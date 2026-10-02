@@ -898,6 +898,8 @@ type
     procedure TestEmbedInstructionPrefixTable;
     procedure TestUtf8IncompleteTailLen;
     procedure TestTakeCompleteUtf8StreamsWholeCodepoints;
+    procedure TestTokenPrefixHash;
+    procedure TestTokenPrefixGuard;
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
@@ -17489,6 +17491,106 @@ begin
   AssertEquals('four continuations', 0,
     Utf8IncompleteTailLen(#$F0#$80#$80#$80#$80));
   AssertEquals('invalid lead', 0, Utf8IncompleteTailLen(#$FF));
+end;
+
+// Equal prefixes hash equal, one changed token anywhere changes the hash,
+// and folding token by token gives the whole-prefix result at every length.
+procedure TTestNeuralPretrained.TestTokenPrefixHash;
+const
+  csTokenCount = 200;
+var
+  Tokens, Copied: TNeuralIntegerArray;
+  TokenPos, ChangedPos, ChangeIdx: integer;
+  Running: UInt64;
+begin
+  SetLength(Tokens, csTokenCount);
+  for TokenPos := 0 to csTokenCount - 1 do
+    Tokens[TokenPos] := (TokenPos * 7919 + 13) mod 151000;
+  Copied := Copy(Tokens);
+  AssertTrue('empty prefix is the seed',
+    TokenPrefixHash(Tokens, 0) = csTokenPrefixHashSeed);
+  AssertTrue('equal prefixes, equal hashes',
+    TokenPrefixHash(Tokens, csTokenCount) = TokenPrefixHash(Copied, csTokenCount));
+  Running := csTokenPrefixHashSeed;
+  for TokenPos := 0 to csTokenCount - 1 do
+  begin
+    Running := FoldTokenIntoPrefixHash(Running, Tokens[TokenPos]);
+    AssertTrue('fold equals whole prefix at ' + IntToStr(TokenPos + 1),
+      Running = TokenPrefixHash(Tokens, TokenPos + 1));
+  end;
+  AssertTrue('a shorter prefix hashes differently',
+    TokenPrefixHash(Tokens, csTokenCount - 1) <>
+    TokenPrefixHash(Tokens, csTokenCount));
+  for ChangeIdx := 0 to 2 do
+  begin
+    case ChangeIdx of
+      0: ChangedPos := 0;
+      1: ChangedPos := csTokenCount div 2;
+    else ChangedPos := csTokenCount - 1;
+    end;
+    Copied := Copy(Tokens);
+    Copied[ChangedPos] := Copied[ChangedPos] + 1;
+    AssertTrue('one token changed at ' + IntToStr(ChangedPos),
+      TokenPrefixHash(Copied, csTokenCount) <>
+      TokenPrefixHash(Tokens, csTokenCount));
+    AssertTrue('prefix before the change is unchanged at ' +
+      IntToStr(ChangedPos), TokenPrefixHash(Copied, ChangedPos) =
+      TokenPrefixHash(Tokens, ChangedPos));
+  end;
+  // Token ids are hashed as 32-bit values: a negative id is a distinct token.
+  Copied := Copy(Tokens);
+  Copied[5] := -Copied[5];
+  AssertTrue('a negated id changes the hash',
+    TokenPrefixHash(Copied, csTokenCount) <> TokenPrefixHash(Tokens, csTokenCount));
+end;
+
+// The guard accepts the sequence it was filled from, rejects a different
+// tail (a hash collision would look exactly like that), and stores fewer
+// than csTokenPrefixGuardLen ids when the position is shorter.
+procedure TTestNeuralPretrained.TestTokenPrefixGuard;
+const
+  csTokenCount = 150;
+var
+  Tokens, Other: TNeuralIntegerArray;
+  Guard: TTokenPrefixGuard;
+  TokenPos: integer;
+begin
+  SetLength(Tokens, csTokenCount);
+  for TokenPos := 0 to csTokenCount - 1 do
+    Tokens[TokenPos] := 1000 + TokenPos;
+  FillTokenPrefixGuard(Tokens, 100, Guard);
+  AssertEquals('full guard count', csTokenPrefixGuardLen, Guard.Count);
+  AssertEquals('guard holds the id right before the position', 1099,
+    Guard.Tokens[Guard.Count - 1]);
+  AssertTrue('true match', TokenPrefixGuardMatches(Guard, Tokens, 100));
+  AssertFalse('other position', TokenPrefixGuardMatches(Guard, Tokens, 101));
+  AssertFalse('position past the tokens',
+    TokenPrefixGuardMatches(Guard, Tokens, csTokenCount + 1));
+  // Same position, same claimed hash, different tail: the guard must reject.
+  Other := Copy(Tokens);
+  Other[99] := Other[99] + 1;
+  AssertFalse('changed last id rejected',
+    TokenPrefixGuardMatches(Guard, Other, 100));
+  Other := Copy(Tokens);
+  Other[100 - csTokenPrefixGuardLen] := 0;
+  AssertFalse('changed first guarded id rejected',
+    TokenPrefixGuardMatches(Guard, Other, 100));
+  // An id before the guarded window is outside the guard (the hash covers it).
+  Other := Copy(Tokens);
+  Other[100 - csTokenPrefixGuardLen - 1] := 0;
+  AssertTrue('id before the window is not guarded',
+    TokenPrefixGuardMatches(Guard, Other, 100));
+  FillTokenPrefixGuard(Tokens, 10, Guard);
+  AssertEquals('short guard count', 10, Guard.Count);
+  AssertTrue('short guard match', TokenPrefixGuardMatches(Guard, Tokens, 10));
+  AssertFalse('short guard against a longer position',
+    TokenPrefixGuardMatches(Guard, Tokens, 70));
+  FillTokenPrefixGuard(Tokens, 0, Guard);
+  AssertEquals('empty guard count', 0, Guard.Count);
+  AssertTrue('empty guard matches position 0',
+    TokenPrefixGuardMatches(Guard, Tokens, 0));
+  AssertFalse('empty guard against position 1',
+    TokenPrefixGuardMatches(Guard, Tokens, 1));
 end;
 
 // Drives the streaming helper the way EmitToken does, with an emoji split

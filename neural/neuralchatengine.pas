@@ -103,8 +103,19 @@ const
   csDefaultCacheCheckpointsCPU = 8;
   csMaxCacheCheckpoints = 2048;
   csDefaultCheckpointBandWidth = 256;
+  // Start value of a token-prefix hash (the hash of the empty prefix).
+  csTokenPrefixHashSeed = QWord($CBF29CE484222325);
+  // Token ids a TTokenPrefixGuard keeps before its position.
+  csTokenPrefixGuardLen = 64;
 
 type
+  // The last token ids before a position, compared exactly after a prefix
+  // hash matches, so a hash collision cannot pass for a matching prefix.
+  TTokenPrefixGuard = record
+    Count: integer; // stored ids: min(Position, csTokenPrefixGuardLen)
+    Tokens: array[0..csTokenPrefixGuardLen - 1] of integer;
+  end;
+
   // Weight storage the chat engine loads the checkpoint into.
   // cwmInt4 is int4 on the convolution/projection layers, int8 elsewhere.
   TChatWeightMode = (cwmFP32, cwmInt8, cwmInt4);
@@ -406,6 +417,18 @@ function ArgMaxRow(Row: TNNetVolume): integer;
 function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
   const Marker: TNeuralIntegerArray): boolean;
 function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
+// Extends a token-prefix hash by TokenId (start: csTokenPrefixHashSeed). Unkeyed,
+// so not collision-resistant against crafted prompts; see TTokenPrefixGuard.
+function FoldTokenIntoPrefixHash(Hash: UInt64; TokenId: integer): UInt64;
+// Token-prefix hash of Tokens[0..Len-1]. The hash does not encode the length:
+// callers compare Position before PrefixHash.
+function TokenPrefixHash(const Tokens: TNeuralIntegerArray; Len: integer): UInt64;
+// Copies the last min(Position, csTokenPrefixGuardLen) ids before Position.
+procedure FillTokenPrefixGuard(const Tokens: TNeuralIntegerArray;
+  Position: integer; out Guard: TTokenPrefixGuard);
+// True when Tokens holds exactly Guard's ids right before Position.
+function TokenPrefixGuardMatches(const Guard: TTokenPrefixGuard;
+  const Tokens: TNeuralIntegerArray; Position: integer): boolean;
 // Number of trailing bytes of S that open a UTF-8 sequence S has not
 // finished (0 when S ends on a whole codepoint, on ASCII, or on bytes no
 // sequence could still complete).
@@ -951,6 +974,51 @@ begin
   N := Length(A);
   if Length(B) < N then N := Length(B);
   while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
+end;
+
+// SplitMix64 is a bijection, so two prefixes that first differ at one token
+// stay apart unless a later fold maps them together (a 2^-64 event).
+{$PUSH}
+{$Q-}{$R-}
+function FoldTokenIntoPrefixHash(Hash: UInt64; TokenId: integer): UInt64;
+begin
+  Result := SplitMix64(Hash xor UInt64(UInt32(TokenId)));
+end;
+{$POP}
+
+function TokenPrefixHash(const Tokens: TNeuralIntegerArray; Len: integer): UInt64;
+var
+  TokenPos, MaxTokenPos: integer;
+begin
+  if (Len < 0) or (Len > Length(Tokens)) then
+    raise Exception.Create('TokenPrefixHash: Len ' + IntToStr(Len) +
+      ' outside 0..' + IntToStr(Length(Tokens)));
+  Result := csTokenPrefixHashSeed;
+  MaxTokenPos := Len - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    Result := FoldTokenIntoPrefixHash(Result, Tokens[TokenPos]);
+end;
+
+procedure FillTokenPrefixGuard(const Tokens: TNeuralIntegerArray;
+  Position: integer; out Guard: TTokenPrefixGuard);
+begin
+  FillChar(Guard, SizeOf(Guard), 0);
+  if (Position < 0) or (Position > Length(Tokens)) then
+    raise Exception.Create('FillTokenPrefixGuard: Position ' +
+      IntToStr(Position) + ' outside 0..' + IntToStr(Length(Tokens)));
+  Guard.Count := Min(Position, csTokenPrefixGuardLen);
+  if Guard.Count > 0 then
+    Move(Tokens[Position - Guard.Count], Guard.Tokens[0],
+      Guard.Count * csIntegerSize);
+end;
+
+function TokenPrefixGuardMatches(const Guard: TTokenPrefixGuard;
+  const Tokens: TNeuralIntegerArray; Position: integer): boolean;
+begin
+  if (Position < 0) or (Position > Length(Tokens)) or
+    (Guard.Count <> Min(Position, csTokenPrefixGuardLen)) then exit(false);
+  Result := (Guard.Count = 0) or CompareMem(@Tokens[Position - Guard.Count],
+    @Guard.Tokens[0], Guard.Count * csIntegerSize);
 end;
 
 function Utf8IncompleteTailLen(const S: string): integer;

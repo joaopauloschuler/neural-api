@@ -206,7 +206,7 @@ rather than acted on.
       an independent Opus review, commit after review + green suites
       (lazbuild -B; default AND -dAVX2 suites; the PoCL suite when OpenCL code is
       touched; 3 GB ulimit). Each task ships its own tests.
-  - [ ] T1. Token-prefix hash primitive. A running 64-bit hash over token ids
+  - [x] T1. Token-prefix hash primitive. A running 64-bit hash over token ids
         (h := Mix(h, Token[i]), {$PUSH}{$Q-}{$R-} around the wrapping math) plus
         a last-64-token guard compared exactly on a hash match. Search for an
         existing 64-bit mix first (coding guide #3). Tests: equal prefixes give

@@ -1481,6 +1481,10 @@ function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat
 // dead-but-not-impossible token never produces -Inf and poisons the sum).
 function SafeLogProb(P: TNeuralFloat): TNeuralFloat;
 
+// The splitmix64 output function: adds the golden gamma, then mixes. A fast,
+// well-mixing 64-bit hash, bijective on UInt64.
+function SplitMix64(X: UInt64): UInt64;
+
 // WATERMARK DETECTION (Kirchenbauer et al. 2023). Given a candidate token
 // sequence and the same (Key, Gamma) the generator used, recomputes the green
 // list at every position from its PREDECESSOR token (positions 1..T-1, the
@@ -5600,16 +5604,13 @@ begin
   AppendToken(TokenId);
 end;
 
-{ TNNetWatermarkLogitsProcessor }
-
-// One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
-// Used as the deterministic green-list PRNG so the partition is bit-identical
-// in the processor and in DetectWatermark.
 // The add/multiply steps wrap around UInt64 on purpose: checks stay off here
-// even in debug builds, where -Co would turn the wrap into EIntOverflow.
+// even in debug builds, where -Co would turn the wrap into EIntOverflow. The
+// watermark uses it as its green-list PRNG, so the partition is bit-identical
+// in the processor and in DetectWatermark.
 {$PUSH}
 {$Q-}{$R-}
-function WatermarkSplitMix64(X: UInt64): UInt64;
+function SplitMix64(X: UInt64): UInt64;
 begin
   X := X + UInt64($9E3779B97F4A7C15);
   X := (X xor (X shr 30)) * UInt64($BF58476D1CE4E5B9);
@@ -5618,8 +5619,10 @@ begin
 end;
 {$POP}
 
+{ TNNetWatermarkLogitsProcessor }
+
 // Green-list membership for a token given the ALREADY-COMPUTED per-step seed
-// (= WatermarkSplitMix64(UInt32(PrevToken) xor Key)). Factored out so a caller
+// (= SplitMix64(UInt32(PrevToken) xor Key)). Factored out so a caller
 // scanning the whole vocab for one (PrevToken, Key) can hoist that first mix
 // out of the loop instead of repeating it per token. The Seed+TokenId sum
 // wraps around UInt64 by design; checks stay off (debug -Co safe).
@@ -5633,7 +5636,7 @@ end;
 function WatermarkGreenFromSeedThresh(Seed: UInt64; TokenId: integer;
   GammaThresh: double): boolean;
 begin
-  Result := (WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId))) shr 11) < GammaThresh;
+  Result := (SplitMix64(Seed + UInt64(UInt32(TokenId))) shr 11) < GammaThresh;
 end;
 
 function WatermarkGreenFromSeed(Seed: UInt64; TokenId: integer;
@@ -5677,7 +5680,7 @@ begin
   // "left-hash" rule of Kirchenbauer et al.); mixing once decorrelates
   // adjacent seeds. The token id is folded in and finalized so each token's
   // membership is an independent uniform draw in [0,1); green iff below Gamma.
-  Seed := WatermarkSplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
+  Seed := SplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
   Result := WatermarkGreenFromSeed(Seed, TokenId, Gamma);
 end;
 {$POP}
@@ -5708,7 +5711,7 @@ begin
   ExpDelta := FExpDelta;
   // The per-step PRNG seed depends only on (FPrevToken, FKey) - invariant
   // across the vocab - so mix it once here instead of inside IsGreen per token.
-  Seed := WatermarkSplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
+  Seed := SplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
   // #5: Gamma*2^53 threshold is invariant across the vocab - hoist once so the
   // per-token green test is an integer compare with no divide.
   GammaThresh := FGamma * 9007199254740992.0; // 2^53
