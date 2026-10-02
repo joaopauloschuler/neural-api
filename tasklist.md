@@ -195,6 +195,25 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
+- [ ] ChatServer: keep a prompt cache per conversation, so several parallel chats
+      do not re-prefill. Today TChatEngine is single-session (one KV cache, one
+      position; neuralchatengine.pas header): each request is diffed
+      (CommonPrefixLen) against the ONE resident token sequence, so two clients
+      taking turns diverge right after the shared system prompt and every request
+      pays a near-full prefill. For hybrid/recurrent nets the --cache-checkpoints
+      store is banded around the last fed position, so the other chat's
+      checkpoints are evicted too. Proposal: hold up to N saved conversation
+      states (the KV-cache rows + the recurrent checkpoints, e.g. via
+      TNNetDecoderSessionSnapshot), pick the one with the longest common token
+      prefix for each request (the OpenAI-style API is stateless, so no session
+      id is needed; an optional `user`/session field could break ties), restore
+      it, prefill only the tail, and evict least-recently-used. Needs a
+      memory-budgeted slot count flag (each slot costs one KV cache; --kv-int8
+      shrinks it; under OpenCL decide resident vs host-RAM slots) and must keep
+      the shared system-prompt prefix reusable across slots. Compute stays
+      serialized (one request at a time); batched concurrent decode is a
+      separate, larger item. Update examples/ChatTerminal/ChatServer.md
+      "Concurrency and cache reuse".
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
@@ -431,8 +450,8 @@ rather than acted on.
 
 - [ ] HunyuanVideo / Mochi-1 text-to-VIDEO DiT importer
       (`BuildHunyuanVideoFromSafeTensors[Ex]`, tencent/HunyuanVideo and the
-      genmo/mochi-1 sibling). Distinct from the landed CogVideoX / Wan / SVD /
-      AnimateDiff video stacks: a dual-stream → single-stream MMDiT (separate
+      genmo/mochi-1 sibling). Distinct from the landed CogVideoX and the planned
+      Wan / SVD / AnimateDiff video stacks: a dual-stream → single-stream MMDiT (separate
       image- and text-stream blocks that later fuse into joint blocks, like
       FLUX's MMDiT but over a spatio-temporal latent) with 3-D RoPE over the
       (T,H,W) token grid and a 3-D causal-VAE latent space. v1 scope: the
@@ -477,8 +496,8 @@ rather than acted on.
       DiT-level long-skip Linear merge; reuse the landed VAE decoder + scheduler
       and scope a small parity fixture.
 - [ ] LTX-Video text-to-video DiT importer (`BuildLTXVideoFromSafeTensors[Ex]`,
-      Lightricks `LTX-Video`). Distinct from the landed CogVideoX / Wan / SVD
-      video importers: a single-stream MMDiT-style video DiT operating on tokens
+      Lightricks `LTX-Video`). Distinct from the landed CogVideoX and the planned
+      Wan / SVD video importers: a single-stream MMDiT-style video DiT operating on tokens
       from a high-compression causal video VAE (patchified space-time latents with
       3-D rotary position embedding), conditioned on a T5 text encoder (landed),
       with rectified-flow sampling. High-value because it reuses the landed
@@ -625,6 +644,50 @@ rather than acted on.
     - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
           scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
           embedding + real-checkpoint parity.
+    - [ ] Real Stable Diffusion text-to-image from a diffusers folder (audit
+          2026-10-02). No example loads a real SD checkpoint today: every SD
+          example defaults to the tests/fixtures pico nets, and all of them fill
+          the UNet text input with random/synthetic states instead of CLIP over a
+          prompt (DiffusionInpainting.lpr:260, FillText in ControlNetCanny and
+          T2IAdapterSketch). ControlNetCanny/T2IAdapterSketch run ONE denoise step
+          and write no image. Missing pieces:
+      - [ ] `TStableDiffusionPipeline` in neuralpretrained.pas with the same
+            public shape as `TQwenImage21Pipeline` (Create(ModelFolder) over
+            model_index.json + text_encoder/ tokenizer/ unet/ vae/ scheduler/,
+            TokenizePrompt, EncodePrompt, Denoise, DecodeLatents,
+            GenerateFromEmbeds, OnPhase/OnStep, load-use-free one component at a
+            time). Scheduler from scheduler/scheduler_config.json onto
+            TNNetDiffusionScheduler (dsScaledLinear; dpEps for SD 1.x, dpV for
+            SD 2.x 768). Latent (H/8,W/8,4) scaled by 1/0.18215 (SDXL 0.13025).
+      - [ ] CFG inside the SD loop: a cond + an empty-prompt uncond UNet pass per
+            step (twice the per-step cost).
+      - [ ] CLIP text encoder for SD: BuildClipFromSafeTensors loads a full CLIP
+            (text + vision); check / add a text-only path for the
+            CLIPTextModel-only text_encoder/ folder (unverified). SD 1.x feeds the
+            last hidden state (77 tokens, padded); SD 2.x the penultimate layer;
+            SDXL two encoders (CLIP-L + OpenCLIP-bigG) concatenated + the pooled
+            vector into SDUNetDenoiseSDXL.
+      - [ ] CLIP tokenizer from vocab.json + merges.txt: the SD 1.5 tokenizer/
+            folder is believed to ship no tokenizer.json, which is what
+            neuralhftokenizer.pas reads (unverified; else convert once).
+      - [ ] F16 weights: the safetensors reader decodes F16, but the SD UNet / VAE
+            loaders are unverified on the F16 (and *.fp16.safetensors variant)
+            files most SD repos ship.
+      - [ ] Resolution: the UNet TNNetInput is sized from Config.LatentGrid at
+            build, so each image size needs a rebuild (or a resizable input).
+      - [ ] Memory/speed: FP32 SD 1.5 UNet ~3.4 GB (over the 3 GB cap on the dev
+            box, so the first real run is on the user's box); int8/int4 UNet
+            weights (the int8 conv path exists, untried on this UNet), UNet
+            OpenCL arming, per-prompt caching of the text cross-attention K/V.
+      - [ ] CLI: either teach examples/QwenImage to pick the pipeline from
+            model_index.json `_class_name` (QwenImage21Pipeline vs
+            StableDiffusionPipeline) so the argument parsing / reporter / OpenCL
+            selection are shared, or a separate examples/StableDiffusion over the
+            same pipeline class. Then wire DiffusionInpainting / ControlNetCanny /
+            T2IAdapterSketch to the real CLIP text states and a full sampling loop.
+      - [ ] Per-component parity against diffusers on real weights (the ~/x venv
+            oracle recipe from the Qwen-Image project), SD 1.5 first, then SD 2.x,
+            then SDXL.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2 / Pixtral):
@@ -1511,7 +1574,19 @@ rather than acted on.
       (the make_pico_*_fixture slicer pattern) once weights are available, incl. the
       real diffusers 3D RoPE frequency layout / temporal VAE up/down blocks and a real
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
-      synthetic text states.
+      synthetic text states. Further gaps (audit 2026-10-02), which together mean
+      the repo has NO usable video generator today:
+  - [ ] Full AutoencoderKLCogVideoX decoder: DecodeCogVideoXVae is only the decode
+        TAIL (one causal temporal conv + SiLU + pointwise conv per spatial cell),
+        not the real up/down-block VAE, so even real denoiser weights cannot
+        produce real frames.
+  - [ ] A `TCogVideoXPipeline` over a diffusers model_index.json folder (the
+        TQwenImage21Pipeline shape: tokenizer + T5 -> transformer -> VAE, one
+        component in memory at a time, OnPhase/OnStep) and a CLI that loads it;
+        examples/TextToVideo takes only a single .safetensors today.
+  - [ ] CFG in the TextToVideo loop with a real empty-prompt uncond branch.
+  - [ ] Output: frames are written as separate P6 PPMs only; add an animated
+        GIF / PNG-sequence or a video-container writer.
 - [ ] Wan 2.1 text-to-VIDEO DiT importer (`BuildWanFromSafeTensors[Ex]` +
       `TWanConfig`, model_type "wan", e.g. Wan-AI/Wan2.1-T2V-1.3B) — the current
       most-downloaded open text-to-video model, a flow-matching MMDiT distinct from
