@@ -252,7 +252,6 @@ procedure CreateNeuralThreadListIfRequired();
 begin
   if Not(Assigned(vNTL)) then
   begin
-    // TThread.ProcessorCount is 1 on non-Windows FPC 3.2.2 (a GetCPUCount stub).
     if NeuralDefaultThreadCount > 1
       then NeuralThreadListCreate(NeuralDefaultThreadCount)
       else NeuralThreadListCreate(1);
