@@ -4565,13 +4565,22 @@ const
   // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
   // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
   csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes of a cai_sdpa_noncausal_tiled work-group: X walks key rows and
-  // head-dim columns, Y walks query rows.
+  // Lanes of a cai_sdpa_noncausal_tiled work-group (its reqd_work_group_size):
+  // X walks key rows and head-dim columns, Y walks query rows.
   csFusedSDPATileLanesX = 16;
   csFusedSDPATileLanesY = 16;
-  // Key rows per tile and the most query rows per tile of that launch.
-  csFusedSDPAKeyTileRows = 32;
-  csFusedSDPAMaxQueryTileRows = 64;
+  // Query rows, key rows and float4 head-dim columns one lane owns per tile:
+  // the CAI_NC_ROW_SLOTS, CAI_NC_KEY_SLOTS and CAI_NC_COL_VECS of neural.cl.
+  csFusedSDPAQueryRowsPerLane = 3;
+  csFusedSDPAKeyRowsPerLane = 2;
+  csFusedSDPAColumnVecsPerLane = 2;
+  // Key rows per tile, the most query rows per tile, and the head-dim columns
+  // one work-group writes (a wider head runs one work-group per column chunk).
+  csFusedSDPAKeyTileRows = csFusedSDPATileLanesX * csFusedSDPAKeyRowsPerLane;
+  csFusedSDPAMaxQueryTileRows =
+    csFusedSDPATileLanesY * csFusedSDPAQueryRowsPerLane;
+  csFusedSDPAColumnChunk =
+    4 * csFusedSDPATileLanesX * csFusedSDPAColumnVecsPerLane;
 
 type
   // RowCount token rows of external K and V in OpenCL memory, all K rows then
@@ -4641,7 +4650,8 @@ type
     // The same budget beside a kernel that declares StaticLocalBytes itself.
     function LocalMemFloatsBeside(StaticLocalBytes: integer): integer;
     // Tile rows of cai_sdpa_noncausal_tiled for head dimension Dk: as many
-    // query rows as the local-memory budget allows, capped (or the forced ones).
+    // query rows as the local-memory budget allows (or the forced ones),
+    // capped.
     procedure ChooseNonCausalTiles(Dk: integer;
       out QueryTileRows, KeyTileRows: integer);
     // The step input's buffer: pExternalSrc when bound, else X uploaded.
@@ -39263,14 +39273,24 @@ begin
     csFusedSDPALocalSize, 1);
 end;
 
-// Local memory of one cai_sdpa_noncausal_tiled work-group, in floats: the
-// padded query tile, the output accumulator, the padded K/V tile, the padded
-// score tile and the per-row max, sum and rescale factor.
-function NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk: integer): integer;
+// Count rounded up to a multiple of 4: the float4 width of the
+// cai_sdpa_noncausal_tiled tiles.
+function RoundUpTo4(Count: integer): integer;
 begin
-  Result := QueryTileRows * (Dk + 1) + QueryTileRows * Dk
-    + KeyTileRows * (Dk + 1) + QueryTileRows * (KeyTileRows + 1)
-    + 3 * QueryTileRows;
+  Result := (Count + 3) and (not 3);
+end;
+
+// Local memory of one cai_sdpa_noncausal_tiled work-group, in floats: the
+// query tile, the K/V tile, the probability tile (rows padded by 4 floats) and
+// one partial per (query row, X lane).
+function NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk: integer): integer;
+var
+  TileStride, KeyTile4: integer;
+begin
+  TileStride := RoundUpTo4(Dk) + 4;
+  KeyTile4 := RoundUpTo4(KeyTileRows);
+  Result := (QueryTileRows + KeyTile4) * TileStride
+    + QueryTileRows * (KeyTile4 + 4 + csFusedSDPATileLanesX);
 end;
 
 procedure TNNetFusedSDPACL.ChooseNonCausalTiles(Dk: integer;
@@ -39280,18 +39300,19 @@ var
 
   function QueryRowsThatFit(): integer;
   begin
-    Result := (BudgetFloats - KeyTileRows * (Dk + 1))
-      div (2 * Dk + KeyTileRows + 5);
+    Result := (BudgetFloats - NonCausalTileFloats(0, KeyTileRows, Dk))
+      div (NonCausalTileFloats(1, KeyTileRows, Dk)
+        - NonCausalTileFloats(0, KeyTileRows, Dk));
   end;
 
 begin
   BudgetFloats := LocalMemFloatsBeside(FNonCausalStaticLocalBytes);
   if FForcedKeyTileRows > 0
-    then KeyTileRows := FForcedKeyTileRows
+    then KeyTileRows := Min(FForcedKeyTileRows, csFusedSDPAKeyTileRows)
     else KeyTileRows := csFusedSDPAKeyTileRows;
   if FForcedQueryTileRows > 0 then
   begin
-    QueryTileRows := FForcedQueryTileRows;
+    QueryTileRows := Min(FForcedQueryTileRows, csFusedSDPAMaxQueryTileRows);
     exit;
   end;
   QueryTileRows := QueryRowsThatFit();
@@ -39328,7 +39349,7 @@ var
   bufX, bufK, bufV, bufY: cl_mem;
   kTiled: cl_kernel;
   TokenCnt, XStride, YStride, KeyStart, KeyEnd: integer;
-  QueryTileRows, KeyTileRows, QueryTiles: integer;
+  QueryTileRows, KeyTileRows, QueryTiles, ColumnChunks: integer;
 begin
   kTiled := FNonCausalKernel;
   TokenCnt := X.SizeX;
@@ -39341,8 +39362,14 @@ begin
     then KeyStart := KeyEnd - Window
     else KeyStart := 0;
   ChooseNonCausalTiles(Dk, QueryTileRows, KeyTileRows);
+  // The kernel's lane slots cover no more rows than these.
+  Assert((KeyTileRows <= csFusedSDPAKeyTileRows) and
+    (QueryTileRows <= csFusedSDPAMaxQueryTileRows),
+    'cai_sdpa_noncausal_tiled tiles exceed its lane slots');
   if QueryTileRows > TokenCnt then QueryTileRows := TokenCnt;
   QueryTiles := (TokenCnt + QueryTileRows - 1) div QueryTileRows;
+  ColumnChunks := (RoundUpTo4(Dk) + csFusedSDPAColumnChunk - 1)
+    div csFusedSDPAColumnChunk;
   FLastQueryTileRows := QueryTileRows;
   FLastKeyTileRows := KeyTileRows;
   FLastScratchBytes := csize_t(NonCausalTileFloats(QueryTileRows, KeyTileRows,
@@ -39370,7 +39397,7 @@ begin
   clSetKernelArg(kTiled, 17, csCLMemSize, @bufY);
   clSetKernelArg(kTiled, 18, FLastScratchBytes, nil);
   FKernel.RunKernel2D(kTiled, csFusedSDPATileLanesX,
-    csFusedSDPATileLanesY * QHeads * QueryTiles,
+    csFusedSDPATileLanesY * QHeads * QueryTiles * ColumnChunks,
     csFusedSDPATileLanesX, csFusedSDPATileLanesY);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;

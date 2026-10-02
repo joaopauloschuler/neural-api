@@ -1994,9 +1994,14 @@ rather than acted on.
           Parity vs CPU 1.8e-7..3.0e-7 (layer), 6.0e-7 (pico velocity). Resident
           prefixes cost NumLayers x L x hidden x 8 B of OpenCL memory (~256 MB at
           L=256, ~1 GB at L=1024). Deferred until a GPU measurement:
-          - [ ] O accumulator in private registers (raises R on 48 KB devices).
-          - [ ] Register-blocked score and P.V loops (today 2 local reads per mad).
-          - [ ] Tree reduction for the running-max fold (one lane per row today).
+          - [x] O accumulator in private registers (raises R on 48 KB devices).
+          - [x] Register-blocked score and P.V loops (today 2 local reads per mad).
+          - [x] Tree reduction for the running-max fold (one lane per row today).
+          DONE (kernel rewrite): O in registers (3x2 float4 per lane), 3x2
+          score and P.V blocking with float4 local loads, parallel row max and
+          per-lane partial sums, one work-group per 128 head-dim columns,
+          reqd_work_group_size(16,16,1); 48 KB tiles 26x32 -> 42x32 (computed),
+          PoCL ~2.1x on one shape (not a GPU timing). L4 gain unmeasured.
     - [x] B1d. Layers that send the activations back to RAM (B1a), worst first:
       - [x] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
             row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow

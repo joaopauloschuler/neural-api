@@ -3322,32 +3322,58 @@ __kernel void cai_sdpa_decode_merge
   }
 }
 
-// NON-CAUSAL TILED CACHED ATTENTION, FP32 KV CACHE (TNNetFusedSDPA with
-// CachedForwardNonCausal). ONE WORK-GROUP PER (QUERY HEAD h, QUERY TILE):
-// dimension 1 of the launch carries h*QueryTiles + tile, and the group owns the
-// token rows [tile*FQueryTileRows, +FQueryTileRows) clipped to FTokenCnt. Every
-// row attends the same cache rows [FKeyStart, FKeyEnd) of KV head
-// h / FGroupSize, with no mask. The keys are walked in tiles of FKeyTileRows
-// staged in local memory, so each K and V row is read from global memory once
-// per query tile rather than once per query row.
-//
-// ONLINE SOFTMAX per query row: m = the running max score, l = the running sum
-// of exp(s - m), O = the running sum of exp(s - m) * V. A key tile that raises
-// m to m' first rescales l and O by exp(m - m'). The result is O / l, zero
-// when l = 0 as the host path does. Scores are scaled and soft-capped exactly
-// as cai_sdpa_decode_split scores them.
-//
-// Launch 2-D with local (LX, LY) and global (LX, LY * FQHeads * QueryTiles).
-// Lane (lx, ly) walks query rows ly, ly+LY, ... and key rows or head-dim
-// columns lx, lx+LX, ..., so no lane index is ever divided (see the PoCL note
-// in cai_sdpa_decode_split). FScratch is R*(FDk+1) + R*FDk + C*(FDk+1) +
-// R*(C+1) + 3*R floats of __local memory (R = FQueryTileRows, C =
-// FKeyTileRows): the query tile, the output accumulator, the K-then-V tile, the
-// score tile and the per-row max, sum and rescale factor. The query, K/V and
-// score rows carry one float of padding, so the rows a warp reads at once
-// (broadcast or not) sit in different banks.
+// Query rows, key rows and float4 columns of one lane's tile slots; mirrored
+// by csFusedSDPA{QueryRows,KeyRows,ColumnVecs}PerLane in neuralnetwork.pas.
+#define CAI_NC_ROW_SLOTS 3
+#define CAI_NC_KEY_SLOTS 2
+#define CAI_NC_COL_VECS 2
+
+// A lane's tile row, key row and first column for slot i/j, recomputed at each
+// use: kept in private int arrays across barriers, PoCL got the rows wrong.
+#define CAI_NC_ROW_LIVE(i) (ly + (i) * LY < RowsLive)
+#define CAI_NC_ROW(i) min(ly + (i) * LY, RowsLive - 1)
+#define CAI_NC_KEY(j) (lx + (j) * LX)
+#define CAI_NC_COL(j) (Col0 + 4 * (lx + (j) * LX))
+
+// acc + dot(a, b) as four chained mads.
+static inline float cai_nc_mad_dot4(const float4 a, const float4 b,
+  const float acc)
+{
+  return mad(a.s3, b.s3, mad(a.s2, b.s2,
+    mad(a.s1, b.s1, mad(a.s0, b.s0, acc))));
+}
+
+// Stages Tile[0..PadRows) x [0..PadCols) from Src, zero past RowsLive rows
+// and Cols columns. The caller owns the barriers.
+static inline void cai_nc_stage(__global const float* Src, const int SrcStride,
+  const int RowsLive, const int PadRows, const int Cols, const int PadCols,
+  __local float* Tile, const int TileStride, const int lx, const int ly,
+  const int LX, const int LY)
+{
+  for (int r = ly; r < PadRows; r += LY)
+    for (int d = lx; d < PadCols; d += LX)
+      Tile[r * TileStride + d] =
+        ((r < RowsLive) && (d < Cols)) ? Src[r * SrcStride + d] : 0.0f;
+}
+
+// NON-CAUSAL TILED CACHED ATTENTION, FP32 KV CACHE (TNNetFusedSDPA,
+// CachedForwardNonCausal). One work-group per (query head h, query tile of
+// FQueryTileRows rows, chunk of 4*LX*CAI_NC_COL_VECS output columns): dimension
+// 1 carries (h*QueryTiles + tile)*ColChunks + chunk; every chunk recomputes the
+// scores. All rows attend cache rows [FKeyStart, FKeyEnd) of KV head
+// h / FGroupSize in key tiles of FKeyTileRows by online softmax (running max m,
+// sum l and output O, rescaled by exp(m - m') when m grows; O / l, or 0 when
+// l = 0), scores scaled and soft-capped as in cai_sdpa_decode_split.
+// Each lane keeps the scores and O of its slots in registers; a slot out of
+// range reads a clamped live index and drops its result, so every barrier sits
+// in uniform control flow. Every lane of a row reads all LX row-max partials,
+// so the lanes agree bitwise on m; l is reduced the same way once, at the end.
+// FScratch: R*(Dk4+4) + C4*(Dk4+4) + R*(C4+4) + R*LX floats (query, K-then-V
+// and probability tiles, row partials; Dk4, C4 = FDk, FKeyTileRows rounded up
+// to 4); the 4-float row padding spreads float4 reads over the banks.
 // Coded by Claude (AI).
-__kernel void cai_sdpa_noncausal_tiled
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void cai_sdpa_noncausal_tiled
 (
   const int FQHeads,
   const int FGroupSize,
@@ -3375,121 +3401,183 @@ __kernel void cai_sdpa_noncausal_tiled
   const int LX = get_local_size(0);
   const int LY = get_local_size(1);
   const int gid = get_group_id(1);
+  int i, j, e, d4, c4, kt;
+  const int Dk4 = (FDk + 3) & ~3;
+  const int ChunkCols = 4 * LX * CAI_NC_COL_VECS;
+  const int ColChunks = (Dk4 + ChunkCols - 1) / ChunkCols;
   const int QueryTiles = (FTokenCnt + FQueryTileRows - 1) / FQueryTileRows;
-  const int h = gid / QueryTiles;
+  const int TileId = gid / ColChunks;
+  const int h = TileId / QueryTiles;
   if (h >= FQHeads) return;
-  int r, c, d, kt;
-  const int Row0 = (gid - h * QueryTiles) * FQueryTileRows;
+  const int Col0 = (gid - TileId * ColChunks) * ChunkCols;
+  const int Row0 = (TileId - h * QueryTiles) * FQueryTileRows;
   const int RowsLive = min(FQueryTileRows, FTokenCnt - Row0);
-  const int KVRowStride = FDk + 1;
-  const int SRowStride = FKeyTileRows + 1;
+  const int KeyTile4 = (FKeyTileRows + 3) & ~3;
+  const int TileStride = Dk4 + 4;
+  const int SRowStride = KeyTile4 + 4;
+  const int MaxDk4Pos = (Dk4 >> 2) - 1;
 
   __local float* qTile = FScratch;
-  __local float* oTile = qTile + FQueryTileRows * KVRowStride;
-  __local float* kvTile = oTile + FQueryTileRows * FDk;
-  __local float* sTile = kvTile + FKeyTileRows * KVRowStride;
-  __local float* rowMax = sTile + FQueryTileRows * SRowStride;
-  __local float* rowSum = rowMax + FQueryTileRows;
-  __local float* rowScale = rowSum + FQueryTileRows;
+  __local float* kvTile = qTile + FQueryTileRows * TileStride;
+  __local float* sTile = kvTile + KeyTile4 * TileStride;
+  __local float* rowPart = sTile + FQueryTileRows * SRowStride;
+
+  float4 o[CAI_NC_ROW_SLOTS][CAI_NC_COL_VECS];
+  float m[CAI_NC_ROW_SLOTS], l[CAI_NC_ROW_SLOTS];
+  #pragma unroll
+  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+  {
+    m[i] = -1e30f;
+    l[i] = 0.0f;
+    #pragma unroll
+    for (j = 0; j < CAI_NC_COL_VECS; j++) o[i][j] = (float4)(0.0f);
+  }
 
   const int plane = (h / FGroupSize) * FCacheMax * FDk;
-  __global const float* qsrc = FX + Row0 * FXStride + h * FDk;
-  for (r = ly; r < RowsLive; r += LY)
-    for (d = lx; d < FDk; d += LX)
-    {
-      qTile[r * KVRowStride + d] = qsrc[r * FXStride + d];
-      oTile[r * FDk + d] = 0.0f;
-    }
-  if (lx == 0)
-    for (r = ly; r < RowsLive; r += LY)
-    {
-      rowMax[r] = -1e30f;
-      rowSum[r] = 0.0f;
-    }
+  cai_nc_stage(FX + Row0 * FXStride + h * FDk, FXStride, RowsLive, RowsLive,
+    FDk, Dk4, qTile, TileStride, lx, ly, LX, LY);
 
   for (kt = FKeyStart; kt < FKeyEnd; kt += FKeyTileRows)
   {
     const int KeysLive = min(FKeyTileRows, FKeyEnd - kt);
-    __global const float* ksrc = FKCache + plane + kt * FDk;
-    __global const float* vsrc = FVCache + plane + kt * FDk;
-    // The previous tile's value reads (and, first time round, the query load)
+    // The previous tile's P.V reads (and, first time round, the query load)
     // are finished before the K tile overwrites the shared tile.
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (c = ly; c < KeysLive; c += LY)
-      for (d = lx; d < FDk; d += LX)
-        kvTile[c * KVRowStride + d] = ksrc[c * FDk + d];
+    cai_nc_stage(FKCache + plane + kt * FDk, FDk, KeysLive, KeyTile4, FDk, Dk4,
+      kvTile, TileStride, lx, ly, LX, LY);
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (r = ly; r < RowsLive; r += LY)
+    float s[CAI_NC_ROW_SLOTS][CAI_NC_KEY_SLOTS];
+    #pragma unroll
+    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+      #pragma unroll
+      for (j = 0; j < CAI_NC_KEY_SLOTS; j++) s[i][j] = 0.0f;
+    for (d4 = 0; d4 <= MaxDk4Pos; d4++)
     {
-      __local const float* qrow = qTile + r * KVRowStride;
-      for (c = lx; c < KeysLive; c += LX)
+      float4 qv[CAI_NC_ROW_SLOTS], kv[CAI_NC_KEY_SLOTS];
+      #pragma unroll
+      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+        qv[i] = vload4(d4, qTile + CAI_NC_ROW(i) * TileStride);
+      #pragma unroll
+      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
+        kv[j] = vload4(d4,
+          kvTile + min(CAI_NC_KEY(j), KeysLive - 1) * TileStride);
+      #pragma unroll
+      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+        #pragma unroll
+        for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
+          s[i][j] = cai_nc_mad_dot4(qv[i], kv[j], s[i][j]);
+    }
+    #pragma unroll
+    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+    {
+      float PartMax = -1e30f;
+      #pragma unroll
+      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
       {
-        __local const float* krow = kvTile + c * KVRowStride;
-        float acc = 0.0f;
-        for (d = 0; d < FDk; d++) acc = mad(qrow[d], krow[d], acc);
-        float sc = acc * FInvSqrtDk;
+        float sc = s[i][j] * FInvSqrtDk;
         if (FScoreSoftCap > 0.0f)
           sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
-        sTile[r * SRowStride + c] = sc;
+        s[i][j] = (CAI_NC_KEY(j) < KeysLive) ? sc : -1e30f;
+        PartMax = fmax(PartMax, s[i][j]);
       }
+      if (CAI_NC_ROW_LIVE(i)) rowPart[CAI_NC_ROW(i) * LX + lx] = PartMax;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // The V tile replaces the K tile while one lane per row folds the tile's
-    // scores into the running max. The exponent is clamped so the first
-    // tile's -1e30 never reaches exp; exp(-80) against l = 0 and O = 0 is 0.
-    for (c = ly; c < KeysLive; c += LY)
-      for (d = lx; d < FDk; d += LX)
-        kvTile[c * KVRowStride + d] = vsrc[c * FDk + d];
-    if (lx == 0)
-      for (r = ly; r < RowsLive; r += LY)
-      {
-        __local const float* srow = sTile + r * SRowStride;
-        const float OldMax = rowMax[r];
-        float m = OldMax;
-        for (c = 0; c < KeysLive; c++) m = fmax(m, srow[c]);
-        rowScale[r] = exp(fmax(OldMax - m, -80.0f));
-        rowMax[r] = m;
-      }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (r = ly; r < RowsLive; r += LY)
+    // Every K read is done: the V tile replaces it while each lane folds the
+    // row partials into its running max. Exponents stay in [-80, 0] (PoCL's exp
+    // traps on large ones); the first tile's exp(-80) meets l = 0 and O = 0.
+    cai_nc_stage(FVCache + plane + kt * FDk, FDk, KeysLive, KeyTile4, FDk, Dk4,
+      kvTile, TileStride, lx, ly, LX, LY);
+    #pragma unroll
+    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
     {
-      __local float* srow = sTile + r * SRowStride;
-      const float m = rowMax[r];
-      for (c = lx; c < KeysLive; c += LX) srow[c] = exp(srow[c] - m);
+      __local const float* part = rowPart + CAI_NC_ROW(i) * LX;
+      float TileMax = m[i];
+      for (e = 0; e < LX; e += 4)
+      {
+        const float4 pm = vload4(0, part + e);
+        TileMax = fmax(TileMax, fmax(fmax(pm.s0, pm.s1), fmax(pm.s2, pm.s3)));
+      }
+      const float RowRescale = exp(fmax(m[i] - TileMax, -80.0f));
+      m[i] = TileMax;
+      float TileSum = 0.0f;
+      #pragma unroll
+      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
+      {
+        const float p = (CAI_NC_KEY(j) < KeysLive)
+          ? exp(clamp(s[i][j] - TileMax, -80.0f, 0.0f)) : 0.0f;
+        TileSum += p;
+        if (CAI_NC_ROW_LIVE(i) && (CAI_NC_KEY(j) < KeyTile4))
+          sTile[CAI_NC_ROW(i) * SRowStride + CAI_NC_KEY(j)] = p;
+      }
+      l[i] = mad(l[i], RowRescale, TileSum);
+      #pragma unroll
+      for (j = 0; j < CAI_NC_COL_VECS; j++) o[i][j] *= RowRescale;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (r = ly; r < RowsLive; r += LY)
+    // Keys from KeysLive to the next multiple of 4 have p = 0 and a zero V row.
+    const int MaxKey4Pos = ((KeysLive + 3) >> 2) - 1;
+    for (c4 = 0; c4 <= MaxKey4Pos; c4++)
     {
-      __local const float* prow = sTile + r * SRowStride;
-      const float RowRescale = rowScale[r];
-      for (d = lx; d < FDk; d += LX)
-      {
-        float acc = 0.0f;
-        for (c = 0; c < KeysLive; c++)
-          acc = mad(prow[c], kvTile[c * KVRowStride + d], acc);
-        oTile[r * FDk + d] = mad(oTile[r * FDk + d], RowRescale, acc);
-      }
-      if (lx == 0)
-      {
-        float TileSum = 0.0f;
-        for (c = 0; c < KeysLive; c++) TileSum += prow[c];
-        rowSum[r] = mad(rowSum[r], RowRescale, TileSum);
-      }
+      float4 p4[CAI_NC_ROW_SLOTS];
+      #pragma unroll
+      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+        p4[i] = vload4(c4, sTile + CAI_NC_ROW(i) * SRowStride);
+      __local const float* vrows = kvTile + (c4 << 2) * TileStride;
+      #pragma unroll
+      for (e = 0; e < 4; e++)
+        #pragma unroll
+        for (j = 0; j < CAI_NC_COL_VECS; j++)
+        {
+          const float4 v =
+            vload4(0, vrows + e * TileStride + min(CAI_NC_COL(j), Dk4 - 4));
+          #pragma unroll
+          for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+          {
+            const float p = (e == 0) ? p4[i].s0 : (e == 1) ? p4[i].s1
+                          : (e == 2) ? p4[i].s2 : p4[i].s3;
+            o[i][j] = mad((float4)(p), v, o[i][j]);
+          }
+        }
     }
   }
+
+  // rowPart was last read before the final P.V barrier, so it is free here.
+  #pragma unroll
+  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+    if (CAI_NC_ROW_LIVE(i)) rowPart[CAI_NC_ROW(i) * LX + lx] = l[i];
   barrier(CLK_LOCAL_MEM_FENCE);
 
   __global float* ydst = FY + Row0 * FYStride + h * FDk;
-  for (r = ly; r < RowsLive; r += LY)
+  #pragma unroll
+  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
   {
-    const float RowTotal = rowSum[r];
+    if (!CAI_NC_ROW_LIVE(i)) continue;
+    __local const float* part = rowPart + CAI_NC_ROW(i) * LX;
+    float RowTotal = 0.0f;
+    for (e = 0; e < LX; e += 4)
+    {
+      const float4 pl = vload4(0, part + e);
+      RowTotal += (pl.s0 + pl.s1) + (pl.s2 + pl.s3);
+    }
     const float InvRowTotal = (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
-    for (d = lx; d < FDk; d += LX)
-      ydst[r * FYStride + d] = oTile[r * FDk + d] * InvRowTotal;
+    __global float* yrow = ydst + CAI_NC_ROW(i) * FYStride;
+    #pragma unroll
+    for (j = 0; j < CAI_NC_COL_VECS; j++)
+    {
+      const float4 y = o[i][j] * InvRowTotal;
+      const int c = CAI_NC_COL(j);
+      if (c + 3 < FDk) vstore4(y, 0, yrow + c);
+      else
+      {
+        if (c < FDk) yrow[c] = y.s0;
+        if (c + 1 < FDk) yrow[c + 1] = y.s1;
+        if (c + 2 < FDk) yrow[c + 2] = y.s2;
+      }
+    }
   }
 }
 

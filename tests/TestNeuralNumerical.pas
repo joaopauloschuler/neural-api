@@ -454,7 +454,8 @@ type
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
     procedure FusedSDPAInt8AppendOpenCLParity;
     // CachedForwardNonCausal on cai_sdpa_noncausal_tiled vs the CPU: head dims
-    // 5 to 128, GQA, prefixes of 0 to 40 rows, ragged query and key tiles, a
+    // 5 to 260 (1 to 3 column chunks), query tiles of 1 to 48 rows, 540 keys,
+    // GQA, prefixes of 0 to 300 rows, ragged query and key tiles, a
     // bound or uploaded source, the prefix appended in OpenCL memory or from the
     // host, the 16-row key-tile fallback, and two host-path cases (a budget
     // too small for any tile, an int8 KV cache) that must match exactly.
@@ -73657,6 +73658,9 @@ procedure TTestNeuralNumerical.FusedSDPANonCausalOpenCLParity;
 var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
+  // Inputs are InputAmplitude * U(-0.5, 0.5). KeyRamp > 0 adds KeyRamp * row to
+  // prefix K row `row` and 1 to every input, so scores grow along the cache.
+  InputAmplitude, KeyRamp: TNeuralFloat;
 
   // ExpectOpenCL false: the host path must run and match the CPU exactly.
   // ExpectedKeyTileRows > 0 asserts the key tile the launch used.
@@ -73714,8 +73718,9 @@ var
       MaxPrefixPos := PrefixK.Size - 1;
       for Pos := 0 to MaxPrefixPos do
       begin
-        PrefixK.FData[Pos] := 3 * (Random - 0.5);
-        PrefixV.FData[Pos] := 3 * (Random - 0.5);
+        PrefixK.FData[Pos] := InputAmplitude * (Random - 0.5)
+          + KeyRamp * (Pos div KW);
+        PrefixV.FData[Pos] := InputAmplitude * (Random - 0.5);
       end;
       if ResidentPrefix then
         KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
@@ -73725,7 +73730,9 @@ var
       MaxAbsCpu := 0;
       for Pass := 0 to 1 do
       begin
-        for Pos := 0 to MaxStepInPos do StepIn.FData[Pos] := 3 * (Random - 0.5);
+        for Pos := 0 to MaxStepInPos do
+          StepIn.FData[Pos] := InputAmplitude * (Random - 0.5)
+            + Ord(KeyRamp > 0);
         LCpu.TruncateCache(0);
         LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
         LGpu.TruncateCache(0);
@@ -73739,7 +73746,7 @@ var
         for Pos := 0 to MaxOutputPos do
         begin
           Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
-          if Diff > MaxDiff then MaxDiff := Diff;
+          if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
           if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
             MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
         end;
@@ -73789,6 +73796,8 @@ begin
     Exit;
   end;
   RandSeed := 20260930;
+  InputAmplitude := 3;
+  KeyRamp := 0;
   // Qwen-Image head dimension, automatic tiles, fewer rows than a tile.
   RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 0, 32, False, True, False, True);
   // No prefix; the rows fill exactly one query tile and two key tiles.
@@ -73804,6 +73813,35 @@ begin
   RunCase(2, 1, 8, 6, 11, 10, 0, 4, 4, 0, 4, False, True, False, True);
   // Automatic tiles over several query and key tiles.
   RunCase(2, 2, 64, 20, 150, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // Query tiles of 1, 15, 17, 33 and 48 rows (one, part of and all three
+  // row slots per lane) against full, odd and single-row key tiles.
+  RunCase(2, 2, 32, 9, 50, 0, 0, 1, 32, 0, 32, False, True, False, True);
+  RunCase(2, 1, 24, 5, 61, 0, 0, 15, 31, 0, 31, True, True, False, True);
+  RunCase(2, 2, 40, 3, 70, 0, 0, 17, 1, 0, 1, False, False, False, True);
+  RunCase(3, 1, 16, 12, 67, 0, 2.5, 33, 13, 0, 13, False, True, False, True);
+  RunCase(2, 2, 128, 30, 100, 0, 0, 48, 32, 0, 32, False, True, False, True);
+  // A lane holds 128 head-dim columns: Dk 129 and 256 run two column chunks
+  // and Dk 260 three, each recomputing the scores.
+  RunCase(2, 2, 129, 6, 20, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  RunCase(2, 1, 256, 10, 35, 0, 0, 16, 32, 0, 32, True, True, False, True);
+  RunCase(2, 2, 260, 4, 9, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // An NVIDIA-sized budget (48 KB less the reserve) at the Qwen-Image head
+  // dimension: automatic tiles of 42 query rows by 32 keys.
+  RunCase(2, 2, 128, 14, 90, 0, 0, 0, 0, 48 * 1024 - 1024, 32, False, True,
+    False, True);
+  // A long sequence: 540 keys over 17 key tiles, automatic query tiles.
+  RunCase(2, 2, 64, 300, 240, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // Inputs in +-20 at Dk 16: scores within one key tile spread by hundreds,
+  // so a row max taken over fewer than all 16 X lanes moves the softmax.
+  InputAmplitude := 40;
+  RunCase(2, 2, 16, 20, 60, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // Scores rising by about 100 per 8-row key tile: the running max moves past
+  // the -80 rescale clamp on every prefix tile.
+  InputAmplitude := 1;
+  KeyRamp := 3;
+  RunCase(2, 2, 16, 40, 12, 0, 0, 16, 8, 0, 8, False, True, False, True);
+  InputAmplitude := 3;
+  KeyRamp := 0;
   // 24000 usable bytes at Dk=128 fit fewer than 16 query rows beside a 32-row
   // key tile, so the automatic sizing falls back to 16-row key tiles.
   RunCase(2, 2, 128, 7, 37, 0, 0, 0, 0, 24000, 16, False, True, False, True);
