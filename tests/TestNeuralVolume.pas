@@ -124,6 +124,8 @@ type
     procedure TestQuant4QuantizeRoundTrip;
     procedure TestDotProductInt4Int8MatchesReference;
     procedure TestQuant4TiledDotProductMatchesDequantized;
+    procedure TestQuant8CopyRowsTransposedMatchesReference;
+    procedure TestQuant4CopyRowsAsPairedTransposedMatchesReference;
     procedure TestDecodeBF16;
     procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
@@ -4030,6 +4032,128 @@ begin
         Abs(Back[i] - V.FData[i]) <= Scale * 0.5 + 1e-7);
   finally
     V.Free;
+  end;
+end;
+
+// CopyRowsTransposedTo puts code d of row r at Dst[r + d * RowCount], for
+// untiled sizes and uneven row ranges. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant8CopyRowsTransposedMatchesReference;
+const
+  cShapes: array[0..5, 0..1] of integer =
+    ((1, 1), (1, 40), (7, 5), (65, 33), (130, 100), (4096, 512));
+var
+  Q: TNNetVolumeQuant8;
+  Got, Expected: TInt8DynArr;
+  ShapeCnt, RowCount, Depth, RowCnt, DepthCnt, i, SplitRow1, SplitRow2: integer;
+  Tag: string;
+begin
+  RandSeed := 4242;
+  Q := TNNetVolumeQuant8.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+    begin
+      RowCount := cShapes[ShapeCnt, 0];
+      Depth := cShapes[ShapeCnt, 1];
+      Tag := IntToStr(RowCount) + 'x' + IntToStr(Depth);
+      Q.ReSize(RowCount, 1, Depth);
+      for i := 0 to Q.Size - 1 do Q.FData[i] := ShortInt(Random(256) - 128);
+      SetLength(Expected, Q.Size);
+      for RowCnt := 0 to RowCount - 1 do
+        for DepthCnt := 0 to Depth - 1 do
+          Expected[RowCnt + DepthCnt * RowCount] := Q.Get(RowCnt, 0, DepthCnt);
+      SetLength(Got, Q.Size);
+      FillChar(Got[0], Q.Size, $5A);
+      Q.CopyRowsTransposedTo(0, RowCount, TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      AssertTrue(Tag + ' whole range is byte-identical',
+        CompareByte(Got[0], Expected[0], Q.Size) = 0);
+      FillChar(Got[0], Q.Size, $5A);
+      SplitRow1 := RowCount div 3;
+      SplitRow2 := (RowCount * 2) div 3 + 1;
+      if SplitRow2 > RowCount then SplitRow2 := RowCount;
+      Q.CopyRowsTransposedTo(0, SplitRow1, TNeuralInt8ArrPtr(@Got[0]),
+        RowCount);
+      Q.CopyRowsTransposedTo(SplitRow1, SplitRow2 - SplitRow1,
+        TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      Q.CopyRowsTransposedTo(SplitRow2, RowCount - SplitRow2,
+        TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      AssertTrue(Tag + ' three ranges are byte-identical',
+        CompareByte(Got[0], Expected[0], Q.Size) = 0);
+    end;
+  finally
+    Q.Free;
+  end;
+end;
+
+// OpenCL int4 layout: Pair[r + (16b + p) * RowCount] holds codes 2p, 2p+1 of
+// block b (biased), Scale[r + b * RowCount] its scale. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4CopyRowsAsPairedTransposedMatchesReference;
+const
+  cShapes: array[0..5, 0..1] of integer =
+    ((1, 32), (1, 96), (7, 64), (65, 96), (130, 160), (4096, 512));
+var
+  Q: TNNetVolumeQuant4;
+  GotPairs, ExpectedPairs: TNeuralByteDynArr;
+  GotScales, ExpectedScales: TNeuralFloatDynArr;
+  ShapeCnt, RowCount, Depth, RowCnt, PairCnt, BlockCnt, i: integer;
+  PairBytes, ScaleCount, SplitRow: integer;
+  Tag: string;
+begin
+  RandSeed := 2424;
+  Q := TNNetVolumeQuant4.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+    begin
+      RowCount := cShapes[ShapeCnt, 0];
+      Depth := cShapes[ShapeCnt, 1];
+      Tag := IntToStr(RowCount) + 'x' + IntToStr(Depth);
+      Q.ReSize(RowCount, 1, Depth);
+      for i := 0 to Q.PackedSize - 1 do Q.FData[i] := Random(256);
+      for i := 0 to Q.ScaleData.Size - 1 do
+        Q.ScaleData.FData[i] := Random - 0.5;
+      PairBytes := Q.PackedSize;
+      ScaleCount := RowCount * Q.BlocksPerRow;
+      SetLength(ExpectedPairs, PairBytes);
+      SetLength(ExpectedScales, ScaleCount);
+      for RowCnt := 0 to RowCount - 1 do
+      begin
+        for PairCnt := 0 to (Depth div 2) - 1 do
+          ExpectedPairs[RowCnt + PairCnt * RowCount] :=
+            (Q.GetCode(RowCnt, 0, 2 * PairCnt) + 8) or
+            ((Q.GetCode(RowCnt, 0, 2 * PairCnt + 1) + 8) shl 4);
+        for BlockCnt := 0 to Q.BlocksPerRow - 1 do
+          ExpectedScales[RowCnt + BlockCnt * RowCount] :=
+            Q.GetScaleRowPtr(RowCnt, 0)^[BlockCnt];
+      end;
+      SetLength(GotPairs, PairBytes);
+      SetLength(GotScales, ScaleCount);
+      FillChar(GotPairs[0], PairBytes, $5A);
+      FillChar(GotScales[0], ScaleCount * SizeOf(TNeuralFloat), $5A);
+      Q.CopyRowsAsPairedTransposedTo(0, RowCount,
+        TNeuralByteArrPtr(@GotPairs[0]),
+        TNeuralFloatArrPtr(@GotScales[0]), RowCount);
+      AssertTrue(Tag + ' pairs are byte-identical',
+        CompareByte(GotPairs[0], ExpectedPairs[0], PairBytes) = 0);
+      AssertTrue(Tag + ' scales are byte-identical',
+        CompareByte(GotScales[0], ExpectedScales[0],
+          ScaleCount * SizeOf(TNeuralFloat)) = 0);
+      FillChar(GotPairs[0], PairBytes, $5A);
+      FillChar(GotScales[0], ScaleCount * SizeOf(TNeuralFloat), $5A);
+      SplitRow := (RowCount + 1) div 2 + 3;
+      if SplitRow > RowCount then SplitRow := RowCount;
+      Q.CopyRowsAsPairedTransposedTo(0, SplitRow,
+        TNeuralByteArrPtr(@GotPairs[0]),
+        TNeuralFloatArrPtr(@GotScales[0]), RowCount);
+      Q.CopyRowsAsPairedTransposedTo(SplitRow, RowCount - SplitRow,
+        TNeuralByteArrPtr(@GotPairs[0]), TNeuralFloatArrPtr(@GotScales[0]),
+        RowCount);
+      AssertTrue(Tag + ' two ranges: pairs are byte-identical',
+        CompareByte(GotPairs[0], ExpectedPairs[0], PairBytes) = 0);
+      AssertTrue(Tag + ' two ranges: scales are byte-identical',
+        CompareByte(GotScales[0], ExpectedScales[0],
+          ScaleCount * SizeOf(TNeuralFloat)) = 0);
+    end;
+  finally
+    Q.Free;
   end;
 end;
 

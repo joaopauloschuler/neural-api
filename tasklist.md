@@ -1951,6 +1951,28 @@ rather than acted on.
     - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
           find the extra ~92 s (suspect: the host-side int4 repack loop in
           `PrepareInt4DotCL`, one nested call per weight pair; unverified).
+          Investigated 2026-10-02 (real-shape block, this box): the extra time
+          is the host repack in `PrepareInt4DotCL` (2.4-2.9 s/block, ~76-92 s
+          for 32 blocks; byte-at-a-time writes with a NumAs stride, each on a
+          new cache line). The upload is ~2 s total. A 64-row tiled loop gives
+          byte-identical output ~3.5-4x faster single-threaded. The CPU int4
+          load is slow for a second reason: `QuantizeWeightsInt4` (int8 ->
+          dequantize -> int4, serial, scalar `QuantizeRow` with per-element
+          IsNan/IsInfinite) costs 2.4-3.9 s/block (~80 s). Neuron object
+          construction costs ~0.6-0.8 s/block (also the text encoder).
+      - [x] B1g1. Tiled + threaded repack in PrepareInt4DotCL and the int8
+            transpose in PrepareInt8DotCL (byte-identical layout).
+            DONE: 64-row tiles (TransposeByteTile; TNNetVolumeQuant8
+            .CopyRowsTransposedTo, TNNetVolumeQuant4
+            .CopyRowsAsPairedTransposedTo) fanned by TQuantRowsTransposeFan.
+            Arming one int4 block on PoCL 2.8-4.6 s -> 0.7-1.1 s (32 blocks
+            ~90-145 s -> ~23-36 s, extrapolated). Found: the shared fNTL pool
+            is 1 thread on Linux (FPC 3.2.2 TThread.ProcessorCount = 1), so
+            every fNTL fan runs inline; fix awaits the user's decision.
+      - [ ] B1g2. Quantize to int4 directly in the loader (FP32/BF16 rows ->
+            Q4_0 in the threaded row fan), branch-free QuantizeRow.
+      - [ ] B1g3. Skip creating the four training volumes per neuron in
+            inference-only builds.
     - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
           probe in the session scratchpad, not in the repo). Only 9 of the
           block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);

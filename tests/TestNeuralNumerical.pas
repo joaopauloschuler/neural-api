@@ -593,6 +593,9 @@ type
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
+    // TQuantRowsTransposeFan (the PrepareInt8DotCL / PrepareInt4DotCL repack)
+    // equals the volume methods, inline and split into worker ranges.
+    procedure TestCopyQuantRowsTransposedMatchesVolumeMethods;
     // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
     // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
     // mixture of one MoE block in one kernel, reading the gate|up bank's slot
@@ -69972,6 +69975,97 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+// Host-only, every build. The jobs are driven by hand for 1, 3 and 5 workers,
+// so the range split runs whatever the pool size. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestCopyQuantRowsTransposedMatchesVolumeMethods;
+const
+  cShapes: array[0..3, 0..1] of integer =
+    ((1, 32), (65, 96), (4096, 512), (4096, 2048));
+  cWorkerCounts: array[0..2] of integer = (1, 3, 5);
+var
+  Q8: TNNetVolumeQuant8;
+  Q4: TNNetVolumeQuant4;
+  Fan: TQuantRowsTransposeFan;
+  Got8, Expected8: TInt8DynArr;
+  GotPairs, ExpectedPairs: TNeuralByteDynArr;
+  GotScales, ExpectedScales: TNeuralFloatDynArr;
+  ShapeCnt, RowCount, Depth, i, ScaleCount, WorkerCnt, WorkerCount: integer;
+  Tag: string;
+begin
+  RandSeed := 777;
+  Q8 := TNNetVolumeQuant8.Create();
+  Q4 := TNNetVolumeQuant4.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+    begin
+      RowCount := cShapes[ShapeCnt, 0];
+      Depth := cShapes[ShapeCnt, 1];
+      Q8.ReSize(RowCount, 1, Depth);
+      for i := 0 to Q8.Size - 1 do Q8.FData[i] := ShortInt(Random(256) - 128);
+      SetLength(Expected8, Q8.Size);
+      SetLength(Got8, Q8.Size);
+      Q8.CopyRowsTransposedTo(0, RowCount, TNeuralInt8ArrPtr(@Expected8[0]),
+        RowCount);
+      Q4.ReSize(RowCount, 1, 2 * Depth);
+      for i := 0 to Q4.PackedSize - 1 do Q4.FData[i] := Random(256);
+      for i := 0 to Q4.ScaleData.Size - 1 do
+        Q4.ScaleData.FData[i] := Random - 0.5;
+      ScaleCount := RowCount * Q4.BlocksPerRow;
+      SetLength(ExpectedPairs, Q4.PackedSize);
+      SetLength(GotPairs, Q4.PackedSize);
+      SetLength(ExpectedScales, ScaleCount);
+      SetLength(GotScales, ScaleCount);
+      Q4.CopyRowsAsPairedTransposedTo(0, RowCount,
+        TNeuralByteArrPtr(@ExpectedPairs[0]),
+        TNeuralFloatArrPtr(@ExpectedScales[0]), RowCount);
+      // WorkerCount 0 is the public routine (Run); the others split by hand.
+      for WorkerCnt := -1 to High(cWorkerCounts) do
+      begin
+        if WorkerCnt < 0 then WorkerCount := 0
+        else WorkerCount := cWorkerCounts[WorkerCnt];
+        Tag := IntToStr(RowCount) + 'x' + IntToStr(Depth) + ' workers ' +
+          IntToStr(WorkerCount);
+        FillChar(Got8[0], Q8.Size, $5A);
+        FillChar(GotPairs[0], Q4.PackedSize, $5A);
+        FillChar(GotScales[0], ScaleCount * SizeOf(TNeuralFloat), $5A);
+        if WorkerCount = 0 then
+        begin
+          CopyQuant8RowsTransposed(Q8, RowCount, TNeuralInt8ArrPtr(@Got8[0]));
+          CopyQuant4RowsAsPairedTransposed(Q4, RowCount,
+            TNeuralByteArrPtr(@GotPairs[0]), TNeuralFloatArrPtr(@GotScales[0]));
+        end
+        else
+        begin
+          Fan := TQuantRowsTransposeFan.CreateQuant8(Q8, RowCount,
+            TNeuralInt8ArrPtr(@Got8[0]));
+          try
+            for i := 0 to WorkerCount - 1 do Fan.Quant8Job(i, WorkerCount);
+          finally
+            Fan.Free;
+          end;
+          Fan := TQuantRowsTransposeFan.CreateQuant4(Q4, RowCount,
+            TNeuralByteArrPtr(@GotPairs[0]), TNeuralFloatArrPtr(@GotScales[0]));
+          try
+            for i := 0 to WorkerCount - 1 do Fan.Quant4Job(i, WorkerCount);
+          finally
+            Fan.Free;
+          end;
+        end;
+        AssertTrue(Tag + ' int8 is byte-identical',
+          CompareByte(Got8[0], Expected8[0], Q8.Size) = 0);
+        AssertTrue(Tag + ' int4 pairs are byte-identical',
+          CompareByte(GotPairs[0], ExpectedPairs[0], Q4.PackedSize) = 0);
+        AssertTrue(Tag + ' int4 scales are byte-identical',
+          CompareByte(GotScales[0], ExpectedScales[0],
+            ScaleCount * SizeOf(TNeuralFloat)) = 0);
+      end;
+    end;
+  finally
+    Q4.Free;
+    Q8.Free;
+  end;
+end;
 
 // C runs on owner A's codes (and bias), re-links to owner B and must equal B
 // bit for bit; a differently shaped owner is refused. Coded by Claude (AI).

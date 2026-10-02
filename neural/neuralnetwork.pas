@@ -22842,6 +22842,41 @@ var
   // Coded by Claude (AI).
   function NeuralInt8QuantizableClass(pLayer: TNNetLayer): boolean;
 
+type
+  { TQuantRowsTransposeFan }
+  // Splits a transposed quant-table copy into row ranges over the neuralthread
+  // pool; ranges write disjoint bytes, so the result is the serial one.
+  TQuantRowsTransposeFan = class
+  private
+    FQuant8: TNNetVolumeQuant8;
+    FQuant4: TNNetVolumeQuant4;
+    FRowCount: integer;
+    FCodesDst: Pointer;
+    FScaleDst: TNeuralFloatArrPtr;
+    procedure RowRangeOf(index, threadnum: integer;
+      out FirstRow, RangeRowCount: integer);
+  public
+    constructor CreateQuant8(Q: TNNetVolumeQuant8; RowCount: integer;
+      Dst: TNeuralInt8ArrPtr);
+    constructor CreateQuant4(Q: TNNetVolumeQuant4; RowCount: integer;
+      PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr);
+    // Fans the job over fNTL when the table is large, else runs it inline.
+    procedure Run();
+    // The per-worker jobs (TNeuralProc): rows of range index of threadnum.
+    procedure Quant8Job(index, threadnum: integer);
+    procedure Quant4Job(index, threadnum: integer);
+  end;
+
+  // Q.CopyRowsTransposedTo(0, RowCount, Dst, RowCount), its row ranges fanned
+  // by TQuantRowsTransposeFan. Coded by Claude (AI).
+  procedure CopyQuant8RowsTransposed(Q: TNNetVolumeQuant8; RowCount: integer;
+    Dst: TNeuralInt8ArrPtr);
+  // Q.CopyRowsAsPairedTransposedTo(0, RowCount, PairDst, ScaleDst, RowCount),
+  // fanned the same way. Coded by Claude (AI).
+  procedure CopyQuant4RowsAsPairedTransposed(Q: TNNetVolumeQuant4;
+    RowCount: integer; PairDst: TNeuralByteArrPtr;
+    ScaleDst: TNeuralFloatArrPtr);
+
   {$IFNDEF FPC}
   procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
   {$ENDIF}
@@ -80292,27 +80327,14 @@ end;
 procedure TNNetLayerConcatedWeights.PrepareInt8DotCL(VBs: TNNetVolume);
 var
   Inter: TInt8DynArr;
-  CodesPtr: TNeuralInt8ArrPtr;
-  NumAs, ACnt, ECnt, VSizeM1, NumAsM1, aBase, pos: integer;
+  NumAs: integer;
 begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) then exit;
   if BorrowOwnerOpenCLCodes(VBs) then exit;
-  CodesPtr := FQuantTable.DataPtr;   // #13: one base pointer for the transpose
   SetLength(Inter, NumAs * FQuantVectorSize);
-  VSizeM1 := FQuantVectorSize - 1;
-  NumAsM1 := NumAs - 1;                   // #2: hoist the arithmetic for-bound
-  for ACnt := 0 to NumAsM1 do
-  begin
-    aBase := ACnt * FQuantVectorSize;    // #11: ECnt-invariant source base
-    pos := ACnt;                         // #6: ACnt + ECnt*NumAs carried by +NumAs
-    for ECnt := 0 to VSizeM1 do
-    begin
-      Inter[pos] := CodesPtr^[aBase + ECnt];
-      Inc(pos, NumAs);
-    end;
-  end;
+  CopyQuant8RowsTransposed(FQuantTable, NumAs, @Inter[0]);
   FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs, FFP16Active);
 end;
@@ -80327,48 +80349,16 @@ procedure TNNetLayerConcatedWeights.PrepareInt4DotCL(VBs: TNNetVolume);
 var
   PackedCodes: TNeuralByteDynArr;
   BlockScales: TNeuralFloatDynArr;
-  RowPtr: TNeuralByteArrPtr;
-  ScaleRowPtr: TNeuralFloatArrPtr;
-  NumAs, NumAsM1, ACnt, BlockCnt, MaxBlockPos, ByteCnt: integer;
-  PairPos, ScalePos, RowOfs, LowCode, HighCode: integer;
-  // Biased code of block element Elem (0..31) at RowPtr^[RowOfs..RowOfs+15].
-  function NibbleOfBlock(Elem: integer): integer;
-  begin
-    if Elem < TNNetVolumeQuant4.PackedBlockBytes
-      then Result := RowPtr^[RowOfs + Elem] and 15
-      else Result := RowPtr^[RowOfs + Elem - TNNetVolumeQuant4.PackedBlockBytes] shr 4;
-  end;
+  NumAs: integer;
 begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) or (FQuantTableInt4.Depth <> FQuantVectorSize) then exit;
   if BorrowOwnerOpenCLCodes(VBs) then exit;
-  MaxBlockPos := FQuantTableInt4.BlocksPerRow - 1;
   SetLength(PackedCodes, NumAs * FQuantTableInt4.PackedRowBytes);
   SetLength(BlockScales, NumAs * FQuantTableInt4.BlocksPerRow);
-  NumAsM1 := NumAs - 1;
-  for ACnt := 0 to NumAsM1 do
-  begin
-    RowPtr := FQuantTableInt4.GetRawPtr(ACnt, 0);
-    ScaleRowPtr := FQuantTableInt4.GetScaleRowPtr(ACnt, 0);
-    PairPos := ACnt;                     // ACnt + p*NumAs carried by +NumAs
-    ScalePos := ACnt;
-    RowOfs := 0;
-    for BlockCnt := 0 to MaxBlockPos do
-    begin
-      BlockScales[ScalePos] := ScaleRowPtr^[BlockCnt];
-      Inc(ScalePos, NumAs);
-      // Device pair ByteCnt covers block elements 2*ByteCnt and 2*ByteCnt+1.
-      for ByteCnt := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
-      begin
-        LowCode := NibbleOfBlock(2 * ByteCnt);
-        HighCode := NibbleOfBlock(2 * ByteCnt + 1);
-        PackedCodes[PairPos] := LowCode or (HighCode shl 4);
-        Inc(PairPos, NumAs);
-      end;
-      Inc(RowOfs, TNNetVolumeQuant4.PackedBlockBytes);
-    end;
-  end;
+  CopyQuant4RowsAsPairedTransposed(FQuantTableInt4, NumAs, @PackedCodes[0],
+    @BlockScales[0]);
   FDotCL.PrepareForComputeInt4(@PackedCodes[0], @BlockScales[0], NumAs,
     FQuantVectorSize, VBs);
 end;
@@ -134078,6 +134068,109 @@ begin
   for LayerCnt := 0 to LastLayerIdx do
   begin
     FLayers[LayerCnt].SetTrainable(pTrainable, pLowMemory);
+  end;
+end;
+
+constructor TQuantRowsTransposeFan.CreateQuant8(Q: TNNetVolumeQuant8;
+  RowCount: integer; Dst: TNeuralInt8ArrPtr);
+begin
+  inherited Create();
+  FQuant8 := Q;
+  FRowCount := RowCount;
+  FCodesDst := Dst;
+end;
+
+constructor TQuantRowsTransposeFan.CreateQuant4(Q: TNNetVolumeQuant4;
+  RowCount: integer; PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr);
+begin
+  inherited Create();
+  FQuant4 := Q;
+  FRowCount := RowCount;
+  FCodesDst := PairDst;
+  FScaleDst := ScaleDst;
+end;
+
+procedure TQuantRowsTransposeFan.RowRangeOf(index, threadnum: integer;
+  out FirstRow, RangeRowCount: integer);
+var
+  LastRow: integer;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, FRowCount,
+    FirstRow, LastRow);
+  RangeRowCount := LastRow - FirstRow + 1;
+end;
+
+procedure TQuantRowsTransposeFan.Quant8Job(index, threadnum: integer);
+var
+  FirstRow, RangeRowCount: integer;
+begin
+  RowRangeOf(index, threadnum, FirstRow, RangeRowCount);
+  if RangeRowCount > 0 then
+    FQuant8.CopyRowsTransposedTo(FirstRow, RangeRowCount,
+      TNeuralInt8ArrPtr(FCodesDst), FRowCount);
+end;
+
+procedure TQuantRowsTransposeFan.Quant4Job(index, threadnum: integer);
+var
+  FirstRow, RangeRowCount: integer;
+begin
+  RowRangeOf(index, threadnum, FirstRow, RangeRowCount);
+  if RangeRowCount > 0 then
+    FQuant4.CopyRowsAsPairedTransposedTo(FirstRow, RangeRowCount,
+      TNeuralByteArrPtr(FCodesDst), FScaleDst, FRowCount);
+end;
+
+procedure TQuantRowsTransposeFan.Run();
+const
+  // Below ~8 MB the pool dispatch costs more than the copy saves.
+  cParallelTransposeMinBytes = 8 * 1024 * 1024;
+var
+  Job: TNeuralProc;
+  RowBytes: integer;
+begin
+  if Assigned(FQuant8) then
+  begin
+    Job := {$IFDEF FPC}@Quant8Job{$ELSE}Quant8Job{$ENDIF};
+    RowBytes := FQuant8.Depth;
+  end
+  else
+  begin
+    Job := {$IFDEF FPC}@Quant4Job{$ELSE}Quant4Job{$ENDIF};
+    RowBytes := FQuant4.PackedRowBytes;
+  end;
+  if (Int64(FRowCount) * RowBytes >= cParallelTransposeMinBytes) and
+    (NeuralDefaultThreadCount > 1) then
+  begin
+    CreateNeuralThreadListIfRequired();
+    fNTL.StartProc(Job);
+  end
+  else
+    Job(0, 1);
+end;
+
+procedure CopyQuant8RowsTransposed(Q: TNNetVolumeQuant8; RowCount: integer;
+  Dst: TNeuralInt8ArrPtr);
+var
+  Fan: TQuantRowsTransposeFan;
+begin
+  Fan := TQuantRowsTransposeFan.CreateQuant8(Q, RowCount, Dst);
+  try
+    Fan.Run();
+  finally
+    Fan.Free;
+  end;
+end;
+
+procedure CopyQuant4RowsAsPairedTransposed(Q: TNNetVolumeQuant4;
+  RowCount: integer; PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr);
+var
+  Fan: TQuantRowsTransposeFan;
+begin
+  Fan := TQuantRowsTransposeFan.CreateQuant4(Q, RowCount, PairDst, ScaleDst);
+  try
+    Fan.Run();
+  finally
+    Fan.Free;
   end;
 end;
 

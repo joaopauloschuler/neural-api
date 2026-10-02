@@ -1042,6 +1042,10 @@ type
       // down, leaving the last Count rows stale. Capacity is untouched: this
       // is the rolling-window eviction primitive, not a resize.
       procedure DeleteRows(StartY: integer; Count: integer = 1);
+      // Copies rows [FirstRow, FirstRow + RowCount) transposed: code d of row r
+      // goes to Dst[r + d * DstColStride], written in contiguous row-tile runs.
+      procedure CopyRowsTransposedTo(FirstRow, RowCount: integer;
+        Dst: TNeuralInt8ArrPtr; DstColStride: integer);
       // Plain copies of both planes, for callers that export or serialize.
       procedure GetQuantData(out pCodes: TInt8DynArr; out pScales: TNeuralFloatDynArr);
       function GetMemSize(): int64;
@@ -1107,6 +1111,11 @@ type
       // Copies one Q4_0 row (BlocksPerRow x 16 packed bytes) and its block
       // scales from the caller's buffers; the loader's direct path.
       procedure ImportPackedRow(x, y: integer; PackedSrc: TNeuralByteArrPtr; Scales: TNeuralFloatArrPtr);
+      // As CopyRowsTransposedTo, blocks re-paired (byte p: elements 2p, 2p+1);
+      // scale b of row r goes to ScaleDst[r + b * DstColStride].
+      procedure CopyRowsAsPairedTransposedTo(FirstRow, RowCount: integer;
+        PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr;
+        DstColStride: integer);
       procedure DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
       // Expands every row into Dest, resized to (SizeX, SizeY, Depth). Leaves
       // Dest untouched when this volume is empty.
@@ -20195,6 +20204,51 @@ begin
     MoveRows * RowScales * csNeuralFloatSize);
 end;
 
+const
+  // Rows per tile of the transposed quant-row copies: the tile's source lines
+  // stay cached while each transposed column receives one contiguous run.
+  csTransposeTileRows = 64;
+
+// Dst^[c * DstColStride + r] := Src^[r * SrcRowStride + c] for r < RowCount and
+// c < ColCount. Coded by Claude (AI).
+procedure TransposeByteTile(Src: TNeuralByteArrPtr; SrcRowStride: integer;
+  Dst: TNeuralByteArrPtr; DstColStride, RowCount, ColCount: integer);
+var
+  RowCnt, ColCnt, MaxRowPos, MaxColPos, SrcPos, DstPos: integer;
+begin
+  MaxRowPos := RowCount - 1;
+  MaxColPos := ColCount - 1;
+  DstPos := 0;
+  for ColCnt := 0 to MaxColPos do
+  begin
+    SrcPos := ColCnt;
+    for RowCnt := 0 to MaxRowPos do
+    begin
+      Dst^[DstPos + RowCnt] := Src^[SrcPos];
+      Inc(SrcPos, SrcRowStride);
+    end;
+    Inc(DstPos, DstColStride);
+  end;
+end;
+
+procedure TNNetVolumeQuant8.CopyRowsTransposedTo(FirstRow, RowCount: integer;
+  Dst: TNeuralInt8ArrPtr; DstColStride: integer);
+var
+  TileRow, EndRow, TileRowCount: integer;
+begin
+  TileRow := FirstRow;
+  EndRow := FirstRow + RowCount;
+  while TileRow < EndRow do
+  begin
+    TileRowCount := EndRow - TileRow;
+    if TileRowCount > csTransposeTileRows then
+      TileRowCount := csTransposeTileRows;
+    TransposeByteTile(TNeuralByteArrPtr(@FDataPtr^[TileRow * FDepth]), FDepth,
+      TNeuralByteArrPtr(@Dst^[TileRow]), DstColStride, TileRowCount, FDepth);
+    Inc(TileRow, TileRowCount);
+  end;
+end;
+
 procedure TNNetVolumeQuant8.GetQuantData(out pCodes: TInt8DynArr;
   out pScales: TNeuralFloatDynArr);
 var
@@ -20380,6 +20434,61 @@ procedure TNNetVolumeQuant4.ImportPackedRow(x, y: integer;
 begin
   Move(PackedSrc^[0], GetRawPtr(x, y)^[0], FPackedRowBytes);
   Move(Scales^[0], GetScaleRowPtr(x, y)^[0], FBlocksPerRow * csNeuralFloatSize);
+end;
+
+procedure TNNetVolumeQuant4.CopyRowsAsPairedTransposedTo(FirstRow,
+  RowCount: integer; PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr;
+  DstColStride: integer);
+const
+  HalfBlockBytes = PackedBlockBytes div 2;
+var
+  PairTile: array[0..csTransposeTileRows * PackedBlockBytes - 1] of byte;
+  TileRow, EndRow, TileRowCount, MaxTileRowPos, RowCnt: integer;
+  BlockCnt, MaxBlockPos: integer;
+  PairCnt, SrcPos, TilePos, ScalePos, ScaleDstPos, PairDstPos: integer;
+  EvenByte, OddByte: byte;
+begin
+  MaxBlockPos := FBlocksPerRow - 1;
+  TileRow := FirstRow;
+  EndRow := FirstRow + RowCount;
+  while TileRow < EndRow do
+  begin
+    TileRowCount := EndRow - TileRow;
+    if TileRowCount > csTransposeTileRows then
+      TileRowCount := csTransposeTileRows;
+    MaxTileRowPos := TileRowCount - 1;
+    ScaleDstPos := TileRow;
+    PairDstPos := TileRow;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      SrcPos := TileRow * FPackedRowBytes + BlockCnt * PackedBlockBytes;
+      ScalePos := TileRow * FBlocksPerRow + BlockCnt;
+      TilePos := 0;
+      for RowCnt := 0 to MaxTileRowPos do
+      begin
+        // Q4_0 keeps elements j (low nibble) and j+16 (high) in byte j.
+        for PairCnt := 0 to HalfBlockBytes - 1 do
+        begin
+          EvenByte := FDataPtr^[SrcPos + 2 * PairCnt];
+          OddByte := FDataPtr^[SrcPos + 2 * PairCnt + 1];
+          PairTile[TilePos + PairCnt] :=
+            (EvenByte and 15) or ((OddByte and 15) shl 4);
+          PairTile[TilePos + HalfBlockBytes + PairCnt] :=
+            (EvenByte shr 4) or (OddByte and $F0);
+        end;
+        ScaleDst^[ScaleDstPos + RowCnt] := FScaleData.FDataPtr^[ScalePos];
+        Inc(SrcPos, FPackedRowBytes);
+        Inc(TilePos, PackedBlockBytes);
+        Inc(ScalePos, FBlocksPerRow);
+      end;
+      TransposeByteTile(TNeuralByteArrPtr(@PairTile[0]), PackedBlockBytes,
+        TNeuralByteArrPtr(@PairDst^[PairDstPos]), DstColStride, TileRowCount,
+        PackedBlockBytes);
+      Inc(ScaleDstPos, DstColStride);
+      Inc(PairDstPos, PackedBlockBytes * DstColStride);
+    end;
+    Inc(TileRow, TileRowCount);
+  end;
 end;
 
 procedure TNNetVolumeQuant4.DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
