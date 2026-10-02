@@ -9065,8 +9065,8 @@ type
     property Int8Input: boolean read FInt8Input write FInt8Input;
     property TextEncoderInt8: boolean read FTextEncoderInt8
       write FTextEncoderInt8;
-    // VAE tile in pixels (multiples of 16); default 128/96 keeps a real-size
-    // tile's activations near 2.3 GB.
+    // VAE tile in pixels (multiples of 16); default 256/192 (diffusers'
+    // enable_tiling) hides tile seams; ~10.7 GB of layer buffers live.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
     property VaeTileStride: integer read FVaeTileStride write FVaeTileStride;
     // Every component runs the parallel layer scheduler with intra-layer
@@ -82872,8 +82872,8 @@ begin
   FTransformerConfig := ReadQwenImage21TransformerConfig(
     ComponentFolder('transformer') + 'config.json');
   FTransformerFormat := qiwFP32;
-  FVaeTileSize := 128;
-  FVaeTileStride := 96;
+  FVaeTileSize := 256;
+  FVaeTileStride := 192;
   FParallel := true;
   FMaxThreads := 0;
 end;

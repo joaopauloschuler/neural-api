@@ -173,7 +173,7 @@ begin
   WriteLn('  --int8-input         int8 activations into the transformer''s ',
     'int8/int4 projections (needs --int8 or --int4)');
   WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
-    'of 16 (default 128,96)');
+    'of 16 (default 256,192)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
     'the parallel layer scheduler with intra-layer threading)');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
@@ -283,8 +283,8 @@ begin
   UseSerial := false;
   UseProfile := false;
   MaxThreads := 0;
-  VaeTileSize := 128;
-  VaeTileStride := 96;
+  VaeTileSize := 256;
+  VaeTileStride := 192;
   UseOpenCL := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
   OpenCLPlatform := 0;
   OpenCLDevice := 0;
