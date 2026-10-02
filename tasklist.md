@@ -1948,7 +1948,7 @@ rather than acted on.
           (OutProj 13.7 ms/block, ~10 TFLOPS). Image-in net 1.16 s/step on the
           CPU for ~2 GFLOP (odd; look later). Order chosen: B1d2 -> B1d3 ->
           B1d4, then B2 (VAE 519 s), then the B1c deferred attention items.
-    - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
+    - [x] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
           find the extra ~92 s (suspect: the host-side int4 repack loop in
           `PrepareInt4DotCL`, one nested call per weight pair; unverified).
           Investigated 2026-10-02 (real-shape block, this box): the extra time
@@ -1980,8 +1980,16 @@ rather than acted on.
             Follow-up:
             - [ ] ChatTerminal / LLM --int4 still go int8 -> int4; switching
                   needs a check of the window/borrowing twin builds.
-      - [ ] B1g3. Skip creating the four training volumes per neuron in
+      - [x] B1g3. Skip creating the four training volumes per neuron in
             inference-only builds.
+            DONE differently: the cost was TVolume's per-volume TFormatSettings
+            copy (~45 managed strings per constructor/destructor), not the
+            training volumes. The field is gone (TNNetVolume 432 -> 56 bytes);
+            formatting reads GetDefaultNumericFormat at conversion time.
+            Neuron Create+Free 12.4 -> ~1.1 us; real-shape block build median
+            ~830 -> ~170 ms (~21 s per 32-block transformer load; text encoder
+            ~15 s, extrapolated). Skipping the training volumes would now save
+            only ~0.7 s per load (not done).
     - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
           probe in the session scratchpad, not in the repo). Only 9 of the
           block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);

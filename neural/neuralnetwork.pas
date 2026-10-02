@@ -235,9 +235,9 @@ type
       procedure LoadFromString(strData: string);
       procedure ClearDelta; {$IFDEF Release} inline; {$ENDIF}
       // Frees the training-only volumes (Delta/BackInertia and their Adam
-      // siblings) - the OBJECTS are freed and the fields set nil, since even
-      // an empty TNNetVolume costs ~0.5KB and million-neuron LLMs pay
-      // gigabytes for four of them per neuron. INFERENCE-ONLY CONTRACT:
+      // siblings) - the OBJECTS are freed and the fields set nil, since each
+      // empty TNNetVolume is still two heap blocks and million-neuron LLMs
+      // pay for four of them per neuron. INFERENCE-ONLY CONTRACT:
       // after this call only Compute() is valid - Backpropagate/
       // UpdateWeights would dereference the nil training buffers. The weight
       // initializers and InitAdam do NOT restore the buffers (they skip the
@@ -138998,11 +138998,11 @@ begin
   Result := Self;
   if not pTrainable then
   begin
-    // FREE the training volumes outright (not just shrink to (1,1,1)): a
-    // TNNetVolume instance costs ~0.5KB even when empty (object header +
-    // embedded TFormatSettings + dynarray bookkeeping), and a
-    // billion-parameter LLM carries over a million neurons - four dormant
-    // volumes each is gigabytes of pure structure. All four are freed and
+    // FREE the training volumes outright (not just shrink to (1,1,1)): an
+    // empty TNNetVolume is still two heap blocks (the object and a
+    // one-element dynarray), and a billion-parameter LLM carries over a
+    // million neurons - four dormant volumes each is pure overhead in both
+    // memory and construction time. All four are freed and
     // recreated together, so a single nil test (FDelta = nil) identifies an
     // inference-only neuron everywhere.
     FreeAndNil(FDelta);

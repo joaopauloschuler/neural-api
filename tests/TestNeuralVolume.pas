@@ -16,6 +16,7 @@ type
     procedure TestVolumeAddSub;
     procedure TestVolumeCopy;
     procedure TestVolumeSaveLoad;
+    procedure TestVolumeSaveLoadIgnoresLocaleSeparator;
     // New comprehensive tests
     procedure TestVolumeMul;
     procedure TestVolumeDiv;
@@ -239,6 +240,39 @@ begin
     V2.LoadFromString(SavedStr);
     AssertEquals('Loaded volume should match saved', 0.0, V1.SumDiff(V2), 0.0001);
   finally
+    V1.Free;
+    V2.Free;
+  end;
+end;
+
+// SaveToString/LoadFromString/FormatSettings always use '.', whatever
+// DefaultFormatSettings says at the time of the call.
+procedure TTestNeuralVolume.TestVolumeSaveLoadIgnoresLocaleSeparator;
+var
+  V1, V2: TNNetVolume;
+  SavedStr: string;
+  OldDecimalSeparator, OldThousandSeparator: char;
+begin
+  OldDecimalSeparator := DefaultFormatSettings.DecimalSeparator;
+  OldThousandSeparator := DefaultFormatSettings.ThousandSeparator;
+  V1 := TNNetVolume.Create(3, 1, 1);
+  V2 := TNNetVolume.Create(1, 1, 1);
+  try
+    DefaultFormatSettings.DecimalSeparator := ',';
+    DefaultFormatSettings.ThousandSeparator := ' ';
+    V1.FData[0] := 0.5;
+    V1.FData[1] := -1.25;
+    V1.FData[2] := 3;
+    SavedStr := V1.SaveToString();
+    AssertTrue('decimal point expected in ' + SavedStr, Pos('0.5', SavedStr) > 0);
+    AssertEquals('FormatSettings separator', '.', V1.FormatSettings.DecimalSeparator);
+    AssertEquals('NeuralToStr', '-1.25', V1.NeuralToStr(V1.FData[1]));
+    V2.LoadFromString(SavedStr);
+    AssertEquals('round trip size', 3, V2.Size);
+    AssertEquals('round trip', 0.0, V1.SumDiff(V2), 0.0);
+  finally
+    DefaultFormatSettings.DecimalSeparator := OldDecimalSeparator;
+    DefaultFormatSettings.ThousandSeparator := OldThousandSeparator;
     V1.Free;
     V2.Free;
   end;

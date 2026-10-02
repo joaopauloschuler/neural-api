@@ -140,9 +140,11 @@ type
     FSizeY: integer;
     FDepth: integer;
     FTag: array[0..1] of integer;
-    FFormatSettings: TFormatSettings;
     FLastPos: integer;
     function GetTag: integer; {$IFDEF Release} inline; {$ENDIF}
+    // GetDefaultNumericFormat, built per call: a TFormatSettings field would
+    // cost every volume ~1.8 us (create + free) and 376 bytes.
+    function GetFormatSettings: TFormatSettings;
     procedure SetTag(I: integer); {$IFDEF Release} inline; {$ENDIF}
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTags(x: integer; AValue: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -421,7 +423,7 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property Depth: integer read FDepth;
-    property FormatSettings: TFormatSettings read FFormatSettings;
+    property FormatSettings: TFormatSettings read GetFormatSettings;
   end;
 
   TNNetToken = record
@@ -7648,8 +7650,10 @@ function TNNetDictionary.VolumeToString(Volume: TNNetVolume;
 var
   I: integer;
   vHigh: integer;
+  NumericFormat: TFormatSettings;
 begin
   FTokenizer.Text := '';
+  NumericFormat := GetDefaultNumericFormat;
   if Length(Volume.FData) > 0 then
   begin
     vHigh := High(Volume.FData);
@@ -7659,7 +7663,7 @@ begin
       begin
         if Volume.FData[I] > Threshold then
         begin
-          FTokenizer.Add(Self[I]+':'+Volume.NeuralToStr(Volume.FData[I]));
+          FTokenizer.Add(Self[I]+':'+FloatToStr(Volume.FData[I], NumericFormat));
         end;
       end;
     end;
@@ -8412,6 +8416,11 @@ begin
   FTag[0] := I;
 end;
 
+function TVolume.GetFormatSettings: TFormatSettings;
+begin
+  Result := GetDefaultNumericFormat;
+end;
+
 function TVolume.GetTag: integer;
 begin
   GetTag := FTag[0];
@@ -8426,8 +8435,6 @@ begin
   ReSize(pSizeX, pSizeY, pDepth);
   Fill(c);
   ClearTag();
-
-  FFormatSettings := GetDefaultNumericFormat;
 end;
 
 constructor TVolume.Create(pInput: array of T);
@@ -10941,7 +10948,7 @@ end;
 
 function TVolume.NeuralToStr(V: TNeuralFloat): string;
 begin
-  Result := FloatToStr(V, FFormatSettings);
+  Result := FloatToStr(V, GetDefaultNumericFormat);
 end;
 
 procedure TVolume.LoadNonZeroPosIntoTIntegerList(Ints: TIntegerList;
@@ -12980,8 +12987,10 @@ var
   I, Hi, Lo: integer;
   version: integer;
   AuxFloat: Single;
+  NumericFormat: TFormatSettings;
 begin
   version := 1;
+  NumericFormat := GetDefaultNumericFormat;
   S := CreateTokenizedStringList(';');
   S.SetCapacity(FSize+10);
   S.Add( IntToStr(version) );
@@ -12994,7 +13003,7 @@ begin
   for I := Lo to Hi do
   begin
     AuxFloat := FData[I];
-    S.Add( FloatToStr(AuxFloat, FFormatSettings) );
+    S.Add( FloatToStr(AuxFloat, NumericFormat) );
   end;
 
   Result := S.GetDelimitedTextFast();
@@ -13009,8 +13018,10 @@ var
   pSizeX, pSizeY, pDepth: integer;
   I, SCountMax: integer;
   AuxFloat: Single;
+  NumericFormat: TFormatSettings;
 begin
   //version := 1;
+  NumericFormat := GetDefaultNumericFormat;
   S := CreateTokenizedStringList(strData,';');
 
   //version := StrToInt(S[0]);
@@ -13039,7 +13050,7 @@ begin
     SCountMax := S.Count-1;
     for I := 4 to SCountMax do
     begin
-      AuxFloat := StrToFloat(S[I], FFormatSettings);
+      AuxFloat := StrToFloat(S[I], NumericFormat);
       FData[I-4] := AuxFloat;
     end;
   end;
