@@ -797,6 +797,9 @@ type
     procedure TestQwen3VLEncodeRefusesOutOfVocabIds;
     procedure TestQwenImage21ParallelMatchesSerial;
     procedure TestQwenImage21PipelineOpenCL;
+    procedure TestQwenImage21PipelineKeepLoaded;
+    procedure TestQwenImage21PipelineUnloadComponents;
+    procedure TestQwenImage21PipelineOpenCLKeepLoaded;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -29769,6 +29772,293 @@ begin
     Embeds.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Two prompts of different lengths and two image sizes through one loaded
+// pipeline (VAE tiled) equal two one-shot runs bit for bit, loading nothing,
+// with an FP32 and an int8 text encoder. A failed encode and a failed denoise
+// in between leave the loaded pipeline usable.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineKeepLoaded;
+const
+  TokenIdsA: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  TokenIdsB: array[0..16] of integer = (11, 48, 85, 122, 159, 23, 60, 97,
+    134, 171, 208, 245, 282, 19, 56, 93, 130);
+  OutOfVocabIds: array[0..6] of integer = (11, 48, 85, 122, 159, 300, 7);
+  DropCount = 5;
+  StepCount = 2;
+var
+  OneShot, Loaded: TQwenImage21Pipeline;
+  EmbedsOneShot, EmbedsLoaded, ImageOneShot, ImageLoaded,
+    WrongLatents: TNNetVolume;
+  TextEncoderWeights: TNNet;
+  LoadedTransformer: TQwenImage21Transformer;
+  LoadedVaeDecoder: TQwenImage21VaeDecoder;
+  PhasePos, ConfigPos: integer;
+  Refused: boolean;
+  What: string;
+
+  procedure RunImage(Pipeline: TQwenImage21Pipeline;
+    const TokenIds: array of integer; Width, Height: integer; Seed: cardinal;
+    Embeds, Image: TNNetVolume);
+  begin
+    Pipeline.EncodeTokenIds(TokenIds, DropCount, Embeds);
+    Pipeline.GenerateFromEmbeds(Embeds, Width, Height, StepCount, Seed, Image);
+  end;
+
+  procedure CompareImages(const Image: string);
+  begin
+    AssertEquals(What + Image + ' prompt embeds', 0,
+      MaxAbsVolumeDiff(EmbedsLoaded, EmbedsOneShot), 0);
+    AssertEquals(What + Image + ' width', ImageOneShot.SizeX,
+      ImageLoaded.SizeX);
+    AssertEquals(What + Image + ' height', ImageOneShot.SizeY,
+      ImageLoaded.SizeY);
+    AssertEquals(What + Image + ' image', 0,
+      MaxAbsVolumeDiff(ImageLoaded, ImageOneShot), 0);
+  end;
+
+  function NewPipeline(TextEncoderInt8: boolean): TQwenImage21Pipeline;
+  begin
+    Result := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Result.TransformerFormat := qiwInt8;
+    Result.TextEncoderInt8 := TextEncoderInt8;
+    Result.VaeTileSize := 32;
+    Result.VaeTileStride := 16;
+  end;
+
+begin
+  OneShot := nil;
+  Loaded := nil;
+  EmbedsOneShot := TNNetVolume.Create;
+  EmbedsLoaded := TNNetVolume.Create;
+  ImageOneShot := TNNetVolume.Create;
+  ImageLoaded := TNNetVolume.Create;
+  WrongLatents := TNNetVolume.Create(3, 1, 16);
+  try
+    for ConfigPos := 0 to 1 do
+    begin
+      What := 'text encoder int8 = ' + BoolToStr(ConfigPos = 1, true) + ': ';
+      OneShot := NewPipeline(ConfigPos = 1);
+      Loaded := NewPipeline(ConfigPos = 1);
+      SetLength(FQwenImage21Phases, 0);
+      Loaded.OnPhase := @RecordQwenImage21Phase;
+      Loaded.LoadComponents();
+      AssertTrue(What + 'loaded', Loaded.ComponentsLoaded);
+      AssertEquals(What + 'load phases', 4, Length(FQwenImage21Phases));
+      AssertTrue(What + 'load phase order',
+        (FQwenImage21Phases[0] = qppLoadTextEncoder) and
+        (FQwenImage21Phases[1] = qppLoadTransformer) and
+        (FQwenImage21Phases[2] = qppLoadVae) and
+        (FQwenImage21Phases[3] = qppDone));
+      SetLength(FQwenImage21Phases, 0);
+      TextEncoderWeights := Loaded.LoadedTextEncoderWeights;
+      LoadedTransformer := Loaded.LoadedTransformer;
+      LoadedVaeDecoder := Loaded.LoadedVaeDecoder;
+
+      RunImage(OneShot, TokenIdsA, 64, 64, 1, EmbedsOneShot, ImageOneShot);
+      RunImage(Loaded, TokenIdsA, 64, 64, 1, EmbedsLoaded, ImageLoaded);
+      CompareImages('first image (64x64)');
+      RunImage(OneShot, TokenIdsB, 32, 64, 2, EmbedsOneShot, ImageOneShot);
+      RunImage(Loaded, TokenIdsB, 32, 64, 2, EmbedsLoaded, ImageLoaded);
+      CompareImages('second image (32x64, longer prompt)');
+      for PhasePos := 0 to High(FQwenImage21Phases) do
+        AssertFalse(What + 'no load phase per image (phase ' +
+          IntToStr(PhasePos) + ')', FQwenImage21Phases[PhasePos] in
+          [qppLoadTextEncoder, qppLoadTransformer, qppLoadVae]);
+      AssertEquals(What + 'phases of two images', 10,
+        Length(FQwenImage21Phases));
+
+      Refused := false;
+      try
+        Loaded.EncodeTokenIds(OutOfVocabIds, DropCount, EmbedsLoaded);
+      except
+        on EPretrainedImportError do Refused := true;
+      end;
+      AssertTrue(What + 'an out-of-vocabulary id is refused', Refused);
+      // Latents that do not form the 64x64 grid fail inside the step pass.
+      Refused := false;
+      try
+        Loaded.GenerateFromEmbeds(EmbedsOneShot, 64, 64, StepCount, 1,
+          ImageLoaded, WrongLatents);
+      except
+        on Exception do Refused := true;
+      end;
+      AssertTrue(What + 'wrong-size latents are refused', Refused);
+      AssertTrue(What + 'the failed step pass was released',
+        Loaded.LoadedTransformer.StepNet = nil);
+      RunImage(OneShot, TokenIdsA, 32, 64, 3, EmbedsOneShot, ImageOneShot);
+      RunImage(Loaded, TokenIdsA, 32, 64, 3, EmbedsLoaded, ImageLoaded);
+      CompareImages('image after the two failures');
+      AssertTrue(What + 'the loaded components were kept',
+        (Loaded.LoadedTextEncoderWeights = TextEncoderWeights) and
+        (Loaded.LoadedTransformer = LoadedTransformer) and
+        (Loaded.LoadedVaeDecoder = LoadedVaeDecoder));
+      FreeAndNil(Loaded);
+      FreeAndNil(OneShot);
+    end;
+  finally
+    Loaded.Free;
+    OneShot.Free;
+    WrongLatents.Free;
+    ImageLoaded.Free;
+    ImageOneShot.Free;
+    EmbedsLoaded.Free;
+    EmbedsOneShot.Free;
+  end;
+end;
+
+// LoadComponents keeps the weights only: after an image the per-image nets are
+// gone; settings that need a reload are refused; UnloadComponents frees the
+// weights and the stages load them again.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineUnloadComponents;
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+var
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, Image: TNNetVolume;
+  Refused: boolean;
+begin
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    AssertFalse('not loaded after Create', Pipeline.ComponentsLoaded);
+    AssertTrue('no components after Create',
+      (Pipeline.LoadedTextEncoderWeights = nil) and
+      (Pipeline.LoadedTransformer = nil) and
+      (Pipeline.LoadedVaeDecoder = nil));
+    Pipeline.LoadComponents();
+    AssertTrue('every component loaded',
+      Assigned(Pipeline.LoadedTextEncoderWeights) and
+      Assigned(Pipeline.LoadedTransformer) and
+      Assigned(Pipeline.LoadedVaeDecoder));
+    AssertEquals('text encoder weights in a 1-token net', 1,
+      Pipeline.LoadedTextEncoderWeights.GetFirstLayer().Output.SizeX);
+    Pipeline.EncodeTokenIds(TokenIds, 5, Embeds);
+    Pipeline.GenerateFromEmbeds(Embeds, 64, 64, 2, 1, Image);
+    AssertTrue('the transformer passes are freed after the image',
+      (Pipeline.LoadedTransformer.PrefixNet = nil) and
+      (Pipeline.LoadedTransformer.StepNet = nil) and
+      (Pipeline.LoadedTransformer.PrefixLength = 0));
+    AssertTrue('the VAE net is freed after the image',
+      Pipeline.LoadedVaeDecoder.Net = nil);
+    AssertTrue('the weights stay',
+      Pipeline.LoadedTransformer.BlockStore[0].CountWeights() > 0);
+    Refused := false;
+    try
+      Pipeline.TransformerFormat := qiwInt8;
+    except
+      Refused := true;
+    end;
+    AssertTrue('a new TransformerFormat is refused while loaded', Refused);
+    Refused := false;
+    try
+      Pipeline.TextEncoderInt8 := true;
+    except
+      Refused := true;
+    end;
+    AssertTrue('a new TextEncoderInt8 is refused while loaded', Refused);
+    Pipeline.Int8Input := false;
+    Pipeline.UnloadComponents();
+    AssertFalse('not loaded after UnloadComponents',
+      Pipeline.ComponentsLoaded);
+    AssertTrue('every component freed',
+      (Pipeline.LoadedTextEncoderWeights = nil) and
+      (Pipeline.LoadedTransformer = nil) and
+      (Pipeline.LoadedVaeDecoder = nil));
+    SetLength(FQwenImage21Phases, 0);
+    Pipeline.OnPhase := @RecordQwenImage21Phase;
+    Pipeline.EncodeTokenIds(TokenIds, 5, Embeds);
+    Pipeline.GenerateFromEmbeds(Embeds, 64, 64, 2, 1, Image);
+    AssertEquals('one-shot phases again', 8, Length(FQwenImage21Phases));
+    AssertTrue('the one-shot run loads the text encoder',
+      FQwenImage21Phases[0] = qppLoadTextEncoder);
+    AssertTrue('nothing stays loaded', Pipeline.LoadedTransformer = nil);
+  finally
+    Pipeline.Free;
+    Image.Free;
+    Embeds.Free;
+  end;
+end;
+
+// Keep-loaded with the step pass (int8) and the VAE on OpenCL: two images of
+// two sizes match one-shot OpenCL runs (TestQwenImage21PipelineOpenCL's 1e-4).
+procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCLKeepLoaded;
+{$IFDEF OpenCL}
+const
+  TokenIdsA: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  TokenIdsB: array[0..16] of integer = (11, 48, 85, 122, 159, 23, 60, 97,
+    134, 171, 208, 245, 282, 19, 56, 93, 130);
+var
+  OneShot, Loaded: TQwenImage21Pipeline;
+  Embeds, ImageOneShot, ImageLoaded: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function NewPipeline(): TQwenImage21Pipeline;
+  begin
+    Result := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Result.TransformerFormat := qiwInt8;
+    Result.EnableOpenCL(PlatformId, DeviceId);
+  end;
+
+  procedure CompareImage(const TokenIds: array of integer;
+    Width, Height: integer; const What: string);
+  var
+    Diff: double;
+  begin
+    OneShot.EncodeTokenIds(TokenIds, 5, Embeds);
+    OneShot.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageOneShot);
+    Loaded.EncodeTokenIds(TokenIds, 5, Embeds);
+    Loaded.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageLoaded);
+    AssertEquals(What + ' width', ImageOneShot.SizeX, ImageLoaded.SizeX);
+    Diff := MaxAbsVolumeDiff(ImageLoaded, ImageOneShot);
+    WriteLn('  Qwen-Image-2.1 keep-loaded vs one-shot on OpenCL, ', What,
+      ': max|diff|=', Diff:0:9);
+    AssertTrue(What + ' max|diff| ' + FloatToStr(Diff) + ' must be < 1e-4',
+      Diff < 1e-4);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  OneShot := nil;
+  Loaded := nil;
+  Embeds := TNNetVolume.Create;
+  ImageOneShot := TNNetVolume.Create;
+  ImageLoaded := TNNetVolume.Create;
+  try
+    OneShot := NewPipeline();
+    Loaded := NewPipeline();
+    Loaded.LoadComponents();
+    AssertTrue('loaded transformer on OpenCL', Loaded.TransformerOnOpenCL);
+    AssertTrue('loaded VAE on OpenCL', Loaded.VaeOnOpenCL);
+    CompareImage(TokenIdsA, 64, 64, 'first image (64x64)');
+    CompareImage(TokenIdsB, 32, 64, 'second image (32x64)');
+    AssertTrue('the step pass stayed on OpenCL',
+      Loaded.TransformerOnOpenCL and Loaded.VaeOnOpenCL);
+  finally
+    Loaded.Free;
+    OneShot.Free;
+    ImageLoaded.Free;
+    ImageOneShot.Free;
+    Embeds.Free;
   end;
 end;
 {$ELSE}

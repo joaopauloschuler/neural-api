@@ -2046,7 +2046,7 @@ rather than acted on.
         Build line and binary path: `cd examples/QwenImage && lazbuild -B QwenImage.lpi`
         writes `bin/x86_64-linux/bin/QwenImage` at the REPO ROOT (the A7 report gave a
         path inside `examples/QwenImage`, which is wrong).
-  - [ ] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
+  - [x] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
         `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
         today's load-and-free order). The text encoder is built once for a maximum
         prompt length (padding is exact, A2); prefix/step/VAE nets are rebuilt per
@@ -2063,6 +2063,26 @@ rather than acted on.
         resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
         Removes the per-image loads measured on the first real run: text encoder
         49-67 s, transformer 64 s int8 / 148 s int4.
+        DONE: `LoadComponents` / `UnloadComponents` / `ComponentsLoaded` and the
+        `Loaded*` properties; the text encoder keeps a 1-token weight owner and
+        builds a borrowing twin per prompt (bit-identical to one-shot, no length
+        cap) instead of a max-length net; the tokenizer stays loaded;
+        `TQwenImage21Transformer.ReleasePasses` frees the per-image nets and the
+        prefix K/V; format/int8/OpenCL settings refuse changes while loaded. REPL
+        numbers outputs past existing files, `.png` when the base has none,
+        prints the prompt per image, sides 32..8192. Tests
+        `TestQwenImage21PipelineKeepLoaded` (FP32 + int8 encoder, recovery after
+        a failed image), `...UnloadComponents`, `...OpenCLKeepLoaded`. Computed resident memory at
+        1024x1024 int4 during the VAE decode: ~16 GB OpenCL (transformer codes
+        ~4.4 + VAE weights 1 + 256-px tile buffers ~10.7), ~24-26 GB host; int8
+        ~18.7 GB OpenCL (tight on a 24 GB L4; `/tile 128` lowers it). Unmeasured.
+        Follow-ups:
+        - [ ] OpenCL errors only print (`FErrorProc`); nothing lets the pipeline
+              detect a failed allocation, so a REPL image can be wrong yet
+              reported as written. Needs a counting error hook on the armed nets.
+        - [ ] `--steps 1` raises EInvalidOp in
+              `TNNetFlowMatchEulerScheduler.SetSigmas` (shift_terminal stretch
+              divides 0/0; diffusers yields NaN). One-shot too.
   Phase B — speed (after a first real measurement on the GPU box):
   - [ ] B1. OpenCL for the transformer step pass. Int4 is required; int8 comes along
         with it (the tiled OpenCL kernels share one layout). The text encoder and

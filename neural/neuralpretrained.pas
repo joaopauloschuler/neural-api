@@ -8615,11 +8615,12 @@ type
 // ReadLlamaConfigFromJSONFile plus the wrapper's image/video token ids.
 function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
 
-// Builds the Qwen3-VL text decoder WITHOUT the final RMSNorm and LM head: input
-// (pSeqLen,1,1) token ids, output (pSeqLen,1,hidden) = last block before norm.
+// Qwen3-VL text decoder without final RMSNorm and LM head: (pSeqLen,1,1) ids
+// in, (pSeqLen,1,hidden) out. pWeightOwner (same config): borrow, load nothing.
 function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
   out Config: TQwen3VLConfig; pSeqLen: integer;
-  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = '';
+  pWeightOwner: TNNet = nil): TNNet;
 
 // Runs Encoder on TokenIds (right-padded to its SeqLen; causal, so rows stay
 // exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
@@ -8813,6 +8814,9 @@ type
     procedure ComputeModulation(Timestep: TNeuralFloat);
     // (Re)builds StepNet for a GridH x GridW image; needs EncodePrefix first.
     procedure PrepareStepPass(GridH, GridW: integer);
+    // Frees the prefix and step passes with their activations and the prefix
+    // K/V (RAM and OpenCL); the block weights stay. Next: EncodePrefix.
+    procedure ReleasePasses();
     // Re-links NN's (PrefixNet or StepNet) block to block BlockIdx's weights.
     // Raises when a layer refuses; NN then mixes blocks and must be rebuilt.
     procedure SelectBlockWeights(NN: TNNet; BlockIdx: integer);
@@ -8888,6 +8892,11 @@ function BuildQwenImage21VaeDecoderNet(NN: TNNet;
 function LoadQwenImage21VaeDecoderWeights(Reader: TNNetSafeTensorsReader;
   const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
 
+// '' when TileSampleSize and TileSampleStride suit DecodeTiled on a VAE with
+// this SpatialScale (pixels per latent); otherwise the reason.
+function QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
+  SpatialScale: integer): string;
+
 type
   // Qwen-Image-2.1 VAE decoder (diffusers AutoencoderKLQwenImage21.decode for
   // one image). WeightOwner is a 1x1-latent net holding the weights; Net is the
@@ -8953,6 +8962,8 @@ type
     property LayerProfiling: boolean read FLayerProfiling
       write FLayerProfiling;
     function ProfileReport(): string;
+    // Drops every table ProfileReport holds so far.
+    procedure ClearProfileReport();
   end;
 
 const
@@ -8976,8 +8987,9 @@ type
   // Qwen-Image-2.1 text-to-image (diffusers QwenImage21Pipeline, no guidance)
   // over a model_index.json folder. Each component (text encoder, transformer,
   // VAE decoder) is loaded when its stage starts and freed when it ends, so
-  // peak memory is the largest component, not the sum. Latents are
-  // (GridH*GridW,1,in_channels) in row-major (h, w) token order.
+  // peak memory is the largest component, not the sum. After LoadComponents
+  // all three stay loaded and each image frees only its activations. Latents
+  // are (GridH*GridW,1,in_channels) in row-major (h, w) token order.
   // Coded by Claude (AI).
   TQwenImage21Pipeline = class(TObject)
   private
@@ -8994,6 +9006,13 @@ type
     FTransformerOnOpenCL, FVaeOnOpenCL: boolean;
     FLayerProfiling: boolean;
     FTransformerProfileReport, FVaeProfileReport: string;
+    // Set by LoadComponents, nil otherwise. The text encoder's weights sit in
+    // a 1-token net; each prompt builds a borrowing net of its own length.
+    FTextEncoderOwner: TNNet;
+    FTransformer: TQwenImage21Transformer;
+    FVaeDecoder: TQwenImage21VaeDecoder;
+    // processor/tokenizer.json, kept by LoadComponents when the file exists.
+    FTokenizer: TNeuralHFTokenizer;
     {$IFDEF OpenCL}
     FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
     FOpenCLPlatform: cl_platform_id;
@@ -9007,6 +9026,18 @@ type
     procedure EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
     function ComponentFolder(const Component: string): string;
     procedure CheckImageSize(Width, Height: integer);
+    // text_encoder/ for SeqLen tokens; WeightOwner <> nil borrows its weights.
+    function BuildTextEncoder(SeqLen: integer; WeightOwner: TNNet;
+      out Config: TQwen3VLConfig): TNNet;
+    // Loads transformer/ (vae/) and arms OpenCL when EnableOpenCL asked for it.
+    function CreateTransformer(): TQwenImage21Transformer;
+    function CreateVaeDecoder(): TQwenImage21VaeDecoder;
+    function GetComponentsLoaded(): boolean;
+    // Raises when ComponentsLoaded: Setting would not reach loaded weights.
+    procedure RefuseWhileLoaded(const Setting: string);
+    procedure SetTransformerFormat(Value: TQwenImage21WeightFormat);
+    procedure SetInt8Input(Value: boolean);
+    procedure SetTextEncoderInt8(Value: boolean);
   public
     // Reads model_index.json, scheduler/scheduler_config.json and
     // transformer/config.json; no weights are loaded here.
@@ -9015,11 +9046,17 @@ type
     // Side rounded down to a multiple of 32 (diffusers does the same after a
     // warning); raises when that leaves less than 32.
     class function RoundDownImageSide(Side: integer): integer;
-    // Tokenizes the text-to-image template with processor/tokenizer.json.
+    // Keeps the text encoder, transformer, VAE decoder (OpenCL armed) and the
+    // tokenizer for every later image. Reads the format and OpenCL settings.
+    procedure LoadComponents();
+    // Frees what LoadComponents loaded; the stages load and free them again.
+    procedure UnloadComponents();
+    // Tokenizes the text-to-image template with processor/tokenizer.json
+    // (the one LoadComponents keeps, else loaded and freed per call).
     function TokenizePrompt(const Prompt: string;
       out DropCount: integer): TNeuralIntegerArray;
-    // Builds text_encoder/ sized to the token count, encodes, frees it.
-    // PromptEmbeds becomes (Length(TokenIds)-DropCount,1,hidden).
+    // Builds text_encoder/ sized to the token count (borrowing loaded weights),
+    // encodes, frees it. PromptEmbeds: (Length(TokenIds)-DropCount,1,hidden).
     procedure EncodeTokenIds(const TokenIds: array of integer;
       DropCount: integer; PromptEmbeds: TNNetVolume);
     procedure EncodePrompt(const Prompt: string; PromptEmbeds: TNNetVolume);
@@ -9027,12 +9064,12 @@ type
     // the global RandSeed is restored). Torch's noise is not reproducible.
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
-    // Loads transformer/, runs StepCount Euler steps on Latents in place (the
-    // initial noise in, the clean latents out), frees the transformer.
+    // StepCount Euler steps on Latents in place (noise in, clean latents out);
+    // loads and frees transformer/ unless it is loaded (then frees the passes).
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
-    // Loads vae/, decodes (tiled when the image exceeds one VaeTileSize tile)
-    // and frees it. Image becomes (Width,Height,4) RGBA in [0, 1].
+    // Decodes (tiled above one VaeTileSize tile) to (Width,Height,4) RGBA in
+    // [0, 1]; loads and frees vae/ unless it is loaded (then frees the net).
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
       Image: TNNetVolume);
     // Denoise + DecodeLatents; InitialLatents = nil draws them from Seed.
@@ -9043,28 +9080,33 @@ type
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
     {$IFDEF OpenCL}
-    // Denoise runs the transformer step pass (int8/int4 weights) and
-    // DecodeLatents the VAE on this OpenCL device; the rest stays on the CPU.
+    // Denoise's step pass (int8/int4 weights) and DecodeLatents' VAE run on
+    // this OpenCL device, the rest on the CPU. Call it before LoadComponents.
     procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true);
     {$ENDIF}
-    // The last Denoise ran the step pass with OpenCL armed; when the request
-    // could not be met, Denoise printed why and ran it on the CPU.
+    // The last Denoise's (or the loaded) transformer has OpenCL armed; when the
+    // request could not be met, its loader printed why and the CPU runs it.
     property TransformerOnOpenCL: boolean read FTransformerOnOpenCL;
-    // The last DecodeLatents ran the VAE with OpenCL armed; when the request
-    // could not be met, DecodeLatents printed why and ran it on the CPU.
+    // The same for the last DecodeLatents' (or the loaded) VAE decoder.
     property VaeOnOpenCL: boolean read FVaeOnOpenCL;
     property ModelFolder: string read FModelFolder;
+    property ComponentsLoaded: boolean read GetComponentsLoaded;
+    // The components LoadComponents keeps; nil when not loaded.
+    property LoadedTextEncoderWeights: TNNet read FTextEncoderOwner;
+    property LoadedTransformer: TQwenImage21Transformer read FTransformer;
+    property LoadedVaeDecoder: TQwenImage21VaeDecoder read FVaeDecoder;
     property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
     property TransformerConfig: TQwenImage21TransformerConfig
       read FTransformerConfig;
     // Transformer block weights (qiwFP32 at real size runs a slow kernel).
+    // These three refuse a new value while ComponentsLoaded.
     property TransformerFormat: TQwenImage21WeightFormat
-      read FTransformerFormat write FTransformerFormat;
+      read FTransformerFormat write SetTransformerFormat;
     // int8 activations into the transformer's int8/int4 projections.
-    property Int8Input: boolean read FInt8Input write FInt8Input;
+    property Int8Input: boolean read FInt8Input write SetInt8Input;
     property TextEncoderInt8: boolean read FTextEncoderInt8
-      write FTextEncoderInt8;
+      write SetTextEncoderInt8;
     // VAE tile in pixels (multiples of 16); default 256/192 (diffusers'
     // enable_tiling) hides tile seams; ~10.7 GB of layer buffers live.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
@@ -68655,6 +68697,19 @@ begin
   end;
 end;
 
+function QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
+  SpatialScale: integer): string;
+begin
+  Result := '';
+  if (TileSampleSize mod SpatialScale <> 0) or
+     (TileSampleStride mod SpatialScale <> 0) or
+     (TileSampleStride < SpatialScale) or
+     (TileSampleStride > TileSampleSize) then
+    Result := 'tile size ' + IntToStr(TileSampleSize) + ' and stride ' +
+      IntToStr(TileSampleStride) + ' must be multiples of ' +
+      IntToStr(SpatialScale) + ' with stride <= size.';
+end;
+
 { TQwenImage21VaeDecoder }
 
 constructor TQwenImage21VaeDecoder.Create(const VaeFolder: string);
@@ -68758,6 +68813,13 @@ begin
   Result := FReleasedNetsProfile + NetProfile();
 end;
 
+procedure TQwenImage21VaeDecoder.ClearProfileReport();
+begin
+  FReleasedNetsProfile := '';
+  FNetPassCount := 0;
+  if Assigned(FNet) then FNet.ClearTime();
+end;
+
 {$IFDEF OpenCL}
 // The context net, not WeightOwner: arming WeightOwner would allocate an
 // OpenCL weight buffer per convolution that no forward ever fills.
@@ -68809,13 +68871,13 @@ var
   Tiles: array of TNNetVolume;
   TileWidths, TileHeights: TNeuralIntegerArray;
   LatentTile: TNNetVolume;
+  TileProblem: string;
 begin
   Scale := FConfig.SpatialScale;
-  if (TileSampleSize mod Scale <> 0) or (TileSampleStride mod Scale <> 0) or
-     (TileSampleStride < Scale) or (TileSampleStride > TileSampleSize) then
-    ImportError(csQwenImage21VaeImporter + ': tile size ' +
-      IntToStr(TileSampleSize) + ' and stride ' + IntToStr(TileSampleStride) +
-      ' must be multiples of ' + IntToStr(Scale) + ' with stride <= size.');
+  TileProblem := QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
+    Scale);
+  if TileProblem <> '' then
+    ImportError(csQwenImage21VaeImporter + ': ' + TileProblem);
   TileLatentSize := TileSampleSize div Scale;
   TileLatentStride := TileSampleStride div Scale;
   BlendExtent := TileSampleSize - TileSampleStride;
@@ -81801,7 +81863,8 @@ end;
 
 function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
   out Config: TQwen3VLConfig; pSeqLen: integer;
-  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = '';
+  pWeightOwner: TNNet = nil): TNNet;
 var
   ConfigPath: string;
 begin
@@ -81812,7 +81875,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadQwen3VLConfigFromJSONFile(ConfigPath);
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
-    {pTrainable=}false, pQuantizeInt8, {pWeightOwner=}nil,
+    {pTrainable=}false, pQuantizeInt8, pWeightOwner,
     {pStopBeforeFinalNorm=}true);
 end;
 
@@ -82421,6 +82484,23 @@ begin
   FStepGridW := 0;
 end;
 
+procedure TQwenImage21Transformer.ReleasePasses();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  FreeStepPass();
+  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
+  FreeAndNil(FPrefixNet);
+  FreeAndNil(FTextInNet);
+  FPrefixLength := 0;
+  MaxBlockPos := Length(FPrefixKeys) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FPrefixKeys[BlockCnt].ReSize(1, 1, 1);
+    FPrefixValues[BlockCnt].ReSize(1, 1, 1);
+  end;
+end;
+
 // A layer with weights in OpenCL memory links only when they can follow by
 // handle; otherwise it refuses and the short count raises (no stale weights).
 procedure TQwenImage21Transformer.SelectBlockWeights(NN: TNNet;
@@ -82880,8 +82960,111 @@ end;
 
 destructor TQwenImage21Pipeline.Destroy();
 begin
+  UnloadComponents();
   FScheduler.Free;
   inherited Destroy();
+end;
+
+function TQwenImage21Pipeline.GetComponentsLoaded(): boolean;
+begin
+  Result := Assigned(FVaeDecoder);
+end;
+
+// Phases qppLoadTextEncoder, qppLoadTransformer, qppLoadVae, then qppDone.
+procedure TQwenImage21Pipeline.LoadComponents();
+var
+  Config: TQwen3VLConfig;
+begin
+  if ComponentsLoaded then exit;
+  try
+    DoPhase(qppLoadTextEncoder);
+    FTextEncoderOwner := BuildTextEncoder({SeqLen=}1, nil, Config);
+    DoPhase(qppLoadTransformer);
+    FTransformer := CreateTransformer();
+    DoPhase(qppLoadVae);
+    FVaeDecoder := CreateVaeDecoder();
+    if FileExists(ComponentFolder('processor') + 'tokenizer.json') then
+    begin
+      FTokenizer := TNeuralHFTokenizer.Create();
+      FTokenizer.LoadFromFile(ComponentFolder('processor') + 'tokenizer.json');
+    end;
+  except
+    UnloadComponents();
+    raise;
+  end;
+  DoPhase(qppDone);
+end;
+
+procedure TQwenImage21Pipeline.UnloadComponents();
+begin
+  FreeAndNil(FTokenizer);
+  FreeAndNil(FVaeDecoder);
+  FreeAndNil(FTransformer);
+  FreeAndNil(FTextEncoderOwner);
+end;
+
+procedure TQwenImage21Pipeline.RefuseWhileLoaded(const Setting: string);
+begin
+  if ComponentsLoaded then
+    raise Exception.Create('TQwenImage21Pipeline: ' + Setting + ' cannot ' +
+      'change while the components are loaded (UnloadComponents first).');
+end;
+
+procedure TQwenImage21Pipeline.SetTransformerFormat(
+  Value: TQwenImage21WeightFormat);
+begin
+  if Value <> FTransformerFormat then RefuseWhileLoaded('TransformerFormat');
+  FTransformerFormat := Value;
+end;
+
+procedure TQwenImage21Pipeline.SetInt8Input(Value: boolean);
+begin
+  if Value <> FInt8Input then RefuseWhileLoaded('Int8Input');
+  FInt8Input := Value;
+end;
+
+procedure TQwenImage21Pipeline.SetTextEncoderInt8(Value: boolean);
+begin
+  if Value <> FTextEncoderInt8 then RefuseWhileLoaded('TextEncoderInt8');
+  FTextEncoderInt8 := Value;
+end;
+
+function TQwenImage21Pipeline.BuildTextEncoder(SeqLen: integer;
+  WeightOwner: TNNet; out Config: TQwen3VLConfig): TNNet;
+begin
+  Result := BuildQwen3VLTextEncoderFromSafeTensors(
+    SafeTensorsFolderWeightsFile(ComponentFolder('text_encoder'), 'model'),
+    Config, SeqLen, FTextEncoderInt8, '', WeightOwner);
+  if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
+  begin
+    Result.Free;
+    ImportError('TQwenImage21Pipeline: the text encoder hidden size ' +
+      IntToStr(Config.Text.HiddenSize) + ' differs from the transformer''s ' +
+      'context_in_dim ' + IntToStr(FTransformerConfig.ContextInDim) + '.');
+  end;
+end;
+
+function TQwenImage21Pipeline.CreateTransformer(): TQwenImage21Transformer;
+begin
+  Result := TQwenImage21Transformer.Create(ComponentFolder('transformer'),
+    FTransformerFormat, FInt8Input);
+  try
+    EnableTransformerOpenCL(Result);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function TQwenImage21Pipeline.CreateVaeDecoder(): TQwenImage21VaeDecoder;
+begin
+  Result := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
+  try
+    EnableVaeOpenCL(Result);
+  except
+    Result.Free;
+    raise;
+  end;
 end;
 
 procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
@@ -82921,6 +83104,8 @@ var
   Tokenizer: TNeuralHFTokenizer;
   TokenizerFile: string;
 begin
+  if Assigned(FTokenizer) then
+    exit(QwenImage21EncodeTextToImagePrompt(FTokenizer, Prompt, DropCount));
   TokenizerFile := ComponentFolder('processor') + 'tokenizer.json';
   if not FileExists(TokenizerFile) then
     ImportError('TQwenImage21Pipeline: ' + TokenizerFile + ' not found.');
@@ -82939,18 +83124,13 @@ var
   Encoder: TNNet;
   Config: TQwen3VLConfig;
 begin
-  DoPhase(qppLoadTextEncoder);
-  Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
-    SafeTensorsFolderWeightsFile(ComponentFolder('text_encoder'), 'model'),
-    Config,
-    Length(TokenIds), FTextEncoderInt8);
+  // A loaded encoder's borrowing net is built inside qppEncodePrompt.
+  if Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt)
+  else DoPhase(qppLoadTextEncoder);
+  Encoder := BuildTextEncoder(Length(TokenIds), FTextEncoderOwner, Config);
   try
     PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
-    if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
-      ImportError('TQwenImage21Pipeline: the text encoder hidden size ' +
-        IntToStr(Config.Text.HiddenSize) + ' differs from the transformer''s ' +
-        'context_in_dim ' + IntToStr(FTransformerConfig.ContextInDim) + '.');
-    DoPhase(qppEncodePrompt);
+    if not Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt);
     Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
       PromptEmbeds, FParallel);
   finally
@@ -82996,16 +83176,17 @@ begin
   // mu from the image token count, as the diffusers pipeline computes it.
   FScheduler.SetTimesteps(StepCount,
     FScheduler.ShiftForImageSeqLen(GridH * GridW));
-  DoPhase(qppLoadTransformer);
   FTransformerProfileReport := '';
   Velocity := TNNetVolume.Create();
-  Transformer := nil;
+  Transformer := FTransformer;
   try
-    Transformer := TQwenImage21Transformer.Create(
-      ComponentFolder('transformer'), FTransformerFormat, FInt8Input);
+    if not Assigned(Transformer) then
+    begin
+      DoPhase(qppLoadTransformer);
+      Transformer := CreateTransformer();
+    end;
     Transformer.Parallel := FParallel;
     Transformer.MaxThreads := FMaxThreads;
-    EnableTransformerOpenCL(Transformer);
     Transformer.LayerProfiling := FLayerProfiling;
     DoPhase(qppEncodePrefix);
     Transformer.EncodePrefix(PromptEmbeds);
@@ -83023,7 +83204,8 @@ begin
     if FLayerProfiling then
       FTransformerProfileReport := Transformer.ProfileReport();
   finally
-    Transformer.Free;
+    if Assigned(FTransformer) then FTransformer.ReleasePasses()
+    else Transformer.Free;
     Velocity.Free;
   end;
 end;
@@ -83069,6 +83251,7 @@ end;
 procedure TQwenImage21Pipeline.EnableOpenCL(pPlatform: cl_platform_id;
   pDevice: cl_device_id; pHasSharedKernel: boolean);
 begin
+  RefuseWhileLoaded('EnableOpenCL');
   FOpenCLRequested := true;
   FOpenCLPlatform := pPlatform;
   FOpenCLDevice := pDevice;
@@ -83091,16 +83274,19 @@ begin
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) +
       ' latent tokens do not form a ' + IntToStr(GridW) + 'x' +
       IntToStr(GridH) + ' grid.');
-  DoPhase(qppLoadVae);
   FVaeProfileReport := '';
   LatentImage := TNNetVolume.Create();
-  Vae := nil;
+  Vae := FVaeDecoder;
   try
-    Vae := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
+    if not Assigned(Vae) then
+    begin
+      DoPhase(qppLoadVae);
+      Vae := CreateVaeDecoder();
+    end;
     Vae.Parallel := FParallel;
     Vae.MaxThreads := FMaxThreads;
     Vae.LayerProfiling := FLayerProfiling;
-    EnableVaeOpenCL(Vae);
+    Vae.ClearProfileReport();
     // Token h * GridW + w is pixel (w, h) of a (GridW, GridH, C) volume.
     LatentImage.Copy(Latents);
     LatentImage.ReSize(GridW, GridH, Latents.Depth);
@@ -83108,7 +83294,8 @@ begin
     Vae.DecodeTiled(LatentImage, Image, FVaeTileSize, FVaeTileStride);
     FVaeProfileReport := Vae.ProfileReport();
   finally
-    Vae.Free;
+    if Assigned(FVaeDecoder) then FVaeDecoder.ReleaseNet()
+    else Vae.Free;
     LatentImage.Free;
   end;
   // The decoder clamps to [-1, 1]; the pipeline postprocess is x / 2 + 0.5.
