@@ -2051,9 +2051,14 @@ rather than acted on.
         today's load-and-free order). The text encoder is built once for a maximum
         prompt length (padding is exact, A2); prefix/step/VAE nets are rebuilt per
         image by borrowing weights; activations are freed between images, weights
-        kept. `examples/QwenImage --repl`: one prompt per line, numbered output
-        files, `/size WxH`, `/steps N`, `/seed N` (else the seed increments),
-        `/tile SIZE[,STRIDE]`, `/quit`; print resident memory at startup. Test: two
+        kept. `examples/QwenImage` follows ChatTerminal: `-p "prompt"` (or
+        `--token-ids`) is a one-shot run that keeps the load-and-free order;
+        `--prompt` is removed (no alias). Without either, the REPL starts: one
+        prompt per line from stdin (so a piped file is a batch), output files
+        numbered from the `--output` base (`out.png` -> `out_0001.png`, ...),
+        `/size WxH`, `/steps N`, `/seed N` (else the seed increments),
+        `/tile SIZE[,STRIDE]`, `/quit`; weights stay resident between prompts;
+        print resident memory at startup (user decisions, 2026-10-03). Test: two
         prompts through one loaded pipeline equal two one-shot runs (pico). Estimated
         resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
         Removes the per-image loads measured on the first real run: text encoder
