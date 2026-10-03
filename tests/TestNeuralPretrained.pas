@@ -13271,8 +13271,8 @@ begin
   RunChatKVSlotGrowingAndEviction('qwen3_5');
 end;
 
-// --kv-slots parsing, the off default, the notice, and the refusal under
-// --no-cache-reuse. Coded by Claude (AI).
+// --kv-slots parsing, the not-given default (DefaultKVSlots), the notice, and
+// the refusal under --no-cache-reuse. Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestChatKVSlotFlag;
 var
   Args: TStringList;
@@ -13293,7 +13293,9 @@ var
 begin
   Args := TStringList.Create();
   try
-    AssertEquals('default is off', 0, DefaultChatOptions().KVSlots);
+    AssertEquals('not given by default', -1, DefaultChatOptions().KVSlots);
+    AssertEquals('the library default is off', 0,
+      DefaultChatOptions().DefaultKVSlots);
     AssertTrue('--kv-slots 4 parses', ParseWith('4'));
     AssertEquals('--kv-slots 4 value', 4, Opt.KVSlots);
     AssertTrue('--kv-slots 64 parses', ParseWith('64'));
@@ -13324,10 +13326,31 @@ begin
       Engine.Free;
     end;
     Opt.KVSlots := -1;
+    Opt.DefaultKVSlots := 65;
     Engine := TChatEngine.Create();
     try
-      AssertFalse('LoadModel refuses --kv-slots -1',
+      AssertFalse('LoadModel refuses a default of 65',
         Engine.LoadModel(Opt, ErrorMsg));
+    finally
+      Engine.Free;
+    end;
+    Opt.DefaultKVSlots := 0;
+    Engine := TChatEngine.Create();
+    try
+      AssertTrue('not given: LoadModel: ' + ErrorMsg,
+        Engine.LoadModel(Opt, ErrorMsg));
+      AssertEquals('not given, library default: no slots', 0,
+        Length(Engine.KVSlots));
+    finally
+      Engine.Free;
+    end;
+    Opt.DefaultKVSlots := 3;
+    Engine := TChatEngine.Create();
+    try
+      AssertTrue('not given, default 3: LoadModel: ' + ErrorMsg,
+        Engine.LoadModel(Opt, ErrorMsg));
+      AssertEquals('not given, default 3: three slots', 3,
+        Length(Engine.KVSlots));
     finally
       Engine.Free;
     end;
@@ -13360,6 +13383,27 @@ begin
       AssertEquals('--no-cache-reuse: no slots', 0, Length(Engine.KVSlots));
       AssertTrue('--no-cache-reuse: the ignored notice',
         Pos('--kv-slots 2 ignored', FNotices) > 0);
+    finally
+      Engine.Free;
+      Args.Free;
+    end;
+    // A default the user never typed is not reported as an ignored flag.
+    Args := TStringList.Create();
+    Engine := TChatEngine.Create();
+    try
+      Engine.OnNotice := @CaptureNotice;
+      FNotices := '';
+      Args.Add(Dir);
+      Args.Add('--fp32'); Args.Add('--cpu'); Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add('16'); Args.Add('--no-cache-reuse');
+      AssertTrue('parse', ParseArgs(Args, Opt));
+      Opt.DefaultKVSlots := 4;
+      LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+      AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertEquals('default under --no-cache-reuse: no slots', 0,
+        Length(Engine.KVSlots));
+      AssertEquals('default under --no-cache-reuse: no ignored notice', 0,
+        Pos('--kv-slots', FNotices));
     finally
       Engine.Free;
       Args.Free;

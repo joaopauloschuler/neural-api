@@ -83,18 +83,21 @@ checkpoints* and *conversation slots*):
   every recent conversation. On a net with attention layers a checkpoint is
   resumable only within the ids the prompt shares with the live KV cache, so
   across conversations it helps only up to the shared system prompt.
-- **Conversation slots** (`--kv-slots N`, **off by default**) save the
-  conversation a request leaves (its K/V rows and recurrent state) and
-  resume it when its client comes back. Each slot costs one KV cache at its
-  conversation's length (host RAM); on hybrid/recurrent nets also one
-  recurrent state (host RAM) and one recurrent state at the last user
-  message (OpenCL memory under `--gpu`), plus one more such copy held by the
-  engine (see *Memory* under *conversation slots* in the README).
+- **Conversation slots** (`--kv-slots N`, **4 by default in ChatServer**;
+  `--kv-slots 0` turns them off) save the conversation a request leaves
+  (its K/V rows and recurrent state) and resume it when its client comes
+  back. Each slot costs one KV cache at its conversation's length (host
+  RAM); on hybrid/recurrent nets also one recurrent state (host RAM) and one
+  recurrent state at the last user message (OpenCL memory under `--gpu`),
+  plus one more such copy held by the engine (see *Memory* under
+  *conversation slots* in the README).
 
-A server for a few alternating clients:
+A server for a few alternating clients (4 conversation slots by default),
+and the same server without slots:
 
 ```
-$ ChatServer /path/to/model --gpu --kv-slots 4 --stats --port 8080
+$ ChatServer /path/to/model --gpu --stats --port 8080
+$ ChatServer /path/to/model --gpu --stats --port 8080 --kv-slots 0
 ```
 
 `--stats` prints, per request, where the prompt resumed from (`live cache`,
@@ -106,4 +109,5 @@ slots have not been timed on a real model yet.
 `ChatServer --selftest` runs the offline request-parsing and
 parameter-overlay checks (the `messages` array, per-request overrides of
 the launch defaults, `max_completion_tokens` over `max_tokens`, the ignored
-`stop` field, the `stream` flag) without needing any model files.
+`stop` field, the `stream` flag, the `--kv-slots` server default) without
+needing any model files.

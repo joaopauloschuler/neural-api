@@ -214,7 +214,10 @@ type
                                  // CPU); 0 = off (full re-prefill); 1 and
                                  // above 2048 are errors
     KVSlots: integer;            // --kv-slots N: saved conversation slots
-                                 // (0 = off, the default; at most 64)
+                                 // (0 = off; at most 64). -1 = not given:
+                                 // LoadModel uses DefaultKVSlots
+    DefaultKVSlots: integer;     // slots when --kv-slots is not given (0 =
+                                 // off; ChatServer sets 4)
     KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
                                  // long context; logits not bit-exact). Follows
                                  // the weight mode (on with int8 weights, off
@@ -646,7 +649,7 @@ begin
   WriteLn('                        hybrid/recurrent nets each slot, plus the engine');
   WriteLn('                        once, also holds the recurrent state at a last');
   WriteLn('                        user message, in OpenCL memory under --gpu');
-  WriteLn('                        (default 0 = off; N is 0 to 64)');
+  WriteLn('                        (default 0 = off, ChatServer 4; N is 0 to 64)');
   WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a width-N');
   WriteLn('                        twin of the net (default 0 = one token per forward;');
   WriteLn('                        N is 0 or at least 2 and below the context, else');
@@ -733,7 +736,8 @@ begin
   Result.Profile := false;
   Result.NoCacheReuse := false;
   Result.CacheCheckpoints := -1; // not given: LoadModel picks 16/8 (OpenCL/CPU)
-  Result.KVSlots := 0; // no conversation slots (--kv-slots N)
+  Result.KVSlots := -1; // not given: LoadModel uses DefaultKVSlots
+  Result.DefaultKVSlots := 0; // no conversation slots unless asked for
   Result.PrefillWindow := 0; // one token per prefill forward (--prefill-window N)
   Result.PrefillTailWindow := 0; // auto (--prefill-tail-window T)
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
@@ -1882,6 +1886,7 @@ var
   Int4RowLayerCount: integer;   // of those, quantized from the checkpoint rows
   TwinBytes: int64;             // the prefill twins' NonWeightBytes
   CheckpointsGiven: boolean;    // --cache-checkpoints N was on the command line
+  KVSlotsGiven: boolean;        // --kv-slots N was on the command line
   OpenCLOn: boolean;            // OpenCL offload is live (not fallen back)
   {$IFDEF OpenCL}
   OpenCLProblem: string;        // why --gpu fell back to the CPU
@@ -2023,6 +2028,8 @@ begin
     FreeAndNil(Tokenizer);
     exit;
   end;
+  KVSlotsGiven := Opt.KVSlots >= 0;
+  if not KVSlotsGiven then Opt.KVSlots := Opt.DefaultKVSlots;
   if (Opt.KVSlots < 0) or (Opt.KVSlots > csMaxKVSlots) then
   begin
     ErrorMsg := Format('--kv-slots %d: must be 0 (off) to %d',
@@ -2476,7 +2483,7 @@ begin
       ' full set frees the slot unused for the most turns]',
       [Opt.KVSlots, Line]));
   end
-  else if Opt.KVSlots > 0 then
+  else if KVSlotsGiven and (Opt.KVSlots > 0) then
   begin
     if Opt.NoCacheReuse then
       Notice(Format('[--kv-slots %d ignored: --no-cache-reuse]',
