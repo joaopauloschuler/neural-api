@@ -400,6 +400,10 @@ type
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
     // round trip must bring the cache home and put it back untouched.
     procedure FusedSDPADecodeResidentOpenCLParity;
+    // Capture a resident cache (it must stay resident), rebuild it from row 0
+    // with other rows, restore (the stale OpenCL copy must be replaced) and
+    // continue: every step after the restore must match the CPU layer.
+    procedure FusedSDPAResidentSnapshotRestoreOpenCLParity;
     // The same decode with a sliding window and a Gemma-2 score soft-cap live,
     // so the kernel's jStart and its tanh branch both run.
     procedure FusedSDPAWindowedDecodeOpenCLParity;
@@ -73604,6 +73608,128 @@ begin
     GpuForwards);
   AssertTrue('OpenCL int8 cached decode vs CPU int8 cached decode: max |diff| = '
     + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAResidentSnapshotRestoreOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; MaxContext = 16;
+  PrefixSteps = 4; DivergeSteps = PrefixSteps + 1; ResumeSteps = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn, CpuK, CpuV, GpuK, GpuV: TNNetVolume;
+  CpuKQ, CpuVQ, GpuKQ, GpuVQ: TNNetVolumeQuant8;
+  CpuLen, CpuSinks, CpuWindow, GpuLen, GpuSinks, GpuWindow: integer;
+  InDepth, OutDepth, Step, MaxInPos, MaxOutPos, ModePos: integer;
+  Int8KV: boolean;
+  MaxDiff, Tolerance: TNeuralFloat;
+
+  procedure RunStep(Compare: boolean);
+  var
+    D: integer;
+  begin
+    for D := 0 to MaxInPos do StepIn.FData[D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(StepIn);
+    NNGpu.Compute(StepIn);
+    if not Compare then exit;
+    for D := 0 to MaxOutPos do
+      MaxDiff := Max(MaxDiff, Abs(NNCpu.GetLastLayer.Output.FData[D] -
+        NNGpu.GetLastLayer.Output.FData[D]));
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  OutDepth := QHeads * Dk;
+  MaxInPos := InDepth - 1;
+  MaxOutPos := OutDepth - 1;
+  for ModePos := 0 to 1 do
+  begin
+    Int8KV := ModePos = 1;
+    RandSeed := 20261002 + ModePos;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    StepIn := TNNetVolume.Create(1, 1, InDepth);
+    CpuK := TNNetVolume.Create(); CpuV := TNNetVolume.Create();
+    GpuK := TNNetVolume.Create(); GpuV := TNNetVolume.Create();
+    CpuKQ := TNNetVolumeQuant8.Create(); CpuVQ := TNNetVolumeQuant8.Create();
+    GpuKQ := TNNetVolumeQuant8.Create(); GpuVQ := TNNetVolumeQuant8.Create();
+    try
+      NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.AddLayer(TNNetSiLU.Create());
+      NNCpu.SetTrainable(False, False);
+      NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.AddLayer(TNNetSiLU.Create());
+      NNGpu.SetTrainable(False, False);
+      LCpu.BeginIncrementalDecode(MaxContext, Int8KV);
+      LGpu.BeginIncrementalDecode(MaxContext, Int8KV);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      MaxDiff := 0;
+      for Step := 1 to PrefixSteps do RunStep(true);
+      AssertTrue('the prefix must have run on OpenCL', LGpu.CacheOnOpenCL);
+      if Int8KV then
+      begin
+        LCpu.CaptureCacheStateInt8(CpuKQ, CpuVQ, CpuLen, CpuSinks, CpuWindow);
+        LGpu.CaptureCacheStateInt8(GpuKQ, GpuVQ, GpuLen, GpuSinks, GpuWindow);
+      end
+      else
+      begin
+        LCpu.CaptureCacheState(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+        LGpu.CaptureCacheState(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+      end;
+      AssertTrue('a capture must leave the cache resident', LGpu.CacheOnOpenCL);
+      AssertEquals('captured length', PrefixSteps, GpuLen);
+      // Rebuild the cache from row 0 with other rows, so the resident rows
+      // the restore must replace differ from the snapshot's.
+      LCpu.ResetCache();
+      LGpu.ResetCache();
+      for Step := 1 to DivergeSteps do RunStep(false);
+      AssertTrue('the diverged rows must be resident before the restore',
+        LGpu.CacheOnOpenCL);
+      if Int8KV then
+      begin
+        LCpu.RestoreCacheStateInt8(CpuKQ, CpuVQ, CpuLen, CpuSinks, CpuWindow);
+        LGpu.RestoreCacheStateInt8(GpuKQ, GpuVQ, GpuLen, GpuSinks, GpuWindow);
+      end
+      else
+      begin
+        LCpu.RestoreCacheState(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+        LGpu.RestoreCacheState(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+      end;
+      AssertFalse('a restore must mark the OpenCL copy stale', LGpu.CacheOnOpenCL);
+      AssertEquals('restored length', PrefixSteps, LGpu.CacheLength);
+      for Step := 1 to ResumeSteps do RunStep(true);
+      AssertTrue('the resumed steps must run on OpenCL again', LGpu.CacheOnOpenCL);
+      if Int8KV then Tolerance := 1e-3 else Tolerance := 1e-4;
+      AssertTrue(BoolToStr(Int8KV, 'int8', 'FP32') +
+        ' restore over a diverged resident cache: max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < Tolerance);
+      LGpu.EndIncrementalDecode();
+      LCpu.EndIncrementalDecode();
+    finally
+      GpuVQ.Free; GpuKQ.Free; CpuVQ.Free; CpuKQ.Free;
+      GpuV.Free; GpuK.Free; CpuV.Free; CpuK.Free;
+      StepIn.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
 end;
 {$ELSE}
 begin

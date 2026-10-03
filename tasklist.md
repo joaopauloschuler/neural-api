@@ -239,7 +239,14 @@ rather than acted on.
         end at or below that boundary. Raw mode (no system role): prompt end and
         reply end only. Revisit the --cache-checkpoints default (16/8) once the
         store no longer holds per-window captures.
-  - [ ] T4. Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
+  - [x] T4a. Session snapshots copy only the live KV rows (per KV head, int8
+        codes+scales verbatim), keep an OpenCL-resident KV cache resident on
+        capture and mark it stale on restore, validate every layer before
+        writing (RestoreSnapshot raises), and take a capacity hint so the twin
+        SwitchTo allocates nothing. Open: GatedDeltaNet / DepthwiseConv1D
+        recurrent state still leaves OpenCL memory on capture (one extra
+        upload per capture).
+  - [ ] T4 (T4b). Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
         session state (attention K/V rows + recurrent state, via
         TNNetDecoderSessionSnapshot / SnapshotInto) per slot, with PrefixHash,
         guard tokens and LastUsedTurn. When a request diverges from the live

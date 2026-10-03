@@ -4347,6 +4347,18 @@ type
     // copy in OpenCL memory. Every host reader or mutator of the cache calls
     // it; the base layer keeps the cache in RAM, so here it does nothing.
     procedure ForceCacheOnRAM(); virtual;
+    // Copies the live cache rows into FKCache/FVCache while a subclass keeps
+    // the OpenCL copy authoritative (a host read that leaves residency alone).
+    procedure CopyCacheToRAM(); virtual;
+    // A host write replaced the live rows: the OpenCL copy is stale and the next
+    // OpenCL forward uploads the cache again.
+    procedure MarkCacheWrittenOnRAM(); virtual;
+    // KV heads in the cache: head g's rows fill plane g of FCacheMax rows.
+    function CacheKVHeads(): integer; virtual;
+    // Copies the first Rows rows (RowBytes each) of every one of Planes planes
+    // from Src (SrcPlaneRows rows per plane) to Dst (DstPlaneRows per plane).
+    class procedure CopyPlaneRows(Src, Dst: Pointer; Planes, Rows, RowBytes,
+      SrcPlaneRows, DstPlaneRows: integer);
     procedure ComputeIncremental();
     // FlashAttention-1 tiled online-softmax forward (opt-in, forward-only).
     // Returns true if it handled the forward; false to fall back to the naive
@@ -4509,20 +4521,18 @@ type
     // already-appended FP32 rows are silently dropped. Coded by Claude (AI).
     procedure EnableInt8KV(); virtual;
     procedure DisableInt8KV(); virtual;
-    // Session snapshot / fork support. CaptureCacheState copies the layer's
-    // full live KV-cache state (the cached keys/values, the live length, and
-    // the eviction config) into the supplied destination volumes / out params
-    // so a caller can save a prefilled session; RestoreCacheState copies that
-    // state back in, so continuation resumes EXACTLY where the snapshot was
-    // taken (the next appended token lands at slot Len, the eviction policy is
-    // re-armed). Both require the cached path (call after BeginIncrementalDecode)
-    // and the destination/source K/V volumes are sized to MaxContext x 1 x Dk.
-    // The fork is a deep copy: the snapshot is independent of the live layer,
-    // so the same snapshot can be restored into many sessions. Coded by Claude (AI).
+    // Snapshot fork: the Len live rows per KV head into (Capacity, KVHeads, Dk),
+    // Capacity >= Max(Len, MinCapacity), grown only when too small.
     procedure CaptureCacheState(DstK, DstV: TNNetVolume;
-      out Len, Sinks, Window: integer);
+      out Len, Sinks, Window: integer; MinCapacity: integer = 0);
+    // Callers check CanRestoreCacheState first (RestoreSnapshot does): a
+    // refused restore only reports through FErrorProc.
     procedure RestoreCacheState(SrcK, SrcV: TNNetVolume;
       Len, Sinks, Window: integer);
+    // True when a snapshot of Rows x KVHeads x Depth holding Len rows and this
+    // eviction config fits this layer's cache; otherwise Reason says why.
+    function CanRestoreCacheState(Rows, KVHeads, Depth, Len, Sinks,
+      Window: integer; out Reason: string): boolean;
     // Same fork, for a layer running the int8 KV cache: the live storage is
     // then the quantized code/scale planes, not the FP32 volumes, so the pair
     // above rejects the call and these carry the codes AND the per-row scales
@@ -4532,7 +4542,8 @@ type
     // int8 cache's own lossiness vs FP32 is unchanged, see EnableInt8KV).
     // Coded by Claude (AI).
     procedure CaptureCacheStateInt8(DstK, DstV: TNNetVolumeQuant8;
-      out Len, Sinks, Window: integer);
+      out Len, Sinks, Window: integer; MinCapacity: integer = 0);
+    // Callers check CanRestoreCacheState first, as for RestoreCacheState.
     procedure RestoreCacheStateInt8(SrcK, SrcV: TNNetVolumeQuant8;
       Len, Sinks, Window: integer);
     // FlashAttention-style tiled online-softmax forward (opt-in, FORWARD-ONLY).
@@ -4904,7 +4915,10 @@ type
     function AttnHeadCount(): integer; override;
     {$IFDEF OpenCL}
     procedure ForceCacheOnRAM(); override;
+    procedure CopyCacheToRAM(); override;
+    procedure MarkCacheWrittenOnRAM(); override;
     {$ENDIF}
+    function CacheKVHeads(): integer; override;
     // Chunk axis: query heads. ComputeRange computes heads
     // [StartRange..FinRange]; the cache append happens ONCE beforehand in
     // PrepareChunkedForward. Coded by Claude (AI).
@@ -33648,6 +33662,21 @@ begin
   // The base layer's cache never leaves RAM.
 end;
 
+procedure TNNetScaledDotProductAttention.CopyCacheToRAM();
+begin
+  // The base layer's cache never leaves RAM.
+end;
+
+procedure TNNetScaledDotProductAttention.MarkCacheWrittenOnRAM();
+begin
+  // The base layer's cache never leaves RAM.
+end;
+
+function TNNetScaledDotProductAttention.CacheKVHeads(): integer;
+begin
+  Result := 1;
+end;
+
 procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
   Dst: TNNetVolumeQuant8; Slot: integer);
 var
@@ -33675,10 +33704,55 @@ begin
   end;
 end;
 
-procedure TNNetScaledDotProductAttention.CaptureCacheState(DstK, DstV: TNNetVolume;
-  out Len, Sinks, Window: integer);
+class procedure TNNetScaledDotProductAttention.CopyPlaneRows(Src, Dst: Pointer;
+  Planes, Rows, RowBytes, SrcPlaneRows, DstPlaneRows: integer);
+var
+  PlanePos, MaxPlanePos: integer;
+  LiveBytes, SrcPlaneBytes, DstPlaneBytes: PtrInt;
+  SrcPlane, DstPlane: PByte;
 begin
-  ForceCacheOnRAM();
+  LiveBytes := PtrInt(Rows) * RowBytes;
+  if LiveBytes <= 0 then exit;
+  SrcPlaneBytes := PtrInt(SrcPlaneRows) * RowBytes;
+  DstPlaneBytes := PtrInt(DstPlaneRows) * RowBytes;
+  SrcPlane := PByte(Src);
+  DstPlane := PByte(Dst);
+  MaxPlanePos := Planes - 1;
+  for PlanePos := 0 to MaxPlanePos do
+  begin
+    Move(SrcPlane^, DstPlane^, LiveBytes);
+    Inc(SrcPlane, SrcPlaneBytes);
+    Inc(DstPlane, DstPlaneBytes);
+  end;
+end;
+
+function TNNetScaledDotProductAttention.CanRestoreCacheState(Rows, KVHeads,
+  Depth, Len, Sinks, Window: integer; out Reason: string): boolean;
+begin
+  Reason := '';
+  if not FCacheEnabled then
+    Reason := 'requires the cached path (call BeginIncrementalDecode first)'
+  else if (Len < 0) or (Len > FCacheMax) then
+    Reason := 'snapshot length ' + IntToStr(Len) + ' exceeds MaxContext (' +
+      IntToStr(FCacheMax) + ')'
+  else if (Len > Rows) or (KVHeads <> CacheKVHeads()) or (Depth <> FDk) then
+    Reason := 'the snapshot holds (' + IntToStr(Rows) + ', ' +
+      IntToStr(KVHeads) + ', ' + IntToStr(Depth) + ') but this layer needs ' +
+      IntToStr(Len) + ' rows of ' + IntToStr(CacheKVHeads()) + ' heads x ' +
+      IntToStr(FDk)
+  else if (Sinks < 0) or (Window < 0) or
+    ((Sinks > 0) and (Sinks + Window > FCacheMax)) then
+    Reason := 'eviction sinks ' + IntToStr(Sinks) + ' + window ' +
+      IntToStr(Window) + ' do not fit MaxContext (' + IntToStr(FCacheMax) + ')';
+  Result := Reason = '';
+end;
+
+procedure TNNetScaledDotProductAttention.CaptureCacheState(DstK, DstV: TNNetVolume;
+  out Len, Sinks, Window: integer; MinCapacity: integer);
+var
+  KVHeads, Capacity: integer;
+begin
+  Len := 0; Sinks := 0; Window := 0;
   if not FCacheEnabled then
   begin
     FErrorProc('TNNetScaledDotProductAttention.CaptureCacheState requires the ' +
@@ -33688,11 +33762,23 @@ begin
   if FKVQuantInt8 then
   begin
     FErrorProc('TNNetScaledDotProductAttention.CaptureCacheState does not ' +
-      'support the int8 KV cache (snapshot is FP32 only).');
+      'support the int8 KV cache. Use CaptureCacheStateInt8.');
     exit;
   end;
-  DstK.Copy(FKCache);
-  DstV.Copy(FVCache);
+  CopyCacheToRAM();
+  KVHeads := CacheKVHeads();
+  Capacity := Max(Max(FCacheLen, MinCapacity), 1);
+  if (DstK.SizeX < Capacity) or (DstK.SizeY <> KVHeads) or
+    (DstK.Depth <> FDk) then
+  begin
+    DstK.ReSize(Capacity, KVHeads, FDk);
+    DstV.ReSize(Capacity, KVHeads, FDk);
+  end;
+  Capacity := DstK.SizeX;
+  CopyPlaneRows(FKCache.DataPtr, DstK.DataPtr, KVHeads, FCacheLen,
+    FDk * csNeuralFloatSize, FCacheMax, Capacity);
+  CopyPlaneRows(FVCache.DataPtr, DstV.DataPtr, KVHeads, FCacheLen,
+    FDk * csNeuralFloatSize, FCacheMax, Capacity);
   Len := FCacheLen;
   Sinks := FEvictSinks;
   Window := FEvictWindow;
@@ -33700,38 +33786,38 @@ end;
 
 procedure TNNetScaledDotProductAttention.RestoreCacheState(SrcK, SrcV: TNNetVolume;
   Len, Sinks, Window: integer);
+var
+  Reason: string;
 begin
-  ForceCacheOnRAM();
-  if not FCacheEnabled then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState requires the ' +
-      'cached path. Call BeginIncrementalDecode first.');
-    exit;
-  end;
   if FKVQuantInt8 then
   begin
     FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState does not ' +
-      'support the int8 KV cache (snapshot is FP32 only).');
+      'support the int8 KV cache. Use RestoreCacheStateInt8.');
     exit;
   end;
-  if (Len < 0) or (Len > FCacheMax) then
+  if (SrcV.Size <> SrcK.Size) or not CanRestoreCacheState(SrcK.SizeX,
+    SrcK.SizeY, SrcK.Depth, Len, Sinks, Window, Reason) then
   begin
-    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState: snapshot ' +
-      'length ' + IntToStr(Len) + ' exceeds this session''s MaxContext (' +
-      IntToStr(FCacheMax) + ').');
+    if Reason = '' then Reason := 'the K and V snapshots differ in size';
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState: ' + Reason + '.');
     exit;
   end;
-  FKCache.Copy(SrcK);
-  FVCache.Copy(SrcV);
+  CopyPlaneRows(SrcK.DataPtr, FKCache.DataPtr, CacheKVHeads(), Len,
+    FDk * csNeuralFloatSize, SrcK.SizeX, FCacheMax);
+  CopyPlaneRows(SrcV.DataPtr, FVCache.DataPtr, CacheKVHeads(), Len,
+    FDk * csNeuralFloatSize, SrcV.SizeX, FCacheMax);
+  MarkCacheWrittenOnRAM();
   FCacheLen := Len;
   FEvictSinks := Sinks;
   FEvictWindow := Window;
 end;
 
 procedure TNNetScaledDotProductAttention.CaptureCacheStateInt8(
-  DstK, DstV: TNNetVolumeQuant8; out Len, Sinks, Window: integer);
+  DstK, DstV: TNNetVolumeQuant8; out Len, Sinks, Window: integer;
+  MinCapacity: integer);
+var
+  KVHeads, Capacity: integer;
 begin
-  ForceCacheOnRAM();
   Len := 0; Sinks := 0; Window := 0;
   if not FCacheEnabled then
   begin
@@ -33745,8 +33831,26 @@ begin
       'the int8 KV cache. Use CaptureCacheState for the FP32 cache.');
     exit;
   end;
-  DstK.CopyFrom(FKCacheQ);   // codes AND per-row scales
-  DstV.CopyFrom(FVCacheQ);
+  CopyCacheToRAM();
+  KVHeads := CacheKVHeads();
+  Capacity := Max(Max(FCacheLen, MinCapacity), 1);
+  if (DstK.SizeX < Capacity) or (DstK.SizeY <> KVHeads) or
+    (DstK.Depth <> FDk) then
+  begin
+    DstK.ReSize(Capacity, KVHeads, FDk);
+    DstV.ReSize(Capacity, KVHeads, FDk);
+  end;
+  Capacity := DstK.SizeX;
+  // Codes and scales share the plane layout: one code row of FDk bytes and
+  // one scale per (row, head).
+  CopyPlaneRows(FKCacheQ.DataPtr, DstK.DataPtr, KVHeads, FCacheLen,
+    FDk * csShortIntSize, FCacheMax, Capacity);
+  CopyPlaneRows(FVCacheQ.DataPtr, DstV.DataPtr, KVHeads, FCacheLen,
+    FDk * csShortIntSize, FCacheMax, Capacity);
+  CopyPlaneRows(FKCacheQ.ScalePtr, DstK.ScalePtr, KVHeads, FCacheLen,
+    csNeuralFloatSize, FCacheMax, Capacity);
+  CopyPlaneRows(FVCacheQ.ScalePtr, DstV.ScalePtr, KVHeads, FCacheLen,
+    csNeuralFloatSize, FCacheMax, Capacity);
   Len := FCacheLen;
   Sinks := FEvictSinks;
   Window := FEvictWindow;
@@ -33754,29 +33858,32 @@ end;
 
 procedure TNNetScaledDotProductAttention.RestoreCacheStateInt8(
   SrcK, SrcV: TNNetVolumeQuant8; Len, Sinks, Window: integer);
+var
+  Reason: string;
 begin
-  ForceCacheOnRAM();
-  if not FCacheEnabled then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8 requires ' +
-      'the cached path. Call BeginIncrementalDecode first.');
-    exit;
-  end;
   if not FKVQuantInt8 then
   begin
     FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8 requires ' +
       'the int8 KV cache. Use RestoreCacheState for the FP32 cache.');
     exit;
   end;
-  if (Len < 0) or (Len > FCacheMax) then
+  if (SrcV.Size <> SrcK.Size) or not CanRestoreCacheState(SrcK.SizeX,
+    SrcK.SizeY, SrcK.Depth, Len, Sinks, Window, Reason) then
   begin
-    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8: snapshot ' +
-      'length ' + IntToStr(Len) + ' exceeds this session''s MaxContext (' +
-      IntToStr(FCacheMax) + ').');
+    if Reason = '' then Reason := 'the K and V snapshots differ in size';
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8: ' +
+      Reason + '.');
     exit;
   end;
-  FKCacheQ.CopyFrom(SrcK);
-  FVCacheQ.CopyFrom(SrcV);
+  CopyPlaneRows(SrcK.DataPtr, FKCacheQ.DataPtr, CacheKVHeads(), Len,
+    FDk * csShortIntSize, SrcK.SizeX, FCacheMax);
+  CopyPlaneRows(SrcV.DataPtr, FVCacheQ.DataPtr, CacheKVHeads(), Len,
+    FDk * csShortIntSize, SrcV.SizeX, FCacheMax);
+  CopyPlaneRows(SrcK.ScalePtr, FKCacheQ.ScalePtr, CacheKVHeads(), Len,
+    csNeuralFloatSize, SrcK.SizeX, FCacheMax);
+  CopyPlaneRows(SrcV.ScalePtr, FVCacheQ.ScalePtr, CacheKVHeads(), Len,
+    csNeuralFloatSize, SrcV.SizeX, FCacheMax);
+  MarkCacheWrittenOnRAM();
   FCacheLen := Len;
   FEvictSinks := Sinks;
   FEvictWindow := Window;
@@ -34770,6 +34877,11 @@ begin
   Result := FQHeads;
 end;
 
+function TNNetFusedSDPA.CacheKVHeads(): integer;
+begin
+  Result := FKVHeads;
+end;
+
 // Non-cached prefill for query heads [h1..h2]: per head, the exact
 // single-head kernel (scores -> stable softmax with the all-masked-row zero
 // policy -> value sum), reading the head's packed Q/K/V slices and writing
@@ -35429,11 +35541,22 @@ end;
 procedure TNNetFusedSDPA.ForceCacheOnRAM();
 begin
   if (not FCacheOnOpenCL) or (not Assigned(FFusedSDPACL)) then exit;
+  CopyCacheToRAM();
+  FCacheOnOpenCL := false;
+end;
+
+procedure TNNetFusedSDPA.CopyCacheToRAM();
+begin
+  if (not FCacheOnOpenCL) or (not Assigned(FFusedSDPACL)) then exit;
   if FKVQuantInt8
     then FFusedSDPACL.DownloadCacheInt8(FKCacheQ, FVCacheQ, FKVHeads, FCacheMax,
       FCacheLen, FDk)
     else FFusedSDPACL.DownloadCache(FKCache, FVCache, FKVHeads, FCacheMax,
       FCacheLen, FDk);
+end;
+
+procedure TNNetFusedSDPA.MarkCacheWrittenOnRAM();
+begin
   FCacheOnOpenCL := false;
 end;
 

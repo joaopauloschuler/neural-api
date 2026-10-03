@@ -1532,9 +1532,9 @@ end;
 procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
 begin
   if Target = ActiveSession then exit;
-  // One deep copy of the live state each way, into the snapshot LoadModel
-  // allocated once; nothing is allocated per switch.
-  ActiveSession.SnapshotInto(TransferSnap);
+  // One deep copy of the live state each way. The hint sizes TransferSnap for
+  // the whole context on the first switch, so later switches allocate nothing.
+  ActiveSession.SnapshotInto(TransferSnap, SeqLen);
   Target.RestoreSnapshot(TransferSnap);
   ActiveSession := Target;
 end;

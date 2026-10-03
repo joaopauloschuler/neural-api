@@ -32,6 +32,16 @@ type
     // the causal depthwise conv on the q|k|v slab) followed by a RoPE
     // attention block - the two mixer families the qwen3_5 decoder interleaves.
     function BuildTinyQwen35HybridLM(ContextLen: integer): TNNet;
+    // Snapshot live-rows check over Inputs (one step volume per position) on
+    // Twin; see TestStreamingDecoderSnapshotLiveRowsTransformer.
+    procedure RunSnapshotLiveRows(Twin: TNNet; const Inputs: array of TNNetVolume;
+      Int8KV: boolean; const Tag: string);
+    // Token-id step volumes for the token LMs: Inputs[T].FData[0] = Toks[T].
+    procedure RunSnapshotLiveRowsOnTokens(Twin: TNNet; Int8KV: boolean;
+      const Tag: string);
+    // Input(1,1,(4+2*2)*4) -> TNNetFusedSDPA(4 query, 2 KV heads, d 4) -> SiLU
+    // over random step rows, so the cache holds two KV-head planes.
+    procedure RunSnapshotLiveRowsOnFusedGQA(Int8KV: boolean; const Tag: string);
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -218,6 +228,17 @@ type
     procedure TestStreamingDecoderForkContinuationBitIdenticalInt8KV;
     procedure TestStreamingDecoderRestoreRejectsMismatchedKVCacheMode;
     procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
+    // A snapshot holds only the live cache rows: its bytes follow the captured
+    // length, a reused snapshot keeps its capacity for a shorter capture and
+    // grows for a longer one, and every restore continues bit-identically.
+    procedure TestStreamingDecoderSnapshotLiveRowsTransformer;
+    procedure TestStreamingDecoderSnapshotLiveRowsQwen35Hybrid;
+    procedure TestStreamingDecoderSnapshotLiveRowsQwen35HybridInt8KV;
+    procedure TestStreamingDecoderSnapshotLiveRowsFusedGQA;
+    procedure TestStreamingDecoderSnapshotLiveRowsFusedGQAInt8KV;
+    // A snapshot that does not fit (too many rows, or eviction sinks + window
+    // past MaxCacheLen) raises before any layer is written.
+    procedure TestStreamingDecoderRestoreRejectsOversizedSnapshot;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
     procedure TestStreamingEvictionCapsCacheLengthPastWindow;
@@ -3920,6 +3941,327 @@ begin
   finally
     Snap.Free;
     Session.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.RunSnapshotLiveRows(Twin: TNNet;
+  const Inputs: array of TNNetVolume; Int8KV: boolean; const Tag: string);
+const
+  MaxLen = 32;
+  ShortLen = 3;
+  MidLen = 6;
+  LongLen = 9;
+  GrownLen = 11;
+var
+  RefSession, Session: TNNetStreamingDecoder;
+  Snap, SnapShort, SnapMid: TNNetDecoderSessionSnapshot;
+  RefOut: array of array of TNeuralFloat;
+  StepCount, MaxStepPos, T, D, MaxDimPos: integer;
+  LongBytes, ShortBytes, MidBytes, GrownBytes: int64;
+
+  // A fresh session (MaxCacheLen pMaxLen) fed Inputs[0..FedLen-1].
+  function FedSession(FedLen, pMaxLen: integer): TNNetStreamingDecoder;
+  var
+    P, MaxFedPos: integer;
+  begin
+    Result := TNNetStreamingDecoder.Create(Twin, pMaxLen, Int8KV);
+    Result.Reset();
+    MaxFedPos := FedLen - 1;
+    for P := 0 to MaxFedPos do Result.StepForward(Inputs[P], P);
+  end;
+
+  // Restores Snap into a fresh session of MaxCacheLen pMaxLen and checks every
+  // step from FromPos on against the uninterrupted reference.
+  procedure AssertResumeMatches(FromPos, pMaxLen: integer);
+  var
+    Resumed: TNNetStreamingDecoder;
+    P, Dim, MaxOutPos: integer;
+  begin
+    Resumed := TNNetStreamingDecoder.Create(Twin, pMaxLen, Int8KV);
+    try
+      // Poison every row the restore must replace (the layers are shared
+      // with the reference sessions, so an empty cache could hide a restore
+      // that copies nothing).
+      Resumed.Reset();
+      for P := 0 to FromPos do
+        Resumed.StepForward(Inputs[MaxStepPos - P], P);
+      Resumed.RestoreSnapshot(Snap);
+      for P := FromPos to MaxStepPos do
+      begin
+        Resumed.StepForward(Inputs[P], P);
+        MaxOutPos := Resumed.Output().Size - 1;
+        for Dim := 0 to MaxOutPos do
+          AssertTrue(Tag + ': resume from ' + IntToStr(FromPos) +
+            ' BIT-IDENTICAL pos ' + IntToStr(P) + ' dim ' + IntToStr(Dim),
+            RefOut[P][Dim] = Resumed.Output().FData[Dim]);
+      end;
+    finally
+      Resumed.Free;
+    end;
+  end;
+
+begin
+  StepCount := Length(Inputs);
+  MaxStepPos := StepCount - 1;
+  SetLength(RefOut, StepCount);
+  RefSession := nil; Session := nil;
+  Snap := nil; SnapShort := nil; SnapMid := nil;
+  try
+    RefSession := FedSession(0, MaxLen);
+    for T := 0 to MaxStepPos do
+    begin
+      RefSession.StepForward(Inputs[T], T);
+      MaxDimPos := RefSession.Output().Size - 1;
+      SetLength(RefOut[T], MaxDimPos + 1);
+      for D := 0 to MaxDimPos do RefOut[T][D] := RefSession.Output().FData[D];
+    end;
+
+    // Memory follows the live length: fresh snapshots at 3, 6 and 9 rows grow
+    // by the same step, which a MaxContext-sized copy would not.
+    Session := FedSession(ShortLen, MaxLen);
+    SnapShort := Session.Snapshot();
+    FreeAndNil(Session);
+    Session := FedSession(MidLen, MaxLen);
+    SnapMid := Session.Snapshot();
+    FreeAndNil(Session);
+    Session := FedSession(LongLen, MaxLen);
+    Snap := Session.Snapshot();
+    FreeAndNil(Session);
+    ShortBytes := SnapShort.Bytes();
+    MidBytes := SnapMid.Bytes();
+    LongBytes := Snap.Bytes();
+    AssertTrue(Tag + ': a longer capture holds more bytes', MidBytes > ShortBytes);
+    AssertEquals(Tag + ': bytes grow linearly with the live rows',
+      MidBytes - ShortBytes, LongBytes - MidBytes);
+    AssertEquals(Tag + ': captured length', LongLen, Snap.CacheLength);
+    AssertResumeMatches(LongLen, MaxLen);
+
+    // Reuse with a SHORTER capture keeps the capacity (no resize) and restores
+    // into a session with a smaller MaxCacheLen.
+    Session := FedSession(ShortLen, MaxLen);
+    Session.SnapshotInto(Snap);
+    FreeAndNil(Session);
+    AssertEquals(Tag + ': shorter capture keeps the capacity', LongBytes,
+      Snap.Bytes());
+    AssertEquals(Tag + ': shorter captured length', ShortLen, Snap.CacheLength);
+    AssertResumeMatches(ShortLen, StepCount);
+
+    // Reuse with a LONGER capture grows the snapshot.
+    Session := FedSession(GrownLen, MaxLen);
+    Session.SnapshotInto(Snap);
+    FreeAndNil(Session);
+    GrownBytes := Snap.Bytes();
+    AssertTrue(Tag + ': longer capture grows the snapshot', GrownBytes > LongBytes);
+    AssertEquals(Tag + ': grown captured length', GrownLen, Snap.CacheLength);
+    AssertResumeMatches(GrownLen, MaxLen);
+  finally
+    Snap.Free;
+    SnapMid.Free;
+    SnapShort.Free;
+    Session.Free;
+    RefSession.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.RunSnapshotLiveRowsOnTokens(Twin: TNNet;
+  Int8KV: boolean; const Tag: string);
+const
+  Toks: array[0..12] of integer = (3, 7, 1, 9, 4, 11, 2, 6, 8, 5, 10, 0, 7);
+var
+  Inputs: array of TNNetVolume;
+  T, MaxTokenPos: integer;
+begin
+  MaxTokenPos := High(Toks);
+  SetLength(Inputs, MaxTokenPos + 1);
+  for T := 0 to MaxTokenPos do
+  begin
+    Inputs[T] := TNNetVolume.Create(1, 1, 1);
+    Inputs[T].FData[0] := Toks[T];
+  end;
+  try
+    RunSnapshotLiveRows(Twin, Inputs, Int8KV, Tag);
+  finally
+    for T := 0 to MaxTokenPos do Inputs[T].Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.RunSnapshotLiveRowsOnFusedGQA(Int8KV: boolean;
+  const Tag: string);
+const
+  QHeads = 4;
+  KVHeads = 2;
+  HeadDim = 4;
+  StepCount = 13;
+var
+  Net: TNNet;
+  Inputs: array of TNNetVolume;
+  T, MaxStepPos, InDepth: integer;
+begin
+  RandSeed := 424242;
+  InDepth := (QHeads + 2 * KVHeads) * HeadDim;
+  Net := TNNet.Create();
+  MaxStepPos := StepCount - 1;
+  SetLength(Inputs, StepCount);
+  for T := 0 to MaxStepPos do
+  begin
+    Inputs[T] := TNNetVolume.Create(1, 1, InDepth);
+    Inputs[T].RandomizeGaussian(0.5);
+  end;
+  try
+    Net.AddLayer(TNNetInput.Create(1, 1, InDepth));
+    Net.AddLayer(TNNetFusedSDPA.Create(QHeads, KVHeads, HeadDim, {Causal=}true));
+    Net.AddLayer(TNNetSiLU.Create());
+    Net.SetTrainable(false, false);
+    RunSnapshotLiveRows(Net, Inputs, Int8KV, Tag);
+  finally
+    for T := 0 to MaxStepPos do Inputs[T].Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotLiveRowsTransformer;
+var
+  Twin: TNNet;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(1);
+  try
+    RunSnapshotLiveRowsOnTokens(Twin, {Int8KV=}false, 'transformer');
+  finally
+    Twin.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotLiveRowsQwen35Hybrid;
+var
+  Twin: TNNet;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  try
+    RunSnapshotLiveRowsOnTokens(Twin, {Int8KV=}false, 'qwen3_5 hybrid');
+  finally
+    Twin.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotLiveRowsQwen35HybridInt8KV;
+var
+  Twin: TNNet;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  try
+    RunSnapshotLiveRowsOnTokens(Twin, {Int8KV=}true, 'qwen3_5 hybrid int8 KV');
+  finally
+    Twin.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotLiveRowsFusedGQA;
+begin
+  RunSnapshotLiveRowsOnFusedGQA({Int8KV=}false, 'fused GQA');
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotLiveRowsFusedGQAInt8KV;
+begin
+  RunSnapshotLiveRowsOnFusedGQA({Int8KV=}true, 'fused GQA int8 KV');
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderRestoreRejectsOversizedSnapshot;
+const
+  FedLen = 9;
+  TargetFed = 3;
+  Toks: array[0..8] of integer = (3, 7, 1, 9, 4, 11, 2, 6, 8);
+var
+  Twin: TNNet;
+  Source, Target, Reference: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[TargetFed..FedLen - 1] of array of TNeuralFloat;
+  T, D, MaxDimPos: integer;
+
+  function RestoreRaises(): boolean;
+  begin
+    Result := false;
+    try
+      Target.RestoreSnapshot(Snap);
+    except
+      on E: Exception do Result := true;
+    end;
+  end;
+
+  procedure Feed(Session: TNNetStreamingDecoder; FromPos, ToPos: integer);
+  var
+    P: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  // A hybrid: if any layer were written before the refusal (the attention
+  // cache or the recurrent states after it), the continuation would differ.
+  Twin := BuildTinyQwen35HybridLM(1);
+  Source := nil; Target := nil; Reference := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Source := TNNetStreamingDecoder.Create(Twin, 32);
+    Source.Reset();
+    Source.EnableEviction({SinkTokens=}2, {RecentWindow=}20);
+    Feed(Source, 0, FedLen);
+    Snap := Source.Snapshot();
+    FreeAndNil(Source);
+
+    // The sessions share Twin's layers (the state lives there), so the
+    // untouched continuation is recorded before the target session runs.
+    Reference := TNNetStreamingDecoder.Create(Twin, 13);
+    Reference.Reset();
+    Feed(Reference, 0, TargetFed);
+    for T := TargetFed to FedLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Reference.StepForward(StepIn, T);
+      MaxDimPos := Reference.Output().Size - 1;
+      SetLength(RefOut[T], MaxDimPos + 1);
+      for D := 0 to MaxDimPos do RefOut[T][D] := Reference.Output().FData[D];
+    end;
+    FreeAndNil(Reference);
+
+    // 9 rows fit 13, but sinks 2 + window 20 would let appends run past it.
+    Target := TNNetStreamingDecoder.Create(Twin, 13);
+    Target.Reset();
+    Feed(Target, 0, TargetFed);
+    AssertTrue('sinks + window past MaxCacheLen must raise', RestoreRaises());
+    AssertEquals('a refused restore leaves the cache length untouched',
+      TargetFed, Target.SDPACacheLength(0));
+    // The refused session must continue exactly like one never touched.
+    for T := TargetFed to FedLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Target.StepForward(StepIn, T);
+      MaxDimPos := Target.Output().Size - 1;
+      for D := 0 to MaxDimPos do
+        AssertTrue('refused restore wrote no state, pos ' + IntToStr(T) +
+          ' dim ' + IntToStr(D), RefOut[T][D] = Target.Output().FData[D]);
+    end;
+    FreeAndNil(Target);
+
+    // 9 rows do not fit a 5-row cache.
+    Target := TNNetStreamingDecoder.Create(Twin, 5);
+    Target.Reset();
+    AssertTrue('more rows than MaxCacheLen must raise', RestoreRaises());
+  finally
+    Snap.Free;
+    Reference.Free;
+    Target.Free;
+    Source.Free;
     StepIn.Free;
     Twin.Free;
   end;
