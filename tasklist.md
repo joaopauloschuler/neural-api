@@ -2366,10 +2366,47 @@ rather than acted on.
           TNNetSum needed no change. Follow-up:
           - [ ] Mid-block attention in OpenCL memory (device softmax, or the
                 VAE through TNNetFusedSDPA's non-causal tiled kernel).
-    - [ ] B2f. Later, for big tiles / untiled decode: implicit-GEMM conv (no
-          im2col, folds the 2x upsample), per-row bias instead of the
-          output-sized bias copy, activation buffer reuse by liveness; then
-          256/192 -> 512/384 -> untiled tiles.
+    - [ ] B2f. Big tiles / untiled decode. Plan (2026-10-03, computed from the
+          code and the real config, not measured; dims 1152/1152/1152/576/288/
+          144, 1.06 TFLOP per 256-px tile; 1024x1024 = 29.2 TFLOP at 256/192,
+          26.5 at 512/384, 17.0 untiled). OpenCL bytes per sized net at a
+          256 tile / 512 / untiled 1024: today 10.4 / 38.5 / 151 GB (im2col
+          6.1 GB at 256); after B2f1 4.2 / 13.6 / 51.4; after B2f2 3.5 / 11.0 /
+          41.0; after B2f3 ~1.3 / ~1.9 / ~4.7. Host today 9.9 + 2.0 GB at 256.
+          Corrections to earlier notes: the 1 GB FP32 upload is inside the net
+          (first forward) and small; blending is milliseconds; the ~22 s outside
+          the nets is most likely host-side arming per tile shape
+          (`TNNetLayerConcatedWeights.EnableOpenCL` calls `AfterWeightUpdate`
+          twice: 1 GB concat + scalar transpose + output-sized bias fill per
+          call) plus ~10 GB of zero-filled host volumes per build. Untiled 1024
+          also overflows on the host (`TVolume.ReSize` integer size;
+          `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
+          resident, so the VAE has ~10-14 GB on a 24 GB L4.
+          - [ ] B2f0. Phase timers in `TQwenImage21VaeDecoder` under --profile
+                (build, PrepareInferenceThreads, arming split into
+                AfterWeightUpdate vs buffers, forwards, blend, release) and
+                `TNNet.OpenCLBufferBytes()`. No behaviour change. L4 run with
+                --profile and --serial.
+          - [ ] B2f1. Implicit-GEMM conv on OpenCL (FP32, inference-only):
+                gather stage in `cai_dot_product_tiled_body`, naive twin for
+                Cout < 64 (conv_out); lazy `FInputBufferBs`; inference-only
+                spatial convs stop sizing host `FInputPrepared`. Int8 keeps
+                im2col. Fixes the int32 overflow.
+          - [ ] B2f2. Per-row bias in OpenCL (`Bias[row]`); lazy host
+                `FBiasOutput` / `FOutputRaw`.
+          - [ ] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;
+                reuse only when every consumer of the producer is an ancestor;
+                single in-order queue; last layer pinned).
+          - [ ] B2f4. Host `FOutput` sharing by liveness (exact-size aliases,
+                opt-in).
+          - [ ] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
+                OpenCL (-17% of decode FLOPs); CPU path unchanged.
+          - [ ] B2f6. Untiled path: memory estimator vs the device limits,
+                `--vae-tile 0`; L4 runs 256/192 -> 512/384 -> untiled in the REPL;
+                then the default decision with the user.
+          Side note: `FInputBufferBs` (READ_ONLY) is written by cai_im2col and
+          `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
+          NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
   Phase C — editing and reference images:
   - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
