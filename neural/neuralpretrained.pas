@@ -8898,6 +8898,15 @@ function QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
   SpatialScale: integer): string;
 
 type
+  // One sized VAE net under LayerProfiling: wall ms of its host phases and the
+  // bytes it holds, sampled after its last pass.
+  TQwenImage21VaeNetPhases = record
+    LatentW, LatentH, PassCount: integer;
+    BuildMs, ThreadsMs, ArmingMs, ArmingWeightPrepMs: double;
+    ForwardMs, DownloadMs: double;
+    OpenCLBytes, HostBytes: int64;
+  end;
+
   // Qwen-Image-2.1 VAE decoder (diffusers AutoencoderKLQwenImage21.decode for
   // one image). WeightOwner is a 1x1-latent net holding the weights; Net is the
   // sized net that borrows them. Latent (W/16, H/16, z_dim) is the NORMALISED
@@ -8917,6 +8926,15 @@ type
     FLayerProfiling: boolean;
     FNetPassCount: integer;
     FReleasedNetsProfile: string;
+    // LayerProfiling: phases of Net and of the nets ReleaseNet freed, and the
+    // decode-level times since ClearProfileReport.
+    FNetPhases: TQwenImage21VaeNetPhases;
+    FReleasedNetPhases: array of TQwenImage21VaeNetPhases;
+    // Phase times of every net (FProfileTotals) and the part of them that fell
+    // inside a Decode/DecodeTiled wall (FDecodePhases).
+    FProfileTotals, FDecodePhases: TQwenImage21VaeNetPhases;
+    FDecodeCount: integer;
+    FDecodeWallMs, FDecodeAssemblyMs, FDecodeReleaseMs, FReleaseMs: double;
     {$IFDEF OpenCL}
     // Set by EnableOpenCL: a weightless net that owns the OpenCL context and
     // program; PrepareNet arms every sized net in it.
@@ -8925,6 +8943,17 @@ type
     {$ENDIF}
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
     function NetProfile(): string;
+    // FNetPhases with Net's pass count and byte counts filled in.
+    function CurrentNetPhases(): TQwenImage21VaeNetPhases;
+    // The per-net phase table and the decode wall-time split.
+    function PhaseReport(): string;
+    // One forward of Net on LatentTile and the copy of its image into
+    // TileImage; LayerProfiling times both.
+    procedure DecodeTile(LatentTile, TileImage: TNNetVolume);
+    // Adds one decode's wall and assembly times, and the phase and ReleaseNet
+    // times accrued since TotalsBefore / ReleaseMsBefore were taken.
+    procedure AddDecodeProfile(DecodeStart, AssemblyStart: TDateTime;
+      const TotalsBefore: TQwenImage21VaeNetPhases; ReleaseMsBefore: double);
   public
     // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
     constructor Create(const VaeFolder: string);
@@ -8958,7 +8987,7 @@ type
     function OpenCLEnabled(): boolean;
     {$ENDIF}
     // TNNet.LayerProfiling on every sized net (read when Net is (re)built);
-    // ProfileReport has one per-class table per net since Create.
+    // ProfileReport has the phase table and one per-class table per net.
     property LayerProfiling: boolean read FLayerProfiling
       write FLayerProfiling;
     function ProfileReport(): string;
@@ -68768,32 +68797,199 @@ begin
 end;
 
 procedure TQwenImage21VaeDecoder.PrepareNet(LatentW, LatentH: integer);
+var
+  PhaseStart: TDateTime;
 begin
   if Assigned(FNet) and (LatentW = FNetLatentW) and (LatentH = FNetLatentH) then
     exit;
   ReleaseNet();
+  FNetPhases := Default(TQwenImage21VaeNetPhases);
+  FNetPhases.LatentW := LatentW;
+  FNetPhases.LatentH := LatentH;
+  PhaseStart := Now();
   FNet := TNNet.Create();
   FNet.BuildWeightOwner := FWeightOwner;
   BuildQwenImage21VaeDecoderNet(FNet, FConfig, LatentW, LatentH);
   FNet.BuildWeightOwner := nil;
+  FNetPhases.BuildMs := (Now() - PhaseStart) * MSecsPerDay;
+  PhaseStart := Now();
   PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
+  FNetPhases.ThreadsMs := (Now() - PhaseStart) * MSecsPerDay;
   FNet.LayerProfiling := FLayerProfiling;
   {$IFDEF OpenCL}
   if Assigned(FOpenCLContextNet) then
+  begin
+    PhaseStart := Now();
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
+    FNetPhases.ArmingMs := (Now() - PhaseStart) * MSecsPerDay;
+    FNetPhases.ArmingWeightPrepMs :=
+      FNet.OpenCLArmingWeightPrepTime * MSecsPerDay;
+  end;
   {$ENDIF}
+  FProfileTotals.BuildMs := FProfileTotals.BuildMs + FNetPhases.BuildMs;
+  FProfileTotals.ThreadsMs := FProfileTotals.ThreadsMs + FNetPhases.ThreadsMs;
+  FProfileTotals.ArmingMs := FProfileTotals.ArmingMs + FNetPhases.ArmingMs;
+  FProfileTotals.ArmingWeightPrepMs := FProfileTotals.ArmingWeightPrepMs +
+    FNetPhases.ArmingWeightPrepMs;
   FNetLatentW := LatentW;
   FNetLatentH := LatentH;
   FNetPassCount := 0;
 end;
 
+// The ReleaseNet time includes the per-class table and the byte sampling.
 procedure TQwenImage21VaeDecoder.ReleaseNet();
+var
+  IsProfiled: boolean;
+  ReleaseStart: TDateTime;
 begin
+  IsProfiled := FLayerProfiling and Assigned(FNet);
+  ReleaseStart := 0;
+  if IsProfiled then ReleaseStart := Now();
   FReleasedNetsProfile := FReleasedNetsProfile + NetProfile();
+  if IsProfiled then
+  begin
+    SetLength(FReleasedNetPhases, Length(FReleasedNetPhases) + 1);
+    FReleasedNetPhases[High(FReleasedNetPhases)] := CurrentNetPhases();
+  end;
   FreeAndNil(FNet);
+  if IsProfiled then
+    FReleaseMs := FReleaseMs + (Now() - ReleaseStart) * MSecsPerDay;
   FNetLatentW := 0;
   FNetLatentH := 0;
   FNetPassCount := 0;
+end;
+
+function TQwenImage21VaeDecoder.CurrentNetPhases(): TQwenImage21VaeNetPhases;
+begin
+  Result := FNetPhases;
+  Result.PassCount := FNetPassCount;
+  Result.OpenCLBytes := FNet.OpenCLBufferBytes();
+  Result.HostBytes := FNet.NonWeightBytes();
+end;
+
+function TQwenImage21VaeDecoder.PhaseReport(): string;
+var
+  Lines: TStringList;
+  Total: TQwenImage21VaeNetPhases;
+  RowPos, MaxRowPos: integer;
+  OutsideDecodeSetupMs: double;
+  InDecodeMs, OutsideMs, AccountedMs: double;
+
+  procedure AddRow(const Row: TQwenImage21VaeNetPhases);
+  begin
+    Lines.Add(Format('%-8s %-10s %6d %9.1f %8.1f %9.1f %12.1f %10.1f %9.1f ' +
+      '%10.1f %9.1f', [IntToStr(Row.LatentW) + 'x' + IntToStr(Row.LatentH),
+      IntToStr(Row.LatentW * FConfig.SpatialScale) + 'x' +
+      IntToStr(Row.LatentH * FConfig.SpatialScale), Row.PassCount,
+      Row.BuildMs, Row.ThreadsMs, Row.ArmingMs, Row.ArmingWeightPrepMs,
+      Row.ForwardMs, Row.DownloadMs, Row.OpenCLBytes / (1024 * 1024),
+      Row.HostBytes / (1024 * 1024)]));
+  end;
+
+begin
+  Result := '';
+  MaxRowPos := High(FReleasedNetPhases);
+  if (MaxRowPos < 0) and not Assigned(FNet) and (FDecodeCount = 0) then exit;
+  Total := FDecodePhases;
+  Lines := TStringList.Create;
+  try
+    Lines.Add('[profile] VAE decode phases per sized net (wall ms). OpenCL MB ' +
+      '= TNNet.OpenCLBufferBytes: FDotCL of every layer plus the own buffers ' +
+      'of the input, activation, sum, concat, split/gather, norm and ' +
+      'upsample layers (other helpers not counted); host MB = ' +
+      'TNNet.NonWeightBytes. Both sampled after the last pass.');
+    Lines.Add(Format('%-8s %-10s %6s %9s %8s %9s %12s %10s %9s %10s %9s',
+      ['Latent', 'Pixels', 'Passes', 'build', 'threads', 'arming',
+      'weight prep', 'forwards', 'download', 'OpenCL MB', 'host MB']));
+    for RowPos := 0 to MaxRowPos do AddRow(FReleasedNetPhases[RowPos]);
+    if Assigned(FNet) then AddRow(CurrentNetPhases());
+    Lines.Add('(build = BuildQwenImage21VaeDecoderNet with the weight links; ' +
+      'threads = PrepareInferenceThreads; arming = EnableOpenCLInContextOf, ' +
+      'of which weight prep = AfterWeightUpdate: bias, concat, interleave; ' +
+      'download = ForceOutputOnRAM + copy of the tile image)');
+    if FDecodeCount > 0 then
+    begin
+      InDecodeMs := FDecodeWallMs;
+      OutsideMs := InDecodeMs - Total.ForwardMs;
+      AccountedMs := Total.BuildMs + Total.ThreadsMs + Total.ArmingMs +
+        Total.DownloadMs + FDecodeAssemblyMs + FDecodeReleaseMs;
+      Lines.Add(Format('[profile] VAE decode wall %.1f ms over %d decode(s): ' +
+        'forwards %.1f ms, outside the forwards %.1f ms = build %.1f + ' +
+        'threads %.1f + arming %.1f (weight prep %.1f, buffers and the rest ' +
+        '%.1f) + download %.1f + blend/assembly %.1f + ReleaseNet %.1f + ' +
+        'unaccounted (tile crops, timer rounding) %.1f', [InDecodeMs,
+        FDecodeCount, Total.ForwardMs,
+        OutsideMs, Total.BuildMs, Total.ThreadsMs, Total.ArmingMs,
+        Total.ArmingWeightPrepMs, Total.ArmingMs - Total.ArmingWeightPrepMs,
+        Total.DownloadMs, FDecodeAssemblyMs, FDecodeReleaseMs,
+        OutsideMs - AccountedMs]));
+      Lines.Add(Format('[profile] ReleaseNet after the decode(s): %.1f ms',
+        [FReleaseMs - FDecodeReleaseMs]));
+    end;
+    OutsideDecodeSetupMs := FProfileTotals.BuildMs + FProfileTotals.ThreadsMs +
+      FProfileTotals.ArmingMs - FDecodePhases.BuildMs - FDecodePhases.ThreadsMs -
+      FDecodePhases.ArmingMs;
+    if OutsideDecodeSetupMs > 0 then
+      Lines.Add(Format('[profile] build, threads and arming outside any ' +
+        'decode (PrepareNet, EnableOpenCL called directly): %.1f ms',
+        [OutsideDecodeSetupMs]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TQwenImage21VaeDecoder.DecodeTile(LatentTile,
+  TileImage: TNNetVolume);
+var
+  PhaseStart: TDateTime;
+  PhaseMs: double;
+begin
+  PhaseStart := 0;
+  if FLayerProfiling then PhaseStart := Now();
+  FNet.Compute(LatentTile, 0, FParallel);
+  Inc(FNetPassCount);
+  if FLayerProfiling then
+  begin
+    PhaseMs := (Now() - PhaseStart) * MSecsPerDay;
+    FNetPhases.ForwardMs := FNetPhases.ForwardMs + PhaseMs;
+    FProfileTotals.ForwardMs := FProfileTotals.ForwardMs + PhaseMs;
+    PhaseStart := Now();
+  end;
+  FNet.GetLastLayer().ForceOutputOnRAM();
+  TileImage.Copy(FNet.GetLastLayer().Output);
+  if FLayerProfiling then
+  begin
+    PhaseMs := (Now() - PhaseStart) * MSecsPerDay;
+    FNetPhases.DownloadMs := FNetPhases.DownloadMs + PhaseMs;
+    FProfileTotals.DownloadMs := FProfileTotals.DownloadMs + PhaseMs;
+  end;
+end;
+
+procedure TQwenImage21VaeDecoder.AddDecodeProfile(DecodeStart,
+  AssemblyStart: TDateTime; const TotalsBefore: TQwenImage21VaeNetPhases;
+  ReleaseMsBefore: double);
+var
+  DecodeEnd: TDateTime;
+begin
+  DecodeEnd := Now();
+  FDecodePhases.BuildMs := FDecodePhases.BuildMs + FProfileTotals.BuildMs -
+    TotalsBefore.BuildMs;
+  FDecodePhases.ThreadsMs := FDecodePhases.ThreadsMs +
+    FProfileTotals.ThreadsMs - TotalsBefore.ThreadsMs;
+  FDecodePhases.ArmingMs := FDecodePhases.ArmingMs + FProfileTotals.ArmingMs -
+    TotalsBefore.ArmingMs;
+  FDecodePhases.ArmingWeightPrepMs := FDecodePhases.ArmingWeightPrepMs +
+    FProfileTotals.ArmingWeightPrepMs - TotalsBefore.ArmingWeightPrepMs;
+  FDecodePhases.ForwardMs := FDecodePhases.ForwardMs +
+    FProfileTotals.ForwardMs - TotalsBefore.ForwardMs;
+  FDecodePhases.DownloadMs := FDecodePhases.DownloadMs +
+    FProfileTotals.DownloadMs - TotalsBefore.DownloadMs;
+  Inc(FDecodeCount);
+  FDecodeWallMs := FDecodeWallMs + (DecodeEnd - DecodeStart) * MSecsPerDay;
+  FDecodeAssemblyMs := FDecodeAssemblyMs +
+    (DecodeEnd - AssemblyStart) * MSecsPerDay;
+  FDecodeReleaseMs := FDecodeReleaseMs + FReleaseMs - ReleaseMsBefore;
 end;
 
 function TQwenImage21VaeDecoder.NetProfile(): string;
@@ -68810,13 +69006,32 @@ end;
 
 function TQwenImage21VaeDecoder.ProfileReport(): string;
 begin
-  Result := FReleasedNetsProfile + NetProfile();
+  Result := '';
+  if not FLayerProfiling then exit;
+  Result := PhaseReport() + FReleasedNetsProfile + NetProfile();
 end;
 
+// A net that outlives the clear keeps its shape but not its build and arming
+// times: they belong to an earlier decode.
 procedure TQwenImage21VaeDecoder.ClearProfileReport();
+var
+  LatentW, LatentH: integer;
 begin
   FReleasedNetsProfile := '';
   FNetPassCount := 0;
+  LatentW := FNetPhases.LatentW;
+  LatentH := FNetPhases.LatentH;
+  FNetPhases := Default(TQwenImage21VaeNetPhases);
+  FNetPhases.LatentW := LatentW;
+  FNetPhases.LatentH := LatentH;
+  SetLength(FReleasedNetPhases, 0);
+  FProfileTotals := Default(TQwenImage21VaeNetPhases);
+  FDecodePhases := Default(TQwenImage21VaeNetPhases);
+  FDecodeCount := 0;
+  FDecodeWallMs := 0;
+  FDecodeAssemblyMs := 0;
+  FDecodeReleaseMs := 0;
+  FReleaseMs := 0;
   if Assigned(FNet) then FNet.ClearTime();
 end;
 
@@ -68825,6 +69040,9 @@ end;
 // OpenCL weight buffer per convolution that no forward ever fills.
 function TQwenImage21VaeDecoder.EnableOpenCL(pPlatform: cl_platform_id;
   pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
+var
+  ArmingStart: TDateTime;
+  WeightPrepBefore, ArmingMs, WeightPrepMs: double;
 begin
   Result := true;
   if Assigned(FOpenCLContextNet) then exit;
@@ -68839,7 +69057,20 @@ begin
   end;
   FOpenCLHasSharedKernel := pHasSharedKernel;
   if Assigned(FNet) then
+  begin
+    WeightPrepBefore := FNet.OpenCLArmingWeightPrepTime;
+    ArmingStart := Now();
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, pHasSharedKernel);
+    ArmingMs := (Now() - ArmingStart) * MSecsPerDay;
+    WeightPrepMs := (FNet.OpenCLArmingWeightPrepTime - WeightPrepBefore) *
+      MSecsPerDay;
+    FNetPhases.ArmingMs := FNetPhases.ArmingMs + ArmingMs;
+    FNetPhases.ArmingWeightPrepMs := FNetPhases.ArmingWeightPrepMs +
+      WeightPrepMs;
+    FProfileTotals.ArmingMs := FProfileTotals.ArmingMs + ArmingMs;
+    FProfileTotals.ArmingWeightPrepMs := FProfileTotals.ArmingWeightPrepMs +
+      WeightPrepMs;
+  end;
 end;
 
 function TQwenImage21VaeDecoder.OpenCLEnabled(): boolean;
@@ -68849,17 +69080,27 @@ end;
 {$ENDIF}
 
 procedure TQwenImage21VaeDecoder.Decode(Latent, Image: TNNetVolume);
+var
+  DecodeStart, AssemblyStart: TDateTime;
+  ReleaseMsBefore: double;
+  TotalsBefore: TQwenImage21VaeNetPhases;
 begin
   if Latent.Depth <> FConfig.ZDim then
     ImportError(csQwenImage21VaeImporter + ': the latent has ' +
       IntToStr(Latent.Depth) + ' channels, expected z_dim = ' +
       IntToStr(FConfig.ZDim) + '.');
+  DecodeStart := 0;
+  ReleaseMsBefore := FReleaseMs;
+  TotalsBefore := FProfileTotals;
+  if FLayerProfiling then DecodeStart := Now();
   PrepareNet(Latent.SizeX, Latent.SizeY);
-  FNet.Compute(Latent, 0, FParallel);
-  Inc(FNetPassCount);
-  FNet.GetLastLayer().ForceOutputOnRAM();
-  Image.Copy(FNet.GetLastLayer().Output);
+  DecodeTile(Latent, Image);
+  AssemblyStart := 0;
+  if FLayerProfiling then AssemblyStart := Now();
   Image.ForceMaxRange(1.0);
+  if FLayerProfiling then
+    AddDecodeProfile(DecodeStart, AssemblyStart, TotalsBefore,
+      ReleaseMsBefore);
 end;
 
 procedure TQwenImage21VaeDecoder.DecodeTiled(Latent, Image: TNNetVolume;
@@ -68872,6 +69113,9 @@ var
   TileWidths, TileHeights: TNeuralIntegerArray;
   LatentTile: TNNetVolume;
   TileProblem: string;
+  DecodeStart, AssemblyStart: TDateTime;
+  ReleaseMsBefore: double;
+  TotalsBefore: TQwenImage21VaeNetPhases;
 begin
   Scale := FConfig.SpatialScale;
   TileProblem := QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
@@ -68891,6 +69135,11 @@ begin
     ImportError(csQwenImage21VaeImporter + ': the latent has ' +
       IntToStr(Latent.Depth) + ' channels, expected z_dim = ' +
       IntToStr(FConfig.ZDim) + '.');
+  DecodeStart := 0;
+  AssemblyStart := 0;
+  ReleaseMsBefore := FReleaseMs;
+  TotalsBefore := FProfileTotals;
+  if FLayerProfiling then DecodeStart := Now();
   RowCount := (Latent.SizeY + TileLatentStride - 1) div TileLatentStride;
   ColumnCount := (Latent.SizeX + TileLatentStride - 1) div TileLatentStride;
   TileCount := RowCount * ColumnCount;
@@ -68924,13 +69173,11 @@ begin
         LatentTile.CopyCropping(Latent,
           (ShapeTilePos mod ColumnCount) * TileLatentStride,
           (ShapeTilePos div ColumnCount) * TileLatentStride, TileW, TileH);
-        FNet.Compute(LatentTile, 0, FParallel);
-        Inc(FNetPassCount);
-        FNet.GetLastLayer().ForceOutputOnRAM();
         Tiles[ShapeTilePos] := TNNetVolume.Create();
-        Tiles[ShapeTilePos].Copy(FNet.GetLastLayer().Output);
+        DecodeTile(LatentTile, Tiles[ShapeTilePos]);
       end;
     end;
+    if FLayerProfiling then AssemblyStart := Now();
     // Row-major and in place, as diffusers does: a tile blends with its
     // neighbours after they were blended themselves.
     Image.ReSize(Latent.SizeX * Scale, Latent.SizeY * Scale,
@@ -68956,6 +69203,9 @@ begin
     for TilePos := 0 to MaxTilePos do Tiles[TilePos].Free;
   end;
   Image.ForceMaxRange(1.0);
+  if FLayerProfiling then
+    AddDecodeProfile(DecodeStart, AssemblyStart, TotalsBefore,
+      ReleaseMsBefore);
 end;
 
 // ===========================================================================
@@ -83292,6 +83542,8 @@ begin
     LatentImage.ReSize(GridW, GridH, Latents.Depth);
     DoPhase(qppDecode);
     Vae.DecodeTiled(LatentImage, Image, FVaeTileSize, FVaeTileStride);
+    // Released before the report, so the report includes this ReleaseNet.
+    Vae.ReleaseNet();
     FVaeProfileReport := Vae.ProfileReport();
   finally
     if Assigned(FVaeDecoder) then FVaeDecoder.ReleaseNet()

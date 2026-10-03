@@ -2382,11 +2382,16 @@ rather than acted on.
           also overflows on the host (`TVolume.ReSize` integer size;
           `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
           resident, so the VAE has ~10-14 GB on a 24 GB L4.
-          - [ ] B2f0. Phase timers in `TQwenImage21VaeDecoder` under --profile
+          - [x] B2f0. Phase timers in `TQwenImage21VaeDecoder` under --profile
                 (build, PrepareInferenceThreads, arming split into
                 AfterWeightUpdate vs buffers, forwards, blend, release) and
                 `TNNet.OpenCLBufferBytes()`. No behaviour change. L4 run with
                 --profile and --serial.
+                DONE: per-shape phase table + a decode-wall split line; arming
+                weight prep via `TimedAfterWeightUpdate`; OpenCLBufferBytes from
+                `clGetMemObjectInfo` (partial: FDotCL + overriding classes; the
+                VAE's classes are covered). Pico shows no real-size signal;
+                waiting for the user's L4 run.
           - [ ] B2f1. Implicit-GEMM conv on OpenCL (FP32, inference-only):
                 gather stage in `cai_dot_product_tiled_body`, naive twin for
                 Cout < 64 (conv_out); lazy `FInputBufferBs`; inference-only

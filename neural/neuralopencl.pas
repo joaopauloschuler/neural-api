@@ -594,6 +594,9 @@ type
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
         NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
+      /// Bytes of the OpenCL buffers this instance holds now; retained
+      /// (borrowed) codes and scales are left to their owner.
+      function BufferBytes(): int64;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
       /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
@@ -667,6 +670,10 @@ procedure SetTiledGemmMinColumns(pValue: integer);
 /// _MAX_CHUNK_ROWS are set.
 procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
   MaxChunkRows: integer);
+
+/// Size in bytes of an OpenCL buffer as the driver reports it (CL_MEM_SIZE);
+/// 0 for nil or when the query fails.
+function OpenCLMemBytes(Buffer: cl_mem): int64;
 
 var
   // While true, TEasyOpenCL's Write/Read routines add every transfer to the
@@ -782,6 +789,30 @@ begin
   UnprepareForCompute();
   // FInt8Kernel and FFP16Kernel are net-owned shared handles - not freed here.
   inherited Destroy();
+end;
+
+function OpenCLMemBytes(Buffer: cl_mem): int64;
+var
+  BufferSize, SizeWritten: csize_t;
+begin
+  Result := 0;
+  if Buffer = nil then exit;
+  BufferSize := 0;
+  SizeWritten := 0;
+  if clGetMemObjectInfo(Buffer, CL_MEM_SIZE, SizeOf(BufferSize), @BufferSize,
+    {$IFDEF FPC}SizeWritten{$ELSE}@SizeWritten{$ENDIF}) = CL_SUCCESS then
+    Result := BufferSize;
+end;
+
+function TDotProductSharedKernel.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FInputBufferAs) + OpenCLMemBytes(FInputBufferBs) +
+    OpenCLMemBytes(FResultBuffer) + OpenCLMemBytes(FBiasBuffer) +
+    OpenCLMemBytes(FIm2ColSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
+    OpenCLMemBytes(FInputBufferBsFP16);
+  if not FCodesBorrowed then
+    Result := Result + OpenCLMemBytes(FCodesBuffer) +
+      OpenCLMemBytes(FScalesBuffer) + OpenCLMemBytes(FBlockScalesBuffer);
 end;
 
 procedure TDotProductSharedKernel.UnprepareForCompute();

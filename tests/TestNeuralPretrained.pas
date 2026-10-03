@@ -787,6 +787,7 @@ type
     procedure TestQwenImage21VaeDecoderTensorSet;
     procedure TestQwenImage21VaeDecoderParity;
     procedure TestQwenImage21VaeDecoderTiledParity;
+    procedure TestQwenImage21VaeDecoderPhaseProfile;
     procedure TestQwenImage21VaeDecoderOpenCL;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwenImage21PipelineParity;
@@ -29230,6 +29231,66 @@ begin
   end;
 end;
 
+// LayerProfiling on the CPU: DecodeTiled 32/16 reports one phase row per tile
+// shape and the decode wall split; no net holds OpenCL buffers.
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderPhaseProfile;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, Image: TNNetVolume;
+  Report: string;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    Decoder.DecodeTiled(Latent, Image, 32, 16);
+    AssertEquals('no report without LayerProfiling', '',
+      Decoder.ProfileReport());
+    Decoder.LayerProfiling := true;
+    Decoder.ReleaseNet();
+    Decoder.ClearProfileReport();
+    Decoder.DecodeTiled(Latent, Image, 32, 16);
+    AssertEquals('the CPU net holds no OpenCL buffers', 0,
+      Decoder.Net.OpenCLBufferBytes());
+    Decoder.ReleaseNet();
+    Report := Decoder.ProfileReport();
+    WriteLn(Report);
+    AssertTrue('phase table', Pos('[profile] VAE decode phases per sized net',
+      Report) > 0);
+    AssertTrue('2x2 row, 9 passes', Pos(Format('%-8s %-10s %6d',
+      ['2x2', '32x32', 9]), Report) > 0);
+    AssertTrue('1x2 row, 3 passes', Pos(Format('%-8s %-10s %6d',
+      ['1x2', '16x32', 3]), Report) > 0);
+    AssertTrue('2x1 row, 3 passes', Pos(Format('%-8s %-10s %6d',
+      ['2x1', '32x16', 3]), Report) > 0);
+    AssertTrue('1x1 row, 1 pass', Pos(Format('%-8s %-10s %6d',
+      ['1x1', '16x16', 1]), Report) > 0);
+    AssertTrue('decode wall split', Pos('[profile] VAE decode wall', Report) > 0);
+    AssertTrue('outside the forwards', Pos('outside the forwards', Report) > 0);
+    AssertTrue('no arming on the CPU', Pos('arming 0.0 (weight prep 0.0',
+      Report) > 0);
+    AssertTrue('final ReleaseNet', Pos('[profile] ReleaseNet after the ' +
+      'decode(s)', Report) > 0);
+    AssertTrue('per-class tables follow', Pos('[profile] VAE decoder net for ' +
+      'a 2x2 latent', Report) > 0);
+  finally
+    Image.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
 // The pico decoder with OpenCL armed vs the CPU on the 4x4 latent: tiled
 // 32/16 (four tile shapes, each net armed in the one context of EnableOpenCL),
 // then whole, serial (parallel + OpenCL is slow on PoCL; the pipeline test
@@ -29252,6 +29313,8 @@ var
   Layer: TNNetLayer;
   MaxDiff: double;
   Transfers, NoTransfers: TOpenCLTransferCounts;
+  OpenCLBytes: int64;
+  Report: string;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -29348,6 +29411,29 @@ begin
     // and the projection after it uploads; the latent is the other upload.
     AssertEquals('uploads per decode', 2, Transfers.UploadCount);
     AssertEquals('downloads per decode', 1, Transfers.DownloadCount);
+    // A rebuilt net under LayerProfiling: phase report with arming, buffers
+    // counted while armed and none left after DisableOpenCL.
+    Decoder.ReleaseNet();
+    Decoder.LayerProfiling := true;
+    Decoder.ClearProfileReport();
+    Decoder.Decode(Latent, Image);
+    OpenCLBytes := Decoder.Net.OpenCLBufferBytes();
+    WriteLn('  Qwen-Image-2.1 VAE 4x4 net OpenCL buffers: ', OpenCLBytes, ' B');
+    AssertTrue('the armed net holds OpenCL buffers', OpenCLBytes > 0);
+    Report := Decoder.ProfileReport();
+    AssertTrue('phase table', Pos('[profile] VAE decode phases per sized net',
+      Report) > 0);
+    AssertTrue('4x4 row, 1 pass', Pos(Format('%-8s %-10s %6d',
+      ['4x4', '64x64', 1]), Report) > 0);
+    AssertTrue('decode wall split', Pos('outside the forwards', Report) > 0);
+    Decoder.Net.DisableOpenCL();
+    AssertEquals('OpenCL buffers after DisableOpenCL', 0,
+      Decoder.Net.OpenCLBufferBytes());
+    Decoder.ReleaseNet();
+    Report := Decoder.ProfileReport();
+    WriteLn(Report);
+    AssertTrue('final ReleaseNet', Pos('[profile] ReleaseNet after the ' +
+      'decode(s)', Report) > 0);
   finally
     Image.Free;
     WholeCPU.Free;

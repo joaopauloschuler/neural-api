@@ -717,6 +717,9 @@ type
       // Bytes of every TNNetVolume this layer owns apart from its neurons'
       // weight rows and quantized tables: activations, error buffers, caches.
       function NonWeightBytes(): int64; virtual;
+      // Bytes of the OpenCL buffers this layer owns now: FDotCL plus the classes
+      // that override it (partial: e.g. embedding tables, KV caches not counted).
+      function OpenCLBufferBytes(): int64; virtual;
       // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Multiplies all weights in the layer by value V.
@@ -1152,6 +1155,11 @@ type
       // DisableOpenCL AND from Destroy, which is why it is a routine: a layer
       // is destroyed without a DisableOpenCL first. Coded by Claude (AI).
       procedure ReleaseInt8Kernels();
+    protected
+      // AfterWeightUpdate, its wall time added to the net's
+      // OpenCLArmingWeightPrepTime when the net profiles its layers.
+      procedure TimedAfterWeightUpdate();
+    public
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       // Whether this layer wants the FP16 activation kernels. False here: the
@@ -1244,6 +1252,7 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       // The next Compute copies Source's resident output into this layer's
       // OpenCL buffer instead of uploading FOutput. False: nothing changes.
@@ -1381,6 +1390,7 @@ type
       procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
@@ -2287,6 +2297,8 @@ type
     // caller; and a blocking upload of V into an existing buffer.
     function NewOpenCLBuffer(Bytes: csize_t): cl_mem;
     procedure UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
+    // Bytes of the OpenCL buffers this helper owns now; 0 unless overridden.
+    function BufferBytes(): int64; virtual;
   end;
 
   // OpenCL device forward for the GLU-family gated feed-forward activations
@@ -5145,6 +5157,7 @@ type
     destructor Destroy(); override;
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
     // Gathers Consumer.PrevLayer's output into Consumer.Output's shape: binds a
     // resident source and keeps the result in OpenCL memory unless trainable.
     procedure GatherFromPrevLayer(Consumer: TNNetLayer;
@@ -5245,6 +5258,7 @@ type
     // per forward: EnsureOutputBuffer replaces the handle when Y grows.
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
     // Normalizes NumSegments contiguous segments of X into Y; Gain/Bias are
     // SegmentSize long (Bias nil if not UseMean); pExternalSrc is borrowed.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
@@ -8571,6 +8585,7 @@ type
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
   end;
 
@@ -8627,6 +8642,7 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
@@ -8664,6 +8680,7 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
@@ -8738,6 +8755,7 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
@@ -13083,6 +13101,7 @@ type
     procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLBufferBytes(): int64; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
@@ -13118,6 +13137,7 @@ type
     procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLBufferBytes(): int64; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
@@ -13279,6 +13299,7 @@ type
     procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLBufferBytes(): int64; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
@@ -15140,6 +15161,7 @@ type
         pIm2ColSrcBuffer: cl_mem = nil);
     public
       procedure DisableOpenCL(); override;
+      function OpenCLBufferBytes(): int64; override;
     private
       {$ENDIF}
       function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -17571,6 +17593,7 @@ type
       // on the host.
       function WillOpenCL(): boolean; override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
@@ -17618,6 +17641,7 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
@@ -18134,6 +18158,7 @@ type
       FLearningRate: TNeuralFloat;
       FNNetForwardTime: double;
       FNNetForwardTimeQueueOpenCL: double;
+      FOpenCLArmingWeightPrepTime: double;
       FNNetBackwardTime: double;
       FKeepLastOutputOnOpenCL: boolean;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
@@ -20183,6 +20208,8 @@ type
       function CountWeights(): int64;
       // Sum of every layer's NonWeightBytes.
       function NonWeightBytes(): int64;
+      // Sum of every layer's OpenCLBufferBytes: partial, see the layer method.
+      function OpenCLBufferBytes(): int64;
       function SummaryString(): string;
       procedure PrintSummary();
       // Unified-diff-style architecture comparison.
@@ -22268,6 +22295,10 @@ type
       // Wall-clock spent draining the OpenCL queue at the end of a forward,
       // download of the last layer included when it runs.
       property NNetForwardTimeQueueOpenCL: double read FNNetForwardTimeQueueOpenCL write FNNetForwardTimeQueueOpenCL;
+      // TDateTime days (as NNetForwardTime) EnableOpenCL spent in AfterWeightUpdate
+      // (bias, concat, interleave) under LayerProfiling; ClearTime zeroes it.
+      property OpenCLArmingWeightPrepTime: double
+        read FOpenCLArmingWeightPrepTime write FOpenCLArmingWeightPrepTime;
       // A full forward leaves the last layer's output where it ends (a reader
       // calls ForceOutputOnRAM). False: the forward downloads it.
       property KeepLastOutputOnOpenCL: boolean read FKeepLastOutputOnOpenCL
@@ -38259,6 +38290,11 @@ begin
   inherited Destroy();
 end;
 
+function TNNetKernelCL.BufferBytes(): int64;
+begin
+  Result := 0;
+end;
+
 function TNNetKernelCL.NewOpenCLBuffer(Bytes: csize_t): cl_mem;
 begin
   Result := FKernel.CreateBuffer(CL_MEM_READ_WRITE, Bytes);
@@ -38357,6 +38393,11 @@ end;
 function TNNetUpsampleGatherCL.ResultBuffer(): cl_mem;
 begin
   Result := FBufDst;
+end;
+
+function TNNetUpsampleGatherCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufSrc) + OpenCLMemBytes(FBufDst);
 end;
 
 function TNNetUpsampleGatherCL.OutputKernel(): TNeuralKernel;
@@ -38557,6 +38598,12 @@ end;
 function TNNetTokenNormCL.ResultBuffer(): cl_mem;
 begin
   Result := FBufY;
+end;
+
+function TNNetTokenNormCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufGain) +
+    OpenCLMemBytes(FBufBias) + OpenCLMemBytes(FBufY);
 end;
 
 function TNNetTokenNormCL.OutputKernel(): TNeuralKernel;
@@ -56677,6 +56724,12 @@ function TNNetPixelShuffle.OpenCLOutputBuffer(): cl_mem;
 begin
   if Assigned(FUpsampleCL) then Result := FUpsampleCL.ResultBuffer()
   else Result := nil;
+end;
+
+function TNNetPixelShuffle.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FUpsampleCL) then Result := Result + FUpsampleCL.BufferBytes();
 end;
 
 function TNNetPixelShuffle.OpenCLOutputKernel(): TNeuralKernel;
@@ -77394,6 +77447,12 @@ begin
   FreeAndNil(FTokenNormCL);
 end;
 
+function TNNetLayerNorm.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
+end;
+
 procedure TNNetLayerNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
@@ -77666,6 +77725,12 @@ begin
   else Result := nil;
 end;
 
+function TNNetTokenLayerNorm.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
+end;
+
 function TNNetTokenLayerNorm.OpenCLOutputKernel(): TNeuralKernel;
 begin
   if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
@@ -77931,6 +77996,12 @@ function TNNetRMSNorm.OpenCLOutputBuffer(): cl_mem;
 begin
   if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
   else Result := nil;
+end;
+
+function TNNetRMSNorm.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
 end;
 
 function TNNetRMSNorm.OpenCLOutputKernel(): TNeuralKernel;
@@ -78233,6 +78304,12 @@ function TNNetTokenRMSNorm.OpenCLOutputBuffer(): cl_mem;
 begin
   if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
   else Result := nil;
+end;
+
+function TNNetTokenRMSNorm.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
 end;
 
 function TNNetTokenRMSNorm.OpenCLOutputKernel(): TNeuralKernel;
@@ -80513,7 +80590,7 @@ begin
     else
     begin
       RefreshNeuronWeightList();
-      AfterWeightUpdate();
+      TimedAfterWeightUpdate();
 
       FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
 
@@ -80526,7 +80603,22 @@ begin
       //FDotProductResult.ReSize(FOutputSizeX, FOutputSizeY, FNeurons.Count);
     end;
   end;
+  TimedAfterWeightUpdate();
+end;
+
+procedure TNNetLayerConcatedWeights.TimedAfterWeightUpdate();
+var
+  StartTime: double;
+begin
+  if not (Assigned(FNN) and FNN.FLayerProfiling) then
+  begin
+    AfterWeightUpdate();
+    exit;
+  end;
+  StartTime := Now();
   AfterWeightUpdate();
+  FNN.FOpenCLArmingWeightPrepTime := FNN.FOpenCLArmingWeightPrepTime +
+    (Now() - StartTime);
 end;
 
 // Interleaves FQuantTable's codes into the device layout (codes[a + i*NumAs],
@@ -80921,6 +81013,11 @@ end;
 function TNNetSum.OpenCLOutputBuffer(): cl_mem;
 begin
   Result := FSumBuffer;
+end;
+
+function TNNetSum.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FSumBuffer);
 end;
 
 function TNNetSum.OpenCLOutputKernel(): TNeuralKernel;
@@ -99851,6 +99948,11 @@ begin
   Result := FConcatBuffer;
 end;
 
+function TNNetDeepConcat.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FConcatBuffer);
+end;
+
 function TNNetDeepConcat.OpenCLOutputKernel(): TNeuralKernel;
 begin
   Result := FConcatKernel;
@@ -100258,6 +100360,12 @@ end;
 function TNNetSplitChannels.OpenCLOutputBuffer(): cl_mem;
 begin
   Result := FSplitBuffer;
+end;
+
+function TNNetSplitChannels.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FSplitBuffer) +
+    OpenCLMemBytes(FChannelIdxBuffer);
 end;
 
 function TNNetSplitChannels.OpenCLOutputKernel(): TNeuralKernel;
@@ -103010,6 +103118,12 @@ begin
   else Result := nil;
 end;
 
+function TNNetDeMaxPool.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FUpsampleCL) then Result := Result + FUpsampleCL.BufferBytes();
+end;
+
 function TNNetDeMaxPool.OpenCLOutputKernel(): TNeuralKernel;
 begin
   if Assigned(FUpsampleCL) then Result := FUpsampleCL.OutputKernel()
@@ -104087,6 +104201,11 @@ end;
 function TNNetIdentity.OpenCLOutputBuffer(): cl_mem;
 begin
   Result := FActivationBuffer;
+end;
+
+function TNNetIdentity.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FActivationBuffer);
 end;
 
 function TNNetIdentity.OpenCLOutputKernel(): TNeuralKernel;
@@ -107714,6 +107833,12 @@ begin
   inherited DisableOpenCL();
   FreeDotProductCL(FBpDotCL);
 end;
+
+function TNNetConvolution.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FBpDotCL) then Result := Result + FBpDotCL.BufferBytes();
+end;
 {$ENDIF}
 
 procedure TNNetConvolution.EnableWinograd(pEnable: boolean = true);
@@ -110439,6 +110564,11 @@ begin
   Result := FInputBuffer;
 end;
 
+function TNNetInput.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FInputBuffer);
+end;
+
 function TNNetInput.OpenCLOutputKernel(): TNeuralKernel;
 begin
   Result := FInputKernel;
@@ -111592,6 +111722,16 @@ begin
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
     Result := Result + FLayers[LayerCnt].NonWeightBytes();
+end;
+
+function TNNet.OpenCLBufferBytes(): int64;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    Result := Result + FLayers[LayerCnt].OpenCLBufferBytes();
 end;
 
 function TNNet.CountWeights(): int64;
@@ -134903,6 +135043,7 @@ var
 begin
   FNNetForwardTime := 0;
   FNNetForwardTimeQueueOpenCL := 0;
+  FOpenCLArmingWeightPrepTime := 0;
   FNNetBackwardTime := 0;
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
@@ -136737,6 +136878,14 @@ function TNNetLayer.NonWeightBytes(): int64;
 begin
   Result := VolumeBytes(FOutput) + VolumeBytes(FOutputRaw) +
     VolumeBytes(FOutputError) + VolumeBytes(FOutputErrorDeriv);
+end;
+
+function TNNetLayer.OpenCLBufferBytes(): int64;
+begin
+  Result := 0;
+  {$IFDEF OpenCL}
+  if Assigned(FDotCL) then Result := FDotCL.BufferBytes();
+  {$ENDIF}
 end;
 
 function TNNetLayer.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
