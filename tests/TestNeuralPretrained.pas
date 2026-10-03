@@ -29310,11 +29310,13 @@ var
   DeviceId: cl_device_id;
   LayerPos, ConvCount, ConvOnOpenCLCount: integer;
   BoundSpatialConvCount, HostSourceSpatialConvCount: integer;
+  ImplicitConvCount: integer;
   Layer: TNNetLayer;
   MaxDiff: double;
   Transfers, NoTransfers: TOpenCLTransferCounts;
-  OpenCLBytes: int64;
+  OpenCLBytes, ExplicitOpenCLBytes: int64;
   Report: string;
+  ImplicitConvWasEnabled: boolean;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -29328,7 +29330,9 @@ begin
   TiledCPU := TNNetVolume.Create;
   WholeCPU := TNNetVolume.Create;
   Image := TNNetVolume.Create;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
   try
+    SetOpenCLImplicitConv(true);
     Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
       FixturePath('tiny_qwenimage21/vae/config.json')));
     Decoder.Parallel := false;
@@ -29369,11 +29373,13 @@ begin
     Decoder.Decode(Latent, Image);
     BoundSpatialConvCount := 0;
     HostSourceSpatialConvCount := 0;
+    ImplicitConvCount := 0;
     for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
     begin
       Layer := Decoder.Net.Layers[LayerPos];
       if not ((Layer is TNNetConvolution) and
         (TNNetConvolution(Layer).FeatureSizeX > 1)) then continue;
+      if Layer.OpenCLImplicitConvLaunchCount() > 0 then Inc(ImplicitConvCount);
       if not Layer.PrevLayer.OutputBindableOnOpenCL() then
       begin
         Inc(HostSourceSpatialConvCount);
@@ -29387,7 +29393,9 @@ begin
     end;
     WriteLn('  Qwen-Image-2.1 VAE 3x3 convs: ', BoundSpatialConvCount,
       ' bind a resident source, ', HostSourceSpatialConvCount,
-      ' read a host source');
+      ' read a host source, ', ImplicitConvCount, ' ran the implicit GEMM');
+    AssertEquals('3x3 convs on the implicit GEMM',
+      BoundSpatialConvCount + HostSourceSpatialConvCount, ImplicitConvCount);
     FillChar(Transfers, SizeOf(Transfers), 0);
     FillChar(NoTransfers, SizeOf(NoTransfers), 0);
     for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
@@ -29434,7 +29442,21 @@ begin
     WriteLn(Report);
     AssertTrue('final ReleaseNet', Pos('[profile] ReleaseNet after the ' +
       'decode(s)', Report) > 0);
+    // The explicit cai_im2col path on a fresh net: same image, and the
+    // column matrices it allocates are the bytes the implicit GEMM saves.
+    SetOpenCLImplicitConv(false);
+    Decoder.Decode(Latent, Image);
+    ExplicitOpenCLBytes := Decoder.Net.OpenCLBufferBytes();
+    MaxDiff := MaxAbsVolumeDiff(Image, WholeCPU);
+    WriteLn('  Qwen-Image-2.1 VAE 4x4 net OpenCL buffers: implicit ',
+      OpenCLBytes, ' B, explicit im2col ', ExplicitOpenCLBytes,
+      ' B; explicit vs CPU max|diff|=', MaxDiff:0:9);
+    AssertTrue('explicit: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < ' +
+      FloatToStr(Tolerance), MaxDiff < Tolerance);
+    AssertTrue('the implicit GEMM holds fewer OpenCL bytes',
+      OpenCLBytes < ExplicitOpenCLBytes);
   finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
     Image.Free;
     WholeCPU.Free;
     TiledCPU.Free;

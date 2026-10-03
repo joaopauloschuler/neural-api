@@ -594,6 +594,11 @@ type
     // FP32 tiled GEMM (cai_dot_product_tiled) for pointwise and 3x3 im2col
     // convolutions vs cai_dot_product and the CPU forward.
     procedure TestTiledGemmFP32OpenCLParity;
+    // Implicit-GEMM convolution (cai_conv_implicit_tiled / cai_conv_implicit):
+    // vs the CPU forward and vs the explicit cai_im2col path over padding,
+    // stride, ragged reduction and small/large Cout, from a host and a
+    // resident source; no B buffer and no host column matrix. Coded by Claude (AI).
+    procedure TestConvImplicitGemmOpenCLParity;
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
@@ -69973,6 +69978,205 @@ begin
   // Both GEMMs tiled (80 and 64 rows); then only Q.K^T (P.V has 48 rows).
   RunAttentionShapeChange(64, 80, 2);
   RunAttentionShapeChange(48, 80, 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvImplicitGemmOpenCLParity;
+{$IFDEF OpenCL}
+type
+  TImplicitCase = record
+    SizeX, SizeY, InDepth, Features, FeatureSize, Padding, Stride: integer;
+    // 0: square kernel; otherwise the kernel height of a
+    // TNNetConvolutionRectangularReLU (FeatureSize is its width).
+    FeatureSizeY: integer;
+    // >= 64 rows and >= 16 positions: cai_conv_implicit_tiled, which stages
+    // the same tiles as cai_im2col + cai_dot_product_tiled.
+    ExpectTiled: boolean;
+    // A CPU-only layer before the conv: the unpadded host Output is uploaded.
+    HostSource: boolean;
+  end;
+const
+  csSentinel = 999;
+  Cases: array[0..13] of TImplicitCase = (
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: true),
+    (SizeX: 9; SizeY: 7; InDepth: 3; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: true),
+    (SizeX: 9; SizeY: 7; InDepth: 3; Features: 70; FeatureSize: 5; Padding: 2; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 19; Features: 80; FeatureSize: 3; Padding: 1; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 13; SizeY: 11; InDepth: 7; Features: 72; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 1; ExpectTiled: true; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: false; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: false; HostSource: true),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 5; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 19; Features: 6; FeatureSize: 3; Padding: 1; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: true),
+    (SizeX: 13; SizeY: 11; InDepth: 7; Features: 6; FeatureSize: 1; Padding: 1; Stride: 2; FeatureSizeY: 3; ExpectTiled: false; HostSource: false),
+    // 2 output positions: too few columns for a tile even at 80 rows.
+    (SizeX: 5; SizeY: 4; InDepth: 3; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: false));
+var
+  NN: TNNet;
+  Input, OutCPU, OutImplicit: TNNetVolume;
+  Source: TNNetLayer;
+  Conv: TNNetConvolution;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, CaseCnt, SentinelsLeft, Positions: integer;
+  ImplicitBefore, TiledBefore, ImplicitLaunches, TiledLaunches: integer;
+  ImplicitBytes, ExplicitBytes, ColumnBytes: int64;
+  DiffCPU, DiffExplicit, MaxAbs, Tol: TNeuralFloat;
+  CaseName: string;
+  ImplicitConvWasEnabled: boolean;
+
+  procedure FillWeights(Layer: TNNetLayer);
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to Layer.Neurons[NeuronCnt].Weights.Size - 1 do
+        Layer.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.08 * Sin(NeuronCnt * 0.7 + WeightCnt * 0.31);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.2 * Cos(NeuronCnt * 0.13);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  try
+  for CaseCnt := Low(Cases) to High(Cases) do
+  with Cases[CaseCnt] do
+  begin
+    CaseName := ' (case ' + IntToStr(CaseCnt) + ')';
+    RandSeed := 20261003;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutCPU := TNNetVolume.Create();
+    OutImplicit := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+      // A fused-activation pointwise conv leaves its output in OpenCL memory.
+      if HostSource
+        then Source := NN.AddLayer(TNNetIdentity.Create())
+        else Source := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(InDepth).SetTrainable(False, False));
+      // Inference-only before SetPrevLayer, as the VAE builder does.
+      if FeatureSizeY = 0
+        then Conv := TNNetConvolutionReLU.Create(Features, FeatureSize, Padding,
+          Stride)
+        else Conv := TNNetConvolutionRectangularReLU.Create(Features,
+          FeatureSize, FeatureSizeY, Padding, Stride);
+      Conv.SetTrainable(False, False);
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.6 * Sin(i * 0.017) + 0.1;
+      // An inference-only layer is not initialized: its weights come from a
+      // checkpoint, here from a formula.
+      FillWeights(Conv);
+      if not HostSource then FillWeights(Source);
+      AssertEquals('inference-only conv sizes no host column matrix' + CaseName,
+        0, Conv.InputPrepared.Size);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        SetOpenCLImplicitConv(true);
+        ImplicitBefore := Conv.OpenCLImplicitConvLaunchCount();
+        TiledBefore := Conv.OpenCLTiledGemmLaunchCount();
+        NN.Compute(Input);
+        Source.Output.Fill(csSentinel);
+        NN.Compute(Input); // resident weights and bias
+        OutImplicit.Copy(NN.GetLastLayer.Output);
+        SentinelsLeft := 0;
+        for i := 0 to Source.Output.Size - 1 do
+          if Source.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        ImplicitLaunches := Conv.OpenCLImplicitConvLaunchCount() - ImplicitBefore;
+        TiledLaunches := Conv.OpenCLTiledGemmLaunchCount() - TiledBefore;
+        ImplicitBytes := Conv.OpenCLBufferBytes();
+        // The explicit path: cai_im2col into the B buffer, then the GEMM.
+        SetOpenCLImplicitConv(false);
+        NN.Compute(Input);
+        ExplicitBytes := Conv.OpenCLBufferBytes();
+        AssertEquals('the explicit path launches no implicit GEMM' + CaseName,
+          ImplicitBefore + ImplicitLaunches, Conv.OpenCLImplicitConvLaunchCount());
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals('output size match' + CaseName, OutCPU.Size, OutImplicit.Size);
+      DiffCPU := 0;
+      DiffExplicit := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        if Abs(OutCPU.Raw[i] - OutImplicit.Raw[i]) > DiffCPU then
+          DiffCPU := Abs(OutCPU.Raw[i] - OutImplicit.Raw[i]);
+        if Abs(NN.GetLastLayer.Output.Raw[i] - OutImplicit.Raw[i]) > DiffExplicit then
+          DiffExplicit := Abs(NN.GetLastLayer.Output.Raw[i] - OutImplicit.Raw[i]);
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      Positions := Conv.Output.SizeX * Conv.Output.SizeY;
+      ColumnBytes := int64(Positions) * Conv.Neurons[0].Weights.Size *
+        SizeOf(TNeuralFloat);
+      // The explicit path uploads a host source padded, so its source buffer
+      // grows by the border.
+      if HostSource then
+        ColumnBytes := ColumnBytes + int64(InDepth) * SizeOf(TNeuralFloat) *
+          ((SizeX + 2 * Padding) * (SizeY + 2 * Padding) - SizeX * SizeY);
+      WriteLn('  ConvImplicitGemm ', SizeX, 'x', SizeY, 'x', InDepth, ' -> ',
+        Features, ' k', FeatureSize, ' pad', Padding, ' s', Stride,
+        ' host source=', HostSource, ': vs cpu max|diff|=', DiffCPU:0:9,
+        ' vs explicit max|diff|=', DiffExplicit:0:9, ' max|ref|=', MaxAbs:0:6,
+        ' implicit/tiled launches=', ImplicitLaunches, '/', TiledLaunches,
+        ' OpenCL bytes implicit/explicit=', ImplicitBytes, '/', ExplicitBytes,
+        ' sentinels kept=', SentinelsLeft, '/', Source.Output.Size);
+      AssertEquals('implicit GEMM launches' + CaseName, 2, ImplicitLaunches);
+      if ExpectTiled
+        then AssertEquals('tiled implicit launches' + CaseName, 2, TiledLaunches)
+        else AssertEquals('untiled implicit launches' + CaseName, 0, TiledLaunches);
+      AssertEquals('the implicit GEMM allocates no B buffer: the explicit ' +
+        'path adds exactly the column matrix (and the padded border of a ' +
+        'host source)' + CaseName, ColumnBytes,
+        ExplicitBytes - ImplicitBytes);
+      if HostSource
+        then AssertEquals('a host source is read from RAM' + CaseName, 0,
+          SentinelsLeft)
+        else AssertEquals('a resident source is not downloaded' + CaseName,
+          Source.Output.Size, SentinelsLeft);
+      if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
+      AssertTrue('implicit vs CPU' + CaseName + ': max |diff| = ' +
+        FloatToStr(DiffCPU) + ' must be < ' + FloatToStr(Tol), DiffCPU < Tol);
+      // The tiled kernels stage the same tiles in the same K order (equal on
+      // PoCL), but the compiler may contract each copy differently, so a
+      // tolerance; cai_conv_implicit sums in k order, cai_dot_product in blocks.
+      if ExpectTiled then
+        AssertTrue('tiled implicit vs explicit' + CaseName + ': max |diff| = ' +
+          FloatToStr(DiffExplicit) + ' must be < ' + FloatToStr(Tol * 0.01),
+          DiffExplicit < Tol * 0.01)
+      else
+        AssertTrue('untiled implicit vs explicit' + CaseName + ': max |diff| = ' +
+          FloatToStr(DiffExplicit) + ' must be < ' + FloatToStr(Tol * 0.1),
+          DiffExplicit < Tol * 0.1);
+    finally
+      OutImplicit.Free;
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+  finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+  end;
 end;
 {$ELSE}
 begin

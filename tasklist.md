@@ -2392,11 +2392,20 @@ rather than acted on.
                 `clGetMemObjectInfo` (partial: FDotCL + overriding classes; the
                 VAE's classes are covered). Pico shows no real-size signal;
                 waiting for the user's L4 run.
-          - [ ] B2f1. Implicit-GEMM conv on OpenCL (FP32, inference-only):
+          - [x] B2f1. Implicit-GEMM conv on OpenCL (FP32, inference-only):
                 gather stage in `cai_dot_product_tiled_body`, naive twin for
                 Cout < 64 (conv_out); lazy `FInputBufferBs`; inference-only
                 spatial convs stop sizing host `FInputPrepared`. Int8 keeps
                 im2col. Fixes the int32 overflow.
+                DONE: `cai_conv_implicit_tiled` (BIsConv + `cai_tiled_stage_b_conv`,
+                same Bs layout, equal to explicit on PoCL) and the untiled
+                `cai_conv_implicit`; `TNNetConvolution.ShouldOpenCLImplicitConv`;
+                `NEURAL_OPENCL_IMPLICIT_CONV=0` / `SetOpenCLImplicitConv` for an
+                A/B. Pico VAE OpenCL bytes per net 12.6 -> 4.7 MB (-63%), image
+                byte-identical. Computed at a real 256 tile: -6.1 GB OpenCL and
+                -6.1 GB host per net. GPU speed unmeasured. Deferred: int8 convs
+                keep the host column matrix; `SetTrainable(false)` after the
+                build keeps it too; the CPU path still overflows untiled 1024.
           - [ ] B2f2. Per-row bias in OpenCL (`Bias[row]`); lazy host
                 `FBiasOutput` / `FOutputRaw`.
           - [ ] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;

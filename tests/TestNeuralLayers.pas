@@ -23,6 +23,10 @@ type
     procedure TestConvolutionWillThreadParity;
     procedure TestConvolutionColdParallelParity;
     procedure TestConvolutionLowMemoryChunkParity;
+    // Convolutions made inference-only BEFORE AddLayer (the VAE builder's
+    // order) size no host column matrix at SetPrevLayer; the serial and the
+    // parallel chunk forwards still match a trainable twin. Coded by Claude (AI).
+    procedure TestConvolutionInferenceOnlyBuildParity;
     procedure TestConvolutionDecodeNeuronChunkParity;
     procedure TestConvolutionFastMemoryNeuronChunk;
     procedure TestConvolutionSpatialNeuronChunk;
@@ -842,6 +846,89 @@ end;
 // concatenated-weight caches are released in low-memory mode). A cold parallel
 // low-memory pass must equal the low-memory SERIAL reference (ComputeLowMemoryCPU)
 // bit-for-bit. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionInferenceOnlyBuildParity;
+var
+  RefNN, NN: TNNet;
+  Input, Reference: TNNetVolume;
+  RefConvs, Convs: array[0..2] of TNNetLayer;
+  ConvCnt, i: integer;
+
+  // The three spatial convs: 3x3 pad 1, 3x3 pad 1 stride 2, 3x1 pad 1.
+  procedure BuildNet(Net: TNNet; InferenceOnly: boolean;
+    out Layers: array of TNNetLayer);
+  var
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+  begin
+    Net.AddLayer(TNNetInput.Create(11, 9, 6));
+    Layers[0] := TNNetConvolutionReLU.Create(16, 3, 1, 1);
+    Layers[1] := TNNetConvolutionLinear.Create(12, 3, 1, 2);
+    Layers[2] := TNNetConvolutionRectangularReLU.Create(8, 3, 1, 1, 1);
+    for LayerCnt := 0 to 2 do
+    begin
+      // Low-memory on one layer, the fast paths on the others.
+      if InferenceOnly then Layers[LayerCnt].SetTrainable(False, LayerCnt = 1);
+      Net.AddLayer(Layers[LayerCnt]);
+      for NeuronCnt := 0 to Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.1 * Sin(LayerCnt + NeuronCnt * 0.37 + WeightCnt * 0.11);
+        Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.05 * Cos(LayerCnt + NeuronCnt * 0.5);
+      end;
+      Layers[LayerCnt].FlushWeightCache();
+    end;
+  end;
+
+  procedure AssertMatches(const What: string);
+  var
+    Pos: integer;
+  begin
+    AssertEquals(What + ': output size', Reference.Size,
+      NN.GetLastLayer().Output.Size);
+    for Pos := 0 to Reference.Size - 1 do
+      AssertTrue(What + ' at ' + IntToStr(Pos) + ': ' +
+        FloatToStr(NN.GetLastLayer().Output.Raw[Pos]) + ' vs ' +
+        FloatToStr(Reference.Raw[Pos]),
+        Abs(NN.GetLastLayer().Output.Raw[Pos] - Reference.Raw[Pos]) < 1e-5);
+  end;
+
+begin
+  RefNN := TNNet.Create();
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(11, 9, 6);
+  Reference := TNNetVolume.Create();
+  try
+    BuildNet(RefNN, false, RefConvs);
+    BuildNet(NN, true, Convs);
+    for ConvCnt := 0 to 2 do
+      AssertEquals('inference-only conv ' + IntToStr(ConvCnt) +
+        ' sizes no host column matrix', 0,
+        TNNetConvolution(Convs[ConvCnt]).InputPrepared.Size);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.07) - 0.2;
+    RefNN.Compute(Input);
+    Reference.Copy(RefNN.GetLastLayer().Output);
+    AssertTrue('reference output is non-trivial', Reference.GetSumAbs() > 0);
+
+    NN.Compute(Input, 0, False);
+    AssertMatches('serial');
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    for ConvCnt := 0 to 2 do
+      AssertTrue('conv ' + IntToStr(ConvCnt) + ' must be chunk-eligible',
+        Convs[ConvCnt].ChunkEligible());
+    NN.Compute(Input, 0, True);
+    NN.Compute(Input, 0, True);
+    AssertMatches('parallel chunk path');
+  finally
+    Reference.Free;
+    Input.Free;
+    NN.Free;
+    RefNN.Free;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestConvolutionLowMemoryChunkParity;
 var
   NN: TNNet;

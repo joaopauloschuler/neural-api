@@ -770,7 +770,10 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
 // twin only by float summation order.
 //
 // Indices are int32, as in cai_dot_product: FNumAs*FSize, FNumBs*FSize and
-// FNumBs*FNumAs must each stay below 2^31. Coded by Claude (AI).
+// FNumBs*FNumAs must each stay below 2^31. The implicit-GEMM convolution
+// (cai_conv_implicit_tiled) has no FNumBs*FSize term: its B index is the
+// source volume's, so the source must stay below 2^31 elements instead.
+// Coded by Claude (AI).
 #define CAI_TILED_LANES 64
 #define CAI_TILED_ROWS_PER_LANE 2
 #define CAI_TILED_COLS 16
@@ -857,12 +860,81 @@ static inline float cai_tiled_load_a(__global const char* A8,
   return AIsFloat ? Af[APos] : convert_float(A8[APos]);
 }
 
-// Tiled body of the FP32-weight and int8-weight entry points; the call-site
-// constants AIsFloat/BIsHalf pick A8 or Af and Bf or Bh. Coded by Claude (AI).
+// IMPLICIT-GEMM CONVOLUTION. Column b of the B operand is output position b
+// and reduction element k is tap (ky, kx, d) with k = ky*RowSpan + kx*InDepth
+// + d - the im2col layout of cai_im2col - so the tile stage reads the
+// unpadded source directly and the column matrix never exists. Taps in the
+// zero padding stage 0, exactly as cai_im2col writes them.
+typedef struct
+{
+  int OutSizeX;  // FOutput.SizeX
+  int RowSpan;   // InDepth * FeatureSizeX: one kernel row of a column
+  int InSizeX, InSizeY, InDepth;
+  int Stride;
+  int Padding;   // zero border on each side of the source
+} cai_conv_gather;
+
+// cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
+// columns lid / KSTEP + j * CAI_TILED_B_COL_STEP; the gather keeps that map.
+#if (CAI_TILED_LANES % CAI_TILED_KSTEP) != 0
+#error "the implicit-GEMM gather needs CAI_TILED_LANES to be a multiple of CAI_TILED_KSTEP"
+#endif
+#if (CAI_TILED_B_ELEMS % CAI_TILED_LANES) != 0
+#error "the implicit-GEMM gather needs CAI_TILED_B_ELEMS to be a multiple of CAI_TILED_LANES"
+#endif
+#define CAI_TILED_B_COLS_PER_LANE (CAI_TILED_B_ELEMS / CAI_TILED_LANES)
+#define CAI_TILED_B_COL_STEP (CAI_TILED_LANES / CAI_TILED_KSTEP)
+
+// Top-left source tap of each column this lane stages, once per work-group;
+// a column past FNumBs gets a first row no tap can reach, so it stages zeros.
+static inline void cai_conv_gather_columns(const cai_conv_gather G,
+  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX)
+{
+  #pragma unroll
+  for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
+  {
+    const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
+    const int oy = gb / G.OutSizeX;
+    const int ox = gb - oy * G.OutSizeX;
+    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.Padding : G.InSizeY;
+    FirstX[j] = ox * G.Stride - G.Padding;
+  }
+}
+
+// cai_tiled_stage_b with the B element gathered from the source: the same Bs
+// layout and the same zeros, so the tile math after it is unchanged.
+static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
+  const int FSize, const int k0, __global const float* Src,
+  __local float* Bs, const int lid, const int* FirstY, const int* FirstX)
+{
+  const int kLane = lid % CAI_TILED_KSTEP;
+  const int bLane = lid / CAI_TILED_KSTEP;
+  const int gk = k0 + kLane;
+  // Past FSize the row offset puts every column below the source.
+  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.Padding;
+  const int rem = gk - ky * G.RowSpan;
+  const int kx = rem / G.InDepth;
+  const int d = rem - kx * G.InDepth;
+  #pragma unroll
+  for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
+  {
+    const int y = FirstY[j] + ky;
+    const int x = FirstX[j] + kx;
+    float v = 0.0f;
+    if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
+      v = Src[(y * G.InSizeX + x) * G.InDepth + d];
+    Bs[(bLane + j * CAI_TILED_B_COL_STEP) * CAI_TILED_KSTEP + kLane] = v;
+  }
+}
+
+// Tiled body of the FP32-weight, int8-weight and implicit-GEMM entry points;
+// the call-site constants AIsFloat/BIsHalf/BIsConv pick A8 or Af and Bf, Bh
+// or the gather from Bf through G. Coded by Claude (AI).
 static inline void cai_dot_product_tiled_body(const int FNumAs,
   const int FNumBs, const int FSize, const int ActFN,
   __global const char* A8, __global const float* Af, const int AIsFloat,
   __global const float* Bf, __global const half* Bh, const int BIsHalf,
+  const int BIsConv, const cai_conv_gather G,
   __global float* FResultBuffer, const int UseBias,
   __global const float* FBiasOutput, __global const float* FScales,
   __local float* Bs)
@@ -879,13 +951,21 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   #pragma unroll
   for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
 
+  int FirstY[CAI_TILED_B_COLS_PER_LANE];
+  int FirstX[CAI_TILED_B_COLS_PER_LANE];
+  if (BIsConv) cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX);
+
   const int RowStep4 = 4 * FNumAs;
   for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
   {
     // The previous step's reads must finish before the tile is overwritten.
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (BIsHalf) cai_tiled_stage_b_h(FNumBs, FSize, b0, k0, Bh, Bs, lid);
-    else         cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, Bs, lid);
+    if (BIsConv)
+      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX);
+    else if (BIsHalf)
+      cai_tiled_stage_b_h(FNumBs, FSize, b0, k0, Bh, Bs, lid);
+    else
+      cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, Bs, lid);
     barrier(CLK_LOCAL_MEM_FENCE);
 
     const int kEnd = min(CAI_TILED_KSTEP, FSize - k0);
@@ -948,8 +1028,10 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, 0, FInputBufferAs,
-    1, FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, 0, Bs);
+    1, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    0, Bs);
 }
 
 // Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS. Launch:
@@ -972,8 +1054,10 @@ __kernel void cai_dot_product_int8_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+    0, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    FScales, Bs);
 }
 
 // HALF-ACTIVATION twin of cai_dot_product_int8_tiled: B is read through
@@ -994,8 +1078,99 @@ __kernel void cai_dot_product_int8_tiled_h
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, 0, FInputBufferBs, 1, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+    0, 0, FInputBufferBs, 1, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    FScales, Bs);
+}
+
+// cai_dot_product_tiled with B gathered from the unpadded source FSrc: the
+// same Bs tiles as cai_im2col + cai_dot_product_tiled. Coded by Claude (AI).
+__kernel void cai_conv_implicit_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  const int OutSizeX,
+  const int RowSpan,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int Stride,
+  const int Padding
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
+    Stride, Padding};
+  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, 0, FInputBufferAs,
+    1, FSrc, 0, 0, 1, G, FResultBuffer, UseBias, FBiasOutput, 0, Bs);
+}
+
+// Untiled twin of cai_conv_implicit_tiled (same arguments), one work-item per
+// (row, position) as cai_dot_product; sums in k order. Coded by Claude (AI).
+__kernel void cai_conv_implicit
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  const int OutSizeX,
+  const int RowSpan,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int Stride,
+  const int Padding
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
+  const int FeatureSizeX = RowSpan / InDepth;
+  const int FeatureSizeY = FSize / RowSpan;
+  const int oy = b_id / OutSizeX;
+  const int ox = b_id - oy * OutSizeX;
+  const int FirstY = oy * Stride - Padding;
+  const int FirstX = ox * Stride - Padding;
+  const int TapStep = InDepth * FNumAs;
+  // A element (a_id, k) sits at a_id + k * FNumAs.
+  int APos = a_id;
+  float acc = 0.0f;
+  for (int ky = 0; ky < FeatureSizeY; ky++)
+  {
+    const int y = FirstY + ky;
+    const int RowInside = (y >= 0) && (y < InSizeY);
+    for (int kx = 0; kx < FeatureSizeX; kx++)
+    {
+      const int x = FirstX + kx;
+      if (RowInside && (x >= 0) && (x < InSizeX))
+      {
+        const int SrcPos = (y * InSizeX + x) * InDepth;
+        int TapAPos = APos;
+        for (int d = 0; d < InDepth; d++)
+        {
+          acc = mad(FInputBufferAs[TapAPos], FSrc[SrcPos + d], acc);
+          TapAPos += FNumAs;
+        }
+      }
+      APos += TapStep;
+    }
+  }
+  const int ResultPos = b_id * FNumAs + a_id;
+  if (UseBias != 0) acc += FBiasOutput[ResultPos];
+  FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
 }
 
 // Q4_0 WEIGHT twin of cai_dot_product_int8_tiled: same tile, same launch

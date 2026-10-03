@@ -328,13 +328,12 @@ type
       /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
       FBiasBuffer: cl_mem;
       FCapBias: csize_t;
-      /// Optional resident source buffer for device-side im2col: holds the small
-      /// convolution input that BuildInputColsOnDevice gathers into
-      /// FInputBufferBs. Grow-only and re-uploaded only when the source changed;
-      /// nil until the first inference-only non-pointwise conv forward that opts in.
-      /// Coded by Claude (AI).
-      FIm2ColSrcBuffer: cl_mem;
-      FCapIm2ColSrc: csize_t;
+      /// Resident copy of a host convolution input that cai_im2col
+      /// (BuildInputColsOnDevice) or the implicit GEMM (ComputeImplicitConv)
+      /// gathers from. Grow-only, re-uploaded each forward; nil until the first
+      /// inference-only spatial conv forward with a host source. Coded by Claude (AI).
+      FGatherSrcBuffer: cl_mem;
+      FCapGatherSrc: csize_t;
       /// INT8 WEIGHT MODE (cai_dot_product_int8). The A operand is per-row
       /// symmetric int8 codes + per-row FP32 scales, both RESIDENT and
       /// IMMUTABLE (quantized layers are inference-only, so unlike the FP32
@@ -452,6 +451,13 @@ type
       FTiledKernel: cl_kernel;
       FTiledRejected: boolean;
       FTiledLaunchCount: integer;
+      /// IMPLICIT-GEMM CONVOLUTION (cai_conv_implicit_tiled, cai_conv_implicit):
+      /// owned handles bound by PrepareImplicitConv; FImplicitConvReady once the
+      /// untiled one bound. FImplicitConvLaunchCount is the test hook.
+      /// Coded by Claude (AI).
+      FImplicitConvKernel, FImplicitConvTiledKernel: cl_kernel;
+      FImplicitConvReady: boolean;
+      FImplicitConvLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
       /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
@@ -504,9 +510,15 @@ type
       /// Binds the tiled entry point for the armed weight mode (FP32 if none)
       /// and a code mode's fixed arguments; False when the device rejected it.
       function PrepareTiled(): boolean;
-      /// Launches the bound tiled entry point over the current shape on the
-      /// shared in-order queue and counts the launch.
-      procedure RunTiledGemm();
+      /// Launches pKernel with the tiled GEMM geometry over the current shape
+      /// on the shared in-order queue and counts the launch.
+      procedure RunTiledGemm(pKernel: cl_kernel);
+      /// FInputBufferBs, (re)allocated grow-only for FNumBs x FSize floats.
+      function EnsureInputBufferBs(): cl_mem;
+      /// The gather source: pExternalSrc when given (borrowed), otherwise
+      /// FGatherSrcBuffer grown for SrcVol and uploaded when NewSrc or grown.
+      function PrepareGatherSource(SrcVol: TNNetVolume; NewSrc: boolean;
+        pExternalSrc: cl_mem; var err: integer): cl_mem;
       /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
       /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
@@ -519,7 +531,10 @@ type
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
-      function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
+      function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer; overload;
+      /// PrepareForCompute with the column count given instead of a B volume.
+      /// Neither form allocates the B buffer: the first launch that needs it does.
+      function PrepareForCompute(VAs: TNNetVolume; pNumBs, pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer; overload;
       /// Grow-only sibling of PrepareForCompute: sets the same scalar shape state
       /// but only releases+recreates a device buffer when the needed byte size
       /// exceeds its current capacity, otherwise reuses it in place. Safe because
@@ -528,16 +543,14 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
-      /// Device-side im2col: gathers SrcVol (the conv input, zero-padded by
-      /// Padding on each side inside the gather) into the
-      /// resident B-operand buffer (FInputBufferBs) using the shared cai_im2col
-      /// kernel, so the host never builds nor uploads the inflated column matrix.
-      /// Must be called AFTER the B buffer is sized (PrepareForCompute in
-      /// EnableOpenCL) and BEFORE the matching Compute(..., NewVBs=false), on the
-      /// same in-order command queue so the gather is ordered before the GEMM.
-      /// Coded by Claude (AI).
+      /// OpenCL im2col: gathers SrcVol (the conv input, zero-padded by Padding
+      /// on each side inside the gather) into FInputBufferBs, sized here on
+      /// first use, with the shared cai_im2col kernel, so the host never builds
+      /// nor uploads the column matrix. Call it after PrepareForCompute and
+      /// BEFORE the matching Compute(..., NewVBs=false), on the same in-order
+      /// command queue so the gather is ordered before the GEMM. Coded by Claude (AI).
       /// pExternalSrc BORROWS an already-resident gather source (a producing
-      /// layer's output buffer) in place of FIm2ColSrcBuffer: nothing is
+      /// layer's output buffer) in place of FGatherSrcBuffer: nothing is
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
@@ -546,8 +559,18 @@ type
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
       /// FInputBufferBs, never uploaded and never released here. VBs then only
-      /// carries the shape. Coded by Claude (AI).
+      /// carries the shape; nil means B already sits in FInputBufferBs.
+      /// Coded by Claude (AI).
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+      /// Binds the implicit-GEMM convolution entry points after an FP32
+      /// PrepareForCompute; False when the device rejected cai_conv_implicit.
+      function PrepareImplicitConv(): boolean;
+      /// Compute for an FP32 convolution with B gathered inside the GEMM from
+      /// unpadded SrcVol (or borrowed pExternalSrc): no column matrix, no B buffer.
+      procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
+        OutSizeX, RowSpan, Stride, Padding, pActFN: longint;
+        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -617,6 +640,11 @@ type
       /// Launches of the tiled GEMM over this instance's lifetime; a test
       /// asserts it moved to prove the tiled path ran.
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
+      /// True after a successful PrepareImplicitConv.
+      property ImplicitConvReady: boolean read FImplicitConvReady;
+      /// Implicit-GEMM convolution launches (tiled ones count in
+      /// TiledGemmLaunchCount too).
+      property ImplicitConvLaunchCount: integer read FImplicitConvLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -664,6 +692,11 @@ type
 /// SetTiledGemmMinColumns was called.
 function TiledGemmMinColumns(): integer;
 procedure SetTiledGemmMinColumns(pValue: integer);
+
+/// Whether inference-only FP32 spatial convolutions may take the implicit GEMM:
+/// true unless NEURAL_OPENCL_IMPLICIT_CONV=0 or SetOpenCLImplicitConv(false).
+function OpenCLImplicitConvEnabled(): boolean;
+procedure SetOpenCLImplicitConv(pValue: boolean);
 
 /// Split-row SDPA decode sizing (TNNetFusedSDPACL): csFusedSDPA* defaults
 /// unless NEURAL_SDPA_GROUPS_PER_UNIT / _MIN_CHUNK_ROWS / _MAX_SPLITS /
@@ -808,7 +841,7 @@ function TDotProductSharedKernel.BufferBytes(): int64;
 begin
   Result := OpenCLMemBytes(FInputBufferAs) + OpenCLMemBytes(FInputBufferBs) +
     OpenCLMemBytes(FResultBuffer) + OpenCLMemBytes(FBiasBuffer) +
-    OpenCLMemBytes(FIm2ColSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
+    OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
     OpenCLMemBytes(FInputBufferBsFP16);
   if not FCodesBorrowed then
     Result := Result + OpenCLMemBytes(FCodesBuffer) +
@@ -821,7 +854,7 @@ begin
   if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
   if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
-  if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+  if Assigned(FGatherSrcBuffer) then clReleaseMemObject(FGatherSrcBuffer);
   if Assigned(FCodesBuffer)   then clReleaseMemObject(FCodesBuffer);
   if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
   if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
@@ -839,6 +872,11 @@ begin
   if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
   if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
   if Assigned(FTiledKernel)        then clReleaseKernel(FTiledKernel);
+  if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
+  if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
+  FImplicitConvKernel := nil;
+  FImplicitConvTiledKernel := nil;
+  FImplicitConvReady := false;
   FMainKernel := nil;
   FSinglePassKernel := nil;
   FTiledKernel := nil;
@@ -865,7 +903,7 @@ begin
   FInputBufferBs := nil;
   FResultBuffer  := nil;
   FBiasBuffer    := nil;
-  FIm2ColSrcBuffer := nil;
+  FGatherSrcBuffer := nil;
   FCodesBuffer   := nil;
   FScalesBuffer  := nil;
 
@@ -873,7 +911,7 @@ begin
   FCapBs := 0;
   FCapResult := 0;
   FCapBias := 0;
-  FCapIm2ColSrc := 0;
+  FCapGatherSrc := 0;
   FCapCodes := 0;
   FCapScales := 0;
   FInt8Ready := false;
@@ -943,9 +981,16 @@ end;
 function TDotProductSharedKernel.PrepareForCompute(VAs, VBs: TNNetVolume;
   pSize: longint; GroupSizeA: integer; GroupSizeB: integer): integer;
 begin
+  Result := PrepareForCompute(VAs, VBs.Size div pSize, pSize, GroupSizeA,
+    GroupSizeB);
+end;
+
+function TDotProductSharedKernel.PrepareForCompute(VAs: TNNetVolume;
+  pNumBs, pSize: longint; GroupSizeA: integer; GroupSizeB: integer): integer;
+begin
   UnprepareForCompute();
   FNumAs := VAs.Size div pSize;
-  FNumBs := VBs.Size div pSize;
+  FNumBs := pNumBs;
   FThreadCount := FNumAs * FNumBs;
   FSize := pSize;
   FGroupSizeA := GroupSizeA;
@@ -953,15 +998,13 @@ begin
 
   // A layer armed before its operands are sized (empty volume, or fewer
   // elements than one row) gets nil buffers: OpenCL rejects 0-byte buffers.
-  if (FHostInput) then
+  // The B buffer waits for EnsureInputBufferBs: a layer that binds a resident
+  // B operand or gathers it inside the GEMM never needs one.
+  if VAs.Size > 0 then
   begin
-    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
-    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
-  end
-  else
-  begin
-    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
-    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    if FHostInput
+      then FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs)
+      else FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
   end;
 
   if FThreadCount > 0 then
@@ -971,6 +1014,39 @@ begin
   PrepareForCompute := CL_SUCCESS;
 end;
 
+function TDotProductSharedKernel.EnsureInputBufferBs(): cl_mem;
+var
+  NeededBs: csize_t;
+begin
+  NeededBs := csize_t(FNumBs) * csize_t(FSize) * csNeuralFloatSize;
+  if (NeededBs > 0) and ((FInputBufferBs = nil) or (NeededBs > FCapBs)) then
+  begin
+    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
+    FCapBs := NeededBs;
+  end;
+  Result := FInputBufferBs;
+end;
+
+function TDotProductSharedKernel.PrepareGatherSource(SrcVol: TNNetVolume;
+  NewSrc: boolean; pExternalSrc: cl_mem; var err: integer): cl_mem;
+var
+  NeededSrc: csize_t;
+begin
+  if pExternalSrc <> nil then exit(pExternalSrc);
+  NeededSrc := SrcVol.GetMemSize();
+  if (FGatherSrcBuffer = nil) or (NeededSrc > FCapGatherSrc) then
+  begin
+    if Assigned(FGatherSrcBuffer) then clReleaseMemObject(FGatherSrcBuffer);
+    FGatherSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
+    FCapGatherSrc := NeededSrc;
+    NewSrc := true; // a fresh buffer holds nothing yet
+  end;
+  if NewSrc then
+    err := err or FDotProductKernel.WriteBuffer(FGatherSrcBuffer, SrcVol);
+  Result := FGatherSrcBuffer;
+end;
+
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
   NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
@@ -978,48 +1054,28 @@ var
   k: cl_kernel;
   N, InSizeX, InSizeY, InDepth: longint;
   err: integer;
-  NeededSrc: csize_t;
   SrcBuffer, ColsBuffer: cl_mem;
 begin
   k := Im2ColKernel.Kernel;
-  // The caller must pass cai_im2col_h whenever this instance is in FP16 mode:
-  // the gather writes whichever B buffer the GEMM will read, and both verdicts
-  // come from the one layer flag so they cannot disagree.
-  if FFP16Activations
-    then ColsBuffer := FInputBufferBsFP16
-    else ColsBuffer := FInputBufferBs;
-  // Total column-matrix elements = FInputBufferBs capacity (already sized to
-  // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
   // The OpenCL kernel indexes with int. TNNetConvolution.ShouldOpenCLIm2Col
   // refuses such a layer first; a raise here cannot leave a stale B operand.
   if Int64(FNumBs) * FSize > High(longint) then
     raise Exception.Create('BuildInputColsOnDevice: column matrix of ' +
       IntToStr(Int64(FNumBs) * FSize) +
       ' elements exceeds the int index range.');
+  // The caller must pass cai_im2col_h whenever this instance is in FP16 mode:
+  // the gather writes whichever B buffer the GEMM will read, and both verdicts
+  // come from the one layer flag so they cannot disagree.
+  if FFP16Activations
+    then ColsBuffer := FInputBufferBsFP16
+    else ColsBuffer := EnsureInputBufferBs();
   N := FNumBs * FSize;
   InSizeX := SrcVol.SizeX;
   InSizeY := SrcVol.SizeY;
   InDepth := SrcVol.Depth;
 
   err := CL_SUCCESS;
-  if pExternalSrc <> nil then
-  begin
-    SrcBuffer := pExternalSrc;
-  end
-  else
-  begin
-    // Resident, grow-only source buffer (same model as the operand/bias buffers).
-    NeededSrc := SrcVol.GetMemSize();
-    if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
-    begin
-      if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
-      FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
-      FCapIm2ColSrc := NeededSrc;
-      NewSrc := true; // fresh/grown buffer: force upload regardless of caller
-    end;
-    SrcBuffer := FIm2ColSrcBuffer;
-    if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol);
-  end;
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
 
   err := err or clSetKernelArg(k, 0, csLongintSize, @N);
   err := err or clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
@@ -1062,11 +1118,13 @@ var
   UseTiled: boolean;
 begin
   FActFun := pActFN;
-  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
+  if (VBs = nil) and NewVBs and (pExternalVBs = nil) then
+    raise Exception.Create('TDotProductSharedKernel.Compute: NewVBs without a B volume.');
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := EnsureInputBufferBs();
 
   if (VAs.Size = FSize * FNumAs) then
   begin
-    if (VBs.Size = FSize * FNumBs) then
+    if (VBs = nil) or (VBs.Size = FSize * FNumBs) then
     begin
       err := CL_SUCCESS;
       UseBias := PrepareBiasOperand(VBias, NewVBias, err);
@@ -1115,7 +1173,7 @@ begin
 
         if UseTiled then
         begin
-          RunTiledGemm();
+          RunTiledGemm(FTiledKernel);
         end
         else if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
@@ -1526,6 +1584,27 @@ begin
   vTiledGemmMinColumns := pValue;
 end;
 
+var
+  vOpenCLImplicitConvLoaded: boolean = false;
+  vOpenCLImplicitConv: boolean = true;
+
+function OpenCLImplicitConvEnabled(): boolean;
+begin
+  if not vOpenCLImplicitConvLoaded then
+  begin
+    vOpenCLImplicitConvLoaded := true;
+    vOpenCLImplicitConv :=
+      GetEnvironmentVariable('NEURAL_OPENCL_IMPLICIT_CONV') <> '0';
+  end;
+  Result := vOpenCLImplicitConv;
+end;
+
+procedure SetOpenCLImplicitConv(pValue: boolean);
+begin
+  vOpenCLImplicitConvLoaded := true;
+  vOpenCLImplicitConv := pValue;
+end;
+
 function TDotProductSharedKernel.ShouldUseTiledGemm(): boolean;
 var
   MinColumns: integer;
@@ -1581,16 +1660,98 @@ begin
   Result := true;
 end;
 
-procedure TDotProductSharedKernel.RunTiledGemm();
+procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel);
 var
   RowTiles, ColTiles: longint;
 begin
   RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
     div (csTiledGemmLanes * csTiledGemmRowsPerLane);
   ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
-  FDotProductKernel.RunKernel2D(FTiledKernel, RowTiles * csTiledGemmLanes,
+  FDotProductKernel.RunKernel2D(pKernel, RowTiles * csTiledGemmLanes,
     ColTiles, csTiledGemmLanes, 1);
   Inc(FTiledLaunchCount);
+end;
+
+function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
+begin
+  Result := FImplicitConvReady;
+  if Result or FInt8Ready or FInt4Ready then exit;
+  FImplicitConvKernel := FDotProductKernel.CreateKernel('cai_conv_implicit');
+  if not Assigned(FImplicitConvKernel) then exit;
+  // Optional: without it every shape takes cai_conv_implicit.
+  FImplicitConvTiledKernel := FDotProductKernel.CreateKernel('cai_conv_implicit_tiled');
+  if Assigned(FImplicitConvTiledKernel) and
+    (FDotProductKernel.KernelMaxWorkGroupSize(FImplicitConvTiledKernel) <
+      csTiledGemmLanes) then
+  begin
+    clReleaseKernel(FImplicitConvTiledKernel);
+    FImplicitConvTiledKernel := nil;
+  end;
+  FImplicitConvReady := true;
+  Result := true;
+end;
+
+procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
+  OutSizeX, RowSpan, Stride, Padding, pActFN: longint; NewVAs: boolean;
+  VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
+  pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InSizeX, InSizeY, InDepth: longint;
+  K: cl_kernel;
+  SrcBuffer: cl_mem;
+  UseTiled: boolean;
+begin
+  if not FImplicitConvReady then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv without ' +
+      'PrepareImplicitConv.');
+    exit;
+  end;
+  if VAs.Size <> FSize * FNumAs then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - VA size: ' +
+      IntToStr(VAs.Size) + ' FSize: ' + IntToStr(FSize) +
+      ' NumAs:' + IntToStr(FNumAs));
+    exit;
+  end;
+  FActFun := pActFN;
+  InSizeX := SrcVol.SizeX;
+  InSizeY := SrcVol.SizeY;
+  InDepth := SrcVol.Depth;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+  UseTiled := Assigned(FImplicitConvTiledKernel) and
+    (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm();
+  if UseTiled then K := FImplicitConvTiledKernel else K := FImplicitConvKernel;
+  err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
+  err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
+  err := err or clSetKernelArg(K, 9, csLongintSize, @OutSizeX);
+  err := err or clSetKernelArg(K, 10, csLongintSize, @RowSpan);
+  err := err or clSetKernelArg(K, 11, csLongintSize, @InSizeX);
+  err := err or clSetKernelArg(K, 12, csLongintSize, @InSizeY);
+  err := err or clSetKernelArg(K, 13, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(K, 14, csLongintSize, @Stride);
+  err := err or clSetKernelArg(K, 15, csLongintSize, @Padding);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'setting arguments or uploading: ' + IntToStr(err));
+    exit;
+  end;
+  if UseTiled
+    then RunTiledGemm(K)
+    else FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
+  Inc(FImplicitConvLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
@@ -1702,8 +1863,6 @@ end;
 
 function TDotProductSharedKernel.PrepareInt8BOperand(VBs: TNNetVolume;
   NewVBs: boolean; pExternalVBs: cl_mem; var err: integer): cl_mem;
-var
-  NeededBs: csize_t;
 begin
   if not FFP16Activations then
   begin
@@ -1729,15 +1888,10 @@ begin
     exit;
   end;
 
-  // Host-supplied B: upload FP32, then narrow on the device. This staging copy
-  // is reached only here, which is why PrepareForComputeInt8 does not size it.
-  NeededBs := VBs.GetMemSize();
-  if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
-  begin
-    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
-    FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
-    FCapBs := NeededBs;
-  end;
+  // Host-supplied B: upload FP32, then narrow in OpenCL memory. This staging
+  // copy is reached only here, which is why PrepareForComputeInt8 does not
+  // size it. VBs.Size = FNumBs * FSize was checked by ComputeResidentCodes.
+  EnsureInputBufferBs();
   err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
   err := err or CastBOperandToFP16(FInputBufferBs, VBs.Size);
 end;
@@ -1938,7 +2092,7 @@ begin
     err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
     if err = CL_SUCCESS then
     begin
-      RunTiledGemm();
+      RunTiledGemm(FTiledKernel);
     end
     else
     begin
