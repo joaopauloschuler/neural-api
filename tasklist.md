@@ -246,7 +246,21 @@ rather than acted on.
         SwitchTo allocates nothing. Open: GatedDeltaNet / DepthwiseConv1D
         recurrent state still leaves OpenCL memory on capture (one extra
         upload per capture).
-  - [ ] T4 (T4b). Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
+  - [x] T3 fix (with T4b): capture also at the end of the LAST USER message
+        (conversation rendered without the generation prompt, accepted only
+        as a token prefix). cfQwen3_5 re-renders earlier assistant turns
+        without <think>, so prompts diverge one token before the previous
+        end-of-prompt; without this point qwen3_5 resumed only at the system
+        checkpoint. Max 4 captures per turn.
+  - [x] T4 (T4b). Conversation slots (--kv-slots N, default 0): a slot holds
+        the reply-end session snapshot (host RAM, truncatable K/V) plus its
+        resume points (system, last-user, reply end) and, on recurrent nets,
+        the recurrent state at the last-user point (OpenCL memory under
+        --gpu). Saved when a request leaves the live conversation; matched in
+        the same one pass; same single eviction rule. Open: the twin-in-own-
+        OpenCL-context restore branch and a forced save failure are untested;
+        not yet run on a real model. Original plan text:
+        Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
         session state (attention K/V rows + recurrent state, via
         TNNetDecoderSessionSnapshot / SnapshotInto) per slot, with PrefixHash,
         guard tokens and LastUsedTurn. When a request diverges from the live

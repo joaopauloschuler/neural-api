@@ -125,6 +125,30 @@ type
     procedure RunChatCheckpointConversationSwitch(const Stem: string);
     procedure RunChatCheckpointSystemPrompt(const Stem: string;
       Ladder: boolean);
+    // The conversation slot whose reply end is at Position tagged with the
+    // hash and guard of Tokens[0..Position-1]; -1 when none is held.
+    function ChatKVSlotOf(Engine: TChatEngine;
+      const Tokens: TNeuralIntegerArray; Position: integer): integer;
+    // A loaded tiny_<Dir> chat engine: greedy, fp32, CPU, serial, --ctx Ctx,
+    // two new tokens per reply, --kv-slots KVSlots, then ExtraArgs.
+    function NewChatSlotEngine(const Dir: string; Ctx, KVSlots: integer;
+      const ExtraArgs: array of string): TChatEngine;
+    // Msgs rendered as cfQwen3_5 (thinking generation prompt) with Engine's
+    // tokenizer, ids mapped into a Vocab-sized pico vocab (id mod Vocab); the
+    // boundary counts come from the unmapped ids.
+    function ThinkingChatIds(Engine: TChatEngine; const Msgs: TChatMessages;
+      Vocab: integer; out SystemTokens, LastUserTokens: integer):
+      TNeuralIntegerArray;
+    // A growing thinking conversation resumes turn 2 at turn 1's last-user end.
+    procedure RunChatThinkingResume(const Stem: string);
+    // Thinking conversations A, B, A, B taking turns with --kv-slots 3.
+    procedure RunChatKVSlotSwitch(const Stem: string;
+      const ExtraArgs: array of string);
+    // Thinking A1, A1 regenerated, B, then A2 with --kv-slots 1.
+    procedure RunChatKVSlotRegenerate(const Stem: string);
+    // A growing conversation never saves a slot; three conversations in two
+    // slots evict by the single rule.
+    procedure RunChatKVSlotGrowingAndEviction(const Stem: string);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -433,6 +457,16 @@ type
     procedure TestChatCountSystemPromptTokens;
     procedure TestMambaChatCheckpointEvictsUnresumedMatch;
     procedure TestQwen35ChatCheckpointFlagErrors;
+    procedure TestChatCountLastUserTokens;
+    procedure TestChatThinkingResume;
+    procedure TestChatKVSlotSwitch;
+    procedure TestChatKVSlotSwitchPrefillWindow;
+    procedure TestChatKVSlotSwitchOpenCL;
+    procedure TestChatKVSlotRegenerateKeepsPoints;
+    procedure TestChatKVSlotSystemPointNoOverwrite;
+    procedure TestChatKVSlotSingleSlot;
+    procedure TestChatKVSlotGrowingAndEviction;
+    procedure TestChatKVSlotFlag;
     procedure TestQwen35ChatPrefillTailWindowErrors;
     procedure TestQwen35BorrowedTwinBuild;
     procedure TestQwen35BorrowedTwinInferenceMemory;
@@ -12570,6 +12604,771 @@ begin
   RunChatCheckpointConversationSwitch('mamba');
 end;
 
+function TTestNeuralPretrained.ChatKVSlotOf(Engine: TChatEngine;
+  const Tokens: TNeuralIntegerArray; Position: integer): integer;
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  Result := -1;
+  MaxSlotPos := High(Engine.KVSlots);
+  for SlotPos := 0 to MaxSlotPos do
+    if (Engine.KVSlots[SlotPos].Points[cspReplyEnd].Position = Position) and
+      (Engine.KVSlots[SlotPos].Points[cspReplyEnd].PrefixHash =
+       TokenPrefixHash(Tokens, Position)) and
+      TokenPrefixGuardMatches(Engine.KVSlots[SlotPos].Points[cspReplyEnd].Guard,
+        Tokens, Position) then exit(SlotPos);
+end;
+
+function TTestNeuralPretrained.NewChatSlotEngine(const Dir: string;
+  Ctx, KVSlots: integer; const ExtraArgs: array of string): TChatEngine;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+  ErrorMsg: string;
+  ParsedOK, LoadedOK: boolean;
+  ArgPos: integer;
+begin
+  Result := TChatEngine.Create();
+  Result.OnNotice := @CaptureNotice;
+  Args := TStringList.Create();
+  try
+    Args.Add(Dir);
+    Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+    Args.Add('--serial');
+    Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+    Args.Add('--max-new-tokens'); Args.Add('2');
+    Args.Add('--kv-slots'); Args.Add(IntToStr(KVSlots));
+    for ArgPos := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[ArgPos]);
+    ParsedOK := ParseArgs(Args, Opt);
+    AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+    LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+    AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+  except
+    Result.Free;
+    Args.Free;
+    raise;
+  end;
+  Args.Free;
+end;
+
+function TTestNeuralPretrained.ThinkingChatIds(Engine: TChatEngine;
+  const Msgs: TChatMessages; Vocab: integer;
+  out SystemTokens, LastUserTokens: integer): TNeuralIntegerArray;
+var
+  TokenPos, MaxTokenPos: integer;
+begin
+  Engine.ChatFormat := cfQwen3_5;
+  Engine.RawMode := false;
+  Result := EncodeChat(Engine.Tokenizer, cfQwen3_5, Msgs,
+    ChatTemplateOptions(true, false, Engine.Opt.ReasoningEffort));
+  SystemTokens := Engine.CountSystemPromptTokens(Msgs, Result, Engine.Opt);
+  LastUserTokens := Engine.CountLastUserTokens(Msgs, Result, Engine.Opt);
+  MaxTokenPos := High(Result);
+  for TokenPos := 0 to MaxTokenPos do
+    Result[TokenPos] := Result[TokenPos] mod Vocab;
+end;
+
+// A growing Qwen3.5 thinking conversation: turn 1 ends its prompt with the
+// opened '<think>' frame, and turn 2 re-renders that reply without it, so
+// turn 2 diverges inside turn 1's generation prompt. Turn 2 must resume at
+// the end of turn 1's last user message (not at the system checkpoint) and
+// reply as a fresh engine does. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatThinkingResume(const Stem: string);
+const
+  Ctx = 512;
+  Vocab = 12;
+var
+  Dir, Tag: string;
+  Engine, Fresh: TChatEngine;
+  Msgs: TChatMessages;
+  Prompt1, Prompt2: TNeuralIntegerArray;
+  System1, User1, System2, User2, Shared: integer;
+  Turn1, Turn2, FreshTurn: TChatTurnRecord;
+begin
+  Tag := Stem + ': ';
+  RandSeed := 737373;
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  Fresh := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 0, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, []);
+    SetLength(Msgs, 2);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    Prompt1 := ThinkingChatIds(Engine, Msgs, Vocab, System1, User1);
+    SetLength(Msgs, 4);
+    Msgs[2] := ChatMessage('assistant', 'Cats are small furry pets.');
+    Msgs[3] := ChatMessage('user', 'And dogs?');
+    Prompt2 := ThinkingChatIds(Engine, Msgs, Vocab, System2, User2);
+    AssertTrue(Tag + 'the system boundary is found', System1 > 0);
+    AssertTrue(Tag + 'the last-user boundary is past it', User1 > System1);
+
+    Turn1.Reply := Engine.GenerateFromIds(Prompt1, Engine.Opt, System1, User1);
+    Turn1.Completion := Engine.LastCompletionTokens;
+    Turn1.Cached := Copy(Engine.CachedTokens);
+    Shared := CommonPrefixLen(Prompt2, Turn1.Cached);
+    AssertTrue(Tag + 'turn 2 keeps turn 1 up to its last user message',
+      Shared >= User1);
+    AssertTrue(Tag + 'turn 2 diverges inside the generation prompt',
+      Shared < Length(Prompt1) - 1);
+
+    Turn2.Reply := Engine.GenerateFromIds(Prompt2, Engine.Opt, System2, User2);
+    Turn2.Completion := Engine.LastCompletionTokens;
+    Turn2.Cached := Copy(Engine.CachedTokens);
+    AssertTrue(Tag + 'resumed from a checkpoint',
+      Engine.LastResumeRoute = crrCheckpoint);
+    AssertEquals(Tag + 'resumed at turn 1''s last-user end', User1,
+      Engine.LastReusedTokens);
+
+    FreshTurn.Reply := Fresh.GenerateFromIds(Prompt2, Fresh.Opt);
+    FreshTurn.Completion := Fresh.LastCompletionTokens;
+    FreshTurn.Cached := Copy(Fresh.CachedTokens);
+    AssertSameChatTurn(FreshTurn, Turn2, Tag + 'turn 2 vs fresh');
+  finally
+    Fresh.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatThinkingResume;
+begin
+  RunChatThinkingResume('qwen3_5');
+  RunChatThinkingResume('mamba');
+end;
+
+// Two Qwen3.5 thinking conversations A and B (same system prompt) take turns
+// with --kv-slots 3: A1, B1, A2, B2. B1 saves A, A2 saves B and resumes A's
+// slot at A1's last-user point (the re-rendered reply diverges inside A1's
+// generation prompt, so the reply-end point never matches), B2 saves A2 into
+// the free slot and resumes B's slot the same way. Every
+// reply equals a fresh engine's. On the pure recurrent net A1's last-user
+// checkpoint is as deep as the slot point and wins the tie.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatKVSlotSwitch(const Stem: string;
+  const ExtraArgs: array of string);
+const
+  Ctx = 512;
+  Vocab = 12;
+var
+  Dir, Tag: string;
+  Engine: TChatEngine;
+  Msgs: TChatMessages;
+  PromptA1, PromptB1, PromptA2, PromptB2: TNeuralIntegerArray;
+  TurnA1, TurnB1, TurnA2, TurnB2: TChatTurnRecord;
+  SystemA1, UserA1, SystemB1, UserB1, SystemA2, UserA2, SystemB2, UserB2: integer;
+  UserPointA, UserPointB, ArgPos: integer;
+  PureRecurrent, OnOpenCL, Windowed: boolean;
+  LogitsTolerance: double;
+
+  procedure RunTurn(AEngine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    SystemTokens, UserTokens: integer; var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := AEngine.GenerateFromIds(Prompt, AEngine.Opt, SystemTokens,
+      UserTokens);
+    Turn.Completion := AEngine.LastCompletionTokens;
+    Turn.Cached := Copy(AEngine.CachedTokens);
+  end;
+
+  // Reply, cached ids and the last logits row equal a fresh engine's, and
+  // the attention cache holds exactly the cached ids.
+  procedure AssertFreshTurn(const Prompt: TNeuralIntegerArray;
+    const Turn: TChatTurnRecord; const What: string);
+  var
+    Fresh: TChatEngine;
+    FreshTurn: TChatTurnRecord;
+    Logits, FreshLogits: TNNetVolume;
+  begin
+    if Engine.Session.SDPACount > 0 then
+      AssertEquals(Tag + What + ': attention cache length',
+        Length(Turn.Cached), Engine.Session.SDPACacheLength(0));
+    Logits := Engine.Session.Output();
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, ExtraArgs);
+    try
+      RunTurn(Fresh, Prompt, 0, 0, FreshTurn);
+      FreshLogits := Fresh.Session.Output();
+      AssertEquals(Tag + What + ': logits size', FreshLogits.Size, Logits.Size);
+      AssertTrue(Tag + What + ': last logits row equals the fresh engine''s',
+        Logits.SumDiff(FreshLogits) < LogitsTolerance);
+    finally
+      Fresh.Free;
+    end;
+    AssertSameChatTurn(FreshTurn, Turn, Tag + What);
+  end;
+
+  // Where the last turn put its last-user point: the boundary itself on a
+  // net without recurrent layers, else the capture the prefill reached.
+  function UserPointOf(const Prompt: TNeuralIntegerArray;
+    UserTokens: integer): integer;
+  var
+    PrefillTokens, WindowLen, WindowCount, TailLen, TailCount: integer;
+  begin
+    if not Engine.StateReuseOK then exit(UserTokens);
+    PrefillTokens := Length(Prompt) - 1 - Engine.LastReusedTokens;
+    WindowLen := 0; WindowCount := 0; TailLen := 0; TailCount := 0;
+    if Assigned(Engine.WindowIn) then
+    begin
+      WindowLen := Engine.WindowIn.SizeX;
+      WindowCount := PrefillTokens div WindowLen;
+    end;
+    if Assigned(Engine.TailIn) then
+    begin
+      TailLen := Engine.TailIn.SizeX;
+      TailCount := (PrefillTokens - WindowCount * WindowLen) div TailLen;
+    end;
+    Result := MessageBoundaryCapturePosition(UserTokens,
+      Engine.LastReusedTokens, Length(Prompt) - 1, WindowLen, WindowCount,
+      TailLen, TailCount);
+  end;
+
+  procedure AssertSlotResume(UserPoint: integer; const What: string);
+  begin
+    AssertEquals(Tag + What + ' resumed at the last-user point', UserPoint,
+      Engine.LastReusedTokens);
+    if PureRecurrent then
+      AssertTrue(Tag + What + ': a checkpoint or a slot',
+        Engine.LastResumeRoute in [crrCheckpoint, crrSlot])
+    else AssertTrue(Tag + What + ' resumed a slot',
+      Engine.LastResumeRoute = crrSlot);
+  end;
+
+begin
+  Tag := Stem + ': ';
+  if Length(ExtraArgs) > 0 then Tag := Stem + ' ' + ExtraArgs[0] + ': ';
+  // OpenCL kernels sum in another order when the prefill splits differently.
+  LogitsTolerance := 1e-5;
+  OnOpenCL := false;
+  Windowed := false;
+  for ArgPos := 0 to High(ExtraArgs) do
+  begin
+    if ExtraArgs[ArgPos] = '--gpu' then OnOpenCL := true;
+    if ExtraArgs[ArgPos] = '--prefill-window' then Windowed := true;
+  end;
+  if OnOpenCL then LogitsTolerance := 1e-2;
+  RandSeed := 515151;
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 3, ExtraArgs);
+    AssertEquals(Tag + 'three conversation slots', 3, Length(Engine.KVSlots));
+    PureRecurrent := Engine.Session.SDPACount = 0;
+    if OnOpenCL then
+    begin
+      {$IFDEF OpenCL}
+      AssertTrue(Tag + 'OpenCL is on', Assigned(Engine.GpuCL));
+      {$ENDIF}
+      // The twins share NN's OpenCL context, so the slot's last-user state
+      // can be restored straight into the twin that steps first.
+      AssertTrue(Tag + 'the twins take captures', Engine.CheckpointOnTwins);
+    end;
+    SetLength(Msgs, 2);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    PromptA1 := ThinkingChatIds(Engine, Msgs, Vocab, SystemA1, UserA1);
+    Msgs[1] := ChatMessage('user', 'What is the capital of France?');
+    PromptB1 := ThinkingChatIds(Engine, Msgs, Vocab, SystemB1, UserB1);
+    SetLength(Msgs, 4);
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    Msgs[2] := ChatMessage('assistant', 'Cats are small furry pets.');
+    Msgs[3] := ChatMessage('user', 'And dogs?');
+    PromptA2 := ThinkingChatIds(Engine, Msgs, Vocab, SystemA2, UserA2);
+    Msgs[1] := ChatMessage('user', 'What is the capital of France?');
+    Msgs[2] := ChatMessage('assistant', 'Paris.');
+    Msgs[3] := ChatMessage('user', 'And of Spain?');
+    PromptB2 := ThinkingChatIds(Engine, Msgs, Vocab, SystemB2, UserB2);
+    AssertTrue(Tag + 'boundaries found', (UserA1 > SystemA1) and
+      (UserB1 > SystemB1) and (SystemA1 > 0));
+
+    RunTurn(Engine, PromptA1, SystemA1, UserA1, TurnA1);
+    UserPointA := UserPointOf(PromptA1, UserA1);
+    AssertTrue(Tag + 'A1 has a last-user point', UserPointA > SystemA1);
+    AssertEquals(Tag + 'A1 saved nothing', 0, Engine.KVSlotSaves);
+
+    RunTurn(Engine, PromptB1, SystemB1, UserB1, TurnB1);
+    UserPointB := UserPointOf(PromptB1, UserB1);
+    AssertEquals(Tag + 'B1 saved A', 1, Engine.KVSlotSaves);
+    AssertTrue(Tag + 'A is held', ChatKVSlotOf(Engine, TurnA1.Cached,
+      Length(TurnA1.Cached)) >= 0);
+    AssertFreshTurn(PromptB1, TurnB1, 'B1 vs fresh');
+
+    AssertTrue(Tag + 'A2 shares less than A''s last-user point with B',
+      CommonPrefixLen(PromptA2, TurnB1.Cached) < UserPointA);
+    AssertTrue(Tag + 'A2 does not reach A1''s reply end',
+      CommonPrefixLen(PromptA2, TurnA1.Cached) < Length(TurnA1.Cached));
+    RunTurn(Engine, PromptA2, SystemA2, UserA2, TurnA2);
+    AssertEquals(Tag + 'A2 saved B', 2, Engine.KVSlotSaves);
+    AssertTrue(Tag + 'B is held', ChatKVSlotOf(Engine, TurnB1.Cached,
+      Length(TurnB1.Cached)) >= 0);
+    AssertSlotResume(UserPointA, 'A2');
+    if Windowed then
+      AssertTrue(Tag + 'A2: the width-N twin stepped first',
+        Engine.LastPrefillWindows > 0);
+    AssertFreshTurn(PromptA2, TurnA2, 'A2 vs fresh');
+
+    AssertTrue(Tag + 'B2 shares less than B''s last-user point with A2',
+      CommonPrefixLen(PromptB2, TurnA2.Cached) < UserPointB);
+    RunTurn(Engine, PromptB2, SystemB2, UserB2, TurnB2);
+    AssertEquals(Tag + 'B2 saved A2', 3, Engine.KVSlotSaves);
+    AssertTrue(Tag + 'A2 is held', ChatKVSlotOf(Engine, TurnA2.Cached,
+      Length(TurnA2.Cached)) >= 0);
+    AssertSlotResume(UserPointB, 'B2');
+    if Windowed then
+      AssertTrue(Tag + 'B2: the width-N twin stepped first',
+        Engine.LastPrefillWindows > 0);
+    AssertFreshTurn(PromptB2, TurnB2, 'B2 vs fresh');
+  finally
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatKVSlotSwitch;
+begin
+  RunChatKVSlotSwitch('qwen2', []);
+  RunChatKVSlotSwitch('qwen3_5', []);
+  RunChatKVSlotSwitch('mamba', []);
+end;
+
+// The slot resume restores straight into the width-N twin that steps first.
+procedure TTestNeuralPretrained.TestChatKVSlotSwitchPrefillWindow;
+begin
+  RunChatKVSlotSwitch('qwen3_5', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+  RunChatKVSlotSwitch('qwen2', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+end;
+
+// The slot switch with the prefill ladder on OpenCL: the slot's last-user
+// state is restored straight into the width-N twin sharing NN's context.
+procedure TTestNeuralPretrained.TestChatKVSlotSwitchOpenCL;
+{$IFDEF OpenCL}
+var
+  APlatform: cl_platform_id;
+  ADevice: cl_device_id;
+{$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if not AcquireFirstOpenCLDevice(APlatform, ADevice) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  RunChatKVSlotSwitch('qwen3_5', ['--prefill-window', '4',
+    '--prefill-tail-window', '2', '--int8', '--kv-int8', '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// One slot. A1, then A1 again with a shorter reply (a regenerate: it resumes
+// past its own last user message, so it captures no last-user point of its
+// own), then B (whose save of the regenerated A takes the only slot), then
+// A2. The regenerated A must still carry A1's last-user point, so A2 resumes
+// there through the slot, and equals a fresh engine. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatKVSlotRegenerate(const Stem: string);
+const
+  Ctx = 512;
+  Vocab = 12;
+var
+  Dir, Tag: string;
+  Engine, Fresh: TChatEngine;
+  Msgs: TChatMessages;
+  PromptA1, PromptB, PromptA2: TNeuralIntegerArray;
+  SystemA1, UserA1, SystemB, UserB, SystemA2, UserA2, UserPointA: integer;
+  RegenOpt: TChatOptions;
+  Reply, FreshReply: string;
+begin
+  Tag := Stem + ': ';
+  RandSeed := 919191;
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  Fresh := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 1, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, []);
+    SetLength(Msgs, 2);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    PromptA1 := ThinkingChatIds(Engine, Msgs, Vocab, SystemA1, UserA1);
+    Msgs[1] := ChatMessage('user', 'What is the capital of France?');
+    PromptB := ThinkingChatIds(Engine, Msgs, Vocab, SystemB, UserB);
+    SetLength(Msgs, 4);
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    Msgs[2] := ChatMessage('assistant', 'Cats are small furry pets.');
+    Msgs[3] := ChatMessage('user', 'And dogs?');
+    PromptA2 := ThinkingChatIds(Engine, Msgs, Vocab, SystemA2, UserA2);
+
+    Engine.GenerateFromIds(PromptA1, Engine.Opt, SystemA1, UserA1);
+    if Engine.StateReuseOK then
+      UserPointA := MessageBoundaryCapturePosition(UserA1,
+        Engine.LastReusedTokens, Length(PromptA1) - 1, 0, 0, 0, 0)
+    else UserPointA := UserA1;
+    RegenOpt := Engine.Opt;
+    RegenOpt.MaxNewTokens := 1;
+    Engine.GenerateFromIds(PromptA1, RegenOpt, SystemA1, UserA1);
+    AssertTrue(Tag + 'the regenerate resumed past its last user message',
+      Engine.LastReusedTokens > UserA1);
+    AssertEquals(Tag + 'the regenerate saved A1', 1, Engine.KVSlotSaves);
+    Engine.GenerateFromIds(PromptB, Engine.Opt, SystemB, UserB);
+    AssertEquals(Tag + 'B saved the regenerated A into the only slot', 2,
+      Engine.KVSlotSaves);
+    AssertEquals(Tag + 'the regenerated A kept A1''s last-user point',
+      UserPointA, Engine.KVSlots[0].Points[cspLastUser].Position);
+
+    Reply := Engine.GenerateFromIds(PromptA2, Engine.Opt, SystemA2, UserA2);
+    AssertTrue(Tag + 'A2 resumed the slot', Engine.LastResumeRoute = crrSlot);
+    AssertEquals(Tag + 'A2 resumed at A1''s last-user point', UserPointA,
+      Engine.LastReusedTokens);
+    FreshReply := Fresh.GenerateFromIds(PromptA2, Fresh.Opt);
+    AssertEquals(Tag + 'A2 vs fresh: reply', FreshReply, Reply);
+    AssertTrue(Tag + 'A2 vs fresh: last logits row',
+      Engine.Session.Output().SumDiff(Fresh.Session.Output()) < 1e-5);
+  finally
+    Fresh.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatKVSlotRegenerateKeepsPoints;
+begin
+  RunChatKVSlotRegenerate('qwen2');
+  RunChatKVSlotRegenerate('qwen3_5');
+end;
+
+// Pure attention, three slots, two system prompts: A (system 1), B (system
+// 2), C (system 1, another question), D (system 2, another question). C
+// resumes A's slot at its system point and D resumes B's the same way; every
+// save takes a free slot, so A, B and C are all held at the end (no save
+// overwrote another conversation). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatKVSlotSystemPointNoOverwrite;
+const
+  Ctx = 512;
+  Vocab = 12;
+var
+  Dir: string;
+  Engine: TChatEngine;
+  Msgs: TChatMessages;
+  PromptA, PromptB, PromptC, PromptD: TNeuralIntegerArray;
+  CachedA, CachedB, CachedC: TNeuralIntegerArray;
+  SystemA, UserA, SystemB, UserB, SystemC, UserC, SystemD, UserD: integer;
+
+  function Ids(const SystemText, UserText: string;
+    out SystemTokens, UserTokens: integer): TNeuralIntegerArray;
+  begin
+    SetLength(Msgs, 2);
+    Msgs[0] := ChatMessage('system', SystemText);
+    Msgs[1] := ChatMessage('user', UserText);
+    Result := ThinkingChatIds(Engine, Msgs, Vocab, SystemTokens, UserTokens);
+  end;
+
+begin
+  RandSeed := 828282;
+  Dir := MakeChatModelDir('qwen2');
+  Engine := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 3, []);
+    PromptA := Ids('You are a helpful assistant.', 'Tell me about cats.',
+      SystemA, UserA);
+    PromptB := Ids('Answer in one short word.', 'Name a colour.',
+      SystemB, UserB);
+    PromptC := Ids('You are a helpful assistant.', 'What is rain?',
+      SystemC, UserC);
+    PromptD := Ids('Answer in one short word.', 'Name a fruit.',
+      SystemD, UserD);
+    AssertEquals('A and C share the system prompt', SystemA, SystemC);
+    AssertTrue('C shares less with B than its system prompt',
+      CommonPrefixLen(PromptC, PromptB) < SystemC);
+
+    Engine.GenerateFromIds(PromptA, Engine.Opt, SystemA, UserA);
+    CachedA := Copy(Engine.CachedTokens);
+    Engine.GenerateFromIds(PromptB, Engine.Opt, SystemB, UserB);
+    CachedB := Copy(Engine.CachedTokens);
+    Engine.GenerateFromIds(PromptC, Engine.Opt, SystemC, UserC);
+    CachedC := Copy(Engine.CachedTokens);
+    AssertTrue('C resumed a slot', Engine.LastResumeRoute = crrSlot);
+    AssertEquals('C resumed at A''s system point', SystemA,
+      Engine.LastReusedTokens);
+    Engine.GenerateFromIds(PromptD, Engine.Opt, SystemD, UserD);
+    AssertTrue('D resumed a slot', Engine.LastResumeRoute = crrSlot);
+    AssertEquals('D resumed at B''s system point', SystemB,
+      Engine.LastReusedTokens);
+    AssertEquals('B, C and D each saved one conversation', 3,
+      Engine.KVSlotSaves);
+    AssertTrue('A still held', ChatKVSlotOf(Engine, CachedA,
+      Length(CachedA)) >= 0);
+    AssertTrue('B still held', ChatKVSlotOf(Engine, CachedB,
+      Length(CachedB)) >= 0);
+    AssertTrue('C held', ChatKVSlotOf(Engine, CachedC, Length(CachedC)) >= 0);
+  finally
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// One slot: B1 saves A; A2 resumes that slot, whose eviction the save of B
+// may not take, so B is dropped (no new save). A2 equals a fresh engine's.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatKVSlotSingleSlot;
+const
+  Ctx = 16;
+  Vocab = 12;
+  FirstLen = 4;
+  MaxFirstPos = FirstLen - 1;
+var
+  Dir: string;
+  Engine, Fresh: TChatEngine;
+  PromptA, PromptB, PromptA2: TNeuralIntegerArray;
+  CachedA, CachedB: TNeuralIntegerArray;
+  TokenPos: integer;
+  FreshReply, Reply: string;
+begin
+  SetLength(PromptA, FirstLen);
+  SetLength(PromptB, FirstLen);
+  for TokenPos := 0 to MaxFirstPos do
+  begin
+    PromptA[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+    PromptB[TokenPos] := (7 * TokenPos + 1) mod Vocab;
+  end;
+  Dir := MakeChatModelDir('qwen2');
+  Engine := nil;
+  Fresh := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 1, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, []);
+    Engine.GenerateFromIds(PromptA, Engine.Opt);
+    CachedA := Copy(Engine.CachedTokens);
+    Engine.GenerateFromIds(PromptB, Engine.Opt);
+    CachedB := Copy(Engine.CachedTokens);
+    AssertEquals('B saved A', 1, Engine.KVSlotSaves);
+    SetLength(PromptA2, Length(CachedA) + 1);
+    Move(CachedA[0], PromptA2[0], Length(CachedA) * SizeOf(integer));
+    PromptA2[Length(CachedA)] := 4;
+    Reply := Engine.GenerateFromIds(PromptA2, Engine.Opt);
+    AssertTrue('A2 resumed the slot', Engine.LastResumeRoute = crrSlot);
+    AssertEquals('A2 resumed at A''s cached length', Length(CachedA),
+      Engine.LastReusedTokens);
+    AssertEquals('the only slot was A''s: B was not saved', 1,
+      Engine.KVSlotSaves);
+    AssertEquals('B is not held', -1,
+      ChatKVSlotOf(Engine, CachedB, Length(CachedB)));
+    FreshReply := Fresh.GenerateFromIds(PromptA2, Fresh.Opt);
+    AssertEquals('A2 vs fresh: reply', FreshReply, Reply);
+    AssertEquals('A2 vs fresh: completion', Fresh.LastCompletionTokens,
+      Engine.LastCompletionTokens);
+  finally
+    Fresh.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// A growing conversation (each prompt extends the previous cached ids) never
+// pays a slot save. Then conversations A, B, C in two slots: B saves A, C
+// saves B, and A again saves C after resuming A's slot, which it refreshes,
+// so the slot unused for the most turns (B's) is the one freed.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatKVSlotGrowingAndEviction(
+  const Stem: string);
+const
+  Ctx = 16;
+  Vocab = 12;
+  FirstLen = 4;
+  MaxFirstPos = FirstLen - 1;
+var
+  Dir, Tag: string;
+  Engine: TChatEngine;
+  Prompt, PromptA, PromptB, PromptC: TNeuralIntegerArray;
+  CachedA, CachedB, CachedC: TNeuralIntegerArray;
+  TurnPos, SlotA: integer;
+
+  procedure Grow(var Ids: TNeuralIntegerArray; Seed: integer);
+  var
+    CachedLen: integer;
+  begin
+    CachedLen := Length(Engine.CachedTokens);
+    SetLength(Ids, CachedLen + 1);
+    if CachedLen > 0 then
+      Move(Engine.CachedTokens[0], Ids[0], CachedLen * SizeOf(integer));
+    Ids[CachedLen] := Seed mod Vocab;
+  end;
+
+  procedure FirstPrompt(var Ids: TNeuralIntegerArray; Mul, Add: integer);
+  var
+    IdPos: integer;
+  begin
+    SetLength(Ids, FirstLen);
+    for IdPos := 0 to MaxFirstPos do
+      Ids[IdPos] := (Mul * IdPos + Add) mod Vocab;
+  end;
+
+begin
+  Tag := Stem + ': ';
+  RandSeed := 626262;
+  Dir := MakeChatModelDir(Stem);
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 2, []);
+    try
+      FirstPrompt(Prompt, 5, 2);
+      for TurnPos := 1 to 3 do
+      begin
+        Engine.GenerateFromIds(Prompt, Engine.Opt);
+        Grow(Prompt, TurnPos);
+      end;
+      AssertEquals(Tag + 'a growing conversation saved no slot', 0,
+        Engine.KVSlotSaves);
+    finally
+      Engine.Free;
+    end;
+
+    Engine := NewChatSlotEngine(Dir, Ctx, 2, []);
+    try
+      FirstPrompt(PromptA, 5, 2);
+      FirstPrompt(PromptB, 7, 1);
+      FirstPrompt(PromptC, 3, 6);
+      AssertTrue(Tag + 'the three conversations differ at their first id',
+        (PromptA[0] <> PromptB[0]) and (PromptA[0] <> PromptC[0]) and
+        (PromptB[0] <> PromptC[0]));
+      Engine.GenerateFromIds(PromptA, Engine.Opt);
+      CachedA := Copy(Engine.CachedTokens);
+      Engine.GenerateFromIds(PromptB, Engine.Opt);
+      CachedB := Copy(Engine.CachedTokens);
+      Engine.GenerateFromIds(PromptC, Engine.Opt);
+      CachedC := Copy(Engine.CachedTokens);
+      AssertEquals(Tag + 'B and C each saved one conversation', 2,
+        Engine.KVSlotSaves);
+      AssertTrue(Tag + 'A held', ChatKVSlotOf(Engine, CachedA,
+        Length(CachedA)) >= 0);
+      AssertTrue(Tag + 'B held', ChatKVSlotOf(Engine, CachedB,
+        Length(CachedB)) >= 0);
+      SetLength(Prompt, Length(CachedA) + 1);
+      Move(CachedA[0], Prompt[0], Length(CachedA) * SizeOf(integer));
+      Prompt[Length(CachedA)] := 4;
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      AssertEquals(Tag + 'A again resumed at its cached length',
+        Length(CachedA), Engine.LastReusedTokens);
+      AssertEquals(Tag + 'A again saved C', 3, Engine.KVSlotSaves);
+      AssertTrue(Tag + 'C held', ChatKVSlotOf(Engine, CachedC,
+        Length(CachedC)) >= 0);
+      SlotA := ChatKVSlotOf(Engine, CachedA, Length(CachedA));
+      AssertTrue(Tag + 'A''s resumed slot kept', SlotA >= 0);
+      AssertEquals(Tag + 'the resumed slot was refreshed (turn 4)', 4,
+        Engine.KVSlots[SlotA].LastUsedTurn);
+      AssertEquals(Tag + 'B''s slot, unused for the most turns, was freed',
+        -1, ChatKVSlotOf(Engine, CachedB, Length(CachedB)));
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatKVSlotGrowingAndEviction;
+begin
+  RunChatKVSlotGrowingAndEviction('qwen2');
+  RunChatKVSlotGrowingAndEviction('qwen3_5');
+end;
+
+// --kv-slots parsing, the off default, the notice, and the refusal under
+// --no-cache-reuse. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatKVSlotFlag;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+  Dir, ErrorMsg: string;
+  Engine: TChatEngine;
+  LoadedOK: boolean;
+
+  function ParseWith(const Value: string): boolean;
+  begin
+    Args.Clear();
+    Args.Add('model');
+    Args.Add('--kv-slots'); Args.Add(Value);
+    Opt := DefaultChatOptions();
+    Result := ParseArgs(Args, Opt);
+  end;
+
+begin
+  Args := TStringList.Create();
+  try
+    AssertEquals('default is off', 0, DefaultChatOptions().KVSlots);
+    AssertTrue('--kv-slots 4 parses', ParseWith('4'));
+    AssertEquals('--kv-slots 4 value', 4, Opt.KVSlots);
+    AssertTrue('--kv-slots 64 parses', ParseWith('64'));
+    AssertFalse('--kv-slots 65 is refused', ParseWith('65'));
+    AssertTrue('the refusal names the flag', Pos('--kv-slots', Opt.ErrorMsg) > 0);
+    AssertFalse('--kv-slots -1 is refused', ParseWith('-1'));
+  finally
+    Args.Free;
+  end;
+  Dir := MakeChatModelDir('qwen2');
+  try
+    // LoadModel repeats the range check for callers that fill TChatOptions
+    // without ParseArgs.
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir); Args.Add('--cpu'); Args.Add('--ctx'); Args.Add('16');
+      AssertTrue('parse', ParseArgs(Args, Opt));
+    finally
+      Args.Free;
+    end;
+    Opt.KVSlots := 65;
+    Engine := TChatEngine.Create();
+    try
+      AssertFalse('LoadModel refuses --kv-slots 65',
+        Engine.LoadModel(Opt, ErrorMsg));
+      AssertTrue('the refusal names the flag', Pos('--kv-slots', ErrorMsg) > 0);
+    finally
+      Engine.Free;
+    end;
+    Opt.KVSlots := -1;
+    Engine := TChatEngine.Create();
+    try
+      AssertFalse('LoadModel refuses --kv-slots -1',
+        Engine.LoadModel(Opt, ErrorMsg));
+    finally
+      Engine.Free;
+    end;
+    Engine := NewChatSlotEngine(Dir, 16, 0, []);
+    try
+      AssertEquals('--kv-slots 0: no slots', 0, Length(Engine.KVSlots));
+    finally
+      Engine.Free;
+    end;
+    FNotices := '';
+    Engine := NewChatSlotEngine(Dir, 16, 3, []);
+    try
+      AssertEquals('--kv-slots 3: three slots', 3, Length(Engine.KVSlots));
+      AssertTrue('the slots notice', Pos('conversation slots ON', FNotices) > 0);
+    finally
+      Engine.Free;
+    end;
+    Args := TStringList.Create();
+    Engine := TChatEngine.Create();
+    try
+      Engine.OnNotice := @CaptureNotice;
+      FNotices := '';
+      Args.Add(Dir);
+      Args.Add('--fp32'); Args.Add('--cpu'); Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add('16');
+      Args.Add('--kv-slots'); Args.Add('2'); Args.Add('--no-cache-reuse');
+      AssertTrue('parse', ParseArgs(Args, Opt));
+      LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+      AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertEquals('--no-cache-reuse: no slots', 0, Length(Engine.KVSlots));
+      AssertTrue('--no-cache-reuse: the ignored notice',
+        Pos('--kv-slots 2 ignored', FNotices) > 0);
+    finally
+      Engine.Free;
+      Args.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
 // Two conversations with the same system prompt (SystemLen ids): A captures
 // three checkpoints (the system prompt, the end of the prompt, the end of the
 // reply; with the 4/2 ladder the system one lands on the last window end at
@@ -12776,6 +13575,64 @@ begin
   end;
 end;
 
+// TChatEngine.CountLastUserTokens over the tiny Qwen3.5 BPE fixture: the
+// conversation rendered without the generation prompt (the end of the last
+// user message), past the system boundary, on ChatML, Qwen3.5 and Qwen3.8
+// (both efforts); raw mode gives 0. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatCountLastUserTokens;
+var
+  Engine: TChatEngine;
+  Msgs: TChatMessages;
+  GenOpt: TChatOptions;
+
+  procedure CheckFormat(Format: TNeuralChatFormat;
+    Effort: TChatReasoningEffort; const What: string);
+  var
+    PromptIds, MessageIds: TNeuralIntegerArray;
+    LastUserTokens, SystemTokens: integer;
+  begin
+    Engine.ChatFormat := Format;
+    GenOpt.ReasoningEffort := Effort;
+    PromptIds := EncodeChat(Engine.Tokenizer, Format, Msgs,
+      ChatTemplateOptions(true, false, Effort));
+    MessageIds := EncodeChat(Engine.Tokenizer, Format, Msgs,
+      ChatTemplateOptions(false, false, Effort));
+    LastUserTokens := Engine.CountLastUserTokens(Msgs, PromptIds, GenOpt);
+    SystemTokens := Engine.CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
+    AssertEquals(What + ': the render without the generation prompt',
+      Length(MessageIds), LastUserTokens);
+    AssertTrue(What + ': past the system boundary',
+      LastUserTokens > SystemTokens);
+    AssertTrue(What + ': before the prompt end',
+      LastUserTokens < Length(PromptIds));
+  end;
+
+begin
+  Engine := TChatEngine.Create();
+  try
+    Engine.Tokenizer := TNeuralHFTokenizer.Create();
+    Engine.Tokenizer.LoadFromFile(
+      FixturePath('tiny_bpe_split_qwen35_tokenizer.json'));
+    Engine.RawMode := false;
+    GenOpt := DefaultChatOptions();
+    SetLength(Msgs, 4);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Hello there.');
+    Msgs[2] := ChatMessage('assistant', '<think>Greet.</think>Hi!');
+    Msgs[3] := ChatMessage('user', 'How are you?');
+    CheckFormat(cfChatML, reXHigh, 'cfChatML');
+    CheckFormat(cfQwen3_5, reXHigh, 'cfQwen3_5');
+    CheckFormat(cfQwen3_8, reLow, 'cfQwen3_8 low');
+    CheckFormat(cfQwen3_8, reXHigh, 'cfQwen3_8 xhigh');
+    Engine.RawMode := true;
+    AssertEquals('raw mode', 0, Engine.CountLastUserTokens(Msgs,
+      EncodeChat(Engine.Tokenizer, cfChatML, Msgs,
+        ChatTemplateOptions(true, false, reXHigh)), GenOpt));
+  finally
+    Engine.Free;
+  end;
+end;
+
 // SystemPromptPrefixLen (a system message tokenized alone that is not a
 // prefix of the prompt gets no checkpoint) and SystemCapturePosition (which
 // prefill phase reaches the system boundary). Coded by Claude (AI).
@@ -12789,40 +13646,40 @@ begin
   PromptIds[0] := 4; PromptIds[1] := 5; PromptIds[2] := 6;
   PromptIds[3] := 7; PromptIds[4] := 8;
   AssertEquals('a proper prefix', 3,
-    SystemPromptPrefixLen(SystemIds, PromptIds));
+    MessageBoundaryPrefixLen(SystemIds, PromptIds));
   PromptIds[2] := 9; // the boundary merged into another id
-  AssertEquals('not a prefix', 0, SystemPromptPrefixLen(SystemIds, PromptIds));
+  AssertEquals('not a prefix', 0, MessageBoundaryPrefixLen(SystemIds, PromptIds));
   PromptIds[2] := 6;
   SetLength(PromptIds, 3);
   AssertEquals('nothing follows the system prompt', 0,
-    SystemPromptPrefixLen(SystemIds, PromptIds));
+    MessageBoundaryPrefixLen(SystemIds, PromptIds));
   SetLength(SystemIds, 0);
   AssertEquals('no system prompt', 0,
-    SystemPromptPrefixLen(SystemIds, PromptIds));
+    MessageBoundaryPrefixLen(SystemIds, PromptIds));
 
-  // SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
+  // MessageBoundaryCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
   //   WindowCount, TailLen, TailCount); 29 fed from 0: windows of 6 to 24,
   //   tails of 2 to 28, then single steps.
   AssertEquals('no system prompt', -1,
-    SystemCapturePosition(0, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(0, 0, 29, 6, 4, 2, 2));
   AssertEquals('window phase: last window end at or below', 12,
-    SystemCapturePosition(13, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(13, 0, 29, 6, 4, 2, 2));
   AssertEquals('exactly on a window end', 18,
-    SystemCapturePosition(18, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(18, 0, 29, 6, 4, 2, 2));
   AssertEquals('tail phase: last tail end at or below', 26,
-    SystemCapturePosition(27, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(27, 0, 29, 6, 4, 2, 2));
   AssertEquals('single steps reach it exactly', 29,
-    SystemCapturePosition(29, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(29, 0, 29, 6, 4, 2, 2));
   AssertEquals('past the prefill', -1,
-    SystemCapturePosition(30, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(30, 0, 29, 6, 4, 2, 2));
   AssertEquals('below the first window end: nothing to capture', -1,
-    SystemCapturePosition(5, 0, 29, 6, 4, 2, 2));
+    MessageBoundaryCapturePosition(5, 0, 29, 6, 4, 2, 2));
   AssertEquals('resumed at the boundary already', -1,
-    SystemCapturePosition(12, 12, 34, 6, 3, 2, 2));
+    MessageBoundaryCapturePosition(12, 12, 34, 6, 3, 2, 2));
   AssertEquals('resumed below it, no window end in between', -1,
-    SystemCapturePosition(13, 12, 34, 6, 3, 2, 2));
+    MessageBoundaryCapturePosition(13, 12, 34, 6, 3, 2, 2));
   AssertEquals('no ladder: the boundary itself', 13,
-    SystemCapturePosition(13, 0, 29, 0, 0, 0, 0));
+    MessageBoundaryCapturePosition(13, 0, 29, 0, 0, 0, 0));
 end;
 
 // Only the resumed checkpoint is refreshed (pure recurrent tiny_mamba, a

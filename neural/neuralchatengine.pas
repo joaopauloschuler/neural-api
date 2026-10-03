@@ -54,15 +54,18 @@ Coded by Claude (AI).
 // flat time-to-first-token. A recurrent (SSM) state cannot be
 // position-truncated, so a hybrid/recurrent net resumes instead from the
 // deepest cache checkpoint (the recurrent half of the state, captured at
-// the end of the system prompt, of the prompt and of the reply) whose
-// token prefix the prompt starts with (on a net with attention layers, only
-// within the prefix shared with the cached ids); --cache-checkpoints N sizes
-// that store, and a full store frees the checkpoint unused for the most turns.
-// NoCacheReuse turns both routes off (full re-prefill).
+// the end of the system prompt, of the last user message, of the prompt and
+// of the reply) whose token prefix the prompt starts with (on a net with
+// attention layers, only within the prefix shared with the cached ids);
+// --cache-checkpoints N sizes that store, and a full store frees the
+// checkpoint unused for the most turns.
+// --kv-slots N keeps up to N other conversations whole (KV cache and
+// recurrent state, host RAM): a prompt that leaves the cached conversation
+// saves it to a slot, and a prompt that starts with a saved conversation
+// resumes from it. NoCacheReuse turns every route off (full re-prefill).
 //
-// The engine is single-session: one model, one KV cache, one conversation
-// position at a time. Callers that serve concurrent clients must
-// serialize calls into it.
+// The engine runs one call at a time: one model, one live KV cache.
+// Callers that serve concurrent clients must serialize calls into it.
 
 {$mode objfpc}{$H+}
 
@@ -104,6 +107,8 @@ const
   csDefaultCacheCheckpointsOpenCL = 16;
   csDefaultCacheCheckpointsCPU = 8;
   csMaxCacheCheckpoints = 2048;
+  // --kv-slots N: the cap on saved conversation slots.
+  csMaxKVSlots = 64;
   // Start value of a token-prefix hash (the hash of the empty prefix).
   csTokenPrefixHashSeed = QWord($CBF29CE484222325);
   // Token ids a TTokenPrefixGuard keeps before its position.
@@ -124,6 +129,33 @@ type
     Guard: TTokenPrefixGuard; // their last ids, checked after a hash match
     LastUsedTurn: integer;    // TChatEngine.CurrentTurn of that request
   end;
+
+  // The points a saved conversation can resume from: the end of the system
+  // prompt, the end of the last user message, and the end of the reply.
+  TConversationSlotPoint = (cspSystem, cspLastUser, cspReplyEnd);
+
+  // A position a saved conversation can resume from: Position tokens fed
+  // (0 = not held), and the hash and guard of the ids before it.
+  TCacheResumePoint = record
+    Position: integer;
+    PrefixHash: UInt64;
+    Guard: TTokenPrefixGuard;
+  end;
+  TCacheResumePoints = array[TConversationSlotPoint] of TCacheResumePoint;
+
+  // A saved conversation (--kv-slots): State is the whole session at the reply
+  // end; LastUserState the recurrent state at Points[cspLastUser].
+  TConversationSlot = record
+    State: TNNetDecoderSessionSnapshot;          // owned
+    LastUserState: TNNetDecoderStateCheckpoint;  // owned; nil without
+                                                 // recurrent layers
+    Points: TCacheResumePoints;   // held when Points[cspReplyEnd].Position > 0
+    LastUsedTurn: integer;
+  end;
+
+  // Where a GenerateFromIds call resumed its prompt from: nothing (full
+  // prefill), the live KV cache, a cache checkpoint, or a conversation slot.
+  TChatResumeRoute = (crrNone, crrLive, crrCheckpoint, crrSlot);
 
   // Weight storage the chat engine loads the checkpoint into.
   // cwmInt4 is int4 on the convolution/projection layers, int8 elsewhere.
@@ -181,6 +213,8 @@ type
                                  // (LoadModel picks 16 under OpenCL, 8 on the
                                  // CPU); 0 = off (full re-prefill); 1 and
                                  // above 2048 are errors
+    KVSlots: integer;            // --kv-slots N: saved conversation slots
+                                 // (0 = off, the default; at most 64)
     KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
                                  // long context; logits not bit-exact). Follows
                                  // the weight mode (on with int8 weights, off
@@ -299,11 +333,13 @@ type
     // bit-identical to a full re-prefill. The store holds up to
     // Opt.CacheCheckpoints of them, sized once in LoadModel so that a capture
     // allocates nothing; Position 0 marks a free slot. CaptureCheckpoint runs
-    // at the end of the system prompt (the last prefill window end at or
-    // below it under a windowed prefill), of the prompt and of the reply,
-    // so one turn adds at most three. A checkpoint belongs to the token
-    // sequence it was captured on (CheckpointInfo), so checkpoints of other
-    // conversations stay held;
+    // at the end of the system prompt and of the last user message (the last
+    // prefill window end at or below each under a windowed prefill), of the
+    // prompt and of the reply, so one turn adds at most four. Thinking
+    // templates re-render the previous reply, so the next prompt diverges
+    // inside the generation prompt and resumes at the last-user end. A
+    // checkpoint belongs to the token sequence it was captured on
+    // (CheckpointInfo), so checkpoints of other conversations stay held;
     // DeleteTheLongestUnusedCheckpoint frees one only when a capture finds
     // the store full. Under OpenCL every slot lives in OpenCL memory (a
     // capture is a copy between resident buffers), else in host RAM:
@@ -311,12 +347,28 @@ type
     StateReuseOK: boolean;       // checkpoint resume sound for this architecture?
     Checkpoints: array of TNNetDecoderStateCheckpoint; // owned; empty when off
     CheckpointInfo: array of TCacheCheckpointInfo; // per slot of Checkpoints
-    CheckpointOrder: array of integer; // MatchPromptAgainstCache's slot
-                                 // indices by Position, sized with the store
+    CandidateOrder: array of integer; // MatchPromptAgainstCache's candidates
+                                 // by Position (a checkpoint slot, or -1-n for
+                                 // resume point n of the conversation slots),
+                                 // sized with both stores
     CheckpointOnTwins: boolean;  // the twins' captures are legal (they share
                                  // NN's OpenCL context, or OpenCL is off)
     CurrentTurn: integer;        // GenerateFromIds calls so far (the turn
                                  // the checkpoint eviction order counts)
+    // Conversation slots (--kv-slots N): other conversations kept whole in
+    // host RAM, so a prompt can resume one after other conversations ran. A
+    // request whose prompt leaves the cached conversation saves it first
+    // (SaveLiveConversation) with its resume points; a prompt that starts
+    // with a point's ids resumes there when that is deeper than the live
+    // cache or a checkpoint. Same eviction rule as the checkpoints.
+    KVSlots: array of TConversationSlot; // empty when off
+    KVSlotSaves: integer;        // conversations saved into a slot so far
+    // The cached conversation's resume points (Position 0 = not held), kept
+    // while KVSlots is not empty, and its recurrent state at the last-user
+    // point (nil without recurrent layers). SaveLiveConversation moves them
+    // into a slot.
+    LivePoints: TCacheResumePoints;
+    LiveUserState: TNNetDecoderStateCheckpoint;
     SeqLen, VocabSize: integer;
     MarkerIds: TNeuralIntegerArray;   // end-of-turn stop sequence (token ids)
     CachedTokens: TNeuralIntegerArray; // token ids resident in the KV cache
@@ -339,6 +391,7 @@ type
     LastCachedTokens: integer;   // Length(CachedTokens) when the last call
                                  // started (the (... of C cached))
     LastPrefillTokens: integer;  // prompt tokens the last call fed
+    LastResumeRoute: TChatResumeRoute; // where the last call resumed from
     LastPrefillWindows: integer; // whole windows the last call fed through
                                  // WindowSession (0 without --prefill-window)
     LastPrefillTailWindows: integer; // whole windows the last call fed
@@ -377,13 +430,19 @@ type
     // error (e.g. a system prompt on a format without a system role).
     function ChatReply(const Msgs: TChatMessages;
       const GenOpt: TChatOptions): string;
-    // One reply from prompt token ids, sampled with GenOpt; a checkpoint is
-    // captured at (or below) the first SystemPromptTokenCount ids when > 0.
+    // One reply from prompt token ids, sampled with GenOpt; the system prompt
+    // and last user message end at the given counts (0 = unknown).
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
-      const GenOpt: TChatOptions; SystemPromptTokenCount: integer = 0): string;
+      const GenOpt: TChatOptions; SystemPromptTokenCount: integer = 0;
+      LastUserTokenCount: integer = 0): string;
     // Ids of Msgs' leading system message rendered alone, when they are a
     // proper prefix of PromptIds; else 0 (no system message, or no clean cut).
     function CountSystemPromptTokens(const Msgs: TChatMessages;
+      const PromptIds: TNeuralIntegerArray;
+      const GenOpt: TChatOptions): integer;
+    // Ids of Msgs (ending with a user message) rendered without the generation
+    // prompt, when they are a proper prefix of PromptIds; else 0.
+    function CountLastUserTokens(const Msgs: TChatMessages;
       const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): integer;
   private
@@ -395,13 +454,30 @@ type
     // Emits U+FFFD for anything still held in PendingUtf8 at reply end.
     procedure FlushPendingUtf8();
     // Cache checkpoints (see the Checkpoints field).
-    // One pass: LivePrefix = common prefix with CachedTokens; ResumeSlot = the
-    // deepest resumable match (attention: <= LivePrefix), marked used, or -1.
+    // One pass: LivePrefix = common prefix with CachedTokens; the deepest
+    // matching checkpoint (attention: <= LivePrefix) and slot point, or -1.
     procedure MatchPromptAgainstCache(const PromptIds: TNeuralIntegerArray;
-      out LivePrefix, ResumeSlot: integer);
+      out LivePrefix, ResumeSlot, ResumeKVSlot: integer;
+      out ResumeKVPoint: TConversationSlotPoint);
     // Frees the checkpoint unused for the most turns (the shallowest on a
     // tie) and returns its slot. The store must be full.
     function DeleteTheLongestUnusedCheckpoint(): integer;
+    // Same rule over the conversation slots, never freeing ExcludeSlot;
+    // returns the freed slot, or -1 when only ExcludeSlot is held.
+    function DeleteTheLongestUnusedKVSlot(ExcludeSlot: integer): integer;
+    // Saves Session's state (the cached conversation) and LivePoints into a
+    // slot unless one holds it already; never evicts ExcludeSlot.
+    procedure SaveLiveConversation(ExcludeSlot: integer);
+    procedure FreeKVSlots();
+    // Drops the live points past Limit (all with Limit 0); the ones kept still
+    // describe the ids the next prompt shares with the cached conversation.
+    procedure KeepLivePointsUpTo(Limit: integer);
+    procedure ClearLivePoints();
+    // Bytes the conversation slots and LiveUserState hold, host and OpenCL.
+    procedure KVSlotBytes(out HostBytes, OpenCLBytes: int64);
+    // Copies Src's recurrent state into Dst through Session's, which it
+    // overwrites: call only before the resume route is applied, never on ReuseOK.
+    procedure CopyStateCheckpoint(Src, Dst: TNNetDecoderStateCheckpoint);
     // Copies ASession's recurrent state at FedPos, PrefixHash being the hash
     // of Tokens[0..FedPos-1]; an already-held checkpoint is only marked used.
     procedure CaptureCheckpoint(ASession: TNNetStreamingDecoder;
@@ -413,6 +489,8 @@ type
   end;
 
 function DefaultChatOptions(): TChatOptions;
+// 'none', 'live cache', 'checkpoint' or 'conversation slot'.
+function ChatResumeRouteName(Route: TChatResumeRoute): string;
 function ParseArgs(Args: TStringList; var Opt: TChatOptions): boolean;
 // The shared block of the --help text (every option ParseArgs understands
 // except the server-only --host/--port, which the server's usage adds).
@@ -424,14 +502,14 @@ function ArgMaxRow(Row: TNNetVolume): integer;
 function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
   const Marker: TNeuralIntegerArray): boolean;
 function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
-// Length(SystemIds) when SystemIds is a proper prefix of PromptIds, else 0
-// (the system message tokenized alone merged differently, or nothing follows).
-function SystemPromptPrefixLen(const SystemIds,
+// Length(BoundaryIds) when they are a proper prefix of PromptIds, else 0 (the
+// messages tokenized alone merged differently, or nothing follows).
+function MessageBoundaryPrefixLen(const BoundaryIds,
   PromptIds: TNeuralIntegerArray): integer;
-// Fed position of the system-prompt checkpoint: SystemTokens when single steps
+// Fed position of a message-boundary capture: BoundaryTokens when single steps
 // reach it, else the last prefill window end at or below it; -1 when none.
-function SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
-  WindowCount, TailLen, TailCount: integer): integer;
+function MessageBoundaryCapturePosition(BoundaryTokens, Reused, PrefillEnd,
+  WindowLen, WindowCount, TailLen, TailCount: integer): integer;
 // Extends a token-prefix hash by TokenId (start: csTokenPrefixHashSeed). Unkeyed,
 // so not collision-resistant against crafted prompts; see TTokenPrefixGuard.
 function FoldTokenIntoPrefixHash(Hash: UInt64; TokenId: integer): UInt64;
@@ -541,17 +619,29 @@ begin
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --cache-checkpoints N  hybrid/recurrent nets (qwen3_5, mamba, ...): keep');
   WriteLn('                        up to N checkpoints of the recurrent state, taken');
-  WriteLn('                        at the end of the system prompt, of the prompt');
-  WriteLn('                        and of the reply; a full store frees the one');
-  WriteLn('                        unused for the most turns. A prompt resumes from the');
-  WriteLn('                        deepest one whose tokens it starts with (with');
-  WriteLn('                        attention layers, only within the prefix shared');
-  WriteLn('                        with the cached ids) and prefills only the tail');
-  WriteLn('                        (default 16 with OpenCL, 8 on the');
-  WriteLn('                        CPU; 0 = off, full re-prefill; N is 0 or 2 to');
-  WriteLn('                        2048, else the program stops with an error before');
-  WriteLn('                        loading). Ignored on pure-attention nets, whose');
-  WriteLn('                        KV cache is truncated to the prefix instead');
+  WriteLn('                        at the end of the system prompt, of the last user');
+  WriteLn('                        message, of the prompt and of the reply; a full');
+  WriteLn('                        store frees the one unused for the most turns. A');
+  WriteLn('                        prompt resumes from the deepest one whose tokens');
+  WriteLn('                        it starts with (with attention layers, only within');
+  WriteLn('                        the prefix shared with the cached ids) and');
+  WriteLn('                        prefills only the tail (default 16 with OpenCL, 8');
+  WriteLn('                        on the CPU; 0 = off, full re-prefill; N is 0 or 2');
+  WriteLn('                        to 2048, else the program stops with an error');
+  WriteLn('                        before loading). Ignored on pure-attention nets,');
+  WriteLn('                        whose KV cache is truncated to the prefix instead');
+  WriteLn('  --kv-slots N          keep up to N other conversations whole: when a');
+  WriteLn('                        prompt leaves the cached conversation, that one is');
+  WriteLn('                        saved to a slot, and a prompt that starts with a');
+  WriteLn('                        saved one resumes from it (at the end of its last');
+  WriteLn('                        user message or of its reply) and prefills only');
+  WriteLn('                        the tail. A full set frees the slot unused for the');
+  WriteLn('                        most turns. A slot holds its conversation''s KV');
+  WriteLn('                        cache and recurrent state in host RAM; on');
+  WriteLn('                        hybrid/recurrent nets each slot, plus the engine');
+  WriteLn('                        once, also holds the recurrent state at a last');
+  WriteLn('                        user message, in OpenCL memory under --gpu');
+  WriteLn('                        (default 0 = off; N is 0 to 64)');
   WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a width-N');
   WriteLn('                        twin of the net (default 0 = one token per forward;');
   WriteLn('                        N is 0 or at least 2 and below the context, else');
@@ -596,6 +686,16 @@ begin
   end;
 end;
 
+function ChatResumeRouteName(Route: TChatResumeRoute): string;
+begin
+  case Route of
+    crrLive: Result := 'live cache';
+    crrCheckpoint: Result := 'checkpoint';
+    crrSlot: Result := 'conversation slot';
+  else Result := 'none';
+  end;
+end;
+
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
@@ -628,6 +728,7 @@ begin
   Result.Profile := false;
   Result.NoCacheReuse := false;
   Result.CacheCheckpoints := -1; // not given: LoadModel picks 16/8 (OpenCL/CPU)
+  Result.KVSlots := 0; // no conversation slots (--kv-slots N)
   Result.PrefillWindow := 0; // one token per prefill forward (--prefill-window N)
   Result.PrefillTailWindow := 0; // auto (--prefill-tail-window T)
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
@@ -725,6 +826,17 @@ begin
         exit(false);
       end;
       Opt.CacheCheckpoints := IVal;
+    end
+    else if Arg = '--kv-slots' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      if (IVal < 0) or (IVal > csMaxKVSlots) then
+      begin
+        Opt.ErrorMsg := Format('--kv-slots: must be 0 (off) to %d',
+          [csMaxKVSlots]);
+        exit(false);
+      end;
+      Opt.KVSlots := IVal;
     end
     else if Arg = '--prefill-window' then
     begin
@@ -993,31 +1105,31 @@ begin
   while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
 end;
 
-function SystemPromptPrefixLen(const SystemIds,
+function MessageBoundaryPrefixLen(const BoundaryIds,
   PromptIds: TNeuralIntegerArray): integer;
 begin
   Result := 0;
-  if (Length(SystemIds) > 0) and (Length(SystemIds) < Length(PromptIds)) and
-    (CommonPrefixLen(SystemIds, PromptIds) = Length(SystemIds)) then
-    Result := Length(SystemIds);
+  if (Length(BoundaryIds) > 0) and (Length(BoundaryIds) < Length(PromptIds)) and
+    (CommonPrefixLen(BoundaryIds, PromptIds) = Length(BoundaryIds)) then
+    Result := Length(BoundaryIds);
 end;
 
-function SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
-  WindowCount, TailLen, TailCount: integer): integer;
+function MessageBoundaryCapturePosition(BoundaryTokens, Reused, PrefillEnd,
+  WindowLen, WindowCount, TailLen, TailCount: integer): integer;
 var
   WindowsEnd, TailEnd: integer;
 begin
   Result := -1;
-  if (SystemTokens <= Reused) or (SystemTokens > PrefillEnd) then exit;
+  if (BoundaryTokens <= Reused) or (BoundaryTokens > PrefillEnd) then exit;
   // The prefill feeds width-N windows, then width-T tail windows, then
   // single steps, each phase starting where the previous one stopped.
   WindowsEnd := Reused + WindowCount * WindowLen;
   TailEnd := WindowsEnd + TailCount * TailLen;
-  if SystemTokens >= TailEnd then Result := SystemTokens
-  else if SystemTokens >= WindowsEnd then
-    Result := WindowsEnd + ((SystemTokens - WindowsEnd) div TailLen) * TailLen
+  if BoundaryTokens >= TailEnd then Result := BoundaryTokens
+  else if BoundaryTokens >= WindowsEnd then
+    Result := WindowsEnd + ((BoundaryTokens - WindowsEnd) div TailLen) * TailLen
   else
-    Result := Reused + ((SystemTokens - Reused) div WindowLen) * WindowLen;
+    Result := Reused + ((BoundaryTokens - Reused) div WindowLen) * WindowLen;
   if Result <= Reused then Result := -1;
 end;
 
@@ -1315,9 +1427,14 @@ begin
   StateReuseOK := false;
   SetLength(Checkpoints, 0);
   SetLength(CheckpointInfo, 0);
-  SetLength(CheckpointOrder, 0);
+  SetLength(CandidateOrder, 0);
   CheckpointOnTwins := false;
   CurrentTurn := 0;
+  SetLength(KVSlots, 0);
+  KVSlotSaves := 0;
+  LiveUserState := nil;
+  ClearLivePoints();
+  LastResumeRoute := crrNone;
   SeqLen := 0;
   VocabSize := 0;
   SetLength(MarkerIds, 0);
@@ -1350,6 +1467,7 @@ end;
 destructor TChatEngine.Destroy();
 begin
   FreeCheckpoints(); // OpenCL slots in NN's context: free before the nets
+  FreeKVSlots();
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(WindowSession);
@@ -1389,36 +1507,82 @@ begin
 end;
 
 procedure TChatEngine.MatchPromptAgainstCache(
-  const PromptIds: TNeuralIntegerArray; out LivePrefix, ResumeSlot: integer);
+  const PromptIds: TNeuralIntegerArray;
+  out LivePrefix, ResumeSlot, ResumeKVSlot: integer;
+  out ResumeKVPoint: TConversationSlotPoint);
+const
+  csPointCount = Ord(High(TConversationSlotPoint)) + 1;
 var
-  SlotPos, MaxSlotPos, CandidateCount, InsertPos, OrderPos: integer;
-  TokenPos, MaxFedPos, LivePrefixBound, CandidatePosition: integer;
+  SlotPos, MaxSlotPos, CandidateCount, OrderPos, Candidate: integer;
+  TokenPos, MaxFedPos, LivePrefixBound, KVPointCandidatesLeft: integer;
   Hash: UInt64;
   HasAttention, LiveMatching: boolean;
+  Point: TConversationSlotPoint;
+  // The resume point a negative CandidateOrder entry names.
+  function SlotPointOf(Candidate: integer): TCacheResumePoint;
+  begin
+    Result := KVSlots[(-1 - Candidate) div csPointCount].Points[
+      TConversationSlotPoint((-1 - Candidate) mod csPointCount)];
+  end;
+  function CandidatePositionOf(Candidate: integer): integer;
+  begin
+    if Candidate >= 0 then Result := Checkpoints[Candidate].Position
+    else Result := SlotPointOf(Candidate).Position;
+  end;
+  // Inserts Candidate into CandidateOrder[0..CandidateCount-1] by position; a
+  // position past MaxFedPos would already hold the last prompt id, which the
+  // first decode step feeds, so it cannot be resumed and is not visited.
+  procedure AddCandidate(Candidate: integer);
+  var
+    CandidatePosition, InsertPos: integer;
+  begin
+    CandidatePosition := CandidatePositionOf(Candidate);
+    if (CandidatePosition <= 0) or (CandidatePosition > MaxFedPos) then exit;
+    InsertPos := CandidateCount;
+    while (InsertPos > 0) and
+      (CandidatePositionOf(CandidateOrder[InsertPos - 1]) > CandidatePosition) do
+    begin
+      CandidateOrder[InsertPos] := CandidateOrder[InsertPos - 1];
+      Dec(InsertPos);
+    end;
+    CandidateOrder[InsertPos] := Candidate;
+    Inc(CandidateCount);
+    if Candidate < 0 then Inc(KVPointCandidatesLeft);
+  end;
+  function CandidateMatches(Candidate: integer): boolean;
+  var
+    ResumePoint: TCacheResumePoint;
+  begin
+    if Candidate >= 0 then
+      Result := ((not HasAttention) or (TokenPos <= LivePrefix)) and
+        (CheckpointInfo[Candidate].PrefixHash = Hash) and
+        TokenPrefixGuardMatches(CheckpointInfo[Candidate].Guard, PromptIds,
+          TokenPos)
+    else
+    begin
+      ResumePoint := SlotPointOf(Candidate);
+      Result := (ResumePoint.PrefixHash = Hash) and
+        TokenPrefixGuardMatches(ResumePoint.Guard, PromptIds, TokenPos);
+    end;
+  end;
 begin
   LivePrefix := 0;
   ResumeSlot := -1;
-  // A checkpoint past MaxFedPos would already hold the last prompt id, which
-  // the first decode step feeds; it cannot be resumed and is not visited.
+  ResumeKVSlot := -1;
+  ResumeKVPoint := cspReplyEnd;
   MaxFedPos := Length(PromptIds) - 1;
   CandidateCount := 0;
+  KVPointCandidatesLeft := 0;
   MaxSlotPos := High(Checkpoints);
+  for SlotPos := 0 to MaxSlotPos do AddCandidate(SlotPos);
+  MaxSlotPos := High(KVSlots);
   for SlotPos := 0 to MaxSlotPos do
-  begin
-    CandidatePosition := Checkpoints[SlotPos].Position;
-    if (CandidatePosition <= 0) or (CandidatePosition > MaxFedPos) then continue;
-    InsertPos := CandidateCount;
-    while (InsertPos > 0) and
-      (Checkpoints[CheckpointOrder[InsertPos - 1]].Position > CandidatePosition) do
-    begin
-      CheckpointOrder[InsertPos] := CheckpointOrder[InsertPos - 1];
-      Dec(InsertPos);
-    end;
-    CheckpointOrder[InsertPos] := SlotPos;
-    Inc(CandidateCount);
-  end;
+    if KVSlots[SlotPos].Points[cspReplyEnd].Position > 0 then
+      for Point := Low(TConversationSlotPoint) to High(TConversationSlotPoint) do
+        AddCandidate(-1 - (SlotPos * csPointCount + Ord(Point)));
   // A checkpoint holds no attention K/V: on a net with attention its rows
-  // must still be in the live cache, i.e. at or below LivePrefix.
+  // must still be in the live cache, i.e. at or below LivePrefix. A slot
+  // carries its own K/V, so its points have no such limit.
   HasAttention := Session.SDPACount > 0;
   LivePrefixBound := Min(Length(CachedTokens), Length(PromptIds));
   LiveMatching := LivePrefixBound > 0;
@@ -1429,38 +1593,44 @@ begin
   begin
     // Hash covers PromptIds[0..TokenPos-1]; candidates come in Position order.
     while (OrderPos < CandidateCount) and
-      (Checkpoints[CheckpointOrder[OrderPos]].Position = TokenPos) do
+      (CandidatePositionOf(CandidateOrder[OrderPos]) = TokenPos) do
     begin
-      SlotPos := CheckpointOrder[OrderPos];
-      if ((not HasAttention) or (TokenPos <= LivePrefix)) and
-        (CheckpointInfo[SlotPos].PrefixHash = Hash) and
-        TokenPrefixGuardMatches(CheckpointInfo[SlotPos].Guard, PromptIds,
-          TokenPos) then ResumeSlot := SlotPos;
+      Candidate := CandidateOrder[OrderPos];
+      if Candidate < 0 then Dec(KVPointCandidatesLeft);
+      if CandidateMatches(Candidate) then
+      begin
+        if Candidate >= 0 then ResumeSlot := Candidate
+        else
+        begin
+          ResumeKVSlot := (-1 - Candidate) div csPointCount;
+          ResumeKVPoint :=
+            TConversationSlotPoint((-1 - Candidate) mod csPointCount);
+        end;
+      end;
       Inc(OrderPos);
     end;
     if LiveMatching and (TokenPos >= LivePrefixBound) then
       LiveMatching := false;
-    // LivePrefix is final once LiveMatching is off; with attention no
-    // candidate past it can be resumed, and those at it were just checked.
-    if (not LiveMatching) and (HasAttention or (OrderPos >= CandidateCount))
-      then break;
+    // LivePrefix is final once LiveMatching is off; with attention only a
+    // slot point past it can still be resumed.
+    if (not LiveMatching) and ((OrderPos >= CandidateCount) or
+      (HasAttention and (KVPointCandidatesLeft = 0))) then break;
     if LiveMatching then
     begin
       if CachedTokens[TokenPos] = PromptIds[TokenPos] then Inc(LivePrefix)
-      else
-      begin
-        LiveMatching := false;
-        if HasAttention then break;
-      end;
+      else LiveMatching := false;
     end;
     if OrderPos < CandidateCount then
       Hash := FoldTokenIntoPrefixHash(Hash, PromptIds[TokenPos]);
     Inc(TokenPos);
   end;
-  // Only the resumed checkpoint is refreshed: a matching one that is never
-  // resumed ages out.
-  if ResumeSlot >= 0 then
-    CheckpointInfo[ResumeSlot].LastUsedTurn := CurrentTurn;
+end;
+
+// The single eviction order of the checkpoints and the conversation slots:
+// A goes before B when it was used in an earlier turn, or shallower on a tie.
+function IsLongerUnused(TurnA, TurnB, PositionA, PositionB: integer): boolean;
+begin
+  Result := (TurnA < TurnB) or ((TurnA = TurnB) and (PositionA < PositionB));
 end;
 
 function TChatEngine.DeleteTheLongestUnusedCheckpoint(): integer;
@@ -1472,13 +1642,9 @@ begin
   for SlotPos := 0 to MaxSlotPos do
   begin
     if Checkpoints[SlotPos].Position <= 0 then continue;
-    if (Result < 0) or
-      (CheckpointInfo[SlotPos].LastUsedTurn <
-       CheckpointInfo[Result].LastUsedTurn) or
-      ((CheckpointInfo[SlotPos].LastUsedTurn =
-        CheckpointInfo[Result].LastUsedTurn) and
-       (Checkpoints[SlotPos].Position < Checkpoints[Result].Position)) then
-      Result := SlotPos;
+    if (Result < 0) or IsLongerUnused(CheckpointInfo[SlotPos].LastUsedTurn,
+      CheckpointInfo[Result].LastUsedTurn, Checkpoints[SlotPos].Position,
+      Checkpoints[Result].Position) then Result := SlotPos;
   end;
   if Result < 0 then
     raise Exception.Create('TChatEngine.DeleteTheLongestUnusedCheckpoint:' +
@@ -1526,7 +1692,167 @@ begin
   for SlotPos := 0 to MaxSlotPos do Checkpoints[SlotPos].Free;
   SetLength(Checkpoints, 0);
   SetLength(CheckpointInfo, 0);
-  SetLength(CheckpointOrder, 0);
+  SetLength(CandidateOrder, 0);
+end;
+
+function TChatEngine.DeleteTheLongestUnusedKVSlot(ExcludeSlot: integer): integer;
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  Result := -1;
+  MaxSlotPos := High(KVSlots);
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    if (KVSlots[SlotPos].Points[cspReplyEnd].Position <= 0) or
+      (SlotPos = ExcludeSlot) then continue;
+    if (Result < 0) or IsLongerUnused(KVSlots[SlotPos].LastUsedTurn,
+      KVSlots[Result].LastUsedTurn,
+      KVSlots[SlotPos].Points[cspReplyEnd].Position,
+      KVSlots[Result].Points[cspReplyEnd].Position) then Result := SlotPos;
+  end;
+  if Result >= 0 then KVSlots[Result].Points[cspReplyEnd].Position := 0;
+end;
+
+procedure TChatEngine.SaveLiveConversation(ExcludeSlot: integer);
+var
+  SlotPos, MaxSlotPos, TargetSlot, LiveLen: integer;
+  Point: TConversationSlotPoint;
+  KeepLastUserState: boolean;
+begin
+  LiveLen := Length(CachedTokens);
+  if (Length(KVSlots) = 0) or (LiveLen <= 0) or
+    (LivePoints[cspReplyEnd].Position <> LiveLen) then exit;
+  {$IFDEF Debug}
+  Assert(ActiveSession = Session,
+    'TChatEngine: the cached conversation is not in Session');
+  {$ENDIF}
+  MaxSlotPos := High(KVSlots);
+  TargetSlot := -1;
+  for SlotPos := 0 to MaxSlotPos do
+    if (KVSlots[SlotPos].Points[cspReplyEnd].Position = LiveLen) and
+      (KVSlots[SlotPos].Points[cspReplyEnd].PrefixHash =
+       LivePoints[cspReplyEnd].PrefixHash) and
+      TokenPrefixGuardMatches(KVSlots[SlotPos].Points[cspReplyEnd].Guard,
+        CachedTokens, LiveLen) then
+    begin
+      KVSlots[SlotPos].LastUsedTurn := CurrentTurn;
+      exit;
+    end;
+  for SlotPos := 0 to MaxSlotPos do
+    if (TargetSlot < 0) and
+      (KVSlots[SlotPos].Points[cspReplyEnd].Position <= 0) then
+      TargetSlot := SlotPos;
+  if TargetSlot < 0 then TargetSlot := DeleteTheLongestUnusedKVSlot(ExcludeSlot);
+  if TargetSlot < 0 then exit;
+  // The recurrent state at the last-user point is copied, not moved: the
+  // next prompt may share it and keep resuming from the live copy.
+  KeepLastUserState := Assigned(LiveUserState) and
+    (LivePoints[cspLastUser].Position > 0) and
+    (LiveUserState.Position = LivePoints[cspLastUser].Position);
+  // The slot stays free until every copy returns; a failed save costs this
+  // conversation its slot, not the request.
+  KVSlots[TargetSlot].Points[cspReplyEnd].Position := 0;
+  try
+    if KVSlots[TargetSlot].State.CacheLength > LiveLen then
+      KVSlots[TargetSlot].State.Clear();
+    Session.SnapshotInto(KVSlots[TargetSlot].State);
+    if KeepLastUserState then
+      CopyStateCheckpoint(LiveUserState, KVSlots[TargetSlot].LastUserState);
+  except
+    on E: Exception do
+    begin
+      Notice('[conversation slot save failed: ' + E.Message + ']');
+      exit;
+    end;
+  end;
+  KVSlots[TargetSlot].Points := LivePoints;
+  if Assigned(LiveUserState) and not KeepLastUserState then
+    KVSlots[TargetSlot].Points[cspLastUser].Position := 0;
+  // The system point needs the recurrent state too; a net with recurrent
+  // layers resumes it from the cache checkpoints instead.
+  if Assigned(LiveUserState) then
+    KVSlots[TargetSlot].Points[cspSystem].Position := 0;
+  for Point := Low(TConversationSlotPoint) to High(TConversationSlotPoint) do
+    if KVSlots[TargetSlot].Points[Point].Position > LiveLen then
+      KVSlots[TargetSlot].Points[Point].Position := 0;
+  KVSlots[TargetSlot].LastUsedTurn := CurrentTurn;
+  Inc(KVSlotSaves);
+end;
+
+procedure TChatEngine.FreeKVSlots();
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  MaxSlotPos := High(KVSlots);
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    KVSlots[SlotPos].State.Free;
+    KVSlots[SlotPos].LastUserState.Free;
+  end;
+  SetLength(KVSlots, 0);
+  FreeAndNil(LiveUserState);
+  ClearLivePoints();
+end;
+
+procedure TChatEngine.KeepLivePointsUpTo(Limit: integer);
+var
+  Point: TConversationSlotPoint;
+begin
+  for Point := Low(TConversationSlotPoint) to High(TConversationSlotPoint) do
+    if LivePoints[Point].Position > Limit then
+      LivePoints[Point].Position := 0;
+  if Assigned(LiveUserState) and
+    ((LiveUserState.Position > Limit) or
+     (LiveUserState.Position <> LivePoints[cspLastUser].Position)) then
+  begin
+    LiveUserState.Position := 0;
+    LivePoints[cspLastUser].Position := 0;
+  end;
+end;
+
+procedure TChatEngine.CopyStateCheckpoint(Src,
+  Dst: TNNetDecoderStateCheckpoint);
+begin
+  {$IFDEF Debug}
+  Assert(not ReuseOK, 'TChatEngine: CopyStateCheckpoint on a live-route net');
+  {$ENDIF}
+  Session.RestoreStateFrom(Src);
+  Session.CaptureStateInto(Dst);
+  Dst.Position := Src.Position;
+end;
+
+procedure TChatEngine.ClearLivePoints();
+var
+  Point: TConversationSlotPoint;
+begin
+  for Point := Low(TConversationSlotPoint) to High(TConversationSlotPoint) do
+  begin
+    LivePoints[Point].Position := 0;
+    LivePoints[Point].PrefixHash := csTokenPrefixHashSeed;
+    FillChar(LivePoints[Point].Guard, SizeOf(LivePoints[Point].Guard), 0);
+  end;
+  if Assigned(LiveUserState) then LiveUserState.Position := 0;
+end;
+
+procedure TChatEngine.KVSlotBytes(out HostBytes, OpenCLBytes: int64);
+var
+  SlotPos, MaxSlotPos: integer;
+  procedure AddState(State: TNNetDecoderStateCheckpoint);
+  begin
+    if not Assigned(State) then exit;
+    Inc(OpenCLBytes, State.OpenCLBytes());
+    Inc(HostBytes, State.Bytes() - State.OpenCLBytes());
+  end;
+begin
+  HostBytes := 0;
+  OpenCLBytes := 0;
+  MaxSlotPos := High(KVSlots);
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    Inc(HostBytes, KVSlots[SlotPos].State.Bytes());
+    AddState(KVSlots[SlotPos].LastUserState);
+  end;
+  AddState(LiveUserState);
 end;
 
 procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
@@ -1689,6 +2015,13 @@ begin
   begin
     ErrorMsg := Format('--cache-checkpoints %d: must be 0 (off) or 2 to %d',
       [Opt.CacheCheckpoints, csMaxCacheCheckpoints]);
+    FreeAndNil(Tokenizer);
+    exit;
+  end;
+  if (Opt.KVSlots < 0) or (Opt.KVSlots > csMaxKVSlots) then
+  begin
+    ErrorMsg := Format('--kv-slots %d: must be 0 (off) to %d',
+      [Opt.KVSlots, csMaxKVSlots]);
     FreeAndNil(Tokenizer);
     exit;
   end;
@@ -2047,11 +2380,29 @@ begin
     for SlotPos := 0 to High(Checkpoints) do
       Checkpoints[SlotPos] := Session.NewStateCheckpoint();
     SetLength(CheckpointInfo, Opt.CacheCheckpoints);
-    SetLength(CheckpointOrder, Opt.CacheCheckpoints);
-    // A twin built in its own OpenCL context cannot read a slot owned by
-    // NN's context, so a capture at a window end is skipped on that fallback.
-    CheckpointOnTwins := (not OpenCLOn) or WindowBorrowsWeights;
   end;
+  // A twin built in its own OpenCL context cannot read a checkpoint owned by
+  // NN's context, so a capture at a window end is skipped on that fallback.
+  CheckpointOnTwins := (not OpenCLOn) or WindowBorrowsWeights;
+  FreeKVSlots();
+  if (ReuseOK or StateReuseOK) and (Opt.KVSlots > 0) and not Opt.NoCacheReuse
+    then
+  begin
+    SetLength(KVSlots, Opt.KVSlots);
+    for SlotPos := 0 to High(KVSlots) do
+    begin
+      KVSlots[SlotPos].State := TNNetDecoderSessionSnapshot.Create();
+      KVSlots[SlotPos].LastUserState := nil;
+      if StateReuseOK then
+        KVSlots[SlotPos].LastUserState := Session.NewStateCheckpoint();
+      KVSlots[SlotPos].Points[cspReplyEnd].Position := 0;
+      KVSlots[SlotPos].LastUsedTurn := 0;
+    end;
+    if StateReuseOK then LiveUserState := Session.NewStateCheckpoint();
+    ClearLivePoints();
+  end;
+  SetLength(CandidateOrder, Length(Checkpoints) +
+    Length(KVSlots) * (Ord(High(TConversationSlotPoint)) + 1));
   Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
     [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
   if RawMode then Line := Line + 'raw (completion)'
@@ -2084,7 +2435,8 @@ begin
       else Line := 'in host RAM';
       Notice(Format('[cache checkpoints ON - up to %d checkpoints of the' +
         ' recurrent state (%.1f MB each, %.1f MB in all, %s), captured at the' +
-        ' end of the system prompt, of the prompt and of the reply;' +
+        ' end of the system prompt, of the last user message, of the prompt' +
+        ' and of the reply;' +
         ' a full store frees the checkpoint unused for the most turns; a' +
         ' prompt resumes from the deepest checkpoint whose tokens it starts' +
         ' with (on a net with attention layers, only within the prefix shared' +
@@ -2099,6 +2451,33 @@ begin
   end
   else
     Notice('[cache reuse N/A for this architecture - full re-prefill each turn]');
+  if Length(KVSlots) > 0 then
+  begin
+    Line := '';
+    if Assigned(LiveUserState) then
+    begin
+      if LiveUserState.OpenCLSlotCount > 0 then Line := 'OpenCL memory'
+      else Line := 'host RAM';
+      Line := Format('; plus %d copies of the recurrent state at a last' +
+        ' user message (%.1f MB each) in %s', [Opt.KVSlots + 1,
+        LiveUserState.Bytes() / (1024 * 1024), Line]);
+    end;
+    Notice(Format('[conversation slots ON - up to %d other conversations' +
+      ' kept whole (KV cache and recurrent state in host RAM, each sized to' +
+      ' its conversation%s); a prompt that leaves the cached conversation' +
+      ' saves it to a slot, a prompt that starts with a saved one resumes' +
+      ' from it (at the end of its last user message or of its reply); a' +
+      ' full set frees the slot unused for the most turns]',
+      [Opt.KVSlots, Line]));
+  end
+  else if Opt.KVSlots > 0 then
+  begin
+    if Opt.NoCacheReuse then
+      Notice(Format('[--kv-slots %d ignored: --no-cache-reuse]',
+        [Opt.KVSlots]))
+    else Notice(Format('[--kv-slots %d ignored: cache reuse N/A for this' +
+      ' architecture]', [Opt.KVSlots]));
+  end;
   if CheckpointsGiven and not StateReuseOK then
     Notice(Format('[--cache-checkpoints %d ignored: no recurrent state in' +
       ' this net; the KV cache is truncated to the shared prefix instead]',
@@ -2156,15 +2535,39 @@ function TChatEngine.ChatReply(const Msgs: TChatMessages;
   const GenOpt: TChatOptions): string;
 var
   PromptIds: TNeuralIntegerArray;
-  SystemTokens: integer;
+  SystemTokens, LastUserTokens: integer;
 begin
   PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
     ChatTemplateOptions({AddGenerationPrompt=}true,
       {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
   SystemTokens := 0;
-  if StateReuseOK and (Length(Checkpoints) > 0) and not GenOpt.NoCacheReuse
-    then SystemTokens := CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
-  Result := GenerateFromIds(PromptIds, GenOpt, SystemTokens);
+  LastUserTokens := 0;
+  // The message boundaries only matter to the checkpoint and slot routes.
+  if ((StateReuseOK and (Length(Checkpoints) > 0)) or (Length(KVSlots) > 0))
+    and not GenOpt.NoCacheReuse then
+  begin
+    SystemTokens := CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
+    LastUserTokens := CountLastUserTokens(Msgs, PromptIds, GenOpt);
+  end;
+  Result := GenerateFromIds(PromptIds, GenOpt, SystemTokens, LastUserTokens);
+end;
+
+function TChatEngine.CountLastUserTokens(const Msgs: TChatMessages;
+  const PromptIds: TNeuralIntegerArray; const GenOpt: TChatOptions): integer;
+var
+  MessageIds: TNeuralIntegerArray;
+begin
+  Result := 0;
+  if RawMode or (Length(Msgs) = 0) or (Msgs[High(Msgs)].Role <> 'user') then
+    exit;
+  try
+    MessageIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
+      ChatTemplateOptions({AddGenerationPrompt=}false,
+        {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
+  except
+    on ENeuralChatError do exit;
+  end;
+  Result := MessageBoundaryPrefixLen(MessageIds, PromptIds);
 end;
 
 function TChatEngine.CountSystemPromptTokens(const Msgs: TChatMessages;
@@ -2183,7 +2586,7 @@ begin
     // cannot render it alone: there is no system boundary to capture at.
     on ENeuralChatError do exit;
   end;
-  Result := SystemPromptPrefixLen(SystemIds, PromptIds);
+  Result := MessageBoundaryPrefixLen(SystemIds, PromptIds);
 end;
 
 // ---------------------------------------------------------------------------
@@ -2211,9 +2614,11 @@ end;
 //     below the common prefix with CachedTokens): TruncateTo it, restore the
 //     recurrent state it holds, and prefill from there; with none, a full
 //     reset.
-// NoCacheReuse disables both: full reset, whole prompt re-prefilled.
+// Either way a conversation slot (--kv-slots) deeper than that route is
+// restored whole instead. NoCacheReuse disables all: full re-prefill.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
-  const GenOpt: TChatOptions; SystemPromptTokenCount: integer): string;
+  const GenOpt: TChatOptions; SystemPromptTokenCount,
+  LastUserTokenCount: integer): string;
 var
   Chain: TNNetLogitsProcessorChain;
   Penalty: TNNetTokenHistoryPenalty;
@@ -2222,11 +2627,17 @@ var
   StateReuse: boolean;         // the checkpoint route: resume AND capture
   ResumeChk: TNNetDecoderStateCheckpoint; // the checkpoint this call resumes
   ResumeSlot: integer;         // its slot, -1 when none
+  SlotReuse: boolean;          // the conversation-slot route: save AND resume
+  ResumeKVSlot: integer;       // the conversation slot this call resumes, -1
+  ResumeKVPoint: TConversationSlotPoint; // and the point it resumes at
+  SlotPointPosition: integer;
+  SlotTarget: TNNetStreamingDecoder; // the session a slot is restored into
+  SlotHostBytes, SlotOpenCLBytes: int64;
   CaptureHash: UInt64;         // TokenPrefixHash of Tokens[0..CaptureHashPos-1]
   CaptureHashPos: integer;
-  // The fed position of the system-prompt checkpoint: the last window end at
-  // or below the system boundary, or the boundary itself; -1 when none.
-  SystemCapturePos: integer;
+  // The fed positions of the system-prompt and last-user captures: the last
+  // window end at or below each boundary, or the boundary itself; -1 = none.
+  SystemCapturePos, UserCapturePos: integer;
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -2265,9 +2676,9 @@ var
     Result := (NowMark - PhaseMark) * MSecsPerDay;
     PhaseMark := NowMark;
   end;
-  // Captures ASession's state at FedPos, advancing CaptureHash to it; the
-  // captures of one call come at increasing positions.
-  procedure CaptureAt(ASession: TNNetStreamingDecoder; FedPos: integer);
+  // Folds Tokens into CaptureHash up to FedPos; the captures and points of
+  // one call come at increasing positions.
+  procedure AdvanceCaptureHash(FedPos: integer);
   begin
     {$IFDEF Debug}
     Assert(FedPos >= CaptureHashPos,
@@ -2279,7 +2690,52 @@ var
         Tokens[CaptureHashPos]);
       Inc(CaptureHashPos);
     end;
-    CaptureCheckpoint(ASession, Tokens, FedPos, CaptureHash);
+  end;
+  // Records FedPos as the cached conversation's resume point Point.
+  procedure RecordLivePoint(Point: TConversationSlotPoint; FedPos: integer);
+  begin
+    AdvanceCaptureHash(FedPos);
+    LivePoints[Point].Position := FedPos;
+    LivePoints[Point].PrefixHash := CaptureHash;
+    FillTokenPrefixGuard(Tokens, FedPos, LivePoints[Point].Guard);
+  end;
+  // Captures ASession's recurrent state at FedPos into the checkpoint store.
+  procedure CaptureAt(ASession: TNNetStreamingDecoder; FedPos: integer);
+  begin
+    AdvanceCaptureHash(FedPos);
+    if StateReuse then
+      CaptureCheckpoint(ASession, Tokens, FedPos, CaptureHash);
+  end;
+  // A message boundary: the checkpoint, and at the last-user end the live
+  // point with its recurrent state for a later slot save.
+  procedure CaptureBoundary(ASession: TNNetStreamingDecoder; FedPos: integer);
+  begin
+    CaptureAt(ASession, FedPos);
+    if (FedPos = UserCapturePos) and SlotReuse and Assigned(LiveUserState) then
+    begin
+      ASession.CaptureStateInto(LiveUserState);
+      LiveUserState.Position := FedPos;
+      RecordLivePoint(cspLastUser, FedPos);
+    end;
+  end;
+  // The resumed slot's points at or below Reused become the live ones; its
+  // last-user state is copied before the slot is restored (Session's own
+  // recurrent state is about to be replaced anyway).
+  procedure InheritSlotPoints();
+  var
+    Point: TConversationSlotPoint;
+  begin
+    LivePoints := KVSlots[ResumeKVSlot].Points;
+    for Point := Low(TConversationSlotPoint) to High(TConversationSlotPoint) do
+      if LivePoints[Point].Position > Reused then
+        LivePoints[Point].Position := 0;
+    if Assigned(LiveUserState) then
+    begin
+      LiveUserState.Position := 0;
+      if LivePoints[cspLastUser].Position > 0 then
+        CopyStateCheckpoint(KVSlots[ResumeKVSlot].LastUserState,
+          LiveUserState);
+    end;
   end;
   // Up to WindowCount whole windows of Tokens from Cnt on through WSession
   // (the active one), never padded. A window that would overflow the cache is
@@ -2307,8 +2763,8 @@ var
       WSession.StepForwardToHidden(WIn, Cnt);
       Inc(Cnt, WLen);
       Inc(Fed);
-      if (Cnt = SystemCapturePos) and CheckpointOnTwins then
-        CaptureAt(WSession, Cnt);
+      if ((Cnt = SystemCapturePos) or (Cnt = UserCapturePos)) and
+        CheckpointOnTwins then CaptureBoundary(WSession, Cnt);
     end;
   end;
 begin
@@ -2348,11 +2804,16 @@ begin
   // --cache-checkpoints 0); --no-cache-reuse disables both routes.
   StateReuse := StateReuseOK and not GenOpt.NoCacheReuse and
     (Length(Checkpoints) > 0);
+  SlotReuse := (Length(KVSlots) > 0) and not GenOpt.NoCacheReuse;
   ResumeChk := nil;
   ResumeSlot := -1;
+  ResumeKVSlot := -1;
+  LastResumeRoute := crrNone;
   CaptureHash := csTokenPrefixHashSeed;
   CaptureHashPos := 0;
   SystemCapturePos := -1;
+  UserCapturePos := -1;
+  ResumeKVPoint := cspReplyEnd;
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
   Chain := TNNetLogitsProcessorChain.Create();
@@ -2440,21 +2901,54 @@ begin
     // (StepForwardToHidden): the vocab projection runs only in the decode
     // steps.
     LastCachedTokens := Length(CachedTokens);
-    if StateReuse then
+    if StateReuse or SlotReuse then
     begin
-      // Checkpoint resume: a checkpoint holds the recurrent state at exactly
-      // its position, so the deepest resumable one whose ids the prompt
-      // starts with is resumed and the tokens from there on are prefilled.
-      // Checkpoints of other sequences stay in the store.
-      MatchPromptAgainstCache(PromptIds, LastPrefixTokens, ResumeSlot);
+      // One pass finds the live-cache prefix, the deepest resumable
+      // checkpoint (it holds the recurrent state at exactly its position)
+      // and the deepest conversation slot whose ids the prompt starts with.
+      // The deepest of the three routes is resumed and only the tail after
+      // it is prefilled; checkpoints and slots of other sequences stay held.
+      MatchPromptAgainstCache(PromptIds, LastPrefixTokens, ResumeSlot,
+        ResumeKVSlot, ResumeKVPoint);
+      Reused := 0;
+      if ResumeSlot >= 0 then
+      begin
+        Reused := Checkpoints[ResumeSlot].Position;
+        LastResumeRoute := crrCheckpoint;
+      end
+      else if CacheReuse then
+      begin
+        Reused := Min(LastPrefixTokens, Len - 1);
+        if Reused > 0 then LastResumeRoute := crrLive;
+      end;
+      SlotPointPosition := 0;
+      if ResumeKVSlot >= 0 then
+        SlotPointPosition :=
+          KVSlots[ResumeKVSlot].Points[ResumeKVPoint].Position;
+      if SlotPointPosition > Reused then
+      begin
+        ResumeSlot := -1;
+        Reused := SlotPointPosition;
+        LastResumeRoute := crrSlot;
+        KVSlots[ResumeKVSlot].LastUsedTurn := CurrentTurn;
+        CaptureHash := KVSlots[ResumeKVSlot].Points[ResumeKVPoint].PrefixHash;
+        CaptureHashPos := Reused;
+      end
+      else ResumeKVSlot := -1;
+      // Only the resumed checkpoint or slot is refreshed: a matching one that
+      // is never resumed ages out.
       if ResumeSlot >= 0 then
       begin
         ResumeChk := Checkpoints[ResumeSlot];
-        Reused := ResumeChk.Position;
+        CheckpointInfo[ResumeSlot].LastUsedTurn := CurrentTurn;
         CaptureHash := CheckpointInfo[ResumeSlot].PrefixHash;
         CaptureHashPos := Reused;
-      end
-      else Reused := 0;
+      end;
+      // The prompt leaves the cached conversation before its end, so the
+      // prefill below overwrites it: save it first (a growing conversation
+      // never gets here).
+      if SlotReuse and (LastPrefixTokens < Length(CachedTokens)) then
+        SaveLiveConversation(ResumeKVSlot);
     end
     else
     begin
@@ -2462,7 +2956,13 @@ begin
       Reused := LastPrefixTokens;
       if Reused > Len - 1 then Reused := Len - 1;
       if not CacheReuse then Reused := 0;
+      if Reused > 0 then LastResumeRoute := crrLive;
     end;
+    // From here Session stops holding CachedTokens until the call ends. The
+    // live points still on the ids this prompt shares with it stay; a slot
+    // resume takes the slot's points at or below its resume position.
+    if ResumeKVSlot >= 0 then InheritSlotPoints()
+    else KeepLivePointsUpTo(Min(Reused, LastPrefixTokens));
     PrefillTokens := LenM2 + 1 - Reused;
     LastReusedTokens := Reused;
     LastPrefillTokens := PrefillTokens;
@@ -2484,10 +2984,47 @@ begin
     else if TailCount > 0 then FirstSession := TailSession
     else FirstSession := Session;
     if StateReuse then
-      SystemCapturePos := SystemCapturePosition(SystemPromptTokenCount,
+      SystemCapturePos := MessageBoundaryCapturePosition(SystemPromptTokenCount,
         Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
+    if StateReuse or (SlotReuse and Assigned(LiveUserState)) then
+      UserCapturePos := MessageBoundaryCapturePosition(LastUserTokenCount,
+        Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
+    // Without recurrent layers a point needs no state: the slot truncates its
+    // K/V to it, so the boundaries are recorded exactly.
+    if SlotReuse and not Assigned(LiveUserState) then
+    begin
+      if (SystemPromptTokenCount > 0) and
+        (SystemPromptTokenCount >= CaptureHashPos) and
+        (SystemPromptTokenCount <= LenM2 + 1) then
+        RecordLivePoint(cspSystem, SystemPromptTokenCount);
+      if (LastUserTokenCount > 0) and (LastUserTokenCount >= CaptureHashPos) and
+        (LastUserTokenCount <= LenM2 + 1) then
+        RecordLivePoint(cspLastUser, LastUserTokenCount);
+    end;
     ActiveSession := FirstSession;
     if Reused = 0 then ActiveSession.Reset() // SSM state cannot be truncated
+    else if ResumeKVSlot >= 0 then
+    begin
+      // A slot is a host snapshot, so it restores straight into the session
+      // that steps first, unless that twin cannot take the recurrent state at
+      // the last-user point (its own OpenCL context).
+      SlotTarget := FirstSession;
+      if (ResumeKVPoint = cspLastUser) and
+        Assigned(KVSlots[ResumeKVSlot].LastUserState) and
+        not CheckpointOnTwins then SlotTarget := Session;
+      SlotTarget.RestoreSnapshot(KVSlots[ResumeKVSlot].State);
+      if ResumeKVPoint <> cspReplyEnd then
+      begin
+        SlotTarget.TruncateTo(Reused);
+        if (ResumeKVPoint = cspLastUser) and
+          Assigned(KVSlots[ResumeKVSlot].LastUserState) then
+          SlotTarget.RestoreStateFrom(KVSlots[ResumeKVSlot].LastUserState);
+      end;
+      SetLength(CachedTokens, Reused);
+      Move(PromptIds[0], CachedTokens[0], Reused * csIntegerSize);
+      ActiveSession := SlotTarget;
+      SwitchTo(FirstSession);
+    end
     else
     begin
       // The prefix lives in Session's cache (rows 0..Reused-1 of what
@@ -2510,13 +3047,15 @@ begin
       FeedWindows(TailSession, TailIn, TailCount, LastPrefillTailWindows);
     end;
     SwitchTo(Session);
-    if Cnt = SystemCapturePos then CaptureAt(Session, Cnt);
+    if (Cnt = SystemCapturePos) or (Cnt = UserCapturePos) then
+      CaptureBoundary(Session, Cnt);
     while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForwardToHidden(InV, Cnt);
       Inc(Cnt);
-      if Cnt = SystemCapturePos then CaptureAt(Session, Cnt);
+      if (Cnt = SystemCapturePos) or (Cnt = UserCapturePos) then
+        CaptureBoundary(Session, Cnt);
     end;
     TPrefillEnd := GetTickCount64();
     // End-of-prompt checkpoint for the next call's resume: Session now holds
@@ -2699,6 +3238,8 @@ begin
     // lists (positions 0..Len-2) - the two must agree or the prefix test
     // above would validate a boundary the session is not actually at.
     if StateReuse then CaptureAt(Session, Len - 1);
+    // The cached conversation's reply end, for SaveLiveConversation.
+    if Length(KVSlots) > 0 then RecordLivePoint(cspReplyEnd, Len - 1);
     // Lifetime usage totals, kept whether or not --stats prints them.
     // Input time is the prefill; output time runs from the end of prefill
     // to the end of decode (it includes the first decode step).
@@ -2719,7 +3260,8 @@ begin
     // the cache or a checkpoint; P is where the prompt's ids diverged from
     // the C cached ids, so a small K next to a large P names a divergence
     // the checkpoints did not cover. K can exceed P on a pure recurrent net,
-    // whose checkpoints resume past the ids it shares with the cache.
+    // whose checkpoints resume past the ids it shares with the cache, and
+    // after a conversation-slot resume.
     if GenOpt.Stats and (Produced > 0) then
     begin
       Write(StdErr, Format('[stats] input: prompt %d tokens (reused %d,' +
@@ -2729,6 +3271,16 @@ begin
       if (PrefillTokens > 0) and (PrefillMs > 0) then
         Write(StdErr, Format(', prefill %.1f tok/s',
           [PrefillTokens * 1000.0 / PrefillMs]));
+      WriteLn(StdErr);
+      Write(StdErr, '[stats] resumed from: ' +
+        ChatResumeRouteName(LastResumeRoute));
+      if Length(KVSlots) > 0 then
+      begin
+        KVSlotBytes(SlotHostBytes, SlotOpenCLBytes);
+        Write(StdErr, Format(' (conversation slots: %.1f MB in host RAM,' +
+          ' %.1f MB in OpenCL memory)', [SlotHostBytes / (1024 * 1024),
+          SlotOpenCLBytes / (1024 * 1024)]));
+      end;
       WriteLn(StdErr);
       Write(StdErr, Format('[stats] output: %d tokens in %.1f s',
         [Produced, (TEnd - TPrefillEnd) / 1000.0]));
@@ -2779,6 +3331,7 @@ begin
   end;
   except
     SetLength(CachedTokens, 0);
+    ClearLivePoints();
     Session.Reset();
     if Assigned(WindowSession) then WindowSession.Reset();
     if Assigned(TailSession) then TailSession.Reset();
