@@ -254,6 +254,11 @@ activation memory (K x every layer output).
 
 ## 7. Cache checkpoints: `--cache-checkpoints N` (design, 2026-09-03)
 
+The current behaviour (capture points, the single eviction rule, conversation
+slots) is described in `examples/ChatTerminal/README.md`, sections *cache
+checkpoints* and *conversation slots*; the dated notes below mark what
+changed.
+
 ### 7.1 The problem
 
 A hybrid (Qwen3.5/3.8, Mamba) resumes a prompt only from a whole-state

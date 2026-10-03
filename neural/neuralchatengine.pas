@@ -48,19 +48,19 @@ Coded by Claude (AI).
 //     zero engine-level cost.
 //
 // KV-cache reuse across calls: each call diffs its prompt against the
-// token ids still resident in the cache (CommonPrefixLen), truncates the
-// divergent tail and prefills only the new tokens - so consecutive
-// requests that share a prefix (a growing conversation) keep a roughly
-// flat time-to-first-token. A recurrent (SSM) state cannot be
-// position-truncated, so a hybrid/recurrent net resumes instead from the
+// token ids still resident in the cache, truncates the divergent tail and
+// prefills only the new tokens - so consecutive requests that share a
+// prefix (a growing conversation) keep a roughly flat time-to-first-token.
+// A recurrent (SSM) state cannot be position-truncated, so a
+// hybrid/recurrent net resumes instead from the
 // deepest cache checkpoint (the recurrent half of the state, captured at
 // the end of the system prompt, of the last user message, of the prompt and
 // of the reply) whose token prefix the prompt starts with (on a net with
 // attention layers, only within the prefix shared with the cached ids);
 // --cache-checkpoints N sizes that store, and a full store frees the
 // checkpoint unused for the most turns.
-// --kv-slots N keeps up to N other conversations whole (KV cache and
-// recurrent state, host RAM): a prompt that leaves the cached conversation
+// --kv-slots N keeps up to N other conversations whole (conversation slots:
+// KV cache and recurrent state): a prompt that leaves the cached conversation
 // saves it to a slot, and a prompt that starts with a saved conversation
 // resumes from it. NoCacheReuse turns every route off (full re-prefill).
 //
@@ -102,8 +102,8 @@ const
   // single steps, the twin costs its activations only, and a 16-wide window
   // is still a full launch of every kernel on the device.
   csDefaultPrefillTailWindow = 16;
-  // --cache-checkpoints N: the store's size when the flag is not given, its
-  // cap, and the retention band width W when no prefill twin sets it.
+  // --cache-checkpoints N: the store's size when the flag is not given, and
+  // its cap.
   csDefaultCacheCheckpointsOpenCL = 16;
   csDefaultCacheCheckpointsCPU = 8;
   csMaxCacheCheckpoints = 2048;
@@ -332,7 +332,7 @@ type
     // rewinds that half in place). Resuming at the checkpoint's position is
     // bit-identical to a full re-prefill. The store holds up to
     // Opt.CacheCheckpoints of them, sized once in LoadModel so that a capture
-    // allocates nothing; Position 0 marks a free slot. CaptureCheckpoint runs
+    // allocates nothing; Position 0 marks a free entry. CaptureCheckpoint runs
     // at the end of the system prompt and of the last user message (the last
     // prefill window end at or below each under a windowed prefill), of the
     // prompt and of the reply, so one turn adds at most four. Thinking
@@ -341,7 +341,7 @@ type
     // checkpoint belongs to the token sequence it was captured on
     // (CheckpointInfo), so checkpoints of other conversations stay held;
     // DeleteTheLongestUnusedCheckpoint frees one only when a capture finds
-    // the store full. Under OpenCL every slot lives in OpenCL memory (a
+    // the store full. Under OpenCL every entry lives in OpenCL memory (a
     // capture is a copy between resident buffers), else in host RAM:
     // Checkpoints[0].Bytes() / OpenCLBytes() say how much.
     StateReuseOK: boolean;       // checkpoint resume sound for this architecture?
@@ -354,18 +354,19 @@ type
     CheckpointOnTwins: boolean;  // the twins' captures are legal (they share
                                  // NN's OpenCL context, or OpenCL is off)
     CurrentTurn: integer;        // GenerateFromIds calls so far (the turn
-                                 // the checkpoint eviction order counts)
-    // Conversation slots (--kv-slots N): other conversations kept whole in
-    // host RAM, so a prompt can resume one after other conversations ran. A
-    // request whose prompt leaves the cached conversation saves it first
-    // (SaveLiveConversation) with its resume points; a prompt that starts
-    // with a point's ids resumes there when that is deeper than the live
-    // cache or a checkpoint. Same eviction rule as the checkpoints.
+                                 // the eviction order counts)
+    // Conversation slots (--kv-slots N): other conversations kept whole (the
+    // session snapshot in host RAM), so a prompt can resume one after other
+    // conversations ran. A request whose prompt leaves the cached
+    // conversation saves it first (SaveLiveConversation) with its resume
+    // points; a prompt that starts with a point's ids resumes there when that
+    // is deeper than the live cache or a checkpoint. Same eviction rule as
+    // the checkpoints.
     KVSlots: array of TConversationSlot; // empty when off
     KVSlotSaves: integer;        // conversations saved into a slot so far
     // The cached conversation's resume points (Position 0 = not held), kept
     // while KVSlots is not empty, and its recurrent state at the last-user
-    // point (nil without recurrent layers). SaveLiveConversation moves them
+    // point (nil without recurrent layers). SaveLiveConversation copies them
     // into a slot.
     LivePoints: TCacheResumePoints;
     LiveUserState: TNNetDecoderStateCheckpoint;
@@ -609,7 +610,9 @@ begin
   WriteLn('                        instead of the queue drain: a profiling mode.');
   WriteLn('  --stats               per-turn timing to stderr: input (prompt, TTFT,');
   WriteLn('                        prefill tok/s), output (tokens, time, decode tok/s),');
-  WriteLn('                        per-step split, and lifetime input/output totals');
+  WriteLn('                        per-step split, lifetime input/output totals, and');
+  WriteLn('                        "resumed from:" (live cache, checkpoint or');
+  WriteLn('                        conversation slot)');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
   WriteLn('                        turn, one report for the prefill and one for the');
   WriteLn('                        decode steps; ranks classes to optimize.');
@@ -631,13 +634,15 @@ begin
   WriteLn('                        before loading). Ignored on pure-attention nets,');
   WriteLn('                        whose KV cache is truncated to the prefix instead');
   WriteLn('  --kv-slots N          keep up to N other conversations whole: when a');
-  WriteLn('                        prompt leaves the cached conversation, that one is');
-  WriteLn('                        saved to a slot, and a prompt that starts with a');
-  WriteLn('                        saved one resumes from it (at the end of its last');
-  WriteLn('                        user message or of its reply) and prefills only');
-  WriteLn('                        the tail. A full set frees the slot unused for the');
-  WriteLn('                        most turns. A slot holds its conversation''s KV');
-  WriteLn('                        cache and recurrent state in host RAM; on');
+  WriteLn('                        prompt leaves the cached conversation, the engine');
+  WriteLn('                        saves that one to a slot, and a prompt that starts');
+  WriteLn('                        with a saved one resumes from it (at the end of its');
+  WriteLn('                        last user message or of its reply; on');
+  WriteLn('                        pure-attention nets also at the end of its system');
+  WriteLn('                        prompt) and prefills only the tail. A full set');
+  WriteLn('                        frees the slot unused for the most turns. A slot');
+  WriteLn('                        holds its conversation''s KV cache and recurrent');
+  WriteLn('                        state in host RAM; on');
   WriteLn('                        hybrid/recurrent nets each slot, plus the engine');
   WriteLn('                        once, also holds the recurrent state at a last');
   WriteLn('                        user message, in OpenCL memory under --gpu');
@@ -1676,7 +1681,7 @@ begin
   end;
   if FreeSlot < 0 then FreeSlot := DeleteTheLongestUnusedCheckpoint();
   // Position stays 0 until the copy returns, so a capture that raises leaves
-  // a free slot rather than a half-written checkpoint.
+  // a free entry rather than a half-written checkpoint.
   ASession.CaptureStateInto(Checkpoints[FreeSlot]);
   CheckpointInfo[FreeSlot].PrefixHash := PrefixHash;
   FillTokenPrefixGuard(Tokens, FedPos, CheckpointInfo[FreeSlot].Guard);
@@ -2464,9 +2469,10 @@ begin
     end;
     Notice(Format('[conversation slots ON - up to %d other conversations' +
       ' kept whole (KV cache and recurrent state in host RAM, each sized to' +
-      ' its conversation%s); a prompt that leaves the cached conversation' +
-      ' saves it to a slot, a prompt that starts with a saved one resumes' +
-      ' from it (at the end of its last user message or of its reply); a' +
+      ' its conversation%s); when a prompt leaves the cached conversation,' +
+      ' the engine saves it to a slot; a prompt that starts with a saved' +
+      ' one resumes from it (at the end of its last user message or of its' +
+      ' reply, and on pure-attention nets also of its system prompt); a' +
       ' full set frees the slot unused for the most turns]',
       [Opt.KVSlots, Line]));
   end

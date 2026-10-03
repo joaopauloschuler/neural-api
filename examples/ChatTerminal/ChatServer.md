@@ -67,11 +67,39 @@ end-of-turn marker, generation stops on the tokenizer's EOS id or at
 
 ## Concurrency and cache reuse
 
-Requests are handled strictly one at a time (one model, one KV-cache
-session; the non-threaded accept loop is the serialization). The KV-cache
-prefix reuse still applies across requests: a growing conversation re-sent
-in full each turn only prefills the new tail, so time-to-first-token stays
-roughly flat.
+Requests are handled strictly one at a time: one model, one live KV cache,
+and the non-threaded accept loop serializes them. The KV-cache prefix reuse
+applies across requests: a growing conversation re-sent in full each turn
+only prefills the new tail, so time-to-first-token stays roughly flat.
+
+The live KV cache holds one conversation. When two clients take turns, each
+request leaves the other client's conversation, so it shares only the ids up
+to where the two differ, often just the system prompt. Two mechanisms keep
+the other conversation (see the ChatTerminal [README](README.md), *cache
+checkpoints* and *conversation slots*):
+
+- **Cache checkpoints** (`--cache-checkpoints N`, on by default for
+  hybrid/recurrent nets) hold the recurrent state at message boundaries of
+  every recent conversation. On a net with attention layers a checkpoint is
+  resumable only within the ids the prompt shares with the live KV cache, so
+  across conversations it helps only up to the shared system prompt.
+- **Conversation slots** (`--kv-slots N`, **off by default**) save the
+  conversation a request leaves (its K/V rows and recurrent state) and
+  resume it when its client comes back. Each slot costs one KV cache at its
+  conversation's length (host RAM); on hybrid/recurrent nets also one
+  recurrent state (host RAM) and one recurrent state at the last user
+  message (OpenCL memory under `--gpu`), plus one more such copy held by the
+  engine (see *Memory* under *conversation slots* in the README).
+
+A server for a few alternating clients:
+
+```
+$ ChatServer /path/to/model --gpu --kv-slots 4 --stats --port 8080
+```
+
+`--stats` prints, per request, where the prompt resumed from (`live cache`,
+`checkpoint` or `conversation slot`) and the memory the slots hold. The
+slots have not been timed on a real model yet.
 
 ## Testing
 

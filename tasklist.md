@@ -274,12 +274,15 @@ rather than acted on.
         memory (FusedSDPA resident KV); fix to copy live rows only. Covers
         hybrid AND pure-attention nets (Llama/Qwen2.5 have no recurrent
         checkpoints, only KV).
-  - [ ] T5. Flags, stats, docs: --kv-slots in ParseArgs + help text; --stats
+  - [x] T5. Flags, stats, docs: --kv-slots in ParseArgs + help text; --stats
         reports which checkpoint/slot matched, reused tokens, and slot memory;
         update examples/ChatTerminal/ChatServer.md "Concurrency and cache
         reuse", the ChatTerminal README and the neuralchatengine.pas header
         ("The engine is single-session").
-  - [ ] T6. End-to-end tests on pico nets (pure attention, hybrid, pure
+  - [x] T6. (covered in T4b: TestChatKVSlotSwitch [+PrefillWindow, +OpenCL],
+        TestChatThinkingResume, TestChatKVSlotSingleSlot,
+        TestChatKVSlotSystemPointNoOverwrite, TestChatKVSlotRegenerateKeepsPoints)
+        End-to-end tests on pico nets (pure attention, hybrid, pure
         recurrent): requests A, B, A, B - the second A and B resume deep, and
         every reply equals the full re-prefill reply.
   - [ ] T7. User acceptance on the GPU box: TTFT of two alternating real
