@@ -621,6 +621,9 @@ type
       /// Bytes of the OpenCL buffers this instance holds now; retained
       /// (borrowed) codes and scales are left to their owner.
       function BufferBytes(): int64;
+      /// Writes every later result into a retained reference to Buffer (Bytes
+      /// long, at least the result size) in place of the private result buffer.
+      procedure AdoptResultBuffer(Buffer: cl_mem; Bytes: csize_t);
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
       /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
@@ -708,6 +711,10 @@ procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
 /// Size in bytes of an OpenCL buffer as the driver reports it (CL_MEM_SIZE);
 /// 0 for nil or when the query fails.
 function OpenCLMemBytes(Buffer: cl_mem): int64;
+
+/// Releases Buffer and makes it a retained reference to SharedBuffer, so the
+/// holder's own clReleaseMemObject later drops only that reference.
+procedure AdoptRetainedOpenCLBuffer(var Buffer: cl_mem; SharedBuffer: cl_mem);
 
 var
   // While true, TEasyOpenCL's Write/Read routines add every transfer to the
@@ -836,6 +843,25 @@ begin
   if clGetMemObjectInfo(Buffer, CL_MEM_SIZE, SizeOf(BufferSize), @BufferSize,
     {$IFDEF FPC}SizeWritten{$ELSE}@SizeWritten{$ENDIF}) = CL_SUCCESS then
     Result := BufferSize;
+end;
+
+procedure AdoptRetainedOpenCLBuffer(var Buffer: cl_mem; SharedBuffer: cl_mem);
+begin
+  if Buffer = SharedBuffer then exit;
+  clRetainMemObject(SharedBuffer);
+  if Assigned(Buffer) then clReleaseMemObject(Buffer);
+  Buffer := SharedBuffer;
+end;
+
+// The bound-argument caches compare handles, so they are dropped too.
+procedure TDotProductSharedKernel.AdoptResultBuffer(Buffer: cl_mem;
+  Bytes: csize_t);
+begin
+  AdoptRetainedOpenCLBuffer(FResultBuffer, Buffer);
+  FCapResult := Bytes;
+  FMainArgsBound := false;
+  FSinglePassArgsBound := false;
+  FSplitKArgsBound := false;
 end;
 
 function TDotProductSharedKernel.BufferBytes(): int64;

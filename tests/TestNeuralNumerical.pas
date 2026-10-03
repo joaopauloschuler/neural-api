@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  neuralabfun, neuraldecode
+  neuralabfun, neuraldecode, neuralthread
   {$IFDEF OpenCL}
   , cl, neuralopencl
   {$ENDIF}
@@ -604,6 +604,9 @@ type
     // the CPU and vs a bias-free twin; a bias buffer of Cout floats; host
     // FOutputRaw and FBiasOutput unsized until a CPU forward. Coded by Claude (AI).
     procedure TestConvRowBiasOpenCLParity;
+    // ShareOpenCLOutputsByLiveness: identical to unshared on a branching graph,
+    // serial, parallel and re-armed; fewer bytes; suffix forwards refused.
+    procedure TestOpenCLShareOutputsByLiveness;
     // TDotProductSharedKernel.Compute raises on a bias that is not one float
     // per row instead of running without it. Coded by Claude (AI).
     procedure TestDotProductWrongSizeBiasRaises;
@@ -70429,6 +70432,231 @@ begin
   end;
   finally
     SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestOpenCLShareOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  cHostReaderIdx = 11;
+  cPinnedLayerIdx = 15;
+var
+  NetCPU, NetOff, NetOn, NetQueues: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassPos, LayerPos, MaxLayerPos, DeadCount, ForwardCount: integer;
+  Parallel: boolean;
+  MaxAbs, Diff: TNeuralFloat;
+  BytesOff, BytesOn: int64;
+  SuffixRefused: boolean;
+
+  function BuildNet(): TNNet;
+  var
+    Block, Skip, Alias, Split, Branch, Projection, HostBranch: TNNetLayer;
+    Merged: TNNetLayer;
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(6, 5, 8));
+    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+    Skip := Result.AddLayer(TNNetSiLU.Create());
+    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+    Result.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
+    Result.AddLayer(TNNetReshape.Create(30, 1, 16));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+    Alias := Result.AddLayer(TNNetReshape.Create(6, 5, 16));
+    Split := Result.AddLayer(TNNetSplitChannels.Create(0, 8));
+    Branch := Result.AddLayerAfter(TNNetSiLU.Create(), Split);
+    Projection := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(8), Split);
+    // cHostReaderIdx has no OpenCL path: it downloads the split from its buffer.
+    Result.AddLayerAfter(TNNetIdentity.Create(), Split);
+    HostBranch := Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+    Block := Result.AddLayer(TNNetDeepConcat.Create([Branch, Projection]));
+    Merged := Result.AddLayer(TNNetSum.Create([Block, Skip, Alias, HostBranch]));
+    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+    Result.AddLayer(TNNetSiLU.Create());
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), Merged]));
+    Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
+    Result.SetTrainable(false, {pLowMemory=}false);
+    for LayerCnt := 0 to Result.GetLastLayerIdx() do
+    begin
+      for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+      end;
+      Result.Layers[LayerCnt].FlushWeightCache();
+    end;
+  end;
+
+  function MaxDiffOf(A, B: TNNetVolume): TNeuralFloat;
+  var
+    ElementPos: integer;
+  begin
+    Result := 0;
+    for ElementPos := 0 to A.Size - 1 do
+      Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+  end;
+
+  // Every layer either reads back NetOff's exact output or reports it gone.
+  function CheckHostReads(const pWhen: string): integer;
+  var
+    ReadPos: integer;
+  begin
+    Result := 0;
+    for ReadPos := 0 to NetOn.GetLastLayerIdx() do
+    begin
+      NetOff.Layers[ReadPos].ForceOutputOnRAM();
+      if not NetOn.Layers[ReadPos].ForceOutputOnRAM() then
+      begin
+        Inc(Result);
+        continue;
+      end;
+      AssertEquals(pWhen + ': layer ' + IntToStr(ReadPos) + ' host read', 0,
+        MaxDiffOf(NetOn.Layers[ReadPos].Output, NetOff.Layers[ReadPos].Output),
+        0);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetCPU := BuildNet();
+  NetOff := BuildNet();
+  NetOn := BuildNet();
+  NetQueues := BuildNet();
+  Input := TNNetVolume.Create(6, 5, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    for LayerPos := 0 to Input.Size - 1 do
+      Input.Raw[LayerPos] := 0.7 * Sin(LayerPos * 0.037) + 0.05;
+    NetCPU.Compute(Input);
+    NetCPU.GetOutput(OutCPU);
+    MaxAbs := OutCPU.GetMaxAbs();
+    NetOff.EnableOpenCL(PlatformId, DeviceId);
+    NetOff.ForceOpenCL(true);
+    NetOff.Layers[cHostReaderIdx].ForceOpenCL(false);
+    NetOn.ShareOpenCLOutputsByLiveness := true;
+    NetOn.Layers[cPinnedLayerIdx].OpenCLOutputPinned := true;
+    NetOn.EnableOpenCL(PlatformId, DeviceId);
+    NetOn.ForceOpenCL(true);
+    NetOn.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertTrue('layers write into shared buffers',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    AssertTrue('the shared buffers are smaller than the outputs they hold',
+      NetOn.OpenCLSharedOutputBytes() < NetOn.OpenCLSharedOutputPrivateBytes());
+    MaxLayerPos := NetOn.GetLastLayerIdx();
+    ForwardCount := 0;
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      Inc(ForwardCount);
+      Diff := MaxDiffOf(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output);
+      AssertEquals('shared vs private, pass ' + IntToStr(PassPos), 0, Diff, 0);
+      Diff := MaxDiffOf(NetOn.GetLastLayer().Output, OutCPU);
+      AssertTrue('shared vs CPU, pass ' + IntToStr(PassPos) + ': ' +
+        FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
+      DeadCount := CheckHostReads('pass ' + IntToStr(PassPos));
+      AssertTrue('overwritten outputs report themselves gone', DeadCount > 0);
+      AssertTrue('the pinned layer keeps its output',
+        NetOn.Layers[cPinnedLayerIdx].ForceOutputOnRAM());
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', NetOn.SchedulerStatsReport()));
+    AssertEquals('the host reader ran on the CPU', 0,
+      NetOn.Layers[cHostReaderIdx].ForwardGPUCnt);
+    for LayerPos := 1 to MaxLayerPos do
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' OpenCL forwards',
+        NetOff.Layers[LayerPos].ForwardGPUCnt,
+        NetOn.Layers[LayerPos].ForwardGPUCnt);
+    AssertEquals('every layer after the input ran on OpenCL', ForwardCount,
+      NetOn.Layers[MaxLayerPos].ForwardGPUCnt);
+    BytesOff := NetOff.OpenCLBufferBytes();
+    BytesOn := NetOn.OpenCLBufferBytes();
+    WriteLn('  ShareOutputsByLiveness: ', NetOn.OpenCLSharedOutputLayerCount(),
+      ' layers share ', NetOn.OpenCLSharedOutputBytes(), ' B (private: ',
+      NetOn.OpenCLSharedOutputPrivateBytes(), ' B); net OpenCL bytes ',
+      BytesOff, ' -> ', BytesOn);
+    AssertEquals('OpenCL bytes saved', NetOn.OpenCLSharedOutputPrivateBytes() -
+      NetOn.OpenCLSharedOutputBytes(), BytesOff - BytesOn);
+    // A suffix forward would re-run readers of overwritten outputs.
+    SuffixRefused := false;
+    try
+      NetOn.Compute(NetOn.Layers[1].Output, 1);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('Compute from layer 1 is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeSerial(cHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeSerial from a middle layer is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeParallel(cHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeParallel from a middle layer is refused', SuffixRefused);
+    // Re-arming plans again in the new context.
+    NetOn.DisableOpenCL();
+    AssertEquals('no OpenCL bytes after DisableOpenCL', 0,
+      NetOn.OpenCLBufferBytes());
+    AssertEquals('no shared layers after DisableOpenCL', 0,
+      NetOn.OpenCLSharedOutputLayerCount());
+    NetOn.EnableOpenCL(PlatformId, DeviceId);
+    NetOn.ForceOpenCL(true);
+    NetOn.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertTrue('re-armed: layers share again',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    for PassPos := 0 to 1 do
+    begin
+      Parallel := PassPos = 1;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      AssertEquals('re-armed shared vs private', 0,
+        MaxDiffOf(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output), 0);
+      CheckHostReads('re-armed pass ' + IntToStr(PassPos));
+    end;
+    // Per-layer queues order nothing between layers: sharing stays off.
+    NetQueues.ShareOpenCLOutputsByLiveness := true;
+    NetQueues.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel=}false);
+    NetQueues.ForceOpenCL(true);
+    NetQueues.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertEquals('per-layer queues: no shared layers', 0,
+      NetQueues.OpenCLSharedOutputLayerCount());
+    AssertEquals('per-layer queues: no shared bytes', 0,
+      NetQueues.OpenCLSharedOutputBytes());
+    NetQueues.Compute(Input);
+    Diff := MaxDiffOf(NetQueues.GetLastLayer().Output, OutCPU);
+    AssertTrue('per-layer queues vs CPU: ' + FloatToStr(Diff),
+      Diff < 1e-4 * (MaxAbs + 1));
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NetQueues.Free;
+    NetOn.Free;
+    NetOff.Free;
+    NetCPU.Free;
   end;
 end;
 {$ELSE}

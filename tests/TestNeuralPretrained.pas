@@ -789,6 +789,9 @@ type
     procedure TestQwenImage21VaeDecoderTiledParity;
     procedure TestQwenImage21VaeDecoderPhaseProfile;
     procedure TestQwenImage21VaeDecoderOpenCL;
+    // ShareOpenCLOutputs on vs off: same images, transfers and implicit GEMMs
+    // (whole and tiled, serial and parallel); fewer OpenCL bytes. Coded by Claude (AI).
+    procedure TestQwenImage21VaeDecoderOpenCLSharedOutputs;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwenImage21PipelineParity;
     procedure TestQwenImage21Pipeline64Parity;
@@ -29336,6 +29339,9 @@ begin
     Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
       FixturePath('tiny_qwenimage21/vae/config.json')));
     Decoder.Parallel := false;
+    // The residency checks below read the flags after the forward, and output
+    // sharing clears them on the layers whose buffer a later layer reused.
+    Decoder.ShareOpenCLOutputs := false;
     RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
     RefRoot := GetJSON(RefJson.Text);
     LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
@@ -29460,6 +29466,118 @@ begin
     Image.Free;
     WholeCPU.Free;
     TiledCPU.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCLSharedOutputs;
+{$IFDEF OpenCL}
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, WholeOff, WholeOn, TiledOff, TiledOn: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ParallelPos: integer;
+  BytesOff, BytesOn, SharedBytes, PrivateBytes: int64;
+  SharedLayerCount: integer;
+  CountsOff, CountsOn: array[0..2] of int64;
+
+  // One profiled decode of the current net: uploads, downloads and implicit
+  // GEMM launches since the net was built.
+  procedure CountProfiledDecode(out Counts: array of int64; Image: TNNetVolume);
+  var
+    LayerPos: integer;
+    Layer: TNNetLayer;
+  begin
+    Decoder.Net.LayerProfiling := true;
+    Decoder.Net.ClearTime();
+    Decoder.Decode(Latent, Image);
+    Counts[0] := 0;
+    Counts[1] := 0;
+    Counts[2] := 0;
+    for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      Counts[0] := Counts[0] + Layer.ProfiledTransfers.UploadCount;
+      Counts[1] := Counts[1] + Layer.ProfiledTransfers.DownloadCount;
+      Counts[2] := Counts[2] + Layer.OpenCLImplicitConvLaunchCount();
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  WholeOff := TNNetVolume.Create;
+  WholeOn := TNNetVolume.Create;
+  TiledOff := TNNetVolume.Create;
+  TiledOn := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    AssertTrue('EnableOpenCL', Decoder.EnableOpenCL(PlatformId, DeviceId));
+    for ParallelPos := 0 to 1 do
+    begin
+      Decoder.Parallel := ParallelPos = 1;
+      Decoder.ShareOpenCLOutputs := false;
+      Decoder.ReleaseNet();
+      Decoder.Decode(Latent, WholeOff);
+      BytesOff := Decoder.Net.OpenCLBufferBytes();
+      AssertEquals('off: no shared layers', 0,
+        Decoder.Net.OpenCLSharedOutputLayerCount());
+      CountProfiledDecode(CountsOff, WholeOff);
+      Decoder.DecodeTiled(Latent, TiledOff, 32, 16);
+      Decoder.ShareOpenCLOutputs := true;
+      Decoder.ReleaseNet();
+      Decoder.Decode(Latent, WholeOn);
+      BytesOn := Decoder.Net.OpenCLBufferBytes();
+      SharedLayerCount := Decoder.Net.OpenCLSharedOutputLayerCount();
+      SharedBytes := Decoder.Net.OpenCLSharedOutputBytes();
+      PrivateBytes := Decoder.Net.OpenCLSharedOutputPrivateBytes();
+      CountProfiledDecode(CountsOn, WholeOn);
+      Decoder.DecodeTiled(Latent, TiledOn, 32, 16);
+      WriteLn('  Qwen-Image-2.1 VAE 4x4 net, parallel=', Decoder.Parallel,
+        ': OpenCL bytes ', BytesOff, ' -> ', BytesOn, '; ', SharedLayerCount,
+        ' of ', Decoder.Net.CountLayers(), ' layers share ', SharedBytes,
+        ' B in place of ', PrivateBytes, ' B; per decode up ', CountsOn[0],
+        ', down ', CountsOn[1], ', implicit GEMMs since build ', CountsOn[2]);
+      AssertTrue('layers share', SharedLayerCount > 0);
+      AssertTrue('fewer OpenCL bytes', BytesOn < BytesOff);
+      AssertEquals('bytes saved', PrivateBytes - SharedBytes,
+        BytesOff - BytesOn);
+      AssertEquals('uploads per decode', CountsOff[0], CountsOn[0]);
+      AssertEquals('downloads per decode', CountsOff[1], CountsOn[1]);
+      AssertEquals('implicit GEMM launches', CountsOff[2], CountsOn[2]);
+      AssertTrue('implicit GEMMs ran', CountsOn[2] > 0);
+      AssertEquals('whole image byte-identical', 0,
+        MaxAbsVolumeDiff(WholeOn, WholeOff), 0);
+      AssertEquals('tiled image byte-identical', 0,
+        MaxAbsVolumeDiff(TiledOn, TiledOff), 0);
+    end;
+  finally
+    TiledOn.Free;
+    TiledOff.Free;
+    WholeOn.Free;
+    WholeOff.Free;
     Latent.Free;
     Decoder.Free;
     RefRoot.Free;

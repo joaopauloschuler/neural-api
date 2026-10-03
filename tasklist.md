@@ -2417,9 +2417,21 @@ rather than acted on.
                 Computed at a real 256 tile: -0.65 GB OpenCL, -1.3 GB host per
                 net. Deferred: `TNNetGroupedConvolutionLinear` keeps its
                 per-position buffers; host buffers built once stay allocated.
-          - [ ] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;
+          - [x] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;
                 reuse only when every consumer of the producer is an ancestor;
                 single in-order queue; last layer pinned).
+                DONE: `TNNet.ShareOpenCLOutputsByLiveness`, planned when armed;
+                on for the VAE nets (`NEURAL_OPENCL_SHARE_OUTPUTS=0` turns it
+                off). Adopters: conv, identity/SiLU, Sum, DeepConcat, Split/
+                Gather, TokenRMSNorm, DeMaxPool, PixelShuffle. Forwards from
+                FromLayerIdx > 0 raise on a sharing net. Pico VAE 4x4 latent
+                3.78 -> 1.07 MB OpenCL, images byte-identical. Computed: 256
+                tile ~3.5 -> ~1.4 GB per net, 512 ~11 -> ~2.7, untiled 1024
+                ~41 -> ~7.7 GB (the ancestor rule keeps the DupUp shortcut in
+                its own slot; a serial-only index-order rule or extra scheduler
+                edges would give ~4.9 GB untiled; not done, user decision).
+                Not adopted yet: RMSNorm, LayerNorm, TokenLayerNorm, RoPE,
+                fused SDPA, GLU.
           - [ ] B2f4. Host `FOutput` sharing by liveness (exact-size aliases,
                 opt-in).
           - [ ] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on

@@ -8905,6 +8905,8 @@ type
     BuildMs, ThreadsMs, ArmingMs, ArmingWeightPrepMs: double;
     ForwardMs, DownloadMs: double;
     OpenCLBytes, HostBytes: int64;
+    // TNNet.OpenCLSharedOutputBytes and OpenCLSharedOutputPrivateBytes.
+    OpenCLSharedBytes, OpenCLPrivateBytes: int64;
   end;
 
   // Qwen-Image-2.1 VAE decoder (diffusers AutoencoderKLQwenImage21.decode for
@@ -8940,6 +8942,7 @@ type
     // program; PrepareNet arms every sized net in it.
     FOpenCLContextNet: TNNet;
     FOpenCLHasSharedKernel: boolean;
+    FShareOpenCLOutputs: boolean;
     {$ENDIF}
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
     function NetProfile(): string;
@@ -8985,6 +8988,10 @@ type
     function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true): boolean;
     function OpenCLEnabled(): boolean;
+    // TNNet.ShareOpenCLOutputsByLiveness on every sized net (read when Net is
+    // armed); true unless NEURAL_OPENCL_SHARE_OUTPUTS=0.
+    property ShareOpenCLOutputs: boolean read FShareOpenCLOutputs
+      write FShareOpenCLOutputs;
     {$ENDIF}
     // TNNet.LayerProfiling on every sized net (read when Net is (re)built);
     // ProfileReport has the phase table and one per-class table per net.
@@ -68749,6 +68756,10 @@ begin
   inherited Create();
   FParallel := true;
   FMaxThreads := 0;
+  {$IFDEF OpenCL}
+  FShareOpenCLOutputs :=
+    GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
+  {$ENDIF}
   Folder := IncludeTrailingPathDelimiter(VaeFolder);
   FConfig := ReadQwenImage21VaeConfig(Folder + 'config.json');
   Reader := TNNetSafeTensorsReader.Create(Folder +
@@ -68766,6 +68777,10 @@ begin
   inherited Create();
   FParallel := true;
   FMaxThreads := 0;
+  {$IFDEF OpenCL}
+  FShareOpenCLOutputs :=
+    GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
+  {$ENDIF}
   FConfig := Config;
   LoadFromReader(Reader);
 end;
@@ -68820,6 +68835,7 @@ begin
   if Assigned(FOpenCLContextNet) then
   begin
     PhaseStart := Now();
+    FNet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
     FNetPhases.ArmingMs := (Now() - PhaseStart) * MSecsPerDay;
     FNetPhases.ArmingWeightPrepMs :=
@@ -68865,6 +68881,10 @@ begin
   Result.PassCount := FNetPassCount;
   Result.OpenCLBytes := FNet.OpenCLBufferBytes();
   Result.HostBytes := FNet.NonWeightBytes();
+  {$IFDEF OpenCL}
+  Result.OpenCLSharedBytes := FNet.OpenCLSharedOutputBytes();
+  Result.OpenCLPrivateBytes := FNet.OpenCLSharedOutputPrivateBytes();
+  {$ENDIF}
 end;
 
 function TQwenImage21VaeDecoder.PhaseReport(): string;
@@ -68878,12 +68898,13 @@ var
   procedure AddRow(const Row: TQwenImage21VaeNetPhases);
   begin
     Lines.Add(Format('%-8s %-10s %6d %9.1f %8.1f %9.1f %12.1f %10.1f %9.1f ' +
-      '%10.1f %9.1f', [IntToStr(Row.LatentW) + 'x' + IntToStr(Row.LatentH),
-      IntToStr(Row.LatentW * FConfig.SpatialScale) + 'x' +
-      IntToStr(Row.LatentH * FConfig.SpatialScale), Row.PassCount,
+      '%10.1f %9.1f %10.1f %10.1f', [IntToStr(Row.LatentW) + 'x' +
+      IntToStr(Row.LatentH), IntToStr(Row.LatentW * FConfig.SpatialScale) +
+      'x' + IntToStr(Row.LatentH * FConfig.SpatialScale), Row.PassCount,
       Row.BuildMs, Row.ThreadsMs, Row.ArmingMs, Row.ArmingWeightPrepMs,
       Row.ForwardMs, Row.DownloadMs, Row.OpenCLBytes / (1024 * 1024),
-      Row.HostBytes / (1024 * 1024)]));
+      Row.HostBytes / (1024 * 1024), Row.OpenCLSharedBytes / (1024 * 1024),
+      Row.OpenCLPrivateBytes / (1024 * 1024)]));
   end;
 
 begin
@@ -68897,10 +68918,13 @@ begin
       '= TNNet.OpenCLBufferBytes: FDotCL of every layer plus the own buffers ' +
       'of the input, activation, sum, concat, split/gather, norm and ' +
       'upsample layers (other helpers not counted); host MB = ' +
-      'TNNet.NonWeightBytes. Both sampled after the last pass.');
-    Lines.Add(Format('%-8s %-10s %6s %9s %8s %9s %12s %10s %9s %10s %9s',
-      ['Latent', 'Pixels', 'Passes', 'build', 'threads', 'arming',
-      'weight prep', 'forwards', 'download', 'OpenCL MB', 'host MB']));
+      'TNNet.NonWeightBytes. Both sampled after the last pass. shared MB = ' +
+      'the OpenCL output buffers shared by liveness (part of OpenCL MB); ' +
+      'private MB = what the sharing layers'' outputs take in private buffers.');
+    Lines.Add(Format('%-8s %-10s %6s %9s %8s %9s %12s %10s %9s %10s %9s ' +
+      '%10s %10s', ['Latent', 'Pixels', 'Passes', 'build', 'threads',
+      'arming', 'weight prep', 'forwards', 'download', 'OpenCL MB', 'host MB',
+      'shared MB', 'private MB']));
     for RowPos := 0 to MaxRowPos do AddRow(FReleasedNetPhases[RowPos]);
     if Assigned(FNet) then AddRow(CurrentNetPhases());
     Lines.Add('(build = BuildQwenImage21VaeDecoderNet with the weight links; ' +
@@ -69060,6 +69084,7 @@ begin
   begin
     WeightPrepBefore := FNet.OpenCLArmingWeightPrepTime;
     ArmingStart := Now();
+    FNet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, pHasSharedKernel);
     ArmingMs := (Now() - ArmingStart) * MSecsPerDay;
     WeightPrepMs := (FNet.OpenCLArmingWeightPrepTime - WeightPrepBefore) *
