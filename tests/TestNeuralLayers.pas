@@ -27,6 +27,9 @@ type
     // order) size no host column matrix at SetPrevLayer; the serial and the
     // parallel chunk forwards still match a trainable twin. Coded by Claude (AI).
     procedure TestConvolutionInferenceOnlyBuildParity;
+    // An inference-only low-memory conv whose weights were set without
+    // FlushWeightCache: the first host forward reads the neurons' biases.
+    procedure TestConvolutionBiasWithoutWeightFlush;
     procedure TestConvolutionDecodeNeuronChunkParity;
     procedure TestConvolutionFastMemoryNeuronChunk;
     procedure TestConvolutionSpatialNeuronChunk;
@@ -923,6 +926,53 @@ begin
     AssertMatches('parallel chunk path');
   finally
     Reference.Free;
+    Input.Free;
+    NN.Free;
+    RefNN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionBiasWithoutWeightFlush;
+var
+  RefNN, NN: TNNet;
+  RefConv, Conv: TNNetLayer;
+  Input: TNNetVolume;
+  i: integer;
+
+  function BuildNet(InferenceOnly: boolean; out Layer: TNNetLayer): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(7, 5, 4));
+    Layer := TNNetConvolutionLinear.Create(6, 3, 1, 1);
+    if InferenceOnly then Layer.SetTrainable(False, True);
+    Result.AddLayer(Layer);
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to Layer.Neurons[NeuronCnt].Weights.Size - 1 do
+        Layer.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.1 * Sin(NeuronCnt * 0.37 + WeightCnt * 0.11);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.5 + 0.1 * NeuronCnt;
+    end;
+    if not InferenceOnly then Layer.FlushWeightCache();
+  end;
+
+begin
+  RefNN := BuildNet(false, RefConv);
+  NN := BuildNet(true, Conv);
+  Input := TNNetVolume.Create(7, 5, 4);
+  try
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.07) - 0.2;
+    RefNN.Compute(Input);
+    NN.Compute(Input, 0, False);
+    AssertEquals('output size', RefConv.Output.Size, Conv.Output.Size);
+    for i := 0 to Conv.Output.Size - 1 do
+      AssertTrue('output at ' + IntToStr(i) + ': ' +
+        FloatToStr(Conv.Output.Raw[i]) + ' vs ' +
+        FloatToStr(RefConv.Output.Raw[i]),
+        Abs(Conv.Output.Raw[i] - RefConv.Output.Raw[i]) < 1e-5);
+  finally
     Input.Free;
     NN.Free;
     RefNN.Free;

@@ -599,6 +599,14 @@ type
     // stride, ragged reduction and small/large Cout, from a host and a
     // resident source; no B buffer and no host column matrix. Coded by Claude (AI).
     procedure TestConvImplicitGemmOpenCLParity;
+    // Fused bias on OpenCL reads one bias per neuron (Bias[row]): FP32
+    // implicit, explicit and pointwise, int8 and int4, tiled and untiled, vs
+    // the CPU and vs a bias-free twin; a bias buffer of Cout floats; host
+    // FOutputRaw and FBiasOutput unsized until a CPU forward. Coded by Claude (AI).
+    procedure TestConvRowBiasOpenCLParity;
+    // TDotProductSharedKernel.Compute raises on a bias that is not one float
+    // per row instead of running without it. Coded by Claude (AI).
+    procedure TestDotProductWrongSizeBiasRaises;
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
@@ -70172,6 +70180,251 @@ begin
       OutCPU.Free;
       Input.Free;
       NN.Free;
+    end;
+  end;
+  finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDotProductWrongSizeBiasRaises;
+{$IFDEF OpenCL}
+const
+  csRows = 6;
+  csColumns = 3;
+  csSize = 5;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Kernel: TNeuralKernel;
+  DotCL: TDotProductSharedKernel;
+  VAs, VBs, RowBias, PositionBias, Results: TNNetVolume;
+  Raised: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Kernel := TNeuralKernel.Create(PlatformId, DeviceId, 'cai_dot_product', true);
+  DotCL := TDotProductSharedKernel.Create(Kernel);
+  VAs := TNNetVolume.Create(csRows * csSize, 1, 1, 0.5);
+  VBs := TNNetVolume.Create(csColumns * csSize, 1, 1, 0.25);
+  RowBias := TNNetVolume.Create(csRows, 1, 1, 1.0);
+  PositionBias := TNNetVolume.Create(csRows * csColumns, 1, 1, 1.0);
+  Results := TNNetVolume.Create(csRows * csColumns, 1, 1);
+  try
+    DotCL.PrepareForCompute(VAs, VBs, csSize);
+    DotCL.Compute(VAs, VBs, {ActFN}0, true, true, RowBias);
+    DotCL.FinishAndLoadResult(Results, 0);
+    // 5 * 0.5 * 0.25 + 1.
+    AssertEquals('one bias per row', 1.625, Results.Raw[0], 1e-6);
+    Raised := false;
+    try
+      DotCL.Compute(VAs, VBs, {ActFN}0, true, true, PositionBias);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('a per-position bias raises', Raised);
+  finally
+    Results.Free;
+    PositionBias.Free;
+    RowBias.Free;
+    VBs.Free;
+    VAs.Free;
+    DotCL.Free;
+    Kernel.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvRowBiasOpenCLParity;
+{$IFDEF OpenCL}
+type
+  TRowBiasCase = record
+    SizeX, SizeY, InDepth, Features: integer;
+    Pointwise: boolean;
+    // 0: FP32, 8: int8 weights, 4: int4 weights.
+    QuantBits: integer;
+    // FP32 spatial only: the implicit GEMM, otherwise cai_im2col.
+    Implicit: boolean;
+    // Rows >= 64 and columns >= csTiledGemmMinColumns: a tiled launch.
+    ExpectTiled: boolean;
+  end;
+const
+  Cases: array[0..11] of TRowBiasCase = (
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; Pointwise: false; QuantBits: 0; Implicit: true; ExpectTiled: true),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; Pointwise: false; QuantBits: 0; Implicit: true; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; Pointwise: false; QuantBits: 0; Implicit: false; ExpectTiled: true),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; Pointwise: false; QuantBits: 0; Implicit: false; ExpectTiled: false),
+    (SizeX: 8; SizeY: 4; InDepth: 40; Features: 72; Pointwise: true; QuantBits: 0; Implicit: false; ExpectTiled: true),
+    (SizeX: 2; SizeY: 1; InDepth: 40; Features: 72; Pointwise: true; QuantBits: 0; Implicit: false; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 32; Features: 72; Pointwise: false; QuantBits: 8; Implicit: false; ExpectTiled: true),
+    (SizeX: 1; SizeY: 1; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 8; Implicit: false; ExpectTiled: false),
+    (SizeX: 2; SizeY: 1; InDepth: 64; Features: 40; Pointwise: true; QuantBits: 8; Implicit: false; ExpectTiled: false),
+    (SizeX: 8; SizeY: 4; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 4; Implicit: false; ExpectTiled: true),
+    (SizeX: 1; SizeY: 1; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 4; Implicit: false; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 32; Features: 72; Pointwise: false; QuantBits: 4; Implicit: false; ExpectTiled: true));
+var
+  NetCPU, NetCL, NetCLNoBias: TNNet;
+  Conv, ConvNoBias: TNNetConvolution;
+  Input, OutCPU, OutCL, OutCLNoBias: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, i, NeuronIdx, TiledBefore: integer;
+  HostBytesOnOpenCL, ColumnBytesGrown: int64;
+  ColumnsBefore: integer;
+  DiffCPU, DiffBias, MaxAbs, Tol: TNeuralFloat;
+  CaseName: string;
+  ImplicitConvWasEnabled: boolean;
+
+  function BuildNet(const pCase: TRowBiasCase; pSuppressBias: integer;
+    out pConv: TNNetConvolution): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(pCase.SizeX, pCase.SizeY,
+      pCase.InDepth, 1));
+    if pCase.Pointwise
+      then pConv := TNNetPointwiseConvLinear.Create(pCase.Features, pSuppressBias)
+      else pConv := TNNetConvolutionLinear.Create(pCase.Features, 3, 1, 1,
+        pSuppressBias);
+    pConv.SetTrainable(False, False);
+    Result.AddLayer(pConv);
+    for NeuronCnt := 0 to pConv.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to pConv.Neurons[NeuronCnt].Weights.Size - 1 do
+        pConv.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.08 * Sin(NeuronCnt * 0.7 + WeightCnt * 0.31);
+      pConv.Neurons[NeuronCnt].BiasWeight := 0.5 * Cos(NeuronCnt * 0.13) + 0.25;
+    end;
+    pConv.FlushWeightCache();
+    if pCase.QuantBits = 8 then Result.QuantizeWeightsInt8()
+    else if pCase.QuantBits = 4 then Result.QuantizeWeightsInt4();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  try
+  for CaseCnt := Low(Cases) to High(Cases) do
+  with Cases[CaseCnt] do
+  begin
+    CaseName := ' (case ' + IntToStr(CaseCnt) + ')';
+    NetCPU := BuildNet(Cases[CaseCnt], 0, Conv);
+    NetCL := BuildNet(Cases[CaseCnt], 0, Conv);
+    NetCLNoBias := BuildNet(Cases[CaseCnt], 1, ConvNoBias);
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutCPU := TNNetVolume.Create();
+    OutCL := TNNetVolume.Create();
+    OutCLNoBias := TNNetVolume.Create();
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.6 * Sin(i * 0.017) + 0.1;
+      NetCPU.Compute(Input);
+      NetCPU.GetOutput(OutCPU);
+
+      SetOpenCLImplicitConv(Implicit);
+      NetCL.EnableOpenCL(PlatformId, DeviceId);
+      NetCLNoBias.EnableOpenCLInContextOf(NetCL);
+      NetCL.ForceOpenCL(True);
+      NetCLNoBias.ForceOpenCL(True);
+      TiledBefore := Conv.OpenCLTiledGemmLaunchCount();
+      NetCL.Compute(Input);
+      NetCL.Compute(Input); // resident weights and bias
+      NetCL.GetOutput(OutCL);
+      NetCLNoBias.Compute(Input);
+      NetCLNoBias.Compute(Input);
+      NetCLNoBias.GetOutput(OutCLNoBias);
+      AssertEquals('both forwards ran on OpenCL' + CaseName, 2,
+        Conv.ForwardGPUCnt);
+      if not Pointwise and (QuantBits = 0) then
+        AssertEquals('implicit GEMM launches' + CaseName,
+          2 * Ord(Implicit), Conv.OpenCLImplicitConvLaunchCount());
+      if ExpectTiled
+        then AssertEquals('tiled launches' + CaseName, 2,
+          Conv.OpenCLTiledGemmLaunchCount() - TiledBefore)
+        else AssertEquals('untiled launches' + CaseName, 0,
+          Conv.OpenCLTiledGemmLaunchCount() - TiledBefore);
+      AssertEquals('the OpenCL bias buffer holds one float per neuron' +
+        CaseName, int64(Features) * SizeOf(TNeuralFloat),
+        Conv.OpenCLBufferBytes() - ConvNoBias.OpenCLBufferBytes());
+      AssertEquals('a fused OpenCL forward sizes no host FOutputRaw' + CaseName,
+        0, Conv.OutputRaw.Size);
+      // FNeuronBias (Features floats against 1) is the only host difference:
+      // the per-position FBiasOutput is still unbuilt.
+      HostBytesOnOpenCL := TNNetLayer(Conv).NonWeightBytes();
+      AssertEquals('host bias bytes on OpenCL' + CaseName,
+        int64(Features - 1) * SizeOf(TNeuralFloat),
+        HostBytesOnOpenCL - TNNetLayer(ConvNoBias).NonWeightBytes());
+
+      AssertEquals('output size match' + CaseName, OutCPU.Size, OutCL.Size);
+      DiffCPU := 0;
+      DiffBias := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        NeuronIdx := i mod Features;
+        if Abs(OutCPU.Raw[i] - OutCL.Raw[i]) > DiffCPU then
+          DiffCPU := Abs(OutCPU.Raw[i] - OutCL.Raw[i]);
+        if Abs(OutCL.Raw[i] - OutCLNoBias.Raw[i] -
+          Conv.Neurons[NeuronIdx].BiasWeight) > DiffBias then
+          DiffBias := Abs(OutCL.Raw[i] - OutCLNoBias.Raw[i] -
+            Conv.Neurons[NeuronIdx].BiasWeight);
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      WriteLn('  ConvRowBias ', SizeX, 'x', SizeY, 'x', InDepth, ' -> ',
+        Features, ' pointwise=', Pointwise, ' bits=', QuantBits,
+        ' implicit=', Implicit, ' tiled=', ExpectTiled,
+        ': vs cpu max|diff|=', DiffCPU:0:9, ' bias max|diff|=', DiffBias:0:9,
+        ' max|ref|=', MaxAbs:0:6);
+      AssertTrue('biased minus bias-free equals the neuron''s bias' + CaseName +
+        ': max |diff| = ' + FloatToStr(DiffBias), DiffBias < 1e-5 * (MaxAbs + 1));
+      // The CPU int4 forward quantizes its input to int8; the OpenCL one
+      // reads it in FP32.
+      if QuantBits = 4 then Tol := 5e-2 * (MaxAbs + 1)
+      else if MaxAbs < 1 then Tol := 1e-4
+      else Tol := 1e-4 * MaxAbs;
+      AssertTrue('OpenCL vs CPU' + CaseName + ': max |diff| = ' +
+        FloatToStr(DiffCPU) + ' must be < ' + FloatToStr(Tol), DiffCPU < Tol);
+
+      // The first CPU forward builds both host volumes (and, spatial FP32 or
+      // int8, the host column matrix).
+      ColumnsBefore := Conv.InputPrepared.Size;
+      NetCL.DisableOpenCL();
+      NetCL.Compute(Input);
+      if Pointwise then ColumnBytesGrown := 0
+      else ColumnBytesGrown := int64(Conv.InputPrepared.Size - ColumnsBefore) *
+        SizeOf(TNeuralFloat);
+      AssertEquals('a CPU forward sizes FOutputRaw' + CaseName,
+        Conv.Output.Size, Conv.OutputRaw.Size);
+      AssertEquals('a CPU forward builds FOutputRaw and FBiasOutput' + CaseName,
+        int64(2 * Conv.Output.Size - 1) * SizeOf(TNeuralFloat),
+        TNNetLayer(Conv).NonWeightBytes() - HostBytesOnOpenCL - ColumnBytesGrown);
+      AssertEquals('CPU forward after OpenCL vs CPU' + CaseName, 0,
+        NetCL.GetLastLayer.Output.SumDiff(OutCPU), 0);
+    finally
+      OutCLNoBias.Free;
+      OutCL.Free;
+      OutCPU.Free;
+      Input.Free;
+      NetCLNoBias.Free;
+      NetCL.Free;
+      NetCPU.Free;
     end;
   end;
   finally

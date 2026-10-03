@@ -966,6 +966,9 @@ type
       FConcatedWeights: TNNetVolume;
       FConcatedWInter: TNNetVolume; // This is the same as transposed concated weights
       FBiasOutput: TNNetVolume;
+      // One bias per neuron: the fused OpenCL bias operand of a convolution,
+      // whose FBiasOutput repeats it per output position.
+      FNeuronBias: TNNetVolume;
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
       {$IFDEF OpenCL}
@@ -1048,7 +1051,10 @@ type
       function BorrowOwnerOpenCLCodes(VBs: TNNetVolume): boolean;
       {$ENDIF}
       procedure AfterWeightUpdate(); override;
-      procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
+      procedure BuildBiasOutput(); virtual;
+      // The fused OpenCL bias, one float per neuron: FBiasOutput only on a FullConnect.
+      // GroupedConvolutionLinear/LocalConnect/LocalProduct hold it per position: override first.
+      function OpenCLBiasOperand(): TNNetVolume; virtual;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -15010,6 +15016,10 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function NonWeightBytes(): int64; override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
+    protected
+      // True when every forward sizes FOutputRaw itself before a host write,
+      // so SetPrevLayer leaves it empty. False here.
+      function HostOutputRawOnDemand(): boolean; virtual;
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
       destructor Destroy(); override;
@@ -15097,7 +15107,17 @@ type
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
       procedure AfterWeightUpdate(); override;
+      // Fills FNeuronBias only; PrepareHostOutput repeats it per position into
+      // FBiasOutput when a host forward needs it.
+      procedure BuildBiasOutput(); override;
+      function OpenCLBiasOperand(): TNNetVolume; override;
+      function HostOutputRawOnDemand(): boolean; override;
+      // Sizes FOutputRaw and rebuilds a stale FBiasOutput before a host forward
+      // writes them; the fused OpenCL forward reads neither. Serial callers only.
+      procedure PrepareHostOutput();
     private
+      // FNeuronBias changed since FBiasOutput was last built from it.
+      FBiasOutputStale: boolean;
       // Winograd F(2x2,3x3) fast-conv scratch (opt-in via FStruct[7]).
       FWinogradKernels: TNNetVolume;   // (16, NumNeurons, InputDepth): U[p,o,:] = (G g G^T) packed depth-contiguous per tile-pos p, neuron o
       FWinogradInput: TNNetVolume;     // (16, NumTiles, InputDepth): V[p,tile,:] = (B^T d B) packed depth-contiguous
@@ -17033,6 +17053,8 @@ type
     FGemmWInter, FGemmIn, FGemmRes: TNNetVolume;
     {$ENDIF}
     function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer; override;
+    // The scatter forwards write FOutputRaw without PrepareHostOutput.
+    function HostOutputRawOnDemand(): boolean; override;
     procedure ComputeCPU();
     {$IFDEF OpenCL}
     procedure ComputeOpenCL();
@@ -80208,7 +80230,7 @@ function TNNetLayerConcatedWeights.NonWeightBytes(): int64;
 begin
   Result := inherited NonWeightBytes() + VolumeBytes(FConcatedWeights) +
     VolumeBytes(FConcatedWInter) + VolumeBytes(FBiasOutput) +
-    Quant8Bytes(FInputCopyInt8);
+    VolumeBytes(FNeuronBias) + Quant8Bytes(FInputCopyInt8);
 end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
@@ -80314,8 +80336,8 @@ begin
   // the shared rows here (only the rows themselves are shared).
   AfterWeightUpdate();
   {$IFDEF OpenCL}
-  // The fused bias add reads a resident copy of FBiasOutput, just rebuilt.
-  if ShouldSwapOpenCLCodes then FDotCL.RefreshResidentBias(FBiasOutput);
+  // The fused bias add reads a resident copy of the bias, just rebuilt.
+  if ShouldSwapOpenCLCodes then FDotCL.RefreshResidentBias(OpenCLBiasOperand());
   {$ENDIF}
   Result := true;
 end;
@@ -80366,18 +80388,11 @@ var
   MaxNeurons: integer;
   BiasValue: TNeuralFloatPtr;
 begin
-  // Every convolution reader checks FSuppressBias first, so a bias-free
-  // convolution neither sizes nor fills the per-position bias copy.
-  if (FSuppressBias <> 0) and (Self is TNNetConvolution) then
-  begin
-    FBiasOutput.ReSize(1, 1, 1);
-    exit;
-  end;
   MaxNeurons := FNeurons.Count - 1;
   FBiasOutput.ReSize(FOutputRaw);
   if High(FArrNeurons) < MaxNeurons then BuildArrNeurons();
 
-  if (Self is TNNetConvolution) or (Self is TNNetGroupedConvolutionLinear) then
+  if Self is TNNetGroupedConvolutionLinear then
   begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
@@ -80412,6 +80427,11 @@ begin
   end;
 end;
 
+function TNNetLayerConcatedWeights.OpenCLBiasOperand(): TNNetVolume;
+begin
+  Result := FBiasOutput;
+end;
+
 constructor TNNetLayerConcatedWeights.Create();
 begin
   inherited Create();
@@ -80421,6 +80441,7 @@ begin
   FQuantTable := TNNetVolumeQuant8.Create();
   FQuantTableInt4 := TNNetVolumeQuant4.Create();
   FBiasOutput := TNNetVolume.Create();
+  FNeuronBias := TNNetVolume.Create();
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
   FAfterWeightUpdateHasBeenCalled := false;
@@ -80437,6 +80458,7 @@ begin
   // Virtual: a convolution frees its int8 im2col buffer here too.
   DisableInt8Input();
   FBiasOutput.Free;
+  FNeuronBias.Free;
   if not FLinkedWeightTables then
   begin
     FQuantTable.Free;
@@ -80594,7 +80616,7 @@ begin
       // descendant arms the resident device codes/scales via PrepareInt8DotCL
       // or PrepareInt4DotCL.
       // FShouldConcatWeights is still set because it gates BuildBiasOutput
-      // (the fused device bias-add reads FBiasOutput); the concat itself
+      // (the fused device bias-add reads OpenCLBiasOperand); the concat itself
       // stays skipped by AfterWeightUpdate's FQuantInt8 guard. The weight
       // list must be refreshed for AfterWeightUpdate's Count>0 gate to let
       // BuildBiasOutput run (the listed volumes are the shrunk 1-element
@@ -106916,7 +106938,9 @@ procedure TNNetConvolutionBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
+  if HostOutputRawOnDemand()
+    then FOutputRaw.ReSize(0, 0, 0)
+    else FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   SetOutputErrorSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*pPrevLayer.Output.Depth;
   FVectorSizeBytes := FVectorSize * csNeuralFloatSize;
@@ -106966,6 +106990,66 @@ begin
   //  '-->',FTileSizeX,' ',FTileSizeD,
   //  '-->',FMaxTileX,' ',FMaxTileD
   //  );
+end;
+
+function TNNetConvolutionBase.HostOutputRawOnDemand(): boolean;
+begin
+  Result := false;
+end;
+
+function TNNetConvolution.HostOutputRawOnDemand(): boolean;
+begin
+  Result := true;
+end;
+
+function TNNetDeconvolution.HostOutputRawOnDemand(): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetConvolution.BuildBiasOutput();
+var
+  MaxNeuronPos, NeuronIdx: integer;
+begin
+  FBiasOutputStale := true;
+  // Every reader checks FSuppressBias first, so a bias-free convolution
+  // neither sizes nor fills either bias volume.
+  if FSuppressBias <> 0 then
+  begin
+    FNeuronBias.ReSize(1, 1, 1);
+    FBiasOutput.ReSize(1, 1, 1);
+    exit;
+  end;
+  MaxNeuronPos := FNeurons.Count - 1;
+  if High(FArrNeurons) < MaxNeuronPos then BuildArrNeurons();
+  FNeuronBias.ReSize(1, 1, FNeurons.Count);
+  for NeuronIdx := 0 to MaxNeuronPos do
+    FNeuronBias.FData[NeuronIdx] := FArrNeurons[NeuronIdx].FBiasWeight;
+end;
+
+function TNNetConvolution.OpenCLBiasOperand(): TNNetVolume;
+begin
+  Result := FNeuronBias;
+end;
+
+procedure TNNetConvolution.PrepareHostOutput();
+var
+  NeuronCount, NeuronBytes, MaxPositionPos, PositionIdx: integer;
+begin
+  NeuronCount := FNeurons.Count;
+  FOutputRaw.ReSize(FOutputSizeX, FOutputSizeY, NeuronCount);
+  if FSuppressBias <> 0 then exit;
+  // A layer whose weights never went through AfterWeightUpdate has no
+  // FNeuronBias yet; BuildBiasOutput reads the neurons' biases.
+  if FNeuronBias.Size <> NeuronCount then BuildBiasOutput();
+  if (not FBiasOutputStale) and (FBiasOutput.Size = FOutputRaw.Size) then exit;
+  FBiasOutput.ReSize(FOutputSizeX, FOutputSizeY, NeuronCount);
+  NeuronBytes := NeuronCount * csNeuralFloatSize;
+  MaxPositionPos := FOutputSizeX * FOutputSizeY - 1;
+  for PositionIdx := 0 to MaxPositionPos do
+    Move(FNeuronBias.FData[0], FBiasOutput.FData[PositionIdx * NeuronCount],
+      NeuronBytes);
+  FBiasOutputStale := false;
 end;
 
 procedure TNNetConvolutionAbstract.RefreshCalculatePrevLayerError();
@@ -107453,6 +107537,7 @@ begin
   // cai_dot_product kernel (the cheap 4x4 input/output transforms stay on CPU).
   if WinogradEligible() then
   begin
+    PrepareHostOutput();
     ComputeWinogradOpenCL();
     Exit;
   end;
@@ -107472,7 +107557,7 @@ begin
 
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
   WUpdated := FAfterWeightUpdateHasBeenCalled;
-  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FNeuronBias else BiasVol := nil;
   // A borrowed buffer was produced on the source layer's queue, so block on that
   // queue first (a no-op when it is this layer's queue too).
   if (PrevOutputBuffer <> nil) or (GatherSrcBuffer <> nil) then
@@ -107517,6 +107602,7 @@ begin
   begin
     FOutputOnOpenCL := false;
     FOutputOnRAM := true;
+    PrepareHostOutput();
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -107542,7 +107628,7 @@ var
 begin
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
-  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FNeuronBias else BiasVol := nil;
 
   OpenCLIm2Col := ShouldOpenCLIm2Col();
   if (pPrevOutputBuffer <> nil) or (pIm2ColSrcBuffer <> nil) then
@@ -107566,6 +107652,7 @@ begin
   end
   else
   begin
+    PrepareHostOutput();
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
     FOutputOnOpenCL := false;
     FOutputOnRAM := true;
@@ -108501,6 +108588,8 @@ begin
   // Pointwise convs: PrepareInputForConvolutionFast is a no-op (FInputPrepared
   // already aliases FPrevLayer.Output), so this just refreshes FInputCopy sizes.
   PrepareForwardPrologue();
+  // The chunks write FOutputRaw and read FBiasOutput, so both exist first.
+  PrepareHostOutput();
   // Quantized weights x int8 input: the chunks read FInputPreparedInt8 only, so
   // the FP32 im2col is dead work here for the same reason it is in Compute().
   // Coded by Claude (AI).
@@ -108520,6 +108609,7 @@ procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
   begin
     RaiseWhenInt4WithoutInt8Input();
+    PrepareHostOutput();
     if WinogradEligible() then
     begin
       ComputeWinogradCPU();
@@ -110215,11 +110305,10 @@ begin
   end;
 
   // Bias rides along as a kernel argument only when the device also applies the
-  // activation. For FullConnect FNumBs = 1, so the result index b_id*FNumAs +
-  // a_id collapses to a_id and FBiasOutput (built by BuildBiasOutput's
-  // TNNetFullConnect branch as bias[neuron], size = FOutput.Size = FNumAs)
-  // indexes exactly right. It rides the same WUpdated gate as the weights.
-  // Coded by Claude (AI).
+  // activation. The kernel reads one bias per row, and FBiasOutput (built by
+  // BuildBiasOutput's TNNetFullConnect branch as bias[neuron], size =
+  // FOutput.Size = FNumAs) is exactly that. It rides the same WUpdated gate as
+  // the weights. Coded by Claude (AI).
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   WUpdated := FAfterWeightUpdateHasBeenCalled;
@@ -139506,11 +139595,10 @@ end;
 
 procedure TNNetConvolution.AfterWeightUpdate();
 begin
-  // Let the inherited update build FBiasOutput (and, transiently, the
+  // Let the inherited update build FNeuronBias (and, transiently, the
   // concatenated caches) under its own FShouldConcatWeights guard - that guard
   // is only true once the layer is fully sized, so we must not build the bias
-  // ourselves here (SetNumWeightsForAllNeurons calls this BEFORE FOutputRaw is
-  // sized, and an early BuildBiasOutput writes out of bounds).
+  // ourselves here (SetNumWeightsForAllNeurons calls this before SetPrevLayer).
   inherited AfterWeightUpdate();
   // Any weight change invalidates the cached Winograd kernel transform; it is
   // rebuilt lazily on the next eligible forward. (Every weight mutation - train
@@ -139522,7 +139610,7 @@ begin
   if ActiveLowMemory() then
   begin
     // Release the persistent weight caches the per-neuron forward does not need.
-    // FBiasOutput (built above) is kept - ComputeLowMemoryCPU uses it.
+    // The biases stay - ComputeLowMemoryCPU adds FBiasOutput.
     FConcatedWeights.ReSize(1, 1, 1);
     FConcatedWInter.ReSize(1, 1, 1);
   end;

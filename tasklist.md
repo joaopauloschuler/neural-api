@@ -2406,8 +2406,17 @@ rather than acted on.
                 -6.1 GB host per net. GPU speed unmeasured. Deferred: int8 convs
                 keep the host column matrix; `SetTrainable(false)` after the
                 build keeps it too; the CPU path still overflows untiled 1024.
-          - [ ] B2f2. Per-row bias in OpenCL (`Bias[row]`); lazy host
+          - [x] B2f2. Per-row bias in OpenCL (`Bias[row]`); lazy host
                 `FBiasOutput` / `FOutputRaw`.
+                DONE: every dot-product kernel reads `Bias[row]`; a conv's
+                OpenCL bias buffer is Cout*4 bytes (`FNeuronBias`); a wrong-size
+                bias raises. `TNNetConvolution.PrepareHostOutput` sizes host
+                `FOutputRaw` and the per-position `FBiasOutput` on the first host
+                forward, so a fused OpenCL forward holds neither. Pico VAE 64x64:
+                OpenCL 4.5 -> 3.6 MB, host 5.8 -> 4.0 MB, image byte-identical.
+                Computed at a real 256 tile: -0.65 GB OpenCL, -1.3 GB host per
+                net. Deferred: `TNNetGroupedConvolutionLinear` keeps its
+                per-position buffers; host buffers built once stay allocated.
           - [ ] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;
                 reuse only when every consumer of the producer is an ancestor;
                 single in-order queue; last layer pinned).

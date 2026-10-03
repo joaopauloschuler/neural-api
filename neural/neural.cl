@@ -83,15 +83,13 @@ __kernel void cai_dot_product
   __global float* FInputBufferAs,
   __global float* FInputBufferBs,
   __global float* FResultBuffer,
-  // Optional fused bias: when UseBias != 0, FBiasOutput[b_id*FNumAs + a_id] is
-  // added to the reduced dot product BEFORE the activation, so an inference
-  // forward computes act(W.x + b) entirely on the device (no host bias-add +
-  // activation sweep). FBiasOutput carries the host FBiasOutput volume verbatim
-  // (bias replicated per output position, same [pos][feature] layout as the
-  // result), so the index matches the result write exactly. When UseBias == 0
-  // the pointer is unread and may be NULL. Coded by Claude (AI).
+  // Optional fused bias: when UseBias != 0, FRowBias[a_id] (one float per A
+  // row, FNumAs in all) is added to the reduced dot product BEFORE the
+  // activation, so an inference forward computes act(W.x + b) entirely on the
+  // device. When UseBias == 0 the pointer is unread and may be NULL.
+  // Coded by Claude (AI).
   const int UseBias,
-  __global const float* FBiasOutput
+  __global const float* FRowBias
 )
 {
   const int a_id = get_global_id(0);
@@ -177,8 +175,8 @@ __kernel void cai_dot_product
         i += 1;
     }
 
-    // Fused bias-add (see the FBiasOutput arg comment): act must see W.x + b.
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    // Fused bias-add (see the FRowBias arg comment): act must see W.x + b.
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     // Optional fused activation, applied in-register to the reduced dot product
     // before it is written back, so an inference forward skips the host-side
@@ -213,7 +211,7 @@ __kernel void cai_dot_product_int8
   __global float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -305,7 +303,7 @@ __kernel void cai_dot_product_int8
     DotProductResult *= FScales[a_id];
 
     // Fused bias-add (see cai_dot_product): act must see W.x + b.
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     // Fused activation, the same cai_fused_act call as cai_dot_product.
     DotProductResult = cai_fused_act(DotProductResult, ActFN);
@@ -339,7 +337,7 @@ __kernel void cai_dot_product_int8_h
   __global const half* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -430,7 +428,7 @@ __kernel void cai_dot_product_int8_h
     // Deferred per-row dequantization scale, the fused bias and the fused
     // activation, in cai_dot_product_int8's order.
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
     DotProductResult = cai_fused_act(DotProductResult, ActFN);
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
@@ -663,7 +661,7 @@ __kernel void cai_dot_product_int8_splitk_reduce
   __global const float* FPartialBuffer,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -684,7 +682,7 @@ __kernel void cai_dot_product_int8_splitk_reduce
     // Deferred per-row dequantization scale, then the (FP32, unscaled) bias -
     // same order as cai_dot_product_int8 and as the host fused path.
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
   }
@@ -708,7 +706,7 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
   __global const half* FPartialBuffer,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -727,7 +725,7 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
     }
 
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
   }
@@ -846,7 +844,7 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
     {
       const int pos = gb * FNumAs + row;
       float v = acc[b] * RowScale;
-      if (UseBias != 0) v += Bias[pos];
+      if (UseBias != 0) v += Bias[row];
       R[pos] = cai_fused_act(v, ActFN);
     }
   }
@@ -936,7 +934,7 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   __global const float* Bf, __global const half* Bh, const int BIsHalf,
   const int BIsConv, const cai_conv_gather G,
   __global float* FResultBuffer, const int UseBias,
-  __global const float* FBiasOutput, __global const float* FScales,
+  __global const float* FRowBias, __global const float* FScales,
   __local float* Bs)
 {
   const int lid = get_local_id(0);
@@ -1007,9 +1005,9 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   const float RowScale0 = AIsFloat ? 1.0f : FScales[row0];
   const float RowScale1 = AIsFloat ? 1.0f : FScales[row1];
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, RowScale0, a0 + lid, b0, acc0);
+    FRowBias, RowScale0, a0 + lid, b0, acc0);
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, RowScale1, a0 + lid + CAI_TILED_LANES, b0, acc1);
+    FRowBias, RowScale1, a0 + lid + CAI_TILED_LANES, b0, acc1);
 }
 
 // Tiled twin of cai_dot_product: FP32 weights in its [a + k*FNumAs] layout,
@@ -1024,13 +1022,13 @@ __kernel void cai_dot_product_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput
+  __global const float* FRowBias
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
   const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, 0, FInputBufferAs,
-    1, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    1, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FRowBias,
     0, Bs);
 }
 
@@ -1049,14 +1047,14 @@ __kernel void cai_dot_product_int8_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
   const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    0, FInputBufferBs, 0, 0, 0, NoGather, FResultBuffer, UseBias, FRowBias,
     FScales, Bs);
 }
 
@@ -1073,14 +1071,14 @@ __kernel void cai_dot_product_int8_tiled_h
   __global const half* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS];
   const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, 0, FInputBufferBs, 1, 0, NoGather, FResultBuffer, UseBias, FBiasOutput,
+    0, 0, FInputBufferBs, 1, 0, NoGather, FResultBuffer, UseBias, FRowBias,
     FScales, Bs);
 }
 
@@ -1096,7 +1094,7 @@ __kernel void cai_conv_implicit_tiled
   __global const float* FSrc,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   const int OutSizeX,
   const int RowSpan,
   const int InSizeX,
@@ -1110,7 +1108,7 @@ __kernel void cai_conv_implicit_tiled
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
     Stride, Padding};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, 0, FInputBufferAs,
-    1, FSrc, 0, 0, 1, G, FResultBuffer, UseBias, FBiasOutput, 0, Bs);
+    1, FSrc, 0, 0, 1, G, FResultBuffer, UseBias, FRowBias, 0, Bs);
 }
 
 // Untiled twin of cai_conv_implicit_tiled (same arguments), one work-item per
@@ -1125,7 +1123,7 @@ __kernel void cai_conv_implicit
   __global const float* FSrc,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   const int OutSizeX,
   const int RowSpan,
   const int InSizeX,
@@ -1169,7 +1167,7 @@ __kernel void cai_conv_implicit
     }
   }
   const int ResultPos = b_id * FNumAs + a_id;
-  if (UseBias != 0) acc += FBiasOutput[ResultPos];
+  if (UseBias != 0) acc += FRowBias[a_id];
   FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
 }
 
@@ -1194,7 +1192,7 @@ __kernel void cai_dot_product_int4_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales,
   __global const float* FBlockScales
 )
@@ -1249,9 +1247,9 @@ __kernel void cai_dot_product_int4_tiled
   }
 
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, FScales[row0], a0 + lid, b0, acc0);
+    FRowBias, FScales[row0], a0 + lid, b0, acc0);
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, FScales[row1], a0 + lid + CAI_TILED_LANES, b0, acc1);
+    FRowBias, FScales[row1], a0 + lid + CAI_TILED_LANES, b0, acc1);
 } // end of kernel
 
 __kernel void cai_dot_product2

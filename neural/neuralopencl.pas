@@ -322,10 +322,11 @@ type
       /// ReallocateBuffersIfRequired for grow-only reuse; kept in sync with the
       /// actual allocations (reset to 0 whenever a buffer is released).
       FCapAs, FCapBs, FCapResult: csize_t;
-      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product). Only
-      /// allocated when a Compute call passes a bias volume; grow-only like the
-      /// operands, uploaded only when NewVBias (or on first/grown allocation).
-      /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
+      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product), one
+      /// float per A row. Only allocated when a Compute call passes a bias
+      /// volume; grow-only like the operands, uploaded only when NewVBias (or
+      /// on first/grown allocation). nil (and UseBias=0) for every bias-less
+      /// caller. Coded by Claude (AI).
       FBiasBuffer: cl_mem;
       FCapBias: csize_t;
       /// Resident copy of a host convolution input that cai_im2col
@@ -500,8 +501,8 @@ type
       /// Coded by Claude (AI).
       function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
         pExternalVBs: cl_mem; var err: integer): cl_mem;
-      /// Uploads VBias into the resident grow-only bias buffer when needed and
-      /// returns the UseBias kernel argument (0 for a nil VBias). Coded by Claude (AI).
+      /// Uploads VBias (one float per A row, else raises) into the resident
+      /// grow-only bias buffer when needed; returns UseBias (0 for nil). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
         var err: integer): longint;
       /// True when the current shape and device take the tiled GEMM: at least
@@ -2044,6 +2045,11 @@ begin
   // re-uploaded only when NewVBias or just (re)allocated.
   Result := 0;
   if VBias = nil then exit;
+  // The kernels read one bias per A row: Bias[row].
+  if VBias.Size <> FNumAs then
+    raise Exception.Create('TDotProductSharedKernel.PrepareBiasOperand: the ' +
+      'bias has ' + IntToStr(VBias.Size) + ' elements, the kernels read one ' +
+      'per row (' + IntToStr(FNumAs) + ').');
   NeededBias := VBias.GetMemSize();
   if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
   begin
@@ -2434,7 +2440,7 @@ begin
   err := err or clSetKernelArg(FKernel, 7, csCLMemSize,  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
+  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FRowBias). This
   // class never fuses bias, but every arg must be set once before enqueue, so pin
   // UseBias=0 and a NULL bias buffer here (clSetKernelArg copies the value
   // immediately, so the locals are safe). Coded by Claude (AI).
