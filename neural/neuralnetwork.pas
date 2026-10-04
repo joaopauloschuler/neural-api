@@ -4292,6 +4292,8 @@ type
     FKCache: TNNetVolume;        // cached keys   [MaxContext x 1 x d_k]
     FVCache: TNNetVolume;        // cached values [MaxContext x 1 x d_k]
     FCacheScores: array of TNeuralFloat; // per-step softmax scratch row
+    // The layer ShareCacheStorageWith last shared FKCache/FVCache with.
+    FCacheStorageSource: TNNetScaledDotProductAttention;
     // --- int8 KV-cache quantization (opt-in, inference only) ---------------
     // OFF by default (FKVQuantInt8 = false) => the FP32 FKCache/FVCache above
     // are the live storage and the cached path is BIT-EXACT. When EnableInt8KV
@@ -4523,6 +4525,12 @@ type
     // and must be discarded before verification continues from the last
     // committed token. TruncateCache(0) is equivalent to ResetCache().
     procedure TruncateCache(NewLength: integer);
+    // Makes the FP32 K/V cache share Source's host storage (both armed and
+    // empty, equal MaxContext and width; raises otherwise): for dead caches.
+    procedure ShareCacheStorageWith(Source: TNNetScaledDotProductAttention);
+    // True while the K and V caches use Source's host storage.
+    function CacheStorageSharedWith(
+      Source: TNNetScaledDotProductAttention): boolean;
     // StreamingLLM-style KV-cache eviction for UNBOUNDED streaming (Xiao et al.
     // 2023; transformers SinkCache). With eviction OFF (the default) the cache
     // grows to MaxContext and overflowing it is an error. EnableEviction(S, W)
@@ -33750,6 +33758,33 @@ begin
   FCacheLen := 0;
 end;
 
+procedure TNNetScaledDotProductAttention.ShareCacheStorageWith(
+  Source: TNNetScaledDotProductAttention);
+begin
+  if (not FCacheEnabled) or (not Source.FCacheEnabled) or FKVQuantInt8 or
+     Source.FKVQuantInt8 or (FCacheMax <> Source.FCacheMax) or
+     (FKCache.Size <> Source.FKCache.Size) or (FCacheLen <> 0) or
+     (Source.FCacheLen <> 0) then
+    raise Exception.Create('TNNetScaledDotProductAttention.' +
+      'ShareCacheStorageWith: both layers need an armed, empty FP32 cache of ' +
+      'the same MaxContext and width.');
+  ForceCacheOnRAM();
+  Source.ForceCacheOnRAM();
+  // A later ReSize to another size gives the layer its own storage again.
+  FKCache.ShareDataWith(Source.FKCache);
+  FVCache.ShareDataWith(Source.FVCache);
+  FCacheStorageSource := Source;
+end;
+
+function TNNetScaledDotProductAttention.CacheStorageSharedWith(
+  Source: TNNetScaledDotProductAttention): boolean;
+begin
+  Result := Assigned(FKCache) and Assigned(Source.FKCache) and
+    (FKCache.Size > 0) and
+    (Pointer(FKCache.FData) = Pointer(Source.FKCache.FData)) and
+    (Pointer(FVCache.FData) = Pointer(Source.FVCache.FData));
+end;
+
 procedure TNNetScaledDotProductAttention.TruncateCache(NewLength: integer);
 begin
   if not FCacheEnabled then
@@ -34359,9 +34394,12 @@ end;
 function TNNetScaledDotProductAttention.NonWeightBytes(): int64;
 begin
   Result := inherited NonWeightBytes() + VolumeBytes(FAttn) +
-    VolumeBytes(FKCache) + VolumeBytes(FVCache) +
     Quant8Bytes(FKCacheQ) + Quant8Bytes(FVCacheQ) +
     int64(Length(FCacheScores)) * csNeuralFloatSize;
+  // Shared K/V storage is counted once, on the source layer.
+  if not (Assigned(FCacheStorageSource) and
+     CacheStorageSharedWith(FCacheStorageSource)) then
+    Result := Result + VolumeBytes(FKCache) + VolumeBytes(FVCache);
   {$IFDEF OpenCL}
   Result := Result + VolumeBytes(FQRowBuf) + VolumeBytes(FKInterBuf) +
     VolumeBytes(FVRowBuf);

@@ -2484,7 +2484,7 @@ rather than acted on.
         `t_start = int(N - min(N*strength, N))` on the shifted sigmas (Qwen-Image v1
         img2img formula; 2.1 has no img2img pipeline), denoises from t_start. Error
         when no step remains. Re-styles; does not follow edit instructions.
-  - [ ] C1a. Qwen3-VL vision tower: patch 16 (the 2 temporal kernel slices summed),
+  - [x] C1a. Qwen3-VL vision tower: patch 16 (the 2 temporal kernel slices summed),
         learned 48x48 position table bilinear (align_corners), 2-D RoPE (rotate-half
         -> interleaved permutation), 27 pre-LN blocks, bidirectional attention via the
         `TNNetFusedSDPA` cached path (no 1 GB score map), 2x2 merger + DeepStack

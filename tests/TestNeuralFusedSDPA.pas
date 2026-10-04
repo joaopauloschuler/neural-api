@@ -44,6 +44,7 @@ type
     procedure TestChunkedPrefillParity;  // planner chunk path vs serial
     procedure TestChunkedDecodeParity;   // chunked cached decode vs serial
     procedure TestCachedForwardNonCausal; // external prefix + unmasked step
+    procedure TestSharedCacheStorage;     // stacked layers, one K/V storage
   end;
 
 implementation
@@ -648,6 +649,79 @@ begin
     PrefixK.Free;
     StepInput.Free;
     FullInput.Free;
+  end;
+end;
+
+// Two CachedForwardNonCausal layers in a row, the second writing into the
+// first's K/V storage, compute what two private caches compute and count the
+// storage once; a non-empty cache is refused; another MaxContext un-shares.
+procedure TTestNeuralFusedSDPA.TestSharedCacheStorage;
+const
+  SeqLen = 6;
+  Hq = 2;
+  Hkv = 2;
+  HeadDim = 4;
+var
+  Nets: array[0..1] of TNNet;
+  Attn: array[0..1, 0..1] of TNNetFusedSDPA;
+  Input: TNNetVolume;
+  PackedWidth, NetCnt, LayerCnt, Pass: integer;
+  Failed: boolean;
+begin
+  PackedWidth := (Hq + 2 * Hkv) * HeadDim;
+  Input := TNNetVolume.Create(SeqLen, 1, PackedWidth);
+  Nets[0] := nil;
+  Nets[1] := nil;
+  try
+    for NetCnt := 0 to 1 do
+    begin
+      Nets[NetCnt] := TNNet.Create();
+      Nets[NetCnt].AddLayer(TNNetInput.Create(SeqLen, 1, PackedWidth));
+      for LayerCnt := 0 to 1 do
+      begin
+        if LayerCnt = 1 then
+          Nets[NetCnt].AddLayer(TNNetPointwiseConvLinear.Create(PackedWidth));
+        Attn[NetCnt, LayerCnt] := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim,
+          {Causal=}false, 0, 0, {pCachedForwardNonCausal=}true);
+        Attn[NetCnt, LayerCnt].BeginIncrementalDecode(SeqLen);
+        Nets[NetCnt].AddLayer(Attn[NetCnt, LayerCnt]);
+      end;
+    end;
+    Nets[1].CopyWeights(Nets[0]);
+    AssertFalse('private storage before sharing',
+      Attn[1, 1].CacheStorageSharedWith(Attn[1, 0]));
+    Attn[1, 1].ShareCacheStorageWith(Attn[1, 0]);
+    AssertTrue('shared storage', Attn[1, 1].CacheStorageSharedWith(Attn[1, 0]));
+    for Pass := 0 to 1 do
+    begin
+      FillPacked(Input, 17 + 40 * Pass);
+      for NetCnt := 0 to 1 do
+      begin
+        for LayerCnt := 0 to 1 do Attn[NetCnt, LayerCnt].TruncateCache(0);
+        Nets[NetCnt].Compute(Input);
+      end;
+      AssertOutputsEqual('pass ' + IntToStr(Pass), Nets[0], Nets[1], 1e-6);
+    end;
+    // The shared K and V storage (SeqLen x KW floats each) is counted once.
+    AssertEquals('shared cache bytes counted on the source only',
+      Attn[0, 1].NonWeightBytes() - 2 * SeqLen * Hkv * HeadDim *
+      SizeOf(TNeuralFloat), Attn[1, 1].NonWeightBytes());
+    AssertEquals('the source still counts them', Attn[0, 0].NonWeightBytes(),
+      Attn[1, 0].NonWeightBytes());
+    Failed := false;
+    try
+      Attn[0, 1].ShareCacheStorageWith(Attn[0, 0]);
+    except
+      Failed := true;
+    end;
+    AssertTrue('a non-empty cache is refused', Failed);
+    Attn[1, 1].BeginIncrementalDecode(SeqLen + 1);
+    AssertFalse('another MaxContext unshares',
+      Attn[1, 1].CacheStorageSharedWith(Attn[1, 0]));
+  finally
+    Nets[1].Free;
+    Nets[0].Free;
+    Input.Free;
   end;
 end;
 

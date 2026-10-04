@@ -8605,15 +8605,153 @@ const
   csQwenImage21SystemPrompt = 'Comprehend and analyze the provided prompt.';
 
 type
+  // vision_config of a Qwen3-VL config.json (transformers Qwen3VLVisionConfig).
+  TQwen3VLVisionConfig = record
+    Depth, Hidden, NumHeads, HeadDim, IntermediateSize, InChannels: integer;
+    PatchSize, TemporalPatchSize, SpatialMergeSize: integer;
+    NumPositionEmbeddings, OutHidden: integer;
+    DeepStackIndexes: TNeuralIntegerArray; // deepstack_visual_indexes
+    HiddenAct: TClipHiddenAct;             // the block MLP activation
+    RopeTheta: TNeuralFloat;
+  end;
+
   TQwen3VLConfig = record
     Text: TLlamaConfig;    // the Qwen3 text decoder (text_config)
     ImageTokenId: integer; // image_token_id (<|image_pad|>); -1 = absent
     VideoTokenId: integer; // video_token_id (<|video_pad|>); -1 = absent
+    Vision: TQwen3VLVisionConfig; // Depth = 0 when vision_config is absent
+  end;
+
+  // processor/preprocessor_config.json (transformers Qwen2VLImageProcessor).
+  TQwen3VLImageProcessorConfig = record
+    ImageMean, ImageStd: array[0..2] of TNeuralFloat;
+    RescaleFactor: TNeuralFloat;
+    MinPixels, MaxPixels: int64; // size.shortest_edge / size.longest_edge
+    PatchSize, TemporalPatchSize, MergeSize: integer;
   end;
 
 // Reads a HF Qwen3-VL config.json: text_config through
-// ReadLlamaConfigFromJSONFile plus the wrapper's image/video token ids.
+// ReadLlamaConfigFromJSONFile plus the wrapper's token ids and vision_config.
 function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
+
+// Reads preprocessor_config.json or processor_config.json's image_processor
+// (raises if FileName is missing); absent keys: HF defaults, Vision's patches.
+function ReadQwen3VLImageProcessorConfig(const FileName: string;
+  const Vision: TQwen3VLVisionConfig): TQwen3VLImageProcessorConfig;
+
+// transformers smart_resize: both sides multiples of Factor, the area within
+// [MinPixels, MaxPixels], the aspect ratio kept as closely as possible.
+procedure Qwen3VLSmartResize(Height, Width, Factor: integer;
+  MinPixels, MaxPixels: int64; out ResizedHeight, ResizedWidth: integer);
+
+// Image (W,H,3|4) in 0..255, RGBA over white as PIL pastes it, to normalised
+// block-major patch rows (GridH*GridW,1,3*P*P); raises if smart_resize resizes.
+procedure Qwen3VLPreprocessImage(Image: TNNetVolume;
+  const Processor: TQwen3VLImageProcessorConfig; Patches: TNNetVolume;
+  out GridH, GridW: integer);
+
+// Grid (row, col) of every patch in block-major order (the 2-D RoPE positions).
+procedure BuildQwen3VLVisionPositions(GridH, GridW, MergeSize: integer;
+  var PosH, PosW: TNeuralIntegerArray);
+
+// The learned (Side*Side,1,Hidden) position Table, bilinear (align_corners) to
+// a GridH x GridW grid: Dest (GridH*GridW,1,Hidden) in block-major order.
+procedure Qwen3VLInterpolatePositionTable(Table: TNNetVolume;
+  GridH, GridW, MergeSize: integer; Dest: TNNetVolume);
+
+type
+  // One pre-LayerNorm vision block: x += proj(attn(norm1 x)); x += mlp(norm2 x).
+  TQwen3VLVisionBlockLayers = record
+    Norm1, QProj, KProj, VProj, OutProj, Norm2, Fc1, Fc2: TNNetLayer;
+    QRope, KRope: TNNetAxialRotaryEmbedding;
+    Attn: TNNetFusedSDPA;
+    Output: TNNetLayer; // the second residual sum
+  end;
+
+  // Patch merger: LayerNorm, 2x2 patches to one row, fc1, erf-GELU, fc2. The
+  // DeepStack mergers normalise after the 2x2 view, the final merger before it.
+  TQwen3VLVisionMergerLayers = record
+    Norm, Fc1, Fc2: TNNetLayer;
+  end;
+
+  TQwen3VLVisionTowerLayers = record
+    PositionInput: TNNetLayer; // the (N,1,Hidden) interpolated position rows
+    PatchEmbed: TNNetLayer;
+    Blocks: array of TQwen3VLVisionBlockLayers;
+    Merger: TQwen3VLVisionMergerLayers;
+    // One per deepstack_visual_indexes entry, in that order.
+    DeepStack: array of TQwen3VLVisionMergerLayers;
+  end;
+
+// Adds the tower for a GridH x GridW patch grid: Layers[0] patch rows
+// (N,1,3*P*P), Layers[1] position rows (N,1,Hidden); returns merger fc2.
+function BuildQwen3VLVisionTowerNet(NN: TNNet;
+  const Vision: TQwen3VLVisionConfig; GridH, GridW: integer;
+  out Tower: TQwen3VLVisionTowerLayers): TNNetLayer;
+
+// Loads Prefix* (patch embed folded over its two frames, blocks, mergers) into
+// Tower; pos_embed is the caller's (TQwen3VLVisionTower keeps it on the host).
+procedure LoadQwen3VLVisionTowerWeights(Reader: TNNetSafeTensorsReader;
+  const Tower: TQwen3VLVisionTowerLayers; const Vision: TQwen3VLVisionConfig;
+  const Prefix: string = 'model.visual.');
+
+type
+  // Qwen3-VL vision tower (transformers Qwen3VLVisionModel, one still image).
+  // WeightOwner is a one-merge-group net holding the weights; Net is the
+  // grid-sized net that borrows them. Merged and every DeepStack feature are
+  // (GridH*GridW/4, 1, OutHidden) in merge-group order. Coded by Claude (AI).
+  TQwen3VLVisionTower = class(TObject)
+  private
+    FConfig: TQwen3VLVisionConfig;
+    FProcessor: TQwen3VLImageProcessorConfig;
+    // pos_embed.weight, and its rows interpolated to Net's grid.
+    FPositionTable, FPositionRows: TNNetVolume;
+    FPatches: TNNetVolume;
+    FWeightOwner, FNet: TNNet;
+    FWeightOwnerLayers, FNetLayers: TQwen3VLVisionTowerLayers;
+    FNetGridH, FNetGridW: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
+    FShareHostOutputs: boolean;
+    procedure LoadFromReader(Reader: TNNetSafeTensorsReader;
+      const Prefix: string);
+  public
+    // config.json + model weights of the folder; ProcessorConfigFile '' =
+    // ../processor/preprocessor_config.json (else processor_config.json).
+    constructor Create(const TextEncoderFolder: string;
+      const ProcessorConfigFile: string = '');
+    constructor CreateFromReader(Reader: TNNetSafeTensorsReader;
+      const Config: TQwen3VLVisionConfig;
+      const Processor: TQwen3VLImageProcessorConfig;
+      const Prefix: string = 'model.visual.');
+    destructor Destroy(); override;
+    // (Re)builds Net for a GridH x GridW patch grid; a same-size call is free.
+    procedure PrepareNet(GridH, GridW: integer);
+    // Frees Net and its activations; the weights stay.
+    procedure ReleaseNet();
+    // Preprocesses Image (see Qwen3VLPreprocessImage) and runs EncodePatches.
+    procedure Encode(Image, Merged: TNNetVolume;
+      const DeepStack: array of TNNetVolume);
+    // Patches as Qwen3VLPreprocessImage writes them; DeepStack needs one
+    // volume per deepstack_visual_indexes entry.
+    procedure EncodePatches(Patches: TNNetVolume; GridH, GridW: integer;
+      Merged: TNNetVolume; const DeepStack: array of TNNetVolume);
+    property Config: TQwen3VLVisionConfig read FConfig;
+    property Processor: TQwen3VLImageProcessorConfig read FProcessor;
+    property WeightOwner: TNNet read FWeightOwner;
+    // Run it only through EncodePatches, which rewinds every attention cache
+    // and fills the position rows before the forward.
+    property Net: TNNet read FNet;
+    property NetLayers: TQwen3VLVisionTowerLayers read FNetLayers;
+    // Net's interpolated position rows (GridH*GridW, 1, Hidden).
+    property PositionRows: TNNetVolume read FPositionRows;
+    // As in TQwenImage21VaeEncoder; read when Net is (re)built. With
+    // ShareHostOutputs, only Merged and DeepStack outlive a forward.
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    property ShareHostOutputs: boolean read FShareHostOutputs
+      write FShareHostOutputs;
+  end;
 
 // Qwen3-VL text decoder without final RMSNorm and LM head: (pSeqLen,1,1) ids
 // in, (pSeqLen,1,hidden) out. pWeightOwner (same config): borrow, load nothing.
@@ -82650,6 +82788,61 @@ begin
   end;
 end;
 
+// vision_config with the transformers Qwen3VLVisionConfig defaults; Depth = 0
+// when Obj is nil.
+function ReadQwen3VLVisionConfig(Obj: TJSONObject): TQwen3VLVisionConfig;
+var
+  IndexArr: TJSONArray;
+  RopeObj: TJSONObject;
+  RopeType: string;
+  IndexPos, MaxIndexPos: integer;
+begin
+  Result := Default(TQwen3VLVisionConfig);
+  if Obj = nil then exit;
+  Result.Depth := Obj.Get('depth', 27);
+  Result.Hidden := Obj.Get('hidden_size', 1152);
+  Result.NumHeads := Obj.Get('num_heads', 16);
+  Result.IntermediateSize := Obj.Get('intermediate_size', 4304);
+  Result.InChannels := Obj.Get('in_channels', 3);
+  Result.PatchSize := Obj.Get('patch_size', 16);
+  Result.TemporalPatchSize := Obj.Get('temporal_patch_size', 2);
+  Result.SpatialMergeSize := Obj.Get('spatial_merge_size', 2);
+  Result.NumPositionEmbeddings := Obj.Get('num_position_embeddings', 2304);
+  Result.OutHidden := Obj.Get('out_hidden_size', 3584);
+  Result.HiddenAct := ClipHiddenActFromString(
+    Obj.Get('hidden_act', 'gelu_pytorch_tanh'));
+  if (Result.NumHeads < 1) or (Result.Hidden mod Result.NumHeads <> 0) then
+    ImportError('Qwen3-VL import: vision hidden_size ' +
+      IntToStr(Result.Hidden) + ' is not a multiple of num_heads ' +
+      IntToStr(Result.NumHeads) + '.');
+  Result.HeadDim := Result.Hidden div Result.NumHeads;
+  Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+  // transformers reads rope_scaling over rope_parameters, rope_type over the
+  // legacy "type", and maps "default" to this config's "axial".
+  RopeObj := TJSONObject(Obj.Find('rope_scaling', jtObject));
+  if (RopeObj = nil) or (RopeObj.Count = 0) then
+    RopeObj := TJSONObject(Obj.Find('rope_parameters', jtObject));
+  if RopeObj <> nil then
+  begin
+    Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+    RopeType := RopeObj.Get('rope_type', RopeObj.Get('type', 'default'));
+    if (RopeType <> 'default') and (RopeType <> 'axial') then
+      ImportError('Qwen3-VL import: vision rope_type "' + RopeType +
+        '" is not supported (Qwen3VLVisionRotaryEmbedding accepts only ' +
+        '"axial").');
+  end;
+  IndexArr := TJSONArray(Obj.Find('deepstack_visual_indexes', jtArray));
+  if IndexArr = nil then
+    Result.DeepStackIndexes := TNeuralIntegerArray.Create(8, 16, 24)
+  else
+  begin
+    SetLength(Result.DeepStackIndexes, IndexArr.Count);
+    MaxIndexPos := IndexArr.Count - 1;
+    for IndexPos := 0 to MaxIndexPos do
+      Result.DeepStackIndexes[IndexPos] := IndexArr.Integers[IndexPos];
+  end;
+end;
+
 function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
 var
   JsonText: TStringList;
@@ -82666,6 +82859,8 @@ begin
     Root := GetJSON(JsonText.Text);
     Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
     Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
+    Result.Vision := ReadQwen3VLVisionConfig(
+      TJSONObject(TJSONObject(Root).Find('vision_config', jtObject)));
   finally
     Root.Free;
     JsonText.Free;
@@ -83182,6 +83377,784 @@ function SafeTensorsFolderWeightsFile(const Folder, Stem: string): string;
 begin
   Result := Folder + Stem + '.safetensors.index.json';
   if not FileExists(Result) then Result := Folder + Stem + '.safetensors';
+end;
+
+const
+  csQwen3VLVisionImporter = 'Qwen3-VL vision tower';
+  // nn.LayerNorm(eps=1e-6) is hard-coded in every vision block and merger.
+  csQwen3VLVisionNormEps = 1e-6;
+
+function ReadQwen3VLImageProcessorConfig(const FileName: string;
+  const Vision: TQwen3VLVisionConfig): TQwen3VLImageProcessorConfig;
+const
+  ClipMean: array[0..2] of TNeuralFloat = (0.48145466, 0.4578275, 0.40821073);
+  ClipStd: array[0..2] of TNeuralFloat = (0.26862954, 0.26130258, 0.27577711);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, SizeObj, NestedObj: TJSONObject;
+
+  procedure ReadChannelTriple(const Key: string;
+    var Values: array of TNeuralFloat);
+  var
+    ValueArr: TJSONArray;
+    ChannelCnt: integer;
+  begin
+    ValueArr := TJSONArray(Obj.Find(Key, jtArray));
+    if ValueArr = nil then exit;
+    if ValueArr.Count <> 3 then
+      ImportError(csQwen3VLVisionImporter + ': "' + Key + '" in "' +
+        FileName + '" must hold 3 values, got ' + IntToStr(ValueArr.Count) +
+        '.');
+    for ChannelCnt := 0 to 2 do
+      Values[ChannelCnt] := ValueArr.Floats[ChannelCnt];
+  end;
+
+begin
+  Move(ClipMean[0], Result.ImageMean[0], SizeOf(ClipMean));
+  Move(ClipStd[0], Result.ImageStd[0], SizeOf(ClipStd));
+  Result.RescaleFactor := 1 / 255;
+  Result.MinPixels := 56 * 56;
+  Result.MaxPixels := 28 * 28 * 1280;
+  Result.PatchSize := Vision.PatchSize;
+  Result.TemporalPatchSize := Vision.TemporalPatchSize;
+  Result.MergeSize := Vision.SpatialMergeSize;
+  if not FileExists(FileName) then
+    ImportError(csQwen3VLVisionImporter + ': image processor config "' +
+      FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError(csQwen3VLVisionImporter + ': "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    NestedObj := TJSONObject(Obj.Find('image_processor', jtObject));
+    if NestedObj <> nil then Obj := NestedObj;
+    ReadChannelTriple('image_mean', Result.ImageMean);
+    ReadChannelTriple('image_std', Result.ImageStd);
+    Result.RescaleFactor := Obj.Get('rescale_factor', Result.RescaleFactor);
+    if not Obj.Get('do_rescale', true) then Result.RescaleFactor := 1;
+    if not Obj.Get('do_normalize', true) then
+    begin
+      FillChar(Result.ImageMean, SizeOf(Result.ImageMean), 0);
+      Result.ImageStd[0] := 1;
+      Result.ImageStd[1] := 1;
+      Result.ImageStd[2] := 1;
+    end;
+    SizeObj := TJSONObject(Obj.Find('size', jtObject));
+    if SizeObj <> nil then
+    begin
+      Result.MinPixels := SizeObj.Get('shortest_edge', Result.MinPixels);
+      Result.MaxPixels := SizeObj.Get('longest_edge', Result.MaxPixels);
+    end;
+    // Qwen2VLImageProcessor.__init__: min_pixels / max_pixels override size.
+    Result.MinPixels := Obj.Get('min_pixels', Result.MinPixels);
+    Result.MaxPixels := Obj.Get('max_pixels', Result.MaxPixels);
+    Result.PatchSize := Obj.Get('patch_size', Result.PatchSize);
+    Result.TemporalPatchSize := Obj.Get('temporal_patch_size',
+      Result.TemporalPatchSize);
+    Result.MergeSize := Obj.Get('merge_size', Result.MergeSize);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure Qwen3VLSmartResize(Height, Width, Factor: integer;
+  MinPixels, MaxPixels: int64; out ResizedHeight, ResizedWidth: integer);
+var
+  Beta: double;
+begin
+  if (Height < 1) or (Width < 1) or (Factor < 1) then
+    ImportError('Qwen3VLSmartResize: height ' + IntToStr(Height) +
+      ', width ' + IntToStr(Width) + ' and factor ' + IntToStr(Factor) +
+      ' must be >= 1.');
+  if Max(Height, Width) / Min(Height, Width) > 200 then
+    ImportError('Qwen3VLSmartResize: the aspect ratio of ' +
+      IntToStr(Width) + 'x' + IntToStr(Height) + ' exceeds 200.');
+  // Round is round-half-even, as Python's round().
+  ResizedHeight := Round(Height / Factor) * Factor;
+  ResizedWidth := Round(Width / Factor) * Factor;
+  if int64(ResizedHeight) * ResizedWidth > MaxPixels then
+  begin
+    Beta := Sqrt((double(Height) * Width) / MaxPixels);
+    ResizedHeight := Max(Factor, Floor(Height / Beta / Factor) * Factor);
+    ResizedWidth := Max(Factor, Floor(Width / Beta / Factor) * Factor);
+  end
+  else if int64(ResizedHeight) * ResizedWidth < MinPixels then
+  begin
+    Beta := Sqrt(MinPixels / (double(Height) * Width));
+    ResizedHeight := Ceil(Height * Beta / Factor) * Factor;
+    ResizedWidth := Ceil(Width * Beta / Factor) * Factor;
+  end;
+end;
+
+procedure BuildQwen3VLVisionPositions(GridH, GridW, MergeSize: integer;
+  var PosH, PosW: TNeuralIntegerArray);
+var
+  BlockRowCnt, BlockColCnt, InRowCnt, InColCnt, PatchPos: integer;
+  MaxBlockRowPos, MaxBlockColPos, MaxMergePos: integer;
+begin
+  if (MergeSize < 1) or (GridH < MergeSize) or (GridW < MergeSize) or
+     (GridH mod MergeSize <> 0) or (GridW mod MergeSize <> 0) then
+    ImportError('BuildQwen3VLVisionPositions: the ' + IntToStr(GridH) + 'x' +
+      IntToStr(GridW) + ' patch grid is not a multiple of the merge size ' +
+      IntToStr(MergeSize) + '.');
+  SetLength(PosH, GridH * GridW);
+  SetLength(PosW, GridH * GridW);
+  MaxBlockRowPos := GridH div MergeSize - 1;
+  MaxBlockColPos := GridW div MergeSize - 1;
+  MaxMergePos := MergeSize - 1;
+  PatchPos := 0;
+  for BlockRowCnt := 0 to MaxBlockRowPos do
+    for BlockColCnt := 0 to MaxBlockColPos do
+      for InRowCnt := 0 to MaxMergePos do
+        for InColCnt := 0 to MaxMergePos do
+        begin
+          PosH[PatchPos] := BlockRowCnt * MergeSize + InRowCnt;
+          PosW[PatchPos] := BlockColCnt * MergeSize + InColCnt;
+          Inc(PatchPos);
+        end;
+end;
+
+procedure Qwen3VLPreprocessImage(Image: TNNetVolume;
+  const Processor: TQwen3VLImageProcessorConfig; Patches: TNNetVolume;
+  out GridH, GridW: integer);
+var
+  PosH, PosW: TNeuralIntegerArray;
+  ChannelScale, ChannelOffset: array[0..2] of TNeuralFloat;
+  ImageW, ImageH, PatchSize, PatchArea, RowDepth, ResizedH, ResizedW: integer;
+  PatchCnt, MaxPatchPos, PatchY, PatchX, MaxPatchPixelPos, ChannelCnt: integer;
+  SourcePos, DestPos, Alpha, Blended: integer;
+  HasAlpha: boolean;
+begin
+  ImageW := Image.SizeX;
+  ImageH := Image.SizeY;
+  if (Image.Depth <> 3) and (Image.Depth <> 4) then
+    ImportError('Qwen3VLPreprocessImage: expected an RGB or RGBA image, got ' +
+      IntToStr(Image.Depth) + ' channels.');
+  HasAlpha := Image.Depth = 4;
+  PatchSize := Processor.PatchSize;
+  Qwen3VLSmartResize(ImageH, ImageW, PatchSize * Processor.MergeSize,
+    Processor.MinPixels, Processor.MaxPixels, ResizedH, ResizedW);
+  if (ResizedW <> ImageW) or (ResizedH <> ImageH) then
+    ImportError('Qwen3VLPreprocessImage: the processor resizes ' +
+      IntToStr(ImageW) + 'x' + IntToStr(ImageH) + ' to ' + IntToStr(ResizedW) +
+      'x' + IntToStr(ResizedH) + '; resize the image to that size first.');
+  GridH := ImageH div PatchSize;
+  GridW := ImageW div PatchSize;
+  BuildQwen3VLVisionPositions(GridH, GridW, Processor.MergeSize, PosH, PosW);
+  PatchArea := PatchSize * PatchSize;
+  RowDepth := 3 * PatchArea;
+  Patches.ReSize(GridH * GridW, 1, RowDepth);
+  // (v * rescale - mean) / std as one multiply-add per value.
+  for ChannelCnt := 0 to 2 do
+  begin
+    ChannelScale[ChannelCnt] := Processor.RescaleFactor /
+      Processor.ImageStd[ChannelCnt];
+    ChannelOffset[ChannelCnt] := -Processor.ImageMean[ChannelCnt] /
+      Processor.ImageStd[ChannelCnt];
+  end;
+  MaxPatchPos := GridH * GridW - 1;
+  MaxPatchPixelPos := PatchSize - 1;
+  for PatchCnt := 0 to MaxPatchPos do
+    for PatchY := 0 to MaxPatchPixelPos do
+    begin
+      SourcePos := Image.GetRawPos(PosW[PatchCnt] * PatchSize,
+        PosH[PatchCnt] * PatchSize + PatchY, 0);
+      DestPos := PatchCnt * RowDepth + PatchY * PatchSize;
+      if HasAlpha then
+        for PatchX := 0 to MaxPatchPixelPos do
+        begin
+          // PIL paste over white with the alpha as mask (integer BLEND).
+          Alpha := EnsureRange(Round(Image.FData[SourcePos + 3]), 0, 255);
+          for ChannelCnt := 0 to 2 do
+          begin
+            Blended := 255 * (255 - Alpha) + Alpha *
+              EnsureRange(Round(Image.FData[SourcePos + ChannelCnt]), 0, 255) +
+              128;
+            Blended := ((Blended shr 8) + Blended) shr 8;
+            Patches.FData[DestPos + ChannelCnt * PatchArea] :=
+              Blended * ChannelScale[ChannelCnt] + ChannelOffset[ChannelCnt];
+          end;
+          Inc(SourcePos, 4);
+          Inc(DestPos);
+        end
+      else
+        for PatchX := 0 to MaxPatchPixelPos do
+        begin
+          for ChannelCnt := 0 to 2 do
+            Patches.FData[DestPos + ChannelCnt * PatchArea] :=
+              Image.FData[SourcePos + ChannelCnt] * ChannelScale[ChannelCnt] +
+              ChannelOffset[ChannelCnt];
+          Inc(SourcePos, 3);
+          Inc(DestPos);
+        end;
+    end;
+end;
+
+procedure Qwen3VLInterpolatePositionTable(Table: TNNetVolume;
+  GridH, GridW, MergeSize: integer; Dest: TNNetVolume);
+var
+  PosH, PosW: TNeuralIntegerArray;
+  Side, Hidden, PatchCnt, MaxPatchPos: integer;
+  RowTaps, ColTaps: array[0..1] of integer;
+  RowWeights, ColWeights: array[0..1] of TNeuralFloat;
+  RowTapCnt, ColTapCnt: integer;
+  DestRow: TNeuralFloatArrPtr;
+
+  // align_corners: grid index Index of Size maps to Index*(Side-1)/(Size-1).
+  procedure AxisTaps(Index, Size: integer; var Taps: array of integer;
+    var Weights: array of TNeuralFloat);
+  var
+    Source, Fraction: double;
+    Lower: integer;
+  begin
+    Source := Index * (Side - 1) / Max(Size - 1, 1);
+    Lower := Floor(Source);
+    Fraction := Source - Lower;
+    Taps[0] := Min(Lower, Side - 1);
+    Taps[1] := Min(Lower + 1, Side - 1);
+    Weights[0] := 1 - Fraction;
+    Weights[1] := Fraction;
+  end;
+
+begin
+  Hidden := Table.Depth;
+  Side := Round(Sqrt(Table.SizeX));
+  if (Side * Side <> Table.SizeX) or (Table.SizeY <> 1) then
+    ImportError('Qwen3VLInterpolatePositionTable: the table must be ' +
+      '(Side*Side, 1, hidden), got ' + IntToStr(Table.SizeX) + 'x' +
+      IntToStr(Table.SizeY) + 'x' + IntToStr(Hidden) + '.');
+  BuildQwen3VLVisionPositions(GridH, GridW, MergeSize, PosH, PosW);
+  Dest.ReSize(GridH * GridW, 1, Hidden);
+  Dest.Fill(0);
+  MaxPatchPos := GridH * GridW - 1;
+  for PatchCnt := 0 to MaxPatchPos do
+  begin
+    AxisTaps(PosH[PatchCnt], GridH, RowTaps, RowWeights);
+    AxisTaps(PosW[PatchCnt], GridW, ColTaps, ColWeights);
+    DestRow := Dest.GetRawPtr(PatchCnt, 0, 0);
+    for RowTapCnt := 0 to 1 do
+      for ColTapCnt := 0 to 1 do
+        TNNetVolume.MulAdd(DestRow,
+          Table.GetRawPtr(RowTaps[RowTapCnt] * Side + ColTaps[ColTapCnt], 0, 0),
+          RowWeights[RowTapCnt] * ColWeights[ColTapCnt], Hidden);
+  end;
+end;
+
+// Conv3d [hidden, C, T, P, P] with bias as a linear map of one frame's
+// (C, P, P) row: the T kernel slices summed (every frame is the same image).
+procedure LoadQwen3VLPatchEmbedWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  const Vision: TQwen3VLVisionConfig);
+var
+  W, B: TNNetVolume;
+  FrameArea, ChannelStride, NeuronCnt, MaxNeuronPos, ChannelCnt: integer;
+  MaxChannelPos, FrameCnt, MaxFramePos, SourceBase: integer;
+  DestRow: TNeuralFloatArrPtr;
+begin
+  if (Reader.DimCount(WName) <> 5) or
+     (Reader.DimSize(WName, 0) <> Vision.Hidden) or
+     (Reader.DimSize(WName, 1) <> Vision.InChannels) or
+     (Reader.DimSize(WName, 2) <> Vision.TemporalPatchSize) or
+     (Reader.DimSize(WName, 3) <> Vision.PatchSize) or
+     (Reader.DimSize(WName, 4) <> Vision.PatchSize) then
+    ImportError(csQwen3VLVisionImporter + ': "' + WName + '" must have ' +
+      'shape [' + IntToStr(Vision.Hidden) + ', ' +
+      IntToStr(Vision.InChannels) + ', ' +
+      IntToStr(Vision.TemporalPatchSize) + ', ' + IntToStr(Vision.PatchSize) +
+      ', ' + IntToStr(Vision.PatchSize) + '], got ' +
+      Reader.ShapeAsString(WName));
+  if (Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> Vision.Hidden) then
+    ImportError(csQwen3VLVisionImporter + ': "' + BName + '" must have ' +
+      'shape [' + IntToStr(Vision.Hidden) + '], got ' +
+      Reader.ShapeAsString(BName));
+  EnsureWritableImportWeights(Layer);
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    FrameArea := Vision.PatchSize * Vision.PatchSize;
+    ChannelStride := Vision.TemporalPatchSize * FrameArea;
+    MaxNeuronPos := Vision.Hidden - 1;
+    MaxChannelPos := Vision.InChannels - 1;
+    MaxFramePos := Vision.TemporalPatchSize - 1;
+    for NeuronCnt := 0 to MaxNeuronPos do
+    begin
+      for ChannelCnt := 0 to MaxChannelPos do
+      begin
+        DestRow := TNeuralFloatArrPtr(
+          @Layer.FArrNeurons[NeuronCnt].Weights.FData[ChannelCnt * FrameArea]);
+        SourceBase := (NeuronCnt * Vision.InChannels + ChannelCnt) *
+          ChannelStride;
+        Move(W.FData[SourceBase], DestRow^, FrameArea * csNeuralFloatSize);
+        for FrameCnt := 1 to MaxFramePos do
+          TNNetVolume.MulAdd(DestRow,
+            TNeuralFloatArrPtr(@W.FData[SourceBase + FrameCnt * FrameArea]),
+            1, FrameArea);
+      end;
+      Layer.FArrNeurons[NeuronCnt].BiasWeight := B.FData[NeuronCnt];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+procedure LoadQwen3VLVisionNorm(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const NamePrefix: string; Width: integer);
+begin
+  LoadAffineNormWeights(Reader, Layer, NamePrefix + 'weight',
+    NamePrefix + 'bias', Width, 0, {HasBeta=}true, {BetaFromTensor=}true,
+    {ValidateBeta=}true, csQwen3VLVisionImporter);
+end;
+
+// nn.Linear with bias at NamePrefix + weight / bias.
+procedure LoadQwen3VLVisionLinear(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const NamePrefix: string; InDim, OutDim: integer);
+begin
+  LoadLlamaLinearWeights(Reader, Layer, NamePrefix + 'weight', InDim, OutDim,
+    0, -1, {RotaryHeadDim=}0, NamePrefix + 'bias');
+end;
+
+function AddQwen3VLVisionActivation(NN: TNNet;
+  HiddenAct: TClipHiddenAct): TNNetLayer;
+begin
+  case HiddenAct of
+    chaGeluTanh: Result := NN.AddLayer(TNNetGELU.Create());
+    chaGeluExact: Result := NN.AddLayer(TNNetGELUErf.Create());
+    else
+    begin
+      Result := nil;
+      ImportError(csQwen3VLVisionImporter + ': hidden_act "' +
+        ClipHiddenActToString(HiddenAct) + '" is not supported (expected ' +
+        'gelu_pytorch_tanh or gelu).');
+    end;
+  end;
+end;
+
+// One pre-LayerNorm block over XInput (N,1,Hidden), bidirectional over all N.
+// CacheOwner <> nil: the attention reuses CacheOwner's K/V cache storage.
+function AddQwen3VLVisionBlock(NN: TNNet; XInput: TNNetLayer;
+  const Vision: TQwen3VLVisionConfig; CacheOwner: TNNetFusedSDPA;
+  out Block: TQwen3VLVisionBlockLayers): TNNetLayer;
+var
+  Hidden, HeadDim, RopePairs: integer;
+  Residual1: TNNetLayer;
+begin
+  Hidden := Vision.Hidden;
+  HeadDim := Vision.HeadDim;
+  // cos = [h, w, h, w] over head_dim/4 frequencies each: rotate-half pair k
+  // is (k, k + head_dim/2), h for k < head_dim/4, else w.
+  RopePairs := HeadDim div 4;
+  Block.Norm1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(csQwen3VLVisionNormEps), XInput);
+  Block.QProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden),
+    Block.Norm1);
+  Block.KProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden),
+    Block.Norm1);
+  Block.VProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden),
+    Block.Norm1);
+  Block.QRope := TNNetAxialRotaryEmbedding.Create(Vision.RopeTheta, 0,
+    RopePairs, RopePairs, HeadDim);
+  NN.AddLayerAfter(Block.QRope, Block.QProj);
+  Block.KRope := TNNetAxialRotaryEmbedding.Create(Vision.RopeTheta, 0,
+    RopePairs, RopePairs, HeadDim);
+  NN.AddLayerAfter(Block.KRope, Block.KProj);
+  NN.AddLayer(TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
+  Block.Attn := TNNetFusedSDPA.Create(Vision.NumHeads, Vision.NumHeads,
+    HeadDim, {pCausalMask=}false, {pWindow=}0, {pScoreSoftCap=}0,
+    {pCachedForwardNonCausal=}true);
+  // Armed before AddLayer: no Heads x N x N score map is ever sized. The
+  // caller calls TruncateCache(0) before each forward.
+  Block.Attn.BeginIncrementalDecode(XInput.Output.SizeX);
+  // Blocks run one after another and never read their cache again, so one
+  // storage serves them all; sharing right away keeps a single extra cache.
+  if Assigned(CacheOwner) then Block.Attn.ShareCacheStorageWith(CacheOwner);
+  NN.AddLayer(Block.Attn);
+  Block.OutProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  Residual1 := NN.AddLayer(TNNetSum.Create([Block.OutProj, XInput]));
+  Block.Norm2 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(csQwen3VLVisionNormEps));
+  Block.Fc1 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Vision.IntermediateSize));
+  AddQwen3VLVisionActivation(NN, Vision.HiddenAct);
+  Block.Fc2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  Block.Output := NN.AddLayer(TNNetSum.Create([Block.Fc2, Residual1]));
+  Result := Block.Output;
+end;
+
+// The patch merger over XInput (N,1,Hidden): rows of 4 consecutive patches
+// (one 2x2 merge group) joined; PostShuffleNorm normalises after the join.
+function AddQwen3VLVisionMerger(NN: TNNet; XInput: TNNetLayer;
+  const Vision: TQwen3VLVisionConfig; PostShuffleNorm: boolean;
+  out Merger: TQwen3VLVisionMergerLayers): TNNetLayer;
+var
+  GroupArea, MergedDepth, MergedCount: integer;
+begin
+  GroupArea := Vision.SpatialMergeSize * Vision.SpatialMergeSize;
+  MergedDepth := Vision.Hidden * GroupArea;
+  MergedCount := XInput.Output.SizeX div GroupArea;
+  if PostShuffleNorm then
+  begin
+    NN.AddLayerAfter(TNNetReshape.Create(MergedCount, 1, MergedDepth), XInput);
+    Merger.Norm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(csQwen3VLVisionNormEps));
+  end
+  else
+  begin
+    Merger.Norm := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(csQwen3VLVisionNormEps), XInput);
+    NN.AddLayer(TNNetReshape.Create(MergedCount, 1, MergedDepth));
+  end;
+  Merger.Fc1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(MergedDepth));
+  NN.AddLayer(TNNetGELUErf.Create()); // nn.GELU()
+  Merger.Fc2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Vision.OutHidden));
+  Result := Merger.Fc2;
+end;
+
+function BuildQwen3VLVisionTowerNet(NN: TNNet;
+  const Vision: TQwen3VLVisionConfig; GridH, GridW: integer;
+  out Tower: TQwen3VLVisionTowerLayers): TNNetLayer;
+var
+  PatchInput, PositionInput, X: TNNetLayer;
+  CacheOwner: TNNetFusedSDPA;
+  PatchCount, BlockCnt, MaxBlockPos, StackCnt, MaxStackPos: integer;
+begin
+  if (Vision.Depth < 1) or (Vision.HeadDim mod 4 <> 0) then
+    ImportError(csQwen3VLVisionImporter + ': needs depth >= 1 and a head ' +
+      'dim that is a multiple of 4, got depth ' + IntToStr(Vision.Depth) +
+      ' and head dim ' + IntToStr(Vision.HeadDim) + '.');
+  if (GridH mod Vision.SpatialMergeSize <> 0) or
+     (GridW mod Vision.SpatialMergeSize <> 0) or (GridH < 1) or
+     (GridW < 1) then
+    ImportError(csQwen3VLVisionImporter + ': the ' + IntToStr(GridH) + 'x' +
+      IntToStr(GridW) + ' patch grid is not a multiple of the merge size ' +
+      IntToStr(Vision.SpatialMergeSize) + '.');
+  MaxStackPos := Length(Vision.DeepStackIndexes) - 1;
+  // HF emits the DeepStack features in block order, so the list must ascend.
+  for StackCnt := 0 to MaxStackPos do
+    if (Vision.DeepStackIndexes[StackCnt] < 0) or
+       (Vision.DeepStackIndexes[StackCnt] >= Vision.Depth) or
+       ((StackCnt > 0) and (Vision.DeepStackIndexes[StackCnt] <=
+         Vision.DeepStackIndexes[StackCnt - 1])) then
+      ImportError(csQwen3VLVisionImporter + ': deepstack_visual_indexes ' +
+        'must ascend strictly within the ' + IntToStr(Vision.Depth) +
+        ' blocks; entry ' + IntToStr(StackCnt) + ' is ' +
+        IntToStr(Vision.DeepStackIndexes[StackCnt]) + '.');
+  PatchCount := GridH * GridW;
+  PatchInput := NN.AddLayer(TNNetInput.Create(PatchCount, 1,
+    Vision.InChannels * Vision.PatchSize * Vision.PatchSize));
+  PositionInput := NN.AddLayer(TNNetInput.Create(PatchCount, 1,
+    Vision.Hidden));
+  Tower.PositionInput := PositionInput;
+  Tower.PatchEmbed := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Vision.Hidden), PatchInput);
+  X := NN.AddLayer(TNNetSum.Create([Tower.PatchEmbed, PositionInput]));
+  SetLength(Tower.Blocks, Vision.Depth);
+  SetLength(Tower.DeepStack, Length(Vision.DeepStackIndexes));
+  MaxBlockPos := Vision.Depth - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    if BlockCnt = 0 then CacheOwner := nil
+    else CacheOwner := Tower.Blocks[0].Attn;
+    X := AddQwen3VLVisionBlock(NN, X, Vision, CacheOwner,
+      Tower.Blocks[BlockCnt]);
+    for StackCnt := 0 to MaxStackPos do
+      if Vision.DeepStackIndexes[StackCnt] = BlockCnt then
+        AddQwen3VLVisionMerger(NN, X, Vision, {PostShuffleNorm=}true,
+          Tower.DeepStack[StackCnt]);
+  end;
+  Result := AddQwen3VLVisionMerger(NN, X, Vision, {PostShuffleNorm=}false,
+    Tower.Merger);
+  NN.SetTrainable();
+end;
+
+procedure LoadQwen3VLVisionMergerWeights(Reader: TNNetSafeTensorsReader;
+  const Merger: TQwen3VLVisionMergerLayers;
+  const Vision: TQwen3VLVisionConfig; const NamePrefix: string;
+  PostShuffleNorm: boolean);
+var
+  MergedDepth: integer;
+begin
+  MergedDepth := Vision.Hidden * Vision.SpatialMergeSize *
+    Vision.SpatialMergeSize;
+  if PostShuffleNorm then
+    LoadQwen3VLVisionNorm(Reader, Merger.Norm, NamePrefix + 'norm.',
+      MergedDepth)
+  else
+    LoadQwen3VLVisionNorm(Reader, Merger.Norm, NamePrefix + 'norm.',
+      Vision.Hidden);
+  LoadQwen3VLVisionLinear(Reader, Merger.Fc1, NamePrefix + 'linear_fc1.',
+    MergedDepth, MergedDepth);
+  LoadQwen3VLVisionLinear(Reader, Merger.Fc2, NamePrefix + 'linear_fc2.',
+    MergedDepth, Vision.OutHidden);
+end;
+
+procedure LoadQwen3VLVisionTowerWeights(Reader: TNNetSafeTensorsReader;
+  const Tower: TQwen3VLVisionTowerLayers; const Vision: TQwen3VLVisionConfig;
+  const Prefix: string);
+var
+  BlockPrefix, QKVName, QKVBiasName: string;
+  Hidden, BlockCnt, MaxBlockPos, StackCnt, MaxStackPos: integer;
+  Block: TQwen3VLVisionBlockLayers;
+  TensorPos, MaxTensorPos, PrefixTensorCount, ExpectedTensorCount: integer;
+  QKVSlab, QKVSlabArg: TNNetVolume;
+begin
+  Hidden := Vision.Hidden;
+  QKVSlab := nil;
+  // 12 tensors per block, 6 per merger, patch embed weight + bias, pos_embed.
+  ExpectedTensorCount := 12 * Length(Tower.Blocks) +
+    6 * (1 + Length(Tower.DeepStack)) + 3;
+  PrefixTensorCount := 0;
+  MaxTensorPos := Reader.Count - 1;
+  for TensorPos := 0 to MaxTensorPos do
+    if Pos(Prefix, Reader.TensorName(TensorPos)) = 1 then
+      Inc(PrefixTensorCount);
+  if PrefixTensorCount <> ExpectedTensorCount then
+    ImportError(csQwen3VLVisionImporter + ': the checkpoint has ' +
+      IntToStr(PrefixTensorCount) + ' "' + Prefix + '*" tensors, the config ' +
+      'describes ' + IntToStr(ExpectedTensorCount) + '.');
+  LoadQwen3VLPatchEmbedWeights(Reader, Tower.PatchEmbed,
+    Prefix + 'patch_embed.proj.weight', Prefix + 'patch_embed.proj.bias',
+    Vision);
+  MaxBlockPos := Length(Tower.Blocks) - 1;
+  try
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      BlockPrefix := Prefix + 'blocks.' + IntToStr(BlockCnt) + '.';
+      Block := Tower.Blocks[BlockCnt];
+      LoadQwen3VLVisionNorm(Reader, Block.Norm1, BlockPrefix + 'norm1.',
+        Hidden);
+      // qkv rows: q | k | v, each head-major. q and k go from rotate-half to
+      // the interleaved pairs of TNNetAxialRotaryEmbedding.
+      QKVName := BlockPrefix + 'attn.qkv.weight';
+      QKVBiasName := BlockPrefix + 'attn.qkv.bias';
+      // Readers with no row view decode the whole slab per slice: stage it
+      // once for those; row-streamable readers keep the streaming path.
+      QKVSlabArg := nil;
+      if Reader.HasTensor(QKVName) and
+         (not Reader.CanStreamTensorRows(QKVName)) then
+      begin
+        if QKVSlab = nil then QKVSlab := TNNetVolume.Create;
+        StageTensorSlabFlat(Reader, QKVName, 3 * Hidden, Hidden, QKVSlab);
+        QKVSlabArg := QKVSlab;
+      end;
+      LoadLlamaLinearWeights(Reader, Block.QProj, QKVName, Hidden, Hidden,
+        0, -1, Vision.HeadDim, QKVBiasName, 1.0, 0, {SrcRowBase=}0,
+        3 * Hidden, false, false, QKVSlabArg);
+      LoadLlamaLinearWeights(Reader, Block.KProj, QKVName, Hidden, Hidden,
+        0, -1, Vision.HeadDim, QKVBiasName, 1.0, 0, {SrcRowBase=}Hidden,
+        3 * Hidden, false, false, QKVSlabArg);
+      LoadLlamaLinearWeights(Reader, Block.VProj, QKVName, Hidden, Hidden,
+        0, -1, 0, QKVBiasName, 1.0, 0, {SrcRowBase=}2 * Hidden,
+        3 * Hidden, false, false, QKVSlabArg);
+      LoadQwen3VLVisionLinear(Reader, Block.OutProj,
+        BlockPrefix + 'attn.proj.', Hidden, Hidden);
+      LoadQwen3VLVisionNorm(Reader, Block.Norm2, BlockPrefix + 'norm2.',
+        Hidden);
+      LoadQwen3VLVisionLinear(Reader, Block.Fc1,
+        BlockPrefix + 'mlp.linear_fc1.', Hidden, Vision.IntermediateSize);
+      LoadQwen3VLVisionLinear(Reader, Block.Fc2,
+        BlockPrefix + 'mlp.linear_fc2.', Vision.IntermediateSize, Hidden);
+    end;
+  finally
+    QKVSlab.Free;
+  end;
+  LoadQwen3VLVisionMergerWeights(Reader, Tower.Merger, Vision,
+    Prefix + 'merger.', {PostShuffleNorm=}false);
+  MaxStackPos := Length(Tower.DeepStack) - 1;
+  for StackCnt := 0 to MaxStackPos do
+    LoadQwen3VLVisionMergerWeights(Reader, Tower.DeepStack[StackCnt], Vision,
+      Prefix + 'deepstack_merger_list.' + IntToStr(StackCnt) + '.',
+      {PostShuffleNorm=}true);
+end;
+
+{ TQwen3VLVisionTower }
+
+constructor TQwen3VLVisionTower.Create(const TextEncoderFolder: string;
+  const ProcessorConfigFile: string);
+var
+  Folder, ProcessorFile: string;
+  ModelConfig: TQwen3VLConfig;
+  ProcessorConfig: TQwen3VLImageProcessorConfig;
+  Reader: TNNetSafeTensorsReader;
+begin
+  Folder := IncludeTrailingPathDelimiter(TextEncoderFolder);
+  ModelConfig := ReadQwen3VLConfigFromJSONFile(Folder + 'config.json');
+  if ProcessorConfigFile <> '' then ProcessorFile := ProcessorConfigFile
+  else
+  begin
+    ProcessorFile := ExpandFileName(Folder + '..' + DirectorySeparator +
+      'processor' + DirectorySeparator + 'preprocessor_config.json');
+    if not FileExists(ProcessorFile) then
+    begin
+      if not FileExists(ExtractFilePath(ProcessorFile) +
+        'processor_config.json') then
+        ImportError(csQwen3VLVisionImporter + ': image processor config "' +
+          ProcessorFile + '" not found, nor processor_config.json beside it; ' +
+          'pass its path as ProcessorConfigFile.');
+      ProcessorFile := ExtractFilePath(ProcessorFile) + 'processor_config.json';
+    end;
+  end;
+  ProcessorConfig := ReadQwen3VLImageProcessorConfig(ProcessorFile,
+    ModelConfig.Vision);
+  Reader := CreatePretrainedTensorReader(
+    SafeTensorsFolderWeightsFile(Folder, 'model'));
+  try
+    CreateFromReader(Reader, ModelConfig.Vision, ProcessorConfig);
+  finally
+    Reader.Free;
+  end;
+end;
+
+constructor TQwen3VLVisionTower.CreateFromReader(
+  Reader: TNNetSafeTensorsReader; const Config: TQwen3VLVisionConfig;
+  const Processor: TQwen3VLImageProcessorConfig; const Prefix: string);
+begin
+  inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
+  FShareHostOutputs := GetEnvironmentVariable('NEURAL_SHARE_HOST_OUTPUTS') <> '0';
+  FConfig := Config;
+  FProcessor := Processor;
+  if Config.Depth < 1 then
+    ImportError(csQwen3VLVisionImporter + ': the config has no ' +
+      'vision_config.');
+  if (Processor.PatchSize <> Config.PatchSize) or
+     (Processor.MergeSize <> Config.SpatialMergeSize) or
+     (Processor.TemporalPatchSize <> Config.TemporalPatchSize) or
+     (Config.InChannels <> 3) then
+    ImportError(csQwen3VLVisionImporter + ': the processor patch/merge/' +
+      'temporal sizes (' + IntToStr(Processor.PatchSize) + '/' +
+      IntToStr(Processor.MergeSize) + '/' +
+      IntToStr(Processor.TemporalPatchSize) + ') differ from the vision ' +
+      'config (' + IntToStr(Config.PatchSize) + '/' +
+      IntToStr(Config.SpatialMergeSize) + '/' +
+      IntToStr(Config.TemporalPatchSize) + '), or in_channels <> 3.');
+  FPositionTable := TNNetVolume.Create();
+  FPositionRows := TNNetVolume.Create();
+  FPatches := TNNetVolume.Create();
+  LoadFromReader(Reader, Prefix);
+end;
+
+destructor TQwen3VLVisionTower.Destroy();
+begin
+  ReleaseNet();
+  FWeightOwner.Free;
+  FPatches.Free;
+  FPositionRows.Free;
+  FPositionTable.Free;
+  inherited Destroy();
+end;
+
+procedure TQwen3VLVisionTower.LoadFromReader(Reader: TNNetSafeTensorsReader;
+  const Prefix: string);
+var
+  TableName: string;
+begin
+  FWeightOwner := TNNet.Create();
+  BuildQwen3VLVisionTowerNet(FWeightOwner, FConfig, FConfig.SpatialMergeSize,
+    FConfig.SpatialMergeSize, FWeightOwnerLayers);
+  LoadQwen3VLVisionTowerWeights(Reader, FWeightOwnerLayers, FConfig, Prefix);
+  TableName := Prefix + 'pos_embed.weight';
+  if (Reader.DimCount(TableName) <> 2) or
+     (Reader.DimSize(TableName, 0) <> FConfig.NumPositionEmbeddings) or
+     (Reader.DimSize(TableName, 1) <> FConfig.Hidden) then
+    ImportError(csQwen3VLVisionImporter + ': "' + TableName + '" must have ' +
+      'shape [' + IntToStr(FConfig.NumPositionEmbeddings) + ', ' +
+      IntToStr(FConfig.Hidden) + '], got ' + Reader.ShapeAsString(TableName));
+  // LoadTensorFlat leaves (count,1,1); ReSize keeps the data at equal size.
+  Reader.LoadTensorFlat(TableName, FPositionTable);
+  FPositionTable.ReSize(FConfig.NumPositionEmbeddings, 1, FConfig.Hidden);
+end;
+
+procedure TQwen3VLVisionTower.PrepareNet(GridH, GridW: integer);
+var
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  BlockCnt, MaxBlockPos: integer;
+begin
+  if Assigned(FNet) and (GridH = FNetGridH) and (GridW = FNetGridW) then
+    exit;
+  ReleaseNet();
+  BuildQwen3VLVisionPositions(GridH, GridW, FConfig.SpatialMergeSize, PosH,
+    PosW);
+  FNet := TNNet.Create();
+  FNet.BuildWeightOwner := FWeightOwner;
+  BuildQwen3VLVisionTowerNet(FNet, FConfig, GridH, GridW, FNetLayers);
+  FNet.BuildWeightOwner := nil;
+  PosF := nil;
+  SetLength(PosF, Length(PosH));
+  MaxBlockPos := FConfig.Depth - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FNetLayers.Blocks[BlockCnt].QRope.SetPositions(PosF, PosH, PosW);
+    FNetLayers.Blocks[BlockCnt].KRope.SetPositions(PosF, PosH, PosW);
+  end;
+  Qwen3VLInterpolatePositionTable(FPositionTable, GridH, GridW,
+    FConfig.SpatialMergeSize, FPositionRows);
+  PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
+  FNet.ShareHostOutputsByLiveness := FShareHostOutputs;
+  FNetGridH := GridH;
+  FNetGridW := GridW;
+end;
+
+procedure TQwen3VLVisionTower.ReleaseNet();
+begin
+  FreeAndNil(FNet);
+  FNetLayers := Default(TQwen3VLVisionTowerLayers);
+  FNetGridH := 0;
+  FNetGridW := 0;
+end;
+
+procedure TQwen3VLVisionTower.Encode(Image, Merged: TNNetVolume;
+  const DeepStack: array of TNNetVolume);
+var
+  GridH, GridW: integer;
+begin
+  Qwen3VLPreprocessImage(Image, FProcessor, FPatches, GridH, GridW);
+  EncodePatches(FPatches, GridH, GridW, Merged, DeepStack);
+end;
+
+procedure TQwen3VLVisionTower.EncodePatches(Patches: TNNetVolume;
+  GridH, GridW: integer; Merged: TNNetVolume;
+  const DeepStack: array of TNNetVolume);
+var
+  BlockCnt, MaxBlockPos, StackCnt, MaxStackPos: integer;
+begin
+  if Length(DeepStack) <> Length(FConfig.DeepStackIndexes) then
+    ImportError(csQwen3VLVisionImporter + ': ' + IntToStr(Length(DeepStack)) +
+      ' DeepStack volumes for ' + IntToStr(Length(FConfig.DeepStackIndexes)) +
+      ' deepstack_visual_indexes.');
+  if (Patches.SizeX <> GridH * GridW) or (Patches.SizeY <> 1) or
+     (Patches.Depth <> FConfig.InChannels * FConfig.PatchSize *
+       FConfig.PatchSize) then
+    ImportError(csQwen3VLVisionImporter + ': the patches are ' +
+      IntToStr(Patches.SizeX) + 'x' + IntToStr(Patches.SizeY) + 'x' +
+      IntToStr(Patches.Depth) + ', expected ' + IntToStr(GridH * GridW) +
+      'x1x' + IntToStr(FConfig.InChannels * FConfig.PatchSize *
+      FConfig.PatchSize) + '.');
+  PrepareNet(GridH, GridW);
+  FNetLayers.PositionInput.Output.Copy(FPositionRows);
+  MaxBlockPos := FConfig.Depth - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    FNetLayers.Blocks[BlockCnt].Attn.TruncateCache(0);
+  FNet.Compute(Patches, 0, FParallel);
+  FNetLayers.Merger.Fc2.ForceOutputOnRAM();
+  Merged.Copy(FNetLayers.Merger.Fc2.Output);
+  MaxStackPos := Length(DeepStack) - 1;
+  for StackCnt := 0 to MaxStackPos do
+  begin
+    FNetLayers.DeepStack[StackCnt].Fc2.ForceOutputOnRAM();
+    DeepStack[StackCnt].Copy(FNetLayers.DeepStack[StackCnt].Fc2.Output);
+  end;
 end;
 
 constructor TQwenImage21Transformer.Create(const TransformerFolder: string;

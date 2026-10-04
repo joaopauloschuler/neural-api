@@ -821,6 +821,11 @@ type
     procedure TestQwenImage21SizeForAspect;
     procedure TestQwenImage21Img2ImgParity;
     procedure TestQwenImage21Img2ImgKeepLoaded;
+    procedure TestQwen3VLVisionConfig;
+    procedure TestQwen3VLVisionPreprocessParity;
+    procedure TestQwen3VLVisionRope;
+    procedure TestQwen3VLVisionTensorSet;
+    procedure TestQwen3VLVisionTowerParity;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -31325,6 +31330,577 @@ begin
     LatentsOneShot.Free;
     InitImage.Free;
     Embeds.Free;
+  end;
+end;
+
+// An RGB or RGBA uint8 image of tiny_qwenimage21_vision_io.json: value
+// ((i * 7919 + 13) mod 256) at row-major (y, x, channel) index i.
+procedure FillQwen3VLVisionFormulaImage(Dest: TNNetVolume; ImageW,
+  ImageH, Channels: integer);
+var
+  ValuePos, MaxValuePos: integer;
+begin
+  // (W, H, C) volumes are (y, x, channel) row-major already.
+  Dest.ReSize(ImageW, ImageH, Channels);
+  MaxValuePos := Dest.Size - 1;
+  for ValuePos := 0 to MaxValuePos do
+    Dest.FData[ValuePos] := (int64(ValuePos) * 7919 + 13) mod 256;
+end;
+
+// vision_config and processor/preprocessor_config.json of the pico folder,
+// the processor config refusals and defaults, and smart_resize vs transformers.
+procedure TTestNeuralPretrained.TestQwen3VLVisionConfig;
+var
+  Config: TQwen3VLConfig;
+  Processor: TQwen3VLImageProcessorConfig;
+  RefJson, ConfigJson: TStringList;
+  RefRoot, ConfigRoot: TJSONData;
+  Cases: TJSONArray;
+  CaseObj, VisionObj: TJSONObject;
+  CasePos, ResizedH, ResizedW, RopeCase: integer;
+  MissingFile, TempFile, TempRoot, ErrorText: string;
+  Tower: TQwen3VLVisionTower;
+  Failed: boolean;
+begin
+  Config := ReadQwen3VLConfigFromJSONFile(
+    FixturePath('tiny_qwenimage21/text_encoder/config.json'));
+  AssertEquals('depth', 3, Config.Vision.Depth);
+  AssertEquals('hidden', 32, Config.Vision.Hidden);
+  AssertEquals('heads', 2, Config.Vision.NumHeads);
+  AssertEquals('head dim', 16, Config.Vision.HeadDim);
+  AssertEquals('intermediate', 48, Config.Vision.IntermediateSize);
+  AssertEquals('patch', 16, Config.Vision.PatchSize);
+  AssertEquals('temporal patch', 2, Config.Vision.TemporalPatchSize);
+  AssertEquals('merge', 2, Config.Vision.SpatialMergeSize);
+  AssertEquals('position table', 9, Config.Vision.NumPositionEmbeddings);
+  AssertEquals('out hidden', 64, Config.Vision.OutHidden);
+  AssertEquals('deepstack count', 2, Length(Config.Vision.DeepStackIndexes));
+  AssertEquals('deepstack 0', 0, Config.Vision.DeepStackIndexes[0]);
+  AssertEquals('deepstack 1', 2, Config.Vision.DeepStackIndexes[1]);
+  AssertTrue('tanh GELU', Config.Vision.HiddenAct = chaGeluTanh);
+  AssertEquals('rope theta', 10000, Config.Vision.RopeTheta, 1e-3);
+  Processor := ReadQwen3VLImageProcessorConfig(
+    FixturePath('tiny_qwenimage21/processor/preprocessor_config.json'),
+    Config.Vision);
+  AssertEquals('mean[1]', 0.45, Processor.ImageMean[1], 1e-7);
+  AssertEquals('std[2]', 0.35, Processor.ImageStd[2], 1e-7);
+  AssertEquals('min pixels', 1024, Processor.MinPixels);
+  AssertEquals('max pixels', 16777216, Processor.MaxPixels);
+  AssertEquals('processor patch', 16, Processor.PatchSize);
+  MissingFile := ExtractFilePath(FixturePath(
+    'tiny_qwenimage21/processor/preprocessor_config.json')) + 'missing.json';
+  ErrorText := '';
+  try
+    ReadQwen3VLImageProcessorConfig(MissingFile, Config.Vision);
+  except
+    on E: EPretrainedImportError do ErrorText := E.Message;
+  end;
+  AssertTrue('a missing processor config is refused, naming it: ' + ErrorText,
+    Pos(MissingFile, ErrorText) > 0);
+  // processor_config.json nests the image processor; absent keys keep the
+  // Qwen2VLImageProcessor defaults.
+  TempFile := WriteTempJSON('{"image_processor": {"image_std": ' +
+    '[0.5, 0.5, 0.5], "merge_size": 2}, "video_processor": {}}');
+  Processor := ReadQwen3VLImageProcessorConfig(TempFile, Config.Vision);
+  AssertEquals('nested std[2]', 0.5, Processor.ImageStd[2], 1e-7);
+  // The tower looks in <text_encoder>/../processor: preprocessor_config.json,
+  // else processor_config.json; with neither it names the first.
+  TempRoot := GetTempDir(false) + 'cai_qwen3vl_' + IntToStr(Random(1000000));
+  ForceDirectories(TempRoot + '/text_encoder');
+  ForceDirectories(TempRoot + '/processor');
+  Tower := nil;
+  try
+    CopyFileTo(FixturePath('tiny_qwenimage21/text_encoder/config.json'),
+      TempRoot + '/text_encoder/config.json');
+    CopyFileTo(FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'),
+      TempRoot + '/text_encoder/model.safetensors');
+    // A run killed before its cleanup could have left these behind.
+    DeleteFile(TempRoot + '/processor/preprocessor_config.json');
+    DeleteFile(TempRoot + '/processor/processor_config.json');
+    ErrorText := '';
+    try
+      TQwen3VLVisionTower.Create(TempRoot + '/text_encoder').Free;
+    except
+      on E: EPretrainedImportError do ErrorText := E.Message;
+    end;
+    AssertTrue('a tower without a processor config names the expected ' +
+      'path: ' + ErrorText, Pos(ExpandFileName(TempRoot +
+      '/processor/preprocessor_config.json'), ErrorText) > 0);
+    CopyFileTo(TempFile, TempRoot + '/processor/processor_config.json');
+    Tower := TQwen3VLVisionTower.Create(TempRoot + '/text_encoder');
+    AssertEquals('processor_config.json std[2]', 0.5,
+      Tower.Processor.ImageStd[2], 1e-7);
+  finally
+    Tower.Free;
+    DeleteFile(TempRoot + '/processor/processor_config.json');
+    DeleteFile(TempRoot + '/text_encoder/model.safetensors');
+    DeleteFile(TempRoot + '/text_encoder/config.json');
+    RemoveDir(TempRoot + '/processor');
+    RemoveDir(TempRoot + '/text_encoder');
+    RemoveDir(TempRoot);
+    DeleteFile(TempFile);
+  end;
+  AssertEquals('default mean[0]', 0.48145466, Processor.ImageMean[0], 1e-7);
+  AssertEquals('default min pixels', 56 * 56, Processor.MinPixels);
+  AssertEquals('default max pixels', 28 * 28 * 1280, Processor.MaxPixels);
+  AssertEquals('default patch from the vision config', 16,
+    Processor.PatchSize);
+  // "default" and "axial" are the axial RoPE, anything else raises; HF's key
+  // precedence: rope_scaling (when not empty), then rope_parameters.
+  ConfigJson := TStringList.Create;
+  ConfigRoot := nil;
+  try
+    ConfigJson.LoadFromFile(
+      FixturePath('tiny_qwenimage21/text_encoder/config.json'));
+    ConfigRoot := GetJSON(ConfigJson.Text);
+    VisionObj := TJSONObject(TJSONObject(ConfigRoot).Find('vision_config'));
+    for RopeCase := 0 to 5 do
+    begin
+      if VisionObj.Find('rope_parameters') <> nil then
+        VisionObj.Delete('rope_parameters');
+      if VisionObj.Find('rope_scaling') <> nil then
+        VisionObj.Delete('rope_scaling');
+      case RopeCase of
+        0: VisionObj.Add('rope_parameters', GetJSON(
+             '{"rope_type": "default", "rope_theta": 500.0}'));
+        1: VisionObj.Add('rope_parameters', GetJSON('{"type": "axial"}'));
+        2: VisionObj.Add('rope_parameters', GetJSON('{"rope_type": "yarn"}'));
+        3: VisionObj.Add('rope_parameters', GetJSON('{"type": "yarn"}'));
+        4: begin // rope_scaling wins over rope_parameters
+             VisionObj.Add('rope_scaling', GetJSON('{"rope_type": "axial"}'));
+             VisionObj.Add('rope_parameters', GetJSON('{"rope_type": "yarn"}'));
+           end;
+        5: begin // an empty rope_scaling falls through, as HF's "or" does
+             VisionObj.Add('rope_scaling', GetJSON('{}'));
+             VisionObj.Add('rope_parameters', GetJSON('{"rope_type": "yarn"}'));
+           end;
+      end;
+      TempFile := WriteTempJSON(ConfigRoot.AsJSON);
+      Failed := false;
+      try
+        try
+          Config := ReadQwen3VLConfigFromJSONFile(TempFile);
+        except
+          on EPretrainedImportError do Failed := true;
+        end;
+      finally
+        DeleteFile(TempFile);
+      end;
+      AssertEquals('rope case ' + IntToStr(RopeCase) + ' refused',
+        RopeCase in [2, 3, 5], Failed);
+      if RopeCase = 0 then
+        AssertEquals('rope_parameters theta', 500, Config.Vision.RopeTheta,
+          1e-3);
+    end;
+  finally
+    ConfigRoot.Free;
+    ConfigJson.Free;
+  end;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vision_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('smart_resize'));
+    AssertTrue('smart_resize cases', Cases.Count >= 6);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      Qwen3VLSmartResize(CaseObj.Get('height', 0), CaseObj.Get('width', 0),
+        CaseObj.Get('factor', 0), CaseObj.Get('min_pixels', int64(0)),
+        CaseObj.Get('max_pixels', int64(0)), ResizedH, ResizedW);
+      AssertEquals('smart_resize case ' + IntToStr(CasePos) + ' height',
+        TJSONArray(CaseObj.Find('result')).Integers[0], ResizedH);
+      AssertEquals('smart_resize case ' + IntToStr(CasePos) + ' width',
+        TJSONArray(CaseObj.Find('result')).Integers[1], ResizedW);
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// White composite, rescale, mean/std and block-major patches against
+// Qwen2VLImageProcessorPil on the 96x64 RGBA and the 32x32 RGB image, and the
+// patch positions of every oracle image.
+procedure TTestNeuralPretrained.TestQwen3VLVisionPreprocessParity;
+var
+  Config: TQwen3VLConfig;
+  Processor: TQwen3VLImageProcessorConfig;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Images: TJSONArray;
+  ImageObj: TJSONObject;
+  Image, Patches, Expected: TNNetVolume;
+  PosH, PosW: TNeuralIntegerArray;
+  ImagePos, GridH, GridW, PatchPos: integer;
+  MaxDiff: double;
+  Failed: boolean;
+begin
+  Config := ReadQwen3VLConfigFromJSONFile(
+    FixturePath('tiny_qwenimage21/text_encoder/config.json'));
+  Processor := ReadQwen3VLImageProcessorConfig(
+    FixturePath('tiny_qwenimage21/processor/preprocessor_config.json'),
+    Config.Vision);
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Image := TNNetVolume.Create;
+  Patches := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vision_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Images := TJSONArray(TJSONObject(RefRoot).Find('images'));
+    AssertEquals('oracle images', 3, Images.Count);
+    for ImagePos := 0 to Images.Count - 1 do
+    begin
+      ImageObj := TJSONObject(Images.Items[ImagePos]);
+      FillQwen3VLVisionFormulaImage(Image, ImageObj.Get('width', 0),
+        ImageObj.Get('height', 0), ImageObj.Get('channels', 0));
+      Qwen3VLPreprocessImage(Image, Processor, Patches, GridH, GridW);
+      AssertEquals('grid h', TJSONArray(ImageObj.Find('grid_thw')).Integers[1],
+        GridH);
+      AssertEquals('grid w', TJSONArray(ImageObj.Find('grid_thw')).Integers[2],
+        GridW);
+      BuildQwen3VLVisionPositions(GridH, GridW, 2, PosH, PosW);
+      LoadOracleTokenTensor(ImageObj, 'position_ids', Expected);
+      for PatchPos := 0 to GridH * GridW - 1 do
+      begin
+        AssertEquals('row of patch ' + IntToStr(PatchPos),
+          Round(Expected.FData[2 * PatchPos]), PosH[PatchPos]);
+        AssertEquals('col of patch ' + IntToStr(PatchPos),
+          Round(Expected.FData[2 * PatchPos + 1]), PosW[PatchPos]);
+      end;
+      if ImageObj.Find('pixel_values_frame0') = nil then continue;
+      LoadOracleTokenTensor(ImageObj, 'pixel_values_frame0', Expected);
+      AssertEquals('patch row count', Expected.SizeX, Patches.SizeX);
+      AssertEquals('patch row depth', Expected.Depth, Patches.Depth);
+      MaxDiff := MaxAbsVolumeDiff(Patches, Expected);
+      AssertTrue('pixel values: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 2e-6', MaxDiff < 2e-6);
+    end;
+    // 80 pixels is 2.5 groups of 32: smart_resize changes it, so it is refused.
+    FillQwen3VLVisionFormulaImage(Image, 80, 64, 4);
+    Failed := false;
+    try
+      Qwen3VLPreprocessImage(Image, Processor, Patches, GridH, GridW);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a size smart_resize would change is refused', Failed);
+  finally
+    Expected.Free;
+    Patches.Free;
+    Image.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// 2-D vision RoPE: rotate-half q at the block-major (row, col) positions
+// equals TNNetAxialRotaryEmbedding(theta, 0, hd/4, hd/4) on the q rows the
+// loader's rotate-half -> interleaved permutation produces.
+procedure TTestNeuralPretrained.TestQwen3VLVisionRope;
+const
+  HeadCount = 2;
+  HeadDim = 16;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Images: TJSONArray;
+  ImageObj: TJSONObject;
+  NN: TNNet;
+  Rope: TNNetAxialRotaryEmbedding;
+  Query, Rotated, Interleaved, Actual: TNNetVolume;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  ImagePos, GridH, GridW, PatchCnt, HeadCnt, PairCnt, HalfDim: integer;
+  RowBase: integer;
+  MaxDiff: double;
+begin
+  HalfDim := HeadDim div 2;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  NN := nil;
+  Query := TNNetVolume.Create;
+  Rotated := TNNetVolume.Create;
+  Interleaved := TNNetVolume.Create;
+  Actual := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vision_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Images := TJSONArray(TJSONObject(RefRoot).Find('images'));
+    for ImagePos := 0 to Images.Count - 1 do
+    begin
+      ImageObj := TJSONObject(Images.Items[ImagePos]);
+      GridH := TJSONArray(ImageObj.Find('grid_thw')).Integers[1];
+      GridW := TJSONArray(ImageObj.Find('grid_thw')).Integers[2];
+      LoadOracleTokenTensor(ImageObj, 'rope_query', Query);
+      LoadOracleTokenTensor(ImageObj, 'rope_rotated', Rotated);
+      AssertEquals('query width', HeadCount * HeadDim, Query.Depth);
+      Interleaved.ReSize(Query);
+      for PatchCnt := 0 to Query.SizeX - 1 do
+        for HeadCnt := 0 to HeadCount - 1 do
+        begin
+          RowBase := PatchCnt * Query.Depth + HeadCnt * HeadDim;
+          for PairCnt := 0 to HalfDim - 1 do
+          begin
+            Interleaved.FData[RowBase + 2 * PairCnt] :=
+              Query.FData[RowBase + PairCnt];
+            Interleaved.FData[RowBase + 2 * PairCnt + 1] :=
+              Query.FData[RowBase + PairCnt + HalfDim];
+          end;
+        end;
+      NN := TNNet.Create();
+      NN.AddLayer(TNNetInput.Create(Query.SizeX, 1, Query.Depth));
+      Rope := TNNetAxialRotaryEmbedding.Create(10000, 0, HeadDim div 4,
+        HeadDim div 4, HeadDim);
+      NN.AddLayer(Rope);
+      BuildQwen3VLVisionPositions(GridH, GridW, 2, PosH, PosW);
+      PosF := nil;
+      SetLength(PosF, Length(PosH));
+      Rope.SetPositions(PosF, PosH, PosW);
+      NN.Compute(Interleaved);
+      Actual.ReSize(Query);
+      for PatchCnt := 0 to Query.SizeX - 1 do
+        for HeadCnt := 0 to HeadCount - 1 do
+        begin
+          RowBase := PatchCnt * Query.Depth + HeadCnt * HeadDim;
+          for PairCnt := 0 to HalfDim - 1 do
+          begin
+            Actual.FData[RowBase + PairCnt] :=
+              Rope.Output.FData[RowBase + 2 * PairCnt];
+            Actual.FData[RowBase + PairCnt + HalfDim] :=
+              Rope.Output.FData[RowBase + 2 * PairCnt + 1];
+          end;
+        end;
+      MaxDiff := MaxAbsVolumeDiff(Actual, Rotated);
+      AssertTrue(IntToStr(GridH) + 'x' + IntToStr(GridW) +
+        ' rotated q: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-5',
+        MaxDiff < 1e-5);
+      FreeAndNil(NN);
+    end;
+  finally
+    NN.Free;
+    Actual.Free;
+    Interleaved.Free;
+    Rotated.Free;
+    Query.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Every model.visual.* tensor of the pico checkpoint lands in the weight
+// owner (patch embed folded to one frame, pos_embed on the host); the grid net
+// borrows them; a missing or extra tensor is refused.
+procedure TTestNeuralPretrained.TestQwen3VLVisionTensorSet;
+const
+  WeightsFile = 'tiny_qwenimage21/text_encoder/model.safetensors';
+var
+  Config: TQwen3VLConfig;
+  Processor: TQwen3VLImageProcessorConfig;
+  Reader: TNNetSafeTensorsReader;
+  Tower: TQwen3VLVisionTower;
+  TensorName: string;
+  TensorPos, VisionTensorCount, StackCase: integer;
+  ExpectedWeights: int64;
+  Failed: boolean;
+begin
+  Reader := nil;
+  Tower := nil;
+  try
+    Config := ReadQwen3VLConfigFromJSONFile(
+      FixturePath('tiny_qwenimage21/text_encoder/config.json'));
+    Processor := ReadQwen3VLImageProcessorConfig(
+      FixturePath('tiny_qwenimage21/processor/preprocessor_config.json'),
+      Config.Vision);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(WeightsFile));
+    ExpectedWeights := 0;
+    VisionTensorCount := 0;
+    for TensorPos := 0 to Reader.Count - 1 do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      if Pos('model.visual.', TensorName) <> 1 then continue;
+      Inc(VisionTensorCount);
+      if TensorName = 'model.visual.pos_embed.weight' then continue;
+      if TensorName = 'model.visual.patch_embed.proj.weight' then
+        Inc(ExpectedWeights, Reader.ElementCount(TensorName) div 2)
+      // Linear biases are neuron biases; LayerNorm betas are a weight row.
+      else if (Pos('.bias', TensorName) = 0) or
+        (Pos('norm', TensorName) > 0) then
+        Inc(ExpectedWeights, Reader.ElementCount(TensorName));
+    end;
+    AssertEquals('vision tensors: 3 + 3*12 + 3*6', 57, VisionTensorCount);
+    Tower := TQwen3VLVisionTower.CreateFromReader(Reader, Config.Vision,
+      Processor);
+    AssertEquals('weights allocated = checkpoint, one patch-embed frame',
+      ExpectedWeights, Tower.WeightOwner.CountWeights());
+    Tower.PrepareNet(4, 6);
+    AssertEquals('the grid net borrows every weight', 0,
+      Tower.Net.CountWeights());
+    AssertEquals('merged rows', 6, Tower.Net.GetLastLayer().Output.SizeX);
+    AssertEquals('merged depth', 64, Tower.Net.GetLastLayer().Output.Depth);
+    AssertEquals('position rows', 24, Tower.PositionRows.SizeX);
+    AssertTrue('the blocks share one K/V cache storage',
+      Tower.NetLayers.Blocks[2].Attn.CacheStorageSharedWith(
+      Tower.NetLayers.Blocks[0].Attn));
+    Failed := false;
+    try
+      Tower.PrepareNet(4, 5);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a grid side that is not a multiple of the merge is refused',
+      Failed);
+    FreeAndNil(Tower);
+    Reader.RenameTensor('model.visual.blocks.2.norm2.bias',
+      'model.visual.blocks.2.norm3.bias');
+    Failed := false;
+    try
+      TQwen3VLVisionTower.CreateFromReader(Reader, Config.Vision,
+        Processor).Free;
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a missing tensor is refused', Failed);
+    Reader.RenameTensor('model.visual.blocks.2.norm3.bias',
+      'model.visual.blocks.2.norm2.bias');
+    Dec(Config.Vision.Depth);
+    Config.Vision.DeepStackIndexes[1] := 1;
+    Failed := false;
+    try
+      TQwen3VLVisionTower.CreateFromReader(Reader, Config.Vision,
+        Processor).Free;
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a checkpoint with an unused block is refused', Failed);
+    Inc(Config.Vision.Depth);
+    for StackCase := 0 to 1 do
+    begin
+      Config.Vision.DeepStackIndexes[0] := 2;
+      Config.Vision.DeepStackIndexes[1] := 2 * StackCase;
+      Failed := false;
+      try
+        TQwen3VLVisionTower.CreateFromReader(Reader, Config.Vision,
+          Processor).Free;
+      except
+        on EPretrainedImportError do Failed := true;
+      end;
+      AssertTrue('deepstack_visual_indexes [2, ' + IntToStr(2 * StackCase) +
+        '] is refused', Failed);
+    end;
+  finally
+    Tower.Free;
+    Reader.Free;
+  end;
+end;
+
+// The pico tower against transformers' Qwen3VLVisionModel in float64:
+// interpolated position rows, block 0, both DeepStack features and the
+// merged tokens of a square and a non-square image; encoding the first image
+// again (rebuilt net, rewound caches) repeats it, with shared host outputs and
+// on the serial path.
+procedure TTestNeuralPretrained.TestQwen3VLVisionTowerParity;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Images, DeepStackArr: TJSONArray;
+  ImageObj: TJSONObject;
+  Tower: TQwen3VLVisionTower;
+  Image, Merged, FirstMerged, Expected: TNNetVolume;
+  DeepStack: array[0..1] of TNNetVolume;
+  ImagePos, StackPos: integer;
+  ImageLabel: string;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Tower := nil;
+  Image := TNNetVolume.Create;
+  Merged := TNNetVolume.Create;
+  FirstMerged := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  DeepStack[0] := TNNetVolume.Create;
+  DeepStack[1] := TNNetVolume.Create;
+  try
+    Tower := TQwen3VLVisionTower.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/text_encoder/config.json')));
+    AssertEquals('processor read from ../processor', 0.45,
+      Tower.Processor.ImageMean[1], 1e-7);
+    // Block 0's output is read after the forward: no host output sharing.
+    Tower.ShareHostOutputs := false;
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vision_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Images := TJSONArray(TJSONObject(RefRoot).Find('images'));
+    for ImagePos := 0 to Images.Count - 1 do
+    begin
+      ImageObj := TJSONObject(Images.Items[ImagePos]);
+      ImageLabel := IntToStr(ImageObj.Get('width', 0)) + 'x' +
+        IntToStr(ImageObj.Get('height', 0));
+      AssertTrue(ImageLabel + ' oracle vs native transformers < 1e-6',
+        ImageObj.Get('native_hf_maxabs_diff', 1.0) < 1e-6);
+      FillQwen3VLVisionFormulaImage(Image, ImageObj.Get('width', 0),
+        ImageObj.Get('height', 0), ImageObj.Get('channels', 0));
+      Tower.Encode(Image, Merged, DeepStack);
+      LoadOracleTokenTensor(ImageObj, 'pos_embeds', Expected);
+      MaxDiff := MaxAbsVolumeDiff(Tower.PositionRows, Expected);
+      AssertTrue(ImageLabel + ' position rows: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+      LoadOracleTokenTensor(ImageObj, 'block0_output', Expected);
+      MaxDiff := MaxAbsVolumeDiff(Tower.NetLayers.Blocks[0].Output.Output,
+        Expected);
+      AssertTrue(ImageLabel + ' block 0: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 2e-5', MaxDiff < 2e-5);
+      DeepStackArr := TJSONArray(ImageObj.Find('deepstack'));
+      AssertEquals('deepstack features', 2, DeepStackArr.Count);
+      for StackPos := 0 to 1 do
+      begin
+        LoadOracleTokenTensorObject(DeepStackArr.Items[StackPos],
+          'deepstack ' + IntToStr(StackPos), Expected);
+        AssertEquals('deepstack rows', Expected.SizeX, DeepStack[StackPos].SizeX);
+        MaxDiff := MaxAbsVolumeDiff(DeepStack[StackPos], Expected);
+        AssertTrue(ImageLabel + ' deepstack ' + IntToStr(StackPos) +
+          ': max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-5',
+          MaxDiff < 1e-5);
+      end;
+      LoadOracleTokenTensor(ImageObj, 'merged', Expected);
+      AssertEquals('merged rows', Expected.SizeX, Merged.SizeX);
+      AssertEquals('merged depth', Expected.Depth, Merged.Depth);
+      MaxDiff := MaxAbsVolumeDiff(Merged, Expected);
+      AssertTrue(ImageLabel + ' merged: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+      if ImagePos = 0 then FirstMerged.Copy(Merged);
+    end;
+    ImageObj := TJSONObject(Images.Items[0]);
+    FillQwen3VLVisionFormulaImage(Image, ImageObj.Get('width', 0),
+      ImageObj.Get('height', 0), ImageObj.Get('channels', 0));
+    Tower.Encode(Image, Merged, DeepStack);
+    AssertEquals('repeated encode', 0, MaxAbsVolumeDiff(Merged, FirstMerged),
+      0);
+    Tower.ShareHostOutputs := true;
+    Tower.ReleaseNet();
+    Tower.Encode(Image, Merged, DeepStack);
+    AssertEquals('shared host outputs', 0,
+      MaxAbsVolumeDiff(Merged, FirstMerged), 0);
+    AssertTrue('host outputs are shared',
+      Tower.Net.HostSharedOutputLayerCount() > 0);
+    Tower.Parallel := false;
+    Tower.ReleaseNet();
+    Tower.Encode(Image, Merged, DeepStack);
+    MaxDiff := MaxAbsVolumeDiff(Merged, FirstMerged);
+    AssertTrue('serial vs parallel merged: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    DeepStack[1].Free;
+    DeepStack[0].Free;
+    Expected.Free;
+    FirstMerged.Free;
+    Merged.Free;
+    Image.Free;
+    Tower.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 
