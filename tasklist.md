@@ -2041,11 +2041,12 @@ rather than acted on.
         256x256, `--int4`, 10 steps -> the image shows a fox. Step time 16.4 s int4,
         34.3 s int8 (was ~162 s int8 single-threaded); load transformer 148 s int4 /
         64 s int8; VAE decode 31 s.
-  - [ ] A8. Docs: README entry for Qwen-Image-2.1 text-to-image on the CPU, listed as
-        user-tested with the exact configuration (256x256, `--int4`, 10 steps, 2026-09-24).
+  - [x] A8. Docs: README entry for Qwen-Image-2.1 text-to-image (no tested-configuration
+        list, user decision 2026-10-04; measured numbers labelled as the user's L4 run).
         Build line and binary path: `cd examples/QwenImage && lazbuild -B QwenImage.lpi`
         writes `bin/x86_64-linux/bin/QwenImage` at the REPO ROOT (the A7 report gave a
         path inside `examples/QwenImage`, which is wrong).
+        DONE: `examples/QwenImage/README.md` (model, build, one-shot + REPL, options, the L4 run, limitations; no tested-configuration table, user decision) + entries in `README.md` and `examples/README.md`.
   - [x] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
         `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
         today's load-and-free order). The text encoder is built once for a maximum
