@@ -2457,7 +2457,7 @@ rather than acted on.
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
   Phase D — example usability (`examples/QwenImage`):
-  - [ ] D1. Defaults int8 weights and 18 steps; `--fp32` asks for FP32.
+  - [x] D1. Defaults int8 weights and 18 steps; `--fp32` asks for FP32.
   - [ ] D2. Step line rewritten in place (`#13` + `ESC[K`) when stdout is a
         terminal; one line per step when it is a pipe or a file.
   - [ ] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,

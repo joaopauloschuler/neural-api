@@ -31,8 +31,8 @@ here but not equal to a diffusers image with the same seed.
 USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
-            [--width 1024] [--height 1024] [--steps 40] [--seed 42]
-            [--int8 | --int4] [--int8-input] [--vae-tile SIZE[,STRIDE]]
+            [--width 1024] [--height 1024] [--steps 18] [--seed 42]
+            [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile]
@@ -176,18 +176,20 @@ begin
     'qwenimage_0002.png, ...');
   WriteLn('  --width N, --height N  pixels, rounded DOWN to a multiple of 32 ',
     '(default 1024)');
-  WriteLn('  --steps N            Euler steps (default 40)');
+  WriteLn('  --steps N            Euler steps (default 18)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
   WriteLn('  --int8               transformer block weights in int8; text ',
-    'encoder weights in int8');
+    'encoder weights in int8 (DEFAULT)');
   WriteLn('  --int4               transformer block weights in Q4_0-style int4 ',
     '(block 32); text encoder weights in int8');
-  WriteLn('                       Without either, both load FP32 (the 7B ',
-    'transformer then runs a slow kernel).');
+  WriteLn('  --fp32               both load FP32 (the 7B transformer then runs ',
+    'a slow kernel)');
+  WriteLn('                       Of --int8, --int4 and --fp32 the last one ',
+    'given wins.');
   WriteLn('                       Norms, embeddings, the transformer''s ',
     'input/output/timestep nets and the VAE stay FP32.');
   WriteLn('  --int8-input         int8 activations into the transformer''s ',
-    'int8/int4 projections (needs --int8 or --int4)');
+    'int8/int4 projections (not with --fp32)');
   WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
     'of 16 (default 256,192)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
@@ -200,11 +202,10 @@ begin
     '--token-ids (default 0)');
   WriteLn('  --gpu                OpenCL for the transformer step pass and ',
     'the VAE decode (DEFAULT when');
-  WriteLn('                       built with -dOpenCL). The step pass needs ',
-    '--int8 or --int4 (FP32');
-  WriteLn('                       weights run it on the CPU). The text ',
-    'encoder and the transformer');
-  WriteLn('                       prefix pass always run on the CPU.');
+  WriteLn('                       built with -dOpenCL). With --fp32 the step ',
+    'pass runs on the CPU.');
+  WriteLn('                       The text encoder and the transformer ',
+    'prefix pass always run on the CPU.');
   WriteLn('  --cpu                run everything on the CPU');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N       OpenCL device index within the platform ',
@@ -347,7 +348,8 @@ var
   ModelFolder, Prompt, OutputFile, TokenList, Arg, TileProblem: string;
   Width, Height, StepCount, DropCount, ArgPos: integer;
   Seed: cardinal;
-  HasPrompt, UseInt8, UseInt4, UseInt8Input, UseSerial, UseProfile: boolean;
+  HasPrompt, UseInt8Input, UseSerial, UseProfile: boolean;
+  WeightFormat: TQwenImage21WeightFormat;
   UseOpenCL, HasSharedKernel: boolean;
   OpenCLPlatform, OpenCLDevice: integer;
   ComputeText: string;
@@ -559,11 +561,10 @@ begin
   TokenList := '';
   Width := 1024;
   Height := 1024;
-  StepCount := 40;
+  StepCount := 18;
   Seed := 42;
   DropCount := 0;
-  UseInt8 := false;
-  UseInt4 := false;
+  WeightFormat := qiwInt8;
   UseInt8Input := false;
   UseSerial := false;
   UseProfile := false;
@@ -589,8 +590,9 @@ begin
     else if Arg = '--height' then Height := StrToIntDef(NextArg(), -1)
     else if Arg = '--steps' then StepCount := StrToInt(NextArg())
     else if Arg = '--seed' then Seed := StrToInt64(NextArg())
-    else if Arg = '--int8' then UseInt8 := true
-    else if Arg = '--int4' then UseInt4 := true
+    else if Arg = '--int8' then WeightFormat := qiwInt8
+    else if Arg = '--int4' then WeightFormat := qiwInt4
+    else if Arg = '--fp32' then WeightFormat := qiwFP32
     else if Arg = '--int8-input' then UseInt8Input := true
     else if Arg = '--serial' then UseSerial := true
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
@@ -638,14 +640,9 @@ begin
     WriteLn('-p and --token-ids are exclusive.');
     Halt(2);
   end;
-  if UseInt8 and UseInt4 then
+  if UseInt8Input and (WeightFormat = qiwFP32) then
   begin
-    WriteLn('--int8 and --int4 are exclusive.');
-    Halt(2);
-  end;
-  if UseInt8Input and not (UseInt8 or UseInt4) then
-  begin
-    WriteLn('--int8-input needs --int8 or --int4.');
+    WriteLn('--int8-input needs int8 or int4 weights, not --fp32.');
     Halt(2);
   end;
   if MaxThreads < 0 then
@@ -665,9 +662,8 @@ begin
   try
   try
     Pipeline := TQwenImage21Pipeline.Create(ModelFolder);
-    if UseInt8 then Pipeline.TransformerFormat := qiwInt8
-    else if UseInt4 then Pipeline.TransformerFormat := qiwInt4;
-    Pipeline.TextEncoderInt8 := UseInt8 or UseInt4;
+    Pipeline.TransformerFormat := WeightFormat;
+    Pipeline.TextEncoderInt8 := WeightFormat <> qiwFP32;
     Pipeline.Int8Input := UseInt8Input;
     Pipeline.VaeTileSize := VaeTileSize;
     Pipeline.VaeTileStride := VaeTileStride;
@@ -697,7 +693,7 @@ begin
         ComputeText := 'OpenCL requested on ' +
           OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
           OpenCLDevices.DeviceNames[OpenCLDevice];
-        if UseInt8 or UseInt4 then
+        if WeightFormat <> qiwFP32 then
           ComputeText := ComputeText + ' (transformer step pass and VAE decode'
         else
           ComputeText := ComputeText + ' (VAE decode; FP32 weights keep the ' +
@@ -721,10 +717,11 @@ begin
     WriteLn('Model      : ', ModelFolder);
     WriteLn('Image      : ', Width, 'x', Height, ' (', (Width div 16) *
       (Height div 16), ' image tokens), ', StepCount, ' steps, seed ', Seed);
-    if UseInt8 then WriteLn('Weights    : transformer int8, text encoder int8')
-    else if UseInt4 then
-      WriteLn('Weights    : transformer int4, text encoder int8')
-    else WriteLn('Weights    : FP32');
+    case WeightFormat of
+      qiwInt8: WriteLn('Weights    : transformer int8, text encoder int8');
+      qiwInt4: WriteLn('Weights    : transformer int4, text encoder int8');
+      qiwFP32: WriteLn('Weights    : FP32 (--fp32)');
+    end;
     WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
     if UseSerial then WriteLn('Threads    : serial (single-threaded)')

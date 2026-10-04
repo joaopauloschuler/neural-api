@@ -27,9 +27,10 @@ The pipeline follows the diffusers `QwenImage21Pipeline`:
 - **VAE decoder** — `TQwenImage21VaeDecoder`, decoding the 64-channel latents
   to RGBA at 16 times the latent width and height, in overlapping tiles.
 
-Weights load as int8 or int4 (`--int8`, `--int4`) or FP32. With an OpenCL
-build (the default), the transformer step pass and the VAE decode run on the
-GPU; the text encoder and the transformer prefix pass always run on the CPU.
+Weights load as int8 by default, or as int4 (`--int4`) or FP32 (`--fp32`).
+With an OpenCL build (the default), the transformer step pass (not with
+`--fp32`) and the VAE decode run on the GPU; the text encoder and the
+transformer prefix pass always run on the CPU.
 `--cpu` runs everything on the CPU, and the program falls back to the CPU by
 itself when it finds no usable OpenCL device.
 
@@ -100,7 +101,7 @@ weights are random, so the image is noise):
 ```
 bin/x86_64-linux/bin/QwenImage --model tests/fixtures/tiny_qwenimage21 \
   --token-ids 11,48,85,122,159,196,233,270,7,44,81,118,155,192 --drop-count 5 \
-  --width 64 --height 64 --steps 2 --int8 --cpu --output p.png
+  --width 64 --height 64 --steps 2 --cpu --output p.png
 ```
 
 ### REPL
@@ -156,15 +157,16 @@ not equal the diffusers image for the same seed.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--model DIR` | the checkpoint folder with `model_index.json` | required |
-| `--int8` | transformer block weights in int8; text encoder weights in int8 | off |
+| `--int8` | transformer block weights in int8; text encoder weights in int8 | on |
 | `--int4` | transformer block weights in Q4_0-style int4 (blocks of 32); text encoder weights in int8 | off |
-| `--int8-input` | int8 activations into the transformer's int8/int4 projections (needs `--int8` or `--int4`) | off |
+| `--fp32` | transformer and text encoder weights in FP32 | off |
+| `--int8-input` | int8 activations into the transformer's int8/int4 projections (not with `--fp32`) | off |
 
-Without `--int8` or `--int4`, both the text encoder and the transformer load
-as FP32, and the 7B transformer then runs a slow kernel; the OpenCL step pass
-also needs `--int8` or `--int4`. The norms, the embeddings, the transformer's
-input, output and timestep nets, and the VAE stay FP32 in every mode.
-`--int8` and `--int4` are exclusive.
+With `--fp32`, both the text encoder and the transformer load as FP32, the 7B
+transformer runs a slow kernel, and the transformer step pass runs on the CPU
+instead of OpenCL. The norms, the embeddings, the transformer's input, output
+and timestep nets, and the VAE stay FP32 in every mode. Of `--int8`, `--int4`
+and `--fp32`, the last one given wins.
 
 ### Prompt and output
 
@@ -180,7 +182,7 @@ input, output and timestep nets, and the VAE stay FP32 in every mode.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
-| `--steps N` | Euler steps | 40 |
+| `--steps N` | Euler steps | 18 |
 | `--seed N` | seed of the initial noise | 42 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
@@ -242,7 +244,8 @@ One run measured by the user on an **NVIDIA L4** (24 GB GPU, machine with
 53 GB RAM): one-shot, 1024x1024, `--int4` (int4 transformer, int8 text
 encoder), 10 steps, VAE tiles 256,192, 12 CPU threads, OpenCL for the
 transformer step pass and the VAE decode. The run predates the latest VAE
-memory work (task B2f in `tasklist.md`).
+memory work (task B2f in `tasklist.md`). The default is int8 weights and 18
+steps; this run used `--int4` and 10 steps.
 
 | Phase | Time |
 | --- | --- |
@@ -257,7 +260,7 @@ memory work (task B2f in `tasklist.md`).
 
 Peak RSS: 12.7 GB.
 
-The default is 40 steps, four times the steps of this run. In the REPL the
+The default is 18 steps, 1.8 times the steps of this run. In the REPL the
 three loads happen once per session instead of once per image.
 
 In the REPL the transformer stays in OpenCL memory while the VAE decodes, so
