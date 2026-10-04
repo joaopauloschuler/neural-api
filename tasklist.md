@@ -2467,16 +2467,48 @@ rather than acted on.
   - [ ] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
         `--stats`, host<->OpenCL MB per step and per VAE tile, peak OpenCL
         bytes, `/profile` and `/stats` REPL toggles.
-  Phase C — editing and reference images:
-  - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
-        features from layers 8/16/24 injected into the LLM (likely 2 tasks).
-  - [ ] C2. VAE encoder.
-  - [ ] C2b. SDEdit img2img: `--image FILE --strength S` VAE-encodes the image,
-        noises it to the matching timestep and denoises from there (needs C2
-        only; re-styles, does not follow edit instructions).
-  - [ ] C3. Edit pipeline: condition-image latents in the prefix, bidirectional
-        within each image block; `<image1>` template; RoPE for several image blocks;
-        up to 10 reference images.
+  Phase C — editing and reference images (plan from source reading of
+  diffusers 0.41.0.dev0 `pipeline_qwenimage21.py` / `transformer_qwenimage21.py`
+  / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`;
+  order C2 -> C2b -> C1a -> C1b -> C3a -> C3b, C4 decided after C3a). diffusers has
+  one pipeline for text-to-image and editing (`image=`): no strength, no mask, no
+  second-image input; masks and circles are extra input images. Condition images
+  are resized with our own resize, not PIL Lanczos (accepted divergence).
+  - [ ] C2. VAE encoder: conv_in 4->base, 5 residual down blocks, mid
+        (res, attn, res), RMS norm, SiLU, conv_out -> 2z, quant_conv 1x1, posterior
+        mean, `(z - mean)/std` folded into quant_conv. Trap: the AvgDown3D shortcut
+        (blocks 1-3 pad a zero frame in front: channel 2c+ft, even channels 0).
+        `time_conv` unused for one frame. The pico fixture already has the weights.
+  - [ ] C2b. SDEdit img2img: `--image FILE --strength S` (default 0.6) VAE-encodes
+        the image, `latents = sigma[t_start]*noise + (1 - sigma[t_start])*x0` with
+        `t_start = int(N - min(N*strength, N))` on the shifted sigmas (Qwen-Image v1
+        img2img formula; 2.1 has no img2img pipeline), denoises from t_start. Error
+        when no step remains. Re-styles; does not follow edit instructions.
+  - [ ] C1a. Qwen3-VL vision tower: patch 16 (the 2 temporal kernel slices summed),
+        learned 48x48 position table bilinear (align_corners), 2-D RoPE (rotate-half
+        -> interleaved permutation), 27 pre-LN blocks, bidirectional attention via the
+        `TNNetFusedSDPA` cached path (no 1 GB score map), 2x2 merger + DeepStack
+        mergers (layers 8/16/24). Preprocessing: composite over white, mean/std and
+        max_pixels from `preprocessor_config.json`. Pico fixture regenerated with
+        vision patch 16, depth 3, deepstack [0, 2].
+  - [ ] C1b. Text encoder with images: vision embeddings spliced into the
+        `<|image_pad|>` rows, DeepStack features added after decoder layers 0-2,
+        interleaved M-RoPE sections, N-image `get_rope_index` positions, edit template
+        `<image1><|vision_start|><|image_pad|><|vision_end|> <image2>...`, image-pad
+        mask output.
+  - [ ] C3a. Transformer prefix with condition images: each image slot expanded x4
+        and filled with `img_in(VAE latents)`, t = 0 modulation, block-causal mask
+        (causal text, bidirectional per image) via a per-row key limit in
+        `TNNetFusedSDPA.ComputeCachedRows`; `PrepareStepPass` must place the target
+        RoPE frame after the images (today it assumes a text-only prefix).
+  - [ ] C3b. Edit pipeline and example: target size from the last condition
+        image's aspect, per-image resize, RGBA to the VAE and white-composited RGB to
+        the vision tower; `--image FILE` repeatable, `/image FILE` and
+        `/images clear` in the REPL.
+  - [ ] C4. Prefix pass on OpenCL, int8 prefix K/V and a windowed text-encoder
+        prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
+        reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
+        unwindowed at ten. Decide scope after C3a with an L4 measurement.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
