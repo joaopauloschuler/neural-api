@@ -2456,10 +2456,24 @@ rather than acted on.
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
+  Phase D — example usability (`examples/QwenImage`):
+  - [ ] D1. Defaults int8 weights and 18 steps; `--fp32` asks for FP32.
+  - [ ] D2. Step line rewritten in place (`#13` + `ESC[K`) when stdout is a
+        terminal; one line per step when it is a pipe or a file.
+  - [ ] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,
+        consecutive seeds, prompt encoded once.
+  - [ ] D4. `GPU %` column (forward count share) and a count/time share summary
+        line in `TNNet.LayerGroupTimingReport`.
+  - [ ] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
+        `--stats`, host<->OpenCL MB per step and per VAE tile, peak OpenCL
+        bytes, `/profile` and `/stats` REPL toggles.
   Phase C — editing and reference images:
   - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
         features from layers 8/16/24 injected into the LLM (likely 2 tasks).
   - [ ] C2. VAE encoder.
+  - [ ] C2b. SDEdit img2img: `--image FILE --strength S` VAE-encodes the image,
+        noises it to the matching timestep and denoises from there (needs C2
+        only; re-styles, does not follow edit instructions).
   - [ ] C3. Edit pipeline: condition-image latents in the prefix, bidirectional
         within each image block; `<image1>` template; RoPE for several image blocks;
         up to 10 reference images.
