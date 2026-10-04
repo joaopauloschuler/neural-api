@@ -76,6 +76,10 @@ type
     // Loads a {"shape": [C, H, W], ...} oracle image of Root as a (W,H,C) volume.
     procedure LoadOracleImageTensor(Root: TJSONData; const Key: string;
       Dest: TNNetVolume);
+    // The (W,H,C) input of tiny_qwenimage21_vae_encoder_io.json: value
+    // ((i * 7919 + 13) mod 2049) / 1024 - 1 at row-major (C,H,W) index i.
+    procedure FillQwenImage21FormulaImage(Dest: TNNetVolume; ImageW, ImageH,
+      Channels: integer);
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
     // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
@@ -795,6 +799,10 @@ type
     // ShareHostOutputs on vs off, on the CPU and on OpenCL: same images (whole
     // and tiled, serial and parallel); fewer host bytes. Coded by Claude (AI).
     procedure TestQwenImage21VaeDecoderSharedHostOutputs;
+    procedure TestQwenImage21VaeAvgDownMapping;
+    procedure TestQwenImage21VaeEncoderTensorSet;
+    procedure TestQwenImage21VaeEncoderParity;
+    procedure TestQwenImage21VaeEncodeDecodeSmoke;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwenImage21PipelineParity;
     procedure TestQwenImage21Pipeline64Parity;
@@ -29048,6 +29056,306 @@ begin
     Input.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.FillQwenImage21FormulaImage(Dest: TNNetVolume;
+  ImageW, ImageH, Channels: integer);
+var
+  X, Y, Channel: integer;
+  FlatPos: int64;
+begin
+  Dest.ReSize(ImageW, ImageH, Channels);
+  for Channel := 0 to Channels - 1 do
+    for Y := 0 to ImageH - 1 do
+      for X := 0 to ImageW - 1 do
+      begin
+        FlatPos := (int64(Channel) * ImageH + Y) * ImageW + X;
+        Dest[X, Y, Channel] := ((FlatPos * 7919 + 13) mod 2049) / 1024 - 1;
+      end;
+end;
+
+// AddQwenImage21AvgDown (depthwise conv + channel gather) against diffusers'
+// own QwenImage21AvgDown3D on seven oracle cases, then the real encoder's
+// three mappings: 96 -> 96 (avg pool), 96 -> 192 with a zero frame, identity.
+procedure TTestNeuralPretrained.TestQwenImage21VaeAvgDownMapping;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, InputHW: TJSONArray;
+  CaseObj: TJSONObject;
+  NN: TNNet;
+  Shortcut: TNNetLayer;
+  Input, Expected, Output: TNNetVolume;
+  Taps: TNeuralFloatDynArr;
+  CasePos, MaxCasePos, TapPos: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Input := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputHW := TJSONArray(TJSONObject(RefRoot).Find('avg_down_input_hw'));
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('avg_down'));
+    AssertEquals('oracle AvgDown cases', 7, Cases.Count);
+    MaxCasePos := Cases.Count - 1;
+    for CasePos := 0 to MaxCasePos do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      FillQwenImage21FormulaImage(Input, InputHW.Integers[1],
+        InputHW.Integers[0], CaseObj.Get('in_channels', 0));
+      LoadOracleImageTensor(CaseObj, 'output', Expected);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+        Shortcut := AddQwenImage21AvgDown(NN, NN.Layers[0],
+          CaseObj.Get('out_channels', 0), CaseObj.Get('factor_t', 0),
+          CaseObj.Get('factor_s', 0));
+        // Identity iff no spatial or temporal factor and the same width.
+        AssertEquals('AvgDown case ' + IntToStr(CasePos) + ' is the identity',
+          (CaseObj.Get('factor_s', 0) = 1) and (CaseObj.Get('factor_t', 0) = 1)
+          and (CaseObj.Get('in_channels', 0) = CaseObj.Get('out_channels', 0)),
+          Shortcut = NN.Layers[0]);
+        if Shortcut = NN.Layers[0]
+          then Output := Input
+          else
+          begin
+            NN.Compute(Input);
+            Output := Shortcut.Output;
+          end;
+        AssertEquals('AvgDown case ' + IntToStr(CasePos) + ' output width',
+          Expected.SizeX, Output.SizeX);
+        AssertEquals('AvgDown case ' + IntToStr(CasePos) + ' output height',
+          Expected.SizeY, Output.SizeY);
+        AssertEquals('AvgDown case ' + IntToStr(CasePos) + ' output depth',
+          Expected.Depth, Output.Depth);
+        MaxDiff := MaxAbsVolumeDiff(Output, Expected);
+        AssertTrue('AvgDown case ' + IntToStr(CasePos) + ' vs diffusers: ' +
+          FloatToStr(MaxDiff), MaxDiff < 1e-6);
+      finally
+        NN.Free;
+      end;
+    end;
+    Taps := QwenImage21AvgDownTaps(96, 96, 1, 2);
+    AssertEquals('96->96 taps', 4, Length(Taps));
+    for TapPos := 0 to 3 do AssertEquals('96->96 tap', 0.25, Taps[TapPos], 0);
+    // Even output channels read the zero frame, odd ones avg pool channel c.
+    Taps := QwenImage21AvgDownTaps(96, 192, 2, 2);
+    AssertEquals('96->192 taps', 8, Length(Taps));
+    for TapPos := 0 to 3 do AssertEquals('96->192 even', 0, Taps[TapPos], 0);
+    for TapPos := 4 to 7 do AssertEquals('96->192 odd', 0.25, Taps[TapPos], 0);
+    Taps := QwenImage21AvgDownTaps(768, 768, 1, 1);
+    AssertEquals('768->768 identity', 1, Length(Taps));
+    AssertEquals('768->768 identity tap', 1, Taps[0], 0);
+  finally
+    Expected.Free;
+    Input.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// The encoder consumes every encoder.* and quant_conv.* tensor except the
+// 3 x 2 time_conv ones, adds only the fixed AvgDown taps, and refuses both a
+// missing and an unused tensor.
+procedure TTestNeuralPretrained.TestQwenImage21VaeEncoderTensorSet;
+const
+  WeightsFile = 'tiny_qwenimage21/vae/diffusion_pytorch_model.safetensors';
+var
+  Encoder: TQwenImage21VaeEncoder;
+  Reader: TNNetSafeTensorsReader;
+  Config: TQwenImage21VaeConfig;
+  TensorName: string;
+  TensorPos, MaxTensorPos, LayerPos, MaxLayerPos: integer;
+  ExpectedWeights, TimeConvTensors, AvgDownWeights: int64;
+  Failed: boolean;
+  FailureMessage: string;
+begin
+  Encoder := nil;
+  Reader := nil;
+  try
+    Config := ReadQwenImage21VaeConfig(
+      FixturePath('tiny_qwenimage21/vae/config.json'));
+    AssertEquals('base_dim', 2, Config.BaseDim);
+    AssertEquals('in_channels', 4, Config.InChannels);
+    AssertEquals('first encoder width', 2, Config.EncoderDims[0]);
+    AssertEquals('down_blocks.1 width', 4, Config.EncoderDims[2]);
+    AssertEquals('last encoder width', 16, Config.EncoderDims[5]);
+    AssertFalse('down_blocks.0 is downsample2d', Config.TemporalDownsample[0]);
+    AssertTrue('down_blocks.1 is downsample3d', Config.TemporalDownsample[1]);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(WeightsFile));
+    ExpectedWeights := 0;
+    TimeConvTensors := 0;
+    MaxTensorPos := Reader.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      if (Pos('encoder.', TensorName) <> 1) and
+         (Pos('quant_conv.', TensorName) <> 1) then continue;
+      if Pos('.time_conv.', TensorName) > 0 then Inc(TimeConvTensors)
+      else if Pos('.bias', TensorName) = 0 then
+        Inc(ExpectedWeights, Reader.ElementCount(TensorName));
+    end;
+    AssertEquals('time_conv tensors in the checkpoint', 6, TimeConvTensors);
+    Encoder := TQwenImage21VaeEncoder.CreateFromReader(Reader, Config);
+    AssertEquals('time_conv tensors skipped', 6, Encoder.SkippedTensorCount);
+    // Taps x input channels: 1x4x2 + 2x4x2 + 2x4x4 + 2x4x8; block 4 is identity.
+    AvgDownWeights := 0;
+    MaxLayerPos := Encoder.WeightOwner.CountLayers() - 1;
+    for LayerPos := 0 to MaxLayerPos do
+      if Encoder.WeightOwner.Layers[LayerPos] is TNNetDepthwiseConvLinear then
+        Inc(AvgDownWeights, Encoder.WeightOwner.Layers[LayerPos].CountWeights());
+    AssertEquals('AvgDown taps', 120, AvgDownWeights);
+    AssertEquals('weights allocated = checkpoint minus time_conv plus taps',
+      ExpectedWeights + AvgDownWeights, Encoder.WeightOwner.CountWeights());
+    Encoder.PrepareNet(48, 32);
+    AssertEquals('the sized net borrows every weight', 0,
+      Encoder.Net.CountWeights());
+    AssertEquals('latent width', 3, Encoder.Net.GetLastLayer().Output.SizeX);
+    AssertEquals('latent height', 2, Encoder.Net.GetLastLayer().Output.SizeY);
+    AssertEquals('latent depth', 16, Encoder.Net.GetLastLayer().Output.Depth);
+    Failed := false;
+    try
+      Encoder.PrepareNet(40, 32);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a side that is not a multiple of 16 is refused', Failed);
+    FreeAndNil(Encoder);
+    Reader.RenameTensor('encoder.down_blocks.1.downsampler.time_conv.weight',
+      'encoder.down_blocks.1.downsampler.extra.weight');
+    Failed := false;
+    try
+      TQwenImage21VaeEncoder.CreateFromReader(Reader, Config).Free;
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('an unused encoder tensor is refused', Failed);
+    Reader.RenameTensor('encoder.down_blocks.1.downsampler.extra.weight',
+      'encoder.down_blocks.1.downsampler.time_conv.weight');
+    // A time_conv name: the unused-tensor scan skips it, so only the
+    // missing-tensor check can raise.
+    Reader.RenameTensor('encoder.norm_out.gamma',
+      'encoder.norm_out.time_conv.gamma');
+    FailureMessage := '';
+    try
+      TQwenImage21VaeEncoder.CreateFromReader(Reader, Config).Free;
+    except
+      on E: EPretrainedImportError do FailureMessage := E.Message;
+    end;
+    AssertTrue('a missing encoder tensor is refused: "' + FailureMessage + '"',
+      Pos('encoder.norm_out.gamma', FailureMessage) > 0);
+  finally
+    Encoder.Free;
+    Reader.Free;
+  end;
+end;
+
+// Pico encoder vs the float64 diffusers oracle (F32 weights, float32 compute)
+// at 48x32 and 64x64: the normalised latent, and the posterior mean it
+// un-normalises to.
+procedure TTestNeuralPretrained.TestQwenImage21VaeEncoderParity;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Images: TJSONArray;
+  ImageObj: TJSONObject;
+  Encoder: TQwenImage21VaeEncoder;
+  Image, Latent, Expected: TNNetVolume;
+  ImagePos, X, Y, Channel: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Encoder := nil;
+  Image := TNNetVolume.Create;
+  Latent := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Encoder := TQwenImage21VaeEncoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    AssertEquals('diffusers ran time_conv', 0,
+      TJSONObject(RefRoot).Get('time_conv_calls_during_encode', -1));
+    Images := TJSONArray(TJSONObject(RefRoot).Find('images'));
+    AssertEquals('oracle images', 2, Images.Count);
+    for ImagePos := 0 to Images.Count - 1 do
+    begin
+      ImageObj := TJSONObject(Images.Items[ImagePos]);
+      FillQwenImage21FormulaImage(Image, ImageObj.Get('width', 0),
+        ImageObj.Get('height', 0), 4);
+      Encoder.Encode(Image, Latent);
+      LoadOracleImageTensor(ImageObj, 'latents_normalized', Expected);
+      AssertEquals('latent width', Image.SizeX div 16, Latent.SizeX);
+      AssertEquals('latent height', Image.SizeY div 16, Latent.SizeY);
+      AssertEquals('latent depth', 16, Latent.Depth);
+      MaxDiff := MaxAbsVolumeDiff(Latent, Expected);
+      AssertTrue(IntToStr(Image.SizeX) + 'x' + IntToStr(Image.SizeY) +
+        ' normalised latent: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 5e-6', MaxDiff < 5e-6);
+      for Y := 0 to Latent.SizeY - 1 do
+        for X := 0 to Latent.SizeX - 1 do
+          for Channel := 0 to Latent.Depth - 1 do
+            Latent[X, Y, Channel] := Latent[X, Y, Channel] *
+              Encoder.Config.LatentsStd[Channel] +
+              Encoder.Config.LatentsMean[Channel];
+      LoadOracleImageTensor(ImageObj, 'posterior_mean', Expected);
+      MaxDiff := MaxAbsVolumeDiff(Latent, Expected);
+      AssertTrue(IntToStr(Image.SizeX) + 'x' + IntToStr(Image.SizeY) +
+        ' posterior mean: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 2e-5', MaxDiff < 2e-5);
+    end;
+  finally
+    Expected.Free;
+    Latent.Free;
+    Image.Free;
+    Encoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// decode(encode(x)) on the pico VAE: the shapes line up and every value is
+// finite. Random weights, so the image is not compared with x.
+procedure TTestNeuralPretrained.TestQwenImage21VaeEncodeDecodeSmoke;
+var
+  Encoder: TQwenImage21VaeEncoder;
+  Decoder: TQwenImage21VaeDecoder;
+  Image, Latent, Decoded: TNNetVolume;
+  VaeFolder: string;
+  ValuePos: integer;
+begin
+  VaeFolder := ExtractFileDir(FixturePath('tiny_qwenimage21/vae/config.json'));
+  Encoder := nil;
+  Decoder := nil;
+  Image := TNNetVolume.Create;
+  Latent := TNNetVolume.Create;
+  Decoded := TNNetVolume.Create;
+  try
+    Encoder := TQwenImage21VaeEncoder.Create(VaeFolder);
+    Decoder := TQwenImage21VaeDecoder.Create(VaeFolder);
+    FillQwenImage21FormulaImage(Image, 48, 32, 4);
+    Encoder.Encode(Image, Latent);
+    Decoder.Decode(Latent, Decoded);
+    AssertEquals('decoded width', 48, Decoded.SizeX);
+    AssertEquals('decoded height', 32, Decoded.SizeY);
+    AssertEquals('decoded depth', 4, Decoded.Depth);
+    for ValuePos := 0 to Latent.Size - 1 do
+      AssertFalse('latent value ' + IntToStr(ValuePos) + ' is finite',
+        IsNan(Latent.FData[ValuePos]) or IsInfinite(Latent.FData[ValuePos]));
+    for ValuePos := 0 to Decoded.Size - 1 do
+      AssertFalse('decoded value ' + IntToStr(ValuePos) + ' is finite',
+        IsNan(Decoded.FData[ValuePos]) or IsInfinite(Decoded.FData[ValuePos]));
+  finally
+    Decoded.Free;
+    Latent.Free;
+    Image.Free;
+    Decoder.Free;
+    Encoder.Free;
   end;
 end;
 

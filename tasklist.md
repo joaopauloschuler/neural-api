@@ -2474,7 +2474,7 @@ rather than acted on.
   one pipeline for text-to-image and editing (`image=`): no strength, no mask, no
   second-image input; masks and circles are extra input images. Condition images
   are resized with our own resize, not PIL Lanczos (accepted divergence).
-  - [ ] C2. VAE encoder: conv_in 4->base, 5 residual down blocks, mid
+  - [x] C2. VAE encoder: conv_in 4->base, 5 residual down blocks, mid
         (res, attn, res), RMS norm, SiLU, conv_out -> 2z, quant_conv 1x1, posterior
         mean, `(z - mean)/std` folded into quant_conv. Trap: the AvgDown3D shortcut
         (blocks 1-3 pad a zero frame in front: channel 2c+ft, even channels 0).

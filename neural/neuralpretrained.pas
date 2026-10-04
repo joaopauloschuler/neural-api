@@ -8863,10 +8863,14 @@ type
 
 type
   // The vae/config.json fields of diffusers AutoencoderKLQwenImage21 that the
-  // decoder reads. DecoderDims/TemporalUpsample are in decoder (up-block) order.
+  // encoder and decoder read. Encoder* fields are in down-block order;
+  // DecoderDims/TemporalUpsample are in decoder (up-block) order.
   TQwenImage21VaeConfig = record
-    ZDim, DecoderBaseDim, NumResBlocks, OutChannels, SpatialScale: integer;
+    ZDim, BaseDim, DecoderBaseDim, NumResBlocks: integer;
+    InChannels, OutChannels, SpatialScale: integer;
     DimMult: TNeuralIntegerArray;
+    EncoderDims: TNeuralIntegerArray;     // Length(DimMult) + 1 widths
+    TemporalDownsample: array of boolean; // one per down block with a downsampler
     DecoderDims: TNeuralIntegerArray;     // Length(DimMult) + 1 widths
     TemporalUpsample: array of boolean;   // one per up block with an upsampler
     LatentsMean, LatentsStd: TNeuralFloatDynArr;
@@ -8893,6 +8897,27 @@ function BuildQwenImage21VaeDecoderNet(NN: TNNet;
 // Loads every TensorLayers prefix, folds latents_std/mean into post_quant_conv
 // and returns how many time_conv tensors it skipped. Raises on unused tensors.
 function LoadQwenImage21VaeDecoderWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
+
+// Depthwise taps of diffusers AvgDown3D(InCh, OutCh, TemporalFactor, SpatialFactor)
+// on one frame, at (n*SpatialFactor + y)*SpatialFactor + x for multiplier n < OutCh div InCh.
+function QwenImage21AvgDownTaps(InCh, OutCh, TemporalFactor,
+  SpatialFactor: integer): TNeuralFloatDynArr;
+
+// Adds that AvgDown3D after Source (depthwise conv, then a channel gather into
+// diffusers' order); returns Source itself when the AvgDown3D is the identity.
+function AddQwenImage21AvgDown(NN: TNNet; Source: TNNetLayer; OutCh,
+  TemporalFactor, SpatialFactor: integer; pTrainable: boolean = false): TNNetLayer;
+
+// Adds the encoder (encoder.conv_in .. quant_conv, posterior mean) for an
+// (ImageW, ImageH, in_channels) image; returns the (ImageW/16, ImageH/16, z_dim) mean.
+function BuildQwenImage21VaeEncoderNet(NN: TNNet;
+  const Config: TQwenImage21VaeConfig; ImageW, ImageH: integer;
+  TensorLayers: TStringList = nil): TNNetLayer;
+
+// Loads every TensorLayers prefix, folds (mean - latents_mean)/latents_std into
+// quant_conv and returns the skipped time_conv count. Raises on unused tensors.
+function LoadQwenImage21VaeEncoderWeights(Reader: TNNetSafeTensorsReader;
   const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
 
 // '' when TileSampleSize and TileSampleStride suit DecodeTiled on a VAE with
@@ -9018,6 +9043,47 @@ type
     // Largest TNNet.OpenCLBufferBytes of a sized net freed by ReleaseNet since
     // the last Decode/DecodeTiled started; 0 without OpenCL.
     property LargestNetOpenCLBytes: int64 read FLargestNetOpenCLBytes;
+  end;
+
+  // Qwen-Image-2.1 VAE encoder (diffusers AutoencoderKLQwenImage21.encode for
+  // one image, posterior mean). WeightOwner is a 16x16-pixel net holding the
+  // weights; Net is the sized net that borrows them. Image (W, H, in_channels)
+  // is in [-1, 1] with W and H multiples of 16; Latent (W/16, H/16, z_dim) is
+  // the NORMALISED latent, the layout TQwenImage21VaeDecoder.Decode reads.
+  // Coded by Claude (AI).
+  TQwenImage21VaeEncoder = class(TObject)
+  private
+    FConfig: TQwenImage21VaeConfig;
+    FWeightOwner: TNNet;
+    FNet: TNNet;
+    FNetImageW, FNetImageH: integer;
+    FSkippedTensorCount: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
+    FShareHostOutputs: boolean;
+    procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
+  public
+    // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
+    constructor Create(const VaeFolder: string);
+    constructor CreateFromReader(Reader: TNNetSafeTensorsReader;
+      const Config: TQwenImage21VaeConfig);
+    destructor Destroy(); override;
+    // (Re)builds Net for an ImageW x ImageH image; a same-size call is free.
+    procedure PrepareNet(ImageW, ImageH: integer);
+    // Frees Net and its activations; the weights stay.
+    procedure ReleaseNet();
+    // Encodes the whole image in one pass (the untiled diffusers encode).
+    procedure Encode(Image, Latent: TNNetVolume);
+    property Config: TQwenImage21VaeConfig read FConfig;
+    property WeightOwner: TNNet read FWeightOwner;
+    property Net: TNNet read FNet;
+    // time_conv weights present in the checkpoint and not loaded.
+    property SkippedTensorCount: integer read FSkippedTensorCount;
+    // As in TQwenImage21VaeDecoder; read when Net is (re)built.
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    property ShareHostOutputs: boolean read FShareHostOutputs
+      write FShareHostOutputs;
   end;
 
 const
@@ -67982,6 +68048,23 @@ begin
       pTrainable) );
 end;
 
+// diffusers Downsample2D on the last layer: ZeroPad2d((0,1,0,1)) then a
+// stride-2 pad-0 3x3 conv. TNNetPadXY pads every side, so TNNetCrop drops the
+// top/left pad again. Returns the conv.
+function AddVaeAsymmetricDownsample(NN: TNNet; OutCh: integer;
+  pTrainable: boolean = true): TNNetLayer;
+var
+  InputW, InputH: integer;
+begin
+  InputW := NN.GetLastLayer().Output.SizeX;
+  InputH := NN.GetLastLayer().Output.SizeY;
+  NN.AddLayer( VaeLayerTrainable(TNNetPadXY.Create(1, 1), pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(TNNetCrop.Create(1, 1, InputW + 1,
+    InputH + 1), pTrainable) );
+  Result := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionLinear.Create(
+    OutCh, 3, {pad=}0, {stride=}2, {bias=}0), pTrainable) );
+end;
+
 // Adds (architecture) one diffusers ResnetBlock2D with GroupNorm norms.
 procedure AddVaeResnetBlock(NN: TNNet; const Config: TVaeDecoderConfig;
   InCh, OutCh: integer; out Refs: TVaeResnetLayers);
@@ -68376,6 +68459,7 @@ end;
 const
   csQwenImage21VaeImporter = 'Qwen-Image-2.1 VAE';
   csQwenImage21PostQuantPrefix = 'post_quant_conv.';
+  csQwenImage21QuantPrefix = 'quant_conv.';
 
 function ReadQwenImage21VaeConfig(const FileName: string): TQwenImage21VaeConfig;
 var
@@ -68383,9 +68467,7 @@ var
   Root, FieldData: TJSONData;
   Obj: TJSONObject;
   FieldArr: TJSONArray;
-  TemporalDownsample: array of boolean;
   LevelCount, LevelPos, MaxLevelPos, ChannelPos, MaxChannelPos: integer;
-  BaseDim: integer;
   ClassName: string;
 
   function ReadFloatArray(const Key: string): TNeuralFloatDynArr;
@@ -68422,17 +68504,18 @@ begin
         '", expected AutoencoderKLQwenImage21.');
     if not Obj.Get('is_residual', true) then
       ImportError(csQwenImage21VaeImporter + ': is_residual=false (the plain ' +
-        'up blocks) is not supported.');
+        'up/down blocks) is not supported.');
     FieldData := Obj.Find('patch_size');
     if (FieldData <> nil) and (FieldData.JSONType <> jtNull) then
       ImportError(csQwenImage21VaeImporter + ': patch_size is not supported.');
     Result.ZDim := Obj.Get('z_dim', 64);
-    BaseDim := Obj.Get('base_dim', 96);
+    Result.BaseDim := Obj.Get('base_dim', 96);
     FieldData := Obj.Find('decoder_base_dim');
     if (FieldData = nil) or (FieldData.JSONType = jtNull)
-      then Result.DecoderBaseDim := BaseDim
+      then Result.DecoderBaseDim := Result.BaseDim
       else Result.DecoderBaseDim := FieldData.AsInteger;
     Result.NumResBlocks := Obj.Get('num_res_blocks', 2);
+    Result.InChannels := Obj.Get('in_channels', 4);
     Result.OutChannels := Obj.Get('out_channels', 4);
     Result.SpatialScale := Obj.Get('scale_factor_spatial', 16);
     FieldArr := TJSONArray(Obj.Find('dim_mult', jtArray));
@@ -68448,13 +68531,13 @@ begin
     LevelCount := Length(Result.DimMult);
     if LevelCount < 2 then
       ImportError(csQwenImage21VaeImporter + ': dim_mult needs >= 2 entries.');
-    SetLength(TemporalDownsample, LevelCount - 1);
+    SetLength(Result.TemporalDownsample, LevelCount - 1);
     FieldArr := TJSONArray(Obj.Find('temperal_downsample', jtArray));
     MaxLevelPos := LevelCount - 2;
     if FieldArr = nil then
     begin
       for LevelPos := 0 to MaxLevelPos do
-        TemporalDownsample[LevelPos] := LevelPos > 0;
+        Result.TemporalDownsample[LevelPos] := LevelPos > 0;
     end
     else
     begin
@@ -68462,7 +68545,7 @@ begin
         ImportError(csQwenImage21VaeImporter + ': temperal_downsample must ' +
           'hold ' + IntToStr(LevelCount - 1) + ' entries.');
       for LevelPos := 0 to MaxLevelPos do
-        TemporalDownsample[LevelPos] := FieldArr.Booleans[LevelPos];
+        Result.TemporalDownsample[LevelPos] := FieldArr.Booleans[LevelPos];
     end;
     Result.LatentsMean := ReadFloatArray('latents_mean');
     Result.LatentsStd := ReadFloatArray('latents_std');
@@ -68470,8 +68553,9 @@ begin
     Root.Free;
     JsonText.Free;
   end;
-  if (Result.ZDim < 1) or (Result.DecoderBaseDim < 1) or
-     (Result.NumResBlocks < 0) or (Result.OutChannels < 1) then
+  if (Result.ZDim < 1) or (Result.BaseDim < 1) or
+     (Result.DecoderBaseDim < 1) or (Result.NumResBlocks < 0) or
+     (Result.InChannels < 1) or (Result.OutChannels < 1) then
     ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
       '" has a non-positive size.');
   if Result.SpatialScale <> 1 shl (LevelCount - 1) then
@@ -68482,6 +68566,12 @@ begin
      (Length(Result.LatentsStd) <> Result.ZDim) then
     ImportError(csQwenImage21VaeImporter + ': latents_mean and latents_std ' +
       'must hold z_dim = ' + IntToStr(Result.ZDim) + ' values.');
+  // diffusers Encoder3d: dims = base * ([1] + dim_mult).
+  SetLength(Result.EncoderDims, LevelCount + 1);
+  Result.EncoderDims[0] := Result.BaseDim;
+  for LevelPos := 1 to LevelCount do
+    Result.EncoderDims[LevelPos] :=
+      Result.BaseDim * Result.DimMult[LevelPos - 1];
   // diffusers Decoder3d: dims = base * ([dim_mult[-1]] + dim_mult[::-1]).
   SetLength(Result.DecoderDims, LevelCount + 1);
   Result.DecoderDims[0] := Result.DecoderBaseDim * Result.DimMult[LevelCount - 1];
@@ -68492,7 +68582,7 @@ begin
   MaxLevelPos := LevelCount - 2;
   for LevelPos := 0 to MaxLevelPos do
     Result.TemporalUpsample[LevelPos] :=
-      TemporalDownsample[MaxLevelPos - LevelPos];
+      Result.TemporalDownsample[MaxLevelPos - LevelPos];
   MaxChannelPos := Result.ZDim - 1;
   for ChannelPos := 0 to MaxChannelPos do
     if not (Result.LatentsStd[ChannelPos] > 0) then
@@ -68548,6 +68638,53 @@ begin
   Result := TNNetTokenRMSNorm.Create(1e-24 / Channels).SetTrainable(false);
 end;
 
+// Adds TensorPrefix -> Layer to TensorLayers (may be nil); returns Layer.
+function TrackQwenImage21VaeLayer(TensorLayers: TStringList; Layer: TNNetLayer;
+  const TensorPrefix: string): TNNetLayer;
+begin
+  if TensorLayers <> nil then TensorLayers.AddObject(TensorPrefix, Layer);
+  Result := Layer;
+end;
+
+// One QwenImage21ResidualBlock on the last layer; its weight layers are
+// tracked under ResPrefix.
+procedure AddQwenImage21VaeResnet(NN: TNNet; TensorLayers: TStringList;
+  const ResPrefix: string; InCh, OutCh: integer);
+var
+  Res: TVaeResnetLayers;
+begin
+  AddVaeResnetBlockWithNorms(NN, InCh, OutCh, CreateQwenImage21VaeNorm(InCh),
+    CreateQwenImage21VaeNorm(OutCh), Res, {pTrainable=}false);
+  TrackQwenImage21VaeLayer(TensorLayers, Res.Norm1, ResPrefix + 'norm1.');
+  TrackQwenImage21VaeLayer(TensorLayers, Res.Conv1, ResPrefix + 'conv1.');
+  TrackQwenImage21VaeLayer(TensorLayers, Res.Norm2, ResPrefix + 'norm2.');
+  TrackQwenImage21VaeLayer(TensorLayers, Res.Conv2, ResPrefix + 'conv2.');
+  if Res.Shortcut <> nil then
+    TrackQwenImage21VaeLayer(TensorLayers, Res.Shortcut,
+      ResPrefix + 'conv_shortcut.');
+end;
+
+// QwenImage21MidBlock on the last layer: resnet, single-head attention,
+// resnet, all Channels wide; tracked under MidPrefix.
+procedure AddQwenImage21VaeMidBlock(NN: TNNet; TensorLayers: TStringList;
+  const MidPrefix: string; Channels: integer);
+var
+  Attn: TVaeAttnLayers;
+begin
+  AddQwenImage21VaeResnet(NN, TensorLayers, MidPrefix + 'resnets.0.', Channels,
+    Channels);
+  AddVaeAttentionWithNorm(NN, Channels, CreateQwenImage21VaeNorm(Channels),
+    Attn, {pTrainable=}false);
+  TrackQwenImage21VaeLayer(TensorLayers, Attn.Norm,
+    MidPrefix + 'attentions.0.norm.');
+  TrackQwenImage21VaeLayer(TensorLayers, Attn.QKV,
+    MidPrefix + 'attentions.0.to_qkv.');
+  TrackQwenImage21VaeLayer(TensorLayers, Attn.AttnOut,
+    MidPrefix + 'attentions.0.proj.');
+  AddQwenImage21VaeResnet(NN, TensorLayers, MidPrefix + 'resnets.1.', Channels,
+    Channels);
+end;
+
 function BuildQwenImage21VaeDecoderNet(NN: TNNet;
   const Config: TQwenImage21VaeConfig; LatentW, LatentH: integer;
   TensorLayers: TStringList): TNNetLayer;
@@ -68555,26 +68692,10 @@ var
   LevelCount, UpPos, MaxUpPos, ResPos, InCh, OutCh, TopCh, TemporalFactor: integer;
   UpPrefix: string;
   BlockInput, Resample, Shortcut: TNNetLayer;
-  Attn: TVaeAttnLayers;
 
   function Track(Layer: TNNetLayer; const TensorPrefix: string): TNNetLayer;
   begin
-    if TensorLayers <> nil then TensorLayers.AddObject(TensorPrefix, Layer);
-    Result := Layer;
-  end;
-
-  procedure AddResnet(const ResPrefix: string; ResInCh, ResOutCh: integer);
-  var
-    Res: TVaeResnetLayers;
-  begin
-    AddVaeResnetBlockWithNorms(NN, ResInCh, ResOutCh,
-      CreateQwenImage21VaeNorm(ResInCh), CreateQwenImage21VaeNorm(ResOutCh),
-      Res, {pTrainable=}false);
-    Track(Res.Norm1, ResPrefix + 'norm1.');
-    Track(Res.Conv1, ResPrefix + 'conv1.');
-    Track(Res.Norm2, ResPrefix + 'norm2.');
-    Track(Res.Conv2, ResPrefix + 'conv2.');
-    if Res.Shortcut <> nil then Track(Res.Shortcut, ResPrefix + 'conv_shortcut.');
+    Result := TrackQwenImage21VaeLayer(TensorLayers, Layer, TensorPrefix);
   end;
 
 begin
@@ -68588,13 +68709,7 @@ begin
     SetTrainable(false)), csQwenImage21PostQuantPrefix);
   Track(NN.AddLayer(TNNetConvolutionLinear.Create(TopCh, 3, 1, 1, 0).
     SetTrainable(false)), 'decoder.conv_in.');
-  AddResnet('decoder.mid_block.resnets.0.', TopCh, TopCh);
-  AddVaeAttentionWithNorm(NN, TopCh, CreateQwenImage21VaeNorm(TopCh), Attn,
-    {pTrainable=}false);
-  Track(Attn.Norm, 'decoder.mid_block.attentions.0.norm.');
-  Track(Attn.QKV, 'decoder.mid_block.attentions.0.to_qkv.');
-  Track(Attn.AttnOut, 'decoder.mid_block.attentions.0.proj.');
-  AddResnet('decoder.mid_block.resnets.1.', TopCh, TopCh);
+  AddQwenImage21VaeMidBlock(NN, TensorLayers, 'decoder.mid_block.', TopCh);
   MaxUpPos := LevelCount - 1;
   for UpPos := 0 to MaxUpPos do
   begin
@@ -68604,7 +68719,8 @@ begin
     OutCh := Config.DecoderDims[UpPos + 1];
     for ResPos := 0 to Config.NumResBlocks do
     begin
-      AddResnet(UpPrefix + 'resnets.' + IntToStr(ResPos) + '.', InCh, OutCh);
+      AddQwenImage21VaeResnet(NN, TensorLayers, UpPrefix + 'resnets.' +
+        IntToStr(ResPos) + '.', InCh, OutCh);
       InCh := OutCh;
     end;
     if UpPos < MaxUpPos then
@@ -68656,68 +68772,310 @@ begin
   PostQuant.FlushWeightCache();
 end;
 
+// Loads every TensorLayers prefix (an RMS gamma or a conv weight + bias) and
+// adds each loaded tensor name to LoadedNames.
+procedure LoadQwenImage21VaeTensorLayers(Reader: TNNetSafeTensorsReader;
+  TensorLayers, LoadedNames: TStringList);
+var
+  LayerPos, MaxLayerPos: integer;
+  Prefix, WeightName: string;
+  Layer: TNNetLayer;
+begin
+  MaxLayerPos := TensorLayers.Count - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Prefix := TensorLayers[LayerPos];
+    Layer := TNNetLayer(TensorLayers.Objects[LayerPos]);
+    if Layer is TNNetTokenRMSNorm then
+    begin
+      WeightName := Prefix + 'gamma';
+      LoadAffineNormWeights(Reader, Layer, WeightName, '',
+        Layer.Output.Depth, 0, {HasBeta=}false, false, false,
+        csQwenImage21VaeImporter);
+      LoadedNames.Add(WeightName);
+    end
+    else
+    begin
+      WeightName := Prefix + 'weight';
+      if not Reader.HasTensor(WeightName) then
+        ImportError(csQwenImage21VaeImporter + ': missing tensor "' +
+          WeightName + '".');
+      if Reader.DimCount(WeightName) <> 4 then
+        ImportError(csQwenImage21VaeImporter + ': "' + WeightName +
+          '" must be a [out,in,k,k] conv weight, got ' +
+          Reader.ShapeAsString(WeightName));
+      LoadVaeConv(Reader, Layer, WeightName, Prefix + 'bias',
+        Layer.Neurons.Count, Layer.PrevLayer.Output.Depth,
+        Reader.DimSize(WeightName, 3));
+      LoadedNames.Add(WeightName);
+      LoadedNames.Add(Prefix + 'bias');
+    end;
+  end;
+end;
+
+// The TensorLayers entry for TensorPrefix; raises when there is none.
+function FindQwenImage21VaeTensorLayer(TensorLayers: TStringList;
+  const TensorPrefix: string): TNNetLayer;
+var
+  LayerPos: integer;
+begin
+  LayerPos := TensorLayers.IndexOf(TensorPrefix);
+  if LayerPos < 0 then
+    ImportError(csQwenImage21VaeImporter + ': TensorLayers has no ' +
+      TensorPrefix + ' entry.');
+  Result := TNNetLayer(TensorLayers.Objects[LayerPos]);
+end;
+
+// Counts the time_conv tensors under NetPrefix and raises on any other tensor
+// under NetPrefix or ConvPrefix that is missing from LoadedNames.
+function CountQwenImage21VaeSkippedTensors(Reader: TNNetSafeTensorsReader;
+  LoadedNames: TStringList; const NetPrefix, ConvPrefix: string): integer;
+var
+  TensorPos, MaxTensorPos: integer;
+  TensorName: string;
+begin
+  // A single-image pass never runs time_conv (diffusers caches the first
+  // chunk instead), so its weights are the only tensors left out.
+  Result := 0;
+  MaxTensorPos := Reader.Count - 1;
+  for TensorPos := 0 to MaxTensorPos do
+  begin
+    TensorName := Reader.TensorName(TensorPos);
+    if (Pos(NetPrefix, TensorName) <> 1) and
+       (Pos(ConvPrefix, TensorName) <> 1) then continue;
+    if Pos('.time_conv.', TensorName) > 0 then Inc(Result)
+    else if LoadedNames.IndexOf(TensorName) < 0 then
+      ImportError(csQwenImage21VaeImporter + ': tensor "' + TensorName +
+        '" is not used by the ' + Copy(NetPrefix, 1, Length(NetPrefix) - 1) +
+        '.');
+  end;
+end;
+
+function CreateQwenImage21LoadedNames(): TStringList;
+begin
+  Result := TStringList.Create;
+  Result.Sorted := true;
+  Result.Duplicates := dupIgnore;
+end;
+
 function LoadQwenImage21VaeDecoderWeights(Reader: TNNetSafeTensorsReader;
   const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
 var
   LoadedNames: TStringList;
-  LayerPos, MaxLayerPos, TensorPos, MaxTensorPos, PostQuantPos: integer;
-  Prefix, WeightName, TensorName: string;
-  Layer: TNNetLayer;
 begin
-  LoadedNames := TStringList.Create;
+  LoadedNames := CreateQwenImage21LoadedNames();
   try
-    LoadedNames.Sorted := true;
-    LoadedNames.Duplicates := dupIgnore;
-    MaxLayerPos := TensorLayers.Count - 1;
-    for LayerPos := 0 to MaxLayerPos do
+    LoadQwenImage21VaeTensorLayers(Reader, TensorLayers, LoadedNames);
+    FoldQwenImage21LatentNorm(FindQwenImage21VaeTensorLayer(TensorLayers,
+      csQwenImage21PostQuantPrefix), Config);
+    Result := CountQwenImage21VaeSkippedTensors(Reader, LoadedNames,
+      'decoder.', csQwenImage21PostQuantPrefix);
+  finally
+    LoadedNames.Free;
+  end;
+end;
+
+// Output o = c*Multiplier + n averages in-channel offsets n*g .. n*g + g - 1
+// of channel c; offsets in the leading zero frames add nothing.
+function QwenImage21AvgDownTaps(InCh, OutCh, TemporalFactor,
+  SpatialFactor: integer): TNeuralFloatDynArr;
+var
+  Factor, PlaneSize, Multiplier, GroupSize: integer;
+  MultiplierPos, MaxMultiplierPos, OffsetPos, MaxOffsetPos: integer;
+  FrameOffset, TapPos: integer;
+begin
+  if (InCh < 1) or (OutCh < 1) or (TemporalFactor < 1) or (SpatialFactor < 1) then
+    ImportError(csQwenImage21VaeImporter + ': AvgDown3D needs positive sizes.');
+  PlaneSize := SpatialFactor * SpatialFactor;
+  Factor := TemporalFactor * PlaneSize;
+  if (OutCh mod InCh <> 0) or (Factor mod (OutCh div InCh) <> 0) then
+    ImportError(csQwenImage21VaeImporter + ': AvgDown3D ' + IntToStr(InCh) +
+      ' -> ' + IntToStr(OutCh) + ' channels with factor ' + IntToStr(Factor) +
+      ' is not a depthwise mapping.');
+  Multiplier := OutCh div InCh;
+  GroupSize := Factor div Multiplier;
+  FrameOffset := (TemporalFactor - 1) * PlaneSize;
+  Result := nil;
+  SetLength(Result, Multiplier * PlaneSize);
+  MaxMultiplierPos := Multiplier - 1;
+  MaxOffsetPos := GroupSize - 1;
+  for MultiplierPos := 0 to MaxMultiplierPos do
+    for OffsetPos := 0 to MaxOffsetPos do
     begin
-      Prefix := TensorLayers[LayerPos];
-      Layer := TNNetLayer(TensorLayers.Objects[LayerPos]);
-      if Layer is TNNetTokenRMSNorm then
-      begin
-        WeightName := Prefix + 'gamma';
-        LoadAffineNormWeights(Reader, Layer, WeightName, '',
-          Layer.Output.Depth, 0, {HasBeta=}false, false, false,
-          csQwenImage21VaeImporter);
-        LoadedNames.Add(WeightName);
-      end
-      else
-      begin
-        WeightName := Prefix + 'weight';
-        if not Reader.HasTensor(WeightName) then
-          ImportError(csQwenImage21VaeImporter + ': missing tensor "' +
-            WeightName + '".');
-        if Reader.DimCount(WeightName) <> 4 then
-          ImportError(csQwenImage21VaeImporter + ': "' + WeightName +
-            '" must be a [out,in,k,k] conv weight, got ' +
-            Reader.ShapeAsString(WeightName));
-        LoadVaeConv(Reader, Layer, WeightName, Prefix + 'bias',
-          Layer.Neurons.Count, Layer.PrevLayer.Output.Depth,
-          Reader.DimSize(WeightName, 3));
-        LoadedNames.Add(WeightName);
-        LoadedNames.Add(Prefix + 'bias');
-      end;
+      TapPos := MultiplierPos * GroupSize + OffsetPos - FrameOffset;
+      if TapPos >= 0 then
+        Result[MultiplierPos * PlaneSize + TapPos] :=
+          Result[MultiplierPos * PlaneSize + TapPos] + 1 / GroupSize;
     end;
-    PostQuantPos := TensorLayers.IndexOf(csQwenImage21PostQuantPrefix);
-    if PostQuantPos < 0 then
-      ImportError(csQwenImage21VaeImporter + ': TensorLayers has no ' +
-        csQwenImage21PostQuantPrefix + ' entry.');
-    FoldQwenImage21LatentNorm(TNNetLayer(TensorLayers.Objects[PostQuantPos]),
-      Config);
-    // A single-image decode never runs time_conv (diffusers caches "Rep" on
-    // the first chunk), so its weights are the only decoder tensors left out.
-    Result := 0;
-    MaxTensorPos := Reader.Count - 1;
-    for TensorPos := 0 to MaxTensorPos do
+end;
+
+function AddQwenImage21AvgDown(NN: TNNet; Source: TNNetLayer; OutCh,
+  TemporalFactor, SpatialFactor: integer; pTrainable: boolean): TNNetLayer;
+var
+  Taps: TNeuralFloatDynArr;
+  Channels: TNeuralIntegerArray;
+  InCh, Multiplier, MultiplierPos, MaxMultiplierPos, ChannelPos: integer;
+  MaxChannelPos, TapX, TapY, MaxTapX, MaxTapY, TapBase: integer;
+  Tap: TNeuralFloat;
+  Depthwise: TNNetLayer;
+  Weights: TNNetVolume;
+begin
+  InCh := Source.Output.Depth;
+  Taps := QwenImage21AvgDownTaps(InCh, OutCh, TemporalFactor, SpatialFactor);
+  if (Length(Taps) = 1) and (Taps[0] = 1) then exit(Source);
+  Multiplier := OutCh div InCh;
+  Depthwise := NN.AddLayerAfter(VaeLayerTrainable(
+    TNNetDepthwiseConvLinear.Create(Multiplier, SpatialFactor, {pad=}0,
+    {stride=}SpatialFactor), pTrainable), Source);
+  // A sized net borrows these weights from its BuildWeightOwner.
+  if not Assigned(NN.BuildWeightOwner) then
+  begin
+    MaxMultiplierPos := Multiplier - 1;
+    MaxTapX := SpatialFactor - 1;
+    MaxTapY := SpatialFactor - 1;
+    MaxChannelPos := InCh - 1;
+    for MultiplierPos := 0 to MaxMultiplierPos do
     begin
-      TensorName := Reader.TensorName(TensorPos);
-      if (Pos('decoder.', TensorName) <> 1) and
-         (Pos(csQwenImage21PostQuantPrefix, TensorName) <> 1) then continue;
-      if Pos('.time_conv.', TensorName) > 0 then Inc(Result)
-      else if LoadedNames.IndexOf(TensorName) < 0 then
-        ImportError(csQwenImage21VaeImporter + ': tensor "' + TensorName +
-          '" is not used by the decoder.');
+      Weights := Depthwise.FArrNeurons[MultiplierPos].Weights;
+      for TapY := 0 to MaxTapY do
+        for TapX := 0 to MaxTapX do
+        begin
+          TapBase := Weights.GetRawPos(TapX, TapY);
+          Tap := Taps[(MultiplierPos * SpatialFactor + TapY) * SpatialFactor +
+            TapX];
+          for ChannelPos := 0 to MaxChannelPos do
+            Weights.FData[TapBase + ChannelPos] := Tap;
+        end;
+      Depthwise.FArrNeurons[MultiplierPos].BiasWeight := 0;
     end;
+    Depthwise.FlushWeightCache();
+  end;
+  Result := Depthwise;
+  if Multiplier > 1 then
+  begin
+    // The depthwise output channel n*InCh + c is diffusers' c*Multiplier + n.
+    Channels := nil;
+    SetLength(Channels, OutCh);
+    MaxChannelPos := OutCh - 1;
+    for ChannelPos := 0 to MaxChannelPos do
+      Channels[ChannelPos] := (ChannelPos mod Multiplier) * InCh +
+        ChannelPos div Multiplier;
+    Result := NN.AddLayer(VaeLayerTrainable(TNNetGatherChannels.Create(Channels),
+      pTrainable));
+  end;
+end;
+
+// Raises unless ImageW and ImageH are positive multiples of SpatialScale.
+procedure CheckQwenImage21VaeImageSize(const Config: TQwenImage21VaeConfig;
+  ImageW, ImageH: integer);
+begin
+  if (ImageW < Config.SpatialScale) or (ImageH < Config.SpatialScale) or
+     (ImageW mod Config.SpatialScale <> 0) or
+     (ImageH mod Config.SpatialScale <> 0) then
+    ImportError(csQwenImage21VaeImporter + ': the encoder needs image sides ' +
+      'that are positive multiples of ' + IntToStr(Config.SpatialScale) +
+      ', got ' + IntToStr(ImageW) + 'x' + IntToStr(ImageH) + '.');
+end;
+
+function BuildQwenImage21VaeEncoderNet(NN: TNNet;
+  const Config: TQwenImage21VaeConfig; ImageW, ImageH: integer;
+  TensorLayers: TStringList): TNNetLayer;
+var
+  LevelCount, DownPos, MaxDownPos, ResPos, MaxResPos, InCh, OutCh: integer;
+  TemporalFactor, SpatialFactor: integer;
+  DownPrefix: string;
+  BlockInput, MainPath, Shortcut: TNNetLayer;
+
+  function Track(Layer: TNNetLayer; const TensorPrefix: string): TNNetLayer;
+  begin
+    Result := TrackQwenImage21VaeLayer(TensorLayers, Layer, TensorPrefix);
+  end;
+
+begin
+  CheckQwenImage21VaeImageSize(Config, ImageW, ImageH);
+  LevelCount := Length(Config.DimMult);
+  NN.AddLayer(TNNetInput.Create(ImageW, ImageH, Config.InChannels).
+    SetTrainable(false));
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(Config.EncoderDims[0], 3, 1,
+    1, 0).SetTrainable(false)), 'encoder.conv_in.');
+  MaxDownPos := LevelCount - 1;
+  MaxResPos := Config.NumResBlocks - 1;
+  for DownPos := 0 to MaxDownPos do
+  begin
+    DownPrefix := 'encoder.down_blocks.' + IntToStr(DownPos) + '.';
+    BlockInput := NN.GetLastLayer();
+    InCh := Config.EncoderDims[DownPos];
+    OutCh := Config.EncoderDims[DownPos + 1];
+    for ResPos := 0 to MaxResPos do
+    begin
+      AddQwenImage21VaeResnet(NN, TensorLayers, DownPrefix + 'resnets.' +
+        IntToStr(ResPos) + '.', InCh, OutCh);
+      InCh := OutCh;
+    end;
+    TemporalFactor := 1;
+    SpatialFactor := 1;
+    if DownPos < MaxDownPos then
+    begin
+      // downsample2d and downsample3d resample alike on one image; time_conv
+      // never runs.
+      Track(AddVaeAsymmetricDownsample(NN, OutCh, {pTrainable=}false),
+        DownPrefix + 'downsampler.resample.1.');
+      SpatialFactor := 2;
+      if Config.TemporalDownsample[DownPos] then TemporalFactor := 2;
+    end;
+    MainPath := NN.GetLastLayer();
+    Shortcut := AddQwenImage21AvgDown(NN, BlockInput, OutCh, TemporalFactor,
+      SpatialFactor);
+    NN.AddLayer(TNNetSum.Create([MainPath, Shortcut]).SetTrainable(false));
+  end;
+  AddQwenImage21VaeMidBlock(NN, TensorLayers, 'encoder.mid_block.',
+    Config.EncoderDims[LevelCount]);
+  Track(NN.AddLayer(CreateQwenImage21VaeNorm(Config.EncoderDims[LevelCount])),
+    'encoder.norm_out.');
+  NN.AddLayer(TNNetSiLU.Create().SetTrainable(false));
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(2 * Config.ZDim, 3, 1, 1,
+    0).SetTrainable(false)), 'encoder.conv_out.');
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(2 * Config.ZDim, 1, 0, 1,
+    0).SetTrainable(false)), csQwenImage21QuantPrefix);
+  // DiagonalGaussianDistribution: the first z_dim channels are the mean.
+  NN.AddLayer(TNNetSplitChannels.Create(0, Config.ZDim).SetTrainable(false));
+  // The attention's inner layers are created trainable.
+  NN.SetTrainable(false);
+  Result := NN.GetLastLayer();
+end;
+
+// latent = (mean - latents_mean) / latents_std on quant_conv's mean rows (1x1):
+// W'[o,i] = W[o,i] / std[o], b'[o] = (b[o] - mean[o]) / std[o], o < z_dim.
+procedure FoldQwenImage21QuantConvLatentNorm(QuantConv: TNNetLayer;
+  const Config: TQwenImage21VaeConfig);
+var
+  OutPos, MaxOutPos: integer;
+  InvStd: TNeuralFloat;
+begin
+  MaxOutPos := Config.ZDim - 1;
+  for OutPos := 0 to MaxOutPos do
+  begin
+    InvStd := 1 / Config.LatentsStd[OutPos];
+    QuantConv.FArrNeurons[OutPos].Weights.Mul(InvStd);
+    QuantConv.FArrNeurons[OutPos].BiasWeight :=
+      (QuantConv.FArrNeurons[OutPos].BiasWeight - Config.LatentsMean[OutPos]) *
+      InvStd;
+  end;
+  QuantConv.FlushWeightCache();
+end;
+
+function LoadQwenImage21VaeEncoderWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
+var
+  LoadedNames: TStringList;
+begin
+  LoadedNames := CreateQwenImage21LoadedNames();
+  try
+    LoadQwenImage21VaeTensorLayers(Reader, TensorLayers, LoadedNames);
+    FoldQwenImage21QuantConvLatentNorm(FindQwenImage21VaeTensorLayer(
+      TensorLayers, csQwenImage21QuantPrefix), Config);
+    Result := CountQwenImage21VaeSkippedTensors(Reader, LoadedNames,
+      'encoder.', csQwenImage21QuantPrefix);
   finally
     LoadedNames.Free;
   end;
@@ -68788,6 +69146,93 @@ begin
     Result := 'tile size ' + IntToStr(TileSampleSize) + ' and stride ' +
       IntToStr(TileSampleStride) + ' must be multiples of ' +
       IntToStr(SpatialScale) + ' with stride <= size.';
+end;
+
+{ TQwenImage21VaeEncoder }
+
+constructor TQwenImage21VaeEncoder.Create(const VaeFolder: string);
+var
+  Folder: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  Folder := IncludeTrailingPathDelimiter(VaeFolder);
+  Reader := TNNetSafeTensorsReader.Create(Folder +
+    'diffusion_pytorch_model.safetensors');
+  try
+    CreateFromReader(Reader, ReadQwenImage21VaeConfig(Folder + 'config.json'));
+  finally
+    Reader.Free;
+  end;
+end;
+
+constructor TQwenImage21VaeEncoder.CreateFromReader(
+  Reader: TNNetSafeTensorsReader; const Config: TQwenImage21VaeConfig);
+begin
+  inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
+  FShareHostOutputs := GetEnvironmentVariable('NEURAL_SHARE_HOST_OUTPUTS') <> '0';
+  FConfig := Config;
+  LoadFromReader(Reader);
+end;
+
+destructor TQwenImage21VaeEncoder.Destroy();
+begin
+  ReleaseNet();
+  FWeightOwner.Free;
+  inherited Destroy();
+end;
+
+procedure TQwenImage21VaeEncoder.LoadFromReader(
+  Reader: TNNetSafeTensorsReader);
+var
+  TensorLayers: TStringList;
+begin
+  TensorLayers := TStringList.Create;
+  try
+    FWeightOwner := TNNet.Create();
+    BuildQwenImage21VaeEncoderNet(FWeightOwner, FConfig, FConfig.SpatialScale,
+      FConfig.SpatialScale, TensorLayers);
+    FSkippedTensorCount := LoadQwenImage21VaeEncoderWeights(Reader, FConfig,
+      TensorLayers);
+  finally
+    TensorLayers.Free;
+  end;
+end;
+
+procedure TQwenImage21VaeEncoder.PrepareNet(ImageW, ImageH: integer);
+begin
+  if Assigned(FNet) and (ImageW = FNetImageW) and (ImageH = FNetImageH) then
+    exit;
+  CheckQwenImage21VaeImageSize(FConfig, ImageW, ImageH);
+  ReleaseNet();
+  FNet := TNNet.Create();
+  FNet.BuildWeightOwner := FWeightOwner;
+  BuildQwenImage21VaeEncoderNet(FNet, FConfig, ImageW, ImageH);
+  FNet.BuildWeightOwner := nil;
+  PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
+  FNet.ShareHostOutputsByLiveness := FShareHostOutputs;
+  FNetImageW := ImageW;
+  FNetImageH := ImageH;
+end;
+
+procedure TQwenImage21VaeEncoder.ReleaseNet();
+begin
+  FreeAndNil(FNet);
+  FNetImageW := 0;
+  FNetImageH := 0;
+end;
+
+procedure TQwenImage21VaeEncoder.Encode(Image, Latent: TNNetVolume);
+begin
+  if Image.Depth <> FConfig.InChannels then
+    ImportError(csQwenImage21VaeImporter + ': the image has ' +
+      IntToStr(Image.Depth) + ' channels, expected in_channels = ' +
+      IntToStr(FConfig.InChannels) + '.');
+  PrepareNet(Image.SizeX, Image.SizeY);
+  FNet.Compute(Image, 0, FParallel);
+  FNet.GetLastLayer().ForceOutputOnRAM();
+  Latent.Copy(FNet.GetLastLayer().Output);
 end;
 
 { TQwenImage21VaeDecoder }
@@ -71730,7 +72175,7 @@ var
   MidAttn: TVaeAttnLayers;
   DownRes: array of array of TVaeResnetLayers;
   DownConv: array of TNNetLayer;
-  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, Out2, H: integer;
+  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, Out2: integer;
   NumBlockOutM1, nResnetM1: integer;
   Prefix: string;
 begin
@@ -71768,15 +72213,7 @@ begin
       InCh := OutCh;
       if d < Config.NumBlockOut - 1 then
       begin
-        // diffusers Downsample2D: asymmetric pad (0,1,0,1) then stride-2 3x3
-        // conv (pad 0). Reproduce by padding ALL sides by 1 (PadXY) then
-        // cropping off the top/left pad (Crop start (1,1)), leaving the
-        // right/bottom-only pad, then a stride-2 pad-0 conv.
-        H := NN.GetLastLayer().Output.SizeY;
-        NN.AddLayer( TNNetPadXY.Create(1, 1) );
-        NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
-        DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetTrainable(pTrainable) );
+        DownConv[d] := AddVaeAsymmetricDownsample(NN, OutCh, pTrainable);
       end
       else
         DownConv[d] := nil;
@@ -71993,7 +72430,7 @@ var
   MidAttn: TVaeAttnLayers;
   DownRes: array of array of TVaeResnetLayers;
   DownConv: array of TNNetLayer;
-  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, H: integer;
+  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid: integer;
   NumBlockOutM1, nResnetM1: integer;
   Prefix: string;
 begin
@@ -72028,11 +72465,7 @@ begin
       InCh := OutCh;
       if d < Config.NumBlockOut - 1 then
       begin
-        H := NN.GetLastLayer().Output.SizeY;
-        NN.AddLayer( TNNetPadXY.Create(1, 1) );
-        NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
-        DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetTrainable(pTrainable) );
+        DownConv[d] := AddVaeAsymmetricDownsample(NN, OutCh, pTrainable);
       end
       else
         DownConv[d] := nil;
