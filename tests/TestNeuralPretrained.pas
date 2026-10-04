@@ -23,7 +23,7 @@ uses
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralchatengine, neuralchat,
-  neuraldecode, neuraldiffusion, neuralthread;
+  neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
 type
   // One greedy chat turn through TChatEngine, as the --prefill-window parity
@@ -816,6 +816,11 @@ type
     procedure TestQwenImage21PipelineUnloadComponents;
     procedure TestQwenImage21PipelineOpenCLKeepLoaded;
     procedure TestQwenImage21PipelineImageStats;
+    procedure TestQwenImage21LanczosResizeVsPIL;
+    procedure TestQwenImage21PrepareVaeImage;
+    procedure TestQwenImage21SizeForAspect;
+    procedure TestQwenImage21Img2ImgParity;
+    procedure TestQwenImage21Img2ImgKeepLoaded;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -30838,6 +30843,488 @@ begin
     LatentsB.Free;
     LatentsA.Free;
     Pipeline.Free;
+  end;
+end;
+
+// ResizeImageLanczos vs PIL LANCZOS in mode 'F' (shrink, enlarge, mixed, same
+// size); 1e-3 on 0..255 values is ~20 single ulps.
+procedure TTestNeuralPretrained.TestQwenImage21LanczosResizeVsPIL;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases: TJSONArray;
+  CaseObj: TJSONObject;
+  Source, Resized, Expected: TNNetVolume;
+  CasePos, InW, InH, OutW, OutH, X, Y, Channel: integer;
+  FlatPos: int64;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Source := TNNetVolume.Create;
+  Resized := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('qwenimage21_img2img_oracle.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).FindPath('resize.float_cases'));
+    AssertEquals('resize cases', 4, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      InW := CaseObj.Get('in_w', 0);
+      InH := CaseObj.Get('in_h', 0);
+      OutW := CaseObj.Get('out_w', 0);
+      OutH := CaseObj.Get('out_h', 0);
+      Source.ReSize(InW, InH, 3);
+      for Channel := 0 to 2 do
+        for Y := 0 to InH - 1 do
+          for X := 0 to InW - 1 do
+          begin
+            FlatPos := (int64(Channel) * InH + Y) * InW + X;
+            Source[X, Y, Channel] := ((FlatPos * 7919 + 13) mod 2049) /
+              1024 * 127.5;
+          end;
+      ResizeImageLanczos(Source, Resized, OutW, OutH);
+      LoadOracleTokenTensorObject(CaseObj.Find('output_hwc'), 'output_hwc',
+        Expected);
+      Expected.ReSize(OutW, OutH, 3);
+      AssertTrue('oracle not empty', Expected.GetMaxAbs() > 100);
+      AssertEquals('width', OutW, Resized.SizeX);
+      AssertEquals('height', OutH, Resized.SizeY);
+      MaxDiff := MaxAbsVolumeDiff(Resized, Expected);
+      WriteLn(Format('  Lanczos %dx%d -> %dx%d vs PIL: max|diff|=%.2e',
+        [InW, InH, OutW, OutH, MaxDiff]));
+      AssertTrue(Format('%dx%d -> %dx%d: max |diff| = %g must be < 1e-3',
+        [InW, InH, OutW, OutH, MaxDiff]), MaxDiff < 1e-3);
+      // In place gives the same result.
+      Resized.Copy(Source);
+      ResizeImageLanczos(Resized, Resized, OutW, OutH);
+      AssertEquals('in place', 0, MaxAbsVolumeDiff(Resized, Expected), 1e-3);
+    end;
+  finally
+    Expected.Free;
+    Resized.Free;
+    Source.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// PrepareVaeImage vs PIL's 8-bit RGBA resize (3 of 255; low/zero alpha: alpha
+// and premultiplied RGB, 8 of 255), then the RGB and opaque paths.
+procedure TTestNeuralPretrained.TestQwenImage21PrepareVaeImage;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases: TJSONArray;
+  CaseObj: TJSONObject;
+  Source, VaeImage, Expected, OpaqueRgba, Reference: TNNetVolume;
+  InW, InH, OutW, OutH, ValuePos, PixelPos, CasePos, Channel: integer;
+  MaxDiff, MaxAlphaDiff, MaxPremultipliedDiff, Diff,
+    PremultipliedTolerance: double;
+  IsLowAlpha: boolean;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Source := TNNetVolume.Create;
+  VaeImage := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  OpaqueRgba := TNNetVolume.Create;
+  Reference := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('qwenimage21_img2img_oracle.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).FindPath(
+      'resize.rgba_uint8_cases'));
+    AssertEquals('RGBA cases', 2, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      IsLowAlpha := CaseObj.Get('low_alpha', false);
+      InW := CaseObj.Get('in_w', 0);
+      InH := CaseObj.Get('in_h', 0);
+      OutW := CaseObj.Get('out_w', 0);
+      OutH := CaseObj.Get('out_h', 0);
+      LoadOracleTokenTensorObject(CaseObj.Find('input_hwc'), 'input_hwc',
+        Source);
+      Source.ReSize(InW, InH, 4);
+      LoadOracleTokenTensorObject(CaseObj.Find('output_hwc'), 'output_hwc',
+        Expected);
+      Expected.ReSize(OutW, OutH, 4);
+      QwenImage21PrepareVaeImage(Source, OutW, OutH, VaeImage);
+      AssertEquals('RGBA out', 4, VaeImage.Depth);
+      AssertEquals('width', OutW, VaeImage.SizeX);
+      AssertTrue('inside [-1, 1]', (VaeImage.GetMin() >= -1) and
+        (VaeImage.GetMax() <= 1));
+      VaeImage.Add(1);
+      VaeImage.Mul(127.5);
+      // Low alpha multiplies PIL's 8-bit rounding by 255/alpha in RGB, so
+      // compare alpha and premultiplied RGB there.
+      MaxAlphaDiff := 0;
+      MaxPremultipliedDiff := 0;
+      for PixelPos := 0 to OutW * OutH - 1 do
+      begin
+        Diff := Abs(VaeImage.FData[PixelPos * 4 + 3] -
+          Expected.FData[PixelPos * 4 + 3]);
+        if Diff > MaxAlphaDiff then MaxAlphaDiff := Diff;
+        for Channel := 0 to 2 do
+        begin
+          Diff := Abs(VaeImage.FData[PixelPos * 4 + Channel] *
+            VaeImage.FData[PixelPos * 4 + 3] -
+            Expected.FData[PixelPos * 4 + Channel] *
+            Expected.FData[PixelPos * 4 + 3]) / 255;
+          if Diff > MaxPremultipliedDiff then MaxPremultipliedDiff := Diff;
+        end;
+      end;
+      MaxDiff := MaxAbsVolumeDiff(VaeImage, Expected);
+      WriteLn(Format('  RGBA prepare vs PIL uint8 (low alpha %s): max|diff| ' +
+        '%.3f, alpha %.3f, premultiplied RGB %.3f of 255',
+        [BoolToStr(IsLowAlpha, true), MaxDiff, MaxAlphaDiff,
+        MaxPremultipliedDiff]));
+      AssertTrue('alpha vs PIL: ' + FloatToStr(MaxAlphaDiff) + ' must be < 3',
+        MaxAlphaDiff < 3);
+      // PIL clips the Lanczos ringing to 0..255 between its two passes; a
+      // float numpy run without that clip gives the same 6.98 on low alpha.
+      if IsLowAlpha then PremultipliedTolerance := 8
+      else PremultipliedTolerance := 3;
+      AssertTrue('premultiplied RGB vs PIL: ' +
+        FloatToStr(MaxPremultipliedDiff) + ' must be < ' +
+        FloatToStr(PremultipliedTolerance),
+        MaxPremultipliedDiff < PremultipliedTolerance);
+      if not IsLowAlpha then
+        AssertTrue('RGBA vs PIL: ' + FloatToStr(MaxDiff) + ' must be < 3',
+          MaxDiff < 3);
+    end;
+
+    // Opaque RGB at the same size: exact, alpha +1, also in place.
+    Source.ReSize(5, 3, 3);
+    for ValuePos := 0 to Source.Size - 1 do
+      Source.FData[ValuePos] := (ValuePos * 37) mod 256;
+    QwenImage21PrepareVaeImage(Source, 5, 3, VaeImage);
+    AssertEquals('RGB gets an alpha channel', 4, VaeImage.Depth);
+    for PixelPos := 0 to 14 do
+    begin
+      AssertEquals('alpha +1', 1, VaeImage.FData[PixelPos * 4 + 3], 1e-6);
+      AssertEquals('red copied', Source.FData[PixelPos * 3] / 127.5 - 1,
+        VaeImage.FData[PixelPos * 4], 1e-6);
+    end;
+    Reference.Copy(VaeImage);
+    VaeImage.Copy(Source);
+    QwenImage21PrepareVaeImage(VaeImage, 5, 3, VaeImage);
+    AssertEquals('in place', 0, MaxAbsVolumeDiff(VaeImage, Reference), 0);
+    // Resized: RGB and the same image as opaque RGBA (no copy) agree, alpha +1.
+    QwenImage21PrepareVaeImage(Source, 9, 7, Reference);
+    OpaqueRgba.ReSize(5, 3, 4);
+    for PixelPos := 0 to 14 do
+    begin
+      for Channel := 0 to 2 do
+        OpaqueRgba.FData[PixelPos * 4 + Channel] :=
+          Source.FData[PixelPos * 3 + Channel];
+      OpaqueRgba.FData[PixelPos * 4 + 3] := 255;
+    end;
+    QwenImage21PrepareVaeImage(OpaqueRgba, 9, 7, VaeImage);
+    AssertEquals('opaque RGBA = RGB', 0, MaxAbsVolumeDiff(VaeImage,
+      Reference), 1e-6);
+    for PixelPos := 0 to 9 * 7 - 1 do
+      AssertEquals('resized alpha +1', 1, VaeImage.FData[PixelPos * 4 + 3],
+        1e-5);
+  finally
+    Reference.Free;
+    OpaqueRgba.Free;
+    Expected.Free;
+    VaeImage.Free;
+    Source.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// QwenImage21SizeForAspect against diffusers' calculate_dimensions.
+procedure TTestNeuralPretrained.TestQwenImage21SizeForAspect;
+
+  procedure Check(TargetArea, AspectRatio: double; ExpectedW,
+    ExpectedH: integer);
+  var
+    Width, Height: integer;
+  begin
+    QwenImage21SizeForAspect(TargetArea, AspectRatio, Width, Height);
+    AssertEquals(FloatToStr(AspectRatio) + ' width', ExpectedW, Width);
+    AssertEquals(FloatToStr(AspectRatio) + ' height', ExpectedH, Height);
+  end;
+
+begin
+  Check(1024 * 1024, 16 / 9, 1376, 768);
+  Check(1024 * 1024, 1, 1024, 1024);
+  Check(512 * 512, 4032 / 3024, 576, 448);
+  Check(1024 * 1024, 3 / 4, 896, 1184);
+  Check(64 * 64, 1, 64, 64);
+  Check(1024 * 1024, 1000, 32384, 32);
+  // diffusers would give a side of 0 here; the pipeline needs 32.
+  Check(1024 * 1024, 100000, 323808, 32);
+end;
+
+// img2img on the pico pipeline vs the float64 oracle: init latents, t_start,
+// noised latents, the steps run (CheckQwenImage21PipelineOracle's 5e-5).
+procedure TTestNeuralPretrained.TestQwenImage21Img2ImgParity;
+const
+  LatentTolerance = 5e-5;
+var
+  RefJson: TStringList;
+  RefRoot, EmbedsRoot: TJSONData;
+  StepArr, TimestepArr: TJSONArray;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, InitImage, ImageLatents, Noise, Noised, Expected, Image: TNNetVolume;
+  ExpectedPhases: array of TQwenImage21PipelinePhase;
+  Width, Height, StepCount, StartStep, StepsRun, StepPos: integer;
+  Strength, MaxDiff: double;
+
+  procedure AssertMaxDiff(Actual: TNNetVolume; Tolerance: double;
+    const What: string);
+  begin
+    MaxDiff := MaxAbsVolumeDiff(Actual, Expected);
+    WriteLn('  Qwen-Image-2.1 img2img ', What, ': max|diff|=', MaxDiff:0:9);
+    AssertTrue('img2img ' + What + ': max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < ' + FloatToStr(Tolerance), MaxDiff < Tolerance);
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Noised := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  SetLength(FQwenImage21Phases, 0);
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_img2img_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    StepCount := TJSONObject(RefRoot).Get('num_inference_steps', 0);
+    Strength := TJSONObject(RefRoot).Get('strength', 0.0);
+    StartStep := TJSONObject(RefRoot).Get('t_start', -1);
+    StepsRun := TJSONObject(RefRoot).Get('steps_run', 0);
+    AssertEquals('t_start', StartStep,
+      TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength));
+    LoadOracleTokenTensor(RefRoot, 'noise', Noise);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.OnPhase := @RecordQwenImage21Phase;
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    // The oracle's [-1, 1] init image in the 0..255 scale EncodeImage reads.
+    FillQwenImage21FormulaImage(InitImage, Width, Height, 4);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    Pipeline.EncodeImage(InitImage, Width, Height, ImageLatents);
+    LoadOracleTokenTensor(RefRoot, 'image_latents', Expected);
+    AssertEquals('image latent tokens', Expected.SizeX, ImageLatents.SizeX);
+    AssertEquals('image latent rows', 1, ImageLatents.SizeY);
+    AssertMaxDiff(ImageLatents, 1e-5, 'image latents');
+
+    Noised.Copy(Noise);
+    Pipeline.GenerateFromEmbeds(Embeds, Width, Height, StepCount, {Seed=}0,
+      Image, Noise, ImageLatents, Strength);
+    // The pipeline left its StepCount schedule in the scheduler.
+    Pipeline.Scheduler.ScaleNoise(Noised, ImageLatents, StartStep);
+    LoadOracleTokenTensor(RefRoot, 'noised_latents', Expected);
+    AssertMaxDiff(Noised, 1e-5, 'noised latents');
+
+    ExpectedPhases := [qppLoadVaeEncoder, qppEncodeImage, qppLoadTransformer,
+      qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode, qppDone];
+    AssertEquals('phase count', Length(ExpectedPhases),
+      Length(FQwenImage21Phases));
+    for StepPos := 0 to High(ExpectedPhases) do
+      AssertTrue('phase ' + IntToStr(StepPos),
+        ExpectedPhases[StepPos] = FQwenImage21Phases[StepPos]);
+    AssertTrue('stats: init image', Pipeline.ImageStats.UsedInitImage);
+    AssertEquals('stats: steps run', StepsRun, Pipeline.ImageStats.StepCount);
+
+    StepArr := TJSONArray(TJSONObject(RefRoot).Find('step_latents'));
+    TimestepArr := TJSONArray(TJSONObject(RefRoot).Find('timesteps'));
+    AssertEquals('steps run', StepsRun, Length(FQwenImage21StepLatents));
+    AssertEquals('oracle steps', StepsRun, StepArr.Count);
+    for StepPos := 0 to StepsRun - 1 do
+    begin
+      AssertEquals('timestep ' + IntToStr(StepPos),
+        TimestepArr.Floats[StepPos], FQwenImage21StepTimesteps[StepPos], 5e-4);
+      LoadOracleTokenTensorObject(StepArr.Items[StepPos], 'step_latents',
+        Expected);
+      AssertMaxDiff(FQwenImage21StepLatents[StepPos], LatentTolerance,
+        'latents after step ' + IntToStr(StepPos));
+    end;
+    AssertEquals('image width', Width, Image.SizeX);
+  finally
+    for StepPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[StepPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    Image.Free;
+    Expected.Free;
+    Noised.Free;
+    Noise.Free;
+    ImageLatents.Free;
+    InitImage.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Loaded img2img = one-shot bit for bit, the VAE encoder kept and freed, the
+// encode stats kept, and the refusals of GenerateFromEmbeds and Denoise.
+procedure TTestNeuralPretrained.TestQwenImage21Img2ImgKeepLoaded;
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  StepCount = 4;
+  Strength = 0.5;
+var
+  OneShot, Loaded: TQwenImage21Pipeline;
+  Embeds, InitImage, LatentsOneShot, LatentsLoaded, ImageOneShot,
+    ImageLoaded: TNNetVolume;
+  Encoder: TQwenImage21VaeEncoder;
+  PhasePos, EncodeTry: integer;
+  EncodeMs: double;
+  Refused: boolean;
+
+  // Denoise of the 64x32 image from StartStep with ImageLatents is refused.
+  function IsDenoiseRefused(StartStep: integer;
+    ImageLatents: TNNetVolume): boolean;
+  begin
+    Result := false;
+    LatentsOneShot.Copy(LatentsLoaded);
+    try
+      Loaded.Denoise(Embeds, 64, 32, StepCount, LatentsOneShot, StartStep,
+        ImageLatents);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  OneShot := nil;
+  Loaded := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  LatentsOneShot := TNNetVolume.Create;
+  LatentsLoaded := TNNetVolume.Create;
+  ImageOneShot := TNNetVolume.Create;
+  ImageLoaded := TNNetVolume.Create;
+  try
+    OneShot := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Loaded := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Loaded.LoadComponents();
+    AssertTrue('LoadComponents leaves the VAE encoder out',
+      Loaded.LoadedVaeEncoder = nil);
+    // A 48x40 RGB image resized to 64x32.
+    FillQwenImage21FormulaImage(InitImage, 48, 40, 3);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    OneShot.EncodeTokenIds(TokenIds, 5, Embeds);
+    OneShot.EncodeImage(InitImage, 64, 32, LatentsOneShot);
+    AssertTrue('one-shot keeps no encoder', OneShot.LoadedVaeEncoder = nil);
+    OneShot.GenerateFromEmbeds(Embeds, 64, 32, StepCount, 7, ImageOneShot,
+      nil, LatentsOneShot, Strength);
+    AssertEquals('steps run', 2, OneShot.ImageStats.StepCount);
+
+    SetLength(FQwenImage21Phases, 0);
+    Loaded.OnPhase := @RecordQwenImage21Phase;
+    Loaded.EncodeImage(InitImage, 64, 32, LatentsLoaded);
+    AssertTrue('the first encode loads the encoder',
+      (Length(FQwenImage21Phases) = 2) and
+      (FQwenImage21Phases[0] = qppLoadVaeEncoder));
+    Encoder := Loaded.LoadedVaeEncoder;
+    AssertTrue('the encoder is kept', Assigned(Encoder));
+    AssertTrue('its net is freed', Encoder.Net = nil);
+    // Now() ticks per ms: encode until the phase is measurable (as D5).
+    EncodeTry := 0;
+    repeat
+      Inc(EncodeTry);
+      SetLength(FQwenImage21Phases, 0);
+      Loaded.EncodeImage(InitImage, 64, 32, LatentsLoaded);
+      EncodeMs := Loaded.ImageStats.PhaseMs[qppEncodeImage];
+    until (EncodeMs > 0) or (EncodeTry >= 20);
+    AssertTrue('encode phase measured', EncodeMs > 0);
+    AssertEquals('a later encode loads nothing', 1,
+      Length(FQwenImage21Phases));
+    AssertTrue('encode phase', FQwenImage21Phases[0] = qppEncodeImage);
+    AssertEquals('same image latents', 0, MaxAbsVolumeDiff(LatentsLoaded,
+      LatentsOneShot), 0);
+    Loaded.GenerateFromEmbeds(Embeds, 64, 32, StepCount, 7, ImageLoaded, nil,
+      LatentsLoaded, Strength);
+    AssertEquals('same image', 0, MaxAbsVolumeDiff(ImageLoaded, ImageOneShot),
+      0);
+    AssertEquals('img2img keeps the encode phase', EncodeMs,
+      Loaded.ImageStats.PhaseMs[qppEncodeImage], 0);
+    for PhasePos := 0 to High(FQwenImage21Phases) do
+      AssertFalse('no load phase (phase ' + IntToStr(PhasePos) + ')',
+        FQwenImage21Phases[PhasePos] in [qppLoadVaeEncoder, qppLoadTransformer,
+        qppLoadVae]);
+
+    Refused := false;
+    try
+      Loaded.GenerateFromEmbeds(Embeds, 64, 32, StepCount, 7, ImageLoaded,
+        nil, LatentsLoaded, 1e-20);
+    except
+      on Exception do Refused := true;
+    end;
+    AssertTrue('a strength that leaves no step is refused', Refused);
+    Refused := false;
+    try
+      Loaded.GenerateFromEmbeds(Embeds, 64, 64, StepCount, 7, ImageLoaded,
+        nil, LatentsLoaded, Strength);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('image latents of another size are refused', Refused);
+    Refused := false;
+    try
+      Loaded.GenerateFromEmbeds(Embeds, 64, 32, StepCount, 7, ImageLoaded,
+        nil, nil, Strength);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('img2img without image latents is refused', Refused);
+    AssertTrue('Denoise from step 2 without image latents is refused',
+      IsDenoiseRefused(2, nil));
+    AssertTrue('Denoise start step = StepCount is refused',
+      IsDenoiseRefused(StepCount, LatentsLoaded));
+    AssertTrue('Denoise start step -1 is refused',
+      IsDenoiseRefused(-1, LatentsLoaded));
+    AssertFalse('Denoise from step 2 with image latents runs',
+      IsDenoiseRefused(2, LatentsLoaded));
+    Loaded.GenerateFromEmbeds(Embeds, 64, 32, StepCount, 7, ImageLoaded);
+    AssertFalse('text-to-image: no init image',
+      Loaded.ImageStats.UsedInitImage);
+    AssertEquals('text-to-image runs every step', StepCount,
+      Loaded.ImageStats.StepCount);
+    AssertEquals('text-to-image drops the image-encode phase', 0,
+      Loaded.ImageStats.PhaseMs[qppEncodeImage], 0);
+    Loaded.UnloadComponents();
+    AssertTrue('UnloadComponents frees the encoder',
+      Loaded.LoadedVaeEncoder = nil);
+  finally
+    Loaded.Free;
+    OneShot.Free;
+    ImageLoaded.Free;
+    ImageOneShot.Free;
+    LatentsLoaded.Free;
+    LatentsOneShot.Free;
+    InitImage.Free;
+    Embeds.Free;
   end;
 end;
 

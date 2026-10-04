@@ -34,8 +34,10 @@ transformer prefix pass always run on the CPU.
 `--cpu` runs everything on the CPU, and the program falls back to the CPU by
 itself when it finds no usable OpenCL device.
 
-Image editing and reference images are not implemented yet (see
-[Known limitations](#known-limitations)).
+`--image FILE` starts from an init image instead of pure noise (SDEdit
+img2img, see [img2img](#img2img-sdedit)): it re-styles the image. Image
+editing that follows instructions, and reference images, are not implemented
+yet (see [Known limitations](#known-limitations)).
 
 ## Getting the model
 
@@ -131,6 +133,8 @@ follow:
 | `/steps N` | Euler steps |
 | `/seed N` | seed of the next image; without it the seed grows by one per image |
 | `/tile SIZE[,STRIDE]` | VAE tile, as `--vae-tile` |
+| `/image FILE` | init image for the next prompts (img2img, as `--image`); `/image off` clears it |
+| `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
@@ -151,6 +155,56 @@ A street market in the rain, photograph
 The same seed, size and step count give the same image again: the initial
 noise comes from the FPC random generator. For the same reason an image does
 not equal the diffusers image for the same seed.
+
+### img2img (SDEdit)
+
+`--image FILE` (or `/image FILE` in the REPL) makes each image start from an
+init image instead of pure noise:
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --image photo.jpg \
+  --strength 0.6 -p "a watercolor painting of a harbor" --output harbor.png
+```
+
+1. The VAE encoder (`TQwenImage21VaeEncoder`, on the CPU, untiled) encodes
+   the init image to latents: the posterior mean, as the 2.1 pipeline
+   encodes its condition images. (The v1 img2img pipeline samples the
+   posterior instead.)
+2. `--strength S` cuts the schedule: of N steps, the first
+   `t_start = int(N - N * S)` are skipped. 18 steps at 0.6 run the last 11;
+   strength 1 runs all of them from pure noise. A strength that leaves no
+   step is an error.
+3. Each image mixes the seed's noise into the init latents at the sigma
+   where the schedule is cut (`sigma * noise + (1 - sigma) * latents`) and
+   runs only the remaining steps.
+
+Steps 2 and 3 are the start-step and noise schedule of the Qwen-Image v1
+diffusers pipeline (`QwenImageImg2ImgPipeline`), applied to the 2.1
+schedule; diffusers ships no img2img pipeline for 2.1.
+The prompt describes the whole picture you want: img2img keeps the init
+image's layout and colours to a degree set by the strength, and re-styles
+it. It does not follow edit instructions such as "remove the car".
+
+The output keeps the init image's aspect ratio at the area of `--width` x
+`--height` (default 1024x1024), each side a multiple of 32 — the
+`calculate_dimensions` rule of the diffusers 2.1 pipeline. A 4000x3000
+photo gives 1184x896 at the default area. The program resizes the init image
+to that size with PIL's Lanczos coefficients in floating point
+(`ResizeImageLanczos` in `neural/neuralimageresize.pas`). That equals PIL on
+float ('F' mode) images. On the 8-bit images diffusers resizes, PIL uses
+fixed-point coefficients, an integer alpha premultiply, and rounds and clips
+to 8 bits after each pass, so the results differ by a few levels of 255. An
+image with an alpha channel is resized with premultiplied alpha, as PIL
+does, and the VAE encodes all four channels; an image without alpha is
+opaque. The JPEG EXIF orientation is not applied (diffusers' `load_image`
+applies `exif_transpose`), so a rotated phone photo stays as stored.
+
+The init image is encoded once and reused: by every image of a `--repeat`
+batch or `/repeat`, and by later REPL prompts until `/image`, `/size` (when
+the output size changes) or `/image off`. The noise still changes with the
+seed. In keep-loaded mode (the REPL, `--repeat N` > 1) the first encode
+loads the VAE encoder and keeps it beside the other components; a one-shot
+run loads it and frees it after the encode.
 
 ## Options
 
@@ -188,6 +242,8 @@ and `--fp32`, the last one given wins.
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
 | `--steps N` | Euler steps | 18 |
 | `--seed N` | seed of the initial noise | 42 |
+| `--image FILE` | img2img from this init image (PNG, JPEG, ...); see [img2img](#img2img-sdedit) | — |
+| `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
@@ -269,6 +325,8 @@ Stages of image 1 (wall time):
   memory, with the uploaded MB.
 - In the REPL and with `--repeat`, the prompt is encoded once: its rows count
   in the first image of the prompt, and later images show "encoded once".
+  The "encode init image" row of img2img works the same way, and
+  "denoise" counts only the steps that ran.
 - ms per step and ms per tile include one-time setup: step 1 builds and arms
   the step pass, and the decode builds, arms and uploads the weights of one
   VAE net per tile shape (the "net(s) built" count).
@@ -336,8 +394,11 @@ under [VAE tiles](#vae-tiles).
 - An OpenCL error, such as a failed allocation, is printed but not detected.
   The pipeline cannot tell that a layer failed, so a REPL image can be wrong
   yet reported as written. Watch the log for OpenCL error lines.
-- Text-to-image only: image editing, reference images and the negative
-  prompt (classifier-free guidance) are not implemented yet.
+- Image editing that follows instructions, reference images and the
+  negative prompt (classifier-free guidance) are not implemented yet;
+  `--image` is img2img (SDEdit) only.
+- The VAE encoder runs untiled on the CPU, so its memory grows with the
+  output size. It has not been measured at 1024x1024 on the real checkpoint.
 
 ## Advanced: A/B switches
 
@@ -360,4 +421,8 @@ The pipeline's parity tests compare against diffusers on the pico checkpoint
 in `tests/fixtures/tiny_qwenimage21/` (generated by
 `tools/make_pico_qwenimage21_fixture.py`): `TestQwenImage21Pipeline*`,
 `TestQwenImage21Transformer*`, `TestQwenImage21Vae*` and
-`TestFlowMatch*`.
+`TestFlowMatch*`. The img2img tests (`TestQwenImage21Img2Img*`,
+`TestQwenImage21LanczosResizeVsPIL`, `TestQwenImage21PrepareVaeImage`,
+`TestQwenImage21SizeForAspect`, `TestFlowMatchImg2ImgStartStepVsOracle`,
+`TestFlowMatchScaleNoiseVsOracle`) read the oracle of
+`tools/make_pico_qwenimage21_img2img_fixture.py`.

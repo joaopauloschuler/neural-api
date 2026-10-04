@@ -2479,7 +2479,7 @@ rather than acted on.
         mean, `(z - mean)/std` folded into quant_conv. Trap: the AvgDown3D shortcut
         (blocks 1-3 pad a zero frame in front: channel 2c+ft, even channels 0).
         `time_conv` unused for one frame. The pico fixture already has the weights.
-  - [ ] C2b. SDEdit img2img: `--image FILE --strength S` (default 0.6) VAE-encodes
+  - [x] C2b. SDEdit img2img: `--image FILE --strength S` (default 0.6) VAE-encodes
         the image, `latents = sigma[t_start]*noise + (1 - sigma[t_start])*x0` with
         `t_start = int(N - min(N*strength, N))` on the shifted sigmas (Qwen-Image v1
         img2img formula; 2.1 has no img2img pipeline), denoises from t_start. Error

@@ -22,8 +22,18 @@ input ends the session). Images go to numbered files from the --output base
 (qwenimage.png -> qwenimage_0001.png, ...; existing files are skipped, never
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
-PROMPT with consecutive seeds, the prompt encoded once), /profile on|off,
-/stats on|off, /quit.
+PROMPT with consecutive seeds, the prompt encoded once), /image FILE|off,
+/strength S, /profile on|off, /stats on|off, /quit.
+
+img2img (--image FILE or /image FILE): SDEdit. The VAE encoder (CPU,
+untiled) encodes the init image once (posterior mean); each image noises
+those latents to the
+sigma where the schedule is cut by --strength (default 0.6) and runs only
+the remaining steps (the Qwen-Image v1 img2img schedule). It re-styles the
+init image; it does not follow edit instructions. The output keeps the init
+image's aspect ratio at the area of --width x --height (sides multiples of
+32, as diffusers' calculate_dimensions); the init image is resized with
+PIL's Lanczos coefficients in float. EXIF orientation is not applied.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -35,7 +45,7 @@ USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
-            [--repeat N]
+            [--repeat N] [--image FILE [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -58,11 +68,14 @@ uses
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
   SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
-  neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread;
+  neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread,
+  neuraldiffusion;
 
 const
   // Largest accepted image side in pixels (64x the 1024 default area).
   csMaxImageSide = 8192;
+  // img2img strength when --strength is not given (diffusers' default).
+  csDefaultStrength = 0.6;
   // Largest --repeat / /repeat count (catches a mistyped count).
   csMaxRepeatCount = 1000;
   csBytesPerMB = 1024.0 * 1024.0;
@@ -162,6 +175,8 @@ begin
   case Phase of
     qppLoadTextEncoder: Result := 'load text encoder';
     qppEncodePrompt: Result := 'encode prompt';
+    qppLoadVaeEncoder: Result := 'load VAE encoder';
+    qppEncodeImage: Result := 'encode init image';
     qppLoadTransformer: Result := 'load transformer';
     qppEncodePrefix: Result := 'transformer prefix';
     qppDenoise: Result := 'denoise';
@@ -175,13 +190,24 @@ end;
 // The per-image stage table of --stats and --profile: one row per phase that
 // ran, PNG save, their sum; then OpenCL transfers and bytes held, peak RSS.
 procedure PrintStageTable(const Stats: TQwenImage21ImageStats;
-  ImageNumber, EncodeImageNumber: integer; PngSaveMs: double;
-  IsProfiled, IsPeakPerImage: boolean);
+  ImageNumber, EncodeImageNumber, InitEncodeImageNumber: integer;
+  PngSaveMs: double; IsProfiled, IsPeakPerImage: boolean);
 var
   Phase: TQwenImage21PipelinePhase;
   TotalMs: double;
   RanOn, Detail, Rss, Peak: string;
-  HasEncode, IsOnOpenCL: boolean;
+  HasEncode, HasInitEncode, IsOnOpenCL: boolean;
+
+  // The phase ran for this image, not for an earlier one or not at all.
+  function IsCountedHere(Phase: TQwenImage21PipelinePhase): boolean;
+  begin
+    case Phase of
+      qppLoadTextEncoder, qppEncodePrompt: Result := HasEncode;
+      qppLoadVaeEncoder, qppEncodeImage: Result := HasInitEncode;
+    else
+      Result := true;
+    end;
+  end;
 
   function Share(Ms: double): double;
   begin
@@ -218,10 +244,12 @@ var
 
 begin
   HasEncode := ImageNumber = EncodeImageNumber;
+  HasInitEncode := Stats.UsedInitImage and
+    (ImageNumber = InitEncodeImageNumber);
   IsOnOpenCL := Stats.TransformerOnOpenCL or Stats.VaeOnOpenCL;
   TotalMs := PngSaveMs;
   for Phase := qppLoadTextEncoder to qppDecode do
-    if HasEncode or not (Phase in [qppLoadTextEncoder, qppEncodePrompt]) then
+    if IsCountedHere(Phase) then
       TotalMs := TotalMs + Stats.PhaseMs[Phase];
   WriteLn('Stages of image ', ImageNumber, ' (wall time):');
   if IsProfiled and IsOnOpenCL then
@@ -230,15 +258,18 @@ begin
   AddRow('Stage', 'Ran on', 'ms', '%', '');
   for Phase := qppLoadTextEncoder to qppDecode do
   begin
-    if (Phase in [qppLoadTextEncoder, qppEncodePrompt]) and not HasEncode then
+    if not IsCountedHere(Phase) then
     begin
       if Phase = qppEncodePrompt then
         AddRow(PhaseName(Phase), '-', '-', '-', 'encoded once, before image ' +
-          IntToStr(EncodeImageNumber) + ' (counted there)');
+          IntToStr(EncodeImageNumber) + ' (counted there)')
+      else if (Phase = qppEncodeImage) and Stats.UsedInitImage then
+        AddRow(PhaseName(Phase), '-', '-', '-', 'encoded once, before image ' +
+          IntToStr(InitEncodeImageNumber) + ' (counted there)');
       continue;
     end;
     if (Stats.PhaseMs[Phase] = 0) and (Phase in [qppLoadTextEncoder,
-      qppLoadTransformer, qppLoadVae]) then continue;
+      qppLoadVaeEncoder, qppLoadTransformer, qppLoadVae]) then continue;
     RanOn := 'CPU';
     Detail := '';
     case Phase of
@@ -372,6 +403,15 @@ begin
     '(default 1024)');
   WriteLn('  --steps N            Euler steps (default 18)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
+  WriteLn('  --image FILE         img2img (SDEdit) from this init image: the ',
+    'output keeps its aspect');
+  WriteLn('                       ratio at the area of --width x --height. It ',
+    're-styles the image;');
+  WriteLn('                       it does not follow edit instructions.');
+  WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
+    csDefaultStrength:0:1, '): runs only the last');
+  WriteLn('                       part of the schedule (18 steps at 0.6: the ',
+    'last 11); 1 = from pure noise');
   WriteLn('  --repeat N           with -p or --token-ids: N images, seeds ',
     '--seed, --seed+1, ...; the prompt');
   WriteLn('                       is encoded once. N > 1 keeps the ',
@@ -452,6 +492,10 @@ begin
     'grows by one per image)');
   WriteLn('  /repeat N PROMPT     N images of PROMPT (encoded once), ',
     'consecutive seeds, numbered files');
+  WriteLn('  /image FILE          init image for the next prompts (img2img); ',
+    '/image off clears it');
+  WriteLn('  /strength S          img2img strength for the next images, ',
+    'in (0, 1]');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
     'with --repeat N > 1) the');
   WriteLn('                       transformer stays in OpenCL memory ',
@@ -522,6 +566,29 @@ begin
   Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
 end;
 
+// DefaultFormatSettings with a '.' decimal point, whatever the locale.
+function PointFormat(): TFormatSettings;
+begin
+  Result := DefaultFormatSettings;
+  Result.DecimalSeparator := '.';
+end;
+
+// Strength as ParseStrength reads it ('.' decimal point).
+function StrengthText(Strength: double): string;
+begin
+  Result := FloatToStr(Strength, PointFormat());
+end;
+
+// Parses an img2img strength in (0, 1] (a '.' decimal point); returns '' or
+// what is wrong.
+function ParseStrength(const Text: string; out Strength: double): string;
+begin
+  if not TryStrToFloat(Trim(Text), Strength, PointFormat()) or
+    not ((Strength > 0) and (Strength <= 1)) then
+    Result := '"' + Text + '" is not a number in (0, 1].'
+  else Result := '';
+end;
+
 // Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
 function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
 begin
@@ -581,6 +648,15 @@ var
   HasPrompt, UseInt8Input, UseSerial, UseProfile, UseStats: boolean;
   // The image whose stage table shows the encode of the current prompt.
   EncodeImageNumber: integer;
+  // img2img: the init image (0..255 RGBA) and its latents, encoded at
+  // ImageLatentsWidth x ImageLatentsHeight (0: not encoded yet) before image
+  // InitEncodeImageNumber.
+  HasInitImage: boolean;
+  InitImageFile: string;
+  InitImage, ImageLatents: TNNetVolume;
+  ImageLatentsWidth, ImageLatentsHeight, InitEncodeImageNumber: integer;
+  Strength: double;
+  HasStrengthArg: boolean;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -633,6 +709,109 @@ var
     EncodeImageNumber := ImageNumber + 1;
   end;
 
+  // The image size: --width x --height, or with SourceImage <> nil its aspect
+  // ratio at that area (diffusers' calculate_dimensions).
+  procedure GetOutputSizeFor(SourceImage: TNNetVolume; out OutputWidth,
+    OutputHeight: integer);
+  begin
+    if Assigned(SourceImage) then
+      QwenImage21SizeForAspect(double(Width) * Height,
+        SourceImage.SizeX / SourceImage.SizeY, OutputWidth, OutputHeight)
+    else
+    begin
+      OutputWidth := Width;
+      OutputHeight := Height;
+    end;
+  end;
+
+  // GetOutputSizeFor the active init image (nil without one).
+  procedure GetOutputSize(out OutputWidth, OutputHeight: integer);
+  begin
+    if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
+    else GetOutputSizeFor(nil, OutputWidth, OutputHeight);
+  end;
+
+  // '' when SourceImage's output size is usable; otherwise what is wrong.
+  function OutputSizeProblemFor(SourceImage: TNNetVolume): string;
+  var
+    OutputWidth, OutputHeight: integer;
+  begin
+    GetOutputSizeFor(SourceImage, OutputWidth, OutputHeight);
+    Result := ImageSideProblem(OutputWidth, OutputHeight);
+    if (Result <> '') and Assigned(SourceImage) then
+      Result := 'the init image''s aspect gives ' + IntToStr(OutputWidth) +
+        'x' + IntToStr(OutputHeight) + ': ' + Result;
+  end;
+
+  // Loads FileName (with alpha) and makes it the init image when its output
+  // size works; otherwise returns what is wrong and changes nothing.
+  function LoadInitImage(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    Result := '';
+    Loaded := TNNetVolume.Create();
+    try
+      try
+        if not LoadImageFromFileIntoVolume(FileName, Loaded, true) then
+          Result := 'could not read ' + FileName + '.';
+      except
+        on E: Exception do Result := 'could not read ' + FileName + ': ' +
+          E.Message;
+      end;
+      if Result = '' then Result := OutputSizeProblemFor(Loaded);
+      if Result <> '' then exit;
+      InitImage.Copy(Loaded);
+    finally
+      Loaded.Free;
+    end;
+    HasInitImage := true;
+    InitImageFile := FileName;
+    ImageLatentsWidth := 0;
+    ImageLatentsHeight := 0;
+  end;
+
+  // Encodes the init image unless its latents already match the output size;
+  // raises when the size or the strength cannot work.
+  procedure PrepareInitLatents();
+  var
+    OutputWidth, OutputHeight: integer;
+    Problem: string;
+  begin
+    if not HasInitImage then exit;
+    Problem := OutputSizeProblemFor(InitImage);
+    if Problem <> '' then raise Exception.Create(Problem);
+    // Raises when the strength leaves no step.
+    TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
+    GetOutputSize(OutputWidth, OutputHeight);
+    if (ImageLatentsWidth = OutputWidth) and
+      (ImageLatentsHeight = OutputHeight) then exit;
+    ImageLatentsWidth := 0;
+    Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight, ImageLatents);
+    Reporter.OnPhase(qppDone);
+    ImageLatentsWidth := OutputWidth;
+    ImageLatentsHeight := OutputHeight;
+    InitEncodeImageNumber := ImageNumber + 1;
+  end;
+
+  // The Image and Init image lines of the run header.
+  procedure PrintImageSettings();
+  var
+    OutputWidth, OutputHeight, StartStep: integer;
+  begin
+    GetOutputSize(OutputWidth, OutputHeight);
+    WriteLn('Image      : ', OutputWidth, 'x', OutputHeight, ' (',
+      (OutputWidth div 16) * (OutputHeight div 16), ' image tokens), ',
+      StepCount, ' steps, seed ', Seed);
+    if not HasInitImage then exit;
+    // Raises when the strength leaves no step.
+    StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount,
+      Strength);
+    WriteLn('Init image : ', InitImageFile, ' (', InitImage.SizeX, 'x',
+      InitImage.SizeY, '), strength ', StrengthText(Strength), ', the last ',
+      StepCount - StartStep, ' of ', StepCount, ' steps');
+  end;
+
   // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
   // on, but only once a pass runs).
   procedure SetProfile(Value: boolean);
@@ -668,13 +847,19 @@ var
     ImageStart: QWord;
     SaveStart: TDateTime;
     PngSaveMs: double;
+    OutputWidth, OutputHeight: integer;
   begin
     // The image that encoded the prompt had its mark reset before the encode.
     if ImageNumber <> EncodeImageNumber then
       IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     ImageStart := GetTickCount64;
-    Pipeline.GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed,
-      Image);
+    GetOutputSize(OutputWidth, OutputHeight);
+    if HasInitImage then
+      Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
+        StepCount, Seed, Image, nil, ImageLatents, Strength)
+    else
+      Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
+        StepCount, Seed, Image);
     SaveStart := Now();
     Image.Mul(255);
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
@@ -685,7 +870,7 @@ var
       ' s; ', MemoryReport());
     if UseStats or UseProfile then
       PrintStageTable(Pipeline.ImageStats, ImageNumber, EncodeImageNumber,
-        PngSaveMs, UseProfile, IsPeakPerImage);
+        InitEncodeImageNumber, PngSaveMs, UseProfile, IsPeakPerImage);
     if UseProfile then
     begin
       WriteLn;
@@ -707,13 +892,21 @@ var
   // --output; the seed then grows by one, also when the image fails.
   procedure GenerateNextImage(Numbered: boolean);
   var
-    ImageFile: string;
+    ImageFile, StepText: string;
+    OutputWidth, OutputHeight: integer;
   begin
     Inc(ImageNumber);
     if Numbered then ImageFile := NextFreeOutputFile(OutputFile, FileNumber)
     else ImageFile := OutputFile;
-    WriteLn('Image ', ImageNumber, ': ', Width, 'x', Height, ', ', StepCount,
-      ' steps, seed ', Seed, ' -> ', ImageFile);
+    GetOutputSize(OutputWidth, OutputHeight);
+    StepText := IntToStr(StepCount) + ' steps';
+    if HasInitImage then
+      StepText := Format('img2img strength %s, the last %d of %d steps',
+        [StrengthText(Strength), StepCount -
+        TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength),
+        StepCount]);
+    WriteLn('Image ', ImageNumber, ': ', OutputWidth, 'x', OutputHeight, ', ',
+      StepText, ', seed ', Seed, ' -> ', ImageFile);
     try
       GenerateImage(ImageFile);
     finally
@@ -744,6 +937,7 @@ var
     try
       TokenIds := Pipeline.TokenizePrompt(PromptText, DropCount);
       EncodePrompt();
+      PrepareInitLatents();
     except
       on E: EOutOfMemory do exit(EndSessionOutOfMemory(E.Message));
       on E: Exception do
@@ -774,6 +968,7 @@ var
   begin
     if RepeatCount > 1 then LoadAllComponents();
     EncodePrompt();
+    PrepareInitLatents();
     for ImageIndex := 1 to RepeatCount do
     try
       GenerateNextImage({Numbered=}RepeatCount > 1);
@@ -801,14 +996,15 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile, /repeat, /profile, /stats and /quit; false on
-  // /quit or when /repeat ran out of memory.
+  // /size, /steps, /seed, /tile, /repeat, /image, /strength, /profile, /stats
+  // and /quit; false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
     IsOn: boolean;
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
+    NewStrength: double;
     Command, Argument, Problem: string;
   begin
     Result := true;
@@ -832,7 +1028,13 @@ var
       begin
         Width := NewWidth;
         Height := NewHeight;
-        WriteLn('[size ', Width, 'x', Height, ']');
+        if HasInitImage then
+        begin
+          GetOutputSize(NewWidth, NewHeight);
+          WriteLn('[size ', Width, 'x', Height, '; the init image''s aspect ',
+            'gives ', NewWidth, 'x', NewHeight, ']');
+        end
+        else WriteLn('[size ', Width, 'x', Height, ']');
       end;
     end
     else if Command = 'steps' then
@@ -885,6 +1087,45 @@ var
             MaxInt)), NewRepeatCount);
       end;
     end
+    else if Command = 'image' then
+    begin
+      if Argument = '' then
+        WriteLn('[/image: expected /image FILE or /image off]')
+      else if LowerCase(Argument) = 'off' then
+      begin
+        HasInitImage := false;
+        ImageLatentsWidth := 0;
+        WriteLn('[init image off: text-to-image]');
+      end
+      else
+      begin
+        Problem := LoadInitImage(Argument);
+        if Problem <> '' then
+        begin
+          if HasInitImage then
+            WriteLn('[/image: ', Problem, ' - the init image ', InitImageFile,
+              ' stays active]')
+          else WriteLn('[/image: ', Problem, ' - no init image is set]');
+        end
+        else
+        begin
+          GetOutputSize(NewWidth, NewHeight);
+          WriteLn('[init image ', InitImageFile, ' (', InitImage.SizeX, 'x',
+            InitImage.SizeY, '), output ', NewWidth, 'x', NewHeight,
+            ', strength ', StrengthText(Strength), ']');
+        end;
+      end;
+    end
+    else if Command = 'strength' then
+    begin
+      Problem := ParseStrength(Argument, NewStrength);
+      if Problem <> '' then WriteLn('[/strength: ', Problem, ']')
+      else
+      begin
+        Strength := NewStrength;
+        WriteLn('[strength ', StrengthText(Strength), ']');
+      end;
+    end
     else if Command = 'profile' then
     begin
       if ParseOnOff(Command, Argument, IsOn) then
@@ -902,7 +1143,7 @@ var
       end;
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
-      '/tile, /repeat, /profile, /stats, /quit]');
+      '/tile, /repeat, /image, /strength, /profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -914,8 +1155,8 @@ var
     LoadAllComponents();
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
-      '/tile SIZE[,STRIDE], /repeat N PROMPT, /profile on|off, ',
-      '/stats on|off, /quit.');
+      '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE|off, /strength S, ',
+      '/profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -964,6 +1205,13 @@ begin
   UseStats := false;
   EncodeImageNumber := 0;
   IsPeakPerImage := false;
+  HasInitImage := false;
+  InitImageFile := '';
+  ImageLatentsWidth := 0;
+  ImageLatentsHeight := 0;
+  InitEncodeImageNumber := 0;
+  Strength := csDefaultStrength;
+  HasStrengthArg := false;
   MaxThreads := 0;
   VaeTileSize := 256;
   VaeTileStride := 192;
@@ -992,6 +1240,17 @@ begin
       if ArgProblem <> '' then
       begin
         WriteLn('--repeat: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--image' then InitImageFile := NextArg()
+    else if Arg = '--strength' then
+    begin
+      HasStrengthArg := true;
+      ArgProblem := ParseStrength(NextArg(), Strength);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--strength: ', ArgProblem);
         Halt(2);
       end;
     end
@@ -1061,11 +1320,19 @@ begin
     WriteLn('--max-threads: must be at least 1.');
     Halt(2);
   end;
+  if HasStrengthArg and (InitImageFile = '') then
+  begin
+    if HasPrompt or (TokenList <> '') then
+      WriteLn('[--strength has no effect without --image]')
+    else WriteLn('[--strength applies once /image sets an init image]');
+  end;
 
   StartTime := GetTickCount64;
   Reporter := TQwenImageReporter.Create();
   PromptEmbeds := TNNetVolume.Create();
   Image := TNNetVolume.Create();
+  InitImage := TNNetVolume.Create();
+  ImageLatents := TNNetVolume.Create();
   Pipeline := nil;
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
@@ -1126,9 +1393,14 @@ begin
     {$ENDIF}
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
     Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
+    if InitImageFile <> '' then
+    begin
+      ArgProblem := LoadInitImage(InitImageFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--image: ' + ArgProblem);
+    end;
     WriteLn('Model      : ', ModelFolder);
-    WriteLn('Image      : ', Width, 'x', Height, ' (', (Width div 16) *
-      (Height div 16), ' image tokens), ', StepCount, ' steps, seed ', Seed);
+    PrintImageSettings();
     case WeightFormat of
       qiwInt8: WriteLn('Weights    : transformer int8, text encoder int8');
       qiwInt4: WriteLn('Weights    : transformer int4, text encoder int8');
@@ -1168,6 +1440,8 @@ begin
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}
+    ImageLatents.Free;
+    InitImage.Free;
     Image.Free;
     PromptEmbeds.Free;
     Reporter.Free;
