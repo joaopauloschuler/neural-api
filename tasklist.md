@@ -2509,6 +2509,25 @@ rather than acted on.
         prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope after C3a with an L4 measurement.
+  Phase F — OpenCL residency of the step pass:
+  - [ ] F1. Modulation chain in OpenCL memory (L4 int8 1024^2 run 2026-10-04:
+        1280 blocking 16 KB operand uploads per image, all modulation layers
+        on the host).
+        (a) `TNNetInput.ComputeOpenCL`: move the upload that `TNNetInput.Compute`
+        does inline into its own ComputeOpenCL; it only puts FOutput into the
+        OpenCL buffer and sets FOutputOnOpenCL. FOutputOnRAM stays true (the
+        host copy is current; producers offer, consumers decide).
+        (b) Consumers bind any source with FOutputOnOpenCL, whether or not it
+        also has a RAM copy: first `TNNetSplitChannels.WillOpenCL` (ends with
+        `Result := not FPrevLayer.FOutputOnRAM`); read-only grep of the other
+        WillOpenCL predicates that fall back to the host when the source is in
+        RAM before changing them.
+        (c) `TNNetAddConstant` opcode in `cai_activation` (ParamA = constant),
+        Compute through ComputeActivationOnOpenCL (also fixes its "-" count).
+        Then tanh follows and `TNNetChannelMulByLayer` binds its operand.
+        Doing (b) without (c) is worse (AddConstant would download).
+        Tests: PoCL sentinel test that the split/tanh/AddConstant/ChannelMul
+        chain binds (no activation upload), parity, counts.
   Phase E — speed gap against other implementations:
   - [ ] E1. The Unsloth build of Qwen-Image-2.1 is reported to be at least 20x
         faster than ours (our L4 int8 1024^2, 10 steps, --profile, 2026-10-04:
