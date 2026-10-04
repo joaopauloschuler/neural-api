@@ -2509,6 +2509,21 @@ rather than acted on.
         prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope after C3a with an L4 measurement.
+  Phase E — speed gap against other implementations:
+  - [ ] E1. The Unsloth build of Qwen-Image-2.1 is reported to be at least 20x
+        faster than ours (our L4 int8 1024^2, 10 steps, --profile, 2026-10-04:
+        322 s total, 19.7 s/step, projections 15.0 s/step = ~3.8 TFLOPS, VAE
+        decode 26.2 s of which 11.3 s weight preparation). Find why, stage by
+        stage. First pin down the comparison: Unsloth artifact and runner (GGUF
+        in ComfyUI / diffusers / other), quantization, steps (distilled or
+        lightning LoRA?), CFG, resolution, GPU, and whether its time includes the
+        loads. Then compare per stage: projections (tensor-core FP16/BF16 or
+        int8 MMA via cuBLAS vs our OpenCL dot-product kernels), attention (flash
+        attention vs cai_sdpa_noncausal_tiled), text encoder and VAE on the GPU vs
+        ours on the CPU / per-tile-net arming, weight load. Output: a ranked list
+        of the gaps with measured or estimated seconds each, and which are
+        reachable in OpenCL (no tensor cores in portable OpenCL; NVIDIA-only
+        inline PTX was an earlier idea).
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
