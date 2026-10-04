@@ -52,7 +52,7 @@ any later version.
 uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
-  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio,{$ENDIF}
+  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
   SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread;
 
@@ -61,14 +61,20 @@ const
   csMaxImageSide = 8192;
 
 type
-  // Prints phase and step timings with the process memory (Linux /proc).
+  // Phase and step timings with the process memory. On a terminal each step
+  // rewrites one line; a pipe or file keeps one line per step for logs.
   TQwenImageReporter = class(TObject)
   private
     FPhaseStart, FStepStart: QWord;
     FPhaseName: string;
+    FRewritesStepLine, FStepLineOpen: boolean;
     procedure EndPhase();
+    // Width of the stdout terminal in characters; 80 when unknown.
+    function TerminalColumns(): integer;
   public
     constructor Create();
+    // Ends a step line left open on the terminal; call before other output.
+    procedure EndStepLine();
     procedure OnPhase(Phase: TQwenImage21PipelinePhase);
     procedure OnStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
@@ -134,10 +140,35 @@ constructor TQwenImageReporter.Create();
 begin
   inherited Create();
   FPhaseName := '';
+  FRewritesStepLine :=
+    {$IFDEF UNIX}IsATTY(StdOutputHandle) = 1{$ELSE}false{$ENDIF};
+  FStepLineOpen := false;
+end;
+
+function TQwenImageReporter.TerminalColumns(): integer;
+{$IFDEF UNIX}
+var
+  WinSize: TWinSize;
+{$ENDIF}
+begin
+  Result := 80;
+  {$IFDEF UNIX}
+  WinSize := Default(TWinSize);
+  if (FpIOCtl(StdOutputHandle, TIOCGWINSZ, @WinSize) = 0) and
+    (WinSize.ws_col > 0) then Result := WinSize.ws_col;
+  {$ENDIF}
+end;
+
+procedure TQwenImageReporter.EndStepLine();
+begin
+  if not FStepLineOpen then exit;
+  WriteLn;
+  FStepLineOpen := false;
 end;
 
 procedure TQwenImageReporter.EndPhase();
 begin
+  EndStepLine();
   if FPhaseName = '' then exit;
   WriteLn(Format('  %-20s %8.1f s   %s', [FPhaseName,
     (GetTickCount64 - FPhaseStart) / 1000, MemoryReport()]));
@@ -155,11 +186,19 @@ procedure TQwenImageReporter.OnStep(StepIndex, StepCount: integer;
   Timestep: double; Latents: TNNetVolume);
 var
   StepEnd: QWord;
+  StepText: string;
 begin
   StepEnd := GetTickCount64;
-  WriteLn(Format('    step %d/%d  t=%7.2f  %6.1f s  |x| max %.3f  %s',
+  StepText := Format('    step %d/%d  t=%7.2f  %6.1f s  |x| max %.3f  %s',
     [StepIndex + 1, StepCount, Timestep, (StepEnd - FStepStart) / 1000,
-     Latents.GetMaxAbs(), MemoryReport()]));
+     Latents.GetMaxAbs(), MemoryReport()]);
+  if FRewritesStepLine then
+  begin
+    Write(#13, Copy(StepText, 1, TerminalColumns() - 1), #27'[K');
+    Flush(System.Output);
+    FStepLineOpen := true;
+  end
+  else WriteLn(StepText);
   FStepStart := StepEnd;
 end;
 
@@ -534,6 +573,7 @@ var
         // weights stay valid, except after an allocation failure.
         on E: EOutOfMemory do
         begin
+          Reporter.EndStepLine();
           WriteLn('Error: ', E.Message, ' - out of memory, ending the ',
             'session.');
           ExitCode := 1;
@@ -751,6 +791,7 @@ begin
         ' s; ', MemoryReport());
     end;
   finally
+    Reporter.EndStepLine();
     Pipeline.Free;
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
