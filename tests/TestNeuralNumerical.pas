@@ -607,6 +607,12 @@ type
     // ShareOpenCLOutputsByLiveness: identical to unshared on a branching graph,
     // serial, parallel and re-armed; fewer bytes; suffix forwards refused.
     procedure TestOpenCLShareOutputsByLiveness;
+    // ShareHostOutputsByLiveness on the CPU: identical to unshared, serial and
+    // parallel; fewer host bytes; suffix forwards refused; trainable nets unshared.
+    procedure TestShareHostOutputsByLiveness;
+    // ShareHostOutputsByLiveness on OpenCL with host-computed layers and a host
+    // reader in the pass: identical to unshared; off with per-layer queues.
+    procedure TestOpenCLShareHostOutputsByLiveness;
     // TDotProductSharedKernel.Compute raises on a bias that is not one float
     // per row instead of running without it. Coded by Claude (AI).
     procedure TestDotProductWrongSizeBiasRaises;
@@ -70440,11 +70446,70 @@ begin
 end;
 {$ENDIF}
 
+function MaxAbsDiffOfVolumes(A, B: TNNetVolume): TNeuralFloat;
+var
+  ElementPos, MaxElementPos: integer;
+begin
+  Result := 0;
+  MaxElementPos := A.Size - 1;
+  for ElementPos := 0 to MaxElementPos do
+    Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+end;
+
+// The liveness sharing tests' graph: long skip, reshape aliases, a split read
+// by three layers (cLivenessHostReaderIdx has no OpenCL path), concat and sums.
+const
+  cLivenessHostReaderIdx = 11;
+  cLivenessChunkedConvIdx = 12;
+  cLivenessPinnedLayerIdx = 15;
+
+function BuildLivenessShareTestNet(pTrainable: boolean): TNNet;
+var
+  Block, Skip, Alias, Split, Branch, Projection, HostBranch: TNNetLayer;
+  Merged: TNNetLayer;
+  LayerCnt, NeuronCnt, WeightCnt: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 5, 8));
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Skip := Result.AddLayer(TNNetSiLU.Create());
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Result.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
+  Result.AddLayer(TNNetReshape.Create(30, 1, 16));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+  Alias := Result.AddLayer(TNNetReshape.Create(6, 5, 16));
+  Split := Result.AddLayer(TNNetSplitChannels.Create(0, 8));
+  Branch := Result.AddLayerAfter(TNNetSiLU.Create(), Split);
+  Projection := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(8), Split);
+  Result.AddLayerAfter(TNNetIdentity.Create(), Split);
+  HostBranch := Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+  Block := Result.AddLayer(TNNetDeepConcat.Create([Branch, Projection]));
+  Merged := Result.AddLayer(TNNetSum.Create([Block, Skip, Alias, HostBranch]));
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Result.AddLayer(TNNetSiLU.Create());
+  Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), Merged]));
+  Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
+  if not pTrainable then Result.SetTrainable(false, {pLowMemory=}false);
+  for LayerCnt := 0 to Result.GetLastLayerIdx() do
+  begin
+    for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+      Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+        0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+    end;
+    Result.Layers[LayerCnt].FlushWeightCache();
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestOpenCLShareOutputsByLiveness;
 {$IFDEF OpenCL}
 const
-  cHostReaderIdx = 11;
-  cPinnedLayerIdx = 15;
+  cHostReaderIdx = cLivenessHostReaderIdx;
+  cPinnedLayerIdx = cLivenessPinnedLayerIdx;
 var
   NetCPU, NetOff, NetOn, NetQueues: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -70457,55 +70522,8 @@ var
   SuffixRefused: boolean;
 
   function BuildNet(): TNNet;
-  var
-    Block, Skip, Alias, Split, Branch, Projection, HostBranch: TNNetLayer;
-    Merged: TNNetLayer;
-    LayerCnt, NeuronCnt, WeightCnt: integer;
   begin
-    Result := TNNet.Create();
-    Result.AddLayer(TNNetInput.Create(6, 5, 8));
-    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
-    Skip := Result.AddLayer(TNNetSiLU.Create());
-    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
-    Result.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
-    Result.AddLayer(TNNetReshape.Create(30, 1, 16));
-    Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
-    Alias := Result.AddLayer(TNNetReshape.Create(6, 5, 16));
-    Split := Result.AddLayer(TNNetSplitChannels.Create(0, 8));
-    Branch := Result.AddLayerAfter(TNNetSiLU.Create(), Split);
-    Projection := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(8), Split);
-    // cHostReaderIdx has no OpenCL path: it downloads the split from its buffer.
-    Result.AddLayerAfter(TNNetIdentity.Create(), Split);
-    HostBranch := Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
-    Block := Result.AddLayer(TNNetDeepConcat.Create([Branch, Projection]));
-    Merged := Result.AddLayer(TNNetSum.Create([Block, Skip, Alias, HostBranch]));
-    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
-    Result.AddLayer(TNNetSiLU.Create());
-    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), Merged]));
-    Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
-    Result.SetTrainable(false, {pLowMemory=}false);
-    for LayerCnt := 0 to Result.GetLastLayerIdx() do
-    begin
-      for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
-      begin
-        for WeightCnt := 0 to
-          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
-          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
-            0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
-        Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
-          0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
-      end;
-      Result.Layers[LayerCnt].FlushWeightCache();
-    end;
-  end;
-
-  function MaxDiffOf(A, B: TNNetVolume): TNeuralFloat;
-  var
-    ElementPos: integer;
-  begin
-    Result := 0;
-    for ElementPos := 0 to A.Size - 1 do
-      Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+    Result := BuildLivenessShareTestNet({pTrainable=}false);
   end;
 
   // Every layer either reads back NetOff's exact output or reports it gone.
@@ -70523,7 +70541,7 @@ var
         continue;
       end;
       AssertEquals(pWhen + ': layer ' + IntToStr(ReadPos) + ' host read', 0,
-        MaxDiffOf(NetOn.Layers[ReadPos].Output, NetOff.Layers[ReadPos].Output),
+        MaxAbsDiffOfVolumes(NetOn.Layers[ReadPos].Output, NetOff.Layers[ReadPos].Output),
         0);
     end;
   end;
@@ -70550,7 +70568,7 @@ begin
     NetOff.ForceOpenCL(true);
     NetOff.Layers[cHostReaderIdx].ForceOpenCL(false);
     NetOn.ShareOpenCLOutputsByLiveness := true;
-    NetOn.Layers[cPinnedLayerIdx].OpenCLOutputPinned := true;
+    NetOn.Layers[cPinnedLayerIdx].OutputPinned := true;
     NetOn.EnableOpenCL(PlatformId, DeviceId);
     NetOn.ForceOpenCL(true);
     NetOn.Layers[cHostReaderIdx].ForceOpenCL(false);
@@ -70566,9 +70584,9 @@ begin
       NetOff.Compute(Input, 0, Parallel);
       NetOn.Compute(Input, 0, Parallel);
       Inc(ForwardCount);
-      Diff := MaxDiffOf(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output);
       AssertEquals('shared vs private, pass ' + IntToStr(PassPos), 0, Diff, 0);
-      Diff := MaxDiffOf(NetOn.GetLastLayer().Output, OutCPU);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, OutCPU);
       AssertTrue('shared vs CPU, pass ' + IntToStr(PassPos) + ': ' +
         FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
       DeadCount := CheckHostReads('pass ' + IntToStr(PassPos));
@@ -70634,7 +70652,7 @@ begin
       NetOff.Compute(Input, 0, Parallel);
       NetOn.Compute(Input, 0, Parallel);
       AssertEquals('re-armed shared vs private', 0,
-        MaxDiffOf(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output), 0);
+        MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output), 0);
       CheckHostReads('re-armed pass ' + IntToStr(PassPos));
     end;
     // Per-layer queues order nothing between layers: sharing stays off.
@@ -70647,7 +70665,7 @@ begin
     AssertEquals('per-layer queues: no shared bytes', 0,
       NetQueues.OpenCLSharedOutputBytes());
     NetQueues.Compute(Input);
-    Diff := MaxDiffOf(NetQueues.GetLastLayer().Output, OutCPU);
+    Diff := MaxAbsDiffOfVolumes(NetQueues.GetLastLayer().Output, OutCPU);
     AssertTrue('per-layer queues vs CPU: ' + FloatToStr(Diff),
       Diff < 1e-4 * (MaxAbs + 1));
   finally
@@ -70657,6 +70675,253 @@ begin
     NetOn.Free;
     NetOff.Free;
     NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestShareHostOutputsByLiveness;
+var
+  NetOff, NetOn, NetTrainable: TNNet;
+  Input: TNNetVolume;
+  PassPos, ElementPos, MaxElementPos, LayerPos, OverwrittenIdx: integer;
+  Parallel, SuffixRefused: boolean;
+  BytesOff, BytesOn, SharedBytes, PrivateBytes: int64;
+
+  procedure CheckPass(const pWhen: string);
+  begin
+    NetOff.Compute(Input, 0, Parallel);
+    NetOn.Compute(Input, 0, Parallel);
+    AssertEquals(pWhen + ': shared vs private output', 0,
+      MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+      NetOff.GetLastLayer().Output), 0);
+    AssertEquals(pWhen + ': the pinned layer keeps its output', 0,
+      MaxAbsDiffOfVolumes(NetOn.Layers[cLivenessPinnedLayerIdx].Output,
+      NetOff.Layers[cLivenessPinnedLayerIdx].Output), 0);
+  end;
+
+begin
+  NetOff := BuildLivenessShareTestNet({pTrainable=}false);
+  NetOn := BuildLivenessShareTestNet({pTrainable=}false);
+  NetTrainable := BuildLivenessShareTestNet({pTrainable=}true);
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.037) + 0.05;
+    NetOn.ShareHostOutputsByLiveness := true;
+    NetOn.Layers[cLivenessPinnedLayerIdx].OutputPinned := true;
+    AssertEquals('nothing shared before the first forward', 0,
+      NetOn.HostSharedOutputLayerCount());
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      CheckPass('pass ' + IntToStr(PassPos));
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+    begin
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', NetOn.SchedulerStatsReport()));
+      // The parallel passes split these convolutions across chunk workers.
+      AssertTrue('chunked convolution', NetOn.Layers[1].ChunkEligible() and
+        NetOn.Layers[cLivenessChunkedConvIdx].ChunkEligible());
+    end;
+    SharedBytes := NetOn.HostSharedOutputBytes();
+    PrivateBytes := NetOn.HostSharedOutputPrivateBytes();
+    BytesOff := NetOff.NonWeightBytes();
+    BytesOn := NetOn.NonWeightBytes();
+    WriteLn('  ShareHostOutputsByLiveness: ', NetOn.HostSharedOutputLayerCount(),
+      ' layers share; ', SharedBytes, ' B in place of ', PrivateBytes,
+      ' B; net host bytes ', BytesOff, ' -> ', BytesOn);
+    AssertTrue('layers share host storage',
+      NetOn.HostSharedOutputLayerCount() > 0);
+    AssertTrue('the shared storage is smaller than the outputs it holds',
+      SharedBytes < PrivateBytes);
+    AssertEquals('host bytes saved', PrivateBytes - SharedBytes,
+      BytesOff - BytesOn);
+    // A suffix forward would read outputs the last pass overwrote.
+    SuffixRefused := false;
+    try
+      NetOn.ComputeSerial(cLivenessHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeSerial from a middle layer is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeParallel(cLivenessHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeParallel from a middle layer is refused', SuffixRefused);
+    // A pin set after a forward takes effect at the next one.
+    OverwrittenIdx := -1;
+    LayerPos := 1;
+    while (OverwrittenIdx < 0) and (LayerPos < NetOn.GetLastLayerIdx()) do
+    begin
+      if MaxAbsDiffOfVolumes(NetOn.Layers[LayerPos].Output,
+        NetOff.Layers[LayerPos].Output) > 0 then OverwrittenIdx := LayerPos;
+      Inc(LayerPos);
+    end;
+    AssertTrue('a later layer overwrote an output', OverwrittenIdx > 0);
+    NetOn.Layers[OverwrittenIdx].OutputPinned := true;
+    CheckPass('pinned after a forward');
+    AssertEquals('the layer pinned after a forward keeps its output', 0,
+      MaxAbsDiffOfVolumes(NetOn.Layers[OverwrittenIdx].Output,
+      NetOff.Layers[OverwrittenIdx].Output), 0);
+    // Switching it off gives every layer its own storage back at once.
+    NetOn.ShareHostOutputsByLiveness := false;
+    AssertEquals('off: no shared layers', 0, NetOn.HostSharedOutputLayerCount());
+    AssertEquals('off: host bytes as unshared', BytesOff, NetOn.NonWeightBytes());
+    Parallel := false;
+    CheckPass('off');
+    NetOn.ShareHostOutputsByLiveness := true;
+    Parallel := true;
+    CheckPass('on again');
+    AssertTrue('on again: layers share', NetOn.HostSharedOutputLayerCount() > 0);
+    // Backprop reads the outputs: a trainable net keeps them private.
+    NetTrainable.ShareHostOutputsByLiveness := true;
+    NetTrainable.Compute(Input);
+    AssertEquals('trainable: no shared layers', 0,
+      NetTrainable.HostSharedOutputLayerCount());
+    NetOn.Layers[1].SetTrainable(true);
+    NetOn.Compute(Input);
+    AssertEquals('a trainable layer drops the sharing', 0,
+      NetOn.HostSharedOutputLayerCount());
+  finally
+    Input.Free;
+    NetTrainable.Free;
+    NetOn.Free;
+    NetOff.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOpenCLShareHostOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  // Host-computed in the OpenCL pass: their consumers upload what they wrote.
+  cHostComputedIdx: array[0..3] of integer = (2, 9, cLivenessChunkedConvIdx, 14);
+var
+  NetOff, NetOn, NetQueues: TNNet;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassPos, ElementPos, MaxElementPos, HostPos, GoneCount: integer;
+  Parallel, PinRefused: boolean;
+  BytesOff, BytesOn: int64;
+
+  // Read from the last layer down, so no read lands in a storage still unread:
+  // each layer gives NetOff's exact output or reports it gone.
+  function CountGoneHostReads(const pWhen: string): integer;
+  var
+    ReadPos: integer;
+  begin
+    Result := 0;
+    for ReadPos := NetOn.GetLastLayerIdx() downto 1 do
+    begin
+      NetOff.Layers[ReadPos].ForceOutputOnRAM();
+      if not NetOn.Layers[ReadPos].ForceOutputOnRAM() then
+      begin
+        Inc(Result);
+        continue;
+      end;
+      AssertEquals(pWhen + ': layer ' + IntToStr(ReadPos) + ' host read', 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[ReadPos].Output,
+        NetOff.Layers[ReadPos].Output), 0);
+    end;
+  end;
+
+  procedure ArmNet(Net: TNNet; pHasSharedKernel: boolean);
+  var
+    HostComputedPos: integer;
+  begin
+    Net.EnableOpenCL(PlatformId, DeviceId, pHasSharedKernel);
+    Net.ForceOpenCL(true);
+    Net.Layers[cLivenessHostReaderIdx].ForceOpenCL(false);
+    for HostComputedPos := 0 to High(cHostComputedIdx) do
+      Net.Layers[cHostComputedIdx[HostComputedPos]].DisableOpenCL();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetOff := BuildLivenessShareTestNet({pTrainable=}false);
+  NetOn := BuildLivenessShareTestNet({pTrainable=}false);
+  NetQueues := BuildLivenessShareTestNet({pTrainable=}false);
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.037) + 0.05;
+    ArmNet(NetOff, true);
+    NetOn.ShareHostOutputsByLiveness := true;
+    NetOn.ShareOpenCLOutputsByLiveness := true;
+    NetOn.Layers[cLivenessPinnedLayerIdx].OutputPinned := true;
+    ArmNet(NetOn, true);
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      AssertEquals('pass ' + IntToStr(PassPos) + ': shared vs private', 0,
+        MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+        NetOff.GetLastLayer().Output), 0);
+      AssertTrue('the pinned layer keeps its output',
+        NetOn.Layers[cLivenessPinnedLayerIdx].ForceOutputOnRAM());
+      NetOff.Layers[cLivenessPinnedLayerIdx].ForceOutputOnRAM();
+      AssertEquals('pass ' + IntToStr(PassPos) + ': pinned layer', 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[cLivenessPinnedLayerIdx].Output,
+        NetOff.Layers[cLivenessPinnedLayerIdx].Output), 0);
+      GoneCount := CountGoneHostReads('pass ' + IntToStr(PassPos));
+      AssertTrue('overwritten host outputs report themselves gone',
+        GoneCount > 0);
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+      AssertTrue('the host-computed convolution ran in chunks',
+        NetOn.Layers[cLivenessChunkedConvIdx].ChunkEligible());
+    // The OpenCL slots were planned when the net was armed.
+    PinRefused := false;
+    try
+      NetOn.Layers[cLivenessHostReaderIdx].OutputPinned := true;
+    except
+      on E: Exception do PinRefused := Pos('EnableOpenCL', E.Message) > 0;
+    end;
+    AssertTrue('a pin after arming is refused', PinRefused);
+    AssertEquals('the host reader ran on the CPU', 0,
+      NetOn.Layers[cLivenessHostReaderIdx].ForwardGPUCnt);
+    for HostPos := 0 to High(cHostComputedIdx) do
+      AssertEquals('layer ' + IntToStr(cHostComputedIdx[HostPos]) +
+        ' ran on the CPU', 0,
+        NetOn.Layers[cHostComputedIdx[HostPos]].ForwardGPUCnt);
+    BytesOff := NetOff.NonWeightBytes();
+    BytesOn := NetOn.NonWeightBytes();
+    WriteLn('  ShareHostOutputsByLiveness on OpenCL: ',
+      NetOn.HostSharedOutputLayerCount(), ' layers share; net host bytes ',
+      BytesOff, ' -> ', BytesOn, '; OpenCL shared layers ',
+      NetOn.OpenCLSharedOutputLayerCount());
+    AssertTrue('layers share host storage',
+      NetOn.HostSharedOutputLayerCount() > 0);
+    AssertTrue('layers share OpenCL buffers',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    AssertEquals('host bytes saved', NetOn.HostSharedOutputPrivateBytes() -
+      NetOn.HostSharedOutputBytes(), BytesOff - BytesOn);
+    // Per-layer queues order nothing between layers: host sharing stays off.
+    NetQueues.ShareHostOutputsByLiveness := true;
+    ArmNet(NetQueues, {pHasSharedKernel=}false);
+    NetQueues.Compute(Input);
+    AssertEquals('per-layer queues: no shared layers', 0,
+      NetQueues.HostSharedOutputLayerCount());
+  finally
+    Input.Free;
+    NetQueues.Free;
+    NetOn.Free;
+    NetOff.Free;
   end;
 end;
 {$ELSE}

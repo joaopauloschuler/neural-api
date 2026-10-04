@@ -514,6 +514,8 @@ type
       procedure InitStruct();
     private
       FLayerIdx: integer;
+      // Output sharing by liveness (TNNet) never shares this layer's output.
+      FOutputPinned: boolean;
       {$IFDEF OpenCL}
       FHasOpenCL: boolean;
       FShouldOpenCL: boolean;
@@ -532,8 +534,6 @@ type
       FOutputOnOpenCL: boolean;     // output is in device memory
       FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
       FErrorOnOpenCL: boolean;      // gradient is in device memory
-      // TNNet.ShareOpenCLOutputsByLiveness never shares this layer's buffer.
-      FOpenCLOutputPinned: boolean;
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure MoveOutputToRAM(); virtual;
@@ -663,10 +663,14 @@ type
       // Writes every later forward output into a retained reference to Buffer
       // (Bytes long, at least the output size). Does nothing here.
       procedure AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t); virtual;
-      // The layer whose buffer OpenCLOutputBuffer returns in place of one of
-      // this layer's own (a reshape alias); nil here.
-      function OpenCLOutputAliasSource(): TNNetLayer; virtual;
       {$ENDIF}
+      // The layer whose output this one aliases or copies on a later host read
+      // (a reshape), so its readers also read that layer; nil here.
+      function OutputAliasSource(): TNNetLayer; virtual;
+      // True when every forward writes the whole host FOutput without reading
+      // what it held, so TNNet may share its storage by liveness. False here.
+      function CanShareHostOutput(): boolean; virtual;
+      procedure SetOutputPinned(Value: boolean);
 
       // Arms the int8 quantized copy of this layer's forward input. Does
       // nothing here: only weight-carrying layers own one. Coded by Claude (AI).
@@ -964,11 +968,10 @@ type
       {$IFDEF OpenCL}
       property HasOpenCL: boolean read FHasOpenCL;
       property ShouldOpenCL:boolean read FShouldOpenCL;
-      // Set before arming when a caller reads this output after the forward:
-      // TNNet.ShareOpenCLOutputsByLiveness then keeps its buffer private.
-      property OpenCLOutputPinned: boolean read FOpenCLOutputPinned
-        write FOpenCLOutputPinned;
       {$ENDIF}
+      // Set before arming and the first forward when a caller reads this output
+      // after the forward: output sharing by liveness then keeps it private.
+      property OutputPinned: boolean read FOutputPinned write SetOutputPinned;
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -1606,6 +1609,7 @@ type
   public
     constructor Create(); override;
     procedure Compute(); override;
+    function CanShareHostOutput(): boolean; override;
   end;
 
   /// E-Swish activation function: y = beta * x * sigmoid(beta * x).
@@ -8773,6 +8777,7 @@ type
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       // Always False: benchmarked as bandwidth-bound (the token split loses at
@@ -12989,8 +12994,8 @@ type
       function WillOpenCL(): boolean; override;
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
-      function OpenCLOutputAliasSource(): TNNetLayer; override;
       {$ENDIF}
+      function OutputAliasSource(): TNNetLayer; override;
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -13142,6 +13147,7 @@ type
     {$ENDIF}
 
     procedure Compute(); override;
+    function CanShareHostOutput(): boolean; override;
     procedure Backpropagate(); override;
   end;
 
@@ -13180,6 +13186,7 @@ type
     {$ENDIF}
 
     procedure Compute(); override;
+    function CanShareHostOutput(): boolean; override;
     procedure Backpropagate(); override;
   end;
 
@@ -13344,6 +13351,7 @@ type
     {$ENDIF}
 
     procedure Compute(); override;
+    function CanShareHostOutput(): boolean; override;
     procedure Backpropagate(); override;
 
     function SaveStructureToString(): string; override;
@@ -15293,6 +15301,9 @@ type
     public
       destructor Destroy(); override;
       procedure Compute(); override;
+      // True for the plain convolution classes only: the descendants with a
+      // forward of their own are not checked for writing the whole output.
+      function CanShareHostOutput(): boolean; override;
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): CPU
       // forward only (not WillOpenCL), and the positions*neurons*vector MAC work
       // is at or above the net's min-work threshold. Winograd keeps its serial
@@ -17660,6 +17671,7 @@ type
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       procedure ComputePreviousLayerError(); override;
   end;
@@ -17696,6 +17708,7 @@ type
       destructor Destroy(); override;
       {$ENDIF}
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       // Forward only: a resident source in inference, or ForceOpenCL. The
@@ -18050,6 +18063,11 @@ type
       // Layers computed per worker slot; each worker owns its own slot, so
       // plain increments need no synchronization.
       FSchedWorkerLayerCnt: array of int64;
+      {$IFDEF OpenCL}
+      // Layer i writes host storage that an OpenCL upload still on the queue may
+      // read, so the forward calls DrainOpenCLQueue first (empty: no layer).
+      FDrainOpenCLQueueBefore: array of boolean;
+      {$ENDIF}
       // Per-net intra-layer chunking state (chunk-eligible layers - the
       // TNNetFullConnect family and TNNetConvolution): opt-in switch and a
       // minimum-work threshold (output items * input size in MACs; small
@@ -18103,14 +18121,16 @@ type
       // mutation that can swap layer objects without changing FLayers.Count
       // (e.g. TNNet.Clear) - the count-only cache check in BuildInferencePlan
       // cannot detect it. Coded by Claude (AI).
-      procedure InvalidateInferencePlan();
+      procedure InvalidateInferencePlan(); virtual;
+      // Called before every forward: TNNet plans its host output sharing there
+      // and raises when the forward cannot start at FromLayerIdx. Does nothing here.
+      procedure PrepareForwardPass(FromLayerIdx: integer); virtual;
       {$IFDEF OpenCL}
-      // Raises when the forward cannot start at FromLayerIdx; TNNet refuses it
-      // while its OpenCL outputs are shared. Does nothing here.
-      procedure CheckForwardStart(FromLayerIdx: integer); virtual;
       // Called after every forward, also one that raised. Does nothing here.
-      procedure ClearOverwrittenOpenCLOutputs(FromLayerIdx,
+      procedure ClearOverwrittenOutputFlags(FromLayerIdx,
         EndLayerIdx: integer); virtual;
+      // Waits for the commands already on the net's OpenCL queue. Does nothing here.
+      procedure DrainOpenCLQueue(); virtual;
       {$ENDIF}
     public
       constructor Create(); override;
@@ -18225,6 +18245,16 @@ type
         read FHotThreadTimeout write FHotThreadTimeout;
   end;
 
+  // TNNet.PlanOutputSlotsByLiveness's result: per layer the slot it writes
+  // (-1: its own output), each slot's bytes, and which layer overwrites which.
+  TNNetOutputSlotPlan = record
+    SlotOfLayer: TNeuralIntegerArray;
+    SlotBytes: array of int64;
+    // Layer Evictors[i] overwrites Evictees[i]'s output.
+    Evictors: TNeuralIntegerArray;
+    Evictees: array of TNNetLayer;
+  end;
+
   /// neural network
   TNNet = class(TNNetExecutionPlanner)
     protected
@@ -18287,28 +18317,54 @@ type
       FOpenCLOwned: TList;
       FForceOpenCL: boolean;
       FShareOpenCLOutputsByLiveness: boolean;
-      // PlanOpenCLOutputSharing's result: the net's reference to each shared
-      // output buffer and its bytes, and per layer the slot it writes (-1: none).
+      // PlanOpenCLOutputSharing's result and the net's reference to each
+      // shared output buffer.
+      FOpenCLOutputPlan: TNNetOutputSlotPlan;
       FOpenCLOutputSlots: array of cl_mem;
-      FOpenCLOutputSlotBytes: array of int64;
-      FOpenCLOutputSlotOfLayer: array of integer;
-      // Layer FOpenCLSlotEvictors[i] overwrites FOpenCLSlotEvictees[i]'s output.
-      FOpenCLSlotEvictors: array of integer;
-      FOpenCLSlotEvictees: array of TNNetLayer;
       // Gives each layer that CanShareOpenCLOutput a net-owned buffer reused by
       // liveness when ShareOpenCLOutputsByLiveness; the arming routines call it.
       procedure PlanOpenCLOutputSharing();
       // Drops the plan and the net's references; DisableOpenCL and Destroy call it.
       procedure ReleaseOpenCLOutputSlots();
     protected
-      // A suffix forward would re-run readers of outputs the last pass overwrote.
-      procedure CheckForwardStart(FromLayerIdx: integer); override;
-      // Clears the residency flag of every output a layer in the range overwrote.
-      procedure ClearOverwrittenOpenCLOutputs(FromLayerIdx,
+      // Clears the residency flag of every OpenCL or host output a layer in the
+      // range overwrote.
+      procedure ClearOverwrittenOutputFlags(FromLayerIdx,
         EndLayerIdx: integer); override;
+      // Waits for the net's shared queue (FDotProductKernel).
+      procedure DrainOpenCLQueue(); override;
     private
       {$ENDIF}
+      FShareHostOutputsByLiveness: boolean;
+      // PlanHostOutputSharing's result, the layer whose FOutput.FData each slot's
+      // other layers share, and what the plan was made for (-1: no plan).
+      FHostOutputPlan: TNNetOutputSlotPlan;
+      FHostOutputSlotHolders: TNeuralIntegerArray;
+      FHostOutputPlanLayerCount: integer;
+      FHostOutputPlanOnOpenCL: boolean;
+      // Puts each Shareable layer in a slot by liveness: it takes a slot only when
+      // the slot's holder and the holder's readers are its ancestors.
+      procedure PlanOutputSlotsByLiveness(const Shareable: array of boolean;
+        ExactSize: boolean; out Plan: TNNetOutputSlotPlan);
+      // (Re)plans host FOutput sharing when ShareHostOutputsByLiveness and the
+      // plan is stale; drops it when sharing is off or a layer is trainable.
+      procedure PlanHostOutputSharing();
+      // Gives every sharing layer its own FOutput storage again; drops the plan.
+      procedure ReleaseHostOutputSharing();
+      procedure SetShareHostOutputsByLiveness(Value: boolean);
+      // TNNetLayer.OutputPinned changed: the sharing plans are stale.
+      procedure OutputPinChanged(pPinned: boolean);
+      // HostSharedOutputLayerCount, HostSharedOutputBytes and
+      // HostSharedOutputPrivateBytes in one pass.
+      procedure CountHostSharedOutputs(out LayerCount: integer;
+        out SharedBytes, PrivateBytes: int64);
       procedure SetLayerProfiling(Value: boolean);
+    protected
+      // Plans host output sharing; a suffix forward is refused while outputs
+      // are shared, as it would read outputs the last pass overwrote.
+      procedure PrepareForwardPass(FromLayerIdx: integer); override;
+      // Also makes the next forward plan host output sharing again.
+      procedure InvalidateInferencePlan(); override;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -20294,10 +20350,19 @@ type
       function OpenCLSharedOutputBytes(): int64;
       function OpenCLSharedOutputPrivateBytes(): int64;
       // Read when armed: dead outputs' OpenCL buffers are reused (one shared
-      // queue only). Caller requirements: see TNNet.PlanOpenCLOutputSharing.
+      // queue only). Caller requirements: see TNNet.PlanOutputSlotsByLiveness.
       property ShareOpenCLOutputsByLiveness: boolean
         read FShareOpenCLOutputsByLiveness write FShareOpenCLOutputsByLiveness;
       {$ENDIF}
+      // Layers sharing another layer's host FOutput storage now, the shared
+      // storage's bytes, and the bytes those outputs would take unshared.
+      function HostSharedOutputLayerCount(): integer;
+      function HostSharedOutputBytes(): int64;
+      function HostSharedOutputPrivateBytes(): int64;
+      // Inference-only nets (not with per-layer OpenCL queues): from the next
+      // forward, equal-size dead outputs share host storage; see PlanOutputSlotsByLiveness.
+      property ShareHostOutputsByLiveness: boolean
+        read FShareHostOutputsByLiveness write SetShareHostOutputsByLiveness;
 
       // debug procedures
       procedure DebugWeights();
@@ -25125,6 +25190,11 @@ constructor TNNetSwish.Create();
 begin
   inherited Create();
   FActivationOpcode := csActSwish; // shared with TNNetSiLU
+end;
+
+function TNNetSwish.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
 end;
 
 procedure TNNetSwish.Compute();
@@ -56748,6 +56818,11 @@ begin
 end;
 {$ENDIF}
 
+function TNNetPixelShuffle.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetPixelShuffle.Compute();
 var
   r, MaxX, MaxY, MaxD, x, y, c, i, j, InD: integer;
@@ -78313,6 +78388,11 @@ begin
   InitDefault();
 end;
 
+function TNNetTokenRMSNorm.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetTokenRMSNorm.Compute();
 var
   StartTime: double;
@@ -81228,6 +81308,11 @@ begin
   FOutputOnRAM := false;
 end;
 {$ENDIF}
+
+function TNNetSum.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
 
 procedure TNNetSum.Compute();
 var
@@ -100207,6 +100292,11 @@ begin
 end;
 {$ENDIF}
 
+function TNNetDeepConcat.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetDeepConcat.Compute();
 var
   OutputDeepCnt, LocalIdx: integer;
@@ -100582,6 +100672,11 @@ begin
   FOutputOnRAM := false;
 end;
 {$ENDIF}
+
+function TNNetSplitChannels.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
 
 procedure TNNetSplitChannels.Compute();
 var
@@ -103345,6 +103440,11 @@ begin
   {$ENDIF}
 end;
 
+function TNNetDeMaxPool.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetDeMaxPool.Compute();
 var
   CntX, CntY: integer;
@@ -104130,12 +104230,12 @@ begin
   if Assigned(FPrevLayer) then Result := FPrevLayer.OpenCLOutputKernel()
   else Result := nil;
 end;
+{$ENDIF}
 
-function TNNetReshape.OpenCLOutputAliasSource(): TNNetLayer;
+function TNNetReshape.OutputAliasSource(): TNNetLayer;
 begin
   Result := FPrevLayer;
 end;
-{$ENDIF}
 
 procedure TNNetReshape.Compute;
 var
@@ -108794,6 +108894,14 @@ begin
   Inc(FForwardCPUCnt);
 end;
 
+function TNNetConvolution.CanShareHostOutput(): boolean;
+begin
+  Result := (not FIsTrainable) and ((ClassType = TNNetConvolution) or
+    (ClassType = TNNetConvolutionLinear) or (ClassType = TNNetConvolutionReLU) or
+    (ClassType = TNNetPointwiseConv) or (ClassType = TNNetPointwiseConvLinear) or
+    (ClassType = TNNetPointwiseConvReLU));
+end;
+
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
   begin
@@ -111909,13 +112017,17 @@ begin
   FSchedPlanLayerCount := -1;
 end;
 
-{$IFDEF OpenCL}
-procedure TNNetExecutionPlanner.CheckForwardStart(FromLayerIdx: integer);
+procedure TNNetExecutionPlanner.PrepareForwardPass(FromLayerIdx: integer);
 begin
 end;
 
-procedure TNNetExecutionPlanner.ClearOverwrittenOpenCLOutputs(FromLayerIdx,
+{$IFDEF OpenCL}
+procedure TNNetExecutionPlanner.ClearOverwrittenOutputFlags(FromLayerIdx,
   EndLayerIdx: integer);
+begin
+end;
+
+procedure TNNetExecutionPlanner.DrainOpenCLQueue();
 begin
 end;
 {$ENDIF}
@@ -111992,6 +112104,7 @@ begin
   inherited Create();
   ClearTime();
   FIsTrainable := true;
+  FHostOutputPlanLayerCount := -1;
   FBuildWeightOwner := nil;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
@@ -112048,14 +112161,18 @@ begin
   end;
 end;
 
+// Host FOutput storage shared by liveness counts once.
 function TNNet.NonWeightBytes(): int64;
 var
-  LayerCnt, LastLayerIdx: integer;
+  LayerCnt, LastLayerIdx, SharedLayerCount: integer;
+  SharedBytes, PrivateBytes: int64;
 begin
   Result := 0;
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
     Result := Result + FLayers[LayerCnt].NonWeightBytes();
+  CountHostSharedOutputs(SharedLayerCount, SharedBytes, PrivateBytes);
+  Result := Result - (PrivateBytes - SharedBytes);
 end;
 
 // A shared buffer counts once, not once per layer still writing into it.
@@ -112071,10 +112188,10 @@ begin
   for LayerCnt := 0 to LastLayerIdx do
     Result := Result + FLayers[LayerCnt].OpenCLBufferBytes();
   {$IFDEF OpenCL}
-  MaxPlannedLayerPos := Min(High(FOpenCLOutputSlotOfLayer), LastLayerIdx);
+  MaxPlannedLayerPos := Min(High(FOpenCLOutputPlan.SlotOfLayer), LastLayerIdx);
   for LayerCnt := 0 to MaxPlannedLayerPos do
   begin
-    SlotPos := FOpenCLOutputSlotOfLayer[LayerCnt];
+    SlotPos := FOpenCLOutputPlan.SlotOfLayer[LayerCnt];
     if (SlotPos >= 0) and
       (FLayers[LayerCnt].OpenCLOutputBuffer() = FOpenCLOutputSlots[SlotPos]) then
       Result := Result - OpenCLMemBytes(FOpenCLOutputSlots[SlotPos]);
@@ -132866,6 +132983,9 @@ var
   LayerCnt: integer;
   LastLayer: integer;
   RunLayersProfiled: boolean;
+  {$IFDEF OpenCL}
+  HasQueueDrains: boolean;
+  {$ENDIF}
 begin
   LastLayer := GetLastLayerIdx();
   if (EndLayerIdx >= 0) and (EndLayerIdx < LastLayer) then LastLayer := EndLayerIdx;
@@ -132874,12 +132994,17 @@ begin
   // intra-layer knob). ComputeParallel does the inverse (enables it).
   EnableIntraLayerThreading(false);
   RunLayersProfiled := FLayerProfiling;
+  PrepareForwardPass(FromLayerIdx);
   {$IFDEF OpenCL}
-  CheckForwardStart(FromLayerIdx);
+  HasQueueDrains := Length(FDrainOpenCLQueueBefore) > LastLayer;
   try
   {$ENDIF}
   for LayerCnt := FromLayerIdx to LastLayer do
   begin
+    {$IFDEF OpenCL}
+    if HasQueueDrains and FDrainOpenCLQueueBefore[LayerCnt] then
+      DrainOpenCLQueue();
+    {$ENDIF}
     if RunLayersProfiled
       then FLayers[LayerCnt].RunProfiled({ChunkPrep=}false)
       else FLayers[LayerCnt].Compute();
@@ -132887,7 +133012,7 @@ begin
   end;
   {$IFDEF OpenCL}
   finally
-    ClearOverwrittenOpenCLOutputs(FromLayerIdx, LastLayer);
+    ClearOverwrittenOutputFlags(FromLayerIdx, LastLayer);
   end;
   {$ENDIF}
 end;
@@ -133127,6 +133252,11 @@ begin
   // Diagnostic state: claimed/dispatched. Written once (each layer is enqueued
   // exactly once per pass) and happens-before any completion (state 2).
   L.FComputeState := 1;
+  {$IFDEF OpenCL}
+  // Every layer whose upload could read this one's host storage has finished.
+  if (pLayerIdx < Length(FDrainOpenCLQueueBefore)) and
+    FDrainOpenCLQueueBefore[pLayerIdx] then DrainOpenCLQueue();
+  {$ENDIF}
   if L.WillOpenCL() then
   begin
     // The verdict is read once, here, after every dependency has completed - so
@@ -133362,9 +133492,7 @@ begin
   // Parallel forward also drives intra-layer threading (big WillThread layers
   // split across the pool); the compute path picks the threading mode so
   // callers only choose serial vs parallel. ComputeSerial does the inverse.
-  {$IFDEF OpenCL}
-  CheckForwardStart(FromLayerIdx);
-  {$ENDIF}
+  PrepareForwardPass(FromLayerIdx);
   EnableIntraLayerThreading(true);
   BuildInferencePlan();
   ThreadCount := Min(FSchedMaxWidth, SchedThreadBudget());
@@ -133463,7 +133591,7 @@ begin
   FSchedPool.StartProc({$IFDEF FPC}@RunInferenceSchedulerWorker{$ELSE}RunInferenceSchedulerWorker{$ENDIF});
   {$IFDEF OpenCL}
   finally
-    ClearOverwrittenOpenCLOutputs(FromLayerIdx, LastLayer);
+    ClearOverwrittenOutputFlags(FromLayerIdx, LastLayer);
   end;
   {$ENDIF}
   // StartProc joins (waits for every worker), so the pass is complete here:
@@ -134600,14 +134728,149 @@ begin
     FLayers[LayerCnt].ForceOpenCL(pForce);
 end;
 
-// A layer takes a slot only when the holder and the holder's readers are its
-// ancestors, so every read is enqueued first on the one in-order queue.
+// Every read of a slot holder is enqueued before the next holder's forward on
+// the one in-order queue (see PlanOutputSlotsByLiveness).
 procedure TNNet.PlanOpenCLOutputSharing();
+var
+  LayerCnt, LastLayerIdx, SlotPos, MaxSlotPos: integer;
+  Layer: TNNetLayer;
+  Shareable: array of boolean;
+begin
+  ReleaseOpenCLOutputSlots();
+  if not (FShareOpenCLOutputsByLiveness and FHasSharedKernel and
+    Assigned(FDotProductKernel)) then exit;
+  LastLayerIdx := GetLastLayerIdx();
+  if LastLayerIdx < 1 then exit;
+  SetLength(Shareable, LastLayerIdx + 1);
+  for LayerCnt := 0 to LastLayerIdx do
+    Shareable[LayerCnt] := FLayers[LayerCnt].CanShareOpenCLOutput();
+  PlanOutputSlotsByLiveness(Shareable, {ExactSize=}false, FOpenCLOutputPlan);
+  MaxSlotPos := High(FOpenCLOutputPlan.SlotBytes);
+  SetLength(FOpenCLOutputSlots, MaxSlotPos + 1);
+  for SlotPos := 0 to MaxSlotPos do FOpenCLOutputSlots[SlotPos] := nil;
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    FOpenCLOutputSlots[SlotPos] := FDotProductKernel.CreateBuffer(
+      CL_MEM_READ_WRITE, FOpenCLOutputPlan.SlotBytes[SlotPos]);
+    if not Assigned(FOpenCLOutputSlots[SlotPos]) then
+    begin
+      FErrorProc('PlanOpenCLOutputSharing: a ' +
+        IntToStr(FOpenCLOutputPlan.SlotBytes[SlotPos]) + '-byte shared buffer ' +
+        'failed; every layer keeps its own OpenCL output buffer.');
+      ReleaseOpenCLOutputSlots();
+      exit;
+    end;
+  end;
+  // A resident output still sits in the private buffer the layer drops.
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    SlotPos := FOpenCLOutputPlan.SlotOfLayer[LayerCnt];
+    if SlotPos < 0 then continue;
+    Layer := FLayers[LayerCnt];
+    Layer.ForceOutputOnRAM();
+    Layer.AdoptOpenCLOutputBuffer(FOpenCLOutputSlots[SlotPos],
+      FOpenCLOutputPlan.SlotBytes[SlotPos]);
+    Layer.FOutputOnOpenCL := false;
+  end;
+end;
+
+// Layers keep their own retained references, so a shared buffer lives on
+// until its last holder releases it as well.
+procedure TNNet.ReleaseOpenCLOutputSlots();
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  MaxSlotPos := High(FOpenCLOutputSlots);
+  for SlotPos := 0 to MaxSlotPos do
+    if Assigned(FOpenCLOutputSlots[SlotPos]) then
+      clReleaseMemObject(FOpenCLOutputSlots[SlotPos]);
+  SetLength(FOpenCLOutputSlots, 0);
+  FOpenCLOutputPlan := Default(TNNetOutputSlotPlan);
+end;
+
+// The overwritten data is gone, so a later ForceOutputOnRAM on such a layer
+// downloads its intact OpenCL copy or returns false, never another layer's output.
+procedure TNNet.ClearOverwrittenOutputFlags(FromLayerIdx,
+  EndLayerIdx: integer);
+var
+  EvictionPos, MaxEvictionPos, EvictorIdx: integer;
+begin
+  MaxEvictionPos := High(FOpenCLOutputPlan.Evictors);
+  for EvictionPos := 0 to MaxEvictionPos do
+  begin
+    EvictorIdx := FOpenCLOutputPlan.Evictors[EvictionPos];
+    if (EvictorIdx >= FromLayerIdx) and (EvictorIdx <= EndLayerIdx) then
+      FOpenCLOutputPlan.Evictees[EvictionPos].FOutputOnOpenCL := false;
+  end;
+  MaxEvictionPos := High(FHostOutputPlan.Evictors);
+  for EvictionPos := 0 to MaxEvictionPos do
+  begin
+    EvictorIdx := FHostOutputPlan.Evictors[EvictionPos];
+    if (EvictorIdx >= FromLayerIdx) and (EvictorIdx <= EndLayerIdx) then
+      FHostOutputPlan.Evictees[EvictionPos].FOutputOnRAM := false;
+  end;
+end;
+
+// Only a non-blocking upload can still read host storage a layer reuses.
+procedure TNNet.DrainOpenCLQueue();
+begin
+  if Assigned(FDotProductKernel) and FDotProductKernel.HasPendingUploads() then
+    FDotProductKernel.Finish();
+end;
+
+function TNNet.OpenCLSharedOutputLayerCount(): integer;
+var
+  LayerCnt, MaxPlannedLayerPos, SlotPos: integer;
+begin
+  Result := 0;
+  MaxPlannedLayerPos := Min(High(FOpenCLOutputPlan.SlotOfLayer),
+    GetLastLayerIdx());
+  for LayerCnt := 0 to MaxPlannedLayerPos do
+  begin
+    SlotPos := FOpenCLOutputPlan.SlotOfLayer[LayerCnt];
+    if (SlotPos >= 0) and
+      (FLayers[LayerCnt].OpenCLOutputBuffer() = FOpenCLOutputSlots[SlotPos]) then
+      Inc(Result);
+  end;
+end;
+
+function TNNet.OpenCLSharedOutputBytes(): int64;
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  Result := 0;
+  MaxSlotPos := High(FOpenCLOutputPlan.SlotBytes);
+  for SlotPos := 0 to MaxSlotPos do
+    Result := Result + FOpenCLOutputPlan.SlotBytes[SlotPos];
+end;
+
+function TNNet.OpenCLSharedOutputPrivateBytes(): int64;
+var
+  LayerCnt, MaxPlannedLayerPos, SlotPos: integer;
+begin
+  Result := 0;
+  MaxPlannedLayerPos := Min(High(FOpenCLOutputPlan.SlotOfLayer),
+    GetLastLayerIdx());
+  for LayerCnt := 0 to MaxPlannedLayerPos do
+  begin
+    SlotPos := FOpenCLOutputPlan.SlotOfLayer[LayerCnt];
+    if (SlotPos >= 0) and
+      (FLayers[LayerCnt].OpenCLOutputBuffer() = FOpenCLOutputSlots[SlotPos]) then
+      Result := Result + int64(FLayers[LayerCnt].FOutput.Size) *
+        csNeuralFloatSize;
+  end;
+end;
+{$ENDIF}
+
+// The scheduler runs a layer after its ancestors, so the rule holds for the
+// serial loop and the parallel pass alike.
+procedure TNNet.PlanOutputSlotsByLiveness(const Shareable: array of boolean;
+  ExactSize: boolean; out Plan: TNNetOutputSlotPlan);
 var
   LayerCnt, LastLayerIdx, LayerCount, WordCount, WordPos, MaxWordPos: integer;
   DepCnt, DepHigh, RawCnt, MaxRawPos, DepIdx, RootIdx, ReaderPos: integer;
   SlotPos, MaxSlotPos, BestSlot, HolderIdx, EvicteeIdx: integer;
-  NeededBytes: int64;
+  NeededBytes, FreeSlotBytes: int64;
   BestFits, HolderFree: boolean;
   RawDeps: TList;
   Dep, Layer, AliasSource: TNNetLayer;
@@ -134624,18 +134887,17 @@ var
 
 begin
   // Readers of an alias count as the root's readers. Pinned: the last layer,
-  // unread layers, previous-pass reads (self-reads included) and
-  // OpenCLOutputPinned layers. The caller's side: AppendInputLayers declares
-  // every source a layer reads, even for serial forwards; a reader issues all
-  // its reads of a source inside its own Compute; no other net reads a
-  // non-last layer unless it is OpenCLOutputPinned. After a forward a host read
-  // of an overwritten layer returns false; a forward from FromLayerIdx > 0 raises.
-  ReleaseOpenCLOutputSlots();
-  if not (FShareOpenCLOutputsByLiveness and FHasSharedKernel and
-    Assigned(FDotProductKernel)) then exit;
+  // unread layers, previous-pass reads (self-reads included) and OutputPinned
+  // layers. The caller's side: AppendInputLayers declares every source a layer
+  // reads, even for serial forwards; a reader issues all its reads of a source
+  // (downloads into it included) inside its own Compute; no other net reads a
+  // non-last layer unless it is OutputPinned.
+  Plan := Default(TNNetOutputSlotPlan);
   LastLayerIdx := GetLastLayerIdx();
-  if LastLayerIdx < 1 then exit;
   LayerCount := LastLayerIdx + 1;
+  SetLength(Plan.SlotOfLayer, LayerCount);
+  for LayerCnt := 0 to LastLayerIdx do Plan.SlotOfLayer[LayerCnt] := -1;
+  if LastLayerIdx < 1 then exit;
   BuildInferencePlan();
   SetLength(AliasRoot, LayerCount);
   SetLength(DirectReaderCount, LayerCount);
@@ -134644,10 +134906,10 @@ begin
   for LayerCnt := 0 to LastLayerIdx do
   begin
     DirectReaderCount[LayerCnt] := 0;
-    Pinned[LayerCnt] := FLayers[LayerCnt].FOpenCLOutputPinned;
+    Pinned[LayerCnt] := FLayers[LayerCnt].FOutputPinned;
     // -1: the alias chain leaves this net, so no layer of it may share.
     AliasRoot[LayerCnt] := LayerCnt;
-    AliasSource := FLayers[LayerCnt].OpenCLOutputAliasSource();
+    AliasSource := FLayers[LayerCnt].OutputAliasSource();
     if Assigned(AliasSource) then
     begin
       DepIdx := AliasSource.LayerIdx;
@@ -134707,20 +134969,18 @@ begin
         (QWord(1) shl (DepIdx and 63));
     end;
   end;
-  SetLength(FOpenCLOutputSlotOfLayer, LayerCount);
   SetLength(SlotHolder, LayerCount);
-  for LayerCnt := 0 to LastLayerIdx do FOpenCLOutputSlotOfLayer[LayerCnt] := -1;
   for LayerCnt := 0 to LastLayerIdx do
   begin
     Layer := FLayers[LayerCnt];
     if Pinned[LayerCnt] or (AliasRoot[LayerCnt] <> LayerCnt) or
-      (not Layer.CanShareOpenCLOutput()) then continue;
+      (not Shareable[LayerCnt]) then continue;
     NeededBytes := int64(Layer.FOutput.Size) * csNeuralFloatSize;
     if NeededBytes = 0 then continue;
-    // Best fit among the free slots; else the largest free slot grows.
+    // Best fit among the free slots; else (not ExactSize) the largest one grows.
     BestSlot := -1;
     BestFits := false;
-    MaxSlotPos := Length(FOpenCLOutputSlotBytes) - 1;
+    MaxSlotPos := Length(Plan.SlotBytes) - 1;
     for SlotPos := 0 to MaxSlotPos do
     begin
       HolderIdx := SlotHolder[SlotPos];
@@ -134732,21 +134992,23 @@ begin
         Dec(ReaderPos);
       end;
       if not HolderFree then continue;
-      if FOpenCLOutputSlotBytes[SlotPos] >= NeededBytes then
+      FreeSlotBytes := Plan.SlotBytes[SlotPos];
+      if (FreeSlotBytes = NeededBytes) or
+        ((not ExactSize) and (FreeSlotBytes > NeededBytes)) then
       begin
-        if (not BestFits) or (FOpenCLOutputSlotBytes[SlotPos] <
-          FOpenCLOutputSlotBytes[BestSlot]) then BestSlot := SlotPos;
+        if (not BestFits) or (FreeSlotBytes < Plan.SlotBytes[BestSlot]) then
+          BestSlot := SlotPos;
         BestFits := true;
       end
-      else if (not BestFits) and ((BestSlot < 0) or
-        (FOpenCLOutputSlotBytes[SlotPos] > FOpenCLOutputSlotBytes[BestSlot])) then
+      else if (not ExactSize) and (not BestFits) and ((BestSlot < 0) or
+        (FreeSlotBytes > Plan.SlotBytes[BestSlot])) then
         BestSlot := SlotPos;
     end;
     if BestSlot < 0 then
     begin
-      BestSlot := Length(FOpenCLOutputSlotBytes);
-      SetLength(FOpenCLOutputSlotBytes, BestSlot + 1);
-      FOpenCLOutputSlotBytes[BestSlot] := NeededBytes;
+      BestSlot := Length(Plan.SlotBytes);
+      SetLength(Plan.SlotBytes, BestSlot + 1);
+      Plan.SlotBytes[BestSlot] := NeededBytes;
     end
     else
     begin
@@ -134754,128 +135016,191 @@ begin
       for EvicteeIdx := HolderIdx to LastLayerIdx do
       begin
         if AliasRoot[EvicteeIdx] <> HolderIdx then continue;
-        SetLength(FOpenCLSlotEvictors, Length(FOpenCLSlotEvictors) + 1);
-        SetLength(FOpenCLSlotEvictees, Length(FOpenCLSlotEvictees) + 1);
-        FOpenCLSlotEvictors[High(FOpenCLSlotEvictors)] := LayerCnt;
-        FOpenCLSlotEvictees[High(FOpenCLSlotEvictees)] := FLayers[EvicteeIdx];
+        SetLength(Plan.Evictors, Length(Plan.Evictors) + 1);
+        SetLength(Plan.Evictees, Length(Plan.Evictees) + 1);
+        Plan.Evictors[High(Plan.Evictors)] := LayerCnt;
+        Plan.Evictees[High(Plan.Evictees)] := FLayers[EvicteeIdx];
       end;
-      if FOpenCLOutputSlotBytes[BestSlot] < NeededBytes then
-        FOpenCLOutputSlotBytes[BestSlot] := NeededBytes;
+      if Plan.SlotBytes[BestSlot] < NeededBytes then
+        Plan.SlotBytes[BestSlot] := NeededBytes;
     end;
     SlotHolder[BestSlot] := LayerCnt;
-    FOpenCLOutputSlotOfLayer[LayerCnt] := BestSlot;
+    Plan.SlotOfLayer[LayerCnt] := BestSlot;
   end;
-  MaxSlotPos := Length(FOpenCLOutputSlotBytes) - 1;
-  SetLength(FOpenCLOutputSlots, MaxSlotPos + 1);
-  for SlotPos := 0 to MaxSlotPos do FOpenCLOutputSlots[SlotPos] := nil;
+end;
+
+// Off on OpenCL with per-layer queues. On the shared queue every layer of a
+// shared storage drains the queue first: an upload may still read the storage.
+procedure TNNet.PlanHostOutputSharing();
+var
+  LayerCnt, LastLayerIdx, SlotPos, MaxSlotPos, HolderIdx: integer;
+  IsOnOpenCL, IsWanted: boolean;
+  Shareable: array of boolean;
+  SlotLayerCount: TNeuralIntegerArray;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  IsOnOpenCL := {$IFDEF OpenCL}Assigned(FDotProductKernel){$ELSE}false{$ENDIF};
+  IsWanted := FShareHostOutputsByLiveness and (LastLayerIdx >= 1) and
+    ((not IsOnOpenCL) or FHasSharedKernel);
+  LayerCnt := 0;
+  while IsWanted and (LayerCnt <= LastLayerIdx) do
+  begin
+    IsWanted := not FLayers[LayerCnt].FIsTrainable;
+    Inc(LayerCnt);
+  end;
+  if IsWanted and (FHostOutputPlanLayerCount = LastLayerIdx + 1) and
+    (FHostOutputPlanOnOpenCL = IsOnOpenCL) then exit;
+  ReleaseHostOutputSharing();
+  if not IsWanted then exit;
+  SetLength(Shareable, LastLayerIdx + 1);
+  for LayerCnt := 0 to LastLayerIdx do
+    Shareable[LayerCnt] := FLayers[LayerCnt].CanShareHostOutput();
+  PlanOutputSlotsByLiveness(Shareable, {ExactSize=}true, FHostOutputPlan);
+  MaxSlotPos := High(FHostOutputPlan.SlotBytes);
+  SetLength(FHostOutputSlotHolders, MaxSlotPos + 1);
+  SetLength(SlotLayerCount, MaxSlotPos + 1);
   for SlotPos := 0 to MaxSlotPos do
   begin
-    FOpenCLOutputSlots[SlotPos] := FDotProductKernel.CreateBuffer(
-      CL_MEM_READ_WRITE, FOpenCLOutputSlotBytes[SlotPos]);
-    if not Assigned(FOpenCLOutputSlots[SlotPos]) then
-    begin
-      FErrorProc('PlanOpenCLOutputSharing: a ' +
-        IntToStr(FOpenCLOutputSlotBytes[SlotPos]) + '-byte shared buffer ' +
-        'failed; every layer keeps its own OpenCL output buffer.');
-      ReleaseOpenCLOutputSlots();
-      exit;
-    end;
+    FHostOutputSlotHolders[SlotPos] := -1;
+    SlotLayerCount[SlotPos] := 0;
   end;
-  // A resident output still sits in the private buffer the layer drops.
   for LayerCnt := 0 to LastLayerIdx do
   begin
-    SlotPos := FOpenCLOutputSlotOfLayer[LayerCnt];
+    SlotPos := FHostOutputPlan.SlotOfLayer[LayerCnt];
     if SlotPos < 0 then continue;
-    Layer := FLayers[LayerCnt];
-    Layer.ForceOutputOnRAM();
-    Layer.AdoptOpenCLOutputBuffer(FOpenCLOutputSlots[SlotPos],
-      FOpenCLOutputSlotBytes[SlotPos]);
-    Layer.FOutputOnOpenCL := false;
+    Inc(SlotLayerCount[SlotPos]);
+    HolderIdx := FHostOutputSlotHolders[SlotPos];
+    if HolderIdx < 0 then FHostOutputSlotHolders[SlotPos] := LayerCnt
+    else FLayers[LayerCnt].FOutput.ShareDataWith(FLayers[HolderIdx].FOutput);
   end;
-end;
-
-// Layers keep their own retained references, so a shared buffer lives on
-// until its last holder releases it as well.
-procedure TNNet.ReleaseOpenCLOutputSlots();
-var
-  SlotPos, MaxSlotPos: integer;
-begin
-  MaxSlotPos := High(FOpenCLOutputSlots);
-  for SlotPos := 0 to MaxSlotPos do
-    if Assigned(FOpenCLOutputSlots[SlotPos]) then
-      clReleaseMemObject(FOpenCLOutputSlots[SlotPos]);
-  SetLength(FOpenCLOutputSlots, 0);
-  SetLength(FOpenCLOutputSlotBytes, 0);
-  SetLength(FOpenCLOutputSlotOfLayer, 0);
-  SetLength(FOpenCLSlotEvictors, 0);
-  SetLength(FOpenCLSlotEvictees, 0);
-end;
-
-// The overwritten data is gone, so a later ForceOutputOnRAM on such a layer
-// returns false instead of downloading another layer's output.
-procedure TNNet.ClearOverwrittenOpenCLOutputs(FromLayerIdx,
-  EndLayerIdx: integer);
-var
-  EvictionPos, MaxEvictionPos, EvictorIdx: integer;
-begin
-  MaxEvictionPos := High(FOpenCLSlotEvictors);
-  for EvictionPos := 0 to MaxEvictionPos do
+  {$IFDEF OpenCL}
+  if IsOnOpenCL then
   begin
-    EvictorIdx := FOpenCLSlotEvictors[EvictionPos];
-    if (EvictorIdx >= FromLayerIdx) and (EvictorIdx <= EndLayerIdx) then
-      FOpenCLSlotEvictees[EvictionPos].FOutputOnOpenCL := false;
+    SetLength(FDrainOpenCLQueueBefore, LastLayerIdx + 1);
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      SlotPos := FHostOutputPlan.SlotOfLayer[LayerCnt];
+      FDrainOpenCLQueueBefore[LayerCnt] :=
+        (SlotPos >= 0) and (SlotLayerCount[SlotPos] > 1);
+    end;
   end;
+  {$ENDIF}
+  FHostOutputPlanLayerCount := LastLayerIdx + 1;
+  FHostOutputPlanOnOpenCL := IsOnOpenCL;
 end;
 
-function TNNet.OpenCLSharedOutputLayerCount(): integer;
+procedure TNNet.ReleaseHostOutputSharing();
 var
-  LayerCnt, MaxPlannedLayerPos, SlotPos: integer;
+  LayerCnt, MaxPlannedLayerPos: integer;
 begin
-  Result := 0;
-  MaxPlannedLayerPos := Min(High(FOpenCLOutputSlotOfLayer), GetLastLayerIdx());
+  MaxPlannedLayerPos := Min(High(FHostOutputPlan.SlotOfLayer),
+    GetLastLayerIdx());
+  for LayerCnt := 0 to MaxPlannedLayerPos do
+    if FHostOutputPlan.SlotOfLayer[LayerCnt] >= 0 then
+      FLayers[LayerCnt].FOutput.UnshareData();
+  FHostOutputPlan := Default(TNNetOutputSlotPlan);
+  SetLength(FHostOutputSlotHolders, 0);
+  {$IFDEF OpenCL}
+  SetLength(FDrainOpenCLQueueBefore, 0);
+  {$ENDIF}
+  FHostOutputPlanLayerCount := -1;
+end;
+
+procedure TNNet.SetShareHostOutputsByLiveness(Value: boolean);
+begin
+  FShareHostOutputsByLiveness := Value;
+  if not Value then ReleaseHostOutputSharing();
+end;
+
+// A layer counts while its FOutput still holds its slot holder's storage (a
+// ReSize to another size gives it its own).
+procedure TNNet.CountHostSharedOutputs(out LayerCount: integer;
+  out SharedBytes, PrivateBytes: int64);
+var
+  LayerCnt, MaxPlannedLayerPos, SlotPos, MaxSlotPos, HolderIdx: integer;
+  HolderCounted: array of boolean;
+begin
+  LayerCount := 0;
+  SharedBytes := 0;
+  PrivateBytes := 0;
+  MaxSlotPos := High(FHostOutputSlotHolders);
+  SetLength(HolderCounted, MaxSlotPos + 1);
+  for SlotPos := 0 to MaxSlotPos do HolderCounted[SlotPos] := false;
+  MaxPlannedLayerPos := Min(High(FHostOutputPlan.SlotOfLayer),
+    GetLastLayerIdx());
   for LayerCnt := 0 to MaxPlannedLayerPos do
   begin
-    SlotPos := FOpenCLOutputSlotOfLayer[LayerCnt];
-    if (SlotPos >= 0) and
-      (FLayers[LayerCnt].OpenCLOutputBuffer() = FOpenCLOutputSlots[SlotPos]) then
-      Inc(Result);
+    SlotPos := FHostOutputPlan.SlotOfLayer[LayerCnt];
+    if SlotPos < 0 then continue;
+    HolderIdx := FHostOutputSlotHolders[SlotPos];
+    if (HolderIdx = LayerCnt) or (Pointer(FLayers[LayerCnt].FOutput.FData) <>
+      Pointer(FLayers[HolderIdx].FOutput.FData)) then continue;
+    Inc(LayerCount);
+    PrivateBytes := PrivateBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
+    if HolderCounted[SlotPos] then continue;
+    HolderCounted[SlotPos] := true;
+    SharedBytes := SharedBytes + VolumeBytes(FLayers[HolderIdx].FOutput);
+    PrivateBytes := PrivateBytes + VolumeBytes(FLayers[HolderIdx].FOutput);
   end;
 end;
 
-function TNNet.OpenCLSharedOutputBytes(): int64;
+function TNNet.HostSharedOutputLayerCount(): integer;
 var
-  SlotPos, MaxSlotPos: integer;
+  SharedBytes, PrivateBytes: int64;
 begin
-  Result := 0;
-  MaxSlotPos := High(FOpenCLOutputSlotBytes);
-  for SlotPos := 0 to MaxSlotPos do
-    Result := Result + FOpenCLOutputSlotBytes[SlotPos];
+  CountHostSharedOutputs(Result, SharedBytes, PrivateBytes);
 end;
 
-function TNNet.OpenCLSharedOutputPrivateBytes(): int64;
+function TNNet.HostSharedOutputBytes(): int64;
 var
-  LayerCnt, MaxPlannedLayerPos, SlotPos: integer;
+  LayerCount: integer;
+  PrivateBytes: int64;
 begin
-  Result := 0;
-  MaxPlannedLayerPos := Min(High(FOpenCLOutputSlotOfLayer), GetLastLayerIdx());
-  for LayerCnt := 0 to MaxPlannedLayerPos do
-  begin
-    SlotPos := FOpenCLOutputSlotOfLayer[LayerCnt];
-    if (SlotPos >= 0) and
-      (FLayers[LayerCnt].OpenCLOutputBuffer() = FOpenCLOutputSlots[SlotPos]) then
-      Result := Result + int64(FLayers[LayerCnt].FOutput.Size) *
-        csNeuralFloatSize;
-  end;
+  CountHostSharedOutputs(LayerCount, Result, PrivateBytes);
 end;
 
-procedure TNNet.CheckForwardStart(FromLayerIdx: integer);
+function TNNet.HostSharedOutputPrivateBytes(): int64;
+var
+  LayerCount: integer;
+  SharedBytes: int64;
 begin
-  if (FromLayerIdx > 0) and (Length(FOpenCLOutputSlots) > 0) then
+  CountHostSharedOutputs(LayerCount, SharedBytes, Result);
+end;
+
+procedure TNNet.InvalidateInferencePlan();
+begin
+  inherited InvalidateInferencePlan();
+  FHostOutputPlanLayerCount := -1;
+end;
+
+// The host plan follows at the next forward; the OpenCL plan was made when the
+// net was armed and cannot take a new pin.
+procedure TNNet.OutputPinChanged(pPinned: boolean);
+begin
+  FHostOutputPlanLayerCount := -1;
+  {$IFDEF OpenCL}
+  if pPinned and (Length(FOpenCLOutputSlots) > 0) then
+    raise Exception.Create('TNNetLayer.OutputPinned: set it before ' +
+      'EnableOpenCL while ShareOpenCLOutputsByLiveness shares OpenCL outputs.');
+  {$ENDIF}
+end;
+
+procedure TNNet.PrepareForwardPass(FromLayerIdx: integer);
+var
+  HasSharedOutputs: boolean;
+begin
+  if FShareHostOutputsByLiveness or (FHostOutputPlanLayerCount >= 0) then
+    PlanHostOutputSharing();
+  if FromLayerIdx <= 0 then exit;
+  HasSharedOutputs := Length(FHostOutputPlan.SlotBytes) > 0;
+  {$IFDEF OpenCL}
+  HasSharedOutputs := HasSharedOutputs or (Length(FOpenCLOutputSlots) > 0);
+  {$ENDIF}
+  if HasSharedOutputs then
     raise Exception.Create('TNNet.Compute: a forward from layer ' +
-      IntToStr(FromLayerIdx) + ' is refused while ShareOpenCLOutputsByLiveness ' +
-      'shares OpenCL outputs: the last pass may have overwritten what it reads.');
+      IntToStr(FromLayerIdx) + ' is refused while outputs are shared by ' +
+      'liveness: the last pass may have overwritten what it reads.');
 end;
-{$ENDIF}
 
 procedure TNNet.MulWeightsGlorotBengio(V: TNeuralFloat);
 var
@@ -135706,6 +136031,7 @@ procedure TNNet.Clear();
 begin
   FLayers.Free;
   FLayers := TNNetLayerList.Create();
+  ReleaseHostOutputSharing();
   // The old layer objects are gone: invalidate the inference plan so a
   // rebuild to the SAME layer count cannot reuse stale pointers in
   // FSchedDeps (count-only cache check in BuildInferencePlan).
@@ -137785,12 +138111,23 @@ end;
 procedure TNNetLayer.AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t);
 begin
 end;
+{$ENDIF}
 
-function TNNetLayer.OpenCLOutputAliasSource(): TNNetLayer;
+function TNNetLayer.OutputAliasSource(): TNNetLayer;
 begin
   Result := nil;
 end;
-{$ENDIF}
+
+function TNNetLayer.CanShareHostOutput(): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetLayer.SetOutputPinned(Value: boolean);
+begin
+  if Assigned(FNN) then FNN.OutputPinChanged(Value);
+  FOutputPinned := Value;
+end;
 
 procedure TNNetLayer.InitDefault();
 begin

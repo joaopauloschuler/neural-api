@@ -123,6 +123,10 @@ type
     // Same for the command queue, which is borrowed independently: a helper
     // kernel either shares the owner's queue or creates its own.
     FBorrowedQueue: boolean;
+    // The instance that created FCommands (Self unless borrowed). Its counters
+    // hold the non-blocking uploads enqueued on that queue and those known done.
+    FQueueOwner: TEasyOpenCL;
+    FUploadsEnqueued, FUploadsCompleted: LongInt;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -132,6 +136,10 @@ type
     procedure LoadPlatforms();
     procedure FreeContext();
     procedure CompileProgram(); overload;
+    function UploadsEnqueuedNow(): LongInt;
+    // The in-order queue finished every command enqueued before UploadCount
+    // was read, so those uploads no longer read host memory.
+    procedure MarkUploadsCompleted(UploadCount: LongInt);
 
   public
     constructor Create(); override;
@@ -168,6 +176,9 @@ type
     // persistent buffer without moving the whole allocation.
     function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
     function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
+    // True when a non-blocking upload enqueued on this queue (by any instance
+    // sharing it) may still read its host memory.
+    function HasPendingUploads(): boolean;
     // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
     // memory; ordered after earlier work on the queue and returns at once.
     function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
@@ -2365,9 +2376,12 @@ begin
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
   FProg     := SharedKernel.Prog;
-  if pSharedQueue
-    then FCommands := SharedKernel.Commands
-    else FCommands := CreateCommandQueue(); // the command queue is given per kernel
+  if pSharedQueue then
+  begin
+    FCommands := SharedKernel.Commands;
+    FQueueOwner := SharedKernel.FQueueOwner;
+  end
+  else FCommands := CreateCommandQueue(); // the command queue is given per kernel
   // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
@@ -3132,6 +3146,10 @@ function TEasyOpenCL.WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; bloc
 begin
   if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
+  // Counted after the enqueue, so any count a reader sees is already queued.
+  if blocking = CL_FALSE then
+    {$IFDEF FPC}InterLockedIncrement{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsEnqueued);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('clEnqueueWriteBuffer :'+ IntToStr(Result)+ ' Size:'+ IntToStr(cb)+' bytes.');
@@ -3139,9 +3157,14 @@ begin
 end;
 
 function TEasyOpenCL.ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+var
+  UploadCount: LongInt;
 begin
   if OpenCLTransferCounting then CountOpenCLDownload(cb);
+  UploadCount := UploadsEnqueuedNow();
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
+  if (Result = CL_SUCCESS) and (blocking <> CL_FALSE) then
+    MarkUploadsCompleted(UploadCount);
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_OUT_OF_RESOURCES)
@@ -3154,6 +3177,9 @@ function TEasyOpenCL.WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr
 begin
   if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if blocking = CL_FALSE then
+    {$IFDEF FPC}InterLockedIncrement{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsEnqueued);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to write buffer slice: ' + IntToStr(Result) +
@@ -3162,9 +3188,14 @@ begin
 end;
 
 function TEasyOpenCL.ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+var
+  UploadCount: LongInt;
 begin
   if OpenCLTransferCounting then CountOpenCLDownload(cb);
+  UploadCount := UploadsEnqueuedNow();
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result = CL_SUCCESS) and (blocking <> CL_FALSE) then
+    MarkUploadsCompleted(UploadCount);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
@@ -3423,9 +3454,41 @@ begin
   end;
 end;
 
-function TEasyOpenCL.Finish(): integer;
+function TEasyOpenCL.UploadsEnqueuedNow(): LongInt;
 begin
+  Result := {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+    FQueueOwner.FUploadsEnqueued, 0);
+end;
+
+// The counters wrap: their difference decides, so overflow checks are off.
+{$PUSH}{$Q-}{$R-}
+procedure TEasyOpenCL.MarkUploadsCompleted(UploadCount: LongInt);
+var
+  Completed: LongInt;
+begin
+  repeat
+    Completed := {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsCompleted, 0);
+    if LongInt(UploadCount - Completed) <= 0 then exit;
+  until {$IFDEF FPC}InterlockedCompareExchange{$ELSE}AtomicCmpExchange{$ENDIF}(
+    FQueueOwner.FUploadsCompleted, UploadCount, Completed) = Completed;
+end;
+
+function TEasyOpenCL.HasPendingUploads(): boolean;
+begin
+  Result := LongInt(UploadsEnqueuedNow() -
+    {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+    FQueueOwner.FUploadsCompleted, 0)) > 0;
+end;
+{$POP}
+
+function TEasyOpenCL.Finish(): integer;
+var
+  UploadCount: LongInt;
+begin
+  UploadCount := UploadsEnqueuedNow();
   Result := clFinish(FCommands);
+  if Result = CL_SUCCESS then MarkUploadsCompleted(UploadCount);
 
   if (Result = CL_SUCCESS) then
     FMessageProc('clFinish OK!')
@@ -3459,6 +3522,9 @@ begin
   FProg := nil;           // compute program
   FBorrowedContext := false;
   FBorrowedQueue := false;
+  FQueueOwner := Self;
+  FUploadsEnqueued := 0;
+  FUploadsCompleted := 0;
 end;
 
 destructor TEasyOpenCL.Destroy();

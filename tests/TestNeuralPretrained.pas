@@ -792,6 +792,9 @@ type
     // ShareOpenCLOutputs on vs off: same images, transfers and implicit GEMMs
     // (whole and tiled, serial and parallel); fewer OpenCL bytes. Coded by Claude (AI).
     procedure TestQwenImage21VaeDecoderOpenCLSharedOutputs;
+    // ShareHostOutputs on vs off, on the CPU and on OpenCL: same images (whole
+    // and tiled, serial and parallel); fewer host bytes. Coded by Claude (AI).
+    procedure TestQwenImage21VaeDecoderSharedHostOutputs;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwenImage21PipelineParity;
     procedure TestQwenImage21Pipeline64Parity;
@@ -29589,6 +29592,89 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderSharedHostOutputs;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, WholeOff, WholeOn, TiledOff, TiledOn: TNNetVolume;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+
+  procedure CompareSharing(const pWhere: string);
+  var
+    ParallelPos, SharedLayerCount: integer;
+    BytesOff, BytesOn, SharedBytes, PrivateBytes: int64;
+  begin
+    for ParallelPos := 0 to 1 do
+    begin
+      Decoder.Parallel := ParallelPos = 1;
+      Decoder.ShareHostOutputs := false;
+      Decoder.ReleaseNet();
+      Decoder.Decode(Latent, WholeOff);
+      BytesOff := Decoder.Net.NonWeightBytes();
+      AssertEquals(pWhere + ' off: no shared layers', 0,
+        Decoder.Net.HostSharedOutputLayerCount());
+      Decoder.DecodeTiled(Latent, TiledOff, 32, 16);
+      Decoder.ShareHostOutputs := true;
+      Decoder.ReleaseNet();
+      Decoder.Decode(Latent, WholeOn);
+      BytesOn := Decoder.Net.NonWeightBytes();
+      SharedLayerCount := Decoder.Net.HostSharedOutputLayerCount();
+      SharedBytes := Decoder.Net.HostSharedOutputBytes();
+      PrivateBytes := Decoder.Net.HostSharedOutputPrivateBytes();
+      Decoder.DecodeTiled(Latent, TiledOn, 32, 16);
+      WriteLn('  Qwen-Image-2.1 VAE 4x4 net, ', pWhere, ', parallel=',
+        Decoder.Parallel, ': host bytes ', BytesOff, ' -> ', BytesOn, '; ',
+        SharedLayerCount, ' of ', Decoder.Net.CountLayers(),
+        ' layers share ', SharedBytes, ' B in place of ', PrivateBytes, ' B');
+      AssertTrue(pWhere + ': layers share', SharedLayerCount > 0);
+      AssertEquals(pWhere + ': host bytes saved', PrivateBytes - SharedBytes,
+        BytesOff - BytesOn);
+      AssertEquals(pWhere + ': whole image byte-identical', 0,
+        MaxAbsVolumeDiff(WholeOn, WholeOff), 0);
+      AssertEquals(pWhere + ': tiled image byte-identical', 0,
+        MaxAbsVolumeDiff(TiledOn, TiledOff), 0);
+    end;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  WholeOff := TNNetVolume.Create;
+  WholeOn := TNNetVolume.Create;
+  TiledOff := TNNetVolume.Create;
+  TiledOn := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    CompareSharing('CPU');
+    {$IFDEF OpenCL}
+    if AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('EnableOpenCL', Decoder.EnableOpenCL(PlatformId, DeviceId));
+      CompareSharing('OpenCL');
+    end;
+    {$ENDIF}
+  finally
+    TiledOn.Free;
+    TiledOff.Free;
+    WholeOn.Free;
+    WholeOff.Free;
+    Latent.Free;
+    RefRoot.Free;
+    Decoder.Free;
+    RefJson.Free;
+  end;
+end;
 
 procedure TTestNeuralPretrained.RecordQwenImage21Phase(
   Phase: TQwenImage21PipelinePhase);

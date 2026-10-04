@@ -8923,6 +8923,7 @@ type
     FSkippedTensorCount: integer;
     FParallel: boolean;
     FMaxThreads: integer;
+    FShareHostOutputs: boolean;
     // LayerProfiling: Net's forwards since PrepareNet, and the tables of the
     // nets ReleaseNet already freed.
     FLayerProfiling: boolean;
@@ -8982,6 +8983,10 @@ type
     // its worker cap (0 = every CPU thread); read when Net is (re)built.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    // TNNet.ShareHostOutputsByLiveness on every sized net (read when Net is
+    // (re)built); true unless NEURAL_SHARE_HOST_OUTPUTS=0.
+    property ShareHostOutputs: boolean read FShareHostOutputs
+      write FShareHostOutputs;
     {$IFDEF OpenCL}
     // Builds one OpenCL context and program and arms Net and every later sized
     // net in it (FP32 weights, one upload per net); false if the build fails.
@@ -68756,6 +68761,7 @@ begin
   inherited Create();
   FParallel := true;
   FMaxThreads := 0;
+  FShareHostOutputs := GetEnvironmentVariable('NEURAL_SHARE_HOST_OUTPUTS') <> '0';
   {$IFDEF OpenCL}
   FShareOpenCLOutputs :=
     GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
@@ -68777,6 +68783,7 @@ begin
   inherited Create();
   FParallel := true;
   FMaxThreads := 0;
+  FShareHostOutputs := GetEnvironmentVariable('NEURAL_SHARE_HOST_OUTPUTS') <> '0';
   {$IFDEF OpenCL}
   FShareOpenCLOutputs :=
     GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
@@ -68831,6 +68838,7 @@ begin
   PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
   FNetPhases.ThreadsMs := (Now() - PhaseStart) * MSecsPerDay;
   FNet.LayerProfiling := FLayerProfiling;
+  FNet.ShareHostOutputsByLiveness := FShareHostOutputs;
   {$IFDEF OpenCL}
   if Assigned(FOpenCLContextNet) then
   begin
@@ -68918,7 +68926,8 @@ begin
       '= TNNet.OpenCLBufferBytes: FDotCL of every layer plus the own buffers ' +
       'of the input, activation, sum, concat, split/gather, norm and ' +
       'upsample layers (other helpers not counted); host MB = ' +
-      'TNNet.NonWeightBytes. Both sampled after the last pass. shared MB = ' +
+      'TNNet.NonWeightBytes (host outputs shared by liveness count once). ' +
+      'Both sampled after the last pass. shared MB = ' +
       'the OpenCL output buffers shared by liveness (part of OpenCL MB); ' +
       'private MB = what the sharing layers'' outputs take in private buffers.');
     Lines.Add(Format('%-8s %-10s %6s %9s %8s %9s %12s %10s %9s %10s %9s ' +

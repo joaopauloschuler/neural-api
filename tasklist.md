@@ -2432,8 +2432,20 @@ rather than acted on.
                 edges would give ~4.9 GB untiled; not done, user decision).
                 Not adopted yet: RMSNorm, LayerNorm, TokenLayerNorm, RoPE,
                 fused SDPA, GLU.
-          - [ ] B2f4. Host `FOutput` sharing by liveness (exact-size aliases,
+          - [x] B2f4. Host `FOutput` sharing by liveness (exact-size aliases,
                 opt-in).
+                DONE: `TNNet.ShareHostOutputsByLiveness` (same planner as B2f3,
+                exact-size slots, `TNNetVolume.ShareDataWith`/`UnshareData`);
+                on for the VAE nets (`NEURAL_SHARE_HOST_OUTPUTS=0` turns it
+                off); inference only (any trainable layer unshares). On armed
+                nets a shared layer drains the queue only while a non-blocking
+                upload is pending. Pico VAE host MB 1.3 -> 0.7 (OpenCL) and
+                3.1 -> 2.5 (CPU), images byte-identical. Computed host FOutput
+                per net: 256 tile ~2.4 -> ~0.56 GB, untiled 1024 ~38 -> ~9 GB.
+                Follow-ups: the net build still sizes every FOutput before the
+                first forward unshares them (untiled 1024 build peak ~38 GB
+                host); exact size and the DupUp branch limit the saving; the
+                drain cost on the L4 is unmeasured.
           - [ ] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
                 OpenCL (-17% of decode FLOPs); CPU path unchanged.
           - [ ] B2f6. Untiled path: memory estimator vs the device limits,
