@@ -13,16 +13,18 @@ and the VAE decode run on OpenCL by default; everything else runs on the CPU:
 
 One-shot (-p "prompt" or --token-ids): one image, then exit. Each component
 is loaded when its stage starts and freed when it ends, so only one is in
-memory at a time.
+memory at a time. --repeat N > 1 makes N images and keeps the three
+components loaded, as the REPL does.
 
 REPL (neither -p nor --token-ids): the three components load once and stay
 in memory; stdin gives one prompt per line (a piped file is a batch, end of
 input ends the session). Images go to numbered files from the --output base
 (qwenimage.png -> qwenimage_0001.png, ...; existing files are skipped, never
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
-grows by one per prompt), /tile SIZE[,STRIDE], /quit.
-GPU memory: in the REPL the transformer stays in OpenCL memory while the VAE
-decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
+grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
+PROMPT with consecutive seeds, the prompt encoded once), /quit.
+GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
+OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
 
 The initial noise comes from the FPC RNG (--seed), so an image is repeatable
@@ -32,6 +34,7 @@ USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
+            [--repeat N]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -59,6 +62,8 @@ uses
 const
   // Largest accepted image side in pixels (64x the 1024 default area).
   csMaxImageSide = 8192;
+  // Largest --repeat / /repeat count (catches a mistyped count).
+  csMaxRepeatCount = 1000;
 
 type
   // Phase and step timings with the process memory. On a terminal each step
@@ -217,6 +222,12 @@ begin
     '(default 1024)');
   WriteLn('  --steps N            Euler steps (default 18)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
+  WriteLn('  --repeat N           with -p or --token-ids: N images, seeds ',
+    '--seed, --seed+1, ...; the prompt');
+  WriteLn('                       is encoded once. N > 1 keeps the ',
+    'components loaded and numbers the');
+  WriteLn('                       files like the REPL (default 1, at most ',
+    csMaxRepeatCount, ')');
   WriteLn('  --int8               transformer block weights in int8; text ',
     'encoder weights in int8 (DEFAULT)');
   WriteLn('  --int4               transformer block weights in Q4_0-style int4 ',
@@ -273,13 +284,16 @@ begin
     'REPL commands:');
   WriteLn('  /size WxH            image size for the next prompts');
   WriteLn('  /steps N             Euler steps for the next prompts');
-  WriteLn('  /seed N              seed of the next prompt (otherwise the seed ',
-    'grows by one per prompt)');
-  WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL the ',
-    'transformer stays in OpenCL');
-  WriteLn('                       memory during the VAE decode; /tile 128 (or ',
-    '--vae-tile 128) lowers the');
-  WriteLn('                       VAE''s memory if both do not fit.');
+  WriteLn('  /seed N              seed of the next image (otherwise the seed ',
+    'grows by one per image)');
+  WriteLn('  /repeat N PROMPT     N images of PROMPT (encoded once), ',
+    'consecutive seeds, numbered files');
+  WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
+    'with --repeat N > 1) the');
+  WriteLn('                       transformer stays in OpenCL memory ',
+    'during the VAE decode; /tile 128');
+  WriteLn('                       (or --vae-tile 128) lowers the VAE''s ',
+    'memory if both do not fit.');
   WriteLn('  /quit                end the session (so does the end of the input)');
 end;
 
@@ -342,6 +356,16 @@ begin
   Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
 end;
 
+// Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
+function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
+begin
+  RepeatCount := StrToIntDef(Trim(Text), -1);
+  if (RepeatCount < 1) or (RepeatCount > csMaxRepeatCount) then
+    Result := '"' + Text + '" is not an integer in 1..' +
+      IntToStr(csMaxRepeatCount) + '.'
+  else Result := '';
+end;
+
 // The first BaseFile_NNNN file after FileNumber that does not exist yet
 // (.png when BaseFile has no extension); FileNumber becomes its number.
 function NextFreeOutputFile(const BaseFile: string;
@@ -384,8 +408,9 @@ begin
 end;
 
 var
-  ModelFolder, Prompt, OutputFile, TokenList, Arg, TileProblem: string;
+  ModelFolder, Prompt, OutputFile, TokenList, Arg, ArgProblem: string;
   Width, Height, StepCount, DropCount, ArgPos: integer;
+  RepeatCount, ImageNumber, FileNumber: integer;
   Seed: cardinal;
   HasPrompt, UseInt8Input, UseSerial, UseProfile: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -429,13 +454,27 @@ var
         RanOnText(Pipeline.VaeOnOpenCL));
   end;
 
-  // Encodes TokenIds, generates at the current settings and writes ImageFile.
+  // Encodes TokenIds into PromptEmbeds and ends the encode phase line.
+  procedure EncodePrompt();
+  begin
+    Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
+    Reporter.OnPhase(qppDone);
+  end;
+
+  procedure AdvanceSeed();
+  begin
+    // The seed wraps from High(cardinal) to 0.
+    {$PUSH}{$Q-}{$R-}
+    Inc(Seed);
+    {$POP}
+  end;
+
+  // Generates from PromptEmbeds at the current settings, writes ImageFile.
   procedure GenerateImage(const ImageFile: string);
   var
     ImageStart: QWord;
   begin
     ImageStart := GetTickCount64;
-    Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
     Pipeline.GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed,
       Image);
     Image.Mul(255);
@@ -452,10 +491,105 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile and /quit; false on /quit.
+  // Loads the three components to keep them and prints the resident memory.
+  procedure LoadAllComponents();
+  begin
+    WriteLn('Loading the text encoder, the transformer and the VAE decoder ',
+      'to keep them in memory.');
+    Pipeline.LoadComponents();
+    WriteLn('Resident   : ', MemoryReport());
+  end;
+
+  // One image at Seed to the next numbered --output file (Numbered) or to
+  // --output; the seed then grows by one, also when the image fails.
+  procedure GenerateNextImage(Numbered: boolean);
+  var
+    ImageFile: string;
+  begin
+    Inc(ImageNumber);
+    if Numbered then ImageFile := NextFreeOutputFile(OutputFile, FileNumber)
+    else ImageFile := OutputFile;
+    WriteLn('Image ', ImageNumber, ': ', Width, 'x', Height, ', ', StepCount,
+      ' steps, seed ', Seed, ' -> ', ImageFile);
+    try
+      GenerateImage(ImageFile);
+    finally
+      AdvanceSeed();
+    end;
+  end;
+
+  // Ends the session after an allocation failure; returns false.
+  function EndSessionOutOfMemory(const Message: string): boolean;
+  begin
+    Reporter.EndStepLine();
+    WriteLn('Error: ', Message, ' - out of memory, ending the session.');
+    ExitCode := 1;
+    Result := false;
+  end;
+
+  // ImageCount images of PromptText (encoded once) with consecutive seeds to
+  // numbered files; an image that raises is skipped. False after out of memory.
+  function GenerateReplImages(const PromptText: string;
+    ImageCount: integer): boolean;
+  var
+    ImageIndex: integer;
+  begin
+    Result := true;
+    WriteLn('Prompt     : "', ShortPrompt(PromptText, 60), '"');
+    // The stages free the per-image passes on the way out; the loaded
+    // weights stay valid, except after an allocation failure.
+    try
+      TokenIds := Pipeline.TokenizePrompt(PromptText, DropCount);
+      EncodePrompt();
+    except
+      on E: EOutOfMemory do exit(EndSessionOutOfMemory(E.Message));
+      on E: Exception do
+      begin
+        Reporter.OnPhase(qppDone);
+        WriteLn('Error: ', E.Message, ' - prompt skipped.');
+        exit;
+      end;
+    end;
+    for ImageIndex := 1 to ImageCount do
+    try
+      GenerateNextImage({Numbered=}true);
+    except
+      on E: EOutOfMemory do exit(EndSessionOutOfMemory(E.Message));
+      on E: Exception do
+      begin
+        Reporter.OnPhase(qppDone);
+        WriteLn('Error: ', E.Message, ' - image ', ImageNumber, ' skipped.');
+      end;
+    end;
+  end;
+
+  // --output, or RepeatCount numbered files with consecutive seeds; an error
+  // ends the run.
+  procedure GenerateOneShotImages();
+  var
+    ImageIndex: integer;
+  begin
+    if RepeatCount > 1 then LoadAllComponents();
+    EncodePrompt();
+    for ImageIndex := 1 to RepeatCount do
+    try
+      GenerateNextImage({Numbered=}RepeatCount > 1);
+    except
+      if RepeatCount > 1 then
+      begin
+        Reporter.EndStepLine();
+        WriteLn(ImageIndex - 1, ' of ', RepeatCount, ' images written.');
+      end;
+      raise;
+    end;
+  end;
+
+  // /size, /steps, /seed, /tile, /repeat and /quit; false on /quit or when
+  // /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
+    NewRepeatCount: integer;
     NewValue: int64;
     Command, Argument, Problem: string;
   begin
@@ -503,7 +637,7 @@ var
       else
       begin
         Seed := NewValue;
-        WriteLn('[seed ', Seed, ' for the next prompt]');
+        WriteLn('[seed ', Seed, ' for the next image]');
       end;
     end
     else if Command = 'tile' then
@@ -518,26 +652,35 @@ var
           ' px]');
       end;
     end
+    else if Command = 'repeat' then
+    begin
+      SpacePos := Pos(' ', Argument);
+      if SpacePos = 0 then
+        WriteLn('[/repeat: expected /repeat N PROMPT]')
+      else
+      begin
+        Problem := ParseRepeatCount(Copy(Argument, 1, SpacePos - 1),
+          NewRepeatCount);
+        if Problem <> '' then WriteLn('[/repeat: ', Problem, ']')
+        else
+          Result := GenerateReplImages(Trim(Copy(Argument, SpacePos + 1,
+            MaxInt)), NewRepeatCount);
+      end;
+    end
     else WriteLn('[unknown command /', Command,
-      ' - /size, /steps, /seed, /tile, /quit]');
+      ' - /size, /steps, /seed, /tile, /repeat, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
   procedure RunRepl();
   var
-    Line, ImageFile: string;
-    ImageNumber, FileNumber: integer;
+    Line: string;
     InteractiveInput: boolean;
   begin
-    WriteLn('Loading the text encoder, the transformer and the VAE decoder ',
-      'to keep them in memory.');
-    Pipeline.LoadComponents();
-    WriteLn('Resident   : ', MemoryReport());
+    LoadAllComponents();
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
-      '/tile SIZE[,STRIDE], /quit.');
-    ImageNumber := 0;
-    FileNumber := 0;
+      '/tile SIZE[,STRIDE], /repeat N PROMPT, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -560,35 +703,7 @@ var
       begin
         if RunReplCommand(Line) then continue else break;
       end;
-      Inc(ImageNumber);
-      ImageFile := NextFreeOutputFile(OutputFile, FileNumber);
-      WriteLn('Image ', ImageNumber, ': ', Width, 'x', Height, ', ', StepCount,
-        ' steps, seed ', Seed, ' -> ', ImageFile, ': "', ShortPrompt(Line, 60),
-        '"');
-      try
-        TokenIds := Pipeline.TokenizePrompt(Line, DropCount);
-        GenerateImage(ImageFile);
-      except
-        // The stages free the per-image passes on the way out; the loaded
-        // weights stay valid, except after an allocation failure.
-        on E: EOutOfMemory do
-        begin
-          Reporter.EndStepLine();
-          WriteLn('Error: ', E.Message, ' - out of memory, ending the ',
-            'session.');
-          ExitCode := 1;
-          break;
-        end;
-        on E: Exception do
-        begin
-          Reporter.OnPhase(qppDone);
-          WriteLn('Error: ', E.Message, ' - image ', ImageNumber, ' skipped.');
-        end;
-      end;
-      // The seed wraps from High(cardinal) to 0.
-      {$PUSH}{$Q-}{$R-}
-      Inc(Seed);
-      {$POP}
+      if not GenerateReplImages(Line, 1) then break;
     end;
     WriteLn('Bye.');
   end;
@@ -604,6 +719,9 @@ begin
   StepCount := 18;
   Seed := 42;
   DropCount := 0;
+  RepeatCount := 1;
+  ImageNumber := 0;
+  FileNumber := 0;
   WeightFormat := qiwInt8;
   UseInt8Input := false;
   UseSerial := false;
@@ -630,6 +748,15 @@ begin
     else if Arg = '--height' then Height := StrToIntDef(NextArg(), -1)
     else if Arg = '--steps' then StepCount := StrToInt(NextArg())
     else if Arg = '--seed' then Seed := StrToInt64(NextArg())
+    else if Arg = '--repeat' then
+    begin
+      ArgProblem := ParseRepeatCount(NextArg(), RepeatCount);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--repeat: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if Arg = '--int8' then WeightFormat := qiwInt8
     else if Arg = '--int4' then WeightFormat := qiwInt4
     else if Arg = '--fp32' then WeightFormat := qiwFP32
@@ -646,10 +773,10 @@ begin
     else if Arg = '--profile' then UseProfile := true
     else if Arg = '--vae-tile' then
     begin
-      TileProblem := ParseVaeTile(NextArg(), VaeTileSize, VaeTileStride);
-      if TileProblem <> '' then
+      ArgProblem := ParseVaeTile(NextArg(), VaeTileSize, VaeTileStride);
+      if ArgProblem <> '' then
       begin
-        WriteLn('--vae-tile: ', TileProblem);
+        WriteLn('--vae-tile: ', ArgProblem);
         Halt(2);
       end;
     end
@@ -678,6 +805,11 @@ begin
   if HasPrompt and (TokenList <> '') then
   begin
     WriteLn('-p and --token-ids are exclusive.');
+    Halt(2);
+  end;
+  if (RepeatCount > 1) and not (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--repeat needs -p or --token-ids (in the REPL: /repeat N PROMPT).');
     Halt(2);
   end;
   if UseInt8Input and (WeightFormat = qiwFP32) then
@@ -785,7 +917,7 @@ begin
         WriteLn('Tokens     : ', Length(TokenIds), ' (', DropCount,
           ' system-prompt tokens dropped)');
       end;
-      GenerateImage(OutputFile);
+      GenerateOneShotImages();
       PrintComputeResult();
       WriteLn('Total      : ', ((GetTickCount64 - StartTime) / 1000):0:1,
         ' s; ', MemoryReport());

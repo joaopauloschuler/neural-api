@@ -2460,7 +2460,7 @@ rather than acted on.
   - [x] D1. Defaults int8 weights and 18 steps; `--fp32` asks for FP32.
   - [x] D2. Step line rewritten in place (`#13` + `ESC[K`) when stdout is a
         terminal; one line per step when it is a pipe or a file.
-  - [ ] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,
+  - [x] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,
         consecutive seeds, prompt encoded once.
   - [ ] D4. `GPU %` column (forward count share) and a count/time share summary
         line in `TNNet.LayerGroupTimingReport`.

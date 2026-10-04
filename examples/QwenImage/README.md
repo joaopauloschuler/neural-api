@@ -90,7 +90,8 @@ bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --int4 \
 
 In this mode each component loads when its stage starts and is freed when the
 stage ends, so only one of the text encoder, the transformer and the VAE is in
-memory at a time.
+memory at a time. `--repeat N` with N > 1 makes N images from one prompt and
+keeps the three components loaded, as the REPL does.
 
 `--token-ids` replaces `-p` with already-tokenized input: the comma-separated
 ids of the whole templated prompt, plus `--drop-count N` for the number of
@@ -128,8 +129,9 @@ follow:
 | --- | --- |
 | `/size WxH` | image size, e.g. `/size 1024x768` (each side rounded down to a multiple of 32, 32..8192) |
 | `/steps N` | Euler steps |
-| `/seed N` | seed of the next prompt; without it the seed grows by one per prompt |
+| `/seed N` | seed of the next image; without it the seed grows by one per image |
 | `/tile SIZE[,STRIDE]` | VAE tile, as `--vae-tile` |
+| `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/quit` | end the session |
 
 A prompt file can mix both:
@@ -184,6 +186,7 @@ and `--fp32`, the last one given wins.
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
 | `--steps N` | Euler steps | 18 |
 | `--seed N` | seed of the initial noise | 42 |
+| `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
 1024x1024. The step time grows with that count.
@@ -263,8 +266,8 @@ Peak RSS: 12.7 GB.
 The default is 18 steps, 1.8 times the steps of this run. In the REPL the
 three loads happen once per session instead of once per image.
 
-In the REPL the transformer stays in OpenCL memory while the VAE decodes, so
-both need GPU memory at once. If they do not fit, `/tile 128` (or
+In the REPL and with `--repeat N` > 1 the transformer stays in OpenCL memory
+while the VAE decodes, so both need GPU memory at once. If they do not fit, `/tile 128` (or
 `--vae-tile 128`) lowers the VAE's share, at the cost of the seams described
 under [VAE tiles](#vae-tiles).
 
