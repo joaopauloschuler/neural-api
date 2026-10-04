@@ -8856,6 +8856,9 @@ type
     property LayerProfiling: boolean read FLayerProfiling
       write SetLayerProfiling;
     function ProfileReport(): string;
+    // TNNet.OpenCLBufferBytes of every block store and pass now, plus the
+    // prefix K/V in OpenCL memory; 0 without OpenCL.
+    function OpenCLBufferBytes(): int64;
   end;
 
 type
@@ -8938,6 +8941,8 @@ type
     FProfileTotals, FDecodePhases: TQwenImage21VaeNetPhases;
     FDecodeCount: integer;
     FDecodeWallMs, FDecodeAssemblyMs, FDecodeReleaseMs, FReleaseMs: double;
+    FLastDecodeTileCount, FLastDecodeNetCount: integer;
+    FLargestNetOpenCLBytes: int64;
     {$IFDEF OpenCL}
     // Set by EnableOpenCL: a weightless net that owns the OpenCL context and
     // program; PrepareNet arms every sized net in it.
@@ -8958,6 +8963,7 @@ type
     // times accrued since TotalsBefore / ReleaseMsBefore were taken.
     procedure AddDecodeProfile(DecodeStart, AssemblyStart: TDateTime;
       const TotalsBefore: TQwenImage21VaeNetPhases; ReleaseMsBefore: double);
+    procedure SetLayerProfiling(Value: boolean);
   public
     // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
     constructor Create(const VaeFolder: string);
@@ -8998,13 +9004,20 @@ type
     property ShareOpenCLOutputs: boolean read FShareOpenCLOutputs
       write FShareOpenCLOutputs;
     {$ENDIF}
-    // TNNet.LayerProfiling on every sized net (read when Net is (re)built);
-    // ProfileReport has the phase table and one per-class table per net.
+    // TNNet.LayerProfiling on Net and every later sized net; ProfileReport
+    // has the phase table and one per-class table per net.
     property LayerProfiling: boolean read FLayerProfiling
-      write FLayerProfiling;
+      write SetLayerProfiling;
     function ProfileReport(): string;
     // Drops every table ProfileReport holds so far.
     procedure ClearProfileReport();
+    // Tiles of the last Decode/DecodeTiled (1 when untiled), and the sized
+    // nets it built (one per tile shape; 0 when it reused Net).
+    property LastDecodeTileCount: integer read FLastDecodeTileCount;
+    property LastDecodeNetCount: integer read FLastDecodeNetCount;
+    // Largest TNNet.OpenCLBufferBytes of a sized net freed by ReleaseNet since
+    // the last Decode/DecodeTiled started; 0 without OpenCL.
+    property LargestNetOpenCLBytes: int64 read FLargestNetOpenCLBytes;
   end;
 
 const
@@ -9024,6 +9037,20 @@ type
   // the sample after that step, Timestep = sigma * 1000 of the step.
   TQwenImage21StepEvent = procedure(StepIndex, StepCount: integer;
     Timestep: double; Latents: TNNetVolume) of object;
+
+  // Wall ms and host<->OpenCL bytes of each phase of the last encode and the
+  // last image (qppDone unused); bytes count while OpenCLTransferCounting is on.
+  TQwenImage21ImageStats = record
+    PhaseMs: array[TQwenImage21PipelinePhase] of double;
+    PhaseUploadBytes, PhaseDownloadBytes:
+      array[TQwenImage21PipelinePhase] of int64;
+    TransfersCounted: boolean;
+    StepCount, VaeTileCount, VaeNetCount: integer;
+    TransformerOnOpenCL, VaeOnOpenCL: boolean;
+    // OpenCL bytes the transformer held after the last step, and the largest
+    // sized VAE net; both sampled, not tracked per allocation.
+    TransformerOpenCLBytes, VaeOpenCLBytes: int64;
+  end;
 
   // Qwen-Image-2.1 text-to-image (diffusers QwenImage21Pipeline, no guidance)
   // over a model_index.json folder. Each component (text encoder, transformer,
@@ -9047,6 +9074,12 @@ type
     FTransformerOnOpenCL, FVaeOnOpenCL: boolean;
     FLayerProfiling: boolean;
     FTransformerProfileReport, FVaeProfileReport: string;
+    FImageStats: TQwenImage21ImageStats;
+    // The phase DoPhase started last (qppDone: none open), when, and the
+    // process transfer totals then.
+    FOpenPhase: TQwenImage21PipelinePhase;
+    FOpenPhaseStart: TDateTime;
+    FOpenPhaseUploadBytes, FOpenPhaseDownloadBytes: int64;
     // Set by LoadComponents, nil otherwise. The text encoder's weights sit in
     // a 1-token net; each prompt builds a borrowing net of its own length.
     FTextEncoderOwner: TNNet;
@@ -9062,7 +9095,10 @@ type
     function OpenCLArmingResult(Armed: boolean;
       const Component: string): boolean;
     {$ENDIF}
+    // Charges the open phase to ImageStats, then starts Phase (EndPhase: none)
+    // and fires OnPhase.
     procedure DoPhase(Phase: TQwenImage21PipelinePhase);
+    procedure EndPhase();
     procedure EnableTransformerOpenCL(Transformer: TQwenImage21Transformer);
     procedure EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
     function ComponentFolder(const Component: string): string;
@@ -9164,6 +9200,9 @@ type
       write FLayerProfiling;
     property TransformerProfileReport: string read FTransformerProfileReport;
     property VaeProfileReport: string read FVaeProfileReport;
+    // EncodeTokenIds fills the qppLoadTextEncoder and qppEncodePrompt phases;
+    // GenerateFromEmbeds clears and fills the rest.
+    property ImageStats: TQwenImage21ImageStats read FImageStats;
   end;
 
 // ===========================================================================
@@ -68825,6 +68864,7 @@ begin
   if Assigned(FNet) and (LatentW = FNetLatentW) and (LatentH = FNetLatentH) then
     exit;
   ReleaseNet();
+  Inc(FLastDecodeNetCount);
   FNetPhases := Default(TQwenImage21VaeNetPhases);
   FNetPhases.LatentW := LatentW;
   FNetPhases.LatentH := LatentH;
@@ -68869,6 +68909,11 @@ begin
   IsProfiled := FLayerProfiling and Assigned(FNet);
   ReleaseStart := 0;
   if IsProfiled then ReleaseStart := Now();
+  {$IFDEF OpenCL}
+  if Assigned(FNet) and Assigned(FOpenCLContextNet) then
+    FLargestNetOpenCLBytes := Max(FLargestNetOpenCLBytes,
+      FNet.OpenCLBufferBytes());
+  {$ENDIF}
   FReleasedNetsProfile := FReleasedNetsProfile + NetProfile();
   if IsProfiled then
   begin
@@ -69037,6 +69082,12 @@ begin
     TNNet.LayerGroupTimingReport(FNet, [], FNetPassCount);
 end;
 
+procedure TQwenImage21VaeDecoder.SetLayerProfiling(Value: boolean);
+begin
+  FLayerProfiling := Value;
+  if Assigned(FNet) then FNet.LayerProfiling := Value;
+end;
+
 function TQwenImage21VaeDecoder.ProfileReport(): string;
 begin
   Result := '';
@@ -69126,6 +69177,9 @@ begin
   DecodeStart := 0;
   ReleaseMsBefore := FReleaseMs;
   TotalsBefore := FProfileTotals;
+  FLargestNetOpenCLBytes := 0;
+  FLastDecodeTileCount := 1;
+  FLastDecodeNetCount := 0;
   if FLayerProfiling then DecodeStart := Now();
   PrepareNet(Latent.SizeX, Latent.SizeY);
   DecodeTile(Latent, Image);
@@ -69177,6 +69231,9 @@ begin
   RowCount := (Latent.SizeY + TileLatentStride - 1) div TileLatentStride;
   ColumnCount := (Latent.SizeX + TileLatentStride - 1) div TileLatentStride;
   TileCount := RowCount * ColumnCount;
+  FLargestNetOpenCLBytes := 0;
+  FLastDecodeTileCount := TileCount;
+  FLastDecodeNetCount := 0;
   MaxTilePos := TileCount - 1;
   SetLength(Tiles, TileCount);
   SetLength(TileWidths, TileCount);
@@ -83089,6 +83146,34 @@ begin
   Result := FModulationLayer.Output;
 end;
 
+function TQwenImage21Transformer.OpenCLBufferBytes(): int64;
+{$IFDEF OpenCL}
+var
+  Nets: array[0..5] of TNNet;
+  NetPos, BlockCnt, MaxBlockPos: integer;
+{$ENDIF}
+begin
+  Result := 0;
+  {$IFDEF OpenCL}
+  if not FOpenCLEnabled then exit;
+  Nets[0] := FTimestepNet;
+  Nets[1] := FTextInNet;
+  Nets[2] := FPrefixNet;
+  Nets[3] := FImageInNet;
+  Nets[4] := FStepNet;
+  Nets[5] := FOutputNet;
+  for NetPos := Low(Nets) to High(Nets) do
+    if Assigned(Nets[NetPos]) then
+      Inc(Result, Nets[NetPos].OpenCLBufferBytes());
+  MaxBlockPos := Length(FBlockStore) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    Inc(Result, FBlockStore[BlockCnt].OpenCLBufferBytes());
+  MaxBlockPos := Length(FPrefixKVOnOpenCL) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    Inc(Result, OpenCLMemBytes(FPrefixKVOnOpenCL[BlockCnt].Buffer));
+  {$ENDIF}
+end;
+
 procedure TQwenImage21Transformer.SetLayerProfiling(Value: boolean);
 var
   Nets: array[0..5] of TNNet;
@@ -83240,6 +83325,7 @@ begin
   FVaeTileStride := 192;
   FParallel := true;
   FMaxThreads := 0;
+  FOpenPhase := qppDone;
 end;
 
 destructor TQwenImage21Pipeline.Destroy();
@@ -83351,8 +83437,41 @@ begin
   end;
 end;
 
-procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
+procedure TQwenImage21Pipeline.EndPhase();
+{$IFDEF OpenCL}
+var
+  Transfers: TOpenCLTransferCounts;
+{$ENDIF}
 begin
+  if FOpenPhase <> qppDone then
+  begin
+    FImageStats.PhaseMs[FOpenPhase] := FImageStats.PhaseMs[FOpenPhase] +
+      (Now() - FOpenPhaseStart) * MSecsPerDay;
+    {$IFDEF OpenCL}
+    Transfers := OpenCLProcessTransferTotals();
+    Inc(FImageStats.PhaseUploadBytes[FOpenPhase],
+      Transfers.UploadBytes - FOpenPhaseUploadBytes);
+    Inc(FImageStats.PhaseDownloadBytes[FOpenPhase],
+      Transfers.DownloadBytes - FOpenPhaseDownloadBytes);
+    {$ENDIF}
+  end;
+  FOpenPhase := qppDone;
+end;
+
+procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
+{$IFDEF OpenCL}
+var
+  Transfers: TOpenCLTransferCounts;
+{$ENDIF}
+begin
+  EndPhase();
+  FOpenPhase := Phase;
+  FOpenPhaseStart := Now();
+  {$IFDEF OpenCL}
+  Transfers := OpenCLProcessTransferTotals();
+  FOpenPhaseUploadBytes := Transfers.UploadBytes;
+  FOpenPhaseDownloadBytes := Transfers.DownloadBytes;
+  {$ENDIF}
   if Assigned(FOnPhase) then FOnPhase(Phase);
 end;
 
@@ -83407,18 +83526,30 @@ procedure TQwenImage21Pipeline.EncodeTokenIds(const TokenIds: array of integer;
 var
   Encoder: TNNet;
   Config: TQwen3VLConfig;
+  Phase: TQwenImage21PipelinePhase;
 begin
-  // A loaded encoder's borrowing net is built inside qppEncodePrompt.
-  if Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt)
-  else DoPhase(qppLoadTextEncoder);
-  Encoder := BuildTextEncoder(Length(TokenIds), FTextEncoderOwner, Config);
+  EndPhase();
+  for Phase in [qppLoadTextEncoder, qppEncodePrompt] do
+  begin
+    FImageStats.PhaseMs[Phase] := 0;
+    FImageStats.PhaseUploadBytes[Phase] := 0;
+    FImageStats.PhaseDownloadBytes[Phase] := 0;
+  end;
   try
-    PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
-    if not Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt);
-    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
-      PromptEmbeds, FParallel);
+    // A loaded encoder's borrowing net is built inside qppEncodePrompt.
+    if Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt)
+    else DoPhase(qppLoadTextEncoder);
+    Encoder := BuildTextEncoder(Length(TokenIds), FTextEncoderOwner, Config);
+    try
+      PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
+      if not Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt);
+      Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
+        PromptEmbeds, FParallel);
+    finally
+      Encoder.Free;
+    end;
   finally
-    Encoder.Free;
+    EndPhase();
   end;
 end;
 
@@ -83485,12 +83616,16 @@ begin
       if Assigned(FOnStep) then
         FOnStep(StepPos, StepCount, FScheduler.Timestep[StepPos], Latents);
     end;
+    FImageStats.StepCount := StepCount;
+    FImageStats.TransformerOnOpenCL := FTransformerOnOpenCL;
+    FImageStats.TransformerOpenCLBytes := Transformer.OpenCLBufferBytes();
     if FLayerProfiling then
       FTransformerProfileReport := Transformer.ProfileReport();
   finally
     if Assigned(FTransformer) then FTransformer.ReleasePasses()
     else Transformer.Free;
     Velocity.Free;
+    EndPhase();
   end;
 end;
 
@@ -83579,14 +83714,19 @@ begin
     // Released before the report, so the report includes this ReleaseNet.
     Vae.ReleaseNet();
     FVaeProfileReport := Vae.ProfileReport();
+    FImageStats.VaeTileCount := Vae.LastDecodeTileCount;
+    FImageStats.VaeNetCount := Vae.LastDecodeNetCount;
+    FImageStats.VaeOnOpenCL := FVaeOnOpenCL;
+    FImageStats.VaeOpenCLBytes := Vae.LargestNetOpenCLBytes;
+    // The decoder clamps to [-1, 1]; the pipeline postprocess is x / 2 + 0.5.
+    Image.Mul(0.5);
+    Image.Add(0.5);
   finally
     if Assigned(FVaeDecoder) then FVaeDecoder.ReleaseNet()
     else Vae.Free;
     LatentImage.Free;
+    EndPhase();
   end;
-  // The decoder clamps to [-1, 1]; the pipeline postprocess is x / 2 + 0.5.
-  Image.Mul(0.5);
-  Image.Add(0.5);
 end;
 
 procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
@@ -83595,9 +83735,24 @@ procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
 var
   Latents: TNNetVolume;
   RoundedWidth, RoundedHeight: integer;
+  EncodeStats: TQwenImage21ImageStats;
+  Phase: TQwenImage21PipelinePhase;
 begin
   RoundedWidth := RoundDownImageSide(Width);
   RoundedHeight := RoundDownImageSide(Height);
+  EndPhase();
+  EncodeStats := FImageStats;
+  FImageStats := Default(TQwenImage21ImageStats);
+  for Phase in [qppLoadTextEncoder, qppEncodePrompt] do
+  begin
+    FImageStats.PhaseMs[Phase] := EncodeStats.PhaseMs[Phase];
+    FImageStats.PhaseUploadBytes[Phase] := EncodeStats.PhaseUploadBytes[Phase];
+    FImageStats.PhaseDownloadBytes[Phase] :=
+      EncodeStats.PhaseDownloadBytes[Phase];
+  end;
+  {$IFDEF OpenCL}
+  FImageStats.TransfersCounted := OpenCLTransferCounting;
+  {$ENDIF}
   Latents := TNNetVolume.Create();
   try
     if Assigned(InitialLatents) then Latents.Copy(InitialLatents)
@@ -83606,6 +83761,7 @@ begin
     DecodeLatents(Latents, RoundedWidth, RoundedHeight, Image);
   finally
     Latents.Free;
+    EndPhase();
   end;
   DoPhase(qppDone);
 end;

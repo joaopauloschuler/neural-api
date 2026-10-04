@@ -22,7 +22,8 @@ input ends the session). Images go to numbered files from the --output base
 (qwenimage.png -> qwenimage_0001.png, ...; existing files are skipped, never
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
-PROMPT with consecutive seeds, the prompt encoded once), /quit.
+PROMPT with consecutive seeds, the prompt encoded once), /profile on|off,
+/stats on|off, /quit.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -38,7 +39,7 @@ USAGE
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
-            [--no-gpu-shared-kernel] [--profile]
+            [--no-gpu-shared-kernel] [--profile] [--stats]
 Run with --help for what each flag does.
 
 Coded by Claude (AI).
@@ -64,6 +65,7 @@ const
   csMaxImageSide = 8192;
   // Largest --repeat / /repeat count (catches a mistyped count).
   csMaxRepeatCount = 1000;
+  csBytesPerMB = 1024.0 * 1024.0;
 
 type
   // Phase and step timings with the process memory. On a terminal each step
@@ -85,12 +87,13 @@ type
       Latents: TNNetVolume);
   end;
 
-// 'VmRSS 123 MB, peak 456 MB' from /proc/self/status; '' elsewhere.
-function MemoryReport(): string;
+// VmRSS and VmHWM of /proc/self/status in MB ('?' when unreadable); false
+// without that file.
+function ReadProcMemory(out Rss, Peak: string): boolean;
 var
   Status: TStringList;
   LinePos: integer;
-  Line, Rss, Peak: string;
+  Line: string;
 
   function Megabytes(const StatusLine: string): string;
   var
@@ -103,10 +106,10 @@ var
   end;
 
 begin
-  Result := '';
-  if not FileExists('/proc/self/status') then exit;
   Rss := '?';
   Peak := '?';
+  Result := FileExists('/proc/self/status');
+  if not Result then exit;
   Status := TStringList.Create;
   try
     try
@@ -123,7 +126,35 @@ begin
   finally
     Status.Free;
   end;
-  Result := 'RSS ' + Rss + ' MB, peak ' + Peak + ' MB';
+end;
+
+// 'RSS 123 MB, peak 456 MB' from /proc/self/status; '' elsewhere.
+function MemoryReport(): string;
+var
+  Rss, Peak: string;
+begin
+  if ReadProcMemory(Rss, Peak) then
+    Result := 'RSS ' + Rss + ' MB, peak ' + Peak + ' MB'
+  else Result := '';
+end;
+
+// Resets the kernel's peak-RSS mark (VmHWM) to the current RSS; false when
+// /proc/self/clear_refs is not writable.
+function ResetPeakRss(): boolean;
+{$IFDEF UNIX}
+var
+  Handle: cint;
+  Command: char;
+{$ENDIF}
+begin
+  Result := false;
+  {$IFDEF UNIX}
+  Handle := FpOpen('/proc/self/clear_refs', O_WRONLY);
+  if Handle < 0 then exit;
+  Command := '5';
+  Result := FpWrite(Handle, Command, 1) = 1;
+  FpClose(Handle);
+  {$ENDIF}
 end;
 
 function PhaseName(Phase: TQwenImage21PipelinePhase): string;
@@ -138,6 +169,125 @@ begin
     qppDecode: Result := 'VAE decode';
   else
     Result := 'done';
+  end;
+end;
+
+// The per-image stage table of --stats and --profile: one row per phase that
+// ran, PNG save, their sum; then OpenCL transfers and bytes held, peak RSS.
+procedure PrintStageTable(const Stats: TQwenImage21ImageStats;
+  ImageNumber, EncodeImageNumber: integer; PngSaveMs: double;
+  IsProfiled, IsPeakPerImage: boolean);
+var
+  Phase: TQwenImage21PipelinePhase;
+  TotalMs: double;
+  RanOn, Detail, Rss, Peak: string;
+  HasEncode, IsOnOpenCL: boolean;
+
+  function Share(Ms: double): double;
+  begin
+    if TotalMs > 0 then Result := 100.0 * Ms / TotalMs else Result := 0;
+  end;
+
+  function Megabytes(Bytes: int64): double;
+  begin
+    Result := Bytes / csBytesPerMB;
+  end;
+
+  // Upload and download MB of Phase divided by Count.
+  function TransferText(Phase: TQwenImage21PipelinePhase;
+    Count: integer): string;
+  begin
+    if Count < 1 then Count := 1;
+    Result := Format('up %.2f MB, down %.2f MB',
+      [Megabytes(Stats.PhaseUploadBytes[Phase]) / Count,
+       Megabytes(Stats.PhaseDownloadBytes[Phase]) / Count]);
+  end;
+
+  procedure AddRow(const Stage, Where, Ms, Pct, RowDetail: string);
+  begin
+    WriteLn(TrimRight(Format('  %-20s %-10s %10s %6s  %s', [Stage, Where, Ms,
+      Pct, RowDetail])));
+  end;
+
+  procedure AddTimedRow(const Stage, Where: string; Ms: double;
+    const RowDetail: string);
+  begin
+    AddRow(Stage, Where, Format('%.1f', [Ms]), Format('%.1f', [Share(Ms)]),
+      RowDetail);
+  end;
+
+begin
+  HasEncode := ImageNumber = EncodeImageNumber;
+  IsOnOpenCL := Stats.TransformerOnOpenCL or Stats.VaeOnOpenCL;
+  TotalMs := PngSaveMs;
+  for Phase := qppLoadTextEncoder to qppDecode do
+    if HasEncode or not (Phase in [qppLoadTextEncoder, qppEncodePrompt]) then
+      TotalMs := TotalMs + Stats.PhaseMs[Phase];
+  WriteLn('Stages of image ', ImageNumber, ' (wall time):');
+  if IsProfiled and IsOnOpenCL then
+    WriteLn('  (--profile drains OpenCL after every layer: these walls are ',
+      'higher than without it)');
+  AddRow('Stage', 'Ran on', 'ms', '%', '');
+  for Phase := qppLoadTextEncoder to qppDecode do
+  begin
+    if (Phase in [qppLoadTextEncoder, qppEncodePrompt]) and not HasEncode then
+    begin
+      if Phase = qppEncodePrompt then
+        AddRow(PhaseName(Phase), '-', '-', '-', 'encoded once, before image ' +
+          IntToStr(EncodeImageNumber) + ' (counted there)');
+      continue;
+    end;
+    if (Stats.PhaseMs[Phase] = 0) and (Phase in [qppLoadTextEncoder,
+      qppLoadTransformer, qppLoadVae]) then continue;
+    RanOn := 'CPU';
+    Detail := '';
+    case Phase of
+      qppLoadTransformer, qppLoadVae:
+        if Stats.PhaseUploadBytes[Phase] > 0 then
+        begin
+          RanOn := 'CPU+upload';
+          Detail := Format('uploads %.1f MB',
+            [Megabytes(Stats.PhaseUploadBytes[Phase])]);
+        end;
+      qppDenoise:
+      begin
+        if Stats.TransformerOnOpenCL then RanOn := 'OpenCL';
+        if Stats.StepCount > 0 then
+          Detail := Format('%d steps x %.1f ms', [Stats.StepCount,
+            Stats.PhaseMs[Phase] / Stats.StepCount]);
+      end;
+      qppDecode:
+      begin
+        if Stats.VaeOnOpenCL then RanOn := 'OpenCL';
+        if Stats.VaeTileCount > 0 then
+          Detail := Format('%d tile(s) x %.1f ms, %d net(s) built',
+            [Stats.VaeTileCount, Stats.PhaseMs[Phase] / Stats.VaeTileCount,
+             Stats.VaeNetCount]);
+      end;
+    end;
+    AddTimedRow(PhaseName(Phase), RanOn, Stats.PhaseMs[Phase], Detail);
+  end;
+  AddTimedRow('PNG save', 'CPU', PngSaveMs, '');
+  AddRow('sum of stages', '', Format('%.1f', [TotalMs]), '100.0', '');
+  if IsOnOpenCL then
+  begin
+    if Stats.TransfersCounted then
+      WriteLn('  host<->OpenCL: step pass ', TransferText(qppDenoise,
+        Stats.StepCount), ' per step; VAE decode ', TransferText(qppDecode,
+        Stats.VaeTileCount), ' per tile')
+    else
+      WriteLn('  host<->OpenCL: not counted (--stats turns the counting on)');
+    WriteLn(Format('  OpenCL memory held: transformer %.1f MB after the last ' +
+      'step, VAE %.1f MB (largest tile net); sampled, not every allocation',
+      [Megabytes(Stats.TransformerOpenCLBytes),
+       Megabytes(Stats.VaeOpenCLBytes)]));
+  end;
+  if ReadProcMemory(Rss, Peak) then
+  begin
+    if IsPeakPerImage then
+      WriteLn('  peak RSS this image: ', Peak, ' MB')
+    else
+      WriteLn('  peak RSS of the process: ', Peak, ' MB');
   end;
 end;
 
@@ -276,7 +426,21 @@ begin
     'transfers; steps run slower.');
   WriteLn('                       With --no-gpu-shared-kernel the layer ',
     'queues are private: the table header');
-  WriteLn('                       says which queues are drained.');
+  WriteLn('                       says which queues are drained. Also ',
+    'prints the --stats stage table.');
+  WriteLn('  --stats              after each image, a stage table: where each ',
+    'stage ran, its wall time');
+  WriteLn('                       and share, ms per step and per VAE tile, ',
+    'host<->OpenCL MB per step');
+  WriteLn('                       and per tile, the OpenCL memory held and ',
+    'the peak RSS of the image.');
+  WriteLn('                       No per-layer drain; it counts transfers ',
+    '(a few integer adds each).');
+  WriteLn('                       --stats and --profile reset the kernel''s ',
+    'peak-RSS mark when an image');
+  WriteLn('                       starts, so getrusage ru_maxrss and ',
+    '/usr/bin/time -v then report only');
+  WriteLn('                       the peak since the last image started.');
   WriteLn;
   WriteLn('Without -p or --token-ids, QwenImage loads the text encoder, the ',
     'transformer and the VAE once');
@@ -294,6 +458,8 @@ begin
     'during the VAE decode; /tile 128');
   WriteLn('                       (or --vae-tile 128) lowers the VAE''s ',
     'memory if both do not fit.');
+  WriteLn('  /profile on|off      --profile for the next images');
+  WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
 end;
 
@@ -412,7 +578,11 @@ var
   Width, Height, StepCount, DropCount, ArgPos: integer;
   RepeatCount, ImageNumber, FileNumber: integer;
   Seed: cardinal;
-  HasPrompt, UseInt8Input, UseSerial, UseProfile: boolean;
+  HasPrompt, UseInt8Input, UseSerial, UseProfile, UseStats: boolean;
+  // The image whose stage table shows the encode of the current prompt.
+  EncodeImageNumber: integer;
+  // The kernel's peak-RSS mark was reset for the current image.
+  IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
   UseOpenCL, HasSharedKernel: boolean;
   OpenCLPlatform, OpenCLDevice: integer;
@@ -457,8 +627,31 @@ var
   // Encodes TokenIds into PromptEmbeds and ends the encode phase line.
   procedure EncodePrompt();
   begin
+    IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
     Reporter.OnPhase(qppDone);
+    EncodeImageNumber := ImageNumber + 1;
+  end;
+
+  // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
+  // on, but only once a pass runs).
+  procedure SetProfile(Value: boolean);
+  begin
+    UseProfile := Value;
+    Pipeline.LayerProfiling := Value;
+    {$IFDEF OpenCL}
+    if Value then OpenCLTransferCounting := true;
+    {$ENDIF}
+  end;
+
+  // Transfer counting stays on after /stats off: its cost per transfer is
+  // four integer adds, two of them atomic.
+  procedure SetStats(Value: boolean);
+  begin
+    UseStats := Value;
+    {$IFDEF OpenCL}
+    if Value then OpenCLTransferCounting := true;
+    {$ENDIF}
   end;
 
   procedure AdvanceSeed();
@@ -473,16 +666,26 @@ var
   procedure GenerateImage(const ImageFile: string);
   var
     ImageStart: QWord;
+    SaveStart: TDateTime;
+    PngSaveMs: double;
   begin
+    // The image that encoded the prompt had its mark reset before the encode.
+    if ImageNumber <> EncodeImageNumber then
+      IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     ImageStart := GetTickCount64;
     Pipeline.GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed,
       Image);
+    SaveStart := Now();
     Image.Mul(255);
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
       raise Exception.Create('could not write ' + ImageFile);
+    PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
     WriteLn('Wrote ', ImageFile, ' (', Image.SizeX, 'x', Image.SizeY, 'x',
       Image.Depth, ') in ', ((GetTickCount64 - ImageStart) / 1000):0:1,
       ' s; ', MemoryReport());
+    if UseStats or UseProfile then
+      PrintStageTable(Pipeline.ImageStats, ImageNumber, EncodeImageNumber,
+        PngSaveMs, UseProfile, IsPeakPerImage);
     if UseProfile then
     begin
       WriteLn;
@@ -584,10 +787,25 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile, /repeat and /quit; false on /quit or when
-  // /repeat ran out of memory.
+  // Parses on/off for /Command; false (and prints why) otherwise.
+  function ParseOnOff(const Command, Argument: string;
+    out Value: boolean): boolean;
+  begin
+    Result := true;
+    if LowerCase(Argument) = 'on' then Value := true
+    else if LowerCase(Argument) = 'off' then Value := false
+    else
+    begin
+      WriteLn('[/', Command, ': expected on or off]');
+      Result := false;
+    end;
+  end;
+
+  // /size, /steps, /seed, /tile, /repeat, /profile, /stats and /quit; false on
+  // /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
+    IsOn: boolean;
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
@@ -667,8 +885,24 @@ var
             MaxInt)), NewRepeatCount);
       end;
     end
-    else WriteLn('[unknown command /', Command,
-      ' - /size, /steps, /seed, /tile, /repeat, /quit]');
+    else if Command = 'profile' then
+    begin
+      if ParseOnOff(Command, Argument, IsOn) then
+      begin
+        SetProfile(IsOn);
+        WriteLn('[profile ', LowerCase(Argument), ' from the next image]');
+      end;
+    end
+    else if Command = 'stats' then
+    begin
+      if ParseOnOff(Command, Argument, IsOn) then
+      begin
+        SetStats(IsOn);
+        WriteLn('[stats ', LowerCase(Argument), ' from the next image]');
+      end;
+    end
+    else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
+      '/tile, /repeat, /profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -680,7 +914,8 @@ var
     LoadAllComponents();
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
-      '/tile SIZE[,STRIDE], /repeat N PROMPT, /quit.');
+      '/tile SIZE[,STRIDE], /repeat N PROMPT, /profile on|off, ',
+      '/stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -726,6 +961,9 @@ begin
   UseInt8Input := false;
   UseSerial := false;
   UseProfile := false;
+  UseStats := false;
+  EncodeImageNumber := 0;
+  IsPeakPerImage := false;
   MaxThreads := 0;
   VaeTileSize := 256;
   VaeTileStride := 192;
@@ -771,6 +1009,7 @@ begin
     else if Arg = '--gpu-device' then OpenCLDevice := StrToInt(NextArg())
     else if Arg = '--no-gpu-shared-kernel' then HasSharedKernel := false
     else if Arg = '--profile' then UseProfile := true
+    else if Arg = '--stats' then UseStats := true
     else if Arg = '--vae-tile' then
     begin
       ArgProblem := ParseVaeTile(NextArg(), VaeTileSize, VaeTileStride);
@@ -841,7 +1080,8 @@ begin
     Pipeline.VaeTileStride := VaeTileStride;
     Pipeline.Parallel := not UseSerial;
     Pipeline.MaxThreads := MaxThreads;
-    Pipeline.LayerProfiling := UseProfile;
+    SetProfile(UseProfile);
+    SetStats(UseStats);
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     if UseOpenCL then ComputeText := 'CPU' else ComputeText := 'CPU (--cpu)';

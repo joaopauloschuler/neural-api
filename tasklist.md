@@ -2464,7 +2464,7 @@ rather than acted on.
         consecutive seeds, prompt encoded once.
   - [x] D4. `GPU %` column (forward count share) and a count/time share summary
         line in `TNNet.LayerGroupTimingReport`.
-  - [ ] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
+  - [x] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
         `--stats`, host<->OpenCL MB per step and per VAE tile, peak OpenCL
         bytes, `/profile` and `/stats` REPL toggles.
   Phase C — editing and reference images (plan from source reading of

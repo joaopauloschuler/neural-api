@@ -132,6 +132,8 @@ follow:
 | `/seed N` | seed of the next image; without it the seed grows by one per image |
 | `/tile SIZE[,STRIDE]` | VAE tile, as `--vae-tile` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
+| `/profile on\|off` | `--profile` from the next image |
+| `/stats on\|off` | `--stats` from the next image |
 | `/quit` | end the session |
 
 A prompt file can mix both:
@@ -231,12 +233,67 @@ intra-layer threading.
 
 | Option | Meaning |
 | --- | --- |
-| `--profile` | after the image, print the per-layer time of the transformer step pass (by block role and by layer class, summed over the blocks and steps), of the prefix pass, and of the VAE decode (by layer class, one table per tile shape) |
+| `--stats` | after each image, print the stage table below |
+| `--profile` | after the image, print the stage table, then the per-layer time of the transformer step pass (by block role and by layer class, summed over the blocks and steps), of the prefix pass, and of the VAE decode (by layer class, one table per tile shape) |
 
 `--profile` drains the OpenCL queue after every layer that queued OpenCL
 work, so each row includes its kernels and transfers, and the steps run
 slower than without it. With `--no-gpu-shared-kernel` the layers have private
 queues; the table header says which queues the profiler drains.
+
+The stage table has one row per stage of the image: where it ran, its wall
+time and its share of the image's stages. This example is the pico
+checkpoint on PoCL (CPU OpenCL), one-shot, with `--stats --vae-tile 32,16`:
+
+```
+Stages of image 1 (wall time):
+  Stage                Ran on             ms      %
+  load text encoder    CPU               6.0    0.0
+  encode prompt        CPU               5.0    0.0
+  load transformer     CPU+upload      170.0    0.8  uploads 0.0 MB
+  transformer prefix   CPU               5.0    0.0
+  denoise              OpenCL         2100.0   10.3  2 steps x 1050.0 ms
+  load VAE             CPU             115.0    0.6
+  VAE decode           OpenCL        17989.0   88.2  16 tile(s) x 1124.3 ms, 4 net(s) built
+  PNG save             CPU               2.0    0.0
+  sum of stages                      20392.0  100.0
+  host<->OpenCL: step pass up 0.01 MB, down 0.01 MB per step; VAE decode up 0.10 MB, down 0.05 MB per tile
+  OpenCL memory held: transformer 0.1 MB after the last step, VAE 0.5 MB (largest tile net); sampled, not every allocation
+  peak RSS this image: 116 MB
+```
+
+- "sum of stages" adds the rows. It leaves out the short gaps between
+  stages, so it can differ from the time on the `Wrote ...` line.
+- The load rows appear only when a stage loaded its component (one-shot
+  runs). "CPU+upload" marks a load that also uploaded weights to OpenCL
+  memory, with the uploaded MB.
+- In the REPL and with `--repeat`, the prompt is encoded once: its rows count
+  in the first image of the prompt, and later images show "encoded once".
+- ms per step and ms per tile include one-time setup: step 1 builds and arms
+  the step pass, and the decode builds, arms and uploads the weights of one
+  VAE net per tile shape (the "net(s) built" count).
+- `--stats` adds no per-layer drain. It turns on the host<->OpenCL transfer
+  counting, which costs four integer adds per transfer (two of them atomic)
+  and stays on for the rest of the session. The counter sees the buffer
+  writes and reads of `TEasyOpenCL` (`WriteBuffer`, `ReadBuffer` and their
+  offset forms), not mapped buffers or buffers created from host memory.
+  The step figure is the step pass's transfers divided by the steps (step 1
+  also uploads the prompt K/V); the tile figure is the decode's transfers
+  divided by the tiles.
+- "OpenCL memory held" is `TNNet.OpenCLBufferBytes`, sampled after the last
+  step (the transformer block weights, the step pass and the prompt K/V) and
+  before each VAE tile net is freed (the largest is shown). It counts the
+  buffers those routines know about; the OpenCL K/V cache of
+  `TNNetFusedSDPA` is not counted. After the steps the pipeline frees the
+  step pass and the prompt K/V, so in the REPL only the transformer block
+  weights stay in OpenCL memory beside the VAE.
+- The peak RSS is per image: `--stats` and `--profile` reset the kernel's
+  peak-RSS mark (`/proc/self/clear_refs`) before the prompt is encoded and
+  before each later image of a `--repeat` batch, so the "peak" in the phase
+  lines is per image too. A side effect: `getrusage` `ru_maxrss` and
+  `/usr/bin/time -v` ("Maximum resident set size") then report only the peak
+  since the last reset. Where the file is not writable the line says
+  "peak RSS of the process".
 
 ## Performance and memory
 

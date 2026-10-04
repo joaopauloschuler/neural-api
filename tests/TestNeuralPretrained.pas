@@ -807,6 +807,7 @@ type
     procedure TestQwenImage21PipelineKeepLoaded;
     procedure TestQwenImage21PipelineUnloadComponents;
     procedure TestQwenImage21PipelineOpenCLKeepLoaded;
+    procedure TestQwenImage21PipelineImageStats;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -30318,6 +30319,10 @@ var
   Embeds, ImageOneShot, ImageLoaded: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  PhaseUploadSum, PhaseDownloadSum: int64;
+  Phase: TQwenImage21PipelinePhase;
 
   function NewPipeline(): TQwenImage21Pipeline;
   begin
@@ -30335,7 +30340,9 @@ var
     OneShot.EncodeTokenIds(TokenIds, 5, Embeds);
     OneShot.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageOneShot);
     Loaded.EncodeTokenIds(TokenIds, 5, Embeds);
+    TransfersBefore := OpenCLProcessTransferTotals();
     Loaded.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageLoaded);
+    TransfersAfter := OpenCLProcessTransferTotals();
     AssertEquals(What + ' width', ImageOneShot.SizeX, ImageLoaded.SizeX);
     Diff := MaxAbsVolumeDiff(ImageLoaded, ImageOneShot);
     WriteLn('  Qwen-Image-2.1 keep-loaded vs one-shot on OpenCL, ', What,
@@ -30352,6 +30359,7 @@ begin
   end;
   OneShot := nil;
   Loaded := nil;
+  WasCounting := OpenCLTransferCounting;
   Embeds := TNNetVolume.Create;
   ImageOneShot := TNNetVolume.Create;
   ImageLoaded := TNNetVolume.Create;
@@ -30361,11 +30369,44 @@ begin
     Loaded.LoadComponents();
     AssertTrue('loaded transformer on OpenCL', Loaded.TransformerOnOpenCL);
     AssertTrue('loaded VAE on OpenCL', Loaded.VaeOnOpenCL);
+    OpenCLTransferCounting := true;
     CompareImage(TokenIdsA, 64, 64, 'first image (64x64)');
     CompareImage(TokenIdsB, 32, 64, 'second image (32x64)');
     AssertTrue('the step pass stayed on OpenCL',
       Loaded.TransformerOnOpenCL and Loaded.VaeOnOpenCL);
+    with Loaded.ImageStats do
+    begin
+      AssertTrue('stats: transfers counted', TransfersCounted);
+      AssertTrue('stats: step pass and VAE on OpenCL',
+        TransformerOnOpenCL and VaeOnOpenCL);
+      AssertEquals('stats: steps', 2, StepCount);
+      AssertEquals('stats: one VAE tile', 1, VaeTileCount);
+      AssertTrue('stats: step pass uploads',
+        PhaseUploadBytes[qppDenoise] > 0);
+      AssertTrue('stats: VAE downloads its image',
+        PhaseDownloadBytes[qppDecode] > 0);
+      AssertEquals('stats: the prefix pass moves nothing', 0,
+        PhaseUploadBytes[qppEncodePrefix] + PhaseDownloadBytes[qppEncodePrefix]);
+      AssertTrue('stats: transformer OpenCL bytes', TransformerOpenCLBytes > 0);
+      AssertTrue('stats: VAE OpenCL bytes', VaeOpenCLBytes > 0);
+      // Every transfer of the image, worker threads included, is charged to
+      // exactly one phase.
+      PhaseUploadSum := 0;
+      PhaseDownloadSum := 0;
+      for Phase := qppLoadTransformer to qppDecode do
+      begin
+        Inc(PhaseUploadSum, PhaseUploadBytes[Phase]);
+        Inc(PhaseDownloadSum, PhaseDownloadBytes[Phase]);
+      end;
+      AssertEquals('stats: uploads = process delta',
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes,
+        PhaseUploadSum);
+      AssertEquals('stats: downloads = process delta',
+        TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes,
+        PhaseDownloadSum);
+    end;
   finally
+    OpenCLTransferCounting := WasCounting;
     Loaded.Free;
     OneShot.Free;
     ImageLoaded.Free;
@@ -30378,6 +30419,86 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+// ImageStats on a loaded CPU pipeline: tiles, steps, no load or OpenCL
+// figures, the encode phases kept across images. LayerProfiling toggled
+// between images on the loaded components fills or empties the reports and
+// leaves the image unchanged.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineImageStats;
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  StepCount = 2;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, ImageProfiled, ImagePlain: TNNetVolume;
+  EncodeMs, WallMs, PhaseSumMs: double;
+  WallStart: TDateTime;
+  Phase: TQwenImage21PipelinePhase;
+  ProfilePos, EncodeTry: integer;
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  ImageProfiled := TNNetVolume.Create;
+  ImagePlain := TNNetVolume.Create;
+  try
+    Pipeline.TransformerFormat := qiwInt8;
+    Pipeline.VaeTileSize := 32;
+    Pipeline.VaeTileStride := 16;
+    Pipeline.LoadComponents();
+    // Now() ticks per ms: encode again until the encode phase is measurable,
+    // so the "kept across images" check below can see a reset.
+    EncodeTry := 0;
+    repeat
+      Inc(EncodeTry);
+      WallStart := Now();
+      Pipeline.EncodeTokenIds(TokenIds, 5, Embeds);
+      EncodeMs := Pipeline.ImageStats.PhaseMs[qppEncodePrompt];
+    until (EncodeMs > 0) or (EncodeTry >= 20);
+    AssertTrue('encode phase measured', EncodeMs > 0);
+    Pipeline.GenerateFromEmbeds(Embeds, 64, 64, StepCount, 1, ImagePlain);
+    WallMs := (Now() - WallStart) * MSecsPerDay;
+    with Pipeline.ImageStats do
+    begin
+      // 4x4 latents, 2-latent tiles every latent: 4 rows x 4 columns.
+      AssertEquals('VAE tiles', 16, VaeTileCount);
+      AssertFalse('CPU step pass', TransformerOnOpenCL);
+      AssertFalse('CPU VAE', VaeOnOpenCL);
+      AssertEquals('no transformer OpenCL bytes', 0, TransformerOpenCLBytes);
+      AssertEquals('no VAE OpenCL bytes', 0, VaeOpenCLBytes);
+      PhaseSumMs := 0;
+      for Phase := qppLoadTextEncoder to qppDecode do
+      begin
+        AssertTrue('phase ms >= 0', PhaseMs[Phase] >= 0);
+        PhaseSumMs := PhaseSumMs + PhaseMs[Phase];
+      end;
+      for Phase in [qppLoadTextEncoder, qppLoadTransformer, qppLoadVae] do
+        AssertEquals('loaded: no load phase', 0, PhaseMs[Phase], 0);
+      // The phases are disjoint intervals of the same clock inside the wall.
+      AssertTrue('phases within the wall', PhaseSumMs <= WallMs + 1e-6);
+    end;
+    AssertEquals('steps recorded', StepCount, Pipeline.ImageStats.StepCount);
+    for ProfilePos := 0 to 2 do
+    begin
+      Pipeline.LayerProfiling := ProfilePos = 1;
+      Pipeline.GenerateFromEmbeds(Embeds, 64, 64, StepCount, 1, ImageProfiled);
+      AssertEquals('encode phase kept across images', EncodeMs,
+        Pipeline.ImageStats.PhaseMs[qppEncodePrompt], 0);
+      AssertEquals('profiling toggled ' + IntToStr(ProfilePos) +
+        ': same image', 0, MaxAbsVolumeDiff(ImageProfiled, ImagePlain), 0);
+      AssertEquals('transformer report iff profiling ' + IntToStr(ProfilePos),
+        Pipeline.LayerProfiling, Pipeline.TransformerProfileReport <> '');
+      AssertEquals('VAE report iff profiling ' + IntToStr(ProfilePos),
+        Pipeline.LayerProfiling, Pipeline.VaeProfileReport <> '');
+    end;
+  finally
+    ImagePlain.Free;
+    ImageProfiled.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
 
 procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
 var

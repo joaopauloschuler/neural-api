@@ -730,8 +730,12 @@ procedure AdoptRetainedOpenCLBuffer(var Buffer: cl_mem; SharedBuffer: cl_mem);
 var
   // While true, TEasyOpenCL's Write/Read routines add every transfer to the
   // calling thread's OpenCLThreadTransfers; TNNet.LayerProfiling sets it.
-  // It stays on once set: one threadvar add per transfer from then on.
+  // It stays on once set: per transfer, two threadvar and two atomic adds.
   OpenCLTransferCounting: boolean = false;
+
+  // The same transfers summed over every thread (NeuralAtomicAdd64), for
+  // callers spanning worker threads; read it with OpenCLProcessTransferTotals.
+  OpenCLProcessTransfers: TOpenCLTransferCounts;
 
 threadvar
   OpenCLThreadTransfers: TOpenCLTransferCounts;
@@ -742,9 +746,11 @@ procedure AddOpenCLTransferCounts(var Total: TOpenCLTransferCounts;
 // Total += After - Before: the transfers between two snapshots.
 procedure AddOpenCLTransferDelta(var Total: TOpenCLTransferCounts;
   const After, Before: TOpenCLTransferCounts);
+// OpenCLProcessTransfers read field by field with NeuralAtomicRead64.
+function OpenCLProcessTransferTotals(): TOpenCLTransferCounts;
 
 implementation
-uses math;
+uses math, neuralthread;
 
 const
   platform_str_info: array[1..5] of record
@@ -3130,16 +3136,30 @@ begin
   Inc(Total.DownloadBytes, After.DownloadBytes - Before.DownloadBytes);
 end;
 
+function OpenCLProcessTransferTotals(): TOpenCLTransferCounts;
+begin
+  Result.UploadCount := NeuralAtomicRead64(OpenCLProcessTransfers.UploadCount);
+  Result.UploadBytes := NeuralAtomicRead64(OpenCLProcessTransfers.UploadBytes);
+  Result.DownloadCount :=
+    NeuralAtomicRead64(OpenCLProcessTransfers.DownloadCount);
+  Result.DownloadBytes :=
+    NeuralAtomicRead64(OpenCLProcessTransfers.DownloadBytes);
+end;
+
 procedure CountOpenCLUpload(Bytes: csize_t);
 begin
   Inc(OpenCLThreadTransfers.UploadCount);
   Inc(OpenCLThreadTransfers.UploadBytes, Bytes);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.UploadCount, 1);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.UploadBytes, Bytes);
 end;
 
 procedure CountOpenCLDownload(Bytes: csize_t);
 begin
   Inc(OpenCLThreadTransfers.DownloadCount);
   Inc(OpenCLThreadTransfers.DownloadBytes, Bytes);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.DownloadCount, 1);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.DownloadBytes, Bytes);
 end;
 
 function TEasyOpenCL.WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
