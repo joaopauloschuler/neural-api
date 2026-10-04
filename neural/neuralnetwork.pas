@@ -432,6 +432,11 @@ type
       // Forwards and host<->OpenCL transfers counted by RunProfiled, i.e. only
       // while the net's LayerProfiling is on. Reset by ClearTimes.
       FProfiledForwardCnt: integer;
+      // FForwardTime of the profiled forwards; the count and FForwardTime of
+      // those among them that took the OpenCL path.
+      FProfiledForwardTime: double;
+      FProfiledForwardOpenCLCnt: integer;
+      FProfiledForwardOpenCLTime: double;
       {$IFDEF OpenCL}
       FProfiledTransfers: TOpenCLTransferCounts;
       {$ENDIF}
@@ -954,6 +959,10 @@ type
       property ForwardGPUCnt: integer read FForwardGPUCnt write FForwardGPUCnt;
       property ForwardCPUCnt: integer read FForwardCPUCnt write FForwardCPUCnt;
       property ProfiledForwardCnt: integer read FProfiledForwardCnt;
+      property ProfiledForwardTime: double read FProfiledForwardTime;
+      property ProfiledForwardOpenCLCnt: integer read FProfiledForwardOpenCLCnt;
+      property ProfiledForwardOpenCLTime: double
+        read FProfiledForwardOpenCLTime;
       {$IFDEF OpenCL}
       property ProfiledTransfers: TOpenCLTransferCounts
         read FProfiledTransfers;
@@ -17935,6 +17944,8 @@ type
     InstanceCnt: integer;
     ForwardUs: double;
     ForwardGPUCnt, ForwardCPUCnt, ProfiledForwardCnt: Int64;
+    ProfiledForwardOpenCLCnt: Int64;
+    ProfiledForwardUs, ProfiledForwardOpenCLUs: double;
     {$IFDEF OpenCL}
     ProfiledTransfers: TOpenCLTransferCounts;
     {$ENDIF}
@@ -20629,8 +20640,8 @@ type
       // (layer i; '' or past the end = class name), largest ForwardUs first.
       class function LayerGroupTimings(NN: TNNet;
         const GroupNames: array of string): TNNetLayerGroupTimingArray;
-      // LayerGroupTimings as a table with a ms-per-pass column (PassCount >= 1)
-      // and, under LayerProfiling, forwards, OpenCL forwards and transfers.
+      // LayerGroupTimings as a table (ms/pass for PassCount >= 1, GPU %); OpenCL
+      // builds add a share line; LayerProfiling adds forwards, transfers, time share.
       class function LayerGroupTimingReport(NN: TNNet;
         const GroupNames: array of string; PassCount: integer): string;
       // ProfileReport is a torch.profiler-lite: a single per-layer table that
@@ -113591,6 +113602,17 @@ const
   // TNNetLayer.ForwardTime and TNNet.NNetForwardTime are TDateTime spans.
   csMicrosecondsPerDay = MSecsPerDay * 1000.0;
 
+// The percent of forwards that took the OpenCL path ('42%'), or '-'
+// when no forward ran on a layer that has an OpenCL path.
+function ForwardOpenCLShareStr(ForwardGPUCnt, ForwardCPUCnt: Int64): string;
+begin
+  if (ForwardGPUCnt + ForwardCPUCnt) > 0 then
+    Result := Format('%.0f%%',
+      [100.0 * ForwardGPUCnt / (ForwardGPUCnt + ForwardCPUCnt)])
+  else
+    Result := '-';
+end;
+
 class function TNNet.LayerGroupTimings(NN: TNNet;
   const GroupNames: array of string): TNNetLayerGroupTimingArray;
 var
@@ -113634,6 +113656,11 @@ begin
       Inc(ForwardGPUCnt, Layer.ForwardGPUCnt);
       Inc(ForwardCPUCnt, Layer.ForwardCPUCnt);
       Inc(ProfiledForwardCnt, Layer.ProfiledForwardCnt);
+      ProfiledForwardUs := ProfiledForwardUs +
+        Layer.ProfiledForwardTime * csMicrosecondsPerDay;
+      Inc(ProfiledForwardOpenCLCnt, Layer.ProfiledForwardOpenCLCnt);
+      ProfiledForwardOpenCLUs := ProfiledForwardOpenCLUs +
+        Layer.ProfiledForwardOpenCLTime * csMicrosecondsPerDay;
       {$IFDEF OpenCL}
       AddOpenCLTransferCounts(ProfiledTransfers, Layer.ProfiledTransfers);
       {$ENDIF}
@@ -113657,8 +113684,6 @@ var
   NNLastIdx, i, ClassQtyM1: integer;
   Classes: TNNetLayerGroupTimingArray;
   TotalUs, Pct, MeanUs: double;
-  GpuPct: double;
-  GpuStr: string;
   {$IFDEF OpenCL}
   QueueOpenCLUs, ForwardWallUs, QueueOpenCLPct: double;
   {$ENDIF}
@@ -113703,20 +113728,10 @@ begin
       MeanUs := Classes[i].ForwardUs / Classes[i].InstanceCnt;
       Pct := 0;
       if TotalUs > 0 then Pct := 100.0 * Classes[i].ForwardUs / TotalUs;
-      // GPU column: percent of this class's forward dispatches that ran on the
-      // OpenCL path. Layers with no GPU path never increment either counter, so
-      // they show "-" rather than a misleading 0%.
-      if (Classes[i].ForwardGPUCnt + Classes[i].ForwardCPUCnt) > 0 then
-      begin
-        GpuPct := 100.0 * Classes[i].ForwardGPUCnt /
-          (Classes[i].ForwardGPUCnt + Classes[i].ForwardCPUCnt);
-        GpuStr := Format('%6.0f%%', [GpuPct]);
-      end
-      else
-        GpuStr := Format('%7s', ['-']);
-      Lines.Add(Format('%-28s %5d %14.2f %14.2f %5.1f %s',
+      Lines.Add(Format('%-28s %5d %14.2f %14.2f %5.1f %7s',
         [Classes[i].GroupName, Classes[i].InstanceCnt, Classes[i].ForwardUs,
-         MeanUs, Pct, GpuStr]));
+         MeanUs, Pct, ForwardOpenCLShareStr(Classes[i].ForwardGPUCnt,
+         Classes[i].ForwardCPUCnt)]));
     end;
     Lines.Add(StringOfChar('-', 86));
     Lines.Add(Format('TOTAL: %.2f us across %d layer(s) in %d class(es)',
@@ -113742,12 +113757,16 @@ var
   Lines: TStringList;
   Groups: TNNetLayerGroupTimingArray;
   GroupPos, MaxGroupPos, InstanceTotal, RuleWidth, NameWidth: integer;
+  ForwardGPUTotal, ForwardCPUTotal: Int64;
   TotalUs, Pct: double;
-  HasGroupNames, IsOnOpenCL: boolean;
-  Row, FwdStr, OpenCLStr: string;
   {$IFDEF OpenCL}
+  ProfiledForwardTotal, ProfiledForwardOpenCLTotal: Int64;
+  ProfiledForwardUsTotal, ProfiledForwardOpenCLUsTotal, CountPct,
+    TimePct: double;
   Transfers: TOpenCLTransferCounts;
   {$ENDIF}
+  HasGroupNames, IsOnOpenCL: boolean;
+  Row, FwdStr, OpenCLStr: string;
 const
   cBytesPerMB = 1024.0 * 1024.0;
 
@@ -113776,16 +113795,30 @@ begin
     {$IFDEF OpenCL}Assigned(NN.FDotProductKernel){$ELSE}false{$ENDIF};
   TotalUs := 0;
   InstanceTotal := 0;
-  NameWidth := 5;
+  ForwardGPUTotal := 0;
+  ForwardCPUTotal := 0;
   {$IFDEF OpenCL}
+  ProfiledForwardTotal := 0;
+  ProfiledForwardOpenCLTotal := 0;
+  ProfiledForwardUsTotal := 0;
+  ProfiledForwardOpenCLUsTotal := 0;
   Transfers := Default(TOpenCLTransferCounts);
   {$ENDIF}
+  NameWidth := 5;
   for GroupPos := 0 to MaxGroupPos do
   begin
     NameWidth := Max(NameWidth, Length(Groups[GroupPos].GroupName));
     TotalUs := TotalUs + Groups[GroupPos].ForwardUs;
     Inc(InstanceTotal, Groups[GroupPos].InstanceCnt);
+    Inc(ForwardGPUTotal, Groups[GroupPos].ForwardGPUCnt);
+    Inc(ForwardCPUTotal, Groups[GroupPos].ForwardCPUCnt);
     {$IFDEF OpenCL}
+    Inc(ProfiledForwardTotal, Groups[GroupPos].ProfiledForwardCnt);
+    Inc(ProfiledForwardOpenCLTotal, Groups[GroupPos].ProfiledForwardOpenCLCnt);
+    ProfiledForwardUsTotal := ProfiledForwardUsTotal +
+      Groups[GroupPos].ProfiledForwardUs;
+    ProfiledForwardOpenCLUsTotal := ProfiledForwardOpenCLUsTotal +
+      Groups[GroupPos].ProfiledForwardOpenCLUs;
     AddOpenCLTransferCounts(Transfers, Groups[GroupPos].ProfiledTransfers);
     {$ENDIF}
   end;
@@ -113821,13 +113854,17 @@ begin
         'so the rows can sum above the forward wall time.');
     if NN.FLayerProfiling then
       Lines.Add('Fwds = forwards; OpenCL = forwards on the OpenCL path.');
+    {$IFDEF OpenCL}
+    Lines.Add('GPU % = OpenCL share of the forwards of layers that have an ' +
+      'OpenCL path; "-" = none.');
+    {$ENDIF}
     if NN.FLayerProfiling and IsOnOpenCL then
       Lines.Add('up/down = host->OpenCL / OpenCL->host transfers the layer ' +
         'issued.');
     Row := Format('%-*s', [NameWidth, 'Group']);
     if HasGroupNames then Row := Row + Format(' %-26s', ['Class']);
-    Row := Row + Format(' %4s %7s %7s %11s %10s %6s', ['Inst', 'Fwds',
-      'OpenCL', 'total ms', 'ms/pass', '%']);
+    Row := Row + Format(' %4s %7s %7s %6s %11s %10s %6s', ['Inst', 'Fwds',
+      'OpenCL', 'GPU %', 'total ms', 'ms/pass', '%']);
     {$IFDEF OpenCL}
     if NN.FLayerProfiling and IsOnOpenCL then
       Row := Row + Format(' %7s %9s %7s %9s', ['up n', 'up MB', 'down n',
@@ -113849,9 +113886,10 @@ begin
         Row := Format('%-*s', [NameWidth, GroupName]);
         if HasGroupNames then
           Row := Row + Format(' %-26s', [LayerClassName]);
-        Row := Row + Format(' %4d %7s %7s %11.2f %10.2f %6.1f', [InstanceCnt,
-          FwdStr, OpenCLStr, ForwardUs / 1000, ForwardUs / 1000 / PassCount,
-          Pct]);
+        Row := Row + Format(' %4d %7s %7s %6s %11.2f %10.2f %6.1f',
+          [InstanceCnt, FwdStr, OpenCLStr,
+           ForwardOpenCLShareStr(ForwardGPUCnt, ForwardCPUCnt),
+           ForwardUs / 1000, ForwardUs / 1000 / PassCount, Pct]);
         {$IFDEF OpenCL}
         Row := Row + TransferColumns(ProfiledTransfers);
         {$ENDIF}
@@ -113860,8 +113898,10 @@ begin
     Lines.Add(StringOfChar('-', RuleWidth));
     Row := Format('%-*s', [NameWidth, 'TOTAL']);
     if HasGroupNames then Row := Row + Format(' %-26s', ['']);
-    Row := Row + Format(' %4d %7s %7s %11.2f %10.2f %6.1f', [InstanceTotal, '',
-      '', TotalUs / 1000, TotalUs / 1000 / PassCount, 100.0]);
+    Row := Row + Format(' %4d %7s %7s %6s %11.2f %10.2f %6.1f',
+      [InstanceTotal, '', '',
+       ForwardOpenCLShareStr(ForwardGPUTotal, ForwardCPUTotal),
+       TotalUs / 1000, TotalUs / 1000 / PassCount, 100.0]);
     {$IFDEF OpenCL}
     Row := Row + TransferColumns(Transfers);
     {$ENDIF}
@@ -113871,6 +113911,30 @@ begin
       [NN.NNetForwardTime * MSecsPerDay,
        NN.NNetForwardTime * MSecsPerDay / PassCount,
        NN.NNetForwardTimeQueueOpenCL * MSecsPerDay]));
+    {$IFDEF OpenCL}
+    // Without LayerProfiling an OpenCL row charges only the enqueue, so a time
+    // share would be meaningless; RunProfiled charges each forward its kernels
+    // and drain. Min guards against counters copied in from another net.
+    if NN.FLayerProfiling then
+    begin
+      CountPct := 0;
+      if ProfiledForwardTotal > 0 then
+        CountPct := Min(100.0,
+          100.0 * ProfiledForwardOpenCLTotal / ProfiledForwardTotal);
+      TimePct := 0;
+      if ProfiledForwardUsTotal > 0 then
+        TimePct := Min(100.0,
+          100.0 * ProfiledForwardOpenCLUsTotal / ProfiledForwardUsTotal);
+      Lines.Add(Format('OpenCL path: %d of %d layer forwards (%.1f%%), ' +
+        '%.1f%% of the profiled layer time.', [ProfiledForwardOpenCLTotal,
+        ProfiledForwardTotal, CountPct, TimePct]));
+    end
+    else
+      Lines.Add(Format('OpenCL path: %d of %d forwards of layers that ' +
+        'have one (%s); LayerProfiling adds the share of all forwards and ' +
+        'of layer time.', [ForwardGPUTotal, ForwardGPUTotal + ForwardCPUTotal,
+        ForwardOpenCLShareStr(ForwardGPUTotal, ForwardCPUTotal)]));
+    {$ENDIF}
     Result := Lines.Text;
   finally
     Lines.Free;
@@ -133246,7 +133310,7 @@ var
   L: TNNetLayer;
   N, c, W, StartR, FinR: integer;
   NM1: integer;
-  PrepStart: TDateTime;
+  PrepStart, PrepTime: TDateTime;
 begin
   L := FLayers[pLayerIdx];
   // Diagnostic state: claimed/dispatched. Written once (each layer is enqueued
@@ -133294,7 +133358,10 @@ begin
     if FLayerProfiling
       then L.RunProfiled({ChunkPrep=}true)
       else L.PrepareChunkedForward();
-    L.FForwardTime := L.FForwardTime + (Now() - PrepStart);
+    PrepTime := Now() - PrepStart;
+    L.FForwardTime := L.FForwardTime + PrepTime;
+    if FLayerProfiling then
+      L.FProfiledForwardTime := L.FProfiledForwardTime + PrepTime;
     W := L.ChunkWorkCount();
     N := FSchedThreadCount;
     if N > W then N := W;
@@ -133357,6 +133424,7 @@ var
   IdleStartTick: TDateTime; // when the current idle stretch began
   HotTimeoutDays: double;   // HotThreadTimeout expressed in TDateTime days
   ChunkStart: TDateTime;    // chunk-0 timing (wall-clock forward time)
+  ChunkTime: TDateTime;
   RunLayersProfiled: boolean;
 begin
   IdleSweeps := 0;
@@ -133434,7 +133502,10 @@ begin
         L.ComputeRange(W.StartRange, W.FinRange);
         with L do
         begin
-          FForwardTime := FForwardTime + (Now() - ChunkStart);
+          ChunkTime := Now() - ChunkStart;
+          FForwardTime := FForwardTime + ChunkTime;
+          if RunLayersProfiled then
+            FProfiledForwardTime := FProfiledForwardTime + ChunkTime;
           Inc(FForwardCPUCnt);
         end;
       end
@@ -138732,19 +138803,24 @@ begin
   FForwardGPUCnt := 0;
   FForwardCPUCnt := 0;
   FProfiledForwardCnt := 0;
+  FProfiledForwardTime := 0;
+  FProfiledForwardOpenCLCnt := 0;
+  FProfiledForwardOpenCLTime := 0;
   {$IFDEF OpenCL}
   FillChar(FProfiledTransfers, SizeOf(FProfiledTransfers), 0);
   {$ENDIF}
 end;
 
 procedure TNNetLayer.RunProfiled(ChunkPrep: boolean);
-{$IFDEF OpenCL}
 var
+  ForwardTimeBefore: double;
+{$IFDEF OpenCL}
   TransfersBefore: TOpenCLTransferCounts;
   GPUCntBefore: integer;
   DrainStart: TDateTime;
 {$ENDIF}
 begin
+  ForwardTimeBefore := FForwardTime;
   {$IFDEF OpenCL}
   TransfersBefore := OpenCLThreadTransfers;
   GPUCntBefore := FForwardGPUCnt;
@@ -138764,9 +138840,16 @@ begin
     if not ChunkPrep then
       FForwardTime := FForwardTime + (Now() - DrainStart);
   end;
+  if FForwardGPUCnt <> GPUCntBefore then
+  begin
+    Inc(FProfiledForwardOpenCLCnt);
+    FProfiledForwardOpenCLTime := FProfiledForwardOpenCLTime +
+      (FForwardTime - ForwardTimeBefore);
+  end;
   AddOpenCLTransferDelta(FProfiledTransfers, OpenCLThreadTransfers,
     TransfersBefore);
   {$ENDIF}
+  FProfiledForwardTime := FProfiledForwardTime + (FForwardTime - ForwardTimeBefore);
   Inc(FProfiledForwardCnt);
 end;
 
@@ -138788,12 +138871,17 @@ procedure TNNetLayer.AddTimes(Origin: TNNetLayer);
 begin
   FBackwardTime := FBackwardTime + Origin.FBackwardTime;
   FForwardTime  := FForwardTime  + Origin.FForwardTime;
+  FProfiledForwardTime := FProfiledForwardTime + Origin.FProfiledForwardTime;
+  FProfiledForwardOpenCLTime := FProfiledForwardOpenCLTime +
+    Origin.FProfiledForwardOpenCLTime;
 end;
 
 procedure TNNetLayer.CopyTimes(Origin: TNNetLayer);
 begin
   FBackwardTime := Origin.FBackwardTime;
   FForwardTime  := Origin.FForwardTime;
+  FProfiledForwardTime := Origin.FProfiledForwardTime;
+  FProfiledForwardOpenCLTime := Origin.FProfiledForwardOpenCLTime;
 end;
 
 procedure TNNetLayer.MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer);

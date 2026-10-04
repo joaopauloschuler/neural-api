@@ -2462,7 +2462,7 @@ rather than acted on.
         terminal; one line per step when it is a pipe or a file.
   - [x] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,
         consecutive seeds, prompt encoded once.
-  - [ ] D4. `GPU %` column (forward count share) and a count/time share summary
+  - [x] D4. `GPU %` column (forward count share) and a count/time share summary
         line in `TNNet.LayerGroupTimingReport`.
   - [ ] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
         `--stats`, host<->OpenCL MB per step and per VAE tile, peak OpenCL

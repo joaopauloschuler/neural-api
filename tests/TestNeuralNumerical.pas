@@ -66832,10 +66832,28 @@ begin
         PointwiseConv.ForwardGPUCnt);
       AssertEquals('profiled forwards = passes', PassCount,
         PointwiseConv.ProfiledForwardCnt);
+      AssertEquals('profiled OpenCL forwards = passes', PassCount,
+        PointwiseConv.ProfiledForwardOpenCLCnt);
+      // Every pass ran on OpenCL, so all of the layer's time is OpenCL time.
+      AssertTrue('OpenCL forward time = layer time',
+        Abs(PointwiseConv.ProfiledForwardOpenCLTime -
+          PointwiseConv.ForwardTime) <= 1e-9 * PointwiseConv.ForwardTime);
+      AssertTrue('profiled forward time = layer time',
+        Abs(PointwiseConv.ProfiledForwardTime -
+          PointwiseConv.ForwardTime) <= 1e-9 * PointwiseConv.ForwardTime);
+      AssertTrue('report states the profiled OpenCL share',
+        Pos(' layer forwards (', TNNet.LayerGroupTimingReport(NN, [], PassCount)) > 0);
       AssertTrue('the input layer counts its uploads',
         InputLayer.ProfiledTransfers.UploadCount > 0);
       AssertTrue('upload bytes counted',
         InputLayer.ProfiledTransfers.UploadBytes >= Input.Size * 4);
+      NN.ClearTime();
+      AssertEquals('ClearTime resets the OpenCL forwards', 0,
+        PointwiseConv.ProfiledForwardOpenCLCnt);
+      AssertEquals('ClearTime resets the OpenCL time', 0,
+        PointwiseConv.ProfiledForwardOpenCLTime, 0);
+      AssertEquals('ClearTime resets the profiled time', 0,
+        PointwiseConv.ProfiledForwardTime, 0);
     finally
       Input.Free;
       NN.Free;
