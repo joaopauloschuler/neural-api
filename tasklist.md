@@ -2528,6 +2528,35 @@ rather than acted on.
         Doing (b) without (c) is worse (AddConstant would download).
         Tests: PoCL sentinel test that the split/tanh/AddConstant/ChannelMul
         chain binds (no activation upload), parity, counts.
+  - [ ] F2. Image-in net and output net on OpenCL (L4 run: image-in 880 ms +
+        output 216 ms + "outside the nets" 126 ms per step; 64 MB up + 64 MB
+        down per step). Arm FImageInNet and FOutputNet in the step net's
+        context (EnableOpenCLInContextOf(FBlockStore[0], ...)), run block 0 as
+        FStepNet.ComputeFromLayerOutput(FImageInNet.GetLastLayer()) and the head
+        as FOutputNet.ComputeFromLayerOutput(FStepNet.GetLastLayer()), download
+        only the velocity. Check first that a net whose weights come from a
+        host-only build owner (FImageInOwner/FOutputOwner) can arm its own
+        buffers.
+  - [ ] F3. Per-layer residency statistic in LayerGroupTimingReport, counted in
+        TNNetLayer.RunProfiled only (zero cost without profiling): per layer,
+        forwards whose source was bound in OpenCL memory / pulled to RAM /
+        activation-uploaded / host forward with a resident-only source (stale
+        suspect) / output left resident; plus a net-level "transfers outside
+        layer rows" line from OpenCLProcessTransferTotals. Source lists built
+        in SetLayerProfiling(true) (no alloc in Compute). PoCL tests incl. a
+        deliberate stale-read layer.
+  - [ ] F4. VAE mid-block attention as one non-causal TNNetFusedSDPA reading the
+        QKV slab (as the transformer block does: BeginIncrementalDecode(N)
+        before AddLayer, TruncateCache(0) per tile pass), replacing the split /
+        TNNetScaledDotProductAttention (host softmax, 4 uploads + 3 blocking
+        downloads per pass) / one-input TNNetDeepConcat. Check
+        NonCausalTilesFit at the VAE width on 48 KB local memory.
+  - [ ] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
+        beta=0 on every block weight swap (20 MB per image): weightless variant
+        or no re-upload when unchanged.
+  - [ ] F6. VAE weights shared across the tile-shape nets: each of the 4 nets
+        prepares and uploads the same 945 MB of conv weights (weight prep
+        11.3 s of the 26.2 s decode on the L4).
   Phase E — speed gap against other implementations:
   - [ ] E1. The Unsloth build of Qwen-Image-2.1 is reported to be at least 20x
         faster than ours (our L4 int8 1024^2, 10 steps, --profile, 2026-10-04:
