@@ -132,6 +132,9 @@ const
 type
   TNNetLayer = class;
   TNNet = class;
+  {$IFDEF OpenCL}
+  TNNetFusedSDPACL = class;
+  {$ENDIF}
 
   // 2-D dynamic double matrix used by TNNetSpectralConv2D's separable 2-D FFT
   // (open arrays cannot be multi-dimensional, so a named type is required).
@@ -4334,6 +4337,7 @@ type
     // scale-BLOCK granularity rather than per-token). Serialized in FStruct[4]
     // (old saved models load with 0 = equality, bit-identical). Coded by Claude (AI).
     FBlockCausalSeg: boolean;
+    FKeepAttentionWeights: boolean; // see KeepAttentionWeights
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -4426,7 +4430,13 @@ type
     FQRowBuf: TNNetVolume;
     FKInterBuf: TNNetVolume;
     FVRowBuf: TNNetVolume;
+    // Flash attention for ComputeFlashOpenCL and TNNetFusedSDPA's cached
+    // forward; nil until EnableOpenCL.
+    FFusedSDPACL: TNNetFusedSDPACL;
     procedure ComputeOpenCL();
+    // The whole forward on cai_sdpa_flash with the source bound when resident;
+    // the output stays in OpenCL memory. The caller checks WillOpenCL.
+    procedure ComputeFlashOpenCL();
     {$ENDIF}
     // True when score (query i, key j) is masked out (causal / sliding-window /
     // bidirectional-window / segment / prefix-LM). Extracted so the CPU and
@@ -4547,10 +4557,17 @@ type
     procedure Backpropagate(); override;
     procedure AppendInputLayers(pList: TList); override;
     {$IFDEF OpenCL}
-    // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
-    // Q/K packing buffers, then flags this layer to offload the prefill score
-    // matmul. Coded by Claude (AI).
+    // Allocates FDotCL, the Q/K packing buffers and (exact class only, trainable
+    // nets too: a few kernel handles) the flash helper. Coded by Claude (AI).
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    // Flash runs when: not trainable, no KV cache, segment ids, prefix-LM or
+    // bidirectional window, window only if causal, resident source or SeqLen >= 32.
+    function WillOpenCL(): boolean; override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    // The flash helper, nil until EnableOpenCL; tests set its overrides.
+    property FusedSDPACL: TNNetFusedSDPACL read FFusedSDPACL;
     {$ENDIF}
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
     // caches for at most MaxContext positions and starts an empty sequence.
@@ -4670,10 +4687,12 @@ type
     procedure DisableTiledForward();
     property TiledForward: boolean read FTiledForward;
     property TileBc: integer read FTileBc;
-    // Read-only access to the post-softmax attention map populated by
-    // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
-    // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
+    // Post-softmax map, X = key j, Y = query i (rows sum to 1); only the host
+    // paths fill it, so a reader sets KeepAttentionWeights on an OpenCL net.
     property AttentionWeights: TNNetVolume read FAttn;
+    // True keeps the forward off the flash kernel so AttentionWeights is filled.
+    property KeepAttentionWeights: boolean read FKeepAttentionWeights
+      write FKeepAttentionWeights;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property Window: integer read FWindow;
@@ -4705,8 +4724,10 @@ const
   // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
   // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
   csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8.
+  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
+  // widest head they take (16 column chunks of 256).
   csFusedSDPAFlashLanes = 256;
+  csFusedSDPAFlashMaxDk = 4096;
 
 type
   // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
@@ -4752,6 +4773,7 @@ type
     // The last flash launch's tiles and key splits, test-only split count and
     // flash row threshold (0 = automatic), and the path of the last forward.
     FLastQueryTileRows, FLastKeyTileRows, FLastFlashSplits: integer;
+    FLastColChunks: integer;
     FForcedFlashSplits, FForcedFlashMinTokens: integer;
     FLastPath: TFusedSDPAOpenCLPath;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
@@ -4905,6 +4927,11 @@ type
       const RowKeyEnds: array of integer; RowKeyEndsVersion: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // One head over X = (TokenCnt, 1, [Q|K|V]): copies K and V into the FP32
+    // cache buffers (CacheMax = TokenCnt), then runs cai_sdpa_flash.
+    procedure ComputeFlashPacked(X, Y: TNNetVolume; Dk, Window: integer;
+      Causal: boolean; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
     // The same over the int8 cache on cai_sdpa_flash_int8 (ComputeInt8's append).
     procedure ComputeFlashInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
@@ -4931,13 +4958,21 @@ type
     property LastQueryTileRows: integer read FLastQueryTileRows;
     property LastKeyTileRows: integer read FLastKeyTileRows;
     property LastFlashSplits: integer read FLastFlashSplits;
+    property LastColChunks: integer read FLastColChunks;
     property ForcedFlashSplits: integer read FForcedFlashSplits
       write FForcedFlashSplits;
     property ForcedFlashMinTokens: integer read FForcedFlashMinTokens
       write FForcedFlashMinTokens;
     property LastPath: TFusedSDPAOpenCLPath read FLastPath;
   end;
+
+// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
+// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
+function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
+  Dk: integer): boolean;
 {$ENDIF}
+
+type
 
   /// Fused multi-head scaled-dot-product attention (GQA-aware): ALL query
   /// heads of one attention sub-layer in ONE layer, replacing the per-head
@@ -4998,9 +5033,6 @@ type
     // the ends only when they change.
     FRowKeyEndsVersion: integer;
     {$IFDEF OpenCL}
-    // Cached-decode forward in OpenCL memory (append, split-row attention,
-    // merge), with the KV cache resident and appended in place.
-    FFusedSDPACL: TNNetFusedSDPACL;
     // True while the live KV cache sits in FFusedSDPACL's buffers rather than
     // in FKCache/FVCache. Every host reader or mutator goes through
     // ForceCacheOnRAM; the OpenCL forward calls EnsureCacheOnOpenCL.
@@ -5093,8 +5125,6 @@ type
     // The OpenCL kernels a step of TokenCnt rows takes once WillOpenCL's
     // scope holds; sdpaPathNone when none fits (the host path runs).
     function OpenCLPathFor(TokenCnt: integer): TFusedSDPAOpenCLPath;
-    function OpenCLOutputBuffer(): cl_mem; override;
-    function OpenCLOutputKernel(): TNeuralKernel; override;
     // K's rows then V's rows (AppendCacheRowsFrom's shapes) in a new buffer
     // in this layer's OpenCL context; the caller releases its Buffer.
     function NewCacheRowsOnOpenCL(K, V: TNNetVolume): TNNetKVRowsOnOpenCL;
@@ -5103,8 +5133,6 @@ type
     procedure AppendCacheRowsFromOpenCL(const KVRows: TNNetKVRowsOnOpenCL);
     // True while the live KV cache sits in FFusedSDPACL's buffers.
     property CacheOnOpenCL: boolean read FCacheOnOpenCL;
-    // The decode helper, nil until EnableOpenCL; tests set its split overrides.
-    property FusedSDPACL: TNNetFusedSDPACL read FFusedSDPACL;
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
@@ -33732,6 +33760,11 @@ end;
 
 { TNNetScaledDotProductAttention }
 
+const
+  // Shortest sequence whose attention leaves the host when its source is in
+  // RAM: below it the upload and the launches outweigh the matmuls.
+  csSDPAOpenCLMinSeqLen = 32;
+
 constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
   pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean;
   pSegmentSource: TNNetLayer);
@@ -33804,6 +33837,9 @@ begin
   if Assigned(FQRowBuf) then FQRowBuf.Free;
   if Assigned(FKInterBuf) then FKInterBuf.Free;
   if Assigned(FVRowBuf) then FVRowBuf.Free;
+  // The helper owns the buffer a kept output sits in.
+  if Assigned(FFusedSDPACL) then ForceOutputOnRAM();
+  FreeAndNil(FFusedSDPACL);
   {$ENDIF}
   inherited Destroy();
 end;
@@ -34628,6 +34664,57 @@ begin
   // TNNetALiBiAttention.EnableOpenCL); a variant without one falls back to its
   // own correct CPU Compute() (FShouldOpenCL stays false). Coded by Claude (AI).
   FShouldOpenCL := (Self.ClassType = TNNetScaledDotProductAttention);
+  if FShouldOpenCL and (not Assigned(FFusedSDPACL)) then
+    FFusedSDPACL := TNNetFusedSDPACL.Create(FNN);
+end;
+
+procedure TNNetScaledDotProductAttention.DisableOpenCL();
+begin
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FFusedSDPACL);
+end;
+
+function TNNetScaledDotProductAttention.WillOpenCL(): boolean;
+var
+  SeqLen: integer;
+begin
+  Result := Assigned(FFusedSDPACL) and FHasOpenCL and FShouldOpenCL
+    and (Self.ClassType = TNNetScaledDotProductAttention)
+    and (not FIsTrainable) and (not FKeepAttentionWeights)
+    and (not FCacheEnabled) and Assigned(FPrevLayer)
+    and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
+    and (not FBidirectionalWindow) and (FCausal or (FWindow = 0));
+  if not Result then exit;
+  SeqLen := FPrevLayer.FOutput.SizeX;
+  Result := (PrevOutputOnOpenCL() or (SeqLen >= csSDPAOpenCLMinSeqLen))
+    and FFusedSDPACL.FlashTilesFit(FDk, {Int8KV=}false)
+    and FusedSDPAFlashIndicesFit(1, 1, SeqLen, SeqLen, FDk);
+end;
+
+procedure TNNetScaledDotProductAttention.ComputeFlashOpenCL();
+var
+  SourceBuffer: cl_mem;
+  StartTime: double;
+begin
+  StartTime := Now();
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FFusedSDPACL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk, FWindow,
+    FCausal, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 // Forward: BOTH matmuls (Q.K^T and P.V) on the device, masking + softmax on the
@@ -34777,9 +34864,6 @@ end;
 
 procedure TNNetScaledDotProductAttention.Compute();
 const
-  // Minimum prefill sequence length to offload the score matmul to OpenCL;
-  // below this the kernel launch + Q/K upload cost outweighs the matmul.
-  csSDPAOpenCLMinSeqLen = 32;
   // Floor used to detect a fully-masked query row. The additive mask sentinel
   // is -1e9; real scaled dot products of normal activations are O(1), so any
   // row whose maximum score is <= -1e8 can only have come from every key being
@@ -34799,6 +34883,15 @@ var
   HasSeg, HasSoftCap: boolean;
 begin
   {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeFlashOpenCL();
+    exit;
+  end;
+  // Every path below writes Output on the host.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FSegLayer) then FSegLayer.ForceOutputOnRAM();
   {$ENDIF}
@@ -35848,7 +35941,7 @@ begin
   // both host copies have to be recovered before it goes.
   ForceOutputOnRAM();
   ForceCacheOnRAM();
-  if Assigned(FFusedSDPACL) then FFusedSDPACL.Free;
+  FreeAndNil(FFusedSDPACL);
   {$ENDIF}
   inherited Destroy();
 end;
@@ -35871,6 +35964,7 @@ end;
 procedure TNNetFusedSDPA.DisableOpenCL();
 begin
   ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
   ForceCacheOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FFusedSDPACL);
@@ -35914,7 +36008,8 @@ var
 begin
   Result := sdpaPathNone;
   if not Assigned(FFusedSDPACL) then exit;
-  FlashFits := FFusedSDPACL.FlashTilesFit(FDk, FKVQuantInt8);
+  FlashFits := FFusedSDPACL.FlashTilesFit(FDk, FKVQuantInt8) and
+    FusedSDPAFlashIndicesFit(FQHeads, FKVHeads, TokenCnt, FCacheMax, FDk);
   // The split decode expresses neither mask: flash or the host.
   if FCachedForwardNonCausal or (Length(FRowKeyEnds) > 0) then
   begin
@@ -35968,13 +36063,13 @@ begin
   Inc(FCacheLen, RowCount);
 end;
 
-function TNNetFusedSDPA.OpenCLOutputBuffer(): cl_mem;
+function TNNetScaledDotProductAttention.OpenCLOutputBuffer(): cl_mem;
 begin
   if Assigned(FFusedSDPACL) then Result := FFusedSDPACL.ResultBuffer()
   else Result := nil;
 end;
 
-function TNNetFusedSDPA.OpenCLOutputKernel(): TNeuralKernel;
+function TNNetScaledDotProductAttention.OpenCLOutputKernel(): TNeuralKernel;
 begin
   if Assigned(FFusedSDPACL) then Result := FFusedSDPACL.OutputKernel()
   else Result := nil;
@@ -40007,28 +40102,35 @@ begin
   Result := (Count + 3) and (not 3);
 end;
 
-// The flash kernels' tile rows, key rows (0 = Dk unsupported) and local-memory
-// floats at head dimension Dk for the named cache format, derived as the kernel does.
+// The flash kernels' tile rows, key rows (0 = Dk unsupported), output columns
+// per work-group and local-memory floats at head dimension Dk, as the kernel.
 procedure FusedSDPAFlashTiles(Dk: integer; Int8KV: boolean;
-  out QueryTileRows, KeyTileRows, ScratchFloats: integer);
+  out QueryTileRows, KeyTileRows, ColChunk, ScratchFloats: integer);
 var
-  Dk4, SliceCols, ValueRows: integer;
+  Dk4, SliceCols, ValueRows, ColChunks, ColChunk4: integer;
 begin
   Dk4 := RoundUpTo4(Dk);
   QueryTileRows := 0;
   KeyTileRows := 0;
+  ColChunk := 0;
   ScratchFloats := 0;
-  if Dk4 > 256 then exit;
-  if Dk4 <= 128 then QueryTileRows := 64 else QueryTileRows := 32;
+  if (Dk < 1) or (Dk4 > csFusedSDPAFlashMaxDk) then exit;
+  // Equal column chunks of at most 256: each work-group recomputes the scores
+  // over all of Dk and owns ColChunk columns of V and of the output.
+  ColChunks := (Dk4 + 255) div 256;
+  ColChunk := RoundUpTo4((Dk + ColChunks - 1) div ColChunks);
+  ColChunk4 := Min(ColChunk, Dk4);
+  if ColChunk4 <= 128 then QueryTileRows := 64 else QueryTileRows := 32;
   KeyTileRows := 64;
   if Dk4 <= 72 then SliceCols := Dk4 else SliceCols := 64;
-  if Dk4 <= 72 then ValueRows := 64
-  else if Dk4 <= 128 then ValueRows := 32
+  if ColChunk4 <= 72 then ValueRows := 64
+  else if ColChunk4 <= 128 then ValueRows := 32
   else ValueRows := 16;
   // Region A (Q slice, then V slice), region B (K slice, then P), 16 row
   // partials, one rescale factor and the row max per row, then the row table
   // (X/Y offsets, lo, hi).
-  ScratchFloats := Max(QueryTileRows * (SliceCols + 4), ValueRows * (Dk4 + 4))
+  ScratchFloats := Max(QueryTileRows * (SliceCols + 4),
+    ValueRows * (ColChunk4 + 4))
     + Max(KeyTileRows * (SliceCols + 4), QueryTileRows * (KeyTileRows + 4))
     + QueryTileRows * 18 + 4 * QueryTileRows;
   // The int8 cache's K and V row scales of one key tile.
@@ -40037,12 +40139,13 @@ end;
 
 function TNNetFusedSDPACL.FlashTilesFit(Dk: integer; Int8KV: boolean): boolean;
 var
-  QueryTileRows, KeyTileRows, ScratchFloats: integer;
+  QueryTileRows, KeyTileRows, ColChunk, ScratchFloats: integer;
 begin
   Result := Assigned(FFlashKernels[Int8KV]) and
     (FFlashMaxWorkGroupSize[Int8KV] >= csFusedSDPAFlashLanes);
   if not Result then exit;
-  FusedSDPAFlashTiles(Dk, Int8KV, QueryTileRows, KeyTileRows, ScratchFloats);
+  FusedSDPAFlashTiles(Dk, Int8KV, QueryTileRows, KeyTileRows, ColChunk,
+    ScratchFloats);
   Result := (QueryTileRows > 0) and (ScratchFloats <=
     LocalMemFloatsBeside(FFlashStaticLocalBytes[Int8KV]));
 end;
@@ -40067,6 +40170,13 @@ begin
   FKernel.WriteBufferAt(FBufRowKeyEnds, 0, Bytes, @RowKeyEnds[0], CL_TRUE);
   FRowKeyEndsVersion := Version;
   FRowKeyEndCnt := RowCnt;
+end;
+
+function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
+  Dk: integer): boolean;
+begin
+  Result := (int64(KVHeads) * CacheMax * Dk < High(longint)) and
+    (int64(QHeads) * TokenCnt * (Dk + 2) < High(longint));
 end;
 
 procedure TNNetFusedSDPACL.ChooseFlashSplits(RowGroups, SpanKeys: integer;
@@ -40136,14 +40246,17 @@ var
   bufPartials, bufY, bufEnds: cl_mem;
   kFlash: cl_kernel;
   TokenCnt, XStride, YStride, RowTiles, NextArg: integer;
-  QueryTileRows, KeyTileRows, ScratchFloats: integer;
+  QueryTileRows, KeyTileRows, ScratchFloats, ColChunks: integer;
   MaskMode, KeySplits, SplitKeys, ColChunk, SpanBase, SpanKeys: integer;
+  MaxKeySplits: int64;
 begin
   kFlash := FFlashKernels[Int8KV];
   TokenCnt := X.SizeX;
   XStride := X.Depth;
   YStride := Y.Depth;
-  FusedSDPAFlashTiles(Dk, Int8KV, QueryTileRows, KeyTileRows, ScratchFloats);
+  FusedSDPAFlashTiles(Dk, Int8KV, QueryTileRows, KeyTileRows, ColChunk,
+    ScratchFloats);
+  ColChunks := (Dk + ColChunk - 1) div ColChunk;
   RowTiles := (TokenCnt * GroupSize + QueryTileRows - 1) div QueryTileRows;
   bufEnds := nil;
   if Length(RowKeyEnds) > 0 then
@@ -40158,9 +40271,17 @@ begin
   // as an argument, so both sides cut the splits alike.
   FusedSDPAFlashSpan(MaskMode, TokenCnt, CacheSlot, Window, RowKeyEnds,
     SpanBase, SpanKeys);
-  ChooseFlashSplits(KVHeads * RowTiles, SpanKeys, KeySplits, SplitKeys);
-  ColChunk := Dk;
+  ChooseFlashSplits(KVHeads * RowTiles * ColChunks, SpanKeys, KeySplits,
+    SplitKeys);
+  // The kernel indexes the partials in 32 bits.
+  MaxKeySplits := Max(1, High(longint) div (int64(QHeads) * TokenCnt * (Dk + 2)));
+  if KeySplits > MaxKeySplits then
+  begin
+    KeySplits := MaxKeySplits;
+    SplitKeys := (SpanKeys + KeySplits - 1) div KeySplits;
+  end;
   FLastQueryTileRows := QueryTileRows;
+  FLastColChunks := ColChunks;
   FLastKeyTileRows := KeyTileRows;
   FLastFlashSplits := KeySplits;
   FLastScratchBytes := csize_t(ScratchFloats) * csNeuralFloatSize;
@@ -40206,7 +40327,7 @@ begin
   clSetKernelArg(kFlash, NextArg + 1, csCLMemSize, @bufPartials);
   clSetKernelArg(kFlash, NextArg + 2, FLastScratchBytes, nil);
   FKernel.RunKernel2D(kFlash, csFusedSDPAFlashLanes,
-    KVHeads * RowTiles * KeySplits, csFusedSDPAFlashLanes, 1);
+    KVHeads * RowTiles * KeySplits * ColChunks, csFusedSDPAFlashLanes, 1);
   if KeySplits > 1 then
     RunMerge(bufPartials, bufY, QHeads, TokenCnt, KeySplits, Dk, YStride);
   FLastPath := sdpaPathFlash;
@@ -40229,6 +40350,28 @@ begin
   RunFlash(X, Y, bufX, {Int8KV=}false, QHeads, KVHeads, GroupSize, Dk,
     CacheMax, CacheSlot, Window, Causal, RowKeyEnds, RowKeyEndsVersion,
     InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufK, bufV, pKeepResultOnOpenCL);
+end;
+
+procedure TNNetFusedSDPACL.ComputeFlashPacked(X, Y: TNNetVolume;
+  Dk, Window: integer; Causal: boolean;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+var
+  bufX: cl_mem;
+  TokenCnt: integer;
+  CacheBytes: csize_t;
+begin
+  TokenCnt := X.SizeX;
+  CacheBytes := csize_t(TokenCnt) * Dk * csNeuralFloatSize;
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, CacheBytes);
+  FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, CacheBytes);
+  RunAppend(bufX, FBufK, FBufV, {KVHeads=}1, TokenCnt, Dk,
+    {CacheMax=}TokenCnt, {CacheSlot=}0, {QW=}Dk, {KVOffset=}Dk, X.Depth);
+  RunFlash(X, Y, bufX, {Int8KV=}false, {QHeads=}1, {KVHeads=}1,
+    {GroupSize=}1, Dk, {CacheMax=}TokenCnt, {CacheSlot=}0, Window, Causal,
+    [], 0, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, FBufK, FBufV,
+    pKeepResultOnOpenCL);
 end;
 
 procedure TNNetFusedSDPACL.ComputeFlashInt8(X, Y: TNNetVolume;
@@ -46341,9 +46484,9 @@ begin
   {$IFDEF OpenCL}
   // Prefill matmuls on the device when OpenCL is enabled and the sequence is
   // long enough to amortize the upload/dispatch (mirrors the parent's gate;
-  // the width-1 cached decode path above stays on the CPU). 32 = the parent's
-  // csSDPAOpenCLMinSeqLen.
-  if FHasOpenCL and FShouldOpenCL and (FPrevLayer.FOutput.SizeX >= 32) then
+  // the width-1 cached decode path above stays on the CPU).
+  if FHasOpenCL and FShouldOpenCL and
+     (FPrevLayer.FOutput.SizeX >= csSDPAOpenCLMinSeqLen) then
   begin
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
@@ -113737,6 +113880,7 @@ var
   NNLastIdx, BinsMax, SeqLenMax, AttnDepth, pos: integer;
   AttnLayer: TNNetScaledDotProductAttention;
   AttnMap: TNNetVolume;
+  WasKeepingWeights: boolean;
   P, RowEntropy, RowMaxH, NormH, Sum, SumSq: TNeuralFloat;
   Mean, Variance, Std, LogSeq, MaxRowH: TNeuralFloat;
   RowCount, DeadRows, SpikeRows, AttnLayerCount, Reported: integer;
@@ -113790,6 +113934,8 @@ begin
       if not (NN.Layers[LayerIdx] is TNNetScaledDotProductAttention) then
         Continue;
       AttnLayer := TNNetScaledDotProductAttention(NN.Layers[LayerIdx]);
+      WasKeepingWeights := AttnLayer.KeepAttentionWeights;
+      AttnLayer.KeepAttentionWeights := true;
 
       Sum := 0;
       SumSq := 0;
@@ -113858,6 +114004,7 @@ begin
           Inc(Bins[BinIdx]);
         end;
       end;
+      AttnLayer.KeepAttentionWeights := WasKeepingWeights;
 
       if RowCount = 0 then
       begin

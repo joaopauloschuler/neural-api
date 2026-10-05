@@ -30393,9 +30393,9 @@ end;
 // The pico decoder with OpenCL armed vs the CPU on the 4x4 latent: tiled
 // 32/16 (four tile shapes, each net armed in the one context of EnableOpenCL),
 // then whole, serial (parallel + OpenCL is slow on PoCL; the pipeline test
-// covers it). Only the FP32 summation order differs (measured 3.9e-6, 2.1e-6);
+// covers it). Only the FP32 summation order differs (measured 1.0e-5, 2.3e-6);
 // tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget. Every 3x3
-// conv binds a resident source; only the attention leaves OpenCL memory.
+// conv and the mid-block attention bind resident sources.
 procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCL;
 {$IFDEF OpenCL}
 const
@@ -30409,7 +30409,7 @@ var
   DeviceId: cl_device_id;
   LayerPos, ConvCount, ConvOnOpenCLCount: integer;
   BoundSpatialConvCount, HostSourceSpatialConvCount: integer;
-  ImplicitConvCount: integer;
+  ImplicitConvCount, AttnCount: integer;
   Layer: TNNetLayer;
   MaxDiff: double;
   Transfers, NoTransfers: TOpenCLTransferCounts;
@@ -30517,10 +30517,30 @@ begin
       Transfers.DownloadBytes, ' B)');
     AssertEquals('3x3 convs that read a host source', 0,
       HostSourceSpatialConvCount);
-    // The mid-block attention runs on the host: it downloads its Q|K|V input
-    // and the projection after it uploads; the latent is the other upload.
-    AssertEquals('uploads per decode', 2, Transfers.UploadCount);
-    AssertEquals('downloads per decode', 1, Transfers.DownloadCount);
+    // The mid-block attention, its one-input concat and the out-projection
+    // bind resident sources: the latent is the only transfer.
+    AssertEquals('uploads per decode', 1, Transfers.UploadCount);
+    AssertEquals('downloads per decode', 0, Transfers.DownloadCount);
+    AttnCount := 0;
+    for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() - 2 do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      if Layer.ClassType <> TNNetScaledDotProductAttention then continue;
+      Inc(AttnCount);
+      AssertEquals('attention bound its source', 1,
+        Layer.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('attention output resident', 1,
+        Layer.ProfiledResidency.OutputResidentCnt);
+      AssertTrue('a concat follows the attention',
+        Decoder.Net.Layers[LayerPos + 1] is TNNetDeepConcat);
+      AssertEquals('the concat bound the attention', 1,
+        Decoder.Net.Layers[LayerPos + 1].ProfiledResidency.SourceBoundCnt);
+      AssertEquals('the concat output resident', 1,
+        Decoder.Net.Layers[LayerPos + 1].ProfiledResidency.OutputResidentCnt);
+      AssertEquals('the out-projection bound the concat', 1,
+        Decoder.Net.Layers[LayerPos + 2].ProfiledResidency.SourceBoundCnt);
+    end;
+    AssertEquals('mid-block attentions', 1, AttnCount);
     // A rebuilt net under LayerProfiling: phase report with arming, buffers
     // counted while armed and none left after DisableOpenCL.
     Decoder.ReleaseNet();

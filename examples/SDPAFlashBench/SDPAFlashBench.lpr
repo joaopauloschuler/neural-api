@@ -420,10 +420,10 @@ begin
       'mode=%s cache=%s, %d live keys per row on average', [QHeads, KVHeads,
       Dk, TokenCnt, PrefixLen, Window, BoolToStr(Causal, 'causal', 'none'),
       BoolToStr(Int8KV, 'int8', 'fp32'), LiveKeys div TokenCnt]));
-    WriteLn('    tiles  splits  local B  private B       ms   TFLOPS');
+    WriteLn('    tiles col chunks  splits  local B  private B       ms   TFLOPS');
     Ms := TimeForwards(Helper, Shape, {Decode=}false);
-    WriteLn(Format('  %3dx%-3d %6d %8d %10s %8.3f %8.2f', [
-      Helper.LastQueryTileRows, Helper.LastKeyTileRows,
+    WriteLn(Format('  %3dx%-3d %10d %7d %8d %10s %8.3f %8.2f', [
+      Helper.LastQueryTileRows, Helper.LastKeyTileRows, Helper.LastColChunks,
       Helper.LastFlashSplits, int64(Helper.LastScratchBytes),
       PrivateMemText(Helper), Ms, Tflops(LiveKeys, Ms)]));
   finally

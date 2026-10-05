@@ -3508,7 +3508,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 
 // FLASH ATTENTION OVER THE KV CACHE (TNNetFusedSDPA): the arguments of
 // cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
-// arguments (FColChunk = FDk only; FKeySplits > 1 writes partials).
+// arguments (FColChunk: output columns per work-group, a multiple of 4 up to
+// 256; FKeySplits > 1 writes partials).
 #define CAI_FLASH_LEADING_PARAMS \
   const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
   const int FDk, const int FCacheMax, const int FKeyBase, \
@@ -3711,26 +3712,27 @@ static inline void cai_flash_store4(__global float* Row, const int c,
   if (c + 3 < Cols) Row[c + 3] = y.s3;
 }
 
-// Copies output tile rows up to MaxRowPos to Out in a loop that is not
-// unrolled (PoCL 5.0 mis-addresses several divergent stores in an unrolled
-// pass); Partials also writes each row's max and sum before its acc[0].
+// Copies output tile rows up to MaxRowPos to columns ColBase.. (Cols4 float4,
+// clipped to FDk) of Out in a loop that is not unrolled (PoCL 5.0 mis-addresses
+// several divergent stores in an unrolled pass); Partials with ColBase 0 also
+// writes each row's max and sum before its acc[0].
 static inline void cai_flash_copy_out(__local const float4* Tile,
   const int TileStride4, __local const int* OutOffsets,
   __local const float4* RowPart, __local const float* RowMax, const int Br,
-  const int MaxRowPos, const int Cols4, const int FDk, const int Partials,
-  __global float* Out, const int lid, const int Lanes)
+  const int MaxRowPos, const int ColBase, const int Cols4, const int FDk,
+  const int Partials, __global float* Out, const int lid, const int Lanes)
 {
   for (int r = lid >> 4; r < Br; r += Lanes >> 4)
   {
     const int OutOffset = OutOffsets[r];
-    if (Partials && (r <= MaxRowPos) && ((lid & 15) == 0))
+    if (Partials && (ColBase == 0) && (r <= MaxRowPos) && ((lid & 15) == 0))
     {
       Out[OutOffset - 2] = RowMax[r];
       Out[OutOffset - 1] = cai_flash_sum16(RowPart + r * 4);
     }
     for (int c = lid & 15; c < Cols4; c += 16)
       if (r <= MaxRowPos)
-        cai_flash_store4(Out + OutOffset, c << 2, FDk,
+        cai_flash_store4(Out + OutOffset + ColBase, c << 2, FDk - ColBase,
           Tile[r * TileStride4 + c]);
   }
 }
@@ -3764,8 +3766,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
 #define CAI_FLASH_V_SCALE(Key) \
   CAI_FLASH_INT8_SCALE_TILE[CAI_FLASH_KEY_TILE + (Key)]
 
-// Dk <= 256, tiles as FusedSDPAFlashTiles; the macro arguments name the cache
-// format (int8: K scale on the dot, V scale on p, l sums unscaled p). Claude (AI).
+// Tiles as FusedSDPAFlashTiles; the macro arguments name the cache format
+// (int8: K scale on the dot, V scale on p, l sums unscaled p). Claude (AI).
 #define CAI_FLASH_BODY(KVType, KSrc, VSrc, Stage, StageScales, KScaleAt, \
   VScaleAt) \
 { \
@@ -3776,10 +3778,12 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   const int Lanes = CAI_FLASH_LANES; \
   const int RowLanes = Lanes >> 4; \
   const int Dk4 = (FDk + 3) & ~3; \
-  const int MaxCol4Pos = (Dk4 >> 2) - 1; \
-  const int Br = (Dk4 <= 128) ? 64 : 32; \
+  /* Q.K^T runs over all of Dk; V and O over this work-group's column chunk, \
+     whose nominal width ColChunk4 sets the tiles of every work-group. */ \
+  const int ColChunk4 = (min(FColChunk, FDk) + 3) & ~3; \
+  const int Br = (ColChunk4 <= 128) ? 64 : 32; \
   const int Ds = (Dk4 <= 72) ? Dk4 : 64; \
-  const int Bv = (Dk4 <= 72) ? 64 : ((Dk4 <= 128) ? 32 : 16); \
+  const int Bv = (ColChunk4 <= 72) ? 64 : ((ColChunk4 <= 128) ? 32 : 16); \
   const int OutColShift = (Br == 64) ? 4 : 5; \
   const int OutColLanes = 1 << OutColShift; \
   const int OutRowLanes = Lanes >> OutColShift; \
@@ -3788,13 +3792,16 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   const int RowTiles = (FTokenCnt * FGroupSize + Br - 1) / Br; \
   const int ColChunks = (FDk + FColChunk - 1) / FColChunk; \
   const int TileId = get_group_id(1) / (FKeySplits * ColChunks); \
-  const int Split = \
-    (get_group_id(1) - TileId * FKeySplits * ColChunks) / ColChunks; \
+  const int SplitChunk = get_group_id(1) - TileId * FKeySplits * ColChunks; \
+  const int Split = SplitChunk / ColChunks; \
+  const int ColBase = (SplitChunk - Split * ColChunks) * FColChunk; \
+  const int MaxCol4Pos = \
+    ((min(FColChunk, FDk - ColBase) + 3) >> 2) - 1; \
   const int g = TileId / RowTiles; \
   if (g >= FKVHeads) return; \
   const int Row0 = (TileId - g * RowTiles) * Br; \
   const int SliceStride4 = (Ds >> 2) + 1; \
-  const int VStride4 = (Dk4 >> 2) + 1; \
+  const int VStride4 = (ColChunk4 >> 2) + 1; \
   const int PStride4 = (CAI_FLASH_KEY_TILE >> 2) + 1; \
   __local float4* RegionA = FScratch; \
   __local float4* RegionB = \
@@ -3900,8 +3907,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
  \
     /* Every Q and K read is done: V slice 0 replaces the Q slice and P the K \
        slice; O is rescaled only for rows whose max grew. */ \
-    Stage(VPlane + kt * FDk, 0, Bv, KeysLive, MaxCol4Pos + 1, FDk, KAligned, \
-      RegionA, VStride4, lid, Lanes); \
+    Stage(VPlane + kt * FDk, ColBase, Bv, KeysLive, MaxCol4Pos + 1, FDk, \
+      KAligned, RegionA, VStride4, lid, Lanes); \
     _Pragma("unroll") \
     for (i = 0; i < CAI_FLASH_SLOTS; i++) \
       if (sy + RowLanes * i < Br) \
@@ -3945,7 +3952,7 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
       if (vs > 0) \
       { \
         barrier(CLK_LOCAL_MEM_FENCE); \
-        Stage(VPlane + (kt + vs * Bv) * FDk, 0, Bv, ValueRowsLive, \
+        Stage(VPlane + (kt + vs * Bv) * FDk, ColBase, Bv, ValueRowsLive, \
           MaxCol4Pos + 1, FDk, KAligned, RegionA, VStride4, lid, Lanes); \
         barrier(CLK_LOCAL_MEM_FENCE); \
       } \
@@ -3985,7 +3992,7 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
       RowMax[sy + RowLanes * i] = m[i]; \
     } \
   barrier(CLK_LOCAL_MEM_FENCE); \
-  /* Regions A and B become the output tile (Br rows of Dk4/4 + 1 float4); \
+  /* Regions A and B become the output tile (Br rows of VStride4 float4); \
      a column past Dk stores into the row's pad column. */ \
   _Pragma("unroll") \
   for (i = 0; i < CAI_FLASH_SLOTS; i++) \
@@ -4000,7 +4007,7 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   } \
   barrier(CLK_LOCAL_MEM_FENCE); \
   cai_flash_copy_out(RegionA, VStride4, RowTable + Br, RowPart, RowMax, Br, \
-    min(MaxRowPos, Br - 1), MaxCol4Pos + 1, FDk, FKeySplits > 1, \
+    min(MaxRowPos, Br - 1), ColBase, MaxCol4Pos + 1, FDk, FKeySplits > 1, \
     (FKeySplits > 1) ? FPartials : FY, lid, Lanes); \
 }
 

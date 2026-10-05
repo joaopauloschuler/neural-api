@@ -467,6 +467,11 @@ type
     // cai_sdpa_flash_int8 vs the CPU int8 path, causal and non-causal (Dk 5
     // to 256, GQA, windows, splits), with the int8 scratch layout pinned.
     procedure FusedSDPAFlashInt8OpenCLParity;
+    // Flash over heads wider than 256 in output column chunks.
+    procedure FusedSDPAFlashColumnChunksOpenCLParity;
+    // TNNetScaledDotProductAttention on cai_sdpa_flash vs the CPU, with the
+    // residency of the attention, the concat and the out-projection.
+    procedure ScaledDotProductAttentionFlashOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -75605,8 +75610,9 @@ var
 // Local memory of a flash work-group, written out from the kernel layout
 // (floats; 0 = not listed): Dk 128: Q/V 64x68 + K/P 64x68 + partials,
 // rescale, max 64x18 + table 4x64; Dk 72: Q/V 64x76 + K 64x76 + 64x18 +
-// 4x64; Dk 256: V 16x260 + K 64x68 + 32x18 + 4x32. The int8 cache adds the K
-// and V row scales of a 64-key tile.
+// 4x64; Dk 256: V 16x260 + K 64x68 + 32x18 + 4x32. Column chunks (V 16 rows of
+// the chunk + 4): Dk 384 = 2 x 192, 768 = 3 x 256, 1152 = 5 x 232. The int8
+// cache adds the K and V row scales of a 64-key tile.
 function ExpectedFlashScratchFloats(Dk: integer; Int8KV: boolean): integer;
 begin
   Result := 0;
@@ -75615,7 +75621,13 @@ begin
   else if Dk = 72 then
     Result := 64 * 76 + 64 * 76 + 64 * 18 + 4 * 64
   else if Dk = 256 then
-    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32;
+    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 384 then
+    Result := 16 * 196 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 768 then
+    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 1152 then
+    Result := 16 * 236 + 64 * 68 + 32 * 18 + 4 * 32;
   if (Result > 0) and Int8KV then Inc(Result, 2 * 64);
 end;
 
@@ -75813,6 +75825,8 @@ begin
       IfThen(Dk <= 128, 64, 32), LGpu.FusedSDPACL.LastQueryTileRows);
     TAssert.AssertEquals(What + ': flash key tile rows', 64,
       LGpu.FusedSDPACL.LastKeyTileRows);
+    TAssert.AssertEquals(What + ': flash column chunks',
+      (((Dk + 3) and (not 3)) + 255) div 256, LGpu.FusedSDPACL.LastColChunks);
     if ForcedSplits > 0 then
       TAssert.AssertEquals(What + ': flash key splits', ForcedSplits,
         LGpu.FusedSDPACL.LastFlashSplits);
@@ -75948,8 +75962,7 @@ begin
   RunCase(2, 1, 24, 5, 61, 0, 0, 0, True, True, False, True);
   RunCase(2, 2, 40, 3, 70, 0, 0, 0, False, False, False, True);
   RunCase(3, 1, 16, 12, 67, 0, 2.5, 0, False, True, False, True);
-  // Dk 129 and 256 (32-row tiles); Dk 260 is past the kernel and keeps the
-  // host path.
+  // Dk 129 and 256 (32-row tiles); Dk 260 in two column chunks.
   RunCase(2, 2, 129, 6, 20, 0, 0, 0, False, True, False, True);
   RunCase(2, 1, 256, 10, 35, 0, 0, 0, True, True, False, True);
   RunCase(2, 2, 260, 4, 9, 0, 0, 0, False, True, False, True);
@@ -76052,6 +76065,221 @@ begin
   // Two rows take flash; one row keeps the int8 split-row decode.
   RunCase(True, 2, 2, 64, 100, 2, 0, 0, 0, False, sdpaPathFlash);
   RunCase(True, 2, 2, 64, 100, 1, 0, 0, 0, False, sdpaPathDecodeSplit);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Heads wider than 256 in column chunks (Dk 260 to 1152), FP32 and int8,
+// causal and non-causal, GQA, windows and key splits; scratch layouts pinned.
+procedure TTestNeuralNumerical.FusedSDPAFlashColumnChunksOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Causal, Int8KV: boolean; QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window, ForcedSplits: integer; SoftCap: TNeuralFloat);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, SoftCap, {InputAmplitude=}3,
+      {KeyRamp=}0, Causal, ForcedSplits, {UsableLocalMemBytes=}0,
+      {HostSource=}False, {ResidentPrefix=}not Int8KV, Int8KV, sdpaPathFlash);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261008;
+  // One head (the VAE mid-block shape), non-causal, 2/3/5 chunks.
+  RunCase(False, False, 1, 1, 384, 0, 40, 0, 0, 0);
+  RunCase(False, False, 1, 1, 768, 5, 37, 0, 0, 0);
+  RunCase(False, False, 1, 1, 1152, 0, 70, 0, 0, 0);
+  RunCase(False, False, 2, 2, 260, 3, 21, 0, 0, 2.5);
+  // Causal with GQA, a window and forced splits (partials per chunk).
+  RunCase(True, False, 4, 2, 384, 30, 20, 0, 0, 0);
+  RunCase(True, False, 2, 1, 1152, 40, 16, 24, 3, 0);
+  RunCase(True, False, 1, 1, 768, 100, 16, 0, 0, 0);
+  // The int8 cache.
+  RunCase(False, True, 1, 1, 1152, 0, 40, 0, 0, 0);
+  RunCase(True, True, 2, 1, 384, 20, 16, 0, 3, 0);
+  // An NVIDIA-sized budget (48 KB less the reserve) holds the Dk 1152 tiles.
+  RunFusedSDPAFlashCase(PlatformId, DeviceId, 1, 1, 1152, 0, 33, 0, 0, 3, 0,
+    {Causal=}False, 0, 48 * 1024 - 1024, False, True, False, sdpaPathFlash);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// AddMultiHeadSelfAttention on OpenCL vs the same weights on the CPU; a flash
+// case asserts residency over PassCount profiled forwards. Bound 2e-5|y|.
+// HostSource puts a host layer before the split; Cycle re-arms OpenCL.
+procedure TTestNeuralNumerical.ScaledDotProductAttentionFlashOpenCLParity;
+{$IFDEF OpenCL}
+const
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Heads, DModel, SeqLen, Window: integer;
+    Causal, ExpectFlash, HostSource, Cycle: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input: TNNetVolume;
+    Attn, Concat, OutProj, Layer: TNNetLayer;
+    LayerPos, Pos, PassCnt, MaxOutputPos: integer;
+    Diff, MaxDiff, MaxAbsY: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('heads=%d d_model=%d T=%d W=%d causal=%s host=%s',
+      [Heads, DModel, SeqLen, Window, BoolToStr(Causal, true),
+      BoolToStr(HostSource, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, DModel);
+    try
+      // The Q|K|V projection the builders put first; it leaves its output in
+      // OpenCL memory only, so the per-head split runs there too.
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      if HostSource then NNCpu.AddLayer(TNNetMulByConstant.Create(1));
+      NNCpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      // A host-only layer: the split then runs on the host too.
+      if HostSource then NNGpu.AddLayer(TNNetMulByConstant.Create(1));
+      NNGpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
+      NNGpu.CopyWeights(NNCpu);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.LayerProfiling := true;
+      Attn := nil;
+      Concat := nil;
+      for LayerPos := 0 to NNGpu.CountLayers() - 1 do
+      begin
+        Layer := NNGpu.Layers[LayerPos];
+        if (Attn = nil) and (Layer.ClassType = TNNetScaledDotProductAttention)
+          then Attn := Layer;
+        if Layer is TNNetDeepConcat then Concat := Layer;
+      end;
+      OutProj := NNGpu.GetLastLayer();
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      for PassCnt := 1 to PassCount do
+      begin
+        Input.RandomizeGaussian(1.0);
+        NNCpu.Compute(Input);
+        NNGpu.Compute(Input);
+        OutProj.ForceOutputOnRAM();
+        MaxOutputPos := OutProj.Output.Size - 1;
+        for Pos := 0 to MaxOutputPos do
+        begin
+          Diff := Abs(NNCpu.GetLastLayer().Output.FData[Pos] -
+            OutProj.Output.FData[Pos]);
+          if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+          MaxAbsY := Max(MaxAbsY, Abs(NNCpu.GetLastLayer().Output.FData[Pos]));
+        end;
+      end;
+      WriteLn('  SDPA flash ', What, ': max|diff|=', MaxDiff:0:9, ' max|y|=',
+        MaxAbsY:0:4, ' attn gpu=', Attn.ForwardGPUCnt, ' bound=',
+        Attn.ProfiledResidency.SourceBoundCnt, ' concat gpu=',
+        Concat.ForwardGPUCnt, ' proj bound=',
+        OutProj.ProfiledResidency.SourceBoundCnt);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * Max(1, MaxAbsY));
+      AssertEquals(What + ': WillOpenCL', ExpectFlash, Attn.WillOpenCL());
+      if not ExpectFlash then
+      begin
+        AssertFalse(What + ': the host path leaves no resident output',
+          Attn.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': attention on OpenCL', PassCount,
+        Attn.ForwardGPUCnt);
+      if HostSource then
+      begin
+        AssertEquals(What + ': attention uploaded its source', PassCount,
+          Attn.ProfiledResidency.ActivationUploadedCnt);
+        AssertEquals(What + ': attention output resident', PassCount,
+          Attn.ProfiledResidency.OutputResidentCnt);
+        exit;
+      end;
+      AssertEquals(What + ': attention bound its source', PassCount,
+        Attn.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': attention output resident', PassCount,
+        Attn.ProfiledResidency.OutputResidentCnt);
+      AssertEquals(What + ': attention pulled nothing', 0,
+        Attn.ProfiledResidency.SourcePulledToRAMCnt);
+      AssertEquals(What + ': attention uploaded nothing', 0,
+        Attn.ProfiledResidency.ActivationUploadedCnt);
+      AssertEquals(What + ': concat on OpenCL', PassCount,
+        Concat.ForwardGPUCnt);
+      AssertEquals(What + ': concat bound its sources', PassCount,
+        Concat.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': concat output resident', PassCount,
+        Concat.ProfiledResidency.OutputResidentCnt);
+      AssertEquals(What + ': out-projection bound the concat', PassCount,
+        OutProj.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': out-projection uploaded nothing', 0,
+        OutProj.ProfiledResidency.ActivationUploadedCnt);
+      if not Cycle then exit;
+      // Disable and re-arm: the forward must run on OpenCL again (a host
+      // fallback would match the CPU exactly, so parity alone proves nothing).
+      NNGpu.DisableOpenCL();
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      PassCnt := Attn.ForwardGPUCnt;
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      OutProj.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for Pos := 0 to MaxOutputPos do
+        MaxDiff := Max(MaxDiff, Abs(NNCpu.GetLastLayer().Output.FData[Pos] -
+          OutProj.Output.FData[Pos]));
+      AssertEquals(What + ': attention on OpenCL after re-arming',
+        PassCnt + 1, Attn.ForwardGPUCnt);
+      AssertTrue(What + ': max|diff| after re-arming ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * Max(1, MaxAbsY));
+    finally
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261009;
+  // One head at Dk 16, 72, 384 and 1152 (the VAE mid-block shape).
+  RunCase(1, 16, 40, 0, False, True, False, True);
+  RunCase(1, 72, 33, 0, False, True, False, False);
+  RunCase(1, 384, 40, 0, False, True, False, False);
+  RunCase(1, 1152, 34, 0, False, True, False, False);
+  // Several heads: causal, causal with a window, a short resident sequence.
+  RunCase(4, 256, 48, 0, True, True, False, False);
+  RunCase(2, 128, 40, 8, True, True, False, False);
+  RunCase(2, 64, 8, 0, False, True, False, False);
+  // A host source of 40 rows is uploaded; one of 8 rows keeps the host paths.
+  RunCase(2, 64, 40, 0, True, True, True, False);
+  RunCase(2, 64, 8, 0, False, False, True, False);
+  // A non-causal window has no flash mask: the host paths run.
+  RunCase(2, 64, 40, 8, False, False, False, False);
 end;
 {$ELSE}
 begin

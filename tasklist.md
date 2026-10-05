@@ -2545,7 +2545,7 @@ rather than acted on.
         layer rows" line from OpenCLProcessTransferTotals. Source lists built
         in SetLayerProfiling(true) (no alloc in Compute). PoCL tests incl. a
         deliberate stale-read layer.
-  - [ ] F4. VAE mid-block attention as one non-causal TNNetFusedSDPA reading the
+  - [x] F4. VAE mid-block attention as one non-causal TNNetFusedSDPA reading the
         QKV slab (as the transformer block does: BeginIncrementalDecode(N)
         before AddLayer, TruncateCache(0) per tile pass), replacing the split /
         TNNetScaledDotProductAttention (host softmax, 4 uploads + 3 blocking
@@ -2601,7 +2601,7 @@ rather than acted on.
           --profile run.
     - [x] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
           int8 K/V tiles (ChatTerminal's default KV cache).
-    - [ ] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
+    - [x] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
           single heads, then TNNetScaledDotProductAttention and TNNetDeepConcat
           on OpenCL (user request 2026-10-05): the generic
           TNNetScaledDotProductAttention (AddMultiHeadSelfAttention and ~90 other
