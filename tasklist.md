@@ -2491,7 +2491,7 @@ rather than acted on.
         mergers (layers 8/16/24). Preprocessing: composite over white, mean/std and
         max_pixels from `preprocessor_config.json`. Pico fixture regenerated with
         vision patch 16, depth 3, deepstack [0, 2].
-  - [ ] C1b. Text encoder with images: vision embeddings spliced into the
+  - [x] C1b. Text encoder with images: vision embeddings spliced into the
         `<|image_pad|>` rows, DeepStack features added after decoder layers 0-2,
         interleaved M-RoPE sections, N-image `get_rope_index` positions, edit template
         `<image1><|vision_start|><|image_pad|><|vision_end|> <image2>...`, image-pad

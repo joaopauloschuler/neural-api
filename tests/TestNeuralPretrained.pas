@@ -826,6 +826,11 @@ type
     procedure TestQwen3VLVisionRope;
     procedure TestQwen3VLVisionTensorSet;
     procedure TestQwen3VLVisionTowerParity;
+    procedure TestQwen3VLInterleavedMRoPESections;
+    procedure TestQwen3VLImageRopePositions;
+    procedure TestQwen3VLTextEncoderWithImagesParity;
+    procedure TestQwen3VLImageEncodeRefusals;
+    procedure TestQwenImage21EditPromptTemplateIds;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -31899,6 +31904,510 @@ begin
     Merged.Free;
     Image.Free;
     Tower.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// The interleaved M-RoPE pair -> axis map against transformers'
+// recomposition_frequencies for four mrope_section values; the contiguous
+// TNNetMRotaryEmbedding map is unchanged; the class survives a save/load.
+procedure TTestNeuralPretrained.TestQwen3VLInterleavedMRoPESections;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Maps, SectionArr, AxisArr: TJSONArray;
+  MapObj: TJSONObject;
+  Rope: TNNetMRotaryEmbedding;
+  NN, Loaded: TNNet;
+  MapPos, PairPos: integer;
+  SectionLabel: string;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  NN := nil;
+  Loaded := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen3vl_image_text_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Maps := TJSONArray(TJSONObject(RefRoot).Find('interleaved_sections'));
+    AssertTrue('section cases', Maps.Count >= 4);
+    for MapPos := 0 to Maps.Count - 1 do
+    begin
+      MapObj := TJSONObject(Maps.Items[MapPos]);
+      SectionArr := TJSONArray(MapObj.Find('mrope_section'));
+      AxisArr := TJSONArray(MapObj.Find('axis_of_pair'));
+      SectionLabel := SectionArr.AsJSON;
+      Rope := TNNetInterleavedMRotaryEmbedding.Create(10000,
+        SectionArr.Integers[0], SectionArr.Integers[1],
+        SectionArr.Integers[2]);
+      try
+        for PairPos := 0 to AxisArr.Count - 1 do
+          AssertEquals(SectionLabel + ' pair ' + IntToStr(PairPos),
+            AxisArr.Integers[PairPos], Rope.SectionOfPair(PairPos));
+      finally
+        Rope.Free;
+      end;
+    end;
+    Rope := TNNetMRotaryEmbedding.Create(10000, 4, 2, 2);
+    try
+      for PairPos := 0 to 7 do
+        AssertEquals('contiguous pair ' + IntToStr(PairPos),
+          integer(Ord(PairPos >= 4) + Ord(PairPos >= 6)), Rope.SectionOfPair(PairPos));
+    finally
+      Rope.Free;
+    end;
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(3, 1, 32));
+    NN.AddLayer(TNNetInterleavedMRotaryEmbedding.Create(5000000, 4, 2, 2,
+      rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, 16));
+    Loaded := TNNet.Create();
+    Loaded.LoadFromString(NN.SaveToString());
+    AssertTrue('reloaded class',
+      Loaded.Layers[1] is TNNetInterleavedMRotaryEmbedding);
+    for PairPos := 0 to 7 do
+      AssertEquals('reloaded pair ' + IntToStr(PairPos),
+        TNNetMRotaryEmbedding(NN.Layers[1]).SectionOfPair(PairPos),
+        TNNetMRotaryEmbedding(Loaded.Layers[1]).SectionOfPair(PairPos));
+  finally
+    Loaded.Free;
+    NN.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Reads case CaseObj of tiny_qwen3vl_image_text_io.json: token ids and the
+// merged grid of every image.
+procedure ReadQwen3VLImageTextCase(CaseObj: TJSONObject; Merge: integer;
+  var TokenIds, MergedHeights, MergedWidths: TNeuralIntegerArray);
+var
+  IdsArr, GridArr: TJSONArray;
+  TokenPos, ImagePos: integer;
+begin
+  IdsArr := TJSONArray(CaseObj.Find('token_ids'));
+  SetLength(TokenIds, IdsArr.Count);
+  for TokenPos := 0 to IdsArr.Count - 1 do
+    TokenIds[TokenPos] := IdsArr.Integers[TokenPos];
+  GridArr := TJSONArray(CaseObj.Find('image_grid_thw'));
+  SetLength(MergedHeights, GridArr.Count);
+  SetLength(MergedWidths, GridArr.Count);
+  for ImagePos := 0 to GridArr.Count - 1 do
+  begin
+    MergedHeights[ImagePos] :=
+      TJSONArray(GridArr.Items[ImagePos]).Integers[1] div Merge;
+    MergedWidths[ImagePos] :=
+      TJSONArray(GridArr.Items[ImagePos]).Integers[2] div Merge;
+  end;
+end;
+
+// BuildQwen2VLMRoPEPositionIds over N images against transformers
+// get_rope_index (1 image, 2 images wide/tall, merged grids 2x3, 2x1, 3x2).
+procedure TTestNeuralPretrained.TestQwen3VLImageRopePositions;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, PosData: TJSONArray;
+  CaseObj: TJSONObject;
+  TokenIds, MergedHeights, MergedWidths: TNeuralIntegerArray;
+  PosT, PosH, PosW: TNeuralIntegerArray;
+  CasePos, TokenPos, TokenCount: integer;
+  CaseLabel: string;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen3vl_image_text_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      CaseLabel := CaseObj.Get('label', '');
+      ReadQwen3VLImageTextCase(CaseObj, 2, TokenIds, MergedHeights,
+        MergedWidths);
+      TokenCount := Length(TokenIds);
+      SetLength(PosT, TokenCount);
+      SetLength(PosH, TokenCount);
+      SetLength(PosW, TokenCount);
+      BuildQwen2VLMRoPEPositionIds(TokenIds, 290, MergedHeights, MergedWidths,
+        PosT, PosH, PosW);
+      PosData := TJSONArray(TJSONObject(CaseObj.Find('positions')).Find('data'));
+      AssertEquals(CaseLabel + ' oracle size', 3 * TokenCount, PosData.Count);
+      for TokenPos := 0 to TokenCount - 1 do
+      begin
+        AssertEquals(CaseLabel + ' T[' + IntToStr(TokenPos) + ']',
+          PosData.Integers[TokenPos], PosT[TokenPos]);
+        AssertEquals(CaseLabel + ' H[' + IntToStr(TokenPos) + ']',
+          PosData.Integers[TokenCount + TokenPos], PosH[TokenPos]);
+        AssertEquals(CaseLabel + ' W[' + IntToStr(TokenPos) + ']',
+          PosData.Integers[2 * TokenCount + TokenPos], PosW[TokenPos]);
+      end;
+    end;
+    // Text-only ids through the single-image overload with an empty grid.
+    TokenIds := TNeuralIntegerArray.Create(4, 9, 7);
+    SetLength(PosT, 3);
+    SetLength(PosH, 3);
+    SetLength(PosW, 3);
+    BuildQwen2VLMRoPEPositionIds(TokenIds, 290, 0, 0, PosT, PosH, PosW);
+    for TokenPos := 0 to 2 do
+    begin
+      AssertEquals('text-only T', TokenPos, PosT[TokenPos]);
+      AssertEquals('text-only H', TokenPos, PosH[TokenPos]);
+      AssertEquals('text-only W', TokenPos, PosW[TokenPos]);
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Runs Tower on the formula images of CaseObj into Images (volumes owned by
+// the caller: FreeQwen3VLImageEmbeds).
+procedure EncodeQwen3VLCaseImages(Tower: TQwen3VLVisionTower;
+  CaseObj: TJSONObject; var Images: array of TQwen3VLImageEmbeds);
+var
+  ImageArr: TJSONArray;
+  ImageObj: TJSONObject;
+  Image: TNNetVolume;
+  ImagePos, StackPos: integer;
+begin
+  ImageArr := TJSONArray(CaseObj.Find('images'));
+  Image := TNNetVolume.Create;
+  try
+    for ImagePos := 0 to High(Images) do
+    begin
+      ImageObj := TJSONObject(ImageArr.Items[ImagePos]);
+      FillQwen3VLVisionFormulaImage(Image, ImageObj.Get('width', 0),
+        ImageObj.Get('height', 0), ImageObj.Get('channels', 0));
+      Images[ImagePos].Merged := TNNetVolume.Create;
+      SetLength(Images[ImagePos].DeepStack,
+        Length(Tower.Config.DeepStackIndexes));
+      for StackPos := 0 to High(Images[ImagePos].DeepStack) do
+        Images[ImagePos].DeepStack[StackPos] := TNNetVolume.Create;
+      Tower.Encode(Image, Images[ImagePos].Merged, Images[ImagePos].DeepStack);
+      Images[ImagePos].GridH := Tower.NetGridH;
+      Images[ImagePos].GridW := Tower.NetGridW;
+    end;
+  finally
+    Image.Free;
+  end;
+end;
+
+procedure FreeQwen3VLImageEmbeds(var Images: array of TQwen3VLImageEmbeds);
+var
+  ImagePos, StackPos: integer;
+begin
+  for ImagePos := 0 to High(Images) do
+  begin
+    FreeAndNil(Images[ImagePos].Merged);
+    for StackPos := 0 to High(Images[ImagePos].DeepStack) do
+      FreeAndNil(Images[ImagePos].DeepStack[StackPos]);
+  end;
+end;
+
+// The pico Qwen3-VL text encoder with images vs the float64 transformers
+// Qwen3VLForConditionalGeneration (pixel_values through the whole model):
+// pre-final-norm rows after dropping 14 system rows, the image-pad mask, and
+// the grids. Vision tower in Pascal, so its error is included; tolerance 1e-4
+// on values up to ~6. Also: a right-padded build, text-only ids through the
+// image encoder, and the int8 build within 5%.
+procedure TTestNeuralPretrained.TestQwen3VLTextEncoderWithImagesParity;
+var
+  RefJson, TextJson: TStringList;
+  RefRoot, TextRoot: TJSONData;
+  Cases, MaskArr, IdsArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Tower: TQwen3VLVisionTower;
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+  Images: array of TQwen3VLImageEmbeds;
+  TokenIds, ImageTokenIds, MergedHeights, MergedWidths: TNeuralIntegerArray;
+  Mask: TQwen3VLImagePadMask;
+  Expected, Hidden: TNNetVolume;
+  CasePos, RowPos, LayerCnt, MRoPECount, ExtraRows: integer;
+  ImagePos, StackPos: integer;
+  CaseLabel: string;
+  MaxDiff, MaxAbs: double;
+  QuantizeInt8, Refused: boolean;
+begin
+  RefJson := TStringList.Create;
+  TextJson := TStringList.Create;
+  Expected := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  RefRoot := nil;
+  TextRoot := nil;
+  Tower := nil;
+  Encoder := nil;
+  Images := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen3vl_image_text_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Tower := TQwen3VLVisionTower.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/text_encoder/config.json')));
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    for CasePos := 0 to Cases.Count - 1 do
+      for ExtraRows := 0 to Ord(CasePos = 1) * 5 do
+        for QuantizeInt8 := false to (CasePos = 0) and (ExtraRows = 0) do
+        begin
+          CaseObj := TJSONObject(Cases.Items[CasePos]);
+          CaseLabel := CaseObj.Get('label', '') + ' pad ' + IntToStr(ExtraRows);
+          if QuantizeInt8 then CaseLabel := CaseLabel + ' int8';
+          AssertTrue(CaseLabel + ' oracle vs native transformers < 1e-5',
+            CaseObj.Get('native_hf_maxabs_diff', 1.0) < 1e-5);
+          AssertTrue(CaseLabel + ' images change the text rows',
+            CaseObj.Get('images_change_text_rows_maxabs', 0.0) > 0.1);
+          ReadQwen3VLImageTextCase(CaseObj, 2, TokenIds, MergedHeights,
+            MergedWidths);
+          SetLength(Images, Length(MergedHeights));
+          EncodeQwen3VLCaseImages(Tower, CaseObj, Images);
+          AssertEquals(CaseLabel + ' grid H', 2 * MergedHeights[0],
+            Images[0].GridH);
+          AssertEquals(CaseLabel + ' grid W', 2 * MergedWidths[0],
+            Images[0].GridW);
+          Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+            FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'),
+            Config, Length(TokenIds) + ExtraRows, QuantizeInt8, '', nil,
+            {pImageInput=}true);
+          AssertTrue('image encoder enables M-RoPE', Config.Text.MRoPEEnabled);
+          MRoPECount := 0;
+          for LayerCnt := 0 to Encoder.GetLastLayerIdx() do
+            if Encoder.Layers[LayerCnt] is TNNetInterleavedMRotaryEmbedding then
+              Inc(MRoPECount);
+          AssertEquals('hoisted q and k M-RoPE per layer',
+            2 * Config.Text.NumLayers, MRoPECount);
+          Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, TokenIds,
+            Images, CaseObj.Get('drop_idx', 0), Hidden, Mask);
+          LoadOracleTokenTensor(CaseObj, 'prompt_embeds', Expected);
+          AssertEquals(CaseLabel + ' rows', Expected.SizeX, Hidden.SizeX);
+          MaxDiff := MaxAbsVolumeDiff(Hidden, Expected);
+          if QuantizeInt8 then
+          begin
+            MaxAbs := Expected.GetMaxAbs();
+            AssertTrue(CaseLabel + ': max |diff| = ' + FloatToStr(MaxDiff) +
+              ' must be < 5% of ' + FloatToStr(MaxAbs), MaxDiff < 0.05 * MaxAbs);
+          end
+          else
+            AssertTrue(CaseLabel + ': max |diff| = ' + FloatToStr(MaxDiff) +
+              ' must be < 1e-4', MaxDiff < 1e-4);
+          MaskArr := TJSONArray(CaseObj.Find('image_pad_mask'));
+          AssertEquals(CaseLabel + ' mask rows', MaskArr.Count, Length(Mask));
+          for RowPos := 0 to MaskArr.Count - 1 do
+            AssertEquals(CaseLabel + ' mask[' + IntToStr(RowPos) + ']',
+              MaskArr.Integers[RowPos] = 1, Mask[RowPos]);
+          if (ExtraRows = 0) and not QuantizeInt8 then
+          begin
+            // Negative control: without DeepStack the rows must move a lot.
+            for ImagePos := 0 to High(Images) do
+              for StackPos := 0 to High(Images[ImagePos].DeepStack) do
+                Images[ImagePos].DeepStack[StackPos].Fill(0);
+            Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, TokenIds,
+              Images, CaseObj.Get('drop_idx', 0), Hidden, Mask);
+            MaxDiff := MaxAbsVolumeDiff(Hidden, Expected);
+            AssertTrue(CaseLabel + ' zero DeepStack: max |diff| = ' +
+              FloatToStr(MaxDiff) + ' must be > 0.1', MaxDiff > 0.1);
+          end;
+          FreeAndNil(Encoder);
+          FreeQwen3VLImageEmbeds(Images);
+        end;
+
+    // Text-only ids through the image encoder: M-RoPE with equal positions
+    // and zero DeepStack rows give the text-only oracle.
+    TextJson.LoadFromFile(FixturePath('tiny_qwenimage21_text_encoder_io.json'));
+    TextRoot := GetJSON(TextJson.Text);
+    IdsArr := TJSONArray(TJSONObject(TextRoot).Find('token_ids'));
+    SetLength(TokenIds, IdsArr.Count);
+    for RowPos := 0 to IdsArr.Count - 1 do
+      TokenIds[RowPos] := IdsArr.Integers[RowPos];
+    // One encoder, first run with images (positions and DeepStack rows set),
+    // then text-only through both routes: no state may leak.
+    CaseObj := TJSONObject(Cases.Items[0]);
+    ReadQwen3VLImageTextCase(CaseObj, 2, ImageTokenIds, MergedHeights,
+      MergedWidths);
+    SetLength(Images, Length(MergedHeights));
+    EncodeQwen3VLCaseImages(Tower, CaseObj, Images);
+    Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'),
+      Config, Length(ImageTokenIds), false, '', nil, {pImageInput=}true);
+    Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, ImageTokenIds, Images,
+      CaseObj.Get('drop_idx', 0), Hidden, Mask);
+    LoadOracleTokenTensor(TextRoot, 'prompt_embeds', Expected);
+    Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, TokenIds, [],
+      TJSONObject(TextRoot).Get('drop_idx', 0), Hidden, Mask, {Parallel=}true);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, Expected);
+    AssertTrue('text-only ids via the image route: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    for RowPos := 0 to High(Mask) do
+      AssertFalse('no image rows', Mask[RowPos]);
+    Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, ImageTokenIds, Images,
+      CaseObj.Get('drop_idx', 0), Hidden, Mask);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds,
+      TJSONObject(TextRoot).Get('drop_idx', 0), Hidden);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, Expected);
+    AssertTrue('Qwen3VLEncodeHiddenStates on an image encoder after an ' +
+      'image run: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+      MaxDiff < 1e-4);
+    Refused := false;
+    try
+      Qwen3VLEncodeHiddenStates(Encoder, Config, ImageTokenIds, 0, Hidden);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('image ids through the text route are refused', Refused);
+  finally
+    FreeQwen3VLImageEmbeds(Images);
+    Encoder.Free;
+    Tower.Free;
+    TextRoot.Free;
+    RefRoot.Free;
+    Hidden.Free;
+    Expected.Free;
+    TextJson.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Image-pad ids that disagree with the images are refused: a slot short, an
+// extra image, a missing DeepStack feature, video ids; and the image route
+// refuses a text-only encoder (no M-RoPE layers).
+procedure TTestNeuralPretrained.TestQwen3VLImageEncodeRefusals;
+var
+  Encoder, TextEncoder: TNNet;
+  Config: TQwen3VLConfig;
+  Images: array of TQwen3VLImageEmbeds;
+  Mask: TQwen3VLImagePadMask;
+  Hidden: TNNetVolume;
+  TokenIds: TNeuralIntegerArray;
+  StackPos: integer;
+  Message: string;
+
+  function Refused(const Ids: array of integer;
+    const ImageList: array of TQwen3VLImageEmbeds; Net: TNNet): boolean;
+  begin
+    Result := false;
+    try
+      Qwen3VLEncodeHiddenStatesWithImages(Net, Config, Ids, ImageList, 0,
+        Hidden, Mask);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  Hidden := TNNetVolume.Create;
+  Images := nil;
+  TextEncoder := nil;
+  Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+    FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+    {pSeqLen=}12, false, '', nil, {pImageInput=}true);
+  try
+    // One 4x4-patch image: 4 slots of the pico hidden width 64.
+    SetLength(Images, 1);
+    Images[0].GridH := 4;
+    Images[0].GridW := 4;
+    Images[0].Merged := TNNetVolume.Create(4, 1, 64);
+    SetLength(Images[0].DeepStack, 2);
+    for StackPos := 0 to 1 do
+      Images[0].DeepStack[StackPos] := TNNetVolume.Create(4, 1, 64);
+    TokenIds := TNeuralIntegerArray.Create(1, 292, 290, 290, 290, 290, 293, 5);
+    AssertFalse('matching ids encode', Refused(TokenIds, Images, Encoder));
+    AssertEquals('mask rows', 8, Length(Mask));
+    AssertTrue('mask marks the slots', Mask[2] and Mask[5] and not Mask[6]);
+    AssertTrue('a slot short is refused', Refused(
+      TNeuralIntegerArray.Create(1, 292, 290, 290, 290, 293, 5), Images,
+      Encoder));
+    AssertTrue('a second pad run without an image is refused', Refused(
+      TNeuralIntegerArray.Create(1, 292, 290, 290, 290, 290, 293, 290, 5),
+      Images, Encoder));
+    AssertTrue('pads without images are refused', Refused(TokenIds, [],
+      Encoder));
+    AssertTrue('a video id is refused', Refused(
+      TNeuralIntegerArray.Create(1, 291, 292, 290, 290, 290, 290, 293), Images,
+      Encoder));
+    Images[0].Merged.ReSize(4, 1, 32);
+    AssertTrue('a Merged of the wrong width is refused',
+      Refused(TokenIds, Images, Encoder));
+    Images[0].Merged.ReSize(4, 1, 64);
+    SetLength(Images[0].DeepStack, 1);
+    AssertTrue('a missing DeepStack feature is refused',
+      Refused(TokenIds, Images, Encoder));
+    SetLength(Images[0].DeepStack, 2);
+    TextEncoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}12);
+    Message := '';
+    try
+      Qwen3VLEncodeHiddenStatesWithImages(TextEncoder, Config, TokenIds, Images,
+        0, Hidden, Mask);
+    except
+      on E: EPretrainedImportError do Message := E.Message;
+    end;
+    AssertTrue('a text-only encoder is refused for its missing M-RoPE: ' +
+      Message, Pos('M-RoPE', Message) > 0);
+  finally
+    FreeQwen3VLImageEmbeds(Images);
+    TextEncoder.Free;
+    Encoder.Free;
+    Hidden.Free;
+  end;
+end;
+
+// The Qwen-Image-2.1 edit template for 1-3 images equals the text the real
+// pipeline hands its processor, and Qwen3VLExpandImagePads on the real
+// tokenizer's template ids equals the tokenizer on the expanded text.
+procedure TTestNeuralPretrained.TestQwenImage21EditPromptTemplateIds;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, IdsArr, SlotArr, ExpandedArr: TJSONArray;
+  CaseObj: TJSONObject;
+  TokenIds, SlotCounts, Expanded: TNeuralIntegerArray;
+  CasePos, ValuePos, ImagePadId: integer;
+  Refused: boolean;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('qwenimage21_edit_prompt_tokens.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    ImagePadId := TJSONObject(RefRoot).Get('image_pad_token_id', 0);
+    AssertEquals('real <|image_pad|> id', 151655, ImagePadId);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 6, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      AssertEquals('template ' + IntToStr(CasePos),
+        CaseObj.Get('template_text', ''),
+        QwenImage21EditPrompt(CaseObj.Get('prompt', ''),
+          CaseObj.Get('image_count', 0)));
+      IdsArr := TJSONArray(CaseObj.Find('input_ids'));
+      SetLength(TokenIds, IdsArr.Count);
+      for ValuePos := 0 to IdsArr.Count - 1 do
+        TokenIds[ValuePos] := IdsArr.Integers[ValuePos];
+      SlotArr := TJSONArray(CaseObj.Find('slot_counts'));
+      SetLength(SlotCounts, SlotArr.Count);
+      for ValuePos := 0 to SlotArr.Count - 1 do
+        SlotCounts[ValuePos] := SlotArr.Integers[ValuePos];
+      Expanded := Qwen3VLExpandImagePads(TokenIds, ImagePadId, SlotCounts);
+      ExpandedArr := TJSONArray(CaseObj.Find('expanded_input_ids'));
+      AssertEquals('expanded length ' + IntToStr(CasePos), ExpandedArr.Count,
+        Length(Expanded));
+      for ValuePos := 0 to ExpandedArr.Count - 1 do
+        AssertEquals('expanded id ' + IntToStr(ValuePos),
+          ExpandedArr.Integers[ValuePos], Expanded[ValuePos]);
+    end;
+    AssertEquals('no images = the text-to-image template',
+      QwenImage21TextToImagePrompt('A cat'), QwenImage21EditPrompt('A cat', 0));
+    Refused := false;
+    try
+      Qwen3VLExpandImagePads(TokenIds, ImagePadId, [2]);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('slot counts must match the pads', Refused);
+  finally
     RefRoot.Free;
     RefJson.Free;
   end;

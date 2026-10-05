@@ -76006,6 +76006,11 @@ begin
   Rope := TNNetMRotaryEmbedding.Create(10000.0, 4, 4, 4);
   Rope.SetPositions([0, 1, 2, 3, 4], [0, 2, 4, 1, 3], [1, 1, 0, 2, 5]);
   CheckLayer(Rope, 'TNNetMRotaryEmbedding');
+  // Qwen3-VL text: interleaved sections, 2 heads x head_dim 12.
+  Rope := TNNetInterleavedMRotaryEmbedding.Create(10000.0, 2, 2, 2, rsmNone,
+    1.0, 0, 1.0, 32.0, 0.0, true, 12);
+  Rope.SetPositions([0, 1, 2, 3, 4], [0, 2, 4, 1, 3], [1, 1, 0, 2, 5]);
+  CheckLayer(Rope, 'TNNetInterleavedMRotaryEmbedding');
 end;
 {$ELSE}
 begin

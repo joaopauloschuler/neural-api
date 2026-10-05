@@ -930,7 +930,8 @@ type
                                // an MoE expert, whose width is IntermediateSize);
                                // 0 = use IntermediateSize.
     // Qwen2-VL M-RoPE (Multimodal Rotary Position Embedding): when
-    // MRoPEEnabled the per-head Q/K rotary layers are TNNetMRotaryEmbedding
+    // MRoPEEnabled the Q/K rotary layers (hoisted to the whole projection
+    // when the rotary is full-width) are TNNetMRotaryEmbedding
     // (the 3-D temporal/height/width index variant) instead of the scalar
     // TNNetRotaryEmbedding. MRoPESectionT/H/W are the channel-pair counts
     // (mrope_section) summing to head_dim/2. The per-token 3-D positions are
@@ -939,6 +940,8 @@ type
     // other family leaves MRoPEEnabled false (ordinary 1-D RoPE).
     MRoPEEnabled: boolean;
     MRoPESectionT, MRoPESectionH, MRoPESectionW: integer;
+    // Qwen3-VL: pairs take their section from TNNetInterleavedMRotaryEmbedding.
+    MRoPEInterleaved: boolean;
     // ---- Qwen3.5 / Qwen3.6 hybrid deltas (model_type qwen3_5 /
     // qwen3_5_moe; all default off/0/empty for the other families) ----
     LinearAttnLayers: array of boolean; // per-layer token-mixer type from the
@@ -1064,10 +1067,13 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // free it before the owner. Coded by Claude (AI).
 // pStopBeforeFinalNorm: the net ends at the last decoder block's residual
 // sum (no final RMSNorm, no LM head); norm.weight and lm_head are not loaded.
+// pDeepStackInputs: after each of the first N blocks, x += a (SeqLen,1,hidden)
+// TNNetInput the caller fills (Qwen3-VL DeepStack; zero leaves x unchanged).
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
+  pDeepStackInputs: integer = 0): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -8549,8 +8555,8 @@ function ReadQwen2VLConfigFromJSONFile(const FileName: string): TQwen2VLConfig;
 
 function Qwen2VLConfigToString(const Config: TQwen2VLConfig): string;
 
-// Builds the Qwen2-VL TEXT decoder (a Qwen2 decoder whose per-head Q/K rotary
-// layers are TNNetMRotaryEmbedding) from the checkpoint at FileName. The
+// Builds the Qwen2-VL TEXT decoder (a Qwen2 decoder whose Q/K rotary layers
+// are TNNetMRotaryEmbedding) from the checkpoint at FileName. The
 // decoder reads the standard Qwen2 weight names (model.embed_tokens /
 // model.layers.* / model.norm / lm_head). Its TNNetEmbedding is fed externally
 // by Qwen2VLRunLogits (the embedding-injection convention). Owned by the
@@ -8576,10 +8582,16 @@ function BuildQwen2VLFromSafeTensors(const FileName: string;
 // Coded by Claude (AI).
 procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
   ImageTokenId, ImageGridH, ImageGridW: integer;
-  var PosT, PosH, PosW: array of integer);
+  var PosT, PosH, PosW: array of integer); overload;
+
+// N still images: each maximal run of ImageTokenId is the next image, over its
+// MERGED grid; a text run after an image resumes at CurPos + max(H, W).
+procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
+  ImageTokenId: integer; const MergedGridHeights, MergedGridWidths: array of integer;
+  var PosT, PosH, PosW: array of integer); overload;
 
 // Sets the per-token 3-D M-RoPE positions on EVERY TNNetMRotaryEmbedding layer
-// in the decoder (all per-head Q/K rotary layers share the same positions).
+// in the decoder (all Q/K rotary layers share the same positions).
 // Coded by Claude (AI).
 procedure Qwen2VLSetMRoPEPositions(TextNet: TNNet;
   const PosT, PosH, PosW: array of integer);
@@ -8599,7 +8611,8 @@ procedure Qwen2VLRunLogits(TextNet: TNNet; const Config: TQwen2VLConfig;
 // Qwen-Image-2.1 text_encoder). The text decoder is a dense Qwen3 decoder built
 // by the Llama builder; model.visual.* is skipped. For text-only input the
 // interleaved M-RoPE positions are equal on all three axes, so plain 1-D
-// rotate-half RoPE is exact; image/video placeholder ids are refused.
+// rotate-half RoPE is exact; the image encoder (pImageInput) takes vision
+// tower outputs, 3-D M-RoPE positions and DeepStack features.
 // ---------------------------------------------------------------------------
 const
   csQwenImage21SystemPrompt = 'Comprehend and analyze the provided prompt.';
@@ -8743,6 +8756,9 @@ type
     // and fills the position rows before the forward.
     property Net: TNNet read FNet;
     property NetLayers: TQwen3VLVisionTowerLayers read FNetLayers;
+    // Patch grid of Net (of the last Encode): TQwen3VLImageEmbeds.GridH/W.
+    property NetGridH: integer read FNetGridH;
+    property NetGridW: integer read FNetGridW;
     // Net's interpolated position rows (GridH*GridW, 1, Hidden).
     property PositionRows: TNNetVolume read FPositionRows;
     // As in TQwenImage21VaeEncoder; read when Net is (re)built. With
@@ -8753,18 +8769,46 @@ type
       write FShareHostOutputs;
   end;
 
-// Qwen3-VL text decoder without final RMSNorm and LM head: (pSeqLen,1,1) ids
-// in, (pSeqLen,1,hidden) out. pWeightOwner (same config): borrow, load nothing.
+// (pSeqLen,1,1) ids -> (pSeqLen,1,hidden) before the final RMSNorm. pImageInput
+// adds M-RoPE + DeepStack; a pWeightOwner must then be a pImageInput build too.
 function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
   out Config: TQwen3VLConfig; pSeqLen: integer;
   pQuantizeInt8: boolean = false; const ConfigFileName: string = '';
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pImageInput: boolean = false): TNNet;
 
 // Runs Encoder on TokenIds (right-padded to its SeqLen; causal, so rows stay
 // exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
 procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
   const Config: TQwen3VLConfig; const TokenIds: array of integer;
   DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean = false);
+
+type
+  // One still image for the Qwen3-VL text encoder: TQwen3VLVisionTower's
+  // outputs (not owned) and its patch grid (image_grid_thw with T = 1).
+  TQwen3VLImageEmbeds = record
+    Merged: TNNetVolume;              // (Slots, 1, hidden)
+    DeepStack: array of TNNetVolume;  // one per deepstack index, same shape
+    GridH, GridW: integer;
+  end;
+
+  // True at the rows that are image slots (<|image_pad|>).
+  TQwen3VLImagePadMask = array of boolean;
+
+// <|image_pad|> slots of a GridH x GridW patch grid: GridH*GridW/MergeSize^2.
+function Qwen3VLImageSlotCount(GridH, GridW, MergeSize: integer): integer;
+
+// TokenIds with the k-th ImagePadId repeated SlotCounts[k] times (the
+// Qwen3-VL processor's expansion); raises when the counts differ.
+function Qwen3VLExpandImagePads(const TokenIds: array of integer;
+  ImagePadId: integer; const SlotCounts: array of integer): TNeuralIntegerArray;
+
+// Qwen3VLEncodeHiddenStates for a pImageInput encoder: image-pad runs take the
+// images' Merged rows (+DeepStack); ImagePadMask covers the returned rows.
+procedure Qwen3VLEncodeHiddenStatesWithImages(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  const Images: array of TQwen3VLImageEmbeds; DropCount: integer;
+  HiddenStates: TNNetVolume; out ImagePadMask: TQwen3VLImagePadMask;
+  Parallel: boolean = false);
 
 // Caps NN's worker pool at MaxThreads (0 = every CPU thread) and starts it, so
 // repeated parallel passes reuse the workers; does nothing when not Parallel.
@@ -8774,6 +8818,18 @@ procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
 // The Qwen-Image-2.1 text-to-image ChatML prompt (system message, user Prompt,
 // assistant opener); an empty Prompt becomes ' ' as in the diffusers pipeline.
 function QwenImage21TextToImagePrompt(const Prompt: string): string;
+
+// The edit prompt: the user message starts with "<image1>" + one vision block
+// (one <|image_pad|>), then " <imageN>" + a block per further image.
+function QwenImage21EditPrompt(const Prompt: string;
+  ImageCount: integer): string;
+
+// Tokenizes QwenImage21EditPrompt and expands the k-th <|image_pad|> to
+// SlotCounts[k] copies; DropCount as QwenImage21EncodeTextToImagePrompt.
+function QwenImage21EncodeEditPrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; ImagePadId: integer;
+  const SlotCounts: array of integer;
+  out DropCount: integer): TNeuralIntegerArray;
 
 // Tokenizes QwenImage21TextToImagePrompt(Prompt). DropCount = token count of
 // the rendered system message alone (the pipeline's drop_idx).
@@ -14476,14 +14532,13 @@ begin
       S.YarnTruncate, pRotaryHeadDim, pRotaryTileDims);
 end;
 
-// Returns the per-head Q/K rotary layer for the decoder block: an ordinary
+// Returns the Q/K rotary layer for the decoder block: an ordinary
 // TNNetRotaryEmbedding, or - when Config.MRoPEEnabled (Qwen2-VL) - the 3-D
 // TNNetMRotaryEmbedding carrying the mrope_section split. The frequency
 // schedule / scaling is identical either way; only the per-token rotary index
 // differs. Coded by Claude (AI).
 // pRotaryHeadDim > 0 requests the head-tiled full-width layer and
-// pRotaryTileDims > 0 the partial rotary within each tile (only the plain
-// non-M-RoPE path supports either; M-RoPE is never hoisted, so it ignores both).
+// pRotaryTileDims > 0 the partial rotary within each tile (M-RoPE: full only).
 function CreateRoPELayerForConfig(const Config: TLlamaConfig;
   Base: TNeuralFloat; const S: TRoPEScalingConfig;
   pRotaryHeadDim: integer = 0;
@@ -14494,10 +14549,18 @@ begin
     if S.Mode = rsmLongRoPE then
       ImportError('CreateRoPELayerForConfig: M-RoPE + LongRoPE is not ' +
         'supported (no Qwen2-VL config combines them).');
-    Result := TNNetMRotaryEmbedding.Create(Base, Config.MRoPESectionT,
-      Config.MRoPESectionH, Config.MRoPESectionW, S.Mode, S.Factor,
-      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
-      S.YarnTruncate);
+    if pRotaryTileDims > 0 then
+      ImportError('CreateRoPELayerForConfig: M-RoPE has no partial rotary.');
+    if Config.MRoPEInterleaved then
+      Result := TNNetInterleavedMRotaryEmbedding.Create(Base,
+        Config.MRoPESectionT, Config.MRoPESectionH, Config.MRoPESectionW,
+        S.Mode, S.Factor, S.OriginalContextLen, S.YarnAlpha, S.YarnBeta,
+        S.YarnAttnFactor, S.YarnTruncate, pRotaryHeadDim)
+    else
+      Result := TNNetMRotaryEmbedding.Create(Base, Config.MRoPESectionT,
+        Config.MRoPESectionH, Config.MRoPESectionW, S.Mode, S.Factor,
+        S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
+        S.YarnTruncate, pRotaryHeadDim);
   end
   else
     Result := CreateRoPEFromScaling(Base, S, pRotaryHeadDim, pRotaryTileDims);
@@ -14548,6 +14611,7 @@ begin
   Result.MRoPESectionT := 0;
   Result.MRoPESectionH := 0;
   Result.MRoPESectionW := 0;
+  Result.MRoPEInterleaved := false;
   JsonText := TStringList.Create;
   Root := nil;
   try
@@ -14781,8 +14845,8 @@ begin
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
       // Qwen3-VL text decoder: interleaved M-RoPE, whose three position
-      // streams are equal for text, so plain 1-D rotate-half RoPE is exact.
-      // Image/video tokens are refused at encode time (Qwen3VLEncodeHiddenStates).
+      // streams are equal for text, so plain 1-D rotate-half RoPE is exact;
+      // the image encoder sets MRoPEEnabled (BuildQwen3VLTextEncoder...).
       if ModelType = 'qwen3_vl' then
       begin
         RopeParamsField := Obj.Find('rope_parameters');
@@ -14811,8 +14875,24 @@ begin
               ImportError('Llama import: Qwen3-VL mrope_section sums to ' +
                 IntToStr(MRoPEPairCount) + ' channel pairs, expected ' +
                 'head_dim/2 = ' + IntToStr(Result.HeadDim div 2) + '.');
+            if MRoPESectionArr.Count <> 3 then
+              ImportError('Llama import: Qwen3-VL mrope_section has ' +
+                IntToStr(MRoPESectionArr.Count) + ' entries, expected 3.');
+            Result.MRoPESectionT := MRoPESectionArr.Integers[0];
+            Result.MRoPESectionH := MRoPESectionArr.Integers[1];
+            Result.MRoPESectionW := MRoPESectionArr.Integers[2];
           end;
         end;
+        // The sections are used only when the image encoder sets
+        // MRoPEEnabled; transformers' default mrope_section is [24, 20, 20].
+        if Result.MRoPESectionT + Result.MRoPESectionH +
+           Result.MRoPESectionW = 0 then
+        begin
+          Result.MRoPESectionT := 24;
+          Result.MRoPESectionH := 20;
+          Result.MRoPESectionW := 20;
+        end;
+        Result.MRoPEInterleaved := true;
       end;
     end
     else if ModelType = 'qwen3_moe' then
@@ -17409,12 +17489,11 @@ var
 begin
   // The two variants that genuinely need a layer PER HEAD between the
   // projection and the SDPA, and can therefore hoist nothing:
-  //  - M-RoPE (Qwen2-VL): CreateRoPELayerForConfig ignores the head dim for it,
-  //    so a hoisted layer would spread the per-head frequency schedule across
-  //    the whole projection width (wrong frequencies);
+  //  - partial M-RoPE (TNNetMRotaryEmbedding tiles only a full-rotary head);
   //  - Llama-4's QK-L2 norm: applied AFTER RoPE, per head.
-  PerHeadOnly := Config.MRoPEEnabled or Config.Llama4QKL2Norm;
   FullRotary := RotaryDims >= HeadDim;
+  PerHeadOnly := (Config.MRoPEEnabled and not FullRotary) or
+    Config.Llama4QKL2Norm;
   // LongRoPE can NEVER be hoisted, at any rotary width: CreateRoPEFromScaling
   // routes it to CreateLongRoPE, whose signature carries no head dim, so a
   // hoisted layer would run its frequency schedule over the WHOLE projection
@@ -17462,17 +17541,19 @@ end;
 // the same index (TNNet.BuildWeightOwner); nothing is read from pReader
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
-// raises. pStopBeforeFinalNorm: see BuildLlamaFromSafeTensorsWithConfig.
-// Coded by Claude (AI).
+// raises. pStopBeforeFinalNorm, pDeepStackInputs: see
+// BuildLlamaFromSafeTensorsWithConfig. Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
+  pDeepStackInputs: integer = 0): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   BorrowWeights: boolean;   // pWeightOwner given: graph only, no loads
+  BlockOutput, DeepStackInput: TNNetLayer;
   QuantizeSweeps: boolean;  // per-block QuantizeWeightsInt8 sweeps run
   OwnerWeightLayers: integer;
   Blocks: array of TLlamaBlockLayers;
@@ -17541,6 +17622,10 @@ begin
       if Config.SlidingWindow < 0 then
         ImportError('Llama import: SlidingWindow must be >= 0 ' +
           '(0 = full attention).');
+      if (pDeepStackInputs < 0) or (pDeepStackInputs > Config.NumLayers) then
+        ImportError('Llama import: ' + IntToStr(pDeepStackInputs) +
+          ' DeepStack inputs do not fit ' + IntToStr(Config.NumLayers) +
+          ' decoder layers.');
       if Config.NumHeads < 1 then
         ImportError('Llama import: num_attention_heads must be >= 1.');
       if Config.NumKVHeads < 1 then
@@ -18178,7 +18263,13 @@ begin
         if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostMlpNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        BlockOutput := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if BlockCnt < pDeepStackInputs then
+        begin
+          DeepStackInput := NN.AddLayer(
+            TNNetInput.Create(SeqLen, 1, Config.HiddenSize) );
+          NN.AddLayer( TNNetSum.Create([BlockOutput, DeepStackInput]) );
+        end;
         if not pTrainable then NN.SetTrainable();
         if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
@@ -18856,7 +18947,8 @@ end;
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
+  pDeepStackInputs: integer = 0): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
@@ -18865,7 +18957,8 @@ begin
   if Assigned(pWeightOwner) then Reader := nil
   else Reader := CreatePretrainedTensorReader(FileName);
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner, pStopBeforeFinalNorm);
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner, pStopBeforeFinalNorm,
+    pDeepStackInputs);
 end;
 
 function BuildLlamaFromGGUFEx(const FileName: string;
@@ -82634,7 +82727,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadQwen2VLConfigFromJSONFile(ConfigPath);
   // Stamp the M-RoPE flags onto the text config so the shared Llama builder
-  // wires TNNetMRotaryEmbedding on the per-head Q/K rotary slices.
+  // wires TNNetMRotaryEmbedding as the Q/K rotary layers.
   Config.Text.MRoPEEnabled := true;
   Config.Text.MRoPESectionT := Config.MRoPESectionT;
   Config.Text.MRoPESectionH := Config.MRoPESectionH;
@@ -82655,74 +82748,82 @@ end;
 procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
   ImageTokenId, ImageGridH, ImageGridW: integer;
   var PosT, PosH, PosW: array of integer);
+begin
+  if ImageGridH * ImageGridW = 0 then
+    BuildQwen2VLMRoPEPositionIds(TokenIds, ImageTokenId, [], [], PosT, PosH,
+      PosW)
+  else
+    BuildQwen2VLMRoPEPositionIds(TokenIds, ImageTokenId, [ImageGridH],
+      [ImageGridW], PosT, PosH, PosW);
+end;
+
+procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
+  ImageTokenId: integer; const MergedGridHeights, MergedGridWidths: array of integer;
+  var PosT, PosH, PosW: array of integer);
 var
-  SeqLen, t, ImageSlots, CurPos, h, w, MaxHW, FirstImg, i: integer;
-  SeqLenM1, ImageSlotsM1, ImageGridHM1, ImageGridWM1: integer;
+  SeqLen, TokenPos, RunEnd, ImageCnt, ImageCount, CurPos: integer;
+  Row, Col, MaxRowPos, MaxColPos: integer;
 begin
   SeqLen := Length(TokenIds);
-  SeqLenM1 := SeqLen - 1;
-  ImageGridHM1 := ImageGridH - 1;
-  ImageGridWM1 := ImageGridW - 1;
+  ImageCount := Length(MergedGridHeights);
+  if Length(MergedGridWidths) <> ImageCount then
+    ImportError('BuildQwen2VLMRoPEPositionIds: ' + IntToStr(ImageCount) +
+      ' grid heights but ' + IntToStr(Length(MergedGridWidths)) + ' widths.');
   if (Length(PosT) <> SeqLen) or (Length(PosH) <> SeqLen) or
      (Length(PosW) <> SeqLen) then
     ImportError('BuildQwen2VLMRoPEPositionIds: PosT/PosH/PosW must each have ' +
       'length SeqLen (' + IntToStr(SeqLen) + ').');
-  ImageSlots := 0;
-  FirstImg := -1;
-  for t := 0 to SeqLenM1 do
-    if TokenIds[t] = ImageTokenId then
-    begin
-      Inc(ImageSlots);
-      if FirstImg < 0 then FirstImg := t;
-    end;
-  if ImageSlots <> ImageGridH * ImageGridW then
-    ImportError('BuildQwen2VLMRoPEPositionIds: prompt has ' +
-      IntToStr(ImageSlots) + ' image placeholder tokens but the merged grid ' +
-      'is ' + IntToStr(ImageGridH) + 'x' + IntToStr(ImageGridW) + ' = ' +
-      IntToStr(ImageGridH * ImageGridW) + ' (they must match).');
-  // The image tokens are assumed CONTIGUOUS (a single still image, T=1) - the
-  // v1 scope. The HF get_rope_index groups by modality; for one image that is
-  // [text prefix][image block][text suffix].
-  ImageSlotsM1 := ImageSlots - 1;
-  if ImageSlots > 0 then
-    for i := 1 to ImageSlotsM1 do
-      if TokenIds[FirstImg + i] <> ImageTokenId then
-        ImportError('BuildQwen2VLMRoPEPositionIds: the ' +
-          IntToStr(ImageSlots) + ' image tokens must be contiguous (v1 ' +
-          'single-image scope).');
   CurPos := 0;
-  t := 0;
-  while t < SeqLen do
+  ImageCnt := 0;
+  TokenPos := 0;
+  while TokenPos < SeqLen do
   begin
-    if TokenIds[t] = ImageTokenId then
+    if TokenIds[TokenPos] = ImageTokenId then
     begin
-      // Image block (T=1): temporal = CurPos for every token; height/width =
-      // CurPos + row / CurPos + col over the merged grid (HF get_rope_index /
-      // get_vision_position_ids with start_position = CurPos, T=1).
-      for h := 0 to ImageGridHM1 do
-        for w := 0 to ImageGridWM1 do
+      // One image: a maximal run of placeholders (get_rope_index groups by
+      // token type), laid out row-major over the merged grid from CurPos.
+      RunEnd := TokenPos;
+      while (RunEnd < SeqLen) and (TokenIds[RunEnd] = ImageTokenId) do
+        Inc(RunEnd);
+      if ImageCnt >= ImageCount then
+        ImportError('BuildQwen2VLMRoPEPositionIds: the prompt has more image ' +
+          'placeholder runs than the ' + IntToStr(ImageCount) +
+          ' image grids given.');
+      if RunEnd - TokenPos <> MergedGridHeights[ImageCnt] *
+         MergedGridWidths[ImageCnt] then
+        ImportError('BuildQwen2VLMRoPEPositionIds: image ' +
+          IntToStr(ImageCnt) + ' has ' + IntToStr(RunEnd - TokenPos) +
+          ' placeholder tokens but its merged grid is ' +
+          IntToStr(MergedGridHeights[ImageCnt]) + 'x' +
+          IntToStr(MergedGridWidths[ImageCnt]) + ' (they must match).');
+      MaxRowPos := MergedGridHeights[ImageCnt] - 1;
+      MaxColPos := MergedGridWidths[ImageCnt] - 1;
+      for Row := 0 to MaxRowPos do
+        for Col := 0 to MaxColPos do
         begin
-          PosT[t] := CurPos;
-          PosH[t] := CurPos + h;
-          PosW[t] := CurPos + w;
-          Inc(t);
+          PosT[TokenPos] := CurPos;
+          PosH[TokenPos] := CurPos + Row;
+          PosW[TokenPos] := CurPos + Col;
+          Inc(TokenPos);
         end;
-      // The next run resumes at CurPos + max(H, W) (HF advances current_pos by
-      // max(llm_grid_h, llm_grid_w)).
-      MaxHW := ImageGridH;
-      if ImageGridW > MaxHW then MaxHW := ImageGridW;
-      CurPos := CurPos + MaxHW;
+      CurPos := CurPos + Max(MergedGridHeights[ImageCnt],
+        MergedGridWidths[ImageCnt]);
+      Inc(ImageCnt);
     end
     else
     begin
-      // Text token: all three sections share the scalar CurPos (1-D RoPE).
-      PosT[t] := CurPos;
-      PosH[t] := CurPos;
-      PosW[t] := CurPos;
+      // Text: the same scalar on all three axes (1-D RoPE).
+      PosT[TokenPos] := CurPos;
+      PosH[TokenPos] := CurPos;
+      PosW[TokenPos] := CurPos;
       Inc(CurPos);
-      Inc(t);
+      Inc(TokenPos);
     end;
   end;
+  if ImageCnt <> ImageCount then
+    ImportError('BuildQwen2VLMRoPEPositionIds: the prompt has ' +
+      IntToStr(ImageCnt) + ' image placeholder runs but ' +
+      IntToStr(ImageCount) + ' image grids were given.');
 end;
 
 procedure Qwen2VLSetMRoPEPositions(TextNet: TNNet;
@@ -82870,9 +82971,10 @@ end;
 function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
   out Config: TQwen3VLConfig; pSeqLen: integer;
   pQuantizeInt8: boolean = false; const ConfigFileName: string = '';
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pImageInput: boolean = false): TNNet;
 var
   ConfigPath: string;
+  DeepStackInputs: integer;
 begin
   if pSeqLen < 1 then
     ImportError('Qwen3-VL text encoder: pSeqLen must be >= 1 (the prompt ' +
@@ -82880,19 +82982,28 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadQwen3VLConfigFromJSONFile(ConfigPath);
+  DeepStackInputs := 0;
+  if pImageInput then
+  begin
+    if (Config.ImageTokenId < 0) or (Config.Vision.Depth < 1) then
+      ImportError('Qwen3-VL text encoder: ' + ConfigPath + ' has no ' +
+        'image_token_id or vision_config, so it cannot take images.');
+    Config.Text.MRoPEEnabled := true;
+    DeepStackInputs := Length(Config.Vision.DeepStackIndexes);
+  end;
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
     {pTrainable=}false, pQuantizeInt8, pWeightOwner,
-    {pStopBeforeFinalNorm=}true);
+    {pStopBeforeFinalNorm=}true, DeepStackInputs);
 end;
 
-procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
-  const Config: TQwen3VLConfig; const TokenIds: array of integer;
-  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean);
+// The checks both encode routes share: TokenIds fit SeqLen and the vocabulary,
+// DropCount leaves a row, no video ids; image ids only when ImagesAllowed.
+procedure Qwen3VLCheckTokenIds(const Config: TQwen3VLConfig;
+  const TokenIds: array of integer; SeqLen, DropCount: integer;
+  ImagesAllowed: boolean);
 var
-  Input: TNNetVolume;
-  SeqLen, TokenCount, MaxTokenPos, TokenPos: integer;
+  TokenCount, MaxTokenPos, TokenPos: integer;
 begin
-  SeqLen := Encoder.GetFirstLayer().Output.SizeX;
   TokenCount := Length(TokenIds);
   if (TokenCount < 1) or (TokenCount > SeqLen) then
     ImportError('Qwen3VLEncodeHiddenStates: ' + IntToStr(TokenCount) +
@@ -82909,15 +83020,48 @@ begin
       ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
         ' has id ' + IntToStr(TokenIds[TokenPos]) + ', outside the ' +
         'vocabulary 0..' + IntToStr(Config.Text.VocabSize - 1) + '.');
-    if ((Config.ImageTokenId >= 0) and
+    if ((not ImagesAllowed) and (Config.ImageTokenId >= 0) and
         (TokenIds[TokenPos] = Config.ImageTokenId)) or
        ((Config.VideoTokenId >= 0) and
         (TokenIds[TokenPos] = Config.VideoTokenId)) then
       ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
         ' is an image/video placeholder (id ' + IntToStr(TokenIds[TokenPos]) +
-        '); vision input needs the vision tower and 3-D M-RoPE positions, ' +
-        'which this text-only encoder does not have.');
+        '); images need Qwen3VLEncodeHiddenStatesWithImages and an encoder ' +
+        'built with pImageInput; video is not supported.');
   end;
+end;
+
+// True when Encoder was built with pImageInput (its RoPE layers are M-RoPE).
+function Qwen3VLEncoderTakesImages(Encoder: TNNet): boolean;
+var
+  LayerCnt, MaxLayerPos: integer;
+begin
+  Result := false;
+  MaxLayerPos := Encoder.GetLastLayerIdx();
+  for LayerCnt := 0 to MaxLayerPos do
+    if Encoder.Layers[LayerCnt] is TNNetMRotaryEmbedding then exit(true);
+end;
+
+procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean);
+var
+  Input: TNNetVolume;
+  SeqLen, TokenCount, MaxTokenPos, TokenPos: integer;
+  ImagePadMask: TQwen3VLImagePadMask;
+begin
+  SeqLen := Encoder.GetFirstLayer().Output.SizeX;
+  Qwen3VLCheckTokenIds(Config, TokenIds, SeqLen, DropCount,
+    {ImagesAllowed=}false);
+  // An image encoder needs its positions and DeepStack rows set every call.
+  if Qwen3VLEncoderTakesImages(Encoder) then
+  begin
+    Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, TokenIds, [],
+      DropCount, HiddenStates, ImagePadMask, Parallel);
+    exit;
+  end;
+  TokenCount := Length(TokenIds);
+  MaxTokenPos := TokenCount - 1;
   Input := TNNetVolume.Create(SeqLen, 1, 1);
   try
     Input.Fill(0);
@@ -82931,6 +83075,216 @@ begin
   end;
 end;
 
+function Qwen3VLImageSlotCount(GridH, GridW, MergeSize: integer): integer;
+begin
+  if (MergeSize < 1) or (GridH < 1) or (GridW < 1) or
+     (GridH mod MergeSize <> 0) or (GridW mod MergeSize <> 0) then
+    ImportError('Qwen3VLImageSlotCount: patch grid ' + IntToStr(GridH) + 'x' +
+      IntToStr(GridW) + ' is not a positive multiple of the merge size ' +
+      IntToStr(MergeSize) + '.');
+  Result := (GridH div MergeSize) * (GridW div MergeSize);
+end;
+
+function Qwen3VLExpandImagePads(const TokenIds: array of integer;
+  ImagePadId: integer; const SlotCounts: array of integer): TNeuralIntegerArray;
+var
+  TokenPos, MaxTokenPos, PadCnt, SlotCnt, MaxSlotPos, ResultPos,
+    ExpandedCount: integer;
+begin
+  Result := nil;
+  MaxTokenPos := Length(TokenIds) - 1;
+  PadCnt := 0;
+  for TokenPos := 0 to MaxTokenPos do
+    if TokenIds[TokenPos] = ImagePadId then Inc(PadCnt);
+  if PadCnt <> Length(SlotCounts) then
+    ImportError('Qwen3VLExpandImagePads: the ids hold ' + IntToStr(PadCnt) +
+      ' image pads but ' + IntToStr(Length(SlotCounts)) +
+      ' slot counts were given.');
+  ExpandedCount := Length(TokenIds) - PadCnt;
+  MaxSlotPos := Length(SlotCounts) - 1;
+  for SlotCnt := 0 to MaxSlotPos do
+  begin
+    if SlotCounts[SlotCnt] < 1 then
+      ImportError('Qwen3VLExpandImagePads: slot count ' +
+        IntToStr(SlotCounts[SlotCnt]) + ' must be >= 1.');
+    Inc(ExpandedCount, SlotCounts[SlotCnt]);
+  end;
+  SetLength(Result, ExpandedCount);
+  ResultPos := 0;
+  PadCnt := 0;
+  for TokenPos := 0 to MaxTokenPos do
+    if TokenIds[TokenPos] = ImagePadId then
+    begin
+      for SlotCnt := 1 to SlotCounts[PadCnt] do
+      begin
+        Result[ResultPos] := ImagePadId;
+        Inc(ResultPos);
+      end;
+      Inc(PadCnt);
+    end
+    else
+    begin
+      Result[ResultPos] := TokenIds[TokenPos];
+      Inc(ResultPos);
+    end;
+end;
+
+procedure Qwen3VLEncodeHiddenStatesWithImages(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  const Images: array of TQwen3VLImageEmbeds; DropCount: integer;
+  HiddenStates: TNNetVolume; out ImagePadMask: TQwen3VLImagePadMask;
+  Parallel: boolean);
+var
+  Input, Embeddings, DeepStackRows: TNNetVolume;
+  DeepStackInputs: array of TNNetLayer;
+  PosT, PosH, PosW, MergedHeights, MergedWidths: TNeuralIntegerArray;
+  SeqLen, TokenCount, MaxTokenPos, TokenPos, Hidden, MergeSize: integer;
+  ImageCnt, MaxImagePos, StackCnt, MaxStackPos, LayerCnt, MaxLayerPos: integer;
+  SlotCount, PaddingRowPos, MaxSeqPos: integer;
+  RowBytes: integer;
+  ImageLabel: string;
+
+  // Copies Merged (StackIdx < 0) or DeepStack[StackIdx] of each image, row by
+  // row, to that image's image-pad rows of Dest.
+  procedure ScatterImageRows(Dest: TNNetVolume; StackIdx: integer);
+  var
+    Source: TNNetVolume;
+    RowPos, ImagePos, SourceRow: integer;
+  begin
+    ImagePos := -1;
+    SourceRow := 0;
+    Source := nil;
+    for RowPos := 0 to MaxTokenPos do
+      if TokenIds[RowPos] = Config.ImageTokenId then
+      begin
+        if (RowPos = 0) or (TokenIds[RowPos - 1] <> Config.ImageTokenId) then
+        begin
+          Inc(ImagePos);
+          SourceRow := 0;
+          if StackIdx < 0 then Source := Images[ImagePos].Merged
+          else Source := Images[ImagePos].DeepStack[StackIdx];
+        end;
+        Move(Source.FData[SourceRow * Hidden], Dest.FData[RowPos * Hidden],
+          RowBytes);
+        Inc(SourceRow);
+      end;
+  end;
+
+begin
+  SeqLen := Encoder.GetFirstLayer().Output.SizeX;
+  Qwen3VLCheckTokenIds(Config, TokenIds, SeqLen, DropCount,
+    {ImagesAllowed=}true);
+  if (Encoder.CountLayers() < 3) or
+     not (Encoder.Layers[1] is TNNetEmbedding) then
+    ImportError('Qwen3VLEncodeHiddenStatesWithImages: layer 1 is not a ' +
+      'TNNetEmbedding (not a BuildQwen3VLTextEncoderFromSafeTensors net?).');
+  if not Qwen3VLEncoderTakesImages(Encoder) then
+    ImportError('Qwen3VLEncodeHiddenStatesWithImages: the encoder has no ' +
+      'M-RoPE layers (build it with pImageInput).');
+  TokenCount := Length(TokenIds);
+  MaxTokenPos := TokenCount - 1;
+  MaxSeqPos := SeqLen - 1;
+  Hidden := Config.Text.HiddenSize;
+  RowBytes := Hidden * csNeuralFloatSize;
+  MergeSize := Config.Vision.SpatialMergeSize;
+  MaxLayerPos := Encoder.GetLastLayerIdx();
+  SetLength(DeepStackInputs, 0);
+  for LayerCnt := 2 to MaxLayerPos do
+    if Encoder.Layers[LayerCnt] is TNNetInput then
+    begin
+      SetLength(DeepStackInputs, Length(DeepStackInputs) + 1);
+      DeepStackInputs[High(DeepStackInputs)] := Encoder.Layers[LayerCnt];
+    end;
+  if Length(DeepStackInputs) <> Length(Config.Vision.DeepStackIndexes) then
+    ImportError('Qwen3VLEncodeHiddenStatesWithImages: the encoder has ' +
+      IntToStr(Length(DeepStackInputs)) + ' DeepStack inputs, the config ' +
+      IntToStr(Length(Config.Vision.DeepStackIndexes)) + ' (build it with ' +
+      'pImageInput).');
+  MaxStackPos := High(DeepStackInputs);
+  MaxImagePos := High(Images);
+  SetLength(MergedHeights, Length(Images));
+  SetLength(MergedWidths, Length(Images));
+  for ImageCnt := 0 to MaxImagePos do
+  begin
+    ImageLabel := 'Qwen3VLEncodeHiddenStatesWithImages: image ' +
+      IntToStr(ImageCnt);
+    SlotCount := Qwen3VLImageSlotCount(Images[ImageCnt].GridH,
+      Images[ImageCnt].GridW, MergeSize);
+    MergedHeights[ImageCnt] := Images[ImageCnt].GridH div MergeSize;
+    MergedWidths[ImageCnt] := Images[ImageCnt].GridW div MergeSize;
+    if (Images[ImageCnt].Merged = nil) or
+       (Images[ImageCnt].Merged.SizeX <> SlotCount) or
+       (Images[ImageCnt].Merged.SizeY <> 1) or
+       (Images[ImageCnt].Merged.Depth <> Hidden) then
+      ImportError(ImageLabel + ': Merged must be (' + IntToStr(SlotCount) +
+        ',1,' + IntToStr(Hidden) + ') for its ' +
+        IntToStr(Images[ImageCnt].GridH) + 'x' +
+        IntToStr(Images[ImageCnt].GridW) + ' patch grid.');
+    if Length(Images[ImageCnt].DeepStack) <> Length(DeepStackInputs) then
+      ImportError(ImageLabel + ' has ' +
+        IntToStr(Length(Images[ImageCnt].DeepStack)) +
+        ' DeepStack features, the encoder takes ' +
+        IntToStr(Length(DeepStackInputs)) + '.');
+    for StackCnt := 0 to MaxStackPos do
+      if (Images[ImageCnt].DeepStack[StackCnt] = nil) or
+         (Images[ImageCnt].DeepStack[StackCnt].Size <>
+          Images[ImageCnt].Merged.Size) then
+        ImportError(ImageLabel + ': DeepStack ' + IntToStr(StackCnt) +
+          ' must have the shape of Merged.');
+  end;
+  // get_rope_index over the real ids; the right padding continues as text
+  // after the largest position (causal: it never reaches the real rows).
+  SetLength(PosT, TokenCount);
+  SetLength(PosH, TokenCount);
+  SetLength(PosW, TokenCount);
+  BuildQwen2VLMRoPEPositionIds(TokenIds, Config.ImageTokenId, MergedHeights,
+    MergedWidths, PosT, PosH, PosW);
+  PaddingRowPos := 0;
+  for TokenPos := 0 to MaxTokenPos do
+    PaddingRowPos := Max(PaddingRowPos, Max(PosT[TokenPos],
+      Max(PosH[TokenPos], PosW[TokenPos])) + 1);
+  SetLength(PosT, SeqLen);
+  SetLength(PosH, SeqLen);
+  SetLength(PosW, SeqLen);
+  for TokenPos := TokenCount to MaxSeqPos do
+  begin
+    PosT[TokenPos] := PaddingRowPos;
+    PosH[TokenPos] := PaddingRowPos;
+    PosW[TokenPos] := PaddingRowPos;
+    Inc(PaddingRowPos);
+  end;
+  Qwen2VLSetMRoPEPositions(Encoder, PosT, PosH, PosW);
+
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    Input.Fill(0);
+    for TokenPos := 0 to MaxTokenPos do
+      Input.FData[TokenPos] := TokenIds[TokenPos];
+    // The embedding lookup alone, then the image rows replaced in its output.
+    Encoder.Compute(Input, 0, Parallel, {EndLayerIdx=}1);
+    Encoder.Layers[1].ForceOutputOnRAM();
+    Embeddings := Encoder.Layers[1].Output;
+    ScatterImageRows(Embeddings, -1);
+    Encoder.Layers[1].MarkOutputWrittenOnRAM();
+    for StackCnt := 0 to MaxStackPos do
+    begin
+      DeepStackRows := DeepStackInputs[StackCnt].Output;
+      DeepStackRows.Fill(0);
+      ScatterImageRows(DeepStackRows, StackCnt);
+      DeepStackInputs[StackCnt].MarkOutputWrittenOnRAM();
+    end;
+    Encoder.ComputeFromFilledInput(2, Parallel, -1);
+    HiddenStates.CopyCropping(Encoder.GetLastLayer().Output, DropCount, 0,
+      TokenCount - DropCount, 1);
+  finally
+    Input.Free;
+  end;
+  SetLength(ImagePadMask, TokenCount - DropCount);
+  for TokenPos := DropCount to MaxTokenPos do
+    ImagePadMask[TokenPos - DropCount] :=
+      TokenIds[TokenPos] = Config.ImageTokenId;
+end;
+
 procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
   MaxThreads: integer);
 begin
@@ -82941,22 +83295,54 @@ begin
 end;
 
 function QwenImage21TextToImagePrompt(const Prompt: string): string;
+begin
+  Result := QwenImage21EditPrompt(Prompt, 0);
+end;
+
+function QwenImage21EditPrompt(const Prompt: string;
+  ImageCount: integer): string;
 var
   UserText: string;
+  ImageCnt: integer;
 begin
-  if Prompt = '' then UserText := ' ' else UserText := Prompt;
+  UserText := '';
+  for ImageCnt := 1 to ImageCount do
+  begin
+    if ImageCnt > 1 then UserText := UserText + ' ';
+    UserText := UserText + '<image' + IntToStr(ImageCnt) +
+      '><|vision_start|><|image_pad|><|vision_end|>';
+  end;
+  if Prompt = '' then UserText := UserText + ' '
+  else UserText := UserText + Prompt;
   Result := ApplyChatTemplate(cfChatML,
     [ChatMessage('system', csQwenImage21SystemPrompt),
      ChatMessage('user', UserText)], {AddGenerationPrompt=}true);
 end;
 
+// Token count of the rendered system message alone (the pipeline's drop_idx).
+function QwenImage21SystemTokenCount(Tokenizer: TNeuralHFTokenizer): integer;
+begin
+  Result := Length(EncodeChat(Tokenizer, cfChatML,
+    [ChatMessage('system', csQwenImage21SystemPrompt)],
+    {AddGenerationPrompt=}false));
+end;
+
 function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
   const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
 begin
-  DropCount := Length(EncodeChat(Tokenizer, cfChatML,
-    [ChatMessage('system', csQwenImage21SystemPrompt)],
-    {AddGenerationPrompt=}false));
+  DropCount := QwenImage21SystemTokenCount(Tokenizer);
   Result := Tokenizer.Encode(QwenImage21TextToImagePrompt(Prompt));
+end;
+
+function QwenImage21EncodeEditPrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; ImagePadId: integer;
+  const SlotCounts: array of integer;
+  out DropCount: integer): TNeuralIntegerArray;
+begin
+  DropCount := QwenImage21SystemTokenCount(Tokenizer);
+  Result := Qwen3VLExpandImagePads(Tokenizer.Encode(
+    QwenImage21EditPrompt(Prompt, Length(SlotCounts))), ImagePadId,
+    SlotCounts);
 end;
 
 procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
