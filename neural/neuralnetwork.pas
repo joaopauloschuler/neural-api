@@ -409,6 +409,17 @@ type
       function WillThread(): boolean;
   end;
 
+  {$IFDEF OpenCL}
+  // Profiled forwards classified by where the layer found its sources and
+  // left its output (TNNetLayer.RunProfiled); legend in LayerGroupTimingReport.
+  // Blind spot: an OpenCL forward that binds one source and reads another
+  // from stale RAM counts as bound; only a sentinel test catches that.
+  TNNetResidencyCounts = record
+    SourceBoundCnt, SourcePulledToRAMCnt, ActivationUploadedCnt,
+      StaleSuspectCnt, OutputResidentCnt: Int64;
+  end;
+  {$ENDIF}
+
   /// neural network layer
   TNNetLayer = class(TNNetLayerThreading)
     protected
@@ -440,6 +451,12 @@ type
       FProfiledForwardOpenCLTime: double;
       {$IFDEF OpenCL}
       FProfiledTransfers: TOpenCLTransferCounts;
+      FProfiledResidency: TNNetResidencyCounts;
+      // AppendInputLayers minus Self, and per source whether its output was
+      // only in OpenCL memory before this forward; set by
+      // BuildResidencySources.
+      FResidencySources: array of TNNetLayer;
+      FResidencySourceWasResidentOnly: array of boolean;
       {$ENDIF}
       FNeurons: TNNetNeuronList;
       FOutput: TNNetVolume;
@@ -787,6 +804,11 @@ type
       // with LayerProfiling on; charges the OpenCL queue drain to this layer.
       procedure RunProfiled(ChunkPrep: boolean);
       {$IFDEF OpenCL}
+      // Caches the sources RunProfiled inspects for ProfiledResidency.
+      procedure BuildResidencySources();
+      // The layers this layer's forward reads; AppendInputLayers unless that
+      // also lists a layer the forward never reads.
+      procedure AppendResidencySources(pList: TList); virtual;
       // Waits for the net's queue and, when it has its own (private kernels),
       // the queue of this layer's output kernel.
       procedure FinishOpenCLQueues();
@@ -970,6 +992,8 @@ type
       {$IFDEF OpenCL}
       property ProfiledTransfers: TOpenCLTransferCounts
         read FProfiledTransfers;
+      property ProfiledResidency: TNNetResidencyCounts
+        read FProfiledResidency;
       {$ENDIF}
       property LinkedNeurons: boolean read FLinkedNeurons;
       // The layer whose weights this one borrows (nil: none, or the owner is
@@ -1299,6 +1323,8 @@ type
       // The next Compute copies Source's resident output into this layer's
       // OpenCL buffer instead of uploading FOutput. False: nothing changes.
       function CopyNextInputFrom(Source: TNNetLayer): boolean;
+      // None: the host fills FOutput; FPrevLayer is never read.
+      procedure AppendResidencySources(pList: TList); override;
       {$ENDIF}
       // Uploads FOutput and leaves the host copy valid, so both locations hold
       // it and a consumer that declines to bind pays nothing.
@@ -13117,6 +13143,10 @@ type
     function SaveStructureToString(): string; override;
     procedure BackpropagateConcat();
     procedure AppendInputLayers(pList: TList); override;
+    {$IFDEF OpenCL}
+    // FPrevLayerList only: the forward never reads FPrevLayer.
+    procedure AppendResidencySources(pList: TList); override;
+    {$ENDIF}
   end;
 
   /// This layer concatenates previous layers into the X axis. Consider using
@@ -13336,6 +13366,10 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure AppendInputLayers(pList: TList); override;
+    {$IFDEF OpenCL}
+    // FA and FB only: the forward never reads FPrevLayer.
+    procedure AppendResidencySources(pList: TList); override;
+    {$ENDIF}
   end;
 
   /// picks/splits from previous layer selected channels.
@@ -17977,6 +18011,7 @@ type
     ProfiledForwardUs, ProfiledForwardOpenCLUs: double;
     {$IFDEF OpenCL}
     ProfiledTransfers: TOpenCLTransferCounts;
+    ProfiledResidency: TNNetResidencyCounts;
     {$ENDIF}
   end;
   TNNetLayerGroupTimingArray = array of TNNetLayerGroupTiming;
@@ -18303,6 +18338,11 @@ type
       FNNetForwardTimeQueueOpenCL: double;
       FOpenCLArmingWeightPrepTime: double;
       FNNetBackwardTime: double;
+      {$IFDEF OpenCL}
+      // OpenCLProcessTransferTotals at the last ClearTime (the start of the
+      // window LayerGroupTimingReport's "outside the layer rows" line covers).
+      FProcessTransfersAtClearTime: TOpenCLTransferCounts;
+      {$ENDIF}
       FKeepLastOutputOnOpenCL: boolean;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
       FMaxDeltaLayer: integer;
@@ -113683,6 +113723,19 @@ begin
     Result := '-';
 end;
 
+{$IFDEF OpenCL}
+// Total += Counts.
+procedure AddResidencyCounts(var Total: TNNetResidencyCounts;
+  const Counts: TNNetResidencyCounts);
+begin
+  Inc(Total.SourceBoundCnt, Counts.SourceBoundCnt);
+  Inc(Total.SourcePulledToRAMCnt, Counts.SourcePulledToRAMCnt);
+  Inc(Total.ActivationUploadedCnt, Counts.ActivationUploadedCnt);
+  Inc(Total.StaleSuspectCnt, Counts.StaleSuspectCnt);
+  Inc(Total.OutputResidentCnt, Counts.OutputResidentCnt);
+end;
+{$ENDIF}
+
 class function TNNet.LayerGroupTimings(NN: TNNet;
   const GroupNames: array of string): TNNetLayerGroupTimingArray;
 var
@@ -113733,6 +113786,7 @@ begin
         Layer.ProfiledForwardOpenCLTime * csMicrosecondsPerDay;
       {$IFDEF OpenCL}
       AddOpenCLTransferCounts(ProfiledTransfers, Layer.ProfiledTransfers);
+      AddResidencyCounts(ProfiledResidency, Layer.ProfiledResidency);
       {$ENDIF}
     end;
   end;
@@ -113833,7 +113887,8 @@ var
   ProfiledForwardTotal, ProfiledForwardOpenCLTotal: Int64;
   ProfiledForwardUsTotal, ProfiledForwardOpenCLUsTotal, CountPct,
     TimePct: double;
-  Transfers: TOpenCLTransferCounts;
+  Transfers, OutsideTransfers: TOpenCLTransferCounts;
+  Residency: TNNetResidencyCounts;
   {$ENDIF}
   HasGroupNames, IsOnOpenCL: boolean;
   Row, FwdStr, OpenCLStr: string;
@@ -113873,6 +113928,7 @@ begin
   ProfiledForwardUsTotal := 0;
   ProfiledForwardOpenCLUsTotal := 0;
   Transfers := Default(TOpenCLTransferCounts);
+  Residency := Default(TNNetResidencyCounts);
   {$ENDIF}
   NameWidth := 5;
   for GroupPos := 0 to MaxGroupPos do
@@ -113890,6 +113946,7 @@ begin
     ProfiledForwardOpenCLUsTotal := ProfiledForwardOpenCLUsTotal +
       Groups[GroupPos].ProfiledForwardOpenCLUs;
     AddOpenCLTransferCounts(Transfers, Groups[GroupPos].ProfiledTransfers);
+    AddResidencyCounts(Residency, Groups[GroupPos].ProfiledResidency);
     {$ENDIF}
   end;
   Lines := TStringList.Create;
@@ -114004,6 +114061,47 @@ begin
         'have one (%s); LayerProfiling adds the share of all forwards and ' +
         'of layer time.', [ForwardGPUTotal, ForwardGPUTotal + ForwardCPUTotal,
         ForwardOpenCLShareStr(ForwardGPUTotal, ForwardCPUTotal)]));
+    if NN.FLayerProfiling and IsOnOpenCL then
+    begin
+      OutsideTransfers := Default(TOpenCLTransferCounts);
+      AddOpenCLTransferDelta(OutsideTransfers, OpenCLProcessTransferTotals(),
+        NN.FProcessTransfersAtClearTime);
+      AddOpenCLTransferDelta(OutsideTransfers, Default(TOpenCLTransferCounts),
+        Transfers);
+      Lines.Add(Format('Transfers outside the layer rows since ClearTime ' +
+        '(callers and other nets included): up %d / %.1f MB, down %d / ' +
+        '%.1f MB.', [OutsideTransfers.UploadCount,
+        OutsideTransfers.UploadBytes / cBytesPerMB,
+        OutsideTransfers.DownloadCount,
+        OutsideTransfers.DownloadBytes / cBytesPerMB]));
+      Lines.Add('');
+      Lines.Add('OpenCL residency of the profiled forwards (sources = the ' +
+        'layers a layer reads):');
+      Lines.Add('bound = OpenCL forward, every source already in OpenCL ' +
+        'memory; pulled = this layer copied a source from OpenCL memory ' +
+        'to RAM;');
+      Lines.Add('uploaded = OpenCL forward that uploaded a source only in RAM ' +
+        'or one it pulled; stale? = host forward, a source only in OpenCL ' +
+        'memory;');
+      Lines.Add('kept = output left only in OpenCL memory. A forward can ' +
+        'count in several columns.');
+      Row := Format('%-*s %7s %7s %7s %8s %7s %7s', [NameWidth, 'Group',
+        'Fwds', 'bound', 'pulled', 'uploaded', 'stale?', 'kept']);
+      RuleWidth := Length(Row);
+      Lines.Add(Row);
+      Lines.Add(StringOfChar('-', RuleWidth));
+      for GroupPos := 0 to MaxGroupPos do
+        with Groups[GroupPos], ProfiledResidency do
+          Lines.Add(Format('%-*s %7d %7d %7d %8d %7d %7d', [NameWidth,
+            GroupName, ProfiledForwardCnt, SourceBoundCnt,
+            SourcePulledToRAMCnt, ActivationUploadedCnt, StaleSuspectCnt,
+            OutputResidentCnt]));
+      Lines.Add(StringOfChar('-', RuleWidth));
+      with Residency do
+        Lines.Add(Format('%-*s %7d %7d %7d %8d %7d %7d', [NameWidth, 'TOTAL',
+          ProfiledForwardTotal, SourceBoundCnt, SourcePulledToRAMCnt,
+          ActivationUploadedCnt, StaleSuspectCnt, OutputResidentCnt]));
+    end;
     {$ENDIF}
     Result := Lines.Text;
   finally
@@ -114012,10 +114110,20 @@ begin
 end;
 
 procedure TNNet.SetLayerProfiling(Value: boolean);
+{$IFDEF OpenCL}
+var
+  LayerCnt, MaxLayerPos: integer;
+{$ENDIF}
 begin
   FLayerProfiling := Value;
   {$IFDEF OpenCL}
-  if Value then OpenCLTransferCounting := true;
+  if Value then
+  begin
+    OpenCLTransferCounting := true;
+    MaxLayerPos := GetLastLayerIdx();
+    for LayerCnt := 0 to MaxLayerPos do
+      FLayers[LayerCnt].BuildResidencySources();
+  end;
   {$ENDIF}
 end;
 
@@ -131474,6 +131582,10 @@ begin
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
   if Assigned(FBuildWeightOwner) then pLayer.LinkBuildWeightOwner();
+  {$IFDEF OpenCL}
+  // Reads the layer's sources, so they must be set before RegisterLayer.
+  if FLayerProfiling then pLayer.BuildResidencySources();
+  {$ENDIF}
 end;
 
 function TNNet.WeightElementsSized(): int64;
@@ -136163,6 +136275,9 @@ begin
   FNNetForwardTimeQueueOpenCL := 0;
   FOpenCLArmingWeightPrepTime := 0;
   FNNetBackwardTime := 0;
+  {$IFDEF OpenCL}
+  FProcessTransfersAtClearTime := OpenCLProcessTransferTotals();
+  {$ENDIF}
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
@@ -138888,6 +139003,7 @@ begin
   FProfiledForwardOpenCLTime := 0;
   {$IFDEF OpenCL}
   FillChar(FProfiledTransfers, SizeOf(FProfiledTransfers), 0);
+  FillChar(FProfiledResidency, SizeOf(FProfiledResidency), 0);
   {$ENDIF}
 end;
 
@@ -138896,17 +139012,62 @@ var
   ForwardTimeBefore: double;
 {$IFDEF OpenCL}
   TransfersBefore: TOpenCLTransferCounts;
-  GPUCntBefore: integer;
+  GPUCntBefore, SourcePos, MaxSourcePos: integer;
   DrainStart: TDateTime;
+  Source: TNNetLayer;
+  TookOpenCL, AnySourceOnlyInRAM, AnySourcePulled,
+    AnySourceStillResidentOnly, SourceUploaded: boolean;
 {$ENDIF}
 begin
   ForwardTimeBefore := FForwardTime;
   {$IFDEF OpenCL}
   TransfersBefore := OpenCLThreadTransfers;
   GPUCntBefore := FForwardGPUCnt;
+  MaxSourcePos := High(FResidencySources);
+  AnySourceOnlyInRAM := false;
+  for SourcePos := 0 to MaxSourcePos do
+  begin
+    Source := FResidencySources[SourcePos];
+    FResidencySourceWasResidentOnly[SourcePos] :=
+      Source.FOutputOnOpenCL and not Source.FOutputOnRAM;
+    if not Source.FOutputOnOpenCL then AnySourceOnlyInRAM := true;
+  end;
   {$ENDIF}
   if ChunkPrep then PrepareChunkedForward() else Compute();
   {$IFDEF OpenCL}
+  TookOpenCL := FForwardGPUCnt <> GPUCntBefore;
+  AnySourcePulled := false;
+  AnySourceStillResidentOnly := false;
+  for SourcePos := 0 to MaxSourcePos do
+    if FResidencySourceWasResidentOnly[SourcePos] then
+    begin
+      Source := FResidencySources[SourcePos];
+      if Source.FOutputOnRAM then AnySourcePulled := true
+      else if Source.FOutputOnOpenCL then AnySourceStillResidentOnly := true;
+    end;
+  // Under the parallel scheduler a sibling may have done the download.
+  AnySourcePulled := AnySourcePulled and
+    (OpenCLThreadTransfers.DownloadCount > TransfersBefore.DownloadCount);
+  SourceUploaded :=
+    OpenCLThreadTransfers.UploadCount > TransfersBefore.UploadCount;
+  with FProfiledResidency do
+  begin
+    if AnySourcePulled then Inc(SourcePulledToRAMCnt);
+    if TookOpenCL then
+    begin
+      // A pulled source uploaded again is a round trip.
+      if (AnySourceOnlyInRAM or AnySourcePulled) and SourceUploaded then
+        Inc(ActivationUploadedCnt);
+      if (MaxSourcePos >= 0) and not (AnySourceOnlyInRAM or AnySourcePulled)
+        then Inc(SourceBoundCnt);
+    end
+    // A host forward whose source is only in OpenCL memory read stale RAM.
+    else if AnySourceStillResidentOnly then Inc(StaleSuspectCnt);
+    // The chunk path computes the output after the prep.
+    if (not ChunkPrep) and FOutputOnOpenCL and not FOutputOnRAM then
+      Inc(OutputResidentCnt);
+  end;
+
   // Only a layer that enqueued work drains, so a host layer running beside an
   // OpenCL layer (parallel scheduler) does not wait for that layer's kernels.
   // The chunk path's caller times the prep itself, drain included.
@@ -138934,6 +139095,54 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetLayer.BuildResidencySources();
+var
+  Sources: TList;
+  SourcePos, MaxSourcePos, KeptCnt: integer;
+begin
+  Sources := TList.Create();
+  try
+    AppendResidencySources(Sources);
+    SetLength(FResidencySources, Sources.Count);
+    KeptCnt := 0;
+    MaxSourcePos := Sources.Count - 1;
+    for SourcePos := 0 to MaxSourcePos do
+      if Assigned(Sources[SourcePos]) and (Sources[SourcePos] <> Pointer(Self))
+        and (Sources.IndexOf(Sources[SourcePos]) = SourcePos) then
+      begin
+        FResidencySources[KeptCnt] := TNNetLayer(Sources[SourcePos]);
+        Inc(KeptCnt);
+      end;
+    SetLength(FResidencySources, KeptCnt);
+    SetLength(FResidencySourceWasResidentOnly, KeptCnt);
+  finally
+    Sources.Free;
+  end;
+end;
+
+procedure TNNetLayer.AppendResidencySources(pList: TList);
+begin
+  AppendInputLayers(pList);
+end;
+
+procedure TNNetInput.AppendResidencySources(pList: TList);
+begin
+end;
+
+procedure TNNetConcatBase.AppendResidencySources(pList: TList);
+var
+  SourcePos, MaxSourcePos: integer;
+begin
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  for SourcePos := 0 to MaxSourcePos do pList.Add(FPrevLayerList[SourcePos]);
+end;
+
+procedure TNNetDotProducts.AppendResidencySources(pList: TList);
+begin
+  if Assigned(FA) then pList.Add(FA);
+  if Assigned(FB) then pList.Add(FB);
+end;
+
 procedure TNNetLayer.FinishOpenCLQueues();
 var
   OutputKernel: TNeuralKernel;

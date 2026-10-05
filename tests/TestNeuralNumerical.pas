@@ -733,6 +733,13 @@ type
     // concat runs there only when every source stayed resident.
     procedure RoPEResidentHeadChainUnforcedOpenCLParity;
     procedure InputResidentSourceUnforcedOpenCLParity;
+    // LayerProfiling's residency counts on TNNetInput -> TNNetPointwiseConvLinear
+    // -> TNNetReLU, then a host consumer, a stale-reading test layer, and a
+    // caller's ForceOutputOnRAM in the "outside the layer rows" line.
+    procedure ProfiledResidencyCountsOpenCL;
+    // Residency sources: a second TNNetInput, a TNNetSum whose FPrevLayer it
+    // never reads (LayerProfiling on before AddLayer), and a forced upload.
+    procedure ProfiledResidencySourcesOpenCL;
     procedure SoftMaxResidentChainUnforcedOpenCLParity;
     // TNNetInput -> TNNetEmbedding -> TNNetPointwiseConvLinear with ForceOpenCL
     // off: the embedding's own size verdict is pinned False, so only a resident
@@ -74060,6 +74067,199 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+type
+  // Host layer that reads its source without ForceOutputOnRAM: the stale read
+  // the residency profile must report.
+  TStaleReadTestLayer = class(TNNetIdentity)
+  public
+    procedure Compute(); override;
+  end;
+
+procedure TStaleReadTestLayer.Compute();
+begin
+  FOutput.CopyNoChecks(FPrevLayer.Output);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.ProfiledResidencyCountsOpenCL;
+{$IFDEF OpenCL}
+const
+  PassCount = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Proj, Relu, Consumer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ConsumerPos, PassCnt: integer;
+  Report: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Input := TNNetVolume.Create(3, 1, 100);
+  try
+    Input.FillForDebug();
+    for ConsumerPos := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      try
+        // Shapes from InputResidentSourceUnforcedOpenCLParity: only the
+        // resident input puts the projection on OpenCL; no ForceOpenCL.
+        NN.AddLayer(TNNetInput.Create(3, 1, 100));
+        Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+        Relu := NN.AddLayer(TNNetReLU.Create());
+        if ConsumerPos = 0
+          then Consumer := NN.AddLayer(TNNetMulByConstant.Create(2))
+          else Consumer := NN.AddLayer(TStaleReadTestLayer.Create());
+        NN.SetTrainable(False, False);
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.LayerProfiling := true;
+        // The warm-up forward takes the one-time uploads out of the window.
+        NN.Compute(Input);
+        NN.ClearTime();
+        for PassCnt := 1 to PassCount do
+        begin
+          NN.Compute(Input);
+          if ConsumerPos = 0 then Proj.ForceOutputOnRAM();
+        end;
+        Report := TNNet.LayerGroupTimingReport(NN, [], PassCount);
+        AssertEquals('ReLU on OpenCL', PassCount, Relu.ForwardGPUCnt);
+        AssertEquals('ReLU bound its source', PassCount,
+          Relu.ProfiledResidency.SourceBoundCnt);
+        AssertEquals('ReLU output resident', PassCount,
+          Relu.ProfiledResidency.OutputResidentCnt);
+        AssertEquals('ReLU pulled nothing', 0,
+          Relu.ProfiledResidency.SourcePulledToRAMCnt);
+        AssertEquals('ReLU uploaded nothing', 0,
+          Relu.ProfiledResidency.ActivationUploadedCnt);
+        AssertEquals('projection bound the input', PassCount,
+          Proj.ProfiledResidency.SourceBoundCnt);
+        AssertEquals('a bound projection uploads nothing', 0,
+          Proj.ProfiledTransfers.UploadCount);
+        AssertEquals('an input layer has no source to classify', 0,
+          NN.Layers[0].ProfiledResidency.ActivationUploadedCnt);
+        if ConsumerPos = 0 then
+        begin
+          AssertEquals('host consumer pulled the ReLU output', PassCount,
+            Consumer.ProfiledResidency.SourcePulledToRAMCnt);
+          AssertEquals('host consumer is no stale read', 0,
+            Consumer.ProfiledResidency.StaleSuspectCnt);
+          AssertTrue('the caller''s downloads are outside the layer rows',
+            Pos('since ClearTime (callers and other nets included): ' +
+            'up 0 / 0.0 MB, down ' + IntToStr(PassCount) + ' / 0.0 MB.',
+            Report) > 0);
+        end
+        else
+        begin
+          AssertEquals('stale read reported', PassCount,
+            Consumer.ProfiledResidency.StaleSuspectCnt);
+          AssertEquals('stale read pulled nothing', 0,
+            Consumer.ProfiledResidency.SourcePulledToRAMCnt);
+        end;
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.ProfiledResidencySourcesOpenCL;
+{$IFDEF OpenCL}
+const
+  PassCount = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ProjA, ProjB, Sum, SecondInput, Mul, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassCnt: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Input := TNNetVolume.Create(3, 1, 100);
+  try
+    Input.FillForDebug();
+    // TNNetSum([ProjA, ProjB]) after a host layer: its FPrevLayer is that host
+    // layer, which only AppendInputLayers lists. A second TNNetInput follows a
+    // resident projection it never reads.
+    NN := TNNet.Create();
+    try
+      NN.LayerProfiling := true;
+      NN.AddLayer(TNNetInput.Create(3, 1, 100));
+      ProjA := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+      ProjB := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
+      NN.AddLayer(TNNetMulByConstant.Create(2));
+      Sum := NN.AddLayer(TNNetSum.Create([ProjA, ProjB]));
+      Proj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
+      SecondInput := NN.AddLayer(TNNetInput.Create(3, 1, 6));
+      NN.SetTrainable(False, False);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.ClearTime();
+      for PassCnt := 1 to PassCount do NN.Compute(Input);
+      AssertEquals('sum on OpenCL', PassCount, Sum.ForwardGPUCnt);
+      AssertEquals('sum bound both sources', PassCount,
+        Sum.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('sum pulled nothing', 0,
+        Sum.ProfiledResidency.SourcePulledToRAMCnt);
+      AssertTrue('the projection before the second input stays resident',
+        Proj.ProfiledResidency.OutputResidentCnt = PassCount);
+      AssertEquals('a second input has no source: bound', 0,
+        SecondInput.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('a second input has no source: stale?', 0,
+        SecondInput.ProfiledResidency.StaleSuspectCnt);
+    finally
+      NN.Free;
+    end;
+    // A host layer feeds a forced projection: the activation is uploaded.
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(3, 1, 100));
+      Mul := NN.AddLayer(TNNetMulByConstant.Create(2));
+      Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+      NN.SetTrainable(False, False);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Proj.ForceOpenCL(True);
+      NN.LayerProfiling := true;
+      NN.Compute(Input);
+      NN.ClearTime();
+      for PassCnt := 1 to PassCount do NN.Compute(Input);
+      AssertEquals('forced projection on OpenCL', PassCount,
+        Proj.ForwardGPUCnt);
+      AssertEquals('projection uploaded its source', PassCount,
+        Proj.ProfiledResidency.ActivationUploadedCnt);
+      AssertEquals('an uploaded source is not bound', 0,
+        Proj.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('host layer with an input in RAM is no stale read', 0,
+        Mul.ProfiledResidency.StaleSuspectCnt);
+    finally
+      NN.Free;
+    end;
+  finally
+    Input.Free;
   end;
 end;
 {$ELSE}

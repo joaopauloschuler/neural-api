@@ -2537,7 +2537,7 @@ rather than acted on.
         only the velocity. Check first that a net whose weights come from a
         host-only build owner (FImageInOwner/FOutputOwner) can arm its own
         buffers.
-  - [ ] F3. Per-layer residency statistic in LayerGroupTimingReport, counted in
+  - [x] F3. Per-layer residency statistic in LayerGroupTimingReport, counted in
         TNNetLayer.RunProfiled only (zero cost without profiling): per layer,
         forwards whose source was bound in OpenCL memory / pulled to RAM /
         activation-uploaded / host forward with a resident-only source (stale
