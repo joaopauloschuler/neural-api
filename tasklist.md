@@ -2528,7 +2528,7 @@ rather than acted on.
         Doing (b) without (c) is worse (AddConstant would download).
         Tests: PoCL sentinel test that the split/tanh/AddConstant/ChannelMul
         chain binds (no activation upload), parity, counts.
-  - [ ] F2. Image-in net and output net on OpenCL (L4 run: image-in 880 ms +
+  - [x] F2. Image-in net and output net on OpenCL (L4 run: image-in 880 ms +
         output 216 ms + "outside the nets" 126 ms per step; 64 MB up + 64 MB
         down per step). Arm FImageInNet and FOutputNet in the step net's
         context (EnableOpenCLInContextOf(FBlockStore[0], ...)), run block 0 as

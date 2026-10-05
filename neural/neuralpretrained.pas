@@ -8960,7 +8960,7 @@ type
     FProfileStepMs: array of double;
     {$IFDEF OpenCL}
     // Set by EnableOpenCL: every block store holds its codes in OpenCL memory;
-    // PrepareStepPass arms each rebuilt step net in BlockStore[0]'s context.
+    // PrepareStepPass arms each rebuilt step pass (EnableStepPassOpenCL).
     FOpenCLEnabled: boolean;
     FOpenCLHasSharedKernel: boolean;
     // Block i's prefix K rows then V rows in OpenCL memory, uploaded by the
@@ -8968,6 +8968,9 @@ type
     FPrefixKVOnOpenCL: array of TNNetKVRowsOnOpenCL;
     FPrefixKVUploadCount: integer;
     procedure ReleasePrefixKVOnOpenCL();
+    // Arms the image-in net, StepNet and the output net in BlockStore[0]'s
+    // context, so one step chains them inside OpenCL memory.
+    procedure EnableStepPassOpenCL();
     {$ENDIF}
     // Rewinds the step attention cache and fills it with block BlockIdx's
     // prefix rows, inside OpenCL memory when the step attention runs there.
@@ -9016,7 +9019,7 @@ type
     procedure SelectBlockWeights(NN: TNNet; BlockIdx: integer);
     {$IFDEF OpenCL}
     // Uploads every block's int8/int4 codes once, in one OpenCL context, and
-    // arms StepNet there; false (nothing armed) if the program fails to build.
+    // arms the step pass there; false (nothing armed) if the program fails.
     function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true): boolean;
     property OpenCLEnabled: boolean read FOpenCLEnabled;
@@ -9028,6 +9031,9 @@ type
     property WeightFormat: TQwenImage21WeightFormat read FWeightFormat;
     property PrefixNet: TNNet read FPrefixNet;
     property StepNet: TNNet read FStepNet;
+    // img_in and norm_out + proj_out of the step pass (PrepareStepPass).
+    property ImageInNet: TNNet read FImageInNet;
+    property OutputNet: TNNet read FOutputNet;
     property PrefixBlock: TQwenImage21BlockLayers read FPrefixBlock;
     property StepBlock: TQwenImage21BlockLayers read FStepBlock;
     property BlockStore[BlockIdx: integer]: TNNet read GetBlockStore;
@@ -84721,8 +84727,16 @@ begin
       pHasSharedKernel);
   FOpenCLHasSharedKernel := pHasSharedKernel;
   FOpenCLEnabled := true;
-  if Assigned(FStepNet) then
-    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], pHasSharedKernel);
+  if Assigned(FStepNet) then EnableStepPassOpenCL();
+end;
+
+// The image-in and output nets are FP32 borrowers of the 1-token owners: each
+// uploads its own copy of the shared host rows, so the owners stay host-only.
+procedure TQwenImage21Transformer.EnableStepPassOpenCL();
+begin
+  FImageInNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
+  FStepNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
+  FOutputNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
 end;
 
 procedure TQwenImage21Transformer.ReleasePrefixKVOnOpenCL();
@@ -84868,6 +84882,8 @@ begin
   FImageInNet.BuildWeightOwner := FImageInOwner;
   BuildImageInNet(FImageInNet, TokenCount);
   FImageInNet.BuildWeightOwner := nil;
+  // Block 0 copies img_in's output inside OpenCL memory when it is there.
+  FImageInNet.KeepLastOutputOnOpenCL := true;
   FStepNet := TNNet.Create();
   FStepNet.BuildWeightOwner := FBlockStore[0];
   BuildBlockNet(FStepNet, TokenCount, qibStep, FPrefixLength, FStepBlock);
@@ -84875,14 +84891,13 @@ begin
   FStepNet.KeepLastOutputOnOpenCL := true;
   if FInt8Input then FStepNet.EnableInt8Input();
   PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
-  {$IFDEF OpenCL}
-  if FOpenCLEnabled then
-    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
-  {$ENDIF}
   FOutputNet := TNNet.Create();
   FOutputNet.BuildWeightOwner := FOutputOwner;
   BuildOutputNet(FOutputNet, TokenCount);
   FOutputNet.BuildWeightOwner := nil;
+  {$IFDEF OpenCL}
+  if FOpenCLEnabled then EnableStepPassOpenCL();
+  {$ENDIF}
   // The step pass carries only the image tokens: the tail of the joint layout.
   BuildQwenImage21RopePositions([FPrefixLength, 0], [GridH], [GridW],
     PosF, PosH, PosW);
@@ -84933,16 +84948,16 @@ begin
     {$IFDEF OpenCL}
     if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
     {$ENDIF}
-    // Block b's output feeds block b + 1 inside OpenCL memory when it is there
-    // (FStepNet.KeepLastOutputOnOpenCL).
+    // img_in feeds block 0 and block b feeds block b + 1 inside OpenCL memory
+    // when the source is there (KeepLastOutputOnOpenCL).
     if BlockCnt = 0
-      then FStepNet.Compute(FImageInNet.GetLastLayer().Output, 0, FParallel)
+      then FStepNet.ComputeFromLayerOutput(FImageInNet.GetLastLayer(), 0,
+        FParallel)
       else FStepNet.ComputeFromLayerOutput(FStepNet.GetLastLayer(), 0,
         FParallel);
   end;
-  FStepNet.GetLastLayer().ForceOutputOnRAM();
-  FOutputNet.Compute(FStepNet.GetLastLayer().Output);
-  FOutputNet.GetLastLayer().ForceOutputOnRAM();
+  // The output net's forward downloads only its last layer, the velocity.
+  FOutputNet.ComputeFromLayerOutput(FStepNet.GetLastLayer());
   Velocity.Copy(FOutputNet.GetLastLayer().Output);
   if FLayerProfiling then
   begin
@@ -85102,8 +85117,8 @@ begin
         [WallMs / StepCnt]));
       Lines.Add(Format('[profile] mean ms/step: StepNet.Compute x %d %.1f | ' +
         'timestep net %.1f | image-in net %.1f | output net %.1f | outside ' +
-        'the nets (weight swap, prefix K/V load, last block download) ' +
-        '%.1f', [FConfig.NumLayers, BlocksMs / StepCnt, TimestepMs / StepCnt,
+        'the nets (weight swap, prefix K/V load) %.1f', [FConfig.NumLayers,
+        BlocksMs / StepCnt, TimestepMs / StepCnt,
         ImageInMs / StepCnt, OutputMs / StepCnt, (WallMs - BlocksMs -
         TimestepMs - ImageInMs - OutputMs) / StepCnt]));
       Lines.Add('[profile] StepNet by block role, summed over blocks and ' +

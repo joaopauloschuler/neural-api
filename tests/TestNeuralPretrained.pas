@@ -28074,6 +28074,22 @@ var
       AssertEquals(FormatName + ': OpenCL velocity replays bit for bit', 0,
         MaxAbsVolumeDiff(VelocityOpenCL, VelocityReplay), 0);
       AssertModulationChainOnOpenCL(Swapped, FormatName);
+      AssertEquals(FormatName + ': img_in ran no host forward', 0,
+        Swapped.ImageInNet.GetLastLayer().ForwardCPUCnt);
+      AssertEquals(FormatName + ': proj_out ran no host forward', 0,
+        Swapped.OutputNet.GetLastLayer().ForwardCPUCnt);
+      AssertEquals(FormatName + ': proj_out ran on OpenCL in both steps', 2,
+        Swapped.OutputNet.GetLastLayer().ForwardGPUCnt);
+      // Rearmed's step pass existed before EnableOpenCL armed it.
+      Rearmed.PredictVelocity(Latents, 0.9, GridH, GridW, VelocityReplay);
+      AssertTrue(FormatName + ': re-armed img_in ran on OpenCL',
+        Rearmed.ImageInNet.GetLastLayer().ForwardGPUCnt > 0);
+      AssertEquals(FormatName + ': re-armed img_in ran no host forward', 0,
+        Rearmed.ImageInNet.GetLastLayer().ForwardCPUCnt);
+      AssertTrue(FormatName + ': re-armed proj_out ran on OpenCL',
+        Rearmed.OutputNet.GetLastLayer().ForwardGPUCnt > 0);
+      AssertEquals(FormatName + ': re-armed proj_out ran no host forward', 0,
+        Rearmed.OutputNet.GetLastLayer().ForwardCPUCnt);
       OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
         pWeightFormat);
       OnCPU.EncodePrefix(Embeds);
@@ -28321,15 +28337,25 @@ var
   RopeUploadsBefore, RopeDownloadsBefore, AttnUploadsBefore: Int64;
   Diff: double;
 
-  // Per step: block 0 uploads the image-in output, blocks 1.. copy the previous
-  // block's output inside OpenCL memory, PredictVelocity downloads the last
-  // one.
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = Sentinel then Inc(Result);
+  end;
+
+  // Per step: img_in -> blocks -> output net chain inside OpenCL memory, and
+  // the step's one download is the velocity.
   procedure AssertOneActivationTransferPerStep(Transformer:
     TQwenImage21Transformer; const What: string);
   var
-    BlockInput: TNNetLayer;
-    UploadsBefore, StepNetDownloadsBefore, DownloadsBefore: Int64;
-    BlockInputGPUBefore: integer;
+    BlockInput, ImageInOutput, BlockOutput: TNNetLayer;
+    UploadsBefore, StepNetDownloadsBefore, ImageInUploadsBefore: Int64;
+    OutputNetInputUploadsBefore: Int64;
+    TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+    BlockInputGPUBefore, OutputNetInputGPUBefore: integer;
 
     function StepNetDownloads(): Int64;
     var
@@ -28342,27 +28368,76 @@ var
           .DownloadCount);
     end;
 
+    procedure AssertNoHostForward(NN: TNNet; const NetName: string);
+    var
+      LayerPos, MaxLayerPos: integer;
+    begin
+      MaxLayerPos := NN.GetLastLayerIdx();
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        AssertEquals(What + ': ' + NetName + ' layer ' + IntToStr(LayerPos) +
+          ' ran no host forward', 0, NN.Layers[LayerPos].ForwardCPUCnt);
+        AssertTrue(What + ': ' + NetName + ' layer ' + IntToStr(LayerPos) +
+          ' ran on OpenCL', NN.Layers[LayerPos].ForwardGPUCnt > 0);
+      end;
+    end;
+
   begin
     BlockInput := Transformer.StepNet.Layers[0];
+    ImageInOutput := Transformer.ImageInNet.GetLastLayer();
+    BlockOutput := Transformer.StepNet.GetLastLayer();
     UploadsBefore := BlockInput.ProfiledTransfers.UploadCount;
     BlockInputGPUBefore := BlockInput.ForwardGPUCnt;
+    OutputNetInputGPUBefore := Transformer.OutputNet.Layers[0].ForwardGPUCnt;
     StepNetDownloadsBefore := StepNetDownloads();
-    DownloadsBefore := OpenCLThreadTransfers.DownloadCount;
+    ImageInUploadsBefore :=
+      Transformer.ImageInNet.Layers[0].ProfiledTransfers.UploadCount;
+    OutputNetInputUploadsBefore :=
+      Transformer.OutputNet.Layers[0].ProfiledTransfers.UploadCount;
+    // Only a download would overwrite these host copies.
+    ImageInOutput.Output.Fill(Sentinel);
+    BlockOutput.Output.Fill(Sentinel);
+    TransfersBefore := OpenCLProcessTransferTotals();
     Transformer.PredictVelocity(Latents, Timesteps[0], GridH, GridW,
       VelocityOpenCL);
+    TransfersAfter := OpenCLProcessTransferTotals();
     WriteLn('  Qwen-Image-2.1 ', What, ': BlockInput uploads=',
       BlockInput.ProfiledTransfers.UploadCount - UploadsBefore,
       ' StepNet layer downloads=', StepNetDownloads() - StepNetDownloadsBefore,
-      ' step downloads=',
-      OpenCLThreadTransfers.DownloadCount - DownloadsBefore);
-    AssertEquals(What + ': BlockInput uploads once per step', 1,
+      '; process per step: uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' (',
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes,
+      ' B) downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount, ' (',
+      TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes,
+      ' B); block activation ', BlockOutput.Output.Size * SizeOf(TNeuralFloat),
+      ' B, velocity ', VelocityOpenCL.Size * SizeOf(TNeuralFloat), ' B');
+    AssertEquals(What + ': BlockInput uploads nothing', 0,
       BlockInput.ProfiledTransfers.UploadCount - UploadsBefore);
     AssertEquals(What + ': BlockInput on OpenCL in every block', BlockCount,
       BlockInput.ForwardGPUCnt - BlockInputGPUBefore);
     AssertEquals(What + ': no StepNet layer downloads', 0,
       StepNetDownloads() - StepNetDownloadsBefore);
-    AssertEquals(What + ': the step downloads once, after the last block', 1,
-      OpenCLThreadTransfers.DownloadCount - DownloadsBefore);
+    AssertEquals(What + ': img_in uploads only the latents', 1,
+      Transformer.ImageInNet.Layers[0].ProfiledTransfers.UploadCount -
+      ImageInUploadsBefore);
+    AssertEquals(What + ': the output net copies the block output on OpenCL',
+      1, Transformer.OutputNet.Layers[0].ForwardGPUCnt -
+      OutputNetInputGPUBefore);
+    AssertEquals(What + ': the output net uploads no block output', 0,
+      Transformer.OutputNet.Layers[0].ProfiledTransfers.UploadCount -
+      OutputNetInputUploadsBefore);
+    AssertEquals(What + ': img_in output stays in OpenCL memory',
+      ImageInOutput.Output.Size, SentinelSurvivors(ImageInOutput.Output));
+    AssertEquals(What + ': the last block output stays in OpenCL memory',
+      BlockOutput.Output.Size, SentinelSurvivors(BlockOutput.Output));
+    AssertNoHostForward(Transformer.ImageInNet, 'image-in net');
+    AssertNoHostForward(Transformer.OutputNet, 'output net');
+    AssertEquals(What + ': the step downloads once', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertEquals(What + ': the one download is the velocity',
+      VelocityOpenCL.Size * SizeOf(TNeuralFloat),
+      TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes);
     OnCPU.PredictVelocity(Latents, Timesteps[0], GridH, GridW, VelocityCPU);
     Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
     WriteLn('  Qwen-Image-2.1 ', What, ': velocity max|diff|=', Diff:0:9);
@@ -28397,15 +28472,6 @@ var
     Result := OnOpenCL.StepBlock.QRope.ProfiledTransfers.DownloadCount +
       OnOpenCL.StepBlock.KRope.ProfiledTransfers.DownloadCount +
       OnOpenCL.StepBlock.QKV.ProfiledTransfers.DownloadCount;
-  end;
-
-  function SentinelSurvivors(V: TNNetVolume): integer;
-  var
-    Pos: integer;
-  begin
-    Result := 0;
-    for Pos := 0 to V.Size - 1 do
-      if V.FData[Pos] = Sentinel then Inc(Result);
   end;
 
 begin
@@ -30332,9 +30398,9 @@ begin
   end;
 end;
 
-// The pipeline with the transformer step pass (int8) and the VAE on OpenCL
-// matches the CPU run. With FP32 weights only the step pass falls back to the
-// CPU; the VAE stays on OpenCL (TestQwenImage21VaeDecoderOpenCL's 5e-5).
+// The pipeline with the transformer step pass (int8, int4) and the VAE on
+// OpenCL matches the CPU run. With FP32 weights only the step pass falls back
+// to the CPU; the VAE stays on OpenCL (TestQwenImage21VaeDecoderOpenCL's 5e-5).
 procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCL;
 {$IFDEF OpenCL}
 const
@@ -30417,6 +30483,15 @@ begin
       Diff:0:9);
     AssertTrue('int8 OpenCL vs CPU image max|diff| ' + FloatToStr(Diff) +
       ' must be < 1e-4', Diff < 1e-4);
+    // Relative bound, as the int4 velocity in
+    // TestQwenImage21TransformerOpenCLSwapParity.
+    RunPipeline(qiwInt4, false, false, ImageCPU, 'int4 CPU');
+    RunPipeline(qiwInt4, true, true, ImageOpenCL, 'int4 OpenCL');
+    Diff := MaxAbsVolumeDiff(ImageOpenCL, ImageCPU);
+    WriteLn('  Qwen-Image-2.1 pipeline int4 OpenCL vs CPU image: max|diff|=',
+      Diff:0:9, ' max|image|=', ImageCPU.GetMaxAbs():0:4);
+    AssertTrue('int4 OpenCL vs CPU image max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1% of max|image|', Diff < 0.01 * ImageCPU.GetMaxAbs());
     RunPipeline(qiwFP32, false, false, ImageFP32CPU, 'FP32 CPU');
     RunPipeline(qiwFP32, true, false, ImageFP32Requested,
       'FP32 with OpenCL requested');
