@@ -27984,6 +27984,33 @@ var
     end;
   end;
 
+  // The modulation input, its split/tanh/AddConstant chain and the four
+  // TNNetChannelMulByLayer consumers ran every step-net forward on OpenCL.
+  procedure AssertModulationChainOnOpenCL(
+    Transformer: TQwenImage21Transformer; const FormatName: string);
+  var
+    LayerPos, MaxChainPos: integer;
+    Layer: TNNetLayer;
+    Consumers: array[0..3] of TNNetLayer;
+  begin
+    MaxChainPos := Transformer.StepBlock.Norm1.LayerIdx - 1;
+    for LayerPos := 1 to MaxChainPos do
+    begin
+      Layer := Transformer.StepNet.Layers[LayerPos];
+      AssertEquals(FormatName + ': ' + Layer.ClassName + ' ' +
+        IntToStr(LayerPos) + ' ran no host forward', 0, Layer.ForwardCPUCnt);
+      AssertTrue(FormatName + ': ' + Layer.ClassName + ' ' +
+        IntToStr(LayerPos) + ' ran on OpenCL', Layer.ForwardGPUCnt > 0);
+    end;
+    Consumers[0] := Transformer.StepBlock.Modulated1;
+    Consumers[1] := Transformer.StepBlock.Gated1;
+    Consumers[2] := Transformer.StepBlock.Modulated2;
+    Consumers[3] := Transformer.StepBlock.Gated2;
+    for LayerPos := 0 to 3 do
+      AssertEquals(FormatName + ': modulation consumer ' + IntToStr(LayerPos) +
+        ' ran no host forward', 0, Consumers[LayerPos].ForwardCPUCnt);
+  end;
+
   procedure RunFormat(pWeightFormat: TQwenImage21WeightFormat;
     const FormatName: string; VelocityTolerance: double;
     RelativeTolerance: boolean);
@@ -28046,6 +28073,7 @@ var
       Swapped.PredictVelocity(Latents, 0.9, GridH, GridW, VelocityReplay);
       AssertEquals(FormatName + ': OpenCL velocity replays bit for bit', 0,
         MaxAbsVolumeDiff(VelocityOpenCL, VelocityReplay), 0);
+      AssertModulationChainOnOpenCL(Swapped, FormatName);
       OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
         pWeightFormat);
       OnCPU.EncodePrefix(Embeds);

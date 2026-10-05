@@ -2510,7 +2510,7 @@ rather than acted on.
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope after C3a with an L4 measurement.
   Phase F — OpenCL residency of the step pass:
-  - [ ] F1. Modulation chain in OpenCL memory (L4 int8 1024^2 run 2026-10-04:
+  - [x] F1. Modulation chain in OpenCL memory (L4 int8 1024^2 run 2026-10-04:
         1280 blocking 16 KB operand uploads per image, all modulation layers
         on the host).
         (a) `TNNetInput.ComputeOpenCL`: move the upload that `TNNetInput.Compute`

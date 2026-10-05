@@ -83471,22 +83471,31 @@ end;
 
 function AddQwenImage21Modulation(NN: TNNet; ModulationLayer: TNNetLayer;
   Hidden: integer): TQwenImage21Modulation;
+
+  // The slices feed TNNetChannelMulByLayer consumers that run on OpenCL, so
+  // each binds the modulation input there instead of gathering on the host.
+  function AddModulationSlice(ChannelStart: integer): TNNetLayer;
+  var
+    Slice: TNNetSplitChannels;
+  begin
+    Slice := TNNetSplitChannels.Create(ChannelStart, Hidden);
+    Slice.BindHostResidentSource := true;
+    Result := NN.AddLayerAfter(Slice, ModulationLayer);
+  end;
+
 begin
   if ModulationLayer.Output.Size <> 4 * Hidden then
     ImportError('AddQwenImage21Modulation: the modulation layer holds ' +
       IntToStr(ModulationLayer.Output.Size) + ' values, expected 4*' +
       IntToStr(Hidden) + '.');
   Result.OnePlusScale1 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
-    NN.AddLayerAfter(TNNetSplitChannels.Create(0, Hidden), ModulationLayer));
+    AddModulationSlice(0));
   Result.TanhGate1 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
-    NN.AddLayerAfter(TNNetSplitChannels.Create(Hidden, Hidden),
-      ModulationLayer));
+    AddModulationSlice(Hidden));
   Result.OnePlusScale2 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
-    NN.AddLayerAfter(TNNetSplitChannels.Create(2 * Hidden, Hidden),
-      ModulationLayer));
+    AddModulationSlice(2 * Hidden));
   Result.TanhGate2 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
-    NN.AddLayerAfter(TNNetSplitChannels.Create(3 * Hidden, Hidden),
-      ModulationLayer));
+    AddModulationSlice(3 * Hidden));
 end;
 
 function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;

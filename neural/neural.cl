@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24). Coded by Claude (AI).
+// (9, 10, 15, 18-21, 24, 25). Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -2490,7 +2490,7 @@ __kernel void cai_softmax
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
-// 24 = ReLUL.
+// 24 = ReLUL, 25 = AddConstant.
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -2589,6 +2589,9 @@ __kernel void cai_activation
       if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
       else if (x > FParamA) y = x;
       else y = FParamA + (x - FParamA) * FParamC;
+      break;
+    case 25: // AddConstant: x + c. FParamA = c.
+      y = x + FParamA;
       break;
     default: // csActNone / unknown: pass through
       y = x;

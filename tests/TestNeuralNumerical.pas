@@ -485,9 +485,21 @@ type
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
     procedure TestChannelMulByLayerOpenCLParity;
-    // Per-token source x host-only per-channel row (Qwen-Image modulation):
-    // resident source bound + row uploaded per forward; host source on the CPU.
+    // Per-token source x host-only per-channel row: resident source bound +
+    // row uploaded per forward; host source on the CPU.
     procedure TestChannelMulByLayerHostRowOpenCLParity;
+    // Qwen-Image modulation chain, ForceOpenCL off: TNNetInput -> opted-in
+    // splits -> AddConstant(1) / tanh stay in OpenCL memory and both
+    // TNNetChannelMulByLayer consumers bind them (sentinels, counts, transfers).
+    procedure TestModulationChainResidentOpenCLParity;
+    // The same chain: a host write marked with MarkOutputWrittenOnRAM, with
+    // the input layer skipped, reaches the product (no stale OpenCL copy).
+    procedure TestModulationChainHostWriteOpenCL;
+    // TNNetInput -> split -> TNNetEmbedding: without the opt-in the split stays
+    // on the host, so nothing is downloaded per forward.
+    procedure TestSplitOfInputBeforeEmbeddingStaysOnHost;
+    // TNNetAddConstant forward on the host: values and ForwardCPUCnt.
+    procedure TestAddConstantHostForwardCount;
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
@@ -66513,10 +66525,11 @@ begin
     OutB := TNNetVolume.Create();
     try
       TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
-      // As in AddQwenImage21Modulation: TNNetAddConstant has no OpenCL path,
-      // so the multiplier is only ever in RAM.
+      // TNNetMulByConstant has no OpenCL path, so the multiplier is only ever
+      // in RAM. A test that needs a host-only layer must not pick one that has
+      // a cai_activation opcode.
       RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-      Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
+      Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
       Source := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth, 1),
         TokenInput);
       MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
@@ -66581,8 +66594,9 @@ begin
   try
     TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
     RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-    Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
-    Source := NN.AddLayerAfter(TNNetAddConstant.Create(0.5), TokenInput);
+    // TNNetMulByConstant has no OpenCL path: both sources stay host-only.
+    Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
+    Source := NN.AddLayerAfter(TNNetMulByConstant.Create(0.5), TokenInput);
     MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
     NN.AddLayer(MulLayer);
     NN.SetTrainable(False, False);
@@ -66613,6 +66627,333 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+{$IFDEF OpenCL}
+const
+  csModChainTokens = 5;
+  csModChainHidden = 8;
+
+type
+  // Layers of BuildModulationChainNet.
+  TModulationChainLayers = record
+    TokenInput, ModulationInput: TNNetLayer;
+    ScaleSplit, OnePlusScale, GateSplit, TanhGate: TNNetLayer;
+    Modulated, Gated: TNNetChannelMulByLayer;
+  end;
+
+// As AddQwenImage21Modulation, at token count 5 and hidden 8: modulation input
+// (1,1,16); split(0..7) -> AddConstant(1) scales the tokens, split(8..15) ->
+// tanh gates that product. Both splits opt in to BindHostResidentSource.
+function BuildModulationChainNet(out Chain: TModulationChainLayers): TNNet;
+var
+  NN: TNNet;
+
+  function AddSlice(ChannelStart: integer): TNNetLayer;
+  var
+    Slice: TNNetSplitChannels;
+  begin
+    Slice := TNNetSplitChannels.Create(ChannelStart, csModChainHidden);
+    Slice.BindHostResidentSource := true;
+    Result := NN.AddLayerAfter(Slice, Chain.ModulationInput);
+  end;
+
+begin
+  NN := TNNet.Create();
+  Result := NN;
+  Chain.TokenInput := Result.AddLayer(
+    TNNetInput.Create(csModChainTokens, 1, csModChainHidden));
+  Chain.ModulationInput := Result.AddLayer(
+    TNNetInput.Create(1, 1, 2 * csModChainHidden));
+  Chain.ScaleSplit := AddSlice(0);
+  Chain.OnePlusScale := Result.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    Chain.ScaleSplit);
+  Chain.GateSplit := AddSlice(csModChainHidden);
+  Chain.TanhGate := Result.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    Chain.GateSplit);
+  Chain.Modulated := TNNetChannelMulByLayer.Create(Chain.TokenInput,
+    Chain.OnePlusScale);
+  Result.AddLayer(Chain.Modulated);
+  Chain.Gated := TNNetChannelMulByLayer.Create(Chain.Modulated,
+    Chain.TanhGate);
+  Result.AddLayer(Chain.Gated);
+  Result.SetTrainable(False, False);
+end;
+
+function MaxAbsDiffToOutput(Expected, Actual: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+begin
+  Result := 0;
+  for Pos := 0 to Expected.Size - 1 do
+    Result := Max(Result, Abs(Expected.Raw[Pos] - Actual.Raw[Pos]));
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestModulationChainResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csChainCount = 6;
+var
+  NN: TNNet;
+  Chain: TModulationChainLayers;
+  Input, Row, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ChainLayers: array[0..csChainCount - 1] of TNNetLayer;
+  CPUCntBefore: array[0..csChainCount - 1] of integer;
+  LayerPos, Pos, SentinelSurvivors, SentinelCount: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261004;
+  WasCounting := OpenCLTransferCounting;
+  NN := BuildModulationChainNet(Chain);
+  Input := TNNetVolume.Create(csModChainTokens, 1, csModChainHidden);
+  Row := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  OutCPU := TNNetVolume.Create();
+  try
+    // The first four hold sentinels; the two products are the consumers.
+    ChainLayers[0] := Chain.ScaleSplit;
+    ChainLayers[1] := Chain.OnePlusScale;
+    ChainLayers[2] := Chain.GateSplit;
+    ChainLayers[3] := Chain.TanhGate;
+    ChainLayers[4] := Chain.Modulated;
+    ChainLayers[5] := Chain.Gated;
+    Input.RandomizeGaussian();
+    Row.RandomizeGaussian();
+    Chain.ModulationInput.Output.Copy(Row);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    for LayerPos := 0 to csChainCount - 1 do
+      CPUCntBefore[LayerPos] := ChainLayers[LayerPos].ForwardCPUCnt;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Chain.ModulationInput.Output.Copy(Row);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.Compute(Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+    // A download or a host forward of any chain layer would overwrite these.
+    SentinelCount := 0;
+    for LayerPos := 0 to 3 do
+    begin
+      ChainLayers[LayerPos].Output.Fill(csSentinel);
+      Inc(SentinelCount, ChainLayers[LayerPos].Output.Size);
+    end;
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output));
+    SentinelSurvivors := 0;
+    for LayerPos := 0 to 3 do
+      for Pos := 0 to ChainLayers[LayerPos].Output.Size - 1 do
+        if ChainLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+          Inc(SentinelSurvivors);
+    Write('  Modulation chain resident: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards scale split/add/gate split/tanh/mul/mul=');
+    for LayerPos := 0 to csChainCount - 1 do
+      Write(ChainLayers[LayerPos].ForwardGPUCnt, ' ');
+    WriteLn('sentinels=', SentinelSurvivors, '/', SentinelCount, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' (',
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes, ' B) downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount, ' (',
+      TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes, ' B)');
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      AssertEquals(ChainLayers[LayerPos].ClassName + ' ' + IntToStr(LayerPos) +
+        ' ran both forwards on OpenCL', 2, ChainLayers[LayerPos].ForwardGPUCnt);
+      AssertEquals(ChainLayers[LayerPos].ClassName + ' ' + IntToStr(LayerPos) +
+        ' ran no host forward', CPUCntBefore[LayerPos],
+        ChainLayers[LayerPos].ForwardCPUCnt);
+    end;
+    AssertEquals('the chain is bound, not downloaded', SentinelCount,
+      SentinelSurvivors);
+    // Only the two input layers upload: neither operand is uploaded again.
+    AssertEquals('uploads per forward', 2,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('bytes uploaded per forward',
+      (Input.Size + Row.Size) * SizeOf(TNeuralFloat),
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('modulation chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCPU.Free;
+    Row.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestModulationChainHostWriteOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Chain: TModulationChainLayers;
+  Input, RowA, RowB, OutA, OutB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  DiffA, DiffB, DiffStale: TNeuralFloat;
+
+  procedure ComputeWithRow(Row: TNNetVolume);
+  begin
+    Chain.ModulationInput.Output.Copy(Row);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.Compute(Input);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4102026;
+  NN := BuildModulationChainNet(Chain);
+  Input := TNNetVolume.Create(csModChainTokens, 1, csModChainHidden);
+  RowA := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  RowB := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  OutA := TNNetVolume.Create();
+  OutB := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    RowA.RandomizeGaussian();
+    RowB.RandomizeGaussian();
+    ComputeWithRow(RowA);
+    OutA.Copy(NN.GetLastLayer.Output);
+    ComputeWithRow(RowB);
+    OutB.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    ComputeWithRow(RowA);
+    DiffA := MaxAbsDiffToOutput(OutA, NN.GetLastLayer.Output);
+    // Starting at the first split skips TNNetInput.Compute, so nothing
+    // re-uploads the modulation input: only the mark keeps the splits from
+    // binding the row A copy still in OpenCL memory.
+    Chain.ModulationInput.Output.Copy(RowB);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.ComputeSerial(Chain.ScaleSplit.LayerIdx);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    DiffB := MaxAbsDiffToOutput(OutB, NN.GetLastLayer.Output);
+    DiffStale := MaxAbsDiffToOutput(OutA, NN.GetLastLayer.Output);
+    WriteLn('  Modulation chain host write: max|diff| row A=', DiffA:0:9,
+      ' row B=', DiffB:0:9, ' row B vs stale row A=', DiffStale:0:6,
+      ' gpu forwards gated=', Chain.Gated.ForwardGPUCnt);
+    AssertEquals('the product ran on OpenCL', 2, Chain.Gated.ForwardGPUCnt);
+    AssertTrue('the two rows must give different products', DiffStale > 1e-3);
+    AssertTrue('row A: max |diff| = ' + FloatToStr(DiffA) + ' must be < 1e-5',
+      DiffA < 1e-5);
+    AssertTrue('row B (fresh host write): max |diff| = ' + FloatToStr(DiffB) +
+      ' must be < 1e-5', DiffB < 1e-5);
+  finally
+    OutB.Free;
+    OutA.Free;
+    RowB.Free;
+    RowA.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSplitOfInputBeforeEmbeddingStaysOnHost;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Split: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  try
+    // Token ids in channel 0, as the BERT and CLIP text builders split them.
+    NN.AddLayer(TNNetInput.Create(4, 1, 2));
+    Split := NN.AddLayer(TNNetSplitChannels.Create(0, 1));
+    NN.AddLayer(TNNetEmbedding.Create(11, 8));
+    NN.SetTrainable(False, False);
+    for Pos := 0 to 3 do
+    begin
+      Input[Pos, 0, 0] := Pos + 2;
+      Input[Pos, 0, 1] := 1;
+    end;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    WriteLn('  Split of input before embedding: split cpu/gpu forwards=',
+      Split.ForwardCPUCnt, '/', Split.ForwardGPUCnt, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertEquals('the split ran on the host', 0, Split.ForwardGPUCnt);
+    AssertTrue('the split counted its host forwards', Split.ForwardCPUCnt > 0);
+    AssertEquals('no download per forward', 0,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestAddConstantHostForwardCount;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  AddConstLayer: TNNetLayer;
+  Pos, ForwardCnt: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4));
+    AddConstLayer := NN.AddLayer(TNNetAddConstant.Create(0.75));
+    for Pos := 0 to Input.Size - 1 do Input.Raw[Pos] := 0.1 * Pos - 1.0;
+    for ForwardCnt := 1 to 3 do NN.Compute(Input);
+    for Pos := 0 to Input.Size - 1 do
+      AssertEquals('x + 0.75 at ' + IntToStr(Pos), Input.Raw[Pos] + 0.75,
+        AddConstLayer.Output.Raw[Pos], 1e-6);
+    {$IFDEF OpenCL}
+    AssertEquals('host forwards', 3, AddConstLayer.ForwardCPUCnt);
+    AssertEquals('OpenCL forwards', 0, AddConstLayer.ForwardGPUCnt);
+    {$ENDIF}
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
 
 procedure TTestNeuralNumerical.TestCellMulByCellOpenCLParity;
 {$IFDEF OpenCL}
@@ -67790,12 +68131,12 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..29] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..30] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
-    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity');
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -67837,7 +68178,8 @@ var
       26: Result := TNNetReLUL.Create(-2, 2, 0);
       27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
       28: Result := TNNetReLU6.Create();
-    else Result := TNNetBentIdentity.Create();
+      29: Result := TNNetBentIdentity.Create();
+    else Result := TNNetAddConstant.Create(-0.375);
     end;
   end;
 
@@ -75810,8 +76152,8 @@ begin
   OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(4, 1, 300));
-    // TNNetAddConstant has no OpenCL path, so its output is in RAM only.
-    HostSource := NN.AddLayer(TNNetAddConstant.Create(0.25));
+    // TNNetMulByConstant has no OpenCL path, so its output is in RAM only.
+    HostSource := NN.AddLayer(TNNetMulByConstant.Create(0.25));
     Norm := NN.AddLayer(TNNetTokenLayerNorm.Create());
     NN.SetTrainable(False, False);
     for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.6 * Sin(Pos * 0.29);

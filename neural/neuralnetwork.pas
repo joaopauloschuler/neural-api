@@ -92,6 +92,7 @@ const
   csActSoftSign     = 22;
   csActBentIdentity = 23;
   csActReLUL        = 24; // ParamA = low limit, ParamB = high limit, ParamC = leak
+  csActAddConstant  = 25; // ParamA = the constant added
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1280,6 +1281,9 @@ type
       FNextOutputSource: TNNetLayer;
       // FInputBuffer can carry this forward's input.
       function InputBufferUsable(): boolean;
+      // Non-blocking upload of FOutput into FInputBuffer; the host copy stays
+      // current. The caller checks InputBufferUsable() first.
+      procedure ComputeOpenCL();
     {$ENDIF}
     public
       constructor Create(pSize: integer); reintroduce; overload;
@@ -13343,6 +13347,7 @@ type
     // can Move/Add a whole run instead of copying channel-by-channel.
     FContiguous: boolean;
     FFirstChannel: integer;
+    FBindHostResidentSource: boolean;
     {$IFDEF OpenCL}
     // Net-wide cai_split_channels handle, borrowed from FNN in EnableOpenCL; the
     // net owns and frees it. Its queue is also the queue the source produced on.
@@ -13384,6 +13389,10 @@ type
     procedure Backpropagate(); override;
 
     function SaveStructureToString(): string; override;
+    // Bind a source held in both RAM and OpenCL memory, for OpenCL consumers.
+    // Default false: such a source is split on the host. Not saved.
+    property BindHostResidentSource: boolean read FBindHostResidentSource
+      write FBindHostResidentSource;
   end;
 
   TNNetSplitChannelEvery = class(TNNetSplitChannels)
@@ -54411,18 +54420,27 @@ constructor TNNetAddConstant.Create();
 begin
   inherited Create();
   FFloatSt[0] := 0;
+  FActivationOpcode := csActAddConstant;
 end;
 
 constructor TNNetAddConstant.Create(pAdd: TNeuralFloat);
 begin
   inherited Create();
   FFloatSt[0] := pAdd;
+  FActivationOpcode := csActAddConstant;
 end;
 
 procedure TNNetAddConstant.Compute();
+var
+  StartTime: double;
 begin
-  inherited Compute();
-  FOutput.Add(FFloatSt[0]);
+  StartTime := Now();
+  if not ComputeActivationOnOpenCL(FFloatSt[0]) then
+  begin
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+    FOutput.Add(FFloatSt[0]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetGradientReversal }
@@ -100676,9 +100694,9 @@ begin
   // output would overrun it, so such a forward stays on the host.
   if FOutput.Size > FSplitBufSize then exit;
   if not PrevOutputOnOpenCL() then exit;
-  // The source is in host memory too, so the CPU gather moves nothing while the
-  // device gather would still have to download its slice.
-  Result := not FPrevLayer.FOutputOnRAM;
+  // A source also in host memory costs nothing to gather on the CPU, while the
+  // OpenCL gather would make a host consumer download the slice.
+  Result := FBindHostResidentSource or (not FPrevLayer.FOutputOnRAM);
 end;
 
 function TNNetSplitChannels.OpenCLOutputBuffer(): cl_mem;
@@ -111120,14 +111138,16 @@ begin
   // TNNet.Compute wrote FOutput from the host just before this call.
   FOutputOnRAM := true;
   FOutputOnOpenCL := false;
-  if not InputBufferUsable() then
-  begin
-    // Host-only forward: the output is offered in RAM alone, as on a
-    // non-OpenCL build.
-    Inc(FForwardCPUCnt);
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end;
+  // Without a usable buffer the output is offered in RAM alone, as on a
+  // non-OpenCL build.
+  if InputBufferUsable() then ComputeOpenCL() else Inc(FForwardCPUCnt);
+  {$ENDIF}
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetInput.ComputeOpenCL();
+begin
   // Non-blocking: the write and its consumers share the net-wide in-order
   // queue, and a consumer holding another queue waits for it through
   // OpenCLWaitOutputIfAnotherQueue.
@@ -111137,9 +111157,8 @@ begin
     Inc(FForwardGPUCnt);
   end
   else Inc(FForwardCPUCnt);
-  {$ENDIF}
-  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+{$ENDIF}
 
 { TNNetEmbedding }
 
