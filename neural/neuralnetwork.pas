@@ -4966,6 +4966,9 @@ type
     // True: every token row of a cached forward attends the whole cache,
     // including the rows that forward appended (no causal order among them).
     FCachedForwardNonCausal: boolean;
+    // Empty, or one key end per token row of a cached forward (see
+    // SetRowKeyEnds); it replaces the causal / non-causal key range.
+    FRowKeyEnds: TNeuralIntegerArray;
     {$IFDEF OpenCL}
     // Cached-decode forward in OpenCL memory (append, split-row attention,
     // merge), with the KV cache resident and appended in place.
@@ -4984,6 +4987,9 @@ type
     // its own slot, or the whole cache when FCachedForwardNonCausal.
     procedure ComputeCachedRows(h1, h2: integer);
     procedure SetCachedForwardNonCausal(pValue: boolean);
+    // Raises unless the row key ends (if any) fit this forward: cached path,
+    // no eviction, one end per token row. Runs before any worker starts.
+    procedure CheckRowKeyEnds();
     // StreamingLLM eviction step: drop the oldest window row (slot
     // FEvictSinks), shifting the later rows (and per-head scales) left.
     procedure EvictOldestWindowRow();
@@ -5043,6 +5049,9 @@ type
     // Appends K.SizeX token rows of externally computed keys and values (each
     // (Rows,1,KVHeads*HeadDim), already position-encoded) at slot CacheLength.
     procedure AppendCacheRowsFrom(K, V: TNNetVolume);
+    // Cached host forward (WillOpenCL refuses): row p attends cache slots below
+    // CacheBase + pRowKeyEnds[p], CacheBase = length before it; [] clears.
+    procedure SetRowKeyEnds(const pRowKeyEnds: array of integer);
     procedure EnableInt8KV(); override;
     procedure DisableInt8KV(); override;
     procedure PrepareChunkedForward(); override;
@@ -35214,6 +35223,35 @@ begin
   if pValue then FStruct[7] := 1 else FStruct[7] := 0;
 end;
 
+procedure TNNetFusedSDPA.SetRowKeyEnds(const pRowKeyEnds: array of integer);
+var
+  RowPos, MaxRowPos: integer;
+begin
+  MaxRowPos := High(pRowKeyEnds);
+  for RowPos := 0 to MaxRowPos do
+    if (pRowKeyEnds[RowPos] < 1) or (pRowKeyEnds[RowPos] > MaxRowPos + 1) then
+      raise Exception.Create('TNNetFusedSDPA.SetRowKeyEnds: row ' +
+        IntToStr(RowPos) + ' key end ' + IntToStr(pRowKeyEnds[RowPos]) +
+        ' is outside 1..' + IntToStr(MaxRowPos + 1) + '.');
+  SetLength(FRowKeyEnds, MaxRowPos + 1);
+  for RowPos := 0 to MaxRowPos do FRowKeyEnds[RowPos] := pRowKeyEnds[RowPos];
+end;
+
+procedure TNNetFusedSDPA.CheckRowKeyEnds();
+begin
+  if Length(FRowKeyEnds) = 0 then exit;
+  if not FCacheEnabled then
+    raise Exception.Create('TNNetFusedSDPA: row key ends need the cached ' +
+      'path (BeginIncrementalDecode).');
+  if FEvictSinks > 0 then
+    raise Exception.Create('TNNetFusedSDPA: row key ends do not support ' +
+      'eviction.');
+  if Length(FRowKeyEnds) <> FPrevLayer.FOutput.SizeX then
+    raise Exception.Create('TNNetFusedSDPA: ' +
+      IntToStr(Length(FRowKeyEnds)) + ' row key ends for ' +
+      IntToStr(FPrevLayer.FOutput.SizeX) + ' token rows.');
+end;
+
 function TNNetFusedSDPA.InputDepthRequired(): integer;
 begin
   Result := (FQHeads + 2 * FKVHeads) * FDk; // packed [allQ | allK | allV]
@@ -35657,6 +35695,13 @@ var
   p, SeqLenM1, LiveLen, LiveLenStep: integer;
 begin
   SeqLenM1 := FPrevLayer.FOutput.SizeX - 1;
+  // CheckRowKeyEnds ran before this forward: one end per token row.
+  if Length(FRowKeyEnds) > 0 then
+  begin
+    for p := 0 to SeqLenM1 do
+      ComputeCachedToken(p, h1, h2, FCacheBaseLen + FRowKeyEnds[p]);
+    exit;
+  end;
   // Causal: token p attends the cache up to and including its own row (base
   // length + p + 1), the single-head append-then-score semantics.
   if FCachedForwardNonCausal then
@@ -35695,6 +35740,7 @@ begin
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
+  CheckRowKeyEnds();
   if FCacheEnabled then
   begin
     ComputeIncrementalFused();
@@ -35718,6 +35764,7 @@ begin
   FOutputOnRAM := true;
   {$ENDIF}
   FChunkPrecomputed := false;
+  CheckRowKeyEnds();
   if not FCacheEnabled then exit; // prefill chunks need no shared prep
   if (FEvictSinks > 0) and (FPrevLayer.FOutput.SizeX > 1) then
   begin
@@ -35811,14 +35858,14 @@ begin
   // Scope: a window of committed tokens - one decode token or a prefill
   // window - over the FP32 or the int8 cache, with only the causal and
   // sliding-window masks live, or a CachedForwardNonCausal window over the
-  // FP32 cache. Eviction, segment masking, prefix-LM, the bidirectional
-  // window and a cache without room for the whole window keep the host path,
-  // which stays exactly as it was. The exact-class test mirrors
+  // FP32 cache. Eviction, row key ends, segment masking, prefix-LM, the
+  // bidirectional window and a cache without room for the whole window keep
+  // the host path, which stays exactly as it was. The exact-class test mirrors
   // the inherited one: a subclass with different score math would inherit
   // this path and silently lose its extra term.
   Result := (not FIsTrainable) and (Self.ClassType = TNNetFusedSDPA)
     and Assigned(FPrevLayer)
-    and (FEvictSinks = 0)
+    and (FEvictSinks = 0) and (Length(FRowKeyEnds) = 0)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
     and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax);

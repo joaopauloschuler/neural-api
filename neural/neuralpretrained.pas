@@ -8841,6 +8841,27 @@ function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
 procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
   GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
 
+// The step-pass layout: the prefix layout, an empty text run, the target grid
+// (whose tokens are the tail of BuildQwenImage21RopePositions over it).
+procedure QwenImage21StepLayout(const PrefixTextLengths, PrefixGridHeights,
+  PrefixGridWidths: array of integer; TargetH, TargetW: integer;
+  out TextLengths, GridHeights, GridWidths: TNeuralIntegerArray);
+
+// Block-causal key ends of the same layout (TNNetFusedSDPA.SetRowKeyEnds): a
+// text row sees up to itself, an image row up to the end of its image block.
+function QwenImage21PrefixRowKeyEnds(const TextLengths, GridHeights,
+  GridWidths: array of integer): TNeuralIntegerArray;
+
+// Drops the image-slot rows of EncoderRows into TextRows; image k must be a run
+// of SlotCounts[k] mask rows. TextLengths: the N+1 text runs around them.
+procedure QwenImage21SplitEncoderRows(EncoderRows: TNNetVolume;
+  const ImagePadMask: TQwen3VLImagePadMask; const SlotCounts: array of integer;
+  TextRows: TNNetVolume; out TextLengths: TNeuralIntegerArray);
+
+const
+  // Latent tokens per text-encoder image slot (a 2x2 group).
+  csQwenImage21LatentTokensPerSlot = 4;
+
 type
   // The diffusers QwenImage21Transformer2DModel config.json fields.
   TQwenImage21TransformerConfig = record
@@ -8856,9 +8877,10 @@ type
     OnePlusScale1, TanhGate1, OnePlusScale2, TanhGate2: TNNetLayer;
   end;
 
-  // Prefix pass: text tokens, causal, plain prefill. Step pass: target-image
-  // tokens attending [cached prefix K/V ; own K/V] with no causal mask.
-  TQwenImage21BlockMode = (qibPrefix, qibStep);
+  // Prefix pass: text tokens, causal, plain prefill. Block-causal prefix: text
+  // and condition-image tokens on the cached path with per-row key ends. Step
+  // pass: target-image tokens attending [cached prefix K/V ; own K/V].
+  TQwenImage21BlockMode = (qibPrefix, qibBlockCausalPrefix, qibStep);
 
   // The layers of one block that carry weights or run-time state.
   TQwenImage21BlockLayers = record
@@ -8950,6 +8972,13 @@ type
     // Block i's post-RoPE prefix keys and values, each (L,1,hidden).
     FPrefixKeys, FPrefixValues: array of TNNetVolume;
     FPrefixLength: integer;
+    // Layout of the last EncodePrefix (BuildQwenImage21RopePositions order).
+    FPrefixTextLengths, FPrefixGridHeights, FPrefixGridWidths:
+      TNeuralIntegerArray;
+    // img_in over the condition images' latents, concatenated in
+    // FConditionLatents; FPrefixInput interleaves its rows with txt_in's.
+    FPrefixImageInNet: TNNet;
+    FConditionLatents, FPrefixInput: TNNetVolume;
     FStepGridH, FStepGridW: integer;
     FParallel: boolean;
     FMaxThreads: integer;
@@ -9001,7 +9030,13 @@ type
     destructor Destroy(); override;
     // Runs txt_in and every block over the prompt with the t = 0 modulation
     // and keeps each block's post-RoPE K and V (PrefixKeys, PrefixValues).
-    procedure EncodePrefix(TextHidden: TNNetVolume);
+    procedure EncodePrefix(TextHidden: TNNetVolume); overload;
+    // With condition images: TextHidden = text rows only (TextLengths runs);
+    // ImageLatents[k] = normalized (GridHeights[k]*GridWidths[k],1,in_channels).
+    procedure EncodePrefix(TextHidden: TNNetVolume;
+      const TextLengths: array of integer;
+      const ImageLatents: array of TNNetVolume;
+      const GridHeights, GridWidths: array of integer); overload;
     // Velocity of the GridH x GridW image tokens at Timestep in [0, 1] (the
     // pipeline's t / 1000), attending the prefix of the last EncodePrefix.
     procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
@@ -9042,7 +9077,8 @@ type
     property PrefixKeys[BlockIdx: integer]: TNNetVolume read GetPrefixKeys;
     property PrefixValues[BlockIdx: integer]: TNNetVolume
       read GetPrefixValues;
-    // Text token count of the last EncodePrefix; 0 before the first.
+    // Text plus condition-image token count of the last EncodePrefix; 0
+    // before the first.
     property PrefixLength: integer read FPrefixLength;
     property TimestepEmbedding: TNNetVolume read GetTimestepEmbedding;
     property Modulation: TNNetVolume read GetModulation;
@@ -83411,6 +83447,49 @@ begin
     SlotCounts);
 end;
 
+// Token count of a text[0], image[0], ..., text[N] layout; raises (naming
+// Caller) unless there are N grids and N+1 text lengths.
+function QwenImage21LayoutTokenCount(const TextLengths, GridHeights,
+  GridWidths: array of integer; const Caller: string): integer;
+var
+  MaxImagePos, MaxRunPos, RunCnt: integer;
+begin
+  if (Length(GridHeights) <> Length(GridWidths)) or
+     (Length(TextLengths) <> Length(GridHeights) + 1) then
+    ImportError(Caller + ': expected N image grids and N+1 text lengths.');
+  MaxImagePos := Length(GridHeights) - 1;
+  MaxRunPos := Length(TextLengths) - 1;
+  Result := 0;
+  for RunCnt := 0 to MaxRunPos do
+    Inc(Result, TextLengths[RunCnt]);
+  for RunCnt := 0 to MaxImagePos do
+    Inc(Result, GridHeights[RunCnt] * GridWidths[RunCnt]);
+end;
+
+procedure QwenImage21StepLayout(const PrefixTextLengths, PrefixGridHeights,
+  PrefixGridWidths: array of integer; TargetH, TargetW: integer;
+  out TextLengths, GridHeights, GridWidths: TNeuralIntegerArray);
+var
+  ImageCount, RunPos, GridPos: integer;
+begin
+  ImageCount := Length(PrefixGridHeights);
+  QwenImage21LayoutTokenCount(PrefixTextLengths, PrefixGridHeights,
+    PrefixGridWidths, 'QwenImage21StepLayout');
+  SetLength(TextLengths, ImageCount + 2);
+  SetLength(GridHeights, ImageCount + 1);
+  SetLength(GridWidths, ImageCount + 1);
+  for RunPos := 0 to ImageCount do
+    TextLengths[RunPos] := PrefixTextLengths[RunPos];
+  TextLengths[ImageCount + 1] := 0;
+  for GridPos := 0 to ImageCount - 1 do
+  begin
+    GridHeights[GridPos] := PrefixGridHeights[GridPos];
+    GridWidths[GridPos] := PrefixGridWidths[GridPos];
+  end;
+  GridHeights[ImageCount] := TargetH;
+  GridWidths[ImageCount] := TargetW;
+end;
+
 procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
   GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
 var
@@ -83418,17 +83497,10 @@ var
   TokenCount, TokenPos, Position, RowCnt, ColCnt: integer;
   MinRow, MaxRow, MinCol, MaxCol: integer;
 begin
-  if (Length(GridHeights) <> Length(GridWidths)) or
-     (Length(TextLengths) <> Length(GridHeights) + 1) then
-    ImportError('BuildQwenImage21RopePositions: expected N image grids and ' +
-      'N+1 text lengths.');
+  TokenCount := QwenImage21LayoutTokenCount(TextLengths, GridHeights,
+    GridWidths, 'BuildQwenImage21RopePositions');
   MaxImagePos := Length(GridHeights) - 1;
   MaxRunPos := Length(TextLengths) - 1;
-  TokenCount := 0;
-  for RunCnt := 0 to MaxRunPos do
-    Inc(TokenCount, TextLengths[RunCnt]);
-  for RunCnt := 0 to MaxImagePos do
-    Inc(TokenCount, GridHeights[RunCnt] * GridWidths[RunCnt]);
   SetLength(PosF, TokenCount);
   SetLength(PosH, TokenCount);
   SetLength(PosW, TokenCount);
@@ -83462,6 +83534,92 @@ begin
       end;
     Inc(Position, Max(GridHeights[RunCnt], GridWidths[RunCnt]));
   end;
+end;
+
+function QwenImage21PrefixRowKeyEnds(const TextLengths, GridHeights,
+  GridWidths: array of integer): TNeuralIntegerArray;
+var
+  MaxImagePos, MaxRunPos, RunCnt, TokenPos, BlockEnd: integer;
+  MaxTextPos, TextCnt: integer;
+begin
+  Result := nil;
+  SetLength(Result, QwenImage21LayoutTokenCount(TextLengths, GridHeights,
+    GridWidths, 'QwenImage21PrefixRowKeyEnds'));
+  MaxImagePos := Length(GridHeights) - 1;
+  MaxRunPos := Length(TextLengths) - 1;
+  TokenPos := 0;
+  for RunCnt := 0 to MaxRunPos do
+  begin
+    MaxTextPos := TextLengths[RunCnt] - 1;
+    for TextCnt := 0 to MaxTextPos do
+    begin
+      Result[TokenPos] := TokenPos + 1;
+      Inc(TokenPos);
+    end;
+    if RunCnt > MaxImagePos then break;
+    BlockEnd := TokenPos + GridHeights[RunCnt] * GridWidths[RunCnt];
+    while TokenPos < BlockEnd do
+    begin
+      Result[TokenPos] := BlockEnd;
+      Inc(TokenPos);
+    end;
+  end;
+end;
+
+procedure QwenImage21SplitEncoderRows(EncoderRows: TNNetVolume;
+  const ImagePadMask: TQwen3VLImagePadMask; const SlotCounts: array of integer;
+  TextRows: TNNetVolume; out TextLengths: TNeuralIntegerArray);
+var
+  RowCount, RowPos, TextRowPos, ImagePos, MaxImagePos, SlotEnd: integer;
+  RowFloats, MaxRowPos: integer;
+begin
+  RowCount := EncoderRows.SizeX;
+  if (EncoderRows.SizeY <> 1) or (Length(ImagePadMask) <> RowCount) then
+    ImportError('QwenImage21SplitEncoderRows: expected (L,1,hidden) rows ' +
+      'and an L-entry image-pad mask.');
+  RowFloats := EncoderRows.Depth;
+  MaxImagePos := Length(SlotCounts) - 1;
+  SetLength(TextLengths, MaxImagePos + 2);
+  TextRowPos := 0;
+  MaxRowPos := RowCount - 1;
+  for RowPos := 0 to MaxRowPos do
+    if not ImagePadMask[RowPos] then Inc(TextRowPos);
+  if TextRowPos = 0 then
+    ImportError('QwenImage21SplitEncoderRows: no text rows.');
+  TextRows.ReSize(TextRowPos, 1, RowFloats);
+  RowPos := 0;
+  TextRowPos := 0;
+  for ImagePos := 0 to MaxImagePos + 1 do
+  begin
+    TextLengths[ImagePos] := 0;
+    while (RowPos < RowCount) and not ImagePadMask[RowPos] do
+    begin
+      Move(EncoderRows.FData[RowPos * RowFloats],
+        TextRows.FData[TextRowPos * RowFloats],
+        RowFloats * csNeuralFloatSize);
+      Inc(TextLengths[ImagePos]);
+      Inc(TextRowPos);
+      Inc(RowPos);
+    end;
+    if ImagePos > MaxImagePos then break;
+    // Adjacent images share one run of mask rows; SlotCounts splits it.
+    SlotEnd := RowPos + SlotCounts[ImagePos];
+    if (SlotCounts[ImagePos] < 1) or (SlotEnd > RowCount) then
+      ImportError('QwenImage21SplitEncoderRows: image ' + IntToStr(ImagePos) +
+        ' needs ' + IntToStr(SlotCounts[ImagePos]) + ' slot rows.');
+    while RowPos < SlotEnd do
+    begin
+      if not ImagePadMask[RowPos] then
+        ImportError('QwenImage21SplitEncoderRows: image ' +
+          IntToStr(ImagePos) + ' has ' + IntToStr(SlotCounts[ImagePos]) +
+          ' slots, but its run of mask rows ends at row ' +
+          IntToStr(RowPos) + '.');
+      Inc(RowPos);
+    end;
+  end;
+  if RowPos < RowCount then
+    ImportError('QwenImage21SplitEncoderRows: the mask has more image-slot ' +
+      'rows than SlotCounts covers.');
 end;
 
 const
@@ -83616,14 +83774,17 @@ begin
   Block.QKV := NN.AddLayer(
     TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
   Block.Attn := TNNetFusedSDPA.Create(Config.NumHeads, Config.NumHeads,
-    HeadDim, {pCausalMask=}Mode = qibPrefix, {pWindow=}0, {pScoreSoftCap=}0,
+    HeadDim, {pCausalMask=}Mode <> qibStep, {pWindow=}0, {pScoreSoftCap=}0,
     {pCachedForwardNonCausal=}Mode = qibStep);
   Block.Attn.SetTrainable(pTrainable);
   // Armed BEFORE AddLayer, so SetPrevLayer never sizes the Heads x SeqLen x
-  // SeqLen prefill score map. The caller fills the prefix K/V with
-  // AppendCacheRowsFrom and calls TruncateCache(prefix length) before each step.
+  // SeqLen prefill score map. Step: the caller fills the prefix K/V with
+  // AppendCacheRowsFrom before each step. Block-causal prefix: the caller sets
+  // the row key ends and calls TruncateCache(0) before each forward.
   if Mode = qibStep then
-    Block.Attn.BeginIncrementalDecode(pPrefixCapacity + XInput.Output.SizeX);
+    Block.Attn.BeginIncrementalDecode(pPrefixCapacity + XInput.Output.SizeX)
+  else if Mode = qibBlockCausalPrefix then
+    Block.Attn.BeginIncrementalDecode(XInput.Output.SizeX);
   NN.AddLayer(Block.Attn);
   Block.OutProj := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Hidden,
@@ -84707,6 +84868,9 @@ begin
   {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FPrefixNet.Free;
   FTextInNet.Free;
+  FPrefixImageInNet.Free;
+  FConditionLatents.Free;
+  FPrefixInput.Free;
   MaxBlockPos := Length(FBlockStore) - 1;
   for BlockCnt := 0 to MaxBlockPos do
   begin
@@ -84739,7 +84903,13 @@ begin
   {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FreeAndNil(FPrefixNet);
   FreeAndNil(FTextInNet);
+  FreeAndNil(FPrefixImageInNet);
+  FreeAndNil(FConditionLatents);
+  FreeAndNil(FPrefixInput);
   FPrefixLength := 0;
+  SetLength(FPrefixTextLengths, 0);
+  SetLength(FPrefixGridHeights, 0);
+  SetLength(FPrefixGridWidths, 0);
   MaxBlockPos := Length(FPrefixKeys) - 1;
   for BlockCnt := 0 to MaxBlockPos do
   begin
@@ -84854,49 +85024,186 @@ begin
 end;
 
 procedure TQwenImage21Transformer.EncodePrefix(TextHidden: TNNetVolume);
+begin
+  EncodePrefix(TextHidden, [TextHidden.SizeX], [], [], []);
+end;
+
+// diffusers lays the prefix out as the text-encoder sequence with each image
+// slot expanded to its 2x2 latent tokens; txt_in and img_in are per-token, so
+// projecting the two row sets apart and interleaving them is the same.
+procedure TQwenImage21Transformer.EncodePrefix(TextHidden: TNNetVolume;
+  const TextLengths: array of integer;
+  const ImageLatents: array of TNNetVolume;
+  const GridHeights, GridWidths: array of integer);
 var
   TextIn: TQwenImage21TextProjectionLayers;
   PosF, PosH, PosW: TNeuralIntegerArray;
   BlockInput: TNNetVolume;
-  TokenCount, BlockCnt, MaxBlockPos, LastBlockEndIdx: integer;
+  TextCount, ConditionCount, TokenCount, ImageCount, MaxImagePos: integer;
+  ImagePos, RunCnt, MaxRunPos: integer;
+  BlockCnt, MaxBlockPos, LastBlockEndIdx: integer;
+  HasImages: boolean;
   PrefixStart: TDateTime;
+
+  function SameLayout(): boolean;
+  var
+    RunPos, GridPos: integer;
+  begin
+    Result := (FPrefixLength > 0) and Assigned(FPrefixNet) and
+      (Length(FPrefixTextLengths) = MaxRunPos + 1) and
+      (Length(FPrefixGridHeights) = ImageCount);
+    if not Result then exit;
+    for RunPos := 0 to MaxRunPos do
+      if FPrefixTextLengths[RunPos] <> TextLengths[RunPos] then exit(false);
+    for GridPos := 0 to MaxImagePos do
+      if (FPrefixGridHeights[GridPos] <> GridHeights[GridPos]) or
+         (FPrefixGridWidths[GridPos] <> GridWidths[GridPos]) then exit(false);
+  end;
+
+  // Copies RowCount (1,1,hidden) rows from Source row SourceRow on.
+  procedure CopyPrefixRows(Source: TNNetVolume; SourceRow, TargetRow,
+    RowCount: integer);
+  begin
+    if RowCount > 0 then
+      Move(Source.FData[SourceRow * FConfig.Hidden],
+        FPrefixInput.FData[TargetRow * FConfig.Hidden],
+        RowCount * FConfig.Hidden * csNeuralFloatSize);
+  end;
+
+  procedure InterleavePrefixRows();
+  var
+    TextRow, ImageRow, TargetRow, ImageTokens, RunPos: integer;
+    TextRows, ImageRows: TNNetVolume;
+  begin
+    TextRows := FTextInNet.GetLastLayer().Output;
+    ImageRows := FPrefixImageInNet.GetLastLayer().Output;
+    TextRow := 0;
+    ImageRow := 0;
+    TargetRow := 0;
+    for RunPos := 0 to MaxRunPos do
+    begin
+      CopyPrefixRows(TextRows, TextRow, TargetRow, TextLengths[RunPos]);
+      Inc(TextRow, TextLengths[RunPos]);
+      Inc(TargetRow, TextLengths[RunPos]);
+      if RunPos > MaxImagePos then break;
+      ImageTokens := GridHeights[RunPos] * GridWidths[RunPos];
+      CopyPrefixRows(ImageRows, ImageRow, TargetRow, ImageTokens);
+      Inc(ImageRow, ImageTokens);
+      Inc(TargetRow, ImageTokens);
+    end;
+  end;
+
 begin
-  TokenCount := TextHidden.SizeX;
-  if (TokenCount < 1) or (TextHidden.SizeY <> 1) or
+  ImageCount := Length(ImageLatents);
+  MaxImagePos := ImageCount - 1;
+  MaxRunPos := Length(TextLengths) - 1;
+  if (Length(GridHeights) <> ImageCount) or
+     (Length(GridWidths) <> ImageCount) or (MaxRunPos <> ImageCount) then
+    raise Exception.Create('TQwenImage21Transformer.EncodePrefix: expected ' +
+      'N latents, N grids and N+1 text lengths.');
+  TextCount := 0;
+  for RunCnt := 0 to MaxRunPos do
+  begin
+    if TextLengths[RunCnt] < 0 then
+      raise Exception.Create('TQwenImage21Transformer.EncodePrefix: ' +
+        'negative text length.');
+    Inc(TextCount, TextLengths[RunCnt]);
+  end;
+  if (TextCount < 1) or (TextHidden.SizeX <> TextCount) or
+     (TextHidden.SizeY <> 1) or
      (TextHidden.Depth <> FConfig.ContextInDim) then
     raise Exception.Create('TQwenImage21Transformer.EncodePrefix: expected ' +
-      '(L,1,' + IntToStr(FConfig.ContextInDim) + ') text hidden states, got ' +
+      '(' + IntToStr(TextCount) + ',1,' + IntToStr(FConfig.ContextInDim) +
+      ') text hidden states (at least one row), got ' +
       IntToStr(TextHidden.SizeX) + 'x' + IntToStr(TextHidden.SizeY) + 'x' +
       IntToStr(TextHidden.Depth) + '.');
+  ConditionCount := 0;
+  for ImagePos := 0 to MaxImagePos do
+  begin
+    if (GridHeights[ImagePos] < 1) or (GridWidths[ImagePos] < 1) or
+       (ImageLatents[ImagePos].SizeX <>
+        GridHeights[ImagePos] * GridWidths[ImagePos]) or
+       (ImageLatents[ImagePos].SizeY <> 1) or
+       (ImageLatents[ImagePos].Depth <> FConfig.InChannels) then
+      raise Exception.Create('TQwenImage21Transformer.EncodePrefix: image ' +
+        IntToStr(ImagePos) + ' expects (' +
+        IntToStr(GridHeights[ImagePos] * GridWidths[ImagePos]) + ',1,' +
+        IntToStr(FConfig.InChannels) + ') latents, got ' +
+        IntToStr(ImageLatents[ImagePos].SizeX) + 'x' +
+        IntToStr(ImageLatents[ImagePos].SizeY) + 'x' +
+        IntToStr(ImageLatents[ImagePos].Depth) + '.');
+    Inc(ConditionCount, ImageLatents[ImagePos].SizeX);
+  end;
+  HasImages := ImageCount > 0;
+  TokenCount := TextCount + ConditionCount;
   // The rows below replace every block's prefix K/V.
   {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
-  if TokenCount <> FPrefixLength then
+  if not SameLayout() then
   begin
-    // The step pass caches prefix + image rows, so it is rebuilt too.
+    // The step pass caches prefix + image rows and places the target after
+    // the prefix layout, so it is rebuilt too.
     FreeStepPass();
     FreeAndNil(FPrefixNet);
     FreeAndNil(FTextInNet);
+    FreeAndNil(FPrefixImageInNet);
     FPrefixLength := 0;
     FTextInNet := TNNet.Create();
     FTextInNet.BuildWeightOwner := FTextInOwner;
     AddQwenImage21TextProjection(FTextInNet,
-      FTextInNet.AddLayer(TNNetInput.Create(TokenCount, 1,
+      FTextInNet.AddLayer(TNNetInput.Create(TextCount, 1,
         FConfig.ContextInDim)), FConfig, TextIn);
     FTextInNet.BuildWeightOwner := nil;
+    if HasImages then
+    begin
+      FPrefixImageInNet := TNNet.Create();
+      FPrefixImageInNet.BuildWeightOwner := FImageInOwner;
+      BuildImageInNet(FPrefixImageInNet, ConditionCount);
+      FPrefixImageInNet.BuildWeightOwner := nil;
+      if not Assigned(FConditionLatents) then
+      begin
+        FConditionLatents := TNNetVolume.Create();
+        FPrefixInput := TNNetVolume.Create();
+      end;
+      FConditionLatents.ReSize(ConditionCount, 1, FConfig.InChannels);
+      FPrefixInput.ReSize(TokenCount, 1, FConfig.Hidden);
+    end
+    else
+    begin
+      FreeAndNil(FConditionLatents);
+      FreeAndNil(FPrefixInput);
+    end;
     FPrefixNet := TNNet.Create();
     FPrefixNet.BuildWeightOwner := FBlockStore[0];
-    BuildBlockNet(FPrefixNet, TokenCount, qibPrefix, 0, FPrefixBlock);
+    if HasImages
+      then BuildBlockNet(FPrefixNet, TokenCount, qibBlockCausalPrefix, 0,
+        FPrefixBlock)
+      else BuildBlockNet(FPrefixNet, TokenCount, qibPrefix, 0, FPrefixBlock);
     FPrefixNet.BuildWeightOwner := nil;
     if FInt8Input then FPrefixNet.EnableInt8Input();
     PrepareInferenceThreads(FPrefixNet, FParallel, FMaxThreads);
-    BuildQwenImage21RopePositions([TokenCount], [], [], PosF, PosH, PosW);
+    if HasImages then
+      FPrefixBlock.Attn.SetRowKeyEnds(QwenImage21PrefixRowKeyEnds(
+        TextLengths, GridHeights, GridWidths));
+    BuildQwenImage21RopePositions(TextLengths, GridHeights, GridWidths,
+      PosF, PosH, PosW);
     QwenImage21SetRopePositions(FPrefixNet, PosF, PosH, PosW);
+    SetLength(FPrefixTextLengths, MaxRunPos + 1);
+    for RunCnt := 0 to MaxRunPos do
+      FPrefixTextLengths[RunCnt] := TextLengths[RunCnt];
+    SetLength(FPrefixGridHeights, ImageCount);
+    SetLength(FPrefixGridWidths, ImageCount);
+    for ImagePos := 0 to MaxImagePos do
+    begin
+      FPrefixGridHeights[ImagePos] := GridHeights[ImagePos];
+      FPrefixGridWidths[ImagePos] := GridWidths[ImagePos];
+    end;
     FPrefixLength := TokenCount;
     SetLayerProfiling(FLayerProfiling);
   end;
   if FLayerProfiling then
   begin
     FTextInNet.ClearTime();
+    if HasImages then FPrefixImageInNet.ClearTime();
     FPrefixNet.ClearTime();
     FPrefixNet.ResetSchedulerStats();
     SetLength(FProfileStepMs, 0);
@@ -84905,7 +85212,21 @@ begin
   ComputeModulation(0);
   FPrefixNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FTextInNet.Compute(TextHidden);
-  BlockInput := FTextInNet.GetLastLayer().Output;
+  if HasImages then
+  begin
+    ConditionCount := 0;
+    for ImagePos := 0 to MaxImagePos do
+    begin
+      Move(ImageLatents[ImagePos].FData[0],
+        FConditionLatents.FData[ConditionCount * FConfig.InChannels],
+        ImageLatents[ImagePos].Size * csNeuralFloatSize);
+      Inc(ConditionCount, ImageLatents[ImagePos].SizeX);
+    end;
+    FPrefixImageInNet.Compute(FConditionLatents);
+    InterleavePrefixRows();
+    BlockInput := FPrefixInput;
+  end
+  else BlockInput := FTextInNet.GetLastLayer().Output;
   MaxBlockPos := FConfig.NumLayers - 1;
   // The text rows after the last block are never read: its forward stops once
   // K and V exist.
@@ -84913,6 +85234,7 @@ begin
   for BlockCnt := 0 to MaxBlockPos do
   begin
     SelectBlockWeights(FPrefixNet, BlockCnt);
+    if HasImages then FPrefixBlock.Attn.TruncateCache(0);
     if BlockCnt < MaxBlockPos
       then FPrefixNet.Compute(BlockInput, 0, FParallel)
       else FPrefixNet.Compute(BlockInput, 0, FParallel, LastBlockEndIdx);
@@ -84928,6 +85250,7 @@ end;
 procedure TQwenImage21Transformer.PrepareStepPass(GridH, GridW: integer);
 var
   PosF, PosH, PosW: TNeuralIntegerArray;
+  TextLengths, GridHeights, GridWidths: TNeuralIntegerArray;
   TokenCount: integer;
 begin
   if FPrefixLength = 0 then
@@ -84960,8 +85283,11 @@ begin
   {$IFDEF OpenCL}
   if FOpenCLEnabled then EnableStepPassOpenCL();
   {$ENDIF}
-  // The step pass carries only the image tokens: the tail of the joint layout.
-  BuildQwenImage21RopePositions([FPrefixLength, 0], [GridH], [GridW],
+  // The step pass carries only the target tokens: the tail of the joint
+  // layout, so its frame position follows every prefix text run and image.
+  QwenImage21StepLayout(FPrefixTextLengths, FPrefixGridHeights,
+    FPrefixGridWidths, GridH, GridW, TextLengths, GridHeights, GridWidths);
+  BuildQwenImage21RopePositions(TextLengths, GridHeights, GridWidths,
     PosF, PosH, PosW);
   QwenImage21SetRopePositions(FStepNet,
     Copy(PosF, FPrefixLength, TokenCount),
@@ -85091,7 +85417,7 @@ end;
 
 procedure TQwenImage21Transformer.SetLayerProfiling(Value: boolean);
 var
-  Nets: array[0..5] of TNNet;
+  Nets: array[0..6] of TNNet;
   NetPos: integer;
 begin
   FLayerProfiling := Value;
@@ -85101,6 +85427,7 @@ begin
   Nets[3] := FImageInNet;
   Nets[4] := FStepNet;
   Nets[5] := FOutputNet;
+  Nets[6] := FPrefixImageInNet;
   for NetPos := Low(Nets) to High(Nets) do
     if Assigned(Nets[NetPos]) then Nets[NetPos].LayerProfiling := Value;
 end;

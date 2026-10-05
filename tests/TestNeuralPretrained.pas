@@ -785,6 +785,11 @@ type
     procedure TestQwenImage21TransformerOpenCLCodesResident;
     procedure TestQwenImage21TransformerOpenCLAttention;
     procedure TestQwenImage21TransformerStepReplay;
+    // Condition images (C3a): RoPE positions, key ends and the encoder-row
+    // split vs the diffusers layout; prefix K/V and velocity parity.
+    procedure TestQwenImage21EditLayout;
+    procedure TestQwenImage21EditTransformerParity;
+    procedure TestQwenImage21EditTransformerOpenCL;
     procedure TestQwenImage21TransformerQuantizedDrift;
     procedure TestQwenImage21Int4DirectLoad;
     procedure TestQwenImage21Int4ImportRefusals;
@@ -28747,6 +28752,436 @@ begin
     VelocityOpenCL.Free;
     Latents.Free;
     Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+type
+  // One case of tiny_qwenimage21_edit_transformer_io.json.
+  TQwenImage21EditCase = record
+    TextLengths, GridHeights, GridWidths, SlotCounts: TNeuralIntegerArray;
+    ImagePadMask: TQwen3VLImagePadMask;
+    TargetH, TargetW, PrefixLength: integer;
+  end;
+  TQwenImage21EditLatents = array of TNNetVolume;
+
+function LoadQwenImage21EditOracle(const FileName: string): TJSONData;
+var
+  RefJson: TStringList;
+begin
+  RefJson := TStringList.Create;
+  try
+    RefJson.LoadFromFile(FileName);
+    Result := GetJSON(RefJson.Text);
+  finally
+    RefJson.Free;
+  end;
+end;
+
+function ReadQwenImage21EditCase(CaseObj: TJSONObject): TQwenImage21EditCase;
+var
+  TextArr, GridArr, MaskArr, TargetArr: TJSONArray;
+  RunPos, GridPos, MaskPos, MaxGridPos: integer;
+begin
+  TextArr := TJSONArray(CaseObj.Find('text_lengths'));
+  GridArr := TJSONArray(CaseObj.Find('condition_grids'));
+  MaskArr := TJSONArray(CaseObj.Find('img_mask'));
+  TargetArr := TJSONArray(CaseObj.Find('target_grid'));
+  SetLength(Result.TextLengths, TextArr.Count);
+  for RunPos := 0 to TextArr.Count - 1 do
+    Result.TextLengths[RunPos] := TextArr.Integers[RunPos];
+  MaxGridPos := GridArr.Count - 1;
+  SetLength(Result.GridHeights, MaxGridPos + 1);
+  SetLength(Result.GridWidths, MaxGridPos + 1);
+  SetLength(Result.SlotCounts, MaxGridPos + 1);
+  for GridPos := 0 to MaxGridPos do
+  begin
+    Result.GridHeights[GridPos] :=
+      TJSONArray(GridArr.Items[GridPos]).Integers[0];
+    Result.GridWidths[GridPos] :=
+      TJSONArray(GridArr.Items[GridPos]).Integers[1];
+    Result.SlotCounts[GridPos] := Result.GridHeights[GridPos] *
+      Result.GridWidths[GridPos] div csQwenImage21LatentTokensPerSlot;
+  end;
+  SetLength(Result.ImagePadMask, MaskArr.Count);
+  for MaskPos := 0 to MaskArr.Count - 1 do
+    Result.ImagePadMask[MaskPos] := MaskArr.Integers[MaskPos] <> 0;
+  Result.TargetH := TargetArr.Integers[0];
+  Result.TargetW := TargetArr.Integers[1];
+  Result.PrefixLength := CaseObj.Get('prefix_len', 0);
+end;
+
+// Splits the case's concatenated condition latents into one (h*w,1,C) volume
+// per image; FreeQwenImage21EditLatents frees them.
+function SplitQwenImage21EditLatents(const EditCase: TQwenImage21EditCase;
+  AllLatents: TNNetVolume): TQwenImage21EditLatents;
+var
+  ImagePos, RowPos, Rows: integer;
+begin
+  SetLength(Result, Length(EditCase.GridHeights));
+  RowPos := 0;
+  for ImagePos := 0 to Length(EditCase.GridHeights) - 1 do
+  begin
+    Rows := EditCase.GridHeights[ImagePos] * EditCase.GridWidths[ImagePos];
+    Result[ImagePos] := TNNetVolume.Create();
+    Result[ImagePos].CopyCropping(AllLatents, RowPos, 0, Rows, 1);
+    Inc(RowPos, Rows);
+  end;
+end;
+
+procedure FreeQwenImage21EditLatents(var ImageLatents: TQwenImage21EditLatents);
+var
+  ImagePos: integer;
+begin
+  for ImagePos := 0 to Length(ImageLatents) - 1 do
+    ImageLatents[ImagePos].Free;
+  SetLength(ImageLatents, 0);
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21EditLayout;
+var
+  RefRoot: TJSONData;
+  Cases, PosArr: TJSONArray;
+  CaseObj: TJSONObject;
+  EditCase: TQwenImage21EditCase;
+  EncoderRows, TextRows: TNNetVolume;
+  PosF, PosH, PosW, KeyEnds, TextLengths: TNeuralIntegerArray;
+  TargetTextLengths, TargetHeights, TargetWidths: TNeuralIntegerArray;
+  CaseCnt, TokenPos, RowPos, TextRow, Channel: integer;
+  What: string;
+begin
+  RefRoot := LoadQwenImage21EditOracle(
+    FixturePath('tiny_qwenimage21_edit_transformer_io.json'));
+  EncoderRows := TNNetVolume.Create;
+  TextRows := TNNetVolume.Create;
+  try
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 2, Cases.Count);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      What := 'case ' + IntToStr(CaseCnt);
+      CaseObj := TJSONObject(Cases.Items[CaseCnt]);
+      EditCase := ReadQwenImage21EditCase(CaseObj);
+      QwenImage21StepLayout(EditCase.TextLengths, EditCase.GridHeights,
+        EditCase.GridWidths, EditCase.TargetH, EditCase.TargetW,
+        TargetTextLengths, TargetHeights, TargetWidths);
+      BuildQwenImage21RopePositions(TargetTextLengths, TargetHeights,
+        TargetWidths, PosF, PosH, PosW);
+      PosArr := TJSONArray(TJSONObject(CaseObj.Find('positions_fhw')).Find(
+        'data'));
+      AssertEquals(What + ': token count', PosArr.Count div 3, Length(PosF));
+      for TokenPos := 0 to Length(PosF) - 1 do
+      begin
+        AssertEquals(What + ' frame ' + IntToStr(TokenPos),
+          PosArr.Integers[3 * TokenPos], PosF[TokenPos]);
+        AssertEquals(What + ' h ' + IntToStr(TokenPos),
+          PosArr.Integers[3 * TokenPos + 1], PosH[TokenPos]);
+        AssertEquals(What + ' w ' + IntToStr(TokenPos),
+          PosArr.Integers[3 * TokenPos + 2], PosW[TokenPos]);
+      end;
+      // The prefix alone is the head of the same layout.
+      BuildQwenImage21RopePositions(EditCase.TextLengths,
+        EditCase.GridHeights, EditCase.GridWidths, PosF, PosH, PosW);
+      AssertEquals(What + ': prefix length', EditCase.PrefixLength,
+        Length(PosF));
+      for TokenPos := 0 to Length(PosF) - 1 do
+        AssertEquals(What + ' prefix frame ' + IntToStr(TokenPos),
+          PosArr.Integers[3 * TokenPos], PosF[TokenPos]);
+      // The encoder rows at the slots are dropped, in order.
+      LoadOracleTokenTensor(CaseObj, 'encoder_hidden_states', EncoderRows);
+      QwenImage21SplitEncoderRows(EncoderRows, EditCase.ImagePadMask,
+        EditCase.SlotCounts, TextRows, TextLengths);
+      AssertEquals(What + ': text runs', Length(EditCase.TextLengths),
+        Length(TextLengths));
+      for TokenPos := 0 to Length(TextLengths) - 1 do
+        AssertEquals(What + ': text run ' + IntToStr(TokenPos),
+          EditCase.TextLengths[TokenPos], TextLengths[TokenPos]);
+      TextRow := 0;
+      for RowPos := 0 to EncoderRows.SizeX - 1 do
+        if not EditCase.ImagePadMask[RowPos] then
+        begin
+          for Channel := 0 to EncoderRows.Depth - 1 do
+            AssertEquals(What + ': text row ' + IntToStr(TextRow) +
+              ' channel ' + IntToStr(Channel),
+              EncoderRows.FData[RowPos * EncoderRows.Depth + Channel],
+              TextRows.FData[TextRow * TextRows.Depth + Channel]);
+          Inc(TextRow);
+        end;
+      AssertEquals(What + ': text row count', TextRow, TextRows.SizeX);
+    end;
+    // Two adjacent images: text 4, image 3x4, image 2x2, text 3.
+    KeyEnds := QwenImage21PrefixRowKeyEnds([4, 0, 3], [3, 2], [4, 2]);
+    AssertEquals('key ends: row count', 23, Length(KeyEnds));
+    for TokenPos := 0 to 3 do
+      AssertEquals('key end, text row ' + IntToStr(TokenPos), TokenPos + 1,
+        KeyEnds[TokenPos]);
+    for TokenPos := 4 to 15 do
+      AssertEquals('key end, image 0 row ' + IntToStr(TokenPos), 16,
+        KeyEnds[TokenPos]);
+    for TokenPos := 16 to 19 do
+      AssertEquals('key end, image 1 row ' + IntToStr(TokenPos), 20,
+        KeyEnds[TokenPos]);
+    for TokenPos := 20 to 22 do
+      AssertEquals('key end, text row ' + IntToStr(TokenPos), TokenPos + 1,
+        KeyEnds[TokenPos]);
+  finally
+    TextRows.Free;
+    EncoderRows.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// The pico transformer with 1 condition image and with 2 adjacent ones vs
+// diffusers extract/cached modes: both blocks' prefix K/V (1e-5) and the
+// target velocity of step 1 (t = 0.9) and step 2 (t = 0.35, new latents;
+// 5e-5 as in TestQwenImage21TransformerParity). Each case first encodes zero
+// latents (same layout, nets reused). The same transformer then encodes the
+// text-only prompt of that test and must still match it; int4 weights drift
+// less than 10% of the largest velocity (as in QuantizedDrift).
+procedure TTestNeuralPretrained.TestQwenImage21EditTransformerParity;
+const
+  KVTolerance = 1e-5;
+  VelocityTolerance = 5e-5;
+var
+  RefRoot, TextOnlyRoot: TJSONData;
+  Cases, CacheKArr, CacheVArr: TJSONArray;
+  CaseObj: TJSONObject;
+  EditCase: TQwenImage21EditCase;
+  Transformer: TQwenImage21Transformer;
+  EncoderRows, TextRows, AllLatents, Latents, Expected, Velocity: TNNetVolume;
+  ImageLatents, ZeroLatents: TQwenImage21EditLatents;
+  TextLengths: TNeuralIntegerArray;
+  CaseCnt, BlockPos, GridH, GridW, PrefixCount, ImagePos: integer;
+  Timestep1, Timestep2, WorstDiff, Drift: double;
+  PrefixNetBefore: TNNet;
+  What: string;
+
+  procedure AssertClose(Actual: TNNetVolume; Tolerance: double;
+    const Msg: string);
+  var
+    MaxDiff: double;
+  begin
+    MaxDiff := MaxAbsVolumeDiff(Actual, Expected);
+    if MaxDiff > WorstDiff then WorstDiff := MaxDiff;
+    AssertTrue(Msg + ': max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < ' + FloatToStr(Tolerance), MaxDiff < Tolerance);
+  end;
+
+begin
+  RefRoot := LoadQwenImage21EditOracle(
+    FixturePath('tiny_qwenimage21_edit_transformer_io.json'));
+  TextOnlyRoot := nil;
+  Transformer := nil;
+  ImageLatents := nil;
+  EncoderRows := TNNetVolume.Create;
+  TextRows := TNNetVolume.Create;
+  AllLatents := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  WorstDiff := 0;
+  try
+    Timestep1 := TJSONObject(RefRoot).Get('timestep_1', 0.0);
+    Timestep2 := TJSONObject(RefRoot).Get('timestep_2', 0.0);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      What := 'case ' + IntToStr(CaseCnt);
+      CaseObj := TJSONObject(Cases.Items[CaseCnt]);
+      EditCase := ReadQwenImage21EditCase(CaseObj);
+      LoadOracleTokenTensor(CaseObj, 'encoder_hidden_states', EncoderRows);
+      QwenImage21SplitEncoderRows(EncoderRows, EditCase.ImagePadMask,
+        EditCase.SlotCounts, TextRows, TextLengths);
+      LoadOracleTokenTensor(CaseObj, 'condition_latents', AllLatents);
+      FreeQwenImage21EditLatents(ImageLatents);
+      ImageLatents := SplitQwenImage21EditLatents(EditCase, AllLatents);
+      FreeQwenImage21EditLatents(ZeroLatents);
+      ZeroLatents := SplitQwenImage21EditLatents(EditCase, AllLatents);
+      for ImagePos := 0 to Length(ZeroLatents) - 1 do
+        ZeroLatents[ImagePos].Fill(0);
+      Transformer.EncodePrefix(TextRows, TextLengths, ZeroLatents,
+        EditCase.GridHeights, EditCase.GridWidths);
+      LoadOracleTokenTensorObject(TJSONArray(CaseObj.Find('cache_k')).Items[0],
+        'cache_k', Expected);
+      AssertTrue(What + ': zero latents change the prefix K',
+        MaxAbsVolumeDiff(Transformer.PrefixKeys[0], Expected) > 1e-3);
+      PrefixNetBefore := Transformer.PrefixNet;
+      Transformer.EncodePrefix(TextRows, TextLengths, ImageLatents,
+        EditCase.GridHeights, EditCase.GridWidths);
+      AssertTrue(What + ': the same layout reuses the prefix net',
+        PrefixNetBefore = Transformer.PrefixNet);
+      AssertEquals(What + ': prefix length', EditCase.PrefixLength,
+        Transformer.PrefixLength);
+      CacheKArr := TJSONArray(CaseObj.Find('cache_k'));
+      CacheVArr := TJSONArray(CaseObj.Find('cache_v'));
+      for BlockPos := 0 to Transformer.Config.NumLayers - 1 do
+      begin
+        LoadOracleTokenTensorObject(CacheKArr.Items[BlockPos], 'cache_k',
+          Expected);
+        AssertClose(Transformer.PrefixKeys[BlockPos], KVTolerance,
+          What + ': prefix K, block ' + IntToStr(BlockPos));
+        LoadOracleTokenTensorObject(CacheVArr.Items[BlockPos], 'cache_v',
+          Expected);
+        AssertClose(Transformer.PrefixValues[BlockPos], KVTolerance,
+          What + ': prefix V, block ' + IntToStr(BlockPos));
+      end;
+      LoadOracleTokenTensor(CaseObj, 'latents_1', Latents);
+      Transformer.PredictVelocity(Latents, Timestep1, EditCase.TargetH,
+        EditCase.TargetW, Velocity);
+      LoadOracleTokenTensor(CaseObj, 'extract_target_output', Expected);
+      AssertClose(Velocity, VelocityTolerance, What + ': step 1 velocity');
+      LoadOracleTokenTensor(CaseObj, 'latents_2', Latents);
+      Transformer.PredictVelocity(Latents, Timestep2, EditCase.TargetH,
+        EditCase.TargetW, Velocity);
+      LoadOracleTokenTensor(CaseObj, 'cached_output', Expected);
+      AssertClose(Velocity, VelocityTolerance, What + ': step 2 velocity');
+    end;
+    // Back to a text-only prompt on the same transformer.
+    TextOnlyRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    PrefixCount := TJSONObject(TextOnlyRoot).Get('text_len', 0);
+    LoadOracleTokenTensor(TextOnlyRoot, 'encoder_hidden_states', TextRows);
+    Transformer.EncodePrefix(TextRows);
+    AssertEquals('text-only prefix length', PrefixCount,
+      Transformer.PrefixLength);
+    LoadOracleTokenTensor(TextOnlyRoot, 'latents_2', Latents);
+    Transformer.PredictVelocity(Latents, 0.35, GridH, GridW, Velocity);
+    LoadOracleTokenTensor(TextOnlyRoot, 'cached_output', Expected);
+    AssertClose(Velocity, VelocityTolerance,
+      'text-only velocity after image prefixes');
+    WriteLn('  Qwen-Image-2.1 edit transformer parity: worst max|diff|=',
+      WorstDiff:0:9);
+    // int4 block weights, the last case (two adjacent images), step 1.
+    FreeAndNil(Transformer);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder(), qiwInt4);
+    // ImageLatents still holds this case's latents from the loop above.
+    CaseObj := TJSONObject(Cases.Items[Cases.Count - 1]);
+    EditCase := ReadQwenImage21EditCase(CaseObj);
+    LoadOracleTokenTensor(CaseObj, 'encoder_hidden_states', EncoderRows);
+    QwenImage21SplitEncoderRows(EncoderRows, EditCase.ImagePadMask,
+      EditCase.SlotCounts, TextRows, TextLengths);
+    Transformer.EncodePrefix(TextRows, TextLengths, ImageLatents,
+      EditCase.GridHeights, EditCase.GridWidths);
+    LoadOracleTokenTensor(CaseObj, 'latents_1', Latents);
+    Transformer.PredictVelocity(Latents, Timestep1, EditCase.TargetH,
+      EditCase.TargetW, Velocity);
+    LoadOracleTokenTensor(CaseObj, 'extract_target_output', Expected);
+    Drift := MaxAbsVolumeDiff(Velocity, Expected) / Expected.GetMaxAbs();
+    WriteLn('  Qwen-Image-2.1 edit transformer int4 relative drift=',
+      Drift:0:6);
+    AssertTrue('int4 relative drift ' + FloatToStr(Drift) + ' must be < 0.10',
+      Drift < 0.10);
+  finally
+    FreeQwenImage21EditLatents(ZeroLatents);
+    FreeQwenImage21EditLatents(ImageLatents);
+    Transformer.Free;
+    Velocity.Free;
+    Expected.Free;
+    Latents.Free;
+    AllLatents.Free;
+    TextRows.Free;
+    EncoderRows.Free;
+    TextOnlyRoot.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// The two-image prefix (host block-causal attention) feeds a step pass on
+// OpenCL: int8 velocities match the int8 CPU run, both steps, and the step
+// attention runs on OpenCL in every block.
+procedure TTestNeuralPretrained.TestQwenImage21EditTransformerOpenCL;
+{$IFDEF OpenCL}
+const
+  Timesteps: array[0..1] of TNeuralFloat = (0.9, 0.35);
+var
+  RefRoot: TJSONData;
+  CaseObj: TJSONObject;
+  EditCase: TQwenImage21EditCase;
+  OnOpenCL, OnCPU: TQwenImage21Transformer;
+  EncoderRows, TextRows, AllLatents, Latents: TNNetVolume;
+  VelocityOpenCL, VelocityCPU: TNNetVolume;
+  ImageLatents: TQwenImage21EditLatents;
+  TextLengths: TNeuralIntegerArray;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  StepPos, GPUBefore: integer;
+  Diff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefRoot := LoadQwenImage21EditOracle(
+    FixturePath('tiny_qwenimage21_edit_transformer_io.json'));
+  OnOpenCL := nil;
+  OnCPU := nil;
+  ImageLatents := nil;
+  EncoderRows := TNNetVolume.Create;
+  TextRows := TNNetVolume.Create;
+  AllLatents := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  VelocityOpenCL := TNNetVolume.Create;
+  VelocityCPU := TNNetVolume.Create;
+  try
+    CaseObj := TJSONObject(TJSONArray(TJSONObject(RefRoot).Find('cases'))
+      .Items[1]);
+    EditCase := ReadQwenImage21EditCase(CaseObj);
+    LoadOracleTokenTensor(CaseObj, 'encoder_hidden_states', EncoderRows);
+    QwenImage21SplitEncoderRows(EncoderRows, EditCase.ImagePadMask,
+      EditCase.SlotCounts, TextRows, TextLengths);
+    LoadOracleTokenTensor(CaseObj, 'condition_latents', AllLatents);
+    ImageLatents := SplitQwenImage21EditLatents(EditCase, AllLatents);
+    LoadOracleTokenTensor(CaseObj, 'latents_1', Latents);
+    OnOpenCL := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+      qiwInt8);
+    AssertTrue('transformer arms OpenCL',
+      OnOpenCL.EnableOpenCL(PlatformId, DeviceId));
+    OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+      qiwInt8);
+    OnOpenCL.EncodePrefix(TextRows, TextLengths, ImageLatents,
+      EditCase.GridHeights, EditCase.GridWidths);
+    OnCPU.EncodePrefix(TextRows, TextLengths, ImageLatents,
+      EditCase.GridHeights, EditCase.GridWidths);
+    for StepPos := 0 to 1 do
+    begin
+      // The first PredictVelocity builds the step pass.
+      if Assigned(OnOpenCL.StepNet)
+        then GPUBefore := OnOpenCL.StepBlock.Attn.ForwardGPUCnt
+        else GPUBefore := 0;
+      OnOpenCL.PredictVelocity(Latents, Timesteps[StepPos], EditCase.TargetH,
+        EditCase.TargetW, VelocityOpenCL);
+      OnCPU.PredictVelocity(Latents, Timesteps[StepPos], EditCase.TargetH,
+        EditCase.TargetW, VelocityCPU);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the step attention ran on OpenCL in every block',
+        OnOpenCL.Config.NumLayers,
+        OnOpenCL.StepBlock.Attn.ForwardGPUCnt - GPUBefore);
+      Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
+      WriteLn('  Qwen-Image-2.1 edit step ', StepPos,
+        ' OpenCL vs CPU velocity max|diff|=', Diff:0:9);
+      AssertTrue('step ' + IntToStr(StepPos) + ': velocity max|diff| ' +
+        FloatToStr(Diff) + ' must be < 1e-5', Diff < 1e-5);
+    end;
+    AssertEquals('prefix K/V uploaded once per block',
+      OnOpenCL.Config.NumLayers, OnOpenCL.PrefixKVUploadCount);
+  finally
+    FreeQwenImage21EditLatents(ImageLatents);
+    OnCPU.Free;
+    OnOpenCL.Free;
+    VelocityCPU.Free;
+    VelocityOpenCL.Free;
+    Latents.Free;
+    AllLatents.Free;
+    TextRows.Free;
+    EncoderRows.Free;
     RefRoot.Free;
   end;
 end;

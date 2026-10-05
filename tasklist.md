@@ -2496,7 +2496,7 @@ rather than acted on.
         interleaved M-RoPE sections, N-image `get_rope_index` positions, edit template
         `<image1><|vision_start|><|image_pad|><|vision_end|> <image2>...`, image-pad
         mask output.
-  - [ ] C3a. Transformer prefix with condition images: each image slot expanded x4
+  - [x] C3a. Transformer prefix with condition images: each image slot expanded x4
         and filled with `img_in(VAE latents)`, t = 0 modulation, block-causal mask
         (causal text, bidirectional per image) via a per-row key limit in
         `TNNetFusedSDPA.ComputeCachedRows`; `PrepareStepPass` must place the target

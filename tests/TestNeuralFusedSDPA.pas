@@ -45,6 +45,7 @@ type
     procedure TestChunkedDecodeParity;   // chunked cached decode vs serial
     procedure TestCachedForwardNonCausal; // external prefix + unmasked step
     procedure TestSharedCacheStorage;     // stacked layers, one K/V storage
+    procedure TestCachedRowKeyEnds;       // per-row key ends vs a dense mask
   end;
 
 implementation
@@ -722,6 +723,177 @@ begin
     Nets[1].Free;
     Nets[0].Free;
     Input.Free;
+  end;
+end;
+
+// Block-causal key ends (text 2 rows, an image block of 3, text 2) over 2
+// externally cached rows must match a dense masked softmax computed here, on
+// the serial and the chunked forward; [] restores the causal mask. A length
+// mismatch, eviction and the non-cached path raise (serial pass).
+procedure TTestNeuralFusedSDPA.TestCachedRowKeyEnds;
+const
+  PrefixLen = 2;
+  SeqLen = 7;
+  Hq = 4;
+  Hkv = 2;
+  HeadDim = 4;
+  BlockEnds: array[0..SeqLen - 1] of integer = (1, 2, 5, 5, 5, 6, 7);
+var
+  NN, Uncached: TNNet;
+  Layer, UncachedLayer: TNNetFusedSDPA;
+  Prefix, Input, PrefixK, PrefixV, Expected: TNNetVolume;
+  QW, KW, PackedWidth, i: integer;
+  Parallel, Raised: boolean;
+  CausalEnds: array[0..SeqLen - 1] of integer;
+
+  procedure DenseReference(const KeyEnds: array of integer);
+  var
+    p, h, g, j, d, KeyCount: integer;
+    Scores: array of double;
+    MaxScore, SumExp, Acc: double;
+    QPos, KPos, VPos: integer;
+  begin
+    Expected.ReSize(SeqLen, 1, QW);
+    for p := 0 to SeqLen - 1 do
+      for h := 0 to Hq - 1 do
+      begin
+        g := h div (Hq div Hkv);
+        KeyCount := PrefixLen + KeyEnds[p];
+        SetLength(Scores, KeyCount);
+        MaxScore := -1e30;
+        // Key j < PrefixLen is cached row j, otherwise forward row j-PrefixLen.
+        for j := 0 to KeyCount - 1 do
+        begin
+          Acc := 0;
+          QPos := p * PackedWidth + h * HeadDim;
+          for d := 0 to HeadDim - 1 do
+          begin
+            if j < PrefixLen
+              then KPos := j * PackedWidth + QW + g * HeadDim + d
+              else KPos := (j - PrefixLen) * PackedWidth + QW + g * HeadDim + d;
+            if j < PrefixLen
+              then Acc := Acc + Input.FData[QPos + d] * Prefix.FData[KPos]
+              else Acc := Acc + Input.FData[QPos + d] * Input.FData[KPos];
+          end;
+          Scores[j] := Acc / Sqrt(HeadDim);
+          if Scores[j] > MaxScore then MaxScore := Scores[j];
+        end;
+        SumExp := 0;
+        for j := 0 to KeyCount - 1 do
+        begin
+          Scores[j] := Exp(Scores[j] - MaxScore);
+          SumExp := SumExp + Scores[j];
+        end;
+        for d := 0 to HeadDim - 1 do
+        begin
+          Acc := 0;
+          for j := 0 to KeyCount - 1 do
+          begin
+            if j < PrefixLen
+              then VPos := j * PackedWidth + QW + KW + g * HeadDim + d
+              else VPos := (j - PrefixLen) * PackedWidth + QW + KW + g * HeadDim + d;
+            if j < PrefixLen
+              then Acc := Acc + Scores[j] * Prefix.FData[VPos]
+              else Acc := Acc + Scores[j] * Input.FData[VPos];
+          end;
+          Expected.FData[p * QW + h * HeadDim + d] := Acc / SumExp;
+        end;
+      end;
+  end;
+
+  function ComputeRaises(Net: TNNet): boolean;
+  begin
+    Result := false;
+    try
+      Net.Compute(Input, 0, Parallel);
+    except
+      Result := true;
+    end;
+  end;
+
+  procedure RunAndCompare(const What: string);
+  var
+    OutPos: integer;
+  begin
+    Layer.TruncateCache(0);
+    Layer.AppendCacheRowsFrom(PrefixK, PrefixV);
+    NN.Compute(Input, 0, Parallel);
+    for OutPos := 0 to SeqLen * QW - 1 do
+      AssertEquals(What + ' parallel=' + BoolToStr(Parallel, true) + ' at ' +
+        IntToStr(OutPos), Expected.FData[OutPos],
+        NN.GetLastLayer().Output.FData[OutPos], 1e-5);
+  end;
+
+begin
+  QW := Hq * HeadDim;
+  KW := Hkv * HeadDim;
+  PackedWidth := QW + 2 * KW;
+  for i := 0 to SeqLen - 1 do CausalEnds[i] := i + 1;
+  Prefix := TNNetVolume.Create(PrefixLen, 1, PackedWidth);
+  Input := TNNetVolume.Create(SeqLen, 1, PackedWidth);
+  PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+  PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+  Expected := TNNetVolume.Create();
+  try
+    FillPacked(Prefix, 17);
+    FillPacked(Input, 53);
+    CopyPackedRows(Prefix, PrefixK, 0, PrefixLen, QW);
+    CopyPackedRows(Prefix, PrefixV, 0, PrefixLen, QW + KW);
+    for Parallel := false to true do
+    begin
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(SeqLen, 1, PackedWidth));
+        Layer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, {Causal=}true);
+        Layer.BeginIncrementalDecode(PrefixLen + SeqLen);
+        NN.AddLayer(Layer);
+        Layer.SetRowKeyEnds(BlockEnds);
+        DenseReference(BlockEnds);
+        RunAndCompare('block-causal');
+        Layer.SetRowKeyEnds([]);
+        DenseReference(CausalEnds);
+        RunAndCompare('cleared = causal');
+        Raised := false;
+        try
+          Layer.SetRowKeyEnds([1, 3]);
+        except
+          Raised := true;
+        end;
+        AssertTrue('a key end past the row count is refused', Raised);
+        // The parallel scheduler catches a layer's exception on its worker
+        // and reports it through FErrorProc, so only the serial pass raises.
+        if not Parallel then
+        begin
+          Layer.SetRowKeyEnds([1, 2]);
+          Layer.TruncateCache(0);
+          AssertTrue('2 key ends for 7 rows raise', ComputeRaises(NN));
+          Layer.SetRowKeyEnds(BlockEnds);
+          Layer.TruncateCache(0);
+          Layer.EnableEviction(1, 4);
+          AssertTrue('key ends with eviction raise', ComputeRaises(NN));
+          Layer.DisableEviction();
+          Uncached := TNNet.Create();
+          try
+            Uncached.AddLayer(TNNetInput.Create(SeqLen, 1, PackedWidth));
+            UncachedLayer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, true);
+            Uncached.AddLayer(UncachedLayer);
+            UncachedLayer.SetRowKeyEnds(BlockEnds);
+            AssertTrue('key ends without the cached path raise',
+              ComputeRaises(Uncached));
+          finally
+            Uncached.Free;
+          end;
+        end;
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Expected.Free;
+    PrefixV.Free;
+    PrefixK.Free;
+    Input.Free;
+    Prefix.Free;
   end;
 end;
 
