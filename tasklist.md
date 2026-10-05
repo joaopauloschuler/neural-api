@@ -2591,7 +2591,7 @@ rather than acted on.
           local-memory budget (48 KB, 64K registers, OpenCL C 1.2, no
           sub-groups), dispatch rule tiled vs decode-split, test plan, benchmark
           spec. Brought to the user before coding.
-    - [ ] E2.1 Kernel (coder A): non-causal mode first, register tiling, vector
+    - [x] E2.1 Kernel (coder A): non-causal mode first, register tiling, vector
           loads, fewer barriers, 2-3 tile variants behind an environment switch;
           a small benchmark example timing the kernel at given shapes without a
           model. User times the variants on the L4.

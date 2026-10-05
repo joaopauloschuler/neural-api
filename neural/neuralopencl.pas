@@ -205,6 +205,14 @@ type
     // CL_KERNEL_LOCAL_MEM_SIZE of pKernel on the current device: the local
     // memory the kernel declares itself, in bytes; 0 when the query fails.
     function KernelLocalMemSize(pKernel: cl_kernel): integer;
+    // CL_KERNEL_PRIVATE_MEM_SIZE of pKernel on the current device in bytes
+    // (spilled registers and private arrays); -1 when the query fails.
+    function KernelPrivateMemSize(pKernel: cl_kernel): int64;
+    // Writes the built program's binary for the current device (PTX text on
+    // NVIDIA) to FileName; false when there is none or the write fails.
+    function SaveProgramBinary(const FileName: string): boolean;
+    // The whole build log of the program for the current device.
+    function BuildLog(): string;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size, d1groupsize, d2groupsize: csize_t): integer; overload;
@@ -2870,6 +2878,10 @@ begin
   end;
 end;
 
+var
+  // NEURAL_OPENCL_BUILD_LOG prints one build log per process.
+  vOpenCLBuildLogPrinted: boolean = false;
+
 procedure TEasyOpenCL.CompileProgram();
 var
   localKernelSource: TNeuralPChar;
@@ -2932,7 +2944,18 @@ begin
       exit;
     end
     else
+    begin
       FMessageProc('clBuildProgram OK!');
+      // NEURAL_OPENCL_BUILD_LOG prints the first successful build's log (with
+      // -cl-nv-verbose, NVIDIA's register use); TNNet builds with messages
+      // hidden, so the opt-in bypasses FMessageProc.
+      if (not vOpenCLBuildLogPrinted) and
+        (GetEnvironmentVariable('NEURAL_OPENCL_BUILD_LOG') <> '') then
+      begin
+        vOpenCLBuildLogPrinted := true;
+        DefaultMessageProc('OpenCL build log: ' + BuildLog());
+      end;
+    end;
   finally
     {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelSource);
   end;
@@ -3437,6 +3460,96 @@ begin
   end;
 end;
 
+function TEasyOpenCL.KernelPrivateMemSize(pKernel: cl_kernel): int64;
+const
+  // CL_KERNEL_PRIVATE_MEM_SIZE (OpenCL 1.1), absent from the FPC cl unit.
+  csCLKernelPrivateMemSize = $11B4;
+var
+  PrivateBytes: cl_ulong;
+  BytesWritten: csize_t;
+begin
+  Result := -1;
+  if (FCurrentDevice = nil) or (pKernel = nil) then exit;
+  PrivateBytes := 0;
+  if clGetKernelWorkGroupInfo(pKernel, FCurrentDevice, csCLKernelPrivateMemSize,
+    SizeOf(PrivateBytes), @PrivateBytes, @BytesWritten) = CL_SUCCESS then
+    Result := PrivateBytes;
+end;
+
+function TEasyOpenCL.SaveProgramBinary(const FileName: string): boolean;
+var
+  DeviceCount: cl_uint;
+  BinarySizes: array of csize_t;
+  Binaries: array of PByte;
+  BytesWritten: csize_t;
+  DeviceIdx, ProgramDeviceIdx: integer;
+  ProgramDevices: array of cl_device_id;
+  BinaryStream: TFileStream;
+begin
+  Result := false;
+  if FProg = nil then exit;
+  DeviceCount := 0;
+  if clGetProgramInfo(FProg, CL_PROGRAM_NUM_DEVICES, SizeOf(DeviceCount),
+    @DeviceCount, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF})
+    <> CL_SUCCESS then exit;
+  if DeviceCount = 0 then exit;
+  SetLength(ProgramDevices, DeviceCount);
+  SetLength(BinarySizes, DeviceCount);
+  SetLength(Binaries, DeviceCount);
+  if clGetProgramInfo(FProg, CL_PROGRAM_DEVICES,
+    DeviceCount * SizeOf(cl_device_id), @ProgramDevices[0],
+    {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) <> CL_SUCCESS then exit;
+  if clGetProgramInfo(FProg, CL_PROGRAM_BINARY_SIZES,
+    DeviceCount * SizeOf(csize_t), @BinarySizes[0],
+    {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) <> CL_SUCCESS then exit;
+  ProgramDeviceIdx := 0;
+  for DeviceIdx := 0 to DeviceCount - 1 do
+  begin
+    if ProgramDevices[DeviceIdx] = FCurrentDevice then
+      ProgramDeviceIdx := DeviceIdx;
+    if BinarySizes[DeviceIdx] > 0
+      then Binaries[DeviceIdx] := GetMem(BinarySizes[DeviceIdx])
+      else Binaries[DeviceIdx] := nil;
+  end;
+  try
+    if (BinarySizes[ProgramDeviceIdx] = 0) or
+      (clGetProgramInfo(FProg, CL_PROGRAM_BINARIES, DeviceCount * SizeOf(PByte),
+       @Binaries[0], {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF})
+       <> CL_SUCCESS) then exit;
+    BinaryStream := TFileStream.Create(FileName, fmCreate);
+    try
+      BinaryStream.WriteBuffer(Binaries[ProgramDeviceIdx]^,
+        BinarySizes[ProgramDeviceIdx]);
+    finally
+      BinaryStream.Free;
+    end;
+    Result := true;
+  finally
+    for DeviceIdx := 0 to DeviceCount - 1 do
+      if Binaries[DeviceIdx] <> nil then FreeMem(Binaries[DeviceIdx]);
+  end;
+end;
+
+function TEasyOpenCL.BuildLog(): string;
+var
+  LogBytes: csize_t;
+  LogText: AnsiString;
+begin
+  Result := '';
+  if FProg = nil then exit;
+  LogBytes := 0;
+  if (clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, 0,
+    nil, {$IFDEF FPC}LogBytes{$ELSE}@LogBytes{$ENDIF}) <> CL_SUCCESS) or
+    (LogBytes < 2) then exit;
+  SetLength(LogText, LogBytes);
+  if clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG,
+    LogBytes, @LogText[1], {$IFDEF FPC}LogBytes{$ELSE}@LogBytes{$ENDIF})
+    <> CL_SUCCESS then exit;
+  SetLength(LogText,
+    {$IFDEF FPC}StrLen{$ELSE}AnsiStrings.StrLen{$ENDIF}(PAnsiChar(LogText)));
+  Result := string(LogText);
+end;
+
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
 var
   GlobalThreadCount: csize_t;
@@ -3611,6 +3724,10 @@ begin
   SetLength(FDevices, 0);
 
   FCompilerOptions := '-cl-fast-relaxed-math -cl-mad-enable';
+  // Extra build options for diagnostics, such as -cl-nv-verbose.
+  if GetEnvironmentVariable('NEURAL_OPENCL_BUILD_OPTIONS') <> '' then
+    FCompilerOptions := FCompilerOptions + ' ' +
+      GetEnvironmentVariable('NEURAL_OPENCL_BUILD_OPTIONS');
 
   FContext := nil;        // compute context
   FCommands := nil;       // compute command queue

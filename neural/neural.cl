@@ -3744,18 +3744,704 @@ void cai_sdpa_noncausal_tiled
     #pragma unroll
     for (j = 0; j < CAI_NC_COL_VECS; j++)
     {
+      // Scalar stores: PoCL 5.0 mis-addresses a vstore4 in this divergent
+      // unrolled loop.
       const float4 y = o[i][j] * InvRowTotal;
       const int c = CAI_NC_COL(j);
-      if (c + 3 < FDk) vstore4(y, 0, yrow + c);
-      else
-      {
-        if (c < FDk) yrow[c] = y.s0;
-        if (c + 1 < FDk) yrow[c + 1] = y.s1;
-        if (c + 2 < FDk) yrow[c + 2] = y.s2;
-      }
+      if (c < FDk) yrow[c] = y.s0;
+      if (c + 1 < FDk) yrow[c + 1] = y.s1;
+      if (c + 2 < FDk) yrow[c + 2] = y.s2;
+      if (c + 3 < FDk) yrow[c + 3] = y.s3;
     }
   }
 }
+
+// FLASH ATTENTION OVER THE FP32 KV CACHE (TNNetFusedSDPA): the arguments of
+// every cai_sdpa_flash_vN. Implemented: FKeySplits = 1, FColChunk = FDk.
+#define CAI_FLASH_PARAMS \
+  const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
+  const int FDk, const int FCacheMax, const int FKeyBase, \
+  const int FMaskMode, const int FWindow, const int FKeySplits, \
+  const int FSplitKeys, const int FColChunk, const int FXStride, \
+  const int FYStride, const float FInvSqrtDk, const float FScoreSoftCap, \
+  const float FInvScoreSoftCap, __global const float* FX, \
+  __global const int* FRowKeyEnds, __global const float* FKCache, \
+  __global const float* FVCache, __global float* FY, \
+  __global float* FPartials, __local float4* FScratch
+
+// Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
+// only: PoCL miscompiles a lane id divided by a run-time value.
+#define CAI_FLASH_KEY_LANE(lid) (((lid) & 7) | (((lid) >> 2) & 8))
+#define CAI_FLASH_ROW_LANE(lid) ((((lid) >> 3) & 3) | (((lid) >> 6) << 2))
+
+// Token row t's cache rows [lo, hi): hi = FKeyBase + (FTokenCnt, t + 1 or
+// FRowKeyEnds[t]) by FMaskMode 0/1/2; lo = max(0, hi - FWindow) if FWindow > 0.
+static inline int2 cai_flash_key_range(const int t, const int FTokenCnt,
+  const int FKeyBase, const int FMaskMode, const int FWindow,
+  __global const int* FRowKeyEnds)
+{
+  const int KeyHi = FKeyBase + ((FMaskMode == 1) ? (t + 1)
+    : ((FMaskMode == 2) ? FRowKeyEnds[t] : FTokenCnt));
+  return (int2)((FWindow > 0) ? max(0, KeyHi - FWindow) : 0, KeyHi);
+}
+
+// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, Y
+// offset, lo and hi tables; past the last token row: -1, -1, 0, 0.
+static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
+  const int r, const int Row0, const int g, const int FGroupSize,
+  const int FTokenCnt, const int FDk, const int FXStride, const int FYStride,
+  const int FKeyBase, const int FMaskMode, const int FWindow,
+  __global const int* FRowKeyEnds)
+{
+  int t = Row0 / FGroupSize;
+  int q = Row0 - t * FGroupSize + r;
+  while (q >= FGroupSize)
+  {
+    q -= FGroupSize;
+    t++;
+  }
+  int XOffset = -1, YOffset = -1;
+  int2 KeyRange = (int2)(0, 0);
+  if (t < FTokenCnt)
+  {
+    const int h = g * FGroupSize + q;
+    XOffset = t * FXStride + h * FDk;
+    YOffset = t * FYStride + h * FDk;
+    KeyRange = cai_flash_key_range(t, FTokenCnt, FKeyBase, FMaskMode, FWindow,
+      FRowKeyEnds);
+  }
+  RowTable[r] = XOffset;
+  RowTable[Br + r] = YOffset;
+  RowTable[2 * Br + r] = KeyRange.x;
+  RowTable[3 * Br + r] = KeyRange.y;
+}
+
+// Min lo, max hi, max lo and min hi over the tile's live rows; every lane
+// computes them alike, so the key loop bounds are uniform.
+static inline int4 cai_flash_tile_bounds(const int Br, const int Row0,
+  const int FGroupSize, const int FTokenCnt, const int FKeyBase,
+  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+{
+  const int FirstToken = Row0 / FGroupSize;
+  const int LastToken =
+    (min(Row0 + Br, FTokenCnt * FGroupSize) - 1) / FGroupSize;
+  int4 Bounds = (int4)(0x7fffffff, 0, 0, 0x7fffffff);
+  for (int t = FirstToken; t <= LastToken; t++)
+  {
+    const int2 KeyRange = cai_flash_key_range(t, FTokenCnt, FKeyBase,
+      FMaskMode, FWindow, FRowKeyEnds);
+    Bounds = (int4)(min(Bounds.x, KeyRange.x), max(Bounds.y, KeyRange.y),
+      max(Bounds.z, KeyRange.x), min(Bounds.w, KeyRange.y));
+  }
+  return Bounds;
+}
+
+// The float4 at column d (< Cols) of Row, zero from Cols on; Aligned (Cols and
+// the row start multiples of 4) takes one vector load.
+static inline float4 cai_flash_load4(__global const float* Row, const int d,
+  const int Cols, const int Aligned)
+{
+  if (Aligned) return *((__global const float4*)(Row + d));
+  const int MaxColPos = Cols - 1;
+  const float4 v = (float4)(Row[min(d, MaxColPos)],
+    Row[min(d + 1, MaxColPos)], Row[min(d + 2, MaxColPos)],
+    Row[min(d + 3, MaxColPos)]);
+  return (float4)(v.s0, (d + 1 < Cols) ? v.s1 : 0.0f,
+    (d + 2 < Cols) ? v.s2 : 0.0f, (d + 3 < Cols) ? v.s3 : 0.0f);
+}
+
+// Stages float4 columns [0, Cols4) from Col0 of Rows query rows into Tile; a
+// dead row reads row 0 (always live) and stores zero, so no load leaves X.
+static inline void cai_flash_stage_queries(__global const float* FX,
+  __local const int* XOffsets, const int Col0, const int Rows,
+  const int Cols4, const int FDk, const int Aligned, __local float4* Tile,
+  const int TileStride4, const int lid, const int Lanes)
+{
+  const int LiveOffset = XOffsets[0];
+  for (int r = lid >> 4; r < Rows; r += Lanes >> 4)
+  {
+    const int XOffset = XOffsets[r];
+    __global const float* Row = FX + max(XOffset, LiveOffset) + Col0;
+    for (int c = lid & 15; c < Cols4; c += 16)
+    {
+      const float4 v = cai_flash_load4(Row, c << 2, FDk - Col0, Aligned);
+      Tile[r * TileStride4 + c] = (XOffset >= 0) ? v : (float4)(0.0f);
+    }
+  }
+}
+
+// The same for Rows cache rows from Src; rows from RowsLive (>= 1) on read the
+// last live row and store zero.
+static inline void cai_flash_stage_keys(__global const float* Src,
+  const int Col0, const int Rows, const int RowsLive, const int Cols4,
+  const int FDk, const int Aligned, __local float4* Tile,
+  const int TileStride4, const int lid, const int Lanes)
+{
+  for (int r = lid >> 4; r < Rows; r += Lanes >> 4)
+  {
+    __global const float* Row = Src + min(r, RowsLive - 1) * FDk + Col0;
+    for (int c = lid & 15; c < Cols4; c += 16)
+    {
+      const float4 v = cai_flash_load4(Row, c << 2, FDk - Col0, Aligned);
+      Tile[r * TileStride4 + c] = (r < RowsLive) ? v : (float4)(0.0f);
+    }
+  }
+}
+
+// The scaled, soft-capped score, or -1e30 when Key is outside [KeyLo, KeyHi)
+// and the tile is not Interior (all its keys live for all rows).
+static inline float cai_flash_score(const float Dot, const int Key,
+  const int KeyLo, const int KeyHi, const int Interior,
+  const float FInvSqrtDk, const float FScoreSoftCap,
+  const float FInvScoreSoftCap)
+{
+  float sc = Dot * FInvSqrtDk;
+  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+  return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
+}
+
+// exp(Score - RowMax) in [exp(-80), 1], and exactly 0 for a masked key.
+static inline float cai_flash_prob(const float Score, const float RowMax)
+{
+  return (Score > -1e29f) ? exp(clamp(Score - RowMax, -80.0f, 0.0f)) : 0.0f;
+}
+
+// The largest of a row's 16 partials and Running.
+static inline float cai_flash_max16(__local const float4* Part,
+  const float Running)
+{
+  const float4 m4 = fmax(fmax(Part[0], Part[1]), fmax(Part[2], Part[3]));
+  return fmax(Running, fmax(fmax(m4.s0, m4.s1), fmax(m4.s2, m4.s3)));
+}
+
+// The sum of a row's 16 partials.
+static inline float cai_flash_sum16(__local const float4* Part)
+{
+  const float4 s4 = (Part[0] + Part[1]) + (Part[2] + Part[3]);
+  return (s4.s0 + s4.s1) + (s4.s2 + s4.s3);
+}
+
+// Writes the float4 y at column c of Row, clipped to Cols columns.
+static inline void cai_flash_store4(__global float* Row, const int c,
+  const int Cols, const float4 y)
+{
+  if (c < Cols) Row[c] = y.s0;
+  if (c + 1 < Cols) Row[c + 1] = y.s1;
+  if (c + 2 < Cols) Row[c + 2] = y.s2;
+  if (c + 3 < Cols) Row[c + 3] = y.s3;
+}
+
+// Copies output tile rows up to MaxRowPos to Y in a loop that is not unrolled:
+// PoCL 5.0 mis-addresses several lane-divergent stores in one unrolled pass.
+static inline void cai_flash_copy_out(__local const float4* Tile,
+  const int TileStride4, __local const int* YOffsets, const int Br,
+  const int MaxRowPos, const int Cols4, const int FDk, __global float* FY,
+  const int lid, const int Lanes)
+{
+  for (int r = lid >> 4; r < Br; r += Lanes >> 4)
+  {
+    const int YOffset = YOffsets[r];
+    for (int c = lid & 15; c < Cols4; c += 16)
+      if (r <= MaxRowPos)
+        cai_flash_store4(FY + YOffset, c << 2, FDk, Tile[r * TileStride4 + c]);
+  }
+}
+
+// Component e (0..3, a compile-time constant after unrolling) of v.
+#define CAI_FLASH_LANE4(v, e) \
+  (((e) == 0) ? (v).s0 : (((e) == 1) ? (v).s1 : (((e) == 2) ? (v).s2 : (v).s3)))
+
+// Variant 1 key tile, and the row slots, key slots and float4 output columns
+// one lane owns (16 key lanes by 16 row lanes); head dimension up to 128.
+#define CAI_FLASH_V1_KEY_TILE 32
+#define CAI_FLASH_V1_ROW_SLOTS 3
+#define CAI_FLASH_V1_KEY_SLOTS 2
+#define CAI_FLASH_V1_COL_VECS 2
+// A V1 lane's tile row for slot i, clamped to the tile; its result is dropped.
+#define CAI_FLASH_V1_ROW(i) min(ly + 16 * (i), Br - 1)
+#define CAI_FLASH_V1_ROW_LIVE(i) (ly + 16 * (i) < Br)
+
+// Variant 1 (Dk <= 128): resident Q tile of Br rows, one 32-key tile for K then
+// V; tiles as FusedSDPAFlashTiles states. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void cai_sdpa_flash_v1(CAI_FLASH_PARAMS)
+{
+  const int lid = get_local_id(0);
+  const int lx = CAI_FLASH_KEY_LANE(lid);
+  const int ly = CAI_FLASH_ROW_LANE(lid);
+  int i, j, e, d4, c4, kt;
+  const int Dk4 = (FDk + 3) & ~3;
+  const int MaxCol4Pos = (Dk4 >> 2) - 1;
+  const int Br = (Dk4 <= 64) ? 48 : 40;
+  const int RowTiles = (FTokenCnt * FGroupSize + Br - 1) / Br;
+  const int TileId = get_group_id(1)
+    / (FKeySplits * ((FDk + FColChunk - 1) / FColChunk));
+  const int g = TileId / RowTiles;
+  if (g >= FKVHeads) return;
+  const int Row0 = (TileId - g * RowTiles) * Br;
+  const int TileStride4 = (Dk4 >> 2) + 1;
+  const int PStride4 = (CAI_FLASH_V1_KEY_TILE >> 2) + 1;
+  __local float4* qTile = FScratch;
+  __local float4* kvTile = qTile + Br * TileStride4;
+  __local float4* pTile = kvTile + CAI_FLASH_V1_KEY_TILE * TileStride4;
+  __local float4* RowPart = pTile + Br * PStride4;
+  __local float* pTileF = (__local float*)pTile;
+  __local float* RowPartF = (__local float*)RowPart;
+  __local int* RowTable = (__local int*)(RowPart + Br * 4);
+
+  float4 o[CAI_FLASH_V1_ROW_SLOTS][CAI_FLASH_V1_COL_VECS];
+  float m[CAI_FLASH_V1_ROW_SLOTS], l[CAI_FLASH_V1_ROW_SLOTS];
+  #pragma unroll
+  for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+  {
+    m[i] = -1e30f;
+    l[i] = 0.0f;
+    #pragma unroll
+    for (j = 0; j < CAI_FLASH_V1_COL_VECS; j++) o[i][j] = (float4)(0.0f);
+  }
+
+  if (lid < Br)
+    cai_flash_row_entry(RowTable, Br, lid, Row0, g, FGroupSize, FTokenCnt,
+      FDk, FXStride, FYStride, FKeyBase, FMaskMode, FWindow, FRowKeyEnds);
+  const int4 TileBounds = cai_flash_tile_bounds(Br, Row0, FGroupSize,
+    FTokenCnt, FKeyBase, FMaskMode, FWindow, FRowKeyEnds);
+  const int TileMinLo = TileBounds.x;
+  const int TileMaxHi = TileBounds.y;
+  const int TileMaxLo = TileBounds.z;
+  const int TileMinHi = TileBounds.w;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int MaxRowPos = FTokenCnt * FGroupSize - 1 - Row0;
+  const int KAligned = (FDk & 3) == 0;
+  const int QAligned = KAligned && ((FXStride & 3) == 0);
+  __global const float* KPlane = FKCache + g * FCacheMax * FDk;
+  __global const float* VPlane = FVCache + g * FCacheMax * FDk;
+  cai_flash_stage_queries(FX, RowTable, 0, Br, MaxCol4Pos + 1, FDk, QAligned,
+    qTile, TileStride4, lid, 256);
+
+  for (kt = TileMinLo; kt < TileMaxHi; kt += CAI_FLASH_V1_KEY_TILE)
+  {
+    const int KeysLive = min(CAI_FLASH_V1_KEY_TILE, TileMaxHi - kt);
+    const int Interior = (kt >= TileMaxLo)
+      && (kt + CAI_FLASH_V1_KEY_TILE <= TileMinHi);
+    // The previous tile's P.V reads (and the query staging) are finished
+    // before K overwrites the shared tile.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_flash_stage_keys(KPlane + kt * FDk, 0, CAI_FLASH_V1_KEY_TILE,
+      KeysLive, MaxCol4Pos + 1, FDk, KAligned, kvTile, TileStride4, lid, 256);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float s[CAI_FLASH_V1_ROW_SLOTS][CAI_FLASH_V1_KEY_SLOTS];
+    #pragma unroll
+    for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+      #pragma unroll
+      for (j = 0; j < CAI_FLASH_V1_KEY_SLOTS; j++) s[i][j] = 0.0f;
+    {
+      __local const float4* KRow0 = kvTile + lx * TileStride4;
+      __local const float4* KRow1 = kvTile + (lx + 16) * TileStride4;
+      for (d4 = 0; d4 <= MaxCol4Pos; d4++)
+      {
+        const float4 k0 = KRow0[d4];
+        const float4 k1 = KRow1[d4];
+        #pragma unroll
+        for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+        {
+          const float4 q = qTile[CAI_FLASH_V1_ROW(i) * TileStride4 + d4];
+          s[i][0] = cai_nc_mad_dot4(q, k0, s[i][0]);
+          s[i][1] = cai_nc_mad_dot4(q, k1, s[i][1]);
+        }
+      }
+    }
+    #pragma unroll
+    for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+    {
+      const int row = CAI_FLASH_V1_ROW(i);
+      const int KeyLo = RowTable[2 * Br + row];
+      const int KeyHi = RowTable[3 * Br + row];
+      float PartMax = -1e30f;
+      #pragma unroll
+      for (j = 0; j < CAI_FLASH_V1_KEY_SLOTS; j++)
+      {
+        s[i][j] = cai_flash_score(s[i][j], kt + lx + 16 * j, KeyLo, KeyHi,
+          Interior, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap);
+        PartMax = fmax(PartMax, s[i][j]);
+      }
+      if (CAI_FLASH_V1_ROW_LIVE(i)) RowPartF[row * 16 + lx] = PartMax;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Every K read is done: V replaces it while each lane folds the row
+    // partials into its running max; O is rescaled only when the max grows.
+    cai_flash_stage_keys(VPlane + kt * FDk, 0, CAI_FLASH_V1_KEY_TILE,
+      KeysLive, MaxCol4Pos + 1, FDk, KAligned, kvTile, TileStride4, lid, 256);
+    #pragma unroll
+    for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+    {
+      const int row = CAI_FLASH_V1_ROW(i);
+      const float TileMax = cai_flash_max16(RowPart + row * 4, m[i]);
+      if (TileMax > m[i])
+      {
+        const float Rescale = exp(fmax(m[i] - TileMax, -80.0f));
+        m[i] = TileMax;
+        l[i] *= Rescale;
+        #pragma unroll
+        for (j = 0; j < CAI_FLASH_V1_COL_VECS; j++) o[i][j] *= Rescale;
+      }
+      #pragma unroll
+      for (j = 0; j < CAI_FLASH_V1_KEY_SLOTS; j++)
+      {
+        const float p = cai_flash_prob(s[i][j], m[i]);
+        l[i] += p;
+        if (CAI_FLASH_V1_ROW_LIVE(i))
+          pTileF[row * (PStride4 << 2) + lx + 16 * j] = p;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Keys from KeysLive to the next multiple of 4 have p = 0 and a zero V row.
+    const int MaxKey4Pos = ((KeysLive + 3) >> 2) - 1;
+    const int Col0 = min(lx, MaxCol4Pos);
+    const int Col1 = min(lx + 16, MaxCol4Pos);
+    for (c4 = 0; c4 <= MaxKey4Pos; c4++)
+    {
+      float4 p4[CAI_FLASH_V1_ROW_SLOTS];
+      #pragma unroll
+      for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+        p4[i] = pTile[CAI_FLASH_V1_ROW(i) * PStride4 + c4];
+      __local const float4* VRows = kvTile + (c4 << 2) * TileStride4;
+      #pragma unroll
+      for (e = 0; e < 4; e++)
+      {
+        const float4 v0 = VRows[e * TileStride4 + Col0];
+        const float4 v1 = VRows[e * TileStride4 + Col1];
+        #pragma unroll
+        for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+        {
+          const float p = CAI_FLASH_LANE4(p4[i], e);
+          o[i][0] = mad((float4)(p), v0, o[i][0]);
+          o[i][1] = mad((float4)(p), v1, o[i][1]);
+        }
+      }
+    }
+  }
+
+  // RowPart was last read before the final P.V barrier, so it is free here.
+  #pragma unroll
+  for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+    if (CAI_FLASH_V1_ROW_LIVE(i))
+      RowPartF[CAI_FLASH_V1_ROW(i) * 16 + lx] = l[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // The query tile becomes the output tile; a dead slot stores into the
+  // K/V tile and a column past Dk into the row's pad column.
+  #pragma unroll
+  for (i = 0; i < CAI_FLASH_V1_ROW_SLOTS; i++)
+  {
+    const int row = CAI_FLASH_V1_ROW(i);
+    const float RowTotal = cai_flash_sum16(RowPart + row * 4);
+    const float InvRowTotal = (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
+    __local float4* ORow = CAI_FLASH_V1_ROW_LIVE(i)
+      ? (qTile + row * TileStride4) : kvTile;
+    #pragma unroll
+    for (j = 0; j < CAI_FLASH_V1_COL_VECS; j++)
+      ORow[min(lx + 16 * j, MaxCol4Pos + 1)] = o[i][j] * InvRowTotal;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  cai_flash_copy_out(qTile, TileStride4, RowTable + Br, Br,
+    min(MaxRowPos, Br - 1), MaxCol4Pos + 1, FDk, FY, lid, 256);
+}
+
+// Key rows per tile of the sliced variants, the most row slots (S and O) a
+// lane owns, and the float4s of a V3 lane's K-slice prefetch.
+#define CAI_FLASH_KEY_TILE 64
+#define CAI_FLASH_MAX_SLOTS 8
+#define CAI_FLASH_PREFETCH_VECS 8
+
+// Variants 2 and 3 (Dk <= 256): Q and K in head-dim slices; region A = Q then
+// V, region B = K then P; tiles as FusedSDPAFlashTiles. Coded by Claude (AI).
+#define CAI_FLASH_SLICED_BODY(Lanes, SlotRows, OutRows, Prefetch) \
+{ \
+  const int lid = get_local_id(0); \
+  const int sx = CAI_FLASH_KEY_LANE(lid); \
+  const int sy = CAI_FLASH_ROW_LANE(lid); \
+  int i, j, e, d4, c4, kt, sl, vs; \
+  const int RowLanes = Lanes >> 4; \
+  const int Dk4 = (FDk + 3) & ~3; \
+  const int MaxCol4Pos = (Dk4 >> 2) - 1; \
+  const int Br = (Dk4 <= 128) ? 64 : 32; \
+  const int Ds = ((Dk4 <= 72) && !Prefetch) ? Dk4 : min(Dk4, 64); \
+  const int Bv = (Dk4 <= 72) ? 64 : ((Dk4 <= 128) ? 32 : 16); \
+  const int OutColShift = (Br == 64) ? 4 : 5; \
+  const int OutColLanes = 1 << OutColShift; \
+  const int OutRowLanes = Lanes >> OutColShift; \
+  const int ox = lid & (OutColLanes - 1); \
+  const int oy = lid >> OutColShift; \
+  const int RowTiles = (FTokenCnt * FGroupSize + Br - 1) / Br; \
+  const int TileId = get_group_id(1) \
+    / (FKeySplits * ((FDk + FColChunk - 1) / FColChunk)); \
+  const int g = TileId / RowTiles; \
+  if (g >= FKVHeads) return; \
+  const int Row0 = (TileId - g * RowTiles) * Br; \
+  const int SliceStride4 = (Ds >> 2) + 1; \
+  const int VStride4 = (Dk4 >> 2) + 1; \
+  const int PStride4 = (CAI_FLASH_KEY_TILE >> 2) + 1; \
+  __local float4* RegionA = FScratch; \
+  __local float4* RegionB = \
+    RegionA + max(Br * SliceStride4, Bv * VStride4); \
+  __local float4* RowPart = \
+    RegionB + max(CAI_FLASH_KEY_TILE * SliceStride4, Br * PStride4); \
+  __local float* PTileF = (__local float*)RegionB; \
+  __local float* RowPartF = (__local float*)RowPart; \
+  __local float* RowScale = RowPartF + Br * 16; \
+  __local int* RowTable = (__local int*)(RowScale + Br); \
+ \
+  float4 o[CAI_FLASH_MAX_SLOTS][2]; \
+  float m[CAI_FLASH_MAX_SLOTS], l[CAI_FLASH_MAX_SLOTS]; \
+  float4 pf[CAI_FLASH_PREFETCH_VECS]; \
+  _Pragma("unroll") \
+  for (i = 0; i < OutRows; i++) \
+  { \
+    o[i][0] = (float4)(0.0f); \
+    o[i][1] = (float4)(0.0f); \
+  } \
+  _Pragma("unroll") \
+  for (i = 0; i < SlotRows; i++) \
+  { \
+    m[i] = -1e30f; \
+    l[i] = 0.0f; \
+  } \
+ \
+  if (lid < Br) \
+    cai_flash_row_entry(RowTable, Br, lid, Row0, g, FGroupSize, FTokenCnt, \
+      FDk, FXStride, FYStride, FKeyBase, FMaskMode, FWindow, FRowKeyEnds); \
+  const int4 TileBounds = cai_flash_tile_bounds(Br, Row0, FGroupSize, \
+    FTokenCnt, FKeyBase, FMaskMode, FWindow, FRowKeyEnds); \
+  const int TileMinLo = TileBounds.x; \
+  const int TileMaxHi = TileBounds.y; \
+  const int TileMaxLo = TileBounds.z; \
+  const int TileMinHi = TileBounds.w; \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  const int MaxRowPos = FTokenCnt * FGroupSize - 1 - Row0; \
+  const int KAligned = (FDk & 3) == 0; \
+  const int QAligned = KAligned && ((FXStride & 3) == 0); \
+  const int Slices = (Dk4 + Ds - 1) / Ds; \
+  __global const float* KPlane = FKCache + g * FCacheMax * FDk; \
+  __global const float* VPlane = FVCache + g * FCacheMax * FDk; \
+  /* A prefetching lane's K-slice element i: row (lid >> 4) + RowLanes*i, \
+     float4 column lid & 15 (a slice is at most 16 float4 wide). */ \
+  const int PrefetchRow = lid >> 4; \
+  const int PrefetchCol4 = lid & 15; \
+  if (Prefetch && (TileMinLo < TileMaxHi)) \
+  { \
+    const int KeysLive = min(CAI_FLASH_KEY_TILE, TileMaxHi - TileMinLo); \
+    const int Cols4 = min(Ds, Dk4) >> 2; \
+    _Pragma("unroll") \
+    for (i = 0; i < CAI_FLASH_PREFETCH_VECS; i++) \
+    { \
+      const int r = PrefetchRow + RowLanes * i; \
+      const float4 v = cai_flash_load4(KPlane + (TileMinLo + min(r, KeysLive \
+        - 1)) * FDk, min(PrefetchCol4, Cols4 - 1) << 2, FDk, KAligned); \
+      pf[i] = ((r < KeysLive) && (PrefetchCol4 < Cols4)) ? v : (float4)(0.0f); \
+    } \
+  } \
+ \
+  for (kt = TileMinLo; kt < TileMaxHi; kt += CAI_FLASH_KEY_TILE) \
+  { \
+    const int KeysLive = min(CAI_FLASH_KEY_TILE, TileMaxHi - kt); \
+    const int Interior = (kt >= TileMaxLo) \
+      && (kt + CAI_FLASH_KEY_TILE <= TileMinHi); \
+    float s[CAI_FLASH_MAX_SLOTS][4]; \
+    _Pragma("unroll") \
+    for (i = 0; i < SlotRows; i++) \
+      _Pragma("unroll") \
+      for (j = 0; j < 4; j++) s[i][j] = 0.0f; \
+ \
+    for (sl = 0; sl < Slices; sl++) \
+    { \
+      const int Col0 = sl * Ds; \
+      const int SliceCols4 = min(Ds, Dk4 - Col0) >> 2; \
+      /* The previous slice's dot (or the previous tile's P.V) is finished \
+         before the Q and K slices overwrite regions A and B. */ \
+      barrier(CLK_LOCAL_MEM_FENCE); \
+      cai_flash_stage_queries(FX, RowTable, Col0, Br, SliceCols4, FDk, \
+        QAligned, RegionA, SliceStride4, lid, Lanes); \
+      if (Prefetch) \
+      { \
+        /* A column past the slice stores its zero into the pad column. */ \
+        _Pragma("unroll") \
+        for (i = 0; i < CAI_FLASH_PREFETCH_VECS; i++) \
+          RegionB[(PrefetchRow + RowLanes * i) * SliceStride4 \
+            + min(PrefetchCol4, SliceCols4)] = pf[i]; \
+      } \
+      else \
+        cai_flash_stage_keys(KPlane + kt * FDk, Col0, CAI_FLASH_KEY_TILE, \
+          KeysLive, SliceCols4, FDk, KAligned, RegionB, SliceStride4, lid, \
+          Lanes); \
+      barrier(CLK_LOCAL_MEM_FENCE); \
+      if (Prefetch) \
+      { \
+        /* This tile's next K slice, or the next tile's first. */ \
+        const int NextKt = (sl + 1 < Slices) ? kt : kt + CAI_FLASH_KEY_TILE; \
+        const int NextCol0 = (sl + 1 < Slices) ? Col0 + Ds : 0; \
+        const int NextKeysLive = \
+          min(CAI_FLASH_KEY_TILE, TileMaxHi - NextKt); \
+        const int NextCols4 = min(Ds, Dk4 - NextCol0) >> 2; \
+        /* Past the last tile the loads re-read the last live row. */ \
+        const int MaxNextKeyPos = min(NextKt + NextKeysLive, TileMaxHi) - 1; \
+        _Pragma("unroll") \
+        for (i = 0; i < CAI_FLASH_PREFETCH_VECS; i++) \
+        { \
+          const int r = PrefetchRow + RowLanes * i; \
+          const float4 v = cai_flash_load4(KPlane + min(NextKt + r, \
+            MaxNextKeyPos) * FDk + NextCol0, \
+            min(PrefetchCol4, NextCols4 - 1) << 2, FDk - NextCol0, KAligned); \
+          pf[i] = ((r < NextKeysLive) && (PrefetchCol4 < NextCols4)) \
+            ? v : (float4)(0.0f); \
+        } \
+      } \
+      for (d4 = 0; d4 < SliceCols4; d4++) \
+      { \
+        float4 kv[4]; \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+          kv[j] = RegionB[(sx + 16 * j) * SliceStride4 + d4]; \
+        _Pragma("unroll") \
+        for (i = 0; i < SlotRows; i++) \
+          if (sy + RowLanes * i < Br) \
+          { \
+            const float4 q = RegionA[(sy + RowLanes * i) * SliceStride4 + d4]; \
+            _Pragma("unroll") \
+            for (j = 0; j < 4; j++) s[i][j] = cai_nc_mad_dot4(q, kv[j], s[i][j]); \
+          } \
+      } \
+    } \
+    _Pragma("unroll") \
+    for (i = 0; i < SlotRows; i++) \
+      if (sy + RowLanes * i < Br) \
+      { \
+        const int row = sy + RowLanes * i; \
+        const int KeyLo = RowTable[2 * Br + row]; \
+        const int KeyHi = RowTable[3 * Br + row]; \
+        float PartMax = -1e30f; \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+        { \
+          s[i][j] = cai_flash_score(s[i][j], kt + sx + 16 * j, KeyLo, KeyHi, \
+            Interior, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap); \
+          PartMax = fmax(PartMax, s[i][j]); \
+        } \
+        RowPartF[row * 16 + sx] = PartMax; \
+      } \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+ \
+    /* Every Q and K read is done: V slice 0 replaces the Q slice and P the K \
+       slice; O is rescaled only for rows whose max grew. */ \
+    cai_flash_stage_keys(VPlane + kt * FDk, 0, Bv, KeysLive, MaxCol4Pos + 1, \
+      FDk, KAligned, RegionA, VStride4, lid, Lanes); \
+    _Pragma("unroll") \
+    for (i = 0; i < SlotRows; i++) \
+      if (sy + RowLanes * i < Br) \
+      { \
+        const int row = sy + RowLanes * i; \
+        const float TileMax = cai_flash_max16(RowPart + row * 4, m[i]); \
+        float Rescale = 1.0f; \
+        if (TileMax > m[i]) \
+        { \
+          Rescale = exp(fmax(m[i] - TileMax, -80.0f)); \
+          m[i] = TileMax; \
+          l[i] *= Rescale; \
+        } \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+        { \
+          const float p = cai_flash_prob(s[i][j], m[i]); \
+          l[i] += p; \
+          PTileF[row * (CAI_FLASH_KEY_TILE + 4) + sx + 16 * j] = p; \
+        } \
+        if (sx == 0) RowScale[row] = Rescale; \
+      } \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+ \
+    _Pragma("unroll") \
+    for (i = 0; i < OutRows; i++) \
+    { \
+      const float Rescale = RowScale[oy + OutRowLanes * i]; \
+      if (Rescale != 1.0f) \
+      { \
+        o[i][0] *= Rescale; \
+        o[i][1] *= Rescale; \
+      } \
+    } \
+    const int Col0 = min(ox, MaxCol4Pos); \
+    const int Col1 = min(ox + OutColLanes, MaxCol4Pos); \
+    for (vs = 0; vs * Bv < KeysLive; vs++) \
+    { \
+      const int ValueRowsLive = min(Bv, KeysLive - vs * Bv); \
+      if (vs > 0) \
+      { \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        cai_flash_stage_keys(VPlane + (kt + vs * Bv) * FDk, 0, Bv, \
+          ValueRowsLive, MaxCol4Pos + 1, FDk, KAligned, RegionA, VStride4, \
+          lid, Lanes); \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+      } \
+      /* Keys up to the next multiple of 4 have p = 0 and a zero V row. */ \
+      const int MaxKey4Pos = ((ValueRowsLive + 3) >> 2) - 1; \
+      const int PCol4 = (vs * Bv) >> 2; \
+      for (c4 = 0; c4 <= MaxKey4Pos; c4++) \
+      { \
+        float4 p4[CAI_FLASH_MAX_SLOTS]; \
+        _Pragma("unroll") \
+        for (i = 0; i < OutRows; i++) \
+          p4[i] = RegionB[(oy + OutRowLanes * i) * PStride4 + PCol4 + c4]; \
+        __local const float4* VRows = RegionA + (c4 << 2) * VStride4; \
+        _Pragma("unroll") \
+        for (e = 0; e < 4; e++) \
+        { \
+          const float4 v0 = VRows[e * VStride4 + Col0]; \
+          const float4 v1 = VRows[e * VStride4 + Col1]; \
+          _Pragma("unroll") \
+          for (i = 0; i < OutRows; i++) \
+          { \
+            const float p = CAI_FLASH_LANE4(p4[i], e); \
+            o[i][0] = mad((float4)(p), v0, o[i][0]); \
+            o[i][1] = mad((float4)(p), v1, o[i][1]); \
+          } \
+        } \
+      } \
+    } \
+  } \
+ \
+  /* RowPart was last read before the final P.V barriers. */ \
+  _Pragma("unroll") \
+  for (i = 0; i < SlotRows; i++) \
+    if (sy + RowLanes * i < Br) RowPartF[(sy + RowLanes * i) * 16 + sx] = l[i]; \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  /* Regions A and B become the output tile (Br rows of Dk4/4 + 1 float4); \
+     a column past Dk stores into the row's pad column. */ \
+  _Pragma("unroll") \
+  for (i = 0; i < OutRows; i++) \
+  { \
+    const int row = oy + OutRowLanes * i; \
+    const float RowTotal = cai_flash_sum16(RowPart + row * 4); \
+    const float InvRowTotal = (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f; \
+    RegionA[row * VStride4 + min(ox, MaxCol4Pos + 1)] = o[i][0] * InvRowTotal; \
+    RegionA[row * VStride4 + min(ox + OutColLanes, MaxCol4Pos + 1)] = \
+      o[i][1] * InvRowTotal; \
+  } \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  cai_flash_copy_out(RegionA, VStride4, RowTable + Br, Br, \
+    min(MaxRowPos, Br - 1), MaxCol4Pos + 1, FDk, FY, lid, Lanes); \
+}
+
+// Variant 2: 256 lanes, 4x4 scores and 4 rows x 2 float4 of O per lane.
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void cai_sdpa_flash_v2(CAI_FLASH_PARAMS)
+CAI_FLASH_SLICED_BODY(256, 4, 4, 0)
+
+// Variant 3: 128 lanes (the prefetch layout assumes exactly 128), 8x4
+// scores, 8 rows x 2 float4 of O and a K-slice register prefetch per lane.
+__kernel __attribute__((reqd_work_group_size(128, 1, 1)))
+void cai_sdpa_flash_v3(CAI_FLASH_PARAMS)
+CAI_FLASH_SLICED_BODY(128, 8, 8, 1)
 
 // INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
 // and V slices into the resident int8 cache at slots FCacheSlot ..
