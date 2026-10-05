@@ -2587,7 +2587,7 @@ rather than acted on.
         VAE attention (F4). Target: attention 2.9 -> ~0.6-1.0 s/step at 1024^2
         (unmeasured). Serial stages, each with a fresh read-only reviewer, the
         three suites and a commit:
-    - [ ] E2.0 Read-only design: mask encoding, tile shapes and register /
+    - [x] E2.0 Read-only design: mask encoding, tile shapes and register /
           local-memory budget (48 KB, 64K registers, OpenCL C 1.2, no
           sub-groups), dispatch rule tiled vs decode-split, test plan, benchmark
           spec. Brought to the user before coding.
