@@ -2602,8 +2602,18 @@ rather than acted on.
     - [ ] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
           int8 K/V tiles (ChatTerminal's default KV cache).
     - [ ] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
-          single heads; the Qwen-Image VAE attention moves onto it (resolves
-          F4). One L4 VAE profile.
+          single heads, then TNNetScaledDotProductAttention and TNNetDeepConcat
+          on OpenCL (user request 2026-10-05): the generic
+          TNNetScaledDotProductAttention (AddMultiHeadSelfAttention and ~90 other
+          call sites, incl. the Qwen-Image VAE mid-block) runs its whole
+          forward on the flash kernel, binds its source and leaves its output in
+          OpenCL memory (today: Q.K^T and P.V on OpenCL, softmax on the host, 4
+          uploads + 3 blocking downloads per pass, output never resident); the
+          following TNNetDeepConcat then binds a resident source and runs on
+          OpenCL (today 0% on the VAE nets). Its other modes (masks, causal,
+          training/backprop) keep their current paths unless the flash kernel
+          covers them. Resolves F4 without changing the VAE graph. One L4 VAE
+          profile.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
