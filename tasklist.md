@@ -2501,7 +2501,7 @@ rather than acted on.
         (causal text, bidirectional per image) via a per-row key limit in
         `TNNetFusedSDPA.ComputeCachedRows`; `PrepareStepPass` must place the target
         RoPE frame after the images (today it assumes a text-only prefix).
-  - [ ] C3b. Edit pipeline and example: target size from the last condition
+  - [x] C3b. Edit pipeline and example: target size from the last condition
         image's aspect, per-image resize, RGBA to the VAE and white-composited RGB to
         the vision tower; `--image FILE` repeatable, `/image FILE` and
         `/images clear` in the REPL.

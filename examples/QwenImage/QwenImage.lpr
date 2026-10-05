@@ -1,6 +1,7 @@
 program QwenImage;
 (*
-QwenImage: Qwen-Image-2.1 text-to-image from a diffusers checkpoint folder
+QwenImage: Qwen-Image-2.1 text-to-image and image editing from a diffusers
+checkpoint folder
 (Qwen/Qwen-Image-2.1: model_index.json, processor/, text_encoder/,
 transformer/, vae/, scheduler/), through TQwenImage21Pipeline
 (neural/neuralpretrained.pas). The transformer step pass (int8/int4 weights)
@@ -22,18 +23,26 @@ input ends the session). Images go to numbered files from the --output base
 (qwenimage.png -> qwenimage_0001.png, ...; existing files are skipped, never
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
-PROMPT with consecutive seeds, the prompt encoded once), /image FILE|off,
-/strength S, /profile on|off, /stats on|off, /quit.
+PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
+/images [clear], /init-image FILE|off, /strength S, /profile on|off,
+/stats on|off, /quit.
 
-img2img (--image FILE or /image FILE): SDEdit. The VAE encoder (CPU,
-untiled) encodes the init image once (posterior mean); each image noises
-those latents to the
-sigma where the schedule is cut by --strength (default 0.6) and runs only
-the remaining steps (the Qwen-Image v1 img2img schedule). It re-styles the
-init image; it does not follow edit instructions. The output keeps the init
-image's aspect ratio at the area of --width x --height (sides multiples of
-32, as diffusers' calculate_dimensions); the init image is resized with
-PIL's Lanczos coefficients in float. EXIF orientation is not applied.
+Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
+an instruction about the condition images (image 1 = the first --image).
+Each image is resized to its own aspect at the area of --width x --height;
+the vision tower and the VAE encoder (both CPU, untiled) encode it once, and
+the output takes the LAST image's aspect at that area. Masks or marked-up
+copies are just more condition images.
+
+img2img (--init-image FILE or /init-image FILE): SDEdit. The VAE encoder
+(CPU, untiled) encodes the init image once (posterior mean); each image
+noises those latents to the sigma where the schedule is cut by --strength
+(default 0.6) and runs only the remaining steps (the Qwen-Image v1 img2img
+schedule). It re-styles the init image; it does not follow instructions.
+The output keeps the init image's aspect ratio at the area of --width x
+--height (sides multiples of 32, as diffusers' calculate_dimensions).
+Images are resized with PIL's Lanczos coefficients in float. EXIF
+orientation is not applied.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -45,7 +54,7 @@ USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
-            [--repeat N] [--image FILE [--strength 0.6]]
+            [--repeat N] [--image FILE ... | --init-image FILE [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -175,8 +184,10 @@ begin
   case Phase of
     qppLoadTextEncoder: Result := 'load text encoder';
     qppEncodePrompt: Result := 'encode prompt';
+    qppLoadVisionTower: Result := 'load vision tower';
+    qppEncodeVision: Result := 'vision encode';
     qppLoadVaeEncoder: Result := 'load VAE encoder';
-    qppEncodeImage: Result := 'encode init image';
+    qppEncodeImage: Result := 'VAE encode';
     qppLoadTransformer: Result := 'load transformer';
     qppEncodePrefix: Result := 'transformer prefix';
     qppDenoise: Result := 'denoise';
@@ -190,20 +201,21 @@ end;
 // The per-image stage table of --stats and --profile: one row per phase that
 // ran, PNG save, their sum; then OpenCL transfers and bytes held, peak RSS.
 procedure PrintStageTable(const Stats: TQwenImage21ImageStats;
-  ImageNumber, EncodeImageNumber, InitEncodeImageNumber: integer;
+  ImageNumber, EncodeImageNumber, InputImageEncodeNumber: integer;
   PngSaveMs: double; IsProfiled, IsPeakPerImage: boolean);
 var
   Phase: TQwenImage21PipelinePhase;
   TotalMs: double;
   RanOn, Detail, Rss, Peak: string;
-  HasEncode, HasInitEncode, IsOnOpenCL: boolean;
+  HasEncode, UsedImages, HasImageEncode, IsOnOpenCL: boolean;
 
   // The phase ran for this image, not for an earlier one or not at all.
   function IsCountedHere(Phase: TQwenImage21PipelinePhase): boolean;
   begin
     case Phase of
       qppLoadTextEncoder, qppEncodePrompt: Result := HasEncode;
-      qppLoadVaeEncoder, qppEncodeImage: Result := HasInitEncode;
+      qppLoadVisionTower, qppEncodeVision, qppLoadVaeEncoder, qppEncodeImage:
+        Result := HasImageEncode;
     else
       Result := true;
     end;
@@ -244,11 +256,11 @@ var
 
 begin
   HasEncode := ImageNumber = EncodeImageNumber;
-  HasInitEncode := Stats.UsedInitImage and
-    (ImageNumber = InitEncodeImageNumber);
+  UsedImages := Stats.UsedInitImage or (Stats.ConditionImageCount > 0);
+  HasImageEncode := UsedImages and (ImageNumber = InputImageEncodeNumber);
   IsOnOpenCL := Stats.TransformerOnOpenCL or Stats.VaeOnOpenCL;
   TotalMs := PngSaveMs;
-  for Phase := qppLoadTextEncoder to qppDecode do
+  for Phase := Low(TQwenImage21PipelinePhase) to qppDecode do
     if IsCountedHere(Phase) then
       TotalMs := TotalMs + Stats.PhaseMs[Phase];
   WriteLn('Stages of image ', ImageNumber, ' (wall time):');
@@ -256,20 +268,24 @@ begin
     WriteLn('  (--profile drains OpenCL after every layer: these walls are ',
       'higher than without it)');
   AddRow('Stage', 'Ran on', 'ms', '%', '');
-  for Phase := qppLoadTextEncoder to qppDecode do
+  for Phase := Low(TQwenImage21PipelinePhase) to qppDecode do
   begin
     if not IsCountedHere(Phase) then
     begin
       if Phase = qppEncodePrompt then
         AddRow(PhaseName(Phase), '-', '-', '-', 'encoded once, before image ' +
           IntToStr(EncodeImageNumber) + ' (counted there)')
-      else if (Phase = qppEncodeImage) and Stats.UsedInitImage then
+      else if ((Phase = qppEncodeImage) and UsedImages) or
+        ((Phase = qppEncodeVision) and (Stats.ConditionImageCount > 0)) then
         AddRow(PhaseName(Phase), '-', '-', '-', 'encoded once, before image ' +
-          IntToStr(InitEncodeImageNumber) + ' (counted there)');
+          IntToStr(InputImageEncodeNumber) + ' (counted there)');
       continue;
     end;
-    if (Stats.PhaseMs[Phase] = 0) and (Phase in [qppLoadTextEncoder,
-      qppLoadVaeEncoder, qppLoadTransformer, qppLoadVae]) then continue;
+    // A phase that did not run this image (no images, or no load) is left out.
+    if (Stats.PhaseMs[Phase] = 0) and ((Phase in [qppLoadTextEncoder,
+      qppLoadVisionTower, qppLoadVaeEncoder, qppLoadTransformer, qppLoadVae])
+      or ((Phase = qppEncodeVision) and (Stats.ConditionImageCount = 0))) then
+      continue;
     RanOn := 'CPU';
     Detail := '';
     case Phase of
@@ -390,8 +406,9 @@ end;
 
 procedure PrintHelp();
 begin
-  WriteLn('QwenImage: Qwen-Image-2.1 text-to-image (CPU; OpenCL for the ',
-    'transformer step pass and the VAE decode).');
+  WriteLn('QwenImage: Qwen-Image-2.1 text-to-image and image editing (CPU; ',
+    'OpenCL for the transformer');
+  WriteLn('step pass and the VAE decode).');
   WriteLn('  --model DIR          diffusers folder with model_index.json (required)');
   WriteLn('  -p TEXT              one-shot: generate this prompt, write ',
     '--output and exit');
@@ -403,7 +420,17 @@ begin
     '(default 1024)');
   WriteLn('  --steps N            Euler steps (default 18)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
-  WriteLn('  --image FILE         img2img (SDEdit) from this init image: the ',
+  WriteLn('  --image FILE         edit: a condition image; repeat it for up ',
+    'to ', csQwenImage21MaxConditionImages, ' images (image 1, 2, ...');
+  WriteLn('                       in the order given). The prompt says what ',
+    'to change. Each image');
+  WriteLn('                       is resized to its aspect at the area of ',
+    '--width x --height; the');
+  WriteLn('                       output takes the LAST image''s aspect at ',
+    'that area. Needs');
+  WriteLn('                       processor/preprocessor_config.json. Not ',
+    'with --init-image.');
+  WriteLn('  --init-image FILE    img2img (SDEdit) from this init image: the ',
     'output keeps its aspect');
   WriteLn('                       ratio at the area of --width x --height. It ',
     're-styles the image;');
@@ -437,7 +464,9 @@ begin
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
     '(default: every CPU thread)');
   WriteLn('  --token-ids LIST     one-shot from comma-separated prompt token ',
-    'ids instead of -p (no processor/ needed)');
+    'ids instead of -p (no tokenizer');
+  WriteLn('                       needed); with --image, one <|image_pad|> ',
+    'id per image (expanded here)');
   WriteLn('  --drop-count N       leading system-prompt tokens to drop with ',
     '--token-ids (default 0)');
   WriteLn('  --gpu                OpenCL for the transformer step pass and ',
@@ -492,8 +521,13 @@ begin
     'grows by one per image)');
   WriteLn('  /repeat N PROMPT     N images of PROMPT (encoded once), ',
     'consecutive seeds, numbered files');
-  WriteLn('  /image FILE          init image for the next prompts (img2img); ',
-    '/image off clears it');
+  WriteLn('  /image FILE          add a condition image (edit) for the next ',
+    'prompts, up to ', csQwenImage21MaxConditionImages);
+  WriteLn('  /images              list the condition images; /images clear ',
+    'removes them all and frees');
+  WriteLn('                       the vision tower and the VAE encoder');
+  WriteLn('  /init-image FILE     init image for the next prompts (img2img); ',
+    '/init-image off clears it');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
@@ -649,12 +683,21 @@ var
   // The image whose stage table shows the encode of the current prompt.
   EncodeImageNumber: integer;
   // img2img: the init image (0..255 RGBA) and its latents, encoded at
-  // ImageLatentsWidth x ImageLatentsHeight (0: not encoded yet) before image
-  // InitEncodeImageNumber.
+  // ImageLatentsWidth x ImageLatentsHeight (0: not encoded yet).
   HasInitImage: boolean;
   InitImageFile: string;
   InitImage, ImageLatents: TNNetVolume;
-  ImageLatentsWidth, ImageLatentsHeight, InitEncodeImageNumber: integer;
+  ImageLatentsWidth, ImageLatentsHeight: integer;
+  // Edit: the condition images as read (0..255) and their files; the
+  // pipeline holds their encoding at ConditionEncodedArea pixels (0: none).
+  // ImageArgFiles: the --image files, read once the output area is known.
+  ConditionFiles, ImageArgFiles: TStringList;
+  ConditionImages: array of TNNetVolume;
+  ConditionEncodedArea: double;
+  // The N+1 text runs of the encoded edit prompt.
+  TextLengths: TNeuralIntegerArray;
+  // The image whose stage table shows the init or condition image encode.
+  InputImageEncodeNumber: integer;
   Strength: double;
   HasStrengthArg: boolean;
   // The kernel's peak-RSS mark was reset for the current image.
@@ -700,13 +743,9 @@ var
         RanOnText(Pipeline.VaeOnOpenCL));
   end;
 
-  // Encodes TokenIds into PromptEmbeds and ends the encode phase line.
-  procedure EncodePrompt();
+  function IsEditing(): boolean;
   begin
-    IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
-    Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
-    Reporter.OnPhase(qppDone);
-    EncodeImageNumber := ImageNumber + 1;
+    Result := Length(ConditionImages) > 0;
   end;
 
   // The image size: --width x --height, or with SourceImage <> nil its aspect
@@ -724,10 +763,20 @@ var
     end;
   end;
 
-  // GetOutputSizeFor the active init image (nil without one).
+  // GetOutputSizeFor the init image, else the edit's size (the pipeline's
+  // once encoded), else --width x --height.
   procedure GetOutputSize(out OutputWidth, OutputHeight: integer);
   begin
     if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
+    else if IsEditing() and (ConditionEncodedArea = double(Width) * Height)
+      then
+    begin
+      OutputWidth := Pipeline.ConditionOutputWidth;
+      OutputHeight := Pipeline.ConditionOutputHeight;
+    end
+    else if IsEditing() then
+      GetOutputSizeFor(ConditionImages[High(ConditionImages)], OutputWidth,
+        OutputHeight)
     else GetOutputSizeFor(nil, OutputWidth, OutputHeight);
   end;
 
@@ -739,27 +788,34 @@ var
     GetOutputSizeFor(SourceImage, OutputWidth, OutputHeight);
     Result := ImageSideProblem(OutputWidth, OutputHeight);
     if (Result <> '') and Assigned(SourceImage) then
-      Result := 'the init image''s aspect gives ' + IntToStr(OutputWidth) +
+      Result := 'the image''s aspect gives ' + IntToStr(OutputWidth) +
         'x' + IntToStr(OutputHeight) + ': ' + Result;
   end;
 
-  // Loads FileName (with alpha) and makes it the init image when its output
-  // size works; otherwise returns what is wrong and changes nothing.
+  // Reads FileName (with alpha) into Dest when its size at the output area
+  // works; otherwise returns what is wrong.
+  function ReadImageFile(const FileName: string; Dest: TNNetVolume): string;
+  begin
+    Result := '';
+    try
+      if not LoadImageFromFileIntoVolume(FileName, Dest, true) then
+        Result := 'could not read ' + FileName + '.';
+    except
+      on E: Exception do Result := 'could not read ' + FileName + ': ' +
+        E.Message;
+    end;
+    if Result = '' then Result := OutputSizeProblemFor(Dest);
+  end;
+
+  // Loads FileName and makes it the init image when its output size works;
+  // otherwise returns what is wrong and changes nothing.
   function LoadInitImage(const FileName: string): string;
   var
     Loaded: TNNetVolume;
   begin
-    Result := '';
     Loaded := TNNetVolume.Create();
     try
-      try
-        if not LoadImageFromFileIntoVolume(FileName, Loaded, true) then
-          Result := 'could not read ' + FileName + '.';
-      except
-        on E: Exception do Result := 'could not read ' + FileName + ': ' +
-          E.Message;
-      end;
-      if Result = '' then Result := OutputSizeProblemFor(Loaded);
+      Result := ReadImageFile(FileName, Loaded);
       if Result <> '' then exit;
       InitImage.Copy(Loaded);
     finally
@@ -769,6 +825,85 @@ var
     InitImageFile := FileName;
     ImageLatentsWidth := 0;
     ImageLatentsHeight := 0;
+  end;
+
+  // Appends FileName to the condition images when it reads and fits;
+  // otherwise returns what is wrong and changes nothing.
+  function AddConditionImage(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    if Length(ConditionImages) >= csQwenImage21MaxConditionImages then
+      exit('an edit takes at most ' +
+        IntToStr(csQwenImage21MaxConditionImages) + ' images.');
+    Loaded := TNNetVolume.Create();
+    Result := ReadImageFile(FileName, Loaded);
+    if Result <> '' then
+    begin
+      Loaded.Free;
+      exit;
+    end;
+    SetLength(ConditionImages, Length(ConditionImages) + 1);
+    ConditionImages[High(ConditionImages)] := Loaded;
+    ConditionFiles.Add(FileName);
+    ConditionEncodedArea := 0;
+  end;
+
+  procedure ClearConditionImages();
+  var
+    ImagePos: integer;
+  begin
+    for ImagePos := 0 to High(ConditionImages) do
+      ConditionImages[ImagePos].Free;
+    ConditionImages := nil;
+    ConditionFiles.Clear;
+    ConditionEncodedArea := 0;
+    if Assigned(Pipeline) then Pipeline.ClearConditionImages();
+  end;
+
+  // One line per condition image: number, file, size as read.
+  procedure ListConditionImages();
+  var
+    ImagePos: integer;
+  begin
+    for ImagePos := 0 to High(ConditionImages) do
+      WriteLn('  image ', ImagePos + 1, ': ', ConditionFiles[ImagePos], ' (',
+        ConditionImages[ImagePos].SizeX, 'x', ConditionImages[ImagePos].SizeY,
+        ')');
+  end;
+
+  // Encodes the condition images unless the pipeline holds them at the
+  // current output area; raises when an image's size cannot work.
+  procedure PrepareConditionImages();
+  var
+    ImagePos: integer;
+    Area: double;
+    Problem: string;
+  begin
+    if not IsEditing() then exit;
+    Area := double(Width) * Height;
+    if (ConditionEncodedArea = Area) and
+      (Pipeline.ConditionImageCount = Length(ConditionImages)) then exit;
+    for ImagePos := 0 to High(ConditionImages) do
+    begin
+      Problem := OutputSizeProblemFor(ConditionImages[ImagePos]);
+      if Problem <> '' then
+        raise Exception.Create(ConditionFiles[ImagePos] + ': ' + Problem);
+    end;
+    ConditionEncodedArea := 0;
+    Pipeline.EncodeConditionImages(ConditionImages, Area);
+    Reporter.OnPhase(qppDone);
+    ConditionEncodedArea := Area;
+    InputImageEncodeNumber := ImageNumber + 1;
+  end;
+
+  // The prompt token ids of PromptText: the edit template while editing.
+  function TokenizeFor(const PromptText: string): TNeuralIntegerArray;
+  begin
+    if IsEditing() then
+      Result := Pipeline.TokenizeEditPrompt(PromptText,
+        Length(ConditionImages), DropCount)
+    else Result := Pipeline.TokenizePrompt(PromptText, DropCount);
   end;
 
   // Encodes the init image unless its latents already match the output size;
@@ -791,7 +926,22 @@ var
     Reporter.OnPhase(qppDone);
     ImageLatentsWidth := OutputWidth;
     ImageLatentsHeight := OutputHeight;
-    InitEncodeImageNumber := ImageNumber + 1;
+    InputImageEncodeNumber := ImageNumber + 1;
+  end;
+
+  // Encodes the input images when needed (condition images or the init
+  // image), then TokenIds into PromptEmbeds; ends the encode phase line.
+  procedure EncodePrompt();
+  begin
+    IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
+    PrepareConditionImages();
+    PrepareInitLatents();
+    if IsEditing() then
+      Pipeline.EncodeEditTokenIds(TokenIds, DropCount, PromptEmbeds,
+        TextLengths)
+    else Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
+    Reporter.OnPhase(qppDone);
+    EncodeImageNumber := ImageNumber + 1;
   end;
 
   // The Image and Init image lines of the run header.
@@ -803,6 +953,12 @@ var
     WriteLn('Image      : ', OutputWidth, 'x', OutputHeight, ' (',
       (OutputWidth div 16) * (OutputHeight div 16), ' image tokens), ',
       StepCount, ' steps, seed ', Seed);
+    if IsEditing() then
+    begin
+      WriteLn('Edit       : ', Length(ConditionImages), ' condition ',
+        'image(s); the output takes the last one''s aspect');
+      ListConditionImages();
+    end;
     if not HasInitImage then exit;
     // Raises when the strength leaves no step.
     StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount,
@@ -857,6 +1013,9 @@ var
     if HasInitImage then
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
         StepCount, Seed, Image, nil, ImageLatents, Strength)
+    else if IsEditing() then
+      Pipeline.GenerateEditFromEmbeds(PromptEmbeds, TextLengths, OutputWidth,
+        OutputHeight, StepCount, Seed, Image)
     else
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
         StepCount, Seed, Image);
@@ -870,7 +1029,7 @@ var
       ' s; ', MemoryReport());
     if UseStats or UseProfile then
       PrintStageTable(Pipeline.ImageStats, ImageNumber, EncodeImageNumber,
-        InitEncodeImageNumber, PngSaveMs, UseProfile, IsPeakPerImage);
+        InputImageEncodeNumber, PngSaveMs, UseProfile, IsPeakPerImage);
     if UseProfile then
     begin
       WriteLn;
@@ -904,7 +1063,10 @@ var
       StepText := Format('img2img strength %s, the last %d of %d steps',
         [StrengthText(Strength), StepCount -
         TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength),
-        StepCount]);
+        StepCount])
+    else if IsEditing() then
+      StepText := Format('edit of %d image(s), %d steps',
+        [Length(ConditionImages), StepCount]);
     WriteLn('Image ', ImageNumber, ': ', OutputWidth, 'x', OutputHeight, ', ',
       StepText, ', seed ', Seed, ' -> ', ImageFile);
     try
@@ -935,9 +1097,8 @@ var
     // The stages free the per-image passes on the way out; the loaded
     // weights stay valid, except after an allocation failure.
     try
-      TokenIds := Pipeline.TokenizePrompt(PromptText, DropCount);
+      TokenIds := TokenizeFor(PromptText);
       EncodePrompt();
-      PrepareInitLatents();
     except
       on E: EOutOfMemory do exit(EndSessionOutOfMemory(E.Message));
       on E: Exception do
@@ -968,7 +1129,6 @@ var
   begin
     if RepeatCount > 1 then LoadAllComponents();
     EncodePrompt();
-    PrepareInitLatents();
     for ImageIndex := 1 to RepeatCount do
     try
       GenerateNextImage({Numbered=}RepeatCount > 1);
@@ -996,8 +1156,9 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile, /repeat, /image, /strength, /profile, /stats
-  // and /quit; false on /quit or when /repeat ran out of memory.
+  // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image,
+  // /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
+  // out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
     IsOn: boolean;
@@ -1028,10 +1189,10 @@ var
       begin
         Width := NewWidth;
         Height := NewHeight;
-        if HasInitImage then
+        if HasInitImage or IsEditing() then
         begin
           GetOutputSize(NewWidth, NewHeight);
-          WriteLn('[size ', Width, 'x', Height, '; the init image''s aspect ',
+          WriteLn('[size ', Width, 'x', Height, '; the image''s aspect ',
             'gives ', NewWidth, 'x', NewHeight, ']');
         end
         else WriteLn('[size ', Width, 'x', Height, ']');
@@ -1090,22 +1251,70 @@ var
     else if Command = 'image' then
     begin
       if Argument = '' then
-        WriteLn('[/image: expected /image FILE or /image off]')
+        WriteLn('[/image: expected /image FILE]')
+      else if LowerCase(Argument) = 'off' then
+        WriteLn('[/image off: /images clear removes the condition images, ',
+          '/init-image off the img2img init image]')
+      else if HasInitImage then
+        WriteLn('[/image: an init image (img2img) is set; /init-image off ',
+          'first]')
+      else
+      begin
+        Problem := '';
+        if not IsEditing() then
+        try
+          Pipeline.CheckEditSupport();
+        except
+          on E: Exception do Problem := E.Message;
+        end;
+        if Problem = '' then Problem := AddConditionImage(Argument);
+        if Problem <> '' then WriteLn('[/image: ', Problem, ']')
+        else
+        begin
+          GetOutputSize(NewWidth, NewHeight);
+          WriteLn('[condition image ', Length(ConditionImages), ': ',
+            Argument, ' (', ConditionImages[High(ConditionImages)].SizeX, 'x',
+            ConditionImages[High(ConditionImages)].SizeY, '); output ',
+            NewWidth, 'x', NewHeight, ' from the last image]');
+        end;
+      end;
+    end
+    else if Command = 'images' then
+    begin
+      if LowerCase(Argument) = 'clear' then
+      begin
+        ClearConditionImages();
+        Pipeline.UnloadImageEncoders();
+        WriteLn('[condition images cleared, vision tower and VAE encoder ',
+          'freed: text-to-image]');
+      end
+      else if Argument <> '' then
+        WriteLn('[/images: expected /images or /images clear]')
+      else if not IsEditing() then WriteLn('[no condition images]')
+      else ListConditionImages();
+    end
+    else if Command = 'init-image' then
+    begin
+      if Argument = '' then
+        WriteLn('[/init-image: expected /init-image FILE or /init-image off]')
       else if LowerCase(Argument) = 'off' then
       begin
         HasInitImage := false;
         ImageLatentsWidth := 0;
         WriteLn('[init image off: text-to-image]');
       end
+      else if IsEditing() then
+        WriteLn('[/init-image: condition images (edit) are set; /images ',
+          'clear first]')
       else
       begin
         Problem := LoadInitImage(Argument);
         if Problem <> '' then
         begin
           if HasInitImage then
-            WriteLn('[/image: ', Problem, ' - the init image ', InitImageFile,
-              ' stays active]')
-          else WriteLn('[/image: ', Problem, ' - no init image is set]');
+            WriteLn('[/init-image: ', Problem, ' - the init image ',
+              InitImageFile, ' stays active]')
+          else WriteLn('[/init-image: ', Problem, ' - no init image is set]');
         end
         else
         begin
@@ -1143,7 +1352,8 @@ var
       end;
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
-      '/tile, /repeat, /image, /strength, /profile, /stats, /quit]');
+      '/tile, /repeat, /image, /images, /init-image, /strength, /profile, ',
+      '/stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -1155,8 +1365,9 @@ var
     LoadAllComponents();
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
-      '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE|off, /strength S, ',
-      '/profile on|off, /stats on|off, /quit.');
+      '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
+      '/init-image FILE|off, /strength S, /profile on|off, /stats on|off, ',
+      '/quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -1209,7 +1420,12 @@ begin
   InitImageFile := '';
   ImageLatentsWidth := 0;
   ImageLatentsHeight := 0;
-  InitEncodeImageNumber := 0;
+  InputImageEncodeNumber := 0;
+  ConditionFiles := TStringList.Create;
+  ImageArgFiles := TStringList.Create;
+  ConditionImages := nil;
+  ConditionEncodedArea := 0;
+  Pipeline := nil;
   Strength := csDefaultStrength;
   HasStrengthArg := false;
   MaxThreads := 0;
@@ -1243,7 +1459,17 @@ begin
         Halt(2);
       end;
     end
-    else if Arg = '--image' then InitImageFile := NextArg()
+    else if Arg = '--image' then
+    begin
+      if ImageArgFiles.Count >= csQwenImage21MaxConditionImages then
+      begin
+        WriteLn('--image: an edit takes at most ',
+          csQwenImage21MaxConditionImages, ' images.');
+        Halt(2);
+      end;
+      ImageArgFiles.Add(NextArg());
+    end
+    else if Arg = '--init-image' then InitImageFile := NextArg()
     else if Arg = '--strength' then
     begin
       HasStrengthArg := true;
@@ -1320,11 +1546,16 @@ begin
     WriteLn('--max-threads: must be at least 1.');
     Halt(2);
   end;
+  if (ImageArgFiles.Count > 0) and (InitImageFile <> '') then
+  begin
+    WriteLn('--image (edit) and --init-image (img2img) are exclusive.');
+    Halt(2);
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
-      WriteLn('[--strength has no effect without --image]')
-    else WriteLn('[--strength applies once /image sets an init image]');
+      WriteLn('[--strength has no effect without --init-image]')
+    else WriteLn('[--strength applies once /init-image sets an init image]');
   end;
 
   StartTime := GetTickCount64;
@@ -1333,7 +1564,6 @@ begin
   Image := TNNetVolume.Create();
   InitImage := TNNetVolume.Create();
   ImageLatents := TNNetVolume.Create();
-  Pipeline := nil;
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -1397,8 +1627,16 @@ begin
     begin
       ArgProblem := LoadInitImage(InitImageFile);
       if ArgProblem <> '' then
+        raise Exception.Create('--init-image: ' + ArgProblem);
+    end;
+    for ArgPos := 0 to ImageArgFiles.Count - 1 do
+    begin
+      ArgProblem := AddConditionImage(ImageArgFiles[ArgPos]);
+      if ArgProblem <> '' then
         raise Exception.Create('--image: ' + ArgProblem);
     end;
+    // Refuses a checkpoint that cannot edit before anything loads.
+    if IsEditing() then Pipeline.CheckEditSupport();
     WriteLn('Model      : ', ModelFolder);
     PrintImageSettings();
     case WeightFormat of
@@ -1425,7 +1663,7 @@ begin
       else
       begin
         WriteLn('Prompt     : ', Prompt);
-        TokenIds := Pipeline.TokenizePrompt(Prompt, DropCount);
+        TokenIds := TokenizeFor(Prompt);
         WriteLn('Tokens     : ', Length(TokenIds), ' (', DropCount,
           ' system-prompt tokens dropped)');
       end;
@@ -1436,6 +1674,9 @@ begin
     end;
   finally
     Reporter.EndStepLine();
+    ClearConditionImages();
+    ImageArgFiles.Free;
+    ConditionFiles.Free;
     Pipeline.Free;
     {$IFDEF OpenCL}
     OpenCLDevices.Free;

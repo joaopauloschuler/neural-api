@@ -8776,6 +8776,9 @@ function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false; const ConfigFileName: string = '';
   pWeightOwner: TNNet = nil; pImageInput: boolean = false): TNNet;
 
+// True when Encoder was built with pImageInput (its RoPE layers are M-RoPE).
+function Qwen3VLEncoderTakesImages(Encoder: TNNet): boolean;
+
 // Runs Encoder on TokenIds (right-padded to its SeqLen; causal, so rows stay
 // exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
 procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
@@ -8793,6 +8796,9 @@ type
 
   // True at the rows that are image slots (<|image_pad|>).
   TQwen3VLImagePadMask = array of boolean;
+
+// Frees and nils every Merged and DeepStack volume of Images.
+procedure FreeQwen3VLImageEmbeds(var Images: array of TQwen3VLImageEmbeds);
 
 // <|image_pad|> slots of a GridH x GridW patch grid: GridH*GridW/MergeSize^2.
 function Qwen3VLImageSlotCount(GridH, GridW, MergeSize: integer): integer;
@@ -9339,9 +9345,14 @@ const
   // rounds each image side DOWN to a multiple of 32, as diffusers does.
   csQwenImage21PixelsPerLatent = 16;
   csQwenImage21ImageSideMultiple = 32;
+  // Most condition images one edit takes (the example's limit too).
+  csQwenImage21MaxConditionImages = 10;
 
-// Source (W, H, 3|4) in 0..255 to the VAE input (Width, Height, 4) in [-1, 1];
-// RGB gets alpha 255. PIL's LANCZOS on premultiplied RGBA, in float (no 8 bits).
+// Source (W, H, 3|4) in 0..255 to (Width, Height, 4) RGBA in 0..255; RGB gets
+// alpha 255. PIL's LANCZOS on premultiplied RGBA, in float (no 8 bits).
+procedure QwenImage21ResizeToRgba(Source: TNNetVolume; Width,
+  Height: integer; Rgba: TNNetVolume);
+// QwenImage21ResizeToRgba, then scaled to the VAE input range [-1, 1].
 procedure QwenImage21PrepareVaeImage(Source: TNNetVolume; Width,
   Height: integer; VaeImage: TNNetVolume);
 // diffusers calculate_dimensions: Width/Height ~ AspectRatio, Width*Height ~
@@ -9351,9 +9362,11 @@ procedure QwenImage21SizeForAspect(TargetArea, AspectRatio: double;
 
 type
   // The stages of TQwenImage21Pipeline; OnPhase fires as each one starts.
-  TQwenImage21PipelinePhase = (qppLoadTextEncoder, qppEncodePrompt,
-    qppLoadVaeEncoder, qppEncodeImage, qppLoadTransformer, qppEncodePrefix,
-    qppDenoise, qppLoadVae, qppDecode, qppDone);
+  // In run order: the input images, the prompt, then the image itself.
+  TQwenImage21PipelinePhase = (qppLoadVisionTower, qppEncodeVision,
+    qppLoadVaeEncoder, qppEncodeImage, qppLoadTextEncoder, qppEncodePrompt,
+    qppLoadTransformer, qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode,
+    qppDone);
   TQwenImage21PhaseEvent = procedure(Phase: TQwenImage21PipelinePhase)
     of object;
   // Fired after denoising step StepIndex (0-based) of the StepCount steps run;
@@ -9373,20 +9386,22 @@ type
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
     // The image started from EncodeImage's latents (img2img).
     UsedInitImage: boolean;
+    // Condition images of an edit (EncodeConditionImages); 0 otherwise.
+    ConditionImageCount: integer;
     // OpenCL bytes the transformer held after the last step, and the largest
     // sized VAE net; both sampled, not tracked per allocation.
     TransformerOpenCLBytes, VaeOpenCLBytes: int64;
   end;
 
-  // Qwen-Image-2.1 text-to-image (diffusers QwenImage21Pipeline, no guidance)
-  // over a model_index.json folder, and SDEdit img2img from an init image (the
-  // Qwen-Image v1 img2img schedule; 2.1 ships no img2img pipeline). Each
-  // component (text encoder, VAE encoder, transformer, VAE decoder) is loaded
-  // when its stage starts and freed when it ends, so peak memory is the
-  // largest component, not the sum. After LoadComponents they stay loaded
-  // (the VAE encoder from its first EncodeImage) and each image frees only its
-  // activations. Latents are (GridH*GridW,1,in_channels) in row-major (h, w)
-  // token order.
+  // Qwen-Image-2.1 text-to-image and editing with condition images (diffusers
+  // QwenImage21Pipeline, no guidance) over a model_index.json folder, and
+  // SDEdit img2img from an init image (the Qwen-Image v1 img2img schedule; 2.1
+  // ships no img2img pipeline). Each component (vision tower, text encoder,
+  // VAE encoder, transformer, VAE decoder) is loaded when its stage starts and
+  // freed when it ends, so peak memory is the largest component, not the sum.
+  // After LoadComponents they stay loaded (the vision tower and the VAE
+  // encoder from their first use) and each image frees only its activations.
+  // Latents are (GridH*GridW,1,in_channels) in row-major (h, w) token order.
   // Coded by Claude (AI).
   TQwenImage21Pipeline = class(TObject)
   private
@@ -9416,8 +9431,19 @@ type
     FVaeDecoder: TQwenImage21VaeDecoder;
     // Kept by the first EncodeImage while ComponentsLoaded; nil otherwise.
     FVaeEncoder: TQwenImage21VaeEncoder;
+    // Kept by the first EncodeConditionImages while ComponentsLoaded.
+    FVisionTower: TQwen3VLVisionTower;
     // processor/tokenizer.json, kept by LoadComponents when the file exists.
     FTokenizer: TNeuralHFTokenizer;
+    // text_encoder/config.json, read on first use.
+    FTextEncoderConfig: TQwen3VLConfig;
+    FTextEncoderConfigRead: boolean;
+    // EncodeConditionImages' output: per image the vision tower rows, the
+    // normalised VAE latents (tokens,1,z) and the patch (= latent) grid.
+    FConditionEmbeds: array of TQwen3VLImageEmbeds;
+    FConditionLatents: array of TNNetVolume;
+    FConditionGridHeights, FConditionGridWidths: TNeuralIntegerArray;
+    FConditionOutputWidth, FConditionOutputHeight: integer;
     {$IFDEF OpenCL}
     FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
     FOpenCLPlatform: cl_platform_id;
@@ -9434,17 +9460,38 @@ type
     procedure EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
     function ComponentFolder(const Component: string): string;
     procedure CheckImageSize(Width, Height: integer);
-    // text_encoder/ for SeqLen tokens; WeightOwner <> nil borrows its weights.
+    function GetTextEncoderConfig(): TQwen3VLConfig;
+    // processor/preprocessor_config.json, else processor_config.json; ''
+    // when neither exists.
+    function VisionProcessorConfigFile(): string;
+    function GetConditionImageCount(): integer;
+    function GetConditionLatents(ImagePos: integer): TNNetVolume;
+    // text_encoder/ for SeqLen tokens; WeightOwner <> nil borrows its weights
+    // and decides ImageInput (an owner built with images builds with images).
     function BuildTextEncoder(SeqLen: integer; WeightOwner: TNNet;
-      out Config: TQwen3VLConfig): TNNet;
+      ImageInput: boolean; out Config: TQwen3VLConfig): TNNet;
+    // processor/tokenizer.json: the kept one (Owned = false) or a new one.
+    function AcquireTokenizer(out Owned: boolean): TNeuralHFTokenizer;
+    // The kept VAE encoder, or a new one (kept when ComponentsLoaded) after
+    // starting qppLoadVaeEncoder; ReleaseVaeEncoder ends its use.
+    function AcquireVaeEncoder(): TQwenImage21VaeEncoder;
+    procedure ReleaseVaeEncoder(Encoder: TQwenImage21VaeEncoder);
+    // Zeroes the time and bytes of Phases in ImageStats.
+    procedure ClearPhaseStats(Phases: array of TQwenImage21PipelinePhase);
     // Loads transformer/ (vae/) and arms OpenCL when EnableOpenCL asked for it.
     function CreateTransformer(): TQwenImage21Transformer;
     function CreateVaeDecoder(): TQwenImage21VaeDecoder;
     function GetComponentsLoaded(): boolean;
-    // Both GenerateFromEmbeds; ImageLatents = nil is text-to-image.
-    procedure GenerateFromEmbedsAt(PromptEmbeds: TNNetVolume; Width, Height,
-      StepCount: integer; Seed: cardinal; Image, InitialLatents,
-      ImageLatents: TNNetVolume; Strength: double);
+    // Every GenerateFromEmbeds*: ImageLatents <> nil is img2img; TextLengths
+    // (N+1 runs) is an edit with EncodeConditionImages' N images.
+    procedure GenerateFromEmbedsAt(PromptEmbeds: TNNetVolume;
+      const TextLengths: array of integer; Width, Height, StepCount: integer;
+      Seed: cardinal; Image, InitialLatents, ImageLatents: TNNetVolume;
+      Strength: double);
+    // Denoise; TextLengths as in GenerateFromEmbedsAt.
+    procedure DenoiseAt(PromptEmbeds: TNNetVolume;
+      const TextLengths: array of integer; Width, Height, StepCount: integer;
+      Latents: TNNetVolume; StartStep: integer; ImageLatents: TNNetVolume);
     // Raises when ComponentsLoaded: Setting would not reach loaded weights.
     procedure RefuseWhileLoaded(const Setting: string);
     procedure SetTransformerFormat(Value: TQwenImage21WeightFormat);
@@ -9485,6 +9532,26 @@ type
     // mean ImageLatents (tokens, 1, z_dim); untiled, on the CPU.
     procedure EncodeImage(Image: TNNetVolume; Width, Height: integer;
       ImageLatents: TNNetVolume);
+    // Edit: each (W,H,3|4) 0..255 image at its aspect x TargetArea through the
+    // vision tower and the VAE encoder (CPU, untiled); kept until replaced.
+    procedure EncodeConditionImages(const Images: array of TNNetVolume;
+      TargetArea: double);
+    procedure ClearConditionImages();
+    // Raises unless the checkpoint can edit: a vision config with 16-pixel
+    // patches and the processor config. Reads only JSON files.
+    procedure CheckEditSupport();
+    // Frees the kept vision tower and VAE encoder (loaded again on use).
+    procedure UnloadImageEncoders();
+    // The edit template for ImageCount images, one <|image_pad|> each.
+    function TokenizeEditPrompt(const Prompt: string; ImageCount: integer;
+      out DropCount: integer): TNeuralIntegerArray;
+    // TokenIds hold one image_token_id per condition image (expanded here to
+    // its slots). PromptEmbeds: the text rows only, in TextLengths' N+1 runs.
+    procedure EncodeEditTokenIds(const TokenIds: array of integer;
+      DropCount: integer; PromptEmbeds: TNNetVolume;
+      out TextLengths: TNeuralIntegerArray);
+    procedure EncodeEditPrompt(const Prompt: string; PromptEmbeds: TNNetVolume;
+      out TextLengths: TNeuralIntegerArray);
     // Decodes (tiled above one VaeTileSize tile) to (Width,Height,4) RGBA in
     // [0, 1]; loads and frees vae/ unless it is loaded (then frees the net).
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
@@ -9499,8 +9566,18 @@ type
     procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Seed: cardinal; Image: TNNetVolume;
       InitialLatents, ImageLatents: TNNetVolume; Strength: double); overload;
+    // Edit: the same with the condition images in the transformer prefix;
+    // PromptEmbeds and TextLengths from EncodeEditTokenIds.
+    procedure GenerateEditFromEmbeds(PromptEmbeds: TNNetVolume;
+      const TextLengths: array of integer; Width, Height, StepCount: integer;
+      Seed: cardinal; Image: TNNetVolume; InitialLatents: TNNetVolume = nil);
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
+    // EncodeConditionImages + EncodeEditPrompt + GenerateEditFromEmbeds at
+    // ConditionOutputWidth x ConditionOutputHeight.
+    procedure GenerateEdit(const Prompt: string;
+      const Images: array of TNNetVolume; TargetArea: double;
+      StepCount: integer; Seed: cardinal; Image: TNNetVolume);
     {$IFDEF OpenCL}
     // Denoise's step pass (int8/int4 weights) and DecodeLatents' VAE run on
     // this OpenCL device, the rest on the CPU. Call it before LoadComponents.
@@ -9520,6 +9597,17 @@ type
     property LoadedVaeDecoder: TQwenImage21VaeDecoder read FVaeDecoder;
     // Kept by the first EncodeImage after LoadComponents; nil otherwise.
     property LoadedVaeEncoder: TQwenImage21VaeEncoder read FVaeEncoder;
+    // Kept by the first EncodeConditionImages after LoadComponents.
+    property LoadedVisionTower: TQwen3VLVisionTower read FVisionTower;
+    property TextEncoderConfig: TQwen3VLConfig read GetTextEncoderConfig;
+    // The images of the last EncodeConditionImages (0 after a clear), and
+    // the edit's output size: the LAST image's aspect at its TargetArea.
+    property ConditionImageCount: integer read GetConditionImageCount;
+    property ConditionOutputWidth: integer read FConditionOutputWidth;
+    property ConditionOutputHeight: integer read FConditionOutputHeight;
+    // Image ImagePos's normalised VAE latents (tokens, 1, z_dim).
+    property ConditionLatents[ImagePos: integer]: TNNetVolume
+      read GetConditionLatents;
     property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
     property TransformerConfig: TQwenImage21TransformerConfig
       read FTransformerConfig;
@@ -9549,7 +9637,8 @@ type
     property VaeProfileReport: string read FVaeProfileReport;
     // EncodeTokenIds fills the qppLoadTextEncoder and qppEncodePrompt phases,
     // EncodeImage qppLoadVaeEncoder and qppEncodeImage (kept by img2img
-    // images only); GenerateFromEmbeds clears and fills the rest.
+    // images only), EncodeConditionImages those two and the vision phases
+    // (kept by edit images only); GenerateFromEmbeds clears and fills the rest.
     property ImageStats: TQwenImage21ImageStats read FImageStats;
   end;
 
@@ -83133,7 +83222,6 @@ begin
   end;
 end;
 
-// True when Encoder was built with pImageInput (its RoPE layers are M-RoPE).
 function Qwen3VLEncoderTakesImages(Encoder: TNNet): boolean;
 var
   LayerCnt, MaxLayerPos: integer;
@@ -83174,6 +83262,18 @@ begin
       TokenCount - DropCount, 1);
   finally
     Input.Free;
+  end;
+end;
+
+procedure FreeQwen3VLImageEmbeds(var Images: array of TQwen3VLImageEmbeds);
+var
+  ImagePos, StackPos: integer;
+begin
+  for ImagePos := 0 to High(Images) do
+  begin
+    FreeAndNil(Images[ImagePos].Merged);
+    for StackPos := 0 to High(Images[ImagePos].DeepStack) do
+      FreeAndNil(Images[ImagePos].DeepStack[StackPos]);
   end;
 end;
 
@@ -85532,21 +85632,21 @@ begin
   end;
 end;
 
-procedure QwenImage21PrepareVaeImage(Source: TNNetVolume; Width,
-  Height: integer; VaeImage: TNNetVolume);
+procedure QwenImage21ResizeToRgba(Source: TNNetVolume; Width,
+  Height: integer; Rgba: TNNetVolume);
 const
   MaxChannelValue: TNeuralFloat = 255;
 var
-  Rgba, Resampled: TNNetVolume;
+  RgbaCopy, Resampled: TNNetVolume;
   PixelPos, MaxPixelPos, SourcePos, RgbaPos, Channel: integer;
   Alpha, Value: TNeuralFloat;
-  IsOpaque, IsResized, IsPremultiplied, OwnsRgba: boolean;
+  IsOpaque, IsResized, IsPremultiplied, OwnsRgbaCopy: boolean;
 begin
   if (Source.Depth <> 3) and (Source.Depth <> 4) then
-    ImportError('QwenImage21PrepareVaeImage: the image has ' +
+    ImportError('QwenImage21ResizeToRgba: the image has ' +
       IntToStr(Source.Depth) + ' channels, expected RGB or RGBA.');
   if (Width < 1) or (Height < 1) then
-    ImportError('QwenImage21PrepareVaeImage: target size ' + IntToStr(Width) +
+    ImportError('QwenImage21ResizeToRgba: target size ' + IntToStr(Width) +
       'x' + IntToStr(Height) + ' is empty.');
   IsResized := (Source.SizeX <> Width) or (Source.SizeY <> Height);
   MaxPixelPos := Source.SizeX * Source.SizeY - 1;
@@ -85560,19 +85660,19 @@ begin
       end;
   // PIL resizes RGBA as premultiplied "RGBa" and clips to 0..255.
   IsPremultiplied := IsResized and not IsOpaque;
-  Rgba := nil;
-  OwnsRgba := false;
+  RgbaCopy := nil;
+  OwnsRgbaCopy := false;
   try
     // An RGBA copy only to add the alpha channel or to premultiply.
     if (Source.Depth = 3) or IsPremultiplied then
     begin
-      if IsResized or (Source = VaeImage) then
+      if IsResized or (Source = Rgba) then
       begin
-        Rgba := TNNetVolume.Create();
-        OwnsRgba := true;
+        RgbaCopy := TNNetVolume.Create();
+        OwnsRgbaCopy := true;
       end
-      else Rgba := VaeImage;
-      Rgba.ReSize(Source.SizeX, Source.SizeY, 4);
+      else RgbaCopy := Rgba;
+      RgbaCopy.ReSize(Source.SizeX, Source.SizeY, 4);
       for PixelPos := 0 to MaxPixelPos do
       begin
         SourcePos := PixelPos * Source.Depth;
@@ -85580,46 +85680,55 @@ begin
         if Source.Depth = 4 then Alpha := Source.FData[SourcePos + 3]
         else Alpha := MaxChannelValue;
         for Channel := 0 to 2 do
-          Rgba.FData[RgbaPos + Channel] := Source.FData[SourcePos + Channel];
+          RgbaCopy.FData[RgbaPos + Channel] :=
+            Source.FData[SourcePos + Channel];
         if IsPremultiplied then
           for Channel := 0 to 2 do
-            Rgba.FData[RgbaPos + Channel] := Rgba.FData[RgbaPos + Channel] *
-              (Alpha / MaxChannelValue);
-        Rgba.FData[RgbaPos + 3] := Alpha;
+            RgbaCopy.FData[RgbaPos + Channel] :=
+              RgbaCopy.FData[RgbaPos + Channel] * (Alpha / MaxChannelValue);
+        RgbaCopy.FData[RgbaPos + 3] := Alpha;
       end;
-      Resampled := Rgba;
+      Resampled := RgbaCopy;
     end
     else Resampled := Source;
     if IsResized then
     begin
-      ResizeImageLanczos(Resampled, VaeImage, Width, Height);
+      ResizeImageLanczos(Resampled, Rgba, Width, Height);
       MaxPixelPos := Width * Height - 1;
       for PixelPos := 0 to MaxPixelPos do
       begin
         RgbaPos := PixelPos * 4;
         for Channel := 0 to 3 do
         begin
-          Value := VaeImage.FData[RgbaPos + Channel];
-          if Value < 0 then VaeImage.FData[RgbaPos + Channel] := 0
+          Value := Rgba.FData[RgbaPos + Channel];
+          if Value < 0 then Rgba.FData[RgbaPos + Channel] := 0
           else if Value > MaxChannelValue then
-            VaeImage.FData[RgbaPos + Channel] := MaxChannelValue;
+            Rgba.FData[RgbaPos + Channel] := MaxChannelValue;
         end;
-        Alpha := VaeImage.FData[RgbaPos + 3];
+        Alpha := Rgba.FData[RgbaPos + 3];
         // PIL's rgba2rgbA leaves a pixel with alpha 0 premultiplied.
         if IsPremultiplied and (Alpha > 0) and (Alpha < MaxChannelValue) then
           for Channel := 0 to 2 do
           begin
-            Value := VaeImage.FData[RgbaPos + Channel] * MaxChannelValue /
+            Value := Rgba.FData[RgbaPos + Channel] * MaxChannelValue /
               Alpha;
             if Value > MaxChannelValue then Value := MaxChannelValue;
-            VaeImage.FData[RgbaPos + Channel] := Value;
+            Rgba.FData[RgbaPos + Channel] := Value;
           end;
       end;
     end
-    else if Resampled <> VaeImage then VaeImage.Copy(Resampled);
+    else if Resampled <> Rgba then Rgba.Copy(Resampled);
   finally
-    if OwnsRgba then Rgba.Free;
+    if OwnsRgbaCopy then RgbaCopy.Free;
   end;
+end;
+
+procedure QwenImage21PrepareVaeImage(Source: TNNetVolume; Width,
+  Height: integer; VaeImage: TNNetVolume);
+const
+  MaxChannelValue: TNeuralFloat = 255;
+begin
+  QwenImage21ResizeToRgba(Source, Width, Height, VaeImage);
   // pixel / 255 * 2 - 1, as the VaeImageProcessor normalises.
   VaeImage.Mul(2 / MaxChannelValue);
   VaeImage.Add(-1);
@@ -85682,6 +85791,7 @@ end;
 destructor TQwenImage21Pipeline.Destroy();
 begin
   UnloadComponents();
+  ClearConditionImages();
   FScheduler.Free;
   inherited Destroy();
 end;
@@ -85699,7 +85809,10 @@ begin
   if ComponentsLoaded then exit;
   try
     DoPhase(qppLoadTextEncoder);
-    FTextEncoderOwner := BuildTextEncoder({SeqLen=}1, nil, Config);
+    Config := GetTextEncoderConfig();
+    // An owner that takes images serves the text-only prompts and the edits.
+    FTextEncoderOwner := BuildTextEncoder({SeqLen=}1, nil,
+      (Config.ImageTokenId >= 0) and (Config.Vision.Depth >= 1), Config);
     DoPhase(qppLoadTransformer);
     FTransformer := CreateTransformer();
     DoPhase(qppLoadVae);
@@ -85719,6 +85832,7 @@ end;
 procedure TQwenImage21Pipeline.UnloadComponents();
 begin
   FreeAndNil(FTokenizer);
+  FreeAndNil(FVisionTower);
   FreeAndNil(FVaeEncoder);
   FreeAndNil(FVaeDecoder);
   FreeAndNil(FTransformer);
@@ -85751,12 +85865,36 @@ begin
   FTextEncoderInt8 := Value;
 end;
 
-function TQwenImage21Pipeline.BuildTextEncoder(SeqLen: integer;
-  WeightOwner: TNNet; out Config: TQwen3VLConfig): TNNet;
+function TQwenImage21Pipeline.GetTextEncoderConfig(): TQwen3VLConfig;
 begin
+  if not FTextEncoderConfigRead then
+  begin
+    FTextEncoderConfig := ReadQwen3VLConfigFromJSONFile(
+      ComponentFolder('text_encoder') + 'config.json');
+    FTextEncoderConfigRead := true;
+  end;
+  Result := FTextEncoderConfig;
+end;
+
+function TQwenImage21Pipeline.GetConditionImageCount(): integer;
+begin
+  Result := Length(FConditionLatents);
+end;
+
+function TQwenImage21Pipeline.GetConditionLatents(
+  ImagePos: integer): TNNetVolume;
+begin
+  Result := FConditionLatents[ImagePos];
+end;
+
+function TQwenImage21Pipeline.BuildTextEncoder(SeqLen: integer;
+  WeightOwner: TNNet; ImageInput: boolean; out Config: TQwen3VLConfig): TNNet;
+begin
+  if Assigned(WeightOwner) then
+    ImageInput := Qwen3VLEncoderTakesImages(WeightOwner);
   Result := BuildQwen3VLTextEncoderFromSafeTensors(
     SafeTensorsFolderWeightsFile(ComponentFolder('text_encoder'), 'model'),
-    Config, SeqLen, FTextEncoderInt8, '', WeightOwner);
+    Config, SeqLen, FTextEncoderInt8, '', WeightOwner, ImageInput);
   if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
   begin
     Result.Free;
@@ -85853,23 +85991,68 @@ begin
       '.');
 end;
 
+function TQwenImage21Pipeline.AcquireTokenizer(
+  out Owned: boolean): TNeuralHFTokenizer;
+var
+  TokenizerFile: string;
+begin
+  Owned := not Assigned(FTokenizer);
+  if not Owned then exit(FTokenizer);
+  TokenizerFile := ComponentFolder('processor') + 'tokenizer.json';
+  if not FileExists(TokenizerFile) then
+    ImportError('TQwenImage21Pipeline: ' + TokenizerFile + ' not found.');
+  Result := TNeuralHFTokenizer.Create();
+  try
+    Result.LoadFromFile(TokenizerFile);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
 function TQwenImage21Pipeline.TokenizePrompt(const Prompt: string;
   out DropCount: integer): TNeuralIntegerArray;
 var
   Tokenizer: TNeuralHFTokenizer;
-  TokenizerFile: string;
+  Owned: boolean;
 begin
-  if Assigned(FTokenizer) then
-    exit(QwenImage21EncodeTextToImagePrompt(FTokenizer, Prompt, DropCount));
-  TokenizerFile := ComponentFolder('processor') + 'tokenizer.json';
-  if not FileExists(TokenizerFile) then
-    ImportError('TQwenImage21Pipeline: ' + TokenizerFile + ' not found.');
-  Tokenizer := TNeuralHFTokenizer.Create();
+  Tokenizer := AcquireTokenizer(Owned);
   try
-    Tokenizer.LoadFromFile(TokenizerFile);
     Result := QwenImage21EncodeTextToImagePrompt(Tokenizer, Prompt, DropCount);
   finally
-    Tokenizer.Free;
+    if Owned then Tokenizer.Free;
+  end;
+end;
+
+function TQwenImage21Pipeline.TokenizeEditPrompt(const Prompt: string;
+  ImageCount: integer; out DropCount: integer): TNeuralIntegerArray;
+var
+  Tokenizer: TNeuralHFTokenizer;
+  Owned: boolean;
+begin
+  if (ImageCount < 1) or (ImageCount > csQwenImage21MaxConditionImages) then
+    ImportError('TQwenImage21Pipeline.TokenizeEditPrompt: ' +
+      IntToStr(ImageCount) + ' images; an edit takes 1..' +
+      IntToStr(csQwenImage21MaxConditionImages) + '.');
+  Tokenizer := AcquireTokenizer(Owned);
+  try
+    DropCount := QwenImage21SystemTokenCount(Tokenizer);
+    Result := Tokenizer.Encode(QwenImage21EditPrompt(Prompt, ImageCount));
+  finally
+    if Owned then Tokenizer.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.ClearPhaseStats(
+  Phases: array of TQwenImage21PipelinePhase);
+var
+  Phase: TQwenImage21PipelinePhase;
+begin
+  for Phase in Phases do
+  begin
+    FImageStats.PhaseMs[Phase] := 0;
+    FImageStats.PhaseUploadBytes[Phase] := 0;
+    FImageStats.PhaseDownloadBytes[Phase] := 0;
   end;
 end;
 
@@ -85878,20 +86061,15 @@ procedure TQwenImage21Pipeline.EncodeTokenIds(const TokenIds: array of integer;
 var
   Encoder: TNNet;
   Config: TQwen3VLConfig;
-  Phase: TQwenImage21PipelinePhase;
 begin
   EndPhase();
-  for Phase in [qppLoadTextEncoder, qppEncodePrompt] do
-  begin
-    FImageStats.PhaseMs[Phase] := 0;
-    FImageStats.PhaseUploadBytes[Phase] := 0;
-    FImageStats.PhaseDownloadBytes[Phase] := 0;
-  end;
+  ClearPhaseStats([qppLoadTextEncoder, qppEncodePrompt]);
   try
     // A loaded encoder's borrowing net is built inside qppEncodePrompt.
     if Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt)
     else DoPhase(qppLoadTextEncoder);
-    Encoder := BuildTextEncoder(Length(TokenIds), FTextEncoderOwner, Config);
+    Encoder := BuildTextEncoder(Length(TokenIds), FTextEncoderOwner,
+      {ImageInput=}false, Config);
     try
       PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
       if not Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt);
@@ -85915,6 +86093,64 @@ begin
   EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
 end;
 
+procedure TQwenImage21Pipeline.EncodeEditTokenIds(
+  const TokenIds: array of integer; DropCount: integer;
+  PromptEmbeds: TNNetVolume; out TextLengths: TNeuralIntegerArray);
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+  EncoderRows: TNNetVolume;
+  Mask: TQwen3VLImagePadMask;
+  SlotCounts, ExpandedIds: TNeuralIntegerArray;
+  ImagePos, MaxImagePos: integer;
+begin
+  if ConditionImageCount < 1 then
+    ImportError('TQwenImage21Pipeline.EncodeEditTokenIds: no condition ' +
+      'images (EncodeConditionImages first).');
+  Config := GetTextEncoderConfig();
+  MaxImagePos := ConditionImageCount - 1;
+  SetLength(SlotCounts, ConditionImageCount);
+  for ImagePos := 0 to MaxImagePos do
+    SlotCounts[ImagePos] := Qwen3VLImageSlotCount(
+      FConditionGridHeights[ImagePos], FConditionGridWidths[ImagePos],
+      Config.Vision.SpatialMergeSize);
+  ExpandedIds := Qwen3VLExpandImagePads(TokenIds, Config.ImageTokenId,
+    SlotCounts);
+  EndPhase();
+  ClearPhaseStats([qppLoadTextEncoder, qppEncodePrompt]);
+  EncoderRows := TNNetVolume.Create();
+  try
+    if Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt)
+    else DoPhase(qppLoadTextEncoder);
+    Encoder := BuildTextEncoder(Length(ExpandedIds), FTextEncoderOwner,
+      {ImageInput=}true, Config);
+    try
+      PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
+      if not Assigned(FTextEncoderOwner) then DoPhase(qppEncodePrompt);
+      Qwen3VLEncodeHiddenStatesWithImages(Encoder, Config, ExpandedIds,
+        FConditionEmbeds, DropCount, EncoderRows, Mask, FParallel);
+    finally
+      Encoder.Free;
+    end;
+    // diffusers keeps only the text rows; the transformer refills the slots.
+    QwenImage21SplitEncoderRows(EncoderRows, Mask, SlotCounts, PromptEmbeds,
+      TextLengths);
+  finally
+    EncoderRows.Free;
+    EndPhase();
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EncodeEditPrompt(const Prompt: string;
+  PromptEmbeds: TNNetVolume; out TextLengths: TNeuralIntegerArray);
+var
+  TokenIds: TNeuralIntegerArray;
+  DropCount: integer;
+begin
+  TokenIds := TokenizeEditPrompt(Prompt, ConditionImageCount, DropCount);
+  EncodeEditTokenIds(TokenIds, DropCount, PromptEmbeds, TextLengths);
+end;
+
 procedure TQwenImage21Pipeline.MakeInitialLatents(Width, Height: integer;
   Seed: cardinal; Latents: TNNetVolume);
 var
@@ -85933,6 +86169,14 @@ end;
 procedure TQwenImage21Pipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
   Height, StepCount: integer; Latents: TNNetVolume; StartStep: integer;
   ImageLatents: TNNetVolume);
+begin
+  DenoiseAt(PromptEmbeds, [], Width, Height, StepCount, Latents, StartStep,
+    ImageLatents);
+end;
+
+procedure TQwenImage21Pipeline.DenoiseAt(PromptEmbeds: TNNetVolume;
+  const TextLengths: array of integer; Width, Height, StepCount: integer;
+  Latents: TNNetVolume; StartStep: integer; ImageLatents: TNNetVolume);
 var
   Transformer: TQwenImage21Transformer;
   Velocity: TNNetVolume;
@@ -85973,7 +86217,9 @@ begin
     Transformer.MaxThreads := FMaxThreads;
     Transformer.LayerProfiling := FLayerProfiling;
     DoPhase(qppEncodePrefix);
-    Transformer.EncodePrefix(PromptEmbeds);
+    if Length(TextLengths) = 0 then Transformer.EncodePrefix(PromptEmbeds)
+    else Transformer.EncodePrefix(PromptEmbeds, TextLengths,
+      FConditionLatents, FConditionGridHeights, FConditionGridWidths);
     DoPhase(qppDenoise);
     MaxStepPos := StepCount - 1;
     for StepPos := StartStep to MaxStepPos do
@@ -85999,45 +86245,239 @@ begin
   end;
 end;
 
+function TQwenImage21Pipeline.AcquireVaeEncoder(): TQwenImage21VaeEncoder;
+var
+  ZDim: integer;
+begin
+  Result := FVaeEncoder;
+  if not Assigned(Result) then
+  begin
+    DoPhase(qppLoadVaeEncoder);
+    Result := TQwenImage21VaeEncoder.Create(ComponentFolder('vae'));
+    if ComponentsLoaded then FVaeEncoder := Result;
+  end;
+  ZDim := Result.Config.ZDim;
+  if ZDim <> FTransformerConfig.InChannels then
+  begin
+    ReleaseVaeEncoder(Result);
+    ImportError('TQwenImage21Pipeline: the VAE z_dim ' +
+      IntToStr(ZDim) + ' differs from the transformer''s ' +
+      'in_channels ' + IntToStr(FTransformerConfig.InChannels) + '.');
+  end;
+  Result.Parallel := FParallel;
+  Result.MaxThreads := FMaxThreads;
+end;
+
+procedure TQwenImage21Pipeline.ReleaseVaeEncoder(
+  Encoder: TQwenImage21VaeEncoder);
+begin
+  if Encoder = FVaeEncoder then FVaeEncoder.ReleaseNet()
+  else Encoder.Free;
+end;
+
+// Pixel (w, h) of the (GridW, GridH, z) latent is token h * GridW + w.
+procedure QwenImage21LatentToTokens(Latent: TNNetVolume);
+begin
+  Latent.ReSize(Latent.SizeX * Latent.SizeY, 1, Latent.Depth);
+end;
+
 procedure TQwenImage21Pipeline.EncodeImage(Image: TNNetVolume; Width,
   Height: integer; ImageLatents: TNNetVolume);
 var
   Encoder: TQwenImage21VaeEncoder;
   VaeImage: TNNetVolume;
-  Phase: TQwenImage21PipelinePhase;
 begin
   CheckImageSize(Width, Height);
   EndPhase();
-  for Phase in [qppLoadVaeEncoder, qppEncodeImage] do
-  begin
-    FImageStats.PhaseMs[Phase] := 0;
-    FImageStats.PhaseUploadBytes[Phase] := 0;
-    FImageStats.PhaseDownloadBytes[Phase] := 0;
-  end;
+  ClearPhaseStats([qppLoadVaeEncoder, qppEncodeImage]);
   VaeImage := TNNetVolume.Create();
-  Encoder := FVaeEncoder;
   try
-    if not Assigned(Encoder) then
-    begin
-      DoPhase(qppLoadVaeEncoder);
-      Encoder := TQwenImage21VaeEncoder.Create(ComponentFolder('vae'));
-      if ComponentsLoaded then FVaeEncoder := Encoder;
+    Encoder := AcquireVaeEncoder();
+    try
+      DoPhase(qppEncodeImage);
+      QwenImage21PrepareVaeImage(Image, Width, Height, VaeImage);
+      Encoder.Encode(VaeImage, ImageLatents);
+      QwenImage21LatentToTokens(ImageLatents);
+    finally
+      ReleaseVaeEncoder(Encoder);
     end;
-    if Encoder.Config.ZDim <> FTransformerConfig.InChannels then
-      ImportError('TQwenImage21Pipeline: the VAE z_dim ' +
-        IntToStr(Encoder.Config.ZDim) + ' differs from the transformer''s ' +
-        'in_channels ' + IntToStr(FTransformerConfig.InChannels) + '.');
-    Encoder.Parallel := FParallel;
-    Encoder.MaxThreads := FMaxThreads;
-    DoPhase(qppEncodeImage);
-    QwenImage21PrepareVaeImage(Image, Width, Height, VaeImage);
-    Encoder.Encode(VaeImage, ImageLatents);
-    // Pixel (w, h) of the (GridW, GridH, z) latent is token h * GridW + w.
-    ImageLatents.ReSize(ImageLatents.SizeX * ImageLatents.SizeY, 1,
-      ImageLatents.Depth);
   finally
-    if Assigned(FVaeEncoder) then FVaeEncoder.ReleaseNet()
-    else Encoder.Free;
+    VaeImage.Free;
+    EndPhase();
+  end;
+end;
+
+function TQwenImage21Pipeline.VisionProcessorConfigFile(): string;
+begin
+  Result := ComponentFolder('processor') + 'preprocessor_config.json';
+  if not FileExists(Result) then
+  begin
+    Result := ComponentFolder('processor') + 'processor_config.json';
+    if not FileExists(Result) then Result := '';
+  end;
+end;
+
+procedure TQwenImage21Pipeline.CheckEditSupport();
+var
+  Config: TQwen3VLConfig;
+begin
+  if VisionProcessorConfigFile() = '' then
+    ImportError('TQwenImage21Pipeline: image editing needs the vision ' +
+      'tower''s image processor config, ' + ComponentFolder('processor') +
+      'preprocessor_config.json (or processor_config.json); not found.');
+  Config := GetTextEncoderConfig();
+  if (Config.ImageTokenId < 0) or (Config.Vision.Depth < 1) then
+    ImportError('TQwenImage21Pipeline: text_encoder/config.json has no ' +
+      'vision_config or image_token_id, so it cannot read images.');
+  if Config.Vision.PatchSize <> csQwenImage21PixelsPerLatent then
+    ImportError('TQwenImage21Pipeline: vision patch size ' +
+      IntToStr(Config.Vision.PatchSize) + ' differs from the ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + ' pixels per VAE latent.');
+end;
+
+procedure TQwenImage21Pipeline.UnloadImageEncoders();
+begin
+  FreeAndNil(FVisionTower);
+  FreeAndNil(FVaeEncoder);
+end;
+
+procedure TQwenImage21Pipeline.ClearConditionImages();
+var
+  ImagePos: integer;
+begin
+  FreeQwen3VLImageEmbeds(FConditionEmbeds);
+  for ImagePos := 0 to High(FConditionLatents) do
+    FConditionLatents[ImagePos].Free;
+  FConditionEmbeds := nil;
+  FConditionLatents := nil;
+  FConditionGridHeights := nil;
+  FConditionGridWidths := nil;
+  FConditionOutputWidth := 0;
+  FConditionOutputHeight := 0;
+end;
+
+// As diffusers: one resize per image feeds the vision tower (which composites
+// over white) and the VAE encoder (all four channels).
+procedure TQwenImage21Pipeline.EncodeConditionImages(
+  const Images: array of TNNetVolume; TargetArea: double);
+var
+  Tower: TQwen3VLVisionTower;
+  Encoder: TQwenImage21VaeEncoder;
+  Resized: array of TNNetVolume;
+  VaeImage: TNNetVolume;
+  Config: TQwen3VLConfig;
+  Processor: TQwen3VLImageProcessorConfig;
+  Widths, Heights: TNeuralIntegerArray;
+  ImageCount, MaxImagePos, ImagePos, StackPos: integer;
+  ProcessedWidth, ProcessedHeight: integer;
+begin
+  ImageCount := Length(Images);
+  if (ImageCount < 1) or (ImageCount > csQwenImage21MaxConditionImages) then
+    ImportError('TQwenImage21Pipeline.EncodeConditionImages: ' +
+      IntToStr(ImageCount) + ' condition images; an edit takes 1..' +
+      IntToStr(csQwenImage21MaxConditionImages) + '.');
+  CheckEditSupport();
+  Config := GetTextEncoderConfig();
+  Processor := ReadQwen3VLImageProcessorConfig(VisionProcessorConfigFile(),
+    Config.Vision);
+  MaxImagePos := ImageCount - 1;
+  SetLength(Widths, ImageCount);
+  SetLength(Heights, ImageCount);
+  // Every size is checked before anything is freed or loaded.
+  for ImagePos := 0 to MaxImagePos do
+  begin
+    QwenImage21SizeForAspect(TargetArea,
+      Images[ImagePos].SizeX / Images[ImagePos].SizeY, Widths[ImagePos],
+      Heights[ImagePos]);
+    CheckImageSize(Widths[ImagePos], Heights[ImagePos]);
+    Qwen3VLSmartResize(Heights[ImagePos], Widths[ImagePos],
+      Processor.PatchSize * Processor.MergeSize, Processor.MinPixels,
+      Processor.MaxPixels, ProcessedHeight, ProcessedWidth);
+    if (ProcessedWidth <> Widths[ImagePos]) or
+       (ProcessedHeight <> Heights[ImagePos]) then
+      ImportError('TQwenImage21Pipeline: condition image ' +
+        IntToStr(ImagePos + 1) + ' at ' + IntToStr(Widths[ImagePos]) + 'x' +
+        IntToStr(Heights[ImagePos]) + ' is outside the vision processor''s ' +
+        IntToStr(Processor.MinPixels) + '..' + IntToStr(Processor.MaxPixels) +
+        ' pixels (it would resize it to ' + IntToStr(ProcessedWidth) + 'x' +
+        IntToStr(ProcessedHeight) + '); change the output area.');
+  end;
+  ClearConditionImages();
+  EndPhase();
+  ClearPhaseStats([qppLoadVisionTower, qppEncodeVision, qppLoadVaeEncoder,
+    qppEncodeImage]);
+  Resized := nil;
+  SetLength(Resized, ImageCount);
+  VaeImage := TNNetVolume.Create();
+  try
+    try
+      for ImagePos := 0 to MaxImagePos do
+      begin
+        Resized[ImagePos] := TNNetVolume.Create();
+        QwenImage21ResizeToRgba(Images[ImagePos], Widths[ImagePos],
+          Heights[ImagePos], Resized[ImagePos]);
+      end;
+      SetLength(FConditionEmbeds, ImageCount);
+      SetLength(FConditionLatents, ImageCount);
+      SetLength(FConditionGridHeights, ImageCount);
+      SetLength(FConditionGridWidths, ImageCount);
+      for ImagePos := 0 to MaxImagePos do
+      begin
+        FConditionEmbeds[ImagePos].Merged := TNNetVolume.Create();
+        SetLength(FConditionEmbeds[ImagePos].DeepStack,
+          Length(Config.Vision.DeepStackIndexes));
+        for StackPos := 0 to High(FConditionEmbeds[ImagePos].DeepStack) do
+          FConditionEmbeds[ImagePos].DeepStack[StackPos] :=
+            TNNetVolume.Create();
+        FConditionLatents[ImagePos] := TNNetVolume.Create();
+      end;
+      Tower := FVisionTower;
+      if not Assigned(Tower) then
+      begin
+        DoPhase(qppLoadVisionTower);
+        Tower := TQwen3VLVisionTower.Create(ComponentFolder('text_encoder'),
+          VisionProcessorConfigFile());
+        if ComponentsLoaded then FVisionTower := Tower;
+      end;
+      try
+        Tower.Parallel := FParallel;
+        Tower.MaxThreads := FMaxThreads;
+        DoPhase(qppEncodeVision);
+        for ImagePos := 0 to MaxImagePos do
+        begin
+          Tower.Encode(Resized[ImagePos], FConditionEmbeds[ImagePos].Merged,
+            FConditionEmbeds[ImagePos].DeepStack);
+          FConditionEmbeds[ImagePos].GridH := Tower.NetGridH;
+          FConditionEmbeds[ImagePos].GridW := Tower.NetGridW;
+          FConditionGridHeights[ImagePos] := Tower.NetGridH;
+          FConditionGridWidths[ImagePos] := Tower.NetGridW;
+        end;
+      finally
+        if Tower = FVisionTower then FVisionTower.ReleaseNet()
+        else Tower.Free;
+      end;
+      Encoder := AcquireVaeEncoder();
+      try
+        DoPhase(qppEncodeImage);
+        for ImagePos := 0 to MaxImagePos do
+        begin
+          QwenImage21PrepareVaeImage(Resized[ImagePos],
+            Resized[ImagePos].SizeX, Resized[ImagePos].SizeY, VaeImage);
+          Encoder.Encode(VaeImage, FConditionLatents[ImagePos]);
+          QwenImage21LatentToTokens(FConditionLatents[ImagePos]);
+        end;
+      finally
+        ReleaseVaeEncoder(Encoder);
+      end;
+      FConditionOutputWidth := Resized[MaxImagePos].SizeX;
+      FConditionOutputHeight := Resized[MaxImagePos].SizeY;
+    except
+      ClearConditionImages();
+      raise;
+    end;
+  finally
+    for ImagePos := 0 to MaxImagePos do
+      Resized[ImagePos].Free;
     VaeImage.Free;
     EndPhase();
   end;
@@ -86154,7 +86594,7 @@ procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
   Width, Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume;
   InitialLatents: TNNetVolume);
 begin
-  GenerateFromEmbedsAt(PromptEmbeds, Width, Height, StepCount, Seed, Image,
+  GenerateFromEmbedsAt(PromptEmbeds, [], Width, Height, StepCount, Seed, Image,
     InitialLatents, nil, 1);
 end;
 
@@ -86165,13 +86605,31 @@ begin
   if not Assigned(ImageLatents) then
     ImportError('TQwenImage21Pipeline.GenerateFromEmbeds: img2img needs ' +
       'the image latents of EncodeImage.');
-  GenerateFromEmbedsAt(PromptEmbeds, Width, Height, StepCount, Seed, Image,
-    InitialLatents, ImageLatents, Strength);
+  GenerateFromEmbedsAt(PromptEmbeds, [], Width, Height, StepCount, Seed,
+    Image, InitialLatents, ImageLatents, Strength);
+end;
+
+procedure TQwenImage21Pipeline.GenerateEditFromEmbeds(
+  PromptEmbeds: TNNetVolume; const TextLengths: array of integer; Width,
+  Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+  InitialLatents: TNNetVolume);
+begin
+  if ConditionImageCount < 1 then
+    ImportError('TQwenImage21Pipeline.GenerateEditFromEmbeds: no condition ' +
+      'images (EncodeConditionImages first).');
+  if Length(TextLengths) <> ConditionImageCount + 1 then
+    ImportError('TQwenImage21Pipeline.GenerateEditFromEmbeds: ' +
+      IntToStr(Length(TextLengths)) + ' text runs for ' +
+      IntToStr(ConditionImageCount) + ' condition images (EncodeEditTokenIds ' +
+      'after the last EncodeConditionImages gives N+1).');
+  GenerateFromEmbedsAt(PromptEmbeds, TextLengths, Width, Height, StepCount,
+    Seed, Image, InitialLatents, nil, 1);
 end;
 
 procedure TQwenImage21Pipeline.GenerateFromEmbedsAt(PromptEmbeds: TNNetVolume;
-  Width, Height, StepCount: integer; Seed: cardinal; Image, InitialLatents,
-  ImageLatents: TNNetVolume; Strength: double);
+  const TextLengths: array of integer; Width, Height, StepCount: integer;
+  Seed: cardinal; Image, InitialLatents, ImageLatents: TNNetVolume;
+  Strength: double);
 var
   Latents: TNNetVolume;
   RoundedWidth, RoundedHeight, StartStep: integer;
@@ -86189,10 +86647,15 @@ begin
       Strength);
     KeptPhases := KeptPhases + [qppLoadVaeEncoder, qppEncodeImage];
   end;
+  if Length(TextLengths) > 0 then
+    KeptPhases := KeptPhases + [qppLoadVisionTower, qppEncodeVision,
+      qppLoadVaeEncoder, qppEncodeImage];
   EndPhase();
   EncodeStats := FImageStats;
   FImageStats := Default(TQwenImage21ImageStats);
   FImageStats.UsedInitImage := Assigned(ImageLatents);
+  if Length(TextLengths) > 0 then
+    FImageStats.ConditionImageCount := ConditionImageCount;
   for Phase in KeptPhases do
   begin
     FImageStats.PhaseMs[Phase] := EncodeStats.PhaseMs[Phase];
@@ -86207,8 +86670,8 @@ begin
   try
     if Assigned(InitialLatents) then Latents.Copy(InitialLatents)
     else MakeInitialLatents(RoundedWidth, RoundedHeight, Seed, Latents);
-    Denoise(PromptEmbeds, RoundedWidth, RoundedHeight, StepCount, Latents,
-      StartStep, ImageLatents);
+    DenoiseAt(PromptEmbeds, TextLengths, RoundedWidth, RoundedHeight,
+      StepCount, Latents, StartStep, ImageLatents);
     DecodeLatents(Latents, RoundedWidth, RoundedHeight, Image);
   finally
     Latents.Free;
@@ -86226,6 +86689,24 @@ begin
   try
     EncodePrompt(Prompt, PromptEmbeds);
     GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed, Image);
+  finally
+    PromptEmbeds.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.GenerateEdit(const Prompt: string;
+  const Images: array of TNNetVolume; TargetArea: double;
+  StepCount: integer; Seed: cardinal; Image: TNNetVolume);
+var
+  PromptEmbeds: TNNetVolume;
+  TextLengths: TNeuralIntegerArray;
+begin
+  PromptEmbeds := TNNetVolume.Create();
+  try
+    EncodeConditionImages(Images, TargetArea);
+    EncodeEditPrompt(Prompt, PromptEmbeds, TextLengths);
+    GenerateEditFromEmbeds(PromptEmbeds, TextLengths, ConditionOutputWidth,
+      ConditionOutputHeight, StepCount, Seed, Image);
   finally
     PromptEmbeds.Free;
   end;

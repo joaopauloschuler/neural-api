@@ -1,7 +1,8 @@
-# QwenImage — text-to-image with Qwen-Image-2.1
+# QwenImage — text-to-image and image editing with Qwen-Image-2.1
 
 `QwenImage` turns a text prompt into an RGBA PNG image with the
-Qwen-Image-2.1 checkpoint. The whole pipeline is Pascal code in this library
+Qwen-Image-2.1 checkpoint, or edits up to 10 condition images by an
+instruction (see [Image editing](#image-editing)). The whole pipeline is Pascal code in this library
 (`TQwenImage21Pipeline` in `neural/neuralpretrained.pas`); no Python runs at
 generation time.
 
@@ -34,10 +35,16 @@ transformer prefix pass always run on the CPU.
 `--cpu` runs everything on the CPU, and the program falls back to the CPU by
 itself when it finds no usable OpenCL device.
 
-`--image FILE` starts from an init image instead of pure noise (SDEdit
-img2img, see [img2img](#img2img-sdedit)): it re-styles the image. Image
-editing that follows instructions, and reference images, are not implemented
-yet (see [Known limitations](#known-limitations)).
+`--image FILE` (repeatable) gives condition images to edit by the prompt
+(see [Image editing](#image-editing)). `--init-image FILE` starts from an
+init image instead of pure noise (SDEdit img2img, see
+[img2img](#img2img-sdedit)): it re-styles the image.
+
+**Flag change:** SDEdit img2img used to be `--image FILE` and `/image FILE`.
+It is now `--init-image FILE` and `/init-image FILE|off`; `--image` and
+`/image` add edit condition images. A run that still passes
+`--image photo.jpg --strength 0.6` now edits (and prints that `--strength`
+has no effect without `--init-image`).
 
 ## Getting the model
 
@@ -55,7 +62,8 @@ git clone https://huggingface.co/Qwen/Qwen-Image-2.1
 ```
 Qwen-Image-2.1/
   model_index.json
-  processor/      tokenizer.json (the prompt tokenizer)
+  processor/      tokenizer.json (the prompt tokenizer),
+                  preprocessor_config.json (the vision tower, editing only)
   text_encoder/   Qwen3-VL-8B config.json + safetensors
   transformer/    config.json + safetensors (7B, BF16)
   vae/            config.json + safetensors
@@ -133,7 +141,9 @@ follow:
 | `/steps N` | Euler steps |
 | `/seed N` | seed of the next image; without it the seed grows by one per image |
 | `/tile SIZE[,STRIDE]` | VAE tile, as `--vae-tile` |
-| `/image FILE` | init image for the next prompts (img2img, as `--image`); `/image off` clears it |
+| `/image FILE` | add a condition image (edit, as `--image`) for the next prompts, up to 10 |
+| `/images` | list the condition images; `/images clear` removes them all (back to text-to-image) and frees the vision tower and the VAE encoder |
+| `/init-image FILE` | init image for the next prompts (img2img, as `--init-image`); `/init-image off` clears it |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/profile on\|off` | `--profile` from the next image |
@@ -156,13 +166,87 @@ The same seed, size and step count give the same image again: the initial
 noise comes from the FPC random generator. For the same reason an image does
 not equal the diffusers image for the same seed.
 
-### img2img (SDEdit)
+### Image editing
 
-`--image FILE` (or `/image FILE` in the REPL) makes each image start from an
-init image instead of pure noise:
+`--image FILE` gives a condition image; repeat it for up to 10 images. The
+prompt is the instruction, and it can refer to the images by their order:
+the first `--image` is image 1, the next image 2, and so on.
 
 ```
-bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --image photo.jpg \
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --image room.jpg \
+  -p "Paint the walls dark green" --output room_green.png
+
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --image person.png \
+  --image jacket.png -p "Image 1 wears the jacket from image 2" --output out.png
+```
+
+In the REPL, `/image FILE` appends a condition image, `/images` lists them
+and `/images clear` removes them all. The images apply to every prompt that
+follows. An edit and an init image (`--init-image`, img2img) are exclusive.
+
+This is the diffusers `QwenImage21Pipeline` with `image=[...]` (no
+classifier-free guidance):
+
+1. Each image is resized to its own aspect ratio at the area of `--width` x
+   `--height` (default 1024x1024), sides multiples of 32 (diffusers'
+   `calculate_dimensions` with `output_resolution`; the resize is
+   `ResizeImageLanczos`, as for img2img below).
+2. The Qwen3-VL vision tower (`TQwen3VLVisionTower`, CPU) encodes the
+   resized image composited over white; the VAE encoder
+   (`TQwenImage21VaeEncoder`, CPU, untiled) encodes the same resized image
+   with its alpha channel.
+3. The text encoder reads the edit template (`<image1><|vision_start|>
+   <|image_pad|><|vision_end|> <image2>...` then the prompt), with each
+   `<|image_pad|>` expanded to the image's vision rows.
+4. The transformer prefix pass holds the prompt and the condition images'
+   latents; the denoising steps run only the target image.
+5. The output takes the aspect ratio of the **last** condition image at the
+   `--width` x `--height` area.
+
+There is no mask input and no strength: a mask, a sketch or an image with
+circles drawn on it is just one more condition image, and the prompt says
+how to use it ("replace the area circled in red in image 1 with ...").
+
+The condition images are encoded once and reused: by every image of a
+`--repeat` batch or `/repeat`, and by later REPL prompts until `/image`,
+`/images clear` or `/size` (when the area changes) changes them. The prompt
+itself is still encoded for every new prompt line. In keep-loaded mode (the
+REPL, `--repeat N` > 1) the first edit loads the vision tower and the VAE
+encoder and keeps them beside the other components until `/images clear`
+frees them; a one-shot run loads and frees each in turn. The stage table shows "vision encode" and
+"VAE encode" rows for the image that encoded them.
+
+Requirements and caveats:
+
+- The vision tower needs `processor/preprocessor_config.json` (or
+  `processor/processor_config.json`) of the checkpoint for its mean, std and
+  pixel limits. `TQwenImage21Pipeline.CheckEditSupport` checks it (and the
+  vision config) when `--image` is given or on the first `/image`, before
+  any component loads. Text-to-image does not need it.
+- `EncodeConditionImages` refuses an image whose resized size is outside the
+  processor's `shortest_edge`..`longest_edge` pixel range, before it frees
+  the previous images or loads anything (the Qwen3-VL processor would
+  resize it a second time; this program does not). Change `--width` x
+  `--height` (or `/size`) then.
+- Memory: the vision tower and the VAE encoder run untiled on the CPU, so
+  their activations grow with the area. The transformer prefix grows by one
+  token per 16x16 pixels of every condition image: one 1024x1024 image adds
+  4096 prefix tokens (task C4 in `tasklist.md` has the estimates; the prefix
+  pass runs on the CPU). None of this has been measured on the real
+  checkpoint. The program keeps every condition image as read in memory
+  (16 bytes per pixel: a 12-megapixel photo takes 192 MB).
+- The JPEG EXIF orientation is not applied (diffusers' `load_image`
+  applies `exif_transpose`), so a rotated phone photo stays as stored.
+- `--token-ids` with `--image` takes the template ids with one
+  `<|image_pad|>` id per image; the pipeline expands them.
+
+### img2img (SDEdit)
+
+`--init-image FILE` (or `/init-image FILE` in the REPL) makes each image
+start from an init image instead of pure noise:
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image photo.jpg \
   --strength 0.6 -p "a watercolor painting of a harbor" --output harbor.png
 ```
 
@@ -200,8 +284,8 @@ opaque. The JPEG EXIF orientation is not applied (diffusers' `load_image`
 applies `exif_transpose`), so a rotated phone photo stays as stored.
 
 The init image is encoded once and reused: by every image of a `--repeat`
-batch or `/repeat`, and by later REPL prompts until `/image`, `/size` (when
-the output size changes) or `/image off`. The noise still changes with the
+batch or `/repeat`, and by later REPL prompts until `/init-image`, `/size`
+(when the output size changes) or `/init-image off`. The noise still changes with the
 seed. In keep-loaded mode (the REPL, `--repeat N` > 1) the first encode
 loads the VAE encoder and keeps it beside the other components; a one-shot
 run loads it and frees it after the encode.
@@ -242,7 +326,8 @@ and `--fp32`, the last one given wins.
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
 | `--steps N` | Euler steps | 18 |
 | `--seed N` | seed of the initial noise | 42 |
-| `--image FILE` | img2img from this init image (PNG, JPEG, ...); see [img2img](#img2img-sdedit) | — |
+| `--image FILE` | edit: a condition image (PNG, JPEG, ...); repeat for up to 10; see [Image editing](#image-editing) | — |
+| `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
@@ -325,7 +410,8 @@ Stages of image 1 (wall time):
   memory, with the uploaded MB.
 - In the REPL and with `--repeat`, the prompt is encoded once: its rows count
   in the first image of the prompt, and later images show "encoded once".
-  The "encode init image" row of img2img works the same way, and
+  The "VAE encode" row (the init image of img2img, the condition images of
+  an edit) and the "vision encode" row of an edit work the same way, and
   "denoise" counts only the steps that ran.
 - ms per step and ms per tile include one-time setup: step 1 builds and arms
   the step pass, and the decode builds, arms and uploads the weights of one
@@ -394,11 +480,12 @@ under [VAE tiles](#vae-tiles).
 - An OpenCL error, such as a failed allocation, is printed but not detected.
   The pipeline cannot tell that a layer failed, so a REPL image can be wrong
   yet reported as written. Watch the log for OpenCL error lines.
-- Image editing that follows instructions, reference images and the
-  negative prompt (classifier-free guidance) are not implemented yet;
-  `--image` is img2img (SDEdit) only.
-- The VAE encoder runs untiled on the CPU, so its memory grows with the
-  output size. It has not been measured at 1024x1024 on the real checkpoint.
+- The negative prompt (classifier-free guidance) is not implemented.
+- Editing is tested only against diffusers on the pico checkpoint; it has
+  not run on the real checkpoint yet.
+- The VAE encoder and the vision tower run untiled on the CPU, so their
+  memory grows with the output size. They have not been measured at
+  1024x1024 on the real checkpoint.
 
 ## Advanced: A/B switches
 
@@ -425,4 +512,7 @@ in `tests/fixtures/tiny_qwenimage21/` (generated by
 `TestQwenImage21LanczosResizeVsPIL`, `TestQwenImage21PrepareVaeImage`,
 `TestQwenImage21SizeForAspect`, `TestFlowMatchImg2ImgStartStepVsOracle`,
 `TestFlowMatchScaleNoiseVsOracle`) read the oracle of
-`tools/make_pico_qwenimage21_img2img_fixture.py`.
+`tools/make_pico_qwenimage21_img2img_fixture.py`. The edit tests
+(`TestQwenImage21Edit*`) read the oracle of
+`tools/make_pico_qwenimage21_edit_pipeline_fixture.py`: the diffusers
+pipeline with one and two condition images.

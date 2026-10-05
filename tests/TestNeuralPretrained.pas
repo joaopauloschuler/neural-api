@@ -71,6 +71,12 @@ type
     procedure CheckQwenImage21PipelineOracle(const FixtureName: string;
       FromTokenIds: boolean);
     procedure RecordQwenImage21Phase(Phase: TQwenImage21PipelinePhase);
+    // Case CaseObj of tiny_qwenimage21_edit_pipeline_io.json through
+    // EncodeConditionImages (its formula images at TargetArea) and
+    // EncodeEditTokenIds (its template ids).
+    procedure EncodeQwenImage21EditCase(Pipeline: TQwenImage21Pipeline;
+      CaseObj: TJSONObject; TargetArea: double; PromptEmbeds: TNNetVolume;
+      out TextLengths: TNeuralIntegerArray);
     procedure RecordQwenImage21Step(StepIndex, StepCount: integer;
       Timestep: double; Latents: TNNetVolume);
     // Loads a {"shape": [C, H, W], ...} oracle image of Root as a (W,H,C) volume.
@@ -840,6 +846,10 @@ type
     procedure TestQwen3VLTextEncoderWithImagesParity;
     procedure TestQwen3VLImageEncodeRefusals;
     procedure TestQwenImage21EditPromptTemplateIds;
+    procedure TestQwenImage21EditPipelineParity;
+    procedure TestQwenImage21EditKeepLoaded;
+    procedure TestQwenImage21EditRefusals;
+    procedure TestQwenImage21EditPipelineOpenCL;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -31573,7 +31583,7 @@ begin
       AssertEquals('no transformer OpenCL bytes', 0, TransformerOpenCLBytes);
       AssertEquals('no VAE OpenCL bytes', 0, VaeOpenCLBytes);
       PhaseSumMs := 0;
-      for Phase := qppLoadTextEncoder to qppDecode do
+      for Phase := Low(TQwenImage21PipelinePhase) to qppDecode do
       begin
         AssertTrue('phase ms >= 0', PhaseMs[Phase] >= 0);
         PhaseSumMs := PhaseSumMs + PhaseMs[Phase];
@@ -32877,18 +32887,6 @@ begin
   end;
 end;
 
-procedure FreeQwen3VLImageEmbeds(var Images: array of TQwen3VLImageEmbeds);
-var
-  ImagePos, StackPos: integer;
-begin
-  for ImagePos := 0 to High(Images) do
-  begin
-    FreeAndNil(Images[ImagePos].Merged);
-    for StackPos := 0 to High(Images[ImagePos].DeepStack) do
-      FreeAndNil(Images[ImagePos].DeepStack[StackPos]);
-  end;
-end;
-
 // The pico Qwen3-VL text encoder with images vs the float64 transformers
 // Qwen3VLForConditionalGeneration (pixel_values through the whole model):
 // pre-final-norm rows after dropping 14 system rows, the image-pad mask, and
@@ -33194,6 +33192,551 @@ begin
     RefJson.Free;
   end;
 end;
+
+procedure TTestNeuralPretrained.EncodeQwenImage21EditCase(
+  Pipeline: TQwenImage21Pipeline; CaseObj: TJSONObject; TargetArea: double;
+  PromptEmbeds: TNNetVolume; out TextLengths: TNeuralIntegerArray);
+var
+  ImageArr, IdsArr: TJSONArray;
+  ImageObj: TJSONObject;
+  Images: array of TNNetVolume;
+  TokenIds: TNeuralIntegerArray;
+  ImagePos, IdPos: integer;
+begin
+  ImageArr := TJSONArray(CaseObj.Find('images'));
+  IdsArr := TJSONArray(CaseObj.Find('token_ids'));
+  SetLength(TokenIds, IdsArr.Count);
+  for IdPos := 0 to IdsArr.Count - 1 do
+    TokenIds[IdPos] := IdsArr.Integers[IdPos];
+  SetLength(Images, ImageArr.Count);
+  for ImagePos := 0 to High(Images) do
+    Images[ImagePos] := nil;
+  try
+    for ImagePos := 0 to High(Images) do
+    begin
+      ImageObj := TJSONObject(ImageArr.Items[ImagePos]);
+      Images[ImagePos] := TNNetVolume.Create;
+      FillQwen3VLVisionFormulaImage(Images[ImagePos], ImageObj.Get('width', 0),
+        ImageObj.Get('height', 0), ImageObj.Get('channels', 0));
+    end;
+    Pipeline.EncodeConditionImages(Images, TargetArea);
+    Pipeline.EncodeEditTokenIds(TokenIds, CaseObj.Get('drop_idx', 0),
+      PromptEmbeds, TextLengths);
+  finally
+    for ImagePos := 0 to High(Images) do
+      Images[ImagePos].Free;
+  end;
+end;
+
+// The edit pipeline (vision tower, image-capable text encoder, VAE-encoded
+// condition images in the transformer prefix) vs diffusers QwenImage21Pipeline
+// (image=[...], output_resolution 64, float64) on the pico folder, for one and
+// two condition images and one that needs a resize. The two-image case takes
+// its size from the LAST image. Tolerances: condition latents 1e-5 (C2); text
+// rows, latents and image 5e-5 (measured <= 6e-6). The resized case diverges
+// by PIL's 8-bit Lanczos (up to 11 levels on this noise image): its latents
+// match a float-resize reference to 1e-5, its rows and steps within 0.1
+// (measured 0.030 and 0.025 on values up to 5.2 and 4.0).
+procedure TTestNeuralPretrained.TestQwenImage21EditPipelineParity;
+const
+  ExactResizeTolerance = 5e-5;
+  ResizedTolerance = 0.1;
+var
+  Tolerance: double;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, StepArr, MaskArr, LatentArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, Expected, OracleRows, Initial, Image: TNNetVolume;
+  TextLengths: TNeuralIntegerArray;
+  ExpectedPhases: array of TQwenImage21PipelinePhase;
+  CasePos, StepPos, RowPos, TextRowPos, Width, Height, StepCount,
+    Resolution: integer;
+  CaseLabel: string;
+  MaxDiff: double;
+
+  procedure AssertMaxDiff(Actual: TNNetVolume; MaxAllowed: double;
+    const What: string);
+  begin
+    MaxDiff := MaxAbsVolumeDiff(Actual, Expected);
+    WriteLn('  Qwen-Image-2.1 edit ', CaseLabel, ' ', What, ': max|diff|=',
+      MaxDiff:0:9);
+    AssertTrue(CaseLabel + ' ' + What + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < ' + FloatToStr(MaxAllowed),
+      MaxDiff < MaxAllowed);
+  end;
+
+  procedure FreeStepLatents();
+  var
+    LatentPos: integer;
+  begin
+    for LatentPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[LatentPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  OracleRows := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_edit_pipeline_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Resolution := TJSONObject(RefRoot).Get('output_resolution', 0);
+    StepCount := TJSONObject(RefRoot).Get('num_inference_steps', 0);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      CaseLabel := CaseObj.Get('label', '');
+      if CaseObj.Get('resized', false) then Tolerance := ResizedTolerance
+      else Tolerance := ExactResizeTolerance;
+      Width := CaseObj.Get('width', 0);
+      Height := CaseObj.Get('height', 0);
+      Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+        FixturePath('tiny_qwenimage21/model_index.json')));
+      SetLength(FQwenImage21Phases, 0);
+      Pipeline.OnPhase := @RecordQwenImage21Phase;
+      Pipeline.OnStep := @RecordQwenImage21Step;
+      EncodeQwenImage21EditCase(Pipeline, CaseObj, Sqr(Resolution), Embeds,
+        TextLengths);
+      AssertEquals(CaseLabel + ' condition images',
+        TJSONArray(CaseObj.Find('images')).Count, Pipeline.ConditionImageCount);
+      AssertEquals(CaseLabel + ' width from the last image', Width,
+        Pipeline.ConditionOutputWidth);
+      AssertEquals(CaseLabel + ' height from the last image', Height,
+        Pipeline.ConditionOutputHeight);
+      AssertTrue(CaseLabel + ' one-shot keeps no tower',
+        Pipeline.LoadedVisionTower = nil);
+
+      // diffusers' prompt_embeds keep the slot rows; the pipeline drops them.
+      LoadOracleTokenTensor(CaseObj, 'prompt_embeds', OracleRows);
+      MaskArr := TJSONArray(CaseObj.Find('image_pad_mask'));
+      AssertEquals(CaseLabel + ' mask rows', OracleRows.SizeX, MaskArr.Count);
+      Expected.ReSize(OracleRows.SizeX, 1, OracleRows.Depth);
+      TextRowPos := 0;
+      for RowPos := 0 to MaskArr.Count - 1 do
+        if MaskArr.Integers[RowPos] = 0 then
+        begin
+          Move(OracleRows.FData[RowPos * OracleRows.Depth],
+            Expected.FData[TextRowPos * OracleRows.Depth],
+            OracleRows.Depth * SizeOf(TNeuralFloat));
+          Inc(TextRowPos);
+        end;
+      Expected.ReSize(TextRowPos, 1, OracleRows.Depth);
+      AssertEquals(CaseLabel + ' text runs', Pipeline.ConditionImageCount + 1,
+        Length(TextLengths));
+      AssertMaxDiff(Embeds, Tolerance, 'text rows');
+
+      LoadOracleTokenTensor(CaseObj, 'initial_latents', Initial);
+      Pipeline.GenerateEditFromEmbeds(Embeds, TextLengths, Width, Height,
+        StepCount, {Seed=}0, Image, Initial);
+      AssertEquals(CaseLabel + ' stats: condition images',
+        Pipeline.ConditionImageCount,
+        Pipeline.ImageStats.ConditionImageCount);
+      AssertFalse(CaseLabel + ' stats: no init image',
+        Pipeline.ImageStats.UsedInitImage);
+      ExpectedPhases := [qppLoadVisionTower, qppEncodeVision,
+        qppLoadVaeEncoder, qppEncodeImage, qppLoadTextEncoder, qppEncodePrompt,
+        qppLoadTransformer, qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode,
+        qppDone];
+      AssertEquals(CaseLabel + ' phase count', Length(ExpectedPhases),
+        Length(FQwenImage21Phases));
+      for StepPos := 0 to High(ExpectedPhases) do
+        AssertTrue(CaseLabel + ' phase ' + IntToStr(StepPos),
+          ExpectedPhases[StepPos] = FQwenImage21Phases[StepPos]);
+
+      // A resized image's latents equal the float-resize reference; PIL's
+      // 8-bit resize is the accepted divergence of the pipeline oracle.
+      if CaseObj.Get('resized', false) then
+        LatentArr := TJSONArray(CaseObj.Find('float_resize_condition_latents'))
+      else LatentArr := TJSONArray(CaseObj.Find('condition_latents'));
+      AssertEquals(CaseLabel + ' oracle condition latents',
+        Pipeline.ConditionImageCount, LatentArr.Count);
+      for StepPos := 0 to LatentArr.Count - 1 do
+      begin
+        LoadOracleTokenTensorObject(LatentArr.Items[StepPos],
+          'condition_latents', Expected);
+        AssertMaxDiff(Pipeline.ConditionLatents[StepPos], 1e-5,
+          'condition latents ' + IntToStr(StepPos));
+      end;
+      StepArr := TJSONArray(CaseObj.Find('step_latents'));
+      AssertEquals(CaseLabel + ' steps', StepArr.Count,
+        Length(FQwenImage21StepLatents));
+      for StepPos := 0 to StepArr.Count - 1 do
+      begin
+        LoadOracleTokenTensorObject(StepArr.Items[StepPos], 'step_latents',
+          Expected);
+        AssertMaxDiff(FQwenImage21StepLatents[StepPos], Tolerance,
+          'latents after step ' + IntToStr(StepPos));
+      end;
+      AssertEquals(CaseLabel + ' image width', Width, Image.SizeX);
+      AssertEquals(CaseLabel + ' image height', Height, Image.SizeY);
+      if Assigned(CaseObj.Find('image')) then
+      begin
+        LoadOracleImageTensor(CaseObj, 'image', Expected);
+        AssertMaxDiff(Image, Tolerance, 'image');
+      end;
+      FreeStepLatents();
+      FreeAndNil(Pipeline);
+    end;
+  finally
+    FreeStepLatents();
+    Pipeline.Free;
+    Image.Free;
+    Initial.Free;
+    OracleRows.Free;
+    Expected.Free;
+    Embeds.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Keep-loaded edits: the text-encoder owner takes images, the vision tower
+// and the VAE encoder load on the first EncodeConditionImages and stay, a
+// second encode loads nothing and gives the same latents, the image equals
+// the one-shot image bit for bit, and a reused prompt gives it again.
+procedure TTestNeuralPretrained.TestQwenImage21EditKeepLoaded;
+const
+  StepCount = 3;
+  Seed = 5;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  CaseObj: TJSONObject;
+  OneShot, Loaded: TQwenImage21Pipeline;
+  EmbedsOneShot, EmbedsLoaded, ImageOneShot, ImageLoaded,
+    ImageAgain: TNNetVolume;
+  LengthsOneShot, LengthsLoaded: TNeuralIntegerArray;
+  PhasePos, Width, Height: integer;
+  Area: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  OneShot := nil;
+  Loaded := nil;
+  EmbedsOneShot := TNNetVolume.Create;
+  EmbedsLoaded := TNNetVolume.Create;
+  ImageOneShot := TNNetVolume.Create;
+  ImageLoaded := TNNetVolume.Create;
+  ImageAgain := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_edit_pipeline_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Area := Sqr(TJSONObject(RefRoot).Get('output_resolution', 0));
+    CaseObj := TJSONObject(TJSONArray(TJSONObject(RefRoot).Find(
+      'cases')).Items[1]);
+    OneShot := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Loaded := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    EncodeQwenImage21EditCase(OneShot, CaseObj, Area, EmbedsOneShot,
+      LengthsOneShot);
+    Width := OneShot.ConditionOutputWidth;
+    Height := OneShot.ConditionOutputHeight;
+    OneShot.GenerateEditFromEmbeds(EmbedsOneShot, LengthsOneShot, Width,
+      Height, StepCount, Seed, ImageOneShot);
+
+    Loaded.LoadComponents();
+    AssertTrue('the loaded text encoder takes images',
+      Qwen3VLEncoderTakesImages(Loaded.LoadedTextEncoderWeights));
+    AssertTrue('LoadComponents leaves the vision tower out',
+      Loaded.LoadedVisionTower = nil);
+    SetLength(FQwenImage21Phases, 0);
+    Loaded.OnPhase := @RecordQwenImage21Phase;
+    EncodeQwenImage21EditCase(Loaded, CaseObj, Area, EmbedsLoaded,
+      LengthsLoaded);
+    AssertTrue('the first encode loads the tower and the VAE encoder',
+      (Length(FQwenImage21Phases) = 5) and
+      (FQwenImage21Phases[0] = qppLoadVisionTower) and
+      (FQwenImage21Phases[2] = qppLoadVaeEncoder) and
+      (FQwenImage21Phases[4] = qppEncodePrompt));
+    AssertTrue('the tower is kept', Assigned(Loaded.LoadedVisionTower));
+    AssertTrue('its net is freed', Loaded.LoadedVisionTower.Net = nil);
+    AssertTrue('the VAE encoder is kept', Assigned(Loaded.LoadedVaeEncoder));
+    SetLength(FQwenImage21Phases, 0);
+    EncodeQwenImage21EditCase(Loaded, CaseObj, Area, EmbedsLoaded,
+      LengthsLoaded);
+    AssertEquals('a later encode loads nothing', 3,
+      Length(FQwenImage21Phases));
+    for PhasePos := 0 to High(FQwenImage21Phases) do
+      AssertFalse('no load phase (phase ' + IntToStr(PhasePos) + ')',
+        FQwenImage21Phases[PhasePos] in [qppLoadVisionTower,
+        qppLoadVaeEncoder, qppLoadTextEncoder]);
+    AssertEquals('same text rows', 0, MaxAbsVolumeDiff(EmbedsLoaded,
+      EmbedsOneShot), 0);
+    AssertEquals('same text runs', Length(LengthsOneShot),
+      Length(LengthsLoaded));
+    Loaded.GenerateEditFromEmbeds(EmbedsLoaded, LengthsLoaded, Width, Height,
+      StepCount, Seed, ImageLoaded);
+    AssertEquals('loaded = one-shot image', 0, MaxAbsVolumeDiff(ImageLoaded,
+      ImageOneShot), 0);
+    AssertEquals('the edit counts its condition images', 2,
+      Loaded.ImageStats.ConditionImageCount);
+    SetLength(FQwenImage21Phases, 0);
+    Loaded.GenerateEditFromEmbeds(EmbedsLoaded, LengthsLoaded, Width, Height,
+      StepCount, Seed, ImageAgain);
+    for PhasePos := 0 to High(FQwenImage21Phases) do
+      AssertFalse('a reused prompt encodes no image (phase ' +
+        IntToStr(PhasePos) + ')', FQwenImage21Phases[PhasePos] in
+        [qppEncodeVision, qppEncodeImage, qppEncodePrompt]);
+    AssertEquals('a reused prompt gives the same image', 0,
+      MaxAbsVolumeDiff(ImageAgain, ImageOneShot), 0);
+    // Text-to-image through the image-capable owner after an edit.
+    Loaded.EncodeTokenIds([11, 48, 85, 122, 159, 196, 233, 270, 7, 44], 5,
+      EmbedsLoaded);
+    Loaded.GenerateFromEmbeds(EmbedsLoaded, 64, 32, StepCount, Seed,
+      ImageLoaded);
+    AssertEquals('text-to-image has no condition images', 0,
+      Loaded.ImageStats.ConditionImageCount);
+    AssertEquals('text-to-image drops the vision phase', 0,
+      Loaded.ImageStats.PhaseMs[qppEncodeVision], 0);
+    Loaded.UnloadImageEncoders();
+    AssertTrue('UnloadImageEncoders frees the tower',
+      Loaded.LoadedVisionTower = nil);
+    AssertTrue('... and the VAE encoder', Loaded.LoadedVaeEncoder = nil);
+    AssertTrue('... and keeps the components', Loaded.ComponentsLoaded);
+    SetLength(FQwenImage21Phases, 0);
+    EncodeQwenImage21EditCase(Loaded, CaseObj, Area, EmbedsLoaded,
+      LengthsLoaded);
+    AssertTrue('the next edit loads the tower again',
+      (Length(FQwenImage21Phases) > 0) and
+      (FQwenImage21Phases[0] = qppLoadVisionTower) and
+      Assigned(Loaded.LoadedVisionTower));
+    Loaded.GenerateEditFromEmbeds(EmbedsLoaded, LengthsLoaded, Width, Height,
+      StepCount, Seed, ImageAgain);
+    AssertEquals('... and gives the same image', 0,
+      MaxAbsVolumeDiff(ImageAgain, ImageOneShot), 0);
+    Loaded.UnloadComponents();
+    AssertTrue('UnloadComponents frees the tower',
+      Loaded.LoadedVisionTower = nil);
+    AssertEquals('the condition images outlive UnloadComponents', 2,
+      Loaded.ConditionImageCount);
+    Loaded.ClearConditionImages();
+    AssertEquals('ClearConditionImages', 0, Loaded.ConditionImageCount);
+  finally
+    Loaded.Free;
+    OneShot.Free;
+    ImageAgain.Free;
+    ImageLoaded.Free;
+    ImageOneShot.Free;
+    EmbedsLoaded.Free;
+    EmbedsOneShot.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// The edit size rule (the LAST image's aspect at the area, after a resize),
+// and the refusals: 0 or 11 images, no processor config, a size outside the
+// processor's pixel range, an edit prompt before any image, pad ids that do
+// not match the images, wrong text runs.
+procedure TTestNeuralPretrained.TestQwenImage21EditRefusals;
+var
+  Pipeline, NoProcessor: TQwenImage21Pipeline;
+  Wide, Tall, Embeds, Image: TNNetVolume;
+  Images: array of TNNetVolume;
+  TextLengths: TNeuralIntegerArray;
+  TempFolder, Message: string;
+  ImagePos: integer;
+
+  procedure CopyFixtureFile(const RelativePath: string);
+  var
+    Lines: TStringList;
+  begin
+    ForceDirectories(ExtractFileDir(TempFolder + RelativePath));
+    Lines := TStringList.Create;
+    try
+      Lines.LoadFromFile(ExtractFileDir(FixturePath(
+        'tiny_qwenimage21/model_index.json')) + PathDelim + RelativePath);
+      Lines.SaveToFile(TempFolder + RelativePath);
+    finally
+      Lines.Free;
+    end;
+  end;
+
+  function RefusalMessage(const Step: string): string;
+  begin
+    Result := '';
+    try
+      if Step = 'encode' then
+        Pipeline.EncodeConditionImages(Images, 4096)
+      else if Step = 'no processor' then
+        NoProcessor.EncodeConditionImages([Wide], 4096)
+      else if Step = 'check' then
+        NoProcessor.CheckEditSupport()
+      else if Step = 'too large' then
+        Pipeline.EncodeConditionImages([Wide, Tall], Sqr(5000.0))
+      else if Step = 'prompt' then
+        Pipeline.EncodeEditTokenIds([1, 290, 5], 0, Embeds, TextLengths)
+      else if Step = 'generate' then
+        Pipeline.GenerateEditFromEmbeds(Embeds, [1], 64, 64, 2, 0, Image);
+    except
+      on E: EPretrainedImportError do Result := E.Message;
+    end;
+  end;
+
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  NoProcessor := nil;
+  Wide := TNNetVolume.Create;
+  Tall := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Images := nil;
+  TempFolder := GetTempDir(false) + 'cai_qwenimage21_noproc_' +
+    IntToStr(Random(1000000)) + PathDelim;
+  try
+    FillQwen3VLVisionFormulaImage(Wide, 300, 100, 3);
+    FillQwen3VLVisionFormulaImage(Tall, 40, 80, 4);
+    AssertTrue('an edit prompt before any image is refused',
+      RefusalMessage('prompt') <> '');
+    AssertTrue('an edit before any image is refused',
+      RefusalMessage('generate') <> '');
+    AssertTrue('no image is refused', RefusalMessage('encode') <> '');
+    SetLength(Images, csQwenImage21MaxConditionImages + 1);
+    for ImagePos := 0 to High(Images) do
+      Images[ImagePos] := Wide;
+    Message := RefusalMessage('encode');
+    AssertTrue('11 images are refused: ' + Message, Pos('1..10', Message) > 0);
+
+    // 300x100 resized to 96x32, then 40x80 to 32x96: the size of the last.
+    Pipeline.EncodeConditionImages([Wide, Tall], 64 * 64);
+    AssertEquals('width from the last image', 32,
+      Pipeline.ConditionOutputWidth);
+    AssertEquals('height from the last image', 96,
+      Pipeline.ConditionOutputHeight);
+    Pipeline.EncodeConditionImages([Tall, Wide], 64 * 64);
+    AssertEquals('reversed: width', 96, Pipeline.ConditionOutputWidth);
+    AssertEquals('reversed: height', 32, Pipeline.ConditionOutputHeight);
+    AssertTrue('one pad for two images is refused',
+      RefusalMessage('prompt') <> '');
+    AssertTrue('two text runs for two images are refused',
+      RefusalMessage('generate') <> '');
+    Pipeline.EncodeEditTokenIds([1, 290, 2, 290, 5], 0, Embeds, TextLengths);
+    AssertEquals('three text runs', 3, Length(TextLengths));
+    AssertEquals('text rows', 3, Embeds.SizeX);
+    // 8672x2880 is above the pico processor's longest_edge 16777216 pixels.
+    Message := RefusalMessage('too large');
+    AssertTrue('a size the processor would resize is refused: ' + Message,
+      Pos('16777216', Message) > 0);
+    AssertEquals('the refusal keeps the encoded images', 2,
+      Pipeline.ConditionImageCount);
+    AssertEquals('... and their output size', 96,
+      Pipeline.ConditionOutputWidth);
+    Pipeline.CheckEditSupport();
+
+    CopyFixtureFile('model_index.json');
+    CopyFixtureFile('scheduler' + PathDelim + 'scheduler_config.json');
+    CopyFixtureFile('transformer' + PathDelim + 'config.json');
+    NoProcessor := TQwenImage21Pipeline.Create(TempFolder);
+    Message := RefusalMessage('no processor');
+    AssertTrue('a missing processor config is refused: ' + Message,
+      Pos('preprocessor_config.json', Message) > 0);
+    Message := RefusalMessage('check');
+    AssertTrue('CheckEditSupport refuses it too: ' + Message,
+      Pos('preprocessor_config.json', Message) > 0);
+  finally
+    DeleteFile(TempFolder + 'model_index.json');
+    DeleteFile(TempFolder + 'scheduler' + PathDelim + 'scheduler_config.json');
+    DeleteFile(TempFolder + 'transformer' + PathDelim + 'config.json');
+    RemoveDir(TempFolder + 'scheduler');
+    RemoveDir(TempFolder + 'transformer');
+    RemoveDir(TempFolder);
+    NoProcessor.Free;
+    Image.Free;
+    Embeds.Free;
+    Tall.Free;
+    Wide.Free;
+    Pipeline.Free;
+  end;
+end;
+
+// The edit pipeline with the int8 step pass and the VAE decode on OpenCL vs
+// the same pipeline on the CPU (two condition images).
+procedure TTestNeuralPretrained.TestQwenImage21EditPipelineOpenCL;
+{$IFDEF OpenCL}
+const
+  StepCount = 3;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  CaseObj: TJSONObject;
+  ImageCPU, ImageOpenCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Area, Diff: double;
+
+  procedure RunEdit(RequestOpenCL: boolean; Image: TNNetVolume);
+  var
+    Pipeline: TQwenImage21Pipeline;
+    Embeds: TNNetVolume;
+    TextLengths: TNeuralIntegerArray;
+  begin
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Embeds := TNNetVolume.Create;
+    try
+      Pipeline.TransformerFormat := qiwInt8;
+      if RequestOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+      EncodeQwenImage21EditCase(Pipeline, CaseObj, Area, Embeds, TextLengths);
+      Pipeline.GenerateEditFromEmbeds(Embeds, TextLengths,
+        Pipeline.ConditionOutputWidth, Pipeline.ConditionOutputHeight,
+        StepCount, {Seed=}3, Image);
+      AssertTrue('TransformerOnOpenCL',
+        Pipeline.TransformerOnOpenCL = RequestOpenCL);
+      AssertTrue('VaeOnOpenCL', Pipeline.VaeOnOpenCL = RequestOpenCL);
+    finally
+      Embeds.Free;
+      Pipeline.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  ImageCPU := TNNetVolume.Create;
+  ImageOpenCL := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_edit_pipeline_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Area := Sqr(TJSONObject(RefRoot).Get('output_resolution', 0));
+    CaseObj := TJSONObject(TJSONArray(TJSONObject(RefRoot).Find(
+      'cases')).Items[1]);
+    RunEdit(false, ImageCPU);
+    RunEdit(true, ImageOpenCL);
+    Diff := MaxAbsVolumeDiff(ImageOpenCL, ImageCPU);
+    WriteLn('  Qwen-Image-2.1 edit int8 OpenCL vs CPU image: max|diff|=',
+      Diff:0:9);
+    AssertTrue('edit int8 OpenCL vs CPU image max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-4', Diff < 1e-4);
+  finally
+    ImageOpenCL.Free;
+    ImageCPU.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // A token id outside 0..vocab-1 (a real-tokenizer id fed to the pico encoder)
 // is refused before the embedding reads past its table.
