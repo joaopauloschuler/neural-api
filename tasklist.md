@@ -2572,6 +2572,38 @@ rather than acted on.
         of the gaps with measured or estimated seconds each, and which are
         reachable in OpenCL (no tensor cores in portable OpenCL; NVIDIA-only
         inline PTX was an earlier idea).
+        Done as a read-only analysis 2026-10-04: a 1024^2 step is ~66 TFLOP, so
+        ~1 s/step needs tensor cores; our projections run at 3.8 TFLOPS (int8
+        tiled GEMM bound by one-byte weight loads, 2x16 micro-tile), attention at
+        3.0 TFLOPS. L4 clinfo (driver 580.82.07): no cl_khr_integer_dot_product,
+        no cl_khr_fp16, no sub-groups, OpenCL C 1.2, 48 KB local memory, max
+        single allocation 5.5 GB. Portable ceiling ~4-5 s/step.
+  - [ ] E2. Generic masked flash attention (FP32) in TNNetFusedSDPA (user-
+        authorized 2026-10-05). One tiled OpenCL kernel replacing
+        cai_sdpa_noncausal_tiled, with a mask mode (none / causal / per-row key
+        end / window), used for many query rows; cai_sdpa_decode_split stays for
+        one or few rows. Users: Qwen-Image step pass, Qwen3-VL vision tower, LLM
+        prefill (--prefill-window, ChatTerminal TTFT), the edit prefix (C4), the
+        VAE attention (F4). Target: attention 2.9 -> ~0.6-1.0 s/step at 1024^2
+        (unmeasured). Serial stages, each with a fresh read-only reviewer, the
+        three suites and a commit:
+    - [ ] E2.0 Read-only design: mask encoding, tile shapes and register /
+          local-memory budget (48 KB, 64K registers, OpenCL C 1.2, no
+          sub-groups), dispatch rule tiled vs decode-split, test plan, benchmark
+          spec. Brought to the user before coding.
+    - [ ] E2.1 Kernel (coder A): non-causal mode first, register tiling, vector
+          loads, fewer barriers, 2-3 tile variants behind an environment switch;
+          a small benchmark example timing the kernel at given shapes without a
+          model. User times the variants on the L4.
+    - [ ] E2.2 (coder A continued): lock in the winning tiles; causal mode and
+          the TNNetFusedSDPA dispatch for LLM prefill windows; parity on LLM
+          prefill and Qwen-Image. User measures ChatTerminal TTFT and a Qwen-Image
+          --profile run.
+    - [ ] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
+          int8 K/V tiles (ChatTerminal's default KV cache).
+    - [ ] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
+          single heads; the Qwen-Image VAE attention moves onto it (resolves
+          F4). One L4 VAE profile.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
