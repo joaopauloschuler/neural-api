@@ -2599,7 +2599,7 @@ rather than acted on.
           the TNNetFusedSDPA dispatch for LLM prefill windows; parity on LLM
           prefill and Qwen-Image. User measures ChatTerminal TTFT and a Qwen-Image
           --profile run.
-    - [ ] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
+    - [x] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
           int8 K/V tiles (ChatTerminal's default KV cache).
     - [ ] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
           single heads, then TNNetScaledDotProductAttention and TNNetDeepConcat

@@ -796,6 +796,8 @@ type
     procedure TestQwenImage21EditLayout;
     procedure TestQwenImage21EditTransformerParity;
     procedure TestQwenImage21EditTransformerOpenCL;
+    // TNNetFusedSDPA row key ends (mask mode 2) on OpenCL vs the host.
+    procedure TestQwenImage21PrefixRowKeyEndsOpenCL;
     procedure TestQwenImage21TransformerQuantizedDrift;
     procedure TestQwenImage21Int4DirectLoad;
     procedure TestQwenImage21Int4ImportRefusals;
@@ -29102,6 +29104,143 @@ begin
     RefRoot.Free;
   end;
 end;
+
+// Block-causal key ends on OpenCL flash vs the host twin: ends A, B, [] and A
+// again; FP32/int8, GQA, Dk 64/128, forced splits, a window. Bound 1e-5|1e-3.
+procedure TTestNeuralPretrained.TestQwenImage21PrefixRowKeyEndsOpenCL;
+{$IFDEF OpenCL}
+const
+  PrefixLen = 30;
+  CaseCnt = 10;
+  CaseInt8: array[0..CaseCnt - 1] of boolean =
+    (false, false, false, false, false, true, true, true, false, true);
+  CaseSplits: array[0..CaseCnt - 1] of integer =
+    (0, 1, 3, 7, 3, 0, 7, 3, 0, 3);
+  CaseWindow: array[0..CaseCnt - 1] of integer =
+    (0, 0, 0, 0, 40, 0, 0, 40, 0, 0);
+  CaseQHeads: array[0..CaseCnt - 1] of integer =
+    (4, 4, 4, 4, 4, 4, 4, 4, 8, 8);
+  CaseKVHeads: array[0..CaseCnt - 1] of integer =
+    (2, 2, 2, 2, 2, 2, 2, 2, 2, 2);
+  CaseHeadDim: array[0..CaseCnt - 1] of integer =
+    (64, 64, 64, 64, 64, 64, 64, 64, 128, 128);
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  EndsA, EndsB: TNeuralIntegerArray;
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn, PrefixK, PrefixV: TNNetVolume;
+  SeqLen, InDepth, KW, CaseIdx, CasePos, GpuForwards: integer;
+  Hq, Hkv, HeadDim: integer;
+  Diff, MaxDiff, MaxAbsY: TNeuralFloat;
+  What: string;
+
+  procedure RunStep(const Ends: array of integer; const StepName: string);
+  var
+    Pos, MaxPos: integer;
+  begin
+    LCpu.SetRowKeyEnds(Ends);
+    LGpu.SetRowKeyEnds(Ends);
+    LCpu.TruncateCache(0);
+    LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+    LGpu.TruncateCache(0);
+    LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+    AssertTrue(What + StepName + ': WillOpenCL', LGpu.WillOpenCL());
+    NNCpu.Compute(StepIn);
+    NNGpu.Compute(StepIn);
+    Inc(GpuForwards);
+    AssertEquals(What + StepName + ': ran on OpenCL', GpuForwards,
+      LGpu.ForwardGPUCnt);
+    AssertEquals(What + StepName + ': flash path', Ord(sdpaPathFlash),
+      Ord(LGpu.FusedSDPACL.LastPath));
+    if CaseSplits[CaseIdx] > 0 then
+      AssertEquals(What + StepName + ': key splits', CaseSplits[CaseIdx],
+        LGpu.FusedSDPACL.LastFlashSplits);
+    MaxDiff := 0;
+    MaxAbsY := 0;
+    MaxPos := LCpu.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+    begin
+      Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
+      if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+      MaxAbsY := Max(MaxAbsY, Abs(LCpu.Output.FData[Pos]));
+    end;
+    WriteLn('  row key ends OpenCL ', What, StepName, ': max|diff|=',
+      MaxDiff:0:9, ' splits=', LGpu.FusedSDPACL.LastFlashSplits);
+    AssertTrue(What + StepName + ': max|diff| ' + FloatToStr(MaxDiff),
+      MaxDiff < IfThen(CaseInt8[CaseIdx], 1e-3, 1e-5) * Max(1, MaxAbsY));
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // 5 text, 8x6 image, 4 text, 3x3 image, 3 text; then 20, 5x6, 7, 3x3, 3.
+  EndsA := QwenImage21PrefixRowKeyEnds([5, 4, 3], [8, 3], [6, 3]);
+  EndsB := QwenImage21PrefixRowKeyEnds([20, 7, 3], [5, 3], [6, 3]);
+  SeqLen := Length(EndsA);
+  AssertEquals('both layouts have the same rows', SeqLen, Length(EndsB));
+  RandSeed := 20261007;
+  StepIn := TNNetVolume.Create();
+  PrefixK := TNNetVolume.Create();
+  PrefixV := TNNetVolume.Create();
+  try
+    for CasePos := 0 to CaseCnt - 1 do
+    begin
+      CaseIdx := CasePos;
+      Hq := CaseQHeads[CaseIdx];
+      Hkv := CaseKVHeads[CaseIdx];
+      HeadDim := CaseHeadDim[CaseIdx];
+      InDepth := (Hq + 2 * Hkv) * HeadDim;
+      KW := Hkv * HeadDim;
+      StepIn.ReSize(SeqLen, 1, InDepth);
+      PrefixK.ReSize(PrefixLen, 1, KW);
+      PrefixV.ReSize(PrefixLen, 1, KW);
+      StepIn.RandomizeGaussian(1.5);
+      PrefixK.RandomizeGaussian(1.5);
+      PrefixV.RandomizeGaussian(1.5);
+      What := Format('Hq=%d Hkv=%d Dk=%d int8=%s splits=%d window=%d ',
+        [Hq, Hkv, HeadDim, BoolToStr(CaseInt8[CaseIdx], true),
+        CaseSplits[CaseIdx], CaseWindow[CaseIdx]]);
+      NNCpu := TNNet.Create();
+      NNGpu := TNNet.Create();
+      try
+        NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+        LCpu := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, {Causal=}true,
+          CaseWindow[CaseIdx]);
+        LCpu.BeginIncrementalDecode(PrefixLen + SeqLen, CaseInt8[CaseIdx]);
+        NNCpu.AddLayer(LCpu);
+        NNCpu.SetTrainable(False, False);
+        NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+        LGpu := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, {Causal=}true,
+          CaseWindow[CaseIdx]);
+        LGpu.BeginIncrementalDecode(PrefixLen + SeqLen, CaseInt8[CaseIdx]);
+        NNGpu.AddLayer(LGpu);
+        NNGpu.SetTrainable(False, False);
+        NNGpu.EnableOpenCL(PlatformId, DeviceId);
+        LGpu.FusedSDPACL.ForcedFlashSplits := CaseSplits[CaseIdx];
+        GpuForwards := 0;
+        RunStep(EndsA, 'ends A');
+        RunStep(EndsB, 'ends B');
+        RunStep([], 'causal');
+        RunStep(EndsA, 'ends A again');
+      finally
+        NNGpu.Free;
+        NNCpu.Free;
+      end;
+    end;
+  finally
+    PrefixV.Free; PrefixK.Free; StepIn.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // The two-image prefix (host block-causal attention) feeds a step pass on
 // OpenCL: int8 velocities match the int8 CPU run, both steps, and the step

@@ -1,32 +1,35 @@
 program SDPAFlashBench;
 (*
 SDPAFlashBench: times the OpenCL flash attention of TNNetFusedSDPA
-(TNNetFusedSDPACL.ComputeFlash, cai_sdpa_flash_v1..v3 = FlashVariant 1..3)
-over a resident KV cache, in mask mode none or causal. No model is loaded.
+(TNNetFusedSDPACL.ComputeFlash on cai_sdpa_flash, or with --int8
+ComputeFlashInt8 on cai_sdpa_flash_int8 over the int8 KV cache) over a
+resident KV cache, in mask mode none or causal. No model is loaded.
 
-Before timing, every variant runs once on a small shape against the CPU twin
-(TNNetFusedSDPA on the host) at the requested head dimension; a variant whose
-max |diff| exceeds 1e-5 * max(1, max |y|) is reported as FAIL and not timed.
+Before timing, the kernel runs once on a small shape against the CPU twin
+(TNNetFusedSDPA on the host, same cache format) at the requested head
+dimension; a max |diff| above 1e-5 (int8: 1e-3) * max(1, max |y|) is reported
+as FAIL and nothing is timed.
 
 Timing is the wall time of the in-order OpenCL pipeline, enqueue included:
 the packed [Q|K|V] input is uploaded once and bound as the step source, the
 KV cache prefix is uploaded once, and the result stays in OpenCL memory; each
 forward also re-appends the step's K/V rows into the same cache slots (one
-cai_sdpa_append_kv launch, small next to the attention). The figure is the
-median of 3 timed blocks, each at least --iters forwards and at least
-200 ms. FLOPs = 4 * QHeads * Dk * (sum over token rows of the cache rows each
-row attends).
+cai_sdpa_append_kv(_int8) launch, small next to the attention). With --int8
+the cache holds random codes and row scales near 1/127 (values of order 1).
+The figure is the median of 3 timed blocks, each at least --iters forwards
+and at least 200 ms. FLOPs = 4 * QHeads * Dk * (sum over token rows of the
+cache rows each row attends).
 
 Memory guard: a shape runs only if its host volumes (X, Y, K and V cache) fit
 600 MB, counted twice on a CPU OpenCL device, whose buffers are host RAM too.
 The default shape needs about 400 MB of host volumes.
 
 --sweep-crossover times the flash path against the split-row decode path
-(TNNetFusedSDPACL.Compute, cai_sdpa_decode_split + merge) for 1..512 token
-rows over 8k and 32k caches. With --mode causal both compute the same
-attention; with --mode none the flash rows see the whole window while the
-decode path stays causal. Key splits (merged by cai_sdpa_decode_merge) are
-printed per flash run.
+(TNNetFusedSDPACL.Compute / ComputeInt8, cai_sdpa_decode_split(_int8) +
+merge) for 1..512 token rows over 8k and 32k caches. With --mode causal both
+compute the same attention; with --mode none the flash rows see the whole
+window while the decode path stays causal. Key splits (merged by
+cai_sdpa_decode_merge) are printed per flash run.
 
 Diagnostics: NEURAL_SDPA_DUMP_PTX=<file> writes the built program (PTX on
 NVIDIA). NEURAL_OPENCL_BUILD_LOG=1 prints the first build log of the process;
@@ -35,14 +38,13 @@ register and spill report (set CUDA_CACHE_DISABLE=1 so the driver compiles
 instead of reusing its cache). NEURAL_OPENCL_BUILD_OPTIONS is appended to every
 program build in the process, is cut at 255 characters with the default
 options, and an option the driver does not know (-cl-nv-verbose on PoCL)
-fails every build. The table prints CL_KERNEL_PRIVATE_MEM_SIZE of every flash
-variant.
+fails every build. The table prints CL_KERNEL_PRIVATE_MEM_SIZE of the flash
+kernel.
 
 Usage:
   SDPAFlashBench [--q-heads 32] [--kv-heads 32] [--dk 128] [--tokens 4096]
     [--prefix 0] [--mode none|causal] [--window 0] [--iters 20] [--warmup 3]
-    [--variants 1,2,3] [--sweep-crossover] [--gpu-platform 0]
-    [--gpu-device 0]
+    [--int8] [--sweep-crossover] [--gpu-platform 0] [--gpu-device 0]
 
 Coded by Claude (AI).
 *)
@@ -65,14 +67,10 @@ const
   csMinBlockSeconds = 0.2;
   csTimedBlocks = 3;
 
-type
-  TVariantList = array of integer;
-
 var
   QHeads, KVHeads, Dk, TokenCnt, PrefixLen, Window, Iters, Warmup: integer;
   PlatformIdx, DeviceIdx: integer;
-  SweepCrossover, Causal: boolean;
-  Variants: TVariantList;
+  SweepCrossover, Causal, Int8KV: boolean;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   DeviceName: string;
@@ -82,27 +80,9 @@ begin
   if Problem <> '' then WriteLn('Error: ', Problem);
   WriteLn('Usage: SDPAFlashBench [--q-heads N] [--kv-heads N] [--dk N] ' +
     '[--tokens N] [--prefix N] [--mode none|causal] [--window N] ' +
-    '[--iters N] [--warmup N] [--variants 1,2,3] [--sweep-crossover] ' +
+    '[--iters N] [--warmup N] [--int8] [--sweep-crossover] ' +
     '[--gpu-platform N] [--gpu-device N]');
   Halt(2);
-end;
-
-function ParseVariants(const Text: string): TVariantList;
-var
-  Parts: TStringArray;
-  PartIdx, Variant: integer;
-begin
-  Result := nil;
-  Parts := Text.Split([',']);
-  SetLength(Result, Length(Parts));
-  for PartIdx := 0 to High(Parts) do
-  begin
-    if (not TryStrToInt(Trim(Parts[PartIdx]), Variant)) or (Variant < 1) or
-      (Variant > csFusedSDPAFlashVariants) then
-      PrintUsageAndHalt('--variants takes numbers 1..' +
-        IntToStr(csFusedSDPAFlashVariants));
-    Result[PartIdx] := Variant;
-  end;
 end;
 
 procedure ParseArguments();
@@ -130,7 +110,7 @@ begin
   DeviceIdx := 0;
   SweepCrossover := false;
   Causal := false;
-  Variants := ParseVariants('1,2,3');
+  Int8KV := false;
   ArgIdx := 1;
   while ArgIdx <= ParamCount do
   begin
@@ -146,12 +126,7 @@ begin
     else if Arg = '--gpu-platform' then PlatformIdx := NextInt()
     else if Arg = '--gpu-device' then DeviceIdx := NextInt()
     else if Arg = '--sweep-crossover' then SweepCrossover := true
-    else if Arg = '--variants' then
-    begin
-      Inc(ArgIdx);
-      if ArgIdx > ParamCount then PrintUsageAndHalt('--variants needs a list');
-      Variants := ParseVariants(ParamStr(ArgIdx));
-    end
+    else if Arg = '--int8' then Int8KV := true
     else if Arg = '--mode' then
     begin
       Inc(ArgIdx);
@@ -200,10 +175,10 @@ begin
       Window);
 end;
 
-// Max |CPU - OpenCL| of one forward of the parity shape at Variant,
-// and the variant that actually ran; MaxAbsY receives max |y| of the CPU.
-function ParityMaxDiff(Variant: integer; out MaxAbsY: TNeuralFloat;
-  out RanVariant: integer): TNeuralFloat;
+// Max |CPU - OpenCL| of one forward of the parity shape; MaxAbsY receives
+// max |y| of the CPU, RanFlash whether the OpenCL forward took flash.
+function ParityMaxDiff(out MaxAbsY: TNeuralFloat;
+  out RanFlash: boolean): TNeuralFloat;
 var
   NNCpu, NNGpu: TNNet;
   LCpu, LGpu: TNNetFusedSDPA;
@@ -221,17 +196,16 @@ begin
     NNCpu.AddLayer(TNNetInput.Create(csParityTokens, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(csParityQHeads, csParityKVHeads, Dk, False,
       Window, 0, {pCachedForwardNonCausal=}not Causal);
-    LCpu.BeginIncrementalDecode(csParityPrefix + csParityTokens);
+    LCpu.BeginIncrementalDecode(csParityPrefix + csParityTokens, Int8KV);
     NNCpu.AddLayer(LCpu);
     NNCpu.SetTrainable(False, False);
     NNGpu.AddLayer(TNNetInput.Create(csParityTokens, 1, InDepth, 1));
     LGpu := TNNetFusedSDPA.Create(csParityQHeads, csParityKVHeads, Dk, False,
       Window, 0, {pCachedForwardNonCausal=}not Causal);
-    LGpu.BeginIncrementalDecode(csParityPrefix + csParityTokens);
+    LGpu.BeginIncrementalDecode(csParityPrefix + csParityTokens, Int8KV);
     NNGpu.AddLayer(LGpu);
     NNGpu.SetTrainable(False, False);
     NNGpu.EnableOpenCL(PlatformId, DeviceId);
-    LGpu.FusedSDPACL.FlashVariant := Variant;
     StepIn.Randomize();
     PrefixK.Randomize();
     PrefixV.Randomize();
@@ -239,9 +213,8 @@ begin
     LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
     NNCpu.Compute(StepIn);
     NNGpu.Compute(StepIn);
-    if (LGpu.ForwardGPUCnt = 0) or (LGpu.FusedSDPACL.LastPath <> sdpaPathFlash)
-      then RanVariant := -1
-      else RanVariant := LGpu.FusedSDPACL.LastFlashVariant;
+    RanFlash := (LGpu.ForwardGPUCnt > 0) and
+      (LGpu.FusedSDPACL.LastPath = sdpaPathFlash);
     Result := 0;
     MaxAbsY := 0;
     for Pos := 0 to LCpu.Output.Size - 1 do
@@ -260,8 +233,20 @@ type
   TTimingShape = record
     Tokens, CacheMax, CacheLen: integer;
     X, Y, K, V: TNNetVolume;
+    KQ, VQ: TNNetVolumeQuant8;
     BufX: cl_mem;
   end;
+
+// Random codes in [-127, 127] and row scales of about 1/127.
+procedure RandomizeInt8Cache(Cache: TNNetVolumeQuant8);
+var
+  Pos, MaxPos: integer;
+begin
+  MaxPos := Cache.Size - 1;
+  for Pos := 0 to MaxPos do Cache.SetRaw(Pos, Random(255) - 127);
+  MaxPos := Cache.ScaleCount - 1;
+  for Pos := 0 to MaxPos do Cache.ScalePtr^[Pos] := (0.5 + Random) / 127;
+end;
 
 procedure CreateShape(Helper: TNNetFusedSDPACL; Tokens, CacheLen: integer;
   out Shape: TTimingShape);
@@ -271,19 +256,38 @@ begin
   Shape.CacheMax := CacheLen + Tokens;
   Shape.X := TNNetVolume.Create(Tokens, 1, (QHeads + 2 * KVHeads) * Dk);
   Shape.Y := TNNetVolume.Create(Tokens, 1, QHeads * Dk);
-  Shape.K := TNNetVolume.Create(KVHeads * Shape.CacheMax * Dk, 1, 1);
-  Shape.V := TNNetVolume.Create(KVHeads * Shape.CacheMax * Dk, 1, 1);
   Shape.X.Randomize();
-  Shape.K.Randomize();
-  Shape.V.Randomize();
   Shape.BufX := Helper.ForwardKernel.CreateBuffer(CL_MEM_READ_WRITE, Shape.X);
   Helper.ForwardKernel.WriteBuffer(Shape.BufX, Shape.X, CL_TRUE);
-  Helper.UploadCache(Shape.K, Shape.V, KVHeads, Shape.CacheMax, CacheLen, Dk);
+  Shape.K := nil;
+  Shape.V := nil;
+  Shape.KQ := nil;
+  Shape.VQ := nil;
+  if Int8KV then
+  begin
+    Shape.KQ := TNNetVolumeQuant8.Create();
+    Shape.VQ := TNNetVolumeQuant8.Create();
+    Shape.KQ.ReSize(Shape.CacheMax, KVHeads, Dk);
+    Shape.VQ.ReSize(Shape.CacheMax, KVHeads, Dk);
+    RandomizeInt8Cache(Shape.KQ);
+    RandomizeInt8Cache(Shape.VQ);
+    Helper.UploadCacheInt8(Shape.KQ, Shape.VQ, KVHeads, Shape.CacheMax,
+      CacheLen, Dk);
+  end
+  else
+  begin
+    Shape.K := TNNetVolume.Create(KVHeads * Shape.CacheMax * Dk, 1, 1);
+    Shape.V := TNNetVolume.Create(KVHeads * Shape.CacheMax * Dk, 1, 1);
+    Shape.K.Randomize();
+    Shape.V.Randomize();
+    Helper.UploadCache(Shape.K, Shape.V, KVHeads, Shape.CacheMax, CacheLen, Dk);
+  end;
 end;
 
 procedure FreeShape(var Shape: TTimingShape);
 begin
   clReleaseMemObject(Shape.BufX);
+  Shape.VQ.Free; Shape.KQ.Free;
   Shape.V.Free; Shape.K.Free; Shape.Y.Free; Shape.X.Free;
 end;
 
@@ -295,14 +299,23 @@ var
   InvSqrtDk: TNeuralFloat;
 begin
   InvSqrtDk := 1 / Sqrt(Dk);
-  if Decode then
+  if Decode and Int8KV then
+    Helper.ComputeInt8(Shape.X, Shape.Y, Shape.KQ, Shape.VQ, QHeads, KVHeads,
+      QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen, QHeads * Dk,
+      KVHeads * Dk, Window, InvSqrtDk, 0, 0, Shape.BufX, true)
+  else if Decode then
     Helper.Compute(Shape.X, Shape.Y, Shape.K, Shape.V, QHeads, KVHeads,
       QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen, QHeads * Dk,
       KVHeads * Dk, Window, InvSqrtDk, 0, 0, Shape.BufX, true)
+  else if Int8KV then
+    Helper.ComputeFlashInt8(Shape.X, Shape.Y, Shape.KQ, Shape.VQ, QHeads,
+      KVHeads, QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen,
+      QHeads * Dk, KVHeads * Dk, Window, Causal, [], 0, InvSqrtDk, 0, 0,
+      Shape.BufX, true)
   else
     Helper.ComputeFlash(Shape.X, Shape.Y, Shape.K, Shape.V, QHeads,
       KVHeads, QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen,
-      QHeads * Dk, KVHeads * Dk, Window, Causal, InvSqrtDk, 0, 0,
+      QHeads * Dk, KVHeads * Dk, Window, Causal, [], 0, InvSqrtDk, 0, 0,
       Shape.BufX, true);
 end;
 
@@ -356,42 +369,41 @@ end;
 // Host RAM a timing shape takes: its volumes, twice on a CPU device.
 function HostBytes(Tokens, CacheMax: integer): int64;
 begin
-  Result := (int64(Tokens) * ((QHeads + 2 * KVHeads) * Dk + QHeads * Dk) +
-    2 * int64(KVHeads) * CacheMax * Dk) * SizeOf(TNeuralFloat);
+  Result := int64(Tokens) * ((QHeads + 2 * KVHeads) * Dk + QHeads * Dk) *
+    SizeOf(TNeuralFloat);
+  if Int8KV
+    then Inc(Result, 2 * int64(KVHeads) * CacheMax * (Dk + SizeOf(TNeuralFloat)))
+    else Inc(Result, 2 * int64(KVHeads) * CacheMax * Dk * SizeOf(TNeuralFloat));
   if DeviceIsCPU() then Result := 2 * Result;
 end;
 
-function PrivateMemText(Helper: TNNetFusedSDPACL; Variant: integer): string;
+function PrivateMemText(Helper: TNNetFusedSDPACL): string;
 begin
   Result := IntToStr(Helper.ForwardKernel.KernelPrivateMemSize(
-    Helper.FlashKernel(Variant)));
+    Helper.FlashKernel(Int8KV)));
 end;
 
-procedure RunParity(var Passed: array of boolean);
+function RunParity(): boolean;
 var
-  VariantIdx, RanVariant: integer;
+  RanFlash: boolean;
   MaxDiff, MaxAbsY, Bound: TNeuralFloat;
 begin
   WriteLn(Format('Parity vs CPU: Hq=%d Hkv=%d Dk=%d tokens=%d prefix=%d ' +
-    'window=%d mode=%s', [csParityQHeads, csParityKVHeads, Dk, csParityTokens,
-    csParityPrefix, Window, BoolToStr(Causal, 'causal', 'none')]));
-  for VariantIdx := 0 to High(Variants) do
-  begin
-    RandSeed := 20261005;
-    MaxDiff := ParityMaxDiff(Variants[VariantIdx], MaxAbsY, RanVariant);
-    Bound := 1e-5 * Max(1, MaxAbsY);
-    Passed[VariantIdx] := (MaxDiff <= Bound) and (RanVariant >= 0);
-    WriteLn(Format('  variant %d (ran %d): max|diff| = %.3e (bound %.1e) %s',
-      [Variants[VariantIdx], RanVariant, MaxDiff, Bound,
-       BoolToStr(Passed[VariantIdx], 'PASS', 'FAIL')]));
-  end;
+    'window=%d mode=%s cache=%s', [csParityQHeads, csParityKVHeads, Dk,
+    csParityTokens, csParityPrefix, Window,
+    BoolToStr(Causal, 'causal', 'none'), BoolToStr(Int8KV, 'int8', 'fp32')]));
+  RandSeed := 20261005;
+  MaxDiff := ParityMaxDiff(MaxAbsY, RanFlash);
+  Bound := IfThen(Int8KV, 1e-3, 1e-5) * Max(1, MaxAbsY);
+  Result := (MaxDiff <= Bound) and RanFlash;
+  WriteLn(Format('  flash ran: %s, max|diff| = %.3e (bound %.1e) %s',
+    [BoolToStr(RanFlash, 'yes', 'no'), MaxDiff, Bound,
+     BoolToStr(Result, 'PASS', 'FAIL')]));
 end;
 
-procedure RunMainTiming(Helper: TNNetFusedSDPACL;
-  const Passed: array of boolean);
+procedure RunMainTiming(Helper: TNNetFusedSDPACL);
 var
   Shape: TTimingShape;
-  VariantIdx, Variant: integer;
   LiveKeys: int64;
   Ms: double;
 begin
@@ -405,41 +417,29 @@ begin
   try
     LiveKeys := StepLiveKeys(PrefixLen, TokenCnt);
     WriteLn(Format('Timing: Hq=%d Hkv=%d Dk=%d tokens=%d prefix=%d window=%d ' +
-      'mode=%s, %d live keys per row on average', [QHeads, KVHeads, Dk,
-      TokenCnt, PrefixLen, Window, BoolToStr(Causal, 'causal', 'none'),
-      LiveKeys div TokenCnt]));
-    WriteLn('  variant ran  tiles  splits  local B  private B       ms   TFLOPS');
-    for VariantIdx := 0 to High(Variants) do
-    begin
-      Variant := Variants[VariantIdx];
-      if not Passed[VariantIdx] then
-      begin
-        WriteLn(Format('  %7d  parity FAIL: not timed', [Variant]));
-        continue;
-      end;
-      Helper.FlashVariant := Variant;
-      Ms := TimeForwards(Helper, Shape, {Decode=}false);
-      WriteLn(Format('  %7d %3d %3dx%-3d %6d %8d %10s %8.3f %8.2f', [Variant,
-        Helper.LastFlashVariant, Helper.LastQueryTileRows,
-        Helper.LastKeyTileRows, Helper.LastFlashSplits,
-        int64(Helper.LastScratchBytes),
-        PrivateMemText(Helper, Variant), Ms, Tflops(LiveKeys, Ms)]));
-    end;
+      'mode=%s cache=%s, %d live keys per row on average', [QHeads, KVHeads,
+      Dk, TokenCnt, PrefixLen, Window, BoolToStr(Causal, 'causal', 'none'),
+      BoolToStr(Int8KV, 'int8', 'fp32'), LiveKeys div TokenCnt]));
+    WriteLn('    tiles  splits  local B  private B       ms   TFLOPS');
+    Ms := TimeForwards(Helper, Shape, {Decode=}false);
+    WriteLn(Format('  %3dx%-3d %6d %8d %10s %8.3f %8.2f', [
+      Helper.LastQueryTileRows, Helper.LastKeyTileRows,
+      Helper.LastFlashSplits, int64(Helper.LastScratchBytes),
+      PrivateMemText(Helper), Ms, Tflops(LiveKeys, Ms)]));
   finally
     FreeShape(Shape);
   end;
 end;
 
-procedure RunSweep(Helper: TNNetFusedSDPACL; const Passed: array of boolean);
+procedure RunSweep(Helper: TNNetFusedSDPACL);
 const
   csSweepCaches: array[0..1] of integer = (8192, 32768);
-  csSweepTokens: array[0..9] of integer = (1, 4, 8, 16, 32, 64, 128, 256,
-    384, 512);
+  csSweepTokens: array[0..11] of integer = (1, 2, 3, 4, 8, 16, 32, 64, 128,
+    256, 384, 512);
 var
   Shape: TTimingShape;
-  CacheIdx, TokenIdx, VariantIdx, Tokens: integer;
+  CacheIdx, TokenIdx, Tokens: integer;
   Ms, DecodeMs: double;
-  Line: string;
 begin
   WriteLn;
   WriteLn(Format('Crossover sweep, flash (mode %s) against the split-row ' +
@@ -457,29 +457,17 @@ begin
         csMaxHostBytes shr 20]));
       continue;
     end;
-    Line := Format('  cache %6d  tokens  decode ms', [csSweepCaches[CacheIdx]]);
-    for VariantIdx := 0 to High(Variants) do
-      Line := Line + Format('      v%d ms', [Variants[VariantIdx]]);
-    WriteLn(Line);
+    WriteLn(Format('  cache %6d  tokens  decode ms    flash ms',
+      [csSweepCaches[CacheIdx]]));
     for TokenIdx := 0 to High(csSweepTokens) do
     begin
       Tokens := csSweepTokens[TokenIdx];
       CreateShape(Helper, Tokens, csSweepCaches[CacheIdx], Shape);
       try
         DecodeMs := TimeForwards(Helper, Shape, {Decode=}true);
-        Line := Format('               %6d %10.4f', [Tokens, DecodeMs]);
-        for VariantIdx := 0 to High(Variants) do
-        begin
-          if not Passed[VariantIdx] then
-          begin
-            Line := Line + '        FAIL';
-            continue;
-          end;
-          Helper.FlashVariant := Variants[VariantIdx];
-          Ms := TimeForwards(Helper, Shape, {Decode=}false);
-          Line := Line + Format(' %8.4f/%-2d', [Ms, Helper.LastFlashSplits]);
-        end;
-        WriteLn(Line);
+        Ms := TimeForwards(Helper, Shape, {Decode=}false);
+        WriteLn(Format('               %6d %10.4f %8.4f/%-2d', [Tokens,
+          DecodeMs, Ms, Helper.LastFlashSplits]));
       finally
         FreeShape(Shape);
       end;
@@ -491,12 +479,8 @@ procedure RunBenchmark();
 var
   NN: TNNet;
   Helper: TNNetFusedSDPACL;
-  Passed: array of boolean;
-  VariantIdx, Variant: integer;
 begin
-  Passed := nil;
-  SetLength(Passed, Length(Variants));
-  RunParity(Passed);
+  if not RunParity() then Halt(1);
   NN := TNNet.Create();
   try
     NN.AddLayer(TNNetInput.Create(1, 1, 1));
@@ -506,26 +490,20 @@ begin
       WriteLn('Device: ', DeviceName, ', local memory ',
         Helper.ForwardKernel.DeviceLocalMemSize(), ' B, compute units ',
         Helper.ForwardKernel.DeviceMaxComputeUnits());
-      for VariantIdx := 0 to High(Variants) do
-      begin
-        Variant := Variants[VariantIdx];
-        WriteLn(Format('  cai_sdpa_flash_v%d: %d lanes, max work-group %d, ' +
-          'private %s B, tiles fit at Dk %d: %s', [Variant,
-          csFusedSDPAFlashLanes[Variant],
-          Helper.ForwardKernel.KernelMaxWorkGroupSize(
-            Helper.FlashKernel(Variant)), PrivateMemText(Helper, Variant), Dk,
-          BoolToStr(Helper.FlashTilesFit(Variant, Dk, false), 'yes', 'no')]));
-      end;
-      RunMainTiming(Helper, Passed);
-      if SweepCrossover then RunSweep(Helper, Passed);
+      WriteLn(Format('  %s: %d lanes, max work-group %d, private %s B, ' +
+        'tiles fit at Dk %d: %s', [BoolToStr(Int8KV, 'cai_sdpa_flash_int8',
+        'cai_sdpa_flash'), csFusedSDPAFlashLanes,
+        Helper.ForwardKernel.KernelMaxWorkGroupSize(Helper.FlashKernel(Int8KV)),
+        PrivateMemText(Helper), Dk,
+        BoolToStr(Helper.FlashTilesFit(Dk, Int8KV), 'yes', 'no')]));
+      RunMainTiming(Helper);
+      if SweepCrossover then RunSweep(Helper);
     finally
       Helper.Free;
     end;
   finally
     NN.Free;
   end;
-  for VariantIdx := 0 to High(Passed) do
-    if not Passed[VariantIdx] then Halt(1);
 end;
 
 var

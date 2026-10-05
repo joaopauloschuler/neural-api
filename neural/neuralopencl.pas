@@ -1635,8 +1635,9 @@ const
   /// when a wide prefill window would otherwise get a few very long chunks.
   csFusedSDPAMaxChunkRows = 512;
   /// Flash SDPA (TNNetFusedSDPA): a causal step of at least FlashMinTokens rows
-  /// takes the flash kernel, and its key splits are at least MinSplitKeys keys.
-  csFusedSDPAFlashMinTokens = 16;
+  /// takes the flash kernel (one decode token keeps the split decode), and its
+  /// key splits are at least MinSplitKeys keys.
+  csFusedSDPAFlashMinTokens = 2;
   csFusedSDPAFlashMinSplitKeys = 256;
 
 var
