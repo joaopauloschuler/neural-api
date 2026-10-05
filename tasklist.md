@@ -2554,7 +2554,7 @@ rather than acted on.
   - [x] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
         beta=0 on every block weight swap (20 MB per image): weightless variant
         or no re-upload when unchanged.
-  - [ ] F6. VAE weights shared across the tile-shape nets: each of the 4 nets
+  - [x] F6. VAE weights shared across the tile-shape nets: each of the 4 nets
         prepares and uploads the same 945 MB of conv weights (weight prep
         11.3 s of the 26.2 s decode on the L4).
   Phase E — speed gap against other implementations:

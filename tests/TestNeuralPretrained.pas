@@ -800,6 +800,9 @@ type
     // ShareHostOutputs on vs off, on the CPU and on OpenCL: same images (whole
     // and tiled, serial and parallel); fewer host bytes. Coded by Claude (AI).
     procedure TestQwenImage21VaeDecoderSharedHostOutputs;
+    // The tile-shape nets borrow WeightOwner's OpenCL weights: one weight
+    // upload per decode, CPU parity, ReleaseOpenCLWeights with Net alive.
+    procedure TestQwenImage21VaeDecoderOpenCLSharedWeights;
     procedure TestQwenImage21VaeAvgDownMapping;
     procedure TestQwenImage21VaeEncoderTensorSet;
     procedure TestQwenImage21VaeEncoderParity;
@@ -30087,6 +30090,159 @@ begin
     TiledOff.Free;
     WholeOn.Free;
     WholeOff.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCLSharedWeights;
+{$IFDEF OpenCL}
+const
+  Tolerance = 5e-5;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, Corner, TiledCPU, CornerCPU, Image: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, MaxLayerPos, ConvCount, BoundConvCount: integer;
+  WeightBytes, ArmingUploadBytes, ArmedUploadBytes, RearmUploadBytes: int64;
+  TransfersBefore: TOpenCLTransferCounts;
+  WasCounting: boolean;
+  MaxDiff: double;
+  Layer: TNNetLayer;
+
+  function UploadBytesSince(): int64;
+  begin
+    Result := OpenCLProcessTransferTotals().UploadBytes -
+      TransfersBefore.UploadBytes;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  Corner := TNNetVolume.Create;
+  TiledCPU := TNNetVolume.Create;
+  CornerCPU := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    Decoder.Parallel := false;
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    Corner.CopyCropping(Latent, Latent.SizeX - 1, Latent.SizeY - 1, 1, 1);
+    Decoder.DecodeTiled(Latent, TiledCPU, 32, 16);
+    Decoder.Decode(Corner, CornerCPU);
+    WeightBytes := 0;
+    MaxLayerPos := Decoder.WeightOwner.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+      if Decoder.WeightOwner.Layers[LayerPos] is TNNetConvolution then
+        WeightBytes := WeightBytes + int64(SizeOf(TNeuralFloat)) *
+          Decoder.WeightOwner.Layers[LayerPos].CountWeights();
+    OpenCLTransferCounting := true;
+    // Net (the 1x1 corner) exists, so EnableOpenCL arms WeightOwner for it.
+    TransfersBefore := OpenCLProcessTransferTotals();
+    AssertTrue('EnableOpenCL', Decoder.EnableOpenCL(PlatformId, DeviceId));
+    ArmingUploadBytes := UploadBytesSince();
+    AssertTrue('WeightOwner armed', Decoder.WeightOwnerOnOpenCL);
+    TransfersBefore := OpenCLProcessTransferTotals();
+    Decoder.DecodeTiled(Latent, Image, 32, 16);
+    ArmedUploadBytes := UploadBytesSince();
+    MaxDiff := MaxAbsVolumeDiff(Image, TiledCPU);
+    AssertEquals('tile-shape nets', 4, Decoder.LastDecodeNetCount);
+    ConvCount := 0;
+    MaxLayerPos := Decoder.Net.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      if not (Layer is TNNetConvolution) then continue;
+      Inc(ConvCount);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the weights',
+        TNNetConvolution(Layer).OpenCLWeightsBorrowed());
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' shares the host caches',
+        TNNetConvolution(Layer).WeightCachesSharedWithOwner());
+    end;
+    AssertTrue('convolutions checked', ConvCount > 0);
+    AssertTrue('the owner holds the weights in OpenCL memory',
+      Decoder.WeightOwner.OpenCLBufferBytes() >= WeightBytes);
+    AssertTrue('the borrowing net does not count them',
+      Decoder.Net.OpenCLBufferBytes() < WeightBytes);
+    AssertTrue('the per-net OpenCL figure includes the shared weights',
+      Decoder.LargestNetOpenCLBytes >= WeightBytes);
+    // The same decode with WeightOwner re-armed inside it: exactly one more
+    // copy of the weights for the four nets.
+    Decoder.ReleaseOpenCLWeights();
+    AssertFalse('WeightOwner disarmed', Decoder.WeightOwnerOnOpenCL);
+    TransfersBefore := OpenCLProcessTransferTotals();
+    Decoder.DecodeTiled(Latent, Image, 32, 16);
+    RearmUploadBytes := UploadBytesSince();
+    MaxDiff := Max(MaxDiff, MaxAbsVolumeDiff(Image, TiledCPU));
+    WriteLn('  Qwen-Image-2.1 VAE shared weights: conv weights ', WeightBytes,
+      ' B; uploads: EnableOpenCL ', ArmingUploadBytes, ' B, tiled decode (4 ',
+      'nets) ', ArmedUploadBytes, ' B, same with WeightOwner re-armed ',
+      RearmUploadBytes, ' B; max|diff|=', MaxDiff:0:9);
+    AssertTrue('EnableOpenCL uploads the weights once',
+      (ArmingUploadBytes >= WeightBytes) and
+      (ArmingUploadBytes < 2 * WeightBytes));
+    AssertTrue('re-arming adds one copy of the weights',
+      (RearmUploadBytes - ArmedUploadBytes >= WeightBytes) and
+      (RearmUploadBytes - ArmedUploadBytes < 2 * WeightBytes));
+    AssertTrue('tiled: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < Tolerance);
+    // Net (the 1x1 corner) keeps its references after the release.
+    Decoder.ReleaseOpenCLWeights();
+    Decoder.Decode(Corner, Image);
+    MaxDiff := MaxAbsVolumeDiff(Image, CornerCPU);
+    AssertEquals('the corner reused Net', 0, Decoder.LastDecodeNetCount);
+    AssertTrue('corner after ReleaseOpenCLWeights: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < Tolerance);
+    AssertTrue('WeightOwner dropped its host caches',
+      Decoder.WeightOwner.NonWeightBytes() < WeightBytes);
+    // A fresh net: no convolution that binds a resident source uploads.
+    Decoder.ReleaseNet();
+    Decoder.LayerProfiling := true;
+    Decoder.Decode(Corner, Image);
+    MaxDiff := MaxAbsVolumeDiff(Image, CornerCPU);
+    AssertTrue('WeightOwner re-armed', Decoder.WeightOwnerOnOpenCL);
+    BoundConvCount := 0;
+    MaxLayerPos := Decoder.Net.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      if not ((Layer is TNNetConvolution) and (Layer.ForwardGPUCnt > 0) and
+        Layer.PrevLayer.OutputBindableOnOpenCL()) then continue;
+      Inc(BoundConvCount);
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' uploads', 0,
+        Layer.ProfiledTransfers.UploadCount);
+    end;
+    WriteLn('  Qwen-Image-2.1 VAE fresh 1x1 net: ', BoundConvCount,
+      ' convolutions on a bound source, none uploads');
+    AssertTrue('convolutions on a bound source', BoundConvCount > 0);
+    AssertTrue('fresh corner: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < Tolerance);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    Image.Free;
+    CornerCPU.Free;
+    TiledCPU.Free;
+    Corner.Free;
     Latent.Free;
     Decoder.Free;
     RefRoot.Free;

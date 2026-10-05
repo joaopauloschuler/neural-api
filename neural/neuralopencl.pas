@@ -476,6 +476,10 @@ type
       /// swaps them for another owner's); the release in UnprepareForCompute
       /// is the same clReleaseMemObject either way. Coded by Claude (AI).
       FCodesBorrowed: boolean;
+      /// FP32 twin of FCodesBorrowed: FInputBufferAs (the A operand) and
+      /// FBiasBuffer are retained references to another instance's
+      /// (PrepareForComputeBorrowingWeights). Coded by Claude (AI).
+      FWeightsBorrowed, FBiasBorrowed: boolean;
       /// Retains Owner's codes/scales/block-scales as this instance's and sets
       /// FCodesBorrowed; the caller releases any handles it replaces.
       procedure RetainCodesOf(Owner: TDotProductSharedKernel);
@@ -612,6 +616,13 @@ type
       /// armed in this instance's context; False leaves this one unarmed. Coded by Claude (AI).
       function PrepareForComputeBorrowingCodes(Owner: TDotProductSharedKernel;
         VBs: TNNetVolume; pFP16: boolean = false): boolean;
+      /// FP32 twin: retains Owner's A operand and bias and sizes only the result;
+      /// never writes them, so weight changes reach it only through Owner's upload.
+      function PrepareForComputeBorrowingWeights(Owner: TDotProductSharedKernel;
+        pNumBs, pSize: longint): boolean;
+      /// Uploads VAs into the A buffer PrepareForCompute created, and VBias
+      /// (nil: none); returns when both are in OpenCL memory. Coded by Claude (AI).
+      function UploadResidentWeights(VAs, VBias: TNNetVolume): boolean;
       /// True when BorrowCodesKeepingBuffers(Owner) applies: both armed in the
       /// same weight mode, same rows and row size, same OpenCL context.
       function CanBorrowCodesKeepingBuffers(
@@ -652,6 +663,7 @@ type
       /// prove a borrower created no second copy.
       property CodesBuffer: cl_mem read FCodesBuffer;
       property CodesBorrowed: boolean read FCodesBorrowed;
+      property WeightsBorrowed: boolean read FWeightsBorrowed;
       /// Launches of the tiled GEMM over this instance's lifetime; a test
       /// asserts it moved to prove the tiled path ran.
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
@@ -883,10 +895,14 @@ end;
 
 function TDotProductSharedKernel.BufferBytes(): int64;
 begin
-  Result := OpenCLMemBytes(FInputBufferAs) + OpenCLMemBytes(FInputBufferBs) +
-    OpenCLMemBytes(FResultBuffer) + OpenCLMemBytes(FBiasBuffer) +
+  Result := OpenCLMemBytes(FInputBufferBs) +
+    OpenCLMemBytes(FResultBuffer) +
     OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
     OpenCLMemBytes(FInputBufferBsFP16);
+  if not FWeightsBorrowed then
+    Result := Result + OpenCLMemBytes(FInputBufferAs);
+  if not FBiasBorrowed then
+    Result := Result + OpenCLMemBytes(FBiasBuffer);
   if not FCodesBorrowed then
     Result := Result + OpenCLMemBytes(FCodesBuffer) +
       OpenCLMemBytes(FScalesBuffer) + OpenCLMemBytes(FBlockScalesBuffer);
@@ -932,6 +948,8 @@ begin
   FCapBlockScales := 0;
   FInt4Ready := false;
   FCodesBorrowed := false;
+  FWeightsBorrowed := false;
+  FBiasBorrowed := false;
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
@@ -998,11 +1016,13 @@ begin
   begin
     NeededAs := VAs.GetMemSize();
     NeededBs := VBs.GetMemSize();
-    if (FInputBufferAs = nil) or (NeededAs > FCapAs) then
+    // A borrowed A buffer holds another instance's weights: never written here.
+    if (FInputBufferAs = nil) or FWeightsBorrowed or (NeededAs > FCapAs) then
     begin
       if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
       FInputBufferAs := FDotProductKernel.CreateInputBuffer(NeededAs);
       FCapAs := NeededAs;
+      FWeightsBorrowed := false;
     end;
     if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
     begin
@@ -1207,7 +1227,8 @@ begin
         ErrorProc('Error: TDotProductSharedKernel.Compute - failed setting ' +
           'kernel arguments: ' + IntToStr(err));
 
-      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+      if NewVAs and not FWeightsBorrowed then
+        err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
       if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -1444,6 +1465,57 @@ begin
   FInt8Ready := Owner.FInt8Ready;
   FInt4Ready := Owner.FInt4Ready;
   Result := true;
+end;
+
+// Both instances must have been armed in one OpenCL context; refcounting
+// lets either be unprepared or freed first. Coded by Claude (AI).
+function TDotProductSharedKernel.PrepareForComputeBorrowingWeights(
+  Owner: TDotProductSharedKernel; pNumBs, pSize: longint): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) or FHostInput or
+    Owner.FHostInput or Owner.FInt8Ready or Owner.FInt4Ready or
+    (not Assigned(Owner.FInputBufferAs)) or (Owner.FSize <> pSize) or
+    (pNumBs <= 0) or
+    (Owner.FDotProductKernel.Context <> FDotProductKernel.Context) then exit;
+  UnprepareForCompute();
+  FNumAs := Owner.FNumAs;
+  FNumBs := pNumBs;
+  FSize := pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+  clRetainMemObject(Owner.FInputBufferAs);
+  FInputBufferAs := Owner.FInputBufferAs;
+  FCapAs := Owner.FCapAs;
+  FWeightsBorrowed := true;
+  if Assigned(Owner.FBiasBuffer) then
+  begin
+    clRetainMemObject(Owner.FBiasBuffer);
+    FBiasBuffer := Owner.FBiasBuffer;
+    FCapBias := Owner.FCapBias;
+    FBiasBorrowed := true;
+  end;
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(
+    FNumAs * FNumBs * csNeuralFloatSize);
+  FPreviousComputeTime := 0;
+  Result := true;
+end;
+
+// The bias goes first: the in-order queue has it written once the blocking
+// A upload returns.
+function TDotProductSharedKernel.UploadResidentWeights(
+  VAs, VBias: TNNetVolume): boolean;
+var
+  err: integer;
+begin
+  Result := false;
+  if (not Assigned(FInputBufferAs)) or FWeightsBorrowed or FInt8Ready or
+    FInt4Ready or (VAs.Size <> FNumAs * FSize) then exit;
+  err := CL_SUCCESS;
+  PrepareBiasOperand(VBias, {NewVBias=}true, err);
+  err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs, CL_TRUE);
+  Result := err = CL_SUCCESS;
 end;
 
 function TDotProductSharedKernel.CanBorrowCodesKeepingBuffers(
@@ -1766,7 +1838,8 @@ begin
   err := CL_SUCCESS;
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
   SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
-  if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+  if NewVAs and not FWeightsBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
   UseTiled := Assigned(FImplicitConvTiledKernel) and
     (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm();
   if UseTiled then K := FImplicitConvTiledKernel else K := FImplicitConvKernel;
@@ -2099,9 +2172,11 @@ begin
     if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
     FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
     FCapBias := NeededBias;
+    FBiasBorrowed := false;
     NewVBias := true; // fresh/grown buffer: force upload regardless of caller
   end;
-  if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+  if NewVBias and not FBiasBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
   Result := 1;
 end;
 

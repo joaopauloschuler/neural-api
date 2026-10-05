@@ -1068,6 +1068,12 @@ type
       // True while FQuantTable and FQuantTableInt4 are FWeightOwner's objects
       // (LinkWeightsFrom): never freed, requantized or uploaded here.
       FLinkedWeightTables: boolean;
+      // FConcatedWeights/FConcatedWInter came from ShareOwnerWeightCaches; other
+      // borrowers may still hold the same arrays after the owner let go of them.
+      FWeightCachesFromOwner: boolean;
+      // Set only around EnableOpenCL's own AfterWeightUpdate right after
+      // ShareOwnerWeightCaches: the owner's caches are already current.
+      FSkipSharedCacheRebuild: boolean;
       // Int8 copy of the forward input (Int8InputSource), nil until
       // EnableInt8Input sizes it: most layers never run an int8 input.
       FInputCopyInt8: TNNetVolumeQuant8;
@@ -1100,10 +1106,16 @@ type
       // (own conversion or link); only the convolution has such planes.
       procedure ArmInt4InputPlanes(); virtual;
       procedure DetachFromWeightOwner(); override;
+      // Drops this layer's references to FWeightOwner's concatenated caches
+      // (no copy): they become empty until the next AfterWeightUpdate.
+      procedure UnshareOwnerWeightCaches();
       {$IFDEF OpenCL}
       // Arms FDotCL from the owner's resident codes (retained, not copied);
       // False when the owner is unarmed or in another context.
       function BorrowOwnerOpenCLCodes(VBs: TNNetVolume): boolean;
+      // Points FConcatedWeights/FConcatedWInter at an OpenCL-armed inference
+      // owner's (no copy, no rebuild); False leaves this layer's own.
+      function ShareOwnerWeightCaches(): boolean;
       {$ENDIF}
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); virtual;
@@ -1242,7 +1254,12 @@ type
       // and whether they are a retained reference to the owner's buffer.
       function OpenCLCodesBuffer(): cl_mem;
       function OpenCLCodesBorrowed(): boolean;
+      // Test hook: FDotCL's FP32 weights are a retained reference to the owner's.
+      function OpenCLWeightsBorrowed(): boolean;
       {$ENDIF}
+      // True while FConcatedWeights and FConcatedWInter are FWeightOwner's
+      // arrays (no copy; this layer's bytes are the owner's).
+      function WeightCachesSharedWithOwner(): boolean;
   end;
 
   {$IFDEF FPC}
@@ -15139,6 +15156,17 @@ type
       // True when every forward sizes FOutputRaw itself before a host write,
       // so SetPrevLayer leaves it empty. False here.
       function HostOutputRawOnDemand(): boolean; virtual;
+      {$IFDEF OpenCL}
+      // Whether this layer may lend its FP32 OpenCL weights or borrow its
+      // owner's. False here.
+      function OpenCLWeightsShareable(): boolean; virtual;
+      // FDotCL holding the FP32 weights and bias in OpenCL memory (uploaded
+      // now when stale), for a borrower to retain; nil when not lendable.
+      function LendOpenCLWeights(): TDotProductSharedKernel;
+      // Arms FDotCL on FWeightOwner's lent weights (no upload); re-arming the
+      // owner with changed weights leaves this layer on the old buffers.
+      function BorrowOwnerOpenCLWeights(pNumBs: integer): boolean;
+      {$ENDIF}
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
       destructor Destroy(); override;
@@ -15303,6 +15331,9 @@ type
       // ComputeOpenCL. Coded by Claude (AI).
       procedure ComputeOpenCLQuantized(pPrevOutputBuffer: cl_mem = nil;
         pIm2ColSrcBuffer: cl_mem = nil);
+    protected
+      // Inference FP32 forwards without Winograd, which writes the A buffer.
+      function OpenCLWeightsShareable(): boolean; override;
     public
       procedure DisableOpenCL(); override;
       function OpenCLBufferBytes(): int64; override;
@@ -80053,8 +80084,10 @@ begin
       //    FQuantTableInt4.
       //  - a pending build link: the rows are one-element placeholders until
       //    LinkBuildWeightOwner points them at the owner's.
+      //  - the arming call right after ShareOwnerWeightCaches. Any other call
+      //    rebuilds shared caches in place: equal dims never reallocate.
       if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() and
-        not FBuildLinkPending then
+        not FBuildLinkPending and not FSkipSharedCacheRebuild then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
@@ -80593,11 +80626,37 @@ begin
     FQuantTable.Scale[NeuronIdx, 0] := 1;
 end;
 
+// Caches shared with the owner are the owner's bytes.
 function TNNetLayerConcatedWeights.NonWeightBytes(): int64;
 begin
-  Result := inherited NonWeightBytes() + VolumeBytes(FConcatedWeights) +
-    VolumeBytes(FConcatedWInter) + VolumeBytes(FBiasOutput) +
+  Result := inherited NonWeightBytes() + VolumeBytes(FBiasOutput) +
     VolumeBytes(FNeuronBias) + Quant8Bytes(FInputCopyInt8);
+  if not WeightCachesSharedWithOwner() then
+    Result := Result + VolumeBytes(FConcatedWeights) +
+      VolumeBytes(FConcatedWInter);
+end;
+
+function TNNetLayerConcatedWeights.WeightCachesSharedWithOwner(): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+begin
+  Result := false;
+  if (not Assigned(FWeightOwner)) or
+    (not (FWeightOwner is TNNetLayerConcatedWeights)) or
+    (FConcatedWeights.Size = 0) or (FConcatedWInter.Size = 0) then exit;
+  OwnerCW := TNNetLayerConcatedWeights(FWeightOwner);
+  Result :=
+    (Pointer(FConcatedWeights.FData) = Pointer(OwnerCW.FConcatedWeights.FData)) and
+    (Pointer(FConcatedWInter.FData) = Pointer(OwnerCW.FConcatedWInter.FData));
+end;
+
+// ReSize to zero drops the reference without copying the shared array.
+procedure TNNetLayerConcatedWeights.UnshareOwnerWeightCaches();
+begin
+  if not FWeightCachesFromOwner then exit;
+  FConcatedWeights.ReSize(0, 0, 0);
+  FConcatedWInter.ReSize(0, 0, 0);
+  FWeightCachesFromOwner := false;
 end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
@@ -80662,6 +80721,8 @@ begin
   // An own int4 state left an int8 input copy behind that an int8 owner does
   // not use; it comes back below when the owner is int4.
   if OwnerCW.FQuantInt8 and FQuantInt4 then DisableInt8Input();
+  // AfterWeightUpdate below would otherwise rebuild the previous owner's caches.
+  UnshareOwnerWeightCaches();
   if not LinkNeuronsFrom(Owner) then exit;
   // The weight list pointed at the rows LinkNeuronsFrom just freed.
   RefreshNeuronWeightList();
@@ -80699,8 +80760,8 @@ begin
       'layer ' + IntToStr(FLayerIdx) + ' linked the owner''s host tables but ' +
       'not its resident OpenCL codes.');
   {$ENDIF}
-  // FP32 owner: this layer keeps its own concatenated caches, rebuilt from
-  // the shared rows here (only the rows themselves are shared).
+  // FP32 owner: the concatenated caches are rebuilt from the shared rows here;
+  // a later EnableOpenCL may point them at the owner's (ShareOwnerWeightCaches).
   AfterWeightUpdate();
   {$IFDEF OpenCL}
   // The fused bias add reads a resident copy of the bias, just rebuilt.
@@ -80716,6 +80777,7 @@ end;
 procedure TNNetLayerConcatedWeights.DetachFromWeightOwner();
 begin
   if not Assigned(FWeightOwner) then exit;
+  UnshareOwnerWeightCaches();
   inherited DetachFromWeightOwner();
   if FLinkedWeightTables then
   begin
@@ -80899,11 +80961,15 @@ begin
   else if FQuantInt4 then
     PrepareInt4DotCL(FInputPrepared)
   else if FPointwise then
-    FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize)
+  begin
+    if not BorrowOwnerOpenCLWeights(FInputPrepared.Size div FVectorSize) then
+      FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize);
+  end
   else
   begin
-    FDotCL.PrepareForCompute(FConcatedWInter, FOutputSizeX * FOutputSizeY,
-      FVectorSize);
+    if not BorrowOwnerOpenCLWeights(FOutputSizeX * FOutputSizeY) then
+      FDotCL.PrepareForCompute(FConcatedWInter, FOutputSizeX * FOutputSizeY,
+        FVectorSize);
     FDotCL.PrepareImplicitConv();
   end;
   // Borrow the cai_im2col handle so ComputeOpenCL can build the column matrix
@@ -80919,6 +80985,46 @@ begin
     else FIm2ColKernelName := 'cai_im2col';
     FIm2ColKernel := FNN.GetKernel(FIm2ColKernelName);
   end;
+end;
+
+function TNNetConvolutionBase.OpenCLWeightsShareable(): boolean;
+begin
+  Result := false;
+end;
+
+// FAfterWeightUpdateHasBeenCalled marks the OpenCL copy stale, as it does for
+// the first forward's upload. Coded by Claude (AI).
+function TNNetConvolutionBase.LendOpenCLWeights(): TDotProductSharedKernel;
+var
+  BiasVol: TNNetVolume;
+begin
+  Result := nil;
+  if (not FHasOpenCL) or (not Assigned(FDotCL)) or
+    (not FShouldInterleaveWeights) or (not OpenCLWeightsShareable()) then exit;
+  if FAfterWeightUpdateHasBeenCalled then
+  begin
+    if FSuppressBias = 0 then BiasVol := OpenCLBiasOperand() else BiasVol := nil;
+    if not FDotCL.UploadResidentWeights(FConcatedWInter, BiasVol) then exit;
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
+  Result := FDotCL;
+end;
+
+// Runs after the inherited EnableOpenCL, so clearing the update flag keeps the
+// first forward from uploading into the owner's buffer.
+function TNNetConvolutionBase.BorrowOwnerOpenCLWeights(
+  pNumBs: integer): boolean;
+var
+  OwnerDotCL: TDotProductSharedKernel;
+begin
+  Result := false;
+  if (not Assigned(FWeightOwner)) or (FWeightOwner.ClassType <> ClassType) or
+    (not OpenCLWeightsShareable()) then exit;
+  OwnerDotCL := TNNetConvolutionBase(FWeightOwner).LendOpenCLWeights();
+  if not Assigned(OwnerDotCL) then exit;
+  Result := FDotCL.PrepareForComputeBorrowingWeights(OwnerDotCL, pNumBs,
+    FVectorSize);
+  if Result then FAfterWeightUpdateHasBeenCalled := false;
 end;
 
 procedure TNNetLayerConcatedWeights.ReleaseInt8Kernels();
@@ -80994,20 +81100,48 @@ begin
     else
     begin
       RefreshNeuronWeightList();
-      TimedAfterWeightUpdate();
-
-      FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
-
-      FConcatedWInter.ReSize(FNeuronWeightList[0].Size, 1, FNeuronWeightList.Count);
-
-      //WriteLn(' Layer:', Self.LayerIdx,' Vector:',FVectorSize,' Neuron count:',FNeuronWeightList.Count,' Output size:',FOutput.Size);
       FShouldInterleaveWeights := true;
       FShouldConcatWeights := true;
-
-      //FDotProductResult.ReSize(FOutputSizeX, FOutputSizeY, FNeurons.Count);
+      // The TimedAfterWeightUpdate below fills these unless they are the
+      // owner's, which it then leaves alone.
+      if ShareOwnerWeightCaches() then FSkipSharedCacheRebuild := true
+      else
+      begin
+        FConcatedWeights.ReSize(FNeuronWeightList.Count, 1, FNeuronWeightList[0].Size);
+        FConcatedWInter.ReSize(FNeuronWeightList[0].Size, 1, FNeuronWeightList.Count);
+      end;
     end;
   end;
-  TimedAfterWeightUpdate();
+  try
+    TimedAfterWeightUpdate();
+  finally
+    FSkipSharedCacheRebuild := false;
+  end;
+end;
+
+// The owner must be an inference layer armed in OpenCL with both caches
+// built (a low-memory verdict at arming shrinks them); the rows are the same
+// linked neurons. Coded by Claude (AI).
+function TNNetLayerConcatedWeights.ShareOwnerWeightCaches(): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+  WeightCount: integer;
+begin
+  Result := false;
+  if FIsTrainable or FQuantInt8 or FQuantInt4 or
+    (not Assigned(FWeightOwner)) or (FWeightOwner.ClassType <> ClassType) or
+    (FNeuronWeightList.Count = 0) then exit;
+  OwnerCW := TNNetLayerConcatedWeights(FWeightOwner);
+  WeightCount := FNeuronWeightList.Count * FNeuronWeightList[0].Size;
+  if OwnerCW.FIsTrainable or (not OwnerCW.FHasOpenCL) or
+    (not OwnerCW.FShouldInterleaveWeights) or OwnerCW.FQuantInt8 or
+    OwnerCW.FQuantInt4 or
+    (OwnerCW.FConcatedWeights.Size <> WeightCount) or
+    (OwnerCW.FConcatedWInter.Size <> WeightCount) then exit;
+  FConcatedWeights.ShareDataWith(OwnerCW.FConcatedWeights, {pAdoptShape=}true);
+  FConcatedWInter.ShareDataWith(OwnerCW.FConcatedWInter, {pAdoptShape=}true);
+  FWeightCachesFromOwner := true;
+  Result := true;
 end;
 
 procedure TNNetLayerConcatedWeights.TimedAfterWeightUpdate();
@@ -81099,6 +81233,11 @@ end;
 function TNNetLayerConcatedWeights.OpenCLCodesBorrowed(): boolean;
 begin
   Result := Assigned(FDotCL) and FDotCL.CodesBorrowed;
+end;
+
+function TNNetLayerConcatedWeights.OpenCLWeightsBorrowed(): boolean;
+begin
+  Result := Assigned(FDotCL) and FDotCL.WeightsBorrowed;
 end;
 {$ENDIF}
 
@@ -108449,6 +108588,14 @@ function TNNetConvolution.WinogradEnabled(): boolean;
 begin
   Result := (FStruct[7] = 1);
 end;
+
+{$IFDEF OpenCL}
+function TNNetConvolution.OpenCLWeightsShareable(): boolean;
+begin
+  Result := (not FIsTrainable) and (not FQuantInt8) and (not FQuantInt4) and
+    (not WinogradEligible());
+end;
+{$ENDIF}
 
 function TNNetConvolution.WinogradEligible(): boolean;
 begin
@@ -140907,7 +141054,8 @@ begin
   {$IFDEF OpenCL}
   FWinogradKernelsTValid := false;
   {$ENDIF}
-  if ActiveLowMemory() then
+  // Caches shared with the owner cost this layer nothing, so they stay.
+  if ActiveLowMemory() and not WeightCachesSharedWithOwner() then
   begin
     // Release the persistent weight caches the per-neuron forward does not need.
     // The biases stay - ComputeLowMemoryCPU adds FBiasOutput.

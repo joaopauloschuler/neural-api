@@ -631,6 +631,9 @@ type
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
+    // FP32 convolutions linked to an OpenCL-armed owner borrow its OpenCL
+    // weights and host caches: no weight upload, parity, three release orders.
+    procedure TestConvBorrowsOwnerOpenCLWeights;
     // TQuantRowsTransposeFan (the PrepareInt8DotCL / PrepareInt4DotCL repack)
     // equals the volume methods, inline and split into worker ranges.
     procedure TestCopyQuantRowsTransposedMatchesVolumeMethods;
@@ -71516,6 +71519,204 @@ begin
   for CasePos := 0 to 7 do
     RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}(CasePos and 2) = 0,
       {pBiased=}(CasePos and 4) <> 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvBorrowsOwnerOpenCLWeights;
+{$IFDEF OpenCL}
+const
+  csDepth = 6;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Owner, Borrower, Control, LateBorrower: TNNet;
+  Input, LateInput, OwnerInput: TNNetVolume;
+  OutCPU, LateCPU, OwnerCPU, OutCL: TNNetVolume;
+  TransfersBefore, Borrowed, Unshared, Flushed: TOpenCLTransferCounts;
+  LayerPos, ForwardsBefore: integer;
+  WeightBytes: int64;
+  Layer: TNNetLayerConcatedWeights;
+  WasCounting: boolean;
+  MaxDiff: TNeuralFloat;
+
+  function BuildNet(SizeX, SizeY: integer; pWeightSeed: integer): TNNet;
+  var
+    LayerIdx, NeuronPos, MaxNeuronPos, WeightPos, MaxWeightPos: integer;
+    Weights: TNNetVolume;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SizeX, SizeY, csDepth));
+    Result.AddLayer(TNNetConvolutionLinear.Create(80, 3, 1, 1));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(72));
+    if pWeightSeed = 0 then
+    begin
+      Result.SetTrainable(false);
+      exit;
+    end;
+    for LayerIdx := 1 to 2 do
+    begin
+      MaxNeuronPos := Result.Layers[LayerIdx].Neurons.Count - 1;
+      for NeuronPos := 0 to MaxNeuronPos do
+      begin
+        Weights := Result.Layers[LayerIdx].Neurons[NeuronPos].Weights;
+        MaxWeightPos := Weights.Size - 1;
+        for WeightPos := 0 to MaxWeightPos do
+          Weights.FData[WeightPos] := 0.2 * Sin((NeuronPos + 1) * 0.37 +
+            WeightPos * 0.11 + LayerIdx + pWeightSeed);
+        Result.Layers[LayerIdx].Neurons[NeuronPos].BiasWeight :=
+          0.3 * Cos(NeuronPos * 0.7 + LayerIdx);
+      end;
+    end;
+    Result.UpdateWeights();
+    Result.SetTrainable(false);
+  end;
+
+  procedure FillInput(V: TNNetVolume);
+  var
+    Pos, MaxPos: integer;
+  begin
+    MaxPos := V.Size - 1;
+    for Pos := 0 to MaxPos do
+      V.FData[Pos] := 0.7 * Cos(Pos * 0.029) - 0.1;
+  end;
+
+  function ForwardUploads(NN: TNNet; V: TNNetVolume): TOpenCLTransferCounts;
+  begin
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(V);
+    Result := OpenCLProcessTransferTotals();
+    Result.UploadCount := Result.UploadCount - TransfersBefore.UploadCount;
+    Result.UploadBytes := Result.UploadBytes - TransfersBefore.UploadBytes;
+    NN.GetOutput(OutCL);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  Owner := BuildNet(3, 2, 1);
+  Borrower := BuildNet(9, 7, 0);
+  Control := BuildNet(9, 7, 0);
+  LateBorrower := BuildNet(5, 5, 0);
+  Input := TNNetVolume.Create(9, 7, csDepth);
+  LateInput := TNNetVolume.Create(5, 5, csDepth);
+  OwnerInput := TNNetVolume.Create(3, 2, csDepth);
+  OutCPU := TNNetVolume.Create();
+  LateCPU := TNNetVolume.Create();
+  OwnerCPU := TNNetVolume.Create();
+  OutCL := TNNetVolume.Create();
+  try
+    FillInput(Input);
+    FillInput(LateInput);
+    FillInput(OwnerInput);
+    AssertEquals('borrower linked', 2, Borrower.LinkWeightsFrom(Owner));
+    AssertEquals('control linked', 2, Control.LinkWeightsFrom(Owner));
+    AssertEquals('late borrower linked', 2, LateBorrower.LinkWeightsFrom(Owner));
+    Borrower.Compute(Input);
+    Borrower.GetOutput(OutCPU);
+    LateBorrower.Compute(LateInput);
+    LateBorrower.GetOutput(LateCPU);
+    Owner.Compute(OwnerInput);
+    Owner.GetOutput(OwnerCPU);
+    WeightBytes := 0;
+    for LayerPos := 1 to 2 do
+      WeightBytes := WeightBytes + int64(Owner.Layers[LayerPos].CountWeights()) *
+        SizeOf(TNeuralFloat);
+    OpenCLTransferCounting := true;
+    // The control arms in a context of its own, so it uploads its weights.
+    Control.EnableOpenCL(PlatformId, DeviceId);
+    Control.ForceOpenCL(true);
+    Unshared := ForwardUploads(Control, Input);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    LateBorrower.EnableOpenCLInContextOf(Owner);
+    Borrower.EnableOpenCLInContextOf(Owner);
+    Borrower.ForceOpenCL(true);
+    LateBorrower.ForceOpenCL(true);
+    for LayerPos := 1 to 2 do
+    begin
+      Layer := TNNetLayerConcatedWeights(Borrower.Layers[LayerPos]);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the OpenCL weights',
+        Layer.OpenCLWeightsBorrowed());
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' shares the host caches',
+        Layer.WeightCachesSharedWithOwner());
+      AssertFalse('the control layer ' + IntToStr(LayerPos) + ' does not borrow',
+        TNNetLayerConcatedWeights(Control.Layers[LayerPos]).OpenCLWeightsBorrowed());
+    end;
+    Borrowed := ForwardUploads(Borrower, Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, OutCL);
+    WriteLn('  Borrowed OpenCL conv weights: first forward uploads ',
+      Borrowed.UploadCount, ' (', Borrowed.UploadBytes, ' B), unshared ',
+      Unshared.UploadCount, ' (', Unshared.UploadBytes, ' B); weights ',
+      WeightBytes, ' B; max|diff|=', MaxDiff:0:9);
+    AssertTrue('the control uploads its weights',
+      Unshared.UploadBytes >= WeightBytes + Input.Size * SizeOf(TNeuralFloat));
+    AssertEquals('the borrower uploads only its input', int64(Input.Size) *
+      SizeOf(TNeuralFloat), Borrowed.UploadBytes);
+    AssertTrue('borrower vs CPU: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    // A weight update on a borrower rebuilds the shared host caches in place
+    // and writes nothing to the borrowed OpenCL buffers.
+    for LayerPos := 1 to 2 do
+    begin
+      Layer := TNNetLayerConcatedWeights(Borrower.Layers[LayerPos]);
+      Layer.FlushWeightCache();
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' still shares the caches',
+        Layer.WeightCachesSharedWithOwner());
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' still borrows',
+        Layer.OpenCLWeightsBorrowed());
+    end;
+    Flushed := ForwardUploads(Borrower, Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, OutCL);
+    AssertEquals('after a borrower update: only the input is uploaded',
+      int64(Input.Size) * SizeOf(TNeuralFloat), Flushed.UploadBytes);
+    AssertTrue('after a borrower update: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    // Release orders: a borrower freed while the owner is armed, the owner
+    // disarmed under a live borrower, then the owner freed before it.
+    FreeAndNil(Borrower);
+    Owner.ForceOpenCL(true);
+    ForwardsBefore := Owner.Layers[1].ForwardGPUCnt;
+    Owner.Compute(OwnerInput);
+    Owner.GetOutput(OutCL);
+    MaxDiff := MaxAbsDiffToOutput(OwnerCPU, OutCL);
+    AssertEquals('the owner ran on OpenCL', ForwardsBefore + 1,
+      Owner.Layers[1].ForwardGPUCnt);
+    AssertTrue('owner after its borrower was freed: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    Owner.DisableOpenCL();
+    ForwardsBefore := LateBorrower.Layers[1].ForwardGPUCnt;
+    LateBorrower.Compute(LateInput);
+    LateBorrower.GetOutput(OutCL);
+    MaxDiff := MaxAbsDiffToOutput(LateCPU, OutCL);
+    AssertTrue('after the owner disarmed: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    AssertEquals('still on OpenCL after the owner disarmed', ForwardsBefore + 1,
+      LateBorrower.Layers[1].ForwardGPUCnt);
+    FreeAndNil(Owner);
+    AssertFalse('detached: caches unshared', TNNetLayerConcatedWeights(
+      LateBorrower.Layers[1]).WeightCachesSharedWithOwner());
+    FreeAndNil(LateBorrower);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCL.Free;
+    OwnerCPU.Free;
+    LateCPU.Free;
+    OutCPU.Free;
+    OwnerInput.Free;
+    LateInput.Free;
+    Input.Free;
+    LateBorrower.Free;
+    Control.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
 end;
 {$ELSE}
 begin

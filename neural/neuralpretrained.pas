@@ -9174,6 +9174,13 @@ type
     FOpenCLContextNet: TNNet;
     FOpenCLHasSharedKernel: boolean;
     FShareOpenCLOutputs: boolean;
+    // WeightOwner is armed in that context: its convolutions hold the one
+    // OpenCL copy of the weights, which every sized net armed after it borrows.
+    FWeightOwnerOnOpenCL: boolean;
+    // Arms WeightOwner when FOpenCLContextNet exists and it is not armed yet.
+    procedure ArmWeightOwnerOnOpenCL();
+    // WeightOwner's OpenCL bytes while armed (the copy the sized nets borrow).
+    function WeightOwnerOpenCLBytes(): int64;
     {$ENDIF}
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
     function NetProfile(): string;
@@ -9220,10 +9227,15 @@ type
       write FShareHostOutputs;
     {$IFDEF OpenCL}
     // Builds one OpenCL context and program and arms Net and every later sized
-    // net in it (FP32 weights, one upload per net); false if the build fails.
+    // net in it (FP32 weights uploaded once, shared); false if the build fails.
     function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true): boolean;
     function OpenCLEnabled(): boolean;
+    // Disarms WeightOwner (its OpenCL weights; its host caches in low-memory
+    // mode); a live Net keeps its retained copies; PrepareNet re-arms it.
+    procedure ReleaseOpenCLWeights();
+    // WeightOwner holds the shared OpenCL weights (test hook).
+    property WeightOwnerOnOpenCL: boolean read FWeightOwnerOnOpenCL;
     // TNNet.ShareOpenCLOutputsByLiveness on every sized net (read when Net is
     // armed); true unless NEURAL_OPENCL_SHARE_OUTPUTS=0.
     property ShareOpenCLOutputs: boolean read FShareOpenCLOutputs
@@ -9240,8 +9252,8 @@ type
     // nets it built (one per tile shape; 0 when it reused Net).
     property LastDecodeTileCount: integer read FLastDecodeTileCount;
     property LastDecodeNetCount: integer read FLastDecodeNetCount;
-    // Largest TNNet.OpenCLBufferBytes of a sized net freed by ReleaseNet since
-    // the last Decode/DecodeTiled started; 0 without OpenCL.
+    // Largest OpenCL bytes of a sized net freed by ReleaseNet since the last
+    // Decode/DecodeTiled started, borrowed weights included; 0 without OpenCL.
     property LargestNetOpenCLBytes: int64 read FLargestNetOpenCLBytes;
   end;
 
@@ -69579,6 +69591,9 @@ end;
 procedure TQwenImage21VaeDecoder.PrepareNet(LatentW, LatentH: integer);
 var
   PhaseStart: TDateTime;
+  {$IFDEF OpenCL}
+  OwnerWeightPrepBefore: double;
+  {$ENDIF}
 begin
   if Assigned(FNet) and (LatentW = FNetLatentW) and (LatentH = FNetLatentH) then
     exit;
@@ -69602,11 +69617,14 @@ begin
   if Assigned(FOpenCLContextNet) then
   begin
     PhaseStart := Now();
+    OwnerWeightPrepBefore := FWeightOwner.OpenCLArmingWeightPrepTime;
+    ArmWeightOwnerOnOpenCL();
     FNet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
     FNetPhases.ArmingMs := (Now() - PhaseStart) * MSecsPerDay;
-    FNetPhases.ArmingWeightPrepMs :=
-      FNet.OpenCLArmingWeightPrepTime * MSecsPerDay;
+    FNetPhases.ArmingWeightPrepMs := (FNet.OpenCLArmingWeightPrepTime +
+      FWeightOwner.OpenCLArmingWeightPrepTime - OwnerWeightPrepBefore) *
+      MSecsPerDay;
   end;
   {$ENDIF}
   FProfileTotals.BuildMs := FProfileTotals.BuildMs + FNetPhases.BuildMs;
@@ -69631,7 +69649,7 @@ begin
   {$IFDEF OpenCL}
   if Assigned(FNet) and Assigned(FOpenCLContextNet) then
     FLargestNetOpenCLBytes := Max(FLargestNetOpenCLBytes,
-      FNet.OpenCLBufferBytes());
+      FNet.OpenCLBufferBytes() + WeightOwnerOpenCLBytes());
   {$ENDIF}
   FReleasedNetsProfile := FReleasedNetsProfile + NetProfile();
   if IsProfiled then
@@ -69654,6 +69672,12 @@ begin
   Result.OpenCLBytes := FNet.OpenCLBufferBytes();
   Result.HostBytes := FNet.NonWeightBytes();
   {$IFDEF OpenCL}
+  // The armed WeightOwner holds the weight copy and caches Net borrows.
+  if FWeightOwnerOnOpenCL then
+  begin
+    Inc(Result.OpenCLBytes, WeightOwnerOpenCLBytes());
+    Inc(Result.HostBytes, FWeightOwner.NonWeightBytes());
+  end;
   Result.OpenCLSharedBytes := FNet.OpenCLSharedOutputBytes();
   Result.OpenCLPrivateBytes := FNet.OpenCLSharedOutputPrivateBytes();
   {$ENDIF}
@@ -69839,8 +69863,8 @@ begin
 end;
 
 {$IFDEF OpenCL}
-// The context net, not WeightOwner: arming WeightOwner would allocate an
-// OpenCL weight buffer per convolution that no forward ever fills.
+// A separate context net, so ReleaseOpenCLWeights can disarm WeightOwner while
+// the context and program stay.
 function TQwenImage21VaeDecoder.EnableOpenCL(pPlatform: cl_platform_id;
   pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
 var
@@ -69861,12 +69885,15 @@ begin
   FOpenCLHasSharedKernel := pHasSharedKernel;
   if Assigned(FNet) then
   begin
-    WeightPrepBefore := FNet.OpenCLArmingWeightPrepTime;
+    WeightPrepBefore := FNet.OpenCLArmingWeightPrepTime +
+      FWeightOwner.OpenCLArmingWeightPrepTime;
     ArmingStart := Now();
+    ArmWeightOwnerOnOpenCL();
     FNet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
     FNet.EnableOpenCLInContextOf(FOpenCLContextNet, pHasSharedKernel);
     ArmingMs := (Now() - ArmingStart) * MSecsPerDay;
-    WeightPrepMs := (FNet.OpenCLArmingWeightPrepTime - WeightPrepBefore) *
+    WeightPrepMs := (FNet.OpenCLArmingWeightPrepTime +
+      FWeightOwner.OpenCLArmingWeightPrepTime - WeightPrepBefore) *
       MSecsPerDay;
     FNetPhases.ArmingMs := FNetPhases.ArmingMs + ArmingMs;
     FNetPhases.ArmingWeightPrepMs := FNetPhases.ArmingWeightPrepMs +
@@ -69880,6 +69907,39 @@ end;
 function TQwenImage21VaeDecoder.OpenCLEnabled(): boolean;
 begin
   Result := Assigned(FOpenCLContextNet);
+end;
+
+// Forced, so no convolution's size verdict at the 1x1 latent leaves it on the
+// low-memory path, which skips the caches the sized nets share. WeightOwner's
+// profiling flag follows the decoder's: its weight preparation is timed.
+procedure TQwenImage21VaeDecoder.ArmWeightOwnerOnOpenCL();
+begin
+  if FWeightOwnerOnOpenCL or not Assigned(FOpenCLContextNet) then exit;
+  FWeightOwner.LayerProfiling := FLayerProfiling;
+  FWeightOwner.ForceOpenCL(true);
+  FWeightOwner.EnableOpenCLInContextOf(FOpenCLContextNet,
+    FOpenCLHasSharedKernel);
+  FWeightOwnerOnOpenCL := true;
+end;
+
+function TQwenImage21VaeDecoder.WeightOwnerOpenCLBytes(): int64;
+begin
+  Result := 0;
+  if FWeightOwnerOnOpenCL then Result := FWeightOwner.OpenCLBufferBytes();
+end;
+
+// Disarmed, the low-memory convolutions drop the host caches arming built.
+procedure TQwenImage21VaeDecoder.ReleaseOpenCLWeights();
+var
+  LayerPos, MaxLayerPos: integer;
+begin
+  if not FWeightOwnerOnOpenCL then exit;
+  FWeightOwner.DisableOpenCL();
+  MaxLayerPos := FWeightOwner.GetLastLayerIdx();
+  for LayerPos := 0 to MaxLayerPos do
+    if FWeightOwner.Layers[LayerPos] is TNNetConvolution then
+      FWeightOwner.Layers[LayerPos].FlushWeightCache();
+  FWeightOwnerOnOpenCL := false;
 end;
 {$ENDIF}
 
@@ -85749,7 +85809,14 @@ begin
     Image.Mul(0.5);
     Image.Add(0.5);
   finally
-    if Assigned(FVaeDecoder) then FVaeDecoder.ReleaseNet()
+    if Assigned(FVaeDecoder) then
+    begin
+      FVaeDecoder.ReleaseNet();
+      {$IFDEF OpenCL}
+      // The OpenCL weights last one decode, as the sized nets do.
+      FVaeDecoder.ReleaseOpenCLWeights();
+      {$ENDIF}
+    end
     else Vae.Free;
     LatentImage.Free;
     EndPhase();
