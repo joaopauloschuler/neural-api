@@ -457,13 +457,13 @@ type
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
     procedure FusedSDPAInt8AppendOpenCLParity;
-    // CachedForwardNonCausal on cai_sdpa_noncausal_tiled vs the CPU: head dims
-    // 5 to 260 (1 to 3 column chunks), query tiles of 1 to 48 rows, 540 keys,
-    // GQA, prefixes of 0 to 300 rows, ragged query and key tiles, a
-    // bound or uploaded source, the prefix appended in OpenCL memory or from the
-    // host, the 16-row key-tile fallback, and two host-path cases (a budget
-    // too small for any tile, an int8 KV cache) that must match exactly.
+    // CachedForwardNonCausal on every flash variant vs the CPU: head dims 5
+    // to 260, GQA, windows, soft-cap, ragged tiles, and host-path cases.
     procedure FusedSDPANonCausalOpenCLParity;
+    // Causal flash steps (prefill windows over a cache, sliding windows, GQA,
+    // key splits incl. empty ones) against the CPU; short steps keep the
+    // split-row decode.
+    procedure FusedSDPAFlashCausalOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -75105,6 +75105,9 @@ begin
         NNGpu.EnableOpenCL(PlatformId, DeviceId);
         LGpu.FusedSDPACL.ForcedSplits := Override.Splits;
         LGpu.FusedSDPACL.ForcedChunkRows := Override.ChunkRows;
+        // This harness tests the split-row decode: keep wide steps off the
+        // flash path (FusedSDPAFlashCausalOpenCLParity covers that).
+        LGpu.FusedSDPACL.ForcedFlashMinTokens := MaxInt;
         if Override.UsableLocalMemBytes > 0 then
           LGpu.FusedSDPACL.ForcedLocalMemBytes := Override.UsableLocalMemBytes
             + LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV)
@@ -75580,173 +75583,201 @@ begin
 end;
 {$ENDIF}
 
-// Tolerance: 1e-5 of max(1, max|y|). The kernel sums the same products as the
-// host but in another order (online softmax, key tiles), so float32 rounding
-// differs by a few ulp per key; a wrong row, head, tile edge or rescale moves
-// the output by order 1e-1.
-procedure TTestNeuralNumerical.FusedSDPANonCausalOpenCLParity;
+{$IFDEF OpenCL}
+// One flash parity case: a CPU twin and an OpenCL TNNetFusedSDPA (causal or
+// CachedForwardNonCausal) attend a PrefixLen-row cache plus StepTokens rows,
+// twice; the OpenCL layer runs FlashVariant Variant with ForcedSplits key
+// splits (0 = automatic). ExpectedPath sdpaPathFlash falls back to the split
+// decode (causal) or the host when the variant's tiles do not fit; on the
+// host path the output must match the CPU exactly. Inputs are InputAmplitude
+// * U(-0.5, 0.5); KeyRamp > 0 adds KeyRamp * row to prefix K row `row` and 1
+// to every input. Tolerance: 1e-5 * max(1, max|y|).
+var
+  // Key splits of the last flash run of RunFusedSDPAFlashCase.
+  LastFlashSplits: integer;
+
+// Local memory of a flash work-group, written out from the kernel layout
+// (floats; 0 = not listed): V1 Dk 64: Q 48x68 + K/V 32x68 + P 48x36 + row
+// partials 48x16 + row max 48 + row table 4x48; V2 Dk 128: Q/V 64x68 + K/P
+// 64x68 + partials, rescale, max 64x18 + table 4x64; V2 Dk 256: V 16x260 +
+// K 64x68 + 32x18 + 4x32.
+function ExpectedFlashScratchFloats(Variant, Dk: integer): integer;
+begin
+  Result := 0;
+  if (Variant = 1) and (Dk = 64) then
+    Result := 48 * 68 + 32 * 68 + 48 * 36 + 48 * 16 + 48 + 4 * 48
+  else if (Variant = 2) and (Dk = 128) then
+    Result := 64 * 68 + 64 * 68 + 64 * 18 + 4 * 64
+  else if (Variant = 2) and (Dk = 256) then
+    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32;
+end;
+
+procedure RunFusedSDPAFlashCase(PlatformId: cl_platform_id;
+  DeviceId: cl_device_id; Variant, QHeads, KVHeads, Dk, PrefixLen,
+  StepTokens, Window: integer; SoftCap, InputAmplitude, KeyRamp: TNeuralFloat;
+  Causal: boolean; ForcedSplits, UsableLocalMemBytes: integer;
+  HostSource, ResidentPrefix, Int8KV: boolean;
+  ExpectedPath: TFusedSDPAOpenCLPath);
+var
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn, PrefixK, PrefixV: TNNetVolume;
+  KVRows: TNNetKVRowsOnOpenCL;
+  InDepth, KW, Pass, Pos: integer;
+  MaxPrefixPos, MaxStepInPos, MaxOutputPos, FlashQueryTileRows: integer;
+  Diff, MaxDiff, MaxAbsCpu, Bound: TNeuralFloat;
+  What: string;
+begin
+  What := Format('variant=%d %s Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f ' +
+    'splits=%d mem=%d host=%s resident=%s int8kv=%s', [Variant,
+    BoolToStr(Causal, 'causal', 'non-causal'), QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window, SoftCap, ForcedSplits, UsableLocalMemBytes,
+    BoolToStr(HostSource, true), BoolToStr(ResidentPrefix, true),
+    BoolToStr(Int8KV, true)]);
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  KW := KVHeads * Dk;
+  KVRows.Buffer := nil;
+  KVRows.RowCount := 0;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
+  PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+  PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+  try
+    NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
+      {pCachedForwardNonCausal=}not Causal);
+    LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+    // TNNetIdentity computes on the host, so the attention uploads its input.
+    if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
+      {pCachedForwardNonCausal=}not Causal);
+    LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+    NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    if GetEnvironmentVariable('NEURAL_SDPA_FLASH_VARIANT') = '' then
+      TAssert.AssertEquals(What + ': default flash variant',
+        csFusedSDPAFlashDefaultVariant, LGpu.FusedSDPACL.FlashVariant);
+    LGpu.FusedSDPACL.FlashVariant := Variant;
+    LGpu.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
+    if UsableLocalMemBytes > 0 then
+      LGpu.FusedSDPACL.ForcedLocalMemBytes := UsableLocalMemBytes
+        + csFusedSDPALocalMemReserveBytes;
+    if (ExpectedPath = sdpaPathFlash) and
+      not LGpu.FusedSDPACL.FlashTilesFit(Variant, Dk, Int8KV) then
+    begin
+      if Causal and LGpu.FusedSDPACL.QueryTileFits(QHeads div KVHeads, Dk, Int8KV)
+        then ExpectedPath := sdpaPathDecodeSplit
+        else ExpectedPath := sdpaPathNone;
+    end;
+    if UsableLocalMemBytes = 48 * 1024 - 1024 then
+      TAssert.AssertTrue(What + ': flash tiles fit the NVIDIA budget',
+        LGpu.FusedSDPACL.FlashTilesFit(Variant, Dk, False));
+    MaxPrefixPos := PrefixK.Size - 1;
+    for Pos := 0 to MaxPrefixPos do
+    begin
+      PrefixK.FData[Pos] := InputAmplitude * (Random - 0.5)
+        + KeyRamp * (Pos div KW);
+      PrefixV.FData[Pos] := InputAmplitude * (Random - 0.5);
+    end;
+    if ResidentPrefix then
+      KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
+    MaxStepInPos := StepIn.Size - 1;
+    MaxOutputPos := LCpu.Output.Size - 1;
+    MaxDiff := 0;
+    MaxAbsCpu := 0;
+    for Pass := 0 to 1 do
+    begin
+      for Pos := 0 to MaxStepInPos do
+        StepIn.FData[Pos] := InputAmplitude * (Random - 0.5)
+          + Ord(KeyRamp > 0);
+      LCpu.TruncateCache(0);
+      LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      LGpu.TruncateCache(0);
+      if ResidentPrefix
+        then LGpu.AppendCacheRowsFromOpenCL(KVRows)
+        else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      TAssert.AssertEquals(What + ': cache rows after pass ' + IntToStr(Pass),
+        LCpu.CacheLength, LGpu.CacheLength);
+      for Pos := 0 to MaxOutputPos do
+      begin
+        Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
+          MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
+      end;
+    end;
+    Bound := 1e-5 * Max(1, MaxAbsCpu);
+    WriteLn('  FusedSDPA OpenCL flash ', What, ': max|diff|=', MaxDiff:0:9,
+      ' max|y|=', MaxAbsCpu:0:4, ' gpu forwards=', LGpu.ForwardGPUCnt,
+      ' path=', Ord(LGpu.FusedSDPACL.LastPath), ' ran=',
+      LGpu.FusedSDPACL.LastFlashVariant, ' splits=',
+      LGpu.FusedSDPACL.LastFlashSplits);
+    if ExpectedPath = sdpaPathNone then
+    begin
+      TAssert.AssertEquals(What + ': the host path ran', 0, LGpu.ForwardGPUCnt);
+      TAssert.AssertEquals(What + ': the host path matches the CPU exactly', 0,
+        MaxDiff, 0);
+      exit;
+    end;
+    TAssert.AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff) +
+      ' must be < ' + FloatToStr(Bound), MaxDiff < Bound);
+    TAssert.AssertEquals(What + ': both forwards ran on OpenCL', 2,
+      LGpu.ForwardGPUCnt);
+    TAssert.AssertTrue(What + ': the output stays in OpenCL memory',
+      LGpu.OutputBindableOnOpenCL());
+    TAssert.AssertEquals(What + ': the input source was ' +
+      BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
+      LGpu.PrevOutputOnOpenCL());
+    TAssert.AssertEquals(What + ': the OpenCL path', Ord(ExpectedPath),
+      Ord(LGpu.FusedSDPACL.LastPath));
+    if ExpectedPath <> sdpaPathFlash then exit;
+    TAssert.AssertEquals(What + ': the variant that ran', Variant,
+      LGpu.FusedSDPACL.LastFlashVariant);
+    if Variant = 1
+      then FlashQueryTileRows := IfThen(Dk <= 64, 48, 40)
+      else FlashQueryTileRows := IfThen(Dk <= 128, 64, 32);
+    TAssert.AssertEquals(What + ': flash query tile rows', FlashQueryTileRows,
+      LGpu.FusedSDPACL.LastQueryTileRows);
+    TAssert.AssertEquals(What + ': flash key tile rows',
+      IfThen(Variant = 1, 32, 64), LGpu.FusedSDPACL.LastKeyTileRows);
+    if ForcedSplits > 0 then
+      TAssert.AssertEquals(What + ': flash key splits', ForcedSplits,
+        LGpu.FusedSDPACL.LastFlashSplits);
+    LastFlashSplits := LGpu.FusedSDPACL.LastFlashSplits;
+    if ExpectedFlashScratchFloats(Variant, Dk) > 0 then
+      TAssert.AssertEquals(What + ': flash local memory bytes',
+        ExpectedFlashScratchFloats(Variant, Dk) * 4,
+        int64(LGpu.FusedSDPACL.LastScratchBytes));
+  finally
+    if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
+    PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAFlashCausalOpenCLParity;
 {$IFDEF OpenCL}
 var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  // Inputs are InputAmplitude * U(-0.5, 0.5). KeyRamp > 0 adds KeyRamp * row to
-  // prefix K row `row` and 1 to every input, so scores grow along the cache.
   InputAmplitude, KeyRamp: TNeuralFloat;
-  // The FlashVariant every case runs with (0 = cai_sdpa_noncausal_tiled).
   Variant: integer;
 
-  // ExpectOpenCL false: the host path must run and match the CPU exactly.
-  // ExpectedKeyTileRows > 0 asserts the key tile cai_sdpa_noncausal_tiled used;
-  // forced tiles apply to that kernel only. A flash variant whose tiles do not
-  // fit falls back to it.
   procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens, Window: integer;
-    SoftCap: TNeuralFloat; ForcedQueryTileRows, ForcedKeyTileRows,
-    UsableLocalMemBytes, ExpectedKeyTileRows: integer;
-    HostSource, ResidentPrefix, Int8KV, ExpectOpenCL: boolean);
-  var
-    NNCpu, NNGpu: TNNet;
-    LCpu, LGpu: TNNetFusedSDPA;
-    StepIn, PrefixK, PrefixV: TNNetVolume;
-    KVRows: TNNetKVRowsOnOpenCL;
-    InDepth, KW, Pass, Pos: integer;
-    MaxPrefixPos, MaxStepInPos, MaxOutputPos: integer;
-    Diff, MaxDiff, MaxAbsCpu, Bound: TNeuralFloat;
-    What: string;
-    ExpectedVariant, FlashQueryTileRows: integer;
+    SoftCap: TNeuralFloat; ForcedSplits: integer; HostSource: boolean;
+    ExpectedPath: TFusedSDPAOpenCLPath);
   begin
-    What := Format('variant=%d Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f ' +
-      'tiles=%dx%d mem=%d host=%s resident=%s int8kv=%s', [Variant, QHeads,
-      KVHeads, Dk, PrefixLen, StepTokens, Window, SoftCap, ForcedQueryTileRows,
-      ForcedKeyTileRows, UsableLocalMemBytes, BoolToStr(HostSource, true),
-      BoolToStr(ResidentPrefix, true), BoolToStr(Int8KV, true)]);
-    InDepth := (QHeads + 2 * KVHeads) * Dk;
-    KW := KVHeads * Dk;
-    KVRows.Buffer := nil;
-    KVRows.RowCount := 0;
-    NNCpu := TNNet.Create();
-    NNGpu := TNNet.Create();
-    StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
-    PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
-    PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
-    try
-      NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
-        {pCachedForwardNonCausal=}True);
-      LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
-      NNCpu.AddLayer(LCpu);
-      NNCpu.SetTrainable(False, False);
-      NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-      // TNNetIdentity computes on the host, so the attention uploads its input.
-      if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
-      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
-        {pCachedForwardNonCausal=}True);
-      LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
-      NNGpu.AddLayer(LGpu);
-      NNGpu.SetTrainable(False, False);
-      NNGpu.EnableOpenCL(PlatformId, DeviceId);
-      if GetEnvironmentVariable('NEURAL_SDPA_FLASH_VARIANT') = '' then
-        AssertEquals(What + ': default flash variant',
-          csFusedSDPAFlashDefaultVariant, LGpu.FusedSDPACL.FlashVariant);
-      LGpu.FusedSDPACL.FlashVariant := Variant;
-      LGpu.FusedSDPACL.ForcedQueryTileRows := ForcedQueryTileRows;
-      LGpu.FusedSDPACL.ForcedKeyTileRows := ForcedKeyTileRows;
-      if UsableLocalMemBytes > 0 then
-        LGpu.FusedSDPACL.ForcedLocalMemBytes := UsableLocalMemBytes
-          + csFusedSDPALocalMemReserveBytes;
-      if (Variant > 0) and LGpu.FusedSDPACL.FlashTilesFit(Variant, Dk, False)
-        then ExpectedVariant := Variant
-        else ExpectedVariant := 0;
-      if (Variant > 0) and (UsableLocalMemBytes = 48 * 1024 - 1024) then
-        AssertEquals(What + ': flash tiles fit the NVIDIA budget', Variant,
-          ExpectedVariant);
-      // Wide enough that the running max moves between key tiles, so a
-      // missing rescale shows.
-      MaxPrefixPos := PrefixK.Size - 1;
-      for Pos := 0 to MaxPrefixPos do
-      begin
-        PrefixK.FData[Pos] := InputAmplitude * (Random - 0.5)
-          + KeyRamp * (Pos div KW);
-        PrefixV.FData[Pos] := InputAmplitude * (Random - 0.5);
-      end;
-      if ResidentPrefix then
-        KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
-      MaxStepInPos := StepIn.Size - 1;
-      MaxOutputPos := LCpu.Output.Size - 1;
-      MaxDiff := 0;
-      MaxAbsCpu := 0;
-      for Pass := 0 to 1 do
-      begin
-        for Pos := 0 to MaxStepInPos do
-          StepIn.FData[Pos] := InputAmplitude * (Random - 0.5)
-            + Ord(KeyRamp > 0);
-        LCpu.TruncateCache(0);
-        LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
-        LGpu.TruncateCache(0);
-        if ResidentPrefix
-          then LGpu.AppendCacheRowsFromOpenCL(KVRows)
-          else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
-        NNCpu.Compute(StepIn);
-        NNGpu.Compute(StepIn);
-        AssertEquals(What + ': cache rows after pass ' + IntToStr(Pass),
-          LCpu.CacheLength, LGpu.CacheLength);
-        for Pos := 0 to MaxOutputPos do
-        begin
-          Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
-          if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
-          if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
-            MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
-        end;
-      end;
-      Bound := 1e-5 * Max(1, MaxAbsCpu);
-      WriteLn('  FusedSDPA OpenCL non-causal ', What, ': max|diff|=',
-        MaxDiff:0:9, ' max|y|=', MaxAbsCpu:0:4, ' gpu forwards=',
-        LGpu.ForwardGPUCnt, ' ran=', LGpu.FusedSDPACL.LastFlashVariant,
-        ' tiles=', LGpu.FusedSDPACL.LastQueryTileRows, 'x',
-        LGpu.FusedSDPACL.LastKeyTileRows);
-      if not ExpectOpenCL then
-      begin
-        AssertEquals(What + ': the host path ran', 0, LGpu.ForwardGPUCnt);
-        AssertEquals(What + ': the host path matches the CPU exactly', 0,
-          MaxDiff, 0);
-        exit;
-      end;
-      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff) + ' must be < ' +
-        FloatToStr(Bound), MaxDiff < Bound);
-      AssertEquals(What + ': both forwards ran on OpenCL', 2,
-        LGpu.ForwardGPUCnt);
-      AssertTrue(What + ': the output stays in OpenCL memory',
-        LGpu.OutputBindableOnOpenCL());
-      AssertEquals(What + ': the input source was ' +
-        BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
-        LGpu.PrevOutputOnOpenCL());
-      AssertEquals(What + ': the variant that ran', ExpectedVariant,
-        LGpu.FusedSDPACL.LastFlashVariant);
-      if ExpectedVariant > 0 then
-      begin
-        if ExpectedVariant = 1
-          then FlashQueryTileRows := IfThen(Dk <= 64, 48, 40)
-          else FlashQueryTileRows := IfThen(Dk <= 128, 64, 32);
-        AssertEquals(What + ': flash query tile rows', FlashQueryTileRows,
-          LGpu.FusedSDPACL.LastQueryTileRows);
-        AssertEquals(What + ': flash key tile rows',
-          IfThen(ExpectedVariant = 1, 32, 64), LGpu.FusedSDPACL.LastKeyTileRows);
-        exit;
-      end;
-      if ExpectedKeyTileRows > 0 then
-        AssertEquals(What + ': key tile rows', ExpectedKeyTileRows,
-          LGpu.FusedSDPACL.LastKeyTileRows);
-      if ForcedQueryTileRows > 0 then
-        AssertEquals(What + ': query tile rows',
-          Min(ForcedQueryTileRows, StepTokens),
-          LGpu.FusedSDPACL.LastQueryTileRows)
-      else
-        AssertTrue(What + ': automatic query tile rows within 1..T',
-          (LGpu.FusedSDPACL.LastQueryTileRows >= 1) and
-          (LGpu.FusedSDPACL.LastQueryTileRows <= StepTokens));
-    finally
-      if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
-      PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
-    end;
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, Variant, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+      {Causal=}True, ForcedSplits, {UsableLocalMemBytes=}0, HostSource,
+      {ResidentPrefix=}True, {Int8KV=}False, ExpectedPath);
   end;
 
 begin
@@ -75755,88 +75786,158 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for Variant := 0 to csFusedSDPAFlashVariants do
+  for Variant := 1 to csFusedSDPAFlashVariants do
+  begin
+    RandSeed := 20261005;
+    InputAmplitude := 3;
+    KeyRamp := 0;
+    // Prefill windows of 16, 64 and 100 rows over prefixes of 0, 7 and 300
+    // rows; groups of 4, 1 and 8.
+    RunCase(4, 1, 64, 0, 16, 0, 0, 0, False, sdpaPathFlash);
+    RunCase(2, 2, 128, 7, 64, 0, 0, 0, False, sdpaPathFlash);
+    // A causal layer fed from the host keeps the host path (WillOpenCL).
+    RunCase(2, 2, 128, 7, 64, 0, 0, 0, True, sdpaPathNone);
+    RunCase(8, 1, 32, 300, 100, 0, 0, 0, False, sdpaPathFlash);
+    // Dk 256 (32-row tiles; variant 1 keeps the split decode) and the Qwen3-VL
+    // head dimension with the soft-cap.
+    RunCase(4, 2, 256, 20, 16, 0, 0, 0, False, sdpaPathFlash);
+    RunCase(2, 1, 72, 40, 32, 0, 5.0, 0, False, sdpaPathFlash);
+    // Sliding windows: 20 keys inside one key tile, and 100 keys starting
+    // past the first 15 tiles of a 1064-row cache.
+    RunCase(2, 1, 64, 300, 16, 20, 0, 0, False, sdpaPathFlash);
+    RunCase(2, 2, 32, 1000, 64, 100, 0, 0, False, sdpaPathFlash);
+    // Forced key splits: 1 and 3, then 7 over a 20-key window, where most
+    // splits hold no key of a given row.
+    RunCase(2, 2, 64, 300, 32, 0, 0, 1, False, sdpaPathFlash);
+    RunCase(2, 2, 64, 300, 16, 0, 0, 3, False, sdpaPathFlash);
+    RunCase(4, 2, 32, 300, 16, 20, 0, 7, False, sdpaPathFlash);
+    // Five rows stay below csFusedSDPAFlashMinTokens: the split-row decode.
+    RunCase(2, 2, 64, 100, 5, 0, 0, 0, False, sdpaPathDecodeSplit);
+    // Several row tiles and splits at once; Dk 256 with splits.
+    RunCase(4, 1, 128, 40, 600, 0, 0, 5, False, sdpaPathFlash);
+    RunCase(2, 1, 256, 100, 16, 0, 0, 3, False, sdpaPathFlash);
+    // Online-softmax drift over a 4016-key cache, automatic splits.
+    RunCase(2, 2, 64, 4000, 16, 0, 0, 0, False, sdpaPathFlash);
+    // Scores rising along a 1016-key cache under automatic splits: the
+    // running max and the merge both cross the -80 exponent clamp.
+    InputAmplitude := 1;
+    KeyRamp := 0.5;
+    RunCase(2, 2, 16, 1000, 16, 0, 0, 0, False, sdpaPathFlash);
+    AssertTrue('the ramp case ran several key splits', LastFlashSplits > 1);
+    InputAmplitude := 3;
+    KeyRamp := 0;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Tolerance: 1e-5 of max(1, max|y|): the kernel sums the same products as the
+// host in another order; a wrong row, head, tile edge or rescale moves the
+// output by order 1e-1.
+procedure TTestNeuralNumerical.FusedSDPANonCausalOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InputAmplitude, KeyRamp: TNeuralFloat;
+  Variant: integer;
+
+  // ExpectOpenCL false: the host path must run and match the CPU exactly. A
+  // variant whose tiles do not fit (Dk, UsableLocalMemBytes) takes the host.
+  procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens, Window: integer;
+    SoftCap: TNeuralFloat; UsableLocalMemBytes: integer;
+    HostSource, ResidentPrefix, Int8KV, ExpectOpenCL: boolean);
+  begin
+    if ExpectOpenCL
+      then RunFusedSDPAFlashCase(PlatformId, DeviceId, Variant, QHeads, KVHeads,
+        Dk, PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+        {Causal=}False, {ForcedSplits=}0, UsableLocalMemBytes, HostSource,
+        ResidentPrefix, Int8KV, sdpaPathFlash)
+      else RunFusedSDPAFlashCase(PlatformId, DeviceId, Variant, QHeads, KVHeads,
+        Dk, PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+        {Causal=}False, {ForcedSplits=}0, UsableLocalMemBytes, HostSource,
+        ResidentPrefix, Int8KV, sdpaPathNone);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for Variant := 1 to csFusedSDPAFlashVariants do
   begin
     RandSeed := 20260930;
     InputAmplitude := 3;
     KeyRamp := 0;
-    // Qwen-Image head dimension, automatic tiles, fewer rows than a tile.
-    RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    // No prefix; the rows fill exactly one query tile and two key tiles.
-    RunCase(2, 2, 16, 0, 16, 0, 0, 16, 8, 0, 8, True, False, False, True);
-    // One prefix row; 37 rows over 16-row query tiles and 38 keys over 8-row
-    // key tiles leave a partial last tile on both axes.
-    RunCase(2, 2, 16, 1, 37, 0, 0, 16, 8, 0, 8, True, True, False, True);
-    // GQA groups of 2, Dk off the lane width, and the soft-cap.
-    RunCase(4, 2, 5, 3, 9, 0, 5.0, 4, 3, 0, 3, False, True, False, True);
-    // Head dimension 128, GQA group of 3, several tiles on both axes.
-    RunCase(3, 1, 128, 40, 70, 0, 0, 32, 16, 0, 16, True, True, False, True);
+    // Qwen-Image head dimension, fewer rows than a tile.
+    RunCase(2, 2, 128, 7, 5, 0, 0, 0, False, True, False, True);
+    // No prefix (uploaded source); a partial last tile on both axes.
+    RunCase(2, 2, 16, 0, 16, 0, 0, 0, True, False, False, True);
+    RunCase(2, 2, 16, 1, 37, 0, 0, 0, True, True, False, True);
+    // GQA groups of 2, Dk off the float4 width, and the soft-cap.
+    RunCase(4, 2, 5, 3, 9, 0, 5.0, 0, False, True, False, True);
+    // Dk 128, a group of 3, several row tiles.
+    RunCase(3, 1, 128, 40, 70, 0, 0, 0, True, True, False, True);
     // A sliding window: the first 7 of the 17 cache rows are out of reach.
-    RunCase(2, 1, 8, 6, 11, 10, 0, 4, 4, 0, 4, False, True, False, True);
-    // Automatic tiles over several query and key tiles.
-    RunCase(2, 2, 64, 20, 150, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    // Query tiles of 1, 15, 17, 33 and 48 rows (one, part of and all three
-    // row slots per lane) against full, odd and single-row key tiles.
-    RunCase(2, 2, 32, 9, 50, 0, 0, 1, 32, 0, 32, False, True, False, True);
-    RunCase(2, 1, 24, 5, 61, 0, 0, 15, 31, 0, 31, True, True, False, True);
-    RunCase(2, 2, 40, 3, 70, 0, 0, 17, 1, 0, 1, False, False, False, True);
-    RunCase(3, 1, 16, 12, 67, 0, 2.5, 33, 13, 0, 13, False, True, False, True);
-    RunCase(2, 2, 128, 30, 100, 0, 0, 48, 32, 0, 32, False, True, False, True);
-    // A lane holds 128 head-dim columns: Dk 129 and 256 run two column chunks
-    // and Dk 260 three, each recomputing the scores.
-    RunCase(2, 2, 129, 6, 20, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    RunCase(2, 1, 256, 10, 35, 0, 0, 16, 32, 0, 32, True, True, False, True);
-    RunCase(2, 2, 260, 4, 9, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    // An NVIDIA-sized budget (48 KB less the reserve) at the Qwen-Image head
-    // dimension: automatic tiles of 42 query rows by 32 keys.
-    RunCase(2, 2, 128, 14, 90, 0, 0, 0, 0, 48 * 1024 - 1024, 32, False, True,
-      False, True);
-    // A long sequence: 540 keys over 17 key tiles, automatic query tiles.
-    RunCase(2, 2, 64, 300, 240, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(2, 1, 8, 6, 11, 10, 0, 0, False, True, False, True);
+    // Several row and key tiles; odd head dimensions; soft-cap.
+    RunCase(2, 2, 64, 20, 150, 0, 0, 0, False, True, False, True);
+    RunCase(2, 1, 24, 5, 61, 0, 0, 0, True, True, False, True);
+    RunCase(2, 2, 40, 3, 70, 0, 0, 0, False, False, False, True);
+    RunCase(3, 1, 16, 12, 67, 0, 2.5, 0, False, True, False, True);
+    // Dk 129 and 256 (32-row tiles, host for variant 1); Dk 260 is past every
+    // variant and keeps the host path.
+    RunCase(2, 2, 129, 6, 20, 0, 0, 0, False, True, False, True);
+    RunCase(2, 1, 256, 10, 35, 0, 0, 0, True, True, False, True);
+    RunCase(2, 2, 260, 4, 9, 0, 0, 0, False, True, False, True);
+    // An NVIDIA-sized budget (48 KB less the reserve) at Dk 128: every
+    // variant's tiles fit.
+    RunCase(2, 2, 128, 14, 90, 0, 0, 48 * 1024 - 1024, False, True, False,
+      True);
+    // 540 keys over several key tiles.
+    RunCase(2, 2, 64, 300, 240, 0, 0, 0, False, True, False, True);
     // Inputs in +-20 at Dk 16: scores within one key tile spread by hundreds,
-    // so a row max taken over fewer than all 16 X lanes moves the softmax.
+    // so a row max taken over fewer than all 16 key lanes moves the softmax.
     InputAmplitude := 40;
-    RunCase(2, 2, 16, 20, 60, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    // Scores rising by about 100 per 8-row key tile: the running max moves past
-    // the -80 rescale clamp on every prefix tile.
-    InputAmplitude := 1;
-    KeyRamp := 3;
-    RunCase(2, 2, 16, 40, 12, 0, 0, 16, 8, 0, 8, False, True, False, True);
+    RunCase(2, 2, 16, 20, 60, 0, 0, 0, False, True, False, True);
     InputAmplitude := 3;
-    KeyRamp := 0;
-    // 24000 usable bytes at Dk=128 fit fewer than 16 query rows beside a 32-row
-    // key tile, so the automatic sizing falls back to 16-row key tiles.
-    RunCase(2, 2, 128, 7, 37, 0, 0, 0, 0, 24000, 16, False, True, False, True);
-    // 1 KB of usable local memory holds no Dk=128 tile: the host path runs,
-    // reading back the prefix the OpenCL-side append left resident.
-    RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 1024, 0, True, True, False, False);
-    // GQA groups of 4 at Dk 64: 80 packed rows over two flash row tiles.
-    RunCase(4, 1, 64, 30, 20, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    // 24000 and 1024 usable bytes hold no Dk=128 flash tile: the host path
+    // runs, reading back the prefix the OpenCL-side append left resident.
+    RunCase(2, 2, 128, 7, 37, 0, 0, 24000, False, True, False, True);
+    RunCase(2, 2, 128, 7, 5, 0, 0, 1024, True, True, False, False);
+    // GQA groups of 4 at Dk 64: 80 packed rows over two row tiles.
+    RunCase(4, 1, 64, 30, 20, 0, 0, 0, False, True, False, True);
     // The Qwen3-VL head dimension (one 72-column slice in variant 2), a group
     // of 4, the soft-cap and an uploaded source.
-    RunCase(4, 1, 72, 9, 15, 0, 3.0, 0, 0, 0, 32, True, True, False, True);
-    RunCase(2, 2, 72, 10, 70, 0, 0, 0, 0, 0, 32, False, True, False, True);
-    // Dk 256: 32-row flash tiles; past variant 1's limit.
-    RunCase(2, 1, 256, 20, 40, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(4, 1, 72, 9, 15, 0, 3.0, 0, True, True, False, True);
+    RunCase(2, 2, 72, 10, 70, 0, 0, 0, False, True, False, True);
     // A group of 8 with 3 token rows: 24 packed rows, fewer than a tile.
-    RunCase(8, 1, 16, 5, 3, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(8, 1, 16, 5, 3, 0, 0, 0, False, True, False, True);
     // One token row, a group of 4, a 50-row prefix.
-    RunCase(4, 1, 32, 50, 1, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(4, 1, 32, 50, 1, 0, 0, 0, False, True, False, True);
     // Dk 128 with groups of 2: 140 packed rows over several row tiles.
-    RunCase(4, 2, 128, 33, 70, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(4, 2, 128, 33, 70, 0, 0, 0, False, True, False, True);
     // A window of 10 inside one key tile, and one of 100 that starts 130 rows
     // into a 230-row cache, so the key loop starts mid-cache.
-    RunCase(2, 2, 32, 40, 12, 10, 0, 0, 0, 0, 32, False, True, False, True);
-    RunCase(2, 1, 16, 200, 30, 100, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(2, 2, 32, 40, 12, 10, 0, 0, False, True, False, True);
+    RunCase(2, 1, 16, 200, 30, 100, 0, 0, False, True, False, True);
     // Scores rising by about 750 per 64-key tile over 312 keys: the running
-    // max moves past the -80 rescale clamp on every flash tile.
+    // max moves past the -80 rescale clamp on every key tile.
     InputAmplitude := 1;
     KeyRamp := 3;
-    RunCase(2, 2, 16, 300, 12, 0, 0, 0, 0, 0, 32, False, True, False, True);
+    RunCase(2, 2, 16, 300, 12, 0, 0, 0, False, True, False, True);
     InputAmplitude := 3;
     KeyRamp := 0;
     // An int8 KV cache keeps the host path.
-    RunCase(2, 2, 16, 4, 9, 0, 0, 0, 0, 0, 0, False, False, True, False);
+    RunCase(2, 2, 16, 4, 9, 0, 0, 0, False, False, True, False);
+    // Forced key splits in mask mode none.
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, Variant, 2, 2, 64, 200, 40, 0,
+      0, InputAmplitude, KeyRamp, {Causal=}False, {ForcedSplits=}4, 0, False,
+      True, False, sdpaPathFlash);
   end;
 end;
 {$ELSE}

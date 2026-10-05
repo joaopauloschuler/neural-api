@@ -1,8 +1,8 @@
 program SDPAFlashBench;
 (*
-SDPAFlashBench: times the OpenCL non-causal cached attention of TNNetFusedSDPA
-(TNNetFusedSDPACL.ComputeNonCausal) for each FlashVariant: 0 is
-cai_sdpa_noncausal_tiled, 1..3 are cai_sdpa_flash_v1..v3. No model is loaded.
+SDPAFlashBench: times the OpenCL flash attention of TNNetFusedSDPA
+(TNNetFusedSDPACL.ComputeFlash, cai_sdpa_flash_v1..v3 = FlashVariant 1..3)
+over a resident KV cache, in mask mode none or causal. No model is loaded.
 
 Before timing, every variant runs once on a small shape against the CPU twin
 (TNNetFusedSDPA on the host) at the requested head dimension; a variant whose
@@ -23,10 +23,10 @@ The default shape needs about 400 MB of host volumes.
 
 --sweep-crossover times the flash path against the split-row decode path
 (TNNetFusedSDPACL.Compute, cai_sdpa_decode_split + merge) for 1..512 token
-rows over 8k and 32k caches. CAVEAT: the flash path runs mask mode none
-(every row attends the whole window) while the decode path is causal (row t
-attends up to its own slot), so their FLOPs differ slightly; compare ms per
-forward and the per-key figure, not the masks.
+rows over 8k and 32k caches. With --mode causal both compute the same
+attention; with --mode none the flash rows see the whole window while the
+decode path stays causal. Key splits (merged by cai_sdpa_decode_merge) are
+printed per flash run.
 
 Diagnostics: NEURAL_SDPA_DUMP_PTX=<file> writes the built program (PTX on
 NVIDIA). NEURAL_OPENCL_BUILD_LOG=1 prints the first build log of the process;
@@ -40,8 +40,8 @@ variant.
 
 Usage:
   SDPAFlashBench [--q-heads 32] [--kv-heads 32] [--dk 128] [--tokens 4096]
-    [--prefix 0] [--mode none] [--window 0] [--iters 20] [--warmup 3]
-    [--variants 0,1,2,3] [--sweep-crossover] [--gpu-platform 0]
+    [--prefix 0] [--mode none|causal] [--window 0] [--iters 20] [--warmup 3]
+    [--variants 1,2,3] [--sweep-crossover] [--gpu-platform 0]
     [--gpu-device 0]
 
 Coded by Claude (AI).
@@ -71,7 +71,7 @@ type
 var
   QHeads, KVHeads, Dk, TokenCnt, PrefixLen, Window, Iters, Warmup: integer;
   PlatformIdx, DeviceIdx: integer;
-  SweepCrossover: boolean;
+  SweepCrossover, Causal: boolean;
   Variants: TVariantList;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -81,8 +81,8 @@ procedure PrintUsageAndHalt(const Problem: string);
 begin
   if Problem <> '' then WriteLn('Error: ', Problem);
   WriteLn('Usage: SDPAFlashBench [--q-heads N] [--kv-heads N] [--dk N] ' +
-    '[--tokens N] [--prefix N] [--mode none] [--window N] [--iters N] ' +
-    '[--warmup N] [--variants 0,1,2,3] [--sweep-crossover] ' +
+    '[--tokens N] [--prefix N] [--mode none|causal] [--window N] ' +
+    '[--iters N] [--warmup N] [--variants 1,2,3] [--sweep-crossover] ' +
     '[--gpu-platform N] [--gpu-device N]');
   Halt(2);
 end;
@@ -97,9 +97,9 @@ begin
   SetLength(Result, Length(Parts));
   for PartIdx := 0 to High(Parts) do
   begin
-    if (not TryStrToInt(Trim(Parts[PartIdx]), Variant)) or (Variant < 0) or
+    if (not TryStrToInt(Trim(Parts[PartIdx]), Variant)) or (Variant < 1) or
       (Variant > csFusedSDPAFlashVariants) then
-      PrintUsageAndHalt('--variants takes numbers 0..' +
+      PrintUsageAndHalt('--variants takes numbers 1..' +
         IntToStr(csFusedSDPAFlashVariants));
     Result[PartIdx] := Variant;
   end;
@@ -129,7 +129,8 @@ begin
   PlatformIdx := 0;
   DeviceIdx := 0;
   SweepCrossover := false;
-  Variants := ParseVariants('0,1,2,3');
+  Causal := false;
+  Variants := ParseVariants('1,2,3');
   ArgIdx := 1;
   while ArgIdx <= ParamCount do
   begin
@@ -154,8 +155,10 @@ begin
     else if Arg = '--mode' then
     begin
       Inc(ArgIdx);
-      if (ArgIdx > ParamCount) or (ParamStr(ArgIdx) <> 'none') then
-        PrintUsageAndHalt('--mode: only "none" exists so far');
+      if (ArgIdx > ParamCount) or ((ParamStr(ArgIdx) <> 'none') and
+        (ParamStr(ArgIdx) <> 'causal')) then
+        PrintUsageAndHalt('--mode takes none or causal');
+      Causal := ParamStr(ArgIdx) = 'causal';
     end
     else PrintUsageAndHalt('unknown argument ' + Arg);
     Inc(ArgIdx);
@@ -174,7 +177,30 @@ begin
   if (pWindow > 0) and (Result > pWindow) then Result := pWindow;
 end;
 
-// Max |CPU - OpenCL| of one non-causal forward of the parity shape at Variant,
+// Cache rows summed over the token rows of a causal step.
+function CausalLiveKeys(CacheLen, StepTokens, pWindow: integer): int64;
+var
+  RowIdx, RowKeys: integer;
+begin
+  Result := 0;
+  for RowIdx := 0 to StepTokens - 1 do
+  begin
+    RowKeys := CacheLen + RowIdx + 1;
+    if (pWindow > 0) and (RowKeys > pWindow) then RowKeys := pWindow;
+    Inc(Result, RowKeys);
+  end;
+end;
+
+// Cache rows summed over the token rows of a step in the selected mode.
+function StepLiveKeys(CacheLen, StepTokens: integer): int64;
+begin
+  if Causal
+    then Result := CausalLiveKeys(CacheLen, StepTokens, Window)
+    else Result := int64(StepTokens) * LiveKeysPerRow(CacheLen, StepTokens,
+      Window);
+end;
+
+// Max |CPU - OpenCL| of one forward of the parity shape at Variant,
 // and the variant that actually ran; MaxAbsY receives max |y| of the CPU.
 function ParityMaxDiff(Variant: integer; out MaxAbsY: TNeuralFloat;
   out RanVariant: integer): TNeuralFloat;
@@ -194,13 +220,13 @@ begin
   try
     NNCpu.AddLayer(TNNetInput.Create(csParityTokens, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(csParityQHeads, csParityKVHeads, Dk, False,
-      Window, 0, {pCachedForwardNonCausal=}True);
+      Window, 0, {pCachedForwardNonCausal=}not Causal);
     LCpu.BeginIncrementalDecode(csParityPrefix + csParityTokens);
     NNCpu.AddLayer(LCpu);
     NNCpu.SetTrainable(False, False);
     NNGpu.AddLayer(TNNetInput.Create(csParityTokens, 1, InDepth, 1));
     LGpu := TNNetFusedSDPA.Create(csParityQHeads, csParityKVHeads, Dk, False,
-      Window, 0, {pCachedForwardNonCausal=}True);
+      Window, 0, {pCachedForwardNonCausal=}not Causal);
     LGpu.BeginIncrementalDecode(csParityPrefix + csParityTokens);
     NNGpu.AddLayer(LGpu);
     NNGpu.SetTrainable(False, False);
@@ -213,7 +239,7 @@ begin
     LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
     NNCpu.Compute(StepIn);
     NNGpu.Compute(StepIn);
-    if LGpu.ForwardGPUCnt = 0
+    if (LGpu.ForwardGPUCnt = 0) or (LGpu.FusedSDPACL.LastPath <> sdpaPathFlash)
       then RanVariant := -1
       else RanVariant := LGpu.FusedSDPACL.LastFlashVariant;
     Result := 0;
@@ -261,27 +287,28 @@ begin
   Shape.V.Free; Shape.K.Free; Shape.Y.Free; Shape.X.Free;
 end;
 
-// One forward of Shape on the flash path (Causal false) or the split-row
-// decode path (Causal true); the result stays in OpenCL memory.
+// One forward of Shape on the split-row decode path (Decode) or the flash
+// path in the selected mode; the result stays in OpenCL memory.
 procedure RunForward(Helper: TNNetFusedSDPACL; const Shape: TTimingShape;
-  Causal: boolean);
+  Decode: boolean);
 var
   InvSqrtDk: TNeuralFloat;
 begin
   InvSqrtDk := 1 / Sqrt(Dk);
-  if Causal then
+  if Decode then
     Helper.Compute(Shape.X, Shape.Y, Shape.K, Shape.V, QHeads, KVHeads,
       QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen, QHeads * Dk,
       KVHeads * Dk, Window, InvSqrtDk, 0, 0, Shape.BufX, true)
   else
-    Helper.ComputeNonCausal(Shape.X, Shape.Y, Shape.K, Shape.V, QHeads,
+    Helper.ComputeFlash(Shape.X, Shape.Y, Shape.K, Shape.V, QHeads,
       KVHeads, QHeads div KVHeads, Dk, Shape.CacheMax, Shape.CacheLen,
-      QHeads * Dk, KVHeads * Dk, Window, InvSqrtDk, 0, 0, Shape.BufX, true);
+      QHeads * Dk, KVHeads * Dk, Window, Causal, InvSqrtDk, 0, 0,
+      Shape.BufX, true);
 end;
 
 // Median milliseconds per forward over csTimedBlocks blocks.
 function TimeForwards(Helper: TNNetFusedSDPACL; const Shape: TTimingShape;
-  Causal: boolean): double;
+  Decode: boolean): double;
 var
   BlockMs: array[0..csTimedBlocks - 1] of double;
   BlockIdx, IterIdx, BlockIters: integer;
@@ -289,7 +316,7 @@ var
   WarmupSeconds: double;
 begin
   StartTime := Now();
-  for IterIdx := 1 to Max(Warmup, 1) do RunForward(Helper, Shape, Causal);
+  for IterIdx := 1 to Max(Warmup, 1) do RunForward(Helper, Shape, Decode);
   Helper.ForwardKernel.Finish();
   WarmupSeconds := (Now() - StartTime) * 86400.0 / Max(Warmup, 1);
   BlockIters := Iters;
@@ -298,7 +325,7 @@ begin
   for BlockIdx := 0 to csTimedBlocks - 1 do
   begin
     StartTime := Now();
-    for IterIdx := 1 to BlockIters do RunForward(Helper, Shape, Causal);
+    for IterIdx := 1 to BlockIters do RunForward(Helper, Shape, Decode);
     Helper.ForwardKernel.Finish();
     BlockMs[BlockIdx] := (Now() - StartTime) * 86400.0 * 1000.0 / BlockIters;
   end;
@@ -336,10 +363,8 @@ end;
 
 function PrivateMemText(Helper: TNNetFusedSDPACL; Variant: integer): string;
 begin
-  if Variant = 0
-    then Result := '-'
-    else Result := IntToStr(Helper.ForwardKernel.KernelPrivateMemSize(
-      Helper.FlashKernel(Variant)));
+  Result := IntToStr(Helper.ForwardKernel.KernelPrivateMemSize(
+    Helper.FlashKernel(Variant)));
 end;
 
 procedure RunParity(var Passed: array of boolean);
@@ -348,8 +373,8 @@ var
   MaxDiff, MaxAbsY, Bound: TNeuralFloat;
 begin
   WriteLn(Format('Parity vs CPU: Hq=%d Hkv=%d Dk=%d tokens=%d prefix=%d ' +
-    'window=%d', [csParityQHeads, csParityKVHeads, Dk, csParityTokens,
-    csParityPrefix, Window]));
+    'window=%d mode=%s', [csParityQHeads, csParityKVHeads, Dk, csParityTokens,
+    csParityPrefix, Window, BoolToStr(Causal, 'causal', 'none')]));
   for VariantIdx := 0 to High(Variants) do
   begin
     RandSeed := 20261005;
@@ -378,11 +403,12 @@ begin
   end;
   CreateShape(Helper, TokenCnt, PrefixLen, Shape);
   try
-    LiveKeys := int64(TokenCnt) * LiveKeysPerRow(PrefixLen, TokenCnt, Window);
+    LiveKeys := StepLiveKeys(PrefixLen, TokenCnt);
     WriteLn(Format('Timing: Hq=%d Hkv=%d Dk=%d tokens=%d prefix=%d window=%d ' +
-      'mode=none, %d live keys per row', [QHeads, KVHeads, Dk, TokenCnt,
-      PrefixLen, Window, LiveKeys div TokenCnt]));
-    WriteLn('  variant ran  tiles   local B  private B       ms   TFLOPS');
+      'mode=%s, %d live keys per row on average', [QHeads, KVHeads, Dk,
+      TokenCnt, PrefixLen, Window, BoolToStr(Causal, 'causal', 'none'),
+      LiveKeys div TokenCnt]));
+    WriteLn('  variant ran  tiles  splits  local B  private B       ms   TFLOPS');
     for VariantIdx := 0 to High(Variants) do
     begin
       Variant := Variants[VariantIdx];
@@ -392,10 +418,11 @@ begin
         continue;
       end;
       Helper.FlashVariant := Variant;
-      Ms := TimeForwards(Helper, Shape, {Causal=}false);
-      WriteLn(Format('  %7d %3d %3dx%-3d %8d %10s %8.3f %8.2f', [Variant,
+      Ms := TimeForwards(Helper, Shape, {Decode=}false);
+      WriteLn(Format('  %7d %3d %3dx%-3d %6d %8d %10s %8.3f %8.2f', [Variant,
         Helper.LastFlashVariant, Helper.LastQueryTileRows,
-        Helper.LastKeyTileRows, int64(Helper.LastScratchBytes),
+        Helper.LastKeyTileRows, Helper.LastFlashSplits,
+        int64(Helper.LastScratchBytes),
         PrivateMemText(Helper, Variant), Ms, Tflops(LiveKeys, Ms)]));
     end;
   finally
@@ -415,9 +442,11 @@ var
   Line: string;
 begin
   WriteLn;
-  WriteLn('Crossover sweep, flash (mask mode none) against the split-row ' +
-    'decode (causal).');
-  WriteLn('  CAVEAT: the masks differ; ms per forward is the comparable figure.');
+  WriteLn(Format('Crossover sweep, flash (mode %s) against the split-row ' +
+    'decode (causal); "/n" = flash key splits.',
+    [BoolToStr(Causal, 'causal', 'none')]));
+  if not Causal then
+    WriteLn('  CAVEAT: the masks differ; ms per forward is the comparable figure.');
   for CacheIdx := 0 to High(csSweepCaches) do
   begin
     if HostBytes(512, csSweepCaches[CacheIdx] + 512) > csMaxHostBytes then
@@ -430,25 +459,25 @@ begin
     end;
     Line := Format('  cache %6d  tokens  decode ms', [csSweepCaches[CacheIdx]]);
     for VariantIdx := 0 to High(Variants) do
-      Line := Line + Format('   v%d ms', [Variants[VariantIdx]]);
+      Line := Line + Format('      v%d ms', [Variants[VariantIdx]]);
     WriteLn(Line);
     for TokenIdx := 0 to High(csSweepTokens) do
     begin
       Tokens := csSweepTokens[TokenIdx];
       CreateShape(Helper, Tokens, csSweepCaches[CacheIdx], Shape);
       try
-        DecodeMs := TimeForwards(Helper, Shape, {Causal=}true);
+        DecodeMs := TimeForwards(Helper, Shape, {Decode=}true);
         Line := Format('               %6d %10.4f', [Tokens, DecodeMs]);
         for VariantIdx := 0 to High(Variants) do
         begin
           if not Passed[VariantIdx] then
           begin
-            Line := Line + '     FAIL';
+            Line := Line + '        FAIL';
             continue;
           end;
           Helper.FlashVariant := Variants[VariantIdx];
-          Ms := TimeForwards(Helper, Shape, {Causal=}false);
-          Line := Line + Format(' %8.4f', [Ms]);
+          Ms := TimeForwards(Helper, Shape, {Decode=}false);
+          Line := Line + Format(' %8.4f/%-2d', [Ms, Helper.LastFlashSplits]);
         end;
         WriteLn(Line);
       finally
@@ -480,7 +509,6 @@ begin
       for VariantIdx := 0 to High(Variants) do
       begin
         Variant := Variants[VariantIdx];
-        if Variant = 0 then continue;
         WriteLn(Format('  cai_sdpa_flash_v%d: %d lanes, max work-group %d, ' +
           'private %s B, tiles fit at Dk %d: %s', [Variant,
           csFusedSDPAFlashLanes[Variant],

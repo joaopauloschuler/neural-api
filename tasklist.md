@@ -2550,7 +2550,7 @@ rather than acted on.
         before AddLayer, TruncateCache(0) per tile pass), replacing the split /
         TNNetScaledDotProductAttention (host softmax, 4 uploads + 3 blocking
         downloads per pass) / one-input TNNetDeepConcat. Check
-        NonCausalTilesFit at the VAE width on 48 KB local memory.
+        FlashTilesFit at the VAE width on 48 KB local memory.
   - [x] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
         beta=0 on every block weight swap (20 MB per image): weightless variant
         or no re-upload when unchanged.
@@ -2595,7 +2595,7 @@ rather than acted on.
           loads, fewer barriers, 2-3 tile variants behind an environment switch;
           a small benchmark example timing the kernel at given shapes without a
           model. User times the variants on the L4.
-    - [ ] E2.2 (coder A continued): lock in the winning tiles; causal mode and
+    - [x] E2.2 (coder A continued): lock in the winning tiles; causal mode and
           the TNNetFusedSDPA dispatch for LLM prefill windows; parity on LLM
           prefill and Qwen-Image. User measures ChatTerminal TTFT and a Qwen-Image
           --profile run.

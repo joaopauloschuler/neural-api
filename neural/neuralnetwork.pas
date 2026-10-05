@@ -4705,30 +4705,18 @@ const
   // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
   // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
   csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes of a cai_sdpa_noncausal_tiled work-group (its reqd_work_group_size):
-  // X walks key rows and head-dim columns, Y walks query rows.
-  csFusedSDPATileLanesX = 16;
-  csFusedSDPATileLanesY = 16;
-  // Query rows, key rows and float4 head-dim columns one lane owns per tile:
-  // the CAI_NC_ROW_SLOTS, CAI_NC_KEY_SLOTS and CAI_NC_COL_VECS of neural.cl.
-  csFusedSDPAQueryRowsPerLane = 3;
-  csFusedSDPAKeyRowsPerLane = 2;
-  csFusedSDPAColumnVecsPerLane = 2;
-  // Key rows per tile, the most query rows per tile, and the head-dim columns
-  // one work-group writes (a wider head runs one work-group per column chunk).
-  csFusedSDPAKeyTileRows = csFusedSDPATileLanesX * csFusedSDPAKeyRowsPerLane;
-  csFusedSDPAMaxQueryTileRows =
-    csFusedSDPATileLanesY * csFusedSDPAQueryRowsPerLane;
-  csFusedSDPAColumnChunk =
-    4 * csFusedSDPATileLanesX * csFusedSDPAColumnVecsPerLane;
-  // FlashVariant 1..3 = cai_sdpa_flash_v1..v3 (0 = cai_sdpa_noncausal_tiled),
-  // their lanes, and the variant used when NEURAL_SDPA_FLASH_VARIANT is unset.
+  // FlashVariant 1..3 = cai_sdpa_flash_v1..v3, their lanes, and the variant
+  // used when NEURAL_SDPA_FLASH_VARIANT is unset.
   csFusedSDPAFlashVariants = 3;
   csFusedSDPAFlashLanes: array[1..csFusedSDPAFlashVariants] of integer =
     (256, 256, 128);
-  csFusedSDPAFlashDefaultVariant = 0;
+  csFusedSDPAFlashDefaultVariant = 2;
 
 type
+  // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
+  // (cai_sdpa_decode_split + merge) or a flash variant (+ merge when split).
+  TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash);
+
   // RowCount token rows of external K and V in OpenCL memory, all K rows then
   // all V rows (TNNetFusedSDPA.NewCacheRowsOnOpenCL); the owner releases Buffer.
   TNNetKVRowsOnOpenCL = record
@@ -4756,19 +4744,17 @@ type
     // Further entry points on FKernel's program and queue (FKernel itself is
     // the FP32 pass 1). Owned here: clReleaseKernel in the destructor.
     FAppendKernel, FAppendInt8Kernel, FSplitInt8Kernel, FMergeKernel: cl_kernel;
-    // cai_sdpa_noncausal_tiled, the cached forward with no mask; nil when the
-    // program lacks it. Its own local memory and work-group limit, from Create.
-    FNonCausalKernel: cl_kernel;
-    FNonCausalStaticLocalBytes, FNonCausalMaxWorkGroupSize: integer;
     // cai_sdpa_flash_v1..v3 (nil if absent) with their static local memory and
-    // work-group limit; the variant to run and the one last run (0 = tiled).
+    // work-group limit; the variant to run and the one last run.
     FFlashKernels: array[1..csFusedSDPAFlashVariants] of cl_kernel;
     FFlashStaticLocalBytes, FFlashMaxWorkGroupSize:
       array[1..csFusedSDPAFlashVariants] of integer;
     FFlashVariant, FLastFlashVariant: integer;
-    // Test-only tile overrides (0 = automatic) and the last launch's tiles.
-    FForcedQueryTileRows, FForcedKeyTileRows: integer;
-    FLastQueryTileRows, FLastKeyTileRows: integer;
+    // The last flash launch's tiles and key splits, test-only split count and
+    // flash row threshold (0 = automatic), and the path of the last forward.
+    FLastQueryTileRows, FLastKeyTileRows, FLastFlashSplits: integer;
+    FForcedFlashSplits, FForcedFlashMinTokens: integer;
+    FLastPath: TFusedSDPAOpenCLPath;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
     // are the resident cache, sized once at MaxContext and advanced in place;
     // FBufPartials holds the per-(query head, token row, chunk) partial softmax
@@ -4802,23 +4788,12 @@ type
     function LocalMemFloats(Int8KV: boolean): integer;
     // The same budget beside a kernel that declares StaticLocalBytes itself.
     function LocalMemFloatsBeside(StaticLocalBytes: integer): integer;
-    // Tile rows of cai_sdpa_noncausal_tiled for head dimension Dk: as many
-    // query rows as the local-memory budget allows (or the forced ones),
-    // capped.
-    procedure ChooseNonCausalTiles(Dk: integer;
-      out QueryTileRows, KeyTileRows: integer);
     // The step input's buffer: pExternalSrc when bound, else X uploaded.
     function StepSourceBuffer(X: TNNetVolume; pExternalSrc: cl_mem): cl_mem;
-    // ComputeNonCausal's attention launch on cai_sdpa_noncausal_tiled, and on
-    // cai_sdpa_flash_v<FFlashVariant> with mask mode 0 and one key split.
-    procedure RunNonCausalTiled(bufX, bufK, bufV, bufY: cl_mem;
-      QHeads, GroupSize, TokenCnt, Dk, CacheMax, CacheSlot, Window,
-      XStride, YStride: integer;
-      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
-    procedure RunFlash(bufX, bufK, bufV, bufY: cl_mem;
-      KVHeads, GroupSize, TokenCnt, Dk, CacheMax, CacheSlot, Window,
-      XStride, YStride: integer;
-      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
+    // Key splits of a flash launch with RowGroups work-groups per split over
+    // SpanKeys keys: enough to fill the device, splits of at least MinSplitKeys.
+    procedure ChooseFlashSplits(RowGroups, SpanKeys: integer;
+      out KeySplits, SplitKeys: integer);
     // The resident FP32 cache buffers, sized for K and V (grow-only, never
     // written here, so an uploaded cache keeps its contents).
     procedure EnsureCacheBuffers(K, V: TNNetVolume; out bufK, bufV: cl_mem);
@@ -4862,9 +4837,6 @@ type
     // True when the query tile (GroupSize*Dk floats) plus one score row fits
     // the local-memory budget; otherwise the layer must keep the host path.
     function QueryTileFits(GroupSize, Dk: integer; Int8KV: boolean): boolean;
-    // True when cai_sdpa_noncausal_tiled exists and its tiles for head
-    // dimension Dk fit the local memory and the work-group limit.
-    function NonCausalTilesFit(Dk: integer): boolean;
     // True when cai_sdpa_flash_v<Variant> exists and its tiles for head
     // dimension Dk fit the local memory and the work-group limit; FP32 only.
     function FlashTilesFit(Variant, Dk: integer; Int8KV: boolean): boolean;
@@ -4910,12 +4882,11 @@ type
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-    // Compute's arguments over the FP32 cache, but every token row attends the
-    // whole live cache (the appended rows included), with no mask. Runs
-    // FlashVariant when its tiles fit, else cai_sdpa_noncausal_tiled.
-    procedure ComputeNonCausal(X, Y, K, V: TNNetVolume;
+    // Compute's step on cai_sdpa_flash_v<FlashVariant> (caller checks
+    // FlashTilesFit); not Causal: every row attends the whole live cache.
+    procedure ComputeFlash(X, Y, K, V: TNNetVolume;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
-      QW, KW, Window: integer;
+      QW, KW, Window: integer; Causal: boolean;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
     // K's rows then V's rows, each (Rows,1,KW), in a new buffer for
@@ -4934,14 +4905,16 @@ type
     property LastSplits: integer read FLastSplits;
     property LastChunkRows: integer read FLastChunkRows;
     property LastScratchBytes: csize_t read FLastScratchBytes;
-    property ForcedQueryTileRows: integer read FForcedQueryTileRows
-      write FForcedQueryTileRows;
-    property ForcedKeyTileRows: integer read FForcedKeyTileRows
-      write FForcedKeyTileRows;
     property LastQueryTileRows: integer read FLastQueryTileRows;
     property LastKeyTileRows: integer read FLastKeyTileRows;
-    // The variant ComputeNonCausal runs (0 = cai_sdpa_noncausal_tiled; default
-    // from NEURAL_SDPA_FLASH_VARIANT) and the one the last call ran.
+    property LastFlashSplits: integer read FLastFlashSplits;
+    property ForcedFlashSplits: integer read FForcedFlashSplits
+      write FForcedFlashSplits;
+    property ForcedFlashMinTokens: integer read FForcedFlashMinTokens
+      write FForcedFlashMinTokens;
+    property LastPath: TFusedSDPAOpenCLPath read FLastPath;
+    // The variant ComputeFlash runs (default from NEURAL_SDPA_FLASH_VARIANT)
+    // and the one the last call ran.
     property FlashVariant: integer read FFlashVariant write FFlashVariant;
     property LastFlashVariant: integer read FLastFlashVariant;
   end;
@@ -5095,6 +5068,9 @@ type
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
+    // The OpenCL kernels a step of TokenCnt rows takes once WillOpenCL's
+    // scope holds; sdpaPathNone when none fits (the host path runs).
+    function OpenCLPathFor(TokenCnt: integer): TFusedSDPAOpenCLPath;
     function OpenCLOutputBuffer(): cl_mem; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
     // K's rows then V's rows (AppendCacheRowsFrom's shapes) in a new buffer
@@ -5110,8 +5086,8 @@ type
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
-    // See FCachedForwardNonCausal. The OpenCL forward runs the tiled
-    // non-causal kernel over an FP32 cache. Eviction must be off.
+    // See FCachedForwardNonCausal. The OpenCL forward runs the flash kernel
+    // (mask mode none) over an FP32 cache. Eviction must be off.
     property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
       write SetCachedForwardNonCausal;
   end;
@@ -35903,11 +35879,32 @@ begin
     and (not FBidirectionalWindow)
     and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax);
   if not Result then exit;
-  if FCachedForwardNonCausal
-    then Result := (not FKVQuantInt8) and
-      (FFusedSDPACL.FlashTilesFit(FFusedSDPACL.FlashVariant, FDk, false)
-       or FFusedSDPACL.NonCausalTilesFit(FDk))
-    else Result := FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
+  Result := OpenCLPathFor(FPrevLayer.FOutput.SizeX) <> sdpaPathNone;
+end;
+
+function TNNetFusedSDPA.OpenCLPathFor(TokenCnt: integer): TFusedSDPAOpenCLPath;
+var
+  FlashFits, SplitFits: boolean;
+  MinTokens, MinSplitKeys: integer;
+begin
+  Result := sdpaPathNone;
+  if not Assigned(FFusedSDPACL) then exit;
+  FlashFits := (not FKVQuantInt8) and
+    FFusedSDPACL.FlashTilesFit(FFusedSDPACL.FlashVariant, FDk, false);
+  if FCachedForwardNonCausal then
+  begin
+    if FlashFits then Result := sdpaPathFlash;
+    exit;
+  end;
+  // A causal step of FlashMinTokens rows or more takes the flash kernel;
+  // fewer rows (decode, speculative windows) and int8 take the split decode.
+  FusedSDPAFlashSizing(MinTokens, MinSplitKeys);
+  if FFusedSDPACL.ForcedFlashMinTokens > 0 then
+    MinTokens := FFusedSDPACL.ForcedFlashMinTokens;
+  SplitFits := FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
+  if FlashFits and ((TokenCnt >= MinTokens) or (not SplitFits))
+    then Result := sdpaPathFlash
+  else if SplitFits then Result := sdpaPathDecodeSplit;
 end;
 
 function TNNetFusedSDPA.NewCacheRowsOnOpenCL(
@@ -35994,13 +35991,10 @@ begin
   FCacheOnOpenCL := false;
 end;
 
-// One decode step of the input's token rows with the KV cache in OpenCL
-// memory: the append, the split-row attention and the merge are three launches
-// on ONE in-order queue, so nothing crosses to the host per step. Row t of the step attends the cache
-// up to and including its own slot, so a window is exactly what the host path
-// computes; with CachedForwardNonCausal the append and one tiled launch let
-// every row attend the whole cache. The host keeps FCacheLen, which is the only
-// cache state the kernels do not own.
+// One step of the input's token rows with the KV cache in OpenCL memory, on
+// the path OpenCLPathFor picks (split-row decode or flash, each with its merge
+// when split); all launches share ONE in-order queue. The host keeps
+// FCacheLen, the only cache state the kernels do not own.
 procedure TNNetFusedSDPA.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
@@ -36023,10 +36017,11 @@ begin
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
   // accessors above.
-  if FCachedForwardNonCausal then
-    FFusedSDPACL.ComputeNonCausal(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
+  if OpenCLPathFor(TokenCnt) = sdpaPathFlash then
+    FFusedSDPACL.ComputeFlash(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
       FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
       {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      {Causal=}not FCachedForwardNonCausal,
       FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
       SourceBuffer, {pKeepResultOnOpenCL=}true)
   else if FKVQuantInt8 then
@@ -39572,13 +39567,13 @@ var
   vFusedSDPAProgramDumped: boolean = false;
 
 // The variant a new TNNetFusedSDPACL runs: NEURAL_SDPA_FLASH_VARIANT when it
-// names one (0..csFusedSDPAFlashVariants), else csFusedSDPAFlashDefaultVariant.
+// names one (1..csFusedSDPAFlashVariants), else csFusedSDPAFlashDefaultVariant.
 function FusedSDPAFlashVariantFromEnv(): integer;
 var
   Parsed: integer;
 begin
   if TryStrToInt(GetEnvironmentVariable('NEURAL_SDPA_FLASH_VARIANT'), Parsed)
-    and (Parsed >= 0) and (Parsed <= csFusedSDPAFlashVariants)
+    and (Parsed >= 1) and (Parsed <= csFusedSDPAFlashVariants)
     then Result := Parsed
     else Result := csFusedSDPAFlashDefaultVariant;
 end;
@@ -39597,13 +39592,6 @@ begin
   FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
   FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
   FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
-  FNonCausalKernel := FKernel.CreateKernel('cai_sdpa_noncausal_tiled');
-  if Assigned(FNonCausalKernel) then
-  begin
-    FNonCausalStaticLocalBytes := FKernel.KernelLocalMemSize(FNonCausalKernel);
-    FNonCausalMaxWorkGroupSize :=
-      FKernel.KernelMaxWorkGroupSize(FNonCausalKernel);
-  end;
   for Variant := 1 to csFusedSDPAFlashVariants do
   begin
     FFlashKernels[Variant] :=
@@ -39635,7 +39623,6 @@ begin
   if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
   if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
   if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
-  if Assigned(FNonCausalKernel)  then clReleaseKernel(FNonCausalKernel);
   for Variant := 1 to csFusedSDPAFlashVariants do
     if Assigned(FFlashKernels[Variant]) then
       clReleaseKernel(FFlashKernels[Variant]);
@@ -39914,6 +39901,7 @@ begin
   FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
     KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
   RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
+  FLastPath := sdpaPathDecodeSplit;
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
@@ -39967,71 +39955,10 @@ begin
     csFusedSDPALocalSize, 1);
 end;
 
-// Count rounded up to a multiple of 4: the float4 width of the
-// cai_sdpa_noncausal_tiled tiles.
+// Count rounded up to a multiple of 4: the float4 width of the flash tiles.
 function RoundUpTo4(Count: integer): integer;
 begin
   Result := (Count + 3) and (not 3);
-end;
-
-// Local memory of one cai_sdpa_noncausal_tiled work-group, in floats: the
-// query tile, the K/V tile, the probability tile (rows padded by 4 floats) and
-// one partial per (query row, X lane).
-function NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk: integer): integer;
-var
-  TileStride, KeyTile4: integer;
-begin
-  TileStride := RoundUpTo4(Dk) + 4;
-  KeyTile4 := RoundUpTo4(KeyTileRows);
-  Result := (QueryTileRows + KeyTile4) * TileStride
-    + QueryTileRows * (KeyTile4 + 4 + csFusedSDPATileLanesX);
-end;
-
-procedure TNNetFusedSDPACL.ChooseNonCausalTiles(Dk: integer;
-  out QueryTileRows, KeyTileRows: integer);
-var
-  BudgetFloats: integer;
-
-  function QueryRowsThatFit(): integer;
-  begin
-    Result := (BudgetFloats - NonCausalTileFloats(0, KeyTileRows, Dk))
-      div (NonCausalTileFloats(1, KeyTileRows, Dk)
-        - NonCausalTileFloats(0, KeyTileRows, Dk));
-  end;
-
-begin
-  BudgetFloats := LocalMemFloatsBeside(FNonCausalStaticLocalBytes);
-  if FForcedKeyTileRows > 0
-    then KeyTileRows := Min(FForcedKeyTileRows, csFusedSDPAKeyTileRows)
-    else KeyTileRows := csFusedSDPAKeyTileRows;
-  if FForcedQueryTileRows > 0 then
-  begin
-    QueryTileRows := Min(FForcedQueryTileRows, csFusedSDPAMaxQueryTileRows);
-    exit;
-  end;
-  QueryTileRows := QueryRowsThatFit();
-  // Fewer query rows than lane rows leaves lanes idle and re-reads K/V more
-  // often; a key tile one lane row wide buys rows back.
-  if (QueryTileRows < csFusedSDPATileLanesY) and (FForcedKeyTileRows = 0) then
-  begin
-    KeyTileRows := csFusedSDPATileLanesX;
-    QueryTileRows := QueryRowsThatFit();
-  end;
-  if QueryTileRows > csFusedSDPAMaxQueryTileRows then
-    QueryTileRows := csFusedSDPAMaxQueryTileRows;
-end;
-
-function TNNetFusedSDPACL.NonCausalTilesFit(Dk: integer): boolean;
-var
-  QueryTileRows, KeyTileRows: integer;
-begin
-  Result := Assigned(FNonCausalKernel) and (FNonCausalMaxWorkGroupSize >=
-    csFusedSDPATileLanesX * csFusedSDPATileLanesY);
-  if not Result then exit;
-  ChooseNonCausalTiles(Dk, QueryTileRows, KeyTileRows);
-  Result := (QueryTileRows >= 1) and (KeyTileRows >= 1) and
-    (NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk) <=
-     LocalMemFloatsBeside(FNonCausalStaticLocalBytes));
 end;
 
 // cai_sdpa_flash_v<Variant>'s tile rows, key rows (0 = Dk unsupported) and
@@ -40071,8 +39998,8 @@ begin
       + Max(KeyTileRows * (SliceCols + 4), QueryTileRows * (KeyTileRows + 4))
       + QueryTileRows * 17;
   end;
-  // The row table: X and Y offsets, lo and hi per row.
-  Inc(ScratchFloats, 4 * QueryTileRows);
+  // The row max, then the row table (X/Y offsets, lo, hi).
+  Inc(ScratchFloats, 5 * QueryTileRows);
 end;
 
 function TNNetFusedSDPACL.FlashTilesFit(Variant, Dk: integer;
@@ -40095,60 +40022,84 @@ begin
     else Result := nil;
 end;
 
-procedure TNNetFusedSDPACL.ComputeNonCausal(X, Y, K, V: TNNetVolume;
+procedure TNNetFusedSDPACL.ChooseFlashSplits(RowGroups, SpanKeys: integer;
+  out KeySplits, SplitKeys: integer);
+var
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows: integer;
+  MinTokens, MinSplitKeys, TargetGroups: integer;
+begin
+  if SpanKeys < 1 then SpanKeys := 1;
+  if FForcedFlashSplits > 0 then
+  begin
+    KeySplits := FForcedFlashSplits;
+    SplitKeys := (SpanKeys + KeySplits - 1) div KeySplits;
+    exit;
+  end;
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
+  FusedSDPAFlashSizing(MinTokens, MinSplitKeys);
+  TargetGroups := FKernel.DeviceMaxComputeUnits() * GroupsPerUnit;
+  KeySplits := (TargetGroups + RowGroups - 1) div RowGroups;
+  KeySplits := Min(KeySplits, (SpanKeys + MinSplitKeys - 1) div MinSplitKeys);
+  KeySplits := Max(1, Min(KeySplits, MaxSplits));
+  // Whole 64-key tiles per split, then as many splits as that takes.
+  SplitKeys := ((SpanKeys + KeySplits - 1) div KeySplits + 63) and (not 63);
+  KeySplits := (SpanKeys + SplitKeys - 1) div SplitKeys;
+end;
+
+procedure TNNetFusedSDPACL.ComputeFlash(X, Y, K, V: TNNetVolume;
   QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
-  QW, KW, Window: integer;
+  QW, KW, Window: integer; Causal: boolean;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
 var
-  bufX, bufK, bufV, bufY: cl_mem;
-  TokenCnt, XStride, YStride: integer;
+  bufX, bufK, bufV, bufPartials, bufY, bufUnread: cl_mem;
+  kFlash: cl_kernel;
+  TokenCnt, XStride, YStride, Lanes, RowTiles: integer;
+  QueryTileRows, KeyTileRows, ScratchFloats: integer;
+  MaskMode, KeySplits, SplitKeys, ColChunk, KeyEnd, SpanBase, SpanKeys: integer;
 begin
+  kFlash := FFlashKernels[FFlashVariant];
   TokenCnt := X.SizeX;
   XStride := X.Depth;
   YStride := Y.Depth;
-  bufX := StepSourceBuffer(X, pExternalSrc);
-  EnsureCacheBuffers(K, V, bufK, bufV);
-  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
-  RunAppend(bufX, bufK, bufV, KVHeads, TokenCnt, Dk, CacheMax, CacheSlot,
-    QW, KW, XStride);
-  if FlashTilesFit(FFlashVariant, Dk, {Int8KV=}false) then
-    RunFlash(bufX, bufK, bufV, bufY, KVHeads, GroupSize, TokenCnt, Dk,
-      CacheMax, CacheSlot, Window, XStride, YStride,
-      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap)
-  else
-    RunNonCausalTiled(bufX, bufK, bufV, bufY, QHeads, GroupSize, TokenCnt, Dk,
-      CacheMax, CacheSlot, Window, XStride, YStride,
-      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap);
-  FinishForward(bufY, Y, pKeepResultOnOpenCL);
-end;
-
-procedure TNNetFusedSDPACL.RunFlash(bufX, bufK, bufV, bufY: cl_mem;
-  KVHeads, GroupSize, TokenCnt, Dk, CacheMax, CacheSlot, Window,
-  XStride, YStride: integer;
-  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
-var
-  kFlash: cl_kernel;
-  bufUnread: cl_mem;
-  QueryTileRows, KeyTileRows, ScratchFloats, RowTiles, Lanes: integer;
-  MaskMode, KeySplits, SplitKeys, ColChunk: integer;
-begin
-  kFlash := FFlashKernels[FFlashVariant];
   FusedSDPAFlashTiles(FFlashVariant, Dk, QueryTileRows, KeyTileRows,
     ScratchFloats);
   Lanes := csFusedSDPAFlashLanes[FFlashVariant];
   RowTiles := (TokenCnt * GroupSize + QueryTileRows - 1) div QueryTileRows;
-  // Every row attends the whole live cache: mask mode 0, one key split over
-  // all of it, all Dk output columns per work-group.
-  MaskMode := 0;
-  KeySplits := 1;
-  SplitKeys := CacheSlot + TokenCnt;
+  // The keys some row of the step attends: the split base and span the
+  // kernel derives too (the lowest row's lo up to the last row's hi).
+  if Causal then
+  begin
+    MaskMode := 1;
+    FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, SpanBase, SpanKeys);
+  end
+  else
+  begin
+    MaskMode := 0;
+    KeyEnd := CacheSlot + TokenCnt;
+    if (Window > 0) and (KeyEnd > Window)
+      then SpanKeys := Window
+      else SpanKeys := KeyEnd;
+  end;
+  ChooseFlashSplits(KVHeads * RowTiles, SpanKeys, KeySplits, SplitKeys);
   ColChunk := Dk;
   bufUnread := nil;
   FLastFlashVariant := FFlashVariant;
   FLastQueryTileRows := QueryTileRows;
   FLastKeyTileRows := KeyTileRows;
+  FLastFlashSplits := KeySplits;
   FLastScratchBytes := csize_t(ScratchFloats) * csNeuralFloatSize;
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  EnsureCacheBuffers(K, V, bufK, bufV);
+  if KeySplits > 1 then
+    PrepareResultBuffers(Y, QHeads, TokenCnt, KeySplits, Dk, bufPartials, bufY)
+  else
+  begin
+    bufPartials := nil;
+    bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  end;
+  RunAppend(bufX, bufK, bufV, KVHeads, TokenCnt, Dk, CacheMax, CacheSlot,
+    QW, KW, XStride);
   clSetKernelArg(kFlash,  0, csLongintSize, @KVHeads);
   clSetKernelArg(kFlash,  1, csLongintSize, @GroupSize);
   clSetKernelArg(kFlash,  2, csLongintSize, @TokenCnt);
@@ -40168,61 +40119,13 @@ begin
   clSetKernelArg(kFlash, 18, csCLMemSize, @bufK);
   clSetKernelArg(kFlash, 19, csCLMemSize, @bufV);
   clSetKernelArg(kFlash, 20, csCLMemSize, @bufY);
-  clSetKernelArg(kFlash, 21, csCLMemSize, @bufUnread);
+  clSetKernelArg(kFlash, 21, csCLMemSize, @bufPartials);
   clSetKernelArg(kFlash, 22, FLastScratchBytes, nil);
   FKernel.RunKernel2D(kFlash, Lanes, KVHeads * RowTiles * KeySplits, Lanes, 1);
-end;
-
-procedure TNNetFusedSDPACL.RunNonCausalTiled(bufX, bufK, bufV, bufY: cl_mem;
-  QHeads, GroupSize, TokenCnt, Dk, CacheMax, CacheSlot, Window,
-  XStride, YStride: integer;
-  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
-var
-  kTiled: cl_kernel;
-  KeyStart, KeyEnd: integer;
-  QueryTileRows, KeyTileRows, QueryTiles, ColumnChunks: integer;
-begin
-  kTiled := FNonCausalKernel;
-  // Every row sees the whole live cache, this step's rows included; a sliding
-  // window keeps its last Window rows, as the host path does.
-  KeyEnd := CacheSlot + TokenCnt;
-  if (Window > 0) and (KeyEnd > Window)
-    then KeyStart := KeyEnd - Window
-    else KeyStart := 0;
-  ChooseNonCausalTiles(Dk, QueryTileRows, KeyTileRows);
-  // The kernel's lane slots cover no more rows than these.
-  Assert((KeyTileRows <= csFusedSDPAKeyTileRows) and
-    (QueryTileRows <= csFusedSDPAMaxQueryTileRows),
-    'cai_sdpa_noncausal_tiled tiles exceed its lane slots');
-  if QueryTileRows > TokenCnt then QueryTileRows := TokenCnt;
-  QueryTiles := (TokenCnt + QueryTileRows - 1) div QueryTileRows;
-  ColumnChunks := (RoundUpTo4(Dk) + csFusedSDPAColumnChunk - 1)
-    div csFusedSDPAColumnChunk;
-  FLastFlashVariant := 0;
-  FLastQueryTileRows := QueryTileRows;
-  FLastKeyTileRows := KeyTileRows;
-  FLastScratchBytes := csize_t(NonCausalTileFloats(QueryTileRows, KeyTileRows,
-    Dk)) * csNeuralFloatSize;
-  clSetKernelArg(kTiled,  0, csLongintSize, @QHeads);
-  clSetKernelArg(kTiled,  1, csLongintSize, @GroupSize);
-  clSetKernelArg(kTiled,  2, csLongintSize, @TokenCnt);
-  clSetKernelArg(kTiled,  3, csLongintSize, @QueryTileRows);
-  clSetKernelArg(kTiled,  4, csLongintSize, @KeyTileRows);
-  clSetKernelArg(kTiled,  5, csLongintSize, @Dk);
-  clSetKernelArg(kTiled,  6, csLongintSize, @CacheMax);
-  clSetKernelArg(kTiled,  7, csLongintSize, @KeyStart);
-  clSetKernelArg(kTiled,  8, csLongintSize, @KeyEnd);
-  clSetKernelArg(kTiled,  9, csLongintSize, @XStride);
-  clSetKernelArg(kTiled, 10, csLongintSize, @YStride);
-  SetScoreArgs(kTiled, 11, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap);
-  clSetKernelArg(kTiled, 14, csCLMemSize, @bufX);
-  clSetKernelArg(kTiled, 15, csCLMemSize, @bufK);
-  clSetKernelArg(kTiled, 16, csCLMemSize, @bufV);
-  clSetKernelArg(kTiled, 17, csCLMemSize, @bufY);
-  clSetKernelArg(kTiled, 18, FLastScratchBytes, nil);
-  FKernel.RunKernel2D(kTiled, csFusedSDPATileLanesX,
-    csFusedSDPATileLanesY * QHeads * QueryTiles * ColumnChunks,
-    csFusedSDPATileLanesX, csFusedSDPATileLanesY);
+  if KeySplits > 1 then
+    RunMerge(bufPartials, bufY, QHeads, TokenCnt, KeySplits, Dk, YStride);
+  FLastPath := sdpaPathFlash;
+  FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
 function TNNetFusedSDPACL.NewKVRowsBuffer(
@@ -40371,6 +40274,7 @@ begin
   FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
     KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
   RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
+  FLastPath := sdpaPathDecodeSplit;
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 

@@ -738,6 +738,9 @@ procedure SetOpenCLImplicitConv(pValue: boolean);
 /// _MAX_CHUNK_ROWS are set.
 procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
   MaxChunkRows: integer);
+/// Flash SDPA dispatch and split sizing: csFusedSDPAFlash* defaults unless
+/// NEURAL_SDPA_FLASH_MIN_TOKENS / _MIN_SPLIT_KEYS are set.
+procedure FusedSDPAFlashSizing(out MinTokens, MinSplitKeys: integer);
 
 /// Size in bytes of an OpenCL buffer as the driver reports it (CL_MEM_SIZE);
 /// 0 for nil or when the query fails.
@@ -1631,8 +1634,15 @@ const
   /// Pass 3 walks a chunk's rows serially per lane, so this bounds that chain
   /// when a wide prefill window would otherwise get a few very long chunks.
   csFusedSDPAMaxChunkRows = 512;
+  /// Flash SDPA (TNNetFusedSDPA): a causal step of at least FlashMinTokens rows
+  /// takes the flash kernel, and its key splits are at least MinSplitKeys keys.
+  csFusedSDPAFlashMinTokens = 16;
+  csFusedSDPAFlashMinSplitKeys = 256;
 
 var
+  vFusedSDPAFlashOverridesLoaded: boolean = false;
+  vFusedSDPAFlashMinTokens: integer = csFusedSDPAFlashMinTokens;
+  vFusedSDPAFlashMinSplitKeys: integer = csFusedSDPAFlashMinSplitKeys;
   vInt4SplitKOverridesLoaded: boolean = false;
   vInt4SplitKThreadsPerUnit: integer = csInt4SplitKThreadsPerUnit;
   vInt4SplitKMinSlab: integer = csInt4SplitKMinSlab;
@@ -1681,6 +1691,20 @@ begin
   MinChunkRows := vFusedSDPAMinChunkRows;
   MaxSplits := vFusedSDPAMaxSplits;
   MaxChunkRows := vFusedSDPAMaxChunkRows;
+end;
+
+procedure FusedSDPAFlashSizing(out MinTokens, MinSplitKeys: integer);
+begin
+  if not vFusedSDPAFlashOverridesLoaded then
+  begin
+    vFusedSDPAFlashOverridesLoaded := true;
+    ReadPositiveIntOverride('NEURAL_SDPA_FLASH_MIN_TOKENS',
+      vFusedSDPAFlashMinTokens);
+    ReadPositiveIntOverride('NEURAL_SDPA_FLASH_MIN_SPLIT_KEYS',
+      vFusedSDPAFlashMinSplitKeys);
+  end;
+  MinTokens := vFusedSDPAFlashMinTokens;
+  MinSplitKeys := vFusedSDPAFlashMinSplitKeys;
 end;
 
 var
