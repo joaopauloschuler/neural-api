@@ -2551,7 +2551,7 @@ rather than acted on.
         TNNetScaledDotProductAttention (host softmax, 4 uploads + 3 blocking
         downloads per pass) / one-input TNNetDeepConcat. Check
         NonCausalTilesFit at the VAE width on 48 KB local memory.
-  - [ ] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
+  - [x] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
         beta=0 on every block weight swap (20 MB per image): weightless variant
         or no re-upload when unchanged.
   - [ ] F6. VAE weights shared across the tile-shape nets: each of the 4 nets

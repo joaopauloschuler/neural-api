@@ -293,6 +293,7 @@ type
       const IoFixture: string);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
+    procedure TestTokenLayerNormNonAffine;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
     procedure TestF16Decode;
     procedure TestBF16Decode;
@@ -1467,6 +1468,76 @@ begin
     Out1.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+
+// pElementwiseAffine=false: no neurons, the forward and the input gradient of
+// an affine layer at gamma=1 / beta=0, and the flag survives save/load.
+procedure TTestNeuralPretrained.TestTokenLayerNormNonAffine;
+var
+  AffineNN, NonAffineNN, ReloadedNN: TNNet;
+  Input, Desired, AffineOut, NonAffineOut, ReloadedOut: TNNetVolume;
+  i: integer;
+
+  function BuildNet(pElementwiseAffine: boolean): TNNet;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(3, 1, 4).EnableErrorCollection());
+    Result.AddLayer(TNNetTokenLayerNorm.Create(1e-5, pElementwiseAffine)
+      .SetTrainable(true));
+    Result.SetLearningRate(0, 0);
+  end;
+
+begin
+  AffineNN := BuildNet(true);
+  NonAffineNN := BuildNet(false);
+  ReloadedNN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  AffineOut := TNNetVolume.Create;
+  NonAffineOut := TNNetVolume.Create;
+  ReloadedOut := TNNetVolume.Create;
+  try
+    AssertEquals('non-affine layer has no neurons', 0,
+      NonAffineNN.Layers[1].Neurons.Count);
+    AssertEquals('non-affine layer has no weights', 0,
+      NonAffineNN.Layers[1].CountWeights());
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.FData[i] := Sin(i * 1.7) * 2 + 0.3 * i;
+      Desired.FData[i] := Cos(i * 0.9);
+    end;
+    AffineNN.Compute(Input);
+    AffineNN.GetOutput(AffineOut);
+    NonAffineNN.Compute(Input);
+    NonAffineNN.GetOutput(NonAffineOut);
+    AssertEquals('forward equals gamma=1 / beta=0', 0,
+      MaxAbsVolumeDiff(AffineOut, NonAffineOut), 1e-7);
+    AffineNN.Backpropagate(Desired);
+    NonAffineNN.Backpropagate(Desired);
+    AssertEquals('input gradient equals gamma=1 / beta=0', 0,
+      MaxAbsVolumeDiff(AffineNN.Layers[0].OutputError,
+      NonAffineNN.Layers[0].OutputError), 1e-6);
+    AssertTrue('the input gradient is not all zero',
+      NonAffineNN.Layers[0].OutputError.GetMaxAbs() > 0);
+    ReloadedNN.LoadFromString(NonAffineNN.SaveToString());
+    AssertFalse('reloaded layer stays non-affine',
+      TNNetTokenLayerNorm(ReloadedNN.Layers[1]).ElementwiseAffine);
+    AssertEquals('reloaded layer has no neurons', 0,
+      ReloadedNN.Layers[1].Neurons.Count);
+    ReloadedNN.Compute(Input);
+    ReloadedNN.GetOutput(ReloadedOut);
+    AssertEquals('reloaded forward', 0,
+      MaxAbsVolumeDiff(ReloadedOut, NonAffineOut), 0);
+  finally
+    ReloadedOut.Free;
+    NonAffineOut.Free;
+    AffineOut.Free;
+    Desired.Free;
+    Input.Free;
+    ReloadedNN.Free;
+    NonAffineNN.Free;
+    AffineNN.Free;
   end;
 end;
 
@@ -28333,7 +28404,7 @@ var
   GridH, GridW, BlockCount, StepPos, GPUBefore: integer;
   Gated1Before, Gated2Before, Modulated1Before, Modulated2Before: integer;
   Norm1Before, Norm2Before, QRopeBefore, KRopeBefore, QKVBefore: integer;
-  ProjUploadsBefore, NormDownloadsBefore: Int64;
+  ProjUploadsBefore, NormDownloadsBefore, NormUploadsBefore: Int64;
   RopeUploadsBefore, RopeDownloadsBefore, AttnUploadsBefore: Int64;
   Diff: double;
 
@@ -28460,6 +28531,13 @@ var
       OnOpenCL.StepBlock.Norm2.ProfiledTransfers.DownloadCount;
   end;
 
+  // Norm1 and Norm2 bind their sources, so what is left is gamma and beta.
+  function NormUploads(): Int64;
+  begin
+    Result := OnOpenCL.StepBlock.Norm1.ProfiledTransfers.UploadCount +
+      OnOpenCL.StepBlock.Norm2.ProfiledTransfers.UploadCount;
+  end;
+
   // The rotations bind QNorm/KNorm; what is left is the angle table.
   function RopeUploads(): Int64;
   begin
@@ -28520,6 +28598,7 @@ begin
       QKVBefore := OnOpenCL.StepBlock.QKV.ForwardGPUCnt;
       ProjUploadsBefore := ProjectionUploads();
       NormDownloadsBefore := NormDownloads();
+      NormUploadsBefore := NormUploads();
       RopeUploadsBefore := RopeUploads();
       RopeDownloadsBefore := RopeAndConcatDownloads();
       AttnUploadsBefore :=
@@ -28547,6 +28626,7 @@ begin
         ' QKV=', OnOpenCL.StepBlock.QKV.ForwardGPUCnt - QKVBefore,
         '; projection uploads=', ProjectionUploads() - ProjUploadsBefore,
         ' norm downloads=', NormDownloads() - NormDownloadsBefore,
+        ' norm uploads=', NormUploads() - NormUploadsBefore,
         ' rope uploads=', RopeUploads() - RopeUploadsBefore,
         ' rope+concat downloads=',
         RopeAndConcatDownloads() - RopeDownloadsBefore,
@@ -28569,6 +28649,14 @@ begin
       AssertEquals('step ' + IntToStr(StepPos) +
         ': the norms download nothing', 0,
         NormDownloads() - NormDownloadsBefore);
+      // The non-affine norms have no weights for a block swap to replace:
+      // the first step uploads each norm's ones and zeros once.
+      if StepPos = 0 then
+        AssertEquals('the first step uploads the norms'' ones and zeros', 4,
+          NormUploads() - NormUploadsBefore)
+      else
+        AssertEquals('step ' + IntToStr(StepPos) +
+          ': the norms upload nothing', 0, NormUploads() - NormUploadsBefore);
       AssertEquals('step ' + IntToStr(StepPos) +
         ': Q/K/V/GateUp bind the modulated norms, no upload', 0,
         ProjectionUploads() - ProjUploadsBefore);

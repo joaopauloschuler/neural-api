@@ -8701,14 +8701,19 @@ type
   // compatibility with existing saved models. Epsilon (default 1e-5, the
   // PyTorch default) is serialized in FFloatSt[0]. Backward applies the
   // exact per-token LayerNorm Jacobian and accumulates gamma/beta gradients
-  // over all tokens.
+  // over all tokens. pElementwiseAffine=false (FStruct[0]=1) is
+  // nn.LayerNorm(elementwise_affine=False): no neurons, y = x_hat.
   // Coded by Claude (AI).
   TNNetTokenLayerNorm = class(TNNetIdentityWithoutL2)
     private
       FTokenLNEpsilon: TNeuralFloat;
+      FElementwiseAffine: boolean;
       FNormalized: TNNetVolume;   // x_hat, same shape as the input
       FInvStd: TNNetVolume;       // per-token 1/sqrt(var+eps), SizeX x SizeY x 1
       FOnes: TNNetVolume;         // Depth-length ones vector for the mean reduction
+      // Depth-length zeros: the OpenCL beta of a non-affine layer (FOnes is
+      // its gamma), uploaded once because nothing ever changes it.
+      FZeros: TNNetVolume;
       FGammaGradScratch: TNNetVolume; // Depth-length backward gamma-grad accumulator
       FBetaGradScratch: TNNetVolume;  // Depth-length backward beta-grad accumulator
       {$IFDEF OpenCL}
@@ -8725,7 +8730,8 @@ type
       procedure FreeBackpropScratch();
     public
       constructor Create(); overload; override;
-      constructor Create(pEpsilon: TNeuralFloat); reintroduce; overload;
+      constructor Create(pEpsilon: TNeuralFloat;
+        pElementwiseAffine: boolean = true); reintroduce; overload;
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
@@ -8739,6 +8745,7 @@ type
       function OpenCLBufferBytes(): int64; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
+      property ElementwiseAffine: boolean read FElementwiseAffine;
   end;
 
   /// This layer does per-sample root-mean-square layer normalization. Each
@@ -77869,18 +77876,25 @@ begin
   inherited Create();
   FTokenLNEpsilon := 1e-5;
   FFloatSt[0] := FTokenLNEpsilon;
+  FElementwiseAffine := true;
   FNormalized := TNNetVolume.Create();
   FInvStd := TNNetVolume.Create();
   FOnes := TNNetVolume.Create();
+  FZeros := TNNetVolume.Create();
   FGammaGradScratch := TNNetVolume.Create();
   FBetaGradScratch := TNNetVolume.Create();
 end;
 
-constructor TNNetTokenLayerNorm.Create(pEpsilon: TNeuralFloat);
+constructor TNNetTokenLayerNorm.Create(pEpsilon: TNeuralFloat;
+  pElementwiseAffine: boolean);
 begin
   Create();
   if pEpsilon > 0 then FTokenLNEpsilon := pEpsilon;
   FFloatSt[0] := FTokenLNEpsilon;
+  FElementwiseAffine := pElementwiseAffine;
+  // 0 is affine, the value InitStruct leaves, so files without the flag load
+  // as affine.
+  if pElementwiseAffine then FStruct[0] := 0 else FStruct[0] := 1;
 end;
 
 destructor TNNetTokenLayerNorm.Destroy();
@@ -77890,6 +77904,7 @@ begin
   {$ENDIF}
   FBetaGradScratch.Free;
   FGammaGradScratch.Free;
+  FZeros.Free;
   FOnes.Free;
   FInvStd.Free;
   FNormalized.Free;
@@ -77914,8 +77929,11 @@ begin
     begin
       FNormalized.ReSize(FOutput);
       FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
-      FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
-      FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+      if FElementwiseAffine then
+      begin
+        FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
+        FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+      end;
     end;
   end
   else FreeBackpropScratch();
@@ -77924,18 +77942,29 @@ end;
 procedure TNNetTokenLayerNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  if FNeurons.Count < 2 then AddMissingNeurons(2);
-  // FNeurons[0] holds gamma (per-channel scale, Depth weights),
-  // FNeurons[1] holds beta (per-channel bias, Depth weights).
-  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  if FElementwiseAffine then
+  begin
+    if FNeurons.Count < 2 then AddMissingNeurons(2);
+    // FNeurons[0] holds gamma (per-channel scale, Depth weights),
+    // FNeurons[1] holds beta (per-channel bias, Depth weights).
+    SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  end
+  else
+  begin
+    FZeros.ReSize(1, 1, FOutput.Depth);
+    FZeros.Fill(0);
+  end;
   FOnes.ReSize(1, 1, FOutput.Depth);
   FOnes.Fill(1);
   if FIsTrainable then
   begin
     FNormalized.ReSize(FOutput);
     FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
-    FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
-    FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+    if FElementwiseAffine then
+    begin
+      FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
+      FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+    end;
   end
   else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
@@ -77950,8 +77979,7 @@ var
   StartTime: double;
   Depth, TokenCnt, TokenMax, BaseIdx: integer;
   Mean, Variance, InvStdDev: TNeuralFloat;
-  KeepNorm: boolean;
-  Gamma, Beta: TNNetVolume;
+  KeepNorm, IsAffine: boolean;
   GammaPtr, BetaPtr, OnesPtr: TNeuralFloatArrPtr;
   XPtr, XHatPtr: TNeuralFloatArrPtr;
 begin
@@ -77982,10 +78010,17 @@ begin
   // reductions and the gain/bias writes use the AVX-vectorized TNNetVolume
   // primitives (mirrors TNNetTokenRMSNorm.Compute, plus the mean subtraction).
   TokenMax := (FOutput.Size div Depth) - 1;
-  Gamma := FNeurons[0].FWeights;
-  Beta := FNeurons[1].FWeights;
-  GammaPtr := Gamma.GetRawPtr();
-  BetaPtr := Beta.GetRawPtr();
+  IsAffine := FElementwiseAffine;
+  if IsAffine then
+  begin
+    GammaPtr := FNeurons[0].FWeights.GetRawPtr();
+    BetaPtr := FNeurons[1].FWeights.GetRawPtr();
+  end
+  else
+  begin
+    GammaPtr := nil;
+    BetaPtr := nil;
+  end;
   OnesPtr := FOnes.GetRawPtr();
   // FNormalized / FInvStd are read only by Backpropagate and are released on
   // an inference-only layer, so the snapshot is keyed on the buffer still
@@ -78012,8 +78047,11 @@ begin
       system.Move(XPtr^, XHatPtr^, Depth * csNeuralFloatSize);
     end;
     // FOutput = gamma .* x_hat + beta  (elementwise over the depth segment).
-    TNNetVolume.Mul(XPtr, GammaPtr, Depth);
-    TNNetVolume.Add(XPtr, BetaPtr, Depth);
+    if IsAffine then
+    begin
+      TNNetVolume.Mul(XPtr, GammaPtr, Depth);
+      TNNetVolume.Add(XPtr, BetaPtr, Depth);
+    end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -78088,10 +78126,17 @@ begin
   // Inference keeps the result in OpenCL memory (a host reader calls
   // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
   KeepOnOpenCL := not FIsTrainable;
-  FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
-    FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon,
-    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
-    KeepOnOpenCL);
+  // A non-affine layer's ones/zeros upload with the helper's fresh buffers
+  // and never again; a buffer kept across a shrink is still all ones/zeros.
+  if FElementwiseAffine then
+    FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
+      FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon,
+      {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
+      KeepOnOpenCL)
+  else
+    FTokenNormCL.Normalize(FOutput, FOnes, FZeros, FOutput, NumTokens, Depth,
+      {UseMean=}true, FTokenLNEpsilon, {pWeightsDirty=}false, SourceBuffer,
+      KeepOnOpenCL);
   FAfterWeightUpdateHasBeenCalled := false;
   FOutputOnOpenCL := KeepOnOpenCL;
   FOutputOnRAM := not KeepOnOpenCL;
@@ -78103,7 +78148,7 @@ var
   StartTime: double;
   Depth, TokenCnt, TokenMax, BaseIdx: integer;
   SumDxHat, SumDxHatXHat, InvStdDev: TNeuralFloat;
-  Gamma: TNNetVolume;
+  IsAffine: boolean;
   GammaPtr, OnesPtr, GammaGradPtr, BetaGradPtr: TNeuralFloatArrPtr;
   OEPtr, NormPtr, DxHatPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
@@ -78116,39 +78161,43 @@ begin
   // runs through the AVX-vectorized TNNetVolume primitives (mirrors
   // TNNetTokenRMSNorm.Backpropagate, plus the mean-subtraction term).
   TokenMax := (FOutput.Size div Depth) - 1;
-  Gamma := FNeurons[0].FWeights;
-  GammaPtr := Gamma.GetRawPtr();
   OnesPtr := FOnes.GetRawPtr();
-  GammaGradPtr := FGammaGradScratch.GetRawPtr();
-  BetaGradPtr := FBetaGradScratch.GetRawPtr();
-  // Gradients with respect to gamma and beta accumulate over all tokens:
-  //   d(gamma)[c] = sum_t OutputError[t,c] * x_hat[t,c]
-  //   d(beta)[c]  = sum_t OutputError[t,c]
-  // Accumulate the (positive) sums into depth scratch via the 3-pointer MulAdd
-  // (gamma scratch += OE .* x_hat) and a plain Add (beta scratch += OE; x*1+y
-  // = x+y exactly, so the scale-1 accumulate needs no multiply), then fold the
-  // -LR scale into each FDelta in one vectorized MulAdd to preserve the exact
-  // scalar semantics.
-  FGammaGradScratch.Fill(0);
-  FBetaGradScratch.Fill(0);
-  for TokenCnt := 0 to TokenMax do
+  IsAffine := FElementwiseAffine;
+  if IsAffine then
   begin
-    BaseIdx := TokenCnt * Depth;
-    OEPtr := FOutputError.GetRawPtr(BaseIdx);
-    TNNetVolume.MulAdd(GammaGradPtr, OEPtr, FNormalized.GetRawPtr(BaseIdx),
-      Depth);
-    TNNetVolume.Add(BetaGradPtr, OEPtr, Depth);
-  end;
-  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), GammaGradPtr,
-    -FLearningRate, Depth);
-  TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), BetaGradPtr,
-    -FLearningRate, Depth);
-  if (not FBatchUpdate) then
-  begin
-    FNeurons[0].UpdateWeights(FInertia);
-    FNeurons[1].UpdateWeights(FInertia);
-    AfterWeightUpdate();
-  end;
+    GammaPtr := FNeurons[0].FWeights.GetRawPtr();
+    GammaGradPtr := FGammaGradScratch.GetRawPtr();
+    BetaGradPtr := FBetaGradScratch.GetRawPtr();
+    // Gradients with respect to gamma and beta accumulate over all tokens:
+    //   d(gamma)[c] = sum_t OutputError[t,c] * x_hat[t,c]
+    //   d(beta)[c]  = sum_t OutputError[t,c]
+    // Accumulate the (positive) sums into depth scratch via the 3-pointer MulAdd
+    // (gamma scratch += OE .* x_hat) and a plain Add (beta scratch += OE; x*1+y
+    // = x+y exactly, so the scale-1 accumulate needs no multiply), then fold the
+    // -LR scale into each FDelta in one vectorized MulAdd to preserve the exact
+    // scalar semantics.
+    FGammaGradScratch.Fill(0);
+    FBetaGradScratch.Fill(0);
+    for TokenCnt := 0 to TokenMax do
+    begin
+      BaseIdx := TokenCnt * Depth;
+      OEPtr := FOutputError.GetRawPtr(BaseIdx);
+      TNNetVolume.MulAdd(GammaGradPtr, OEPtr, FNormalized.GetRawPtr(BaseIdx),
+        Depth);
+      TNNetVolume.Add(BetaGradPtr, OEPtr, Depth);
+    end;
+    TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), GammaGradPtr,
+      -FLearningRate, Depth);
+    TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), BetaGradPtr,
+      -FLearningRate, Depth);
+    if (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      FNeurons[1].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
+  end
+  else GammaPtr := nil;
   if Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
@@ -78161,11 +78210,16 @@ begin
       InvStdDev := FInvStd.FData[TokenCnt];
       OEPtr := FOutputError.GetRawPtr(BaseIdx);
       NormPtr := FNormalized.GetRawPtr(BaseIdx);
-      DxHatPtr := FOutputErrorDeriv.GetRawPtr(BaseIdx);
       PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(BaseIdx);
-      // dxhat = OutputError .* gamma  (elementwise over the depth segment).
-      system.Move(OEPtr^, DxHatPtr^, Depth * csNeuralFloatSize);
-      TNNetVolume.Mul(DxHatPtr, GammaPtr, Depth);
+      // dxhat = OutputError .* gamma  (elementwise over the depth segment);
+      // without gamma it is OutputError itself, read in place.
+      if IsAffine then
+      begin
+        DxHatPtr := FOutputErrorDeriv.GetRawPtr(BaseIdx);
+        system.Move(OEPtr^, DxHatPtr^, Depth * csNeuralFloatSize);
+        TNNetVolume.Mul(DxHatPtr, GammaPtr, Depth);
+      end
+      else DxHatPtr := OEPtr;
       // mean_c( dxhat ) and mean_c( dxhat * x_hat ) via vectorized dot products.
       SumDxHat := TNNetVolume.DotProduct(DxHatPtr, OnesPtr, Depth) / Depth;
       SumDxHatXHat := TNNetVolume.DotProduct(DxHatPtr, NormPtr, Depth) / Depth;
@@ -78181,6 +78235,7 @@ end;
 
 procedure TNNetTokenLayerNorm.InitDefault();
 begin
+  if not FElementwiseAffine then exit;
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   FNeurons[0].FWeights.Fill(1); // gamma
   FNeurons[1].FWeights.Fill(0); // beta
@@ -131009,7 +131064,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
-      'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0]);
+      'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetTokenRMSNorm':          Result := TNNetTokenRMSNorm.Create(Ft[0]);
       'TNNetHeadRMSNorm':           Result := TNNetHeadRMSNorm.Create(St[0], Ft[0]);
@@ -131456,7 +131511,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
-      if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0]) else
+      if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetTokenRMSNorm' then Result := TNNetTokenRMSNorm.Create(Ft[0]) else
       if S[0] = 'TNNetHeadRMSNorm' then Result := TNNetHeadRMSNorm.Create(St[0], Ft[0]) else

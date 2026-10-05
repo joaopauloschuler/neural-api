@@ -83520,9 +83520,10 @@ begin
   if (Mode = qibStep) and (pPrefixCapacity < 0) then
     ImportError('AddQwenImage21Block: pPrefixCapacity must be >= 0.');
   // ---- attention branch: x + tanh(gate1) * attn(LN(x) * (1 + scale1)) ----
-  // Non-affine LayerNorm: TNNetTokenLayerNorm keeps its default gamma=1, beta=0.
+  // Non-affine LayerNorm: no weights for SelectBlockWeights to link or upload.
   Block.Norm1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
+    TNNetTokenLayerNorm.Create(Config.Eps,
+      {pElementwiseAffine=}false).SetTrainable(pTrainable), XInput);
   Block.Modulated1 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.Norm1, Modulation.OnePlusScale1));
   Block.QProj := NN.AddLayerAfter(
@@ -83572,7 +83573,8 @@ begin
   Block.Residual1 := NN.AddLayer(TNNetSum.Create([Block.Gated1, XInput]));
   // ---- SwiGLU MLP branch: out(silu(gate_layer(h)) * proj(h)) ----
   Block.Norm2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable),
+    TNNetTokenLayerNorm.Create(Config.Eps,
+      {pElementwiseAffine=}false).SetTrainable(pTrainable),
     Block.Residual1);
   Block.Modulated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.Norm2, Modulation.OnePlusScale2));
@@ -83725,8 +83727,8 @@ var
 begin
   XInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, FConfig.Hidden));
   ScaleInput := NN.AddLayer(TNNetInput.Create(1, 1, FConfig.Hidden));
-  Norm := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(FConfig.Eps).SetTrainable(false), XInput);
+  Norm := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(FConfig.Eps,
+    {pElementwiseAffine=}false).SetTrainable(false), XInput);
   NN.AddLayer(TNNetChannelMulByLayer.Create(Norm, ScaleInput));
   Result := NN.AddLayer(TNNetPointwiseConvLinear.Create(FConfig.OutChannels,
     {pSuppressBias=}1).SetTrainable(false));
