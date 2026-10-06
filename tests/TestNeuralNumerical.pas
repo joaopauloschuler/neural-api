@@ -8,7 +8,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
   neuralabfun, neuraldecode, neuralthread
   {$IFDEF OpenCL}
-  , cl, neuralopencl
+  , cl, ctypes, neuralopencl
   {$ENDIF}
   ;
 
@@ -492,6 +492,9 @@ type
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
+    // OpenCLLocalSizeCap: each chosen local size divides its global size, and a
+    // forward on odd/composite shapes matches the driver-chosen local size.
+    procedure TestOpenCLLocalSizeCapParity;
     procedure TestChannelMulByLayerOpenCLParity;
     // Per-token source x host-only per-channel row: resident source bound +
     // row uploaded per forward; host source on the CPU.
@@ -67068,6 +67071,109 @@ begin
     Input.Free;
     NN.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestOpenCLLocalSizeCapParity;
+{$IFDEF OpenCL}
+  procedure CheckLocalSizes(const GlobalSizes, ExpectedSizes: array of csize_t);
+  var
+    LocalSizes: array[0..2] of csize_t;
+    DimPos, MaxDimPos: integer;
+    LocalProduct: csize_t;
+  begin
+    CappedPowerOfTwoLocalSizes(GlobalSizes, LocalSizes, 8);
+    LocalProduct := 1;
+    MaxDimPos := High(GlobalSizes);
+    for DimPos := 0 to MaxDimPos do
+    begin
+      AssertEquals('local size of dimension ' + IntToStr(DimPos),
+        Int64(ExpectedSizes[DimPos]), Int64(LocalSizes[DimPos]));
+      AssertEquals('local size divides the global size', 0,
+        Int64(GlobalSizes[DimPos] mod LocalSizes[DimPos]));
+      LocalProduct := LocalProduct * LocalSizes[DimPos];
+    end;
+    AssertTrue('local size product within the cap', LocalProduct <= 8);
+  end;
+  procedure CheckForwardParity(PlatformId: cl_platform_id; DeviceId: cl_device_id;
+    SizeX, SizeY, InDepth, Filters: integer);
+  var
+    NN: TNNet;
+    Input, OutDriverLocal: TNNetVolume;
+    InputLayer, BranchA, BranchB: TNNetLayer;
+    MulLayer: TNNetCellMulByCell;
+    i, InSize, SavedLocalSizeCap: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    ShapeName: string;
+  begin
+    ShapeName := IntToStr(SizeX) + 'x' + IntToStr(SizeY) + 'x' + IntToStr(InDepth) +
+      ' -> ' + IntToStr(Filters) + ': ';
+    SavedLocalSizeCap := OpenCLLocalSizeCap;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutDriverLocal := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+      BranchA := NN.AddLayerAfter(TNNetConvolutionReLU.Create(Filters, 3, 1, 1), InputLayer);
+      BranchB := NN.AddLayerAfter(TNNetConvolutionReLU.Create(Filters, 3, 1, 1), InputLayer);
+      MulLayer := TNNetCellMulByCell.Create(BranchA, BranchB);
+      NN.AddLayer(MulLayer);
+      NN.SetTrainable(False, False);
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        OpenCLLocalSizeCap := 0;
+        NN.Compute(Input);
+        OutDriverLocal.Copy(NN.GetLastLayer.Output);
+        OpenCLLocalSizeCap := 8;
+        NN.Compute(Input);
+      finally
+        OpenCLLocalSizeCap := SavedLocalSizeCap;
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals(ShapeName + 'output size match', OutDriverLocal.Size,
+        NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutDriverLocal.Size - 1 do
+      begin
+        Diff := Abs(OutDriverLocal.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(ShapeName + 'TNNetCellMulByCell must reach the device',
+        MulLayer.ForwardGPUCnt >= 2);
+      AssertTrue(ShapeName + 'capped vs driver-chosen local size: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+    finally
+      OutDriverLocal.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  CheckLocalSizes([45], [1]);
+  CheckLocalSizes([40, 24], [8, 1]);
+  CheckLocalSizes([6, 10], [2, 2]);
+  CheckLocalSizes([12, 20, 3], [4, 2, 1]);
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424243;
+  // Odd and composite sizes: 15 positions, 7 input and 6 output channels.
+  CheckForwardParity(PlatformId, DeviceId, 5, 3, 7, 6);
+  // Sizes divisible by 8 (32 positions, 8 channels), so groups of 4 and 8 run.
+  CheckForwardParity(PlatformId, DeviceId, 8, 4, 8, 8);
 end;
 {$ELSE}
 begin

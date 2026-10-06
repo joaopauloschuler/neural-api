@@ -140,6 +140,9 @@ type
     // The in-order queue finished every command enqueued before UploadCount
     // was read, so those uploads no longer read host memory.
     procedure MarkUploadsCompleted(UploadCount: LongInt);
+    // OpenCLLocalSizeCap lowered to pKernel's CL_KERNEL_WORK_GROUP_SIZE. Not
+    // checked: per-dimension CL_DEVICE_MAX_WORK_ITEM_SIZES (64+ in z on GPUs).
+    function LocalSizeCapFor(pKernel: cl_kernel): csize_t;
 
   public
     constructor Create(); override;
@@ -760,6 +763,10 @@ var
   // callers spanning worker threads; read it with OpenCLProcessTransferTotals.
   OpenCLProcessTransfers: TOpenCLTransferCounts;
 
+  // 0 (default): a launch without a local size leaves it to the driver. N > 0:
+  // TEasyOpenCL uses CappedPowerOfTwoLocalSizes(N) (env NEURAL_OPENCL_LOCAL_SIZE_CAP).
+  OpenCLLocalSizeCap: integer = 0;
+
 threadvar
   OpenCLThreadTransfers: TOpenCLTransferCounts;
 
@@ -779,6 +786,11 @@ function OpenCLProgramCacheHitCount(): integer;
 /// Drops the cache's references (holders keep theirs). Otherwise a cached context
 /// lives to exit, holding OpenCL memory, even once the driver marks it unusable.
 procedure ClearOpenCLProgramCache();
+
+/// LocalSizes[d] := the largest power of two dividing GlobalSizes[d], with the
+/// product over all dimensions at most pCap; fewer local sizes, fewer PoCL compiles.
+procedure CappedPowerOfTwoLocalSizes(const GlobalSizes: array of csize_t;
+  var LocalSizes: array of csize_t; pCap: csize_t);
 
 implementation
 uses math, neuralthread;
@@ -3686,14 +3698,51 @@ begin
   Result := string(LogText);
 end;
 
+procedure CappedPowerOfTwoLocalSizes(const GlobalSizes: array of csize_t;
+  var LocalSizes: array of csize_t; pCap: csize_t);
+var
+  DimPos, MaxDimPos: integer;
+  LocalProduct, DimLocalSize: csize_t;
+begin
+  LocalProduct := 1;
+  MaxDimPos := High(GlobalSizes);
+  for DimPos := 0 to MaxDimPos do
+  begin
+    DimLocalSize := 1;
+    while (GlobalSizes[DimPos] mod (DimLocalSize * 2) = 0) and
+      (LocalProduct * DimLocalSize * 2 <= pCap) do
+      DimLocalSize := DimLocalSize * 2;
+    LocalSizes[DimPos] := DimLocalSize;
+    LocalProduct := LocalProduct * DimLocalSize;
+  end;
+end;
+
+function TEasyOpenCL.LocalSizeCapFor(pKernel: cl_kernel): csize_t;
+var
+  KernelGroupSize: integer;
+begin
+  Result := OpenCLLocalSizeCap;
+  KernelGroupSize := KernelMaxWorkGroupSize(pKernel);
+  if (KernelGroupSize > 0) and (csize_t(KernelGroupSize) < Result) then
+    Result := KernelGroupSize;
+end;
+
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
 var
-  GlobalThreadCount: csize_t;
+  GlobalThreadCount: array[0..0] of csize_t;
+  LocalThreadCount: array[0..0] of csize_t;
+  LocalSizesArg: pointer;
   work_dim: cl_uint;
 begin
-  GlobalThreadCount := ThreadCount;
+  GlobalThreadCount[0] := ThreadCount;
   work_dim := 1;
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @GlobalThreadCount, nil, 0, nil, nil);
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(GlobalThreadCount, LocalThreadCount, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @LocalThreadCount[0];
+  end;
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @GlobalThreadCount[0], LocalSizesArg, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
@@ -3706,13 +3755,20 @@ function TEasyOpenCL.RunKernel2D(pkernel: cl_kernel;
   d1size, d2size: csize_t): integer;
 var
   work_dim: cl_uint;
-  dim_sizes: array[0..1] of csize_t;
+  dim_sizes, group_sizes: array[0..1] of csize_t;
+  LocalSizesArg: pointer;
 begin
   work_dim := 2;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(dim_sizes, group_sizes, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @group_sizes[0];
+  end;
 
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], nil, 0, nil, nil);
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], LocalSizesArg, 0, nil, nil);
 
   if (Result <> CL_SUCCESS) then
   begin
@@ -3752,14 +3808,21 @@ function TEasyOpenCL.RunKernel3D(pkernel: cl_kernel; d1size, d2size,
   d3size: csize_t): integer;
 var
   work_dim: cl_uint;
-  dim_sizes: array[0..2] of csize_t;
+  dim_sizes, group_sizes: array[0..2] of csize_t;
+  LocalSizesArg: pointer;
 begin
   work_dim := 3;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
   dim_sizes[2] := d3size;
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(dim_sizes, group_sizes, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @group_sizes[0];
+  end;
 
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], nil, 0, nil, nil);
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], LocalSizesArg, 0, nil, nil);
 
   if (Result <> CL_SUCCESS) then
   begin
@@ -3888,6 +3951,7 @@ end;
 
 initialization
 NeuralInitCriticalSection(vOpenCLProgramCacheLock);
+ReadPositiveIntOverride('NEURAL_OPENCL_LOCAL_SIZE_CAP', OpenCLLocalSizeCap);
 {$IFNDEF FPC}
 InitOpenCL;
 {$ENDIF}

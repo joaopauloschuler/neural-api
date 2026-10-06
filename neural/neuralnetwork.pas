@@ -39173,6 +39173,8 @@ const
   // Power of two (the tree reduction halves it) and within every device's
   // maximum work-group size.
   cMaxLocalSize = 256;
+  // One warp: a smaller group saves nothing on a GPU and adds a PoCL compile.
+  cMinLocalSize = 32;
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
@@ -39183,9 +39185,9 @@ begin
   k := FKernel.Kernel;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;
-  // A short segment gets the smallest power-of-two group that covers it, so no
-  // lane idles through the whole launch.
-  LocalSize := 1;
+  // A short segment gets the smallest power-of-two group (at least
+  // cMinLocalSize) that covers it; the kernel's strided loops take any size.
+  LocalSize := cMinLocalSize;
   while (LocalSize < cMaxLocalSize) and (LocalSize < csize_t(SegmentSize)) do
     LocalSize := LocalSize * 2;
   // The weights re-upload only when they changed. Without a bias the kernel
