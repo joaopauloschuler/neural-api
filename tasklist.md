@@ -212,9 +212,13 @@ rather than acted on.
         meta-iterations, the tiled VAE grid, the Qwen-Image pipeline steps and
         tokens) without weakening what they check; also helps the default and
         AVX2 suites.
-  - Optional, not started: fewer distinct work-group sizes per kernel (only the
-    first run after a neural.cl edit, ~200 s of cold PoCL compiles). Moving
-    end-to-end tests to an opt-in slow runner reduces coverage: user decision.
+  - [ ] S4. Fewer distinct work-group sizes per kernel (e.g. cai_volume_sum 6,
+        cai_dot_product 15+): each size is a separate cold PoCL compile, ~200 s
+        on the first run after a neural.cl edit. User-approved 2026-10-05.
+  - [ ] S5. Move the end-to-end Qwen-Image OpenCL tests (PipelineOpenCLKeepLoaded,
+        EditPipelineOpenCL, the VAE shared-output pair, TransformerOpenCLAttention;
+        or merge KeepLoaded with PipelineOpenCL) to an opt-in slow runner. Reduces
+        the default coverage; user-approved 2026-10-05.
 
 - [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
       re-prefill (design agreed with the user 2026-10-02). Today TChatEngine is
