@@ -64,13 +64,22 @@ const
   /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
   /// operand is only ever written and read by device kernels.
   csHalfSize = 2;
-  /// Tile geometry of cai_dot_product_tiled / _int8_tiled / _int8_tiled_h /
-  /// _int4_tiled (the CAI_TILED_* defines in neural.cl; the launch geometry
-  /// derives from them, so the two copies must agree): lanes per work-group,
-  /// rows per lane and columns per tile.
+  /// Tile geometry of the FP32 cai_dot_product_tiled / cai_conv_implicit_tiled
+  /// (the CAI_TILED_* defines in neural.cl; the launch geometry derives from
+  /// them, so the two copies must agree): lanes per work-group, rows per lane
+  /// and columns per tile.
   csTiledGemmLanes = 64;
   csTiledGemmRowsPerLane = 2;
   csTiledGemmCols = 16;
+  /// The code kernels _int8_tiled / _int8_tiled_h / _int4_tiled (CAI_CODES_*):
+  /// a lane owns 4 consecutive rows; the work-group size is required exactly.
+  /// The _small entry points run the same body on the small grid.
+  csTiledGemmCodesLanes = 128;
+  csTiledGemmCodesSmallLanes = 32;
+  csTiledGemmCodesRowsPerLane = 4;
+  /// The code kernels take the small grid when the large one would launch
+  /// fewer than this many work-groups per compute unit.
+  csTiledGemmCodesMinGroupsPerUnit = 2;
   /// Columns (FNumBs) from which Compute and ComputeResidentCodes take the
   /// tiled GEMM: one full column tile. Below it the tile would multiply
   /// zero-padded columns, while the existing kernels re-read each weight row
@@ -81,6 +90,9 @@ const
   csTiledGemmFP32MinRows = csTiledGemmLanes;
 
 type
+  /// Grid of the tiled code kernels: tgcAuto picks per shape
+  /// (csTiledGemmCodesMinGroupsPerUnit); the others force one, for A/B timing.
+  TTiledGemmCodesGrid = (tgcAuto, tgcLarge, tgcSmall);
   TPlatformNames = array of string;
   TPlatforms = array of cl_platform_id;
   TDeviceNames = array of string;
@@ -470,10 +482,12 @@ type
       /// launch. FTiledRejected remembers a device that refused the kernel or
       /// its work-group size, so the fallback is decided once.
       /// FTiledLaunchCount is the test hook that proves the tiled path ran.
+      /// In a code mode FTiledSmallKernel is the _small entry point (required);
+      /// FTiledKernel (the large grid) may be nil when the device rejects it.
       /// Coded by Claude (AI).
-      FTiledKernel: cl_kernel;
+      FTiledKernel, FTiledSmallKernel: cl_kernel;
       FTiledRejected: boolean;
-      FTiledLaunchCount: integer;
+      FTiledLaunchCount, FLastTiledLanes: integer;
       /// IMPLICIT-GEMM CONVOLUTION (cai_conv_implicit_tiled, cai_conv_implicit):
       /// owned handles bound by PrepareImplicitConv; FImplicitConvReady once the
       /// untiled one bound. FImplicitConvLaunchCount is the test hook.
@@ -494,9 +508,13 @@ type
       /// Retains Owner's codes/scales/block-scales as this instance's and sets
       /// FCodesBorrowed; the caller releases any handles it replaces.
       procedure RetainCodesOf(Owner: TDotProductSharedKernel);
-      /// Sets the tiled kernel's codes (4), scales (9) and, for int4, block
+      /// Sets the tiled kernels' codes (4), scales (9) and, for int4, block
       /// scales (10) arguments from the current handles.
       function BindTiledCodesArgs(): integer;
+      /// Shape (0-2), result (6) and BindTiledCodesArgs on one code kernel.
+      function BindTiledFixedArgs(pKernel: cl_kernel): integer;
+      /// Releases FTiledKernel and FTiledSmallKernel.
+      procedure ReleaseTiledKernels();
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -532,14 +550,18 @@ type
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
         var err: integer): longint;
       /// True when the current shape and device take the tiled GEMM: at least
-      /// TiledGemmMinColumns columns and a work-group of csTiledGemmLanes fits.
+      /// TiledGemmMinColumns columns (and 4 rows in a code mode) and a
+      /// work-group of the smallest tiled kernel of the armed mode fits.
       function ShouldUseTiledGemm(): boolean;
+      /// True when the code kernels take the small grid for the current shape:
+      /// forced by TiledGemmCodesGrid, or no large kernel, or too few tiles.
+      function UseSmallCodesGrid(): boolean;
       /// Binds the tiled entry point for the armed weight mode (FP32 if none)
       /// and a code mode's fixed arguments; False when the device rejected it.
       function PrepareTiled(): boolean;
-      /// Launches pKernel with the tiled GEMM geometry over the current shape
-      /// on the shared in-order queue and counts the launch.
-      procedure RunTiledGemm(pKernel: cl_kernel);
+      /// Launches pKernel over the current shape with pLanes lanes of
+      /// pRowsPerLane rows per work-group, on the shared queue; counts it.
+      procedure RunTiledGemm(pKernel: cl_kernel; pLanes, pRowsPerLane: longint);
       /// FInputBufferBs, (re)allocated grow-only for FNumBs x FSize floats.
       function EnsureInputBufferBs(): cl_mem;
       /// The gather source: pExternalSrc when given (borrowed), otherwise
@@ -678,6 +700,8 @@ type
       /// Launches of the tiled GEMM over this instance's lifetime; a test
       /// asserts it moved to prove the tiled path ran.
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
+      /// Work-group lanes of the last tiled launch (0 before the first).
+      property LastTiledGemmLanes: integer read FLastTiledLanes;
       /// True after a successful PrepareImplicitConv.
       property ImplicitConvReady: boolean read FImplicitConvReady;
       /// Implicit-GEMM convolution launches (tiled ones count in
@@ -730,6 +754,11 @@ type
 /// SetTiledGemmMinColumns was called.
 function TiledGemmMinColumns(): integer;
 procedure SetTiledGemmMinColumns(pValue: integer);
+
+/// Grid of the tiled code kernels: tgcAuto unless NEURAL_TILED_GEMM_GRID is
+/// large or small (read once, at first use) or SetTiledGemmCodesGrid was called.
+function TiledGemmCodesGrid(): TTiledGemmCodesGrid;
+procedure SetTiledGemmCodesGrid(pValue: TTiledGemmCodesGrid);
 
 /// Whether inference-only FP32 spatial convolutions may take the implicit GEMM:
 /// true unless NEURAL_OPENCL_IMPLICIT_CONV=0 or SetOpenCLImplicitConv(false).
@@ -962,7 +991,7 @@ begin
   if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
   if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
   if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
-  if Assigned(FTiledKernel)        then clReleaseKernel(FTiledKernel);
+  ReleaseTiledKernels();
   if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
   if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
   FImplicitConvKernel := nil;
@@ -970,7 +999,6 @@ begin
   FImplicitConvReady := false;
   FMainKernel := nil;
   FSinglePassKernel := nil;
-  FTiledKernel := nil;
   FTiledRejected := false;
   FMainArgsBound := false;
   FSinglePassArgsBound := false;
@@ -1269,7 +1297,7 @@ begin
 
         if UseTiled then
         begin
-          RunTiledGemm(FTiledKernel);
+          RunTiledGemm(FTiledKernel, csTiledGemmLanes, csTiledGemmRowsPerLane);
         end
         else if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
@@ -1582,11 +1610,10 @@ begin
   // split-K and single-pass bindings are dropped rather than compared.
   FSplitKArgsBound := false;
   FSinglePassArgsBound := false;
-  if Assigned(FTiledKernel) and (BindTiledCodesArgs() <> CL_SUCCESS) then
+  if Assigned(FTiledSmallKernel) and (BindTiledCodesArgs() <> CL_SUCCESS) then
   begin
-    // PrepareTiled binds a fresh handle to the new buffers on the next launch.
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
+    // PrepareTiled binds fresh handles to the new buffers on the next launch.
+    ReleaseTiledKernels();
   end;
 end;
 
@@ -1609,13 +1636,37 @@ begin
 end;
 
 function TDotProductSharedKernel.BindTiledCodesArgs(): integer;
+
+  function BindOne(pKernel: cl_kernel): integer;
+  begin
+    Result := CL_SUCCESS;
+    if not Assigned(pKernel) then exit;
+    Result := clSetKernelArg(pKernel, 4, csCLMemSize, @FCodesBuffer);
+    Result := Result or clSetKernelArg(pKernel, 9, csCLMemSize,
+      @FScalesBuffer);
+    if FInt4Ready then
+      Result := Result or clSetKernelArg(pKernel, 10, csCLMemSize,
+        @FBlockScalesBuffer);
+  end;
+
 begin
-  Result := clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
-  Result := Result or clSetKernelArg(FTiledKernel, 9, csCLMemSize,
-    @FScalesBuffer);
-  if FInt4Ready then
-    Result := Result or clSetKernelArg(FTiledKernel, 10, csCLMemSize,
-      @FBlockScalesBuffer);
+  Result := BindOne(FTiledKernel) or BindOne(FTiledSmallKernel);
+end;
+
+function TDotProductSharedKernel.BindTiledFixedArgs(pKernel: cl_kernel): integer;
+begin
+  Result := clSetKernelArg(pKernel, 0, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(pKernel, 1, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(pKernel, 2, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(pKernel, 6, csCLMemSize, @FResultBuffer);
+end;
+
+procedure TDotProductSharedKernel.ReleaseTiledKernels();
+begin
+  if Assigned(FTiledKernel) then clReleaseKernel(FTiledKernel);
+  if Assigned(FTiledSmallKernel) then clReleaseKernel(FTiledSmallKernel);
+  FTiledKernel := nil;
+  FTiledSmallKernel := nil;
 end;
 
 procedure TDotProductSharedKernel.RefreshResidentBias(VBias: TNNetVolume);
@@ -1754,6 +1805,30 @@ begin
 end;
 
 var
+  vTiledGemmCodesGridLoaded: boolean = false;
+  vTiledGemmCodesGrid: TTiledGemmCodesGrid = tgcAuto;
+
+function TiledGemmCodesGrid(): TTiledGemmCodesGrid;
+var
+  EnvValue: string;
+begin
+  if not vTiledGemmCodesGridLoaded then
+  begin
+    vTiledGemmCodesGridLoaded := true;
+    EnvValue := LowerCase(GetEnvironmentVariable('NEURAL_TILED_GEMM_GRID'));
+    if EnvValue = 'large' then vTiledGemmCodesGrid := tgcLarge
+    else if EnvValue = 'small' then vTiledGemmCodesGrid := tgcSmall;
+  end;
+  Result := vTiledGemmCodesGrid;
+end;
+
+procedure SetTiledGemmCodesGrid(pValue: TTiledGemmCodesGrid);
+begin
+  vTiledGemmCodesGridLoaded := true;
+  vTiledGemmCodesGrid := pValue;
+end;
+
+var
   vOpenCLImplicitConvLoaded: boolean = false;
   vOpenCLImplicitConv: boolean = true;
 
@@ -1776,69 +1851,115 @@ end;
 
 function TDotProductSharedKernel.ShouldUseTiledGemm(): boolean;
 var
-  MinColumns: integer;
+  MinColumns, MinLanes: integer;
 begin
   MinColumns := TiledGemmMinColumns();
+  if FInt8Ready or FInt4Ready
+    then MinLanes := csTiledGemmCodesSmallLanes
+    else MinLanes := csTiledGemmLanes;
   Result := (MinColumns > 0) and (FNumBs >= MinColumns) and (FSize > 0) and
-    (FDotProductKernel.DeviceMaxWorkGroupSize() >= csTiledGemmLanes);
+    (FDotProductKernel.DeviceMaxWorkGroupSize() >= MinLanes);
+  // A code-kernel lane reads 4 rows starting at most at row FNumAs-4.
+  if (FInt8Ready or FInt4Ready) and (FNumAs < csTiledGemmCodesRowsPerLane) then
+    Result := false;
+end;
+
+// DeviceMaxComputeUnits is cached by TEasyOpenCL after its first query.
+function TDotProductSharedKernel.UseSmallCodesGrid(): boolean;
+var
+  LargeRows, LargeTiles: int64;
+begin
+  case TiledGemmCodesGrid() of
+    tgcSmall: Result := true;
+    tgcLarge: Result := not Assigned(FTiledKernel);
+  else
+    begin
+      LargeRows := csTiledGemmCodesLanes * csTiledGemmCodesRowsPerLane;
+      LargeTiles := ((FNumAs + LargeRows - 1) div LargeRows) *
+        int64((FNumBs + csTiledGemmCols - 1) div csTiledGemmCols);
+      Result := (not Assigned(FTiledKernel)) or (LargeTiles <
+        int64(csTiledGemmCodesMinGroupsPerUnit) *
+        FDotProductKernel.DeviceMaxComputeUnits());
+    end;
+  end;
 end;
 
 function TDotProductSharedKernel.PrepareTiled(): boolean;
 var
   err: integer;
+  KernelName: string;
+  CodesKernel: TNeuralKernel;
 begin
-  Result := Assigned(FTiledKernel);
+  if FInt8Ready or FInt4Ready
+    then Result := Assigned(FTiledSmallKernel)
+    else Result := Assigned(FTiledKernel);
   if Result or FTiledRejected then exit;
   FTiledRejected := true;
-  if FInt4Ready then
-    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_tiled')
-  else if not FInt8Ready then
-    FTiledKernel := FDotProductKernel.CreateKernel('cai_dot_product_tiled')
-  else if FFP16Activations then
-    FTiledKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_tiled_h')
-  else
-    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_tiled');
-  if not Assigned(FTiledKernel) then exit;
-  // Register use can cap the kernel below the device's work-group limit.
-  if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
-  begin
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
-    exit;
-  end;
   if not (FInt8Ready or FInt4Ready) then
   begin
+    FTiledKernel := FDotProductKernel.CreateKernel('cai_dot_product_tiled');
+    if not Assigned(FTiledKernel) then exit;
+    // Register use can cap the kernel below the device's work-group limit.
+    if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
+    begin
+      ReleaseTiledKernels();
+      exit;
+    end;
     FTiledRejected := false;
     Result := true;
     exit;
   end;
-  err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(FTiledKernel, 1, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(FTiledKernel, 2, csLongintSize, @FSize);
-  err := err or clSetKernelArg(FTiledKernel, 6, csCLMemSize, @FResultBuffer);
+  CodesKernel := FInt8Kernel;
+  if FInt4Ready then KernelName := 'cai_dot_product_int4_tiled'
+  else if FFP16Activations then
+  begin
+    KernelName := 'cai_dot_product_int8_tiled_h';
+    CodesKernel := FFP16Kernel;
+  end
+  else KernelName := 'cai_dot_product_int8_tiled';
+  // The small grid is required; the large one is dropped when the device
+  // cannot run its work-group size.
+  FTiledSmallKernel := CodesKernel.CreateKernel(KernelName + '_small');
+  if (not Assigned(FTiledSmallKernel)) or
+    (FDotProductKernel.KernelMaxWorkGroupSize(FTiledSmallKernel) <
+      csTiledGemmCodesSmallLanes) then
+  begin
+    ReleaseTiledKernels();
+    exit;
+  end;
+  FTiledKernel := CodesKernel.CreateKernel(KernelName);
+  if Assigned(FTiledKernel) and
+    (FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) <
+      csTiledGemmCodesLanes) then
+  begin
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+  end;
+  err := BindTiledFixedArgs(FTiledSmallKernel);
+  if Assigned(FTiledKernel) then err := err or BindTiledFixedArgs(FTiledKernel);
   err := err or BindTiledCodesArgs();
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.PrepareTiled - failed setting ' +
       'the fixed tiled GEMM arguments: ' + IntToStr(err));
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
+    ReleaseTiledKernels();
     exit;
   end;
   FTiledRejected := false;
   Result := true;
 end;
 
-procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel);
+procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel;
+  pLanes, pRowsPerLane: longint);
 var
-  RowTiles, ColTiles: longint;
+  RowsPerTile, RowTiles, ColTiles: longint;
 begin
-  RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
-    div (csTiledGemmLanes * csTiledGemmRowsPerLane);
+  RowsPerTile := pLanes * pRowsPerLane;
+  RowTiles := (FNumAs + RowsPerTile - 1) div RowsPerTile;
   ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
-  FDotProductKernel.RunKernel2D(pKernel, RowTiles * csTiledGemmLanes,
-    ColTiles, csTiledGemmLanes, 1);
+  FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles, pLanes, 1);
   Inc(FTiledLaunchCount);
+  FLastTiledLanes := pLanes;
 end;
 
 function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
@@ -1919,7 +2040,7 @@ begin
     exit;
   end;
   if UseTiled
-    then RunTiledGemm(K)
+    then RunTiledGemm(K, csTiledGemmLanes, csTiledGemmRowsPerLane)
     else FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
   Inc(FImplicitConvLaunchCount);
 end;
@@ -2241,7 +2362,7 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits: longint;
+  Splits, Lanes: longint;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -2262,14 +2383,23 @@ begin
   // change per call; the FNumBs = 1 decode paths further down are untouched.
   if ShouldUseTiledGemm() and PrepareTiled() then
   begin
-    K := FTiledKernel;
+    if UseSmallCodesGrid() then
+    begin
+      K := FTiledSmallKernel;
+      Lanes := csTiledGemmCodesSmallLanes;
+    end
+    else
+    begin
+      K := FTiledKernel;
+      Lanes := csTiledGemmCodesLanes;
+    end;
     err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
     err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
     err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
     err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
     if err = CL_SUCCESS then
     begin
-      RunTiledGemm(FTiledKernel);
+      RunTiledGemm(K, Lanes, csTiledGemmCodesRowsPerLane);
     end
     else
     begin

@@ -69948,11 +69948,12 @@ end;
 // pointwise convolution over a (pColumns x 1 x pInputs) input gives exactly
 // FNumBs = pColumns, FNumAs = pNeurons, FSize = pInputs, so the shapes below
 // pick FNumBs on both sides of the threshold and ragged FNumAs / FSize (not
-// multiples of the 128-row tile, the 16-column tile, the 32-wide K-step or its
-// 4-wide inner unroll). Each shape runs three device forwards: two tiled (the
-// launch counter must read 2, or 0 below the threshold), then one with the
-// tiled path switched off (SetTiledGemmMinColumns(0)) so the SAME resident
-// codes go through the existing kernels. The tiled result is held against the
+// multiples of the 128- or 512-row tile, the 4-row lane, the 16-column tile
+// or the 32-wide K-step). Each shape runs three device forwards: two tiled,
+// one per grid (SetTiledGemmCodesGrid large, then small; the launch counter
+// must read 2, or 0 below the threshold), then one with the tiled path
+// switched off (SetTiledGemmMinColumns(0)) so the SAME resident codes go
+// through the existing kernels. The tiled result is held against the
 // existing kernels' result and against the reference at the FP32 tolerance;
 // they differ only in float summation order.
 
@@ -69963,7 +69964,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     pSuppressBias: integer; pFP16, ExpectTiled: boolean);
   var
     NN: TNNet;
-    Input, OutCPU, OutTiled, OutUntiled: TNNetVolume;
+    Input, OutCPU, OutTiled, OutUntiled, OutLarge: TNNetVolume;
     Conv: TNNetConvolution;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
@@ -69981,6 +69982,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     OutCPU := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
+    OutLarge := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
       Conv := TNNetConvolution.Create(pNeurons, 1, 0, 1, pSuppressBias);
@@ -70005,8 +70007,13 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if pFP16 then
           AssertTrue('TiledGemmInt8 ' + aName + ' took the FP16 route', Conv.FP16Active);
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        // Both grids of the code kernels over the same resident codes/scales/
+        // bias and bound tiled arguments.
+        SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
+        OutLarge.Copy(NN.GetLastLayer.Output);
+        SetTiledGemmCodesGrid(tgcSmall);
+        NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The existing kernels over the same resident codes and B operand.
@@ -70017,6 +70024,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
           TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        SetTiledGemmCodesGrid(tgcAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt8 ' + aName + ' output size match', OutCPU.Size,
@@ -70029,6 +70037,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         Diff := Abs(OutCPU.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutLarge.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
       end;
@@ -70052,6 +70062,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs CPU: max |diff| = ' +
         FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(TolCPU), MaxDiffCPU < TolCPU);
     finally
+      OutLarge.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutCPU.Free;
@@ -70065,14 +70076,15 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
   RunPointwise('7 col 1003x96 identity nobias', 7, 1003, 96,
     @Identity, @IdentityDerivative, 1, false, false);
-  // Exactly one column tile; 200 rows = one full row tile + 72; 1003 = 31
-  // K-steps + a 11-wide remainder whose last 3 elements take the scalar loop.
+  // Exactly one column tile; 200 rows = one small tile + 72 (one partial large
+  // tile); 1003 = 31 K-steps + an 11-wide ragged last step.
   RunPointwise('16 col 1003x200 relu bias', 16, 1003, 200,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
-  // Four column tiles, 130 rows (a lane's second row past FNumAs), no bias.
+  // Four column tiles, 130 rows (a last lane that stores 2 of its 4 rows),
+  // no bias.
   RunPointwise('64 col 1003x130 identity nobias', 64, 1003, 130,
     @Identity, @IdentityDerivative, 1, false, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row;
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 small tiles + 1 row;
   // 96 = 3 K-steps exactly; a transcendental activation.
   RunPointwise('130 col 96x257 swish bias', 130, 96, 257,
     @Swish, @SwishDerivative, 0, false, true);
@@ -70086,6 +70098,34 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
   RunPointwise('fp16 7 col 1003x96 relu bias', 7, 1003, 96,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, false);
+  // The 4-row lanes of the code kernels: 4 rows = one lane; 5..7 rows = the
+  // last lane reads rows FNumAs-4..FNumAs-1 and stores 1..3 of them; 3 rows
+  // are below one lane, so no tile. 7 = a reduction axis shorter than one
+  // K-step (tail only), 32 = one step and no tail; 17 and 33 columns leave a
+  // 1-column tile.
+  RunPointwise('17 col 7x4 relu bias', 17, 7, 4,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  RunPointwise('17 col 45x5 identity nobias', 17, 45, 5,
+    @Identity, @IdentityDerivative, 1, false, true);
+  RunPointwise('16 col 32x6 tanh bias', 16, 32, 6,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true);
+  RunPointwise('33 col 77x7 relu bias', 33, 77, 7,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  RunPointwise('16 col 64x3 relu bias', 16, 64, 3,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
+  // 516 rows = one 512-row tile + one lane (4-byte loads); 515 = the second
+  // tile's only lane reads rows 511..514 and stores 512..514 (byte loads).
+  RunPointwise('17 col 100x516 relu bias', 17, 100, 516,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  RunPointwise('17 col 100x515 identity nobias', 17, 100, 515,
+    @Identity, @IdentityDerivative, 1, false, true);
+  RunPointwise('fp16 17 col 45x7 relu bias', 17, 45, 7,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  // FP16 with row counts that are multiples of 4: the 4-byte load instance.
+  RunPointwise('fp16 17 col 45x8 relu bias', 17, 45, 8,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  RunPointwise('fp16 16 col 64x516 identity nobias', 16, 64, 516,
+    @Identity, @IdentityDerivative, 1, true, true);
 end;
 {$ELSE}
 begin
@@ -70105,7 +70145,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     pSuppressBias: integer; ExpectTiled: boolean);
   var
     NN, NNRef: TNNet;
-    Input, OutRef, OutTiled, OutUntiled: TNNetVolume;
+    Input, OutRef, OutTiled, OutUntiled, OutLarge: TNNetVolume;
     Conv, ConvRef: TNNetConvolution;
     Quant4: TNNetVolumeQuant4;
     PlatformId: cl_platform_id;
@@ -70139,6 +70179,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     OutRef := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
+    OutLarge := TNNetVolume.Create();
     Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
     try
       for i := 0 to Input.Size - 1 do
@@ -70163,8 +70204,13 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        // Both grids of the code kernels over the same resident codes/scales/
+        // bias and bound tiled arguments.
+        SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
+        OutLarge.Copy(NN.GetLastLayer.Output);
+        SetTiledGemmCodesGrid(tgcSmall);
+        NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The split-K pair over the same resident packed codes and B operand.
@@ -70175,6 +70221,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
           TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        SetTiledGemmCodesGrid(tgcAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt4 ' + aName + ' output size match', OutRef.Size,
@@ -70187,6 +70234,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         Diff := Abs(OutRef.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffRef then MaxDiffRef := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutLarge.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
       end;
@@ -70206,6 +70255,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         FloatToStr(MaxDiffRef) + ' must be < ' + FloatToStr(Tol), MaxDiffRef < Tol);
     finally
       Quant4.Free;
+      OutLarge.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutRef.Free;
@@ -70220,17 +70270,32 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
   RunPointwise('7 col 96x64 identity nobias', 7, 96, 64,
     @Identity, @IdentityDerivative, 1, false);
-  // One column tile, 200 rows (one row tile + 72), 3 blocks.
+  // One column tile, 200 rows (one small tile + 72), 3 blocks.
   RunPointwise('16 col 96x200 relu bias', 16, 96, 200,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
   // Four column tiles, 130 rows, 65 blocks (an odd count), no bias.
   RunPointwise('64 col 2080x130 identity nobias', 64, 2080, 130,
     @Identity, @IdentityDerivative, 1, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row.
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 small tiles + 1 row.
   RunPointwise('130 col 160x257 swish bias', 130, 160, 257,
     @Swish, @SwishDerivative, 0, true);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
     @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+  // The 4-row lanes, as in TestTiledGemmInt8OpenCLParity: 4 rows, 5..7 rows
+  // (a last lane that stores 1..3 rows), 3 rows (no tile), 516 / 515 rows
+  // (one lane past a 512-row tile, 4-byte vs byte loads), 1-column tiles.
+  RunPointwise('17 col 32x4 relu bias', 17, 32, 4,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  RunPointwise('17 col 64x5 identity nobias', 17, 64, 5,
+    @Identity, @IdentityDerivative, 1, true);
+  RunPointwise('33 col 96x7 tanh bias', 33, 96, 7,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+  RunPointwise('16 col 64x3 relu bias', 16, 64, 3,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
+  RunPointwise('17 col 64x516 relu bias', 17, 64, 516,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  RunPointwise('17 col 64x515 identity nobias', 17, 64, 515,
+    @Identity, @IdentityDerivative, 1, true);
 end;
 {$ELSE}
 begin
