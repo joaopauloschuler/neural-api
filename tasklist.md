@@ -2654,7 +2654,7 @@ rather than acted on.
           local-memory staging of codes and inputs). Estimate: 5-7 s/step.
           L4 measured 2026-10-06: int8 block 9.9-11.4 TFLOPS, Qwen-Image step
           16.1 -> 7.4 s.
-    - [ ] E3.3 Remove the _small grid (user-authorized 2026-10-06): on the L4
+    - [x] E3.3 (076c1d0a) Remove the _small grid (user-authorized 2026-10-06): on the L4
           it lost every measured window shape (1024/2560 rows x 2560 x 16/64
           tokens: int8 13-17% and int4 52-56% slower than the large grid).
     - [ ] E3.4 Split-K with plain FP32 partials for tiled code GEMMs with too
