@@ -6,7 +6,9 @@ runs for a window of tokens (TDotProductSharedKernel.ComputeInt8 / ComputeInt4
 the Qwen-Image-2.1 projection shapes: Q/K/V/O 4096 -> 4096, GateUp 4096 ->
 24576, Down 12288 -> 4096, over --tokens columns. No model is loaded.
 
-Before timing, each weight mode runs once on two small shapes (516 and 515
+First it prints each tiled code kernel's work-group cap, local memory and
+private (spilled) bytes as the device compiler reports them. Before timing,
+each weight mode runs once on two small shapes (516 and 515
 rows, a ragged reduction axis, 37 columns) against a plain Pascal loop over the
 same codes; a max |diff| above 1e-4 * max(1, max |y|) is reported as FAIL and
 nothing is timed.
@@ -20,13 +22,14 @@ reduction * tokens. Memory guard: a shape runs only if its host volumes fit
 
 Usage:
   GemmBench [--tokens 4096] [--iters 10] [--int8 | --int4] [--pico]
-    [--rows R --reduction K] [--grid auto|large|small]
+    [--rows R --reduction K] [--grid auto|large|small|block]
     [--gpu-platform 0] [--gpu-device 0]
 --pico times hidden 64 / MLP 192 over 32 tokens (a smoke run). --rows and
 --reduction time that one shape instead (e.g. an LLM projection at a prefill
 window: --rows 1024 --reduction 2560 --tokens 64). --grid forces the large
-(512-row) or small (128-row) work-groups of the code kernels; auto picks per
-shape, as TNNetPointwiseConvLinear does (SetTiledGemmCodesGrid).
+(512 rows x 16 columns), small (128 x 16) or block (128 x 128) work-groups of
+the code kernels; auto picks per shape, as TNNetPointwiseConvLinear does
+(SetTiledGemmCodesGrid). Parity runs on all three grids.
 
 Coded by Claude (AI).
 *)
@@ -68,7 +71,7 @@ procedure PrintUsageAndHalt(const Problem: string);
 begin
   if Problem <> '' then WriteLn('Error: ', Problem);
   WriteLn('Usage: GemmBench [--tokens N] [--iters N] [--int8 | --int4] ' +
-    '[--pico] [--rows R --reduction K] [--grid auto|large|small] ' +
+    '[--pico] [--rows R --reduction K] [--grid auto|large|small|block] ' +
     '[--gpu-platform N] [--gpu-device N]');
   Halt(2);
 end;
@@ -115,8 +118,9 @@ begin
       if ArgIdx > ParamCount then PrintUsageAndHalt('--grid needs a value');
       if ParamStr(ArgIdx) = 'large' then Grid := tgcLarge
       else if ParamStr(ArgIdx) = 'small' then Grid := tgcSmall
+      else if ParamStr(ArgIdx) = 'block' then Grid := tgcBlock
       else if ParamStr(ArgIdx) <> 'auto' then
-        PrintUsageAndHalt('--grid takes auto, large or small');
+        PrintUsageAndHalt('--grid takes auto, large, small or block');
     end
     else PrintUsageAndHalt('unknown argument ' + Arg);
     Inc(ArgIdx);
@@ -290,6 +294,34 @@ begin
   end;
 end;
 
+// Work-group size cap, local and private (spilled) bytes of each tiled code
+// kernel, as the device compiler reports them for Kernel's program.
+procedure PrintKernelResources(Kernel: TNeuralKernel);
+const
+  csCodeKernels: array[0..5] of string = ('cai_dot_product_int8_tiled',
+    'cai_dot_product_int8_tiled_small', 'cai_dot_product_int8_tiled_block',
+    'cai_dot_product_int4_tiled', 'cai_dot_product_int4_tiled_small',
+    'cai_dot_product_int4_tiled_block');
+var
+  KernelIdx: integer;
+  K: cl_kernel;
+begin
+  WriteLn('Kernel resources (max work-group, local bytes, private bytes):');
+  for KernelIdx := 0 to High(csCodeKernels) do
+  begin
+    K := Kernel.CreateKernel(csCodeKernels[KernelIdx]);
+    if not Assigned(K) then
+    begin
+      WriteLn('  ', csCodeKernels[KernelIdx], ': not created');
+      continue;
+    end;
+    WriteLn(Format('  %-34s %5d %7d %7d', [csCodeKernels[KernelIdx],
+      Kernel.KernelMaxWorkGroupSize(K), Kernel.KernelLocalMemSize(K),
+      Kernel.KernelPrivateMemSize(K)]));
+    clReleaseKernel(K);
+  end;
+end;
+
 // Median milliseconds per launch over csTimedBlocks blocks of equal length.
 function TimeLaunches(Kernel: TNeuralKernel; DotCL: TDotProductSharedKernel;
   B: TNNetVolume; Int4: boolean): double;
@@ -425,10 +457,11 @@ begin
     WriteLn('Device: ', DeviceName, ', compute units ',
       Kernel.DeviceMaxComputeUnits(), ', local memory ',
       Kernel.DeviceLocalMemSize(), ' B');
+    PrintKernelResources(Int8Kernel);
     RandSeed := 20261006;
     WriteLn('Parity vs Pascal:');
     ParityOk := true;
-    for ParityGrid := tgcLarge to tgcSmall do
+    for ParityGrid := tgcLarge to tgcBlock do
     begin
       SetTiledGemmCodesGrid(ParityGrid);
       for Int4 := false to true do

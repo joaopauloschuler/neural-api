@@ -677,6 +677,9 @@ type
       // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
       // test hook proving a window forward took the tiled int8/int4 kernel.
       function OpenCLTiledGemmLaunchCount(): integer;
+      // Work-group lanes of this layer's last tiled-GEMM launch (0 before the
+      // first): the test hook telling the code-kernel grids apart.
+      function OpenCLLastTiledGemmLanes(): integer;
       // Implicit-GEMM convolution launches of this layer's FDotCL (0 without one).
       function OpenCLImplicitConvLaunchCount(): integer;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
@@ -138357,6 +138360,11 @@ end;
 function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;
 begin
   if Assigned(FDotCL) then Result := FDotCL.TiledGemmLaunchCount else Result := 0;
+end;
+
+function TNNetLayer.OpenCLLastTiledGemmLanes(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.LastTiledGemmLanes else Result := 0;
 end;
 
 function TNNetLayer.OpenCLImplicitConvLaunchCount(): integer;
