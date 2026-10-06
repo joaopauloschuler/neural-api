@@ -614,8 +614,8 @@ type
     // axis; the launch counter proves the tiled path ran. Coded by Claude (AI).
     procedure TestTiledGemmInt8OpenCLParity;
     procedure TestTiledGemmInt4OpenCLParity;
-    // AutoTiledGemmCodesGrid: block for big column windows, never below 128
-    // columns or with over 20% padded columns. Coded by Claude (AI).
+    // AutoTiledGemmCodesGrid: block for big column windows, else large; never
+    // block below 128 columns or with over 20% padded columns. Coded by Claude (AI).
     procedure TestTiledGemmCodesAutoGrid;
     // FP32 tiled GEMM (cai_dot_product_tiled) for pointwise and 3x3 im2col
     // convolutions vs cai_dot_product and the CPU forward.
@@ -69952,10 +69952,10 @@ end;
 // FNumBs = pColumns, FNumAs = pNeurons, FSize = pInputs, so the shapes below
 // pick FNumBs on both sides of the threshold and ragged FNumAs / FSize (not
 // multiples of the 128- or 512-row tile, the 4-row lane, the 16-column tile
-// or the 32-wide K-step). Each shape runs four device forwards: three tiled,
-// one per grid (SetTiledGemmCodesGrid large, small, then block; the launch
-// counter must read 3, or 0 below the threshold, and the block forward must
-// report 256 lanes), then one with the tiled path switched off
+// or the 32-wide K-step). Each shape runs three device forwards: two tiled,
+// one per grid (SetTiledGemmCodesGrid large, then block; the launch counter
+// must read 2, or 0 below the threshold, and the two forwards must report 128
+// and 256 lanes), then one with the tiled path switched off
 // (SetTiledGemmMinColumns(0)) so the SAME resident codes go through the
 // existing kernels. The tiled result is held against the
 // existing kernels' result and against the reference at the FP32 tolerance;
@@ -69968,11 +69968,11 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     pSuppressBias: integer; pFP16, ExpectTiled: boolean);
   var
     NN: TNNet;
-    Input, OutCPU, OutTiled, OutUntiled, OutLarge, OutBlock: TNNetVolume;
+    Input, OutCPU, OutTiled, OutUntiled, OutBlock: TNNetVolume;
     Conv: TNNetConvolution;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches, BlockLanes: integer;
+    i, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffCPU, MaxDiffKernels, MaxAbs, Tol, TolCPU: TNeuralFloat;
   begin
     if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -69986,7 +69986,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     OutCPU := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
-    OutLarge := TNNetVolume.Create();
     OutBlock := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
@@ -70012,14 +70011,12 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if pFP16 then
           AssertTrue('TiledGemmInt8 ' + aName + ' took the FP16 route', Conv.FP16Active);
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
-        // The three grids of the code kernels over the same resident codes/
+        // The two grids of the code kernels over the same resident codes/
         // scales/bias and bound tiled arguments.
         SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        OutLarge.Copy(NN.GetLastLayer.Output);
-        SetTiledGemmCodesGrid(tgcSmall);
-        NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
+        LargeLanes := Conv.OpenCLLastTiledGemmLanes();
         SetTiledGemmCodesGrid(tgcBlock);
         NN.Compute(Input);
         OutBlock.Copy(NN.GetLastLayer.Output);
@@ -70047,8 +70044,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
-        Diff := Abs(OutUntiled.Raw[i] - OutLarge.Raw[i]);
-        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
@@ -70060,13 +70055,17 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
       // Without these the device path could be unarmed, or the tiled kernel
       // never taken, and parity would prove nothing.
       AssertTrue('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 4', Conv.ForwardGPUCnt = 4);
-      if ExpectTiled then ExpectedLaunches := 3 else ExpectedLaunches := 0;
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
+      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt8 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
       if ExpectTiled then
+      begin
+        AssertEquals('TiledGemmInt8 ' + aName + ' large grid lanes',
+          csTiledGemmCodesLanes, LargeLanes);
         AssertEquals('TiledGemmInt8 ' + aName + ' block grid lanes',
           csTiledGemmBlockLanes, BlockLanes);
+      end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs existing kernels: max |diff| = ' +
         FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
@@ -70077,7 +70076,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(TolCPU), MaxDiffCPU < TolCPU);
     finally
       OutBlock.Free;
-      OutLarge.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutCPU.Free;
@@ -70091,15 +70089,15 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
   RunPointwise('7 col 1003x96 identity nobias', 7, 1003, 96,
     @Identity, @IdentityDerivative, 1, false, false);
-  // Exactly one column tile; 200 rows = one small tile + 72 (one partial large
-  // tile); 1003 = 31 K-steps + an 11-wide ragged last step.
+  // Exactly one column tile; 200 rows = one partial 512-row large tile (one
+  // 128-row block tile + 72); 1003 = 31 K-steps + an 11-wide ragged last step.
   RunPointwise('16 col 1003x200 relu bias', 16, 1003, 200,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
   // Four column tiles, 130 rows (a last lane that stores 2 of its 4 rows),
   // no bias.
   RunPointwise('64 col 1003x130 identity nobias', 64, 1003, 130,
     @Identity, @IdentityDerivative, 1, false, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 small tiles + 1 row;
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row;
   // 96 = 3 K-steps exactly; a transcendental activation.
   RunPointwise('130 col 96x257 swish bias', 130, 96, 257,
     @Swish, @SwishDerivative, 0, false, true);
@@ -70172,12 +70170,12 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     pSuppressBias: integer; ExpectTiled: boolean);
   var
     NN, NNRef: TNNet;
-    Input, OutRef, OutTiled, OutUntiled, OutLarge, OutBlock: TNNetVolume;
+    Input, OutRef, OutTiled, OutUntiled, OutBlock: TNNetVolume;
     Conv, ConvRef: TNNetConvolution;
     Quant4: TNNetVolumeQuant4;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches, BlockLanes: integer;
+    i, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffRef, MaxDiffKernels, MaxAbs, Tol: TNeuralFloat;
     procedure BuildNet(var pNN: TNNet; var pConv: TNNetConvolution);
     var
@@ -70206,7 +70204,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     OutRef := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
-    OutLarge := TNNetVolume.Create();
     OutBlock := TNNetVolume.Create();
     Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
     try
@@ -70232,14 +70229,12 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
-        // The three grids of the code kernels over the same resident codes/
+        // The two grids of the code kernels over the same resident codes/
         // scales/bias and bound tiled arguments.
         SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        OutLarge.Copy(NN.GetLastLayer.Output);
-        SetTiledGemmCodesGrid(tgcSmall);
-        NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
+        LargeLanes := Conv.OpenCLLastTiledGemmLanes();
         SetTiledGemmCodesGrid(tgcBlock);
         NN.Compute(Input);
         OutBlock.Copy(NN.GetLastLayer.Output);
@@ -70267,8 +70262,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         if Diff > MaxDiffRef then MaxDiffRef := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
-        Diff := Abs(OutUntiled.Raw[i] - OutLarge.Raw[i]);
-        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
@@ -70278,13 +70271,17 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
         ' gpu forwards=', Conv.ForwardGPUCnt);
       AssertTrue('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 4', Conv.ForwardGPUCnt = 4);
-      if ExpectTiled then ExpectedLaunches := 3 else ExpectedLaunches := 0;
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
+      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt4 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
       if ExpectTiled then
+      begin
+        AssertEquals('TiledGemmInt4 ' + aName + ' large grid lanes',
+          csTiledGemmCodesLanes, LargeLanes);
         AssertEquals('TiledGemmInt4 ' + aName + ' block grid lanes',
           csTiledGemmBlockLanes, BlockLanes);
+      end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs split-K: max |diff| = ' +
         FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
@@ -70293,7 +70290,6 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     finally
       Quant4.Free;
       OutBlock.Free;
-      OutLarge.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutRef.Free;
@@ -70308,13 +70304,13 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
   RunPointwise('7 col 96x64 identity nobias', 7, 96, 64,
     @Identity, @IdentityDerivative, 1, false);
-  // One column tile, 200 rows (one small tile + 72), 3 blocks.
+  // One column tile, 200 rows (one block row tile + 72), 3 blocks.
   RunPointwise('16 col 96x200 relu bias', 16, 96, 200,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
   // Four column tiles, 130 rows, 65 blocks (an odd count), no bias.
   RunPointwise('64 col 2080x130 identity nobias', 64, 2080, 130,
     @Identity, @IdentityDerivative, 1, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 small tiles + 1 row.
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row.
   RunPointwise('130 col 160x257 swish bias', 130, 160, 257,
     @Swish, @SwishDerivative, 0, true);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
@@ -70352,30 +70348,30 @@ end;
 procedure TTestNeuralNumerical.TestTiledGemmCodesAutoGrid;
 {$IFDEF OpenCL}
   procedure Check(const aName: string; pNumAs, pNumBs: integer;
-    pHasLarge, pHasBlock: boolean; Expected: TTiledGemmCodesGrid);
+    pHasBlock: boolean; Expected: TTiledGemmCodesGrid);
   begin
     AssertEquals('AutoTiledGemmCodesGrid ' + aName, Ord(Expected),
-      Ord(AutoTiledGemmCodesGrid(pNumAs, pNumBs, 58, pHasLarge, pHasBlock)));
+      Ord(AutoTiledGemmCodesGrid(pNumAs, pNumBs, 58, pHasBlock)));
   end;
 begin
   // Qwen-Image QKVO / GateUp at 4096 tokens: 1024 / 6144 block tiles.
-  Check('4096x4096', 4096, 4096, true, true, tgcBlock);
-  Check('24576x4096', 24576, 4096, true, true, tgcBlock);
-  // No block kernel: the large grid (8 x 256 = 2048 tiles).
-  Check('4096x4096 no block', 4096, 4096, true, false, tgcLarge);
-  // 127 columns: never block; 4096 rows give 8 x 8 = 64 large tiles < 116.
-  Check('4096x127', 4096, 127, true, true, tgcSmall);
-  Check('24576x127', 24576, 127, true, true, tgcLarge);
-  // 128 columns, 24576 rows: 192 block tiles; 4096 rows: 32 < 116.
-  Check('24576x128', 24576, 128, true, true, tgcBlock);
-  Check('4096x128', 4096, 128, true, true, tgcSmall);
+  Check('4096x4096', 4096, 4096, true, tgcBlock);
+  Check('24576x4096', 24576, 4096, true, tgcBlock);
+  // No block kernel: the large grid.
+  Check('4096x4096 no block', 4096, 4096, false, tgcLarge);
+  // 127 columns: never block.
+  Check('4096x127', 4096, 127, true, tgcLarge);
+  Check('24576x127', 24576, 127, true, tgcLarge);
+  // 128 columns, 24576 rows: 192 block tiles; 4096 rows: 32 < 116, so large.
+  Check('24576x128', 24576, 128, true, tgcBlock);
+  Check('4096x128', 4096, 128, true, tgcLarge);
   // 129..204 columns pad the second tile past 20%: 129 and 204 are refused,
   // 205 (2 tiles, 256 * 4 <= 205 * 5) is accepted.
-  Check('24576x129', 24576, 129, true, true, tgcLarge);
-  Check('24576x204', 24576, 204, true, true, tgcLarge);
-  Check('24576x205', 24576, 205, true, true, tgcBlock);
-  // LLM prefill window: 2560 rows x 64 columns, 5 x 4 large tiles < 116.
-  Check('2560x64', 2560, 64, true, true, tgcSmall);
+  Check('24576x129', 24576, 129, true, tgcLarge);
+  Check('24576x204', 24576, 204, true, tgcLarge);
+  Check('24576x205', 24576, 205, true, tgcBlock);
+  // LLM prefill window: 2560 rows x 64 columns, below one block column tile.
+  Check('2560x64', 2560, 64, true, tgcLarge);
 end;
 {$ELSE}
 begin

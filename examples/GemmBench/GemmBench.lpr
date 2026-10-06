@@ -22,14 +22,14 @@ reduction * tokens. Memory guard: a shape runs only if its host volumes fit
 
 Usage:
   GemmBench [--tokens 4096] [--iters 10] [--int8 | --int4] [--pico]
-    [--rows R --reduction K] [--grid auto|large|small|block]
+    [--rows R --reduction K] [--grid auto|large|block]
     [--gpu-platform 0] [--gpu-device 0]
 --pico times hidden 64 / MLP 192 over 32 tokens (a smoke run). --rows and
 --reduction time that one shape instead (e.g. an LLM projection at a prefill
 window: --rows 1024 --reduction 2560 --tokens 64). --grid forces the large
-(512 rows x 16 columns), small (128 x 16) or block (128 x 128) work-groups of
-the code kernels; auto picks per shape, as TNNetPointwiseConvLinear does
-(SetTiledGemmCodesGrid). Parity runs on all three grids.
+(512 rows x 16 columns) or block (128 x 128) work-groups of the code kernels;
+auto picks per shape, as TNNetPointwiseConvLinear does
+(SetTiledGemmCodesGrid). Parity runs on both grids.
 
 Coded by Claude (AI).
 *)
@@ -71,7 +71,7 @@ procedure PrintUsageAndHalt(const Problem: string);
 begin
   if Problem <> '' then WriteLn('Error: ', Problem);
   WriteLn('Usage: GemmBench [--tokens N] [--iters N] [--int8 | --int4] ' +
-    '[--pico] [--rows R --reduction K] [--grid auto|large|small|block] ' +
+    '[--pico] [--rows R --reduction K] [--grid auto|large|block] ' +
     '[--gpu-platform N] [--gpu-device N]');
   Halt(2);
 end;
@@ -117,10 +117,9 @@ begin
       Inc(ArgIdx);
       if ArgIdx > ParamCount then PrintUsageAndHalt('--grid needs a value');
       if ParamStr(ArgIdx) = 'large' then Grid := tgcLarge
-      else if ParamStr(ArgIdx) = 'small' then Grid := tgcSmall
       else if ParamStr(ArgIdx) = 'block' then Grid := tgcBlock
       else if ParamStr(ArgIdx) <> 'auto' then
-        PrintUsageAndHalt('--grid takes auto, large, small or block');
+        PrintUsageAndHalt('--grid takes auto, large or block');
     end
     else PrintUsageAndHalt('unknown argument ' + Arg);
     Inc(ArgIdx);
@@ -298,9 +297,8 @@ end;
 // kernel, as the device compiler reports them for Kernel's program.
 procedure PrintKernelResources(Kernel: TNeuralKernel);
 const
-  csCodeKernels: array[0..5] of string = ('cai_dot_product_int8_tiled',
-    'cai_dot_product_int8_tiled_small', 'cai_dot_product_int8_tiled_block',
-    'cai_dot_product_int4_tiled', 'cai_dot_product_int4_tiled_small',
+  csCodeKernels: array[0..3] of string = ('cai_dot_product_int8_tiled',
+    'cai_dot_product_int8_tiled_block', 'cai_dot_product_int4_tiled',
     'cai_dot_product_int4_tiled_block');
 var
   KernelIdx: integer;
