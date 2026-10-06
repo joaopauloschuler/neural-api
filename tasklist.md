@@ -2646,7 +2646,7 @@ rather than acted on.
         (one-byte weight loads inside the FMA loop, int8 K loop with a run-time
         bound and no unroll). Serial stages, each with a fresh read-only
         reviewer, the three suites and a commit; the user times each on the L4:
-    - [ ] E3.1 GEMM fix 1: a kernel-only benchmark example at the Qwen-Image
+    - [x] E3.1 GEMM fix 1 (fdde6fc6; L4 timing pending): a kernel-only benchmark example at the Qwen-Image
           projection shapes, then a constant-32 unrolled K loop, 4 rows per
           lane read as 4-byte codes, 4x16 micro-tile per lane (int8 and int4).
           Estimate: 16 -> 8-10 s/step.
