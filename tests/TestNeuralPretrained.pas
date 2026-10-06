@@ -19,7 +19,7 @@ uses
   {$IFDEF OpenCL}
   cl, neuralopencl, // platform/device for the audio-holder conv OpenCL parity test
   {$ENDIF}
-  Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
+  Classes, SysUtils, Math, fpcunit, testregistry, testutils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralchatengine, neuralchat,
@@ -42,6 +42,9 @@ type
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
+    // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
+    // OnOpenCL (skipped without a device).
+    procedure CheckQwenImage21VaeSharedHostOutputs(OnOpenCL: boolean);
     // The tiny_qwen3_5 hybrid fixture as an inference net whose input width
     // (the streamed window) is pSeqLen tokens; pWeightOwner builds it
     // borrowing that net's weights from a checkpoint path that does not exist.
@@ -789,7 +792,6 @@ type
     procedure TestQwenImage21TransformerOpenCLGuard;
     procedure TestQwenImage21TransformerOpenCLSwapParity;
     procedure TestQwenImage21TransformerOpenCLCodesResident;
-    procedure TestQwenImage21TransformerOpenCLAttention;
     procedure TestQwenImage21TransformerStepReplay;
     // Condition images (C3a): RoPE positions, key ends and the encoder-row
     // split vs the diffusers layout; prefix K/V and velocity parity.
@@ -807,11 +809,8 @@ type
     procedure TestQwenImage21VaeDecoderTiledParity;
     procedure TestQwenImage21VaeDecoderPhaseProfile;
     procedure TestQwenImage21VaeDecoderOpenCL;
-    // ShareOpenCLOutputs on vs off: same images, transfers and implicit GEMMs
-    // (whole and tiled, serial and parallel); fewer OpenCL bytes. Coded by Claude (AI).
-    procedure TestQwenImage21VaeDecoderOpenCLSharedOutputs;
-    // ShareHostOutputs on vs off, on the CPU and on OpenCL: same images (whole
-    // and tiled, serial and parallel); fewer host bytes. Coded by Claude (AI).
+    // ShareHostOutputs on vs off on the CPU: same images (whole and tiled,
+    // serial and parallel); fewer host bytes. Coded by Claude (AI).
     procedure TestQwenImage21VaeDecoderSharedHostOutputs;
     // The tile-shape nets borrow WeightOwner's OpenCL weights: one weight
     // upload per decode, CPU parity, ReleaseOpenCLWeights with Net alive.
@@ -831,7 +830,6 @@ type
     procedure TestQwenImage21PipelineOpenCL;
     procedure TestQwenImage21PipelineKeepLoaded;
     procedure TestQwenImage21PipelineUnloadComponents;
-    procedure TestQwenImage21PipelineOpenCLKeepLoaded;
     procedure TestQwenImage21PipelineImageStats;
     procedure TestQwenImage21LanczosResizeVsPIL;
     procedure TestQwenImage21PrepareVaeImage;
@@ -851,7 +849,6 @@ type
     procedure TestQwenImage21EditPipelineParity;
     procedure TestQwenImage21EditKeepLoaded;
     procedure TestQwenImage21EditRefusals;
-    procedure TestQwenImage21EditPipelineOpenCL;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -1029,6 +1026,19 @@ type
     procedure TestTorchLSTMImportParity;
     procedure TestTorchGRUImportParity;
     procedure TestTorchRNNImportRejectsProjection;
+  end;
+
+  // End-to-end Qwen-Image OpenCL tests, registered only when the environment
+  // variable NEURAL_SLOW_TESTS is 1 (RegisterSlowPretrainedTests).
+  TTestNeuralPretrainedSlow = class(TTestNeuralPretrained)
+  published
+    procedure TestQwenImage21TransformerOpenCLAttention;
+    // ShareOpenCLOutputs on vs off: same images, transfers and implicit GEMMs;
+    // fewer OpenCL bytes.
+    procedure TestQwenImage21VaeDecoderOpenCLSharedOutputs;
+    // ShareHostOutputs on vs off on OpenCL: same images; fewer host bytes.
+    procedure TestQwenImage21VaeDecoderSharedHostOutputsOpenCL;
+    procedure TestQwenImage21EditPipelineOpenCL;
   end;
 
 implementation
@@ -28413,7 +28423,7 @@ end;
 // projections, match the CPU (int8, 1e-5 as the swap test), and the prefix K/V
 // goes up once per EncodePrefix. The block activation goes up and down once per
 // step, with shared and with private kernels.
-procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLAttention;
+procedure TTestNeuralPretrainedSlow.TestQwenImage21TransformerOpenCLAttention;
 {$IFDEF OpenCL}
 const
   Timesteps: array[0..1] of TNeuralFloat = (0.9, 0.35);
@@ -30597,7 +30607,7 @@ begin
 end;
 {$ENDIF}
 
-procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCLSharedOutputs;
+procedure TTestNeuralPretrainedSlow.TestQwenImage21VaeDecoderOpenCLSharedOutputs;
 {$IFDEF OpenCL}
 var
   RefJson: TStringList;
@@ -30862,7 +30872,8 @@ begin
 end;
 {$ENDIF}
 
-procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderSharedHostOutputs;
+procedure TTestNeuralPretrained.CheckQwenImage21VaeSharedHostOutputs(
+  OnOpenCL: boolean);
 var
   RefJson: TStringList;
   RefRoot: TJSONData;
@@ -30925,14 +30936,17 @@ begin
     RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
     RefRoot := GetJSON(RefJson.Text);
     LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
-    CompareSharing('CPU');
+    if not OnOpenCL then
+      CompareSharing('CPU')
     {$IFDEF OpenCL}
-    if AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    else if AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
     begin
       AssertTrue('EnableOpenCL', Decoder.EnableOpenCL(PlatformId, DeviceId));
       CompareSharing('OpenCL');
-    end;
+    end
     {$ENDIF}
+    else
+      AssertTrue('no OpenCL device: SKIP', true);
   finally
     TiledOn.Free;
     TiledOff.Free;
@@ -30943,6 +30957,20 @@ begin
     Decoder.Free;
     RefJson.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderSharedHostOutputs;
+begin
+  CheckQwenImage21VaeSharedHostOutputs({OnOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrainedSlow.TestQwenImage21VaeDecoderSharedHostOutputsOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckQwenImage21VaeSharedHostOutputs({OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.RecordQwenImage21Phase(
@@ -31252,20 +31280,46 @@ end;
 // The pipeline with the transformer step pass (int8, int4) and the VAE on
 // OpenCL matches the CPU run. With FP32 weights only the step pass falls back
 // to the CPU; the VAE stays on OpenCL (TestQwenImage21VaeDecoderOpenCL's 5e-5).
+// Keep-loaded on OpenCL (int8): two images of two sizes match one-shot runs.
 procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCL;
 {$IFDEF OpenCL}
 const
   FixtureName = 'tiny_qwenimage21_pipeline_64_io.json';
+  TokenIdsB: array[0..16] of integer = (11, 48, 85, 122, 159, 23, 60, 97,
+    134, 171, 208, 245, 282, 19, 56, 93, 130);
 var
   RefJson: TStringList;
   RefRoot: TJSONData;
   Transformer: TQwenImage21Transformer;
+  OneShot, Loaded: TQwenImage21Pipeline;
   Embeds, Initial, Velocity, ImageCPU, ImageOpenCL, ImageFP32CPU,
-    ImageFP32Requested: TNNetVolume;
+    ImageFP32Requested, TokenEmbeds, OneShotEmbeds, ImageLoaded: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   Width, Height, StepCount: integer;
   Diff: double;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  PhaseUploadSum, PhaseDownloadSum: int64;
+  Phase: TQwenImage21PipelinePhase;
+
+  function NewPipeline(): TQwenImage21Pipeline;
+  begin
+    Result := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Result.TransformerFormat := qiwInt8;
+    Result.EnableOpenCL(PlatformId, DeviceId);
+  end;
+
+  procedure AssertLoadedMatches(Reference: TNNetVolume; const What: string);
+  begin
+    AssertEquals(What + ' width', Reference.SizeX, ImageLoaded.SizeX);
+    Diff := MaxAbsVolumeDiff(ImageLoaded, Reference);
+    WriteLn('  Qwen-Image-2.1 keep-loaded vs one-shot on OpenCL, ', What,
+      ': max|diff|=', Diff:0:9);
+    AssertTrue(What + ' max|diff| ' + FloatToStr(Diff) + ' must be < 1e-4',
+      Diff < 1e-4);
+  end;
 
   procedure RunPipeline(pWeightFormat: TQwenImage21WeightFormat;
     RequestOpenCL, ExpectOnOpenCL: boolean; Image: TNNetVolume;
@@ -31298,6 +31352,9 @@ begin
   RefJson := TStringList.Create;
   RefRoot := nil;
   Transformer := nil;
+  OneShot := nil;
+  Loaded := nil;
+  WasCounting := OpenCLTransferCounting;
   Embeds := TNNetVolume.Create;
   Initial := TNNetVolume.Create;
   Velocity := TNNetVolume.Create;
@@ -31305,6 +31362,9 @@ begin
   ImageOpenCL := TNNetVolume.Create;
   ImageFP32CPU := TNNetVolume.Create;
   ImageFP32Requested := TNNetVolume.Create;
+  TokenEmbeds := TNNetVolume.Create;
+  OneShotEmbeds := TNNetVolume.Create;
+  ImageLoaded := TNNetVolume.Create;
   try
     RefJson.LoadFromFile(FixturePath(FixtureName));
     RefRoot := GetJSON(RefJson.Text);
@@ -31334,6 +31394,65 @@ begin
       Diff:0:9);
     AssertTrue('int8 OpenCL vs CPU image max|diff| ' + FloatToStr(Diff) +
       ' must be < 1e-4', Diff < 1e-4);
+    // Keep-loaded: the first image reuses the one-shot int8 OpenCL run above;
+    // the second (another size, from token ids) is the one the stats describe.
+    Loaded := NewPipeline();
+    Loaded.LoadComponents();
+    AssertTrue('loaded transformer on OpenCL', Loaded.TransformerOnOpenCL);
+    AssertTrue('loaded VAE on OpenCL', Loaded.VaeOnOpenCL);
+    OpenCLTransferCounting := true;
+    Loaded.GenerateFromEmbeds(Embeds, Width, Height, StepCount, {Seed=}0,
+      ImageLoaded, Initial);
+    AssertLoadedMatches(ImageOpenCL, 'first image (64x64)');
+    OneShot := NewPipeline();
+    OneShot.EncodeTokenIds(TokenIdsB, 5, OneShotEmbeds);
+    OneShot.GenerateFromEmbeds(OneShotEmbeds, 32, 64, 2, 1, ImageOpenCL);
+    FreeAndNil(OneShot);
+    Loaded.EncodeTokenIds(TokenIdsB, 5, TokenEmbeds);
+    AssertEquals('loaded encode = one-shot encode', 0,
+      MaxAbsVolumeDiff(TokenEmbeds, OneShotEmbeds), 0);
+    TransfersBefore := OpenCLProcessTransferTotals();
+    Loaded.GenerateFromEmbeds(TokenEmbeds, 32, 64, 2, 1, ImageLoaded);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    AssertLoadedMatches(ImageOpenCL, 'second image (32x64)');
+    AssertTrue('the step pass stayed on OpenCL',
+      Loaded.TransformerOnOpenCL and Loaded.VaeOnOpenCL);
+    with Loaded.ImageStats do
+    begin
+      AssertTrue('stats: transfers counted', TransfersCounted);
+      AssertTrue('stats: step pass and VAE on OpenCL',
+        TransformerOnOpenCL and VaeOnOpenCL);
+      AssertEquals('stats: steps', 2, StepCount);
+      AssertEquals('stats: one VAE tile', 1, VaeTileCount);
+      AssertTrue('stats: step pass uploads',
+        PhaseUploadBytes[qppDenoise] > 0);
+      AssertTrue('stats: VAE downloads its image',
+        PhaseDownloadBytes[qppDecode] > 0);
+      AssertEquals('stats: the prefix pass moves nothing', 0,
+        PhaseUploadBytes[qppEncodePrefix] + PhaseDownloadBytes[qppEncodePrefix]);
+      AssertTrue('stats: transformer OpenCL bytes', TransformerOpenCLBytes > 0);
+      AssertTrue('stats: VAE OpenCL bytes', VaeOpenCLBytes > 0);
+      // Every transfer of the image, worker threads included, is charged to
+      // exactly one phase.
+      PhaseUploadSum := 0;
+      PhaseDownloadSum := 0;
+      for Phase := qppLoadTransformer to qppDecode do
+      begin
+        Inc(PhaseUploadSum, PhaseUploadBytes[Phase]);
+        Inc(PhaseDownloadSum, PhaseDownloadBytes[Phase]);
+      end;
+      AssertEquals('stats: uploads = process delta',
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes,
+        PhaseUploadSum);
+      AssertEquals('stats: downloads = process delta',
+        TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes,
+        PhaseDownloadSum);
+    end;
+    OpenCLTransferCounting := WasCounting;
+    Loaded.EncodeTokenIds(TokenIdsB, 5, TokenEmbeds);
+    AssertEquals('second loaded encode = one-shot encode', 0,
+      MaxAbsVolumeDiff(TokenEmbeds, OneShotEmbeds), 0);
+    FreeAndNil(Loaded);
     // Relative bound, as the int4 velocity in
     // TestQwenImage21TransformerOpenCLSwapParity.
     RunPipeline(qiwInt4, false, false, ImageCPU, 'int4 CPU');
@@ -31352,7 +31471,13 @@ begin
     AssertTrue('FP32 (VAE only on OpenCL) vs CPU image max|diff| ' +
       FloatToStr(Diff) + ' must be < 5e-5', Diff < 5e-5);
   finally
+    OpenCLTransferCounting := WasCounting;
+    Loaded.Free;
+    OneShot.Free;
     Transformer.Free;
+    ImageLoaded.Free;
+    OneShotEmbeds.Free;
+    TokenEmbeds.Free;
     ImageFP32Requested.Free;
     ImageFP32CPU.Free;
     ImageOpenCL.Free;
@@ -31581,121 +31706,6 @@ begin
     Embeds.Free;
   end;
 end;
-
-// Keep-loaded with the step pass (int8) and the VAE on OpenCL: two images of
-// two sizes match one-shot OpenCL runs (TestQwenImage21PipelineOpenCL's 1e-4).
-procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCLKeepLoaded;
-{$IFDEF OpenCL}
-const
-  TokenIdsA: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
-    7, 44, 81, 118, 155, 192);
-  TokenIdsB: array[0..16] of integer = (11, 48, 85, 122, 159, 23, 60, 97,
-    134, 171, 208, 245, 282, 19, 56, 93, 130);
-var
-  OneShot, Loaded: TQwenImage21Pipeline;
-  Embeds, ImageOneShot, ImageLoaded: TNNetVolume;
-  PlatformId: cl_platform_id;
-  DeviceId: cl_device_id;
-  WasCounting: boolean;
-  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
-  PhaseUploadSum, PhaseDownloadSum: int64;
-  Phase: TQwenImage21PipelinePhase;
-
-  function NewPipeline(): TQwenImage21Pipeline;
-  begin
-    Result := TQwenImage21Pipeline.Create(ExtractFileDir(
-      FixturePath('tiny_qwenimage21/model_index.json')));
-    Result.TransformerFormat := qiwInt8;
-    Result.EnableOpenCL(PlatformId, DeviceId);
-  end;
-
-  procedure CompareImage(const TokenIds: array of integer;
-    Width, Height: integer; const What: string);
-  var
-    Diff: double;
-  begin
-    OneShot.EncodeTokenIds(TokenIds, 5, Embeds);
-    OneShot.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageOneShot);
-    Loaded.EncodeTokenIds(TokenIds, 5, Embeds);
-    TransfersBefore := OpenCLProcessTransferTotals();
-    Loaded.GenerateFromEmbeds(Embeds, Width, Height, 2, 1, ImageLoaded);
-    TransfersAfter := OpenCLProcessTransferTotals();
-    AssertEquals(What + ' width', ImageOneShot.SizeX, ImageLoaded.SizeX);
-    Diff := MaxAbsVolumeDiff(ImageLoaded, ImageOneShot);
-    WriteLn('  Qwen-Image-2.1 keep-loaded vs one-shot on OpenCL, ', What,
-      ': max|diff|=', Diff:0:9);
-    AssertTrue(What + ' max|diff| ' + FloatToStr(Diff) + ' must be < 1e-4',
-      Diff < 1e-4);
-  end;
-
-begin
-  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
-  begin
-    AssertTrue('no OpenCL device: SKIP', true);
-    Exit;
-  end;
-  OneShot := nil;
-  Loaded := nil;
-  WasCounting := OpenCLTransferCounting;
-  Embeds := TNNetVolume.Create;
-  ImageOneShot := TNNetVolume.Create;
-  ImageLoaded := TNNetVolume.Create;
-  try
-    OneShot := NewPipeline();
-    Loaded := NewPipeline();
-    Loaded.LoadComponents();
-    AssertTrue('loaded transformer on OpenCL', Loaded.TransformerOnOpenCL);
-    AssertTrue('loaded VAE on OpenCL', Loaded.VaeOnOpenCL);
-    OpenCLTransferCounting := true;
-    CompareImage(TokenIdsA, 64, 64, 'first image (64x64)');
-    CompareImage(TokenIdsB, 32, 64, 'second image (32x64)');
-    AssertTrue('the step pass stayed on OpenCL',
-      Loaded.TransformerOnOpenCL and Loaded.VaeOnOpenCL);
-    with Loaded.ImageStats do
-    begin
-      AssertTrue('stats: transfers counted', TransfersCounted);
-      AssertTrue('stats: step pass and VAE on OpenCL',
-        TransformerOnOpenCL and VaeOnOpenCL);
-      AssertEquals('stats: steps', 2, StepCount);
-      AssertEquals('stats: one VAE tile', 1, VaeTileCount);
-      AssertTrue('stats: step pass uploads',
-        PhaseUploadBytes[qppDenoise] > 0);
-      AssertTrue('stats: VAE downloads its image',
-        PhaseDownloadBytes[qppDecode] > 0);
-      AssertEquals('stats: the prefix pass moves nothing', 0,
-        PhaseUploadBytes[qppEncodePrefix] + PhaseDownloadBytes[qppEncodePrefix]);
-      AssertTrue('stats: transformer OpenCL bytes', TransformerOpenCLBytes > 0);
-      AssertTrue('stats: VAE OpenCL bytes', VaeOpenCLBytes > 0);
-      // Every transfer of the image, worker threads included, is charged to
-      // exactly one phase.
-      PhaseUploadSum := 0;
-      PhaseDownloadSum := 0;
-      for Phase := qppLoadTransformer to qppDecode do
-      begin
-        Inc(PhaseUploadSum, PhaseUploadBytes[Phase]);
-        Inc(PhaseDownloadSum, PhaseDownloadBytes[Phase]);
-      end;
-      AssertEquals('stats: uploads = process delta',
-        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes,
-        PhaseUploadSum);
-      AssertEquals('stats: downloads = process delta',
-        TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes,
-        PhaseDownloadSum);
-    end;
-  finally
-    OpenCLTransferCounting := WasCounting;
-    Loaded.Free;
-    OneShot.Free;
-    ImageLoaded.Free;
-    ImageOneShot.Free;
-    Embeds.Free;
-  end;
-end;
-{$ELSE}
-begin
-  AssertTrue('OpenCL not compiled in: SKIP', true);
-end;
-{$ENDIF}
 
 // ImageStats on a loaded CPU pipeline: tiles, steps, no load or OpenCL
 // figures, the encode phases kept across images. LayerProfiling toggled
@@ -33826,7 +33836,7 @@ end;
 
 // The edit pipeline with the int8 step pass and the VAE decode on OpenCL vs
 // the same pipeline on the CPU (two condition images).
-procedure TTestNeuralPretrained.TestQwenImage21EditPipelineOpenCL;
+procedure TTestNeuralPretrainedSlow.TestQwenImage21EditPipelineOpenCL;
 {$IFDEF OpenCL}
 const
   StepCount = 3;
@@ -43380,6 +43390,34 @@ begin
   AssertTrue('stacked-bidirectional projection must be rejected', Raised);
 end;
 
+// Registers the methods TTestNeuralPretrainedSlow adds (not the inherited
+// ones) as the suite TTestNeuralPretrainedSlow.
+procedure RegisterSlowPretrainedTests;
+var
+  SlowNames, BaseNames: TStringList;
+  Suite: TTestSuite;
+  NamePos: integer;
+begin
+  SlowNames := TStringList.Create;
+  BaseNames := TStringList.Create;
+  try
+    GetMethodList(TTestNeuralPretrainedSlow, SlowNames);
+    GetMethodList(TTestNeuralPretrained, BaseNames);
+    BaseNames.Sorted := true;
+    Suite := TTestSuite.Create(TTestNeuralPretrainedSlow.ClassName);
+    for NamePos := 0 to SlowNames.Count - 1 do
+      if BaseNames.IndexOf(SlowNames[NamePos]) < 0 then
+        Suite.AddTest(TTestNeuralPretrainedSlow.CreateWith(SlowNames[NamePos],
+          TTestNeuralPretrainedSlow.ClassName));
+    RegisterTest('', Suite);
+  finally
+    BaseNames.Free;
+    SlowNames.Free;
+  end;
+end;
+
 initialization
   RegisterTest(TTestNeuralPretrained);
+  if GetEnvironmentVariable('NEURAL_SLOW_TESTS') = '1' then
+    RegisterSlowPretrainedTests;
 end.
