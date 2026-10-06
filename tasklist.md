@@ -201,21 +201,21 @@ rather than acted on.
       pass 95 s vs 3.3 s serial, 415k clock syscalls); neural.cl is built again
       for every EnableOpenCL; a few heavy test shapes. Serial tasks, each with a
       fresh read-only Opus reviewer, the three suites and a commit:
-  - [ ] S1. Scheduler: with OpenCL armed, only worker 0 stays hot (OpenCL layers
+  - [x] S1. Scheduler: with OpenCL armed, only worker 0 stays hot (OpenCL layers
         all go to it on a shared kernel); the hot loop reads the clock every N
         passes, not every pass (PrepareInferenceThreads in neuralpretrained.pas,
         StartThreadWorkers and the hot loop in neuralnetwork.pas). Coverage
         identical. Also a product fix: frees CPU cores during OpenCL passes.
-  - [ ] S2. Build neural.cl once per process and share the context and program,
+  - [x] S2. Build neural.cl once per process and share the context and program,
         keyed by platform, device, source and build options. Coverage identical.
-  - [ ] S3. Shrink the slowest test shapes (depth-4096 norm chains, Reptile
+  - [x] S3. Shrink the slowest test shapes (depth-4096 norm chains, Reptile
         meta-iterations, the tiled VAE grid, the Qwen-Image pipeline steps and
         tokens) without weakening what they check; also helps the default and
         AVX2 suites.
-  - [ ] S4. Fewer distinct work-group sizes per kernel (e.g. cai_volume_sum 6,
+  - [x] S4. Fewer distinct work-group sizes per kernel (e.g. cai_volume_sum 6,
         cai_dot_product 15+): each size is a separate cold PoCL compile, ~200 s
         on the first run after a neural.cl edit. User-approved 2026-10-05.
-  - [ ] S5. Move the end-to-end Qwen-Image OpenCL tests (PipelineOpenCLKeepLoaded,
+  - [x] S5. Move the end-to-end Qwen-Image OpenCL tests (PipelineOpenCLKeepLoaded,
         EditPipelineOpenCL, the VAE shared-output pair, TransformerOpenCLAttention;
         or merge KeepLoaded with PipelineOpenCL) to an opt-in slow runner. Reduces
         the default coverage; user-approved 2026-10-05.
