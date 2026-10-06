@@ -2652,6 +2652,16 @@ rather than acted on.
           Estimate: 16 -> 8-10 s/step.
     - [x] E3.2 GEMM fix 2 (451a6b5f; L4 timing pending): 128x128 register-blocked tiled GEMM (8x8 per lane,
           local-memory staging of codes and inputs). Estimate: 5-7 s/step.
+          L4 measured 2026-10-06: int8 block 9.9-11.4 TFLOPS, Qwen-Image step
+          16.1 -> 7.4 s.
+    - [ ] E3.3 Remove the _small grid (user-authorized 2026-10-06): on the L4
+          it lost every measured window shape (1024/2560 rows x 2560 x 16/64
+          tokens: int8 13-17% and int4 52-56% slower than the large grid).
+    - [ ] E3.4 Split-K with plain FP32 partials for tiled code GEMMs with too
+          few tiles to fill the compute units (user-authorized 2026-10-06):
+          every measured window shape takes a flat ~0.2 ms (serial K loop over
+          1-20 work-groups) against a ~10 us weight-read floor. GemmBench A/B,
+          then the user measures ChatTerminal TTFT with --prefill-window.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
