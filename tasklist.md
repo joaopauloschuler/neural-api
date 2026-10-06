@@ -2639,6 +2639,19 @@ rather than acted on.
           training/backprop) keep their current paths unless the flash kernel
           covers them. Resolves F4 without changing the VAE graph. One L4 VAE
           profile.
+  - [ ] E3. Faster int8/int4 tiled GEMM for TNNetPointwiseConvLinear
+        (ComputeResidentCodes -> RunTiledGemm; user-authorized 2026-10-06).
+        Projections are 14.1 of 16.1 s/step on the L4 (GateUp 3.6 TFLOPS, Down
+        4.0, Q/K/V/O 4.7-5.1); the kernel is latency-bound at ~12.5% of FMA peak
+        (one-byte weight loads inside the FMA loop, int8 K loop with a run-time
+        bound and no unroll). Serial stages, each with a fresh read-only
+        reviewer, the three suites and a commit; the user times each on the L4:
+    - [ ] E3.1 GEMM fix 1: a kernel-only benchmark example at the Qwen-Image
+          projection shapes, then a constant-32 unrolled K loop, 4 rows per
+          lane read as 4-byte codes, 4x16 micro-tile per lane (int8 and int4).
+          Estimate: 16 -> 8-10 s/step.
+    - [ ] E3.2 GEMM fix 2: 128x128 register-blocked tiled GEMM (8x8 per lane,
+          local-memory staging of codes and inputs). Estimate: 5-7 s/step.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
