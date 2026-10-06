@@ -18271,6 +18271,12 @@ type
       FHotThreadWorkers: integer;   // hot workers (indices 0..N-1); default 1
       FHotThreadTimeout: integer;   // hot cool-down window, seconds; default 2
       FHotStopOnFinish: boolean;    // tear the pool down after the next pass
+      // Hot workers of the current pass: FHotThreadWorkers, or worker 0 alone
+      // while OpenCL is enabled (spinning workers take the cores OpenCL needs).
+      FSchedHotWorkers: integer;
+      // Set with OpenCL enabled, for the pass only: SchedEnqueueReady then wakes
+      // the napping workers for each item it pushes to FSchedWork.
+      FSchedWakeOnEnqueue: boolean;
       // Min(FMaxThreadNum, FSchedCpuCount), reading the cpu count lazily.
       // Single source of truth for the pool size, the plan's width floor and
       // the cost proxy's threaded-layer divisor. Coded by Claude (AI).
@@ -18364,6 +18370,11 @@ type
       // pass. Lets diagnostics compute the per-layer chunk count exactly the way
       // the scheduler does. Coded by Claude (AI).
       function SchedulerWorkerCount(): integer;
+      // Hot workers of the last parallel pass (FSchedHotWorkers); 0 before any.
+      function SchedulerHotWorkerCount(): integer;
+      // True once EnableOpenCL ran, even if most layers stay on the CPU: parallel
+      // passes then keep only worker 0 hot and wake the others per push.
+      function OpenCLEnabled(): boolean; virtual;
       // Zeroes the scheduler statistics counters (pass counts, peak
       // in-flight, per-worker layer counts). Coded by Claude (AI).
       procedure ResetSchedulerStats();
@@ -18417,7 +18428,8 @@ type
         read FMaxThreadNum write SetMaxThreadNum;
       // Number of scheduler workers kept HOT (never napping while idle within a
       // pass) - the low-index workers 0..HotThreadWorkers-1. 1 (default) keeps
-      // only worker 0 hot, the classic policy. Coded by Claude (AI).
+      // only worker 0 hot, the classic policy; so does every pass with OpenCL
+      // enabled (see SchedulerHotWorkerCount). Coded by Claude (AI).
       property HotThreadWorkers: integer
         read FHotThreadWorkers write FHotThreadWorkers;
       // Seconds a hot worker stays hot after going continuously idle before it
@@ -20504,6 +20516,7 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
       procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pHasSharedKernel:boolean = true);
+      function OpenCLEnabled(): boolean; override;
       // EnableOpenCL inside Owner's armed context/program (own command queue),
       // so layers linked to Owner's retain its resident weights instead of
       // uploading a copy. Owner first; either net may be freed first. Coded by Claude (AI).
@@ -112732,6 +112745,8 @@ begin
   FHotThreadWorkers := 1;
   FHotThreadTimeout := 2;
   FHotStopOnFinish := false;
+  FSchedHotWorkers := 0;
+  FSchedWakeOnEnqueue := false;
 end;
 
 destructor TNNetExecutionPlanner.Destroy();
@@ -134130,7 +134145,11 @@ begin
     // divert the layer onto the CPU ComputeRange path.
     if FHasSharedKernel
       then WorkQueuePush(FSchedW0Work, Ord(wkLayer), pLayerIdx, 0, 0)
-      else WorkQueuePush(FSchedWork, Ord(wkLayer), pLayerIdx, 0, 0);
+      else
+      begin
+        WorkQueuePush(FSchedWork, Ord(wkLayer), pLayerIdx, 0, 0);
+        if FSchedWakeOnEnqueue then FSchedWake.SetEvent;
+      end;
     exit;
   end;
   if L.WillThread() then
@@ -134171,10 +134190,12 @@ begin
       FinR   := ((c + 1) * W) div N - 1;
       WorkQueuePush(FSchedWork, Ord(wkChunk), pLayerIdx, StartR, FinR);
     end;
+    if FSchedWakeOnEnqueue then FSchedWake.SetEvent;
     exit;
   end;
   // Ordinary whole-layer work: any worker computes it via Compute().
   WorkQueuePush(FSchedWork, Ord(wkLayer), pLayerIdx, 0, 0);
+  if FSchedWakeOnEnqueue then FSchedWake.SetEvent;
 end;
 
 procedure TNNetExecutionPlanner.RunEpilogue(pLayerIdx: integer);
@@ -134211,13 +134232,18 @@ begin
 end;
 
 procedure TNNetExecutionPlanner.RunInferenceSchedulerWorker(index, threadnum: integer);
+const
+  // A hot worker reads the clock once per 256 idle sweeps (mask + 1): a sweep
+  // costs ~10-100 ns, so the 2 s timeout stays exact to well under 1 ms.
+  HotClockSweepMask = 255;
 var
   W: TWorkItem;
   L: TNNetLayer;
   got: boolean;
   CurInFlight, PeakSeen: LongInt;
   IdleSweeps: integer;
-  IsHotWorker: boolean;     // this worker is one of the first HotThreadWorkers
+  IsHotWorker: boolean;     // this worker is one of the first FSchedHotWorkers
+  StaysHot: boolean;        // hot and not yet timed out in this idle stretch
   IdleStartTick: TDateTime; // when the current idle stretch began
   HotTimeoutDays: double;   // HotThreadTimeout expressed in TDateTime days
   ChunkStart: TDateTime;    // chunk-0 timing (wall-clock forward time)
@@ -134226,7 +134252,8 @@ var
 begin
   IdleSweeps := 0;
   RunLayersProfiled := FLayerProfiling;
-  IsHotWorker := index < FHotThreadWorkers;
+  IsHotWorker := (index = 0) or (index < FSchedHotWorkers);
+  StaysHot := IsHotWorker;
   HotTimeoutDays := FHotThreadTimeout / (24.0 * 60.0 * 60.0);
   IdleStartTick := 0;
   // One exception frame per worker per pass: a failure sets FSchedFailed so
@@ -134247,7 +134274,7 @@ begin
       // Both queues empty: everything left is blocked on layers other
       // workers currently own. Idle policy (keeps the latency floor without
       // burning every core):
-      // - The first HotThreadWorkers workers stay HOT: they re-poll the queues
+      // - The first FSchedHotWorkers workers stay HOT: they re-poll the queues
       //   immediately (spin, never nap), so at least one thread is always
       //   probing and the pass is never slower than serial. Worker 0 is
       //   unconditionally hot; the other hot workers stay hot only while they
@@ -134260,14 +134287,38 @@ begin
       //   only engage for sustained wide sections). Any successful pop resets
       //   IdleSweeps, and so both the idle-stretch clock (IdleStartTick) and the
       //   backoff; the pass-completing worker sets the wake event, ending all
-      //   naps instantly so the join never waits one out. Coded by Claude (AI).
-      Inc(IdleSweeps);
-      if IdleSweeps = 1 then IdleStartTick := Now; // start of this idle stretch
-      // Short-circuit order keeps Now() off the path for worker 0.
-      if (index = 0)
-           or (IsHotWorker and ((Now - IdleStartTick) < HotTimeoutDays))
-        then continue
-        else FSchedWake.WaitFor(Min(index + (IdleSweeps shr 8), 10));
+      //   naps instantly so the join never waits one out.
+      // - With FSchedWakeOnEnqueue, SchedEnqueueReady also sets the wake event
+      //   for each push, and a napper resets it only after re-checking the queue.
+      //   Coded by Claude (AI).
+      // Saturates: worker 0 may spin for over 2^31 sweeps in one pass.
+      if IdleSweeps < MaxInt then Inc(IdleSweeps);
+      if IdleSweeps = 1 then
+      begin
+        StaysHot := IsHotWorker;
+        // Worker 0 never times out, so it never reads the clock.
+        if StaysHot and (index <> 0) then IdleStartTick := Now;
+      end;
+      if StaysHot then
+      begin
+        if (index = 0) or ((IdleSweeps and HotClockSweepMask) <> 0) or
+          ((Now - IdleStartTick) < HotTimeoutDays) then continue;
+        StaysHot := false;
+      end;
+      if FSchedWakeOnEnqueue then
+      begin
+        FSchedWake.ResetEvent;
+        // A push or the pass end may have set the event before the reset: set
+        // it again for the other nappers and go back to the queues.
+        if (NeuralAtomicRead(FSchedWork.Head) < NeuralAtomicRead(FSchedWork.Tail))
+          or (NeuralAtomicRead(FSchedRemaining) = 0)
+          or (NeuralAtomicRead(FSchedFailed) <> 0) then
+        begin
+          FSchedWake.SetEvent;
+          continue;
+        end;
+      end;
+      FSchedWake.WaitFor(Min(index + (IdleSweeps shr 8), 10));
       continue;
     end;
     IdleSweeps := 0;
@@ -134384,6 +134435,8 @@ begin
     exit;
   end;
   Inc(FSchedParallelPassCnt);
+  // Seeding below pushes before the wake event is reset: no wake per push yet.
+  FSchedWakeOnEnqueue := false;
   // Committed to the parallel path: from here until the worker join, every
   // chunk-eligible layer's WillThread() returns True. Set BEFORE the ready
   // queue is seeded (SchedEnqueueReady consults WillThread). Coded by Claude (AI).
@@ -134445,6 +134498,13 @@ begin
     FSchedWake :=
       {$IFDEF FPC}TEventObject{$ELSE}TEvent{$ENDIF}.Create(nil, True, False, '');
   FSchedWake.ResetEvent; // latched from the previous pass
+  // Read per pass, so EnableOpenCL/DisableOpenCL after StartThreadWorkers counts.
+  if OpenCLEnabled() then
+  begin
+    FSchedHotWorkers := 1;
+    FSchedWakeOnEnqueue := true;
+  end
+  else FSchedHotWorkers := FHotThreadWorkers;
   // Grow (never shrink) the per-worker stats slots; growth zero-fills the
   // new slots and preserves accumulated counts.
   if Length(FSchedWorkerLayerCnt) < ThreadCount
@@ -134465,6 +134525,7 @@ begin
   // StartProc joins (waits for every worker), so the pass is complete here:
   // drop back to the serial-visible state where WillThread() is False.
   FParallelActive := false;
+  FSchedWakeOnEnqueue := false;
   // A worker exception was already reported via FErrorProc at the failure
   // site (see RunInferenceSchedulerWorker's outer except); FSchedFailed and
   // FSchedErrorMsg keep the last pass's outcome for inspection.
@@ -134508,6 +134569,16 @@ end;
 function TNNetExecutionPlanner.SchedulerWorkerCount(): integer;
 begin
   if FSchedPool <> nil then Result := FSchedPool.Count else Result := 0;
+end;
+
+function TNNetExecutionPlanner.SchedulerHotWorkerCount(): integer;
+begin
+  Result := FSchedHotWorkers;
+end;
+
+function TNNetExecutionPlanner.OpenCLEnabled(): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetExecutionPlanner.ResetSchedulerStats();
@@ -135503,6 +135574,11 @@ begin
     FLayers[LayerCnt].EnableOpenCL(FDotProductKernel);
   end;
   PlanOpenCLOutputSharing();
+end;
+
+function TNNet.OpenCLEnabled(): boolean;
+begin
+  Result := Assigned(FDotProductKernel);
 end;
 
 function TNNet.GetSharedKernel(const kernelname: string): TNeuralKernel;

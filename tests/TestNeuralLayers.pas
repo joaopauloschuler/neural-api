@@ -538,6 +538,11 @@ begin
           ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
           SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
     end;
+    // Without OpenCL the pass keeps the configured hot count.
+    AssertFalse('no OpenCL on this net', NN.OpenCLEnabled());
+    if NeuralDefaultThreadCount() > 1 then
+      AssertEquals('the pass used HotThreadWorkers hot workers',
+        NN.HotThreadWorkers, NN.SchedulerHotWorkerCount());
 
     // StopThreadWorkers reverts the hot policy to its default (worker 0 hot).
     NN.StopThreadWorkers();

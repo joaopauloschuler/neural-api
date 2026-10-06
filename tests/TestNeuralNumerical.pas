@@ -627,6 +627,9 @@ type
     // ShareOpenCLOutputsByLiveness: identical to unshared on a branching graph,
     // serial, parallel and re-armed; fewer bytes; suffix forwards refused.
     procedure TestOpenCLShareOutputsByLiveness;
+    // With OpenCL enabled (also after StartThreadWorkers) a parallel pass keeps
+    // worker 0 alone hot; a mixed host/OpenCL graph still matches the CPU.
+    procedure TestOpenCLSchedulerHotWorkers;
     // ShareHostOutputsByLiveness on the CPU: identical to unshared, serial and
     // parallel; fewer host bytes; suffix forwards refused; trainable nets unshared.
     procedure TestShareHostOutputsByLiveness;
@@ -70882,6 +70885,97 @@ begin
     Result.Layers[LayerCnt].FlushWeightCache();
   end;
 end;
+
+procedure TTestNeuralNumerical.TestOpenCLSchedulerHotWorkers;
+{$IFDEF OpenCL}
+var
+  NetCPU, Net: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InputPos, MaxInputPos, PassPos: integer;
+  MaxAbs: TNeuralFloat;
+  IsMultiCore: boolean;
+  LastLayerGPUCount: integer;
+
+  procedure CheckParallelPass(const pWhen: string; pExpectedHot: integer);
+  var
+    Diff: TNeuralFloat;
+  begin
+    Net.Compute(Input, 0, {Parallel=}true);
+    Diff := MaxAbsDiffOfVolumes(Net.GetLastLayer().Output, OutCPU);
+    AssertTrue(pWhen + ' vs CPU: ' + FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
+    if IsMultiCore then
+      AssertEquals(pWhen + ': hot workers', pExpectedHot,
+        Net.SchedulerHotWorkerCount());
+  end;
+
+  procedure EnableWithHostReader(pHasSharedKernel: boolean);
+  begin
+    Net.EnableOpenCL(PlatformId, DeviceId, pHasSharedKernel);
+    Net.ForceOpenCL(true);
+    Net.Layers[cLivenessHostReaderIdx].ForceOpenCL(false);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  IsMultiCore := NeuralDefaultThreadCount() > 1;
+  NetCPU := BuildLivenessShareTestNet({pTrainable=}false);
+  Net := BuildLivenessShareTestNet({pTrainable=}false);
+  Input := TNNetVolume.Create(6, 5, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    MaxInputPos := Input.Size - 1;
+    for InputPos := 0 to MaxInputPos do
+      Input.Raw[InputPos] := 0.7 * Sin(InputPos * 0.037) + 0.05;
+    NetCPU.Compute(Input);
+    NetCPU.GetOutput(OutCPU);
+    MaxAbs := OutCPU.GetMaxAbs();
+    // The pool starts before OpenCL is enabled, as PrepareInferenceThreads does.
+    Net.StartThreadWorkers();
+    AssertFalse('OpenCLEnabled before EnableOpenCL', Net.OpenCLEnabled());
+    CheckParallelPass('CPU pass', Net.HotThreadWorkers);
+    EnableWithHostReader({pHasSharedKernel=}true);
+    AssertTrue('OpenCLEnabled after EnableOpenCL', Net.OpenCLEnabled());
+    for PassPos := 0 to 1 do
+      CheckParallelPass('shared kernel pass ' + IntToStr(PassPos), 1);
+    AssertEquals('the host reader ran on the CPU', 0,
+      Net.Layers[cLivenessHostReaderIdx].ForwardGPUCnt);
+    AssertTrue('the last layer ran on OpenCL',
+      Net.GetLastLayer().ForwardGPUCnt > 0);
+    Net.DisableOpenCL();
+    AssertFalse('OpenCLEnabled after DisableOpenCL', Net.OpenCLEnabled());
+    // Serial first: a parallel pass right after DisableOpenCL logs "Error at
+    // moving output from OpenCL to RAM" for the conv layers (not a scheduler issue).
+    Net.Compute(Input);
+    CheckParallelPass('CPU pass after DisableOpenCL', Net.HotThreadWorkers);
+    // Private handles: OpenCL layers ride the shared queue, so the cold
+    // workers must be woken for them.
+    LastLayerGPUCount := Net.GetLastLayer().ForwardGPUCnt;
+    EnableWithHostReader({pHasSharedKernel=}false);
+    for PassPos := 0 to 1 do
+      CheckParallelPass('private kernel pass ' + IntToStr(PassPos), 1);
+    AssertTrue('private handles: the last layer ran on OpenCL',
+      Net.GetLastLayer().ForwardGPUCnt > LastLayerGPUCount);
+    if IsMultiCore then
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', Net.SchedulerStatsReport()));
+  finally
+    OutCPU.Free;
+    Input.Free;
+    Net.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 procedure TTestNeuralNumerical.TestOpenCLShareOutputsByLiveness;
 {$IFDEF OpenCL}
