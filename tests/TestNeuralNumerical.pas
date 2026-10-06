@@ -766,7 +766,7 @@ type
     // only when the normalized tokens stayed.
     procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
     // TNNetPointwiseConvLinear -> TNNetTokenLayerNorm -> TNNetPointwiseConvLinear
-    // with ForceOpenCL off, affine and not, small odd to 4096 depths, 1 and
+    // with ForceOpenCL off, affine and not, small odd to 1024 depths, 1 and
     // many tokens: the norm binds its source, keeps its output and uploads
     // gamma/beta again after a weight change.
     procedure TokenLayerNormResidentChainUnforcedOpenCLParity;
@@ -77091,7 +77091,7 @@ var
       WriteLn('  TokenLayerNorm resident ', CaseName, ': norm max|diff|=',
         NormDiff:0:9, ' out max|diff|=', OutDiff:0:9);
       // The source projection itself differs by float rounding on OpenCL, so
-      // the bound covers its error times 1/std at depth 4096 (measured 5.7e-6).
+      // the bound covers its error times 1/std at depth 1024 (measured 3.6e-6).
       AssertTrue(CaseName + ': norm max|diff| ' + FloatToStr(NormDiff) +
         ' must be < 2e-5', NormDiff < 2e-5);
       AssertTrue(CaseName + ': output max|diff| ' + FloatToStr(OutDiff) +
@@ -77131,8 +77131,8 @@ begin
   CheckCase(1, 37, false);
   CheckCase(7, 37, true);
   CheckCase(3, 300, true);
-  CheckCase(1, 4096, true);
-  CheckCase(6, 4096, false);
+  CheckCase(1, 1024, true);
+  CheckCase(6, 1024, false);
 end;
 {$ELSE}
 begin

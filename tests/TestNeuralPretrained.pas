@@ -30664,7 +30664,7 @@ begin
       AssertEquals('off: no shared layers', 0,
         Decoder.Net.OpenCLSharedOutputLayerCount());
       CountProfiledDecode(CountsOff, WholeOff);
-      Decoder.DecodeTiled(Latent, TiledOff, 32, 16);
+      Decoder.DecodeTiled(Latent, TiledOff, 48, 32);
       Decoder.ShareOpenCLOutputs := true;
       Decoder.ReleaseNet();
       Decoder.Decode(Latent, WholeOn);
@@ -30673,7 +30673,7 @@ begin
       SharedBytes := Decoder.Net.OpenCLSharedOutputBytes();
       PrivateBytes := Decoder.Net.OpenCLSharedOutputPrivateBytes();
       CountProfiledDecode(CountsOn, WholeOn);
-      Decoder.DecodeTiled(Latent, TiledOn, 32, 16);
+      Decoder.DecodeTiled(Latent, TiledOn, 48, 32);
       WriteLn('  Qwen-Image-2.1 VAE 4x4 net, parallel=', Decoder.Parallel,
         ': OpenCL bytes ', BytesOff, ' -> ', BytesOn, '; ', SharedLayerCount,
         ' of ', Decoder.Net.CountLayers(), ' layers share ', SharedBytes,
@@ -30887,7 +30887,7 @@ var
       BytesOff := Decoder.Net.NonWeightBytes();
       AssertEquals(pWhere + ' off: no shared layers', 0,
         Decoder.Net.HostSharedOutputLayerCount());
-      Decoder.DecodeTiled(Latent, TiledOff, 32, 16);
+      Decoder.DecodeTiled(Latent, TiledOff, 48, 32);
       Decoder.ShareHostOutputs := true;
       Decoder.ReleaseNet();
       Decoder.Decode(Latent, WholeOn);
@@ -30895,7 +30895,7 @@ var
       SharedLayerCount := Decoder.Net.HostSharedOutputLayerCount();
       SharedBytes := Decoder.Net.HostSharedOutputBytes();
       PrivateBytes := Decoder.Net.HostSharedOutputPrivateBytes();
-      Decoder.DecodeTiled(Latent, TiledOn, 32, 16);
+      Decoder.DecodeTiled(Latent, TiledOn, 48, 32);
       WriteLn('  Qwen-Image-2.1 VAE 4x4 net, ', pWhere, ', parallel=',
         Decoder.Parallel, ': host bytes ', BytesOff, ' -> ', BytesOn, '; ',
         SharedLayerCount, ' of ', Decoder.Net.CountLayers(),
