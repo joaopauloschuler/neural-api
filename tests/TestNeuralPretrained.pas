@@ -28342,6 +28342,8 @@ var
         Transformer.BlockStoreLayers[MaxBlockPos].QProj));
       OtherContext := TQwenImage21Transformer.Create(
         QwenImage21TransformerFolder(), pWeightFormat);
+      // Without the clear it would reuse the cached context and could link.
+      ClearOpenCLProgramCache();
       AssertTrue(FormatName + ': second-context transformer arms OpenCL',
         OtherContext.EnableOpenCL(PlatformId, DeviceId));
       AssertFalse(FormatName + ': to_q refuses codes of another context',
@@ -28353,6 +28355,7 @@ var
         (Transformer.StepBlock.QProj.WeightOwner =
         Transformer.BlockStoreLayers[MaxBlockPos].QProj));
       // A step net armed in a context of its own cannot follow the stores.
+      ClearOpenCLProgramCache();
       Transformer.StepNet.EnableOpenCL(PlatformId, DeviceId);
       OwnContextCodes := TNNetLayerConcatedWeights(
         Transformer.StepBlock.QProj).OpenCLCodesBuffer();

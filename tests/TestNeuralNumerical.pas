@@ -784,6 +784,15 @@ type
     // FPC heap; the failing-build path must also survive its build-log read.
     procedure CompileProgramSourceIsNotLeaked;
     procedure CompileProgramBuildFailureLogIsSafe;
+    // TEasyOpenCL.CompileProgram reuses a built program for the same platform,
+    // device, source and options; any difference, or a cleared cache, builds.
+    procedure OpenCLProgramCacheKeyAndLifetime;
+    // A second net armed on the same device builds nothing, keeps running on
+    // OpenCL after the first net is freed, and survives disable/re-enable.
+    procedure OpenCLProgramCacheSharedAcrossNets;
+    // Nets armed separately share one context, so a linked FP32 embedding and
+    // a linked int8 pointwise conv borrow the owner's OpenCL weights; parity.
+    procedure OpenCLBorrowAcrossSeparatelyArmedNets;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -69114,10 +69123,10 @@ end;
 {$ENDIF}
 
 // Repeated EnableOpenCL/DisableOpenCL cycles. A buffer or kernel handle that
-// survives a DisableOpenCL belongs to the context that call tore down, so the
-// next EnableOpenCL - which builds a NEW context - would mix the two and every
-// enqueue would fail with CL_INVALID_CONTEXT. The device path then silently
-// falls back to the CPU, which is why this checks ForwardGPUCnt as well as
+// survives a DisableOpenCL belongs to the context that call tore down, so an
+// EnableOpenCL that gets a NEW context (cycle 3 clears the program cache) would
+// mix the two and every enqueue would fail with CL_INVALID_CONTEXT. The OpenCL
+// path then silently falls back to the CPU, which is why this checks ForwardGPUCnt as well as
 // parity: a CPU fallback matches the reference EXACTLY and would otherwise
 // read as a pass. Coded by Claude (AI).
 procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycle;
@@ -69162,6 +69171,8 @@ begin
     for Cycle := 1 to 3 do
     begin
       GPUCntBefore := SumLayer.ForwardGPUCnt;
+      // Cycle 2 reuses the cached context; cycle 3 gets a new one.
+      if Cycle = 3 then ClearOpenCLProgramCache();
       NN.EnableOpenCL(PlatformId, DeviceId);
       NN.ForceOpenCL(True);
       NN.Compute(Input);
@@ -69259,6 +69270,8 @@ begin
     for Cycle := 1 to 3 do
     begin
       GPUCntBefore := TotalForwardGPUCnt(NN);
+      // Cycle 2 reuses the cached context; cycle 3 gets a new one.
+      if Cycle = 3 then ClearOpenCLProgramCache();
       NN.EnableOpenCL(PlatformId, DeviceId);
       NN.ForceOpenCL(True);
       NN.Compute(Input);
@@ -71732,7 +71745,8 @@ begin
       WeightBytes := WeightBytes + int64(Owner.Layers[LayerPos].CountWeights()) *
         SizeOf(TNeuralFloat);
     OpenCLTransferCounting := true;
-    // The control arms in a context of its own, so it uploads its weights.
+    // The control arms before the owner, so it has nothing to borrow and
+    // uploads its own weights.
     Control.EnableOpenCL(PlatformId, DeviceId);
     Control.ForceOpenCL(true);
     Unshared := ForwardUploads(Control, Input);
@@ -84412,7 +84426,12 @@ begin
     // Warm up: the first compile settles the driver-side and RTL allocations.
     EasyCL.CompileProgram(KernelSrc);
     MemBefore := ReadVmDataKB();
-    for i := 1 to csRepeats do EasyCL.CompileProgram(KernelSrc);
+    // Clearing first makes every repeat take the build path, cache insert included.
+    for i := 1 to csRepeats do
+    begin
+      ClearOpenCLProgramCache();
+      EasyCL.CompileProgram(KernelSrc);
+    end;
     MemAfter := ReadVmDataKB();
     LeakKB := (Int64(csRepeats) * SrcLen) div 1024;
     AssertTrue('CompileProgram data-segment growth over ' + IntToStr(csRepeats) +
@@ -84464,6 +84483,293 @@ begin
   end;
   for i := 0 to High(Guard) do
     AssertEquals('stack guard byte ' + IntToStr(i), $5A, Guard[i]);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Runs cai_cache_probe from EasyCL's program on a 4-float buffer and returns
+// element 3, which the kernel sets to 2.
+function RunCacheProbeKernel(EasyCL: TEasyOpenCL): TNeuralFloat;
+var
+  Kernel: cl_kernel;
+  Buffer: cl_mem;
+  Values: array[0..3] of TNeuralFloat;
+begin
+  FillChar(Values, SizeOf(Values), 0);
+  Kernel := EasyCL.CreateKernel('cai_cache_probe');
+  Buffer := EasyCL.CreateBuffer(CL_MEM_READ_WRITE, SizeOf(Values));
+  try
+    clSetKernelArg(Kernel, 0, SizeOf(cl_mem), @Buffer);
+    EasyCL.RunKernel(Kernel, 4);
+    EasyCL.Finish();
+    EasyCL.ReadBuffer(Buffer, SizeOf(Values), @Values[0]);
+  finally
+    clReleaseMemObject(Buffer);
+    clReleaseKernel(Kernel);
+  end;
+  Result := Values[3];
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLProgramCacheKeyAndLifetime;
+{$IFDEF OpenCL}
+const
+  csProbeSource = '__kernel void cai_cache_probe(__global float* v)' + LineEnding +
+    '{ v[get_global_id(0)] = 2.0f; }' + LineEnding;
+var
+  First, Second, OtherOptions, OtherSource, Rebuilt: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BuildsBefore, HitsBefore: integer;
+
+  function NewEasyCL(): TEasyOpenCL;
+  begin
+    Result := TEasyOpenCL.Create();
+    Result.HideMessages();
+    Result.SetCurrentPlatform(PlatformId);
+    Result.SetCurrentDevice(DeviceId);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ClearOpenCLProgramCache();
+  First := nil; Second := nil; OtherOptions := nil; OtherSource := nil;
+  Rebuilt := nil;
+  try
+    BuildsBefore := OpenCLProgramBuildCount();
+    HitsBefore := OpenCLProgramCacheHitCount();
+    First := NewEasyCL();
+    First.CompileProgram(csProbeSource);
+    Second := NewEasyCL();
+    Second.CompileProgram(csProbeSource);
+    AssertEquals('same key builds once', 1, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertEquals('same key hits the cache', 1, OpenCLProgramCacheHitCount() - HitsBefore);
+    AssertTrue('same program', Second.Prog = First.Prog);
+    AssertTrue('same context', Second.Context = First.Context);
+    AssertTrue('own command queue', Second.Commands <> First.Commands);
+    // The cache's reference keeps the program usable after its builder is freed.
+    FreeAndNil(First);
+    AssertEquals('program outlives its builder', 2.0, RunCacheProbeKernel(Second), 0);
+
+    OtherOptions := NewEasyCL();
+    OtherOptions.CompilerOptions := Second.CompilerOptions + ' -DCAI_CACHE_PROBE=1';
+    OtherOptions.CompileProgram(csProbeSource);
+    AssertEquals('other options build', 2, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('other options, other program', OtherOptions.Prog <> Second.Prog);
+
+    OtherSource := NewEasyCL();
+    OtherSource.CompileProgram('/* other */' + LineEnding + csProbeSource);
+    AssertEquals('other source builds', 3, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('other source, other program', OtherSource.Prog <> Second.Prog);
+
+    ClearOpenCLProgramCache();
+    Rebuilt := NewEasyCL();
+    Rebuilt.CompileProgram(csProbeSource);
+    AssertEquals('cleared cache builds', 4, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('cleared cache, other program', Rebuilt.Prog <> Second.Prog);
+    AssertEquals('holder keeps its program after a clear', 2.0,
+      RunCacheProbeKernel(Second), 0);
+    AssertEquals('rebuilt program runs', 2.0, RunCacheProbeKernel(Rebuilt), 0);
+  finally
+    Rebuilt.Free;
+    OtherSource.Free;
+    OtherOptions.Free;
+    Second.Free;
+    First.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLProgramCacheSharedAcrossNets;
+{$IFDEF OpenCL}
+var
+  NetA, NetB: TNNet;
+  Input, Ref: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BuildsBefore, GPUCntBefore, Cycle, i: integer;
+
+  function BuildNet(): TNNet;
+  var
+    LayerCnt: integer;
+  begin
+    RandSeed := 20261005;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(8, 8, 4));
+    Result.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1));
+    for LayerCnt := 1 to Result.GetLastLayerIdx() do
+      Result.Layers[LayerCnt].SetTrainable(False, False);
+  end;
+
+  procedure CheckOpenCLForward(const Step: string);
+  var
+    MaxDiff: TNeuralFloat;
+    ValueCnt: integer;
+  begin
+    GPUCntBefore := NetB.GetLastLayer.ForwardGPUCnt;
+    NetB.ForceOpenCL(True);
+    NetB.Compute(Input);
+    NetB.GetLastLayer.ForceOutputOnRAM();
+    AssertTrue(Step + ' ran on OpenCL',
+      NetB.GetLastLayer.ForwardGPUCnt > GPUCntBefore);
+    MaxDiff := 0;
+    for ValueCnt := 0 to Ref.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Ref.Raw[ValueCnt] -
+        NetB.GetLastLayer.Output.Raw[ValueCnt]));
+    AssertTrue(Step + ' parity: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetA := BuildNet();
+  NetB := BuildNet();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Ref := TNNetVolume.Create();
+  try
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NetB.Compute(Input);
+    Ref.Copy(NetB.GetLastLayer.Output);
+    NetA.EnableOpenCL(PlatformId, DeviceId);
+    BuildsBefore := OpenCLProgramBuildCount();
+    NetB.EnableOpenCL(PlatformId, DeviceId);
+    AssertEquals('second net builds nothing', 0, OpenCLProgramBuildCount() - BuildsBefore);
+    FreeAndNil(NetA);
+    CheckOpenCLForward('after the first net is freed');
+    for Cycle := 1 to 2 do
+    begin
+      NetB.ForceOpenCL(False);
+      NetB.DisableOpenCL();
+      NetB.EnableOpenCL(PlatformId, DeviceId);
+      CheckOpenCLForward('re-enable ' + IntToStr(Cycle));
+    end;
+    AssertEquals('re-enabling builds nothing', 0, OpenCLProgramBuildCount() - BuildsBefore);
+  finally
+    Ref.Free;
+    Input.Free;
+    NetB.Free;
+    NetA.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLBorrowAcrossSeparatelyArmedNets;
+{$IFDEF OpenCL}
+const
+  csSeqLen = 6;
+  csVocab = 4096;
+  csEmbedding = 64;
+  csColumns = 8;
+  csInputs = 64;
+  csNeurons = 40;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  OwnerNet, LinkedNet: TNNet;
+  Input, OutOwner, OutLinked: TNNetVolume;
+  Pos: integer;
+
+  function BuildEmbeddingNet(): TNNet;
+  begin
+    RandSeed := 20261006;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(csSeqLen, 1, 1, 1));
+    Result.AddLayer(TNNetEmbedding.Create(csVocab, csEmbedding, 0, 0.5));
+  end;
+
+  function BuildConvNet(pSeed: integer): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+    Weights: TNNetVolume;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(csColumns, 1, csInputs));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csNeurons));
+    for NeuronCnt := 0 to csNeurons - 1 do
+    begin
+      Weights := Result.GetLastLayer().Neurons[NeuronCnt].Weights;
+      for WeightCnt := 0 to Weights.Size - 1 do
+        Weights.FData[WeightCnt] :=
+          0.5 * Sin((NeuronCnt + 1) * 0.37 + WeightCnt * 0.11 + pSeed);
+    end;
+    Result.UpdateWeights();
+    Result.SetTrainable(false);
+    Result.QuantizeWeightsInt8();
+  end;
+
+  procedure ArmAndCompute(const What: string);
+  begin
+    OwnerNet.EnableOpenCL(PlatformId, DeviceId);
+    OwnerNet.ForceOpenCL(true);
+    OwnerNet.Compute(Input);
+    OwnerNet.GetOutput(OutOwner);
+    LinkedNet.EnableOpenCL(PlatformId, DeviceId);
+    LinkedNet.ForceOpenCL(true);
+    LinkedNet.Compute(Input);
+    LinkedNet.GetOutput(OutLinked);
+    AssertTrue(What + ': linked net ran on OpenCL',
+      LinkedNet.GetLastLayer().ForwardGPUCnt > 0);
+    AssertEquals(What + ': linked equals owner', 0, OutOwner.SumDiff(OutLinked), 0);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  OwnerNet := nil;
+  LinkedNet := nil;
+  Input := TNNetVolume.Create(csSeqLen, 1, 1);
+  OutOwner := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    OwnerNet := BuildEmbeddingNet();
+    LinkedNet := BuildEmbeddingNet();
+    AssertEquals('embedding linked', 1, LinkedNet.LinkWeightsFrom(OwnerNet));
+    for Pos := 0 to csSeqLen - 1 do Input.FData[Pos] := (Pos * 977) mod csVocab;
+    ArmAndCompute('FP32 embedding');
+    AssertTrue('the linked embedding holds the owner''s table',
+      TNNetEmbedding(LinkedNet.GetLastLayer()).OpenCLTableBuffer() =
+      TNNetEmbedding(OwnerNet.GetLastLayer()).OpenCLTableBuffer());
+    FreeAndNil(LinkedNet);
+    FreeAndNil(OwnerNet);
+
+    OwnerNet := BuildConvNet(1);
+    LinkedNet := BuildConvNet(4);
+    AssertEquals('conv linked', 1, LinkedNet.LinkWeightsFrom(OwnerNet));
+    Input.ReSize(csColumns, 1, csInputs);
+    for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.7 * Cos(Pos * 0.029) - 0.1;
+    ArmAndCompute('int8 pointwise conv');
+    AssertTrue('the linked conv borrows the owner''s codes',
+      TNNetLayerConcatedWeights(LinkedNet.GetLastLayer()).OpenCLCodesBorrowed());
+  finally
+    OutLinked.Free;
+    OutOwner.Free;
+    Input.Free;
+    LinkedNet.Free;
+    OwnerNet.Free;
+  end;
 end;
 {$ELSE}
 begin

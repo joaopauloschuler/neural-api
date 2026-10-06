@@ -5754,7 +5754,7 @@ type
       const TokenRows: array of integer; Y: TNNetVolume;
       NumTokens, EmbeddingSize, VocabSize: integer);
     // Uploads the table now when it is not resident yet (Gather does it
-    // lazily), so a borrower can retain it before its first forward.
+    // lazily), blocking, so a borrower on another queue reads a complete table.
     procedure EnsureTableResident(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
       VocabSize, EmbeddingSize: integer);
     // Retains Owner's resident table (same entry point, same context) in place
@@ -40897,7 +40897,8 @@ begin
   if FInt8
     then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
            QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
-    else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
+    else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true,
+      {pBlocking}true);
   FWeightCached := true;
 end;
 
@@ -135453,9 +135454,9 @@ end;
 {$IFDEF OpenCL}
 // Undoes EnableOpenCL completely: every layer first, then the shared helper
 // kernels, then the root kernel that owns their context and program - the order
-// Destroy uses, and the reverse of how they were built. Tearing the context down
-// is what makes a later EnableOpenCL correct: it builds a NEW context, so any
-// buffer or kernel handle surviving from this one would belong to the old one
+// Destroy uses, and the reverse of how they were built. A later EnableOpenCL may
+// get a NEW context (another device, or after ClearOpenCLProgramCache), so any
+// buffer or kernel handle surviving from this arming would belong to the old one
 // and every enqueue mixing the two fails with CL_INVALID_CONTEXT.
 // Coded by Claude (AI).
 procedure TNNet.DisableOpenCL();
@@ -135546,7 +135547,7 @@ var
   LayerCnt: integer;
   LastLayerIdx: integer;
 begin
-  // Arming twice without a DisableOpenCL in between would build a SECOND context
+  // Arming twice without a DisableOpenCL in between could get a SECOND context
   // while FSharedKernels still handed out handles bound to the first one, and
   // every enqueue mixing the two fails with CL_INVALID_CONTEXT. Undo the first
   // arming instead of stacking a second on top of it. Coded by Claude (AI).

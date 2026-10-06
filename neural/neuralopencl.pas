@@ -772,6 +772,14 @@ procedure AddOpenCLTransferDelta(var Total: TOpenCLTransferCounts;
 // OpenCLProcessTransfers read field by field with NeuralAtomicRead64.
 function OpenCLProcessTransferTotals(): TOpenCLTransferCounts;
 
+/// clBuildProgram calls made by TEasyOpenCL.CompileProgram in this process, and
+/// the compiles it served from the process program cache instead.
+function OpenCLProgramBuildCount(): integer;
+function OpenCLProgramCacheHitCount(): integer;
+/// Drops the cache's references (holders keep theirs). Otherwise a cached context
+/// lives to exit, holding OpenCL memory, even once the driver marks it unusable.
+procedure ClearOpenCLProgramCache();
+
 implementation
 uses math, neuralthread;
 
@@ -2903,9 +2911,82 @@ begin
   end;
 end;
 
+type
+  // A built program and its context, keyed by everything that changes the build.
+  TOpenCLProgramCacheEntry = record
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    CompilerOptions: AnsiString;
+    Source: AnsiString;
+    Context: cl_context;
+    Prog: cl_program;
+  end;
+
 var
   // NEURAL_OPENCL_BUILD_LOG prints one build log per process.
   vOpenCLBuildLogPrinted: boolean = false;
+  // Each entry holds one reference to its context and program; every
+  // TEasyOpenCL compiled from it holds its own. Guarded by the lock below.
+  vOpenCLProgramCache: array of TOpenCLProgramCacheEntry;
+  vOpenCLProgramCacheLock: TRTLCriticalSection;
+  vOpenCLProgramBuilds: integer = 0;
+  vOpenCLProgramCacheHits: integer = 0;
+
+function OpenCLProgramBuildCount(): integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  Result := vOpenCLProgramBuilds;
+  LeaveCriticalSection(vOpenCLProgramCacheLock);
+end;
+
+function OpenCLProgramCacheHitCount(): integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  Result := vOpenCLProgramCacheHits;
+  LeaveCriticalSection(vOpenCLProgramCacheLock);
+end;
+
+procedure ClearOpenCLProgramCache();
+var
+  EntryCnt: integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  try
+    for EntryCnt := 0 to High(vOpenCLProgramCache) do
+    begin
+      clReleaseProgram(vOpenCLProgramCache[EntryCnt].Prog);
+      clReleaseContext(vOpenCLProgramCache[EntryCnt].Context);
+    end;
+    SetLength(vOpenCLProgramCache, 0);
+  finally
+    LeaveCriticalSection(vOpenCLProgramCacheLock);
+  end;
+end;
+
+// Index of the cache entry built from Source with the current platform, device
+// and compiler options; -1 when none. Caller holds vOpenCLProgramCacheLock.
+function FindCachedOpenCLProgram(PlatformId: cl_platform_id;
+  DeviceId: cl_device_id; const CompilerOptions: AnsiString;
+  Source: TNeuralPChar): integer;
+var
+  EntryCnt, SourceLen: integer;
+begin
+  SourceLen := {$IFDEF FPC}StrLen{$ELSE}AnsiStrings.StrLen{$ENDIF}(Source);
+  for EntryCnt := 0 to High(vOpenCLProgramCache) do
+  begin
+    if (vOpenCLProgramCache[EntryCnt].PlatformId = PlatformId) and
+      (vOpenCLProgramCache[EntryCnt].DeviceId = DeviceId) and
+      (Length(vOpenCLProgramCache[EntryCnt].Source) = SourceLen) and
+      (vOpenCLProgramCache[EntryCnt].CompilerOptions = CompilerOptions) and
+      ({$IFDEF FPC}StrComp{$ELSE}AnsiStrings.StrComp{$ENDIF}(
+        TNeuralPChar(vOpenCLProgramCache[EntryCnt].Source), Source) = 0) then
+    begin
+      Result := EntryCnt;
+      exit;
+    end;
+  end;
+  Result := -1;
+end;
 
 procedure TEasyOpenCL.CompileProgram();
 var
@@ -2914,6 +2995,7 @@ var
   err: integer; // error code returned from api calls
   errorlogstr: TNeuralStrBuffer;
   loglen: csize_t;
+  CacheIdx: integer;
 begin
   err := 0;
   FreeContext();
@@ -2925,7 +3007,24 @@ begin
   {$ELSE}
   localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
   {$ENDIF}
+  EnterCriticalSection(vOpenCLProgramCacheLock);
   try
+    // Every TNNet.EnableOpenCL compiles neural.cl: reuse the context and the
+    // built program, and give this instance its own command queue.
+    CacheIdx := FindCachedOpenCLProgram(FCurrentPlatform, FCurrentDevice,
+      FCompilerOptions, localKernelSource);
+    if CacheIdx >= 0 then
+    begin
+      FContext := vOpenCLProgramCache[CacheIdx].Context;
+      clRetainContext(FContext);
+      FProg := vOpenCLProgramCache[CacheIdx].Prog;
+      clRetainProgram(FProg);
+      FCommands := CreateCommandQueue();
+      Inc(vOpenCLProgramCacheHits);
+      FMessageProc('OpenCL program reused from the process cache.');
+      exit;
+    end;
+
     // Create a compute context
     FContext := CreateContext();
     if FContext = nil then exit;
@@ -2953,6 +3052,7 @@ begin
 
     // Build the program executable
     err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
+    Inc(vOpenCLProgramBuilds);
 
     {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
 
@@ -2971,6 +3071,16 @@ begin
     else
     begin
       FMessageProc('clBuildProgram OK!');
+      CacheIdx := Length(vOpenCLProgramCache);
+      SetLength(vOpenCLProgramCache, CacheIdx + 1);
+      vOpenCLProgramCache[CacheIdx].PlatformId := FCurrentPlatform;
+      vOpenCLProgramCache[CacheIdx].DeviceId := FCurrentDevice;
+      vOpenCLProgramCache[CacheIdx].CompilerOptions := FCompilerOptions;
+      vOpenCLProgramCache[CacheIdx].Source := AnsiString(localKernelSource);
+      vOpenCLProgramCache[CacheIdx].Context := FContext;
+      vOpenCLProgramCache[CacheIdx].Prog := FProg;
+      clRetainContext(FContext);
+      clRetainProgram(FProg);
       // NEURAL_OPENCL_BUILD_LOG prints the first successful build's log (with
       // -cl-nv-verbose, NVIDIA's register use); TNNet builds with messages
       // hidden, so the opt-in bypasses FMessageProc.
@@ -2982,6 +3092,7 @@ begin
       end;
     end;
   finally
+    LeaveCriticalSection(vOpenCLProgramCacheLock);
     {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelSource);
   end;
 end;
@@ -3775,9 +3886,14 @@ begin
   inherited Destroy;
 end;
 
-{$IFNDEF FPC}
 initialization
+NeuralInitCriticalSection(vOpenCLProgramCacheLock);
+{$IFNDEF FPC}
 InitOpenCL;
 {$ENDIF}
+
+finalization
+ClearOpenCLProgramCache();
+NeuralDoneCriticalSection(vOpenCLProgramCacheLock);
 
 end.
