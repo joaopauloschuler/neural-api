@@ -195,6 +195,27 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
+- [ ] OpenCL test suite under 2 minutes (user goal and authorization
+      2026-10-05; today ~600 s on PoCL). Diagnosis (single-test runs): idle
+      scheduler workers spin hot against PoCL (one VAE test: OpenCL + parallel
+      pass 95 s vs 3.3 s serial, 415k clock syscalls); neural.cl is built again
+      for every EnableOpenCL; a few heavy test shapes. Serial tasks, each with a
+      fresh read-only Opus reviewer, the three suites and a commit:
+  - [ ] S1. Scheduler: with OpenCL armed, only worker 0 stays hot (OpenCL layers
+        all go to it on a shared kernel); the hot loop reads the clock every N
+        passes, not every pass (PrepareInferenceThreads in neuralpretrained.pas,
+        StartThreadWorkers and the hot loop in neuralnetwork.pas). Coverage
+        identical. Also a product fix: frees CPU cores during OpenCL passes.
+  - [ ] S2. Build neural.cl once per process and share the context and program,
+        keyed by platform, device, source and build options. Coverage identical.
+  - [ ] S3. Shrink the slowest test shapes (depth-4096 norm chains, Reptile
+        meta-iterations, the tiled VAE grid, the Qwen-Image pipeline steps and
+        tokens) without weakening what they check; also helps the default and
+        AVX2 suites.
+  - Optional, not started: fewer distinct work-group sizes per kernel (only the
+    first run after a neural.cl edit, ~200 s of cold PoCL compiles). Moving
+    end-to-end tests to an opt-in slow runner reduces coverage: user decision.
+
 - [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
       re-prefill (design agreed with the user 2026-10-02). Today TChatEngine is
       single-session (one KV cache, one position; neuralchatengine.pas header):
