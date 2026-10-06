@@ -2650,7 +2650,7 @@ rather than acted on.
           projection shapes, then a constant-32 unrolled K loop, 4 rows per
           lane read as 4-byte codes, 4x16 micro-tile per lane (int8 and int4).
           Estimate: 16 -> 8-10 s/step.
-    - [ ] E3.2 GEMM fix 2: 128x128 register-blocked tiled GEMM (8x8 per lane,
+    - [x] E3.2 GEMM fix 2 (451a6b5f; L4 timing pending): 128x128 register-blocked tiled GEMM (8x8 per lane,
           local-memory staging of codes and inputs). Estimate: 5-7 s/step.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
