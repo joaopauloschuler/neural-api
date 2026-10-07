@@ -2646,18 +2646,18 @@ rather than acted on.
         (one-byte weight loads inside the FMA loop, int8 K loop with a run-time
         bound and no unroll). Serial stages, each with a fresh read-only
         reviewer, the three suites and a commit; the user times each on the L4:
-    - [x] E3.1 GEMM fix 1 (fdde6fc6; L4 timing pending): a kernel-only benchmark example at the Qwen-Image
+    - [x] E3.1 GEMM fix 1 (fdde6fc6): a kernel-only benchmark example at the Qwen-Image
           projection shapes, then a constant-32 unrolled K loop, 4 rows per
           lane read as 4-byte codes, 4x16 micro-tile per lane (int8 and int4).
           Estimate: 16 -> 8-10 s/step.
-    - [x] E3.2 GEMM fix 2 (451a6b5f; L4 timing pending): 128x128 register-blocked tiled GEMM (8x8 per lane,
+    - [x] E3.2 GEMM fix 2 (451a6b5f): 128x128 register-blocked tiled GEMM (8x8 per lane,
           local-memory staging of codes and inputs). Estimate: 5-7 s/step.
           L4 measured 2026-10-06: int8 block 9.9-11.4 TFLOPS, Qwen-Image step
           16.1 -> 7.4 s.
     - [x] E3.3 (076c1d0a) Remove the _small grid (user-authorized 2026-10-06): on the L4
           it lost every measured window shape (1024/2560 rows x 2560 x 16/64
           tokens: int8 13-17% and int4 52-56% slower than the large grid).
-    - [x] E3.4 (39e37080; L4 timing pending) Split-K with plain FP32 partials for tiled code GEMMs with too
+    - [x] E3.4 (39e37080; L4 GemmBench: window shapes 1.1-12.8x, auto S best or tied everywhere) Split-K with plain FP32 partials for tiled code GEMMs with too
           few tiles to fill the compute units (user-authorized 2026-10-06):
           every measured window shape takes a flat ~0.2 ms (serial K loop over
           1-20 work-groups) against a ~10 us weight-read floor. GemmBench A/B,
