@@ -2657,7 +2657,7 @@ rather than acted on.
     - [x] E3.3 (076c1d0a) Remove the _small grid (user-authorized 2026-10-06): on the L4
           it lost every measured window shape (1024/2560 rows x 2560 x 16/64
           tokens: int8 13-17% and int4 52-56% slower than the large grid).
-    - [ ] E3.4 Split-K with plain FP32 partials for tiled code GEMMs with too
+    - [x] E3.4 (39e37080; L4 timing pending) Split-K with plain FP32 partials for tiled code GEMMs with too
           few tiles to fill the compute units (user-authorized 2026-10-06):
           every measured window shape takes a flat ~0.2 ms (serial K loop over
           1-20 work-groups) against a ~10 us weight-read floor. GemmBench A/B,
