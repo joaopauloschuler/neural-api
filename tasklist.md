@@ -2662,6 +2662,11 @@ rather than acted on.
           every measured window shape takes a flat ~0.2 ms (serial K loop over
           1-20 work-groups) against a ~10 us weight-read floor. GemmBench A/B,
           then the user measures ChatTerminal TTFT with --prefill-window.
+    - [ ] E3.5 GemmBench FP16-activation option (user-authorized 2026-10-06):
+          time the int8 code kernels with the B operand in FP16 (the existing
+          _h kernels) next to FP32 at the Qwen-Image shapes, to test whether
+          the block kernel (10-11 TFLOPS of ~30) is bound by FP32 activation
+          traffic (64 MB at 4096 tokens > 48 MB L2). Measurement only.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
