@@ -1,0 +1,355 @@
+object frmManager: TfrmManager
+  Left = 350
+  Height = 400
+  Top = 250
+  Width = 520
+  BorderStyle = bsDialog
+  Caption = 'ChatServer Manager'
+  ClientHeight = 400
+  ClientWidth = 520
+  OnClose = FormClose
+  OnCreate = FormCreate
+  OnShow = FormShow
+  Position = poScreenCenter
+  object pgcMain: TPageControl
+    Left = 10
+    Height = 320
+    Top = 10
+    Width = 500
+    ActivePage = tsConfig
+    TabIndex = 0
+    TabOrder = 0
+    object tsConfig: TTabSheet
+      Caption = 'Configuration'
+      ClientHeight = 292
+      ClientWidth = 492
+      object lblProjectPath: TLabel
+        Left = 10
+        Height = 15
+        Top = 10
+        Width = 100
+        Caption = 'Project Path:'
+        ParentColor = False
+      end
+      object edtProjectPath: TEdit
+        Left = 10
+        Height = 23
+        Top = 30
+        Width = 380
+        TabOrder = 0
+      end
+      object btnBrowsePath: TButton
+        Left = 400
+        Height = 25
+        Top = 29
+        Width = 80
+        Caption = 'Browse...'
+        OnClick = btnBrowsePathClick
+        TabOrder = 1
+      end
+      object lblServerPath: TLabel
+        Left = 10
+        Height = 15
+        Top = 60
+        Width = 120
+        Caption = 'ChatServer.exe Path:'
+        ParentColor = False
+      end
+      object edtServerPath: TEdit
+        Left = 10
+        Height = 23
+        Top = 80
+        Width = 380
+        TabOrder = 2
+      end
+      object btnBrowseServer: TButton
+        Left = 400
+        Height = 25
+        Top = 79
+        Width = 80
+        Caption = 'Browse...'
+        OnClick = btnBrowseServerClick
+        TabOrder = 3
+      end
+      object lblModelsPath: TLabel
+        Left = 10
+        Height = 15
+        Top = 110
+        Width = 100
+        Caption = 'Models Folder Path:'
+        ParentColor = False
+      end
+      object edtModelsPath: TEdit
+        Left = 10
+        Height = 23
+        Top = 130
+        Width = 380
+        TabOrder = 4
+      end
+      object btnBrowseModels: TButton
+        Left = 400
+        Height = 25
+        Top = 129
+        Width = 80
+        Caption = 'Browse...'
+        OnClick = btnBrowseModelsClick
+        TabOrder = 5
+      end
+      object lblPort: TLabel
+        Left = 10
+        Height = 15
+        Top = 160
+        Width = 30
+        Caption = 'Port:'
+        ParentColor = False
+      end
+      object edtPort: TEdit
+        Left = 10
+        Height = 23
+        Top = 180
+        Width = 70
+        TabOrder = 6
+        Text = '8095'
+      end
+      object lblModel: TLabel
+        Left = 100
+        Height = 15
+        Top = 160
+        Width = 70
+        Caption = 'Model Folder:'
+        ParentColor = False
+      end
+      object cmbModel: TComboBox
+        Left = 100
+        Height = 23
+        Top = 180
+        Width = 380
+        ItemHeight = 15
+        Style = csDropDownList
+        TabOrder = 7
+      end
+      object lblLanguage: TLabel
+        Left = 10
+        Height = 15
+        Top = 210
+        Width = 55
+        Caption = 'Language:'
+        ParentColor = False
+      end
+      object cmbLanguage: TComboBox
+        Left = 10
+        Height = 23
+        Top = 230
+        Width = 110
+        ItemHeight = 15
+        Items.Strings = (
+          'English'
+          'Português'
+          'Français'
+          'Deutsch'
+          'Español'
+          'العربية'
+          '中文'
+          '日本語'
+          'Русский'
+        )
+        Style = csDropDownList
+        TabOrder = 8
+        OnChange = cmbLanguageChange
+      end
+      object btnSetup: TButton
+        Left = 125
+        Height = 25
+        Top = 229
+        Width = 65
+        Caption = 'Setup'
+        OnClick = btnSetupClick
+        TabOrder = 9
+      end
+      object lblCtx: TLabel
+        Left = 200
+        Height = 15
+        Top = 210
+        Width = 70
+        Caption = 'Context (ctx):'
+        ParentColor = False
+      end
+      object edtCtx: TEdit
+        Left = 200
+        Height = 23
+        Top = 230
+        Width = 100
+        TabOrder = 10
+        Text = '8192'
+      end
+      object lblMaxNewTokens: TLabel
+        Left = 315
+        Height = 15
+        Top = 210
+        Width = 95
+        Caption = 'Max New Tokens:'
+        ParentColor = False
+      end
+      object cmbMaxNewTokens: TComboBox
+        Left = 315
+        Height = 23
+        Top = 230
+        Width = 165
+        ItemHeight = 15
+        Items.Strings = (
+          '8'
+          '16'
+          '32'
+        )
+        Style = csDropDownList
+        TabOrder = 11
+      end
+      object chkAutoStart: TCheckBox
+        Left = 10
+        Height = 19
+        Top = 262
+        Width = 175
+        Caption = 'Auto Start'
+        TabOrder = 12
+      end
+      object chkAutoOn: TCheckBox
+        Left = 190
+        Height = 19
+        Top = 262
+        Width = 165
+        Caption = 'Auto On'
+        TabOrder = 13
+      end
+      object chkUseGpu: TCheckBox
+        Left = 360
+        Height = 19
+        Top = 262
+        Width = 120
+        Caption = 'Usar GPU'
+        TabOrder = 14
+      end
+    end
+    object tsLog: TTabSheet
+      Caption = 'Log Viewer'
+      ClientHeight = 292
+      ClientWidth = 492
+      object memLog: TMemo
+        Left = 10
+        Height = 230
+        Top = 10
+        Width = 472
+        Anchors = [akTop, akLeft, akRight, akBottom]
+        ReadOnly = True
+        ScrollBars = ssAutoVertical
+        TabOrder = 0
+      end
+      object btnClearLog: TButton
+        Left = 402
+        Height = 25
+        Top = 250
+        Width = 80
+        Anchors = [akRight, akBottom]
+        Caption = 'Clear'
+        OnClick = btnClearLogClick
+        TabOrder = 1
+      end
+    end
+  end
+  object btnSave: TButton
+    Left = 330
+    Height = 30
+    Top = 350
+    Width = 85
+    Caption = 'Save'
+    Default = True
+    OnClick = btnSaveClick
+    TabOrder = 1
+  end
+  object btnCancelForm: TButton
+    Left = 425
+    Height = 30
+    Top = 350
+    Width = 85
+    Cancel = True
+    Caption = 'Cancel'
+    OnClick = btnCancelFormClick
+    TabOrder = 2
+  end
+  object btnBenchmark: TButton
+    Left = 10
+    Height = 30
+    Top = 350
+    Width = 100
+    Caption = 'Benchmark'
+    OnClick = btnBenchmarkClick
+    TabOrder = 3
+  end
+  object btnChat: TButton
+    Left = 120
+    Height = 30
+    Top = 350
+    Width = 100
+    Caption = 'Chat'
+    OnClick = btnChatClick
+    TabOrder = 4
+  end
+  object selectDirDialog: TSelectDirectoryDialog
+    Left = 240
+    Top = 200
+  end
+  object timerStatus: TTimer
+    Enabled = False
+    Interval = 2000
+    OnTimer = timerStatusTimer
+    Left = 320
+    Top = 200
+  end
+  object trayIcon: TTrayIcon
+    PopUpMenu = pmTrayMenu
+    OnDblClick = trayIconDblClick
+    Left = 160
+    Top = 200
+  end
+  object pmTrayMenu: TPopupMenu
+    Left = 80
+    Top = 200
+    object menuStatus: TMenuItem
+      Enabled = False
+    end
+    object menuSeparator1: TMenuItem
+      Caption = '-'
+    end
+    object menuStart: TMenuItem
+      OnClick = menuStartClick
+    end
+    object menuStop: TMenuItem
+      OnClick = menuStopClick
+    end
+    object menuSeparator4: TMenuItem
+      Caption = '-'
+    end
+    object menuChat: TMenuItem
+      OnClick = menuChatClick
+    end
+    object menuBenchmark: TMenuItem
+      OnClick = menuBenchmarkClick
+    end
+    object menuSeparator2: TMenuItem
+      Caption = '-'
+    end
+    object menuConfig: TMenuItem
+      OnClick = menuConfigClick
+    end
+    object menuLog: TMenuItem
+      OnClick = menuLogClick
+    end
+    object menuLanguage: TMenuItem
+    end
+    object menuSeparator3: TMenuItem
+      Caption = '-'
+    end
+    object menuExit: TMenuItem
+      OnClick = menuExitClick
+    end
+  end
+end
