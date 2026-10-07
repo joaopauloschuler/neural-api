@@ -680,6 +680,8 @@ type
       // Work-group lanes of this layer's last tiled-GEMM launch (0 before the
       // first): the test hook telling the code-kernel grids apart.
       function OpenCLLastTiledGemmLanes(): integer;
+      // K-splits of this layer's last tiled-GEMM launch (1 = none, 0 before the first).
+      function OpenCLLastTiledGemmSplits(): integer;
       // Implicit-GEMM convolution launches of this layer's FDotCL (0 without one).
       function OpenCLImplicitConvLaunchCount(): integer;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
@@ -18182,6 +18184,8 @@ type
       //   construction. Empty when FHasSharedKernel is False - private handles
       //   have no shared argument state, so those layers ride FSchedWork.
       //   Chunk-eligible layers NO LONGER go here - their chunks ride FSchedWork.
+      //   Split-K partials share one scratch per OpenCL queue (PrepareTiledSplitK),
+      //   another reason shared-queue OpenCL layers must stay on worker 0.
       FSchedWork: TWorkQueue;
       FSchedW0Work: TWorkQueue;
       // Per-pass, per-layer outstanding-chunk countdown for chunked (wkChunk)
@@ -138365,6 +138369,11 @@ end;
 function TNNetLayer.OpenCLLastTiledGemmLanes(): integer;
 begin
   if Assigned(FDotCL) then Result := FDotCL.LastTiledGemmLanes else Result := 0;
+end;
+
+function TNNetLayer.OpenCLLastTiledGemmSplits(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.LastTiledGemmSplits else Result := 0;
 end;
 
 function TNNetLayer.OpenCLImplicitConvLaunchCount(): integer;

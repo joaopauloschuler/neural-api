@@ -1054,15 +1054,15 @@ static inline void cai_codes_store_col4(const int FNumAs, const int ActFN,
   }
 }
 
-// cai_codes_store_col4 over CAI_TILED_COLS columns from b0, skipping columns
-// past FNumBs-1 and lanes whose rows all lie past FNumAs-1.
+// cai_codes_store_col4 over CAI_TILED_COLS columns from b0, skipping rows/columns
+// past the edges; RawPartials (compile-time) stores raw sums, no scale/bias/act.
 static inline void cai_codes_store_rows(const int FNumAs, const int FNumBs,
   const int ActFN, const int UseBias, __global float* R,
   __global const float* Bias, __global const float* FScales, const int Base,
-  const int FirstRow, const int b0, const float4* acc)
+  const int FirstRow, const int b0, const float4* acc, const int RawPartials)
 {
   if (FirstRow >= FNumAs) return;
-  const float4 RowScale = vload4(0, FScales + Base);
+  const float4 RowScale = RawPartials ? (float4)(1.0f) : vload4(0, FScales + Base);
   const float4 RowBias = (UseBias != 0) ? vload4(0, Bias + Base) : (float4)(0.0f);
   #pragma unroll
   for (int b = 0; b < CAI_TILED_COLS; b++)
@@ -1079,12 +1079,13 @@ static inline char4 cai_codes_load4(__global const char* P,
   return RowsAligned ? *((__global const char4*)P) : vload4(0, P);
 }
 
-// int8 body: CAI_CODES_LANES lanes of rows FirstRow..+3 (read from
-// min(FirstRow, FNumAs-4); FNumAs >= 4), constant-32 K-steps, a ragged last step.
+// int8 body: lanes of rows FirstRow..+3 (from min(FirstRow, FNumAs-4)), K-steps
+// [StepFirst, StepEnd) of ceil(FSize/32); the ragged tail goes to the last range.
 static inline void cai_codes_int8_body(const int FNumAs, const int FNumBs,
   const int FSize, const int ActFN, __global const char* A8,
   __global const float* Bf, __global const half* Bh, const int BIsHalf,
-  const int RowsAligned, __global float* R, const int UseBias,
+  const int RowsAligned, const int StepFirst, const int StepEnd,
+  const int RawPartials, __global float* R, const int UseBias,
   __global const float* Bias, __global const float* FScales,
   __local float* Bs)
 {
@@ -1098,10 +1099,11 @@ static inline void cai_codes_int8_body(const int FNumAs, const int FNumBs,
   #pragma unroll
   for (int b = 0; b < CAI_TILED_COLS; b++) acc[b] = (float4)(0.0f);
 
-  __global const char* P = A8 + Base;
+  __global const char* P = A8 + Base + StepFirst * CAI_TILED_KSTEP * FNumAs;
   const int TailLen = FSize & (CAI_TILED_KSTEP - 1);
-  const int MaxStepPos = FSize / CAI_TILED_KSTEP - 1;
-  for (int step = 0; step <= MaxStepPos; step++)
+  const int FullSteps = FSize / CAI_TILED_KSTEP;
+  const int MaxStepPos = min(StepEnd, FullSteps) - 1;
+  for (int step = StepFirst; step <= MaxStepPos; step++)
   {
     // Issued before the barrier, so the loads fly while the tile is staged.
     char4 Codes[CAI_TILED_KSTEP];
@@ -1123,7 +1125,7 @@ static inline void cai_codes_int8_body(const int FNumAs, const int FNumBs,
         convert_float4(Codes[k + 3]), k);
   }
   // Ragged FSize: the staged tile is zero past FSize, the code loop stops there.
-  if (TailLen > 0)
+  if ((TailLen > 0) && (StepEnd > FullSteps))
   {
     barrier(CLK_LOCAL_MEM_FENCE);
     cai_tiled_stage_b(FNumBs, FSize, b0, FSize - TailLen, Bf, Bh, BIsHalf, Bs,
@@ -1139,23 +1141,34 @@ static inline void cai_codes_int8_body(const int FNumAs, const int FNumBs,
     }
   }
   cai_codes_store_rows(FNumAs, FNumBs, ActFN, UseBias, R, Bias, FScales, Base,
-    FirstRow, b0, acc);
+    FirstRow, b0, acc, RawPartials);
 }
 
-// Shared by the two int8 entry points: one uniform branch picks the 4-byte
-// load instance. BIsHalf is a compile-time constant at each caller.
+// Shared by the int8 entry points: one uniform branch picks the 4-byte load
+// instance. BIsHalf and RawPartials are compile-time constants at each caller.
 static inline void cai_codes_int8_launch(const int FNumAs, const int FNumBs,
   const int FSize, const int ActFN, __global const char* A8,
   __global const float* Bf, __global const half* Bh, const int BIsHalf,
+  const int StepFirst, const int StepEnd, const int RawPartials,
   __global float* R, const int UseBias, __global const float* Bias,
   __global const float* FScales, __local float* Bs)
 {
   if ((FNumAs & (CAI_CODES_ROWS_PER_LANE - 1)) == 0)
     cai_codes_int8_body(FNumAs, FNumBs, FSize, ActFN, A8, Bf, Bh, BIsHalf, 1,
-      R, UseBias, Bias, FScales, Bs);
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales, Bs);
   else
     cai_codes_int8_body(FNumAs, FNumBs, FSize, ActFN, A8, Bf, Bh, BIsHalf, 0,
-      R, UseBias, Bias, FScales, Bs);
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales, Bs);
+}
+
+// The K-steps [*StepFirst, *StepEnd) of split get_group_id(2) of a split-K
+// launch: StepsPerSplit steps each, the last split cut at ceil(FSize/32).
+static inline void cai_codes_split_steps(const int FSize,
+  const int StepsPerSplit, int* StepFirst, int* StepEnd)
+{
+  const int TotalSteps = (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP;
+  *StepFirst = get_group_id(2) * StepsPerSplit;
+  *StepEnd = min(*StepFirst + StepsPerSplit, TotalSteps);
 }
 
 // Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS and
@@ -1180,7 +1193,30 @@ void cai_dot_product_int8_tiled
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   cai_codes_int8_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
-    FInputBufferBs, 0, 0, FResultBuffer, UseBias, FRowBias, FScales, Bs);
+    FInputBufferBs, 0, 0, 0, (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP,
+    0, FResultBuffer, UseBias, FRowBias, FScales, Bs);
+}
+
+// SPLIT-K twin of cai_dot_product_int8_tiled: group axis 2 is split s; raw sums of its K-steps
+// to FPartialBuffer + s*FNumAs*FNumBs, for cai_dot_product_int8_splitk_reduce. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, 0, FInputBufferAs,
+    FInputBufferBs, 0, 0, StepFirst, StepEnd, 1,
+    FPartialBuffer + get_group_id(2) * FNumAs * FNumBs, 0, 0, 0, Bs);
 }
 
 // HALF-ACTIVATION twin of cai_dot_product_int8_tiled: B is read through
@@ -1203,7 +1239,30 @@ void cai_dot_product_int8_tiled_h
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   cai_codes_int8_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    FInputBufferBs, 1, FResultBuffer, UseBias, FRowBias, FScales, Bs);
+    FInputBufferBs, 1, 0, (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP, 0,
+    FResultBuffer, UseBias, FRowBias, FScales, Bs);
+}
+
+// HALF-ACTIVATION twin of cai_dot_product_int8_tiled_splitk; the partials
+// stay FP32. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_h_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, 0, FInputBufferAs, 0,
+    FInputBufferBs, 1, StepFirst, StepEnd, 1,
+    FPartialBuffer + get_group_id(2) * FNumAs * FNumBs, 0, 0, 0, Bs);
 }
 
 // cai_dot_product_tiled with B gathered from the unpadded source FSrc: the
@@ -1295,11 +1354,12 @@ __kernel void cai_conv_implicit
   FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
 }
 
-// int4 body: the int8 lane map with one Q4_0 block per K-step, 4-byte loads
-// of 4 rows' packed pairs and block scales, weight = (code - 8) * scale.
+// int4 body: the int8 lane map, one Q4_0 block per K-step (blocks [StepFirst,
+// StepEnd)), weight = (code - 8) * scale; RawPartials as cai_codes_int8_body.
 static inline void cai_codes_int4_body(const int FNumAs, const int FNumBs,
   const int FSize, const int ActFN, __global const uchar* FPackedAs,
-  __global const float* Bf, const int RowsAligned, __global float* R,
+  __global const float* Bf, const int RowsAligned, const int StepFirst,
+  const int StepEnd, const int RawPartials, __global float* R,
   const int UseBias, __global const float* Bias,
   __global const float* FScales, __global const float* FBlockScales,
   __local float* Bs)
@@ -1316,10 +1376,11 @@ static inline void cai_codes_int4_body(const int FNumAs, const int FNumBs,
 
   // Pair p = k/2 holds codes k (low nibble) and k+1; one row's pairs are
   // FNumAs bytes apart and its block scales FNumAs floats apart.
-  __global const uchar* P = FPackedAs + Base;
-  __global const float* S = FBlockScales + Base;
-  const int MaxBlockPos = FSize / CAI_TILED_KSTEP - 1;
-  for (int blk = 0; blk <= MaxBlockPos; blk++)
+  __global const uchar* P =
+    FPackedAs + Base + StepFirst * (CAI_TILED_KSTEP / 2) * FNumAs;
+  __global const float* S = FBlockScales + Base + StepFirst * FNumAs;
+  const int MaxBlockPos = StepEnd - 1;
+  for (int blk = StepFirst; blk <= MaxBlockPos; blk++)
   {
     uchar4 Pairs[CAI_TILED_KSTEP / 2];
     #pragma unroll
@@ -1345,23 +1406,26 @@ static inline void cai_codes_int4_body(const int FNumAs, const int FNumBs,
     }
   }
   cai_codes_store_rows(FNumAs, FNumBs, ActFN, UseBias, R, Bias, FScales, Base,
-    FirstRow, b0, acc);
+    FirstRow, b0, acc, RawPartials);
 }
 
-// Used by cai_dot_product_int4_tiled; picks the aligned instance as
+// Used by the int4 entry points; picks the aligned instance as
 // cai_codes_int8_launch.
 static inline void cai_codes_int4_launch(const int FNumAs, const int FNumBs,
   const int FSize, const int ActFN, __global const uchar* FPackedAs,
-  __global const float* Bf, __global float* R, const int UseBias,
+  __global const float* Bf, const int StepFirst, const int StepEnd,
+  const int RawPartials, __global float* R, const int UseBias,
   __global const float* Bias, __global const float* FScales,
   __global const float* FBlockScales, __local float* Bs)
 {
   if ((FNumAs & (CAI_CODES_ROWS_PER_LANE - 1)) == 0)
-    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 1, R,
-      UseBias, Bias, FScales, FBlockScales, Bs);
+    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 1,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales,
+      FBlockScales, Bs);
   else
-    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 0, R,
-      UseBias, Bias, FScales, FBlockScales, Bs);
+    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 0,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales,
+      FBlockScales, Bs);
 }
 
 // Q4_0 WEIGHT twin of cai_dot_product_int8_tiled: same tile, same launch
@@ -1390,8 +1454,31 @@ void cai_dot_product_int4_tiled
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   cai_codes_int4_launch(FNumAs, FNumBs, FSize, ActFN, FPackedAs,
-    FInputBufferBs, FResultBuffer, UseBias, FRowBias, FScales, FBlockScales,
-    Bs);
+    FInputBufferBs, 0, FSize / CAI_TILED_KSTEP, 0, FResultBuffer, UseBias,
+    FRowBias, FScales, FBlockScales, Bs);
+} // end of kernel
+
+// Q4_0 twin of cai_dot_product_int8_tiled_splitk; the partials carry the block
+// scales, so the merge applies FScales' row of 1.0. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int4_tiled_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer,
+  __global const float* FBlockScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int4_launch(FNumAs, FNumBs, FSize, 0, FPackedAs, FInputBufferBs,
+    StepFirst, StepEnd, 1, FPartialBuffer + get_group_id(2) * FNumAs * FNumBs,
+    0, 0, 0, FBlockScales, Bs);
 } // end of kernel
 
 // BLOCK GRID of the code kernels (the _block entry points): a work-group of

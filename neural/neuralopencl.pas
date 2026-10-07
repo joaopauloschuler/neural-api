@@ -75,6 +75,9 @@ const
   /// a lane owns 4 consecutive rows; the work-group size is required exactly.
   csTiledGemmCodesLanes = 128;
   csTiledGemmCodesRowsPerLane = 4;
+  csTiledGemmCodesRowsPerTile = csTiledGemmCodesLanes * csTiledGemmCodesRowsPerLane;
+  /// Reduction elements per K-step of every tiled kernel (CAI_TILED_KSTEP).
+  csTiledGemmKStep = 32;
   /// The _block entry points (CAI_BLOCK_*): 256 lanes of 8x8 outputs own a
   /// 128-row x 128-column tile.
   csTiledGemmBlockLanes = 256;
@@ -83,6 +86,13 @@ const
   /// Work-groups per compute unit the block grid must launch to be picked by
   /// tgcAuto (AutoTiledGemmCodesGrid); otherwise tgcAuto picks large.
   csTiledGemmCodesMinGroupsPerUnit = 2;
+  /// Split-K of the large grid: target work-groups per compute unit, least
+  /// K-steps per split, most splits (AutoTiledGemmSplitCount states the rule).
+  csTiledGemmSplitKGroupsPerUnit = 4;
+  csTiledGemmSplitKMinSteps = 4;
+  csTiledGemmSplitKMaxSplits = 32;
+  /// TiledGemmSplitK value for the auto rule; 0 turns split-K off.
+  csTiledGemmSplitKAuto = -1;
   /// Columns (FNumBs) from which Compute and ComputeResidentCodes take the
   /// tiled GEMM: one full column tile. Below it the tile would multiply
   /// zero-padded columns, while the existing kernels re-read each weight row
@@ -142,6 +152,11 @@ type
     // hold the non-blocking uploads enqueued on that queue and those known done.
     FQueueOwner: TEasyOpenCL;
     FUploadsEnqueued, FUploadsCompleted: LongInt;
+    // QueueScratchBuffer's buffer, held by the queue owner; the generation
+    // changes on every reallocation.
+    FQueueScratch: cl_mem;
+    FQueueScratchBytes: csize_t;
+    FQueueScratchGeneration: integer;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -197,6 +212,14 @@ type
     // True when a non-blocking upload enqueued on this queue (by any instance
     // sharing it) may still read its host memory.
     function HasPendingUploads(): boolean;
+    // True for a helper that borrowed the program but runs its own command
+    // queue (CreateFromProgram with pSharedQueue = False).
+    function HasPrivateQueue(): boolean;
+    // The one grow-only scratch buffer of this command queue, at least pBytes
+    // (nil on failure), for a writer and reader enqueued back to back on it.
+    function QueueScratchBuffer(pBytes: csize_t; out pGeneration: integer): cl_mem;
+    // Bytes of this command queue's scratch buffer (0 before the first use).
+    function QueueScratchBytes(): csize_t;
     // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
     // memory; ordered after earlier work on the queue and returns at once.
     function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
@@ -490,7 +513,12 @@ type
       /// Coded by Claude (AI).
       FTiledKernel, FTiledBlockKernel: cl_kernel;
       FTiledRejected: boolean;
-      FTiledLaunchCount, FLastTiledLanes: integer;
+      FTiledLaunchCount, FLastTiledLanes, FLastTiledSplits: integer;
+      /// Split-K pair (PrepareTiledSplitK): FP32 partials in the queue's
+      /// scratch buffer, of generation FTiledScratchGeneration, then the merge.
+      FTiledSplitKKernel, FTiledMergeKernel: cl_kernel;
+      FTiledScratchGeneration: integer;
+      FTiledSplitKRejected: boolean;
       /// IMPLICIT-GEMM CONVOLUTION (cai_conv_implicit_tiled, cai_conv_implicit):
       /// owned handles bound by PrepareImplicitConv; FImplicitConvReady once the
       /// untiled one bound. FImplicitConvLaunchCount is the test hook.
@@ -511,12 +539,12 @@ type
       /// Retains Owner's codes/scales/block-scales as this instance's and sets
       /// FCodesBorrowed; the caller releases any handles it replaces.
       procedure RetainCodesOf(Owner: TDotProductSharedKernel);
-      /// Sets the tiled kernels' codes (4), scales (9) and, for int4, block
-      /// scales (10) arguments from the current handles.
+      /// Sets the tiled kernels' codes, scales and int4 block scales arguments
+      /// from the current handles (split-K twin and merge included).
       function BindTiledCodesArgs(): integer;
       /// Shape (0-2), result (6) and BindTiledCodesArgs on one code kernel.
       function BindTiledFixedArgs(pKernel: cl_kernel): integer;
-      /// Releases FTiledKernel and FTiledBlockKernel.
+      /// Releases FTiledKernel, FTiledBlockKernel and the split-K pair.
       procedure ReleaseTiledKernels();
 
       /// How many slabs to cut the reduction axis into for the current shape:
@@ -563,9 +591,18 @@ type
       /// and a code mode's fixed arguments; False when the device rejected it.
       function PrepareTiled(): boolean;
       /// Launches pKernel over the current shape with pLanes lanes per
-      /// pRowsPerTile x pColsPerTile work-group, on the shared queue; counts it.
+      /// pRowsPerTile x pColsPerTile work-group and pSplits K-splits, on the shared queue.
       procedure RunTiledGemm(pKernel: cl_kernel;
-        pLanes, pRowsPerTile, pColsPerTile: longint);
+        pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+      /// The large grid's split count (1 = none): TiledGemmSplitK fitted to
+      /// FSize, or AutoTiledGemmSplitCount unless the queue is private.
+      function SelectTiledSplitCount(): integer;
+      /// Binds the split-K twin and the merge to the queue's scratch grown to
+      /// pSplits partials; False when a kernel or the scratch failed.
+      function PrepareTiledSplitK(pSplits: integer): boolean;
+      /// The tiled code kernel name of the armed mode (no grid suffix) and the
+      /// TNeuralKernel whose program builds it.
+      function TiledCodesKernelName(out pCodesKernel: TNeuralKernel): string;
       /// FInputBufferBs, (re)allocated grow-only for FNumBs x FSize floats.
       function EnsureInputBufferBs(): cl_mem;
       /// The gather source: pExternalSrc when given (borrowed), otherwise
@@ -706,6 +743,8 @@ type
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
       /// Work-group lanes of the last tiled launch (0 before the first).
       property LastTiledGemmLanes: integer read FLastTiledLanes;
+      /// K-splits of the last tiled launch (1 = no split, 0 before the first).
+      property LastTiledGemmSplits: integer read FLastTiledSplits;
       /// True after a successful PrepareImplicitConv.
       property ImplicitConvReady: boolean read FImplicitConvReady;
       /// Implicit-GEMM convolution launches (tiled ones count in
@@ -768,6 +807,18 @@ procedure SetTiledGemmCodesGrid(pValue: TTiledGemmCodesGrid);
 /// units, given whether the block kernel exists (never tgcAuto).
 function AutoTiledGemmCodesGrid(pNumAs, pNumBs, pComputeUnits: integer;
   pHasBlock: boolean): TTiledGemmCodesGrid;
+/// Split count of the large code grid: csTiledGemmSplitKAuto unless
+/// NEURAL_TILED_GEMM_SPLITK is 0 (off) or N >= 1 (read once) or SetTiledGemmSplitK was called.
+function TiledGemmSplitK(): integer;
+procedure SetTiledGemmSplitK(pValue: integer);
+/// The auto split count of an FNumAs x FNumBs x FSize code GEMM on the large
+/// grid with pComputeUnits compute units (1 = no split); fitted as below.
+function AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize,
+  pComputeUnits: integer): integer;
+/// pSplits clamped to [1, ceil(pSize/32)] and lowered until no split is
+/// empty; TiledGemmStepsPerSplit gives the K-steps of all but the last.
+function FitTiledGemmSplitCount(pSize, pSplits: integer): integer;
+function TiledGemmStepsPerSplit(pSize, pSplits: integer): integer;
 
 /// Whether inference-only FP32 spatial convolutions may take the implicit GEMM:
 /// true unless NEURAL_OPENCL_IMPLICIT_CONV=0 or SetOpenCLImplicitConv(false).
@@ -1009,6 +1060,7 @@ begin
   FMainKernel := nil;
   FSinglePassKernel := nil;
   FTiledRejected := false;
+  FTiledSplitKRejected := false;
   FMainArgsBound := false;
   FSinglePassArgsBound := false;
   FSplitKInt4Kernel := nil;
@@ -1647,20 +1699,26 @@ end;
 
 function TDotProductSharedKernel.BindTiledCodesArgs(): integer;
 
-  function BindOne(pKernel: cl_kernel): integer;
+  // pScalesPos < 0: the kernel takes no row scales.
+  function BindOne(pKernel: cl_kernel; pScalesPos, pBlockScalesPos: integer): integer;
   begin
     Result := CL_SUCCESS;
     if not Assigned(pKernel) then exit;
     Result := clSetKernelArg(pKernel, 4, csCLMemSize, @FCodesBuffer);
-    Result := Result or clSetKernelArg(pKernel, 9, csCLMemSize,
-      @FScalesBuffer);
+    if pScalesPos >= 0 then
+      Result := Result or clSetKernelArg(pKernel, pScalesPos, csCLMemSize,
+        @FScalesBuffer);
     if FInt4Ready then
-      Result := Result or clSetKernelArg(pKernel, 10, csCLMemSize,
+      Result := Result or clSetKernelArg(pKernel, pBlockScalesPos, csCLMemSize,
         @FBlockScalesBuffer);
   end;
 
 begin
-  Result := BindOne(FTiledKernel) or BindOne(FTiledBlockKernel);
+  Result := BindOne(FTiledKernel, 9, 10) or BindOne(FTiledBlockKernel, 9, 10) or
+    BindOne(FTiledSplitKKernel, -1, 7);
+  if Assigned(FTiledMergeKernel) then
+    Result := Result or clSetKernelArg(FTiledMergeKernel, 8, csCLMemSize,
+      @FScalesBuffer);
 end;
 
 function TDotProductSharedKernel.BindTiledFixedArgs(pKernel: cl_kernel): integer;
@@ -1675,8 +1733,12 @@ procedure TDotProductSharedKernel.ReleaseTiledKernels();
 begin
   if Assigned(FTiledKernel) then clReleaseKernel(FTiledKernel);
   if Assigned(FTiledBlockKernel) then clReleaseKernel(FTiledBlockKernel);
+  if Assigned(FTiledSplitKKernel) then clReleaseKernel(FTiledSplitKKernel);
+  if Assigned(FTiledMergeKernel) then clReleaseKernel(FTiledMergeKernel);
   FTiledKernel := nil;
   FTiledBlockKernel := nil;
+  FTiledSplitKKernel := nil;
+  FTiledMergeKernel := nil;
 end;
 
 procedure TDotProductSharedKernel.RefreshResidentBias(VBias: TNNetVolume);
@@ -1858,6 +1920,81 @@ begin
 end;
 
 var
+  vTiledGemmSplitKLoaded: boolean = false;
+  vTiledGemmSplitK: integer = csTiledGemmSplitKAuto;
+
+function TiledGemmSplitK(): integer;
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  if not vTiledGemmSplitKLoaded then
+  begin
+    EnvValue := GetEnvironmentVariable('NEURAL_TILED_GEMM_SPLITK');
+    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed >= 0) then
+      vTiledGemmSplitK := Parsed;
+    vTiledGemmSplitKLoaded := true;
+  end;
+  Result := vTiledGemmSplitK;
+end;
+
+procedure SetTiledGemmSplitK(pValue: integer);
+begin
+  vTiledGemmSplitKLoaded := true;
+  vTiledGemmSplitK := pValue;
+end;
+
+function TiledGemmStepsPerSplit(pSize, pSplits: integer): integer;
+var
+  TotalSteps: integer;
+begin
+  TotalSteps := (pSize + csTiledGemmKStep - 1) div csTiledGemmKStep;
+  if pSplits < 1 then pSplits := 1;
+  Result := (TotalSteps + pSplits - 1) div pSplits;
+end;
+
+function FitTiledGemmSplitCount(pSize, pSplits: integer): integer;
+var
+  TotalSteps, StepsPerSplit: integer;
+begin
+  Result := 1;
+  TotalSteps := (pSize + csTiledGemmKStep - 1) div csTiledGemmKStep;
+  if (pSplits <= 1) or (TotalSteps <= 1) then exit;
+  if pSplits > TotalSteps then pSplits := TotalSteps;
+  StepsPerSplit := (TotalSteps + pSplits - 1) div pSplits;
+  Result := (TotalSteps + StepsPerSplit - 1) div StepsPerSplit;
+end;
+
+function AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize,
+  pComputeUnits: integer): integer;
+var
+  Tiles, TargetGroups, MaxSplits: int64;
+begin
+  // The large grid launches Tiles work-groups, each walking all of K. Below
+  // csTiledGemmCodesMinGroupsPerUnit per compute unit, K is cut until tiles x
+  // splits reaches csTiledGemmSplitKGroupsPerUnit per unit, with at least
+  // csTiledGemmSplitKMinSteps K-steps per split, at most
+  // csTiledGemmSplitKMaxSplits splits, and partial bytes (rows x columns x
+  // splits x 4) at most the int8 weight bytes (rows x K).
+  Result := 1;
+  if (pNumAs < 1) or (pNumBs < 1) or (pSize < 1) or (pComputeUnits < 1) then exit;
+  Tiles := int64((pNumAs + csTiledGemmCodesRowsPerTile - 1) div
+    csTiledGemmCodesRowsPerTile) *
+    ((pNumBs + csTiledGemmCols - 1) div csTiledGemmCols);
+  if Tiles >= int64(csTiledGemmCodesMinGroupsPerUnit) * pComputeUnits then exit;
+  MaxSplits := ((pSize + csTiledGemmKStep - 1) div csTiledGemmKStep) div
+    csTiledGemmSplitKMinSteps;
+  if MaxSplits > csTiledGemmSplitKMaxSplits then
+    MaxSplits := csTiledGemmSplitKMaxSplits;
+  if MaxSplits > pSize div (4 * int64(pNumBs)) then
+    MaxSplits := pSize div (4 * int64(pNumBs));
+  if MaxSplits < 2 then exit;
+  TargetGroups := int64(csTiledGemmSplitKGroupsPerUnit) * pComputeUnits;
+  Result := FitTiledGemmSplitCount(pSize,
+    integer(Min(MaxSplits, (TargetGroups + Tiles - 1) div Tiles)));
+end;
+
+var
   vOpenCLImplicitConvLoaded: boolean = false;
   vOpenCLImplicitConv: boolean = true;
 
@@ -1926,14 +2063,7 @@ begin
     Result := true;
     exit;
   end;
-  CodesKernel := FInt8Kernel;
-  if FInt4Ready then KernelName := 'cai_dot_product_int4_tiled'
-  else if FFP16Activations then
-  begin
-    KernelName := 'cai_dot_product_int8_tiled_h';
-    CodesKernel := FFP16Kernel;
-  end
-  else KernelName := 'cai_dot_product_int8_tiled';
+  KernelName := TiledCodesKernelName(CodesKernel);
   // The large grid is required: when registers cap it below its 128 lanes,
   // FTiledRejected keeps ComputeResidentCodes on the untiled kernels.
   FTiledKernel := CodesKernel.CreateKernel(KernelName);
@@ -1969,18 +2099,135 @@ begin
   end;
   FTiledRejected := false;
   Result := true;
+  // PrepareTiled runs inside the first compute call that takes the tiled
+  // path; this grows the queue's scratch (clCreateBuffer) for this layer's
+  // split there, as PrepareSplitK does for the untiled split-K.
+  if SelectCodesGrid() = tgcLarge then PrepareTiledSplitK(SelectTiledSplitCount());
+end;
+
+function TDotProductSharedKernel.TiledCodesKernelName(
+  out pCodesKernel: TNeuralKernel): string;
+begin
+  pCodesKernel := FInt8Kernel;
+  if FInt4Ready then Result := 'cai_dot_product_int4_tiled'
+  else if FFP16Activations then
+  begin
+    Result := 'cai_dot_product_int8_tiled_h';
+    pCodesKernel := FFP16Kernel;
+  end
+  else Result := 'cai_dot_product_int8_tiled';
+end;
+
+// The partials live in one scratch buffer per command queue. On a private
+// queue (one per layer) that buffer would be per layer too, so auto never
+// splits there; a forced count still does.
+function TDotProductSharedKernel.SelectTiledSplitCount(): integer;
+begin
+  Result := TiledGemmSplitK();
+  if Result <> csTiledGemmSplitKAuto then
+    Result := FitTiledGemmSplitCount(FSize, Result)
+  else if FDotProductKernel.HasPrivateQueue() then
+    Result := 1
+  else
+    Result := AutoTiledGemmSplitCount(FNumAs, FNumBs, FSize,
+      FDotProductKernel.DeviceMaxComputeUnits());
+end;
+
+function TDotProductSharedKernel.PrepareTiledSplitK(pSplits: integer): boolean;
+var
+  err: integer;
+  KernelName: string;
+  CodesKernel: TNeuralKernel;
+  NeededPartial: csize_t;
+  Scratch: cl_mem;
+  Generation: integer;
+  BindPartial: boolean;
+
+  // FTiledKernel and FTiledBlockKernel stay: the unsplit grids still run.
+  procedure ReleaseSplitPair();
+  begin
+    if Assigned(FTiledSplitKKernel) then clReleaseKernel(FTiledSplitKKernel);
+    if Assigned(FTiledMergeKernel) then clReleaseKernel(FTiledMergeKernel);
+    FTiledSplitKKernel := nil;
+    FTiledMergeKernel := nil;
+  end;
+
+begin
+  Result := false;
+  // The kernels index the partials in int32.
+  if FTiledSplitKRejected or (pSplits < 2) or (not Assigned(FTiledKernel)) or
+    (int64(FNumAs) * FNumBs * pSplits >= High(longint)) then exit;
+  BindPartial := false;
+  if not Assigned(FTiledSplitKKernel) then
+  begin
+    FTiledSplitKRejected := true;
+    KernelName := TiledCodesKernelName(CodesKernel) + '_splitk';
+    FTiledSplitKKernel := CodesKernel.CreateKernel(KernelName);
+    FTiledMergeKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+    if (not Assigned(FTiledSplitKKernel)) or (not Assigned(FTiledMergeKernel)) or
+      (FDotProductKernel.KernelMaxWorkGroupSize(FTiledSplitKKernel) <
+        csTiledGemmCodesLanes) then
+    begin
+      ReleaseSplitPair();
+      exit;
+    end;
+    err := clSetKernelArg(FTiledSplitKKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FTiledSplitKKernel, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(FTiledSplitKKernel, 2, csLongintSize, @FSize);
+    err := err or clSetKernelArg(FTiledMergeKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FTiledMergeKernel, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(FTiledMergeKernel, 5, csCLMemSize, @FResultBuffer);
+    err := err or BindTiledCodesArgs();
+    if err <> CL_SUCCESS then
+    begin
+      ErrorProc('Error: TDotProductSharedKernel.PrepareTiledSplitK - failed ' +
+        'setting the fixed arguments: ' + IntToStr(err));
+      ReleaseSplitPair();
+      exit;
+    end;
+    FTiledSplitKRejected := false;
+    BindPartial := true;
+  end;
+  // Shared by every layer on this in-order queue: each launch enqueues its
+  // split kernel and merge back to back, so no other writer comes between.
+  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * csNeuralFloatSize;
+  Scratch := FDotProductKernel.QueueScratchBuffer(NeededPartial, Generation);
+  if not Assigned(Scratch) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.PrepareTiledSplitK - failed ' +
+      'allocating ' + IntToStr(NeededPartial) + ' bytes of split-K partials.');
+    FTiledSplitKRejected := true;
+    exit;
+  end;
+  if BindPartial or (Generation <> FTiledScratchGeneration) then
+  begin
+    err := clSetKernelArg(FTiledSplitKKernel, 6, csCLMemSize, @Scratch);
+    err := err or clSetKernelArg(FTiledMergeKernel, 4, csCLMemSize, @Scratch);
+    if err <> CL_SUCCESS then
+    begin
+      FTiledSplitKRejected := true;
+      exit;
+    end;
+    FTiledScratchGeneration := Generation;
+  end;
+  Result := true;
 end;
 
 procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel;
-  pLanes, pRowsPerTile, pColsPerTile: longint);
+  pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
 var
   RowTiles, ColTiles: longint;
 begin
   RowTiles := (FNumAs + pRowsPerTile - 1) div pRowsPerTile;
   ColTiles := (FNumBs + pColsPerTile - 1) div pColsPerTile;
-  FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles, pLanes, 1);
+  if pSplits > 1
+    then FDotProductKernel.RunKernel3D(pKernel, RowTiles * pLanes, ColTiles,
+      pSplits, pLanes, 1, 1)
+    else FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles,
+      pLanes, 1);
   Inc(FTiledLaunchCount);
   FLastTiledLanes := pLanes;
+  FLastTiledSplits := pSplits;
 end;
 
 function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
@@ -2384,7 +2631,8 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits, Lanes, RowsPerTile, ColsPerTile: longint;
+  Splits, Lanes, RowsPerTile, ColsPerTile, StepsPerSplit: longint;
+  Grid: TTiledGemmCodesGrid;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -2405,7 +2653,31 @@ begin
   // change per call; the FNumBs = 1 decode paths further down are untouched.
   if ShouldUseTiledGemm() and PrepareTiled() then
   begin
-    case SelectCodesGrid() of
+    Grid := SelectCodesGrid();
+    if Grid = tgcBlock then Splits := 1 else Splits := SelectTiledSplitCount();
+    if (Splits > 1) and PrepareTiledSplitK(Splits) then
+    begin
+      // Raw partials, then the merge: same in-order queue, so no wait.
+      StepsPerSplit := TiledGemmStepsPerSplit(FSize, Splits);
+      err := err or clSetKernelArg(FTiledSplitKKernel, 3, csLongintSize,
+        @StepsPerSplit);
+      err := err or clSetKernelArg(FTiledSplitKKernel, 5, csCLMemSize, @BufferBs);
+      err := err or clSetKernelArg(FTiledMergeKernel, 2, csLongintSize, @Splits);
+      err := err or clSetKernelArg(FTiledMergeKernel, 3, csLongintSize, @FActFun);
+      err := err or clSetKernelArg(FTiledMergeKernel, 6, csLongintSize, @UseBias);
+      err := err or clSetKernelArg(FTiledMergeKernel, 7, csCLMemSize, @FBiasBuffer);
+      if err = CL_SUCCESS then
+      begin
+        RunTiledGemm(FTiledSplitKKernel, csTiledGemmCodesLanes,
+          csTiledGemmCodesRowsPerTile, csTiledGemmCols, Splits);
+        FDotProductKernel.RunKernel2D(FTiledMergeKernel, FNumAs, FNumBs);
+      end
+      else
+        ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
+          'failed setting split-K tiled GEMM parameters: ' + IntToStr(err));
+      exit;
+    end;
+    case Grid of
       tgcBlock:
         begin
           K := FTiledBlockKernel;
@@ -3064,6 +3336,10 @@ begin
   // A borrowed context, program or command queue belongs to the shared kernel
   // that created it; releasing one here would tear it out from under every other
   // borrower, so those references are only dropped. (Coded by Claude (AI).)
+  if (not FBorrowedQueue) and Assigned(FQueueScratch) then
+    clReleaseMemObject(FQueueScratch);
+  FQueueScratch := nil;
+  FQueueScratchBytes := 0;
   if (not FBorrowedQueue) and Assigned(FCommands) then
     clReleaseCommandQueue(FCommands);
   FCommands := nil;
@@ -4047,6 +4323,37 @@ begin
 end;
 {$POP}
 
+function TEasyOpenCL.HasPrivateQueue(): boolean;
+begin
+  Result := FBorrowedContext and not FBorrowedQueue;
+end;
+
+// A released buffer stays alive until the commands already enqueued with it
+// finish, so growing it never pulls memory from under an earlier launch.
+function TEasyOpenCL.QueueScratchBuffer(pBytes: csize_t;
+  out pGeneration: integer): cl_mem;
+var
+  Owner: TEasyOpenCL;
+begin
+  Owner := FQueueOwner;
+  if (Owner.FQueueScratch = nil) or (pBytes > Owner.FQueueScratchBytes) then
+  begin
+    if Assigned(Owner.FQueueScratch) then clReleaseMemObject(Owner.FQueueScratch);
+    Owner.FQueueScratch := Owner.CreateBuffer(pBytes);
+    if Assigned(Owner.FQueueScratch)
+      then Owner.FQueueScratchBytes := pBytes
+      else Owner.FQueueScratchBytes := 0;
+    Inc(Owner.FQueueScratchGeneration);
+  end;
+  pGeneration := Owner.FQueueScratchGeneration;
+  Result := Owner.FQueueScratch;
+end;
+
+function TEasyOpenCL.QueueScratchBytes(): csize_t;
+begin
+  Result := FQueueOwner.FQueueScratchBytes;
+end;
+
 function TEasyOpenCL.Finish(): integer;
 var
   UploadCount: LongInt;
@@ -4094,6 +4401,9 @@ begin
   FQueueOwner := Self;
   FUploadsEnqueued := 0;
   FUploadsCompleted := 0;
+  FQueueScratch := nil;
+  FQueueScratchBytes := 0;
+  FQueueScratchGeneration := 0;
 end;
 
 destructor TEasyOpenCL.Destroy();

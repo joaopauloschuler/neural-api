@@ -617,6 +617,12 @@ type
     // AutoTiledGemmCodesGrid: block for big column windows, else large; never
     // block below 128 columns or with over 20% padded columns. Coded by Claude (AI).
     procedure TestTiledGemmCodesAutoGrid;
+    // AutoTiledGemmSplitCount / FitTiledGemmSplitCount on 58 compute units:
+    // LLM prefill windows split, big Qwen-Image shapes do not. Coded by Claude (AI).
+    procedure TestTiledGemmSplitKAutoCount;
+    // Two split-K layers on one queue share one scratch buffer, sized to the
+    // larger, and stay correct after it grows. Coded by Claude (AI).
+    procedure TestTiledGemmSplitKSharedScratch;
     // FP32 tiled GEMM (cai_dot_product_tiled) for pointwise and 3x3 im2col
     // convolutions vs cai_dot_product and the CPU forward.
     procedure TestTiledGemmFP32OpenCLParity;
@@ -69955,9 +69961,10 @@ end;
 // or the 32-wide K-step). Each shape runs three device forwards: two tiled,
 // one per grid (SetTiledGemmCodesGrid large, then block; the launch counter
 // must read 2, or 0 below the threshold, and the two forwards must report 128
-// and 256 lanes), then one with the tiled path switched off
-// (SetTiledGemmMinColumns(0)) so the SAME resident codes go through the
-// existing kernels. The tiled result is held against the
+// and 256 lanes), up to two on the large grid at forced K-split counts
+// (SetTiledGemmSplitK; raw partials + merge), then one with the tiled path
+// switched off (SetTiledGemmMinColumns(0)) so the SAME resident codes go
+// through the existing kernels. The tiled result is held against the
 // existing kernels' result and against the reference at the FP32 tolerance;
 // they differ only in float summation order.
 
@@ -69965,14 +69972,17 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
 {$IFDEF OpenCL}
   procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
     ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
-    pSuppressBias: integer; pFP16, ExpectTiled: boolean);
+    pSuppressBias: integer; pFP16, ExpectTiled: boolean;
+    pSplitA: integer = 0; pSplitB: integer = 0);
   var
     NN: TNNet;
     Input, OutCPU, OutTiled, OutUntiled, OutBlock: TNNetVolume;
+    OutSplit: array[0..1] of TNNetVolume;
+    SplitRequests, SplitsRan: array[0..1] of integer;
     Conv: TNNetConvolution;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
+    i, SplitPos, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffCPU, MaxDiffKernels, MaxAbs, Tol, TolCPU: TNeuralFloat;
   begin
     if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -69987,6 +69997,13 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
     OutBlock := TNNetVolume.Create();
+    SplitRequests[0] := pSplitA;
+    SplitRequests[1] := pSplitB;
+    for SplitPos := 0 to 1 do
+    begin
+      OutSplit[SplitPos] := TNNetVolume.Create();
+      SplitsRan[SplitPos] := 0;
+    end;
     try
       NN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
       Conv := TNNetConvolution.Create(pNeurons, 1, 0, 1, pSuppressBias);
@@ -70012,7 +70029,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
           AssertTrue('TiledGemmInt8 ' + aName + ' took the FP16 route', Conv.FP16Active);
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
         // The two grids of the code kernels over the same resident codes/
-        // scales/bias and bound tiled arguments.
+        // scales/bias and bound tiled arguments; the large grid unsplit.
+        SetTiledGemmSplitK(0);
         SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
@@ -70021,6 +70039,16 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         NN.Compute(Input);
         OutBlock.Copy(NN.GetLastLayer.Output);
         BlockLanes := Conv.OpenCLLastTiledGemmLanes();
+        // The large grid at forced K-split counts: raw partials + merge.
+        SetTiledGemmCodesGrid(tgcLarge);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            SetTiledGemmSplitK(SplitRequests[SplitPos]);
+            NN.Compute(Input);
+            OutSplit[SplitPos].Copy(NN.GetLastLayer.Output);
+            SplitsRan[SplitPos] := Conv.OpenCLLastTiledGemmSplits();
+          end;
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The existing kernels over the same resident codes and B operand.
         SetTiledGemmMinColumns(0);
@@ -70031,6 +70059,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
         SetTiledGemmCodesGrid(tgcAuto);
+        SetTiledGemmSplitK(csTiledGemmSplitKAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt8 ' + aName + ' output size match', OutCPU.Size,
@@ -70046,17 +70075,25 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            Diff := Abs(OutUntiled.Raw[i] - OutSplit[SplitPos].Raw[i]);
+            if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+          end;
         if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
       end;
       WriteLn('  TiledGemmInt8 ', aName, ': tiled vs cpu max|diff|=', MaxDiffCPU:0:9,
         ' tiled vs existing kernels max|diff|=', MaxDiffKernels:0:9,
         ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
-        ' gpu forwards=', Conv.ForwardGPUCnt);
+        ' gpu forwards=', Conv.ForwardGPUCnt, ' K-splits=', SplitsRan[0], '/',
+        SplitsRan[1]);
       // Without these the device path could be unarmed, or the tiled kernel
       // never taken, and parity would prove nothing.
-      AssertTrue('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
-      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+      SplitPos := Ord(pSplitA > 0) + Ord(pSplitB > 0);
+      AssertEquals('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt',
+        3 + SplitPos, Conv.ForwardGPUCnt);
+      if ExpectTiled then ExpectedLaunches := 2 + SplitPos else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt8 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
       if ExpectTiled then
@@ -70065,6 +70102,12 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
           csTiledGemmCodesLanes, LargeLanes);
         AssertEquals('TiledGemmInt8 ' + aName + ' block grid lanes',
           csTiledGemmBlockLanes, BlockLanes);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+            AssertEquals('TiledGemmInt8 ' + aName + ' K-splits for ' +
+              IntToStr(SplitRequests[SplitPos]) + ' requested',
+              FitTiledGemmSplitCount(pInputs, SplitRequests[SplitPos]),
+              SplitsRan[SplitPos]);
       end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs existing kernels: max |diff| = ' +
@@ -70075,6 +70118,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs CPU: max |diff| = ' +
         FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(TolCPU), MaxDiffCPU < TolCPU);
     finally
+      for SplitPos := 0 to 1 do OutSplit[SplitPos].Free;
       OutBlock.Free;
       OutUntiled.Free;
       OutTiled.Free;
@@ -70091,24 +70135,28 @@ begin
     @Identity, @IdentityDerivative, 1, false, false);
   // Exactly one column tile; 200 rows = one partial 512-row large tile (one
   // 128-row block tile + 72); 1003 = 31 K-steps + an 11-wide ragged last step.
+  // Split-K: 32 K-steps as 7+7+7+7+4 (the tail in the last split), then 32
+  // splits of one step, the last one the 11-wide tail alone.
   RunPointwise('16 col 1003x200 relu bias', 16, 1003, 200,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 5, 32);
   // Four column tiles, 130 rows (a last lane that stores 2 of its 4 rows),
   // no bias.
   RunPointwise('64 col 1003x130 identity nobias', 64, 1003, 130,
-    @Identity, @IdentityDerivative, 1, false, true);
+    @Identity, @IdentityDerivative, 1, false, true, 6);
   // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row;
   // 96 = 3 K-steps exactly; a transcendental activation.
   RunPointwise('130 col 96x257 swish bias', 130, 96, 257,
     @Swish, @SwishDerivative, 0, false, true);
+  // Split-K whose merge applies tanh: 3 splits of one K-step.
   RunPointwise('130 col 96x257 tanh bias', 130, 96, 257,
-    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true);
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true, 3);
   // Long reduction axis, the decode-projection shape at a 64-token window.
+  // Split-K: 64 K-steps as 22+22+20, then 8 x 8.
   RunPointwise('64 col 2048x320 relu bias', 64, 2048, 320,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 3, 8);
   // FP16 B operand: cai_dot_product_int8_tiled_h stages through vload_half.
   RunPointwise('fp16 64 col 1003x130 relu bias', 64, 1003, 130,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true, 3);
   RunPointwise('fp16 7 col 1003x96 relu bias', 7, 1003, 96,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, false);
   // The 4-row lanes of the code kernels: 4 rows = one lane; 5..7 rows = the
@@ -70116,8 +70164,9 @@ begin
   // are below one lane, so no tile. 7 = a reduction axis shorter than one
   // K-step (tail only), 32 = one step and no tail; 17 and 33 columns leave a
   // 1-column tile.
+  // A requested split of a one-step reduction fits to 1: the unsplit kernel.
   RunPointwise('17 col 7x4 relu bias', 17, 7, 4,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 2);
   RunPointwise('17 col 45x5 identity nobias', 17, 45, 5,
     @Identity, @IdentityDerivative, 1, false, true);
   RunPointwise('16 col 32x6 tanh bias', 16, 32, 6,
@@ -70131,14 +70180,14 @@ begin
   RunPointwise('17 col 100x516 relu bias', 17, 100, 516,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
   RunPointwise('17 col 100x515 identity nobias', 17, 100, 515,
-    @Identity, @IdentityDerivative, 1, false, true);
+    @Identity, @IdentityDerivative, 1, false, true, 4, 2);
   RunPointwise('fp16 17 col 45x7 relu bias', 17, 45, 7,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
   // FP16 with row counts that are multiples of 4: the 4-byte load instance.
   RunPointwise('fp16 17 col 45x8 relu bias', 17, 45, 8,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
   RunPointwise('fp16 16 col 64x516 identity nobias', 16, 64, 516,
-    @Identity, @IdentityDerivative, 1, true, true);
+    @Identity, @IdentityDerivative, 1, true, true, 2);
   // The block grid's 128x128 tiles: 2 column tiles (136 = 128 + 8) x 3 row
   // tiles (260 = 2*128 + 4, 262 = + 6 with byte loads), FSize 100 = 3 K-steps
   // + a 4-wide tail with 16-byte B loads (FSize mod 4 = 0), FP32 and FP16;
@@ -70167,15 +70216,18 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
 {$IFDEF OpenCL}
   procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
     ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
-    pSuppressBias: integer; ExpectTiled: boolean);
+    pSuppressBias: integer; ExpectTiled: boolean;
+    pSplitA: integer = 0; pSplitB: integer = 0);
   var
     NN, NNRef: TNNet;
     Input, OutRef, OutTiled, OutUntiled, OutBlock: TNNetVolume;
+    OutSplit: array[0..1] of TNNetVolume;
+    SplitRequests, SplitsRan: array[0..1] of integer;
     Conv, ConvRef: TNNetConvolution;
     Quant4: TNNetVolumeQuant4;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
+    i, SplitPos, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffRef, MaxDiffKernels, MaxAbs, Tol: TNeuralFloat;
     procedure BuildNet(var pNN: TNNet; var pConv: TNNetConvolution);
     var
@@ -70205,6 +70257,13 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
     OutBlock := TNNetVolume.Create();
+    SplitRequests[0] := pSplitA;
+    SplitRequests[1] := pSplitB;
+    for SplitPos := 0 to 1 do
+    begin
+      OutSplit[SplitPos] := TNNetVolume.Create();
+      SplitsRan[SplitPos] := 0;
+    end;
     Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
     try
       for i := 0 to Input.Size - 1 do
@@ -70230,7 +70289,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       try
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
         // The two grids of the code kernels over the same resident codes/
-        // scales/bias and bound tiled arguments.
+        // scales/bias and bound tiled arguments; the large grid unsplit.
+        SetTiledGemmSplitK(0);
         SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
         OutTiled.Copy(NN.GetLastLayer.Output);
@@ -70239,6 +70299,16 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         NN.Compute(Input);
         OutBlock.Copy(NN.GetLastLayer.Output);
         BlockLanes := Conv.OpenCLLastTiledGemmLanes();
+        // The large grid at forced K-split counts: raw partials + merge.
+        SetTiledGemmCodesGrid(tgcLarge);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            SetTiledGemmSplitK(SplitRequests[SplitPos]);
+            NN.Compute(Input);
+            OutSplit[SplitPos].Copy(NN.GetLastLayer.Output);
+            SplitsRan[SplitPos] := Conv.OpenCLLastTiledGemmSplits();
+          end;
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The split-K pair over the same resident packed codes and B operand.
         SetTiledGemmMinColumns(0);
@@ -70249,6 +70319,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
         SetTiledGemmCodesGrid(tgcAuto);
+        SetTiledGemmSplitK(csTiledGemmSplitKAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt4 ' + aName + ' output size match', OutRef.Size,
@@ -70264,15 +70335,23 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            Diff := Abs(OutUntiled.Raw[i] - OutSplit[SplitPos].Raw[i]);
+            if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+          end;
         if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
       end;
       WriteLn('  TiledGemmInt4 ', aName, ': tiled vs dequantized FP32 max|diff|=',
         MaxDiffRef:0:9, ' tiled vs split-K max|diff|=', MaxDiffKernels:0:9,
         ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
-        ' gpu forwards=', Conv.ForwardGPUCnt);
-      AssertTrue('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
-      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+        ' gpu forwards=', Conv.ForwardGPUCnt, ' K-splits=', SplitsRan[0], '/',
+        SplitsRan[1]);
+      SplitPos := Ord(pSplitA > 0) + Ord(pSplitB > 0);
+      AssertEquals('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt',
+        3 + SplitPos, Conv.ForwardGPUCnt);
+      if ExpectTiled then ExpectedLaunches := 2 + SplitPos else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt4 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
       if ExpectTiled then
@@ -70281,6 +70360,12 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
           csTiledGemmCodesLanes, LargeLanes);
         AssertEquals('TiledGemmInt4 ' + aName + ' block grid lanes',
           csTiledGemmBlockLanes, BlockLanes);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+            AssertEquals('TiledGemmInt4 ' + aName + ' K-splits for ' +
+              IntToStr(SplitRequests[SplitPos]) + ' requested',
+              FitTiledGemmSplitCount(pInputs, SplitRequests[SplitPos]),
+              SplitsRan[SplitPos]);
       end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs split-K: max |diff| = ' +
@@ -70288,6 +70373,7 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs dequantized FP32: max |diff| = ' +
         FloatToStr(MaxDiffRef) + ' must be < ' + FloatToStr(Tol), MaxDiffRef < Tol);
     finally
+      for SplitPos := 0 to 1 do OutSplit[SplitPos].Free;
       Quant4.Free;
       OutBlock.Free;
       OutUntiled.Free;
@@ -70306,30 +70392,32 @@ begin
     @Identity, @IdentityDerivative, 1, false);
   // One column tile, 200 rows (one block row tile + 72), 3 blocks.
   RunPointwise('16 col 96x200 relu bias', 16, 96, 200,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, 2);
   // Four column tiles, 130 rows, 65 blocks (an odd count), no bias.
+  // Split-K: 65 blocks as 17+17+17+14, then 65 splits of one block.
   RunPointwise('64 col 2080x130 identity nobias', 64, 2080, 130,
-    @Identity, @IdentityDerivative, 1, true);
+    @Identity, @IdentityDerivative, 1, true, 4, 65);
   // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row.
+  // Split-K whose merge applies swish: 5 blocks as 3 + 2.
   RunPointwise('130 col 160x257 swish bias', 130, 160, 257,
-    @Swish, @SwishDerivative, 0, true);
+    @Swish, @SwishDerivative, 0, true, 2);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
     @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
   // The 4-row lanes, as in TestTiledGemmInt8OpenCLParity: 4 rows, 5..7 rows
   // (a last lane that stores 1..3 rows), 3 rows (no tile), 516 / 515 rows
   // (one lane past a 512-row tile, 4-byte vs byte loads), 1-column tiles.
   RunPointwise('17 col 32x4 relu bias', 17, 32, 4,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, 2);
   RunPointwise('17 col 64x5 identity nobias', 17, 64, 5,
     @Identity, @IdentityDerivative, 1, true);
   RunPointwise('33 col 96x7 tanh bias', 33, 96, 7,
-    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true, 3);
   RunPointwise('16 col 64x3 relu bias', 16, 64, 3,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
   RunPointwise('17 col 64x516 relu bias', 17, 64, 516,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
   RunPointwise('17 col 64x515 identity nobias', 17, 64, 515,
-    @Identity, @IdentityDerivative, 1, true);
+    @Identity, @IdentityDerivative, 1, true, 2);
   // The block grid's 128x128 tiles: 2 column tiles x 3 row tiles, ragged on
   // both axes (136 = 128 + 8 columns, 262 = 2*128 + 6 rows, byte loads).
   RunPointwise('136 col 96x262 swish bias', 136, 96, 262,
@@ -70372,6 +70460,165 @@ begin
   Check('24576x205', 24576, 205, true, tgcBlock);
   // LLM prefill window: 2560 rows x 64 columns, below one block column tile.
   Check('2560x64', 2560, 64, true, tgcLarge);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The split-K rule as a pure function of the shape and the L4's 58 compute
+// units: split below 116 large-grid tiles, towards 232 work-groups, each split
+// at least 4 K-steps of 32, at most 32 splits, partial bytes at most the int8
+// weight bytes (splits <= K / (4 x columns)), and no empty split.
+procedure TTestNeuralNumerical.TestTiledGemmSplitKAutoCount;
+{$IFDEF OpenCL}
+  procedure CheckAuto(pNumAs, pSize, pNumBs, Expected: integer);
+  begin
+    AssertEquals('AutoTiledGemmSplitCount ' + IntToStr(pNumAs) + 'x' +
+      IntToStr(pSize) + 'x' + IntToStr(pNumBs), Expected,
+      AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize, 58));
+  end;
+  procedure CheckFit(pSize, pSplits, Expected: integer);
+  begin
+    AssertEquals('FitTiledGemmSplitCount ' + IntToStr(pSize) + ' / ' +
+      IntToStr(pSplits), Expected, FitTiledGemmSplitCount(pSize, pSplits));
+  end;
+begin
+  // Measured LLM prefill windows (rows x reduction x tokens): 16 columns
+  // reach the 20-split cap of 80 K-steps; at 64 columns the partial-bytes cap
+  // (2560 / 256) gives 10.
+  CheckAuto(1024, 2560, 16, 20);
+  CheckAuto(1024, 2560, 64, 10);
+  CheckAuto(2560, 2560, 64, 10);
+  // MLP up (76 tiles) and down (20 tiles, 304 K-steps) at a 64-token window.
+  CheckAuto(9728, 2560, 64, 4);
+  CheckAuto(2560, 9728, 64, 12);
+  // 116 tiles fill the device; 115 split in 3 (27 + 27 + 26 steps).
+  CheckAuto(29 * 512, 2560, 64, 1);
+  CheckAuto(23 * 512, 2560, 80, 3);
+  // Qwen-Image projections at 4096 tokens: thousands of tiles, no split.
+  CheckAuto(4096, 4096, 4096, 1);
+  CheckAuto(24576, 4096, 4096, 1);
+  CheckAuto(4096, 12288, 4096, 1);
+  // Short reductions: 3 K-steps cannot split, 8 split in 2; 1003 = 32 steps
+  // with an 11-wide tail split in 8 of 4.
+  CheckAuto(1024, 96, 16, 1);
+  CheckAuto(1024, 256, 16, 2);
+  CheckAuto(200, 1003, 16, 8);
+  // 8 K-steps would split in 2, but 2 x 64 columns of partials exceed K = 256.
+  CheckAuto(512, 256, 64, 1);
+  CheckAuto(0, 2560, 16, 1);
+  // Fitting a requested count: 0 and 1 mean no split; never more splits than
+  // K-steps; 13 splits of 80 steps leave the 13th empty, so 12 of 7.
+  CheckFit(2560, 0, 1);
+  CheckFit(2560, 1, 1);
+  CheckFit(2560, 3, 3);
+  CheckFit(2560, 13, 12);
+  CheckFit(1003, 32, 32);
+  CheckFit(1003, 100, 32);
+  CheckFit(7, 2, 1);
+  CheckFit(2080, 65, 65);
+  AssertEquals('TiledGemmStepsPerSplit 1003 / 5', 7, TiledGemmStepsPerSplit(1003, 5));
+  AssertEquals('TiledGemmStepsPerSplit 2560 / 12', 7, TiledGemmStepsPerSplit(2560, 12));
+  AssertEquals('TiledGemmStepsPerSplit 2080 / 4', 17, TiledGemmStepsPerSplit(2080, 4));
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Conv1 (120 rows, K 200) needs 30720 partial bytes at 4 splits and runs
+// first; Conv2 (300 rows, K 120) needs 76800 and grows the queue's scratch,
+// so Conv1's second forward must rebind to the new buffer.
+procedure TTestNeuralNumerical.TestTiledGemmSplitKSharedScratch;
+{$IFDEF OpenCL}
+const
+  csColumns = 16;
+  csInputs = 200;
+var
+  NN: TNNet;
+  Conv1, Conv2: TNNetConvolution;
+  Input, OutCPU, OutFirst, OutSecond, OutUntiled: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff, MaxDiffCPU, Tol: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261006;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(csColumns, 1, csInputs);
+  OutCPU := TNNetVolume.Create();
+  OutFirst := TNNetVolume.Create();
+  OutSecond := TNNetVolume.Create();
+  OutUntiled := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(csColumns, 1, csInputs, 1));
+    Conv1 := TNNetConvolution.Create(120, 1, 0, 1, 0);
+    NN.AddLayer(Conv1);
+    Conv2 := TNNetConvolution.Create(300, 1, 0, 1, 0);
+    Conv2.ActivationFn := @HiperbolicTangent;
+    Conv2.ActivationFnDerivative := @HiperbolicTangentDerivative;
+    NN.AddLayer(Conv2);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+    NN.SetTrainable(False);
+    NN.QuantizeWeightsInt8();
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmCodesGrid(tgcLarge);
+      SetTiledGemmSplitK(4);
+      NN.Compute(Input);
+      OutFirst.Copy(NN.GetLastLayer.Output);
+      NN.Compute(Input);
+      OutSecond.Copy(NN.GetLastLayer.Output);
+      AssertEquals('Conv1 K-splits', 4, Conv1.OpenCLLastTiledGemmSplits());
+      AssertEquals('Conv2 K-splits', 4, Conv2.OpenCLLastTiledGemmSplits());
+      AssertTrue('both layers on one queue',
+        Conv1.OpenCLOutputKernel().QueueScratchBytes() =
+        Conv2.OpenCLOutputKernel().QueueScratchBytes());
+      AssertEquals('one scratch sized to the larger layer', 300 * csColumns * 4 * 4,
+        int64(Conv2.OpenCLOutputKernel().QueueScratchBytes()));
+      SetTiledGemmMinColumns(0);
+      NN.Compute(Input);
+      OutUntiled.Copy(NN.GetLastLayer.Output);
+    finally
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmCodesGrid(tgcAuto);
+      SetTiledGemmSplitK(csTiledGemmSplitKAuto);
+      NN.ForceOpenCL(False);
+    end;
+    MaxDiff := 0;
+    MaxDiffCPU := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      MaxDiff := Max(MaxDiff, Abs(OutUntiled.Raw[i] - OutFirst.Raw[i]));
+      MaxDiff := Max(MaxDiff, Abs(OutUntiled.Raw[i] - OutSecond.Raw[i]));
+      MaxDiffCPU := Max(MaxDiffCPU, Abs(OutCPU.Raw[i] - OutSecond.Raw[i]));
+    end;
+    Tol := 1e-4;
+    WriteLn('  TiledGemmSplitKSharedScratch: split vs untiled max|diff|=',
+      MaxDiff:0:9, ' split vs cpu max|diff|=', MaxDiffCPU:0:9);
+    AssertTrue('split vs untiled: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < Tol);
+    AssertTrue('split vs CPU: max |diff| = ' + FloatToStr(MaxDiffCPU), MaxDiffCPU < Tol);
+  finally
+    OutUntiled.Free;
+    OutSecond.Free;
+    OutFirst.Free;
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
 end;
 {$ELSE}
 begin
@@ -71791,7 +72038,8 @@ var
     else Result.QuantizeWeightsInt8();
   end;
 
-  procedure RunCase(pInt4, pTiled, pBiased: boolean);
+  // pSplit forces 2 K-splits on the tiled launches (64 inputs = 2 K-steps).
+  procedure RunCase(pInt4, pTiled, pBiased, pSplit: boolean);
   var
     NetA, NetB, NetC, NetWide: TNNet;
     LayerB, LayerC: TNNetLayerConcatedWeights;
@@ -71803,6 +72051,7 @@ var
     if pTiled then CaseName := CaseName + ' tiled'
     else CaseName := CaseName + ' untiled';
     if pBiased then CaseName := CaseName + ' biased';
+    if pSplit then CaseName := CaseName + ' split-K';
     NetA := BuildNet(csNeurons, 1, pInt4, pBiased);
     NetB := BuildNet(csNeurons, 2, pInt4, pBiased);
     NetWide := BuildNet(csNeurons + 8, 3, pInt4, pBiased);
@@ -71824,6 +72073,7 @@ var
       NetC.ForceOpenCL(true);
       if pTiled then SetTiledGemmMinColumns(csTiledGemmMinColumns)
       else SetTiledGemmMinColumns(0);
+      if pSplit then SetTiledGemmSplitK(2) else SetTiledGemmSplitK(0);
       LayerB := TNNetLayerConcatedWeights(NetB.GetLastLayer());
       LayerC := TNNetLayerConcatedWeights(NetC.GetLastLayer());
       AssertTrue(CaseName + ': C armed on A''s codes',
@@ -71847,6 +72097,9 @@ var
       AssertEquals(CaseName + ': C re-linked to B vs B', 0,
         OutB.SumDiff(OutC), 0);
       AssertTrue(CaseName + ': C ran on OpenCL', LayerC.ForwardGPUCnt = 2);
+      if pSplit then
+        AssertEquals(CaseName + ': K-splits after the swap', 2,
+          LayerC.OpenCLLastTiledGemmSplits());
       if pTiled then
         AssertEquals(CaseName + ': tiled launch after the swap',
           TiledBefore + 1, LayerC.OpenCLTiledGemmLaunchCount())
@@ -71861,6 +72114,7 @@ var
         LayerC.WeightOwner = LayerB);
     finally
       SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmSplitK(csTiledGemmSplitKAuto);
       OutC.Free;
       OutB.Free;
       OutA.Free;
@@ -71880,7 +72134,11 @@ begin
   end;
   for CasePos := 0 to 7 do
     RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}(CasePos and 2) = 0,
-      {pBiased=}(CasePos and 4) <> 0);
+      {pBiased=}(CasePos and 4) <> 0, {pSplit=}false);
+  // The split-K kernel and its merge were bound before the swap.
+  for CasePos := 0 to 3 do
+    RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}true,
+      {pBiased=}(CasePos and 2) <> 0, {pSplit=}true);
 end;
 {$ELSE}
 begin

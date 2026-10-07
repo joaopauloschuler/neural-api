@@ -22,14 +22,18 @@ reduction * tokens. Memory guard: a shape runs only if its host volumes fit
 
 Usage:
   GemmBench [--tokens 4096] [--iters 10] [--int8 | --int4] [--pico]
-    [--rows R --reduction K] [--grid auto|large|block]
+    [--rows R --reduction K] [--grid auto|large|block] [--split-k auto|off|N]
     [--gpu-platform 0] [--gpu-device 0]
 --pico times hidden 64 / MLP 192 over 32 tokens (a smoke run). --rows and
 --reduction time that one shape instead (e.g. an LLM projection at a prefill
 window: --rows 1024 --reduction 2560 --tokens 64). --grid forces the large
 (512 rows x 16 columns) or block (128 x 128) work-groups of the code kernels;
 auto picks per shape, as TNNetPointwiseConvLinear does
-(SetTiledGemmCodesGrid). Parity runs on both grids.
+(SetTiledGemmCodesGrid). --split-k cuts the large grid's reduction into N
+K-splits (raw partials + merge), off never splits, auto picks per shape
+(SetTiledGemmSplitK); the block grid never splits. Each timing line reports
+the lanes and K-splits that ran. Parity runs on both grids and on the large
+grid at 3 K-splits.
 
 Coded by Claude (AI).
 *)
@@ -49,6 +53,7 @@ const
   csPicoTokens = 32;
   csParityColumns = 37;
   csParityReduction = 1003; // int4 rounds it down to whole blocks of 32
+  csParitySplits = 3;
   csMaxHostBytes = 600 * 1024 * 1024;
   csMinBlockSeconds = 0.2;
   csTimedBlocks = 3;
@@ -61,6 +66,7 @@ type
 
 var
   TokenCnt, Iters, PlatformIdx, DeviceIdx, CustomRows, CustomReduction: integer;
+  SplitK: integer;
   Grid: TTiledGemmCodesGrid;
   RunInt8, RunInt4, Pico: boolean;
   PlatformId: cl_platform_id;
@@ -72,7 +78,7 @@ begin
   if Problem <> '' then WriteLn('Error: ', Problem);
   WriteLn('Usage: GemmBench [--tokens N] [--iters N] [--int8 | --int4] ' +
     '[--pico] [--rows R --reduction K] [--grid auto|large|block] ' +
-    '[--gpu-platform N] [--gpu-device N]');
+    '[--split-k auto|off|N] [--gpu-platform N] [--gpu-device N]');
   Halt(2);
 end;
 
@@ -99,6 +105,7 @@ begin
   CustomRows := 0;
   CustomReduction := 0;
   Grid := tgcAuto;
+  SplitK := csTiledGemmSplitKAuto;
   ArgIdx := 1;
   while ArgIdx <= ParamCount do
   begin
@@ -120,6 +127,15 @@ begin
       else if ParamStr(ArgIdx) = 'block' then Grid := tgcBlock
       else if ParamStr(ArgIdx) <> 'auto' then
         PrintUsageAndHalt('--grid takes auto, large or block');
+    end
+    else if Arg = '--split-k' then
+    begin
+      Inc(ArgIdx);
+      if ArgIdx > ParamCount then PrintUsageAndHalt('--split-k needs a value');
+      if ParamStr(ArgIdx) = 'auto' then SplitK := csTiledGemmSplitKAuto
+      else if ParamStr(ArgIdx) = 'off' then SplitK := 0
+      else if (not TryStrToInt(ParamStr(ArgIdx), SplitK)) or (SplitK < 0) then
+        PrintUsageAndHalt('--split-k takes auto, off or a split count');
     end
     else PrintUsageAndHalt('unknown argument ' + Arg);
     Inc(ArgIdx);
@@ -282,9 +298,10 @@ begin
       end;
     Bound := 1e-4 * Max(1, MaxAbsY);
     Result := Ran and (MaxDiff <= Bound);
-    WriteLn(Format('  %s %d rows x %d x %d columns, %d lanes: tiled ran: %s, ' +
-      'max|diff| = %.3e (bound %.1e) %s', [ModeName(Int4), Rows, Reduction,
-      csParityColumns, DotCL.LastTiledGemmLanes, BoolToStr(Ran, 'yes', 'no'),
+    WriteLn(Format('  %s %d rows x %d x %d columns, %d lanes, %d K-splits: ' +
+      'tiled ran: %s, max|diff| = %.3e (bound %.1e) %s', [ModeName(Int4), Rows,
+      Reduction, csParityColumns, DotCL.LastTiledGemmLanes,
+      DotCL.LastTiledGemmSplits, BoolToStr(Ran, 'yes', 'no'),
       MaxDiff, Bound,
       BoolToStr(Result, 'PASS', 'FAIL')]));
   finally
@@ -393,9 +410,9 @@ begin
     if Ms > 0
       then Tflops := 2.0 * Shape.Rows * Shape.Reduction * TokenCnt / (Ms * 1e-3) / 1e12
       else Tflops := 0;
-    WriteLn(Format('  %-8s %s %6d x %6d x %5d %4d lanes %10.3f %8.2f',
+    WriteLn(Format('  %-8s %s %6d x %6d x %5d %4d lanes %3d splits %10.3f %8.2f',
       [Shape.Name, ModeName(Int4), Shape.Rows, Shape.Reduction, TokenCnt,
-      DotCL.LastTiledGemmLanes, Ms, Tflops]));
+      DotCL.LastTiledGemmLanes, DotCL.LastTiledGemmSplits, Ms, Tflops]));
   finally
     DotCL.UnprepareForCompute();
     B.Free;
@@ -409,7 +426,7 @@ var
   Shapes: array of TGemmShape;
   Hidden, MlpHidden, ShapeIdx, ParityReduction: integer;
   Int4, ParityOk: boolean;
-  ParityGrid: TTiledGemmCodesGrid;
+  ParityPass: integer;
 begin
   if Pico then
   begin
@@ -459,9 +476,15 @@ begin
     RandSeed := 20261006;
     WriteLn('Parity vs Pascal:');
     ParityOk := true;
-    for ParityGrid := tgcLarge to tgcBlock do
+    // Large unsplit, block, large at csParitySplits K-splits.
+    for ParityPass := 0 to 2 do
     begin
-      SetTiledGemmCodesGrid(ParityGrid);
+      if ParityPass = 1
+        then SetTiledGemmCodesGrid(tgcBlock)
+        else SetTiledGemmCodesGrid(tgcLarge);
+      if ParityPass = 2
+        then SetTiledGemmSplitK(csParitySplits)
+        else SetTiledGemmSplitK(0);
       for Int4 := false to true do
         if (Int4 and RunInt4) or ((not Int4) and RunInt8) then
         begin
@@ -474,8 +497,9 @@ begin
     end;
     if not ParityOk then Halt(1);
     SetTiledGemmCodesGrid(Grid);
-    WriteLn('Timing (rows x reduction x tokens, work-group lanes, ms per ' +
-      'launch, TFLOPS):');
+    SetTiledGemmSplitK(SplitK);
+    WriteLn('Timing (rows x reduction x tokens, work-group lanes, K-splits, ' +
+      'ms per launch, TFLOPS):');
     for Int4 := false to true do
       if (Int4 and RunInt4) or ((not Int4) and RunInt8) then
         for ShapeIdx := 0 to High(Shapes) do
