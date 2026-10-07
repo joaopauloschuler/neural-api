@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24). Coded by Claude (AI).
+// (9, 10, 15, 18-21, 24, 25). Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -83,15 +83,13 @@ __kernel void cai_dot_product
   __global float* FInputBufferAs,
   __global float* FInputBufferBs,
   __global float* FResultBuffer,
-  // Optional fused bias: when UseBias != 0, FBiasOutput[b_id*FNumAs + a_id] is
-  // added to the reduced dot product BEFORE the activation, so an inference
-  // forward computes act(W.x + b) entirely on the device (no host bias-add +
-  // activation sweep). FBiasOutput carries the host FBiasOutput volume verbatim
-  // (bias replicated per output position, same [pos][feature] layout as the
-  // result), so the index matches the result write exactly. When UseBias == 0
-  // the pointer is unread and may be NULL. Coded by Claude (AI).
+  // Optional fused bias: when UseBias != 0, FRowBias[a_id] (one float per A
+  // row, FNumAs in all) is added to the reduced dot product BEFORE the
+  // activation, so an inference forward computes act(W.x + b) entirely on the
+  // device. When UseBias == 0 the pointer is unread and may be NULL.
+  // Coded by Claude (AI).
   const int UseBias,
-  __global const float* FBiasOutput
+  __global const float* FRowBias
 )
 {
   const int a_id = get_global_id(0);
@@ -177,8 +175,8 @@ __kernel void cai_dot_product
         i += 1;
     }
 
-    // Fused bias-add (see the FBiasOutput arg comment): act must see W.x + b.
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    // Fused bias-add (see the FRowBias arg comment): act must see W.x + b.
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     // Optional fused activation, applied in-register to the reduced dot product
     // before it is written back, so an inference forward skips the host-side
@@ -213,7 +211,7 @@ __kernel void cai_dot_product_int8
   __global float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -305,7 +303,7 @@ __kernel void cai_dot_product_int8
     DotProductResult *= FScales[a_id];
 
     // Fused bias-add (see cai_dot_product): act must see W.x + b.
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     // Fused activation, the same cai_fused_act call as cai_dot_product.
     DotProductResult = cai_fused_act(DotProductResult, ActFN);
@@ -339,7 +337,7 @@ __kernel void cai_dot_product_int8_h
   __global const half* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -430,7 +428,7 @@ __kernel void cai_dot_product_int8_h
     // Deferred per-row dequantization scale, the fused bias and the fused
     // activation, in cai_dot_product_int8's order.
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
     DotProductResult = cai_fused_act(DotProductResult, ActFN);
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
@@ -663,7 +661,7 @@ __kernel void cai_dot_product_int8_splitk_reduce
   __global const float* FPartialBuffer,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -684,7 +682,7 @@ __kernel void cai_dot_product_int8_splitk_reduce
     // Deferred per-row dequantization scale, then the (FP32, unscaled) bias -
     // same order as cai_dot_product_int8 and as the host fused path.
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
   }
@@ -708,7 +706,7 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
   __global const half* FPartialBuffer,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
@@ -727,7 +725,7 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
     }
 
     DotProductResult *= FScales[a_id];
-    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+    if (UseBias != 0) DotProductResult += FRowBias[a_id];
 
     FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
   }
@@ -736,41 +734,45 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
 // TILED GEMM for a window of columns. cai_dot_product_int8 and the split-K
 // pair give one work-item per (row, column) and every work-item streams its
 // whole weight row, so a K-column prefill moves each weight byte through L2
-// K times. Here one work-group of CAI_TILED_LANES lanes owns a tile of
-// CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE rows x CAI_TILED_COLS columns: the
-// B tile (CAI_TILED_COLS columns x CAI_TILED_KSTEP reduction elements) is
-// staged in __local once per K-step and every lane reads each weight code of
-// its rows ONCE, multiplying it into CAI_TILED_COLS accumulators, so a weight
-// byte crosses the memory system once per column tile instead of once per
-// column. Codes keep the codes[a + i*FNumAs] layout (a lane's second row is
-// CAI_TILED_LANES rows up, so both per-k loads of a work-group hit
-// CAI_TILED_LANES consecutive bytes) and the result keeps [b*FNumAs + a].
+// K times. Here one work-group owns a tile of rows x CAI_TILED_COLS columns:
+// the B tile (CAI_TILED_COLS columns x CAI_TILED_KSTEP reduction elements) is
+// staged in __local once per K-step and every lane reads each weight of its
+// rows ONCE, multiplying it into CAI_TILED_COLS accumulators, so a weight
+// crosses the memory system once per column tile instead of once per column.
+// Weights keep the [a + i*FNumAs] layout and the result keeps [b*FNumAs + a].
 //
 // Tile constants (mirrored by csTiledGemm* in neuralopencl.pas; the host
 // derives the launch geometry from them, so both copies must agree):
-// - CAI_TILED_LANES 64: two warps/one wavefront of coalesced 64-byte code
-//   reads; small enough that a 2560-row projection at a 64-column window
-//   still yields 80 work-groups, large enough that the tile stage is 8
-//   coalesced loads per lane.
-// - CAI_TILED_ROWS_PER_LANE 2 and CAI_TILED_COLS 16: 32 accumulators per
-//   lane. Each staged B element serves 2 multiply-adds and each weight
-//   byte 16, so a lane issues 1 global byte load per 32 mads and 1 local
-//   float4 broadcast per 8 mads. Doubling either doubles the register
-//   file per lane and halves the grid, which starves the device at the
-//   4B-class shapes.
-// - CAI_TILED_KSTEP 32 = one Q4_0 block, so the int4 twin loads one block
-//   scale per row per step; the tile is 2 KB of __local.
+// - CAI_TILED_COLS 16 and CAI_TILED_KSTEP 32 (one Q4_0 block, so the int4
+//   kernel loads one block scale per row per step); the tile is 2 KB.
+// - FP32 kernels (cai_dot_product_tiled, cai_conv_implicit_tiled):
+//   CAI_TILED_LANES 64 lanes of CAI_TILED_ROWS_PER_LANE 2 rows CAI_TILED_LANES
+//   apart, so both per-k loads of a work-group are coalesced; 2x16 = 32
+//   accumulators per lane, 128 rows per work-group.
+// - Code kernels (int8 / int8_h / int4): CAI_CODES_ROWS_PER_LANE 4
+//   CONSECUTIVE rows per lane, adjacent in the code layout, so one 4-byte load
+//   reads 4 rows' codes at one k. A lane issues the whole K-step's code loads
+//   before the tile barrier, so their latency overlaps the B stage. 4x16 = 64
+//   accumulators, about 120 registers with the 32 staged code words; each
+//   local float4 broadcast feeds 16 mads and each code load 64.
+//   CAI_CODES_LANES 128 lanes give 512 rows per work-group (the large grid).
+//   A second grid, 128x128 tiles in the _block entry points, is described
+//   after cai_dot_product_int4_tiled.
 //
-// Ragged edges: a lane whose row index passes FNumAs-1 reads row FNumAs-1
-// instead (a valid address) and skips its store; columns past FNumBs and
-// reduction elements past FSize are staged as 0 and never stored; the code
+// Ragged edges: an FP32 lane whose row passes FNumAs-1 reads row FNumAs-1
+// instead (a valid address) and skips its store; a code-kernel lane reads
+// rows FNumAs-4..FNumAs-1 and stores the ones it owns. Columns past FNumBs and
+// reduction elements past FSize are staged as 0 and never stored; the weight
 // loop stops at FSize, never reading past the codes buffer. The tail applies
 // the per-row scale, the fused bias and the fused activation in
 // cai_dot_product_int8's order, so each tiled kernel differs from its untiled
 // twin only by float summation order.
 //
 // Indices are int32, as in cai_dot_product: FNumAs*FSize, FNumBs*FSize and
-// FNumBs*FNumAs must each stay below 2^31. Coded by Claude (AI).
+// FNumBs*FNumAs must each stay below 2^31. The implicit-GEMM convolution
+// (cai_conv_implicit_tiled) has no FNumBs*FSize term: its B index is the
+// source volume's, so the source must stay below 2^31 elements instead.
+// Coded by Claude (AI).
 #define CAI_TILED_LANES 64
 #define CAI_TILED_ROWS_PER_LANE 2
 #define CAI_TILED_COLS 16
@@ -778,35 +780,25 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
 #define CAI_TILED_B_ELEMS (CAI_TILED_COLS * CAI_TILED_KSTEP)
 
 // Stages B[b0..b0+CAI_TILED_COLS) x [k0..k0+CAI_TILED_KSTEP) into Bs, column
-// major (Bs[b*CAI_TILED_KSTEP + k]), zero past FNumBs and FSize. Coalesced
-// over k. The caller owns the barriers.
+// major (Bs[b*CAI_TILED_KSTEP + k]), zero past FNumBs and FSize, from Bf or,
+// when BIsHalf, the half-storage Bh. Lanes is the work-group size; BIsHalf
+// and Lanes are compile-time constants at every call site. Coalesced over k.
+// The caller owns the barriers.
 static inline void cai_tiled_stage_b(const int FNumBs, const int FSize,
-  const int b0, const int k0, __global const float* B, __local float* Bs,
-  const int lid)
+  const int b0, const int k0, __global const float* Bf,
+  __global const half* Bh, const int BIsHalf, __local float* Bs,
+  const int lid, const int Lanes)
 {
-  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
+  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += Lanes)
   {
     const int b = idx / CAI_TILED_KSTEP;
     const int k = idx - b * CAI_TILED_KSTEP;
     const int gb = b0 + b;
     const int gk = k0 + k;
-    Bs[idx] = ((gb < FNumBs) && (gk < FSize)) ? B[gb * FSize + gk] : 0.0f;
-  }
-}
-
-// Half-storage twin of cai_tiled_stage_b (the FP16-activation B operand).
-static inline void cai_tiled_stage_b_h(const int FNumBs, const int FSize,
-  const int b0, const int k0, __global const half* B, __local float* Bs,
-  const int lid)
-{
-  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
-  {
-    const int b = idx / CAI_TILED_KSTEP;
-    const int k = idx - b * CAI_TILED_KSTEP;
-    const int gb = b0 + b;
-    const int gk = k0 + k;
-    Bs[idx] = ((gb < FNumBs) && (gk < FSize))
-      ? vload_half(gb * FSize + gk, B) : 0.0f;
+    float v = 0.0f;
+    if ((gb < FNumBs) && (gk < FSize))
+      v = BIsHalf ? vload_half(gb * FSize + gk, Bh) : Bf[gb * FSize + gk];
+    Bs[idx] = v;
   }
 }
 
@@ -843,29 +835,88 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
     {
       const int pos = gb * FNumAs + row;
       float v = acc[b] * RowScale;
-      if (UseBias != 0) v += Bias[pos];
+      if (UseBias != 0) v += Bias[row];
       R[pos] = cai_fused_act(v, ActFN);
     }
   }
 }
 
-// Element APos of the A operand: an FP32 weight, or an int8 code converted
-// to float. AIsFloat is a compile-time constant at every call site.
-static inline float cai_tiled_load_a(__global const char* A8,
-  __global const float* Af, const int AIsFloat, const int APos)
+// IMPLICIT-GEMM CONVOLUTION. Column b of the B operand is output position b
+// and reduction element k is tap (ky, kx, d) with k = ky*RowSpan + kx*InDepth
+// + d - the im2col layout of cai_im2col - so the tile stage reads the
+// unpadded source directly and the column matrix never exists. Taps in the
+// zero padding stage 0, exactly as cai_im2col writes them.
+typedef struct
 {
-  return AIsFloat ? Af[APos] : convert_float(A8[APos]);
+  int OutSizeX;  // FOutput.SizeX
+  int RowSpan;   // InDepth * FeatureSizeX: one kernel row of a column
+  int InSizeX, InSizeY, InDepth;
+  int Stride;
+  int Padding;   // zero border on each side of the source
+} cai_conv_gather;
+
+// cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
+// columns lid / KSTEP + j * CAI_TILED_B_COL_STEP; the gather keeps that map.
+#if (CAI_TILED_LANES % CAI_TILED_KSTEP) != 0
+#error "the implicit-GEMM gather needs CAI_TILED_LANES to be a multiple of CAI_TILED_KSTEP"
+#endif
+#if (CAI_TILED_B_ELEMS % CAI_TILED_LANES) != 0
+#error "the implicit-GEMM gather needs CAI_TILED_B_ELEMS to be a multiple of CAI_TILED_LANES"
+#endif
+#define CAI_TILED_B_COLS_PER_LANE (CAI_TILED_B_ELEMS / CAI_TILED_LANES)
+#define CAI_TILED_B_COL_STEP (CAI_TILED_LANES / CAI_TILED_KSTEP)
+
+// Top-left source tap of each column this lane stages, once per work-group;
+// a column past FNumBs gets a first row no tap can reach, so it stages zeros.
+static inline void cai_conv_gather_columns(const cai_conv_gather G,
+  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX)
+{
+  #pragma unroll
+  for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
+  {
+    const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
+    const int oy = gb / G.OutSizeX;
+    const int ox = gb - oy * G.OutSizeX;
+    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.Padding : G.InSizeY;
+    FirstX[j] = ox * G.Stride - G.Padding;
+  }
 }
 
-// Tiled body of the FP32-weight and int8-weight entry points; the call-site
-// constants AIsFloat/BIsHalf pick A8 or Af and Bf or Bh. Coded by Claude (AI).
+// cai_tiled_stage_b with the B element gathered from the source: the same Bs
+// layout and the same zeros, so the tile math after it is unchanged.
+static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
+  const int FSize, const int k0, __global const float* Src,
+  __local float* Bs, const int lid, const int* FirstY, const int* FirstX)
+{
+  const int kLane = lid % CAI_TILED_KSTEP;
+  const int bLane = lid / CAI_TILED_KSTEP;
+  const int gk = k0 + kLane;
+  // Past FSize the row offset puts every column below the source.
+  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.Padding;
+  const int rem = gk - ky * G.RowSpan;
+  const int kx = rem / G.InDepth;
+  const int d = rem - kx * G.InDepth;
+  #pragma unroll
+  for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
+  {
+    const int y = FirstY[j] + ky;
+    const int x = FirstX[j] + kx;
+    float v = 0.0f;
+    if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
+      v = Src[(y * G.InSizeX + x) * G.InDepth + d];
+    Bs[(bLane + j * CAI_TILED_B_COL_STEP) * CAI_TILED_KSTEP + kLane] = v;
+  }
+}
+
+// Tiled body of the FP32-weight and implicit-GEMM entry points; the
+// call-site constant BIsConv picks the B stage from Bf or the gather from Bf
+// through G. Coded by Claude (AI).
 static inline void cai_dot_product_tiled_body(const int FNumAs,
   const int FNumBs, const int FSize, const int ActFN,
-  __global const char* A8, __global const float* Af, const int AIsFloat,
-  __global const float* Bf, __global const half* Bh, const int BIsHalf,
+  __global const float* Af, __global const float* Bf,
+  const int BIsConv, const cai_conv_gather G,
   __global float* FResultBuffer, const int UseBias,
-  __global const float* FBiasOutput, __global const float* FScales,
-  __local float* Bs)
+  __global const float* FRowBias, __local float* Bs)
 {
   const int lid = get_local_id(0);
   const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
@@ -879,13 +930,20 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   #pragma unroll
   for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
 
+  int FirstY[CAI_TILED_B_COLS_PER_LANE];
+  int FirstX[CAI_TILED_B_COLS_PER_LANE];
+  if (BIsConv) cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX);
+
   const int RowStep4 = 4 * FNumAs;
   for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
   {
     // The previous step's reads must finish before the tile is overwritten.
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (BIsHalf) cai_tiled_stage_b_h(FNumBs, FSize, b0, k0, Bh, Bs, lid);
-    else         cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, Bs, lid);
+    if (BIsConv)
+      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX);
+    else
+      cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, 0, 0, Bs, lid,
+        CAI_TILED_LANES);
     barrier(CLK_LOCAL_MEM_FENCE);
 
     const int kEnd = min(CAI_TILED_KSTEP, FSize - k0);
@@ -894,14 +952,14 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     int k = 0;
     for (; k + 3 < kEnd; k += 4)
     {
-      const float w00 = cai_tiled_load_a(A8, Af, AIsFloat, APos0);
-      const float w01 = cai_tiled_load_a(A8, Af, AIsFloat, APos0 + FNumAs);
-      const float w02 = cai_tiled_load_a(A8, Af, AIsFloat, APos0 + 2 * FNumAs);
-      const float w03 = cai_tiled_load_a(A8, Af, AIsFloat, APos0 + 3 * FNumAs);
-      const float w10 = cai_tiled_load_a(A8, Af, AIsFloat, APos1);
-      const float w11 = cai_tiled_load_a(A8, Af, AIsFloat, APos1 + FNumAs);
-      const float w12 = cai_tiled_load_a(A8, Af, AIsFloat, APos1 + 2 * FNumAs);
-      const float w13 = cai_tiled_load_a(A8, Af, AIsFloat, APos1 + 3 * FNumAs);
+      const float w00 = Af[APos0];
+      const float w01 = Af[APos0 + FNumAs];
+      const float w02 = Af[APos0 + 2 * FNumAs];
+      const float w03 = Af[APos0 + 3 * FNumAs];
+      const float w10 = Af[APos1];
+      const float w11 = Af[APos1 + FNumAs];
+      const float w12 = Af[APos1 + 2 * FNumAs];
+      const float w13 = Af[APos1 + 3 * FNumAs];
       APos0 += RowStep4;
       APos1 += RowStep4;
       cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
@@ -910,8 +968,8 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     // Ragged FSize: the last step's remainder (fewer than 4 elements).
     for (; k < kEnd; k++)
     {
-      const float w0 = cai_tiled_load_a(A8, Af, AIsFloat, APos0);
-      const float w1 = cai_tiled_load_a(A8, Af, AIsFloat, APos1);
+      const float w0 = Af[APos0];
+      const float w1 = Af[APos1];
       APos0 += FNumAs;
       APos1 += FNumAs;
       #pragma unroll
@@ -924,16 +982,16 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     }
   }
 
-  const float RowScale0 = AIsFloat ? 1.0f : FScales[row0];
-  const float RowScale1 = AIsFloat ? 1.0f : FScales[row1];
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, RowScale0, a0 + lid, b0, acc0);
+    FRowBias, 1.0f, a0 + lid, b0, acc0);
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, RowScale1, a0 + lid + CAI_TILED_LANES, b0, acc1);
+    FRowBias, 1.0f, a0 + lid + CAI_TILED_LANES, b0, acc1);
 }
 
 // Tiled twin of cai_dot_product: FP32 weights in its [a + k*FNumAs] layout,
-// no row scales, cai_dot_product_int8_tiled's launch. Coded by Claude (AI).
+// no row scales. Launch: global (ceil(FNumAs / (CAI_TILED_LANES *
+// CAI_TILED_ROWS_PER_LANE)) * CAI_TILED_LANES, ceil(FNumBs / CAI_TILED_COLS)),
+// local (CAI_TILED_LANES, 1). Coded by Claude (AI).
 __kernel void cai_dot_product_tiled
 (
   const int FNumAs,
@@ -944,20 +1002,182 @@ __kernel void cai_dot_product_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput
+  __global const float* FRowBias
 )
 {
-  __local float Bs[CAI_TILED_B_ELEMS];
-  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, 0, FInputBufferAs,
-    1, FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, 0, Bs);
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
+  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
 
-// Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS. Launch:
-// global (ceil(FNumAs / (CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE)) *
-// CAI_TILED_LANES, ceil(FNumBs / CAI_TILED_COLS)), local (CAI_TILED_LANES, 1).
+#define CAI_CODES_LANES 128
+#define CAI_CODES_ROWS_PER_LANE 4
+
+// Reduction elements k..k+3 of a lane's 4 rows (w0..w3: the 4 rows at k..k+3)
+// against the staged tile, into acc[b] (the 4 rows of column b). Every lane
+// reads the same tile address, so the float4 load is a broadcast.
+static inline void cai_codes_mad4(float4* acc, __local const float* Bs,
+  const float4 w0, const float4 w1, const float4 w2, const float4 w3,
+  const int k)
+{
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+  {
+    const float4 bv = vload4(0, Bs + b * CAI_TILED_KSTEP + k);
+    acc[b] = mad(w3, (float4)(bv.s3), mad(w2, (float4)(bv.s2),
+      mad(w1, (float4)(bv.s1), mad(w0, (float4)(bv.s0), acc[b]))));
+  }
+}
+
+// Scale, bias, activation and store of column gb's rows Base..Base+3 (acc);
+// skips rows below FirstRow (the previous lane's). The caller checks gb.
+static inline void cai_codes_store_col4(const int FNumAs, const int ActFN,
+  const int UseBias, __global float* R, const float4 RowScale,
+  const float4 RowBias, const int Base, const int FirstRow, const int gb,
+  const float4 acc)
+{
+  float4 v = acc * RowScale;
+  if (UseBias != 0) v += RowBias;
+  v.s0 = cai_fused_act(v.s0, ActFN);
+  v.s1 = cai_fused_act(v.s1, ActFN);
+  v.s2 = cai_fused_act(v.s2, ActFN);
+  v.s3 = cai_fused_act(v.s3, ActFN);
+  __global float* Dst = R + gb * FNumAs + Base;
+  if (Base == FirstRow) vstore4(v, 0, Dst);
+  else
+  {
+    // The last lane of a ragged FNumAs: Base < FirstRow <= Base + 3.
+    if (Base + 1 >= FirstRow) Dst[1] = v.s1;
+    if (Base + 2 >= FirstRow) Dst[2] = v.s2;
+    Dst[3] = v.s3;
+  }
+}
+
+// cai_codes_store_col4 over CAI_TILED_COLS columns from b0, skipping rows/columns
+// past the edges; RawPartials (compile-time) stores raw sums, no scale/bias/act.
+static inline void cai_codes_store_rows(const int FNumAs, const int FNumBs,
+  const int ActFN, const int UseBias, __global float* R,
+  __global const float* Bias, __global const float* FScales, const int Base,
+  const int FirstRow, const int b0, const float4* acc, const int RawPartials)
+{
+  if (FirstRow >= FNumAs) return;
+  const float4 RowScale = RawPartials ? (float4)(1.0f) : vload4(0, FScales + Base);
+  const float4 RowBias = (UseBias != 0) ? vload4(0, Bias + Base) : (float4)(0.0f);
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+    if (b0 + b < FNumBs)
+      cai_codes_store_col4(FNumAs, ActFN, UseBias, R, RowScale, RowBias, Base,
+        FirstRow, b0 + b, acc[b]);
+}
+
+// The int8 codes of 4 consecutive rows at one k. RowsAligned (FNumAs a
+// multiple of 4) is a compile-time constant and allows one 4-byte load.
+static inline char4 cai_codes_load4(__global const char* P,
+  const int RowsAligned)
+{
+  return RowsAligned ? *((__global const char4*)P) : vload4(0, P);
+}
+
+// int8 body: lanes of rows FirstRow..+3 (from min(FirstRow, FNumAs-4)), K-steps
+// [StepFirst, StepEnd) of ceil(FSize/32); the ragged tail goes to the last range.
+static inline void cai_codes_int8_body(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const char* A8,
+  __global const float* Bf, __global const half* Bh, const int BIsHalf,
+  const int RowsAligned, const int StepFirst, const int StepEnd,
+  const int RawPartials, __global float* R, const int UseBias,
+  __global const float* Bias, __global const float* FScales,
+  __local float* Bs)
+{
+  const int lid = get_local_id(0);
+  const int FirstRow =
+    get_group_id(0) * (CAI_CODES_LANES * CAI_CODES_ROWS_PER_LANE) +
+    lid * CAI_CODES_ROWS_PER_LANE;
+  const int Base = min(FirstRow, FNumAs - CAI_CODES_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  float4 acc[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) acc[b] = (float4)(0.0f);
+
+  __global const char* P = A8 + Base + StepFirst * CAI_TILED_KSTEP * FNumAs;
+  const int TailLen = FSize & (CAI_TILED_KSTEP - 1);
+  const int FullSteps = FSize / CAI_TILED_KSTEP;
+  const int MaxStepPos = min(StepEnd, FullSteps) - 1;
+  for (int step = StepFirst; step <= MaxStepPos; step++)
+  {
+    // Issued before the barrier, so the loads fly while the tile is staged.
+    char4 Codes[CAI_TILED_KSTEP];
+    #pragma unroll
+    for (int k = 0; k < CAI_TILED_KSTEP; k++)
+    {
+      Codes[k] = cai_codes_load4(P, RowsAligned);
+      P += FNumAs;
+    }
+    // The previous step's reads must finish before the tile is overwritten.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_tiled_stage_b(FNumBs, FSize, b0, step * CAI_TILED_KSTEP, Bf, Bh,
+      BIsHalf, Bs, lid, CAI_CODES_LANES);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int k = 0; k < CAI_TILED_KSTEP; k += 4)
+      cai_codes_mad4(acc, Bs, convert_float4(Codes[k]),
+        convert_float4(Codes[k + 1]), convert_float4(Codes[k + 2]),
+        convert_float4(Codes[k + 3]), k);
+  }
+  // Ragged FSize: the staged tile is zero past FSize, the code loop stops there.
+  if ((TailLen > 0) && (StepEnd > FullSteps))
+  {
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_tiled_stage_b(FNumBs, FSize, b0, FSize - TailLen, Bf, Bh, BIsHalf, Bs,
+      lid, CAI_CODES_LANES);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = 0; k < TailLen; k++)
+    {
+      const float4 w = convert_float4(cai_codes_load4(P, RowsAligned));
+      P += FNumAs;
+      #pragma unroll
+      for (int b = 0; b < CAI_TILED_COLS; b++)
+        acc[b] = mad(w, (float4)(Bs[b * CAI_TILED_KSTEP + k]), acc[b]);
+    }
+  }
+  cai_codes_store_rows(FNumAs, FNumBs, ActFN, UseBias, R, Bias, FScales, Base,
+    FirstRow, b0, acc, RawPartials);
+}
+
+// Shared by the int8 entry points: one uniform branch picks the 4-byte load
+// instance. BIsHalf and RawPartials are compile-time constants at each caller.
+static inline void cai_codes_int8_launch(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const char* A8,
+  __global const float* Bf, __global const half* Bh, const int BIsHalf,
+  const int StepFirst, const int StepEnd, const int RawPartials,
+  __global float* R, const int UseBias, __global const float* Bias,
+  __global const float* FScales, __local float* Bs)
+{
+  if ((FNumAs & (CAI_CODES_ROWS_PER_LANE - 1)) == 0)
+    cai_codes_int8_body(FNumAs, FNumBs, FSize, ActFN, A8, Bf, Bh, BIsHalf, 1,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales, Bs);
+  else
+    cai_codes_int8_body(FNumAs, FNumBs, FSize, ActFN, A8, Bf, Bh, BIsHalf, 0,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales, Bs);
+}
+
+// The K-steps [*StepFirst, *StepEnd) of split get_group_id(2) of a split-K
+// launch: StepsPerSplit steps each, the last split cut at ceil(FSize/32).
+static inline void cai_codes_split_steps(const int FSize,
+  const int StepsPerSplit, int* StepFirst, int* StepEnd)
+{
+  const int TotalSteps = (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP;
+  *StepFirst = get_group_id(2) * StepsPerSplit;
+  *StepEnd = min(*StepFirst + StepsPerSplit, TotalSteps);
+}
+
+// Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS and
+// FNumAs >= 4. Launch: global (ceil(FNumAs / (4 * CAI_CODES_LANES)) *
+// CAI_CODES_LANES, ceil(FNumBs / CAI_TILED_COLS)), local (CAI_CODES_LANES, 1).
 // Same operands, scale order and fused tail as cai_dot_product_int8; the
 // result differs from it only by float summation order. Coded by Claude (AI).
-__kernel void cai_dot_product_int8_tiled
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled
 (
   const int FNumAs,
   const int FNumBs,
@@ -967,19 +1187,43 @@ __kernel void cai_dot_product_int8_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
-  __local float Bs[CAI_TILED_B_ELEMS];
-  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    FInputBufferBs, 0, 0, 0, (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP,
+    0, FResultBuffer, UseBias, FRowBias, FScales, Bs);
+}
+
+// SPLIT-K twin of cai_dot_product_int8_tiled: group axis 2 is split s; raw sums of its K-steps
+// to FPartialBuffer + s*FNumAs*FNumBs, for cai_dot_product_int8_splitk_reduce. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, 0, FInputBufferAs,
+    FInputBufferBs, 0, 0, StepFirst, StepEnd, 1,
+    FPartialBuffer + get_group_id(2) * FNumAs * FNumBs, 0, 0, 0, Bs);
 }
 
 // HALF-ACTIVATION twin of cai_dot_product_int8_tiled: B is read through
 // vload_half while it is staged, everything after the stage is the same
 // float code. Same accuracy note as cai_dot_product_int8_h. Coded by Claude (AI).
-__kernel void cai_dot_product_int8_tiled_h
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_h
 (
   const int FNumAs,
   const int FNumBs,
@@ -989,27 +1233,211 @@ __kernel void cai_dot_product_int8_tiled_h
   __global const half* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales
 )
 {
-  __local float Bs[CAI_TILED_B_ELEMS];
-  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
-    0, 0, FInputBufferBs, 1, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0,
+    FInputBufferBs, 1, 0, (FSize + CAI_TILED_KSTEP - 1) / CAI_TILED_KSTEP, 0,
+    FResultBuffer, UseBias, FRowBias, FScales, Bs);
+}
+
+// HALF-ACTIVATION twin of cai_dot_product_int8_tiled_splitk; the partials
+// stay FP32. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_h_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int8_launch(FNumAs, FNumBs, FSize, 0, FInputBufferAs, 0,
+    FInputBufferBs, 1, StepFirst, StepEnd, 1,
+    FPartialBuffer + get_group_id(2) * FNumAs * FNumBs, 0, 0, 0, Bs);
+}
+
+// cai_dot_product_tiled with B gathered from the unpadded source FSrc: the
+// same Bs tiles as cai_im2col + cai_dot_product_tiled. Coded by Claude (AI).
+__kernel void cai_conv_implicit_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  const int OutSizeX,
+  const int RowSpan,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int Stride,
+  const int Padding
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
+    Stride, Padding};
+  cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
+}
+
+// Untiled twin of cai_conv_implicit_tiled (same arguments), one work-item per
+// (row, position) as cai_dot_product; sums in k order. Coded by Claude (AI).
+__kernel void cai_conv_implicit
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  const int OutSizeX,
+  const int RowSpan,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int Stride,
+  const int Padding
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
+  const int FeatureSizeX = RowSpan / InDepth;
+  const int FeatureSizeY = FSize / RowSpan;
+  const int oy = b_id / OutSizeX;
+  const int ox = b_id - oy * OutSizeX;
+  const int FirstY = oy * Stride - Padding;
+  const int FirstX = ox * Stride - Padding;
+  const int TapStep = InDepth * FNumAs;
+  // A element (a_id, k) sits at a_id + k * FNumAs.
+  int APos = a_id;
+  float acc = 0.0f;
+  for (int ky = 0; ky < FeatureSizeY; ky++)
+  {
+    const int y = FirstY + ky;
+    const int RowInside = (y >= 0) && (y < InSizeY);
+    for (int kx = 0; kx < FeatureSizeX; kx++)
+    {
+      const int x = FirstX + kx;
+      if (RowInside && (x >= 0) && (x < InSizeX))
+      {
+        const int SrcPos = (y * InSizeX + x) * InDepth;
+        int TapAPos = APos;
+        for (int d = 0; d < InDepth; d++)
+        {
+          acc = mad(FInputBufferAs[TapAPos], FSrc[SrcPos + d], acc);
+          TapAPos += FNumAs;
+        }
+      }
+      APos += TapStep;
+    }
+  }
+  const int ResultPos = b_id * FNumAs + a_id;
+  if (UseBias != 0) acc += FRowBias[a_id];
+  FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
+}
+
+// int4 body: the int8 lane map, one Q4_0 block per K-step (blocks [StepFirst,
+// StepEnd)), weight = (code - 8) * scale; RawPartials as cai_codes_int8_body.
+static inline void cai_codes_int4_body(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const uchar* FPackedAs,
+  __global const float* Bf, const int RowsAligned, const int StepFirst,
+  const int StepEnd, const int RawPartials, __global float* R,
+  const int UseBias, __global const float* Bias,
+  __global const float* FScales, __global const float* FBlockScales,
+  __local float* Bs)
+{
+  const int lid = get_local_id(0);
+  const int FirstRow =
+    get_group_id(0) * (CAI_CODES_LANES * CAI_CODES_ROWS_PER_LANE) +
+    lid * CAI_CODES_ROWS_PER_LANE;
+  const int Base = min(FirstRow, FNumAs - CAI_CODES_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  float4 acc[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) acc[b] = (float4)(0.0f);
+
+  // Pair p = k/2 holds codes k (low nibble) and k+1; one row's pairs are
+  // FNumAs bytes apart and its block scales FNumAs floats apart.
+  __global const uchar* P =
+    FPackedAs + Base + StepFirst * (CAI_TILED_KSTEP / 2) * FNumAs;
+  __global const float* S = FBlockScales + Base + StepFirst * FNumAs;
+  const int MaxBlockPos = StepEnd - 1;
+  for (int blk = StepFirst; blk <= MaxBlockPos; blk++)
+  {
+    uchar4 Pairs[CAI_TILED_KSTEP / 2];
+    #pragma unroll
+    for (int p = 0; p < CAI_TILED_KSTEP / 2; p++)
+    {
+      Pairs[p] = RowsAligned ? *((__global const uchar4*)P) : vload4(0, P);
+      P += FNumAs;
+    }
+    const float4 s = RowsAligned ? *((__global const float4*)S) : vload4(0, S);
+    S += FNumAs;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_tiled_stage_b(FNumBs, FSize, b0, blk * CAI_TILED_KSTEP, Bf, 0, 0, Bs,
+      lid, CAI_CODES_LANES);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int p = 0; p < CAI_TILED_KSTEP / 2; p += 2)
+    {
+      const int4 c0 = convert_int4(Pairs[p]);
+      const int4 c1 = convert_int4(Pairs[p + 1]);
+      cai_codes_mad4(acc, Bs, convert_float4((c0 & 15) - 8) * s,
+        convert_float4((c0 >> 4) - 8) * s, convert_float4((c1 & 15) - 8) * s,
+        convert_float4((c1 >> 4) - 8) * s, 2 * p);
+    }
+  }
+  cai_codes_store_rows(FNumAs, FNumBs, ActFN, UseBias, R, Bias, FScales, Base,
+    FirstRow, b0, acc, RawPartials);
+}
+
+// Used by the int4 entry points; picks the aligned instance as
+// cai_codes_int8_launch.
+static inline void cai_codes_int4_launch(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const uchar* FPackedAs,
+  __global const float* Bf, const int StepFirst, const int StepEnd,
+  const int RawPartials, __global float* R, const int UseBias,
+  __global const float* Bias, __global const float* FScales,
+  __global const float* FBlockScales, __local float* Bs)
+{
+  if ((FNumAs & (CAI_CODES_ROWS_PER_LANE - 1)) == 0)
+    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 1,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales,
+      FBlockScales, Bs);
+  else
+    cai_codes_int4_body(FNumAs, FNumBs, FSize, ActFN, FPackedAs, Bf, 0,
+      StepFirst, StepEnd, RawPartials, R, UseBias, Bias, FScales,
+      FBlockScales, Bs);
 }
 
 // Q4_0 WEIGHT twin of cai_dot_product_int8_tiled: same tile, same launch
 // geometry, same fused tail (FScales is the row of 1.0 PrepareForComputeInt4
 // uploads). The A operand is the interleaved packed layout of
 // cai_dot_product_int4_splitk (FPackedAs[a + p*FNumAs], p = k/2, low nibble
-// = code k, high = code k+1, +8 biased; FBlockScales[a + blk*FNumAs]). A
-// K-step is one block, so each lane loads one block scale per row per step
-// and applies it to the code before the multiply-add: the dequantized weight
-// (code - 8) * scale, which is what the FP32 oracle multiplies, rather than
-// the block-sum-then-scale of pass 1 - a difference of float rounding order
-// only. FSize is a multiple of 32 (the PrepareForComputeInt4 invariant), so
-// no step is ragged along k. Coded by Claude (AI).
-__kernel void cai_dot_product_int4_tiled
+// = code k, high = code k+1, +8 biased; FBlockScales[a + blk*FNumAs]). The
+// dequantize-then-multiply order differs from pass 1's block-sum-then-scale
+// by float rounding order only. FSize is a multiple of 32 (the
+// PrepareForComputeInt4 invariant), so no step is ragged. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int4_tiled
 (
   const int FNumAs,
   const int FNumBs,
@@ -1019,65 +1447,381 @@ __kernel void cai_dot_product_int4_tiled
   __global const float* FInputBufferBs,
   __global float* FResultBuffer,
   const int UseBias,
-  __global const float* FBiasOutput,
+  __global const float* FRowBias,
   __global const float* FScales,
   __global const float* FBlockScales
 )
 {
-  __local float Bs[CAI_TILED_B_ELEMS];
-  const int lid = get_local_id(0);
-  const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
-  const int b0 = get_group_id(1) * CAI_TILED_COLS;
-  const int MaxRow = FNumAs - 1;
-  const int row0 = min(a0 + lid, MaxRow);
-  const int row1 = min(a0 + lid + CAI_TILED_LANES, MaxRow);
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  cai_codes_int4_launch(FNumAs, FNumBs, FSize, ActFN, FPackedAs,
+    FInputBufferBs, 0, FSize / CAI_TILED_KSTEP, 0, FResultBuffer, UseBias,
+    FRowBias, FScales, FBlockScales, Bs);
+} // end of kernel
 
-  float acc0[CAI_TILED_COLS];
-  float acc1[CAI_TILED_COLS];
-  #pragma unroll
-  for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
+// Q4_0 twin of cai_dot_product_int8_tiled_splitk; the partials carry the block
+// scales, so the merge applies FScales' row of 1.0. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_CODES_LANES, 1, 1)))
+void cai_dot_product_int4_tiled_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int StepsPerSplit,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer,
+  __global const float* FBlockScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
+  int StepFirst, StepEnd;
+  cai_codes_split_steps(FSize, StepsPerSplit, &StepFirst, &StepEnd);
+  cai_codes_int4_launch(FNumAs, FNumBs, FSize, 0, FPackedAs, FInputBufferBs,
+    StepFirst, StepEnd, 1, FPartialBuffer + get_group_id(2) * FNumAs * FNumBs,
+    0, 0, 0, FBlockScales, Bs);
+} // end of kernel
 
-  const int PairStep2 = 2 * FNumAs;
-  int blk = 0;
-  for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP, blk++)
+// BLOCK GRID of the code kernels (the _block entry points): a work-group of
+// CAI_BLOCK_LANES lanes owns CAI_BLOCK_ROWS rows x CAI_BLOCK_COLS columns, so a
+// weight crosses the memory system once per 128 columns instead of once per 16.
+// Per K-step of CAI_TILED_KSTEP the work-group stages the A tile, dequantized
+// to float (As[k][row], 16 KB), and the B tile (Bs[k][col], 16.5 KB) in local
+// memory; each lane then reads 2 float4 of A and 2 float4 of B per k from
+// local and does 64 multiply-adds into its 8 rows x 8 columns (64 float
+// accumulators). 32.5 KB of local memory per work-group leaves no room for a
+// second stage under the 48 KB limit, so the next step's global loads go to
+// registers before the multiply-adds (about 20 registers) and land in local
+// memory after them. Register estimate per lane: 64 accumulators + 16 operands
+// + 20-22 staged loads + addresses, about 115, so two work-groups fit an SM of
+// 64K registers.
+//
+// Lane maps (shifts and masks of the lane id only):
+// - A stage: row quad lid & 31 (4 rows, one 4-byte code load, read from
+//   min(row, FNumAs-4) as cai_codes_int8_body), K lanes lid >> 5 + 8j; a warp
+//   stores 32 consecutive float4, no bank conflict.
+// - B stage: column lid >> 1, float4 j at k = (lid & 1)*4 + 8j (a lane pair
+//   reads 32 contiguous bytes of a column); the 4-float row padding of Bs puts
+//   the pair's scalar stores 16 banks apart.
+// - Multiply-add: rows 4*(lid & 15) + {0..3, 64..67}, columns 4*(lid >> 4) +
+//   {0..3, 64..67}; a warp reads 16 A float4 and 2 broadcast B float4 per k.
+// Ragged edges: a row quad past FNumAs-4 stages rows FNumAs-4..FNumAs-1 and
+// stores only its own; columns past FNumBs and k past FSize (the int8 tail)
+// stage zeros. The scale/bias/activation tail is cai_codes_store_col4.
+#define CAI_BLOCK_LANES 256
+#define CAI_BLOCK_ROWS 128
+#define CAI_BLOCK_COLS 128
+#define CAI_BLOCK_HALF 64
+#define CAI_BLOCK_A_STRIDE CAI_BLOCK_ROWS
+#define CAI_BLOCK_B_STRIDE (CAI_BLOCK_COLS + 4)
+#define CAI_BLOCK_A_ELEMS (CAI_TILED_KSTEP * CAI_BLOCK_A_STRIDE)
+#define CAI_BLOCK_B_ELEMS (CAI_TILED_KSTEP * CAI_BLOCK_B_STRIDE)
+
+// The lane maps above are written out for these values (lid & 31 row quads x
+// lid >> 5 K lanes, lid >> 1 columns, 16 x 16 multiply-add lanes).
+#if (CAI_BLOCK_LANES != 256) || (CAI_TILED_KSTEP != 32) || (CAI_BLOCK_ROWS != 128) || (CAI_BLOCK_COLS != 128)
+#error "the _block lane maps need CAI_BLOCK_LANES 256, CAI_TILED_KSTEP 32 and 128x128 tiles"
+#endif
+
+// B element (column ColPos / FSize, reduction k), or 0 past FSize or when the
+// column is not Valid. BIsHalf is a compile-time constant at every call site.
+static inline float cai_block_b1(__global const float* Bf,
+  __global const half* Bh, const int BIsHalf, const int FSize,
+  const int ColPos, const int k, const int Valid)
+{
+  if (!(Valid && (k < FSize))) return 0.0f;
+  return BIsHalf ? vload_half(ColPos + k, Bh) : Bf[ColPos + k];
+}
+
+// Global loads of this lane's 16 B elements of the K-step at k0 into Reg.
+static inline void cai_block_load_b(__global const float* Bf,
+  __global const half* Bh, const int BIsHalf, const int FNumBs,
+  const int FSize, const int b0, const int k0, const int lid, float4* Reg)
+{
+  const int gb = b0 + (lid >> 1);
+  const int Valid = gb < FNumBs;
+  const int ColPos = min(gb, FNumBs - 1) * FSize;
+  const int kLane = k0 + ((lid & 1) << 2);
+  if ((FSize & 3) == 0)
   {
-    barrier(CLK_LOCAL_MEM_FENCE);
-    cai_tiled_stage_b(FNumBs, FSize, b0, k0, FInputBufferBs, Bs, lid);
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    const float s0 = FBlockScales[row0 + blk * FNumAs];
-    const float s1 = FBlockScales[row1 + blk * FNumAs];
-    // Pair p = k/2 = 16*blk is the block's first packed byte; the block's 16
-    // bytes of one row are FNumAs apart.
-    __global const uchar* P0 = FPackedAs + row0 + (blk << 4) * FNumAs;
-    __global const uchar* P1 = FPackedAs + row1 + (blk << 4) * FNumAs;
+    // Each float4 lies wholly inside or past FSize and is 16-byte aligned.
     #pragma unroll
-    for (int k = 0; k < CAI_TILED_KSTEP; k += 4)
+    for (int j = 0; j < 4; j++)
     {
-      const int p00 = P0[0];
-      const int p01 = P0[FNumAs];
-      const int p10 = P1[0];
-      const int p11 = P1[FNumAs];
-      P0 += PairStep2;
-      P1 += PairStep2;
-      const float w00 = convert_float((p00 & 15) - 8) * s0;
-      const float w01 = convert_float((p00 >> 4) - 8) * s0;
-      const float w02 = convert_float((p01 & 15) - 8) * s0;
-      const float w03 = convert_float((p01 >> 4) - 8) * s0;
-      const float w10 = convert_float((p10 & 15) - 8) * s1;
-      const float w11 = convert_float((p10 >> 4) - 8) * s1;
-      const float w12 = convert_float((p11 & 15) - 8) * s1;
-      const float w13 = convert_float((p11 >> 4) - 8) * s1;
-      cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
-      cai_tiled_mad4(acc1, Bs, w10, w11, w12, w13, k);
+      const int k = kLane + 8 * j;
+      if (Valid && (k < FSize))
+        Reg[j] = BIsHalf ? vloada_half4((ColPos + k) >> 2, Bh)
+          : *((__global const float4*)(Bf + ColPos + k));
+      else Reg[j] = (float4)(0.0f);
+    }
+  }
+  else
+  {
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+      const int k = kLane + 8 * j;
+      Reg[j] = (float4)(cai_block_b1(Bf, Bh, BIsHalf, FSize, ColPos, k, Valid),
+        cai_block_b1(Bf, Bh, BIsHalf, FSize, ColPos, k + 1, Valid),
+        cai_block_b1(Bf, Bh, BIsHalf, FSize, ColPos, k + 2, Valid),
+        cai_block_b1(Bf, Bh, BIsHalf, FSize, ColPos, k + 3, Valid));
+    }
+  }
+}
+
+// Stores cai_block_load_b's Reg as Bs[k][column]. The caller owns the barriers.
+static inline void cai_block_store_b(__local float* Bs, const float4* Reg,
+  const int lid)
+{
+  __local float* Dst = Bs + ((lid & 1) << 2) * CAI_BLOCK_B_STRIDE + (lid >> 1);
+  #pragma unroll
+  for (int j = 0; j < 4; j++)
+  {
+    Dst[0] = Reg[j].s0;
+    Dst[CAI_BLOCK_B_STRIDE] = Reg[j].s1;
+    Dst[2 * CAI_BLOCK_B_STRIDE] = Reg[j].s2;
+    Dst[3 * CAI_BLOCK_B_STRIDE] = Reg[j].s3;
+    Dst += 8 * CAI_BLOCK_B_STRIDE;
+  }
+}
+
+// Global loads of the lane's A codes of the K-step at k0: int8 at k0 + (lid >> 5)
+// + 8j (zero past FSize), or int4 pairs k0/2 + (lid >> 5) + 8j and block scales.
+static inline void cai_block_load_a(__global const char* A8,
+  __global const uchar* A4, __global const float* FBlockScales,
+  const int AIsInt4, const int RowsAligned, const int FNumAs, const int FSize,
+  const int Base, const int k0, const int lid, char4* Codes8, uchar4* Pairs4,
+  float4* BlockScale)
+{
+  if (AIsInt4)
+  {
+    __global const uchar* P = A4 + Base + ((k0 >> 1) + (lid >> 5)) * FNumAs;
+    #pragma unroll
+    for (int j = 0; j < 2; j++)
+      Pairs4[j] = RowsAligned ? *((__global const uchar4*)(P + 8 * j * FNumAs))
+        : vload4(0, P + 8 * j * FNumAs);
+    __global const float* S = FBlockScales + Base + (k0 >> 5) * FNumAs;
+    *BlockScale = RowsAligned ? *((__global const float4*)S) : vload4(0, S);
+  }
+  else
+  {
+    const int kLane = k0 + (lid >> 5);
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+      const int k = kLane + 8 * j;
+      Codes8[j] = (k < FSize)
+        ? cai_codes_load4(A8 + Base + k * FNumAs, RowsAligned) : (char4)(0);
+    }
+  }
+}
+
+// Stores cai_block_load_a's registers as float weights As[k][row].
+static inline void cai_block_store_a(__local float* As, const int AIsInt4,
+  const char4* Codes8, const uchar4* Pairs4, const float4 BlockScale,
+  const int lid)
+{
+  __local float* Dst = As + ((lid & 31) << 2);
+  if (AIsInt4)
+  {
+    #pragma unroll
+    for (int j = 0; j < 2; j++)
+    {
+      const int4 c = convert_int4(Pairs4[j]);
+      const int k = 2 * ((lid >> 5) + 8 * j);
+      *((__local float4*)(Dst + k * CAI_BLOCK_A_STRIDE)) =
+        convert_float4((c & 15) - 8) * BlockScale;
+      *((__local float4*)(Dst + (k + 1) * CAI_BLOCK_A_STRIDE)) =
+        convert_float4((c >> 4) - 8) * BlockScale;
+    }
+  }
+  else
+  {
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      *((__local float4*)(Dst + ((lid >> 5) + 8 * j) * CAI_BLOCK_A_STRIDE)) =
+        convert_float4(Codes8[j]);
+  }
+}
+
+// Columns Col (0..7 of the lane) times the lane's two row quads a0/a1.
+#define CAI_BLOCK_MAD_COL(Col, BValue) \
+  acc[2 * (Col)] = mad(a0, (float4)(BValue), acc[2 * (Col)]); \
+  acc[2 * (Col) + 1] = mad(a1, (float4)(BValue), acc[2 * (Col) + 1]);
+
+// Block body of the three _block entry points; AIsInt4, BIsHalf and
+// RowsAligned are compile-time constants at every call site. Coded by Claude (AI).
+static inline void cai_block_body(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const char* A8,
+  __global const uchar* A4, __global const float* FBlockScales,
+  const int AIsInt4, __global const float* Bf, __global const half* Bh,
+  const int BIsHalf, const int RowsAligned, __global float* R,
+  const int UseBias, __global const float* Bias,
+  __global const float* FScales, __local float* As, __local float* Bs)
+{
+  const int lid = get_local_id(0);
+  const int a0Tile = get_group_id(0) * CAI_BLOCK_ROWS;
+  const int b0 = get_group_id(1) * CAI_BLOCK_COLS;
+  const int StageBase = min(a0Tile + ((lid & 31) << 2),
+    FNumAs - CAI_CODES_ROWS_PER_LANE);
+  const int RowLane = (lid & 15) << 2;
+  const int ColLane = (lid >> 4) << 2;
+  float4 acc[16];
+  #pragma unroll
+  for (int i = 0; i < 16; i++) acc[i] = (float4)(0.0f);
+
+  char4 Codes8[4];
+  uchar4 Pairs4[2];
+  float4 BlockScale = (float4)(0.0f);
+  float4 BReg[4];
+  cai_block_load_a(A8, A4, FBlockScales, AIsInt4, RowsAligned, FNumAs, FSize,
+    StageBase, 0, lid, Codes8, Pairs4, &BlockScale);
+  cai_block_load_b(Bf, Bh, BIsHalf, FNumBs, FSize, b0, 0, lid, BReg);
+  const int MaxStepPos = (FSize - 1) / CAI_TILED_KSTEP;
+  for (int step = 0; step <= MaxStepPos; step++)
+  {
+    // The previous step's reads must finish before the tiles are overwritten.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_block_store_a(As, AIsInt4, Codes8, Pairs4, BlockScale, lid);
+    cai_block_store_b(Bs, BReg, lid);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // The next step's loads fly during this step's multiply-adds.
+    if (step < MaxStepPos)
+    {
+      const int kNext = (step + 1) * CAI_TILED_KSTEP;
+      cai_block_load_a(A8, A4, FBlockScales, AIsInt4, RowsAligned, FNumAs,
+        FSize, StageBase, kNext, lid, Codes8, Pairs4, &BlockScale);
+      cai_block_load_b(Bf, Bh, BIsHalf, FNumBs, FSize, b0, kNext, lid, BReg);
+    }
+    #pragma unroll
+    for (int k = 0; k < CAI_TILED_KSTEP; k++)
+    {
+      __local const float* ARow = As + k * CAI_BLOCK_A_STRIDE + RowLane;
+      __local const float* BRow = Bs + k * CAI_BLOCK_B_STRIDE + ColLane;
+      const float4 a0 = *((__local const float4*)ARow);
+      const float4 a1 = *((__local const float4*)(ARow + CAI_BLOCK_HALF));
+      const float4 b0v = *((__local const float4*)BRow);
+      const float4 b1v = *((__local const float4*)(BRow + CAI_BLOCK_HALF));
+      CAI_BLOCK_MAD_COL(0, b0v.s0)
+      CAI_BLOCK_MAD_COL(1, b0v.s1)
+      CAI_BLOCK_MAD_COL(2, b0v.s2)
+      CAI_BLOCK_MAD_COL(3, b0v.s3)
+      CAI_BLOCK_MAD_COL(4, b1v.s0)
+      CAI_BLOCK_MAD_COL(5, b1v.s1)
+      CAI_BLOCK_MAD_COL(6, b1v.s2)
+      CAI_BLOCK_MAD_COL(7, b1v.s3)
     }
   }
 
-  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, FScales[row0], a0 + lid, b0, acc0);
-  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FBiasOutput, FScales[row1], a0 + lid + CAI_TILED_LANES, b0, acc1);
-} // end of kernel
+  // acc[2c + h]: column c of the lane (ColLane + (c & 3) + 64*(c >> 2)), row
+  // quad h (RowLane + 64*h).
+  #pragma unroll
+  for (int h = 0; h < 2; h++)
+  {
+    const int FirstRow = a0Tile + RowLane + h * CAI_BLOCK_HALF;
+    if (FirstRow < FNumAs)
+    {
+      const int Base = min(FirstRow, FNumAs - CAI_CODES_ROWS_PER_LANE);
+      const float4 RowScale = vload4(0, FScales + Base);
+      const float4 RowBias = (UseBias != 0) ? vload4(0, Bias + Base)
+        : (float4)(0.0f);
+      #pragma unroll
+      for (int c = 0; c < 8; c++)
+      {
+        const int gb = b0 + ColLane + (c & 3) + (c >> 2) * CAI_BLOCK_HALF;
+        if (gb < FNumBs)
+          cai_codes_store_col4(FNumAs, ActFN, UseBias, R, RowScale, RowBias,
+            Base, FirstRow, gb, acc[2 * c + h]);
+      }
+    }
+  }
+}
+
+// Shared by the three _block entry points: one uniform branch picks the
+// 4-byte load instance, as cai_codes_int8_launch.
+static inline void cai_block_launch(const int FNumAs, const int FNumBs,
+  const int FSize, const int ActFN, __global const char* A8,
+  __global const uchar* A4, __global const float* FBlockScales,
+  const int AIsInt4, __global const float* Bf, __global const half* Bh,
+  const int BIsHalf, __global float* R, const int UseBias,
+  __global const float* Bias, __global const float* FScales,
+  __local float* As, __local float* Bs)
+{
+  if ((FNumAs & (CAI_CODES_ROWS_PER_LANE - 1)) == 0)
+    cai_block_body(FNumAs, FNumBs, FSize, ActFN, A8, A4, FBlockScales, AIsInt4,
+      Bf, Bh, BIsHalf, 1, R, UseBias, Bias, FScales, As, Bs);
+  else
+    cai_block_body(FNumAs, FNumBs, FSize, ActFN, A8, A4, FBlockScales, AIsInt4,
+      Bf, Bh, BIsHalf, 0, R, UseBias, Bias, FScales, As, Bs);
+}
+
+// cai_dot_product_int8_tiled on the block grid. Launch: global (ceil(FNumAs /
+// 128) * 256, ceil(FNumBs / 128)), local (256, 1). Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_BLOCK_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_block
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  __global const float* FScales
+)
+{
+  __local float As[CAI_BLOCK_A_ELEMS] __attribute__((aligned(16)));
+  __local float Bs[CAI_BLOCK_B_ELEMS] __attribute__((aligned(16)));
+  cai_block_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0, 0, 0,
+    FInputBufferBs, 0, 0, FResultBuffer, UseBias, FRowBias, FScales, As, Bs);
+}
+
+// cai_dot_product_int8_tiled_h on the block grid. Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_BLOCK_LANES, 1, 1)))
+void cai_dot_product_int8_tiled_h_block
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  __global const float* FScales
+)
+{
+  __local float As[CAI_BLOCK_A_ELEMS] __attribute__((aligned(16)));
+  __local float Bs[CAI_BLOCK_B_ELEMS] __attribute__((aligned(16)));
+  cai_block_launch(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs, 0, 0, 0, 0,
+    FInputBufferBs, 1, FResultBuffer, UseBias, FRowBias, FScales, As, Bs);
+}
+
+// cai_dot_product_int4_tiled on the block grid (FSize a multiple of 32: one
+// Q4_0 block per K-step). Coded by Claude (AI).
+__kernel __attribute__((reqd_work_group_size(CAI_BLOCK_LANES, 1, 1)))
+void cai_dot_product_int4_tiled_block
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  __global const float* FScales,
+  __global const float* FBlockScales
+)
+{
+  __local float As[CAI_BLOCK_A_ELEMS] __attribute__((aligned(16)));
+  __local float Bs[CAI_BLOCK_B_ELEMS] __attribute__((aligned(16)));
+  cai_block_launch(FNumAs, FNumBs, FSize, ActFN, 0, FPackedAs, FBlockScales, 1,
+    FInputBufferBs, 0, 0, FResultBuffer, UseBias, FRowBias, FScales, As, Bs);
+}
 
 __kernel void cai_dot_product2
 (
@@ -2317,7 +3061,7 @@ __kernel void cai_softmax
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
-// 24 = ReLUL.
+// 24 = ReLUL, 25 = AddConstant.
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -2416,6 +3160,9 @@ __kernel void cai_activation
       if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
       else if (x > FParamA) y = x;
       else y = FParamA + (x - FParamA) * FParamC;
+      break;
+    case 25: // AddConstant: x + c. FParamA = c.
+      y = x + FParamA;
       break;
     default: // csActNone / unknown: pass through
       y = x;
@@ -3322,264 +4069,536 @@ __kernel void cai_sdpa_decode_merge
   }
 }
 
-// Query rows, key rows and float4 columns of one lane's tile slots; mirrored
-// by csFusedSDPA{QueryRows,KeyRows,ColumnVecs}PerLane in neuralnetwork.pas.
-#define CAI_NC_ROW_SLOTS 3
-#define CAI_NC_KEY_SLOTS 2
-#define CAI_NC_COL_VECS 2
-
-// A lane's tile row, key row and first column for slot i/j, recomputed at each
-// use: kept in private int arrays across barriers, PoCL got the rows wrong.
-#define CAI_NC_ROW_LIVE(i) (ly + (i) * LY < RowsLive)
-#define CAI_NC_ROW(i) min(ly + (i) * LY, RowsLive - 1)
-#define CAI_NC_KEY(j) (lx + (j) * LX)
-#define CAI_NC_COL(j) (Col0 + 4 * (lx + (j) * LX))
-
 // acc + dot(a, b) as four chained mads.
-static inline float cai_nc_mad_dot4(const float4 a, const float4 b,
+static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
   const float acc)
 {
   return mad(a.s3, b.s3, mad(a.s2, b.s2,
     mad(a.s1, b.s1, mad(a.s0, b.s0, acc))));
 }
 
-// Stages Tile[0..PadRows) x [0..PadCols) from Src, zero past RowsLive rows
-// and Cols columns. The caller owns the barriers.
-static inline void cai_nc_stage(__global const float* Src, const int SrcStride,
-  const int RowsLive, const int PadRows, const int Cols, const int PadCols,
-  __local float* Tile, const int TileStride, const int lx, const int ly,
-  const int LX, const int LY)
+// FLASH ATTENTION OVER THE KV CACHE (TNNetFusedSDPA): the arguments of
+// cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
+// arguments (FColChunk: output columns per work-group, a multiple of 4 up to
+// 256; FKeySplits > 1 writes partials).
+#define CAI_FLASH_LEADING_PARAMS \
+  const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
+  const int FDk, const int FCacheMax, const int FKeyBase, \
+  const int FMaskMode, const int FWindow, const int FKeySplits, \
+  const int FSplitKeys, const int FSpanBase, const int FColChunk, \
+  const int FXStride, const int FYStride, const float FInvSqrtDk, \
+  const float FScoreSoftCap, const float FInvScoreSoftCap, \
+  __global const float* FX, __global const int* FRowKeyEnds
+#define CAI_FLASH_TRAILING_PARAMS \
+  __global float* FY, __global float* FPartials, __local float4* FScratch
+
+// Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
+// only: PoCL miscompiles a lane id divided by a run-time value.
+#define CAI_FLASH_KEY_LANE(lid) (((lid) & 7) | (((lid) >> 2) & 8))
+#define CAI_FLASH_ROW_LANE(lid) ((((lid) >> 3) & 3) | (((lid) >> 6) << 2))
+
+// Token row t's cache rows [lo, hi): hi = FKeyBase + (FTokenCnt, t + 1 or
+// FRowKeyEnds[t]) by FMaskMode 0/1/2; lo = max(0, hi - FWindow) if FWindow > 0.
+static inline int2 cai_flash_key_range(const int t, const int FTokenCnt,
+  const int FKeyBase, const int FMaskMode, const int FWindow,
+  __global const int* FRowKeyEnds)
 {
-  for (int r = ly; r < PadRows; r += LY)
-    for (int d = lx; d < PadCols; d += LX)
-      Tile[r * TileStride + d] =
-        ((r < RowsLive) && (d < Cols)) ? Src[r * SrcStride + d] : 0.0f;
+  const int KeyHi = FKeyBase + ((FMaskMode == 1) ? (t + 1)
+    : ((FMaskMode == 2) ? FRowKeyEnds[t] : FTokenCnt));
+  return (int2)((FWindow > 0) ? max(0, KeyHi - FWindow) : 0, KeyHi);
 }
 
-// NON-CAUSAL TILED CACHED ATTENTION, FP32 KV CACHE (TNNetFusedSDPA,
-// CachedForwardNonCausal). One work-group per (query head h, query tile of
-// FQueryTileRows rows, chunk of 4*LX*CAI_NC_COL_VECS output columns): dimension
-// 1 carries (h*QueryTiles + tile)*ColChunks + chunk; every chunk recomputes the
-// scores. All rows attend cache rows [FKeyStart, FKeyEnd) of KV head
-// h / FGroupSize in key tiles of FKeyTileRows by online softmax (running max m,
-// sum l and output O, rescaled by exp(m - m') when m grows; O / l, or 0 when
-// l = 0), scores scaled and soft-capped as in cai_sdpa_decode_split.
-// Each lane keeps the scores and O of its slots in registers; a slot out of
-// range reads a clamped live index and drops its result, so every barrier sits
-// in uniform control flow. Every lane of a row reads all LX row-max partials,
-// so the lanes agree bitwise on m; l is reduced the same way once, at the end.
-// FScratch: R*(Dk4+4) + C4*(Dk4+4) + R*(C4+4) + R*LX floats (query, K-then-V
-// and probability tiles, row partials; Dk4, C4 = FDk, FKeyTileRows rounded up
-// to 4); the 4-float row padding spreads float4 reads over the banks.
-// Coded by Claude (AI).
-__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void cai_sdpa_noncausal_tiled
-(
-  const int FQHeads,
-  const int FGroupSize,
-  const int FTokenCnt,
-  const int FQueryTileRows,
-  const int FKeyTileRows,
-  const int FDk,
-  const int FCacheMax,
-  const int FKeyStart,
-  const int FKeyEnd,
-  const int FXStride,
-  const int FYStride,
-  const float FInvSqrtDk,
-  const float FScoreSoftCap,
-  const float FInvScoreSoftCap,
-  __global const float* FX,
-  __global const float* FKCache,
-  __global const float* FVCache,
-  __global float* FY,
-  __local float* FScratch
-)
+// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, out
+// offset (Y, or split Split's partial acc[0]), lo and hi tables; dead: -1, -1, 0, 0.
+static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
+  const int r, const int Row0, const int g, const int Split,
+  const int FKeySplits, const int FGroupSize, const int FTokenCnt,
+  const int FDk, const int FXStride, const int FYStride, const int FKeyBase,
+  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
 {
-  const int lx = get_local_id(0);
-  const int ly = get_local_id(1);
-  const int LX = get_local_size(0);
-  const int LY = get_local_size(1);
-  const int gid = get_group_id(1);
-  int i, j, e, d4, c4, kt;
-  const int Dk4 = (FDk + 3) & ~3;
-  const int ChunkCols = 4 * LX * CAI_NC_COL_VECS;
-  const int ColChunks = (Dk4 + ChunkCols - 1) / ChunkCols;
-  const int QueryTiles = (FTokenCnt + FQueryTileRows - 1) / FQueryTileRows;
-  const int TileId = gid / ColChunks;
-  const int h = TileId / QueryTiles;
-  if (h >= FQHeads) return;
-  const int Col0 = (gid - TileId * ColChunks) * ChunkCols;
-  const int Row0 = (TileId - h * QueryTiles) * FQueryTileRows;
-  const int RowsLive = min(FQueryTileRows, FTokenCnt - Row0);
-  const int KeyTile4 = (FKeyTileRows + 3) & ~3;
-  const int TileStride = Dk4 + 4;
-  const int SRowStride = KeyTile4 + 4;
-  const int MaxDk4Pos = (Dk4 >> 2) - 1;
-
-  __local float* qTile = FScratch;
-  __local float* kvTile = qTile + FQueryTileRows * TileStride;
-  __local float* sTile = kvTile + KeyTile4 * TileStride;
-  __local float* rowPart = sTile + FQueryTileRows * SRowStride;
-
-  float4 o[CAI_NC_ROW_SLOTS][CAI_NC_COL_VECS];
-  float m[CAI_NC_ROW_SLOTS], l[CAI_NC_ROW_SLOTS];
-  #pragma unroll
-  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+  int t = Row0 / FGroupSize;
+  int q = Row0 - t * FGroupSize + r;
+  while (q >= FGroupSize)
   {
-    m[i] = -1e30f;
-    l[i] = 0.0f;
-    #pragma unroll
-    for (j = 0; j < CAI_NC_COL_VECS; j++) o[i][j] = (float4)(0.0f);
+    q -= FGroupSize;
+    t++;
   }
-
-  const int plane = (h / FGroupSize) * FCacheMax * FDk;
-  cai_nc_stage(FX + Row0 * FXStride + h * FDk, FXStride, RowsLive, RowsLive,
-    FDk, Dk4, qTile, TileStride, lx, ly, LX, LY);
-
-  for (kt = FKeyStart; kt < FKeyEnd; kt += FKeyTileRows)
+  int XOffset = -1, YOffset = -1;
+  int2 KeyRange = (int2)(0, 0);
+  if (t < FTokenCnt)
   {
-    const int KeysLive = min(FKeyTileRows, FKeyEnd - kt);
-    // The previous tile's P.V reads (and, first time round, the query load)
-    // are finished before the K tile overwrites the shared tile.
-    barrier(CLK_LOCAL_MEM_FENCE);
-    cai_nc_stage(FKCache + plane + kt * FDk, FDk, KeysLive, KeyTile4, FDk, Dk4,
-      kvTile, TileStride, lx, ly, LX, LY);
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    float s[CAI_NC_ROW_SLOTS][CAI_NC_KEY_SLOTS];
-    #pragma unroll
-    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-      #pragma unroll
-      for (j = 0; j < CAI_NC_KEY_SLOTS; j++) s[i][j] = 0.0f;
-    for (d4 = 0; d4 <= MaxDk4Pos; d4++)
-    {
-      float4 qv[CAI_NC_ROW_SLOTS], kv[CAI_NC_KEY_SLOTS];
-      #pragma unroll
-      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-        qv[i] = vload4(d4, qTile + CAI_NC_ROW(i) * TileStride);
-      #pragma unroll
-      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
-        kv[j] = vload4(d4,
-          kvTile + min(CAI_NC_KEY(j), KeysLive - 1) * TileStride);
-      #pragma unroll
-      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-        #pragma unroll
-        for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
-          s[i][j] = cai_nc_mad_dot4(qv[i], kv[j], s[i][j]);
-    }
-    #pragma unroll
-    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-    {
-      float PartMax = -1e30f;
-      #pragma unroll
-      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
-      {
-        float sc = s[i][j] * FInvSqrtDk;
-        if (FScoreSoftCap > 0.0f)
-          sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
-        s[i][j] = (CAI_NC_KEY(j) < KeysLive) ? sc : -1e30f;
-        PartMax = fmax(PartMax, s[i][j]);
-      }
-      if (CAI_NC_ROW_LIVE(i)) rowPart[CAI_NC_ROW(i) * LX + lx] = PartMax;
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Every K read is done: the V tile replaces it while each lane folds the
-    // row partials into its running max. Exponents stay in [-80, 0] (PoCL's exp
-    // traps on large ones); the first tile's exp(-80) meets l = 0 and O = 0.
-    cai_nc_stage(FVCache + plane + kt * FDk, FDk, KeysLive, KeyTile4, FDk, Dk4,
-      kvTile, TileStride, lx, ly, LX, LY);
-    #pragma unroll
-    for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-    {
-      __local const float* part = rowPart + CAI_NC_ROW(i) * LX;
-      float TileMax = m[i];
-      for (e = 0; e < LX; e += 4)
-      {
-        const float4 pm = vload4(0, part + e);
-        TileMax = fmax(TileMax, fmax(fmax(pm.s0, pm.s1), fmax(pm.s2, pm.s3)));
-      }
-      const float RowRescale = exp(fmax(m[i] - TileMax, -80.0f));
-      m[i] = TileMax;
-      float TileSum = 0.0f;
-      #pragma unroll
-      for (j = 0; j < CAI_NC_KEY_SLOTS; j++)
-      {
-        const float p = (CAI_NC_KEY(j) < KeysLive)
-          ? exp(clamp(s[i][j] - TileMax, -80.0f, 0.0f)) : 0.0f;
-        TileSum += p;
-        if (CAI_NC_ROW_LIVE(i) && (CAI_NC_KEY(j) < KeyTile4))
-          sTile[CAI_NC_ROW(i) * SRowStride + CAI_NC_KEY(j)] = p;
-      }
-      l[i] = mad(l[i], RowRescale, TileSum);
-      #pragma unroll
-      for (j = 0; j < CAI_NC_COL_VECS; j++) o[i][j] *= RowRescale;
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Keys from KeysLive to the next multiple of 4 have p = 0 and a zero V row.
-    const int MaxKey4Pos = ((KeysLive + 3) >> 2) - 1;
-    for (c4 = 0; c4 <= MaxKey4Pos; c4++)
-    {
-      float4 p4[CAI_NC_ROW_SLOTS];
-      #pragma unroll
-      for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-        p4[i] = vload4(c4, sTile + CAI_NC_ROW(i) * SRowStride);
-      __local const float* vrows = kvTile + (c4 << 2) * TileStride;
-      #pragma unroll
-      for (e = 0; e < 4; e++)
-        #pragma unroll
-        for (j = 0; j < CAI_NC_COL_VECS; j++)
-        {
-          const float4 v =
-            vload4(0, vrows + e * TileStride + min(CAI_NC_COL(j), Dk4 - 4));
-          #pragma unroll
-          for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-          {
-            const float p = (e == 0) ? p4[i].s0 : (e == 1) ? p4[i].s1
-                          : (e == 2) ? p4[i].s2 : p4[i].s3;
-            o[i][j] = mad((float4)(p), v, o[i][j]);
-          }
-        }
-    }
+    const int h = g * FGroupSize + q;
+    XOffset = t * FXStride + h * FDk;
+    YOffset = (FKeySplits > 1)
+      ? ((h * FTokenCnt + t) * FKeySplits + Split) * (FDk + 2) + 2
+      : t * FYStride + h * FDk;
+    KeyRange = cai_flash_key_range(t, FTokenCnt, FKeyBase, FMaskMode, FWindow,
+      FRowKeyEnds);
   }
+  RowTable[r] = XOffset;
+  RowTable[Br + r] = YOffset;
+  RowTable[2 * Br + r] = KeyRange.x;
+  RowTable[3 * Br + r] = KeyRange.y;
+}
 
-  // rowPart was last read before the final P.V barrier, so it is free here.
-  #pragma unroll
-  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
-    if (CAI_NC_ROW_LIVE(i)) rowPart[CAI_NC_ROW(i) * LX + lx] = l[i];
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  __global float* ydst = FY + Row0 * FYStride + h * FDk;
-  #pragma unroll
-  for (i = 0; i < CAI_NC_ROW_SLOTS; i++)
+// Min lo, max hi, max lo and min hi over the tile's live rows; every lane
+// computes them alike, so the key loop bounds are uniform.
+static inline int4 cai_flash_tile_bounds(const int Br, const int Row0,
+  const int FGroupSize, const int FTokenCnt, const int FKeyBase,
+  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+{
+  const int FirstToken = Row0 / FGroupSize;
+  const int LastToken =
+    (min(Row0 + Br, FTokenCnt * FGroupSize) - 1) / FGroupSize;
+  int4 Bounds = (int4)(0x7fffffff, 0, 0, 0x7fffffff);
+  for (int t = FirstToken; t <= LastToken; t++)
   {
-    if (!CAI_NC_ROW_LIVE(i)) continue;
-    __local const float* part = rowPart + CAI_NC_ROW(i) * LX;
-    float RowTotal = 0.0f;
-    for (e = 0; e < LX; e += 4)
+    const int2 KeyRange = cai_flash_key_range(t, FTokenCnt, FKeyBase,
+      FMaskMode, FWindow, FRowKeyEnds);
+    Bounds = (int4)(min(Bounds.x, KeyRange.x), max(Bounds.y, KeyRange.y),
+      max(Bounds.z, KeyRange.x), min(Bounds.w, KeyRange.y));
+  }
+  return Bounds;
+}
+
+// The keys [lo, hi) a work-group visits: the tile's range, cut to split
+// Split's FSplitKeys keys counted from FSpanBase, the step's lowest lo.
+static inline int2 cai_flash_loop_range(const int4 TileBounds, const int Split,
+  const int FKeySplits, const int FSplitKeys, const int FSpanBase)
+{
+  if (FKeySplits <= 1) return (int2)(TileBounds.x, TileBounds.y);
+  const int SplitLo = FSpanBase + Split * FSplitKeys;
+  return (int2)(max(TileBounds.x, SplitLo),
+    min(TileBounds.y, SplitLo + FSplitKeys));
+}
+
+// The float4 at column d (< Cols) of Row, zero from Cols on; Aligned (Cols and
+// the row start multiples of 4) takes one vector load.
+static inline float4 cai_flash_load4(__global const float* Row, const int d,
+  const int Cols, const int Aligned)
+{
+  if (Aligned) return *((__global const float4*)(Row + d));
+  const int MaxColPos = Cols - 1;
+  const float4 v = (float4)(Row[min(d, MaxColPos)],
+    Row[min(d + 1, MaxColPos)], Row[min(d + 2, MaxColPos)],
+    Row[min(d + 3, MaxColPos)]);
+  return (float4)(v.s0, (d + 1 < Cols) ? v.s1 : 0.0f,
+    (d + 2 < Cols) ? v.s2 : 0.0f, (d + 3 < Cols) ? v.s3 : 0.0f);
+}
+
+// The same over int8 codes, as floats (exact for |code| <= 127).
+static inline float4 cai_flash_load_codes4(__global const char* Row,
+  const int d, const int Cols, const int Aligned)
+{
+  if (Aligned || (d + 4 <= Cols)) return convert_float4(vload4(0, Row + d));
+  const int MaxColPos = Cols - 1;
+  const float4 v = (float4)(Row[min(d, MaxColPos)],
+    Row[min(d + 1, MaxColPos)], Row[min(d + 2, MaxColPos)],
+    Row[min(d + 3, MaxColPos)]);
+  return (float4)(v.s0, (d + 1 < Cols) ? v.s1 : 0.0f,
+    (d + 2 < Cols) ? v.s2 : 0.0f, (d + 3 < Cols) ? v.s3 : 0.0f);
+}
+
+// Stages float4 columns [0, Cols4) from Col0 of Rows query rows into Tile; a
+// dead row reads row 0 (always live) and stores zero, so no load leaves X.
+static inline void cai_flash_stage_queries(__global const float* FX,
+  __local const int* XOffsets, const int Col0, const int Rows,
+  const int Cols4, const int FDk, const int Aligned, __local float4* Tile,
+  const int TileStride4, const int lid, const int Lanes)
+{
+  const int LiveOffset = XOffsets[0];
+  for (int r = lid >> 4; r < Rows; r += Lanes >> 4)
+  {
+    const int XOffset = XOffsets[r];
+    __global const float* Row = FX + max(XOffset, LiveOffset) + Col0;
+    for (int c = lid & 15; c < Cols4; c += 16)
     {
-      const float4 pl = vload4(0, part + e);
-      RowTotal += (pl.s0 + pl.s1) + (pl.s2 + pl.s3);
-    }
-    const float InvRowTotal = (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
-    __global float* yrow = ydst + CAI_NC_ROW(i) * FYStride;
-    #pragma unroll
-    for (j = 0; j < CAI_NC_COL_VECS; j++)
-    {
-      const float4 y = o[i][j] * InvRowTotal;
-      const int c = CAI_NC_COL(j);
-      if (c + 3 < FDk) vstore4(y, 0, yrow + c);
-      else
-      {
-        if (c < FDk) yrow[c] = y.s0;
-        if (c + 1 < FDk) yrow[c + 1] = y.s1;
-        if (c + 2 < FDk) yrow[c + 2] = y.s2;
-      }
+      const float4 v = cai_flash_load4(Row, c << 2, FDk - Col0, Aligned);
+      Tile[r * TileStride4 + c] = (XOffset >= 0) ? v : (float4)(0.0f);
     }
   }
 }
+
+// The same for Rows cache rows from Src; rows from RowsLive (>= 1) on read the
+// last live row and store zero. The _codes twin reads int8 codes.
+#define CAI_FLASH_STAGE_ROWS(Name, SrcType, Load) \
+static inline void Name(__global const SrcType* Src, \
+  const int Col0, const int Rows, const int RowsLive, const int Cols4, \
+  const int FDk, const int Aligned, __local float4* Tile, \
+  const int TileStride4, const int lid, const int Lanes) \
+{ \
+  for (int r = lid >> 4; r < Rows; r += Lanes >> 4) \
+  { \
+    __global const SrcType* Row = Src + min(r, RowsLive - 1) * FDk + Col0; \
+    for (int c = lid & 15; c < Cols4; c += 16) \
+    { \
+      const float4 v = Load(Row, c << 2, FDk - Col0, Aligned); \
+      Tile[r * TileStride4 + c] = (r < RowsLive) ? v : (float4)(0.0f); \
+    } \
+  } \
+}
+CAI_FLASH_STAGE_ROWS(cai_flash_stage_keys, float, cai_flash_load4)
+CAI_FLASH_STAGE_ROWS(cai_flash_stage_codes, char, cai_flash_load_codes4)
+
+// Dot * ScoreScale, soft-capped, or -1e30 when Key is outside [KeyLo, KeyHi)
+// and the tile is not Interior (all its keys live for all rows).
+static inline float cai_flash_score(const float Dot, const int Key,
+  const int KeyLo, const int KeyHi, const int Interior,
+  const float ScoreScale, const float FScoreSoftCap,
+  const float FInvScoreSoftCap)
+{
+  float sc = Dot * ScoreScale;
+  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+  return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
+}
+
+// exp(Score - RowMax) in [exp(-80), 1], and exactly 0 for a masked key.
+static inline float cai_flash_prob(const float Score, const float RowMax)
+{
+  return (Score > -1e29f) ? exp(clamp(Score - RowMax, -80.0f, 0.0f)) : 0.0f;
+}
+
+// The largest of a row's 16 partials and Running.
+static inline float cai_flash_max16(__local const float4* Part,
+  const float Running)
+{
+  const float4 m4 = fmax(fmax(Part[0], Part[1]), fmax(Part[2], Part[3]));
+  return fmax(Running, fmax(fmax(m4.s0, m4.s1), fmax(m4.s2, m4.s3)));
+}
+
+// The sum of a row's 16 partials.
+static inline float cai_flash_sum16(__local const float4* Part)
+{
+  const float4 s4 = (Part[0] + Part[1]) + (Part[2] + Part[3]);
+  return (s4.s0 + s4.s1) + (s4.s2 + s4.s3);
+}
+
+// Writes the float4 y at column c of Row, clipped to Cols columns.
+static inline void cai_flash_store4(__global float* Row, const int c,
+  const int Cols, const float4 y)
+{
+  if (c < Cols) Row[c] = y.s0;
+  if (c + 1 < Cols) Row[c + 1] = y.s1;
+  if (c + 2 < Cols) Row[c + 2] = y.s2;
+  if (c + 3 < Cols) Row[c + 3] = y.s3;
+}
+
+// Copies output tile rows up to MaxRowPos to columns ColBase.. (Cols4 float4,
+// clipped to FDk) of Out in a loop that is not unrolled (PoCL 5.0 mis-addresses
+// several divergent stores in an unrolled pass); Partials with ColBase 0 also
+// writes each row's max and sum before its acc[0].
+static inline void cai_flash_copy_out(__local const float4* Tile,
+  const int TileStride4, __local const int* OutOffsets,
+  __local const float4* RowPart, __local const float* RowMax, const int Br,
+  const int MaxRowPos, const int ColBase, const int Cols4, const int FDk,
+  const int Partials, __global float* Out, const int lid, const int Lanes)
+{
+  for (int r = lid >> 4; r < Br; r += Lanes >> 4)
+  {
+    const int OutOffset = OutOffsets[r];
+    if (Partials && (ColBase == 0) && (r <= MaxRowPos) && ((lid & 15) == 0))
+    {
+      Out[OutOffset - 2] = RowMax[r];
+      Out[OutOffset - 1] = cai_flash_sum16(RowPart + r * 4);
+    }
+    for (int c = lid & 15; c < Cols4; c += 16)
+      if (r <= MaxRowPos)
+        cai_flash_store4(Out + OutOffset + ColBase, c << 2, FDk - ColBase,
+          Tile[r * TileStride4 + c]);
+  }
+}
+
+// Component e (0..3, a compile-time constant after unrolling) of v.
+#define CAI_FLASH_LANE4(v, e) \
+  (((e) == 0) ? (v).s0 : (((e) == 1) ? (v).s1 : (((e) == 2) ? (v).s2 : (v).s3)))
+
+// Lanes per work-group, key rows per tile, and the row slots of S and O one
+// lane owns.
+#define CAI_FLASH_LANES 256
+#define CAI_FLASH_KEY_TILE 64
+#define CAI_FLASH_SLOTS 4
+
+// The FP32 cache has no row scales.
+#define CAI_FLASH_NO_SCALES(kt, KeysLive)
+#define CAI_FLASH_UNIT_SCALE(Key) 1.0f
+// The int8 cache: the tile's K then V row scales after the row table (zero
+// past KeysLive), counted in FusedSDPAFlashTiles for this kernel only.
+#define CAI_FLASH_INT8_SCALE_TILE ((__local float*)(RowTable + 4 * Br))
+#define CAI_FLASH_STAGE_INT8_SCALES(kt, KeysLive) \
+  if (lid < CAI_FLASH_KEY_TILE) \
+  { \
+    const int ScaleRow = g * FCacheMax + kt + min(lid, KeysLive - 1); \
+    CAI_FLASH_INT8_SCALE_TILE[lid] = \
+      (lid < KeysLive) ? FKScales[ScaleRow] : 0.0f; \
+    CAI_FLASH_INT8_SCALE_TILE[CAI_FLASH_KEY_TILE + lid] = \
+      (lid < KeysLive) ? FVScales[ScaleRow] : 0.0f; \
+  }
+#define CAI_FLASH_K_SCALE(Key) CAI_FLASH_INT8_SCALE_TILE[Key]
+#define CAI_FLASH_V_SCALE(Key) \
+  CAI_FLASH_INT8_SCALE_TILE[CAI_FLASH_KEY_TILE + (Key)]
+
+// Tiles as FusedSDPAFlashTiles; the macro arguments name the cache format
+// (int8: K scale on the dot, V scale on p, l sums unscaled p). Claude (AI).
+#define CAI_FLASH_BODY(KVType, KSrc, VSrc, Stage, StageScales, KScaleAt, \
+  VScaleAt) \
+{ \
+  const int lid = get_local_id(0); \
+  const int sx = CAI_FLASH_KEY_LANE(lid); \
+  const int sy = CAI_FLASH_ROW_LANE(lid); \
+  int i, j, e, d4, c4, kt, sl, vs; \
+  const int Lanes = CAI_FLASH_LANES; \
+  const int RowLanes = Lanes >> 4; \
+  const int Dk4 = (FDk + 3) & ~3; \
+  /* Q.K^T runs over all of Dk; V and O over this work-group's column chunk, \
+     whose nominal width ColChunk4 sets the tiles of every work-group. */ \
+  const int ColChunk4 = (min(FColChunk, FDk) + 3) & ~3; \
+  const int Br = (ColChunk4 <= 128) ? 64 : 32; \
+  const int Ds = (Dk4 <= 72) ? Dk4 : 64; \
+  const int Bv = (ColChunk4 <= 72) ? 64 : ((ColChunk4 <= 128) ? 32 : 16); \
+  const int OutColShift = (Br == 64) ? 4 : 5; \
+  const int OutColLanes = 1 << OutColShift; \
+  const int OutRowLanes = Lanes >> OutColShift; \
+  const int ox = lid & (OutColLanes - 1); \
+  const int oy = lid >> OutColShift; \
+  const int RowTiles = (FTokenCnt * FGroupSize + Br - 1) / Br; \
+  const int ColChunks = (FDk + FColChunk - 1) / FColChunk; \
+  const int TileId = get_group_id(1) / (FKeySplits * ColChunks); \
+  const int SplitChunk = get_group_id(1) - TileId * FKeySplits * ColChunks; \
+  const int Split = SplitChunk / ColChunks; \
+  const int ColBase = (SplitChunk - Split * ColChunks) * FColChunk; \
+  const int MaxCol4Pos = \
+    ((min(FColChunk, FDk - ColBase) + 3) >> 2) - 1; \
+  const int g = TileId / RowTiles; \
+  if (g >= FKVHeads) return; \
+  const int Row0 = (TileId - g * RowTiles) * Br; \
+  const int SliceStride4 = (Ds >> 2) + 1; \
+  const int VStride4 = (ColChunk4 >> 2) + 1; \
+  const int PStride4 = (CAI_FLASH_KEY_TILE >> 2) + 1; \
+  __local float4* RegionA = FScratch; \
+  __local float4* RegionB = \
+    RegionA + max(Br * SliceStride4, Bv * VStride4); \
+  __local float4* RowPart = \
+    RegionB + max(CAI_FLASH_KEY_TILE * SliceStride4, Br * PStride4); \
+  __local float* PTileF = (__local float*)RegionB; \
+  __local float* RowPartF = (__local float*)RowPart; \
+  __local float* RowScale = RowPartF + Br * 16; \
+  __local float* RowMax = RowScale + Br; \
+  __local int* RowTable = (__local int*)(RowMax + Br); \
+ \
+  float4 o[CAI_FLASH_SLOTS][2]; \
+  float m[CAI_FLASH_SLOTS], l[CAI_FLASH_SLOTS]; \
+  _Pragma("unroll") \
+  for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+  { \
+    o[i][0] = (float4)(0.0f); \
+    o[i][1] = (float4)(0.0f); \
+    m[i] = -1e30f; \
+    l[i] = 0.0f; \
+  } \
+ \
+  if (lid < Br) \
+    cai_flash_row_entry(RowTable, Br, lid, Row0, g, Split, FKeySplits, \
+      FGroupSize, FTokenCnt, FDk, FXStride, FYStride, FKeyBase, FMaskMode, \
+      FWindow, FRowKeyEnds); \
+  const int4 TileBounds = cai_flash_tile_bounds(Br, Row0, FGroupSize, \
+    FTokenCnt, FKeyBase, FMaskMode, FWindow, FRowKeyEnds); \
+  const int2 LoopRange = cai_flash_loop_range(TileBounds, Split, FKeySplits, \
+    FSplitKeys, FSpanBase); \
+  const int LoopLo = LoopRange.x; \
+  const int LoopHi = LoopRange.y; \
+  const int TileMaxLo = TileBounds.z; \
+  const int InteriorHi = min(TileBounds.w, LoopHi); \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  const int MaxRowPos = FTokenCnt * FGroupSize - 1 - Row0; \
+  const int KAligned = (FDk & 3) == 0; \
+  const int QAligned = KAligned && ((FXStride & 3) == 0); \
+  const int Slices = (Dk4 + Ds - 1) / Ds; \
+  __global const KVType* KPlane = KSrc + g * FCacheMax * FDk; \
+  __global const KVType* VPlane = VSrc + g * FCacheMax * FDk; \
+ \
+  for (kt = LoopLo; kt < LoopHi; kt += CAI_FLASH_KEY_TILE) \
+  { \
+    const int KeysLive = min(CAI_FLASH_KEY_TILE, LoopHi - kt); \
+    const int Interior = (kt >= TileMaxLo) \
+      && (kt + CAI_FLASH_KEY_TILE <= InteriorHi); \
+    float s[CAI_FLASH_SLOTS][4]; \
+    _Pragma("unroll") \
+    for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+      _Pragma("unroll") \
+      for (j = 0; j < 4; j++) s[i][j] = 0.0f; \
+ \
+    for (sl = 0; sl < Slices; sl++) \
+    { \
+      const int Col0 = sl * Ds; \
+      const int SliceCols4 = min(Ds, Dk4 - Col0) >> 2; \
+      /* The previous slice's dot (or the previous tile's P.V) is finished \
+         before the Q and K slices overwrite regions A and B. */ \
+      barrier(CLK_LOCAL_MEM_FENCE); \
+      cai_flash_stage_queries(FX, RowTable, Col0, Br, SliceCols4, FDk, \
+        QAligned, RegionA, SliceStride4, lid, Lanes); \
+      Stage(KPlane + kt * FDk, Col0, CAI_FLASH_KEY_TILE, KeysLive, \
+        SliceCols4, FDk, KAligned, RegionB, SliceStride4, lid, Lanes); \
+      if (sl == 0) { StageScales(kt, KeysLive) } \
+      barrier(CLK_LOCAL_MEM_FENCE); \
+      for (d4 = 0; d4 < SliceCols4; d4++) \
+      { \
+        float4 kv[4]; \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+          kv[j] = RegionB[(sx + 16 * j) * SliceStride4 + d4]; \
+        _Pragma("unroll") \
+        for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+          if (sy + RowLanes * i < Br) \
+          { \
+            const float4 q = RegionA[(sy + RowLanes * i) * SliceStride4 + d4]; \
+            _Pragma("unroll") \
+            for (j = 0; j < 4; j++) s[i][j] = cai_flash_mad_dot4(q, kv[j], s[i][j]); \
+          } \
+      } \
+    } \
+    _Pragma("unroll") \
+    for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+      if (sy + RowLanes * i < Br) \
+      { \
+        const int row = sy + RowLanes * i; \
+        const int KeyLo = RowTable[2 * Br + row]; \
+        const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
+        float PartMax = -1e30f; \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+        { \
+          s[i][j] = cai_flash_score(s[i][j], kt + sx + 16 * j, KeyLo, \
+            KeyHi, Interior, KScaleAt(sx + 16 * j) * FInvSqrtDk, \
+            FScoreSoftCap, FInvScoreSoftCap); \
+          PartMax = fmax(PartMax, s[i][j]); \
+        } \
+        RowPartF[row * 16 + sx] = PartMax; \
+      } \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+ \
+    /* Every Q and K read is done: V slice 0 replaces the Q slice and P the K \
+       slice; O is rescaled only for rows whose max grew. */ \
+    Stage(VPlane + kt * FDk, ColBase, Bv, KeysLive, MaxCol4Pos + 1, FDk, \
+      KAligned, RegionA, VStride4, lid, Lanes); \
+    _Pragma("unroll") \
+    for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+      if (sy + RowLanes * i < Br) \
+      { \
+        const int row = sy + RowLanes * i; \
+        const float TileMax = cai_flash_max16(RowPart + row * 4, m[i]); \
+        float Rescale = 1.0f; \
+        if (TileMax > m[i]) \
+        { \
+          Rescale = exp(fmax(m[i] - TileMax, -80.0f)); \
+          m[i] = TileMax; \
+          l[i] *= Rescale; \
+        } \
+        _Pragma("unroll") \
+        for (j = 0; j < 4; j++) \
+        { \
+          const float p = cai_flash_prob(s[i][j], m[i]); \
+          l[i] += p; \
+          PTileF[row * (CAI_FLASH_KEY_TILE + 4) + sx + 16 * j] = \
+            p * VScaleAt(sx + 16 * j); \
+        } \
+        if (sx == 0) RowScale[row] = Rescale; \
+      } \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+ \
+    _Pragma("unroll") \
+    for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+    { \
+      const float Rescale = RowScale[oy + OutRowLanes * i]; \
+      if (Rescale != 1.0f) \
+      { \
+        o[i][0] *= Rescale; \
+        o[i][1] *= Rescale; \
+      } \
+    } \
+    const int Col0 = min(ox, MaxCol4Pos); \
+    const int Col1 = min(ox + OutColLanes, MaxCol4Pos); \
+    for (vs = 0; vs * Bv < KeysLive; vs++) \
+    { \
+      const int ValueRowsLive = min(Bv, KeysLive - vs * Bv); \
+      if (vs > 0) \
+      { \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        Stage(VPlane + (kt + vs * Bv) * FDk, ColBase, Bv, ValueRowsLive, \
+          MaxCol4Pos + 1, FDk, KAligned, RegionA, VStride4, lid, Lanes); \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+      } \
+      /* Keys up to the next multiple of 4 have p = 0 and a zero V row. */ \
+      const int MaxKey4Pos = ((ValueRowsLive + 3) >> 2) - 1; \
+      const int PCol4 = (vs * Bv) >> 2; \
+      for (c4 = 0; c4 <= MaxKey4Pos; c4++) \
+      { \
+        float4 p4[CAI_FLASH_SLOTS]; \
+        _Pragma("unroll") \
+        for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+          p4[i] = RegionB[(oy + OutRowLanes * i) * PStride4 + PCol4 + c4]; \
+        __local const float4* VRows = RegionA + (c4 << 2) * VStride4; \
+        _Pragma("unroll") \
+        for (e = 0; e < 4; e++) \
+        { \
+          const float4 v0 = VRows[e * VStride4 + Col0]; \
+          const float4 v1 = VRows[e * VStride4 + Col1]; \
+          _Pragma("unroll") \
+          for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+          { \
+            const float p = CAI_FLASH_LANE4(p4[i], e); \
+            o[i][0] = mad((float4)(p), v0, o[i][0]); \
+            o[i][1] = mad((float4)(p), v1, o[i][1]); \
+          } \
+        } \
+      } \
+    } \
+  } \
+ \
+  /* RowPart was last read before the final P.V barriers. */ \
+  _Pragma("unroll") \
+  for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+    if (sy + RowLanes * i < Br) \
+    { \
+      RowPartF[(sy + RowLanes * i) * 16 + sx] = l[i]; \
+      RowMax[sy + RowLanes * i] = m[i]; \
+    } \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  /* Regions A and B become the output tile (Br rows of VStride4 float4); \
+     a column past Dk stores into the row's pad column. */ \
+  _Pragma("unroll") \
+  for (i = 0; i < CAI_FLASH_SLOTS; i++) \
+  { \
+    const int row = oy + OutRowLanes * i; \
+    const float RowTotal = cai_flash_sum16(RowPart + row * 4); \
+    const float InvRowTotal = (FKeySplits > 1) ? 1.0f \
+      : ((RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f); \
+    RegionA[row * VStride4 + min(ox, MaxCol4Pos + 1)] = o[i][0] * InvRowTotal; \
+    RegionA[row * VStride4 + min(ox + OutColLanes, MaxCol4Pos + 1)] = \
+      o[i][1] * InvRowTotal; \
+  } \
+  barrier(CLK_LOCAL_MEM_FENCE); \
+  cai_flash_copy_out(RegionA, VStride4, RowTable + Br, RowPart, RowMax, Br, \
+    min(MaxRowPos, Br - 1), ColBase, MaxCol4Pos + 1, FDk, FKeySplits > 1, \
+    (FKeySplits > 1) ? FPartials : FY, lid, Lanes); \
+}
+
+// 256 lanes, 4x4 scores and 4 rows x 2 float4 of O per lane, FP32 cache.
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void cai_sdpa_flash(CAI_FLASH_LEADING_PARAMS,
+  __global const float* FKCache, __global const float* FVCache,
+  CAI_FLASH_TRAILING_PARAMS)
+CAI_FLASH_BODY(float, FKCache, FVCache, cai_flash_stage_keys,
+  CAI_FLASH_NO_SCALES, CAI_FLASH_UNIT_SCALE, CAI_FLASH_UNIT_SCALE)
+
+// The same over the int8 cache (codes and per-row scales as
+// cai_sdpa_append_kv_int8 writes them).
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void cai_sdpa_flash_int8(CAI_FLASH_LEADING_PARAMS,
+  __global const char* FKCodes, __global const float* FKScales,
+  __global const char* FVCodes, __global const float* FVScales,
+  CAI_FLASH_TRAILING_PARAMS)
+CAI_FLASH_BODY(char, FKCodes, FVCodes, cai_flash_stage_codes,
+  CAI_FLASH_STAGE_INT8_SCALES, CAI_FLASH_K_SCALE, CAI_FLASH_V_SCALE)
 
 // INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
 // and V slices into the resident int8 cache at slots FCacheSlot ..

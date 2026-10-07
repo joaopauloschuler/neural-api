@@ -64,13 +64,35 @@ const
   /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
   /// operand is only ever written and read by device kernels.
   csHalfSize = 2;
-  /// Tile geometry of cai_dot_product_tiled / _int8_tiled / _int8_tiled_h /
-  /// _int4_tiled (the CAI_TILED_* defines in neural.cl; the launch geometry
-  /// derives from them, so the two copies must agree): lanes per work-group,
-  /// rows per lane and columns per tile.
+  /// Tile geometry of the FP32 cai_dot_product_tiled / cai_conv_implicit_tiled
+  /// (the CAI_TILED_* defines in neural.cl; the launch geometry derives from
+  /// them, so the two copies must agree): lanes per work-group, rows per lane
+  /// and columns per tile.
   csTiledGemmLanes = 64;
   csTiledGemmRowsPerLane = 2;
   csTiledGemmCols = 16;
+  /// The code kernels _int8_tiled / _int8_tiled_h / _int4_tiled (CAI_CODES_*):
+  /// a lane owns 4 consecutive rows; the work-group size is required exactly.
+  csTiledGemmCodesLanes = 128;
+  csTiledGemmCodesRowsPerLane = 4;
+  csTiledGemmCodesRowsPerTile = csTiledGemmCodesLanes * csTiledGemmCodesRowsPerLane;
+  /// Reduction elements per K-step of every tiled kernel (CAI_TILED_KSTEP).
+  csTiledGemmKStep = 32;
+  /// The _block entry points (CAI_BLOCK_*): 256 lanes of 8x8 outputs own a
+  /// 128-row x 128-column tile.
+  csTiledGemmBlockLanes = 256;
+  csTiledGemmBlockRows = 128;
+  csTiledGemmBlockCols = 128;
+  /// Work-groups per compute unit the block grid must launch to be picked by
+  /// tgcAuto (AutoTiledGemmCodesGrid); otherwise tgcAuto picks large.
+  csTiledGemmCodesMinGroupsPerUnit = 2;
+  /// Split-K of the large grid: target work-groups per compute unit, least
+  /// K-steps per split, most splits (AutoTiledGemmSplitCount states the rule).
+  csTiledGemmSplitKGroupsPerUnit = 4;
+  csTiledGemmSplitKMinSteps = 4;
+  csTiledGemmSplitKMaxSplits = 32;
+  /// TiledGemmSplitK value for the auto rule; 0 turns split-K off.
+  csTiledGemmSplitKAuto = -1;
   /// Columns (FNumBs) from which Compute and ComputeResidentCodes take the
   /// tiled GEMM: one full column tile. Below it the tile would multiply
   /// zero-padded columns, while the existing kernels re-read each weight row
@@ -81,6 +103,9 @@ const
   csTiledGemmFP32MinRows = csTiledGemmLanes;
 
 type
+  /// Grid of the tiled code kernels: tgcAuto picks per shape
+  /// (csTiledGemmCodesMinGroupsPerUnit); the others force one, for A/B timing.
+  TTiledGemmCodesGrid = (tgcAuto, tgcLarge, tgcBlock);
   TPlatformNames = array of string;
   TPlatforms = array of cl_platform_id;
   TDeviceNames = array of string;
@@ -123,6 +148,15 @@ type
     // Same for the command queue, which is borrowed independently: a helper
     // kernel either shares the owner's queue or creates its own.
     FBorrowedQueue: boolean;
+    // The instance that created FCommands (Self unless borrowed). Its counters
+    // hold the non-blocking uploads enqueued on that queue and those known done.
+    FQueueOwner: TEasyOpenCL;
+    FUploadsEnqueued, FUploadsCompleted: LongInt;
+    // QueueScratchBuffer's buffer, held by the queue owner; the generation
+    // changes on every reallocation.
+    FQueueScratch: cl_mem;
+    FQueueScratchBytes: csize_t;
+    FQueueScratchGeneration: integer;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -132,6 +166,13 @@ type
     procedure LoadPlatforms();
     procedure FreeContext();
     procedure CompileProgram(); overload;
+    function UploadsEnqueuedNow(): LongInt;
+    // The in-order queue finished every command enqueued before UploadCount
+    // was read, so those uploads no longer read host memory.
+    procedure MarkUploadsCompleted(UploadCount: LongInt);
+    // OpenCLLocalSizeCap lowered to pKernel's CL_KERNEL_WORK_GROUP_SIZE. Not
+    // checked: per-dimension CL_DEVICE_MAX_WORK_ITEM_SIZES (64+ in z on GPUs).
+    function LocalSizeCapFor(pKernel: cl_kernel): csize_t;
 
   public
     constructor Create(); override;
@@ -168,6 +209,17 @@ type
     // persistent buffer without moving the whole allocation.
     function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
     function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
+    // True when a non-blocking upload enqueued on this queue (by any instance
+    // sharing it) may still read its host memory.
+    function HasPendingUploads(): boolean;
+    // True for a helper that borrowed the program but runs its own command
+    // queue (CreateFromProgram with pSharedQueue = False).
+    function HasPrivateQueue(): boolean;
+    // The one grow-only scratch buffer of this command queue, at least pBytes
+    // (nil on failure), for a writer and reader enqueued back to back on it.
+    function QueueScratchBuffer(pBytes: csize_t; out pGeneration: integer): cl_mem;
+    // Bytes of this command queue's scratch buffer (0 before the first use).
+    function QueueScratchBytes(): csize_t;
     // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
     // memory; ordered after earlier work on the queue and returns at once.
     function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
@@ -194,6 +246,14 @@ type
     // CL_KERNEL_LOCAL_MEM_SIZE of pKernel on the current device: the local
     // memory the kernel declares itself, in bytes; 0 when the query fails.
     function KernelLocalMemSize(pKernel: cl_kernel): integer;
+    // CL_KERNEL_PRIVATE_MEM_SIZE of pKernel on the current device in bytes
+    // (spilled registers and private arrays); -1 when the query fails.
+    function KernelPrivateMemSize(pKernel: cl_kernel): int64;
+    // Writes the built program's binary for the current device (PTX text on
+    // NVIDIA) to FileName; false when there is none or the write fails.
+    function SaveProgramBinary(const FileName: string): boolean;
+    // The whole build log of the program for the current device.
+    function BuildLog(): string;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size, d1groupsize, d2groupsize: csize_t): integer; overload;
@@ -322,19 +382,19 @@ type
       /// ReallocateBuffersIfRequired for grow-only reuse; kept in sync with the
       /// actual allocations (reset to 0 whenever a buffer is released).
       FCapAs, FCapBs, FCapResult: csize_t;
-      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product). Only
-      /// allocated when a Compute call passes a bias volume; grow-only like the
-      /// operands, uploaded only when NewVBias (or on first/grown allocation).
-      /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
+      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product), one
+      /// float per A row. Only allocated when a Compute call passes a bias
+      /// volume; grow-only like the operands, uploaded only when NewVBias (or
+      /// on first/grown allocation). nil (and UseBias=0) for every bias-less
+      /// caller. Coded by Claude (AI).
       FBiasBuffer: cl_mem;
       FCapBias: csize_t;
-      /// Optional resident source buffer for device-side im2col: holds the small
-      /// convolution input that BuildInputColsOnDevice gathers into
-      /// FInputBufferBs. Grow-only and re-uploaded only when the source changed;
-      /// nil until the first inference-only non-pointwise conv forward that opts in.
-      /// Coded by Claude (AI).
-      FIm2ColSrcBuffer: cl_mem;
-      FCapIm2ColSrc: csize_t;
+      /// Resident copy of a host convolution input that cai_im2col
+      /// (BuildInputColsOnDevice) or the implicit GEMM (ComputeImplicitConv)
+      /// gathers from. Grow-only, re-uploaded each forward; nil until the first
+      /// inference-only spatial conv forward with a host source. Coded by Claude (AI).
+      FGatherSrcBuffer: cl_mem;
+      FCapGatherSrc: csize_t;
       /// INT8 WEIGHT MODE (cai_dot_product_int8). The A operand is per-row
       /// symmetric int8 codes + per-row FP32 scales, both RESIDENT and
       /// IMMUTABLE (quantized layers are inference-only, so unlike the FP32
@@ -448,22 +508,44 @@ type
       /// launch. FTiledRejected remembers a device that refused the kernel or
       /// its work-group size, so the fallback is decided once.
       /// FTiledLaunchCount is the test hook that proves the tiled path ran.
+      /// In a code mode FTiledKernel is the large grid (required) and
+      /// FTiledBlockKernel (_block) is nil when the device rejects it.
       /// Coded by Claude (AI).
-      FTiledKernel: cl_kernel;
+      FTiledKernel, FTiledBlockKernel: cl_kernel;
       FTiledRejected: boolean;
-      FTiledLaunchCount: integer;
+      FTiledLaunchCount, FLastTiledLanes, FLastTiledSplits: integer;
+      /// Split-K pair (PrepareTiledSplitK): FP32 partials in the queue's
+      /// scratch buffer, of generation FTiledScratchGeneration, then the merge.
+      FTiledSplitKKernel, FTiledMergeKernel: cl_kernel;
+      FTiledScratchGeneration: integer;
+      FTiledSplitKRejected: boolean;
+      /// IMPLICIT-GEMM CONVOLUTION (cai_conv_implicit_tiled, cai_conv_implicit):
+      /// owned handles bound by PrepareImplicitConv; FImplicitConvReady once the
+      /// untiled one bound. FImplicitConvLaunchCount is the test hook.
+      /// Coded by Claude (AI).
+      FImplicitConvKernel, FImplicitConvTiledKernel: cl_kernel;
+      FImplicitConvReady: boolean;
+      FImplicitConvLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
       /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
       /// swaps them for another owner's); the release in UnprepareForCompute
       /// is the same clReleaseMemObject either way. Coded by Claude (AI).
       FCodesBorrowed: boolean;
+      /// FP32 twin of FCodesBorrowed: FInputBufferAs (the A operand) and
+      /// FBiasBuffer are retained references to another instance's
+      /// (PrepareForComputeBorrowingWeights). Coded by Claude (AI).
+      FWeightsBorrowed, FBiasBorrowed: boolean;
       /// Retains Owner's codes/scales/block-scales as this instance's and sets
       /// FCodesBorrowed; the caller releases any handles it replaces.
       procedure RetainCodesOf(Owner: TDotProductSharedKernel);
-      /// Sets the tiled kernel's codes (4), scales (9) and, for int4, block
-      /// scales (10) arguments from the current handles.
+      /// Sets the tiled kernels' codes, scales and int4 block scales arguments
+      /// from the current handles (split-K twin and merge included).
       function BindTiledCodesArgs(): integer;
+      /// Shape (0-2), result (6) and BindTiledCodesArgs on one code kernel.
+      function BindTiledFixedArgs(pKernel: cl_kernel): integer;
+      /// Releases FTiledKernel, FTiledBlockKernel and the split-K pair.
+      procedure ReleaseTiledKernels();
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -494,19 +576,39 @@ type
       /// Coded by Claude (AI).
       function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
         pExternalVBs: cl_mem; var err: integer): cl_mem;
-      /// Uploads VBias into the resident grow-only bias buffer when needed and
-      /// returns the UseBias kernel argument (0 for a nil VBias). Coded by Claude (AI).
+      /// Uploads VBias (one float per A row, else raises) into the resident
+      /// grow-only bias buffer when needed; returns UseBias (0 for nil). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
         var err: integer): longint;
       /// True when the current shape and device take the tiled GEMM: at least
-      /// TiledGemmMinColumns columns and a work-group of csTiledGemmLanes fits.
+      /// TiledGemmMinColumns columns (and 4 rows in a code mode) and a
+      /// work-group of the armed mode's required tiled kernel fits.
       function ShouldUseTiledGemm(): boolean;
+      /// The grid the code kernels launch for the current shape (never
+      /// tgcAuto): TiledGemmCodesGrid when that kernel exists, else the auto rule.
+      function SelectCodesGrid(): TTiledGemmCodesGrid;
       /// Binds the tiled entry point for the armed weight mode (FP32 if none)
       /// and a code mode's fixed arguments; False when the device rejected it.
       function PrepareTiled(): boolean;
-      /// Launches the bound tiled entry point over the current shape on the
-      /// shared in-order queue and counts the launch.
-      procedure RunTiledGemm();
+      /// Launches pKernel over the current shape with pLanes lanes per
+      /// pRowsPerTile x pColsPerTile work-group and pSplits K-splits, on the shared queue.
+      procedure RunTiledGemm(pKernel: cl_kernel;
+        pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+      /// The large grid's split count (1 = none): TiledGemmSplitK fitted to
+      /// FSize, or AutoTiledGemmSplitCount unless the queue is private.
+      function SelectTiledSplitCount(): integer;
+      /// Binds the split-K twin and the merge to the queue's scratch grown to
+      /// pSplits partials; False when a kernel or the scratch failed.
+      function PrepareTiledSplitK(pSplits: integer): boolean;
+      /// The tiled code kernel name of the armed mode (no grid suffix) and the
+      /// TNeuralKernel whose program builds it.
+      function TiledCodesKernelName(out pCodesKernel: TNeuralKernel): string;
+      /// FInputBufferBs, (re)allocated grow-only for FNumBs x FSize floats.
+      function EnsureInputBufferBs(): cl_mem;
+      /// The gather source: pExternalSrc when given (borrowed), otherwise
+      /// FGatherSrcBuffer grown for SrcVol and uploaded when NewSrc or grown.
+      function PrepareGatherSource(SrcVol: TNNetVolume; NewSrc: boolean;
+        pExternalSrc: cl_mem; var err: integer): cl_mem;
       /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
       /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
@@ -519,7 +621,10 @@ type
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
-      function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
+      function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer; overload;
+      /// PrepareForCompute with the column count given instead of a B volume.
+      /// Neither form allocates the B buffer: the first launch that needs it does.
+      function PrepareForCompute(VAs: TNNetVolume; pNumBs, pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer; overload;
       /// Grow-only sibling of PrepareForCompute: sets the same scalar shape state
       /// but only releases+recreates a device buffer when the needed byte size
       /// exceeds its current capacity, otherwise reuses it in place. Safe because
@@ -528,16 +633,14 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
-      /// Device-side im2col: gathers SrcVol (the conv input, zero-padded by
-      /// Padding on each side inside the gather) into the
-      /// resident B-operand buffer (FInputBufferBs) using the shared cai_im2col
-      /// kernel, so the host never builds nor uploads the inflated column matrix.
-      /// Must be called AFTER the B buffer is sized (PrepareForCompute in
-      /// EnableOpenCL) and BEFORE the matching Compute(..., NewVBs=false), on the
-      /// same in-order command queue so the gather is ordered before the GEMM.
-      /// Coded by Claude (AI).
+      /// OpenCL im2col: gathers SrcVol (the conv input, zero-padded by Padding
+      /// on each side inside the gather) into FInputBufferBs, sized here on
+      /// first use, with the shared cai_im2col kernel, so the host never builds
+      /// nor uploads the column matrix. Call it after PrepareForCompute and
+      /// BEFORE the matching Compute(..., NewVBs=false), on the same in-order
+      /// command queue so the gather is ordered before the GEMM. Coded by Claude (AI).
       /// pExternalSrc BORROWS an already-resident gather source (a producing
-      /// layer's output buffer) in place of FIm2ColSrcBuffer: nothing is
+      /// layer's output buffer) in place of FGatherSrcBuffer: nothing is
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
@@ -546,8 +649,18 @@ type
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
       /// FInputBufferBs, never uploaded and never released here. VBs then only
-      /// carries the shape. Coded by Claude (AI).
+      /// carries the shape; nil means B already sits in FInputBufferBs.
+      /// Coded by Claude (AI).
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+      /// Binds the implicit-GEMM convolution entry points after an FP32
+      /// PrepareForCompute; False when the device rejected cai_conv_implicit.
+      function PrepareImplicitConv(): boolean;
+      /// Compute for an FP32 convolution with B gathered inside the GEMM from
+      /// unpadded SrcVol (or borrowed pExternalSrc): no column matrix, no B buffer.
+      procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
+        OutSizeX, RowSpan, Stride, Padding, pActFN: longint;
+        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -577,6 +690,13 @@ type
       /// armed in this instance's context; False leaves this one unarmed. Coded by Claude (AI).
       function PrepareForComputeBorrowingCodes(Owner: TDotProductSharedKernel;
         VBs: TNNetVolume; pFP16: boolean = false): boolean;
+      /// FP32 twin: retains Owner's A operand and bias and sizes only the result;
+      /// never writes them, so weight changes reach it only through Owner's upload.
+      function PrepareForComputeBorrowingWeights(Owner: TDotProductSharedKernel;
+        pNumBs, pSize: longint): boolean;
+      /// Uploads VAs into the A buffer PrepareForCompute created, and VBias
+      /// (nil: none); returns when both are in OpenCL memory. Coded by Claude (AI).
+      function UploadResidentWeights(VAs, VBias: TNNetVolume): boolean;
       /// True when BorrowCodesKeepingBuffers(Owner) applies: both armed in the
       /// same weight mode, same rows and row size, same OpenCL context.
       function CanBorrowCodesKeepingBuffers(
@@ -594,6 +714,12 @@ type
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
         NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
+      /// Bytes of the OpenCL buffers this instance holds now; retained
+      /// (borrowed) codes and scales are left to their owner.
+      function BufferBytes(): int64;
+      /// Writes every later result into a retained reference to Buffer (Bytes
+      /// long, at least the result size) in place of the private result buffer.
+      procedure AdoptResultBuffer(Buffer: cl_mem; Bytes: csize_t);
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
       /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
@@ -611,9 +737,19 @@ type
       /// prove a borrower created no second copy.
       property CodesBuffer: cl_mem read FCodesBuffer;
       property CodesBorrowed: boolean read FCodesBorrowed;
+      property WeightsBorrowed: boolean read FWeightsBorrowed;
       /// Launches of the tiled GEMM over this instance's lifetime; a test
       /// asserts it moved to prove the tiled path ran.
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
+      /// Work-group lanes of the last tiled launch (0 before the first).
+      property LastTiledGemmLanes: integer read FLastTiledLanes;
+      /// K-splits of the last tiled launch (1 = no split, 0 before the first).
+      property LastTiledGemmSplits: integer read FLastTiledSplits;
+      /// True after a successful PrepareImplicitConv.
+      property ImplicitConvReady: boolean read FImplicitConvReady;
+      /// Implicit-GEMM convolution launches (tiled ones count in
+      /// TiledGemmLaunchCount too).
+      property ImplicitConvLaunchCount: integer read FImplicitConvLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -662,17 +798,63 @@ type
 function TiledGemmMinColumns(): integer;
 procedure SetTiledGemmMinColumns(pValue: integer);
 
+/// Grid of the tiled code kernels: tgcAuto unless NEURAL_TILED_GEMM_GRID is
+/// large or block (read once, at first use; other values mean tgcAuto) or
+/// SetTiledGemmCodesGrid was called.
+function TiledGemmCodesGrid(): TTiledGemmCodesGrid;
+procedure SetTiledGemmCodesGrid(pValue: TTiledGemmCodesGrid);
+/// The tgcAuto grid of an FNumAs x FNumBs code GEMM on pComputeUnits compute
+/// units, given whether the block kernel exists (never tgcAuto).
+function AutoTiledGemmCodesGrid(pNumAs, pNumBs, pComputeUnits: integer;
+  pHasBlock: boolean): TTiledGemmCodesGrid;
+/// Split count of the large code grid: csTiledGemmSplitKAuto unless
+/// NEURAL_TILED_GEMM_SPLITK is 0 (off) or N >= 1 (read once) or SetTiledGemmSplitK was called.
+function TiledGemmSplitK(): integer;
+procedure SetTiledGemmSplitK(pValue: integer);
+/// The auto split count of an FNumAs x FNumBs x FSize code GEMM on the large
+/// grid with pComputeUnits compute units (1 = no split); fitted as below.
+function AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize,
+  pComputeUnits: integer): integer;
+/// pSplits clamped to [1, ceil(pSize/32)] and lowered until no split is
+/// empty; TiledGemmStepsPerSplit gives the K-steps of all but the last.
+function FitTiledGemmSplitCount(pSize, pSplits: integer): integer;
+function TiledGemmStepsPerSplit(pSize, pSplits: integer): integer;
+
+/// Whether inference-only FP32 spatial convolutions may take the implicit GEMM:
+/// true unless NEURAL_OPENCL_IMPLICIT_CONV=0 or SetOpenCLImplicitConv(false).
+function OpenCLImplicitConvEnabled(): boolean;
+procedure SetOpenCLImplicitConv(pValue: boolean);
+
 /// Split-row SDPA decode sizing (TNNetFusedSDPACL): csFusedSDPA* defaults
 /// unless NEURAL_SDPA_GROUPS_PER_UNIT / _MIN_CHUNK_ROWS / _MAX_SPLITS /
 /// _MAX_CHUNK_ROWS are set.
 procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
   MaxChunkRows: integer);
+/// Flash SDPA dispatch and split sizing: csFusedSDPAFlash* defaults unless
+/// NEURAL_SDPA_FLASH_MIN_TOKENS / _MIN_SPLIT_KEYS are set.
+procedure FusedSDPAFlashSizing(out MinTokens, MinSplitKeys: integer);
+
+/// Size in bytes of an OpenCL buffer as the driver reports it (CL_MEM_SIZE);
+/// 0 for nil or when the query fails.
+function OpenCLMemBytes(Buffer: cl_mem): int64;
+
+/// Releases Buffer and makes it a retained reference to SharedBuffer, so the
+/// holder's own clReleaseMemObject later drops only that reference.
+procedure AdoptRetainedOpenCLBuffer(var Buffer: cl_mem; SharedBuffer: cl_mem);
 
 var
   // While true, TEasyOpenCL's Write/Read routines add every transfer to the
   // calling thread's OpenCLThreadTransfers; TNNet.LayerProfiling sets it.
-  // It stays on once set: one threadvar add per transfer from then on.
+  // It stays on once set: per transfer, two threadvar and two atomic adds.
   OpenCLTransferCounting: boolean = false;
+
+  // The same transfers summed over every thread (NeuralAtomicAdd64), for
+  // callers spanning worker threads; read it with OpenCLProcessTransferTotals.
+  OpenCLProcessTransfers: TOpenCLTransferCounts;
+
+  // 0 (default): a launch without a local size leaves it to the driver. N > 0:
+  // TEasyOpenCL uses CappedPowerOfTwoLocalSizes(N) (env NEURAL_OPENCL_LOCAL_SIZE_CAP).
+  OpenCLLocalSizeCap: integer = 0;
 
 threadvar
   OpenCLThreadTransfers: TOpenCLTransferCounts;
@@ -683,9 +865,24 @@ procedure AddOpenCLTransferCounts(var Total: TOpenCLTransferCounts;
 // Total += After - Before: the transfers between two snapshots.
 procedure AddOpenCLTransferDelta(var Total: TOpenCLTransferCounts;
   const After, Before: TOpenCLTransferCounts);
+// OpenCLProcessTransfers read field by field with NeuralAtomicRead64.
+function OpenCLProcessTransferTotals(): TOpenCLTransferCounts;
+
+/// clBuildProgram calls made by TEasyOpenCL.CompileProgram in this process, and
+/// the compiles it served from the process program cache instead.
+function OpenCLProgramBuildCount(): integer;
+function OpenCLProgramCacheHitCount(): integer;
+/// Drops the cache's references (holders keep theirs). Otherwise a cached context
+/// lives to exit, holding OpenCL memory, even once the driver marks it unusable.
+procedure ClearOpenCLProgramCache();
+
+/// LocalSizes[d] := the largest power of two dividing GlobalSizes[d], with the
+/// product over all dimensions at most pCap; fewer local sizes, fewer PoCL compiles.
+procedure CappedPowerOfTwoLocalSizes(const GlobalSizes: array of csize_t;
+  var LocalSizes: array of csize_t; pCap: csize_t);
 
 implementation
-uses math;
+uses math, neuralthread;
 
 const
   platform_str_info: array[1..5] of record
@@ -784,13 +981,60 @@ begin
   inherited Destroy();
 end;
 
+function OpenCLMemBytes(Buffer: cl_mem): int64;
+var
+  BufferSize, SizeWritten: csize_t;
+begin
+  Result := 0;
+  if Buffer = nil then exit;
+  BufferSize := 0;
+  SizeWritten := 0;
+  if clGetMemObjectInfo(Buffer, CL_MEM_SIZE, SizeOf(BufferSize), @BufferSize,
+    {$IFDEF FPC}SizeWritten{$ELSE}@SizeWritten{$ENDIF}) = CL_SUCCESS then
+    Result := BufferSize;
+end;
+
+procedure AdoptRetainedOpenCLBuffer(var Buffer: cl_mem; SharedBuffer: cl_mem);
+begin
+  if Buffer = SharedBuffer then exit;
+  clRetainMemObject(SharedBuffer);
+  if Assigned(Buffer) then clReleaseMemObject(Buffer);
+  Buffer := SharedBuffer;
+end;
+
+// The bound-argument caches compare handles, so they are dropped too.
+procedure TDotProductSharedKernel.AdoptResultBuffer(Buffer: cl_mem;
+  Bytes: csize_t);
+begin
+  AdoptRetainedOpenCLBuffer(FResultBuffer, Buffer);
+  FCapResult := Bytes;
+  FMainArgsBound := false;
+  FSinglePassArgsBound := false;
+  FSplitKArgsBound := false;
+end;
+
+function TDotProductSharedKernel.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FInputBufferBs) +
+    OpenCLMemBytes(FResultBuffer) +
+    OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
+    OpenCLMemBytes(FInputBufferBsFP16);
+  if not FWeightsBorrowed then
+    Result := Result + OpenCLMemBytes(FInputBufferAs);
+  if not FBiasBorrowed then
+    Result := Result + OpenCLMemBytes(FBiasBuffer);
+  if not FCodesBorrowed then
+    Result := Result + OpenCLMemBytes(FCodesBuffer) +
+      OpenCLMemBytes(FScalesBuffer) + OpenCLMemBytes(FBlockScalesBuffer);
+end;
+
 procedure TDotProductSharedKernel.UnprepareForCompute();
 begin
   if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
   if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
   if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
-  if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+  if Assigned(FGatherSrcBuffer) then clReleaseMemObject(FGatherSrcBuffer);
   if Assigned(FCodesBuffer)   then clReleaseMemObject(FCodesBuffer);
   if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
   if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
@@ -807,11 +1051,16 @@ begin
   if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
   if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
   if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
-  if Assigned(FTiledKernel)        then clReleaseKernel(FTiledKernel);
+  ReleaseTiledKernels();
+  if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
+  if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
+  FImplicitConvKernel := nil;
+  FImplicitConvTiledKernel := nil;
+  FImplicitConvReady := false;
   FMainKernel := nil;
   FSinglePassKernel := nil;
-  FTiledKernel := nil;
   FTiledRejected := false;
+  FTiledSplitKRejected := false;
   FMainArgsBound := false;
   FSinglePassArgsBound := false;
   FSplitKInt4Kernel := nil;
@@ -819,6 +1068,8 @@ begin
   FCapBlockScales := 0;
   FInt4Ready := false;
   FCodesBorrowed := false;
+  FWeightsBorrowed := false;
+  FBiasBorrowed := false;
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
@@ -834,7 +1085,7 @@ begin
   FInputBufferBs := nil;
   FResultBuffer  := nil;
   FBiasBuffer    := nil;
-  FIm2ColSrcBuffer := nil;
+  FGatherSrcBuffer := nil;
   FCodesBuffer   := nil;
   FScalesBuffer  := nil;
 
@@ -842,7 +1093,7 @@ begin
   FCapBs := 0;
   FCapResult := 0;
   FCapBias := 0;
-  FCapIm2ColSrc := 0;
+  FCapGatherSrc := 0;
   FCapCodes := 0;
   FCapScales := 0;
   FInt8Ready := false;
@@ -885,11 +1136,13 @@ begin
   begin
     NeededAs := VAs.GetMemSize();
     NeededBs := VBs.GetMemSize();
-    if (FInputBufferAs = nil) or (NeededAs > FCapAs) then
+    // A borrowed A buffer holds another instance's weights: never written here.
+    if (FInputBufferAs = nil) or FWeightsBorrowed or (NeededAs > FCapAs) then
     begin
       if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
       FInputBufferAs := FDotProductKernel.CreateInputBuffer(NeededAs);
       FCapAs := NeededAs;
+      FWeightsBorrowed := false;
     end;
     if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
     begin
@@ -912,9 +1165,16 @@ end;
 function TDotProductSharedKernel.PrepareForCompute(VAs, VBs: TNNetVolume;
   pSize: longint; GroupSizeA: integer; GroupSizeB: integer): integer;
 begin
+  Result := PrepareForCompute(VAs, VBs.Size div pSize, pSize, GroupSizeA,
+    GroupSizeB);
+end;
+
+function TDotProductSharedKernel.PrepareForCompute(VAs: TNNetVolume;
+  pNumBs, pSize: longint; GroupSizeA: integer; GroupSizeB: integer): integer;
+begin
   UnprepareForCompute();
   FNumAs := VAs.Size div pSize;
-  FNumBs := VBs.Size div pSize;
+  FNumBs := pNumBs;
   FThreadCount := FNumAs * FNumBs;
   FSize := pSize;
   FGroupSizeA := GroupSizeA;
@@ -922,15 +1182,13 @@ begin
 
   // A layer armed before its operands are sized (empty volume, or fewer
   // elements than one row) gets nil buffers: OpenCL rejects 0-byte buffers.
-  if (FHostInput) then
+  // The B buffer waits for EnsureInputBufferBs: a layer that binds a resident
+  // B operand or gathers it inside the GEMM never needs one.
+  if VAs.Size > 0 then
   begin
-    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
-    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
-  end
-  else
-  begin
-    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
-    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    if FHostInput
+      then FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs)
+      else FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
   end;
 
   if FThreadCount > 0 then
@@ -940,6 +1198,39 @@ begin
   PrepareForCompute := CL_SUCCESS;
 end;
 
+function TDotProductSharedKernel.EnsureInputBufferBs(): cl_mem;
+var
+  NeededBs: csize_t;
+begin
+  NeededBs := csize_t(FNumBs) * csize_t(FSize) * csNeuralFloatSize;
+  if (NeededBs > 0) and ((FInputBufferBs = nil) or (NeededBs > FCapBs)) then
+  begin
+    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
+    FCapBs := NeededBs;
+  end;
+  Result := FInputBufferBs;
+end;
+
+function TDotProductSharedKernel.PrepareGatherSource(SrcVol: TNNetVolume;
+  NewSrc: boolean; pExternalSrc: cl_mem; var err: integer): cl_mem;
+var
+  NeededSrc: csize_t;
+begin
+  if pExternalSrc <> nil then exit(pExternalSrc);
+  NeededSrc := SrcVol.GetMemSize();
+  if (FGatherSrcBuffer = nil) or (NeededSrc > FCapGatherSrc) then
+  begin
+    if Assigned(FGatherSrcBuffer) then clReleaseMemObject(FGatherSrcBuffer);
+    FGatherSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
+    FCapGatherSrc := NeededSrc;
+    NewSrc := true; // a fresh buffer holds nothing yet
+  end;
+  if NewSrc then
+    err := err or FDotProductKernel.WriteBuffer(FGatherSrcBuffer, SrcVol);
+  Result := FGatherSrcBuffer;
+end;
+
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
   NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
@@ -947,48 +1238,28 @@ var
   k: cl_kernel;
   N, InSizeX, InSizeY, InDepth: longint;
   err: integer;
-  NeededSrc: csize_t;
   SrcBuffer, ColsBuffer: cl_mem;
 begin
   k := Im2ColKernel.Kernel;
-  // The caller must pass cai_im2col_h whenever this instance is in FP16 mode:
-  // the gather writes whichever B buffer the GEMM will read, and both verdicts
-  // come from the one layer flag so they cannot disagree.
-  if FFP16Activations
-    then ColsBuffer := FInputBufferBsFP16
-    else ColsBuffer := FInputBufferBs;
-  // Total column-matrix elements = FInputBufferBs capacity (already sized to
-  // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
   // The OpenCL kernel indexes with int. TNNetConvolution.ShouldOpenCLIm2Col
   // refuses such a layer first; a raise here cannot leave a stale B operand.
   if Int64(FNumBs) * FSize > High(longint) then
     raise Exception.Create('BuildInputColsOnDevice: column matrix of ' +
       IntToStr(Int64(FNumBs) * FSize) +
       ' elements exceeds the int index range.');
+  // The caller must pass cai_im2col_h whenever this instance is in FP16 mode:
+  // the gather writes whichever B buffer the GEMM will read, and both verdicts
+  // come from the one layer flag so they cannot disagree.
+  if FFP16Activations
+    then ColsBuffer := FInputBufferBsFP16
+    else ColsBuffer := EnsureInputBufferBs();
   N := FNumBs * FSize;
   InSizeX := SrcVol.SizeX;
   InSizeY := SrcVol.SizeY;
   InDepth := SrcVol.Depth;
 
   err := CL_SUCCESS;
-  if pExternalSrc <> nil then
-  begin
-    SrcBuffer := pExternalSrc;
-  end
-  else
-  begin
-    // Resident, grow-only source buffer (same model as the operand/bias buffers).
-    NeededSrc := SrcVol.GetMemSize();
-    if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
-    begin
-      if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
-      FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
-      FCapIm2ColSrc := NeededSrc;
-      NewSrc := true; // fresh/grown buffer: force upload regardless of caller
-    end;
-    SrcBuffer := FIm2ColSrcBuffer;
-    if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol);
-  end;
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
 
   err := err or clSetKernelArg(k, 0, csLongintSize, @N);
   err := err or clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
@@ -1031,11 +1302,13 @@ var
   UseTiled: boolean;
 begin
   FActFun := pActFN;
-  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
+  if (VBs = nil) and NewVBs and (pExternalVBs = nil) then
+    raise Exception.Create('TDotProductSharedKernel.Compute: NewVBs without a B volume.');
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := EnsureInputBufferBs();
 
   if (VAs.Size = FSize * FNumAs) then
   begin
-    if (VBs.Size = FSize * FNumBs) then
+    if (VBs = nil) or (VBs.Size = FSize * FNumBs) then
     begin
       err := CL_SUCCESS;
       UseBias := PrepareBiasOperand(VBias, NewVBias, err);
@@ -1074,7 +1347,8 @@ begin
         ErrorProc('Error: TDotProductSharedKernel.Compute - failed setting ' +
           'kernel arguments: ' + IntToStr(err));
 
-      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+      if NewVAs and not FWeightsBorrowed then
+        err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
       if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -1084,7 +1358,8 @@ begin
 
         if UseTiled then
         begin
-          RunTiledGemm();
+          RunTiledGemm(FTiledKernel, csTiledGemmLanes,
+            csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols);
         end
         else if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
@@ -1313,6 +1588,57 @@ begin
   Result := true;
 end;
 
+// Both instances must have been armed in one OpenCL context; refcounting
+// lets either be unprepared or freed first. Coded by Claude (AI).
+function TDotProductSharedKernel.PrepareForComputeBorrowingWeights(
+  Owner: TDotProductSharedKernel; pNumBs, pSize: longint): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) or FHostInput or
+    Owner.FHostInput or Owner.FInt8Ready or Owner.FInt4Ready or
+    (not Assigned(Owner.FInputBufferAs)) or (Owner.FSize <> pSize) or
+    (pNumBs <= 0) or
+    (Owner.FDotProductKernel.Context <> FDotProductKernel.Context) then exit;
+  UnprepareForCompute();
+  FNumAs := Owner.FNumAs;
+  FNumBs := pNumBs;
+  FSize := pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+  clRetainMemObject(Owner.FInputBufferAs);
+  FInputBufferAs := Owner.FInputBufferAs;
+  FCapAs := Owner.FCapAs;
+  FWeightsBorrowed := true;
+  if Assigned(Owner.FBiasBuffer) then
+  begin
+    clRetainMemObject(Owner.FBiasBuffer);
+    FBiasBuffer := Owner.FBiasBuffer;
+    FCapBias := Owner.FCapBias;
+    FBiasBorrowed := true;
+  end;
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(
+    FNumAs * FNumBs * csNeuralFloatSize);
+  FPreviousComputeTime := 0;
+  Result := true;
+end;
+
+// The bias goes first: the in-order queue has it written once the blocking
+// A upload returns.
+function TDotProductSharedKernel.UploadResidentWeights(
+  VAs, VBias: TNNetVolume): boolean;
+var
+  err: integer;
+begin
+  Result := false;
+  if (not Assigned(FInputBufferAs)) or FWeightsBorrowed or FInt8Ready or
+    FInt4Ready or (VAs.Size <> FNumAs * FSize) then exit;
+  err := CL_SUCCESS;
+  PrepareBiasOperand(VBias, {NewVBias=}true, err);
+  err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs, CL_TRUE);
+  Result := err = CL_SUCCESS;
+end;
+
 function TDotProductSharedKernel.CanBorrowCodesKeepingBuffers(
   Owner: TDotProductSharedKernel): boolean;
 begin
@@ -1348,9 +1674,8 @@ begin
   FSinglePassArgsBound := false;
   if Assigned(FTiledKernel) and (BindTiledCodesArgs() <> CL_SUCCESS) then
   begin
-    // PrepareTiled binds a fresh handle to the new buffers on the next launch.
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
+    // PrepareTiled binds fresh handles to the new buffers on the next launch.
+    ReleaseTiledKernels();
   end;
 end;
 
@@ -1373,13 +1698,47 @@ begin
 end;
 
 function TDotProductSharedKernel.BindTiledCodesArgs(): integer;
+
+  // pScalesPos < 0: the kernel takes no row scales.
+  function BindOne(pKernel: cl_kernel; pScalesPos, pBlockScalesPos: integer): integer;
+  begin
+    Result := CL_SUCCESS;
+    if not Assigned(pKernel) then exit;
+    Result := clSetKernelArg(pKernel, 4, csCLMemSize, @FCodesBuffer);
+    if pScalesPos >= 0 then
+      Result := Result or clSetKernelArg(pKernel, pScalesPos, csCLMemSize,
+        @FScalesBuffer);
+    if FInt4Ready then
+      Result := Result or clSetKernelArg(pKernel, pBlockScalesPos, csCLMemSize,
+        @FBlockScalesBuffer);
+  end;
+
 begin
-  Result := clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
-  Result := Result or clSetKernelArg(FTiledKernel, 9, csCLMemSize,
-    @FScalesBuffer);
-  if FInt4Ready then
-    Result := Result or clSetKernelArg(FTiledKernel, 10, csCLMemSize,
-      @FBlockScalesBuffer);
+  Result := BindOne(FTiledKernel, 9, 10) or BindOne(FTiledBlockKernel, 9, 10) or
+    BindOne(FTiledSplitKKernel, -1, 7);
+  if Assigned(FTiledMergeKernel) then
+    Result := Result or clSetKernelArg(FTiledMergeKernel, 8, csCLMemSize,
+      @FScalesBuffer);
+end;
+
+function TDotProductSharedKernel.BindTiledFixedArgs(pKernel: cl_kernel): integer;
+begin
+  Result := clSetKernelArg(pKernel, 0, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(pKernel, 1, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(pKernel, 2, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(pKernel, 6, csCLMemSize, @FResultBuffer);
+end;
+
+procedure TDotProductSharedKernel.ReleaseTiledKernels();
+begin
+  if Assigned(FTiledKernel) then clReleaseKernel(FTiledKernel);
+  if Assigned(FTiledBlockKernel) then clReleaseKernel(FTiledBlockKernel);
+  if Assigned(FTiledSplitKKernel) then clReleaseKernel(FTiledSplitKKernel);
+  if Assigned(FTiledMergeKernel) then clReleaseKernel(FTiledMergeKernel);
+  FTiledKernel := nil;
+  FTiledBlockKernel := nil;
+  FTiledSplitKKernel := nil;
+  FTiledMergeKernel := nil;
 end;
 
 procedure TDotProductSharedKernel.RefreshResidentBias(VBias: TNNetVolume);
@@ -1418,8 +1777,16 @@ const
   /// Pass 3 walks a chunk's rows serially per lane, so this bounds that chain
   /// when a wide prefill window would otherwise get a few very long chunks.
   csFusedSDPAMaxChunkRows = 512;
+  /// Flash SDPA (TNNetFusedSDPA): a causal step of at least FlashMinTokens rows
+  /// takes the flash kernel (one decode token keeps the split decode), and its
+  /// key splits are at least MinSplitKeys keys.
+  csFusedSDPAFlashMinTokens = 2;
+  csFusedSDPAFlashMinSplitKeys = 256;
 
 var
+  vFusedSDPAFlashOverridesLoaded: boolean = false;
+  vFusedSDPAFlashMinTokens: integer = csFusedSDPAFlashMinTokens;
+  vFusedSDPAFlashMinSplitKeys: integer = csFusedSDPAFlashMinSplitKeys;
   vInt4SplitKOverridesLoaded: boolean = false;
   vInt4SplitKThreadsPerUnit: integer = csInt4SplitKThreadsPerUnit;
   vInt4SplitKMinSlab: integer = csInt4SplitKMinSlab;
@@ -1470,6 +1837,20 @@ begin
   MaxChunkRows := vFusedSDPAMaxChunkRows;
 end;
 
+procedure FusedSDPAFlashSizing(out MinTokens, MinSplitKeys: integer);
+begin
+  if not vFusedSDPAFlashOverridesLoaded then
+  begin
+    vFusedSDPAFlashOverridesLoaded := true;
+    ReadPositiveIntOverride('NEURAL_SDPA_FLASH_MIN_TOKENS',
+      vFusedSDPAFlashMinTokens);
+    ReadPositiveIntOverride('NEURAL_SDPA_FLASH_MIN_SPLIT_KEYS',
+      vFusedSDPAFlashMinSplitKeys);
+  end;
+  MinTokens := vFusedSDPAFlashMinTokens;
+  MinSplitKeys := vFusedSDPAFlashMinSplitKeys;
+end;
+
 var
   vTiledGemmMinColumnsLoaded: boolean = false;
   vTiledGemmMinColumns: integer = csTiledGemmMinColumns;
@@ -1495,71 +1876,442 @@ begin
   vTiledGemmMinColumns := pValue;
 end;
 
+var
+  vTiledGemmCodesGridLoaded: boolean = false;
+  vTiledGemmCodesGrid: TTiledGemmCodesGrid = tgcAuto;
+
+function TiledGemmCodesGrid(): TTiledGemmCodesGrid;
+var
+  EnvValue: string;
+begin
+  if not vTiledGemmCodesGridLoaded then
+  begin
+    vTiledGemmCodesGridLoaded := true;
+    EnvValue := LowerCase(GetEnvironmentVariable('NEURAL_TILED_GEMM_GRID'));
+    if EnvValue = 'large' then vTiledGemmCodesGrid := tgcLarge
+    else if EnvValue = 'block' then vTiledGemmCodesGrid := tgcBlock;
+  end;
+  Result := vTiledGemmCodesGrid;
+end;
+
+function AutoTiledGemmCodesGrid(pNumAs, pNumBs, pComputeUnits: integer;
+  pHasBlock: boolean): TTiledGemmCodesGrid;
+var
+  BlockTiles, BlockColTiles, MinTiles: int64;
+begin
+  // Block when its grid still gives every compute unit
+  // csTiledGemmCodesMinGroupsPerUnit work-groups, with one full column tile
+  // and at most 20% zero-padded columns over its column tiles (129..204
+  // columns would multiply up to 2x the FMAs); else large.
+  MinTiles := int64(csTiledGemmCodesMinGroupsPerUnit) * pComputeUnits;
+  BlockColTiles := (pNumBs + csTiledGemmBlockCols - 1) div csTiledGemmBlockCols;
+  BlockTiles := ((pNumAs + csTiledGemmBlockRows - 1) div csTiledGemmBlockRows) *
+    BlockColTiles;
+  if pHasBlock and (pNumBs >= csTiledGemmBlockCols) and
+    (BlockColTiles * csTiledGemmBlockCols * 4 <= int64(pNumBs) * 5) and
+    (BlockTiles >= MinTiles) then Result := tgcBlock
+  else Result := tgcLarge;
+end;
+
+procedure SetTiledGemmCodesGrid(pValue: TTiledGemmCodesGrid);
+begin
+  vTiledGemmCodesGridLoaded := true;
+  vTiledGemmCodesGrid := pValue;
+end;
+
+var
+  vTiledGemmSplitKLoaded: boolean = false;
+  vTiledGemmSplitK: integer = csTiledGemmSplitKAuto;
+
+function TiledGemmSplitK(): integer;
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  if not vTiledGemmSplitKLoaded then
+  begin
+    EnvValue := GetEnvironmentVariable('NEURAL_TILED_GEMM_SPLITK');
+    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed >= 0) then
+      vTiledGemmSplitK := Parsed;
+    vTiledGemmSplitKLoaded := true;
+  end;
+  Result := vTiledGemmSplitK;
+end;
+
+procedure SetTiledGemmSplitK(pValue: integer);
+begin
+  vTiledGemmSplitKLoaded := true;
+  vTiledGemmSplitK := pValue;
+end;
+
+function TiledGemmStepsPerSplit(pSize, pSplits: integer): integer;
+var
+  TotalSteps: integer;
+begin
+  TotalSteps := (pSize + csTiledGemmKStep - 1) div csTiledGemmKStep;
+  if pSplits < 1 then pSplits := 1;
+  Result := (TotalSteps + pSplits - 1) div pSplits;
+end;
+
+function FitTiledGemmSplitCount(pSize, pSplits: integer): integer;
+var
+  TotalSteps, StepsPerSplit: integer;
+begin
+  Result := 1;
+  TotalSteps := (pSize + csTiledGemmKStep - 1) div csTiledGemmKStep;
+  if (pSplits <= 1) or (TotalSteps <= 1) then exit;
+  if pSplits > TotalSteps then pSplits := TotalSteps;
+  StepsPerSplit := (TotalSteps + pSplits - 1) div pSplits;
+  Result := (TotalSteps + StepsPerSplit - 1) div StepsPerSplit;
+end;
+
+function AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize,
+  pComputeUnits: integer): integer;
+var
+  Tiles, TargetGroups, MaxSplits: int64;
+begin
+  // The large grid launches Tiles work-groups, each walking all of K. Below
+  // csTiledGemmCodesMinGroupsPerUnit per compute unit, K is cut until tiles x
+  // splits reaches csTiledGemmSplitKGroupsPerUnit per unit, with at least
+  // csTiledGemmSplitKMinSteps K-steps per split, at most
+  // csTiledGemmSplitKMaxSplits splits, and partial bytes (rows x columns x
+  // splits x 4) at most the int8 weight bytes (rows x K).
+  Result := 1;
+  if (pNumAs < 1) or (pNumBs < 1) or (pSize < 1) or (pComputeUnits < 1) then exit;
+  Tiles := int64((pNumAs + csTiledGemmCodesRowsPerTile - 1) div
+    csTiledGemmCodesRowsPerTile) *
+    ((pNumBs + csTiledGemmCols - 1) div csTiledGemmCols);
+  if Tiles >= int64(csTiledGemmCodesMinGroupsPerUnit) * pComputeUnits then exit;
+  MaxSplits := ((pSize + csTiledGemmKStep - 1) div csTiledGemmKStep) div
+    csTiledGemmSplitKMinSteps;
+  if MaxSplits > csTiledGemmSplitKMaxSplits then
+    MaxSplits := csTiledGemmSplitKMaxSplits;
+  if MaxSplits > pSize div (4 * int64(pNumBs)) then
+    MaxSplits := pSize div (4 * int64(pNumBs));
+  if MaxSplits < 2 then exit;
+  TargetGroups := int64(csTiledGemmSplitKGroupsPerUnit) * pComputeUnits;
+  Result := FitTiledGemmSplitCount(pSize,
+    integer(Min(MaxSplits, (TargetGroups + Tiles - 1) div Tiles)));
+end;
+
+var
+  vOpenCLImplicitConvLoaded: boolean = false;
+  vOpenCLImplicitConv: boolean = true;
+
+function OpenCLImplicitConvEnabled(): boolean;
+begin
+  if not vOpenCLImplicitConvLoaded then
+  begin
+    vOpenCLImplicitConvLoaded := true;
+    vOpenCLImplicitConv :=
+      GetEnvironmentVariable('NEURAL_OPENCL_IMPLICIT_CONV') <> '0';
+  end;
+  Result := vOpenCLImplicitConv;
+end;
+
+procedure SetOpenCLImplicitConv(pValue: boolean);
+begin
+  vOpenCLImplicitConvLoaded := true;
+  vOpenCLImplicitConv := pValue;
+end;
+
 function TDotProductSharedKernel.ShouldUseTiledGemm(): boolean;
 var
-  MinColumns: integer;
+  MinColumns, MinLanes: integer;
 begin
   MinColumns := TiledGemmMinColumns();
+  if FInt8Ready or FInt4Ready
+    then MinLanes := csTiledGemmCodesLanes
+    else MinLanes := csTiledGemmLanes;
   Result := (MinColumns > 0) and (FNumBs >= MinColumns) and (FSize > 0) and
-    (FDotProductKernel.DeviceMaxWorkGroupSize() >= csTiledGemmLanes);
+    (FDotProductKernel.DeviceMaxWorkGroupSize() >= MinLanes);
+  // A code-kernel lane reads 4 rows starting at most at row FNumAs-4.
+  if (FInt8Ready or FInt4Ready) and (FNumAs < csTiledGemmCodesRowsPerLane) then
+    Result := false;
+end;
+
+// DeviceMaxComputeUnits is cached by TEasyOpenCL after its first query.
+function TDotProductSharedKernel.SelectCodesGrid(): TTiledGemmCodesGrid;
+begin
+  Result := TiledGemmCodesGrid();
+  if (Result = tgcLarge) or
+    ((Result = tgcBlock) and Assigned(FTiledBlockKernel)) then exit;
+  Result := AutoTiledGemmCodesGrid(FNumAs, FNumBs,
+    FDotProductKernel.DeviceMaxComputeUnits(), Assigned(FTiledBlockKernel));
 end;
 
 function TDotProductSharedKernel.PrepareTiled(): boolean;
 var
   err: integer;
+  KernelName: string;
+  CodesKernel: TNeuralKernel;
 begin
   Result := Assigned(FTiledKernel);
   if Result or FTiledRejected then exit;
   FTiledRejected := true;
-  if FInt4Ready then
-    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_tiled')
-  else if not FInt8Ready then
-    FTiledKernel := FDotProductKernel.CreateKernel('cai_dot_product_tiled')
-  else if FFP16Activations then
-    FTiledKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_tiled_h')
-  else
-    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_tiled');
-  if not Assigned(FTiledKernel) then exit;
-  // Register use can cap the kernel below the device's work-group limit.
-  if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
-  begin
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
-    exit;
-  end;
   if not (FInt8Ready or FInt4Ready) then
   begin
+    FTiledKernel := FDotProductKernel.CreateKernel('cai_dot_product_tiled');
+    if not Assigned(FTiledKernel) then exit;
+    // Register use can cap the kernel below the device's work-group limit.
+    if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
+    begin
+      ReleaseTiledKernels();
+      exit;
+    end;
     FTiledRejected := false;
     Result := true;
     exit;
   end;
-  err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(FTiledKernel, 1, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(FTiledKernel, 2, csLongintSize, @FSize);
-  err := err or clSetKernelArg(FTiledKernel, 6, csCLMemSize, @FResultBuffer);
+  KernelName := TiledCodesKernelName(CodesKernel);
+  // The large grid is required: when registers cap it below its 128 lanes,
+  // FTiledRejected keeps ComputeResidentCodes on the untiled kernels.
+  FTiledKernel := CodesKernel.CreateKernel(KernelName);
+  if (not Assigned(FTiledKernel)) or
+    (FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) <
+      csTiledGemmCodesLanes) then
+  begin
+    ReleaseTiledKernels();
+    exit;
+  end;
+  FTiledBlockKernel := CodesKernel.CreateKernel(KernelName + '_block');
+  // Dropped when registers cap its work-group or its 32.5 KB of local memory
+  // does not fit the device.
+  if Assigned(FTiledBlockKernel) and
+    ((FDotProductKernel.KernelMaxWorkGroupSize(FTiledBlockKernel) <
+      csTiledGemmBlockLanes) or
+    (FDotProductKernel.KernelLocalMemSize(FTiledBlockKernel) >
+      FDotProductKernel.DeviceLocalMemSize())) then
+  begin
+    clReleaseKernel(FTiledBlockKernel);
+    FTiledBlockKernel := nil;
+  end;
+  err := BindTiledFixedArgs(FTiledKernel);
+  if Assigned(FTiledBlockKernel) then
+    err := err or BindTiledFixedArgs(FTiledBlockKernel);
   err := err or BindTiledCodesArgs();
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.PrepareTiled - failed setting ' +
       'the fixed tiled GEMM arguments: ' + IntToStr(err));
-    clReleaseKernel(FTiledKernel);
-    FTiledKernel := nil;
+    ReleaseTiledKernels();
     exit;
   end;
   FTiledRejected := false;
   Result := true;
+  // PrepareTiled runs inside the first compute call that takes the tiled
+  // path; this grows the queue's scratch (clCreateBuffer) for this layer's
+  // split there, as PrepareSplitK does for the untiled split-K.
+  if SelectCodesGrid() = tgcLarge then PrepareTiledSplitK(SelectTiledSplitCount());
 end;
 
-procedure TDotProductSharedKernel.RunTiledGemm();
+function TDotProductSharedKernel.TiledCodesKernelName(
+  out pCodesKernel: TNeuralKernel): string;
+begin
+  pCodesKernel := FInt8Kernel;
+  if FInt4Ready then Result := 'cai_dot_product_int4_tiled'
+  else if FFP16Activations then
+  begin
+    Result := 'cai_dot_product_int8_tiled_h';
+    pCodesKernel := FFP16Kernel;
+  end
+  else Result := 'cai_dot_product_int8_tiled';
+end;
+
+// The partials live in one scratch buffer per command queue. On a private
+// queue (one per layer) that buffer would be per layer too, so auto never
+// splits there; a forced count still does.
+function TDotProductSharedKernel.SelectTiledSplitCount(): integer;
+begin
+  Result := TiledGemmSplitK();
+  if Result <> csTiledGemmSplitKAuto then
+    Result := FitTiledGemmSplitCount(FSize, Result)
+  else if FDotProductKernel.HasPrivateQueue() then
+    Result := 1
+  else
+    Result := AutoTiledGemmSplitCount(FNumAs, FNumBs, FSize,
+      FDotProductKernel.DeviceMaxComputeUnits());
+end;
+
+function TDotProductSharedKernel.PrepareTiledSplitK(pSplits: integer): boolean;
+var
+  err: integer;
+  KernelName: string;
+  CodesKernel: TNeuralKernel;
+  NeededPartial: csize_t;
+  Scratch: cl_mem;
+  Generation: integer;
+  BindPartial: boolean;
+
+  // FTiledKernel and FTiledBlockKernel stay: the unsplit grids still run.
+  procedure ReleaseSplitPair();
+  begin
+    if Assigned(FTiledSplitKKernel) then clReleaseKernel(FTiledSplitKKernel);
+    if Assigned(FTiledMergeKernel) then clReleaseKernel(FTiledMergeKernel);
+    FTiledSplitKKernel := nil;
+    FTiledMergeKernel := nil;
+  end;
+
+begin
+  Result := false;
+  // The kernels index the partials in int32.
+  if FTiledSplitKRejected or (pSplits < 2) or (not Assigned(FTiledKernel)) or
+    (int64(FNumAs) * FNumBs * pSplits >= High(longint)) then exit;
+  BindPartial := false;
+  if not Assigned(FTiledSplitKKernel) then
+  begin
+    FTiledSplitKRejected := true;
+    KernelName := TiledCodesKernelName(CodesKernel) + '_splitk';
+    FTiledSplitKKernel := CodesKernel.CreateKernel(KernelName);
+    FTiledMergeKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+    if (not Assigned(FTiledSplitKKernel)) or (not Assigned(FTiledMergeKernel)) or
+      (FDotProductKernel.KernelMaxWorkGroupSize(FTiledSplitKKernel) <
+        csTiledGemmCodesLanes) then
+    begin
+      ReleaseSplitPair();
+      exit;
+    end;
+    err := clSetKernelArg(FTiledSplitKKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FTiledSplitKKernel, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(FTiledSplitKKernel, 2, csLongintSize, @FSize);
+    err := err or clSetKernelArg(FTiledMergeKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FTiledMergeKernel, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(FTiledMergeKernel, 5, csCLMemSize, @FResultBuffer);
+    err := err or BindTiledCodesArgs();
+    if err <> CL_SUCCESS then
+    begin
+      ErrorProc('Error: TDotProductSharedKernel.PrepareTiledSplitK - failed ' +
+        'setting the fixed arguments: ' + IntToStr(err));
+      ReleaseSplitPair();
+      exit;
+    end;
+    FTiledSplitKRejected := false;
+    BindPartial := true;
+  end;
+  // Shared by every layer on this in-order queue: each launch enqueues its
+  // split kernel and merge back to back, so no other writer comes between.
+  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * csNeuralFloatSize;
+  Scratch := FDotProductKernel.QueueScratchBuffer(NeededPartial, Generation);
+  if not Assigned(Scratch) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.PrepareTiledSplitK - failed ' +
+      'allocating ' + IntToStr(NeededPartial) + ' bytes of split-K partials.');
+    FTiledSplitKRejected := true;
+    exit;
+  end;
+  if BindPartial or (Generation <> FTiledScratchGeneration) then
+  begin
+    err := clSetKernelArg(FTiledSplitKKernel, 6, csCLMemSize, @Scratch);
+    err := err or clSetKernelArg(FTiledMergeKernel, 4, csCLMemSize, @Scratch);
+    if err <> CL_SUCCESS then
+    begin
+      FTiledSplitKRejected := true;
+      exit;
+    end;
+    FTiledScratchGeneration := Generation;
+  end;
+  Result := true;
+end;
+
+procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel;
+  pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
 var
   RowTiles, ColTiles: longint;
 begin
-  RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
-    div (csTiledGemmLanes * csTiledGemmRowsPerLane);
-  ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
-  FDotProductKernel.RunKernel2D(FTiledKernel, RowTiles * csTiledGemmLanes,
-    ColTiles, csTiledGemmLanes, 1);
+  RowTiles := (FNumAs + pRowsPerTile - 1) div pRowsPerTile;
+  ColTiles := (FNumBs + pColsPerTile - 1) div pColsPerTile;
+  if pSplits > 1
+    then FDotProductKernel.RunKernel3D(pKernel, RowTiles * pLanes, ColTiles,
+      pSplits, pLanes, 1, 1)
+    else FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles,
+      pLanes, 1);
   Inc(FTiledLaunchCount);
+  FLastTiledLanes := pLanes;
+  FLastTiledSplits := pSplits;
+end;
+
+function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
+begin
+  Result := FImplicitConvReady;
+  if Result or FInt8Ready or FInt4Ready then exit;
+  FImplicitConvKernel := FDotProductKernel.CreateKernel('cai_conv_implicit');
+  if not Assigned(FImplicitConvKernel) then exit;
+  // Optional: without it every shape takes cai_conv_implicit.
+  FImplicitConvTiledKernel := FDotProductKernel.CreateKernel('cai_conv_implicit_tiled');
+  if Assigned(FImplicitConvTiledKernel) and
+    (FDotProductKernel.KernelMaxWorkGroupSize(FImplicitConvTiledKernel) <
+      csTiledGemmLanes) then
+  begin
+    clReleaseKernel(FImplicitConvTiledKernel);
+    FImplicitConvTiledKernel := nil;
+  end;
+  FImplicitConvReady := true;
+  Result := true;
+end;
+
+procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
+  OutSizeX, RowSpan, Stride, Padding, pActFN: longint; NewVAs: boolean;
+  VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
+  pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InSizeX, InSizeY, InDepth: longint;
+  K: cl_kernel;
+  SrcBuffer: cl_mem;
+  UseTiled: boolean;
+begin
+  if not FImplicitConvReady then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv without ' +
+      'PrepareImplicitConv.');
+    exit;
+  end;
+  if VAs.Size <> FSize * FNumAs then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - VA size: ' +
+      IntToStr(VAs.Size) + ' FSize: ' + IntToStr(FSize) +
+      ' NumAs:' + IntToStr(FNumAs));
+    exit;
+  end;
+  FActFun := pActFN;
+  InSizeX := SrcVol.SizeX;
+  InSizeY := SrcVol.SizeY;
+  InDepth := SrcVol.Depth;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs and not FWeightsBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+  UseTiled := Assigned(FImplicitConvTiledKernel) and
+    (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm();
+  if UseTiled then K := FImplicitConvTiledKernel else K := FImplicitConvKernel;
+  err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
+  err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
+  err := err or clSetKernelArg(K, 9, csLongintSize, @OutSizeX);
+  err := err or clSetKernelArg(K, 10, csLongintSize, @RowSpan);
+  err := err or clSetKernelArg(K, 11, csLongintSize, @InSizeX);
+  err := err or clSetKernelArg(K, 12, csLongintSize, @InSizeY);
+  err := err or clSetKernelArg(K, 13, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(K, 14, csLongintSize, @Stride);
+  err := err or clSetKernelArg(K, 15, csLongintSize, @Padding);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'setting arguments or uploading: ' + IntToStr(err));
+    exit;
+  end;
+  if UseTiled
+    then RunTiledGemm(K, csTiledGemmLanes,
+      csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols)
+    else FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
+  Inc(FImplicitConvLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
@@ -1671,8 +2423,6 @@ end;
 
 function TDotProductSharedKernel.PrepareInt8BOperand(VBs: TNNetVolume;
   NewVBs: boolean; pExternalVBs: cl_mem; var err: integer): cl_mem;
-var
-  NeededBs: csize_t;
 begin
   if not FFP16Activations then
   begin
@@ -1698,15 +2448,10 @@ begin
     exit;
   end;
 
-  // Host-supplied B: upload FP32, then narrow on the device. This staging copy
-  // is reached only here, which is why PrepareForComputeInt8 does not size it.
-  NeededBs := VBs.GetMemSize();
-  if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
-  begin
-    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
-    FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
-    FCapBs := NeededBs;
-  end;
+  // Host-supplied B: upload FP32, then narrow in OpenCL memory. This staging
+  // copy is reached only here, which is why PrepareForComputeInt8 does not
+  // size it. VBs.Size = FNumBs * FSize was checked by ComputeResidentCodes.
+  EnsureInputBufferBs();
   err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
   err := err or CastBOperandToFP16(FInputBufferBs, VBs.Size);
 end;
@@ -1859,15 +2604,22 @@ begin
   // re-uploaded only when NewVBias or just (re)allocated.
   Result := 0;
   if VBias = nil then exit;
+  // The kernels read one bias per A row: Bias[row].
+  if VBias.Size <> FNumAs then
+    raise Exception.Create('TDotProductSharedKernel.PrepareBiasOperand: the ' +
+      'bias has ' + IntToStr(VBias.Size) + ' elements, the kernels read one ' +
+      'per row (' + IntToStr(FNumAs) + ').');
   NeededBias := VBias.GetMemSize();
   if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
   begin
     if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
     FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
     FCapBias := NeededBias;
+    FBiasBorrowed := false;
     NewVBias := true; // fresh/grown buffer: force upload regardless of caller
   end;
-  if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+  if NewVBias and not FBiasBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
   Result := 1;
 end;
 
@@ -1879,7 +2631,8 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits: longint;
+  Splits, Lanes, RowsPerTile, ColsPerTile, StepsPerSplit: longint;
+  Grid: TTiledGemmCodesGrid;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -1900,14 +2653,53 @@ begin
   // change per call; the FNumBs = 1 decode paths further down are untouched.
   if ShouldUseTiledGemm() and PrepareTiled() then
   begin
-    K := FTiledKernel;
+    Grid := SelectCodesGrid();
+    if Grid = tgcBlock then Splits := 1 else Splits := SelectTiledSplitCount();
+    if (Splits > 1) and PrepareTiledSplitK(Splits) then
+    begin
+      // Raw partials, then the merge: same in-order queue, so no wait.
+      StepsPerSplit := TiledGemmStepsPerSplit(FSize, Splits);
+      err := err or clSetKernelArg(FTiledSplitKKernel, 3, csLongintSize,
+        @StepsPerSplit);
+      err := err or clSetKernelArg(FTiledSplitKKernel, 5, csCLMemSize, @BufferBs);
+      err := err or clSetKernelArg(FTiledMergeKernel, 2, csLongintSize, @Splits);
+      err := err or clSetKernelArg(FTiledMergeKernel, 3, csLongintSize, @FActFun);
+      err := err or clSetKernelArg(FTiledMergeKernel, 6, csLongintSize, @UseBias);
+      err := err or clSetKernelArg(FTiledMergeKernel, 7, csCLMemSize, @FBiasBuffer);
+      if err = CL_SUCCESS then
+      begin
+        RunTiledGemm(FTiledSplitKKernel, csTiledGemmCodesLanes,
+          csTiledGemmCodesRowsPerTile, csTiledGemmCols, Splits);
+        FDotProductKernel.RunKernel2D(FTiledMergeKernel, FNumAs, FNumBs);
+      end
+      else
+        ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
+          'failed setting split-K tiled GEMM parameters: ' + IntToStr(err));
+      exit;
+    end;
+    case Grid of
+      tgcBlock:
+        begin
+          K := FTiledBlockKernel;
+          Lanes := csTiledGemmBlockLanes;
+          RowsPerTile := csTiledGemmBlockRows;
+          ColsPerTile := csTiledGemmBlockCols;
+        end;
+    else
+      begin
+        K := FTiledKernel;
+        Lanes := csTiledGemmCodesLanes;
+        RowsPerTile := Lanes * csTiledGemmCodesRowsPerLane;
+        ColsPerTile := csTiledGemmCols;
+      end;
+    end;
     err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
     err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
     err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
     err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
     if err = CL_SUCCESS then
     begin
-      RunTiledGemm();
+      RunTiledGemm(K, Lanes, RowsPerTile, ColsPerTile);
     end
     else
     begin
@@ -2148,9 +2940,12 @@ begin
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
   FProg     := SharedKernel.Prog;
-  if pSharedQueue
-    then FCommands := SharedKernel.Commands
-    else FCommands := CreateCommandQueue(); // the command queue is given per kernel
+  if pSharedQueue then
+  begin
+    FCommands := SharedKernel.Commands;
+    FQueueOwner := SharedKernel.FQueueOwner;
+  end
+  else FCommands := CreateCommandQueue(); // the command queue is given per kernel
   // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
@@ -2249,7 +3044,7 @@ begin
   err := err or clSetKernelArg(FKernel, 7, csCLMemSize,  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
+  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FRowBias). This
   // class never fuses bias, but every arg must be set once before enqueue, so pin
   // UseBias=0 and a NULL bias buffer here (clSetKernelArg copies the value
   // immediately, so the locals are safe). Coded by Claude (AI).
@@ -2541,6 +3336,10 @@ begin
   // A borrowed context, program or command queue belongs to the shared kernel
   // that created it; releasing one here would tear it out from under every other
   // borrower, so those references are only dropped. (Coded by Claude (AI).)
+  if (not FBorrowedQueue) and Assigned(FQueueScratch) then
+    clReleaseMemObject(FQueueScratch);
+  FQueueScratch := nil;
+  FQueueScratchBytes := 0;
   if (not FBorrowedQueue) and Assigned(FCommands) then
     clReleaseCommandQueue(FCommands);
   FCommands := nil;
@@ -2558,6 +3357,83 @@ begin
   end;
 end;
 
+type
+  // A built program and its context, keyed by everything that changes the build.
+  TOpenCLProgramCacheEntry = record
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    CompilerOptions: AnsiString;
+    Source: AnsiString;
+    Context: cl_context;
+    Prog: cl_program;
+  end;
+
+var
+  // NEURAL_OPENCL_BUILD_LOG prints one build log per process.
+  vOpenCLBuildLogPrinted: boolean = false;
+  // Each entry holds one reference to its context and program; every
+  // TEasyOpenCL compiled from it holds its own. Guarded by the lock below.
+  vOpenCLProgramCache: array of TOpenCLProgramCacheEntry;
+  vOpenCLProgramCacheLock: TRTLCriticalSection;
+  vOpenCLProgramBuilds: integer = 0;
+  vOpenCLProgramCacheHits: integer = 0;
+
+function OpenCLProgramBuildCount(): integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  Result := vOpenCLProgramBuilds;
+  LeaveCriticalSection(vOpenCLProgramCacheLock);
+end;
+
+function OpenCLProgramCacheHitCount(): integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  Result := vOpenCLProgramCacheHits;
+  LeaveCriticalSection(vOpenCLProgramCacheLock);
+end;
+
+procedure ClearOpenCLProgramCache();
+var
+  EntryCnt: integer;
+begin
+  EnterCriticalSection(vOpenCLProgramCacheLock);
+  try
+    for EntryCnt := 0 to High(vOpenCLProgramCache) do
+    begin
+      clReleaseProgram(vOpenCLProgramCache[EntryCnt].Prog);
+      clReleaseContext(vOpenCLProgramCache[EntryCnt].Context);
+    end;
+    SetLength(vOpenCLProgramCache, 0);
+  finally
+    LeaveCriticalSection(vOpenCLProgramCacheLock);
+  end;
+end;
+
+// Index of the cache entry built from Source with the current platform, device
+// and compiler options; -1 when none. Caller holds vOpenCLProgramCacheLock.
+function FindCachedOpenCLProgram(PlatformId: cl_platform_id;
+  DeviceId: cl_device_id; const CompilerOptions: AnsiString;
+  Source: TNeuralPChar): integer;
+var
+  EntryCnt, SourceLen: integer;
+begin
+  SourceLen := {$IFDEF FPC}StrLen{$ELSE}AnsiStrings.StrLen{$ENDIF}(Source);
+  for EntryCnt := 0 to High(vOpenCLProgramCache) do
+  begin
+    if (vOpenCLProgramCache[EntryCnt].PlatformId = PlatformId) and
+      (vOpenCLProgramCache[EntryCnt].DeviceId = DeviceId) and
+      (Length(vOpenCLProgramCache[EntryCnt].Source) = SourceLen) and
+      (vOpenCLProgramCache[EntryCnt].CompilerOptions = CompilerOptions) and
+      ({$IFDEF FPC}StrComp{$ELSE}AnsiStrings.StrComp{$ENDIF}(
+        TNeuralPChar(vOpenCLProgramCache[EntryCnt].Source), Source) = 0) then
+    begin
+      Result := EntryCnt;
+      exit;
+    end;
+  end;
+  Result := -1;
+end;
+
 procedure TEasyOpenCL.CompileProgram();
 var
   localKernelSource: TNeuralPChar;
@@ -2565,6 +3441,7 @@ var
   err: integer; // error code returned from api calls
   errorlogstr: TNeuralStrBuffer;
   loglen: csize_t;
+  CacheIdx: integer;
 begin
   err := 0;
   FreeContext();
@@ -2576,7 +3453,24 @@ begin
   {$ELSE}
   localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
   {$ENDIF}
+  EnterCriticalSection(vOpenCLProgramCacheLock);
   try
+    // Every TNNet.EnableOpenCL compiles neural.cl: reuse the context and the
+    // built program, and give this instance its own command queue.
+    CacheIdx := FindCachedOpenCLProgram(FCurrentPlatform, FCurrentDevice,
+      FCompilerOptions, localKernelSource);
+    if CacheIdx >= 0 then
+    begin
+      FContext := vOpenCLProgramCache[CacheIdx].Context;
+      clRetainContext(FContext);
+      FProg := vOpenCLProgramCache[CacheIdx].Prog;
+      clRetainProgram(FProg);
+      FCommands := CreateCommandQueue();
+      Inc(vOpenCLProgramCacheHits);
+      FMessageProc('OpenCL program reused from the process cache.');
+      exit;
+    end;
+
     // Create a compute context
     FContext := CreateContext();
     if FContext = nil then exit;
@@ -2604,6 +3498,7 @@ begin
 
     // Build the program executable
     err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
+    Inc(vOpenCLProgramBuilds);
 
     {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
 
@@ -2620,8 +3515,30 @@ begin
       exit;
     end
     else
+    begin
       FMessageProc('clBuildProgram OK!');
+      CacheIdx := Length(vOpenCLProgramCache);
+      SetLength(vOpenCLProgramCache, CacheIdx + 1);
+      vOpenCLProgramCache[CacheIdx].PlatformId := FCurrentPlatform;
+      vOpenCLProgramCache[CacheIdx].DeviceId := FCurrentDevice;
+      vOpenCLProgramCache[CacheIdx].CompilerOptions := FCompilerOptions;
+      vOpenCLProgramCache[CacheIdx].Source := AnsiString(localKernelSource);
+      vOpenCLProgramCache[CacheIdx].Context := FContext;
+      vOpenCLProgramCache[CacheIdx].Prog := FProg;
+      clRetainContext(FContext);
+      clRetainProgram(FProg);
+      // NEURAL_OPENCL_BUILD_LOG prints the first successful build's log (with
+      // -cl-nv-verbose, NVIDIA's register use); TNNet builds with messages
+      // hidden, so the opt-in bypasses FMessageProc.
+      if (not vOpenCLBuildLogPrinted) and
+        (GetEnvironmentVariable('NEURAL_OPENCL_BUILD_LOG') <> '') then
+      begin
+        vOpenCLBuildLogPrinted := true;
+        DefaultMessageProc('OpenCL build log: ' + BuildLog());
+      end;
+    end;
   finally
+    LeaveCriticalSection(vOpenCLProgramCacheLock);
     {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelSource);
   end;
 end;
@@ -2899,22 +3816,40 @@ begin
   Inc(Total.DownloadBytes, After.DownloadBytes - Before.DownloadBytes);
 end;
 
+function OpenCLProcessTransferTotals(): TOpenCLTransferCounts;
+begin
+  Result.UploadCount := NeuralAtomicRead64(OpenCLProcessTransfers.UploadCount);
+  Result.UploadBytes := NeuralAtomicRead64(OpenCLProcessTransfers.UploadBytes);
+  Result.DownloadCount :=
+    NeuralAtomicRead64(OpenCLProcessTransfers.DownloadCount);
+  Result.DownloadBytes :=
+    NeuralAtomicRead64(OpenCLProcessTransfers.DownloadBytes);
+end;
+
 procedure CountOpenCLUpload(Bytes: csize_t);
 begin
   Inc(OpenCLThreadTransfers.UploadCount);
   Inc(OpenCLThreadTransfers.UploadBytes, Bytes);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.UploadCount, 1);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.UploadBytes, Bytes);
 end;
 
 procedure CountOpenCLDownload(Bytes: csize_t);
 begin
   Inc(OpenCLThreadTransfers.DownloadCount);
   Inc(OpenCLThreadTransfers.DownloadBytes, Bytes);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.DownloadCount, 1);
+  NeuralAtomicAdd64(OpenCLProcessTransfers.DownloadBytes, Bytes);
 end;
 
 function TEasyOpenCL.WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
 begin
   if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
+  // Counted after the enqueue, so any count a reader sees is already queued.
+  if blocking = CL_FALSE then
+    {$IFDEF FPC}InterLockedIncrement{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsEnqueued);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('clEnqueueWriteBuffer :'+ IntToStr(Result)+ ' Size:'+ IntToStr(cb)+' bytes.');
@@ -2922,9 +3857,14 @@ begin
 end;
 
 function TEasyOpenCL.ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+var
+  UploadCount: LongInt;
 begin
   if OpenCLTransferCounting then CountOpenCLDownload(cb);
+  UploadCount := UploadsEnqueuedNow();
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
+  if (Result = CL_SUCCESS) and (blocking <> CL_FALSE) then
+    MarkUploadsCompleted(UploadCount);
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_OUT_OF_RESOURCES)
@@ -2937,6 +3877,9 @@ function TEasyOpenCL.WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr
 begin
   if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if blocking = CL_FALSE then
+    {$IFDEF FPC}InterLockedIncrement{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsEnqueued);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to write buffer slice: ' + IntToStr(Result) +
@@ -2945,9 +3888,14 @@ begin
 end;
 
 function TEasyOpenCL.ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+var
+  UploadCount: LongInt;
 begin
   if OpenCLTransferCounting then CountOpenCLDownload(cb);
+  UploadCount := UploadsEnqueuedNow();
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result = CL_SUCCESS) and (blocking <> CL_FALSE) then
+    MarkUploadsCompleted(UploadCount);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
@@ -3094,14 +4042,141 @@ begin
   end;
 end;
 
+function TEasyOpenCL.KernelPrivateMemSize(pKernel: cl_kernel): int64;
+const
+  // CL_KERNEL_PRIVATE_MEM_SIZE (OpenCL 1.1), absent from the FPC cl unit.
+  csCLKernelPrivateMemSize = $11B4;
+var
+  PrivateBytes: cl_ulong;
+  BytesWritten: csize_t;
+begin
+  Result := -1;
+  if (FCurrentDevice = nil) or (pKernel = nil) then exit;
+  PrivateBytes := 0;
+  if clGetKernelWorkGroupInfo(pKernel, FCurrentDevice, csCLKernelPrivateMemSize,
+    SizeOf(PrivateBytes), @PrivateBytes, @BytesWritten) = CL_SUCCESS then
+    Result := PrivateBytes;
+end;
+
+function TEasyOpenCL.SaveProgramBinary(const FileName: string): boolean;
+var
+  DeviceCount: cl_uint;
+  BinarySizes: array of csize_t;
+  Binaries: array of PByte;
+  BytesWritten: csize_t;
+  DeviceIdx, ProgramDeviceIdx: integer;
+  ProgramDevices: array of cl_device_id;
+  BinaryStream: TFileStream;
+begin
+  Result := false;
+  if FProg = nil then exit;
+  DeviceCount := 0;
+  if clGetProgramInfo(FProg, CL_PROGRAM_NUM_DEVICES, SizeOf(DeviceCount),
+    @DeviceCount, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF})
+    <> CL_SUCCESS then exit;
+  if DeviceCount = 0 then exit;
+  SetLength(ProgramDevices, DeviceCount);
+  SetLength(BinarySizes, DeviceCount);
+  SetLength(Binaries, DeviceCount);
+  if clGetProgramInfo(FProg, CL_PROGRAM_DEVICES,
+    DeviceCount * SizeOf(cl_device_id), @ProgramDevices[0],
+    {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) <> CL_SUCCESS then exit;
+  if clGetProgramInfo(FProg, CL_PROGRAM_BINARY_SIZES,
+    DeviceCount * SizeOf(csize_t), @BinarySizes[0],
+    {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) <> CL_SUCCESS then exit;
+  ProgramDeviceIdx := 0;
+  for DeviceIdx := 0 to DeviceCount - 1 do
+  begin
+    if ProgramDevices[DeviceIdx] = FCurrentDevice then
+      ProgramDeviceIdx := DeviceIdx;
+    if BinarySizes[DeviceIdx] > 0
+      then Binaries[DeviceIdx] := GetMem(BinarySizes[DeviceIdx])
+      else Binaries[DeviceIdx] := nil;
+  end;
+  try
+    if (BinarySizes[ProgramDeviceIdx] = 0) or
+      (clGetProgramInfo(FProg, CL_PROGRAM_BINARIES, DeviceCount * SizeOf(PByte),
+       @Binaries[0], {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF})
+       <> CL_SUCCESS) then exit;
+    BinaryStream := TFileStream.Create(FileName, fmCreate);
+    try
+      BinaryStream.WriteBuffer(Binaries[ProgramDeviceIdx]^,
+        BinarySizes[ProgramDeviceIdx]);
+    finally
+      BinaryStream.Free;
+    end;
+    Result := true;
+  finally
+    for DeviceIdx := 0 to DeviceCount - 1 do
+      if Binaries[DeviceIdx] <> nil then FreeMem(Binaries[DeviceIdx]);
+  end;
+end;
+
+function TEasyOpenCL.BuildLog(): string;
+var
+  LogBytes: csize_t;
+  LogText: AnsiString;
+begin
+  Result := '';
+  if FProg = nil then exit;
+  LogBytes := 0;
+  if (clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, 0,
+    nil, {$IFDEF FPC}LogBytes{$ELSE}@LogBytes{$ENDIF}) <> CL_SUCCESS) or
+    (LogBytes < 2) then exit;
+  SetLength(LogText, LogBytes);
+  if clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG,
+    LogBytes, @LogText[1], {$IFDEF FPC}LogBytes{$ELSE}@LogBytes{$ENDIF})
+    <> CL_SUCCESS then exit;
+  SetLength(LogText,
+    {$IFDEF FPC}StrLen{$ELSE}AnsiStrings.StrLen{$ENDIF}(PAnsiChar(LogText)));
+  Result := string(LogText);
+end;
+
+procedure CappedPowerOfTwoLocalSizes(const GlobalSizes: array of csize_t;
+  var LocalSizes: array of csize_t; pCap: csize_t);
+var
+  DimPos, MaxDimPos: integer;
+  LocalProduct, DimLocalSize: csize_t;
+begin
+  LocalProduct := 1;
+  MaxDimPos := High(GlobalSizes);
+  for DimPos := 0 to MaxDimPos do
+  begin
+    DimLocalSize := 1;
+    while (GlobalSizes[DimPos] mod (DimLocalSize * 2) = 0) and
+      (LocalProduct * DimLocalSize * 2 <= pCap) do
+      DimLocalSize := DimLocalSize * 2;
+    LocalSizes[DimPos] := DimLocalSize;
+    LocalProduct := LocalProduct * DimLocalSize;
+  end;
+end;
+
+function TEasyOpenCL.LocalSizeCapFor(pKernel: cl_kernel): csize_t;
+var
+  KernelGroupSize: integer;
+begin
+  Result := OpenCLLocalSizeCap;
+  KernelGroupSize := KernelMaxWorkGroupSize(pKernel);
+  if (KernelGroupSize > 0) and (csize_t(KernelGroupSize) < Result) then
+    Result := KernelGroupSize;
+end;
+
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
 var
-  GlobalThreadCount: csize_t;
+  GlobalThreadCount: array[0..0] of csize_t;
+  LocalThreadCount: array[0..0] of csize_t;
+  LocalSizesArg: pointer;
   work_dim: cl_uint;
 begin
-  GlobalThreadCount := ThreadCount;
+  GlobalThreadCount[0] := ThreadCount;
   work_dim := 1;
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @GlobalThreadCount, nil, 0, nil, nil);
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(GlobalThreadCount, LocalThreadCount, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @LocalThreadCount[0];
+  end;
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @GlobalThreadCount[0], LocalSizesArg, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
@@ -3114,13 +4189,20 @@ function TEasyOpenCL.RunKernel2D(pkernel: cl_kernel;
   d1size, d2size: csize_t): integer;
 var
   work_dim: cl_uint;
-  dim_sizes: array[0..1] of csize_t;
+  dim_sizes, group_sizes: array[0..1] of csize_t;
+  LocalSizesArg: pointer;
 begin
   work_dim := 2;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(dim_sizes, group_sizes, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @group_sizes[0];
+  end;
 
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], nil, 0, nil, nil);
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], LocalSizesArg, 0, nil, nil);
 
   if (Result <> CL_SUCCESS) then
   begin
@@ -3160,14 +4242,21 @@ function TEasyOpenCL.RunKernel3D(pkernel: cl_kernel; d1size, d2size,
   d3size: csize_t): integer;
 var
   work_dim: cl_uint;
-  dim_sizes: array[0..2] of csize_t;
+  dim_sizes, group_sizes: array[0..2] of csize_t;
+  LocalSizesArg: pointer;
 begin
   work_dim := 3;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
   dim_sizes[2] := d3size;
+  LocalSizesArg := nil;
+  if OpenCLLocalSizeCap > 0 then
+  begin
+    CappedPowerOfTwoLocalSizes(dim_sizes, group_sizes, LocalSizeCapFor(pkernel));
+    LocalSizesArg := @group_sizes[0];
+  end;
 
-  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], nil, 0, nil, nil);
+  Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], LocalSizesArg, 0, nil, nil);
 
   if (Result <> CL_SUCCESS) then
   begin
@@ -3206,9 +4295,72 @@ begin
   end;
 end;
 
-function TEasyOpenCL.Finish(): integer;
+function TEasyOpenCL.UploadsEnqueuedNow(): LongInt;
 begin
+  Result := {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+    FQueueOwner.FUploadsEnqueued, 0);
+end;
+
+// The counters wrap: their difference decides, so overflow checks are off.
+{$PUSH}{$Q-}{$R-}
+procedure TEasyOpenCL.MarkUploadsCompleted(UploadCount: LongInt);
+var
+  Completed: LongInt;
+begin
+  repeat
+    Completed := {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+      FQueueOwner.FUploadsCompleted, 0);
+    if LongInt(UploadCount - Completed) <= 0 then exit;
+  until {$IFDEF FPC}InterlockedCompareExchange{$ELSE}AtomicCmpExchange{$ENDIF}(
+    FQueueOwner.FUploadsCompleted, UploadCount, Completed) = Completed;
+end;
+
+function TEasyOpenCL.HasPendingUploads(): boolean;
+begin
+  Result := LongInt(UploadsEnqueuedNow() -
+    {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
+    FQueueOwner.FUploadsCompleted, 0)) > 0;
+end;
+{$POP}
+
+function TEasyOpenCL.HasPrivateQueue(): boolean;
+begin
+  Result := FBorrowedContext and not FBorrowedQueue;
+end;
+
+// A released buffer stays alive until the commands already enqueued with it
+// finish, so growing it never pulls memory from under an earlier launch.
+function TEasyOpenCL.QueueScratchBuffer(pBytes: csize_t;
+  out pGeneration: integer): cl_mem;
+var
+  Owner: TEasyOpenCL;
+begin
+  Owner := FQueueOwner;
+  if (Owner.FQueueScratch = nil) or (pBytes > Owner.FQueueScratchBytes) then
+  begin
+    if Assigned(Owner.FQueueScratch) then clReleaseMemObject(Owner.FQueueScratch);
+    Owner.FQueueScratch := Owner.CreateBuffer(pBytes);
+    if Assigned(Owner.FQueueScratch)
+      then Owner.FQueueScratchBytes := pBytes
+      else Owner.FQueueScratchBytes := 0;
+    Inc(Owner.FQueueScratchGeneration);
+  end;
+  pGeneration := Owner.FQueueScratchGeneration;
+  Result := Owner.FQueueScratch;
+end;
+
+function TEasyOpenCL.QueueScratchBytes(): csize_t;
+begin
+  Result := FQueueOwner.FQueueScratchBytes;
+end;
+
+function TEasyOpenCL.Finish(): integer;
+var
+  UploadCount: LongInt;
+begin
+  UploadCount := UploadsEnqueuedNow();
   Result := clFinish(FCommands);
+  if Result = CL_SUCCESS then MarkUploadsCompleted(UploadCount);
 
   if (Result = CL_SUCCESS) then
     FMessageProc('clFinish OK!')
@@ -3236,12 +4388,22 @@ begin
   SetLength(FDevices, 0);
 
   FCompilerOptions := '-cl-fast-relaxed-math -cl-mad-enable';
+  // Extra build options for diagnostics, such as -cl-nv-verbose.
+  if GetEnvironmentVariable('NEURAL_OPENCL_BUILD_OPTIONS') <> '' then
+    FCompilerOptions := FCompilerOptions + ' ' +
+      GetEnvironmentVariable('NEURAL_OPENCL_BUILD_OPTIONS');
 
   FContext := nil;        // compute context
   FCommands := nil;       // compute command queue
   FProg := nil;           // compute program
   FBorrowedContext := false;
   FBorrowedQueue := false;
+  FQueueOwner := Self;
+  FUploadsEnqueued := 0;
+  FUploadsCompleted := 0;
+  FQueueScratch := nil;
+  FQueueScratchBytes := 0;
+  FQueueScratchGeneration := 0;
 end;
 
 destructor TEasyOpenCL.Destroy();
@@ -3255,9 +4417,15 @@ begin
   inherited Destroy;
 end;
 
-{$IFNDEF FPC}
 initialization
+NeuralInitCriticalSection(vOpenCLProgramCacheLock);
+ReadPositiveIntOverride('NEURAL_OPENCL_LOCAL_SIZE_CAP', OpenCLLocalSizeCap);
+{$IFNDEF FPC}
 InitOpenCL;
 {$ENDIF}
+
+finalization
+ClearOpenCLProgramCache();
+NeuralDoneCriticalSection(vOpenCLProgramCacheLock);
 
 end.

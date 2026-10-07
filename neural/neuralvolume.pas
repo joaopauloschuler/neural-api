@@ -457,6 +457,11 @@ type
     public
       procedure ReSize(pSizeX, pSizeY, pDepth: integer); override;
       function GetMemSize(): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Makes FData the same dynamic array as Original.FData, so a write through
+      // either volume reaches both. Sizes must match unless pAdoptShape is set.
+      procedure ShareDataWith(Original: TNNetVolume; pAdoptShape: boolean = false);
+      // Gives this volume its own copy of FData when another volume shares it.
+      procedure UnshareData();
       // SqrElements is a caller-owned scratch volume shaped like Original; it
       // is resized here only when the shape changes, so nothing is allocated
       // per call (rule #17).
@@ -13062,7 +13067,34 @@ end;
 procedure TNNetVolume.ReSize(pSizeX, pSizeY, pDepth: integer);
 begin
   inherited ReSize(pSizeX, pSizeY, pDepth);
-  FDataPtr := addr(FData[0]);
+  if FSize > 0 then FDataPtr := addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+procedure TNNetVolume.ShareDataWith(Original: TNNetVolume;
+  pAdoptShape: boolean);
+begin
+  if pAdoptShape then
+  begin
+    FSizeX := Original.FSizeX;
+    FSizeY := Original.FSizeY;
+    FDepth := Original.FDepth;
+    FSize := Original.FSize;
+  end
+  else if Original.FSize <> FSize then
+    raise Exception.Create('TNNetVolume.ShareDataWith: sizes ' +
+      IntToStr(FSize) + ' and ' + IntToStr(Original.FSize) + ' differ.');
+  FData := Original.FData;
+  FDataPtr := Original.FDataPtr;
+end;
+
+// SetLength copies a dynamic array referenced more than once and leaves one
+// referenced only here in place.
+procedure TNNetVolume.UnshareData();
+begin
+  SetLength(FData, FSize);
+  if FSize > 0 then FDataPtr := Addr(FData[0])
+  else FDataPtr := nil;
 end;
 
 function TNNetVolume.GetMemSize(): integer;

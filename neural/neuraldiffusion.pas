@@ -346,6 +346,13 @@ type
     // One Euler step in place: Sample += (Sigma[StepIndex+1] - Sigma[StepIndex])
     // * Velocity, where Velocity is the model output at Timestep[StepIndex].
     procedure Step(Sample, Velocity: TNNetVolume; StepIndex: integer);
+    // diffusers img2img get_timesteps: the first step that runs at Strength,
+    // int(N - min(N * Strength, N)); raises when no step runs.
+    class function Img2ImgStartStep(NumSteps: integer;
+      Strength: double): integer;
+    // diffusers scale_noise (the img2img start): Noise becomes
+    // Sigma[StepIndex] * Noise + (1 - Sigma[StepIndex]) * Sample.
+    procedure ScaleNoise(Noise, Sample: TNNetVolume; StepIndex: integer);
 
     property NumSteps: integer read GetNumSteps;
     // Sigma[0..NumSteps]; Sigma[NumSteps] = 0.
@@ -1531,6 +1538,45 @@ begin
     raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
       ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
   Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
+end;
+
+class function TNNetFlowMatchEulerScheduler.Img2ImgStartStep(NumSteps: integer;
+  Strength: double): integer;
+var
+  InitStepCount, StartStepExact: double;
+begin
+  if NumSteps < 1 then
+    raise Exception.Create('Flow-matching NumSteps must be >= 1.');
+  if not ((Strength >= 0) and (Strength <= 1)) then
+    raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
+      ' is outside [0, 1].');
+  // Double throughout (Min/Max would pick their single overloads), so the
+  // truncation lands where Python's does.
+  InitStepCount := NumSteps * Strength;
+  if InitStepCount > NumSteps then InitStepCount := NumSteps;
+  StartStepExact := NumSteps - InitStepCount;
+  if StartStepExact < 0 then StartStepExact := 0;
+  Result := Trunc(StartStepExact);
+  if Result >= NumSteps then
+    raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
+      ' with ' + IntToStr(NumSteps) + ' steps leaves no step to run; raise ' +
+      'the strength or the step count.');
+end;
+
+procedure TNNetFlowMatchEulerScheduler.ScaleNoise(Noise, Sample: TNNetVolume;
+  StepIndex: integer);
+var
+  StartSigma: double;
+begin
+  if (StepIndex < 0) or (StepIndex >= GetNumSteps) then
+    raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
+      ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
+  if Noise.Size <> Sample.Size then
+    raise Exception.Create('ScaleNoise: noise has ' + IntToStr(Noise.Size) +
+      ' values, the sample ' + IntToStr(Sample.Size) + '.');
+  StartSigma := FSigmas[StepIndex];
+  Noise.Mul(StartSigma);
+  Noise.MulAdd(1 - StartSigma, Sample);
 end;
 
 end.

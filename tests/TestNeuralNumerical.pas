@@ -6,9 +6,9 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  neuralabfun, neuraldecode
+  neuralabfun, neuraldecode, neuralthread
   {$IFDEF OpenCL}
-  , cl, neuralopencl
+  , cl, ctypes, neuralopencl
   {$ENDIF}
   ;
 
@@ -400,6 +400,10 @@ type
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
     // round trip must bring the cache home and put it back untouched.
     procedure FusedSDPADecodeResidentOpenCLParity;
+    // Capture a resident cache (it must stay resident), rebuild it from row 0
+    // with other rows, restore (the stale OpenCL copy must be replaced) and
+    // continue: every step after the restore must match the CPU layer.
+    procedure FusedSDPAResidentSnapshotRestoreOpenCLParity;
     // The same decode with a sliding window and a Gemma-2 score soft-cap live,
     // so the kernel's jStart and its tanh branch both run.
     procedure FusedSDPAWindowedDecodeOpenCLParity;
@@ -453,13 +457,21 @@ type
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
     procedure FusedSDPAInt8AppendOpenCLParity;
-    // CachedForwardNonCausal on cai_sdpa_noncausal_tiled vs the CPU: head dims
-    // 5 to 260 (1 to 3 column chunks), query tiles of 1 to 48 rows, 540 keys,
-    // GQA, prefixes of 0 to 300 rows, ragged query and key tiles, a
-    // bound or uploaded source, the prefix appended in OpenCL memory or from the
-    // host, the 16-row key-tile fallback, and two host-path cases (a budget
-    // too small for any tile, an int8 KV cache) that must match exactly.
+    // CachedForwardNonCausal flash vs the CPU: head dims 5 to 260, GQA,
+    // windows, soft-cap, ragged tiles, the int8 cache, and host-path cases.
     procedure FusedSDPANonCausalOpenCLParity;
+    // Causal flash steps (prefill windows over a cache, sliding windows, GQA,
+    // key splits incl. empty ones) against the CPU; one-row steps keep the
+    // split-row decode.
+    procedure FusedSDPAFlashCausalOpenCLParity;
+    // cai_sdpa_flash_int8 vs the CPU int8 path, causal and non-causal (Dk 5
+    // to 256, GQA, windows, splits), with the int8 scratch layout pinned.
+    procedure FusedSDPAFlashInt8OpenCLParity;
+    // Flash over heads wider than 256 in output column chunks.
+    procedure FusedSDPAFlashColumnChunksOpenCLParity;
+    // TNNetScaledDotProductAttention on cai_sdpa_flash vs the CPU, with the
+    // residency of the attention, the concat and the out-projection.
+    procedure ScaledDotProductAttentionFlashOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -480,10 +492,25 @@ type
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
+    // OpenCLLocalSizeCap: each chosen local size divides its global size, and a
+    // forward on odd/composite shapes matches the driver-chosen local size.
+    procedure TestOpenCLLocalSizeCapParity;
     procedure TestChannelMulByLayerOpenCLParity;
-    // Per-token source x host-only per-channel row (Qwen-Image modulation):
-    // resident source bound + row uploaded per forward; host source on the CPU.
+    // Per-token source x host-only per-channel row: resident source bound +
+    // row uploaded per forward; host source on the CPU.
     procedure TestChannelMulByLayerHostRowOpenCLParity;
+    // Qwen-Image modulation chain, ForceOpenCL off: TNNetInput -> opted-in
+    // splits -> AddConstant(1) / tanh stay in OpenCL memory and both
+    // TNNetChannelMulByLayer consumers bind them (sentinels, counts, transfers).
+    procedure TestModulationChainResidentOpenCLParity;
+    // The same chain: a host write marked with MarkOutputWrittenOnRAM, with
+    // the input layer skipped, reaches the product (no stale OpenCL copy).
+    procedure TestModulationChainHostWriteOpenCL;
+    // TNNetInput -> split -> TNNetEmbedding: without the opt-in the split stays
+    // on the host, so nothing is downloaded per forward.
+    procedure TestSplitOfInputBeforeEmbeddingStaysOnHost;
+    // TNNetAddConstant forward on the host: values and ForwardCPUCnt.
+    procedure TestAddConstantHostForwardCount;
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
@@ -587,12 +614,49 @@ type
     // axis; the launch counter proves the tiled path ran. Coded by Claude (AI).
     procedure TestTiledGemmInt8OpenCLParity;
     procedure TestTiledGemmInt4OpenCLParity;
+    // AutoTiledGemmCodesGrid: block for big column windows, else large; never
+    // block below 128 columns or with over 20% padded columns. Coded by Claude (AI).
+    procedure TestTiledGemmCodesAutoGrid;
+    // AutoTiledGemmSplitCount / FitTiledGemmSplitCount on 58 compute units:
+    // LLM prefill windows split, big Qwen-Image shapes do not. Coded by Claude (AI).
+    procedure TestTiledGemmSplitKAutoCount;
+    // Two split-K layers on one queue share one scratch buffer, sized to the
+    // larger, and stay correct after it grows. Coded by Claude (AI).
+    procedure TestTiledGemmSplitKSharedScratch;
     // FP32 tiled GEMM (cai_dot_product_tiled) for pointwise and 3x3 im2col
     // convolutions vs cai_dot_product and the CPU forward.
     procedure TestTiledGemmFP32OpenCLParity;
+    // Implicit-GEMM convolution (cai_conv_implicit_tiled / cai_conv_implicit):
+    // vs the CPU forward and vs the explicit cai_im2col path over padding,
+    // stride, ragged reduction and small/large Cout, from a host and a
+    // resident source; no B buffer and no host column matrix. Coded by Claude (AI).
+    procedure TestConvImplicitGemmOpenCLParity;
+    // Fused bias on OpenCL reads one bias per neuron (Bias[row]): FP32
+    // implicit, explicit and pointwise, int8 and int4, tiled and untiled, vs
+    // the CPU and vs a bias-free twin; a bias buffer of Cout floats; host
+    // FOutputRaw and FBiasOutput unsized until a CPU forward. Coded by Claude (AI).
+    procedure TestConvRowBiasOpenCLParity;
+    // ShareOpenCLOutputsByLiveness: identical to unshared on a branching graph,
+    // serial, parallel and re-armed; fewer bytes; suffix forwards refused.
+    procedure TestOpenCLShareOutputsByLiveness;
+    // With OpenCL enabled (also after StartThreadWorkers) a parallel pass keeps
+    // worker 0 alone hot; a mixed host/OpenCL graph still matches the CPU.
+    procedure TestOpenCLSchedulerHotWorkers;
+    // ShareHostOutputsByLiveness on the CPU: identical to unshared, serial and
+    // parallel; fewer host bytes; suffix forwards refused; trainable nets unshared.
+    procedure TestShareHostOutputsByLiveness;
+    // ShareHostOutputsByLiveness on OpenCL with host-computed layers and a host
+    // reader in the pass: identical to unshared; off with per-layer queues.
+    procedure TestOpenCLShareHostOutputsByLiveness;
+    // TDotProductSharedKernel.Compute raises on a bias that is not one float
+    // per row instead of running without it. Coded by Claude (AI).
+    procedure TestDotProductWrongSizeBiasRaises;
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
+    // FP32 convolutions linked to an OpenCL-armed owner borrow its OpenCL
+    // weights and host caches: no weight upload, parity, three release orders.
+    procedure TestConvBorrowsOwnerOpenCLWeights;
     // TQuantRowsTransposeFan (the PrepareInt8DotCL / PrepareInt4DotCL repack)
     // equals the volume methods, inline and split into worker ranges.
     procedure TestCopyQuantRowsTransposedMatchesVolumeMethods;
@@ -695,6 +759,13 @@ type
     // concat runs there only when every source stayed resident.
     procedure RoPEResidentHeadChainUnforcedOpenCLParity;
     procedure InputResidentSourceUnforcedOpenCLParity;
+    // LayerProfiling's residency counts on TNNetInput -> TNNetPointwiseConvLinear
+    // -> TNNetReLU, then a host consumer, a stale-reading test layer, and a
+    // caller's ForceOutputOnRAM in the "outside the layer rows" line.
+    procedure ProfiledResidencyCountsOpenCL;
+    // Residency sources: a second TNNetInput, a TNNetSum whose FPrevLayer it
+    // never reads (LayerProfiling on before AddLayer), and a forced upload.
+    procedure ProfiledResidencySourcesOpenCL;
     procedure SoftMaxResidentChainUnforcedOpenCLParity;
     // TNNetInput -> TNNetEmbedding -> TNNetPointwiseConvLinear with ForceOpenCL
     // off: the embedding's own size verdict is pinned False, so only a resident
@@ -707,7 +778,7 @@ type
     // only when the normalized tokens stayed.
     procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
     // TNNetPointwiseConvLinear -> TNNetTokenLayerNorm -> TNNetPointwiseConvLinear
-    // with ForceOpenCL off, affine and not, small odd to 4096 depths, 1 and
+    // with ForceOpenCL off, affine and not, small odd to 1024 depths, 1 and
     // many tokens: the norm binds its source, keeps its output and uploads
     // gamma/beta again after a weight change.
     procedure TokenLayerNormResidentChainUnforcedOpenCLParity;
@@ -725,6 +796,15 @@ type
     // FPC heap; the failing-build path must also survive its build-log read.
     procedure CompileProgramSourceIsNotLeaked;
     procedure CompileProgramBuildFailureLogIsSafe;
+    // TEasyOpenCL.CompileProgram reuses a built program for the same platform,
+    // device, source and options; any difference, or a cleared cache, builds.
+    procedure OpenCLProgramCacheKeyAndLifetime;
+    // A second net armed on the same device builds nothing, keeps running on
+    // OpenCL after the first net is freed, and survives disable/re-enable.
+    procedure OpenCLProgramCacheSharedAcrossNets;
+    // Nets armed separately share one context, so a linked FP32 embedding and
+    // a linked int8 pointwise conv borrow the owner's OpenCL weights; parity.
+    procedure OpenCLBorrowAcrossSeparatelyArmedNets;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -66487,10 +66567,11 @@ begin
     OutB := TNNetVolume.Create();
     try
       TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
-      // As in AddQwenImage21Modulation: TNNetAddConstant has no OpenCL path,
-      // so the multiplier is only ever in RAM.
+      // TNNetMulByConstant has no OpenCL path, so the multiplier is only ever
+      // in RAM. A test that needs a host-only layer must not pick one that has
+      // a cai_activation opcode.
       RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-      Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
+      Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
       Source := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth, 1),
         TokenInput);
       MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
@@ -66555,8 +66636,9 @@ begin
   try
     TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
     RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-    Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
-    Source := NN.AddLayerAfter(TNNetAddConstant.Create(0.5), TokenInput);
+    // TNNetMulByConstant has no OpenCL path: both sources stay host-only.
+    Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
+    Source := NN.AddLayerAfter(TNNetMulByConstant.Create(0.5), TokenInput);
     MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
     NN.AddLayer(MulLayer);
     NN.SetTrainable(False, False);
@@ -66587,6 +66669,333 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+{$IFDEF OpenCL}
+const
+  csModChainTokens = 5;
+  csModChainHidden = 8;
+
+type
+  // Layers of BuildModulationChainNet.
+  TModulationChainLayers = record
+    TokenInput, ModulationInput: TNNetLayer;
+    ScaleSplit, OnePlusScale, GateSplit, TanhGate: TNNetLayer;
+    Modulated, Gated: TNNetChannelMulByLayer;
+  end;
+
+// As AddQwenImage21Modulation, at token count 5 and hidden 8: modulation input
+// (1,1,16); split(0..7) -> AddConstant(1) scales the tokens, split(8..15) ->
+// tanh gates that product. Both splits opt in to BindHostResidentSource.
+function BuildModulationChainNet(out Chain: TModulationChainLayers): TNNet;
+var
+  NN: TNNet;
+
+  function AddSlice(ChannelStart: integer): TNNetLayer;
+  var
+    Slice: TNNetSplitChannels;
+  begin
+    Slice := TNNetSplitChannels.Create(ChannelStart, csModChainHidden);
+    Slice.BindHostResidentSource := true;
+    Result := NN.AddLayerAfter(Slice, Chain.ModulationInput);
+  end;
+
+begin
+  NN := TNNet.Create();
+  Result := NN;
+  Chain.TokenInput := Result.AddLayer(
+    TNNetInput.Create(csModChainTokens, 1, csModChainHidden));
+  Chain.ModulationInput := Result.AddLayer(
+    TNNetInput.Create(1, 1, 2 * csModChainHidden));
+  Chain.ScaleSplit := AddSlice(0);
+  Chain.OnePlusScale := Result.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    Chain.ScaleSplit);
+  Chain.GateSplit := AddSlice(csModChainHidden);
+  Chain.TanhGate := Result.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    Chain.GateSplit);
+  Chain.Modulated := TNNetChannelMulByLayer.Create(Chain.TokenInput,
+    Chain.OnePlusScale);
+  Result.AddLayer(Chain.Modulated);
+  Chain.Gated := TNNetChannelMulByLayer.Create(Chain.Modulated,
+    Chain.TanhGate);
+  Result.AddLayer(Chain.Gated);
+  Result.SetTrainable(False, False);
+end;
+
+function MaxAbsDiffToOutput(Expected, Actual: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+begin
+  Result := 0;
+  for Pos := 0 to Expected.Size - 1 do
+    Result := Max(Result, Abs(Expected.Raw[Pos] - Actual.Raw[Pos]));
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestModulationChainResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csChainCount = 6;
+var
+  NN: TNNet;
+  Chain: TModulationChainLayers;
+  Input, Row, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ChainLayers: array[0..csChainCount - 1] of TNNetLayer;
+  CPUCntBefore: array[0..csChainCount - 1] of integer;
+  LayerPos, Pos, SentinelSurvivors, SentinelCount: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261004;
+  WasCounting := OpenCLTransferCounting;
+  NN := BuildModulationChainNet(Chain);
+  Input := TNNetVolume.Create(csModChainTokens, 1, csModChainHidden);
+  Row := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  OutCPU := TNNetVolume.Create();
+  try
+    // The first four hold sentinels; the two products are the consumers.
+    ChainLayers[0] := Chain.ScaleSplit;
+    ChainLayers[1] := Chain.OnePlusScale;
+    ChainLayers[2] := Chain.GateSplit;
+    ChainLayers[3] := Chain.TanhGate;
+    ChainLayers[4] := Chain.Modulated;
+    ChainLayers[5] := Chain.Gated;
+    Input.RandomizeGaussian();
+    Row.RandomizeGaussian();
+    Chain.ModulationInput.Output.Copy(Row);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    for LayerPos := 0 to csChainCount - 1 do
+      CPUCntBefore[LayerPos] := ChainLayers[LayerPos].ForwardCPUCnt;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Chain.ModulationInput.Output.Copy(Row);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.Compute(Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+    // A download or a host forward of any chain layer would overwrite these.
+    SentinelCount := 0;
+    for LayerPos := 0 to 3 do
+    begin
+      ChainLayers[LayerPos].Output.Fill(csSentinel);
+      Inc(SentinelCount, ChainLayers[LayerPos].Output.Size);
+    end;
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output));
+    SentinelSurvivors := 0;
+    for LayerPos := 0 to 3 do
+      for Pos := 0 to ChainLayers[LayerPos].Output.Size - 1 do
+        if ChainLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+          Inc(SentinelSurvivors);
+    Write('  Modulation chain resident: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards scale split/add/gate split/tanh/mul/mul=');
+    for LayerPos := 0 to csChainCount - 1 do
+      Write(ChainLayers[LayerPos].ForwardGPUCnt, ' ');
+    WriteLn('sentinels=', SentinelSurvivors, '/', SentinelCount, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' (',
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes, ' B) downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount, ' (',
+      TransfersAfter.DownloadBytes - TransfersBefore.DownloadBytes, ' B)');
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      AssertEquals(ChainLayers[LayerPos].ClassName + ' ' + IntToStr(LayerPos) +
+        ' ran both forwards on OpenCL', 2, ChainLayers[LayerPos].ForwardGPUCnt);
+      AssertEquals(ChainLayers[LayerPos].ClassName + ' ' + IntToStr(LayerPos) +
+        ' ran no host forward', CPUCntBefore[LayerPos],
+        ChainLayers[LayerPos].ForwardCPUCnt);
+    end;
+    AssertEquals('the chain is bound, not downloaded', SentinelCount,
+      SentinelSurvivors);
+    // Only the two input layers upload: neither operand is uploaded again.
+    AssertEquals('uploads per forward', 2,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('bytes uploaded per forward',
+      (Input.Size + Row.Size) * SizeOf(TNeuralFloat),
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('modulation chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCPU.Free;
+    Row.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestModulationChainHostWriteOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Chain: TModulationChainLayers;
+  Input, RowA, RowB, OutA, OutB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  DiffA, DiffB, DiffStale: TNeuralFloat;
+
+  procedure ComputeWithRow(Row: TNNetVolume);
+  begin
+    Chain.ModulationInput.Output.Copy(Row);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.Compute(Input);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4102026;
+  NN := BuildModulationChainNet(Chain);
+  Input := TNNetVolume.Create(csModChainTokens, 1, csModChainHidden);
+  RowA := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  RowB := TNNetVolume.Create(1, 1, 2 * csModChainHidden);
+  OutA := TNNetVolume.Create();
+  OutB := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    RowA.RandomizeGaussian();
+    RowB.RandomizeGaussian();
+    ComputeWithRow(RowA);
+    OutA.Copy(NN.GetLastLayer.Output);
+    ComputeWithRow(RowB);
+    OutB.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    ComputeWithRow(RowA);
+    DiffA := MaxAbsDiffToOutput(OutA, NN.GetLastLayer.Output);
+    // Starting at the first split skips TNNetInput.Compute, so nothing
+    // re-uploads the modulation input: only the mark keeps the splits from
+    // binding the row A copy still in OpenCL memory.
+    Chain.ModulationInput.Output.Copy(RowB);
+    Chain.ModulationInput.MarkOutputWrittenOnRAM();
+    NN.ComputeSerial(Chain.ScaleSplit.LayerIdx);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    DiffB := MaxAbsDiffToOutput(OutB, NN.GetLastLayer.Output);
+    DiffStale := MaxAbsDiffToOutput(OutA, NN.GetLastLayer.Output);
+    WriteLn('  Modulation chain host write: max|diff| row A=', DiffA:0:9,
+      ' row B=', DiffB:0:9, ' row B vs stale row A=', DiffStale:0:6,
+      ' gpu forwards gated=', Chain.Gated.ForwardGPUCnt);
+    AssertEquals('the product ran on OpenCL', 2, Chain.Gated.ForwardGPUCnt);
+    AssertTrue('the two rows must give different products', DiffStale > 1e-3);
+    AssertTrue('row A: max |diff| = ' + FloatToStr(DiffA) + ' must be < 1e-5',
+      DiffA < 1e-5);
+    AssertTrue('row B (fresh host write): max |diff| = ' + FloatToStr(DiffB) +
+      ' must be < 1e-5', DiffB < 1e-5);
+  finally
+    OutB.Free;
+    OutA.Free;
+    RowB.Free;
+    RowA.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSplitOfInputBeforeEmbeddingStaysOnHost;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Split: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  try
+    // Token ids in channel 0, as the BERT and CLIP text builders split them.
+    NN.AddLayer(TNNetInput.Create(4, 1, 2));
+    Split := NN.AddLayer(TNNetSplitChannels.Create(0, 1));
+    NN.AddLayer(TNNetEmbedding.Create(11, 8));
+    NN.SetTrainable(False, False);
+    for Pos := 0 to 3 do
+    begin
+      Input[Pos, 0, 0] := Pos + 2;
+      Input[Pos, 0, 1] := 1;
+    end;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    WriteLn('  Split of input before embedding: split cpu/gpu forwards=',
+      Split.ForwardCPUCnt, '/', Split.ForwardGPUCnt, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertEquals('the split ran on the host', 0, Split.ForwardGPUCnt);
+    AssertTrue('the split counted its host forwards', Split.ForwardCPUCnt > 0);
+    AssertEquals('no download per forward', 0,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestAddConstantHostForwardCount;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  AddConstLayer: TNNetLayer;
+  Pos, ForwardCnt: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4));
+    AddConstLayer := NN.AddLayer(TNNetAddConstant.Create(0.75));
+    for Pos := 0 to Input.Size - 1 do Input.Raw[Pos] := 0.1 * Pos - 1.0;
+    for ForwardCnt := 1 to 3 do NN.Compute(Input);
+    for Pos := 0 to Input.Size - 1 do
+      AssertEquals('x + 0.75 at ' + IntToStr(Pos), Input.Raw[Pos] + 0.75,
+        AddConstLayer.Output.Raw[Pos], 1e-6);
+    {$IFDEF OpenCL}
+    AssertEquals('host forwards', 3, AddConstLayer.ForwardCPUCnt);
+    AssertEquals('OpenCL forwards', 0, AddConstLayer.ForwardGPUCnt);
+    {$ENDIF}
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
 
 procedure TTestNeuralNumerical.TestCellMulByCellOpenCLParity;
 {$IFDEF OpenCL}
@@ -66671,6 +67080,109 @@ begin
     Input.Free;
     NN.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestOpenCLLocalSizeCapParity;
+{$IFDEF OpenCL}
+  procedure CheckLocalSizes(const GlobalSizes, ExpectedSizes: array of csize_t);
+  var
+    LocalSizes: array[0..2] of csize_t;
+    DimPos, MaxDimPos: integer;
+    LocalProduct: csize_t;
+  begin
+    CappedPowerOfTwoLocalSizes(GlobalSizes, LocalSizes, 8);
+    LocalProduct := 1;
+    MaxDimPos := High(GlobalSizes);
+    for DimPos := 0 to MaxDimPos do
+    begin
+      AssertEquals('local size of dimension ' + IntToStr(DimPos),
+        Int64(ExpectedSizes[DimPos]), Int64(LocalSizes[DimPos]));
+      AssertEquals('local size divides the global size', 0,
+        Int64(GlobalSizes[DimPos] mod LocalSizes[DimPos]));
+      LocalProduct := LocalProduct * LocalSizes[DimPos];
+    end;
+    AssertTrue('local size product within the cap', LocalProduct <= 8);
+  end;
+  procedure CheckForwardParity(PlatformId: cl_platform_id; DeviceId: cl_device_id;
+    SizeX, SizeY, InDepth, Filters: integer);
+  var
+    NN: TNNet;
+    Input, OutDriverLocal: TNNetVolume;
+    InputLayer, BranchA, BranchB: TNNetLayer;
+    MulLayer: TNNetCellMulByCell;
+    i, InSize, SavedLocalSizeCap: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    ShapeName: string;
+  begin
+    ShapeName := IntToStr(SizeX) + 'x' + IntToStr(SizeY) + 'x' + IntToStr(InDepth) +
+      ' -> ' + IntToStr(Filters) + ': ';
+    SavedLocalSizeCap := OpenCLLocalSizeCap;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutDriverLocal := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+      BranchA := NN.AddLayerAfter(TNNetConvolutionReLU.Create(Filters, 3, 1, 1), InputLayer);
+      BranchB := NN.AddLayerAfter(TNNetConvolutionReLU.Create(Filters, 3, 1, 1), InputLayer);
+      MulLayer := TNNetCellMulByCell.Create(BranchA, BranchB);
+      NN.AddLayer(MulLayer);
+      NN.SetTrainable(False, False);
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        OpenCLLocalSizeCap := 0;
+        NN.Compute(Input);
+        OutDriverLocal.Copy(NN.GetLastLayer.Output);
+        OpenCLLocalSizeCap := 8;
+        NN.Compute(Input);
+      finally
+        OpenCLLocalSizeCap := SavedLocalSizeCap;
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals(ShapeName + 'output size match', OutDriverLocal.Size,
+        NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutDriverLocal.Size - 1 do
+      begin
+        Diff := Abs(OutDriverLocal.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(ShapeName + 'TNNetCellMulByCell must reach the device',
+        MulLayer.ForwardGPUCnt >= 2);
+      AssertTrue(ShapeName + 'capped vs driver-chosen local size: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+    finally
+      OutDriverLocal.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  CheckLocalSizes([45], [1]);
+  CheckLocalSizes([40, 24], [8, 1]);
+  CheckLocalSizes([6, 10], [2, 2]);
+  CheckLocalSizes([12, 20, 3], [4, 2, 1]);
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424243;
+  // Odd and composite sizes: 15 positions, 7 input and 6 output channels.
+  CheckForwardParity(PlatformId, DeviceId, 5, 3, 7, 6);
+  // Sizes divisible by 8 (32 positions, 8 channels), so groups of 4 and 8 run.
+  CheckForwardParity(PlatformId, DeviceId, 8, 4, 8, 8);
 end;
 {$ELSE}
 begin
@@ -66806,10 +67318,28 @@ begin
         PointwiseConv.ForwardGPUCnt);
       AssertEquals('profiled forwards = passes', PassCount,
         PointwiseConv.ProfiledForwardCnt);
+      AssertEquals('profiled OpenCL forwards = passes', PassCount,
+        PointwiseConv.ProfiledForwardOpenCLCnt);
+      // Every pass ran on OpenCL, so all of the layer's time is OpenCL time.
+      AssertTrue('OpenCL forward time = layer time',
+        Abs(PointwiseConv.ProfiledForwardOpenCLTime -
+          PointwiseConv.ForwardTime) <= 1e-9 * PointwiseConv.ForwardTime);
+      AssertTrue('profiled forward time = layer time',
+        Abs(PointwiseConv.ProfiledForwardTime -
+          PointwiseConv.ForwardTime) <= 1e-9 * PointwiseConv.ForwardTime);
+      AssertTrue('report states the profiled OpenCL share',
+        Pos(' layer forwards (', TNNet.LayerGroupTimingReport(NN, [], PassCount)) > 0);
       AssertTrue('the input layer counts its uploads',
         InputLayer.ProfiledTransfers.UploadCount > 0);
       AssertTrue('upload bytes counted',
         InputLayer.ProfiledTransfers.UploadBytes >= Input.Size * 4);
+      NN.ClearTime();
+      AssertEquals('ClearTime resets the OpenCL forwards', 0,
+        PointwiseConv.ProfiledForwardOpenCLCnt);
+      AssertEquals('ClearTime resets the OpenCL time', 0,
+        PointwiseConv.ProfiledForwardOpenCLTime, 0);
+      AssertEquals('ClearTime resets the profiled time', 0,
+        PointwiseConv.ProfiledForwardTime, 0);
     finally
       Input.Free;
       NN.Free;
@@ -67746,12 +68276,12 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..29] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..30] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
-    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity');
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -67793,7 +68323,8 @@ var
       26: Result := TNNetReLUL.Create(-2, 2, 0);
       27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
       28: Result := TNNetReLU6.Create();
-    else Result := TNNetBentIdentity.Create();
+      29: Result := TNNetBentIdentity.Create();
+    else Result := TNNetAddConstant.Create(-0.375);
     end;
   end;
 
@@ -68707,10 +69238,10 @@ end;
 {$ENDIF}
 
 // Repeated EnableOpenCL/DisableOpenCL cycles. A buffer or kernel handle that
-// survives a DisableOpenCL belongs to the context that call tore down, so the
-// next EnableOpenCL - which builds a NEW context - would mix the two and every
-// enqueue would fail with CL_INVALID_CONTEXT. The device path then silently
-// falls back to the CPU, which is why this checks ForwardGPUCnt as well as
+// survives a DisableOpenCL belongs to the context that call tore down, so an
+// EnableOpenCL that gets a NEW context (cycle 3 clears the program cache) would
+// mix the two and every enqueue would fail with CL_INVALID_CONTEXT. The OpenCL
+// path then silently falls back to the CPU, which is why this checks ForwardGPUCnt as well as
 // parity: a CPU fallback matches the reference EXACTLY and would otherwise
 // read as a pass. Coded by Claude (AI).
 procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycle;
@@ -68755,6 +69286,8 @@ begin
     for Cycle := 1 to 3 do
     begin
       GPUCntBefore := SumLayer.ForwardGPUCnt;
+      // Cycle 2 reuses the cached context; cycle 3 gets a new one.
+      if Cycle = 3 then ClearOpenCLProgramCache();
       NN.EnableOpenCL(PlatformId, DeviceId);
       NN.ForceOpenCL(True);
       NN.Compute(Input);
@@ -68852,6 +69385,8 @@ begin
     for Cycle := 1 to 3 do
     begin
       GPUCntBefore := TotalForwardGPUCnt(NN);
+      // Cycle 2 reuses the cached context; cycle 3 gets a new one.
+      if Cycle = 3 then ClearOpenCLProgramCache();
       NN.EnableOpenCL(PlatformId, DeviceId);
       NN.ForceOpenCL(True);
       NN.Compute(Input);
@@ -69422,11 +69957,14 @@ end;
 // pointwise convolution over a (pColumns x 1 x pInputs) input gives exactly
 // FNumBs = pColumns, FNumAs = pNeurons, FSize = pInputs, so the shapes below
 // pick FNumBs on both sides of the threshold and ragged FNumAs / FSize (not
-// multiples of the 128-row tile, the 16-column tile, the 32-wide K-step or its
-// 4-wide inner unroll). Each shape runs three device forwards: two tiled (the
-// launch counter must read 2, or 0 below the threshold), then one with the
-// tiled path switched off (SetTiledGemmMinColumns(0)) so the SAME resident
-// codes go through the existing kernels. The tiled result is held against the
+// multiples of the 128- or 512-row tile, the 4-row lane, the 16-column tile
+// or the 32-wide K-step). Each shape runs three device forwards: two tiled,
+// one per grid (SetTiledGemmCodesGrid large, then block; the launch counter
+// must read 2, or 0 below the threshold, and the two forwards must report 128
+// and 256 lanes), up to two on the large grid at forced K-split counts
+// (SetTiledGemmSplitK; raw partials + merge), then one with the tiled path
+// switched off (SetTiledGemmMinColumns(0)) so the SAME resident codes go
+// through the existing kernels. The tiled result is held against the
 // existing kernels' result and against the reference at the FP32 tolerance;
 // they differ only in float summation order.
 
@@ -69434,14 +69972,17 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
 {$IFDEF OpenCL}
   procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
     ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
-    pSuppressBias: integer; pFP16, ExpectTiled: boolean);
+    pSuppressBias: integer; pFP16, ExpectTiled: boolean;
+    pSplitA: integer = 0; pSplitB: integer = 0);
   var
     NN: TNNet;
-    Input, OutCPU, OutTiled, OutUntiled: TNNetVolume;
+    Input, OutCPU, OutTiled, OutUntiled, OutBlock: TNNetVolume;
+    OutSplit: array[0..1] of TNNetVolume;
+    SplitRequests, SplitsRan: array[0..1] of integer;
     Conv: TNNetConvolution;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches: integer;
+    i, SplitPos, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffCPU, MaxDiffKernels, MaxAbs, Tol, TolCPU: TNeuralFloat;
   begin
     if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -69455,6 +69996,14 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
     OutCPU := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
+    OutBlock := TNNetVolume.Create();
+    SplitRequests[0] := pSplitA;
+    SplitRequests[1] := pSplitB;
+    for SplitPos := 0 to 1 do
+    begin
+      OutSplit[SplitPos] := TNNetVolume.Create();
+      SplitsRan[SplitPos] := 0;
+    end;
     try
       NN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
       Conv := TNNetConvolution.Create(pNeurons, 1, 0, 1, pSuppressBias);
@@ -69479,9 +70028,27 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if pFP16 then
           AssertTrue('TiledGemmInt8 ' + aName + ' took the FP16 route', Conv.FP16Active);
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        // The two grids of the code kernels over the same resident codes/
+        // scales/bias and bound tiled arguments; the large grid unsplit.
+        SetTiledGemmSplitK(0);
+        SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
         OutTiled.Copy(NN.GetLastLayer.Output);
+        LargeLanes := Conv.OpenCLLastTiledGemmLanes();
+        SetTiledGemmCodesGrid(tgcBlock);
+        NN.Compute(Input);
+        OutBlock.Copy(NN.GetLastLayer.Output);
+        BlockLanes := Conv.OpenCLLastTiledGemmLanes();
+        // The large grid at forced K-split counts: raw partials + merge.
+        SetTiledGemmCodesGrid(tgcLarge);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            SetTiledGemmSplitK(SplitRequests[SplitPos]);
+            NN.Compute(Input);
+            OutSplit[SplitPos].Copy(NN.GetLastLayer.Output);
+            SplitsRan[SplitPos] := Conv.OpenCLLastTiledGemmSplits();
+          end;
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The existing kernels over the same resident codes and B operand.
         SetTiledGemmMinColumns(0);
@@ -69491,6 +70058,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
           TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        SetTiledGemmCodesGrid(tgcAuto);
+        SetTiledGemmSplitK(csTiledGemmSplitKAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt8 ' + aName + ' output size match', OutCPU.Size,
@@ -69504,19 +70073,42 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
         if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            Diff := Abs(OutUntiled.Raw[i] - OutSplit[SplitPos].Raw[i]);
+            if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+          end;
         if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
       end;
       WriteLn('  TiledGemmInt8 ', aName, ': tiled vs cpu max|diff|=', MaxDiffCPU:0:9,
         ' tiled vs existing kernels max|diff|=', MaxDiffKernels:0:9,
         ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
-        ' gpu forwards=', Conv.ForwardGPUCnt);
+        ' gpu forwards=', Conv.ForwardGPUCnt, ' K-splits=', SplitsRan[0], '/',
+        SplitsRan[1]);
       // Without these the device path could be unarmed, or the tiled kernel
       // never taken, and parity would prove nothing.
-      AssertTrue('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
-      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+      SplitPos := Ord(pSplitA > 0) + Ord(pSplitB > 0);
+      AssertEquals('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt',
+        3 + SplitPos, Conv.ForwardGPUCnt);
+      if ExpectTiled then ExpectedLaunches := 2 + SplitPos else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt8 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
+      if ExpectTiled then
+      begin
+        AssertEquals('TiledGemmInt8 ' + aName + ' large grid lanes',
+          csTiledGemmCodesLanes, LargeLanes);
+        AssertEquals('TiledGemmInt8 ' + aName + ' block grid lanes',
+          csTiledGemmBlockLanes, BlockLanes);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+            AssertEquals('TiledGemmInt8 ' + aName + ' K-splits for ' +
+              IntToStr(SplitRequests[SplitPos]) + ' requested',
+              FitTiledGemmSplitCount(pInputs, SplitRequests[SplitPos]),
+              SplitsRan[SplitPos]);
+      end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs existing kernels: max |diff| = ' +
         FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
@@ -69526,6 +70118,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
       AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs CPU: max |diff| = ' +
         FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(TolCPU), MaxDiffCPU < TolCPU);
     finally
+      for SplitPos := 0 to 1 do OutSplit[SplitPos].Free;
+      OutBlock.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutCPU.Free;
@@ -69539,27 +70133,73 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
   RunPointwise('7 col 1003x96 identity nobias', 7, 1003, 96,
     @Identity, @IdentityDerivative, 1, false, false);
-  // Exactly one column tile; 200 rows = one full row tile + 72; 1003 = 31
-  // K-steps + a 11-wide remainder whose last 3 elements take the scalar loop.
+  // Exactly one column tile; 200 rows = one partial 512-row large tile (one
+  // 128-row block tile + 72); 1003 = 31 K-steps + an 11-wide ragged last step.
+  // Split-K: 32 K-steps as 7+7+7+7+4 (the tail in the last split), then 32
+  // splits of one step, the last one the 11-wide tail alone.
   RunPointwise('16 col 1003x200 relu bias', 16, 1003, 200,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
-  // Four column tiles, 130 rows (a lane's second row past FNumAs), no bias.
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 5, 32);
+  // Four column tiles, 130 rows (a last lane that stores 2 of its 4 rows),
+  // no bias.
   RunPointwise('64 col 1003x130 identity nobias', 64, 1003, 130,
-    @Identity, @IdentityDerivative, 1, false, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row;
+    @Identity, @IdentityDerivative, 1, false, true, 6);
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row;
   // 96 = 3 K-steps exactly; a transcendental activation.
   RunPointwise('130 col 96x257 swish bias', 130, 96, 257,
     @Swish, @SwishDerivative, 0, false, true);
+  // Split-K whose merge applies tanh: 3 splits of one K-step.
   RunPointwise('130 col 96x257 tanh bias', 130, 96, 257,
-    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true);
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true, 3);
   // Long reduction axis, the decode-projection shape at a 64-token window.
+  // Split-K: 64 K-steps as 22+22+20, then 8 x 8.
   RunPointwise('64 col 2048x320 relu bias', 64, 2048, 320,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 3, 8);
   // FP16 B operand: cai_dot_product_int8_tiled_h stages through vload_half.
   RunPointwise('fp16 64 col 1003x130 relu bias', 64, 1003, 130,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true, 3);
   RunPointwise('fp16 7 col 1003x96 relu bias', 7, 1003, 96,
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, false);
+  // The 4-row lanes of the code kernels: 4 rows = one lane; 5..7 rows = the
+  // last lane reads rows FNumAs-4..FNumAs-1 and stores 1..3 of them; 3 rows
+  // are below one lane, so no tile. 7 = a reduction axis shorter than one
+  // K-step (tail only), 32 = one step and no tail; 17 and 33 columns leave a
+  // 1-column tile.
+  // A requested split of a one-step reduction fits to 1: the unsplit kernel.
+  RunPointwise('17 col 7x4 relu bias', 17, 7, 4,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true, 2);
+  RunPointwise('17 col 45x5 identity nobias', 17, 45, 5,
+    @Identity, @IdentityDerivative, 1, false, true);
+  RunPointwise('16 col 32x6 tanh bias', 16, 32, 6,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true);
+  RunPointwise('33 col 77x7 relu bias', 33, 77, 7,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  RunPointwise('16 col 64x3 relu bias', 16, 64, 3,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
+  // 516 rows = one 512-row tile + one lane (4-byte loads); 515 = the second
+  // tile's only lane reads rows 511..514 and stores 512..514 (byte loads).
+  RunPointwise('17 col 100x516 relu bias', 17, 100, 516,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  RunPointwise('17 col 100x515 identity nobias', 17, 100, 515,
+    @Identity, @IdentityDerivative, 1, false, true, 4, 2);
+  RunPointwise('fp16 17 col 45x7 relu bias', 17, 45, 7,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  // FP16 with row counts that are multiples of 4: the 4-byte load instance.
+  RunPointwise('fp16 17 col 45x8 relu bias', 17, 45, 8,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  RunPointwise('fp16 16 col 64x516 identity nobias', 16, 64, 516,
+    @Identity, @IdentityDerivative, 1, true, true, 2);
+  // The block grid's 128x128 tiles: 2 column tiles (136 = 128 + 8) x 3 row
+  // tiles (260 = 2*128 + 4, 262 = + 6 with byte loads), FSize 100 = 3 K-steps
+  // + a 4-wide tail with 16-byte B loads (FSize mod 4 = 0), FP32 and FP16;
+  // 131 columns x 101 inputs: a 3-column tile and element-wise B loads.
+  RunPointwise('136 col 100x260 swish bias', 136, 100, 260,
+    @Swish, @SwishDerivative, 0, false, true);
+  RunPointwise('136 col 100x262 identity nobias', 136, 100, 262,
+    @Identity, @IdentityDerivative, 1, false, true);
+  RunPointwise('fp16 136 col 100x260 relu bias', 136, 100, 260,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  RunPointwise('fp16 131 col 101x133 relu bias', 131, 101, 133,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
 end;
 {$ELSE}
 begin
@@ -69576,15 +70216,18 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
 {$IFDEF OpenCL}
   procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
     ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
-    pSuppressBias: integer; ExpectTiled: boolean);
+    pSuppressBias: integer; ExpectTiled: boolean;
+    pSplitA: integer = 0; pSplitB: integer = 0);
   var
     NN, NNRef: TNNet;
-    Input, OutRef, OutTiled, OutUntiled: TNNetVolume;
+    Input, OutRef, OutTiled, OutUntiled, OutBlock: TNNetVolume;
+    OutSplit: array[0..1] of TNNetVolume;
+    SplitRequests, SplitsRan: array[0..1] of integer;
     Conv, ConvRef: TNNetConvolution;
     Quant4: TNNetVolumeQuant4;
     PlatformId: cl_platform_id;
     DeviceId: cl_device_id;
-    i, TiledLaunches, ExpectedLaunches: integer;
+    i, SplitPos, TiledLaunches, ExpectedLaunches, LargeLanes, BlockLanes: integer;
     Diff, MaxDiffRef, MaxDiffKernels, MaxAbs, Tol: TNeuralFloat;
     procedure BuildNet(var pNN: TNNet; var pConv: TNNetConvolution);
     var
@@ -69613,6 +70256,14 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
     OutRef := TNNetVolume.Create();
     OutTiled := TNNetVolume.Create();
     OutUntiled := TNNetVolume.Create();
+    OutBlock := TNNetVolume.Create();
+    SplitRequests[0] := pSplitA;
+    SplitRequests[1] := pSplitB;
+    for SplitPos := 0 to 1 do
+    begin
+      OutSplit[SplitPos] := TNNetVolume.Create();
+      SplitsRan[SplitPos] := 0;
+    end;
     Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
     try
       for i := 0 to Input.Size - 1 do
@@ -69637,9 +70288,27 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        // The two grids of the code kernels over the same resident codes/
+        // scales/bias and bound tiled arguments; the large grid unsplit.
+        SetTiledGemmSplitK(0);
+        SetTiledGemmCodesGrid(tgcLarge);
         NN.Compute(Input);
-        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
         OutTiled.Copy(NN.GetLastLayer.Output);
+        LargeLanes := Conv.OpenCLLastTiledGemmLanes();
+        SetTiledGemmCodesGrid(tgcBlock);
+        NN.Compute(Input);
+        OutBlock.Copy(NN.GetLastLayer.Output);
+        BlockLanes := Conv.OpenCLLastTiledGemmLanes();
+        // The large grid at forced K-split counts: raw partials + merge.
+        SetTiledGemmCodesGrid(tgcLarge);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            SetTiledGemmSplitK(SplitRequests[SplitPos]);
+            NN.Compute(Input);
+            OutSplit[SplitPos].Copy(NN.GetLastLayer.Output);
+            SplitsRan[SplitPos] := Conv.OpenCLLastTiledGemmSplits();
+          end;
         TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
         // The split-K pair over the same resident packed codes and B operand.
         SetTiledGemmMinColumns(0);
@@ -69649,6 +70318,8 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
           TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
       finally
         SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        SetTiledGemmCodesGrid(tgcAuto);
+        SetTiledGemmSplitK(csTiledGemmSplitKAuto);
         NN.ForceOpenCL(False);
       end;
       AssertEquals('TiledGemmInt4 ' + aName + ' output size match', OutRef.Size,
@@ -69662,24 +70333,49 @@ procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
         if Diff > MaxDiffRef then MaxDiffRef := Diff;
         Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
         if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutBlock.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+          begin
+            Diff := Abs(OutUntiled.Raw[i] - OutSplit[SplitPos].Raw[i]);
+            if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+          end;
         if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
       end;
       WriteLn('  TiledGemmInt4 ', aName, ': tiled vs dequantized FP32 max|diff|=',
         MaxDiffRef:0:9, ' tiled vs split-K max|diff|=', MaxDiffKernels:0:9,
         ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
-        ' gpu forwards=', Conv.ForwardGPUCnt);
-      AssertTrue('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
-        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
-      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+        ' gpu forwards=', Conv.ForwardGPUCnt, ' K-splits=', SplitsRan[0], '/',
+        SplitsRan[1]);
+      SplitPos := Ord(pSplitA > 0) + Ord(pSplitB > 0);
+      AssertEquals('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt',
+        3 + SplitPos, Conv.ForwardGPUCnt);
+      if ExpectTiled then ExpectedLaunches := 2 + SplitPos else ExpectedLaunches := 0;
       AssertEquals('TiledGemmInt4 ' + aName + ' tiled launches', ExpectedLaunches,
         TiledLaunches);
+      if ExpectTiled then
+      begin
+        AssertEquals('TiledGemmInt4 ' + aName + ' large grid lanes',
+          csTiledGemmCodesLanes, LargeLanes);
+        AssertEquals('TiledGemmInt4 ' + aName + ' block grid lanes',
+          csTiledGemmBlockLanes, BlockLanes);
+        for SplitPos := 0 to 1 do
+          if SplitRequests[SplitPos] > 0 then
+            AssertEquals('TiledGemmInt4 ' + aName + ' K-splits for ' +
+              IntToStr(SplitRequests[SplitPos]) + ' requested',
+              FitTiledGemmSplitCount(pInputs, SplitRequests[SplitPos]),
+              SplitsRan[SplitPos]);
+      end;
       if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
       AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs split-K: max |diff| = ' +
         FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
       AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs dequantized FP32: max |diff| = ' +
         FloatToStr(MaxDiffRef) + ' must be < ' + FloatToStr(Tol), MaxDiffRef < Tol);
     finally
+      for SplitPos := 0 to 1 do OutSplit[SplitPos].Free;
       Quant4.Free;
+      OutBlock.Free;
       OutUntiled.Free;
       OutTiled.Free;
       OutRef.Free;
@@ -69694,17 +70390,235 @@ begin
     @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
   RunPointwise('7 col 96x64 identity nobias', 7, 96, 64,
     @Identity, @IdentityDerivative, 1, false);
-  // One column tile, 200 rows (one row tile + 72), 3 blocks.
+  // One column tile, 200 rows (one block row tile + 72), 3 blocks.
   RunPointwise('16 col 96x200 relu bias', 16, 96, 200,
-    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, 2);
   // Four column tiles, 130 rows, 65 blocks (an odd count), no bias.
+  // Split-K: 65 blocks as 17+17+17+14, then 65 splits of one block.
   RunPointwise('64 col 2080x130 identity nobias', 64, 2080, 130,
-    @Identity, @IdentityDerivative, 1, true);
-  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row.
+    @Identity, @IdentityDerivative, 1, true, 4, 65);
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 block row tiles + 1 row.
+  // Split-K whose merge applies swish: 5 blocks as 3 + 2.
   RunPointwise('130 col 160x257 swish bias', 130, 160, 257,
-    @Swish, @SwishDerivative, 0, true);
+    @Swish, @SwishDerivative, 0, true, 2);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
     @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+  // The 4-row lanes, as in TestTiledGemmInt8OpenCLParity: 4 rows, 5..7 rows
+  // (a last lane that stores 1..3 rows), 3 rows (no tile), 516 / 515 rows
+  // (one lane past a 512-row tile, 4-byte vs byte loads), 1-column tiles.
+  RunPointwise('17 col 32x4 relu bias', 17, 32, 4,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, 2);
+  RunPointwise('17 col 64x5 identity nobias', 17, 64, 5,
+    @Identity, @IdentityDerivative, 1, true);
+  RunPointwise('33 col 96x7 tanh bias', 33, 96, 7,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true, 3);
+  RunPointwise('16 col 64x3 relu bias', 16, 64, 3,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
+  RunPointwise('17 col 64x516 relu bias', 17, 64, 516,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  RunPointwise('17 col 64x515 identity nobias', 17, 64, 515,
+    @Identity, @IdentityDerivative, 1, true, 2);
+  // The block grid's 128x128 tiles: 2 column tiles x 3 row tiles, ragged on
+  // both axes (136 = 128 + 8 columns, 262 = 2*128 + 6 rows, byte loads).
+  RunPointwise('136 col 96x262 swish bias', 136, 96, 262,
+    @Swish, @SwishDerivative, 0, true);
+  RunPointwise('131 col 64x260 identity nobias', 131, 64, 260,
+    @Identity, @IdentityDerivative, 1, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The tgcAuto decision as a pure function of the shape and the L4's 58
+// compute units (116 work-groups needed), no OpenCL device involved.
+procedure TTestNeuralNumerical.TestTiledGemmCodesAutoGrid;
+{$IFDEF OpenCL}
+  procedure Check(const aName: string; pNumAs, pNumBs: integer;
+    pHasBlock: boolean; Expected: TTiledGemmCodesGrid);
+  begin
+    AssertEquals('AutoTiledGemmCodesGrid ' + aName, Ord(Expected),
+      Ord(AutoTiledGemmCodesGrid(pNumAs, pNumBs, 58, pHasBlock)));
+  end;
+begin
+  // Qwen-Image QKVO / GateUp at 4096 tokens: 1024 / 6144 block tiles.
+  Check('4096x4096', 4096, 4096, true, tgcBlock);
+  Check('24576x4096', 24576, 4096, true, tgcBlock);
+  // No block kernel: the large grid.
+  Check('4096x4096 no block', 4096, 4096, false, tgcLarge);
+  // 127 columns: never block.
+  Check('4096x127', 4096, 127, true, tgcLarge);
+  Check('24576x127', 24576, 127, true, tgcLarge);
+  // 128 columns, 24576 rows: 192 block tiles; 4096 rows: 32 < 116, so large.
+  Check('24576x128', 24576, 128, true, tgcBlock);
+  Check('4096x128', 4096, 128, true, tgcLarge);
+  // 129..204 columns pad the second tile past 20%: 129 and 204 are refused,
+  // 205 (2 tiles, 256 * 4 <= 205 * 5) is accepted.
+  Check('24576x129', 24576, 129, true, tgcLarge);
+  Check('24576x204', 24576, 204, true, tgcLarge);
+  Check('24576x205', 24576, 205, true, tgcBlock);
+  // LLM prefill window: 2560 rows x 64 columns, below one block column tile.
+  Check('2560x64', 2560, 64, true, tgcLarge);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The split-K rule as a pure function of the shape and the L4's 58 compute
+// units: split below 116 large-grid tiles, towards 232 work-groups, each split
+// at least 4 K-steps of 32, at most 32 splits, partial bytes at most the int8
+// weight bytes (splits <= K / (4 x columns)), and no empty split.
+procedure TTestNeuralNumerical.TestTiledGemmSplitKAutoCount;
+{$IFDEF OpenCL}
+  procedure CheckAuto(pNumAs, pSize, pNumBs, Expected: integer);
+  begin
+    AssertEquals('AutoTiledGemmSplitCount ' + IntToStr(pNumAs) + 'x' +
+      IntToStr(pSize) + 'x' + IntToStr(pNumBs), Expected,
+      AutoTiledGemmSplitCount(pNumAs, pNumBs, pSize, 58));
+  end;
+  procedure CheckFit(pSize, pSplits, Expected: integer);
+  begin
+    AssertEquals('FitTiledGemmSplitCount ' + IntToStr(pSize) + ' / ' +
+      IntToStr(pSplits), Expected, FitTiledGemmSplitCount(pSize, pSplits));
+  end;
+begin
+  // Measured LLM prefill windows (rows x reduction x tokens): 16 columns
+  // reach the 20-split cap of 80 K-steps; at 64 columns the partial-bytes cap
+  // (2560 / 256) gives 10.
+  CheckAuto(1024, 2560, 16, 20);
+  CheckAuto(1024, 2560, 64, 10);
+  CheckAuto(2560, 2560, 64, 10);
+  // MLP up (76 tiles) and down (20 tiles, 304 K-steps) at a 64-token window.
+  CheckAuto(9728, 2560, 64, 4);
+  CheckAuto(2560, 9728, 64, 12);
+  // 116 tiles fill the device; 115 split in 3 (27 + 27 + 26 steps).
+  CheckAuto(29 * 512, 2560, 64, 1);
+  CheckAuto(23 * 512, 2560, 80, 3);
+  // Qwen-Image projections at 4096 tokens: thousands of tiles, no split.
+  CheckAuto(4096, 4096, 4096, 1);
+  CheckAuto(24576, 4096, 4096, 1);
+  CheckAuto(4096, 12288, 4096, 1);
+  // Short reductions: 3 K-steps cannot split, 8 split in 2; 1003 = 32 steps
+  // with an 11-wide tail split in 8 of 4.
+  CheckAuto(1024, 96, 16, 1);
+  CheckAuto(1024, 256, 16, 2);
+  CheckAuto(200, 1003, 16, 8);
+  // 8 K-steps would split in 2, but 2 x 64 columns of partials exceed K = 256.
+  CheckAuto(512, 256, 64, 1);
+  CheckAuto(0, 2560, 16, 1);
+  // Fitting a requested count: 0 and 1 mean no split; never more splits than
+  // K-steps; 13 splits of 80 steps leave the 13th empty, so 12 of 7.
+  CheckFit(2560, 0, 1);
+  CheckFit(2560, 1, 1);
+  CheckFit(2560, 3, 3);
+  CheckFit(2560, 13, 12);
+  CheckFit(1003, 32, 32);
+  CheckFit(1003, 100, 32);
+  CheckFit(7, 2, 1);
+  CheckFit(2080, 65, 65);
+  AssertEquals('TiledGemmStepsPerSplit 1003 / 5', 7, TiledGemmStepsPerSplit(1003, 5));
+  AssertEquals('TiledGemmStepsPerSplit 2560 / 12', 7, TiledGemmStepsPerSplit(2560, 12));
+  AssertEquals('TiledGemmStepsPerSplit 2080 / 4', 17, TiledGemmStepsPerSplit(2080, 4));
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Conv1 (120 rows, K 200) needs 30720 partial bytes at 4 splits and runs
+// first; Conv2 (300 rows, K 120) needs 76800 and grows the queue's scratch,
+// so Conv1's second forward must rebind to the new buffer.
+procedure TTestNeuralNumerical.TestTiledGemmSplitKSharedScratch;
+{$IFDEF OpenCL}
+const
+  csColumns = 16;
+  csInputs = 200;
+var
+  NN: TNNet;
+  Conv1, Conv2: TNNetConvolution;
+  Input, OutCPU, OutFirst, OutSecond, OutUntiled: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff, MaxDiffCPU, Tol: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261006;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(csColumns, 1, csInputs);
+  OutCPU := TNNetVolume.Create();
+  OutFirst := TNNetVolume.Create();
+  OutSecond := TNNetVolume.Create();
+  OutUntiled := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(csColumns, 1, csInputs, 1));
+    Conv1 := TNNetConvolution.Create(120, 1, 0, 1, 0);
+    NN.AddLayer(Conv1);
+    Conv2 := TNNetConvolution.Create(300, 1, 0, 1, 0);
+    Conv2.ActivationFn := @HiperbolicTangent;
+    Conv2.ActivationFnDerivative := @HiperbolicTangentDerivative;
+    NN.AddLayer(Conv2);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+    NN.SetTrainable(False);
+    NN.QuantizeWeightsInt8();
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmCodesGrid(tgcLarge);
+      SetTiledGemmSplitK(4);
+      NN.Compute(Input);
+      OutFirst.Copy(NN.GetLastLayer.Output);
+      NN.Compute(Input);
+      OutSecond.Copy(NN.GetLastLayer.Output);
+      AssertEquals('Conv1 K-splits', 4, Conv1.OpenCLLastTiledGemmSplits());
+      AssertEquals('Conv2 K-splits', 4, Conv2.OpenCLLastTiledGemmSplits());
+      AssertTrue('both layers on one queue',
+        Conv1.OpenCLOutputKernel().QueueScratchBytes() =
+        Conv2.OpenCLOutputKernel().QueueScratchBytes());
+      AssertEquals('one scratch sized to the larger layer', 300 * csColumns * 4 * 4,
+        int64(Conv2.OpenCLOutputKernel().QueueScratchBytes()));
+      SetTiledGemmMinColumns(0);
+      NN.Compute(Input);
+      OutUntiled.Copy(NN.GetLastLayer.Output);
+    finally
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmCodesGrid(tgcAuto);
+      SetTiledGemmSplitK(csTiledGemmSplitKAuto);
+      NN.ForceOpenCL(False);
+    end;
+    MaxDiff := 0;
+    MaxDiffCPU := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      MaxDiff := Max(MaxDiff, Abs(OutUntiled.Raw[i] - OutFirst.Raw[i]));
+      MaxDiff := Max(MaxDiff, Abs(OutUntiled.Raw[i] - OutSecond.Raw[i]));
+      MaxDiffCPU := Max(MaxDiffCPU, Abs(OutCPU.Raw[i] - OutSecond.Raw[i]));
+    end;
+    Tol := 1e-4;
+    WriteLn('  TiledGemmSplitKSharedScratch: split vs untiled max|diff|=',
+      MaxDiff:0:9, ' split vs cpu max|diff|=', MaxDiffCPU:0:9);
+    AssertTrue('split vs untiled: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < Tol);
+    AssertTrue('split vs CPU: max |diff| = ' + FloatToStr(MaxDiffCPU), MaxDiffCPU < Tol);
+  finally
+    OutUntiled.Free;
+    OutSecond.Free;
+    OutFirst.Free;
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
 end;
 {$ELSE}
 begin
@@ -69976,6 +70890,1025 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.TestConvImplicitGemmOpenCLParity;
+{$IFDEF OpenCL}
+type
+  TImplicitCase = record
+    SizeX, SizeY, InDepth, Features, FeatureSize, Padding, Stride: integer;
+    // 0: square kernel; otherwise the kernel height of a
+    // TNNetConvolutionRectangularReLU (FeatureSize is its width).
+    FeatureSizeY: integer;
+    // >= 64 rows and >= 16 positions: cai_conv_implicit_tiled, which stages
+    // the same tiles as cai_im2col + cai_dot_product_tiled.
+    ExpectTiled: boolean;
+    // A CPU-only layer before the conv: the unpadded host Output is uploaded.
+    HostSource: boolean;
+  end;
+const
+  csSentinel = 999;
+  Cases: array[0..13] of TImplicitCase = (
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: true),
+    (SizeX: 9; SizeY: 7; InDepth: 3; Features: 80; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: true),
+    (SizeX: 9; SizeY: 7; InDepth: 3; Features: 70; FeatureSize: 5; Padding: 2; Stride: 1; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 19; Features: 80; FeatureSize: 3; Padding: 1; Stride: 2; FeatureSizeY: 0; ExpectTiled: true; HostSource: false),
+    (SizeX: 13; SizeY: 11; InDepth: 7; Features: 72; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 1; ExpectTiled: true; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: false; HostSource: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; FeatureSize: 3; Padding: 1; Stride: 1; FeatureSizeY: 0; ExpectTiled: false; HostSource: true),
+    (SizeX: 17; SizeY: 13; InDepth: 64; Features: 5; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: false),
+    (SizeX: 17; SizeY: 13; InDepth: 19; Features: 6; FeatureSize: 3; Padding: 1; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: true),
+    (SizeX: 13; SizeY: 11; InDepth: 7; Features: 6; FeatureSize: 1; Padding: 1; Stride: 2; FeatureSizeY: 3; ExpectTiled: false; HostSource: false),
+    // 2 output positions: too few columns for a tile even at 80 rows.
+    (SizeX: 5; SizeY: 4; InDepth: 3; Features: 80; FeatureSize: 3; Padding: 0; Stride: 2; FeatureSizeY: 0; ExpectTiled: false; HostSource: false));
+var
+  NN: TNNet;
+  Input, OutCPU, OutImplicit: TNNetVolume;
+  Source: TNNetLayer;
+  Conv: TNNetConvolution;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, CaseCnt, SentinelsLeft, Positions: integer;
+  ImplicitBefore, TiledBefore, ImplicitLaunches, TiledLaunches: integer;
+  ImplicitBytes, ExplicitBytes, ColumnBytes: int64;
+  DiffCPU, DiffExplicit, MaxAbs, Tol: TNeuralFloat;
+  CaseName: string;
+  ImplicitConvWasEnabled: boolean;
+
+  procedure FillWeights(Layer: TNNetLayer);
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to Layer.Neurons[NeuronCnt].Weights.Size - 1 do
+        Layer.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.08 * Sin(NeuronCnt * 0.7 + WeightCnt * 0.31);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.2 * Cos(NeuronCnt * 0.13);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  try
+  for CaseCnt := Low(Cases) to High(Cases) do
+  with Cases[CaseCnt] do
+  begin
+    CaseName := ' (case ' + IntToStr(CaseCnt) + ')';
+    RandSeed := 20261003;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutCPU := TNNetVolume.Create();
+    OutImplicit := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1));
+      // A fused-activation pointwise conv leaves its output in OpenCL memory.
+      if HostSource
+        then Source := NN.AddLayer(TNNetIdentity.Create())
+        else Source := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(InDepth).SetTrainable(False, False));
+      // Inference-only before SetPrevLayer, as the VAE builder does.
+      if FeatureSizeY = 0
+        then Conv := TNNetConvolutionReLU.Create(Features, FeatureSize, Padding,
+          Stride)
+        else Conv := TNNetConvolutionRectangularReLU.Create(Features,
+          FeatureSize, FeatureSizeY, Padding, Stride);
+      Conv.SetTrainable(False, False);
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.6 * Sin(i * 0.017) + 0.1;
+      // An inference-only layer is not initialized: its weights come from a
+      // checkpoint, here from a formula.
+      FillWeights(Conv);
+      if not HostSource then FillWeights(Source);
+      AssertEquals('inference-only conv sizes no host column matrix' + CaseName,
+        0, Conv.InputPrepared.Size);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        SetOpenCLImplicitConv(true);
+        ImplicitBefore := Conv.OpenCLImplicitConvLaunchCount();
+        TiledBefore := Conv.OpenCLTiledGemmLaunchCount();
+        NN.Compute(Input);
+        Source.Output.Fill(csSentinel);
+        NN.Compute(Input); // resident weights and bias
+        OutImplicit.Copy(NN.GetLastLayer.Output);
+        SentinelsLeft := 0;
+        for i := 0 to Source.Output.Size - 1 do
+          if Source.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        ImplicitLaunches := Conv.OpenCLImplicitConvLaunchCount() - ImplicitBefore;
+        TiledLaunches := Conv.OpenCLTiledGemmLaunchCount() - TiledBefore;
+        ImplicitBytes := Conv.OpenCLBufferBytes();
+        // The explicit path: cai_im2col into the B buffer, then the GEMM.
+        SetOpenCLImplicitConv(false);
+        NN.Compute(Input);
+        ExplicitBytes := Conv.OpenCLBufferBytes();
+        AssertEquals('the explicit path launches no implicit GEMM' + CaseName,
+          ImplicitBefore + ImplicitLaunches, Conv.OpenCLImplicitConvLaunchCount());
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals('output size match' + CaseName, OutCPU.Size, OutImplicit.Size);
+      DiffCPU := 0;
+      DiffExplicit := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        if Abs(OutCPU.Raw[i] - OutImplicit.Raw[i]) > DiffCPU then
+          DiffCPU := Abs(OutCPU.Raw[i] - OutImplicit.Raw[i]);
+        if Abs(NN.GetLastLayer.Output.Raw[i] - OutImplicit.Raw[i]) > DiffExplicit then
+          DiffExplicit := Abs(NN.GetLastLayer.Output.Raw[i] - OutImplicit.Raw[i]);
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      Positions := Conv.Output.SizeX * Conv.Output.SizeY;
+      ColumnBytes := int64(Positions) * Conv.Neurons[0].Weights.Size *
+        SizeOf(TNeuralFloat);
+      // The explicit path uploads a host source padded, so its source buffer
+      // grows by the border.
+      if HostSource then
+        ColumnBytes := ColumnBytes + int64(InDepth) * SizeOf(TNeuralFloat) *
+          ((SizeX + 2 * Padding) * (SizeY + 2 * Padding) - SizeX * SizeY);
+      WriteLn('  ConvImplicitGemm ', SizeX, 'x', SizeY, 'x', InDepth, ' -> ',
+        Features, ' k', FeatureSize, ' pad', Padding, ' s', Stride,
+        ' host source=', HostSource, ': vs cpu max|diff|=', DiffCPU:0:9,
+        ' vs explicit max|diff|=', DiffExplicit:0:9, ' max|ref|=', MaxAbs:0:6,
+        ' implicit/tiled launches=', ImplicitLaunches, '/', TiledLaunches,
+        ' OpenCL bytes implicit/explicit=', ImplicitBytes, '/', ExplicitBytes,
+        ' sentinels kept=', SentinelsLeft, '/', Source.Output.Size);
+      AssertEquals('implicit GEMM launches' + CaseName, 2, ImplicitLaunches);
+      if ExpectTiled
+        then AssertEquals('tiled implicit launches' + CaseName, 2, TiledLaunches)
+        else AssertEquals('untiled implicit launches' + CaseName, 0, TiledLaunches);
+      AssertEquals('the implicit GEMM allocates no B buffer: the explicit ' +
+        'path adds exactly the column matrix (and the padded border of a ' +
+        'host source)' + CaseName, ColumnBytes,
+        ExplicitBytes - ImplicitBytes);
+      if HostSource
+        then AssertEquals('a host source is read from RAM' + CaseName, 0,
+          SentinelsLeft)
+        else AssertEquals('a resident source is not downloaded' + CaseName,
+          Source.Output.Size, SentinelsLeft);
+      if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
+      AssertTrue('implicit vs CPU' + CaseName + ': max |diff| = ' +
+        FloatToStr(DiffCPU) + ' must be < ' + FloatToStr(Tol), DiffCPU < Tol);
+      // The tiled kernels stage the same tiles in the same K order (equal on
+      // PoCL), but the compiler may contract each copy differently, so a
+      // tolerance; cai_conv_implicit sums in k order, cai_dot_product in blocks.
+      if ExpectTiled then
+        AssertTrue('tiled implicit vs explicit' + CaseName + ': max |diff| = ' +
+          FloatToStr(DiffExplicit) + ' must be < ' + FloatToStr(Tol * 0.01),
+          DiffExplicit < Tol * 0.01)
+      else
+        AssertTrue('untiled implicit vs explicit' + CaseName + ': max |diff| = ' +
+          FloatToStr(DiffExplicit) + ' must be < ' + FloatToStr(Tol * 0.1),
+          DiffExplicit < Tol * 0.1);
+    finally
+      OutImplicit.Free;
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+  finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDotProductWrongSizeBiasRaises;
+{$IFDEF OpenCL}
+const
+  csRows = 6;
+  csColumns = 3;
+  csSize = 5;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Kernel: TNeuralKernel;
+  DotCL: TDotProductSharedKernel;
+  VAs, VBs, RowBias, PositionBias, Results: TNNetVolume;
+  Raised: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Kernel := TNeuralKernel.Create(PlatformId, DeviceId, 'cai_dot_product', true);
+  DotCL := TDotProductSharedKernel.Create(Kernel);
+  VAs := TNNetVolume.Create(csRows * csSize, 1, 1, 0.5);
+  VBs := TNNetVolume.Create(csColumns * csSize, 1, 1, 0.25);
+  RowBias := TNNetVolume.Create(csRows, 1, 1, 1.0);
+  PositionBias := TNNetVolume.Create(csRows * csColumns, 1, 1, 1.0);
+  Results := TNNetVolume.Create(csRows * csColumns, 1, 1);
+  try
+    DotCL.PrepareForCompute(VAs, VBs, csSize);
+    DotCL.Compute(VAs, VBs, {ActFN}0, true, true, RowBias);
+    DotCL.FinishAndLoadResult(Results, 0);
+    // 5 * 0.5 * 0.25 + 1.
+    AssertEquals('one bias per row', 1.625, Results.Raw[0], 1e-6);
+    Raised := false;
+    try
+      DotCL.Compute(VAs, VBs, {ActFN}0, true, true, PositionBias);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('a per-position bias raises', Raised);
+  finally
+    Results.Free;
+    PositionBias.Free;
+    RowBias.Free;
+    VBs.Free;
+    VAs.Free;
+    DotCL.Free;
+    Kernel.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvRowBiasOpenCLParity;
+{$IFDEF OpenCL}
+type
+  TRowBiasCase = record
+    SizeX, SizeY, InDepth, Features: integer;
+    Pointwise: boolean;
+    // 0: FP32, 8: int8 weights, 4: int4 weights.
+    QuantBits: integer;
+    // FP32 spatial only: the implicit GEMM, otherwise cai_im2col.
+    Implicit: boolean;
+    // Rows >= 64 and columns >= csTiledGemmMinColumns: a tiled launch.
+    ExpectTiled: boolean;
+  end;
+const
+  Cases: array[0..11] of TRowBiasCase = (
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; Pointwise: false; QuantBits: 0; Implicit: true; ExpectTiled: true),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; Pointwise: false; QuantBits: 0; Implicit: true; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 80; Pointwise: false; QuantBits: 0; Implicit: false; ExpectTiled: true),
+    (SizeX: 9; SizeY: 7; InDepth: 37; Features: 5; Pointwise: false; QuantBits: 0; Implicit: false; ExpectTiled: false),
+    (SizeX: 8; SizeY: 4; InDepth: 40; Features: 72; Pointwise: true; QuantBits: 0; Implicit: false; ExpectTiled: true),
+    (SizeX: 2; SizeY: 1; InDepth: 40; Features: 72; Pointwise: true; QuantBits: 0; Implicit: false; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 32; Features: 72; Pointwise: false; QuantBits: 8; Implicit: false; ExpectTiled: true),
+    (SizeX: 1; SizeY: 1; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 8; Implicit: false; ExpectTiled: false),
+    (SizeX: 2; SizeY: 1; InDepth: 64; Features: 40; Pointwise: true; QuantBits: 8; Implicit: false; ExpectTiled: false),
+    (SizeX: 8; SizeY: 4; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 4; Implicit: false; ExpectTiled: true),
+    (SizeX: 1; SizeY: 1; InDepth: 64; Features: 72; Pointwise: true; QuantBits: 4; Implicit: false; ExpectTiled: false),
+    (SizeX: 9; SizeY: 7; InDepth: 32; Features: 72; Pointwise: false; QuantBits: 4; Implicit: false; ExpectTiled: true));
+var
+  NetCPU, NetCL, NetCLNoBias: TNNet;
+  Conv, ConvNoBias: TNNetConvolution;
+  Input, OutCPU, OutCL, OutCLNoBias: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, i, NeuronIdx, TiledBefore: integer;
+  HostBytesOnOpenCL, ColumnBytesGrown: int64;
+  ColumnsBefore: integer;
+  DiffCPU, DiffBias, MaxAbs, Tol: TNeuralFloat;
+  CaseName: string;
+  ImplicitConvWasEnabled: boolean;
+
+  function BuildNet(const pCase: TRowBiasCase; pSuppressBias: integer;
+    out pConv: TNNetConvolution): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(pCase.SizeX, pCase.SizeY,
+      pCase.InDepth, 1));
+    if pCase.Pointwise
+      then pConv := TNNetPointwiseConvLinear.Create(pCase.Features, pSuppressBias)
+      else pConv := TNNetConvolutionLinear.Create(pCase.Features, 3, 1, 1,
+        pSuppressBias);
+    pConv.SetTrainable(False, False);
+    Result.AddLayer(pConv);
+    for NeuronCnt := 0 to pConv.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to pConv.Neurons[NeuronCnt].Weights.Size - 1 do
+        pConv.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.08 * Sin(NeuronCnt * 0.7 + WeightCnt * 0.31);
+      pConv.Neurons[NeuronCnt].BiasWeight := 0.5 * Cos(NeuronCnt * 0.13) + 0.25;
+    end;
+    pConv.FlushWeightCache();
+    if pCase.QuantBits = 8 then Result.QuantizeWeightsInt8()
+    else if pCase.QuantBits = 4 then Result.QuantizeWeightsInt4();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  try
+  for CaseCnt := Low(Cases) to High(Cases) do
+  with Cases[CaseCnt] do
+  begin
+    CaseName := ' (case ' + IntToStr(CaseCnt) + ')';
+    NetCPU := BuildNet(Cases[CaseCnt], 0, Conv);
+    NetCL := BuildNet(Cases[CaseCnt], 0, Conv);
+    NetCLNoBias := BuildNet(Cases[CaseCnt], 1, ConvNoBias);
+    Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+    OutCPU := TNNetVolume.Create();
+    OutCL := TNNetVolume.Create();
+    OutCLNoBias := TNNetVolume.Create();
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.6 * Sin(i * 0.017) + 0.1;
+      NetCPU.Compute(Input);
+      NetCPU.GetOutput(OutCPU);
+
+      SetOpenCLImplicitConv(Implicit);
+      NetCL.EnableOpenCL(PlatformId, DeviceId);
+      NetCLNoBias.EnableOpenCLInContextOf(NetCL);
+      NetCL.ForceOpenCL(True);
+      NetCLNoBias.ForceOpenCL(True);
+      TiledBefore := Conv.OpenCLTiledGemmLaunchCount();
+      NetCL.Compute(Input);
+      NetCL.Compute(Input); // resident weights and bias
+      NetCL.GetOutput(OutCL);
+      NetCLNoBias.Compute(Input);
+      NetCLNoBias.Compute(Input);
+      NetCLNoBias.GetOutput(OutCLNoBias);
+      AssertEquals('both forwards ran on OpenCL' + CaseName, 2,
+        Conv.ForwardGPUCnt);
+      if not Pointwise and (QuantBits = 0) then
+        AssertEquals('implicit GEMM launches' + CaseName,
+          2 * Ord(Implicit), Conv.OpenCLImplicitConvLaunchCount());
+      if ExpectTiled
+        then AssertEquals('tiled launches' + CaseName, 2,
+          Conv.OpenCLTiledGemmLaunchCount() - TiledBefore)
+        else AssertEquals('untiled launches' + CaseName, 0,
+          Conv.OpenCLTiledGemmLaunchCount() - TiledBefore);
+      AssertEquals('the OpenCL bias buffer holds one float per neuron' +
+        CaseName, int64(Features) * SizeOf(TNeuralFloat),
+        Conv.OpenCLBufferBytes() - ConvNoBias.OpenCLBufferBytes());
+      AssertEquals('a fused OpenCL forward sizes no host FOutputRaw' + CaseName,
+        0, Conv.OutputRaw.Size);
+      // FNeuronBias (Features floats against 1) is the only host difference:
+      // the per-position FBiasOutput is still unbuilt.
+      HostBytesOnOpenCL := TNNetLayer(Conv).NonWeightBytes();
+      AssertEquals('host bias bytes on OpenCL' + CaseName,
+        int64(Features - 1) * SizeOf(TNeuralFloat),
+        HostBytesOnOpenCL - TNNetLayer(ConvNoBias).NonWeightBytes());
+
+      AssertEquals('output size match' + CaseName, OutCPU.Size, OutCL.Size);
+      DiffCPU := 0;
+      DiffBias := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        NeuronIdx := i mod Features;
+        if Abs(OutCPU.Raw[i] - OutCL.Raw[i]) > DiffCPU then
+          DiffCPU := Abs(OutCPU.Raw[i] - OutCL.Raw[i]);
+        if Abs(OutCL.Raw[i] - OutCLNoBias.Raw[i] -
+          Conv.Neurons[NeuronIdx].BiasWeight) > DiffBias then
+          DiffBias := Abs(OutCL.Raw[i] - OutCLNoBias.Raw[i] -
+            Conv.Neurons[NeuronIdx].BiasWeight);
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      WriteLn('  ConvRowBias ', SizeX, 'x', SizeY, 'x', InDepth, ' -> ',
+        Features, ' pointwise=', Pointwise, ' bits=', QuantBits,
+        ' implicit=', Implicit, ' tiled=', ExpectTiled,
+        ': vs cpu max|diff|=', DiffCPU:0:9, ' bias max|diff|=', DiffBias:0:9,
+        ' max|ref|=', MaxAbs:0:6);
+      AssertTrue('biased minus bias-free equals the neuron''s bias' + CaseName +
+        ': max |diff| = ' + FloatToStr(DiffBias), DiffBias < 1e-5 * (MaxAbs + 1));
+      // The CPU int4 forward quantizes its input to int8; the OpenCL one
+      // reads it in FP32.
+      if QuantBits = 4 then Tol := 5e-2 * (MaxAbs + 1)
+      else if MaxAbs < 1 then Tol := 1e-4
+      else Tol := 1e-4 * MaxAbs;
+      AssertTrue('OpenCL vs CPU' + CaseName + ': max |diff| = ' +
+        FloatToStr(DiffCPU) + ' must be < ' + FloatToStr(Tol), DiffCPU < Tol);
+
+      // The first CPU forward builds both host volumes (and, spatial FP32 or
+      // int8, the host column matrix).
+      ColumnsBefore := Conv.InputPrepared.Size;
+      NetCL.DisableOpenCL();
+      NetCL.Compute(Input);
+      if Pointwise then ColumnBytesGrown := 0
+      else ColumnBytesGrown := int64(Conv.InputPrepared.Size - ColumnsBefore) *
+        SizeOf(TNeuralFloat);
+      AssertEquals('a CPU forward sizes FOutputRaw' + CaseName,
+        Conv.Output.Size, Conv.OutputRaw.Size);
+      AssertEquals('a CPU forward builds FOutputRaw and FBiasOutput' + CaseName,
+        int64(2 * Conv.Output.Size - 1) * SizeOf(TNeuralFloat),
+        TNNetLayer(Conv).NonWeightBytes() - HostBytesOnOpenCL - ColumnBytesGrown);
+      AssertEquals('CPU forward after OpenCL vs CPU' + CaseName, 0,
+        NetCL.GetLastLayer.Output.SumDiff(OutCPU), 0);
+    finally
+      OutCLNoBias.Free;
+      OutCL.Free;
+      OutCPU.Free;
+      Input.Free;
+      NetCLNoBias.Free;
+      NetCL.Free;
+      NetCPU.Free;
+    end;
+  end;
+  finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+function MaxAbsDiffOfVolumes(A, B: TNNetVolume): TNeuralFloat;
+var
+  ElementPos, MaxElementPos: integer;
+begin
+  Result := 0;
+  MaxElementPos := A.Size - 1;
+  for ElementPos := 0 to MaxElementPos do
+    Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+end;
+
+// The liveness sharing tests' graph: long skip, reshape aliases, a split read
+// by three layers (cLivenessHostReaderIdx has no OpenCL path), concat and sums.
+const
+  cLivenessHostReaderIdx = 11;
+  cLivenessChunkedConvIdx = 12;
+  cLivenessPinnedLayerIdx = 15;
+
+function BuildLivenessShareTestNet(pTrainable: boolean): TNNet;
+var
+  Block, Skip, Alias, Split, Branch, Projection, HostBranch: TNNetLayer;
+  Merged: TNNetLayer;
+  LayerCnt, NeuronCnt, WeightCnt: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 5, 8));
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Skip := Result.AddLayer(TNNetSiLU.Create());
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Result.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
+  Result.AddLayer(TNNetReshape.Create(30, 1, 16));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+  Alias := Result.AddLayer(TNNetReshape.Create(6, 5, 16));
+  Split := Result.AddLayer(TNNetSplitChannels.Create(0, 8));
+  Branch := Result.AddLayerAfter(TNNetSiLU.Create(), Split);
+  Projection := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(8), Split);
+  Result.AddLayerAfter(TNNetIdentity.Create(), Split);
+  HostBranch := Result.AddLayer(TNNetPointwiseConvLinear.Create(16));
+  Block := Result.AddLayer(TNNetDeepConcat.Create([Branch, Projection]));
+  Merged := Result.AddLayer(TNNetSum.Create([Block, Skip, Alias, HostBranch]));
+  Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+  Result.AddLayer(TNNetSiLU.Create());
+  Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), Merged]));
+  Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
+  if not pTrainable then Result.SetTrainable(false, {pLowMemory=}false);
+  for LayerCnt := 0 to Result.GetLastLayerIdx() do
+  begin
+    for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+      Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+        0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+    end;
+    Result.Layers[LayerCnt].FlushWeightCache();
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOpenCLSchedulerHotWorkers;
+{$IFDEF OpenCL}
+var
+  NetCPU, Net: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InputPos, MaxInputPos, PassPos: integer;
+  MaxAbs: TNeuralFloat;
+  IsMultiCore: boolean;
+  LastLayerGPUCount: integer;
+
+  procedure CheckParallelPass(const pWhen: string; pExpectedHot: integer);
+  var
+    Diff: TNeuralFloat;
+  begin
+    Net.Compute(Input, 0, {Parallel=}true);
+    Diff := MaxAbsDiffOfVolumes(Net.GetLastLayer().Output, OutCPU);
+    AssertTrue(pWhen + ' vs CPU: ' + FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
+    if IsMultiCore then
+      AssertEquals(pWhen + ': hot workers', pExpectedHot,
+        Net.SchedulerHotWorkerCount());
+  end;
+
+  procedure EnableWithHostReader(pHasSharedKernel: boolean);
+  begin
+    Net.EnableOpenCL(PlatformId, DeviceId, pHasSharedKernel);
+    Net.ForceOpenCL(true);
+    Net.Layers[cLivenessHostReaderIdx].ForceOpenCL(false);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  IsMultiCore := NeuralDefaultThreadCount() > 1;
+  NetCPU := BuildLivenessShareTestNet({pTrainable=}false);
+  Net := BuildLivenessShareTestNet({pTrainable=}false);
+  Input := TNNetVolume.Create(6, 5, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    MaxInputPos := Input.Size - 1;
+    for InputPos := 0 to MaxInputPos do
+      Input.Raw[InputPos] := 0.7 * Sin(InputPos * 0.037) + 0.05;
+    NetCPU.Compute(Input);
+    NetCPU.GetOutput(OutCPU);
+    MaxAbs := OutCPU.GetMaxAbs();
+    // The pool starts before OpenCL is enabled, as PrepareInferenceThreads does.
+    Net.StartThreadWorkers();
+    AssertFalse('OpenCLEnabled before EnableOpenCL', Net.OpenCLEnabled());
+    CheckParallelPass('CPU pass', Net.HotThreadWorkers);
+    EnableWithHostReader({pHasSharedKernel=}true);
+    AssertTrue('OpenCLEnabled after EnableOpenCL', Net.OpenCLEnabled());
+    for PassPos := 0 to 1 do
+      CheckParallelPass('shared kernel pass ' + IntToStr(PassPos), 1);
+    AssertEquals('the host reader ran on the CPU', 0,
+      Net.Layers[cLivenessHostReaderIdx].ForwardGPUCnt);
+    AssertTrue('the last layer ran on OpenCL',
+      Net.GetLastLayer().ForwardGPUCnt > 0);
+    Net.DisableOpenCL();
+    AssertFalse('OpenCLEnabled after DisableOpenCL', Net.OpenCLEnabled());
+    // Serial first: a parallel pass right after DisableOpenCL logs "Error at
+    // moving output from OpenCL to RAM" for the conv layers (not a scheduler issue).
+    Net.Compute(Input);
+    CheckParallelPass('CPU pass after DisableOpenCL', Net.HotThreadWorkers);
+    // Private handles: OpenCL layers ride the shared queue, so the cold
+    // workers must be woken for them.
+    LastLayerGPUCount := Net.GetLastLayer().ForwardGPUCnt;
+    EnableWithHostReader({pHasSharedKernel=}false);
+    for PassPos := 0 to 1 do
+      CheckParallelPass('private kernel pass ' + IntToStr(PassPos), 1);
+    AssertTrue('private handles: the last layer ran on OpenCL',
+      Net.GetLastLayer().ForwardGPUCnt > LastLayerGPUCount);
+    if IsMultiCore then
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', Net.SchedulerStatsReport()));
+  finally
+    OutCPU.Free;
+    Input.Free;
+    Net.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestOpenCLShareOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  cHostReaderIdx = cLivenessHostReaderIdx;
+  cPinnedLayerIdx = cLivenessPinnedLayerIdx;
+var
+  NetCPU, NetOff, NetOn, NetQueues: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassPos, LayerPos, MaxLayerPos, DeadCount, ForwardCount: integer;
+  Parallel: boolean;
+  MaxAbs, Diff: TNeuralFloat;
+  BytesOff, BytesOn: int64;
+  SuffixRefused: boolean;
+
+  function BuildNet(): TNNet;
+  begin
+    Result := BuildLivenessShareTestNet({pTrainable=}false);
+  end;
+
+  // Every layer either reads back NetOff's exact output or reports it gone.
+  function CheckHostReads(const pWhen: string): integer;
+  var
+    ReadPos: integer;
+  begin
+    Result := 0;
+    for ReadPos := 0 to NetOn.GetLastLayerIdx() do
+    begin
+      NetOff.Layers[ReadPos].ForceOutputOnRAM();
+      if not NetOn.Layers[ReadPos].ForceOutputOnRAM() then
+      begin
+        Inc(Result);
+        continue;
+      end;
+      AssertEquals(pWhen + ': layer ' + IntToStr(ReadPos) + ' host read', 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[ReadPos].Output, NetOff.Layers[ReadPos].Output),
+        0);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetCPU := BuildNet();
+  NetOff := BuildNet();
+  NetOn := BuildNet();
+  NetQueues := BuildNet();
+  Input := TNNetVolume.Create(6, 5, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    for LayerPos := 0 to Input.Size - 1 do
+      Input.Raw[LayerPos] := 0.7 * Sin(LayerPos * 0.037) + 0.05;
+    NetCPU.Compute(Input);
+    NetCPU.GetOutput(OutCPU);
+    MaxAbs := OutCPU.GetMaxAbs();
+    NetOff.EnableOpenCL(PlatformId, DeviceId);
+    NetOff.ForceOpenCL(true);
+    NetOff.Layers[cHostReaderIdx].ForceOpenCL(false);
+    NetOn.ShareOpenCLOutputsByLiveness := true;
+    NetOn.Layers[cPinnedLayerIdx].OutputPinned := true;
+    NetOn.EnableOpenCL(PlatformId, DeviceId);
+    NetOn.ForceOpenCL(true);
+    NetOn.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertTrue('layers write into shared buffers',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    AssertTrue('the shared buffers are smaller than the outputs they hold',
+      NetOn.OpenCLSharedOutputBytes() < NetOn.OpenCLSharedOutputPrivateBytes());
+    MaxLayerPos := NetOn.GetLastLayerIdx();
+    ForwardCount := 0;
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      Inc(ForwardCount);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output);
+      AssertEquals('shared vs private, pass ' + IntToStr(PassPos), 0, Diff, 0);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, OutCPU);
+      AssertTrue('shared vs CPU, pass ' + IntToStr(PassPos) + ': ' +
+        FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
+      DeadCount := CheckHostReads('pass ' + IntToStr(PassPos));
+      AssertTrue('overwritten outputs report themselves gone', DeadCount > 0);
+      AssertTrue('the pinned layer keeps its output',
+        NetOn.Layers[cPinnedLayerIdx].ForceOutputOnRAM());
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', NetOn.SchedulerStatsReport()));
+    AssertEquals('the host reader ran on the CPU', 0,
+      NetOn.Layers[cHostReaderIdx].ForwardGPUCnt);
+    for LayerPos := 1 to MaxLayerPos do
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' OpenCL forwards',
+        NetOff.Layers[LayerPos].ForwardGPUCnt,
+        NetOn.Layers[LayerPos].ForwardGPUCnt);
+    AssertEquals('every layer after the input ran on OpenCL', ForwardCount,
+      NetOn.Layers[MaxLayerPos].ForwardGPUCnt);
+    BytesOff := NetOff.OpenCLBufferBytes();
+    BytesOn := NetOn.OpenCLBufferBytes();
+    WriteLn('  ShareOutputsByLiveness: ', NetOn.OpenCLSharedOutputLayerCount(),
+      ' layers share ', NetOn.OpenCLSharedOutputBytes(), ' B (private: ',
+      NetOn.OpenCLSharedOutputPrivateBytes(), ' B); net OpenCL bytes ',
+      BytesOff, ' -> ', BytesOn);
+    AssertEquals('OpenCL bytes saved', NetOn.OpenCLSharedOutputPrivateBytes() -
+      NetOn.OpenCLSharedOutputBytes(), BytesOff - BytesOn);
+    // A suffix forward would re-run readers of overwritten outputs.
+    SuffixRefused := false;
+    try
+      NetOn.Compute(NetOn.Layers[1].Output, 1);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('Compute from layer 1 is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeSerial(cHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeSerial from a middle layer is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeParallel(cHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeParallel from a middle layer is refused', SuffixRefused);
+    // Re-arming plans again in the new context.
+    NetOn.DisableOpenCL();
+    AssertEquals('no OpenCL bytes after DisableOpenCL', 0,
+      NetOn.OpenCLBufferBytes());
+    AssertEquals('no shared layers after DisableOpenCL', 0,
+      NetOn.OpenCLSharedOutputLayerCount());
+    NetOn.EnableOpenCL(PlatformId, DeviceId);
+    NetOn.ForceOpenCL(true);
+    NetOn.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertTrue('re-armed: layers share again',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    for PassPos := 0 to 1 do
+    begin
+      Parallel := PassPos = 1;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      AssertEquals('re-armed shared vs private', 0,
+        MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, NetOff.GetLastLayer().Output), 0);
+      CheckHostReads('re-armed pass ' + IntToStr(PassPos));
+    end;
+    // Per-layer queues order nothing between layers: sharing stays off.
+    NetQueues.ShareOpenCLOutputsByLiveness := true;
+    NetQueues.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel=}false);
+    NetQueues.ForceOpenCL(true);
+    NetQueues.Layers[cHostReaderIdx].ForceOpenCL(false);
+    AssertEquals('per-layer queues: no shared layers', 0,
+      NetQueues.OpenCLSharedOutputLayerCount());
+    AssertEquals('per-layer queues: no shared bytes', 0,
+      NetQueues.OpenCLSharedOutputBytes());
+    NetQueues.Compute(Input);
+    Diff := MaxAbsDiffOfVolumes(NetQueues.GetLastLayer().Output, OutCPU);
+    AssertTrue('per-layer queues vs CPU: ' + FloatToStr(Diff),
+      Diff < 1e-4 * (MaxAbs + 1));
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NetQueues.Free;
+    NetOn.Free;
+    NetOff.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestShareHostOutputsByLiveness;
+var
+  NetOff, NetOn, NetTrainable: TNNet;
+  Input: TNNetVolume;
+  PassPos, ElementPos, MaxElementPos, LayerPos, OverwrittenIdx: integer;
+  Parallel, SuffixRefused: boolean;
+  BytesOff, BytesOn, SharedBytes, PrivateBytes: int64;
+
+  procedure CheckPass(const pWhen: string);
+  begin
+    NetOff.Compute(Input, 0, Parallel);
+    NetOn.Compute(Input, 0, Parallel);
+    AssertEquals(pWhen + ': shared vs private output', 0,
+      MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+      NetOff.GetLastLayer().Output), 0);
+    AssertEquals(pWhen + ': the pinned layer keeps its output', 0,
+      MaxAbsDiffOfVolumes(NetOn.Layers[cLivenessPinnedLayerIdx].Output,
+      NetOff.Layers[cLivenessPinnedLayerIdx].Output), 0);
+  end;
+
+begin
+  NetOff := BuildLivenessShareTestNet({pTrainable=}false);
+  NetOn := BuildLivenessShareTestNet({pTrainable=}false);
+  NetTrainable := BuildLivenessShareTestNet({pTrainable=}true);
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.037) + 0.05;
+    NetOn.ShareHostOutputsByLiveness := true;
+    NetOn.Layers[cLivenessPinnedLayerIdx].OutputPinned := true;
+    AssertEquals('nothing shared before the first forward', 0,
+      NetOn.HostSharedOutputLayerCount());
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      CheckPass('pass ' + IntToStr(PassPos));
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+    begin
+      AssertEquals('the scheduler ran parallel passes', 0,
+        Pos(' 0 parallel', NetOn.SchedulerStatsReport()));
+      // The parallel passes split these convolutions across chunk workers.
+      AssertTrue('chunked convolution', NetOn.Layers[1].ChunkEligible() and
+        NetOn.Layers[cLivenessChunkedConvIdx].ChunkEligible());
+    end;
+    SharedBytes := NetOn.HostSharedOutputBytes();
+    PrivateBytes := NetOn.HostSharedOutputPrivateBytes();
+    BytesOff := NetOff.NonWeightBytes();
+    BytesOn := NetOn.NonWeightBytes();
+    WriteLn('  ShareHostOutputsByLiveness: ', NetOn.HostSharedOutputLayerCount(),
+      ' layers share; ', SharedBytes, ' B in place of ', PrivateBytes,
+      ' B; net host bytes ', BytesOff, ' -> ', BytesOn);
+    AssertTrue('layers share host storage',
+      NetOn.HostSharedOutputLayerCount() > 0);
+    AssertTrue('the shared storage is smaller than the outputs it holds',
+      SharedBytes < PrivateBytes);
+    AssertEquals('host bytes saved', PrivateBytes - SharedBytes,
+      BytesOff - BytesOn);
+    // A suffix forward would read outputs the last pass overwrote.
+    SuffixRefused := false;
+    try
+      NetOn.ComputeSerial(cLivenessHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeSerial from a middle layer is refused', SuffixRefused);
+    SuffixRefused := false;
+    try
+      NetOn.ComputeParallel(cLivenessHostReaderIdx);
+    except
+      on E: Exception do SuffixRefused := Pos('refused', E.Message) > 0;
+    end;
+    AssertTrue('ComputeParallel from a middle layer is refused', SuffixRefused);
+    // A pin set after a forward takes effect at the next one.
+    OverwrittenIdx := -1;
+    LayerPos := 1;
+    while (OverwrittenIdx < 0) and (LayerPos < NetOn.GetLastLayerIdx()) do
+    begin
+      if MaxAbsDiffOfVolumes(NetOn.Layers[LayerPos].Output,
+        NetOff.Layers[LayerPos].Output) > 0 then OverwrittenIdx := LayerPos;
+      Inc(LayerPos);
+    end;
+    AssertTrue('a later layer overwrote an output', OverwrittenIdx > 0);
+    NetOn.Layers[OverwrittenIdx].OutputPinned := true;
+    CheckPass('pinned after a forward');
+    AssertEquals('the layer pinned after a forward keeps its output', 0,
+      MaxAbsDiffOfVolumes(NetOn.Layers[OverwrittenIdx].Output,
+      NetOff.Layers[OverwrittenIdx].Output), 0);
+    // Switching it off gives every layer its own storage back at once.
+    NetOn.ShareHostOutputsByLiveness := false;
+    AssertEquals('off: no shared layers', 0, NetOn.HostSharedOutputLayerCount());
+    AssertEquals('off: host bytes as unshared', BytesOff, NetOn.NonWeightBytes());
+    Parallel := false;
+    CheckPass('off');
+    NetOn.ShareHostOutputsByLiveness := true;
+    Parallel := true;
+    CheckPass('on again');
+    AssertTrue('on again: layers share', NetOn.HostSharedOutputLayerCount() > 0);
+    // Backprop reads the outputs: a trainable net keeps them private.
+    NetTrainable.ShareHostOutputsByLiveness := true;
+    NetTrainable.Compute(Input);
+    AssertEquals('trainable: no shared layers', 0,
+      NetTrainable.HostSharedOutputLayerCount());
+    NetOn.Layers[1].SetTrainable(true);
+    NetOn.Compute(Input);
+    AssertEquals('a trainable layer drops the sharing', 0,
+      NetOn.HostSharedOutputLayerCount());
+  finally
+    Input.Free;
+    NetTrainable.Free;
+    NetOn.Free;
+    NetOff.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestOpenCLShareHostOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  // Host-computed in the OpenCL pass: their consumers upload what they wrote.
+  cHostComputedIdx: array[0..3] of integer = (2, 9, cLivenessChunkedConvIdx, 14);
+var
+  NetOff, NetOn, NetQueues: TNNet;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassPos, ElementPos, MaxElementPos, HostPos, GoneCount: integer;
+  Parallel, PinRefused: boolean;
+  BytesOff, BytesOn: int64;
+
+  // Read from the last layer down, so no read lands in a storage still unread:
+  // each layer gives NetOff's exact output or reports it gone.
+  function CountGoneHostReads(const pWhen: string): integer;
+  var
+    ReadPos: integer;
+  begin
+    Result := 0;
+    for ReadPos := NetOn.GetLastLayerIdx() downto 1 do
+    begin
+      NetOff.Layers[ReadPos].ForceOutputOnRAM();
+      if not NetOn.Layers[ReadPos].ForceOutputOnRAM() then
+      begin
+        Inc(Result);
+        continue;
+      end;
+      AssertEquals(pWhen + ': layer ' + IntToStr(ReadPos) + ' host read', 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[ReadPos].Output,
+        NetOff.Layers[ReadPos].Output), 0);
+    end;
+  end;
+
+  procedure ArmNet(Net: TNNet; pHasSharedKernel: boolean);
+  var
+    HostComputedPos: integer;
+  begin
+    Net.EnableOpenCL(PlatformId, DeviceId, pHasSharedKernel);
+    Net.ForceOpenCL(true);
+    Net.Layers[cLivenessHostReaderIdx].ForceOpenCL(false);
+    for HostComputedPos := 0 to High(cHostComputedIdx) do
+      Net.Layers[cHostComputedIdx[HostComputedPos]].DisableOpenCL();
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetOff := BuildLivenessShareTestNet({pTrainable=}false);
+  NetOn := BuildLivenessShareTestNet({pTrainable=}false);
+  NetQueues := BuildLivenessShareTestNet({pTrainable=}false);
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.037) + 0.05;
+    ArmNet(NetOff, true);
+    NetOn.ShareHostOutputsByLiveness := true;
+    NetOn.ShareOpenCLOutputsByLiveness := true;
+    NetOn.Layers[cLivenessPinnedLayerIdx].OutputPinned := true;
+    ArmNet(NetOn, true);
+    for PassPos := 0 to 3 do
+    begin
+      Parallel := PassPos >= 2;
+      NetOff.Compute(Input, 0, Parallel);
+      NetOn.Compute(Input, 0, Parallel);
+      AssertEquals('pass ' + IntToStr(PassPos) + ': shared vs private', 0,
+        MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+        NetOff.GetLastLayer().Output), 0);
+      AssertTrue('the pinned layer keeps its output',
+        NetOn.Layers[cLivenessPinnedLayerIdx].ForceOutputOnRAM());
+      NetOff.Layers[cLivenessPinnedLayerIdx].ForceOutputOnRAM();
+      AssertEquals('pass ' + IntToStr(PassPos) + ': pinned layer', 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[cLivenessPinnedLayerIdx].Output,
+        NetOff.Layers[cLivenessPinnedLayerIdx].Output), 0);
+      GoneCount := CountGoneHostReads('pass ' + IntToStr(PassPos));
+      AssertTrue('overwritten host outputs report themselves gone',
+        GoneCount > 0);
+    end;
+    if NeuralDefaultThreadCount() > 1 then
+      AssertTrue('the host-computed convolution ran in chunks',
+        NetOn.Layers[cLivenessChunkedConvIdx].ChunkEligible());
+    // The OpenCL slots were planned when the net was armed.
+    PinRefused := false;
+    try
+      NetOn.Layers[cLivenessHostReaderIdx].OutputPinned := true;
+    except
+      on E: Exception do PinRefused := Pos('EnableOpenCL', E.Message) > 0;
+    end;
+    AssertTrue('a pin after arming is refused', PinRefused);
+    AssertEquals('the host reader ran on the CPU', 0,
+      NetOn.Layers[cLivenessHostReaderIdx].ForwardGPUCnt);
+    for HostPos := 0 to High(cHostComputedIdx) do
+      AssertEquals('layer ' + IntToStr(cHostComputedIdx[HostPos]) +
+        ' ran on the CPU', 0,
+        NetOn.Layers[cHostComputedIdx[HostPos]].ForwardGPUCnt);
+    BytesOff := NetOff.NonWeightBytes();
+    BytesOn := NetOn.NonWeightBytes();
+    WriteLn('  ShareHostOutputsByLiveness on OpenCL: ',
+      NetOn.HostSharedOutputLayerCount(), ' layers share; net host bytes ',
+      BytesOff, ' -> ', BytesOn, '; OpenCL shared layers ',
+      NetOn.OpenCLSharedOutputLayerCount());
+    AssertTrue('layers share host storage',
+      NetOn.HostSharedOutputLayerCount() > 0);
+    AssertTrue('layers share OpenCL buffers',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    AssertEquals('host bytes saved', NetOn.HostSharedOutputPrivateBytes() -
+      NetOn.HostSharedOutputBytes(), BytesOff - BytesOn);
+    // Per-layer queues order nothing between layers: host sharing stays off.
+    NetQueues.ShareHostOutputsByLiveness := true;
+    ArmNet(NetQueues, {pHasSharedKernel=}false);
+    NetQueues.Compute(Input);
+    AssertEquals('per-layer queues: no shared layers', 0,
+      NetQueues.HostSharedOutputLayerCount());
+  finally
+    Input.Free;
+    NetQueues.Free;
+    NetOn.Free;
+    NetOff.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // Host-only, every build. The jobs are driven by hand for 1, 3 and 5 workers,
 // so the range split runs whatever the pool size. Coded by Claude (AI).
 procedure TTestNeuralNumerical.TestCopyQuantRowsTransposedMatchesVolumeMethods;
@@ -70105,7 +72038,8 @@ var
     else Result.QuantizeWeightsInt8();
   end;
 
-  procedure RunCase(pInt4, pTiled, pBiased: boolean);
+  // pSplit forces 2 K-splits on the tiled launches (64 inputs = 2 K-steps).
+  procedure RunCase(pInt4, pTiled, pBiased, pSplit: boolean);
   var
     NetA, NetB, NetC, NetWide: TNNet;
     LayerB, LayerC: TNNetLayerConcatedWeights;
@@ -70117,6 +72051,7 @@ var
     if pTiled then CaseName := CaseName + ' tiled'
     else CaseName := CaseName + ' untiled';
     if pBiased then CaseName := CaseName + ' biased';
+    if pSplit then CaseName := CaseName + ' split-K';
     NetA := BuildNet(csNeurons, 1, pInt4, pBiased);
     NetB := BuildNet(csNeurons, 2, pInt4, pBiased);
     NetWide := BuildNet(csNeurons + 8, 3, pInt4, pBiased);
@@ -70138,6 +72073,7 @@ var
       NetC.ForceOpenCL(true);
       if pTiled then SetTiledGemmMinColumns(csTiledGemmMinColumns)
       else SetTiledGemmMinColumns(0);
+      if pSplit then SetTiledGemmSplitK(2) else SetTiledGemmSplitK(0);
       LayerB := TNNetLayerConcatedWeights(NetB.GetLastLayer());
       LayerC := TNNetLayerConcatedWeights(NetC.GetLastLayer());
       AssertTrue(CaseName + ': C armed on A''s codes',
@@ -70161,6 +72097,9 @@ var
       AssertEquals(CaseName + ': C re-linked to B vs B', 0,
         OutB.SumDiff(OutC), 0);
       AssertTrue(CaseName + ': C ran on OpenCL', LayerC.ForwardGPUCnt = 2);
+      if pSplit then
+        AssertEquals(CaseName + ': K-splits after the swap', 2,
+          LayerC.OpenCLLastTiledGemmSplits());
       if pTiled then
         AssertEquals(CaseName + ': tiled launch after the swap',
           TiledBefore + 1, LayerC.OpenCLTiledGemmLaunchCount())
@@ -70175,6 +72114,7 @@ var
         LayerC.WeightOwner = LayerB);
     finally
       SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      SetTiledGemmSplitK(csTiledGemmSplitKAuto);
       OutC.Free;
       OutB.Free;
       OutA.Free;
@@ -70194,7 +72134,210 @@ begin
   end;
   for CasePos := 0 to 7 do
     RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}(CasePos and 2) = 0,
-      {pBiased=}(CasePos and 4) <> 0);
+      {pBiased=}(CasePos and 4) <> 0, {pSplit=}false);
+  // The split-K kernel and its merge were bound before the swap.
+  for CasePos := 0 to 3 do
+    RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}true,
+      {pBiased=}(CasePos and 2) <> 0, {pSplit=}true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvBorrowsOwnerOpenCLWeights;
+{$IFDEF OpenCL}
+const
+  csDepth = 6;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Owner, Borrower, Control, LateBorrower: TNNet;
+  Input, LateInput, OwnerInput: TNNetVolume;
+  OutCPU, LateCPU, OwnerCPU, OutCL: TNNetVolume;
+  TransfersBefore, Borrowed, Unshared, Flushed: TOpenCLTransferCounts;
+  LayerPos, ForwardsBefore: integer;
+  WeightBytes: int64;
+  Layer: TNNetLayerConcatedWeights;
+  WasCounting: boolean;
+  MaxDiff: TNeuralFloat;
+
+  function BuildNet(SizeX, SizeY: integer; pWeightSeed: integer): TNNet;
+  var
+    LayerIdx, NeuronPos, MaxNeuronPos, WeightPos, MaxWeightPos: integer;
+    Weights: TNNetVolume;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SizeX, SizeY, csDepth));
+    Result.AddLayer(TNNetConvolutionLinear.Create(80, 3, 1, 1));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(72));
+    if pWeightSeed = 0 then
+    begin
+      Result.SetTrainable(false);
+      exit;
+    end;
+    for LayerIdx := 1 to 2 do
+    begin
+      MaxNeuronPos := Result.Layers[LayerIdx].Neurons.Count - 1;
+      for NeuronPos := 0 to MaxNeuronPos do
+      begin
+        Weights := Result.Layers[LayerIdx].Neurons[NeuronPos].Weights;
+        MaxWeightPos := Weights.Size - 1;
+        for WeightPos := 0 to MaxWeightPos do
+          Weights.FData[WeightPos] := 0.2 * Sin((NeuronPos + 1) * 0.37 +
+            WeightPos * 0.11 + LayerIdx + pWeightSeed);
+        Result.Layers[LayerIdx].Neurons[NeuronPos].BiasWeight :=
+          0.3 * Cos(NeuronPos * 0.7 + LayerIdx);
+      end;
+    end;
+    Result.UpdateWeights();
+    Result.SetTrainable(false);
+  end;
+
+  procedure FillInput(V: TNNetVolume);
+  var
+    Pos, MaxPos: integer;
+  begin
+    MaxPos := V.Size - 1;
+    for Pos := 0 to MaxPos do
+      V.FData[Pos] := 0.7 * Cos(Pos * 0.029) - 0.1;
+  end;
+
+  function ForwardUploads(NN: TNNet; V: TNNetVolume): TOpenCLTransferCounts;
+  begin
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(V);
+    Result := OpenCLProcessTransferTotals();
+    Result.UploadCount := Result.UploadCount - TransfersBefore.UploadCount;
+    Result.UploadBytes := Result.UploadBytes - TransfersBefore.UploadBytes;
+    NN.GetOutput(OutCL);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  Owner := BuildNet(3, 2, 1);
+  Borrower := BuildNet(9, 7, 0);
+  Control := BuildNet(9, 7, 0);
+  LateBorrower := BuildNet(5, 5, 0);
+  Input := TNNetVolume.Create(9, 7, csDepth);
+  LateInput := TNNetVolume.Create(5, 5, csDepth);
+  OwnerInput := TNNetVolume.Create(3, 2, csDepth);
+  OutCPU := TNNetVolume.Create();
+  LateCPU := TNNetVolume.Create();
+  OwnerCPU := TNNetVolume.Create();
+  OutCL := TNNetVolume.Create();
+  try
+    FillInput(Input);
+    FillInput(LateInput);
+    FillInput(OwnerInput);
+    AssertEquals('borrower linked', 2, Borrower.LinkWeightsFrom(Owner));
+    AssertEquals('control linked', 2, Control.LinkWeightsFrom(Owner));
+    AssertEquals('late borrower linked', 2, LateBorrower.LinkWeightsFrom(Owner));
+    Borrower.Compute(Input);
+    Borrower.GetOutput(OutCPU);
+    LateBorrower.Compute(LateInput);
+    LateBorrower.GetOutput(LateCPU);
+    Owner.Compute(OwnerInput);
+    Owner.GetOutput(OwnerCPU);
+    WeightBytes := 0;
+    for LayerPos := 1 to 2 do
+      WeightBytes := WeightBytes + int64(Owner.Layers[LayerPos].CountWeights()) *
+        SizeOf(TNeuralFloat);
+    OpenCLTransferCounting := true;
+    // The control arms before the owner, so it has nothing to borrow and
+    // uploads its own weights.
+    Control.EnableOpenCL(PlatformId, DeviceId);
+    Control.ForceOpenCL(true);
+    Unshared := ForwardUploads(Control, Input);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    LateBorrower.EnableOpenCLInContextOf(Owner);
+    Borrower.EnableOpenCLInContextOf(Owner);
+    Borrower.ForceOpenCL(true);
+    LateBorrower.ForceOpenCL(true);
+    for LayerPos := 1 to 2 do
+    begin
+      Layer := TNNetLayerConcatedWeights(Borrower.Layers[LayerPos]);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the OpenCL weights',
+        Layer.OpenCLWeightsBorrowed());
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' shares the host caches',
+        Layer.WeightCachesSharedWithOwner());
+      AssertFalse('the control layer ' + IntToStr(LayerPos) + ' does not borrow',
+        TNNetLayerConcatedWeights(Control.Layers[LayerPos]).OpenCLWeightsBorrowed());
+    end;
+    Borrowed := ForwardUploads(Borrower, Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, OutCL);
+    WriteLn('  Borrowed OpenCL conv weights: first forward uploads ',
+      Borrowed.UploadCount, ' (', Borrowed.UploadBytes, ' B), unshared ',
+      Unshared.UploadCount, ' (', Unshared.UploadBytes, ' B); weights ',
+      WeightBytes, ' B; max|diff|=', MaxDiff:0:9);
+    AssertTrue('the control uploads its weights',
+      Unshared.UploadBytes >= WeightBytes + Input.Size * SizeOf(TNeuralFloat));
+    AssertEquals('the borrower uploads only its input', int64(Input.Size) *
+      SizeOf(TNeuralFloat), Borrowed.UploadBytes);
+    AssertTrue('borrower vs CPU: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    // A weight update on a borrower rebuilds the shared host caches in place
+    // and writes nothing to the borrowed OpenCL buffers.
+    for LayerPos := 1 to 2 do
+    begin
+      Layer := TNNetLayerConcatedWeights(Borrower.Layers[LayerPos]);
+      Layer.FlushWeightCache();
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' still shares the caches',
+        Layer.WeightCachesSharedWithOwner());
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' still borrows',
+        Layer.OpenCLWeightsBorrowed());
+    end;
+    Flushed := ForwardUploads(Borrower, Input);
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, OutCL);
+    AssertEquals('after a borrower update: only the input is uploaded',
+      int64(Input.Size) * SizeOf(TNeuralFloat), Flushed.UploadBytes);
+    AssertTrue('after a borrower update: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    // Release orders: a borrower freed while the owner is armed, the owner
+    // disarmed under a live borrower, then the owner freed before it.
+    FreeAndNil(Borrower);
+    Owner.ForceOpenCL(true);
+    ForwardsBefore := Owner.Layers[1].ForwardGPUCnt;
+    Owner.Compute(OwnerInput);
+    Owner.GetOutput(OutCL);
+    MaxDiff := MaxAbsDiffToOutput(OwnerCPU, OutCL);
+    AssertEquals('the owner ran on OpenCL', ForwardsBefore + 1,
+      Owner.Layers[1].ForwardGPUCnt);
+    AssertTrue('owner after its borrower was freed: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    Owner.DisableOpenCL();
+    ForwardsBefore := LateBorrower.Layers[1].ForwardGPUCnt;
+    LateBorrower.Compute(LateInput);
+    LateBorrower.GetOutput(OutCL);
+    MaxDiff := MaxAbsDiffToOutput(LateCPU, OutCL);
+    AssertTrue('after the owner disarmed: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    AssertEquals('still on OpenCL after the owner disarmed', ForwardsBefore + 1,
+      LateBorrower.Layers[1].ForwardGPUCnt);
+    FreeAndNil(Owner);
+    AssertFalse('detached: caches unshared', TNNetLayerConcatedWeights(
+      LateBorrower.Layers[1]).WeightCachesSharedWithOwner());
+    FreeAndNil(LateBorrower);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCL.Free;
+    OwnerCPU.Free;
+    LateCPU.Free;
+    OutCPU.Free;
+    OwnerInput.Free;
+    LateInput.Free;
+    Input.Free;
+    LateBorrower.Free;
+    Control.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
 end;
 {$ELSE}
 begin
@@ -72754,6 +74897,199 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF OpenCL}
+type
+  // Host layer that reads its source without ForceOutputOnRAM: the stale read
+  // the residency profile must report.
+  TStaleReadTestLayer = class(TNNetIdentity)
+  public
+    procedure Compute(); override;
+  end;
+
+procedure TStaleReadTestLayer.Compute();
+begin
+  FOutput.CopyNoChecks(FPrevLayer.Output);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.ProfiledResidencyCountsOpenCL;
+{$IFDEF OpenCL}
+const
+  PassCount = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Proj, Relu, Consumer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ConsumerPos, PassCnt: integer;
+  Report: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Input := TNNetVolume.Create(3, 1, 100);
+  try
+    Input.FillForDebug();
+    for ConsumerPos := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      try
+        // Shapes from InputResidentSourceUnforcedOpenCLParity: only the
+        // resident input puts the projection on OpenCL; no ForceOpenCL.
+        NN.AddLayer(TNNetInput.Create(3, 1, 100));
+        Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+        Relu := NN.AddLayer(TNNetReLU.Create());
+        if ConsumerPos = 0
+          then Consumer := NN.AddLayer(TNNetMulByConstant.Create(2))
+          else Consumer := NN.AddLayer(TStaleReadTestLayer.Create());
+        NN.SetTrainable(False, False);
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.LayerProfiling := true;
+        // The warm-up forward takes the one-time uploads out of the window.
+        NN.Compute(Input);
+        NN.ClearTime();
+        for PassCnt := 1 to PassCount do
+        begin
+          NN.Compute(Input);
+          if ConsumerPos = 0 then Proj.ForceOutputOnRAM();
+        end;
+        Report := TNNet.LayerGroupTimingReport(NN, [], PassCount);
+        AssertEquals('ReLU on OpenCL', PassCount, Relu.ForwardGPUCnt);
+        AssertEquals('ReLU bound its source', PassCount,
+          Relu.ProfiledResidency.SourceBoundCnt);
+        AssertEquals('ReLU output resident', PassCount,
+          Relu.ProfiledResidency.OutputResidentCnt);
+        AssertEquals('ReLU pulled nothing', 0,
+          Relu.ProfiledResidency.SourcePulledToRAMCnt);
+        AssertEquals('ReLU uploaded nothing', 0,
+          Relu.ProfiledResidency.ActivationUploadedCnt);
+        AssertEquals('projection bound the input', PassCount,
+          Proj.ProfiledResidency.SourceBoundCnt);
+        AssertEquals('a bound projection uploads nothing', 0,
+          Proj.ProfiledTransfers.UploadCount);
+        AssertEquals('an input layer has no source to classify', 0,
+          NN.Layers[0].ProfiledResidency.ActivationUploadedCnt);
+        if ConsumerPos = 0 then
+        begin
+          AssertEquals('host consumer pulled the ReLU output', PassCount,
+            Consumer.ProfiledResidency.SourcePulledToRAMCnt);
+          AssertEquals('host consumer is no stale read', 0,
+            Consumer.ProfiledResidency.StaleSuspectCnt);
+          AssertTrue('the caller''s downloads are outside the layer rows',
+            Pos('since ClearTime (callers and other nets included): ' +
+            'up 0 / 0.0 MB, down ' + IntToStr(PassCount) + ' / 0.0 MB.',
+            Report) > 0);
+        end
+        else
+        begin
+          AssertEquals('stale read reported', PassCount,
+            Consumer.ProfiledResidency.StaleSuspectCnt);
+          AssertEquals('stale read pulled nothing', 0,
+            Consumer.ProfiledResidency.SourcePulledToRAMCnt);
+        end;
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.ProfiledResidencySourcesOpenCL;
+{$IFDEF OpenCL}
+const
+  PassCount = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ProjA, ProjB, Sum, SecondInput, Mul, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassCnt: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Input := TNNetVolume.Create(3, 1, 100);
+  try
+    Input.FillForDebug();
+    // TNNetSum([ProjA, ProjB]) after a host layer: its FPrevLayer is that host
+    // layer, which only AppendInputLayers lists. A second TNNetInput follows a
+    // resident projection it never reads.
+    NN := TNNet.Create();
+    try
+      NN.LayerProfiling := true;
+      NN.AddLayer(TNNetInput.Create(3, 1, 100));
+      ProjA := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+      ProjB := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
+      NN.AddLayer(TNNetMulByConstant.Create(2));
+      Sum := NN.AddLayer(TNNetSum.Create([ProjA, ProjB]));
+      Proj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
+      SecondInput := NN.AddLayer(TNNetInput.Create(3, 1, 6));
+      NN.SetTrainable(False, False);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.ClearTime();
+      for PassCnt := 1 to PassCount do NN.Compute(Input);
+      AssertEquals('sum on OpenCL', PassCount, Sum.ForwardGPUCnt);
+      AssertEquals('sum bound both sources', PassCount,
+        Sum.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('sum pulled nothing', 0,
+        Sum.ProfiledResidency.SourcePulledToRAMCnt);
+      AssertTrue('the projection before the second input stays resident',
+        Proj.ProfiledResidency.OutputResidentCnt = PassCount);
+      AssertEquals('a second input has no source: bound', 0,
+        SecondInput.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('a second input has no source: stale?', 0,
+        SecondInput.ProfiledResidency.StaleSuspectCnt);
+    finally
+      NN.Free;
+    end;
+    // A host layer feeds a forced projection: the activation is uploaded.
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(3, 1, 100));
+      Mul := NN.AddLayer(TNNetMulByConstant.Create(2));
+      Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+      NN.SetTrainable(False, False);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Proj.ForceOpenCL(True);
+      NN.LayerProfiling := true;
+      NN.Compute(Input);
+      NN.ClearTime();
+      for PassCnt := 1 to PassCount do NN.Compute(Input);
+      AssertEquals('forced projection on OpenCL', PassCount,
+        Proj.ForwardGPUCnt);
+      AssertEquals('projection uploaded its source', PassCount,
+        Proj.ProfiledResidency.ActivationUploadedCnt);
+      AssertEquals('an uploaded source is not bound', 0,
+        Proj.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('host layer with an input in RAM is no stale read', 0,
+        Mul.ProfiledResidency.StaleSuspectCnt);
+    finally
+      NN.Free;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.InputResidentSourceUnforcedOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -73390,6 +75726,9 @@ begin
         NNGpu.EnableOpenCL(PlatformId, DeviceId);
         LGpu.FusedSDPACL.ForcedSplits := Override.Splits;
         LGpu.FusedSDPACL.ForcedChunkRows := Override.ChunkRows;
+        // This harness tests the split-row decode: keep wide steps off the
+        // flash path (FusedSDPAFlashCausalOpenCLParity covers that).
+        LGpu.FusedSDPACL.ForcedFlashMinTokens := MaxInt;
         if Override.UsableLocalMemBytes > 0 then
           LGpu.FusedSDPACL.ForcedLocalMemBytes := Override.UsableLocalMemBytes
             + LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV)
@@ -73611,6 +75950,128 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.FusedSDPAResidentSnapshotRestoreOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; MaxContext = 16;
+  PrefixSteps = 4; DivergeSteps = PrefixSteps + 1; ResumeSteps = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn, CpuK, CpuV, GpuK, GpuV: TNNetVolume;
+  CpuKQ, CpuVQ, GpuKQ, GpuVQ: TNNetVolumeQuant8;
+  CpuLen, CpuSinks, CpuWindow, GpuLen, GpuSinks, GpuWindow: integer;
+  InDepth, OutDepth, Step, MaxInPos, MaxOutPos, ModePos: integer;
+  Int8KV: boolean;
+  MaxDiff, Tolerance: TNeuralFloat;
+
+  procedure RunStep(Compare: boolean);
+  var
+    D: integer;
+  begin
+    for D := 0 to MaxInPos do StepIn.FData[D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(StepIn);
+    NNGpu.Compute(StepIn);
+    if not Compare then exit;
+    for D := 0 to MaxOutPos do
+      MaxDiff := Max(MaxDiff, Abs(NNCpu.GetLastLayer.Output.FData[D] -
+        NNGpu.GetLastLayer.Output.FData[D]));
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  OutDepth := QHeads * Dk;
+  MaxInPos := InDepth - 1;
+  MaxOutPos := OutDepth - 1;
+  for ModePos := 0 to 1 do
+  begin
+    Int8KV := ModePos = 1;
+    RandSeed := 20261002 + ModePos;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    StepIn := TNNetVolume.Create(1, 1, InDepth);
+    CpuK := TNNetVolume.Create(); CpuV := TNNetVolume.Create();
+    GpuK := TNNetVolume.Create(); GpuV := TNNetVolume.Create();
+    CpuKQ := TNNetVolumeQuant8.Create(); CpuVQ := TNNetVolumeQuant8.Create();
+    GpuKQ := TNNetVolumeQuant8.Create(); GpuVQ := TNNetVolumeQuant8.Create();
+    try
+      NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.AddLayer(TNNetSiLU.Create());
+      NNCpu.SetTrainable(False, False);
+      NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.AddLayer(TNNetSiLU.Create());
+      NNGpu.SetTrainable(False, False);
+      LCpu.BeginIncrementalDecode(MaxContext, Int8KV);
+      LGpu.BeginIncrementalDecode(MaxContext, Int8KV);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      MaxDiff := 0;
+      for Step := 1 to PrefixSteps do RunStep(true);
+      AssertTrue('the prefix must have run on OpenCL', LGpu.CacheOnOpenCL);
+      if Int8KV then
+      begin
+        LCpu.CaptureCacheStateInt8(CpuKQ, CpuVQ, CpuLen, CpuSinks, CpuWindow);
+        LGpu.CaptureCacheStateInt8(GpuKQ, GpuVQ, GpuLen, GpuSinks, GpuWindow);
+      end
+      else
+      begin
+        LCpu.CaptureCacheState(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+        LGpu.CaptureCacheState(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+      end;
+      AssertTrue('a capture must leave the cache resident', LGpu.CacheOnOpenCL);
+      AssertEquals('captured length', PrefixSteps, GpuLen);
+      // Rebuild the cache from row 0 with other rows, so the resident rows
+      // the restore must replace differ from the snapshot's.
+      LCpu.ResetCache();
+      LGpu.ResetCache();
+      for Step := 1 to DivergeSteps do RunStep(false);
+      AssertTrue('the diverged rows must be resident before the restore',
+        LGpu.CacheOnOpenCL);
+      if Int8KV then
+      begin
+        LCpu.RestoreCacheStateInt8(CpuKQ, CpuVQ, CpuLen, CpuSinks, CpuWindow);
+        LGpu.RestoreCacheStateInt8(GpuKQ, GpuVQ, GpuLen, GpuSinks, GpuWindow);
+      end
+      else
+      begin
+        LCpu.RestoreCacheState(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+        LGpu.RestoreCacheState(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+      end;
+      AssertFalse('a restore must mark the OpenCL copy stale', LGpu.CacheOnOpenCL);
+      AssertEquals('restored length', PrefixSteps, LGpu.CacheLength);
+      for Step := 1 to ResumeSteps do RunStep(true);
+      AssertTrue('the resumed steps must run on OpenCL again', LGpu.CacheOnOpenCL);
+      if Int8KV then Tolerance := 1e-3 else Tolerance := 1e-4;
+      AssertTrue(BoolToStr(Int8KV, 'int8', 'FP32') +
+        ' restore over a diverged resident cache: max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < Tolerance);
+      LGpu.EndIncrementalDecode();
+      LCpu.EndIncrementalDecode();
+    finally
+      GpuVQ.Free; GpuKQ.Free; CpuVQ.Free; CpuKQ.Free;
+      GpuV.Free; GpuK.Free; CpuV.Free; CpuK.Free;
+      StepIn.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.FusedSDPAInt8WindowedDecodeOpenCLParity;
 {$IFDEF OpenCL}
 const
@@ -73743,144 +76204,350 @@ begin
 end;
 {$ENDIF}
 
-// Tolerance: 1e-5 of max(1, max|y|). The kernel sums the same products as the
-// host but in another order (online softmax, key tiles), so float32 rounding
-// differs by a few ulp per key; a wrong row, head, tile edge or rescale moves
-// the output by order 1e-1.
+{$IFDEF OpenCL}
+// One flash parity case: a CPU twin and an OpenCL TNNetFusedSDPA (causal or
+// CachedForwardNonCausal) attend a PrefixLen-row cache plus StepTokens rows,
+// twice; the OpenCL layer runs with ForcedSplits key splits (0 = automatic).
+// ExpectedPath sdpaPathFlash falls back to the split decode (causal) or the
+// host when the tiles do not fit; on the host path the output must match the
+// CPU exactly. Inputs are InputAmplitude * U(-0.5, 0.5); KeyRamp > 0 adds
+// KeyRamp * row to prefix K row `row` and 1 to every input. With the int8
+// cache, row r of the prefix and of the step is scaled by 0.5 + 0.375*(r mod 5)
+// and the reference is a double-precision attention over the codes and scales
+// the OpenCL append wrote, so quantizer rounding is not tested here
+// (FusedSDPAInt8AppendOpenCLParity covers it). Tolerance: 1e-5 * max(1, max|y|).
+var
+  // Key splits of the last flash run of RunFusedSDPAFlashCase.
+  LastFlashSplits: integer;
+
+// Local memory of a flash work-group, written out from the kernel layout
+// (floats; 0 = not listed): Dk 128: Q/V 64x68 + K/P 64x68 + partials,
+// rescale, max 64x18 + table 4x64; Dk 72: Q/V 64x76 + K 64x76 + 64x18 +
+// 4x64; Dk 256: V 16x260 + K 64x68 + 32x18 + 4x32. Column chunks (V 16 rows of
+// the chunk + 4): Dk 384 = 2 x 192, 768 = 3 x 256, 1152 = 5 x 232. The int8
+// cache adds the K and V row scales of a 64-key tile.
+function ExpectedFlashScratchFloats(Dk: integer; Int8KV: boolean): integer;
+begin
+  Result := 0;
+  if Dk = 128 then
+    Result := 64 * 68 + 64 * 68 + 64 * 18 + 4 * 64
+  else if Dk = 72 then
+    Result := 64 * 76 + 64 * 76 + 64 * 18 + 4 * 64
+  else if Dk = 256 then
+    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 384 then
+    Result := 16 * 196 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 768 then
+    Result := 16 * 260 + 64 * 68 + 32 * 18 + 4 * 32
+  else if Dk = 1152 then
+    Result := 16 * 236 + 64 * 68 + 32 * 18 + 4 * 32;
+  if (Result > 0) and Int8KV then Inc(Result, 2 * 64);
+end;
+
+procedure RunFusedSDPAFlashCase(PlatformId: cl_platform_id;
+  DeviceId: cl_device_id; QHeads, KVHeads, Dk, PrefixLen,
+  StepTokens, Window: integer; SoftCap, InputAmplitude, KeyRamp: TNeuralFloat;
+  Causal: boolean; ForcedSplits, UsableLocalMemBytes: integer;
+  HostSource, ResidentPrefix, Int8KV: boolean;
+  ExpectedPath: TFusedSDPAOpenCLPath);
+var
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn, PrefixK, PrefixV: TNNetVolume;
+  KVRows: TNNetKVRowsOnOpenCL;
+  InDepth, KW, Pass, Pos, SnapLen, SnapSinks, SnapWindow: integer;
+  MaxPrefixPos, MaxStepInPos, MaxOutputPos: integer;
+  Diff, MaxDiff, MaxAbsCpu, Bound: TNeuralFloat;
+  What: string;
+  SnapK, SnapV: TNNetVolumeQuant8;
+  Reference: TNNetVolume;
+  CompareToCodes: boolean;
+
+  // Row amplitude of the int8 cases: 0.5 .. 2.0, so row scales differ by 4x.
+  function RowAmplitude(Row: integer): TNeuralFloat;
+  begin
+    if Int8KV then Result := 0.5 + 0.375 * (Row mod 5) else Result := 1;
+  end;
+
+  // Reference := attention of StepIn's queries over the codes in SnapK/SnapV.
+  procedure ComputeCodesReference();
+  var
+    T, H, G, J, D, KeyLo, KeyHi, GroupSize: integer;
+    Score, MaxScore, SumExp: double;
+    Scores: array of double;
+    Acc: array of double;
+  begin
+    Scores := nil;
+    Acc := nil;
+    SetLength(Scores, PrefixLen + StepTokens);
+    SetLength(Acc, Dk);
+    GroupSize := QHeads div KVHeads;
+    for T := 0 to StepTokens - 1 do
+      for H := 0 to QHeads - 1 do
+      begin
+        G := H div GroupSize;
+        if Causal then KeyHi := PrefixLen + T + 1
+        else KeyHi := PrefixLen + StepTokens;
+        if Window > 0 then KeyLo := Max(0, KeyHi - Window) else KeyLo := 0;
+        MaxScore := -1e300;
+        for J := KeyLo to KeyHi - 1 do
+        begin
+          Score := 0;
+          for D := 0 to Dk - 1 do
+            Score := Score + StepIn.FData[T * InDepth + H * Dk + D] *
+              SnapK.Get(J, G, D);
+          Score := Score * SnapK.Scale[J, G] / Sqrt(Dk);
+          if SoftCap > 0 then Score := SoftCap * Tanh(Score / SoftCap);
+          Scores[J] := Score;
+          MaxScore := Max(MaxScore, Score);
+        end;
+        SumExp := 0;
+        for D := 0 to Dk - 1 do Acc[D] := 0;
+        for J := KeyLo to KeyHi - 1 do
+        begin
+          Score := Exp(Scores[J] - MaxScore);
+          SumExp := SumExp + Score;
+          for D := 0 to Dk - 1 do
+            Acc[D] := Acc[D] + Score * SnapV.Scale[J, G] * SnapV.Get(J, G, D);
+        end;
+        for D := 0 to Dk - 1 do
+          Reference.FData[T * QHeads * Dk + H * Dk + D] := Acc[D] / SumExp;
+      end;
+  end;
+
+begin
+  What := Format('%s Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f ' +
+    'splits=%d mem=%d host=%s resident=%s int8kv=%s', [
+    BoolToStr(Causal, 'causal', 'non-causal'), QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window, SoftCap, ForcedSplits, UsableLocalMemBytes,
+    BoolToStr(HostSource, true), BoolToStr(ResidentPrefix, true),
+    BoolToStr(Int8KV, true)]);
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  KW := KVHeads * Dk;
+  KVRows.Buffer := nil;
+  KVRows.RowCount := 0;
+  CompareToCodes := Int8KV and (ExpectedPath <> sdpaPathNone);
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
+  PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+  PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+  SnapK := TNNetVolumeQuant8.Create();
+  SnapV := TNNetVolumeQuant8.Create();
+  Reference := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
+      {pCachedForwardNonCausal=}not Causal);
+    LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+    // TNNetIdentity computes on the host, so the attention uploads its input.
+    if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
+      {pCachedForwardNonCausal=}not Causal);
+    LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+    NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    LGpu.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
+    if UsableLocalMemBytes > 0 then
+      LGpu.FusedSDPACL.ForcedLocalMemBytes := UsableLocalMemBytes
+        + csFusedSDPALocalMemReserveBytes;
+    if (ExpectedPath = sdpaPathFlash) and
+      not LGpu.FusedSDPACL.FlashTilesFit(Dk, Int8KV) then
+    begin
+      if Causal and LGpu.FusedSDPACL.QueryTileFits(QHeads div KVHeads, Dk, Int8KV)
+        then ExpectedPath := sdpaPathDecodeSplit
+        else ExpectedPath := sdpaPathNone;
+    end;
+    if UsableLocalMemBytes = 48 * 1024 - 1024 then
+      TAssert.AssertTrue(What + ': flash tiles fit the NVIDIA budget',
+        LGpu.FusedSDPACL.FlashTilesFit(Dk, Int8KV));
+    MaxPrefixPos := PrefixK.Size - 1;
+    for Pos := 0 to MaxPrefixPos do
+    begin
+      PrefixK.FData[Pos] := RowAmplitude(Pos div KW) * InputAmplitude *
+        (Random - 0.5) + KeyRamp * (Pos div KW);
+      PrefixV.FData[Pos] := RowAmplitude(Pos div KW) * InputAmplitude *
+        (Random - 0.5);
+    end;
+    if ResidentPrefix then
+      KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
+    MaxStepInPos := StepIn.Size - 1;
+    MaxOutputPos := LCpu.Output.Size - 1;
+    MaxDiff := 0;
+    MaxAbsCpu := 0;
+    for Pass := 0 to 1 do
+    begin
+      for Pos := 0 to MaxStepInPos do
+        StepIn.FData[Pos] := RowAmplitude(Pos div InDepth) * InputAmplitude *
+          (Random - 0.5) + Ord(KeyRamp > 0);
+      LCpu.TruncateCache(0);
+      LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      LGpu.TruncateCache(0);
+      if ResidentPrefix
+        then LGpu.AppendCacheRowsFromOpenCL(KVRows)
+        else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      TAssert.AssertEquals(What + ': cache rows after pass ' + IntToStr(Pass),
+        LCpu.CacheLength, LGpu.CacheLength);
+      if CompareToCodes then
+      begin
+        LGpu.CaptureCacheStateInt8(SnapK, SnapV, SnapLen, SnapSinks,
+          SnapWindow);
+        Reference.ReSize(LCpu.Output);
+        ComputeCodesReference();
+      end
+      else Reference.Copy(LCpu.Output);
+      for Pos := 0 to MaxOutputPos do
+      begin
+        Diff := Abs(Reference.FData[Pos] - LGpu.Output.FData[Pos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        if Abs(Reference.FData[Pos]) > MaxAbsCpu then
+          MaxAbsCpu := Abs(Reference.FData[Pos]);
+      end;
+    end;
+    Bound := 1e-5 * Max(1, MaxAbsCpu);
+    WriteLn('  FusedSDPA OpenCL flash ', What, ': max|diff|=', MaxDiff:0:9,
+      ' max|y|=', MaxAbsCpu:0:4, ' gpu forwards=', LGpu.ForwardGPUCnt,
+      ' path=', Ord(LGpu.FusedSDPACL.LastPath), ' splits=',
+      LGpu.FusedSDPACL.LastFlashSplits);
+    if ExpectedPath = sdpaPathNone then
+    begin
+      TAssert.AssertEquals(What + ': the host path ran', 0, LGpu.ForwardGPUCnt);
+      TAssert.AssertEquals(What + ': the host path matches the CPU exactly', 0,
+        MaxDiff, 0);
+      exit;
+    end;
+    TAssert.AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff) +
+      ' must be < ' + FloatToStr(Bound), MaxDiff < Bound);
+    TAssert.AssertEquals(What + ': both forwards ran on OpenCL', 2,
+      LGpu.ForwardGPUCnt);
+    TAssert.AssertTrue(What + ': the output stays in OpenCL memory',
+      LGpu.OutputBindableOnOpenCL());
+    TAssert.AssertEquals(What + ': the input source was ' +
+      BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
+      LGpu.PrevOutputOnOpenCL());
+    TAssert.AssertEquals(What + ': the OpenCL path', Ord(ExpectedPath),
+      Ord(LGpu.FusedSDPACL.LastPath));
+    if ExpectedPath <> sdpaPathFlash then exit;
+    TAssert.AssertEquals(What + ': flash query tile rows',
+      IfThen(Dk <= 128, 64, 32), LGpu.FusedSDPACL.LastQueryTileRows);
+    TAssert.AssertEquals(What + ': flash key tile rows', 64,
+      LGpu.FusedSDPACL.LastKeyTileRows);
+    TAssert.AssertEquals(What + ': flash column chunks',
+      (((Dk + 3) and (not 3)) + 255) div 256, LGpu.FusedSDPACL.LastColChunks);
+    if ForcedSplits > 0 then
+      TAssert.AssertEquals(What + ': flash key splits', ForcedSplits,
+        LGpu.FusedSDPACL.LastFlashSplits);
+    LastFlashSplits := LGpu.FusedSDPACL.LastFlashSplits;
+    if ExpectedFlashScratchFloats(Dk, Int8KV) > 0 then
+      TAssert.AssertEquals(What + ': flash local memory bytes',
+        ExpectedFlashScratchFloats(Dk, Int8KV) * 4,
+        int64(LGpu.FusedSDPACL.LastScratchBytes));
+  finally
+    if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
+    Reference.Free; SnapV.Free; SnapK.Free;
+    PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAFlashCausalOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InputAmplitude, KeyRamp: TNeuralFloat;
+
+  procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens, Window: integer;
+    SoftCap: TNeuralFloat; ForcedSplits: integer; HostSource: boolean;
+    ExpectedPath: TFusedSDPAOpenCLPath);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+      {Causal=}True, ForcedSplits, {UsableLocalMemBytes=}0, HostSource,
+      {ResidentPrefix=}True, {Int8KV=}False, ExpectedPath);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261005;
+  InputAmplitude := 3;
+  KeyRamp := 0;
+  // Prefill windows of 16, 64 and 100 rows over prefixes of 0, 7 and 300
+  // rows; groups of 4, 1 and 8.
+  RunCase(4, 1, 64, 0, 16, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(2, 2, 128, 7, 64, 0, 0, 0, False, sdpaPathFlash);
+  // A causal layer fed from the host keeps the host path (WillOpenCL).
+  RunCase(2, 2, 128, 7, 64, 0, 0, 0, True, sdpaPathNone);
+  RunCase(8, 1, 32, 300, 100, 0, 0, 0, False, sdpaPathFlash);
+  // Dk 256 (32-row tiles) and the Qwen3-VL head dimension with the soft-cap.
+  RunCase(4, 2, 256, 20, 16, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(2, 1, 72, 40, 32, 0, 5.0, 0, False, sdpaPathFlash);
+  // Sliding windows: 20 keys inside one key tile, and 100 keys starting
+  // past the first 15 tiles of a 1064-row cache.
+  RunCase(2, 1, 64, 300, 16, 20, 0, 0, False, sdpaPathFlash);
+  RunCase(2, 2, 32, 1000, 64, 100, 0, 0, False, sdpaPathFlash);
+  // Forced key splits: 1 and 3, then 7 over a 20-key window, where most
+  // splits hold no key of a given row.
+  RunCase(2, 2, 64, 300, 32, 0, 0, 1, False, sdpaPathFlash);
+  RunCase(2, 2, 64, 300, 16, 0, 0, 3, False, sdpaPathFlash);
+  RunCase(4, 2, 32, 300, 16, 20, 0, 7, False, sdpaPathFlash);
+  // csFusedSDPAFlashMinTokens = 2: two rows take flash, one row the
+  // split-row decode.
+  RunCase(2, 2, 64, 100, 2, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(2, 2, 64, 100, 1, 0, 0, 0, False, sdpaPathDecodeSplit);
+  // Several row tiles and splits at once; Dk 256 with splits.
+  RunCase(4, 1, 128, 40, 600, 0, 0, 5, False, sdpaPathFlash);
+  RunCase(2, 1, 256, 100, 16, 0, 0, 3, False, sdpaPathFlash);
+  // Online-softmax drift over a 4016-key cache, automatic splits.
+  RunCase(2, 2, 64, 4000, 16, 0, 0, 0, False, sdpaPathFlash);
+  // Scores rising along a 1016-key cache under automatic splits: the
+  // running max and the merge both cross the -80 exponent clamp.
+  InputAmplitude := 1;
+  KeyRamp := 0.5;
+  RunCase(2, 2, 16, 1000, 16, 0, 0, 0, False, sdpaPathFlash);
+  AssertTrue('the ramp case ran several key splits', LastFlashSplits > 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Tolerance: 1e-5 of max(1, max|y|): the kernel sums the same products as the
+// host in another order; a wrong row, head, tile edge or rescale moves the
+// output by order 1e-1.
 procedure TTestNeuralNumerical.FusedSDPANonCausalOpenCLParity;
 {$IFDEF OpenCL}
 var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  // Inputs are InputAmplitude * U(-0.5, 0.5). KeyRamp > 0 adds KeyRamp * row to
-  // prefix K row `row` and 1 to every input, so scores grow along the cache.
   InputAmplitude, KeyRamp: TNeuralFloat;
 
   // ExpectOpenCL false: the host path must run and match the CPU exactly.
-  // ExpectedKeyTileRows > 0 asserts the key tile the launch used.
+  // Tiles that do not fit (Dk, UsableLocalMemBytes) take the host.
   procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens, Window: integer;
-    SoftCap: TNeuralFloat; ForcedQueryTileRows, ForcedKeyTileRows,
-    UsableLocalMemBytes, ExpectedKeyTileRows: integer;
+    SoftCap: TNeuralFloat; UsableLocalMemBytes: integer;
     HostSource, ResidentPrefix, Int8KV, ExpectOpenCL: boolean);
-  var
-    NNCpu, NNGpu: TNNet;
-    LCpu, LGpu: TNNetFusedSDPA;
-    StepIn, PrefixK, PrefixV: TNNetVolume;
-    KVRows: TNNetKVRowsOnOpenCL;
-    InDepth, KW, Pass, Pos: integer;
-    MaxPrefixPos, MaxStepInPos, MaxOutputPos: integer;
-    Diff, MaxDiff, MaxAbsCpu, Bound: TNeuralFloat;
-    What: string;
   begin
-    What := Format('Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f tiles=%dx%d ' +
-      'mem=%d host=%s resident=%s int8kv=%s', [QHeads, KVHeads, Dk, PrefixLen,
-      StepTokens, Window, SoftCap, ForcedQueryTileRows, ForcedKeyTileRows,
-      UsableLocalMemBytes, BoolToStr(HostSource, true),
-      BoolToStr(ResidentPrefix, true), BoolToStr(Int8KV, true)]);
-    InDepth := (QHeads + 2 * KVHeads) * Dk;
-    KW := KVHeads * Dk;
-    KVRows.Buffer := nil;
-    KVRows.RowCount := 0;
-    NNCpu := TNNet.Create();
-    NNGpu := TNNet.Create();
-    StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
-    PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
-    PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
-    try
-      NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
-        {pCachedForwardNonCausal=}True);
-      LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
-      NNCpu.AddLayer(LCpu);
-      NNCpu.SetTrainable(False, False);
-      NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-      // TNNetIdentity computes on the host, so the attention uploads its input.
-      if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
-      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
-        {pCachedForwardNonCausal=}True);
-      LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
-      NNGpu.AddLayer(LGpu);
-      NNGpu.SetTrainable(False, False);
-      NNGpu.EnableOpenCL(PlatformId, DeviceId);
-      LGpu.FusedSDPACL.ForcedQueryTileRows := ForcedQueryTileRows;
-      LGpu.FusedSDPACL.ForcedKeyTileRows := ForcedKeyTileRows;
-      if UsableLocalMemBytes > 0 then
-        LGpu.FusedSDPACL.ForcedLocalMemBytes := UsableLocalMemBytes
-          + csFusedSDPALocalMemReserveBytes;
-      // Wide enough that the running max moves between key tiles, so a
-      // missing rescale shows.
-      MaxPrefixPos := PrefixK.Size - 1;
-      for Pos := 0 to MaxPrefixPos do
-      begin
-        PrefixK.FData[Pos] := InputAmplitude * (Random - 0.5)
-          + KeyRamp * (Pos div KW);
-        PrefixV.FData[Pos] := InputAmplitude * (Random - 0.5);
-      end;
-      if ResidentPrefix then
-        KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
-      MaxStepInPos := StepIn.Size - 1;
-      MaxOutputPos := LCpu.Output.Size - 1;
-      MaxDiff := 0;
-      MaxAbsCpu := 0;
-      for Pass := 0 to 1 do
-      begin
-        for Pos := 0 to MaxStepInPos do
-          StepIn.FData[Pos] := InputAmplitude * (Random - 0.5)
-            + Ord(KeyRamp > 0);
-        LCpu.TruncateCache(0);
-        LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
-        LGpu.TruncateCache(0);
-        if ResidentPrefix
-          then LGpu.AppendCacheRowsFromOpenCL(KVRows)
-          else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
-        NNCpu.Compute(StepIn);
-        NNGpu.Compute(StepIn);
-        AssertEquals(What + ': cache rows after pass ' + IntToStr(Pass),
-          LCpu.CacheLength, LGpu.CacheLength);
-        for Pos := 0 to MaxOutputPos do
-        begin
-          Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
-          if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
-          if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
-            MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
-        end;
-      end;
-      Bound := 1e-5 * Max(1, MaxAbsCpu);
-      WriteLn('  FusedSDPA OpenCL non-causal ', What, ': max|diff|=',
-        MaxDiff:0:9, ' max|y|=', MaxAbsCpu:0:4, ' gpu forwards=',
-        LGpu.ForwardGPUCnt, ' tiles=', LGpu.FusedSDPACL.LastQueryTileRows, 'x',
-        LGpu.FusedSDPACL.LastKeyTileRows);
-      if not ExpectOpenCL then
-      begin
-        AssertEquals(What + ': the host path ran', 0, LGpu.ForwardGPUCnt);
-        AssertEquals(What + ': the host path matches the CPU exactly', 0,
-          MaxDiff, 0);
-        exit;
-      end;
-      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff) + ' must be < ' +
-        FloatToStr(Bound), MaxDiff < Bound);
-      AssertEquals(What + ': both forwards ran on OpenCL', 2,
-        LGpu.ForwardGPUCnt);
-      AssertTrue(What + ': the output stays in OpenCL memory',
-        LGpu.OutputBindableOnOpenCL());
-      AssertEquals(What + ': the input source was ' +
-        BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
-        LGpu.PrevOutputOnOpenCL());
-      if ExpectedKeyTileRows > 0 then
-        AssertEquals(What + ': key tile rows', ExpectedKeyTileRows,
-          LGpu.FusedSDPACL.LastKeyTileRows);
-      if ForcedQueryTileRows > 0 then
-        AssertEquals(What + ': query tile rows',
-          Min(ForcedQueryTileRows, StepTokens),
-          LGpu.FusedSDPACL.LastQueryTileRows)
-      else
-        AssertTrue(What + ': automatic query tile rows within 1..T',
-          (LGpu.FusedSDPACL.LastQueryTileRows >= 1) and
-          (LGpu.FusedSDPACL.LastQueryTileRows <= StepTokens));
-    finally
-      if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
-      PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
-    end;
+    if ExpectOpenCL
+      then RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads,
+        Dk, PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+        {Causal=}False, {ForcedSplits=}0, UsableLocalMemBytes, HostSource,
+        ResidentPrefix, Int8KV, sdpaPathFlash)
+      else RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads,
+        Dk, PrefixLen, StepTokens, Window, SoftCap, InputAmplitude, KeyRamp,
+        {Causal=}False, {ForcedSplits=}0, UsableLocalMemBytes, HostSource,
+        ResidentPrefix, Int8KV, sdpaPathNone);
   end;
 
 begin
@@ -73892,58 +76559,340 @@ begin
   RandSeed := 20260930;
   InputAmplitude := 3;
   KeyRamp := 0;
-  // Qwen-Image head dimension, automatic tiles, fewer rows than a tile.
-  RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 0, 32, False, True, False, True);
-  // No prefix; the rows fill exactly one query tile and two key tiles.
-  RunCase(2, 2, 16, 0, 16, 0, 0, 16, 8, 0, 8, True, False, False, True);
-  // One prefix row; 37 rows over 16-row query tiles and 38 keys over 8-row
-  // key tiles leave a partial last tile on both axes.
-  RunCase(2, 2, 16, 1, 37, 0, 0, 16, 8, 0, 8, True, True, False, True);
-  // GQA groups of 2, Dk off the lane width, and the soft-cap.
-  RunCase(4, 2, 5, 3, 9, 0, 5.0, 4, 3, 0, 3, False, True, False, True);
-  // Head dimension 128, GQA group of 3, several tiles on both axes.
-  RunCase(3, 1, 128, 40, 70, 0, 0, 32, 16, 0, 16, True, True, False, True);
+  // Qwen-Image head dimension, fewer rows than a tile.
+  RunCase(2, 2, 128, 7, 5, 0, 0, 0, False, True, False, True);
+  // No prefix (uploaded source); a partial last tile on both axes.
+  RunCase(2, 2, 16, 0, 16, 0, 0, 0, True, False, False, True);
+  RunCase(2, 2, 16, 1, 37, 0, 0, 0, True, True, False, True);
+  // GQA groups of 2, Dk off the float4 width, and the soft-cap.
+  RunCase(4, 2, 5, 3, 9, 0, 5.0, 0, False, True, False, True);
+  // Dk 128, a group of 3, several row tiles.
+  RunCase(3, 1, 128, 40, 70, 0, 0, 0, True, True, False, True);
   // A sliding window: the first 7 of the 17 cache rows are out of reach.
-  RunCase(2, 1, 8, 6, 11, 10, 0, 4, 4, 0, 4, False, True, False, True);
-  // Automatic tiles over several query and key tiles.
-  RunCase(2, 2, 64, 20, 150, 0, 0, 0, 0, 0, 32, False, True, False, True);
-  // Query tiles of 1, 15, 17, 33 and 48 rows (one, part of and all three
-  // row slots per lane) against full, odd and single-row key tiles.
-  RunCase(2, 2, 32, 9, 50, 0, 0, 1, 32, 0, 32, False, True, False, True);
-  RunCase(2, 1, 24, 5, 61, 0, 0, 15, 31, 0, 31, True, True, False, True);
-  RunCase(2, 2, 40, 3, 70, 0, 0, 17, 1, 0, 1, False, False, False, True);
-  RunCase(3, 1, 16, 12, 67, 0, 2.5, 33, 13, 0, 13, False, True, False, True);
-  RunCase(2, 2, 128, 30, 100, 0, 0, 48, 32, 0, 32, False, True, False, True);
-  // A lane holds 128 head-dim columns: Dk 129 and 256 run two column chunks
-  // and Dk 260 three, each recomputing the scores.
-  RunCase(2, 2, 129, 6, 20, 0, 0, 0, 0, 0, 32, False, True, False, True);
-  RunCase(2, 1, 256, 10, 35, 0, 0, 16, 32, 0, 32, True, True, False, True);
-  RunCase(2, 2, 260, 4, 9, 0, 0, 0, 0, 0, 32, False, True, False, True);
-  // An NVIDIA-sized budget (48 KB less the reserve) at the Qwen-Image head
-  // dimension: automatic tiles of 42 query rows by 32 keys.
-  RunCase(2, 2, 128, 14, 90, 0, 0, 0, 0, 48 * 1024 - 1024, 32, False, True,
-    False, True);
-  // A long sequence: 540 keys over 17 key tiles, automatic query tiles.
-  RunCase(2, 2, 64, 300, 240, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  RunCase(2, 1, 8, 6, 11, 10, 0, 0, False, True, False, True);
+  // Several row and key tiles; odd head dimensions; soft-cap.
+  RunCase(2, 2, 64, 20, 150, 0, 0, 0, False, True, False, True);
+  RunCase(2, 1, 24, 5, 61, 0, 0, 0, True, True, False, True);
+  RunCase(2, 2, 40, 3, 70, 0, 0, 0, False, False, False, True);
+  RunCase(3, 1, 16, 12, 67, 0, 2.5, 0, False, True, False, True);
+  // Dk 129 and 256 (32-row tiles); Dk 260 in two column chunks.
+  RunCase(2, 2, 129, 6, 20, 0, 0, 0, False, True, False, True);
+  RunCase(2, 1, 256, 10, 35, 0, 0, 0, True, True, False, True);
+  RunCase(2, 2, 260, 4, 9, 0, 0, 0, False, True, False, True);
+  // An NVIDIA-sized budget (48 KB less the reserve) at Dk 128: the tiles fit.
+  RunCase(2, 2, 128, 14, 90, 0, 0, 48 * 1024 - 1024, False, True, False,
+    True);
+  // 540 keys over several key tiles.
+  RunCase(2, 2, 64, 300, 240, 0, 0, 0, False, True, False, True);
   // Inputs in +-20 at Dk 16: scores within one key tile spread by hundreds,
-  // so a row max taken over fewer than all 16 X lanes moves the softmax.
+  // so a row max taken over fewer than all 16 key lanes moves the softmax.
   InputAmplitude := 40;
-  RunCase(2, 2, 16, 20, 60, 0, 0, 0, 0, 0, 32, False, True, False, True);
-  // Scores rising by about 100 per 8-row key tile: the running max moves past
-  // the -80 rescale clamp on every prefix tile.
+  RunCase(2, 2, 16, 20, 60, 0, 0, 0, False, True, False, True);
+  InputAmplitude := 3;
+  // 24000 and 1024 usable bytes hold no Dk=128 flash tile: the host path
+  // runs, reading back the prefix the OpenCL-side append left resident.
+  RunCase(2, 2, 128, 7, 37, 0, 0, 24000, False, True, False, True);
+  RunCase(2, 2, 128, 7, 5, 0, 0, 1024, True, True, False, False);
+  // GQA groups of 4 at Dk 64: 80 packed rows over two row tiles.
+  RunCase(4, 1, 64, 30, 20, 0, 0, 0, False, True, False, True);
+  // The Qwen3-VL head dimension (one 72-column slice), a group of 4, the
+  // soft-cap and an uploaded source.
+  RunCase(4, 1, 72, 9, 15, 0, 3.0, 0, True, True, False, True);
+  RunCase(2, 2, 72, 10, 70, 0, 0, 0, False, True, False, True);
+  // A group of 8 with 3 token rows: 24 packed rows, fewer than a tile.
+  RunCase(8, 1, 16, 5, 3, 0, 0, 0, False, True, False, True);
+  // One token row, a group of 4, a 50-row prefix.
+  RunCase(4, 1, 32, 50, 1, 0, 0, 0, False, True, False, True);
+  // Dk 128 with groups of 2: 140 packed rows over several row tiles.
+  RunCase(4, 2, 128, 33, 70, 0, 0, 0, False, True, False, True);
+  // A window of 10 inside one key tile, and one of 100 that starts 130 rows
+  // into a 230-row cache, so the key loop starts mid-cache.
+  RunCase(2, 2, 32, 40, 12, 10, 0, 0, False, True, False, True);
+  RunCase(2, 1, 16, 200, 30, 100, 0, 0, False, True, False, True);
+  // Scores rising by about 750 per 64-key tile over 312 keys: the running
+  // max moves past the -80 rescale clamp on every key tile.
   InputAmplitude := 1;
   KeyRamp := 3;
-  RunCase(2, 2, 16, 40, 12, 0, 0, 16, 8, 0, 8, False, True, False, True);
+  RunCase(2, 2, 16, 300, 12, 0, 0, 0, False, True, False, True);
   InputAmplitude := 3;
   KeyRamp := 0;
-  // 24000 usable bytes at Dk=128 fit fewer than 16 query rows beside a 32-row
-  // key tile, so the automatic sizing falls back to 16-row key tiles.
-  RunCase(2, 2, 128, 7, 37, 0, 0, 0, 0, 24000, 16, False, True, False, True);
-  // 1 KB of usable local memory holds no Dk=128 tile: the host path runs,
-  // reading back the prefix the OpenCL-side append left resident.
-  RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 1024, 0, True, True, False, False);
-  // An int8 KV cache keeps the host path.
-  RunCase(2, 2, 16, 4, 9, 0, 0, 0, 0, 0, 0, False, False, True, False);
+  // An int8 KV cache takes cai_sdpa_flash_int8.
+  RunCase(2, 2, 16, 4, 9, 0, 0, 0, False, False, True, True);
+  // Forced key splits in mask mode none.
+  RunFusedSDPAFlashCase(PlatformId, DeviceId, 2, 2, 64, 200, 40, 0,
+    0, InputAmplitude, KeyRamp, {Causal=}False, {ForcedSplits=}4, 0, False,
+    True, False, sdpaPathFlash);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Against a reference over the codes the OpenCL append wrote (see
+// RunFusedSDPAFlashCase); prefix and step rows vary 4x in magnitude.
+procedure TTestNeuralNumerical.FusedSDPAFlashInt8OpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Causal: boolean; QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window: integer; SoftCap: TNeuralFloat; ForcedSplits: integer;
+    HostSource: boolean; ExpectedPath: TFusedSDPAOpenCLPath);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, SoftCap, {InputAmplitude=}3,
+      {KeyRamp=}0, Causal, ForcedSplits, {UsableLocalMemBytes=}0, HostSource,
+      {ResidentPrefix=}False, {Int8KV=}True, ExpectedPath);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261006;
+  // Non-causal: Dk 64/72/128/256, GQA, soft-cap, a window starting
+  // mid-cache, Dk off the float4 width, forced splits.
+  RunCase(False, 2, 2, 64, 7, 20, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(False, 4, 1, 128, 30, 70, 0, 0, 0, True, sdpaPathFlash);
+  RunCase(False, 4, 2, 256, 10, 35, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(False, 4, 1, 72, 9, 15, 0, 3.0, 0, False, sdpaPathFlash);
+  RunCase(False, 2, 1, 16, 200, 30, 100, 0, 0, False, sdpaPathFlash);
+  RunCase(False, 4, 2, 5, 3, 9, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(False, 2, 2, 64, 200, 40, 0, 0, 4, False, sdpaPathFlash);
+  // Causal prefill windows: groups of 4 and 1, Dk 64/128/256, sliding
+  // windows, forced splits incl. empty ones, several row tiles, and a long
+  // cache with automatic splits.
+  RunCase(True, 4, 1, 64, 0, 16, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(True, 2, 2, 128, 7, 64, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(True, 4, 2, 256, 20, 16, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(True, 2, 1, 72, 40, 32, 0, 5.0, 0, False, sdpaPathFlash);
+  RunCase(True, 2, 1, 64, 300, 16, 20, 0, 0, False, sdpaPathFlash);
+  RunCase(True, 2, 2, 64, 300, 16, 0, 0, 3, False, sdpaPathFlash);
+  RunCase(True, 4, 2, 32, 300, 16, 20, 0, 7, False, sdpaPathFlash);
+  RunCase(True, 4, 1, 128, 40, 200, 0, 0, 5, False, sdpaPathFlash);
+  RunCase(True, 2, 2, 64, 2000, 16, 0, 0, 0, False, sdpaPathFlash);
+  // Two rows take flash; one row keeps the int8 split-row decode.
+  RunCase(True, 2, 2, 64, 100, 2, 0, 0, 0, False, sdpaPathFlash);
+  RunCase(True, 2, 2, 64, 100, 1, 0, 0, 0, False, sdpaPathDecodeSplit);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Heads wider than 256 in column chunks (Dk 260 to 1152), FP32 and int8,
+// causal and non-causal, GQA, windows and key splits; scratch layouts pinned.
+procedure TTestNeuralNumerical.FusedSDPAFlashColumnChunksOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Causal, Int8KV: boolean; QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window, ForcedSplits: integer; SoftCap: TNeuralFloat);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, SoftCap, {InputAmplitude=}3,
+      {KeyRamp=}0, Causal, ForcedSplits, {UsableLocalMemBytes=}0,
+      {HostSource=}False, {ResidentPrefix=}not Int8KV, Int8KV, sdpaPathFlash);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261008;
+  // One head (the VAE mid-block shape), non-causal, 2/3/5 chunks.
+  RunCase(False, False, 1, 1, 384, 0, 40, 0, 0, 0);
+  RunCase(False, False, 1, 1, 768, 5, 37, 0, 0, 0);
+  RunCase(False, False, 1, 1, 1152, 0, 70, 0, 0, 0);
+  RunCase(False, False, 2, 2, 260, 3, 21, 0, 0, 2.5);
+  // Causal with GQA, a window and forced splits (partials per chunk).
+  RunCase(True, False, 4, 2, 384, 30, 20, 0, 0, 0);
+  RunCase(True, False, 2, 1, 1152, 40, 16, 24, 3, 0);
+  RunCase(True, False, 1, 1, 768, 100, 16, 0, 0, 0);
+  // The int8 cache.
+  RunCase(False, True, 1, 1, 1152, 0, 40, 0, 0, 0);
+  RunCase(True, True, 2, 1, 384, 20, 16, 0, 3, 0);
+  // An NVIDIA-sized budget (48 KB less the reserve) holds the Dk 1152 tiles.
+  RunFusedSDPAFlashCase(PlatformId, DeviceId, 1, 1, 1152, 0, 33, 0, 0, 3, 0,
+    {Causal=}False, 0, 48 * 1024 - 1024, False, True, False, sdpaPathFlash);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// AddMultiHeadSelfAttention on OpenCL vs the same weights on the CPU; a flash
+// case asserts residency over PassCount profiled forwards. Bound 2e-5|y|.
+// HostSource puts a host layer before the split; Cycle re-arms OpenCL.
+procedure TTestNeuralNumerical.ScaledDotProductAttentionFlashOpenCLParity;
+{$IFDEF OpenCL}
+const
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Heads, DModel, SeqLen, Window: integer;
+    Causal, ExpectFlash, HostSource, Cycle: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input: TNNetVolume;
+    Attn, Concat, OutProj, Layer: TNNetLayer;
+    LayerPos, Pos, PassCnt, MaxOutputPos: integer;
+    Diff, MaxDiff, MaxAbsY: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('heads=%d d_model=%d T=%d W=%d causal=%s host=%s',
+      [Heads, DModel, SeqLen, Window, BoolToStr(Causal, true),
+      BoolToStr(HostSource, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, DModel);
+    try
+      // The Q|K|V projection the builders put first; it leaves its output in
+      // OpenCL memory only, so the per-head split runs there too.
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      if HostSource then NNCpu.AddLayer(TNNetMulByConstant.Create(1));
+      NNCpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      // A host-only layer: the split then runs on the host too.
+      if HostSource then NNGpu.AddLayer(TNNetMulByConstant.Create(1));
+      NNGpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
+      NNGpu.CopyWeights(NNCpu);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.LayerProfiling := true;
+      Attn := nil;
+      Concat := nil;
+      for LayerPos := 0 to NNGpu.CountLayers() - 1 do
+      begin
+        Layer := NNGpu.Layers[LayerPos];
+        if (Attn = nil) and (Layer.ClassType = TNNetScaledDotProductAttention)
+          then Attn := Layer;
+        if Layer is TNNetDeepConcat then Concat := Layer;
+      end;
+      OutProj := NNGpu.GetLastLayer();
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      for PassCnt := 1 to PassCount do
+      begin
+        Input.RandomizeGaussian(1.0);
+        NNCpu.Compute(Input);
+        NNGpu.Compute(Input);
+        OutProj.ForceOutputOnRAM();
+        MaxOutputPos := OutProj.Output.Size - 1;
+        for Pos := 0 to MaxOutputPos do
+        begin
+          Diff := Abs(NNCpu.GetLastLayer().Output.FData[Pos] -
+            OutProj.Output.FData[Pos]);
+          if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+          MaxAbsY := Max(MaxAbsY, Abs(NNCpu.GetLastLayer().Output.FData[Pos]));
+        end;
+      end;
+      WriteLn('  SDPA flash ', What, ': max|diff|=', MaxDiff:0:9, ' max|y|=',
+        MaxAbsY:0:4, ' attn gpu=', Attn.ForwardGPUCnt, ' bound=',
+        Attn.ProfiledResidency.SourceBoundCnt, ' concat gpu=',
+        Concat.ForwardGPUCnt, ' proj bound=',
+        OutProj.ProfiledResidency.SourceBoundCnt);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * Max(1, MaxAbsY));
+      AssertEquals(What + ': WillOpenCL', ExpectFlash, Attn.WillOpenCL());
+      if not ExpectFlash then
+      begin
+        AssertFalse(What + ': the host path leaves no resident output',
+          Attn.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': attention on OpenCL', PassCount,
+        Attn.ForwardGPUCnt);
+      if HostSource then
+      begin
+        AssertEquals(What + ': attention uploaded its source', PassCount,
+          Attn.ProfiledResidency.ActivationUploadedCnt);
+        AssertEquals(What + ': attention output resident', PassCount,
+          Attn.ProfiledResidency.OutputResidentCnt);
+        exit;
+      end;
+      AssertEquals(What + ': attention bound its source', PassCount,
+        Attn.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': attention output resident', PassCount,
+        Attn.ProfiledResidency.OutputResidentCnt);
+      AssertEquals(What + ': attention pulled nothing', 0,
+        Attn.ProfiledResidency.SourcePulledToRAMCnt);
+      AssertEquals(What + ': attention uploaded nothing', 0,
+        Attn.ProfiledResidency.ActivationUploadedCnt);
+      AssertEquals(What + ': concat on OpenCL', PassCount,
+        Concat.ForwardGPUCnt);
+      AssertEquals(What + ': concat bound its sources', PassCount,
+        Concat.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': concat output resident', PassCount,
+        Concat.ProfiledResidency.OutputResidentCnt);
+      AssertEquals(What + ': out-projection bound the concat', PassCount,
+        OutProj.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': out-projection uploaded nothing', 0,
+        OutProj.ProfiledResidency.ActivationUploadedCnt);
+      if not Cycle then exit;
+      // Disable and re-arm: the forward must run on OpenCL again (a host
+      // fallback would match the CPU exactly, so parity alone proves nothing).
+      NNGpu.DisableOpenCL();
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      PassCnt := Attn.ForwardGPUCnt;
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      OutProj.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for Pos := 0 to MaxOutputPos do
+        MaxDiff := Max(MaxDiff, Abs(NNCpu.GetLastLayer().Output.FData[Pos] -
+          OutProj.Output.FData[Pos]));
+      AssertEquals(What + ': attention on OpenCL after re-arming',
+        PassCnt + 1, Attn.ForwardGPUCnt);
+      AssertTrue(What + ': max|diff| after re-arming ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * Max(1, MaxAbsY));
+    finally
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261009;
+  // One head at Dk 16, 72, 384 and 1152 (the VAE mid-block shape).
+  RunCase(1, 16, 40, 0, False, True, False, True);
+  RunCase(1, 72, 33, 0, False, True, False, False);
+  RunCase(1, 384, 40, 0, False, True, False, False);
+  RunCase(1, 1152, 34, 0, False, True, False, False);
+  // Several heads: causal, causal with a window, a short resident sequence.
+  RunCase(4, 256, 48, 0, True, True, False, False);
+  RunCase(2, 128, 40, 8, True, True, False, False);
+  RunCase(2, 64, 8, 0, False, True, False, False);
+  // A host source of 40 rows is uploaded; one of 8 rows keeps the host paths.
+  RunCase(2, 64, 40, 0, True, True, True, False);
+  RunCase(2, 64, 8, 0, False, False, True, False);
+  // A non-causal window has no flash mask: the host paths run.
+  RunCase(2, 64, 40, 8, False, False, False, False);
 end;
 {$ELSE}
 begin
@@ -74647,7 +77596,7 @@ var
       WriteLn('  TokenLayerNorm resident ', CaseName, ': norm max|diff|=',
         NormDiff:0:9, ' out max|diff|=', OutDiff:0:9);
       // The source projection itself differs by float rounding on OpenCL, so
-      // the bound covers its error times 1/std at depth 4096 (measured 5.7e-6).
+      // the bound covers its error times 1/std at depth 1024 (measured 3.6e-6).
       AssertTrue(CaseName + ': norm max|diff| ' + FloatToStr(NormDiff) +
         ' must be < 2e-5', NormDiff < 2e-5);
       AssertTrue(CaseName + ': output max|diff| ' + FloatToStr(OutDiff) +
@@ -74687,8 +77636,8 @@ begin
   CheckCase(1, 37, false);
   CheckCase(7, 37, true);
   CheckCase(3, 300, true);
-  CheckCase(1, 4096, true);
-  CheckCase(6, 4096, false);
+  CheckCase(1, 1024, true);
+  CheckCase(6, 1024, false);
 end;
 {$ELSE}
 begin
@@ -74716,8 +77665,8 @@ begin
   OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(4, 1, 300));
-    // TNNetAddConstant has no OpenCL path, so its output is in RAM only.
-    HostSource := NN.AddLayer(TNNetAddConstant.Create(0.25));
+    // TNNetMulByConstant has no OpenCL path, so its output is in RAM only.
+    HostSource := NN.AddLayer(TNNetMulByConstant.Create(0.25));
     Norm := NN.AddLayer(TNNetTokenLayerNorm.Create());
     NN.SetTrainable(False, False);
     for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.6 * Sin(Pos * 0.29);
@@ -74912,6 +77861,11 @@ begin
   Rope := TNNetMRotaryEmbedding.Create(10000.0, 4, 4, 4);
   Rope.SetPositions([0, 1, 2, 3, 4], [0, 2, 4, 1, 3], [1, 1, 0, 2, 5]);
   CheckLayer(Rope, 'TNNetMRotaryEmbedding');
+  // Qwen3-VL text: interleaved sections, 2 heads x head_dim 12.
+  Rope := TNNetInterleavedMRotaryEmbedding.Create(10000.0, 2, 2, 2, rsmNone,
+    1.0, 0, 1.0, 32.0, 0.0, true, 12);
+  Rope.SetPositions([0, 1, 2, 3, 4], [0, 2, 4, 1, 3], [1, 1, 0, 2, 5]);
+  CheckLayer(Rope, 'TNNetInterleavedMRotaryEmbedding');
 end;
 {$ELSE}
 begin
@@ -81977,7 +84931,12 @@ begin
     // Warm up: the first compile settles the driver-side and RTL allocations.
     EasyCL.CompileProgram(KernelSrc);
     MemBefore := ReadVmDataKB();
-    for i := 1 to csRepeats do EasyCL.CompileProgram(KernelSrc);
+    // Clearing first makes every repeat take the build path, cache insert included.
+    for i := 1 to csRepeats do
+    begin
+      ClearOpenCLProgramCache();
+      EasyCL.CompileProgram(KernelSrc);
+    end;
     MemAfter := ReadVmDataKB();
     LeakKB := (Int64(csRepeats) * SrcLen) div 1024;
     AssertTrue('CompileProgram data-segment growth over ' + IntToStr(csRepeats) +
@@ -82029,6 +84988,293 @@ begin
   end;
   for i := 0 to High(Guard) do
     AssertEquals('stack guard byte ' + IntToStr(i), $5A, Guard[i]);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Runs cai_cache_probe from EasyCL's program on a 4-float buffer and returns
+// element 3, which the kernel sets to 2.
+function RunCacheProbeKernel(EasyCL: TEasyOpenCL): TNeuralFloat;
+var
+  Kernel: cl_kernel;
+  Buffer: cl_mem;
+  Values: array[0..3] of TNeuralFloat;
+begin
+  FillChar(Values, SizeOf(Values), 0);
+  Kernel := EasyCL.CreateKernel('cai_cache_probe');
+  Buffer := EasyCL.CreateBuffer(CL_MEM_READ_WRITE, SizeOf(Values));
+  try
+    clSetKernelArg(Kernel, 0, SizeOf(cl_mem), @Buffer);
+    EasyCL.RunKernel(Kernel, 4);
+    EasyCL.Finish();
+    EasyCL.ReadBuffer(Buffer, SizeOf(Values), @Values[0]);
+  finally
+    clReleaseMemObject(Buffer);
+    clReleaseKernel(Kernel);
+  end;
+  Result := Values[3];
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLProgramCacheKeyAndLifetime;
+{$IFDEF OpenCL}
+const
+  csProbeSource = '__kernel void cai_cache_probe(__global float* v)' + LineEnding +
+    '{ v[get_global_id(0)] = 2.0f; }' + LineEnding;
+var
+  First, Second, OtherOptions, OtherSource, Rebuilt: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BuildsBefore, HitsBefore: integer;
+
+  function NewEasyCL(): TEasyOpenCL;
+  begin
+    Result := TEasyOpenCL.Create();
+    Result.HideMessages();
+    Result.SetCurrentPlatform(PlatformId);
+    Result.SetCurrentDevice(DeviceId);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ClearOpenCLProgramCache();
+  First := nil; Second := nil; OtherOptions := nil; OtherSource := nil;
+  Rebuilt := nil;
+  try
+    BuildsBefore := OpenCLProgramBuildCount();
+    HitsBefore := OpenCLProgramCacheHitCount();
+    First := NewEasyCL();
+    First.CompileProgram(csProbeSource);
+    Second := NewEasyCL();
+    Second.CompileProgram(csProbeSource);
+    AssertEquals('same key builds once', 1, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertEquals('same key hits the cache', 1, OpenCLProgramCacheHitCount() - HitsBefore);
+    AssertTrue('same program', Second.Prog = First.Prog);
+    AssertTrue('same context', Second.Context = First.Context);
+    AssertTrue('own command queue', Second.Commands <> First.Commands);
+    // The cache's reference keeps the program usable after its builder is freed.
+    FreeAndNil(First);
+    AssertEquals('program outlives its builder', 2.0, RunCacheProbeKernel(Second), 0);
+
+    OtherOptions := NewEasyCL();
+    OtherOptions.CompilerOptions := Second.CompilerOptions + ' -DCAI_CACHE_PROBE=1';
+    OtherOptions.CompileProgram(csProbeSource);
+    AssertEquals('other options build', 2, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('other options, other program', OtherOptions.Prog <> Second.Prog);
+
+    OtherSource := NewEasyCL();
+    OtherSource.CompileProgram('/* other */' + LineEnding + csProbeSource);
+    AssertEquals('other source builds', 3, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('other source, other program', OtherSource.Prog <> Second.Prog);
+
+    ClearOpenCLProgramCache();
+    Rebuilt := NewEasyCL();
+    Rebuilt.CompileProgram(csProbeSource);
+    AssertEquals('cleared cache builds', 4, OpenCLProgramBuildCount() - BuildsBefore);
+    AssertTrue('cleared cache, other program', Rebuilt.Prog <> Second.Prog);
+    AssertEquals('holder keeps its program after a clear', 2.0,
+      RunCacheProbeKernel(Second), 0);
+    AssertEquals('rebuilt program runs', 2.0, RunCacheProbeKernel(Rebuilt), 0);
+  finally
+    Rebuilt.Free;
+    OtherSource.Free;
+    OtherOptions.Free;
+    Second.Free;
+    First.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLProgramCacheSharedAcrossNets;
+{$IFDEF OpenCL}
+var
+  NetA, NetB: TNNet;
+  Input, Ref: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BuildsBefore, GPUCntBefore, Cycle, i: integer;
+
+  function BuildNet(): TNNet;
+  var
+    LayerCnt: integer;
+  begin
+    RandSeed := 20261005;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(8, 8, 4));
+    Result.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1));
+    for LayerCnt := 1 to Result.GetLastLayerIdx() do
+      Result.Layers[LayerCnt].SetTrainable(False, False);
+  end;
+
+  procedure CheckOpenCLForward(const Step: string);
+  var
+    MaxDiff: TNeuralFloat;
+    ValueCnt: integer;
+  begin
+    GPUCntBefore := NetB.GetLastLayer.ForwardGPUCnt;
+    NetB.ForceOpenCL(True);
+    NetB.Compute(Input);
+    NetB.GetLastLayer.ForceOutputOnRAM();
+    AssertTrue(Step + ' ran on OpenCL',
+      NetB.GetLastLayer.ForwardGPUCnt > GPUCntBefore);
+    MaxDiff := 0;
+    for ValueCnt := 0 to Ref.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Ref.Raw[ValueCnt] -
+        NetB.GetLastLayer.Output.Raw[ValueCnt]));
+    AssertTrue(Step + ' parity: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetA := BuildNet();
+  NetB := BuildNet();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Ref := TNNetVolume.Create();
+  try
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NetB.Compute(Input);
+    Ref.Copy(NetB.GetLastLayer.Output);
+    NetA.EnableOpenCL(PlatformId, DeviceId);
+    BuildsBefore := OpenCLProgramBuildCount();
+    NetB.EnableOpenCL(PlatformId, DeviceId);
+    AssertEquals('second net builds nothing', 0, OpenCLProgramBuildCount() - BuildsBefore);
+    FreeAndNil(NetA);
+    CheckOpenCLForward('after the first net is freed');
+    for Cycle := 1 to 2 do
+    begin
+      NetB.ForceOpenCL(False);
+      NetB.DisableOpenCL();
+      NetB.EnableOpenCL(PlatformId, DeviceId);
+      CheckOpenCLForward('re-enable ' + IntToStr(Cycle));
+    end;
+    AssertEquals('re-enabling builds nothing', 0, OpenCLProgramBuildCount() - BuildsBefore);
+  finally
+    Ref.Free;
+    Input.Free;
+    NetB.Free;
+    NetA.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.OpenCLBorrowAcrossSeparatelyArmedNets;
+{$IFDEF OpenCL}
+const
+  csSeqLen = 6;
+  csVocab = 4096;
+  csEmbedding = 64;
+  csColumns = 8;
+  csInputs = 64;
+  csNeurons = 40;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  OwnerNet, LinkedNet: TNNet;
+  Input, OutOwner, OutLinked: TNNetVolume;
+  Pos: integer;
+
+  function BuildEmbeddingNet(): TNNet;
+  begin
+    RandSeed := 20261006;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(csSeqLen, 1, 1, 1));
+    Result.AddLayer(TNNetEmbedding.Create(csVocab, csEmbedding, 0, 0.5));
+  end;
+
+  function BuildConvNet(pSeed: integer): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+    Weights: TNNetVolume;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(csColumns, 1, csInputs));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csNeurons));
+    for NeuronCnt := 0 to csNeurons - 1 do
+    begin
+      Weights := Result.GetLastLayer().Neurons[NeuronCnt].Weights;
+      for WeightCnt := 0 to Weights.Size - 1 do
+        Weights.FData[WeightCnt] :=
+          0.5 * Sin((NeuronCnt + 1) * 0.37 + WeightCnt * 0.11 + pSeed);
+    end;
+    Result.UpdateWeights();
+    Result.SetTrainable(false);
+    Result.QuantizeWeightsInt8();
+  end;
+
+  procedure ArmAndCompute(const What: string);
+  begin
+    OwnerNet.EnableOpenCL(PlatformId, DeviceId);
+    OwnerNet.ForceOpenCL(true);
+    OwnerNet.Compute(Input);
+    OwnerNet.GetOutput(OutOwner);
+    LinkedNet.EnableOpenCL(PlatformId, DeviceId);
+    LinkedNet.ForceOpenCL(true);
+    LinkedNet.Compute(Input);
+    LinkedNet.GetOutput(OutLinked);
+    AssertTrue(What + ': linked net ran on OpenCL',
+      LinkedNet.GetLastLayer().ForwardGPUCnt > 0);
+    AssertEquals(What + ': linked equals owner', 0, OutOwner.SumDiff(OutLinked), 0);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  OwnerNet := nil;
+  LinkedNet := nil;
+  Input := TNNetVolume.Create(csSeqLen, 1, 1);
+  OutOwner := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    OwnerNet := BuildEmbeddingNet();
+    LinkedNet := BuildEmbeddingNet();
+    AssertEquals('embedding linked', 1, LinkedNet.LinkWeightsFrom(OwnerNet));
+    for Pos := 0 to csSeqLen - 1 do Input.FData[Pos] := (Pos * 977) mod csVocab;
+    ArmAndCompute('FP32 embedding');
+    AssertTrue('the linked embedding holds the owner''s table',
+      TNNetEmbedding(LinkedNet.GetLastLayer()).OpenCLTableBuffer() =
+      TNNetEmbedding(OwnerNet.GetLastLayer()).OpenCLTableBuffer());
+    FreeAndNil(LinkedNet);
+    FreeAndNil(OwnerNet);
+
+    OwnerNet := BuildConvNet(1);
+    LinkedNet := BuildConvNet(4);
+    AssertEquals('conv linked', 1, LinkedNet.LinkWeightsFrom(OwnerNet));
+    Input.ReSize(csColumns, 1, csInputs);
+    for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.7 * Cos(Pos * 0.029) - 0.1;
+    ArmAndCompute('int8 pointwise conv');
+    AssertTrue('the linked conv borrows the owner''s codes',
+      TNNetLayerConcatedWeights(LinkedNet.GetLastLayer()).OpenCLCodesBorrowed());
+  finally
+    OutLinked.Free;
+    OutOwner.Free;
+    Input.Free;
+    LinkedNet.Free;
+    OwnerNet.Free;
+  end;
 end;
 {$ELSE}
 begin

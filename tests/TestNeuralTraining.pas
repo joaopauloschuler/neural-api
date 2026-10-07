@@ -1841,11 +1841,11 @@ end;
 
 procedure TTestNeuralTraining.TestReptileMetaInitBeatsRandom;
 const
-  cMetaIters = 2000;  // outer Reptile iterations
-  cInnerSteps = 16;   // SGD steps per task
+  cMetaIters = 1000;  // outer Reptile iterations
+  cInnerSteps = 4;    // SGD steps per task
   cNumPts = 20;       // points per sine task
-  cInnerLR = 0.0007;  // inner-loop learning rate (stable for the summed grad)
-  cEps = 0.1;         // outer Reptile step
+  cInnerLR = 0.0028;  // inner-loop learning rate (stable for the summed grad)
+  cEps = 0.2;         // outer Reptile step
   cAdaptK = 4;        // held-out adaptation steps (matched k)
 var
   Meta, RandInit, MetaAdapt, RandAdapt, Worker: TNNet;

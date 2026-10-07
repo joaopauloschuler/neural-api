@@ -543,6 +543,10 @@ begin
 
     // Axial 3-axis RoPE (depth 16 = 2 heads x head_dim 8, sections 1/2/1).
     380: begin AddSeqInput(ANet); Exit(L('TNNetAxialRotaryEmbedding', TNNetAxialRotaryEmbedding.Create(10000.0, 1, 2, 1, 8))); end;
+
+    // Interleaved M-RoPE (Qwen3-VL text; depth 16 = 2 heads x head_dim 8).
+    381: begin AddSeqInput(ANet); Exit(L('TNNetInterleavedMRotaryEmbedding', TNNetInterleavedMRotaryEmbedding.Create(
+            10000.0, 2, 1, 1, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, True, 8))); end;
     else
       Result := False;
   end;

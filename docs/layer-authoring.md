@@ -88,6 +88,9 @@ Follow this in order. Steps marked **(both)** have TWO places that must change.
 
 10. **Build and run the whole suite:** `bash tests/RunAll.sh`. Use the runner, not
     a hand-rolled `fpc` line (the latter can spuriously fail on `UTF8Process`).
+    The slow end-to-end tests (suite `TTestNeuralPretrainedSlow`) run only with
+    `NEURAL_SLOW_TESTS=1 bash tests/RunAll.sh`; the same variable lets
+    `RunTests --suite=<name>` find one of them.
 
 ## 2. Reading a numerical-gradient failure
 

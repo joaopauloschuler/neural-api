@@ -98,10 +98,11 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--experimental-fp16` | **experimental and under construction.** Half-precision activations in the int8 OpenCL matmuls (`cai_dot_product_int8_h` and its split-K twin): the weights stay int8 and the layer still hands the CPU a `Single`, only the column matrix inside OpenCL memory narrows. Logits are not bit-exact. Needs `--gpu` and int8 weights — `--cpu`, `--fp32` or `--int4` ignores it, and a device that rejects the half kernel keeps the FP32 activations | off |
 | `--experimental-int8-input` | **experimental and under construction.** `TNNet.EnableInt8Input` after the weights are quantized: every int8-weight layer keeps an int8 copy of its input with one scale per tensor. Today only `TNNetConvolution` has an int8 x int8 CPU kernel (`ComputeInt8Int8CPU`); the fully connected blocks of an LLM arm the copy but still run int8 x FP32, so on ChatTerminal's models this changes nothing yet. Needs int8 or int4 weights — `--fp32` ignores it. With `--int4` the printed count includes the int4 layers, which arm the copy themselves | off |
 | `--no-gpu-shared-kernel` | give every layer its own OpenCL kernel handles and command queue instead of the net-wide shared ones (see below) | shared on |
-| `--stats` | per-turn timing to **stderr**. `input:` prompt tokens, `(reused K, prefix P of C cached)` — K tokens resumed from the KV cache or a cache checkpoint, P the length of the token-id prefix the prompt shares with the C ids cached from the previous turn (a small K next to a large P says the divergence fell below every checkpoint), TTFT (prefill + first token) and `prefill X tok/s`; `output:` reply tokens, their time from the end of prefill, and the steady-state decode tok/s; a per-decode-step phase split; and `total input` / `total output` lines accumulated for as long as the process runs (`cached` = prompt tokens the reuse skipped) | off |
+| `--stats` | per-turn timing to **stderr**. `input:` prompt tokens, `(reused K, prefix P of C cached)` — K tokens resumed from the live KV cache, a cache checkpoint or a conversation slot, P the length of the token-id prefix the prompt shares with the C ids cached from the previous turn (a small K next to a large P says the divergence fell below every checkpoint; K can exceed P on a pure recurrent net, because a checkpoint of an earlier conversation resumes past the ids shared with the cache, and after a conversation-slot resume, because the slot carries its own K/V), TTFT (prefill + first token) and `prefill X tok/s`; `output:` reply tokens, their time from the end of prefill, and the steady-state decode tok/s; a per-decode-step phase split; and `total input` / `total output` lines accumulated for as long as the process runs (`cached` = prompt tokens the reuse skipped). A `resumed from:` line names where the prompt resumed (`none`, `live cache`, `checkpoint` or `conversation slot`); with `--kv-slots` it also prints the memory the conversation slots hold, in host RAM and in OpenCL memory | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn, one `[profile] prefill:` report (one table per net that ran: the windows on the `--prefill-window` twin, the windows on the tail twin, the single steps on the main net, each under a header line with its window count) and one for the decode steps, each followed by a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
-| `--cache-checkpoints N` | hybrid/recurrent nets only (`qwen3_5`, `qwen3_8`, mamba, ...): keep up to N **cache checkpoints** of the recurrent state (see *cache checkpoints* below), captured after every prefill window and at the end of the prompt and of the reply, kept geometrically denser near the newest token; a prompt resumes from the deepest checkpoint at or below its shared token prefix and prefills only the tail. 0 turns the route off (full re-prefill every turn); 1 and values above 2048 stop the program with an error before loading. Inert with a notice on pure-attention nets, whose KV cache is truncated to the prefix instead | 16 with `--gpu`, 8 on the CPU |
+| `--cache-checkpoints N` | hybrid/recurrent nets only (`qwen3_5`, `qwen3_8`, mamba, ...): keep up to N **cache checkpoints** of the recurrent state (see *cache checkpoints* below), captured at the end of the system prompt, of the last user message, of the prompt and of the reply; a full store frees the checkpoint unused for the most turns; a prompt resumes from the deepest checkpoint whose tokens it starts with and prefills only the tail. 0 turns the route off (full re-prefill every turn); 1 and values above 2048 stop the program with an error before loading. Inert with a notice on pure-attention nets, whose KV cache is truncated to the prefix instead | 16 with `--gpu`, 8 on the CPU |
+| `--kv-slots N` | keep up to N other conversations whole in **conversation slots** (see *conversation slots* below): when a prompt leaves the cached conversation, the engine saves that conversation to a slot; a later prompt that starts with a saved conversation resumes from it and prefills only the tail. A full set frees the slot unused for the most turns. Each slot costs one KV cache at its conversation's length (host RAM); on hybrid/recurrent nets also one recurrent state (host RAM) and one recurrent state at the last user message (OpenCL memory under `--gpu`), plus one more such copy held by the engine. Works on pure-attention, hybrid and recurrent nets; ignored with a notice under `--no-cache-reuse` and on an architecture without cache reuse. N is 0 to 64, else the program stops with an error before loading | 0 (off); ChatServer: 4 |
 | `--prefill-window N` | prefill the prompt N tokens per forward on a width-N twin of the net (`TChatEngine.WindowNN`); the state crosses to the width-1 net with a session snapshot before the tail and the decode loop. The tail that does not fill a window is fed one token at a time — nothing is padded. The twin borrows the loaded net's weights (`BuildFromPretrained` with `pWeightOwner`: the int8/int4 tables in RAM and the resident codes on the device are shared, the checkpoint is read once, and the twin allocates no weight storage — it costs its activations). Model families outside the Llama builder (`PretrainedModelTypeCanBorrowWeights`: llama, mistral, qwen*, gemma*, phi3, olmo*, mixtral, glm4, granite*, minicpm, bitnet) fall back to a full second build — checkpoint read twice, weights held twice — and the startup notice says so. N must be 0 or at least 2, and below the context length (`--ctx`), otherwise the program stops with an error before loading | 0 (one token per forward) |
 | `--prefill-tail-window T` | width of a second, width-T twin (`TChatEngine.TailNN`) that feeds what the width-N windows leave over T tokens per forward, so at most T-1 tokens go one at a time: the prompt runs down a ladder of widths N, then T, then 1. On a 7880-token prompt with N=256 the 199-token leftover cost 199 single steps, about a fifth of the time-to-first-token; with T=16 it costs 12 tail windows and 7 single steps. The tail twin borrows the weights like the width-N twin (it costs its activations) and is not built on the full-second-build fallback. T must be below N and needs `--prefill-window` (otherwise the program stops with an error before loading); 0 picks 16 when that is below N, else a notice and no tail twin; 1 builds none | 0 (auto) |
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
@@ -221,13 +222,17 @@ region and trimmed from the reply), or at `--max-new-tokens`.
 that re-sends the conversation) re-renders the whole history, but
 its token prefix is almost always identical to what is already resident in
 the KV cache (last turn's prompt + reply). The session keeps the cache,
-diffs the new prompt against it (`CommonPrefixLen`), `TruncateTo`s the
+diffs the new prompt against its token ids (`CommonPrefixLen`, or
+`MatchPromptAgainstCache` when checkpoints or slots are on), `TruncateTo`s the
 divergent tail and prefills only the new tokens — so time-to-first-token
 stays roughly flat instead of growing with the transcript. This is correct
 regardless of tokenizer round-tripping (the diff always finds the true
 shared prefix; `/system` and `/reset` simply diverge earlier and re-prefill
 more), and it works the same with the int8 KV cache (truncation only
-rewinds the cache length). Truncation applies to pure-attention models
+rewinds the cache length). The live KV cache holds one conversation: a
+prompt from another conversation shares only the ids up to where the two
+differ (often just the system prompt), and *conversation slots* below keep
+other conversations. Truncation applies to pure-attention models
 only: a recurrent (SSM/Mamba/RWKV) state cannot be truncated by position.
 
 **Cache checkpoints (hybrid/recurrent models).** A net with recurrent
@@ -238,33 +243,92 @@ per-position history. `TChatEngine` therefore keeps a store of up to N
 **cache checkpoints** (`--cache-checkpoints N`; `TNNetDecoderStateCheckpoint`:
 one copy of every recurrent layer's state and step count, no K/V), each
 tagged with the number of tokens fed when it was captured. Captures happen
-after every window the `--prefill-window` twins feed, at the end of the
-prompt and at the end of the reply; the store is sized once at load and a
-capture allocates nothing. The next prompt is diffed against the cached ids
-(`CommonPrefixLen`), the deepest checkpoint at or below that prefix is
-picked, the K/V is truncated to its position, its recurrent state is put
-back (`RestoreStateFrom`) and only the tokens after it are prefilled —
+at the end of the system prompt, of the last user message, of the prompt
+and of the reply, so one turn adds at most four; under `--prefill-window`
+the system-prompt and last-user captures land on the last window end at or
+below each boundary. The store is sized once at load and a capture allocates
+nothing. Each checkpoint also records which token sequence
+it belongs to: a 64-bit hash of the ids before its position plus their last
+64 ids. One pass over the next prompt finds its common prefix with the cached
+ids and every checkpoint whose ids the prompt starts with; the deepest one
+that can be resumed is picked (on a net with attention layers it must also
+lie within the cached prefix, because a checkpoint holds no K/V), the K/V is
+truncated to its position, its recurrent state is put back
+(`RestoreStateFrom`) and only the tokens after it are prefilled —
 bit-identical to a fresh prefill. So a client that echoes the reply resumes
-at the end of the reply, one that re-renders the assistant turn resumes at
-the end of the prompt, and an agent that edits or appends to a message deep
-inside the history resumes at the last checkpoint before the edit instead of
-re-prefilling everything.
+at the end of the reply, and one that re-renders the assistant turn resumes
+at the end of the prompt, or, on a thinking template (Qwen3.5/3.6, which
+drops the previous turn's `<think>` block while the generation prompt opened
+one), at the end of the previous last user message; a new conversation
+with the same system prompt resumes at the end of the system prompt. An edit
+deep inside the history resumes at the deepest turn-boundary checkpoint
+before the edit.
 
-Retention: with W the finest capture spacing (the tail window, else the
-prefill window, else 256 capped at half the context), context C and N
-slots, `r = (C / W)^(1 / N)` and band k covers distances `[W r^k, W r^(k+1))`
-from the newest fed token (distances below W count as band 0); on every
-capture the store keeps the deepest checkpoint per band (denser near the
-end, where prompts usually diverge) and drops the rest, so the end-of-prompt
-and end-of-reply checkpoints of the newest request, its two deepest, always
-survive. A divergence at distance d therefore costs at most about `(r - 1) d`
-extra prefill on top of the unavoidable d; with `--prefill-window 256
---prefill-tail-window 16` at C = 32768 that is 0.61 d for N = 16 (r = 1.61)
-and 1.6 d for N = 8 (r = 2.59). Each
+Retention: a prompt that diverges never frees a checkpoint, so the
+checkpoints of another conversation stay in the store. A checkpoint counts as
+used in a turn (one request) when that turn captures it or resumes from it; a
+checkpoint the prompt merely starts with is not refreshed, so one that is
+never resumed ages out. When a capture finds the store full, the checkpoint
+unused for the most turns is freed (the shallowest one on a tie). This is
+the only eviction rule, and conversation slots follow it too. Each
 checkpoint costs the recurrent state only (about 4 MB per GatedDeltaNet
 layer on a 27B Qwen3.8, so about 190 MB per checkpoint, 3 GB for N = 16),
 held in OpenCL memory under `--gpu` (a capture is a copy between resident
-buffers) and in host RAM otherwise; the load notice prints the figure. The
-attention K/V is never copied. `--no-cache-reuse` turns both routes off (use
-`--stats` to compare: watch `prompt N (reused K, prefix P of C cached)` and
-TTFT).
+buffers) and in host RAM otherwise; the load notice prints the figure. A
+cache checkpoint never copies the attention K/V. `--no-cache-reuse` turns
+every route off (use `--stats` to compare: watch `prompt N (reused K, prefix
+P of C cached)`, the `resumed from:` line and TTFT).
+
+**Conversation slots (`--kv-slots N`; off by default in ChatTerminal, 4 in
+ChatServer).** The live KV cache
+and the cache checkpoints serve the conversation the last request belonged
+to. When requests alternate between conversations (two clients of
+ChatServer, or `/reset` and back), each switch would otherwise re-prefill
+everything after the ids the two conversations share. With `--kv-slots N`,
+`TChatEngine` keeps up to N other conversations in **conversation slots**:
+
+- *Save.* When a prompt leaves the cached conversation before its end,
+  `TChatEngine` first saves that conversation to a slot
+  (`SaveLiveConversation`): a session snapshot of its K/V rows and recurrent
+  state at the end of its reply (only the rows in use are copied), plus its
+  resume points: the end of the system prompt, the end of its last user
+  message and the end of its reply (each a position, a 64-bit token-prefix
+  hash and the last 64 ids). On a hybrid/recurrent net the slot also keeps
+  the recurrent state at the last-user point, captured at the same position
+  as the last-user cache checkpoint (under `--prefill-window`, the last
+  window end at or below the message end), also with
+  `--cache-checkpoints 0`. On such a net the system-prompt point is left out
+  (the cache checkpoints cover it), and the last-user point is kept only
+  when its recurrent state was captured. `TChatEngine` never saves a
+  conversation that keeps growing. If the save fails (out of memory),
+  `TChatEngine` prints a notice, the slot stays free, and the request
+  continues.
+- *Resume.* The same one pass over the prompt that matches the cache
+  checkpoints also matches every slot's resume points. A slot point wins
+  only when it is deeper than the position the live cache or the matching
+  checkpoint would resume from. `TChatEngine` then restores the snapshot,
+  truncates the K/V to that point and puts back the recurrent state there,
+  and prefills only the tokens after it; at the reply-end point the
+  snapshot is used as is (no truncation, no separate recurrent restore). On a
+  thinking template the point that matches is the end of the last user
+  message, for the reason given under *cache checkpoints* above.
+- *Eviction.* When every slot is taken, the slot unused for the most turns
+  is freed (the shallowest on a tie); a slot counts as used when a request
+  resumes from it or saves it. This is the same rule as the cache
+  checkpoints.
+- *Memory.* A slot holds one KV cache at its conversation's length (int8
+  under `--kv-int8`) in host RAM. On a hybrid/recurrent net it also holds
+  one recurrent state (host RAM) and one recurrent state at the last user
+  message; the engine holds one more such copy, so N+1 copies in OpenCL
+  memory under `--gpu` (about 190 MB each on a 27B Qwen3.8), in host RAM
+  otherwise. The
+  load notice prints the per-copy size, and `--stats` prints the slots' total
+  in host RAM and in OpenCL memory after each turn; size N from those
+  figures and the number of conversations you expect to alternate.
+
+Requests still run one at a time; slots change what a request resumes from,
+not how many run at once. The slots are covered by the test suite on small
+test nets (pure-attention, hybrid and Mamba, with and without
+`--prefill-window`, and an OpenCL run). They have not yet been timed on a
+real model, and restoring into a prefill twin that runs in its own OpenCL
+context is untested.
