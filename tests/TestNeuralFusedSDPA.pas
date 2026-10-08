@@ -43,6 +43,7 @@ type
     procedure TestBackwardParity;        // per-head backward mirror
     procedure TestChunkedPrefillParity;  // planner chunk path vs serial
     procedure TestChunkedDecodeParity;   // chunked cached decode vs serial
+    procedure TestCachedForwardNonCausal; // external prefix + unmasked step
   end;
 
 implementation
@@ -544,6 +545,109 @@ begin
     Tok.Free;
     Chunked.Free;
     Serial.Free;
+  end;
+end;
+
+// Copies channels [ChannelStart, ChannelStart+Dst.Depth) of rows
+// [FirstRow, FirstRow+RowCount) of Src into Dst.
+procedure CopyPackedRows(Src, Dst: TNNetVolume; FirstRow, RowCount,
+  ChannelStart: integer);
+var
+  RowPos: integer;
+begin
+  Dst.ReSize(RowCount, 1, Dst.Depth);
+  for RowPos := 0 to RowCount - 1 do
+    Move(Src.FData[(FirstRow + RowPos) * Src.Depth + ChannelStart],
+      Dst.FData[RowPos * Dst.Depth], Dst.Depth * SizeOf(TNeuralFloat));
+end;
+
+procedure TTestNeuralFusedSDPA.TestCachedForwardNonCausal;
+const
+  PrefixLen = 5;
+  StepLen = 4;
+  Hq = 4;
+  Hkv = 2;
+  HeadDim = 4;
+var
+  Full, Step, Reloaded: TNNet;
+  Layer: TNNetFusedSDPA;
+  FullInput, StepInput, PrefixK, PrefixV, Tail: TNNetVolume;
+  QW, KW, PackedWidth, Pass, i: integer;
+  Parallel: boolean;
+begin
+  // A cached forward of StepLen rows over PrefixLen externally appended rows
+  // must equal the last StepLen rows of an unmasked prefill over all rows;
+  // pass 1 rewinds to the prefix and steps new rows (the diffusion step loop).
+  QW := Hq * HeadDim;
+  KW := Hkv * HeadDim;
+  PackedWidth := QW + 2 * KW;
+  FullInput := TNNetVolume.Create(PrefixLen + StepLen, 1, PackedWidth);
+  StepInput := TNNetVolume.Create(StepLen, 1, PackedWidth);
+  PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+  PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+  Tail := TNNetVolume.Create(PrefixLen + StepLen, 1, PackedWidth);
+  Full := BuildFusedNet(PrefixLen + StepLen, Hq, Hkv, HeadDim, 0,
+    {Causal=}false);
+  Reloaded := nil;
+  try
+    for Parallel := false to true do
+    begin
+      Step := TNNet.Create();
+      try
+        Step.AddLayer(TNNetInput.Create(StepLen, 1, PackedWidth));
+        Layer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, {Causal=}false, 0, 0,
+          {pCachedForwardNonCausal=}true);
+        Layer.BeginIncrementalDecode(PrefixLen + StepLen);
+        Step.AddLayer(Layer);
+        FillPacked(FullInput, 91);
+        CopyPackedRows(FullInput, PrefixK, 0, PrefixLen, QW);
+        CopyPackedRows(FullInput, PrefixV, 0, PrefixLen, QW + KW);
+        Layer.AppendCacheRowsFrom(PrefixK, PrefixV);
+        AssertEquals('prefix rows cached', PrefixLen, Layer.CacheLength);
+        for Pass := 0 to 1 do
+        begin
+          if Pass = 1 then
+          begin
+            // New step rows over the same prefix.
+            FillPacked(Tail, 300);
+            Move(Tail.FData[PrefixLen * PackedWidth],
+              FullInput.FData[PrefixLen * PackedWidth],
+              StepLen * PackedWidth * SizeOf(TNeuralFloat));
+            Layer.TruncateCache(PrefixLen);
+          end;
+          Full.Compute(FullInput);
+          CopyPackedRows(FullInput, StepInput, PrefixLen, StepLen, 0);
+          Step.Compute(StepInput, 0, Parallel);
+          for i := 0 to StepLen * QW - 1 do
+            AssertEquals('parallel=' + BoolToStr(Parallel, true) + ' pass ' +
+              IntToStr(Pass) + ' at ' + IntToStr(i),
+              Full.GetLastLayer().Output.FData[PrefixLen * QW + i],
+              Step.GetLastLayer().Output.FData[i], 1e-6);
+        end;
+      finally
+        Step.Free;
+      end;
+    end;
+    // The flag survives a structure round trip.
+    Step := TNNet.Create();
+    try
+      Step.AddLayer(TNNetInput.Create(StepLen, 1, PackedWidth));
+      Step.AddLayer(TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, false, 0, 0, true));
+      Reloaded := TNNet.Create();
+      Reloaded.LoadFromString(Step.SaveToString());
+      AssertTrue('CachedForwardNonCausal reloads',
+        TNNetFusedSDPA(Reloaded.Layers[1]).CachedForwardNonCausal);
+    finally
+      Step.Free;
+    end;
+  finally
+    Reloaded.Free;
+    Full.Free;
+    Tail.Free;
+    PrefixV.Free;
+    PrefixK.Free;
+    StepInput.Free;
+    FullInput.Free;
   end;
 end;
 

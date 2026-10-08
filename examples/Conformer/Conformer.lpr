@@ -4,7 +4,7 @@ Conformer: a tiny pure-CPU demo of TNNet.AddConformerBlock, the convolution-
 augmented transformer block of Gulati et al. 2020 ("Conformer: Convolution-
 augmented Transformer for Speech Recognition"). The Conformer block is a
 "macaron" sandwich: two HALF-step feed-forward modules wrap a multi-head self-
-attention module and a (depthwise-separable-style) convolution module, every
+attention module and a depthwise-separable convolution module, every
 sub-module a pre-norm residual, with a final LayerNorm:
     x := x + 0.5 * FFN(x)        (first half-step FFN)
     x := x + MHSA(x)             (multi-head self-attention -- GLOBAL mixing)
@@ -12,7 +12,7 @@ sub-module a pre-norm residual, with a final LayerNorm:
     x := x + 0.5 * FFN(x)        (second half-step FFN)
     x := LayerNorm(x)
 The whole block is composed from existing serializable primitives (LayerNorm,
-PointwiseConvLinear, multi-head self-attention, GLU, TNNetCausalConv1D, Swish,
+PointwiseConvLinear, multi-head self-attention, GLU, TNNetDepthwiseConv1D, Swish,
 Sum), so it needs no new class and round-trips through SaveToString/LoadFromString.
 
 WHY A TASK THAT NEEDS BOTH CONV AND ATTENTION. The whole point of a Conformer is

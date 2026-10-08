@@ -16,6 +16,7 @@ type
     procedure TestVolumeAddSub;
     procedure TestVolumeCopy;
     procedure TestVolumeSaveLoad;
+    procedure TestVolumeSaveLoadIgnoresLocaleSeparator;
     // New comprehensive tests
     procedure TestVolumeMul;
     procedure TestVolumeDiv;
@@ -122,8 +123,12 @@ type
     procedure TestDotProductInt8Int8MatchesFloatPath;
     procedure TestQuant4GeometryAndLayout;
     procedure TestQuant4QuantizeRoundTrip;
+    procedure TestQuant4QuantizeRowMatchesScalarReference;
+    procedure TestQuant4QuantizeRowTinyAndDenormalBlocks;
     procedure TestDotProductInt4Int8MatchesReference;
     procedure TestQuant4TiledDotProductMatchesDequantized;
+    procedure TestQuant8CopyRowsTransposedMatchesReference;
+    procedure TestQuant4CopyRowsAsPairedTransposedMatchesReference;
     procedure TestDecodeBF16;
     procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
@@ -235,6 +240,39 @@ begin
     V2.LoadFromString(SavedStr);
     AssertEquals('Loaded volume should match saved', 0.0, V1.SumDiff(V2), 0.0001);
   finally
+    V1.Free;
+    V2.Free;
+  end;
+end;
+
+// SaveToString/LoadFromString/FormatSettings always use '.', whatever
+// DefaultFormatSettings says at the time of the call.
+procedure TTestNeuralVolume.TestVolumeSaveLoadIgnoresLocaleSeparator;
+var
+  V1, V2: TNNetVolume;
+  SavedStr: string;
+  OldDecimalSeparator, OldThousandSeparator: char;
+begin
+  OldDecimalSeparator := DefaultFormatSettings.DecimalSeparator;
+  OldThousandSeparator := DefaultFormatSettings.ThousandSeparator;
+  V1 := TNNetVolume.Create(3, 1, 1);
+  V2 := TNNetVolume.Create(1, 1, 1);
+  try
+    DefaultFormatSettings.DecimalSeparator := ',';
+    DefaultFormatSettings.ThousandSeparator := ' ';
+    V1.FData[0] := 0.5;
+    V1.FData[1] := -1.25;
+    V1.FData[2] := 3;
+    SavedStr := V1.SaveToString();
+    AssertTrue('decimal point expected in ' + SavedStr, Pos('0.5', SavedStr) > 0);
+    AssertEquals('FormatSettings separator', '.', V1.FormatSettings.DecimalSeparator);
+    AssertEquals('NeuralToStr', '-1.25', V1.NeuralToStr(V1.FData[1]));
+    V2.LoadFromString(SavedStr);
+    AssertEquals('round trip size', 3, V2.Size);
+    AssertEquals('round trip', 0.0, V1.SumDiff(V2), 0.0);
+  finally
+    DefaultFormatSettings.DecimalSeparator := OldDecimalSeparator;
+    DefaultFormatSettings.ThousandSeparator := OldThousandSeparator;
     V1.Free;
     V2.Free;
   end;
@@ -3869,6 +3907,197 @@ begin
   end;
 end;
 
+// TNNetVolumeQuant4.QuantizeRow as a scalar loop (IsNan/IsInfinite, single
+// -8/max): the reference its fast path must match. Coded by Claude (AI).
+procedure ReferenceQuantizeRowQ4_0(Q: TNNetVolumeQuant4; x, y: integer;
+  Src: TNeuralFloatArrPtr);
+var
+  PackedRow: TNeuralByteArrPtr;
+  Scales: TNeuralFloatArrPtr;
+  BlockIdx, MaxBlockIdx, ByteIdx, SrcOfs, PackedOfs: integer;
+  Value, MaxAbs, MaxSigned, InvScale: TNeuralFloat;
+  LowCode, HighCode: integer;
+begin
+  PackedRow := Q.GetRawPtr(x, y);
+  Scales := Q.GetScaleRowPtr(x, y);
+  MaxBlockIdx := Q.BlocksPerRow - 1;
+  SrcOfs := 0;
+  PackedOfs := 0;
+  for BlockIdx := 0 to MaxBlockIdx do
+  begin
+    MaxAbs := 0;
+    MaxSigned := 0;
+    for ByteIdx := 0 to TNNetVolumeQuant4.BlockSize - 1 do
+    begin
+      Value := Src^[SrcOfs + ByteIdx];
+      if IsNan(Value) or IsInfinite(Value) then continue;
+      if Abs(Value) > MaxAbs then
+      begin
+        MaxAbs := Abs(Value);
+        MaxSigned := Value;
+      end;
+    end;
+    Scales^[BlockIdx] := MaxSigned / (-8);
+    if MaxSigned <> 0
+    then InvScale := -8 / MaxSigned
+    else InvScale := 0;
+    for ByteIdx := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
+    begin
+      Value := Src^[SrcOfs + ByteIdx];
+      if IsNan(Value) or IsInfinite(Value) then Value := 0;
+      LowCode := Min(15, Trunc(Value * InvScale + 8.5));
+      Value := Src^[SrcOfs + ByteIdx + TNNetVolumeQuant4.PackedBlockBytes];
+      if IsNan(Value) or IsInfinite(Value) then Value := 0;
+      HighCode := Min(15, Trunc(Value * InvScale + 8.5));
+      PackedRow^[PackedOfs + ByteIdx] := Byte(LowCode or (HighCode shl 4));
+    end;
+    Inc(SrcOfs, TNNetVolumeQuant4.BlockSize);
+    Inc(PackedOfs, TNNetVolumeQuant4.PackedBlockBytes);
+  end;
+end;
+
+// QuantizeRow equals the scalar reference bit for bit on ties, NaN/Inf, zero
+// blocks and 1e-37..1e38 (blocks the reference cannot divide are skipped).
+procedure TTestNeuralVolumeQuant8.TestQuant4QuantizeRowMatchesScalarReference;
+const
+  RowCount = 40;
+  Depth = 32 * 12;
+var
+  Src, ReferenceSrc: TNNetVolume;
+  Fast, Reference: TNNetVolumeQuant4;
+  RowIdx, BlockIdx, ElementIdx, Base, i, SkippedBlocks: integer;
+  Magnitude, BlockMax: TNeuralFloat;
+  // The old reference raises EOverflow on these blocks (single -8/max).
+  MinInvertibleMax: double;
+  Skipped: array of boolean;
+begin
+  MinInvertibleMax := 8 / MaxSingle;
+  SetLength(Skipped, RowCount * (Depth div 32));
+  RandSeed := 24680;
+  Src := TNNetVolume.Create(RowCount, 1, Depth);
+  ReferenceSrc := TNNetVolume.Create(RowCount, 1, Depth);
+  Fast := TNNetVolumeQuant4.Create(RowCount, 1, Depth);
+  Reference := TNNetVolumeQuant4.Create(RowCount, 1, Depth);
+  try
+    for RowIdx := 0 to RowCount - 1 do
+      for BlockIdx := 0 to (Depth div 32) - 1 do
+      begin
+        Base := RowIdx * Depth + BlockIdx * 32;
+        case Random(4) of
+          0: Magnitude := 1;
+          1: Magnitude := 1e-37;
+          2: Magnitude := 1e38;
+          else Magnitude := 0.01;
+        end;
+        for ElementIdx := 0 to 31 do
+          Src.FData[Base + ElementIdx] := RandG(0, 1) * Magnitude * 0.25;
+        case (RowIdx * 7 + BlockIdx) mod 9 of
+          // Exact ties: the first one sets the sign of the scale.
+          0: for ElementIdx := 0 to 31 do
+               if Odd(ElementIdx) then Src.FData[Base + ElementIdx] := 1.5
+               else Src.FData[Base + ElementIdx] := -1.5;
+          1: for ElementIdx := 0 to 31 do
+               Src.FData[Base + ElementIdx] :=
+                 Round(RandG(0, 1) * 4) * 0.25 * Magnitude;
+          2: for i := 0 to 3 do
+             begin
+               Src.FData[Base + Random(32)] := NaN;
+               Src.FData[Base + Random(32)] := Infinity;
+               Src.FData[Base + Random(32)] := NegInfinity;
+             end;
+          3: for ElementIdx := 0 to 31 do Src.FData[Base + ElementIdx] := NaN;
+          4: for ElementIdx := 0 to 31 do Src.FData[Base + ElementIdx] := 0;
+          5: for ElementIdx := 0 to 31 do
+               Src.FData[Base + ElementIdx] := -0.0;
+          6: for ElementIdx := 0 to 31 do
+               Src.FData[Base + ElementIdx] := RandG(0, 1) * 1e-39;
+        end;
+      end;
+    // The reference sees the skipped blocks zeroed; they are not compared.
+    ReferenceSrc.Copy(Src);
+    SkippedBlocks := 0;
+    for i := 0 to Length(Skipped) - 1 do
+    begin
+      BlockMax := TNNetVolume.MaxAbsFinite(
+        TNeuralFloatArrPtr(@Src.FData[i * 32]), 32);
+      Skipped[i] := (BlockMax > 0) and (BlockMax < MinInvertibleMax);
+      if Skipped[i] then
+      begin
+        Inc(SkippedBlocks);
+        for ElementIdx := 0 to 31 do
+          ReferenceSrc.FData[i * 32 + ElementIdx] := 0;
+      end;
+    end;
+    AssertTrue('some blocks are below 8/MaxSingle', SkippedBlocks > 0);
+    for RowIdx := 0 to RowCount - 1 do
+    begin
+      Fast.QuantizeRow(RowIdx, 0,
+        TNeuralFloatArrPtr(@Src.FData[RowIdx * Depth]));
+      ReferenceQuantizeRowQ4_0(Reference, RowIdx, 0,
+        TNeuralFloatArrPtr(@ReferenceSrc.FData[RowIdx * Depth]));
+    end;
+    for i := 0 to Fast.PackedSize - 1 do
+      if not Skipped[i div 16] then
+        AssertEquals('packed byte ' + IntToStr(i), Reference.FData[i],
+          Fast.FData[i]);
+    for i := 0 to Fast.ScaleData.Size - 1 do
+      if not Skipped[i] then
+        AssertEquals('scale bits ' + IntToStr(i),
+          PLongWord(@Reference.ScaleData.FData[i])^,
+          PLongWord(@Fast.ScaleData.FData[i])^);
+  finally
+    ReferenceSrc.Free;
+    Reference.Free;
+    Fast.Free;
+    Src.Free;
+  end;
+end;
+
+// Blocks with max below 8/MaxSingle (no single -8/max) must not raise; the
+// extreme codes -8 and each value is within one scale. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4QuantizeRowTinyAndDenormalBlocks;
+const
+  cBlockMax: array[0..2] of TNeuralFloat = (1e-39, 2e-38, 1e-41);
+var
+  Src: array[0..95] of TNeuralFloat;
+  Q: TNNetVolumeQuant4;
+  BlockIdx, ElementIdx: integer;
+  Scale, ExpectedScale: TNeuralFloat;
+begin
+  Q := TNNetVolumeQuant4.Create(1, 1, 96);
+  try
+    for BlockIdx := 0 to 2 do
+    begin
+      for ElementIdx := 0 to 31 do
+        Src[BlockIdx * 32 + ElementIdx] :=
+          cBlockMax[BlockIdx] * (ElementIdx - 15) / 17;
+      // The positive extreme sits after the negative values.
+      Src[BlockIdx * 32 + 31] := cBlockMax[BlockIdx];
+      Src[BlockIdx * 32 + 3] := NaN;
+    end;
+    Q.QuantizeRow(0, 0, TNeuralFloatArrPtr(@Src[0]));
+    for BlockIdx := 0 to 2 do
+    begin
+      Scale := Q.GetScaleRowPtr(0, 0)^[BlockIdx];
+      ExpectedScale := cBlockMax[BlockIdx];
+      ExpectedScale := ExpectedScale / (-8);
+      AssertTrue('block ' + IntToStr(BlockIdx) + ' scale is -max/8',
+        Scale = ExpectedScale);
+      AssertEquals('block ' + IntToStr(BlockIdx) + ' extreme codes -8', -8,
+        Q.GetCode(0, 0, BlockIdx * 32 + 31));
+      AssertEquals('block ' + IntToStr(BlockIdx) + ' NaN codes 0', 0,
+        Q.GetCode(0, 0, BlockIdx * 32 + 3));
+      for ElementIdx := 0 to 31 do
+        if ElementIdx <> 3 then
+          AssertEquals('block ' + IntToStr(BlockIdx) + ' element ' +
+            IntToStr(ElementIdx), Src[BlockIdx * 32 + ElementIdx],
+            Q.Dequantize(0, 0, BlockIdx * 32 + ElementIdx), Abs(Scale) * 1.01);
+    end;
+  finally
+    Q.Free;
+  end;
+end;
+
 // DotProductInt4Int8 must agree with the dequantized FP32 dot product over
 // every block count, including the AVX2 kernel's float accumulation order.
 // NumElements must be the input row's depth (the paired order is a property
@@ -4030,6 +4259,128 @@ begin
         Abs(Back[i] - V.FData[i]) <= Scale * 0.5 + 1e-7);
   finally
     V.Free;
+  end;
+end;
+
+// CopyRowsTransposedTo puts code d of row r at Dst[r + d * RowCount], for
+// untiled sizes and uneven row ranges. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant8CopyRowsTransposedMatchesReference;
+const
+  cShapes: array[0..5, 0..1] of integer =
+    ((1, 1), (1, 40), (7, 5), (65, 33), (130, 100), (4096, 512));
+var
+  Q: TNNetVolumeQuant8;
+  Got, Expected: TInt8DynArr;
+  ShapeCnt, RowCount, Depth, RowCnt, DepthCnt, i, SplitRow1, SplitRow2: integer;
+  Tag: string;
+begin
+  RandSeed := 4242;
+  Q := TNNetVolumeQuant8.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+    begin
+      RowCount := cShapes[ShapeCnt, 0];
+      Depth := cShapes[ShapeCnt, 1];
+      Tag := IntToStr(RowCount) + 'x' + IntToStr(Depth);
+      Q.ReSize(RowCount, 1, Depth);
+      for i := 0 to Q.Size - 1 do Q.FData[i] := ShortInt(Random(256) - 128);
+      SetLength(Expected, Q.Size);
+      for RowCnt := 0 to RowCount - 1 do
+        for DepthCnt := 0 to Depth - 1 do
+          Expected[RowCnt + DepthCnt * RowCount] := Q.Get(RowCnt, 0, DepthCnt);
+      SetLength(Got, Q.Size);
+      FillChar(Got[0], Q.Size, $5A);
+      Q.CopyRowsTransposedTo(0, RowCount, TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      AssertTrue(Tag + ' whole range is byte-identical',
+        CompareByte(Got[0], Expected[0], Q.Size) = 0);
+      FillChar(Got[0], Q.Size, $5A);
+      SplitRow1 := RowCount div 3;
+      SplitRow2 := (RowCount * 2) div 3 + 1;
+      if SplitRow2 > RowCount then SplitRow2 := RowCount;
+      Q.CopyRowsTransposedTo(0, SplitRow1, TNeuralInt8ArrPtr(@Got[0]),
+        RowCount);
+      Q.CopyRowsTransposedTo(SplitRow1, SplitRow2 - SplitRow1,
+        TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      Q.CopyRowsTransposedTo(SplitRow2, RowCount - SplitRow2,
+        TNeuralInt8ArrPtr(@Got[0]), RowCount);
+      AssertTrue(Tag + ' three ranges are byte-identical',
+        CompareByte(Got[0], Expected[0], Q.Size) = 0);
+    end;
+  finally
+    Q.Free;
+  end;
+end;
+
+// OpenCL int4 layout: Pair[r + (16b + p) * RowCount] holds codes 2p, 2p+1 of
+// block b (biased), Scale[r + b * RowCount] its scale. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4CopyRowsAsPairedTransposedMatchesReference;
+const
+  cShapes: array[0..5, 0..1] of integer =
+    ((1, 32), (1, 96), (7, 64), (65, 96), (130, 160), (4096, 512));
+var
+  Q: TNNetVolumeQuant4;
+  GotPairs, ExpectedPairs: TNeuralByteDynArr;
+  GotScales, ExpectedScales: TNeuralFloatDynArr;
+  ShapeCnt, RowCount, Depth, RowCnt, PairCnt, BlockCnt, i: integer;
+  PairBytes, ScaleCount, SplitRow: integer;
+  Tag: string;
+begin
+  RandSeed := 2424;
+  Q := TNNetVolumeQuant4.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+    begin
+      RowCount := cShapes[ShapeCnt, 0];
+      Depth := cShapes[ShapeCnt, 1];
+      Tag := IntToStr(RowCount) + 'x' + IntToStr(Depth);
+      Q.ReSize(RowCount, 1, Depth);
+      for i := 0 to Q.PackedSize - 1 do Q.FData[i] := Random(256);
+      for i := 0 to Q.ScaleData.Size - 1 do
+        Q.ScaleData.FData[i] := Random - 0.5;
+      PairBytes := Q.PackedSize;
+      ScaleCount := RowCount * Q.BlocksPerRow;
+      SetLength(ExpectedPairs, PairBytes);
+      SetLength(ExpectedScales, ScaleCount);
+      for RowCnt := 0 to RowCount - 1 do
+      begin
+        for PairCnt := 0 to (Depth div 2) - 1 do
+          ExpectedPairs[RowCnt + PairCnt * RowCount] :=
+            (Q.GetCode(RowCnt, 0, 2 * PairCnt) + 8) or
+            ((Q.GetCode(RowCnt, 0, 2 * PairCnt + 1) + 8) shl 4);
+        for BlockCnt := 0 to Q.BlocksPerRow - 1 do
+          ExpectedScales[RowCnt + BlockCnt * RowCount] :=
+            Q.GetScaleRowPtr(RowCnt, 0)^[BlockCnt];
+      end;
+      SetLength(GotPairs, PairBytes);
+      SetLength(GotScales, ScaleCount);
+      FillChar(GotPairs[0], PairBytes, $5A);
+      FillChar(GotScales[0], ScaleCount * SizeOf(TNeuralFloat), $5A);
+      Q.CopyRowsAsPairedTransposedTo(0, RowCount,
+        TNeuralByteArrPtr(@GotPairs[0]),
+        TNeuralFloatArrPtr(@GotScales[0]), RowCount);
+      AssertTrue(Tag + ' pairs are byte-identical',
+        CompareByte(GotPairs[0], ExpectedPairs[0], PairBytes) = 0);
+      AssertTrue(Tag + ' scales are byte-identical',
+        CompareByte(GotScales[0], ExpectedScales[0],
+          ScaleCount * SizeOf(TNeuralFloat)) = 0);
+      FillChar(GotPairs[0], PairBytes, $5A);
+      FillChar(GotScales[0], ScaleCount * SizeOf(TNeuralFloat), $5A);
+      SplitRow := (RowCount + 1) div 2 + 3;
+      if SplitRow > RowCount then SplitRow := RowCount;
+      Q.CopyRowsAsPairedTransposedTo(0, SplitRow,
+        TNeuralByteArrPtr(@GotPairs[0]),
+        TNeuralFloatArrPtr(@GotScales[0]), RowCount);
+      Q.CopyRowsAsPairedTransposedTo(SplitRow, RowCount - SplitRow,
+        TNeuralByteArrPtr(@GotPairs[0]), TNeuralFloatArrPtr(@GotScales[0]),
+        RowCount);
+      AssertTrue(Tag + ' two ranges: pairs are byte-identical',
+        CompareByte(GotPairs[0], ExpectedPairs[0], PairBytes) = 0);
+      AssertTrue(Tag + ' two ranges: scales are byte-identical',
+        CompareByte(GotScales[0], ExpectedScales[0],
+          ScaleCount * SizeOf(TNeuralFloat)) = 0);
+    end;
+  finally
+    Q.Free;
   end;
 end;
 

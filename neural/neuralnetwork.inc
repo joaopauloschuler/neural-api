@@ -56,7 +56,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 {$ELSE}
   // AVX code is supported only under FPC
   {$UNDEF AVX}
-  {.$UNDEF AVX2}
+  {$UNDEF AVX2}
   {$UNDEF AVX512}
   {$UNDEF AVXANY}
 
@@ -101,7 +101,5 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 {$ENDIF}
 
 {$IFDEF AVXANY}
-  {$IFDEF FPC}
-    {$include neuralasm.inc}
-  {$ENDIF}
+{$include neuralasm.inc}
 {$ENDIF}

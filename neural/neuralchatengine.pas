@@ -1410,9 +1410,13 @@ var
   Cnt, LastIdx: integer;
   Int4LayerCount: integer;      // layers holding int4 weights after --int4
   Int4DirectLayerCount: integer; // of those, loaded straight from Q4_0 blocks
+  Int4RowLayerCount: integer;   // of those, quantized from the checkpoint rows
   TwinBytes: int64;             // the prefill twins' NonWeightBytes
   CheckpointsGiven: boolean;    // --cache-checkpoints N was on the command line
   OpenCLOn: boolean;            // OpenCL offload is live (not fallen back)
+  {$IFDEF OpenCL}
+  OpenCLProblem: string;        // why --gpu fell back to the CPU
+  {$ENDIF}
   SlotPos: integer;
 begin
   Result := false;
@@ -1590,8 +1594,9 @@ begin
       ' on --gpu the codes stay resident on the device; --fp32 opts out]');
     cwmFP32: Notice('[--fp32: full-precision weights - more RAM, slower than int8]');
     cwmInt4: Notice('[--int4: Q4_0 tensors of a .gguf checkpoint load' +
-      ' straight into int4 weight rows; every other tensor streams into int8' +
-      ' rows and TNNet.QuantizeWeightsInt4 requantizes it to Q4_0 int4 after' +
+      ' straight into int4 weight rows; the loader quantizes every other' +
+      ' row-streamable tensor of an int4 layer straight to Q4_0, and' +
+      ' TNNet.QuantizeWeightsInt4 requantizes the remaining int8 layers after' +
       ' the load; on --gpu the packed codes stay resident on the device;' +
       ' output quality below int8]');
   end;
@@ -1607,121 +1612,137 @@ begin
   // The global gates the importer's per-block fused-vs-per-head decision, so
   // it must be set BEFORE BuildFromPretrained. Restored after the build so a
   // second load in the same process is unaffected.
-  // The direct Q4_0 -> int4 weight route reads a global too, for the same
-  // reason: it must reach LoadLlamaLinearWeights without touching the
-  // signature of every importer between here and it. Restored after the build.
-  NeuralImportInt4FromQ4_0 := Opt.WeightMode = cwmInt4;
-  NeuralImportInt4LayerCount := 0;
-  NeuralAllowFusedAttention := not Opt.NoFusedAttn;
-  if Opt.NoFusedAttn then
-    Notice('[--no-fused-attn: per-head attention wiring (SplitChannels/SDPA/' +
-      'DeepConcat) instead of the fused layer - bit-identical, A/B only]');
+  // The direct Q4_0 -> int4 and FP32 row -> int4 weight routes read globals
+  // too, for the same reason: they must reach LoadLlamaLinearWeights without
+  // touching the signature of every importer between here and it. Restored
+  // after the build.
+  // The finally restores the globals even when the load raises.
+  try
+    NeuralAllowFusedAttention := not Opt.NoFusedAttn;
+    if Opt.NoFusedAttn then
+      Notice('[--no-fused-attn: per-head attention wiring (SplitChannels/SDPA/' +
+        'DeepConcat) instead of the fused layer - bit-identical, A/B only]');
 
-  Notice('Loading ' + Opt.ModelDir + ' ...');
-  LoadStart := GetTickCount64();
-  ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
-    'config.json');
-  if ModelType = '' then ModelType := 'unknown';
-  // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
-  // forward and the KV cache (budget = CtxLen, set on the session below) holds
-  // the context. SeqLen is the cache budget, NOT the built input width.
-  NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-    {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
-  Int4DirectLayerCount := NeuralImportInt4LayerCount;
-  // --prefill-window: the width-N twin borrows NN's weights
-  // (BuildFromPretrained with pWeightOwner: one checkpoint read, no weight
-  // storage of its own) once NN's weight state is final, below. Families the
-  // Llama builder does not cover take the full second build here instead;
-  // that twin then follows every step NN takes.
-  WindowBorrowsWeights := (Opt.PrefillWindow > 0) and
-    PretrainedModelTypeCanBorrowWeights(ModelType);
-  if (Opt.PrefillWindow > 0) and (not WindowBorrowsWeights) then
-  begin
-    Notice(Format('[--prefill-window %d: model_type "%s" is outside the' +
-      ' Llama builder, so the width-%d twin is a full second build:' +
-      ' checkpoint read twice, weights held twice in RAM and on the device]',
-      [Opt.PrefillWindow, ModelType, Opt.PrefillWindow]));
-    if Opt.PrefillTailWindow > 1 then
-      Notice(Format('[--prefill-tail-window %d: no tail twin on the full' +
-        ' second build, a third copy of the weights is not worth the' +
-        ' leftover single steps]', [Opt.PrefillTailWindow]));
-    Opt.PrefillTailWindow := 1;
-    NeuralImportInt4LayerCount := 0;
-    WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
-      {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
-  end;
-  NeuralImportInt4FromQ4_0 := false;
-  // Low-memory forward path, set independently of trainability. The importer
-  // built inference-only with low memory ON (SetTrainable's pLowMemory default);
-  // honor --max-fast-memory by re-sweeping the layers, then flush each weight
-  // cache so the concatenated-weight cache is (re)built or dropped to match.
-  NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-  LastIdx := NN.GetLastLayerIdx();
-  for Cnt := 0 to LastIdx do
-    NN.Layers[Cnt].FlushWeightCache();
-  if Assigned(WindowNN) then
-  begin
-    WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-    LastIdx := WindowNN.GetLastLayerIdx();
-    for Cnt := 0 to LastIdx do
-      WindowNN.Layers[Cnt].FlushWeightCache();
-  end;
-  Notice(Format('Model loaded in %.1fs.',
-    [(GetTickCount64() - LoadStart) / 1000]));
-
-  // --int4 runs BEFORE EnableOpenCL: TNNetLayerConcatedWeights.QuantizeWeightsInt4
-  // refuses a layer that already has OpenCL enabled.
-  if Opt.WeightMode = cwmInt4 then
-  begin
-    // Counts the layers the loader already direct-loaded too: they exit
-    // QuantizeWeightsInt4 immediately and it counts them as int4.
-    Int4LayerCount := NN.QuantizeWeightsInt4();
-    // The fallback twin quantizes its own copy; a borrowing twin does not
-    // exist yet and will link NN's int4 tables as it is built.
-    if Assigned(WindowNN) then WindowNN.QuantizeWeightsInt4();
-    Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
-      ' layers (' + IntToStr(Int4DirectLayerCount) +
-      ' loaded directly from the checkpoint Q4_0 blocks, ' +
-      IntToStr(Int4LayerCount - Int4DirectLayerCount) +
-      ' requantized from int8); the other weight layers' +
-      ' stay int8; int8 input copy enabled on the int4 layers]');
-  end;
-
-  // The borrowing twin: NN's weight state is final (int8, or int4 above) and
-  // OpenCL is not enabled yet, the order TNNetLayer.LinkWeightsFrom needs.
-  // NeuralAllowFusedAttention is still the build-time value, so the twin
-  // gets the same graph. It takes no quantize step of its own (its layers
-  // borrow), only the low-memory sweep that decides its own caches.
-  if WindowBorrowsWeights then
-  begin
+    Notice('Loading ' + Opt.ModelDir + ' ...');
     LoadStart := GetTickCount64();
-    WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
-      {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
-      {pWeightOwner=}NN);
-    WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-    LastIdx := WindowNN.GetLastLayerIdx();
-    for Cnt := 0 to LastIdx do
-      WindowNN.Layers[Cnt].FlushWeightCache();
-    if Opt.PrefillTailWindow > 1 then
-    begin
-      TailNN := BuildFromPretrained(Opt.ModelDir,
-        {pSeqLen=}Opt.PrefillTailWindow, {pTrainable=}false, '',
-        {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN);
-      TailNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-      LastIdx := TailNN.GetLastLayerIdx();
-      for Cnt := 0 to LastIdx do
-        TailNN.Layers[Cnt].FlushWeightCache();
+    ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
+      'config.json');
+    if ModelType = '' then ModelType := 'unknown';
+    // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
+    // forward and the KV cache (budget = CtxLen, set on the session below) holds
+    // the context. SeqLen is the cache budget, NOT the built input width.
+    // A raising build must not leave the int4 routes on for the next load.
+    try
+      NeuralImportInt4FromQ4_0 := Opt.WeightMode = cwmInt4;
+      NeuralImportInt4FromRows := Opt.WeightMode = cwmInt4;
+      NeuralImportInt4LayerCount := 0;
+      NeuralImportInt4FromRowsLayerCount := 0;
+      NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
+        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+      Int4DirectLayerCount := NeuralImportInt4LayerCount;
+      Int4RowLayerCount := NeuralImportInt4FromRowsLayerCount;
+      // --prefill-window: the width-N twin borrows NN's weights
+      // (BuildFromPretrained with pWeightOwner: one checkpoint read, no weight
+      // storage of its own) once NN's weight state is final, below. Families the
+      // Llama builder does not cover take the full second build here instead;
+      // that twin then follows every step NN takes.
+      WindowBorrowsWeights := (Opt.PrefillWindow > 0) and
+        PretrainedModelTypeCanBorrowWeights(ModelType);
+      if (Opt.PrefillWindow > 0) and (not WindowBorrowsWeights) then
+      begin
+        Notice(Format('[--prefill-window %d: model_type "%s" is outside the' +
+          ' Llama builder, so the width-%d twin is a full second build:' +
+          ' checkpoint read twice, weights held twice in RAM and on the device]',
+          [Opt.PrefillWindow, ModelType, Opt.PrefillWindow]));
+        if Opt.PrefillTailWindow > 1 then
+          Notice(Format('[--prefill-tail-window %d: no tail twin on the full' +
+            ' second build, a third copy of the weights is not worth the' +
+            ' leftover single steps]', [Opt.PrefillTailWindow]));
+        Opt.PrefillTailWindow := 1;
+        NeuralImportInt4LayerCount := 0;
+        NeuralImportInt4FromRowsLayerCount := 0;
+        WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
+          {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+      end;
+    finally
+      NeuralImportInt4FromQ4_0 := false;
+      NeuralImportInt4FromRows := false;
     end;
-    Line := '';
-    if Assigned(TailNN) then
-      Line := Format(' and the width-%d tail twin', [Opt.PrefillTailWindow]);
-    Notice(Format('[--prefill-window %d: width-%d twin%s built in %.1fs' +
-      ' sharing the loaded weights (checkpoint read once; the twins hold' +
-      ' %d weights of their own and cost their activations only)]',
-      [Opt.PrefillWindow, Opt.PrefillWindow, Line,
-       (GetTickCount64() - LoadStart) / 1000, WindowNN.CountWeights()]));
+    // Low-memory forward path, set independently of trainability. The importer
+    // built inference-only with low memory ON (SetTrainable's pLowMemory default);
+    // honor --max-fast-memory by re-sweeping the layers, then flush each weight
+    // cache so the concatenated-weight cache is (re)built or dropped to match.
+    NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+    LastIdx := NN.GetLastLayerIdx();
+    for Cnt := 0 to LastIdx do
+      NN.Layers[Cnt].FlushWeightCache();
+    if Assigned(WindowNN) then
+    begin
+      WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+      LastIdx := WindowNN.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do
+        WindowNN.Layers[Cnt].FlushWeightCache();
+    end;
+    Notice(Format('Model loaded in %.1fs.',
+      [(GetTickCount64() - LoadStart) / 1000]));
+
+    // --int4 runs BEFORE EnableOpenCL: TNNetLayerConcatedWeights.QuantizeWeightsInt4
+    // refuses a layer that already has OpenCL enabled.
+    if Opt.WeightMode = cwmInt4 then
+    begin
+      // Counts the layers the loader already direct-loaded too: they exit
+      // QuantizeWeightsInt4 immediately and it counts them as int4.
+      Int4LayerCount := NN.QuantizeWeightsInt4();
+      // The fallback twin quantizes its own copy; a borrowing twin does not
+      // exist yet and will link NN's int4 tables as it is built.
+      if Assigned(WindowNN) then WindowNN.QuantizeWeightsInt4();
+      Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
+        ' layers (' + IntToStr(Int4DirectLayerCount) +
+        ' loaded directly from the checkpoint Q4_0 blocks, ' +
+        IntToStr(Int4RowLayerCount) +
+        ' quantized from the checkpoint rows by the loader, ' +
+        IntToStr(Int4LayerCount - Int4DirectLayerCount - Int4RowLayerCount) +
+        ' requantized from int8); the other weight layers' +
+        ' stay int8; int8 input copy enabled on the int4 layers]');
+    end;
+
+    // The borrowing twin: NN's weight state is final (int8, or int4 above) and
+    // OpenCL is not enabled yet, the order TNNetLayer.LinkWeightsFrom needs.
+    // NeuralAllowFusedAttention is still the build-time value, so the twin
+    // gets the same graph. It takes no quantize step of its own (its layers
+    // borrow), only the low-memory sweep that decides its own caches.
+    if WindowBorrowsWeights then
+    begin
+      LoadStart := GetTickCount64();
+      WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
+        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+        {pWeightOwner=}NN);
+      WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+      LastIdx := WindowNN.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do
+        WindowNN.Layers[Cnt].FlushWeightCache();
+      if Opt.PrefillTailWindow > 1 then
+      begin
+        TailNN := BuildFromPretrained(Opt.ModelDir,
+          {pSeqLen=}Opt.PrefillTailWindow, {pTrainable=}false, '',
+          {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN);
+        TailNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+        LastIdx := TailNN.GetLastLayerIdx();
+        for Cnt := 0 to LastIdx do
+          TailNN.Layers[Cnt].FlushWeightCache();
+      end;
+      Line := '';
+      if Assigned(TailNN) then
+        Line := Format(' and the width-%d tail twin', [Opt.PrefillTailWindow]);
+      Notice(Format('[--prefill-window %d: width-%d twin%s built in %.1fs' +
+        ' sharing the loaded weights (checkpoint read once; the twins hold' +
+        ' %d weights of their own and cost their activations only)]',
+        [Opt.PrefillWindow, Opt.PrefillWindow, Line,
+         (GetTickCount64() - LoadStart) / 1000, WindowNN.CountWeights()]));
+    end;
+  finally
+    NeuralAllowFusedAttention := true; // the global default
   end;
-  NeuralAllowFusedAttention := true; // restore the global default post-build
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
@@ -1733,66 +1754,53 @@ begin
   if Opt.Gpu then
   begin
     GpuCL := TEasyOpenCL.Create();
-    if GpuCL.GetPlatformCount() = 0 then
+    if not GpuCL.SelectPlatformAndDevice(Opt.GpuPlatform, Opt.GpuDevice,
+      OpenCLProblem) then
     begin
-      Notice('[--gpu: no OpenCL platform found - falling back to CPU]');
+      Notice('[--gpu: ' + OpenCLProblem + ' - falling back to CPU]');
       FreeAndNil(GpuCL);
     end
     else
     begin
-      if (Opt.GpuPlatform < 0) or
-        (Opt.GpuPlatform >= GpuCL.GetPlatformCount()) then Opt.GpuPlatform := 0;
-      GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[Opt.GpuPlatform]);
-      if GpuCL.GetDeviceCount() = 0 then
+      Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
+        ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
+      if not Opt.GpuSharedKernel then
+        Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
+          'each layer waits for its sources, so --profile charges GPU time to ' +
+          'layers instead of the queue drain; slower than shared]');
+      if Opt.WeightMode = cwmInt4 then
+        Notice('[--int4 with --gpu: cai_dot_product_int4_splitk reads the' +
+          ' packed codes at half the int8 traffic; activations stay FP32]');
+      if Opt.ExperimentalFP16 then
+        Notice('[--experimental-fp16: under construction -' +
+          ' half-precision activations in the int8 matmuls; weights stay' +
+          ' int8, logits are not bit-exact. A device that rejects' +
+          ' cai_dot_product_int8_h keeps the FP32 activations]');
+      LoadStart := GetTickCount64();
+      // Read by TNNetLayerConcatedWeights.EnableOpenCL when it acquires the
+      // half kernel, so it must be assigned before the call below: that is
+      // what sizes the half B buffer, and a later write does nothing.
+      NN.OpenCLFP16 := Opt.ExperimentalFP16;
+      NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+        GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+      if Assigned(WindowNN) then
       begin
-        Notice('[--gpu: no OpenCL device on platform ' +
-          GpuCL.PlatformNames[Opt.GpuPlatform] + ' - falling back to CPU]');
-        FreeAndNil(GpuCL);
-      end
-      else
-      begin
-        if (Opt.GpuDevice < 0) or
-          (Opt.GpuDevice >= GpuCL.GetDeviceCount()) then Opt.GpuDevice := 0;
-        Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
-          ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
-        if not Opt.GpuSharedKernel then
-          Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
-            'each layer waits for its sources, so --profile charges GPU time to ' +
-            'layers instead of the queue drain; slower than shared]');
-        if Opt.WeightMode = cwmInt4 then
-          Notice('[--int4 with --gpu: cai_dot_product_int4_splitk reads the' +
-            ' packed codes at half the int8 traffic; activations stay FP32]');
-        if Opt.ExperimentalFP16 then
-          Notice('[--experimental-fp16: under construction -' +
-            ' half-precision activations in the int8 matmuls; weights stay' +
-            ' int8, logits are not bit-exact. A device that rejects' +
-            ' cai_dot_product_int8_h keeps the FP32 activations]');
-        LoadStart := GetTickCount64();
-        // Read by TNNetLayerConcatedWeights.EnableOpenCL when it acquires the
-        // half kernel, so it must be assigned before the call below: that is
-        // what sizes the half B buffer, and a later write does nothing.
-        NN.OpenCLFP16 := Opt.ExperimentalFP16;
-        NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-          GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
-        if Assigned(WindowNN) then
-        begin
-          WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
-          // A borrowing twin must live in NN's OpenCL context to retain
-          // NN's resident codes (a context of its own cannot share cl_mem).
-          if WindowBorrowsWeights then
-            WindowNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel)
-          else
-            WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-              GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
-        end;
-        if Assigned(TailNN) then // only built when it borrows
-        begin
-          TailNN.OpenCLFP16 := Opt.ExperimentalFP16;
-          TailNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel);
-        end;
-        Notice(Format('GPU weights uploaded in %.1fs.',
-          [(GetTickCount64() - LoadStart) / 1000]));
+        WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
+        // A borrowing twin must live in NN's OpenCL context to retain
+        // NN's resident codes (a context of its own cannot share cl_mem).
+        if WindowBorrowsWeights then
+          WindowNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel)
+        else
+          WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+            GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
       end;
+      if Assigned(TailNN) then // only built when it borrows
+      begin
+        TailNN.OpenCLFP16 := Opt.ExperimentalFP16;
+        TailNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel);
+      end;
+      Notice(Format('GPU weights uploaded in %.1fs.',
+        [(GetTickCount64() - LoadStart) / 1000]));
     end;
   end;
   {$ENDIF}
