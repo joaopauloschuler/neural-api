@@ -45,6 +45,7 @@ type
   TNeuralStrBuffer = array[0..999] of AnsiChar;
   TNeuralPChar     = PAnsiChar;
   csize_t          = NativeUInt;
+  cl_ulong         = TCL_ulong;
   cl_bool          = TCL_bool;
   cl_int           = TCL_int;
   cl_uint          = TCL_uint;
