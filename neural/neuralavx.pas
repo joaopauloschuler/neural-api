@@ -282,7 +282,7 @@ procedure _AVXMulAddF( dst : PSingle; src : PSingle; N : Integer; const fact : S
 begin
   {$IFDEF TRACE}
   for var i := 0 to N - 1 do
-    dst[i] := dst[i] * src[i] + fact;
+    dst[i] := dst[i] + src[i] * fact;
   Exit;
   {$ENDIF}
 
@@ -613,7 +613,7 @@ begin
   {$ENDIF}
 end;
 
-procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
+procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer);
 begin
   {$IFDEF AVX64}
   _AVX512SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);

@@ -494,6 +494,8 @@ asm
   // Load parameters into volatile registers (they are already in RCX, RDX, R8, R9)
   // but we can use them directly; we'll move to R10/R11/R12 for clarity and to
   // preserve original values if needed (not necessary but okay).
+  // R12 is non-volatile in the Win64 ABI and must be saved/restored.
+  push r12                    // save non-volatile R12
   mov r10, rcx                // r10 = dst
   mov r11, rdx                // r11 = src
   mov r12, r8                 // r12 = z
@@ -586,6 +588,7 @@ asm
 
 @Exit:
   vzeroupper
+  pop r12
 end;
 
 procedure _AVX512MulAdd( dst : PSingle; src : PSingle; z : PSingle; N : Integer); inline;
@@ -1470,6 +1473,11 @@ end;
 -----------------------------------------------------------------------------}
 procedure _AVX2Exp(dst: PSingle; src: PSingle; N: Integer);
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   // Load parameters
   mov rax, rcx                // rax = dst
   mov rdx, rdx                // rdx = src
@@ -1586,7 +1594,10 @@ asm
   jl @TailLoop
 
 @Exit:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 end;
 
 procedure _AVX512Exp( dst : PSingle; src : PSingle; N : Integer); inline;
@@ -1609,6 +1620,11 @@ end;
 -----------------------------------------------------------------------------}
 function _AVX2DotProd(dst: PSingle; src: PSingle; N: Integer): Single;
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   // Load parameters into volatile registers
   mov rax, rcx                // rax = dst
   mov rdx, rdx                // rdx = src (already)
@@ -1699,7 +1715,10 @@ asm
   vxorps xmm0, xmm0, xmm0
 
 @Exit:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 end;
 
 function _AVX512DotProd( dst : PSingle; src : PSingle; N : Integer ) : Single; inline;
@@ -1720,6 +1739,11 @@ end;
 -----------------------------------------------------------------------------}
 function _AVX2DotProdInt8(dst: PShortInt; src: PSingle; N: Integer): Single;
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   // Load parameters into volatile registers
   mov rax, rcx                // rax = dst
   mov rdx, rdx                // rdx = src (already)
@@ -1826,7 +1850,10 @@ asm
   vxorps xmm0, xmm0, xmm0
 
 @Done:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 end;
 
 function _AVX512DotProdInt8( dst : PShortInt; src : PSingle; N : Integer ) : Single; inline;
@@ -2157,6 +2184,11 @@ end;
 -----------------------------------------------------------------------------}
 procedure _AVX2QuantizeInt8(dst: PShortInt; src: PSingle; N: Integer; const MaxAbs: Single);
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   // Load parameters into volatile registers
   mov r10, rcx                // r10 = dst
   mov r11, rdx                // r11 = src
@@ -2233,7 +2265,10 @@ asm
   jl @TailLoop
 
 @Exit:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 end;
 
 procedure _AVX512QuantizeInt8( dst : PShortInt; src : PSingle; N : Integer; const MaxAbs : Single );
@@ -2737,6 +2772,11 @@ procedure _AVX2AdamDelta(PtrDelta, PtrM, PtrV: PSingle;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: Single;
   NumElements: Integer);
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   // ---- Load pointer parameters into volatile registers ----
   mov r10, rcx                // r10 = PtrDelta
   mov r11, rdx                // r11 = PtrM
@@ -2833,7 +2873,10 @@ asm
   jl @TailLoop
 
 @Exit:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 
 end;
 
@@ -2862,6 +2905,11 @@ end;
 procedure _AVX2AdafactorDelta(PtrDelta, PtrV: PSingle;
   Beta2, k, c, Epsilon: Single; NumElements: Integer);
 asm
+  sub rsp, 32                 // allocate stack scratch
+  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp], xmm6
+  vmovups [rsp+16], xmm7
+
   mov r10, rcx
   mov r11, rdx
 
@@ -2937,7 +2985,10 @@ asm
   jl @TailLoop
 
 @Exit:
+  vmovups xmm6, [rsp]
+  vmovups xmm7, [rsp+16]
   vzeroupper
+  add rsp, 32
 end;
 
 procedure _AVX512AdafactorDelta( PtrDelta, PtrV : PSingle;
@@ -3036,16 +3087,26 @@ end;
     [RBP+72] = PosLR
     [RBP+80] = NumElements
 
-  Uses volatile high XMM registers (XMM8-XMM13) to preserve constants.
-  Non-volatile YMM6 and YMM7 are saved/restored.
+  Uses volatile high XMM registers (XMM8-XMM15) to preserve constants.
+  Non-volatile YMM6/YMM7 and XMM8-XMM15 (low 128 bits) are saved/restored.
 -----------------------------------------------------------------------------}
 procedure _AVX2LionDelta(PtrDelta, PtrM: PSingle;
   Beta1, k1, Beta2, k2, NegLR, PosLR: Single;
   NumElements: Integer);
 asm
-  sub rsp, 64
+  sub rsp, 192
   vmovups [rsp], ymm6
   vmovups [rsp+32], ymm7
+
+  // Save non-volatile XMM8-XMM15 (low 128 bits; upper YMM halves are volatile)
+  vmovups [rsp+64],  xmm8
+  vmovups [rsp+80],  xmm9
+  vmovups [rsp+96],  xmm10
+  vmovups [rsp+112], xmm11
+  vmovups [rsp+128], xmm12
+  vmovups [rsp+144], xmm13
+  vmovups [rsp+160], xmm14
+  vmovups [rsp+176], xmm15
 
   vmovaps xmm8, xmm2          // Beta1
   vmovaps xmm9, xmm3          // k1
@@ -3113,7 +3174,7 @@ asm
   test edx, edx
   jz @Exit
 
-  // ÖØÐÂ¼ÓÔØÎ²²¿³£Á¿£¨È·±£ÕýÈ·ÐÔ£©
+  // ï¿½ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Î²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È·ï¿½ï¿½ï¿½ï¿½È·ï¿½Ô£ï¿½
   vmovss xmm14, [rbp+48]      // Beta2
   vmovss xmm15, [rbp+56]      // k2
 
@@ -3122,7 +3183,7 @@ asm
   vmovss xmm0, [r10 + rcx*4]  // g
   vmovss xmm1, [r11 + rcx*4]  // m
 
-  // ±£´æ g µ½ xmm2 (Ê¹ÓÃ vmovaps ¸´ÖÆ)
+  // ï¿½ï¿½ï¿½ï¿½ g ï¿½ï¿½ xmm2 (Ê¹ï¿½ï¿½ vmovaps ï¿½ï¿½ï¿½ï¿½)
   vmovaps xmm2, xmm0
 
   // c = Beta1*m + k1*g
@@ -3145,7 +3206,7 @@ asm
 @StoreDelta:
   vmovss [r10 + rcx*4], xmm0
 
-  // m_new = Beta2*m + k2*g (Ê¹ÓÃ±£´æµÄ g ÔÚ xmm2)
+  // m_new = Beta2*m + k2*g (Ê¹ï¿½Ã±ï¿½ï¿½ï¿½ï¿½ g ï¿½ï¿½ xmm2)
   vmovss xmm0, [r11 + rcx*4]  // m (reload)
   vmulss xmm0, xmm0, xmm14
   vmulss xmm2, xmm2, xmm15
@@ -3160,7 +3221,18 @@ asm
   vzeroupper
   vmovups ymm6, [rsp]
   vmovups ymm7, [rsp+32]
-  add rsp, 64
+
+  // Restore non-volatile XMM8-XMM15
+  vmovups xmm8,  [rsp+64]
+  vmovups xmm9,  [rsp+80]
+  vmovups xmm10, [rsp+96]
+  vmovups xmm11, [rsp+112]
+  vmovups xmm12, [rsp+128]
+  vmovups xmm13, [rsp+144]
+  vmovups xmm14, [rsp+160]
+  vmovups xmm15, [rsp+176]
+
+  add rsp, 192
 end;
 
 procedure _AVX512LionDelta( PtrDelta, PtrM : PSingle; Beta1, k1, Beta2, k2, NegLR, PosLR : Single; NumElements : Integer ); inline;
@@ -3269,14 +3341,15 @@ asm
 
   // r10 already points to the start of tail (after bulk loop)
   // Base index for tail = bulk count (32-bit)
-  mov edi, [rsp+8]            // edi = bulk count (32-bit)
+  mov r11d, [rsp+8]           // r11d = bulk count (32-bit; R11 is volatile, RDI was clobbered here)
   xor ecx, ecx                // ecx = tail index (32-bit)
 @TailLoop:
   vmovss xmm1, [r10 + rcx*4]
   comiss xmm1, xmm0
   jbe @TailSkip
   movaps xmm0, xmm1           // update max
-  lea eax, [edi + ecx]        // new position = bulk_count + tail_index (both 32-bit)
+  mov eax, r11d               // new position = bulk_count + tail_index (both 32-bit)
+  add eax, ecx
 @TailSkip:
   inc ecx
   cmp ecx, edx
@@ -3421,14 +3494,15 @@ asm
 
   // r10 already points to the start of tail (after bulk loop)
   // Base index for tail = bulk count (32-bit)
-  mov edi, [rsp+8]            // edi = bulk count (32-bit)
+  mov r11d, [rsp+8]           // r11d = bulk count (32-bit; R11 is volatile, RDI was clobbered here)
   xor ecx, ecx                // ecx = tail index (32-bit)
 @TailLoop:
   vmovss xmm1, [r10 + rcx*4]
   comiss xmm1, xmm0
   jae @TailSkip               // if >=, skip (keep first occurrence)
   movaps xmm0, xmm1           // update min
-  lea eax, [edi + ecx]        // new position = bulk_count + tail_index (both 32-bit)
+  mov eax, r11d               // new position = bulk_count + tail_index (both 32-bit)
+  add eax, ecx
 @TailSkip:
   inc ecx
   cmp ecx, edx
@@ -3601,7 +3675,7 @@ asm
 
   // r10 already points to start of tail (after bulk loop)
   // Base index for tail = bulk count (32-bit)
-  mov edi, [rsp+72]           // edi = bulk count (32-bit)
+  mov r11d, [rsp+72]          // r11d = bulk count (32-bit; R11 is volatile, RDI was clobbered here)
   xor ecx, ecx                // ecx = tail index (32-bit)
 
   // Reload absolute mask into xmm2 (low 128-bit)
@@ -3613,7 +3687,8 @@ asm
   comiss xmm1, xmm0
   jbe @TailSkip                // if <=, keep first occurrence
   movaps xmm0, xmm1            // update max
-  lea eax, [edi + ecx]         // new position = bulk_count + tail_index
+  mov eax, r11d               // new position = bulk_count + tail_index
+  add eax, ecx
 @TailSkip:
   inc ecx
   cmp ecx, edx
@@ -4148,6 +4223,8 @@ end;
 procedure _AVX2SinCos(dst: PSingle; src: PSingle; N: integer; DoCos: integer);
 asm
   sub rsp, 128
+  vmovups [rsp+96], xmm6      // save non-volatile XMM6/XMM7
+  vmovups [rsp+112], xmm7
   mov [rsp+4], r9d            // save DoCos
 
   mov r10, rcx                // dst
@@ -4378,6 +4455,8 @@ asm
   jl @TailLoop
 
 @Exit:
+  vmovups xmm6, [rsp+96]      // restore non-volatile XMM6/XMM7
+  vmovups xmm7, [rsp+112]
   vzeroupper
   add rsp, 128
 end;
@@ -4395,11 +4474,17 @@ end;
     R8  = N   : integer
   Processes 8 elements per loop (YMM), scalar tail.
   Uses integer operations exclusively; no MXCSR dependency.
-  All registers used are volatile (YMM0-YMM5, XMM0-XMM5).
+  All registers used are volatile (YMM0-YMM5, XMM0-XMM5) except YMM6/YMM7,
+  XMM6/XMM7 and RBX, which are saved/restored.
   vzeroupper called before exit.
 -----------------------------------------------------------------------------}
 procedure _AVX2EncodeBF16(dst: PSingle; src: PSingle; N: integer);
 asm
+  push rbx                    // save non-volatile RBX
+  // Save non-volatile XMM6/XMM7 into caller shadow space (RSP shifted by push)
+  vmovups [rsp+16], xmm6
+  vmovups [rsp+32], xmm7
+
   // ---- Load parameters ----
   mov r10, rcx                // r10 = dst (Word pointer)
   mov r11, rdx                // r11 = src
@@ -4524,6 +4609,9 @@ asm
   jl @ScalarLoop
 
 @Exit:
+  vmovups xmm6, [rsp+16]      // restore non-volatile XMM6/XMM7
+  vmovups xmm7, [rsp+32]
+  pop rbx
   vzeroupper
 end;
 
