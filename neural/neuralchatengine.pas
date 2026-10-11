@@ -2717,6 +2717,7 @@ var
   TStart, TPrefillEnd, TFirst, TEnd: QWord;
   Produced: integer;
   DecodeSecs: double;
+  TotalEngineMs: double;       // TotalInputMs + TotalOutputMs, for the shares
   // --stats per-phase split of one decode step, accumulated over the loop in
   // ms: the net forward, the logits row copy + softmax, the processor chain
   // (repetition penalty), the sampler, the detokenize + emit, and the rest.
@@ -3370,16 +3371,26 @@ begin
          (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
          StepMs / Produced]));
       // TotalInputTokens > 0 here: this turn produced, so it added PromptLen.
+      // The input and output shares split the engine time; they sum to 100%.
+      TotalEngineMs := TotalInputMs + TotalOutputMs;
       Write(StdErr, Format('[stats] total input: %d tokens (cached %d, %.1f%%),' +
         ' %.1f s', [TotalInputTokens, TotalCachedInputTokens,
         TotalCachedInputTokens * 100.0 / TotalInputTokens,
         TotalInputMs / 1000.0]));
+      if TotalEngineMs > 0 then
+        Write(StdErr, Format(' (%.1f%%)', [TotalInputMs * 100.0 / TotalEngineMs]));
       if TotalInputMs > 0 then
         Write(StdErr, Format(', %.1f avg. input tok/s',
           [TotalInputTokens * 1000.0 / TotalInputMs]));
       WriteLn(StdErr);
-      WriteLn(StdErr, Format('[stats] total output: %d tokens, %.1f s',
+      Write(StdErr, Format('[stats] total output: %d tokens, %.1f s',
         [TotalOutputTokens, TotalOutputMs / 1000.0]));
+      if TotalEngineMs > 0 then
+        Write(StdErr, Format(' (%.1f%%)', [TotalOutputMs * 100.0 / TotalEngineMs]));
+      if TotalOutputMs > 0 then
+        Write(StdErr, Format(', %.1f avg. output tok/s',
+          [TotalOutputTokens * 1000.0 / TotalOutputMs]));
+      WriteLn(StdErr);
       Flush(StdErr);
     end;
     // --profile: per-layer-class forward timing accumulated over this call's
