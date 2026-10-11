@@ -1,0 +1,26 @@
+{
+  "do_convert_rgb": true,
+  "do_normalize": true,
+  "do_rescale": true,
+  "do_resize": true,
+  "image_mean": [
+    0.5,
+    0.45,
+    0.4
+  ],
+  "image_std": [
+    0.25,
+    0.3,
+    0.35
+  ],
+  "image_processor_type": "Qwen2VLImageProcessorFast",
+  "merge_size": 2,
+  "patch_size": 16,
+  "resample": 3,
+  "rescale_factor": 0.00392156862745098,
+  "size": {
+    "longest_edge": 16777216,
+    "shortest_edge": 1024
+  },
+  "temporal_patch_size": 2
+}

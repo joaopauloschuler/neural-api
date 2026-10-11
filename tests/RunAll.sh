@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build and run the full test suite. Exits non-zero on any test failure.
+# NEURAL_SLOW_TESTS=1 ./RunAll.sh also runs the slow end-to-end tests
+# (suite TTestNeuralPretrainedSlow), which are skipped by default.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

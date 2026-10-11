@@ -9,6 +9,7 @@ CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and
 
 ## Highlights
 * 🗣️ **Run real LLMs, natively** — import a HuggingFace instruct checkpoint (Qwen2.5/Qwen3/Qwen3.8, Llama, Mistral, Phi-3, OLMoE) and chat from your terminal with [`ChatTerminal`](examples/ChatTerminal), or serve the same checkpoint over an OpenAI-style HTTP endpoint with [`ChatServer`](examples/ChatTerminal), so any OpenAI client or SDK can call it. No Python, no CUDA.
+* 🎨 **Text-to-image** — turn a text prompt into a 1024x1024 image with [`QwenImage`](examples/QwenImage) (Qwen-Image-2.1: Qwen3-VL text encoder, 7B MMDiT transformer, VAE decoder; int8/int4 weights, OpenCL GPU by default).
 * 🎵 **Text-to-music** — turn a text prompt into audio with [`MusicGenText`](examples/MusicGenText) (T5 encoder + MusicGen decoder).
 * 🔊 **More audio** — separate a song into stems with [`MusicSourceSeparation`](examples/MusicSourceSeparation), or talk to an audio-aware model with [`Qwen2AudioChat`](examples/Qwen2AudioChat).
 * 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.

@@ -29,6 +29,10 @@ Outputs (all under tests/fixtures/):
   tiny_qwenimage21_pipeline_io.json        A7: pico pipeline, fixed latents and
                                            fixed prompt embeds (32x64)
   tiny_qwenimage21_pipeline_64_io.json     A7: the same at 64x64
+  tiny_qwenimage21/processor/preprocessor_config.json   C1a: pico image processor
+  tiny_qwenimage21_vision_io.json          C1a: vision tower (pixel values,
+                                           positions, RoPE, block 0, DeepStack,
+                                           merged tokens), smart_resize cases
 
 Precision. Weights are rounded to their storage dtype (BF16 for the text
 encoder and transformer, F32 for the VAE) and every forward then runs in
@@ -122,6 +126,42 @@ TE_VOCAB = 300
 TE_MROPE_SECTION = [4, 2, 2]          # sums to TE_HEAD_DIM / 2, like [24, 20, 20]
 TE_TOKEN_IDS = [(37 * i + 11) % TE_VOCAB for i in range(14)]
 TE_DROP_IDX = 5                       # stands in for the system-prompt length
+
+# The vision tower of the first fixture: kept only to replay the random stream,
+# so the text weights stay byte-identical after the vision tower changed.
+LEGACY_VISION_CONFIG = {
+    "deepstack_visual_indexes": [0], "depth": 1, "dtype": "bfloat16",
+    "hidden_act": "gelu_pytorch_tanh", "hidden_size": 16, "in_channels": 3,
+    "initializer_range": 0.02, "intermediate_size": 32, "model_type": "qwen3_vl",
+    "num_heads": 2, "num_position_embeddings": 16, "out_hidden_size": TE_HIDDEN,
+    "patch_size": 4, "spatial_merge_size": 2, "temporal_patch_size": 2,
+}
+# C1a: the real patch 16 (4 vision slots per 2x2 merge = 4 VAE latents of 16x16
+# pixels), three blocks with DeepStack after blocks 0 and 2, a 3x3 position
+# table so every pico grid interpolates between table rows.
+VISION_CONFIG = {
+    "deepstack_visual_indexes": [0, 2], "depth": 3, "dtype": "bfloat16",
+    "hidden_act": "gelu_pytorch_tanh", "hidden_size": 32, "in_channels": 3,
+    "initializer_range": 0.02, "intermediate_size": 48, "model_type": "qwen3_vl",
+    "num_heads": 2, "num_position_embeddings": 9, "out_hidden_size": TE_HIDDEN,
+    "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+}
+VISION_SEED = 20261004
+# processor/preprocessor_config.json in the real Qwen3-VL layout; pico mean, std
+# and shortest_edge (the real shortest_edge would upscale a 64x64 image).
+PREPROCESSOR_CONFIG = {
+    "do_convert_rgb": True, "do_normalize": True, "do_rescale": True, "do_resize": True,
+    "image_mean": [0.5, 0.45, 0.4], "image_std": [0.25, 0.3, 0.35],
+    "image_processor_type": "Qwen2VLImageProcessorFast", "merge_size": 2, "patch_size": 16,
+    "resample": 3, "rescale_factor": 0.00392156862745098,
+    "size": {"longest_edge": 16777216, "shortest_edge": 1024}, "temporal_patch_size": 2,
+}
+# (width, height, mode): RGBA goes through the pipeline's white composite; the
+# 2x2-patch RGB image has a grid smaller than the 3x3 position table.
+VISION_IMAGES = [(64, 64, "RGBA"), (96, 64, "RGBA"), (32, 32, "RGB")]
+SMART_RESIZE_CASES = [(64, 96, 32, 1024, 16777216), (1000, 700, 32, 65536, 16777216),
+                      (50, 70, 32, 65536, 16777216), (4000, 3000, 32, 65536, 1048576),
+                      (17, 3000, 32, 1024, 16777216), (1024, 1024, 32, 65536, 16777216)]
 
 TR_LAYERS = 2
 TR_HEADS = 2
@@ -237,6 +277,22 @@ def qwen3vl_plain_rope_f64(self, x, position_ids):
     return (emb.cos() * self.attention_scaling).to(x.dtype), (emb.sin() * self.attention_scaling).to(x.dtype)
 
 
+def qwen3vl_vision_rope_f64(self, x, position_ids):
+    base = self.config.rope_parameters["rope_theta"]
+    spatial_dim = (self.config.hidden_size // self.config.num_heads) // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, spatial_dim, 2, dtype=torch.float64) / spatial_dim))
+    freqs = position_ids[..., None].to(torch.float64) * inv_freq
+    return self.recomposition_frequencies(freqs.cos()), self.recomposition_frequencies(freqs.sin())
+
+
+def apply_rotary_pos_emb_vision_f64(q, k, cos, sin):
+    cos, sin = cos.unsqueeze(-2).to(torch.float64), sin.unsqueeze(-2).to(torch.float64)
+    q64, k64 = q.to(torch.float64), k.to(torch.float64)
+    rotate_half = qwen3vl_module.rotate_half
+    return ((q64 * cos + rotate_half(q64) * sin).to(q.dtype),
+            (k64 * cos + rotate_half(k64) * sin).to(k.dtype))
+
+
 SHIM_TARGETS = [
     (diffusers_normalization.RMSNorm, "forward", diffusers_rmsnorm_f64),
     (transformer_module.QwenImage21ZeroCenterRMSNorm, "forward", zero_center_rmsnorm_f64),
@@ -246,6 +302,8 @@ SHIM_TARGETS = [
     (vae_module.QwenImage21Upsample, "forward", vae_upsample_f64),
     (qwen3vl_module.Qwen3VLTextRMSNorm, "forward", qwen3vl_rmsnorm_f64),
     (qwen3vl_module.Qwen3VLTextRotaryEmbedding, "forward", qwen3vl_mrope_f64),
+    (qwen3vl_module.Qwen3VLVisionRotaryEmbedding, "forward", qwen3vl_vision_rope_f64),
+    (qwen3vl_module, "apply_rotary_pos_emb_vision", apply_rotary_pos_emb_vision_f64),
 ]
 ORIGINALS = {(owner, name): getattr(owner, name) for owner, name, _ in SHIM_TARGETS}
 
@@ -368,8 +426,10 @@ def make_scheduler_oracle():
 
 
 # ---------------- A2: text encoder ----------------
-def text_encoder_config():
+def text_encoder_config(vision_config=None):
     """The real text_encoder/config.json layout with pico sizes."""
+    if vision_config is None:
+        vision_config = VISION_CONFIG
     return {
         "architectures": ["Qwen3VLForConditionalGeneration"],
         "dtype": "bfloat16",
@@ -401,23 +461,7 @@ def text_encoder_config():
         "tie_word_embeddings": False,
         "transformers_version": "4.57.1",
         "video_token_id": 291,
-        "vision_config": {
-            "deepstack_visual_indexes": [0],
-            "depth": 1,
-            "dtype": "bfloat16",
-            "hidden_act": "gelu_pytorch_tanh",
-            "hidden_size": 16,
-            "in_channels": 3,
-            "initializer_range": 0.02,
-            "intermediate_size": 32,
-            "model_type": "qwen3_vl",
-            "num_heads": 2,
-            "num_position_embeddings": 16,
-            "out_hidden_size": TE_HIDDEN,
-            "patch_size": 4,
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 2,
-        },
+        "vision_config": vision_config,
         "vision_end_token_id": 293,
         "vision_start_token_id": 292,
     }
@@ -444,8 +488,19 @@ def last_layer_before_norm(model, input_ids):
 def make_text_encoder():
     config_dict = text_encoder_config()
     torch.manual_seed(1)
+    # The text weights come from the legacy model's random stream (the visual
+    # parameters come first in it); the vision tower has a stream of its own.
+    legacy = Qwen3VLForConditionalGeneration(
+        Qwen3VLConfig(**text_encoder_config(LEGACY_VISION_CONFIG))).to(torch.float64).eval()
+    randomize_parameters(legacy, 20260923, norm_suffixes=("layernorm.weight", "norm.weight"))
+    rng_state = torch.get_rng_state()
     model = Qwen3VLForConditionalGeneration(Qwen3VLConfig(**config_dict)).to(torch.float64).eval()
-    randomize_parameters(model, 20260923, norm_suffixes=("layernorm.weight", "norm.weight"))
+    torch.set_rng_state(rng_state)
+    model.model.language_model.load_state_dict(legacy.model.language_model.state_dict())
+    model.lm_head.load_state_dict(legacy.lm_head.state_dict())
+    del legacy
+    randomize_parameters(model.model.visual, VISION_SEED,
+                         norm_suffixes=("norm1.weight", "norm2.weight", "norm.weight"))
     round_parameters(model, torch.bfloat16)
 
     out_dir = os.path.join(PICO_DIR, "text_encoder")
@@ -535,6 +590,131 @@ def make_prompt_token_oracle(processor_dir):
                 "reach it). drop_idx = len(apply_chat_template(system message)), as the pipeline computes it.",
     })
     return len(sys_tokens)
+
+
+# ---------------- C1a: vision tower ----------------
+def vision_formula_image(width, height, channels):
+    """uint8, every value ((i * 7919 + 13) mod 256), i = row-major (y, x, channel) index."""
+    flat = (np.arange(height * width * channels, dtype=np.int64) * 7919 + 13) % 256
+    return flat.astype(np.uint8).reshape(height, width, channels)
+
+
+def vision_block_major_rows_cols(grid_h, grid_w, merge):
+    index = torch.arange(grid_h * grid_w)
+    blocks_w = grid_w // merge
+    row = (index // (merge * merge * blocks_w)) * merge + (index // merge) % merge
+    col = ((index // (merge * merge)) % blocks_w) * merge + index % merge
+    return row, col
+
+
+def vision_interpolation_f64(grid_h, grid_w, side, merge):
+    """transformers' bilinear align_corners=True taps and weights, in float64."""
+    row, col = vision_block_major_rows_cols(grid_h, grid_w, merge)
+
+    def axis(index, size):
+        src = index.to(torch.float64) * (side - 1) / max(size - 1, 1)
+        floor = torch.floor(src)
+        offsets = torch.arange(2)
+        taps = (floor.long()[:, None] + offsets).clamp(0, side - 1)
+        weights = (1 - (src[:, None] - floor[:, None] - offsets).abs()).clamp(min=0)
+        return taps, weights
+
+    h_taps, h_weights = axis(row, grid_h)
+    w_taps, w_weights = axis(col, grid_w)
+    indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, 4)
+    weights = (h_weights[:, :, None] * w_weights[:, None, :]).reshape(-1, 4)
+    return indices, weights
+
+
+def float32_json(x):
+    """Shortest float32 text of every value (processor outputs are float32)."""
+    x = np.asarray(x, dtype=np.float32)
+    return {"shape": list(x.shape), "data": [float(str(v)) for v in x.reshape(-1)]}
+
+
+def make_vision_oracle(model):
+    from PIL import Image
+    from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import (Qwen2VLImageProcessorPil,
+                                                                             smart_resize)
+    processor_dir = os.path.join(PICO_DIR, "processor")
+    os.makedirs(processor_dir, exist_ok=True)
+    with open(os.path.join(processor_dir, "preprocessor_config.json"), "w") as f:
+        json.dump(PREPROCESSOR_CONFIG, f, indent=2)
+    processor = Qwen2VLImageProcessorPil(**{k: v for k, v in PREPROCESSOR_CONFIG.items()
+                                            if k != "image_processor_type"})
+    visual = model.model.visual
+    vision = VISION_CONFIG
+    side = int(round(vision["num_position_embeddings"] ** 0.5))
+    merge = vision["spatial_merge_size"]
+    heads = vision["num_heads"]
+    head_dim = vision["hidden_size"] // heads
+    gen = torch.Generator().manual_seed(23)
+    images = []
+    for width, height, mode in VISION_IMAGES:
+        image = Image.fromarray(vision_formula_image(width, height, len(mode)), mode)
+        if mode == "RGBA":
+            # The pipeline's composite over white (pipeline_qwenimage21.py).
+            white = Image.new("RGB", image.size, (255, 255, 255))
+            white.paste(image, mask=image.getchannel("A"))
+            image = white
+        inputs = processor(images=[image], return_tensors="pt")
+        pixel_values = inputs["pixel_values"]
+        grid_thw = inputs["image_grid_thw"]
+        _, grid_h, grid_w = grid_thw[0].tolist()
+        assert (grid_h, grid_w) == (height // vision["patch_size"], width // vision["patch_size"])
+        frames = pixel_values.reshape(grid_h * grid_w, 3, vision["temporal_patch_size"], -1)
+        assert torch.equal(frames[:, :, 0], frames[:, :, 1])
+        indices, weights = vision_interpolation_f64(grid_h, grid_w, side, merge)
+        native_indices, native_weights = transformers.vision_utils.get_vision_interpolation_indices_and_weights(
+            grid_thw, num_grid_per_side=side, mode="bilinear", align_corners=True, spatial_merge_size=merge)
+        assert torch.equal(indices, native_indices)
+        pixels64 = pixel_values.to(torch.float64)
+        block_outputs = []
+        hook = visual.blocks[0].register_forward_hook(lambda m, a, o: block_outputs.append(o))
+        with torch.no_grad():
+            pos_embeds = (visual.pos_embed(indices) * weights[:, :, None]).sum(1)
+            result = visual(pixels64, grid_thw=grid_thw, interp_indices=indices, interp_weights=weights)
+            with NativeReference():
+                native = visual(pixels64, grid_thw=grid_thw)
+            position_ids = torch.stack(vision_block_major_rows_cols(grid_h, grid_w, merge), dim=-1)
+            assert torch.equal(position_ids, transformers.vision_utils.get_vision_position_ids(grid_thw, merge))
+            query = torch.randn(grid_h * grid_w, heads, head_dim, generator=gen, dtype=torch.float64)
+            cos, sin = visual.rotary_pos_emb(query, position_ids)
+            rotated = qwen3vl_module.apply_rotary_pos_emb_vision(query, query, cos, sin)[0]
+        hook.remove()
+        merged = result.pooler_output
+        case = {
+            "width": width, "height": height, "channels": len(mode),
+            "grid_thw": [1, grid_h, grid_w],
+            "position_ids": tensor_json(position_ids),
+            "pos_embeds": tensor_json(pos_embeds),
+            "rope_query": tensor_json(query),
+            "rope_rotated": tensor_json(rotated),
+            "block0_output": tensor_json(block_outputs[0]),
+            "deepstack": [tensor_json(feature) for feature in result.deepstack_features],
+            "merged": tensor_json(merged),
+            "interp_weights_native_maxabs_diff": max_abs_diff(weights, native_weights),
+            "native_hf_maxabs_diff": max_abs_diff(merged, native.pooler_output),
+        }
+        if width != height or mode == "RGB":
+            case["pixel_values_frame0"] = float32_json(frames[:, :, 0].reshape(grid_h * grid_w, -1))
+        images.append(case)
+    write_json("tiny_qwenimage21_vision_io.json", {
+        "vision_config": vision,
+        "preprocessor_config": PREPROCESSOR_CONFIG,
+        "images": images,
+        "smart_resize": [{"height": h, "width": w, "factor": fac, "min_pixels": lo, "max_pixels": hi,
+                          "result": list(smart_resize(h, w, fac, lo, hi))}
+                         for h, w, fac, lo, hi in SMART_RESIZE_CASES],
+        "note": "Image i: uint8 value ((i*7919+13) mod 256) over the row-major (y, x, channel) "
+                "index; RGBA images composited over white with PIL paste (the pipeline), then "
+                "Qwen2VLImageProcessorPil with preprocessor_config. Patches are block-major (the 4 "
+                "patches of a 2x2 merge group are consecutive). pixel_values_frame0: frame 0 of each "
+                "processor row (C, 16, 16), float32; frame 1 is identical. position_ids: (row, col) "
+                "per patch. pos_embeds: the interpolated table rows (float64 taps/weights). "
+                "rope_rotated: apply_rotary_pos_emb_vision of rope_query (patch, head, head_dim) at "
+                "position_ids. block0_output, deepstack[k], merged: model.model.visual in float64.",
+    })
 
 
 # ---------------- A3: RoPE ----------------
@@ -921,6 +1101,7 @@ def main():
     # Last, so every fixture above is unchanged by its addition.
     make_pipeline_oracle(transformer, vae, text_encoder, embeds, PIPE_64_SIZE, PIPE_64_SIZE,
                          "tiny_qwenimage21_pipeline_64_io.json")
+    make_vision_oracle(text_encoder)
     print(f"time_conv calls during a single-image decode: {time_conv_calls}")
 
 

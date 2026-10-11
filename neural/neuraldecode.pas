@@ -1172,10 +1172,12 @@ type
   // requantized, so the fork adds no error on top of the int8 cache's own
   // lossiness vs FP32. The
   // shape contract is the source and destination sessions wrap the SAME
-  // architecture at the SAME MaxCacheLen (the natural case: one twin built once,
-  // or two twins CopyWeights'd from the same trained net). Disk persistence of a
-  // snapshot (a system-prompt cache on disk) is a documented follow-up; this is
-  // the in-memory fork. Coded by Claude (AI).
+  // architecture (the natural case: one twin built once, or two twins
+  // CopyWeights'd from the same trained net) and the destination's MaxCacheLen
+  // holds the captured length. Only the live cache rows are held, so a
+  // snapshot's memory follows its longest capture, not MaxCacheLen. Disk
+  // persistence of a snapshot (a system-prompt cache on disk) is a documented
+  // follow-up; this is the in-memory fork. Coded by Claude (AI).
   TNNetDecoderSessionSnapshot = class(TObject)
   private
     FK: array of TNNetVolume;        // per-attention-layer cached keys (deep copy)
@@ -1193,11 +1195,18 @@ type
     FSteps: array of integer;        // per-SSM-layer step count
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
+    function GetCacheLength(): integer;
   public
     destructor Destroy(); override;
+    // Releases every captured volume; the next SnapshotInto allocates again.
+    procedure Clear();
+    // Host bytes held by the captured volumes (K/V rows, int8 scales, states).
+    function Bytes(): int64;
     // Number of attention / SSM layers captured (diagnostics / tests).
     property SDPACount: integer read GetSDPACount;
     property SSMCount: integer read GetSSMCount;
+    // Live cache rows of the first attention layer at capture; 0 without one.
+    property CacheLength: integer read GetCacheLength;
   end;
 
   // TNNetDecoderStateCheckpoint: the recurrent half of a TNNetStreamingDecoder's
@@ -1418,13 +1427,14 @@ type
     // continues EXACTLY where the snapshot was taken; restoring is BIT-IDENTICAL
     // to a fresh prefill of the whole snapshotted prefix. The snapshot is an
     // independent copy, so it can be restored into many sessions (the per-request
-    // fork, and the per-hypothesis fork the KV-cache beam task wants). The
-    // snapshot must come from a session wrapping the SAME architecture at the
-    // SAME MaxCacheLen (e.g. the same twin, or twins CopyWeights'd from one net).
+    // fork, and the per-hypothesis fork the KV-cache beam task wants). Same
+    // architecture only; the destination's MaxCacheLen must hold the captured
+    // rows and Sinks+Window, else RestoreSnapshot raises before writing.
     function Snapshot(): TNNetDecoderSessionSnapshot;
-    // Same capture into a snapshot the caller owns: its volumes are reused
-    // when the shapes match, so a repeated capture allocates nothing.
-    procedure SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
+    // Same capture into a snapshot the caller owns. K/V volumes hold at least
+    // Max(live rows, MinCapacityRows) rows and grow only when too small.
+    procedure SnapshotInto(Snap: TNNetDecoderSessionSnapshot;
+      MinCapacityRows: integer = 0);
     procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
     // CACHE CHECKPOINTS (the recurrent half only; see
     // TNNetDecoderStateCheckpoint). SizeStateCheckpoint allocates Chk's
@@ -1480,6 +1490,10 @@ function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat
 // Numerically-safe natural log of a probability (clamps tiny / zero probs so a
 // dead-but-not-impossible token never produces -Inf and poisons the sum).
 function SafeLogProb(P: TNeuralFloat): TNeuralFloat;
+
+// The splitmix64 output function: adds the golden gamma, then mixes. A fast,
+// well-mixing 64-bit hash, bijective on UInt64.
+function SplitMix64(X: UInt64): UInt64;
 
 // WATERMARK DETECTION (Kirchenbauer et al. 2023). Given a candidate token
 // sequence and the same (Key, Gamma) the generator used, recomputes the green
@@ -5600,16 +5614,13 @@ begin
   AppendToken(TokenId);
 end;
 
-{ TNNetWatermarkLogitsProcessor }
-
-// One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
-// Used as the deterministic green-list PRNG so the partition is bit-identical
-// in the processor and in DetectWatermark.
 // The add/multiply steps wrap around UInt64 on purpose: checks stay off here
-// even in debug builds, where -Co would turn the wrap into EIntOverflow.
+// even in debug builds, where -Co would turn the wrap into EIntOverflow. The
+// watermark uses it as its green-list PRNG, so the partition is bit-identical
+// in the processor and in DetectWatermark.
 {$PUSH}
 {$Q-}{$R-}
-function WatermarkSplitMix64(X: UInt64): UInt64;
+function SplitMix64(X: UInt64): UInt64;
 begin
   X := X + UInt64($9E3779B97F4A7C15);
   X := (X xor (X shr 30)) * UInt64($BF58476D1CE4E5B9);
@@ -5618,8 +5629,10 @@ begin
 end;
 {$POP}
 
+{ TNNetWatermarkLogitsProcessor }
+
 // Green-list membership for a token given the ALREADY-COMPUTED per-step seed
-// (= WatermarkSplitMix64(UInt32(PrevToken) xor Key)). Factored out so a caller
+// (= SplitMix64(UInt32(PrevToken) xor Key)). Factored out so a caller
 // scanning the whole vocab for one (PrevToken, Key) can hoist that first mix
 // out of the loop instead of repeating it per token. The Seed+TokenId sum
 // wraps around UInt64 by design; checks stay off (debug -Co safe).
@@ -5633,7 +5646,7 @@ end;
 function WatermarkGreenFromSeedThresh(Seed: UInt64; TokenId: integer;
   GammaThresh: double): boolean;
 begin
-  Result := (WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId))) shr 11) < GammaThresh;
+  Result := (SplitMix64(Seed + UInt64(UInt32(TokenId))) shr 11) < GammaThresh;
 end;
 
 function WatermarkGreenFromSeed(Seed: UInt64; TokenId: integer;
@@ -5677,7 +5690,7 @@ begin
   // "left-hash" rule of Kirchenbauer et al.); mixing once decorrelates
   // adjacent seeds. The token id is folded in and finalized so each token's
   // membership is an independent uniform draw in [0,1); green iff below Gamma.
-  Seed := WatermarkSplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
+  Seed := SplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
   Result := WatermarkGreenFromSeed(Seed, TokenId, Gamma);
 end;
 {$POP}
@@ -5708,7 +5721,7 @@ begin
   ExpDelta := FExpDelta;
   // The per-step PRNG seed depends only on (FPrevToken, FKey) - invariant
   // across the vocab - so mix it once here instead of inside IsGreen per token.
-  Seed := WatermarkSplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
+  Seed := SplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
   // #5: Gamma*2^53 threshold is invariant across the vocab - hoist once so the
   // per-token green test is an integer compare with no divide.
   GammaThresh := FGamma * 9007199254740992.0; // 2^53
@@ -5928,26 +5941,58 @@ end;
 { TNNetDecoderSessionSnapshot }
 
 destructor TNNetDecoderSessionSnapshot.Destroy();
-var
-  i, HiK, HiV, HiH: integer;
 begin
-  HiK := High(FK);
-  HiV := High(FV);
-  HiH := High(FH);
-  for i := 0 to HiK do FK[i].Free;
-  for i := 0 to HiV do FV[i].Free;
-  for i := 0 to HiH do FH[i].Free;
+  Clear();
+  inherited Destroy();
+end;
+
+procedure TNNetDecoderSessionSnapshot.Clear();
+var
+  i, MaxLayerPos: integer;
+begin
   // Only one of the FP32 / int8 pairs is populated per layer; the other holds
   // nil, and Free on nil is a no-op.
-  for i := 0 to High(FKQ) do FKQ[i].Free;
-  for i := 0 to High(FVQ) do FVQ[i].Free;
+  MaxLayerPos := High(FK);
+  for i := 0 to MaxLayerPos do
+  begin
+    FK[i].Free;
+    FV[i].Free;
+    FKQ[i].Free;
+    FVQ[i].Free;
+  end;
+  MaxLayerPos := High(FH);
+  for i := 0 to MaxLayerPos do FH[i].Free;
   SetLength(FK, 0);
   SetLength(FV, 0);
   SetLength(FKQ, 0);
   SetLength(FVQ, 0);
   SetLength(FInt8, 0);
+  SetLength(FLen, 0);
+  SetLength(FSinks, 0);
+  SetLength(FWindow, 0);
   SetLength(FH, 0);
-  inherited Destroy();
+  SetLength(FSteps, 0);
+end;
+
+function TNNetDecoderSessionSnapshot.Bytes(): int64;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FK);
+  for i := 0 to MaxLayerPos do
+  begin
+    if Assigned(FK[i]) then Inc(Result, FK[i].GetMemSize() + FV[i].GetMemSize());
+    if Assigned(FKQ[i]) then Inc(Result, FKQ[i].GetMemSize() + FVQ[i].GetMemSize());
+  end;
+  MaxLayerPos := High(FH);
+  for i := 0 to MaxLayerPos do
+    if Assigned(FH[i]) then Inc(Result, FH[i].GetMemSize());
+end;
+
+function TNNetDecoderSessionSnapshot.GetCacheLength(): integer;
+begin
+  if Length(FLen) > 0 then Result := FLen[0] else Result := 0;
 end;
 
 function TNNetDecoderSessionSnapshot.GetSDPACount(): integer;
@@ -6253,13 +6298,14 @@ begin
   SnapshotInto(Result);
 end;
 
-procedure TNNetStreamingDecoder.SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
+procedure TNNetStreamingDecoder.SnapshotInto(Snap: TNNetDecoderSessionSnapshot;
+  MinCapacityRows: integer);
 var
   i, HiSDPA, HiSSM: integer;
 begin
   // The per-layer arrays and their volumes stay in place across captures: a
   // shorter array is grown (new entries nil), an entry is created on first
-  // use only, and Copy/CopyFrom below reallocate only when a shape changed.
+  // use only, and a K/V volume is resized only when the live rows outgrow it.
   if Length(Snap.FK) <> Length(FSDPAs) then
   begin
     for i := 0 to High(Snap.FK) do FreeAndNil(Snap.FK[i]);
@@ -6285,20 +6331,26 @@ begin
     // Capture whichever storage is live: the int8 cache keeps its codes and
     // per-row scales, the FP32 cache its volumes. Only the live pair is
     // allocated on first use; the other stays nil.
+    // The pair of the other cache mode is freed, so Bytes() counts only what
+    // a restore can use.
     Snap.FInt8[i] := FSDPAs[i].Int8KVCache;
     if Snap.FInt8[i] then
     begin
+      FreeAndNil(Snap.FK[i]);
+      FreeAndNil(Snap.FV[i]);
       if Snap.FKQ[i] = nil then Snap.FKQ[i] := TNNetVolumeQuant8.Create();
       if Snap.FVQ[i] = nil then Snap.FVQ[i] := TNNetVolumeQuant8.Create();
       FSDPAs[i].CaptureCacheStateInt8(Snap.FKQ[i], Snap.FVQ[i],
-        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i], MinCapacityRows);
     end
     else
     begin
+      FreeAndNil(Snap.FKQ[i]);
+      FreeAndNil(Snap.FVQ[i]);
       if Snap.FK[i] = nil then Snap.FK[i] := TNNetVolume.Create();
       if Snap.FV[i] = nil then Snap.FV[i] := TNNetVolume.Create();
       FSDPAs[i].CaptureCacheState(Snap.FK[i], Snap.FV[i],
-        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i], MinCapacityRows);
     end;
   end;
   if Length(Snap.FH) <> Length(FSSMs) then
@@ -6319,6 +6371,8 @@ end;
 procedure TNNetStreamingDecoder.RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
 var
   i, HiSDPA, HiSSM: integer;
+  Fits: boolean;
+  Reason: string;
 begin
   if Length(Snap.FK) <> Length(FSDPAs) then
   begin
@@ -6340,12 +6394,26 @@ begin
   // leaving the other stale. The mode is fixed when the session is built, so
   // a mismatch means the snapshot came from a differently-configured session.
   for i := 0 to HiSDPA do
+  begin
     if Snap.FInt8[i] <> FSDPAs[i].Int8KVCache then
       raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: attention ' +
         'layer ' + IntToStr(i) + ' was captured with the ' +
         BoolToStr(Snap.FInt8[i], 'int8', 'FP32') + ' KV cache but this session ' +
         'runs the ' + BoolToStr(FSDPAs[i].Int8KVCache, 'int8', 'FP32') +
         ' cache (mismatched session configuration).');
+    // Every layer is checked before any is written, so a refused snapshot
+    // leaves the session untouched instead of half restored.
+    if Snap.FInt8[i]
+      then Fits := FSDPAs[i].CanRestoreCacheState(Snap.FKQ[i].SizeX,
+        Snap.FKQ[i].SizeY, Snap.FKQ[i].Depth, Snap.FLen[i], Snap.FSinks[i],
+        Snap.FWindow[i], Reason)
+      else Fits := FSDPAs[i].CanRestoreCacheState(Snap.FK[i].SizeX,
+        Snap.FK[i].SizeY, Snap.FK[i].Depth, Snap.FLen[i], Snap.FSinks[i],
+        Snap.FWindow[i], Reason);
+    if not Fits then
+      raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: attention ' +
+        'layer ' + IntToStr(i) + ': ' + Reason + '.');
+  end;
   for i := 0 to HiSDPA do
     if Snap.FInt8[i] then
       FSDPAs[i].RestoreCacheStateInt8(Snap.FKQ[i], Snap.FVQ[i],

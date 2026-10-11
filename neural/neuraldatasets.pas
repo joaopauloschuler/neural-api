@@ -194,6 +194,10 @@ type
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
   // A depth-4 volume saved as .png keeps its alpha channel (0..255 each).
   function SaveImageFromVolumeIntoFile(V:TNNetVolume; ImageFileName:string):boolean;
+  // V becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha (opaque files get
+  // alpha 255); 0..255 each. False when the file does not load.
+  function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
+    pWithAlpha: boolean): boolean; overload;
   {$ENDIF}
 
   // Loads an image from a file and stores it into a Volume.
@@ -2858,13 +2862,22 @@ begin
 end;
 
 function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume):boolean;
+begin
+  Result := LoadImageFromFileIntoVolume(ImageFileName, V, false);
+end;
+
+function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
+  pWithAlpha: boolean): boolean;
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
-  Result := M.LoadFromFile( ImageFileName );
-  if Result then LoadImageIntoVolume(M, V);
-  M.Free;
+  try
+    Result := M.LoadFromFile(ImageFileName);
+    if Result then LoadImageIntoVolume(M, V, pWithAlpha);
+  finally
+    M.Free;
+  end;
 end;
 
 function SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string
