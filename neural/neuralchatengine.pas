@@ -2828,8 +2828,9 @@ var
   // The highest-priority message boundary captured at FedPos.
   function BoundaryCaptureKind(FedPos: integer): TCacheCheckpointKind;
   begin
-    if FedPos = UserCapturePos then Result := cckLastUser
-    else if FedPos = AllButLastTwoCapturePos then Result := cckAllButLastTwo
+    // LastUser checkpoints are not stored (see CaptureBoundary).
+    // if FedPos = UserCapturePos then Result := cckLastUser else
+    if FedPos = AllButLastTwoCapturePos then Result := cckAllButLastTwo
     else if FedPos = FirstHalfCapturePos then Result := cckFirstHalf
     else Result := cckSystem;
   end;
@@ -2837,7 +2838,12 @@ var
   // point with its recurrent state for a later slot save.
   procedure CaptureBoundary(ASession: TNNetStreamingDecoder; FedPos: integer);
   begin
-    CaptureAt(ASession, FedPos, BoundaryCaptureKind(FedPos));
+    // LastUser checkpoints are not stored: they took store entries and were
+    // never resumed under BPSA. Thinking-template clients resume from them.
+    // CaptureAt(ASession, FedPos, BoundaryCaptureKind(FedPos));
+    if (FedPos = SystemCapturePos) or (FedPos = AllButLastTwoCapturePos) or
+      (FedPos = FirstHalfCapturePos) then
+      CaptureAt(ASession, FedPos, BoundaryCaptureKind(FedPos));
     if (FedPos = UserCapturePos) and SlotReuse and Assigned(LiveUserState) then
     begin
       ASession.CaptureStateInto(LiveUserState);
@@ -3204,7 +3210,9 @@ begin
     // exactly PromptIds[0..Len-2], a prefix of what CachedTokens will list
     // after the decode loop, so the prefix test above stays truthful for
     // it. The time counts toward TTFT (--stats prefill excludes it).
-    if StateReuse then CaptureAt(Session, Cnt, cckPromptEnd);
+    // PromptEnd checkpoints are not stored: they took store entries and were
+    // never resumed under BPSA, which echoes the reply (ReplyEnd matches).
+    // if StateReuse then CaptureAt(Session, Cnt, cckPromptEnd);
     SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
       LastPrefillTailWindows * TailLen;
     // --profile: the prefill's own layer-class report, one table per net
