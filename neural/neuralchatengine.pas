@@ -122,12 +122,19 @@ type
     Tokens: array[0..csTokenPrefixGuardLen - 1] of integer;
   end;
 
+  // Why a cache checkpoint was captured, in priority order: a checkpoint that
+  // serves several boundaries keeps the highest, so the [stats] counts add up.
+  TCacheCheckpointKind = (cckSystem, cckFirstHalf, cckAllButLastTwo,
+    cckLastUser, cckPromptEnd, cckReplyEnd);
+  TCacheCheckpointKindCounts = array[TCacheCheckpointKind] of Int64;
+
   // Which token sequence a cache checkpoint belongs to, and when a request
   // last captured or resumed it (the eviction order).
   TCacheCheckpointInfo = record
     PrefixHash: UInt64;       // TokenPrefixHash of the ids before Position
     Guard: TTokenPrefixGuard; // their last ids, checked after a hash match
     LastUsedTurn: integer;    // TChatEngine.CurrentTurn of that request
+    Kind: TCacheCheckpointKind;
   end;
 
   // The points a saved conversation can resume from: the end of the system
@@ -410,6 +417,7 @@ type
     TotalInputMs: double;
     TotalOutputTokens: Int64;
     TotalOutputMs: double;
+    CheckpointResumes: TCacheCheckpointKindCounts; // resumes per capture kind
     Loaded: boolean;
     {$IFDEF OpenCL}
     GpuCL: TEasyOpenCL;          // platform/device handle for OpenCL offload
@@ -490,13 +498,19 @@ type
     procedure ClearLivePoints();
     // Bytes the conversation slots and LiveUserState hold, host and OpenCL.
     procedure KVSlotBytes(out HostBytes, OpenCLBytes: int64);
+    // Checkpoints held, their count per kind, and the bytes the whole store
+    // holds (every entry is allocated at load), host and OpenCL.
+    procedure CheckpointStoreStats(out Stored: integer;
+      out KindCounts: TCacheCheckpointKindCounts;
+      out HostBytes, OpenCLBytes: int64);
     // Copies Src's recurrent state into Dst through Session's, which it
     // overwrites: call only before the resume route is applied, never on ReuseOK.
     procedure CopyStateCheckpoint(Src, Dst: TNNetDecoderStateCheckpoint);
     // Copies ASession's recurrent state at FedPos, PrefixHash being the hash
-    // of Tokens[0..FedPos-1]; an already-held checkpoint is only marked used.
+    // of Tokens[0..FedPos-1]; an already-held one is marked used, kind raised.
     procedure CaptureCheckpoint(ASession: TNNetStreamingDecoder;
-      const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64);
+      const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64;
+      Kind: TCacheCheckpointKind);
     procedure FreeCheckpoints();
     // Moves the live state from ActiveSession into Target (snapshot, restore)
     // and makes Target the active session. No-op when Target is active.
@@ -506,6 +520,8 @@ type
 function DefaultChatOptions(): TChatOptions;
 // 'none', 'live cache', 'checkpoint' or 'conversation slot'.
 function ChatResumeRouteName(Route: TChatResumeRoute): string;
+// 'System', 'FirstHalf', 'AllButLastTwo', 'LastUser', 'PromptEnd', 'ReplyEnd'.
+function CacheCheckpointKindName(Kind: TCacheCheckpointKind): string;
 function ParseArgs(Args: TStringList; var Opt: TChatOptions): boolean;
 // The shared block of the --help text (every option ParseArgs understands
 // except the server-only --host/--port, which the server's usage adds).
@@ -712,6 +728,18 @@ begin
     crrCheckpoint: Result := 'checkpoint';
     crrSlot: Result := 'conversation slot';
   else Result := 'none';
+  end;
+end;
+
+function CacheCheckpointKindName(Kind: TCacheCheckpointKind): string;
+begin
+  case Kind of
+    cckSystem: Result := 'System';
+    cckFirstHalf: Result := 'FirstHalf';
+    cckAllButLastTwo: Result := 'AllButLastTwo';
+    cckLastUser: Result := 'LastUser';
+    cckPromptEnd: Result := 'PromptEnd';
+  else Result := 'ReplyEnd';
   end;
 end;
 
@@ -1475,6 +1503,7 @@ begin
   TotalInputMs := 0;
   TotalOutputTokens := 0;
   TotalOutputMs := 0;
+  FillChar(CheckpointResumes, SizeOf(CheckpointResumes), 0);
   Loaded := false;
   {$IFDEF OpenCL}
   GpuCL := nil;
@@ -1673,7 +1702,8 @@ begin
 end;
 
 procedure TChatEngine.CaptureCheckpoint(ASession: TNNetStreamingDecoder;
-  const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64);
+  const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64;
+  Kind: TCacheCheckpointKind);
 var
   SlotPos, MaxSlotPos, FreeSlot: integer;
 begin
@@ -1691,6 +1721,8 @@ begin
       TokenPrefixGuardMatches(CheckpointInfo[SlotPos].Guard, Tokens, FedPos) then
     begin
       CheckpointInfo[SlotPos].LastUsedTurn := CurrentTurn;
+      if Kind > CheckpointInfo[SlotPos].Kind then
+        CheckpointInfo[SlotPos].Kind := Kind;
       exit;
     end;
   end;
@@ -1701,6 +1733,7 @@ begin
   CheckpointInfo[FreeSlot].PrefixHash := PrefixHash;
   FillTokenPrefixGuard(Tokens, FedPos, CheckpointInfo[FreeSlot].Guard);
   CheckpointInfo[FreeSlot].LastUsedTurn := CurrentTurn;
+  CheckpointInfo[FreeSlot].Kind := Kind;
   Checkpoints[FreeSlot].Position := FedPos;
 end;
 
@@ -1873,6 +1906,30 @@ begin
     AddState(KVSlots[SlotPos].LastUserState);
   end;
   AddState(LiveUserState);
+end;
+
+procedure TChatEngine.CheckpointStoreStats(out Stored: integer;
+  out KindCounts: TCacheCheckpointKindCounts;
+  out HostBytes, OpenCLBytes: int64);
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  Stored := 0;
+  FillChar(KindCounts, SizeOf(KindCounts), 0);
+  HostBytes := 0;
+  OpenCLBytes := 0;
+  MaxSlotPos := High(Checkpoints);
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    Inc(OpenCLBytes, Checkpoints[SlotPos].OpenCLBytes());
+    Inc(HostBytes, Checkpoints[SlotPos].Bytes() -
+      Checkpoints[SlotPos].OpenCLBytes());
+    if Checkpoints[SlotPos].Position > 0 then
+    begin
+      Inc(Stored);
+      Inc(KindCounts[CheckpointInfo[SlotPos].Kind]);
+    end;
+  end;
 end;
 
 procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
@@ -2680,6 +2737,7 @@ var
   StateReuse: boolean;         // the checkpoint route: resume AND capture
   ResumeChk: TNNetDecoderStateCheckpoint; // the checkpoint this call resumes
   ResumeSlot: integer;         // its slot, -1 when none
+  ResumedCheckpointKind: TCacheCheckpointKind; // its kind, for the [stats]
   SlotReuse: boolean;          // the conversation-slot route: save AND resume
   ResumeKVSlot: integer;       // the conversation slot this call resumes, -1
   ResumeKVPoint: TConversationSlotPoint; // and the point it resumes at
@@ -2718,6 +2776,11 @@ var
   Produced: integer;
   DecodeSecs: double;
   TotalEngineMs: double;       // TotalInputMs + TotalOutputMs, for the shares
+  StoredCheckpoints: integer;
+  StoredKindCounts: TCacheCheckpointKindCounts;
+  CheckpointHostBytes, CheckpointOpenCLBytes: int64;
+  Kind: TCacheCheckpointKind;
+  KindSeparator: string;
   // --stats per-phase split of one decode step, accumulated over the loop in
   // ms: the net forward, the logits row copy + softmax, the processor chain
   // (repetition penalty), the sampler, the detokenize + emit, and the rest.
@@ -2755,17 +2818,26 @@ var
     FillTokenPrefixGuard(Tokens, FedPos, LivePoints[Point].Guard);
   end;
   // Captures ASession's recurrent state at FedPos into the checkpoint store.
-  procedure CaptureAt(ASession: TNNetStreamingDecoder; FedPos: integer);
+  procedure CaptureAt(ASession: TNNetStreamingDecoder; FedPos: integer;
+    Kind: TCacheCheckpointKind);
   begin
     AdvanceCaptureHash(FedPos);
     if StateReuse then
-      CaptureCheckpoint(ASession, Tokens, FedPos, CaptureHash);
+      CaptureCheckpoint(ASession, Tokens, FedPos, CaptureHash, Kind);
+  end;
+  // The highest-priority message boundary captured at FedPos.
+  function BoundaryCaptureKind(FedPos: integer): TCacheCheckpointKind;
+  begin
+    if FedPos = UserCapturePos then Result := cckLastUser
+    else if FedPos = AllButLastTwoCapturePos then Result := cckAllButLastTwo
+    else if FedPos = FirstHalfCapturePos then Result := cckFirstHalf
+    else Result := cckSystem;
   end;
   // A message boundary: the checkpoint, and at the last-user end the live
   // point with its recurrent state for a later slot save.
   procedure CaptureBoundary(ASession: TNNetStreamingDecoder; FedPos: integer);
   begin
-    CaptureAt(ASession, FedPos);
+    CaptureAt(ASession, FedPos, BoundaryCaptureKind(FedPos));
     if (FedPos = UserCapturePos) and SlotReuse and Assigned(LiveUserState) then
     begin
       ASession.CaptureStateInto(LiveUserState);
@@ -2868,6 +2940,7 @@ begin
   SlotReuse := (Length(KVSlots) > 0) and not GenOpt.NoCacheReuse;
   ResumeChk := nil;
   ResumeSlot := -1;
+  ResumedCheckpointKind := cckSystem;
   ResumeKVSlot := -1;
   LastResumeRoute := crrNone;
   CaptureHash := csTokenPrefixHashSeed;
@@ -3003,6 +3076,7 @@ begin
       if ResumeSlot >= 0 then
       begin
         ResumeChk := Checkpoints[ResumeSlot];
+        ResumedCheckpointKind := CheckpointInfo[ResumeSlot].Kind;
         CheckpointInfo[ResumeSlot].LastUsedTurn := CurrentTurn;
         CaptureHash := CheckpointInfo[ResumeSlot].PrefixHash;
         CaptureHashPos := Reused;
@@ -3130,7 +3204,7 @@ begin
     // exactly PromptIds[0..Len-2], a prefix of what CachedTokens will list
     // after the decode loop, so the prefix test above stays truthful for
     // it. The time counts toward TTFT (--stats prefill excludes it).
-    if StateReuse then CaptureAt(Session, Cnt);
+    if StateReuse then CaptureAt(Session, Cnt, cckPromptEnd);
     SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
       LastPrefillTailWindows * TailLen;
     // --profile: the prefill's own layer-class report, one table per net
@@ -3305,7 +3379,7 @@ begin
     // the decode loop, so the session holds exactly the tokens CachedTokens
     // lists (positions 0..Len-2) - the two must agree or the prefix test
     // above would validate a boundary the session is not actually at.
-    if StateReuse then CaptureAt(Session, Len - 1);
+    if StateReuse then CaptureAt(Session, Len - 1, cckReplyEnd);
     // The cached conversation's reply end, for SaveLiveConversation.
     if Length(KVSlots) > 0 then RecordLivePoint(cspReplyEnd, Len - 1);
     // Lifetime usage totals, kept whether or not --stats prints them.
@@ -3320,6 +3394,8 @@ begin
       TotalInputMs := TotalInputMs + PrefillMs;
       Inc(TotalOutputTokens, Produced);
       TotalOutputMs := TotalOutputMs + (TEnd - TPrefillEnd);
+      if LastResumeRoute = crrCheckpoint then
+        Inc(CheckpointResumes[ResumedCheckpointKind]);
     end;
     // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
     // prefill + first decode step; decode tok/s measures the steady-state
@@ -3350,6 +3426,35 @@ begin
           SlotOpenCLBytes / (1024 * 1024)]));
       end;
       WriteLn(StdErr);
+      // The checkpoint store now, then the lifetime resumes per capture kind.
+      if StateReuse then
+      begin
+        CheckpointStoreStats(StoredCheckpoints, StoredKindCounts,
+          CheckpointHostBytes, CheckpointOpenCLBytes);
+        Write(StdErr, Format('[stats] checkpoints: capacity %d, stored %d,' +
+          ' free %d (%.1f MB host, %.1f MB OpenCL)',
+          [Length(Checkpoints), StoredCheckpoints,
+           Length(Checkpoints) - StoredCheckpoints,
+           CheckpointHostBytes / (1024 * 1024),
+           CheckpointOpenCLBytes / (1024 * 1024)]));
+        KindSeparator := '; ';
+        for Kind := Low(TCacheCheckpointKind) to High(TCacheCheckpointKind) do
+        begin
+          Write(StdErr, Format('%s%s %d', [KindSeparator,
+            CacheCheckpointKindName(Kind), StoredKindCounts[Kind]]));
+          KindSeparator := ', ';
+        end;
+        WriteLn(StdErr);
+        Write(StdErr, '[stats] checkpoint resumes:');
+        KindSeparator := ' ';
+        for Kind := Low(TCacheCheckpointKind) to High(TCacheCheckpointKind) do
+        begin
+          Write(StdErr, Format('%s%s %d', [KindSeparator,
+            CacheCheckpointKindName(Kind), CheckpointResumes[Kind]]));
+          KindSeparator := ', ';
+        end;
+        WriteLn(StdErr);
+      end;
       Write(StdErr, Format('[stats] output: %d tokens in %.1f s',
         [Produced, (TEnd - TPrefillEnd) / 1000.0]));
       if Produced > 1 then

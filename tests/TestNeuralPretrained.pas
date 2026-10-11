@@ -12961,6 +12961,8 @@ begin
       Engine.LastResumeRoute = crrCheckpoint);
     AssertEquals(Tag + 'resumed at turn 1''s Msgs[0..High-2] end',
       ButLastTwo1, Engine.LastReusedTokens);
+    AssertEquals(Tag + 'counted as one AllButLastTwo resume', 1,
+      Engine.CheckpointResumes[cckAllButLastTwo]);
 
     FreshTurn.Reply := Fresh.GenerateFromIds(Prompt2, Fresh.Opt);
     FreshTurn.Completion := Fresh.LastCompletionTokens;
