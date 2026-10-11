@@ -3315,8 +3315,12 @@ begin
          SamplerMs / Produced, EmitMs / Produced,
          (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
          StepMs / Produced]));
-      WriteLn(StdErr, Format('[stats] total input: %d tokens (cached %d), %.1f s',
+      Write(StdErr, Format('[stats] total input: %d tokens (cached %d), %.1f s',
         [TotalInputTokens, TotalCachedInputTokens, TotalInputMs / 1000.0]));
+      if TotalInputMs > 0 then
+        Write(StdErr, Format(', %.1f input tok/s incl. cached',
+          [TotalInputTokens * 1000.0 / TotalInputMs]));
+      WriteLn(StdErr);
       WriteLn(StdErr, Format('[stats] total output: %d tokens, %.1f s',
         [TotalOutputTokens, TotalOutputMs / 1000.0]));
       Flush(StdErr);
