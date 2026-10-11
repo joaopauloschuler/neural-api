@@ -3369,10 +3369,13 @@ begin
          SamplerMs / Produced, EmitMs / Produced,
          (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
          StepMs / Produced]));
-      Write(StdErr, Format('[stats] total input: %d tokens (cached %d), %.1f s',
-        [TotalInputTokens, TotalCachedInputTokens, TotalInputMs / 1000.0]));
+      // TotalInputTokens > 0 here: this turn produced, so it added PromptLen.
+      Write(StdErr, Format('[stats] total input: %d tokens (cached %d, %.1f%%),' +
+        ' %.1f s', [TotalInputTokens, TotalCachedInputTokens,
+        TotalCachedInputTokens * 100.0 / TotalInputTokens,
+        TotalInputMs / 1000.0]));
       if TotalInputMs > 0 then
-        Write(StdErr, Format(', %.1f input tok/s incl. cached',
+        Write(StdErr, Format(', %.1f avg. input tok/s',
           [TotalInputTokens * 1000.0 / TotalInputMs]));
       WriteLn(StdErr);
       WriteLn(StdErr, Format('[stats] total output: %d tokens, %.1f s',
