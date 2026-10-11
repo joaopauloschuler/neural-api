@@ -434,11 +434,12 @@ type
     // error (e.g. a system prompt on a format without a system role).
     function ChatReply(const Msgs: TChatMessages;
       const GenOpt: TChatOptions): string;
-    // One reply from prompt token ids, sampled with GenOpt; the system prompt
-    // and last user message end at the given counts (0 = unknown).
+    // One reply from PromptIds sampled with GenOpt; the counts are where the
+    // system, last user, Msgs[0..High-2], Msgs[0..High div 2] end (0 = unknown).
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions; SystemPromptTokenCount: integer = 0;
-      LastUserTokenCount: integer = 0): string;
+      LastUserTokenCount: integer = 0; AllButLastTwoTokenCount: integer = 0;
+      FirstHalfTokenCount: integer = 0): string;
     // Ids of Msgs' leading system message rendered alone, when they are a
     // proper prefix of PromptIds; else 0 (no system message, or no clean cut).
     function CountSystemPromptTokens(const Msgs: TChatMessages;
@@ -449,10 +450,20 @@ type
     function CountLastUserTokens(const Msgs: TChatMessages;
       const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): integer;
+    // Ids PromptIds shares with Msgs[0..LastMessagePos] rendered alone (a
+    // thinking template re-renders a trailing assistant message); 0 = none.
+    function CountMessagePrefixTokens(const Msgs: TChatMessages;
+      LastMessagePos: integer; const PromptIds: TNeuralIntegerArray;
+      const GenOpt: TChatOptions): integer;
   private
     // Bytes of an unfinished UTF-8 sequence EmitToken is holding until the
     // token that completes it arrives (a codepoint can straddle two tokens).
     PendingUtf8: string;
+    // Msgs[0..LastMessagePos] rendered without the generation prompt; false
+    // in raw mode, out of range, or when the template refuses the prefix.
+    function RenderMessagePrefix(const Msgs: TChatMessages;
+      LastMessagePos: integer; const GenOpt: TChatOptions;
+      out PrefixIds: TNeuralIntegerArray): boolean;
     procedure Notice(const S: string);
     procedure EmitToken(const S: string);
     // Emits U+FFFD for anything still held in PendingUtf8 at reply end.
@@ -2549,20 +2560,33 @@ function TChatEngine.ChatReply(const Msgs: TChatMessages;
 var
   PromptIds: TNeuralIntegerArray;
   SystemTokens, LastUserTokens: integer;
+  AllButLastTwoTokens, FirstHalfTokens: integer;
 begin
   PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
     ChatTemplateOptions({AddGenerationPrompt=}true,
       {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
   SystemTokens := 0;
   LastUserTokens := 0;
+  AllButLastTwoTokens := 0;
+  FirstHalfTokens := 0;
   // The message boundaries only matter to the checkpoint and slot routes.
   if ((StateReuseOK and (Length(Checkpoints) > 0)) or (Length(KVSlots) > 0))
     and not GenOpt.NoCacheReuse then
   begin
     SystemTokens := CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
     LastUserTokens := CountLastUserTokens(Msgs, PromptIds, GenOpt);
+    // Checkpoint-only boundaries: a client that inserts a message before the
+    // last one every turn, or edits the history, still resumes from these.
+    if StateReuseOK and (Length(Checkpoints) > 0) then
+    begin
+      AllButLastTwoTokens := CountMessagePrefixTokens(Msgs, High(Msgs) - 2,
+        PromptIds, GenOpt);
+      FirstHalfTokens := CountMessagePrefixTokens(Msgs, High(Msgs) div 2,
+        PromptIds, GenOpt);
+    end;
   end;
-  Result := GenerateFromIds(PromptIds, GenOpt, SystemTokens, LastUserTokens);
+  Result := GenerateFromIds(PromptIds, GenOpt, SystemTokens, LastUserTokens,
+    AllButLastTwoTokens, FirstHalfTokens);
 end;
 
 function TChatEngine.CountLastUserTokens(const Msgs: TChatMessages;
@@ -2571,16 +2595,9 @@ var
   MessageIds: TNeuralIntegerArray;
 begin
   Result := 0;
-  if RawMode or (Length(Msgs) = 0) or (Msgs[High(Msgs)].Role <> 'user') then
-    exit;
-  try
-    MessageIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
-      ChatTemplateOptions({AddGenerationPrompt=}false,
-        {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
-  except
-    on ENeuralChatError do exit;
-  end;
-  Result := MessageBoundaryPrefixLen(MessageIds, PromptIds);
+  if (Length(Msgs) > 0) and (Msgs[High(Msgs)].Role = 'user') and
+    RenderMessagePrefix(Msgs, High(Msgs), GenOpt, MessageIds) then
+    Result := MessageBoundaryPrefixLen(MessageIds, PromptIds);
 end;
 
 function TChatEngine.CountSystemPromptTokens(const Msgs: TChatMessages;
@@ -2589,17 +2606,40 @@ var
   SystemIds: TNeuralIntegerArray;
 begin
   Result := 0;
-  if RawMode or (Length(Msgs) = 0) or (Msgs[0].Role <> 'system') then exit;
+  if (Length(Msgs) > 0) and (Msgs[0].Role = 'system') and
+    RenderMessagePrefix(Msgs, 0, GenOpt, SystemIds) then
+    Result := MessageBoundaryPrefixLen(SystemIds, PromptIds);
+end;
+
+function TChatEngine.CountMessagePrefixTokens(const Msgs: TChatMessages;
+  LastMessagePos: integer; const PromptIds: TNeuralIntegerArray;
+  const GenOpt: TChatOptions): integer;
+var
+  PrefixIds: TNeuralIntegerArray;
+begin
+  Result := 0;
+  if RenderMessagePrefix(Msgs, LastMessagePos, GenOpt, PrefixIds) then
+    Result := Min(CommonPrefixLen(PrefixIds, PromptIds), Length(PromptIds) - 1);
+end;
+
+function TChatEngine.RenderMessagePrefix(const Msgs: TChatMessages;
+  LastMessagePos: integer; const GenOpt: TChatOptions;
+  out PrefixIds: TNeuralIntegerArray): boolean;
+begin
+  PrefixIds := nil;
+  Result := false;
+  if RawMode or (LastMessagePos < 0) or (LastMessagePos > High(Msgs)) then
+    exit;
   try
-    SystemIds := EncodeChat(Tokenizer, ChatFormat, Msgs[0..0],
+    PrefixIds := EncodeChat(Tokenizer, ChatFormat, Msgs[0..LastMessagePos],
       ChatTemplateOptions({AddGenerationPrompt=}false,
         {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
   except
     // A format that folds the system message into the first user turn
-    // cannot render it alone: there is no system boundary to capture at.
+    // cannot render it alone: there is no boundary to capture at.
     on ENeuralChatError do exit;
   end;
-  Result := MessageBoundaryPrefixLen(SystemIds, PromptIds);
+  Result := true;
 end;
 
 // ---------------------------------------------------------------------------
@@ -2630,8 +2670,8 @@ end;
 // Either way a conversation slot (--kv-slots) deeper than that route is
 // restored whole instead. NoCacheReuse disables all: full re-prefill.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
-  const GenOpt: TChatOptions; SystemPromptTokenCount,
-  LastUserTokenCount: integer): string;
+  const GenOpt: TChatOptions; SystemPromptTokenCount, LastUserTokenCount,
+  AllButLastTwoTokenCount, FirstHalfTokenCount: integer): string;
 var
   Chain: TNNetLogitsProcessorChain;
   Penalty: TNNetTokenHistoryPenalty;
@@ -2648,9 +2688,10 @@ var
   SlotHostBytes, SlotOpenCLBytes: int64;
   CaptureHash: UInt64;         // TokenPrefixHash of Tokens[0..CaptureHashPos-1]
   CaptureHashPos: integer;
-  // The fed positions of the system-prompt and last-user captures: the last
-  // window end at or below each boundary, or the boundary itself; -1 = none.
+  // The fed positions of the message-boundary captures: the last window end
+  // at or below each boundary, or the boundary itself; -1 = none.
   SystemCapturePos, UserCapturePos: integer;
+  AllButLastTwoCapturePos, FirstHalfCapturePos: integer;
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -2676,6 +2717,7 @@ var
   TStart, TPrefillEnd, TFirst, TEnd: QWord;
   Produced: integer;
   DecodeSecs: double;
+  TotalEngineMs: double;       // TotalInputMs + TotalOutputMs, for the shares
   // --stats per-phase split of one decode step, accumulated over the loop in
   // ms: the net forward, the logits row copy + softmax, the processor chain
   // (repetition penalty), the sampler, the detokenize + emit, and the rest.
@@ -2750,6 +2792,12 @@ var
           LiveUserState);
     end;
   end;
+  // True when FedPos is one of this call's message-boundary captures.
+  function IsBoundaryCapture(FedPos: integer): boolean;
+  begin
+    Result := (FedPos = SystemCapturePos) or (FedPos = UserCapturePos) or
+      (FedPos = AllButLastTwoCapturePos) or (FedPos = FirstHalfCapturePos);
+  end;
   // Up to WindowCount whole windows of Tokens from Cnt on through WSession
   // (the active one), never padded. A window that would overflow the cache is
   // never fed: the fused attention layer only prints on overflow and then
@@ -2776,8 +2824,8 @@ var
       WSession.StepForwardToHidden(WIn, Cnt);
       Inc(Cnt, WLen);
       Inc(Fed);
-      if ((Cnt = SystemCapturePos) or (Cnt = UserCapturePos)) and
-        CheckpointOnTwins then CaptureBoundary(WSession, Cnt);
+      if IsBoundaryCapture(Cnt) and CheckpointOnTwins then
+        CaptureBoundary(WSession, Cnt);
     end;
   end;
 begin
@@ -2826,6 +2874,8 @@ begin
   CaptureHashPos := 0;
   SystemCapturePos := -1;
   UserCapturePos := -1;
+  AllButLastTwoCapturePos := -1;
+  FirstHalfCapturePos := -1;
   ResumeKVPoint := cspReplyEnd;
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
@@ -2997,8 +3047,15 @@ begin
     else if TailCount > 0 then FirstSession := TailSession
     else FirstSession := Session;
     if StateReuse then
+    begin
       SystemCapturePos := MessageBoundaryCapturePosition(SystemPromptTokenCount,
         Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
+      AllButLastTwoCapturePos := MessageBoundaryCapturePosition(
+        AllButLastTwoTokenCount, Reused, LenM2 + 1, WindowLen, WindowCount,
+        TailLen, TailCount);
+      FirstHalfCapturePos := MessageBoundaryCapturePosition(FirstHalfTokenCount,
+        Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
+    end;
     if StateReuse or (SlotReuse and Assigned(LiveUserState)) then
       UserCapturePos := MessageBoundaryCapturePosition(LastUserTokenCount,
         Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
@@ -3060,15 +3117,13 @@ begin
       FeedWindows(TailSession, TailIn, TailCount, LastPrefillTailWindows);
     end;
     SwitchTo(Session);
-    if (Cnt = SystemCapturePos) or (Cnt = UserCapturePos) then
-      CaptureBoundary(Session, Cnt);
+    if IsBoundaryCapture(Cnt) then CaptureBoundary(Session, Cnt);
     while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForwardToHidden(InV, Cnt);
       Inc(Cnt);
-      if (Cnt = SystemCapturePos) or (Cnt = UserCapturePos) then
-        CaptureBoundary(Session, Cnt);
+      if IsBoundaryCapture(Cnt) then CaptureBoundary(Session, Cnt);
     end;
     TPrefillEnd := GetTickCount64();
     // End-of-prompt checkpoint for the next call's resume: Session now holds
@@ -3315,10 +3370,27 @@ begin
          SamplerMs / Produced, EmitMs / Produced,
          (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
          StepMs / Produced]));
-      WriteLn(StdErr, Format('[stats] total input: %d tokens (cached %d), %.1f s',
-        [TotalInputTokens, TotalCachedInputTokens, TotalInputMs / 1000.0]));
-      WriteLn(StdErr, Format('[stats] total output: %d tokens, %.1f s',
+      // TotalInputTokens > 0 here: this turn produced, so it added PromptLen.
+      // The input and output shares split the engine time; they sum to 100%.
+      TotalEngineMs := TotalInputMs + TotalOutputMs;
+      Write(StdErr, Format('[stats] total input: %d tokens (cached %d, %.1f%%),' +
+        ' %.1f s', [TotalInputTokens, TotalCachedInputTokens,
+        TotalCachedInputTokens * 100.0 / TotalInputTokens,
+        TotalInputMs / 1000.0]));
+      if TotalEngineMs > 0 then
+        Write(StdErr, Format(' (%.1f%%)', [TotalInputMs * 100.0 / TotalEngineMs]));
+      if TotalInputMs > 0 then
+        Write(StdErr, Format(', %.1f avg. input tok/s',
+          [TotalInputTokens * 1000.0 / TotalInputMs]));
+      WriteLn(StdErr);
+      Write(StdErr, Format('[stats] total output: %d tokens, %.1f s',
         [TotalOutputTokens, TotalOutputMs / 1000.0]));
+      if TotalEngineMs > 0 then
+        Write(StdErr, Format(' (%.1f%%)', [TotalOutputMs * 100.0 / TotalEngineMs]));
+      if TotalOutputMs > 0 then
+        Write(StdErr, Format(', %.1f avg. output tok/s',
+          [TotalOutputTokens * 1000.0 / TotalOutputMs]));
+      WriteLn(StdErr);
       Flush(StdErr);
     end;
     // --profile: per-layer-class forward timing accumulated over this call's
