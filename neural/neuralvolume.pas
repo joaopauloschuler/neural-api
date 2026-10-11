@@ -2799,6 +2799,11 @@ end;
 // Q4BlockExtremeIdx's AVX2 path: index of the first of the 32 floats with
 // the largest finite magnitude, -1 when none. Coded by Claude (AI).
 function AVXQ4BlockExtremeIdx(BlockSrc: TNeuralFloatArrPtr): integer;
+{$IFNDEF FPC}
+begin
+  Result := _AVXQ4BlockExtremeIdx(PSingle(BlockSrc));
+end;
+{$ELSE}
 var
   // [0] = $7FFFFFFF sign-clearing mask, [1] = $7F7FFFFF largest finite bits.
   Consts: array[0..1] of LongWord;
@@ -2866,11 +2871,17 @@ begin
     then Result := -1
     else Result := BsfDWord(EqualMask);
 end;
+{$ENDIF}
 
 // Q4BlockCodes's AVX2 path: vmulps then vaddps, the scalar loop's two single
 // roundings, so its codes are bit-identical. Coded by Claude (AI).
 procedure AVXQ4BlockCodes(BlockSrc: TNeuralFloatArrPtr;
   PackedDst: TNeuralByteArrPtr; InvScale: Single);
+{$IFNDEF FPC}
+begin
+  _AVXQ4BlockCodes(PSingle(BlockSrc), PByte(PackedDst), InvScale);
+end;
+{$ELSE}
 var
   // [0] = $7FFFFFFF, [1] = $7F7FFFFF, [2] = InvScale, [3] = 8.5, [4] = 15.
   Consts: array[0..4] of LongWord;
@@ -2941,6 +2952,7 @@ begin
     'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13'
   ];
 end;
+{$ENDIF}
 
 // dst[i] := Scale * src[i] over NumElements symmetric int8 codes. Per 8 lanes:
 // vpmovsxbd sign-extends 8 bytes to dwords, vcvtdq2ps converts, one broadcast

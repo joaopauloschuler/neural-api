@@ -211,6 +211,15 @@ procedure _AVX512ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer)
 procedure _AVX2SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
 procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 
+// Coded by Claude (AI)
+// Q4 block helpers: process exactly 32 floats (one quantization block).
+procedure _AVX2Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); register; assembler;
+procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inline;
+
+// Coded by Claude (AI)
+function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer; register; assembler;
+function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
+
 implementation
 
 
@@ -1018,11 +1027,10 @@ asm
   jmp @Loop8
 
 @Tail:
-  test ecx, ecx
-  jz @Done
+  vxorps xmm4, xmm4, xmm4     // zero tail accumulator BEFORE the jz:
+  test ecx, ecx               // when N is a multiple of 8 the jump is taken,
+  jz @Done                    // and @Done still adds xmm4 to the result.
 
-  // ---- Tail: accumulate in XMM4 ----
-  vxorps xmm4, xmm4, xmm4
 @ScalarLoop:
   vmovss xmm2, [eax]
   vmovss xmm3, [edx]
@@ -1128,10 +1136,10 @@ asm
   jmp @Loop4
 
 @Tail:
-  test ecx, ecx
-  jz @Done
+  vxorps xmm4, xmm4, xmm4     // zero tail accumulator BEFORE the jz:
+  test ecx, ecx               // when N is a multiple of 32 the jump is taken,
+  jz @Done                    // and @Done still adds xmm4 to the result.
 
-  vxorps xmm4, xmm4, xmm4
 @ScalarLoop:
   vmovss xmm2, [eax]
   vmovss xmm3, [edx]
@@ -2531,24 +2539,25 @@ function _AVX2SumSqrCentered(src: PSingle; Mean: Single; N: Integer): Single;
 asm
   // No manual prologue; compiler generates push ebp; mov ebp, esp
 
+  // Save callee-saved registers FIRST: they must not be clobbered before
+  // being saved, otherwise the caller's ESI is destroyed on return.
+  push esi
+  push edi
+  push ebx
+
   // Allocate temporary 4-byte stack space for broadcasting Mean
   sub esp, 4
 
   mov esi, eax                 // src
   mov eax, edx                 // N (from EDX)
 
-  movss xmm3, [ebp+8]          // Mean (scalar)
+  movss xmm3, [ebp+8]          // Mean (scalar) - EBP frame is unaffected by pushes
   movss xmm4, [ebp+8]          // keep scalar for tail
 
   // Broadcast Mean to all lanes using memory operand
   movss [esp], xmm3            // store Mean to temp
   vbroadcastss ymm3, [esp]     // ymm3 = {Mean, Mean, ...}
   add esp, 4                   // release temp
-
-  // Save registers after using them for parameters and temp stack
-  push esi
-  push edi
-  push ebx
 
   test eax, eax
   jle @Zero
@@ -2824,7 +2833,7 @@ asm
   test eax, eax
   jz @Exit
 
-  // ---- ±êÁ¿Î²²¿£¨ÓëÖ÷Ñ­»·Æ«ÒÆÒ»ÖÂ£© ----
+  // ---- ï¿½ï¿½ï¿½ï¿½Î²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñ­ï¿½ï¿½Æ«ï¿½ï¿½Ò»ï¿½Â£ï¿½ ----
   movss xmm0, dword ptr [ebp+20]   // Beta2
   movss xmm1, dword ptr [ebp+16]   // k
   movss xmm2, dword ptr [ebp+12]   // c
@@ -3517,7 +3526,7 @@ asm
   // Load Value from stack (at [ebp+8]) and broadcast to YMM7
   vbroadcastss ymm7, [ebp+8]
 
-  // Bulk processing: 32 elements per loop (4 YMM registers ¡Á 8 lanes)
+  // Bulk processing: 32 elements per loop (4 YMM registers ï¿½ï¿½ 8 lanes)
   mov eax, edi
   and eax, 31                  // tail = N mod 32
   sub edi, eax                 // bulk = N - tail (multiple of 32)
@@ -5216,6 +5225,174 @@ end;
 procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 begin
   _AVX2SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
+end;
+
+{-----------------------------------------------------------------------------
+  Q4 block codes: packs nibbles Min(15, Trunc(src[i] * InvScale + 8.5)) of
+  exactly 32 floats into 16 bytes at dst; NaN/Inf store nibble 8 (value 0).
+  Byte j holds code[j] in the low nibble and code[j+16] in the high nibble.
+  Mirrors the FPC AVXQ4BlockCodes in neuralvolume.pas instruction by
+  instruction, with the integer constants built in registers and only
+  volatile registers used.
+  Win32 calling convention:
+    EAX      = src : PSingle (32 floats)
+    EDX      = dst : PByte (16 bytes)
+    [EBP+8]  = InvScale (Single, stack parameter; the compiler generates the
+               EBP frame because the function has a stack parameter)
+  Coded by Claude (AI)
+-----------------------------------------------------------------------------}
+procedure _AVX2Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single);
+asm
+  mov ecx, eax                  // ecx = src (32 floats = 128 bytes)
+
+  vbroadcastss ymm4, [ebp+8]    // ymm4 = InvScale
+
+  mov eax, $7FFFFFFF            // sign-clearing mask
+  vmovd xmm5, eax
+  vbroadcastss ymm5, xmm5
+  mov eax, $7F7FFFFF            // largest finite bits
+  vmovd xmm6, eax
+  vbroadcastss ymm6, xmm6
+
+  vmovups ymm0, [ecx]
+  vmovups ymm1, [ecx+32]
+  vmovups ymm2, [ecx+64]
+  vmovups ymm3, [ecx+96]
+
+  // non-finite (NaN/Inf) elements -> +0
+  vpand    ymm7, ymm0, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6     // NaN or Inf
+  vpandn   ymm0, ymm7, ymm0
+  vpand    ymm7, ymm1, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm1, ymm7, ymm1
+  vpand    ymm7, ymm2, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm2, ymm7, ymm2
+  vpand    ymm7, ymm3, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm3, ymm7, ymm3
+
+  // code = Min(15, Trunc(v * InvScale + 8.5)), two single roundings
+  vmulps   ymm0, ymm0, ymm4
+  vmulps   ymm1, ymm1, ymm4
+  vmulps   ymm2, ymm2, ymm4
+  vmulps   ymm3, ymm3, ymm4
+  mov eax, $41080000            // 8.5 as float bits
+  vmovd xmm7, eax
+  vbroadcastss ymm7, xmm7
+  vaddps   ymm0, ymm0, ymm7
+  vaddps   ymm1, ymm1, ymm7
+  vaddps   ymm2, ymm2, ymm7
+  vaddps   ymm3, ymm3, ymm7
+  vcvttps2dq ymm0, ymm0         // truncate toward zero
+  vcvttps2dq ymm1, ymm1
+  vcvttps2dq ymm2, ymm2
+  vcvttps2dq ymm3, ymm3
+  mov eax, 15
+  vmovd xmm7, eax
+  vbroadcastss ymm7, xmm7       // ymm7 = integer 15
+  vpminsd  ymm0, ymm0, ymm7
+  vpminsd  ymm1, ymm1, ymm7
+  vpminsd  ymm2, ymm2, ymm7
+  vpminsd  ymm3, ymm3, ymm7
+
+  // byte j = code[j] | code[j+16] shl 4
+  vpslld   ymm2, ymm2, 4        // elements 16..31 -> high nibbles
+  vpslld   ymm3, ymm3, 4
+  vpor     ymm0, ymm0, ymm2     // bytes 0..7 as dwords
+  vpor     ymm1, ymm1, ymm3     // bytes 8..15 as dwords
+  vextracti128 xmm2, ymm0, 1
+  vextracti128 xmm3, ymm1, 1
+  vpackusdw xmm0, xmm0, xmm2    // 8 words, in lane order
+  vpackusdw xmm1, xmm1, xmm3
+  vpackuswb xmm0, xmm0, xmm1    // 16 bytes
+  vmovups  [edx], xmm0
+  vzeroupper
+end;
+
+procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inline;
+begin
+  _AVX2Q4BlockCodes(src, dst, InvScale);
+end;
+
+{-----------------------------------------------------------------------------
+  Q4 block extreme index: index of the first of the 32 floats at src with the
+  largest finite magnitude, -1 when none is finite and non-zero. Finite
+  magnitudes order like their sign-cleared bits, so the scan is an integer
+  max; vpcmpeqd + vmovmskps then mark the lanes holding it. Mirrors the FPC
+  AVXQ4BlockExtremeIdx in neuralvolume.pas, restructured onto the volatile
+  YMM0-YMM7 only.
+  Win32 calling convention:
+    EAX  = src : PSingle (32 floats)
+    EAX  = result index (-1 when none)
+  Coded by Claude (AI)
+-----------------------------------------------------------------------------}
+function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer;
+asm
+  mov ecx, eax                  // ecx = src
+
+  mov eax, $7FFFFFFF            // sign-clearing mask
+  vmovd xmm5, eax
+  vbroadcastss ymm5, xmm5
+  mov eax, $7F7FFFFF            // largest finite bits
+  vmovd xmm6, eax
+  vbroadcastss ymm6, xmm6
+
+  vpand ymm0, ymm5, [ecx]       // |bits| of 4 x 8 floats
+  vpand ymm1, ymm5, [ecx+32]
+  vpand ymm2, ymm5, [ecx+64]
+  vpand ymm3, ymm5, [ecx+96]
+
+  vpcmpgtd ymm7, ymm0, ymm6     // NaN or Inf
+  vpandn   ymm0, ymm7, ymm0     // non-finite magnitude -> 0
+  vpcmpgtd ymm7, ymm1, ymm6
+  vpandn   ymm1, ymm7, ymm1
+  vpcmpgtd ymm7, ymm2, ymm6
+  vpandn   ymm2, ymm7, ymm2
+  vpcmpgtd ymm7, ymm3, ymm6
+  vpandn   ymm3, ymm7, ymm3
+
+  vpmaxud  ymm4, ymm0, ymm1     // block max into every lane
+  vpmaxud  ymm7, ymm2, ymm3
+  vpmaxud  ymm4, ymm4, ymm7
+  vextracti128 xmm7, ymm4, 1
+  vpmaxud  xmm4, xmm4, xmm7
+  vpshufd  xmm7, xmm4, $4E
+  vpmaxud  xmm4, xmm4, xmm7
+  vpshufd  xmm7, xmm4, $B1
+  vpmaxud  xmm4, xmm4, xmm7
+  vmovd    edx, xmm4            // edx = max |bits| (0 when none finite)
+
+  vinserti128 ymm4, ymm4, xmm4, 1
+  vpcmpeqd ymm0, ymm0, ymm4
+  vmovmskps eax, ymm0           // lanes 0..7
+  vpcmpeqd ymm1, ymm1, ymm4
+  vmovmskps ecx, ymm1
+  shl      ecx, 8
+  or       eax, ecx             // lanes 8..15
+  vpcmpeqd ymm2, ymm2, ymm4
+  vmovmskps ecx, ymm2
+  shl      ecx, 16
+  or       eax, ecx             // lanes 16..23
+  vpcmpeqd ymm3, ymm3, ymm4
+  vmovmskps ecx, ymm3
+  shl      ecx, 24
+  or       eax, ecx             // lanes 24..31
+
+  vzeroupper
+  test edx, edx
+  jz @None
+  bsf  eax, eax                 // first (lowest) matching index
+  jmp @Done
+@None:
+  mov eax, -1
+@Done:
+end;
+
+function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
+begin
+  Result := _AVX2Q4BlockExtremeIdx(src);
 end;
 
 end.

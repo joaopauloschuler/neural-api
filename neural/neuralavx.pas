@@ -60,6 +60,8 @@ function _AVXDotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB:
   PtrBlockSum8: PSingle; NumBlocks: integer): Single; inline;
 procedure _AVXReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); inline;
 procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
+procedure _AVXQ4BlockCodes( src : PSingle; dst : PByte; InvScale : Single ); inline;
+function _AVXQ4BlockExtremeIdx( src : PSingle ) : Integer; inline;
 
 implementation
 
@@ -619,6 +621,34 @@ begin
   _AVX512SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
   {$ELSE}
   _AVX2SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
+  {$ENDIF}
+end;
+
+{-----------------------------------------------------------------------------
+  _AVXQ4BlockCodes: packs nibbles Min(15, Trunc(src[i] * InvScale + 8.5)) of
+  exactly 32 floats into 16 bytes; NaN/Inf store nibble 8. Mirrors
+  AVXQ4BlockCodes in neuralvolume.pas.
+-----------------------------------------------------------------------------}
+procedure _AVXQ4BlockCodes( src : PSingle; dst : PByte; InvScale : Single ); inline;
+begin
+  {$IFDEF AVX64}
+  _AVX512Q4BlockCodes(src, dst, InvScale);
+  {$ELSE}
+  _AVX2Q4BlockCodes(src, dst, InvScale);
+  {$ENDIF}
+end;
+
+{-----------------------------------------------------------------------------
+  _AVXQ4BlockExtremeIdx: index of the first of the 32 floats at src with the
+  largest finite magnitude, -1 when none. Mirrors AVXQ4BlockExtremeIdx in
+  neuralvolume.pas.
+-----------------------------------------------------------------------------}
+function _AVXQ4BlockExtremeIdx( src : PSingle ) : Integer; inline;
+begin
+  {$IFDEF AVX64}
+  Result := _AVX512Q4BlockExtremeIdx(src);
+  {$ELSE}
+  Result := _AVX2Q4BlockExtremeIdx(src);
   {$ENDIF}
 end;
 

@@ -209,6 +209,15 @@ procedure _AVX512ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer)
 procedure _AVX2SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
 procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 
+// Coded by Claude (AI)
+// Q4 block helpers: process exactly 32 floats (one quantization block).
+procedure _AVX2Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); register; assembler;
+procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inline;
+
+// Coded by Claude (AI)
+function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer; register; assembler;
+function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
+
 
 implementation
 
@@ -1074,11 +1083,11 @@ asm
   jmp @Loop8
 
 @Tail:
-  test ecx, ecx
-  jz @Done
+  vxorps xmm4, xmm4, xmm4     // zero tail accumulator BEFORE the jz:
+  test ecx, ecx               // when N is a multiple of 8 the jump is taken,
+  jz @Done                    // and @Done still adds xmm4 to the result.
 
   // ---- Tail: accumulate in XMM4 (scalar) ----
-  vxorps xmm4, xmm4, xmm4
   xor r8, r8                  // r8 = index
 @ScalarLoop:
   vmovss xmm2, [rax + r8*4]
@@ -1186,11 +1195,11 @@ asm
   jmp @Loop4
 
 @Tail:
-  test ecx, ecx
-  jz @Done
+  vxorps xmm4, xmm4, xmm4     // zero tail accumulator BEFORE the jz:
+  test ecx, ecx               // when N is a multiple of 32 the jump is taken,
+  jz @Done                    // and @Done still adds xmm4 to the result.
 
   // ---- Scalar tail (0..3 elements) accumulated in XMM4 ----
-  vxorps xmm4, xmm4, xmm4
   xor r8, r8                  // r8 = index
 @ScalarLoop:
   vmovss xmm2, [rax + r8*4]
@@ -1360,11 +1369,11 @@ asm
   jmp @Loop4
 
 @Tail:
-  test ecx, ecx
-  jz @Done
+  vxorps xmm1, xmm1, xmm1     // zero tail accumulator BEFORE the jz:
+  test ecx, ecx               // when N is a multiple of 32 the jump is taken,
+  jz @Done                    // and @Done still adds xmm1 to the result.
 
   // ---- Scalar tail (0..3 elements) accumulated in XMM1 ----
-  vxorps xmm1, xmm1, xmm1
   xor r8, r8                  // r8 = index
 @ScalarLoop:
   vaddss xmm1, xmm1, [rax + r8*4]
@@ -1473,10 +1482,11 @@ end;
 -----------------------------------------------------------------------------}
 procedure _AVX2Exp(dst: PSingle; src: PSingle; N: Integer);
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // Load parameters
   mov rax, rcx                // rax = dst
@@ -1594,10 +1604,10 @@ asm
   jl @TailLoop
 
 @Exit:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 end;
 
 procedure _AVX512Exp( dst : PSingle; src : PSingle; N : Integer); inline;
@@ -1620,10 +1630,11 @@ end;
 -----------------------------------------------------------------------------}
 function _AVX2DotProd(dst: PSingle; src: PSingle; N: Integer): Single;
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // Load parameters into volatile registers
   mov rax, rcx                // rax = dst
@@ -1715,10 +1726,10 @@ asm
   vxorps xmm0, xmm0, xmm0
 
 @Exit:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 end;
 
 function _AVX512DotProd( dst : PSingle; src : PSingle; N : Integer ) : Single; inline;
@@ -1739,10 +1750,11 @@ end;
 -----------------------------------------------------------------------------}
 function _AVX2DotProdInt8(dst: PShortInt; src: PSingle; N: Integer): Single;
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // Load parameters into volatile registers
   mov rax, rcx                // rax = dst
@@ -1850,10 +1862,10 @@ asm
   vxorps xmm0, xmm0, xmm0
 
 @Done:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 end;
 
 function _AVX512DotProdInt8( dst : PShortInt; src : PSingle; N : Integer ) : Single; inline;
@@ -2054,8 +2066,8 @@ asm
   xor r9d, r9d                // index
   // r11 points to codes[bulk], rax to dst[bulk], r10 to src[bulk]
 @ScalarLoop:
-  movsx r12d, byte ptr [r11 + r9]   // load code sign-extended
-  vcvtsi2ss xmm0, xmm0, r12d
+  movsx edx, byte ptr [r11 + r9]    // load code sign-extended (edx: dead + volatile)
+  vcvtsi2ss xmm0, xmm0, edx
   vmovss xmm1, [r10 + r9*4]          // src[bulk + r9]  <-- corrected pointer
   vmulss xmm0, xmm0, xmm1
   vmovss xmm2, [rax + r9*4]          // dst[bulk + r9]
@@ -2184,10 +2196,11 @@ end;
 -----------------------------------------------------------------------------}
 procedure _AVX2QuantizeInt8(dst: PShortInt; src: PSingle; N: Integer; const MaxAbs: Single);
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // Load parameters into volatile registers
   mov r10, rcx                // r10 = dst
@@ -2265,10 +2278,10 @@ asm
   jl @TailLoop
 
 @Exit:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 end;
 
 procedure _AVX512QuantizeInt8( dst : PShortInt; src : PSingle; N : Integer; const MaxAbs : Single );
@@ -2772,10 +2785,11 @@ procedure _AVX2AdamDelta(PtrDelta, PtrM, PtrV: PSingle;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: Single;
   NumElements: Integer);
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // ---- Load pointer parameters into volatile registers ----
   mov r10, rcx                // r10 = PtrDelta
@@ -2873,10 +2887,10 @@ asm
   jl @TailLoop
 
 @Exit:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 
 end;
 
@@ -2905,10 +2919,11 @@ end;
 procedure _AVX2AdafactorDelta(PtrDelta, PtrV: PSingle;
   Beta2, k, c, Epsilon: Single; NumElements: Integer);
 asm
-  sub rsp, 32                 // allocate stack scratch
-  // Save non-volatile XMM6/XMM7 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp], xmm6
-  vmovups [rsp+16], xmm7
+  sub rsp, 64                 // allocate stack scratch
+  // Save non-volatile YMM6/YMM7 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   mov r10, rcx
   mov r11, rdx
@@ -2985,10 +3000,10 @@ asm
   jl @TailLoop
 
 @Exit:
-  vmovups xmm6, [rsp]
-  vmovups xmm7, [rsp+16]
   vzeroupper
-  add rsp, 32
+  vmovups ymm6, [rsp]
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
 end;
 
 procedure _AVX512AdafactorDelta( PtrDelta, PtrV : PSingle;
@@ -3088,25 +3103,26 @@ end;
     [RBP+80] = NumElements
 
   Uses volatile high XMM registers (XMM8-XMM15) to preserve constants.
-  Non-volatile YMM6/YMM7 and XMM8-XMM15 (low 128 bits) are saved/restored.
+  Non-volatile YMM6-YMM15 (full 256 bits) are saved/restored.
 -----------------------------------------------------------------------------}
 procedure _AVX2LionDelta(PtrDelta, PtrM: PSingle;
   Beta1, k1, Beta2, k2, NegLR, PosLR: Single;
   NumElements: Integer);
 asm
-  sub rsp, 192
+  sub rsp, 320
   vmovups [rsp], ymm6
   vmovups [rsp+32], ymm7
 
-  // Save non-volatile XMM8-XMM15 (low 128 bits; upper YMM halves are volatile)
-  vmovups [rsp+64],  xmm8
-  vmovups [rsp+80],  xmm9
-  vmovups [rsp+96],  xmm10
-  vmovups [rsp+112], xmm11
-  vmovups [rsp+128], xmm12
-  vmovups [rsp+144], xmm13
-  vmovups [rsp+160], xmm14
-  vmovups [rsp+176], xmm15
+  // Save non-volatile YMM8-YMM15 (full 256 bits: the Win64 ABI keeps XMM6-XMM15
+  // and the upper halves of YMM6-YMM15 preserved across calls)
+  vmovups [rsp+64],  ymm8
+  vmovups [rsp+96],  ymm9
+  vmovups [rsp+128], ymm10
+  vmovups [rsp+160], ymm11
+  vmovups [rsp+192], ymm12
+  vmovups [rsp+224], ymm13
+  vmovups [rsp+256], ymm14
+  vmovups [rsp+288], ymm15
 
   vmovaps xmm8, xmm2          // Beta1
   vmovaps xmm9, xmm3          // k1
@@ -3222,15 +3238,15 @@ asm
   vmovups ymm6, [rsp]
   vmovups ymm7, [rsp+32]
 
-  // Restore non-volatile XMM8-XMM15
-  vmovups xmm8,  [rsp+64]
-  vmovups xmm9,  [rsp+80]
-  vmovups xmm10, [rsp+96]
-  vmovups xmm11, [rsp+112]
-  vmovups xmm12, [rsp+128]
-  vmovups xmm13, [rsp+144]
-  vmovups xmm14, [rsp+160]
-  vmovups xmm15, [rsp+176]
+  // Restore non-volatile YMM8-YMM15
+  vmovups ymm8,  [rsp+64]
+  vmovups ymm9,  [rsp+96]
+  vmovups ymm10, [rsp+128]
+  vmovups ymm11, [rsp+160]
+  vmovups ymm12, [rsp+192]
+  vmovups ymm13, [rsp+224]
+  vmovups ymm14, [rsp+256]
+  vmovups ymm15, [rsp+288]
 
   add rsp, 192
 end;
@@ -4222,9 +4238,9 @@ end;
 -----------------------------------------------------------------------------}
 procedure _AVX2SinCos(dst: PSingle; src: PSingle; N: integer; DoCos: integer);
 asm
-  sub rsp, 128
-  vmovups [rsp+96], xmm6      // save non-volatile XMM6/XMM7
-  vmovups [rsp+112], xmm7
+  sub rsp, 160
+  vmovups [rsp+96], ymm6      // save non-volatile YMM6/YMM7
+  vmovups [rsp+128], ymm7
   mov [rsp+4], r9d            // save DoCos
 
   mov r10, rcx                // dst
@@ -4455,10 +4471,10 @@ asm
   jl @TailLoop
 
 @Exit:
-  vmovups xmm6, [rsp+96]      // restore non-volatile XMM6/XMM7
-  vmovups xmm7, [rsp+112]
   vzeroupper
-  add rsp, 128
+  vmovups ymm6, [rsp+96]      // restore non-volatile YMM6/YMM7
+  vmovups ymm7, [rsp+128]
+  add rsp, 160
 end;
 
 procedure _AVX512SinCos( dst : PSingle; src : PSingle; N : integer; DoCos : integer ); inline;
@@ -4481,9 +4497,9 @@ end;
 procedure _AVX2EncodeBF16(dst: PSingle; src: PSingle; N: integer);
 asm
   push rbx                    // save non-volatile RBX
-  // Save non-volatile XMM6/XMM7 into caller shadow space (RSP shifted by push)
-  vmovups [rsp+16], xmm6
-  vmovups [rsp+32], xmm7
+  sub rsp, 64
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
 
   // ---- Load parameters ----
   mov r10, rcx                // r10 = dst (Word pointer)
@@ -4609,10 +4625,11 @@ asm
   jl @ScalarLoop
 
 @Exit:
-  vmovups xmm6, [rsp+16]      // restore non-volatile XMM6/XMM7
-  vmovups xmm7, [rsp+32]
-  pop rbx
   vzeroupper
+  vmovups ymm6, [rsp]         // restore non-volatile YMM6/YMM7
+  vmovups ymm7, [rsp+32]
+  add rsp, 64
+  pop rbx
 end;
 
 procedure _AVX512EncodeBF16( dst: PSingle; src : PSingle; N : integer ); inline;
@@ -5537,6 +5554,187 @@ end;
 procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 begin
   _AVX2SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
+end;
+
+{-----------------------------------------------------------------------------
+  Q4 block codes: packs nibbles Min(15, Trunc(src[i] * InvScale + 8.5)) of
+  exactly 32 floats into 16 bytes at dst; NaN/Inf store nibble 8 (value 0).
+  Byte j holds code[j] in the low nibble and code[j+16] in the high nibble.
+  Mirrors the FPC AVXQ4BlockCodes in neuralvolume.pas instruction by
+  instruction, with the integer constants built in registers; YMM6/YMM7 are
+  used but saved and restored (non-volatile in Win64).
+  Win64 calling convention:
+    RCX   = src : PSingle (32 floats)
+    RDX   = dst : PByte (16 bytes)
+    XMM2  = InvScale (parameter 3, positional float register)
+  Coded by Claude (AI)
+-----------------------------------------------------------------------------}
+procedure _AVX2Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single);
+asm
+  sub rsp, 64
+  vmovdqu [rsp], ymm6           // save non-volatile YMM6/YMM7
+  vmovdqu [rsp+32], ymm7
+
+  mov rax, rcx                  // rax = src (32 floats = 128 bytes)
+
+  vbroadcastss ymm4, xmm2       // ymm4 = InvScale
+
+  mov r8d, $7FFFFFFF            // sign-clearing mask
+  vmovd xmm5, r8d
+  vbroadcastss ymm5, xmm5
+  mov r9d, $7F7FFFFF            // largest finite bits
+  vmovd xmm6, r9d
+  vbroadcastss ymm6, xmm6
+
+  vmovups ymm0, [rax]
+  vmovups ymm1, [rax+32]
+  vmovups ymm2, [rax+64]
+  vmovups ymm3, [rax+96]
+
+  // non-finite (NaN/Inf) elements -> +0
+  vpand    ymm7, ymm0, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6     // NaN or Inf
+  vpandn   ymm0, ymm7, ymm0
+  vpand    ymm7, ymm1, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm1, ymm7, ymm1
+  vpand    ymm7, ymm2, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm2, ymm7, ymm2
+  vpand    ymm7, ymm3, ymm5
+  vpcmpgtd ymm7, ymm7, ymm6
+  vpandn   ymm3, ymm7, ymm3
+
+  // code = Min(15, Trunc(v * InvScale + 8.5)), two single roundings
+  vmulps   ymm0, ymm0, ymm4
+  vmulps   ymm1, ymm1, ymm4
+  vmulps   ymm2, ymm2, ymm4
+  vmulps   ymm3, ymm3, ymm4
+  mov r8d, $41080000            // 8.5 as float bits
+  vmovd xmm7, r8d
+  vbroadcastss ymm7, xmm7
+  vaddps   ymm0, ymm0, ymm7
+  vaddps   ymm1, ymm1, ymm7
+  vaddps   ymm2, ymm2, ymm7
+  vaddps   ymm3, ymm3, ymm7
+  vcvttps2dq ymm0, ymm0         // truncate toward zero
+  vcvttps2dq ymm1, ymm1
+  vcvttps2dq ymm2, ymm2
+  vcvttps2dq ymm3, ymm3
+  mov r8d, 15
+  vmovd xmm7, r8d
+  vbroadcastss ymm7, xmm7       // ymm7 = integer 15
+  vpminsd  ymm0, ymm0, ymm7
+  vpminsd  ymm1, ymm1, ymm7
+  vpminsd  ymm2, ymm2, ymm7
+  vpminsd  ymm3, ymm3, ymm7
+
+  // byte j = code[j] | code[j+16] shl 4
+  vpslld   ymm2, ymm2, 4        // elements 16..31 -> high nibbles
+  vpslld   ymm3, ymm3, 4
+  vpor     ymm0, ymm0, ymm2     // bytes 0..7 as dwords
+  vpor     ymm1, ymm1, ymm3     // bytes 8..15 as dwords
+  vextracti128 xmm2, ymm0, 1
+  vextracti128 xmm3, ymm1, 1
+  vpackusdw xmm0, xmm0, xmm2    // 8 words, in lane order
+  vpackusdw xmm1, xmm1, xmm3
+  vpackuswb xmm0, xmm0, xmm1    // 16 bytes
+  vmovups  [rdx], xmm0
+  vzeroupper
+  vmovdqu ymm6, [rsp]           // restore non-volatile YMM6/YMM7
+  vmovdqu ymm7, [rsp+32]
+  add rsp, 64
+end;
+
+procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inline;
+begin
+  _AVX2Q4BlockCodes(src, dst, InvScale);
+end;
+
+{-----------------------------------------------------------------------------
+  Q4 block extreme index: index of the first of the 32 floats at src with the
+  largest finite magnitude, -1 when none is finite and non-zero. Finite
+  magnitudes order like their sign-cleared bits, so the scan is an integer
+  max; vpcmpeqd + vmovmskps then mark the lanes holding it. Mirrors the FPC
+  AVXQ4BlockExtremeIdx in neuralvolume.pas; YMM6/YMM7 are used but saved and
+  restored (non-volatile in Win64).
+  Win64 calling convention:
+    RCX  = src : PSingle (32 floats)
+    EAX  = result index (-1 when none)
+  Coded by Claude (AI)
+-----------------------------------------------------------------------------}
+function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer;
+asm
+  sub rsp, 64
+  vmovdqu [rsp], ymm6           // save non-volatile YMM6/YMM7
+  vmovdqu [rsp+32], ymm7
+
+  mov r8, rcx                   // r8 = src
+
+  mov eax, $7FFFFFFF            // sign-clearing mask
+  vmovd xmm5, eax
+  vbroadcastss ymm5, xmm5
+  mov eax, $7F7FFFFF            // largest finite bits
+  vmovd xmm6, eax
+  vbroadcastss ymm6, xmm6
+
+  vpand ymm0, ymm5, [r8]        // |bits| of 4 x 8 floats
+  vpand ymm1, ymm5, [r8+32]
+  vpand ymm2, ymm5, [r8+64]
+  vpand ymm3, ymm5, [r8+96]
+
+  vpcmpgtd ymm7, ymm0, ymm6     // NaN or Inf
+  vpandn   ymm0, ymm7, ymm0     // non-finite magnitude -> 0
+  vpcmpgtd ymm7, ymm1, ymm6
+  vpandn   ymm1, ymm7, ymm1
+  vpcmpgtd ymm7, ymm2, ymm6
+  vpandn   ymm2, ymm7, ymm2
+  vpcmpgtd ymm7, ymm3, ymm6
+  vpandn   ymm3, ymm7, ymm3
+
+  vpmaxud  ymm4, ymm0, ymm1     // block max into every lane
+  vpmaxud  ymm7, ymm2, ymm3
+  vpmaxud  ymm4, ymm4, ymm7
+  vextracti128 xmm7, ymm4, 1
+  vpmaxud  xmm4, xmm4, xmm7
+  vpshufd  xmm7, xmm4, $4E
+  vpmaxud  xmm4, xmm4, xmm7
+  vpshufd  xmm7, xmm4, $B1
+  vpmaxud  xmm4, xmm4, xmm7
+  vmovd    edx, xmm4            // edx = max |bits| (0 when none finite)
+
+  vinserti128 ymm4, ymm4, xmm4, 1
+  vpcmpeqd ymm0, ymm0, ymm4
+  vmovmskps eax, ymm0           // lanes 0..7
+  vpcmpeqd ymm1, ymm1, ymm4
+  vmovmskps ecx, ymm1
+  shl      ecx, 8
+  or       eax, ecx             // lanes 8..15
+  vpcmpeqd ymm2, ymm2, ymm4
+  vmovmskps ecx, ymm2
+  shl      ecx, 16
+  or       eax, ecx             // lanes 16..23
+  vpcmpeqd ymm3, ymm3, ymm4
+  vmovmskps ecx, ymm3
+  shl      ecx, 24
+  or       eax, ecx             // lanes 24..31
+
+  vzeroupper
+  test edx, edx
+  jz @None
+  bsf  eax, eax                 // first (lowest) matching index
+  jmp @Done
+@None:
+  mov eax, -1
+@Done:
+  vmovdqu ymm6, [rsp]           // restore non-volatile YMM6/YMM7
+  vmovdqu ymm7, [rsp+32]
+  add rsp, 64
+end;
+
+function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
+begin
+  Result := _AVX2Q4BlockExtremeIdx(src);
 end;
 
 

@@ -24,6 +24,11 @@ type
     procedure FillWithConst(var Arr: array of Single; const Value: Single; N: Integer);
     procedure FillWithSeq(var Arr: array of Single; Start, Step: Single; N: Integer);
 
+    // Scalar Q4 references mirroring neuralvolume.pas
+    // Q4BlockExtremeIdx / Q4BlockCodes
+    function Q4RefExtremeIdx(Block: PSingle): Integer;
+    procedure Q4RefCodes(Block: PSingle; InvScale: Single; Codes: PByte);
+
     // Conversion helpers for half and bfloat16 (IEEE-754 binary16 / bfloat16)
     function SingleToHalf(Value: Single): Word;
     function HalfToSingle(Value: Word): Single;
@@ -78,6 +83,8 @@ type
     procedure TestDotProductInt4Int8;
     procedure TestReluGrad;
     procedure TestSinCosBoth;
+    procedure TestQ4BlockCodes;
+    procedure TestQ4BlockExtremeIdx;
     //
     procedure TestMulAddF_ParamProbe;
     procedure TestMulAddF_BoundaryN;
@@ -98,6 +105,8 @@ type
   end;
 
 implementation
+
+{$POINTERMATH ON}
 
 uses
   System.RTLConsts;
@@ -2011,6 +2020,141 @@ begin
     else Ref[i] := Slope;
   _AVXReluLGateMask(@Dst[0], @Src[0], Low, High, Slope, N);
   Check(CompareSingleArrays(Dst, Ref, N, 1e-6), 'ReluLGateMask failed');
+end;
+
+// Scalar reference of neuralvolume.pas FiniteBitsOrZero semantics: bits of a
+// binary32 value, or 0 (+0.0) when they encode NaN or +/-Inf.
+function TTestAVX.Q4RefExtremeIdx(Block: PSingle): Integer;
+var
+  i: Integer;
+  Bits, AbsBits, MaxAbsBits: LongWord;
+begin
+  Result := -1;
+  MaxAbsBits := 0;
+  for i := 0 to 31 do
+  begin
+    Bits := PLongWord(@(Block[i]))^;
+    if (Bits and $7F800000) = $7F800000 then Bits := 0; // NaN/Inf -> 0
+    AbsBits := Bits and $7FFFFFFF;
+    if AbsBits > MaxAbsBits then
+    begin
+      MaxAbsBits := AbsBits;
+      Result := i;
+    end;
+  end;
+end;
+
+// Scalar reference of neuralvolume.pas Q4BlockCodes: nibbles
+// Min(15, Trunc(v * InvScale + 8.5)) of 32 floats into 16 bytes, byte j
+// holding code[j] | code[j+16] shl 4. Single temporaries force the two
+// single roundings the AVX path performs (Delphi Win32 would otherwise
+// evaluate the expression in Extended precision).
+procedure TTestAVX.Q4RefCodes(Block: PSingle; InvScale: Single; Codes: PByte);
+var
+  ByteIdx: Integer;
+  Bits: LongWord;
+  Scaled: Single;
+  LowCode, HighCode: Integer;
+begin
+  for ByteIdx := 0 to 15 do
+  begin
+    Bits := PLongWord(@(Block[ByteIdx]))^;
+    if (Bits and $7F800000) = $7F800000 then Bits := 0;
+    Scaled := PSingle(@Bits)^ * InvScale;   // single rounding
+    Scaled := Scaled + 8.5;                 // single rounding
+    LowCode := Min(15, Trunc(Scaled));
+
+    Bits := PLongWord(@(Block[ByteIdx + 16]))^;
+    if (Bits and $7F800000) = $7F800000 then Bits := 0;
+    Scaled := PSingle(@Bits)^ * InvScale;
+    Scaled := Scaled + 8.5;
+    HighCode := Min(15, Trunc(Scaled));
+
+    Codes[ByteIdx] := Byte(LowCode or (HighCode shl 4));
+  end;
+end;
+
+procedure TTestAVX.TestQ4BlockExtremeIdx;
+var
+  Block: array[0..31] of Single;
+  i, Ref, Actual, CaseIdx: Integer;
+begin
+  // Random finite values, positive and negative magnitudes
+  for CaseIdx := 1 to 10 do
+  begin
+    for i := 0 to 31 do Block[i] := (Random(2001) - 1000) / 100.0;
+    Ref := Q4RefExtremeIdx(@Block[0]);
+    Actual := _AVXQ4BlockExtremeIdx(@Block[0]);
+    Check(Actual = Ref, Format('Q4BlockExtremeIdx random: expected %d got %d',
+      [Ref, Actual]));
+  end;
+
+  // Magnitude tie: the first occurrence wins
+  for i := 0 to 31 do Block[i] := 0.1 * i;
+  Block[5] := 9.0;
+  Block[17] := -9.0;
+  Check(_AVXQ4BlockExtremeIdx(@Block[0]) = 5, 'Q4BlockExtremeIdx tie');
+
+  // NaN / Inf are ignored; the largest finite magnitude wins
+  for i := 0 to 31 do Block[i] := 1.0 * i;
+  Block[3] := NaN;
+  Block[9] := Infinity;
+  Block[20] := -Infinity;
+  Block[30] := 100.0;
+  Check(_AVXQ4BlockExtremeIdx(@Block[0]) = 30, 'Q4BlockExtremeIdx non-finite');
+
+  // No finite non-zero value -> -1
+  for i := 0 to 31 do Block[i] := NaN;
+  Check(_AVXQ4BlockExtremeIdx(@Block[0]) = -1, 'Q4BlockExtremeIdx all NaN');
+  for i := 0 to 31 do Block[i] := 0.0;
+  Check(_AVXQ4BlockExtremeIdx(@Block[0]) = -1, 'Q4BlockExtremeIdx all zeros');
+  Block[7] := Infinity;
+  Check(_AVXQ4BlockExtremeIdx(@Block[0]) = -1, 'Q4BlockExtremeIdx only Inf');
+end;
+
+procedure TTestAVX.TestQ4BlockCodes;
+const
+  CASES = 12;
+var
+  Block: array[0..31] of Single;
+  RefCodes, ActCodes: array[0..15] of Byte;
+  MaxSigned, InvScale: Single;
+  CaseIdx, i, Extreme: Integer;
+begin
+  for CaseIdx := 1 to CASES do
+  begin
+    case CaseIdx mod 4 of
+      0: // NaN / Inf mixed with finite values
+        begin
+          for i := 0 to 31 do Block[i] := (Random(2001) - 1000) / 100.0;
+          Block[2] := NaN;
+          Block[7] := Infinity;
+          Block[19] := -Infinity;
+          Block[30] := NaN;
+        end;
+      1: // all zeros: no extreme, InvScale = 0, every nibble stores 8
+        for i := 0 to 31 do Block[i] := 0.0;
+      2: // magnitude tie between a negative and a positive maximum
+        begin
+          for i := 0 to 31 do Block[i] := (Random(21) - 10) / 10.0;
+          Block[5] := -12.5;
+          Block[17] := 12.5;
+        end;
+    else // pure random finite values
+      for i := 0 to 31 do Block[i] := (Random(2001) - 1000) / 100.0;
+    end;
+
+    // Production scale: the largest-magnitude finite value maps to code -8
+    Extreme := Q4RefExtremeIdx(@Block[0]);
+    if Extreme >= 0 then MaxSigned := Block[Extreme] else MaxSigned := 0.0;
+    if MaxSigned <> 0.0 then InvScale := -8 / MaxSigned else InvScale := 0.0;
+
+    Q4RefCodes(@Block[0], InvScale, @RefCodes[0]);
+    FillChar(ActCodes, SizeOf(ActCodes), $AA);
+    _AVXQ4BlockCodes(@Block[0], @ActCodes[0], InvScale);
+    Check(CompareMem(@RefCodes[0], @ActCodes[0], 16),
+      Format('Q4BlockCodes case %d mismatch', [CaseIdx]));
+  end;
 end;
 
 initialization
