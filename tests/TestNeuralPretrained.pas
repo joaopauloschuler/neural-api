@@ -154,6 +154,9 @@ type
       TNeuralIntegerArray;
     // A growing thinking conversation resumes turn 2 at turn 1's last-user end.
     procedure RunChatThinkingResume(const Stem: string);
+    // A message inserted before the last one every turn: turn 2 resumes at
+    // turn 1's Msgs[0..High-2] capture.
+    procedure RunChatInsertedMessageResume(const Stem: string);
     // Thinking conversations A, B, A, B taking turns with --kv-slots 3.
     procedure RunChatKVSlotSwitch(const Stem: string;
       const ExtraArgs: array of string);
@@ -473,6 +476,7 @@ type
     procedure TestQwen35ChatCheckpointFlagErrors;
     procedure TestChatCountLastUserTokens;
     procedure TestChatThinkingResume;
+    procedure TestChatInsertedMessageResume;
     procedure TestChatKVSlotSwitch;
     procedure TestChatKVSlotSwitchPrefillWindow;
     procedure TestChatKVSlotSwitchOpenCL;
@@ -12871,6 +12875,108 @@ procedure TTestNeuralPretrained.TestChatThinkingResume;
 begin
   RunChatThinkingResume('qwen3_5');
   RunChatThinkingResume('mamba');
+end;
+
+// A client that puts a moving message (here a knowledge note) right before
+// the last message of every turn: turn 2 diverges where turn 1 had the note,
+// before turn 1's last-user, prompt-end and reply-end captures. Turn 2 must
+// resume at turn 1's Msgs[0..High-2] capture and reply as a fresh engine
+// does. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatInsertedMessageResume(const Stem: string);
+const
+  Ctx = 512;
+  Vocab = 12;
+var
+  Dir, Tag: string;
+  Engine, Fresh: TChatEngine;
+  Msgs: TChatMessages;
+  Prompt1, Prompt2: TNeuralIntegerArray;
+  System1, User1, ButLastTwo1, FirstHalf1: integer;
+  System2, User2, ButLastTwo2, FirstHalf2, Shared: integer;
+  Turn1, Turn2, FreshTurn: TChatTurnRecord;
+
+  function RenderTurn(out SystemTokens, LastUserTokens, ButLastTwoTokens,
+    FirstHalfTokens: integer): TNeuralIntegerArray;
+  var
+    TokenPos, MaxTokenPos: integer;
+  begin
+    Engine.ChatFormat := cfQwen3_5;
+    Engine.RawMode := false;
+    Result := EncodeChat(Engine.Tokenizer, cfQwen3_5, Msgs,
+      ChatTemplateOptions(true, false, Engine.Opt.ReasoningEffort));
+    SystemTokens := Engine.CountSystemPromptTokens(Msgs, Result, Engine.Opt);
+    LastUserTokens := Engine.CountLastUserTokens(Msgs, Result, Engine.Opt);
+    ButLastTwoTokens := Engine.CountMessagePrefixTokens(Msgs, High(Msgs) - 2,
+      Result, Engine.Opt);
+    FirstHalfTokens := Engine.CountMessagePrefixTokens(Msgs, High(Msgs) div 2,
+      Result, Engine.Opt);
+    MaxTokenPos := High(Result);
+    for TokenPos := 0 to MaxTokenPos do
+      Result[TokenPos] := Result[TokenPos] mod Vocab;
+  end;
+
+begin
+  Tag := Stem + ': ';
+  RandSeed := 747474;
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  Fresh := nil;
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 0, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, []);
+    SetLength(Msgs, 5);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Tell me about cats.');
+    Msgs[2] := ChatMessage('assistant', 'Cats are small furry pets.');
+    Msgs[3] := ChatMessage('assistant', '<knowledge>cats purr</knowledge>');
+    Msgs[4] := ChatMessage('user', 'And dogs?');
+    Prompt1 := RenderTurn(System1, User1, ButLastTwo1, FirstHalf1);
+    SetLength(Msgs, 7);
+    Msgs[3] := ChatMessage('user', 'And dogs?');
+    Msgs[4] := ChatMessage('assistant', 'Dogs bark.');
+    Msgs[5] := ChatMessage('assistant',
+      '<knowledge>cats purr, dogs bark</knowledge>');
+    Msgs[6] := ChatMessage('user', 'And birds?');
+    Prompt2 := RenderTurn(System2, User2, ButLastTwo2, FirstHalf2);
+    AssertTrue(Tag + 'Msgs[0..High-2] ends past the system prompt',
+      ButLastTwo1 > System1);
+    AssertTrue(Tag + 'Msgs[0..High-2] ends before the last user message',
+      ButLastTwo1 < User1);
+
+    Turn1.Reply := Engine.GenerateFromIds(Prompt1, Engine.Opt, System1, User1,
+      ButLastTwo1, FirstHalf1);
+    Turn1.Completion := Engine.LastCompletionTokens;
+    Turn1.Cached := Copy(Engine.CachedTokens);
+    Shared := CommonPrefixLen(Prompt2, Turn1.Cached);
+    AssertTrue(Tag + 'turn 2 keeps turn 1 up to Msgs[0..High-2]',
+      Shared >= ButLastTwo1);
+    AssertTrue(Tag + 'turn 2 diverges before turn 1''s last-user end',
+      Shared < User1);
+
+    Turn2.Reply := Engine.GenerateFromIds(Prompt2, Engine.Opt, System2, User2,
+      ButLastTwo2, FirstHalf2);
+    Turn2.Completion := Engine.LastCompletionTokens;
+    Turn2.Cached := Copy(Engine.CachedTokens);
+    AssertTrue(Tag + 'resumed from a checkpoint',
+      Engine.LastResumeRoute = crrCheckpoint);
+    AssertEquals(Tag + 'resumed at turn 1''s Msgs[0..High-2] end',
+      ButLastTwo1, Engine.LastReusedTokens);
+
+    FreshTurn.Reply := Fresh.GenerateFromIds(Prompt2, Fresh.Opt);
+    FreshTurn.Completion := Fresh.LastCompletionTokens;
+    FreshTurn.Cached := Copy(Fresh.CachedTokens);
+    AssertSameChatTurn(FreshTurn, Turn2, Tag + 'turn 2 vs fresh');
+  finally
+    Fresh.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatInsertedMessageResume;
+begin
+  RunChatInsertedMessageResume('qwen3_5');
+  RunChatInsertedMessageResume('mamba');
 end;
 
 // Two Qwen3.5 thinking conversations A and B (same system prompt) take turns
