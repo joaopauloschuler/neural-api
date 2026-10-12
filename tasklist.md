@@ -1444,11 +1444,33 @@ rather than acted on.
         numpy pico fixture.
         Done: `tools/make_kokoro82m_fixture.py tiny` -> `tests/fixtures/tiny_kokoro82m/`
         (`config.json`, `kokoro-v1_0.pth`, `voices/af_heart.pt`) + `tiny_kokoro82m_ref.{safetensors,json}`.
-  - [ ] 0.3 Per-utterance length: token count and frame count change every
+  - [x] 0.3 Per-utterance length: token count and frame count change every
         sentence, and a `TNNet`'s length is fixed when it is built. Measure the cost
         of rebuilding the stage nets from in-memory weights vs. padded buckets
         (padding changes InstanceNorm statistics and the reverse LSTM, so buckets need
         masking). Report before Phase 2.
+        Done: use a BORROWING REBUILD per utterance, the `TQwenImage21VaeDecoder`
+        pattern: one owner net per stage built once at a small length, then per
+        utterance `Net.BuildWeightOwner := Owner`, build at T/F, `BuildWeightOwner :=
+        nil` (layers link the owner's neurons, size no weights; OpenCL: arm the owner,
+        `EnableOpenCLInContextOf`, layers borrow its device weights). Measured on a
+        stage-C-like net (133 layers, 78.7M weights: 4 TDNN k3 blocks at 1024 ch,
+        Deconvolution stand-ins x2/x10/x6, 2 MRFs of TDNN k3/7/11 d1/3/5 at 256/128 ch),
+        CPU, F=100 frames, two runs (VM noise ~2-3x): owner build at F=8 119-690 ms,
+        355 MB; borrowing build 244-863 ms, 0 weight elements, +410 MB (activations
+        only, ~4.1 MB/frame; F=300 +1225 MB); rebuild + CopyWeights 350-1174 ms +
+        38-101 ms copy, +720 MB (a second 315 MB weight copy); forward 6.2-8.9 s.
+        Borrow output == copy output bit-exact. In the same run the borrowing build
+        (863 ms) is ~13% of one stage-C forward. Rejected: re-propagating sizes in place (`SetPrevLayer` is private,
+        many overrides call `InitDefault` and wipe weights, `TNNetSum`/concat size in
+        their constructor, OpenCL buffers are sized at `EnableOpenCL`); padded buckets
+        (needs a valid length on ~58 AdaIN InstanceNorms + ~65 conv inputs re-zeroed
+        in stage C, the reverse LSTM start, an ALBERT key mask, and pays the padding
+        in compute) to save ~13%. Traps: `TNNetInstanceNorm.Create(false)` is
+        a PER-ELEMENT affine sized by length (use the default `true`, gamma 1 beta 0);
+        build the owner long enough that `TNNetConvolutionAbstract.SetPrevLayer` does
+        not clamp a kernel (Deconvolution K20 p5 needs input >= 10). OpenCL arming
+        per rebuild not measured (no GPU here).
   - [ ] 0.4 Layers for the `TNNet` route:
         - dilated 1D conv: REUSE `TNNetTDNNConv1D` (centred SAME padding = torch
           `get_padding` for odd K, dilation). Gaps: no OpenCL path, and `Compute` is
@@ -1462,6 +1484,17 @@ rather than acted on.
           shape). Needs an X-only 1D geometry and groups (depthwise).
         - per-channel Snake (`TNNetSnake` has one scalar alpha).
         - AdaIN as InstanceNorm + per-channel scale/shift set once per utterance.
+  - [ ] 0.5 Stage-net holder for Kokoro: owner nets for stages A/B/C built once
+        from the checkpoint, `PrepareNet(T)` / `PrepareNet(F)` borrowing rebuild that
+        exits early when the length is unchanged, OpenCL arming as in
+        `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
+        code path; do not clone it.
+  - [ ] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
+        build allocates and `InitDefault`s them, then `LinkNeuronsFrom` frees them.
+        Correct but wasted; honour `DeferWeightSizingToBuildLink` there (~5 lines).
+  - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
+        (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
+        (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
   Phase 1 — loading:
   - [ ] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
         pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
