@@ -95,6 +95,11 @@ uses
   Classes, SysUtils, DateUtils, fpjson, jsonparser, fphttpserver,
   neuralvolume, neuralchat, neuralchatengine;
 
+const
+  // Conversation slots when --kv-slots is not given: alternating clients
+  // resume their own conversation instead of re-prefilling it.
+  csChatServerDefaultKVSlots = 4;
+
 type
   // TFPHTTPServer keeps the listen Address protected; republish it so the
   // server can honor --host.
@@ -132,6 +137,9 @@ begin
   WriteLn('Server options:');
   WriteLn('  --host ADDR           listen address (default 127.0.0.1, loopback only)');
   WriteLn('  --port N              listen port (default 8080)');
+  WriteLn('  --kv-slots N          conversation slots, see below (default ',
+    csChatServerDefaultKVSlots, ' here;');
+  WriteLn('                        --kv-slots 0 turns them off)');
   WriteLn;
   PrintChatOptionsHelp();
 end;
@@ -889,6 +897,14 @@ begin
   end;
 end;
 
+// Parses the command line and applies the server's own defaults; false +
+// Opt.ErrorMsg on a bad argument.
+function ParseServerArgs(Args: TStringList; var Opt: TChatOptions): boolean;
+begin
+  Result := ParseArgs(Args, Opt);
+  Opt.DefaultKVSlots := csChatServerDefaultKVSlots;
+end;
+
 // ---------------------------------------------------------------------------
 // --selftest: offline unit checks (no model files needed).
 // ---------------------------------------------------------------------------
@@ -919,13 +935,28 @@ var
   end;
 
 var
-  Base, GenOpt: TChatOptions;
+  Base, GenOpt, ServerOpt: TChatOptions;
   Req: TJSONObject;
   Msgs: TChatMessages;
   ErrMsg: string;
   IgnoredStop, Stream, IncludeUsage: boolean;
+  ServerArgs: TStringList;
 begin
   Failures := 0;
+  // Conversation slots: on by default here, an explicit --kv-slots wins.
+  ServerArgs := TStringList.Create();
+  try
+    ServerArgs.Add('model');
+    Check(ParseServerArgs(ServerArgs, ServerOpt) and
+      (ServerOpt.KVSlots < 0) and
+      (ServerOpt.DefaultKVSlots = csChatServerDefaultKVSlots),
+      'no --kv-slots: the server default applies');
+    ServerArgs.Add('--kv-slots'); ServerArgs.Add('0');
+    Check(ParseServerArgs(ServerArgs, ServerOpt) and (ServerOpt.KVSlots = 0),
+      '--kv-slots 0 turns the slots off');
+  finally
+    ServerArgs.Free;
+  end;
   Base := DefaultChatOptions();
   Base.Temperature := 0.7;
   Base.TopP := 0.8;
@@ -1219,7 +1250,7 @@ var
 begin
   Args := TStringList.Create();
   for Cnt := 1 to ParamCount do Args.Add(ParamStr(Cnt));
-  if not ParseArgs(Args, Opt) then
+  if not ParseServerArgs(Args, Opt) then
   begin
     WriteLn('Error: ', Opt.ErrorMsg);
     WriteLn;

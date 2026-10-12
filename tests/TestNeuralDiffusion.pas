@@ -83,6 +83,8 @@ type
     procedure TestFlowMatchStepVsOracle;
     procedure TestFlowMatchStaticAndLinearShift;
     procedure TestFlowMatchFromDiffusersConfig;
+    procedure TestFlowMatchImg2ImgStartStepVsOracle;
+    procedure TestFlowMatchScaleNoiseVsOracle;
   end;
 
 implementation
@@ -1062,6 +1064,123 @@ begin
     DeleteFile(KarrasFile);
   end;
   AssertTrue('Karras sigmas are refused', Refused);
+end;
+
+const
+  cImg2ImgOracleFile = 'qwenimage21_img2img_oracle.json';
+
+procedure TTestNeuralDiffusion.TestFlowMatchImg2ImgStartStepVsOracle;
+var
+  Root, Config, CaseObj: TJSONObject;
+  Cases: TJSONArray;
+  Sched: TNNetFlowMatchEulerScheduler;
+  CasePos, NumSteps, StartStep: integer;
+  Mu: double;
+  Refused: boolean;
+
+  function IsRefused(StepCount: integer; Strength: double): boolean;
+  begin
+    Result := false;
+    try
+      TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
+    except
+      on Exception do Result := true;
+    end;
+  end;
+
+begin
+  // t_start = int(N - min(N * strength, N)) from QwenImageImg2ImgPipeline,
+  // and Sigma[t_start] of the 2.1 schedule to the float64 formula.
+  Root := LoadFlowOracle(cImg2ImgOracleFile);
+  Sched := nil;
+  try
+    Config := Root.Objects['config'];
+    Cases := Root.Arrays['cases'];
+    AssertTrue('oracle cases', Cases.Count >= 10);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CasePos];
+      NumSteps := CaseObj.Get('num_steps', 0);
+      StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(NumSteps,
+        CaseObj.Get('strength', 0.0));
+      AssertEquals('t_start case ' + IntToStr(CasePos),
+        CaseObj.Get('t_start', -1), StartStep);
+      AssertEquals('steps run case ' + IntToStr(CasePos),
+        CaseObj.Get('steps_run', -1), NumSteps - StartStep);
+      Sched := CreateFlowSchedulerFromOracle(Config);
+      Mu := Sched.CalculateShift(Root.Get('image_seq_len', 0),
+        Config.Get('base_image_seq_len', 0), Config.Get('max_image_seq_len', 0),
+        Config.Get('base_shift', 0.0), Config.Get('max_shift', 0.0));
+      AssertEquals('mu case ' + IntToStr(CasePos), CaseObj.Get('mu', 0.0), Mu,
+        1e-12);
+      Sched.SetTimesteps(NumSteps, Mu);
+      AssertEquals('sigma[t_start] case ' + IntToStr(CasePos),
+        CaseObj.Get('sigma_start_f64', 0.0), Sched.Sigma[StartStep], 1e-12);
+      FreeAndNil(Sched);
+    end;
+    Cases := Root.Arrays['zero_step_cases'];
+    AssertEquals('zero-step cases', 2, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CasePos];
+      AssertTrue('no step left is refused, case ' + IntToStr(CasePos),
+        IsRefused(CaseObj.Get('num_steps', 0), CaseObj.Get('strength', 0.0)));
+    end;
+    AssertTrue('strength above 1 is refused', IsRefused(10, 1.5));
+    AssertTrue('negative strength is refused', IsRefused(10, -0.1));
+    AssertTrue('NaN strength is refused', IsRefused(10, NaN));
+    Refused := IsRefused(10, 1e-10);
+    AssertFalse('a tiny strength still runs one step', Refused);
+    AssertEquals('which is the last', 9,
+      TNNetFlowMatchEulerScheduler.Img2ImgStartStep(10, 1e-10));
+  finally
+    Sched.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchScaleNoiseVsOracle;
+var
+  Root, Config, Oracle: TJSONObject;
+  Sched: TNNetFlowMatchEulerScheduler;
+  Noise, Sample: TNNetVolume;
+  Expected: TJSONArray;
+  ElementPos, StartStep: integer;
+begin
+  // sigma * noise + (1 - sigma) * sample in single precision: 1e-6 absolute.
+  Root := LoadFlowOracle(cImg2ImgOracleFile);
+  Sched := nil;
+  Noise := TNNetVolume.Create;
+  Sample := TNNetVolume.Create;
+  try
+    Config := Root.Objects['config'];
+    Oracle := Root.Objects['scale_noise'];
+    Sample.ReSize(6, 1, 1);
+    Noise.ReSize(6, 1, 1);
+    for ElementPos := 0 to 5 do
+    begin
+      Sample.FData[ElementPos] := Oracle.Arrays['sample'].Floats[ElementPos];
+      Noise.FData[ElementPos] := Oracle.Arrays['noise'].Floats[ElementPos];
+    end;
+    Sched := CreateFlowSchedulerFromOracle(Config);
+    Sched.SetTimesteps(Oracle.Get('num_steps', 0), Sched.CalculateShift(
+      Root.Get('image_seq_len', 0), Config.Get('base_image_seq_len', 0),
+      Config.Get('max_image_seq_len', 0), Config.Get('base_shift', 0.0),
+      Config.Get('max_shift', 0.0)));
+    StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(
+      Oracle.Get('num_steps', 0), Oracle.Get('strength', 0.0));
+    AssertEquals('t_start', Oracle.Get('t_start', -1), StartStep);
+    Sched.ScaleNoise(Noise, Sample, StartStep);
+    Expected := Oracle.Arrays['noised_f64'];
+    for ElementPos := 0 to 5 do
+      AssertEquals('noised @ ' + IntToStr(ElementPos),
+        Expected.Floats[ElementPos], Noise.FData[ElementPos], 1e-6);
+  finally
+    Sched.Free;
+    Noise.Free;
+    Sample.Free;
+    Root.Free;
+  end;
 end;
 
 initialization

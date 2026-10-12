@@ -140,6 +140,10 @@ type
   function NeuralAtomicIncrement(var Target: LongInt): LongInt;
   function NeuralAtomicDecrement(var Target: LongInt): LongInt;
   function NeuralAtomicRead(var Target: LongInt): LongInt;
+  // 64-bit add and full-barrier read, also on 32-bit targets (a critical
+  // section where the compiler has no 64-bit interlocked add).
+  procedure NeuralAtomicAdd64(var Target: Int64; Value: Int64);
+  function NeuralAtomicRead64(var Target: Int64): Int64;
   // SMT-polite busy-wait hint for spin loops: PAUSE on x86 (releases the
   // core's execution resources to the sibling hyperthread and saves power;
   // ~tens of ns), a no-op elsewhere. Unlike TThread.Yield it is NOT a
@@ -199,6 +203,37 @@ begin
   {$ELSE}
   Result := AtomicCmpExchange(Target, 0, 0);
   {$ENDIF}
+end;
+
+{$IF DEFINED(FPC) AND NOT DEFINED(CPU64)}
+var
+  vAtomic64CritSec: TRTLCriticalSection;
+{$IFEND}
+
+procedure NeuralAtomicAdd64(var Target: Int64; Value: Int64);
+begin
+  {$IF DEFINED(FPC) AND DEFINED(CPU64)}
+  InterLockedExchangeAdd64(Target, Value);
+  {$ELSEIF DEFINED(FPC)}
+  EnterCriticalSection(vAtomic64CritSec);
+  Inc(Target, Value);
+  LeaveCriticalSection(vAtomic64CritSec);
+  {$ELSE}
+  AtomicIncrement(Target, Value);
+  {$IFEND}
+end;
+
+function NeuralAtomicRead64(var Target: Int64): Int64;
+begin
+  {$IF DEFINED(FPC) AND DEFINED(CPU64)}
+  Result := InterLockedExchangeAdd64(Target, 0);
+  {$ELSEIF DEFINED(FPC)}
+  EnterCriticalSection(vAtomic64CritSec);
+  Result := Target;
+  LeaveCriticalSection(vAtomic64CritSec);
+  {$ELSE}
+  Result := AtomicCmpExchange(Target, 0, 0);
+  {$IFEND}
 end;
 
 {$IF DEFINED(CPUX86_64) OR DEFINED(CPUX64) OR DEFINED(CPU386) OR DEFINED(CPUI386)}
@@ -536,9 +571,15 @@ end;
 initialization
 vNTL := nil;
 vDefaultThreadCountCached := 0;
+{$IF DEFINED(FPC) AND NOT DEFINED(CPU64)}
+InitCriticalSection(vAtomic64CritSec);
+{$IFEND}
 
 finalization
 NeuralThreadListFree();
+{$IF DEFINED(FPC) AND NOT DEFINED(CPU64)}
+DoneCriticalSection(vAtomic64CritSec);
+{$IFEND}
 
 end.
 

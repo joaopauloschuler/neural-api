@@ -153,6 +153,7 @@ type
     procedure TestLayerTimingReportSmoke;
     procedure TestProfileReportStructureAndCounts;
     procedure TestLayerGroupTimingsUnderLayerProfiling;
+    procedure TestLayerGroupTimingReportOpenCLShare;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
     procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
@@ -7414,6 +7415,76 @@ begin
     AssertEquals('ClearTime resets the count', 0,
       NN.Layers[2].ProfiledForwardCnt);
   finally
+    Sample.Free;
+    NN.Free;
+  end;
+end;
+
+// LayerGroupTimingReport on a host-only net: the GPU % column reads '-' for a
+// group without an OpenCL path and 0% otherwise; the OpenCL build's share line reads 0.
+procedure TTestNeuralLayersExtra.TestLayerGroupTimingReportOpenCLShare;
+var
+  NN: TNNet;
+  Sample: TNNetVolume;
+  ReportLines: TStringList;
+  PassCnt: integer;
+
+  // The TokenPos-th space-separated token of the report row starting with
+  // RowName ('' when no row does).
+  function RowToken(const RowName: string; TokenPos: integer): string;
+  var
+    LinePos: integer;
+  begin
+    Result := '';
+    for LinePos := 0 to ReportLines.Count - 1 do
+      if ExtractWord(1, ReportLines[LinePos], [' ']) = RowName then
+        Exit(ExtractWord(TokenPos, ReportLines[LinePos], [' ']));
+  end;
+
+begin
+  NN := TNNet.Create;
+  Sample := TNNetVolume.Create(4, 1, 1);
+  ReportLines := TStringList.Create;
+  try
+    NN.AddLayer(TNNetInput.Create(4));
+    NN.AddLayer(TNNetFullConnectReLU.Create(5));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    Sample.FillForDebug();
+    NN.LayerProfiling := true;
+    NN.ClearTime();
+    for PassCnt := 1 to 3 do NN.Compute(Sample);
+    ReportLines.Text := TNNet.LayerGroupTimingReport(NN, ['', 'Dense', 'Dense'], 3);
+    AssertEquals('GPU % header', 'GPU', RowToken('Group', 6));
+    // Tokens: group, class, Inst, Fwds, OpenCL, GPU %.
+    AssertEquals('Dense ran on the host', '0%', RowToken('Dense', 6));
+    AssertEquals('TOTAL GPU %', '0%', RowToken('TOTAL', 3));
+    {$IFNDEF OpenCL}
+    AssertEquals('TNNetInput has no OpenCL path', '-',
+      RowToken('TNNetInput', 6));
+    {$ENDIF}
+    {$IFDEF OpenCL}
+    AssertTrue('profiled share line', Pos('OpenCL path: 0 of 9 layer ' +
+      'forwards (0.0%), 0.0% of the profiled layer time.',
+      ReportLines.Text) > 0);
+    {$ELSE}
+    AssertTrue('no share line in a host-only build',
+      Pos('OpenCL path:', ReportLines.Text) = 0);
+    AssertTrue('no GPU % legend in a host-only build',
+      Pos('GPU % =', ReportLines.Text) = 0);
+    {$ENDIF}
+    NN.LayerProfiling := false;
+    NN.ClearTime();
+    for PassCnt := 1 to 2 do NN.Compute(Sample);
+    ReportLines.Text := TNNet.LayerGroupTimingReport(NN, ['', 'Dense', 'Dense'], 2);
+    {$IFDEF OpenCL}
+    AssertTrue('unprofiled share line', Pos('OpenCL path: 0 of 6 forwards ' +
+      'of layers that have one (0%); LayerProfiling adds',
+      ReportLines.Text) > 0);
+    {$ENDIF}
+    AssertTrue('no time share without LayerProfiling',
+      Pos('profiled layer time', ReportLines.Text) = 0);
+  finally
+    ReportLines.Free;
     Sample.Free;
     NN.Free;
   end;

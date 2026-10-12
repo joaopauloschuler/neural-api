@@ -254,6 +254,11 @@ activation memory (K x every layer output).
 
 ## 7. Cache checkpoints: `--cache-checkpoints N` (design, 2026-09-03)
 
+The current behaviour (capture points, the single eviction rule, conversation
+slots) is described in `examples/ChatTerminal/README.md`, sections *cache
+checkpoints* and *conversation slots*; the dated notes below mark what
+changed.
+
 ### 7.1 The problem
 
 A hybrid (Qwen3.5/3.8, Mamba) resumes a prompt only from a whole-state
@@ -340,7 +345,11 @@ the session. It holds NO attention K/V. The engine keeps up to N of them in
 a **checkpoint store** allocated once at `LoadModel` (rule 17), N given by
 `--cache-checkpoints N`.
 
-**Capture points.** After every window the width-N twin feeds, after every
+**Capture points.** Superseded on 2026-10-02/03: captures now happen only
+at the end of the system prompt and of the last user message (the last
+window end at or below each under a windowed prefill), of the prompt and of
+the reply. The original design:
+after every window the width-N twin feeds, after every
 tail-twin window, at the end of the prompt (where `PromptSnap` is taken
 today, `:2068`) and at the end of the reply (where `TurnSnap` is taken,
 `:2243`). Under `--gpu` a capture is one `clEnqueueCopyBuffer` per layer from
@@ -348,7 +357,9 @@ the layer's resident state buffer into the store's slot buffer, on the
 layer's own queue; on CPU it is `CaptureState` into the slot's host volume.
 Nothing is allocated per capture.
 
-**Resume.** `Reused := CommonPrefixLen(CachedTokens, PromptIds)`, capped at
+**Resume.** Superseded on 2026-10-02 (see Retention below): a checkpoint is
+now matched by its token-prefix hash, not by position alone.
+`Reused := CommonPrefixLen(CachedTokens, PromptIds)`, capped at
 `Len - 1` as today. Pick the checkpoint with the largest position `<=
 Reused`. If none, full reset. Else `Session.TruncateTo(Pos)`, restore the
 recurrent half into `Session` from the slot (device-to-device under `--gpu`),
@@ -357,7 +368,10 @@ snapshots (`TurnSnap`, `PromptSnap`, `TransferSnap` stays) and the 2 x 1.1 GB
 they hold go away; the end-of-reply and end-of-prompt captures are ordinary
 checkpoints at N >= 2.
 
-**Retention (which N to keep).** Let `E` be the current fed position and
+**Retention (which N to keep).** Superseded on 2026-10-02: the store now
+matches checkpoints by a token-prefix hash and frees the checkpoint unused
+for the most turns (`TChatEngine.DeleteTheLongestUnusedCheckpoint`); the
+band rule below is the original design. Let `E` be the current fed position and
 `d = E - Pos` a checkpoint's distance from it. Divergence is far more likely
 near the end of a prompt than near its start, so slots are spent
 geometrically: with window `W` and context `C`, band `k` covers distances

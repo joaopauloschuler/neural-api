@@ -23,6 +23,13 @@ type
     procedure TestConvolutionWillThreadParity;
     procedure TestConvolutionColdParallelParity;
     procedure TestConvolutionLowMemoryChunkParity;
+    // Convolutions made inference-only BEFORE AddLayer (the VAE builder's
+    // order) size no host column matrix at SetPrevLayer; the serial and the
+    // parallel chunk forwards still match a trainable twin. Coded by Claude (AI).
+    procedure TestConvolutionInferenceOnlyBuildParity;
+    // An inference-only low-memory conv whose weights were set without
+    // FlushWeightCache: the first host forward reads the neurons' biases.
+    procedure TestConvolutionBiasWithoutWeightFlush;
     procedure TestConvolutionDecodeNeuronChunkParity;
     procedure TestConvolutionFastMemoryNeuronChunk;
     procedure TestConvolutionSpatialNeuronChunk;
@@ -531,6 +538,11 @@ begin
           ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
           SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
     end;
+    // Without OpenCL the pass keeps the configured hot count.
+    AssertFalse('no OpenCL on this net', NN.OpenCLEnabled());
+    if NeuralDefaultThreadCount() > 1 then
+      AssertEquals('the pass used HotThreadWorkers hot workers',
+        NN.HotThreadWorkers, NN.SchedulerHotWorkerCount());
 
     // StopThreadWorkers reverts the hot policy to its default (worker 0 hot).
     NN.StopThreadWorkers();
@@ -842,6 +854,136 @@ end;
 // concatenated-weight caches are released in low-memory mode). A cold parallel
 // low-memory pass must equal the low-memory SERIAL reference (ComputeLowMemoryCPU)
 // bit-for-bit. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionInferenceOnlyBuildParity;
+var
+  RefNN, NN: TNNet;
+  Input, Reference: TNNetVolume;
+  RefConvs, Convs: array[0..2] of TNNetLayer;
+  ConvCnt, i: integer;
+
+  // The three spatial convs: 3x3 pad 1, 3x3 pad 1 stride 2, 3x1 pad 1.
+  procedure BuildNet(Net: TNNet; InferenceOnly: boolean;
+    out Layers: array of TNNetLayer);
+  var
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+  begin
+    Net.AddLayer(TNNetInput.Create(11, 9, 6));
+    Layers[0] := TNNetConvolutionReLU.Create(16, 3, 1, 1);
+    Layers[1] := TNNetConvolutionLinear.Create(12, 3, 1, 2);
+    Layers[2] := TNNetConvolutionRectangularReLU.Create(8, 3, 1, 1, 1);
+    for LayerCnt := 0 to 2 do
+    begin
+      // Low-memory on one layer, the fast paths on the others.
+      if InferenceOnly then Layers[LayerCnt].SetTrainable(False, LayerCnt = 1);
+      Net.AddLayer(Layers[LayerCnt]);
+      for NeuronCnt := 0 to Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.1 * Sin(LayerCnt + NeuronCnt * 0.37 + WeightCnt * 0.11);
+        Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.05 * Cos(LayerCnt + NeuronCnt * 0.5);
+      end;
+      Layers[LayerCnt].FlushWeightCache();
+    end;
+  end;
+
+  procedure AssertMatches(const What: string);
+  var
+    Pos: integer;
+  begin
+    AssertEquals(What + ': output size', Reference.Size,
+      NN.GetLastLayer().Output.Size);
+    for Pos := 0 to Reference.Size - 1 do
+      AssertTrue(What + ' at ' + IntToStr(Pos) + ': ' +
+        FloatToStr(NN.GetLastLayer().Output.Raw[Pos]) + ' vs ' +
+        FloatToStr(Reference.Raw[Pos]),
+        Abs(NN.GetLastLayer().Output.Raw[Pos] - Reference.Raw[Pos]) < 1e-5);
+  end;
+
+begin
+  RefNN := TNNet.Create();
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(11, 9, 6);
+  Reference := TNNetVolume.Create();
+  try
+    BuildNet(RefNN, false, RefConvs);
+    BuildNet(NN, true, Convs);
+    for ConvCnt := 0 to 2 do
+      AssertEquals('inference-only conv ' + IntToStr(ConvCnt) +
+        ' sizes no host column matrix', 0,
+        TNNetConvolution(Convs[ConvCnt]).InputPrepared.Size);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.07) - 0.2;
+    RefNN.Compute(Input);
+    Reference.Copy(RefNN.GetLastLayer().Output);
+    AssertTrue('reference output is non-trivial', Reference.GetSumAbs() > 0);
+
+    NN.Compute(Input, 0, False);
+    AssertMatches('serial');
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    for ConvCnt := 0 to 2 do
+      AssertTrue('conv ' + IntToStr(ConvCnt) + ' must be chunk-eligible',
+        Convs[ConvCnt].ChunkEligible());
+    NN.Compute(Input, 0, True);
+    NN.Compute(Input, 0, True);
+    AssertMatches('parallel chunk path');
+  finally
+    Reference.Free;
+    Input.Free;
+    NN.Free;
+    RefNN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionBiasWithoutWeightFlush;
+var
+  RefNN, NN: TNNet;
+  RefConv, Conv: TNNetLayer;
+  Input: TNNetVolume;
+  i: integer;
+
+  function BuildNet(InferenceOnly: boolean; out Layer: TNNetLayer): TNNet;
+  var
+    NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(7, 5, 4));
+    Layer := TNNetConvolutionLinear.Create(6, 3, 1, 1);
+    if InferenceOnly then Layer.SetTrainable(False, True);
+    Result.AddLayer(Layer);
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to Layer.Neurons[NeuronCnt].Weights.Size - 1 do
+        Layer.Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.1 * Sin(NeuronCnt * 0.37 + WeightCnt * 0.11);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.5 + 0.1 * NeuronCnt;
+    end;
+    if not InferenceOnly then Layer.FlushWeightCache();
+  end;
+
+begin
+  RefNN := BuildNet(false, RefConv);
+  NN := BuildNet(true, Conv);
+  Input := TNNetVolume.Create(7, 5, 4);
+  try
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.07) - 0.2;
+    RefNN.Compute(Input);
+    NN.Compute(Input, 0, False);
+    AssertEquals('output size', RefConv.Output.Size, Conv.Output.Size);
+    for i := 0 to Conv.Output.Size - 1 do
+      AssertTrue('output at ' + IntToStr(i) + ': ' +
+        FloatToStr(Conv.Output.Raw[i]) + ' vs ' +
+        FloatToStr(RefConv.Output.Raw[i]),
+        Abs(Conv.Output.Raw[i] - RefConv.Output.Raw[i]) < 1e-5);
+  finally
+    Input.Free;
+    NN.Free;
+    RefNN.Free;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestConvolutionLowMemoryChunkParity;
 var
   NN: TNNet;
