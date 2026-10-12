@@ -1240,14 +1240,14 @@ type
     procedure TestConv1DLinearGradientCheck;
     // TNNetDeconv1DLinear vs a torch ConvTranspose1d oracle on the Kokoro-82M
     // transposed geometries (trainable scatter and inference CPU GEMM).
-    procedure TestDeconv1DTorchParity;
+    procedure TestDeconv1DLinearTorchParity;
     // The dense geometries through the OpenCL scatter GEMM; grouped stay on CPU.
-    procedure TestDeconv1DOpenCLParity;
-    procedure TestDeconv1DSaveLoadRoundTrip;
+    procedure TestDeconv1DLinearOpenCLParity;
+    procedure TestDeconv1DLinearSaveLoadRoundTrip;
     // An owner built at length 1 (kernel longer than its input) lends weights.
-    procedure TestDeconv1DBorrowingBuild;
+    procedure TestDeconv1DLinearBorrowingBuild;
     // Input and weight gradients for dense, depthwise and grouped geometries.
-    procedure TestDeconv1DGradientCheck;
+    procedure TestDeconv1DLinearGradientCheck;
     // Kokoro-82M AdaIN1d (InstanceNorm), AdaLayerNorm and the channel LayerNorm
     // (TokenLayerNorm) vs torch, with fc(style) written into gamma/beta.
     procedure TestKokoroStyleNormTorchParity;
@@ -66007,7 +66007,7 @@ begin
   Deconv.FlushWeightCache();
 end;
 
-procedure TTestNeuralNumerical.TestDeconv1DTorchParity;
+procedure TTestNeuralNumerical.TestDeconv1DLinearTorchParity;
 var
   Oracle, OracleCase: TJSONObject;
   Cases: TJSONArray;
@@ -66065,7 +66065,7 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconv1DOpenCLParity;
+procedure TTestNeuralNumerical.TestDeconv1DLinearOpenCLParity;
 {$IFDEF OpenCL}
 var
   Oracle, OracleCase: TJSONObject;
@@ -66168,7 +66168,7 @@ begin
     SetTrainable(Trainable, Trainable));
 end;
 
-procedure TTestNeuralNumerical.TestDeconv1DSaveLoadRoundTrip;
+procedure TTestNeuralNumerical.TestDeconv1DLinearSaveLoadRoundTrip;
 var
   NN, NNLoaded: TNNet;
   Input: TNNetVolume;
@@ -66214,7 +66214,7 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconv1DBorrowingBuild;
+procedure TTestNeuralNumerical.TestDeconv1DLinearBorrowingBuild;
 var
   Owner, Borrower, Copied: TNNet;
   Input: TNNetVolume;
@@ -66254,7 +66254,7 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconv1DGradientCheck;
+procedure TTestNeuralNumerical.TestDeconv1DLinearGradientCheck;
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;

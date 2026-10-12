@@ -1506,7 +1506,7 @@ rather than acted on.
           path). The old "11x wasted work" was weight memory, not CPU time: the
           scatter skipped out-of-range rows. CPU, ups1 512->256 k20 s10 p5, L=200:
           old 2D stand-in (20x11) 397-459 ms, new 1D inference 90-109 ms, new 1D
-          trainable (scatter) 394-470 ms. Tests: `TestDeconv1D{TorchParity,
+          trainable (scatter) 394-470 ms. Tests: `TestDeconv1DLinear{TorchParity,
           OpenCLParity,SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
           `tests/fixtures/conv_transpose1d_oracle.json`
           (`tools/conv_transpose1d_oracle.py`, torch). Loader mapping: torch weight
@@ -1578,7 +1578,7 @@ rather than acted on.
         Done: `TNNetLSTMCell` and `TNNetGRUCell` (same issue) skip sizing under
         `DeferWeightSizingToBuildLink` (the `TNNetGatedDeltaNet` pattern) and now
         count `WeightElementsSized`. Test `TestBidirectionalRecurrentBorrowingBuild`
-        (LSTM and GRU stacks, owner at 6, borrower at 11).
+        (LSTM and GRU stacks, owner at 6, borrower at 11). Commit 74287878.
   - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
         (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
         (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
