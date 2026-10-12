@@ -123,6 +123,9 @@ type
     procedure TestPadXYCircularGradientCheck;
     procedure TestPadReflectGradientCheck;
     procedure TestPadXYPadModeLoadFromString;
+    // TrailingPaddingX: torch ReflectionPad1d((1, 0)), an asymmetric zero pad,
+    // their input gradient and the FStruct[3] round trip.
+    procedure TestPadXYTrailingPaddingX;
 
     // Spatial/channel rearrangement layers: the routing must be the exact
     // adjoint of the forward permutation.
@@ -10455,6 +10458,57 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYTrailingPaddingX;
+const
+  Expected: array[0..1, 0..6] of TNeuralFloat = (
+    (20, 10, 20, 30, 40, -1, -1),  // (1, 0, pmReflect, 0): ReflectionPad1d((1, 0))
+    (0, 0, 10, 20, 30, 40, 0));    // (2, 0, pmZero, 1)
+  ExpectedSizeX: array[0..1] of integer = (5, 7);
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  CasePos, X: integer;
+begin
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    for X := 0 to 3 do Input[X, 0, 0] := 10 * (X + 1);
+    for CasePos := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      NN2 := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(4, 1, 1));
+        if CasePos = 0
+          then NN.AddLayer(TNNetPadXY.Create(1, 0, pmReflect, 0))
+          else NN.AddLayer(TNNetPadXY.Create(2, 0, pmZero, 1));
+        NN.Compute(Input);
+        AssertEquals('case ' + IntToStr(CasePos) + ' SizeX',
+          ExpectedSizeX[CasePos], NN.GetLastLayer.Output.SizeX);
+        for X := 0 to ExpectedSizeX[CasePos] - 1 do
+          AssertEquals('case ' + IntToStr(CasePos) + ' x' + IntToStr(X),
+            Expected[CasePos, X], NN.GetLastLayer.Output[X, 0, 0], 1e-6);
+        NN2.LoadFromString(NN.SaveToString());
+        AssertEquals('case ' + IntToStr(CasePos) + ' round trip',
+          NN.SaveToString(), NN2.SaveToString());
+        NN2.Compute(Input);
+        for X := 0 to ExpectedSizeX[CasePos] - 1 do
+          AssertEquals('case ' + IntToStr(CasePos) + ' reloaded x' +
+            IntToStr(X), Expected[CasePos, X], NN2.GetLastLayer.Output[X, 0, 0],
+            1e-6);
+      finally
+        NN2.Free;
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(1, 1, pmReflect, 0),
+    'PadXY reflect trailing 0', 4, 3, 2);
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmZero, 1),
+    'PadXY zero trailing 1', 4, 3, 2);
 end;
 
 procedure TTestNeuralNumerical.TestGatherForward;

@@ -1531,12 +1531,15 @@ type
   // more efficient than padding at the convolutional layer.
   TNNetPadXY = class(TNNetLayer)
   private
-    FPaddingX, FPaddingY: integer;
+    FPaddingX, FPaddingY, FTrailingPaddingX: integer;
     FPadMode: TNNetPadMode;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(PaddingX, PaddingY: integer); reintroduce; overload;
-    constructor Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode); reintroduce; overload;
+    // TrailingPaddingX >= 0 pads the end of X by that many columns instead of
+    // PaddingX (torch ReflectionPad1d((1, 0)) = (1, 0, pmReflect, 0)); FStruct[3] = it + 1.
+    constructor Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode;
+      TrailingPaddingX: integer = -1); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -25098,7 +25101,7 @@ end;
 procedure TNNetPadXY.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  FOutput.ReSize(pPrevLayer.FOutput.SizeX + FPaddingX*2, pPrevLayer.FOutput.SizeY + FPaddingY*2, pPrevLayer.FOutput.Depth);
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX + FPaddingX + FTrailingPaddingX, pPrevLayer.FOutput.SizeY + FPaddingY*2, pPrevLayer.FOutput.Depth);
   if (pPrevLayer.FOutputError.Size = pPrevLayer.FOutput.Size) then SetOutputErrorSize(FOutput);
 end;
 
@@ -25107,15 +25110,21 @@ begin
   Create(PaddingX, PaddingY, pmZero);
 end;
 
-constructor TNNetPadXY.Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode);
+constructor TNNetPadXY.Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode;
+  TrailingPaddingX: integer);
 begin
   inherited Create();
   FStruct[0] := PaddingX;
   FStruct[1] := PaddingY;
   FStruct[2] := Ord(PadMode);
+  // 0 (every file saved before the option) keeps the symmetric X padding.
+  FStruct[3] := Max(TrailingPaddingX, -1) + 1;
   FPaddingX := PaddingX;
   FPaddingY := PaddingY;
   FPadMode := PadMode;
+  if TrailingPaddingX >= 0
+    then FTrailingPaddingX := TrailingPaddingX
+    else FTrailingPaddingX := PaddingX;
 end;
 
 procedure TNNetPadXY.Compute;
@@ -25133,7 +25142,7 @@ begin
     (FOutput.Size <> FOutputError.Size)
     then
     SetOutputErrorSize(FOutput);
-  if FPadMode = pmZero then
+  if (FPadMode = pmZero) and (FTrailingPaddingX = FPaddingX) then
   begin
     FOutput.CopyPadding(FPrevLayer.FOutput, FPaddingX, FPaddingY);
   end
@@ -25152,8 +25161,14 @@ begin
       for OutX := 0 to MaxX do
       begin
         SrcX := NeuralPadSourceIndex(OutX, FPaddingX, SrcW, FPadMode);
-        basePrev0 := FPrevLayer.FOutput.GetRawPos(SrcX, SrcY);
         baseOut0  := FOutput.GetRawPos(OutX, OutY);
+        // pmZero border cells have no source (-1).
+        if (SrcX < 0) or (SrcY < 0) then
+        begin
+          FillChar(FOutput.FData[baseOut0], RowBytes, 0);
+          continue;
+        end;
+        basePrev0 := FPrevLayer.FOutput.GetRawPos(SrcX, SrcY);
         Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
           RowBytes);
       end;
@@ -131994,7 +132009,7 @@ begin
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetDotProducts' :          Result := TNNetDotProducts.Create(St[0], St[1], St[2]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0], TNNetPadMode(St[1]));
-      'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2]));
+      'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2]), St[3] - 1);
       'TNNetCrop' :                 Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
@@ -132441,7 +132456,7 @@ begin
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetDotProducts' then Result := TNNetDotProducts.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0], TNNetPadMode(St[1])) else
-      if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2])) else
+      if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2]), St[3] - 1) else
       if S[0] = 'TNNetCrop' then Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
