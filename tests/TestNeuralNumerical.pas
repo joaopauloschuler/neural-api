@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralnetwork, neuralvolume, neuralabfun, neuraldecode, neuralthread,
-  neuralpretrained
+  neuralpretrained, neuralaudio
   {$IFDEF OpenCL}
   , cl, ctypes, neuralopencl
   {$ENDIF}
@@ -1268,6 +1268,18 @@ type
     procedure TestKokoroLayersBorrowingBuild;
     // Input and per-channel alpha gradients.
     procedure TestSnakePerChannelGradientCheck;
+    // TNNetForwardSTFT Re/Im and magnitude/phase vs torch.stft (center reflect
+    // pad, periodic Hann) for n_fft 20 / 16 / 15 (odd).
+    procedure TestForwardSTFTTorchParity;
+    // A cosine on bin 3: interior frames hold A*NFFT/4 at bin 3, A*NFFT/8 at
+    // bins 2 and 4 (the Hann window's spectrum) and ~0 elsewhere.
+    procedure TestForwardSTFTCosinePeakBins;
+    // TNNetHarmonicSource (zero noise) vs the kokoro SourceModuleHnNSF:
+    // upsampled F0 and voicing exact, har_source.
+    procedure TestHarmonicSourceTorchParity;
+    // Random noise: repeatable per seed, continues the sequence across calls,
+    // restores the global RandSeed, leaves the zero-noise default untouched.
+    procedure TestHarmonicSourceRandomNoise;
     procedure TestAttentiveStatsPoolingFeatureGradientCheck;
     procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
@@ -73116,6 +73128,272 @@ begin
   MaxElementPos := A.Size - 1;
   for ElementPos := 0 to MaxElementPos do
     Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+end;
+
+// tests/fixtures/stft_harmonic_source_oracle.json
+// (tools/stft_harmonic_source_oracle.py): torch.stft cases [bins][frames] and
+// one zero-noise SourceModuleHnNSF case.
+procedure TTestNeuralNumerical.TestForwardSTFTTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  STFT: TNNetForwardSTFT;
+  Wave, Re, Im, MagnitudePhase: TNNetVolume;
+  CasePos, SamplePos, FramePos, BinPos, FrameCount, BinCount: integer;
+  RefRe, RefIm, RefMag, RefPhase, MaxRefMag, MaxComplexDiff, MaxMagDiff,
+    MaxPhaseDiff, PhaseDiff: double;
+  CaseName: string;
+begin
+  Oracle := LoadJSONFixture('stft_harmonic_source_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('stft_harmonic_source_oracle.json absent; run ' +
+      'tools/stft_harmonic_source_oracle.py');
+    exit;
+  end;
+  Wave := TNNetVolume.Create();
+  Re := TNNetVolume.Create();
+  Im := TNNetVolume.Create();
+  MagnitudePhase := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['stft_cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      CaseName := OracleCase.Strings['name'];
+      Wave.ReSize(OracleCase.Integers['length'], 1, 1);
+      for SamplePos := 0 to Wave.Size - 1 do
+        Wave.FData[SamplePos] := OracleCase.Arrays['input'].Floats[SamplePos];
+      STFT := TNNetForwardSTFT.Create(OracleCase.Integers['n_fft'],
+        OracleCase.Integers['hop']);
+      try
+        STFT.Transform(Wave, Re, Im);
+        STFT.TransformToMagnitudePhase(Wave, MagnitudePhase);
+        BinCount := OracleCase.Arrays['re'].Count;
+        FrameCount := OracleCase.Arrays['re'].Arrays[0].Count;
+        AssertEquals(CaseName + ': bins', BinCount, STFT.BinCount);
+        AssertEquals(CaseName + ': frames', FrameCount, Re.SizeX);
+        AssertEquals(CaseName + ': FrameCount', FrameCount,
+          STFT.FrameCount(Wave.Size));
+        AssertEquals(CaseName + ': magnitude/phase depth', 2 * BinCount,
+          MagnitudePhase.Depth);
+        MaxRefMag := 0;
+        for BinPos := 0 to BinCount - 1 do
+          for FramePos := 0 to FrameCount - 1 do
+            MaxRefMag := Max(MaxRefMag, OracleCase.Arrays['magnitude'].
+              Arrays[BinPos].Floats[FramePos]);
+        MaxComplexDiff := 0;
+        MaxMagDiff := 0;
+        MaxPhaseDiff := 0;
+        for BinPos := 0 to BinCount - 1 do
+          for FramePos := 0 to FrameCount - 1 do
+          begin
+            RefRe := OracleCase.Arrays['re'].Arrays[BinPos].Floats[FramePos];
+            RefIm := OracleCase.Arrays['im'].Arrays[BinPos].Floats[FramePos];
+            RefMag := OracleCase.Arrays['magnitude'].Arrays[BinPos].
+              Floats[FramePos];
+            RefPhase := OracleCase.Arrays['phase'].Arrays[BinPos].
+              Floats[FramePos];
+            MaxComplexDiff := Max(MaxComplexDiff,
+              Max(Abs(Re[FramePos, 0, BinPos] - RefRe),
+              Abs(Im[FramePos, 0, BinPos] - RefIm)));
+            MaxMagDiff := Max(MaxMagDiff,
+              Abs(MagnitudePhase[FramePos, 0, BinPos] - RefMag));
+            // Phase only where the bin is not rounding noise; wrapped.
+            if RefMag > 1e-4 * MaxRefMag then
+            begin
+              PhaseDiff := Abs(MagnitudePhase[FramePos, 0, BinCount + BinPos] -
+                RefPhase);
+              if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
+              MaxPhaseDiff := Max(MaxPhaseDiff, PhaseDiff);
+            end;
+          end;
+        AssertTrue(CaseName + ': Re/Im max |diff| = ' +
+          FloatToStr(MaxComplexDiff), MaxComplexDiff < 1e-5 * MaxRefMag);
+        AssertTrue(CaseName + ': magnitude max |diff| = ' +
+          FloatToStr(MaxMagDiff), MaxMagDiff < 1e-5 * MaxRefMag);
+        AssertTrue(CaseName + ': wrapped phase max |diff| = ' +
+          FloatToStr(MaxPhaseDiff), MaxPhaseDiff < 1e-3);
+      finally
+        STFT.Free;
+      end;
+    end;
+  finally
+    MagnitudePhase.Free;
+    Im.Free;
+    Re.Free;
+    Wave.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForwardSTFTCosinePeakBins;
+const
+  CosineAmplitude = 0.5;
+  CosineBin = 3;
+  NFFT = 20;
+var
+  STFT: TNNetForwardSTFT;
+  Wave, Re, Im: TNNetVolume;
+  SamplePos, FramePos, BinPos: integer;
+  Expected, Actual: double;
+begin
+  STFT := TNNetForwardSTFT.Create(NFFT, 5);
+  Wave := TNNetVolume.Create(200, 1, 1);
+  Re := TNNetVolume.Create();
+  Im := TNNetVolume.Create();
+  try
+    for SamplePos := 0 to Wave.Size - 1 do
+      Wave.FData[SamplePos] := CosineAmplitude *
+        Cos(2 * Pi * CosineBin * SamplePos / NFFT + 0.3);
+    STFT.Transform(Wave, Re, Im);
+    AssertEquals('frames', 41, Re.SizeX);
+    AssertEquals('bins', 11, Re.Depth);
+    // Interior frames only: the edge frames see the reflect pad.
+    for FramePos := 2 to Re.SizeX - 3 do
+      for BinPos := 0 to Re.Depth - 1 do
+      begin
+        Actual := Sqrt(Sqr(Re[FramePos, 0, BinPos]) +
+          Sqr(Im[FramePos, 0, BinPos]));
+        if BinPos = CosineBin then Expected := CosineAmplitude * NFFT / 4
+        else if Abs(BinPos - CosineBin) = 1 then
+          Expected := CosineAmplitude * NFFT / 8
+        else Expected := 0;
+        AssertEquals('frame ' + IntToStr(FramePos) + ' bin ' + IntToStr(BinPos),
+          Expected, Actual, 1e-5);
+      end;
+    // DC and Nyquist bins carry an exact +0 imaginary part.
+    for FramePos := 0 to Re.SizeX - 1 do
+    begin
+      AssertTrue('Im DC', Im[FramePos, 0, 0] = 0);
+      AssertTrue('Im Nyquist', Im[FramePos, 0, Re.Depth - 1] = 0);
+    end;
+  finally
+    Im.Free;
+    Re.Free;
+    Wave.Free;
+    STFT.Free;
+  end;
+end;
+
+// A TNNetHarmonicSource for the oracle's harmonic_source case.
+function CreateHarmonicSourceFromOracle(OracleCase: TJSONObject;
+  F0Frames: TNNetVolume): TNNetHarmonicSource;
+var
+  MergeWeights: TNeuralFloatDynArr;
+  HarmonicPos, FramePos: integer;
+begin
+  Result := TNNetHarmonicSource.Create(OracleCase.Integers['sample_rate'],
+    OracleCase.Integers['upsample_scale'],
+    OracleCase.Integers['harmonic_count'], OracleCase.Floats['sine_amp'],
+    OracleCase.Floats['noise_std'], OracleCase.Floats['voiced_threshold']);
+  SetLength(MergeWeights, Result.HarmonicCount);
+  for HarmonicPos := 0 to High(MergeWeights) do
+    MergeWeights[HarmonicPos] :=
+      OracleCase.Arrays['merge_weights'].Floats[HarmonicPos];
+  Result.SetMergeWeights(MergeWeights, OracleCase.Floats['merge_bias']);
+  F0Frames.ReSize(OracleCase.Arrays['f0'].Count, 1, 1);
+  for FramePos := 0 to F0Frames.Size - 1 do
+    F0Frames.FData[FramePos] := OracleCase.Arrays['f0'].Floats[FramePos];
+end;
+
+procedure TTestNeuralNumerical.TestHarmonicSourceTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Source: TNNetHarmonicSource;
+  F0Frames, F0Upsampled, Voicing, HarmonicWave: TNNetVolume;
+  SamplePos: integer;
+  MaxDiff: double;
+begin
+  Oracle := LoadJSONFixture('stft_harmonic_source_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('stft_harmonic_source_oracle.json absent; run ' +
+      'tools/stft_harmonic_source_oracle.py');
+    exit;
+  end;
+  F0Frames := TNNetVolume.Create();
+  F0Upsampled := TNNetVolume.Create();
+  Voicing := TNNetVolume.Create();
+  HarmonicWave := TNNetVolume.Create();
+  OracleCase := Oracle.Objects['harmonic_source'];
+  Source := CreateHarmonicSourceFromOracle(OracleCase, F0Frames);
+  try
+    Source.ComputeUpsampledF0AndVoicing(F0Frames, F0Upsampled, Voicing);
+    Source.Compute(F0Frames, HarmonicWave);
+    AssertEquals('samples', OracleCase.Arrays['har_source'].Count,
+      HarmonicWave.Size);
+    AssertEquals('samples (SampleCount)', HarmonicWave.Size,
+      Source.SampleCount(F0Frames.Size));
+    MaxDiff := 0;
+    for SamplePos := 0 to HarmonicWave.Size - 1 do
+    begin
+      AssertTrue('f0 upsampled ' + IntToStr(SamplePos),
+        F0Upsampled.FData[SamplePos] =
+        OracleCase.Arrays['f0_upsampled'].Floats[SamplePos]);
+      AssertTrue('uv ' + IntToStr(SamplePos), Voicing.FData[SamplePos] =
+        OracleCase.Arrays['uv'].Floats[SamplePos]);
+      MaxDiff := Max(MaxDiff, Abs(HarmonicWave.FData[SamplePos] -
+        OracleCase.Arrays['har_source'].Floats[SamplePos]));
+    end;
+    AssertTrue('har_source max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-6);
+  finally
+    Source.Free;
+    HarmonicWave.Free;
+    Voicing.Free;
+    F0Upsampled.Free;
+    F0Frames.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHarmonicSourceRandomNoise;
+var
+  Source: TNNetHarmonicSource;
+  F0Frames, ZeroNoise, FirstRun, SecondRun, RepeatedRun: TNNetVolume;
+  FramePos: integer;
+  SavedRandSeed: cardinal;
+begin
+  Source := TNNetHarmonicSource.Create(240, 6, 3, 0.1, 0.003, 10);
+  F0Frames := TNNetVolume.Create(8, 1, 1);
+  ZeroNoise := TNNetVolume.Create();
+  FirstRun := TNNetVolume.Create();
+  SecondRun := TNNetVolume.Create();
+  RepeatedRun := TNNetVolume.Create();
+  try
+    Source.SetMergeWeights([0.5, -0.2, 0.3], 0.01);
+    for FramePos := 0 to F0Frames.Size - 1 do
+      F0Frames.FData[FramePos] := 20 * FramePos;
+    Source.Compute(F0Frames, ZeroNoise);
+    SavedRandSeed := RandSeed;
+    Source.RandomNoise := true;
+    Source.NoiseSeed := 1234;
+    Source.Compute(F0Frames, FirstRun);
+    AssertEquals('global RandSeed restored', SavedRandSeed, RandSeed);
+    AssertTrue('the seed advanced', Source.NoiseSeed <> 1234);
+    Source.Compute(F0Frames, SecondRun);
+    Source.NoiseSeed := 1234;
+    Source.Compute(F0Frames, RepeatedRun);
+    AssertEquals('same seed, same noise', 0,
+      MaxAbsDiffOfVolumes(FirstRun, RepeatedRun), 0);
+    AssertTrue('the next call draws new noise',
+      MaxAbsDiffOfVolumes(FirstRun, SecondRun) > 0);
+    AssertTrue('noise changes the excitation',
+      MaxAbsDiffOfVolumes(FirstRun, ZeroNoise) > 1e-4);
+    AssertTrue('noise stays small',
+      MaxAbsDiffOfVolumes(FirstRun, ZeroNoise) < 0.2);
+    Source.RandomNoise := false;
+    Source.Compute(F0Frames, SecondRun);
+    AssertEquals('zero noise is repeatable', 0,
+      MaxAbsDiffOfVolumes(ZeroNoise, SecondRun), 0);
+  finally
+    RepeatedRun.Free;
+    SecondRun.Free;
+    FirstRun.Free;
+    ZeroNoise.Free;
+    F0Frames.Free;
+    Source.Free;
+  end;
 end;
 
 // The liveness sharing tests' graph: long skip, reshape aliases, a split read
