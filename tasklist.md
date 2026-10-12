@@ -1494,12 +1494,38 @@ rather than acted on.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
-        - transposed 1D conv: EXTEND `TNNetDeconvolution` (torch ConvTranspose2d
-          geometry, OpenCL scatter GEMM). Gap: square kernel, padding and
-          output_padding apply to BOTH axes. On a (SeqLen,1,C) input the generator
-          ups (K20 s10 p5, K12 s6 p3) clamp to 20x11 / 12x7 kernels with OutY=1 (11x
-          / 7x wasted work); the depthwise x2 (K3 s2 p1 op1) gives OutY=2 (wrong
-          shape). Needs an X-only 1D geometry and groups (depthwise).
+        - [x] transposed 1D conv (torch ConvTranspose1d). Done: new
+          `TNNetDeconvolution1D(NumFeatures, K, Stride, Padding, OutputPadding,
+          Groups=1, SuppressBias=0)`, a `TNNetDeconvolutionLinear` with a Kx1
+          kernel, no Y padding / output padding, no kernel clamp, groups in
+          FStruct[6] (commit cf181f32). `TNNetDeconvolution` gained
+          `FOutputPaddingY`, `FGroups` (grouped CPU scatter forward + backward;
+          grouped layers stay off OpenCL) and a CPU GEMM forward for dense
+          inference-only layers (`FConcatedWeights` x input positions with
+          `DotProductsTiled`, chunked, then a host scatter shared with the OpenCL
+          path). The old "11x wasted work" was weight memory, not CPU time: the
+          scatter skipped out-of-range rows. CPU, ups1 512->256 k20 s10 p5, L=200:
+          old 2D stand-in (20x11) 397-459 ms, new 1D inference 90-109 ms, new 1D
+          trainable (scatter) 394-470 ms. Tests: `TestDeconvolution1D{TorchParity,
+          OpenCLParity,SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
+          `tests/fixtures/conv_transpose1d_oracle.json`
+          (`tools/conv_transpose1d_oracle.py`, torch). Loader mapping: torch weight
+          [In, Out/G, K]; neuron Oc, group g = Oc div (Out/G), gets
+          `Weights[k, 0, c] := w[g*(In/G) + c, Oc mod (Out/G), k]` (no flip; dense:
+          `w[c, Oc, k]`), bias as is, then `FlushWeightCache`.
+        - [ ] The CPU GEMM needs `SetTrainable(False, {pLowMemory=}False)`: with the
+          default low memory (and when trainable) the deconv runs the per-neuron
+          scatter, ~4x slower at ups1. Decide for the Kokoro stage nets.
+        - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
+          neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
+          scratch.
+        - [ ] Depthwise pool runs one length-1 `DotProduct` per (position, tap,
+          channel); vectorize over channels if it shows in a stage-C profile.
+        - [ ] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
+          products and scatters on the host; no resident source/output, and no
+          borrowing (`EnableOpenCLInContextOf`) test for the deconv.
+        - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
+          deconv) for 32-multiple channel counts: one extra weight copy.
         - per-channel Snake (`TNNetSnake` has one scalar alpha).
         - AdaIN as InstanceNorm + per-channel scale/shift set once per utterance.
   - [ ] 0.5 Stage-net holder for Kokoro: owner nets for stages A/B/C built once
