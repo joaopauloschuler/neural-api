@@ -70858,15 +70858,20 @@ begin
   SetOutputErrorSize(FOutput);
   if FNeurons.Count < 12 then AddMissingNeurons(12);
   // [0..3]=W_ii/W_if/W_ig/W_io and [4..7]=W_hi/W_hf/W_hg/W_ho are DepthxDepth
-  // (stored [out,0,in]); [8..11]=b_i/b_f/b_g/b_o are Depth-long.
-  for ii := 0 to 7 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
-  for ii := 8 to 11 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
-  if FIsTrainable then
-    for ii := 0 to 11 do
-    begin
-      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
-      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
-    end;
+  // (stored [out,0,in]); [8..11]=b_i/b_f/b_g/b_o are Depth-long. The rows
+  // differ per neuron, so the borrowing build is honoured here.
+  if not DeferWeightSizingToBuildLink() then
+  begin
+    Inc(FWeightElementsSized, 8 * int64(Depth) * Depth + 4 * Depth);
+    for ii := 0 to 7 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
+    for ii := 8 to 11 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
+    if FIsTrainable then
+      for ii := 0 to 11 do
+      begin
+        FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+        FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+      end;
+  end;
   FIg.ReSize(FOutput.SizeX, 1, Depth); FFg.ReSize(FOutput.SizeX, 1, Depth);
   FGg.ReSize(FOutput.SizeX, 1, Depth); FOg.ReSize(FOutput.SizeX, 1, Depth);
   FC.ReSize(FOutput.SizeX, 1, Depth);  FTanhC.ReSize(FOutput.SizeX, 1, Depth);
@@ -71281,14 +71286,19 @@ begin
   if FNeurons.Count < 11 then AddMissingNeurons(11);
   // [0..2]=W_ir/W_iz/W_in and [3..5]=W_hr/W_hz/W_hn are DepthxDepth
   // (stored [out,0,in]); [6]=b_r [7]=b_z [8]=b_in [9]=b_hn [10]=spare are Depth-long.
-  for ii := 0 to 5 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
-  for ii := 6 to 10 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
-  if FIsTrainable then
-    for ii := 0 to 10 do
-    begin
-      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
-      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
-    end;
+  // The rows differ per neuron, so the borrowing build is honoured here.
+  if not DeferWeightSizingToBuildLink() then
+  begin
+    Inc(FWeightElementsSized, 6 * int64(Depth) * Depth + 5 * Depth);
+    for ii := 0 to 5 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
+    for ii := 6 to 10 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
+    if FIsTrainable then
+      for ii := 0 to 10 do
+      begin
+        FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+        FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+      end;
+  end;
   FR.ReSize(FOutput.SizeX, 1, Depth); FZ.ReSize(FOutput.SizeX, 1, Depth);
   FN.ReSize(FOutput.SizeX, 1, Depth); FWhn.ReSize(FOutput.SizeX, 1, Depth);
   FHt.ReSize(FOutput.SizeX, 1, Depth);

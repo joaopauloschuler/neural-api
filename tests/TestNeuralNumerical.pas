@@ -1037,6 +1037,9 @@ type
     procedure TestBidirectionalLSTMUnidirectionalEquivalence;
     procedure TestBidirectionalLSTMForwardHalfEquivalence;
     procedure TestBidirectionalLSTMStackGradientCheck;
+    // LSTM and GRU stacks built with BuildWeightOwner at another length size no
+    // rows, share the owner's neurons and match copied weights.
+    procedure TestBidirectionalRecurrentBorrowingBuild;
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
@@ -40052,6 +40055,72 @@ begin
     L.Neurons[0].Weights[f, 0, 0] := 30 + f * 17 + Sin(f * 1.3) * 5;
     // band_raw (Hz), strictly positive
     L.Neurons[0].Weights[f, 0, 1] := 20 + f * 9  + Cos(f * 0.7) * 4;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalRecurrentBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  CellKind, LayerPos, NeuronPos, ElementPos: integer;
+  UseGRU: boolean;
+  KindName: string;
+
+  procedure AddRecurrentStack(Net: TNNet; SeqLen: integer);
+  begin
+    Net.AddLayer(TNNetInput.Create(SeqLen, 1, 3));
+    Net.AddBidirectionalRecurrentStack(4, 2, {Bidirectional=}True, UseGRU);
+  end;
+
+begin
+  for CellKind := 0 to 1 do
+  begin
+    UseGRU := CellKind = 1;
+    if UseGRU then KindName := 'GRU ' else KindName := 'LSTM ';
+    RandSeed := 424242;
+    Owner := TNNet.Create();
+    Borrower := TNNet.Create();
+    Copied := TNNet.Create();
+    Input := TNNetVolume.Create(11, 1, 3);
+    try
+      AddRecurrentStack(Owner, 6);
+      // Moves every weight off its default so a missed link shows in the output.
+      for LayerPos := 1 to Owner.CountLayers() - 1 do
+      begin
+        for NeuronPos := 0 to Owner.Layers[LayerPos].Neurons.Count - 1 do
+          Owner.Layers[LayerPos].Neurons[NeuronPos].Weights.Mul(1.5);
+        Owner.Layers[LayerPos].FlushWeightCache();
+      end;
+      Borrower.BuildWeightOwner := Owner;
+      AddRecurrentStack(Borrower, 11);
+      Borrower.BuildWeightOwner := nil;
+      AssertEquals(KindName + 'borrowing build sizes no weight rows', 0,
+        Borrower.WeightElementsSized());
+      AssertTrue(KindName + 'owner build sizes its rows',
+        Owner.WeightElementsSized() > 0);
+      for LayerPos := 1 to Borrower.CountLayers() - 1 do
+        if Owner.Layers[LayerPos].Neurons.Count > 0 then
+          AssertTrue(KindName + 'layer ' + IntToStr(LayerPos) +
+            ' borrows the owner''s neurons',
+            Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+      AddRecurrentStack(Copied, 11);
+      Copied.CopyWeights(Owner);
+      for ElementPos := 0 to Input.Size - 1 do
+        Input.Raw[ElementPos] := Sin(ElementPos * 0.53) * 1.1;
+      Borrower.Compute(Input);
+      Copied.Compute(Input);
+      AssertEquals(KindName + 'borrowed output length', 11,
+        Borrower.GetLastLayer.Output.SizeX);
+      for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+        AssertEquals(KindName + 'borrowed vs copied output ' + IntToStr(ElementPos),
+          Copied.GetLastLayer.Output.Raw[ElementPos],
+          Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+    finally
+      Input.Free;
+      Copied.Free;
+      Borrower.Free;
+      Owner.Free;
+    end;
   end;
 end;
 

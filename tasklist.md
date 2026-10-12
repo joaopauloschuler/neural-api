@@ -1572,9 +1572,13 @@ rather than acted on.
         exits early when the length is unchanged, OpenCL arming as in
         `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
         code path; do not clone it.
-  - [ ] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
+  - [x] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
         build allocates and `InitDefault`s them, then `LinkNeuronsFrom` frees them.
         Correct but wasted; honour `DeferWeightSizingToBuildLink` there (~5 lines).
+        Done: `TNNetLSTMCell` and `TNNetGRUCell` (same issue) skip sizing under
+        `DeferWeightSizingToBuildLink` (the `TNNetGatedDeltaNet` pattern) and now
+        count `WeightElementsSized`. Test `TestBidirectionalRecurrentBorrowingBuild`
+        (LSTM and GRU stacks, owner at 6, borrower at 11).
   - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
         (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
         (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
