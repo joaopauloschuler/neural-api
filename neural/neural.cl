@@ -852,7 +852,9 @@ typedef struct
   int RowSpan;   // InDepth * FeatureSizeX: one kernel row of a column
   int InSizeX, InSizeY, InDepth;
   int Stride;
-  int Padding;   // zero border on each side of the source
+  int PaddingX;  // zero columns left and right of the source
+  int PaddingY;  // zero rows above and below the source
+  int DilationX; // spacing of the kernel taps along X
 } cai_conv_gather;
 
 // cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
@@ -877,8 +879,8 @@ static inline void cai_conv_gather_columns(const cai_conv_gather G,
     const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
     const int oy = gb / G.OutSizeX;
     const int ox = gb - oy * G.OutSizeX;
-    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.Padding : G.InSizeY;
-    FirstX[j] = ox * G.Stride - G.Padding;
+    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.PaddingY : G.InSizeY;
+    FirstX[j] = ox * G.Stride - G.PaddingX;
   }
 }
 
@@ -892,15 +894,16 @@ static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
   const int bLane = lid / CAI_TILED_KSTEP;
   const int gk = k0 + kLane;
   // Past FSize the row offset puts every column below the source.
-  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.Padding;
+  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.PaddingY;
   const int rem = gk - ky * G.RowSpan;
   const int kx = rem / G.InDepth;
   const int d = rem - kx * G.InDepth;
+  const int TapX = kx * G.DilationX;
   #pragma unroll
   for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
   {
     const int y = FirstY[j] + ky;
-    const int x = FirstX[j] + kx;
+    const int x = FirstX[j] + TapX;
     float v = 0.0f;
     if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
       v = Src[(y * G.InSizeX + x) * G.InDepth + d];
@@ -1006,7 +1009,7 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
-  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1284,12 +1287,14 @@ __kernel void cai_conv_implicit_tiled
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-    Stride, Padding};
+    Stride, PaddingX, PaddingY, DilationX};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1313,7 +1318,9 @@ __kernel void cai_conv_implicit
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX
 )
 {
   const int a_id = get_global_id(0);
@@ -1323,8 +1330,8 @@ __kernel void cai_conv_implicit
   const int FeatureSizeY = FSize / RowSpan;
   const int oy = b_id / OutSizeX;
   const int ox = b_id - oy * OutSizeX;
-  const int FirstY = oy * Stride - Padding;
-  const int FirstX = ox * Stride - Padding;
+  const int FirstY = oy * Stride - PaddingY;
+  const int FirstX = ox * Stride - PaddingX;
   const int TapStep = InDepth * FNumAs;
   // A element (a_id, k) sits at a_id + k * FNumAs.
   int APos = a_id;
@@ -1335,7 +1342,7 @@ __kernel void cai_conv_implicit
     const int RowInside = (y >= 0) && (y < InSizeY);
     for (int kx = 0; kx < FeatureSizeX; kx++)
     {
-      const int x = FirstX + kx;
+      const int x = FirstX + kx * DilationX;
       if (RowInside && (x >= 0) && (x < InSizeX))
       {
         const int SrcPos = (y * InSizeX + x) * InDepth;
@@ -2832,15 +2839,16 @@ __kernel void cai_embedding_gather_int8
    element of the convolution's FInputPrepared column matrix: a copy of one
    FInput element, or 0 for a tap in the zero padding, in the layout of the CPU
    PrepareInputForConvolutionFast ((SizeX*y)+x)*Depth+d, so the GEMM reads the
-   same B operand. FInput is either unpadded (a bound resident source; Padding
-   is applied here, symmetric on X and Y) or the host-padded FInputCopy with
-   Padding = 0. Indices are int: N must stay below 2^31.
+   same B operand. FInput is either unpadded (a bound resident source; the
+   padding is applied here) or the host-padded FInputCopy with both paddings 0.
+   Kernel taps sit DilationX columns apart. Indices are int: N < 2^31.
    Coded by Claude (AI). */
 // Index of the FInput element read by column element gid; -1 for a tap in the
 // zero padding.
 static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int ColDepth, const int RowSpan, const int InSizeX, const int InSizeY,
-  const int InDepth, const int Stride, const int Padding)
+  const int InDepth, const int Stride, const int PaddingX, const int PaddingY,
+  const int DilationX)
 {
   const int col_elem = gid % ColDepth;
   const int pos      = gid / ColDepth;
@@ -2848,11 +2856,11 @@ static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int oy       = pos / OutSizeX;
   const int yCount   = col_elem / RowSpan;
   const int rem      = col_elem % RowSpan;
-  const int y        = oy * Stride + yCount - Padding;
-  const int xFirst   = ox * Stride - Padding;
-  const int x        = xFirst + rem / InDepth;
+  const int kx       = rem / InDepth;
+  const int y        = oy * Stride + yCount - PaddingY;
+  const int x        = ox * Stride - PaddingX + kx * DilationX;
   if ((y < 0) || (y >= InSizeY) || (x < 0) || (x >= InSizeX)) return -1;
-  return ((InSizeX * y) + xFirst) * InDepth + rem;
+  return ((InSizeX * y) + x) * InDepth + (rem - kx * InDepth);
 }
 
 // FP32 gather into the GEMM B operand. Coded by Claude (AI).
@@ -2866,7 +2874,9 @@ __kernel void cai_im2col
   const int InSizeY,    // FInput.SizeY
   const int InDepth,    // FInput.Depth
   const int Stride,
-  const int Padding,    // zero border added on each side of FInput
+  const int PaddingX,   // zero columns added left and right of FInput
+  const int PaddingY,   // zero rows added above and below FInput
+  const int DilationX,  // spacing of the kernel taps along X
   __global const float* FInput,
   __global float* FCols
 )
@@ -2874,7 +2884,7 @@ __kernel void cai_im2col
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, Padding);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
   FCols[gid] = (src < 0) ? 0.0f : FInput[src];
 }
 
@@ -2890,7 +2900,9 @@ __kernel void cai_im2col_h
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding,
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX,
   __global const float* FInput,
   __global half* FCols
 )
@@ -2898,7 +2910,7 @@ __kernel void cai_im2col_h
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, Padding);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
   vstore_half((src < 0) ? 0.0f : FInput[src], gid, FCols);
 }
 

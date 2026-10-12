@@ -1090,7 +1090,7 @@ type
       FInputScaleInt8: TNeuralFloat;
       // Creates FInputCopyInt8 sized as the previous layer's output grown by
       // pPadding on each side. Keeps an existing one. Coded by Claude (AI).
-      procedure AllocInputCopyInt8(pPadding: integer);
+      procedure AllocInputCopyInt8(pPaddingX, pPaddingY: integer);
       // Construction-time int8 arming (see TNNet.BuildQuantInt8): puts the
       // layer directly into the quantized state (dims recorded, zeroed
       // codes, unit scales) instead of sizing FP32 rows. Returns False when
@@ -15100,7 +15100,14 @@ type
   TNNetConvolutionAbstract = class(TNNetLayerConcatedWeights)
     private
       FPadding: integer;
+      // Zero rows above and below the input: FPadding, or 0 for the X-only
+      // padding of TNNetConvolution1D. Never larger than FPadding.
+      FPaddingY: integer;
       FStride: integer;
+      // Spacing of the kernel taps along X (1 = dense kernel).
+      FDilationX: integer;
+      // Input columns one output position spans: FDilationX*(FFeatureSizeX-1)+1.
+      FFeatureExtentX: integer;
       FOutputSizeX, FOutputSizeY: integer;
       FFeatureSizeX, FFeatureSizeY: integer;
       FFeatureSizeYMinus1, FFeatureSizeXMinus1: integer;
@@ -15123,6 +15130,8 @@ type
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
       property FeatureSizeX: integer read FFeatureSizeX;
       property FeatureSizeY: integer read FFeatureSizeY;
+      property PaddingY: integer read FPaddingY;
+      property DilationX: integer read FDilationX;
       destructor Destroy(); override;
       procedure InitDefault(); override;
       // The padded input copy Compute builds, not the previous layer's output.
@@ -15572,6 +15581,19 @@ type
   TNNetConvolutionRectangularReLU = class(TNNetConvolutionRectangular)
   public
     constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
+  /// 1D convolution along X of a (SeqLen, 1, Channels) input, the geometry of
+  /// torch.nn.Conv1d: a K x 1 kernel with taps pDilation apart, pPadding zero
+  /// columns on both ends and no Y padding, pStride along X, linear activation.
+  /// Output length = (SeqLen + 2*pPadding - pDilation*(K-1) - 1) div pStride + 1.
+  /// Runs the TNNetConvolution forwards (tiled/threaded CPU, OpenCL im2col and
+  /// implicit GEMM) and its backward. FStruct[6] holds the dilation.
+  // Coded by Claude (AI).
+  TNNetConvolution1D = class(TNNetConvolutionLinear)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pPadding, pStride: integer;
+      pDilation: integer = 1; pSuppressBias: integer = 0); reintroduce;
   end;
 
   /// QUATERNION CONVOLUTION layer -- the spatial sibling of the dense
@@ -80952,7 +80974,7 @@ begin
   FinishInt4WeightConversion();
 end;
 
-procedure TNNetLayerConcatedWeights.AllocInputCopyInt8(pPadding: integer);
+procedure TNNetLayerConcatedWeights.AllocInputCopyInt8(pPaddingX, pPaddingY: integer);
 var
   PrevOutput: TNNetVolume;
 begin
@@ -80963,8 +80985,8 @@ begin
   end;
   if Assigned(FInputCopyInt8) then exit;
   PrevOutput := FPrevLayer.Output;
-  FInputCopyInt8 := TNNetVolumeQuant8.Create(PrevOutput.SizeX + pPadding * 2,
-    PrevOutput.SizeY + pPadding * 2, PrevOutput.Depth);
+  FInputCopyInt8 := TNNetVolumeQuant8.Create(PrevOutput.SizeX + pPaddingX * 2,
+    PrevOutput.SizeY + pPaddingY * 2, PrevOutput.Depth);
   FInputCopyInt8.Fill(0);
   FInputCopyInt8.ScaleData.Fill(1);
   FInputScaleInt8 := 1;
@@ -80979,7 +81001,7 @@ end;
 
 procedure TNNetLayerConcatedWeights.EnableInt8Input();
 begin
-  AllocInputCopyInt8({pPadding}0);
+  AllocInputCopyInt8({pPaddingX}0, {pPaddingY}0);
 end;
 
 procedure TNNetLayerConcatedWeights.DisableInt8Input();
@@ -83182,6 +83204,18 @@ begin
   FStruct[5] := FFeatureSizeY;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
+end;
+
+{ TNNetConvolution1D }
+constructor TNNetConvolution1D.Create(pNumFeatures, pFeatureSize, pPadding,
+  pStride: integer; pDilation: integer = 1; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pPadding, pStride, pSuppressBias);
+  FPaddingY := 0;
+  FDilationX := Max(pDilation, 1);
+  SetFeatureSizeXY(pFeatureSize, 1);
+  FStruct[5] := 1;
+  FStruct[6] := FDilationX;
 end;
 
 { TNNetConvolutionRectangularReLU }
@@ -108083,18 +108117,26 @@ procedure TNNetConvolutionAbstract.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   // A kernel only has to fit the PADDED input: a 3x3 pad-1 conv on a 1x1 input
-  // keeps its 3x3 weights, as in PyTorch.
-  FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX + 2 * FPadding);
-  FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPadding);
+  // keeps its 3x3 weights, as in PyTorch. A dilated kernel is never clamped.
+  if FDilationX = 1 then
+    FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX + 2 * FPadding);
+  FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPaddingY);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
+  FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
   RefreshCalculatePrevLayerError();
-  FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureSizeX, FPadding, FStride);
-  FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPadding, FStride);
+  FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureExtentX, FPadding, FStride);
+  FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPaddingY, FStride);
+  if (FOutputSizeX < 1) or (FOutputSizeY < 1) then
+    FErrorProc(ClassName + '.SetPrevLayer: the kernel spans ' +
+      IntToStr(FFeatureExtentX) + 'x' + IntToStr(FFeatureSizeY) +
+      ' but the padded input is only ' +
+      IntToStr(pPrevLayer.Output.SizeX + 2 * FPadding) + 'x' +
+      IntToStr(pPrevLayer.Output.SizeY + 2 * FPaddingY) + '.');
   if FPadding > 0 then
   begin
-    FPrevLayerErrorPadded.ReSize( pPrevLayer.OutputError.SizeX + FPadding*2, pPrevLayer.OutputError.SizeY + FPadding*2, pPrevLayer.OutputError.Depth );
+    FPrevLayerErrorPadded.ReSize( pPrevLayer.OutputError.SizeX + FPadding*2, pPrevLayer.OutputError.SizeY + FPaddingY*2, pPrevLayer.OutputError.Depth );
   end;
 end;
 
@@ -108519,12 +108561,12 @@ begin
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FPrevLayer.Output,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX, {Stride}FStride,
-      {Padding}FPadding, {NewSrc}true, pIm2ColSrcBuffer)
+      FPadding, FPaddingY, FDilationX, {NewSrc}true, pIm2ColSrcBuffer)
   else
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {Stride}FStride,
-      {Padding}0, {NewSrc}true, nil);
+      {PaddingX}0, {PaddingY}0, FDilationX, {NewSrc}true, nil);
 end;
 
 procedure TNNetConvolution.ComputeOpenCL();
@@ -108589,7 +108631,7 @@ begin
   begin
     FDotCL.ComputeImplicitConv(InputAVolume, FPrevLayer.Output,
       {OutSizeX}FOutput.SizeX, {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX,
-      FStride, FPadding, ActOpcode, {NewVAs}WUpdated, BiasVol,
+      FStride, FPadding, FPaddingY, FDilationX, ActOpcode, {NewVAs}WUpdated, BiasVol,
       {NewVBias}WUpdated, {NewSrc}true, GatherSrcBuffer);
   end
   else
@@ -108782,11 +108824,12 @@ procedure TNNetConvolutionBase.PrepareInputForConvolutionFast();
 var
   OutputCntX, OutputCntY: integer;
   MaxX, MaxY: integer;
-  DepthFSize, SizeOfDepthFSize: integer;
+  DepthFSize: integer;
   yCount, FeatSizeYMax: integer;
   InputX: integer;
-  RowSize: integer;
+  RowSize, SizeOfTapRun: integer;
   SrcRowStride, SrcPos, DstPos: integer;
+  TapRunCnt, MaxTapRunPos, TapRunSrcStep, TapRunSrcPos, TapRunDstPos: integer;
   {$IFDEF AVXANY}
   SourceRawPos, DestRawPos: pointer;
   {$ENDIF}
@@ -108798,8 +108841,20 @@ begin
   else
   begin
     DepthFSize := FInputCopy.Depth * FFeatureSizeX;
-    RowSize := DepthFSize;
-    SizeOfDepthFSize := DepthFSize * csNeuralFloatSize;
+    // A kernel row is copied as runs of RowSize adjacent input elements (the
+    // count asm_dword_copy reads): the whole row at dilation 1, else one tap.
+    if FDilationX = 1 then
+    begin
+      RowSize := DepthFSize;
+      MaxTapRunPos := 0;
+    end
+    else
+    begin
+      RowSize := FInputCopy.Depth;
+      MaxTapRunPos := FFeatureSizeXMinus1;
+    end;
+    TapRunSrcStep := FDilationX * FInputCopy.Depth;
+    SizeOfTapRun := RowSize * csNeuralFloatSize;
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     FeatSizeYMax := FFeatureSizeY - 1;
@@ -108821,17 +108876,24 @@ begin
         DstPos := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
         for yCount := 0 to FeatSizeYMax do
         begin
-          {$IFDEF AVXANY}
-          SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
-          DestRawPos := FInputPrepared.GetRawPtr(DstPos);
-          asm_dword_copy;
-          {$ELSE}
-          Move(
-            FInputCopy.FData[SrcPos],
-            FInputPrepared.FData[DstPos],
-            SizeOfDepthFSize
-          );
-          {$ENDIF}
+          TapRunSrcPos := SrcPos;
+          TapRunDstPos := DstPos;
+          for TapRunCnt := 0 to MaxTapRunPos do
+          begin
+            {$IFDEF AVXANY}
+            SourceRawPos := FInputCopy.GetRawPtr(TapRunSrcPos);
+            DestRawPos := FInputPrepared.GetRawPtr(TapRunDstPos);
+            asm_dword_copy;
+            {$ELSE}
+            Move(
+              FInputCopy.FData[TapRunSrcPos],
+              FInputPrepared.FData[TapRunDstPos],
+              SizeOfTapRun
+            );
+            {$ENDIF}
+            Inc(TapRunSrcPos, TapRunSrcStep);
+            Inc(TapRunDstPos, RowSize);
+          end;
           Inc(SrcPos, SrcRowStride);
           Inc(DstPos, DepthFSize);
         end;
@@ -108871,10 +108933,12 @@ procedure TNNetConvolutionBase.PrepareInputForConvolutionInt8();
 var
   OutputCntX, OutputCntY: integer;
   MaxOutputXPos, MaxOutputYPos: integer;
-  DepthFSize, DepthFSizeBytes: integer;
+  DepthFSize: integer;
   yCount, MaxFeatureYPos: integer;
   InputX: integer;
   SrcRowStride, SrcPos, DstPos: integer;
+  TapRunCnt, MaxTapRunPos, TapRunSize, TapRunBytes: integer;
+  TapRunSrcStep, TapRunSrcPos, TapRunDstPos: integer;
 begin
   if not Assigned(FInputPreparedInt8) then
   begin
@@ -108886,7 +108950,19 @@ begin
   // gather, exactly as in the FP32 path.
   if FPointwise then exit;
   DepthFSize := FInputCopyInt8.Depth * FFeatureSizeX;
-  DepthFSizeBytes := DepthFSize * csShortIntSize;
+  // The tap runs of PrepareInputForConvolutionFast.
+  if FDilationX = 1 then
+  begin
+    TapRunSize := DepthFSize;
+    MaxTapRunPos := 0;
+  end
+  else
+  begin
+    TapRunSize := FInputCopyInt8.Depth;
+    MaxTapRunPos := FFeatureSizeXMinus1;
+  end;
+  TapRunSrcStep := FDilationX * FInputCopyInt8.Depth;
+  TapRunBytes := TapRunSize * csShortIntSize;
   MaxOutputXPos := FOutput.SizeX - 1;
   MaxOutputYPos := FOutput.SizeY - 1;
   MaxFeatureYPos := FFeatureSizeY - 1;
@@ -108900,11 +108976,18 @@ begin
       DstPos := FInputPreparedInt8.GetRawPos(OutputCntX, OutputCntY);
       for yCount := 0 to MaxFeatureYPos do
       begin
-        Move(
-          FInputCopyInt8.FData[SrcPos],
-          FInputPreparedInt8.FData[DstPos],
-          DepthFSizeBytes
-        );
+        TapRunSrcPos := SrcPos;
+        TapRunDstPos := DstPos;
+        for TapRunCnt := 0 to MaxTapRunPos do
+        begin
+          Move(
+            FInputCopyInt8.FData[TapRunSrcPos],
+            FInputPreparedInt8.FData[TapRunDstPos],
+            TapRunBytes
+          );
+          Inc(TapRunSrcPos, TapRunSrcStep);
+          Inc(TapRunDstPos, TapRunSize);
+        end;
         Inc(SrcPos, SrcRowStride);
         Inc(DstPos, DepthFSize);
       end;
@@ -109600,7 +109683,7 @@ begin
   // pads the source itself, so FInputCopy is neither built nor read.
   if FPadding = 0 then FInputCopy := FPrevLayer.Output
   else if not pPaddingOnOpenCL then
-    FInputCopy.CopyPadding(FPrevLayer.Output, FPadding);
+    FInputCopy.CopyPadding(FPrevLayer.Output, FPadding, FPaddingY);
 
   if FSmoothErrorPropagation then
   begin
@@ -109651,7 +109734,7 @@ begin
   Result := (not FIsTrainable) and ((ClassType = TNNetConvolution) or
     (ClassType = TNNetConvolutionLinear) or (ClassType = TNNetConvolutionReLU) or
     (ClassType = TNNetPointwiseConv) or (ClassType = TNNetPointwiseConvLinear) or
-    (ClassType = TNNetPointwiseConvReLU));
+    (ClassType = TNNetPointwiseConvReLU) or (ClassType = TNNetConvolution1D));
 end;
 
 procedure TNNetConvolution.Compute();
@@ -110084,6 +110167,8 @@ var
   LocalLearningErrorDerivPtr: pointer;
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
+  TapRunCnt, MaxTapRunPos, TapRunSize, TapRunSrcStep: integer;
+  RowPrevPtr, RowWeightPtr: TNeuralFloatArrPtr;
   // Tiling
   TileXCnt, TileDCnt: integer;
   StartTileX, EndTileX, StartTileD, EndTileD: integer;
@@ -110105,11 +110190,24 @@ begin
   begin
     LocalPrevError := FPrevLayer.OutputError;
   end;
-  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureExtentX;
   MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
+  // Each kernel row scatters as runs of adjacent elements, as the im2col
+  // gathers them: the whole row at dilation 1, one tap otherwise.
+  if FDilationX = 1 then
+  begin
+    TapRunSize := FSizeXDepth;
+    MaxTapRunPos := 0;
+  end
+  else
+  begin
+    TapRunSize := FPrevLayer.Output.Depth;
+    MaxTapRunPos := FFeatureSizeXMinus1;
+  end;
+  TapRunSrcStep := FDilationX * FPrevLayer.Output.Depth;
 
-  PrevNumElements := (FSizeXDepth shr 2) shl 2;
-  PrevMissedElements := FSizeXDepth - PrevNumElements;
+  PrevNumElements := (TapRunSize shr 2) shl 2;
+  PrevMissedElements := TapRunSize - PrevNumElements;
   NeuronWeights := FArrNeurons[0].Delta.Size;
   localNumElements := (NeuronWeights shr 2) shl 2;
   MissedElements := NeuronWeights - localNumElements;
@@ -110226,35 +110324,34 @@ begin
                         // (FCalculatePrevLayerError and CanBackpropOnPos) guard
                         // once per OutputX, and neither PrevX/PrevY nor it change
                         // inside the OutputD loop.
-                        PrevPtrA := LocalDestPtr;
-                        PrevPtrB := LocalWeight.DataPtr;
+                        RowPrevPtr := LocalDestPtr;
+                        RowWeightPtr := LocalWeight.DataPtr;
                         for LocalCntY := 0 to FFeatureSizeYMinus1 do
                         begin
-                          {$IFNDEF AVX64}
-                          LocalPrevError.MulAdd
-                          (
-                            PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
-                            PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
-                            SmoothLocalOutputErrorDeriv,
-                            FSizeXDepth
-                          );
-                          {$ELSE}
-                          {$IFDEF Debug}
-                          if PrevNumElements + PrevMissedElements <> FSizeXDepth
-                          then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
-                          {$ENDIF}
-                          //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                          //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
-                          asm_avx64_prev_backprop;
-                          {$ENDIF}
+                          for TapRunCnt := 0 to MaxTapRunPos do
+                          begin
+                            PrevPtrA := TNeuralFloatArrPtr(@RowPrevPtr^[TapRunCnt * TapRunSrcStep]);
+                            PrevPtrB := TNeuralFloatArrPtr(@RowWeightPtr^[TapRunCnt * TapRunSize]);
+                            {$IFNDEF AVX64}
+                            LocalPrevError.MulAdd
+                            (
+                              PrevPtrA,
+                              PrevPtrB,
+                              SmoothLocalOutputErrorDeriv,
+                              TapRunSize
+                            );
+                            {$ELSE}
+                            asm_avx64_prev_backprop;
+                            {$ENDIF}
+                          end;
                           if LocalCntY < FFeatureSizeYMinus1 then
                           begin
                             {$IFDEF FPC}
-                            PrevPtrA := (pointer(PrevPtrA) + FPrevSizeXDepthBytes);
-                            PrevPtrB := (pointer(PrevPtrB) + FSizeXDepthBytes);
+                            RowPrevPtr := (pointer(RowPrevPtr) + FPrevSizeXDepthBytes);
+                            RowWeightPtr := (pointer(RowWeightPtr) + FSizeXDepthBytes);
                             {$ELSE}
-                            PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY + 1);
-                            PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY + 1);
+                            RowPrevPtr := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY + 1);
+                            RowWeightPtr := LocalWeight.GetRawPtr(0, LocalCntY + 1);
                             {$ENDIF}
                           end;
                         end;
@@ -110280,7 +110377,7 @@ begin
 
   if FPadding > 0 then
   begin
-    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPaddingY, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
   end;
 
   if (not FBatchUpdate) then
@@ -110891,7 +110988,10 @@ begin
   FFeatureSizeX := pFeatureSize;
   FFeatureSizeY := pFeatureSize;
   FPadding := pInputPadding;
+  FPaddingY := FPadding;
   FStride := Max(pStride,1);
+  FDilationX := 1;
+  FFeatureExtentX := FFeatureSizeX;
   FSuppressBias := pSuppressBias;
   if FPadding > 0 then
   begin
@@ -110906,6 +111006,7 @@ begin
   FFeatureSizeY := Max(pFeatureSizeY, 1);
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
+  FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
@@ -110934,8 +111035,8 @@ end;
 
 procedure TNNetConvolutionAbstract.EnableInt8Input();
 begin
-  // FPadding gives FInputCopyInt8 the geometry CopyPadding gives FInputCopy.
-  AllocInputCopyInt8(FPadding);
+  // The padding gives FInputCopyInt8 the geometry CopyPadding gives FInputCopy.
+  AllocInputCopyInt8(FPadding, FPaddingY);
 end;
 
 { TNNetFullConnect }
@@ -120053,10 +120154,10 @@ begin
       if (Layer is TNNetConvolutionAbstract) then
       begin
         Conv := TNNetConvolutionAbstract(Layer);
-        KernelX := Conv.FFeatureSizeX;
+        KernelX := Conv.FFeatureExtentX;
         KernelY := Conv.FFeatureSizeY;
         PadX := Conv.FPadding;
-        PadY := Conv.FPadding;
+        PadY := Conv.FPaddingY;
         if Conv.FStride > 0 then
         begin
           StrideX := Conv.FStride;
@@ -131557,6 +131658,7 @@ begin
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
+      'TNNetConvolution1D' :        Result := TNNetConvolution1D.Create(St[0], St[1], St[2], St[3], St[6], St[4]);
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -132004,6 +132106,7 @@ begin
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolution1D' then Result := TNNetConvolution1D.Create(St[0], St[1], St[2], St[3], St[6], St[4]) else
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
