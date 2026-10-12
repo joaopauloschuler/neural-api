@@ -1568,9 +1568,11 @@ rather than acted on.
           host style rewrite), `TestSnakePerChannelSaveLoadRoundTrip`,
           `TestKokoroLayersBorrowingBuild`, `TestSnakePerChannelGradientCheck`;
           `TestActivationOpenCLParity` gained the 3 opcodes.
-        - [ ] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
+        - [x] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
           `TNNetSin` exist on CPU only (no opcode); 22 x frames, so either
           `TNNetSplitChannels` + those layers or a host step before the iSTFT.
+          Done: host step (the net ends at conv_post; 22 x (120F+1) floats,
+          one download, and the iSTFT is on the host anyway).
         - [x] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
           lives only in the test (`WriteStyleIntoChannelAffine`); move it into the
           Kokoro loader (2.5) rather than writing a second copy.
@@ -1613,7 +1615,7 @@ rather than acted on.
           build + forward (2 runs); activations 171.5 MB with host-output
           sharing off, 163.5 MB on (20 of 58 layers shared); the test process
           (all three owners + the decoder net) peaks at 802 MB RSS.
-        - [ ] Stage C generator: recommended as a FOLLOWING net
+        - [x] Stage C generator: recommended as a FOLLOWING net
           (`StageCGenerator`), not appended to the decoder net. Inputs: x
           (2F,1,512) at index 0, the host harmonic spectrum (120F+1,1,22) at
           index 1. The host writes `Layers[1].Output`, then
@@ -1623,6 +1625,32 @@ rather than acted on.
           the dump's dec_decode3 alone; one net would share no host storage
           across the two (exact-size liveness slots, no common shapes); the
           hand-over costs one 0.4 MB copy.
+          Done as recommended: `LoadStageCGenerator` builds the owner once at
+          2 frames (`KokoroStageCGeneratorOwnerFrameCount`; no generator kernel
+          clamps at any length); `PrepareStageCGenerator(F)` /
+          `ReleaseStageCGenerator` / `RunStageCGenerator(x, spectrum, style,
+          Audio)`, same borrowing rebuild and `ArmStageNet`. `Synthesize`
+          hands x over with `ComputeFromLayerOutput(StageCDecoderNet last
+          layer)`; `RunStageCDecoder` still downloads and copies x (0.4 MB)
+          because it returns it. Inference: low memory, except the two ups
+          deconvs in fast memory (`SetTrainable(False, False)` +
+          `FlushWeightCache` after the borrowing build) so they run the CPU
+          GEMM: standalone real shapes, CPU, best of 4: ups0 512->256 k20 s10
+          L=204 407 -> 285 ms (borrowed weights 398 -> 284 ms), ups1 256->128
+          k12 s6 L=2040 471 -> 378 ms; +12 MB weight cache. Not measured
+          inside the real generator (no real-size runs on the dev VM).
+          `TNNetKokoro.Create` now checks EVERY checkpoint tensor is consumed
+          (one shared Consumed list, `RaiseOnUnreadKokoroTensors` over
+          bert/bert_encoder/predictor/text_encoder/decoder; real file passes).
+          - [ ] Real-size generator memory / time not measured here: the
+            generator parity and end-to-end tests on the real checkpoint (and
+            the real stage-C decoder ones) are opt-in,
+            `NEURAL_KOKORO82M_REAL_HEAVY=1`; an earlier real generator run hit
+            the VM's OOM killer (2.7 GB RSS + swap) with host-output sharing off.
+          - [ ] OpenCL: `TNNetPadXY` (the reflection pad) has no kernel, so it
+            downloads ups1's output and its consumer re-uploads (6 MB at 102
+            frames); the ups deconvs scatter on the host (see 0.4). Not
+            measured on a GPU (PoCL parity only).
         Stage B done: `TNNetKokoro.LoadStageB` builds the stage-B owner once at 8
         frames (`KokoroStageBOwnerFrameCount`) and loads it (a stage-B tensor left
         unread raises, via `RaiseOnUnreadKokoroTensors`, now shared with stage A);
@@ -1893,12 +1921,59 @@ rather than acted on.
         - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
-  - [ ] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
+  - [x] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
         (`TNNetDAC.RunSnake`); extend `THiFiGANResBlock` rather than clone it.
-  - [ ] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
+        Done as `TNNet` layers instead (the host-run `THiFiGANResBlock` does not
+        fit the TNNet-stage decision): `AddKokoroAdaINResBlock1(NN, Input, K,
+        Dilations)` -> `TKokoroAdaINResBlock1Layers`; per dilation d:
+        `TNNetInstanceNorm`, per-channel `TNNetSnake`, `TNNetConv1DLinear(C, K,
+        d*(K-1)/2, 1, d)`, again with d = 1, `TNNetSum` with the residual.
+        `LoadKokoroAdaINResBlock1Weights` loads convs1/convs2 (weight_norm
+        folded), alpha1/alpha2 (`LoadKokoroSnakeAlpha`) and the adain fc
+        (`LoadKokoroStyleFc`). Used for noise_res and the MRF resblocks.
+  - [x] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
         ups, reflection pad (1,0) on the last stage, MRF average of 3 resblocks,
         `conv_post` 128->22, exp (magnitude) / sin (phase), iSTFT via
         `ISTFTOverlapAdd` with the centre trim and the phase-sign flip.
+        Done: `BuildKokoroStageCGeneratorNet(NN, Config, F)`: inputs x
+        (2F,1,512) and the harmonic spectrum (120F+1,1,22); per stage
+        `TNNetLeakyReLU(0.1)`, noise conv (`TNNetConv1DLinear(c, 2*s, (s+1)
+        div 2, s)`, s = prod(rates[i+1:]); last stage
+        `TNNetPointwiseConvLinear`), noise_res (k7 / last k11, d 1,3,5), ups
+        `TNNetDeconv1DLinear(c, k, u, (k-u) div 2)`, on the last stage
+        `TNNetPadXY(1, 0, pmReflect, 0)`, `TNNetSum`, 3 resblocks, `TNNetSum` +
+        `TNNetMulByConstant(1/3)`; then `TNNetLeakyReLU(0.01)` and conv_post.
+        Lengths (real): x 2F -> ups0 20F (= noise conv0 (120F+1+6-12) div 6 +
+        1) -> ups1 120F -> pad 120F+1 (= the 1x1 noise conv); the builder
+        raises on a mismatch. `TNNetPadXY` gained `TrailingPaddingX`
+        (FStruct[3] = it + 1, 0 = symmetric as before; test
+        `TestPadXYTrailingPaddingX`). Host: exp / sin per element, then new
+        `ISTFTCenteredMagnitudePhase` (neuralaudio: torch.istft center=True:
+        `ISTFTOverlapAddReIm` with Im negated, NFFT div 2 trimmed at both ends,
+        600F samples). Top level: `Synthesize(ids, decoder style, prosody
+        style, speed, Audio)`, `SynthesizePhonemes(phonemes, voice, ...)`,
+        `SynthesizePhonemesToWav` (`SaveVolumeToWav16`, 24 kHz). Tests (tiny,
+        relative to max |ref|): gen_stage0 leaky 0, noise_conv 3.7e-7,
+        noise_res 8.4e-7, ups 1.8e-7, sum 5.7e-7, resblock0..2 8.7e-7/7.2e-7/
+        6.2e-7, mrf 5.9e-7; gen_stage1 noise_conv 1.4e-7, noise_res 6.2e-6,
+        ups / pad 5.4e-7, sum 5.6e-6, resblock0..2 4.4e-6/4.3e-6/3.8e-6, mrf
+        4.3e-6; post_leaky 3.8e-6; gen_spec 9.4e-6; gen_phase 7.0e-5 abs;
+        audio 0.81 of 47963 (1.7e-5) (`TestKokoroStageCGeneratorTinyParity`);
+        `TestKokoroISTFTTinyParity` (dump gen_spec/gen_phase -> audio, 1.2e-7);
+        `TestKokoroStageCGeneratorBorrowingRebuild` (F = 10 and 6 vs a fresh
+        build); `TestKokoroStageCGeneratorOpenCLParity` (PoCL: 120 of 185
+        layers on OpenCL as armed, 162 forced; conv_post <= 2.0e-5 abs of ~7,
+        audio <= 3.8e-5 of ~8);
+        `TestKokoroTinySynthesizePhonemes` (equals the stages one by one;
+        dec_decode3 7.4e-6, F0_pred 9.0e-6 rel.).
+        - [ ] Tiny end to end vs the dump audio: 43763 of 47963 max abs. The
+          generator on the dump's x with OUR harmonic spectrum gives the same
+          43763, so it is the arbitrary phase bins of 2.9 (random tiny weights
+          and exp() amplify them). Real-checkpoint end-to-end diff not
+          measured here (opt-in test `TestKokoroRealEndToEnd`, writes
+          pascal.wav beside the dump).
+        - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
+          their scratch per call (once per utterance).
   Phase 3 — text input:
   - [ ] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
         split long input into chunks.

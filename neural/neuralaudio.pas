@@ -218,6 +218,11 @@ procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
 procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
   NFFT: integer; HopLength: integer);
 
+// torch.istft(Magnitude * exp(1j * Phase), NFFT, HopLength, center=True), periodic
+// Hann: ISTFTOverlapAddReIm, then NFFT div 2 trimmed from both ends.
+procedure ISTFTCenteredMagnitudePhase(Magnitude, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+
 type
   // torch.stft defaults (center reflect pad, periodic Hann, onesided) and sign:
   // X[k] = sum w[n] x[n] exp(-2 pi i k n / NFFT); ISTFTOverlapAddReIm takes -Im.
@@ -1780,6 +1785,45 @@ begin
   finally
     Re.Free;
     Im.Free;
+  end;
+end;
+
+procedure ISTFTCenteredMagnitudePhase(Magnitude, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  Re, Im, FullWave: TNNetVolume;
+  ElementPos, MaxElementPos, TrimCount, WaveLength: integer;
+  SinPhase, CosPhase: TNeuralFloat;
+begin
+  if (Magnitude.SizeX <> Phase.SizeX) or (Magnitude.Depth <> Phase.Depth) or
+     (Magnitude.SizeY <> 1) or (Phase.SizeY <> 1) then
+    raise Exception.Create('ISTFTCenteredMagnitudePhase: Magnitude and Phase ' +
+      'must both be (frames, 1, bins).');
+  Re := TNNetVolume.Create(Magnitude.SizeX, 1, Magnitude.Depth);
+  Im := TNNetVolume.Create(Magnitude.SizeX, 1, Magnitude.Depth);
+  FullWave := TNNetVolume.Create();
+  try
+    MaxElementPos := Magnitude.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      pcr_sincosf(Phase.FData[ElementPos], SinPhase, CosPhase);
+      Re.FData[ElementPos] := Magnitude.FData[ElementPos] * CosPhase;
+      // ISTFTOverlapAddReIm stores the negated imaginary part.
+      Im.FData[ElementPos] := -Magnitude.FData[ElementPos] * SinPhase;
+    end;
+    ISTFTOverlapAddReIm(Re, Im, FullWave, NFFT, HopLength);
+    TrimCount := NFFT div 2;
+    WaveLength := FullWave.Size - 2 * TrimCount;
+    if WaveLength < 1 then
+      raise Exception.Create('ISTFTCenteredMagnitudePhase: ' +
+        IntToStr(Magnitude.SizeX) + ' frames leave no sample after the trim.');
+    Wave.ReSize(WaveLength, 1, 1);
+    Move(FullWave.FData[TrimCount], Wave.FData[0],
+      WaveLength * csNeuralFloatSize);
+  finally
+    FullWave.Free;
+    Im.Free;
+    Re.Free;
   end;
 end;
 

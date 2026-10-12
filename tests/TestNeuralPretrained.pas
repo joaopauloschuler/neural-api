@@ -64,11 +64,17 @@ type
     procedure CheckKokoroStageCDecoderParity(Kokoro: TNNetKokoro;
       const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean);
     // TNNetKokoro over the real snapshot and the real dump file; Ignore()s
-    // the test when either is missing.
-    function CreateRealKokoroOrIgnore(out ReferenceFile: string): TNNetKokoro;
+    // the test when either is missing, or when Heavy without NEURAL_KOKORO82M_REAL_HEAVY=1.
+    function CreateRealKokoroOrIgnore(out ReferenceFile: string;
+      Heavy: boolean = false): TNNetKokoro;
     // ComputeHarmonicSpectrum on the dump's F0_pred vs gen_har_source /
     // gen_har_spec / gen_har_phase (see the phase rule in the body).
     procedure CheckKokoroHarmonicSpectrumParity(Kokoro: TNNetKokoro;
+      const ReferenceFile: string; Tolerance: TNeuralFloat);
+    // Runs the stage-C generator on the dump's dec_decode3, gen_har_spec /
+    // gen_har_phase and ref_s and checks every generator stage and the audio,
+    // relative to max |reference|.
+    procedure CheckKokoroStageCGeneratorParity(Kokoro: TNNetKokoro;
       const ReferenceFile: string; Tolerance: TNeuralFloat);
     // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
     // OnOpenCL (skipped without a device).
@@ -764,10 +770,10 @@ type
     // style rewrite on the same net.
     procedure TestKokoroStageCDecoderOpenCLParity;
     // Stage-C decoder on the real snapshot vs the real dump, plus its memory
-    // with host-output sharing on; ignored when absent.
+    // with host-output sharing on; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
     procedure TestKokoroRealStageCDecoderParity;
     // Real stages A, B and the decoder chained (our t_en, durations, curves)
-    // vs the dump's dec_decode3; reports the error, loose tolerance.
+    // vs the dump's dec_decode3, loose tolerance; opt-in as above.
     procedure TestKokoroRealStagesChainedToDecoder;
     // Generator host step (har_source, its STFT magnitude and phase) vs
     // tiny_kokoro82m_ref from the dumped F0_pred.
@@ -775,6 +781,26 @@ type
     // The same on the real snapshot, plus gen_f0_upsampled and gen_uv exact;
     // ignored when absent.
     procedure TestKokoroRealHarmonicSpectrumParity;
+    // torch.istft(center=True) of the dump's gen_spec / gen_phase vs its audio.
+    procedure TestKokoroISTFTTinyParity;
+    // Stage-C generator per stage vs tiny_kokoro82m_ref from the dumped x and
+    // harmonic spectrum: < 1e-4 of max |reference|.
+    procedure TestKokoroStageCGeneratorTinyParity;
+    // Stage-C generator at two frame counts through the borrowing rebuild
+    // equals a fresh build, and the sized net sizes no weights.
+    procedure TestKokoroStageCGeneratorBorrowingRebuild;
+    // Stage-C generator armed for OpenCL vs the CPU at two frame counts, with
+    // a style rewrite on the same net.
+    procedure TestKokoroStageCGeneratorOpenCLParity;
+    // SynthesizePhonemes on the tiny fixture: equals the stages run one by one
+    // (x handed over from the decoder's layer); reports the diff to the dump.
+    procedure TestKokoroTinySynthesizePhonemes;
+    // The stage-C generator and the iSTFT on the real snapshot vs the real
+    // dump; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
+    procedure TestKokoroRealStageCGeneratorParity;
+    // Every real stage from input_ids and ref_s only: audio diff to the dump,
+    // time and RSS per stage, pascal.wav beside the dump; opt-in as above.
+    procedure TestKokoroRealEndToEnd;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -24268,7 +24294,7 @@ begin
 end;
 
 function TTestNeuralPretrained.CreateRealKokoroOrIgnore(
-  out ReferenceFile: string): TNNetKokoro;
+  out ReferenceFile: string; Heavy: boolean): TNNetKokoro;
 var
   SnapshotDir: string;
   Config: TKokoroConfig;
@@ -24284,6 +24310,10 @@ begin
     Ignore('hexgrad/Kokoro-82M snapshot or ' + ReferenceFile + ' not found ' +
       '(tools/make_kokoro82m_fixture.py real; NEURAL_KOKORO82M_DIR, ' +
       'NEURAL_KOKORO82M_REF)');
+  // Real-size stage-C forwards need more RAM than a 4 GB dev VM has spare.
+  if Heavy and (GetEnvironmentVariable('NEURAL_KOKORO82M_REAL_HEAVY') <> '1') then
+    Ignore('real-size Kokoro stage-C run: set NEURAL_KOKORO82M_REAL_HEAVY=1 ' +
+      'to run it');
   Reader := OpenKokoroSnapshot(SnapshotDir, 'af_heart', Config, Voice);
   try
     Result := TNNetKokoro.Create(Reader, Config);
@@ -24948,7 +24978,7 @@ var
   DecoderStyle: TNeuralFloatDynArr;
   StartTime: TDateTime;
 begin
-  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile);
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile, {Heavy=}true);
   Reference := nil;
   TextFeatures := TNNetVolume.Create;
   F0Curve := TNNetVolume.Create; NCurve := TNNetVolume.Create;
@@ -25001,7 +25031,7 @@ var
   MaxDiff, ReferenceMaxAbs: TNeuralFloat;
   StartTime: TDateTime;
 begin
-  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile);
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile, {Heavy=}true);
   Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
   Values := TNNetVolume.Create;
   DurationFeatures := TNNetVolume.Create; TextFeatures := TNNetVolume.Create;
@@ -25193,6 +25223,525 @@ begin
     Voicing.Free;
     F0Upsampled.Free;
     F0Curve.Free;
+    Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+// The generator inputs of a Kokoro dump: dec_decode3 as (2F,1,C), the harmonic
+// spectrum [gen_har_spec; gen_har_phase] as (frames,1,2*bins), the decoder style.
+procedure LoadKokoroStageCGeneratorInputs(Reference: TNNetSafeTensorsReader;
+  StyleDim, DecoderBlockCount: integer; DecoderFeatures,
+  HarmonicSpectrum: TNNetVolume; out DecoderStyle: TNeuralFloatDynArr);
+var
+  Values, Phases: TNNetVolume;
+  StageName: string;
+  ChannelCount, PositionCount, ChannelPos, PositionPos, StylePos: integer;
+begin
+  Values := TNNetVolume.Create;
+  Phases := TNNetVolume.Create;
+  try
+    StageName := 'dec_decode' + IntToStr(DecoderBlockCount - 1);
+    Reference.LoadTensorFlat(StageName, Values);
+    ChannelCount := Reference.DimSize(StageName, 1);
+    PositionCount := Reference.DimSize(StageName, 2);
+    DecoderFeatures.ReSize(PositionCount, 1, ChannelCount);
+    for ChannelPos := 0 to ChannelCount - 1 do
+      for PositionPos := 0 to PositionCount - 1 do
+        DecoderFeatures[PositionPos, 0, ChannelPos] :=
+          Values.FData[ChannelPos * PositionCount + PositionPos];
+    Reference.LoadTensorFlat('gen_har_spec', Values);
+    Reference.LoadTensorFlat('gen_har_phase', Phases);
+    ChannelCount := Reference.DimSize('gen_har_spec', 1);
+    PositionCount := Reference.DimSize('gen_har_spec', 2);
+    HarmonicSpectrum.ReSize(PositionCount, 1, 2 * ChannelCount);
+    for ChannelPos := 0 to ChannelCount - 1 do
+      for PositionPos := 0 to PositionCount - 1 do
+      begin
+        HarmonicSpectrum[PositionPos, 0, ChannelPos] :=
+          Values.FData[ChannelPos * PositionCount + PositionPos];
+        HarmonicSpectrum[PositionPos, 0, ChannelCount + ChannelPos] :=
+          Phases.FData[ChannelPos * PositionCount + PositionPos];
+      end;
+    Reference.LoadTensorFlat('ref_s', Values);
+    SetLength(DecoderStyle, StyleDim);
+    for StylePos := 0 to StyleDim - 1 do
+      DecoderStyle[StylePos] := Values.FData[StylePos];
+  finally
+    Phases.Free;
+    Values.Free;
+  end;
+end;
+
+// Max |Audio - dump audio| and the RMS of the difference; -1 on a length mismatch.
+function KokoroAudioDiff(Reference: TNNetSafeTensorsReader; Audio: TNNetVolume;
+  out RMSDiff, ReferenceMaxAbs, ReferenceRMS: double): double;
+var
+  Values: TNNetVolume;
+  SamplePos: integer;
+  Diff, SumSquares, ReferenceSumSquares: double;
+begin
+  Result := -1;
+  RMSDiff := 0;
+  ReferenceMaxAbs := 0;
+  ReferenceRMS := 0;
+  Values := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat('audio', Values);
+    if Values.Size <> Audio.Size then exit;
+    Result := 0;
+    SumSquares := 0;
+    ReferenceSumSquares := 0;
+    for SamplePos := 0 to Values.Size - 1 do
+    begin
+      Diff := Audio.FData[SamplePos] - Values.FData[SamplePos];
+      Result := Max(Result, Abs(Diff));
+      ReferenceMaxAbs := Max(ReferenceMaxAbs, Abs(Values.FData[SamplePos]));
+      SumSquares := SumSquares + Sqr(Diff);
+      ReferenceSumSquares := ReferenceSumSquares + Sqr(Values.FData[SamplePos]);
+    end;
+    RMSDiff := Sqrt(SumSquares / Values.Size);
+    ReferenceRMS := Sqrt(ReferenceSumSquares / Values.Size);
+  finally
+    Values.Free;
+  end;
+end;
+
+// Asserts the audio against the dump within Tolerance of max |reference|.
+procedure CheckKokoroAudio(Reference: TNNetSafeTensorsReader;
+  Audio: TNNetVolume; Tolerance: double; const Context: string);
+var
+  MaxDiff, RMSDiff, ReferenceMaxAbs, ReferenceRMS: double;
+begin
+  MaxDiff := KokoroAudioDiff(Reference, Audio, RMSDiff, ReferenceMaxAbs,
+    ReferenceRMS);
+  WriteLn('  Kokoro ', Context, ' audio (', Audio.Size, ' samples): max |diff| = ',
+    MaxDiff:0:9, ' (max |ref| = ', ReferenceMaxAbs:0:4, ', rel. ',
+    (MaxDiff / Max(ReferenceMaxAbs, 1e-30)):0:9, '), RMS diff ', RMSDiff:0:9,
+    ' (RMS ref ', ReferenceRMS:0:6, ')');
+  TAssert.AssertTrue(Context + ' audio length ' + IntToStr(Audio.Size) + ' vs ' +
+    Reference.ShapeAsString('audio'), MaxDiff >= 0);
+  TAssert.AssertTrue(Context + ' audio max |diff| = ' + FloatToStr(MaxDiff),
+    MaxDiff < Tolerance * ReferenceMaxAbs);
+end;
+
+procedure TTestNeuralPretrained.TestKokoroISTFTTinyParity;
+var
+  Reference: TNNetSafeTensorsReader;
+  Magnitude, Phase, Values, Audio: TNNetVolume;
+  BinCount, FrameCount, BinPos, FramePos: integer;
+begin
+  Reference := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_kokoro82m_ref.safetensors'));
+  Magnitude := TNNetVolume.Create; Phase := TNNetVolume.Create;
+  Values := TNNetVolume.Create; Audio := TNNetVolume.Create;
+  try
+    BinCount := Reference.DimSize('gen_spec', 1);
+    FrameCount := Reference.DimSize('gen_spec', 2);
+    Magnitude.ReSize(FrameCount, 1, BinCount);
+    Phase.ReSize(FrameCount, 1, BinCount);
+    Reference.LoadTensorFlat('gen_spec', Values);
+    for BinPos := 0 to BinCount - 1 do
+      for FramePos := 0 to FrameCount - 1 do
+        Magnitude[FramePos, 0, BinPos] := Values.FData[BinPos * FrameCount + FramePos];
+    Reference.LoadTensorFlat('gen_phase', Values);
+    for BinPos := 0 to BinCount - 1 do
+      for FramePos := 0 to FrameCount - 1 do
+        Phase[FramePos, 0, BinPos] := Values.FData[BinPos * FrameCount + FramePos];
+    ISTFTCenteredMagnitudePhase(Magnitude, Phase, Audio, 20, 5);
+    AssertEquals('hop * (frames - 1) samples', 5 * (FrameCount - 1), Audio.Size);
+    CheckKokoroAudio(Reference, Audio, 1e-5, 'tiny iSTFT');
+  finally
+    Magnitude.Free; Phase.Free; Values.Free; Audio.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStageCGeneratorParity(
+  Kokoro: TNNetKokoro; const ReferenceFile: string; Tolerance: TNeuralFloat);
+var
+  Reference: TNNetSafeTensorsReader;
+  DecoderFeatures, HarmonicSpectrum, Audio: TNNetVolume;
+  DecoderStyle: TNeuralFloatDynArr;
+  Layers: TKokoroStageCGeneratorLayers;
+  StagePos, ResBlockPos: integer;
+  StageName: string;
+  StartTime: TDateTime;
+
+  procedure CheckStage(const Name: string; Actual: TNNetVolume);
+  begin
+    CheckKokoroStage(Reference, Name, Actual, true, Tolerance, true);
+  end;
+
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  DecoderFeatures := TNNetVolume.Create;
+  HarmonicSpectrum := TNNetVolume.Create;
+  Audio := TNNetVolume.Create;
+  try
+    LoadKokoroStageCGeneratorInputs(Reference, Kokoro.Config.StyleDim,
+      Kokoro.Config.DecoderBlockCount, DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle);
+    Kokoro.ShareHostOutputs := false;
+    StartTime := Now();
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      Audio);
+    WriteLn('  Kokoro stage-C generator, ', DecoderFeatures.SizeX div 2,
+      ' frames: ', ((Now() - StartTime) * MSecsPerDay):0:1,
+      ' ms (build + forward + iSTFT)');
+    Layers := Kokoro.StageCGeneratorLayers;
+    for StagePos := 0 to High(Layers.Stages) do
+    begin
+      StageName := 'gen_stage' + IntToStr(StagePos) + '_';
+      CheckStage(StageName + 'leaky', Layers.Stages[StagePos].Leaky.Output);
+      CheckStage(StageName + 'noise_conv',
+        Layers.Stages[StagePos].NoiseConv.Output);
+      CheckStage(StageName + 'noise_res',
+        Layers.Stages[StagePos].NoiseRes.Output.Output);
+      CheckStage(StageName + 'ups', Layers.Stages[StagePos].Ups.Output);
+      if Assigned(Layers.Stages[StagePos].Pad) then
+        CheckStage(StageName + 'pad', Layers.Stages[StagePos].Pad.Output);
+      CheckStage(StageName + 'sum', Layers.Stages[StagePos].Sum.Output);
+      for ResBlockPos := 0 to High(Layers.Stages[StagePos].ResBlocks) do
+        CheckStage(StageName + 'resblock' + IntToStr(ResBlockPos),
+          Layers.Stages[StagePos].ResBlocks[ResBlockPos].Output.Output);
+      CheckStage(StageName + 'mrf', Layers.Stages[StagePos].Mrf.Output);
+    end;
+    CheckStage('gen_post_leaky', Layers.PostLeaky.Output);
+    if Reference.HasTensor('gen_conv_post') then
+      CheckStage('gen_conv_post', Layers.ConvPost.Output);
+    CheckStage('gen_spec', Kokoro.GeneratorMagnitude);
+    CheckStage('gen_phase', Kokoro.GeneratorPhase);
+    CheckKokoroAudio(Reference, Audio, Tolerance, 'generator');
+  finally
+    Audio.Free;
+    HarmonicSpectrum.Free;
+    DecoderFeatures.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageCGeneratorTinyParity;
+var
+  Kokoro: TNNetKokoro;
+begin
+  Kokoro := CreateTinyKokoro();
+  try
+    CheckKokoroStageCGeneratorParity(Kokoro,
+      FixturePath('tiny_kokoro82m_ref.safetensors'), 1e-4);
+    AssertEquals('two upsampling stages', 2,
+      Length(Kokoro.StageCGeneratorLayers.Stages));
+    AssertEquals('120F + 1 positions at conv_post', 1201,
+      Kokoro.StageCGeneratorNet.GetLastLayer().Output.SizeX);
+  finally
+    Kokoro.Free;
+  end;
+end;
+
+// Runs the tiny generator for FrameCount frames on synthetic x, harmonic
+// spectrum and decoder style (StylePhase picks them).
+procedure RunTinyKokoroStageCGenerator(Kokoro: TNNetKokoro;
+  FrameCount: integer; Audio: TNNetVolume; StylePhase: TNeuralFloat = 0.2);
+var
+  DecoderStyle: TNeuralFloatDynArr;
+  DecoderFeatures, HarmonicSpectrum: TNNetVolume;
+  StylePos, ElementPos: integer;
+begin
+  SetLength(DecoderStyle, Kokoro.Config.StyleDim);
+  for StylePos := 0 to High(DecoderStyle) do
+    DecoderStyle[StylePos] := 0.3 * Sin(StylePos * 0.8 + StylePhase);
+  DecoderFeatures := TNNetVolume.Create(2 * FrameCount, 1,
+    Kokoro.Config.DecoderOutputWidth);
+  HarmonicSpectrum := TNNetVolume.Create(120 * FrameCount + 1, 1,
+    Kokoro.Config.ISTFTNFFT + 2);
+  try
+    for ElementPos := 0 to DecoderFeatures.Size - 1 do
+      DecoderFeatures.FData[ElementPos] := 2 * Sin(ElementPos * 0.37 + StylePhase);
+    for ElementPos := 0 to HarmonicSpectrum.Size - 1 do
+      HarmonicSpectrum.FData[ElementPos] := Abs(Sin(ElementPos * 0.11 - StylePhase));
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      Audio);
+  finally
+    HarmonicSpectrum.Free;
+    DecoderFeatures.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageCGeneratorBorrowingRebuild;
+var
+  Kokoro, FreshKokoro: TNNetKokoro;
+  LongAudio, ShortAudio, AgainAudio, FreshAudio: TNNetVolume;
+begin
+  Kokoro := CreateTinyKokoro();
+  FreshKokoro := CreateTinyKokoro();
+  LongAudio := TNNetVolume.Create; ShortAudio := TNNetVolume.Create;
+  AgainAudio := TNNetVolume.Create; FreshAudio := TNNetVolume.Create;
+  try
+    RunTinyKokoroStageCGenerator(Kokoro, 10, LongAudio);
+    AssertEquals('long audio is 600F', 6000, LongAudio.Size);
+    AssertEquals('borrowing net sizes no weights', 0,
+      Kokoro.StageCGeneratorNet.WeightElementsSized());
+    RunTinyKokoroStageCGenerator(Kokoro, 6, ShortAudio);
+    AssertEquals('short net reads 2F positions', 12,
+      Kokoro.StageCGeneratorNet.Layers[0].Output.SizeX);
+    AssertEquals('short audio is 600F', 3600, ShortAudio.Size);
+    RunTinyKokoroStageCGenerator(FreshKokoro, 6, FreshAudio);
+    AssertEquals('short audio vs fresh build', 0,
+      MaxAbsVolumeDiff(ShortAudio, FreshAudio), 1e-6);
+    RunTinyKokoroStageCGenerator(Kokoro, 10, AgainAudio);
+    AssertEquals('long audio after a rebuild', 0,
+      MaxAbsVolumeDiff(LongAudio, AgainAudio), 1e-6);
+  finally
+    LongAudio.Free; ShortAudio.Free; AgainAudio.Free; FreshAudio.Free;
+    FreshKokoro.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageCGeneratorOpenCLParity;
+{$IFDEF OpenCL}
+var
+  CPUKokoro, CLKokoro: TNNetKokoro;
+  CPUAudio, CLAudio, CPUConvPost: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  RunPos, LayerPos, MaxLayerPos, OpenCLLayerCount, FrameCount: integer;
+  ConvPostDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  CPUKokoro := CreateTinyKokoro();
+  CLKokoro := CreateTinyKokoro();
+  CPUAudio := TNNetVolume.Create; CLAudio := TNNetVolume.Create;
+  CPUConvPost := TNNetVolume.Create;
+  try
+    AssertTrue('OpenCL program builds',
+      CLKokoro.EnableOpenCL(PlatformId, DeviceId));
+    // Run 0 as production arms it; runs 1 and 2 force every layer onto
+    // OpenCL, and run 2 rewrites the AdaIN1d style on the same net.
+    for RunPos := 0 to 2 do
+    begin
+      if RunPos = 0 then FrameCount := 10 else FrameCount := 6;
+      if RunPos > 0 then
+      begin
+        CLKokoro.PrepareStageCGenerator(FrameCount);
+        CLKokoro.StageCGeneratorNet.ForceOpenCL(true);
+      end;
+      RunTinyKokoroStageCGenerator(CPUKokoro, FrameCount, CPUAudio,
+        0.2 + RunPos);
+      CPUConvPost.Copy(CPUKokoro.StageCGeneratorNet.GetLastLayer().Output);
+      RunTinyKokoroStageCGenerator(CLKokoro, FrameCount, CLAudio, 0.2 + RunPos);
+      AssertTrue('owner armed', CLKokoro.StageCGeneratorOwnerOnOpenCL);
+      OpenCLLayerCount := 0;
+      MaxLayerPos := CLKokoro.StageCGeneratorNet.GetLastLayerIdx();
+      for LayerPos := 0 to MaxLayerPos do
+        if CLKokoro.StageCGeneratorNet.Layers[LayerPos].ForwardGPUCnt > 0 then
+          Inc(OpenCLLayerCount);
+      ConvPostDiff := MaxAbsVolumeDiff(CPUConvPost,
+        CLKokoro.StageCGeneratorNet.GetLastLayer().Output);
+      WriteLn('  Kokoro stage-C generator OpenCL run ', RunPos, ': ',
+        OpenCLLayerCount, ' of ', MaxLayerPos + 1,
+        ' layers on OpenCL, max |diff| conv_post = ', ConvPostDiff:0:9,
+        ' (max ', CPUConvPost.GetMaxAbs():0:3, '), audio = ',
+        MaxAbsVolumeDiff(CPUAudio, CLAudio):0:9, ' (max ',
+        CPUAudio.GetMaxAbs():0:4, ')');
+      AssertTrue('layers on OpenCL in run ' + IntToStr(RunPos),
+        OpenCLLayerCount > 0);
+      AssertTrue('conv_post OpenCL vs CPU run ' + IntToStr(RunPos),
+        ConvPostDiff < 1e-4 * Max(1, CPUConvPost.GetMaxAbs()));
+      AssertTrue('audio OpenCL vs CPU run ' + IntToStr(RunPos),
+        MaxAbsVolumeDiff(CPUAudio, CLAudio) < 1e-4 * Max(1, CPUAudio.GetMaxAbs()));
+    end;
+  finally
+    CPUAudio.Free; CLAudio.Free; CPUConvPost.Free;
+    CLKokoro.Free;
+    CPUKokoro.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestKokoroTinySynthesizePhonemes;
+var
+  Kokoro: TNNetKokoro;
+  Reference: TNNetSafeTensorsReader;
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+  Audio, ChainAudio, DurationFeatures, TextFeatures, F0Curve, NCurve,
+    DecoderFeatures, HarmonicSpectrum: TNNetVolume;
+  TokenIds, Durations: TNeuralIntegerArray;
+  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
+  SkippedSymbols: string;
+  MaxDiff, RMSDiff, ReferenceMaxAbs, ReferenceRMS: double;
+begin
+  Reader := OpenKokoroSnapshot(ExtractFileDir(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'config.json')), 'af_heart', Config, Voice);
+  try
+    Kokoro := TNNetKokoro.Create(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+  Reference := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_kokoro82m_ref.safetensors'));
+  Audio := TNNetVolume.Create; ChainAudio := TNNetVolume.Create;
+  DurationFeatures := TNNetVolume.Create; TextFeatures := TNNetVolume.Create;
+  F0Curve := TNNetVolume.Create; NCurve := TNNetVolume.Create;
+  DecoderFeatures := TNNetVolume.Create; HarmonicSpectrum := TNNetVolume.Create;
+  try
+    Kokoro.SynthesizePhonemes('h' + #$CB#$88 + 'O.', Voice, 1.0, Audio,
+      SkippedSymbols);
+    AssertEquals('no skipped symbol', '', SkippedSymbols);
+    // The same stages with x copied on the host.
+    TokenIds := KokoroPhonemesToIds(Config, 'h' + #$CB#$88 + 'O.',
+      SkippedSymbols);
+    SelectKokoroVoiceStyle(Voice, 4, DecoderStyle, ProsodyStyle);
+    Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
+      TextFeatures, Durations);
+    Kokoro.RunStageB(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
+    Kokoro.RunStageCDecoder(TextFeatures, Durations, F0Curve, NCurve,
+      DecoderStyle, DecoderFeatures);
+    Kokoro.ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum);
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      ChainAudio);
+    AssertEquals('SynthesizePhonemes vs the stages one by one', 0,
+      MaxAbsVolumeDiff(Audio, ChainAudio), 0);
+    // The chain up to the generator inputs matches the dump.
+    CheckKokoroStage(Reference, 'dec_decode' +
+      IntToStr(Config.DecoderBlockCount - 1), DecoderFeatures, true, 1e-4, true);
+    CheckKokoroStage(Reference, 'F0_pred', F0Curve, false, 1e-4, true);
+    MaxDiff := KokoroAudioDiff(Reference, Audio, RMSDiff, ReferenceMaxAbs,
+      ReferenceRMS);
+    WriteLn('  Kokoro tiny end to end (our harmonic phases): max |diff| = ',
+      MaxDiff:0:9, ' (max |ref| = ', ReferenceMaxAbs:0:6, '), RMS diff ',
+      RMSDiff:0:9, ' (RMS ref ', ReferenceRMS:0:6, ')');
+    AssertTrue('tiny audio length', MaxDiff >= 0);
+    // The dump's x with our harmonic spectrum: what the arbitrary phase bins
+    // alone (tasklist 2.9) do to the audio.
+    LoadKokoroStageCGeneratorInputs(Reference, Config.StyleDim,
+      Config.DecoderBlockCount, DecoderFeatures, ChainAudio, DecoderStyle);
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      ChainAudio);
+    MaxDiff := KokoroAudioDiff(Reference, ChainAudio, RMSDiff, ReferenceMaxAbs,
+      ReferenceRMS);
+    WriteLn('  Kokoro tiny generator on the dump''s x, our harmonic phases: ',
+      'max |diff| = ', MaxDiff:0:9, ', RMS diff ', RMSDiff:0:9);
+  finally
+    Audio.Free; ChainAudio.Free;
+    DurationFeatures.Free; TextFeatures.Free;
+    F0Curve.Free; NCurve.Free;
+    DecoderFeatures.Free; HarmonicSpectrum.Free;
+    Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealStageCGeneratorParity;
+var
+  ReferenceFile: string;
+  Kokoro: TNNetKokoro;
+begin
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile, {Heavy=}true);
+  try
+    WriteLn('  Kokoro stage-C generator owner: ',
+      Kokoro.StageCGeneratorOwner.CountWeights(), ' weights');
+    CheckKokoroStageCGeneratorParity(Kokoro, ReferenceFile, 1e-4);
+    WriteLn('  Kokoro stage-C generator activations, sharing off: ',
+      (Kokoro.StageCGeneratorNet.NonWeightBytes() / (1024 * 1024)):0:1,
+      ' MB; RSS ', ProcessStatusKB('VmRSS') div 1024, ' MB, peak ',
+      ProcessStatusKB('VmHWM') div 1024, ' MB');
+  finally
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealEndToEnd;
+var
+  ReferenceFile, WavFile: string;
+  Kokoro: TNNetKokoro;
+  Reference: TNNetSafeTensorsReader;
+  Values, DurationFeatures, TextFeatures, F0Curve, NCurve, DecoderFeatures,
+    HarmonicSpectrum, Audio: TNNetVolume;
+  TokenIds, Durations: TNeuralIntegerArray;
+  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
+  TokenPos, StylePos, StyleDim: integer;
+  MaxDiff, RMSDiff, ReferenceMaxAbs, ReferenceRMS: double;
+  StageStart, TotalStart: TDateTime;
+
+  procedure ReportStage(const StageName: string);
+  begin
+    WriteLn('  Kokoro end to end, ', StageName, ': ',
+      ((Now() - StageStart) * MSecsPerDay):0:1, ' ms; RSS ',
+      ProcessStatusKB('VmRSS') div 1024, ' MB, peak ',
+      ProcessStatusKB('VmHWM') div 1024, ' MB');
+    StageStart := Now();
+  end;
+
+begin
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile, {Heavy=}true);
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  Values := TNNetVolume.Create;
+  DurationFeatures := TNNetVolume.Create; TextFeatures := TNNetVolume.Create;
+  F0Curve := TNNetVolume.Create; NCurve := TNNetVolume.Create;
+  DecoderFeatures := TNNetVolume.Create; HarmonicSpectrum := TNNetVolume.Create;
+  Audio := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat('input_ids', Values);
+    SetLength(TokenIds, Values.Size);
+    for TokenPos := 0 to Values.Size - 1 do
+      TokenIds[TokenPos] := Round(Values.FData[TokenPos]);
+    StyleDim := Kokoro.Config.StyleDim;
+    Reference.LoadTensorFlat('ref_s', Values);
+    SetLength(DecoderStyle, StyleDim);
+    SetLength(ProsodyStyle, StyleDim);
+    for StylePos := 0 to StyleDim - 1 do
+    begin
+      DecoderStyle[StylePos] := Values.FData[StylePos];
+      ProsodyStyle[StylePos] := Values.FData[StyleDim + StylePos];
+    end;
+    WriteLn('  Kokoro end to end, owners loaded: RSS ',
+      ProcessStatusKB('VmRSS') div 1024, ' MB');
+    TotalStart := Now();
+    StageStart := TotalStart;
+    Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
+      TextFeatures, Durations);
+    ReportStage('stage A');
+    Kokoro.RunStageB(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
+    ReportStage('stage B');
+    Kokoro.RunStageCDecoder(TextFeatures, Durations, F0Curve, NCurve,
+      DecoderStyle, DecoderFeatures);
+    ReportStage('stage-C decoder');
+    Kokoro.ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum);
+    ReportStage('harmonic spectrum');
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      Audio);
+    ReportStage('stage-C generator + iSTFT');
+    WriteLn('  Kokoro end to end: ', ((Now() - TotalStart) * MSecsPerDay):0:1,
+      ' ms for ', Audio.Size, ' samples (',
+      (Audio.Size / KokoroSampleRate):0:2, ' s of audio)');
+    MaxDiff := KokoroAudioDiff(Reference, Audio, RMSDiff, ReferenceMaxAbs,
+      ReferenceRMS);
+    WriteLn('  Kokoro end to end audio: max |diff| = ', MaxDiff:0:6,
+      ' (max |ref| = ', ReferenceMaxAbs:0:4, '), RMS diff ', RMSDiff:0:6,
+      ' (RMS ref ', ReferenceRMS:0:6, ')');
+    WavFile := ExtractFilePath(ReferenceFile) + 'pascal.wav';
+    SaveVolumeToWav16(Audio, WavFile, KokoroSampleRate);
+    WriteLn('  Kokoro end to end WAV: ', WavFile);
+    AssertTrue('audio length', MaxDiff >= 0);
+    // The arbitrary harmonic phases alone move the audio by ~0.09 (tasklist 2.9).
+    AssertTrue('audio max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 0.5);
+  finally
+    Audio.Free;
+    DecoderFeatures.Free; HarmonicSpectrum.Free;
+    F0Curve.Free; NCurve.Free;
+    DurationFeatures.Free; TextFeatures.Free;
+    Values.Free;
     Reference.Free;
     Kokoro.Free;
   end;
