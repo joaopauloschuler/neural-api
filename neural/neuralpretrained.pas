@@ -13525,10 +13525,12 @@ procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);
 // submodule whose keys are 'rnn.weight_ih_l0'...) and the builder's returned
 // last layer (the DeepConcat for bidirectional, or the top forward cell for
 // unidirectional). The Build*FromSafeTensors helpers create the matching net,
-// load it and return it (caller-owned). Coded by Claude (AI).
+// load it and return it (caller-owned). StackInput (or nil = the whole net up
+// to LastLayer) bounds the search for the stack's cells. Coded by Claude (AI).
 procedure LoadTorchLSTMInto(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
-  Hidden, NumLayers: integer; Bidirectional: boolean);
+  Hidden, NumLayers: integer; Bidirectional: boolean;
+  StackInput: TNNetLayer = nil);
 
 procedure LoadTorchGRUInto(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
@@ -90615,13 +90617,15 @@ end;
 //   [forward_l0, forward_l1, ...]                          (unidirectional)
 // because each layer emits its forward cell first, then (if bidirectional) its
 // reverse cell. Coded by Claude (AI).
-procedure CollectRNNCells(Net: TNNet; LastLayer: TNNetLayer;
+procedure CollectRNNCells(Net: TNNet; LastLayer, StackInput: TNNetLayer;
   CellClass: TClass; out Cells: array of TNNetLayer; Expected: integer);
 var
-  i, n, lastIdx: integer;
+  i, n, lastIdx, FirstCellIdx: integer;
   LayerCountM1: integer;
 begin
   lastIdx := -1;
+  FirstCellIdx := 0;
+  if Assigned(StackInput) then FirstCellIdx := StackInput.LayerIdx + 1;
   LayerCountM1 := Net.Layers.Count - 1;
   // a layer occurs once in the net, so the first hit is the answer.
   for i := 0 to LayerCountM1 do
@@ -90634,7 +90638,7 @@ begin
     raise EPretrainedImportError.Create(
       'LoadTorchRNN: LastLayer is not part of Net');
   n := 0;
-  for i := 0 to lastIdx do
+  for i := FirstCellIdx to lastIdx do
     if Net.Layers[i].InheritsFrom(CellClass) then
     begin
       if n >= Expected then
@@ -90792,36 +90796,24 @@ begin
 end;
 
 // True if the builder inserted a learned per-direction projection
-// (TNNetPointwiseConvLinear) anywhere up to and including LastCell - i.e. some
-// cell boundary had incoming Depth != Hidden. Such a projection has no torch
-// counterpart, so torch weights cannot be loaded faithfully through it.
-function NetHasProjectionBeforeCells(Net: TNNet;
-  const Cells: array of TNNetLayer; NumCells: integer): boolean;
+// (TNNetPointwiseConvLinear) right before one of the cells: such a projection
+// has no torch counterpart, so torch weights cannot be loaded through it.
+function NetHasProjectionBeforeCells(const Cells: array of TNNetLayer;
+  NumCells: integer): boolean;
 var
-  i, lastIdx: integer;
-  LayerCountM1: integer;
+  CellPos, MaxCellPos: integer;
 begin
   Result := False;
-  lastIdx := -1;
-  LayerCountM1 := Net.Layers.Count - 1;
-  // a layer occurs once in the net, so the first hit is the answer.
-  for i := 0 to LayerCountM1 do
-    if Net.Layers[i] = Cells[NumCells - 1] then
-    begin
-      lastIdx := i;
-      break;
-    end;
-  for i := 0 to lastIdx do
-    if Net.Layers[i] is TNNetPointwiseConvLinear then
-    begin
-      Result := True;
-      exit;
-    end;
+  MaxCellPos := NumCells - 1;
+  for CellPos := 0 to MaxCellPos do
+    if Cells[CellPos].PrevLayer is TNNetPointwiseConvLinear then
+      exit(True);
 end;
 
 procedure LoadTorchRNNStack(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
-  Hidden, NumLayers: integer; Bidirectional, UseGRU: boolean);
+  Hidden, NumLayers: integer; Bidirectional, UseGRU: boolean;
+  StackInput: TNNetLayer = nil);
 var
   Base, Suffix: string;
   Cells: array of TNNetLayer;
@@ -90847,21 +90839,19 @@ begin
   NumCells := NumLayers * NumDir;
   SetLength(Cells, NumCells);
   if UseGRU then CellClass := TNNetGRUCell else CellClass := TNNetLSTMCell;
-  CollectRNNCells(Net, LastLayer, CellClass, Cells, NumCells);
+  CollectRNNCells(Net, LastLayer, StackInput, CellClass, Cells, NumCells);
 
   // A learned per-direction projection (TNNetPointwiseConvLinear, inserted by
   // the builder when an incoming Depth != Hidden) has NO torch counterpart, so
-  // torch weights cannot be loaded faithfully through it. This fires for
-  // layer 0 when input_size != Hidden and for any layer above a bidirectional
-  // one (incoming 2*Hidden). Faithfully importable: unidirectional stacks with
-  // input_size == Hidden (any depth) and a SINGLE bidirectional layer with
-  // input_size == Hidden. Reject loudly rather than silently mis-load.
-  if NetHasProjectionBeforeCells(Net, Cells, NumCells) then
+  // torch weights cannot be loaded faithfully through it. It is absent when
+  // input_size == Hidden everywhere, or for LSTM stacks built with
+  // CellsReadInputWidth. Reject loudly rather than silently mis-load.
+  if NetHasProjectionBeforeCells(Cells, NumCells) then
     raise EPretrainedImportError.Create(
       'LoadTorchRNN: builder inserted a learned projection (input_size != ' +
       'Hidden, or a stacked bidirectional layer). torch weights are not ' +
-      'faithfully importable through it. Supported: unidirectional stacks ' +
-      'and single bidirectional layers with input_size == Hidden.');
+      'faithfully importable through it. Build LSTM stacks with ' +
+      'CellsReadInputWidth = true for any input_size.');
 
   NumLayersM1 := NumLayers - 1;
   for k := 0 to NumLayersM1 do
@@ -90890,10 +90880,11 @@ end;
 
 procedure LoadTorchLSTMInto(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
-  Hidden, NumLayers: integer; Bidirectional: boolean);
+  Hidden, NumLayers: integer; Bidirectional: boolean;
+  StackInput: TNNetLayer = nil);
 begin
   LoadTorchRNNStack(Reader, Prefix, Net, LastLayer, Hidden, NumLayers,
-    Bidirectional, {UseGRU=}False);
+    Bidirectional, {UseGRU=}False, StackInput);
 end;
 
 procedure LoadTorchGRUInto(Reader: TNNetSafeTensorsReader;

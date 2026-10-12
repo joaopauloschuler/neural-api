@@ -1029,6 +1029,10 @@ type
     procedure TestLSTMCellInputGradientCheck;
     procedure TestLSTMCellWeightGradientCheck;
     procedure TestLSTMCellSerializationRoundTrip;
+    // TNNetLSTMCell.Create(Hidden) with an input wider than Hidden (torch
+    // input_size != hidden_size): input and all twelve weight gradients.
+    procedure TestLSTMCellInputWidthGradientCheck;
+    procedure TestLSTMCellInputWidthSerializationRoundTrip;
     procedure TestGRUCellInputGradientCheck;
     procedure TestGRUCellWeightGradientCheck;
     procedure TestGRUCellSerializationRoundTrip;
@@ -39592,6 +39596,96 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetLSTMCell.Create(), 'LSTMCell', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellInputWidthGradientCheck;
+const
+  SeqLen = 3; InputDepth = 5; Hidden = 3;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InputDepth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, InputDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Hidden);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InputDepth, 1));
+    L := TNNetLSTMCell.Create(Hidden);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    AssertEquals('output depth', Hidden, L.Output.Depth);
+    AssertEquals('W_ii input width', InputDepth, L.Neurons[0].Weights.Depth);
+    AssertEquals('W_hi width', Hidden, L.Neurons[4].Weights.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+        L.Neurons[n].Weights.Raw[i] := Sin(n * 1.3 + i * 0.7) * 0.25;
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('LSTMCell(Hidden) input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        AssertTrue('LSTMCell(Hidden) weight gradient neuron ' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellInputWidthSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLSTMCell.Create(3), 'LSTMCell(3) on width 5', 4, 1, 5, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestGRUCellInputGradientCheck;
