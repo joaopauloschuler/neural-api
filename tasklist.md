@@ -1992,15 +1992,47 @@ rather than acted on.
         model, e.g. `g2p_en`, is the follow-up); the example downloads the
         dictionaries on first use instead of committing them.
   Phase 4 — integration:
-  - [ ] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
+  - [x] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
         writes 24 kHz WAV. The pico example of that name was removed in 403d17f2:
         recreate it (new .lpr needs cthreads first; re-add its `.gitignore` entry
         for the output WAV, the binary entry is still there) and its
         examples/README.md entry.
+        Done: `KokoroTTS --model-dir DIR --phonemes "IPA" [--voice af_heart]
+        [--speed 1] [--out kokoro.wav] [--serial] [--max-threads N] [--gpu]
+        [--gpu-platform N] [--gpu-device N] [--no-gpu-shared-kernel]` (OpenCL and
+        thread flags named as in QwenImage; OpenCL off by default because no
+        Kokoro stage has run on a GPU). `OpenKokoroSnapshot` + `TNNetKokoro` +
+        `SynthesizePhonemes` + `SaveVolumeToWav16`; prints skipped symbols, token
+        count, frame count, audio seconds, load / synthesis / WAV-write / total
+        time and peak RSS (VmHWM). No per-stage times: `Synthesize` does not
+        report them. README: phonemes from misaki's English G2P (reference
+        `həlˈO wˈɜɹld. ðˌɪs ɪz ɐ tˈɛst.`), the three files to download, zero
+        noise, English voices only until G2P, and only the memory figures
+        measured here (no real end-to-end peak yet). `lazbuild -B` Default,
+        Debug, Release: all build. Tiny-fixture smoke (`hˈO.`): 6 tokens, 10
+        frames, 0.25 s audio, WAV written, peak RSS 21 MB (CPU); the Debug build
+        (range checks) and `--gpu` on PoCL also wrote it.
   - [ ] 4.2 Per-stage parity on the tiny fixture (< 1e-4) + one real-checkpoint
         test against the 0.1 dump, under the 3 GB ulimit.
-  - [ ] 4.3 README (planned vs supported split; "supported" only after the user
+        Tiny per-stage parity is in the default suite (see 2.x). The real
+        checkpoint part stays open: the real stage-C decoder, chained, generator
+        and end-to-end tests (`TestKokoroRealStageCDecoderParity`,
+        `TestKokoroRealStagesChainedToDecoder`,
+        `TestKokoroRealStageCGeneratorParity`, `TestKokoroRealEndToEnd`) are
+        opt-in (`NEURAL_KOKORO82M_REAL_HEAVY=1`, plus the dump from
+        `tools/make_kokoro82m_fixture.py real`) and have not run end to end on
+        this VM; the user's real-machine check is those tests and
+        `KokoroTTS --model-dir <snapshot> --phonemes "həlˈO wˈɜɹld. ðˌɪs ɪz ɐ
+        tˈɛst." --out hello.wav`.
+        - [ ] OPEN DECISION (2.9, awaiting the user's listening test): keep or
+          zero the arbitrary harmonic-spectrum phase bins on unvoiced spans.
+          Today they are kept (our STFT's rounding values).
+  - [x] 4.3 README (planned vs supported split; "supported" only after the user
         tests it), this entry.
+        Done: root README "More audio" highlight names `KokoroTTS` as planned
+        (coded), not yet tested on the real checkpoint; examples/README.md entry
+        and examples/KokoroTTS/README.md say the same. Move it to supported only
+        after the user's real run.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
