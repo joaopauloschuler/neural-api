@@ -1224,17 +1224,17 @@ type
     procedure TestTDNNConv1DInputGradientCheck;
     procedure TestTDNNConv1DWeightGradientCheck;
     procedure TestTDNNConv1DSerializationRoundTrip;
-    // TNNetConvolution1D vs a torch Conv1d oracle on every Kokoro-82M geometry
+    // TNNetConv1DLinear vs a torch Conv1d oracle on every Kokoro-82M geometry
     // (trainable and threaded inference forwards).
-    procedure TestConvolution1DTorchParity;
+    procedure TestConv1DLinearTorchParity;
     // The same geometries in OpenCL: implicit GEMM and cai_im2col, from a
     // resident and from a host source.
-    procedure TestConvolution1DOpenCLParity;
-    procedure TestConvolution1DSaveLoadRoundTrip;
+    procedure TestConv1DLinearOpenCLParity;
+    procedure TestConv1DLinearSaveLoadRoundTrip;
     // A net built with BuildWeightOwner at another length matches copied weights.
-    procedure TestConvolution1DBorrowingBuild;
+    procedure TestConv1DLinearBorrowingBuild;
     // Input and weight gradients for dilation with X-only padding and k12 s6.
-    procedure TestConvolution1DGradientCheck;
+    procedure TestConv1DLinearGradientCheck;
     // TNNetDeconv1DLinear vs a torch ConvTranspose1d oracle on the Kokoro-82M
     // transposed geometries (trainable scatter and inference CPU GEMM).
     procedure TestDeconv1DTorchParity;
@@ -65378,7 +65378,7 @@ begin
 end;
 {$ENDIF}
 
-// --- TNNetConvolution1D: torch.nn.Conv1d geometry ---------------------------
+// --- TNNetConv1DLinear: torch.nn.Conv1d geometry ---------------------------
 // tests/fixtures/conv1d_oracle.json (tools/conv1d_oracle.py) holds one torch
 // Conv1d per Kokoro-82M forward geometry, in torch layouts: input [C][L],
 // weight [Out][In][K], output [Out][Lout]. Coded by Claude (AI).
@@ -65408,12 +65408,12 @@ begin
   end;
 end;
 
-function CreateConv1DFromOracle(OracleCase: TJSONObject): TNNetConvolution1D;
+function CreateConv1DFromOracle(OracleCase: TJSONObject): TNNetConv1DLinear;
 var
   SuppressBias: integer;
 begin
   if OracleCase.Booleans['bias'] then SuppressBias := 0 else SuppressBias := 1;
-  Result := TNNetConvolution1D.Create(OracleCase.Integers['out_channels'],
+  Result := TNNetConv1DLinear.Create(OracleCase.Integers['out_channels'],
     OracleCase.Integers['kernel_size'], OracleCase.Integers['padding'],
     OracleCase.Integers['stride'], OracleCase.Integers['dilation'],
     SuppressBias);
@@ -65477,12 +65477,12 @@ begin
         Values.Arrays[ChannelPos].Floats[TimePos]));
 end;
 
-procedure TTestNeuralNumerical.TestConvolution1DTorchParity;
+procedure TTestNeuralNumerical.TestConv1DLinearTorchParity;
 var
   Oracle, OracleCase: TJSONObject;
   Cases: TJSONArray;
   NN: TNNet;
-  Conv: TNNetConvolution1D;
+  Conv: TNNetConv1DLinear;
   Input: TNNetVolume;
   CasePos, ModePos: integer;
   MaxDiff: TNeuralFloat;
@@ -65538,14 +65538,14 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestConvolution1DOpenCLParity;
+procedure TTestNeuralNumerical.TestConv1DLinearOpenCLParity;
 {$IFDEF OpenCL}
 var
   Oracle, OracleCase: TJSONObject;
   Cases: TJSONArray;
   NN: TNNet;
   Source: TNNetLayer;
-  Conv: TNNetConvolution1D;
+  Conv: TNNetConv1DLinear;
   Input, OutCPU, OutImplicit: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -65683,9 +65683,9 @@ end;
 procedure AddConv1DChain(NN: TNNet; SeqLen: integer);
 begin
   NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3, 1));
-  NN.AddLayer(TNNetConvolution1D.Create(4, 7, 9, 1, 3));
-  NN.AddLayer(TNNetConvolution1D.Create(5, 12, 3, 6, 1, 1));
-  NN.AddLayer(TNNetConvolution1D.Create(2, 3, 5, 1, 5));
+  NN.AddLayer(TNNetConv1DLinear.Create(4, 7, 9, 1, 3));
+  NN.AddLayer(TNNetConv1DLinear.Create(5, 12, 3, 6, 1, 1));
+  NN.AddLayer(TNNetConv1DLinear.Create(2, 3, 5, 1, 5));
 end;
 
 procedure FillConv1DChainInput(Input: TNNetVolume);
@@ -65696,7 +65696,7 @@ begin
     Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.37) - 0.1;
 end;
 
-procedure TTestNeuralNumerical.TestConvolution1DSaveLoadRoundTrip;
+procedure TTestNeuralNumerical.TestConv1DLinearSaveLoadRoundTrip;
 var
   NN, NNLoaded: TNNet;
   Input: TNNetVolume;
@@ -65713,16 +65713,16 @@ begin
     NN.Compute(Input);
     Saved := NN.SaveToString();
     NNLoaded.LoadFromString(Saved);
-    AssertEquals('TNNetConvolution1D structure round-trip',
+    AssertEquals('TNNetConv1DLinear structure round-trip',
       NN.SaveStructureToString(), NNLoaded.SaveStructureToString());
-    AssertEquals('TNNetConvolution1D full round-trip', Saved,
+    AssertEquals('TNNetConv1DLinear full round-trip', Saved,
       NNLoaded.SaveToString());
     AssertEquals('reloaded dilation', 3,
-      TNNetConvolution1D(NNLoaded.Layers[1]).DilationX);
+      TNNetConv1DLinear(NNLoaded.Layers[1]).DilationX);
     AssertEquals('reloaded Y padding', 0,
-      TNNetConvolution1D(NNLoaded.Layers[2]).PaddingY);
+      TNNetConv1DLinear(NNLoaded.Layers[2]).PaddingY);
     AssertEquals('reloaded kernel height', 1,
-      TNNetConvolution1D(NNLoaded.Layers[2]).FeatureSizeY);
+      TNNetConv1DLinear(NNLoaded.Layers[2]).FeatureSizeY);
     AssertEquals('k12 s6 p3 output length', 10, NN.GetLastLayer.Output.SizeX);
     NNLoaded.Compute(Input);
     for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
@@ -65736,7 +65736,7 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestConvolution1DBorrowingBuild;
+procedure TTestNeuralNumerical.TestConv1DLinearBorrowingBuild;
 var
   Owner, Borrower, Copied: TNNet;
   Input: TNNetVolume;
@@ -65773,11 +65773,11 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestConvolution1DGradientCheck;
+procedure TTestNeuralNumerical.TestConv1DLinearGradientCheck;
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
-  Conv: TNNetConvolution1D;
+  Conv: TNNetConv1DLinear;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
   GeometryPos, ElementPos, NeuronPos, WeightPos: integer;
   GeometryName: string;
@@ -65815,7 +65815,7 @@ begin
     Desired := nil;
     try
       NN.AddLayer(TNNetInput.Create(14, 1, 2, 1));
-      Conv := TNNetConvolution1D.Create(3, csGeometries[GeometryPos, 0],
+      Conv := TNNetConv1DLinear.Create(3, csGeometries[GeometryPos, 0],
         csGeometries[GeometryPos, 1], csGeometries[GeometryPos, 2],
         csGeometries[GeometryPos, 3]);
       NN.AddLayer(Conv);

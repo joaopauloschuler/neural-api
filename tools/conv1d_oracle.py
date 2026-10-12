@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""torch.nn.Conv1d oracle for TNNetConvolution1D (tasklist Kokoro-82M, 0.4).
+"""torch.nn.Conv1d oracle for TNNetConv1DLinear (tasklist Kokoro-82M, 0.4).
 
 One case per Kokoro-82M forward Conv1d geometry, with the REAL kernel size,
 stride, padding and dilation and small channel counts:

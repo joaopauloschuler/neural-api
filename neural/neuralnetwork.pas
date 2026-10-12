@@ -15139,7 +15139,7 @@ type
     private
       FPadding: integer;
       // Zero rows above and below the input: FPadding, or 0 for the X-only
-      // padding of TNNetConvolution1D. Never larger than FPadding.
+      // padding of TNNetConv1DLinear. Never larger than FPadding.
       FPaddingY: integer;
       FStride: integer;
       // Spacing of the kernel taps along X (1 = dense kernel).
@@ -15634,7 +15634,7 @@ type
   /// Runs the TNNetConvolution forwards (tiled/threaded CPU, OpenCL im2col and
   /// implicit GEMM) and its backward. FStruct[6] holds the dilation.
   // Coded by Claude (AI).
-  TNNetConvolution1D = class(TNNetConvolutionLinear)
+  TNNetConv1DLinear = class(TNNetConvolutionLinear)
   public
     constructor Create(pNumFeatures, pFeatureSize, pPadding, pStride: integer;
       pDilation: integer = 1; pSuppressBias: integer = 0); reintroduce;
@@ -83541,8 +83541,8 @@ begin
   FActivationFnDerivative := @IdentityDerivative;
 end;
 
-{ TNNetConvolution1D }
-constructor TNNetConvolution1D.Create(pNumFeatures, pFeatureSize, pPadding,
+{ TNNetConv1DLinear }
+constructor TNNetConv1DLinear.Create(pNumFeatures, pFeatureSize, pPadding,
   pStride: integer; pDilation: integer = 1; pSuppressBias: integer = 0);
 begin
   inherited Create(pNumFeatures, pFeatureSize, pPadding, pStride, pSuppressBias);
@@ -110258,7 +110258,7 @@ begin
   Result := (not FIsTrainable) and ((ClassType = TNNetConvolution) or
     (ClassType = TNNetConvolutionLinear) or (ClassType = TNNetConvolutionReLU) or
     (ClassType = TNNetPointwiseConv) or (ClassType = TNNetPointwiseConvLinear) or
-    (ClassType = TNNetPointwiseConvReLU) or (ClassType = TNNetConvolution1D));
+    (ClassType = TNNetPointwiseConvReLU) or (ClassType = TNNetConv1DLinear));
 end;
 
 procedure TNNetConvolution.Compute();
@@ -132183,7 +132183,7 @@ begin
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
-      'TNNetConvolution1D' :        Result := TNNetConvolution1D.Create(St[0], St[1], St[2], St[3], St[6], St[4]);
+      'TNNetConv1DLinear' :         Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]);
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -132632,7 +132632,7 @@ begin
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetConvolution1D' then Result := TNNetConvolution1D.Create(St[0], St[1], St[2], St[3], St[6], St[4]) else
+      if S[0] = 'TNNetConv1DLinear' then Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]) else
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else

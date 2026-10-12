@@ -1473,12 +1473,12 @@ rather than acted on.
         per rebuild not measured (no GPU here).
   - [ ] 0.4 Layers for the `TNNet` route:
         - [x] dilated / strided 1D conv (torch Conv1d geometry). Done: new
-          `TNNetConvolution1D` (a `TNNetConvolutionLinear` with a Kx1 kernel,
+          `TNNetConv1DLinear` (a `TNNetConvolutionLinear` with a Kx1 kernel,
           X-only padding, dilation along X) instead of extending `TNNetTDNNConv1D`:
           `TNNetConvolutionAbstract` gained `FPaddingY`/`FDilationX`, the CPU im2col
           (FP32 and int8), `BackpropagateFastTiledCPU`, `cai_im2col` and the implicit
           GEMM honour them, so the tiled/threaded CPU and both OpenCL forwards serve
-          every Kokoro geometry (commit 2ff0b5d4). Tests: `TestConvolution1D{TorchParity,OpenCLParity,
+          every Kokoro geometry (commit 2ff0b5d4). Tests: `TestConv1DLinear{TorchParity,OpenCLParity,
           SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
           `tests/fixtures/conv1d_oracle.json` (`tools/conv1d_oracle.py`, torch).
           CPU, 256 ch k7 d3 L=2000: old TDNN 304-335 ms, new 260-266 ms serial,
@@ -1490,7 +1490,7 @@ rather than acted on.
           channel convs all take the interleaved path. Measure on 2D convs too
           before changing the heuristic.
         - [ ] OpenCL weight borrowing (`BuildWeightOwner` + `EnableOpenCLInContextOf`)
-          is not tested for `TNNetConvolution1D` (the CPU borrowing build is).
+          is not tested for `TNNetConv1DLinear` (the CPU borrowing build is).
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
