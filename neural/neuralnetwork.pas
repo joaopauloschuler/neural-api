@@ -93,6 +93,9 @@ const
   csActBentIdentity = 23;
   csActReLUL        = 24; // ParamA = low limit, ParamB = high limit, ParamC = leak
   csActAddConstant  = 25; // ParamA = the constant added
+  csActMulConstant  = 26; // ParamA = the constant factor
+  csActSnake        = 27; // ParamA = alpha, ParamB = 1/alpha
+  csActSnakeChannel = 28; // alpha per channel, from the channel-parameter buffer
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1452,6 +1455,9 @@ type
       // the kernel above this buffer IS per-layer and IS freed in Destroy.
       FActivationBuffer: cl_mem;
       FActivationBufSize: integer; // element capacity of FActivationBuffer
+      // Per-layer copy of ActivationChannelParams for the per-channel opcodes.
+      FActivationChannelBuffer: cl_mem;
+      FActivationChannelBufBytes: csize_t;
       // Releases this layer's OpenCL resources: the device buffer, then the
       // borrowed FActivationKernel handle. Called from DisableOpenCL AND from Destroy -
       // a layer is destroyed without a DisableOpenCL first, so neither may be
@@ -1468,6 +1474,9 @@ type
       // place of an upload and leave its own result there. Coded by Claude (AI).
       function ShouldStayOnOpenCL(): boolean;
       {$ENDIF}
+      // One constant per channel (Depth long) for a per-channel opcode, read by
+      // cai_activation; nil (the default) for the other opcodes.
+      function ActivationChannelParams(): TNNetVolume; virtual;
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
       // already downloaded. Descendants whose activation takes constants pass
@@ -2155,17 +2164,33 @@ type
 
   /// Snake activation function.
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2. Derivative is
-  // 1 + sin(2*alpha*x). Parameter-free w.r.t. learning but alpha is a
-  // user-configurable frequency hyperparameter stored in FFloatSt[0]
-  // for serialization. From "Neural Networks Fail to Learn Periodic
-  // Functions and How to Fix It" (Ziyin et al., 2020); models periodic
-  // inductive bias while preserving monotonic identity-like behavior.
+  // 1 + sin(2*alpha*x). With one scalar alpha it is parameter-free w.r.t.
+  // learning: alpha is a frequency hyperparameter stored in FFloatSt[0].
+  // pPerChannelAlpha (FStruct[0] = 1) instead learns one alpha per channel in
+  // FNeurons[0].Weights (Depth long, initialized to pAlpha), the HiFi-GAN /
+  // Kokoro AdaINResBlock1 Snake1D with alpha [1,C,1]. From "Neural Networks
+  // Fail to Learn Periodic Functions and How to Fix It" (Ziyin et al., 2020).
   // Coded by Claude (AI).
   TNNetSnake = class(TNNetReLUBase)
+  private
+    FPerChannelAlpha: boolean;
+    // Depth-long scratch of the per-channel path: the current row's sin(a*x)
+    // terms, 1/alpha, and the backward alpha-gradient accumulator.
+    FSnakeRow, FInvAlpha, FAlphaGrad: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure ComputePerChannel();
+  protected
+    function ActivationChannelParams(): TNNetVolume; override;
   public
     constructor Create(); overload; override;
-    constructor Create(pAlpha: TNeuralFloat); reintroduce; overload;
+    constructor Create(pAlpha: TNeuralFloat;
+      pPerChannelAlpha: boolean = false); reintroduce; overload;
+    destructor Destroy(); override;
     procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    procedure ComputeL2Decay(); override;
+    property PerChannelAlpha: boolean read FPerChannelAlpha;
   end;
 
   /// Sinc activation function.
@@ -2395,6 +2420,9 @@ type
     procedure UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
     // Bytes of the OpenCL buffers this helper owns now; 0 unless overridden.
     function BufferBytes(): int64; virtual;
+    // Work-group size of a one-group-per-segment tree reduction: the smallest
+    // power of two from 32 up to 256 that covers SegmentSize.
+    class function ReductionLocalSize(SegmentSize: integer): csize_t;
   end;
 
   // OpenCL device forward for the GLU-family gated feed-forward activations
@@ -5444,25 +5472,30 @@ type
 
   /// OpenCL forward helper for TNNetGroupNorm (and its Groups=Depth limit
   // TNNetInstanceNorm). Binds the cai_group_norm entry point on the shared
-  // dot-product program's device, uploads the volume + gamma/beta weights, runs
-  // one work-item per (sample) group (per-group mean/variance reduction + affine)
-  // and reads the normalized result back. Forward-only.
+  // dot-product program's device, uploads the volume (or binds a resident one)
+  // + gamma/beta weights, runs one work-group per (sample) group (per-group
+  // mean/variance reduction + affine). Forward-only.
   // Coded by Claude (AI).
   TNNetGroupNormCL = class(TNNetKernelCL)
   private
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufGain, FBufBias, FBufY: cl_mem;
     FCapX, FCapGain, FCapBias, FCapY: csize_t;
+    // The kernel that wrote FBufY; nil before the first forward.
+    FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // X is one sample's volume (depth-contiguous); Gain/Bias hold gamma/beta.
-    // PerChannelAffine selects the gamma/beta layout (per-channel = Depth long,
-    // else per-element = X.Size long). Y receives the normalized output in the
-    // same layout. Eps matches the layer's epsilon.
+    // The buffer the last call wrote Y into, and the kernel that wrote it.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+    // X is one sample's volume (depth-contiguous); Gain/Bias hold gamma/beta,
+    // per channel (Depth long) or per element. pExternalSrc is borrowed.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
       SizeX, SizeY, Depth, Groups, ChannelsPerGroup: integer;
-      PerChannelAffine: boolean; Eps: TNeuralFloat);
+      PerChannelAffine: boolean; Eps: TNeuralFloat; pExternalSrc: cl_mem = nil;
+      pKeepResultOnOpenCL: boolean = false);
   end;
 
   /// OpenCL forward helper for the windowed 2-D pooling layers (TNNetMaxPool /
@@ -8220,7 +8253,7 @@ type
   /// This layer multiplies the output by a constant.
   TNNetMulByConstant = class(TNNetMulLearning)
     public
-      // constructor Create(pMul: integer); overload;
+      constructor Create(pMul: TNeuralFloat); overload;
       procedure Compute(); override;
   end;
 
@@ -9078,6 +9111,8 @@ type
       FMeanScratch, FInvStdScratch, FSumScratch, FSumSqScratch: TNNetVolume;
       {$IFDEF OpenCL}
       FGroupNormCL: TNNetGroupNormCL;
+      // Binds a source in OpenCL memory (else uploads it); inference leaves
+      // the result there for the next layer.
       procedure ComputeOpenCL();
       {$ENDIF}
       // Releases FNormalized: it is read only by Backpropagate, so an
@@ -9096,6 +9131,9 @@ type
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
       // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
       property GroupNormEpsilon: TNeuralFloat read FGroupNormEpsilon
@@ -38915,6 +38953,19 @@ begin
   Result := 0;
 end;
 
+class function TNNetKernelCL.ReductionLocalSize(SegmentSize: integer): csize_t;
+const
+  // Power of two (the tree reduction halves it) and within every device's
+  // maximum work-group size.
+  cMaxLocalSize = 256;
+  // One warp: a smaller group saves nothing on a GPU and adds a PoCL compile.
+  cMinLocalSize = 32;
+begin
+  Result := cMinLocalSize;
+  while (Result < cMaxLocalSize) and (Result < csize_t(SegmentSize)) do
+    Result := Result * 2;
+end;
+
 function TNNetKernelCL.NewOpenCLBuffer(Bytes: csize_t): cl_mem;
 begin
   Result := FKernel.CreateBuffer(CL_MEM_READ_WRITE, Bytes);
@@ -39249,12 +39300,6 @@ procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
   Y: TNNetVolume; NumSegments, SegmentSize: integer; UseMean: boolean;
   Eps: TNeuralFloat; pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
   pKeepResultOnOpenCL: boolean = false);
-const
-  // Power of two (the tree reduction halves it) and within every device's
-  // maximum work-group size.
-  cMaxLocalSize = 256;
-  // One warp: a smaller group saves nothing on a GPU and adds a PoCL compile.
-  cMinLocalSize = 32;
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
@@ -39265,11 +39310,8 @@ begin
   k := FKernel.Kernel;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;
-  // A short segment gets the smallest power-of-two group (at least
-  // cMinLocalSize) that covers it; the kernel's strided loops take any size.
-  LocalSize := cMinLocalSize;
-  while (LocalSize < cMaxLocalSize) and (LocalSize < csize_t(SegmentSize)) do
-    LocalSize := LocalSize * 2;
+  // The kernel's strided loops take any group size.
+  LocalSize := ReductionLocalSize(SegmentSize);
   // The weights re-upload only when they changed. Without a bias the kernel
   // never reads FBias, so the gain buffer stands in for it: the argument is a
   // valid handle and no second buffer is allocated or uploaded.
@@ -39316,21 +39358,43 @@ begin
   inherited Destroy();
 end;
 
+function TNNetGroupNormCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetGroupNormCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
+function TNNetGroupNormCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufGain) +
+    OpenCLMemBytes(FBufBias) + OpenCLMemBytes(FBufY);
+end;
+
 procedure TNNetGroupNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
   Y: TNNetVolume; SizeX, SizeY, Depth, Groups, ChannelsPerGroup: integer;
-  PerChannelAffine: boolean; Eps: TNeuralFloat);
+  PerChannelAffine: boolean; Eps: TNeuralFloat; pExternalSrc: cl_mem;
+  pKeepResultOnOpenCL: boolean);
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
   iAffineMode: longint;
+  LocalSize: csize_t;
   fEps: single;
 begin
   k := FKernel.Kernel;
   // FAffineMode: 0 = per-channel gamma/beta (Depth long), 1 = per-element.
   if PerChannelAffine then iAffineMode := 0 else iAffineMode := 1;
   fEps := Eps;
-  // Upload the volume + the gamma/beta weights; allocate the device result.
-  bufX    := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  LocalSize := ReductionLocalSize(SizeX * SizeY * ChannelsPerGroup);
+  // Upload the volume (unless bound) + the gamma/beta weights, which are small
+  // enough to upload every call, so a host write to them needs no flag.
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufGain := FKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain);
   bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias);
   bufY    := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
@@ -39345,10 +39409,15 @@ begin
   clSetKernelArg(k, 8, csCLMemSize, @bufBias);
   clSetKernelArg(k, 9, csCLMemSize, @bufX);
   clSetKernelArg(k, 10, csCLMemSize, @bufY);
-  // One work-item per group.
-  FKernel.RunKernel(k, Groups);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  clSetKernelArg(k, 11, LocalSize * csNeuralFloatSize, nil); // __local scratch
+  // One work-group per group.
+  FKernel.RunKernel2D(k, LocalSize * csize_t(Groups), 1, LocalSize, 1);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
@@ -51827,12 +51896,158 @@ begin
   Create(1.0);
 end;
 
-constructor TNNetSnake.Create(pAlpha: TNeuralFloat);
+constructor TNNetSnake.Create(pAlpha: TNeuralFloat; pPerChannelAlpha: boolean);
 begin
   inherited Create();
   if pAlpha = 0 then
     FErrorProc('TNNetSnake requires alpha <> 0.');
   FFloatSt[0] := pAlpha;
+  FPerChannelAlpha := pPerChannelAlpha;
+  FStruct[0] := Ord(pPerChannelAlpha);
+  FSnakeRow := TNNetVolume.Create();
+  FInvAlpha := TNNetVolume.Create();
+  FAlphaGrad := TNNetVolume.Create();
+  if pPerChannelAlpha then FActivationOpcode := csActSnakeChannel
+  else FActivationOpcode := csActSnake;
+end;
+
+destructor TNNetSnake.Destroy();
+begin
+  FAlphaGrad.Free;
+  FInvAlpha.Free;
+  FSnakeRow.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSnake.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FPerChannelAlpha then
+  begin
+    if FNeurons.Count < 1 then AddMissingNeurons(1);
+    SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+    FSnakeRow.ReSize(1, 1, FOutput.Depth);
+    FInvAlpha.ReSize(1, 1, FOutput.Depth);
+    FAlphaGrad.ReSize(1, 1, FOutput.Depth);
+    InitDefault();
+  end;
+end;
+
+procedure TNNetSnake.InitDefault();
+begin
+  if FPerChannelAlpha and (FNeurons.Count > 0) then
+  begin
+    FNeurons[0].FWeights.Fill(FFloatSt[0]);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetSnake.ComputeL2Decay();
+begin
+  // alpha is a frequency, not a weight to shrink.
+end;
+
+function TNNetSnake.ActivationChannelParams(): TNNetVolume;
+begin
+  if FPerChannelAlpha then Result := FNeurons[0].FWeights
+  else Result := nil;
+end;
+
+procedure TNNetSnake.ComputePerChannel();
+var
+  Depth, MaxPositionPos, PositionPos, MaxChannelPos, ChannelPos, ElementPos: integer;
+  x, SinAx, CosAx: TNeuralFloat;
+  AlphaPtr, InvAlphaPtr, RowPtr, OutputPtr: TNeuralFloatArrPtr;
+begin
+  Depth := FOutput.Depth;
+  MaxPositionPos := FOutput.SizeX * FOutput.SizeY - 1;
+  MaxChannelPos := Depth - 1;
+  AlphaPtr := FNeurons[0].FWeights.GetRawPtr();
+  for ChannelPos := 0 to MaxChannelPos do
+    FInvAlpha.FData[ChannelPos] := 1 / AlphaPtr^[ChannelPos];
+  InvAlphaPtr := FInvAlpha.GetRawPtr();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    ElementPos := 0;
+    for PositionPos := 0 to MaxPositionPos do
+      for ChannelPos := 0 to MaxChannelPos do
+      begin
+        x := FPrevLayer.FOutput.FData[ElementPos];
+        pcr_sincosf(AlphaPtr^[ChannelPos] * x, SinAx, CosAx);
+        FOutput.FData[ElementPos] := x + InvAlphaPtr^[ChannelPos] * SinAx * SinAx;
+        FOutputErrorDeriv.FData[ElementPos] := 1.0 + 2.0 * SinAx * CosAx;
+        Inc(ElementPos);
+      end;
+  end
+  else
+  begin
+    // y = x + (1/a) .* sin(a .* x)^2, one depth-contiguous row at a time.
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+    RowPtr := FSnakeRow.GetRawPtr();
+    for PositionPos := 0 to MaxPositionPos do
+    begin
+      OutputPtr := FOutput.GetRawPtr(PositionPos * Depth);
+      System.Move(OutputPtr^, RowPtr^, Depth * csNeuralFloatSize);
+      TNNetVolume.Mul(RowPtr, AlphaPtr, Depth);
+      TNNetVolume.Sin(RowPtr, RowPtr, Depth);
+      TNNetVolume.Mul(RowPtr, RowPtr, Depth);
+      TNNetVolume.Mul(RowPtr, InvAlphaPtr, Depth);
+      TNNetVolume.Add(OutputPtr, RowPtr, Depth);
+    end;
+  end;
+end;
+
+procedure TNNetSnake.Backpropagate();
+var
+  Depth, MaxPositionPos, PositionPos, MaxChannelPos, ChannelPos, ElementPos: integer;
+  x, Alpha, InvAlpha, SinAx, CosAx: TNeuralFloat;
+  AlphaPtr, AlphaGradPtr: TNeuralFloatArrPtr;
+  StartTime: double;
+begin
+  if not FPerChannelAlpha then
+  begin
+    inherited Backpropagate();
+    exit;
+  end;
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    // d y / d a = x*sin(2ax)/a - sin(ax)^2/a^2, summed over the positions.
+    if FNeurons[0].FDelta.Size = FAlphaGrad.Size then
+    begin
+      Depth := FOutput.Depth;
+      MaxPositionPos := FOutput.SizeX * FOutput.SizeY - 1;
+      MaxChannelPos := Depth - 1;
+      AlphaPtr := FNeurons[0].FWeights.GetRawPtr();
+      AlphaGradPtr := FAlphaGrad.GetRawPtr();
+      FAlphaGrad.Fill(0);
+      ElementPos := 0;
+      for PositionPos := 0 to MaxPositionPos do
+        for ChannelPos := 0 to MaxChannelPos do
+        begin
+          x := FPrevLayer.FOutput.FData[ElementPos];
+          Alpha := AlphaPtr^[ChannelPos];
+          InvAlpha := 1 / Alpha;
+          pcr_sincosf(Alpha * x, SinAx, CosAx);
+          AlphaGradPtr^[ChannelPos] := AlphaGradPtr^[ChannelPos] +
+            FOutputError.FData[ElementPos] * InvAlpha *
+            (2.0 * x * SinAx * CosAx - SinAx * SinAx * InvAlpha);
+          Inc(ElementPos);
+        end;
+      FNeurons[0].FDelta.MulAdd(-FLearningRate, FAlphaGrad);
+      if not FBatchUpdate then
+      begin
+        FNeurons[0].UpdateWeights(FInertia);
+        AfterWeightUpdate();
+      end;
+    end;
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
 end;
 
 procedure TNNetSnake.Compute();
@@ -51844,11 +52059,21 @@ var
   x, Alpha, InvAlpha, SinAx, CosAx: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
   InvAlpha := 1.0 / Alpha;
+  if ComputeActivationOnOpenCL(Alpha, InvAlpha) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  if FPerChannelAlpha then
+  begin
+    ComputePerChannel();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
 
   // Snake(x) = x + (1/alpha) * sin(alpha*x)^2.
   // Derivative is 1 + sin(2*alpha*x).
@@ -54990,10 +55215,23 @@ begin
 end;
 
 { TNNetMulByConstant }
-procedure TNNetMulByConstant.Compute();
+constructor TNNetMulByConstant.Create(pMul: TNeuralFloat);
 begin
-  inherited Compute();
-  FOutput.Mul(FFloatSt[0]);
+  inherited Create(pMul);
+  FActivationOpcode := csActMulConstant;
+end;
+
+procedure TNNetMulByConstant.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if not ComputeActivationOnOpenCL(FFloatSt[0]) then
+  begin
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+    FOutput.Mul(FFloatSt[0]);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetAddConstant }
@@ -80174,11 +80412,10 @@ var
   ColPtr, OnesPtr, MeanPtr, InvStdPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  inherited Compute;
   {$IFDEF OpenCL}
-  // Device forward keeps the activation resident on the GPU between the conv
-  // stacks of diffusion/GAN image stacks (forward-only; training stays on the
-  // CPU path below, which also caches FNormalized/FInvStdDev for backward).
+  // Forward-only OpenCL path (training stays on the CPU path below, which also
+  // caches FNormalized/FInvStdDev for backward). It runs BEFORE the inherited
+  // copy because that copy downloads a resident source.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -80187,7 +80424,12 @@ begin
     exit;
   end
   else Inc(FForwardCPUCnt);
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous OpenCL forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
+  inherited Compute;
   GroupDepth := FChannelsPerGroup;
   GroupSize := FOutput.SizeX * FOutput.SizeY * GroupDepth;
   FGroupsM1 := FGroups - 1;
@@ -80392,13 +80634,34 @@ end;
 function TNNetGroupNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FGroupNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
 procedure TNNetGroupNorm.DisableOpenCL();
 begin
+  // FGroupNormCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FGroupNormCL);
+end;
+
+function TNNetGroupNorm.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FGroupNormCL) then Result := FGroupNormCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetGroupNorm.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FGroupNormCL) then Result := FGroupNormCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetGroupNorm.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FGroupNormCL) then Result := Result + FGroupNormCL.BufferBytes();
 end;
 
 procedure TNNetGroupNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -80412,11 +80675,32 @@ end;
 // the group's spatial * channel elements, then gamma .* x_hat + beta), faithful
 // to the scalar Compute() above (TNNetInstanceNorm reuses it via Groups=Depth).
 procedure TNNetGroupNorm.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if PrevOutputOnOpenCLSameSize() then
+  begin
+    // The result goes to the helper's own buffer: input and output never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FGroupNormCL.OutputKernel());
+  end
+  else
+  begin
+    // Nothing to bind: stage the source in FOutput, which the upload reads.
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  end;
+  // Inference keeps the result in OpenCL memory (a host reader calls
+  // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
+  KeepOnOpenCL := not FIsTrainable;
   FGroupNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
     FOutput, FOutput.SizeX, FOutput.SizeY, FOutput.Depth, FGroups,
-    FChannelsPerGroup, FPerChannelAffine, FGroupNormEpsilon);
+    FChannelsPerGroup, FPerChannelAffine, FGroupNormEpsilon, SourceBuffer,
+    KeepOnOpenCL);
+  FOutputOnOpenCL := KeepOnOpenCL;
+  FOutputOnRAM := not KeepOnOpenCL;
 end;
 {$ENDIF}
 
@@ -105404,6 +105688,8 @@ begin
   FActivationKernel := nil;
   FActivationBuffer := nil;
   FActivationBufSize := 0;
+  FActivationChannelBuffer := nil;
+  FActivationChannelBufBytes := 0;
   {$ENDIF}
 end;
 
@@ -105421,6 +105707,12 @@ begin
     clReleaseMemObject(FActivationBuffer);
     FActivationBuffer := nil;
     FActivationBufSize := 0;
+  end;
+  if Assigned(FActivationChannelBuffer) then
+  begin
+    clReleaseMemObject(FActivationChannelBuffer);
+    FActivationChannelBuffer := nil;
+    FActivationChannelBufBytes := 0;
   end;
   // With the buffer gone nothing of this layer's output is in OpenCL
   // memory: leaving the flag set would hand a consumer a released buffer.
@@ -105491,7 +105783,8 @@ end;
 
 function TNNetIdentity.OpenCLBufferBytes(): int64;
 begin
-  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FActivationBuffer);
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FActivationBuffer) +
+    OpenCLMemBytes(FActivationChannelBuffer);
 end;
 
 function TNNetIdentity.CanShareOpenCLOutput(): boolean;
@@ -105515,8 +105808,9 @@ procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
 var
   Kern: TNeuralKernel;
   k: cl_kernel;
-  iSize, iOpcode: longint;
-  SourceBuffer: cl_mem;
+  iSize, iOpcode, iChannels: longint;
+  SourceBuffer, ChannelBuffer: cl_mem;
+  ChannelParams: TNNetVolume;
   StayOnOpenCL: boolean;
 begin
   // Run the net's shared cai_activation kernel over the per-layer buffer. No
@@ -105544,6 +105838,15 @@ begin
   iSize := FPrevLayer.FOutput.Size;
   iOpcode := FActivationOpcode;
   if not StayOnOpenCL then Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
+  // The per-channel constants are Depth floats: they upload every forward, so
+  // a host write to them needs no flag. Other opcodes get a valid dummy handle.
+  ChannelParams := ActivationChannelParams();
+  iChannels := FOutput.Depth;
+  if Assigned(ChannelParams) then
+    ChannelBuffer := Kern.EnsureWriteBuffer(FActivationChannelBuffer,
+      FActivationChannelBufBytes, ChannelParams)
+  else
+    ChannelBuffer := FActivationBuffer;
   clSetKernelArg(k, 0, csLongintSize, @iSize);
   clSetKernelArg(k, 1, csLongintSize, @iOpcode);
   clSetKernelArg(k, 2, csNeuralFloatSize, @ParamA);
@@ -105551,6 +105854,8 @@ begin
   clSetKernelArg(k, 4, csNeuralFloatSize, @ParamC);
   clSetKernelArg(k, 5, csCLMemSize, @SourceBuffer);      // FX
   clSetKernelArg(k, 6, csCLMemSize, @FActivationBuffer); // FY
+  clSetKernelArg(k, 7, csLongintSize, @iChannels);
+  clSetKernelArg(k, 8, csCLMemSize, @ChannelBuffer);
   Kern.RunKernel(k, iSize);
   if StayOnOpenCL then
   begin
@@ -105568,6 +105873,11 @@ begin
   end;
 end;
 {$ENDIF}
+
+function TNNetIdentity.ActivationChannelParams(): TNNetVolume;
+begin
+  Result := nil;
+end;
 
 function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
   ParamB: TNeuralFloat = 0; ParamC: TNeuralFloat = 0): boolean;
@@ -131650,7 +131960,7 @@ begin
       'TNNetCos' :                  Result := TNNetCos.Create();
       'TNNetSinhAct' :              Result := TNNetSinhAct.Create();
       'TNNetArcSinh' :              Result := TNNetArcSinh.Create();
-      'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0]);
+      'TNNetSnake' :                Result := TNNetSnake.Create(Ft[0], St[0] = 1);
       'TNNetSinc' :                 Result := TNNetSinc.Create();
       'TNNetFourierFeatures' :      Result := TNNetFourierFeatures.Create(St[0], Ft[0], St[1]);
       'TNNetBentIdentity' :         Result := TNNetBentIdentity.Create();
@@ -132097,7 +132407,7 @@ begin
       if S[0] = 'TNNetCos' then Result := TNNetCos.Create() else
       if S[0] = 'TNNetSinhAct' then Result := TNNetSinhAct.Create() else
       if S[0] = 'TNNetArcSinh' then Result := TNNetArcSinh.Create() else
-      if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0]) else
+      if S[0] = 'TNNetSnake' then Result := TNNetSnake.Create(Ft[0], St[0] = 1) else
       if S[0] = 'TNNetSinc' then Result := TNNetSinc.Create() else
       if S[0] = 'TNNetFourierFeatures' then Result := TNNetFourierFeatures.Create(St[0], Ft[0], St[1]) else
       if S[0] = 'TNNetBentIdentity' then Result := TNNetBentIdentity.Create() else

@@ -1245,6 +1245,18 @@ type
     procedure TestDeconv1DBorrowingBuild;
     // Input and weight gradients for dense, depthwise and grouped geometries.
     procedure TestDeconv1DGradientCheck;
+    // Kokoro-82M AdaIN1d (InstanceNorm), AdaLayerNorm and the channel LayerNorm
+    // (TokenLayerNorm) vs torch, with fc(style) written into gamma/beta.
+    procedure TestKokoroStyleNormTorchParity;
+    // Per-channel Snake and LeakyReLU 0.2/0.1/0.01 vs torch.
+    procedure TestKokoroActivationTorchParity;
+    // A norm/activation chain kept in OpenCL memory, then a host style rewrite.
+    procedure TestKokoroLayersOpenCLParity;
+    procedure TestSnakePerChannelSaveLoadRoundTrip;
+    // The per-utterance style write goes through a borrowing net's layers.
+    procedure TestKokoroLayersBorrowingBuild;
+    // Input and per-channel alpha gradients.
+    procedure TestSnakePerChannelGradientCheck;
     procedure TestAttentiveStatsPoolingFeatureGradientCheck;
     procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
@@ -1991,6 +2003,20 @@ type
   end;
 
 implementation
+
+type
+  // TNNetMulByConstant without its cai_activation opcode: a scaling layer whose
+  // output only ever lives in RAM, for tests that need a host-only layer.
+  THostOnlyMulByConstant = class(TNNetMulByConstant)
+  public
+    constructor Create(pMul: TNeuralFloat); overload;
+  end;
+
+constructor THostOnlyMulByConstant.Create(pMul: TNeuralFloat);
+begin
+  inherited Create(pMul);
+  FActivationOpcode := csActNone;
+end;
 
 procedure TTestNeuralNumerical.TestConvolutionNumericalValues;
 var
@@ -65356,7 +65382,9 @@ end;
 // tests/fixtures/conv1d_oracle.json (tools/conv1d_oracle.py) holds one torch
 // Conv1d per Kokoro-82M forward geometry, in torch layouts: input [C][L],
 // weight [Out][In][K], output [Out][Lout]. Coded by Claude (AI).
-function LoadConv1DOracle(): TJSONObject;
+
+// Parses tests/fixtures/<FileName> (next to the binary); nil when it is absent.
+function LoadJSONFixture(const FileName: string): TJSONObject;
 var
   FixturePath: string;
   Text: TStringStream;
@@ -65364,7 +65392,7 @@ var
 begin
   Result := nil;
   FixturePath := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
-    'conv1d_oracle.json';
+    FileName;
   if not FileExists(FixturePath) then exit;
   Text := TStringStream.Create('');
   try
@@ -65460,7 +65488,7 @@ var
   MaxDiff: TNeuralFloat;
   CaseName: string;
 begin
-  Oracle := LoadConv1DOracle();
+  Oracle := LoadJSONFixture('conv1d_oracle.json');
   if Oracle = nil then
   begin
     Ignore('conv1d_oracle.json absent; run tools/conv1d_oracle.py');
@@ -65534,7 +65562,7 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     exit;
   end;
-  Oracle := LoadConv1DOracle();
+  Oracle := LoadJSONFixture('conv1d_oracle.json');
   if Oracle = nil then
   begin
     Ignore('conv1d_oracle.json absent; run tools/conv1d_oracle.py');
@@ -65863,30 +65891,6 @@ type
   // Reaches the protected path predicate of the layer under test.
   TDeconv1DAccess = class(TNNetDeconv1DLinear);
 
-function LoadConvTranspose1DOracle(): TJSONObject;
-var
-  FixturePath: string;
-  Text: TStringStream;
-  Parser: TJSONParser;
-begin
-  Result := nil;
-  FixturePath := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
-    'conv_transpose1d_oracle.json';
-  if not FileExists(FixturePath) then exit;
-  Text := TStringStream.Create('');
-  try
-    Text.LoadFromFile(FixturePath);
-    Parser := TJSONParser.Create(Text.DataString, []);
-    try
-      Result := Parser.Parse as TJSONObject;
-    finally
-      Parser.Free;
-    end;
-  finally
-    Text.Free;
-  end;
-end;
-
 function CreateDeconv1DFromOracle(OracleCase: TJSONObject): TNNetDeconv1DLinear;
 var
   SuppressBias: integer;
@@ -65945,7 +65949,7 @@ var
   MaxDiff: TNeuralFloat;
   CaseName: string;
 begin
-  Oracle := LoadConvTranspose1DOracle();
+  Oracle := LoadJSONFixture('conv_transpose1d_oracle.json');
   if Oracle = nil then
   begin
     Ignore('conv_transpose1d_oracle.json absent; run tools/conv_transpose1d_oracle.py');
@@ -66012,7 +66016,7 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     exit;
   end;
-  Oracle := LoadConvTranspose1DOracle();
+  Oracle := LoadJSONFixture('conv_transpose1d_oracle.json');
   if Oracle = nil then
   begin
     Ignore('conv_transpose1d_oracle.json absent; run tools/conv_transpose1d_oracle.py');
@@ -66290,6 +66294,553 @@ begin
       Input.Free;
       NN.Free;
     end;
+  end;
+end;
+
+// --- Kokoro-82M norms and activations -------------------------------------
+// tests/fixtures/kokoro_norm_activation_oracle.json
+// (tools/kokoro_norm_activation_oracle.py) holds the kokoro package's AdaIN1d,
+// AdaLayerNorm and LayerNorm, the AdaINResBlock1 per-channel Snake and
+// F.leaky_relu at three slopes, sequences in torch's [C][L] layout.
+// Coded by Claude (AI).
+
+// Torch [C][L] (time on L) into a (L,1,C) volume.
+procedure LoadChannelByTimeVolume(Volume: TNNetVolume; Values: TJSONArray);
+var
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  MaxChannelPos := Values.Count - 1;
+  MaxTimePos := Values.Arrays[0].Count - 1;
+  Volume.ReSize(MaxTimePos + 1, 1, MaxChannelPos + 1);
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Volume[TimePos, 0, ChannelPos] := Values.Arrays[ChannelPos].Floats[TimePos];
+end;
+
+// Max |Output - Values| for a torch [C][L] array; -1 when the shapes differ.
+function ChannelByTimeMaxDiff(Output: TNNetVolume; Values: TJSONArray): TNeuralFloat;
+var
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  Result := -1;
+  MaxChannelPos := Values.Count - 1;
+  MaxTimePos := Values.Arrays[0].Count - 1;
+  if (Output.SizeX <> MaxTimePos + 1) or (Output.SizeY <> 1) or
+    (Output.Depth <> MaxChannelPos + 1) then exit;
+  Result := 0;
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Result := Max(Result, Abs(Output[TimePos, 0, ChannelPos] -
+        Values.Arrays[ChannelPos].Floats[TimePos]));
+end;
+
+// The per-utterance host step of AdaIN1d / AdaLayerNorm: [gamma; beta] =
+// fc(style), written into the norm layer's per-channel gamma (FNeurons[0]) and
+// beta (FNeurons[1]) as (1+gamma)*w and (1+gamma)*b + beta, where w/b are the
+// norm's own affine (nil = identity).
+procedure WriteStyleIntoChannelAffine(NormLayer: TNNetLayer;
+  FcWeight, FcBias, Style: TJSONArray; NormWeight: TJSONArray = nil;
+  NormBias: TJSONArray = nil);
+var
+  ChannelCount, ChannelPos, MaxChannelPos, MaxStylePos: integer;
+  Gamma, Beta, Scale, Shift: TNeuralFloat;
+
+  function FcRow(RowPos: integer): TNeuralFloat;
+  var
+    StylePos: integer;
+  begin
+    Result := FcBias.Floats[RowPos];
+    for StylePos := 0 to MaxStylePos do
+      Result := Result + FcWeight.Arrays[RowPos].Floats[StylePos] *
+        Style.Floats[StylePos];
+  end;
+
+begin
+  ChannelCount := FcBias.Count div 2;
+  MaxChannelPos := ChannelCount - 1;
+  MaxStylePos := Style.Count - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+  begin
+    Gamma := FcRow(ChannelPos);
+    Beta := FcRow(ChannelCount + ChannelPos);
+    Scale := 1 + Gamma;
+    Shift := Beta;
+    if Assigned(NormWeight) then
+    begin
+      Shift := Scale * NormBias.Floats[ChannelPos] + Beta;
+      Scale := Scale * NormWeight.Floats[ChannelPos];
+    end;
+    NormLayer.Neurons[0].Weights.Raw[ChannelPos] := Scale;
+    NormLayer.Neurons[1].Weights.Raw[ChannelPos] := Shift;
+  end;
+  // A norm that keeps its gamma/beta in OpenCL memory re-uploads on this.
+  NormLayer.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestKokoroStyleNormTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Norm: TNNetLayer;
+  Input: TNNetVolume;
+  CasePos, ChannelPos, ModePos: integer;
+  MaxDiff: TNeuralFloat;
+  Kind, CaseName: string;
+begin
+  Oracle := LoadJSONFixture('kokoro_norm_activation_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('kokoro_norm_activation_oracle.json absent; run tools/kokoro_norm_activation_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      Kind := OracleCase.Strings['kind'];
+      if (Kind <> 'adain1d') and (Kind <> 'ada_layer_norm') and
+        (Kind <> 'layer_norm') then continue;
+      // Mode 0 trainable, mode 1 inference-only.
+      for ModePos := 0 to 1 do
+      begin
+        CaseName := Kind + ' C=' + IntToStr(OracleCase.Integers['channels']) +
+          ' L=' + IntToStr(OracleCase.Integers['length']) + ' mode ' +
+          IntToStr(ModePos);
+        LoadChannelByTimeVolume(Input, OracleCase.Arrays['input']);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          if Kind = 'adain1d' then
+            Norm := NN.AddLayer(TNNetInstanceNorm.Create())
+          else
+            Norm := NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+          if ModePos = 1 then NN.SetTrainable(False, False);
+          if Kind = 'adain1d' then
+            WriteStyleIntoChannelAffine(Norm, OracleCase.Arrays['fc_weight'],
+              OracleCase.Arrays['fc_bias'], OracleCase.Arrays['style'],
+              OracleCase.Arrays['norm_weight'], OracleCase.Arrays['norm_bias'])
+          else if Kind = 'ada_layer_norm' then
+            WriteStyleIntoChannelAffine(Norm, OracleCase.Arrays['fc_weight'],
+              OracleCase.Arrays['fc_bias'], OracleCase.Arrays['style'])
+          else
+          begin
+            for ChannelPos := 0 to Input.Depth - 1 do
+            begin
+              Norm.Neurons[0].Weights.Raw[ChannelPos] :=
+                OracleCase.Arrays['gamma'].Floats[ChannelPos];
+              Norm.Neurons[1].Weights.Raw[ChannelPos] :=
+                OracleCase.Arrays['beta'].Floats[ChannelPos];
+            end;
+            Norm.FlushWeightCache();
+          end;
+          NN.Compute(Input);
+          MaxDiff := ChannelByTimeMaxDiff(NN.GetLastLayer.Output,
+            OracleCase.Arrays['output']);
+          AssertTrue(CaseName + ': output shape', MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+        finally
+          NN.Free;
+        end;
+      end;
+    end;
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+// Per-channel Snake alphas in channel order.
+procedure WriteSnakeAlphas(Snake: TNNetLayer; Alphas: TJSONArray);
+var
+  ChannelPos: integer;
+begin
+  for ChannelPos := 0 to Alphas.Count - 1 do
+    Snake.Neurons[0].Weights.Raw[ChannelPos] := Alphas.Floats[ChannelPos];
+  Snake.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestKokoroActivationTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Activation: TNNetLayer;
+  Input: TNNetVolume;
+  CasePos, ModePos, CheckedCount: integer;
+  MaxDiff: TNeuralFloat;
+  Kind, CaseName: string;
+begin
+  Oracle := LoadJSONFixture('kokoro_norm_activation_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('kokoro_norm_activation_oracle.json absent; run tools/kokoro_norm_activation_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  CheckedCount := 0;
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      Kind := OracleCase.Strings['kind'];
+      if (Kind <> 'snake') and (Kind <> 'leaky_relu') then continue;
+      // Mode 0: trainable (scalar loop with the derivative). Mode 1: inference
+      // (the per-channel Snake's vectorized row path).
+      for ModePos := 0 to 1 do
+      begin
+        CaseName := Kind + ' mode ' + IntToStr(ModePos);
+        if Kind = 'leaky_relu' then
+          CaseName := CaseName + ' slope ' + FloatToStr(OracleCase.Floats['slope']);
+        LoadChannelByTimeVolume(Input, OracleCase.Arrays['input']);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          if Kind = 'snake' then
+            Activation := NN.AddLayer(TNNetSnake.Create(1.0, true))
+          else
+            Activation := NN.AddLayer(TNNetLeakyReLU.Create(
+              OracleCase.Floats['slope']));
+          if ModePos = 1 then NN.SetTrainable(False, False);
+          if Kind = 'snake' then
+            WriteSnakeAlphas(Activation, OracleCase.Arrays['alpha']);
+          NN.Compute(Input);
+          MaxDiff := ChannelByTimeMaxDiff(NN.GetLastLayer.Output,
+            OracleCase.Arrays['output']);
+          AssertTrue(CaseName + ': output shape', MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+          Inc(CheckedCount);
+        finally
+          NN.Free;
+        end;
+      end;
+    end;
+    AssertEquals('snake + 3 leaky_relu slopes, two modes each', 8, CheckedCount);
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+// Input -> InstanceNorm (AdaIN1d) -> LeakyReLU 0.2 -> per-channel Snake ->
+// MulByConstant 1/sqrt(2) -> TokenLayerNorm (AdaLayerNorm). Coded by Claude (AI).
+procedure AddKokoroNormActivationChain(NN: TNNet; SeqLen, Channels: integer);
+begin
+  NN.AddLayer(TNNetInput.Create(SeqLen, 1, Channels, 1));
+  NN.AddLayer(TNNetInstanceNorm.Create());
+  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+  NN.AddLayer(TNNetSnake.Create(1.0, true));
+  NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
+  NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+end;
+
+// Per-utterance style A (StylePos 0) or B (1) on the chain's two norms, and
+// fixed per-channel Snake alphas.
+procedure WriteKokoroChainStyle(NN: TNNet; FirstNormPos, StylePos: integer);
+var
+  ChannelPos, Channels: integer;
+  Phase: TNeuralFloat;
+begin
+  Channels := NN.Layers[FirstNormPos].Output.Depth;
+  Phase := 1.3 * StylePos;
+  for ChannelPos := 0 to Channels - 1 do
+  begin
+    NN.Layers[FirstNormPos].Neurons[0].Weights.Raw[ChannelPos] :=
+      1 + 0.4 * Sin(ChannelPos * 0.9 + Phase);
+    NN.Layers[FirstNormPos].Neurons[1].Weights.Raw[ChannelPos] :=
+      0.3 * Cos(ChannelPos * 0.5 + Phase);
+    NN.Layers[FirstNormPos + 2].Neurons[0].Weights.Raw[ChannelPos] :=
+      0.3 + 0.25 * ChannelPos;
+    NN.Layers[FirstNormPos + 4].Neurons[0].Weights.Raw[ChannelPos] :=
+      0.8 + 0.3 * Sin(ChannelPos * 0.7 - Phase);
+    NN.Layers[FirstNormPos + 4].Neurons[1].Weights.Raw[ChannelPos] :=
+      0.2 * Sin(ChannelPos * 1.1 + Phase);
+  end;
+  NN.Layers[FirstNormPos].FlushWeightCache();
+  NN.Layers[FirstNormPos + 2].FlushWeightCache();
+  NN.Layers[FirstNormPos + 4].FlushWeightCache();
+end;
+
+procedure FillKokoroChainInput(Input: TNNetVolume);
+var
+  ElementPos: integer;
+begin
+  for ElementPos := 0 to Input.Size - 1 do
+    Input.Raw[ElementPos] := 1.5 * Sin(ElementPos * 0.37) + 0.2 * Cos(ElementPos * 1.7);
+end;
+
+procedure TTestNeuralNumerical.TestKokoroLayersOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csKokoroSentinel = 12345.0;
+  csSeqLen = 37;
+  csChannels = 6;
+var
+  NN: TNNet;
+  Source: TNNetLayer;
+  Input, OutCPUStyleA, OutCPUStyleB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, NeuronPos, ElementPos: integer;
+  DiffA, DiffB: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  Input := TNNetVolume.Create(csSeqLen, 1, csChannels);
+  OutCPUStyleA := TNNetVolume.Create();
+  OutCPUStyleB := TNNetVolume.Create();
+  NN := TNNet.Create();
+  try
+    // An identity pointwise convolution leaves the chain's input in OpenCL
+    // memory, so every layer below can bind its source.
+    NN.AddLayer(TNNetInput.Create(csSeqLen, 1, csChannels, 1));
+    Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(csChannels));
+    NN.AddLayer(TNNetInstanceNorm.Create());
+    NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+    NN.AddLayer(TNNetSnake.Create(1.0, true));
+    NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
+    NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+    NN.SetTrainable(False, False);
+    for NeuronPos := 0 to Source.Neurons.Count - 1 do
+    begin
+      Source.Neurons[NeuronPos].Weights.Fill(0);
+      Source.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+      Source.Neurons[NeuronPos].BiasWeight := 0;
+    end;
+    Source.FlushWeightCache();
+    FillKokoroChainInput(Input);
+    WriteKokoroChainStyle(NN, 2, 1);
+    NN.Compute(Input);
+    OutCPUStyleB.Copy(NN.GetLastLayer.Output);
+    WriteKokoroChainStyle(NN, 2, 0);
+    NN.Compute(Input);
+    OutCPUStyleA.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Every chain layer binds its source in OpenCL memory: the host copies
+      // keep the sentinel and the result still matches.
+      for LayerPos := 1 to NN.GetLastLayerIdx() - 1 do
+        NN.Layers[LayerPos].Output.Fill(csKokoroSentinel);
+      NN.Compute(Input);
+      for LayerPos := 2 to NN.GetLastLayerIdx() do
+        AssertTrue(NN.Layers[LayerPos].ClassName + ' ran in OpenCL',
+          NN.Layers[LayerPos].ForwardGPUCnt >= 2);
+      for LayerPos := 1 to NN.GetLastLayerIdx() - 1 do
+        AssertEquals(NN.Layers[LayerPos].ClassName +
+          ': host output not downloaded', csKokoroSentinel,
+          NN.Layers[LayerPos].Output.Raw[0], 0);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      DiffA := 0;
+      for ElementPos := 0 to OutCPUStyleA.Size - 1 do
+        DiffA := Max(DiffA, Abs(OutCPUStyleA.Raw[ElementPos] -
+          NN.GetLastLayer.Output.Raw[ElementPos]));
+      // The next utterance: the host rewrites the per-channel style.
+      WriteKokoroChainStyle(NN, 2, 1);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      DiffB := 0;
+      for ElementPos := 0 to OutCPUStyleB.Size - 1 do
+        DiffB := Max(DiffB, Abs(OutCPUStyleB.Raw[ElementPos] -
+          NN.GetLastLayer.Output.Raw[ElementPos]));
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertTrue('style A: OpenCL vs CPU max |diff| = ' + FloatToStr(DiffA),
+      DiffA < 1e-4);
+    AssertTrue('style B after the host rewrite: OpenCL vs CPU max |diff| = ' +
+      FloatToStr(DiffB), DiffB < 1e-4);
+  finally
+    NN.Free;
+    OutCPUStyleB.Free;
+    OutCPUStyleA.Free;
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSnakePerChannelSaveLoadRoundTrip;
+var
+  NN, NNLoaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ElementPos: integer;
+begin
+  NN := TNNet.Create();
+  NNLoaded := TNNet.Create();
+  Input := TNNetVolume.Create(11, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(11, 1, 4));
+    NN.AddLayer(TNNetSnake.Create(0.7, true));
+    NN.AddLayer(TNNetSnake.Create(1.5));
+    NN.AddLayer(TNNetMulByConstant.Create(1 / 3));
+    for ElementPos := 0 to 3 do
+      NN.Layers[1].Neurons[0].Weights.Raw[ElementPos] := 0.4 + 0.5 * ElementPos;
+    NN.Layers[1].FlushWeightCache();
+    FillKokoroChainInput(Input);
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NNLoaded.LoadFromString(Saved);
+    AssertEquals('structure round-trip', NN.SaveStructureToString(),
+      NNLoaded.SaveStructureToString());
+    AssertEquals('full round-trip', Saved, NNLoaded.SaveToString());
+    AssertTrue('per-channel alpha reloaded',
+      TNNetSnake(NNLoaded.Layers[1]).PerChannelAlpha);
+    AssertFalse('scalar alpha reloaded',
+      TNNetSnake(NNLoaded.Layers[2]).PerChannelAlpha);
+    AssertEquals('scalar Snake keeps its file format',
+      'TNNetSnake:0;0;0;0;0;0;0;0::1.5;0;0;0;0;0;0;0',
+      NNLoaded.Layers[2].SaveStructureToString());
+    NNLoaded.Compute(Input);
+    for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('reloaded output ' + IntToStr(ElementPos),
+        NN.GetLastLayer.Output.Raw[ElementPos],
+        NNLoaded.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    NNLoaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKokoroLayersBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  LayerPos, ElementPos: integer;
+begin
+  Owner := TNNet.Create();
+  Borrower := TNNet.Create();
+  Copied := TNNet.Create();
+  Input := TNNetVolume.Create(29, 1, 5);
+  try
+    AddKokoroNormActivationChain(Owner, 8, 5);
+    Owner.SetTrainable(False, False);
+    WriteKokoroChainStyle(Owner, 1, 0);
+    Borrower.BuildWeightOwner := Owner;
+    AddKokoroNormActivationChain(Borrower, 29, 5);
+    Borrower.BuildWeightOwner := nil;
+    Borrower.SetTrainable(False, False);
+    for LayerPos := 1 to Borrower.CountLayers() - 1 do
+      if Owner.Layers[LayerPos].Neurons.Count > 0 then
+        AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the owner''s neurons',
+          Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+    // The per-utterance style write goes through the borrowing net's layers.
+    WriteKokoroChainStyle(Borrower, 1, 1);
+    AddKokoroNormActivationChain(Copied, 29, 5);
+    Copied.CopyWeights(Owner);
+    FillKokoroChainInput(Input);
+    Borrower.Compute(Input);
+    Copied.Compute(Input);
+    for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+      AssertEquals('borrowed vs copied output ' + IntToStr(ElementPos),
+        Copied.GetLastLayer.Output.Raw[ElementPos],
+        Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    Copied.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSnakePerChannelGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Snake: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  ElementPos, ChannelPos: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  epsilon := 0.001;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 1, 3);
+  InputPlus := TNNetVolume.Create(9, 1, 3);
+  Desired := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(9, 1, 3, 1));
+    Snake := NN.AddLayer(TNNetSnake.Create(1.0, true));
+    Desired := TNNetVolume.Create(Snake.Output);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for ChannelPos := 0 to 2 do
+      Snake.Neurons[0].Weights.Raw[ChannelPos] := 0.5 + 0.6 * ChannelPos;
+    Snake.FlushWeightCache();
+    for ElementPos := 0 to Input.Size - 1 do
+      Input.Raw[ElementPos] := Sin(ElementPos * 0.41) * 1.2 + 0.1;
+    for ElementPos := 0 to Desired.Size - 1 do
+      Desired.Raw[ElementPos] := Cos(ElementPos * 0.27) * 0.5;
+
+    for ElementPos := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[ElementPos];
+      AssertTrue('Snake input gradient at ' + IntToStr(ElementPos) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    for ChannelPos := 0 to 2 do
+    begin
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      Snake.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -Snake.Neurons[0].Delta.Raw[ChannelPos];
+      AssertTrue('Snake alpha gradient (' + IntToStr(ChannelPos) + ') num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    Desired.Free;
+    InputPlus.Free;
+    Input.Free;
+    NN.Free;
   end;
 end;
 
@@ -67529,11 +68080,11 @@ begin
     OutB := TNNetVolume.Create();
     try
       TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
-      // TNNetMulByConstant has no OpenCL path, so the multiplier is only ever
-      // in RAM. A test that needs a host-only layer must not pick one that has
-      // a cai_activation opcode.
+      // THostOnlyMulByConstant has no OpenCL path, so the multiplier is only
+      // ever in RAM. A test that needs a host-only layer must not pick one that
+      // has a cai_activation opcode.
       RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-      Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
+      Multiplier := NN.AddLayerAfter(THostOnlyMulByConstant.Create(1.5), RowInput);
       Source := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth, 1),
         TokenInput);
       MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
@@ -67598,9 +68149,9 @@ begin
   try
     TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
     RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-    // TNNetMulByConstant has no OpenCL path: both sources stay host-only.
-    Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
-    Source := NN.AddLayerAfter(TNNetMulByConstant.Create(0.5), TokenInput);
+    // THostOnlyMulByConstant has no OpenCL path: both sources stay host-only.
+    Multiplier := NN.AddLayerAfter(THostOnlyMulByConstant.Create(1.5), RowInput);
+    Source := NN.AddLayerAfter(THostOnlyMulByConstant.Create(0.5), TokenInput);
     MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
     NN.AddLayer(MulLayer);
     NN.SetTrainable(False, False);
@@ -69238,12 +69789,13 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..30] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..33] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
-    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant');
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant',
+    'MulByConstant', 'Snake', 'Snake per channel');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -69286,7 +69838,10 @@ var
       27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
       28: Result := TNNetReLU6.Create();
       29: Result := TNNetBentIdentity.Create();
-    else Result := TNNetAddConstant.Create(-0.375);
+      30: Result := TNNetAddConstant.Create(-0.375);
+      31: Result := TNNetMulByConstant.Create(-0.75);
+      32: Result := TNNetSnake.Create(0.8);
+    else Result := TNNetSnake.Create(1.7, true);
     end;
   end;
 
@@ -75905,7 +76460,7 @@ begin
         Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
         Relu := NN.AddLayer(TNNetReLU.Create());
         if ConsumerPos = 0
-          then Consumer := NN.AddLayer(TNNetMulByConstant.Create(2))
+          then Consumer := NN.AddLayer(THostOnlyMulByConstant.Create(2))
           else Consumer := NN.AddLayer(TStaleReadTestLayer.Create());
         NN.SetTrainable(False, False);
         NN.EnableOpenCL(PlatformId, DeviceId);
@@ -75995,7 +76550,7 @@ begin
       NN.AddLayer(TNNetInput.Create(3, 1, 100));
       ProjA := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
       ProjB := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
-      NN.AddLayer(TNNetMulByConstant.Create(2));
+      NN.AddLayer(THostOnlyMulByConstant.Create(2));
       Sum := NN.AddLayer(TNNetSum.Create([ProjA, ProjB]));
       Proj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
       SecondInput := NN.AddLayer(TNNetInput.Create(3, 1, 6));
@@ -76022,7 +76577,7 @@ begin
     NN := TNNet.Create();
     try
       NN.AddLayer(TNNetInput.Create(3, 1, 100));
-      Mul := NN.AddLayer(TNNetMulByConstant.Create(2));
+      Mul := NN.AddLayer(THostOnlyMulByConstant.Create(2));
       Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
       NN.SetTrainable(False, False);
       NN.EnableOpenCL(PlatformId, DeviceId);
@@ -77725,12 +78280,12 @@ var
       // OpenCL memory only, so the per-head split runs there too.
       NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
       NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
-      if HostSource then NNCpu.AddLayer(TNNetMulByConstant.Create(1));
+      if HostSource then NNCpu.AddLayer(THostOnlyMulByConstant.Create(1));
       NNCpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
       NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
       NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
       // A host-only layer: the split then runs on the host too.
-      if HostSource then NNGpu.AddLayer(TNNetMulByConstant.Create(1));
+      if HostSource then NNGpu.AddLayer(THostOnlyMulByConstant.Create(1));
       NNGpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
       NNGpu.CopyWeights(NNCpu);
       NNCpu.SetTrainable(False, False);
@@ -78627,8 +79182,8 @@ begin
   OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(4, 1, 300));
-    // TNNetMulByConstant has no OpenCL path, so its output is in RAM only.
-    HostSource := NN.AddLayer(TNNetMulByConstant.Create(0.25));
+    // THostOnlyMulByConstant has no OpenCL path, so its output is in RAM only.
+    HostSource := NN.AddLayer(THostOnlyMulByConstant.Create(0.25));
     Norm := NN.AddLayer(TNNetTokenLayerNorm.Create());
     NN.SetTrainable(False, False);
     for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.6 * Sin(Pos * 0.29);

@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24, 25). Coded by Claude (AI).
+// (9, 10, 15, 18-21, 24-28). Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -2630,18 +2630,21 @@ __kernel void cai_glu_gate
 
 // Group / Instance normalization forward (TNNetGroupNorm, and its Groups=Depth
 // limit TNNetInstanceNorm). A single sample's volume is laid out depth-axis
-// contiguous: element (x,y,c) lives at FX[(x*FSizeY + y)*FDepth + c]. The Depth
-// channels are partitioned into FGroups contiguous groups of FChannelsPerGroup =
-// FDepth/FGroups channels; group g owns channels [g*FChannelsPerGroup ..
-// +FChannelsPerGroup). Each group is normalized to zero mean / unit variance
-// over its (FSizeX * FSizeY * FChannelsPerGroup) elements, then an affine
-// gamma/beta is applied. FAffineMode selects the gamma/beta layout:
+// contiguous: position p = x*FSizeY + y holds its FDepth channels at
+// FX[p*FDepth ..]. The Depth channels are partitioned into FGroups contiguous
+// groups of FChannelsPerGroup = FDepth/FGroups channels; group g owns channels
+// [g*FChannelsPerGroup .. +FChannelsPerGroup). Each group is normalized to zero
+// mean / unit variance over its (FSizeX * FSizeY * FChannelsPerGroup) elements
+// (biased variance), then an affine gamma/beta is applied. FAffineMode selects
+// the gamma/beta layout:
 //   0 = per-channel : FGain/FBias are FDepth long, indexed by absolute channel c
 //   1 = per-element : FGain/FBias are FSizeX*FSizeY*FDepth long, indexed by the
 //                     full element offset (legacy affine)
-// One work-item per GROUP: global size = FGroups (dim 0). Keeping the whole
-// per-group reduction in a single work-item matches the scalar accumulation
-// order closely (parity well under 1e-4). Forward-only; training stays on CPU.
+// One work-group per GROUP (global size = FGroups x local size) with a
+// power-of-two local size; it reduces the group cooperatively through FScratch
+// (get_local_size(0) floats of __local memory), as cai_volume_norm does. For
+// instance norm the group is one channel strided by FDepth over the positions.
+// Forward-only; training stays on CPU.
 __kernel void cai_group_norm
 (
   const int FSizeX,
@@ -2654,53 +2657,57 @@ __kernel void cai_group_norm
   __global const float* FGain,
   __global const float* FBias,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  __local float* FScratch
 )
 {
-  const int g = get_global_id(0);
-  if (g >= FGroups) return;
-  const int dStart = g * FChannelsPerGroup;
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int dStart = get_group_id(0) * FChannelsPerGroup;
   const int groupSize = FSizeX * FSizeY * FChannelsPerGroup;
-  const int rowStride = FSizeY * FDepth; // stride between successive x
-  // Mean over the group.
-  float s = 0.0f;
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-        s += FX[base + c];
-    }
-  const float mean = s / (float)groupSize;
-  // Variance = mean( (x-mean)^2 ) over the group.
+  int s;
+  // ---- mean ----
+  float partial = 0.0f;
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    partial += FX[p * FDepth + dStart + (j - p * FChannelsPerGroup)];
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = FScratch[0] / (float)groupSize;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // ---- variance = mean( (x-mean)^2 ) ----
   float ss = 0.0f;
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-      {
-        const float v = FX[base + c] - mean;
-        ss = mad(v, v, ss);
-      }
-    }
-  const float variance = ss / (float)groupSize;
-  const float invStd = 1.0f / sqrt(variance + FEps);
-  // Normalize then apply the learnable scale (gamma) and bias (beta).
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-      {
-        const int idx = base + c;
-        const float xhat = (FX[idx] - mean) * invStd;
-        int wIdx;
-        if (FAffineMode == 0) wIdx = dStart + c; // per-channel
-        else                  wIdx = idx;        // per-element
-        FY[idx] = mad(FGain[wIdx], xhat, FBias[wIdx]);
-      }
-    }
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    const float v = FX[p * FDepth + dStart + (j - p * FChannelsPerGroup)] - mean;
+    ss = mad(v, v, ss);
+  }
+  FScratch[lid] = ss;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float invStd = 1.0f / sqrt(FScratch[0] / (float)groupSize + FEps);
+  // ---- normalize, then the learnable scale (gamma) and bias (beta) ----
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    const int c = dStart + (j - p * FChannelsPerGroup);
+    const int idx = p * FDepth + c;
+    const float xhat = (FX[idx] - mean) * invStd;
+    const int wIdx = (FAffineMode == 0) ? c : idx;
+    FY[idx] = mad(FGain[wIdx], xhat, FBias[wIdx]);
+  }
 }
 
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetAvgPool). The input volume is
@@ -3078,7 +3085,8 @@ __kernel void cai_softmax
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
 // activations (a slope, a lambda, a pair of limits and their leak); cases that
-// take none ignore them.
+// take none ignore them. FChannelParam holds one constant per channel (element
+// i is channel i % FChannels, depth-contiguous); only the per-channel cases read it.
 // Forward-only: the host keeps the backward pass (and, for ReLU, the
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
@@ -3092,7 +3100,9 @@ __kernel void cai_activation
   const float FParamB,
   const float FParamC,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  const int FChannels,
+  __global const float* FChannelParam
 )
 {
   const int i = get_global_id(0);
@@ -3176,6 +3186,22 @@ __kernel void cai_activation
     case 25: // AddConstant: x + c. FParamA = c.
       y = x + FParamA;
       break;
+    case 26: // MulConstant: x * c. FParamA = c.
+      y = x * FParamA;
+      break;
+    case 27: // Snake: x + sin(alpha*x)^2 / alpha. FParamA = alpha, FParamB = 1/alpha.
+    {
+      const float s = sin(FParamA * x);
+      y = mad(FParamB * s, s, x);
+      break;
+    }
+    case 28: // Snake with alpha = FChannelParam[channel].
+    {
+      const float a = FChannelParam[i % FChannels];
+      const float s = sin(a * x);
+      y = mad(s / a, s, x);
+      break;
+    }
     default: // csActNone / unknown: pass through
       y = x;
   }
