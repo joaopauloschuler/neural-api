@@ -1399,12 +1399,129 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [ ] Kokoro StyleTTS2 TTS real-checkpoint follow-up (`BuildKokoroFromSafeTensors[Ex]`
-      + `TNNetAdaIN` leaf + `TNNetKokoro` holder + examples/KokoroTTS LANDED, pico
-      parity TestKokoroSynthesisParity < 1e-4): real `hexgrad/Kokoro-82M` checkpoint +
-      voice-pack `.pt` style-tensor load (offline/RAM-gated here); also the
-      grapheme->phoneme (espeak/misaki) frontend dropped from v1 (v1 takes
-      pre-phonemized integer ids).
+- [ ] Kokoro-82M TTS, real checkpoint (`hexgrad/Kokoro-82M`, Apache-2.0, StyleTTS2 +
+      iSTFTNet). Plan agreed 2026-10-12. Target: load the HF snapshot folder
+      (`config.json`, `kokoro-v1_0.pth`, `voices/*.pt`) and write a 24 kHz WAV.
+      Reference: the `kokoro` 0.9.4 package in the `x` venv (`kokoro/model.py`,
+      `modules.py`, `istftnet.py`). One Opus agent per task, run serially, test +
+      commit after each.
+      Decisions:
+      - REPLACE the pico `TNNetKokoro` (neuralpretrained.pas:5439, its invented
+        tensor names, `tools/make_pico_kokoro_fixture.py`, `TestKokoroSynthesisParity`,
+        examples/KokoroTTS) with the real architecture. Its AdaIN uses plain `gamma`;
+        the checkpoint needs `(1+gamma)`.
+      - Noise: zero noise by default (repeatable output, simple parity), random noise
+        as an option.
+      - Code structure: `TNNet` stages run by `TNNet.Compute`, so OpenCL comes with
+        the layers; as many `TNNet`s as needed, host steps between them (duration
+        rounding + frame repeat, sine source + forward STFT).
+      - G2P comes later (task 3.2). Until then the input is a phoneme string.
+      Checkpoint facts (from the cached snapshot and the package source):
+      - 81.7M parameters, 327 MB FP32; fits under the 3 GB ulimit, so real-checkpoint
+        runs are possible on the dev box.
+      - `kokoro-v1_0.pth`: torch zip, entries stored (no DEFLATE), root = dict of 5
+        state dicts `bert`, `bert_encoder`, `predictor`, `text_encoder`, `decoder`,
+        every key prefixed `module.`. Weight norm stored as legacy `weight_g`/`weight_v`.
+      - `voices/<name>.pt`: torch zip whose root is a BARE tensor [510,1,256]. Row =
+        phoneme count - 1. Columns 0..127 = decoder style, 128..255 = prosody style.
+        54 voices, 9 languages; only `af_heart` is downloaded here.
+      - PL-BERT = ALBERT: word embedding 178x128, `embedding_hidden_mapping_in`
+        128->768, ONE shared layer (`albert_layer_groups.0.albert_layers.0`) run 12
+        times, 12 heads, FFN 2048, max 512 positions. Then `bert_encoder` 768->512.
+      - AdaIN1d: InstanceNorm WITHOUT affine weights (none in the checkpoint), then
+        `(1+gamma)*x + beta` with gamma/beta from Linear(style 128 -> 2C).
+      - frame rate: decoder upsamples x2, generator x10 x6, iSTFT hop 5 = 600 samples
+        per predicted frame = 40 frames/s at 24 kHz.
+  Phase 0 — oracle and structure:
+  - [ ] 0.1 `tools/` script: run the installed `KModel` on a fixed phoneme string
+        with `af_heart`; dump every stage (BERT out, durations, F0/N, decoder blocks,
+        harmonic source, waveform) as the real-checkpoint reference. Patch `SineGen`
+        noise to zero (or dump it) so Pascal can match.
+  - [ ] 0.2 Same script: tiny real-architecture fixture (the package's torch
+        classes, small dims, random weights) -> `tests/fixtures/`, replacing the
+        numpy pico fixture.
+  - [ ] 0.3 Per-utterance length: token count and frame count change every
+        sentence, and a `TNNet`'s length is fixed when it is built. Measure the cost
+        of rebuilding the stage nets from in-memory weights vs. padded buckets
+        (padding changes InstanceNorm statistics and the reverse LSTM, so buckets need
+        masking). Report before Phase 2.
+  - [ ] 0.4 Layers for the `TNNet` route:
+        - dilated 1D conv: REUSE `TNNetTDNNConv1D` (centred SAME padding = torch
+          `get_padding` for odd K, dilation). Gaps: no OpenCL path, and `Compute` is
+          one `DotProduct` per (channel, position, tap) on one thread. This is where
+          ~90% of the generator's work lands.
+        - transposed 1D conv: EXTEND `TNNetDeconvolution` (torch ConvTranspose2d
+          geometry, OpenCL scatter GEMM). Gap: square kernel, padding and
+          output_padding apply to BOTH axes. On a (SeqLen,1,C) input the generator
+          ups (K20 s10 p5, K12 s6 p3) clamp to 20x11 / 12x7 kernels with OutY=1 (11x
+          / 7x wasted work); the depthwise x2 (K3 s2 p1 op1) gives OutY=2 (wrong
+          shape). Needs an X-only 1D geometry and groups (depthwise).
+        - per-channel Snake (`TNNetSnake` has one scalar alpha).
+        - AdaIN as InstanceNorm + per-channel scale/shift set once per utterance.
+  Phase 1 — loading:
+  - [ ] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
+        pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
+  - [ ] 1.2 `TNNetTorchBinReader`: accept a bare-tensor root (rejected today at
+        neuraltorchbin.pas:1018); voice-pack row selection.
+  - [ ] 1.3 Config reader: `plbert`, `istftnet`, `vocab` (keys are multibyte IPA
+        characters: look up per UTF-8 code point).
+  - [ ] 1.4 Load from the snapshot folder: one call takes the folder plus a voice
+        name (`af_heart`) and finds the three files. The example takes the folder as
+        a command-line argument (the HF cache path contains a commit hash).
+  Phase 2 — components, in graph order:
+  - [ ] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
+        and one shared layer (do not clone it); then `bert_encoder` 768->512.
+  - [ ] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
+        LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
+  - [ ] 2.3 `AdaLayerNorm` (LayerNorm, `(1+gamma)`, beta from Linear(style)) and the
+        `DurationEncoder` loop (3x bi-LSTM + AdaLayerNorm, style concatenated each
+        round).
+  - [ ] 2.4 Duration head: bi-LSTM, Linear 512->50, sigmoid, sum, /speed, round,
+        clamp >= 1; frame expansion by repeat (no alignment matmul).
+  - [ ] 2.5 AdaIN1d as above.
+  - [ ] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
+        1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
+        ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
+        `THiFiGANConv` (or the `TNNet` equivalent).
+  - [ ] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
+        the Decoder (`F0_conv`/`N_conv` k3 s2, `encode`, `asr_res`, 4 `decode` blocks
+        with the concat).
+  - [ ] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
+        down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
+        9->1 + tanh.
+  - [ ] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
+        in neuralaudio.pas; only power-spectrum and private FFT routines exist.
+  - [ ] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
+        (`TNNetDAC.RunSnake`); extend `THiFiGANResBlock` rather than clone it.
+  - [ ] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
+        ups, reflection pad (1,0) on the last stage, MRF average of 3 resblocks,
+        `conv_post` 128->22, exp (magnitude) / sin (phase), iSTFT via
+        `ISTFTOverlapAdd` with the centre trim and the phase-sign flip.
+  Phase 3 — text input:
+  - [ ] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
+        split long input into chunks.
+  - [ ] 3.2 G2P (text -> phonemes). misaki English = gold/silver dictionaries
+        (~6 MB JSON), spaCy part-of-speech tagging, num2words, espeak-ng fallback.
+        Options: (a) phonemes as input (user runs misaki); (b) Pascal dictionary
+        lookup, English only (`a*`/`b*` voices); (c) espeak-ng shared-library
+        binding. With (a) every voice works; (b) covers English only.
+        User 2026-10-12: no Python dependency, so (a) is out. Found: misaki
+        `us_gold.json` 90,201 + `us_silver.json` 93,361 entries (Apache-2.0), only 790
+        keyed by part of speech (`read`: DEFAULT `ɹˈid`, VBD `ɹˈɛd`);
+        `libespeak-ng.so.1` (1.51, GPL-3.0) is installed on the dev box.
+        User 2026-10-12: no C library either (pure Pascal), so (c) is out. Scope:
+        (b), English only (`a*`/`b*` voices), DEFERRED until synthesis works. When
+        it starts: unknown words are skipped and reported (a small neural G2P
+        model, e.g. `g2p_en`, is the follow-up); the example downloads the
+        dictionaries on first use instead of committing them.
+  Phase 4 — integration:
+  - [ ] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
+        writes 24 kHz WAV.
+  - [ ] 4.2 Per-stage parity on the tiny fixture (< 1e-4) + one real-checkpoint
+        test against the 0.1 dump, under the 3 GB ulimit.
+  - [ ] 4.3 README (planned vs supported split; "supported" only after the user
+        tests it), this entry.
+  Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
