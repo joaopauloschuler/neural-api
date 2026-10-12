@@ -1433,13 +1433,17 @@ rather than acted on.
       - frame rate: decoder upsamples x2, generator x10 x6, iSTFT hop 5 = 600 samples
         per predicted frame = 40 frames/s at 24 kHz.
   Phase 0 — oracle and structure:
-  - [ ] 0.1 `tools/` script: run the installed `KModel` on a fixed phoneme string
+  - [x] 0.1 `tools/` script: run the installed `KModel` on a fixed phoneme string
         with `af_heart`; dump every stage (BERT out, durations, F0/N, decoder blocks,
         harmonic source, waveform) as the real-checkpoint reference. Patch `SineGen`
         noise to zero (or dump it) so Pascal can match.
-  - [ ] 0.2 Same script: tiny real-architecture fixture (the package's torch
+        Done: `tools/make_kokoro82m_fixture.py real` -> ~/.cache/neural-api/kokoro82m_ref/
+        `kokoro82m_ref.{safetensors,json,wav}` (not committed, 92 MB).
+  - [x] 0.2 Same script: tiny real-architecture fixture (the package's torch
         classes, small dims, random weights) -> `tests/fixtures/`, replacing the
         numpy pico fixture.
+        Done: `tools/make_kokoro82m_fixture.py tiny` -> `tests/fixtures/tiny_kokoro82m/`
+        (`config.json`, `kokoro-v1_0.pth`, `voices/af_heart.pt`) + `tiny_kokoro82m_ref.{safetensors,json}`.
   - [ ] 0.3 Per-utterance length: token count and frame count change every
         sentence, and a `TNNet`'s length is fixed when it is built. Measure the cost
         of rebuilding the stage nets from in-memory weights vs. padded buckets
