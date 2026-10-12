@@ -15283,6 +15283,9 @@ type
       function NonWeightBytes(): int64; override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     protected
+      // Set by a layer whose rows are narrower than FVectorSize during the
+      // base SetPrevLayer (grouped TNNetDeconvolution): no interleaved copy.
+      FNoInterleavedWeights: boolean;
       // True when every forward sizes FOutputRaw itself before a host write,
       // so SetPrevLayer leaves it empty. False here.
       function HostOutputRawOnDemand(): boolean; virtual;
@@ -17941,6 +17944,9 @@ type
   TNNetDeMaxPool = class(TNNetMaxPool)
     private
       FSpacing: integer;
+      // Output rows per input row: FPoolSize unless the constructor got a
+      // pPoolSizeY (1 = upsample along X only, e.g. a (L, 1, C) sequence).
+      FPoolSizeY: integer;
       // cai_upsample_gather source-channel strides (see neural.cl), set by the
       // constructor: nearest upsample here, depth-to-space in TNNetUpsample.
       FGatherChannelStride, FGatherXStride, FGatherYStride: integer;
@@ -17954,13 +17960,15 @@ type
       // follows, with the source in RAM and both residency flags reset.
       function ComputeUpsampleOnOpenCL(StartTime: double): boolean;
     public
-      constructor Create(pPoolSize: integer; pSpacing: integer = 0); overload;
+      // pPoolSizeY = 0 repeats rows pPoolSize times, as columns.
+      constructor Create(pPoolSize: integer; pSpacing: integer = 0;
+        pPoolSizeY: integer = 0); overload;
       {$IFDEF OpenCL}
       destructor Destroy(); override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
-      // A resident source in inference (or ForceOpenCL); random spacing stays
-      // on the host.
+      // A resident source in inference (or ForceOpenCL); random spacing and a
+      // Y factor other than the X factor on several rows stay on the host.
       function WillOpenCL(): boolean; override;
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLBufferBytes(): int64; override;
@@ -55495,11 +55503,12 @@ procedure NeuralPerChannelMeanInvStd(V: TNNetVolume;
   Eps: TNeuralFloat);
 var
   CntD, Depth: integer;
-  DepthM1, pos, MaxPos: integer;
-  InvN, Mean, Variance: TNeuralFloat;
-  SumPtr, SumSqPtr: TNeuralFloatArrPtr;
+  DepthM1, pos, MaxPos, DepthBytes: integer;
+  InvN, Variance: TNeuralFloat;
+  SumPtr, SumSqPtr, MeanPtr: TNeuralFloatArrPtr;
 begin
   Depth := V.Depth;
+  DepthBytes := Depth * csNeuralFloatSize;
   DepthM1 := Depth - 1;
   MaxPos := V.Size - Depth;
   // One reciprocal of the position count for both channel passes (#21).
@@ -55512,23 +55521,28 @@ begin
   SumSqScratch.Fill(0);
   SumPtr := SumScratch.GetRawPtr(0);
   SumSqPtr := SumSqScratch.GetRawPtr(0);
-  // One pass over the volume accumulates both per-channel moments along the
-  // contiguous depth run: sum for the mean, raw sum of squares for the
-  // variance via Var = E[x^2] - mean^2. Cancellation in that identity can push
-  // the variance slightly below zero, so it is clamped before the inverse root.
+  MeanPtr := OutMean.GetRawPtr(0);
   pos := 0;
   while pos <= MaxPos do
   begin
     TNNetVolume.Add(SumPtr, @V.FData[pos], Depth);
-    TNNetVolume.MulAdd(SumSqPtr, @V.FData[pos], @V.FData[pos], Depth);
+    Inc(pos, Depth);
+  end;
+  for CntD := 0 to DepthM1 do
+    OutMean.FData[CntD] := SumScratch.FData[CntD] * InvN;
+  // Centered second pass: E[x^2] - mean^2 cancels in single precision on a
+  // channel whose variance is small next to mean^2. SumScratch holds x - mean.
+  pos := 0;
+  while pos <= MaxPos do
+  begin
+    Move(V.FData[pos], SumPtr^, DepthBytes);
+    TNNetVolume.MulAdd(SumPtr, MeanPtr, -1, Depth);
+    TNNetVolume.MulAdd(SumSqPtr, SumPtr, SumPtr, Depth);
     Inc(pos, Depth);
   end;
   for CntD := 0 to DepthM1 do
   begin
-    Mean := SumScratch.FData[CntD] * InvN;
-    OutMean.FData[CntD] := Mean;
-    Variance := SumSqScratch.FData[CntD] * InvN - Mean * Mean;
-    if Variance < 0 then Variance := 0;
+    Variance := SumSqScratch.FData[CntD] * InvN;
     OutInvStd.FData[CntD] := pcr_rsqrtf(Variance + Eps);
   end;
 end;
@@ -80482,7 +80496,7 @@ begin
   begin
     // Instance-norm limit (one channel per group): the per-group statistics ARE
     // per-channel, so the shared depth-contiguous reduction computes the whole
-    // Depth-vector of means / inv-stds in two AVX passes, and the normalize is a
+    // Depth-vector of means / inv-stds in AVX passes, and the normalize is a
     // single full-depth (col - mean) * inv_std per (x,y) column -- no per-group
     // stride-Depth column gather. Numerically identical to the per-group loop
     // below (same x,y order, same centered-variance formula).
@@ -104506,6 +104520,12 @@ end;
 procedure TNNetDeMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
+  if FPoolSizeY <> FPoolSize then
+  begin
+    FOutputSizeY := pPrevLayer.Output.SizeY * FPoolSizeY;
+    FOutput.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
+    SetOutputErrorSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
+  end;
   SetLength(FMaxPosX, 0);
   SetLength(FMaxPosY, 0);
 end;
@@ -104516,11 +104536,14 @@ begin
   Result := pInputSize * FPoolSize;
 end;
 
-constructor TNNetDeMaxPool.Create(pPoolSize: integer; pSpacing: integer = 0);
+constructor TNNetDeMaxPool.Create(pPoolSize: integer; pSpacing: integer = 0;
+  pPoolSizeY: integer = 0);
 begin
   inherited Create(pPoolSize);
   FSpacing := pSpacing;
   FStruct[7] := FSpacing;
+  FStruct[3] := pPoolSizeY;
+  if pPoolSizeY > 0 then FPoolSizeY := pPoolSizeY else FPoolSizeY := pPoolSize;
   FGatherChannelStride := 1;
   FGatherXStride := 0;
   FGatherYStride := 0;
@@ -104550,7 +104573,9 @@ end;
 
 function TNNetDeMaxPool.WillOpenCL(): boolean;
 begin
+  // cai_upsample_gather applies FPoolSize to both axes.
   Result := Assigned(FUpsampleCL) and FHasOpenCL and (FSpacing = 0) and
+    ((FPoolSizeY = FPoolSize) or (FOutput.SizeY = 1)) and
     (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
@@ -104632,7 +104657,7 @@ begin
       OutX := CntX*FPoolSize + Random(FPoolSize);
       for CntY := 0 to MaxY do
       begin
-        OutY := CntY*FPoolSize + Random(FPoolSize);
+        OutY := CntY*FPoolSizeY + Random(FPoolSizeY);
         PrevLayerRawPos := FPrevLayer.FOutput.GetRawPos(CntX, CntY);
         OutputRawPos := FOutput.GetRawPos(OutX, OutY);
         // #13: contiguous depth-row copy (bit-exact).
@@ -104652,8 +104677,8 @@ begin
     // one cell, so the offset is carried (#12).
     for CntY := 0 to MaxY do
     begin
-      OutYStart := CntY*FPoolSize;
-      OutYEnd := OutYStart + FPoolSize - 1;
+      OutYStart := CntY*FPoolSizeY;
+      OutYEnd := OutYStart + FPoolSizeY - 1;
       for CntX := 0 to MaxX do
       begin
         OutXStart := CntX*FPoolSize;
@@ -104747,7 +104772,7 @@ begin
       // per (CntX,CntY) cell (rule #13).
       for CntY := 0 to MaxY do
       begin
-        PrevPosY := CntY div FPoolSize;
+        PrevPosY := CntY div FPoolSizeY;
         for CntX := 0 to MaxX do
         begin
           PrevPosX := CntX div FPoolSize;
@@ -104763,7 +104788,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        PrevPosY := CntY div FPoolSize;
+        PrevPosY := CntY div FPoolSizeY;
         for CntX := 0 to MaxX do
         begin
           PrevPosX := CntX div FPoolSize;
@@ -104870,6 +104895,7 @@ begin
   // A grouped layer sizes its rows for its group's channels below, as
   // TNNetGroupedConvolutionLinear does.
   if FGroups > 1 then FCanSetNumWeightsForAllNeurons := false;
+  FNoInterleavedWeights := FGroups > 1;
   inherited SetPrevLayer(pPrevLayer);
   if FGroups > 1 then
   begin
@@ -108840,7 +108866,7 @@ begin
       FOutput.HasAVX and
       (FNeurons.Count mod 32 = 0) and
       ( (FVectorSize <= csMaxInterleavedSize) or (FOutputSizeX>=40) ) and
-      ( not(FPointwise) )
+      ( not(FPointwise) ) and (not FNoInterleavedWeights)
     );
 end;
 
@@ -132312,7 +132338,7 @@ begin
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionLinear' :  Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconv1DLinear' :      Result := TNNetDeconv1DLinear.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]);
-      'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
+      'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7], St[3]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetEchoStateReservoir' :   Result := TNNetEchoStateReservoir.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3], St[2]);
@@ -132761,7 +132787,7 @@ begin
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionLinear' then Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconv1DLinear' then Result := TNNetDeconv1DLinear.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]) else
-      if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
+      if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7], St[3]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetEchoStateReservoir' then Result := TNNetEchoStateReservoir.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3], St[2]) else

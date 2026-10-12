@@ -1253,6 +1253,9 @@ type
     procedure TestDeconv1DLinearBorrowingBuild;
     // Input and weight gradients for dense, depthwise and grouped geometries.
     procedure TestDeconv1DLinearGradientCheck;
+    // Depthwise x2 (Kokoro pool) at 32 channels and 60 output positions, the
+    // size where the AVX base SetPrevLayer used to interleave grouped rows.
+    procedure TestDeconv1DLinearDepthwiseWide;
     // Kokoro-82M AdaIN1d (InstanceNorm), AdaLayerNorm and the channel LayerNorm
     // (TokenLayerNorm) vs torch, with fc(style) written into gamma/beta.
     procedure TestKokoroStyleNormTorchParity;
@@ -1497,6 +1500,9 @@ type
     procedure TestDeMaxPoolGradientCheck;
     procedure TestDeAvgPoolGradientCheck;
     procedure TestDeMaxPoolForwardReplication;
+    // pPoolSizeY = 1: nearest x2 along X only (torch UpSample1d on (L,1,C)),
+    // forward, save/load and the input gradient.
+    procedure TestDeMaxPoolAlongXOnly;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
     procedure TestAddPositionalEmbeddingForward;
@@ -10983,6 +10989,44 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestDeMaxPoolAlongXOnly;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, OutX: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2));
+    NN.AddLayer(TNNetDeMaxPool.Create(2, 0, {pPoolSizeY=}1));
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntX := 0 to 2 do
+          Input[CntX, CntY, CntD] := 1.0 + CntX + 10 * CntY + 100 * CntD;
+    NN.Compute(Input);
+    AssertEquals('X doubled', 6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Y kept', 2, NN.GetLastLayer.Output.SizeY);
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for OutX := 0 to 5 do
+          AssertEquals('nearest at ' + IntToStr(OutX) + ',' + IntToStr(CntY),
+            Input[OutX div 2, CntY, CntD],
+            NN.GetLastLayer.Output[OutX, CntY, CntD], 0);
+    Loaded.LoadStructureFromString(NN.SaveStructureToString());
+    AssertEquals('round-trip structure', NN.SaveStructureToString(),
+      Loaded.SaveStructureToString());
+    AssertEquals('round-trip Y kept', 2, Loaded.GetLastLayer.Output.SizeY);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+  DeMaxPoolFamilyGradientCheck(Self, TNNetDeMaxPool.Create(2, 0, 1),
+    'DeMaxPool X only', 3, 2, 2, 0.001);
 end;
 
 procedure TTestNeuralNumerical.TestGEGLUForward;
@@ -66261,6 +66305,49 @@ begin
     SetTrainable(Trainable, Trainable));
   NN.AddLayer(TNNetDeconv1DLinear.Create(2, 20, 10, 5, 0, 2, 1).
     SetTrainable(Trainable, Trainable));
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearDepthwiseWide;
+const
+  ChannelCount = 32;
+  InputLength = 30;
+var
+  NN: TNNet;
+  Deconv: TNNetLayer;
+  Input: TNNetVolume;
+  InPos, OutPos, ChannelPos, TapPos: integer;
+  Expected, MaxDiff: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InputLength, 1, ChannelCount);
+  try
+    NN.AddLayer(TNNetInput.Create(InputLength, 1, ChannelCount));
+    Deconv := NN.AddLayer(TNNetDeconv1DLinear.Create(ChannelCount, 3, 2, 1, 1,
+      ChannelCount));
+    NN.SetTrainable(false);
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+    AssertEquals('output length', 2 * InputLength, Deconv.Output.SizeX);
+    // torch ConvTranspose1d: output o = 2*i - 1 + k.
+    MaxDiff := 0;
+    for ChannelPos := 0 to ChannelCount - 1 do
+      for OutPos := 0 to 2 * InputLength - 1 do
+      begin
+        Expected := Deconv.Neurons[ChannelPos].BiasWeight;
+        for InPos := 0 to InputLength - 1 do
+          for TapPos := 0 to 2 do
+            if 2 * InPos - 1 + TapPos = OutPos then
+              Expected := Expected + Input[InPos, 0, ChannelPos] *
+                Deconv.Neurons[ChannelPos].Weights[TapPos, 0, 0];
+        MaxDiff := Max(MaxDiff, Abs(Expected -
+          Deconv.Output[OutPos, 0, ChannelPos]));
+      end;
+    AssertTrue('depthwise output, max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-5);
+  finally
+    Input.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestDeconv1DLinearSaveLoadRoundTrip;
