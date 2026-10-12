@@ -5373,11 +5373,17 @@ function BuildVitsFromSafeTensors(const FileName: string;
 // whose root is a dict of the five state dicts bert, bert_encoder,
 // predictor, text_encoder and decoder, keys prefixed "module.") and
 // voices/<name>.pt (a bare tensor [rows, 1, 2*style_dim]). TNNetKokoro runs
-// stages A (text side), B (prosody) and the decoder of stage C (no generator yet).
+// stages A (text side), B (prosody), the decoder of stage C and the host
+// harmonic spectrum of the generator (no generator net yet).
 // Coded by Claude (AI).
 // ---------------------------------------------------------------------------
 const
   KokoroSampleRate = 24000;
+  // Generator.m_source (SourceModuleHnNSF): sine_amp, add_noise_std and
+  // voiced_threshod as the kokoro package hard-codes them.
+  KokoroHarmonicSineAmp = 0.1;
+  KokoroHarmonicNoiseStd = 0.003;
+  KokoroVoicedThreshold = 10;
   // The five state dicts of kokoro-v1_0.pth; OpenKokoroCheckpoint exposes
   // their tensors as '<component>.<name>' (the 'module.' level removed).
   KokoroComponentNames: array[0..4] of string =
@@ -5587,7 +5593,8 @@ type
   // them. Each stage has a weight owner built once from the checkpoint and a
   // net sized per utterance that borrows the owner's weights. Stage A (text
   // side: PL-BERT, duration predictor, text encoder), stage B (prosody:
-  // F0Ntrain) and the stage-C decoder so far. Coded by Claude (AI).
+  // F0Ntrain), the stage-C decoder and the generator's host harmonic
+  // spectrum so far. Coded by Claude (AI).
   TNNetKokoro = class(TObject)
   private
     FConfig: TKokoroConfig;
@@ -5614,6 +5621,10 @@ type
     FStageCDecoderAsr: TNNetVolume;
     // AdaIN1d fc of each FStageCDecoderLayers.StyleNorms entry.
     FStageCDecoderNormFcWeights, FStageCDecoderNormFcBiases: array of TNNetVolume;
+    FHarmonicSource: TNNetHarmonicSource;
+    FHarmonicSTFT: TNNetForwardSTFT;
+    // har_source of the last ComputeHarmonicSpectrum: (600F,1,1) real.
+    FHarmonicWave: TNNetVolume;
     FParallel: boolean;
     FMaxThreads: integer;
     FShareHostOutputs: boolean;
@@ -5629,6 +5640,8 @@ type
     procedure LoadStageA(Reader: TNNetSafeTensorsReader);
     procedure LoadStageB(Reader: TNNetSafeTensorsReader);
     procedure LoadStageCDecoder(Reader: TNNetSafeTensorsReader);
+    // decoder.generator.m_source.l_linear into FHarmonicSource.
+    procedure LoadHarmonicSource(Reader: TNNetSafeTensorsReader);
     // After a borrowing build of Net: inference threads, host-output sharing
     // and, with OpenCL enabled, the owner's arming (once) and Net's.
     procedure ArmStageNet(Net, Owner: TNNet; var OwnerOnOpenCL: boolean);
@@ -5664,6 +5677,9 @@ type
     procedure RunStageCDecoder(TextFeatures: TNNetVolume;
       const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
       const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
+    // Generator host step: F0Curve (2F,1,1) -> har_source -> its STFT as
+    // HarmonicSpectrum (120F+1,1,22 real): [magnitude; phase] per frame.
+    procedure ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum: TNNetVolume);
     {$IFDEF OpenCL}
     // One OpenCL context and program for every stage net (owner weights
     // uploaded once, borrowed); false if the program does not build.
@@ -5693,6 +5709,10 @@ type
       read FStageCDecoderLayers;
     // asr of the last RunStageCDecoder: (F,1,hidden).
     property StageCDecoderAsr: TNNetVolume read FStageCDecoderAsr;
+    // Set RandomNoise / NoiseSeed here; zero noise by default.
+    property HarmonicSource: TNNetHarmonicSource read FHarmonicSource;
+    property HarmonicSTFT: TNNetForwardSTFT read FHarmonicSTFT;
+    property HarmonicWave: TNNetVolume read FHarmonicWave;
     // Read when a stage net is (re)built, as in TQwenImage21VaeDecoder.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
@@ -51879,9 +51899,13 @@ begin
   FStageAInput := TNNetVolume.Create();
   FStageBInput := TNNetVolume.Create();
   FStageCDecoderAsr := TNNetVolume.Create();
+  FHarmonicWave := TNNetVolume.Create();
+  FHarmonicSTFT := TNNetForwardSTFT.Create(Config.ISTFTNFFT,
+    Config.ISTFTHopSize);
   LoadStageA(Reader);
   LoadStageB(Reader);
   LoadStageCDecoder(Reader);
+  LoadHarmonicSource(Reader);
 end;
 
 destructor TNNetKokoro.Destroy();
@@ -51913,6 +51937,9 @@ begin
   FStageAInput.Free;
   FStageBInput.Free;
   FStageCDecoderAsr.Free;
+  FHarmonicSource.Free;
+  FHarmonicSTFT.Free;
+  FHarmonicWave.Free;
   inherited Destroy();
 end;
 
@@ -52056,6 +52083,47 @@ begin
   finally
     Consumed.Free;
   end;
+end;
+
+procedure TNNetKokoro.LoadHarmonicSource(Reader: TNNetSafeTensorsReader);
+const
+  MergeName = 'decoder.generator.m_source.l_linear';
+var
+  MergeWeights, MergeBias: TNNetVolume;
+  UpsampleScale, RatePos: integer;
+begin
+  if (Reader.DimCount(MergeName + '.weight') <> 2) or
+     (Reader.DimSize(MergeName + '.weight', 0) <> 1) or
+     (Reader.DimCount(MergeName + '.bias') <> 1) or
+     (Reader.DimSize(MergeName + '.bias', 0) <> 1) then
+    ImportError('Kokoro import: ' + MergeName + ' is ' +
+      Reader.ShapeAsString(MergeName + '.weight') + ' + ' +
+      Reader.ShapeAsString(MergeName + '.bias') +
+      ', expected [1, harmonics] + [1].');
+  // SineGen runs at the iSTFT input rate: prod(upsample_rates) * hop.
+  UpsampleScale := FConfig.ISTFTHopSize;
+  for RatePos := 0 to High(FConfig.Generator.UpsampleRates) do
+    UpsampleScale := UpsampleScale * FConfig.Generator.UpsampleRates[RatePos];
+  MergeWeights := TNNetVolume.Create();
+  MergeBias := TNNetVolume.Create();
+  try
+    Reader.LoadTensorFlat(MergeName + '.weight', MergeWeights);
+    Reader.LoadTensorFlat(MergeName + '.bias', MergeBias);
+    FHarmonicSource := TNNetHarmonicSource.Create(KokoroSampleRate,
+      UpsampleScale, MergeWeights.Size, KokoroHarmonicSineAmp,
+      KokoroHarmonicNoiseStd, KokoroVoicedThreshold);
+    FHarmonicSource.SetMergeWeights(MergeWeights.FData, MergeBias.FData[0]);
+  finally
+    MergeWeights.Free;
+    MergeBias.Free;
+  end;
+end;
+
+procedure TNNetKokoro.ComputeHarmonicSpectrum(F0Curve,
+  HarmonicSpectrum: TNNetVolume);
+begin
+  FHarmonicSource.Compute(F0Curve, FHarmonicWave);
+  FHarmonicSTFT.TransformToMagnitudePhase(FHarmonicWave, HarmonicSpectrum);
 end;
 
 procedure TNNetKokoro.ArmStageNet(Net, Owner: TNNet;

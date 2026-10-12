@@ -1830,11 +1830,69 @@ rather than acted on.
           for ~31M weights x 102-204 frames); not run. Real decoder on a GPU:
           not run.
         - [ ] Stage B on a GPU and a CPU profile: not run.
-  - [ ] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
+  - [x] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
         down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
         9->1 + tanh.
-  - [ ] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
+        Done: `TNNetHarmonicSource` in neuralaudio.pas (a general hn-NSF piece,
+        not Kokoro-specific): `Create(SampleRate, UpsampleScale, HarmonicCount,
+        SineAmp, NoiseStd, VoicedThreshold)`, `SetMergeWeights`, `Compute(F0,
+        HarmonicSource)`, `ComputeUpsampledF0AndVoicing`. Zero noise by default;
+        `RandomNoise` + `NoiseSeed` (FPC RNG, global RandSeed restored, the seed
+        advances per call) add rand_ini and the Gaussian noise. Torch semantics
+        verified bit-exact in Python against the real dump (scratch scripts):
+        nearest index = floor(float(i) * float(1/300)); interpolate with
+        scale_factor uses the coordinate scale float(1/scale_factor)
+        (recompute_scale_factor unset) and output length floor(L * scale_factor)
+        in double; the source coordinate is FMA-contracted,
+        fma(scale, i + 0.5, -0.5) in float, clamped at 0; the blend is
+        fma(x0, w0, x1 * w1); cumsum accumulates in double; phase =
+        ((float(cumsum) * 2) * float(pi)) * 300. The down-sample reads samples
+        300j+149/150 with weight 0.5, so rand_ini (added to sample 0 only) never
+        reaches the phase: the random initial phase is a no-op in Kokoro.
+        Tests: `TestHarmonicSourceTorchParity` (kokoro SourceModuleHnNSF, U=6,
+        negative / unvoiced / high F0; f0 up and uv exact, har_source < 1e-6),
+        `TestHarmonicSourceRandomNoise`; fixture
+        tests/fixtures/stft_harmonic_source_oracle.json
+        (`tools/stft_harmonic_source_oracle.py`).
+  - [x] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
         in neuralaudio.pas; only power-spectrum and private FFT routines exist.
+        Done: `TNNetForwardSTFT(NFFT, Hop)`: torch.stft defaults and sign,
+        `Transform(Wave, Re, Im)`, `TransformToMagnitudePhase(Wave, Dest)`
+        (Dest = [|X|; atan2] along Depth, torch.cat order). Direct DFT with
+        `TNNetVolume.DotProduct` against window-premultiplied cos / -sin tables
+        built in Create (the radix-2 FFT does not take 20; `RealFramePowerSpectrum`
+        returns power only); interior frames read the wave in place, edge frames
+        a reflect-padded scratch; DC / Nyquist Im forced to +0 (torch gives
+        phase 0 or +pi there). Tests: `TestForwardSTFTTorchParity` (n_fft
+        20/16/15), `TestForwardSTFTCosinePeakBins`.
+        Kokoro wiring: `TNNetKokoro.ComputeHarmonicSpectrum(F0Curve, Spectrum)`
+        -> (120F+1, 1, 22), the generator's second input; `LoadHarmonicSource`
+        reads `decoder.generator.m_source.l_linear` (upsample scale =
+        prod(upsample_rates) * hop = 300). Tests:
+        `TestKokoroHarmonicSpectrumTinyParity`, `TestKokoroRealHarmonicSpectrumParity`.
+        Real sentence (204 F0 frames -> 61200 samples -> 12241 STFT frames):
+        gen_f0_upsampled and gen_uv exact; gen_har_source 3.0e-8 abs (rel.
+        2.1e-7, phases up to ~3.8e4 rad); gen_har_spec 2.4e-7 (rel. 1.9e-7);
+        complex spectrum 2.4e-7; phase (only where |X| > 1e-4 max |X|, wrapped)
+        4.0e-4 rad. Tiny: har_source 1.5e-8, spec 2.4e-7, phase 3.9e-4 rad.
+        Host step 41 ms on the real sentence (`fpc -O2` test build, no AVX2).
+        - [ ] ARBITRARY PHASE BINS: zero noise makes har_source the constant
+          tanh(bias) on unvoiced spans, so bins 2..10 of those frames are
+          rounding noise. Real sentence: 44,238 of 134,651 bins at |X| <=
+          1e-7 max (52,990 at <= 1e-4). Torch (MKL FFT) is deterministic there
+          (same pattern on every constant frame, e.g. bin 2 phase 2.03) but the
+          values are MKL rounding artefacts, so no Pascal FFT can reproduce
+          them. They feed the generator's noise_convs: replacing torch's
+          phases with a float64 STFT's (a stand-in for any other FFT) moved
+          the torch audio by 0.087 max abs (peak 0.32), RMS 0.0037 vs signal
+          RMS 0.047. So: generator parity (2.11) must feed the dump's
+          gen_har_spec / gen_har_phase; end-to-end audio parity will not get
+          below ~0.1 abs; decide whether to zero or keep those phases.
+        - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
+          want `RealFramePowerSpectrum`'s two-factor path with complex output.
+        - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
+          rad need its exact range reduction; the vector `Sin` was not checked
+          at that range) on one thread; 41 ms total is small next to the nets.
   - [ ] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
         (`TNNetDAC.RunSnake`); extend `THiFiGANResBlock` rather than clone it.
   - [ ] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d

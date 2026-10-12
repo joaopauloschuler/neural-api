@@ -66,6 +66,10 @@ type
     // TNNetKokoro over the real snapshot and the real dump file; Ignore()s
     // the test when either is missing.
     function CreateRealKokoroOrIgnore(out ReferenceFile: string): TNNetKokoro;
+    // ComputeHarmonicSpectrum on the dump's F0_pred vs gen_har_source /
+    // gen_har_spec / gen_har_phase (see the phase rule in the body).
+    procedure CheckKokoroHarmonicSpectrumParity(Kokoro: TNNetKokoro;
+      const ReferenceFile: string; Tolerance: TNeuralFloat);
     // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
     // OnOpenCL (skipped without a device).
     procedure CheckQwenImage21VaeSharedHostOutputs(OnOpenCL: boolean);
@@ -765,6 +769,12 @@ type
     // Real stages A, B and the decoder chained (our t_en, durations, curves)
     // vs the dump's dec_decode3; reports the error, loose tolerance.
     procedure TestKokoroRealStagesChainedToDecoder;
+    // Generator host step (har_source, its STFT magnitude and phase) vs
+    // tiny_kokoro82m_ref from the dumped F0_pred.
+    procedure TestKokoroHarmonicSpectrumTinyParity;
+    // The same on the real snapshot, plus gen_f0_upsampled and gen_uv exact;
+    // ignored when absent.
+    procedure TestKokoroRealHarmonicSpectrumParity;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -25044,6 +25054,145 @@ begin
     F0Curve.Free; NCurve.Free;
     DurationFeatures.Free; TextFeatures.Free;
     Values.Free;
+    Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+// Reference magnitudes at or below this fraction of the largest are rounding
+// noise (bins 2..10 of a constant frame): their angle is arbitrary in torch too.
+const
+  KokoroArbitraryPhaseFraction = 1e-4;
+
+procedure TTestNeuralPretrained.CheckKokoroHarmonicSpectrumParity(
+  Kokoro: TNNetKokoro; const ReferenceFile: string; Tolerance: TNeuralFloat);
+var
+  Reference: TNNetSafeTensorsReader;
+  F0Curve, Spectrum, Magnitude, ReferenceMagnitude, ReferencePhase: TNNetVolume;
+  FrameCount, BinCount, FramePos, BinPos, ArbitraryCount, NoiseLevelCount,
+    BinOffset: integer;
+  RefMag, RefPhase, OurMag, OurPhase, MaxRefMag, PhaseDiff, MaxPhaseDiff,
+    ComplexDiff, MaxComplexDiff: double;
+  StartTime: TDateTime;
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  F0Curve := TNNetVolume.Create;
+  Spectrum := TNNetVolume.Create;
+  Magnitude := TNNetVolume.Create;
+  ReferenceMagnitude := TNNetVolume.Create;
+  ReferencePhase := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat('F0_pred', F0Curve);
+    StartTime := Now();
+    Kokoro.ComputeHarmonicSpectrum(F0Curve, Spectrum);
+    WriteLn('  Kokoro harmonic spectrum, ', F0Curve.Size, ' F0 frames -> ',
+      Spectrum.SizeX, ' STFT frames: ',
+      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms');
+    // har_source lies in (-1, 1): absolute.
+    CheckKokoroStage(Reference, 'gen_har_source', Kokoro.HarmonicWave, false,
+      Tolerance, false);
+    BinCount := Kokoro.HarmonicSTFT.BinCount;
+    FrameCount := Spectrum.SizeX;
+    AssertEquals('spectrum depth', 2 * BinCount, Spectrum.Depth);
+    Magnitude.ReSize(FrameCount, 1, BinCount);
+    for FramePos := 0 to FrameCount - 1 do
+      for BinPos := 0 to BinCount - 1 do
+        Magnitude[FramePos, 0, BinPos] := Spectrum[FramePos, 0, BinPos];
+    CheckKokoroStage(Reference, 'gen_har_spec', Magnitude, true, Tolerance,
+      true);
+    // Phase: the wrapped difference where the reference magnitude is above
+    // KokoroArbitraryPhaseFraction of its max; everywhere, the complex values.
+    Reference.LoadTensorFlat('gen_har_spec', ReferenceMagnitude);
+    Reference.LoadTensorFlat('gen_har_phase', ReferencePhase);
+    AssertEquals('gen_har_phase frames', FrameCount,
+      Reference.DimSize('gen_har_phase', 2));
+    MaxRefMag := ReferenceMagnitude.GetMaxAbs();
+    ArbitraryCount := 0;
+    NoiseLevelCount := 0;
+    MaxPhaseDiff := 0;
+    MaxComplexDiff := 0;
+    for BinPos := 0 to BinCount - 1 do
+    begin
+      BinOffset := BinPos * FrameCount;
+      for FramePos := 0 to FrameCount - 1 do
+      begin
+        RefMag := ReferenceMagnitude.FData[BinOffset + FramePos];
+        RefPhase := ReferencePhase.FData[BinOffset + FramePos];
+        OurMag := Spectrum[FramePos, 0, BinPos];
+        OurPhase := Spectrum[FramePos, 0, BinCount + BinPos];
+        ComplexDiff := Sqrt(Sqr(OurMag * Cos(OurPhase) - RefMag * Cos(RefPhase)) +
+          Sqr(OurMag * Sin(OurPhase) - RefMag * Sin(RefPhase)));
+        MaxComplexDiff := Max(MaxComplexDiff, ComplexDiff);
+        if RefMag <= 1e-7 * MaxRefMag then Inc(NoiseLevelCount);
+        if RefMag <= KokoroArbitraryPhaseFraction * MaxRefMag then
+        begin
+          Inc(ArbitraryCount);
+          continue;
+        end;
+        PhaseDiff := Abs(OurPhase - RefPhase);
+        if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
+        MaxPhaseDiff := Max(MaxPhaseDiff, PhaseDiff);
+      end;
+    end;
+    WriteLn('  Kokoro gen_har_phase: ', ArbitraryCount, ' of ',
+      FrameCount * BinCount, ' bins at |X| <= ',
+      KokoroArbitraryPhaseFraction:0:5, ' max |X| (', NoiseLevelCount,
+      ' at <= 1e-7 max |X|); elsewhere max wrapped |diff| = ',
+      MaxPhaseDiff:0:7, ' rad; complex max |diff| = ', MaxComplexDiff:0:9,
+      ' (max |X| = ', MaxRefMag:0:4, ')');
+    AssertTrue('gen_har_phase wrapped max |diff| = ' + FloatToStr(MaxPhaseDiff),
+      MaxPhaseDiff < 1e-2);
+    AssertTrue('complex spectrum max |diff| = ' + FloatToStr(MaxComplexDiff),
+      MaxComplexDiff < Tolerance * MaxRefMag);
+  finally
+    ReferencePhase.Free;
+    ReferenceMagnitude.Free;
+    Magnitude.Free;
+    Spectrum.Free;
+    F0Curve.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroHarmonicSpectrumTinyParity;
+var
+  Kokoro: TNNetKokoro;
+begin
+  Kokoro := CreateTinyKokoro();
+  try
+    AssertEquals('harmonics', 9, Kokoro.HarmonicSource.HarmonicCount);
+    AssertEquals('upsample scale', 300, Kokoro.HarmonicSource.UpsampleScale);
+    CheckKokoroHarmonicSpectrumParity(Kokoro,
+      FixturePath('tiny_kokoro82m_ref.safetensors'), 1e-4);
+  finally
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealHarmonicSpectrumParity;
+var
+  ReferenceFile: string;
+  Kokoro: TNNetKokoro;
+  Reference: TNNetSafeTensorsReader;
+  F0Curve, F0Upsampled, Voicing: TNNetVolume;
+begin
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile);
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  F0Curve := TNNetVolume.Create;
+  F0Upsampled := TNNetVolume.Create;
+  Voicing := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat('F0_pred', F0Curve);
+    Kokoro.HarmonicSource.ComputeUpsampledF0AndVoicing(F0Curve, F0Upsampled,
+      Voicing);
+    CheckKokoroStage(Reference, 'gen_f0_upsampled', F0Upsampled, false, 1e-30,
+      false);
+    CheckKokoroStage(Reference, 'gen_uv', Voicing, false, 1e-30, false);
+    CheckKokoroHarmonicSpectrumParity(Kokoro, ReferenceFile, 1e-4);
+  finally
+    Voicing.Free;
+    F0Upsampled.Free;
+    F0Curve.Free;
     Reference.Free;
     Kokoro.Free;
   end;
