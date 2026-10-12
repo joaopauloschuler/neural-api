@@ -15108,6 +15108,9 @@ type
       FDilationX: integer;
       // Input columns one output position spans: FDilationX*(FFeatureSizeX-1)+1.
       FFeatureExtentX: integer;
+      // False keeps the X kernel size when it exceeds the padded input (the
+      // transposed 1D convolution, whose kernel never has to fit its input).
+      FClampKernelToInputX: boolean;
       FOutputSizeX, FOutputSizeY: integer;
       FFeatureSizeX, FFeatureSizeY: integer;
       FFeatureSizeYMinus1, FFeatureSizeXMinus1: integer;
@@ -15118,6 +15121,9 @@ type
       FPrevSizeXDepthBytes: integer;
       FCalculatePrevLayerError: boolean;
       function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer; virtual;
+      // Output rows for pInputSizeY input rows: CalcOutputSize with the Y kernel
+      // size and FPaddingY, unless a descendant has Y-specific geometry.
+      function CalcOutputSizeY(pInputSizeY: integer): integer; virtual;
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure RefreshPrevSizeXDepthBytes();
@@ -17294,33 +17300,62 @@ type
   TNNetDeconvolution = class(TNNetConvolution)
   protected
     FOutputPadding: integer;
+    // Extra output rows: FOutputPadding, or 0 for TNNetDeconvolution1D.
+    FOutputPaddingY: integer;
+    // Channel groups (torch groups): neuron Oc reads input channels
+    // [g*InDepth/FGroups, (g+1)*InDepth/FGroups) of its group g. 1 = dense.
+    FGroups: integer;
+    // CPU GEMM scratch, sized in SetPrevLayer: a chunk of input positions
+    // and their (position, out-channel, tap) products.
+    FGemmChunkIn, FGemmChunkProducts: TNNetVolume;
+    // Input positions one CPU GEMM chunk holds.
+    FGemmChunkPositions: integer;
+    // At least half of the (input position, tap) products land inside the
+    // output, so the CPU GEMM does not compute mostly discarded products.
+    FMostTapsLandInOutput: boolean;
     {$IFDEF OpenCL}
     // Scratch operands for the device "scatter GEMM": the per-(tap,out-channel)
     // weight rows (A), the per-input-position depth columns (B) and the dense
     // GEMM result. The overlap-add SCATTER back into FOutputRaw stays on the
-    // CPU (overlapping output writes), mirroring the DeformableConv/GroupConvP4
-    // im2col-GEMM offload path.
+    // CPU (overlapping output writes).
     FGemmWInter, FGemmIn, FGemmRes: TNNetVolume;
     {$ENDIF}
     function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer; override;
+    function CalcOutputSizeY(pInputSizeY: integer): integer; override;
     // The scatter forwards write FOutputRaw without PrepareHostOutput.
     function HostOutputRawOnDemand(): boolean; override;
+    // True when ComputeCPUGemm can run: dense, inference-only, most taps used,
+    // FP32 FConcatedWeights built (the conv-family FlushWeightCache contract).
+    function CPUGemmEligible(): boolean;
     procedure ComputeCPU();
+    // FConcatedWeights x input positions with DotProductsTiled, chunk by chunk,
+    // then ScatterTapProducts. Coded by Claude (AI).
+    procedure ComputeCPUGemm();
+    // Adds pProducts (input positions pFirstPos.. pFirstPos+pPosCount-1, one
+    // NumNeurons*taps row each, product of out-channel Oc and tap K at
+    // Oc*pNeuronStride + K*pTapStride) into FOutputRaw. Coded by Claude (AI).
+    procedure ScatterTapProducts(pProducts: TNNetVolume;
+      pFirstPos, pPosCount, pTapStride, pNeuronStride: integer);
+    // FOutputRaw += bias, FOutput := activation(FOutputRaw). Coded by Claude (AI).
+    procedure ApplyBiasAndActivation();
     {$IFDEF OpenCL}
     procedure ComputeOpenCL();
+    // Grouped layers stay on the CPU: the device GEMM contracts all channels.
+    function WillOpenCL(): boolean; override;
     {$ENDIF}
   public
     constructor Create(pNumFeatures, pFeatureSize: integer;
       pStride: integer = 2; pPadding: integer = 0;
       pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
+    destructor Destroy(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     // Never chunks: the inherited ComputeRange is the forward convolution, not
     // the transposed scatter this layer's Compute runs. Coded by Claude (AI).
     function ChunkEligible(): boolean; override;
     procedure Backpropagate(); override;
+    property Groups: integer read FGroups;
     {$IFDEF OpenCL}
-    destructor Destroy(); override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
   end;
@@ -17344,6 +17379,22 @@ type
     constructor Create(pNumFeatures, pFeatureSize: integer;
       pStride: integer = 2; pPadding: integer = 0;
       pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
+  end;
+
+  /// Transposed 1D convolution along X of a (SeqLen, 1, Channels) input, the
+  /// geometry of torch.nn.ConvTranspose1d (dilation 1): a K x 1 kernel, pPadding
+  /// trimmed from both ends, pOutputPadding added at the end, no Y geometry,
+  /// linear activation. Output length = (SeqLen-1)*pStride - 2*pPadding + K +
+  /// pOutputPadding. pGroups splits the channels (pGroups = channels is the
+  /// depthwise case). FStruct[6] holds the groups. Torch weight [In, Out/G, K]:
+  /// neuron Oc (group g = Oc div (Out/G)) gets Weights[k, 0, c] = w[g*In/G + c,
+  /// Oc mod (Out/G), k], no kernel flip.
+  // Coded by Claude (AI).
+  TNNetDeconvolution1D = class(TNNetDeconvolutionLinear)
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pStride, pPadding: integer;
+      pOutputPadding: integer = 0; pGroups: integer = 1;
+      pSuppressBias: integer = 0); reintroduce;
   end;
 
   { TNNetLocalConnect }
@@ -104416,6 +104467,24 @@ begin
   inherited Create(pNumFeatures,pFeatureSize,pFeatureSize-1,0,pSuppressBias);
 end;
 
+// Counts the (input position, tap) pairs along one axis whose output index
+// pInputPos*pStride - pPadding + pTap falls in [0, pOutputSize).
+function CountTapsLandingInOutput(pInputSize, pFeatureSize, pStride, pPadding,
+  pOutputSize: integer): int64;
+var
+  InputPos, Tap, MaxInputPos, MaxTapPos, OutputPos: integer;
+begin
+  Result := 0;
+  MaxInputPos := pInputSize - 1;
+  MaxTapPos := pFeatureSize - 1;
+  for InputPos := 0 to MaxInputPos do
+    for Tap := 0 to MaxTapPos do
+    begin
+      OutputPos := InputPos * pStride - pPadding + Tap;
+      if (OutputPos >= 0) and (OutputPos < pOutputSize) then Inc(Result);
+    end;
+end;
+
 { TNNetDeconvolution }
 constructor TNNetDeconvolution.Create(pNumFeatures, pFeatureSize: integer;
   pStride: integer = 2; pPadding: integer = 0;
@@ -104425,18 +104494,74 @@ begin
   // (CalcOutputSize) and the forward/backward math are overridden below.
   inherited Create(pNumFeatures, pFeatureSize, Max(pPadding, 0), Max(pStride, 1), pSuppressBias);
   FOutputPadding := Max(pOutputPadding, 0);
+  FOutputPaddingY := FOutputPadding;
+  FGroups := 1;
   FStruct[5] := FOutputPadding;
+  FGemmChunkIn := TNNetVolume.Create();
+  FGemmChunkProducts := TNNetVolume.Create();
+end;
+
+destructor TNNetDeconvolution.Destroy();
+begin
+  FGemmChunkIn.Free;
+  FGemmChunkProducts.Free;
+  {$IFDEF OpenCL}
+  FGemmWInter.Free;
+  FGemmIn.Free;
+  FGemmRes.Free;
+  {$ENDIF}
+  inherited Destroy();
 end;
 
 function TNNetDeconvolution.CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer;
 begin
-  // Transposed-conv geometry: the exact inverse of the conv downsample.
+  // Transposed-conv geometry along X: the exact inverse of the conv downsample.
   Result := (pInputSize - 1) * pStride - 2 * pInputPadding + pFeatureSize + FOutputPadding;
 end;
 
-procedure TNNetDeconvolution.SetPrevLayer(pPrevLayer: TNNetLayer);
+function TNNetDeconvolution.CalcOutputSizeY(pInputSizeY: integer): integer;
 begin
+  Result := (pInputSizeY - 1) * FStride - 2 * FPaddingY + FFeatureSizeY + FOutputPaddingY;
+end;
+
+procedure TNNetDeconvolution.SetPrevLayer(pPrevLayer: TNNetLayer);
+const
+  // A chunk keeps its input rows within ~128 KB and its products within ~1 MB.
+  csDeconvGemmChunkInputFloats = 32768;
+  csDeconvGemmChunkProductFloats = 262144;
+var
+  InDepth, GroupInDepth, NumProducts, PositionCount: integer;
+begin
+  InDepth := pPrevLayer.Output.Depth;
+  // A grouped layer sizes its rows for its group's channels below, as
+  // TNNetGroupedConvolutionLinear does.
+  if FGroups > 1 then FCanSetNumWeightsForAllNeurons := false;
   inherited SetPrevLayer(pPrevLayer);
+  if FGroups > 1 then
+  begin
+    FCanSetNumWeightsForAllNeurons := true;
+    if (InDepth mod FGroups <> 0) or (FNeurons.Count mod FGroups <> 0) then
+      FErrorProc(ClassName + '.SetPrevLayer: ' + IntToStr(InDepth) +
+        ' input and ' + IntToStr(FNeurons.Count) + ' output channels are not ' +
+        'both divisible by ' + IntToStr(FGroups) + ' groups.');
+    GroupInDepth := InDepth div FGroups;
+    FVectorSize := FFeatureSizeX * FFeatureSizeY * GroupInDepth;
+    FVectorSizeBytes := FVectorSize * csNeuralFloatSize;
+    SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, GroupInDepth);
+    InitDefault();
+  end;
+  NumProducts := FNeurons.Count * FFeatureSizeX * FFeatureSizeY;
+  PositionCount := pPrevLayer.Output.SizeX * pPrevLayer.Output.SizeY;
+  FGemmChunkPositions := Max(1, Min(PositionCount,
+    Min(csDeconvGemmChunkInputFloats div Max(InDepth, 1),
+      csDeconvGemmChunkProductFloats div Max(NumProducts, 1))));
+  FMostTapsLandInOutput := 2 *
+    CountTapsLandingInOutput(pPrevLayer.Output.SizeX, FFeatureSizeX, FStride,
+      FPadding, FOutputSizeX) *
+    CountTapsLandingInOutput(pPrevLayer.Output.SizeY, FFeatureSizeY, FStride,
+      FPaddingY, FOutputSizeY) >= Int64(PositionCount) * (FFeatureSizeX * FFeatureSizeY);
+  FGemmChunkIn.ReSize(FGemmChunkPositions * InDepth, 1, 1);
+  FGemmChunkProducts.ReSize(FGemmChunkPositions * NumProducts, 1, 1);
   {$IFDEF OpenCL}
   FShouldOpenCL := FShouldOpenCL and
     (Int64(FNeurons.Count) * (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY)
@@ -104447,6 +104572,13 @@ end;
 function TNNetDeconvolution.ChunkEligible(): boolean;
 begin
   Result := false;
+end;
+
+function TNNetDeconvolution.CPUGemmEligible(): boolean;
+begin
+  Result := (FGroups = 1) and FMostTapsLandInOutput and (not FIsTrainable) and
+    (not FQuantInt8) and (not FQuantInt4) and (not ActiveLowMemory()) and
+    (FConcatedWeights.Size = FNeurons.Count * FVectorSize);
 end;
 
 procedure TNNetDeconvolution.Compute();
@@ -104465,7 +104597,7 @@ begin
   // device when OpenCL is armed and the work is large enough to amortise the
   // upload/dispatch. The overlap-add SCATTER back into FOutputRaw stays on the
   // CPU. Below the work threshold (or with OpenCL off) the whole deconv runs on
-  // the CPU - byte-identical to the gate-OFF path.
+  // the CPU.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -104475,7 +104607,9 @@ begin
   end
   else Inc(FForwardCPUCnt);
   {$ENDIF}
-  ComputeCPU();
+  if CPUGemmEligible()
+    then ComputeCPUGemm()
+    else ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -104483,23 +104617,26 @@ procedure TNNetDeconvolution.ComputeCPU();
 var
   Prev: TNNetVolume;
   InW, InH, InD, OutW, OutH: integer;
-  ix, iy, id, kx, ky, oc, ox, oy: integer;
-  MaxInX, MaxInY, MaxInD, MaxN: integer;
-  FeatYMax, FeatXMax, OutHMax, OutWMax: integer;
-  StrideX, Pad, outBase, pos: integer;
-  acc, raw: TNeuralFloat;
+  ix, iy, kx, ky, oc, ox, oy: integer;
+  MaxInX, MaxInY: integer;
+  FeatYMax, FeatXMax: integer;
+  StrideX, PadX, PadY, outBase: integer;
+  GroupInDepth, NeuronsPerGroup, MaxGroupPos, GroupCnt: integer;
+  FirstGroupNeuron, LastGroupNeuron: integer;
+  acc: TNeuralFloat;
   W: TNNetVolume;
-  prevPtr: TNeuralFloatArrPtr;
+  prevPtr, GroupPrevPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
   OutW := FOutput.SizeX; OutH := FOutput.SizeY;
-  StrideX := FStride; Pad := FPadding;
-  MaxInX := InW - 1; MaxInY := InH - 1; MaxInD := InD - 1;
-  MaxN := FNeurons.Count - 1;
+  StrideX := FStride; PadX := FPadding; PadY := FPaddingY;
+  MaxInX := InW - 1; MaxInY := InH - 1;
   FeatYMax := FFeatureSizeY - 1; FeatXMax := FFeatureSizeX - 1;
-  OutHMax := OutH - 1; OutWMax := OutW - 1;
+  GroupInDepth := InD div FGroups;
+  NeuronsPerGroup := FNeurons.Count div FGroups;
+  MaxGroupPos := FGroups - 1;
 
   // Overlap-add scatter: out[i*stride - pad + k] += W[k] * in[i], accumulated
   // over every (input cell, kernel tap) pair that lands inside the output.
@@ -104507,34 +104644,132 @@ begin
   for iy := 0 to MaxInY do
    for ky := 0 to FeatYMax do
    begin
-     oy := iy * StrideX - Pad + ky;
+     oy := iy * StrideX - PadY + ky;
      if (oy < 0) or (oy >= OutH) then continue;
      for ix := 0 to MaxInX do
       for kx := 0 to FeatXMax do
       begin
-        ox := ix * StrideX - Pad + kx;
+        ox := ix * StrideX - PadX + kx;
         if (ox < 0) or (ox >= OutW) then continue;
         // Rule #11: Prev column ptr and output row base are invariant across oc.
         prevPtr := Prev.GetRawPtr(ix, iy);
         outBase := FOutputRaw.GetRawPos(ox, oy);
-        for oc := 0 to MaxN do
+        // One pass for a dense layer; a group's neurons read its channel slice.
+        for GroupCnt := 0 to MaxGroupPos do
         begin
-          W := FArrNeurons[oc].FWeights;
-          // Depth axis is contiguous: W column (kx,ky,:) and Prev column
-          // (ix,iy,:) are each InD contiguous floats. SIMD dot product.
-          acc := TNNetVolume.DotProduct(
-            W.GetRawPtr(kx, ky), prevPtr, InD);
-          FOutputRaw.FData[outBase + oc] := FOutputRaw.FData[outBase + oc] + acc;
+          GroupPrevPtr := TNeuralFloatArrPtr(@prevPtr^[GroupCnt * GroupInDepth]);
+          FirstGroupNeuron := GroupCnt * NeuronsPerGroup;
+          LastGroupNeuron := FirstGroupNeuron + NeuronsPerGroup - 1;
+          for oc := FirstGroupNeuron to LastGroupNeuron do
+          begin
+            W := FArrNeurons[oc].FWeights;
+            // Depth axis is contiguous: W column (kx,ky,:) and the Prev group
+            // slice are each GroupInDepth contiguous floats. SIMD dot product.
+            acc := TNNetVolume.DotProduct(
+              W.GetRawPtr(kx, ky), GroupPrevPtr, GroupInDepth);
+            FOutputRaw.FData[outBase + oc] := FOutputRaw.FData[outBase + oc] + acc;
+          end;
         end;
       end;
    end;
+  ApplyBiasAndActivation();
+end;
 
+procedure TNNetDeconvolution.ComputeCPUGemm();
+var
+  Prev: TNNetVolume;
+  InDepth, TapsPerNeuron, NumProducts, PositionCount: integer;
+  FirstPos, ChunkPositions: integer;
+begin
+  Prev := FPrevLayer.FOutput;
+  InDepth := Prev.Depth;
+  TapsPerNeuron := FFeatureSizeX * FFeatureSizeY;
+  NumProducts := FNeurons.Count * TapsPerNeuron;
+  PositionCount := Prev.SizeX * Prev.SizeY;
+  FOutputRaw.Fill(0);
+  FirstPos := 0;
+  while FirstPos < PositionCount do
+  begin
+    ChunkPositions := Min(FGemmChunkPositions, PositionCount - FirstPos);
+    // Input positions are contiguous depth columns, so a chunk is one Move.
+    Move(Prev.FData[FirstPos * InDepth], FGemmChunkIn.FData[0],
+      ChunkPositions * InDepth * csNeuralFloatSize);
+    // FConcatedWeights row Oc*TapsPerNeuron+K is neuron Oc's tap K (InDepth
+    // floats): product (position, Oc, K) lands at Oc*TapsPerNeuron + K.
+    FGemmChunkProducts.DotProductsTiled(NumProducts, ChunkPositions, InDepth,
+      FConcatedWeights, FGemmChunkIn, {TileSizeA}16, {TileSizeB}ChunkPositions);
+    ScatterTapProducts(FGemmChunkProducts, FirstPos, ChunkPositions,
+      {TapStride}1, {NeuronStride}TapsPerNeuron);
+    Inc(FirstPos, ChunkPositions);
+  end;
+  ApplyBiasAndActivation();
+end;
+
+procedure TNNetDeconvolution.ScatterTapProducts(pProducts: TNNetVolume;
+  pFirstPos, pPosCount, pTapStride, pNeuronStride: integer);
+var
+  InSizeX, OutSizeX, OutSizeY, NumProducts: integer;
+  MaxPos, MaxNeuronPos, MaxFeatureXPos, MaxFeatureYPos: integer;
+  PosCnt, InX, InY, FeatureX, FeatureY, OutX, OutY, NeuronCnt: integer;
+  RowStart, TapStart, ProductPos, OutBase, FirstOutX, FirstOutY: integer;
+begin
+  InSizeX := FPrevLayer.FOutput.SizeX;
+  OutSizeX := FOutputRaw.SizeX;
+  OutSizeY := FOutputRaw.SizeY;
+  NumProducts := FNeurons.Count * FFeatureSizeX * FFeatureSizeY;
+  MaxPos := pFirstPos + pPosCount - 1;
+  MaxNeuronPos := FNeurons.Count - 1;
+  MaxFeatureXPos := FFeatureSizeX - 1;
+  MaxFeatureYPos := FFeatureSizeY - 1;
+  RowStart := 0;
+  for PosCnt := pFirstPos to MaxPos do
+  begin
+    InY := PosCnt div InSizeX;
+    InX := PosCnt - InY * InSizeX;
+    FirstOutX := InX * FStride - FPadding;
+    FirstOutY := InY * FStride - FPaddingY;
+    for FeatureY := 0 to MaxFeatureYPos do
+    begin
+      OutY := FirstOutY + FeatureY;
+      if (OutY < 0) or (OutY >= OutSizeY) then continue;
+      for FeatureX := 0 to MaxFeatureXPos do
+      begin
+        OutX := FirstOutX + FeatureX;
+        if (OutX < 0) or (OutX >= OutSizeX) then continue;
+        TapStart := RowStart + (FeatureY * FFeatureSizeX + FeatureX) * pTapStride;
+        OutBase := FOutputRaw.GetRawPos(OutX, OutY);
+        if pNeuronStride = 1 then
+          // #13: the out-channel run is a contiguous accumulate.
+          TNNetVolume.Add(FOutputRaw.GetRawPtr(OutBase),
+            pProducts.GetRawPtr(TapStart), FNeurons.Count)
+        else
+        begin
+          ProductPos := TapStart;
+          for NeuronCnt := 0 to MaxNeuronPos do
+          begin
+            FOutputRaw.FData[OutBase + NeuronCnt] :=
+              FOutputRaw.FData[OutBase + NeuronCnt] + pProducts.FData[ProductPos];
+            Inc(ProductPos, pNeuronStride);
+          end;
+        end;
+      end;
+    end;
+    Inc(RowStart, NumProducts);
+  end;
+end;
+
+procedure TNNetDeconvolution.ApplyBiasAndActivation();
+var
+  OutHMax, OutWMax, MaxN, ox, oy, oc, outBase, pos: integer;
+  raw: TNeuralFloat;
+begin
+  OutHMax := FOutput.SizeY - 1;
+  OutWMax := FOutput.SizeX - 1;
+  MaxN := FNeurons.Count - 1;
   // Add bias INTO the raw output (so the activation derivative used in
   // Backpropagate sees the true pre-activation), then apply the activation.
-  // App. E: the out-channel is the DEPTH axis here, so an oc-outer nest made
-  // one strided pass over the whole output per channel; with oc innermost the
-  // pair of volumes is streamed once, and the offset is a hoisted row base plus
-  // oc (#11). The bias is unswitched out of the body (#20).
+  // App. E: the out-channel is the DEPTH axis here, so oc is innermost and the
+  // pair of volumes is streamed once (#11). The bias is unswitched (#20).
   if FSuppressBias = 0 then
   begin
     for oy := 0 to OutHMax do
@@ -104567,12 +104802,9 @@ begin
 end;
 
 {$IFDEF OpenCL}
-destructor TNNetDeconvolution.Destroy();
+function TNNetDeconvolution.WillOpenCL(): boolean;
 begin
-  FGemmWInter.Free;
-  FGemmIn.Free;
-  FGemmRes.Free;
-  inherited Destroy();
+  Result := (FGroups = 1) and inherited WillOpenCL();
 end;
 
 procedure TNNetDeconvolution.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -104608,34 +104840,28 @@ end;
 //            stored INTERLEAVED A[id*NumAs + a] (the kernel's A layout).
 //   B rows : t = iy*InW+ix                     -> B[t][id] = in[ix,iy,id]
 //            NumBs = InW*InH (one column per input cell), row-major [t*Size+id].
-// The kernel returns Res[t*NumAs + a]. The host then scatters each tap into
-// FOutputRaw at out (ox,oy) = (ix*stride-pad+kx, iy*stride-pad+ky), accumulating
-// overlaps - byte-for-byte the same accumulation order is irrelevant since
-// addition is the same set of products as ComputeCPU (same depth dot product
-// per (t,k,oc)). Finally bias + activation, identical to ComputeCPU.
+// The kernel returns Res[t*NumAs + a]. ScatterTapProducts then adds each tap
+// into FOutputRaw, and ApplyBiasAndActivation finishes as on the CPU.
 procedure TNNetDeconvolution.ComputeOpenCL();
 var
   Prev: TNNetVolume;
-  InW, InH, InD, OutW, OutH: integer;
-  ix, iy, id, kx, ky, oc, ox, oy, t, a, pos: integer;
+  InW, InH, InD: integer;
+  ix, iy, id, kx, ky, oc, t, a, pos: integer;
   MaxInX, MaxInY, MaxN: integer;
-  FeatYMax, FeatXMax, InDMax, OutHMax, OutWMax: integer;
-  StrideX, Pad, N, NumAs, NumBs, aBase, wBase, outBase: integer;
-  raw: TNeuralFloat;
+  FeatYMax, FeatXMax, InDMax: integer;
+  N, NumAs, NumBs, aBase, wBase: integer;
   W: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
-  OutW := FOutput.SizeX; OutH := FOutput.SizeY;
-  StrideX := FStride; Pad := FPadding;
   MaxInX := InW - 1; MaxInY := InH - 1;
   MaxN := FNeurons.Count - 1;
   N := FNeurons.Count;
   NumAs := FFeatureSizeX * FFeatureSizeY * N;
   NumBs := InW * InH;
   FeatYMax := FFeatureSizeY - 1; FeatXMax := FFeatureSizeX - 1;
-  InDMax := InD - 1; OutHMax := OutH - 1; OutWMax := OutW - 1;
+  InDMax := InD - 1;
 
   // 1. A operand: one row per (tap k, out-channel oc), each InD contiguous
   //    weights W_oc[kx,ky,:]. Row a = (ky*FeatureSizeX+kx)*N + oc. Rebuilt +
@@ -104686,59 +104912,10 @@ begin
   FDotCL.FinishAndLoadResult(FGemmRes, 0);
   FAfterWeightUpdateHasBeenCalled := false;
 
-  // 4. Overlap-add scatter (host): every contributing product is in the GEMM
-  //    result; place it at its output cell, accumulating overlaps.
+  // 4. Overlap-add scatter (host), 5. bias + activation.
   FOutputRaw.Fill(0);
-  for iy := 0 to MaxInY do
-   for ky := 0 to FeatYMax do
-   begin
-     oy := iy * StrideX - Pad + ky;
-     if (oy < 0) or (oy >= OutH) then continue;
-     for ix := 0 to MaxInX do
-      for kx := 0 to FeatXMax do
-      begin
-        ox := ix * StrideX - Pad + kx;
-        if (ox < 0) or (ox >= OutW) then continue;
-        t := iy * InW + ix;
-        aBase := (ky * FFeatureSizeX + kx) * N;
-        // #13: the oc-run is a contiguous accumulate (FOutputRaw depth = N).
-        TNNetVolume.Add(FOutputRaw.GetRawPtr(ox, oy),
-          @FGemmRes.FData[t * NumAs + aBase], N);
-      end;
-   end;
-
-  // 5. Bias + activation, identical to ComputeCPU: oc innermost so the output
-  //    pair is streamed once instead of once per channel (App. E), with the
-  //    bias unswitched out of the body (#20).
-  if FSuppressBias = 0 then
-  begin
-    for oy := 0 to OutHMax do
-     for ox := 0 to OutWMax do
-     begin
-       // #3: one flat offset addresses both same-shaped output volumes.
-       outBase := FOutputRaw.GetRawPos(ox, oy);
-       for oc := 0 to MaxN do
-       begin
-         pos := outBase + oc;
-         raw := FOutputRaw.FData[pos] + FArrNeurons[oc].FBiasWeight;
-         FOutputRaw.FData[pos] := raw;
-         FOutput.FData[pos] := FActivationFn(raw);
-       end;
-     end;
-  end
-  else
-  begin
-    for oy := 0 to OutHMax do
-     for ox := 0 to OutWMax do
-     begin
-       outBase := FOutputRaw.GetRawPos(ox, oy);
-       for oc := 0 to MaxN do
-       begin
-         pos := outBase + oc;
-         FOutput.FData[pos] := FActivationFn(FOutputRaw.FData[pos]);
-       end;
-     end;
-  end;
+  ScatterTapProducts(FGemmRes, 0, NumBs, {TapStride}N, {NeuronStride}1);
+  ApplyBiasAndActivation();
 end;
 {$ENDIF}
 
@@ -104747,15 +104924,17 @@ var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   InW, InH, InD, OutW, OutH: integer;
-  ix, iy, id, kx, ky, oc, ox, oy: integer;
-  MaxInX, MaxInY, MaxInD, MaxN: integer;
+  ix, iy, kx, ky, oc, ox, oy: integer;
+  MaxInX, MaxInY, MaxN: integer;
   FeatYMax, FeatXMax, OutHMax, OutWMax: integer;
-  StrideX, Pad, actKind, pos, outBase, derivBase: integer;
-  lr, d, deriv, xval: TNeuralFloat;
+  StrideX, PadX, PadY, actKind, pos, outBase, derivBase: integer;
+  GroupInDepth, NeuronsPerGroup, MaxGroupPos, GroupCnt, GroupInputStart: integer;
+  FirstGroupNeuron, LastGroupNeuron: integer;
+  lr, d, deriv: TNeuralFloat;
   W, GW: TNNetVolume;
   localNeuron: TNNetNeuron;
   hasInputGrad, hasBias: boolean;
-  prevPtr, prevErrPtr: TNeuralFloatArrPtr;
+  prevPtr, prevErrPtr, GroupPrevPtr, GroupPrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -104764,16 +104943,20 @@ begin
   Prev := FPrevLayer.FOutput;
   InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
   OutW := FOutput.SizeX; OutH := FOutput.SizeY;
-  StrideX := FStride; Pad := FPadding;
-  MaxInX := InW - 1; MaxInY := InH - 1; MaxInD := InD - 1;
+  StrideX := FStride; PadX := FPadding; PadY := FPaddingY;
+  MaxInX := InW - 1; MaxInY := InH - 1;
   MaxN := FNeurons.Count - 1;
   lr := -FLearningRate;
   FeatYMax := FFeatureSizeY - 1; FeatXMax := FFeatureSizeX - 1;
   OutHMax := OutH - 1; OutWMax := OutW - 1;
+  GroupInDepth := InD div FGroups;
+  NeuronsPerGroup := FNeurons.Count div FGroups;
+  MaxGroupPos := FGroups - 1;
 
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = Prev.Size);
   PrevErr := nil;
+  prevErrPtr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
   // Activation-corrected output-error derivative, plus bias deltas in the same
@@ -104819,31 +105002,42 @@ begin
   for iy := 0 to MaxInY do
    for ky := 0 to FeatYMax do
    begin
-     oy := iy * StrideX - Pad + ky;
+     oy := iy * StrideX - PadY + ky;
      if (oy < 0) or (oy >= OutH) then continue;
      for ix := 0 to MaxInX do
       for kx := 0 to FeatXMax do
       begin
-        ox := ix * StrideX - Pad + kx;
+        ox := ix * StrideX - PadX + kx;
         if (ox < 0) or (ox >= OutW) then continue;
         // Rule #11: Prev / PrevErr depth-column ptrs and the derivative row base
         // are invariant across oc.
         prevPtr := Prev.GetRawPtr(ix, iy);
         if hasInputGrad then prevErrPtr := PrevErr.GetRawPtr(ix, iy);
         derivBase := FOutputErrorDeriv.GetRawPos(ox, oy);
-        for oc := 0 to MaxN do
+        // One pass for a dense layer; a group's neurons use its channel slice.
+        for GroupCnt := 0 to MaxGroupPos do
         begin
-          d := FOutputErrorDeriv.FData[derivBase + oc];
-          if d = 0 then continue;
-          GW := FArrNeurons[oc].FDelta;
-          W := FArrNeurons[oc].FWeights;
-          // Depth axis is contiguous: scaled SIMD MulAdd of Prev's depth
-          // column into GW's (scale lr*d), and of W's into PrevErr's (scale d).
-          TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky),
-            prevPtr, lr * d, InD);
+          GroupInputStart := GroupCnt * GroupInDepth;
+          GroupPrevPtr := TNeuralFloatArrPtr(@prevPtr^[GroupInputStart]);
+          GroupPrevErrPtr := nil;
           if hasInputGrad then
-            TNNetVolume.MulAdd(prevErrPtr,
-              W.GetRawPtr(kx, ky), d, InD);
+            GroupPrevErrPtr := TNeuralFloatArrPtr(@prevErrPtr^[GroupInputStart]);
+          FirstGroupNeuron := GroupCnt * NeuronsPerGroup;
+          LastGroupNeuron := FirstGroupNeuron + NeuronsPerGroup - 1;
+          for oc := FirstGroupNeuron to LastGroupNeuron do
+          begin
+            d := FOutputErrorDeriv.FData[derivBase + oc];
+            if d = 0 then continue;
+            GW := FArrNeurons[oc].FDelta;
+            W := FArrNeurons[oc].FWeights;
+            // Depth axis is contiguous: scaled SIMD MulAdd of Prev's group
+            // slice into GW's (scale lr*d), and of W's into PrevErr's (scale d).
+            TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky),
+              GroupPrevPtr, lr * d, GroupInDepth);
+            if hasInputGrad then
+              TNNetVolume.MulAdd(GroupPrevErrPtr,
+                W.GetRawPtr(kx, ky), d, GroupInDepth);
+          end;
         end;
       end;
    end;
@@ -104875,6 +105069,21 @@ begin
   inherited Create(pNumFeatures, pFeatureSize, pStride, pPadding, pOutputPadding, pSuppressBias);
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
+end;
+
+{ TNNetDeconvolution1D }
+constructor TNNetDeconvolution1D.Create(pNumFeatures, pFeatureSize, pStride,
+  pPadding: integer; pOutputPadding: integer = 0; pGroups: integer = 1;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pStride, pPadding,
+    pOutputPadding, pSuppressBias);
+  FPaddingY := 0;
+  FOutputPaddingY := 0;
+  FClampKernelToInputX := false;
+  FGroups := Max(pGroups, 1);
+  SetFeatureSizeXY(pFeatureSize, 1);
+  FStruct[6] := FGroups;
 end;
 
 { TNNetConcat }
@@ -108118,7 +108327,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   // A kernel only has to fit the PADDED input: a 3x3 pad-1 conv on a 1x1 input
   // keeps its 3x3 weights, as in PyTorch. A dilated kernel is never clamped.
-  if FDilationX = 1 then
+  if (FDilationX = 1) and FClampKernelToInputX then
     FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX + 2 * FPadding);
   FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPaddingY);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
@@ -108127,7 +108336,7 @@ begin
   FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
   RefreshCalculatePrevLayerError();
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureExtentX, FPadding, FStride);
-  FOutputSizeY := CalcOutputSize(pPrevLayer.Output.SizeY, FFeatureSizeY, FPaddingY, FStride);
+  FOutputSizeY := CalcOutputSizeY(pPrevLayer.Output.SizeY);
   if (FOutputSizeX < 1) or (FOutputSizeY < 1) then
     FErrorProc(ClassName + '.SetPrevLayer: the kernel spans ' +
       IntToStr(FFeatureExtentX) + 'x' + IntToStr(FFeatureSizeY) +
@@ -108156,6 +108365,11 @@ function TNNetConvolutionAbstract.CalcOutputSize(pInputSize, pFeatureSize, pInpu
   pStride: integer): integer;
 begin
   Result := ( ( pInputSize - pFeatureSize + 2*pInputPadding ) div pStride) + 1;
+end;
+
+function TNNetConvolutionAbstract.CalcOutputSizeY(pInputSizeY: integer): integer;
+begin
+  Result := CalcOutputSize(pInputSizeY, FFeatureSizeY, FPaddingY, FStride);
 end;
 
 procedure TNNetConvolution.BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer);
@@ -110992,6 +111206,7 @@ begin
   FStride := Max(pStride,1);
   FDilationX := 1;
   FFeatureExtentX := FFeatureSizeX;
+  FClampKernelToInputX := true;
   FSuppressBias := pSuppressBias;
   if FPadding > 0 then
   begin
@@ -131736,6 +131951,7 @@ begin
       'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionLinear' :  Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
+      'TNNetDeconvolution1D' :      Result := TNNetDeconvolution1D.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]);
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
@@ -132184,6 +132400,7 @@ begin
       if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionLinear' then Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
+      if S[0] = 'TNNetDeconvolution1D' then Result := TNNetDeconvolution1D.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]) else
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
