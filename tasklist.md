@@ -1526,8 +1526,47 @@ rather than acted on.
           borrowing (`EnableOpenCLInContextOf`) test for the deconv.
         - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
           deconv) for 32-multiple channel counts: one extra weight copy.
-        - per-channel Snake (`TNNetSnake` has one scalar alpha).
-        - AdaIN as InstanceNorm + per-channel scale/shift set once per utterance.
+        - [x] per-channel Snake. Done: `TNNetSnake.Create(Alpha, PerChannelAlpha=
+          true)` learns one alpha per channel in `Neurons[0].Weights` (Depth long,
+          FStruct[0] = 1; scalar files unchanged); inference forward is row-wise
+          `TNNetVolume` Mul/Sin/Mul/Mul/Add, trainable forward a scalar loop with
+          the derivative; backward has the alpha gradient (commit 9a6ec901). Loader: torch
+          `alpha1[j]` [1,C,1] -> `Weights.Raw[c]`, then `FlushWeightCache`.
+        - [x] AdaIN1d / AdaLayerNorm / channel LayerNorm, no new class. AdaIN1d =
+          `TNNetInstanceNorm` (default per-channel affine; reduces over time per
+          channel, torch InstanceNorm1d), AdaLayerNorm and TextEncoder `LayerNorm` =
+          `TNNetTokenLayerNorm(1e-5)` (commit 9a6ec901). Per utterance the HOST computes
+          [gamma; beta] = fc(s) and writes `Neurons[0].Weights[c] := (1+gamma)*w`,
+          `Neurons[1].Weights[c] := (1+gamma)*b + beta` (w/b = the norm's own affine,
+          1/0 when absent), then calls `FlushWeightCache` on the layer of the net
+          that runs (a borrowing net's layers share the owner's neurons; the
+          TokenLayerNorm re-uploads its OpenCL gamma/beta only on that flag,
+          the InstanceNorm and the per-channel Snake upload theirs every forward).
+          `TNNetGroupNorm`/`TNNetInstanceNorm` OpenCL: `cai_group_norm` is now one
+          work-group per group (local tree reduction, was one work-item per
+          group), binds a source in OpenCL memory and keeps its output there when
+          not trainable. Activations: `TNNetLeakyReLU.Create(0.2 / 0.1 / 0.01)`,
+          `TNNetHyperbolicTangent`, `TNNetSigmoid` (all OpenCL already); new
+          `cai_activation` opcodes MulConstant (`TNNetMulByConstant`, for the
+          rsqrt(2) and /3 scalings after `TNNetSum`), Snake and per-channel Snake
+          (a per-layer channel-parameter buffer on `TNNetIdentity`). Tests:
+          `TestKokoroStyleNormTorchParity`, `TestKokoroActivationTorchParity`
+          (tests/fixtures/kokoro_norm_activation_oracle.json from
+          `tools/kokoro_norm_activation_oracle.py`, the kokoro classes),
+          `TestKokoroLayersOpenCLParity` (chain stays in OpenCL memory, then a
+          host style rewrite), `TestSnakePerChannelSaveLoadRoundTrip`,
+          `TestKokoroLayersBorrowingBuild`, `TestSnakePerChannelGradientCheck`;
+          `TestActivationOpenCLParity` gained the 3 opcodes.
+        - [ ] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
+          `TNNetSin` exist on CPU only (no opcode); 22 x frames, so either
+          `TNNetSplitChannels` + those layers or a host step before the iSTFT.
+        - [ ] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
+          lives only in the test (`WriteStyleIntoChannelAffine`); move it into the
+          Kokoro loader (2.5) rather than writing a second copy.
+        - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
+          `pcr_sinf` loop; the per-channel path is vectorized.
+        - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
+          activation chain are unmeasured on a GPU (PoCL parity only).
   - [ ] 0.5 Stage-net holder for Kokoro: owner nets for stages A/B/C built once
         from the checkpoint, `PrepareNet(T)` / `PrepareNet(F)` borrowing rebuild that
         exits early when the length is unchanged, OpenCL arming as in
