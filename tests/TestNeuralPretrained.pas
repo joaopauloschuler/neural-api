@@ -42,6 +42,15 @@ type
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
+    // The hexgrad/Kokoro-82M snapshot folder (NEURAL_KOKORO82M_DIR, else the
+    // HF cache); '' when it has no voices/af_heart.pt.
+    function KokoroRealSnapshotDir(): string;
+    // TNNetKokoro over the tiny_kokoro82m fixture.
+    function CreateTinyKokoro(): TNNetKokoro;
+    // Runs stage A on the dump's input_ids / ref_s and checks every stage-A
+    // stage of the dump; Relative divides each max |diff| by max |reference|.
+    procedure CheckKokoroStageAParity(Kokoro: TNNetKokoro;
+      const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean);
     // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
     // OnOpenCL (skipped without a device).
     procedure CheckQwenImage21VaeSharedHostOutputs(OnOpenCL: boolean);
@@ -704,6 +713,17 @@ type
     // The real hexgrad/Kokoro-82M snapshot from the HF cache, ignored when
     // absent (NEURAL_KOKORO82M_DIR overrides the cache path).
     procedure TestKokoroRealSnapshotSmoke;
+    // Stage A (PL-BERT, duration encoder and head, text encoder) per stage vs
+    // tiny_kokoro82m_ref: < 1e-4, pred_dur exact; the ALBERT block is shared.
+    procedure TestKokoroStageATinyParity;
+    // Stage A at two token counts through the borrowing rebuild equals a
+    // fresh build, and the sized net sizes no weights.
+    procedure TestKokoroStageABorrowingRebuild;
+    // Stage A armed for OpenCL vs the CPU at two token counts.
+    procedure TestKokoroStageAOpenCLParity;
+    // Stage A on the real snapshot vs the real dump (~/.cache/neural-api/
+    // kokoro82m_ref, NEURAL_KOKORO82M_REF overrides); ignored when absent.
+    procedure TestKokoroRealStageAParity;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -23887,18 +23907,13 @@ begin
   AssertTrue('missing folder rejected', Failed);
 end;
 
-procedure TTestNeuralPretrained.TestKokoroRealSnapshotSmoke;
+function TTestNeuralPretrained.KokoroRealSnapshotDir(): string;
 var
-  SnapshotDir, SnapshotsDir: string;
+  SnapshotsDir: string;
   SearchRec: TSearchRec;
-  Config: TKokoroConfig;
-  Voice: TKokoroVoicePack;
-  Reader: TNNetSafeTensorsReader;
-  Values: TNNetVolume;
-  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
 begin
-  SnapshotDir := GetEnvironmentVariable('NEURAL_KOKORO82M_DIR');
-  if SnapshotDir = '' then
+  Result := GetEnvironmentVariable('NEURAL_KOKORO82M_DIR');
+  if Result = '' then
   begin
     SnapshotsDir := IncludeTrailingPathDelimiter(GetUserDir) +
       '.cache/huggingface/hub/models--hexgrad--Kokoro-82M/snapshots/';
@@ -23907,14 +23922,28 @@ begin
       repeat
         if (SearchRec.Name <> '.') and (SearchRec.Name <> '..') and
            FileExists(SnapshotsDir + SearchRec.Name + '/config.json') then
-          SnapshotDir := SnapshotsDir + SearchRec.Name;
-      until (SnapshotDir <> '') or (FindNext(SearchRec) <> 0);
+          Result := SnapshotsDir + SearchRec.Name;
+      until (Result <> '') or (FindNext(SearchRec) <> 0);
     finally
       FindClose(SearchRec);
     end;
   end;
-  if (SnapshotDir = '') or not FileExists(IncludeTrailingPathDelimiter(
-    SnapshotDir) + 'voices/af_heart.pt') then
+  if (Result <> '') and not FileExists(IncludeTrailingPathDelimiter(Result) +
+    'voices/af_heart.pt') then
+    Result := '';
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealSnapshotSmoke;
+var
+  SnapshotDir: string;
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+  Values: TNNetVolume;
+  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
+begin
+  SnapshotDir := KokoroRealSnapshotDir();
+  if SnapshotDir = '' then
     Ignore('hexgrad/Kokoro-82M snapshot with voices/af_heart.pt not found ' +
       '(set NEURAL_KOKORO82M_DIR)');
   Values := TNNetVolume.Create;
@@ -23939,6 +23968,353 @@ begin
   finally
     Reader.Free;
     Values.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.CreateTinyKokoro(): TNNetKokoro;
+var
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := OpenKokoroSnapshot(ExtractFileDir(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'config.json')), 'af_heart', Config, Voice);
+  try
+    Result := TNNetKokoro.Create(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Max |Actual - stage| over a dumped [1, T, C] or [1, T] stage (ChannelMajor:
+// [1, C, T]); -1 on a shape mismatch. ReferenceMaxAbs is max |stage|.
+function KokoroStageMaxDiff(Reference: TNNetSafeTensorsReader;
+  const StageName: string; Actual: TNNetVolume; ChannelMajor: boolean;
+  out ReferenceMaxAbs: TNeuralFloat): TNeuralFloat;
+var
+  Values: TNNetVolume;
+  TokenCount, ChannelCount, TokenPos, ChannelPos: integer;
+  ReferenceValue: TNeuralFloat;
+begin
+  Result := -1;
+  ReferenceMaxAbs := 0;
+  Values := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat(StageName, Values);
+    if Reference.DimCount(StageName) = 2 then
+    begin
+      TokenCount := Reference.DimSize(StageName, 1);
+      ChannelCount := 1;
+    end
+    else if ChannelMajor then
+    begin
+      ChannelCount := Reference.DimSize(StageName, 1);
+      TokenCount := Reference.DimSize(StageName, 2);
+    end
+    else
+    begin
+      TokenCount := Reference.DimSize(StageName, 1);
+      ChannelCount := Reference.DimSize(StageName, 2);
+    end;
+    if (Actual.SizeX <> TokenCount) or (Actual.SizeY <> 1) or
+       (Actual.Depth <> ChannelCount) then exit;
+    Result := 0;
+    for TokenPos := 0 to TokenCount - 1 do
+      for ChannelPos := 0 to ChannelCount - 1 do
+      begin
+        if ChannelMajor then
+          ReferenceValue := Values.FData[ChannelPos * TokenCount + TokenPos]
+        else
+          ReferenceValue := Values.FData[TokenPos * ChannelCount + ChannelPos];
+        ReferenceMaxAbs := Max(ReferenceMaxAbs, Abs(ReferenceValue));
+        Result := Max(Result, Abs(Actual[TokenPos, 0, ChannelPos] -
+          ReferenceValue));
+      end;
+  finally
+    Values.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStageAParity(Kokoro: TNNetKokoro;
+  const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean);
+var
+  Reference: TNNetSafeTensorsReader;
+  Values, DurationFeatures, TextFeatures, DurationSums: TNNetVolume;
+  TokenIds, Durations: TNeuralIntegerArray;
+  ProsodyStyle: TNeuralFloatDynArr;
+  Layers: TKokoroStageALayers;
+  TokenPos, StylePos, LayerPos, StyleDim: integer;
+  StartTime: TDateTime;
+
+  procedure CheckStage(const StageName: string; Actual: TNNetVolume;
+    ChannelMajor: boolean);
+  var
+    MaxDiff, ReferenceMaxAbs, Measure: TNeuralFloat;
+  begin
+    MaxDiff := KokoroStageMaxDiff(Reference, StageName, Actual, ChannelMajor,
+      ReferenceMaxAbs);
+    AssertTrue(StageName + ': shape ' + IntToStr(Actual.SizeX) + 'x' +
+      IntToStr(Actual.SizeY) + 'x' + IntToStr(Actual.Depth) + ' vs ' +
+      Reference.ShapeAsString(StageName), MaxDiff >= 0);
+    Measure := MaxDiff;
+    if Relative then Measure := MaxDiff / Max(ReferenceMaxAbs, 1e-30);
+    WriteLn('  Kokoro ', StageName, ': max |diff| = ', MaxDiff:0:9,
+      ' (max |ref| = ', ReferenceMaxAbs:0:4, ')');
+    AssertTrue(StageName + ': max |diff| = ' + FloatToStr(MaxDiff) +
+      ', max |ref| = ' + FloatToStr(ReferenceMaxAbs), Measure < Tolerance);
+  end;
+
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  Values := TNNetVolume.Create;
+  DurationFeatures := TNNetVolume.Create;
+  TextFeatures := TNNetVolume.Create;
+  DurationSums := TNNetVolume.Create;
+  try
+    Reference.LoadTensorFlat('input_ids', Values);
+    SetLength(TokenIds, Values.Size);
+    for TokenPos := 0 to Values.Size - 1 do
+      TokenIds[TokenPos] := Round(Values.FData[TokenPos]);
+    // ref_s = [decoder style | prosody style].
+    Reference.LoadTensorFlat('ref_s', Values);
+    StyleDim := Kokoro.Config.StyleDim;
+    AssertEquals('ref_s width', 2 * StyleDim, Values.Size);
+    SetLength(ProsodyStyle, StyleDim);
+    for StylePos := 0 to StyleDim - 1 do
+      ProsodyStyle[StylePos] := Values.FData[StyleDim + StylePos];
+    Kokoro.ShareHostOutputs := false;
+    StartTime := Now();
+    Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
+      TextFeatures, Durations);
+    WriteLn('  Kokoro stage A, ', Length(TokenIds), ' tokens: ',
+      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms (build + forward)');
+    Layers := Kokoro.StageALayers;
+    CheckStage('bert_embeddings', Layers.BertEmbeddings.Output, false);
+    CheckStage('bert_hidden_in', Layers.BertHiddenIn.Output, false);
+    for LayerPos := 0 to High(Layers.BertBlocks) do
+      CheckStage('bert_layer' + IntToStr(LayerPos),
+        Layers.BertBlocks[LayerPos].Output, false);
+    CheckStage('bert', Layers.BertBlocks[High(Layers.BertBlocks)].Output,
+      false);
+    CheckStage('d_en', Layers.BertEncoder.Output, true);
+    for LayerPos := 0 to High(Layers.DurationNorms) do
+      CheckStage('dur_enc_adanorm' + IntToStr(LayerPos),
+        Layers.DurationNorms[LayerPos].Output, false);
+    CheckStage('d', Layers.DurationEncoder.Output, false);
+    CheckStage('d', DurationFeatures, false);
+    CheckStage('duration_lstm', Layers.DurationLSTM.Output, false);
+    CheckStage('duration_logits', Layers.DurationProj.Output, false);
+    // duration is [1, T]: one channel over T tokens.
+    DurationSums.ReSize(Length(TokenIds), 1, 1);
+    for TokenPos := 0 to High(TokenIds) do
+      DurationSums.FData[TokenPos] := TNNetVolume.Sum(
+        Layers.DurationSigmoid.Output.GetRawPtr(TokenPos, 0),
+        Kokoro.Config.MaxDur);
+    CheckStage('duration', DurationSums, false);
+    Reference.LoadTensorFlat('pred_dur', Values);
+    AssertEquals('pred_dur count', Values.Size, Length(Durations));
+    for TokenPos := 0 to High(Durations) do
+      AssertEquals('pred_dur[' + IntToStr(TokenPos) + ']',
+        Round(Values.FData[TokenPos]), Durations[TokenPos]);
+    CheckStage('text_embedding', Layers.TextEmbedding.Output, false);
+    for LayerPos := 0 to High(Layers.TextBlocks) do
+      CheckStage('text_cnn' + IntToStr(LayerPos),
+        Layers.TextBlocks[LayerPos].Output, true);
+    CheckStage('t_en', Layers.TextLSTM.Output, true);
+    CheckStage('t_en', TextFeatures, true);
+  finally
+    DurationSums.Free;
+    TextFeatures.Free;
+    DurationFeatures.Free;
+    Values.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageATinyParity;
+var
+  Kokoro: TNNetKokoro;
+  Layers: TKokoroStageALayers;
+begin
+  Kokoro := CreateTinyKokoro();
+  try
+    CheckKokoroStageAParity(Kokoro, FixturePath('tiny_kokoro82m_ref.safetensors'),
+      1e-4, {Relative=}false);
+    // One shared ALBERT block: every repeat reads block 0's neurons.
+    Layers := Kokoro.StageALayers;
+    AssertEquals('ALBERT repeats', 3, Length(Layers.BertBlocks));
+    AssertTrue('repeat 2 shares block 0 gamma',
+      Layers.BertBlocks[2].Neurons[0].Weights =
+      Layers.BertBlocks[0].Neurons[0].Weights);
+  finally
+    Kokoro.Free;
+  end;
+end;
+
+// Runs stage A on Ids with a synthetic prosody style (StylePhase picks it).
+procedure RunTinyKokoroStageA(Kokoro: TNNetKokoro; const Ids: array of integer;
+  DurationFeatures, TextFeatures: TNNetVolume;
+  out Durations: TNeuralIntegerArray; StylePhase: TNeuralFloat = 0.2);
+var
+  ProsodyStyle: TNeuralFloatDynArr;
+  StylePos: integer;
+begin
+  SetLength(ProsodyStyle, Kokoro.Config.StyleDim);
+  for StylePos := 0 to High(ProsodyStyle) do
+    ProsodyStyle[StylePos] := 0.3 * Sin(StylePos * 0.9 + StylePhase);
+  Kokoro.RunStageA(Ids, ProsodyStyle, 1.0, DurationFeatures, TextFeatures,
+    Durations);
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageABorrowingRebuild;
+const
+  LongIds: array[0..5] of integer = (0, 50, 156, 31, 4, 0);
+  ShortIds: array[0..3] of integer = (0, 43, 54, 0);
+var
+  Kokoro, FreshKokoro: TNNetKokoro;
+  LongD, LongT, ShortD, ShortT, AgainD, AgainT, FreshD, FreshT: TNNetVolume;
+  LongDurations, ShortDurations, AgainDurations, FreshDurations: TNeuralIntegerArray;
+  TokenPos: integer;
+begin
+  Kokoro := CreateTinyKokoro();
+  FreshKokoro := CreateTinyKokoro();
+  LongD := TNNetVolume.Create; LongT := TNNetVolume.Create;
+  ShortD := TNNetVolume.Create; ShortT := TNNetVolume.Create;
+  AgainD := TNNetVolume.Create; AgainT := TNNetVolume.Create;
+  FreshD := TNNetVolume.Create; FreshT := TNNetVolume.Create;
+  try
+    RunTinyKokoroStageA(Kokoro, LongIds, LongD, LongT, LongDurations);
+    // Only the three TNNetEmbedding tables: they size in the constructor,
+    // before the net is known, and the link frees them.
+    AssertEquals('borrowing net sizes only the embedding tables',
+      (Kokoro.Config.NumTokens + 2) * Kokoro.Config.PLBert.EmbeddingSize +
+      Kokoro.Config.NumTokens * Kokoro.Config.HiddenDim,
+      Kokoro.StageANet.WeightElementsSized());
+    RunTinyKokoroStageA(Kokoro, ShortIds, ShortD, ShortT, ShortDurations);
+    AssertEquals('short net is 4 tokens', 4,
+      Kokoro.StageANet.Layers[0].Output.SizeX);
+    RunTinyKokoroStageA(FreshKokoro, ShortIds, FreshD, FreshT, FreshDurations);
+    AssertEquals('short d vs fresh build', 0, MaxAbsVolumeDiff(ShortD, FreshD), 1e-6);
+    AssertEquals('short t_en vs fresh build', 0, MaxAbsVolumeDiff(ShortT, FreshT), 1e-6);
+    for TokenPos := 0 to High(ShortIds) do
+      AssertEquals('short durations', FreshDurations[TokenPos],
+        ShortDurations[TokenPos]);
+    RunTinyKokoroStageA(Kokoro, LongIds, AgainD, AgainT, AgainDurations);
+    AssertEquals('long d after a rebuild', 0, MaxAbsVolumeDiff(LongD, AgainD), 1e-6);
+    AssertEquals('long t_en after a rebuild', 0, MaxAbsVolumeDiff(LongT, AgainT), 1e-6);
+    for TokenPos := 0 to High(LongIds) do
+      AssertEquals('long durations', LongDurations[TokenPos],
+        AgainDurations[TokenPos]);
+  finally
+    LongD.Free; LongT.Free; ShortD.Free; ShortT.Free;
+    AgainD.Free; AgainT.Free; FreshD.Free; FreshT.Free;
+    FreshKokoro.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageAOpenCLParity;
+{$IFDEF OpenCL}
+const
+  LongIds: array[0..5] of integer = (0, 50, 156, 31, 4, 0);
+  ShortIds: array[0..3] of integer = (0, 43, 54, 0);
+var
+  CPUKokoro, CLKokoro: TNNetKokoro;
+  CPUD, CPUT, CLD, CLT: TNNetVolume;
+  CPUDurations, CLDurations: TNeuralIntegerArray;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  RunPos, TokenPos, LayerPos, MaxLayerPos, OpenCLLayerCount: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  CPUKokoro := CreateTinyKokoro();
+  CLKokoro := CreateTinyKokoro();
+  CPUD := TNNetVolume.Create; CPUT := TNNetVolume.Create;
+  CLD := TNNetVolume.Create; CLT := TNNetVolume.Create;
+  try
+    AssertTrue('OpenCL program builds',
+      CLKokoro.EnableOpenCL(PlatformId, DeviceId));
+    // Run 0 as production arms it; runs 1 and 2 force every layer onto
+    // OpenCL, and run 2 rewrites the AdaLayerNorm style on the same net.
+    for RunPos := 0 to 2 do
+    begin
+      if RunPos = 0 then
+      begin
+        RunTinyKokoroStageA(CPUKokoro, LongIds, CPUD, CPUT, CPUDurations);
+        RunTinyKokoroStageA(CLKokoro, LongIds, CLD, CLT, CLDurations);
+      end
+      else
+      begin
+        CLKokoro.PrepareStageA(Length(ShortIds));
+        CLKokoro.StageANet.ForceOpenCL(true);
+        RunTinyKokoroStageA(CPUKokoro, ShortIds, CPUD, CPUT, CPUDurations,
+          0.2 + RunPos);
+        RunTinyKokoroStageA(CLKokoro, ShortIds, CLD, CLT, CLDurations,
+          0.2 + RunPos);
+      end;
+      AssertTrue('owner armed', CLKokoro.StageAOwnerOnOpenCL);
+      OpenCLLayerCount := 0;
+      MaxLayerPos := CLKokoro.StageANet.GetLastLayerIdx();
+      for LayerPos := 0 to MaxLayerPos do
+        if CLKokoro.StageANet.Layers[LayerPos].ForwardGPUCnt > 0 then
+          Inc(OpenCLLayerCount);
+      WriteLn('  Kokoro stage A OpenCL run ', RunPos, ': ', OpenCLLayerCount,
+        ' of ', MaxLayerPos + 1, ' layers on OpenCL, max |diff| d = ',
+        MaxAbsVolumeDiff(CPUD, CLD):0:9, ', t_en = ',
+        MaxAbsVolumeDiff(CPUT, CLT):0:9);
+      AssertTrue('layers on OpenCL in run ' + IntToStr(RunPos),
+        OpenCLLayerCount > 0);
+      AssertTrue('d OpenCL vs CPU run ' + IntToStr(RunPos),
+        MaxAbsVolumeDiff(CPUD, CLD) < 1e-4);
+      AssertTrue('t_en OpenCL vs CPU run ' + IntToStr(RunPos),
+        MaxAbsVolumeDiff(CPUT, CLT) < 1e-4);
+      for TokenPos := 0 to High(CPUDurations) do
+        AssertEquals('durations run ' + IntToStr(RunPos),
+          CPUDurations[TokenPos], CLDurations[TokenPos]);
+    end;
+  finally
+    CPUD.Free; CPUT.Free; CLD.Free; CLT.Free;
+    CLKokoro.Free;
+    CPUKokoro.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestKokoroRealStageAParity;
+var
+  SnapshotDir, ReferenceFile: string;
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+  Kokoro: TNNetKokoro;
+begin
+  SnapshotDir := KokoroRealSnapshotDir();
+  ReferenceFile := GetEnvironmentVariable('NEURAL_KOKORO82M_REF');
+  if ReferenceFile = '' then
+    ReferenceFile := IncludeTrailingPathDelimiter(GetUserDir) +
+      '.cache/neural-api/kokoro82m_ref/kokoro82m_ref.safetensors';
+  if (SnapshotDir = '') or not FileExists(ReferenceFile) then
+    Ignore('hexgrad/Kokoro-82M snapshot or ' + ReferenceFile + ' not found ' +
+      '(tools/make_kokoro82m_fixture.py real; NEURAL_KOKORO82M_DIR, ' +
+      'NEURAL_KOKORO82M_REF)');
+  Reader := OpenKokoroSnapshot(SnapshotDir, 'af_heart', Config, Voice);
+  try
+    Kokoro := TNNetKokoro.Create(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+  try
+    CheckKokoroStageAParity(Kokoro, ReferenceFile, 1e-4, {Relative=}true);
+  finally
+    Kokoro.Free;
   end;
 end;
 

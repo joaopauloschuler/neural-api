@@ -6,7 +6,8 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
-  neuralnetwork, neuralvolume, neuralabfun, neuraldecode, neuralthread
+  neuralnetwork, neuralvolume, neuralabfun, neuraldecode, neuralthread,
+  neuralpretrained
   {$IFDEF OpenCL}
   , cl, ctypes, neuralopencl
   {$ENDIF}
@@ -66497,47 +66498,53 @@ begin
         Values.Arrays[ChannelPos].Floats[TimePos]));
 end;
 
-// The per-utterance host step of AdaIN1d / AdaLayerNorm: [gamma; beta] =
-// fc(style), written into the norm layer's per-channel gamma (FNeurons[0]) and
-// beta (FNeurons[1]) as (1+gamma)*w and (1+gamma)*b + beta, where w/b are the
-// norm's own affine (nil = identity).
+// Converts the oracle's JSON arrays and calls the library
+// WriteStyleIntoChannelAffine (neuralpretrained).
 procedure WriteStyleIntoChannelAffine(NormLayer: TNNetLayer;
   FcWeight, FcBias, Style: TJSONArray; NormWeight: TJSONArray = nil;
   NormBias: TJSONArray = nil);
 var
-  ChannelCount, ChannelPos, MaxChannelPos, MaxStylePos: integer;
-  Gamma, Beta, Scale, Shift: TNeuralFloat;
+  FcWeightVolume, FcBiasVolume, NormWeightVolume, NormBiasVolume: TNNetVolume;
+  StyleValues: TNeuralFloatDynArr;
+  RowPos, ColumnPos, MaxRowPos, MaxColumnPos: integer;
 
-  function FcRow(RowPos: integer): TNeuralFloat;
+  function VolumeFromArray(Values: TJSONArray): TNNetVolume;
   var
-    StylePos: integer;
+    ValuePos: integer;
   begin
-    Result := FcBias.Floats[RowPos];
-    for StylePos := 0 to MaxStylePos do
-      Result := Result + FcWeight.Arrays[RowPos].Floats[StylePos] *
-        Style.Floats[StylePos];
+    Result := TNNetVolume.Create(Values.Count, 1, 1);
+    for ValuePos := 0 to Values.Count - 1 do
+      Result.Raw[ValuePos] := Values.Floats[ValuePos];
   end;
 
 begin
-  ChannelCount := FcBias.Count div 2;
-  MaxChannelPos := ChannelCount - 1;
-  MaxStylePos := Style.Count - 1;
-  for ChannelPos := 0 to MaxChannelPos do
-  begin
-    Gamma := FcRow(ChannelPos);
-    Beta := FcRow(ChannelCount + ChannelPos);
-    Scale := 1 + Gamma;
-    Shift := Beta;
+  MaxRowPos := FcWeight.Count - 1;
+  MaxColumnPos := Style.Count - 1;
+  FcWeightVolume := TNNetVolume.Create(FcWeight.Count * Style.Count, 1, 1);
+  FcBiasVolume := VolumeFromArray(FcBias);
+  NormWeightVolume := nil;
+  NormBiasVolume := nil;
+  try
+    for RowPos := 0 to MaxRowPos do
+      for ColumnPos := 0 to MaxColumnPos do
+        FcWeightVolume.Raw[RowPos * Style.Count + ColumnPos] :=
+          FcWeight.Arrays[RowPos].Floats[ColumnPos];
+    SetLength(StyleValues, Style.Count);
+    for ColumnPos := 0 to MaxColumnPos do
+      StyleValues[ColumnPos] := Style.Floats[ColumnPos];
     if Assigned(NormWeight) then
     begin
-      Shift := Scale * NormBias.Floats[ChannelPos] + Beta;
-      Scale := Scale * NormWeight.Floats[ChannelPos];
+      NormWeightVolume := VolumeFromArray(NormWeight);
+      NormBiasVolume := VolumeFromArray(NormBias);
     end;
-    NormLayer.Neurons[0].Weights.Raw[ChannelPos] := Scale;
-    NormLayer.Neurons[1].Weights.Raw[ChannelPos] := Shift;
+    neuralpretrained.WriteStyleIntoChannelAffine(NormLayer, FcWeightVolume,
+      FcBiasVolume, StyleValues, NormWeightVolume, NormBiasVolume);
+  finally
+    FcWeightVolume.Free;
+    FcBiasVolume.Free;
+    NormWeightVolume.Free;
+    NormBiasVolume.Free;
   end;
-  // A norm that keeps its gamma/beta in OpenCL memory re-uploads on this.
-  NormLayer.FlushWeightCache();
 end;
 
 procedure TTestNeuralNumerical.TestKokoroStyleNormTorchParity;
