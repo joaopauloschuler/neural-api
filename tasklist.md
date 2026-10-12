@@ -1472,10 +1472,28 @@ rather than acted on.
         not clamp a kernel (Deconvolution K20 p5 needs input >= 10). OpenCL arming
         per rebuild not measured (no GPU here).
   - [ ] 0.4 Layers for the `TNNet` route:
-        - dilated 1D conv: REUSE `TNNetTDNNConv1D` (centred SAME padding = torch
-          `get_padding` for odd K, dilation). Gaps: no OpenCL path, and `Compute` is
-          one `DotProduct` per (channel, position, tap) on one thread. This is where
-          ~90% of the generator's work lands.
+        - [x] dilated / strided 1D conv (torch Conv1d geometry). Done: new
+          `TNNetConvolution1D` (a `TNNetConvolutionLinear` with a Kx1 kernel,
+          X-only padding, dilation along X) instead of extending `TNNetTDNNConv1D`:
+          `TNNetConvolutionAbstract` gained `FPaddingY`/`FDilationX`, the CPU im2col
+          (FP32 and int8), `BackpropagateFastTiledCPU`, `cai_im2col` and the implicit
+          GEMM honour them, so the tiled/threaded CPU and both OpenCL forwards serve
+          every Kokoro geometry (commit 2ff0b5d4). Tests: `TestConvolution1D{TorchParity,OpenCLParity,
+          SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
+          `tests/fixtures/conv1d_oracle.json` (`tools/conv1d_oracle.py`, torch).
+          CPU, 256 ch k7 d3 L=2000: old TDNN 304-335 ms, new 260-266 ms serial,
+          161-189 ms threaded (4 vCPU VM).
+        - [ ] `ShouldUseInterleavedDotProduct` picks `InterleavedDotProduct` for
+          every conv with a multiple of 32 neurons; on 1D convs it is slower than
+          `DotProductsTiled`: same conv at 250 ch (tiled) 199 ms serial / 89 ms
+          threaded vs 256 ch (interleaved) 260 / 161-189 ms. Kokoro's 128/256/512
+          channel convs all take the interleaved path. Measure on 2D convs too
+          before changing the heuristic.
+        - [ ] OpenCL weight borrowing (`BuildWeightOwner` + `EnableOpenCLInContextOf`)
+          is not tested for `TNNetConvolution1D` (the CPU borrowing build is).
+        - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
+          `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
+          `FDilationX`; only `BackpropagateFastTiledCPU` is called.
         - transposed 1D conv: EXTEND `TNNetDeconvolution` (torch ConvTranspose2d
           geometry, OpenCL scatter GEMM). Gap: square kernel, padding and
           output_padding apply to BOTH axes. On a (SeqLen,1,C) input the generator
