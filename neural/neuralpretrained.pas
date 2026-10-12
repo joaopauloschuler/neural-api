@@ -5023,9 +5023,9 @@ type
   THiFiGANConfig = record
     ModelInDim: integer;          // model_in_dim (n_mels)
     UpsampleInitialChannel: integer; // upsample_initial_channel
-    UpsampleRates: array of integer; // upsample_rates
-    UpsampleKernelSizes: array of integer; // upsample_kernel_sizes
-    ResblockKernelSizes: array of integer; // resblock_kernel_sizes
+    UpsampleRates: TNeuralIntegerArray; // upsample_rates
+    UpsampleKernelSizes: TNeuralIntegerArray; // upsample_kernel_sizes
+    ResblockKernelSizes: TNeuralIntegerArray; // resblock_kernel_sizes
     ResblockDilationSizes: TIntArray2D;    // resblock_dilation_sizes[r][j]
     LeakyReluSlope: TNeuralFloat;  // leaky_relu_slope (0.1)
     NormalizeBefore: boolean;      // normalize_before (SpeechT5 mean/scale)
@@ -5362,6 +5362,102 @@ function BuildVitsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
 function BuildVitsFromSafeTensors(const FileName: string;
   out Config: TVitsConfig;
   const ConfigFileName: string = ''): TNNetVits;
+
+// ---------------------------------------------------------------------------
+// KOKORO-82M LOADING (hexgrad/Kokoro-82M, Apache-2.0; StyleTTS2 + iSTFTNet).
+// Reads the HF snapshot folder: config.json, kokoro-v1_0.pth (a torch zip
+// whose root is a dict of the five state dicts bert, bert_encoder,
+// predictor, text_encoder and decoder, keys prefixed "module.") and
+// voices/<name>.pt (a bare tensor [rows, 1, 2*style_dim]). The forward pass
+// is not implemented yet. Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+const
+  KokoroSampleRate = 24000;
+  // The five state dicts of kokoro-v1_0.pth; OpenKokoroCheckpoint exposes
+  // their tensors as '<component>.<name>' (the 'module.' level removed).
+  KokoroComponentNames: array[0..4] of string =
+    ('bert', 'bert_encoder', 'predictor', 'text_encoder', 'decoder');
+
+type
+  // config.json "plbert": the ALBERT text encoder.
+  TKokoroPLBertConfig = record
+    HiddenSize: integer;            // hidden_size
+    NumAttentionHeads: integer;     // num_attention_heads
+    IntermediateSize: integer;      // intermediate_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    NumHiddenLayers: integer;       // num_hidden_layers
+    EmbeddingSize: integer;         // embedding_size (128 when absent)
+  end;
+
+  TKokoroConfig = record
+    PLBert: TKokoroPLBertConfig;
+    // config.json "istftnet": upsample / resblock fields; ModelInDim is the
+    // generator input width, set by ReadKokoroWidthsFromWeights.
+    Generator: THiFiGANConfig;
+    ISTFTNFFT: integer;             // istftnet.gen_istft_n_fft
+    ISTFTHopSize: integer;          // istftnet.gen_istft_hop_size
+    DimIn: integer;                 // dim_in
+    HiddenDim: integer;             // hidden_dim
+    MaxConvDim: integer;            // max_conv_dim
+    MaxDur: integer;                // max_dur
+    NumLayers: integer;             // n_layer
+    NumMels: integer;               // n_mels
+    NumTokens: integer;             // n_token
+    StyleDim: integer;              // style_dim (each half of a voice row)
+    TextEncoderKernelSize: integer; // text_encoder_kernel_size
+    // vocab: one Unicode code point per symbol, sorted by code point.
+    VocabCodePoints: array of cardinal;
+    VocabIds: TNeuralIntegerArray;
+    // Widths absent from config.json, set by ReadKokoroWidthsFromWeights
+    // (real checkpoint: 1024, 1090, 512, 64, 4 blocks).
+    DecoderWidth: integer;          // decoder.encode output channels
+    DecoderBlockInputWidth: integer; // decoder.decode.* input channels
+    DecoderOutputWidth: integer;    // last decoder.decode block output
+    AsrResWidth: integer;           // decoder.asr_res output channels
+    DecoderBlockCount: integer;     // number of decoder.decode blocks
+  end;
+
+  // A voice pack voices/<name>.pt: row r is the reference style for an
+  // utterance of r+1 phonemes; Values is [RowCount, 2*StyleDim] row-major.
+  TKokoroVoicePack = record
+    Name: string;
+    RowCount: integer;
+    StyleDim: integer;
+    Values: TNeuralFloatDynArr;
+  end;
+
+// Reads a Kokoro config.json; vocab keys may be raw UTF-8 or \u escapes.
+function ReadKokoroConfigFromJSONFile(const FileName: string): TKokoroConfig;
+
+// Maps a phoneme string to ids per code point, wrapped as [0, ..., 0].
+// Symbols outside the vocab are skipped and returned in SkippedSymbols.
+function KokoroPhonemesToIds(const Config: TKokoroConfig;
+  const Phonemes: string; out SkippedSymbols: string): TNeuralIntegerArray;
+
+// Opens kokoro-v1_0.pth (caller owns the reader) and renames each
+// '<component>.module.<name>' tensor to '<component>.<name>'.
+function OpenKokoroCheckpoint(const FileName: string): TNNetSafeTensorsReader;
+
+// Sets the decoder widths of Config from the weight shapes in Reader (an
+// OpenKokoroCheckpoint reader) and checks them against config.json.
+procedure ReadKokoroWidthsFromWeights(Reader: TNNetSafeTensorsReader;
+  var Config: TKokoroConfig);
+
+// Loads a voice pack (a .pt file whose root is a bare tensor
+// [rows, 1, 2*StyleDim]).
+function LoadKokoroVoicePack(const FileName: string;
+  StyleDim: integer): TKokoroVoicePack;
+
+// Splits row PhonemeCount-1 (kokoro's pack[len(ps)-1]; PhonemeCount counts
+// code points) into the decoder half and the prosody half.
+procedure SelectKokoroVoiceStyle(const Pack: TKokoroVoicePack;
+  PhonemeCount: integer; out DecoderStyle, ProsodyStyle: TNeuralFloatDynArr);
+
+// Opens a snapshot folder: config.json, the single *.pth and
+// voices/<VoiceName>.pt. Returns the checkpoint reader (caller-owned).
+function OpenKokoroSnapshot(const SnapshotDir, VoiceName: string;
+  out Config: TKokoroConfig;
+  out Voice: TKokoroVoicePack): TNNetSafeTensorsReader;
 
 // ---------------------------------------------------------------------------
 // F5-TTS FLOW-MATCHING TEXT-TO-SPEECH IMPORT (SWivid/F5-TTS; Chen et al. 2024,
@@ -47353,15 +47449,83 @@ end;
 
 // ============================ HIFI-GAN VOCODER IMPORT ======================
 
+// Reads the HiFi-GAN generator fields upsample_initial_channel,
+// upsample_rates, upsample_kernel_sizes, resblock_kernel_sizes and
+// resblock_dilation_sizes from Obj into Config; ErrorPrefix names the source.
+procedure ReadHiFiGANGeneratorFields(Obj: TJSONObject;
+  const ErrorPrefix: string; var Config: THiFiGANConfig);
+var
+  Outer, Inner: TJSONArray;
+  k, j, MaxOuterPos, MaxInnerPos: integer;
+
+  function RequiredArray(const FieldName: string): TJSONArray;
+  begin
+    if not (Obj.Find(FieldName) is TJSONArray) then
+      ImportError(ErrorPrefix + ': field "' + FieldName +
+        '" is missing or not an array.');
+    Result := TJSONArray(Obj.Find(FieldName));
+    if Result.Count < 1 then
+      ImportError(ErrorPrefix + ': field "' + FieldName +
+        '" must be non-empty.');
+  end;
+
+  procedure ReadIntArray(const FieldName: string; ExpectedCount: integer;
+    var Dst: TNeuralIntegerArray);
+  var
+    i, MaxPos: integer;
+  begin
+    Outer := RequiredArray(FieldName);
+    if (ExpectedCount > 0) and (Outer.Count <> ExpectedCount) then
+      ImportError(ErrorPrefix + ': field "' + FieldName + '" must have ' +
+        IntToStr(ExpectedCount) + ' entries, got ' + IntToStr(Outer.Count) +
+        '.');
+    SetLength(Dst, Outer.Count);
+    MaxPos := Outer.Count - 1;
+    for i := 0 to MaxPos do
+    begin
+      Dst[i] := Outer.Items[i].AsInteger;
+      if Dst[i] <= 0 then
+        ImportError(ErrorPrefix + ': ' + FieldName + '[' + IntToStr(i) +
+          '] must be positive.');
+    end;
+  end;
+
+begin
+  Config.UpsampleInitialChannel := Obj.Get('upsample_initial_channel', 0);
+  if Config.UpsampleInitialChannel <= 0 then
+    ImportError(ErrorPrefix + ': field "upsample_initial_channel" is ' +
+      'missing or not a positive integer.');
+  ReadIntArray('upsample_rates', 0, Config.UpsampleRates);
+  ReadIntArray('upsample_kernel_sizes', Length(Config.UpsampleRates),
+    Config.UpsampleKernelSizes);
+  ReadIntArray('resblock_kernel_sizes', 0, Config.ResblockKernelSizes);
+  Outer := RequiredArray('resblock_dilation_sizes');
+  if Outer.Count <> Length(Config.ResblockKernelSizes) then
+    ImportError(ErrorPrefix + ': resblock_dilation_sizes must have the ' +
+      'same length as resblock_kernel_sizes (' +
+      IntToStr(Length(Config.ResblockKernelSizes)) + '), got ' +
+      IntToStr(Outer.Count) + '.');
+  SetLength(Config.ResblockDilationSizes, Outer.Count);
+  MaxOuterPos := Outer.Count - 1;
+  for k := 0 to MaxOuterPos do
+  begin
+    if not (Outer.Items[k] is TJSONArray) then
+      ImportError(ErrorPrefix + ': resblock_dilation_sizes[' + IntToStr(k) +
+        '] must be an array.');
+    Inner := TJSONArray(Outer.Items[k]);
+    SetLength(Config.ResblockDilationSizes[k], Inner.Count);
+    MaxInnerPos := Inner.Count - 1;
+    for j := 0 to MaxInnerPos do
+      Config.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
+  end;
+end;
+
 function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
 var
-  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType, ResType: string;
-  Arr, Inner: TJSONArray;
-  k, j: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -47372,28 +47536,6 @@ var
     if Result <= 0 then
       ImportError('HiFi-GAN import: config field "' + FieldName +
         '" must be a positive integer.');
-  end;
-
-  // Reads a required non-empty JSON int array into Dst (length inferred).
-  procedure RequiredIntArray(const FieldName: string;
-    var Dst: array of integer);
-  var
-    A: TJSONArray;
-    i: integer;
-  begin
-    if Obj.IndexOfName(FieldName) < 0 then
-      ImportError('HiFi-GAN import: config "' + FileName +
-        '" is missing the required field "' + FieldName + '".');
-    if not (Obj.Find(FieldName) is TJSONArray) then
-      ImportError('HiFi-GAN import: config field "' + FieldName +
-        '" must be an array.');
-    A := TJSONArray(Obj.Find(FieldName));
-    if A.Count <> Length(Dst) then
-      ImportError('HiFi-GAN import: config field "' + FieldName +
-        '" must have ' + IntToStr(Length(Dst)) + ' entries, got ' +
-        IntToStr(A.Count) + '.');
-    LpMax := A.Count - 1;
-    for i := 0 to LpMax do Dst[i] := A.Items[i].AsInteger;
   end;
 
 begin
@@ -47436,69 +47578,8 @@ begin
         '" is not supported - only types "1" and "2" are implemented.');
 
     Result.ModelInDim := RequiredInt('model_in_dim');
-    Result.UpsampleInitialChannel := RequiredInt('upsample_initial_channel');
-
-    // upsample_rates is the spine: upsample_kernel_sizes must match its length.
-    if Obj.IndexOfName('upsample_rates') < 0 then
-      ImportError('HiFi-GAN import: config "' + FileName +
-        '" is missing the required field "upsample_rates".');
-    if not (Obj.Find('upsample_rates') is TJSONArray) then
-      ImportError('HiFi-GAN import: "upsample_rates" must be an array.');
-    Arr := TJSONArray(Obj.Find('upsample_rates'));
-    if Arr.Count < 1 then
-      ImportError('HiFi-GAN import: upsample_rates must be non-empty.');
-    SetLength(Result.UpsampleRates, Arr.Count);
-    SetLength(Result.UpsampleKernelSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-    begin
-      Result.UpsampleRates[k] := Arr.Items[k].AsInteger;
-      if Result.UpsampleRates[k] <= 0 then
-        ImportError('HiFi-GAN import: upsample_rates[' + IntToStr(k) +
-          '] must be positive.');
-    end;
-    RequiredIntArray('upsample_kernel_sizes', Result.UpsampleKernelSizes);
-
-    // resblock_kernel_sizes is the MRF spine; resblock_dilation_sizes is a
-    // matching array-of-arrays.
-    if Obj.IndexOfName('resblock_kernel_sizes') < 0 then
-      ImportError('HiFi-GAN import: config "' + FileName +
-        '" is missing the required field "resblock_kernel_sizes".');
-    if not (Obj.Find('resblock_kernel_sizes') is TJSONArray) then
-      ImportError('HiFi-GAN import: "resblock_kernel_sizes" must be an array.');
-    Arr := TJSONArray(Obj.Find('resblock_kernel_sizes'));
-    if Arr.Count < 1 then
-      ImportError('HiFi-GAN import: resblock_kernel_sizes must be non-empty.');
-    SetLength(Result.ResblockKernelSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-      Result.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
-
-    if Obj.IndexOfName('resblock_dilation_sizes') < 0 then
-      ImportError('HiFi-GAN import: config "' + FileName +
-        '" is missing the required field "resblock_dilation_sizes".');
-    if not (Obj.Find('resblock_dilation_sizes') is TJSONArray) then
-      ImportError('HiFi-GAN import: "resblock_dilation_sizes" must be ' +
-        'an array of arrays.');
-    Arr := TJSONArray(Obj.Find('resblock_dilation_sizes'));
-    if Arr.Count <> Length(Result.ResblockKernelSizes) then
-      ImportError('HiFi-GAN import: resblock_dilation_sizes must have the ' +
-        'same length as resblock_kernel_sizes (' +
-        IntToStr(Length(Result.ResblockKernelSizes)) + '), got ' +
-        IntToStr(Arr.Count) + '.');
-    SetLength(Result.ResblockDilationSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-    begin
-      if not (Arr.Items[k] is TJSONArray) then
-        ImportError('HiFi-GAN import: resblock_dilation_sizes[' +
-          IntToStr(k) + '] must be an array.');
-      Inner := TJSONArray(Arr.Items[k]);
-      SetLength(Result.ResblockDilationSizes[k], Inner.Count);
-      LpMax := Inner.Count - 1;
-      for j := 0 to LpMax do
-        Result.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
-    end;
+    ReadHiFiGANGeneratorFields(Obj, 'HiFi-GAN import: config "' + FileName +
+      '"', Result);
 
     Result.LeakyReluSlope := Obj.Get('leaky_relu_slope', 0.1);
     Result.NormalizeBefore := Obj.Get('normalize_before', False);
@@ -50018,13 +50099,10 @@ end;
 
 function ReadVitsConfigFromJSONFile(const FileName: string): TVitsConfig;
 var
-  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
-  ModelType, ResType: string;
-  Arr, Inner: TJSONArray;
-  k, j: integer;
+  ModelType: string;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -50105,48 +50183,8 @@ begin
     // the top level of a VitsConfig).
     Result.Decoder.ModelType := 'hifigan';
     Result.Decoder.ModelInDim := Result.FlowSize;   // decoder conv_pre in = flow
-    Result.Decoder.UpsampleInitialChannel :=
-      RequiredInt('upsample_initial_channel');
-    ResType := '1';
-    if ResType <> '1' then ;
-
-    if not (Obj.Find('upsample_rates') is TJSONArray) then
-      ImportError('VITS import: "upsample_rates" must be an array.');
-    Arr := TJSONArray(Obj.Find('upsample_rates'));
-    SetLength(Result.Decoder.UpsampleRates, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-      Result.Decoder.UpsampleRates[k] := Arr.Items[k].AsInteger;
-
-    if not (Obj.Find('upsample_kernel_sizes') is TJSONArray) then
-      ImportError('VITS import: "upsample_kernel_sizes" must be an array.');
-    Arr := TJSONArray(Obj.Find('upsample_kernel_sizes'));
-    SetLength(Result.Decoder.UpsampleKernelSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-      Result.Decoder.UpsampleKernelSizes[k] := Arr.Items[k].AsInteger;
-
-    if not (Obj.Find('resblock_kernel_sizes') is TJSONArray) then
-      ImportError('VITS import: "resblock_kernel_sizes" must be an array.');
-    Arr := TJSONArray(Obj.Find('resblock_kernel_sizes'));
-    SetLength(Result.Decoder.ResblockKernelSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-      Result.Decoder.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
-
-    if not (Obj.Find('resblock_dilation_sizes') is TJSONArray) then
-      ImportError('VITS import: "resblock_dilation_sizes" must be an array.');
-    Arr := TJSONArray(Obj.Find('resblock_dilation_sizes'));
-    SetLength(Result.Decoder.ResblockDilationSizes, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for k := 0 to LpMax do
-    begin
-      Inner := TJSONArray(Arr.Items[k]);
-      SetLength(Result.Decoder.ResblockDilationSizes[k], Inner.Count);
-      LpMax := Inner.Count - 1;
-      for j := 0 to LpMax do
-        Result.Decoder.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
-    end;
+    ReadHiFiGANGeneratorFields(Obj, 'VITS import: config "' + FileName +
+      '"', Result.Decoder);
 
     Result.Decoder.LeakyReluSlope := Obj.Get('leaky_relu_slope', 0.1);
     Result.Decoder.NormalizeBefore := False;
@@ -50517,6 +50555,385 @@ begin
     Result := BuildVitsFromSafeTensorsEx(Reader, Config);
   finally
     Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// KOKORO-82M loading.
+// ===========================================================================
+function ReadKokoroConfigFromJSONFile(const FileName: string): TKokoroConfig;
+var
+  JsonText: TStringList;
+  Root, Node: TJSONData;
+  Obj, PLBertObj, ISTFTObj, VocabObj: TJSONObject;
+  Key: string;
+  KeyPos, i, j, MaxVocabPos, Id: integer;
+  CodePoint: cardinal;
+
+  function RequiredObject(Parent: TJSONObject;
+    const FieldName: string): TJSONObject;
+  begin
+    if not (Parent.Find(FieldName) is TJSONObject) then
+      ImportError('Kokoro import: config "' + FileName + '" field "' +
+        FieldName + '" is missing or not an object.');
+    Result := TJSONObject(Parent.Find(FieldName));
+  end;
+
+  function RequiredInt(Parent: TJSONObject;
+    const FieldName: string): integer;
+  begin
+    Node := Parent.Find(FieldName);
+    if (Node = nil) or (Node.JSONType <> jtNumber) or
+       (Node.AsInteger <= 0) then
+      ImportError('Kokoro import: config "' + FileName + '" field "' +
+        FieldName + '" is missing or not a positive integer.');
+    Result := Node.AsInteger;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Kokoro import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    // The HF config.json escapes some vocab keys (̃); decode them to
+    // raw UTF-8 and parse without joUTF8 so every key keeps its bytes.
+    try
+      Root := HFParseJSONRaw(HFDecodeUnicodeEscapes(JsonText.Text));
+    except
+      on E: Exception do
+        ImportError('Kokoro import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Kokoro import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.DimIn := RequiredInt(Obj, 'dim_in');
+    Result.HiddenDim := RequiredInt(Obj, 'hidden_dim');
+    Result.MaxConvDim := RequiredInt(Obj, 'max_conv_dim');
+    Result.MaxDur := RequiredInt(Obj, 'max_dur');
+    Result.NumLayers := RequiredInt(Obj, 'n_layer');
+    Result.NumMels := RequiredInt(Obj, 'n_mels');
+    Result.NumTokens := RequiredInt(Obj, 'n_token');
+    Result.StyleDim := RequiredInt(Obj, 'style_dim');
+    Result.TextEncoderKernelSize := RequiredInt(Obj,
+      'text_encoder_kernel_size');
+
+    PLBertObj := RequiredObject(Obj, 'plbert');
+    Result.PLBert.HiddenSize := RequiredInt(PLBertObj, 'hidden_size');
+    Result.PLBert.NumAttentionHeads := RequiredInt(PLBertObj,
+      'num_attention_heads');
+    Result.PLBert.IntermediateSize := RequiredInt(PLBertObj,
+      'intermediate_size');
+    Result.PLBert.MaxPositionEmbeddings := RequiredInt(PLBertObj,
+      'max_position_embeddings');
+    Result.PLBert.NumHiddenLayers := RequiredInt(PLBertObj,
+      'num_hidden_layers');
+    // transformers AlbertConfig default; the real config omits it.
+    if PLBertObj.Find('embedding_size') = nil then
+      Result.PLBert.EmbeddingSize := 128
+    else
+      Result.PLBert.EmbeddingSize := RequiredInt(PLBertObj, 'embedding_size');
+
+    ISTFTObj := RequiredObject(Obj, 'istftnet');
+    Result.ISTFTNFFT := RequiredInt(ISTFTObj, 'gen_istft_n_fft');
+    Result.ISTFTHopSize := RequiredInt(ISTFTObj, 'gen_istft_hop_size');
+    ReadHiFiGANGeneratorFields(ISTFTObj, 'Kokoro import: config "' +
+      FileName + '" istftnet', Result.Generator);
+    Result.Generator.ModelType := 'istftnet';
+    Result.Generator.ModelInDim := 0;
+    Result.Generator.ResblockType := 1;
+    Result.Generator.LeakyReluSlope := 0.1;
+    Result.Generator.NormalizeBefore := False;
+    Result.Generator.SamplingRate := KokoroSampleRate;
+
+    VocabObj := RequiredObject(Obj, 'vocab');
+    if VocabObj.Count = 0 then
+      ImportError('Kokoro import: config "' + FileName +
+        '" has an empty vocab.');
+    SetLength(Result.VocabCodePoints, VocabObj.Count);
+    SetLength(Result.VocabIds, VocabObj.Count);
+    MaxVocabPos := VocabObj.Count - 1;
+    for i := 0 to MaxVocabPos do
+    begin
+      Key := VocabObj.Names[i];
+      if Key = '' then
+        ImportError('Kokoro import: config "' + FileName +
+          '" has an empty vocab key.');
+      KeyPos := 1;
+      CodePoint := NextCodePoint(Key, KeyPos);
+      if KeyPos <= Length(Key) then
+        ImportError('Kokoro import: vocab key "' + Key +
+          '" is not a single code point.');
+      Node := VocabObj.Items[i];
+      if Node.JSONType <> jtNumber then
+        ImportError('Kokoro import: vocab entry "' + Key +
+          '" must map to an integer id.');
+      Id := Node.AsInteger;
+      if (Id < 0) or (Id >= Result.NumTokens) then
+        ImportError('Kokoro import: vocab id ' + IntToStr(Id) + ' of "' +
+          Key + '" is outside [0, n_token).');
+      // Insertion sort by code point (the vocab has ~100 entries).
+      j := i;
+      while (j > 0) and (Result.VocabCodePoints[j - 1] > CodePoint) do
+      begin
+        Result.VocabCodePoints[j] := Result.VocabCodePoints[j - 1];
+        Result.VocabIds[j] := Result.VocabIds[j - 1];
+        Dec(j);
+      end;
+      if (j > 0) and (Result.VocabCodePoints[j - 1] = CodePoint) then
+        ImportError('Kokoro import: duplicate vocab key "' + Key + '".');
+      Result.VocabCodePoints[j] := CodePoint;
+      Result.VocabIds[j] := Id;
+    end;
+    Result.DecoderWidth := 0;
+    Result.DecoderBlockInputWidth := 0;
+    Result.DecoderOutputWidth := 0;
+    Result.AsrResWidth := 0;
+    Result.DecoderBlockCount := 0;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function KokoroPhonemesToIds(const Config: TKokoroConfig;
+  const Phonemes: string; out SkippedSymbols: string): TNeuralIntegerArray;
+var
+  SymbolStart, Position, PhonemesLen, IdCount: integer;
+  LowPos, HighPos, MiddlePos, VocabCount: integer;
+  CodePoint: cardinal;
+begin
+  SkippedSymbols := '';
+  VocabCount := Length(Config.VocabCodePoints);
+  PhonemesLen := Length(Phonemes);
+  Result := nil;
+  SetLength(Result, PhonemesLen + 2);
+  Result[0] := 0;
+  IdCount := 1;
+  Position := 1;
+  while Position <= PhonemesLen do
+  begin
+    SymbolStart := Position;
+    CodePoint := NextCodePoint(Phonemes, Position);
+    LowPos := 0;
+    HighPos := VocabCount - 1;
+    while LowPos <= HighPos do
+    begin
+      MiddlePos := (LowPos + HighPos) shr 1;
+      if Config.VocabCodePoints[MiddlePos] < CodePoint then
+        LowPos := MiddlePos + 1
+      else
+        HighPos := MiddlePos - 1;
+    end;
+    if (LowPos < VocabCount) and
+       (Config.VocabCodePoints[LowPos] = CodePoint) then
+    begin
+      Result[IdCount] := Config.VocabIds[LowPos];
+      Inc(IdCount);
+    end
+    else
+      SkippedSymbols := SkippedSymbols +
+        Copy(Phonemes, SymbolStart, Position - SymbolStart);
+  end;
+  Result[IdCount] := 0;
+  Inc(IdCount);
+  SetLength(Result, IdCount);
+  if IdCount > Config.PLBert.MaxPositionEmbeddings then
+    ImportError('Kokoro: ' + IntToStr(IdCount) + ' ids (with the two ' +
+      'wrapping 0s) exceed max_position_embeddings = ' +
+      IntToStr(Config.PLBert.MaxPositionEmbeddings) +
+      '; split the phoneme string.');
+end;
+
+function OpenKokoroCheckpoint(const FileName: string): TNNetSafeTensorsReader;
+var
+  ComponentIdx, TensorIdx, MaxTensorPos, ComponentTensorCount: integer;
+  Prefix: string;
+begin
+  Result := CreatePretrainedTensorReader(FileName);
+  try
+    for ComponentIdx := Low(KokoroComponentNames) to
+      High(KokoroComponentNames) do
+    begin
+      Prefix := KokoroComponentNames[ComponentIdx] + '.';
+      Result.RenameTensorPrefix(Prefix + 'module.', Prefix);
+      ComponentTensorCount := 0;
+      MaxTensorPos := Result.Count - 1;
+      for TensorIdx := 0 to MaxTensorPos do
+        if Copy(Result.TensorName(TensorIdx), 1, Length(Prefix)) = Prefix then
+          Inc(ComponentTensorCount);
+      if ComponentTensorCount = 0 then
+        ImportError('Kokoro import: "' + FileName + '" has no "' +
+          KokoroComponentNames[ComponentIdx] + '" state dict - not a ' +
+          'Kokoro-82M checkpoint?');
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure ReadKokoroWidthsFromWeights(Reader: TNNetSafeTensorsReader;
+  var Config: TKokoroConfig);
+
+  // Name of the (weight-norm direction or plain) weight of conv Prefix.
+  function ConvWeightName(const Prefix: string): string;
+  begin
+    if Reader.HasTensor(Prefix + '.weight_v') then
+      Result := Prefix + '.weight_v'
+    else if Reader.HasTensor(Prefix + '.parametrizations.weight.original1') then
+      Result := Prefix + '.parametrizations.weight.original1'
+    else if Reader.HasTensor(Prefix + '.weight') then
+      Result := Prefix + '.weight'
+    else
+    begin
+      ImportError('Kokoro import: weight of "' + Prefix + '" not found in ' +
+        Reader.FileName + '.');
+      Result := '';
+    end;
+  end;
+
+  function ConvWidth(const Prefix: string; Dim: integer): integer;
+  begin
+    Result := Reader.DimSize(ConvWeightName(Prefix), Dim);
+  end;
+
+const
+  WordEmbeddingName = 'bert.embeddings.word_embeddings.weight';
+  ConvPostPrefix = 'decoder.generator.conv_post';
+begin
+  if Reader.DimCount(WordEmbeddingName) <> 2 then
+    ImportError('Kokoro import: ' + WordEmbeddingName + ' must be 2-D, got ' +
+      Reader.ShapeAsString(WordEmbeddingName));
+  if (Reader.DimSize(WordEmbeddingName, 0) <> Config.NumTokens) or
+     (Reader.DimSize(WordEmbeddingName, 1) <> Config.PLBert.EmbeddingSize) then
+    ImportError('Kokoro import: ' + WordEmbeddingName + ' is ' +
+      Reader.ShapeAsString(WordEmbeddingName) + ' but config.json gives ' +
+      'n_token = ' + IntToStr(Config.NumTokens) + ', plbert.embedding_size = ' +
+      IntToStr(Config.PLBert.EmbeddingSize) + '.');
+  Config.DecoderWidth := ConvWidth('decoder.encode.conv1', 0);
+  Config.AsrResWidth := ConvWidth('decoder.asr_res.0', 0);
+  Config.DecoderBlockCount := 0;
+  while Reader.HasTensor('decoder.decode.' +
+    IntToStr(Config.DecoderBlockCount) + '.conv1.bias') do
+    Inc(Config.DecoderBlockCount);
+  if Config.DecoderBlockCount = 0 then
+    ImportError('Kokoro import: no decoder.decode.* blocks in ' +
+      Reader.FileName + '.');
+  Config.DecoderBlockInputWidth := ConvWidth('decoder.decode.0.conv1', 1);
+  Config.DecoderOutputWidth := ConvWidth('decoder.decode.' +
+    IntToStr(Config.DecoderBlockCount - 1) + '.conv1', 0);
+  Config.Generator.ModelInDim := Config.DecoderOutputWidth;
+  // The decoder concatenates [x, F0, N, asr_res] before every decode block.
+  if Config.DecoderBlockInputWidth <>
+     Config.DecoderWidth + 2 + Config.AsrResWidth then
+    ImportError('Kokoro import: decoder.decode.0 takes ' +
+      IntToStr(Config.DecoderBlockInputWidth) + ' channels, expected ' +
+      'encode width ' + IntToStr(Config.DecoderWidth) + ' + 2 + asr_res ' +
+      'width ' + IntToStr(Config.AsrResWidth) + '.');
+  if ConvWidth(ConvPostPrefix, 0) <> Config.ISTFTNFFT + 2 then
+    ImportError('Kokoro import: ' + ConvPostPrefix + ' has ' +
+      IntToStr(ConvWidth(ConvPostPrefix, 0)) + ' output channels, expected ' +
+      'gen_istft_n_fft + 2 = ' + IntToStr(Config.ISTFTNFFT + 2) + '.');
+end;
+
+function LoadKokoroVoicePack(const FileName: string;
+  StyleDim: integer): TKokoroVoicePack;
+var
+  Reader: TNNetSafeTensorsReader;
+  Values: TNNetVolume;
+  ElementCount: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Kokoro: voice pack not found: ' + FileName);
+  Values := TNNetVolume.Create;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    if (Reader.Count <> 1) or not Reader.HasTensor(TorchBinBareTensorName) then
+      ImportError('Kokoro: voice pack "' + FileName + '" must hold a single ' +
+        'bare tensor.');
+    if (Reader.DimCount(TorchBinBareTensorName) <> 3) or
+       (Reader.DimSize(TorchBinBareTensorName, 1) <> 1) or
+       (Reader.DimSize(TorchBinBareTensorName, 2) <> 2 * StyleDim) then
+      ImportError('Kokoro: voice pack "' + FileName + '" has shape ' +
+        Reader.ShapeAsString(TorchBinBareTensorName) + ', expected [rows, 1, ' +
+        IntToStr(2 * StyleDim) + '] (2 * style_dim).');
+    Result.Name := ChangeFileExt(ExtractFileName(FileName), '');
+    Result.RowCount := Reader.DimSize(TorchBinBareTensorName, 0);
+    Result.StyleDim := StyleDim;
+    Reader.LoadTensorFlat(TorchBinBareTensorName, Values);
+    ElementCount := Values.Size;
+    SetLength(Result.Values, ElementCount);
+    if ElementCount > 0 then
+      Move(Values.FData[0], Result.Values[0], ElementCount * csNeuralFloatSize);
+  finally
+    Reader.Free;
+    Values.Free;
+  end;
+end;
+
+procedure SelectKokoroVoiceStyle(const Pack: TKokoroVoicePack;
+  PhonemeCount: integer; out DecoderStyle, ProsodyStyle: TNeuralFloatDynArr);
+var
+  RowStart: integer;
+begin
+  if (PhonemeCount < 1) or (PhonemeCount > Pack.RowCount) then
+    ImportError('Kokoro: voice pack "' + Pack.Name + '" has rows for 1..' +
+      IntToStr(Pack.RowCount) + ' phonemes, got ' + IntToStr(PhonemeCount) +
+      '; split the phoneme string.');
+  RowStart := (PhonemeCount - 1) * 2 * Pack.StyleDim;
+  SetLength(DecoderStyle, Pack.StyleDim);
+  SetLength(ProsodyStyle, Pack.StyleDim);
+  Move(Pack.Values[RowStart], DecoderStyle[0],
+    Pack.StyleDim * csNeuralFloatSize);
+  Move(Pack.Values[RowStart + Pack.StyleDim], ProsodyStyle[0],
+    Pack.StyleDim * csNeuralFloatSize);
+end;
+
+function OpenKokoroSnapshot(const SnapshotDir, VoiceName: string;
+  out Config: TKokoroConfig;
+  out Voice: TKokoroVoicePack): TNNetSafeTensorsReader;
+var
+  Dir, CheckpointFile, VoiceFile, Found: string;
+  SearchRec: TSearchRec;
+  CheckpointCount: integer;
+begin
+  Dir := IncludeTrailingPathDelimiter(SnapshotDir);
+  if not DirectoryExists(Dir) then
+    ImportError('Kokoro: snapshot folder not found: ' + SnapshotDir);
+  if not FileExists(Dir + 'config.json') then
+    ImportError('Kokoro: no config.json in ' + SnapshotDir);
+  CheckpointCount := 0;
+  CheckpointFile := '';
+  Found := '';
+  if FindFirst(Dir + '*.pth', faAnyFile and not faDirectory, SearchRec) = 0 then
+  try
+    repeat
+      Inc(CheckpointCount);
+      CheckpointFile := Dir + SearchRec.Name;
+      Found := Found + ' ' + SearchRec.Name;
+    until FindNext(SearchRec) <> 0;
+  finally
+    FindClose(SearchRec);
+  end;
+  if CheckpointCount <> 1 then
+    ImportError('Kokoro: expected exactly one *.pth in ' + SnapshotDir +
+      ', found ' + IntToStr(CheckpointCount) + ':' + Found);
+  VoiceFile := Dir + 'voices' + DirectorySeparator + VoiceName + '.pt';
+  if not FileExists(VoiceFile) then
+    ImportError('Kokoro: voice "' + VoiceName + '" not found (' + VoiceFile +
+      ').');
+  Config := ReadKokoroConfigFromJSONFile(Dir + 'config.json');
+  Result := OpenKokoroCheckpoint(CheckpointFile);
+  try
+    ReadKokoroWidthsFromWeights(Result, Config);
+    Voice := LoadKokoroVoicePack(VoiceFile, Config.StyleDim);
+  except
+    Result.Free;
+    raise;
   end;
 end;
 

@@ -463,6 +463,11 @@ type
 function HFDecodeUnicodeEscapes(const S: string): string;
 function HFParseJSONRaw(const S: string): TJSONData;
 
+// Decodes the UTF-8 code point at byte Position (1-based) and advances past
+// it; invalid bytes come back as-is. CodePointCount uses the same rule.
+function NextCodePoint(const S: string; var Position: integer): cardinal;
+function CodePointCount(const S: string): integer;
+
 // fpjson's TJSONObject stores member names in a TFPHashObjectList whose
 // keys are SHORTSTRINGS: every object key is silently truncated to its
 // first 255 bytes. Keys that share a 255-byte prefix then collide and

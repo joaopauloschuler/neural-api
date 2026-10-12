@@ -689,6 +689,21 @@ type
     // committed char-vocab fixture; the expected ids come from the real HF
     // VitsTokenizer (cross-checked offline).
     procedure TestVitsTokenizerParity;
+    // Kokoro-82M loading on tests/fixtures/tiny_kokoro82m (the real
+    // architecture with small widths, tools/make_kokoro82m_fixture.py):
+    // the five state dicts with 'module.' removed, tensor values vs torch.
+    procedure TestKokoroCheckpointTensors;
+    // Bare-tensor voice pack, row = phoneme count - 1 vs the oracle ref_s.
+    procedure TestKokoroVoicePackRowSelection;
+    // config.json fields, incl. the plbert.embedding_size default of 128.
+    procedure TestKokoroConfigFromJSONFile;
+    // Phoneme string -> ids per code point (multibyte IPA, skipped symbols).
+    procedure TestKokoroPhonemesToIds;
+    // Snapshot folder -> config + reader + voice; decoder widths from shapes.
+    procedure TestKokoroSnapshotLoad;
+    // The real hexgrad/Kokoro-82M snapshot from the HF cache, ignored when
+    // absent (NEURAL_KOKORO82M_DIR overrides the cache path).
+    procedure TestKokoroRealSnapshotSmoke;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -23602,6 +23617,328 @@ begin
     CheckCase('HELLO', [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0]);
   finally
     Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroCheckpointTensors;
+const
+  ComponentTensorCounts: array[0..4] of integer = (25, 2, 122, 24, 375);
+var
+  Reader: TNNetSafeTensorsReader;
+  Values: TNNetVolume;
+  ComponentIdx, TensorIdx, MaxTensorPos, ComponentTensorCount: integer;
+  Prefix: string;
+
+  // Sum, first and last element as printed by torch for the tiny fixture.
+  procedure CheckTensor(const Name: string; ExpectedCount: integer;
+    ExpectedSum, ExpectedFirst, ExpectedLast: double);
+  begin
+    AssertTrue('has ' + Name, Reader.HasTensor(Name));
+    Reader.LoadTensorFlat(Name, Values);
+    AssertEquals(Name + ' size', ExpectedCount, Values.Size);
+    AssertEquals(Name + ' sum', ExpectedSum, Values.GetSum, 1e-3);
+    AssertEquals(Name + ' first', ExpectedFirst, Values.FData[0], 1e-6);
+    AssertEquals(Name + ' last', ExpectedLast, Values.FData[Values.Size - 1],
+      1e-6);
+  end;
+
+begin
+  Values := TNNetVolume.Create;
+  Reader := OpenKokoroCheckpoint(
+    FixturePath('tiny_kokoro82m' + DirectorySeparator + 'kokoro-v1_0.pth'));
+  try
+    AssertEquals('tensor count', 548, Reader.Count);
+    MaxTensorPos := Reader.Count - 1;
+    for TensorIdx := 0 to MaxTensorPos do
+      AssertTrue('no module. level in ' + Reader.TensorName(TensorIdx),
+        Pos('.module.', Reader.TensorName(TensorIdx)) = 0);
+    for ComponentIdx := 0 to 4 do
+    begin
+      Prefix := KokoroComponentNames[ComponentIdx] + '.';
+      ComponentTensorCount := 0;
+      for TensorIdx := 0 to MaxTensorPos do
+        if Copy(Reader.TensorName(TensorIdx), 1, Length(Prefix)) = Prefix then
+          Inc(ComponentTensorCount);
+      AssertEquals(Prefix + ' tensors', ComponentTensorCounts[ComponentIdx],
+        ComponentTensorCount);
+    end;
+    CheckTensor('decoder.generator.conv_post.weight_v', 22 * 2 * 7,
+      4.001081, -0.0652555078, 0.152357981);
+    CheckTensor('bert.embeddings.word_embeddings.weight', 178 * 8,
+      -76.713155, -0.941416502, -0.5809955);
+    CheckTensor('predictor.F0_proj.bias', 1, 30, 30, 30);
+    CheckTensor('text_encoder.lstm.weight_ih_l0_reverse', 16 * 8,
+      -5.151623, 0.0601263605, 0.0899601728);
+    CheckTensor('bert_encoder.weight', 8 * 16,
+      -0.643624, 0.0591072887, -0.254131705);
+  finally
+    Reader.Free;
+    Values.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroVoicePackRowSelection;
+var
+  Voice: TKokoroVoicePack;
+  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
+  RefReader: TNNetSafeTensorsReader;
+  RefStyle: TNNetVolume;
+  StylePos, BadCount: integer;
+  Failed: boolean;
+begin
+  Voice := LoadKokoroVoicePack(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'voices' + DirectorySeparator + 'af_heart.pt'), 8);
+  AssertEquals('voice name', 'af_heart', Voice.Name);
+  AssertEquals('rows', 32, Voice.RowCount);
+  AssertEquals('style dim', 8, Voice.StyleDim);
+  AssertEquals('values', 32 * 16, Length(Voice.Values));
+  AssertEquals('last value', 0.939191222, Voice.Values[32 * 16 - 1], 1e-6);
+  // 'hO.' with the stress mark: 4 phonemes -> row 3, the oracle's ref_s.
+  SelectKokoroVoiceStyle(Voice, 4, DecoderStyle, ProsodyStyle);
+  AssertEquals('decoder half', 8, Length(DecoderStyle));
+  AssertEquals('prosody half', 8, Length(ProsodyStyle));
+  RefStyle := TNNetVolume.Create;
+  RefReader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_kokoro82m_ref.safetensors'));
+  try
+    RefReader.LoadTensorFlat('ref_s', RefStyle);
+    AssertEquals('ref_s size', 16, RefStyle.Size);
+    for StylePos := 0 to 7 do
+    begin
+      AssertEquals('decoder style ' + IntToStr(StylePos),
+        RefStyle.FData[StylePos], DecoderStyle[StylePos], 0);
+      AssertEquals('prosody style ' + IntToStr(StylePos),
+        RefStyle.FData[8 + StylePos], ProsodyStyle[StylePos], 0);
+    end;
+  finally
+    RefReader.Free;
+    RefStyle.Free;
+  end;
+  SelectKokoroVoiceStyle(Voice, 32, DecoderStyle, ProsodyStyle);
+  AssertEquals('last row prosody', 0.939191222, ProsodyStyle[7], 1e-6);
+  for BadCount in [0, 33] do
+  begin
+    Failed := false;
+    try
+      SelectKokoroVoiceStyle(Voice, BadCount, DecoderStyle, ProsodyStyle);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('phoneme count ' + IntToStr(BadCount) + ' rejected', Failed);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroConfigFromJSONFile;
+const
+  EmbeddingSizeEntry = ',' + LineEnding + '    "embedding_size": 8';
+var
+  Config: TKokoroConfig;
+  ConfigText: TStringList;
+  ConfigName, TempName, Text: string;
+  ResblockPos: integer;
+begin
+  ConfigName := FixturePath('tiny_kokoro82m' + DirectorySeparator +
+    'config.json');
+  Config := ReadKokoroConfigFromJSONFile(ConfigName);
+  AssertEquals('plbert hidden', 16, Config.PLBert.HiddenSize);
+  AssertEquals('plbert heads', 2, Config.PLBert.NumAttentionHeads);
+  AssertEquals('plbert ffn', 32, Config.PLBert.IntermediateSize);
+  AssertEquals('plbert positions', 32, Config.PLBert.MaxPositionEmbeddings);
+  AssertEquals('plbert layers', 3, Config.PLBert.NumHiddenLayers);
+  AssertEquals('plbert embedding', 8, Config.PLBert.EmbeddingSize);
+  AssertEquals('dim_in', 64, Config.DimIn);
+  AssertEquals('hidden_dim', 8, Config.HiddenDim);
+  AssertEquals('max_conv_dim', 8, Config.MaxConvDim);
+  AssertEquals('max_dur', 3, Config.MaxDur);
+  AssertEquals('n_layer', 3, Config.NumLayers);
+  AssertEquals('n_mels', 80, Config.NumMels);
+  AssertEquals('n_token', 178, Config.NumTokens);
+  AssertEquals('style_dim', 8, Config.StyleDim);
+  AssertEquals('text kernel', 5, Config.TextEncoderKernelSize);
+  AssertEquals('n_fft', 20, Config.ISTFTNFFT);
+  AssertEquals('hop', 5, Config.ISTFTHopSize);
+  AssertEquals('init channels', 8, Config.Generator.UpsampleInitialChannel);
+  AssertEquals('upsample stages', 2, Length(Config.Generator.UpsampleRates));
+  AssertEquals('rate 0', 10, Config.Generator.UpsampleRates[0]);
+  AssertEquals('rate 1', 6, Config.Generator.UpsampleRates[1]);
+  AssertEquals('up kernel 0', 20, Config.Generator.UpsampleKernelSizes[0]);
+  AssertEquals('up kernel 1', 12, Config.Generator.UpsampleKernelSizes[1]);
+  AssertEquals('resblocks', 3, Length(Config.Generator.ResblockKernelSizes));
+  AssertEquals('resblock kernel 2', 11, Config.Generator.ResblockKernelSizes[2]);
+  for ResblockPos := 0 to 2 do
+  begin
+    AssertEquals('dilations', 3,
+      Length(Config.Generator.ResblockDilationSizes[ResblockPos]));
+    AssertEquals('dilation 2', 5,
+      Config.Generator.ResblockDilationSizes[ResblockPos][2]);
+  end;
+  AssertEquals('vocab entries', 114, Length(Config.VocabIds));
+  AssertEquals('decoder width before weights', 0, Config.DecoderWidth);
+
+  // The real config.json has no plbert.embedding_size: AlbertConfig's 128.
+  ConfigText := TStringList.Create;
+  try
+    ConfigText.LoadFromFile(ConfigName);
+    Text := ConfigText.Text;
+    AssertTrue('fixture has embedding_size', Pos(EmbeddingSizeEntry, Text) > 0);
+    TempName := WriteTempJSON(StringReplace(Text, EmbeddingSizeEntry, '', []));
+  finally
+    ConfigText.Free;
+  end;
+  try
+    Config := ReadKokoroConfigFromJSONFile(TempName);
+    AssertEquals('default embedding size', 128, Config.PLBert.EmbeddingSize);
+    AssertEquals('other plbert fields kept', 16, Config.PLBert.HiddenSize);
+  finally
+    DeleteFile(TempName);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroPhonemesToIds;
+var
+  Config: TKokoroConfig;
+  Skipped: string;
+
+  procedure CheckIds(const Phonemes: string; const Expected: array of integer;
+    const ExpectedSkipped: string);
+  var
+    Ids: TNeuralIntegerArray;
+    IdPos: integer;
+  begin
+    Ids := KokoroPhonemesToIds(Config, Phonemes, Skipped);
+    AssertEquals('id count', Length(Expected), Length(Ids));
+    for IdPos := 0 to High(Expected) do
+      AssertEquals('id ' + IntToStr(IdPos), Expected[IdPos], Ids[IdPos]);
+    AssertEquals('skipped symbols', ExpectedSkipped, Skipped);
+  end;
+
+var
+  Failed: boolean;
+begin
+  Config := ReadKokoroConfigFromJSONFile(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'config.json'));
+  // The fixture oracle's phonemes (U+02C8 primary stress).
+  CheckIds('h' + #$CB#$88 + 'O.', [0, 50, 156, 31, 4, 0], '');
+  // The real-checkpoint oracle's phonemes; the real vocab is the same.
+  CheckIds('h' + #$C9#$99 + 'l' + #$CB#$88 + 'O w' + #$CB#$88 + #$C9#$9C +
+    #$C9#$B9 + 'ld. ' + #$C3#$B0 + #$CB#$8C + #$C9#$AA + 's ' + #$C9#$AA +
+    'z ' + #$C9#$90 + ' t' + #$CB#$88 + #$C9#$9B + 'st.',
+    [0, 50, 83, 54, 156, 31, 16, 65, 156, 87, 123, 54, 46, 4, 16, 81, 157,
+     102, 61, 16, 102, 68, 16, 70, 16, 62, 156, 86, 61, 62, 4, 0], '');
+  // U+20AC and '7' are outside the vocab: skipped and reported.
+  CheckIds('h' + #$E2#$82#$AC + #$CB#$88 + '7O.', [0, 50, 156, 31, 4, 0],
+    #$E2#$82#$AC + '7');
+  // U+0303 (combining tilde, escaped as ̃ in the real config).
+  CheckIds(#$CC#$83, [0, 17, 0], '');
+  CheckIds('', [0, 0], '');
+  // 30 phonemes + the two 0s fill max_position_embeddings = 32.
+  AssertEquals('at the position limit', 32,
+    Length(KokoroPhonemesToIds(Config, StringOfChar('h', 30), Skipped)));
+  Failed := false;
+  try
+    KokoroPhonemesToIds(Config, StringOfChar('h', 31), Skipped);
+  except
+    on EPretrainedImportError do Failed := true;
+  end;
+  AssertTrue('over the position limit rejected', Failed);
+end;
+
+procedure TTestNeuralPretrained.TestKokoroSnapshotLoad;
+var
+  SnapshotDir: string;
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+  Failed: boolean;
+begin
+  SnapshotDir := ExtractFileDir(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'config.json'));
+  Reader := OpenKokoroSnapshot(SnapshotDir, 'af_heart', Config, Voice);
+  try
+    AssertEquals('tensor count', 548, Reader.Count);
+    AssertTrue('module. removed',
+      Reader.HasTensor('decoder.generator.conv_post.weight_v'));
+    AssertEquals('decoder width', 8, Config.DecoderWidth);
+    AssertEquals('decoder block input', 14, Config.DecoderBlockInputWidth);
+    AssertEquals('decoder output', 8, Config.DecoderOutputWidth);
+    AssertEquals('asr_res width', 4, Config.AsrResWidth);
+    AssertEquals('decoder blocks', 4, Config.DecoderBlockCount);
+    AssertEquals('generator input', 8, Config.Generator.ModelInDim);
+    AssertEquals('voice rows', 32, Voice.RowCount);
+    AssertEquals('voice style dim', 8, Voice.StyleDim);
+  finally
+    Reader.Free;
+  end;
+  Failed := false;
+  try
+    OpenKokoroSnapshot(SnapshotDir, 'no_such_voice', Config, Voice).Free;
+  except
+    on E: EPretrainedImportError do
+      Failed := Pos('no_such_voice', E.Message) > 0;
+  end;
+  AssertTrue('missing voice named in the error', Failed);
+  Failed := false;
+  try
+    OpenKokoroSnapshot(SnapshotDir + '_missing', 'af_heart', Config,
+      Voice).Free;
+  except
+    on EPretrainedImportError do Failed := true;
+  end;
+  AssertTrue('missing folder rejected', Failed);
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealSnapshotSmoke;
+var
+  SnapshotDir, SnapshotsDir: string;
+  SearchRec: TSearchRec;
+  Config: TKokoroConfig;
+  Voice: TKokoroVoicePack;
+  Reader: TNNetSafeTensorsReader;
+  Values: TNNetVolume;
+  DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
+begin
+  SnapshotDir := GetEnvironmentVariable('NEURAL_KOKORO82M_DIR');
+  if SnapshotDir = '' then
+  begin
+    SnapshotsDir := IncludeTrailingPathDelimiter(GetUserDir) +
+      '.cache/huggingface/hub/models--hexgrad--Kokoro-82M/snapshots/';
+    if FindFirst(SnapshotsDir + '*', faDirectory, SearchRec) = 0 then
+    try
+      repeat
+        if (SearchRec.Name <> '.') and (SearchRec.Name <> '..') and
+           FileExists(SnapshotsDir + SearchRec.Name + '/config.json') then
+          SnapshotDir := SnapshotsDir + SearchRec.Name;
+      until (SnapshotDir <> '') or (FindNext(SearchRec) <> 0);
+    finally
+      FindClose(SearchRec);
+    end;
+  end;
+  if (SnapshotDir = '') or not FileExists(IncludeTrailingPathDelimiter(
+    SnapshotDir) + 'voices/af_heart.pt') then
+    Ignore('hexgrad/Kokoro-82M snapshot with voices/af_heart.pt not found ' +
+      '(set NEURAL_KOKORO82M_DIR)');
+  Values := TNNetVolume.Create;
+  Reader := OpenKokoroSnapshot(SnapshotDir, 'af_heart', Config, Voice);
+  try
+    AssertEquals('tensor count', 548, Reader.Count);
+    AssertEquals('plbert embedding default', 128, Config.PLBert.EmbeddingSize);
+    AssertEquals('style_dim', 128, Config.StyleDim);
+    AssertEquals('decoder width', 1024, Config.DecoderWidth);
+    AssertEquals('decoder block input', 1090, Config.DecoderBlockInputWidth);
+    AssertEquals('decoder output', 512, Config.DecoderOutputWidth);
+    AssertEquals('asr_res width', 64, Config.AsrResWidth);
+    AssertEquals('voice rows', 510, Voice.RowCount);
+    Reader.LoadTensorFlat('decoder.generator.conv_post.weight_v', Values);
+    AssertEquals('conv_post size', 22 * 128 * 7, Values.Size);
+    AssertEquals('conv_post sum', -23.9126, Values.GetSum, 1e-3);
+    Reader.LoadTensorFlat('predictor.F0_proj.bias', Values);
+    AssertEquals('F0_proj bias', 0.241111666, Values.FData[0], 1e-6);
+    SelectKokoroVoiceStyle(Voice, 4, DecoderStyle, ProsodyStyle);
+    AssertEquals('row 3 decoder style', -0.243153930, DecoderStyle[0], 1e-6);
+    AssertEquals('row 3 prosody style', -0.111578137, ProsodyStyle[0], 1e-6);
+  finally
+    Reader.Free;
+    Values.Free;
   end;
 end;
 

@@ -23,8 +23,9 @@ unit neuraltorchbin;
 //     OrderedDict, torch._utils _rebuild_tensor_v2 / _rebuild_parameter,
 //     and the torch.*Storage dtype classes) - anything else (e.g. the
 //     classic `os system` payload) raises ETorchBinError;
-//   * REDUCE only ever calls those whitelisted callables, and BUILD /
-//     INST / OBJ / NEWOBJ are not implemented at all.
+//   * REDUCE only ever calls those whitelisted callables; BUILD is accepted
+//     only as a dict's attribute dict (dropped), INST / OBJ / NEWOBJ not
+//     at all.
 // Nothing is ever executed; the unpickler only builds a passive object tree.
 //
 // The reader subclasses TNNetSafeTensorsReader and populates the same
@@ -55,6 +56,11 @@ interface
 
 uses
   Classes, SysUtils, fpjson, jsonparser, neuralvolume, neuralsafetensors;
+
+const
+  // Tensor name under which a checkpoint whose pickle root is a bare tensor
+  // (not a dict) is exposed.
+  TorchBinBareTensorName = 'tensor';
 
 type
   ETorchBinError = class(Exception);
@@ -1008,6 +1014,13 @@ begin
             for i := 0 to NodeItemsHi do
               ValNode.Items[j + i] := Node.Items[i];
           end;
+        $62: // BUILD 'b': sets attributes (e.g. a state_dict's _metadata)
+          begin
+            Node := Pop; // state
+            if (StackTop < 0) or (Stack[StackTop].Kind <> pkDict) or
+               not (Node.Kind in [pkDict, pkNone]) then
+              Fail('BUILD is only accepted as dict attributes on a dict');
+          end;
         $95: // FRAME (protocol 4): 8-byte length hint, ignored
           NeedBytes(8);
         else
@@ -1015,10 +1028,20 @@ begin
             'restricted state_dict subset', [Op]));
       end;
     end;
+    // A bare tensor (torch.save(tensor), e.g. a voice pack) becomes a
+    // one-entry state_dict named TorchBinBareTensorName.
+    if (Root <> nil) and (Root.Kind = pkTensor) then
+    begin
+      Node := NewNode(pkDict);
+      ValNode := NewNode(pkStr);
+      ValNode.StrVal := TorchBinBareTensorName;
+      DictSetItem(Node, ValNode, Root);
+      Root := Node;
+    end;
     if (Root = nil) or (Root.Kind <> pkDict) then
       raise ETorchBinError.CreateFmt(
-        'torch.bin: the pickled object is not a dict/state_dict: %s',
-        [ShardPath]);
+        'torch.bin: the pickled object is neither a dict/state_dict nor a ' +
+        'tensor: %s', [ShardPath]);
 
     // ---- unwrap a nested checkpoint dict --------------------------------
     // Many checkpoints (e.g. Real-ESRGAN .pth) wrap the actual state_dict in
