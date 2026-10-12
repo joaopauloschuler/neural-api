@@ -138,6 +138,17 @@ const
   // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
   // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
   csFusedSDPALocalMemReserveBytes = 1024;
+  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
+  // widest head they take (16 column chunks of 256).
+  csFusedSDPAFlashLanes = 256;
+  csFusedSDPAFlashMaxDk = 4096;
+{$ENDIF OpenCL}
+
+{$IFDEF OpenCL}
+// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
+// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
+function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
+  Dk: integer): boolean;
 {$ENDIF OpenCL}
 
 type
@@ -4733,19 +4744,6 @@ type
   end;
 
 {$IFDEF OpenCL}
-const
-  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
-  // tree reductions halve it) within every device's max work-group size.
-  csFusedSDPALocalSize = 256;
-  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
-  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
-  csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
-  // widest head they take (16 column chunks of 256).
-  csFusedSDPAFlashLanes = 256;
-  csFusedSDPAFlashMaxDk = 4096;
-
-type
   // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
   // (cai_sdpa_decode_split + merge) or a flash variant (+ merge when split).
   TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash);
@@ -4982,13 +4980,8 @@ type
     property LastPath: TFusedSDPAOpenCLPath read FLastPath;
   end;
 
-// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
-// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
-function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
-  Dk: integer): boolean;
-{$ENDIF}
 
-type
+{$ENDIF}
 
   /// Fused multi-head scaled-dot-product attention (GQA-aware): ALL query
   /// heads of one attention sub-layer in ONE layer, replacing the per-head

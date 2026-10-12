@@ -104,4 +104,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
   {$IFDEF AVXANY}
   {$include neuralasm.inc}
   {$ENDIF}
+{$ELSE}
+  {$IF CompilerVersion < 37.0}
+    "Only support Delphi 13 +"
+  {$IFEND}
 {$ENDIF}

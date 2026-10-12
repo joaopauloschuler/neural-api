@@ -3,6 +3,9 @@ unit neuraldelphi;
 
 interface
 
+type
+  QWord = UInt64;
+
 procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
 
 implementation

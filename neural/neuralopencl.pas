@@ -4090,9 +4090,14 @@ begin
   begin
     if ProgramDevices[DeviceIdx] = FCurrentDevice then
       ProgramDeviceIdx := DeviceIdx;
+
     if BinarySizes[DeviceIdx] > 0
+    {$IFDEF FPC}
       then Binaries[DeviceIdx] := GetMem(BinarySizes[DeviceIdx])
-      else Binaries[DeviceIdx] := nil;
+    {$ELSE}
+      then GetMem(Binaries[DeviceIdx], BinarySizes[DeviceIdx])
+    {$ENDIF}
+    else Binaries[DeviceIdx] := nil;
   end;
   try
     if (BinarySizes[ProgramDeviceIdx] = 0) or
@@ -4303,7 +4308,11 @@ begin
 end;
 
 // The counters wrap: their difference decides, so overflow checks are off.
-{$PUSH}{$Q-}{$R-}
+{$IFDEF FPC}
+  {$PUSH}{$Q-}{$R-}
+{$ELSE}
+  {$PUSHOPT} {$Q-}{$R-}
+{$ENDIF}
 procedure TEasyOpenCL.MarkUploadsCompleted(UploadCount: LongInt);
 var
   Completed: LongInt;
@@ -4322,7 +4331,11 @@ begin
     {$IFDEF FPC}InterLockedExchangeAdd{$ELSE}AtomicIncrement{$ENDIF}(
     FQueueOwner.FUploadsCompleted, 0)) > 0;
 end;
-{$POP}
+{$IFDEF FPC}
+  {$POP}
+{$ELSE}
+  {$POPOPT}
+{$ENDIF}
 
 function TEasyOpenCL.HasPrivateQueue(): boolean;
 begin
