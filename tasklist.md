@@ -1600,8 +1600,29 @@ rather than acted on.
         `FlushWeightCache` raised EInvalidOp (empty caches). Real stage A: owner
         load 1.2-2.2 s, PrepareStageA 0.09-0.22 s, forward 0.32-0.44 s parallel /
         0.56-0.88 s serial (other runs on a busy VM: 1.3-3.9 s).
-        - [ ] Stage C: add it beside stages A and B (`FStage*Owner`,
+        - [x] Stage C: add it beside stages A and B (`FStage*Owner`,
           `FStage*Net`, one shared `FOpenCLContextNet`, `ArmStageNet`).
+          Decoder part done: `TNNetKokoro.LoadStageCDecoder` builds the owner
+          once at 8 frames (`KokoroStageCDecoderOwnerFrameCount`) and loads
+          every `decoder.*` tensor except `decoder.generator.*` (one left unread
+          raises); `PrepareStageCDecoder(F)` / `ReleaseStageCDecoder` /
+          `RunStageCDecoder(t_en, PredDur, F0Curve, NCurve, DecoderStyle, x)`,
+          same borrowing rebuild, `ArmStageNet` and inference settings as
+          stages A and B. Real decoder, 102 frames (`fpc -O2` test build, no
+          AVX2, threaded, CPU): owner 31,155,936 weights (124.6 MB); 3.1-4.5 s
+          build + forward (2 runs); activations 171.5 MB with host-output
+          sharing off, 163.5 MB on (20 of 58 layers shared); the test process
+          (all three owners + the decoder net) peaks at 802 MB RSS.
+        - [ ] Stage C generator: recommended as a FOLLOWING net
+          (`StageCGenerator`), not appended to the decoder net. Inputs: x
+          (2F,1,512) at index 0, the host harmonic spectrum (120F+1,1,22) at
+          index 1. The host writes `Layers[1].Output`, then
+          `ComputeFromLayerOutput(StageCDecoderNet.GetLastLayer())` hands x
+          over (an OpenCL buffer copy when x is resident; `RunStageCDecoder`
+          would then skip its host copy). Why: generator parity can start from
+          the dump's dec_decode3 alone; one net would share no host storage
+          across the two (exact-size liveness slots, no common shapes); the
+          hand-over costs one 0.4 MB copy.
         Stage B done: `TNNetKokoro.LoadStageB` builds the stage-B owner once at 8
         frames (`KokoroStageBOwnerFrameCount`) and loads it (a stage-B tensor left
         unread raises, via `RaiseOnUnreadKokoroTensors`, now shared with stage A);
@@ -1639,6 +1660,7 @@ rather than acted on.
   - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
         (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
         (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
+        Same on the real stage-C decoder: 20 of 58 layers shared, 171.5 -> 163.5 MB.
   Phase 1 — loading:
   - [x] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
         pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
@@ -1757,7 +1779,7 @@ rather than acted on.
           B, 9 of 63 layers off OpenCL in a forced run; stage C has more).
         - [ ] A Y factor other than the X factor on SizeY > 1 runs
           `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
-  - [ ] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
+  - [x] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
         the Decoder (`F0_conv`/`N_conv` k3 s2, `encode`, `asr_res`, 4 `decode` blocks
         with the concat).
         F0Ntrain done: `BuildKokoroStageBNet(NN, Config, F)`: input en (F,1,
@@ -1774,8 +1796,39 @@ rather than acted on.
         1.6e-6: f0n_shared 1.2e-6 abs, F0_block1 5.3e-5 of 35.9, F0_pred 1.5e-4 of
         312.6 Hz, N_pred 5.7e-6 of 9.6). Stage-B parity feeds the dump's d and
         pred_dur, so it does not include stage A's error (d: 7.4e-6 rel.).
-        - [ ] Decoder half (stage C).
-        - [ ] Real stage A + B chained (our d into stage B) not compared to the dump.
+        - [x] Decoder half (stage C).
+          Done: `BuildKokoroStageCDecoderNet(NN, Config, F)`: three
+          `TNNetInput`s, the first layers of the net, fed by
+          `TNNet.Compute([asr, F0, N])` (the RAFT / F5-TTS multi-input idiom;
+          inputs of different lengths need no packing): asr (F,1,hidden),
+          F0 and N (2F,1,1). F0_conv / N_conv = `TNNetConv1DLinear(1, 3, 1, 2)`
+          on the curves, `TNNetDeepConcat([asr, F0, N])`, encode =
+          `AddKokoroAdainResBlock(.., 1024)`, asr_res =
+          `TNNetPointwiseConvLinear(64)` on asr, then per decode block
+          `TNNetDeepConcat([x, asr_res, F0, N])` (torch order) and
+          `AddKokoroAdainResBlock`; only the last block upsamples (to 2F, 512
+          out), so the package's `res` flag never stops the concat. The host
+          expands t_en to asr with `RepeatTokenRows`; the decoder style is the
+          FIRST half of ref_s. The norm1/norm2 fc loader is now
+          `LoadKokoroAdainResBlockStyleFcs`, shared with stage B. Tests:
+          `TestKokoroStageCDecoderTinyParity` (abs: asr 0, dec_N_conv 2.4e-7,
+          dec_encode 3.8e-6 of 49.7, dec_asr_res 1.5e-8, dec_decode0..3
+          1.5e-5/1.1e-5/7.6e-6/1.5e-5 of up to 106; dec_F0_conv relative
+          9.2e-8), `TestKokoroStageCDecoderBorrowingRebuild` (F = 10 and 6 vs a
+          fresh build), `TestKokoroStageCDecoderOpenCLParity` (PoCL, incl. a
+          style rewrite: 57 of 58 layers on OpenCL, the grouped pool stays on
+          the CPU; max |diff| x 7.6e-6 of 49.6), `TestKokoroRealStageCDecoderParity` (real dump, 102
+          frames, max rel. diff 2.6e-6: dec_F0_conv 1.5e-7, dec_N_conv 6.6e-8,
+          dec_encode 1.3e-6, dec_asr_res 8.1e-7, dec_decode0..3 6.9e-7/7.5e-7/
+          8.4e-7/2.6e-6; host-output sharing on == off).
+        - [x] Real stage A + B chained (our d into stage B) not compared to the dump.
+          Done: `TestKokoroRealStagesChainedToDecoder` runs A -> B -> decoder on
+          the real sentence from input_ids and ref_s only: pred_dur exact,
+          F0_pred 4.8e-4 Hz (rel. 1.5e-6), dec_decode3 1.5e-4 abs of 35.3 (rel. 4.2e-6);
+          3.3 s for the three stages, 999 MB peak RSS. Tolerance 1e-3 relative.
+        - [ ] CPU profile of the real decoder (3.1-4.5 s at 102 frames is slow
+          for ~31M weights x 102-204 frames); not run. Real decoder on a GPU:
+          not run.
         - [ ] Stage B on a GPU and a CPU profile: not run.
   - [ ] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
         down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
