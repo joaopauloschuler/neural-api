@@ -1527,7 +1527,16 @@ rather than acted on.
           products and scatters on the host; no resident source/output, and no
           borrowing (`EnableOpenCLInContextOf`) test for the deconv.
         - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
-          deconv) for 32-multiple channel counts: one extra weight copy.
+          deconv) for 32-multiple channel counts: one extra weight copy (dense
+          deconvs only now).
+        - [x] Grouped deconv under AVX: the base `SetPrevLayer` armed the
+          interleaved copy with the dense vector size (K*InDepth) over the
+          K*InDepth/G rows, so `InterleaveWithXFrom` divided by zero at >= 32
+          channels and >= 40 output positions (real stage B at 102 frames; the
+          8-frame owner never reached it). Fixed: `FNoInterleavedWeights` (set
+          for groups > 1) keeps `ShouldUseInterleavedDotProduct` false. Test
+          `TestDeconv1DLinearDepthwiseWide` (raised EDivByZero under -dAVX2
+          before the fix).
         - [x] per-channel Snake. Done: `TNNetSnake.Create(Alpha, PerChannelAlpha=
           true)` learns one alpha per channel in `Neurons[0].Weights` (Depth long,
           FStruct[0] = 1; scalar files unchanged); inference forward is row-wise
@@ -1591,8 +1600,24 @@ rather than acted on.
         `FlushWeightCache` raised EInvalidOp (empty caches). Real stage A: owner
         load 1.2-2.2 s, PrepareStageA 0.09-0.22 s, forward 0.32-0.44 s parallel /
         0.56-0.88 s serial (other runs on a busy VM: 1.3-3.9 s).
-        - [ ] Stage B owner/`PrepareStageB(F)` and stage C: add them beside stage A
-          (`FStage*Owner`, `FStage*Net`, one shared `FOpenCLContextNet`).
+        - [ ] Stage C: add it beside stages A and B (`FStage*Owner`,
+          `FStage*Net`, one shared `FOpenCLContextNet`, `ArmStageNet`).
+        Stage B done: `TNNetKokoro.LoadStageB` builds the stage-B owner once at 8
+        frames (`KokoroStageBOwnerFrameCount`) and loads it (a stage-B tensor left
+        unread raises, via `RaiseOnUnreadKokoroTensors`, now shared with stage A);
+        `PrepareStageB(F)` = the stage-A borrowing rebuild with early exit; the
+        post-build steps (threads, host-output sharing, OpenCL owner arming once,
+        `EnableOpenCLInContextOf`) are `ArmStageNet`, used by both stages.
+        `RunStageB(d, PredDur, ProsodyStyle, F0Curve, NCurve)`: host frame
+        expansion (`RepeatTokenRows`), 12 AdaIN1d style folds
+        (`WriteStyleIntoChannelAffine`), `TNNet.Compute`, then the (2F,1,2)
+        output split into F0_pred / N_pred (2F,1,1). Inference settings as stage A
+        (`SetTrainable(False)`, low memory): the depthwise pool is grouped, and
+        grouped `TNNetDeconvolution` runs the CPU scatter in either memory mode
+        (the GEMM path is dense-only), so fast memory buys nothing here. The
+        borrowing net sizes no weights (`WeightElementsSized` = 0). Real stage B,
+        102 frames, CPU (`fpc -O2` test build, no AVX2, threaded, one run):
+        236 ms build + forward.
         - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
           is known), so a borrowing build allocates and frees each table: 3
           tables, 114,176 floats on the real checkpoint. Other layers size none.
@@ -1695,16 +1720,63 @@ rather than acted on.
         torch.round) / clamp on the host. pred_dur exact on tiny and real.
         Tests: `TestKokoroStageATinyParity`, `TestKokoroStageABorrowingRebuild`,
         `TestKokoroStageAOpenCLParity`, `TestKokoroRealStageAParity`.
-        - [ ] Frame expansion by repeat (d and t_en, per pred_dur): the host step
-          before stage B.
-  - [ ] 2.5 AdaIN1d as above.
-  - [ ] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
+        - [x] Frame expansion by repeat (d and t_en, per pred_dur): the host step
+          before stage B. Done: `RepeatTokenRows(Source, Durations, Dest)` (one
+          `Move` per frame); stage C reuses it for t_en -> asr.
+  - [x] 2.5 AdaIN1d as above.
+        Done: `TNNetInstanceNorm` + the host fold `WriteStyleIntoChannelAffine`;
+        the fc of each AdaIN1d is loaded by `LoadKokoroStyleFc` (shape-checked,
+        shared with stage A's AdaLayerNorms). The checkpoint has no InstanceNorm
+        affine (torch builds `affine=True` and leaves it at 1/0).
+        Bug fixed on the way: `NeuralPerChannelMeanInvStd` (the CPU
+        instance-norm path of `TNNetGroupNorm` and `TNNetAdaIN`) computed the
+        variance as E[x^2] - mean^2, contrary to its declared contract; on a
+        near-constant channel (tiny F0_block0 norm1: variance 2e-5, eps 1e-5)
+        that cancelled to a 2.4e-4 norm1 error. Now centered (sum then
+        sum((x-mean)^2)); norm1 error 1.9e-6. Costs one extra pass (a `Move` +
+        2 `MulAdd` per position); not timed. The OpenCL kernel was already
+        centered.
+  - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
         1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
         ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
         `THiFiGANConv` (or the `TNNet` equivalent).
+        Done: `AddKokoroAdainResBlock(NN, InputLayer, DimOut, Upsample)` returns
+        `TKokoroAdainResBlockLayers` (Norm1/Norm2/Pool/Conv1/Conv2/Shortcut/
+        Output) for stage C's encode/decode blocks too: InstanceNorm, LeakyReLU
+        0.2, pool = `TNNetDeconv1DLinear(C, 3, 2, 1, 1, groups=C)`, conv1/conv2 =
+        `TNNetConv1DLinear` k3 p1; shortcut = `TNNetDeMaxPool(2, 0, pPoolSizeY=1)`
+        (new Y factor: an X-only nearest x2 on (L,1,C); `FStruct[3]`, 0 = old
+        behaviour; OpenCL gather when Y factor = X factor or SizeY = 1) then
+        `TNNetPointwiseConvLinear(DimOut, SuppressBias=1)`; `TNNetSum` +
+        `TNNetMulByConstant(1/sqrt 2)`. `LoadKokoroAdainResBlockWeights` loads
+        the convs; new `LoadTorchConvTranspose1DLinear` (grouped torch layout,
+        weight_norm folded) and `LoadTorchConv1DLinear` accept a conv without
+        bias (shared `LoadTorchConvBias`). Test `TestDeMaxPoolAlongXOnly`.
+        - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
+          pool downloads its source and re-uploads its output (2 pools in stage
+          B, 9 of 63 layers off OpenCL in a forced run; stage C has more).
+        - [ ] A Y factor other than the X factor on SizeY > 1 runs
+          `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
   - [ ] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
         the Decoder (`F0_conv`/`N_conv` k3 s2, `encode`, `asr_res`, 4 `decode` blocks
         with the concat).
+        F0Ntrain done: `BuildKokoroStageBNet(NN, Config, F)`: input en (F,1,
+        hidden+style = 640 real), shared bi-LSTM (cells read the input width),
+        then the F0 and N branches fork from it in one net (3 blocks each:
+        d_hid->d_hid, d_hid->d_hid/2 x2, d_hid/2->d_hid/2), `F0_proj`/`N_proj` as
+        `TNNetPointwiseConvLinear(1)`, `TNNetDeepConcat` -> (2F,1,2). Tests:
+        `TestKokoroStageBTinyParity` (abs: en 0, f0n_shared 6.0e-8, F0_block0..2
+        4.5e-6/1.3e-5/1.8e-5, N_block0..2 5.2e-6/3.4e-6/8.8e-6; F0_pred / N_pred
+        checked relative because F0 is in Hz: 5.2e-4 of 140.7 = 3.7e-6, 6.3e-6 of
+        2.1), `TestKokoroStageBBorrowingRebuild` (F = 10 and 6, vs a fresh build),
+        `TestKokoroStageBOpenCLParity` (PoCL, incl. a style rewrite),
+        `TestKokoroRealStageBParity` (real dump, 102 frames, max rel. diff
+        1.6e-6: f0n_shared 1.2e-6 abs, F0_block1 5.3e-5 of 35.9, F0_pred 1.5e-4 of
+        312.6 Hz, N_pred 5.7e-6 of 9.6). Stage-B parity feeds the dump's d and
+        pred_dur, so it does not include stage A's error (d: 7.4e-6 rel.).
+        - [ ] Decoder half (stage C).
+        - [ ] Real stage A + B chained (our d into stage B) not compared to the dump.
+        - [ ] Stage B on a GPU and a CPU profile: not run.
   - [ ] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
         down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
         9->1 + tanh.

@@ -5373,7 +5373,8 @@ function BuildVitsFromSafeTensors(const FileName: string;
 // whose root is a dict of the five state dicts bert, bert_encoder,
 // predictor, text_encoder and decoder, keys prefixed "module.") and
 // voices/<name>.pt (a bare tensor [rows, 1, 2*style_dim]). TNNetKokoro runs
-// stage A (text side); stages B and C are not implemented yet. Coded by Claude (AI).
+// stages A (text side) and B (prosody); stage C is not implemented yet.
+// Coded by Claude (AI).
 // ---------------------------------------------------------------------------
 const
   KokoroSampleRate = 24000;
@@ -5470,9 +5471,19 @@ procedure WriteStyleIntoChannelAffine(NormLayer: TNNetLayer;
   NormWeight: TNNetVolume = nil; NormBias: TNNetVolume = nil);
 
 // Loads the torch Conv1d Prefix (weight_norm folded) into a TNNetConv1DLinear:
-// weight [o][c][k] goes to neuron o at (k, 0, c); the bias as is.
+// weight [o][c][k] goes to neuron o at (k, 0, c); the bias as is (0 if absent).
 procedure LoadTorchConv1DLinear(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Conv: TNNetLayer; Consumed: TStrings);
+
+// Loads the torch ConvTranspose1d Prefix (weight_norm folded) into a
+// TNNetDeconv1DLinear: w[g*In/G + c][o][k] goes to neuron g*(Out/G) + o at (k, 0, c).
+procedure LoadTorchConvTranspose1DLinear(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Deconv: TNNetLayer; Consumed: TStrings);
+
+// Repeats row t of Source (T,1,C) Durations[t] times into Dest (sum,1,C):
+// Kokoro's en = d^T @ pred_aln_trg without the alignment matrix.
+procedure RepeatTokenRows(Source: TNNetVolume;
+  const Durations: array of integer; Dest: TNNetVolume);
 
 const
   // Stage-A input channels: token id, token type (always 0), then the
@@ -5507,11 +5518,52 @@ function BuildKokoroStageANet(NN: TNNet; const Config: TKokoroConfig;
   TokenCount: integer): TKokoroStageALayers;
 
 type
+  // An AdainResBlk1d (StyleTTS2 / Kokoro): the layers its loader and the host
+  // style step use.
+  TKokoroAdainResBlockLayers = record
+    Norm1, Norm2: TNNetLayer;  // AdaIN1d InstanceNorms (style written per run)
+    Pool: TNNetLayer;          // depthwise ConvTranspose1d x2; nil without upsample
+    Conv1, Conv2: TNNetLayer;
+    Shortcut: TNNetLayer;      // conv1x1 without bias; nil when dim_in = dim_out
+    Output: TNNetLayer;        // (residual + shortcut) * rsqrt(2)
+  end;
+
+// Adds AdainResBlk1d(InputLayer depth -> DimOut) on InputLayer's (L,1,C)
+// output; Upsample doubles L. Dropout is the identity (inference).
+function AddKokoroAdainResBlock(NN: TNNet; InputLayer: TNNetLayer;
+  DimOut: integer; Upsample: boolean): TKokoroAdainResBlockLayers;
+
+// Loads the AdainResBlk1d convs of Prefix into Block (not the norm fc: the
+// host folds it per utterance with WriteStyleIntoChannelAffine).
+procedure LoadKokoroAdainResBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const Block: TKokoroAdainResBlockLayers;
+  Consumed: TStrings);
+
+const
+  // AdainResBlk1d count of each ProsodyPredictor F0 / N branch.
+  KokoroF0NBlockCount = 3;
+
+type
+  // The stage-B layers the host reads or writes (BuildKokoroStageBNet).
+  TKokoroStageBLayers = record
+    SharedLSTM: TNNetLayer;    // predictor.shared: f0n_shared
+    F0Blocks, NBlocks: array of TKokoroAdainResBlockLayers;
+    F0Proj, NProj: TNNetLayer; // F0_pred, N_pred: (2F,1,1)
+    // Every AdaIN1d: F0 blocks then N blocks, norm1 before norm2.
+    StyleNorms: array of TNNetLayer;
+  end;
+
+// Adds Kokoro stage B (ProsodyPredictor.F0Ntrain) for FrameCount frames of en
+// (F,1,hidden+style) to the empty NN; the output is [F0; N] on 2F positions.
+function BuildKokoroStageBNet(NN: TNNet; const Config: TKokoroConfig;
+  FrameCount: integer): TKokoroStageBLayers;
+
+type
   // Kokoro-82M as TNNet stages run by TNNet.Compute with host steps between
   // them. Each stage has a weight owner built once from the checkpoint and a
   // net sized per utterance that borrows the owner's weights. Stage A (text
-  // side: PL-BERT, duration predictor, text encoder) only so far.
-  // Coded by Claude (AI).
+  // side: PL-BERT, duration predictor, text encoder) and stage B (prosody:
+  // F0Ntrain) so far. Coded by Claude (AI).
   TNNetKokoro = class(TObject)
   private
     FConfig: TKokoroConfig;
@@ -5522,17 +5574,30 @@ type
     FStageAInput: TNNetVolume;
     // predictor.text_encoder AdaLayerNorm fc: [2*hidden_dim, style_dim] + bias.
     FDurationNormFcWeights, FDurationNormFcBiases: array of TNNetVolume;
+    FStageBOwner: TNNet;
+    FStageBNet: TNNet;
+    FStageBLayers: TKokoroStageBLayers;
+    FStageBFrameCount: integer;
+    // en: d repeated per predicted duration, the stage-B input.
+    FStageBInput: TNNetVolume;
+    // AdaIN1d fc of each FStageBLayers.StyleNorms entry: [2C, style_dim] + bias.
+    FStageBNormFcWeights, FStageBNormFcBiases: array of TNNetVolume;
     FParallel: boolean;
     FMaxThreads: integer;
     FShareHostOutputs: boolean;
+    // Set when the stage owner is armed in the OpenCL context.
+    FStageAOwnerOnOpenCL, FStageBOwnerOnOpenCL: boolean;
     {$IFDEF OpenCL}
     // Weightless net owning the OpenCL context and program (EnableOpenCL).
     FOpenCLContextNet: TNNet;
     FOpenCLHasSharedKernel: boolean;
     FShareOpenCLOutputs: boolean;
-    FStageAOwnerOnOpenCL: boolean;
     {$ENDIF}
     procedure LoadStageA(Reader: TNNetSafeTensorsReader);
+    procedure LoadStageB(Reader: TNNetSafeTensorsReader);
+    // After a borrowing build of Net: inference threads, host-output sharing
+    // and, with OpenCL enabled, the owner's arming (once) and Net's.
+    procedure ArmStageNet(Net, Owner: TNNet; var OwnerOnOpenCL: boolean);
   public
     // Builds the stage owners from an OpenKokoroSnapshot reader and its config.
     constructor Create(Reader: TNNetSafeTensorsReader;
@@ -5548,6 +5613,14 @@ type
       const ProsodyStyle: array of TNeuralFloat; Speed: TNeuralFloat;
       DurationFeatures, TextFeatures: TNNetVolume;
       out PredictedDurations: TNeuralIntegerArray);
+    // (Re)builds StageBNet for FrameCount frames; a same-length call is free.
+    procedure PrepareStageB(FrameCount: integer);
+    procedure ReleaseStageB();
+    // Stage B: DurationFeatures (d from RunStageA) repeated per
+    // PredictedDurations, then F0Ntrain; F0_pred and N_pred as (2F,1,1).
+    procedure RunStageB(DurationFeatures: TNNetVolume;
+      const PredictedDurations: array of integer;
+      const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
     {$IFDEF OpenCL}
     // One OpenCL context and program for every stage net (owner weights
     // uploaded once, borrowed); false if the program does not build.
@@ -5555,6 +5628,7 @@ type
       pHasSharedKernel: boolean = true): boolean;
     function OpenCLEnabled(): boolean;
     property StageAOwnerOnOpenCL: boolean read FStageAOwnerOnOpenCL;
+    property StageBOwnerOnOpenCL: boolean read FStageBOwnerOnOpenCL;
     property ShareOpenCLOutputs: boolean read FShareOpenCLOutputs
       write FShareOpenCLOutputs;
     {$ENDIF}
@@ -5563,6 +5637,11 @@ type
     property StageANet: TNNet read FStageANet;
     // The layers of StageANet (valid until the next rebuild).
     property StageALayers: TKokoroStageALayers read FStageALayers;
+    property StageBOwner: TNNet read FStageBOwner;
+    property StageBNet: TNNet read FStageBNet;
+    property StageBLayers: TKokoroStageBLayers read FStageBLayers;
+    // en of the last RunStageB: (F,1,hidden+style).
+    property StageBInput: TNNetVolume read FStageBInput;
     // Read when a stage net is (re)built, as in TQwenImage21VaeDecoder.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
@@ -51176,15 +51255,43 @@ begin
   NormLayer.FlushWeightCache();
 end;
 
+// Prefix.bias into the neurons' BiasWeight (0 when the conv has no bias).
+procedure LoadTorchConvBias(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Conv: TNNetLayer; Consumed: TStrings);
+var
+  Biases: TNNetVolume;
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  MaxNeuronPos := Conv.Neurons.Count - 1;
+  if not Reader.HasTensor(Prefix + '.bias') then
+  begin
+    for NeuronPos := 0 to MaxNeuronPos do
+      Conv.Neurons[NeuronPos].BiasWeight := 0;
+    exit;
+  end;
+  Biases := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.bias', Biases);
+    Consumed.Add(Prefix + '.bias');
+    if Biases.Size <> Conv.Neurons.Count then
+      ImportError('Conv import: "' + Prefix + '.bias" has ' +
+        IntToStr(Biases.Size) + ' elements, expected ' +
+        IntToStr(Conv.Neurons.Count) + '.');
+    for NeuronPos := 0 to MaxNeuronPos do
+      Conv.Neurons[NeuronPos].BiasWeight := Biases.FData[NeuronPos];
+  finally
+    Biases.Free;
+  end;
+end;
+
 procedure LoadTorchConv1DLinear(Reader: TNNetSafeTensorsReader;
   const Prefix: string; Conv: TNNetLayer; Consumed: TStrings);
 var
-  Weights, Biases, NeuronWeights: TNNetVolume;
+  Weights, NeuronWeights: TNNetVolume;
   OutDim, InDim, K, OutPos, InPos, TapPos: integer;
   MaxOutPos, MaxInPos, MaxTapPos, SourcePos: integer;
 begin
   Weights := TNNetVolume.Create;
-  Biases := TNNetVolume.Create;
   try
     LoadTorchConv1DWeight(Reader, Prefix, Weights, OutDim, InDim, K, Consumed);
     EnsureWritableImportWeights(Conv);
@@ -51198,12 +51305,7 @@ begin
         IntToStr(Conv.Neurons[0].Weights.SizeX) + 'x' +
         IntToStr(Conv.Neurons[0].Weights.SizeY) + 'x' +
         IntToStr(Conv.Neurons[0].Weights.Depth) + '.');
-    Reader.LoadTensorFlat(Prefix + '.bias', Biases);
-    Consumed.Add(Prefix + '.bias');
-    if Biases.Size <> OutDim then
-      ImportError('Conv1d import: "' + Prefix + '.bias" has ' +
-        IntToStr(Biases.Size) + ' elements, expected ' + IntToStr(OutDim) +
-        '.');
+    LoadTorchConvBias(Reader, Prefix, Conv, Consumed);
     MaxOutPos := OutDim - 1;
     MaxInPos := InDim - 1;
     MaxTapPos := K - 1;
@@ -51219,12 +51321,102 @@ begin
             Weights.FData[SourcePos];
           Inc(SourcePos);
         end;
-      Conv.Neurons[OutPos].BiasWeight := Biases.FData[OutPos];
     end;
     Conv.FlushWeightCache();
   finally
-    Biases.Free;
     Weights.Free;
+  end;
+end;
+
+procedure LoadTorchConvTranspose1DLinear(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Deconv: TNNetLayer; Consumed: TStrings);
+var
+  Weights, NeuronWeights: TNNetVolume;
+  InDim, GroupOutDim, K, Groups, GroupInDim: integer;
+  InPos, LocalInPos, LocalOutPos, NeuronPos, TapPos, SourcePos: integer;
+  MaxInPos, MaxLocalOutPos, MaxTapPos: integer;
+begin
+  if not (Deconv is TNNetDeconvolution) then
+    ImportError('ConvTranspose1d import: "' + Prefix + '" needs a ' +
+      'TNNetDeconv1DLinear, got ' + Deconv.ClassName + '.');
+  Weights := TNNetVolume.Create;
+  try
+    // Torch layout [In, Out/G, K].
+    LoadTorchConv1DWeight(Reader, Prefix, Weights, InDim, GroupOutDim, K,
+      Consumed);
+    EnsureWritableImportWeights(Deconv);
+    Groups := TNNetDeconvolution(Deconv).Groups;
+    GroupInDim := InDim div Groups;
+    if (InDim mod Groups <> 0) or
+       (Deconv.Neurons.Count <> GroupOutDim * Groups) or
+       (Deconv.Neurons[0].Weights.SizeX <> K) or
+       (Deconv.Neurons[0].Weights.SizeY <> 1) or
+       (Deconv.Neurons[0].Weights.Depth <> GroupInDim) then
+      ImportError('ConvTranspose1d import: "' + Prefix + '" is [' +
+        IntToStr(InDim) + ', ' + IntToStr(GroupOutDim) + ', ' + IntToStr(K) +
+        '] but the layer has ' + IntToStr(Groups) + ' groups of ' +
+        IntToStr(Deconv.Neurons.Count) + ' neurons of ' +
+        IntToStr(Deconv.Neurons[0].Weights.SizeX) + 'x' +
+        IntToStr(Deconv.Neurons[0].Weights.SizeY) + 'x' +
+        IntToStr(Deconv.Neurons[0].Weights.Depth) + '.');
+    LoadTorchConvBias(Reader, Prefix, Deconv, Consumed);
+    MaxInPos := InDim - 1;
+    MaxLocalOutPos := GroupOutDim - 1;
+    MaxTapPos := K - 1;
+    SourcePos := 0;
+    for InPos := 0 to MaxInPos do
+    begin
+      LocalInPos := InPos mod GroupInDim;
+      NeuronPos := (InPos div GroupInDim) * GroupOutDim;
+      for LocalOutPos := 0 to MaxLocalOutPos do
+      begin
+        NeuronWeights := Deconv.Neurons[NeuronPos].Weights;
+        for TapPos := 0 to MaxTapPos do
+        begin
+          NeuronWeights.FData[TapPos * GroupInDim + LocalInPos] :=
+            Weights.FData[SourcePos];
+          Inc(SourcePos);
+        end;
+        Inc(NeuronPos);
+      end;
+    end;
+    Deconv.FlushWeightCache();
+  finally
+    Weights.Free;
+  end;
+end;
+
+procedure RepeatTokenRows(Source: TNNetVolume;
+  const Durations: array of integer; Dest: TNNetVolume);
+var
+  TokenPos, MaxTokenPos, RepeatPos, MaxRepeatPos, FrameCount: integer;
+  RowBytes, DestRowBase: integer;
+begin
+  if (Length(Durations) <> Source.SizeX) or (Source.SizeY <> 1) then
+    ImportError('RepeatTokenRows: ' + IntToStr(Length(Durations)) +
+      ' durations for a ' + IntToStr(Source.SizeX) + 'x' +
+      IntToStr(Source.SizeY) + ' source.');
+  MaxTokenPos := Length(Durations) - 1;
+  FrameCount := 0;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    if Durations[TokenPos] < 0 then
+      ImportError('RepeatTokenRows: negative duration at token ' +
+        IntToStr(TokenPos) + '.');
+    Inc(FrameCount, Durations[TokenPos]);
+  end;
+  Dest.ReSize(FrameCount, 1, Source.Depth);
+  RowBytes := Source.Depth * csNeuralFloatSize;
+  DestRowBase := 0;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    MaxRepeatPos := Durations[TokenPos] - 1;
+    for RepeatPos := 0 to MaxRepeatPos do
+    begin
+      Move(Source.FData[TokenPos * Source.Depth], Dest.FData[DestRowBase],
+        RowBytes);
+      Inc(DestRowBase, Source.Depth);
+    end;
   end;
 end;
 
@@ -51338,6 +51530,165 @@ begin
   Result := AddKokoroStageA(NN, Config, TokenCount, BertLayers);
 end;
 
+function AddKokoroAdainResBlock(NN: TNNet; InputLayer: TNNetLayer;
+  DimOut: integer; Upsample: boolean): TKokoroAdainResBlockLayers;
+var
+  DimIn: integer;
+  ShortcutSource: TNNetLayer;
+begin
+  Result := Default(TKokoroAdainResBlockLayers);
+  DimIn := InputLayer.Output.Depth;
+  // Residual: AdaIN1d, LeakyReLU, pool, conv1, AdaIN1d, LeakyReLU, conv2.
+  Result.Norm1 := NN.AddLayerAfter(TNNetInstanceNorm.Create(), InputLayer);
+  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+  if Upsample then
+    Result.Pool := NN.AddLayer(TNNetDeconv1DLinear.Create(DimIn, 3, 2, 1, 1,
+      {pGroups=}DimIn));
+  Result.Conv1 := NN.AddLayer(TNNetConv1DLinear.Create(DimOut, 3, 1, 1));
+  Result.Norm2 := NN.AddLayer(TNNetInstanceNorm.Create());
+  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+  Result.Conv2 := NN.AddLayer(TNNetConv1DLinear.Create(DimOut, 3, 1, 1));
+  // Shortcut: nearest x2 along X (UpSample1d), then conv1x1 without bias.
+  ShortcutSource := InputLayer;
+  if Upsample then
+    ShortcutSource := NN.AddLayerAfter(TNNetDeMaxPool.Create(2, 0,
+      {pPoolSizeY=}1), InputLayer);
+  if DimIn <> DimOut then
+  begin
+    Result.Shortcut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(DimOut,
+      {pSuppressBias=}1), ShortcutSource);
+    ShortcutSource := Result.Shortcut;
+  end;
+  NN.AddLayer(TNNetSum.Create([Result.Conv2, ShortcutSource]));
+  Result.Output := NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
+end;
+
+procedure LoadKokoroAdainResBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const Block: TKokoroAdainResBlockLayers;
+  Consumed: TStrings);
+begin
+  LoadTorchConv1DLinear(Reader, Prefix + '.conv1', Block.Conv1, Consumed);
+  LoadTorchConv1DLinear(Reader, Prefix + '.conv2', Block.Conv2, Consumed);
+  if Assigned(Block.Pool) then
+    LoadTorchConvTranspose1DLinear(Reader, Prefix + '.pool', Block.Pool,
+      Consumed);
+  if Assigned(Block.Shortcut) then
+    LoadTorchConv1DLinear(Reader, Prefix + '.conv1x1', Block.Shortcut,
+      Consumed);
+end;
+
+function BuildKokoroStageBNet(NN: TNNet; const Config: TKokoroConfig;
+  FrameCount: integer): TKokoroStageBLayers;
+const
+  // d_hid -> d_hid, d_hid -> d_hid/2 (x2 upsample), d_hid/2 -> d_hid/2.
+  BlockHalvesWidth: array[0..KokoroF0NBlockCount - 1] of boolean =
+    (false, true, false);
+  MaxBlockPos = KokoroF0NBlockCount - 1;
+var
+  BranchPos, BlockPos, BlockWidth, StyleNormPos: integer;
+  BranchInput: TNNetLayer;
+  Blocks: array of TKokoroAdainResBlockLayers;
+  Projection: TNNetLayer;
+begin
+  Result := Default(TKokoroStageBLayers);
+  if FrameCount < 1 then
+    ImportError('Kokoro: stage B needs at least one frame, got ' +
+      IntToStr(FrameCount) + '.');
+  if Odd(Config.HiddenDim) then
+    ImportError('Kokoro: hidden_dim must be even.');
+  NN.AddLayer(TNNetInput.Create(FrameCount, 1,
+    Config.HiddenDim + Config.StyleDim));
+  Result.SharedLSTM := NN.AddBidirectionalLSTM(Config.HiddenDim div 2, 1,
+    {Bidirectional=}true, {CellsReadInputWidth=}true);
+  SetLength(Result.StyleNorms, 4 * KokoroF0NBlockCount);
+  StyleNormPos := 0;
+  // Branch 0 = F0, branch 1 = N; both fork from the shared bi-LSTM.
+  for BranchPos := 0 to 1 do
+  begin
+    SetLength(Blocks, KokoroF0NBlockCount);
+    BranchInput := Result.SharedLSTM;
+    BlockWidth := Config.HiddenDim;
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      if BlockHalvesWidth[BlockPos] then BlockWidth := BlockWidth div 2;
+      Blocks[BlockPos] := AddKokoroAdainResBlock(NN, BranchInput, BlockWidth,
+        {Upsample=}BlockHalvesWidth[BlockPos]);
+      Result.StyleNorms[StyleNormPos] := Blocks[BlockPos].Norm1;
+      Result.StyleNorms[StyleNormPos + 1] := Blocks[BlockPos].Norm2;
+      Inc(StyleNormPos, 2);
+      BranchInput := Blocks[BlockPos].Output;
+    end;
+    Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+    if BranchPos = 0 then
+    begin
+      Result.F0Blocks := Blocks;
+      Result.F0Proj := Projection;
+    end
+    else
+    begin
+      Result.NBlocks := Blocks;
+      Result.NProj := Projection;
+    end;
+    Blocks := nil;
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create([Result.F0Proj, Result.NProj]));
+  // Same inference settings as stage A (low memory). The grouped pool runs the
+  // CPU scatter in either memory mode.
+  NN.SetTrainable(false);
+end;
+
+// The AdaIN1d / AdaLayerNorm fc FcName ([2*Channels, style_dim] + bias) into
+// new volumes the caller owns.
+procedure LoadKokoroStyleFc(Reader: TNNetSafeTensorsReader;
+  const FcName: string; Channels, StyleDim: integer;
+  out FcWeight, FcBias: TNNetVolume; Consumed: TStrings);
+begin
+  if (Reader.DimCount(FcName + '.weight') <> 2) or
+     (Reader.DimSize(FcName + '.weight', 0) <> 2 * Channels) or
+     (Reader.DimSize(FcName + '.weight', 1) <> StyleDim) then
+    ImportError('Kokoro import: ' + FcName + '.weight is ' +
+      Reader.ShapeAsString(FcName + '.weight') + ', expected [' +
+      IntToStr(2 * Channels) + ', ' + IntToStr(StyleDim) + '].');
+  FcWeight := TNNetVolume.Create();
+  FcBias := TNNetVolume.Create();
+  Reader.LoadTensorFlat(FcName + '.weight', FcWeight);
+  Reader.LoadTensorFlat(FcName + '.bias', FcBias);
+  Consumed.Add(FcName + '.weight');
+  Consumed.Add(FcName + '.bias');
+end;
+
+// Raises on a tensor under one of StagePrefixes missing from Consumed (an
+// entry ending in '.' consumes every tensor it prefixes).
+procedure RaiseOnUnreadKokoroTensors(Reader: TNNetSafeTensorsReader;
+  Consumed: TStrings; const StagePrefixes: array of string;
+  const StageName: string);
+var
+  TensorPos, MaxTensorPos, PrefixPos, MaxConsumedPos: integer;
+  TensorNameStr: string;
+  IsConsumed: boolean;
+begin
+  MaxTensorPos := Reader.Count - 1;
+  MaxConsumedPos := Consumed.Count - 1;
+  for TensorPos := 0 to MaxTensorPos do
+  begin
+    TensorNameStr := Reader.TensorName(TensorPos);
+    if (Pos('bert.pooler.', TensorNameStr) = 1) or
+       (Pos('bert.embeddings.position_ids', TensorNameStr) = 1) or
+       (Consumed.IndexOf(TensorNameStr) >= 0) then continue;
+    IsConsumed := false;
+    for PrefixPos := 0 to MaxConsumedPos do
+      if (Consumed[PrefixPos][Length(Consumed[PrefixPos])] = '.') and
+         (Pos(Consumed[PrefixPos], TensorNameStr) = 1) then
+        IsConsumed := true;
+    if IsConsumed then continue;
+    for PrefixPos := Low(StagePrefixes) to High(StagePrefixes) do
+      if Pos(StagePrefixes[PrefixPos], TensorNameStr) = 1 then
+        ImportError('Kokoro import: ' + StageName + ' tensor "' +
+          TensorNameStr + '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') was not loaded.');
+  end;
+end;
+
 // Loads every stage-A weight except the AdaLayerNorm fc (the host applies it).
 procedure LoadKokoroStageAWeights(Reader: TNNetSafeTensorsReader; NN: TNNet;
   const Config: TKokoroConfig; const Layers: TKokoroStageALayers;
@@ -51392,6 +51743,8 @@ end;
 
 const
   KokoroStageAOwnerTokenCount = 8;
+  // Long enough that no stage-B conv kernel is clamped.
+  KokoroStageBOwnerFrameCount = 8;
 
 constructor TNNetKokoro.Create(Reader: TNNetSafeTensorsReader;
   const Config: TKokoroConfig);
@@ -51406,7 +51759,9 @@ begin
     GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
   {$ENDIF}
   FStageAInput := TNNetVolume.Create();
+  FStageBInput := TNNetVolume.Create();
   LoadStageA(Reader);
+  LoadStageB(Reader);
 end;
 
 destructor TNNetKokoro.Destroy();
@@ -51414,17 +51769,26 @@ var
   LayerPos, MaxLayerPos: integer;
 begin
   ReleaseStageA();
+  ReleaseStageB();
   {$IFDEF OpenCL}
   FOpenCLContextNet.Free;
   {$ENDIF}
   FStageAOwner.Free;
+  FStageBOwner.Free;
   MaxLayerPos := Length(FDurationNormFcWeights) - 1;
   for LayerPos := 0 to MaxLayerPos do
   begin
     FDurationNormFcWeights[LayerPos].Free;
     FDurationNormFcBiases[LayerPos].Free;
   end;
+  MaxLayerPos := Length(FStageBNormFcWeights) - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    FStageBNormFcWeights[LayerPos].Free;
+    FStageBNormFcBiases[LayerPos].Free;
+  end;
   FStageAInput.Free;
+  FStageBInput.Free;
   inherited Destroy();
 end;
 
@@ -51439,10 +51803,7 @@ var
   Consumed: TStringList;
   BertLayers: TBertEncoderLayers;
   OwnerLayers: TKokoroStageALayers;
-  LayerPos, MaxLayerPos, TensorPos, MaxTensorPos, PrefixPos: integer;
-  MaxConsumedPos: integer;
-  FcName, TensorNameStr: string;
-  IsConsumed: boolean;
+  LayerPos, MaxLayerPos: integer;
 begin
   Consumed := TStringList.Create;
   Consumed.Sorted := true;
@@ -51458,49 +51819,94 @@ begin
     SetLength(FDurationNormFcWeights, FConfig.NumLayers);
     SetLength(FDurationNormFcBiases, FConfig.NumLayers);
     for LayerPos := 0 to MaxLayerPos do
-    begin
-      FcName := 'predictor.text_encoder.lstms.' + IntToStr(2 * LayerPos + 1) +
-        '.fc';
-      if (Reader.DimCount(FcName + '.weight') <> 2) or
-         (Reader.DimSize(FcName + '.weight', 0) <> 2 * FConfig.HiddenDim) or
-         (Reader.DimSize(FcName + '.weight', 1) <> FConfig.StyleDim) then
-        ImportError('Kokoro import: ' + FcName + '.weight is ' +
-          Reader.ShapeAsString(FcName + '.weight') + ', expected [' +
-          IntToStr(2 * FConfig.HiddenDim) + ', ' + IntToStr(FConfig.StyleDim) +
-          '].');
-      FDurationNormFcWeights[LayerPos] := TNNetVolume.Create();
-      FDurationNormFcBiases[LayerPos] := TNNetVolume.Create();
-      Reader.LoadTensorFlat(FcName + '.weight',
-        FDurationNormFcWeights[LayerPos]);
-      Reader.LoadTensorFlat(FcName + '.bias', FDurationNormFcBiases[LayerPos]);
-      Consumed.Add(FcName + '.weight');
-      Consumed.Add(FcName + '.bias');
-    end;
-    // Consumed entries ending in '.' are prefixes: LoadTorchLSTMInto names its
-    // tensors itself.
-    MaxTensorPos := Reader.Count - 1;
-    MaxConsumedPos := Consumed.Count - 1;
-    for TensorPos := 0 to MaxTensorPos do
-    begin
-      TensorNameStr := Reader.TensorName(TensorPos);
-      if (Pos('bert.pooler.', TensorNameStr) = 1) or
-         (Pos('bert.embeddings.position_ids', TensorNameStr) = 1) or
-         (Consumed.IndexOf(TensorNameStr) >= 0) then continue;
-      IsConsumed := false;
-      for PrefixPos := 0 to MaxConsumedPos do
-        if (Consumed[PrefixPos][Length(Consumed[PrefixPos])] = '.') and
-           (Pos(Consumed[PrefixPos], TensorNameStr) = 1) then
-          IsConsumed := true;
-      if IsConsumed then continue;
-      for PrefixPos := Low(StageAPrefixes) to High(StageAPrefixes) do
-        if Pos(StageAPrefixes[PrefixPos], TensorNameStr) = 1 then
-          ImportError('Kokoro import: stage-A tensor "' + TensorNameStr +
-            '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
-            ') was not loaded.');
-    end;
+      LoadKokoroStyleFc(Reader, 'predictor.text_encoder.lstms.' +
+        IntToStr(2 * LayerPos + 1) + '.fc', FConfig.HiddenDim,
+        FConfig.StyleDim, FDurationNormFcWeights[LayerPos],
+        FDurationNormFcBiases[LayerPos], Consumed);
+    RaiseOnUnreadKokoroTensors(Reader, Consumed, StageAPrefixes, 'stage-A');
   finally
     Consumed.Free;
   end;
+end;
+
+procedure TNNetKokoro.LoadStageB(Reader: TNNetSafeTensorsReader);
+const
+  StageBPrefixes: array[0..4] of string = ('predictor.shared.',
+    'predictor.F0.', 'predictor.N.', 'predictor.F0_proj.',
+    'predictor.N_proj.');
+  BranchNames: array[0..1] of string = ('F0', 'N');
+var
+  Consumed: TStringList;
+  OwnerLayers: TKokoroStageBLayers;
+  BranchPos, BlockPos, MaxBlockPos, StyleNormPos: integer;
+  Blocks: array of TKokoroAdainResBlockLayers;
+  BlockPrefix: string;
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := true;
+  Consumed.Duplicates := dupIgnore;
+  try
+    FStageBOwner := TNNet.Create();
+    OwnerLayers := BuildKokoroStageBNet(FStageBOwner, FConfig,
+      KokoroStageBOwnerFrameCount);
+    LoadTorchLSTMInto(Reader, 'predictor.shared', FStageBOwner,
+      OwnerLayers.SharedLSTM, FConfig.HiddenDim div 2, 1, true,
+      FStageBOwner.Layers[0]);
+    Consumed.Add('predictor.shared.');
+    SetLength(FStageBNormFcWeights, Length(OwnerLayers.StyleNorms));
+    SetLength(FStageBNormFcBiases, Length(OwnerLayers.StyleNorms));
+    StyleNormPos := 0;
+    for BranchPos := 0 to 1 do
+    begin
+      if BranchPos = 0 then Blocks := OwnerLayers.F0Blocks
+      else Blocks := OwnerLayers.NBlocks;
+      MaxBlockPos := Length(Blocks) - 1;
+      for BlockPos := 0 to MaxBlockPos do
+      begin
+        BlockPrefix := 'predictor.' + BranchNames[BranchPos] + '.' +
+          IntToStr(BlockPos);
+        LoadKokoroAdainResBlockWeights(Reader, BlockPrefix, Blocks[BlockPos],
+          Consumed);
+        // The order of OwnerLayers.StyleNorms: norm1, then norm2.
+        LoadKokoroStyleFc(Reader, BlockPrefix + '.norm1.fc',
+          Blocks[BlockPos].Norm1.Output.Depth, FConfig.StyleDim,
+          FStageBNormFcWeights[StyleNormPos],
+          FStageBNormFcBiases[StyleNormPos], Consumed);
+        LoadKokoroStyleFc(Reader, BlockPrefix + '.norm2.fc',
+          Blocks[BlockPos].Norm2.Output.Depth, FConfig.StyleDim,
+          FStageBNormFcWeights[StyleNormPos + 1],
+          FStageBNormFcBiases[StyleNormPos + 1], Consumed);
+        Inc(StyleNormPos, 2);
+      end;
+    end;
+    LoadTorchConv1DLinear(Reader, 'predictor.F0_proj', OwnerLayers.F0Proj,
+      Consumed);
+    LoadTorchConv1DLinear(Reader, 'predictor.N_proj', OwnerLayers.NProj,
+      Consumed);
+    RaiseOnUnreadKokoroTensors(Reader, Consumed, StageBPrefixes, 'stage-B');
+  finally
+    Consumed.Free;
+  end;
+end;
+
+procedure TNNetKokoro.ArmStageNet(Net, Owner: TNNet;
+  var OwnerOnOpenCL: boolean);
+begin
+  PrepareInferenceThreads(Net, FParallel, FMaxThreads);
+  Net.ShareHostOutputsByLiveness := FShareHostOutputs;
+  {$IFDEF OpenCL}
+  if Assigned(FOpenCLContextNet) then
+  begin
+    if not OwnerOnOpenCL then
+    begin
+      ArmWeightOwnerInOpenCLContext(Owner, FOpenCLContextNet,
+        FOpenCLHasSharedKernel);
+      OwnerOnOpenCL := true;
+    end;
+    Net.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
+    Net.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
+  end;
+  {$ENDIF}
 end;
 
 procedure TNNetKokoro.PrepareStageA(TokenCount: integer);
@@ -51511,22 +51917,7 @@ begin
   FStageANet.BuildWeightOwner := FStageAOwner;
   FStageALayers := BuildKokoroStageANet(FStageANet, FConfig, TokenCount);
   FStageANet.BuildWeightOwner := nil;
-  PrepareInferenceThreads(FStageANet, FParallel, FMaxThreads);
-  FStageANet.ShareHostOutputsByLiveness := FShareHostOutputs;
-  {$IFDEF OpenCL}
-  if Assigned(FOpenCLContextNet) then
-  begin
-    if not FStageAOwnerOnOpenCL then
-    begin
-      ArmWeightOwnerInOpenCLContext(FStageAOwner, FOpenCLContextNet,
-        FOpenCLHasSharedKernel);
-      FStageAOwnerOnOpenCL := true;
-    end;
-    FStageANet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
-    FStageANet.EnableOpenCLInContextOf(FOpenCLContextNet,
-      FOpenCLHasSharedKernel);
-  end;
-  {$ENDIF}
+  ArmStageNet(FStageANet, FStageAOwner, FStageAOwnerOnOpenCL);
   FStageATokenCount := TokenCount;
 end;
 
@@ -51535,6 +51926,63 @@ begin
   FreeAndNil(FStageANet);
   FStageALayers := Default(TKokoroStageALayers);
   FStageATokenCount := 0;
+end;
+
+procedure TNNetKokoro.PrepareStageB(FrameCount: integer);
+begin
+  if Assigned(FStageBNet) and (FrameCount = FStageBFrameCount) then exit;
+  ReleaseStageB();
+  FStageBNet := TNNet.Create();
+  FStageBNet.BuildWeightOwner := FStageBOwner;
+  FStageBLayers := BuildKokoroStageBNet(FStageBNet, FConfig, FrameCount);
+  FStageBNet.BuildWeightOwner := nil;
+  ArmStageNet(FStageBNet, FStageBOwner, FStageBOwnerOnOpenCL);
+  FStageBFrameCount := FrameCount;
+end;
+
+procedure TNNetKokoro.ReleaseStageB();
+begin
+  FreeAndNil(FStageBNet);
+  FStageBLayers := Default(TKokoroStageBLayers);
+  FStageBFrameCount := 0;
+end;
+
+procedure TNNetKokoro.RunStageB(DurationFeatures: TNNetVolume;
+  const PredictedDurations: array of integer;
+  const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
+var
+  StyleNormPos, MaxStyleNormPos, CurvePos, MaxCurvePos, OutputPos: integer;
+  Output: TNNetVolume;
+begin
+  if Length(ProsodyStyle) <> FConfig.StyleDim then
+    ImportError('Kokoro: the prosody style has ' +
+      IntToStr(Length(ProsodyStyle)) + ' values, expected style_dim = ' +
+      IntToStr(FConfig.StyleDim) + '.');
+  if DurationFeatures.Depth <> FConfig.HiddenDim + FConfig.StyleDim then
+    ImportError('Kokoro: stage B reads d with ' +
+      IntToStr(FConfig.HiddenDim + FConfig.StyleDim) + ' channels, got ' +
+      IntToStr(DurationFeatures.Depth) + '.');
+  RepeatTokenRows(DurationFeatures, PredictedDurations, FStageBInput);
+  PrepareStageB(FStageBInput.SizeX);
+  MaxStyleNormPos := Length(FStageBLayers.StyleNorms) - 1;
+  for StyleNormPos := 0 to MaxStyleNormPos do
+    WriteStyleIntoChannelAffine(FStageBLayers.StyleNorms[StyleNormPos],
+      FStageBNormFcWeights[StyleNormPos], FStageBNormFcBiases[StyleNormPos],
+      ProsodyStyle);
+  FStageBNet.Compute(FStageBInput, 0, FParallel);
+  FStageBNet.GetLastLayer().ForceOutputOnRAM();
+  // Host step: the output is [F0; N] per position.
+  Output := FStageBNet.GetLastLayer().Output;
+  F0Curve.ReSize(Output.SizeX, 1, 1);
+  NCurve.ReSize(Output.SizeX, 1, 1);
+  MaxCurvePos := Output.SizeX - 1;
+  OutputPos := 0;
+  for CurvePos := 0 to MaxCurvePos do
+  begin
+    F0Curve.FData[CurvePos] := Output.FData[OutputPos];
+    NCurve.FData[CurvePos] := Output.FData[OutputPos + 1];
+    Inc(OutputPos, 2);
+  end;
 end;
 
 procedure TNNetKokoro.RunStageA(const TokenIds: array of integer;
@@ -51615,6 +52063,7 @@ begin
   FOpenCLHasSharedKernel := pHasSharedKernel;
   // A live stage net was built on the CPU: the next Prepare* arms a new one.
   ReleaseStageA();
+  ReleaseStageB();
 end;
 
 function TNNetKokoro.OpenCLEnabled(): boolean;
