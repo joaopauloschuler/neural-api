@@ -1406,10 +1406,12 @@ rather than acted on.
       `modules.py`, `istftnet.py`). One Opus agent per task, run serially, test +
       commit after each.
       Decisions:
-      - REPLACE the pico `TNNetKokoro` (neuralpretrained.pas:5439, its invented
-        tensor names, `tools/make_pico_kokoro_fixture.py`, `TestKokoroSynthesisParity`,
-        examples/KokoroTTS) with the real architecture. Its AdaIN uses plain `gamma`;
-        the checkpoint needs `(1+gamma)`.
+      - REPLACE the pico `TNNetKokoro` with the real architecture. Its AdaIN used
+        plain `gamma`; the checkpoint needs `(1+gamma)`. Removed in commit 403d17f2
+        (`TNNetKokoro`, its config/AdaIN records and builders,
+        `tools/make_pico_kokoro_fixture.py`, the `tiny_kokoro*` pico fixtures,
+        `TestKokoroSynthesisParity`, examples/KokoroTTS); the names are free for
+        the real model.
       - Noise: zero noise by default (repeatable output, simple parity), random noise
         as an option.
       - Code structure: `TNNet` stages run by `TNNet.Compute`, so OpenCL comes with
@@ -1583,15 +1585,47 @@ rather than acted on.
         (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
         (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
   Phase 1 — loading:
-  - [ ] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
+  - [x] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
         pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
-  - [ ] 1.2 `TNNetTorchBinReader`: accept a bare-tensor root (rejected today at
+        Done: the unpickler accepts BUILD only as a dict's attribute dict (the
+        state dicts' `_metadata`, dropped); the five nested state dicts flatten
+        to `<component>.module.<name>` and `OpenKokoroCheckpoint` renames them to
+        `<component>.<name>` (`RenameTensorPrefix`, no reader copy). Real file:
+        548 tensors, 81,763,410 parameters, all F32; every tensor read once
+        (1.45 s, 19.5 MB RSS); counts and sum/sum-abs match torch. The extra zip
+        entries of the tiny fixture (`.format_version`, `.storage_alignment`)
+        needed no change.
+  - [x] 1.2 `TNNetTorchBinReader`: accept a bare-tensor root (rejected today at
         neuraltorchbin.pas:1018); voice-pack row selection.
-  - [ ] 1.3 Config reader: `plbert`, `istftnet`, `vocab` (keys are multibyte IPA
+        Done: a bare-tensor root is exposed as the one tensor
+        `TorchBinBareTensorName` ('tensor'). `LoadKokoroVoicePack` (checks
+        [rows, 1, 2*style_dim]) + `SelectKokoroVoiceStyle(Pack, PhonemeCount,
+        DecoderStyle, ProsodyStyle)`: row PhonemeCount-1 (kokoro's
+        `pack[len(ps)-1]`, code points of the phoneme string incl. symbols the
+        vocab skips); raises outside 1..rows.
+  - [x] 1.3 Config reader: `plbert`, `istftnet`, `vocab` (keys are multibyte IPA
         characters: look up per UTF-8 code point).
-  - [ ] 1.4 Load from the snapshot folder: one call takes the folder plus a voice
+        Done: `TKokoroConfig` / `ReadKokoroConfigFromJSONFile` (escapes decoded,
+        raw-UTF-8 parse; each vocab key must be one code point; embedding_size
+        defaults to 128). The istftnet arrays go into a `THiFiGANConfig` through
+        the new `ReadHiFiGANGeneratorFields`, now shared by the HiFi-GAN and VITS
+        config readers. `KokoroPhonemesToIds` (binary search per code point,
+        skipped symbols returned, raises past max_position_embeddings).
+        `ReadKokoroWidthsFromWeights` sets DecoderWidth / DecoderBlockInputWidth /
+        DecoderOutputWidth / AsrResWidth / DecoderBlockCount (real 1024 / 1090 /
+        512 / 64 / 4) and checks word-embedding and conv_post shapes against the
+        config. The fpjson 255-byte key limit does not apply (keys are 1-3 bytes).
+  - [x] 1.4 Load from the snapshot folder: one call takes the folder plus a voice
         name (`af_heart`) and finds the three files. The example takes the folder as
         a command-line argument (the HF cache path contains a commit hash).
+        Done: `OpenKokoroSnapshot(Dir, VoiceName, out Config, out Voice)` returns
+        the reader; errors name the missing folder / config.json / voice, and
+        list the *.pth files when there is not exactly one.
+        Tests: `TestKokoroCheckpointTensors`, `TestKokoroVoicePackRowSelection`,
+        `TestKokoroConfigFromJSONFile`, `TestKokoroPhonemesToIds`,
+        `TestKokoroSnapshotLoad`, `TestKokoroRealSnapshotSmoke` (Ignored when no
+        snapshot is in the HF cache; `NEURAL_KOKORO82M_DIR` overrides).
+        Commit d6db9f49.
   Phase 2 — components, in graph order:
   - [ ] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
         and one shared layer (do not clone it); then `bert_encoder` 768->512.
@@ -1640,7 +1674,10 @@ rather than acted on.
         dictionaries on first use instead of committing them.
   Phase 4 — integration:
   - [ ] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
-        writes 24 kHz WAV.
+        writes 24 kHz WAV. The pico example of that name was removed in 403d17f2:
+        recreate it (new .lpr needs cthreads first; re-add its `.gitignore` entry
+        for the output WAV, the binary entry is still there) and its
+        examples/README.md entry.
   - [ ] 4.2 Per-stage parity on the tiny fixture (< 1e-4) + one real-checkpoint
         test against the 0.1 dump, under the 3 GB ulimit.
   - [ ] 4.3 README (planned vs supported split; "supported" only after the user
