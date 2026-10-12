@@ -2258,7 +2258,7 @@ function BuildPhiFromSafeTensors(const FileName: string;
 type
   // The encoder families sharing the BERT skeleton (selected by
   // config.json's model_type; see the BERT IMPORT section of the header).
-  TBertFamily = (bfBert, bfDistilBert, bfRoberta);
+  TBertFamily = (bfBert, bfDistilBert, bfRoberta, bfAlbert);
 
   TBertConfig = record
     Family: TBertFamily;       // bert / distilbert / roberta (model_type)
@@ -2281,6 +2281,10 @@ type
                                // usable SeqLen is MaxPositions - 2)
     Prefix: string;            // tensor-name prefix ('' or 'bert.' /
                                // 'distilbert.' / 'roberta.')
+    EmbeddingSize: integer;    // bfAlbert only: embedding table width;
+                               // encoder.embedding_hidden_mapping_in projects
+                               // it to HiddenSize, and every block shares the
+                               // weights of the one albert_layers.0 block
   end;
 
 // Reads a HF BERT-family config.json (model_type 'bert' or 'distilbert').
@@ -25747,6 +25751,289 @@ type
     QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: TNNetLayer;
   end;
 
+  // The encoder layers AddBertEncoder adds and LoadBertEncoderWeights fills.
+  TBertEncoderLayers = record
+    WordEmb, PosEmb, TypeEmb, EmbLN, EmbProj: TNNetLayer;
+    Blocks: array of TBertBlockLayers;
+  end;
+
+// Loads a [Rows, Cols] table into a TNNetEmbedding / positional embedding,
+// skipping the first SrcRowOffset rows (RoBERTa's never-read padding rows).
+procedure LoadBertEmbeddingTable(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const TName: string; Rows, Cols: integer;
+  SrcRowOffset: integer; Consumed: TStrings);
+var
+  Tmp, WV: TNNetVolume;
+  UsedSize: integer;
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError('BERT import: missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 2) or
+     (Reader.DimSize(TName, 0) <> Rows) or
+     (Reader.DimSize(TName, 1) <> Cols) then
+    ImportError('BERT import: "' + TName + '" must have shape [' +
+      IntToStr(Rows) + ', ' + IntToStr(Cols) + '], got ' +
+      Reader.ShapeAsString(TName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    UsedSize := (Rows - SrcRowOffset) * Cols;
+    if Layer.FArrNeurons[0].Weights.Size <> UsedSize then
+      ImportError('BERT import: "' + TName + '" usable element count ' +
+        IntToStr(UsedSize) + ' does not match the table size ' +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + '.');
+    if SrcRowOffset = 0 then
+      Layer.FArrNeurons[0].Weights.Copy(Tmp)
+    else
+    begin
+      WV := Layer.FArrNeurons[0].Weights;
+      Move(Tmp.FData[SrcRowOffset * Cols], WV.FData[0],
+        UsedSize * csNeuralFloatSize);
+    end;
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+  Consumed.Add(TName);
+end;
+
+// Adds the BERT-family encoder after InputLayer (channel 0 = token ids, 1 =
+// token-type ids); SegMaskSrc (or nil) is every attention block's key mask.
+function AddBertEncoder(NN: TNNet; const Config: TBertConfig;
+  InputLayer, SegMaskSrc: TNNetLayer; PositionRows: integer;
+  pTrainable, pQuantizeInt8: boolean): TBertEncoderLayers;
+var
+  SliceLayer, HiddenAct, PhiBranch, BranchInput: TNNetLayer;
+  BlockCnt, BlockMax, EmbeddingWidth: integer;
+  FirstBlockLayerIdx, BlockLayerIdx, LayerPos, MaxLayerPos: integer;
+  IsShared: boolean;
+begin
+  Result := Default(TBertEncoderLayers);
+  IsShared := Config.Family = bfAlbert;
+  if IsShared and pQuantizeInt8 then
+    ImportError('BERT import: int8 is not available for the shared ALBERT ' +
+      'blocks.');
+  if IsShared then EmbeddingWidth := Config.EmbeddingSize
+  else EmbeddingWidth := Config.HiddenSize;
+  if EmbeddingWidth < 1 then
+    ImportError('BERT import: embedding_size must be >= 1.');
+  // Word branch: tokens -> embedding -> + learned absolute positions.
+  // EncodeZero=1: token id 0 is [PAD], a REAL row in the BERT vocab.
+  // Anchored explicitly to InputLayer (GetLastLayer may be the segment
+  // mask source when pPaddingMask is on).
+  NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
+  Result.WordEmb := NN.AddLayer( TNNetEmbedding.Create(
+    Config.VocabSize, EmbeddingWidth, {EncodeZero=}1).SetTrainable(pTrainable) );
+  // The structural table only carries the USABLE rows: row p is
+  // checkpoint row p + PositionOffset (0 for bert/distilbert).
+  Result.PosEmb := NN.AddLayer(
+    TNNetLearnedPositionalEmbedding.Create(PositionRows).SetTrainable(pTrainable) );
+  if Config.TypeVocabSize > 0 then
+  begin
+    // Token-type branch: segment ids -> their own embedding table,
+    // then word + position + token-type summed.
+    SliceLayer := NN.AddLayerAfter(
+      TNNetSplitChannels.Create([1]), InputLayer);
+    Result.TypeEmb := NN.AddLayerAfter( TNNetEmbedding.Create(
+      Config.TypeVocabSize, EmbeddingWidth, {EncodeZero=}1).SetTrainable(pTrainable),
+      SliceLayer);
+    NN.AddLayer( TNNetSum.Create([Result.PosEmb, Result.TypeEmb]) );
+  end;
+  // ... then the embedding LayerNorm.
+  Result.EmbLN := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+  // ALBERT factorizes the embedding: embedding_size -> hidden_size.
+  if IsShared then
+    Result.EmbProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+  if not pTrainable then NN.SetTrainable();
+  if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+  SetLength(Result.Blocks, Config.NumLayers);
+  BlockMax := Config.NumLayers - 1;
+  FirstBlockLayerIdx := NN.GetLastLayerIdx() + 1;
+  for BlockCnt := 0 to BlockMax do
+  begin
+    BlockLayerIdx := NN.GetLastLayerIdx() + 1;
+    // POST-LN attention sub-block:
+    //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
+    BranchInput := NN.GetLastLayer();
+    Result.Blocks[BlockCnt].QKV := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
+    // CausalMask=false: every position attends to all SeqLen keys
+    // (INTERSECTED with the key-padding segment mask when pPaddingMask is
+    // on - SegMaskSrc excludes the [PAD] key positions from every real
+    // query, so a short document is encoded exactly).
+    Result.Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
+      Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
+      {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
+      {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+      {SegmentSource=}SegMaskSrc);
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Result.Blocks[BlockCnt].AttnLN := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    // POST-LN FFN sub-block:
+    //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
+    BranchInput := NN.GetLastLayer();
+    Result.Blocks[BlockCnt].Inter := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
+    if Config.HiddenActTanh then
+      NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+    else
+    begin
+      // EXACT erf GELU x*Phi(x) composed from existing layers (see the
+      // unit header): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch,
+      // then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
+      // (TNNetReGLU applies the ReLU to the FIRST depth half, the
+      // Shazeer max(0, xW) (x) xV convention - Phi must come first.)
+      HiddenAct := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+    Result.Blocks[BlockCnt].OutDense := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Result.Blocks[BlockCnt].OutLN := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    // Shared blocks borrow block 0's rows layer by layer; a borrowing build
+    // links them to the owner's root layer instead (LinkBuildWeightOwner).
+    if IsShared and (BlockCnt > 0) and not Assigned(NN.BuildWeightOwner) then
+    begin
+      MaxLayerPos := NN.GetLastLayerIdx();
+      for LayerPos := BlockLayerIdx to MaxLayerPos do
+        if NN.Layers[LayerPos].Neurons.Count > 0 then
+          NN.Layers[LayerPos].LinkWeightsFrom(
+            NN.Layers[FirstBlockLayerIdx + LayerPos - BlockLayerIdx]);
+    end;
+    if not pTrainable then NN.SetTrainable();
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+  end;
+end;
+
+// Loads the embeddings and every block of an AddBertEncoder encoder (block 0
+// only for the shared ALBERT blocks); adds each consumed tensor name to Consumed.
+procedure LoadBertEncoderWeights(Reader: TNNetSafeTensorsReader; NN: TNNet;
+  const Config: TBertConfig; const Layers: TBertEncoderLayers;
+  Consumed: TStrings; pQuantizeInt8: boolean);
+var
+  BlockCnt, BlockMax, EmbeddingWidth: integer;
+  BlockPrefix: string;
+  QName, KName, VName, AttnDenseName, AttnLNName: string;
+  InterName, OutDenseName, OutLNName: string;
+
+  procedure LoadLinear(Layer: TNNetLayer; const LinearName: string;
+    InDim, OutDim, NeuronBase, ExpectedNeurons: integer);
+  begin
+    LoadLlamaLinearWeights(Reader, Layer, LinearName + '.weight', InDim,
+      OutDim, NeuronBase, ExpectedNeurons, 0, LinearName + '.bias');
+    Consumed.Add(LinearName + '.weight');
+    Consumed.Add(LinearName + '.bias');
+  end;
+
+  procedure LoadNorm(Layer: TNNetLayer; const NormName: string);
+  begin
+    LoadLayerNormWeights(Reader, Layer, NormName + '.weight',
+      NormName + '.bias', Config.HiddenSize);
+    Consumed.Add(NormName + '.weight');
+    Consumed.Add(NormName + '.bias');
+  end;
+
+begin
+  if Config.Family = bfAlbert then EmbeddingWidth := Config.EmbeddingSize
+  else EmbeddingWidth := Config.HiddenSize;
+  LoadBertEmbeddingTable(Reader, Layers.WordEmb,
+    Config.Prefix + 'embeddings.word_embeddings.weight',
+    Config.VocabSize, EmbeddingWidth, 0, Consumed);
+  // PositionOffset > 0 (roberta): checkpoint rows 0..PositionOffset-1
+  // are padding-position rows and are NEVER read.
+  LoadBertEmbeddingTable(Reader, Layers.PosEmb,
+    Config.Prefix + 'embeddings.position_embeddings.weight',
+    Config.MaxPositions, EmbeddingWidth, Config.PositionOffset, Consumed);
+  if Config.TypeVocabSize > 0 then
+    LoadBertEmbeddingTable(Reader, Layers.TypeEmb,
+      Config.Prefix + 'embeddings.token_type_embeddings.weight',
+      Config.TypeVocabSize, EmbeddingWidth, 0, Consumed);
+  LoadLayerNormWeights(Reader, Layers.EmbLN,
+    Config.Prefix + 'embeddings.LayerNorm.weight',
+    Config.Prefix + 'embeddings.LayerNorm.bias', EmbeddingWidth);
+  Consumed.Add(Config.Prefix + 'embeddings.LayerNorm.weight');
+  Consumed.Add(Config.Prefix + 'embeddings.LayerNorm.bias');
+  if Assigned(Layers.EmbProj) then
+    LoadLinear(Layers.EmbProj,
+      Config.Prefix + 'encoder.embedding_hidden_mapping_in', EmbeddingWidth,
+      Config.HiddenSize, 0, -1);
+  BlockMax := Config.NumLayers - 1;
+  // The shared ALBERT blocks link block 0's rows.
+  if Config.Family = bfAlbert then BlockMax := Min(BlockMax, 0);
+  for BlockCnt := 0 to BlockMax do
+  begin
+    // Same six weight slots in every family - only the names differ.
+    if Config.Family = bfDistilBert then
+    begin
+      BlockPrefix := Config.Prefix + 'transformer.layer.' +
+        IntToStr(BlockCnt) + '.';
+      QName := BlockPrefix + 'attention.q_lin';
+      KName := BlockPrefix + 'attention.k_lin';
+      VName := BlockPrefix + 'attention.v_lin';
+      AttnDenseName := BlockPrefix + 'attention.out_lin';
+      AttnLNName := BlockPrefix + 'sa_layer_norm';
+      InterName := BlockPrefix + 'ffn.lin1';
+      OutDenseName := BlockPrefix + 'ffn.lin2';
+      OutLNName := BlockPrefix + 'output_layer_norm';
+    end
+    else if Config.Family = bfAlbert then
+    begin
+      BlockPrefix := Config.Prefix +
+        'encoder.albert_layer_groups.0.albert_layers.0.';
+      QName := BlockPrefix + 'attention.query';
+      KName := BlockPrefix + 'attention.key';
+      VName := BlockPrefix + 'attention.value';
+      AttnDenseName := BlockPrefix + 'attention.dense';
+      AttnLNName := BlockPrefix + 'attention.LayerNorm';
+      InterName := BlockPrefix + 'ffn';
+      OutDenseName := BlockPrefix + 'ffn_output';
+      OutLNName := BlockPrefix + 'full_layer_layer_norm';
+    end
+    else
+    begin
+      BlockPrefix := Config.Prefix + 'encoder.layer.' +
+        IntToStr(BlockCnt) + '.';
+      QName := BlockPrefix + 'attention.self.query';
+      KName := BlockPrefix + 'attention.self.key';
+      VName := BlockPrefix + 'attention.self.value';
+      AttnDenseName := BlockPrefix + 'attention.output.dense';
+      AttnLNName := BlockPrefix + 'attention.output.LayerNorm';
+      InterName := BlockPrefix + 'intermediate.dense';
+      OutDenseName := BlockPrefix + 'output.dense';
+      OutLNName := BlockPrefix + 'output.LayerNorm';
+    end;
+    // Separate biased nn.Linear q/k/v -> the fused Q|K|V slab (query ->
+    // neurons 0..d-1, key -> d..2d-1, value -> 2d..3d-1; the builder's
+    // per-head slicing then matches HF's transpose_for_scores).
+    LoadLinear(Layers.Blocks[BlockCnt].QKV, QName, Config.HiddenSize,
+      Config.HiddenSize, 0, 3 * Config.HiddenSize);
+    LoadLinear(Layers.Blocks[BlockCnt].QKV, KName, Config.HiddenSize,
+      Config.HiddenSize, Config.HiddenSize, 3 * Config.HiddenSize);
+    LoadLinear(Layers.Blocks[BlockCnt].QKV, VName, Config.HiddenSize,
+      Config.HiddenSize, 2 * Config.HiddenSize, 3 * Config.HiddenSize);
+    LoadLinear(Layers.Blocks[BlockCnt].AttnDense, AttnDenseName,
+      Config.HiddenSize, Config.HiddenSize, 0, -1);
+    LoadNorm(Layers.Blocks[BlockCnt].AttnLN, AttnLNName);
+    LoadLinear(Layers.Blocks[BlockCnt].Inter, InterName, Config.HiddenSize,
+      Config.IntermediateSize, 0, -1);
+    LoadLinear(Layers.Blocks[BlockCnt].OutDense, OutDenseName,
+      Config.IntermediateSize, Config.HiddenSize, 0, -1);
+    LoadNorm(Layers.Blocks[BlockCnt].OutLN, OutLNName);
+    // Re-quantize the block just refilled with checkpoint weights.
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+  end;
+end;
+
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pIncludePooler: boolean = false;
@@ -25756,66 +26043,18 @@ var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
-  Blocks: array of TBertBlockLayers;
-  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN, SegMaskSrc: TNNetLayer;
+  Encoder: TBertEncoderLayers;
+  InputLayer, SegMaskSrc: TNNetLayer;
   PoolerDense, ClassifierDense, ClsHeadDense: TNNetLayer;
   ClsHeadName, ClsOutName: string;
   IncludePooler: boolean;
-  BranchInput, SliceLayer, HiddenAct, PhiBranch: TNNetLayer;
-  BlockCnt, SeqLen, UsablePositions, NumLabels, i: integer;
-  BlockMax: integer;
-  BlockPrefix, TensorNameStr, FamilyPrefix: string;
-  QName, KName, VName, AttnDenseName, AttnLNName: string;
-  InterName, OutDenseName, OutLNName: string;
+  SeqLen, UsablePositions, NumLabels, i: integer;
+  TensorNameStr, FamilyPrefix: string;
   Consumed: TStringList;
 
   procedure MarkConsumed(const TName: string);
   begin
     Consumed.Add(TName);
-  end;
-
-  // Loads a [Rows, Cols] embedding table straight into the single-neuron
-  // weight volume of a TNNetEmbedding / TNNetLearnedPositionalEmbedding
-  // (row-major in both the checkpoint and the layer). SrcRowOffset > 0
-  // SKIPS the first SrcRowOffset checkpoint rows (the layer table then has
-  // Rows - SrcRowOffset rows): the RoBERTa position-table case, where rows
-  // 0..PositionOffset-1 are padding-position rows that are NEVER read.
-  procedure LoadEmbeddingTable(Layer: TNNetLayer; const TName: string;
-    Rows, Cols: integer; SrcRowOffset: integer = 0);
-  var
-    Tmp, WV: TNNetVolume;
-    UsedSize: integer;
-  begin
-    if not Reader.HasTensor(TName) then
-      ImportError('BERT import: missing tensor "' + TName + '".');
-    if (Reader.DimCount(TName) <> 2) or
-       (Reader.DimSize(TName, 0) <> Rows) or
-       (Reader.DimSize(TName, 1) <> Cols) then
-      ImportError('BERT import: "' + TName + '" must have shape [' +
-        IntToStr(Rows) + ', ' + IntToStr(Cols) + '], got ' +
-        Reader.ShapeAsString(TName));
-    Tmp := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(TName, Tmp);
-      EnsureWritableImportWeights(Layer);
-      UsedSize := (Rows - SrcRowOffset) * Cols;
-      if Layer.FArrNeurons[0].Weights.Size <> UsedSize then
-        ImportError('BERT import: "' + TName + '" usable element count ' +
-          IntToStr(UsedSize) + ' does not match the table size ' +
-          IntToStr(Layer.FArrNeurons[0].Weights.Size) + '.');
-      if SrcRowOffset = 0 then
-        Layer.FArrNeurons[0].Weights.Copy(Tmp)
-      else
-      begin
-        WV := Layer.FArrNeurons[0].Weights;
-        Move(Tmp.FData[SrcRowOffset * Cols], WV.FData[0],
-          UsedSize * csNeuralFloatSize);
-      end;
-      Layer.FlushWeightCache();
-    finally
-      Tmp.Free;
-    end;
-    MarkConsumed(TName);
   end;
 
 begin
@@ -25838,6 +26077,9 @@ begin
       if (Config.Family = bfDistilBert) and pIncludePooler then
         ImportError('BERT import: DistilBERT has no pooler head - ' +
           'pIncludePooler is not available for model_type "distilbert".');
+      if (Config.Family = bfAlbert) and (pIncludePooler or pSeqClsHead) then
+        ImportError('BERT import: the ALBERT pooler and classifier heads ' +
+          'are not implemented.');
       // Only the bert classifier sits on tanh(pooler(h)) - that head
       // forces the pooler. DistilBERT (pre_classifier + ReLU) and RoBERTa
       // (classifier.dense + tanh + classifier.out_proj) classify the raw
@@ -25850,6 +26092,8 @@ begin
         FamilyPrefix := 'distilbert.'
       else if Config.Family = bfRoberta then
         FamilyPrefix := 'roberta.'
+      else if Config.Family = bfAlbert then
+        FamilyPrefix := 'albert.'
       else
         FamilyPrefix := 'bert.';
       if Reader.HasTensor('embeddings.word_embeddings.weight') then
@@ -25899,86 +26143,8 @@ begin
         // (SeqLen,1,1) per-sample segment-id source; varies across the batch.
         SegMaskSrc := NN.AddLayerAfter(
           TNNetSplitChannels.Create([2]), InputLayer);
-      // Word branch: tokens -> embedding -> + learned absolute positions.
-      // EncodeZero=1: token id 0 is [PAD], a REAL row in the BERT vocab.
-      // Anchored explicitly to InputLayer (GetLastLayer may be the segment
-      // mask source when pPaddingMask is on).
-      NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
-      WordEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
-      // The structural table only carries the USABLE rows: row p is
-      // checkpoint row p + PositionOffset (0 for bert/distilbert).
-      PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(UsablePositions).SetTrainable(pTrainable) );
-      TypeEmb := nil;
-      if Config.TypeVocabSize > 0 then
-      begin
-        // Token-type branch: segment ids -> their own embedding table,
-        // then word + position + token-type summed.
-        SliceLayer := NN.AddLayerAfter(
-          TNNetSplitChannels.Create([1]), InputLayer);
-        TypeEmb := NN.AddLayerAfter( TNNetEmbedding.Create(
-          Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable),
-          SliceLayer);
-        NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
-      end;
-      // ... then the embedding LayerNorm.
-      EmbLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-      if not pTrainable then NN.SetTrainable();
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
-      SetLength(Blocks, Config.NumLayers);
-      BlockMax := Config.NumLayers - 1;
-      for BlockCnt := 0 to BlockMax do
-      begin
-        // POST-LN attention sub-block:
-        //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
-        BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
-        // CausalMask=false: every position attends to all SeqLen keys
-        // (INTERSECTED with the key-padding segment mask when pPaddingMask is
-        // on - SegMaskSrc excludes the [PAD] key positions from every real
-        // query, so a short document is encoded exactly).
-        Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
-          Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
-          {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
-          {RelPosMaxDistance=}128, {QKRMSNorm=}false,
-          {SegmentSource=}SegMaskSrc);
-        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        Blocks[BlockCnt].AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-        // POST-LN FFN sub-block:
-        //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
-        BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
-        if Config.HiddenActTanh then
-          NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
-        else
-        begin
-          // EXACT erf GELU x*Phi(x) composed from existing layers (see the
-          // unit header): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch,
-          // then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
-          // (TNNetReGLU applies the ReLU to the FIRST depth half, the
-          // Shazeer max(0, xW) (x) xV convention - Phi must come first.)
-          HiddenAct := NN.GetLastLayer();
-          NN.AddLayerAfter(
-            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
-          NN.AddLayer( TNNetErf.Create() );
-          NN.AddLayer( TNNetAddConstant.Create(1.0) );
-          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
-          NN.AddLayer( TNNetReGLU.Create() );
-        end;
-        Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
-        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        Blocks[BlockCnt].OutLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-        if not pTrainable then NN.SetTrainable();
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
-      end;
+      Encoder := AddBertEncoder(NN, Config, InputLayer, SegMaskSrc,
+        UsablePositions, pTrainable, pQuantizeInt8);
       // No final norm and NO LM head: the encoder output IS the last
       // block's LN output, (SeqLen,1,hidden) final hidden states.
       PoolerDense := nil;
@@ -26045,107 +26211,8 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
-      LoadEmbeddingTable(WordEmb,
-        Config.Prefix + 'embeddings.word_embeddings.weight',
-        Config.VocabSize, Config.HiddenSize);
-      // PositionOffset > 0 (roberta): checkpoint rows 0..PositionOffset-1
-      // are padding-position rows and are NEVER read.
-      LoadEmbeddingTable(PosEmb,
-        Config.Prefix + 'embeddings.position_embeddings.weight',
-        Config.MaxPositions, Config.HiddenSize, Config.PositionOffset);
-      if Config.TypeVocabSize > 0 then
-        LoadEmbeddingTable(TypeEmb,
-          Config.Prefix + 'embeddings.token_type_embeddings.weight',
-          Config.TypeVocabSize, Config.HiddenSize);
-      LoadLayerNormWeights(Reader, EmbLN,
-        Config.Prefix + 'embeddings.LayerNorm.weight',
-        Config.Prefix + 'embeddings.LayerNorm.bias', Config.HiddenSize);
-      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.weight');
-      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.bias');
-      BlockMax := Config.NumLayers - 1;
-      for BlockCnt := 0 to BlockMax do
-      begin
-        // Same six weight slots in both families - only the names differ.
-        if Config.Family = bfDistilBert then
-        begin
-          BlockPrefix := Config.Prefix + 'transformer.layer.' +
-            IntToStr(BlockCnt) + '.';
-          QName := BlockPrefix + 'attention.q_lin';
-          KName := BlockPrefix + 'attention.k_lin';
-          VName := BlockPrefix + 'attention.v_lin';
-          AttnDenseName := BlockPrefix + 'attention.out_lin';
-          AttnLNName := BlockPrefix + 'sa_layer_norm';
-          InterName := BlockPrefix + 'ffn.lin1';
-          OutDenseName := BlockPrefix + 'ffn.lin2';
-          OutLNName := BlockPrefix + 'output_layer_norm';
-        end
-        else
-        begin
-          BlockPrefix := Config.Prefix + 'encoder.layer.' +
-            IntToStr(BlockCnt) + '.';
-          QName := BlockPrefix + 'attention.self.query';
-          KName := BlockPrefix + 'attention.self.key';
-          VName := BlockPrefix + 'attention.self.value';
-          AttnDenseName := BlockPrefix + 'attention.output.dense';
-          AttnLNName := BlockPrefix + 'attention.output.LayerNorm';
-          InterName := BlockPrefix + 'intermediate.dense';
-          OutDenseName := BlockPrefix + 'output.dense';
-          OutLNName := BlockPrefix + 'output.LayerNorm';
-        end;
-        // Separate biased nn.Linear q/k/v -> the fused Q|K|V slab (query ->
-        // neurons 0..d-1, key -> d..2d-1, value -> 2d..3d-1; the builder's
-        // per-head slicing then matches HF's transpose_for_scores).
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
-          QName + '.weight',
-          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize,
-          0, QName + '.bias');
-        MarkConsumed(QName + '.weight');
-        MarkConsumed(QName + '.bias');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
-          KName + '.weight',
-          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
-          3 * Config.HiddenSize, 0, KName + '.bias');
-        MarkConsumed(KName + '.weight');
-        MarkConsumed(KName + '.bias');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
-          VName + '.weight',
-          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
-          3 * Config.HiddenSize, 0,
-          VName + '.bias');
-        MarkConsumed(VName + '.weight');
-        MarkConsumed(VName + '.bias');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
-          AttnDenseName + '.weight',
-          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
-          AttnDenseName + '.bias');
-        MarkConsumed(AttnDenseName + '.weight');
-        MarkConsumed(AttnDenseName + '.bias');
-        LoadLayerNormWeights(Reader, Blocks[BlockCnt].AttnLN,
-          AttnLNName + '.weight',
-          AttnLNName + '.bias',
-          Config.HiddenSize);
-        MarkConsumed(AttnLNName + '.weight');
-        MarkConsumed(AttnLNName + '.bias');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
-          InterName + '.weight',
-          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
-          InterName + '.bias');
-        MarkConsumed(InterName + '.weight');
-        MarkConsumed(InterName + '.bias');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
-          OutDenseName + '.weight',
-          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
-          OutDenseName + '.bias');
-        MarkConsumed(OutDenseName + '.weight');
-        MarkConsumed(OutDenseName + '.bias');
-        LoadLayerNormWeights(Reader, Blocks[BlockCnt].OutLN,
-          OutLNName + '.weight',
-          OutLNName + '.bias', Config.HiddenSize);
-        MarkConsumed(OutLNName + '.weight');
-        MarkConsumed(OutLNName + '.bias');
-        // Re-quantize the block just refilled with checkpoint weights.
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
-      end;
+      LoadBertEncoderWeights(Reader, NN, Config, Encoder, Consumed,
+        pQuantizeInt8);
       if IncludePooler then
       begin
         LoadLlamaLinearWeights(Reader, PoolerDense,
@@ -26190,6 +26257,8 @@ begin
         if (Config.Family in [bfBert, bfRoberta]) and
            (not IncludePooler) and
            (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
+        if (Config.Family = bfAlbert) and
+           (Pos('pooler.', TensorNameStr) > 0) then continue;
         // ColBERT projection head ([dim, hidden] no-bias "linear"): not part
         // of a plain BERT export; BuildColBERTFromSafeTensorsEx loads it as a
         // separate per-token head on top of this encoder.
