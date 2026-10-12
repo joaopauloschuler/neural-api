@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""torch.nn.ConvTranspose1d oracle for TNNetDeconvolution1D (tasklist Kokoro-82M, 0.4).
+"""torch.nn.ConvTranspose1d oracle for TNNetDeconv1DLinear (tasklist Kokoro-82M, 0.4).
 
 One case per Kokoro-82M transposed geometry, with the REAL kernel size, stride,
 padding, output_padding and groups and small channel counts:

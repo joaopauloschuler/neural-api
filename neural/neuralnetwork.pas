@@ -17300,7 +17300,7 @@ type
   TNNetDeconvolution = class(TNNetConvolution)
   protected
     FOutputPadding: integer;
-    // Extra output rows: FOutputPadding, or 0 for TNNetDeconvolution1D.
+    // Extra output rows: FOutputPadding, or 0 for TNNetDeconv1DLinear.
     FOutputPaddingY: integer;
     // Channel groups (torch groups): neuron Oc reads input channels
     // [g*InDepth/FGroups, (g+1)*InDepth/FGroups) of its group g. 1 = dense.
@@ -17390,7 +17390,7 @@ type
   /// neuron Oc (group g = Oc div (Out/G)) gets Weights[k, 0, c] = w[g*In/G + c,
   /// Oc mod (Out/G), k], no kernel flip.
   // Coded by Claude (AI).
-  TNNetDeconvolution1D = class(TNNetDeconvolutionLinear)
+  TNNetDeconv1DLinear = class(TNNetDeconvolutionLinear)
   public
     constructor Create(pNumFeatures, pFeatureSize, pStride, pPadding: integer;
       pOutputPadding: integer = 0; pGroups: integer = 1;
@@ -105071,8 +105071,8 @@ begin
   FActivationFnDerivative := @IdentityDerivative;
 end;
 
-{ TNNetDeconvolution1D }
-constructor TNNetDeconvolution1D.Create(pNumFeatures, pFeatureSize, pStride,
+{ TNNetDeconv1DLinear }
+constructor TNNetDeconv1DLinear.Create(pNumFeatures, pFeatureSize, pStride,
   pPadding: integer; pOutputPadding: integer = 0; pGroups: integer = 1;
   pSuppressBias: integer = 0);
 begin
@@ -131951,7 +131951,7 @@ begin
       'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionLinear' :  Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
-      'TNNetDeconvolution1D' :      Result := TNNetDeconvolution1D.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]);
+      'TNNetDeconv1DLinear' :      Result := TNNetDeconv1DLinear.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]);
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
@@ -132400,7 +132400,7 @@ begin
       if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionLinear' then Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
-      if S[0] = 'TNNetDeconvolution1D' then Result := TNNetDeconvolution1D.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]) else
+      if S[0] = 'TNNetDeconv1DLinear' then Result := TNNetDeconv1DLinear.Create(St[0], St[1], St[3], St[2], St[5], St[6], St[4]) else
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else

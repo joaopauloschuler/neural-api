@@ -1235,16 +1235,16 @@ type
     procedure TestConvolution1DBorrowingBuild;
     // Input and weight gradients for dilation with X-only padding and k12 s6.
     procedure TestConvolution1DGradientCheck;
-    // TNNetDeconvolution1D vs a torch ConvTranspose1d oracle on the Kokoro-82M
+    // TNNetDeconv1DLinear vs a torch ConvTranspose1d oracle on the Kokoro-82M
     // transposed geometries (trainable scatter and inference CPU GEMM).
-    procedure TestDeconvolution1DTorchParity;
+    procedure TestDeconv1DTorchParity;
     // The dense geometries through the OpenCL scatter GEMM; grouped stay on CPU.
-    procedure TestDeconvolution1DOpenCLParity;
-    procedure TestDeconvolution1DSaveLoadRoundTrip;
+    procedure TestDeconv1DOpenCLParity;
+    procedure TestDeconv1DSaveLoadRoundTrip;
     // An owner built at length 1 (kernel longer than its input) lends weights.
-    procedure TestDeconvolution1DBorrowingBuild;
+    procedure TestDeconv1DBorrowingBuild;
     // Input and weight gradients for dense, depthwise and grouped geometries.
-    procedure TestDeconvolution1DGradientCheck;
+    procedure TestDeconv1DGradientCheck;
     procedure TestAttentiveStatsPoolingFeatureGradientCheck;
     procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
@@ -65854,14 +65854,14 @@ begin
   end;
 end;
 
-// --- TNNetDeconvolution1D: torch.nn.ConvTranspose1d geometry ----------------
+// --- TNNetDeconv1DLinear: torch.nn.ConvTranspose1d geometry ----------------
 // tests/fixtures/conv_transpose1d_oracle.json (tools/conv_transpose1d_oracle.py)
 // holds one torch ConvTranspose1d per Kokoro-82M transposed geometry, in torch
 // layouts: input [C][L], weight [In][Out/groups][K], output [Out][Lout].
 // Coded by Claude (AI).
 type
   // Reaches the protected path predicate of the layer under test.
-  TDeconvolution1DAccess = class(TNNetDeconvolution1D);
+  TDeconv1DAccess = class(TNNetDeconv1DLinear);
 
 function LoadConvTranspose1DOracle(): TJSONObject;
 var
@@ -65887,12 +65887,12 @@ begin
   end;
 end;
 
-function CreateDeconv1DFromOracle(OracleCase: TJSONObject): TNNetDeconvolution1D;
+function CreateDeconv1DFromOracle(OracleCase: TJSONObject): TNNetDeconv1DLinear;
 var
   SuppressBias: integer;
 begin
   if OracleCase.Booleans['bias'] then SuppressBias := 0 else SuppressBias := 1;
-  Result := TNNetDeconvolution1D.Create(OracleCase.Integers['out_channels'],
+  Result := TNNetDeconv1DLinear.Create(OracleCase.Integers['out_channels'],
     OracleCase.Integers['kernel_size'], OracleCase.Integers['stride'],
     OracleCase.Integers['padding'], OracleCase.Integers['output_padding'],
     OracleCase.Integers['groups'], SuppressBias);
@@ -65934,12 +65934,12 @@ begin
   Deconv.FlushWeightCache();
 end;
 
-procedure TTestNeuralNumerical.TestDeconvolution1DTorchParity;
+procedure TTestNeuralNumerical.TestDeconv1DTorchParity;
 var
   Oracle, OracleCase: TJSONObject;
   Cases: TJSONArray;
   NN: TNNet;
-  Deconv: TNNetDeconvolution1D;
+  Deconv: TNNetDeconv1DLinear;
   Input: TNNetVolume;
   CasePos, ModePos: integer;
   MaxDiff: TNeuralFloat;
@@ -65971,7 +65971,7 @@ begin
           LoadDeconv1DOracleWeights(Deconv, OracleCase);
           AssertEquals(CaseName + ': CPU GEMM path',
             (ModePos = 1) and (OracleCase.Integers['groups'] = 1),
-            TDeconvolution1DAccess(Deconv).CPUGemmEligible());
+            TDeconv1DAccess(Deconv).CPUGemmEligible());
           NN.Compute(Input);
           NN.Compute(Input);
           MaxDiff := Conv1DOracleMaxDiff(NN.GetLastLayer.Output, OracleCase);
@@ -65992,13 +65992,13 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconvolution1DOpenCLParity;
+procedure TTestNeuralNumerical.TestDeconv1DOpenCLParity;
 {$IFDEF OpenCL}
 var
   Oracle, OracleCase: TJSONObject;
   Cases: TJSONArray;
   NN: TNNet;
-  Deconv: TNNetDeconvolution1D;
+  Deconv: TNNetDeconv1DLinear;
   Input, OutCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -66087,15 +66087,15 @@ end;
 procedure AddDeconv1DChain(NN: TNNet; SeqLen: integer; Trainable: boolean);
 begin
   NN.AddLayer(TNNetInput.Create(SeqLen, 1, 6, 1));
-  NN.AddLayer(TNNetDeconvolution1D.Create(6, 3, 2, 1, 1, 6).
+  NN.AddLayer(TNNetDeconv1DLinear.Create(6, 3, 2, 1, 1, 6).
     SetTrainable(Trainable, Trainable));
-  NN.AddLayer(TNNetDeconvolution1D.Create(4, 12, 6, 3).
+  NN.AddLayer(TNNetDeconv1DLinear.Create(4, 12, 6, 3).
     SetTrainable(Trainable, Trainable));
-  NN.AddLayer(TNNetDeconvolution1D.Create(2, 20, 10, 5, 0, 2, 1).
+  NN.AddLayer(TNNetDeconv1DLinear.Create(2, 20, 10, 5, 0, 2, 1).
     SetTrainable(Trainable, Trainable));
 end;
 
-procedure TTestNeuralNumerical.TestDeconvolution1DSaveLoadRoundTrip;
+procedure TTestNeuralNumerical.TestDeconv1DSaveLoadRoundTrip;
 var
   NN, NNLoaded: TNNet;
   Input: TNNetVolume;
@@ -66112,18 +66112,18 @@ begin
     NN.Compute(Input);
     Saved := NN.SaveToString();
     NNLoaded.LoadFromString(Saved);
-    AssertEquals('TNNetDeconvolution1D structure round-trip',
+    AssertEquals('TNNetDeconv1DLinear structure round-trip',
       NN.SaveStructureToString(), NNLoaded.SaveStructureToString());
-    AssertEquals('TNNetDeconvolution1D full round-trip', Saved,
+    AssertEquals('TNNetDeconv1DLinear full round-trip', Saved,
       NNLoaded.SaveToString());
     AssertEquals('reloaded depthwise groups', 6,
-      TNNetDeconvolution1D(NNLoaded.Layers[1]).Groups);
+      TNNetDeconv1DLinear(NNLoaded.Layers[1]).Groups);
     AssertEquals('reloaded grouped groups', 2,
-      TNNetDeconvolution1D(NNLoaded.Layers[3]).Groups);
+      TNNetDeconv1DLinear(NNLoaded.Layers[3]).Groups);
     AssertEquals('reloaded Y padding', 0,
-      TNNetDeconvolution1D(NNLoaded.Layers[2]).PaddingY);
+      TNNetDeconv1DLinear(NNLoaded.Layers[2]).PaddingY);
     AssertEquals('reloaded kernel height', 1,
-      TNNetDeconvolution1D(NNLoaded.Layers[3]).FeatureSizeY);
+      TNNetDeconv1DLinear(NNLoaded.Layers[3]).FeatureSizeY);
     AssertEquals('depthwise weights per neuron', 3,
       NNLoaded.Layers[1].Neurons[0].Weights.Size);
     // 3 -> 6 (x2, op1) -> 36 (x6) -> 360 (x10), one row.
@@ -66141,7 +66141,7 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconvolution1DBorrowingBuild;
+procedure TTestNeuralNumerical.TestDeconv1DBorrowingBuild;
 var
   Owner, Borrower, Copied: TNNet;
   Input: TNNetVolume;
@@ -66164,7 +66164,7 @@ begin
       AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the owner''s neurons',
         Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
     AssertEquals('owner kernel not clamped', 20,
-      TNNetDeconvolution1D(Owner.Layers[3]).FeatureSizeX);
+      TNNetDeconv1DLinear(Owner.Layers[3]).FeatureSizeX);
     FillConv1DChainInput(Input);
     Borrower.Compute(Input);
     Copied.Compute(Input);
@@ -66181,11 +66181,11 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeconvolution1DGradientCheck;
+procedure TTestNeuralNumerical.TestDeconv1DGradientCheck;
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
-  Deconv: TNNetDeconvolution1D;
+  Deconv: TNNetDeconv1DLinear;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
   GeometryPos, ElementPos, NeuronPos, WeightPos: integer;
   GeometryName: string;
@@ -66225,7 +66225,7 @@ begin
     Desired := nil;
     try
       NN.AddLayer(TNNetInput.Create(5, 1, 4, 1));
-      Deconv := TNNetDeconvolution1D.Create(csGeometries[GeometryPos, 0],
+      Deconv := TNNetDeconv1DLinear.Create(csGeometries[GeometryPos, 0],
         csGeometries[GeometryPos, 1], csGeometries[GeometryPos, 2],
         csGeometries[GeometryPos, 3], csGeometries[GeometryPos, 4],
         csGeometries[GeometryPos, 5]);

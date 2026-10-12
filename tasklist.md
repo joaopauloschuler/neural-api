@@ -1495,7 +1495,7 @@ rather than acted on.
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
         - [x] transposed 1D conv (torch ConvTranspose1d). Done: new
-          `TNNetDeconvolution1D(NumFeatures, K, Stride, Padding, OutputPadding,
+          `TNNetDeconv1DLinear(NumFeatures, K, Stride, Padding, OutputPadding,
           Groups=1, SuppressBias=0)`, a `TNNetDeconvolutionLinear` with a Kx1
           kernel, no Y padding / output padding, no kernel clamp, groups in
           FStruct[6] (commit cf181f32). `TNNetDeconvolution` gained
@@ -1506,7 +1506,7 @@ rather than acted on.
           path). The old "11x wasted work" was weight memory, not CPU time: the
           scatter skipped out-of-range rows. CPU, ups1 512->256 k20 s10 p5, L=200:
           old 2D stand-in (20x11) 397-459 ms, new 1D inference 90-109 ms, new 1D
-          trainable (scatter) 394-470 ms. Tests: `TestDeconvolution1D{TorchParity,
+          trainable (scatter) 394-470 ms. Tests: `TestDeconv1D{TorchParity,
           OpenCLParity,SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
           `tests/fixtures/conv_transpose1d_oracle.json`
           (`tools/conv_transpose1d_oracle.py`, torch). Loader mapping: torch weight
