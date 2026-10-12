@@ -1562,9 +1562,12 @@ rather than acted on.
         - [ ] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
           `TNNetSin` exist on CPU only (no opcode); 22 x frames, so either
           `TNNetSplitChannels` + those layers or a host step before the iSTFT.
-        - [ ] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
+        - [x] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
           lives only in the test (`WriteStyleIntoChannelAffine`); move it into the
           Kokoro loader (2.5) rather than writing a second copy.
+          Done: `WriteStyleIntoChannelAffine(NormLayer, FcWeight, FcBias, Style,
+          NormWeight, NormBias)` in neuralpretrained (TNNetVolume arguments); the
+          test helper converts the oracle JSON and calls it (commit 3f1f670e).
         - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
           `pcr_sinf` loop; the per-channel path is vectorized.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
@@ -1574,6 +1577,33 @@ rather than acted on.
         exits early when the length is unchanged, OpenCL arming as in
         `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
         code path; do not clone it.
+        Stage A done (commit 3f1f670e): `TNNetKokoro.Create(Reader, Config)` builds
+        the stage-A owner once at 8 tokens and loads it (a stage-A tensor left
+        unread raises); `PrepareStageA(T)` = `BuildWeightOwner := owner`, build,
+        `nil`, `PrepareInferenceThreads`, `ShareHostOutputsByLiveness`, OpenCL
+        arming; `RunStageA(Ids, ProsodyStyle, Speed, d, t_en, PredDur)`. The VAE
+        decoder's context-net creation and owner arming became
+        `CreateOpenCLContextNet` / `ArmWeightOwnerInOpenCLContext`, used by both.
+        Inference: `SetTrainable(False)` with low memory: the shared ALBERT
+        repeats keep no per-layer weight cache. Measured (real, 32 tokens, CPU,
+        AVX2 release, VM noise): fast memory gave no gain and +1.2 s per rebuild;
+        switching the sized net to fast memory after the build without
+        `FlushWeightCache` raised EInvalidOp (empty caches). Real stage A: owner
+        load 1.2-2.2 s, PrepareStageA 0.09-0.22 s, forward 0.32-0.44 s parallel /
+        0.56-0.88 s serial (other runs on a busy VM: 1.3-3.9 s).
+        - [ ] Stage B owner/`PrepareStageB(F)` and stage C: add them beside stage A
+          (`FStage*Owner`, `FStage*Net`, one shared `FOpenCLContextNet`).
+        - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
+          is known), so a borrowing build allocates and frees each table: 3
+          tables, 114,176 floats on the real checkpoint. Other layers size none.
+        - [ ] The owner build sizes each ALBERT repeat's rows before
+          `LinkWeightsFrom` frees them (transient, one block at a time).
+        - [ ] CPU profile of the real stage A: `TNNetLSTMCell` ~51% of layer time
+          (the CPU input projection is per-step dot products, no GEMM; the OpenCL
+          path batches it only at Depth >= 32), `TNNetPointwiseConvLinear` ~44%.
+        - [ ] Real-checkpoint stage A on a GPU: not run (PoCL parity on the tiny
+          fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
+          unless forced, because the LSTM output is on RAM.
   - [x] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
         build allocates and `InitDefault`s them, then `LinkNeuronsFrom` frees them.
         Correct but wasted; honour `DeferWeightSizingToBuildLink` there (~5 lines).
@@ -1627,15 +1657,46 @@ rather than acted on.
         snapshot is in the HF cache; `NEURAL_KOKORO82M_DIR` overrides).
         Commit d6db9f49.
   Phase 2 — components, in graph order:
-  - [ ] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
+  - [x] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
         and one shared layer (do not clone it); then `bert_encoder` 768->512.
-  - [ ] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
+        Done (a77647bb, 3f1f670e): the BERT builder's encoder and loader became
+        `AddBertEncoder` / `LoadBertEncoderWeights`; family `bfAlbert` adds
+        `EmbeddingSize` tables, `embedding_hidden_mapping_in`, and repeats 1.. that
+        `LinkWeightsFrom` block 0 (one weight copy; the borrowing build links the
+        owner's root via `LinkBuildWeightOwner`). AlbertConfig defaults: gelu_new
+        (`TNNetGELU`), eps 1e-12, 2 token types. Tiny max |diff| <= 1.1e-6; real
+        bert_layer0..11 <= 2.0e-5 abs (max |ref| ~11.4), d_en 3.3e-5.
+        - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
+          `albert-*` checkpoints) is untested; no config reader for model_type
+          "albert"; pooler / classifier / int8 refused.
+  - [x] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
         LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
-  - [ ] 2.3 `AdaLayerNorm` (LayerNorm, `(1+gamma)`, beta from Linear(style)) and the
+        Done (3f1f670e): `TNNetEmbedding`, `TNNetConv1DLinear` k5 p2 loaded by
+        `LoadTorchConv1DLinear` (weight_norm fold `LoadTorchConv1DWeight`, now
+        shared with `LoadHiFiGANConv`), `TNNetTokenLayerNorm(1e-5)`,
+        `TNNetLeakyReLU(0.2)`, bi-LSTM. The bi-LSTMs need input != hidden: new
+        `TNNetLSTMCell.Create(Hidden)` + `AddBidirectionalLSTM(...,
+        CellsReadInputWidth)` (b5381f69); `LoadTorchLSTMInto(..., StackInput)`
+        loads one stack of several. Real: text_cnn <= 8.6e-6, t_en 1.9e-6.
+        - [ ] `TNNetGRUCell` has no input-width option.
+  - [x] 2.3 `AdaLayerNorm` (LayerNorm, `(1+gamma)`, beta from Linear(style)) and the
         `DurationEncoder` loop (3x bi-LSTM + AdaLayerNorm, style concatenated each
         round).
-  - [ ] 2.4 Duration head: bi-LSTM, Linear 512->50, sigmoid, sum, /speed, round,
+        Done (3f1f670e): the style is input channels 2.. of stage A (host-filled,
+        the same row on every token); one `TNNetSplitChannels` feeds every
+        `[norm; style]` `TNNetDeepConcat`. No weights (nothing to borrow), one
+        upload with the ids, OpenCL-resident after. `RunStageA` writes each
+        AdaLayerNorm's gamma/beta with `WriteStyleIntoChannelAffine` before the
+        forward. Real: dur_enc_adanorm0..2 <= 8.4e-5 abs (rel. 1.7e-5), d 1.9e-5.
+  - [x] 2.4 Duration head: bi-LSTM, Linear 512->50, sigmoid, sum, /speed, round,
         clamp >= 1; frame expansion by repeat (no alignment matmul).
+        Done (3f1f670e) up to the durations: bi-LSTM, `TNNetPointwiseConvLinear`,
+        `TNNetSigmoid` in the net; sum / speed / `Round` (half to even, as
+        torch.round) / clamp on the host. pred_dur exact on tiny and real.
+        Tests: `TestKokoroStageATinyParity`, `TestKokoroStageABorrowingRebuild`,
+        `TestKokoroStageAOpenCLParity`, `TestKokoroRealStageAParity`.
+        - [ ] Frame expansion by repeat (d and t_en, per pred_dur): the host step
+          before stage B.
   - [ ] 2.5 AdaIN1d as above.
   - [ ] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
         1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
