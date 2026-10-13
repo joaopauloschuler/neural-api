@@ -1,0 +1,392 @@
+{
+  "generator": "tools/make_g2p_english_fixture.py",
+  "versions": {
+    "misaki": "0.9.4",
+    "spacy": "3.8.16",
+    "spacy_model": "en_core_web_sm 3.8.0",
+    "num2words": "0.5.14"
+  },
+  "g2p_construction": {
+    "us": "misaki.en.G2P(trf=False, british=False, fallback=None, unk='')",
+    "gb": "misaki.en.G2P(trf=False, british=True, fallback=None, unk='')",
+    "source": "kokoro/pipeline.py builds en.G2P(trf=trf, british=lang_code=='b', fallback=EspeakFallback or None, unk=''); trf defaults to False; version stays None"
+  },
+  "sentence_fields": {
+    "phonemes": "first value returned by G2P.__call__ (tokens joined with their whitespace, unknown tokens as '')",
+    "tokens": "second value: the merged output tokens; phonemes null = unknown",
+    "phonemes_if_default": "present only when forcing DEFAULT for every POS-keyed entry changes the result (what task 5.4 will produce)",
+    "chunks": "long_mixed only: KPipeline.en_tokenize output (text, phonemes)"
+  },
+  "dictionary_subsets": {
+    "rule": "entry kept when key.lower() is a substring of a lowercased fixture word (whitespace chunk or letter/apostrophe run), or was looked up by misaki while producing this fixture (either accent run, incl. the DEFAULT run), or is a single letter",
+    "files": {
+      "us_gold.json": {
+        "entries": 1710,
+        "full_entries": 90201,
+        "bytes": 41475
+      },
+      "us_silver.json": {
+        "entries": 396,
+        "full_entries": 93361,
+        "bytes": 8864
+      },
+      "gb_gold.json": {
+        "entries": 1724,
+        "full_entries": 87352,
+        "bytes": 41797
+      },
+      "gb_silver.json": {
+        "entries": 416,
+        "full_entries": 109766,
+        "bytes": 9415
+      }
+    },
+    "total_bytes": 101551,
+    "verified": "misaki re-run with the subsets gives identical output"
+  },
+  "counts": {
+    "us": {
+      "per_group": {
+        "plain": {
+          "sentences": 25,
+          "tokens": 215,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 12,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "punctuation": {
+          "sentences": 26,
+          "tokens": 217,
+          "unknown_tokens": 2,
+          "heteronym_tokens": 3,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 1
+        },
+        "capitals_acronyms": {
+          "sentences": 26,
+          "tokens": 194,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 11,
+          "heteronym_tokens_differing": 2,
+          "tokens_differing_from_default_run": 2
+        },
+        "possessives": {
+          "sentences": 20,
+          "tokens": 111,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "contractions": {
+          "sentences": 20,
+          "tokens": 120,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 5,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 2
+        },
+        "hyphenated": {
+          "sentences": 20,
+          "tokens": 100,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "suffix_stems": {
+          "sentences": 30,
+          "tokens": 190,
+          "unknown_tokens": 11,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "numbers": {
+          "sentences": 32,
+          "tokens": 215,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "currency": {
+          "sentences": 20,
+          "tokens": 140,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 2,
+          "tokens_differing_from_default_run": 2
+        },
+        "percent": {
+          "sentences": 10,
+          "tokens": 58,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 4,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 1
+        },
+        "heteronyms": {
+          "sentences": 38,
+          "tokens": 292,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 76,
+          "heteronym_tokens_differing": 30,
+          "tokens_differing_from_default_run": 30
+        },
+        "unknown_and_names": {
+          "sentences": 24,
+          "tokens": 124,
+          "unknown_tokens": 37,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "long_mixed": {
+          "sentences": 6,
+          "tokens": 629,
+          "unknown_tokens": 12,
+          "heteronym_tokens": 37,
+          "heteronym_tokens_differing": 10,
+          "tokens_differing_from_default_run": 11
+        }
+      },
+      "total": {
+        "sentences": 297,
+        "tokens": 2605,
+        "unknown_tokens": 62,
+        "heteronym_tokens": 158,
+        "heteronym_tokens_differing": 47,
+        "tokens_differing_from_default_run": 49
+      }
+    },
+    "gb": {
+      "per_group": {
+        "plain": {
+          "sentences": 25,
+          "tokens": 215,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 12,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "punctuation": {
+          "sentences": 26,
+          "tokens": 217,
+          "unknown_tokens": 2,
+          "heteronym_tokens": 3,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 1
+        },
+        "capitals_acronyms": {
+          "sentences": 26,
+          "tokens": 194,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 11,
+          "heteronym_tokens_differing": 2,
+          "tokens_differing_from_default_run": 2
+        },
+        "possessives": {
+          "sentences": 20,
+          "tokens": 111,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "contractions": {
+          "sentences": 20,
+          "tokens": 120,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 5,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 2
+        },
+        "hyphenated": {
+          "sentences": 20,
+          "tokens": 100,
+          "unknown_tokens": 1,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "suffix_stems": {
+          "sentences": 30,
+          "tokens": 190,
+          "unknown_tokens": 12,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "numbers": {
+          "sentences": 32,
+          "tokens": 215,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "currency": {
+          "sentences": 20,
+          "tokens": 140,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 2,
+          "tokens_differing_from_default_run": 2
+        },
+        "percent": {
+          "sentences": 10,
+          "tokens": 58,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 4,
+          "heteronym_tokens_differing": 1,
+          "tokens_differing_from_default_run": 1
+        },
+        "heteronyms": {
+          "sentences": 38,
+          "tokens": 292,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 76,
+          "heteronym_tokens_differing": 30,
+          "tokens_differing_from_default_run": 30
+        },
+        "unknown_and_names": {
+          "sentences": 24,
+          "tokens": 124,
+          "unknown_tokens": 37,
+          "heteronym_tokens": 2,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
+        },
+        "long_mixed": {
+          "sentences": 6,
+          "tokens": 629,
+          "unknown_tokens": 12,
+          "heteronym_tokens": 37,
+          "heteronym_tokens_differing": 10,
+          "tokens_differing_from_default_run": 11
+        }
+      },
+      "total": {
+        "sentences": 297,
+        "tokens": 2605,
+        "unknown_tokens": 64,
+        "heteronym_tokens": 158,
+        "heteronym_tokens_differing": 47,
+        "tokens_differing_from_default_run": 49
+      }
+    }
+  },
+  "heteronyms": {
+    "us": {
+      "rule": "a token counts when its letters, lowercased, are a POS-keyed gold entry; it differs when misaki's output token differs from a run with every POS-keyed entry forced to DEFAULT (same spaCy tokens, same right-to-left context)",
+      "all_sentences": {
+        "heteronym_tokens": 158,
+        "differing": 47,
+        "any_token_differing": 49
+      },
+      "heteronyms_group": {
+        "heteronym_tokens": 76,
+        "differing": 30
+      },
+      "differing_words": {
+        "that": 8,
+        "read": 5,
+        "present": 3,
+        "close": 3,
+        "it": 2,
+        "content": 2,
+        "live": 2,
+        "object": 2,
+        "excuse": 2,
+        "record": 1,
+        "wind": 1,
+        "tear": 1,
+        "use": 1,
+        "produce": 1,
+        "desert": 1,
+        "permit": 1,
+        "refuse": 1,
+        "wound": 1,
+        "conduct": 1,
+        "project": 1,
+        "subject": 1,
+        "separate": 1,
+        "estimate": 1,
+        "increase": 1,
+        "rebel": 1,
+        "house": 1,
+        "minute": 1
+      },
+      "pos_keyed_entries_in_gold_file": 790
+    },
+    "gb": {
+      "rule": "a token counts when its letters, lowercased, are a POS-keyed gold entry; it differs when misaki's output token differs from a run with every POS-keyed entry forced to DEFAULT (same spaCy tokens, same right-to-left context)",
+      "all_sentences": {
+        "heteronym_tokens": 158,
+        "differing": 47,
+        "any_token_differing": 49
+      },
+      "heteronyms_group": {
+        "heteronym_tokens": 76,
+        "differing": 30
+      },
+      "differing_words": {
+        "that": 8,
+        "read": 5,
+        "present": 3,
+        "close": 3,
+        "it": 2,
+        "content": 2,
+        "live": 2,
+        "object": 2,
+        "excuse": 2,
+        "record": 1,
+        "wind": 1,
+        "tear": 1,
+        "use": 1,
+        "produce": 1,
+        "desert": 1,
+        "permit": 1,
+        "refuse": 1,
+        "wound": 1,
+        "conduct": 1,
+        "project": 1,
+        "subject": 1,
+        "separate": 1,
+        "estimate": 1,
+        "increase": 1,
+        "rebel": 1,
+        "house": 1,
+        "minute": 1
+      },
+      "pos_keyed_entries_in_gold_file": 788
+    }
+  },
+  "behaviours_from_en_py": {
+    "unknown_word": "With fallback=None, Lexicon.__call__ returns (None, None) for a word it cannot resolve: token.phonemes stays None (null in sentences.json), the token keeps its text, tag and whitespace, and G2P.__call__ writes unk ('') in the result string, so the word simply disappears from the phoneme string (the space after it stays). KPipeline.en_tokenize then turns None into ''. Inside a multi-piece word (pieces from subtokenize with no whitespace between them, e.g. a hyphenated word), the loop at en.py:668 tries the longest merge of pieces ending at the right first; an unresolvable piece stays None and merge_tokens(unk='') joins it as '', so known pieces keep their phonemes and unknown ones vanish. Words with characters outside A-Z a-z ' - (e.g. café, Wrocław) are unknown unless the exact key is in the dictionary. Pieces made only of ',-._‘’/ get ''.",
+    "capitals_and_acronyms": "Stress offset from case (Lexicon.__call__): lowercase None, Capitalized 0.5, ALL CAPS 2, applied with apply_stress. get_word lowercases a capitalized/ALL-CAPS word that is not itself a key when the lowercase form (or its -s/-ed/-ing stem) is known, except NNP-tagged words of 7 letters or less. is_known treats any word whose letters after the first are all upper case as known; lookup then lowercases an ALL-CAPS word that is not a gold key, and when nothing is found (or the word is NNP and its entry has no primary stress) get_NNP spells it with the gold single-letter entries, demoting all stresses to secondary and making the LAST one primary. Dotted abbreviations (U.S., Ph.D.) whose parts are at most 2 letters are also spelled by get_NNP. So the 'spell unknown ALL-CAPS' route in plan 5.5 is misaki's own rule, not a fallback.",
+    "special_cases": "get_special_case: 'a' -> ɐ when tagged DT else ˈA; am/an/I/by/to/in/the/used have context forms (the -> ði before a vowel; to -> tə / tʊ by next vowel; I tagged PRP -> ˌI; 'by' tagged as adverb -> bˈI; 'used' + following 'to' -> the VBD reading); 'vs' tagged IN -> versus; symbols % & + @ -> percent/and/plus/at; '.' and '/' are read 'dot'/'slash' only when spaCy tags the token ADD (URLs/e-mail). These need the part-of-speech tag (DT, PRP, IN, ADV, VBD, NNP, ADD); the Pascal port has no tagger.",
+    "context": "Tokens are processed right to left; TokenContext carries future_vowel (does the next word start with a vowel, None after punctuation) and future_to. A heteronym entry with a 'None' key is used when future_vowel is None, i.e. at the end of a clause; this is not a spaCy decision and the port can reproduce it.",
+    "suffix_rules": "Only when the whole word is not known, one level deep, stem must satisfy is_known: stem_s: -s (not -ss), -'s, -es (len>4, not -ies), -ies -> y (len>4); appends s after p t k f θ, ᵻz (US) / ɪz (GB) after s z ʃ ʒ ʧ ʤ, else z. stem_ed: -d (not -dd), -ed (len>4, not -eed); appends t after p k f θ ʃ s ʧ, ᵻd/ɪd after d, d after other non-t, and after t: GB ɪd, US ɾᵻd when the sound before t is in AIOWYiuæɑəɛɪɹʊʌ, else ᵻd. stem_ing (len>=5): stem, stem+e, or doubled consonant / -cking (drop one letter); appends ɪŋ, US t after such a vowel -> ɾɪŋ, GB returns None when the stem ends in ə or ː; stem_ing is called with stress 0.5 when the word had none. Also: word ending s' looks up word's, a trailing ' is dropped. The same _s/_ed/_ing endings apply to numbers (1990s).",
+    "numbers": "is_number: digits with , and . (and a leading - only at the head of a word), optional suffix ing 'd ed 's st nd rd th s. get_number: ordinal suffix -> num2words(to='ordinal'); 4-digit integer not after a currency sign -> num2words(to='year'); digits glued to letters (not head, e.g. 'B2B', '3D') -> read as digits/short groups; numbers with 2+ dots (2.0.1) -> each group, groups with a leading 0 or not of length 2 read digit by digit; $ £ € followed by a number with at most 2 decimals -> dollars/cents, pounds/pence, euros/cents ('and' between, singular for 1, pence never pluralized, zero part dropped); otherwise cardinal via num2words (float for decimals, '.5' -> point five). Commas are removed. num2words output is split on non-letters and each word looked up; the word 'and' is DROPPED ('one hundred one'), 'point' gets stress -2 (unstressed), 'minus' prefixes a leading '-'. A currency sign whose number is followed by another CD token ('$12 million') gets the plural unit appended after the number words. '¥' is not a currency. num_flags (& keep 'and', a 'a' for one, n) only come from the [n](#flags#) markdown syntax.",
+    "stress": "Primary ˈ and secondary ˌ are written before the vowel of the stressed syllable (restress moves an added mark to just before the first vowel after it). apply_stress(ps, s): s<-1 removes all marks; s==-1, or s in (0,-0.5) with a primary present, demotes primary to secondary; s in (0,0.5,1) with no marks adds secondary; s>=1 with only secondary promotes it; s>1 with no marks adds primary. Inside a multi-piece word, resolve_tokens demotes (-0.5) the lighter half of the pieces that carry a primary (stress_weight counts diphthong letters AIOQWYʤʧ double), unless the pieces are separated by space, '/', or mix letters and digits.",
+    "post_processing": "G2P version None (KPipeline's default) replaces ɾ with T and ʔ with t in every token after lookup (en.py:707), so US flaps come out as T. The dictionaries themselves contain ɾ.",
+    "punctuation": "Tokens tagged as punctuation by spaCy (. , -LRB- -RRB- `` '' : $ # NFP ...) keep only the characters in ;:,.!?—…\"“”; ( ) map to ( ), opening quotes to “, closing to ”; a '-' or '–' tagged ':' becomes —; other symbols (*, #, [, {, <) give ''. Punctuation depends on the spaCy tag, not only on the character.",
+    "other_input_syntax": "G2P.preprocess honours markdown links: [word](/IPA/) sets the phonemes, [word](-1|-0.5|0.5|+1|2...) sets stress, [n](#flags#) sets number flags. A '2' between letters (P2P) is read 'to' (alias). The Pascal port may skip this syntax but should not misread brackets.",
+    "chunking": "KPipeline.__call__ first splits the text on \\n+, then en_tokenize cuts the token list so each chunk's phoneme string is at most 510 characters, backing up to the last token whose phonemes are one of !.?…, then :;, then ,— (plus a following ) or ”), else cutting at the current token; a chunk longer than 510 is truncated with a warning."
+  },
+  "observed_in_this_fixture": {
+    "suffix_gaps": "stem_ed does not undo a doubled consonant (blogged, vlogged, hashtagged, photoshopped, geotagged; GB also hummed) nor -ied -> y (photocopied), and -ed/-ing only try the stem misaki has: livestreamed, facetimed, deduped, smurfs stay unknown because livestream, facetime, dedupe, smurf are not keys. GB 'refactoring' is unknown because GB _ing refuses a stem ending in ə.",
+    "capitalized_unknown_names": "Capitalized unknown words (Joao, Schuler, Nguyen, Okafor) are NOT spelled: is_known only accepts words whose letters after the first are upper case, so they come out empty. Only ALL-CAPS strings are spelled.",
+    "camel_case": "subtokenize splits camelCase; unknown pieces vanish: 'WiFi' -> '', 'PyTorch' -> 'tˈɔɹʧ' (Py dropped).",
+    "spacy_errors": "spaCy's tag is sometimes wrong: 'I read books every day' -> ɹˈɛd, 'Have you read it?' -> ɹˈid, 'A is the first letter' -> ɐ (tagged DT). DEFAULT is not always worse than misaki.",
+    "pos_keyed_function_words": "'that' (DT vs DEFAULT, stressed vs not) and 'IT' are POS-keyed too; 'that' is the most frequent disagreement.",
+    "lead_not_heteronym": "'lead' is a plain string (lˈid) in both accents.",
+    "dropped_punctuation": "' - ' with spaces (spaCy HYPH) and '--' become '' (no dash), and '--' between words leaves no space; '?—' inside 'raining?—No' is lost (one spaCy token); [ ] and < > vanish, { } become ( ); * # give ''.",
+    "four_digit_numbers": "Every bare 4-digit integer is read as a year (1234 -> twelve thirty four); leading zeros vanish (007 -> seven).",
+    "currency_details": "¥ is not a currency (¥500 -> five hundred); $123.456 (3 decimals) is read as a plain decimal without 'dollars'; '$12 million' -> twelve million dollars.",
+    "urls": "'/usr/local/bin' loses 'usr'; e-mail and URL dots/slashes become dot/at only when spaCy tags them ADD."
+  }
+}

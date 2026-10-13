@@ -2079,6 +2079,14 @@ rather than acted on.
         fixture and report the phoneme agreement rate; unit tests for number
         words, sub-word splitting and spelling. Test dictionaries: a small
         committed subset (or the fixture's own word list), never the full files.
+        Fixture part DONE 2026-10-13: `tools/make_g2p_english_fixture.py`
+        writes `tests/fixtures/g2p_english/` (sentences.json 297 sentences in
+        13 groups, US + GB, per-token output; 4 dictionary subsets in misaki's
+        format, 101.5 KB total, verified to reproduce misaki exactly;
+        notes.json with counts, en.py behaviours and quirks). misaki left
+        62 (US) / 64 (GB) of 2605 tokens empty. Forcing DEFAULT changes 47 of
+        158 POS-keyed tokens (30 of 76 in the heteronym group), so 5.4's
+        context rules look worth doing. Pascal tests come with 5.1-5.6.
   - [ ] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
         argument, as in ChatTerminal (`KokoroTTS <model-dir> [options]`;
         `--model-dir` removed). Text input by default; `--phonemes "<IPA>"` stays
