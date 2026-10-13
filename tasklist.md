@@ -2033,16 +2033,89 @@ rather than acted on.
         and examples/KokoroTTS/README.md say the same. Move it to supported only
         after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
-  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). NOT STARTED.
+  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). IN PROGRESS:
+  5.1, 5.2, 5.4 and the 5.7 fixture done.
   Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
   no Python at test time (a `tools/` script writes fixtures once on the dev box).
-  - [ ] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
+  - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
         (a later TTS model can reuse it); `TNNetKokoro` calls it. Port of misaki
         `en.py` (0.9.4, 712 lines) WITHOUT spaCy: word splitting, capital letters
         and acronyms, possessives (`'s`), contractions, hyphenated words, the
         -s / -ed / -ing suffix rules for words found only as their stem, stress
         adjustment, punctuation passed through (Kokoro's vocab has
         `, . ! ? ; : — …` and quotes).
+        Done (commits c1af8ee1, 51b1c903). API: `TNeuralEnglishG2P.Create(DictDir,
+        g2pAmerican|g2pBritish)` (neuralg2p.pas:248), `Phonemize(Text): string`
+        and `Phonemize(Text, out Tokens)`; each `TNeuralG2PToken` (:73) has
+        Text, Whitespace, Tag (rule tagger, Penn tags), Phonemes, IsKnown and
+        Resolutions, a set of punctuation / dictionary / context rule / POS
+        rule / stem rule / spelled / unknown / number pending
+        (`G2PResolutionName` prints them, for `/show`). Also exported:
+        `ApplyG2PStress`, `G2PSubTokenize` (misaki's sub-token regex, matched by
+        hand), `EnglishG2PAccentFromVoice` (`a*` US, `b*` GB, others raise; it
+        lives in neuralg2p, not in the Kokoro code), `EnglishG2PDictionaryFileName`.
+        `TNNetKokoro` does not call it yet (5.8/5.9 wire it into the example).
+        Ported as in en.py: retokenize grouping, the right-to-left loop with
+        future_vowel / future_to, the longest-merge loop over sub-tokens,
+        resolve_tokens (junk pieces, prespace, demotion of the lighter
+        primaries), merge_tokens, get_special_case (a/am/an/I/by/to/in/the/vs/
+        used, % & + @, ADD dot/slash), get_NNP spelling, is_known, lookup
+        (grown keys, gold then silver, the "None" key at a clause end, NNP
+        spelling when the entry has no primary stress), get_word (case folding,
+        `s'` and `'` endings, stems), _s/_ed/_ing (US ᵻ, GB ɪ, US flap, GB
+        refuses -ing after ə/ː), the ɾ -> T / ʔ -> t mapping. spaCy's tokenizer
+        is approximated: whitespace chunks; prefixes `( { " “ ‘ /`, the
+        backtick and `$ £ € ¥` (read ''); suffixes `. , ! ? ; : … ) } " ” %` (and `’` only after an
+        opening `‘`), one token per character; a final `.` stays on a dictionary
+        abbreviation (Dr., Mr.) or a dotted one (U.S., Ph.D.); infixes `--`, `—`,
+        `–` between letters/digits; clitics `'s n't 're 've 'll 'd 'm` and
+        plural `s'` split off (straight and curly). Unicode helpers come from
+        neuralhftokenizer (IsLetterCP, LowercaseCP, the new UppercaseCP, NFKC
+        UnicodeNormalize); \p{Lu}/\p{Ll} are exact for ASCII, Latin-1 and
+        Latin Extended-A only.
+        Hook points: numbers (5.3) at `ReadWord`'s `IsNumberWord` branch (a
+        digit token, or a number span inside a word such as `1990s`, stays
+        unread with g2prNumberPending; the currency sign before it reads '');
+        unknown words (5.5): tokens/pieces with g2prUnknown, empty phonemes as
+        misaki with fallback=None; chunking (5.6): the per-token output.
+        Gaps: misaki's markdown overrides (`[word](/IPA/)`, `[w](+1)`,
+        `[n](#flags#)`) are not parsed (brackets read as text); numeric_if_needed
+        (Unicode digits) not ported; merges inside one word are capped at 32
+        sub-tokens (`csMaxMergedPieces`; misaki's loop is cubic, the longest key
+        in its four files has 13; a pathological 8000-sub-token word takes
+        3.4 s); a run of 2+ spaces keeps only the first character, like spaCy.
+        Speed: ~0.2 ms per 20-word sentence on this VM.
+        Tests (`TestNeuralG2P`, 15): dictionary parse/lookup, missing-file
+        error, voice -> accent, ApplyG2PStress, sub-token regex, US and GB stem
+        rules, stress demotion, acronyms / dotted abbreviations / shouting
+        sentences, next-word context, POS rules, per-token resolutions, the
+        fixture agreement (US, GB) and the real-dictionary load (ignored when
+        misaki's data/ is missing; `NEURAL_MISAKI_DATA_DIR`).
+        Fixture agreement (both accents identical in shape; numbers, currency,
+        percent groups and every token with a digit or money sign excluded =
+        5.3; tokens misaki left unknown excluded = 5.5; POS-keyed tokens
+        counted apart):
+        | group | tokens US | tokens GB | sentences |
+        | plain | 203/203 | 203/203 | 25/25 |
+        | punctuation | 212/212 | 212/212 | 26/26 |
+        | capitals_acronyms | 182/183 | 182/183 | 24/26 |
+        | possessives | 109/109 | 109/109 | 20/20 |
+        | contractions | 115/115 | 115/115 | 20/20 |
+        | hyphenated | 99/99 | 98/98 | 20/20 |
+        | suffix_stems | 178/178 | 177/177 | 30/30 |
+        | heteronyms | 216/216 | 216/216 | 36/38 |
+        | unknown_and_names | 85/85 | 85/85 | 24/24 |
+        | long_mixed | 542/543 | 542/543 | 0/6 (numbers) |
+        | total | 1941/1943 (99.9%) | 1939/1941 (99.9%) | 225/235 |
+        Asserted: 100% for every group except capitals_acronyms and long_mixed
+        (>= 99%). Remaining mismatch classes (same in US and GB): (1) `NEAR` in
+        the all-caps "THE END IS NEAR": spaCy tagged it NNP and misaki spelled
+        it; the port reads a sentence whose words are all upper case as words.
+        (2) `the` before a number in long_mixed ("the 1st of June", sentence
+        296): misaki's context comes from the number reading (5.3); the port
+        skips the unread number and sees "of". The POS-keyed mismatches are listed under 5.4.
+        Suites after the commit: cpu, avx2, opencl all `TESTS=3259 ERRORS=0
+        FAILURES=0 IGNORED=4` (was 3244).
   - [ ] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
         `gb_gold.json` + `gb_silver.json` (GB), Apache-2.0, from misaki's GitHub
         repository (`misaki/data/`). The USER downloads them, like the model: by
@@ -2052,6 +2125,27 @@ rather than acted on.
         `a*` = US, `b*` = GB; other voices raise until their language has a G2P.
         Load cost matters (~183k entries per accent): parse once at startup,
         hash lookup (reuse an existing string hash map; search first).
+        Done (commit 51b1c903), library side: `TNeuralG2PDictionary`
+        (neuralg2p.pas:99) `LoadFromFile` / `LoadFromString`, `IndexOf`,
+        `IndexOfGrown` (misaki grow_dictionary: a lowercase key also answers
+        its Capitalized form and vice versa, computed at lookup time instead
+        of doubling the table), `TagReading` (POS-keyed values incl. "None"
+        and null), `DefaultReading`, `KeyAt`. Search result: no public string
+        hash map in the repo (neuralhftokenizer's merge table and
+        neuralsafetensors' name table are private FNV tables), so the unit has
+        its own FNV-1a open-addressing index. Parsing bypasses TJSONObject
+        entirely (no 255-byte key limit; misaki's longest key is 45 bytes):
+        a dedicated scanner keeps keys and readings as byte spans inside the
+        file text (JSON escapes decoded in place; a repeated key keeps the last
+        value, as Python). Missing files raise `ENeuralG2PError` naming every
+        missing path and where to get them. Measured on the real files
+        (`x` venv, misaki 0.9.4 data/, release -O2, this VM, 2 runs each):
+        US 90,201 gold + 93,361 silver entries in 82-184 ms, +16.5 MB RSS
+        (peak +19 MB); GB 87,352 + 109,766 in 92-131 ms, +17.7 MB RSS (peak
+        +21 MB); the suite's load test saw 67-74 ms. Entry counts equal
+        notes.json's `full_entries`. NOT done here: the `<model-dir>/misaki/`
+        default and `--dict-dir` belong to the example (5.8/5.9); the
+        constructor takes the folder.
   - [ ] 5.3 Text normalization, matching misaki and no more: cardinals,
         ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
         `%`. Small English number-to-words port (misaki uses `num2words`).
@@ -2060,6 +2154,34 @@ rather than acted on.
         reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
         often this differs from misaki's spaCy choice; context rules (after "to"
         -> verb, after "the"/"a" -> noun) only if that rate is noticeable.
+        Done (commit 51b1c903) with context rules, since DEFAULT disagreed on
+        30%: `TNeuralEnglishG2P.TagRawTokens` / `TagWord`, tables at
+        neuralg2p.pas:309 (`cPreviousWordCues`), `cPreviousSuffixCues`,
+        `cObjectPronouns`, `cDeterminers`, `cConjunctions`,
+        `cThatComplementNext`, `cClosedClassTags`. Order: `@` in a word -> ADD;
+        ALL-CAPS (2+ letters) -> NNP unless the whole sentence is upper case;
+        closed class (a/an/the DT, `A` alone before punctuation NNP, I PRP,
+        to TO, in/by/vs IN, be/have/do forms VB*; a contraction tags as its
+        first word, that'll -> that); `used` VBD before "to"; `that` IN when
+        a determiner or subject pronoun follows, else DT; Capitalized inside a
+        sentence -> NNP; previous word: to/modals/do/not/please -> VB,
+        I/you/we/they -> VBP, he/she/it -> VBD (VBZ for an -s word),
+        had/has/have/was/were/been -> VBN, is/are/am/be/very/so/too/stay -> JJ,
+        determiners/possessives/prepositions -> NN, `'ll`/`n't`/`'d` -> VB,
+        `'ve` -> VBN; next word: me/him/them/us -> VB; a determiner after a
+        clause start or and/or/but -> VB; before punctuation -> NN; -ed VBD,
+        -ing VBG; otherwise no tag (DEFAULT). Pieces of a hyphenated word take
+        their own closed-class tag (spaCy tags them one by one), so the `a` in
+        one-of-a-kind reads ɐ.
+        Result on the fixture's 158 POS-keyed tokens (all groups): 153/158
+        (96.8%) in US and GB, vs 111/158 (70.3%) reading DEFAULT; asserted
+        >= 95%. Heteronym group 74/76. Remaining 5 (US = GB): "LOL, that was
+        funny" (spaCy WDT, port DT); "Fat content changed" (spaCy NN after an
+        adjective; the port has no adjective list -> DEFAULT); "the change is minute" (port JJ -> mInˈut, the right
+        English; spaCy NN -> DEFAULT mˈɪnət); "the minute hand" (spaCy JJ ->
+        mInˈut; port NN -> DEFAULT mˈɪnət, again the right English); "Have you
+        read it?" (spaCy VB -> ɹˈid; port VBP -> ɹˈɛd, the right English).
+        Three of the five are spaCy errors the port does not copy.
   - [ ] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
         possessives, hyphen parts); (2) SPLIT the word into dictionary words by
         dynamic programming, fewest pieces, each piece at least 2 letters
