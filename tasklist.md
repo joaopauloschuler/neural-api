@@ -1987,10 +1987,9 @@ rather than acted on.
         keyed by part of speech (`read`: DEFAULT `ɹˈid`, VBD `ɹˈɛd`);
         `libespeak-ng.so.1` (1.51, GPL-3.0) is installed on the dev box.
         User 2026-10-12: no C library either (pure Pascal), so (c) is out. Scope:
-        (b), English only (`a*`/`b*` voices), DEFERRED until synthesis works. When
-        it starts: unknown words are skipped and reported (a small neural G2P
-        model, e.g. `g2p_en`, is the follow-up); the example downloads the
-        dictionaries on first use instead of committing them.
+        (b), English only (`a*`/`b*` voices), DEFERRED until synthesis works.
+        SUPERSEDED 2026-10-13 by Phase 5 below (no download: the user passes the
+        dictionaries in a folder; unknown words go through sub-word splitting).
   Phase 4 — integration:
   - [x] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
         writes 24 kHz WAV. The pico example of that name was removed in 403d17f2:
@@ -2033,6 +2032,74 @@ rather than acted on.
         (coded), not yet tested on the real checkpoint; examples/README.md entry
         and examples/KokoroTTS/README.md say the same. Move it to supported only
         after the user's real run.
+  Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
+  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). NOT STARTED.
+  Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
+  no Python at test time (a `tools/` script writes fixtures once on the dev box).
+  - [ ] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
+        (a later TTS model can reuse it); `TNNetKokoro` calls it. Port of misaki
+        `en.py` (0.9.4, 712 lines) WITHOUT spaCy: word splitting, capital letters
+        and acronyms, possessives (`'s`), contractions, hyphenated words, the
+        -s / -ed / -ing suffix rules for words found only as their stem, stress
+        adjustment, punctuation passed through (Kokoro's vocab has
+        `, . ! ? ; : — …` and quotes).
+  - [ ] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
+        `gb_gold.json` + `gb_silver.json` (GB), Apache-2.0, from misaki's GitHub
+        repository (`misaki/data/`). The USER downloads them, like the model: by
+        default the program looks in `<model-dir>/misaki/`; `--dict-dir <folder>`
+        overrides. Never downloaded by the program, never committed to the repo.
+        Clear error naming the missing file. Dictionary picked from the voice:
+        `a*` = US, `b*` = GB; other voices raise until their language has a G2P.
+        Load cost matters (~183k entries per accent): parse once at startup,
+        hash lookup (reuse an existing string hash map; search first).
+  - [ ] 5.3 Text normalization, matching misaki and no more: cardinals,
+        ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
+        `%`. Small English number-to-words port (misaki uses `num2words`).
+  - [ ] 5.4 Words spelled the same but pronounced differently (790 entries keyed
+        by part of speech, e.g. `read`, `record`): use the dictionary's DEFAULT
+        reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
+        often this differs from misaki's spaCy choice; context rules (after "to"
+        -> verb, after "the"/"a" -> noun) only if that rate is noticeable.
+  - [ ] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
+        possessives, hyphen parts); (2) SPLIT the word into dictionary words by
+        dynamic programming, fewest pieces, each piece at least 2 letters
+        ("sunflowerfield" -> sun + flower + field), join their phonemes; only
+        the first piece keeps primary stress (ˈ), later primary stresses become
+        secondary (ˌ); (3) SPELL letter by letter (the dictionaries' own letter
+        entries: `A` -> `ˈA`, `B` -> `bˈi`) ONLY for unknown ALL-CAPS strings and
+        for leftover single characters the split cannot cover. Report which
+        words took route 2 or 3. Names may split oddly; that is accepted.
+  - [ ] 5.6 Long text (also closes 3.1's chunking): split at sentence
+        punctuation into chunks of at most 510 tokens, synthesize each, join the
+        audio into one WAV (as Kokoro's own pipeline does).
+  - [ ] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
+        English sentences (numbers, currency, acronyms, contractions,
+        possessives, hyphens, heteronyms, unknown words) for US and GB and writes
+        a fixture of sentence -> expected phonemes. Pascal tests read only the
+        fixture and report the phoneme agreement rate; unit tests for number
+        words, sub-word splitting and spelling. Test dictionaries: a small
+        committed subset (or the fixture's own word list), never the full files.
+  - [ ] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
+        argument, as in ChatTerminal (`KokoroTTS <model-dir> [options]`;
+        `--model-dir` removed). Text input by default; `--phonemes "<IPA>"` stays
+        as an expert override.
+  - [ ] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
+        each typed line synthesized to a WAV); `-p "text"` one-shot that never
+        reads stdin; `--stats` timing to stderr; `--selftest` (argument parsing
+        and REPL commands, no model). Output names from `--out <pattern>`
+        (default `kokoro_%03d.wav`). Commands: `/exit`, `/help`,
+        `/voice <name>`, `/speed <x>`, `/out <pattern>`, `/phonemes <IPA>`,
+        `/show` (phonemes of the last line). Errors print and the REPL goes on.
+        External programs (not linked libraries, so pure Pascal holds), unset
+        by default: `--play-cmd "aplay {wav}"` and `--encode-cmd "lame --quiet
+        {wav} {base}.mp3"` run after each WAV (`{wav}` = WAV path, `{base}` =
+        path without `.wav`); `--keep-wav false` deletes the WAV after a
+        successful encode. Library side (load, voice switch, text -> phonemes ->
+        audio) lives in neural/, the `.lpr` keeps only the REPL loop and argument
+        parsing, so a later TTS HTTP server can reuse it (as ChatServer reuses
+        `neuralchatengine.pas`).
+  Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
+  and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
