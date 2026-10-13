@@ -467,6 +467,17 @@ function HFParseJSONRaw(const S: string): TJSONData;
 // it; invalid bytes come back as-is. CodePointCount uses the same rule.
 function NextCodePoint(const S: string; var Position: integer): cardinal;
 function CodePointCount(const S: string): integer;
+function CodePointToUTF8(CP: cardinal): string;
+
+// Unicode classes and case maps shared with neuralg2p. IsLetterCP is exact
+// \p{L}; the case maps cover ASCII, Latin-1 and Latin Extended-A only.
+function IsWhitespaceCP(CP: cardinal): boolean;
+function IsLetterCP(CP: cardinal): boolean;
+function LowercaseCP(CP: cardinal): cardinal;
+function UppercaseCP(CP: cardinal): cardinal;
+// NFD/NFC (Compat=False) or NFKD/NFKC (Compat=True) of a UTF-8 string.
+function UnicodeNormalize(const S: string; Compose: boolean;
+  Compat: boolean = false): string;
 
 // fpjson's TJSONObject stores member names in a TFPHashObjectList whose
 // keys are SHORTSTRINGS: every object key is silently truncated to its
@@ -1136,6 +1147,18 @@ begin
     if (CP >= $139) and (CP <= $148) and ((CP and 1) = 1) then Exit(CP + 1);
   end;
   if (CP >= $179) and (CP <= $17E) and ((CP and 1) = 1) then Exit(CP + 1);
+end;
+
+// Inverse of LowercaseCP over the same blocks (ASCII, Latin-1, Latin
+// Extended-A); every other code point comes back unchanged.
+function UppercaseCP(CP: cardinal): cardinal;
+begin
+  Result := CP;
+  if (CP >= Ord('a')) and (CP <= Ord('z')) then Exit(CP - 32);
+  if (CP >= $E0) and (CP <= $FE) and (CP <> $F7) then Exit(CP - 32);
+  if CP = $FF then Exit($178);
+  if (CP >= $101) and (CP <= $17E) and (LowercaseCP(CP - 1) = CP) then
+    Exit(CP - 1);
 end;
 
 { ---------------------------------------------------------------- }
