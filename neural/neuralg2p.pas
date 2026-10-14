@@ -251,6 +251,9 @@ type
     // tagger
     procedure TagRawTokens();
     function TagWord(Index: integer; IsShouting, IsSentenceStart: boolean): string;
+    // The lowercased raw token at RawIndex; false when out of range or
+    // punctuation.
+    function RawWordAt(RawIndex: integer; out Word: string): boolean;
     function PreviousWord(Index: integer; out Word: string): boolean;
     function NextWord(Index: integer; out Word: string): boolean;
     // pieces and groups
@@ -2180,18 +2183,23 @@ end;
 { Rule tagger (replaces spaCy)                                      }
 { ---------------------------------------------------------------- }
 
-function TNeuralEnglishG2P.PreviousWord(Index: integer; out Word: string): boolean;
+function TNeuralEnglishG2P.RawWordAt(RawIndex: integer;
+  out Word: string): boolean;
 begin
   Word := '';
-  Result := (Index > 0) and not FRaw[Index - 1].IsPunctuation;
-  if Result then Word := G2PLower(ReplaceCurlyApostrophes(FRaw[Index - 1].Text));
+  Result := (RawIndex >= 0) and (RawIndex < FRawCount) and
+    not FRaw[RawIndex].IsPunctuation;
+  if Result then Word := G2PLower(ReplaceCurlyApostrophes(FRaw[RawIndex].Text));
+end;
+
+function TNeuralEnglishG2P.PreviousWord(Index: integer; out Word: string): boolean;
+begin
+  Result := RawWordAt(Index - 1, Word);
 end;
 
 function TNeuralEnglishG2P.NextWord(Index: integer; out Word: string): boolean;
 begin
-  Word := '';
-  Result := (Index + 1 < FRawCount) and not FRaw[Index + 1].IsPunctuation;
-  if Result then Word := G2PLower(ReplaceCurlyApostrophes(FRaw[Index + 1].Text));
+  Result := RawWordAt(Index + 1, Word);
 end;
 
 function TNeuralEnglishG2P.TagWord(Index: integer; IsShouting,
