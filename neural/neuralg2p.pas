@@ -737,6 +737,20 @@ begin
   Result := Copy(S, 1, Length(S) - Count);
 end;
 
+// misaki's ([bcdgklmnprstvxz])\1<Suffix>$|ck<Suffix>$.
+function EndsWithDoubledConsonant(const Word, Suffix: string): boolean;
+var
+  ConsonantPos: integer;
+begin
+  if not EndsWith(Word, Suffix) then Exit(false);
+  if EndsWith(Word, 'ck' + Suffix) then Exit(true);
+  ConsonantPos := Length(Word) - Length(Suffix);
+  Result := (ConsonantPos >= 2) and
+    (Word[ConsonantPos] = Word[ConsonantPos - 1]) and
+    (Word[ConsonantPos] in ['b', 'c', 'd', 'g', 'k', 'l', 'm', 'n', 'p', 'r',
+    's', 't', 'v', 'x', 'z']);
+end;
+
 function InStringArray(const S: string; const Items: array of string): boolean;
 var
   ItemCnt, MaxItemPos: integer;
@@ -2903,6 +2917,10 @@ begin
   else if (WordLen > 4) and EndsWith(Word, 'ed') and not EndsWith(Word, 'eed')
     and IsKnown(DropBytes(Word, 2)) then
     Stem := DropBytes(Word, 2)
+  // not in misaki: stem_ing's doubled-consonant branch, applied to -ed
+  else if (WordLen > 5) and EndsWithDoubledConsonant(Word, 'ed') and
+    IsKnown(DropBytes(Word, 3)) then
+    Stem := DropBytes(Word, 3)
   else Exit(false);
   if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or
     (StemPhonemes = '') then Exit(false);
@@ -2915,24 +2933,18 @@ function TNeuralEnglishG2P.StemIng(const Word, Tag: string; Stress: single;
   const Ctx: TNeuralG2PContext; out Phonemes: string;
   var Resolutions: TNeuralG2PResolutions): boolean;
 var
-  WordLen, ByteLen: integer;
+  WordLen: integer;
   Stem, StemPhonemes: string;
-  IsDoubled: boolean;
 begin
   Phonemes := '';
   WordLen := CodePointCount(Word);
   if (WordLen < 5) or not EndsWith(Word, 'ing') then Exit(false);
-  ByteLen := Length(Word);
-  // ([bcdgklmnprstvxz])\1ing$|cking$
-  IsDoubled := EndsWith(Word, 'cking') or ((ByteLen >= 5) and
-    (Word[ByteLen - 3] = Word[ByteLen - 4]) and
-    (Word[ByteLen - 3] in ['b', 'c', 'd', 'g', 'k', 'l', 'm', 'n', 'p', 'r',
-    's', 't', 'v', 'x', 'z']));
   if (WordLen > 5) and IsKnown(DropBytes(Word, 3)) then
     Stem := DropBytes(Word, 3)
   else if IsKnown(DropBytes(Word, 3) + 'e') then
     Stem := DropBytes(Word, 3) + 'e'
-  else if (WordLen > 5) and IsDoubled and IsKnown(DropBytes(Word, 4)) then
+  else if (WordLen > 5) and EndsWithDoubledConsonant(Word, 'ing') and
+    IsKnown(DropBytes(Word, 4)) then
     Stem := DropBytes(Word, 4)
   else Exit(false);
   if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or

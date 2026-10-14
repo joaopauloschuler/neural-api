@@ -305,9 +305,11 @@ begin
     AssertPhonemes(G2P, 'refactoring', 'ɹifˈæktəɹɪŋ');
     AssertPhonemes(G2P, 'boss''s', 'bˈɔsᵻz');
     AssertPhonemes(G2P, 'dogs''', 'dˈɔɡz');
-    // one level only, no doubled-consonant -ed: misaki leaves it unknown and
-    // the unknown-word split reads B + logged
-    AssertPhonemes(G2P, 'blogged', 'bˈilˌɔɡd');
+    // doubled consonant before -ed (not in misaki): blog + ed, not B + logged
+    AssertPhonemes(G2P, 'blogged', 'blˈɑɡd');
+    AssertPhonemes(G2P, 'vlogged', 'vlˈɑɡd');
+    AssertPhonemes(G2P, 'hashtagged', 'hˈæʃtˌæɡd');
+    AssertPhonemes(G2P, 'geotagged', 'ʤˈiOtˌæɡd');
   finally
     G2P.Free;
   end;
@@ -324,6 +326,8 @@ begin
     AssertPhonemes(G2P, 'foxes', 'fˈɒksɪz');
     AssertPhonemes(G2P, 'boss''s', 'bˈɒsɪz');
     AssertPhonemes(G2P, 'googling', 'ɡˈuːɡᵊlɪŋ');
+    AssertPhonemes(G2P, 'blogged', 'blˈɒɡd');
+    AssertPhonemes(G2P, 'geotagged', 'ʤˈiːQtaɡd');
     // GB -ing refuses a stem ending in ə; the unknown-word split reads
     // refactor + ing
     AssertPhonemes(G2P, 'refactoring', 'ɹiːfˈaktəˌɪŋ');
@@ -930,10 +934,14 @@ begin
         begin
           IsEqual := Tokens[MyIdx].Phonemes = RefPhonemes;
           // task 5.5 owns a token an unknown-word route read (misaki dropped
-          // all or part of it) and the context it gives the word before it
+          // all or part of it) and the context it gives the word before it;
+          // so does a word misaki left unknown that the -ed stem rule reads
           IsRouted := cUnknownRoutes * Tokens[MyIdx].Resolutions <> [];
           IsBeforeRouted := (MyIdx + 1 < Length(Tokens)) and
-            (cUnknownRoutes * Tokens[MyIdx + 1].Resolutions <> []);
+            ((cUnknownRoutes * Tokens[MyIdx + 1].Resolutions <> []) or
+            ((RefIdx + 1 < RefTokens.Count) and (Tokens[MyIdx + 1].Phonemes <> '')
+            and RefTokens.Objects[RefIdx + 1].Items[RefTokens.Objects[RefIdx + 1]
+            .IndexOfName('phonemes')].IsNull));
           if IsCounted and IsPOSToken and (IsRouted or (IsBeforeRouted and
             not IsEqual)) then
             Inc(UncountedPOSTokens);
