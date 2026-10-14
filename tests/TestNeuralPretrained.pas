@@ -22,6 +22,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, testutils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
+  neuralg2p,
   neuralchatengine, neuralchat,
   neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
@@ -795,6 +796,12 @@ type
     // SynthesizePhonemes on the tiny fixture: equals the stages run one by one
     // (x handed over from the decoder's layer); reports the diff to the dump.
     procedure TestKokoroTinySynthesizePhonemes;
+    // English text on the tiny fixture with the G2P fixture dictionaries: one
+    // chunk equals SynthesizePhonemes; several equal the per-chunk audio joined.
+    procedure TestKokoroTinySynthesizeText;
+    // The G2P follows the voice's accent: a* -> b* re-creates it, a* -> a*
+    // keeps it; a non-English voice or a missing folder raises.
+    procedure TestKokoroEnglishG2PAccentSwitch;
     // The stage-C generator and the iSTFT on the real snapshot vs the real
     // dump; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
     procedure TestKokoroRealStageCGeneratorParity;
@@ -25638,6 +25645,155 @@ begin
     F0Curve.Free; NCurve.Free;
     DecoderFeatures.Free; HarmonicSpectrum.Free;
     Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroTinySynthesizeText;
+const
+  cShortText = 'The quick brown fox.';
+  cLongText = 'The quick brown fox jumps over the lazy dog.' + #10#10 +
+    'The sunflowerfield.';
+var
+  Kokoro: TNNetKokoro;
+  Voice: TKokoroVoicePack;
+  Audio, Expected, ChunkAudio: TNNetVolume;
+  Report: TKokoroTextReport;
+  Lines: TStringList;
+  Phonemes, SkippedSymbols: string;
+  ChunkPos, SampleCount, MaxChunkPhonemeCount, MinChunkPhonemeCount: integer;
+  Failed: boolean;
+begin
+  Kokoro := CreateTinyKokoro();
+  Voice := LoadKokoroVoicePack(FixturePath('tiny_kokoro82m' +
+    DirectorySeparator + 'voices' + DirectorySeparator + 'af_heart.pt'),
+    Kokoro.Config.StyleDim);
+  Audio := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  ChunkAudio := TNNetVolume.Create;
+  Lines := TStringList.Create;
+  try
+    Kokoro.EnglishDictionaryDir := ExtractFileDir(FixturePath('g2p_english' +
+      DirectorySeparator + 'us_gold.json'));
+    // max_position_embeddings 32 - 2 (the voice pack has 32 rows)
+    AssertEquals('tiny chunk limit', 30, Kokoro.MaxChunkPhonemes(Voice));
+    // one chunk: the same audio as SynthesizePhonemes of the G2P's phonemes
+    Kokoro.SynthesizeText(cShortText, Voice, 1.0, Audio, Report);
+    AssertEquals('short text chunks', 1, Length(Report));
+    Phonemes := Kokoro.EnglishG2P.Phonemize(cShortText);
+    AssertEquals('short text phonemes', Phonemes, Report[0].G2PChunk.Phonemes);
+    Kokoro.SynthesizePhonemes(Phonemes, Voice, 1.0, Expected, SkippedSymbols);
+    AssertEquals('short text samples', Expected.Size, Audio.Size);
+    AssertEquals('short text audio', 0, MaxAbsVolumeDiff(Expected, Audio), 0);
+    // several chunks (30-phoneme limit, a paragraph break): the per-chunk
+    // audio, each with its own voice row, joined with no gap
+    Kokoro.SynthesizeText(cLongText, Voice, 1.0, Audio, Report);
+    AssertTrue('long text chunks', Length(Report) >= 3);
+    Expected.ReSize(Audio.Size, 1, 1);
+    SampleCount := 0;
+    MaxChunkPhonemeCount := 0;
+    MinChunkPhonemeCount := MaxInt;
+    for ChunkPos := 0 to High(Report) do
+    begin
+      Phonemes := Report[ChunkPos].G2PChunk.Phonemes;
+      AssertTrue('chunk within the limit', CodePointCount(Phonemes) <= 30);
+      MaxChunkPhonemeCount := Max(MaxChunkPhonemeCount, CodePointCount(Phonemes));
+      MinChunkPhonemeCount := Min(MinChunkPhonemeCount, CodePointCount(Phonemes));
+      Kokoro.SynthesizePhonemes(Phonemes, Voice, 1.0, ChunkAudio, SkippedSymbols);
+      AssertEquals('chunk first sample', SampleCount,
+        Report[ChunkPos].FirstSample);
+      AssertEquals('chunk samples', ChunkAudio.Size,
+        Report[ChunkPos].SampleCount);
+      AssertTrue('chunk inside the audio',
+        SampleCount + ChunkAudio.Size <= Audio.Size);
+      Move(ChunkAudio.FData[0], Expected.FData[SampleCount],
+        ChunkAudio.Size * SizeOf(TNeuralFloat));
+      Inc(SampleCount, ChunkAudio.Size);
+    end;
+    AssertTrue('chunks of different lengths (different voice rows)',
+      MinChunkPhonemeCount < MaxChunkPhonemeCount);
+    AssertEquals('joined samples', SampleCount, Audio.Size);
+    AssertEquals('joined audio', 0, MaxAbsVolumeDiff(Expected, Audio), 0);
+    AssertEquals('second paragraph', 1,
+      Report[High(Report)].G2PChunk.ParagraphIndex);
+    DescribeKokoroTextReport(Report, Lines);
+    WriteLn('  Kokoro tiny SynthesizeText report:');
+    for ChunkPos := 0 to Lines.Count - 1 do
+      WriteLn('    ', Lines[ChunkPos]);
+    AssertTrue('unknown word in the report', Pos('  word sunflowerfield: ' +
+      'unknown word split (sunflower+field) -> ', Lines.Text) > 0);
+    // the file path writes the same audio
+    Kokoro.SynthesizeTextToWav(cShortText, Voice, 1.0,
+      GetTempDir + 'kokoro_text_test.wav', Report);
+    AssertTrue('WAV written', FileExists(GetTempDir + 'kokoro_text_test.wav'));
+    DeleteFile(GetTempDir + 'kokoro_text_test.wav');
+    Failed := false;
+    try
+      Kokoro.SynthesizeText('  ' + #10, Voice, 1.0, Audio, Report);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('text with no words rejected', Failed);
+  finally
+    Lines.Free;
+    ChunkAudio.Free;
+    Expected.Free;
+    Audio.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroEnglishG2PAccentSwitch;
+var
+  Kokoro: TNNetKokoro;
+  American, American2, British, Japanese: TKokoroVoicePack;
+  FirstG2P, BritishG2P: TNeuralEnglishG2P;
+  Failed: boolean;
+begin
+  AssertEquals('dictionary folder', 'snap' + DirectorySeparator + 'misaki',
+    KokoroEnglishDictionaryDir('snap'));
+  Kokoro := CreateTinyKokoro();
+  try
+    American := Default(TKokoroVoicePack);
+    American.Name := 'af_heart';
+    American2 := American;
+    American2.Name := 'am_adam';
+    British := American;
+    British.Name := 'bf_emma';
+    Japanese := American;
+    Japanese.Name := 'jf_alpha';
+    AssertNull('no G2P before a text call', Kokoro.EnglishG2P);
+    Failed := false;
+    try
+      Kokoro.EnglishG2PForVoice(American);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('no dictionary folder rejected', Failed);
+    Kokoro.EnglishDictionaryDir := ExtractFileDir(FixturePath('g2p_english' +
+      DirectorySeparator + 'us_gold.json'));
+    FirstG2P := Kokoro.EnglishG2PForVoice(American);
+    AssertTrue('US accent', FirstG2P.Accent = g2pAmerican);
+    AssertSame('a* -> a*: kept', FirstG2P, Kokoro.EnglishG2PForVoice(American2));
+    BritishG2P := Kokoro.EnglishG2PForVoice(British);
+    AssertNotSame('a* -> b*: re-created', FirstG2P, BritishG2P);
+    AssertTrue('GB accent', BritishG2P.Accent = g2pBritish);
+    AssertSame('b* -> b*: kept', BritishG2P, Kokoro.EnglishG2PForVoice(British));
+    Failed := false;
+    try
+      Kokoro.EnglishG2PForVoice(Japanese);
+    except
+      on ENeuralG2PError do Failed := true;
+    end;
+    AssertTrue('non-English voice rejected', Failed);
+    AssertSame('a failed switch keeps the G2P', BritishG2P, Kokoro.EnglishG2P);
+    AssertTrue('b* -> a*: US again',
+      Kokoro.EnglishG2PForVoice(American).Accent = g2pAmerican);
+    // a new folder drops the loaded G2P
+    Kokoro.EnglishDictionaryDir := ExtractFileDir(FixturePath('g2p_english' +
+      DirectorySeparator + 'us_gold.json')) + DirectorySeparator;
+    AssertNull('new folder', Kokoro.EnglishG2P);
+  finally
     Kokoro.Free;
   end;
 end;

@@ -536,7 +536,7 @@ uses
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralchat, neuralmxfp4, neuralnf4,
-  neuralaudio, neuraldiffusion, pascoremath32;
+  neuralaudio, neuraldiffusion, neuralg2p, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -5378,6 +5378,9 @@ function BuildVitsFromSafeTensors(const FileName: string;
 // ---------------------------------------------------------------------------
 const
   KokoroSampleRate = 24000;
+  // Phonemes per chunk in kokoro KPipeline (max_position_embeddings 512 minus
+  // the two wrapping 0s; the voice packs have 510 rows).
+  KokoroMaxChunkPhonemes = 510;
   // Generator.m_source (SourceModuleHnNSF): sine_amp, add_noise_std and
   // voiced_threshod as the kokoro package hard-codes them.
   KokoroHarmonicSineAmp = 0.1;
@@ -5436,6 +5439,15 @@ type
     Values: TNeuralFloatDynArr;
   end;
 
+  // One chunk of TNNetKokoro.SynthesizeText: the G2P chunk, the symbols
+  // outside the vocab and where its audio starts in the joined output.
+  TKokoroTextChunk = record
+    G2PChunk: TNeuralG2PChunk;
+    SkippedSymbols: string;
+    FirstSample, SampleCount: integer;
+  end;
+  TKokoroTextReport = array of TKokoroTextChunk;
+
 // Reads a Kokoro config.json; vocab keys may be raw UTF-8 or \u escapes.
 function ReadKokoroConfigFromJSONFile(const FileName: string): TKokoroConfig;
 
@@ -5462,6 +5474,14 @@ function LoadKokoroVoicePack(const FileName: string;
 // code points) into the decoder half and the prosody half.
 procedure SelectKokoroVoiceStyle(const Pack: TKokoroVoicePack;
   PhonemeCount: integer; out DecoderStyle, ProsodyStyle: TNeuralFloatDynArr);
+
+// <SnapshotDir>/misaki: where the user puts misaki's English dictionaries.
+function KokoroEnglishDictionaryDir(const SnapshotDir: string): string;
+
+// Per chunk: phonemes, symbols outside the vocab, and the words read by an
+// unknown-word route or left unknown (DescribeG2PUnknownWords).
+procedure DescribeKokoroTextReport(const Report: TKokoroTextReport;
+  Lines: TStrings);
 
 // Opens a snapshot folder: config.json, the single *.pth and
 // voices/<VoiceName>.pt. Returns the checkpoint reader (caller-owned).
@@ -5687,6 +5707,9 @@ type
     FParallel: boolean;
     FMaxThreads: integer;
     FShareHostOutputs: boolean;
+    // English G2P of the last text call (its accent) and its dictionary folder.
+    FEnglishG2P: TNeuralEnglishG2P;
+    FEnglishDictionaryDir: string;
     // Set when the stage owner is armed in the OpenCL context.
     FStageAOwnerOnOpenCL, FStageBOwnerOnOpenCL,
       FStageCDecoderOwnerOnOpenCL, FStageCGeneratorOwnerOnOpenCL: boolean;
@@ -5696,6 +5719,7 @@ type
     FOpenCLHasSharedKernel: boolean;
     FShareOpenCLOutputs: boolean;
     {$ENDIF}
+    procedure SetEnglishDictionaryDir(const Value: string);
     // Each loader adds the tensors it reads to Consumed.
     procedure LoadStageA(Reader: TNNetSafeTensorsReader; Consumed: TStrings);
     procedure LoadStageB(Reader: TNNetSafeTensorsReader; Consumed: TStrings);
@@ -5770,6 +5794,20 @@ type
     procedure SynthesizePhonemesToWav(const Phonemes: string;
       const Voice: TKokoroVoicePack; Speed: TNeuralFloat;
       const FileName: string);
+    // Chunk limit in phonemes: KokoroMaxChunkPhonemes, capped by
+    // max_position_embeddings - 2 and Voice's rows.
+    function MaxChunkPhonemes(const Voice: TKokoroVoicePack): integer;
+    // The English G2P for Voice's accent (a* US, b* GB; others raise), loaded
+    // from EnglishDictionaryDir; re-created only when the accent changes.
+    function EnglishG2PForVoice(const Voice: TKokoroVoicePack): TNeuralEnglishG2P;
+    // English text as kokoro KPipeline: G2P, chunks, each synthesized with its
+    // own voice row, audio joined with no gap. Raises when no chunk has phonemes.
+    procedure SynthesizeText(const Text: string; const Voice: TKokoroVoicePack;
+      Speed: TNeuralFloat; Audio: TNNetVolume; out Report: TKokoroTextReport);
+    // SynthesizeText, written to FileName as a 16-bit 24 kHz WAV.
+    procedure SynthesizeTextToWav(const Text: string;
+      const Voice: TKokoroVoicePack; Speed: TNeuralFloat;
+      const FileName: string; out Report: TKokoroTextReport);
     {$IFDEF OpenCL}
     // One OpenCL context and program for every stage net (owner weights
     // uploaded once, borrowed); false if the program does not build.
@@ -5786,6 +5824,12 @@ type
       write FShareOpenCLOutputs;
     {$ENDIF}
     property Config: TKokoroConfig read FConfig;
+    // Folder with misaki's {us|gb}_{gold|silver}.json (see
+    // KokoroEnglishDictionaryDir); a new folder drops the loaded G2P.
+    property EnglishDictionaryDir: string read FEnglishDictionaryDir
+      write SetEnglishDictionaryDir;
+    // nil until the first text call.
+    property EnglishG2P: TNeuralEnglishG2P read FEnglishG2P;
     property StageAOwner: TNNet read FStageAOwner;
     property StageANet: TNNet read FStageANet;
     // The layers of StageANet (valid until the next rebuild).
@@ -52291,6 +52335,7 @@ begin
   FHarmonicSource.Free;
   FHarmonicSTFT.Free;
   FHarmonicWave.Free;
+  FEnglishG2P.Free;
   inherited Destroy();
 end;
 
@@ -52868,19 +52913,11 @@ procedure TNNetKokoro.SynthesizePhonemes(const Phonemes: string;
 var
   TokenIds: TNeuralIntegerArray;
   DecoderStyle, ProsodyStyle: TNeuralFloatDynArr;
-  PhonemeCount, Position, PhonemesLen: integer;
 begin
   TokenIds := KokoroPhonemesToIds(FConfig, Phonemes, SkippedSymbols);
   // kokoro's pack[len(ps) - 1]: code points, skipped symbols included.
-  PhonemeCount := 0;
-  Position := 1;
-  PhonemesLen := Length(Phonemes);
-  while Position <= PhonemesLen do
-  begin
-    NextCodePoint(Phonemes, Position);
-    Inc(PhonemeCount);
-  end;
-  SelectKokoroVoiceStyle(Voice, PhonemeCount, DecoderStyle, ProsodyStyle);
+  SelectKokoroVoiceStyle(Voice, CodePointCount(Phonemes), DecoderStyle,
+    ProsodyStyle);
   Synthesize(TokenIds, DecoderStyle, ProsodyStyle, Speed, Audio);
 end;
 
@@ -52896,6 +52933,134 @@ begin
     SaveVolumeToWav16(Audio, FileName, KokoroSampleRate);
   finally
     Audio.Free;
+  end;
+end;
+
+function TNNetKokoro.MaxChunkPhonemes(const Voice: TKokoroVoicePack): integer;
+begin
+  Result := Min(KokoroMaxChunkPhonemes,
+    Min(FConfig.PLBert.MaxPositionEmbeddings - 2, Voice.RowCount));
+end;
+
+procedure TNNetKokoro.SetEnglishDictionaryDir(const Value: string);
+begin
+  if Value = FEnglishDictionaryDir then Exit;
+  FreeAndNil(FEnglishG2P);
+  FEnglishDictionaryDir := Value;
+end;
+
+function TNNetKokoro.EnglishG2PForVoice(
+  const Voice: TKokoroVoicePack): TNeuralEnglishG2P;
+var
+  Accent: TNeuralG2PAccent;
+  NewG2P: TNeuralEnglishG2P;
+begin
+  Accent := EnglishG2PAccentFromVoice(Voice.Name);
+  if Assigned(FEnglishG2P) and (FEnglishG2P.Accent = Accent) then
+    Exit(FEnglishG2P);
+  if FEnglishDictionaryDir = '' then
+    ImportError('Kokoro: set EnglishDictionaryDir (misaki''s dictionaries, ' +
+      'by default <model folder>/misaki) before synthesizing text.');
+  // The old G2P stays usable if the new dictionaries fail to load.
+  NewG2P := TNeuralEnglishG2P.Create(FEnglishDictionaryDir, Accent);
+  FEnglishG2P.Free;
+  FEnglishG2P := NewG2P;
+  Result := FEnglishG2P;
+end;
+
+procedure TNNetKokoro.SynthesizeText(const Text: string;
+  const Voice: TKokoroVoicePack; Speed: TNeuralFloat; Audio: TNNetVolume;
+  out Report: TKokoroTextReport);
+var
+  Chunks: TNeuralG2PChunkArray;
+  ChunkAudio: TNNetVolume;
+  Samples: TNeuralFloatDynArr;
+  ChunkPos, SampleCount, ChunkSampleCount: integer;
+begin
+  Chunks := EnglishG2PForVoice(Voice).PhonemizeInChunks(Text,
+    MaxChunkPhonemes(Voice));
+  Report := nil;
+  if Length(Chunks) = 0 then
+    ImportError('Kokoro: the text has no words to speak.');
+  SetLength(Report, Length(Chunks));
+  Samples := nil;
+  SampleCount := 0;
+  ChunkAudio := TNNetVolume.Create();
+  try
+    for ChunkPos := 0 to High(Chunks) do
+    begin
+      Report[ChunkPos].G2PChunk := Chunks[ChunkPos];
+      SynthesizePhonemes(Chunks[ChunkPos].Phonemes, Voice, Speed, ChunkAudio,
+        Report[ChunkPos].SkippedSymbols);
+      ChunkSampleCount := ChunkAudio.Size;
+      Report[ChunkPos].FirstSample := SampleCount;
+      Report[ChunkPos].SampleCount := ChunkSampleCount;
+      if SampleCount + ChunkSampleCount > Length(Samples) then
+        SetLength(Samples, Max(2 * Length(Samples),
+          SampleCount + ChunkSampleCount));
+      if ChunkSampleCount > 0 then
+        Move(ChunkAudio.FData[0], Samples[SampleCount],
+          ChunkSampleCount * csNeuralFloatSize);
+      Inc(SampleCount, ChunkSampleCount);
+    end;
+  finally
+    ChunkAudio.Free;
+  end;
+  Audio.ReSize(SampleCount, 1, 1);
+  if SampleCount > 0 then
+    Move(Samples[0], Audio.FData[0], SampleCount * csNeuralFloatSize);
+end;
+
+procedure TNNetKokoro.SynthesizeTextToWav(const Text: string;
+  const Voice: TKokoroVoicePack; Speed: TNeuralFloat; const FileName: string;
+  out Report: TKokoroTextReport);
+var
+  Audio: TNNetVolume;
+begin
+  Audio := TNNetVolume.Create();
+  try
+    SynthesizeText(Text, Voice, Speed, Audio, Report);
+    SaveVolumeToWav16(Audio, FileName, KokoroSampleRate);
+  finally
+    Audio.Free;
+  end;
+end;
+
+function KokoroEnglishDictionaryDir(const SnapshotDir: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(SnapshotDir) + 'misaki';
+end;
+
+procedure DescribeKokoroTextReport(const Report: TKokoroTextReport;
+  Lines: TStrings);
+var
+  ChunkPos, WordLinePos: integer;
+  Line: string;
+  WordLines: TStringList;
+begin
+  WordLines := TStringList.Create;
+  try
+    for ChunkPos := 0 to High(Report) do
+    begin
+      Line := Format('chunk %d of %d: %d phonemes, %.2f s',
+        [ChunkPos + 1, Length(Report),
+        CodePointCount(Report[ChunkPos].G2PChunk.Phonemes),
+        Report[ChunkPos].SampleCount / KokoroSampleRate]);
+      if Report[ChunkPos].G2PChunk.IsTruncated then
+        Line := Line + ', cut to the chunk limit (one word too long)';
+      Lines.Add(Line);
+      Lines.Add('  text: ' + Report[ChunkPos].G2PChunk.Text);
+      Lines.Add('  phonemes: ' + Report[ChunkPos].G2PChunk.Phonemes);
+      if Report[ChunkPos].SkippedSymbols <> '' then
+        Lines.Add('  not in the vocab (skipped): ' +
+          Report[ChunkPos].SkippedSymbols);
+      WordLines.Clear;
+      DescribeG2PUnknownWords(Report[ChunkPos].G2PChunk.Tokens, WordLines);
+      for WordLinePos := 0 to WordLines.Count - 1 do
+        Lines.Add('  word ' + WordLines[WordLinePos]);
+    end;
+  finally
+    WordLines.Free;
   end;
 end;
 
