@@ -2034,7 +2034,7 @@ rather than acted on.
         after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
   5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). IN PROGRESS:
-  5.1, 5.2, 5.3, 5.4 and the 5.7 fixture done.
+  5.1, 5.2, 5.3, 5.4, 5.5 and the 5.7 fixture done.
   Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
   no Python at test time (a `tools/` script writes fixtures once on the dev box).
   - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
@@ -2220,7 +2220,7 @@ rather than acted on.
         mInˈut; port NN -> DEFAULT mˈɪnət, again the right English); "Have you
         read it?" (spaCy VB -> ɹˈid; port VBP -> ɹˈɛd, the right English).
         Three of the five are spaCy errors the port does not copy.
-  - [ ] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
+  - [x] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
         possessives, hyphen parts); (2) SPLIT the word into dictionary words by
         dynamic programming, fewest pieces, each piece at least 2 letters
         ("sunflowerfield" -> sun + flower + field), join their phonemes; only
@@ -2229,6 +2229,142 @@ rather than acted on.
         entries: `A` -> `ˈA`, `B` -> `bˈi`) ONLY for unknown ALL-CAPS strings and
         for leftover single characters the split cannot cover. Report which
         words took route 2 or 3. Names may split oddly; that is accepted.
+        Done (commit 95cb6312). Rule as implemented, after misaki's own rules
+        fail: `TNeuralEnglishG2P.ReadUnknownWord` (neuralg2p.pas:300, body
+        :3273). (a) Letters folded to ASCII: NFKC, apostrophes dropped,
+        Latin-1 / Latin Extended-A accents stripped with neuralhftokenizer's
+        `StripAccentBaseCP` (now exported, :480); any other character (ł, ø,
+        æ, digits, symbols) leaves the word unknown. Folding is a table
+        lookup, so it is safe mechanically, but it can pick the wrong word:
+        résumé -> resume reads the verb (ɹəzˈum). (b) An ALL-CAPS string of 2+
+        letters is spelled as misaki spells acronyms (all secondary, last
+        primary); misaki already spells ASCII ALL-CAPS words itself, so in
+        practice this fires after folding (ÉCOLE -> E+C+O+L+E). (c) Any other word,
+        lowercased, at most `csG2PMaxSplitLetters` = 64 letters (:72; longer
+        stays unknown), is covered by dynamic programming
+        (`SplitIntoWords`, :3154): pieces are dictionary words of 2+ letters
+        that contain a vowel letter a e i o u y (this keeps out abbreviation
+        keys such as mr, dr, st, ft, which read as whole words), or single
+        letters spelled with their gold letter entry. Cost: fewest spelled
+        letters, then fewest pieces, then the longest first piece. So a full
+        cover always exists for ASCII letters; "leftover single characters"
+        = the spelled letters of the best cover, and a word with no
+        dictionary piece is spelled letter by letter (Qwrtz, Hrrm, shh,
+        Bpsa) — the literal reading of the rule; say if such words should
+        stay silent instead. A piece reads its DEFAULT (POS-free) reading,
+        gold before silver, the exact key before its Capitalized form
+        (misaki grow_dictionary), null entries skipped. Readings are joined
+        without spaces; only the first piece keeps ˈ, later ˈ become ˌ. A
+        Capitalized or mixed-case word then gets misaki's capital stress
+        (ApplyG2PStress 0.5, which only adds a mark when the result has
+        none). Fewest pieces means sunflowerfield -> sunflower+field (2
+        pieces), not sun+flower+field. DP cost: at most 64 start positions
+        x the longest dictionary key (45 bytes) x 4 hash probes, no string
+        built per probe (`TNeuralG2PDictionary.IndexOfBytes` :152,
+        `MaxKeyLength` :165). (d) Multi-piece words (`ResolveUnknownRuns`,
+        :3636): after misaki's merge loop, the run of adjacent letter pieces
+        around an unread piece (taking whole any misaki merge made only of
+        letter pieces) is read as one word, so camelCase WiFi -> wifi,
+        PyTorch -> pytorch, possessive Schuler's -> schuler + misaki's 's,
+        blorp-zing -> blorp + misaki's zing. A clitic piece after an
+        apostrophe piece (I'd've, GB that'll) stays unread as in misaki.
+        The word before a now-read word sees its first sound (misaki's
+        right-to-left context). Report: new kinds `g2prUnknownSplit` /
+        `g2prUnknownSpelled` (:90; `G2PResolutionName`: "unknown word
+        split" / "unknown word spelled"); a cover with both words and
+        spelled letters has both; `TNeuralG2PToken.Pieces` (:106) holds the
+        pieces, '+'-joined, spelled letters upper case ("pa+U+lo").
+        Tests (3 new, 20 in TestNeuralG2P): TestUnknownWords (pieces,
+        one primary, kinds, folding, Wrocław unknown, camelCase, possessive,
+        clitic, context "the applegarden" -> ði, the 64/65-letter cap),
+        TestUnknownWordReport (prints the table below), and
+        TestUnknownWordRealDictionaries (full misaki files, ignored when
+        missing): with the full files only the 4 folded words differ —
+        Café -> cafe kæfˈA (GB kˈafA), naïve -> naive nɑˈiv (GB nIˈiːv),
+        résumé -> resume ɹəzˈum (GB ɹɪzjˈuːm), Raphaël -> raphael ɹˈæfiəl
+        (GB ɹˈafAəl); the subset lacks cafe/naive/resume/raphael because
+        they are not substrings of the accented fixture words. Every other
+        row is identical. Fixture agreement: tokens misaki read are
+        unchanged except 8 it read only in part, now read whole and not
+        counted (blorp-zing, Mia's, Nguyen's, PyTorch, Schuler's,
+        usr/local/bin, WiFi, www.example.org/page; asserted as a list) and
+        one context change not counted ("got" before "hashtagged" in #293:
+        misaki's clause-end "None" reading ɡˈɑt -> ɡɑt). Totals US
+        2563/2564, GB 2561/2562 (same mismatches as before: NEAR + the 5.4
+        POS cases); sentence agreement drops to 270/320 (US) and 269/320
+        (GB) because sentences with unknown words now have phonemes where
+        misaki has none. The fixture's `*` and `#` stay as before (not
+        letters). Suites: cpu, avx2, opencl `TESTS=3264 ERRORS=0
+        FAILURES=0 IGNORED=4`.
+        Every fixture word misaki left unknown (or read in part), dictionary
+        subset; pieces -> phonemes (US | GB; ɾ already mapped to T):
+        | word | US | GB |
+        | --- | --- | --- |
+        | usr/local/bin | us+R -> ˌʌsˌɑɹ lˈOkəl bˈɪn | us+R -> ˌʌsˌɑː lˈQkᵊl bˈɪn |
+        | www.example.org/page | W+W+W -> dˈʌbᵊljudˌʌbᵊljudˌʌbᵊlju ɪɡzˈæmpəl ˈɔɹɡ pˈAʤ | W+W+W, or+G -> dˈʌbᵊljuːdˌʌbᵊljuːdˌʌbᵊljuː ɪɡzˈɑːmpᵊl ɔːʤˌiː pˈAʤ |
+        | PyTorch | P+Y+torch -> pˈiwˌItˌɔɹʧ | P+Y+torch -> pˈiːwˌItˌɔːʧ |
+        | WiFi | W+if+I -> dˈʌbᵊljuɪfˌI | W+if+I -> dˈʌbᵊljuːɪfˌI |
+        | Schuler's | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹs | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜːs |
+        | Nguyen's | N+guy+en -> ˈɛnɡˌIˌɛns | N+guy+en -> ˈɛnɡˌIˌɛns |
+        | Mia's | mi+A -> mˈiˌAs | M+I+A -> ˈɛmˌIˌAs |
+        | blorp-zing | blo+R+P -> blˈOˌɑɹpˌizˌɪŋ | blo+R+P -> blˈQˌɑːpˌiːzˌɪŋ |
+        | blogged | B+logged -> bˈilˌɔɡd | blog+G+E+D -> blˈɒɡʤˌiːˌiːdˌiː |
+        | livestreamed | livest+reamed -> lˈIvstɹˌimd | livest+reamed -> lˈIvstɹˌiːmd |
+        | livestreaming | livest+reaming -> lˈIvstɹˌimɪŋ | livest+reaming -> lˈIvstɹˌiːmɪŋ |
+        | photoshopped | photos+hopped -> fˈOTOzhˌɑpt | photo+shopped -> fˈQtQʃˌɒpt |
+        | hashtagged | hash+tagged -> hˈæʃtˌæɡd | hashtag+G+E+D -> hˈaʃtaɡʤˌiːˌiːdˌiː |
+        | facetimed | face+timed -> fˈAstˌImd | face+timed -> fˈAstˌImd |
+        | smurfs | S+M+urf+S -> ˈɛsˌɛmˌɜɹfˌɛs | S+M+urf+S -> ˈɛsˌɛmˌɜːfˌɛs |
+        | photocopied | photo+co+pied -> fˈOTOkˌOpˌId | photo+co+pied -> fˈQtQkˌQpˌId |
+        | vlogged | V+logged -> vˈilˌɔɡd | vlog+G+E+D -> vlˈɒɡʤˌiːˌiːdˌiː |
+        | geotagged | geotag+G+E+D -> ʤˈiOtˌæɡʤˌiˌidˌi | geotag+G+E+D -> ʤˈiːQtaɡʤˌiːˌiːdˌiː |
+        | deduped | D+E+duped -> dˈiˌidˌupt | D+E+duped -> dˈiːˌiːdjˌuːpt |
+        | sunflowerfield | sunflower+field -> sˈʌnflˌWəɹfˌild | sunflower+field -> sˈʌnflˌWəfˌiːld |
+        | keyboardstand | keyboard+stand -> kˈibˌɔɹdstˌænd | keyboard+stand -> kˈiːbɔːdstˌand |
+        | rainbowbridge | rainbow+bridge -> ɹˈAnbˌObɹˌɪʤ | rainbow+bridge -> ɹˈAnbQbɹˌɪʤ |
+        | moonlightgarden | moonlight+garden -> mˈunlˌItɡˌɑɹdən | moonlight+garden -> mˈuːnlItɡˌɑːdᵊn |
+        | Joao | J+O+A+O -> ʤˈAˌOˌAˌO | jo+A+O -> ʤˈQˌAˌQ |
+        | Paulo | pa+U+lo -> pˈɑjˌulˌO | pa+U+lo -> pˈɑːjˌuːlˌQ |
+        | Schuler | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹ | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜː |
+        | Nguyen | N+guy+en -> ˈɛnɡˌIˌɛn | N+guy+en -> ˈɛnɡˌIˌɛn |
+        | Xochitl | X+O+chit+L -> ˈɛksˌOʧˌɪtˌɛl | X+och+it+L -> ˈɛksˌɒkɪtˌɛl |
+        | Siobhan | si+ob+han -> sˈiˌɑbhˌæn | si+ob+han -> sˈiːˌɒbhˌan |
+        | Okonkwo | ok+on+K+W+O -> ˌOkˈAˌɔnkˌAdˌʌbᵊljuˌO | ok+on+K+wo -> ˌQkˈAˌɒnkˌAwˌQ |
+        | blorptastic | blo+R+P+ta+S+tic -> blˈOˌɑɹpˌitˌɑˌɛstˌɪk | blo+R+P+ta+S+tic -> blˈQˌɑːpˌiːtˌɑːˌɛstˌɪk |
+        | zingwhizzle | zing+whizzle -> zˈɪŋwˌɪzᵊl | zing+whizzle -> zˈɪŋwˌɪzᵊl |
+        | Llanfairpwllgwyngyll | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌænfˌɛɹpˌidˌʌbᵊljuˌɛlˌɛlʤˌidˌʌbᵊljuwˌIˌɛnʤˌiwˌIˌɛlˌɛl | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌanfˌɛːpˌiːdˌʌbᵊljuːˌɛlˌɛlʤˌiːdˌʌbᵊljuːwˌIˌɛnʤˌiːwˌIˌɛlˌɛl |
+        | Zbigniew | Z+big+N+I+ew -> zˈibˌɪɡˌɛnˌIjˌɪw | Z+big+N+I+ew -> zˈiːbˌɪɡˌɛnˌIjˌɪw |
+        | Brzezinski | B+R+ze+zin+ski -> bˈiˌɑɹzˌizˌɪnskˌi | B+R+ze+zin+ski -> bˈiːˌɑːzˌiːzˌɪnskˌiː |
+        | Dmitri | D+mi+T+R+I -> dˈimˌitˌiˌɑɹˌI | D+M+it+R+I -> dˈiːˌɛmɪtˌɑːˌI |
+        | Shostakovich | sho+sta+K+O+V+I+C+H -> ʃˈOstˌɑkˌAˌOvˌiˌIsˌiˌAʧ | sho+sta+K+O+V+I+C+H -> ʃˈQstˌɑːkˌAˌQvˌiːˌIsˌiːˌAʧ |
+        | Qwrtz | Q+W+R+T+Z -> kjˈudˌʌbᵊljuˌɑɹtˌizˌi | Q+W+R+T+Z -> kjˈuːdˌʌbᵊljuːˌɑːtˌiːzˌiː |
+        | Wrocław | stays unknown (ł has no ASCII base) | stays unknown |
+        | Café | C+A+F+E -> sˈiˌAˌɛfˌi | C+A+F+E -> sˈiːˌAˌɛfˌiː |
+        | naïve | na+I+V+E -> nˈʌˌIvˌiˌi | na+I+V+E -> nˈʌˌIvˌiːˌiː |
+        | résumé | re+sum+E -> ɹˌAsˌʌmˌi | res+um+E -> ɹˈiːzˌʌmˌiː |
+        | Okafor | oka+for -> ˈOkəfɔɹ | oka+for -> ˈQkəfɔː |
+        | Tanaka | ta+na+ka -> tˈɑnˌʌkˌɑ | tana+ka -> tˈɑːnəkˌɑː |
+        | Hrrm | H+R+R+M -> ˈAʧˌɑɹˌɑɹˌɛm | H+R+R+M -> ˈAʧˌɑːˌɑːˌɛm |
+        | shh | S+H+H -> ˈɛsˌAʧˌAʧ | S+H+H -> ˈɛsˌAʧˌAʧ |
+        | firetruckladder | fire+truck+ladder -> fˈIəɹtɹˌʌklˌædəɹ | fire+truck+ladder -> fˈIətɹˌʌklˌadə |
+        | Greenhousegas | greenhouse+gas -> ɡɹˈinhˌWsɡˌæs | greenhouse+gas -> ɡɹˈiːnhWsɡˌas |
+        | snowmanhat | snowman+hat -> snˈOmˌænhˌæt | snowman+hat -> snˈQmanhˌat |
+        | Bpsa | B+P+S+A -> bˈipˌiˌɛsˌA | B+P+S+A -> bˈiːpˌiːˌɛsˌA |
+        | joaopauloschuler | J+O+A+opa+U+lo+S+C+H+U+ler -> ʤˈAˌOˌAˌOpəjˌulˌOˌɛssˌiˌAʧjˌulˌɜɹ | jo+A+opa+U+lo+S+C+H+U+ler -> ʤˈQˌAˌQpəjˌuːlˌQˌɛssˌiːˌAʧjˌuːlˌɜː |
+        | Kokoro | K+ok+or+O -> kˈAˌOkˌAɔɹˌO | K+O+koro -> kˈAˌQkˌɔːɹQ |
+        | Raphaël | rap+ha+el -> ɹˈæphˌɑˌɛl | rap+ha+el -> ɹˈaphˌɑːˌɛl |
+        | Zoë | Z+O+E -> zˈiˌOˌi | Z+O+E -> zˈiːˌQˌiː |
+        | tokenizer | tokenize+R -> tˈOkənˌIzˌɑɹ | tokenize+R -> tˈQkənIzˌɑː |
+        | hummed | (misaki reads it) | hum+med -> hˈʌmmˌɛd |
+        | refactoring | (misaki reads it) | refactor+ing -> ɹiːfˈaktəˌɪŋ |
+        Seen in the table, for the user to judge: words with a doubled
+        consonant before -ed come out as spelled letters (blogged B+logged
+        US, blog+G+E+D GB; hashtagged, vlogged, geotagged), because pieces
+        are dictionary words only and -ed is not one; a doubled-consonant
+        -ed stem rule (not in misaki) would fix that group. Names mostly
+        spell (Joao J+O+A+O, Schuler S+C+H+U+ler). Not done: no stem rules
+        on pieces, no letter-to-sound rules, no folding beyond Latin-1 /
+        Latin Extended-A.
   - [ ] 5.6 Long text (also closes 3.1's chunking): split at sentence
         punctuation into chunks of at most 510 tokens, synthesize each, join the
         audio into one WAV (as Kokoro's own pipeline does).
