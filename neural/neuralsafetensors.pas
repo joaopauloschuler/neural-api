@@ -35,7 +35,7 @@ interface
 
 uses
   Classes, SysUtils, fpjson, jsonparser, neuralvolume, neuralnetwork,
-  neuralthread;
+  neuralthread, neuralminhash;
 
 type
   ESafeTensorsError = class(Exception);
@@ -332,23 +332,6 @@ const
   csTensorSlotEmpty = -1;
   csTensorSlotDeleted = -2;
   csMinTensorSlots = 64;
-
-// FNV-1a over the name bytes. The multiply wraps by design, so overflow
-// checking is off for it.
-{$PUSH}{$Q-}{$R-}
-function SafeTensorNameHash(const pName: string): cardinal;
-var
-  i, NameLen: integer;
-begin
-  Result := 2166136261;
-  NameLen := Length(pName);
-  for i := 1 to NameLen do
-  begin
-    Result := Result xor cardinal(Ord(pName[i]));
-    Result := Result * 16777619;
-  end;
-end;
-{$POP}
 
 function DecodeF16(Bits: Word): Single;
 var
@@ -782,7 +765,8 @@ begin
   begin
     Idx := OldSlots[i];
     if Idx < 0 then continue;
-    Slot := integer(SafeTensorNameHash(FTensors[Idx].Name)) and FNameSlotMask;
+    Slot := integer(FNV1a32(PAnsiChar(FTensors[Idx].Name),
+    Length(FTensors[Idx].Name))) and FNameSlotMask;
     while FNameSlots[Slot] >= 0 do Slot := (Slot + 1) and FNameSlotMask;
     FNameSlots[Slot] := Idx;
     Inc(FIndexedSlots);
@@ -812,7 +796,8 @@ begin
   // here would only build a table that is thrown away.
   if not FNameIndexValid then exit;
   if (FIndexedSlots + 1) * 2 > FNameSlotMask + 1 then GrowTensorIndex;
-  Slot := integer(SafeTensorNameHash(FTensors[Idx].Name)) and FNameSlotMask;
+  Slot := integer(FNV1a32(PAnsiChar(FTensors[Idx].Name),
+    Length(FTensors[Idx].Name))) and FNameSlotMask;
   while FNameSlots[Slot] >= 0 do Slot := (Slot + 1) and FNameSlotMask;
   if FNameSlots[Slot] = csTensorSlotEmpty then Inc(FIndexedSlots);
   FNameSlots[Slot] := Idx;
@@ -823,7 +808,7 @@ var
   Slot, Idx: integer;
 begin
   if not FNameIndexValid then exit;
-  Slot := integer(SafeTensorNameHash(pName)) and FNameSlotMask;
+  Slot := integer(FNV1a32(PAnsiChar(pName), Length(pName))) and FNameSlotMask;
   repeat
     Idx := FNameSlots[Slot];
     if Idx = csTensorSlotEmpty then exit;
@@ -841,7 +826,7 @@ var
   Slot, Idx: integer;
 begin
   if not FNameIndexValid then RebuildTensorIndex;
-  Slot := integer(SafeTensorNameHash(pName)) and FNameSlotMask;
+  Slot := integer(FNV1a32(PAnsiChar(pName), Length(pName))) and FNameSlotMask;
   repeat
     Idx := FNameSlots[Slot];
     if Idx = csTensorSlotEmpty then exit(-1);

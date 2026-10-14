@@ -355,7 +355,7 @@ function EnglishDecimalWords(const Number: string): string;
 implementation
 
 uses
-  Math, neuralhftokenizer;
+  Math, neuralhftokenizer, neuralminhash;
 
 const
   csPrimaryStress = #$CB#$88;   // ˈ
@@ -1461,18 +1461,6 @@ end;
 { TNeuralG2PDictionary                                              }
 { ---------------------------------------------------------------- }
 
-function G2PKeyHash(P: PAnsiChar; Len: integer): cardinal;
-var
-  ByteCnt, MaxBytePos: integer;
-begin
-  {$PUSH}{$Q-}{$R-}
-  Result := 2166136261;
-  MaxBytePos := Len - 1;
-  for ByteCnt := 0 to MaxBytePos do
-    Result := (Result xor cardinal(byte(P[ByteCnt]))) * 16777619;
-  {$POP}
-end;
-
 procedure TNeuralG2PDictionary.RaiseParseError(Position: integer;
   const Expected: string);
 begin
@@ -1739,7 +1727,7 @@ function TNeuralG2PDictionary.FindSlot(P: PAnsiChar; Len: integer): integer;
 var
   EntryIdx: integer;
 begin
-  Result := integer(G2PKeyHash(P, Len)) and FSlotMask;
+  Result := integer(FNV1a32(P, Len)) and FSlotMask;
   while true do
   begin
     EntryIdx := FSlots[Result] - 1;

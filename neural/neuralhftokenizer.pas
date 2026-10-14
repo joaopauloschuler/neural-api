@@ -505,7 +505,7 @@ function HFUnshieldJSONKey(const Key: string;
 implementation
 
 uses
-  jsonparser, Math, StrUtils;
+  jsonparser, Math, StrUtils, neuralminhash;
 
 const
   csMergeSep = #1;
@@ -1624,33 +1624,12 @@ begin
   else Result := -1;
 end;
 
-// FNV-1a over a stored 'left'#1'right' merge key.
-function HFMergeKeyHash(P: PAnsiChar; Len: integer): cardinal;
-var
-  Cnt: integer;
-begin
-  {$PUSH}{$Q-}{$R-}
-  Result := 2166136261;
-  for Cnt := 0 to Len - 1 do
-    Result := (Result xor cardinal(byte(P[Cnt]))) * 16777619;
-  {$POP}
-end;
-
-// The same FNV-1a over the two symbols with the separator between them: the
-// hash of the concatenated key, computed WITHOUT concatenating.
+// FNV1a32 of the stored key A + csMergeSep + B, computed without concatenating.
 function HFMergePairHash(PA: PAnsiChar; LenA: integer;
   PB: PAnsiChar; LenB: integer): cardinal;
-var
-  Cnt: integer;
 begin
-  {$PUSH}{$Q-}{$R-}
-  Result := 2166136261;
-  for Cnt := 0 to LenA - 1 do
-    Result := (Result xor cardinal(byte(PA[Cnt]))) * 16777619;
-  Result := (Result xor cardinal(byte(csMergeSep))) * 16777619;
-  for Cnt := 0 to LenB - 1 do
-    Result := (Result xor cardinal(byte(PB[Cnt]))) * 16777619;
-  {$POP}
+  Result := FNV1a32Continue(FNV1a32Step(FNV1a32(PA, LenA), byte(csMergeSep)),
+    PB, LenB);
 end;
 
 // Indexes the finished merge table for pair lookup. Runs once per load, from
@@ -1678,7 +1657,7 @@ begin
     FMergeEntry[Cnt].Key := PAnsiChar(Key);
     FMergeEntry[Cnt].KeyLen := Length(Key);
     FMergeEntry[Cnt].Rank := integer(PtrInt(FMerges.Objects[Cnt]));
-    Slot := integer(HFMergeKeyHash(PAnsiChar(Key), Length(Key))) and
+    Slot := integer(FNV1a32(PAnsiChar(Key), Length(Key))) and
       FMergeHashMask;
     while FMergeHash[Slot] <> 0 do Slot := (Slot + 1) and FMergeHashMask;
     FMergeHash[Slot] := Cnt + 1;
