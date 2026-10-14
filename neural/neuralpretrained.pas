@@ -5478,6 +5478,9 @@ procedure SelectKokoroVoiceStyle(const Pack: TKokoroVoicePack;
 // <SnapshotDir>/misaki: where the user puts misaki's English dictionaries.
 function KokoroEnglishDictionaryDir(const SnapshotDir: string): string;
 
+// <SnapshotDir>/voices/<VoiceName>.pt: a voice pack of the snapshot folder.
+function KokoroVoiceFileName(const SnapshotDir, VoiceName: string): string;
+
 // Per chunk: phonemes, symbols outside the vocab, and the words read by an
 // unknown-word route or left unknown (DescribeG2PUnknownWords).
 procedure DescribeKokoroTextReport(const Report: TKokoroTextReport;
@@ -51408,7 +51411,7 @@ begin
   if CheckpointCount <> 1 then
     ImportError('Kokoro: expected exactly one *.pth in ' + SnapshotDir +
       ', found ' + IntToStr(CheckpointCount) + ':' + Found);
-  VoiceFile := Dir + 'voices' + DirectorySeparator + VoiceName + '.pt';
+  VoiceFile := KokoroVoiceFileName(SnapshotDir, VoiceName);
   if not FileExists(VoiceFile) then
     ImportError('Kokoro: voice "' + VoiceName + '" not found (' + VoiceFile +
       ').');
@@ -53029,6 +53032,12 @@ end;
 function KokoroEnglishDictionaryDir(const SnapshotDir: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(SnapshotDir) + 'misaki';
+end;
+
+function KokoroVoiceFileName(const SnapshotDir, VoiceName: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(SnapshotDir) + 'voices' +
+    DirectorySeparator + VoiceName + '.pt';
 end;
 
 procedure DescribeKokoroTextReport(const Report: TKokoroTextReport;

@@ -23,7 +23,7 @@ uses
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralg2p,
-  neuralchatengine, neuralchat,
+  neuralchatengine, neuralchat, neuralkokorosession,
   neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
 type
@@ -802,6 +802,9 @@ type
     // The G2P follows the voice's accent: a* -> b* re-creates it, a* -> a*
     // keeps it; a non-English voice or a missing folder raises.
     procedure TestKokoroEnglishG2PAccentSwitch;
+    // TKokoroSession on a copy of the tiny fixture with the G2P subsets in
+    // <folder>/misaki: two text lines, a voice switch to b*, refused switches.
+    procedure TestKokoroSessionLinesAndVoiceSwitch;
     // The stage-C generator and the iSTFT on the real snapshot vs the real
     // dump; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
     procedure TestKokoroRealStageCGeneratorParity;
@@ -25796,6 +25799,148 @@ begin
   finally
     Kokoro.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroSessionLinesAndVoiceSwitch;
+var
+  SnapshotDir, FirstWav, SecondWav: string;
+  Options: TKokoroSessionOptions;
+  Session: TKokoroSession;
+  LineResult: TKokoroLineResult;
+  Audio: TNNetVolume;
+  Report: TKokoroTextReport;
+  Failed: boolean;
+
+  procedure CopyFixture(const Source, Target: string);
+  var
+    Stream: TMemoryStream;
+  begin
+    ForceDirectories(ExtractFileDir(SnapshotDir + Target));
+    Stream := TMemoryStream.Create;
+    try
+      Stream.LoadFromFile(FixturePath(Source));
+      Stream.SaveToFile(SnapshotDir + Target);
+    finally
+      Stream.Free;
+    end;
+  end;
+
+  function FileByteCount(const FileName: string): int64;
+  var
+    Stream: TFileStream;
+  begin
+    Stream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+    try
+      Result := Stream.Size;
+    finally
+      Stream.Free;
+    end;
+  end;
+
+  // Runs Step and returns true when it raised.
+  function Raises(const Step: string): boolean;
+  begin
+    Result := false;
+    try
+      if Step = 'missing voice' then Session.SelectVoice('xx_missing')
+      else if Step = 'path' then Session.SelectVoice('../af_heart')
+      else if Step = 'japanese' then Session.SelectVoice('jf_test')
+      else if Step = 'speed' then Session.Speed := 0;
+    except
+      on E: Exception do Result := true;
+    end;
+  end;
+
+begin
+  SnapshotDir := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'kokoro_session_test_' + IntToStr(Random(1000000)) + DirectorySeparator;
+  CopyFixture('tiny_kokoro82m/config.json', 'config.json');
+  CopyFixture('tiny_kokoro82m/kokoro-v1_0.pth', 'kokoro-v1_0.pth');
+  CopyFixture('tiny_kokoro82m/voices/af_heart.pt', 'voices/af_heart.pt');
+  CopyFixture('tiny_kokoro82m/voices/af_heart.pt', 'voices/bf_test.pt');
+  CopyFixture('tiny_kokoro82m/voices/af_heart.pt', 'voices/jf_test.pt');
+  CopyFixture('g2p_english/us_gold.json', 'misaki/us_gold.json');
+  CopyFixture('g2p_english/us_silver.json', 'misaki/us_silver.json');
+  CopyFixture('g2p_english/gb_gold.json', 'misaki/gb_gold.json');
+  CopyFixture('g2p_english/gb_silver.json', 'misaki/gb_silver.json');
+  FirstWav := SnapshotDir + 'line1.wav';
+  SecondWav := SnapshotDir + 'line2.wav';
+  Options := DefaultKokoroSessionOptions();
+  Options.ModelDir := SnapshotDir;
+  Session := TKokoroSession.Create(Options);
+  Audio := TNNetVolume.Create;
+  try
+    AssertEquals('default dictionary folder',
+      KokoroEnglishDictionaryDir(SnapshotDir), Session.DictionaryDir);
+    AssertFalse('no line yet', Session.HasLastLine);
+    Session.CheckTextInput();
+    // line 1: the same audio as TNNetKokoro.SynthesizeText
+    LineResult := Session.SpeakTextToWav('The quick brown fox.', FirstWav);
+    AssertTrue('first WAV', FileExists(FirstWav));
+    Session.Kokoro.SynthesizeText('The quick brown fox.', Session.Voice, 1.0,
+      Audio, Report);
+    AssertEquals('first line samples', Audio.Size, LineResult.SampleCount);
+    AssertEquals('first line chunks', Length(Report), Length(LineResult.Report));
+    AssertEquals('first line phonemes', Report[0].G2PChunk.Phonemes,
+      LineResult.Report[0].G2PChunk.Phonemes);
+    AssertEquals('phoneme count',
+      CodePointCount(Report[0].G2PChunk.Phonemes), LineResult.PhonemeCount);
+    AssertEquals('WAV size', 44 + 2 * Audio.Size, FileByteCount(FirstWav));
+    // voice switch: b* re-creates the G2P with the British accent
+    Session.SelectVoice('bf_test');
+    AssertEquals('voice switched', 'bf_test', Session.Voice.Name);
+    AssertTrue('British G2P', Session.Kokoro.EnglishG2P.Accent = g2pBritish);
+    Session.Speed := 1.5;
+    LineResult := Session.SpeakTextToWav('The sunflowerfield.', SecondWav);
+    AssertTrue('second WAV', FileExists(SecondWav));
+    AssertEquals('last line', SecondWav, Session.LastLine.FileName);
+    AssertTrue('second line has phonemes', LineResult.PhonemeCount > 0);
+    // refused switches keep the voice and the G2P
+    AssertTrue('missing voice raises', Raises('missing voice'));
+    AssertTrue('a path is not a voice name', Raises('path'));
+    AssertTrue('non-English voice raises', Raises('japanese'));
+    AssertEquals('voice kept', 'bf_test', Session.Voice.Name);
+    AssertTrue('G2P kept', Session.Kokoro.EnglishG2P.Accent = g2pBritish);
+    AssertTrue('speed 0 raises', Raises('speed'));
+    AssertEquals('speed kept', 1.5, Session.Speed, 1e-6);
+    // phonemes as given: one chunk, no G2P
+    LineResult := Session.SpeakPhonemesToWav('h' + #$CB#$88 + 'O.', FirstWav);
+    AssertEquals('phoneme line chunks', 1, Length(LineResult.Report));
+    AssertEquals('phoneme line count', 4, LineResult.PhonemeCount);
+    AssertTrue('phoneme line audio', LineResult.SampleCount > 0);
+  finally
+    Audio.Free;
+    Session.Free;
+    DeleteFile(FirstWav);
+    DeleteFile(SecondWav);
+  end;
+  // a dictionary folder without the files: CheckTextInput names them
+  Options.DictionaryDir := SnapshotDir + 'voices';
+  Session := TKokoroSession.Create(Options);
+  try
+    Failed := false;
+    try
+      Session.CheckTextInput();
+    except
+      on E: ENeuralG2PError do
+        Failed := Pos('us_gold.json', E.Message) > 0;
+    end;
+    AssertTrue('missing dictionaries named', Failed);
+  finally
+    Session.Free;
+  end;
+  DeleteFile(SnapshotDir + 'misaki/us_gold.json');
+  DeleteFile(SnapshotDir + 'misaki/us_silver.json');
+  DeleteFile(SnapshotDir + 'misaki/gb_gold.json');
+  DeleteFile(SnapshotDir + 'misaki/gb_silver.json');
+  DeleteFile(SnapshotDir + 'voices/af_heart.pt');
+  DeleteFile(SnapshotDir + 'voices/bf_test.pt');
+  DeleteFile(SnapshotDir + 'voices/jf_test.pt');
+  DeleteFile(SnapshotDir + 'config.json');
+  DeleteFile(SnapshotDir + 'kokoro-v1_0.pth');
+  RemoveDir(SnapshotDir + 'misaki');
+  RemoveDir(SnapshotDir + 'voices');
+  RemoveDir(SnapshotDir);
 end;
 
 procedure TTestNeuralPretrained.TestKokoroRealStageCGeneratorParity;
