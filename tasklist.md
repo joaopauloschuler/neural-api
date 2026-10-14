@@ -1399,12 +1399,1174 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [ ] Kokoro StyleTTS2 TTS real-checkpoint follow-up (`BuildKokoroFromSafeTensors[Ex]`
-      + `TNNetAdaIN` leaf + `TNNetKokoro` holder + examples/KokoroTTS LANDED, pico
-      parity TestKokoroSynthesisParity < 1e-4): real `hexgrad/Kokoro-82M` checkpoint +
-      voice-pack `.pt` style-tensor load (offline/RAM-gated here); also the
-      grapheme->phoneme (espeak/misaki) frontend dropped from v1 (v1 takes
-      pre-phonemized integer ids).
+- [ ] Kokoro-82M TTS, real checkpoint (`hexgrad/Kokoro-82M`, Apache-2.0, StyleTTS2 +
+      iSTFTNet). Plan agreed 2026-10-12. Target: load the HF snapshot folder
+      (`config.json`, `kokoro-v1_0.pth`, `voices/*.pt`) and write a 24 kHz WAV.
+      Reference: the `kokoro` 0.9.4 package in the `x` venv (`kokoro/model.py`,
+      `modules.py`, `istftnet.py`). One Opus agent per task, run serially, test +
+      commit after each.
+      Decisions:
+      - REPLACE the pico `TNNetKokoro` with the real architecture. Its AdaIN used
+        plain `gamma`; the checkpoint needs `(1+gamma)`. Removed in commit 403d17f2
+        (`TNNetKokoro`, its config/AdaIN records and builders,
+        `tools/make_pico_kokoro_fixture.py`, the `tiny_kokoro*` pico fixtures,
+        `TestKokoroSynthesisParity`, examples/KokoroTTS); the names are free for
+        the real model.
+      - Noise: zero noise by default (repeatable output, simple parity), random noise
+        as an option.
+      - Code structure: `TNNet` stages run by `TNNet.Compute`, so OpenCL comes with
+        the layers; as many `TNNet`s as needed, host steps between them (duration
+        rounding + frame repeat, sine source + forward STFT).
+      - G2P comes later (task 3.2). Until then the input is a phoneme string.
+      Checkpoint facts (from the cached snapshot and the package source):
+      - 81.7M parameters, 327 MB FP32; fits under the 3 GB ulimit, so real-checkpoint
+        runs are possible on the dev box.
+      - `kokoro-v1_0.pth`: torch zip, entries stored (no DEFLATE), root = dict of 5
+        state dicts `bert`, `bert_encoder`, `predictor`, `text_encoder`, `decoder`,
+        every key prefixed `module.`. Weight norm stored as legacy `weight_g`/`weight_v`.
+      - `voices/<name>.pt`: torch zip whose root is a BARE tensor [510,1,256]. Row =
+        phoneme count - 1. Columns 0..127 = decoder style, 128..255 = prosody style.
+        54 voices, 9 languages; only `af_heart` is downloaded here.
+      - PL-BERT = ALBERT: word embedding 178x128, `embedding_hidden_mapping_in`
+        128->768, ONE shared layer (`albert_layer_groups.0.albert_layers.0`) run 12
+        times, 12 heads, FFN 2048, max 512 positions. Then `bert_encoder` 768->512.
+      - AdaIN1d: InstanceNorm WITHOUT affine weights (none in the checkpoint), then
+        `(1+gamma)*x + beta` with gamma/beta from Linear(style 128 -> 2C).
+      - frame rate: decoder upsamples x2, generator x10 x6, iSTFT hop 5 = 600 samples
+        per predicted frame = 40 frames/s at 24 kHz.
+  Phase 0 — oracle and structure:
+  - [x] 0.1 `tools/` script: run the installed `KModel` on a fixed phoneme string
+        with `af_heart`; dump every stage (BERT out, durations, F0/N, decoder blocks,
+        harmonic source, waveform) as the real-checkpoint reference. Patch `SineGen`
+        noise to zero (or dump it) so Pascal can match.
+        Done: `tools/make_kokoro82m_fixture.py real` -> ~/.cache/neural-api/kokoro82m_ref/
+        `kokoro82m_ref.{safetensors,json,wav}` (not committed, 92 MB).
+  - [x] 0.2 Same script: tiny real-architecture fixture (the package's torch
+        classes, small dims, random weights) -> `tests/fixtures/`, replacing the
+        numpy pico fixture.
+        Done: `tools/make_kokoro82m_fixture.py tiny` -> `tests/fixtures/tiny_kokoro82m/`
+        (`config.json`, `kokoro-v1_0.pth`, `voices/af_heart.pt`) + `tiny_kokoro82m_ref.{safetensors,json}`.
+  - [x] 0.3 Per-utterance length: token count and frame count change every
+        sentence, and a `TNNet`'s length is fixed when it is built. Measure the cost
+        of rebuilding the stage nets from in-memory weights vs. padded buckets
+        (padding changes InstanceNorm statistics and the reverse LSTM, so buckets need
+        masking). Report before Phase 2.
+        Done: use a BORROWING REBUILD per utterance, the `TQwenImage21VaeDecoder`
+        pattern: one owner net per stage built once at a small length, then per
+        utterance `Net.BuildWeightOwner := Owner`, build at T/F, `BuildWeightOwner :=
+        nil` (layers link the owner's neurons, size no weights; OpenCL: arm the owner,
+        `EnableOpenCLInContextOf`, layers borrow its device weights). Measured on a
+        stage-C-like net (133 layers, 78.7M weights: 4 TDNN k3 blocks at 1024 ch,
+        Deconvolution stand-ins x2/x10/x6, 2 MRFs of TDNN k3/7/11 d1/3/5 at 256/128 ch),
+        CPU, F=100 frames, two runs (VM noise ~2-3x): owner build at F=8 119-690 ms,
+        355 MB; borrowing build 244-863 ms, 0 weight elements, +410 MB (activations
+        only, ~4.1 MB/frame; F=300 +1225 MB); rebuild + CopyWeights 350-1174 ms +
+        38-101 ms copy, +720 MB (a second 315 MB weight copy); forward 6.2-8.9 s.
+        Borrow output == copy output bit-exact. In the same run the borrowing build
+        (863 ms) is ~13% of one stage-C forward. Rejected: re-propagating sizes in place (`SetPrevLayer` is private,
+        many overrides call `InitDefault` and wipe weights, `TNNetSum`/concat size in
+        their constructor, OpenCL buffers are sized at `EnableOpenCL`); padded buckets
+        (needs a valid length on ~58 AdaIN InstanceNorms + ~65 conv inputs re-zeroed
+        in stage C, the reverse LSTM start, an ALBERT key mask, and pays the padding
+        in compute) to save ~13%. Traps: `TNNetInstanceNorm.Create(false)` is
+        a PER-ELEMENT affine sized by length (use the default `true`, gamma 1 beta 0);
+        build the owner long enough that `TNNetConvolutionAbstract.SetPrevLayer` does
+        not clamp a kernel (Deconvolution K20 p5 needs input >= 10). OpenCL arming
+        per rebuild not measured (no GPU here).
+  - [ ] 0.4 Layers for the `TNNet` route:
+        - [x] dilated / strided 1D conv (torch Conv1d geometry). Done: new
+          `TNNetConv1DLinear` (a `TNNetConvolutionLinear` with a Kx1 kernel,
+          X-only padding, dilation along X) instead of extending `TNNetTDNNConv1D`:
+          `TNNetConvolutionAbstract` gained `FPaddingY`/`FDilationX`, the CPU im2col
+          (FP32 and int8), `BackpropagateFastTiledCPU`, `cai_im2col` and the implicit
+          GEMM honour them, so the tiled/threaded CPU and both OpenCL forwards serve
+          every Kokoro geometry (commit 2ff0b5d4). Tests: `TestConv1DLinear{TorchParity,OpenCLParity,
+          SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
+          `tests/fixtures/conv1d_oracle.json` (`tools/conv1d_oracle.py`, torch).
+          CPU, 256 ch k7 d3 L=2000: old TDNN 304-335 ms, new 260-266 ms serial,
+          161-189 ms threaded (4 vCPU VM).
+        - [ ] `ShouldUseInterleavedDotProduct` picks `InterleavedDotProduct` for
+          every conv with a multiple of 32 neurons; on 1D convs it is slower than
+          `DotProductsTiled`: same conv at 250 ch (tiled) 199 ms serial / 89 ms
+          threaded vs 256 ch (interleaved) 260 / 161-189 ms. Kokoro's 128/256/512
+          channel convs all take the interleaved path. Measure on 2D convs too
+          before changing the heuristic.
+        - [ ] OpenCL weight borrowing (`BuildWeightOwner` + `EnableOpenCLInContextOf`)
+          is not tested for `TNNetConv1DLinear` (the CPU borrowing build is).
+        - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
+          `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
+          `FDilationX`; only `BackpropagateFastTiledCPU` is called.
+        - [x] transposed 1D conv (torch ConvTranspose1d). Done: new
+          `TNNetDeconv1DLinear(NumFeatures, K, Stride, Padding, OutputPadding,
+          Groups=1, SuppressBias=0)`, a `TNNetDeconvolutionLinear` with a Kx1
+          kernel, no Y padding / output padding, no kernel clamp, groups in
+          FStruct[6] (commit cf181f32). `TNNetDeconvolution` gained
+          `FOutputPaddingY`, `FGroups` (grouped CPU scatter forward + backward;
+          grouped layers stay off OpenCL) and a CPU GEMM forward for dense
+          inference-only layers (`FConcatedWeights` x input positions with
+          `DotProductsTiled`, chunked, then a host scatter shared with the OpenCL
+          path). The old "11x wasted work" was weight memory, not CPU time: the
+          scatter skipped out-of-range rows. CPU, ups1 512->256 k20 s10 p5, L=200:
+          old 2D stand-in (20x11) 397-459 ms, new 1D inference 90-109 ms, new 1D
+          trainable (scatter) 394-470 ms. Tests: `TestDeconv1DLinear{TorchParity,
+          OpenCLParity,SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
+          `tests/fixtures/conv_transpose1d_oracle.json`
+          (`tools/conv_transpose1d_oracle.py`, torch). Loader mapping: torch weight
+          [In, Out/G, K]; neuron Oc, group g = Oc div (Out/G), gets
+          `Weights[k, 0, c] := w[g*(In/G) + c, Oc mod (Out/G), k]` (no flip; dense:
+          `w[c, Oc, k]`), bias as is, then `FlushWeightCache`.
+        - [ ] The CPU GEMM needs `SetTrainable(False, {pLowMemory=}False)`: with the
+          default low memory (and when trainable) the deconv runs the per-neuron
+          scatter, ~4x slower at ups1. Decide for the Kokoro stage nets.
+        - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
+          neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
+          scratch.
+        - [ ] Depthwise pool runs one length-1 `DotProduct` per (position, tap,
+          channel); vectorize over channels if it shows in a stage-C profile.
+        - [ ] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
+          products and scatters on the host; no resident source/output, and no
+          borrowing (`EnableOpenCLInContextOf`) test for the deconv.
+        - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
+          deconv) for 32-multiple channel counts: one extra weight copy (dense
+          deconvs only now).
+        - [x] Grouped deconv under AVX: the base `SetPrevLayer` armed the
+          interleaved copy with the dense vector size (K*InDepth) over the
+          K*InDepth/G rows, so `InterleaveWithXFrom` divided by zero at >= 32
+          channels and >= 40 output positions (real stage B at 102 frames; the
+          8-frame owner never reached it). Fixed: `FNoInterleavedWeights` (set
+          for groups > 1) keeps `ShouldUseInterleavedDotProduct` false. Test
+          `TestDeconv1DLinearDepthwiseWide` (raised EDivByZero under -dAVX2
+          before the fix).
+        - [x] per-channel Snake. Done: `TNNetSnake.Create(Alpha, PerChannelAlpha=
+          true)` learns one alpha per channel in `Neurons[0].Weights` (Depth long,
+          FStruct[0] = 1; scalar files unchanged); inference forward is row-wise
+          `TNNetVolume` Mul/Sin/Mul/Mul/Add, trainable forward a scalar loop with
+          the derivative; backward has the alpha gradient (commit 9a6ec901). Loader: torch
+          `alpha1[j]` [1,C,1] -> `Weights.Raw[c]`, then `FlushWeightCache`.
+        - [x] AdaIN1d / AdaLayerNorm / channel LayerNorm, no new class. AdaIN1d =
+          `TNNetInstanceNorm` (default per-channel affine; reduces over time per
+          channel, torch InstanceNorm1d), AdaLayerNorm and TextEncoder `LayerNorm` =
+          `TNNetTokenLayerNorm(1e-5)` (commit 9a6ec901). Per utterance the HOST computes
+          [gamma; beta] = fc(s) and writes `Neurons[0].Weights[c] := (1+gamma)*w`,
+          `Neurons[1].Weights[c] := (1+gamma)*b + beta` (w/b = the norm's own affine,
+          1/0 when absent), then calls `FlushWeightCache` on the layer of the net
+          that runs (a borrowing net's layers share the owner's neurons; the
+          TokenLayerNorm re-uploads its OpenCL gamma/beta only on that flag,
+          the InstanceNorm and the per-channel Snake upload theirs every forward).
+          `TNNetGroupNorm`/`TNNetInstanceNorm` OpenCL: `cai_group_norm` is now one
+          work-group per group (local tree reduction, was one work-item per
+          group), binds a source in OpenCL memory and keeps its output there when
+          not trainable. Activations: `TNNetLeakyReLU.Create(0.2 / 0.1 / 0.01)`,
+          `TNNetHyperbolicTangent`, `TNNetSigmoid` (all OpenCL already); new
+          `cai_activation` opcodes MulConstant (`TNNetMulByConstant`, for the
+          rsqrt(2) and /3 scalings after `TNNetSum`), Snake and per-channel Snake
+          (a per-layer channel-parameter buffer on `TNNetIdentity`). Tests:
+          `TestKokoroStyleNormTorchParity`, `TestKokoroActivationTorchParity`
+          (tests/fixtures/kokoro_norm_activation_oracle.json from
+          `tools/kokoro_norm_activation_oracle.py`, the kokoro classes),
+          `TestKokoroLayersOpenCLParity` (chain stays in OpenCL memory, then a
+          host style rewrite), `TestSnakePerChannelSaveLoadRoundTrip`,
+          `TestKokoroLayersBorrowingBuild`, `TestSnakePerChannelGradientCheck`;
+          `TestActivationOpenCLParity` gained the 3 opcodes.
+        - [x] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
+          `TNNetSin` exist on CPU only (no opcode); 22 x frames, so either
+          `TNNetSplitChannels` + those layers or a host step before the iSTFT.
+          Done: host step (the net ends at conv_post; 22 x (120F+1) floats,
+          one download, and the iSTFT is on the host anyway).
+        - [x] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
+          lives only in the test (`WriteStyleIntoChannelAffine`); move it into the
+          Kokoro loader (2.5) rather than writing a second copy.
+          Done: `WriteStyleIntoChannelAffine(NormLayer, FcWeight, FcBias, Style,
+          NormWeight, NormBias)` in neuralpretrained (TNNetVolume arguments); the
+          test helper converts the oracle JSON and calls it (commit 3f1f670e).
+        - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
+          `pcr_sinf` loop; the per-channel path is vectorized.
+        - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
+          activation chain are unmeasured on a GPU (PoCL parity only).
+  - [ ] 0.5 Stage-net holder for Kokoro: owner nets for stages A/B/C built once
+        from the checkpoint, `PrepareNet(T)` / `PrepareNet(F)` borrowing rebuild that
+        exits early when the length is unchanged, OpenCL arming as in
+        `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
+        code path; do not clone it.
+        Stage A done (commit 3f1f670e): `TNNetKokoro.Create(Reader, Config)` builds
+        the stage-A owner once at 8 tokens and loads it (a stage-A tensor left
+        unread raises); `PrepareStageA(T)` = `BuildWeightOwner := owner`, build,
+        `nil`, `PrepareInferenceThreads`, `ShareHostOutputsByLiveness`, OpenCL
+        arming; `RunStageA(Ids, ProsodyStyle, Speed, d, t_en, PredDur)`. The VAE
+        decoder's context-net creation and owner arming became
+        `CreateOpenCLContextNet` / `ArmWeightOwnerInOpenCLContext`, used by both.
+        Inference: `SetTrainable(False)` with low memory: the shared ALBERT
+        repeats keep no per-layer weight cache. Measured (real, 32 tokens, CPU,
+        AVX2 release, VM noise): fast memory gave no gain and +1.2 s per rebuild;
+        switching the sized net to fast memory after the build without
+        `FlushWeightCache` raised EInvalidOp (empty caches). Real stage A: owner
+        load 1.2-2.2 s, PrepareStageA 0.09-0.22 s, forward 0.32-0.44 s parallel /
+        0.56-0.88 s serial (other runs on a busy VM: 1.3-3.9 s).
+        - [x] Stage C: add it beside stages A and B (`FStage*Owner`,
+          `FStage*Net`, one shared `FOpenCLContextNet`, `ArmStageNet`).
+          Decoder part done: `TNNetKokoro.LoadStageCDecoder` builds the owner
+          once at 8 frames (`KokoroStageCDecoderOwnerFrameCount`) and loads
+          every `decoder.*` tensor except `decoder.generator.*` (one left unread
+          raises); `PrepareStageCDecoder(F)` / `ReleaseStageCDecoder` /
+          `RunStageCDecoder(t_en, PredDur, F0Curve, NCurve, DecoderStyle, x)`,
+          same borrowing rebuild, `ArmStageNet` and inference settings as
+          stages A and B. Real decoder, 102 frames (`fpc -O2` test build, no
+          AVX2, threaded, CPU): owner 31,155,936 weights (124.6 MB); 3.1-4.5 s
+          build + forward (2 runs); activations 171.5 MB with host-output
+          sharing off, 163.5 MB on (20 of 58 layers shared); the test process
+          (all three owners + the decoder net) peaks at 802 MB RSS.
+        - [x] Stage C generator: recommended as a FOLLOWING net
+          (`StageCGenerator`), not appended to the decoder net. Inputs: x
+          (2F,1,512) at index 0, the host harmonic spectrum (120F+1,1,22) at
+          index 1. The host writes `Layers[1].Output`, then
+          `ComputeFromLayerOutput(StageCDecoderNet.GetLastLayer())` hands x
+          over (an OpenCL buffer copy when x is resident; `RunStageCDecoder`
+          would then skip its host copy). Why: generator parity can start from
+          the dump's dec_decode3 alone; one net would share no host storage
+          across the two (exact-size liveness slots, no common shapes); the
+          hand-over costs one 0.4 MB copy.
+          Done as recommended: `LoadStageCGenerator` builds the owner once at
+          2 frames (`KokoroStageCGeneratorOwnerFrameCount`; no generator kernel
+          clamps at any length); `PrepareStageCGenerator(F)` /
+          `ReleaseStageCGenerator` / `RunStageCGenerator(x, spectrum, style,
+          Audio)`, same borrowing rebuild and `ArmStageNet`. `Synthesize`
+          hands x over with `ComputeFromLayerOutput(StageCDecoderNet last
+          layer)`; `RunStageCDecoder` still downloads and copies x (0.4 MB)
+          because it returns it. Inference: low memory, except the two ups
+          deconvs in fast memory (`SetTrainable(False, False)` +
+          `FlushWeightCache` after the borrowing build) so they run the CPU
+          GEMM: standalone real shapes, CPU, best of 4: ups0 512->256 k20 s10
+          L=204 407 -> 285 ms (borrowed weights 398 -> 284 ms), ups1 256->128
+          k12 s6 L=2040 471 -> 378 ms; +12 MB weight cache. Not measured
+          inside the real generator (no real-size runs on the dev VM).
+          `TNNetKokoro.Create` now checks EVERY checkpoint tensor is consumed
+          (one shared Consumed list, `RaiseOnUnreadKokoroTensors` over
+          bert/bert_encoder/predictor/text_encoder/decoder; real file passes).
+          - [ ] Real-size generator memory / time not measured here: the
+            generator parity and end-to-end tests on the real checkpoint (and
+            the real stage-C decoder ones) are opt-in,
+            `NEURAL_KOKORO82M_REAL_HEAVY=1`; an earlier real generator run hit
+            the VM's OOM killer (2.7 GB RSS + swap) with host-output sharing off.
+          - [ ] OpenCL: `TNNetPadXY` (the reflection pad) has no kernel, so it
+            downloads ups1's output and its consumer re-uploads (6 MB at 102
+            frames); the ups deconvs scatter on the host (see 0.4). Not
+            measured on a GPU (PoCL parity only).
+        Stage B done: `TNNetKokoro.LoadStageB` builds the stage-B owner once at 8
+        frames (`KokoroStageBOwnerFrameCount`) and loads it (a stage-B tensor left
+        unread raises, via `RaiseOnUnreadKokoroTensors`, now shared with stage A);
+        `PrepareStageB(F)` = the stage-A borrowing rebuild with early exit; the
+        post-build steps (threads, host-output sharing, OpenCL owner arming once,
+        `EnableOpenCLInContextOf`) are `ArmStageNet`, used by both stages.
+        `RunStageB(d, PredDur, ProsodyStyle, F0Curve, NCurve)`: host frame
+        expansion (`RepeatTokenRows`), 12 AdaIN1d style folds
+        (`WriteStyleIntoChannelAffine`), `TNNet.Compute`, then the (2F,1,2)
+        output split into F0_pred / N_pred (2F,1,1). Inference settings as stage A
+        (`SetTrainable(False)`, low memory): the depthwise pool is grouped, and
+        grouped `TNNetDeconvolution` runs the CPU scatter in either memory mode
+        (the GEMM path is dense-only), so fast memory buys nothing here. The
+        borrowing net sizes no weights (`WeightElementsSized` = 0). Real stage B,
+        102 frames, CPU (`fpc -O2` test build, no AVX2, threaded, one run):
+        236 ms build + forward.
+        - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
+          is known), so a borrowing build allocates and frees each table: 3
+          tables, 114,176 floats on the real checkpoint. Other layers size none.
+        - [ ] The owner build sizes each ALBERT repeat's rows before
+          `LinkWeightsFrom` frees them (transient, one block at a time).
+        - [ ] CPU profile of the real stage A: `TNNetLSTMCell` ~51% of layer time
+          (the CPU input projection is per-step dot products, no GEMM; the OpenCL
+          path batches it only at Depth >= 32), `TNNetPointwiseConvLinear` ~44%.
+        - [ ] Real-checkpoint stage A on a GPU: not run (PoCL parity on the tiny
+          fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
+          unless forced, because the LSTM output is on RAM.
+  - [x] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
+        build allocates and `InitDefault`s them, then `LinkNeuronsFrom` frees them.
+        Correct but wasted; honour `DeferWeightSizingToBuildLink` there (~5 lines).
+        Done: `TNNetLSTMCell` and `TNNetGRUCell` (same issue) skip sizing under
+        `DeferWeightSizingToBuildLink` (the `TNNetGatedDeltaNet` pattern) and now
+        count `WeightElementsSized`. Test `TestBidirectionalRecurrentBorrowingBuild`
+        (LSTM and GRU stacks, owner at 6, borrower at 11). Commit 74287878.
+  - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
+        (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
+        (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
+        Same on the real stage-C decoder: 20 of 58 layers shared, 171.5 -> 163.5 MB.
+  Phase 1 — loading:
+  - [x] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
+        pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
+        Done: the unpickler accepts BUILD only as a dict's attribute dict (the
+        state dicts' `_metadata`, dropped); the five nested state dicts flatten
+        to `<component>.module.<name>` and `OpenKokoroCheckpoint` renames them to
+        `<component>.<name>` (`RenameTensorPrefix`, no reader copy). Real file:
+        548 tensors, 81,763,410 parameters, all F32; every tensor read once
+        (1.45 s, 19.5 MB RSS); counts and sum/sum-abs match torch. The extra zip
+        entries of the tiny fixture (`.format_version`, `.storage_alignment`)
+        needed no change.
+  - [x] 1.2 `TNNetTorchBinReader`: accept a bare-tensor root (rejected today at
+        neuraltorchbin.pas:1018); voice-pack row selection.
+        Done: a bare-tensor root is exposed as the one tensor
+        `TorchBinBareTensorName` ('tensor'). `LoadKokoroVoicePack` (checks
+        [rows, 1, 2*style_dim]) + `SelectKokoroVoiceStyle(Pack, PhonemeCount,
+        DecoderStyle, ProsodyStyle)`: row PhonemeCount-1 (kokoro's
+        `pack[len(ps)-1]`, code points of the phoneme string incl. symbols the
+        vocab skips); raises outside 1..rows.
+  - [x] 1.3 Config reader: `plbert`, `istftnet`, `vocab` (keys are multibyte IPA
+        characters: look up per UTF-8 code point).
+        Done: `TKokoroConfig` / `ReadKokoroConfigFromJSONFile` (escapes decoded,
+        raw-UTF-8 parse; each vocab key must be one code point; embedding_size
+        defaults to 128). The istftnet arrays go into a `THiFiGANConfig` through
+        the new `ReadHiFiGANGeneratorFields`, now shared by the HiFi-GAN and VITS
+        config readers. `KokoroPhonemesToIds` (binary search per code point,
+        skipped symbols returned, raises past max_position_embeddings).
+        `ReadKokoroWidthsFromWeights` sets DecoderWidth / DecoderBlockInputWidth /
+        DecoderOutputWidth / AsrResWidth / DecoderBlockCount (real 1024 / 1090 /
+        512 / 64 / 4) and checks word-embedding and conv_post shapes against the
+        config. The fpjson 255-byte key limit does not apply (keys are 1-3 bytes).
+  - [x] 1.4 Load from the snapshot folder: one call takes the folder plus a voice
+        name (`af_heart`) and finds the three files. The example takes the folder as
+        a command-line argument (the HF cache path contains a commit hash).
+        Done: `OpenKokoroSnapshot(Dir, VoiceName, out Config, out Voice)` returns
+        the reader; errors name the missing folder / config.json / voice, and
+        list the *.pth files when there is not exactly one.
+        Tests: `TestKokoroCheckpointTensors`, `TestKokoroVoicePackRowSelection`,
+        `TestKokoroConfigFromJSONFile`, `TestKokoroPhonemesToIds`,
+        `TestKokoroSnapshotLoad`, `TestKokoroRealSnapshotSmoke` (Ignored when no
+        snapshot is in the HF cache; `NEURAL_KOKORO82M_DIR` overrides).
+        Commit d6db9f49.
+  Phase 2 — components, in graph order:
+  - [x] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
+        and one shared layer (do not clone it); then `bert_encoder` 768->512.
+        Done (a77647bb, 3f1f670e): the BERT builder's encoder and loader became
+        `AddBertEncoder` / `LoadBertEncoderWeights`; family `bfAlbert` adds
+        `EmbeddingSize` tables, `embedding_hidden_mapping_in`, and repeats 1.. that
+        `LinkWeightsFrom` block 0 (one weight copy; the borrowing build links the
+        owner's root via `LinkBuildWeightOwner`). AlbertConfig defaults: gelu_new
+        (`TNNetGELU`), eps 1e-12, 2 token types. Tiny max |diff| <= 1.1e-6; real
+        bert_layer0..11 <= 2.0e-5 abs (max |ref| ~11.4), d_en 3.3e-5.
+        - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
+          `albert-*` checkpoints) is untested; no config reader for model_type
+          "albert"; pooler / classifier / int8 refused.
+  - [x] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
+        LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
+        Done (3f1f670e): `TNNetEmbedding`, `TNNetConv1DLinear` k5 p2 loaded by
+        `LoadTorchConv1DLinear` (weight_norm fold `LoadTorchConv1DWeight`, now
+        shared with `LoadHiFiGANConv`), `TNNetTokenLayerNorm(1e-5)`,
+        `TNNetLeakyReLU(0.2)`, bi-LSTM. The bi-LSTMs need input != hidden: new
+        `TNNetLSTMCell.Create(Hidden)` + `AddBidirectionalLSTM(...,
+        CellsReadInputWidth)` (b5381f69); `LoadTorchLSTMInto(..., StackInput)`
+        loads one stack of several. Real: text_cnn <= 8.6e-6, t_en 1.9e-6.
+        - [ ] `TNNetGRUCell` has no input-width option.
+  - [x] 2.3 `AdaLayerNorm` (LayerNorm, `(1+gamma)`, beta from Linear(style)) and the
+        `DurationEncoder` loop (3x bi-LSTM + AdaLayerNorm, style concatenated each
+        round).
+        Done (3f1f670e): the style is input channels 2.. of stage A (host-filled,
+        the same row on every token); one `TNNetSplitChannels` feeds every
+        `[norm; style]` `TNNetDeepConcat`. No weights (nothing to borrow), one
+        upload with the ids, OpenCL-resident after. `RunStageA` writes each
+        AdaLayerNorm's gamma/beta with `WriteStyleIntoChannelAffine` before the
+        forward. Real: dur_enc_adanorm0..2 <= 8.4e-5 abs (rel. 1.7e-5), d 1.9e-5.
+  - [x] 2.4 Duration head: bi-LSTM, Linear 512->50, sigmoid, sum, /speed, round,
+        clamp >= 1; frame expansion by repeat (no alignment matmul).
+        Done (3f1f670e) up to the durations: bi-LSTM, `TNNetPointwiseConvLinear`,
+        `TNNetSigmoid` in the net; sum / speed / `Round` (half to even, as
+        torch.round) / clamp on the host. pred_dur exact on tiny and real.
+        Tests: `TestKokoroStageATinyParity`, `TestKokoroStageABorrowingRebuild`,
+        `TestKokoroStageAOpenCLParity`, `TestKokoroRealStageAParity`.
+        - [x] Frame expansion by repeat (d and t_en, per pred_dur): the host step
+          before stage B. Done: `RepeatTokenRows(Source, Durations, Dest)` (one
+          `Move` per frame); stage C reuses it for t_en -> asr.
+  - [x] 2.5 AdaIN1d as above.
+        Done: `TNNetInstanceNorm` + the host fold `WriteStyleIntoChannelAffine`;
+        the fc of each AdaIN1d is loaded by `LoadKokoroStyleFc` (shape-checked,
+        shared with stage A's AdaLayerNorms). The checkpoint has no InstanceNorm
+        affine (torch builds `affine=True` and leaves it at 1/0).
+        Bug fixed on the way: `NeuralPerChannelMeanInvStd` (the CPU
+        instance-norm path of `TNNetGroupNorm` and `TNNetAdaIN`) computed the
+        variance as E[x^2] - mean^2, contrary to its declared contract; on a
+        near-constant channel (tiny F0_block0 norm1: variance 2e-5, eps 1e-5)
+        that cancelled to a 2.4e-4 norm1 error. Now centered (sum then
+        sum((x-mean)^2)); norm1 error 1.9e-6. Costs one extra pass (a `Move` +
+        2 `MulAdd` per position); not timed. The OpenCL kernel was already
+        centered.
+  - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
+        1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
+        ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
+        `THiFiGANConv` (or the `TNNet` equivalent).
+        Done: `AddKokoroAdainResBlock(NN, InputLayer, DimOut, Upsample)` returns
+        `TKokoroAdainResBlockLayers` (Norm1/Norm2/Pool/Conv1/Conv2/Shortcut/
+        Output) for stage C's encode/decode blocks too: InstanceNorm, LeakyReLU
+        0.2, pool = `TNNetDeconv1DLinear(C, 3, 2, 1, 1, groups=C)`, conv1/conv2 =
+        `TNNetConv1DLinear` k3 p1; shortcut = `TNNetDeMaxPool(2, 0, pPoolSizeY=1)`
+        (new Y factor: an X-only nearest x2 on (L,1,C); `FStruct[3]`, 0 = old
+        behaviour; OpenCL gather when Y factor = X factor or SizeY = 1) then
+        `TNNetPointwiseConvLinear(DimOut, SuppressBias=1)`; `TNNetSum` +
+        `TNNetMulByConstant(1/sqrt 2)`. `LoadKokoroAdainResBlockWeights` loads
+        the convs; new `LoadTorchConvTranspose1DLinear` (grouped torch layout,
+        weight_norm folded) and `LoadTorchConv1DLinear` accept a conv without
+        bias (shared `LoadTorchConvBias`). Test `TestDeMaxPoolAlongXOnly`.
+        - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
+          pool downloads its source and re-uploads its output (2 pools in stage
+          B, 9 of 63 layers off OpenCL in a forced run; stage C has more).
+        - [ ] A Y factor other than the X factor on SizeY > 1 runs
+          `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
+  - [x] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
+        the Decoder (`F0_conv`/`N_conv` k3 s2, `encode`, `asr_res`, 4 `decode` blocks
+        with the concat).
+        F0Ntrain done: `BuildKokoroStageBNet(NN, Config, F)`: input en (F,1,
+        hidden+style = 640 real), shared bi-LSTM (cells read the input width),
+        then the F0 and N branches fork from it in one net (3 blocks each:
+        d_hid->d_hid, d_hid->d_hid/2 x2, d_hid/2->d_hid/2), `F0_proj`/`N_proj` as
+        `TNNetPointwiseConvLinear(1)`, `TNNetDeepConcat` -> (2F,1,2). Tests:
+        `TestKokoroStageBTinyParity` (abs: en 0, f0n_shared 6.0e-8, F0_block0..2
+        4.5e-6/1.3e-5/1.8e-5, N_block0..2 5.2e-6/3.4e-6/8.8e-6; F0_pred / N_pred
+        checked relative because F0 is in Hz: 5.2e-4 of 140.7 = 3.7e-6, 6.3e-6 of
+        2.1), `TestKokoroStageBBorrowingRebuild` (F = 10 and 6, vs a fresh build),
+        `TestKokoroStageBOpenCLParity` (PoCL, incl. a style rewrite),
+        `TestKokoroRealStageBParity` (real dump, 102 frames, max rel. diff
+        1.6e-6: f0n_shared 1.2e-6 abs, F0_block1 5.3e-5 of 35.9, F0_pred 1.5e-4 of
+        312.6 Hz, N_pred 5.7e-6 of 9.6). Stage-B parity feeds the dump's d and
+        pred_dur, so it does not include stage A's error (d: 7.4e-6 rel.).
+        - [x] Decoder half (stage C).
+          Done: `BuildKokoroStageCDecoderNet(NN, Config, F)`: three
+          `TNNetInput`s, the first layers of the net, fed by
+          `TNNet.Compute([asr, F0, N])` (the RAFT / F5-TTS multi-input idiom;
+          inputs of different lengths need no packing): asr (F,1,hidden),
+          F0 and N (2F,1,1). F0_conv / N_conv = `TNNetConv1DLinear(1, 3, 1, 2)`
+          on the curves, `TNNetDeepConcat([asr, F0, N])`, encode =
+          `AddKokoroAdainResBlock(.., 1024)`, asr_res =
+          `TNNetPointwiseConvLinear(64)` on asr, then per decode block
+          `TNNetDeepConcat([x, asr_res, F0, N])` (torch order) and
+          `AddKokoroAdainResBlock`; only the last block upsamples (to 2F, 512
+          out), so the package's `res` flag never stops the concat. The host
+          expands t_en to asr with `RepeatTokenRows`; the decoder style is the
+          FIRST half of ref_s. The norm1/norm2 fc loader is now
+          `LoadKokoroAdainResBlockStyleFcs`, shared with stage B. Tests:
+          `TestKokoroStageCDecoderTinyParity` (abs: asr 0, dec_N_conv 2.4e-7,
+          dec_encode 3.8e-6 of 49.7, dec_asr_res 1.5e-8, dec_decode0..3
+          1.5e-5/1.1e-5/7.6e-6/1.5e-5 of up to 106; dec_F0_conv relative
+          9.2e-8), `TestKokoroStageCDecoderBorrowingRebuild` (F = 10 and 6 vs a
+          fresh build), `TestKokoroStageCDecoderOpenCLParity` (PoCL, incl. a
+          style rewrite: 57 of 58 layers on OpenCL, the grouped pool stays on
+          the CPU; max |diff| x 7.6e-6 of 49.6), `TestKokoroRealStageCDecoderParity` (real dump, 102
+          frames, max rel. diff 2.6e-6: dec_F0_conv 1.5e-7, dec_N_conv 6.6e-8,
+          dec_encode 1.3e-6, dec_asr_res 8.1e-7, dec_decode0..3 6.9e-7/7.5e-7/
+          8.4e-7/2.6e-6; host-output sharing on == off).
+        - [x] Real stage A + B chained (our d into stage B) not compared to the dump.
+          Done: `TestKokoroRealStagesChainedToDecoder` runs A -> B -> decoder on
+          the real sentence from input_ids and ref_s only: pred_dur exact,
+          F0_pred 4.8e-4 Hz (rel. 1.5e-6), dec_decode3 1.5e-4 abs of 35.3 (rel. 4.2e-6);
+          3.3 s for the three stages, 999 MB peak RSS. Tolerance 1e-3 relative.
+        - [ ] CPU profile of the real decoder (3.1-4.5 s at 102 frames is slow
+          for ~31M weights x 102-204 frames); not run. Real decoder on a GPU:
+          not run.
+        - [ ] Stage B on a GPU and a CPU profile: not run.
+  - [x] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
+        down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
+        9->1 + tanh.
+        Done: `TNNetHarmonicSource` in neuralaudio.pas (a general hn-NSF piece,
+        not Kokoro-specific): `Create(SampleRate, UpsampleScale, HarmonicCount,
+        SineAmp, NoiseStd, VoicedThreshold)`, `SetMergeWeights`, `Compute(F0,
+        HarmonicSource)`, `ComputeUpsampledF0AndVoicing`. Zero noise by default;
+        `RandomNoise` + `NoiseSeed` (FPC RNG, global RandSeed restored, the seed
+        advances per call) add rand_ini and the Gaussian noise. Torch semantics
+        verified bit-exact in Python against the real dump (scratch scripts):
+        nearest index = floor(float(i) * float(1/300)); interpolate with
+        scale_factor uses the coordinate scale float(1/scale_factor)
+        (recompute_scale_factor unset) and output length floor(L * scale_factor)
+        in double; the source coordinate is FMA-contracted,
+        fma(scale, i + 0.5, -0.5) in float, clamped at 0; the blend is
+        fma(x0, w0, x1 * w1); cumsum accumulates in double; phase =
+        ((float(cumsum) * 2) * float(pi)) * 300. The down-sample reads samples
+        300j+149/150 with weight 0.5, so rand_ini (added to sample 0 only) never
+        reaches the phase: the random initial phase is a no-op in Kokoro.
+        Tests: `TestHarmonicSourceTorchParity` (kokoro SourceModuleHnNSF, U=6,
+        negative / unvoiced / high F0; f0 up and uv exact, har_source < 1e-6),
+        `TestHarmonicSourceRandomNoise`; fixture
+        tests/fixtures/stft_harmonic_source_oracle.json
+        (`tools/stft_harmonic_source_oracle.py`).
+  - [x] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
+        in neuralaudio.pas; only power-spectrum and private FFT routines exist.
+        Done: `TNNetForwardSTFT(NFFT, Hop)`: torch.stft defaults and sign,
+        `Transform(Wave, Re, Im)`, `TransformToMagnitudePhase(Wave, Dest)`
+        (Dest = [|X|; atan2] along Depth, torch.cat order). Direct DFT with
+        `TNNetVolume.DotProduct` against window-premultiplied cos / -sin tables
+        built in Create (the radix-2 FFT does not take 20; `RealFramePowerSpectrum`
+        returns power only); interior frames read the wave in place, edge frames
+        a reflect-padded scratch; DC / Nyquist Im forced to +0 (torch gives
+        phase 0 or +pi there). Tests: `TestForwardSTFTTorchParity` (n_fft
+        20/16/15), `TestForwardSTFTCosinePeakBins`.
+        Kokoro wiring: `TNNetKokoro.ComputeHarmonicSpectrum(F0Curve, Spectrum)`
+        -> (120F+1, 1, 22), the generator's second input; `LoadHarmonicSource`
+        reads `decoder.generator.m_source.l_linear` (upsample scale =
+        prod(upsample_rates) * hop = 300). Tests:
+        `TestKokoroHarmonicSpectrumTinyParity`, `TestKokoroRealHarmonicSpectrumParity`.
+        Real sentence (204 F0 frames -> 61200 samples -> 12241 STFT frames):
+        gen_f0_upsampled and gen_uv exact; gen_har_source 3.0e-8 abs (rel.
+        2.1e-7, phases up to ~3.8e4 rad); gen_har_spec 2.4e-7 (rel. 1.9e-7);
+        complex spectrum 2.4e-7; phase (only where |X| > 1e-4 max |X|, wrapped)
+        4.0e-4 rad. Tiny: har_source 1.5e-8, spec 2.4e-7, phase 3.9e-4 rad.
+        Host step 41 ms on the real sentence (`fpc -O2` test build, no AVX2).
+        - [x] ARBITRARY PHASE BINS (kept, user decision 2026-10-14): zero noise makes har_source the constant
+          tanh(bias) on unvoiced spans, so bins 2..10 of those frames are
+          rounding noise. Real sentence: 44,238 of 134,651 bins at |X| <=
+          1e-7 max (52,990 at <= 1e-4). Torch (MKL FFT) is deterministic there
+          (same pattern on every constant frame, e.g. bin 2 phase 2.03) but the
+          values are MKL rounding artefacts, so no Pascal FFT can reproduce
+          them. They feed the generator's noise_convs: replacing torch's
+          phases with a float64 STFT's (a stand-in for any other FFT) moved
+          the torch audio by 0.087 max abs (peak 0.32), RMS 0.0037 vs signal
+          RMS 0.047. So: generator parity (2.11) must feed the dump's
+          gen_har_spec / gen_har_phase; end-to-end audio parity will not get
+          below ~0.1 abs; decide whether to zero or keep those phases.
+        - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
+          want `RealFramePowerSpectrum`'s two-factor path with complex output.
+        - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
+          rad need its exact range reduction; the vector `Sin` was not checked
+          at that range) on one thread; 41 ms total is small next to the nets.
+  - [x] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
+        (`TNNetDAC.RunSnake`); extend `THiFiGANResBlock` rather than clone it.
+        Done as `TNNet` layers instead (the host-run `THiFiGANResBlock` does not
+        fit the TNNet-stage decision): `AddKokoroAdaINResBlock1(NN, Input, K,
+        Dilations)` -> `TKokoroAdaINResBlock1Layers`; per dilation d:
+        `TNNetInstanceNorm`, per-channel `TNNetSnake`, `TNNetConv1DLinear(C, K,
+        d*(K-1)/2, 1, d)`, again with d = 1, `TNNetSum` with the residual.
+        `LoadKokoroAdaINResBlock1Weights` loads convs1/convs2 (weight_norm
+        folded), alpha1/alpha2 (`LoadKokoroSnakeAlpha`) and the adain fc
+        (`LoadKokoroStyleFc`). Used for noise_res and the MRF resblocks.
+  - [x] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
+        ups, reflection pad (1,0) on the last stage, MRF average of 3 resblocks,
+        `conv_post` 128->22, exp (magnitude) / sin (phase), iSTFT via
+        `ISTFTOverlapAdd` with the centre trim and the phase-sign flip.
+        Done: `BuildKokoroStageCGeneratorNet(NN, Config, F)`: inputs x
+        (2F,1,512) and the harmonic spectrum (120F+1,1,22); per stage
+        `TNNetLeakyReLU(0.1)`, noise conv (`TNNetConv1DLinear(c, 2*s, (s+1)
+        div 2, s)`, s = prod(rates[i+1:]); last stage
+        `TNNetPointwiseConvLinear`), noise_res (k7 / last k11, d 1,3,5), ups
+        `TNNetDeconv1DLinear(c, k, u, (k-u) div 2)`, on the last stage
+        `TNNetPadXY(1, 0, pmReflect, 0)`, `TNNetSum`, 3 resblocks, `TNNetSum` +
+        `TNNetMulByConstant(1/3)`; then `TNNetLeakyReLU(0.01)` and conv_post.
+        Lengths (real): x 2F -> ups0 20F (= noise conv0 (120F+1+6-12) div 6 +
+        1) -> ups1 120F -> pad 120F+1 (= the 1x1 noise conv); the builder
+        raises on a mismatch. `TNNetPadXY` gained `TrailingPaddingX`
+        (FStruct[3] = it + 1, 0 = symmetric as before; test
+        `TestPadXYTrailingPaddingX`). Host: exp / sin per element, then new
+        `ISTFTCenteredMagnitudePhase` (neuralaudio: torch.istft center=True:
+        `ISTFTOverlapAddReIm` with Im negated, NFFT div 2 trimmed at both ends,
+        600F samples). Top level: `Synthesize(ids, decoder style, prosody
+        style, speed, Audio)`, `SynthesizePhonemes(phonemes, voice, ...)`,
+        `SynthesizePhonemesToWav` (`SaveVolumeToWav16`, 24 kHz). Tests (tiny,
+        relative to max |ref|): gen_stage0 leaky 0, noise_conv 3.7e-7,
+        noise_res 8.4e-7, ups 1.8e-7, sum 5.7e-7, resblock0..2 8.7e-7/7.2e-7/
+        6.2e-7, mrf 5.9e-7; gen_stage1 noise_conv 1.4e-7, noise_res 6.2e-6,
+        ups / pad 5.4e-7, sum 5.6e-6, resblock0..2 4.4e-6/4.3e-6/3.8e-6, mrf
+        4.3e-6; post_leaky 3.8e-6; gen_spec 9.4e-6; gen_phase 7.0e-5 abs;
+        audio 0.81 of 47963 (1.7e-5) (`TestKokoroStageCGeneratorTinyParity`);
+        `TestKokoroISTFTTinyParity` (dump gen_spec/gen_phase -> audio, 1.2e-7);
+        `TestKokoroStageCGeneratorBorrowingRebuild` (F = 10 and 6 vs a fresh
+        build); `TestKokoroStageCGeneratorOpenCLParity` (PoCL: 120 of 185
+        layers on OpenCL as armed, 162 forced; conv_post <= 2.0e-5 abs of ~7,
+        audio <= 3.8e-5 of ~8);
+        `TestKokoroTinySynthesizePhonemes` (equals the stages one by one;
+        dec_decode3 7.4e-6, F0_pred 9.0e-6 rel.).
+        - [ ] Tiny end to end vs the dump audio: 43763 of 47963 max abs. The
+          generator on the dump's x with OUR harmonic spectrum gives the same
+          43763, so it is the arbitrary phase bins of 2.9 (random tiny weights
+          and exp() amplify them). Real-checkpoint end-to-end diff not
+          measured here (opt-in test `TestKokoroRealEndToEnd`, writes
+          pascal.wav beside the dump).
+        - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
+          their scratch per call (once per utterance).
+  Phase 3 — text input:
+  - [x] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
+        split long input into chunks.
+        Done: ids by `KokoroPhonemesToIds` (1.3; raises past
+        max_position_embeddings, as KModel's assert); chunking of text by 5.6.
+        A raw phoneme string (`--phonemes`) is not chunked, as in KPipeline
+        (`generate_from_tokens` raises on a phoneme string over 510).
+  - [ ] 3.2 G2P (text -> phonemes). misaki English = gold/silver dictionaries
+        (~6 MB JSON), spaCy part-of-speech tagging, num2words, espeak-ng fallback.
+        Options: (a) phonemes as input (user runs misaki); (b) Pascal dictionary
+        lookup, English only (`a*`/`b*` voices); (c) espeak-ng shared-library
+        binding. With (a) every voice works; (b) covers English only.
+        User 2026-10-12: no Python dependency, so (a) is out. Found: misaki
+        `us_gold.json` 90,201 + `us_silver.json` 93,361 entries (Apache-2.0), only 790
+        keyed by part of speech (`read`: DEFAULT `ɹˈid`, VBD `ɹˈɛd`);
+        `libespeak-ng.so.1` (1.51, GPL-3.0) is installed on the dev box.
+        User 2026-10-12: no C library either (pure Pascal), so (c) is out. Scope:
+        (b), English only (`a*`/`b*` voices), DEFERRED until synthesis works.
+        SUPERSEDED 2026-10-13 by Phase 5 below (no download: the user passes the
+        dictionaries in a folder; unknown words go through sub-word splitting).
+  Phase 4 — integration:
+  - [x] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
+        writes 24 kHz WAV. The pico example of that name was removed in 403d17f2:
+        recreate it (new .lpr needs cthreads first; re-add its `.gitignore` entry
+        for the output WAV, the binary entry is still there) and its
+        examples/README.md entry.
+        Done: `KokoroTTS --model-dir DIR --phonemes "IPA" [--voice af_heart]
+        [--speed 1] [--out kokoro.wav] [--serial] [--max-threads N] [--gpu]
+        [--gpu-platform N] [--gpu-device N] [--no-gpu-shared-kernel]` (OpenCL and
+        thread flags named as in QwenImage; OpenCL off by default because no
+        Kokoro stage has run on a GPU). `OpenKokoroSnapshot` + `TNNetKokoro` +
+        `SynthesizePhonemes` + `SaveVolumeToWav16`; prints skipped symbols, token
+        count, frame count, audio seconds, load / synthesis / WAV-write / total
+        time and peak RSS (VmHWM). No per-stage times: `Synthesize` does not
+        report them. README: phonemes from misaki's English G2P (reference
+        `həlˈO wˈɜɹld. ðˌɪs ɪz ɐ tˈɛst.`), the three files to download, zero
+        noise, English voices only until G2P, and only the memory figures
+        measured here (no real end-to-end peak yet). `lazbuild -B` Default,
+        Debug, Release: all build. Tiny-fixture smoke (`hˈO.`): 6 tokens, 10
+        frames, 0.25 s audio, WAV written, peak RSS 21 MB (CPU); the Debug build
+        (range checks) and `--gpu` on PoCL also wrote it.
+  - [ ] 4.2 Per-stage parity on the tiny fixture (< 1e-4) + one real-checkpoint
+        test against the 0.1 dump, under the 3 GB ulimit.
+        Tiny per-stage parity is in the default suite (see 2.x). The real
+        checkpoint part stays open: the real stage-C decoder, chained, generator
+        and end-to-end tests (`TestKokoroRealStageCDecoderParity`,
+        `TestKokoroRealStagesChainedToDecoder`,
+        `TestKokoroRealStageCGeneratorParity`, `TestKokoroRealEndToEnd`) are
+        opt-in (`NEURAL_KOKORO82M_REAL_HEAVY=1`, plus the dump from
+        `tools/make_kokoro82m_fixture.py real`) and have not run end to end on
+        this VM; the user's real-machine check is those tests and
+        `KokoroTTS --model-dir <snapshot> --phonemes "həlˈO wˈɜɹld. ðˌɪs ɪz ɐ
+        tˈɛst." --out hello.wav`.
+        - [x] DECIDED (2.9, 2026-10-14, after the user's listening test): keep
+          the arbitrary harmonic-spectrum phase bins on unvoiced spans (our
+          STFT's rounding values).
+  - [x] 4.3 README (planned vs supported split; "supported" only after the user
+        tests it), this entry.
+        Done: root README "More audio" highlight names `KokoroTTS` as planned
+        (coded), not yet tested on the real checkpoint; examples/README.md entry
+        and examples/KokoroTTS/README.md say the same. Moved to supported on
+        2026-10-14 after the user's real run.
+  Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
+  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). CODED:
+  5.1-5.9 done; the real checkpoint with text input is untested (user run
+  pending).
+  Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
+  no Python at test time (a `tools/` script writes fixtures once on the dev box).
+  - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
+        (a later TTS model can reuse it); `TNNetKokoro` calls it. Port of misaki
+        `en.py` (0.9.4, 712 lines) WITHOUT spaCy: word splitting, capital letters
+        and acronyms, possessives (`'s`), contractions, hyphenated words, the
+        -s / -ed / -ing suffix rules for words found only as their stem, stress
+        adjustment, punctuation passed through (Kokoro's vocab has
+        `, . ! ? ; : — …` and quotes).
+        Done (commits c1af8ee1, 51b1c903). API: `TNeuralEnglishG2P.Create(DictDir,
+        g2pAmerican|g2pBritish)` (neuralg2p.pas:248), `Phonemize(Text): string`
+        and `Phonemize(Text, out Tokens)`; each `TNeuralG2PToken` (:73) has
+        Text, Whitespace, Tag (rule tagger, Penn tags), Phonemes, IsKnown and
+        Resolutions, a set of punctuation / dictionary / context rule / POS
+        rule / stem rule / spelled / unknown / number pending
+        (`G2PResolutionName` prints them, for `/show`). Also exported:
+        `ApplyG2PStress`, `G2PSubTokenize` (misaki's sub-token regex, matched by
+        hand), `EnglishG2PAccentFromVoice` (`a*` US, `b*` GB, others raise; it
+        lives in neuralg2p, not in the Kokoro code), `EnglishG2PDictionaryFileName`.
+        `TNNetKokoro.SynthesizeText` calls it (5.6); 5.8/5.9 wire it into the example.
+        Ported as in en.py: retokenize grouping, the right-to-left loop with
+        future_vowel / future_to, the longest-merge loop over sub-tokens,
+        resolve_tokens (junk pieces, prespace, demotion of the lighter
+        primaries), merge_tokens, get_special_case (a/am/an/I/by/to/in/the/vs/
+        used, % & + @, ADD dot/slash), get_NNP spelling, is_known, lookup
+        (grown keys, gold then silver, the "None" key at a clause end, NNP
+        spelling when the entry has no primary stress), get_word (case folding,
+        `s'` and `'` endings, stems), _s/_ed/_ing (US ᵻ, GB ɪ, US flap, GB
+        refuses -ing after ə/ː), the ɾ -> T / ʔ -> t mapping. spaCy's tokenizer
+        is approximated: whitespace chunks; prefixes `( { " “ ‘ /`, the
+        backtick and `$ £ € ¥` (read ''); suffixes `. , ! ? ; : … ) } " ” %` (and `’` only after an
+        opening `‘`), one token per character; a final `.` stays on a dictionary
+        abbreviation (Dr., Mr.) or a dotted one (U.S., Ph.D.); infixes `--`, `—`,
+        `–` between letters/digits; clitics `'s n't 're 've 'll 'd 'm` and
+        plural `s'` split off (straight and curly). Unicode helpers come from
+        neuralhftokenizer (IsLetterCP, LowercaseCP, the new UppercaseCP, NFKC
+        UnicodeNormalize); \p{Lu}/\p{Ll} are exact for ASCII, Latin-1 and
+        Latin Extended-A only.
+        Hook points: numbers (5.3, now done: `ReadWord`'s `IsNumberWord`
+        branch calls `ReadNumber`);
+        unknown words (5.5): tokens/pieces with g2prUnknown, empty phonemes as
+        misaki with fallback=None; chunking (5.6): the per-token output.
+        Gaps: misaki's markdown overrides (`[word](/IPA/)`, `[w](+1)`,
+        `[n](#flags#)`) are not parsed (brackets read as text); numeric_if_needed
+        (Unicode digits) not ported; merges inside one word are capped at 32
+        sub-tokens (`csMaxMergedPieces`; misaki's loop is cubic, the longest key
+        in its four files has 13; a pathological 8000-sub-token word takes
+        3.4 s); a run of 2+ spaces keeps only the first character, like spaCy.
+        Speed: ~0.2 ms per 20-word sentence on this VM.
+        Tests (`TestNeuralG2P`, 15): dictionary parse/lookup, missing-file
+        error, voice -> accent, ApplyG2PStress, sub-token regex, US and GB stem
+        rules, stress demotion, acronyms / dotted abbreviations / shouting
+        sentences, next-word context, POS rules, per-token resolutions, the
+        fixture agreement (US, GB) and the real-dictionary load (ignored when
+        misaki's data/ is missing; `NEURAL_MISAKI_DATA_DIR`).
+        Fixture agreement (both accents identical in shape; numbers, currency,
+        percent groups and every token with a digit or money sign excluded =
+        5.3; tokens misaki left unknown excluded = 5.5; POS-keyed tokens
+        counted apart):
+        | group | tokens US | tokens GB | sentences |
+        | plain | 203/203 | 203/203 | 25/25 |
+        | punctuation | 212/212 | 212/212 | 26/26 |
+        | capitals_acronyms | 182/183 | 182/183 | 24/26 |
+        | possessives | 109/109 | 109/109 | 20/20 |
+        | contractions | 115/115 | 115/115 | 20/20 |
+        | hyphenated | 99/99 | 98/98 | 20/20 |
+        | suffix_stems | 178/178 | 177/177 | 30/30 |
+        | heteronyms | 216/216 | 216/216 | 36/38 |
+        | unknown_and_names | 85/85 | 85/85 | 24/24 |
+        | long_mixed | 542/543 | 542/543 | 0/6 (numbers) |
+        | total | 1941/1943 (99.9%) | 1939/1941 (99.9%) | 225/235 |
+        Asserted: 100% for every group except capitals_acronyms and long_mixed
+        (>= 99%). Remaining mismatch classes (same in US and GB): (1) `NEAR` in
+        the all-caps "THE END IS NEAR": spaCy tagged it NNP and misaki spelled
+        it; the port reads a sentence whose words are all upper case as words.
+        (2) `the` before a number in long_mixed ("the 1st of June", sentence
+        296): misaki's context comes from the number reading (5.3); the port
+        skips the unread number and sees "of". The POS-keyed mismatches are listed under 5.4.
+        Suites after the commit: cpu, avx2, opencl all `TESTS=3259 ERRORS=0
+        FAILURES=0 IGNORED=4` (was 3244).
+  - [x] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
+        `gb_gold.json` + `gb_silver.json` (GB), Apache-2.0, from misaki's GitHub
+        repository (`misaki/data/`). The USER downloads them, like the model: by
+        default the program looks in `<model-dir>/misaki/`; `--dict-dir <folder>`
+        overrides. Never downloaded by the program, never committed to the repo.
+        Clear error naming the missing file. Dictionary picked from the voice:
+        `a*` = US, `b*` = GB; other voices raise until their language has a G2P.
+        Load cost matters (~183k entries per accent): parse once at startup,
+        hash lookup (reuse an existing string hash map; search first).
+        Done (commit 51b1c903), library side: `TNeuralG2PDictionary`
+        (neuralg2p.pas:99) `LoadFromFile` / `LoadFromString`, `IndexOf`,
+        `IndexOfGrown` (misaki grow_dictionary: a lowercase key also answers
+        its Capitalized form and vice versa, computed at lookup time instead
+        of doubling the table), `TagReading` (POS-keyed values incl. "None"
+        and null), `DefaultReading`, `KeyAt`. Search result: no public string
+        hash map in the repo (neuralhftokenizer's merge table and
+        neuralsafetensors' name table are private FNV tables), so the unit has
+        its own FNV-1a open-addressing index. Parsing bypasses TJSONObject
+        entirely (no 255-byte key limit; misaki's longest key is 45 bytes):
+        a dedicated scanner keeps keys and readings as byte spans inside the
+        file text (JSON escapes decoded in place; a repeated key keeps the last
+        value, as Python). Missing files raise `ENeuralG2PError` naming every
+        missing path and where to get them. Measured on the real files
+        (`x` venv, misaki 0.9.4 data/, release -O2, this VM, 2 runs each):
+        US 90,201 gold + 93,361 silver entries in 82-184 ms, +16.5 MB RSS
+        (peak +19 MB); GB 87,352 + 109,766 in 92-131 ms, +17.7 MB RSS (peak
+        +21 MB); the suite's load test saw 67-74 ms. Entry counts equal
+        notes.json's `full_entries`. NOT done here: the `<model-dir>/misaki/`
+        default and `--dict-dir` belong to the example (5.8/5.9); the
+        constructor takes the folder. The example part is done in 5.8.
+  - [x] 5.3 Text normalization, matching misaki and no more: cardinals,
+        ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
+        `%`. Small English number-to-words port (misaki uses `num2words`).
+        Done (commits 71db06b4 fixture, db271fb1 code). API in neuralg2p.pas:
+        `EnglishCardinalWords` / `EnglishOrdinalWords` / `EnglishYearWords` /
+        `EnglishDecimalWords` (:281-288), num2words 0.5.14's exact English
+        strings ("one hundred and one", "twenty-first", "ten sixty-six",
+        "nineteen oh-five", "two thousand and one", "2.0" -> "two"), computed
+        on digit strings up to num2words' 10^306 limit; they stay in
+        neuralg2p because the English G2P is their only consumer.
+        `TNeuralEnglishG2P.ReadNumber` (:2779) ports get_number: ordinals,
+        bare 4-digit years (not after a currency sign), digits glued to
+        letters (A380 three eighty, A305 three O five, 555-1234), version
+        numbers, minus only at a word head, commas removed, leading zeros
+        dropped, unstressed "point", `$ £ €` with at most 2 decimals (dollars
+        and cents, pence never plural, zero part dropped), -s/-ed/-ing
+        (1990s, 80s), num2words' "and" dropped. Currency follows retokenize
+        (`BuildPiecesAndGroups`): the last piece of a CD token after the sign,
+        unless the next token is CD, so "$12 million" puts "dollars" after
+        million (append_currency); ¥ reads nothing. The tagger now tags
+        number tokens and cardinal words CD; g2prNumberPending became
+        g2prNumber. Two tagger fixes found by the new group: A380-like
+        pieces keep the token's tag (only hyphenated words are tagged piece
+        by piece), "A" before % & + @ is NNP.
+        Fixture: new group numbers_more (23 sentences, ids 297-319, earlier
+        output byte-identical, subsets regrown under the same rule).
+        Agreement, US = GB (non-POS tokens; sentences): numbers 213/213,
+        32/32; currency 138/138, 20/20; percent 54/54, 9/10; numbers_more
+        188/188, 23/23; long_mixed 580/580, 5/6; capitals_acronyms 182/183;
+        total US 2572/2573, GB 2570/2571 tokens, 314/320 sentences. Asserted
+        100% for every group but capitals_acronyms (99%). Every remaining
+        mismatch is an earlier class: NEAR (5.1) and the POS-keyed tokens
+        (5.4: "content" in percent #228, "minute" in long_mixed #292).
+        Deviations, only where misaki/num2words would crash or round: 10^306
+        and above reads digit by digit; a number word missing from the
+        dictionary is skipped; decimals read their written digits (num2words
+        reads the float64, which differs past 15 significant digits).
+        Not done: number flags from markdown (`[n](#&a#)`, no markdown
+        parser), Unicode digits (numeric_if_needed). Tests:
+        TestEnglishNumberWords, TestNumberReading, fixture agreement now
+        counts every digit/money token. Suites: cpu, avx2, opencl
+        `TESTS=3261 ERRORS=0 FAILURES=0 IGNORED=4`.
+  - [x] 5.4 Words spelled the same but pronounced differently (790 entries keyed
+        by part of speech, e.g. `read`, `record`): use the dictionary's DEFAULT
+        reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
+        often this differs from misaki's spaCy choice; context rules (after "to"
+        -> verb, after "the"/"a" -> noun) only if that rate is noticeable.
+        Done (commit 51b1c903) with context rules, since DEFAULT disagreed on
+        30%: `TNeuralEnglishG2P.TagRawTokens` / `TagWord`, tables at
+        neuralg2p.pas:309 (`cPreviousWordCues`), `cPreviousSuffixCues`,
+        `cObjectPronouns`, `cDeterminers`, `cConjunctions`,
+        `cThatComplementNext`, `cClosedClassTags`. Order: `@` in a word -> ADD;
+        ALL-CAPS (2+ letters) -> NNP unless the whole sentence is upper case;
+        closed class (a/an/the DT, `A` alone before punctuation NNP, I PRP,
+        to TO, in/by/vs IN, be/have/do forms VB*; a contraction tags as its
+        first word, that'll -> that); `used` VBD before "to"; `that` IN when
+        a determiner or subject pronoun follows, else DT; Capitalized inside a
+        sentence -> NNP; previous word: to/modals/do/not/please -> VB,
+        I/you/we/they -> VBP, he/she/it -> VBD (VBZ for an -s word),
+        had/has/have/was/were/been -> VBN, is/are/am/be/very/so/too/stay -> JJ,
+        determiners/possessives/prepositions -> NN, `'ll`/`n't`/`'d` -> VB,
+        `'ve` -> VBN; next word: me/him/them/us -> VB; a determiner after a
+        clause start or and/or/but -> VB; before punctuation -> NN; -ed VBD,
+        -ing VBG; otherwise no tag (DEFAULT). Pieces of a hyphenated word take
+        their own closed-class tag (spaCy tags them one by one), so the `a` in
+        one-of-a-kind reads ɐ.
+        Result on the fixture's 158 POS-keyed tokens (all groups): 153/158
+        (96.8%) in US and GB, vs 111/158 (70.3%) reading DEFAULT; asserted
+        >= 95%. Heteronym group 74/76. Remaining 5 (US = GB): "LOL, that was
+        funny" (spaCy WDT, port DT); "Fat content changed" (spaCy NN after an
+        adjective; the port has no adjective list -> DEFAULT); "the change is minute" (port JJ -> mInˈut, the right
+        English; spaCy NN -> DEFAULT mˈɪnət); "the minute hand" (spaCy JJ ->
+        mInˈut; port NN -> DEFAULT mˈɪnət, again the right English); "Have you
+        read it?" (spaCy VB -> ɹˈid; port VBP -> ɹˈɛd, the right English).
+        Three of the five are spaCy errors the port does not copy.
+  - [x] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
+        possessives, hyphen parts); (2) SPLIT the word into dictionary words by
+        dynamic programming, fewest pieces, each piece at least 2 letters
+        ("sunflowerfield" -> sun + flower + field), join their phonemes; only
+        the first piece keeps primary stress (ˈ), later primary stresses become
+        secondary (ˌ); (3) SPELL letter by letter (the dictionaries' own letter
+        entries: `A` -> `ˈA`, `B` -> `bˈi`) ONLY for unknown ALL-CAPS strings and
+        for leftover single characters the split cannot cover. Report which
+        words took route 2 or 3. Names may split oddly; that is accepted.
+        Done (commit 95cb6312). Rule as implemented, after misaki's own rules
+        fail: `TNeuralEnglishG2P.ReadUnknownWord` (neuralg2p.pas:300, body
+        :3273). (a) Letters folded to ASCII: NFKC, apostrophes dropped,
+        Latin-1 / Latin Extended-A accents stripped with neuralhftokenizer's
+        `StripAccentBaseCP` (now exported, :480); any other character (ł, ø,
+        æ, digits, symbols) leaves the word unknown. Folding is a table
+        lookup, so it is safe mechanically, but it can pick the wrong word:
+        résumé -> resume reads the verb (ɹəzˈum). (b) An ALL-CAPS string of 2+
+        letters is spelled as misaki spells acronyms (all secondary, last
+        primary); misaki already spells ASCII ALL-CAPS words itself, so in
+        practice this fires after folding (ÉCOLE -> E+C+O+L+E). (c) Any other word,
+        lowercased, at most `csG2PMaxSplitLetters` = 64 letters (:72; longer
+        stays unknown), is covered by dynamic programming
+        (`SplitIntoWords`, :3154): pieces are dictionary words of 2+ letters
+        that contain a vowel letter a e i o u y (this keeps out abbreviation
+        keys such as mr, dr, st, ft, which read as whole words), or single
+        letters spelled with their gold letter entry. Cost: fewest spelled
+        letters, then fewest pieces, then the longest first piece. So a full
+        cover always exists for ASCII letters; "leftover single characters"
+        = the spelled letters of the best cover, and a word with no
+        dictionary piece is spelled letter by letter (Qwrtz, Hrrm, shh,
+        Bpsa) — the literal reading of the rule; kept (user decision
+        2026-10-14: spell, not silent). A piece reads its DEFAULT (POS-free) reading,
+        gold before silver, the exact key before its Capitalized form
+        (misaki grow_dictionary), null entries skipped. Readings are joined
+        without spaces; only the first piece keeps ˈ, later ˈ become ˌ. A
+        Capitalized or mixed-case word then gets misaki's capital stress
+        (ApplyG2PStress 0.5, which only adds a mark when the result has
+        none). Fewest pieces means sunflowerfield -> sunflower+field (2
+        pieces), not sun+flower+field. DP cost: at most 64 start positions
+        x the longest dictionary key (45 bytes) x 4 hash probes, no string
+        built per probe (`TNeuralG2PDictionary.IndexOfBytes` :152,
+        `MaxKeyLength` :165). (d) Multi-piece words (`ResolveUnknownRuns`,
+        :3636): after misaki's merge loop, the run of adjacent letter pieces
+        around an unread piece (taking whole any misaki merge made only of
+        letter pieces) is read as one word, so camelCase WiFi -> wifi,
+        PyTorch -> pytorch, possessive Schuler's -> schuler + misaki's 's,
+        blorp-zing -> blorp + misaki's zing. A clitic piece after an
+        apostrophe piece (I'd've, GB that'll) stays unread as in misaki.
+        The word before a now-read word sees its first sound (misaki's
+        right-to-left context). Report: new kinds `g2prUnknownSplit` /
+        `g2prUnknownSpelled` (:90; `G2PResolutionName`: "unknown word
+        split" / "unknown word spelled"); a cover with both words and
+        spelled letters has both; `TNeuralG2PToken.Pieces` (:106) holds the
+        pieces, '+'-joined, spelled letters upper case ("pa+U+lo").
+        Tests (3 new, 20 in TestNeuralG2P): TestUnknownWords (pieces,
+        one primary, kinds, folding, Wrocław unknown, camelCase, possessive,
+        clitic, context "the applegarden" -> ði, the 64/65-letter cap),
+        TestUnknownWordReport (prints the table below), and
+        TestUnknownWordRealDictionaries (full misaki files, ignored when
+        missing): with the full files only the 4 folded words differ —
+        Café -> cafe kæfˈA (GB kˈafA), naïve -> naive nɑˈiv (GB nIˈiːv),
+        résumé -> resume ɹəzˈum (GB ɹɪzjˈuːm), Raphaël -> raphael ɹˈæfiəl
+        (GB ɹˈafAəl); the subset lacks cafe/naive/resume/raphael because
+        they are not substrings of the accented fixture words. Every other
+        row is identical. Fixture agreement: tokens misaki read are
+        unchanged except 8 it read only in part, now read whole and not
+        counted (blorp-zing, Mia's, Nguyen's, PyTorch, Schuler's,
+        usr/local/bin, WiFi, www.example.org/page; asserted as a list) and
+        one context change not counted ("got" before "hashtagged" in #293:
+        misaki's clause-end "None" reading ɡˈɑt -> ɡɑt). Totals US
+        2563/2564, GB 2561/2562 (same mismatches as before: NEAR + the 5.4
+        POS cases); sentence agreement drops to 270/320 (US) and 269/320
+        (GB) because sentences with unknown words now have phonemes where
+        misaki has none. The fixture's `*` and `#` stay as before (not
+        letters). Suites: cpu, avx2, opencl `TESTS=3264 ERRORS=0
+        FAILURES=0 IGNORED=4`.
+        Every fixture word misaki left unknown (or read in part), dictionary
+        subset; pieces -> phonemes (US | GB; ɾ already mapped to T):
+        | word | US | GB |
+        | --- | --- | --- |
+        | usr/local/bin | us+R -> ˌʌsˌɑɹ lˈOkəl bˈɪn | us+R -> ˌʌsˌɑː lˈQkᵊl bˈɪn |
+        | www.example.org/page | W+W+W -> dˈʌbᵊljudˌʌbᵊljudˌʌbᵊlju ɪɡzˈæmpəl ˈɔɹɡ pˈAʤ | W+W+W, or+G -> dˈʌbᵊljuːdˌʌbᵊljuːdˌʌbᵊljuː ɪɡzˈɑːmpᵊl ɔːʤˌiː pˈAʤ |
+        | PyTorch | P+Y+torch -> pˈiwˌItˌɔɹʧ | P+Y+torch -> pˈiːwˌItˌɔːʧ |
+        | WiFi | W+if+I -> dˈʌbᵊljuɪfˌI | W+if+I -> dˈʌbᵊljuːɪfˌI |
+        | Schuler's | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹs | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜːs |
+        | Nguyen's | N+guy+en -> ˈɛnɡˌIˌɛns | N+guy+en -> ˈɛnɡˌIˌɛns |
+        | Mia's | mi+A -> mˈiˌAs | M+I+A -> ˈɛmˌIˌAs |
+        | blorp-zing | blo+R+P -> blˈOˌɑɹpˌizˌɪŋ | blo+R+P -> blˈQˌɑːpˌiːzˌɪŋ |
+        | blogged | B+logged -> bˈilˌɔɡd | blog+G+E+D -> blˈɒɡʤˌiːˌiːdˌiː |
+        | livestreamed | livest+reamed -> lˈIvstɹˌimd | livest+reamed -> lˈIvstɹˌiːmd |
+        | livestreaming | livest+reaming -> lˈIvstɹˌimɪŋ | livest+reaming -> lˈIvstɹˌiːmɪŋ |
+        | photoshopped | photos+hopped -> fˈOTOzhˌɑpt | photo+shopped -> fˈQtQʃˌɒpt |
+        | hashtagged | hash+tagged -> hˈæʃtˌæɡd | hashtag+G+E+D -> hˈaʃtaɡʤˌiːˌiːdˌiː |
+        | facetimed | face+timed -> fˈAstˌImd | face+timed -> fˈAstˌImd |
+        | smurfs | S+M+urf+S -> ˈɛsˌɛmˌɜɹfˌɛs | S+M+urf+S -> ˈɛsˌɛmˌɜːfˌɛs |
+        | photocopied | photo+co+pied -> fˈOTOkˌOpˌId | photo+co+pied -> fˈQtQkˌQpˌId |
+        | vlogged | V+logged -> vˈilˌɔɡd | vlog+G+E+D -> vlˈɒɡʤˌiːˌiːdˌiː |
+        | geotagged | geotag+G+E+D -> ʤˈiOtˌæɡʤˌiˌidˌi | geotag+G+E+D -> ʤˈiːQtaɡʤˌiːˌiːdˌiː |
+        | deduped | D+E+duped -> dˈiˌidˌupt | D+E+duped -> dˈiːˌiːdjˌuːpt |
+        | sunflowerfield | sunflower+field -> sˈʌnflˌWəɹfˌild | sunflower+field -> sˈʌnflˌWəfˌiːld |
+        | keyboardstand | keyboard+stand -> kˈibˌɔɹdstˌænd | keyboard+stand -> kˈiːbɔːdstˌand |
+        | rainbowbridge | rainbow+bridge -> ɹˈAnbˌObɹˌɪʤ | rainbow+bridge -> ɹˈAnbQbɹˌɪʤ |
+        | moonlightgarden | moonlight+garden -> mˈunlˌItɡˌɑɹdən | moonlight+garden -> mˈuːnlItɡˌɑːdᵊn |
+        | Joao | J+O+A+O -> ʤˈAˌOˌAˌO | jo+A+O -> ʤˈQˌAˌQ |
+        | Paulo | pa+U+lo -> pˈɑjˌulˌO | pa+U+lo -> pˈɑːjˌuːlˌQ |
+        | Schuler | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹ | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜː |
+        | Nguyen | N+guy+en -> ˈɛnɡˌIˌɛn | N+guy+en -> ˈɛnɡˌIˌɛn |
+        | Xochitl | X+O+chit+L -> ˈɛksˌOʧˌɪtˌɛl | X+och+it+L -> ˈɛksˌɒkɪtˌɛl |
+        | Siobhan | si+ob+han -> sˈiˌɑbhˌæn | si+ob+han -> sˈiːˌɒbhˌan |
+        | Okonkwo | ok+on+K+W+O -> ˌOkˈAˌɔnkˌAdˌʌbᵊljuˌO | ok+on+K+wo -> ˌQkˈAˌɒnkˌAwˌQ |
+        | blorptastic | blo+R+P+ta+S+tic -> blˈOˌɑɹpˌitˌɑˌɛstˌɪk | blo+R+P+ta+S+tic -> blˈQˌɑːpˌiːtˌɑːˌɛstˌɪk |
+        | zingwhizzle | zing+whizzle -> zˈɪŋwˌɪzᵊl | zing+whizzle -> zˈɪŋwˌɪzᵊl |
+        | Llanfairpwllgwyngyll | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌænfˌɛɹpˌidˌʌbᵊljuˌɛlˌɛlʤˌidˌʌbᵊljuwˌIˌɛnʤˌiwˌIˌɛlˌɛl | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌanfˌɛːpˌiːdˌʌbᵊljuːˌɛlˌɛlʤˌiːdˌʌbᵊljuːwˌIˌɛnʤˌiːwˌIˌɛlˌɛl |
+        | Zbigniew | Z+big+N+I+ew -> zˈibˌɪɡˌɛnˌIjˌɪw | Z+big+N+I+ew -> zˈiːbˌɪɡˌɛnˌIjˌɪw |
+        | Brzezinski | B+R+ze+zin+ski -> bˈiˌɑɹzˌizˌɪnskˌi | B+R+ze+zin+ski -> bˈiːˌɑːzˌiːzˌɪnskˌiː |
+        | Dmitri | D+mi+T+R+I -> dˈimˌitˌiˌɑɹˌI | D+M+it+R+I -> dˈiːˌɛmɪtˌɑːˌI |
+        | Shostakovich | sho+sta+K+O+V+I+C+H -> ʃˈOstˌɑkˌAˌOvˌiˌIsˌiˌAʧ | sho+sta+K+O+V+I+C+H -> ʃˈQstˌɑːkˌAˌQvˌiːˌIsˌiːˌAʧ |
+        | Qwrtz | Q+W+R+T+Z -> kjˈudˌʌbᵊljuˌɑɹtˌizˌi | Q+W+R+T+Z -> kjˈuːdˌʌbᵊljuːˌɑːtˌiːzˌiː |
+        | Wrocław | stays unknown (ł has no ASCII base) | stays unknown |
+        | Café | C+A+F+E -> sˈiˌAˌɛfˌi | C+A+F+E -> sˈiːˌAˌɛfˌiː |
+        | naïve | na+I+V+E -> nˈʌˌIvˌiˌi | na+I+V+E -> nˈʌˌIvˌiːˌiː |
+        | résumé | re+sum+E -> ɹˌAsˌʌmˌi | res+um+E -> ɹˈiːzˌʌmˌiː |
+        | Okafor | oka+for -> ˈOkəfɔɹ | oka+for -> ˈQkəfɔː |
+        | Tanaka | ta+na+ka -> tˈɑnˌʌkˌɑ | tana+ka -> tˈɑːnəkˌɑː |
+        | Hrrm | H+R+R+M -> ˈAʧˌɑɹˌɑɹˌɛm | H+R+R+M -> ˈAʧˌɑːˌɑːˌɛm |
+        | shh | S+H+H -> ˈɛsˌAʧˌAʧ | S+H+H -> ˈɛsˌAʧˌAʧ |
+        | firetruckladder | fire+truck+ladder -> fˈIəɹtɹˌʌklˌædəɹ | fire+truck+ladder -> fˈIətɹˌʌklˌadə |
+        | Greenhousegas | greenhouse+gas -> ɡɹˈinhˌWsɡˌæs | greenhouse+gas -> ɡɹˈiːnhWsɡˌas |
+        | snowmanhat | snowman+hat -> snˈOmˌænhˌæt | snowman+hat -> snˈQmanhˌat |
+        | Bpsa | B+P+S+A -> bˈipˌiˌɛsˌA | B+P+S+A -> bˈiːpˌiːˌɛsˌA |
+        | joaopauloschuler | J+O+A+opa+U+lo+S+C+H+U+ler -> ʤˈAˌOˌAˌOpəjˌulˌOˌɛssˌiˌAʧjˌulˌɜɹ | jo+A+opa+U+lo+S+C+H+U+ler -> ʤˈQˌAˌQpəjˌuːlˌQˌɛssˌiːˌAʧjˌuːlˌɜː |
+        | Kokoro | K+ok+or+O -> kˈAˌOkˌAɔɹˌO | K+O+koro -> kˈAˌQkˌɔːɹQ |
+        | Raphaël | rap+ha+el -> ɹˈæphˌɑˌɛl | rap+ha+el -> ɹˈaphˌɑːˌɛl |
+        | Zoë | Z+O+E -> zˈiˌOˌi | Z+O+E -> zˈiːˌQˌiː |
+        | tokenizer | tokenize+R -> tˈOkənˌIzˌɑɹ | tokenize+R -> tˈQkənIzˌɑː |
+        | hummed | (misaki reads it) | hum+med -> hˈʌmmˌɛd |
+        | refactoring | (misaki reads it) | refactor+ing -> ɹiːfˈaktəˌɪŋ |
+        Seen in the table, for the user to judge: words with a doubled
+        consonant before -ed come out as spelled letters (blogged B+logged
+        US, blog+G+E+D GB; hashtagged, vlogged, geotagged), because pieces
+        are dictionary words only and -ed is not one; a doubled-consonant
+        -ed stem rule (not in misaki) would fix that group. Names mostly
+        spell (Joao J+O+A+O, Schuler S+C+H+U+ler). Not done: no stem rules
+        on pieces, no letter-to-sound rules, no folding beyond Latin-1 /
+        Latin Extended-A.
+        Done (user-approved follow-up): the doubled-consonant -ed stem rule.
+        `StemEd` gets a third branch after misaki's two: a word of 6+ letters
+        ending in `([bcdgklmnprstvxz])\1ed` or `cked` whose word[:-3] is known
+        reads as that stem + `SuffixEd` (stem_ing's branch, shared through
+        `EndsWithDoubledConsonant`). Fixture words leaving the unknown routes
+        (US | GB): blogged blˈɑɡd | blˈɒɡd, vlogged vlˈɑɡd | vlˈɒɡd,
+        hashtagged hˈæʃtˌæɡd | hˈaʃtaɡd, geotagged ʤˈiOtˌæɡd | ʤˈiːQtaɡd,
+        photoshopped fˈOTəʃˌɑpt | fˈQtQʃɒpt (grown key `Photoshop`), GB hummed
+        hˈʌmd.
+        No counted fixture token changes; the agreement test treats the word
+        before such a token as context, as it does for the unknown routes.
+  - [x] 5.6 Long text (also closes 3.1's chunking): split at sentence
+        punctuation into chunks of at most 510 tokens, synthesize each, join the
+        audio into one WAV (as Kokoro's own pipeline does).
+        Done. Chunking lives in neuralg2p (guide rule 4: it reads only
+        `TNeuralG2PToken` fields, and the limit is a parameter, so a later TTS
+        model reuses it): `SplitG2PTokensIntoChunks` (neuralg2p.pas:337) ports
+        KPipeline.en_tokenize + waterfall_last exactly (code-point counts,
+        the pending trailing space counted, cut after the last `! . ? …`, then
+        `: ;`, then `, —` whose cut leaves the rest within the limit, a `)` or
+        `”` right after the cut goes with the first chunk, no punctuation =
+        cut before the overflowing token, an empty chunk when the first token
+        alone is over the limit); `TNeuralEnglishG2P.PhonemizeInChunks`
+        (:314) ports KPipeline.__call__ for English: `re.split('\n+',
+        text.strip())` into paragraphs (a blank part keeps its index), G2P per
+        paragraph, empty chunks dropped, a chunk over the limit cut to the
+        limit in code points (`IsTruncated`; KPipeline's `ps[:510]`); the
+        chunk (`TNeuralG2PChunk`, :115) keeps its tokens.
+        `DescribeG2PUnknownWords` (:342) prints "word: routes (pieces) ->
+        phonemes" for split / spelled / unknown tokens. KPipeline inserts no
+        silence: it yields one audio per chunk and `python -m kokoro` writes
+        them back to back, so `SynthesizeText` joins them with no gap.
+        TNNetKokoro (neuralpretrained.pas): `KokoroMaxChunkPhonemes` = 510
+        (:5383); `MaxChunkPhonemes(Voice)` (:5799) = min(510,
+        max_position_embeddings - 2, voice rows), 510 on the real checkpoint,
+        30 on the tiny fixture; `EnglishG2PForVoice(Voice)` (:5802) owns one
+        `TNeuralEnglishG2P`, accent from `EnglishG2PAccentFromVoice(Voice.Name)`,
+        re-created only when the accent changes (the new one is loaded before
+        the old is freed, so a failed load keeps the old); property
+        `EnglishDictionaryDir` (a new folder drops the G2P), `EnglishG2P`;
+        `SynthesizeText(Text, Voice, Speed, Audio, out Report)` (:5805): each
+        chunk through `SynthesizePhonemes`, so each takes its own voice row
+        (pack[len(ps)-1]) and builds stage nets for that chunk only; raises
+        when no chunk has phonemes; `SynthesizeTextToWav` (:5808).
+        `TKokoroTextReport` (:5449) = per chunk the G2P chunk, the symbols
+        outside the vocab and FirstSample/SampleCount;
+        `DescribeKokoroTextReport` (:5483) prints it for `/show` (5.9);
+        `KokoroEnglishDictionaryDir(SnapshotDir)` (:5479) = `<dir>/misaki` for
+        the example and a future server. `SynthesizePhonemes` unchanged as
+        the expert path (now counts code points with `CodePointCount`).
+        examples/KokoroTTS command line unchanged (5.8/5.9); lazbuild -B
+        Default, Debug, Release build.
+        Chunk fixture (long_mixed, 6 sentences, US and GB): misaki's own
+        tokens through `SplitG2PTokensIntoChunks` give the fixture's chunks
+        exactly (text and phonemes, 12/12 sentences). The port's own tokens
+        give the same cuts in 5 of 6 per accent; #294 differs (US and GB): the
+        port reads Qwrtz and moonlightgarden (5.5), which misaki left empty,
+        so the first chunk would pass 510 and the cut moves one sentence
+        earlier ("... since dawn." / rest). Chunk phonemes differ in #291,
+        #293, #295 (unknown words now read) and #292 ("minute", 5.4).
+        Tests: TestChunkSplitRules, TestChunksMatchKPipelineUS/GB
+        (TestNeuralG2P), TestKokoroTinySynthesizeText (one chunk =
+        SynthesizePhonemes of the G2P phonemes, bit-equal; "The quick brown
+        fox jumps over the lazy dog.\n\nThe sunflowerfield." = 3 chunks of
+        27/20/19 phonemes = the per-chunk audio joined, bit-equal; the report
+        names sunflowerfield split sunflower+field),
+        TestKokoroEnglishG2PAccentSwitch (a* -> a* same object, a* -> b*
+        new, jf_* raises and keeps the G2P, no folder raises).
+  - [x] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
+        English sentences (numbers, currency, acronyms, contractions,
+        possessives, hyphens, heteronyms, unknown words) for US and GB and writes
+        a fixture of sentence -> expected phonemes. Pascal tests read only the
+        fixture and report the phoneme agreement rate; unit tests for number
+        words, sub-word splitting and spelling. Test dictionaries: a small
+        committed subset (or the fixture's own word list), never the full files.
+        Fixture part DONE 2026-10-13: `tools/make_g2p_english_fixture.py`
+        writes `tests/fixtures/g2p_english/` (sentences.json 297 sentences in
+        13 groups, US + GB, per-token output; 4 dictionary subsets in misaki's
+        format, 101.5 KB total, verified to reproduce misaki exactly;
+        notes.json with counts, en.py behaviours and quirks). misaki left
+        62 (US) / 64 (GB) of 2605 tokens empty. Forcing DEFAULT changes 47 of
+        158 POS-keyed tokens (30 of 76 in the heteronym group), so 5.4's
+        context rules look worth doing. Pascal tests come with 5.1-5.6.
+        Pascal tests DONE with 5.1-5.6: fixture agreement per group, US and
+        GB (`TestNeuralG2P`, rates printed and asserted), number words
+        (`TestEnglishNumberWords`, `TestNumberReading`), sub-word splitting
+        and spelling (`TestUnknownWords`, `TestUnknownWordReport`), chunks
+        (`TestChunkSplitRules`, `TestChunksMatchKPipelineUS/GB`).
+  - [x] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
+        argument, as in ChatTerminal (`KokoroTTS <model-dir> [options]`;
+        `--model-dir` removed). Text input by default; `--phonemes "<IPA>"` stays
+        as an expert override.
+        Done (with 5.9, same commits). `KokoroTTS <model-dir> [options]`; the
+        first argument without a leading `-` is the folder, a second one is
+        an error, `--model-dir` is rejected with a hint. `--dict-dir`
+        overrides the default `<model-dir>/misaki`
+        (`KokoroEnglishDictionaryDir`). Text needs the dictionaries, so the
+        program loads the G2P at startup (`TKokoroSession.CheckTextInput`); a
+        missing file stops it with exit code 1, the G2P's list of missing
+        paths and one line naming misaki/data/{us,gb}_{gold,silver}.json on
+        github.com/hexgrad/misaki, `<model-dir>/misaki` and `--dict-dir`.
+        `--phonemes` skips the G2P (no dictionaries needed; non-English
+        voices work there). Kept: `--voice`, `--speed`, `--serial`,
+        `--max-threads`, `--gpu`, `--gpu-platform`, `--gpu-device`,
+        `--no-gpu-shared-kernel` (CPU stays the default, unlike ChatTerminal).
+        New `KokoroVoiceFileName(SnapshotDir, VoiceName)` in neuralpretrained
+        (`OpenKokoroSnapshot` uses it too).
+  - [x] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
+        each typed line synthesized to a WAV); `-p "text"` one-shot that never
+        reads stdin; `--stats` timing to stderr; `--selftest` (argument parsing
+        and REPL commands, no model). Output names from `--out <pattern>`
+        (default `kokoro_%03d.wav`). Commands: `/exit`, `/help`,
+        `/voice <name>`, `/speed <x>`, `/out <pattern>`, `/phonemes <IPA>`,
+        `/show` (phonemes of the last line). Errors print and the REPL goes on.
+        External programs (not linked libraries, so pure Pascal holds), unset
+        by default: `--play-cmd "aplay {wav}"` and `--encode-cmd "lame --quiet
+        {wav} {base}.mp3"` run after each WAV (`{wav}` = WAV path, `{base}` =
+        path without `.wav`); `--keep-wav false` deletes the WAV after a
+        successful encode. Library side (load, voice switch, text -> phonemes ->
+        audio) lives in neural/, the `.lpr` keeps only the REPL loop and argument
+        parsing, so a later TTS HTTP server can reuse it (as ChatServer reuses
+        `neuralchatengine.pas`).
+        Done. Library: new unit `neural/neuralkokorosession.pas`,
+        `TKokoroSession` + `TKokoroSessionOptions` (folder, dictionary
+        folder, voice, speed, threads, OpenCL). Why a unit and not methods
+        of `TNNetKokoro` (guide rule 4): the session owns things the model
+        holder does not know about (the snapshot folder layout for voice
+        switching, the `TEasyOpenCL` device object, the current voice and
+        speed, the result of the last line), as `TChatEngine` owns them for
+        the chat frontends; it uses only `TNNetKokoro`'s public API.
+        `Create` = `OpenKokoroSnapshot` + `TNNetKokoro.Create`, threads,
+        `EnableOpenCL`, `EnglishDictionaryDir`; `CheckTextInput`;
+        `SelectVoice(Name, CheckText=true)` loads `voices/<name>.pt`, then
+        `EnglishG2PForVoice` (accent switch re-creates the G2P), and keeps the
+        old voice on any error (missing file, non-English voice, missing
+        dictionaries, a name with a path); `SpeakTextToWav(Text, File)` =
+        `SynthesizeText` + `SaveVolumeToWav16`, `SpeakPhonemesToWav` =
+        `SynthesizePhonemes` as a one-chunk report; `TKokoroLineResult`
+        (file, `TKokoroTextReport`, phoneme count, samples, synthesis and
+        write ms) and `LastLine` for `/show`. Argument parsing stays in the
+        .lpr as agreed (a server can move `ParseKokoroArgs` later).
+        Example: REPL by default; `-p "text"` / `--phonemes` one-shot, stdin
+        never read, exit 0 or 1 (1 also when a play/encode command fails;
+        `-p` with `--phonemes` is an error). `--out` pattern: `%d`, `%Nd`,
+        `%0Nd` (N <= 9) = line counter, 1 for the first WAV written, +1 per
+        WAV written (failed lines do not count; `/out` keeps the counter);
+        `%%` = `%`; other `%` sequences rejected at parse time; a pattern
+        without a counter is used as is, so -p "Hi" --out hello.wav writes
+        hello.wav and REPL lines overwrite it. Commands `/exit`, `/help`,
+        `/voice [name]`, `/speed [x]`, `/out [pattern]` (no argument prints
+        the current value), `/phonemes <IPA>`, `/show`
+        (`DescribeKokoroTextReport` of the last line); unknown commands and
+        failed lines print `Error: ...` and the REPL goes on. External
+        programs: `SplitCommandTemplate` splits the template once at startup
+        (spaces/tabs separate, '...' and "..." group with the quotes
+        removed, no escapes, "" = empty argument, unbalanced quote = parse
+        error), `ExpandCommandArguments` replaces `{wav}` / `{base}` inside
+        each argument in one pass (a substituted path stays one argument and
+        is not re-scanned; `{base}` = path without a final .wav, any case),
+        `RunExternalCommand` runs it with FPC `TProcess` (`poWaitOnExit`, no
+        shell, program searched in PATH, inherits the terminal). Order: play,
+        encode, then delete the WAV when `--keep-wav false` and the encode
+        exited 0 (`--keep-wav false` without `--encode-cmd` is a parse
+        error). A failure prints the exit code (FPC on Unix: `ExitStatus`
+        after `poWaitOnExit` is the exit code, minus the wait status for a
+        signal; `ExitCode` read 0 for `false`). `--stats` to stderr: load
+        time + peak RSS once; per line chunks, phonemes, audio s, synthesis
+        s, real-time factor (synthesis / audio), WAV write s, peak RSS.
+        `--selftest`: 73 checks (positional folder, every option, -p /
+        --phonemes, --out patterns, command splitting and placeholders,
+        --keep-wav, every REPL command), no model.
+        Test `TestKokoroSessionLinesAndVoiceSwitch` (tiny fixture copied to a
+        temp folder with the G2P subsets in `misaki/`, so the default folder
+        is used): line 1 = `SynthesizeText` (samples, chunks, phonemes, WAV
+        size), switch to a b* copy of the voice (British G2P), line 2 at
+        speed 1.5, refused switches (missing, `../af_heart`, a jf* copy) keep
+        the voice and the G2P, speed 0 raises, a phoneme line, a dictionary
+        folder without the files names us_gold.json.
+        Smoke runs (tiny fixture, `--dict-dir tests/fixtures/g2p_english`,
+        REPL fed from a here-doc): text, /show, /voice to a missing and a
+        non-English voice (refused), /speed, /out, /phonemes, /bogus, /help,
+        /exit; a b* copy switched accent; -p with `--out hello.wav`; encode
+        with `cp {wav} '{base} copy.bin'` + `--keep-wav false` (WAV
+        deleted); `false` as play and as encode (exit code 1 printed, WAV
+        kept, process exit 1); a missing program; `sh -c 'kill -9 $$'`
+        (signal reported); --phonemes with a jf* voice; missing dictionaries
+        (exit 1). Debug build (range/overflow checks) ran the REPL smoke too.
+        lazbuild -B Default, Debug, Release build.
+        Suites: cpu, avx2, opencl `TESTS=3270 ERRORS=0 FAILURES=0 IGNORED=4`
+        (was 3269).
+        Not done: no real-checkpoint run (dev-box rule); the README's raw
+        GitHub download URLs (branch `main`) were not fetched; output files
+        are overwritten without a question; the child program inherits
+        stdin, so a program that reads stdin would consume REPL input.
+  Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
+  and/or encoder (shine port, LGPL); not scheduled.
+  Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the

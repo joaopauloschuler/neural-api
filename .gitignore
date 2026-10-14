@@ -40,7 +40,7 @@ examples/OpenCLForwardBenchmark/OpenCLForwardBenchmark
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/LatentTextToImage/LatentTextToImage
 examples/KokoroTTS/KokoroTTS
-examples/KokoroTTS/kokoro_pico.wav
+examples/KokoroTTS/*.wav
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
 examples/SpanCorruptionPretrain/SpanCorruptionPretrain

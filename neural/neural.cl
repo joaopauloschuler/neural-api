@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24, 25). Coded by Claude (AI).
+// (9, 10, 15, 18-21, 24-28). Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -852,7 +852,9 @@ typedef struct
   int RowSpan;   // InDepth * FeatureSizeX: one kernel row of a column
   int InSizeX, InSizeY, InDepth;
   int Stride;
-  int Padding;   // zero border on each side of the source
+  int PaddingX;  // zero columns left and right of the source
+  int PaddingY;  // zero rows above and below the source
+  int DilationX; // spacing of the kernel taps along X
 } cai_conv_gather;
 
 // cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
@@ -877,8 +879,8 @@ static inline void cai_conv_gather_columns(const cai_conv_gather G,
     const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
     const int oy = gb / G.OutSizeX;
     const int ox = gb - oy * G.OutSizeX;
-    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.Padding : G.InSizeY;
-    FirstX[j] = ox * G.Stride - G.Padding;
+    FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.PaddingY : G.InSizeY;
+    FirstX[j] = ox * G.Stride - G.PaddingX;
   }
 }
 
@@ -892,15 +894,16 @@ static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
   const int bLane = lid / CAI_TILED_KSTEP;
   const int gk = k0 + kLane;
   // Past FSize the row offset puts every column below the source.
-  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.Padding;
+  const int ky = (gk < FSize) ? gk / G.RowSpan : G.InSizeY + G.PaddingY;
   const int rem = gk - ky * G.RowSpan;
   const int kx = rem / G.InDepth;
   const int d = rem - kx * G.InDepth;
+  const int TapX = kx * G.DilationX;
   #pragma unroll
   for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
   {
     const int y = FirstY[j] + ky;
-    const int x = FirstX[j] + kx;
+    const int x = FirstX[j] + TapX;
     float v = 0.0f;
     if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
       v = Src[(y * G.InSizeX + x) * G.InDepth + d];
@@ -1006,7 +1009,7 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
-  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0};
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1284,12 +1287,14 @@ __kernel void cai_conv_implicit_tiled
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-    Stride, Padding};
+    Stride, PaddingX, PaddingY, DilationX};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1313,7 +1318,9 @@ __kernel void cai_conv_implicit
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX
 )
 {
   const int a_id = get_global_id(0);
@@ -1323,8 +1330,8 @@ __kernel void cai_conv_implicit
   const int FeatureSizeY = FSize / RowSpan;
   const int oy = b_id / OutSizeX;
   const int ox = b_id - oy * OutSizeX;
-  const int FirstY = oy * Stride - Padding;
-  const int FirstX = ox * Stride - Padding;
+  const int FirstY = oy * Stride - PaddingY;
+  const int FirstX = ox * Stride - PaddingX;
   const int TapStep = InDepth * FNumAs;
   // A element (a_id, k) sits at a_id + k * FNumAs.
   int APos = a_id;
@@ -1335,7 +1342,7 @@ __kernel void cai_conv_implicit
     const int RowInside = (y >= 0) && (y < InSizeY);
     for (int kx = 0; kx < FeatureSizeX; kx++)
     {
-      const int x = FirstX + kx;
+      const int x = FirstX + kx * DilationX;
       if (RowInside && (x >= 0) && (x < InSizeX))
       {
         const int SrcPos = (y * InSizeX + x) * InDepth;
@@ -2623,18 +2630,21 @@ __kernel void cai_glu_gate
 
 // Group / Instance normalization forward (TNNetGroupNorm, and its Groups=Depth
 // limit TNNetInstanceNorm). A single sample's volume is laid out depth-axis
-// contiguous: element (x,y,c) lives at FX[(x*FSizeY + y)*FDepth + c]. The Depth
-// channels are partitioned into FGroups contiguous groups of FChannelsPerGroup =
-// FDepth/FGroups channels; group g owns channels [g*FChannelsPerGroup ..
-// +FChannelsPerGroup). Each group is normalized to zero mean / unit variance
-// over its (FSizeX * FSizeY * FChannelsPerGroup) elements, then an affine
-// gamma/beta is applied. FAffineMode selects the gamma/beta layout:
+// contiguous: position p = x*FSizeY + y holds its FDepth channels at
+// FX[p*FDepth ..]. The Depth channels are partitioned into FGroups contiguous
+// groups of FChannelsPerGroup = FDepth/FGroups channels; group g owns channels
+// [g*FChannelsPerGroup .. +FChannelsPerGroup). Each group is normalized to zero
+// mean / unit variance over its (FSizeX * FSizeY * FChannelsPerGroup) elements
+// (biased variance), then an affine gamma/beta is applied. FAffineMode selects
+// the gamma/beta layout:
 //   0 = per-channel : FGain/FBias are FDepth long, indexed by absolute channel c
 //   1 = per-element : FGain/FBias are FSizeX*FSizeY*FDepth long, indexed by the
 //                     full element offset (legacy affine)
-// One work-item per GROUP: global size = FGroups (dim 0). Keeping the whole
-// per-group reduction in a single work-item matches the scalar accumulation
-// order closely (parity well under 1e-4). Forward-only; training stays on CPU.
+// One work-group per GROUP (global size = FGroups x local size) with a
+// power-of-two local size; it reduces the group cooperatively through FScratch
+// (get_local_size(0) floats of __local memory), as cai_volume_norm does. For
+// instance norm the group is one channel strided by FDepth over the positions.
+// Forward-only; training stays on CPU.
 __kernel void cai_group_norm
 (
   const int FSizeX,
@@ -2647,53 +2657,57 @@ __kernel void cai_group_norm
   __global const float* FGain,
   __global const float* FBias,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  __local float* FScratch
 )
 {
-  const int g = get_global_id(0);
-  if (g >= FGroups) return;
-  const int dStart = g * FChannelsPerGroup;
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int dStart = get_group_id(0) * FChannelsPerGroup;
   const int groupSize = FSizeX * FSizeY * FChannelsPerGroup;
-  const int rowStride = FSizeY * FDepth; // stride between successive x
-  // Mean over the group.
-  float s = 0.0f;
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-        s += FX[base + c];
-    }
-  const float mean = s / (float)groupSize;
-  // Variance = mean( (x-mean)^2 ) over the group.
+  int s;
+  // ---- mean ----
+  float partial = 0.0f;
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    partial += FX[p * FDepth + dStart + (j - p * FChannelsPerGroup)];
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = FScratch[0] / (float)groupSize;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // ---- variance = mean( (x-mean)^2 ) ----
   float ss = 0.0f;
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-      {
-        const float v = FX[base + c] - mean;
-        ss = mad(v, v, ss);
-      }
-    }
-  const float variance = ss / (float)groupSize;
-  const float invStd = 1.0f / sqrt(variance + FEps);
-  // Normalize then apply the learnable scale (gamma) and bias (beta).
-  for (int x = 0; x < FSizeX; x++)
-    for (int y = 0; y < FSizeY; y++)
-    {
-      const int base = x * rowStride + y * FDepth + dStart;
-      for (int c = 0; c < FChannelsPerGroup; c++)
-      {
-        const int idx = base + c;
-        const float xhat = (FX[idx] - mean) * invStd;
-        int wIdx;
-        if (FAffineMode == 0) wIdx = dStart + c; // per-channel
-        else                  wIdx = idx;        // per-element
-        FY[idx] = mad(FGain[wIdx], xhat, FBias[wIdx]);
-      }
-    }
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    const float v = FX[p * FDepth + dStart + (j - p * FChannelsPerGroup)] - mean;
+    ss = mad(v, v, ss);
+  }
+  FScratch[lid] = ss;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float invStd = 1.0f / sqrt(FScratch[0] / (float)groupSize + FEps);
+  // ---- normalize, then the learnable scale (gamma) and bias (beta) ----
+  for (int j = lid; j < groupSize; j += lsize)
+  {
+    const int p = j / FChannelsPerGroup;
+    const int c = dStart + (j - p * FChannelsPerGroup);
+    const int idx = p * FDepth + c;
+    const float xhat = (FX[idx] - mean) * invStd;
+    const int wIdx = (FAffineMode == 0) ? c : idx;
+    FY[idx] = mad(FGain[wIdx], xhat, FBias[wIdx]);
+  }
 }
 
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetAvgPool). The input volume is
@@ -2832,15 +2846,16 @@ __kernel void cai_embedding_gather_int8
    element of the convolution's FInputPrepared column matrix: a copy of one
    FInput element, or 0 for a tap in the zero padding, in the layout of the CPU
    PrepareInputForConvolutionFast ((SizeX*y)+x)*Depth+d, so the GEMM reads the
-   same B operand. FInput is either unpadded (a bound resident source; Padding
-   is applied here, symmetric on X and Y) or the host-padded FInputCopy with
-   Padding = 0. Indices are int: N must stay below 2^31.
+   same B operand. FInput is either unpadded (a bound resident source; the
+   padding is applied here) or the host-padded FInputCopy with both paddings 0.
+   Kernel taps sit DilationX columns apart. Indices are int: N < 2^31.
    Coded by Claude (AI). */
 // Index of the FInput element read by column element gid; -1 for a tap in the
 // zero padding.
 static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int ColDepth, const int RowSpan, const int InSizeX, const int InSizeY,
-  const int InDepth, const int Stride, const int Padding)
+  const int InDepth, const int Stride, const int PaddingX, const int PaddingY,
+  const int DilationX)
 {
   const int col_elem = gid % ColDepth;
   const int pos      = gid / ColDepth;
@@ -2848,11 +2863,11 @@ static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int oy       = pos / OutSizeX;
   const int yCount   = col_elem / RowSpan;
   const int rem      = col_elem % RowSpan;
-  const int y        = oy * Stride + yCount - Padding;
-  const int xFirst   = ox * Stride - Padding;
-  const int x        = xFirst + rem / InDepth;
+  const int kx       = rem / InDepth;
+  const int y        = oy * Stride + yCount - PaddingY;
+  const int x        = ox * Stride - PaddingX + kx * DilationX;
   if ((y < 0) || (y >= InSizeY) || (x < 0) || (x >= InSizeX)) return -1;
-  return ((InSizeX * y) + xFirst) * InDepth + rem;
+  return ((InSizeX * y) + x) * InDepth + (rem - kx * InDepth);
 }
 
 // FP32 gather into the GEMM B operand. Coded by Claude (AI).
@@ -2866,7 +2881,9 @@ __kernel void cai_im2col
   const int InSizeY,    // FInput.SizeY
   const int InDepth,    // FInput.Depth
   const int Stride,
-  const int Padding,    // zero border added on each side of FInput
+  const int PaddingX,   // zero columns added left and right of FInput
+  const int PaddingY,   // zero rows added above and below FInput
+  const int DilationX,  // spacing of the kernel taps along X
   __global const float* FInput,
   __global float* FCols
 )
@@ -2874,7 +2891,7 @@ __kernel void cai_im2col
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, Padding);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
   FCols[gid] = (src < 0) ? 0.0f : FInput[src];
 }
 
@@ -2890,7 +2907,9 @@ __kernel void cai_im2col_h
   const int InSizeY,
   const int InDepth,
   const int Stride,
-  const int Padding,
+  const int PaddingX,
+  const int PaddingY,
+  const int DilationX,
   __global const float* FInput,
   __global half* FCols
 )
@@ -2898,7 +2917,7 @@ __kernel void cai_im2col_h
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, Padding);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
   vstore_half((src < 0) ? 0.0f : FInput[src], gid, FCols);
 }
 
@@ -3066,7 +3085,8 @@ __kernel void cai_softmax
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
 // activations (a slope, a lambda, a pair of limits and their leak); cases that
-// take none ignore them.
+// take none ignore them. FChannelParam holds one constant per channel (element
+// i is channel i % FChannels, depth-contiguous); only the per-channel cases read it.
 // Forward-only: the host keeps the backward pass (and, for ReLU, the
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
@@ -3080,7 +3100,9 @@ __kernel void cai_activation
   const float FParamB,
   const float FParamC,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  const int FChannels,
+  __global const float* FChannelParam
 )
 {
   const int i = get_global_id(0);
@@ -3164,6 +3186,22 @@ __kernel void cai_activation
     case 25: // AddConstant: x + c. FParamA = c.
       y = x + FParamA;
       break;
+    case 26: // MulConstant: x * c. FParamA = c.
+      y = x * FParamA;
+      break;
+    case 27: // Snake: x + sin(alpha*x)^2 / alpha. FParamA = alpha, FParamB = 1/alpha.
+    {
+      const float s = sin(FParamA * x);
+      y = mad(FParamB * s, s, x);
+      break;
+    }
+    case 28: // Snake with alpha = FChannelParam[channel].
+    {
+      const float a = FChannelParam[i % FChannels];
+      const float s = sin(a * x);
+      y = mad(s / a, s, x);
+      break;
+    }
     default: // csActNone / unknown: pass through
       y = x;
   }

@@ -218,6 +218,86 @@ procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
 procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
   NFFT: integer; HopLength: integer);
 
+// torch.istft(Magnitude * exp(1j * Phase), NFFT, HopLength, center=True), periodic
+// Hann: ISTFTOverlapAddReIm, then NFFT div 2 trimmed from both ends.
+procedure ISTFTCenteredMagnitudePhase(Magnitude, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+
+type
+  // torch.stft defaults (center reflect pad, periodic Hann, onesided) and sign:
+  // X[k] = sum w[n] x[n] exp(-2 pi i k n / NFFT); ISTFTOverlapAddReIm takes -Im.
+  // Direct DFT, tables built in Create: for short NFFT (any, not only 2^n).
+  // Outputs are (FrameCount, 1, BinCount), time along SizeX. Coded by Claude (AI).
+  TNNetForwardSTFT = class(TObject)
+  private
+    FNFFT, FHopLength, FBinCount, FPadding: integer;
+    // Row Bin holds w[n]*cos(2 pi Bin n / NFFT) / -w[n]*sin(...), n = 0..NFFT-1.
+    FWindowedCos, FWindowedNegSin: TNeuralFloatDynArr;
+    FEdgeFrame: TNeuralFloatDynArr;
+    FBinRe, FBinIm: TNeuralFloatDynArr;
+    procedure CheckWave(Wave: TNNetVolume);
+    // Re/Im of frame FrameIdx of Wave into RePtr^/ImPtr^ (BinCount each).
+    procedure ComputeFrameBins(Wave: TNNetVolume; FrameIdx: integer;
+      RePtr, ImPtr: TNeuralFloatArrPtr);
+  public
+    constructor Create(NFFT, HopLength: integer);
+    // 1 + SampleCount div HopLength for an even NFFT (torch's center=True count).
+    function FrameCount(SampleCount: integer): integer;
+    // Re and Im of every frame of the mono Wave (its FData in order).
+    procedure Transform(Wave, Re, Im: TNNetVolume);
+    // MagnitudePhase: (FrameCount, 1, 2 * BinCount); Depth 0..BinCount-1 is
+    // |X| (torch.abs), the rest angle(X) in [-pi, pi] (torch.angle, atan2).
+    procedure TransformToMagnitudePhase(Wave, MagnitudePhase: TNNetVolume);
+    property NFFT: integer read FNFFT;
+    property HopLength: integer read FHopLength;
+    property BinCount: integer read FBinCount;
+  end;
+
+  // hn-NSF source (SourceModuleHnNSF + SineGen of iSTFTNet / StyleTTS2 / Kokoro,
+  // no pulse mode): F0 per frame -> merged excitation per sample, torch's float32
+  // steps reproduced. Zero noise by default; RandomNoise (seeded Gaussian noise
+  // + random initial phase) cannot match a torch oracle. Coded by Claude (AI).
+  TNNetHarmonicSource = class(TObject)
+  private
+    FSampleRate, FUpsampleScale, FHarmonicCount: integer;
+    FSineAmp, FNoiseStd, FVoicedThreshold: TNeuralFloat;
+    FMergeWeights: TNeuralFloatDynArr;
+    FMergeBias: TNeuralFloat;
+    FRandomNoise: boolean;
+    FNoiseSeed: cardinal;
+    // Phase (radians x UpsampleScale) per down-sampled frame, harmonic-minor.
+    FFramePhase: TNeuralFloatDynArr;
+    FInitialCycles: TNeuralFloatDynArr;
+    FCycleSums: array of double;
+    FGaussianSource: TNNetVolume;
+    // Torch's nearest upsampling: the F0 frame read by sample SampleIdx.
+    function NearestFrame(SampleIdx, FrameCount: integer;
+      NearestScale: Single): integer; {$IFDEF Release} inline; {$ENDIF}
+    // (f0 * Harmonic / SampleRate) mod 1, torch's float32 remainder.
+    function HarmonicCycles(F0: Single; Harmonic: integer): Single;
+      {$IFDEF Release} inline; {$ENDIF}
+  public
+    constructor Create(SampleRate, UpsampleScale, HarmonicCount: integer;
+      SineAmp: TNeuralFloat = 0.1; NoiseStd: TNeuralFloat = 0.003;
+      VoicedThreshold: TNeuralFloat = 0);
+    destructor Destroy(); override;
+    // l_linear: Weights[HarmonicCount] (fundamental first) and the bias.
+    procedure SetMergeWeights(const Weights: array of TNeuralFloat;
+      Bias: TNeuralFloat);
+    function SampleCount(FrameCount: integer): integer;
+    // F0Upsampled and Voicing (1 where F0 > VoicedThreshold, else 0) per
+    // sample, (SampleCount, 1, 1) each, from F0Frames (its FData in order).
+    procedure ComputeUpsampledF0AndVoicing(F0Frames, F0Upsampled,
+      Voicing: TNNetVolume);
+    // The merged excitation tanh(Linear(sines * uv + noise)), (SampleCount, 1, 1).
+    procedure Compute(F0Frames, HarmonicSource: TNNetVolume);
+    property HarmonicCount: integer read FHarmonicCount;
+    property UpsampleScale: integer read FUpsampleScale;
+    // Seeded from NoiseSeed; each Compute continues the sequence.
+    property RandomNoise: boolean read FRandomNoise write FRandomNoise;
+    property NoiseSeed: cardinal read FNoiseSeed write FNoiseSeed;
+  end;
+
 // MIXED-precision dot product: WS is Single, XD is Double, the accumulation is
 // Double. This is the shape of every contraction where a Single weight/filter
 // row meets a Double activation row (the chroma filter bank here, the Mimi
@@ -1705,6 +1785,422 @@ begin
   finally
     Re.Free;
     Im.Free;
+  end;
+end;
+
+procedure ISTFTCenteredMagnitudePhase(Magnitude, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  Re, Im, FullWave: TNNetVolume;
+  ElementPos, MaxElementPos, TrimCount, WaveLength: integer;
+  SinPhase, CosPhase: TNeuralFloat;
+begin
+  if (Magnitude.SizeX <> Phase.SizeX) or (Magnitude.Depth <> Phase.Depth) or
+     (Magnitude.SizeY <> 1) or (Phase.SizeY <> 1) then
+    raise Exception.Create('ISTFTCenteredMagnitudePhase: Magnitude and Phase ' +
+      'must both be (frames, 1, bins).');
+  Re := TNNetVolume.Create(Magnitude.SizeX, 1, Magnitude.Depth);
+  Im := TNNetVolume.Create(Magnitude.SizeX, 1, Magnitude.Depth);
+  FullWave := TNNetVolume.Create();
+  try
+    MaxElementPos := Magnitude.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      pcr_sincosf(Phase.FData[ElementPos], SinPhase, CosPhase);
+      Re.FData[ElementPos] := Magnitude.FData[ElementPos] * CosPhase;
+      // ISTFTOverlapAddReIm stores the negated imaginary part.
+      Im.FData[ElementPos] := -Magnitude.FData[ElementPos] * SinPhase;
+    end;
+    ISTFTOverlapAddReIm(Re, Im, FullWave, NFFT, HopLength);
+    TrimCount := NFFT div 2;
+    WaveLength := FullWave.Size - 2 * TrimCount;
+    if WaveLength < 1 then
+      raise Exception.Create('ISTFTCenteredMagnitudePhase: ' +
+        IntToStr(Magnitude.SizeX) + ' frames leave no sample after the trim.');
+    Wave.ReSize(WaveLength, 1, 1);
+    Move(FullWave.FData[TrimCount], Wave.FData[0],
+      WaveLength * csNeuralFloatSize);
+  finally
+    FullWave.Free;
+    Im.Free;
+    Re.Free;
+  end;
+end;
+
+// fma(A, B, C) as torch's FMA-contracted kernels round it: A*B is exact in
+// double, so only the final sum rounds (twice in rare ties: double, then single).
+function FusedMulAddSingle(A, B, C: Single): Single;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := Double(A) * Double(B) + Double(C);
+end;
+
+// torch's area_pixel_compute_source_index (align_corners=False, clamped at 0)
+// as its FMA-contracted float kernel computes it.
+function LinearSourceCoordinate(Scale: Single; DstIdx: integer): Single;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := Double(Scale) * (Double(DstIdx) + 0.5) - 0.5;
+  if Result < 0 then Result := 0;
+end;
+
+// torch's linear-interpolation neighbours of SrcCoord in a row of SourceCount
+// values: indices Idx0/Idx1 and weights Weight0/Weight1 (float32, as torch).
+procedure LinearSourceNeighbours(SrcCoord: Single; SourceCount: integer;
+  out Idx0, Idx1: integer; out Weight0, Weight1: Single);
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Idx0 := Trunc(SrcCoord);
+  if Idx0 > SourceCount - 1 then Idx0 := SourceCount - 1;
+  Weight1 := SrcCoord - Idx0;
+  if Weight1 < 0 then Weight1 := 0;
+  if Weight1 > 1 then Weight1 := 1;
+  Weight0 := 1 - Weight1;
+  if Idx0 < SourceCount - 1 then Idx1 := Idx0 + 1 else Idx1 := Idx0;
+end;
+
+{ TNNetForwardSTFT }
+
+constructor TNNetForwardSTFT.Create(NFFT, HopLength: integer);
+var
+  BinPos, TapPos, MaxBinPos, MaxTapPos, TableIdx, TwiddleIdx: integer;
+  WindowValue, Angle: double;
+begin
+  inherited Create();
+  if (NFFT < 2) or (HopLength < 1) then
+    raise Exception.Create('TNNetForwardSTFT: NFFT must be >= 2 and ' +
+      'HopLength >= 1.');
+  FNFFT := NFFT;
+  FHopLength := HopLength;
+  FBinCount := NFFT div 2 + 1;
+  FPadding := NFFT div 2;
+  SetLength(FWindowedCos, FBinCount * NFFT);
+  SetLength(FWindowedNegSin, FBinCount * NFFT);
+  SetLength(FEdgeFrame, NFFT);
+  SetLength(FBinRe, FBinCount);
+  SetLength(FBinIm, FBinCount);
+  MaxBinPos := FBinCount - 1;
+  MaxTapPos := NFFT - 1;
+  TableIdx := 0;
+  for BinPos := 0 to MaxBinPos do
+  begin
+    TwiddleIdx := 0;
+    for TapPos := 0 to MaxTapPos do
+    begin
+      WindowValue := 0.5 - 0.5 * Cos(2.0 * Pi * TapPos / NFFT);
+      Angle := 2.0 * Pi * TwiddleIdx / NFFT;
+      FWindowedCos[TableIdx] := WindowValue * Cos(Angle);
+      // The DC and Nyquist rows have no imaginary part: exact zeros.
+      if (TwiddleIdx = 0) or (2 * TwiddleIdx = NFFT) then
+        FWindowedNegSin[TableIdx] := 0
+      else
+        FWindowedNegSin[TableIdx] := -WindowValue * Sin(Angle);
+      Inc(TableIdx);
+      Inc(TwiddleIdx, BinPos);
+      if TwiddleIdx >= NFFT then Dec(TwiddleIdx, NFFT);
+    end;
+  end;
+end;
+
+function TNNetForwardSTFT.FrameCount(SampleCount: integer): integer;
+begin
+  Result := 1 + (SampleCount + 2 * FPadding - FNFFT) div FHopLength;
+end;
+
+procedure TNNetForwardSTFT.CheckWave(Wave: TNNetVolume);
+begin
+  // torch's reflect pad needs more samples than the pad.
+  if Wave.Size <= FPadding then
+    raise Exception.Create('TNNetForwardSTFT: ' + IntToStr(Wave.Size) +
+      ' samples; the reflect pad needs more than ' + IntToStr(FPadding) + '.');
+end;
+
+procedure TNNetForwardSTFT.ComputeFrameBins(Wave: TNNetVolume;
+  FrameIdx: integer; RePtr, ImPtr: TNeuralFloatArrPtr);
+var
+  FrameStart, SampleCount, TapPos, MaxTapPos, SampleIdx, BinPos, MaxBinPos,
+    RowOffset: integer;
+  FramePtr: TNeuralFloatArrPtr;
+begin
+  SampleCount := Wave.Size;
+  FrameStart := FrameIdx * FHopLength - FPadding;
+  if (FrameStart >= 0) and (FrameStart + FNFFT <= SampleCount) then
+    FramePtr := TNeuralFloatArrPtr(@Wave.FData[FrameStart])
+  else
+  begin
+    // Reflect padding (np.pad 'reflect', the edge sample not repeated).
+    MaxTapPos := FNFFT - 1;
+    for TapPos := 0 to MaxTapPos do
+    begin
+      SampleIdx := FrameStart + TapPos;
+      if SampleIdx < 0 then SampleIdx := -SampleIdx;
+      if SampleIdx >= SampleCount then
+        SampleIdx := 2 * SampleCount - 2 - SampleIdx;
+      FEdgeFrame[TapPos] := Wave.FData[SampleIdx];
+    end;
+    FramePtr := TNeuralFloatArrPtr(@FEdgeFrame[0]);
+  end;
+  MaxBinPos := FBinCount - 1;
+  RowOffset := 0;
+  for BinPos := 0 to MaxBinPos do
+  begin
+    RePtr^[BinPos] := TNNetVolume.DotProduct(FramePtr,
+      TNeuralFloatArrPtr(@FWindowedCos[RowOffset]), FNFFT);
+    ImPtr^[BinPos] := TNNetVolume.DotProduct(FramePtr,
+      TNeuralFloatArrPtr(@FWindowedNegSin[RowOffset]), FNFFT);
+    Inc(RowOffset, FNFFT);
+  end;
+  // +0, not -0: angle() of a negative real bin is then +pi, as in torch.
+  ImPtr^[0] := 0;
+  if (FNFFT and 1) = 0 then ImPtr^[MaxBinPos] := 0;
+end;
+
+procedure TNNetForwardSTFT.Transform(Wave, Re, Im: TNNetVolume);
+var
+  FramePos, MaxFramePos, RowOffset: integer;
+begin
+  CheckWave(Wave);
+  MaxFramePos := FrameCount(Wave.Size) - 1;
+  Re.ReSize(MaxFramePos + 1, 1, FBinCount);
+  Im.ReSize(MaxFramePos + 1, 1, FBinCount);
+  RowOffset := 0;
+  for FramePos := 0 to MaxFramePos do
+  begin
+    ComputeFrameBins(Wave, FramePos, TNeuralFloatArrPtr(@Re.FData[RowOffset]),
+      TNeuralFloatArrPtr(@Im.FData[RowOffset]));
+    Inc(RowOffset, FBinCount);
+  end;
+end;
+
+procedure TNNetForwardSTFT.TransformToMagnitudePhase(Wave,
+  MagnitudePhase: TNNetVolume);
+var
+  FramePos, MaxFramePos, BinPos, MaxBinPos, RowOffset: integer;
+  BinRe, BinIm: Single;
+begin
+  CheckWave(Wave);
+  MaxFramePos := FrameCount(Wave.Size) - 1;
+  MaxBinPos := FBinCount - 1;
+  MagnitudePhase.ReSize(MaxFramePos + 1, 1, 2 * FBinCount);
+  RowOffset := 0;
+  for FramePos := 0 to MaxFramePos do
+  begin
+    ComputeFrameBins(Wave, FramePos, TNeuralFloatArrPtr(@FBinRe[0]),
+      TNeuralFloatArrPtr(@FBinIm[0]));
+    for BinPos := 0 to MaxBinPos do
+    begin
+      BinRe := FBinRe[BinPos];
+      BinIm := FBinIm[BinPos];
+      MagnitudePhase.FData[RowOffset + BinPos] :=
+        Sqrt(BinRe * BinRe + BinIm * BinIm);
+      MagnitudePhase.FData[RowOffset + FBinCount + BinPos] :=
+        pcr_atan2f(BinIm, BinRe);
+    end;
+    Inc(RowOffset, 2 * FBinCount);
+  end;
+end;
+
+{ TNNetHarmonicSource }
+
+constructor TNNetHarmonicSource.Create(SampleRate, UpsampleScale,
+  HarmonicCount: integer; SineAmp: TNeuralFloat; NoiseStd: TNeuralFloat;
+  VoicedThreshold: TNeuralFloat);
+begin
+  inherited Create();
+  if (SampleRate < 1) or (UpsampleScale < 1) or (HarmonicCount < 1) then
+    raise Exception.Create('TNNetHarmonicSource: SampleRate, UpsampleScale ' +
+      'and HarmonicCount must be >= 1.');
+  FSampleRate := SampleRate;
+  FUpsampleScale := UpsampleScale;
+  FHarmonicCount := HarmonicCount;
+  FSineAmp := SineAmp;
+  FNoiseStd := NoiseStd;
+  FVoicedThreshold := VoicedThreshold;
+  SetLength(FMergeWeights, HarmonicCount);
+  SetLength(FInitialCycles, HarmonicCount);
+  SetLength(FCycleSums, HarmonicCount);
+  FGaussianSource := TNNetVolume.Create(1, 1, 1);
+  FNoiseSeed := 1;
+end;
+
+destructor TNNetHarmonicSource.Destroy();
+begin
+  FGaussianSource.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetHarmonicSource.SetMergeWeights(
+  const Weights: array of TNeuralFloat; Bias: TNeuralFloat);
+var
+  HarmonicPos: integer;
+begin
+  if Length(Weights) <> FHarmonicCount then
+    raise Exception.Create('TNNetHarmonicSource: ' + IntToStr(Length(Weights)) +
+      ' merge weights for ' + IntToStr(FHarmonicCount) + ' harmonics.');
+  for HarmonicPos := 0 to FHarmonicCount - 1 do
+    FMergeWeights[HarmonicPos] := Weights[HarmonicPos];
+  FMergeBias := Bias;
+end;
+
+function TNNetHarmonicSource.SampleCount(FrameCount: integer): integer;
+begin
+  Result := FrameCount * FUpsampleScale;
+end;
+
+function TNNetHarmonicSource.NearestFrame(SampleIdx, FrameCount: integer;
+  NearestScale: Single): integer;
+var
+  SampleAsSingle, SourceCoord: Single;
+begin
+  SampleAsSingle := SampleIdx;
+  SourceCoord := SampleAsSingle * NearestScale;
+  Result := Trunc(SourceCoord);
+  if Result > FrameCount - 1 then Result := FrameCount - 1;
+end;
+
+function TNNetHarmonicSource.HarmonicCycles(F0: Single;
+  Harmonic: integer): Single;
+var
+  HarmonicAsSingle, HarmonicF0, SampleRateAsSingle: Single;
+begin
+  HarmonicAsSingle := Harmonic;
+  SampleRateAsSingle := FSampleRate;
+  HarmonicF0 := F0 * HarmonicAsSingle;
+  Result := HarmonicF0 / SampleRateAsSingle;
+  // torch.remainder(x, 1): fmod (exact), then + 1 when negative.
+  Result := Result - Int(Result);
+  if Result < 0 then Result := Result + 1;
+end;
+
+procedure TNNetHarmonicSource.ComputeUpsampledF0AndVoicing(F0Frames,
+  F0Upsampled, Voicing: TNNetVolume);
+var
+  FrameCount, SamplePos, MaxSamplePos: integer;
+  NearestScale, F0: Single;
+begin
+  FrameCount := F0Frames.Size;
+  MaxSamplePos := SampleCount(FrameCount) - 1;
+  F0Upsampled.ReSize(MaxSamplePos + 1, 1, 1);
+  Voicing.ReSize(MaxSamplePos + 1, 1, 1);
+  NearestScale := Double(1) / FUpsampleScale;
+  for SamplePos := 0 to MaxSamplePos do
+  begin
+    F0 := F0Frames.FData[NearestFrame(SamplePos, FrameCount, NearestScale)];
+    F0Upsampled.FData[SamplePos] := F0;
+    if F0 > FVoicedThreshold then Voicing.FData[SamplePos] := 1
+    else Voicing.FData[SamplePos] := 0;
+  end;
+end;
+
+procedure TNNetHarmonicSource.Compute(F0Frames, HarmonicSource: TNNetVolume);
+var
+  FrameCount, UpsampledCount, DownCount, HarmonicPos, MaxHarmonicPos,
+    DownPos, MaxDownPos, SamplePos, MaxSamplePos, Idx0, Idx1, Row0, Row1,
+    PhaseRow: integer;
+  NearestScale, DownScale, UpScale, Weight0, Weight1, F0At0, F0At1,
+    Cycles0, Cycles1, DownCycles, PiAsSingle, PhaseScale, Phase, Sine,
+    SineAmp, Merged, F0, NoiseAmp, UnvoicedNoiseAmp, Excitation: Single;
+  SavedRandSeed: cardinal;
+begin
+  FrameCount := F0Frames.Size;
+  if FrameCount < 1 then
+    raise Exception.Create('TNNetHarmonicSource.Compute: no F0 frames.');
+  UpsampledCount := SampleCount(FrameCount);
+  // torch: floor(size * scale_factor) in double, scale 1/UpsampleScale.
+  DownCount := Floor(UpsampledCount * (Double(1) / FUpsampleScale));
+  if Floor(DownCount * Double(FUpsampleScale)) <> UpsampledCount then
+    raise Exception.Create('TNNetHarmonicSource.Compute: the phase of ' +
+      IntToStr(DownCount) + ' frames does not upsample back to ' +
+      IntToStr(UpsampledCount) + ' samples.');
+  MaxHarmonicPos := FHarmonicCount - 1;
+  if Length(FFramePhase) < DownCount * FHarmonicCount then
+    SetLength(FFramePhase, DownCount * FHarmonicCount);
+  HarmonicSource.ReSize(UpsampledCount, 1, 1);
+  NearestScale := Double(1) / FUpsampleScale;
+  // compute_scales_value: the coordinate scale is 1 / scale_factor.
+  DownScale := Double(1) / (Double(1) / FUpsampleScale);
+  UpScale := NearestScale;
+  PiAsSingle := Pi;
+  PhaseScale := FUpsampleScale;
+  SineAmp := FSineAmp;
+  UnvoicedNoiseAmp := FSineAmp / 3;
+  SavedRandSeed := RandSeed;
+  if FRandomNoise then
+  begin
+    RandSeed := FNoiseSeed;
+    // rand_ini: none on the fundamental.
+    FInitialCycles[0] := 0;
+    for HarmonicPos := 1 to MaxHarmonicPos do
+      FInitialCycles[HarmonicPos] := Random;
+  end
+  else
+    for HarmonicPos := 0 to MaxHarmonicPos do
+      FInitialCycles[HarmonicPos] := 0;
+  try
+    // rad_values linearly down-sampled by UpsampleScale, then the cumsum
+    // (torch accumulates float32 cumsum in double) and phase * UpsampleScale.
+    for HarmonicPos := 0 to MaxHarmonicPos do
+      FCycleSums[HarmonicPos] := 0;
+    MaxDownPos := DownCount - 1;
+    PhaseRow := 0;
+    for DownPos := 0 to MaxDownPos do
+    begin
+      LinearSourceNeighbours(LinearSourceCoordinate(DownScale, DownPos),
+        UpsampledCount, Idx0, Idx1, Weight0, Weight1);
+      F0At0 := F0Frames.FData[NearestFrame(Idx0, FrameCount, NearestScale)];
+      F0At1 := F0Frames.FData[NearestFrame(Idx1, FrameCount, NearestScale)];
+      for HarmonicPos := 0 to MaxHarmonicPos do
+      begin
+        Cycles0 := HarmonicCycles(F0At0, HarmonicPos + 1);
+        Cycles1 := HarmonicCycles(F0At1, HarmonicPos + 1);
+        if Idx0 = 0 then Cycles0 := Cycles0 + FInitialCycles[HarmonicPos];
+        if Idx1 = 0 then Cycles1 := Cycles1 + FInitialCycles[HarmonicPos];
+        DownCycles := FusedMulAddSingle(Cycles0, Weight0, Cycles1 * Weight1);
+        FCycleSums[HarmonicPos] := FCycleSums[HarmonicPos] + DownCycles;
+        Phase := FCycleSums[HarmonicPos];
+        Phase := Phase * 2;
+        Phase := Phase * PiAsSingle;
+        FFramePhase[PhaseRow + HarmonicPos] := Phase * PhaseScale;
+      end;
+      Inc(PhaseRow, FHarmonicCount);
+    end;
+    // The phase linearly up-sampled back to every sample, sin, voicing,
+    // noise, then Linear(HarmonicCount -> 1) and tanh.
+    MaxSamplePos := UpsampledCount - 1;
+    for SamplePos := 0 to MaxSamplePos do
+    begin
+      F0 := F0Frames.FData[NearestFrame(SamplePos, FrameCount, NearestScale)];
+      Merged := 0;
+      // Unvoiced: sines * uv is 0, so only the noise (at sine_amp / 3) is left.
+      NoiseAmp := UnvoicedNoiseAmp;
+      if F0 > FVoicedThreshold then
+      begin
+        LinearSourceNeighbours(LinearSourceCoordinate(UpScale, SamplePos),
+          DownCount, Idx0, Idx1, Weight0, Weight1);
+        Row0 := Idx0 * FHarmonicCount;
+        Row1 := Idx1 * FHarmonicCount;
+        for HarmonicPos := 0 to MaxHarmonicPos do
+        begin
+          Phase := FusedMulAddSingle(FFramePhase[Row0 + HarmonicPos], Weight0,
+            FFramePhase[Row1 + HarmonicPos] * Weight1);
+          Sine := pcr_sinf(Phase);
+          Excitation := Sine * SineAmp;
+          Merged := Merged + FMergeWeights[HarmonicPos] * Excitation;
+        end;
+        NoiseAmp := FNoiseStd;
+      end;
+      if FRandomNoise then
+        for HarmonicPos := 0 to MaxHarmonicPos do
+          Merged := Merged + FMergeWeights[HarmonicPos] *
+            (NoiseAmp * FGaussianSource.RandomGaussianValue());
+      HarmonicSource.FData[SamplePos] := pcr_tanhf(Merged + FMergeBias);
+    end;
+  finally
+    if FRandomNoise then
+    begin
+      FNoiseSeed := RandSeed;
+      RandSeed := SavedRandSeed;
+    end;
   end;
 end;
 

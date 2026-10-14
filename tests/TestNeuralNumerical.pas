@@ -5,8 +5,9 @@
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  neuralabfun, neuraldecode, neuralthread
+  Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
+  neuralnetwork, neuralvolume, neuralabfun, neuraldecode, neuralthread,
+  neuralpretrained, neuralaudio
   {$IFDEF OpenCL}
   , cl, ctypes, neuralopencl
   {$ENDIF}
@@ -122,6 +123,9 @@ type
     procedure TestPadXYCircularGradientCheck;
     procedure TestPadReflectGradientCheck;
     procedure TestPadXYPadModeLoadFromString;
+    // TrailingPaddingX: torch ReflectionPad1d((1, 0)), an asymmetric zero pad,
+    // their input gradient and the FStruct[3] round trip.
+    procedure TestPadXYTrailingPaddingX;
 
     // Spatial/channel rearrangement layers: the routing must be the exact
     // adjoint of the forward permutation.
@@ -1029,6 +1033,10 @@ type
     procedure TestLSTMCellInputGradientCheck;
     procedure TestLSTMCellWeightGradientCheck;
     procedure TestLSTMCellSerializationRoundTrip;
+    // TNNetLSTMCell.Create(Hidden) with an input wider than Hidden (torch
+    // input_size != hidden_size): input and all twelve weight gradients.
+    procedure TestLSTMCellInputWidthGradientCheck;
+    procedure TestLSTMCellInputWidthSerializationRoundTrip;
     procedure TestGRUCellInputGradientCheck;
     procedure TestGRUCellWeightGradientCheck;
     procedure TestGRUCellSerializationRoundTrip;
@@ -1037,6 +1045,9 @@ type
     procedure TestBidirectionalLSTMUnidirectionalEquivalence;
     procedure TestBidirectionalLSTMForwardHalfEquivalence;
     procedure TestBidirectionalLSTMStackGradientCheck;
+    // LSTM and GRU stacks built with BuildWeightOwner at another length size no
+    // rows, share the owner's neurons and match copied weights.
+    procedure TestBidirectionalRecurrentBorrowingBuild;
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
@@ -1224,6 +1235,54 @@ type
     procedure TestTDNNConv1DInputGradientCheck;
     procedure TestTDNNConv1DWeightGradientCheck;
     procedure TestTDNNConv1DSerializationRoundTrip;
+    // TNNetConv1DLinear vs a torch Conv1d oracle on every Kokoro-82M geometry
+    // (trainable and threaded inference forwards).
+    procedure TestConv1DLinearTorchParity;
+    // The same geometries in OpenCL: implicit GEMM and cai_im2col, from a
+    // resident and from a host source.
+    procedure TestConv1DLinearOpenCLParity;
+    procedure TestConv1DLinearSaveLoadRoundTrip;
+    // A net built with BuildWeightOwner at another length matches copied weights.
+    procedure TestConv1DLinearBorrowingBuild;
+    // Input and weight gradients for dilation with X-only padding and k12 s6.
+    procedure TestConv1DLinearGradientCheck;
+    // TNNetDeconv1DLinear vs a torch ConvTranspose1d oracle on the Kokoro-82M
+    // transposed geometries (trainable scatter and inference CPU GEMM).
+    procedure TestDeconv1DLinearTorchParity;
+    // The dense geometries through the OpenCL scatter GEMM; grouped stay on CPU.
+    procedure TestDeconv1DLinearOpenCLParity;
+    procedure TestDeconv1DLinearSaveLoadRoundTrip;
+    // An owner built at length 1 (kernel longer than its input) lends weights.
+    procedure TestDeconv1DLinearBorrowingBuild;
+    // Input and weight gradients for dense, depthwise and grouped geometries.
+    procedure TestDeconv1DLinearGradientCheck;
+    // Depthwise x2 (Kokoro pool) at 32 channels and 60 output positions, the
+    // size where the AVX base SetPrevLayer used to interleave grouped rows.
+    procedure TestDeconv1DLinearDepthwiseWide;
+    // Kokoro-82M AdaIN1d (InstanceNorm), AdaLayerNorm and the channel LayerNorm
+    // (TokenLayerNorm) vs torch, with fc(style) written into gamma/beta.
+    procedure TestKokoroStyleNormTorchParity;
+    // Per-channel Snake and LeakyReLU 0.2/0.1/0.01 vs torch.
+    procedure TestKokoroActivationTorchParity;
+    // A norm/activation chain kept in OpenCL memory, then a host style rewrite.
+    procedure TestKokoroLayersOpenCLParity;
+    procedure TestSnakePerChannelSaveLoadRoundTrip;
+    // The per-utterance style write goes through a borrowing net's layers.
+    procedure TestKokoroLayersBorrowingBuild;
+    // Input and per-channel alpha gradients.
+    procedure TestSnakePerChannelGradientCheck;
+    // TNNetForwardSTFT Re/Im and magnitude/phase vs torch.stft (center reflect
+    // pad, periodic Hann) for n_fft 20 / 16 / 15 (odd).
+    procedure TestForwardSTFTTorchParity;
+    // A cosine on bin 3: interior frames hold A*NFFT/4 at bin 3, A*NFFT/8 at
+    // bins 2 and 4 (the Hann window's spectrum) and ~0 elsewhere.
+    procedure TestForwardSTFTCosinePeakBins;
+    // TNNetHarmonicSource (zero noise) vs the kokoro SourceModuleHnNSF:
+    // upsampled F0 and voicing exact, har_source.
+    procedure TestHarmonicSourceTorchParity;
+    // Random noise: repeatable per seed, continues the sequence across calls,
+    // restores the global RandSeed, leaves the zero-noise default untouched.
+    procedure TestHarmonicSourceRandomNoise;
     procedure TestAttentiveStatsPoolingFeatureGradientCheck;
     procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
@@ -1456,6 +1515,9 @@ type
     procedure TestDeMaxPoolGradientCheck;
     procedure TestDeAvgPoolGradientCheck;
     procedure TestDeMaxPoolForwardReplication;
+    // pPoolSizeY = 1: nearest x2 along X only (torch UpSample1d on (L,1,C)),
+    // forward, save/load and the input gradient.
+    procedure TestDeMaxPoolAlongXOnly;
     procedure TestCellBiasGradientCheck;
     procedure TestCellMulGradientCheck;
     procedure TestAddPositionalEmbeddingForward;
@@ -1970,6 +2032,20 @@ type
   end;
 
 implementation
+
+type
+  // TNNetMulByConstant without its cai_activation opcode: a scaling layer whose
+  // output only ever lives in RAM, for tests that need a host-only layer.
+  THostOnlyMulByConstant = class(TNNetMulByConstant)
+  public
+    constructor Create(pMul: TNeuralFloat); overload;
+  end;
+
+constructor THostOnlyMulByConstant.Create(pMul: TNeuralFloat);
+begin
+  inherited Create(pMul);
+  FActivationOpcode := csActNone;
+end;
 
 procedure TTestNeuralNumerical.TestConvolutionNumericalValues;
 var
@@ -10384,6 +10460,57 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestPadXYTrailingPaddingX;
+const
+  Expected: array[0..1, 0..6] of TNeuralFloat = (
+    (20, 10, 20, 30, 40, -1, -1),  // (1, 0, pmReflect, 0): ReflectionPad1d((1, 0))
+    (0, 0, 10, 20, 30, 40, 0));    // (2, 0, pmZero, 1)
+  ExpectedSizeX: array[0..1] of integer = (5, 7);
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  CasePos, X: integer;
+begin
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    for X := 0 to 3 do Input[X, 0, 0] := 10 * (X + 1);
+    for CasePos := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      NN2 := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(4, 1, 1));
+        if CasePos = 0
+          then NN.AddLayer(TNNetPadXY.Create(1, 0, pmReflect, 0))
+          else NN.AddLayer(TNNetPadXY.Create(2, 0, pmZero, 1));
+        NN.Compute(Input);
+        AssertEquals('case ' + IntToStr(CasePos) + ' SizeX',
+          ExpectedSizeX[CasePos], NN.GetLastLayer.Output.SizeX);
+        for X := 0 to ExpectedSizeX[CasePos] - 1 do
+          AssertEquals('case ' + IntToStr(CasePos) + ' x' + IntToStr(X),
+            Expected[CasePos, X], NN.GetLastLayer.Output[X, 0, 0], 1e-6);
+        NN2.LoadFromString(NN.SaveToString());
+        AssertEquals('case ' + IntToStr(CasePos) + ' round trip',
+          NN.SaveToString(), NN2.SaveToString());
+        NN2.Compute(Input);
+        for X := 0 to ExpectedSizeX[CasePos] - 1 do
+          AssertEquals('case ' + IntToStr(CasePos) + ' reloaded x' +
+            IntToStr(X), Expected[CasePos, X], NN2.GetLastLayer.Output[X, 0, 0],
+            1e-6);
+      finally
+        NN2.Free;
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(1, 1, pmReflect, 0),
+    'PadXY reflect trailing 0', 4, 3, 2);
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmZero, 1),
+    'PadXY zero trailing 1', 4, 3, 2);
+end;
+
 procedure TTestNeuralNumerical.TestGatherForward;
 var
   NN: TNNet;
@@ -10928,6 +11055,44 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestDeMaxPoolAlongXOnly;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, OutX: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 2));
+    NN.AddLayer(TNNetDeMaxPool.Create(2, 0, {pPoolSizeY=}1));
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntX := 0 to 2 do
+          Input[CntX, CntY, CntD] := 1.0 + CntX + 10 * CntY + 100 * CntD;
+    NN.Compute(Input);
+    AssertEquals('X doubled', 6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Y kept', 2, NN.GetLastLayer.Output.SizeY);
+    for CntD := 0 to 1 do
+      for CntY := 0 to 1 do
+        for OutX := 0 to 5 do
+          AssertEquals('nearest at ' + IntToStr(OutX) + ',' + IntToStr(CntY),
+            Input[OutX div 2, CntY, CntD],
+            NN.GetLastLayer.Output[OutX, CntY, CntD], 0);
+    Loaded.LoadStructureFromString(NN.SaveStructureToString());
+    AssertEquals('round-trip structure', NN.SaveStructureToString(),
+      Loaded.SaveStructureToString());
+    AssertEquals('round-trip Y kept', 2, Loaded.GetLastLayer.Output.SizeY);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+  DeMaxPoolFamilyGradientCheck(Self, TNNetDeMaxPool.Create(2, 0, 1),
+    'DeMaxPool X only', 3, 2, 2, 0.001);
 end;
 
 procedure TTestNeuralNumerical.TestGEGLUForward;
@@ -39544,6 +39709,96 @@ begin
     TNNetLSTMCell.Create(), 'LSTMCell', 4, 1, 3, 1e-5);
 end;
 
+procedure TTestNeuralNumerical.TestLSTMCellInputWidthGradientCheck;
+const
+  SeqLen = 3; InputDepth = 5; Hidden = 3;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InputDepth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, InputDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Hidden);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InputDepth, 1));
+    L := TNNetLSTMCell.Create(Hidden);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    AssertEquals('output depth', Hidden, L.Output.Depth);
+    AssertEquals('W_ii input width', InputDepth, L.Neurons[0].Weights.Depth);
+    AssertEquals('W_hi width', Hidden, L.Neurons[4].Weights.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+        L.Neurons[n].Weights.Raw[i] := Sin(n * 1.3 + i * 0.7) * 0.25;
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('LSTMCell(Hidden) input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        AssertTrue('LSTMCell(Hidden) weight gradient neuron ' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellInputWidthSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLSTMCell.Create(3), 'LSTMCell(3) on width 5', 4, 1, 5, 1e-5);
+end;
+
 procedure TTestNeuralNumerical.TestGRUCellInputGradientCheck;
 var
   NN: TNNet;
@@ -40005,6 +40260,72 @@ begin
     L.Neurons[0].Weights[f, 0, 0] := 30 + f * 17 + Sin(f * 1.3) * 5;
     // band_raw (Hz), strictly positive
     L.Neurons[0].Weights[f, 0, 1] := 20 + f * 9  + Cos(f * 0.7) * 4;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalRecurrentBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  CellKind, LayerPos, NeuronPos, ElementPos: integer;
+  UseGRU: boolean;
+  KindName: string;
+
+  procedure AddRecurrentStack(Net: TNNet; SeqLen: integer);
+  begin
+    Net.AddLayer(TNNetInput.Create(SeqLen, 1, 3));
+    Net.AddBidirectionalRecurrentStack(4, 2, {Bidirectional=}True, UseGRU);
+  end;
+
+begin
+  for CellKind := 0 to 1 do
+  begin
+    UseGRU := CellKind = 1;
+    if UseGRU then KindName := 'GRU ' else KindName := 'LSTM ';
+    RandSeed := 424242;
+    Owner := TNNet.Create();
+    Borrower := TNNet.Create();
+    Copied := TNNet.Create();
+    Input := TNNetVolume.Create(11, 1, 3);
+    try
+      AddRecurrentStack(Owner, 6);
+      // Moves every weight off its default so a missed link shows in the output.
+      for LayerPos := 1 to Owner.CountLayers() - 1 do
+      begin
+        for NeuronPos := 0 to Owner.Layers[LayerPos].Neurons.Count - 1 do
+          Owner.Layers[LayerPos].Neurons[NeuronPos].Weights.Mul(1.5);
+        Owner.Layers[LayerPos].FlushWeightCache();
+      end;
+      Borrower.BuildWeightOwner := Owner;
+      AddRecurrentStack(Borrower, 11);
+      Borrower.BuildWeightOwner := nil;
+      AssertEquals(KindName + 'borrowing build sizes no weight rows', 0,
+        Borrower.WeightElementsSized());
+      AssertTrue(KindName + 'owner build sizes its rows',
+        Owner.WeightElementsSized() > 0);
+      for LayerPos := 1 to Borrower.CountLayers() - 1 do
+        if Owner.Layers[LayerPos].Neurons.Count > 0 then
+          AssertTrue(KindName + 'layer ' + IntToStr(LayerPos) +
+            ' borrows the owner''s neurons',
+            Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+      AddRecurrentStack(Copied, 11);
+      Copied.CopyWeights(Owner);
+      for ElementPos := 0 to Input.Size - 1 do
+        Input.Raw[ElementPos] := Sin(ElementPos * 0.53) * 1.1;
+      Borrower.Compute(Input);
+      Copied.Compute(Input);
+      AssertEquals(KindName + 'borrowed output length', 11,
+        Borrower.GetLastLayer.Output.SizeX);
+      for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+        AssertEquals(KindName + 'borrowed vs copied output ' + IntToStr(ElementPos),
+          Copied.GetLastLayer.Output.Raw[ElementPos],
+          Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+    finally
+      Input.Free;
+      Copied.Free;
+      Borrower.Free;
+      Owner.Free;
+    end;
   end;
 end;
 
@@ -65331,6 +65652,1521 @@ begin
 end;
 {$ENDIF}
 
+// --- TNNetConv1DLinear: torch.nn.Conv1d geometry ---------------------------
+// tests/fixtures/conv1d_oracle.json (tools/conv1d_oracle.py) holds one torch
+// Conv1d per Kokoro-82M forward geometry, in torch layouts: input [C][L],
+// weight [Out][In][K], output [Out][Lout]. Coded by Claude (AI).
+
+// Parses tests/fixtures/<FileName> (next to the binary); nil when it is absent.
+function LoadJSONFixture(const FileName: string): TJSONObject;
+var
+  FixturePath: string;
+  Text: TStringStream;
+  Parser: TJSONParser;
+begin
+  Result := nil;
+  FixturePath := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
+    FileName;
+  if not FileExists(FixturePath) then exit;
+  Text := TStringStream.Create('');
+  try
+    Text.LoadFromFile(FixturePath);
+    Parser := TJSONParser.Create(Text.DataString, []);
+    try
+      Result := Parser.Parse as TJSONObject;
+    finally
+      Parser.Free;
+    end;
+  finally
+    Text.Free;
+  end;
+end;
+
+function CreateConv1DFromOracle(OracleCase: TJSONObject): TNNetConv1DLinear;
+var
+  SuppressBias: integer;
+begin
+  if OracleCase.Booleans['bias'] then SuppressBias := 0 else SuppressBias := 1;
+  Result := TNNetConv1DLinear.Create(OracleCase.Integers['out_channels'],
+    OracleCase.Integers['kernel_size'], OracleCase.Integers['padding'],
+    OracleCase.Integers['stride'], OracleCase.Integers['dilation'],
+    SuppressBias);
+end;
+
+// Torch weight [o][c][k] goes to neuron o at (k, 0, c).
+procedure LoadConv1DOracleWeights(Conv: TNNetLayer; OracleCase: TJSONObject);
+var
+  Weights, Biases: TJSONArray;
+  OutPos, InPos, TapPos, MaxOutPos, MaxInPos, MaxTapPos: integer;
+begin
+  Weights := OracleCase.Arrays['weight'];
+  Biases := OracleCase.Arrays['bias_values'];
+  MaxOutPos := OracleCase.Integers['out_channels'] - 1;
+  MaxInPos := OracleCase.Integers['in_channels'] - 1;
+  MaxTapPos := OracleCase.Integers['kernel_size'] - 1;
+  for OutPos := 0 to MaxOutPos do
+  begin
+    for InPos := 0 to MaxInPos do
+      for TapPos := 0 to MaxTapPos do
+        Conv.Neurons[OutPos].Weights[TapPos, 0, InPos] :=
+          Weights.Arrays[OutPos].Arrays[InPos].Floats[TapPos];
+    if Biases.Count > 0 then
+      Conv.Neurons[OutPos].BiasWeight := Biases.Floats[OutPos]
+    else
+      Conv.Neurons[OutPos].BiasWeight := 0;
+  end;
+  Conv.FlushWeightCache();
+end;
+
+procedure LoadConv1DOracleInput(Input: TNNetVolume; OracleCase: TJSONObject);
+var
+  Values: TJSONArray;
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  Values := OracleCase.Arrays['input'];
+  MaxChannelPos := OracleCase.Integers['in_channels'] - 1;
+  MaxTimePos := OracleCase.Integers['length'] - 1;
+  Input.ReSize(MaxTimePos + 1, 1, MaxChannelPos + 1);
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Input[TimePos, 0, ChannelPos] := Values.Arrays[ChannelPos].Floats[TimePos];
+end;
+
+// Max |Output - torch output|; -1 when the shapes differ.
+function Conv1DOracleMaxDiff(Output: TNNetVolume; OracleCase: TJSONObject): TNeuralFloat;
+var
+  Values: TJSONArray;
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  Result := -1;
+  Values := OracleCase.Arrays['output'];
+  MaxChannelPos := OracleCase.Integers['out_channels'] - 1;
+  MaxTimePos := OracleCase.Integers['out_length'] - 1;
+  if (Output.SizeX <> MaxTimePos + 1) or (Output.SizeY <> 1) or
+    (Output.Depth <> MaxChannelPos + 1) then exit;
+  Result := 0;
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Result := Max(Result, Abs(Output[TimePos, 0, ChannelPos] -
+        Values.Arrays[ChannelPos].Floats[TimePos]));
+end;
+
+procedure TTestNeuralNumerical.TestConv1DLinearTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Conv: TNNetConv1DLinear;
+  Input: TNNetVolume;
+  CasePos, ModePos: integer;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  Oracle := LoadJSONFixture('conv1d_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('conv1d_oracle.json absent; run tools/conv1d_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+      // Mode 0: trainable (host im2col sized at build). Mode 1: inference-only
+      // with intra-layer threading (the chunked ComputeRange forward).
+      for ModePos := 0 to 1 do
+      begin
+        OracleCase := Cases.Objects[CasePos];
+        CaseName := OracleCase.Strings['name'] + ' mode ' + IntToStr(ModePos);
+        LoadConv1DOracleInput(Input, OracleCase);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          Conv := CreateConv1DFromOracle(OracleCase);
+          if ModePos = 1 then Conv.SetTrainable(False, False);
+          NN.AddLayer(Conv);
+          LoadConv1DOracleWeights(Conv, OracleCase);
+          if ModePos = 1 then
+          begin
+            NN.EnableIntraLayerThreading(true);
+            NN.SchedulerMinGain := 0;
+            AssertTrue(CaseName + ': chunk-eligible', Conv.ChunkEligible());
+          end;
+          NN.Compute(Input, 0, ModePos = 1);
+          NN.Compute(Input, 0, ModePos = 1);
+          MaxDiff := Conv1DOracleMaxDiff(NN.GetLastLayer.Output, OracleCase);
+          AssertTrue(CaseName + ': output shape ' +
+            IntToStr(NN.GetLastLayer.Output.SizeX) + 'x' +
+            IntToStr(NN.GetLastLayer.Output.SizeY) + 'x' +
+            IntToStr(NN.GetLastLayer.Output.Depth) + ' vs torch length ' +
+            IntToStr(OracleCase.Integers['out_length']), MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConv1DLinearOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Source: TNNetLayer;
+  Conv: TNNetConv1DLinear;
+  Input, OutCPU, OutImplicit: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, ElementPos, NeuronPos, ImplicitBefore, ImplicitLaunches: integer;
+  SentinelsLeft: integer;
+  HostSource, ImplicitConvWasEnabled: boolean;
+  DiffImplicit, DiffExplicit, DiffTorch: TNeuralFloat;
+  CaseName: string;
+const
+  csConv1DSentinel = 12345.0;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  Oracle := LoadJSONFixture('conv1d_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('conv1d_oracle.json absent; run tools/conv1d_oracle.py');
+    exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  Input := TNNetVolume.Create();
+  OutCPU := TNNetVolume.Create();
+  OutImplicit := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+      // A resident source makes the gather pad in OpenCL; a host source is
+      // padded by the host first.
+      for HostSource := false to true do
+      begin
+        OracleCase := Cases.Objects[CasePos];
+        CaseName := OracleCase.Strings['name'] + ' host source=' +
+          BoolToStr(HostSource, true);
+        LoadConv1DOracleInput(Input, OracleCase);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth, 1));
+          if HostSource then
+            Source := NN.AddLayer(TNNetIdentity.Create())
+          else
+          begin
+            // An identity pointwise convolution that leaves its output in
+            // OpenCL memory, so the torch output stays the reference.
+            Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(Input.Depth).
+              SetTrainable(False, False));
+            for NeuronPos := 0 to Source.Neurons.Count - 1 do
+            begin
+              Source.Neurons[NeuronPos].Weights.Fill(0);
+              Source.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+              Source.Neurons[NeuronPos].BiasWeight := 0;
+            end;
+            Source.FlushWeightCache();
+          end;
+          Conv := CreateConv1DFromOracle(OracleCase);
+          Conv.SetTrainable(False, False);
+          NN.AddLayer(Conv);
+          LoadConv1DOracleWeights(Conv, OracleCase);
+          NN.Compute(Input);
+          OutCPU.Copy(NN.GetLastLayer.Output);
+
+          NN.ForceOpenCL(True);
+          NN.EnableOpenCL(PlatformId, DeviceId);
+          try
+            SetOpenCLImplicitConv(true);
+            ImplicitBefore := Conv.OpenCLImplicitConvLaunchCount();
+            NN.Compute(Input);
+            // A resident source must be gathered (and padded) in OpenCL: the
+            // host copy then keeps the sentinel.
+            Source.Output.Fill(csConv1DSentinel);
+            NN.Compute(Input);
+            OutImplicit.Copy(NN.GetLastLayer.Output);
+            ImplicitLaunches := Conv.OpenCLImplicitConvLaunchCount() - ImplicitBefore;
+            AssertTrue(CaseName + ': the convolution ran in OpenCL',
+              Conv.OutputBindableOnOpenCL());
+            // The explicit path: cai_im2col, then the GEMM.
+            SetOpenCLImplicitConv(false);
+            Source.Output.Fill(csConv1DSentinel);
+            NN.Compute(Input);
+            SentinelsLeft := 0;
+            for ElementPos := 0 to Source.Output.Size - 1 do
+              if Source.Output.Raw[ElementPos] = csConv1DSentinel then
+                Inc(SentinelsLeft);
+            if HostSource then
+              AssertEquals(CaseName + ': a host source is read from RAM', 0,
+                SentinelsLeft)
+            else
+              AssertEquals(CaseName + ': a resident source is not downloaded',
+                Source.Output.Size, SentinelsLeft);
+          finally
+            NN.ForceOpenCL(False);
+            SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+          end;
+          if not Conv.Pointwise then
+            AssertEquals(CaseName + ': implicit GEMM launches', 2, ImplicitLaunches);
+          AssertEquals(CaseName + ': output size', OutCPU.Size, OutImplicit.Size);
+          DiffImplicit := 0;
+          DiffExplicit := 0;
+          for ElementPos := 0 to OutCPU.Size - 1 do
+          begin
+            DiffImplicit := Max(DiffImplicit,
+              Abs(OutCPU.Raw[ElementPos] - OutImplicit.Raw[ElementPos]));
+            DiffExplicit := Max(DiffExplicit,
+              Abs(OutCPU.Raw[ElementPos] - NN.GetLastLayer.Output.Raw[ElementPos]));
+          end;
+          DiffTorch := Conv1DOracleMaxDiff(NN.GetLastLayer.Output, OracleCase);
+          AssertTrue(CaseName + ': implicit GEMM vs CPU max |diff| = ' +
+            FloatToStr(DiffImplicit), DiffImplicit < 1e-4);
+          AssertTrue(CaseName + ': cai_im2col vs CPU max |diff| = ' +
+            FloatToStr(DiffExplicit), DiffExplicit < 1e-4);
+          AssertTrue(CaseName + ': cai_im2col vs torch max |diff| = ' +
+            FloatToStr(DiffTorch), (DiffTorch >= 0) and (DiffTorch < 1e-4));
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+    OutImplicit.Free;
+    OutCPU.Free;
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The Kokoro generator chain at a test size: resblock conv (k7 d3), noise conv
+// (k12 s6 p3, no bias) and conv_post-like (k3 d5). Coded by Claude (AI).
+procedure AddConv1DChain(NN: TNNet; SeqLen: integer);
+begin
+  NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3, 1));
+  NN.AddLayer(TNNetConv1DLinear.Create(4, 7, 9, 1, 3));
+  NN.AddLayer(TNNetConv1DLinear.Create(5, 12, 3, 6, 1, 1));
+  NN.AddLayer(TNNetConv1DLinear.Create(2, 3, 5, 1, 5));
+end;
+
+procedure FillConv1DChainInput(Input: TNNetVolume);
+var
+  ElementPos: integer;
+begin
+  for ElementPos := 0 to Input.Size - 1 do
+    Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.37) - 0.1;
+end;
+
+procedure TTestNeuralNumerical.TestConv1DLinearSaveLoadRoundTrip;
+var
+  NN, NNLoaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ElementPos: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNLoaded := TNNet.Create();
+  Input := TNNetVolume.Create(61, 1, 3);
+  try
+    AddConv1DChain(NN, 61);
+    FillConv1DChainInput(Input);
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NNLoaded.LoadFromString(Saved);
+    AssertEquals('TNNetConv1DLinear structure round-trip',
+      NN.SaveStructureToString(), NNLoaded.SaveStructureToString());
+    AssertEquals('TNNetConv1DLinear full round-trip', Saved,
+      NNLoaded.SaveToString());
+    AssertEquals('reloaded dilation', 3,
+      TNNetConv1DLinear(NNLoaded.Layers[1]).DilationX);
+    AssertEquals('reloaded Y padding', 0,
+      TNNetConv1DLinear(NNLoaded.Layers[2]).PaddingY);
+    AssertEquals('reloaded kernel height', 1,
+      TNNetConv1DLinear(NNLoaded.Layers[2]).FeatureSizeY);
+    AssertEquals('k12 s6 p3 output length', 10, NN.GetLastLayer.Output.SizeX);
+    NNLoaded.Compute(Input);
+    for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('reloaded output ' + IntToStr(ElementPos),
+        NN.GetLastLayer.Output.Raw[ElementPos],
+        NNLoaded.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    NNLoaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConv1DLinearBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  LayerPos, ElementPos: integer;
+begin
+  RandSeed := 424242;
+  Owner := TNNet.Create();
+  Borrower := TNNet.Create();
+  Copied := TNNet.Create();
+  Input := TNNetVolume.Create(97, 1, 3);
+  try
+    AddConv1DChain(Owner, 40);
+    Borrower.BuildWeightOwner := Owner;
+    AddConv1DChain(Borrower, 97);
+    Borrower.BuildWeightOwner := nil;
+    AddConv1DChain(Copied, 97);
+    Copied.CopyWeights(Owner);
+    for LayerPos := 1 to Borrower.CountLayers() - 1 do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the owner''s neurons',
+        Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+    FillConv1DChainInput(Input);
+    Borrower.Compute(Input);
+    Copied.Compute(Input);
+    AssertEquals('borrowed output length', 16, Borrower.GetLastLayer.Output.SizeX);
+    for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+      AssertEquals('borrowed vs copied output ' + IntToStr(ElementPos),
+        Copied.GetLastLayer.Output.Raw[ElementPos],
+        Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    Copied.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConv1DLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Conv: TNNetConv1DLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  GeometryPos, ElementPos, NeuronPos, WeightPos: integer;
+  GeometryName: string;
+const
+  // kernel, padding, stride, dilation: dilated X-only padding, then the
+  // strided even kernel of noise_convs[0].
+  csGeometries: array[0..1, 0..3] of integer = ((3, 3, 1, 3), (12, 3, 6, 1));
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  epsilon := 0.001;
+  for GeometryPos := 0 to 1 do
+  begin
+    GeometryName := 'Conv1D k' + IntToStr(csGeometries[GeometryPos, 0]) +
+      ' p' + IntToStr(csGeometries[GeometryPos, 1]) +
+      ' s' + IntToStr(csGeometries[GeometryPos, 2]) +
+      ' d' + IntToStr(csGeometries[GeometryPos, 3]);
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(14, 1, 2);
+    InputPlus := TNNetVolume.Create(14, 1, 2);
+    Desired := nil;
+    try
+      NN.AddLayer(TNNetInput.Create(14, 1, 2, 1));
+      Conv := TNNetConv1DLinear.Create(3, csGeometries[GeometryPos, 0],
+        csGeometries[GeometryPos, 1], csGeometries[GeometryPos, 2],
+        csGeometries[GeometryPos, 3]);
+      NN.AddLayer(Conv);
+      Desired := TNNetVolume.Create(Conv.Output);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+      for ElementPos := 0 to Input.Size - 1 do
+        Input.Raw[ElementPos] := (Sin(ElementPos * 0.41) * 0.5 + 0.1) * 0.4;
+      for ElementPos := 0 to Desired.Size - 1 do
+        Desired.Raw[ElementPos] := Cos(ElementPos * 0.27) * 0.1;
+      for NeuronPos := 0 to Conv.Neurons.Count - 1 do
+        for WeightPos := 0 to Conv.Neurons[NeuronPos].Weights.Size - 1 do
+          Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Sin(NeuronPos * 0.7 + WeightPos * 0.3) * 0.2;
+      Conv.FlushWeightCache();
+
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        InputPlus.Copy(Input);
+        InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + epsilon;
+        lossPlus := ComputeLoss(InputPlus);
+        InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - epsilon;
+        lossMinus := ComputeLoss(InputPlus);
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        analyticalGrad := NN.Layers[0].OutputError.Raw[ElementPos];
+        AssertTrue(GeometryName + ' input gradient at ' + IntToStr(ElementPos) +
+          ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+      for NeuronPos := 0 to Conv.Neurons.Count - 1 do
+        for WeightPos := 0 to Conv.Neurons[NeuronPos].Weights.Size - 1 do
+        begin
+          Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] + epsilon;
+          Conv.FlushWeightCache();
+          lossPlus := ComputeLoss(Input);
+          Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] - 2 * epsilon;
+          Conv.FlushWeightCache();
+          lossMinus := ComputeLoss(Input);
+          Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Conv.Neurons[NeuronPos].Weights.Raw[WeightPos] + epsilon;
+          Conv.FlushWeightCache();
+          numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+          NN.Compute(Input);
+          Conv.Neurons[NeuronPos].ClearDelta;
+          NN.Backpropagate(Desired);
+          analyticalGrad := -Conv.Neurons[NeuronPos].Delta.Raw[WeightPos];
+          AssertTrue(GeometryName + ' weight gradient (' + IntToStr(NeuronPos) +
+            ',' + IntToStr(WeightPos) + ') num=' + FloatToStr(numericalGrad) +
+            ' ana=' + FloatToStr(analyticalGrad),
+            Abs(numericalGrad - analyticalGrad) < 0.01);
+        end;
+    finally
+      Desired.Free;
+      InputPlus.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+// --- TNNetDeconv1DLinear: torch.nn.ConvTranspose1d geometry ----------------
+// tests/fixtures/conv_transpose1d_oracle.json (tools/conv_transpose1d_oracle.py)
+// holds one torch ConvTranspose1d per Kokoro-82M transposed geometry, in torch
+// layouts: input [C][L], weight [In][Out/groups][K], output [Out][Lout].
+// Coded by Claude (AI).
+type
+  // Reaches the protected path predicate of the layer under test.
+  TDeconv1DAccess = class(TNNetDeconv1DLinear);
+
+function CreateDeconv1DFromOracle(OracleCase: TJSONObject): TNNetDeconv1DLinear;
+var
+  SuppressBias: integer;
+begin
+  if OracleCase.Booleans['bias'] then SuppressBias := 0 else SuppressBias := 1;
+  Result := TNNetDeconv1DLinear.Create(OracleCase.Integers['out_channels'],
+    OracleCase.Integers['kernel_size'], OracleCase.Integers['stride'],
+    OracleCase.Integers['padding'], OracleCase.Integers['output_padding'],
+    OracleCase.Integers['groups'], SuppressBias);
+end;
+
+// Torch weight [g*In/G + c][o][k] goes to neuron g*(Out/G) + o at (k, 0, c).
+procedure LoadDeconv1DOracleWeights(Deconv: TNNetLayer; OracleCase: TJSONObject);
+var
+  Weights, Biases: TJSONArray;
+  Groups, GroupInChannels, GroupOutChannels: integer;
+  InPos, LocalOutPos, NeuronPos, TapPos, LocalInPos: integer;
+  MaxInPos, MaxLocalOutPos, MaxTapPos, MaxNeuronPos: integer;
+begin
+  Weights := OracleCase.Arrays['weight'];
+  Biases := OracleCase.Arrays['bias_values'];
+  Groups := OracleCase.Integers['groups'];
+  GroupInChannels := OracleCase.Integers['in_channels'] div Groups;
+  GroupOutChannels := OracleCase.Integers['out_channels'] div Groups;
+  MaxInPos := OracleCase.Integers['in_channels'] - 1;
+  MaxLocalOutPos := GroupOutChannels - 1;
+  MaxTapPos := OracleCase.Integers['kernel_size'] - 1;
+  for InPos := 0 to MaxInPos do
+  begin
+    LocalInPos := InPos mod GroupInChannels;
+    for LocalOutPos := 0 to MaxLocalOutPos do
+    begin
+      NeuronPos := (InPos div GroupInChannels) * GroupOutChannels + LocalOutPos;
+      for TapPos := 0 to MaxTapPos do
+        Deconv.Neurons[NeuronPos].Weights[TapPos, 0, LocalInPos] :=
+          Weights.Arrays[InPos].Arrays[LocalOutPos].Floats[TapPos];
+    end;
+  end;
+  MaxNeuronPos := OracleCase.Integers['out_channels'] - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+    if Biases.Count > 0 then
+      Deconv.Neurons[NeuronPos].BiasWeight := Biases.Floats[NeuronPos]
+    else
+      Deconv.Neurons[NeuronPos].BiasWeight := 0;
+  Deconv.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Deconv: TNNetDeconv1DLinear;
+  Input: TNNetVolume;
+  CasePos, ModePos: integer;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  Oracle := LoadJSONFixture('conv_transpose1d_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('conv_transpose1d_oracle.json absent; run tools/conv_transpose1d_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+      // Mode 0: trainable (the per-neuron scatter). Mode 1: inference-only
+      // (the CPU GEMM when dense, the scatter when grouped).
+      for ModePos := 0 to 1 do
+      begin
+        OracleCase := Cases.Objects[CasePos];
+        CaseName := OracleCase.Strings['name'] + ' mode ' + IntToStr(ModePos);
+        LoadConv1DOracleInput(Input, OracleCase);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          Deconv := CreateDeconv1DFromOracle(OracleCase);
+          if ModePos = 1 then Deconv.SetTrainable(False, False);
+          NN.AddLayer(Deconv);
+          LoadDeconv1DOracleWeights(Deconv, OracleCase);
+          AssertEquals(CaseName + ': CPU GEMM path',
+            (ModePos = 1) and (OracleCase.Integers['groups'] = 1),
+            TDeconv1DAccess(Deconv).CPUGemmEligible());
+          NN.Compute(Input);
+          NN.Compute(Input);
+          MaxDiff := Conv1DOracleMaxDiff(NN.GetLastLayer.Output, OracleCase);
+          AssertTrue(CaseName + ': output shape ' +
+            IntToStr(NN.GetLastLayer.Output.SizeX) + 'x' +
+            IntToStr(NN.GetLastLayer.Output.SizeY) + 'x' +
+            IntToStr(NN.GetLastLayer.Output.Depth) + ' vs torch length ' +
+            IntToStr(OracleCase.Integers['out_length']), MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Deconv: TNNetDeconv1DLinear;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, ElementPos, OpenCLForwardsBefore: integer;
+  IsDense: boolean;
+  DiffCPU, DiffTorch: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  Oracle := LoadJSONFixture('conv_transpose1d_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('conv_transpose1d_oracle.json absent; run tools/conv_transpose1d_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  OutCPU := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      CaseName := OracleCase.Strings['name'];
+      IsDense := OracleCase.Integers['groups'] = 1;
+      LoadConv1DOracleInput(Input, OracleCase);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth, 1));
+        Deconv := CreateDeconv1DFromOracle(OracleCase);
+        Deconv.SetTrainable(False, False);
+        NN.AddLayer(Deconv);
+        LoadDeconv1DOracleWeights(Deconv, OracleCase);
+        NN.Compute(Input);
+        OutCPU.Copy(NN.GetLastLayer.Output);
+        NN.ForceOpenCL(True);
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        try
+          OpenCLForwardsBefore := Deconv.ForwardGPUCnt;
+          NN.Compute(Input);
+          // Unchanged weights: the resident A operand is reused.
+          NN.Compute(Input);
+          // A grouped layer stays on the CPU.
+          if IsDense then
+            AssertEquals(CaseName + ': OpenCL forwards', 2,
+              Deconv.ForwardGPUCnt - OpenCLForwardsBefore)
+          else
+            AssertEquals(CaseName + ': OpenCL forwards', 0,
+              Deconv.ForwardGPUCnt - OpenCLForwardsBefore);
+        finally
+          NN.ForceOpenCL(False);
+        end;
+        AssertEquals(CaseName + ': output size', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        DiffCPU := 0;
+        for ElementPos := 0 to OutCPU.Size - 1 do
+          DiffCPU := Max(DiffCPU,
+            Abs(OutCPU.Raw[ElementPos] - NN.GetLastLayer.Output.Raw[ElementPos]));
+        DiffTorch := Conv1DOracleMaxDiff(NN.GetLastLayer.Output, OracleCase);
+        AssertTrue(CaseName + ': OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffCPU), DiffCPU < 1e-4);
+        AssertTrue(CaseName + ': OpenCL vs torch max |diff| = ' +
+          FloatToStr(DiffTorch), (DiffTorch >= 0) and (DiffTorch < 1e-4));
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    OutCPU.Free;
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The Kokoro transposed chain at a test size: AdainResBlk1d pool (depthwise
+// k3 s2 p1 op1), generator ups k12 s6 p3, then a grouped bias-free k20 s10 p5.
+// Coded by Claude (AI).
+procedure AddDeconv1DChain(NN: TNNet; SeqLen: integer; Trainable: boolean);
+begin
+  NN.AddLayer(TNNetInput.Create(SeqLen, 1, 6, 1));
+  NN.AddLayer(TNNetDeconv1DLinear.Create(6, 3, 2, 1, 1, 6).
+    SetTrainable(Trainable, Trainable));
+  NN.AddLayer(TNNetDeconv1DLinear.Create(4, 12, 6, 3).
+    SetTrainable(Trainable, Trainable));
+  NN.AddLayer(TNNetDeconv1DLinear.Create(2, 20, 10, 5, 0, 2, 1).
+    SetTrainable(Trainable, Trainable));
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearDepthwiseWide;
+const
+  ChannelCount = 32;
+  InputLength = 30;
+var
+  NN: TNNet;
+  Deconv: TNNetLayer;
+  Input: TNNetVolume;
+  InPos, OutPos, ChannelPos, TapPos: integer;
+  Expected, MaxDiff: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InputLength, 1, ChannelCount);
+  try
+    NN.AddLayer(TNNetInput.Create(InputLength, 1, ChannelCount));
+    Deconv := NN.AddLayer(TNNetDeconv1DLinear.Create(ChannelCount, 3, 2, 1, 1,
+      ChannelCount));
+    NN.SetTrainable(false);
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+    AssertEquals('output length', 2 * InputLength, Deconv.Output.SizeX);
+    // torch ConvTranspose1d: output o = 2*i - 1 + k.
+    MaxDiff := 0;
+    for ChannelPos := 0 to ChannelCount - 1 do
+      for OutPos := 0 to 2 * InputLength - 1 do
+      begin
+        Expected := Deconv.Neurons[ChannelPos].BiasWeight;
+        for InPos := 0 to InputLength - 1 do
+          for TapPos := 0 to 2 do
+            if 2 * InPos - 1 + TapPos = OutPos then
+              Expected := Expected + Input[InPos, 0, ChannelPos] *
+                Deconv.Neurons[ChannelPos].Weights[TapPos, 0, 0];
+        MaxDiff := Max(MaxDiff, Abs(Expected -
+          Deconv.Output[OutPos, 0, ChannelPos]));
+      end;
+    AssertTrue('depthwise output, max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-5);
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearSaveLoadRoundTrip;
+var
+  NN, NNLoaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ElementPos: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNLoaded := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 6);
+  try
+    AddDeconv1DChain(NN, 3, true);
+    FillConv1DChainInput(Input);
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NNLoaded.LoadFromString(Saved);
+    AssertEquals('TNNetDeconv1DLinear structure round-trip',
+      NN.SaveStructureToString(), NNLoaded.SaveStructureToString());
+    AssertEquals('TNNetDeconv1DLinear full round-trip', Saved,
+      NNLoaded.SaveToString());
+    AssertEquals('reloaded depthwise groups', 6,
+      TNNetDeconv1DLinear(NNLoaded.Layers[1]).Groups);
+    AssertEquals('reloaded grouped groups', 2,
+      TNNetDeconv1DLinear(NNLoaded.Layers[3]).Groups);
+    AssertEquals('reloaded Y padding', 0,
+      TNNetDeconv1DLinear(NNLoaded.Layers[2]).PaddingY);
+    AssertEquals('reloaded kernel height', 1,
+      TNNetDeconv1DLinear(NNLoaded.Layers[3]).FeatureSizeY);
+    AssertEquals('depthwise weights per neuron', 3,
+      NNLoaded.Layers[1].Neurons[0].Weights.Size);
+    // 3 -> 6 (x2, op1) -> 36 (x6) -> 360 (x10), one row.
+    AssertEquals('output length', 360, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('output rows', 1, NN.GetLastLayer.Output.SizeY);
+    NNLoaded.Compute(Input);
+    for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('reloaded output ' + IntToStr(ElementPos),
+        NN.GetLastLayer.Output.Raw[ElementPos],
+        NNLoaded.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    NNLoaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  LayerPos, ElementPos: integer;
+begin
+  RandSeed := 424242;
+  Owner := TNNet.Create();
+  Borrower := TNNet.Create();
+  Copied := TNNet.Create();
+  Input := TNNetVolume.Create(13, 1, 6);
+  try
+    // Length 1: the k20 p5 kernel is longer than its padded input.
+    AddDeconv1DChain(Owner, 1, false);
+    Borrower.BuildWeightOwner := Owner;
+    AddDeconv1DChain(Borrower, 13, false);
+    Borrower.BuildWeightOwner := nil;
+    AddDeconv1DChain(Copied, 13, false);
+    Copied.CopyWeights(Owner);
+    for LayerPos := 1 to Borrower.CountLayers() - 1 do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the owner''s neurons',
+        Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+    AssertEquals('owner kernel not clamped', 20,
+      TNNetDeconv1DLinear(Owner.Layers[3]).FeatureSizeX);
+    FillConv1DChainInput(Input);
+    Borrower.Compute(Input);
+    Copied.Compute(Input);
+    AssertEquals('borrowed output length', 1560, Borrower.GetLastLayer.Output.SizeX);
+    for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+      AssertEquals('borrowed vs copied output ' + IntToStr(ElementPos),
+        Copied.GetLastLayer.Output.Raw[ElementPos],
+        Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    Copied.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeconv1DLinearGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Deconv: TNNetDeconv1DLinear;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  GeometryPos, ElementPos, NeuronPos, WeightPos: integer;
+  GeometryName: string;
+const
+  // out channels, kernel, stride, padding, output padding, groups (4 input
+  // channels): generator ups k12 s6 p3, depthwise pool, two groups.
+  csGeometries: array[0..2, 0..5] of integer =
+    ((3, 12, 6, 3, 0, 1), (4, 3, 2, 1, 1, 4), (2, 4, 2, 1, 0, 2));
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  epsilon := 0.001;
+  for GeometryPos := 0 to 2 do
+  begin
+    GeometryName := 'Deconv1D k' + IntToStr(csGeometries[GeometryPos, 1]) +
+      ' s' + IntToStr(csGeometries[GeometryPos, 2]) +
+      ' p' + IntToStr(csGeometries[GeometryPos, 3]) +
+      ' op' + IntToStr(csGeometries[GeometryPos, 4]) +
+      ' g' + IntToStr(csGeometries[GeometryPos, 5]);
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(5, 1, 4);
+    InputPlus := TNNetVolume.Create(5, 1, 4);
+    Desired := nil;
+    try
+      NN.AddLayer(TNNetInput.Create(5, 1, 4, 1));
+      Deconv := TNNetDeconv1DLinear.Create(csGeometries[GeometryPos, 0],
+        csGeometries[GeometryPos, 1], csGeometries[GeometryPos, 2],
+        csGeometries[GeometryPos, 3], csGeometries[GeometryPos, 4],
+        csGeometries[GeometryPos, 5]);
+      NN.AddLayer(Deconv);
+      Desired := TNNetVolume.Create(Deconv.Output);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+      for ElementPos := 0 to Input.Size - 1 do
+        Input.Raw[ElementPos] := (Sin(ElementPos * 0.41) * 0.5 + 0.1) * 0.4;
+      for ElementPos := 0 to Desired.Size - 1 do
+        Desired.Raw[ElementPos] := Cos(ElementPos * 0.27) * 0.1;
+      for NeuronPos := 0 to Deconv.Neurons.Count - 1 do
+        for WeightPos := 0 to Deconv.Neurons[NeuronPos].Weights.Size - 1 do
+          Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Sin(NeuronPos * 0.7 + WeightPos * 0.3) * 0.2;
+      Deconv.FlushWeightCache();
+
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        InputPlus.Copy(Input);
+        InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + epsilon;
+        lossPlus := ComputeLoss(InputPlus);
+        InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - epsilon;
+        lossMinus := ComputeLoss(InputPlus);
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        NN.Layers[0].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        analyticalGrad := NN.Layers[0].OutputError.Raw[ElementPos];
+        AssertTrue(GeometryName + ' input gradient at ' + IntToStr(ElementPos) +
+          ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+      for NeuronPos := 0 to Deconv.Neurons.Count - 1 do
+        for WeightPos := 0 to Deconv.Neurons[NeuronPos].Weights.Size - 1 do
+        begin
+          Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] + epsilon;
+          Deconv.FlushWeightCache();
+          lossPlus := ComputeLoss(Input);
+          Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] - 2 * epsilon;
+          Deconv.FlushWeightCache();
+          lossMinus := ComputeLoss(Input);
+          Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+            Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] + epsilon;
+          Deconv.FlushWeightCache();
+          numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+          NN.Compute(Input);
+          Deconv.Neurons[NeuronPos].ClearDelta;
+          NN.Backpropagate(Desired);
+          analyticalGrad := -Deconv.Neurons[NeuronPos].Delta.Raw[WeightPos];
+          AssertTrue(GeometryName + ' weight gradient (' + IntToStr(NeuronPos) +
+            ',' + IntToStr(WeightPos) + ') num=' + FloatToStr(numericalGrad) +
+            ' ana=' + FloatToStr(analyticalGrad),
+            Abs(numericalGrad - analyticalGrad) < 0.01);
+        end;
+    finally
+      Desired.Free;
+      InputPlus.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+// --- Kokoro-82M norms and activations -------------------------------------
+// tests/fixtures/kokoro_norm_activation_oracle.json
+// (tools/kokoro_norm_activation_oracle.py) holds the kokoro package's AdaIN1d,
+// AdaLayerNorm and LayerNorm, the AdaINResBlock1 per-channel Snake and
+// F.leaky_relu at three slopes, sequences in torch's [C][L] layout.
+// Coded by Claude (AI).
+
+// Torch [C][L] (time on L) into a (L,1,C) volume.
+procedure LoadChannelByTimeVolume(Volume: TNNetVolume; Values: TJSONArray);
+var
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  MaxChannelPos := Values.Count - 1;
+  MaxTimePos := Values.Arrays[0].Count - 1;
+  Volume.ReSize(MaxTimePos + 1, 1, MaxChannelPos + 1);
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Volume[TimePos, 0, ChannelPos] := Values.Arrays[ChannelPos].Floats[TimePos];
+end;
+
+// Max |Output - Values| for a torch [C][L] array; -1 when the shapes differ.
+function ChannelByTimeMaxDiff(Output: TNNetVolume; Values: TJSONArray): TNeuralFloat;
+var
+  ChannelPos, TimePos, MaxChannelPos, MaxTimePos: integer;
+begin
+  Result := -1;
+  MaxChannelPos := Values.Count - 1;
+  MaxTimePos := Values.Arrays[0].Count - 1;
+  if (Output.SizeX <> MaxTimePos + 1) or (Output.SizeY <> 1) or
+    (Output.Depth <> MaxChannelPos + 1) then exit;
+  Result := 0;
+  for ChannelPos := 0 to MaxChannelPos do
+    for TimePos := 0 to MaxTimePos do
+      Result := Max(Result, Abs(Output[TimePos, 0, ChannelPos] -
+        Values.Arrays[ChannelPos].Floats[TimePos]));
+end;
+
+// Converts the oracle's JSON arrays and calls the library
+// WriteStyleIntoChannelAffine (neuralpretrained).
+procedure WriteStyleIntoChannelAffine(NormLayer: TNNetLayer;
+  FcWeight, FcBias, Style: TJSONArray; NormWeight: TJSONArray = nil;
+  NormBias: TJSONArray = nil);
+var
+  FcWeightVolume, FcBiasVolume, NormWeightVolume, NormBiasVolume: TNNetVolume;
+  StyleValues: TNeuralFloatDynArr;
+  RowPos, ColumnPos, MaxRowPos, MaxColumnPos: integer;
+
+  function VolumeFromArray(Values: TJSONArray): TNNetVolume;
+  var
+    ValuePos: integer;
+  begin
+    Result := TNNetVolume.Create(Values.Count, 1, 1);
+    for ValuePos := 0 to Values.Count - 1 do
+      Result.Raw[ValuePos] := Values.Floats[ValuePos];
+  end;
+
+begin
+  MaxRowPos := FcWeight.Count - 1;
+  MaxColumnPos := Style.Count - 1;
+  FcWeightVolume := TNNetVolume.Create(FcWeight.Count * Style.Count, 1, 1);
+  FcBiasVolume := VolumeFromArray(FcBias);
+  NormWeightVolume := nil;
+  NormBiasVolume := nil;
+  try
+    for RowPos := 0 to MaxRowPos do
+      for ColumnPos := 0 to MaxColumnPos do
+        FcWeightVolume.Raw[RowPos * Style.Count + ColumnPos] :=
+          FcWeight.Arrays[RowPos].Floats[ColumnPos];
+    SetLength(StyleValues, Style.Count);
+    for ColumnPos := 0 to MaxColumnPos do
+      StyleValues[ColumnPos] := Style.Floats[ColumnPos];
+    if Assigned(NormWeight) then
+    begin
+      NormWeightVolume := VolumeFromArray(NormWeight);
+      NormBiasVolume := VolumeFromArray(NormBias);
+    end;
+    neuralpretrained.WriteStyleIntoChannelAffine(NormLayer, FcWeightVolume,
+      FcBiasVolume, StyleValues, NormWeightVolume, NormBiasVolume);
+  finally
+    FcWeightVolume.Free;
+    FcBiasVolume.Free;
+    NormWeightVolume.Free;
+    NormBiasVolume.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKokoroStyleNormTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Norm: TNNetLayer;
+  Input: TNNetVolume;
+  CasePos, ChannelPos, ModePos: integer;
+  MaxDiff: TNeuralFloat;
+  Kind, CaseName: string;
+begin
+  Oracle := LoadJSONFixture('kokoro_norm_activation_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('kokoro_norm_activation_oracle.json absent; run tools/kokoro_norm_activation_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      Kind := OracleCase.Strings['kind'];
+      if (Kind <> 'adain1d') and (Kind <> 'ada_layer_norm') and
+        (Kind <> 'layer_norm') then continue;
+      // Mode 0 trainable, mode 1 inference-only.
+      for ModePos := 0 to 1 do
+      begin
+        CaseName := Kind + ' C=' + IntToStr(OracleCase.Integers['channels']) +
+          ' L=' + IntToStr(OracleCase.Integers['length']) + ' mode ' +
+          IntToStr(ModePos);
+        LoadChannelByTimeVolume(Input, OracleCase.Arrays['input']);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          if Kind = 'adain1d' then
+            Norm := NN.AddLayer(TNNetInstanceNorm.Create())
+          else
+            Norm := NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+          if ModePos = 1 then NN.SetTrainable(False, False);
+          if Kind = 'adain1d' then
+            WriteStyleIntoChannelAffine(Norm, OracleCase.Arrays['fc_weight'],
+              OracleCase.Arrays['fc_bias'], OracleCase.Arrays['style'],
+              OracleCase.Arrays['norm_weight'], OracleCase.Arrays['norm_bias'])
+          else if Kind = 'ada_layer_norm' then
+            WriteStyleIntoChannelAffine(Norm, OracleCase.Arrays['fc_weight'],
+              OracleCase.Arrays['fc_bias'], OracleCase.Arrays['style'])
+          else
+          begin
+            for ChannelPos := 0 to Input.Depth - 1 do
+            begin
+              Norm.Neurons[0].Weights.Raw[ChannelPos] :=
+                OracleCase.Arrays['gamma'].Floats[ChannelPos];
+              Norm.Neurons[1].Weights.Raw[ChannelPos] :=
+                OracleCase.Arrays['beta'].Floats[ChannelPos];
+            end;
+            Norm.FlushWeightCache();
+          end;
+          NN.Compute(Input);
+          MaxDiff := ChannelByTimeMaxDiff(NN.GetLastLayer.Output,
+            OracleCase.Arrays['output']);
+          AssertTrue(CaseName + ': output shape', MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+        finally
+          NN.Free;
+        end;
+      end;
+    end;
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+// Per-channel Snake alphas in channel order.
+procedure WriteSnakeAlphas(Snake: TNNetLayer; Alphas: TJSONArray);
+var
+  ChannelPos: integer;
+begin
+  for ChannelPos := 0 to Alphas.Count - 1 do
+    Snake.Neurons[0].Weights.Raw[ChannelPos] := Alphas.Floats[ChannelPos];
+  Snake.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestKokoroActivationTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Activation: TNNetLayer;
+  Input: TNNetVolume;
+  CasePos, ModePos, CheckedCount: integer;
+  MaxDiff: TNeuralFloat;
+  Kind, CaseName: string;
+begin
+  Oracle := LoadJSONFixture('kokoro_norm_activation_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('kokoro_norm_activation_oracle.json absent; run tools/kokoro_norm_activation_oracle.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  CheckedCount := 0;
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      Kind := OracleCase.Strings['kind'];
+      if (Kind <> 'snake') and (Kind <> 'leaky_relu') then continue;
+      // Mode 0: trainable (scalar loop with the derivative). Mode 1: inference
+      // (the per-channel Snake's vectorized row path).
+      for ModePos := 0 to 1 do
+      begin
+        CaseName := Kind + ' mode ' + IntToStr(ModePos);
+        if Kind = 'leaky_relu' then
+          CaseName := CaseName + ' slope ' + FloatToStr(OracleCase.Floats['slope']);
+        LoadChannelByTimeVolume(Input, OracleCase.Arrays['input']);
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+          if Kind = 'snake' then
+            Activation := NN.AddLayer(TNNetSnake.Create(1.0, true))
+          else
+            Activation := NN.AddLayer(TNNetLeakyReLU.Create(
+              OracleCase.Floats['slope']));
+          if ModePos = 1 then NN.SetTrainable(False, False);
+          if Kind = 'snake' then
+            WriteSnakeAlphas(Activation, OracleCase.Arrays['alpha']);
+          NN.Compute(Input);
+          MaxDiff := ChannelByTimeMaxDiff(NN.GetLastLayer.Output,
+            OracleCase.Arrays['output']);
+          AssertTrue(CaseName + ': output shape', MaxDiff >= 0);
+          AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+            MaxDiff < 1e-4);
+          Inc(CheckedCount);
+        finally
+          NN.Free;
+        end;
+      end;
+    end;
+    AssertEquals('snake + 3 leaky_relu slopes, two modes each', 8, CheckedCount);
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
+// Input -> InstanceNorm (AdaIN1d) -> LeakyReLU 0.2 -> per-channel Snake ->
+// MulByConstant 1/sqrt(2) -> TokenLayerNorm (AdaLayerNorm). Coded by Claude (AI).
+procedure AddKokoroNormActivationChain(NN: TNNet; SeqLen, Channels: integer);
+begin
+  NN.AddLayer(TNNetInput.Create(SeqLen, 1, Channels, 1));
+  NN.AddLayer(TNNetInstanceNorm.Create());
+  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+  NN.AddLayer(TNNetSnake.Create(1.0, true));
+  NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
+  NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+end;
+
+// Per-utterance style A (StylePos 0) or B (1) on the chain's two norms, and
+// fixed per-channel Snake alphas.
+procedure WriteKokoroChainStyle(NN: TNNet; FirstNormPos, StylePos: integer);
+var
+  ChannelPos, Channels: integer;
+  Phase: TNeuralFloat;
+begin
+  Channels := NN.Layers[FirstNormPos].Output.Depth;
+  Phase := 1.3 * StylePos;
+  for ChannelPos := 0 to Channels - 1 do
+  begin
+    NN.Layers[FirstNormPos].Neurons[0].Weights.Raw[ChannelPos] :=
+      1 + 0.4 * Sin(ChannelPos * 0.9 + Phase);
+    NN.Layers[FirstNormPos].Neurons[1].Weights.Raw[ChannelPos] :=
+      0.3 * Cos(ChannelPos * 0.5 + Phase);
+    NN.Layers[FirstNormPos + 2].Neurons[0].Weights.Raw[ChannelPos] :=
+      0.3 + 0.25 * ChannelPos;
+    NN.Layers[FirstNormPos + 4].Neurons[0].Weights.Raw[ChannelPos] :=
+      0.8 + 0.3 * Sin(ChannelPos * 0.7 - Phase);
+    NN.Layers[FirstNormPos + 4].Neurons[1].Weights.Raw[ChannelPos] :=
+      0.2 * Sin(ChannelPos * 1.1 + Phase);
+  end;
+  NN.Layers[FirstNormPos].FlushWeightCache();
+  NN.Layers[FirstNormPos + 2].FlushWeightCache();
+  NN.Layers[FirstNormPos + 4].FlushWeightCache();
+end;
+
+procedure FillKokoroChainInput(Input: TNNetVolume);
+var
+  ElementPos: integer;
+begin
+  for ElementPos := 0 to Input.Size - 1 do
+    Input.Raw[ElementPos] := 1.5 * Sin(ElementPos * 0.37) + 0.2 * Cos(ElementPos * 1.7);
+end;
+
+procedure TTestNeuralNumerical.TestKokoroLayersOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csKokoroSentinel = 12345.0;
+  csSeqLen = 37;
+  csChannels = 6;
+var
+  NN: TNNet;
+  Source: TNNetLayer;
+  Input, OutCPUStyleA, OutCPUStyleB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, NeuronPos, ElementPos: integer;
+  DiffA, DiffB: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  Input := TNNetVolume.Create(csSeqLen, 1, csChannels);
+  OutCPUStyleA := TNNetVolume.Create();
+  OutCPUStyleB := TNNetVolume.Create();
+  NN := TNNet.Create();
+  try
+    // An identity pointwise convolution leaves the chain's input in OpenCL
+    // memory, so every layer below can bind its source.
+    NN.AddLayer(TNNetInput.Create(csSeqLen, 1, csChannels, 1));
+    Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(csChannels));
+    NN.AddLayer(TNNetInstanceNorm.Create());
+    NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+    NN.AddLayer(TNNetSnake.Create(1.0, true));
+    NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
+    NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+    NN.SetTrainable(False, False);
+    for NeuronPos := 0 to Source.Neurons.Count - 1 do
+    begin
+      Source.Neurons[NeuronPos].Weights.Fill(0);
+      Source.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+      Source.Neurons[NeuronPos].BiasWeight := 0;
+    end;
+    Source.FlushWeightCache();
+    FillKokoroChainInput(Input);
+    WriteKokoroChainStyle(NN, 2, 1);
+    NN.Compute(Input);
+    OutCPUStyleB.Copy(NN.GetLastLayer.Output);
+    WriteKokoroChainStyle(NN, 2, 0);
+    NN.Compute(Input);
+    OutCPUStyleA.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Every chain layer binds its source in OpenCL memory: the host copies
+      // keep the sentinel and the result still matches.
+      for LayerPos := 1 to NN.GetLastLayerIdx() - 1 do
+        NN.Layers[LayerPos].Output.Fill(csKokoroSentinel);
+      NN.Compute(Input);
+      for LayerPos := 2 to NN.GetLastLayerIdx() do
+        AssertTrue(NN.Layers[LayerPos].ClassName + ' ran in OpenCL',
+          NN.Layers[LayerPos].ForwardGPUCnt >= 2);
+      for LayerPos := 1 to NN.GetLastLayerIdx() - 1 do
+        AssertEquals(NN.Layers[LayerPos].ClassName +
+          ': host output not downloaded', csKokoroSentinel,
+          NN.Layers[LayerPos].Output.Raw[0], 0);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      DiffA := 0;
+      for ElementPos := 0 to OutCPUStyleA.Size - 1 do
+        DiffA := Max(DiffA, Abs(OutCPUStyleA.Raw[ElementPos] -
+          NN.GetLastLayer.Output.Raw[ElementPos]));
+      // The next utterance: the host rewrites the per-channel style.
+      WriteKokoroChainStyle(NN, 2, 1);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      DiffB := 0;
+      for ElementPos := 0 to OutCPUStyleB.Size - 1 do
+        DiffB := Max(DiffB, Abs(OutCPUStyleB.Raw[ElementPos] -
+          NN.GetLastLayer.Output.Raw[ElementPos]));
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertTrue('style A: OpenCL vs CPU max |diff| = ' + FloatToStr(DiffA),
+      DiffA < 1e-4);
+    AssertTrue('style B after the host rewrite: OpenCL vs CPU max |diff| = ' +
+      FloatToStr(DiffB), DiffB < 1e-4);
+  finally
+    NN.Free;
+    OutCPUStyleB.Free;
+    OutCPUStyleA.Free;
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSnakePerChannelSaveLoadRoundTrip;
+var
+  NN, NNLoaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ElementPos: integer;
+begin
+  NN := TNNet.Create();
+  NNLoaded := TNNet.Create();
+  Input := TNNetVolume.Create(11, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(11, 1, 4));
+    NN.AddLayer(TNNetSnake.Create(0.7, true));
+    NN.AddLayer(TNNetSnake.Create(1.5));
+    NN.AddLayer(TNNetMulByConstant.Create(1 / 3));
+    for ElementPos := 0 to 3 do
+      NN.Layers[1].Neurons[0].Weights.Raw[ElementPos] := 0.4 + 0.5 * ElementPos;
+    NN.Layers[1].FlushWeightCache();
+    FillKokoroChainInput(Input);
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NNLoaded.LoadFromString(Saved);
+    AssertEquals('structure round-trip', NN.SaveStructureToString(),
+      NNLoaded.SaveStructureToString());
+    AssertEquals('full round-trip', Saved, NNLoaded.SaveToString());
+    AssertTrue('per-channel alpha reloaded',
+      TNNetSnake(NNLoaded.Layers[1]).PerChannelAlpha);
+    AssertFalse('scalar alpha reloaded',
+      TNNetSnake(NNLoaded.Layers[2]).PerChannelAlpha);
+    AssertEquals('scalar Snake keeps its file format',
+      'TNNetSnake:0;0;0;0;0;0;0;0::1.5;0;0;0;0;0;0;0',
+      NNLoaded.Layers[2].SaveStructureToString());
+    NNLoaded.Compute(Input);
+    for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('reloaded output ' + IntToStr(ElementPos),
+        NN.GetLastLayer.Output.Raw[ElementPos],
+        NNLoaded.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    NNLoaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKokoroLayersBorrowingBuild;
+var
+  Owner, Borrower, Copied: TNNet;
+  Input: TNNetVolume;
+  LayerPos, ElementPos: integer;
+begin
+  Owner := TNNet.Create();
+  Borrower := TNNet.Create();
+  Copied := TNNet.Create();
+  Input := TNNetVolume.Create(29, 1, 5);
+  try
+    AddKokoroNormActivationChain(Owner, 8, 5);
+    Owner.SetTrainable(False, False);
+    WriteKokoroChainStyle(Owner, 1, 0);
+    Borrower.BuildWeightOwner := Owner;
+    AddKokoroNormActivationChain(Borrower, 29, 5);
+    Borrower.BuildWeightOwner := nil;
+    Borrower.SetTrainable(False, False);
+    for LayerPos := 1 to Borrower.CountLayers() - 1 do
+      if Owner.Layers[LayerPos].Neurons.Count > 0 then
+        AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the owner''s neurons',
+          Borrower.Layers[LayerPos].Neurons[0] = Owner.Layers[LayerPos].Neurons[0]);
+    // The per-utterance style write goes through the borrowing net's layers.
+    WriteKokoroChainStyle(Borrower, 1, 1);
+    AddKokoroNormActivationChain(Copied, 29, 5);
+    Copied.CopyWeights(Owner);
+    FillKokoroChainInput(Input);
+    Borrower.Compute(Input);
+    Copied.Compute(Input);
+    for ElementPos := 0 to Copied.GetLastLayer.Output.Size - 1 do
+      AssertEquals('borrowed vs copied output ' + IntToStr(ElementPos),
+        Copied.GetLastLayer.Output.Raw[ElementPos],
+        Borrower.GetLastLayer.Output.Raw[ElementPos], 1e-6);
+  finally
+    Input.Free;
+    Copied.Free;
+    Borrower.Free;
+    Owner.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSnakePerChannelGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Snake: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  ElementPos, ChannelPos: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  epsilon := 0.001;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 1, 3);
+  InputPlus := TNNetVolume.Create(9, 1, 3);
+  Desired := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(9, 1, 3, 1));
+    Snake := NN.AddLayer(TNNetSnake.Create(1.0, true));
+    Desired := TNNetVolume.Create(Snake.Output);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for ChannelPos := 0 to 2 do
+      Snake.Neurons[0].Weights.Raw[ChannelPos] := 0.5 + 0.6 * ChannelPos;
+    Snake.FlushWeightCache();
+    for ElementPos := 0 to Input.Size - 1 do
+      Input.Raw[ElementPos] := Sin(ElementPos * 0.41) * 1.2 + 0.1;
+    for ElementPos := 0 to Desired.Size - 1 do
+      Desired.Raw[ElementPos] := Cos(ElementPos * 0.27) * 0.5;
+
+    for ElementPos := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[ElementPos];
+      AssertTrue('Snake input gradient at ' + IntToStr(ElementPos) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    for ChannelPos := 0 to 2 do
+    begin
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      Snake.Neurons[0].Weights.Raw[ChannelPos] :=
+        Snake.Neurons[0].Weights.Raw[ChannelPos] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      Snake.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -Snake.Neurons[0].Delta.Raw[ChannelPos];
+      AssertTrue('Snake alpha gradient (' + IntToStr(ChannelPos) + ') num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    Desired.Free;
+    InputPlus.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
 // Independent scalar reference for the TNNetDeformableConv bilinear gather. The
 // production forward now blends the four corner columns through the shared AVX
 // helper NeuralBilinearGatherColumn; this confirms forward output AND the
@@ -66567,11 +68403,11 @@ begin
     OutB := TNNetVolume.Create();
     try
       TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
-      // TNNetMulByConstant has no OpenCL path, so the multiplier is only ever
-      // in RAM. A test that needs a host-only layer must not pick one that has
-      // a cai_activation opcode.
+      // THostOnlyMulByConstant has no OpenCL path, so the multiplier is only
+      // ever in RAM. A test that needs a host-only layer must not pick one that
+      // has a cai_activation opcode.
       RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-      Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
+      Multiplier := NN.AddLayerAfter(THostOnlyMulByConstant.Create(1.5), RowInput);
       Source := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth, 1),
         TokenInput);
       MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
@@ -66636,9 +68472,9 @@ begin
   try
     TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
     RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
-    // TNNetMulByConstant has no OpenCL path: both sources stay host-only.
-    Multiplier := NN.AddLayerAfter(TNNetMulByConstant.Create(1.5), RowInput);
-    Source := NN.AddLayerAfter(TNNetMulByConstant.Create(0.5), TokenInput);
+    // THostOnlyMulByConstant has no OpenCL path: both sources stay host-only.
+    Multiplier := NN.AddLayerAfter(THostOnlyMulByConstant.Create(1.5), RowInput);
+    Source := NN.AddLayerAfter(THostOnlyMulByConstant.Create(0.5), TokenInput);
     MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
     NN.AddLayer(MulLayer);
     NN.SetTrainable(False, False);
@@ -68276,12 +70112,13 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..30] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..33] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
-    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant');
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant',
+    'MulByConstant', 'Snake', 'Snake per channel');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -68324,7 +70161,10 @@ var
       27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
       28: Result := TNNetReLU6.Create();
       29: Result := TNNetBentIdentity.Create();
-    else Result := TNNetAddConstant.Create(-0.375);
+      30: Result := TNNetAddConstant.Create(-0.375);
+      31: Result := TNNetMulByConstant.Create(-0.75);
+      32: Result := TNNetSnake.Create(0.8);
+    else Result := TNNetSnake.Create(1.7, true);
     end;
   end;
 
@@ -71342,6 +73182,272 @@ begin
   MaxElementPos := A.Size - 1;
   for ElementPos := 0 to MaxElementPos do
     Result := Max(Result, Abs(A.Raw[ElementPos] - B.Raw[ElementPos]));
+end;
+
+// tests/fixtures/stft_harmonic_source_oracle.json
+// (tools/stft_harmonic_source_oracle.py): torch.stft cases [bins][frames] and
+// one zero-noise SourceModuleHnNSF case.
+procedure TTestNeuralNumerical.TestForwardSTFTTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases: TJSONArray;
+  STFT: TNNetForwardSTFT;
+  Wave, Re, Im, MagnitudePhase: TNNetVolume;
+  CasePos, SamplePos, FramePos, BinPos, FrameCount, BinCount: integer;
+  RefRe, RefIm, RefMag, RefPhase, MaxRefMag, MaxComplexDiff, MaxMagDiff,
+    MaxPhaseDiff, PhaseDiff: double;
+  CaseName: string;
+begin
+  Oracle := LoadJSONFixture('stft_harmonic_source_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('stft_harmonic_source_oracle.json absent; run ' +
+      'tools/stft_harmonic_source_oracle.py');
+    exit;
+  end;
+  Wave := TNNetVolume.Create();
+  Re := TNNetVolume.Create();
+  Im := TNNetVolume.Create();
+  MagnitudePhase := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['stft_cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      CaseName := OracleCase.Strings['name'];
+      Wave.ReSize(OracleCase.Integers['length'], 1, 1);
+      for SamplePos := 0 to Wave.Size - 1 do
+        Wave.FData[SamplePos] := OracleCase.Arrays['input'].Floats[SamplePos];
+      STFT := TNNetForwardSTFT.Create(OracleCase.Integers['n_fft'],
+        OracleCase.Integers['hop']);
+      try
+        STFT.Transform(Wave, Re, Im);
+        STFT.TransformToMagnitudePhase(Wave, MagnitudePhase);
+        BinCount := OracleCase.Arrays['re'].Count;
+        FrameCount := OracleCase.Arrays['re'].Arrays[0].Count;
+        AssertEquals(CaseName + ': bins', BinCount, STFT.BinCount);
+        AssertEquals(CaseName + ': frames', FrameCount, Re.SizeX);
+        AssertEquals(CaseName + ': FrameCount', FrameCount,
+          STFT.FrameCount(Wave.Size));
+        AssertEquals(CaseName + ': magnitude/phase depth', 2 * BinCount,
+          MagnitudePhase.Depth);
+        MaxRefMag := 0;
+        for BinPos := 0 to BinCount - 1 do
+          for FramePos := 0 to FrameCount - 1 do
+            MaxRefMag := Max(MaxRefMag, OracleCase.Arrays['magnitude'].
+              Arrays[BinPos].Floats[FramePos]);
+        MaxComplexDiff := 0;
+        MaxMagDiff := 0;
+        MaxPhaseDiff := 0;
+        for BinPos := 0 to BinCount - 1 do
+          for FramePos := 0 to FrameCount - 1 do
+          begin
+            RefRe := OracleCase.Arrays['re'].Arrays[BinPos].Floats[FramePos];
+            RefIm := OracleCase.Arrays['im'].Arrays[BinPos].Floats[FramePos];
+            RefMag := OracleCase.Arrays['magnitude'].Arrays[BinPos].
+              Floats[FramePos];
+            RefPhase := OracleCase.Arrays['phase'].Arrays[BinPos].
+              Floats[FramePos];
+            MaxComplexDiff := Max(MaxComplexDiff,
+              Max(Abs(Re[FramePos, 0, BinPos] - RefRe),
+              Abs(Im[FramePos, 0, BinPos] - RefIm)));
+            MaxMagDiff := Max(MaxMagDiff,
+              Abs(MagnitudePhase[FramePos, 0, BinPos] - RefMag));
+            // Phase only where the bin is not rounding noise; wrapped.
+            if RefMag > 1e-4 * MaxRefMag then
+            begin
+              PhaseDiff := Abs(MagnitudePhase[FramePos, 0, BinCount + BinPos] -
+                RefPhase);
+              if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
+              MaxPhaseDiff := Max(MaxPhaseDiff, PhaseDiff);
+            end;
+          end;
+        AssertTrue(CaseName + ': Re/Im max |diff| = ' +
+          FloatToStr(MaxComplexDiff), MaxComplexDiff < 1e-5 * MaxRefMag);
+        AssertTrue(CaseName + ': magnitude max |diff| = ' +
+          FloatToStr(MaxMagDiff), MaxMagDiff < 1e-5 * MaxRefMag);
+        AssertTrue(CaseName + ': wrapped phase max |diff| = ' +
+          FloatToStr(MaxPhaseDiff), MaxPhaseDiff < 1e-3);
+      finally
+        STFT.Free;
+      end;
+    end;
+  finally
+    MagnitudePhase.Free;
+    Im.Free;
+    Re.Free;
+    Wave.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForwardSTFTCosinePeakBins;
+const
+  CosineAmplitude = 0.5;
+  CosineBin = 3;
+  NFFT = 20;
+var
+  STFT: TNNetForwardSTFT;
+  Wave, Re, Im: TNNetVolume;
+  SamplePos, FramePos, BinPos: integer;
+  Expected, Actual: double;
+begin
+  STFT := TNNetForwardSTFT.Create(NFFT, 5);
+  Wave := TNNetVolume.Create(200, 1, 1);
+  Re := TNNetVolume.Create();
+  Im := TNNetVolume.Create();
+  try
+    for SamplePos := 0 to Wave.Size - 1 do
+      Wave.FData[SamplePos] := CosineAmplitude *
+        Cos(2 * Pi * CosineBin * SamplePos / NFFT + 0.3);
+    STFT.Transform(Wave, Re, Im);
+    AssertEquals('frames', 41, Re.SizeX);
+    AssertEquals('bins', 11, Re.Depth);
+    // Interior frames only: the edge frames see the reflect pad.
+    for FramePos := 2 to Re.SizeX - 3 do
+      for BinPos := 0 to Re.Depth - 1 do
+      begin
+        Actual := Sqrt(Sqr(Re[FramePos, 0, BinPos]) +
+          Sqr(Im[FramePos, 0, BinPos]));
+        if BinPos = CosineBin then Expected := CosineAmplitude * NFFT / 4
+        else if Abs(BinPos - CosineBin) = 1 then
+          Expected := CosineAmplitude * NFFT / 8
+        else Expected := 0;
+        AssertEquals('frame ' + IntToStr(FramePos) + ' bin ' + IntToStr(BinPos),
+          Expected, Actual, 1e-5);
+      end;
+    // DC and Nyquist bins carry an exact +0 imaginary part.
+    for FramePos := 0 to Re.SizeX - 1 do
+    begin
+      AssertTrue('Im DC', Im[FramePos, 0, 0] = 0);
+      AssertTrue('Im Nyquist', Im[FramePos, 0, Re.Depth - 1] = 0);
+    end;
+  finally
+    Im.Free;
+    Re.Free;
+    Wave.Free;
+    STFT.Free;
+  end;
+end;
+
+// A TNNetHarmonicSource for the oracle's harmonic_source case.
+function CreateHarmonicSourceFromOracle(OracleCase: TJSONObject;
+  F0Frames: TNNetVolume): TNNetHarmonicSource;
+var
+  MergeWeights: TNeuralFloatDynArr;
+  HarmonicPos, FramePos: integer;
+begin
+  Result := TNNetHarmonicSource.Create(OracleCase.Integers['sample_rate'],
+    OracleCase.Integers['upsample_scale'],
+    OracleCase.Integers['harmonic_count'], OracleCase.Floats['sine_amp'],
+    OracleCase.Floats['noise_std'], OracleCase.Floats['voiced_threshold']);
+  SetLength(MergeWeights, Result.HarmonicCount);
+  for HarmonicPos := 0 to High(MergeWeights) do
+    MergeWeights[HarmonicPos] :=
+      OracleCase.Arrays['merge_weights'].Floats[HarmonicPos];
+  Result.SetMergeWeights(MergeWeights, OracleCase.Floats['merge_bias']);
+  F0Frames.ReSize(OracleCase.Arrays['f0'].Count, 1, 1);
+  for FramePos := 0 to F0Frames.Size - 1 do
+    F0Frames.FData[FramePos] := OracleCase.Arrays['f0'].Floats[FramePos];
+end;
+
+procedure TTestNeuralNumerical.TestHarmonicSourceTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Source: TNNetHarmonicSource;
+  F0Frames, F0Upsampled, Voicing, HarmonicWave: TNNetVolume;
+  SamplePos: integer;
+  MaxDiff: double;
+begin
+  Oracle := LoadJSONFixture('stft_harmonic_source_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('stft_harmonic_source_oracle.json absent; run ' +
+      'tools/stft_harmonic_source_oracle.py');
+    exit;
+  end;
+  F0Frames := TNNetVolume.Create();
+  F0Upsampled := TNNetVolume.Create();
+  Voicing := TNNetVolume.Create();
+  HarmonicWave := TNNetVolume.Create();
+  OracleCase := Oracle.Objects['harmonic_source'];
+  Source := CreateHarmonicSourceFromOracle(OracleCase, F0Frames);
+  try
+    Source.ComputeUpsampledF0AndVoicing(F0Frames, F0Upsampled, Voicing);
+    Source.Compute(F0Frames, HarmonicWave);
+    AssertEquals('samples', OracleCase.Arrays['har_source'].Count,
+      HarmonicWave.Size);
+    AssertEquals('samples (SampleCount)', HarmonicWave.Size,
+      Source.SampleCount(F0Frames.Size));
+    MaxDiff := 0;
+    for SamplePos := 0 to HarmonicWave.Size - 1 do
+    begin
+      AssertTrue('f0 upsampled ' + IntToStr(SamplePos),
+        F0Upsampled.FData[SamplePos] =
+        OracleCase.Arrays['f0_upsampled'].Floats[SamplePos]);
+      AssertTrue('uv ' + IntToStr(SamplePos), Voicing.FData[SamplePos] =
+        OracleCase.Arrays['uv'].Floats[SamplePos]);
+      MaxDiff := Max(MaxDiff, Abs(HarmonicWave.FData[SamplePos] -
+        OracleCase.Arrays['har_source'].Floats[SamplePos]));
+    end;
+    AssertTrue('har_source max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-6);
+  finally
+    Source.Free;
+    HarmonicWave.Free;
+    Voicing.Free;
+    F0Upsampled.Free;
+    F0Frames.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHarmonicSourceRandomNoise;
+var
+  Source: TNNetHarmonicSource;
+  F0Frames, ZeroNoise, FirstRun, SecondRun, RepeatedRun: TNNetVolume;
+  FramePos: integer;
+  SavedRandSeed: cardinal;
+begin
+  Source := TNNetHarmonicSource.Create(240, 6, 3, 0.1, 0.003, 10);
+  F0Frames := TNNetVolume.Create(8, 1, 1);
+  ZeroNoise := TNNetVolume.Create();
+  FirstRun := TNNetVolume.Create();
+  SecondRun := TNNetVolume.Create();
+  RepeatedRun := TNNetVolume.Create();
+  try
+    Source.SetMergeWeights([0.5, -0.2, 0.3], 0.01);
+    for FramePos := 0 to F0Frames.Size - 1 do
+      F0Frames.FData[FramePos] := 20 * FramePos;
+    Source.Compute(F0Frames, ZeroNoise);
+    SavedRandSeed := RandSeed;
+    Source.RandomNoise := true;
+    Source.NoiseSeed := 1234;
+    Source.Compute(F0Frames, FirstRun);
+    AssertEquals('global RandSeed restored', SavedRandSeed, RandSeed);
+    AssertTrue('the seed advanced', Source.NoiseSeed <> 1234);
+    Source.Compute(F0Frames, SecondRun);
+    Source.NoiseSeed := 1234;
+    Source.Compute(F0Frames, RepeatedRun);
+    AssertEquals('same seed, same noise', 0,
+      MaxAbsDiffOfVolumes(FirstRun, RepeatedRun), 0);
+    AssertTrue('the next call draws new noise',
+      MaxAbsDiffOfVolumes(FirstRun, SecondRun) > 0);
+    AssertTrue('noise changes the excitation',
+      MaxAbsDiffOfVolumes(FirstRun, ZeroNoise) > 1e-4);
+    AssertTrue('noise stays small',
+      MaxAbsDiffOfVolumes(FirstRun, ZeroNoise) < 0.2);
+    Source.RandomNoise := false;
+    Source.Compute(F0Frames, SecondRun);
+    AssertEquals('zero noise is repeatable', 0,
+      MaxAbsDiffOfVolumes(ZeroNoise, SecondRun), 0);
+  finally
+    RepeatedRun.Free;
+    SecondRun.Free;
+    FirstRun.Free;
+    ZeroNoise.Free;
+    F0Frames.Free;
+    Source.Free;
+  end;
 end;
 
 // The liveness sharing tests' graph: long skip, reshape aliases, a split read
@@ -74943,7 +77049,7 @@ begin
         Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
         Relu := NN.AddLayer(TNNetReLU.Create());
         if ConsumerPos = 0
-          then Consumer := NN.AddLayer(TNNetMulByConstant.Create(2))
+          then Consumer := NN.AddLayer(THostOnlyMulByConstant.Create(2))
           else Consumer := NN.AddLayer(TStaleReadTestLayer.Create());
         NN.SetTrainable(False, False);
         NN.EnableOpenCL(PlatformId, DeviceId);
@@ -75033,7 +77139,7 @@ begin
       NN.AddLayer(TNNetInput.Create(3, 1, 100));
       ProjA := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
       ProjB := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
-      NN.AddLayer(TNNetMulByConstant.Create(2));
+      NN.AddLayer(THostOnlyMulByConstant.Create(2));
       Sum := NN.AddLayer(TNNetSum.Create([ProjA, ProjB]));
       Proj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(6), 0);
       SecondInput := NN.AddLayer(TNNetInput.Create(3, 1, 6));
@@ -75060,7 +77166,7 @@ begin
     NN := TNNet.Create();
     try
       NN.AddLayer(TNNetInput.Create(3, 1, 100));
-      Mul := NN.AddLayer(TNNetMulByConstant.Create(2));
+      Mul := NN.AddLayer(THostOnlyMulByConstant.Create(2));
       Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
       NN.SetTrainable(False, False);
       NN.EnableOpenCL(PlatformId, DeviceId);
@@ -76763,12 +78869,12 @@ var
       // OpenCL memory only, so the per-head split runs there too.
       NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
       NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
-      if HostSource then NNCpu.AddLayer(TNNetMulByConstant.Create(1));
+      if HostSource then NNCpu.AddLayer(THostOnlyMulByConstant.Create(1));
       NNCpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
       NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
       NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
       // A host-only layer: the split then runs on the host too.
-      if HostSource then NNGpu.AddLayer(TNNetMulByConstant.Create(1));
+      if HostSource then NNGpu.AddLayer(THostOnlyMulByConstant.Create(1));
       NNGpu.AddMultiHeadSelfAttention(Heads, Causal, false, avSDPA, 1, Window);
       NNGpu.CopyWeights(NNCpu);
       NNCpu.SetTrainable(False, False);
@@ -77665,8 +79771,8 @@ begin
   OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(4, 1, 300));
-    // TNNetMulByConstant has no OpenCL path, so its output is in RAM only.
-    HostSource := NN.AddLayer(TNNetMulByConstant.Create(0.25));
+    // THostOnlyMulByConstant has no OpenCL path, so its output is in RAM only.
+    HostSource := NN.AddLayer(THostOnlyMulByConstant.Create(0.25));
     Norm := NN.AddLayer(TNNetTokenLayerNorm.Create());
     NN.SetTrainable(False, False);
     for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.6 * Sin(Pos * 0.29);
