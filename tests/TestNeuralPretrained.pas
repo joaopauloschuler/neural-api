@@ -515,6 +515,7 @@ type
     procedure TestEmbeddingGemma2ConfigFromJSONFile;
     procedure TestEmbeddingGemma2HiddenStateParity;
     procedure TestEmbeddingGemma2SentenceEmbedding;
+    procedure TestEmbeddingGemma2WeightOwnerTwin;
     procedure TestDebertaV2ConfigFromJSONFile;
     procedure TestDebertaV2HiddenStateParity;
     procedure TestDebertaV2SeqClassificationParity;
@@ -16171,6 +16172,50 @@ begin
       FixturePath('tiny_embeddinggemma2_logits.json'), 12, 6);
   finally
     NN.Free;
+  end;
+end;
+
+// pWeightOwner: a twin built at another SeqLen borrows every weight from an
+// owner net (no loads) and must reproduce the fixture; a twin whose graph
+// differs (here SeqLen 3 <= sliding_window + 1: windowless sliding layers,
+// vs the owner's windowed ones) must be refused.
+procedure TTestNeuralPretrained.TestEmbeddingGemma2WeightOwnerTwin;
+var
+  Owner, Twin: TNNet;
+  Config, TwinConfig: TEmbeddingGemma2Config;
+  Raised: boolean;
+begin
+  Owner := BuildEmbeddingGemma2FromSafeTensorsEx(
+    FixturePath('tiny_embeddinggemma2.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_embeddinggemma2_config.json'));
+  try
+    TwinConfig := Config;
+    Twin := BuildEmbeddingGemma2FromSafeTensorsWithConfig(
+      FixturePath('tiny_embeddinggemma2.safetensors'), TwinConfig,
+      {SeqLen=}12, {pTrainable=}false, {pQuantizeInt8=}false, Owner);
+    try
+      AssertEquals('twin layer count', Owner.CountLayers(),
+        Twin.CountLayers());
+      AssertLogitParityWithFixture(Twin,
+        FixturePath('tiny_embeddinggemma2_logits.json'), 12, 6);
+    finally
+      Twin.Free;
+    end;
+    Raised := false;
+    TwinConfig := Config;
+    try
+      Twin := BuildEmbeddingGemma2FromSafeTensorsWithConfig(
+        FixturePath('tiny_embeddinggemma2.safetensors'), TwinConfig,
+        {SeqLen=}3, {pTrainable=}false, {pQuantizeInt8=}false, Owner);
+      Twin.Free;
+    except
+      // EPretrainedImportError from the builder, or the per-layer link
+      // refusing a class/shape mismatch.
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('graph-mismatched twin must raise', Raised);
+  finally
+    Owner.Free;
   end;
 end;
 

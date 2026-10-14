@@ -7257,16 +7257,25 @@ function EmbeddingGemma2ConfigToString(
 // skipped; an unexpected tensor INSIDE it is rejected.
 // The encoder carries NO attention padding mask: for exact parity build the
 // net with pSeqLen = the token count (pads would be attended to).
+// pWeightOwner (a net this builder produced from the same checkpoint, its
+// weight state final): the graph is built at pSeqLen with every
+// weight-bearing layer linked to the owner's layer at the same index
+// (TNNet.BuildWeightOwner) - no weight is loaded, so one loaded net serves
+// any number of cheap per-length (or per-thread) twins. Owner and twin must
+// have the same graph: both SeqLen <= sliding_window + 1 (the windowless
+// sliding layers) or both above it; a mismatch raises.
 function BuildEmbeddingGemma2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildEmbeddingGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildEmbeddingGemma2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -57211,7 +57220,8 @@ type
 
 function BuildEmbeddingGemma2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 const
   csPrefixes: array[0..3] of string =
     ('language_model.', 'model.language_model.', 'model.', '');
@@ -57234,10 +57244,26 @@ var
   BlockPrefix, TensorNameStr: string;
   Tmp: TNNetVolume;
   Consumed: TStringList;
+  BorrowWeights: boolean;   // pWeightOwner given: graph only, no loads
+  QuantizeSweeps: boolean;  // pQuantizeInt8 and not BorrowWeights
+  OwnerWeightLayers: integer;
 
   procedure MarkConsumed(const TName: string);
   begin
     Consumed.Add(TName);
+  end;
+
+  // The owner's layer at the index the next AddLayer will take (nil when
+  // not borrowing): TNNetEmbedding sizes its table in its constructor.
+  function OwnerLayerForNextIndex(): TNNetLayer;
+  begin
+    if not BorrowWeights then exit(nil);
+    if NN.CountLayers() >= pWeightOwner.CountLayers() then
+      ImportError('EmbeddingGemma2 import: the borrowing twin needs a ' +
+        'layer at index ' + IntToStr(NN.CountLayers()) + ' but the owner ' +
+        'net has only ' + IntToStr(pWeightOwner.CountLayers()) +
+        ' layers (graph mismatch).');
+    Result := pWeightOwner.Layers[NN.CountLayers()];
   end;
 
   procedure CheckShape(const TName: string; Dim0, Dim1: integer);
@@ -57254,6 +57280,12 @@ var
   end;
 
 begin
+  BorrowWeights := Assigned(pWeightOwner);
+  QuantizeSweeps := pQuantizeInt8 and (not BorrowWeights);
+  if BorrowWeights and not Assigned(pWeightOwner.GetFirstLayer()) then
+    ImportError('EmbeddingGemma2 import: the weight owner net is empty.');
+  // A borrowing build still opens the checkpoint: the prefix and the
+  // layer_scalar constants come from it (header + one-element reads).
   Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Tmp := TNNetVolume.Create;
@@ -57312,12 +57344,15 @@ begin
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
-      NN.BuildQuantInt8 := pQuantizeInt8;
+      NN.BuildQuantInt8 := QuantizeSweeps;
+      // Borrowing build: every layer links to the owner's at its index.
+      NN.BuildWeightOwner := pWeightOwner;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: id 0 is <pad>, a real row of the table.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
-        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        {ScaleEmbedding=}0.02, pTrainable, QuantizeSweeps,
+        OwnerLayerForNextIndex()
         ).SetTrainable(pTrainable) );
       // PLE: one projection of the (scaled) embeddings into all layers'
       // slices, then a per-slice RMSNorm (TNNetHeadRMSNorm over PLE-wide
@@ -57331,7 +57366,7 @@ begin
       // The residual stream continues from the embeddings.
       NN.AddLayerAfter( TNNetIdentity.Create(), EmbeddingLayer );
       if not pTrainable then NN.SetTrainable();
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       for BlockCnt := 0 to NumLayersM1 do
@@ -57455,7 +57490,7 @@ begin
         if LayerScalars[BlockCnt] <> 1 then
           NN.AddLayer( TNNetMulByConstant.Create(LayerScalars[BlockCnt]) );
         if not pTrainable then NN.SetTrainable();
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
         TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
@@ -57463,7 +57498,31 @@ begin
       EmbeddingProjection := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.EmbeddingDim).SetTrainable(pTrainable) );
       if not pTrainable then NN.SetTrainable();
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
+
+      if BorrowWeights then
+      begin
+        // ---------------- Borrowed weights ----------------
+        // Every layer linked as it was attached; check the graph matched
+        // (a shorter twin, or a weight layer left unlinked).
+        NN.BuildWeightOwner := nil;
+        if NN.CountLayers() <> pWeightOwner.CountLayers() then
+          ImportError('EmbeddingGemma2 import: the borrowing twin has ' +
+            IntToStr(NN.CountLayers()) + ' layers, the owner net ' +
+            IntToStr(pWeightOwner.CountLayers()) + ' (graph mismatch - ' +
+            'owner and twin on different sides of SeqLen = ' +
+            'sliding_window + 1?).');
+        OwnerWeightLayers := 0;
+        for i := 0 to pWeightOwner.CountLayers() - 1 do
+          if pWeightOwner.Layers[i].CountWeights() > 0 then
+            Inc(OwnerWeightLayers);
+        if NN.LinkWeightsFrom(pWeightOwner) <> OwnerWeightLayers then
+          ImportError('EmbeddingGemma2 import: not every weight layer of ' +
+            'the owner net is borrowed by the twin (graph mismatch).');
+        Result := NN;
+        NN := nil; // ownership transferred to the caller
+        exit;      // the finally below still frees the reader
+      end;
 
       // ---------------- Weights ----------------
       // embed_tokens with the sqrt(hidden_size) scale folded into the rows
@@ -57585,7 +57644,7 @@ begin
           TensorNameStr, Config.HiddenSize);
         MarkConsumed(TensorNameStr);
         MarkConsumed(BlockPrefix + 'layer_scalar'); // read at build time
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
       LoadLlamaRMSNormWeights(Reader, FinalNorm, Config.Prefix + 'norm.weight',
         Config.HiddenSize);
@@ -57595,7 +57654,7 @@ begin
       LoadLlamaLinearWeights(Reader, EmbeddingProjection, TensorNameStr,
         Config.HiddenSize, Config.EmbeddingDim);
       MarkConsumed(TensorNameStr);
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
       // Only the text tower is imported: tensors outside the prefix (the
@@ -57630,7 +57689,8 @@ end;
 function BuildEmbeddingGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   ConfigPath: string;
 begin
@@ -57638,7 +57698,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadEmbeddingGemma2ConfigFromJSONFile(ConfigPath);
   Result := BuildEmbeddingGemma2FromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pTrainable, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildEmbeddingGemma2FromSafeTensors(const FileName: string;
