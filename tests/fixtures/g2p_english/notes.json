@@ -21,27 +21,27 @@
     "rule": "entry kept when key.lower() is a substring of a lowercased fixture word (whitespace chunk or letter/apostrophe run), or was looked up by misaki while producing this fixture (either accent run, incl. the DEFAULT run), or is a single letter",
     "files": {
       "us_gold.json": {
-        "entries": 1710,
+        "entries": 1743,
         "full_entries": 90201,
-        "bytes": 41475
+        "bytes": 42310
       },
       "us_silver.json": {
-        "entries": 396,
+        "entries": 400,
         "full_entries": 93361,
-        "bytes": 8864
+        "bytes": 8962
       },
       "gb_gold.json": {
-        "entries": 1724,
+        "entries": 1758,
         "full_entries": 87352,
-        "bytes": 41797
+        "bytes": 42652
       },
       "gb_silver.json": {
-        "entries": 416,
+        "entries": 423,
         "full_entries": 109766,
-        "bytes": 9415
+        "bytes": 9593
       }
     },
-    "total_bytes": 101551,
+    "total_bytes": 103517,
     "verified": "misaki re-run with the subsets gives identical output"
   },
   "counts": {
@@ -150,13 +150,21 @@
           "heteronym_tokens": 37,
           "heteronym_tokens_differing": 10,
           "tokens_differing_from_default_run": 11
+        },
+        "numbers_more": {
+          "sentences": 23,
+          "tokens": 189,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
         }
       },
       "total": {
-        "sentences": 297,
-        "tokens": 2605,
+        "sentences": 320,
+        "tokens": 2794,
         "unknown_tokens": 62,
-        "heteronym_tokens": 158,
+        "heteronym_tokens": 159,
         "heteronym_tokens_differing": 47,
         "tokens_differing_from_default_run": 49
       }
@@ -266,13 +274,21 @@
           "heteronym_tokens": 37,
           "heteronym_tokens_differing": 10,
           "tokens_differing_from_default_run": 11
+        },
+        "numbers_more": {
+          "sentences": 23,
+          "tokens": 189,
+          "unknown_tokens": 0,
+          "heteronym_tokens": 1,
+          "heteronym_tokens_differing": 0,
+          "tokens_differing_from_default_run": 0
         }
       },
       "total": {
-        "sentences": 297,
-        "tokens": 2605,
+        "sentences": 320,
+        "tokens": 2794,
         "unknown_tokens": 64,
-        "heteronym_tokens": 158,
+        "heteronym_tokens": 159,
         "heteronym_tokens_differing": 47,
         "tokens_differing_from_default_run": 49
       }
@@ -282,7 +298,7 @@
     "us": {
       "rule": "a token counts when its letters, lowercased, are a POS-keyed gold entry; it differs when misaki's output token differs from a run with every POS-keyed entry forced to DEFAULT (same spaCy tokens, same right-to-left context)",
       "all_sentences": {
-        "heteronym_tokens": 158,
+        "heteronym_tokens": 159,
         "differing": 47,
         "any_token_differing": 49
       },
@@ -324,7 +340,7 @@
     "gb": {
       "rule": "a token counts when its letters, lowercased, are a POS-keyed gold entry; it differs when misaki's output token differs from a run with every POS-keyed entry forced to DEFAULT (same spaCy tokens, same right-to-left context)",
       "all_sentences": {
-        "heteronym_tokens": 158,
+        "heteronym_tokens": 159,
         "differing": 47,
         "any_token_differing": 49
       },

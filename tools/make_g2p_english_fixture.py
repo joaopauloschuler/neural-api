@@ -417,6 +417,33 @@ GROUPS = [
         "June, and the mayor's going to cut the ribbon herself, wearing the "
         "town's ancient hat.",
     ]),
+    # Task 5.3: number paths the groups above leave out (appended last so the
+    # earlier sentence ids stay the same).
+    ("numbers_more", [
+        "The 11th, 13th and 101st runners came 22nd and 33rd.",
+        "In 1905 and 2010 and 1999 and 1600.",
+        "The year 0123 and the year 1000 and 1100.",
+        "The A380 and the A305 flew.",
+        "Python 3.10 and v2.5 came out.",
+        "It fell to -1984 and rose by 8%.",
+        "Pay $2024 or £0.01 or €1.10 or $3.",
+        "She won the 1,000th race.",
+        "Look at .05 and 10.01 and 2.00 now.",
+        "Room 2B and gate 12C are open.",
+        "Call 555-1234 now.",
+        "The debt was 3,000,000,000,000 dollars.",
+        "Pi is about 3.14159.",
+        "Temperatures of -3.5 degrees.",
+        "Section 4.2.10 says so.",
+        "I owe $0.50 and $0.",
+        "In the 2000s, 5,000 of 12,345.67 units.",
+        "Rock & roll, A + B, meet @ noon.",
+        "Win £5 or £1.50 or 99p.",
+        "Prices hit $5 billion and $3.5 trillion.",
+        "The 1800s and the 70s.",
+        "He was 1st, she was 0th.",
+        "It is 14 or 16 or 17 or 18 or 88.",
+    ]),
 ]
 
 BEHAVIOURS = {

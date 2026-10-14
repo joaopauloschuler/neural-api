@@ -10665,6 +10665,775 @@
      }
     ]
    }
+  },
+  {
+   "id": 297,
+   "group": "numbers_more",
+   "text": "The 11th, 13th and 101st runners came 22nd and 33rd.",
+   "us": {
+    "phonemes": "ði əlˈɛvənθ, θˌɜɹtˈinθ ænd wˈʌn hˈʌndɹəd fˈɜɹst ɹˈʌnəɹz kˈAm twˈɛnti sˈɛkənd ænd θˈɜɹTi θˈɜɹd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "11th", "tag": "JJ", "whitespace": "", "phonemes": "əlˈɛvənθ", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "13th", "tag": "NN", "whitespace": " ", "phonemes": "θˌɜɹtˈinθ", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "101st", "tag": "NNP", "whitespace": " ", "phonemes": "wˈʌn hˈʌndɹəd fˈɜɹst", "_": {}},
+     {"text": "runners", "tag": "NNS", "whitespace": " ", "phonemes": "ɹˈʌnəɹz", "_": {}, "rating": 3},
+     {"text": "came", "tag": "VBD", "whitespace": " ", "phonemes": "kˈAm", "_": {}, "rating": 4},
+     {"text": "22nd", "tag": "NN", "whitespace": " ", "phonemes": "twˈɛnti sˈɛkənd", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "33rd", "tag": "NN", "whitespace": "", "phonemes": "θˈɜɹTi θˈɜɹd", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ði ɪlˈɛvnθ, θˌɜːtˈiːnθ and wˈʌn hˈʌndɹəd fˈɜːst ɹˈʌnəz kˈAm twˈɛnti sˈɛkᵊnd and θˈɜːti θˈɜːd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "11th", "tag": "JJ", "whitespace": "", "phonemes": "ɪlˈɛvnθ", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "13th", "tag": "NN", "whitespace": " ", "phonemes": "θˌɜːtˈiːnθ", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "101st", "tag": "NNP", "whitespace": " ", "phonemes": "wˈʌn hˈʌndɹəd fˈɜːst", "_": {}},
+     {"text": "runners", "tag": "NNS", "whitespace": " ", "phonemes": "ɹˈʌnəz", "_": {}, "rating": 3},
+     {"text": "came", "tag": "VBD", "whitespace": " ", "phonemes": "kˈAm", "_": {}, "rating": 4},
+     {"text": "22nd", "tag": "NN", "whitespace": " ", "phonemes": "twˈɛnti sˈɛkᵊnd", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "33rd", "tag": "NN", "whitespace": "", "phonemes": "θˈɜːti θˈɜːd", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 298,
+   "group": "numbers_more",
+   "text": "In 1905 and 2010 and 1999 and 1600.",
+   "us": {
+    "phonemes": "ɪn nˌIntˈin ˈO fˈIv ænd twˈɛnti tˈɛn ænd nˌIntˈin nˈIndi nˈIn ænd sˌɪkstˈin hˈʌndɹəd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "In", "tag": "IN", "whitespace": " ", "phonemes": "ɪn", "_": {}, "rating": 4},
+     {"text": "1905", "tag": "CD", "whitespace": " ", "phonemes": "nˌIntˈin ˈO fˈIv", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "2010", "tag": "CD", "whitespace": " ", "phonemes": "twˈɛnti tˈɛn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "1999", "tag": "CD", "whitespace": " ", "phonemes": "nˌIntˈin nˈIndi nˈIn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "1600", "tag": "CD", "whitespace": "", "phonemes": "sˌɪkstˈin hˈʌndɹəd", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ɪn nˌIntˈiːn ˈQ fˈIv and twˈɛnti tˈɛn and nˌIntˈiːn nˈInti nˈIn and sˌɪkstˈiːn hˈʌndɹəd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "In", "tag": "IN", "whitespace": " ", "phonemes": "ɪn", "_": {}, "rating": 4},
+     {"text": "1905", "tag": "CD", "whitespace": " ", "phonemes": "nˌIntˈiːn ˈQ fˈIv", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "2010", "tag": "CD", "whitespace": " ", "phonemes": "twˈɛnti tˈɛn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "1999", "tag": "CD", "whitespace": " ", "phonemes": "nˌIntˈiːn nˈInti nˈIn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "1600", "tag": "CD", "whitespace": "", "phonemes": "sˌɪkstˈiːn hˈʌndɹəd", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 299,
+   "group": "numbers_more",
+   "text": "The year 0123 and the year 1000 and 1100.",
+   "us": {
+    "phonemes": "ðə jˈɪɹ wˈʌn twˈɛnti θɹˈi ænd ðə jˈɪɹ wˈʌn θˈWzᵊnd ænd əlˈɛvᵊn hˈʌndɹəd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "year", "tag": "NN", "whitespace": " ", "phonemes": "jˈɪɹ", "_": {}, "rating": 4},
+     {"text": "0123", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn twˈɛnti θɹˈi", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "year", "tag": "NN", "whitespace": " ", "phonemes": "jˈɪɹ", "_": {}, "rating": 4},
+     {"text": "1000", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn θˈWzᵊnd", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "1100", "tag": "CD", "whitespace": "", "phonemes": "əlˈɛvᵊn hˈʌndɹəd", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ðə jˈɪə wˈʌn twˈɛnti θɹˈiː and ðə jˈɪə wˈʌn θˈWzᵊnd and ɪlˈɛvᵊn hˈʌndɹəd.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "year", "tag": "NN", "whitespace": " ", "phonemes": "jˈɪə", "_": {}, "rating": 4},
+     {"text": "0123", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn twˈɛnti θɹˈiː", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "year", "tag": "NN", "whitespace": " ", "phonemes": "jˈɪə", "_": {}, "rating": 4},
+     {"text": "1000", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn θˈWzᵊnd", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "1100", "tag": "CD", "whitespace": "", "phonemes": "ɪlˈɛvᵊn hˈʌndɹəd", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 300,
+   "group": "numbers_more",
+   "text": "The A380 and the A305 flew.",
+   "us": {
+    "phonemes": "ði ˈA θɹˈi ˈATi ænd ði ˈA θɹˈi O fˈIv flˈu.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "A380", "tag": "NN", "whitespace": " ", "phonemes": "ˈA θɹˈi ˈATi", "_": {"rating": 4}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "A305", "tag": "NN", "whitespace": " ", "phonemes": "ˈA θɹˈi O fˈIv", "_": {"rating": 4}},
+     {"text": "flew", "tag": "VBD", "whitespace": "", "phonemes": "flˈu", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ði ˈA θɹˈiː ˈAti and ði ˈA θɹˈiː Q fˈIv flˈuː.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "A380", "tag": "NN", "whitespace": " ", "phonemes": "ˈA θɹˈiː ˈAti", "_": {"rating": 4}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "A305", "tag": "NN", "whitespace": " ", "phonemes": "ˈA θɹˈiː Q fˈIv", "_": {"rating": 4}},
+     {"text": "flew", "tag": "VBD", "whitespace": "", "phonemes": "flˈuː", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 301,
+   "group": "numbers_more",
+   "text": "Python 3.10 and v2.5 came out.",
+   "us": {
+    "phonemes": "pˈIθˌɑn θɹˈi pYnt wˈʌn ænd vˈi tˈu fˈIv kˈAm ˈWt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Python", "tag": "NNP", "whitespace": " ", "phonemes": "pˈIθˌɑn", "_": {}, "rating": 4},
+     {"text": "3.10", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈi pYnt wˈʌn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "v2.5", "tag": "NNS", "whitespace": " ", "phonemes": "vˈi tˈu fˈIv", "_": {"rating": 3}},
+     {"text": "came", "tag": "VBD", "whitespace": " ", "phonemes": "kˈAm", "_": {}, "rating": 4},
+     {"text": "out", "tag": "RP", "whitespace": "", "phonemes": "ˈWt", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "pˈIθn θɹˈiː pYnt wˈʌn and vˈiː tˈuː fˈIv kˈAm ˈWt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Python", "tag": "NNP", "whitespace": " ", "phonemes": "pˈIθn", "_": {}, "rating": 4},
+     {"text": "3.10", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈiː pYnt wˈʌn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "v2.5", "tag": "NNS", "whitespace": " ", "phonemes": "vˈiː tˈuː fˈIv", "_": {"rating": 3}},
+     {"text": "came", "tag": "VBD", "whitespace": " ", "phonemes": "kˈAm", "_": {}, "rating": 4},
+     {"text": "out", "tag": "RP", "whitespace": "", "phonemes": "ˈWt", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 302,
+   "group": "numbers_more",
+   "text": "It fell to -1984 and rose by 8%.",
+   "us": {
+    "phonemes": "ˌɪt fˈɛl tə mˈInəs wˈʌn θˈWzᵊnd nˈIn hˈʌndɹəd ˈATi fˈɔɹ ænd ɹˈOz bI ˈAt pəɹsˈɛnt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "It", "tag": "PRP", "whitespace": " ", "phonemes": "ˌɪt", "_": {}, "rating": 4},
+     {"text": "fell", "tag": "VBD", "whitespace": " ", "phonemes": "fˈɛl", "_": {}, "rating": 4},
+     {"text": "to", "tag": "IN", "whitespace": " ", "phonemes": "tə", "_": {}, "rating": 4},
+     {"text": "-1984", "tag": "NNP", "whitespace": " ", "phonemes": "mˈInəs wˈʌn θˈWzᵊnd nˈIn hˈʌndɹəd ˈATi fˈɔɹ", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "rose", "tag": "VBD", "whitespace": " ", "phonemes": "ɹˈOz", "_": {}, "rating": 4},
+     {"text": "by", "tag": "IN", "whitespace": " ", "phonemes": "bI", "_": {}, "rating": 4},
+     {"text": "8%", "tag": "CD", "whitespace": "", "phonemes": "ˈAt pəɹsˈɛnt", "_": {"rating": 4}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ˌɪt fˈɛl tə mˈInəs wˈʌn θˈWzᵊnd nˈIn hˈʌndɹəd ˈAti fˈɔː and ɹˈQz bI ˈAt pəsˈɛnt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "It", "tag": "PRP", "whitespace": " ", "phonemes": "ˌɪt", "_": {}, "rating": 4},
+     {"text": "fell", "tag": "VBD", "whitespace": " ", "phonemes": "fˈɛl", "_": {}, "rating": 4},
+     {"text": "to", "tag": "IN", "whitespace": " ", "phonemes": "tə", "_": {}, "rating": 4},
+     {"text": "-1984", "tag": "NNP", "whitespace": " ", "phonemes": "mˈInəs wˈʌn θˈWzᵊnd nˈIn hˈʌndɹəd ˈAti fˈɔː", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "rose", "tag": "VBD", "whitespace": " ", "phonemes": "ɹˈQz", "_": {}, "rating": 4},
+     {"text": "by", "tag": "IN", "whitespace": " ", "phonemes": "bI", "_": {}, "rating": 4},
+     {"text": "8%", "tag": "CD", "whitespace": "", "phonemes": "ˈAt pəsˈɛnt", "_": {"rating": 4}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 303,
+   "group": "numbers_more",
+   "text": "Pay $2024 or £0.01 or €1.10 or $3.",
+   "us": {
+    "phonemes": "pˈA tˈu θˈWzᵊnd twˈɛnti fˈɔɹ dˈɑləɹz ɔɹ wˈʌn pˈɛns ɔɹ wˈʌn jˈʊɹO ænd tˈɛn sˈɛnts ɔɹ θɹˈi dˈɑləɹz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Pay", "tag": "VB", "whitespace": " ", "phonemes": "pˈA", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "2024", "tag": "CD", "whitespace": " ", "phonemes": "tˈu θˈWzᵊnd twˈɛnti fˈɔɹ dˈɑləɹz", "_": {"currency": "$"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0.01", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn pˈɛns", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "€", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "1.10", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn jˈʊɹO ænd tˈɛn sˈɛnts", "_": {"currency": "€"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "3", "tag": "CD", "whitespace": "", "phonemes": "θɹˈi dˈɑləɹz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "pˈA tˈuː θˈWzᵊnd twˈɛnti fˈɔː dˈɒləz ɔː wˈʌn pˈɛns ɔː wˈʌn jˈʊəɹQ and tˈɛn sˈɛnts ɔː θɹˈiː dˈɒləz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Pay", "tag": "VB", "whitespace": " ", "phonemes": "pˈA", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "2024", "tag": "CD", "whitespace": " ", "phonemes": "tˈuː θˈWzᵊnd twˈɛnti fˈɔː dˈɒləz", "_": {"currency": "$"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0.01", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn pˈɛns", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "€", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "1.10", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn jˈʊəɹQ and tˈɛn sˈɛnts", "_": {"currency": "€"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "3", "tag": "CD", "whitespace": "", "phonemes": "θɹˈiː dˈɒləz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 304,
+   "group": "numbers_more",
+   "text": "She won the 1,000th race.",
+   "us": {
+    "phonemes": "ʃˌi wˈʌn ðə wˈʌn θˈWzᵊnθ ɹˈAs.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "She", "tag": "PRP", "whitespace": " ", "phonemes": "ʃˌi", "_": {}, "rating": 4},
+     {"text": "won", "tag": "VBD", "whitespace": " ", "phonemes": "wˈʌn", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "1,000th", "tag": "JJ", "whitespace": " ", "phonemes": "wˈʌn θˈWzᵊnθ", "_": {}},
+     {"text": "race", "tag": "NN", "whitespace": "", "phonemes": "ɹˈAs", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ʃˌiː wˈʌn ðə wˈʌn θˈWzᵊnθ ɹˈAs.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "She", "tag": "PRP", "whitespace": " ", "phonemes": "ʃˌiː", "_": {}, "rating": 4},
+     {"text": "won", "tag": "VBD", "whitespace": " ", "phonemes": "wˈʌn", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "1,000th", "tag": "JJ", "whitespace": " ", "phonemes": "wˈʌn θˈWzᵊnθ", "_": {}},
+     {"text": "race", "tag": "NN", "whitespace": "", "phonemes": "ɹˈAs", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 305,
+   "group": "numbers_more",
+   "text": "Look at .05 and 10.01 and 2.00 now.",
+   "us": {
+    "phonemes": "lˈʊk æt pYnt zˈɪɹO fˈIv ænd tˈɛn pYnt zˈɪɹO wˈʌn ænd tˈu nˈW.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Look", "tag": "VB", "whitespace": " ", "phonemes": "lˈʊk", "_": {}, "rating": 4},
+     {"text": "at", "tag": "IN", "whitespace": " ", "phonemes": "æt", "_": {}, "rating": 4},
+     {"text": ".05", "tag": "CD", "whitespace": " ", "phonemes": "pYnt zˈɪɹO fˈIv", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "10.01", "tag": "CD", "whitespace": " ", "phonemes": "tˈɛn pYnt zˈɪɹO wˈʌn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "2.00", "tag": "CD", "whitespace": " ", "phonemes": "tˈu", "_": {}, "rating": 4},
+     {"text": "now", "tag": "RB", "whitespace": "", "phonemes": "nˈW", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "lˈʊk at pYnt zˈɪəɹQ fˈIv and tˈɛn pYnt zˈɪəɹQ wˈʌn and tˈuː nˈW.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Look", "tag": "VB", "whitespace": " ", "phonemes": "lˈʊk", "_": {}, "rating": 4},
+     {"text": "at", "tag": "IN", "whitespace": " ", "phonemes": "at", "_": {}, "rating": 4},
+     {"text": ".05", "tag": "CD", "whitespace": " ", "phonemes": "pYnt zˈɪəɹQ fˈIv", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "10.01", "tag": "CD", "whitespace": " ", "phonemes": "tˈɛn pYnt zˈɪəɹQ wˈʌn", "_": {}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "2.00", "tag": "CD", "whitespace": " ", "phonemes": "tˈuː", "_": {}, "rating": 4},
+     {"text": "now", "tag": "RB", "whitespace": "", "phonemes": "nˈW", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 306,
+   "group": "numbers_more",
+   "text": "Room 2B and gate 12C are open.",
+   "us": {
+    "phonemes": "ɹˈum tˈu bˈi ænd ɡˈAt twˈɛlv sˈi ɑɹ ˈOpᵊn.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Room", "tag": "NN", "whitespace": " ", "phonemes": "ɹˈum", "_": {}, "rating": 4},
+     {"text": "2B", "tag": "NNP", "whitespace": " ", "phonemes": "tˈu bˈi", "_": {"rating": 4}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "gate", "tag": "NN", "whitespace": " ", "phonemes": "ɡˈAt", "_": {}, "rating": 4},
+     {"text": "12C", "tag": "CD", "whitespace": " ", "phonemes": "twˈɛlv sˈi", "_": {"rating": 4}},
+     {"text": "are", "tag": "VBP", "whitespace": " ", "phonemes": "ɑɹ", "_": {}, "rating": 4},
+     {"text": "open", "tag": "JJ", "whitespace": "", "phonemes": "ˈOpᵊn", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ɹˈuːm tˈuː bˈiː and ɡˈAt twˈɛlv sˈiː ɑː ˈQpᵊn.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Room", "tag": "NN", "whitespace": " ", "phonemes": "ɹˈuːm", "_": {}, "rating": 4},
+     {"text": "2B", "tag": "NNP", "whitespace": " ", "phonemes": "tˈuː bˈiː", "_": {"rating": 4}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "gate", "tag": "NN", "whitespace": " ", "phonemes": "ɡˈAt", "_": {}, "rating": 4},
+     {"text": "12C", "tag": "CD", "whitespace": " ", "phonemes": "twˈɛlv sˈiː", "_": {"rating": 4}},
+     {"text": "are", "tag": "VBP", "whitespace": " ", "phonemes": "ɑː", "_": {}, "rating": 4},
+     {"text": "open", "tag": "JJ", "whitespace": "", "phonemes": "ˈQpᵊn", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 307,
+   "group": "numbers_more",
+   "text": "Call 555-1234 now.",
+   "us": {
+    "phonemes": "kˈɔl fˈIv hˈʌndɹəd fˈɪfti fˈIvtwˌɛlv θˌɜɹTi fˌɔɹ nˈW.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Call", "tag": "VB", "whitespace": " ", "phonemes": "kˈɔl", "_": {}, "rating": 4},
+     {"text": "555-1234", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv hˈʌndɹəd fˈɪfti fˈIvtwˌɛlv θˌɜɹTi fˌɔɹ", "_": {"rating": 3}},
+     {"text": "now", "tag": "RB", "whitespace": "", "phonemes": "nˈW", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "kˈɔːl fˈIv hˈʌndɹəd fˈɪfti fˈIvtwˌɛlv θˌɜːti fˌɔː nˈW.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Call", "tag": "VB", "whitespace": " ", "phonemes": "kˈɔːl", "_": {}, "rating": 4},
+     {"text": "555-1234", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv hˈʌndɹəd fˈɪfti fˈIvtwˌɛlv θˌɜːti fˌɔː", "_": {"rating": 3}},
+     {"text": "now", "tag": "RB", "whitespace": "", "phonemes": "nˈW", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 308,
+   "group": "numbers_more",
+   "text": "The debt was 3,000,000,000,000 dollars.",
+   "us": {
+    "phonemes": "ðə dˈɛt wʌz θɹˈi tɹˈɪljən dˈɑləɹz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "debt", "tag": "NN", "whitespace": " ", "phonemes": "dˈɛt", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wʌz", "_": {}, "rating": 4},
+     {"text": "3,000,000,000,000", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈi tɹˈɪljən", "_": {}, "rating": 4},
+     {"text": "dollars", "tag": "NNS", "whitespace": "", "phonemes": "dˈɑləɹz", "_": {}, "rating": 3},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ðə dˈɛt wɒz θɹˈiː tɹˈɪljən dˈɒləz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "debt", "tag": "NN", "whitespace": " ", "phonemes": "dˈɛt", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wɒz", "_": {}, "rating": 4},
+     {"text": "3,000,000,000,000", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈiː tɹˈɪljən", "_": {}, "rating": 4},
+     {"text": "dollars", "tag": "NNS", "whitespace": "", "phonemes": "dˈɒləz", "_": {}, "rating": 3},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 309,
+   "group": "numbers_more",
+   "text": "Pi is about 3.14159.",
+   "us": {
+    "phonemes": "pˈI ɪz əbˈWt θɹˈi pYnt wˈʌn fˈɔɹ wˈʌn fˈIv nˈIn.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Pi", "tag": "NNP", "whitespace": " ", "phonemes": "pˈI", "_": {}, "rating": 4},
+     {"text": "is", "tag": "VBZ", "whitespace": " ", "phonemes": "ɪz", "_": {}, "rating": 4},
+     {"text": "about", "tag": "IN", "whitespace": " ", "phonemes": "əbˈWt", "_": {}, "rating": 4},
+     {"text": "3.14159", "tag": "CD", "whitespace": "", "phonemes": "θɹˈi pYnt wˈʌn fˈɔɹ wˈʌn fˈIv nˈIn", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "pˈI ɪz əbˈWt θɹˈiː pYnt wˈʌn fˈɔː wˈʌn fˈIv nˈIn.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Pi", "tag": "NNP", "whitespace": " ", "phonemes": "pˈI", "_": {}, "rating": 4},
+     {"text": "is", "tag": "VBZ", "whitespace": " ", "phonemes": "ɪz", "_": {}, "rating": 4},
+     {"text": "about", "tag": "IN", "whitespace": " ", "phonemes": "əbˈWt", "_": {}, "rating": 4},
+     {"text": "3.14159", "tag": "CD", "whitespace": "", "phonemes": "θɹˈiː pYnt wˈʌn fˈɔː wˈʌn fˈIv nˈIn", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 310,
+   "group": "numbers_more",
+   "text": "Temperatures of -3.5 degrees.",
+   "us": {
+    "phonemes": "tˈɛmpɹəʧəɹz ʌv mˈInəs θɹˈi pYnt fˈIv dəɡɹˈiz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Temperatures", "tag": "NNS", "whitespace": " ", "phonemes": "tˈɛmpɹəʧəɹz", "_": {}, "rating": 4},
+     {"text": "of", "tag": "IN", "whitespace": " ", "phonemes": "ʌv", "_": {}, "rating": 4},
+     {"text": "-3.5", "tag": "NNP", "whitespace": " ", "phonemes": "mˈInəs θɹˈi pYnt fˈIv", "_": {}, "rating": 4},
+     {"text": "degrees", "tag": "NNS", "whitespace": "", "phonemes": "dəɡɹˈiz", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "tˈɛmpɹɪʧəz ɒv mˈInəs θɹˈiː pYnt fˈIv dɪɡɹˈiːz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Temperatures", "tag": "NNS", "whitespace": " ", "phonemes": "tˈɛmpɹɪʧəz", "_": {}, "rating": 3},
+     {"text": "of", "tag": "IN", "whitespace": " ", "phonemes": "ɒv", "_": {}, "rating": 4},
+     {"text": "-3.5", "tag": "NNP", "whitespace": " ", "phonemes": "mˈInəs θɹˈiː pYnt fˈIv", "_": {}, "rating": 4},
+     {"text": "degrees", "tag": "NNS", "whitespace": "", "phonemes": "dɪɡɹˈiːz", "_": {}, "rating": 3},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 311,
+   "group": "numbers_more",
+   "text": "Section 4.2.10 says so.",
+   "us": {
+    "phonemes": "sˈɛkʃən fˈɔɹ tˈu tˈɛn sˈɛz sˌO.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Section", "tag": "NN", "whitespace": " ", "phonemes": "sˈɛkʃən", "_": {}, "rating": 4},
+     {"text": "4.2.10", "tag": "NNP", "whitespace": " ", "phonemes": "fˈɔɹ tˈu tˈɛn", "_": {}, "rating": 4},
+     {"text": "says", "tag": "VBZ", "whitespace": " ", "phonemes": "sˈɛz", "_": {}, "rating": 4},
+     {"text": "so", "tag": "RB", "whitespace": "", "phonemes": "sˌO", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "sˈɛkʃᵊn fˈɔː tˈuː tˈɛn sˈɛz sˌQ.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Section", "tag": "NN", "whitespace": " ", "phonemes": "sˈɛkʃᵊn", "_": {}, "rating": 4},
+     {"text": "4.2.10", "tag": "NNP", "whitespace": " ", "phonemes": "fˈɔː tˈuː tˈɛn", "_": {}, "rating": 4},
+     {"text": "says", "tag": "VBZ", "whitespace": " ", "phonemes": "sˈɛz", "_": {}, "rating": 4},
+     {"text": "so", "tag": "RB", "whitespace": "", "phonemes": "sˌQ", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 312,
+   "group": "numbers_more",
+   "text": "I owe $0.50 and $0.",
+   "us": {
+    "phonemes": "ˌI ˈO fˈɪfti sˈɛnts ænd zˈɪɹO dˈɑləɹz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "I", "tag": "PRP", "whitespace": " ", "phonemes": "ˌI", "_": {}, "rating": 4},
+     {"text": "owe", "tag": "VBP", "whitespace": " ", "phonemes": "ˈO", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0.50", "tag": "CD", "whitespace": " ", "phonemes": "fˈɪfti sˈɛnts", "_": {"currency": "$"}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0", "tag": "CD", "whitespace": "", "phonemes": "zˈɪɹO dˈɑləɹz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ˌI ˈQ fˈɪfti sˈɛnts and zˈɪəɹQ dˈɒləz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "I", "tag": "PRP", "whitespace": " ", "phonemes": "ˌI", "_": {}, "rating": 4},
+     {"text": "owe", "tag": "VBP", "whitespace": " ", "phonemes": "ˈQ", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0.50", "tag": "CD", "whitespace": " ", "phonemes": "fˈɪfti sˈɛnts", "_": {"currency": "$"}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "0", "tag": "CD", "whitespace": "", "phonemes": "zˈɪəɹQ dˈɒləz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 313,
+   "group": "numbers_more",
+   "text": "In the 2000s, 5,000 of 12,345.67 units.",
+   "us": {
+    "phonemes": "ɪn ðə tˈu θˈWzᵊndz, fˈIv θˈWzᵊnd ʌv twˈɛlv θˈWzᵊnd θɹˈi hˈʌndɹəd fˈɔɹTi fˈIv pYnt sˈɪks sˈɛvən jˈunəts.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "In", "tag": "IN", "whitespace": " ", "phonemes": "ɪn", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "2000s", "tag": "CD", "whitespace": "", "phonemes": "tˈu θˈWzᵊndz", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "5,000", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv θˈWzᵊnd", "_": {}, "rating": 4},
+     {"text": "of", "tag": "IN", "whitespace": " ", "phonemes": "ʌv", "_": {}, "rating": 4},
+     {"text": "12,345.67", "tag": "JJ", "whitespace": " ", "phonemes": "twˈɛlv θˈWzᵊnd θɹˈi hˈʌndɹəd fˈɔɹTi fˈIv pYnt sˈɪks sˈɛvən", "_": {}, "rating": 4},
+     {"text": "units", "tag": "NNS", "whitespace": "", "phonemes": "jˈunəts", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ɪn ðə tˈuː θˈWzᵊndz, fˈIv θˈWzᵊnd ɒv twˈɛlv θˈWzᵊnd θɹˈiː hˈʌndɹəd fˈɔːti fˈIv pYnt sˈɪks sˈɛvᵊn jˈuːnɪts.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "In", "tag": "IN", "whitespace": " ", "phonemes": "ɪn", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "2000s", "tag": "CD", "whitespace": "", "phonemes": "tˈuː θˈWzᵊndz", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "5,000", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv θˈWzᵊnd", "_": {}, "rating": 4},
+     {"text": "of", "tag": "IN", "whitespace": " ", "phonemes": "ɒv", "_": {}, "rating": 4},
+     {"text": "12,345.67", "tag": "JJ", "whitespace": " ", "phonemes": "twˈɛlv θˈWzᵊnd θɹˈiː hˈʌndɹəd fˈɔːti fˈIv pYnt sˈɪks sˈɛvᵊn", "_": {}, "rating": 4},
+     {"text": "units", "tag": "NNS", "whitespace": "", "phonemes": "jˈuːnɪts", "_": {}, "rating": 3},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 314,
+   "group": "numbers_more",
+   "text": "Rock & roll, A + B, meet @ noon.",
+   "us": {
+    "phonemes": "ɹˈɑk ænd ɹˈOl, ˈA plˈʌs bˈi, mˈit æt nˈun.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Rock", "tag": "NNP", "whitespace": " ", "phonemes": "ɹˈɑk", "_": {}, "rating": 4},
+     {"text": "&", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "roll", "tag": "NNP", "whitespace": "", "phonemes": "ɹˈOl", "_": {}, "rating": 4},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "A", "tag": "NNP", "whitespace": " ", "phonemes": "ˈA", "_": {}, "rating": 4},
+     {"text": "+", "tag": "CC", "whitespace": " ", "phonemes": "plˈʌs", "_": {}, "rating": 4},
+     {"text": "B", "tag": "NN", "whitespace": "", "phonemes": "bˈi", "_": {}, "rating": 4},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "meet", "tag": "VBP", "whitespace": " ", "phonemes": "mˈit", "_": {}, "rating": 4},
+     {"text": "@", "tag": "IN", "whitespace": " ", "phonemes": "æt", "_": {}, "rating": 4},
+     {"text": "noon", "tag": "NN", "whitespace": "", "phonemes": "nˈun", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ɹˈɒk and ɹˈQl, ˈA plˈʌs bˈiː, mˈiːt at nˈuːn.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Rock", "tag": "NNP", "whitespace": " ", "phonemes": "ɹˈɒk", "_": {}, "rating": 4},
+     {"text": "&", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "roll", "tag": "NNP", "whitespace": "", "phonemes": "ɹˈQl", "_": {}, "rating": 4},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "A", "tag": "NNP", "whitespace": " ", "phonemes": "ˈA", "_": {}, "rating": 4},
+     {"text": "+", "tag": "CC", "whitespace": " ", "phonemes": "plˈʌs", "_": {}, "rating": 4},
+     {"text": "B", "tag": "NN", "whitespace": "", "phonemes": "bˈiː", "_": {}, "rating": 4},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "meet", "tag": "VBP", "whitespace": " ", "phonemes": "mˈiːt", "_": {}, "rating": 4},
+     {"text": "@", "tag": "IN", "whitespace": " ", "phonemes": "at", "_": {}, "rating": 4},
+     {"text": "noon", "tag": "NN", "whitespace": "", "phonemes": "nˈuːn", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 315,
+   "group": "numbers_more",
+   "text": "Win £5 or £1.50 or 99p.",
+   "us": {
+    "phonemes": "wˈɪn fˈIv pˈWndz ɔɹ wˈʌn pˈWnd ænd fˈɪfti pˈɛns ɔɹ nˈIndi nˈIn pˈi.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Win", "tag": "VB", "whitespace": " ", "phonemes": "wˈɪn", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "5", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv pˈWndz", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "1.50", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn pˈWnd ænd fˈɪfti pˈɛns", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "99p", "tag": "NNS", "whitespace": "", "phonemes": "nˈIndi nˈIn pˈi", "_": {"rating": 4}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "wˈɪn fˈIv pˈWndz ɔː wˈʌn pˈWnd and fˈɪfti pˈɛns ɔː nˈInti nˈIn pˈiː.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Win", "tag": "VB", "whitespace": " ", "phonemes": "wˈɪn", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "5", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv pˈWndz", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "£", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "1.50", "tag": "CD", "whitespace": " ", "phonemes": "wˈʌn pˈWnd and fˈɪfti pˈɛns", "_": {"currency": "£"}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "99p", "tag": "NNS", "whitespace": "", "phonemes": "nˈInti nˈIn pˈiː", "_": {"rating": 3}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 316,
+   "group": "numbers_more",
+   "text": "Prices hit $5 billion and $3.5 trillion.",
+   "us": {
+    "phonemes": "pɹˈIsᵻz hˈɪt fˈIv bˈɪljən dˈɑləɹz ænd θɹˈi pYnt fˈIv tɹˈɪljən dˈɑləɹz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Prices", "tag": "NNS", "whitespace": " ", "phonemes": "pɹˈIsᵻz", "_": {}, "rating": 3},
+     {"text": "hit", "tag": "VBD", "whitespace": " ", "phonemes": "hˈɪt", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "5", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv", "_": {}, "rating": 4},
+     {"text": "billion", "tag": "CD", "whitespace": " ", "phonemes": "bˈɪljən dˈɑləɹz", "_": {"currency": "$"}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "3.5", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈi pYnt fˈIv", "_": {}, "rating": 4},
+     {"text": "trillion", "tag": "CD", "whitespace": "", "phonemes": "tɹˈɪljən dˈɑləɹz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "pɹˈIsɪz hˈɪt fˈIv bˈɪljən dˈɒləz and θɹˈiː pYnt fˈIv tɹˈɪljən dˈɒləz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "Prices", "tag": "NNS", "whitespace": " ", "phonemes": "pɹˈIsɪz", "_": {}, "rating": 3},
+     {"text": "hit", "tag": "VBD", "whitespace": " ", "phonemes": "hˈɪt", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "5", "tag": "CD", "whitespace": " ", "phonemes": "fˈIv", "_": {}, "rating": 4},
+     {"text": "billion", "tag": "CD", "whitespace": " ", "phonemes": "bˈɪljən dˈɒləz", "_": {"currency": "$"}, "rating": 4},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "$", "tag": "$", "whitespace": "", "phonemes": "", "_": {"rating": 4}},
+     {"text": "3.5", "tag": "CD", "whitespace": " ", "phonemes": "θɹˈiː pYnt fˈIv", "_": {}, "rating": 4},
+     {"text": "trillion", "tag": "CD", "whitespace": "", "phonemes": "tɹˈɪljən dˈɒləz", "_": {"currency": "$"}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 317,
+   "group": "numbers_more",
+   "text": "The 1800s and the 70s.",
+   "us": {
+    "phonemes": "ði ˌAtˈin hˈʌndɹədz ænd ðə sˈɛvəntiz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "1800s", "tag": "NNS", "whitespace": " ", "phonemes": "ˌAtˈin hˈʌndɹədz", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "ænd", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "70s", "tag": "NNS", "whitespace": "", "phonemes": "sˈɛvəntiz", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ði ˌAtˈiːn hˈʌndɹədz and ðə sˈɛvntiz.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "The", "tag": "DT", "whitespace": " ", "phonemes": "ði", "_": {}, "rating": 4},
+     {"text": "1800s", "tag": "NNS", "whitespace": " ", "phonemes": "ˌAtˈiːn hˈʌndɹədz", "_": {}},
+     {"text": "and", "tag": "CC", "whitespace": " ", "phonemes": "and", "_": {}, "rating": 4},
+     {"text": "the", "tag": "DT", "whitespace": " ", "phonemes": "ðə", "_": {}, "rating": 4},
+     {"text": "70s", "tag": "NNS", "whitespace": "", "phonemes": "sˈɛvntiz", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 318,
+   "group": "numbers_more",
+   "text": "He was 1st, she was 0th.",
+   "us": {
+    "phonemes": "hˌi wʌz fˈɜɹst, ʃi wʌz zˈɪɹOθ.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "He", "tag": "PRP", "whitespace": " ", "phonemes": "hˌi", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wʌz", "_": {}, "rating": 4},
+     {"text": "1st", "tag": "JJ", "whitespace": "", "phonemes": "fˈɜɹst", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "she", "tag": "PRP", "whitespace": " ", "phonemes": "ʃi", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wʌz", "_": {}, "rating": 4},
+     {"text": "0th", "tag": "JJ", "whitespace": "", "phonemes": "zˈɪɹOθ", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "hˌiː wɒz fˈɜːst, ʃiː wɒz zˈɪəɹQθ.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "He", "tag": "PRP", "whitespace": " ", "phonemes": "hˌiː", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wɒz", "_": {}, "rating": 4},
+     {"text": "1st", "tag": "JJ", "whitespace": "", "phonemes": "fˈɜːst", "_": {}},
+     {"text": ",", "tag": ",", "whitespace": " ", "phonemes": ",", "_": {"rating": 4}},
+     {"text": "she", "tag": "PRP", "whitespace": " ", "phonemes": "ʃiː", "_": {}, "rating": 4},
+     {"text": "was", "tag": "VBD", "whitespace": " ", "phonemes": "wɒz", "_": {}, "rating": 4},
+     {"text": "0th", "tag": "JJ", "whitespace": "", "phonemes": "zˈɪəɹQθ", "_": {}},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
+  },
+  {
+   "id": 319,
+   "group": "numbers_more",
+   "text": "It is 14 or 16 or 17 or 18 or 88.",
+   "us": {
+    "phonemes": "ˌɪt ɪz fˌɔɹtˈin ɔɹ sˌɪkstˈin ɔɹ sˌɛvəntˈin ɔɹ ˌAtˈin ɔɹ ˈATi ˈAt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "It", "tag": "PRP", "whitespace": " ", "phonemes": "ˌɪt", "_": {}, "rating": 4},
+     {"text": "is", "tag": "VBZ", "whitespace": " ", "phonemes": "ɪz", "_": {}, "rating": 4},
+     {"text": "14", "tag": "CD", "whitespace": " ", "phonemes": "fˌɔɹtˈin", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "16", "tag": "CD", "whitespace": " ", "phonemes": "sˌɪkstˈin", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "17", "tag": "CD", "whitespace": " ", "phonemes": "sˌɛvəntˈin", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "18", "tag": "CD", "whitespace": " ", "phonemes": "ˌAtˈin", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔɹ", "_": {}, "rating": 4},
+     {"text": "88", "tag": "CD", "whitespace": "", "phonemes": "ˈATi ˈAt", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   },
+   "gb": {
+    "phonemes": "ˌɪt ɪz fˌɔːtˈiːn ɔː sˌɪkstˈiːn ɔː sˌɛvntˈiːn ɔː ˌAtˈiːn ɔː ˈAti ˈAt.",
+    "unknown_tokens": [],
+    "tokens": [
+     {"text": "It", "tag": "PRP", "whitespace": " ", "phonemes": "ˌɪt", "_": {}, "rating": 4},
+     {"text": "is", "tag": "VBZ", "whitespace": " ", "phonemes": "ɪz", "_": {}, "rating": 4},
+     {"text": "14", "tag": "CD", "whitespace": " ", "phonemes": "fˌɔːtˈiːn", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "16", "tag": "CD", "whitespace": " ", "phonemes": "sˌɪkstˈiːn", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "17", "tag": "CD", "whitespace": " ", "phonemes": "sˌɛvntˈiːn", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "18", "tag": "CD", "whitespace": " ", "phonemes": "ˌAtˈiːn", "_": {}, "rating": 4},
+     {"text": "or", "tag": "CC", "whitespace": " ", "phonemes": "ɔː", "_": {}, "rating": 4},
+     {"text": "88", "tag": "CD", "whitespace": "", "phonemes": "ˈAti ˈAt", "_": {}, "rating": 4},
+     {"text": ".", "tag": ".", "whitespace": "", "phonemes": ".", "_": {"rating": 4}}
+    ]
+   }
   }
  ]
 }

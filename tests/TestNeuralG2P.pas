@@ -418,14 +418,14 @@ end;
 
 procedure TTestNeuralG2P.RunFixtureAgreement(Accent: TNeuralG2PAccent);
 const
-  cGroups: array[0..12] of string = ('plain', 'punctuation',
+  cGroups: array[0..13] of string = ('plain', 'punctuation',
     'capitals_acronyms', 'possessives', 'contractions', 'hyphenated',
     'suffix_stems', 'numbers', 'currency', 'percent', 'heteronyms',
-    'unknown_and_names', 'long_mixed');
+    'unknown_and_names', 'long_mixed', 'numbers_more');
   // Lowest token agreement (%) each group must keep; numbers/currency/
-  // percent are task 5.3 (-1: not counted).
-  cMinTokenAgreement: array[0..12] of double = (100, 100, 99, 100, 100, 100,
-    100, -1, -1, -1, 100, 100, 99);
+  // percent/numbers_more are task 5.3 (-1: not counted).
+  cMinTokenAgreement: array[0..13] of double = (100, 100, 99, 100, 100, 100,
+    100, -1, -1, -1, 100, 100, 99, -1);
 var
   Root, Notes: TJSONData;
   Sentences: TJSONArray;
@@ -435,7 +435,7 @@ var
   AccentKey, Group, Mine, RefText, RefPhonemes, MyText, Joined, RefJoined,
     Letters: string;
   Tokens: TNeuralG2PTokenArray;
-  Counts: array[0..12] of TG2PAgreementCounts;
+  Counts: array[0..13] of TG2PAgreementCounts;
   Total: TG2PAgreementCounts;
   SentenceCnt, GroupIdx, GroupCnt, MyIdx, RefIdx, SpanEnd, MySpanEnd,
     BaselineTokens, BaselineDiffering, CharPos, MaxCharPos, MaxSentencePos,
