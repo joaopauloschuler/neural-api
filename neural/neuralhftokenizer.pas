@@ -475,6 +475,9 @@ function IsWhitespaceCP(CP: cardinal): boolean;
 function IsLetterCP(CP: cardinal): boolean;
 function LowercaseCP(CP: cardinal): cardinal;
 function UppercaseCP(CP: cardinal): cardinal;
+// Unaccented base letter over Latin-1 and Latin Extended-A; 0 = no canonical
+// decomposition (ł, ø, æ, ...), 1 = a bare combining mark (drop it).
+function StripAccentBaseCP(CP: cardinal): cardinal;
 // NFD/NFC (Compat=False) or NFKD/NFKC (Compat=True) of a UTF-8 string.
 function UnicodeNormalize(const S: string; Compose: boolean;
   Compat: boolean = false): string;

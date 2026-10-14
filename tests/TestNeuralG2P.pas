@@ -36,6 +36,12 @@ type
     procedure AssertPhonemes(G2P: TNeuralEnglishG2P; const Text,
       Expected: string);
     procedure RunFixtureAgreement(Accent: TNeuralG2PAccent);
+    function ReadFixtureJSON(const FileName: string): TJSONData;
+    // misaki's data/ folder ('' when missing; NEURAL_MISAKI_DATA_DIR overrides)
+    function RealDictionaryDir(): string;
+    // One row per fixture token left unknown or read by an unknown-word
+    // route: "text pieces phonemes", first occurrence only.
+    procedure CollectUnknownWordRows(G2P: TNeuralEnglishG2P; Rows: TStrings);
   published
     // Hand-written JSON: plain, null, POS-keyed and escaped values, a
     // repeated key (the last one wins) and misaki's grown-key lookup.
@@ -66,6 +72,15 @@ type
     // Number readings the fixture does not pin: currency on the CD word
     // after the amount, a number too large for words, the yen sign.
     procedure TestNumberReading;
+    // Tasklist 5.5: words misaki leaves unknown are split into dictionary
+    // words or spelled; pieces, stress pattern and resolution kinds.
+    procedure TestUnknownWords;
+    // Every fixture word misaki left unknown, word -> pieces -> phonemes with
+    // the dictionary subset (US, GB); printed for the tasklist.
+    procedure TestUnknownWordReport;
+    // The same rows with misaki's full dictionaries (ignored when missing):
+    // equal to the subset rows except for words with accents folded.
+    procedure TestUnknownWordRealDictionaries;
     procedure TestEnglishFixtureAgreementUS;
     procedure TestEnglishFixtureAgreementGB;
     // The full misaki dictionaries (ignored when not installed): entry
@@ -74,6 +89,9 @@ type
   end;
 
 implementation
+
+const
+  cUnknownRoutes: TNeuralG2PResolutions = [g2prUnknownSplit, g2prUnknownSpelled];
 
 function TTestNeuralG2P.FixtureDir(): string;
 begin
@@ -95,6 +113,32 @@ procedure TTestNeuralG2P.AssertPhonemes(G2P: TNeuralEnglishG2P; const Text,
   Expected: string);
 begin
   AssertEquals(Text, Expected, G2P.Phonemize(Text));
+end;
+
+function TTestNeuralG2P.ReadFixtureJSON(const FileName: string): TJSONData;
+var
+  Stream: TFileStream;
+  Text: string;
+begin
+  Stream := TFileStream.Create(FixtureDir() + DirectorySeparator + FileName,
+    fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Text, Stream.Size);
+    if Length(Text) > 0 then Stream.ReadBuffer(Text[1], Length(Text));
+  finally
+    Stream.Free;
+  end;
+  Result := HFParseJSONRaw(Text);
+end;
+
+function TTestNeuralG2P.RealDictionaryDir(): string;
+begin
+  Result := GetEnvironmentVariable('NEURAL_MISAKI_DATA_DIR');
+  if Result = '' then
+    Result := IncludeTrailingPathDelimiter(GetUserDir) +
+      'x/lib/python3.12/site-packages/misaki/data';
+  if not FileExists(IncludeTrailingPathDelimiter(Result) + 'us_gold.json') then
+    Result := '';
 end;
 
 procedure TTestNeuralG2P.TestDictionaryParseAndLookup;
@@ -252,8 +296,9 @@ begin
     AssertPhonemes(G2P, 'refactoring', 'ɹifˈæktəɹɪŋ');
     AssertPhonemes(G2P, 'boss''s', 'bˈɔsᵻz');
     AssertPhonemes(G2P, 'dogs''', 'dˈɔɡz');
-    // one level only, no doubled-consonant -ed: misaki leaves it unknown
-    AssertPhonemes(G2P, 'blogged', '');
+    // one level only, no doubled-consonant -ed: misaki leaves it unknown and
+    // the unknown-word split reads B + logged
+    AssertPhonemes(G2P, 'blogged', 'bˈilˌɔɡd');
   finally
     G2P.Free;
   end;
@@ -270,8 +315,9 @@ begin
     AssertPhonemes(G2P, 'foxes', 'fˈɒksɪz');
     AssertPhonemes(G2P, 'boss''s', 'bˈɒsɪz');
     AssertPhonemes(G2P, 'googling', 'ɡˈuːɡᵊlɪŋ');
-    // GB -ing refuses a stem ending in ə
-    AssertPhonemes(G2P, 'refactoring', '');
+    // GB -ing refuses a stem ending in ə; the unknown-word split reads
+    // refactor + ing
+    AssertPhonemes(G2P, 'refactoring', 'ɹiːfˈaktəˌɪŋ');
   finally
     G2P.Free;
   end;
@@ -288,9 +334,6 @@ begin
     AssertPhonemes(G2P, 'self-driving', 'sˌɛlfdɹˈIvɪŋ');
     AssertPhonemes(G2P, 'state-of-the-art', 'stˈAtʌvðiˈɑɹt');
     AssertPhonemes(G2P, 'Re-enter', 'ɹiˈɛntəɹ');
-    // camelCase: an unknown piece vanishes, the known one stays
-    AssertPhonemes(G2P, 'PyTorch', 'tˈɔɹʧ');
-    AssertPhonemes(G2P, 'WiFi', '');
   finally
     G2P.Free;
   end;
@@ -395,12 +438,12 @@ var
 begin
   G2P := CreateFixtureG2P(g2pAmerican);
   try
-    G2P.Phonemize('They blogged, googled FBI and I read it.', Tokens);
+    G2P.Phonemize('They Wrocław, googled FBI and I read it.', Tokens);
     AssertEquals('token count', 10, Length(Tokens));
     AssertEquals('They', Tokens[0].Text);
     AssertTrue('dictionary', g2prDictionary in Tokens[0].Resolutions);
-    AssertEquals('blogged', Tokens[1].Text);
-    AssertFalse('blogged unknown', Tokens[1].IsKnown);
+    AssertEquals('Wrocław', Tokens[1].Text);
+    AssertFalse('Wrocław unknown', Tokens[1].IsKnown);
     AssertTrue('unknown flag', g2prUnknown in Tokens[1].Resolutions);
     AssertTrue('comma', g2prPunctuation in Tokens[2].Resolutions);
     AssertEquals(' ', Tokens[2].Whitespace);
@@ -560,6 +603,210 @@ begin
   end;
 end;
 
+procedure TTestNeuralG2P.TestUnknownWords;
+var
+  G2P: TNeuralEnglishG2P;
+  Tokens: TNeuralG2PTokenArray;
+  Phonemes, Pieces, LongWord: string;
+  Resolutions: TNeuralG2PResolutions;
+
+  // one-token text: its pieces, phonemes and resolution kinds
+  procedure Check(const Text, ExpectedPieces, ExpectedPhonemes: string;
+    ExpectedResolutions: TNeuralG2PResolutions);
+  begin
+    G2P.Phonemize(Text, Tokens);
+    AssertEquals(Text + ' token count', 1, Length(Tokens));
+    AssertEquals(Text + ' pieces', ExpectedPieces, Tokens[0].Pieces);
+    AssertEquals(Text + ' phonemes', ExpectedPhonemes, Tokens[0].Phonemes);
+    AssertTrue(Text + ' resolutions',
+      Tokens[0].Resolutions = ExpectedResolutions);
+    AssertTrue(Text + ' known', Tokens[0].IsKnown);
+  end;
+
+  function CountOf(const Mark, S: string): integer;
+  begin
+    Result := (Length(S) - Length(StringReplace(S, Mark, '', [rfReplaceAll]))) div
+      Length(Mark);
+  end;
+
+begin
+  AssertEquals('unknown word split', G2PResolutionName(g2prUnknownSplit));
+  AssertEquals('unknown word spelled', G2PResolutionName(g2prUnknownSpelled));
+  G2P := CreateFixtureG2P(g2pAmerican);
+  try
+    // fewest pieces: sunflower + field, not sun + flower + field; only the
+    // first piece keeps its primary stress
+    Check('sunflowerfield', 'sunflower+field', 'sˈʌnflˌWəɹfˌild',
+      [g2prUnknownSplit]);
+    AssertEquals('one primary', 1, CountOf('ˈ', Tokens[0].Phonemes));
+    Check('firetruckladder', 'fire+truck+ladder', 'fˈIəɹtɹˌʌklˌædəɹ',
+      [g2prUnknownSplit]);
+    // Capitalized: split on the lowercase form
+    Check('Greenhousegas', 'greenhouse+gas', 'ɡɹˈinhˌWsɡˌæs', [g2prUnknownSplit]);
+    // a letter no word covers is spelled with its letter entry
+    Check('Paulo', 'pa+U+lo', 'pˈɑjˌulˌO', [g2prUnknownSplit, g2prUnknownSpelled]);
+    // no dictionary word at all: every letter spelled, first one primary
+    Check('Qwrtz', 'Q+W+R+T+Z', 'kjˈudˌʌbᵊljuˌɑɹtˌizˌi', [g2prUnknownSpelled]);
+    // an ALL-CAPS string misaki cannot read (É) is spelled as misaki spells
+    // acronyms: all secondary, the last one primary
+    Check('ÉCOLE', 'E+C+O+L+E', G2P.Phonemize('ECOLE'), [g2prUnknownSpelled]);
+    // accents of Latin-1 / Latin Extended-A are folded before the split ...
+    Check('Sünflowerfield', 'sunflower+field', 'sˈʌnflˌWəɹfˌild',
+      [g2prUnknownSplit]);
+    // ... a letter without an ASCII base (ł) leaves the word unknown
+    G2P.Phonemize('Wrocław', Tokens);
+    AssertFalse('Wrocław unknown', Tokens[0].IsKnown);
+    AssertEquals('Wrocław no pieces', '', Tokens[0].Pieces);
+    AssertTrue('Wrocław', Tokens[0].Resolutions * cUnknownRoutes = []);
+    // camelCase: the pieces misaki dropped are read with their neighbours
+    Check('PyTorch', 'P+Y+torch', 'pˈiwˌItˌɔɹʧ',
+      [g2prUnknownSplit, g2prUnknownSpelled]);
+    Check('WiFi', 'W+if+I', 'dˈʌbᵊljuɪfˌI', [g2prUnknownSplit, g2prUnknownSpelled]);
+    // possessive: the name is split, misaki's 's stays
+    G2P.Phonemize('Nguyen''s', Tokens);
+    AssertEquals('Nguyen''s pieces', 'N+guy+en', Tokens[0].Pieces);
+    AssertEquals('Nguyen''s', 'ˈɛnɡˌIˌɛns', Tokens[0].Phonemes);
+    // a clitic misaki drops is not a word: I'd've stays as misaki reads it
+    G2P.Phonemize('I''d''ve', Tokens);
+    AssertEquals('I''d''ve', 'ˌId', Tokens[0].Phonemes);
+    AssertTrue('I''d''ve', Tokens[0].Resolutions * cUnknownRoutes = []);
+    // context: the word before now sees the split word's first sound
+    AssertPhonemes(G2P, 'the applegarden', 'ði ˈæpᵊlɡˌɑɹdən');
+    // the length cap: 64 letters are read, 65 stay unknown
+    LongWord := StringOfChar('b', csG2PMaxSplitLetters);
+    Resolutions := [];
+    AssertTrue('64 letters', G2P.ReadUnknownWord(LongWord, Phonemes, Pieces,
+      Resolutions));
+    AssertEquals('64 spelled letters', csG2PMaxSplitLetters,
+      CountOf('B', Pieces));
+    Resolutions := [];
+    AssertFalse('65 letters', G2P.ReadUnknownWord(LongWord + 'b', Phonemes,
+      Pieces, Resolutions));
+    AssertEquals('65 letters: no phonemes', '', Phonemes);
+  finally
+    G2P.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.CollectUnknownWordRows(G2P: TNeuralEnglishG2P;
+  Rows: TStrings);
+var
+  Root: TJSONData;
+  Sentences: TJSONArray;
+  Tokens: TNeuralG2PTokenArray;
+  Token: TNeuralG2PToken;
+  Seen: TStringList;
+  SentenceCnt, MaxSentencePos, TokenCnt, MaxTokenPos: integer;
+  Pieces: string;
+begin
+  Root := ReadFixtureJSON('sentences.json');
+  Seen := TStringList.Create;
+  try
+    Seen.Sorted := true;
+    Sentences := TJSONObject(Root).Arrays['sentences'];
+    MaxSentencePos := Sentences.Count - 1;
+    for SentenceCnt := 0 to MaxSentencePos do
+    begin
+      G2P.Phonemize(Sentences.Objects[SentenceCnt].Strings['text'], Tokens);
+      MaxTokenPos := Length(Tokens) - 1;
+      for TokenCnt := 0 to MaxTokenPos do
+      begin
+        Token := Tokens[TokenCnt];
+        if Token.IsKnown and (cUnknownRoutes * Token.Resolutions = []) then
+          Continue;
+        if Seen.IndexOf(Token.Text) >= 0 then Continue;
+        Seen.Add(Token.Text);
+        if Token.Pieces = '' then Pieces := '(unknown)' else Pieces := Token.Pieces;
+        Rows.Add(Format('%-22s %-34s %s', [Token.Text, Pieces, Token.Phonemes]));
+      end;
+    end;
+  finally
+    Seen.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.TestUnknownWordReport;
+var
+  G2P: TNeuralEnglishG2P;
+  Rows: TStringList;
+  Accent: TNeuralG2PAccent;
+  RowCnt, MaxRowPos: integer;
+begin
+  Rows := TStringList.Create;
+  try
+    for Accent := g2pAmerican to g2pBritish do
+    begin
+      G2P := CreateFixtureG2P(Accent);
+      try
+        Rows.Clear;
+        CollectUnknownWordRows(G2P, Rows);
+      finally
+        G2P.Free;
+      end;
+      WriteLn('Unknown fixture words (', EnglishG2PDictionaryFileName(Accent,
+        true), ' subset): word, pieces, phonemes');
+      MaxRowPos := Rows.Count - 1;
+      for RowCnt := 0 to MaxRowPos do WriteLn('  ', Rows[RowCnt]);
+      AssertTrue('rows', Rows.Count > 40);
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.TestUnknownWordRealDictionaries;
+var
+  DataDir, Word: string;
+  G2P: TNeuralEnglishG2P;
+  SubsetRows, RealRows: TStringList;
+  Accent: TNeuralG2PAccent;
+  RowCnt, MaxRowPos: integer;
+begin
+  DataDir := RealDictionaryDir();
+  if DataDir = '' then
+    Ignore('misaki dictionaries not found (set NEURAL_MISAKI_DATA_DIR to ' +
+      'misaki''s data/ folder)');
+  SubsetRows := TStringList.Create;
+  RealRows := TStringList.Create;
+  try
+    for Accent := g2pAmerican to g2pBritish do
+    begin
+      SubsetRows.Clear;
+      RealRows.Clear;
+      G2P := CreateFixtureG2P(Accent);
+      try
+        CollectUnknownWordRows(G2P, SubsetRows);
+      finally
+        G2P.Free;
+      end;
+      G2P := TNeuralEnglishG2P.Create(DataDir, Accent);
+      try
+        CollectUnknownWordRows(G2P, RealRows);
+      finally
+        G2P.Free;
+      end;
+      AssertEquals('row count', SubsetRows.Count, RealRows.Count);
+      MaxRowPos := RealRows.Count - 1;
+      for RowCnt := 0 to MaxRowPos do
+      begin
+        if RealRows[RowCnt] = SubsetRows[RowCnt] then Continue;
+        WriteLn(EnglishG2PDictionaryFileName(Accent, true), ' full vs subset:');
+        WriteLn('  full   ', RealRows[RowCnt]);
+        WriteLn('  subset ', SubsetRows[RowCnt]);
+        // the subset holds the keys inside each fixture word; a folded
+        // accent (café -> cafe) makes a key the subset does not have
+        Word := Copy(RealRows[RowCnt], 1, Pos(' ', RealRows[RowCnt]) - 1);
+        AssertTrue('only folded words differ: ' + RealRows[RowCnt],
+          Length(Word) > CodePointCount(Word));
+      end;
+    end;
+  finally
+    RealRows.Free;
+    SubsetRows.Free;
+  end;
+end;
+
 procedure TTestNeuralG2P.RunFixtureAgreement(Accent: TNeuralG2PAccent);
 const
   cGroups: array[0..13] of string = ('plain', 'punctuation',
@@ -569,6 +816,11 @@ const
   // Lowest token agreement (%) each group must keep.
   cMinTokenAgreement: array[0..13] of double = (100, 100, 99, 100, 100, 100,
     100, 100, 100, 100, 100, 100, 100, 100);
+  // Tokens misaki read only in part (a camelCase, possessive, hyphen or URL
+  // piece dropped) that the unknown-word routes now read whole.
+  cRoutedKnownUS = 'blorp-zing,Mia''s,Nguyen''s,PyTorch,Schuler''s,' +
+    'usr/local/bin,WiFi,www.example.org/page';
+  cRoutedKnownGB = cRoutedKnownUS;
 var
   Root, Notes: TJSONData;
   Sentences: TJSONArray;
@@ -581,23 +833,12 @@ var
   Counts: array[0..13] of TG2PAgreementCounts;
   Total: TG2PAgreementCounts;
   SentenceCnt, GroupIdx, GroupCnt, MyIdx, RefIdx, SpanEnd, MySpanEnd,
-    BaselineTokens, BaselineDiffering, CharPos, MaxCharPos, MaxSentencePos,
+    BaselineTokens, BaselineDiffering, UncountedPOSTokens, CharPos, MaxCharPos, MaxSentencePos,
     MaxLinePos: integer;
-  IsCounted, IsPOSToken, IsEqual, IsRefUnknown: boolean;
-  Lines: TStringList;
-
-  function ReadFile(const FileName: string): string;
-  var
-    Stream: TFileStream;
-  begin
-    Stream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
-    try
-      SetLength(Result, Stream.Size);
-      if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
-    finally
-      Stream.Free;
-    end;
-  end;
+  IsCounted, IsPOSToken, IsEqual, IsRefUnknown, IsRouted,
+    IsBeforeRouted: boolean;
+  Lines, ContextLines, RoutedKnown: TStringList;
+  ExpectedRoutedKnown: string;
 
   function IsPOSKeyedGold(const Key: string): boolean;
   var
@@ -629,15 +870,18 @@ var
 
 begin
   if Accent = g2pBritish then AccentKey := 'gb' else AccentKey := 'us';
-  Root := HFParseJSONRaw(ReadFile(FixtureDir() + DirectorySeparator +
-    'sentences.json'));
-  Notes := HFParseJSONRaw(ReadFile(FixtureDir() + DirectorySeparator +
-    'notes.json'));
+  Root := ReadFixtureJSON('sentences.json');
+  Notes := ReadFixtureJSON('notes.json');
   G2P := CreateFixtureG2P(Accent);
   Lines := TStringList.Create;
+  ContextLines := TStringList.Create;
+  RoutedKnown := TStringList.Create;
+  RoutedKnown.Sorted := true;
+  RoutedKnown.Duplicates := dupIgnore;
   try
     FillChar(Counts, SizeOf(Counts), 0);
     FillChar(Total, SizeOf(Total), 0);
+    UncountedPOSTokens := 0;
     Sentences := TJSONObject(Root).Arrays['sentences'];
     MaxSentencePos := Sentences.Count - 1;
     for SentenceCnt := 0 to MaxSentencePos do
@@ -676,7 +920,21 @@ begin
         if (MyIdx < Length(Tokens)) and (Tokens[MyIdx].Text = RefText) then
         begin
           IsEqual := Tokens[MyIdx].Phonemes = RefPhonemes;
-          if IsCounted then
+          // task 5.5 owns a token an unknown-word route read (misaki dropped
+          // all or part of it) and the context it gives the word before it
+          IsRouted := cUnknownRoutes * Tokens[MyIdx].Resolutions <> [];
+          IsBeforeRouted := (MyIdx + 1 < Length(Tokens)) and
+            (cUnknownRoutes * Tokens[MyIdx + 1].Resolutions <> []);
+          if IsCounted and IsPOSToken and (IsRouted or (IsBeforeRouted and
+            not IsEqual)) then
+            Inc(UncountedPOSTokens);
+          if IsCounted and IsRouted then
+            RoutedKnown.Add(RefText)
+          else if IsCounted and IsBeforeRouted and not IsEqual then
+            ContextLines.Add(Format('  %s #%d %s: "%s" misaki %s, port %s ' +
+              '(next word now read)', [AccentKey, Sentence.Integers['id'], Group,
+              RefText, RefPhonemes, Tokens[MyIdx].Phonemes]))
+          else if IsCounted then
           begin
             CountToken(Counts[GroupIdx], IsPOSToken, IsEqual);
             if not IsEqual then
@@ -754,8 +1012,17 @@ begin
       Percent(BaselineTokens - BaselineDiffering, BaselineTokens)]));
     MaxLinePos := Lines.Count - 1;
     for GroupCnt := 0 to MaxLinePos do WriteLn(Lines[GroupCnt]);
+    WriteLn('  not counted, read by an unknown-word route although misaki read ',
+      'part of it: ', RoutedKnown.CommaText);
+    MaxLinePos := ContextLines.Count - 1;
+    for GroupCnt := 0 to MaxLinePos do WriteLn(ContextLines[GroupCnt]);
+    if Accent = g2pBritish then ExpectedRoutedKnown := cRoutedKnownGB
+    else ExpectedRoutedKnown := cRoutedKnownUS;
+    AssertEquals('tokens misaki read in part, now read whole',
+      ExpectedRoutedKnown, RoutedKnown.CommaText);
+    // a POS-keyed token task 5.5 changed (minus its context) is not compared
     AssertEquals('POS-keyed token count matches notes.json', BaselineTokens,
-      Total.POSTokens);
+      Total.POSTokens + UncountedPOSTokens);
     // DEFAULT alone agrees on 70.3%; the rule tagger reaches 96.8% (153/158)
     AssertTrue('POS-keyed agreement ' +
       Percent(Total.POSTokensEqual, Total.POSTokens) + ' >= 95%',
@@ -766,6 +1033,8 @@ begin
           Percent(TokensEqual, Tokens),
           100.0 * TokensEqual >= cMinTokenAgreement[GroupCnt] * Tokens);
   finally
+    RoutedKnown.Free;
+    ContextLines.Free;
     Lines.Free;
     G2P.Free;
     Notes.Free;
@@ -793,13 +1062,10 @@ var
   G2P: TNeuralEnglishG2P;
   StartTime: QWord;
 begin
-  DataDir := GetEnvironmentVariable('NEURAL_MISAKI_DATA_DIR');
+  DataDir := RealDictionaryDir();
   if DataDir = '' then
-    DataDir := IncludeTrailingPathDelimiter(GetUserDir) +
-      'x/lib/python3.12/site-packages/misaki/data';
-  if not FileExists(IncludeTrailingPathDelimiter(DataDir) + 'us_gold.json') then
-    Ignore('misaki dictionaries not found in ' + DataDir +
-      ' (set NEURAL_MISAKI_DATA_DIR to misaki''s data/ folder)');
+    Ignore('misaki dictionaries not found (set NEURAL_MISAKI_DATA_DIR to ' +
+      'misaki''s data/ folder)');
   for Accent := g2pAmerican to g2pBritish do
   begin
     StartTime := GetTickCount64;

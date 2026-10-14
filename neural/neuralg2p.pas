@@ -29,12 +29,25 @@ Kokoro-82M reads). A pure-Pascal port of misaki 0.9.4 `en.py`
     EnglishYearWords, EnglishDecimalWords): years, ordinals, decimals,
     version numbers, digits inside words, $ £ € amounts and % & + @.
 
-Not here (later tasks), with their hook points: splitting unknown words into
-dictionary words (5.5: a token or piece with g2prUnknown has empty phonemes,
-as misaki does with fallback=None); long-text chunking (5.6: Phonemize's
-per-token output). Not ported: misaki's markdown overrides ([word](/IPA/),
-[word](+1), [n](#flags#), so no number flags) and its Unicode digit folding
-(numeric_if_needed).
+  * Unknown words (tasklist 5.5, beyond misaki, which leaves them empty with
+    fallback=None), ReadUnknownWord: the word's letters are folded to ASCII
+    (NFKC, apostrophes dropped, Latin-1 / Latin Extended-A accents stripped;
+    any other character leaves it unknown). An ALL-CAPS string of 2+ letters
+    is spelled as misaki spells acronyms. Any other word, lowercased and at
+    most csG2PMaxSplitLetters long, is covered by dynamic programming with
+    dictionary words of 2+ letters containing a vowel letter (DEFAULT
+    reading, gold before silver, exact key before its Capitalized form) and
+    single spelled letters: fewest spelled letters, then fewest pieces, then
+    the longest first piece. Only the first piece keeps primary stress; a
+    Capitalized word takes misaki's capital stress (0.5). Inside a multi-piece
+    word the run of letter pieces around an unread one is read as one word
+    (WiFi, PyTorch, Schuler's); a clitic piece misaki drops ('ve) stays
+    unread. Tokens report g2prUnknownSplit / g2prUnknownSpelled and Pieces.
+
+Not here (later tasks), with their hook points: long-text chunking (5.6:
+Phonemize's per-token output). Not ported: misaki's markdown overrides
+([word](/IPA/), [word](+1), [n](#flags#), so no number flags) and its Unicode
+digit folding (numeric_if_needed).
 Deviations: a word of more than csMaxMergedPieces sub-tokens only tries merges
 of up to that many (misaki's merge loop is cubic in the sub-token count); a
 decimal is read from its digits as written (num2words reads the float64
@@ -55,6 +68,8 @@ uses
 const
   // misaki's stress argument None (no change); real values are -2..2.
   csG2PNoStress = 1000.0;
+  // Longest word (letters) the unknown-word split reads; longer stays unknown.
+  csG2PMaxSplitLetters = 64;
 
 type
   ENeuralG2PError = class(Exception);
@@ -71,7 +86,10 @@ type
     g2prStemRule,      // -s / -ed / -ing over a known stem
     g2prSpelled,       // spelled with the letter entries
     g2prUnknown,       // no reading: empty phonemes (misaki None)
-    g2prNumber         // misaki get_number: digits read as number words
+    g2prNumber,        // misaki get_number: digits read as number words
+    g2prUnknownSplit,  // unknown to misaki: split into dictionary words
+    g2prUnknownSpelled // unknown to misaki: letters spelled (an ALL-CAPS
+                       // string, or letters no dictionary word covers)
   );
   TNeuralG2PResolutions = set of TNeuralG2PResolution;
 
@@ -83,6 +101,9 @@ type
     Phonemes: string;
     IsKnown: boolean;     // false: misaki's None, written as ''
     Resolutions: TNeuralG2PResolutions;
+    // Unknown-word routes only: the pieces read, '+'-joined ("sunflower+field",
+    // a spelled letter in upper case: "pa+U+lo"); '' otherwise.
+    Pieces: string;
   end;
   TNeuralG2PTokenArray = array of TNeuralG2PToken;
 
@@ -112,6 +133,7 @@ type
     FVariantCount: integer;
     FSlots: array of integer;  // entry index + 1, 0 = empty
     FSlotMask: integer;
+    FMaxKeyLength: integer;    // bytes
     procedure ParseText();
     procedure BuildIndex();
     procedure RaiseParseError(Position: integer; const Expected: string);
@@ -126,6 +148,8 @@ type
       const SourceName: string = '');
     // Exact key lookup; -1 when absent.
     function IndexOf(const Key: string): integer;
+    // IndexOf on Len bytes at P (no string built).
+    function IndexOfBytes(P: PAnsiChar; Len: integer): integer;
     // misaki grow_dictionary: a lowercase key also answers its Capitalized
     // form and vice versa (keys of 2+ characters, the exact key wins).
     function IndexOfGrown(const Key: string): integer;
@@ -138,6 +162,7 @@ type
       out Phonemes: string): boolean;
     function KeyAt(Index: integer): string;
     property Count: integer read FEntryCount;
+    property MaxKeyLength: integer read FMaxKeyLength;
   end;
 
   // misaki TokenContext.future_vowel: None / False / True.
@@ -170,6 +195,9 @@ type
     Prespace: boolean;
     Currency: string;  // misaki _.currency: '$', '£' or '€' on an amount
     Resolutions: TNeuralG2PResolutions;
+    SplitPieces: string;   // TNeuralG2PToken.Pieces of an unknown-word route
+    // The merge (misaki's multi-piece loop) that read this piece.
+    MergeFirst, MergeLast: integer;
   end;
 
   // Consecutive pieces read as one word (misaki's list tokens).
@@ -215,6 +243,8 @@ type
     procedure ResolveGroups();
     procedure ResolveMultiPieceGroup(var Ctx: TNeuralG2PContext;
       FirstPiece, LastPiece: integer);
+    procedure ResolveUnknownRuns(var Ctx: TNeuralG2PContext;
+      FirstPiece, LastPiece: integer);
     procedure ResolveTokens(FirstPiece, LastPiece: integer);
     function HeaviestPieceTag(FirstPiece, LastPiece: integer): string;
     function PiecesText(FirstPiece, LastPiece: integer): string;
@@ -253,6 +283,10 @@ type
     function ReadWord(const Text, Tag, Currency: string; IsHead: boolean;
       const Ctx: TNeuralG2PContext; out Phonemes: string;
       var Resolutions: TNeuralG2PResolutions): boolean;
+    // unknown-word routes
+    function LetterReading(Letter: char; out Phonemes: string): boolean;
+    function SplitIntoWords(const Lower: string; out Phonemes, Pieces: string;
+      var Resolutions: TNeuralG2PResolutions): boolean;
   public
     // Loads <DictionaryDir>/{us|gb}_gold.json and _silver.json; raises
     // ENeuralG2PError naming every missing file.
@@ -261,6 +295,10 @@ type
     function Phonemize(const Text: string): string; overload;
     function Phonemize(const Text: string;
       out Tokens: TNeuralG2PTokenArray): string; overload;
+    // Tasklist 5.5 routes for a word misaki left unknown (see the unit header);
+    // false (unknown) on letters with no ASCII base or over csG2PMaxSplitLetters.
+    function ReadUnknownWord(const Text: string; out Phonemes, Pieces: string;
+      var Resolutions: TNeuralG2PResolutions): boolean;
     property Accent: TNeuralG2PAccent read FAccent;
     property Gold: TNeuralG2PDictionary read FGold;
     property Silver: TNeuralG2PDictionary read FSilver;
@@ -1030,6 +1068,8 @@ begin
     g2prSpelled: Result := 'spelled';
     g2prUnknown: Result := 'unknown';
     g2prNumber: Result := 'number';
+    g2prUnknownSplit: Result := 'unknown word split';
+    g2prUnknownSpelled: Result := 'unknown word spelled';
   else
     Result := '?';
   end;
@@ -1475,9 +1515,12 @@ begin
   FillChar(FSlots[0], Capacity * SizeOf(integer), 0);
   FSlotMask := Capacity - 1;
   WriteCnt := 0;
+  FMaxKeyLength := 0;
   MaxEntryPos := FEntryCount - 1;
   for EntryCnt := 0 to MaxEntryPos do
   begin
+    if FEntries[EntryCnt].KeyLength > FMaxKeyLength then
+      FMaxKeyLength := FEntries[EntryCnt].KeyLength;
     Slot := FindSlot(@FText[FEntries[EntryCnt].KeyStart],
       FEntries[EntryCnt].KeyLength);
     Existing := FSlots[Slot] - 1;
@@ -1524,11 +1567,14 @@ end;
 
 function TNeuralG2PDictionary.IndexOf(const Key: string): integer;
 begin
+  if Key = '' then Result := IndexOfBytes(nil, 0)
+  else Result := IndexOfBytes(@Key[1], Length(Key));
+end;
+
+function TNeuralG2PDictionary.IndexOfBytes(P: PAnsiChar; Len: integer): integer;
+begin
   if FSlots = nil then Exit(-1);
-  if Key = '' then
-    Result := FSlots[FindSlot(nil, 0)] - 1
-  else
-    Result := FSlots[FindSlot(@Key[1], Length(Key))] - 1;
+  Result := FSlots[FindSlot(P, Len)] - 1;
 end;
 
 function TNeuralG2PDictionary.IndexOfGrown(const Key: string): integer;
@@ -3024,6 +3070,239 @@ begin
 end;
 
 { ---------------------------------------------------------------- }
+{ Unknown words (tasklist 5.5, beyond misaki)                        }
+{ ---------------------------------------------------------------- }
+
+// Text -> ASCII letters: NFKC, apostrophes dropped, Latin-1 / Latin
+// Extended-A accents stripped (café -> cafe); false on any other character.
+function FoldUnknownWordLetters(const Text: string; out Letters: string): boolean;
+var
+  Word: string;
+  Position, TextLen, LetterCount: integer;
+  CP, Base: cardinal;
+begin
+  Word := Text;
+  if HasNonASCII(Word) then Word := UnicodeNormalize(Word, true, true);
+  TextLen := Length(Word);
+  SetLength(Letters, TextLen);
+  LetterCount := 0;
+  Position := 1;
+  while Position <= TextLen do
+  begin
+    CP := NextCodePoint(Word, Position);
+    if IsApostropheCP(CP) then Continue;
+    if CP >= $80 then
+    begin
+      Base := StripAccentBaseCP(CP);
+      if Base = 1 then Continue;
+      CP := Base;
+    end;
+    if not (((CP >= Ord('A')) and (CP <= Ord('Z'))) or
+      ((CP >= Ord('a')) and (CP <= Ord('z')))) then
+    begin
+      Letters := '';
+      Exit(false);
+    end;
+    Inc(LetterCount);
+    Letters[LetterCount] := Chr(CP);
+  end;
+  SetLength(Letters, LetterCount);
+  Result := LetterCount > 0;
+end;
+
+// Parts[0..PartCount-1] joined by Separator, one allocation.
+function JoinStringParts(const Parts: array of string; PartCount: integer;
+  const Separator: string): string;
+var
+  PartCnt, MaxPartPos, TotalLen, OutPos, PartLen, SeparatorLen: integer;
+begin
+  if PartCount = 0 then Exit('');
+  SeparatorLen := Length(Separator);
+  MaxPartPos := PartCount - 1;
+  TotalLen := SeparatorLen * MaxPartPos;
+  for PartCnt := 0 to MaxPartPos do Inc(TotalLen, Length(Parts[PartCnt]));
+  SetLength(Result, TotalLen);
+  OutPos := 1;
+  for PartCnt := 0 to MaxPartPos do
+  begin
+    if (PartCnt > 0) and (SeparatorLen > 0) then
+    begin
+      Move(Separator[1], Result[OutPos], SeparatorLen);
+      Inc(OutPos, SeparatorLen);
+    end;
+    PartLen := Length(Parts[PartCnt]);
+    if PartLen > 0 then Move(Parts[PartCnt][1], Result[OutPos], PartLen);
+    Inc(OutPos, PartLen);
+  end;
+end;
+
+// The gold entry of one letter (as get_NNP spells: A -> ˈA, B -> bˈi).
+function TNeuralEnglishG2P.LetterReading(Letter: char;
+  out Phonemes: string): boolean;
+var
+  UpperLetter: char;
+  EntryIdx: integer;
+begin
+  UpperLetter := UpCase(Letter);
+  EntryIdx := FGold.IndexOfBytes(@UpperLetter, 1);
+  Result := (EntryIdx >= 0) and FGold.DefaultReading(EntryIdx, Phonemes);
+  if not Result then Phonemes := '';
+end;
+
+// Route 2 on lowercase ASCII letters: the cover with the fewest spelled
+// letters, then the fewest pieces, then the longest first piece.
+function TNeuralEnglishG2P.SplitIntoWords(const Lower: string;
+  out Phonemes, Pieces: string;
+  var Resolutions: TNeuralG2PResolutions): boolean;
+const
+  // a spelled letter outweighs any number of word pieces (64 at most)
+  cSpelledLetterCost = csG2PMaxSplitLetters + 1;
+  cNoCover = MaxInt;
+  cVowelLetters = ['a', 'e', 'i', 'o', 'u', 'y'];
+var
+  Capital: string;
+  Cost, NextStart: array[0..csG2PMaxSplitLetters] of integer;
+  PieceReadings, PieceTexts: array[0..csG2PMaxSplitLetters - 1] of string;
+  LetterCount, StartPos, EndPos, MaxEndPos, MaxPieceLength, Candidate,
+    PieceCount: integer;
+  HasVowelLetter: boolean;
+  Reading: string;
+
+  // misaki lookup order: gold before silver, in each the exact key before
+  // its Capitalized form (grow_dictionary); the entry needs a DEFAULT reading
+  function FindSpan(Start, Len: integer; out Dictionary: TNeuralG2PDictionary;
+    out EntryIdx: integer): boolean;
+  var
+    DictionaryCnt: integer;
+  begin
+    Capital[Start] := UpCase(Lower[Start]);
+    Result := false;
+    for DictionaryCnt := 0 to 1 do
+    begin
+      if DictionaryCnt = 0 then Dictionary := FGold else Dictionary := FSilver;
+      EntryIdx := Dictionary.IndexOfBytes(@Lower[Start], Len);
+      if EntryIdx < 0 then EntryIdx := Dictionary.IndexOfBytes(@Capital[Start], Len);
+      if (EntryIdx >= 0) and not Dictionary.FEntries[EntryIdx].ValueIsNull then
+      begin
+        Result := true;
+        Break;
+      end;
+    end;
+    Capital[Start] := Lower[Start];
+  end;
+
+  function HasLetterEntry(Letter: char): boolean;
+  var
+    UpperLetter: char;
+    EntryIdx: integer;
+  begin
+    UpperLetter := UpCase(Letter);
+    EntryIdx := FGold.IndexOfBytes(@UpperLetter, 1);
+    Result := (EntryIdx >= 0) and not FGold.FEntries[EntryIdx].ValueIsNull;
+  end;
+
+var
+  Dictionary: TNeuralG2PDictionary;
+  EntryIdx: integer;
+begin
+  Phonemes := '';
+  Pieces := '';
+  LetterCount := Length(Lower);
+  if (LetterCount = 0) or (LetterCount > csG2PMaxSplitLetters) then Exit(false);
+  Capital := Lower;
+  UniqueString(Capital);
+  MaxPieceLength := Max(FGold.MaxKeyLength, FSilver.MaxKeyLength);
+  // Cost[StartPos]: best cover of Lower[StartPos + 1 .. LetterCount]
+  Cost[LetterCount] := 0;
+  for StartPos := LetterCount - 1 downto 0 do
+  begin
+    Cost[StartPos] := cNoCover;
+    if (Cost[StartPos + 1] <> cNoCover) and HasLetterEntry(Lower[StartPos + 1]) then
+    begin
+      Cost[StartPos] := Cost[StartPos + 1] + cSpelledLetterCost + 1;
+      NextStart[StartPos] := StartPos + 1;
+    end;
+    HasVowelLetter := Lower[StartPos + 1] in cVowelLetters;
+    MaxEndPos := Min(LetterCount, StartPos + MaxPieceLength);
+    for EndPos := StartPos + 2 to MaxEndPos do
+    begin
+      HasVowelLetter := HasVowelLetter or (Lower[EndPos] in cVowelLetters);
+      // a piece without a vowel letter is an abbreviation (mr, st, ft)
+      if not HasVowelLetter or (Cost[EndPos] = cNoCover) then Continue;
+      Candidate := Cost[EndPos] + 1;
+      if (Candidate <= Cost[StartPos]) and
+        FindSpan(StartPos + 1, EndPos - StartPos, Dictionary, EntryIdx) then
+      begin
+        Cost[StartPos] := Candidate;
+        NextStart[StartPos] := EndPos;
+      end;
+    end;
+  end;
+  if Cost[0] = cNoCover then Exit(false);
+  PieceCount := 0;
+  StartPos := 0;
+  while StartPos < LetterCount do
+  begin
+    EndPos := NextStart[StartPos];
+    if EndPos = StartPos + 1 then
+    begin
+      LetterReading(Lower[EndPos], Reading);
+      PieceTexts[PieceCount] := UpCase(Lower[EndPos]);
+      Include(Resolutions, g2prUnknownSpelled);
+    end
+    else
+    begin
+      FindSpan(StartPos + 1, EndPos - StartPos, Dictionary, EntryIdx);
+      Dictionary.DefaultReading(EntryIdx, Reading);
+      PieceTexts[PieceCount] := Copy(Lower, StartPos + 1, EndPos - StartPos);
+      Include(Resolutions, g2prUnknownSplit);
+    end;
+    // only the first piece keeps its primary stress
+    if PieceCount > 0 then
+      Reading := StringReplace(Reading, csPrimaryStress, csSecondaryStress,
+        [rfReplaceAll]);
+    PieceReadings[PieceCount] := Reading;
+    Inc(PieceCount);
+    StartPos := EndPos;
+  end;
+  Phonemes := JoinStringParts(PieceReadings, PieceCount, '');
+  Pieces := JoinStringParts(PieceTexts, PieceCount, '+');
+  Result := true;
+end;
+
+function TNeuralEnglishG2P.ReadUnknownWord(const Text: string;
+  out Phonemes, Pieces: string; var Resolutions: TNeuralG2PResolutions): boolean;
+var
+  Letters, Lower: string;
+  LetterCount, LetterCnt, Position: integer;
+  LetterTexts: array[0..csG2PMaxSplitLetters - 1] of string;
+begin
+  Phonemes := '';
+  Pieces := '';
+  // a clitic ('ve, 'll) is not a word: misaki reads it or drops it
+  Position := 1;
+  if (Text = '') or IsApostropheCP(NextCodePoint(Text, Position)) then Exit(false);
+  if not FoldUnknownWordLetters(Text, Letters) then Exit(false);
+  LetterCount := Length(Letters);
+  if LetterCount > csG2PMaxSplitLetters then Exit(false);
+  Lower := LowerCase(Letters);
+  // route 3: an ALL-CAPS string is spelled as misaki spells acronyms
+  if (LetterCount >= 2) and (Letters = UpperCase(Letters)) then
+  begin
+    if not SpellLetters(Letters, Phonemes) then Exit(false);
+    for LetterCnt := 1 to LetterCount do
+      LetterTexts[LetterCnt - 1] := Letters[LetterCnt];
+    Pieces := JoinStringParts(LetterTexts, LetterCount, '+');
+    Include(Resolutions, g2prUnknownSpelled);
+    Exit(true);
+  end;
+  // route 2; Capitalized and mixed case take misaki's capital stress (0.5)
+  if not SplitIntoWords(Lower, Phonemes, Pieces, Resolutions) then Exit(false);
+  if Letters <> Lower then Phonemes := ApplyG2PStress(Phonemes, 0.5);
+  Result := true;
+end;
+
+{ ---------------------------------------------------------------- }
 { Right-to-left resolution (misaki G2P.__call__)                    }
 { ---------------------------------------------------------------- }
 
@@ -3305,15 +3584,15 @@ begin
     if ReadWord(MergedText, MergedTag, MergedCurrency, Left = FirstPiece, Ctx,
       MergedPhonemes, Resolutions) then
     begin
-      FPieces[Left].Phonemes := MergedPhonemes;
-      FPieces[Left].HasPhonemes := true;
-      FPieces[Left].Resolutions := Resolutions;
-      for PieceCnt := Left + 1 to MaxMergedPos do
+      for PieceCnt := Left to MaxMergedPos do
       begin
         FPieces[PieceCnt].Phonemes := '';
         FPieces[PieceCnt].HasPhonemes := true;
         FPieces[PieceCnt].Resolutions := Resolutions;
+        FPieces[PieceCnt].MergeFirst := Left;
+        FPieces[PieceCnt].MergeLast := MaxMergedPos;
       end;
+      FPieces[Left].Phonemes := MergedPhonemes;
       UpdateContext(Ctx, true, MergedPhonemes, MergedText, MergedTag);
       Right := Left;
       Left := Max(FirstPiece, Right - csMaxMergedPieces);
@@ -3338,6 +3617,8 @@ begin
         begin
           FPieces[Right].Phonemes := '';
           FPieces[Right].HasPhonemes := true;
+          FPieces[Right].MergeFirst := Right;
+          FPieces[Right].MergeLast := Right;
         end
         else
           FPieces[Right].Resolutions := FPieces[Right].Resolutions +
@@ -3346,7 +3627,120 @@ begin
       Left := Max(FirstPiece, Right - csMaxMergedPieces);
     end;
   end;
+  ResolveUnknownRuns(Ctx, FirstPiece, LastPiece);
   ResolveTokens(FirstPiece, LastPiece);
+end;
+
+// Tasklist 5.5 for pieces misaki's loop left unread: the run of adjacent letter
+// pieces around one (camelCase WiFi, PyTorch) is read as one unknown word.
+procedure TNeuralEnglishG2P.ResolveUnknownRuns(var Ctx: TNeuralG2PContext;
+  FirstPiece, LastPiece: integer);
+var
+  PieceCnt, RunFirst, RunLast, Probe, MaxLeftPiecePos: integer;
+  Text, Phonemes, SplitPieces: string;
+  Resolutions: TNeuralG2PResolutions;
+  HasReadPieceOnLeft, IsClitic: boolean;
+
+  function IsLetterPiece(PieceIdx: integer): boolean;
+  begin
+    Result := IsAlphaText(FPieces[PieceIdx].Text);
+  end;
+
+  // the apostrophe subtokenize splits off a clitic: ' + ve, ' + ll
+  function IsApostrophePiece(PieceIdx: integer): boolean;
+  var
+    Position, TextLen: integer;
+  begin
+    TextLen := Length(FPieces[PieceIdx].Text);
+    Position := 1;
+    while Position <= TextLen do
+      if not IsApostropheCP(NextCodePoint(FPieces[PieceIdx].Text, Position)) then
+        Exit(false);
+    Result := TextLen > 0;
+  end;
+
+  function IsUnreadLetterPiece(PieceIdx: integer): boolean;
+  begin
+    Result := not FPieces[PieceIdx].HasPhonemes and IsLetterPiece(PieceIdx);
+  end;
+
+  // a merge of misaki's loop made of letter pieces only, so the run may take
+  // it whole
+  function IsLetterMerge(MergeFirst, MergeLast: integer): boolean;
+  var
+    MergeCnt: integer;
+  begin
+    for MergeCnt := MergeFirst to MergeLast do
+      if not IsLetterPiece(MergeCnt) then Exit(false);
+    Result := true;
+  end;
+
+begin
+  PieceCnt := LastPiece;
+  // right to left, so Ctx ends with the leftmost reading, as misaki's loop
+  while PieceCnt >= FirstPiece do
+  begin
+    if FPieces[PieceCnt].HasPhonemes then
+    begin
+      Dec(PieceCnt);
+      Continue;
+    end;
+    RunFirst := PieceCnt;
+    RunLast := PieceCnt;
+    if IsLetterPiece(PieceCnt) then
+    begin
+      while RunLast < LastPiece do
+      begin
+        Probe := RunLast + 1;
+        if IsUnreadLetterPiece(Probe) then RunLast := Probe
+        else if FPieces[Probe].HasPhonemes and
+          (FPieces[Probe].MergeFirst = Probe) and
+          IsLetterMerge(Probe, FPieces[Probe].MergeLast) then
+          RunLast := FPieces[Probe].MergeLast
+        else Break;
+      end;
+      while RunFirst > FirstPiece do
+      begin
+        Probe := RunFirst - 1;
+        if IsUnreadLetterPiece(Probe) then RunFirst := Probe
+        else if FPieces[Probe].HasPhonemes and
+          (FPieces[Probe].MergeLast = Probe) and
+          IsLetterMerge(FPieces[Probe].MergeFirst, Probe) then
+          RunFirst := FPieces[Probe].MergeFirst
+        else Break;
+      end;
+    end;
+    Text := PiecesText(RunFirst, RunLast);
+    Resolutions := [];
+    // a clitic misaki drops (I'd've, GB that'll) is not a word
+    IsClitic := (RunFirst > FirstPiece) and IsApostrophePiece(RunFirst - 1);
+    if not IsClitic and ReadUnknownWord(Text, Phonemes, SplitPieces,
+      Resolutions) then
+    begin
+      for Probe := RunFirst to RunLast do
+      begin
+        FPieces[Probe].Phonemes := '';
+        FPieces[Probe].HasPhonemes := true;
+        FPieces[Probe].Resolutions := Resolutions;
+        FPieces[Probe].SplitPieces := '';
+        FPieces[Probe].MergeFirst := RunFirst;
+        FPieces[Probe].MergeLast := RunLast;
+      end;
+      FPieces[RunFirst].Phonemes := Phonemes;
+      FPieces[RunFirst].SplitPieces := SplitPieces;
+      HasReadPieceOnLeft := false;
+      MaxLeftPiecePos := RunFirst - 1;
+      for Probe := FirstPiece to MaxLeftPiecePos do
+        if FPieces[Probe].HasPhonemes and (FPieces[Probe].Phonemes <> '') then
+        begin
+          HasReadPieceOnLeft := true;
+          Break;
+        end;
+      if not HasReadPieceOnLeft then
+        UpdateContext(Ctx, true, Phonemes, Text, FPieces[RunFirst].Tag);
+    end;
+    PieceCnt := RunFirst - 1;
+  end;
 end;
 
 procedure TNeuralEnglishG2P.ResolveGroups();
@@ -3354,7 +3748,7 @@ var
   GroupCnt, PieceIdx: integer;
   Ctx: TNeuralG2PContext;
   Resolutions: TNeuralG2PResolutions;
-  Phonemes, Text: string;
+  Phonemes, Text, SplitPieces: string;
 begin
   Ctx.NextSound := g2pnsUnknown;
   Ctx.NextIsTo := false;
@@ -3370,8 +3764,17 @@ begin
         else Text := FPieces[PieceIdx].Text;
         FPieces[PieceIdx].HasPhonemes := ReadWord(Text, FPieces[PieceIdx].Tag,
           FPieces[PieceIdx].Currency, true, Ctx, Phonemes, Resolutions);
+        if not FPieces[PieceIdx].HasPhonemes then
+        begin
+          // flags of misaki's failed attempts (a stem read, then refused)
+          Resolutions := [];
+          FPieces[PieceIdx].HasPhonemes := ReadUnknownWord(
+            FPieces[PieceIdx].Text, Phonemes, SplitPieces, Resolutions);
+          if FPieces[PieceIdx].HasPhonemes then
+            FPieces[PieceIdx].SplitPieces := SplitPieces
+          else Include(Resolutions, g2prUnknown);
+        end;
         FPieces[PieceIdx].Phonemes := Phonemes;
-        if not FPieces[PieceIdx].HasPhonemes then Include(Resolutions, g2prUnknown);
         FPieces[PieceIdx].Resolutions := Resolutions;
       end;
       UpdateContext(Ctx, FPieces[PieceIdx].HasPhonemes,
@@ -3405,7 +3808,12 @@ begin
       Token.Text := PiecesText(FirstPiece, LastPiece);
       Token.Phonemes := PiecesPhonemes(FirstPiece, LastPiece, AnyKnown);
       for PieceCnt := FirstPiece to LastPiece do
+      begin
         Token.Resolutions := Token.Resolutions + FPieces[PieceCnt].Resolutions;
+        if FPieces[PieceCnt].SplitPieces = '' then Continue;
+        if Token.Pieces <> '' then Token.Pieces := Token.Pieces + ' ';
+        Token.Pieces := Token.Pieces + FPieces[PieceCnt].SplitPieces;
+      end;
       Token.Whitespace := FPieces[LastPiece].Whitespace;
       // a single unread piece is misaki's None; a merged list reads ''
       Token.IsKnown := AnyKnown or (FirstPiece <> LastPiece);
