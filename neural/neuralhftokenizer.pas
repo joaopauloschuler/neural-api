@@ -35,7 +35,11 @@ Coded by Claude (AI).
 //     Replace/ByteFallback/Fuse/Strip decoder chain. The Metaspace
 //     PRE_TOKENIZER variant (Mistral-v0.x / legacy=false Llama exports:
 //     replacement, prepend_scheme always/first/never, split) and the
-//     Metaspace decoder are supported too.
+//     Metaspace decoder are supported too. A LITERAL Split pre_tokenizer
+//     ({"String": ...} pattern, behavior MergedWithPrevious /
+//     MergedWithNext / Isolated / Removed) applies to the normalized text
+//     on this path - the Gemma-3 / Gemma-4 / EmbeddingGemma-2 form
+//     (Replace(" "->"▁") normalizer + Split(" ", MergedWithPrevious)).
 //   * Split-regex byte-level BPE (Qwen2/Qwen3, Llama-3 style):
 //     Sequence[Split(pattern, behavior=Isolated), ByteLevel(use_regex=
 //     false)]. No regex engine is vendored -- the shipped pattern string
@@ -228,6 +232,14 @@ type
       FMSReplacement: string;     // usually U+2581
       FMSPrependScheme: string;   // 'always' | 'first' | 'never'
       FMSSplit: boolean;          // split before each replacement char
+      // Split pre-tokenizer with a LITERAL pattern ({"String": ...}, not
+      // {"Regex": ...}) on the metaspace/byte-fallback BPE path - the
+      // Gemma-3 / Gemma-4 / EmbeddingGemma-2 tokenizer.json ships
+      // Split(" ", MergedWithPrevious) behind a Replace(" " -> U+2581)
+      // normalizer. '' = off. Behavior is one of MergedWithPrevious /
+      // MergedWithNext / Isolated / Removed (invert=false only).
+      FLiteralSplit: string;
+      FLiteralSplitBehavior: string;
       // Unicode normalization form to apply to input before everything else.
       // '' = none; 'NFC'/'NFD' = real canonical normalization; 'NFKC'/'NFKD' =
       // real compatibility normalization (compat decompositions folded -- see
@@ -1297,6 +1309,8 @@ begin
   FMSReplacement := csMetaspace;
   FMSPrependScheme := 'always';
   FMSSplit := true;
+  FLiteralSplit := '';
+  FLiteralSplitBehavior := '';
   FWordPiece := false;
   FWPPrefix := '##';
   FWPMaxChars := 100;
@@ -1830,12 +1844,17 @@ var
 
   procedure AddPreTokenizer(PreObj: TJSONObject);
   var
-    Kind, Pattern: string;
+    Kind, Pattern, LiteralPattern, LiteralBehavior: string;
     InnerArr: TJSONArray;
     InnerCnt, InnerMax: integer;
     SubNode: TJSONData;
   begin
     Kind := PreObj.Get('type', '');
+    if (FLiteralSplit <> '') and
+      ((Kind = 'ByteLevel') or (Kind = 'Metaspace') or (Kind = 'Digits')) then
+      raise EHFTokenizerError.Create(
+        'Unsupported pre_tokenizer combination: ' + Kind +
+        ' after a literal Split');
     if Kind = 'Sequence' then
     begin
       InnerArr := PreObj.Arrays['pretokenizers'];
@@ -1913,12 +1932,39 @@ var
       // verbatim against the known cl100k-family literals and dispatched
       // to the hand-written splitter (SplitCl100kPieces).
       Pattern := '';
+      LiteralPattern := '';
       SubNode := PreObj.Find('pattern');
       if (SubNode <> nil) and (SubNode is TJSONObject) then
       begin
         Pattern := TJSONObject(SubNode).Get('Regex', '');
         if Pattern = '' then
-          Pattern := TJSONObject(SubNode).Get('String', '');
+          LiteralPattern := TJSONObject(SubNode).Get('String', '');
+      end;
+      if LiteralPattern <> '' then
+      begin
+        // LITERAL Split (Gemma-3/4: Split(" ", MergedWithPrevious) after a
+        // Replace(" " -> U+2581) normalizer). Only the metaspace /
+        // byte-fallback BPE path applies it (see EncodeSegment); a byte-level
+        // or regex-split tokenizer combined with it is rejected rather than
+        // silently mis-split.
+        LiteralBehavior := PreObj.Get('behavior', '');
+        if ((LiteralBehavior <> 'MergedWithPrevious') and
+          (LiteralBehavior <> 'MergedWithNext') and
+          (LiteralBehavior <> 'Isolated') and
+          (LiteralBehavior <> 'Removed')) or
+          PreObj.Get('invert', false) then
+          raise EHFTokenizerError.Create(
+            'Unsupported literal Split pre_tokenizer behavior "' +
+            LiteralBehavior + '" (MergedWithPrevious, MergedWithNext, ' +
+            'Isolated or Removed, invert=false)');
+        if FByteLevel or FSplitPreTok or FO200kPreTok or FMetaspacePreTok or
+          (FLiteralSplit <> '') then
+          raise EHFTokenizerError.Create(
+            'Unsupported pre_tokenizer combination: a literal Split is ' +
+            'only supported alone on the metaspace BPE path');
+        FLiteralSplit := LiteralPattern;
+        FLiteralSplitBehavior := LiteralBehavior;
+        Exit;
       end;
       if (PreObj.Get('behavior', '') <> 'Isolated') or
         PreObj.Get('invert', false) then
@@ -4437,6 +4483,12 @@ var
     BPEWord(FSymbolBuf, Ids);
   end;
 
+  // BPECodePoints over a possibly EMPTY range (literal-Split pieces).
+  procedure BPEPiece(PieceFrom, PieceTo: integer);
+  begin
+    if PieceTo >= PieceFrom then BPECodePoints(PieceFrom, PieceTo);
+  end;
+
 begin
   if Segment = '' then exit;
   // Unicode normalization runs FIRST, before any pre-tokenization, matching
@@ -4638,6 +4690,49 @@ begin
         BPECodePoints(PieceStart, NormLen);
         exit;
       end;
+    end
+    else if FLiteralSplit <> '' then
+    begin
+      // Literal Split pre_tokenizer on the NORMALIZED text (HF order: the
+      // normalizer runs first, so Gemma's Split(" ") after Replace(" " ->
+      // U+2581) finds nothing and the segment stays one BPE word - exactly
+      // as in HF). Pieces never cross a delimiter boundary.
+      MSLen := Length(FLiteralSplit);
+      NormLen := Length(Normalized);
+      PieceStart := 1;
+      Position := 1;
+      while Position <= NormLen - MSLen + 1 do
+      begin
+        if (Normalized[Position] = FLiteralSplit[1]) and
+          CompareMem(@Normalized[Position], @FLiteralSplit[1], MSLen) then
+        begin
+          if FLiteralSplitBehavior = 'MergedWithPrevious' then
+          begin
+            // delimiter closes the current piece
+            BPEPiece(PieceStart, Position + MSLen - 1);
+            PieceStart := Position + MSLen;
+          end
+          else if FLiteralSplitBehavior = 'MergedWithNext' then
+          begin
+            // delimiter opens the next piece
+            BPEPiece(PieceStart, Position - 1);
+            PieceStart := Position;
+          end
+          else
+          begin
+            // Isolated: delimiter is its own piece; Removed: dropped
+            BPEPiece(PieceStart, Position - 1);
+            if FLiteralSplitBehavior = 'Isolated' then
+              BPEPiece(Position, Position + MSLen - 1);
+            PieceStart := Position + MSLen;
+          end;
+          Inc(Position, MSLen);
+        end
+        else
+          Inc(Position);
+      end;
+      BPEPiece(PieceStart, NormLen);
+      exit;
     end;
     // whole-segment BPE over codepoints
     BPECodePoints(1, Length(Normalized));
