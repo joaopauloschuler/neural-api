@@ -2370,6 +2370,17 @@ rather than acted on.
         spell (Joao J+O+A+O, Schuler S+C+H+U+ler). Not done: no stem rules
         on pieces, no letter-to-sound rules, no folding beyond Latin-1 /
         Latin Extended-A.
+        Done (user-approved follow-up): the doubled-consonant -ed stem rule.
+        `StemEd` gets a third branch after misaki's two: a word of 6+ letters
+        ending in `([bcdgklmnprstvxz])\1ed` or `cked` whose word[:-3] is known
+        reads as that stem + `SuffixEd` (stem_ing's branch, shared through
+        `EndsWithDoubledConsonant`). Fixture words leaving the unknown routes
+        (US | GB): blogged blˈɑɡd | blˈɒɡd, vlogged vlˈɑɡd | vlˈɒɡd,
+        hashtagged hˈæʃtˌæɡd | hˈaʃtaɡd, geotagged ʤˈiOtˌæɡd | ʤˈiːQtaɡd,
+        photoshopped fˈOTəʃˌɑpt | fˈQtQʃɒpt (grown key `Photoshop`), GB hummed
+        hˈʌmd.
+        No counted fixture token changes; the agreement test treats the word
+        before such a token as context, as it does for the unknown routes.
   - [x] 5.6 Long text (also closes 3.1's chunking): split at sentence
         punctuation into chunks of at most 510 tokens, synthesize each, join the
         audio into one WAV (as Kokoro's own pipeline does).
