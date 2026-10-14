@@ -13,6 +13,46 @@ Run these in the folder that holds `neural-api`. The model's `.pth` and
 voice files are stored with Git LFS, so `git lfs` must be installed before
 the first clone. The voice goes to `kokoro_001.wav` (24 kHz, mono).
 
+## From your own code
+
+```pascal
+program SimpleKokoroTTS;
+{$mode objfpc}{$H+}
+uses
+  {$IFDEF UNIX} cthreads, {$ENDIF}
+  neuralkokorosession;
+
+var
+  Options: TKokoroSessionOptions;
+  Session: TKokoroSession;
+begin
+  Options := DefaultKokoroSessionOptions();      // voice af_heart, speed 1, CPU
+  Options.ModelDir := 'k';                        // git clone of hexgrad/Kokoro-82M
+  Options.DictionaryDir := 'misaki/misaki/data';  // git clone of hexgrad/misaki
+  Session := TKokoroSession.Create(Options);      // loads the model and voice once
+  try
+    Session.SpeakTextToWav('A red fox in the snow.', 'fox.wav');
+    Session.SpeakTextToWav('It jumped over the fence.', 'fence.wav');
+  finally
+    Session.Free;
+  end;
+end.
+```
+
+This is `SimpleKokoroTTS.lpr` in this folder. Build it with
+`lazbuild -B neural-api/examples/KokoroTTS/SimpleKokoroTTS.lpi` and run
+`neural-api/bin/x86_64-linux/bin/SimpleKokoroTTS` from the folder that holds
+`k` and `misaki`; it writes `fox.wav` and `fence.wav`.
+
+* `TKokoroSession.Create` loads the model and the voice once.
+* `SpeakTextToWav` can be called as many times as you like.
+* Set `Options.VoiceName` (e.g. `bf_emma`), `Options.Speed` or
+  `Options.Gpu := true` (OpenCL build) before `Create`.
+* `SpeakTextToWav` returns a `TKokoroLineResult`: timing, sample count and a
+  per-chunk report (phonemes, unknown words that were split or spelled).
+* One level down, `TNNetKokoro.SynthesizeText` (`neural/neuralpretrained.pas`)
+  gives you the audio as a `TNNetVolume` instead of a file.
+
 ## Running
 
 ```
