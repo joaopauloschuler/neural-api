@@ -42,6 +42,8 @@ type
     // One row per fixture token left unknown or read by an unknown-word
     // route: "text pieces phonemes", first occurrence only.
     procedure CollectUnknownWordRows(G2P: TNeuralEnglishG2P; Rows: TStrings);
+    // The long_mixed sentences against KPipeline.en_tokenize's chunks.
+    procedure RunChunkFixture(Accent: TNeuralG2PAccent);
   published
     // Hand-written JSON: plain, null, POS-keyed and escaped values, a
     // repeated key (the last one wins) and misaki's grown-key lookup.
@@ -81,6 +83,13 @@ type
     // The same rows with misaki's full dictionaries (ignored when missing):
     // equal to the subset rows except for words with accents folded.
     procedure TestUnknownWordRealDictionaries;
+    // KPipeline.en_tokenize on hand-made tokens: sentence cut, the comma
+    // fallback, the ')' bump, a word over the limit, truncation, paragraphs.
+    procedure TestChunkSplitRules;
+    // misaki's own tokens give the fixture's chunks exactly; the port's
+    // tokens give the same chunk texts.
+    procedure TestChunksMatchKPipelineUS;
+    procedure TestChunksMatchKPipelineGB;
     procedure TestEnglishFixtureAgreementUS;
     procedure TestEnglishFixtureAgreementGB;
     // The full misaki dictionaries (ignored when not installed): entry
@@ -1040,6 +1049,210 @@ begin
     Notes.Free;
     Root.Free;
   end;
+end;
+
+procedure TTestNeuralG2P.TestChunkSplitRules;
+var
+  Tokens: TNeuralG2PTokenArray;
+  Chunks: TNeuralG2PChunkArray;
+  ChunkCount: integer;
+  G2P: TNeuralEnglishG2P;
+
+  // Each token as 'phonemes' + an optional trailing space (its whitespace);
+  // the text equals the phonemes.
+  procedure SetTokens(const Spelled: array of string);
+  var
+    TokenPos: integer;
+    Phonemes: string;
+  begin
+    SetLength(Tokens, Length(Spelled));
+    for TokenPos := 0 to High(Spelled) do
+    begin
+      Tokens[TokenPos] := Default(TNeuralG2PToken);
+      Phonemes := Spelled[TokenPos];
+      if (Phonemes <> '') and (Phonemes[Length(Phonemes)] = ' ') then
+      begin
+        SetLength(Phonemes, Length(Phonemes) - 1);
+        Tokens[TokenPos].Whitespace := ' ';
+      end;
+      Tokens[TokenPos].Text := Phonemes;
+      Tokens[TokenPos].Phonemes := Phonemes;
+      Tokens[TokenPos].IsKnown := true;
+    end;
+  end;
+
+  procedure CheckChunks(MaxPhonemes: integer; const Expected: array of string);
+  var
+    ChunkPos: integer;
+  begin
+    Chunks := nil;
+    ChunkCount := 0;
+    SplitG2PTokensIntoChunks(Tokens, MaxPhonemes, 7, Chunks, ChunkCount);
+    AssertEquals('chunk count', Length(Expected), ChunkCount);
+    for ChunkPos := 0 to High(Expected) do
+    begin
+      AssertEquals('chunk ' + IntToStr(ChunkPos), Expected[ChunkPos],
+        Chunks[ChunkPos].Phonemes);
+      AssertEquals('chunk text ' + IntToStr(ChunkPos), Expected[ChunkPos],
+        Chunks[ChunkPos].Text);
+      AssertEquals('paragraph index', 7, Chunks[ChunkPos].ParagraphIndex);
+    end;
+  end;
+
+begin
+  // the cut follows the last '.' that leaves the rest within the limit
+  SetTokens(['aa', ', ', 'bb', '. ', 'cc ', 'dd ', 'ee']);
+  CheckChunks(10, ['aa, bb.', 'cc dd ee']);
+  AssertEquals('tokens of the first chunk', 4, Length(Chunks[0].Tokens));
+  CheckChunks(16, ['aa, bb. cc dd ee']);
+  // cutting at '.' leaves 11 > 10 for the rest: the comma takes it
+  SetTokens(['a', '. ', 'bbbbbb', ', ', 'cc ', 'dd']);
+  CheckChunks(10, ['a. bbbbbb,', 'cc dd']);
+  // a ')' right after the '.' goes with the first chunk
+  SetTokens(['aa ', '(', 'bb', '.', ') ', 'cc ', 'dd ', 'ee']);
+  CheckChunks(10, ['aa (bb.)', 'cc dd ee']);
+  // no punctuation: every token that would overflow starts a chunk; a token
+  // longer than the limit is a chunk of its own
+  SetTokens(['ab ', 'cdefghij ', 'kl']);
+  CheckChunks(5, ['ab', 'cdefghij', 'kl']);
+  // ... and when it comes first, en_tokenize yields an empty chunk before it
+  SetTokens(['abcdefg ', 'hi']);
+  CheckChunks(5, ['', 'abcdefg', 'hi']);
+  // PhonemizeInChunks (KPipeline.__call__): empty chunks dropped, a chunk
+  // over the limit cut to MaxPhonemes code points, '\n' runs split paragraphs
+  G2P := CreateFixtureG2P(g2pAmerican);
+  try
+    Chunks := G2P.PhonemizeInChunks('The quick brown fox.', 4);
+    // a lone '.' is a chunk too, as in en_tokenize
+    AssertEquals('chunks', 5, Length(Chunks));
+    AssertEquals('ðə', Chunks[0].Phonemes);
+    AssertEquals('.', Chunks[4].Phonemes);
+    AssertEquals('kwˈɪ', Chunks[1].Phonemes);
+    AssertTrue('cut', Chunks[1].IsTruncated);
+    AssertFalse('not cut', Chunks[0].IsTruncated);
+    AssertEquals('quick', Chunks[1].Text);
+    Chunks := G2P.PhonemizeInChunks(LineEnding + ' The fox.' + #10#10 +
+      '  ' + #10 + 'The dog. ' + #10, 510);
+    AssertEquals('paragraph chunks', 2, Length(Chunks));
+    AssertEquals('ðə fˈɑks.', Chunks[0].Phonemes);
+    AssertEquals(0, Chunks[0].ParagraphIndex);
+    AssertEquals('ðə dˈɔɡ.', Chunks[1].Phonemes);
+    AssertEquals('The dog.', Chunks[1].Text);
+    // the whitespace-only part between them keeps its index
+    AssertEquals(2, Chunks[1].ParagraphIndex);
+    AssertEquals('empty text', 0, Length(G2P.PhonemizeInChunks(' ' + #10, 510)));
+  finally
+    G2P.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.RunChunkFixture(Accent: TNeuralG2PAccent);
+var
+  Root: TJSONData;
+  Sentences, RefTokens, RefChunks: TJSONArray;
+  Sentence, AccentObj, RefToken: TJSONObject;
+  Tokens: TNeuralG2PTokenArray;
+  Chunks: TNeuralG2PChunkArray;
+  G2P: TNeuralEnglishG2P;
+  AccentKey, Context, CutDifferences, ExpectedCutDifferences: string;
+  SentencePos, TokenPos, ChunkPos, ChunkCount, LongSentences,
+    PhonemeDifferences: integer;
+  IsCutEqual: boolean;
+begin
+  if Accent = g2pBritish then AccentKey := 'gb' else AccentKey := 'us';
+  ExpectedCutDifferences := AccentKey + ' #294';
+  CutDifferences := '';
+  Root := ReadFixtureJSON('sentences.json');
+  G2P := CreateFixtureG2P(Accent);
+  try
+    Sentences := TJSONObject(Root).Arrays['sentences'];
+    LongSentences := 0;
+    PhonemeDifferences := 0;
+    for SentencePos := 0 to Sentences.Count - 1 do
+    begin
+      Sentence := Sentences.Objects[SentencePos];
+      AccentObj := Sentence.Objects[AccentKey];
+      if AccentObj.IndexOfName('chunks') < 0 then Continue;
+      Inc(LongSentences);
+      Context := AccentKey + ' #' + IntToStr(Sentence.Integers['id']);
+      RefChunks := AccentObj.Arrays['chunks'];
+      // (1) misaki's tokens through the port's chunker: exact
+      RefTokens := AccentObj.Arrays['tokens'];
+      SetLength(Tokens, RefTokens.Count);
+      for TokenPos := 0 to RefTokens.Count - 1 do
+      begin
+        RefToken := RefTokens.Objects[TokenPos];
+        Tokens[TokenPos] := Default(TNeuralG2PToken);
+        Tokens[TokenPos].Text := RefToken.Strings['text'];
+        Tokens[TokenPos].Whitespace := RefToken.Strings['whitespace'];
+        if not RefToken.Items[RefToken.IndexOfName('phonemes')].IsNull then
+          Tokens[TokenPos].Phonemes := RefToken.Strings['phonemes'];
+      end;
+      Chunks := nil;
+      ChunkCount := 0;
+      SplitG2PTokensIntoChunks(Tokens, 510, 0, Chunks, ChunkCount);
+      AssertEquals(Context + ' chunk count', RefChunks.Count, ChunkCount);
+      for ChunkPos := 0 to ChunkCount - 1 do
+      begin
+        AssertEquals(Context + ' chunk text',
+          RefChunks.Objects[ChunkPos].Strings['text'], Chunks[ChunkPos].Text);
+        AssertEquals(Context + ' chunk phonemes',
+          RefChunks.Objects[ChunkPos].Strings['phonemes'],
+          Chunks[ChunkPos].Phonemes);
+      end;
+      // (2) the port's own tokens: the cuts differ only where the port reads
+      // words misaki left empty (more phonemes before the cut)
+      Chunks := G2P.PhonemizeInChunks(Sentence.Strings['text'], 510);
+      IsCutEqual := Length(Chunks) = RefChunks.Count;
+      for ChunkPos := 0 to High(Chunks) do
+      begin
+        AssertTrue(Context + ' port chunk within 510',
+          CodePointCount(Chunks[ChunkPos].Phonemes) <= 510);
+        if IsCutEqual and (Chunks[ChunkPos].Text <>
+           RefChunks.Objects[ChunkPos].Strings['text']) then
+          IsCutEqual := false;
+      end;
+      if not IsCutEqual then
+      begin
+        if CutDifferences <> '' then CutDifferences := CutDifferences + ',';
+        CutDifferences := CutDifferences + Context;
+        for ChunkPos := 0 to High(Chunks) do
+          WriteLn('  ', Context, ' port chunk ', ChunkPos, ': ',
+            CodePointCount(Chunks[ChunkPos].Phonemes), ' code points, ends "',
+            Copy(Chunks[ChunkPos].Text, Length(Chunks[ChunkPos].Text) - 30, 31),
+            '"');
+        Continue;
+      end;
+      for ChunkPos := 0 to High(Chunks) do
+        if Chunks[ChunkPos].Phonemes <>
+           RefChunks.Objects[ChunkPos].Strings['phonemes'] then
+        begin
+          Inc(PhonemeDifferences);
+          WriteLn('  ', Context, ' chunk ', ChunkPos, ' phonemes differ: misaki ',
+            CodePointCount(RefChunks.Objects[ChunkPos].Strings['phonemes']),
+            ' code points, port ', CodePointCount(Chunks[ChunkPos].Phonemes));
+        end;
+    end;
+    WriteLn('KPipeline chunks (', AccentKey, '): misaki tokens -> chunks equal ',
+      'in all ', LongSentences, ' sentences; port tokens: cuts differ in [',
+      CutDifferences, '], chunk phonemes differ in ', PhonemeDifferences);
+    AssertEquals('sentences whose port cuts differ', ExpectedCutDifferences,
+      CutDifferences);
+    AssertEquals('long_mixed sentences with chunks', 6, LongSentences);
+  finally
+    G2P.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.TestChunksMatchKPipelineUS;
+begin
+  RunChunkFixture(g2pAmerican);
+end;
+
+procedure TTestNeuralG2P.TestChunksMatchKPipelineGB;
+begin
+  RunChunkFixture(g2pBritish);
 end;
 
 procedure TTestNeuralG2P.TestEnglishFixtureAgreementUS;

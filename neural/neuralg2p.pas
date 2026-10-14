@@ -44,8 +44,12 @@ Kokoro-82M reads). A pure-Pascal port of misaki 0.9.4 `en.py`
     (WiFi, PyTorch, Schuler's); a clitic piece misaki drops ('ve) stays
     unread. Tokens report g2prUnknownSplit / g2prUnknownSpelled and Pieces.
 
-Not here (later tasks), with their hook points: long-text chunking (5.6:
-Phonemize's per-token output). Not ported: misaki's markdown overrides
+  * Long text (PhonemizeInChunks, SplitG2PTokensIntoChunks): kokoro
+    KPipeline's English chunker; '\n' runs split paragraphs, and chunks of at
+    most MaxPhonemes code points end at the last sentence, then clause, then
+    comma punctuation that fits.
+
+Not ported: misaki's markdown overrides
 ([word](/IPA/), [word](+1), [n](#flags#), so no number flags) and its Unicode
 digit folding (numeric_if_needed).
 Deviations: a word of more than csMaxMergedPieces sub-tokens only tries merges
@@ -106,6 +110,16 @@ type
     Pieces: string;
   end;
   TNeuralG2PTokenArray = array of TNeuralG2PToken;
+
+  // One chunk of kokoro KPipeline's English chunker (en_tokenize).
+  TNeuralG2PChunk = record
+    Text: string;      // token text + whitespace, stripped (tokens_to_text)
+    Phonemes: string;  // phonemes + ' ' after spaced tokens, stripped (tokens_to_ps)
+    Tokens: TNeuralG2PTokenArray;
+    ParagraphIndex: integer; // part of the input between '\n' runs, from 0
+    IsTruncated: boolean;    // Phonemes cut to the chunk limit (one long word)
+  end;
+  TNeuralG2PChunkArray = array of TNeuralG2PChunk;
 
   TNeuralG2PDictionaryEntry = record
     KeyStart, KeyLength: integer;      // byte span in the file text
@@ -295,6 +309,10 @@ type
     function Phonemize(const Text: string): string; overload;
     function Phonemize(const Text: string;
       out Tokens: TNeuralG2PTokenArray): string; overload;
+    // kokoro KPipeline on English text: '\n' runs split paragraphs, each is
+    // chunked by SplitG2PTokensIntoChunks; empty chunks dropped, long ones cut.
+    function PhonemizeInChunks(const Text: string;
+      MaxPhonemes: integer): TNeuralG2PChunkArray;
     // Tasklist 5.5 routes for a word misaki left unknown (see the unit header);
     // false (unknown) on letters with no ASCII base or over csG2PMaxSplitLetters.
     function ReadUnknownWord(const Text: string; out Phonemes, Pieces: string;
@@ -314,6 +332,15 @@ function ApplyG2PStress(const Phonemes: string; Stress: single): string;
 // misaki subtokenize: the sub-token regex of en.py, matched by hand.
 procedure G2PSubTokenize(const Word: string; Pieces: TStrings);
 function G2PResolutionName(Resolution: TNeuralG2PResolution): string;
+// kokoro KPipeline.en_tokenize: appends Tokens as chunks of at most MaxPhonemes
+// code points, cut after the last . ! ? ... else : ; else , and a dash.
+procedure SplitG2PTokensIntoChunks(const Tokens: TNeuralG2PTokenArray;
+  MaxPhonemes, ParagraphIndex: integer; var Chunks: TNeuralG2PChunkArray;
+  var ChunkCount: integer);
+// One line per token read by an unknown-word route or left unknown:
+// "text: routes (pieces) -> phonemes".
+procedure DescribeG2PUnknownWords(const Tokens: TNeuralG2PTokenArray;
+  Lines: TStrings);
 // num2words(int(Digits), lang='en') 0.5.14: "one hundred and one",
 // "twenty-one". Digits: [-]0-9..., below 10^306; others raise ENeuralG2PError.
 function EnglishCardinalWords(const Digits: string): string;
@@ -1072,6 +1099,163 @@ begin
     g2prUnknownSpelled: Result := 'unknown word spelled';
   else
     Result := '?';
+  end;
+end;
+
+// Python str.strip() over IsWhitespaceCP.
+function StripG2PWhitespace(const S: string): string;
+var
+  Position, Start, FirstKept, AfterLastKept, TextLen: integer;
+begin
+  TextLen := Length(S);
+  FirstKept := 0;
+  AfterLastKept := 1;
+  Position := 1;
+  while Position <= TextLen do
+  begin
+    Start := Position;
+    if not IsWhitespaceCP(NextCodePoint(S, Position)) then
+    begin
+      if FirstKept = 0 then FirstKept := Start;
+      AfterLastKept := Position;
+    end;
+  end;
+  if FirstKept = 0 then Result := ''
+  else Result := Copy(S, FirstKept, AfterLastKept - FirstKept);
+end;
+
+// tokens_to_ps of Tokens[FirstToken..LastToken].
+function JoinG2PChunkPhonemes(const Tokens: TNeuralG2PTokenArray;
+  FirstToken, LastToken: integer): string;
+var
+  TokenPos: integer;
+begin
+  Result := '';
+  for TokenPos := FirstToken to LastToken do
+  begin
+    Result := Result + Tokens[TokenPos].Phonemes;
+    if Tokens[TokenPos].Whitespace <> '' then Result := Result + ' ';
+  end;
+  Result := StripG2PWhitespace(Result);
+end;
+
+// KPipeline.waterfall_last over Tokens[FirstToken..LastToken]: the index after
+// the cut (LastToken + 1 when no punctuation leaves the rest within the limit).
+function G2PWaterfallSplit(const Tokens: TNeuralG2PTokenArray;
+  FirstToken, LastToken, NextPhonemeCount, MaxPhonemes: integer): integer;
+const
+  cWaterfall: array[0..2] of string = ('!.?' + #$E2#$80#$A6, ':;',
+    ',' + #$E2#$80#$94);
+  cRightDoubleQuote = #$E2#$80#$9D;
+var
+  GroupPos, TokenPos: integer;
+  Phonemes: string;
+begin
+  for GroupPos := Low(cWaterfall) to High(cWaterfall) do
+  begin
+    Result := -1;
+    for TokenPos := LastToken downto FirstToken do
+    begin
+      Phonemes := Tokens[TokenPos].Phonemes;
+      // t.phonemes in set(w): exactly one character of the group
+      if (Phonemes <> '') and (CodePointCount(Phonemes) = 1) and
+         (Pos(Phonemes, cWaterfall[GroupPos]) > 0) then
+      begin
+        Result := TokenPos + 1;
+        Break;
+      end;
+    end;
+    if Result < 0 then Continue;
+    if (Result <= LastToken) and ((Tokens[Result].Phonemes = ')') or
+       (Tokens[Result].Phonemes = cRightDoubleQuote)) then
+      Inc(Result);
+    if NextPhonemeCount - CodePointCount(JoinG2PChunkPhonemes(Tokens,
+       FirstToken, Result - 1)) <= MaxPhonemes then
+      Exit;
+  end;
+  Result := LastToken + 1;
+end;
+
+procedure SplitG2PTokensIntoChunks(const Tokens: TNeuralG2PTokenArray;
+  MaxPhonemes, ParagraphIndex: integer; var Chunks: TNeuralG2PChunkArray;
+  var ChunkCount: integer);
+
+  procedure AddChunk(FirstToken, LastToken: integer);
+  var
+    TokenPos: integer;
+    Text: string;
+  begin
+    if ChunkCount >= Length(Chunks) then
+      SetLength(Chunks, 2 * ChunkCount + 4);
+    Text := '';
+    for TokenPos := FirstToken to LastToken do
+      Text := Text + Tokens[TokenPos].Text + Tokens[TokenPos].Whitespace;
+    Chunks[ChunkCount] := Default(TNeuralG2PChunk);
+    Chunks[ChunkCount].Text := StripG2PWhitespace(Text);
+    Chunks[ChunkCount].Phonemes := JoinG2PChunkPhonemes(Tokens, FirstToken,
+      LastToken);
+    Chunks[ChunkCount].Tokens := Copy(Tokens, FirstToken,
+      LastToken - FirstToken + 1);
+    Chunks[ChunkCount].ParagraphIndex := ParagraphIndex;
+    Inc(ChunkCount);
+  end;
+
+var
+  TokenPos, MaxTokenPos, ChunkFirstToken, PhonemeCount, NextPhonemeCount,
+    SplitPos: integer;
+  NextPhonemes: string;
+begin
+  // The pending chunk is Tokens[ChunkFirstToken..TokenPos-1]; PhonemeCount
+  // follows en_tokenize, which counts the pending trailing space.
+  ChunkFirstToken := 0;
+  PhonemeCount := 0;
+  MaxTokenPos := High(Tokens);
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    NextPhonemes := Tokens[TokenPos].Phonemes;
+    if Tokens[TokenPos].Whitespace <> '' then NextPhonemes := NextPhonemes + ' ';
+    NextPhonemeCount := PhonemeCount +
+      CodePointCount(TrimRight(NextPhonemes));
+    if NextPhonemeCount > MaxPhonemes then
+    begin
+      SplitPos := G2PWaterfallSplit(Tokens, ChunkFirstToken, TokenPos - 1,
+        NextPhonemeCount, MaxPhonemes);
+      AddChunk(ChunkFirstToken, SplitPos - 1);
+      ChunkFirstToken := SplitPos;
+      PhonemeCount := CodePointCount(JoinG2PChunkPhonemes(Tokens,
+        ChunkFirstToken, TokenPos - 1));
+      if ChunkFirstToken = TokenPos then NextPhonemes := TrimLeft(NextPhonemes);
+    end;
+    Inc(PhonemeCount, CodePointCount(NextPhonemes));
+  end;
+  if ChunkFirstToken <= MaxTokenPos then AddChunk(ChunkFirstToken, MaxTokenPos);
+end;
+
+procedure DescribeG2PUnknownWords(const Tokens: TNeuralG2PTokenArray;
+  Lines: TStrings);
+const
+  cReportedRoutes: array[0..2] of TNeuralG2PResolution =
+    (g2prUnknownSplit, g2prUnknownSpelled, g2prUnknown);
+var
+  TokenPos, RoutePos: integer;
+  Line, Routes: string;
+begin
+  for TokenPos := 0 to High(Tokens) do
+  begin
+    Routes := '';
+    for RoutePos := Low(cReportedRoutes) to High(cReportedRoutes) do
+      if cReportedRoutes[RoutePos] in Tokens[TokenPos].Resolutions then
+      begin
+        if Routes <> '' then Routes := Routes + ', ';
+        Routes := Routes + G2PResolutionName(cReportedRoutes[RoutePos]);
+      end;
+    if Routes = '' then Continue;
+    Line := Tokens[TokenPos].Text + ': ' + Routes;
+    if Tokens[TokenPos].Pieces <> '' then
+      Line := Line + ' (' + Tokens[TokenPos].Pieces + ')';
+    if Tokens[TokenPos].Phonemes <> '' then
+      Line := Line + ' -> ' + Tokens[TokenPos].Phonemes;
+    Lines.Add(Line);
   end;
 end;
 
@@ -3845,6 +4029,63 @@ begin
   BuildPiecesAndGroups();
   ResolveGroups();
   Result := BuildOutput(Tokens);
+end;
+
+function TNeuralEnglishG2P.PhonemizeInChunks(const Text: string;
+  MaxPhonemes: integer): TNeuralG2PChunkArray;
+var
+  RawChunks: TNeuralG2PChunkArray;
+  Tokens: TNeuralG2PTokenArray;
+  RawCount, ChunkCount, RawPos, ParagraphIndex, ParagraphStart, Position,
+    TextLen, PhonemePos, CodePointPos: integer;
+  StrippedText, Paragraph: string;
+begin
+  if MaxPhonemes < 1 then
+    raise ENeuralG2PError.Create('PhonemizeInChunks: MaxPhonemes must be >= 1.');
+  Result := nil;
+  ChunkCount := 0;
+  RawChunks := nil;
+  StrippedText := StripG2PWhitespace(Text);
+  TextLen := Length(StrippedText);
+  ParagraphIndex := 0;
+  Position := 1;
+  // re.split(r'\n+', text.strip()); a blank part is skipped but keeps its index
+  while Position <= TextLen + 1 do
+  begin
+    ParagraphStart := Position;
+    while (Position <= TextLen) and (StrippedText[Position] <> #10) do
+      Inc(Position);
+    Paragraph := Copy(StrippedText, ParagraphStart, Position - ParagraphStart);
+    while (Position <= TextLen) and (StrippedText[Position] = #10) do
+      Inc(Position);
+    if StripG2PWhitespace(Paragraph) <> '' then
+    begin
+      Phonemize(Paragraph, Tokens);
+      RawCount := 0;
+      SplitG2PTokensIntoChunks(Tokens, MaxPhonemes, ParagraphIndex, RawChunks,
+        RawCount);
+      for RawPos := 0 to RawCount - 1 do
+      begin
+        if RawChunks[RawPos].Phonemes = '' then Continue;
+        if CodePointCount(RawChunks[RawPos].Phonemes) > MaxPhonemes then
+        begin
+          // KPipeline: ps = ps[:510]
+          PhonemePos := 1;
+          for CodePointPos := 1 to MaxPhonemes do
+            NextCodePoint(RawChunks[RawPos].Phonemes, PhonemePos);
+          SetLength(RawChunks[RawPos].Phonemes, PhonemePos - 1);
+          RawChunks[RawPos].IsTruncated := true;
+        end;
+        if ChunkCount >= Length(Result) then
+          SetLength(Result, 2 * ChunkCount + 4);
+        Result[ChunkCount] := RawChunks[RawPos];
+        Inc(ChunkCount);
+      end;
+    end;
+    Inc(ParagraphIndex);
+    if Position > TextLen then Break;
+  end;
+  SetLength(Result, ChunkCount);
 end;
 
 function TNeuralEnglishG2P.Phonemize(const Text: string): string;
