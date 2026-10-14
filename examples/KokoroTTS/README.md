@@ -1,74 +1,17 @@
 # KokoroTTS — Kokoro-82M text-to-speech
 
-Status: **planned (coded), not yet tested by the user on the real
-checkpoint.** The code exists and matches the reference `kokoro` package stage
-by stage on the real checkpoint (see Parity below), but no full sentence has
-been synthesized and listened to on a real machine yet.
-
-`KokoroTTS` loads a `hexgrad/Kokoro-82M` snapshot folder (Apache-2.0;
-StyleTTS2 + iSTFTNet, 81.7M parameters) into `TNNetKokoro`
-(`neural/neuralpretrained.pas`) once, then speaks English text into 16-bit
-mono WAV files at **24 kHz**:
+## Quick start
 
 ```
-text -> English G2P (neural/neuralg2p.pas, misaki's dictionaries)
-  -> chunks of at most 510 phonemes (split at sentence punctuation, as kokoro's KPipeline)
-  -> per chunk: phonemes -> ids (config.json vocab, wrapped in 0s)
-     -> stage A  (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
-     -> stage B  (F0 and energy curves)
-     -> stage-C decoder
-     -> harmonic source + STFT (host)
-     -> stage-C generator -> exp / sin -> inverse STFT (host)
-  -> chunk audio joined with no gap -> WAV
+git clone https://huggingface.co/hexgrad/Kokoro-82M k
+git clone https://github.com/hexgrad/misaki
+lazbuild -B neural-api/examples/KokoroTTS/KokoroTTS.lpi
+neural-api/bin/x86_64-linux/bin/KokoroTTS ./k --dict-dir misaki/misaki/data -p "A red fox in the snow"
 ```
 
-Stages A, B and C are `TNNet`s run by `TNNet.Compute`; each is built once
-from the checkpoint and resized per chunk by a borrowing rebuild (no second
-copy of the weights). The shared part (loading, voice switching, text ->
-audio -> WAV) is `TKokoroSession` in `neural/neuralkokorosession.pas`, so a
-later TTS server can reuse it; `KokoroTTS.lpr` holds the argument parsing,
-the REPL and the external-program step.
-
-Only the English voices work with text: `a*` (American: `af_*`, `am_*`) and
-`b*` (British: `bf_*`, `bm_*`). The other languages need their own G2P; their
-voices can still be used with `--phonemes`.
-
-## Download
-
-From `https://huggingface.co/hexgrad/Kokoro-82M` you need:
-
-- `config.json`
-- `kokoro-v1_0.pth` (327 MB)
-- `voices/<name>.pt` for each voice you want (e.g. `voices/af_heart.pt`,
-  0.5 MB)
-
-```
-huggingface-cli download hexgrad/Kokoro-82M config.json kokoro-v1_0.pth \
-  voices/af_heart.pt voices/bf_emma.pt --local-dir Kokoro-82M
-```
-
-For text you also need misaki's English dictionaries (Apache-2.0) from
-`https://github.com/hexgrad/misaki`, folder `misaki/data/`:
-`us_gold.json` and `us_silver.json` (American voices), `gb_gold.json` and
-`gb_silver.json` (British voices). The program never downloads them. By
-default it reads them from `<model-dir>/misaki/`; `--dict-dir <folder>`
-points elsewhere.
-
-```
-mkdir -p Kokoro-82M/misaki
-for f in us_gold us_silver gb_gold gb_silver; do
-  wget -O Kokoro-82M/misaki/$f.json \
-    https://raw.githubusercontent.com/hexgrad/misaki/main/misaki/data/$f.json
-done
-```
-
-The same files ship inside the `misaki` Python package
-(`site-packages/misaki/data/`), if it is installed somewhere.
-
-A missing dictionary file stops the program at startup with the list of the
-missing paths. Loading takes about 0.1-0.2 s and 17-21 MB per accent
-(measured on the development VM); `/voice` loads the other accent's pair when
-the accent changes.
+Run these in the folder that holds `neural-api`. The model's `.pth` and
+voice files are stored with Git LFS, so `git lfs` must be installed before
+the first clone. The voice goes to `kokoro_001.wav` (24 kHz, mono).
 
 ## Running
 
@@ -76,15 +19,18 @@ the accent changes.
 KokoroTTS <model-dir> [options]
 ```
 
+The examples below use the folders of the Quick start and write
+`KokoroTTS` for `neural-api/bin/x86_64-linux/bin/KokoroTTS`.
+
 The model folder is the first argument (as in ChatTerminal). Without `-p` or
 `--phonemes` the program opens a REPL: it loads the model once, then each
 typed line is spoken into the next WAV.
 
 ```
-$ KokoroTTS Kokoro-82M
-Model      : Kokoro-82M
+$ KokoroTTS ./k --dict-dir misaki/misaki/data
+Model      : ./k
 Voice      : af_heart
-Dictionary : Kokoro-82M/misaki
+Dictionary : misaki/misaki/data
 Compute    : CPU
 Threads    : parallel, every CPU thread (4)
 Loaded in  : x.xx s
@@ -99,15 +45,14 @@ Wrote      : kokoro_002.wav (x.xx s of audio, 1 chunk(s))
 Bye.
 ```
 
-(x.xx: the times depend on the machine; none was measured on the real
-checkpoint yet.)
+(x.xx: the times depend on the machine; `--stats` prints them.)
 
 One-shot runs never read stdin and exit with code 0, or 1 on any error
 (including a failing `--play-cmd` / `--encode-cmd`):
 
 ```
-KokoroTTS Kokoro-82M -p "Hello world. This is a test." --out hello.wav
-KokoroTTS Kokoro-82M --phonemes "həlˈO wˈɜɹld." --out hello.wav
+KokoroTTS ./k --dict-dir misaki/misaki/data -p "Hello world. This is a test." --out hello.wav
+KokoroTTS ./k --phonemes "həlˈO wˈɜɹld." --out hello.wav
 ```
 
 ### REPL commands
@@ -197,13 +142,13 @@ Examples:
 
 ```
 # speak each line as soon as it is written (ALSA)
-KokoroTTS Kokoro-82M --play-cmd "aplay -q {wav}"
+KokoroTTS ./k --dict-dir misaki/misaki/data --play-cmd "aplay -q {wav}"
 # MP3 next to each WAV, then drop the WAV
-KokoroTTS Kokoro-82M --encode-cmd "lame --quiet {wav} {base}.mp3" --keep-wav false
+KokoroTTS ./k --dict-dir misaki/misaki/data --encode-cmd "lame --quiet {wav} {base}.mp3" --keep-wav false
 # ffmpeg to Opus
-KokoroTTS Kokoro-82M --encode-cmd "ffmpeg -loglevel error -y -i {wav} {base}.opus"
+KokoroTTS ./k --dict-dir misaki/misaki/data --encode-cmd "ffmpeg -loglevel error -y -i {wav} {base}.opus"
 # macOS
-KokoroTTS Kokoro-82M --play-cmd "afplay {wav}"
+KokoroTTS ./k --dict-dir misaki/misaki/data --play-cmd "afplay {wav}"
 ```
 
 ### Timing (`--stats`)
@@ -224,8 +169,9 @@ three define AVX2 and OpenCL). The binary goes to `bin/<cpu>-<os>/bin/`.
 
 ## Memory
 
-No full sentence has been run on the real checkpoint on a measured machine
-yet. What was measured on the development VM (CPU, real checkpoint):
+Full sentences run on the real checkpoint, but the end-to-end memory peak
+has not been measured yet (`--stats` prints the peak RSS). What was measured
+per stage on the development VM (CPU, real checkpoint):
 
 - stages A -> B -> stage-C decoder on a 102-frame sentence (2.55 s of audio):
   999 MB peak RSS for the test process;
@@ -253,6 +199,44 @@ printf 'The quick brown fox.\n/show\n/exit\n' | \
   KokoroTTS tests/fixtures/tiny_kokoro82m --dict-dir tests/fixtures/g2p_english
 KokoroTTS --selftest
 ```
+
+## How it works
+
+`KokoroTTS` loads a `hexgrad/Kokoro-82M` snapshot folder (Apache-2.0;
+StyleTTS2 + iSTFTNet, 81.7M parameters) into `TNNetKokoro`
+(`neural/neuralpretrained.pas`) once:
+
+```
+text -> English G2P (neural/neuralg2p.pas, misaki's dictionaries)
+  -> chunks of at most 510 phonemes (split at sentence punctuation, as kokoro's KPipeline)
+  -> per chunk: phonemes -> ids (config.json vocab, wrapped in 0s)
+     -> stage A  (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
+     -> stage B  (F0 and energy curves)
+     -> stage-C decoder
+     -> harmonic source + STFT (host)
+     -> stage-C generator -> exp / sin -> inverse STFT (host)
+  -> chunk audio joined with no gap -> WAV
+```
+
+Stages A, B and C are `TNNet`s run by `TNNet.Compute`; each is built once
+from the checkpoint and resized per chunk by a borrowing rebuild (no second
+copy of the weights). The shared part (loading, voice switching, text ->
+audio -> WAV) is `TKokoroSession` in `neural/neuralkokorosession.pas`, so a
+later TTS server can reuse it; `KokoroTTS.lpr` holds the argument parsing,
+the REPL and the external-program step.
+
+Only the English voices work with text: `a*` (American: `af_*`, `am_*`) and
+`b*` (British: `bf_*`, `bm_*`). The other languages need their own G2P; their
+voices can still be used with `--phonemes`.
+
+misaki's English dictionaries (Apache-2.0) are `us_gold.json` and
+`us_silver.json` (American voices), `gb_gold.json` and `gb_silver.json`
+(British voices). The program never downloads them. By default it reads
+them from `<model-dir>/misaki/`; `--dict-dir <folder>` points elsewhere. A
+missing dictionary file stops the program at startup with the list of the
+missing paths. Loading takes about 0.1-0.2 s and 17-21 MB per accent
+(measured on the development VM); `/voice` loads the other accent's pair
+when the accent changes.
 
 ## Parity
 
