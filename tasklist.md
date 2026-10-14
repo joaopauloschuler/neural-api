@@ -2192,7 +2192,7 @@ rather than acted on.
         TestEnglishNumberWords, TestNumberReading, fixture agreement now
         counts every digit/money token. Suites: cpu, avx2, opencl
         `TESTS=3261 ERRORS=0 FAILURES=0 IGNORED=4`.
-  - [ ] 5.4 Words spelled the same but pronounced differently (790 entries keyed
+  - [x] 5.4 Words spelled the same but pronounced differently (790 entries keyed
         by part of speech, e.g. `read`, `record`): use the dictionary's DEFAULT
         reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
         often this differs from misaki's spaCy choice; context rules (after "to"
@@ -2466,7 +2466,7 @@ rather than acted on.
         `--no-gpu-shared-kernel` (CPU stays the default, unlike ChatTerminal).
         New `KokoroVoiceFileName(SnapshotDir, VoiceName)` in neuralpretrained
         (`OpenKokoroSnapshot` uses it too).
-  - [ ] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
+  - [x] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
         each typed line synthesized to a WAV); `-p "text"` one-shot that never
         reads stdin; `--stats` timing to stderr; `--selftest` (argument parsing
         and REPL commands, no model). Output names from `--out <pattern>`
