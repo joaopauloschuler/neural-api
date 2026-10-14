@@ -1975,8 +1975,12 @@ rather than acted on.
         - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
           their scratch per call (once per utterance).
   Phase 3 — text input:
-  - [ ] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
+  - [x] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
         split long input into chunks.
+        Done: ids by `KokoroPhonemesToIds` (1.3; raises past
+        max_position_embeddings, as KModel's assert); chunking of text by 5.6.
+        A raw phoneme string (`--phonemes`) is not chunked, as in KPipeline
+        (`generate_from_tokens` raises on a phoneme string over 510).
   - [ ] 3.2 G2P (text -> phonemes). misaki English = gold/silver dictionaries
         (~6 MB JSON), spaCy part-of-speech tagging, num2words, espeak-ng fallback.
         Options: (a) phonemes as input (user runs misaki); (b) Pascal dictionary
@@ -2034,7 +2038,7 @@ rather than acted on.
         after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
   5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). IN PROGRESS:
-  5.1, 5.2, 5.3, 5.4, 5.5 and the 5.7 fixture done.
+  5.1, 5.2, 5.3, 5.4, 5.5, 5.6 and the 5.7 fixture done.
   Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
   no Python at test time (a `tools/` script writes fixtures once on the dev box).
   - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
@@ -2054,7 +2058,7 @@ rather than acted on.
         `ApplyG2PStress`, `G2PSubTokenize` (misaki's sub-token regex, matched by
         hand), `EnglishG2PAccentFromVoice` (`a*` US, `b*` GB, others raise; it
         lives in neuralg2p, not in the Kokoro code), `EnglishG2PDictionaryFileName`.
-        `TNNetKokoro` does not call it yet (5.8/5.9 wire it into the example).
+        `TNNetKokoro.SynthesizeText` calls it (5.6); 5.8/5.9 wire it into the example.
         Ported as in en.py: retokenize grouping, the right-to-left loop with
         future_vowel / future_to, the longest-merge loop over sub-tokens,
         resolve_tokens (junk pieces, prespace, demotion of the lighter
@@ -2365,9 +2369,63 @@ rather than acted on.
         spell (Joao J+O+A+O, Schuler S+C+H+U+ler). Not done: no stem rules
         on pieces, no letter-to-sound rules, no folding beyond Latin-1 /
         Latin Extended-A.
-  - [ ] 5.6 Long text (also closes 3.1's chunking): split at sentence
+  - [x] 5.6 Long text (also closes 3.1's chunking): split at sentence
         punctuation into chunks of at most 510 tokens, synthesize each, join the
         audio into one WAV (as Kokoro's own pipeline does).
+        Done. Chunking lives in neuralg2p (guide rule 4: it reads only
+        `TNeuralG2PToken` fields, and the limit is a parameter, so a later TTS
+        model reuses it): `SplitG2PTokensIntoChunks` (neuralg2p.pas:337) ports
+        KPipeline.en_tokenize + waterfall_last exactly (code-point counts,
+        the pending trailing space counted, cut after the last `! . ? …`, then
+        `: ;`, then `, —` whose cut leaves the rest within the limit, a `)` or
+        `”` right after the cut goes with the first chunk, no punctuation =
+        cut before the overflowing token, an empty chunk when the first token
+        alone is over the limit); `TNeuralEnglishG2P.PhonemizeInChunks`
+        (:314) ports KPipeline.__call__ for English: `re.split('\n+',
+        text.strip())` into paragraphs (a blank part keeps its index), G2P per
+        paragraph, empty chunks dropped, a chunk over the limit cut to the
+        limit in code points (`IsTruncated`; KPipeline's `ps[:510]`); the
+        chunk (`TNeuralG2PChunk`, :115) keeps its tokens.
+        `DescribeG2PUnknownWords` (:342) prints "word: routes (pieces) ->
+        phonemes" for split / spelled / unknown tokens. KPipeline inserts no
+        silence: it yields one audio per chunk and `python -m kokoro` writes
+        them back to back, so `SynthesizeText` joins them with no gap.
+        TNNetKokoro (neuralpretrained.pas): `KokoroMaxChunkPhonemes` = 510
+        (:5383); `MaxChunkPhonemes(Voice)` (:5799) = min(510,
+        max_position_embeddings - 2, voice rows), 510 on the real checkpoint,
+        30 on the tiny fixture; `EnglishG2PForVoice(Voice)` (:5802) owns one
+        `TNeuralEnglishG2P`, accent from `EnglishG2PAccentFromVoice(Voice.Name)`,
+        re-created only when the accent changes (the new one is loaded before
+        the old is freed, so a failed load keeps the old); property
+        `EnglishDictionaryDir` (a new folder drops the G2P), `EnglishG2P`;
+        `SynthesizeText(Text, Voice, Speed, Audio, out Report)` (:5805): each
+        chunk through `SynthesizePhonemes`, so each takes its own voice row
+        (pack[len(ps)-1]) and builds stage nets for that chunk only; raises
+        when no chunk has phonemes; `SynthesizeTextToWav` (:5808).
+        `TKokoroTextReport` (:5449) = per chunk the G2P chunk, the symbols
+        outside the vocab and FirstSample/SampleCount;
+        `DescribeKokoroTextReport` (:5483) prints it for `/show` (5.9);
+        `KokoroEnglishDictionaryDir(SnapshotDir)` (:5479) = `<dir>/misaki` for
+        the example and a future server. `SynthesizePhonemes` unchanged as
+        the expert path (now counts code points with `CodePointCount`).
+        examples/KokoroTTS command line unchanged (5.8/5.9); lazbuild -B
+        Default, Debug, Release build.
+        Chunk fixture (long_mixed, 6 sentences, US and GB): misaki's own
+        tokens through `SplitG2PTokensIntoChunks` give the fixture's chunks
+        exactly (text and phonemes, 12/12 sentences). The port's own tokens
+        give the same cuts in 5 of 6 per accent; #294 differs (US and GB): the
+        port reads Qwrtz and moonlightgarden (5.5), which misaki left empty,
+        so the first chunk would pass 510 and the cut moves one sentence
+        earlier ("... since dawn." / rest). Chunk phonemes differ in #291,
+        #293, #295 (unknown words now read) and #292 ("minute", 5.4).
+        Tests: TestChunkSplitRules, TestChunksMatchKPipelineUS/GB
+        (TestNeuralG2P), TestKokoroTinySynthesizeText (one chunk =
+        SynthesizePhonemes of the G2P phonemes, bit-equal; "The quick brown
+        fox jumps over the lazy dog.\n\nThe sunflowerfield." = 3 chunks of
+        27/20/19 phonemes = the per-chunk audio joined, bit-equal; the report
+        names sunflowerfield split sunflower+field),
+        TestKokoroEnglishG2PAccentSwitch (a* -> a* same object, a* -> b*
+        new, jf_* raises and keeps the G2P, no folder raises).
   - [ ] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
         English sentences (numbers, currency, acronyms, contractions,
         possessives, hyphens, heteronyms, unknown words) for US and GB and writes
