@@ -2034,7 +2034,7 @@ rather than acted on.
         after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
   5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). IN PROGRESS:
-  5.1, 5.2, 5.4 and the 5.7 fixture done.
+  5.1, 5.2, 5.3, 5.4 and the 5.7 fixture done.
   Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
   no Python at test time (a `tools/` script writes fixtures once on the dev box).
   - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
@@ -2073,9 +2073,8 @@ rather than acted on.
         neuralhftokenizer (IsLetterCP, LowercaseCP, the new UppercaseCP, NFKC
         UnicodeNormalize); \p{Lu}/\p{Ll} are exact for ASCII, Latin-1 and
         Latin Extended-A only.
-        Hook points: numbers (5.3) at `ReadWord`'s `IsNumberWord` branch (a
-        digit token, or a number span inside a word such as `1990s`, stays
-        unread with g2prNumberPending; the currency sign before it reads '');
+        Hook points: numbers (5.3, now done: `ReadWord`'s `IsNumberWord`
+        branch calls `ReadNumber`);
         unknown words (5.5): tokens/pieces with g2prUnknown, empty phonemes as
         misaki with fallback=None; chunking (5.6): the per-token output.
         Gaps: misaki's markdown overrides (`[word](/IPA/)`, `[w](+1)`,
@@ -2146,9 +2145,48 @@ rather than acted on.
         notes.json's `full_entries`. NOT done here: the `<model-dir>/misaki/`
         default and `--dict-dir` belong to the example (5.8/5.9); the
         constructor takes the folder.
-  - [ ] 5.3 Text normalization, matching misaki and no more: cardinals,
+  - [x] 5.3 Text normalization, matching misaki and no more: cardinals,
         ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
         `%`. Small English number-to-words port (misaki uses `num2words`).
+        Done (commits 71db06b4 fixture, db271fb1 code). API in neuralg2p.pas:
+        `EnglishCardinalWords` / `EnglishOrdinalWords` / `EnglishYearWords` /
+        `EnglishDecimalWords` (:281-288), num2words 0.5.14's exact English
+        strings ("one hundred and one", "twenty-first", "ten sixty-six",
+        "nineteen oh-five", "two thousand and one", "2.0" -> "two"), computed
+        on digit strings up to num2words' 10^306 limit; they stay in
+        neuralg2p because the English G2P is their only consumer.
+        `TNeuralEnglishG2P.ReadNumber` (:2779) ports get_number: ordinals,
+        bare 4-digit years (not after a currency sign), digits glued to
+        letters (A380 three eighty, A305 three O five, 555-1234), version
+        numbers, minus only at a word head, commas removed, leading zeros
+        dropped, unstressed "point", `$ £ €` with at most 2 decimals (dollars
+        and cents, pence never plural, zero part dropped), -s/-ed/-ing
+        (1990s, 80s), num2words' "and" dropped. Currency follows retokenize
+        (`BuildPiecesAndGroups`): the last piece of a CD token after the sign,
+        unless the next token is CD, so "$12 million" puts "dollars" after
+        million (append_currency); ¥ reads nothing. The tagger now tags
+        number tokens and cardinal words CD; g2prNumberPending became
+        g2prNumber. Two tagger fixes found by the new group: A380-like
+        pieces keep the token's tag (only hyphenated words are tagged piece
+        by piece), "A" before % & + @ is NNP.
+        Fixture: new group numbers_more (23 sentences, ids 297-319, earlier
+        output byte-identical, subsets regrown under the same rule).
+        Agreement, US = GB (non-POS tokens; sentences): numbers 213/213,
+        32/32; currency 138/138, 20/20; percent 54/54, 9/10; numbers_more
+        188/188, 23/23; long_mixed 580/580, 5/6; capitals_acronyms 182/183;
+        total US 2572/2573, GB 2570/2571 tokens, 314/320 sentences. Asserted
+        100% for every group but capitals_acronyms (99%). Every remaining
+        mismatch is an earlier class: NEAR (5.1) and the POS-keyed tokens
+        (5.4: "content" in percent #228, "minute" in long_mixed #292).
+        Deviations, only where misaki/num2words would crash or round: 10^306
+        and above reads digit by digit; a number word missing from the
+        dictionary is skipped; decimals read their written digits (num2words
+        reads the float64, which differs past 15 significant digits).
+        Not done: number flags from markdown (`[n](#&a#)`, no markdown
+        parser), Unicode digits (numeric_if_needed). Tests:
+        TestEnglishNumberWords, TestNumberReading, fixture agreement now
+        counts every digit/money token. Suites: cpu, avx2, opencl
+        `TESTS=3261 ERRORS=0 FAILURES=0 IGNORED=4`.
   - [ ] 5.4 Words spelled the same but pronounced differently (790 entries keyed
         by part of speech, e.g. `read`, `record`): use the dictionary's DEFAULT
         reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
