@@ -97,6 +97,9 @@ type
   );
   TNeuralG2PResolutions = set of TNeuralG2PResolution;
 
+  // The suffix a stem rule appends: misaki _s, _ed or _ing.
+  TNeuralG2PStemSuffix = (g2pSuffixS, g2pSuffixEd, g2pSuffixIng);
+
   // One output token (misaki's merged MToken).
   TNeuralG2PToken = record
     Text: string;
@@ -279,6 +282,11 @@ type
     function SuffixS(const Stem: string): string;
     function SuffixEd(const Stem: string): string;
     function SuffixIng(const Stem: string; out Phonemes: string): boolean;
+    // misaki stem_* tail: lookup(stem), then _s / _ed / _ing on its reading;
+    // false when the stem has no reading or _ing refuses it.
+    function StemWithSuffix(const Stem, Tag: string; Stress: single;
+      const Ctx: TNeuralG2PContext; Suffix: TNeuralG2PStemSuffix;
+      out Phonemes: string; var Resolutions: TNeuralG2PResolutions): boolean;
     function StemS(const Word, Tag: string; Stress: single;
       const Ctx: TNeuralG2PContext; out Phonemes: string;
       var Resolutions: TNeuralG2PResolutions): boolean;
@@ -2832,12 +2840,30 @@ begin
   Result := true;
 end;
 
+function TNeuralEnglishG2P.StemWithSuffix(const Stem, Tag: string;
+  Stress: single; const Ctx: TNeuralG2PContext; Suffix: TNeuralG2PStemSuffix;
+  out Phonemes: string; var Resolutions: TNeuralG2PResolutions): boolean;
+var
+  StemPhonemes: string;
+begin
+  Phonemes := '';
+  if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or
+    (StemPhonemes = '') then Exit(false);
+  case Suffix of
+    g2pSuffixS: Phonemes := SuffixS(StemPhonemes);
+    g2pSuffixEd: Phonemes := SuffixEd(StemPhonemes);
+    g2pSuffixIng: if not SuffixIng(StemPhonemes, Phonemes) then Exit(false);
+  end;
+  Include(Resolutions, g2prStemRule);
+  Result := true;
+end;
+
 function TNeuralEnglishG2P.StemS(const Word, Tag: string; Stress: single;
   const Ctx: TNeuralG2PContext; out Phonemes: string;
   var Resolutions: TNeuralG2PResolutions): boolean;
 var
   WordLen: integer;
-  Stem, StemPhonemes: string;
+  Stem: string;
 begin
   Phonemes := '';
   WordLen := CodePointCount(Word);
@@ -2851,11 +2877,8 @@ begin
     IsKnown(DropBytes(Word, 3) + 'y') then
     Stem := DropBytes(Word, 3) + 'y'
   else Exit(false);
-  if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or
-    (StemPhonemes = '') then Exit(false);
-  Phonemes := SuffixS(StemPhonemes);
-  Include(Resolutions, g2prStemRule);
-  Result := true;
+  Result := StemWithSuffix(Stem, Tag, Stress, Ctx, g2pSuffixS, Phonemes,
+    Resolutions);
 end;
 
 function TNeuralEnglishG2P.StemEd(const Word, Tag: string; Stress: single;
@@ -2863,7 +2886,7 @@ function TNeuralEnglishG2P.StemEd(const Word, Tag: string; Stress: single;
   var Resolutions: TNeuralG2PResolutions): boolean;
 var
   WordLen: integer;
-  Stem, StemPhonemes: string;
+  Stem: string;
 begin
   Phonemes := '';
   WordLen := CodePointCount(Word);
@@ -2878,11 +2901,8 @@ begin
     IsKnown(DropBytes(Word, 3)) then
     Stem := DropBytes(Word, 3)
   else Exit(false);
-  if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or
-    (StemPhonemes = '') then Exit(false);
-  Phonemes := SuffixEd(StemPhonemes);
-  Include(Resolutions, g2prStemRule);
-  Result := true;
+  Result := StemWithSuffix(Stem, Tag, Stress, Ctx, g2pSuffixEd, Phonemes,
+    Resolutions);
 end;
 
 function TNeuralEnglishG2P.StemIng(const Word, Tag: string; Stress: single;
@@ -2890,7 +2910,7 @@ function TNeuralEnglishG2P.StemIng(const Word, Tag: string; Stress: single;
   var Resolutions: TNeuralG2PResolutions): boolean;
 var
   WordLen: integer;
-  Stem, StemPhonemes: string;
+  Stem: string;
 begin
   Phonemes := '';
   WordLen := CodePointCount(Word);
@@ -2903,11 +2923,8 @@ begin
     IsKnown(DropBytes(Word, 4)) then
     Stem := DropBytes(Word, 4)
   else Exit(false);
-  if not Lookup(Stem, Tag, Stress, Ctx, true, StemPhonemes, Resolutions) or
-    (StemPhonemes = '') then Exit(false);
-  if not SuffixIng(StemPhonemes, Phonemes) then Exit(false);
-  Include(Resolutions, g2prStemRule);
-  Result := true;
+  Result := StemWithSuffix(Stem, Tag, Stress, Ctx, g2pSuffixIng, Phonemes,
+    Resolutions);
 end;
 
 // misaki get_word.
