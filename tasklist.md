@@ -2037,8 +2037,9 @@ rather than acted on.
         and examples/KokoroTTS/README.md say the same. Move it to supported only
         after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
-  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). IN PROGRESS:
-  5.1, 5.2, 5.3, 5.4, 5.5, 5.6 and the 5.7 fixture done.
+  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). CODED:
+  5.1-5.9 done; the real checkpoint with text input is untested (user run
+  pending).
   Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
   no Python at test time (a `tools/` script writes fixtures once on the dev box).
   - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
@@ -2119,7 +2120,7 @@ rather than acted on.
         skips the unread number and sees "of". The POS-keyed mismatches are listed under 5.4.
         Suites after the commit: cpu, avx2, opencl all `TESTS=3259 ERRORS=0
         FAILURES=0 IGNORED=4` (was 3244).
-  - [ ] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
+  - [x] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
         `gb_gold.json` + `gb_silver.json` (GB), Apache-2.0, from misaki's GitHub
         repository (`misaki/data/`). The USER downloads them, like the model: by
         default the program looks in `<model-dir>/misaki/`; `--dict-dir <folder>`
@@ -2148,7 +2149,7 @@ rather than acted on.
         +21 MB); the suite's load test saw 67-74 ms. Entry counts equal
         notes.json's `full_entries`. NOT done here: the `<model-dir>/misaki/`
         default and `--dict-dir` belong to the example (5.8/5.9); the
-        constructor takes the folder.
+        constructor takes the folder. The example part is done in 5.8.
   - [x] 5.3 Text normalization, matching misaki and no more: cardinals,
         ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
         `%`. Small English number-to-words port (misaki uses `num2words`).
@@ -2426,7 +2427,7 @@ rather than acted on.
         names sunflowerfield split sunflower+field),
         TestKokoroEnglishG2PAccentSwitch (a* -> a* same object, a* -> b*
         new, jf_* raises and keeps the G2P, no folder raises).
-  - [ ] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
+  - [x] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
         English sentences (numbers, currency, acronyms, contractions,
         possessives, hyphens, heteronyms, unknown words) for US and GB and writes
         a fixture of sentence -> expected phonemes. Pascal tests read only the
@@ -2441,10 +2442,30 @@ rather than acted on.
         62 (US) / 64 (GB) of 2605 tokens empty. Forcing DEFAULT changes 47 of
         158 POS-keyed tokens (30 of 76 in the heteronym group), so 5.4's
         context rules look worth doing. Pascal tests come with 5.1-5.6.
-  - [ ] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
+        Pascal tests DONE with 5.1-5.6: fixture agreement per group, US and
+        GB (`TestNeuralG2P`, rates printed and asserted), number words
+        (`TestEnglishNumberWords`, `TestNumberReading`), sub-word splitting
+        and spelling (`TestUnknownWords`, `TestUnknownWordReport`), chunks
+        (`TestChunkSplitRules`, `TestChunksMatchKPipelineUS/GB`).
+  - [x] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
         argument, as in ChatTerminal (`KokoroTTS <model-dir> [options]`;
         `--model-dir` removed). Text input by default; `--phonemes "<IPA>"` stays
         as an expert override.
+        Done (with 5.9, same commits). `KokoroTTS <model-dir> [options]`; the
+        first argument without a leading `-` is the folder, a second one is
+        an error, `--model-dir` is rejected with a hint. `--dict-dir`
+        overrides the default `<model-dir>/misaki`
+        (`KokoroEnglishDictionaryDir`). Text needs the dictionaries, so the
+        program loads the G2P at startup (`TKokoroSession.CheckTextInput`); a
+        missing file stops it with exit code 1, the G2P's list of missing
+        paths and one line naming misaki/data/{us,gb}_{gold,silver}.json on
+        github.com/hexgrad/misaki, `<model-dir>/misaki` and `--dict-dir`.
+        `--phonemes` skips the G2P (no dictionaries needed; non-English
+        voices work there). Kept: `--voice`, `--speed`, `--serial`,
+        `--max-threads`, `--gpu`, `--gpu-platform`, `--gpu-device`,
+        `--no-gpu-shared-kernel` (CPU stays the default, unlike ChatTerminal).
+        New `KokoroVoiceFileName(SnapshotDir, VoiceName)` in neuralpretrained
+        (`OpenKokoroSnapshot` uses it too).
   - [ ] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
         each typed line synthesized to a WAV); `-p "text"` one-shot that never
         reads stdin; `--stats` timing to stderr; `--selftest` (argument parsing
@@ -2460,6 +2481,78 @@ rather than acted on.
         audio) lives in neural/, the `.lpr` keeps only the REPL loop and argument
         parsing, so a later TTS HTTP server can reuse it (as ChatServer reuses
         `neuralchatengine.pas`).
+        Done. Library: new unit `neural/neuralkokorosession.pas`,
+        `TKokoroSession` + `TKokoroSessionOptions` (folder, dictionary
+        folder, voice, speed, threads, OpenCL). Why a unit and not methods
+        of `TNNetKokoro` (guide rule 4): the session owns things the model
+        holder does not know about (the snapshot folder layout for voice
+        switching, the `TEasyOpenCL` device object, the current voice and
+        speed, the result of the last line), as `TChatEngine` owns them for
+        the chat frontends; it uses only `TNNetKokoro`'s public API.
+        `Create` = `OpenKokoroSnapshot` + `TNNetKokoro.Create`, threads,
+        `EnableOpenCL`, `EnglishDictionaryDir`; `CheckTextInput`;
+        `SelectVoice(Name, CheckText=true)` loads `voices/<name>.pt`, then
+        `EnglishG2PForVoice` (accent switch re-creates the G2P), and keeps the
+        old voice on any error (missing file, non-English voice, missing
+        dictionaries, a name with a path); `SpeakTextToWav(Text, File)` =
+        `SynthesizeText` + `SaveVolumeToWav16`, `SpeakPhonemesToWav` =
+        `SynthesizePhonemes` as a one-chunk report; `TKokoroLineResult`
+        (file, `TKokoroTextReport`, phoneme count, samples, synthesis and
+        write ms) and `LastLine` for `/show`. Argument parsing stays in the
+        .lpr as agreed (a server can move `ParseKokoroArgs` later).
+        Example: REPL by default; `-p "text"` / `--phonemes` one-shot, stdin
+        never read, exit 0 or 1 (1 also when a play/encode command fails;
+        `-p` with `--phonemes` is an error). `--out` pattern: `%d`, `%Nd`,
+        `%0Nd` (N <= 9) = line counter, 1 for the first WAV written, +1 per
+        WAV written (failed lines do not count; `/out` keeps the counter);
+        `%%` = `%`; other `%` sequences rejected at parse time; a pattern
+        without a counter is used as is, so -p "Hi" --out hello.wav writes
+        hello.wav and REPL lines overwrite it. Commands `/exit`, `/help`,
+        `/voice [name]`, `/speed [x]`, `/out [pattern]` (no argument prints
+        the current value), `/phonemes <IPA>`, `/show`
+        (`DescribeKokoroTextReport` of the last line); unknown commands and
+        failed lines print `Error: ...` and the REPL goes on. External
+        programs: `SplitCommandTemplate` splits the template once at startup
+        (spaces/tabs separate, '...' and "..." group with the quotes
+        removed, no escapes, "" = empty argument, unbalanced quote = parse
+        error), `ExpandCommandArguments` replaces `{wav}` / `{base}` inside
+        each argument in one pass (a substituted path stays one argument and
+        is not re-scanned; `{base}` = path without a final .wav, any case),
+        `RunExternalCommand` runs it with FPC `TProcess` (`poWaitOnExit`, no
+        shell, program searched in PATH, inherits the terminal). Order: play,
+        encode, then delete the WAV when `--keep-wav false` and the encode
+        exited 0 (`--keep-wav false` without `--encode-cmd` is a parse
+        error). A failure prints the exit code (FPC on Unix: `ExitStatus`
+        after `poWaitOnExit` is the exit code, minus the wait status for a
+        signal; `ExitCode` read 0 for `false`). `--stats` to stderr: load
+        time + peak RSS once; per line chunks, phonemes, audio s, synthesis
+        s, real-time factor (synthesis / audio), WAV write s, peak RSS.
+        `--selftest`: 73 checks (positional folder, every option, -p /
+        --phonemes, --out patterns, command splitting and placeholders,
+        --keep-wav, every REPL command), no model.
+        Test `TestKokoroSessionLinesAndVoiceSwitch` (tiny fixture copied to a
+        temp folder with the G2P subsets in `misaki/`, so the default folder
+        is used): line 1 = `SynthesizeText` (samples, chunks, phonemes, WAV
+        size), switch to a b* copy of the voice (British G2P), line 2 at
+        speed 1.5, refused switches (missing, `../af_heart`, a jf* copy) keep
+        the voice and the G2P, speed 0 raises, a phoneme line, a dictionary
+        folder without the files names us_gold.json.
+        Smoke runs (tiny fixture, `--dict-dir tests/fixtures/g2p_english`,
+        REPL fed from a here-doc): text, /show, /voice to a missing and a
+        non-English voice (refused), /speed, /out, /phonemes, /bogus, /help,
+        /exit; a b* copy switched accent; -p with `--out hello.wav`; encode
+        with `cp {wav} '{base} copy.bin'` + `--keep-wav false` (WAV
+        deleted); `false` as play and as encode (exit code 1 printed, WAV
+        kept, process exit 1); a missing program; `sh -c 'kill -9 $$'`
+        (signal reported); --phonemes with a jf* voice; missing dictionaries
+        (exit 1). Debug build (range/overflow checks) ran the REPL smoke too.
+        lazbuild -B Default, Debug, Release build.
+        Suites: cpu, avx2, opencl `TESTS=3270 ERRORS=0 FAILURES=0 IGNORED=4`
+        (was 3269).
+        Not done: no real-checkpoint run (dev-box rule); the README's raw
+        GitHub download URLs (branch `main`) were not fetched; output files
+        are overwritten without a question; the child program inherits
+        stdin, so a program that reads stdin would consume REPL input.
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
