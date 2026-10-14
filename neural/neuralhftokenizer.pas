@@ -462,6 +462,12 @@ type
 //     so string values keep their raw UTF-8 bytes.
 function HFDecodeUnicodeEscapes(const S: string): string;
 function HFParseJSONRaw(const S: string): TJSONData;
+// Reads the 4 hex digits of a JSON \uXXXX escape at HexPos (1-based, just past
+// the 'u'), pairing a high surrogate with a directly following \uDC00-\uDFFF.
+// True: CP and ByteCount (4 or 10) are set. False: ByteCount is the offset of
+// the first missing or non-hex digit.
+function HFReadUnicodeEscape(const S: string; HexPos: integer;
+  out CP: cardinal; out ByteCount: integer): boolean;
 
 // Decodes the UTF-8 code point at byte Position (1-based) and advances past
 // it; invalid bytes come back as-is. CodePointCount uses the same rule.
@@ -1168,6 +1174,51 @@ end;
 { fpjson portability helpers                                        }
 { ---------------------------------------------------------------- }
 
+// The 4 hex digits at HexPos; on failure BadOffset is the offset of the first
+// missing or non-hex digit.
+function ReadHex4(const S: string; HexPos: integer; out Value: cardinal;
+  out BadOffset: integer): boolean;
+var
+  DigitOffset, DigitPos, TextLen: integer;
+  Digit: char;
+begin
+  Value := 0;
+  TextLen := Length(S);
+  for DigitOffset := 0 to 3 do
+  begin
+    DigitPos := HexPos + DigitOffset;
+    BadOffset := DigitOffset;
+    if DigitPos > TextLen then Exit(false);
+    Digit := S[DigitPos];
+    case Digit of
+      '0'..'9': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('0'));
+      'a'..'f': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('a') + 10);
+      'A'..'F': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('A') + 10);
+      else Exit(false);
+    end;
+  end;
+  Result := true;
+end;
+
+function HFReadUnicodeEscape(const S: string; HexPos: integer;
+  out CP: cardinal; out ByteCount: integer): boolean;
+var
+  LowCP: cardinal;
+  LowBadOffset: integer;
+begin
+  Result := ReadHex4(S, HexPos, CP, ByteCount);
+  if not Result then exit;
+  ByteCount := 4;
+  if (CP >= $D800) and (CP <= $DBFF) and (HexPos + 5 <= Length(S)) and
+    (S[HexPos + 4] = '\') and (S[HexPos + 5] = 'u') and
+    ReadHex4(S, HexPos + 6, LowCP, LowBadOffset) and (LowCP >= $DC00) and
+    (LowCP <= $DFFF) then
+  begin
+    CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
+    ByteCount := 10;
+  end;
+end;
+
 // fpjson converts \uXXXX escapes through the widestring manager; without
 // one installed (plain FPC programs that don't use LazUTF8/cwstring) every
 // non-ASCII escape decodes to '?'. Decode them to raw UTF-8 up front so
@@ -1176,29 +1227,8 @@ end;
 // backslash) is never decoded.
 function DecodeUnicodeEscapes(const S: string): string;
 var
-  Position, Total: integer;
-  CP, LowCP: cardinal;
-
-  function HexAt(StartPos: integer; out Value: cardinal): boolean;
-  var
-    Cnt, EndPos: integer;
-    Digit: char;
-  begin
-    Value := 0;
-    Result := StartPos + 3 <= Length(S);
-    if not Result then exit;
-    EndPos := StartPos + 3;
-    for Cnt := StartPos to EndPos do
-    begin
-      Digit := S[Cnt];
-      case Digit of
-        '0'..'9': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('0'));
-        'a'..'f': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('a') + 10);
-        'A'..'F': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('A') + 10);
-        else Exit(false);
-      end;
-    end;
-  end;
+  Position, Total, EscapeLen: integer;
+  CP: cardinal;
 
 var
   OutPos: integer;
@@ -1227,17 +1257,10 @@ begin
   begin
     if (S[Position] = '\') and (Position < Total) then
     begin
-      if (S[Position + 1] = 'u') and HexAt(Position + 2, CP) then
+      if (S[Position + 1] = 'u') and
+        HFReadUnicodeEscape(S, Position + 2, CP, EscapeLen) then
       begin
-        Inc(Position, 6);
-        if (CP >= $D800) and (CP <= $DBFF) and (Position + 1 <= Total) and
-          (S[Position] = '\') and (S[Position + 1] = 'u') and
-          HexAt(Position + 2, LowCP) and (LowCP >= $DC00) and
-          (LowCP <= $DFFF) then
-        begin // surrogate pair
-          CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
-          Inc(Position, 6);
-        end;
+        Inc(Position, 2 + EscapeLen);
         // Encodes straight into the buffer: no intermediate string fragment.
         HFWriteCodePointUTF8(PBuf, OutPos, CP);
       end

@@ -1504,31 +1504,10 @@ end;
 procedure TNeuralG2PDictionary.ScanString(var Position: integer;
   out Start, Len: integer);
 var
-  ReadPos, WritePos, TextLen, ByteCnt, EncodedLen: integer;
+  ReadPos, WritePos, TextLen, ByteCnt, EncodedLen, EscapeLen: integer;
   C: char;
-  CP, LowSurrogate: cardinal;
+  CP: cardinal;
   Encoded: string;
-
-  function HexAt(At: integer): cardinal;
-  var
-    DigitCnt: integer;
-    Digit: char;
-  begin
-    Result := 0;
-    if At + 3 > TextLen then RaiseParseError(At, 'four hex digits');
-    for DigitCnt := 0 to 3 do
-    begin
-      Digit := FText[At + DigitCnt];
-      case Digit of
-        '0'..'9': Result := Result * 16 + cardinal(Ord(Digit) - Ord('0'));
-        'a'..'f': Result := Result * 16 + cardinal(Ord(Digit) - Ord('a') + 10);
-        'A'..'F': Result := Result * 16 + cardinal(Ord(Digit) - Ord('A') + 10);
-      else
-        RaiseParseError(At + DigitCnt, 'a hex digit');
-      end;
-    end;
-  end;
-
 begin
   TextLen := Length(FText);
   if (Position > TextLen) or (FText[Position] <> '"') then
@@ -1560,18 +1539,13 @@ begin
       't': Encoded := #9;
       'u':
         begin
-          CP := HexAt(ReadPos);
-          Inc(ReadPos, 4);
-          if (CP >= $D800) and (CP <= $DBFF) and (ReadPos + 5 <= TextLen) and
-            (FText[ReadPos] = '\') and (FText[ReadPos + 1] = 'u') then
+          if not HFReadUnicodeEscape(FText, ReadPos, CP, EscapeLen) then
           begin
-            LowSurrogate := HexAt(ReadPos + 2);
-            if (LowSurrogate >= $DC00) and (LowSurrogate <= $DFFF) then
-            begin
-              CP := $10000 + ((CP - $D800) shl 10) + (LowSurrogate - $DC00);
-              Inc(ReadPos, 6);
-            end;
+            if ReadPos + 3 > TextLen then
+              RaiseParseError(ReadPos, 'four hex digits');
+            RaiseParseError(ReadPos + EscapeLen, 'a hex digit');
           end;
+          Inc(ReadPos, EscapeLen);
           Encoded := CodePointToUTF8(CP);
         end;
     else
