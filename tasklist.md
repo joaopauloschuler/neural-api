@@ -1904,7 +1904,7 @@ rather than acted on.
         complex spectrum 2.4e-7; phase (only where |X| > 1e-4 max |X|, wrapped)
         4.0e-4 rad. Tiny: har_source 1.5e-8, spec 2.4e-7, phase 3.9e-4 rad.
         Host step 41 ms on the real sentence (`fpc -O2` test build, no AVX2).
-        - [ ] ARBITRARY PHASE BINS: zero noise makes har_source the constant
+        - [x] ARBITRARY PHASE BINS (kept, user decision 2026-10-14): zero noise makes har_source the constant
           tanh(bias) on unvoiced spans, so bins 2..10 of those frames are
           rounding noise. Real sentence: 44,238 of 134,651 bins at |X| <=
           1e-7 max (52,990 at <= 1e-4). Torch (MKL FFT) is deterministic there
@@ -2027,15 +2027,15 @@ rather than acted on.
         this VM; the user's real-machine check is those tests and
         `KokoroTTS --model-dir <snapshot> --phonemes "həlˈO wˈɜɹld. ðˌɪs ɪz ɐ
         tˈɛst." --out hello.wav`.
-        - [ ] OPEN DECISION (2.9, awaiting the user's listening test): keep or
-          zero the arbitrary harmonic-spectrum phase bins on unvoiced spans.
-          Today they are kept (our STFT's rounding values).
+        - [x] DECIDED (2.9, 2026-10-14, after the user's listening test): keep
+          the arbitrary harmonic-spectrum phase bins on unvoiced spans (our
+          STFT's rounding values).
   - [x] 4.3 README (planned vs supported split; "supported" only after the user
         tests it), this entry.
         Done: root README "More audio" highlight names `KokoroTTS` as planned
         (coded), not yet tested on the real checkpoint; examples/README.md entry
-        and examples/KokoroTTS/README.md say the same. Move it to supported only
-        after the user's real run.
+        and examples/KokoroTTS/README.md say the same. Moved to supported on
+        2026-10-14 after the user's real run.
   Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
   5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). CODED:
   5.1-5.9 done; the real checkpoint with text input is untested (user run
@@ -2255,8 +2255,8 @@ rather than acted on.
         cover always exists for ASCII letters; "leftover single characters"
         = the spelled letters of the best cover, and a word with no
         dictionary piece is spelled letter by letter (Qwrtz, Hrrm, shh,
-        Bpsa) — the literal reading of the rule; say if such words should
-        stay silent instead. A piece reads its DEFAULT (POS-free) reading,
+        Bpsa) — the literal reading of the rule; kept (user decision
+        2026-10-14: spell, not silent). A piece reads its DEFAULT (POS-free) reading,
         gold before silver, the exact key before its Capitalized form
         (misaki grow_dictionary), null entries skipped. Readings are joined
         without spaces; only the first piece keeps ˈ, later ˈ become ˌ. A
