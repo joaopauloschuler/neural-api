@@ -24,17 +24,23 @@ Kokoro-82M reads). A pure-Pascal port of misaki 0.9.4 `en.py`
     replaces spaCy. It reads the neighbouring words against fixed tables
     (cPreviousWordCues and friends) to choose the determiner / verb / noun /
     adjective reading of POS-keyed entries (read, present, that, ...).
+  * Numbers (ReadNumber): misaki get_number on top of a port of num2words'
+    English converter (EnglishCardinalWords, EnglishOrdinalWords,
+    EnglishYearWords, EnglishDecimalWords): years, ordinals, decimals,
+    version numbers, digits inside words, $ £ € amounts and % & + @.
 
-Not here (later tasks), with their hook points: numbers, currency and
-percent (5.3: ReadWord's IsNumberWord branch; a digit token or a number span
-inside a word stays unread with resolution g2prNumberPending, and the
-currency sign before it reads ''); splitting unknown words into dictionary
-words (5.5: a token or piece with g2prUnknown has empty phonemes, as misaki
-does with fallback=None); long-text chunking (5.6: Phonemize's per-token
-output). Not ported: misaki's markdown overrides ([word](/IPA/), [word](+1),
-[n](#flags#)) and its Unicode digit folding (numeric_if_needed).
-Deviation: a word of more than csMaxMergedPieces sub-tokens only tries merges
-of up to that many (misaki's merge loop is cubic in the sub-token count).
+Not here (later tasks), with their hook points: splitting unknown words into
+dictionary words (5.5: a token or piece with g2prUnknown has empty phonemes,
+as misaki does with fallback=None); long-text chunking (5.6: Phonemize's
+per-token output). Not ported: misaki's markdown overrides ([word](/IPA/),
+[word](+1), [n](#flags#), so no number flags) and its Unicode digit folding
+(numeric_if_needed).
+Deviations: a word of more than csMaxMergedPieces sub-tokens only tries merges
+of up to that many (misaki's merge loop is cubic in the sub-token count); a
+decimal is read from its digits as written (num2words reads the float64
+value, which differs past 15 significant digits); a number misaki would crash
+on (10^306 and above, a number word missing from the dictionary) is read digit
+by digit or without that word.
 
 Coded by Claude (AI).
 *)
@@ -65,7 +71,7 @@ type
     g2prStemRule,      // -s / -ed / -ing over a known stem
     g2prSpelled,       // spelled with the letter entries
     g2prUnknown,       // no reading: empty phonemes (misaki None)
-    g2prNumberPending  // digits: number reading not implemented (task 5.3)
+    g2prNumber         // misaki get_number: digits read as number words
   );
   TNeuralG2PResolutions = set of TNeuralG2PResolution;
 
@@ -162,6 +168,7 @@ type
     Phonemes: string;
     HasPhonemes: boolean;
     Prespace: boolean;
+    Currency: string;  // misaki _.currency: '$', '£' or '€' on an amount
     Resolutions: TNeuralG2PResolutions;
   end;
 
@@ -240,8 +247,12 @@ type
     function GetWord(const AWord, Tag: string; Stress: single;
       const Ctx: TNeuralG2PContext; out Phonemes: string;
       var Resolutions: TNeuralG2PResolutions): boolean;
-    function ReadWord(const Text, Tag: string; const Ctx: TNeuralG2PContext;
-      out Phonemes: string; var Resolutions: TNeuralG2PResolutions): boolean;
+    function ReadNumber(const AWord, Currency: string; IsHead: boolean;
+      out Phonemes: string): boolean;
+    function AppendCurrencyUnit(const Phonemes, Currency: string): string;
+    function ReadWord(const Text, Tag, Currency: string; IsHead: boolean;
+      const Ctx: TNeuralG2PContext; out Phonemes: string;
+      var Resolutions: TNeuralG2PResolutions): boolean;
   public
     // Loads <DictionaryDir>/{us|gb}_gold.json and _silver.json; raises
     // ENeuralG2PError naming every missing file.
@@ -265,6 +276,16 @@ function ApplyG2PStress(const Phonemes: string; Stress: single): string;
 // misaki subtokenize: the sub-token regex of en.py, matched by hand.
 procedure G2PSubTokenize(const Word: string; Pieces: TStrings);
 function G2PResolutionName(Resolution: TNeuralG2PResolution): string;
+// num2words(int(Digits), lang='en') 0.5.14: "one hundred and one",
+// "twenty-one". Digits: [-]0-9..., below 10^306; others raise ENeuralG2PError.
+function EnglishCardinalWords(const Digits: string): string;
+// num2words to='ordinal': "twenty-first", "one hundredth"; no '-' allowed.
+function EnglishOrdinalWords(const Digits: string): string;
+// num2words to='year': "ten sixty-six", "nineteen oh-five", "two thousand".
+function EnglishYearWords(const Digits: string): string;
+// num2words(float(Number)): [-]digits[.digits] -> "three point one four";
+// a zero fraction reads as the integer ("2.0" -> "two").
+function EnglishDecimalWords(const Number: string): string;
 
 implementation
 
@@ -679,6 +700,21 @@ begin
   else Result := Tag;
 end;
 
+const
+  // misaki CURRENCIES: unit and sub-unit per sign (¥ is not one).
+  cCurrencySigns: array[0..2] of string = ('$', #$C2#$A3, #$E2#$82#$AC);
+  cCurrencyUnits: array[0..2, 0..1] of string = (('dollar', 'cent'),
+    ('pound', 'pence'), ('euro', 'cent'));
+
+function CurrencyIndex(const Sign: string): integer;
+var
+  SignCnt: integer;
+begin
+  for SignCnt := 0 to High(cCurrencySigns) do
+    if cCurrencySigns[SignCnt] = Sign then Exit(SignCnt);
+  Result := -1;
+end;
+
 // misaki SYMBOLS: % & + @.
 function SymbolWord(const Word: string): string;
 begin
@@ -689,8 +725,9 @@ begin
   else Result := '';
 end;
 
-// misaki is_number (is_head is always true in this port).
-function IsNumberWord(const Word: string): boolean;
+// misaki is_number: digits , . and the suffixes ing 'd ed 's st nd rd th s;
+// a leading '-' only at the head of a word.
+function IsNumberWord(const Word: string; IsHead: boolean): boolean;
 const
   cSuffixes: array[0..9] of string = ('ing', '''d', 'ed', '''s', 'st', 'nd',
     'rd', 'th', 's', '');
@@ -714,8 +751,222 @@ begin
   MaxBytePos := Length(Stripped);
   for BytePos := 1 to MaxBytePos do
     if not ((Stripped[BytePos] in ['0'..'9', ',', '.']) or
-      ((BytePos = 1) and (Stripped[BytePos] = '-'))) then Exit(false);
+      (IsHead and (BytePos = 1) and (Stripped[BytePos] = '-'))) then Exit(false);
   Result := true;
+end;
+
+{ ---------------------------------------------------------------- }
+{ num2words 0.5.14, English (lang_EN.py over base.py)               }
+{ ---------------------------------------------------------------- }
+
+const
+  cLowNumberWords: array[0..20] of string = ('zero', 'one', 'two', 'three',
+    'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
+    'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen',
+    'nineteen', 'twenty');
+  cTensNumberWords: array[2..9] of string = ('twenty', 'thirty', 'forty',
+    'fifty', 'sixty', 'seventy', 'eighty', 'ninety');
+  // num2words' "illion" prefixes: 10^6 .. 10^30, then unit + ten prefixes
+  // up to 10^330 (only 10^33 .. 10^300 used), then cent (10^303).
+  cIllionLowPrefixes: array[0..8] of string = ('m', 'b', 'tr', 'quadr',
+    'quint', 'sext', 'sept', 'oct', 'non');
+  cIllionUnitPrefixes: array[0..9] of string = ('', 'un', 'duo', 'tre',
+    'quattuor', 'quin', 'sex', 'sept', 'octo', 'novem');
+  cIllionTenPrefixes: array[0..8] of string = ('dec', 'vigint', 'trigint',
+    'quadragint', 'quinquagint', 'sexagint', 'septuagint', 'octogint',
+    'nonagint');
+  // num2words' MAXVAL is 1000 * 10^303.
+  csMaxCardinalDigits = 306;
+
+// 0..99: "seven", "forty-two".
+function SmallCardinalWords(Value: integer): string;
+begin
+  if Value <= 20 then Exit(cLowNumberWords[Value]);
+  Result := cTensNumberWords[Value div 10];
+  if Value mod 10 > 0 then
+    Result := Result + '-' + cLowNumberWords[Value mod 10];
+end;
+
+// Name of 10^Exponent for Exponent = 6, 9, ..., 303.
+function IllionWord(Exponent: integer): string;
+var
+  PrefixIdx: integer;
+begin
+  PrefixIdx := (Exponent - 6) div 3;
+  if PrefixIdx <= High(cIllionLowPrefixes) then
+    Result := cIllionLowPrefixes[PrefixIdx]
+  else if PrefixIdx < 99 then
+  begin
+    Dec(PrefixIdx, Length(cIllionLowPrefixes));
+    Result := cIllionUnitPrefixes[PrefixIdx mod 10] +
+      cIllionTenPrefixes[PrefixIdx div 10];
+  end
+  else Result := 'cent';
+  Result := Result + 'illion';
+end;
+
+function StripLeadingZeros(const Digits: string): string;
+var
+  FirstPos, MaxFirstPos: integer;
+begin
+  FirstPos := 1;
+  MaxFirstPos := Length(Digits) - 1;
+  while (FirstPos <= MaxFirstPos) and (Digits[FirstPos] = '0') do Inc(FirstPos);
+  Result := Copy(Digits, FirstPos, MaxInt);
+end;
+
+function IsDigitText(const S: string): boolean;
+var
+  BytePos, MaxBytePos: integer;
+begin
+  MaxBytePos := Length(S);
+  if MaxBytePos = 0 then Exit(false);
+  for BytePos := 1 to MaxBytePos do
+    if not (S[BytePos] in ['0'..'9']) then Exit(false);
+  Result := true;
+end;
+
+// Splits an optional leading '-' off and checks the digits.
+procedure ParseSignedDigits(const Digits: string; out IsNegative: boolean;
+  out Magnitude: string);
+begin
+  IsNegative := (Digits <> '') and (Digits[1] = '-');
+  if IsNegative then Magnitude := Copy(Digits, 2, MaxInt)
+  else Magnitude := Digits;
+  if not IsDigitText(Magnitude) then
+    raise ENeuralG2PError.Create('Not an integer: "' + Digits + '"');
+  Magnitude := StripLeadingZeros(Magnitude);
+  if Length(Magnitude) > csMaxCardinalDigits then
+    raise ENeuralG2PError.Create('Number too large for words (10^306 and ' +
+      'above): ' + Digits);
+end;
+
+// num2words splitnum + clean + merge on a digit string without leading zeros:
+// largest card (100, 1000, 10^6, ...) times its multiplier, then the rest
+// after "and" (below 100) or ", ".
+function CardinalWordsOfDigits(const Digits: string): string;
+var
+  DigitCount, CardExponent: integer;
+  Rest: string;
+begin
+  DigitCount := Length(Digits);
+  if DigitCount <= 2 then Exit(SmallCardinalWords(StrToInt(Digits)));
+  if DigitCount = 3 then CardExponent := 2
+  else CardExponent := 3 * ((DigitCount - 1) div 3);
+  Result := CardinalWordsOfDigits(Copy(Digits, 1, DigitCount - CardExponent));
+  case CardExponent of
+    2: Result := Result + ' hundred';
+    3: Result := Result + ' thousand';
+  else
+    Result := Result + ' ' + IllionWord(CardExponent);
+  end;
+  Rest := StripLeadingZeros(Copy(Digits, DigitCount - CardExponent + 1,
+    CardExponent));
+  if Rest = '0' then Exit;
+  if Length(Rest) <= 2 then Result := Result + ' and '
+  else Result := Result + ', ';
+  Result := Result + CardinalWordsOfDigits(Rest);
+end;
+
+function EnglishCardinalWords(const Digits: string): string;
+var
+  IsNegative: boolean;
+  Magnitude: string;
+begin
+  ParseSignedDigits(Digits, IsNegative, Magnitude);
+  Result := CardinalWordsOfDigits(Magnitude);
+  if IsNegative and (Magnitude <> '0') then Result := 'minus ' + Result;
+end;
+
+function EnglishOrdinalWords(const Digits: string): string;
+const
+  cOrdinalExceptions: array[0..11, 0..1] of string = (('one', 'first'),
+    ('two', 'second'), ('three', 'third'), ('four', 'fourth'),
+    ('five', 'fifth'), ('six', 'sixth'), ('seven', 'seventh'),
+    ('eight', 'eighth'), ('nine', 'ninth'), ('ten', 'tenth'),
+    ('eleven', 'eleventh'), ('twelve', 'twelfth'));
+var
+  IsNegative: boolean;
+  Magnitude, LastWord, Ordinal: string;
+  LastWordStart, ExceptionCnt: integer;
+begin
+  ParseSignedDigits(Digits, IsNegative, Magnitude);
+  if IsNegative then
+    raise ENeuralG2PError.Create('Cannot treat negative num ' + Digits +
+      ' as ordinal.');
+  Result := CardinalWordsOfDigits(Magnitude);
+  LastWordStart := Length(Result);
+  while (LastWordStart > 1) and not (Result[LastWordStart - 1] in [' ', '-']) do
+    Dec(LastWordStart);
+  LastWord := Copy(Result, LastWordStart, MaxInt);
+  Ordinal := '';
+  for ExceptionCnt := 0 to High(cOrdinalExceptions) do
+    if cOrdinalExceptions[ExceptionCnt, 0] = LastWord then
+      Ordinal := cOrdinalExceptions[ExceptionCnt, 1];
+  if Ordinal = '' then
+  begin
+    if LastWord[Length(LastWord)] = 'y' then
+      Ordinal := DropBytes(LastWord, 1) + 'ieth'
+    else Ordinal := LastWord + 'th';
+  end;
+  Result := Copy(Result, 1, LastWordStart - 1) + Ordinal;
+end;
+
+function EnglishYearWords(const Digits: string): string;
+var
+  IsNegative: boolean;
+  Magnitude, Century: string;
+  YearInCentury, CenturyLength: integer;
+begin
+  ParseSignedDigits(Digits, IsNegative, Magnitude);
+  if Length(Magnitude) <= 2 then Century := '0'
+  else Century := Copy(Magnitude, 1, Length(Magnitude) - 2);
+  YearInCentury := StrToInt(Copy(Magnitude, Length(Magnitude) - 1, 2));
+  CenturyLength := Length(Century);
+  // 00XX, X00X and five or more digits read as a cardinal
+  if (Century = '0') or ((Century[CenturyLength] = '0') and
+    (YearInCentury < 10)) or (CenturyLength >= 3) then
+    Result := CardinalWordsOfDigits(Magnitude)
+  else
+  begin
+    Result := CardinalWordsOfDigits(Century);
+    if YearInCentury = 0 then Result := Result + ' hundred'
+    else if YearInCentury < 10 then
+      Result := Result + ' oh-' + SmallCardinalWords(YearInCentury)
+    else Result := Result + ' ' + SmallCardinalWords(YearInCentury);
+  end;
+  if IsNegative then Result := Result + ' BC';
+end;
+
+function EnglishDecimalWords(const Number: string): string;
+var
+  DotPos, FractionLength, DigitCnt: integer;
+  IntegerPart, Fraction: string;
+  IsNegative: boolean;
+begin
+  DotPos := Pos('.', Number);
+  if DotPos = 0 then Exit(EnglishCardinalWords(Number));
+  IntegerPart := Copy(Number, 1, DotPos - 1);
+  Fraction := Copy(Number, DotPos + 1, MaxInt);
+  IsNegative := (IntegerPart <> '') and (IntegerPart[1] = '-');
+  if IsNegative then Delete(IntegerPart, 1, 1);
+  if ((IntegerPart = '') and (Fraction = '')) or
+    ((IntegerPart <> '') and not IsDigitText(IntegerPart)) or
+    ((Fraction <> '') and not IsDigitText(Fraction)) then
+    raise ENeuralG2PError.Create('Not a decimal number: "' + Number + '"');
+  if IntegerPart = '' then IntegerPart := '0';
+  FractionLength := Length(Fraction);
+  while (FractionLength > 0) and (Fraction[FractionLength] = '0') do
+    Dec(FractionLength);
+  IntegerPart := StripLeadingZeros(IntegerPart);
+  // Python's int() keeps the sign of -3.5 but not of -0.5
+  if IsNegative and ((FractionLength = 0) or (IntegerPart <> '0')) then
+    IntegerPart := '-' + IntegerPart;
+  Result := EnglishCardinalWords(IntegerPart);
+  if FractionLength = 0 then Exit;
+  Result := Result + ' point';
+  for DigitCnt := 1 to FractionLength do
+    Result := Result + ' ' + cLowNumberWords[Ord(Fraction[DigitCnt]) - Ord('0')];
 end;
 
 function ApplyG2PStress(const Phonemes: string; Stress: single): string;
@@ -778,7 +1029,7 @@ begin
     g2prStemRule: Result := 'stem rule';
     g2prSpelled: Result := 'spelled';
     g2prUnknown: Result := 'unknown';
-    g2prNumberPending: Result := 'number (not read yet)';
+    g2prNumber: Result := 'number';
   else
     Result := '?';
   end;
@@ -1748,6 +1999,8 @@ begin
   HasPrevious := PreviousWord(Index, Previous);
   HasNext := NextWord(Index, Next);
   if Pos('@', Word) > 0 then Exit('ADD');
+  if IsNumberWord(Word, true) and (Word[Length(Word)] in ['0'..'9', ',', '.']) then
+    Exit('CD');
   LetterCount := 0;
   TextLen := Length(Word);
   Position := 1;
@@ -1764,7 +2017,9 @@ begin
   Base := StripClitic(Lower);
   if Base = 'a' then
   begin
-    if (Word = 'A') and HasPrevious and not HasNext then Exit('NNP');
+    // "A." and "A + B" name the letter
+    if (Word = 'A') and ((HasPrevious and not HasNext) or
+      (SymbolWord(Next) <> '')) then Exit('NNP');
     Exit('DT');
   end;
   if Word = 'I' then Exit('PRP');
@@ -1781,6 +2036,9 @@ begin
   end;
   Result := ClosedClassTag(Base);
   if Result <> '' then Exit;
+  if InStringArray(Lower, cLowNumberWords) or
+    InStringArray(Lower, cTensNumberWords) or InStringArray(Lower,
+    ['hundred', 'thousand', 'million', 'billion', 'trillion']) then Exit('CD');
   // Capitalized words inside a sentence are proper nouns
   if not IsSentenceStart and (LetterCount >= 2) and
     (G2PCapitalize(Word) = Word) and (G2PLower(Word) <> Word) then
@@ -1949,8 +2207,9 @@ begin
         Piece := Default(TNeuralG2PPiece);
         Piece.Text := SubPieces[PieceCnt];
         Piece.Tag := RawToken.Tag;
-        // spaCy tags the parts of a hyphenated word one by one
-        if (Parts.Count > 1) or (MaxPieceCnt > 0) then
+        // spaCy tags the parts of a hyphenated word one by one (not A380)
+        if (Parts.Count > 1) or ((MaxPieceCnt > 0) and
+          (Pos('-', Parts[PartCnt]) > 0)) then
         begin
           PieceTag := ClosedClassTag(LowerCase(Piece.Text));
           if (PieceTag = 'PRP') and (Piece.Text <> 'I') then PieceTag := '';
@@ -1983,13 +2242,18 @@ begin
   end;
 end;
 
+// misaki retokenize, including its currency rule: after $ £ €, the last
+// piece of a CD token takes the sign unless the next token is CD too
+// ("$12 million" -> million dollars); a token that is not CD ends it.
 procedure TNeuralEnglishG2P.BuildPiecesAndGroups();
 var
   RawCnt, MaxRawPos: integer;
   Piece: TNeuralG2PPiece;
+  Currency: string;
 begin
   FPieceCount := 0;
   FGroupCount := 0;
+  Currency := '';
   MaxRawPos := FRawCount - 1;
   for RawCnt := 0 to MaxRawPos do
     if FRaw[RawCnt].IsPunctuation then
@@ -2002,9 +2266,19 @@ begin
       Piece.HasPhonemes := true;
       Piece.Resolutions := [g2prPunctuation];
       AddPiece(Piece);
+      if (FRaw[RawCnt].Tag = '$') and (CurrencyIndex(FRaw[RawCnt].Text) >= 0) then
+        Currency := FRaw[RawCnt].Text;
     end
     else
+    begin
       AppendWordPieces(FRaw[RawCnt]);
+      if Currency <> '' then
+      begin
+        if FRaw[RawCnt].Tag <> 'CD' then Currency := ''
+        else if (RawCnt = MaxRawPos) or (FRaw[RawCnt + 1].Tag <> 'CD') then
+          FPieces[FPieceCount - 1].Currency := Currency;
+      end;
+    end;
 end;
 
 { ---------------------------------------------------------------- }
@@ -2483,9 +2757,247 @@ begin
   Result := false;
 end;
 
-// misaki Lexicon.__call__ for one (merged) token text.
-function TNeuralEnglishG2P.ReadWord(const Text, Tag: string;
-  const Ctx: TNeuralG2PContext; out Phonemes: string;
+// misaki append_currency: "million" after "$12" reads "million dollars".
+function TNeuralEnglishG2P.AppendCurrencyUnit(const Phonemes,
+  Currency: string): string;
+var
+  CurrencyIdx: integer;
+  UnitPhonemes: string;
+  Unused: TNeuralG2PResolutions;
+begin
+  Result := Phonemes;
+  CurrencyIdx := CurrencyIndex(Currency);
+  if CurrencyIdx < 0 then Exit;
+  Unused := [];
+  if StemS(cCurrencyUnits[CurrencyIdx, 0] + 's', '', csG2PNoStress,
+    Default(TNeuralG2PContext), UnitPhonemes, Unused) then
+    Result := Phonemes + ' ' + UnitPhonemes;
+end;
+
+// misaki get_number: num2words words read from the dictionary ("and"
+// dropped, "point" unstressed), then the -s/-ed/-ing ending ("1990s").
+function TNeuralEnglishG2P.ReadNumber(const AWord, Currency: string;
+  IsHead: boolean; out Phonemes: string): boolean;
+var
+  Word, Suffix, Digits, UnitPhonemes: string;
+  PartCount, SuffixStart, CurrencyIdx, DotCount, BytePos,
+    MaxBytePos: integer;
+  HadMinus, IsOrdinal: boolean;
+  Unused: TNeuralG2PResolutions;
+
+  procedure AddPhonemes(const Part: string);
+  begin
+    if PartCount > 0 then Phonemes := Phonemes + ' ';
+    Phonemes := Phonemes + Part;
+    Inc(PartCount);
+  end;
+
+  // misaki lookup(word, None, stress, None); a word missing from the
+  // dictionary is skipped (misaki would fail joining None).
+  procedure AddWord(const NumberWord: string; Stress: single);
+  var
+    WordPhonemes: string;
+  begin
+    if Lookup(NumberWord, '', Stress, Default(TNeuralG2PContext), false,
+      WordPhonemes, Unused) then AddPhonemes(WordPhonemes);
+  end;
+
+  // misaki extend_num(escape=True): split on non-letters, drop "and".
+  procedure AddNumberWords(const NumberText: string);
+  var
+    WordStart, Position, TextLen: integer;
+    NumberWord: string;
+  begin
+    TextLen := Length(NumberText);
+    Position := 1;
+    while Position <= TextLen do
+    begin
+      while (Position <= TextLen) and not (NumberText[Position] in ['a'..'z']) do
+        Inc(Position);
+      WordStart := Position;
+      while (Position <= TextLen) and (NumberText[Position] in ['a'..'z']) do
+        Inc(Position);
+      if Position = WordStart then Break;
+      NumberWord := Copy(NumberText, WordStart, Position - WordStart);
+      if NumberWord = 'point' then AddWord(NumberWord, -2)
+      else if NumberWord <> 'and' then AddWord(NumberWord, csG2PNoStress);
+    end;
+  end;
+
+  procedure AddDigitByDigit(const DigitText: string);
+  var
+    DigitPos, MaxDigitPos: integer;
+  begin
+    MaxDigitPos := Length(DigitText);
+    for DigitPos := 1 to MaxDigitPos do
+      if DigitText[DigitPos] in ['0'..'9'] then
+        AddNumberWords(cLowNumberWords[Ord(DigitText[DigitPos]) - Ord('0')]);
+  end;
+
+  function HasNonZeroAfterFirst(const DigitText: string): boolean;
+  var
+    DigitPos, MaxDigitPos: integer;
+  begin
+    MaxDigitPos := Length(DigitText);
+    for DigitPos := 2 to MaxDigitPos do
+      if DigitText[DigitPos] <> '0' then Exit(true);
+    Result := false;
+  end;
+
+  // Digits glued to letters (A380, 50p): short groups or digit by digit.
+  procedure AddGluedDigits;
+  begin
+    if (Digits[1] = '0') or (Length(Digits) > 3) then AddDigitByDigit(Digits)
+    else if (Length(Digits) = 3) and not EndsWith(Digits, '00') then
+    begin
+      AddNumberWords(EnglishCardinalWords(Digits[1]));
+      if Digits[2] = '0' then
+      begin
+        AddWord('O', -2);
+        AddNumberWords(EnglishCardinalWords(Digits[3]));
+      end
+      else AddNumberWords(EnglishCardinalWords(Copy(Digits, 2, 2)));
+    end
+    else AddNumberWords(EnglishCardinalWords(Digits));
+  end;
+
+  // Version numbers (2.0.1): each group digit by digit, unless it has two
+  // digits or is round (10, 100).
+  procedure AddVersionGroups;
+  var
+    Groups: TStringList;
+    GroupCnt, MaxGroupPos: integer;
+  begin
+    Groups := TStringList.Create;
+    try
+      Groups.StrictDelimiter := true;
+      Groups.Delimiter := '.';
+      Groups.DelimitedText := Digits;
+      MaxGroupPos := Groups.Count - 1;
+      for GroupCnt := 0 to MaxGroupPos do
+      begin
+        if Groups[GroupCnt] = '' then Continue;
+        if (Groups[GroupCnt][1] = '0') or ((Length(Groups[GroupCnt]) <> 2) and
+          HasNonZeroAfterFirst(Groups[GroupCnt])) then
+          AddDigitByDigit(Groups[GroupCnt])
+        else AddNumberWords(EnglishCardinalWords(Groups[GroupCnt]));
+      end;
+    finally
+      Groups.Free;
+    end;
+  end;
+
+  procedure AddUnit(const Amount, UnitWord: string);
+  var
+    UnitPlural: string;
+  begin
+    AddNumberWords(EnglishCardinalWords(Amount));
+    if (Amount <> '1') and (UnitWord <> 'pence') then
+    begin
+      if StemS(UnitWord + 's', '', csG2PNoStress, Default(TNeuralG2PContext),
+        UnitPlural, Unused) then AddPhonemes(UnitPlural);
+    end
+    else AddWord(UnitWord, csG2PNoStress);
+  end;
+
+  // $5.50 -> five dollars and fifty cents; a zero part is dropped.
+  procedure AddAmount;
+  var
+    WholeDigits, CentDigits: string;
+    HasWhole: boolean;
+  begin
+    WholeDigits := Digits;
+    CentDigits := '0';
+    if DotCount > 0 then
+    begin
+      WholeDigits := Copy(Digits, 1, Pos('.', Digits) - 1);
+      CentDigits := Copy(Digits, Pos('.', Digits) + 1, MaxInt);
+      if WholeDigits = '' then WholeDigits := '0';
+      if CentDigits = '' then CentDigits := '0';
+    end;
+    WholeDigits := StripLeadingZeros(WholeDigits);
+    CentDigits := StripLeadingZeros(CentDigits);
+    HasWhole := (CentDigits = '0') or (WholeDigits <> '0');
+    if HasWhole then AddUnit(WholeDigits, cCurrencyUnits[CurrencyIdx, 0]);
+    if CentDigits <> '0' then
+    begin
+      if HasWhole then AddWord('and', csG2PNoStress);
+      AddUnit(CentDigits, cCurrencyUnits[CurrencyIdx, 1]);
+    end;
+  end;
+
+begin
+  Phonemes := '';
+  PartCount := 0;
+  Unused := [];
+  Word := AWord;
+  SuffixStart := Length(Word) + 1;
+  while (SuffixStart > 1) and (Word[SuffixStart - 1] in ['a'..'z', '''']) do
+    Dec(SuffixStart);
+  Suffix := Copy(Word, SuffixStart, MaxInt);
+  Word := Copy(Word, 1, SuffixStart - 1);
+  IsOrdinal := (Suffix = 'st') or (Suffix = 'nd') or (Suffix = 'rd') or
+    (Suffix = 'th');
+  HadMinus := (Word <> '') and (Word[1] = '-');
+  if HadMinus then
+  begin
+    AddWord('minus', csG2PNoStress);
+    Delete(Word, 1, 1);
+  end;
+  Digits := StringReplace(Word, ',', '', [rfReplaceAll]);
+  DotCount := 0;
+  MaxBytePos := Length(Digits);
+  for BytePos := 1 to MaxBytePos do
+    if Digits[BytePos] = '.' then Inc(DotCount);
+  CurrencyIdx := CurrencyIndex(Currency);
+  try
+    if IsDigitText(Word) and IsOrdinal then
+      AddNumberWords(EnglishOrdinalWords(Word))
+    else if not HadMinus and (Length(Word) = 4) and (CurrencyIdx < 0) and
+      IsDigitText(Word) then
+      AddNumberWords(EnglishYearWords(Word))
+    else if not IsHead and (DotCount = 0) then AddGluedDigits
+    else if (DotCount > 1) or not IsHead then AddVersionGroups
+    else if (CurrencyIdx >= 0) and ((DotCount = 0) or
+      (Length(Word) - Pos('.', Word) < 3)) then AddAmount
+    else if IsDigitText(Word) then
+      AddNumberWords(EnglishCardinalWords(Word))
+    else if DotCount = 0 then
+    begin
+      if IsOrdinal then AddNumberWords(EnglishOrdinalWords(Digits))
+      else AddNumberWords(EnglishCardinalWords(Digits));
+    end
+    else if Digits[1] = '.' then
+    begin
+      AddWord('point', -2);
+      AddDigitByDigit(Copy(Digits, 2, MaxInt));
+    end
+    else AddNumberWords(EnglishDecimalWords(Digits));
+  except
+    // 10^306 and above: num2words raises, the port reads the digits
+    on ENeuralG2PError do
+    begin
+      Phonemes := '';
+      PartCount := 0;
+      if HadMinus then AddWord('minus', csG2PNoStress);
+      AddDigitByDigit(Digits);
+    end;
+  end;
+  if PartCount = 0 then Exit(false);
+  if (Suffix = 's') or (Suffix = '''s') then Phonemes := SuffixS(Phonemes)
+  else if (Suffix = 'ed') or (Suffix = '''d') then Phonemes := SuffixEd(Phonemes)
+  else if Suffix = 'ing' then
+  begin
+    UnitPhonemes := Phonemes;
+    if not SuffixIng(UnitPhonemes, Phonemes) then Exit(false);
+  end;
+  Result := true;
+end;
+
+// misaki Lexicon.__call__ for one (merged) token text; IsHead: the text
+// starts its word (misaki _.is_head), Currency: the amount's sign or ''.
+function TNeuralEnglishG2P.ReadWord(const Text, Tag, Currency: string;
+  IsHead: boolean; const Ctx: TNeuralG2PContext; out Phonemes: string;
   var Resolutions: TNeuralG2PResolutions): boolean;
 var
   Word: string;
@@ -2496,8 +3008,17 @@ begin
   if Word = G2PLower(Word) then Stress := csG2PNoStress
   else if Word = G2PUpper(Word) then Stress := 2
   else Stress := 0.5;
-  if GetWord(Word, Tag, Stress, Ctx, Phonemes, Resolutions) then Exit(true);
-  if IsNumberWord(Word) then Include(Resolutions, g2prNumberPending);
+  if GetWord(Word, Tag, Stress, Ctx, Phonemes, Resolutions) then
+  begin
+    if Currency <> '' then Phonemes := AppendCurrencyUnit(Phonemes, Currency);
+    Exit(true);
+  end;
+  if IsNumberWord(Word, IsHead) and
+    ReadNumber(Word, Currency, IsHead, Phonemes) then
+  begin
+    Include(Resolutions, g2prNumber);
+    Exit(true);
+  end;
   Phonemes := '';
   Result := false;
 end;
@@ -2764,7 +3285,7 @@ procedure TNeuralEnglishG2P.ResolveMultiPieceGroup(var Ctx: TNeuralG2PContext;
   FirstPiece, LastPiece: integer);
 var
   Left, Right, MaxMergedPos, PieceCnt, Position, TextLen: integer;
-  MergedText, MergedPhonemes, MergedTag: string;
+  MergedText, MergedPhonemes, MergedTag, MergedCurrency: string;
   Resolutions: TNeuralG2PResolutions;
   AllJunk: boolean;
 begin
@@ -2776,8 +3297,13 @@ begin
     MergedText := PiecesText(Left, MaxMergedPos);
     Resolutions := [];
     MergedTag := HeaviestPieceTag(Left, MaxMergedPos);
-    if ReadWord(MergedText, MergedTag, Ctx, MergedPhonemes,
-      Resolutions) then
+    // misaki merge_tokens: the largest currency sign of the pieces
+    MergedCurrency := '';
+    for PieceCnt := Left to MaxMergedPos do
+      if FPieces[PieceCnt].Currency > MergedCurrency then
+        MergedCurrency := FPieces[PieceCnt].Currency;
+    if ReadWord(MergedText, MergedTag, MergedCurrency, Left = FirstPiece, Ctx,
+      MergedPhonemes, Resolutions) then
     begin
       FPieces[Left].Phonemes := MergedPhonemes;
       FPieces[Left].HasPhonemes := true;
@@ -2789,15 +3315,6 @@ begin
         FPieces[PieceCnt].Resolutions := Resolutions;
       end;
       UpdateContext(Ctx, true, MergedPhonemes, MergedText, MergedTag);
-      Right := Left;
-      Left := Max(FirstPiece, Right - csMaxMergedPieces);
-    end
-    else if g2prNumberPending in Resolutions then
-    begin
-      // misaki reads this span as one number (task 5.3): its pieces stay
-      // unread instead of being spelled one by one
-      for PieceCnt := Left to MaxMergedPos do
-        FPieces[PieceCnt].Resolutions := [g2prNumberPending];
       Right := Left;
       Left := Max(FirstPiece, Right - csMaxMergedPieces);
     end
@@ -2852,7 +3369,7 @@ begin
         if FPieces[PieceIdx].HasAlias then Text := FPieces[PieceIdx].Alias
         else Text := FPieces[PieceIdx].Text;
         FPieces[PieceIdx].HasPhonemes := ReadWord(Text, FPieces[PieceIdx].Tag,
-          Ctx, Phonemes, Resolutions);
+          FPieces[PieceIdx].Currency, true, Ctx, Phonemes, Resolutions);
         FPieces[PieceIdx].Phonemes := Phonemes;
         if not FPieces[PieceIdx].HasPhonemes then Include(Resolutions, g2prUnknown);
         FPieces[PieceIdx].Resolutions := Resolutions;

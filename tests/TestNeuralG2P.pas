@@ -3,15 +3,14 @@ unit TestNeuralG2P;
 Tests for neuralg2p.pas, the pure-Pascal port of misaki's English G2P.
 
 The fixture tests/fixtures/g2p_english/ (tools/make_g2p_english_fixture.py,
-misaki 0.9.4 + spaCy en_core_web_sm) holds 297 sentences with misaki's
+misaki 0.9.4 + spaCy en_core_web_sm) holds 320 sentences with misaki's
 phoneme strings and tokens, for US and GB, and dictionary subsets that
 reproduce misaki exactly on those sentences. TestEnglishFixtureAgreement*
 runs the port on every sentence and reports token- and sentence-level
-agreement per group. Excluded, because later tasks own them: the numbers,
-currency and percent groups and every token with a digit (task 5.3), and
-tokens misaki itself left unknown (task 5.5). Tokens whose letters are a
-POS-keyed gold entry are counted separately and compared with the baseline
-of reading every such entry as DEFAULT (notes.json counts).
+agreement per group. Excluded, because task 5.5 owns them: tokens misaki
+itself left unknown. Tokens whose letters are a POS-keyed gold entry are
+counted separately and compared with the baseline of reading every such
+entry as DEFAULT (notes.json counts).
 Coded by Claude (AI).
 *)
 
@@ -61,6 +60,12 @@ type
     procedure TestPOSRules;
     // Per-token resolution report (dictionary / stem / spelled / unknown ...).
     procedure TestTokenResolutions;
+    // num2words 0.5.14 English: cardinal, ordinal, year, decimal, negatives,
+    // the illion names and the input errors.
+    procedure TestEnglishNumberWords;
+    // Number readings the fixture does not pin: currency on the CD word
+    // after the amount, a number too large for words, the yen sign.
+    procedure TestNumberReading;
     procedure TestEnglishFixtureAgreementUS;
     procedure TestEnglishFixtureAgreementGB;
     // The full misaki dictionaries (ignored when not installed): entry
@@ -406,11 +411,150 @@ begin
     AssertEquals('VBP', Tokens[7].Tag);
     AssertTrue('read: POS rule', g2prPOSRule in Tokens[7].Resolutions);
     G2P.Phonemize('It costs 5 dollars in the 1990s.', Tokens);
-    AssertTrue('digits wait for task 5.3',
-      g2prNumberPending in Tokens[2].Resolutions);
+    AssertTrue('5: number', g2prNumber in Tokens[2].Resolutions);
+    AssertEquals('5', 'fˈIv', Tokens[2].Phonemes);
+    AssertEquals('5: tagged CD', 'CD', Tokens[2].Tag);
     AssertEquals('1990s', Tokens[6].Text);
-    AssertEquals('a pending number reads nothing, not its letters', '',
+    AssertTrue('1990s: number', g2prNumber in Tokens[6].Resolutions);
+    AssertEquals('1990s: a year with the -s ending', 'nˌIntˈin nˈIndiz',
       Tokens[6].Phonemes);
+  finally
+    G2P.Free;
+  end;
+end;
+
+procedure TTestNeuralG2P.TestEnglishNumberWords;
+
+  procedure CheckRaises(const Kind, Input: string);
+  var
+    Raised: boolean;
+  begin
+    Raised := false;
+    try
+      if Kind = 'cardinal' then EnglishCardinalWords(Input)
+      else if Kind = 'ordinal' then EnglishOrdinalWords(Input)
+      else EnglishDecimalWords(Input);
+    except
+      on ENeuralG2PError do Raised := true;
+    end;
+    AssertTrue(Kind + ' "' + Input + '" raises', Raised);
+  end;
+
+const
+  cCardinals: array[0..36, 0..1] of string = (('0', 'zero'), ('7', 'seven'),
+    ('11', 'eleven'), ('12', 'twelve'), ('13', 'thirteen'),
+    ('15', 'fifteen'), ('19', 'nineteen'), ('20', 'twenty'),
+    ('21', 'twenty-one'), ('42', 'forty-two'), ('99', 'ninety-nine'),
+    ('100', 'one hundred'), ('101', 'one hundred and one'),
+    ('110', 'one hundred and ten'), ('123', 'one hundred and twenty-three'),
+    ('999', 'nine hundred and ninety-nine'), ('1000', 'one thousand'),
+    ('1001', 'one thousand and one'), ('1100', 'one thousand, one hundred'),
+    ('1234', 'one thousand, two hundred and thirty-four'),
+    ('2001', 'two thousand and one'),
+    ('12345', 'twelve thousand, three hundred and forty-five'),
+    ('123456', 'one hundred and twenty-three thousand, four hundred and ' +
+    'fifty-six'), ('1000000', 'one million'), ('1000001', 'one million and one'),
+    ('1001000', 'one million, one thousand'),
+    ('1234567', 'one million, two hundred and thirty-four thousand, five ' +
+    'hundred and sixty-seven'),
+    ('2500000000', 'two billion, five hundred million'),
+    ('1000000000000', 'one trillion'),
+    ('1000000000000000000', 'one quintillion'),
+    ('999999999999', 'nine hundred and ninety-nine billion, nine hundred and ' +
+    'ninety-nine million, nine hundred and ninety-nine thousand, nine ' +
+    'hundred and ninety-nine'),
+    ('007', 'seven'), ('-5', 'minus five'),
+    ('-1234', 'minus one thousand, two hundred and thirty-four'),
+    ('-0', 'zero'), ('1000000000000000000000000000000', 'one nonillion'),
+    ('1000000000000000000000000000000000', 'one decillion'));
+  cOrdinals: array[0..22, 0..1] of string = (('0', 'zeroth'), ('1', 'first'),
+    ('2', 'second'), ('3', 'third'), ('4', 'fourth'), ('5', 'fifth'),
+    ('8', 'eighth'), ('9', 'ninth'), ('11', 'eleventh'), ('12', 'twelfth'),
+    ('13', 'thirteenth'), ('20', 'twentieth'), ('21', 'twenty-first'),
+    ('22', 'twenty-second'), ('23', 'twenty-third'), ('40', 'fortieth'),
+    ('99', 'ninety-ninth'), ('100', 'one hundredth'),
+    ('101', 'one hundred and first'), ('111', 'one hundred and eleventh'),
+    ('1000', 'one thousandth'), ('1000000', 'one millionth'),
+    ('1234', 'one thousand, two hundred and thirty-fourth'));
+  cYears: array[0..20, 0..1] of string = (('0', 'zero'), ('5', 'five'),
+    ('99', 'ninety-nine'), ('100', 'one hundred'), ('105', 'one oh-five'),
+    ('1000', 'one thousand'), ('1066', 'ten sixty-six'),
+    ('1100', 'eleven hundred'), ('1900', 'nineteen hundred'),
+    ('1905', 'nineteen oh-five'), ('1999', 'nineteen ninety-nine'),
+    ('2000', 'two thousand'), ('2001', 'two thousand and one'),
+    ('2009', 'two thousand and nine'), ('2010', 'twenty ten'),
+    ('2024', 'twenty twenty-four'), ('10000', 'ten thousand'),
+    ('12345', 'twelve thousand, three hundred and forty-five'),
+    ('0123', 'one twenty-three'), ('-44', 'forty-four BC'),
+    ('-1066', 'ten sixty-six BC'));
+  cDecimals: array[0..15, 0..1] of string = (('3.14', 'three point one four'),
+    ('0.5', 'zero point five'), ('0.75', 'zero point seven five'),
+    ('26.2', 'twenty-six point two'), ('99.9', 'ninety-nine point nine'),
+    ('123.456', 'one hundred and twenty-three point four five six'),
+    ('2.0', 'two'), ('0.05', 'zero point zero five'),
+    ('1.50', 'one point five'), ('10.01', 'ten point zero one'),
+    ('0.001', 'zero point zero zero one'), ('-3.5', 'minus three point five'),
+    ('-0.5', 'zero point five'), ('.5', 'zero point five'), ('5.', 'five'),
+    ('42', 'forty-two'));
+var
+  CaseCnt: integer;
+  Centillion: string;
+begin
+  for CaseCnt := 0 to High(cCardinals) do
+    AssertEquals('cardinal ' + cCardinals[CaseCnt, 0], cCardinals[CaseCnt, 1],
+      EnglishCardinalWords(cCardinals[CaseCnt, 0]));
+  for CaseCnt := 0 to High(cOrdinals) do
+    AssertEquals('ordinal ' + cOrdinals[CaseCnt, 0], cOrdinals[CaseCnt, 1],
+      EnglishOrdinalWords(cOrdinals[CaseCnt, 0]));
+  for CaseCnt := 0 to High(cYears) do
+    AssertEquals('year ' + cYears[CaseCnt, 0], cYears[CaseCnt, 1],
+      EnglishYearWords(cYears[CaseCnt, 0]));
+  for CaseCnt := 0 to High(cDecimals) do
+    AssertEquals('decimal ' + cDecimals[CaseCnt, 0], cDecimals[CaseCnt, 1],
+      EnglishDecimalWords(cDecimals[CaseCnt, 0]));
+  // num2words' last name (10^303) and its limit (10^306)
+  Centillion := '1' + StringOfChar('0', 303);
+  AssertEquals('10^303', 'one centillion', EnglishCardinalWords(Centillion));
+  AssertEquals('10^36', 'one undecillion',
+    EnglishCardinalWords('1' + StringOfChar('0', 36)));
+  AssertEquals('10^300', 'one novemnonagintillion',
+    EnglishCardinalWords('1' + StringOfChar('0', 300)));
+  AssertEquals('10^306 - 1', 'nine hundred and ninety-nine centillion,',
+    Copy(EnglishCardinalWords(StringOfChar('9', 306)), 1, 40));
+  CheckRaises('cardinal', '1' + StringOfChar('0', 306));
+  CheckRaises('cardinal', '');
+  CheckRaises('cardinal', '12a');
+  CheckRaises('cardinal', '1.5');
+  CheckRaises('ordinal', '-1');
+  CheckRaises('decimal', '1.2.3');
+  CheckRaises('decimal', '.');
+end;
+
+procedure TTestNeuralG2P.TestNumberReading;
+var
+  G2P: TNeuralEnglishG2P;
+  Tokens: TNeuralG2PTokenArray;
+  Phonemes: string;
+begin
+  G2P := CreateFixtureG2P(g2pAmerican);
+  try
+    G2P.Phonemize('They owe us $12 million.', Tokens);
+    AssertEquals('token count', 7, Length(Tokens));
+    AssertEquals('$ reads nothing', '', Tokens[3].Phonemes);
+    AssertEquals('12: the next word is CD too, no unit', 'twˈɛlv',
+      Tokens[4].Phonemes);
+    AssertTrue('12: number', g2prNumber in Tokens[4].Resolutions);
+    AssertEquals('million takes the unit', 'mˈɪljᵊn dˈɑləɹz', Tokens[5].Phonemes);
+    AssertEquals('CD', Tokens[5].Tag);
+    // ¥ is not one of misaki's currencies
+    AssertPhonemes(G2P, 'That is ¥500 in yen.',
+      'ðˈæt ɪz fˈIv hˈʌndɹəd ɪn jˈɛn.');
+    // 10^306 and above: num2words raises; the port reads the digits
+    Phonemes := G2P.Phonemize('1' + StringOfChar('0', 400));
+    AssertEquals('digit by digit', 'wˈʌn zˈɪɹO zˈɪɹO', Copy(Phonemes, 1,
+      Length('wˈʌn zˈɪɹO zˈɪɹO')));
+    AssertEquals('one word per digit', 401,
+      Length(Phonemes) - Length(StringReplace(Phonemes, ' ', '', [rfReplaceAll])) + 1);
   finally
     G2P.Free;
   end;
@@ -422,10 +566,9 @@ const
     'capitals_acronyms', 'possessives', 'contractions', 'hyphenated',
     'suffix_stems', 'numbers', 'currency', 'percent', 'heteronyms',
     'unknown_and_names', 'long_mixed', 'numbers_more');
-  // Lowest token agreement (%) each group must keep; numbers/currency/
-  // percent/numbers_more are task 5.3 (-1: not counted).
+  // Lowest token agreement (%) each group must keep.
   cMinTokenAgreement: array[0..13] of double = (100, 100, 99, 100, 100, 100,
-    100, -1, -1, -1, 100, 100, 99, -1);
+    100, 100, 100, 100, 100, 100, 100, 100);
 var
   Root, Notes: TJSONData;
   Sentences: TJSONArray;
@@ -454,16 +597,6 @@ var
     finally
       Stream.Free;
     end;
-  end;
-
-  function HasDigitOrMoney(const S: string): boolean;
-  var
-    BytePos, MaxBytePos: integer;
-  begin
-    MaxBytePos := Length(S);
-    for BytePos := 1 to MaxBytePos do
-      if S[BytePos] in ['0'..'9', '$', '%'] then Exit(true);
-    Result := (Pos('£', S) > 0) or (Pos('€', S) > 0) or (Pos('¥', S) > 0);
   end;
 
   function IsPOSKeyedGold(const Key: string): boolean;
@@ -518,8 +651,6 @@ begin
       AccentObj := Sentence.Objects[AccentKey];
       RefTokens := AccentObj.Arrays['tokens'];
       Mine := G2P.Phonemize(Sentence.Strings['text'], Tokens);
-      // POS-keyed tokens are counted in every group (their words have no
-      // digits); everything else skips the number groups.
       Inc(Counts[GroupIdx].Sentences);
       if Mine = AccentObj.Strings['phonemes'] then
         Inc(Counts[GroupIdx].SentencesEqual);
@@ -541,8 +672,7 @@ begin
             Letters := Letters + RefText[CharPos];
         IsPOSToken := (Letters <> '') and
           (IsPOSKeyedGold(Letters) or IsPOSKeyedGold(LowerCase(Letters)));
-        IsCounted := not IsRefUnknown and (IsPOSToken or
-          (not HasDigitOrMoney(RefText) and (cMinTokenAgreement[GroupIdx] >= 0)));
+        IsCounted := not IsRefUnknown;
         if (MyIdx < Length(Tokens)) and (Tokens[MyIdx].Text = RefText) then
         begin
           IsEqual := Tokens[MyIdx].Phonemes = RefPhonemes;
@@ -584,9 +714,7 @@ begin
         begin
           RefToken := RefTokens.Objects[RefIdx];
           RefText := RefToken.Strings['text'];
-          if not RefToken.Items[RefToken.IndexOfName('phonemes')].IsNull and
-            not HasDigitOrMoney(RefText) and
-            (cMinTokenAgreement[GroupIdx] >= 0) then
+          if not RefToken.Items[RefToken.IndexOfName('phonemes')].IsNull then
             CountToken(Counts[GroupIdx], false, false);
           Inc(RefIdx);
         end;
@@ -600,23 +728,16 @@ begin
     begin
       with Counts[GroupCnt] do
       begin
-        if cMinTokenAgreement[GroupCnt] >= 0 then
-          WriteLn(Format('  %-18s %4d/%-4d %6s   %3d/%-3d     %3d/%-3d',
-            [cGroups[GroupCnt], TokensEqual, Tokens,
-            Percent(TokensEqual, Tokens), SentencesEqual, Sentences,
-            POSTokensEqual, POSTokens]))
-        else
-          WriteLn(Format('  %-18s (task 5.3, not counted)               %3d/%-3d',
-            [cGroups[GroupCnt], POSTokensEqual, POSTokens]));
+        WriteLn(Format('  %-18s %4d/%-4d %6s   %3d/%-3d     %3d/%-3d',
+          [cGroups[GroupCnt], TokensEqual, Tokens,
+          Percent(TokensEqual, Tokens), SentencesEqual, Sentences,
+          POSTokensEqual, POSTokens]));
         Inc(Total.Tokens, Tokens);
         Inc(Total.TokensEqual, TokensEqual);
         Inc(Total.POSTokens, POSTokens);
         Inc(Total.POSTokensEqual, POSTokensEqual);
-        if cMinTokenAgreement[GroupCnt] >= 0 then
-        begin
-          Inc(Total.Sentences, Sentences);
-          Inc(Total.SentencesEqual, SentencesEqual);
-        end;
+        Inc(Total.Sentences, Sentences);
+        Inc(Total.SentencesEqual, SentencesEqual);
       end;
     end;
     GroupCounts := TJSONObject(TJSONObject(TJSONObject(Notes).Objects['counts'])
@@ -640,11 +761,10 @@ begin
       Percent(Total.POSTokensEqual, Total.POSTokens) + ' >= 95%',
       Total.POSTokensEqual * 100 >= Total.POSTokens * 95);
     for GroupCnt := 0 to High(cGroups) do
-      if cMinTokenAgreement[GroupCnt] >= 0 then
-        with Counts[GroupCnt] do
-          AssertTrue(cGroups[GroupCnt] + ' token agreement ' +
-            Percent(TokensEqual, Tokens),
-            100.0 * TokensEqual >= cMinTokenAgreement[GroupCnt] * Tokens);
+      with Counts[GroupCnt] do
+        AssertTrue(cGroups[GroupCnt] + ' token agreement ' +
+          Percent(TokensEqual, Tokens),
+          100.0 * TokensEqual >= cMinTokenAgreement[GroupCnt] * Tokens);
   finally
     Lines.Free;
     G2P.Free;
