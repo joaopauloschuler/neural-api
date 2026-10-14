@@ -568,9 +568,9 @@ end;
 
 function MapCase(const S: string; ToUpper: boolean): string;
 var
-  Position, Start, OutPos, ByteCnt, TextLen, EncodedLen: integer;
+  Position, Start, OutPos, TextLen: integer;
   CP, Mapped: cardinal;
-  Encoded: string;
+  PBuf: PAnsiChar;
 begin
   if not HasNonASCII(S) then
   begin
@@ -579,6 +579,7 @@ begin
   end;
   TextLen := Length(S);
   SetLength(Result, TextLen * 4);
+  PBuf := PAnsiChar(Result);
   OutPos := 0;
   Position := 1;
   while Position <= TextLen do
@@ -587,15 +588,12 @@ begin
     CP := NextCodePoint(S, Position);
     if ToUpper then Mapped := UppercaseCP(CP) else Mapped := LowercaseCP(CP);
     if Mapped = CP then
-      Encoded := Copy(S, Start, Position - Start)
+    begin // the source bytes as-is, so an invalid byte survives unchanged
+      Move(S[Start], PBuf[OutPos], Position - Start);
+      Inc(OutPos, Position - Start);
+    end
     else
-      Encoded := CodePointToUTF8(Mapped);
-    EncodedLen := Length(Encoded);
-    for ByteCnt := 1 to EncodedLen do
-    begin
-      Inc(OutPos);
-      Result[OutPos] := Encoded[ByteCnt];
-    end;
+      HFWriteCodePointUTF8(PBuf, OutPos, Mapped);
   end;
   SetLength(Result, OutPos);
 end;
@@ -1504,14 +1502,16 @@ end;
 procedure TNeuralG2PDictionary.ScanString(var Position: integer;
   out Start, Len: integer);
 var
-  ReadPos, WritePos, TextLen, ByteCnt, EncodedLen, EscapeLen: integer;
+  ReadPos, WritePos, TextLen, EscapeLen: integer;
   C: char;
   CP: cardinal;
-  Encoded: string;
+  TextBase1: PAnsiChar;
 begin
   TextLen := Length(FText);
   if (Position > TextLen) or (FText[Position] <> '"') then
     RaiseParseError(Position, 'a string');
+  // 1-based view of FText, so TextBase1[WritePos] is FText[WritePos].
+  TextBase1 := PAnsiChar(FText) - 1;
   Start := Position + 1;
   ReadPos := Start;
   WritePos := Start;
@@ -1531,12 +1531,12 @@ begin
     C := FText[ReadPos + 1];
     Inc(ReadPos, 2);
     case C of
-      '"', '\', '/': Encoded := C;
-      'b': Encoded := #8;
-      'f': Encoded := #12;
-      'n': Encoded := #10;
-      'r': Encoded := #13;
-      't': Encoded := #9;
+      '"', '\', '/': CP := Ord(C);
+      'b': CP := 8;
+      'f': CP := 12;
+      'n': CP := 10;
+      'r': CP := 13;
+      't': CP := 9;
       'u':
         begin
           if not HFReadUnicodeEscape(FText, ReadPos, CP, EscapeLen) then
@@ -1546,17 +1546,11 @@ begin
             RaiseParseError(ReadPos + EscapeLen, 'a hex digit');
           end;
           Inc(ReadPos, EscapeLen);
-          Encoded := CodePointToUTF8(CP);
         end;
     else
       RaiseParseError(ReadPos - 1, 'a JSON escape');
     end;
-    EncodedLen := Length(Encoded);
-    for ByteCnt := 1 to EncodedLen do
-    begin
-      FText[WritePos] := Encoded[ByteCnt];
-      Inc(WritePos);
-    end;
+    HFWriteCodePointUTF8(TextBase1, WritePos, CP);
   end;
   Len := WritePos - Start;
   Position := ReadPos + 1;

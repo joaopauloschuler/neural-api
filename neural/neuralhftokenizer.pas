@@ -474,6 +474,10 @@ function HFReadUnicodeEscape(const S: string; HexPos: integer;
 function NextCodePoint(const S: string; var Position: integer): cardinal;
 function CodePointCount(const S: string): integer;
 function CodePointToUTF8(CP: cardinal): string;
+// Writes CP as UTF-8 at P[OutPos] and advances OutPos (up to 4 bytes); the
+// same encoding as CodePointToUTF8 without its string allocation.
+procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
+  CP: cardinal); inline;
 
 // Unicode classes and case maps shared with neuralg2p. IsLetterCP is exact
 // \p{L}; the case maps cover ASCII, Latin-1 and Latin Extended-A only.
@@ -623,11 +627,8 @@ begin
       Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
 end;
 
-// Writes CP as UTF-8 into a preallocated buffer at the 0-based OutPos and
-// advances it. Same encoding as CodePointToUTF8, without that function's
-// per-codepoint string allocation.
 procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
-  CP: cardinal); inline;
+  CP: cardinal);
 begin
   if CP < $80 then
   begin
