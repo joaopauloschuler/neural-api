@@ -695,27 +695,42 @@ begin
   Result := 0;
 end;
 
-// One-step canonical decomposition of CP. Returns True and fills A (and B,
-// or 0 for a singleton) when CP has a tabled canonical decomposition.
-function NFCDecomposeStep(CP: cardinal; out A, B: cardinal): boolean;
+type
+  // One row of a 3-column decomposition table: the key CP, then two values.
+  TNFCDecompRow = array[0..2] of cardinal;
+
+// Binary search of a decomposition table sorted by its key column: the row
+// index of CP, or -1.
+function FindNFCDecompRow(const Table: array of TNFCDecompRow;
+  CP: cardinal): integer;
 var
   Lo, Hi, Mid: integer;
 begin
   Lo := 0;
-  Hi := cNFCDecompCount - 1;
+  Hi := High(Table);
   while Lo <= Hi do
   begin
     Mid := (Lo + Hi) div 2;
-    if cNFCDecomp[Mid][0] = CP then
-    begin
-      A := cNFCDecomp[Mid][1];
-      B := cNFCDecomp[Mid][2];
-      Exit(True);
-    end
-    else if cNFCDecomp[Mid][0] < CP then Lo := Mid + 1
+    if Table[Mid][0] = CP then Exit(Mid)
+    else if Table[Mid][0] < CP then Lo := Mid + 1
     else Hi := Mid - 1;
   end;
-  Result := False;
+  Result := -1;
+end;
+
+// One-step canonical decomposition of CP. Returns True and fills A (and B,
+// or 0 for a singleton) when CP has a tabled canonical decomposition.
+function NFCDecomposeStep(CP: cardinal; out A, B: cardinal): boolean;
+var
+  Row: integer;
+begin
+  Row := FindNFCDecompRow(cNFCDecomp, CP);
+  Result := Row >= 0;
+  if Result then
+  begin
+    A := cNFCDecomp[Row][1];
+    B := cNFCDecomp[Row][2];
+  end;
 end;
 
 // Canonical composition of a starter A with following char B. Returns the
@@ -765,23 +780,15 @@ end;
 // tabled compatibility decomposition. Binary search by CP.
 function NFKCDecomposeStep(CP: cardinal; out Offset, Count: integer): boolean;
 var
-  Lo, Hi, Mid: integer;
+  Row: integer;
 begin
-  Lo := 0;
-  Hi := cNFKCDecompCount - 1;
-  while Lo <= Hi do
+  Row := FindNFCDecompRow(cNFKCDecompIdx, CP);
+  Result := Row >= 0;
+  if Result then
   begin
-    Mid := (Lo + Hi) div 2;
-    if cNFKCDecompIdx[Mid][0] = CP then
-    begin
-      Offset := integer(cNFKCDecompIdx[Mid][1]);
-      Count := integer(cNFKCDecompIdx[Mid][2]);
-      Exit(True);
-    end
-    else if cNFKCDecompIdx[Mid][0] < CP then Lo := Mid + 1
-    else Hi := Mid - 1;
+    Offset := integer(cNFKCDecompIdx[Row][1]);
+    Count := integer(cNFKCDecompIdx[Row][2]);
   end;
-  Result := False;
 end;
 
 // Recursively decompose CP, appending resulting codepoints to Buf (1-based
