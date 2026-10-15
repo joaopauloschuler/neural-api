@@ -30,8 +30,16 @@ the same "trainer-level helper" pattern to general MDPs:
 NETWORK REQUIREMENTS
 --------------------------------------------------------------------------
   Q-NET (DQN):    Input(1,1,D) -> ... -> TNNetFullConnectLinear(NumActions)
-  POLICY (PG):    Input(1,1,D) -> ... -> TNNetSoftMax(NumActions)
+  POLICY (PG):    Input(1,1,D) -> ... -> TNNetFullConnectLinear(NumActions)
+                  -> TNNetSoftMax
   CRITIC (opt):   Input(1,1,D) -> ... -> TNNetFullConnectLinear(1)
+
+  IMPORTANT: TNNetSoftMax is a PASS-THROUGH layer (output size = input size,
+  no width parameter), so the policy MUST project to NumActions with a
+  FullConnect layer BEFORE the softmax. A softmax placed directly on a hidden
+  layer defines a distribution over the hidden width instead of over the
+  actions. Both trainers validate the shapes against the environment at the
+  first TrainEpisode/TrainOnEpisode/TotalReward call and raise on mismatch.
 
   The caller builds and owns the networks. The trainer clones the Q-net
   for the target network. All updates use the same three TNNet calls:
@@ -122,12 +130,14 @@ type
     FInput, FTargetInput, FPseudoTarget: TNNetVolume;
     FRngState: cardinal;
     FLastLoss: TNeuralFloat;
+    FActionCount: integer;
   private
     function Rand(): TNeuralFloat;
     function RandInt(AMax: integer): integer;
     function ForwardQ(const State: TNeuralRLState;
       ANet: TNNet; AInput: TNNetVolume): TNeuralRLState;
     procedure HardUpdateTarget;
+    procedure ValidateAgainstEnv(Env: TNeuralEnv);
   public
     constructor Create(pQNet: TNNet;
       pGamma: TNeuralFloat = 0.99; pEpsilon: TNeuralFloat = 1.0;
@@ -166,10 +176,15 @@ type
     FLastPolicyLoss, FLastValueLoss: TNeuralFloat;
     FRngState: cardinal;
     FEpsilon, FEpsilonMin, FEpsilonDecay: TNeuralFloat;
+    FProbFloor: TNeuralFloat;
+    FUpdateFloor: TNeuralFloat;
+    FActionCount: integer;
   private
     function Rand(): TNeuralFloat;
     function RandInt(AMax: integer): integer;
     procedure DetectSoftmaxVariant;
+    procedure ValidatePolicyAgainstEnv(Env: TNeuralEnv);
+    procedure ValidateCriticHead;
     function Forward(NN: TNNet; AInput: TNNetVolume;
       const State: TNeuralRLState): TNeuralRLState;
   public
@@ -191,6 +206,17 @@ type
     property Critic: TNNet read FCritic;
     property Gamma: TNeuralFloat read FGamma write FGamma;
     property Epsilon: TNeuralFloat read FEpsilon write FEpsilon;
+    // Numerical floor for the log(pi) term of the LastPolicyLoss diagnostic
+    // (same convention as TNeuralDPOTrainer.ProbFloor in neuraldpo.pas).
+    // Default 1e-9; keeps log() finite when a taken action has probability 0.
+    property ProbFloor: TNeuralFloat read FProbFloor write FProbFloor;
+    // Policy-gradient update floor: steps whose taken-action probability is at
+    // or below this value are skipped by the REINFORCE update (see Phase 4 of
+    // TrainOnEpisode). Default Min(0.1, 0.5/NumActions): being relative to the
+    // action count keeps a uniform policy (pi = 1/NumActions) updating even
+    // with many actions, while still suppressing the off-policy bias of
+    // epsilon-random rare actions.
+    property UpdateFloor: TNeuralFloat read FUpdateFloor write FUpdateFloor;
     property LastPolicyLoss: TNeuralFloat read FLastPolicyLoss;
     property LastValueLoss: TNeuralFloat read FLastValueLoss;
   end;
@@ -360,6 +386,31 @@ begin
   if Result >= AMax then Result := AMax - 1;
 end;
 
+// Validates the Q-net against the environment's dimensions at the API
+// boundary (same fail-loudly style as neuraldpo.pas): a Q-net whose output
+// size differs from NumActions would silently emit out-of-range action ids,
+// and an input size that differs from StateDim would read past the state
+// vector.
+procedure TNeuralDQNTrainer.ValidateAgainstEnv(Env: TNeuralEnv);
+var
+  FirstLayer, LastLayer: TNNetLayer;
+begin
+  LastLayer := FQ.GetLastLayer();
+  if LastLayer.Output.Size <> Env.NumActions then
+    raise Exception.Create('TNeuralDQNTrainer: the Q-net''s last layer (' +
+      LastLayer.ClassName + ') outputs ' + IntToStr(LastLayer.Output.Size) +
+      ' values but the environment has ' + IntToStr(Env.NumActions) +
+      ' actions. Build the Q-net as Input(1,1,StateDim) -> ... -> ' +
+      'TNNetFullConnectLinear(NumActions).');
+  FirstLayer := FQ.GetFirstLayer();
+  if FirstLayer.Output.Size <> Env.StateDim then
+    raise Exception.Create('TNeuralDQNTrainer: the Q-net''s input layer (' +
+      FirstLayer.ClassName + ') has size ' +
+      IntToStr(FirstLayer.Output.Size) + ' but the environment''s states ' +
+      'have ' + IntToStr(Env.StateDim) + ' dimensions. Build the input as ' +
+      'TNNetInput.Create(1, 1, StateDim).');
+end;
+
 constructor TNeuralDQNTrainer.Create(pQNet: TNNet;
   pGamma, pEpsilon, pEpsilonMin, pEpsilonDecay: TNeuralFloat;
   pTargetUpdateFreq, pReplayCapacity, pMiniBatch: integer);
@@ -372,6 +423,8 @@ begin
   FEpsilonDecay := pEpsilonDecay; FTargetUpdateFreq := pTargetUpdateFreq;
   FStepCount := 0; FMiniBatch := pMiniBatch; FDoubleDQN := false;
   FLastLoss := 0; FRngState := 42;
+  // The action count is the Q-net's output size, known before any Compute.
+  FActionCount := pQNet.GetLastLayer().Output.Size;
   FReplay := TNeuralReplayBuffer.Create(pReplayCapacity);
   FInput := TNNetVolume.Create;
   FTargetInput := TNNetVolume.Create;
@@ -511,6 +564,7 @@ var
   I, A: integer; R, TotalR: TNeuralFloat;
   S, SN: TNeuralRLState; T: TNeuralRLTransition;
 begin
+  ValidateAgainstEnv(Env);
   Env.Reset;
   Env.CopyState(S);
   TotalR := 0;
@@ -539,6 +593,7 @@ var
   I, A: integer; R, OldEps: TNeuralFloat;
   S: TNeuralRLState; Qs: TNeuralRLState;
 begin
+  ValidateAgainstEnv(Env);
   OldEps := FEpsilon;
   FEpsilon := pEpsilonOverride;
   Env.Reset;
@@ -577,6 +632,60 @@ begin
   if Result >= AMax then Result := AMax - 1;
 end;
 
+// Validates the policy (and critic, when present) against the environment's
+// dimensions at the API boundary (same fail-loudly style as neuraldpo.pas).
+// The classic failure this catches: TNNetSoftMax is a pass-through layer, so
+// a policy built as "... -> FullConnectReLU(Hidden) -> TNNetSoftMax" defines
+// a distribution over the HIDDEN width, not over the actions; with far more
+// outputs than actions, every update degenerates and learning silently never
+// happens.
+procedure TNeuralPolicyGradTrainer.ValidatePolicyAgainstEnv(Env: TNeuralEnv);
+var
+  FirstLayer, LastLayer: TNNetLayer;
+begin
+  LastLayer := FPolicy.GetLastLayer();
+  if LastLayer.Output.Size <> Env.NumActions then
+    raise Exception.Create('TNeuralPolicyGradTrainer: the policy''s last ' +
+      'layer (' + LastLayer.ClassName + ') outputs ' +
+      IntToStr(LastLayer.Output.Size) + ' values but the environment has ' +
+      IntToStr(Env.NumActions) + ' actions. TNNetSoftMax is a pass-through ' +
+      'layer: project to the action space with ' +
+      'TNNetFullConnectLinear.Create(NumActions) BEFORE the softmax.');
+  FirstLayer := FPolicy.GetFirstLayer();
+  if FirstLayer.Output.Size <> Env.StateDim then
+    raise Exception.Create('TNeuralPolicyGradTrainer: the policy''s input ' +
+      'layer (' + FirstLayer.ClassName + ') has size ' +
+      IntToStr(FirstLayer.Output.Size) + ' but the environment''s states ' +
+      'have ' + IntToStr(Env.StateDim) + ' dimensions. Build the input as ' +
+      'TNNetInput.Create(1, 1, StateDim).');
+  if FCritic <> nil then
+  begin
+    if FCritic.GetLastLayer().Output.Size <> 1 then
+      raise Exception.Create('TNeuralPolicyGradTrainer: the critic must end ' +
+        'in a scalar head (last layer Output.Size = 1, e.g. ' +
+        'TNNetFullConnectLinear(1)). Found Output.Size = ' +
+        IntToStr(FCritic.GetLastLayer().Output.Size) + ' (' +
+        FCritic.GetLastLayer().ClassName + ').');
+    if FCritic.GetFirstLayer().Output.Size <> Env.StateDim then
+      raise Exception.Create('TNeuralPolicyGradTrainer: the critic''s input ' +
+        'layer (' + FCritic.GetFirstLayer().ClassName + ') has size ' +
+        IntToStr(FCritic.GetFirstLayer().Output.Size) + ' but the ' +
+        'environment''s states have ' + IntToStr(Env.StateDim) + ' dimensions.');
+  end;
+end;
+
+// Constructor-time check (no environment needed): the critic must end in a
+// single-scalar head, exactly like the reward model in neuraldpo.pas.
+procedure TNeuralPolicyGradTrainer.ValidateCriticHead;
+begin
+  if FCritic.GetLastLayer().Output.Size <> 1 then
+    raise Exception.Create('TNeuralPolicyGradTrainer: the critic must end in ' +
+      'a scalar head (last layer Output.Size = 1, e.g. ' +
+      'TNNetFullConnectLinear(1)). Found Output.Size = ' +
+      IntToStr(FCritic.GetLastLayer().Output.Size) + ' (' +
+      FCritic.GetLastLayer().ClassName + ').');
+end;
+
 procedure TNeuralPolicyGradTrainer.DetectSoftmaxVariant;
 var
   LastLayer: TNNetLayer;
@@ -605,6 +714,10 @@ begin
   if AInput.Size <> FirstOut.Size then
     AInput.ReSize(FirstOut.SizeX, FirstOut.SizeY, FirstOut.Depth);
   D := FirstOut.Size;
+  if Length(State) < D then
+    raise Exception.Create('TNeuralPolicyGradTrainer.Forward: state vector ' +
+      'length (' + IntToStr(Length(State)) + ') is smaller than the network ' +
+      'input size (' + IntToStr(D) + ').');
   for I := 0 to D - 1 do AInput.FData[I] := State[I];
   NN.Compute(AInput);
   LastOut := NN.GetLastLayer().Output;
@@ -619,7 +732,15 @@ begin
   FPolicy := pPolicy; FCritic := nil; FOwnsCritic := false;
   FGamma := pGamma; FLastPolicyLoss := 0; FLastValueLoss := 0;
   FEpsilon := pEpsilon; FEpsilonMin := pEpsilonMin; FEpsilonDecay := pEpsilonDecay;
+  FProbFloor := 1e-9;
   FRngState := 777;
+  // The action count is the policy's output size, known before any Compute.
+  FActionCount := pPolicy.GetLastLayer().Output.Size;
+  // K-relative update floor, computed after FActionCount (see Phase 4).
+  if FActionCount > 0 then
+    FUpdateFloor := Min(0.1, 0.5 / FActionCount)
+  else
+    FUpdateFloor := 0.1;
   FInput := TNNetVolume.Create;
   FPseudoTarget := TNNetVolume.Create;
   DetectSoftmaxVariant;
@@ -632,6 +753,7 @@ begin
   Create(pPolicy, pGamma, pEpsilon, pEpsilonMin, pEpsilonDecay);
   FCritic := pCritic;
   FOwnsCritic := pOwnsCritic;
+  if FCritic <> nil then ValidateCriticHead;
 end;
 
 destructor TNeuralPolicyGradTrainer.Destroy;
@@ -652,8 +774,8 @@ begin
   // Epsilon-greedy exploration.
   if (FEpsilon > 0) and (Rand < FEpsilon) then
   begin
-    Dist := PolicyDist(State);
-    Result := RandInt(Length(Dist));
+    // Random action: no forward pass needed, the action count is cached.
+    Result := RandInt(FActionCount);
     Exit;
   end;
   Dist := PolicyDist(State);
@@ -698,6 +820,7 @@ var
   Pi, V: TNeuralRLState;
   VLoss: TNeuralFloat;
 begin
+  ValidatePolicyAgainstEnv(Env);
   Env.Reset;
   Env.CopyState(S);
   N := 0; TotalR := 0;
@@ -760,15 +883,32 @@ begin
   // Minimize L = -sum A_t * log pi(a_t|s_t).
   // dL/dlogit = -A*(onehot - pi) = A*(pi - onehot).
   // Pseudo-target (same trick as neuraldpo):
-  //   SkipDeriv=0: pDesired[a] = pi[a] - A/pi[a], pDesired[a'] = pi[a']
-  //   SkipDeriv=1: pDesired[a] = pi[a] + A*(pi[a]-1), pDesired[a'] = pi[a']*(1+A)
+  //   SkipDeriv=0: pDesired[a] = pi[a] + A/pi[a], pDesired[a'] = pi[a']
+  //   SkipDeriv=1: pDesired[a] = pi[a]*(1-A) + A, pDesired[a'] = pi[a']*(1-A)
+  // The 1/pi[a] term is numerically harmless even for tiny pi[a]: the softmax
+  // Jacobian multiplies the large e_target back down by y_target, so the
+  // gradient stays exact and bounded for ANY pi[a] > 0. Steps are nevertheless
+  // SKIPPED when pi[a] is at or below UpdateFloor, for a behavioral reason:
+  // Phase 1 explores epsilon-greedily, so rare actions are disproportionately
+  // epsilon-RANDOM picks whose disadvantage (A < 0) would push their
+  // probability UP, systematically corrupting a sharpened policy (verified: an
+  // unconditional ProbFloor-style update collapsed Test 5). UpdateFloor
+  // defaults to Min(0.1, 0.5/NumActions) instead of the old hardcoded 0.1: the
+  // old value silently FROZE any policy whose action count makes the uniform
+  // probability 1/NumActions <= 0.1 (e.g. K >= 10 never learns at all), while
+  // K-relative thresholds keep uniform initialization above the floor.
+  // UpdateFloor must stay > 0 (the division below divides by pi[a] directly).
   FPolicy.SetBatchUpdate(true);
   FPolicy.ClearDeltas;
+  FLastPolicyLoss := 0;
   for I := 0 to N - 1 do
   begin
     Pi := Forward(FPolicy, FInput, States[I]);
     D := Length(Pi); A := Actions[I];
     if FPseudoTarget.Size <> D then FPseudoTarget.ReSize(1, 1, D);
+    // Diagnostic surrogate loss L = -sum A_t * log pi(a_t|s_t).
+    FLastPolicyLoss := FLastPolicyLoss
+      - Advantages[I] * pcr_logf(Max(Pi[A], FProbFloor));
 
     if FSkipDerivSoftmax then
       for J := 0 to D - 1 do
@@ -777,12 +917,15 @@ begin
         else
           FPseudoTarget.FData[J] := Pi[J] * (1.0 - Advantages[I])
     else
+      // NOTE: divide by Pi[J] DIRECTLY (no Max): Pi[J] > FUpdateFloor (>= 0)
+      // guarantees a positive divisor, and keeping the expression
+      // Single/Single preserves the exact same rounding as the original
+      // formula (a Max() here promotes the division to a wider type and the
+      // resulting 1-ulp differences cascade into different training
+      // trajectories over hundreds of episodes).
       for J := 0 to D - 1 do
-        if J = A then
-          if Pi[J] > 0.1 then
-            FPseudoTarget.FData[J] := Pi[J] + Advantages[I] / Pi[J]
-          else
-            FPseudoTarget.FData[J] := Pi[J]
+        if (J = A) and (Pi[J] > FUpdateFloor) then
+          FPseudoTarget.FData[J] := Pi[J] + Advantages[I] / Pi[J]
         else
           FPseudoTarget.FData[J] := Pi[J];
 
@@ -818,6 +961,7 @@ function TNeuralPolicyGradTrainer.TotalReward(Env: TNeuralEnv;
   MaxSteps: integer): TNeuralFloat;
 var I, A: integer; R: TNeuralFloat; S: TNeuralRLState;
 begin
+  ValidatePolicyAgainstEnv(Env);
   Env.Reset;
   Env.CopyState(S);
   Result := 0;
