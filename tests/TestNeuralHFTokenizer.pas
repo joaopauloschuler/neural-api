@@ -51,6 +51,7 @@ type
     procedure TestFalconSequenceParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
+    procedure TestLiteralSplitParityWithHF;
     procedure TestNFCComposesDecomposedInput;
     procedure TestNFDDecomposesPrecomposedInput;
     procedure TestNFKCFoldsCompatibilityForms;
@@ -686,6 +687,81 @@ begin
       on E: EHFTokenizerError do Raised := true;
     end;
     AssertTrue('unknown Split pattern must raise EHFTokenizerError', Raised);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+// A LITERAL Split pre_tokenizer ({"String": ...} pattern) on the metaspace
+// BPE path: the Gemma-3/4 / EmbeddingGemma-2 form (Replace(" " -> U+2581)
+// normalizer + Split(" ", MergedWithPrevious) - a no-op on the normalized
+// text, exactly as in HF) and a "-" delimiter under every behavior with no
+// normalizer. Expected ids are HF `tokenizers` output
+// (tools/literal_split_tokenizer_cases.py).
+procedure TTestNeuralHFTokenizer.TestLiteralSplitParityWithHF;
+const
+  csMS = #$E2#$96#$81; // U+2581 as UTF-8
+  Texts: array[0..4] of string =
+    ('ab c-abc', 'abc--ab', '-ab-', 'a b  c', 'ab');
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+
+  function Spec(const Normalizer, Behavior, Pattern: string): string;
+  begin
+    Result := '{"model": {"type": "BPE", "byte_fallback": false, ' +
+      '"vocab": {"a": 0, "b": 1, "c": 2, "' + csMS + '": 3, "-": 4, ' +
+      '" ": 5, "ab": 6, "abc": 7, "' + csMS + 'a": 8, "' + csMS +
+      'ab": 9, "c-": 10, "-a": 11, "b' + csMS + '": 12}, ' +
+      '"merges": [["a", "b"], ["ab", "c"], ["' + csMS + '", "a"], ["' +
+      csMS + 'a", "b"], ["c", "-"], ["-", "a"], ["b", "' + csMS +
+      '"]]}, "normalizer": ' + Normalizer + ', "pre_tokenizer": ' +
+      '{"type": "Split", "pattern": {"String": "' + Pattern + '"}, ' +
+      '"behavior": "' + Behavior + '", "invert": false}}';
+  end;
+
+  procedure Check(const Name, Json: string;
+    const Expected: array of string);
+  var
+    Ids: TNeuralIntegerArray;
+    S: string;
+    i, j: integer;
+  begin
+    SL.Text := Json;
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    for i := 0 to High(Texts) do
+    begin
+      Ids := Tok.Encode(Texts[i]);
+      S := '';
+      for j := 0 to High(Ids) do
+      begin
+        if j > 0 then S := S + ' ';
+        S := S + IntToStr(Ids[j]);
+      end;
+      AssertEquals(Name + ' "' + Texts[i] + '"', Expected[i], S);
+    end;
+  end;
+
+begin
+  TempFile := GetTempDir(true) + 'literal_split_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Check('gemma', Spec('{"type": "Replace", "pattern": {"String": " "}, ' +
+      '"content": "' + csMS + '"}', 'MergedWithPrevious', ' '),
+      ['6 3 10 7', '7 4 4 6', '4 6 4', '0 3 12 3 2', '6']);
+    Check('MergedWithPrevious', Spec('null', 'MergedWithPrevious', '-'),
+      ['6 5 10 7', '7 4 4 6', '4 6 4', '0 5 1 5 5 2', '6']);
+    Check('MergedWithNext', Spec('null', 'MergedWithNext', '-'),
+      ['6 5 2 4 7', '7 4 4 6', '4 6 4', '0 5 1 5 5 2', '6']);
+    Check('Isolated', Spec('null', 'Isolated', '-'),
+      ['6 5 2 4 7', '7 4 4 6', '4 6 4', '0 5 1 5 5 2', '6']);
+    Check('Removed', Spec('null', 'Removed', '-'),
+      ['6 5 2 7', '7 6', '6', '0 5 1 5 5 2', '6']);
   finally
     Tok.Free;
     SL.Free;

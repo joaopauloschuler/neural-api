@@ -512,6 +512,10 @@ type
     procedure TestNemotronHMoEPerBlockRoutingBias;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
+    procedure TestEmbeddingGemma2ConfigFromJSONFile;
+    procedure TestEmbeddingGemma2HiddenStateParity;
+    procedure TestEmbeddingGemma2SentenceEmbedding;
+    procedure TestEmbeddingGemma2WeightOwnerTwin;
     procedure TestDebertaV2ConfigFromJSONFile;
     procedure TestDebertaV2HiddenStateParity;
     procedure TestDebertaV2SeqClassificationParity;
@@ -16043,6 +16047,265 @@ begin
       FixturePath('tiny_modernbert_logits.json'), 16, 8);
   finally
     NN.Free;
+  end;
+end;
+
+// EmbeddingGemma 2 (model_type "embedding_gemma2"): tests/fixtures/
+// tiny_embeddinggemma2.* is a RANDOM pico EmbeddingGemma2TextModel
+// (tools/embeddinggemma2_tiny_fixture.py - generated, never downloaded)
+// saved like the composite google/embeddinggemma-2 export: the text tower
+// under "language_model.", a composite config.json with "text_config", and
+// one dummy vision_tower.* tensor the importer must skip. The generator
+// ASSERTS every delta NON-VACUOUS against the float64 oracle (each moves the
+// output > 1e-3): the bidirectional sliding window (radius 2 << 12), the
+// per-layer-type RoPE theta, the GeGLU gate/up packing, layer_scalar, the
+// PLE path and the Gemma-4 RMSNorm gain (w, not 1 + w).
+procedure TTestNeuralPretrained.TestEmbeddingGemma2ConfigFromJSONFile;
+var
+  Config: TEmbeddingGemma2Config;
+begin
+  Config := ReadEmbeddingGemma2ConfigFromJSONFile(
+    FixturePath('tiny_embeddinggemma2_config.json'));
+  AssertEquals('model_type (composite)', 'embedding_gemma2',
+    Config.ModelType);
+  AssertEquals('layers', 5, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('hidden', 8, Config.HiddenSize);
+  AssertEquals('intermediate', 6, Config.IntermediateSize);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('hidden_size_per_layer_input', 4,
+    Config.HiddenSizePerLayerInput);
+  AssertEquals('embedding_dim', 6, Config.EmbeddingDim);
+  AssertEquals('sliding_window (radius)', 2, Config.SlidingWindow);
+  AssertEquals('full rope theta', 1000.0, Config.FullRopeTheta, 1e-9);
+  AssertEquals('sliding rope theta', 10.0, Config.SlidingRopeTheta, 1e-9);
+  AssertEquals('bos', 2, Config.BosTokenId);
+  AssertEquals('eos', 1, Config.EosTokenId);
+  AssertEquals('pad', 0, Config.PadTokenId);
+  // layer_types [s, s, f, s, f]; per_layer_config widens the full layers.
+  AssertTrue('layer 0 sliding', Config.LayerIsSliding[0]);
+  AssertTrue('layer 1 sliding', Config.LayerIsSliding[1]);
+  AssertFalse('layer 2 full', Config.LayerIsSliding[2]);
+  AssertTrue('layer 3 sliding', Config.LayerIsSliding[3]);
+  AssertFalse('layer 4 full', Config.LayerIsSliding[4]);
+  AssertEquals('sliding head_dim', 4, Config.LayerHeadDim[0]);
+  AssertEquals('sliding kv heads', 1, Config.LayerNumKVHeads[0]);
+  AssertEquals('full head_dim (per_layer_config "02")', 6,
+    Config.LayerHeadDim[2]);
+  AssertEquals('full kv heads (per_layer_config "02")', 2,
+    Config.LayerNumKVHeads[2]);
+  AssertEquals('full head_dim (per_layer_config "04")', 6,
+    Config.LayerHeadDim[4]);
+end;
+
+procedure TTestNeuralPretrained.TestEmbeddingGemma2HiddenStateParity;
+var
+  NN: TNNet;
+  Config: TEmbeddingGemma2Config;
+  LayerCnt, RopeCnt, FusedCnt, WindowedCnt, GegluCnt, ScalarCnt,
+  HeadNormCnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildEmbeddingGemma2FromSafeTensorsEx(
+    FixturePath('tiny_embeddinggemma2.safetensors'), Config, {SeqLen=}12,
+    {pTrainable=}true, FixturePath('tiny_embeddinggemma2_config.json'));
+  try
+    // Ground truth first: per-token states (already embedding_dim wide)
+    // stored under the fixture's "logits" key.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_embeddinggemma2_logits.json'), 12,
+      Config.EmbeddingDim);
+    AssertEquals('prefix (composite export)', 'language_model.',
+      Config.Prefix);
+    // Structure: 2 head-tiled RoPE layers per block = 10. The 2 full layers
+    // fuse (TNNetFusedSDPA); the 3 sliding layers carry the bidirectional
+    // window W = radius + 1 = 3 (SeqLen 12 reaches the band edge), one SDPA
+    // per query head = 6. One tanh TNNetGEGLU per block, q/k/v head norms
+    // (3 per block) + the PLE slice norm = 16 TNNetHeadRMSNorm, and one
+    // TNNetMulByConstant per block (every layer_scalar <> 1).
+    RopeCnt := 0;
+    FusedCnt := 0;
+    WindowedCnt := 0;
+    GegluCnt := 0;
+    ScalarCnt := 0;
+    HeadNormCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then Inc(RopeCnt);
+      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        AssertFalse('encoder attention is non-causal', SDPA.CausalMask);
+        if SDPA.Window > 0 then
+        begin
+          AssertTrue('sliding window is bidirectional',
+            SDPA.BidirectionalWindow);
+          AssertEquals('window W = sliding_window + 1', 3, SDPA.Window);
+          Inc(WindowedCnt);
+        end;
+        if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      end;
+      if NN.Layers[LayerCnt] is TNNetGEGLU then Inc(GegluCnt);
+      AssertFalse('no erf GEGLU with gelu_pytorch_tanh',
+        NN.Layers[LayerCnt] is TNNetGEGLUErf);
+      if NN.Layers[LayerCnt] is TNNetMulByConstant then Inc(ScalarCnt);
+      if NN.Layers[LayerCnt] is TNNetHeadRMSNorm then Inc(HeadNormCnt);
+    end;
+    AssertEquals('RoPE count (q+k band per block)', 10, RopeCnt);
+    AssertEquals('fused attention (2 full layers)', 2, FusedCnt);
+    AssertEquals('windowed heads (3 sliding layers x 2 heads)', 6,
+      WindowedCnt);
+    AssertEquals('TNNetGEGLU per block', 5, GegluCnt);
+    AssertEquals('layer_scalar multipliers', 5, ScalarCnt);
+    AssertEquals('head RMSNorms (q/k/v per block + PLE)', 16, HeadNormCnt);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "embedding_gemma2" onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_embeddinggemma2.safetensors'),
+    {SeqLen=}12, {pTrainable=}true,
+    FixturePath('tiny_embeddinggemma2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_embeddinggemma2_logits.json'), 12, 6);
+  finally
+    NN.Free;
+  end;
+end;
+
+// pWeightOwner: a twin built at another SeqLen borrows every weight from an
+// owner net (no loads) and must reproduce the fixture; a twin whose graph
+// differs (here SeqLen 3 <= sliding_window + 1: windowless sliding layers,
+// vs the owner's windowed ones) must be refused.
+procedure TTestNeuralPretrained.TestEmbeddingGemma2WeightOwnerTwin;
+var
+  Owner, Twin: TNNet;
+  Config, TwinConfig: TEmbeddingGemma2Config;
+  Raised: boolean;
+begin
+  Owner := BuildEmbeddingGemma2FromSafeTensorsEx(
+    FixturePath('tiny_embeddinggemma2.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_embeddinggemma2_config.json'));
+  try
+    TwinConfig := Config;
+    Twin := BuildEmbeddingGemma2FromSafeTensorsWithConfig(
+      FixturePath('tiny_embeddinggemma2.safetensors'), TwinConfig,
+      {SeqLen=}12, {pTrainable=}false, {pQuantizeInt8=}false, Owner);
+    try
+      AssertEquals('twin layer count', Owner.CountLayers(),
+        Twin.CountLayers());
+      AssertLogitParityWithFixture(Twin,
+        FixturePath('tiny_embeddinggemma2_logits.json'), 12, 6);
+    finally
+      Twin.Free;
+    end;
+    Raised := false;
+    TwinConfig := Config;
+    try
+      Twin := BuildEmbeddingGemma2FromSafeTensorsWithConfig(
+        FixturePath('tiny_embeddinggemma2.safetensors'), TwinConfig,
+        {SeqLen=}3, {pTrainable=}false, {pQuantizeInt8=}false, Owner);
+      Twin.Free;
+    except
+      // EPretrainedImportError from the builder, or the per-layer link
+      // refusing a class/shape mismatch.
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('graph-mismatched twin must raise', Raised);
+  finally
+    Owner.Free;
+  end;
+end;
+
+// The sentence-transformers head on top of the parity-checked encoder: mean
+// over the REAL rows + L2 normalization (EmbeddingGemma2EmbedIds), checked
+// against the fixture's "embeddings"; the Matryoshka Dim keeps the leading
+// components and renormalizes; EmbeddingGemma2TokenizeText wraps the ids in
+// <bos> ... <eos>.
+procedure TTestNeuralPretrained.TestEmbeddingGemma2SentenceEmbedding;
+var
+  NN: TNNet;
+  Config: TEmbeddingGemma2Config;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Sequences, Embeddings, SeqArr, EmbArr: TJSONArray;
+  Ids: TNeuralIntegerArray;
+  Emb: TNNetVolume;
+  SeqCnt, i: integer;
+  Norm, MaxDiff: double;
+  Tok: TNeuralHFTokenizer;
+  SL: TStringList;
+  TempFile: string;
+begin
+  NN := BuildEmbeddingGemma2FromSafeTensorsEx(
+    FixturePath('tiny_embeddinggemma2.safetensors'), Config, {SeqLen=}12,
+    {pTrainable=}false, FixturePath('tiny_embeddinggemma2_config.json'));
+  RefJson := TStringList.Create;
+  Emb := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_embeddinggemma2_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    Embeddings := TJSONArray(TJSONObject(RefRoot).Find('embeddings'));
+    AssertTrue('embeddings present', Embeddings <> nil);
+    MaxDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      EmbArr := TJSONArray(Embeddings.Items[SeqCnt]);
+      SetLength(Ids, SeqArr.Count);
+      for i := 0 to SeqArr.Count - 1 do
+        Ids[i] := SeqArr.Items[i].AsInteger;
+      EmbeddingGemma2EmbedIds(NN, Config, Ids, Emb);
+      AssertEquals('embedding size', Config.EmbeddingDim, Emb.Size);
+      for i := 0 to Emb.Size - 1 do
+        MaxDiff := Max(MaxDiff, Abs(Emb.FData[i] - EmbArr.Items[i].AsFloat));
+      // Matryoshka: first 4 components, renormalized.
+      EmbeddingGemma2EmbedIds(NN, Config, Ids, Emb, {Dim=}4);
+      AssertEquals('matryoshka size', 4, Emb.Size);
+      Norm := 0;
+      for i := 0 to 3 do
+        Norm := Norm + Sqr(EmbArr.Items[i].AsFloat);
+      Norm := Sqrt(Norm);
+      for i := 0 to 3 do
+        MaxDiff := Max(MaxDiff,
+          Abs(Emb.FData[i] - EmbArr.Items[i].AsFloat / Norm));
+    end;
+    AssertTrue('sentence embedding parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    RefRoot.Free;
+    Emb.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+  // <bos> + body + <eos>, truncated to MaxTokens keeping the <eos>.
+  TempFile := GetTempDir(true) + 'eg2_tokenizer.json';
+  SL := TStringList.Create;
+  Tok := TNeuralHFTokenizer.Create;
+  try
+    SL.Text := '{"model": {"type": "BPE", "vocab": {"a": 3, "b": 4},' +
+      ' "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    Ids := EmbeddingGemma2TokenizeText(Tok, Config, 'ba', 'a');
+    AssertEquals('length', 5, Length(Ids));
+    AssertEquals('bos', 2, Ids[0]);
+    AssertEquals('prompt', 3, Ids[1]);
+    AssertEquals('text b', 4, Ids[2]);
+    AssertEquals('text a', 3, Ids[3]);
+    AssertEquals('eos', 1, Ids[4]);
+    Ids := EmbeddingGemma2TokenizeText(Tok, Config, 'ba', 'a', 3);
+    AssertEquals('truncated length', 3, Length(Ids));
+    AssertEquals('truncated keeps bos', 2, Ids[0]);
+    AssertEquals('truncated keeps eos', 1, Ids[2]);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
   end;
 end;
 
