@@ -58,6 +58,68 @@ These models have been run/verified through ChatTerminal:
 | state-spaces/mamba-130m-hf | mamba |
 | openai-community/gpt2 | gpt2 |
 
+## From your own code
+
+```
+git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q
+lazbuild -B neural-api/examples/ChatTerminal/SimpleChat.lpi
+neural-api/bin/x86_64-linux/bin/SimpleChat
+```
+
+Run these in the folder that holds `neural-api`. The weights are stored with
+Git LFS, so `git lfs` must be installed before the clone. `SimpleChat` looks
+for the model in `q`, so run it from the folder that holds `q`.
+
+```pascal
+program SimpleChat;
+{$mode objfpc}{$H+}
+uses
+  {$IFDEF UNIX} cthreads, {$ENDIF}
+  neuralchat, neuralchatengine;
+
+var
+  Options: TChatOptions;
+  Engine: TChatEngine;
+  ErrorMsg: string;
+  History: TChatMessages;
+begin
+  Options := DefaultChatOptions();          // int8 weights, model's sampling defaults
+  Options.ModelDir := 'q';                  // git clone of Qwen/Qwen2.5-0.5B-Instruct
+  Options.CtxLen := 2048;                   // keeps the KV cache small
+  Engine := TChatEngine.Create();
+  try
+    if Engine.LoadModel(Options, ErrorMsg) then
+    begin
+      History := [ChatMessage('user', 'Name three colours.')];
+      WriteLn(Engine.ChatReply(History, Engine.Opt));
+    end
+    else
+      WriteLn('Error: ', ErrorMsg);
+  finally
+    Engine.Free;
+  end;
+end.
+```
+
+This is `SimpleChat.lpr` in this folder.
+
+* `LoadModel` loads the tokenizer and the model once. It returns `false` and
+  sets `ErrorMsg` when it cannot load them. In the default build (`-dOpenCL`)
+  it uses OpenCL and falls back to the CPU when it finds no OpenCL device;
+  set `Options.Gpu := false` to skip OpenCL.
+* `ChatReply` renders the chat template, generates and returns the whole
+  reply as a string.
+* `Engine.Opt` holds the options after loading: your `Options` plus the
+  sampling defaults from the model's `generation_config.json`.
+* For a conversation, append `ChatMessage('assistant', Reply)` and the next
+  `ChatMessage('user', ...)` to `History` and call `ChatReply` again. The
+  engine reuses the KV cache for the part of the prompt it has already seen.
+* For a system prompt, pass `AssembleMessages('You are ...', History)` to
+  `ChatReply` instead of `History`.
+* For streaming, assign `Engine.OnToken` (a `procedure(const S: string) of
+  object`, so a method of a class) before calling `ChatReply`; it receives
+  the reply text piece by piece.
+
 ## Common flags
 
 Sampling defaults resolve **per parameter** as: explicit flag >
