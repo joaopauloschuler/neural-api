@@ -10,7 +10,7 @@ TESTS:
   2. CartPole env: from a small initial angle, the pole must eventually fall
      (episode terminates) within 500 steps if no action is taken.
   3. ReplayBuffer: add N transitions, sample, verify size and no crash.
-  4. DQN on GridWorld: train for 300 episodes, greedy policy must reach the
+  4. DQN on GridWorld: train for 1200 episodes, greedy policy must reach the
      goal (TotalReward > 0, ideally ~10 - step_cost).
   5. PolicyGradient on GridWorld: train for 200 episodes, greedy policy must
      reach the goal.
@@ -35,10 +35,15 @@ const
   cGW = 5;           // 5x5 grid
   cGWMaxSteps = 30;  // max steps per episode
 
-  // DQN params.
-  cDQNEpisodes = 400;
+  // DQN params. lr=0.005 + 1200 episodes + TargetUpdateFreq=250 were probed
+  // under both idle and full-CPU-load conditions (see DQNProbe in F:\Temp):
+  // the original lr=0.02/400ep/target=50 kept the Q-function in a churn
+  // regime (TD loss 1-16 forever, Q flat near +/-1) and failed ~10-15% of
+  // runs (wall-bounce loops; at lr=0.01 a single-precision overflow was even
+  // observed under load). This combination: 0/30 idle + 0/30 loaded.
+  cDQNEpisodes = 1200;
   cDQNGamma = 0.95;
-  cDQNLR = 0.02;
+  cDQNLR = 0.005;
 
   // PG params.
   cPGEpisodes = 500;
@@ -47,11 +52,15 @@ const
 
   // PPO params. Standard batch usage: 100 update rounds x 8 episodes per
   // batch (800 episodes total). Single-episode batches were verified flaky
-  // (~20% failure): a confidently-wrong policy can trap itself on this env
-  // with no entropy bonus; 8-episode batches + a conservative LR fix it.
-  cPPORounds = 100;
-  cPPOEpsPerBatch = 8;
-  cPPOEpisodes = 800;
+  // (~20% failure): a confidently-wrong policy can trap itself on this env.
+  // Probe runs (PPOProbe2 in F:\Temp) measured the failure rate vs total
+  // episodes AND batch size: 800 eps 3/20, 1600 eps 1/20, 3200 eps at
+  // 8/batch still 1/20, but 3200 eps at 16/batch 0/20 - both more data per
+  // update and more rounds are needed for a stable gradient. Plus
+  // ExploreEpsilon=0 (see TestPPOGridWorld) removes the trap trigger.
+  cPPORounds = 200;
+  cPPOEpsPerBatch = 16;
+  cPPOEpisodes = 3200;
   cPPOGamma = 0.95;
   cPPOLambda = 0.95;
   cPPOClip = 0.2;
@@ -288,7 +297,12 @@ begin
   QNet := BuildQNet(Env.StateDim, Env.NumActions, 32);
   QNet.SetLearningRate(cDQNLR, 0);
 
-  Trainer := TNeuralDQNTrainer.Create(QNet, cDQNGamma, 1.0, 0.05, 0.995, 50, 5000, 16);
+  // TargetUpdateFreq=250 (not 50): with 50 the target net hard-clones every
+  // ~2-3 episodes, the bootstrap target churns and Bellman iteration never
+  // contracts (TD loss stays 1-16 forever, Q stays flat near +/-1); probe
+  // runs showed 50 fails ~10% of the time with the greedy policy locked in a
+  // wall-bounce loop, while 250 passes 10/10. See F:\Temp DQNProbe analysis.
+  Trainer := TNeuralDQNTrainer.Create(QNet, cDQNGamma, 1.0, 0.05, 0.995, 250, 5000, 16);
   try
     // Train.
     for I := 1 to cDQNEpisodes do
@@ -381,6 +395,14 @@ begin
 
   PPO := TNeuralPPOTrainer.CreateWithCritic(Policy, Critic,
     cPPOGamma, cPPOLambda, cPPOClip, cPPOEpochs, cPPOBatch);
+  // ExploreEpsilon=0: sample actions from the policy itself (like the PG
+  // trainer). Probe evidence (PPOProbe2 in F:\Temp): with the default
+  // epsilon-greedy the recorded logpi (policy's own) mislabels the ~10%
+  // random actions as on-policy, the biased gradients can collapse the
+  // softmax onto a single wrong action (pi -> [1,0,0,0] saturation) and the
+  // trap is structural - ~10-15% of runs failed at every epsilon/rounds/lr
+  // combination tried. Pure on-policy sampling: 0/60 idle + 0/30 loaded.
+  PPO.ExploreEpsilon := 0;
   try
     for I := 1 to cPPORounds do
     begin
