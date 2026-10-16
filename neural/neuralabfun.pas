@@ -34,7 +34,7 @@ unit neuralabfun;
 {$ENDIF}
 interface
 
-uses neuralab;
+uses SysUtils, neuralab;
 
 // available operations. Some operations are logic/test operations such as <,> and <>.
 // Other operations are math operations such as +,- and *.
@@ -286,7 +286,7 @@ type
   { TRunOperation }
   TRunOperation = object
   private
-    Actions, CurrentStates, NextStates: array of byte;
+    Actions, CurrentStates, NextStates: {$IFDEF FPC}array of byte; {$ELSE} TBytes; {$ENDIF}
     NumberOfActions, NumberOfCurrentStates, NumberOfNextStates: integer;
     FCS: TCreateOperationSettings;
 
@@ -357,7 +357,7 @@ type
 
 implementation
 
-uses Classes, SysUtils, Math;
+uses Classes, Math;
 
 procedure TTestsClass.DeleteOperation(operationIndex: integer);
 var

@@ -47,7 +47,9 @@ unit neuralbyteprediction; // this unit used to be called UBup3
 
 interface
 
-uses neuralabfun, neuralcache, neuralvolume;
+uses
+  {$IFNDEF FPC} neuraldelphi, {$ENDIF}
+  neuralabfun, neuralcache, neuralvolume;
 
 type
   TCountings = array of longint;
