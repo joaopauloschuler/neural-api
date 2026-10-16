@@ -1,7 +1,8 @@
 program TestNeuralRL;
 (*
 TestNeuralRL: validates the neuralrl.pas unit (TNeuralEnv, TNeuralReplayBuffer,
-TNeuralDQNTrainer, TNeuralPolicyGradTrainer, TNeuralCartPoleEnv, TNeuralGridWorldEnv).
+TNeuralDQNTrainer, TNeuralPolicyGradTrainer, TNeuralPPOTrainer,
+TNeuralCartPoleEnv, TNeuralGridWorldEnv).
 
 TESTS:
   1. GridWorld env: deterministic path to goal (no slip) must reach goal in
@@ -13,6 +14,8 @@ TESTS:
      goal (TotalReward > 0, ideally ~10 - step_cost).
   5. PolicyGradient on GridWorld: train for 200 episodes, greedy policy must
      reach the goal.
+  6. PPO on GridWorld: 100 update rounds of 8-episode batches (GAE + clipped
+     surrogate + critic), greedy policy must reach the goal.
 
 Each test prints PASS or FAIL. Any FAIL causes Halt(1).
 
@@ -41,6 +44,20 @@ const
   cPGEpisodes = 500;
   cPGGamma = 0.95;
   cPGLR = 0.05;
+
+  // PPO params. Standard batch usage: 100 update rounds x 8 episodes per
+  // batch (800 episodes total). Single-episode batches were verified flaky
+  // (~20% failure): a confidently-wrong policy can trap itself on this env
+  // with no entropy bonus; 8-episode batches + a conservative LR fix it.
+  cPPORounds = 100;
+  cPPOEpsPerBatch = 8;
+  cPPOEpisodes = 800;
+  cPPOGamma = 0.95;
+  cPPOLambda = 0.95;
+  cPPOClip = 0.2;
+  cPPOEpochs = 4;
+  cPPOBatch = 64;
+  cPPOLR = 0.005;
 
 var
   GPassCount, GFailCount: integer;
@@ -80,7 +97,21 @@ begin
   Result.AddLayer(TNNetInput.Create(1, 1, StateDim));
   Result.AddLayer(TNNetFullConnectReLU.Create(Hidden));
   Result.AddLayer(TNNetFullConnectReLU.Create(Hidden));
+  // Project to the action space BEFORE the softmax: TNNetSoftMax is a
+  // pass-through layer, so without this head the policy would be a softmax
+  // over Hidden outputs (32 "actions") instead of NumActions, and with the
+  // Pi>0.1 update guard in neuralrl.pas every gradient step would be a no-op.
+  Result.AddLayer(TNNetFullConnectLinear.Create(NumActions));
   Result.AddLayer(TNNetSoftMax.Create);
+end;
+
+// Critic network: state -> hidden -> scalar value estimate V(s).
+function BuildCriticNet(StateDim, Hidden: integer): TNNet;
+begin
+  Result := TNNet.Create;
+  Result.AddLayer(TNNetInput.Create(1, 1, StateDim));
+  Result.AddLayer(TNNetFullConnectReLU.Create(Hidden));
+  Result.AddLayer(TNNetFullConnectLinear.Create(1));
 end;
 
 // One-hot encode a grid cell (x,y) into a StateDim-vector (cGW*cGW cells).
@@ -327,6 +358,57 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test 6: PPO on GridWorld.
+// ---------------------------------------------------------------------------
+procedure TestPPOGridWorld;
+var
+  Env: TNeuralGridWorldEnv;
+  Policy, Critic: TNNet;
+  PPO: TNeuralPPOTrainer;
+  R, FinalR: TNeuralFloat;
+  I: integer;
+  S: TNeuralRLState;
+  X, Y: integer;
+begin
+  Env := TNeuralGridWorldEnv.Create(cGW, cGW, cGWMaxSteps, 0.0);
+  Env.SetGoal(cGW - 1, 0);
+  Env.SetPit(2, 2);
+
+  Policy := BuildPolicyNet(Env.StateDim, Env.NumActions, 32);
+  Policy.SetLearningRate(cPPOLR, 0);
+  Critic := BuildCriticNet(Env.StateDim, 32);
+  Critic.SetLearningRate(cPPOLR, 0);
+
+  PPO := TNeuralPPOTrainer.CreateWithCritic(Policy, Critic,
+    cPPOGamma, cPPOLambda, cPPOClip, cPPOEpochs, cPPOBatch);
+  try
+    for I := 1 to cPPORounds do
+    begin
+      R := PPO.TrainOnEpisodes(Env, cPPOEpsPerBatch, cGWMaxSteps);
+      if (I mod 5 = 0) then
+        WriteLn('  PPO round ', I, ' (', I * cPPOEpsPerBatch, ' episodes): avg_reward=',
+          Format('%.2f', [R / cPPOEpsPerBatch]),
+          '  clip_frac=', Format('%.2f', [PPO.LastClipFraction]),
+          '  vloss=', Format('%.3f', [PPO.LastValueLoss]));
+    end;
+
+    // Evaluate: greedy policy from start.
+    FinalR := PPO.TotalReward(Env, cGWMaxSteps);
+    Env.CopyState(S);
+    DecodeCell(S, X, Y);
+    // Success: reached the goal (reward includes +10).
+    Report('PPO GridWorld learns', FinalR > 0,
+      Format('final_reward=%.2f, pos=(%d,%d), done=%s',
+        [FinalR, X, Y, BoolToStr(Env.Done, true)]));
+  finally
+    PPO.Free;
+    Policy.Free;
+    Critic.Free;
+    Env.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 // Main.
 // ---------------------------------------------------------------------------
 begin
@@ -356,6 +438,11 @@ begin
   TestPGGridWorld;
   WriteLn;
 
+  WriteLn('Test 6: PPO on GridWorld (', cPPORounds, ' rounds x ',
+    cPPOEpsPerBatch, ' episodes)');
+  TestPPOGridWorld;
+  WriteLn;
+
   WriteLn('=================================');
   WriteLn('Total: ', GPassCount + GFailCount, '  Passed: ', GPassCount,
     '  Failed: ', GFailCount);
@@ -364,6 +451,7 @@ begin
   if GFailCount > 0 then
   begin
     WriteLn('SOME TESTS FAILED');
+    Halt(1);
   end
   else
     WriteLn('ALL TESTS PASSED');
