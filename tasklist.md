@@ -2646,11 +2646,51 @@ rather than acted on.
         tiny + real.
   - [ ] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
         release stage A's net after use and drop its spare weight copies
-        (`FlushWeightCache` after `SetTrainable(false)`); remove the obsolete
-        Kokoro stage B / C net code (builders, loaders into layers,
-        Prepare/Release/Run, the stage B / C OpenCL arming) but keep every
-        TNNet layer; rewrite the stage B / C parity tests on the new code.
-        Full cpu / avx2 / opencl suites.
+        (`FlushWeightCache` after `SetTrainable(false)`); rewrite the stage
+        B / C parity tests on the new code. Full cpu / avx2 / opencl suites.
+        REMOVE (neuralpretrained.pas unless noted):
+        - stage B net: `BuildKokoroStageBNet`, `TNNetKokoro.LoadStageB`,
+          `PrepareStageB`, `ReleaseStageB`, `RunStageB`,
+          `AddKokoroAdainResBlock`, `LoadKokoroAdainResBlockWeights`, types
+          `TKokoroStageBLayers`, `TKokoroAdainResBlockLayers`, fields and
+          properties `StageBOwner`, `StageBNet`, `StageBLayers`,
+          `StageBInput`, `StageBOwnerOnOpenCL`;
+        - decoder net: `BuildKokoroStageCDecoderNet`,
+          `TNNetKokoro.LoadStageCDecoder`, `PrepareStageCDecoder`,
+          `ReleaseStageCDecoder`, `RunStageCDecoder`, type
+          `TKokoroStageCDecoderLayers`, fields and properties
+          `StageCDecoderOwner`, `StageCDecoderNet`, `StageCDecoderLayers`,
+          `StageCDecoderAsr`, `StageCDecoderOwnerOnOpenCL`,
+          `FStageCDecoderNormFcWeights` / `FStageCDecoderNormFcBiases`;
+        - generator net: `BuildKokoroStageCGeneratorNet`,
+          `AddKokoroAdaINResBlock1`, `LoadKokoroAdaINResBlock1Weights`,
+          `LoadKokoroSnakeAlpha`, `TNNetKokoro.LoadStageCGenerator`,
+          `PrepareStageCGenerator`, `ReleaseStageCGenerator`,
+          `RunStageCGenerator`, `RunStageCGeneratorFrom`, types
+          `TKokoroAdaINResBlock1Layers`, `TKokoroGeneratorStageLayers`,
+          `TKokoroStageCGeneratorLayers`, fields and properties
+          `StageCGeneratorOwner`, `StageCGeneratorNet`,
+          `StageCGeneratorLayers`, `StageCGeneratorOwnerOnOpenCL`,
+          `FStageCGeneratorNormFcWeights` / `FStageCGeneratorNormFcBiases`;
+        - the stage B / C parts of `ArmStageNet` and `EnableOpenCL`, and
+          `ShareOpenCLOutputs` if stage A does not need it;
+        - tests (tests/TestNeuralPretrained.pas):
+          `TestKokoroStageB/StageCDecoder/StageCGeneratorBorrowingRebuild`,
+          `TestKokoroStageB/StageCDecoder/StageCGeneratorOpenCLParity`.
+        REWRITE on the new code (same fixture dumps):
+        `TestKokoroStageBTinyParity`, `TestKokoroRealStageBParity`,
+        `TestKokoroStageCDecoderTinyParity`,
+        `TestKokoroRealStageCDecoderParity`,
+        `TestKokoroStageCGeneratorTinyParity`,
+        `TestKokoroRealStageCGeneratorParity`,
+        `TestKokoroRealStagesChainedToDecoder`, `TestKokoroRealEndToEnd`.
+        KEEP: every TNNet layer (`TNNetConv1DLinear`, `TNNetDeconv1DLinear`,
+        per-channel `TNNetSnake`, `TNNetDeMaxPool`, `TNNetPadXY`,
+        `TNNetInstanceNorm`, `TNNetLSTMCell`) with their own tests and
+        OpenCL kernels; stage A as a net (`BuildKokoroStageANet`,
+        `RunStageA`); `WriteStyleIntoChannelAffine` (stage A uses it);
+        `LoadKokoroStyleFc`; loaders and voice packs; neuralaudio host
+        steps; tools/make_kokoro82m_fixture.py.
   - [ ] 6.6 Measure and document: memory per frame and peak against Python
         (same short real lines under the cap, extrapolated to the 26 x
         "Hello" line); update examples/KokoroTTS/README.md (Memory section,
