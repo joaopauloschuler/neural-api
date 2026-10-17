@@ -2601,7 +2601,7 @@ rather than acted on.
   (`tests/run_suite_capped.sh`, `systemd-run ... MemoryMax=2G`); no real-size
   forwards on the dev VM (short real lines only); before/after memory numbers;
   commit per task.
-  - [ ] 6.1 Plain-volume ops, reusable (not Kokoro-specific), CPU, threaded
+  - [x] 6.1 Plain-volume ops, reusable (not Kokoro-specific), CPU, threaded
         over time tiles with per-thread scratch allocated once (never inside
         the per-tile work): 1D conv with stride / dilation / zero padding
         (tile gather + `DotProductsTiled` + bias), pointwise conv, dense
@@ -2612,6 +2612,25 @@ rather than acted on.
         bidirectional LSTM keeping only h and c. Unit tests against the
         existing layers on small random cases (exact where the arithmetic
         order is the same).
+        Done 2026-10-17: `neural/neuralplainops.pas` (no change to
+        neuralnetwork.pas / neuralvolume.pas). `TNNetPlainConvWeights` (rows
+        per op: conv [Cout][K][Cin], transposed [K][Cout][Cin], depthwise
+        taps [K][C]; loaders from the layers and from torch tensors),
+        `TNNetPlainLSTMWeights` (from `TNNetLSTMCell` or torch ih/hh),
+        `TNNetPlainOps` (Conv1D, PointwiseConv, ConvTranspose1D,
+        DepthwiseConvTranspose1D, UpsampleNearest, ReflectPad, InstanceNorm,
+        Snake, LeakyReLU, BiLSTM; residual sum / x constant stay
+        `TNNetVolume.Add` / `Mul`), `ComputeStyleChannelAffine`. Scratch per
+        pool thread, grown at op entry and kept: patch + tile result, 1.02 MiB
+        per thread at 32 positions after the widest Kokoro ops (decoder conv
+        1090 -> 1024 k3 patch, ups0 512 -> 256 k20 products); BiLSTM keeps
+        an input projection of 8 KiB per frame (H 256). Tests
+        `TestNeuralPlainOps` (12): conv / pointwise / transposed / Snake /
+        upsample / pad / LeakyReLU / style affine exact on cpu (conv and
+        pointwise <= 2.4e-7 under AVX2: the layers' low-memory DotProduct
+        kernel), depthwise 0, instance norm 1.2e-7, BiLSTM 6.7e-8; serial ==
+        threaded (3-thread pool). Suites cpu / avx2 / opencl
+        `TESTS=3282 ERRORS=0 FAILURES=0 IGNORED=4` (was 3270).
   - [ ] 6.2 Stage-C decoder as plain code: its weights loaded once into
         plain volumes owned by `TNNetKokoro` (concatenated [Cout][K][Cin]
         conv rows; no owner net), the style projections reused
