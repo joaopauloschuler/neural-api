@@ -24,7 +24,7 @@ Coded by Claude (AI).
 // neuralplainops -- inference ops on plain TNNetVolume buffers, without a
 // TNNet: 1D conv, pointwise conv, dense and depthwise transposed 1D conv,
 // nearest upsample, reflect pad, instance norm with a channel affine, Snake,
-// LeakyReLU and a bidirectional LSTM. A caller holds the weights once and
+// LeakyReLU, channel concat and a bidirectional LSTM. A caller holds the weights once and
 // reuses a few activation volumes, so memory does not grow with per-layer
 // buffers (PyTorch eager style).
 //
@@ -170,6 +170,10 @@ type
     procedure Snake(V, Alpha: TNNetVolume);
     // Output may be Input.
     procedure LeakyReLU(Input, Output: TNNetVolume; Slope: TNeuralFloat);
+    // Output (T, 1, sum of depths): per position the Sources' channels in order
+    // (torch.cat on dim 1). Output must not be a source.
+    procedure ConcatChannels(const Sources: array of TNNetVolume;
+      Output: TNNetVolume);
     // Output (T, 1, 2H) = [forward h_t ; backward h_t], zero initial state.
     procedure BiLSTM(Input, Output: TNNetVolume;
       ForwardWeights, BackwardWeights: TNNetPlainLSTMWeights);
@@ -1033,6 +1037,42 @@ procedure TNNetPlainOps.LeakyReLU(Input, Output: TNNetVolume;
 begin
   Output.ReSize(Input);
   TNNetVolume.LeakyRelu(Output.DataPtr, Input.DataPtr, Slope, Input.Size);
+end;
+
+procedure TNNetPlainOps.ConcatChannels(const Sources: array of TNNetVolume;
+  Output: TNNetVolume);
+var
+  SourcePos, Position, MaxPosition, PositionCount: integer;
+  OutChannels, SourceChannels, ChannelOffset, RowBytes: integer;
+  Source: TNNetVolume;
+begin
+  if Length(Sources) = 0 then
+    raise Exception.Create('ConcatChannels: no sources.');
+  PositionCount := Sources[0].SizeX;
+  OutChannels := 0;
+  for SourcePos := 0 to High(Sources) do
+  begin
+    Source := Sources[SourcePos];
+    CheckSequence(Source, Source.Depth, 'ConcatChannels');
+    if (Source.SizeX <> PositionCount) or (Source = Output) then
+      raise Exception.Create('ConcatChannels: source ' + IntToStr(SourcePos) +
+        ' has ' + IntToStr(Source.SizeX) + ' positions (expected ' +
+        IntToStr(PositionCount) + ') or is the output.');
+    Inc(OutChannels, Source.Depth);
+  end;
+  Output.ReSize(PositionCount, 1, OutChannels);
+  MaxPosition := PositionCount - 1;
+  ChannelOffset := 0;
+  for SourcePos := 0 to High(Sources) do
+  begin
+    Source := Sources[SourcePos];
+    SourceChannels := Source.Depth;
+    RowBytes := SourceChannels * csNeuralFloatSize;
+    for Position := 0 to MaxPosition do
+      Move(Source.FData[Position * SourceChannels],
+        Output.FData[Position * OutChannels + ChannelOffset], RowBytes);
+    Inc(ChannelOffset, SourceChannels);
+  end;
 end;
 
 procedure TNNetPlainOps.LSTMProjectionJob(Index, ThreadNum: integer);

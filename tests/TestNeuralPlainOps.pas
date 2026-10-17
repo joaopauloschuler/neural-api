@@ -50,6 +50,8 @@ type
     procedure TestSnakeMatchesLayer;
     // LeakyReLU vs TNNetLeakyReLU.
     procedure TestLeakyReLUMatchesLayer;
+    // ConcatChannels vs TNNetDeepConcat (widths 3, 1, 2).
+    procedure TestConcatChannelsMatchesLayer;
     // BiLSTM vs TNNet.AddBidirectionalLSTM(H, 1, true, true), and torch-layout
     // weights loaded with LoadTorchLSTM give the same result.
     procedure TestBiLSTMMatchesLayer;
@@ -563,6 +565,38 @@ begin
     NN.Free;
     Output.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestConcatChannelsMatchesLayer;
+var
+  NN: TNNet;
+  InputA, InputB, InputC, Concat: TNNetLayer;
+  SourceA, SourceB, SourceC, Output: TNNetVolume;
+begin
+  SourceA := TNNetVolume.Create(6, 1, 3);
+  SourceB := TNNetVolume.Create(6, 1, 1);
+  SourceC := TNNetVolume.Create(6, 1, 2);
+  Output := TNNetVolume.Create();
+  NN := TNNet.Create();
+  try
+    InputA := NN.AddLayer(TNNetInput.Create(6, 1, 3));
+    InputB := NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    InputC := NN.AddLayer(TNNetInput.Create(6, 1, 2));
+    Concat := NN.AddLayer(TNNetDeepConcat.Create([InputA, InputB, InputC]));
+    NN.SetTrainable(false);
+    FillRandom(SourceA);
+    FillRandom(SourceB);
+    FillRandom(SourceC);
+    NN.Compute([SourceA, SourceB, SourceC]);
+    FSerial.ConcatChannels([SourceA, SourceB, SourceC], Output);
+    AssertEquals(0, MaxAbsDiff(Output, Concat.Output), 0);
+  finally
+    NN.Free;
+    Output.Free;
+    SourceC.Free;
+    SourceB.Free;
+    SourceA.Free;
   end;
 end;
 
