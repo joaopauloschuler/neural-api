@@ -2631,13 +2631,35 @@ rather than acted on.
         kernel), depthwise 0, instance norm 1.2e-7, BiLSTM 6.7e-8; serial ==
         threaded (3-thread pool). Suites cpu / avx2 / opencl
         `TESTS=3282 ERRORS=0 FAILURES=0 IGNORED=4` (was 3270).
-  - [ ] 6.2 Stage-C decoder as plain code: its weights loaded once into
+  - [x] 6.2 Stage-C decoder as plain code: its weights loaded once into
         plain volumes owned by `TNNetKokoro` (concatenated [Cout][K][Cin]
         conv rows; no owner net), the style projections reused
         (`LoadKokoroStyleFc`; split a scale/shift routine out of
         `WriteStyleIntoChannelAffine` if useful). Parity on the tiny fixture
         and the real dump (opt-in heavy test). The old net path stays until
         6.5. Measure memory per frame.
+        Done 2026-10-17: `TKokoroPlainDecoder` (weights read once at
+        `TNNetKokoro.Create` via `LoadTorchPlainConv`, weight_norm folded by
+        `LoadTorchConv1DWeight`; norm fcs borrowed from
+        `FStageCDecoderNormFc*`), `TKokoroPlainAdainResBlock` (reusable for
+        stage B; conv1x1 runs before the nearest x2), `TKokoroPlainWorkspace`
+        (one `TNNetPlainOps` + Work1 / Work2 / Shortcut / norm scale+shift),
+        new op `TNNetPlainOps.ConcatChannels`. Entry
+        `TNNetKokoro.RunStageCDecoderPlain` (same arguments as
+        `RunStageCDecoder`; frees block and work buffers after). Parity: tiny
+        dec_decode3 1.5e-5 abs (same as the net), plain vs net 5.7e-6 (max
+        |x| 106); real dump (102 frames) dec_decode3 9.4e-5 abs, rel.
+        2.7e-6, RSS 894 MB. Memory (real checkpoint, synthetic F = 56 / 112
+        / 224, scratch probe): plain buffers ~24.5 KB per frame (decoder
+        10.5 + workspace 10 + x 4) + 0.55 MB ops scratch, measured VmHWM
+        delta 0.3 MB (reuses heap already resident); net RSS delta
+        124 / 154 / 204 MB (0.48 MB per frame + ~97 MB fixed), VmHWM delta
+        129 / 188 / 299 MB (1.0 MB per frame). Both paths loaded: +118.8 MB
+        of plain decoder weights until 6.5. Tests
+        `TestKokoroStageCDecoderPlainTinyParity`,
+        `TestKokoroRealStageCDecoderPlainParity` (opt-in),
+        `TestConcatChannelsMatchesLayer`. Suites cpu / avx2 / opencl
+        `TESTS=3285 ERRORS=0 FAILURES=0 IGNORED=5` (was 3282 / 4).
   - [ ] 6.3 Stage-C generator as plain code (noise convs, ups, AdaINResBlock1
         stacks, conv_post, then the existing exp / sin and iSTFT). Parity
         tiny + real dump; memory per frame on short real lines.
