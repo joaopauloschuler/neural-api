@@ -2564,6 +2564,81 @@ rather than acted on.
         GitHub download URLs (branch `main`) were not fetched; output files
         are overwritten without a question; the child program inherits
         stdin, so a program that reads stdin would consume REPL input.
+  Phase 6 — memory: stages B and C as plain Pascal code (plan agreed with the
+  user 2026-10-17; route B). Problem: a 26 x "Hello" REPL line (one chunk,
+  ~157 tokens, ~344 frames) ran out of memory on the user's machine. Measured
+  on the dev VM (real checkpoint, short lines, 2 GB cgroup cap): the stage-C
+  generator holds ~32 MB per frame (~45 MB at the peak) against ~0.27 MB per
+  frame for the Python `kokoro` package (FP32, `torch.no_grad()`, eager
+  freeing; it does not split text further than we do). Cause: every layer of
+  the stage nets keeps its own buffers (per-conv im2col `FInputPrepared`,
+  `FBiasOutput`, `FOutputRaw` + `FOutput`, padded `FInputCopy`), and the stage
+  nets are never released in `Synthesize`. Stage B is ~0.29 MB per frame,
+  the decoder ~0.44 MB per frame.
+  User decisions: rewrite stages B and C (prosody F0/N predictor, decoder,
+  generator) as plain Pascal code on `TNNetVolume` buffers with a few reused
+  buffers, like PyTorch eager mode; stage A stays a `TNNet`; do not change
+  `TNNet` much; do NOT remove working TNNet layers (`TNNetConv1DLinear`,
+  `TNNetDeconv1DLinear`, per-channel `TNNetSnake` stay, with their tests);
+  CPU only for now (`--gpu` then covers stage A only).
+  Goal: memory per frame close to Python's ~0.27 MB (report the ratio), peak
+  for the 26 x "Hello" line near Python's ~1.2 GB, audio unchanged (parity
+  with the existing torch dumps at today's tolerances).
+  Finding (2026-10-17, read-only check + scratch program): the conv math can
+  be reused without touching neuralnetwork.pas/neuralvolume.pas: a tile im2col
+  gather (new) + `TNNetVolume.DotProductsTiled` + bias `Add` matched
+  `TNNetConv1DLinear` with max abs diff 0 on every Kokoro conv shape; scratch
+  for the widest generator conv (128 ch, k11) is 192 KiB per thread at 32
+  positions per tile, independent of length (today ~920 KB per frame per such
+  layer). Reusable as is: `NeuralPerChannelMeanInvStd` + `MulChannels` /
+  `AddToChannels` (instance norm with the style folded into scale and shift),
+  the elementwise class procedures (LeakyRelu, Add, Mul, MulAdd, Sigmoid,
+  Tanh, Sin), the neuralaudio host steps, the thread pool (`fNTL`).
+  Prior art: `RunEnCodecConv` (neuralpretrained.pas) already does a host
+  im2col conv; the new routines go in one reusable place so EnCodec can move
+  to them later (no second copy).
+  Every task: one Opus agent at a time; parity tests; the 2 GB cgroup cap
+  (`tests/run_suite_capped.sh`, `systemd-run ... MemoryMax=2G`); no real-size
+  forwards on the dev VM (short real lines only); before/after memory numbers;
+  commit per task.
+  - [ ] 6.1 Plain-volume ops, reusable (not Kokoro-specific), CPU, threaded
+        over time tiles with per-thread scratch allocated once (never inside
+        the per-tile work): 1D conv with stride / dilation / zero padding
+        (tile gather + `DotProductsTiled` + bias), pointwise conv, dense
+        transposed 1D conv (GEMM + a scatter written in this code, not
+        extracted from `TNNetDeconvolution`), depthwise transposed 1D conv
+        (k3 s2 p1 op1, groups = C), nearest x2 upsample, reflect pad, instance
+        norm + style affine, Snake per channel, LeakyReLU, residual sum,
+        bidirectional LSTM keeping only h and c. Unit tests against the
+        existing layers on small random cases (exact where the arithmetic
+        order is the same).
+  - [ ] 6.2 Stage-C decoder as plain code: its weights loaded once into
+        plain volumes owned by `TNNetKokoro` (concatenated [Cout][K][Cin]
+        conv rows; no owner net), the style projections reused
+        (`LoadKokoroStyleFc`; split a scale/shift routine out of
+        `WriteStyleIntoChannelAffine` if useful). Parity on the tiny fixture
+        and the real dump (opt-in heavy test). The old net path stays until
+        6.5. Measure memory per frame.
+  - [ ] 6.3 Stage-C generator as plain code (noise convs, ups, AdaINResBlock1
+        stacks, conv_post, then the existing exp / sin and iSTFT). Parity
+        tiny + real dump; memory per frame on short real lines.
+  - [ ] 6.4 Stage B as plain code (shared bi-LSTM, F0 / N AdainResBlk1d
+        branches with the depthwise-transposed upsample, projections). Parity
+        tiny + real.
+  - [ ] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
+        release stage A's net after use and drop its spare weight copies
+        (`FlushWeightCache` after `SetTrainable(false)`); remove the obsolete
+        Kokoro stage B / C net code (builders, loaders into layers,
+        Prepare/Release/Run, the stage B / C OpenCL arming) but keep every
+        TNNet layer; rewrite the stage B / C parity tests on the new code.
+        Full cpu / avx2 / opencl suites.
+  - [ ] 6.6 Measure and document: memory per frame and peak against Python
+        (same short real lines under the cap, extrapolated to the 26 x
+        "Hello" line); update examples/KokoroTTS/README.md (Memory section,
+        `--gpu` = stage A only), examples/README.md, and the code examples:
+        `SimpleKokoroTTS.lpr` (speak a long multi-sentence text to show it
+        fits), `KokoroTTS.lpr` (`--gpu` help text, `--stats`), the README's
+        "From your own code" snippet; lazbuild -B every mode.
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
