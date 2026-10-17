@@ -22,7 +22,7 @@ uses
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
   TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
   TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun, TestNeuralReduction,
-  TestNeuralBytePrediction, TestNeuralG2P{$IFDEF OpenCL}, neuralopencl{$ENDIF};
+  TestNeuralBytePrediction, TestNeuralG2P, TestNeuralPlainOps{$IFDEF OpenCL}, neuralopencl{$ENDIF};
 
 type
   TMyTestRunner = class(TTestRunner)
