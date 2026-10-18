@@ -1037,6 +1037,9 @@ type
     // input_size != hidden_size): input and all twelve weight gradients.
     procedure TestLSTMCellInputWidthGradientCheck;
     procedure TestLSTMCellInputWidthSerializationRoundTrip;
+    // Inference-only: no gradient buffers, two cache rows, same forward;
+    // trainable again: buffers back and the weight gradients still check.
+    procedure TestLSTMCellInferenceOnlyBuffers;
     procedure TestGRUCellInputGradientCheck;
     procedure TestGRUCellWeightGradientCheck;
     procedure TestGRUCellSerializationRoundTrip;
@@ -39797,6 +39800,119 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetLSTMCell.Create(3), 'LSTMCell(3) on width 5', 4, 1, 5, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellInferenceOnlyBuffers;
+const
+  SeqLen = 5; InputDepth = 4; Hidden = 3;
+  // Per-step caches (7 x SeqLen rows) beyond the two inference rows, the three
+  // backward carries and the gradient accumulators (8 projections, 4 biases).
+  csTrainOnlyBytes = (7 * (SeqLen - 2) * Hidden + 3 * Hidden +
+    4 * Hidden * InputDepth + 4 * Hidden * Hidden + 4 * Hidden) * 4;
+var
+  NN, ChainedNN: TNNet;
+  Input, Desired, TrainedOutput: TNNetVolume;
+  L, ChainedL: TNNetLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  TrainableBytes, InferenceBytes: int64;
+  i, n: integer;
+
+  procedure SeedWeights(Cell: TNNetLSTMCell);
+  var NeuronPos, WeightPos: integer;
+  begin
+    for NeuronPos := 0 to 11 do
+      for WeightPos := 0 to Cell.Neurons[NeuronPos].Weights.Size - 1 do
+        Cell.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+          Sin(NeuronPos * 1.3 + WeightPos * 0.7) * 0.25;
+  end;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure AssertOutputEquals(const Msg: string; Output: TNNetVolume);
+  var k: integer;
+  begin
+    AssertEquals(Msg + ' size', TrainedOutput.Size, Output.Size);
+    for k := 0 to TrainedOutput.Size - 1 do
+      AssertEquals(Msg + ' at ' + IntToStr(k), TrainedOutput.Raw[k],
+        Output.Raw[k], 0);
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  ChainedNN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InputDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Hidden);
+  TrainedOutput := TNNetVolume.Create();
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InputDepth, 1));
+    L := TNNetLSTMCell.Create(Hidden);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    SeedWeights(L);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    NN.Compute(Input);
+    TrainedOutput.Copy(L.Output);
+    TrainableBytes := L.NonWeightBytes();
+
+    NN.SetTrainable(false);
+    InferenceBytes := L.NonWeightBytes();
+    AssertTrue('inference-only drops the training buffers (' +
+      IntToStr(TrainableBytes) + ' -> ' + IntToStr(InferenceBytes) + ')',
+      TrainableBytes - InferenceBytes >= csTrainOnlyBytes);
+    NN.Compute(Input);
+    AssertOutputEquals('inference-only forward', L.Output);
+
+    // Chained before AddLayer: never sized for training in the first place.
+    ChainedNN.AddLayer(TNNetInput.Create(SeqLen, 1, InputDepth, 1));
+    ChainedL := TNNetLSTMCell.Create(Hidden);
+    ChainedL.SetTrainable(false);
+    ChainedNN.AddLayer(ChainedL);
+    SeedWeights(ChainedL);
+    AssertEquals('chained inference-only bytes', InferenceBytes,
+      ChainedL.NonWeightBytes());
+    ChainedNN.Compute(Input);
+    AssertOutputEquals('chained inference-only forward', ChainedL.Output);
+
+    NN.SetTrainable(true);
+    AssertEquals('trainable again restores the buffers', TrainableBytes,
+      L.NonWeightBytes());
+    NN.Compute(Input);
+    AssertOutputEquals('trainable again forward', L.Output);
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+        AssertTrue('LSTMCell trainable-again weight gradient neuron ' +
+          IntToStr(n) + '[' + IntToStr(i) + '] num=' +
+          FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free; ChainedNN.Free; Input.Free; Desired.Free; TrainedOutput.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGRUCellInputGradientCheck;

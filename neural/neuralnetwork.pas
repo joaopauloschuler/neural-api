@@ -10755,11 +10755,16 @@ type
       procedure AfterWeightUpdate(); override;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
+      // Trainable: one cache row per timestep, gradient buffers sized.
+      // Inference-only: two alternating cache rows, gradient buffers empty.
+      procedure SizeSequenceCaches();
     public
       constructor Create(); overload; override;
       // pHidden = 0 keeps the input Depth (shape-preserving).
       constructor Create(pHidden: integer); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -19694,12 +19699,15 @@ type
       // Shared engine behind AddBidirectionalLSTM/AddBidirectionalGRU (UseGRU
       // picks the cell class). CellsReadInputWidth (LSTM only): TNNetLSTMCell.Create(
       // Hidden) cells read any input width as nn.LSTM does, no projection inserted.
+      // pTrainable=false builds every layer inference-only (no training buffers).
       function AddBidirectionalRecurrentStack(Hidden, NumLayers: integer;
         Bidirectional, UseGRU: boolean;
-        CellsReadInputWidth: boolean = false): TNNetLayer;
+        CellsReadInputWidth: boolean = false;
+        pTrainable: boolean = true): TNNetLayer;
       function AddBidirectionalLSTM(Hidden, NumLayers: integer;
         Bidirectional: boolean;
-        CellsReadInputWidth: boolean = false): TNNetLayer;
+        CellsReadInputWidth: boolean = false;
+        pTrainable: boolean = true): TNNetLayer;
       // MULTI-LAYER and/or BIDIRECTIONAL stack of classic GRU cells
       // (TNNetGRUCell), the GRU twin of AddBidirectionalLSTM - same torch
       // nn.GRU(num_layers, bidirectional) semantics, same [forward ; backward]
@@ -70919,16 +70927,59 @@ begin
         FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
       end;
   end;
-  FIg.ReSize(FOutput.SizeX, 1, Depth); FFg.ReSize(FOutput.SizeX, 1, Depth);
-  FGg.ReSize(FOutput.SizeX, 1, Depth); FOg.ReSize(FOutput.SizeX, 1, Depth);
-  FC.ReSize(FOutput.SizeX, 1, Depth);  FTanhC.ReSize(FOutput.SizeX, 1, Depth);
-  FHt.ReSize(FOutput.SizeX, 1, Depth);
   FH.ReSize(1, 1, Depth); FHprev.ReSize(1, 1, Depth);
-  FGc.ReSize(1, 1, Depth); FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
-  for ii := 0 to 3 do FGradW[ii].ReSize(Depth, 1, InputDepth);
-  for ii := 4 to 7 do FGradW[ii].ReSize(Depth, 1, Depth);
-  for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
+  SizeSequenceCaches();
   InitDefault();
+end;
+
+function TNNetLSTMCell.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if Assigned(FPrevLayer) then
+  begin
+    SetOutputErrorSize(FOutput);
+    SizeSequenceCaches();
+  end;
+end;
+
+function TNNetLSTMCell.NonWeightBytes(): int64;
+var ii: integer;
+begin
+  Result := inherited NonWeightBytes() +
+    VolumeBytes(FIg) + VolumeBytes(FFg) + VolumeBytes(FGg) + VolumeBytes(FOg) +
+    VolumeBytes(FC) + VolumeBytes(FTanhC) + VolumeBytes(FHt) +
+    VolumeBytes(FH) + VolumeBytes(FHprev) +
+    VolumeBytes(FGc) + VolumeBytes(FGh) + VolumeBytes(FGhNext);
+  for ii := 0 to 7 do Result := Result + VolumeBytes(FGradW[ii]);
+  for ii := 0 to 3 do Result := Result + VolumeBytes(FGradB[ii]);
+end;
+
+// The forward reads only the cache row of step t-1 (c_{t-1}); everything else
+// in the per-step caches and the gradient buffers serves Backpropagate.
+procedure TNNetLSTMCell.SizeSequenceCaches();
+var CacheRows, Depth, InputDepth, ii: integer;
+begin
+  Depth := FOutput.Depth;
+  InputDepth := FPrevLayer.FOutput.Depth;
+  if FIsTrainable then CacheRows := FOutput.SizeX
+  else CacheRows := Min(FOutput.SizeX, 2);
+  FIg.ReSize(CacheRows, 1, Depth); FFg.ReSize(CacheRows, 1, Depth);
+  FGg.ReSize(CacheRows, 1, Depth); FOg.ReSize(CacheRows, 1, Depth);
+  FC.ReSize(CacheRows, 1, Depth);  FTanhC.ReSize(CacheRows, 1, Depth);
+  FHt.ReSize(CacheRows, 1, Depth);
+  if FIsTrainable then
+  begin
+    FGc.ReSize(1, 1, Depth); FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
+    for ii := 0 to 3 do FGradW[ii].ReSize(Depth, 1, InputDepth);
+    for ii := 4 to 7 do FGradW[ii].ReSize(Depth, 1, Depth);
+    for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
+  end
+  else
+  begin
+    FGc.ReSize(0, 0, 0); FGh.ReSize(0, 0, 0); FGhNext.ReSize(0, 0, 0);
+    for ii := 0 to 7 do FGradW[ii].ReSize(0, 0, 0);
+    for ii := 0 to 3 do FGradB[ii].ReSize(0, 0, 0);
+  end;
 end;
 
 {$IFDEF OpenCL}
@@ -70954,7 +71005,8 @@ procedure TNNetLSTMCell.ComputeOpenCL();
 var
   StartTime: double;
   Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev, Wsrc: TNNetVolume;
-  SeqLen, Depth, t, d, baseT, baseX, g4d, idx, idxPrev, rowOfs: integer;
+  SeqLen, Depth, t, d, baseX, g4d, idx, idxPrev, rowOfs: integer;
+  CacheRows, CacheBase, PrevCacheBase: integer;
   SeqLenM1, DepthM1, Depth2, Depth3, InputDepth, MaxInputPos: integer;
   g, outd, inn, m, srcBase: integer;
   accI, accF, accG, accO, iv, fv, gv, ovv, cPrev, cv, tc, hv: TNeuralFloat;
@@ -71007,17 +71059,19 @@ begin
   FGpuWeightsDirty := false;
 
   // CPU: add bias, the per-step recurrent projection and the gate recurrence.
+  CacheRows := FC.SizeX;
   FHprev.Fill(0);
   HprevPtr := FHprev.GetRawPtr(0, 0);
   for t := 0 to SeqLenM1 do
   begin
     OutPtr := FOutput.GetRawPtr(t, 0);
-    baseT := t * Depth;
+    CacheBase := (t mod CacheRows) * Depth;
+    PrevCacheBase := ((t + CacheRows - 1) mod CacheRows) * Depth;
     baseX := t * g4d;
     rowOfs := 0;
     for d := 0 to DepthM1 do
     begin
-      idx := baseT + d; idxPrev := idx - Depth;
+      idx := CacheBase + d; idxPrev := PrevCacheBase + d;
       WhiR := Whi.GetRawPtr(rowOfs); WhfR := Whf.GetRawPtr(rowOfs);
       WhgR := Whg.GetRawPtr(rowOfs); WhoR := Who.GetRawPtr(rowOfs);
       ixBase := baseX + d;
@@ -71057,7 +71111,8 @@ const
 var
   StartTime: double;
   Wii, Wif, Wig, Wio, Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, j, baseT, idx, idxPrev, rowOfs: integer;
+  SeqLen, Depth, t, d, j, idx, idxPrev, rowOfs: integer;
+  CacheRows, CacheBase, PrevCacheBase: integer;
   SeqLenM1, DepthM1, InputDepth, InputRowOfs: integer;
   accI, accF, accG, accO, iv, fv, gv, ovv, cPrev, cv, tc, hv: TNeuralFloat;
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
@@ -71086,18 +71141,20 @@ begin
   InputDepth := Prev.Depth;
   // FHprev holds the FROZEN h_{t-1} read by every gate of step t (reading FH
   // mid-loop would leak a freshly-updated channel into a later channel's gate).
+  CacheRows := FC.SizeX;
   FHprev.Fill(0);
   HprevPtr := FHprev.GetRawPtr(0, 0);
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
-    baseT := t * Depth;
+    CacheBase := (t mod CacheRows) * Depth;
+    PrevCacheBase := ((t + CacheRows - 1) mod CacheRows) * Depth;
     rowOfs := 0;
     InputRowOfs := 0;
     for d := 0 to DepthM1 do
     begin
-      idx := baseT + d; idxPrev := idx - Depth;
+      idx := CacheBase + d; idxPrev := PrevCacheBase + d;
       WiiR := Wii.GetRawPtr(InputRowOfs); WifR := Wif.GetRawPtr(InputRowOfs);
       WigR := Wig.GetRawPtr(InputRowOfs); WioR := Wio.GetRawPtr(InputRowOfs);
       WhiR := Whi.GetRawPtr(rowOfs); WhfR := Whf.GetRawPtr(rowOfs);
@@ -85196,7 +85253,8 @@ end;
 // where layer k>0 has input_size = num_directions*hidden.
 function TNNet.AddBidirectionalRecurrentStack(Hidden, NumLayers: integer;
   Bidirectional, UseGRU: boolean;
-  CellsReadInputWidth: boolean = false): TNNetLayer;
+  CellsReadInputWidth: boolean = false;
+  pTrainable: boolean = true): TNNetLayer;
 var
   SourceLayer, ForwardCell, ReverseCell: TNNetLayer;
   LayerIdx, NumLayersM1: integer;
@@ -85207,6 +85265,13 @@ var
     if UseGRU then Result := TNNetGRUCell.Create()
     else if CellsReadInputWidth then Result := TNNetLSTMCell.Create(Hidden)
     else Result := TNNetLSTMCell.Create();
+    if not pTrainable then Result.SetTrainable(false);
+  end;
+
+  function MakeProjection(): TNNetLayer;
+  begin
+    Result := TNNetPointwiseConvLinear.Create(Hidden);
+    if not pTrainable then Result.SetTrainable(false);
   end;
 
 begin
@@ -85235,7 +85300,7 @@ begin
     // Forward direction: project the incoming Depth to Hidden (if needed) then a
     // left-to-right cell over it.
     if ShouldProject then
-      AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), SourceLayer);
+      AddLayerAfter(MakeProjection(), SourceLayer);
     ForwardCell := AddLayer(MakeCell());
     if not Bidirectional then
     begin
@@ -85246,7 +85311,7 @@ begin
     // the t-th reverse output aligns with the t-th forward output.
     AddLayerAfter(TNNetFlipX.Create(), SourceLayer);
     if ShouldProject then
-      AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+      AddLayer(MakeProjection());
     AddLayer(MakeCell());
     ReverseCell := AddLayer(TNNetFlipX.Create());
     // torch ordering: [forward ; backward] along Depth -> output Depth 2*Hidden.
@@ -85255,10 +85320,11 @@ begin
 end;
 
 function TNNet.AddBidirectionalLSTM(Hidden, NumLayers: integer;
-  Bidirectional: boolean; CellsReadInputWidth: boolean = false): TNNetLayer;
+  Bidirectional: boolean; CellsReadInputWidth: boolean = false;
+  pTrainable: boolean = true): TNNetLayer;
 begin
   Result := AddBidirectionalRecurrentStack(Hidden, NumLayers, Bidirectional,
-    {UseGRU=}False, CellsReadInputWidth);
+    {UseGRU=}False, CellsReadInputWidth, pTrainable);
 end;
 
 function TNNet.AddBidirectionalGRU(Hidden, NumLayers: integer;

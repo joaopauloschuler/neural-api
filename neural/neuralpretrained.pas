@@ -51775,7 +51775,7 @@ begin
     KokoroStageAStyleChannel + Config.StyleDim, Config.PLBert.HiddenSize),
     InputLayer);
   Result.BertEncoder := TailNet.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenDim));
+    TNNetPointwiseConvLinear.Create(Config.HiddenDim).SetTrainable(false));
   // DurationEncoder: n_layer x (bi-LSTM, AdaLayerNorm), the style
   // concatenated before every bi-LSTM and at the end.
   MaxLayerPos := Config.NumLayers - 1;
@@ -51787,7 +51787,7 @@ begin
   for LayerPos := 0 to MaxLayerPos do
   begin
     Result.DurationLSTMs[LayerPos] := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
-      {Bidirectional=}true, {CellsReadInputWidth=}true);
+      {Bidirectional=}true, {CellsReadInputWidth=}true, {pTrainable=}false);
     Result.DurationNorms[LayerPos] := TailNet.AddLayer(
       TNNetTokenLayerNorm.Create(1e-5));
     Result.DurationConcats[LayerPos + 1] := TailNet.AddLayer(
@@ -51796,9 +51796,9 @@ begin
   Result.DurationEncoder := Result.DurationConcats[Config.NumLayers];
   // Duration head: bi-LSTM, Linear hidden_dim -> max_dur, sigmoid.
   Result.DurationLSTM := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
-    {Bidirectional=}true, {CellsReadInputWidth=}true);
+    {Bidirectional=}true, {CellsReadInputWidth=}true, {pTrainable=}false);
   Result.DurationProj := TailNet.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.MaxDur));
+    TNNetPointwiseConvLinear.Create(Config.MaxDur).SetTrainable(false));
   Result.DurationSigmoid := TailNet.AddLayer(TNNetSigmoid.Create());
   // TextEncoder: embedding, n_layer x (Conv1d, LayerNorm, LeakyReLU 0.2),
   // bi-LSTM.
@@ -51813,12 +51813,13 @@ begin
   for LayerPos := 0 to MaxLayerPos do
   begin
     Result.TextConvs[LayerPos] := TailNet.AddLayer(TNNetConv1DLinear.Create(
-      Config.HiddenDim, Config.TextEncoderKernelSize, TextPadding, 1));
+      Config.HiddenDim, Config.TextEncoderKernelSize, TextPadding,
+      1).SetTrainable(false));
     Result.TextNorms[LayerPos] := TailNet.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
     Result.TextBlocks[LayerPos] := TailNet.AddLayer(TNNetLeakyReLU.Create(0.2));
   end;
   Result.TextLSTM := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
-    {Bidirectional=}true, {CellsReadInputWidth=}true);
+    {Bidirectional=}true, {CellsReadInputWidth=}true, {pTrainable=}false);
   TailNet.AddLayer(TNNetDeepConcat.Create([Result.DurationEncoder,
     Result.DurationSigmoid, Result.TextLSTM]));
   TailNet.SetTrainable(false);
@@ -53106,7 +53107,15 @@ begin
 end;
 
 procedure TNNetKokoro.PrepareStageANet(NN: TNNet);
+var
+  LayerPos, MaxLayerPos: integer;
 begin
+  // The links built each layer's weight caches before the net went
+  // inference-only; a low-memory layer drops them here, and EnableOpenCL
+  // below rebuilds or shares the ones an OpenCL layer reads.
+  MaxLayerPos := NN.GetLastLayerIdx();
+  for LayerPos := 0 to MaxLayerPos do
+    NN.Layers[LayerPos].FlushWeightCache();
   PrepareInferenceThreads(NN, FParallel, FMaxThreads);
   NN.ShareHostOutputsByLiveness := FShareHostOutputs;
   {$IFDEF OpenCL}
