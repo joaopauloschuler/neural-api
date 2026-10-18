@@ -73,6 +73,36 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] BUG: `SetTrainable(False)` then `SetTrainable(True)` did not give back a
+      trainable layer. `TNNetLayer.SetTrainable(False)` shrinks `FOutputError` /
+      `FOutputErrorDeriv` to 1x1x1; the True branch only set flags, so nothing
+      regrew them. Effects: `TNNetFullConnect.BackpropagateCPU` wrote past the
+      end of both buffers, convolutions kept the `FCalculatePrevLayerError` flag
+      and `FPrevLayerErrorPadded` size they cached at wiring time, a layer
+      flipped from low-memory inference kept its 1x1x1 concatenated weight
+      caches (wrong output), and a `TNNetInput(pError=1)` lost its input
+      gradient. Adam moments are freed by the False flip and are not restored:
+      run `InitAdam` again after the True flip.
+  - [x] Part 1 (Done 2026-10-18, commit 4c39cee9): `TNNetLayer.SetTrainable(True)` on an
+        inference-only layer regrows the error buffers to `FOutput` (a class that
+        uses `SetOutputErrorSizeNoDeriv` keeps its deriv buffer at 1x1x1) and runs
+        `AfterWeightUpdate` when low-memory mode was on. Quantized and
+        weight-borrowing layers (`HasInferenceOnlyWeights`) stay inference-only.
+        `TNNetInput` regrows its buffers when `FStruct[3]=1`. `TNNet.SetTrainable`
+        then runs the new `TNNet.RefreshPrevLayerErrorCaches` (conv family:
+        flag + padded error buffer; `EnableInputGradient` uses it too). Size
+        checks added in `ComputeOutputErrorForIdx`, `ComputeErrorDeriv`,
+        `TNNetFullConnect.Backpropagate` and `TNNetFullConnectDiff.Backpropagate`.
+        New tests `TestSetTrainableRoundTripMatchesTwin` (8 nets x 4 flip modes vs
+        a never-flipped twin, 1e-6) and `TestSetTrainableKeepsInferenceOnlyWeights`.
+        Suites green: cpu 3283 (+1 run alone), avx2 3284, opencl 3284; 0 errors,
+        0 failures. Not done in part 1: re-arming OpenCL after a flip.
+  - [ ] Part 2: the 32 layers whose `SetTrainable` override only frees
+        (`if not pTrainable then FreeBackpropScratch()`), plus AconC, MetaAconC,
+        DyT, PReLUChannel and SReLU, lose backprop scratch that the True flip
+        does not size again. Add a per-class
+        `SizeBackpropScratch` helper called from `SetPrevLayer` and from the
+        `SetTrainable` True branch.
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
