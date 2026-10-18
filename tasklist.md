@@ -2829,6 +2829,56 @@ rather than acted on.
         dictionaries split or spell 6 story words). lazbuild -B Default /
         Debug / Release of both .lpi; `--selftest` OK. Script:
         scratchpad pyk/pymem.py (written for this task).
+  Phase 7 — stage A memory, then generator speed (plan agreed with the
+  user 2026-10-18, after a read-only diagnosis). Measured on the dev VM
+  (26 x "Hello", 157 tokens, 415 frames, 1 core, 2 GB cap): the peak
+  (708 MB in the probe, 724 MB in KokoroTTS) is reached during the stage-A
+  compute; stage A holds 260 MB = ~98 MB fixed + ~0.96 MB per token +
+  5.2e-4 * T^2 MB (one T x T score matrix per attention head). Largest
+  holders: the 51 TNNetPointwiseConvLinear layers (`FOutputRaw` +
+  `FBiasOutput`, 120 MB), the 10 TNNetLSTMCell (`FGradW` / `FGradB` training
+  accumulators allocated when not trainable, 46 MB), the 3 TNNetConv1DLinear
+  (own weight caches, 39 MB), attention 19 MB. The stage-A owner also keeps
+  ~35 MB of LSTM `FGradW` for the whole session; ~89 MB of heap freed during
+  load is not reused. The generator peaks 146 MB below stage A. Time
+  (ours / Python, s): stage A 2.2-3.1 / 0.56, decoder ~1.0 / 0.39,
+  generator 14-16 / 9.3. The generator (~254 GMAC of 1D convs) runs at
+  14-18 GMAC/s against PyTorch's ~27: `TNNetVolume.DotProductsTiled` computes
+  each output as its own dot product (not register-blocked).
+  User rules: adding TNNet layers is fine; small changes inside TNNet layers
+  are fine when required; do not remove working layers; CPU only; pure
+  Pascal. One Opus agent at a time; test and commit after each task.
+  - [ ] 7.1 Build ALBERT's shared layer once and run it 12 times, instead of
+        12 unrolled copies in the stage-A net (`neuralpretrained.pas`:
+        stage-A builder and `RunStageA`). Expected: ~150 MB less at 157 tokens
+        (per-token buffers ~112, attention T^2 ~13, out-projection weight
+        caches ~26), ~500 MB less on a 510-phoneme chunk, build -0.3 s.
+        Parity: the existing stage-A tests must still pass at their current
+        tolerances. Measure the 26 x "Hello" line peak (one run).
+  - [ ] 7.2 Free what stage A holds and never reads:
+        (a) TNNetLSTMCell allocates `FGradW` / `FGradB` and the backprop-only
+        per-step sequences only when the layer is trainable (small change in
+        `neuralnetwork.pas`; training must behave exactly as before; add a
+        test that a non-trainable LSTM holds no gradient buffers);
+        (b) drop the weight caches on the stage-A borrower layers the
+        low-memory path never reads (out-projections, bert_encoder, the
+        text-encoder convs): first try `FlushWeightCache` after
+        `PrepareStageA`; if they come back, find why (`AfterWeightUpdate`)
+        and make the small layer fix. Expected: ~36 MB off the load RSS and
+        ~70-100 MB off the line peak. Measure load + the 26 x line (one run).
+  - [ ] 7.3 Measure and decide: the 26 x "Hello" line and the SimpleKokoroTTS
+        story, and if it fits under the 2 GB cap, one full 510-phoneme chunk;
+        compare against the Phase 6 Python numbers. Update the README Memory
+        section. Then report to the user for two decisions: (i) a lean
+        inference-only pointwise layer (new TNNet layer, used only by Kokoro
+        stage A, without the per-position bias copy and the separate raw
+        output), (ii) investigating the ~89 MB of load heap not reused.
+  - [ ] 7.4 Generator speed: a register-blocked FP32 matrix-multiply routine
+        (new routine in `neuralvolume.pas`, called from `neuralplainops`;
+        asm must be PIC-safe; scalar fallback; not bit-identical, which is
+        fine). Do not change `DotProductsTiled` itself. Expected: generator
+        14 -> ~7-9 s, decoder -0.5 s on 1 core. Parity tests vs the current
+        conv; all three suites; one timed run of the 26 x line.
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
