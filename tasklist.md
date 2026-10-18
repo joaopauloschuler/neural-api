@@ -2727,7 +2727,7 @@ rather than acted on.
         (same gate as `TestKokoroRealStageBParity`: snapshot + dump present).
         Suites cpu / avx2 / opencl `TESTS=3291 ERRORS=0 FAILURES=0
         IGNORED=6` (was 3289); lazbuild -B KokoroTTS builds.
-  - [ ] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
+  - [x] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
         release stage A's net after use and drop its spare weight copies
         (`FlushWeightCache` after `SetTrainable(false)`); rewrite the stage
         B / C parity tests on the new code. Full cpu / avx2 / opencl suites.
@@ -2774,6 +2774,29 @@ rather than acted on.
         `RunStageA`); `WriteStyleIntoChannelAffine` (stage A uses it);
         `LoadKokoroStyleFc`; loaders and voice packs; neuralaudio host
         steps; tools/make_kokoro82m_fixture.py.
+        Done 2026-10-17 (7e5929da switch, 6a9c17fd removal + tests,
+        d48c6ff4 stage-A flush): `Synthesize` runs stage A (net), frees
+        StageANet (`ReleaseStageA`), then plain B, decoder, harmonic
+        spectrum, plain generator. The REMOVE list is gone (also
+        `ArmStageNet`, folded into `PrepareStageA`); `ShareOpenCLOutputs`
+        kept (stage A reads it). The plain blocks read and own their style
+        fc volumes; `TKokoroPlainStage` holds `OnCheckpoint` (the decoder now
+        reports dec_encode / dec_decode<i>). The plain entry points and
+        properties took the old names (`RunStageB` / `RunStageCDecoder` /
+        `RunStageCGenerator`, `StageB` / `StageCDecoder` /
+        `StageCGenerator`). `--gpu` / `EnableOpenCL` = stage A only.
+        Stage A: `FlushWeightCache` per owner layer after load: load RSS
+        456 -> 442 MB; inference-only owner build skipped (load VmHWM = RSS,
+        no transient peak; the bi-LSTMs come from neuralnetwork.pas).
+        Real KokoroTTS, 26 x "Hello" (155 phonemes, 10.38 s audio), 2 GB
+        cap, 1 core: load 1.72 s / 462 MB, synthesis 30.19 s, peak RSS
+        724 MB (6.4 preview: 1265 MB). REPL, 2 lines: both written, peak
+        724 MB after each. Real heavy tests (one run each, cpu):
+        decoder dec_decode3 2.7e-6 rel., generator audio 8.4e-5 rel. /
+        phase 1.4e-4 (tolerance 5e-4 kept), chained dec_decode3 4.0e-6,
+        end to end audio max |diff| 0.102 (phases), peak 549 MB.
+        Suites cpu / avx2 / opencl `TESTS=3279 ERRORS=0 FAILURES=0
+        IGNORED=4` (was 3291 / 6: 12 net tests removed).
   - [ ] 6.6 Measure and document: memory per frame and peak against Python
         (same short real lines under the cap, extrapolated to the 26 x
         "Hello" line); update examples/KokoroTTS/README.md (Memory section,
