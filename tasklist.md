@@ -162,13 +162,34 @@ rather than acted on.
       depthwise / local-connect `BackpropagateAtOutputPos` and the circulant
       FFT helper are called from routines that apply). The next item is a
       related defect of a different shape.
-- [ ] BUG (awaits user decision, not fixed): `TNNetWeightStandardizationConv.Backpropagate`
+- [x] BUG: `TNNetWeightStandardizationConv.Backpropagate`
       (neural/neuralnetwork.pas ~100865) and `TNNetSpectralNormConv.Backpropagate`
       (~101080) remap the per-call delta increment AFTER `inherited Backpropagate`.
       Outside batch mode the inherited conv backprop
       (`BackpropagateFastTiledCPU`) has already applied and cleared the deltas,
       so the raw weights get the w_hat / w_eff gradient unmapped and the remap
       sees a zero increment. Batch mode is correct.
+      Done 2026-10-18 (430b02a4): worse than reported - the inherited step went
+      to the in-place standardised / scaled copy, which `RestoreRawFilters`
+      overwrote, so the raw weights never moved (only the bias did). Both
+      overrides now run the inherited backward with `FBatchUpdate` forced true,
+      remap, then call `UpdateWeights()` when not in batch mode and the output
+      error is non-zero (the inherited `MaxError > 0` guard). `TNNetConvolution`
+      is unchanged; the conv OpenCL backward is disabled, so both layers use the
+      CPU path. New tests `TestWeightStandardizationConvTrainsWithoutBatchUpdate`
+      and `TestSpectralNormConvTrainsWithoutBatchUpdate` (inertia 0 and 0.9;
+      step and next forward match batch + `UpdateWeights` within 1e-6 / 1e-5)
+      fail on the old code; `TestSpectralNormConvWeightGradientMatchesScaledConv`
+      adds the missing raw-weight check (constant-sigma, so against a plain conv
+      holding W/sigma, not finite differences). Scan of every `Backpropagate`
+      override in neural/ for delta work or weight restore after `inherited`
+      found no other layer with this shape. Suites green: cpu, avx2, opencl 3290
+      each, 0 errors, 0 failures.
+- [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
+      (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
+      (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
+      applies; its declaration comment calls this intended, but dL/dW =
+      (1/sigma) dL/dw_eff under the same constant-sigma rule.
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
