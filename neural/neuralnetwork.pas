@@ -100877,6 +100877,7 @@ var
   localNeuron: TNNetNeuron;
   PreD: TNNetVolume;
   SumDwHat, SumDwHatWHat, dwHat, gradRaw, InvNegLR: TNeuralFloat;
+  WasBatchUpdate, ShouldApplyStep: boolean;
 begin
   // Mirror the guard the inherited conv Backpropagate uses, so we only do the
   // (expensive) standardize / remap work on the LAST departing branch. The
@@ -100904,9 +100905,17 @@ begin
     // Run the optimized conv backprop with the STANDARDIZED filters: this gives
     // the correct input gradient (which uses w_hat) and accumulates
     // -LearningRate * dL/dw_hat into each neuron's Delta. It also cascades into
-    // the previous layer.
+    // the previous layer. It runs in batch mode so the w_hat delta is remapped
+    // below before any step; ShouldApplyStep mirrors the inherited MaxError > 0 guard.
+    WasBatchUpdate := FBatchUpdate;
+    ShouldApplyStep := (not WasBatchUpdate) and (FOutputError.GetMaxAbs() > 0);
     StandardizeFilters();
-    inherited Backpropagate();
+    FBatchUpdate := true;
+    try
+      inherited Backpropagate();
+    finally
+      FBatchUpdate := WasBatchUpdate;
+    end;
     RestoreRawFilters();
 
     // Remap the per-call Delta increment from the w_hat gradient to the RAW
@@ -100964,6 +100973,7 @@ begin
         end;
       end;
     end;
+    if ShouldApplyStep then UpdateWeights();
   end
   else
   begin
@@ -101092,6 +101102,7 @@ var
   NeuronCnt, MaxNeurons, WeightCnt, MaxWeights: integer;
   localNeuron: TNNetNeuron;
   InvSigma, dwEff: TNeuralFloat;
+  WasBatchUpdate, ShouldApplyStep: boolean;
 begin
   // Only do the (expensive) scale / remap work on the LAST departing branch.
   // The inherited Backpropagate re-tests this counter, so we only peek here.
@@ -101117,8 +101128,17 @@ begin
     // Run the optimized conv backprop with the SCALED filters: correct input
     // gradient (uses w_eff) and accumulates -LearningRate * dL/dw_eff into each
     // neuron's Delta. ScaleFilters re-estimates sigma (constant in backward).
+    // It runs in batch mode so the w_eff delta is rescaled below before any
+    // step; ShouldApplyStep mirrors the inherited MaxError > 0 guard.
+    WasBatchUpdate := FBatchUpdate;
+    ShouldApplyStep := (not WasBatchUpdate) and (FOutputError.GetMaxAbs() > 0);
     ScaleFilters();
-    inherited Backpropagate();
+    FBatchUpdate := true;
+    try
+      inherited Backpropagate();
+    finally
+      FBatchUpdate := WasBatchUpdate;
+    end;
     RestoreRawFilters();
 
     // Remap the per-call Delta increment from dL/dw_eff to dL/dW = (1/sigma) *
@@ -101142,6 +101162,7 @@ begin
         end;
       end;
     end;
+    if ShouldApplyStep then UpdateWeights();
   end
   else
   begin

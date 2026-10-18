@@ -47,6 +47,9 @@ type
       StepCnt, StepTokens, Window: integer; Int8KV: boolean;
       SoftCap, Tolerance: TNeuralFloat; const Override: TFusedSDPASplitOverride;
       ExpectedGpuForwards: integer): TFusedSDPASplitLaunch;
+    // Shared check for the reparameterised convs: one per-sample step moves the
+    // raw weights exactly as a batch-mode step flushed by UpdateWeights.
+    procedure CheckReparamConvTrainsWithoutBatchUpdate(pSpectral: boolean);
   published
     // Convolution numerical tests with known weights
     procedure TestConvolutionNumericalValues;
@@ -207,6 +210,7 @@ type
     procedure TestWeightStandardizationConvForward;
     procedure TestWeightStandardizationConvGradientCheck;
     procedure TestWeightStandardizationConvSerializationRoundTrip;
+    procedure TestWeightStandardizationConvTrainsWithoutBatchUpdate;
     procedure TestRectangularConvForwardShape;
     procedure TestRectangularConv1x3GradientCheck;
     procedure TestRectangularConv3x1GradientCheck;
@@ -228,6 +232,9 @@ type
     procedure TestSpectralNormSerializationRoundTrip;
     procedure TestSpectralNormConvForward;
     procedure TestSpectralNormConvInputGradientCheck;
+    // Raw-weight delta = (1/sigma) * the delta of a plain conv holding W/sigma.
+    procedure TestSpectralNormConvWeightGradientMatchesScaledConv;
+    procedure TestSpectralNormConvTrainsWithoutBatchUpdate;
     procedure TestSpectralNormConvSerializationRoundTrip;
     procedure TestSpectralNormDirectWeightWriteRecomputesSigma;
     procedure TestSpectralNormConvDirectWeightWriteRecomputesSigma;
@@ -58692,6 +58699,190 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.CheckReparamConvTrainsWithoutBatchUpdate(pSpectral: boolean);
+var
+  NetPerSample, NetBatch: TNNet;
+  ConvPerSample, ConvBatch: TNNetLayer;
+  Input, Desired: TNNetVolume;
+  InertiaCnt, NeuronCnt, i: integer;
+  Inertia, MaxMove, MaxDiff, MaxBiasDiff: TNeuralFloat;
+  LayerName: string;
+
+  function NewLayer(): TNNetLayer;
+  begin
+    if pSpectral then
+      Result := TNNetSpectralNormConv.Create(3, 3, 1, 1, 0, 20)
+    else
+      Result := TNNetWeightStandardizationConv.Create(3, 3, 1, 1);
+  end;
+
+begin
+  if pSpectral then LayerName := 'SpectralNormConv'
+  else LayerName := 'WeightStandardizationConv';
+  RandSeed := 616161;
+  Input := TNNetVolume.Create(4, 4, 2);
+  Desired := TNNetVolume.Create(4, 4, 3);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    for InertiaCnt := 0 to 1 do
+    begin
+      Inertia := 0.9 * InertiaCnt;
+      NetPerSample := TNNet.Create();
+      NetBatch := TNNet.Create();
+      try
+        NetPerSample.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+        ConvPerSample := NetPerSample.AddLayer(NewLayer());
+        NetBatch.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+        ConvBatch := NetBatch.AddLayer(NewLayer());
+        NetBatch.CopyWeights(NetPerSample);
+        NetPerSample.SetLearningRate(0.05, Inertia);
+        NetBatch.SetLearningRate(0.05, Inertia);
+        NetPerSample.SetBatchUpdate(false);
+        NetBatch.SetBatchUpdate(true);
+
+        NetPerSample.Compute(Input);
+        NetPerSample.Backpropagate(Desired);
+        NetBatch.Compute(Input);
+        NetBatch.Backpropagate(Desired);
+        // Batch mode has not stepped yet: its weights are still the start.
+        MaxMove := 0;
+        for NeuronCnt := 0 to ConvBatch.Neurons.Count - 1 do
+        begin
+          for i := 0 to ConvBatch.Neurons[NeuronCnt].Weights.Size - 1 do
+            MaxMove := Max(MaxMove, Abs(ConvPerSample.Neurons[NeuronCnt].Weights.Raw[i] -
+              ConvBatch.Neurons[NeuronCnt].Weights.Raw[i]));
+          AssertTrue(Format('%s neuron %d delta not cleared after the per-sample step',
+            [LayerName, NeuronCnt]),
+            ConvPerSample.Neurons[NeuronCnt].Delta.GetSumAbs() = 0);
+        end;
+        AssertTrue(Format('%s raw weights did not move without batch update (inertia %g)',
+          [LayerName, Inertia]), MaxMove > 1e-4);
+
+        NetBatch.UpdateWeights();
+        MaxDiff := 0;
+        MaxBiasDiff := 0;
+        for NeuronCnt := 0 to ConvBatch.Neurons.Count - 1 do
+        begin
+          for i := 0 to ConvBatch.Neurons[NeuronCnt].Weights.Size - 1 do
+            MaxDiff := Max(MaxDiff, Abs(ConvPerSample.Neurons[NeuronCnt].Weights.Raw[i] -
+              ConvBatch.Neurons[NeuronCnt].Weights.Raw[i]));
+          MaxBiasDiff := Max(MaxBiasDiff, Abs(ConvPerSample.Neurons[NeuronCnt].BiasWeight -
+            ConvBatch.Neurons[NeuronCnt].BiasWeight));
+        end;
+        AssertTrue(Format('%s per-sample vs batch weight step differ by %g (inertia %g)',
+          [LayerName, MaxDiff, Inertia]), MaxDiff <= 1e-6);
+        AssertTrue(Format('%s per-sample vs batch bias step differ by %g (inertia %g)',
+          [LayerName, MaxBiasDiff, Inertia]), MaxBiasDiff <= 1e-6);
+
+        // The next forward must read the stepped weights in both modes.
+        NetPerSample.Compute(Input);
+        NetBatch.Compute(Input);
+        MaxDiff := 0;
+        for i := 0 to ConvBatch.Output.Size - 1 do
+          MaxDiff := Max(MaxDiff, Abs(ConvPerSample.Output.Raw[i] - ConvBatch.Output.Raw[i]));
+        AssertTrue(Format('%s forward after the step differs by %g (inertia %g)',
+          [LayerName, MaxDiff, Inertia]), MaxDiff <= 1e-5);
+      finally
+        NetPerSample.Free;
+        NetBatch.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestWeightStandardizationConvTrainsWithoutBatchUpdate;
+begin
+  CheckReparamConvTrainsWithoutBatchUpdate(false);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralNormConvTrainsWithoutBatchUpdate;
+begin
+  CheckReparamConvTrainsWithoutBatchUpdate(true);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralNormConvWeightGradientMatchesScaledConv;
+const
+  cIters = 20;
+var
+  NetSpectral, NetPlain: TNNet;
+  SN: TNNetSpectralNormConv;
+  Plain: TNNetConvolutionLinear;
+  Input, Desired: TNNetVolume;
+  NeuronCnt, i: integer;
+  Sigma, InvSigma, Expected, MaxDiff, MaxDelta, MaxInputDiff: TNeuralFloat;
+begin
+  // sigma is constant w.r.t. the gradient, so dL/dW = (1/sigma) * dL/dw_eff,
+  // and dL/dw_eff is what a plain linear conv holding w_eff = W/sigma computes.
+  RandSeed := 626262;
+  NetSpectral := TNNet.Create();
+  NetPlain := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  Desired := TNNetVolume.Create(4, 4, 3);
+  try
+    NetSpectral.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    SN := TNNetSpectralNormConv.Create(3, 3, 1, 1, 0, cIters);
+    NetSpectral.AddLayer(SN);
+    NetPlain.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    Plain := TNNetConvolutionLinear.Create(3, 3, 1, 1);
+    NetPlain.AddLayer(Plain);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+    Sigma := TNNet.EstimateSpectralNorm(SN, cIters);
+    AssertTrue('SpectralNormConv sigma is positive', Sigma > 0.01);
+    InvSigma := 1.0 / Sigma;
+    for NeuronCnt := 0 to SN.Neurons.Count - 1 do
+    begin
+      Plain.Neurons[NeuronCnt].Weights.Copy(SN.Neurons[NeuronCnt].Weights);
+      Plain.Neurons[NeuronCnt].Weights.Mul(InvSigma);
+      Plain.Neurons[NeuronCnt].BiasWeight := SN.Neurons[NeuronCnt].BiasWeight;
+    end;
+    Plain.FlushWeightCache();
+    NetSpectral.SetLearningRate(1.0, 0.0);
+    NetPlain.SetLearningRate(1.0, 0.0);
+    NetSpectral.SetBatchUpdate(true);
+    NetPlain.SetBatchUpdate(true);
+
+    NetSpectral.Compute(Input);
+    NetSpectral.Layers[0].OutputError.Fill(0);
+    NetSpectral.Backpropagate(Desired);
+    NetPlain.Compute(Input);
+    NetPlain.Layers[0].OutputError.Fill(0);
+    NetPlain.Backpropagate(Desired);
+
+    MaxDiff := 0;
+    MaxDelta := 0;
+    for NeuronCnt := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[NeuronCnt].Delta.Size - 1 do
+      begin
+        Expected := Plain.Neurons[NeuronCnt].Delta.Raw[i] * InvSigma;
+        MaxDelta := Max(MaxDelta, Abs(Expected));
+        MaxDiff := Max(MaxDiff, Abs(SN.Neurons[NeuronCnt].Delta.Raw[i] - Expected));
+      end;
+    AssertTrue('SpectralNormConv raw-weight delta is non-trivial', MaxDelta > 1e-3);
+    AssertTrue(Format('SpectralNormConv raw-weight delta vs (1/sigma)*plain delta differ by %g (max %g)',
+      [MaxDiff, MaxDelta]), MaxDiff <= 1e-5 * Max(1.0, MaxDelta));
+    MaxInputDiff := 0;
+    for i := 0 to NetSpectral.Layers[0].OutputError.Size - 1 do
+      MaxInputDiff := Max(MaxInputDiff, Abs(NetSpectral.Layers[0].OutputError.Raw[i] -
+        NetPlain.Layers[0].OutputError.Raw[i]));
+    AssertTrue(Format('SpectralNormConv input gradient vs plain conv differ by %g',
+      [MaxInputDiff]), MaxInputDiff <= 1e-5);
+  finally
+    NetSpectral.Free;
+    NetPlain.Free;
+    Input.Free;
     Desired.Free;
   end;
 end;
