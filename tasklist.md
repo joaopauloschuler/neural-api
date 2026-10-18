@@ -4345,6 +4345,165 @@ rather than acted on.
           _h kernels) next to FP32 at the Qwen-Image shapes, to test whether
           the block kernel (10-11 TFLOPS of ~30) is bound by FP32 activation
           traffic (64 MB at 4096 tokens > 48 MB L2). Measurement only.
+- [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
+      calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
+      branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
+      (AnyJev L0 readout on any loaded decoder), stage 2 (Kev and Open-Jev: Qwen3.5 +
+      LoRA + a small head). Laya (ModernBERT encoder + decision head) is LATER, not in
+      this plan. One Opus agent per task, run serially, test + commit after each.
+      Decisions:
+      - Wire format = TypeSafe's `POST /v1/systemone` (OpenAPI 0.2.0 at
+        api.typesafe.ai/openapi.json). Request `{model, state, questions:{id:{type,
+        instructions, criteria}}}`; `state`/`instructions`/descriptions may be a
+        string, an object or an array. `choice.criteria` = name -> description map
+        (1..255, key order = option order, null description allowed);
+        `score.criteria` = ordered array of level descriptions (1..10, levels 0..n-1);
+        `noul.criteria` = optional `{true, false}`. Response `{model, answers, usage:
+        {input_tokens, output_tokens}}`; choice `{type, choice, probabilities (by
+        name), confidence}`; score `{type, score (= sum i*p_i), legend, probabilities
+        (keys "0".."n-1"), confidence}`; noul `{type, noul}` only. Validation errors
+        = HTTP 422 `{"detail":[{loc, msg, type}]}`; other errors `{"detail": str}`.
+        `box` questions and image `assets` are rejected (422).
+      - Confidence = Jev's published formulas on EVERY scorer, computed from the
+        probabilities only: choice `(p_max-1/n)/(1-1/n)`; score
+        `max(0, 1 - sum p_i|i-mode| / D)`, `D = (1/n) sum |i-(n-1)/2|`, mode = first
+        argmax; both 1.0 when n = 1; all-zero p -> uniform. Noul has no confidence.
+        Checks: score (0,0.57,0.43) -> 0.355; (0,0.95,0.05) -> 0.925.
+      - Rendering of object/array values (state, instructions, descriptions): Kev's
+        `api.render` (str/number/bool as text, list -> "- item" lines, dict ->
+        "key: value" lines, nested values indented). One renderer for all scorers.
+      - Special-token strings in caller text: rewrite `<|x|>` -> `<¦x¦>` before
+        tokenizing (Kev's rule), on every scorer. A general "specials as plain text"
+        tokenizer flag is a separate follow-up.
+      - ChatServer always registers `/v1/systemone`. Without `--decision-adapter` it
+        answers with AnyJev L0 on the loaded chat model (nothing extra is loaded).
+        With `--decision-adapter <dir>` the server merges the adapter, reads the head
+        and becomes decision-only: the chat endpoints return an error naming the
+        reason. ChatTerminal does not change.
+      - LoRA is merged in HF TENSOR space before the build (base + scale*B@A in FP32,
+        rounded once), so the importer's row permutations (rotate_half q/k, the
+        Qwen3.5 q/gate split, fused gate+up, fused z/b/a) apply unchanged and
+        int8/int4 quantization follows as usual. No live (unmerged) LoRA path.
+      - `head.pt` is read by `neuraltorchbin.pas` (extended for top-level scalar /
+        string metadata). No Python conversion step for users.
+      - Multi-question and multi-candidate scoring: prefill the shared prefix once,
+        then per branch `TruncateTo(PrefixLen)` + `RestoreStateFrom(checkpoint)`,
+        then feed the branch. Exact on attention-only and GatedDeltaNet hybrids; no
+        new attention masks, no per-token RoPE positions.
+      - AnyJev label prior: the content-free prior (states "N/A", "" and "[MASK]",
+        alpha 1.0) is the default. The running-mean batch prior (stateful across
+        requests) is a follow-up. AnyJev L1/L2 are out of scope (removed upstream in
+        0.3.0, and both need labelled data).
+      - GPT-AGI/OpenJev is not ported: AnyJev L0 covers it, and its first-token-only
+        label scoring is a correctness bug.
+      - Tests: pico fixtures with an HF/PyTorch float64 oracle made by
+        `tools/*_fixture.py` scripts in the `~/x` venv under the 2 GB cap, plus
+        model-free unit tests. Real-checkpoint checks run on the user's box.
+      Reference facts (research 2026-10-18):
+      - AnyJev L0 (`anyjev` 0.3.0 `readout.py`, `calibrate/permute.py`,
+        `calibrate/contextual.py`): system prompt "You are a decision function. You
+        will be given a state and one question. Reply with the answer label only: no
+        words, no punctuation, no explanation."; user message lines "State:", state
+        (or "(empty)"), "", "Question: <q>", then per kind: choice "Options:" + "A. opt"
+        lines + "Answer with the letter only."; score "Pick the level that applies (the
+        levels are ordered):" + "1. lvl" lines + "Answer with the number only."; noul
+        "Answer Yes or No." / "Answer No or Yes.". Chat template with
+        add_generation_prompt and thinking OFF; no template -> "{system}\n\n{user}\n
+        Answer:". Encoded without special tokens. Labels: choice A..Z (max 26), score
+        "1".."K" (letters if a digit is not one token), noul Yes/No. Each label = the
+        first of `lab`, `" "+lab` that is ONE token, else error. Readout = full-vocab
+        log_softmax at the last position, then softmax over the label logits.
+        Rotations: choice cyclic shifts `perm[j] = (j+s) mod K`, noul both orders,
+        score none. Per rotation p = p_raw / prior^alpha, clip 1e-8, renormalise; then
+        map positions back to options and combine by log-mean (mean of log(clip
+        1e-12), subtract max, exp, normalise). Content-free prior = mean over the 3
+        empty-state probes per rotation, clip 1e-8, renormalise. Model-free oracle:
+        raw (0.62,0.38), prior (0.70,0.30), alpha 1 -> 0.4115.
+      - Kev (`jaredpalmer/kev`, HF `jaredpalmer/kev-0.8b|4b|9b|27b`): bases
+        `Qwen/Qwen3.5-{0.8B,4B,9B}-Base` (frozen, LoRA r16 alpha32 on q/k/v/o,
+        gate/up/down, in_proj_qkv/z/a/b, out_proj) and `Qwen/Qwen3.8-27B` (27B = full
+        fine-tune, `Qwen3_5TextModel` keys without `model.` prefix, no lm_head).
+        Adapter keys `base_model.model.layers.N.<module>.lora_{A,B}.weight`, F32.
+        Tokens reused: state `<|fim_prefix|>`, question `<|fim_middle|>`, option open
+        `<|box_start|>`, option close `<|box_end|>`, decide `<|fim_suffix|>`. Row =
+        `[<|fim_prefix|>] + state` then per question `[<|fim_middle|>] + instructions
+        + (<|box_start|> opt <|box_end|>)* + [<|fim_suffix|>]`; no BOS, no chat
+        template. Options: noul `["no[: false desc]", "yes[: true desc]"]` -> answer
+        p[1]; choice "name" or "name: desc"; score rendered level text. Head reads the
+        FINAL hidden state (after the final RMSNorm): `z = (K h_</opt>) . (Q h_decide)
+        / sqrt(256) / T`, Q and K = Linear(d -> 256) with bias. `head.pt` = torch.save
+        dict: `head` (OrderedDict q.weight/q.bias/k.weight/k.bias, fp32), `temperature`
+        (0.8B 2.3510958), `head_dim` 256, `base`, `base_revision`, `lora`, plus nested
+        training metadata. State limit 65536 tokens (422 above it).
+      - Open-Jev (`Zefan-Cai/Open-Jev`, MIT code; HF `ZefanCai/Open-Jev-2B|9B|27B-v1.1`,
+        Apache-2.0): bases `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`
+        (post-trained). Package `package/checkpoint/{adapter/, head.pt, model.json,
+        temperature.json}`. LoRA r8 alpha16 on q/k/v/o, in_proj_qkv, out_proj, same key
+        naming as Kev. Head = plain state_dict `weight [1,d]`, `bias [1]` (storage
+        location may be 'cuda:0'). One chat-template prompt per candidate (user turn
+        only, thinking off): "Context:\n{state}\n\nQuestion: {q}\n" + "Proposed
+        answer: {option}\nIs this proposed answer correct? Answer Yes or No."; noul =
+        ONE prompt "...Is the answer to this question yes? Answer Yes or No." with
+        "\nYes means: ..."/"\nNo means: ..." appended to the question. Score s = head(
+        final hidden state of the last token); choice/score p = softmax(s/T), noul
+        p = sigmoid(s/T). Non-string values rendered with json.dumps(sort_keys).
+  Stage 0 — shared decision layer:
+  - [ ] D0.1 `neural/neuraldecision.pas`: question/answer records, the Jev request
+        parser + validator (422 detail list), the response builder, the confidence
+        formulas, the value renderer, the special-token rewrite, and a restricted
+        softmax over a set of logit ids (search `TNNetVolume`/`neuralvolume.pas` for an
+        existing row softmax first). Model-free unit tests, including the 0.355/0.925
+        confidence checks and JSON round trips.
+  - [ ] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
+        prefix and capture its state; score a branch from that state, returning the
+        last-position logits and/or the final hidden state at requested branch
+        positions; leave the engine consistent (`CachedTokens` = session contents, or
+        cleared) on success and on exception. Tests on the Qwen3.5 hybrid pico and an
+        attention-only pico: branch-after-restore equals a full fresh forward.
+  - [ ] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
+        decision-only mode switch for later stage-2 use, `--selftest` cases.
+  Stage 1 — AnyJev L0 readout (no trained weights):
+  - [ ] D1.1 AnyJev L0 scorer in `neuraldecision.pas`: prompt builder per kind, label
+        token mapping, rotations, content-free prior, log-mean marginalisation, plus a
+        `raw` level (one prompt, no prior). Jev mapping: choice options rendered
+        "name: desc", score levels = descriptions, noul criteria appended as
+        "Yes means: ..."/"No means: ..." lines. Port AnyJev's model-free tests
+        (`tests/test_calibrate.py`).
+  - [ ] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
+        Decider (L0, content-free prior) on a pico Qwen-family decoder with a chat
+        template; Pascal test compares probabilities.
+  - [ ] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
+        on Qwen2.5-0.5B-Instruct against Python AnyJev.
+  Stage 2 — Kev and Open-Jev:
+  - [ ] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
+        torch.save dict (temperature, head_dim, base, base_revision, lora), keep
+        nested-dict tensors under dotted names (`head.q.weight`), accept any storage
+        location string. Unit test on a generated `head.pt`-shaped fixture.
+  - [ ] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
+        lora_alpha, target_modules), map adapter keys onto base checkpoint keys, merge
+        in FP32, and build through the normal importer (export the in-memory tensor
+        reader path). Test: pico Qwen3.5 + random adapter; merged build logits = HF
+        reference with the merged weights.
+  - [ ] D2.3 Kev scorer: row construction, per-question rows from the shared state,
+        pointer head, temperature from `head.pt`, Jev answer mapping, 65536-token state
+        limit. Fixture: pico Qwen3.5 + random LoRA + random head through Kev's own
+        `kev/model.py` math.
+  - [ ] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
+        the first token where the candidates diverge (check encode(prefix + suffix) =
+        encode(prefix) + encode(suffix), else score the full prompt), Linear(d,1) head,
+        `temperature.json`. Fixture as in D2.3.
+  - [ ] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
+        load the base given by the usual model directory (warn when it differs from
+        the adapter's recorded base), merge, read the head, switch to decision-only.
+  - [ ] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
+        `model.` prefix and without `lm_head` (build ends at the final norm). Pico
+        fixture in that layout.
+  - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
+        Open-Jev-2B against their Python servers; commands written by the agents.
+  Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
+  `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
+  `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
+  "specials as plain text" flag for chat requests; live (unmerged) LoRA.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
