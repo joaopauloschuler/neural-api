@@ -24,7 +24,8 @@ Coded by Claude (AI).
 // neuralplainops -- inference ops on plain TNNetVolume buffers, without a
 // TNNet: 1D conv, pointwise conv, dense and depthwise transposed 1D conv,
 // nearest upsample, reflect pad, instance norm with a channel affine, Snake,
-// LeakyReLU, channel concat and a bidirectional LSTM. A caller holds the weights once and
+// a norm + Snake + conv chunked over time, LeakyReLU, channel concat and a
+// bidirectional LSTM. A caller holds the weights once and
 // reuses a few activation volumes, so memory does not grow with per-layer
 // buffers (PyTorch eager style).
 //
@@ -118,15 +119,27 @@ type
     FPatch, FTileOut: array of TNNetVolume;
     // Per LSTM direction: input projection of every step, gates, h and c.
     FProjection, FGates, FHidden, FCell: array[0..1] of TNNetVolume;
-    FMean, FInvStd, FSum, FSumSq, FChannelScale, FInvAlpha: TNNetVolume;
+    // Per channel: the prepared InstanceNorm mean, inv_std * Scale and Shift.
+    FMean, FInvStd, FSum, FSumSq, FChannelScale, FNormShift: TNNetVolume;
+    FInvAlpha: TNNetVolume;
+    // NormSnakeConv1D: one chunk's input window and its conv output.
+    FWindow, FChunkOutput: TNNetVolume;
+    FMaxThreads: integer;
     // Arguments of the running job.
     FJobInput, FJobOutput, FJobAlpha: TNNetVolume;
     FJobConv: TNNetPlainConvWeights;
     FJobLSTM: array[0..1] of TNNetPlainLSTMWeights;
     FJobPositionCount, FJobStride, FJobDilation, FJobPadding: integer;
+    FJobThreadCount: integer;
+    FCappedJob: TNeuralProc;
     function ScratchSlotCount(): integer;
+    // Pool threads a job uses: ScratchSlotCount capped by MaxThreads.
+    function JobThreadCount(): integer;
     procedure EnsureTileScratch(PatchFloats, TileOutFloats: integer);
     procedure RunJob(Job: TNeuralProc; PositionCount: integer);
+    // Runs Job on JobThreadCount pool threads (Job sees that thread count).
+    procedure RunOnPool(Job: TNeuralProc);
+    procedure CappedJob(Index, ThreadNum: integer);
     procedure AddBiasToRows(Output: TNNetVolume; Bias: TNNetVolume;
       FirstPos, LastPos: integer);
     procedure Conv1DJob(Index, ThreadNum: integer);
@@ -166,6 +179,17 @@ type
       PaddingLeft, PaddingRight: integer);
     // In place: per channel (x - mean) * inv_std (biased variance) * Scale + Shift.
     procedure InstanceNorm(V, Scale, Shift: TNNetVolume; Eps: TNeuralFloat = 1e-5);
+    // Stores V's per-channel mean and inv_std * Scale, and Shift, for
+    // ApplyInstanceNorm (InstanceNorm = PrepareInstanceNorm + ApplyInstanceNorm).
+    procedure PrepareInstanceNorm(V, Scale, Shift: TNNetVolume;
+      Eps: TNeuralFloat = 1e-5);
+    // In place on any rows of the prepared depth: the prepared InstanceNorm.
+    procedure ApplyInstanceNorm(V: TNNetVolume);
+    // Conv1D(Snake(prepared InstanceNorm(Input))), stride 1, zero padding
+    // Dilation*(K-1)/2, chunked over time; Accumulate adds it to Output.
+    procedure NormSnakeConv1D(Input, Output: TNNetVolume;
+      Weights: TNNetPlainConvWeights; Alpha: TNNetVolume; Dilation: integer;
+      Accumulate: boolean; ChunkPositions: integer = 1024);
     // In place: x + 1/alpha * sin(alpha * x)^2 with one alpha per channel.
     procedure Snake(V, Alpha: TNNetVolume);
     // Output may be Input.
@@ -184,6 +208,8 @@ type
     // Ops on fewer positions run on the calling thread.
     property MinPositionsToThread: integer read FMinPositionsToThread
       write FMinPositionsToThread;
+    // Most pool threads one op uses; 0 = every pool thread.
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
   end;
 
 // AdaIN1d / AdaLayerNorm channel affine for InstanceNorm, as
@@ -524,7 +550,10 @@ begin
   FSum := TNNetVolume.Create();
   FSumSq := TNNetVolume.Create();
   FChannelScale := TNNetVolume.Create();
+  FNormShift := TNNetVolume.Create();
   FInvAlpha := TNNetVolume.Create();
+  FWindow := TNNetVolume.Create();
+  FChunkOutput := TNNetVolume.Create();
 end;
 
 destructor TNNetPlainOps.Destroy();
@@ -548,7 +577,10 @@ begin
   FSum.Free;
   FSumSq.Free;
   FChannelScale.Free;
+  FNormShift.Free;
   FInvAlpha.Free;
+  FWindow.Free;
+  FChunkOutput.Free;
   inherited Destroy();
 end;
 
@@ -600,12 +632,35 @@ begin
   end;
 end;
 
+function TNNetPlainOps.JobThreadCount(): integer;
+begin
+  Result := ScratchSlotCount();
+  if (FMaxThreads > 0) and (FMaxThreads < Result) then Result := FMaxThreads;
+end;
+
+procedure TNNetPlainOps.CappedJob(Index, ThreadNum: integer);
+begin
+  if Index < FJobThreadCount then FCappedJob(Index, FJobThreadCount);
+end;
+
+procedure TNNetPlainOps.RunOnPool(Job: TNeuralProc);
+begin
+  FJobThreadCount := JobThreadCount();
+  if FJobThreadCount <= 1 then Job(0, 1)
+  else if FJobThreadCount = fNTL.Count then fNTL.StartProc(Job)
+  else
+  begin
+    // The pool wakes every thread; the ones past the cap return at once.
+    FCappedJob := Job;
+    fNTL.StartProc(@CappedJob);
+  end;
+end;
+
 procedure TNNetPlainOps.RunJob(Job: TNeuralProc; PositionCount: integer);
 begin
   FJobPositionCount := PositionCount;
-  if FThreaded and (PositionCount >= FMinPositionsToThread) and
-     (ScratchSlotCount() > 1)
-    then fNTL.StartProc(Job)
+  if FThreaded and (PositionCount >= FMinPositionsToThread)
+    then RunOnPool(Job)
     else Job(0, 1);
 end;
 
@@ -962,9 +1017,15 @@ end;
 
 procedure TNNetPlainOps.InstanceNorm(V, Scale, Shift: TNNetVolume;
   Eps: TNeuralFloat);
+begin
+  PrepareInstanceNorm(V, Scale, Shift, Eps);
+  ApplyInstanceNorm(V);
+end;
+
+procedure TNNetPlainOps.PrepareInstanceNorm(V, Scale, Shift: TNNetVolume;
+  Eps: TNeuralFloat);
 var
-  Channels, ChannelPos, MaxChannelPos, Position, MaxPosition: integer;
-  RowPtr, MeanPtr, ScalePtr, ShiftPtr: TNeuralFloatArrPtr;
+  Channels, ChannelPos, MaxChannelPos: integer;
 begin
   Channels := V.Depth;
   if (Scale.Size <> Channels) or (Shift.Size <> Channels) then
@@ -977,9 +1038,23 @@ begin
   for ChannelPos := 0 to MaxChannelPos do
     FChannelScale.FData[ChannelPos] :=
       FInvStd.FData[ChannelPos] * Scale.FData[ChannelPos];
+  FNormShift.ReSize(1, 1, Channels);
+  FNormShift.CopyNoChecks(Shift);
+end;
+
+procedure TNNetPlainOps.ApplyInstanceNorm(V: TNNetVolume);
+var
+  Channels, Position, MaxPosition: integer;
+  RowPtr, MeanPtr, ScalePtr, ShiftPtr: TNeuralFloatArrPtr;
+begin
+  Channels := V.Depth;
+  if FChannelScale.Size <> Channels then
+    raise Exception.Create('ApplyInstanceNorm: prepared for ' +
+      IntToStr(FChannelScale.Size) + ' channels, got ' +
+      IntToStr(Channels) + '.');
   MeanPtr := FMean.DataPtr;
   ScalePtr := FChannelScale.DataPtr;
-  ShiftPtr := Shift.DataPtr;
+  ShiftPtr := FNormShift.DataPtr;
   MaxPosition := V.SizeX * V.SizeY - 1;
   for Position := 0 to MaxPosition do
   begin
@@ -1030,6 +1105,88 @@ begin
   FJobOutput := V;
   FJobAlpha := Alpha;
   RunJob(@SnakeJob, V.SizeX * V.SizeY);
+end;
+
+procedure TNNetPlainOps.NormSnakeConv1D(Input, Output: TNNetVolume;
+  Weights: TNNetPlainConvWeights; Alpha: TNNetVolume; Dilation: integer;
+  Accumulate: boolean; ChunkPositions: integer);
+var
+  InLength, InChannels, OutChannels, Padding, ChunkCount, WindowRows: integer;
+  ChunkPos, MaxChunkPos, ChunkStart, FirstInPos, FirstValidPos, LastValidPos: integer;
+  LeadingRows, TrailingRows, FirstWritePos, WriteRows, WrittenEnd: integer;
+  RowBytes: integer;
+
+  procedure ZeroPaddingRows();
+  begin
+    if LeadingRows > 0 then
+      FillChar(FWindow.FData[0], LeadingRows * RowBytes, 0);
+    if TrailingRows > 0 then
+      FillChar(FWindow.FData[(WindowRows - TrailingRows) * InChannels],
+        TrailingRows * RowBytes, 0);
+  end;
+
+begin
+  if Weights.Layout <> pclConv then
+    raise Exception.Create('NormSnakeConv1D: weights are not in the conv layout.');
+  CheckSequence(Input, Weights.InChannels, 'NormSnakeConv1D');
+  if (Input = Output) or (Dilation < 1) or (ChunkPositions < 1) or
+     not Odd(Weights.KernelSize) then
+    raise Exception.Create('NormSnakeConv1D: Output = Input, bad dilation or ' +
+      'chunk, or an even kernel.');
+  InLength := Input.SizeX;
+  InChannels := Input.Depth;
+  OutChannels := Weights.OutChannels;
+  Padding := Dilation * (Weights.KernelSize - 1) div 2;
+  if Accumulate then
+  begin
+    if (Output.SizeX <> InLength) or (Output.SizeY <> 1) or
+       (Output.Depth <> OutChannels) then
+      raise Exception.Create('NormSnakeConv1D: Output to accumulate into is ' +
+        IntToStr(Output.SizeX) + 'x' + IntToStr(Output.SizeY) + 'x' +
+        IntToStr(Output.Depth) + ', expected (' + IntToStr(InLength) +
+        ', 1, ' + IntToStr(OutChannels) + ').');
+  end
+  else Output.ReSize(InLength, 1, OutChannels);
+  // Equal chunks, the last one moved back to end at InLength (its first rows
+  // repeat the previous chunk and are not written), keep the window size fixed.
+  ChunkCount := (InLength + ChunkPositions - 1) div ChunkPositions;
+  ChunkPositions := (InLength + ChunkCount - 1) div ChunkCount;
+  WindowRows := ChunkPositions + 2 * Padding;
+  FWindow.ReSize(WindowRows, 1, InChannels);
+  RowBytes := InChannels * csNeuralFloatSize;
+  WrittenEnd := 0;
+  MaxChunkPos := ChunkCount - 1;
+  for ChunkPos := 0 to MaxChunkPos do
+  begin
+    ChunkStart := Min(ChunkPos * ChunkPositions, InLength - ChunkPositions);
+    FirstInPos := ChunkStart - Padding;
+    FirstValidPos := Max(0, FirstInPos);
+    LastValidPos := Min(InLength - 1, FirstInPos + WindowRows - 1);
+    LeadingRows := FirstValidPos - FirstInPos;
+    TrailingRows := FirstInPos + WindowRows - 1 - LastValidPos;
+    Move(Input.FData[FirstValidPos * InChannels],
+      FWindow.FData[LeadingRows * InChannels],
+      (LastValidPos - FirstValidPos + 1) * RowBytes);
+    // The padding rows are zeroed before the transform too, so it never
+    // reads stale values.
+    ZeroPaddingRows();
+    ApplyInstanceNorm(FWindow);
+    Snake(FWindow, Alpha);
+    // torch pads the transformed input with zeros.
+    ZeroPaddingRows();
+    Conv1D(FWindow, FChunkOutput, Weights, 1, Dilation, 0);
+    FirstWritePos := Max(ChunkStart, WrittenEnd);
+    WriteRows := ChunkStart + ChunkPositions - FirstWritePos;
+    if Accumulate then
+      TNNetVolume.Add(Output.GetRawPtr(FirstWritePos * OutChannels),
+        FChunkOutput.GetRawPtr((FirstWritePos - ChunkStart) * OutChannels),
+        WriteRows * OutChannels)
+    else
+      Move(FChunkOutput.FData[(FirstWritePos - ChunkStart) * OutChannels],
+        Output.FData[FirstWritePos * OutChannels],
+        WriteRows * OutChannels * csNeuralFloatSize);
+    WrittenEnd := ChunkStart + ChunkPositions;
+  end;
 end;
 
 procedure TNNetPlainOps.LeakyReLU(Input, Output: TNNetVolume;
@@ -1188,9 +1345,8 @@ begin
   RunJob(@LSTMProjectionJob, StepCount);
   // One pool thread per direction; the steps of a direction are sequential.
   FJobPositionCount := StepCount;
-  if FThreaded and (ScratchSlotCount() > 1)
-    then fNTL.StartProc(@LSTMRecurrenceJob)
-    else LSTMRecurrenceJob(0, 1);
+  if FThreaded then RunOnPool(@LSTMRecurrenceJob)
+  else LSTMRecurrenceJob(0, 1);
 end;
 
 function TNNetPlainOps.ScratchBytes(): int64;
@@ -1198,7 +1354,8 @@ var
   SlotPos, Direction: integer;
 begin
   Result := int64(FMean.Size) + FInvStd.Size + FSum.Size + FSumSq.Size +
-    FChannelScale.Size + FInvAlpha.Size;
+    FChannelScale.Size + FNormShift.Size + FInvAlpha.Size + FWindow.Size +
+    FChunkOutput.Size;
   for SlotPos := 0 to High(FPatch) do
     Result := Result + FPatch[SlotPos].Size + FTileOut[SlotPos].Size;
   for Direction := 0 to 1 do

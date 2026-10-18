@@ -82,6 +82,11 @@ type
     // relative to max |reference|.
     procedure CheckKokoroStageCGeneratorParity(Kokoro: TNNetKokoro;
       const ReferenceFile: string; Tolerance: TNeuralFloat);
+    // RunStageCGeneratorPlain on the same dump inputs: every checkpoint the
+    // net test checks, the spectrum and the audio (into PlainAudio).
+    procedure CheckKokoroStageCGeneratorPlainParity(Kokoro: TNNetKokoro;
+      const ReferenceFile: string; Tolerance, PhaseTolerance: TNeuralFloat;
+      PlainAudio: TNNetVolume);
     // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
     // OnOpenCL (skipped without a device).
     procedure CheckQwenImage21VaeSharedHostOutputs(OnOpenCL: boolean);
@@ -798,6 +803,9 @@ type
     // Stage-C generator per stage vs tiny_kokoro82m_ref from the dumped x and
     // harmonic spectrum: < 1e-4 of max |reference|.
     procedure TestKokoroStageCGeneratorTinyParity;
+    // The plain-code generator vs tiny_kokoro82m_ref (as above) and vs the
+    // net path on the same inputs.
+    procedure TestKokoroStageCGeneratorPlainTinyParity;
     // Stage-C generator at two frame counts through the borrowing rebuild
     // equals a fresh build, and the sized net sizes no weights.
     procedure TestKokoroStageCGeneratorBorrowingRebuild;
@@ -819,6 +827,9 @@ type
     // The stage-C generator and the iSTFT on the real snapshot vs the real
     // dump; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
     procedure TestKokoroRealStageCGeneratorParity;
+    // The plain-code generator on the real snapshot vs the real dump, with its
+    // weight and peak buffer bytes and RSS; opt-in (NEURAL_KOKORO82M_REAL_HEAVY=1).
+    procedure TestKokoroRealStageCGeneratorPlainParity;
     // Every real stage from input_ids and ref_s only: audio diff to the dump,
     // time and RSS per stage, pascal.wav beside the dump; opt-in as above.
     procedure TestKokoroRealEndToEnd;
@@ -25554,6 +25565,137 @@ begin
   end;
 end;
 
+type
+  // OnCheckpoint target of the plain generator: each checkpoint vs the dump.
+  TKokoroPlainCheckpointChecker = class
+  public
+    Test: TTestNeuralPretrained;
+    Reference: TNNetSafeTensorsReader;
+    Tolerance: TNeuralFloat;
+    CheckedCount: integer;
+    procedure Check(const CheckpointName: string; Values: TNNetVolume);
+  end;
+
+procedure TKokoroPlainCheckpointChecker.Check(const CheckpointName: string;
+  Values: TNNetVolume);
+begin
+  // Older dumps have no gen_conv_post (as in CheckKokoroStageCGeneratorParity).
+  if (CheckpointName = 'gen_conv_post') and
+     not Reference.HasTensor(CheckpointName) then exit;
+  Test.CheckKokoroStage(Reference, CheckpointName, Values, true, Tolerance,
+    true);
+  Inc(CheckedCount);
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStageCGeneratorPlainParity(
+  Kokoro: TNNetKokoro; const ReferenceFile: string;
+  Tolerance, PhaseTolerance: TNeuralFloat; PlainAudio: TNNetVolume);
+var
+  Reference: TNNetSafeTensorsReader;
+  DecoderFeatures, HarmonicSpectrum: TNNetVolume;
+  DecoderStyle: TNeuralFloatDynArr;
+  Checker: TKokoroPlainCheckpointChecker;
+  Generator: TKokoroPlainGenerator;
+  ExpectedCount, FrameCount: integer;
+  StartTime: TDateTime;
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  DecoderFeatures := TNNetVolume.Create;
+  HarmonicSpectrum := TNNetVolume.Create;
+  Checker := TKokoroPlainCheckpointChecker.Create;
+  Generator := Kokoro.StageCGeneratorPlain;
+  try
+    LoadKokoroStageCGeneratorInputs(Reference, Kokoro.Config.StyleDim,
+      Kokoro.Config.DecoderBlockCount, DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle);
+    FrameCount := DecoderFeatures.SizeX div 2;
+    Checker.Test := Self;
+    Checker.Reference := Reference;
+    Checker.Tolerance := Tolerance;
+    Generator.OnCheckpoint := @Checker.Check;
+    try
+      StartTime := Now();
+      Kokoro.RunStageCGeneratorPlain(DecoderFeatures, HarmonicSpectrum,
+        DecoderStyle, PlainAudio);
+    finally
+      Generator.OnCheckpoint := nil;
+    end;
+    WriteLn('  Kokoro plain stage-C generator, ', FrameCount, ' frames: ',
+      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms (forward + checks + ',
+      'iSTFT), peak buffers ', (Generator.PeakBufferBytes / 1024):0:1, ' KB = ',
+      (Generator.PeakBufferBytes / (1024 * FrameCount)):0:1, ' KB per frame');
+    // Per stage: leaky, ups, noise_conv, noise_res, sum, each resblock, mrf;
+    // then the last stage's pad, post_leaky and conv_post when dumped.
+    ExpectedCount := Generator.StageCount() *
+      (6 + Length(Kokoro.Config.Generator.ResblockKernelSizes)) + 2;
+    if Reference.HasTensor('gen_conv_post') then Inc(ExpectedCount);
+    AssertEquals('checkpoints checked', ExpectedCount, Checker.CheckedCount);
+    CheckKokoroStage(Reference, 'gen_spec', Kokoro.GeneratorMagnitude, true,
+      Tolerance, true);
+    CheckKokoroStage(Reference, 'gen_phase', Kokoro.GeneratorPhase, true,
+      PhaseTolerance, true);
+    CheckKokoroAudio(Reference, PlainAudio, Tolerance, 'plain generator');
+    AssertEquals('no buffer held after the run', 0, Generator.BufferBytes());
+  finally
+    Checker.Free;
+    HarmonicSpectrum.Free;
+    DecoderFeatures.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageCGeneratorPlainTinyParity;
+var
+  Kokoro: TNNetKokoro;
+  Reference: TNNetSafeTensorsReader;
+  DecoderFeatures, HarmonicSpectrum, PlainAudio, NetAudio,
+    PlainMagnitude: TNNetVolume;
+  DecoderStyle: TNeuralFloatDynArr;
+  ReferenceFile: string;
+  Diff: double;
+begin
+  ReferenceFile := FixturePath('tiny_kokoro82m_ref.safetensors');
+  Kokoro := CreateTinyKokoro();
+  Reference := nil;
+  DecoderFeatures := TNNetVolume.Create;
+  HarmonicSpectrum := TNNetVolume.Create;
+  PlainAudio := TNNetVolume.Create;
+  NetAudio := TNNetVolume.Create;
+  PlainMagnitude := TNNetVolume.Create;
+  try
+    CheckKokoroStageCGeneratorPlainParity(Kokoro, ReferenceFile, 1e-4, 1e-4,
+      PlainAudio);
+    AssertEquals('two upsampling stages', 2,
+      Kokoro.StageCGeneratorPlain.StageCount());
+    PlainMagnitude.Copy(Kokoro.GeneratorMagnitude);
+    Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+    LoadKokoroStageCGeneratorInputs(Reference, Kokoro.Config.StyleDim,
+      Kokoro.Config.DecoderBlockCount, DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle);
+    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      NetAudio);
+    Diff := MaxAbsVolumeDiff(PlainMagnitude, Kokoro.GeneratorMagnitude);
+    WriteLn('  Kokoro stage-C generator plain vs net: magnitude max |diff| = ',
+      Diff:0:9, ' (max |net| = ', Kokoro.GeneratorMagnitude.GetMaxAbs():0:4,
+      ')');
+    AssertTrue('plain vs net magnitude: ' + FloatToStr(Diff),
+      Diff <= 1e-5 * Max(1.0, Kokoro.GeneratorMagnitude.GetMaxAbs()));
+    Diff := MaxAbsVolumeDiff(PlainAudio, NetAudio);
+    WriteLn('  Kokoro stage-C generator plain vs net: audio max |diff| = ',
+      Diff:0:9, ' (max |net| = ', NetAudio.GetMaxAbs():0:4, ')');
+    AssertTrue('plain vs net audio: ' + FloatToStr(Diff),
+      Diff <= 1e-5 * Max(1.0, NetAudio.GetMaxAbs()));
+  finally
+    PlainMagnitude.Free;
+    NetAudio.Free;
+    PlainAudio.Free;
+    HarmonicSpectrum.Free;
+    DecoderFeatures.Free;
+    Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestKokoroStageCGeneratorTinyParity;
 var
   Kokoro: TNNetKokoro;
@@ -26081,6 +26223,33 @@ begin
       ' MB; RSS ', ProcessStatusKB('VmRSS') div 1024, ' MB, peak ',
       ProcessStatusKB('VmHWM') div 1024, ' MB');
   finally
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealStageCGeneratorPlainParity;
+var
+  ReferenceFile: string;
+  Kokoro: TNNetKokoro;
+  PlainAudio: TNNetVolume;
+begin
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile, {Heavy=}true);
+  PlainAudio := TNNetVolume.Create;
+  try
+    WriteLn('  Kokoro plain stage-C generator weights: ',
+      (Kokoro.StageCGeneratorPlain.WeightBytes() / (1024 * 1024)):0:1,
+      ' MB (owner net: ', Kokoro.StageCGeneratorOwner.CountWeights(),
+      ' weights)');
+    // phase = sin(conv_post): it keeps conv_post's absolute error (1.8e-4
+    // of max |x| 59 on the real dump), which max |phase| = 1 does not scale.
+    CheckKokoroStageCGeneratorPlainParity(Kokoro, ReferenceFile, 1e-4, 5e-4,
+      PlainAudio);
+    WriteLn('  Kokoro plain stage-C generator: workspace ',
+      (Kokoro.PlainWorkspace.BufferBytes() / (1024 * 1024)):0:2,
+      ' MB after the run, RSS ', ProcessStatusKB('VmRSS') div 1024,
+      ' MB, peak ', ProcessStatusKB('VmHWM') div 1024, ' MB');
+  finally
+    PlainAudio.Free;
     Kokoro.Free;
   end;
 end;

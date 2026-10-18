@@ -48,6 +48,11 @@ type
     procedure TestStyleChannelAffineMatchesWriter;
     // Snake vs a per-channel TNNetSnake.
     procedure TestSnakeMatchesLayer;
+    // NormSnakeConv1D (several chunk sizes, write and accumulate, serial and
+    // threaded) vs InstanceNorm, Snake and Conv1D run one after the other.
+    procedure TestNormSnakeConv1DMatchesSteps;
+    // MaxThreads 1 and 2 on a 3-thread pool: Conv1D equals the serial result.
+    procedure TestMaxThreadsCapsTheJob;
     // LeakyReLU vs TNNetLeakyReLU.
     procedure TestLeakyReLUMatchesLayer;
     // ConcatChannels vs TNNetDeepConcat (widths 3, 1, 2).
@@ -536,6 +541,125 @@ begin
     NN.Free;
     Alpha.Free;
     ThreadedOut.Free;
+    SerialOut.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestNormSnakeConv1DMatchesSteps;
+const
+  csLength = 37;
+  csInChannels = 5;
+  csOutChannels = 4;
+  csKernelSize = 7;
+  csDilation = 3;
+  csChunkSizes: array[0..3] of integer = (1, 8, 36, 64);
+var
+  Input, Transformed, Expected, Scale, Shift, Alpha, TorchWeight, TorchBias,
+    Output, Accumulated, Start: TNNetVolume;
+  Weights: TNNetPlainConvWeights;
+  ChunkPos, ChannelPos: integer;
+  Ops: TNNetPlainOps;
+  OpsPos: integer;
+  Diff: TNeuralFloat;
+begin
+  Input := TNNetVolume.Create(csLength, 1, csInChannels);
+  Transformed := TNNetVolume.Create();
+  Expected := TNNetVolume.Create();
+  Scale := TNNetVolume.Create(csInChannels, 1, 1);
+  Shift := TNNetVolume.Create(csInChannels, 1, 1);
+  Alpha := TNNetVolume.Create(csInChannels, 1, 1);
+  TorchWeight := TNNetVolume.Create(csOutChannels * csInChannels * csKernelSize,
+    1, 1);
+  TorchBias := TNNetVolume.Create(csOutChannels, 1, 1);
+  Output := TNNetVolume.Create();
+  Accumulated := TNNetVolume.Create();
+  Start := TNNetVolume.Create(csLength, 1, csOutChannels);
+  Weights := TNNetPlainConvWeights.Create();
+  try
+    FillRandom(Input, 3);
+    FillRandom(Scale);
+    FillRandom(Shift);
+    for ChannelPos := 0 to csInChannels - 1 do
+      Alpha.FData[ChannelPos] := 0.5 + Random;
+    FillRandom(TorchWeight, 0.5);
+    FillRandom(TorchBias, 0.5);
+    FillRandom(Start);
+    Weights.LoadTorchConv1D(TorchWeight, TorchBias, csOutChannels,
+      csInChannels, csKernelSize);
+    Transformed.Copy(Input);
+    FSerial.InstanceNorm(Transformed, Scale, Shift);
+    FSerial.Snake(Transformed, Alpha);
+    FSerial.Conv1D(Transformed, Expected, Weights, 1, csDilation,
+      csDilation * (csKernelSize - 1) div 2);
+    for OpsPos := 0 to 1 do
+    begin
+      if OpsPos = 0 then Ops := FSerial else Ops := FThreaded;
+      for ChunkPos := 0 to High(csChunkSizes) do
+      begin
+        Ops.PrepareInstanceNorm(Input, Scale, Shift);
+        Ops.NormSnakeConv1D(Input, Output, Weights, Alpha, csDilation,
+          {Accumulate=}false, csChunkSizes[ChunkPos]);
+        Diff := MaxAbsDiff(Output, Expected);
+        AssertTrue('ops ' + IntToStr(OpsPos) + ' chunk ' +
+          IntToStr(csChunkSizes[ChunkPos]) + ' max diff ' + FloatToStr(Diff),
+          Diff <= 1e-5);
+        Accumulated.Copy(Start);
+        Ops.NormSnakeConv1D(Input, Accumulated, Weights, Alpha, csDilation,
+          {Accumulate=}true, csChunkSizes[ChunkPos]);
+        Accumulated.Sub(Start);
+        Diff := MaxAbsDiff(Accumulated, Expected);
+        AssertTrue('accumulate, ops ' + IntToStr(OpsPos) + ' chunk ' +
+          IntToStr(csChunkSizes[ChunkPos]) + ' max diff ' + FloatToStr(Diff),
+          Diff <= 1e-5);
+      end;
+    end;
+  finally
+    Weights.Free;
+    Start.Free;
+    Accumulated.Free;
+    Output.Free;
+    TorchBias.Free;
+    TorchWeight.Free;
+    Alpha.Free;
+    Shift.Free;
+    Scale.Free;
+    Expected.Free;
+    Transformed.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestMaxThreadsCapsTheJob;
+const
+  csCaps: array[0..1] of integer = (1, 2);
+var
+  Input, SerialOut, CappedOut, TorchWeight: TNNetVolume;
+  Weights: TNNetPlainConvWeights;
+  CapPos: integer;
+begin
+  Input := TNNetVolume.Create(29, 1, 6);
+  SerialOut := TNNetVolume.Create();
+  CappedOut := TNNetVolume.Create();
+  TorchWeight := TNNetVolume.Create(5 * 6 * 3, 1, 1);
+  Weights := TNNetPlainConvWeights.Create();
+  try
+    FillRandom(Input);
+    FillRandom(TorchWeight, 0.5);
+    Weights.LoadTorchConv1D(TorchWeight, nil, 5, 6, 3);
+    FSerial.Conv1D(Input, SerialOut, Weights, 1, 1, 1);
+    for CapPos := 0 to High(csCaps) do
+    begin
+      FThreaded.MaxThreads := csCaps[CapPos];
+      FThreaded.Conv1D(Input, CappedOut, Weights, 1, 1, 1);
+      AssertEquals('MaxThreads ' + IntToStr(csCaps[CapPos]), 0,
+        MaxAbsDiff(SerialOut, CappedOut), 0);
+    end;
+  finally
+    FThreaded.MaxThreads := 0;
+    Weights.Free;
+    TorchWeight.Free;
+    CappedOut.Free;
     SerialOut.Free;
     Input.Free;
   end;
