@@ -245,10 +245,10 @@ phonemes. A frame is 25 ms of audio (40 frames per second).
   peak by only 12 MB (465 MB to 477 MB).
 * `SimpleKokoroTTS` (`fox.wav`, then `story.wav`) peaked at 538 MB.
 
-Speed on the same VM (1 core): synthesis took 31.3 s for the 10.38 s line
-and 78.0 s for the 27.70 s chunk (real-time factor 2.8 to 3.0); Python's
-forward took 16.8 s and 57.6 s. Other work was running on the VM, so these
-times can be off by several seconds.
+Speed on the same VM (1 core): synthesis took 16.3 s for the 10.38 s line
+and 43.9 s for the 27.70 s chunk (real-time factor 1.6); Python's forward
+took 16.8 s and 57.6 s. The VM is shared and its CPU slows down under
+sustained load, so these times can be off by several seconds.
 
 ## Smoke run without the real checkpoint
 

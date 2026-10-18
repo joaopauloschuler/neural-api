@@ -60,13 +60,19 @@ type
     // BiLSTM vs TNNet.AddBidirectionalLSTM(H, 1, true, true), and torch-layout
     // weights loaded with LoadTorchLSTM give the same result.
     procedure TestBiLSTMMatchesLayer;
+    // TNNetVolume.DotProductsPacked vs a double reference on odd shapes (rows,
+    // positions and lengths not multiples of the 16 x 6 block), strides, bias.
+    procedure TestDotProductsPackedMatchesReference;
+    // Conv1D, PointwiseConv and ConvTranspose1D vs a double reference at
+    // generator-like sizes (128 / 256 channels, kernels 3 / 7 / 11, dilations).
+    procedure TestConvsMatchReferenceAtGeneratorSizes;
   end;
 
 implementation
 
 const
-  // The layers' low-memory forward sums with the single DotProduct kernel;
-  // under AVX, DotProductsTiled orders the sum differently (a few ulp).
+  // Under AVX the plain ops (TNNetVolume.DotProductsPacked) and the layers
+  // order and round their sums differently (a few ulp); scalar builds agree.
   {$IF DEFINED(AVX) or DEFINED(AVX2) or DEFINED(AVX512)}
   csDotKernelTolerance = 1e-5;
   {$ELSE}
@@ -105,6 +111,22 @@ begin
   Result := 0;
   for ElementPos := 0 to A.Size - 1 do
     Result := Max(Result, Abs(A.FData[ElementPos] - B.FData[ElementPos]));
+end;
+
+// Per element: |Actual - Reference| <= 1e-5 * Magnitude + 1e-6, where
+// Magnitude is the sum of |a * b| of that element's dot product.
+procedure AssertCloseToReference(const Name: string;
+  const Actual, Reference, Magnitude: array of double);
+var
+  ElementPos: integer;
+begin
+  TAssert.AssertEquals(Name + ' element count', Length(Reference), Length(Actual));
+  for ElementPos := 0 to High(Reference) do
+    if Abs(Actual[ElementPos] - Reference[ElementPos]) >
+       1e-5 * Magnitude[ElementPos] + 1e-6 then
+      raise EAssertionFailedError.Create(Name + ' element ' +
+        IntToStr(ElementPos) + ': ' + FloatToStr(Actual[ElementPos]) +
+        ' vs reference ' + FloatToStr(Reference[ElementPos]));
 end;
 
 procedure TTestNeuralPlainOps.SetUp;
@@ -309,7 +331,7 @@ begin
           csCases[CasePos, 3], csCases[CasePos, 4], 0);
         Diff := MaxAbsDiff(SerialOut, Deconv.Output);
         AssertTrue('case ' + IntToStr(CasePos) + ' max diff ' +
-          FloatToStr(Diff), Diff = 0);
+          FloatToStr(Diff), Diff <= csDotKernelTolerance);
         AssertEquals('case ' + IntToStr(CasePos) + ' serial vs threaded', 0,
           MaxAbsDiff(SerialOut, ThreadedOut), 0);
       finally
@@ -806,6 +828,232 @@ begin
     TorchOut.Free;
     ThreadedOut.Free;
     SerialOut.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestDotProductsPackedMatchesReference;
+const
+  // NumAs, NumBs, VectorSize, extra B stride, extra C stride, with bias.
+  csCases: array[0..8, 0..5] of integer = (
+    (1, 1, 1, 0, 0, 1),
+    (16, 6, 4, 0, 0, 0),
+    (5, 7, 3, 2, 3, 1),
+    (22, 13, 17, 1, 0, 1),
+    (37, 50, 33, 0, 5, 0),
+    (128, 49, 384, 0, 0, 1),
+    (32, 96, 64, 3, 0, 1),
+    (17, 5, 129, 0, 1, 1),
+    (48, 61, 7, 0, 0, 0));
+  csSentinel = 1234.5;
+var
+  CasePos, NumAs, NumBs, VectorSize, BStride, CStride: integer;
+  RowPos, ColPos, ElementPos, OutPos: integer;
+  A, PackedA, B, C, Bias: TNNetVolume;
+  BiasPtr: TNeuralFloatArrPtr;
+  Actual, Reference, Magnitude: array of double;
+  Sum, SumAbs, Product: double;
+  {$IF not (DEFINED(AVX) or DEFINED(AVX2) or DEFINED(AVX512))}
+  ScalarDot: TNeuralFloat;
+  {$ENDIF}
+begin
+  A := TNNetVolume.Create();
+  PackedA := TNNetVolume.Create();
+  B := TNNetVolume.Create();
+  C := TNNetVolume.Create();
+  Bias := TNNetVolume.Create();
+  try
+    for CasePos := 0 to High(csCases) do
+    begin
+      NumAs := csCases[CasePos, 0];
+      NumBs := csCases[CasePos, 1];
+      VectorSize := csCases[CasePos, 2];
+      BStride := VectorSize + csCases[CasePos, 3];
+      CStride := NumAs + csCases[CasePos, 4];
+      A.ReSize(NumAs * VectorSize, 1, 1);
+      B.ReSize(NumBs * BStride, 1, 1);
+      Bias.ReSize(NumAs, 1, 1);
+      FillRandom(A);
+      FillRandom(B);
+      FillRandom(Bias);
+      PackedA.ReSize(TNNetVolume.PackedDotProductFloats(NumAs, VectorSize), 1, 1);
+      TNNetVolume.PackDotProductRows(PackedA.DataPtr, A.DataPtr, NumAs,
+        VectorSize);
+      C.ReSize(NumBs * CStride, 1, 1);
+      C.Fill(csSentinel);
+      if csCases[CasePos, 5] = 1 then BiasPtr := Bias.DataPtr
+      else BiasPtr := nil;
+      TNNetVolume.DotProductsPacked(C.DataPtr, CStride, PackedA.DataPtr, NumAs,
+        B.DataPtr, BStride, NumBs, VectorSize, BiasPtr);
+      SetLength(Actual, NumBs * NumAs);
+      SetLength(Reference, NumBs * NumAs);
+      SetLength(Magnitude, NumBs * NumAs);
+      OutPos := 0;
+      for RowPos := 0 to NumBs - 1 do
+      begin
+        for ColPos := 0 to NumAs - 1 do
+        begin
+          Sum := 0;
+          SumAbs := 0;
+          for ElementPos := 0 to VectorSize - 1 do
+          begin
+            Product := double(A.FData[ColPos * VectorSize + ElementPos]) *
+              B.FData[RowPos * BStride + ElementPos];
+            Sum := Sum + Product;
+            SumAbs := SumAbs + Abs(Product);
+          end;
+          if Assigned(BiasPtr) then Sum := Sum + Bias.FData[ColPos];
+          Reference[OutPos] := Sum;
+          Magnitude[OutPos] := SumAbs;
+          Actual[OutPos] := C.FData[RowPos * CStride + ColPos];
+          Inc(OutPos);
+        end;
+        // Cells between NumAs and CStride stay untouched.
+        for ColPos := NumAs to CStride - 1 do
+          AssertEquals('case ' + IntToStr(CasePos) + ' gap', csSentinel,
+            C.FData[RowPos * CStride + ColPos], 0);
+      end;
+      AssertCloseToReference('case ' + IntToStr(CasePos), Actual, Reference,
+        Magnitude);
+      {$IF not (DEFINED(AVX) or DEFINED(AVX2) or DEFINED(AVX512))}
+      // The scalar path sums in element order, as TNNetVolume.DotProduct does.
+      for RowPos := 0 to NumBs - 1 do
+        for ColPos := 0 to NumAs - 1 do
+        begin
+          ScalarDot := TNNetVolume.DotProduct(A.GetRawPtr(ColPos * VectorSize),
+            B.GetRawPtr(RowPos * BStride), VectorSize);
+          if Assigned(BiasPtr) then ScalarDot := ScalarDot + Bias.FData[ColPos];
+          AssertEquals('case ' + IntToStr(CasePos) + ' scalar order', ScalarDot,
+            C.FData[RowPos * CStride + ColPos], 0);
+        end;
+      {$ENDIF}
+    end;
+  finally
+    Bias.Free;
+    C.Free;
+    B.Free;
+    PackedA.Free;
+    A.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestConvsMatchReferenceAtGeneratorSizes;
+const
+  // Kind (0 Conv1D, 1 PointwiseConv, 2 ConvTranspose1D), Cin, Cout, K,
+  // stride, dilation, padding, input length.
+  csCases: array[0..7, 0..7] of integer = (
+    (0, 128, 128, 3, 1, 1, 1, 41),
+    (0, 128, 128, 7, 1, 3, 9, 50),
+    (0, 128, 128, 11, 1, 5, 25, 67),
+    (0, 256, 256, 11, 1, 1, 5, 23),
+    (0, 64, 22, 7, 1, 1, 3, 37),
+    (1, 128, 22, 1, 1, 1, 0, 43),
+    (2, 64, 32, 12, 6, 1, 3, 13),
+    (2, 128, 64, 20, 10, 1, 5, 7));
+var
+  CasePos, Kind, InChannels, OutChannels, KernelSize, Stride, Dilation: integer;
+  Padding, InLength, OutLength, OpsPos: integer;
+  OutPos, OutChannelPos, InChannelPos, TapPos, InPos, ElementPos: integer;
+  Input, Output, TorchWeight, TorchBias: TNNetVolume;
+  Weights: TNNetPlainConvWeights;
+  Ops: TNNetPlainOps;
+  Actual, Reference, Magnitude: array of double;
+  Product, WeightValue: double;
+begin
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  TorchWeight := TNNetVolume.Create();
+  TorchBias := TNNetVolume.Create();
+  Weights := TNNetPlainConvWeights.Create();
+  try
+    for CasePos := 0 to High(csCases) do
+    begin
+      Kind := csCases[CasePos, 0];
+      InChannels := csCases[CasePos, 1];
+      OutChannels := csCases[CasePos, 2];
+      KernelSize := csCases[CasePos, 3];
+      Stride := csCases[CasePos, 4];
+      Dilation := csCases[CasePos, 5];
+      Padding := csCases[CasePos, 6];
+      InLength := csCases[CasePos, 7];
+      Input.ReSize(InLength, 1, InChannels);
+      FillRandom(Input);
+      TorchWeight.ReSize(OutChannels * InChannels * KernelSize, 1, 1);
+      FillRandom(TorchWeight, 0.5);
+      TorchBias.ReSize(OutChannels, 1, 1);
+      FillRandom(TorchBias, 0.5);
+      if Kind = 2 then
+      begin
+        Weights.LoadTorchConvTranspose1D(TorchWeight, TorchBias, InChannels,
+          OutChannels, KernelSize);
+        OutLength := (InLength - 1) * Stride - 2 * Padding + KernelSize;
+      end
+      else
+      begin
+        Weights.LoadTorchConv1D(TorchWeight, TorchBias, OutChannels,
+          InChannels, KernelSize);
+        OutLength := (InLength + 2 * Padding - Dilation * (KernelSize - 1) - 1)
+          div Stride + 1;
+      end;
+      // Reference in double: torch weight [Cout][Cin][K] (conv) or
+      // [Cin][Cout][K] (transposed).
+      SetLength(Reference, OutLength * OutChannels);
+      SetLength(Magnitude, OutLength * OutChannels);
+      for ElementPos := 0 to High(Reference) do
+      begin
+        Reference[ElementPos] := TorchBias.FData[ElementPos mod OutChannels];
+        Magnitude[ElementPos] := 0;
+      end;
+      for OutChannelPos := 0 to OutChannels - 1 do
+        for InChannelPos := 0 to InChannels - 1 do
+          for TapPos := 0 to KernelSize - 1 do
+          begin
+            if Kind = 2 then
+              WeightValue := TorchWeight.FData[(InChannelPos * OutChannels +
+                OutChannelPos) * KernelSize + TapPos]
+            else
+              WeightValue := TorchWeight.FData[(OutChannelPos * InChannels +
+                InChannelPos) * KernelSize + TapPos];
+            for OutPos := 0 to OutLength - 1 do
+            begin
+              if Kind = 2 then
+              begin
+                // out[o] += w * in[i] where o = i * Stride - Padding + k.
+                InPos := OutPos + Padding - TapPos;
+                if (InPos < 0) or (InPos mod Stride <> 0) then continue;
+                InPos := InPos div Stride;
+              end
+              else InPos := OutPos * Stride - Padding + TapPos * Dilation;
+              if (InPos < 0) or (InPos >= InLength) then continue;
+              Product := WeightValue *
+                Input.FData[InPos * InChannels + InChannelPos];
+              ElementPos := OutPos * OutChannels + OutChannelPos;
+              Reference[ElementPos] := Reference[ElementPos] + Product;
+              Magnitude[ElementPos] := Magnitude[ElementPos] + Abs(Product);
+            end;
+          end;
+      for OpsPos := 0 to 1 do
+      begin
+        if OpsPos = 0 then Ops := FSerial else Ops := FThreaded;
+        case Kind of
+          0: Ops.Conv1D(Input, Output, Weights, Stride, Dilation, Padding);
+          1: Ops.PointwiseConv(Input, Output, Weights);
+          2: Ops.ConvTranspose1D(Input, Output, Weights, Stride, Padding, 0);
+        end;
+        AssertEquals('case ' + IntToStr(CasePos) + ' length', OutLength,
+          Output.SizeX);
+        SetLength(Actual, Output.Size);
+        for ElementPos := 0 to Output.Size - 1 do
+          Actual[ElementPos] := Output.FData[ElementPos];
+        AssertCloseToReference('case ' + IntToStr(CasePos) + ' ops ' +
+          IntToStr(OpsPos), Actual, Reference, Magnitude);
+      end;
+    end;
+  finally
+    Weights.Free;
+    TorchBias.Free;
+    TorchWeight.Free;
+    Output.Free;
     Input.Free;
   end;
 end;

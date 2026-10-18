@@ -45,7 +45,8 @@ uses
   Classes, SysUtils, Math, neuralvolume, neuralnetwork, neuralthread;
 
 type
-  // Row layout of TNNetPlainConvWeights.Rows, one per op family.
+  // Row layout of TNNetPlainConvWeights.Rows, one per op family; the pclConv
+  // and pclTransposed rows are packed by TNNetVolume.PackDotProductRows.
   TNNetPlainConvLayout = (
     pclConv,                 // [Cout][K][Cin]: Conv1D, PointwiseConv
     pclTransposed,           // [K][Cout][Cin]: ConvTranspose1D
@@ -62,6 +63,8 @@ type
       pOutChannels, pInChannels, pKernelSize: integer);
     procedure LoadLayerBias(Layer: TNNetLayer; pHasBias: boolean);
     procedure LoadTorchBias(Bias: TNNetVolume);
+    // Packs the filled pclConv / pclTransposed rows for DotProductsPacked.
+    procedure PackRows();
   public
     constructor Create();
     destructor Destroy(); override;
@@ -136,6 +139,7 @@ type
     // Pool threads a job uses: ScratchSlotCount capped by MaxThreads.
     function JobThreadCount(): integer;
     procedure EnsureTileScratch(PatchFloats, TileOutFloats: integer);
+    function JobBiasPtr(): TNeuralFloatArrPtr;
     procedure RunJob(Job: TNeuralProc; PositionCount: integer);
     // Runs Job on JobThreadCount pool threads (Job sees that thread count).
     procedure RunOnPool(Job: TNeuralProc);
@@ -156,7 +160,7 @@ type
   public
     // pTilePositions time positions per tile (per-thread scratch scales with
     // it); pThreaded = false runs every op on the calling thread.
-    constructor Create(pThreaded: boolean = true; pTilePositions: integer = 32);
+    constructor Create(pThreaded: boolean = true; pTilePositions: integer = 36);
     destructor Destroy(); override;
     // torch Conv1d (zero padding, dilation); PaddingRight only sets the length.
     procedure Conv1D(Input, Output: TNNetVolume; Weights: TNNetPlainConvWeights;
@@ -221,7 +225,7 @@ procedure ComputeStyleChannelAffine(FcWeight, FcBias: TNNetVolume;
 implementation
 
 const
-  // A rows per DotProductsTiled tile (the conv layers use the same).
+  // A rows per DotProductsTiled tile (the LSTM input projection).
   csPlainOpsTileRows = 16;
 
 procedure ComputeStyleChannelAffine(FcWeight, FcBias: TNNetVolume;
@@ -323,6 +327,32 @@ begin
   FBias.CopyNoChecks(Bias);
 end;
 
+procedure TNNetPlainConvWeights.PackRows();
+var
+  Unpacked: TNNetVolume;
+  RowCount, VectorSize: integer;
+begin
+  if FLayout = pclConv then
+  begin
+    RowCount := FOutChannels;
+    VectorSize := FKernelSize * FInChannels;
+  end
+  else
+  begin
+    RowCount := FKernelSize * FOutChannels;
+    VectorSize := FInChannels;
+  end;
+  Unpacked := TNNetVolume.Create();
+  try
+    Unpacked.Copy(FRows);
+    FRows.ReSize(TNNetVolume.PackedDotProductFloats(RowCount, VectorSize), 1, 1);
+    TNNetVolume.PackDotProductRows(FRows.DataPtr, Unpacked.DataPtr, RowCount,
+      VectorSize);
+  finally
+    Unpacked.Free;
+  end;
+end;
+
 procedure TNNetPlainConvWeights.LoadConv1DLayer(Conv: TNNetLayer;
   pHasBias: boolean);
 var
@@ -340,6 +370,7 @@ begin
   for NeuronPos := 0 to MaxNeuronPos do
     Move(Conv.Neurons[NeuronPos].Weights.FData[0],
       FRows.FData[NeuronPos * RowFloats], RowFloats * csNeuralFloatSize);
+  PackRows();
   LoadLayerBias(Conv, pHasBias);
 end;
 
@@ -364,6 +395,7 @@ begin
           Weight.FData[SourcePos];
         Inc(SourcePos);
       end;
+  PackRows();
   LoadTorchBias(Bias);
 end;
 
@@ -391,6 +423,7 @@ begin
         FRows.FData[(TapPos * FOutChannels + NeuronPos) * FInChannels],
         RowBytes);
   end;
+  PackRows();
   LoadLayerBias(Deconv, pHasBias);
 end;
 
@@ -415,6 +448,7 @@ begin
           Weight.FData[SourcePos];
         Inc(SourcePos);
       end;
+  PackRows();
   LoadTorchBias(Bias);
 end;
 
@@ -676,19 +710,26 @@ begin
     TNNetVolume.Add(Output.GetRawPtr(Position * Channels), BiasPtr, Channels);
 end;
 
+function TNNetPlainOps.JobBiasPtr(): TNeuralFloatArrPtr;
+begin
+  if FJobConv.HasBias then Result := FJobConv.Bias.DataPtr
+  else Result := nil;
+end;
+
 procedure TNNetPlainOps.Conv1DJob(Index, ThreadNum: integer);
 var
   StartPos, FinishPos, TileStart, TileCount, MaxTilePos: integer;
   OutPos, PatchPos, TapPos, FirstInPos, LastInOffset, FirstTap, LastTap: integer;
   InChannels, OutChannels, KernelSize, Stride, Dilation, InLength: integer;
   TapBytes, PatchRowFloats, InPos: integer;
-  Patch, TileOut, Input: TNNetVolume;
+  Patch, Input: TNNetVolume;
+  BiasPtr: TNeuralFloatArrPtr;
 begin
   TNeuralThreadList.CalculateWorkingRange(Index, ThreadNum, FJobPositionCount,
     StartPos, FinishPos);
   Patch := FPatch[Index];
-  TileOut := FTileOut[Index];
   Input := FJobInput;
+  BiasPtr := JobBiasPtr();
   InChannels := FJobConv.InChannels;
   OutChannels := FJobConv.OutChannels;
   KernelSize := FJobConv.KernelSize;
@@ -739,12 +780,9 @@ begin
       end;
       Inc(PatchPos, PatchRowFloats);
     end;
-    TileOut.DotProductsTiled(OutChannels, 0, TileCount - 1, PatchRowFloats,
-      FJobConv.Rows, Patch, Min(csPlainOpsTileRows, OutChannels), TileCount);
-    Move(TileOut.FData[0], FJobOutput.FData[TileStart * OutChannels],
-      TileCount * OutChannels * csNeuralFloatSize);
-    if FJobConv.HasBias then
-      AddBiasToRows(FJobOutput, FJobConv.Bias, TileStart, MaxTilePos);
+    TNNetVolume.DotProductsPacked(FJobOutput.GetRawPtr(TileStart * OutChannels),
+      OutChannels, FJobConv.Rows.DataPtr, OutChannels, Patch.DataPtr,
+      PatchRowFloats, TileCount, PatchRowFloats, BiasPtr);
     Inc(TileStart, TileCount);
   end;
 end;
@@ -768,8 +806,7 @@ begin
     raise Exception.Create('Conv1D: input of ' + IntToStr(Input.SizeX) +
       ' positions is shorter than the kernel.');
   Output.ReSize(OutLength, 1, Weights.OutChannels);
-  EnsureTileScratch(FTilePositions * Weights.KernelSize * Weights.InChannels,
-    FTilePositions * Weights.OutChannels);
+  EnsureTileScratch(FTilePositions * Weights.KernelSize * Weights.InChannels, 0);
   FJobInput := Input;
   FJobOutput := Output;
   FJobConv := Weights;
@@ -787,18 +824,17 @@ end;
 
 procedure TNNetPlainOps.PointwiseConvJob(Index, ThreadNum: integer);
 var
-  StartPos, FinishPos, OutChannels: integer;
+  StartPos, FinishPos, OutChannels, InChannels: integer;
 begin
   TNeuralThreadList.CalculateWorkingRange(Index, ThreadNum, FJobPositionCount,
     StartPos, FinishPos);
   if StartPos > FinishPos then exit;
   OutChannels := FJobConv.OutChannels;
-  // DotProductsTiled writes absolute rows, so it reads and writes in place.
-  FJobOutput.DotProductsTiled(OutChannels, StartPos, FinishPos,
-    FJobConv.InChannels, FJobConv.Rows, FJobInput,
-    Min(csPlainOpsTileRows, OutChannels), FTilePositions);
-  if FJobConv.HasBias then
-    AddBiasToRows(FJobOutput, FJobConv.Bias, StartPos, FinishPos);
+  InChannels := FJobConv.InChannels;
+  TNNetVolume.DotProductsPacked(FJobOutput.GetRawPtr(StartPos * OutChannels),
+    OutChannels, FJobConv.Rows.DataPtr, OutChannels,
+    FJobInput.GetRawPtr(StartPos * InChannels), InChannels,
+    FinishPos - StartPos + 1, InChannels, JobBiasPtr());
 end;
 
 procedure TNNetPlainOps.PointwiseConv(Input, Output: TNNetVolume;
@@ -822,12 +858,11 @@ var
   InChannels, OutChannels, KernelSize, ProductCount, Stride, LowestInput: integer;
   TilePos, MaxTilePos, FirstOut, FirstTap, LastTap, TapPos: integer;
   ProductPos, OutPos: integer;
-  Patch, TileOut, Input, Output: TNNetVolume;
+  TileOut, Input, Output: TNNetVolume;
 begin
   TNeuralThreadList.CalculateWorkingRange(Index, ThreadNum, FJobPositionCount,
     FirstOutPos, LastOutPos);
   if FirstOutPos > LastOutPos then exit;
-  Patch := FPatch[Index];
   TileOut := FTileOut[Index];
   Input := FJobInput;
   Output := FJobOutput;
@@ -848,11 +883,10 @@ begin
   begin
     TileCount := Min(FTilePositions, LastInPos - TileStart + 1);
     MaxTilePos := TileCount - 1;
-    Move(Input.FData[TileStart * InChannels], Patch.FData[0],
-      TileCount * InChannels * csNeuralFloatSize);
     // Product (j, k, oc) at j*K*Cout + k*Cout + oc: one contiguous Cout run per tap.
-    TileOut.DotProductsTiled(ProductCount, 0, MaxTilePos, InChannels,
-      FJobConv.Rows, Patch, Min(csPlainOpsTileRows, ProductCount), TileCount);
+    TNNetVolume.DotProductsPacked(TileOut.DataPtr, ProductCount,
+      FJobConv.Rows.DataPtr, ProductCount, Input.GetRawPtr(TileStart * InChannels),
+      InChannels, TileCount, InChannels, nil);
     // Scatter in ascending input position, as the TNNetDeconvolution forwards.
     for TilePos := 0 to MaxTilePos do
     begin
@@ -893,8 +927,7 @@ begin
   if OutLength < 1 then
     raise Exception.Create('ConvTranspose1D: empty output.');
   Output.ReSize(OutLength, 1, Weights.OutChannels);
-  EnsureTileScratch(FTilePositions * Weights.InChannels,
-    FTilePositions * Weights.KernelSize * Weights.OutChannels);
+  EnsureTileScratch(0, FTilePositions * Weights.KernelSize * Weights.OutChannels);
   FJobInput := Input;
   FJobOutput := Output;
   FJobConv := Weights;
