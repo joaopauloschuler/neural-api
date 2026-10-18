@@ -2848,13 +2848,25 @@ rather than acted on.
   User rules: adding TNNet layers is fine; small changes inside TNNet layers
   are fine when required; do not remove working layers; CPU only; pure
   Pascal. One Opus agent at a time; test and commit after each task.
-  - [ ] 7.1 Build ALBERT's shared layer once and run it 12 times, instead of
+  - [x] 7.1 Build ALBERT's shared layer once and run it 12 times, instead of
         12 unrolled copies in the stage-A net (`neuralpretrained.pas`:
         stage-A builder and `RunStageA`). Expected: ~150 MB less at 157 tokens
         (per-token buffers ~112, attention T^2 ~13, out-projection weight
         caches ~26), ~500 MB less on a 510-phoneme chunk, build -0.3 s.
         Parity: the existing stage-A tests must still pass at their current
         tolerances. Measure the 26 x "Hello" line peak (one run).
+        Done 2026-10-18 (1cf2fbbf): stage A = three nets with their own
+        weight owners: front (PL-BERT embeddings), block (one ALBERT layer,
+        `RunStageA` runs it 12 times feeding each output back), tail
+        (bert_encoder, duration predictor, text encoder; its input carries
+        the PL-BERT output, written by the host). `AddBertBlock` extracted
+        from `AddBertEncoder`; `OnStageACheckpoint` reports bert_layer<i>
+        for the parity tests (tolerances unchanged). Real KokoroTTS,
+        26 x "Hello", 1 core, 2 GB cap: peak RSS 723 -> 557 MB (-166 MB),
+        load RSS 459-462 -> 441 MB, WAV bit-identical to HEAD (max |diff|
+        0). Synthesis time not comparable on the loaded VM (load average
+        ~2.5): HEAD 24.7 / 36.9 s, new 32.8 / 35.0 s. Suites cpu / avx2 /
+        opencl `TESTS=3279 ERRORS=0 FAILURES=0 IGNORED=4`.
   - [ ] 7.2 Free what stage A holds and never reads:
         (a) TNNetLSTMCell allocates `FGradW` / `FGradB` and the backprop-only
         per-step sequences only when the layer is trainable (small change in
