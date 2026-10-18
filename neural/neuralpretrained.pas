@@ -5825,6 +5825,46 @@ type
       write FOnCheckpoint;
   end;
 
+  // Kokoro stage B (ProsodyPredictor.F0Ntrain) as plain code on TNNetPlainOps
+  // (the same inputs and outputs as TNNetKokoro.RunStageB).
+  TKokoroPlainF0NPredictor = class
+  private
+    FHiddenDim, FStyleDim: integer;
+    FSharedForward, FSharedBackward: TNNetPlainLSTMWeights;
+    FF0Blocks, FNBlocks: array of TKokoroPlainAdainResBlock;
+    FF0Proj, FNProj: TNNetPlainConvWeights;
+    // en (freed after the bi-LSTM), the bi-LSTM output and the two block
+    // outputs a branch alternates between: all freed by ReleaseBuffers.
+    FFrameFeatures, FShared: TNNetVolume;
+    FBlockOutputs: array[0..1] of TNNetVolume;
+    FOnCheckpoint: TKokoroPlainCheckpointProc;
+    procedure Checkpoint(const CheckpointName: string; Values: TNNetVolume);
+    // One branch on FShared: its blocks, then Projection into Curve (2F,1,1).
+    procedure RunBranch(Workspace: TKokoroPlainWorkspace;
+      const Blocks: array of TKokoroPlainAdainResBlock;
+      Projection: TNNetPlainConvWeights; const BranchName: string;
+      const Style: array of TNeuralFloat; Curve: TNNetVolume);
+  public
+    // NormFcWeights / NormFcBiases in the TKokoroStageBLayers.StyleNorms
+    // order, borrowed for the predictor's lifetime.
+    constructor Create(Reader: TNNetSafeTensorsReader;
+      const Config: TKokoroConfig;
+      const NormFcWeights, NormFcBiases: array of TNNetVolume;
+      Consumed: TStrings);
+    destructor Destroy(); override;
+    procedure Run(Workspace: TKokoroPlainWorkspace;
+      DurationFeatures: TNNetVolume; const PredictedDurations: array of integer;
+      const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
+    procedure ReleaseBuffers();
+    function WeightBytes(): int64;
+    // Bytes of the activation buffers this predictor owns now (not the workspace).
+    function BufferBytes(): int64;
+    function BlockCount(): integer;
+    // Called with 'en', 'f0n_shared', 'F0_block<i>' and 'N_block<i>'.
+    property OnCheckpoint: TKokoroPlainCheckpointProc read FOnCheckpoint
+      write FOnCheckpoint;
+  end;
+
 type
   // Kokoro-82M as TNNet stages run by TNNet.Compute with host steps between
   // them. Each stage has a weight owner built once from the checkpoint and a
@@ -5850,6 +5890,8 @@ type
     FStageBInput: TNNetVolume;
     // AdaIN1d fc of each FStageBLayers.StyleNorms entry: [2C, style_dim] + bias.
     FStageBNormFcWeights, FStageBNormFcBiases: array of TNNetVolume;
+    // Stage B as plain code; borrows the FStageBNormFc* volumes.
+    FStageBPlain: TKokoroPlainF0NPredictor;
     FStageCDecoderOwner: TNNet;
     FStageCDecoderNet: TNNet;
     FStageCDecoderLayers: TKokoroStageCDecoderLayers;
@@ -5937,6 +5979,11 @@ type
     // Stage B: DurationFeatures (d from RunStageA) repeated per
     // PredictedDurations, then F0Ntrain; F0_pred and N_pred as (2F,1,1).
     procedure RunStageB(DurationFeatures: TNNetVolume;
+      const PredictedDurations: array of integer;
+      const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
+    // RunStageB as plain code (StageBPlain on PlainWorkspace, threaded when
+    // Parallel); frees stage B's activation buffers after.
+    procedure RunStageBPlain(DurationFeatures: TNNetVolume;
       const PredictedDurations: array of integer;
       const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
     // (Re)builds StageCDecoderNet for FrameCount frames; a same-length call
@@ -6027,6 +6074,7 @@ type
     property StageBLayers: TKokoroStageBLayers read FStageBLayers;
     // en of the last RunStageB: (F,1,hidden+style).
     property StageBInput: TNNetVolume read FStageBInput;
+    property StageBPlain: TKokoroPlainF0NPredictor read FStageBPlain;
     property StageCDecoderOwner: TNNet read FStageCDecoderOwner;
     property StageCDecoderNet: TNNet read FStageCDecoderNet;
     property StageCDecoderLayers: TKokoroStageCDecoderLayers
@@ -51982,12 +52030,15 @@ begin
       Consumed);
 end;
 
+const
+  // Per F0 / N block: d_hid -> d_hid, d_hid -> d_hid/2 (x2 upsample),
+  // d_hid/2 -> d_hid/2.
+  KokoroF0NBlockHalvesWidth: array[0..KokoroF0NBlockCount - 1] of boolean =
+    (false, true, false);
+
 function BuildKokoroStageBNet(NN: TNNet; const Config: TKokoroConfig;
   FrameCount: integer): TKokoroStageBLayers;
 const
-  // d_hid -> d_hid, d_hid -> d_hid/2 (x2 upsample), d_hid/2 -> d_hid/2.
-  BlockHalvesWidth: array[0..KokoroF0NBlockCount - 1] of boolean =
-    (false, true, false);
   MaxBlockPos = KokoroF0NBlockCount - 1;
 var
   BranchPos, BlockPos, BlockWidth, StyleNormPos: integer;
@@ -52015,9 +52066,10 @@ begin
     BlockWidth := Config.HiddenDim;
     for BlockPos := 0 to MaxBlockPos do
     begin
-      if BlockHalvesWidth[BlockPos] then BlockWidth := BlockWidth div 2;
+      if KokoroF0NBlockHalvesWidth[BlockPos] then
+        BlockWidth := BlockWidth div 2;
       Blocks[BlockPos] := AddKokoroAdainResBlock(NN, BranchInput, BlockWidth,
-        {Upsample=}BlockHalvesWidth[BlockPos]);
+        {Upsample=}KokoroF0NBlockHalvesWidth[BlockPos]);
       Result.StyleNorms[StyleNormPos] := Blocks[BlockPos].Norm1;
       Result.StyleNorms[StyleNormPos + 1] := Blocks[BlockPos].Norm2;
       Inc(StyleNormPos, 2);
@@ -53155,6 +53207,222 @@ begin
   Result := Length(FUps);
 end;
 
+{ TKokoroPlainF0NPredictor }
+
+constructor TKokoroPlainF0NPredictor.Create(Reader: TNNetSafeTensorsReader;
+  const Config: TKokoroConfig;
+  const NormFcWeights, NormFcBiases: array of TNNetVolume;
+  Consumed: TStrings);
+const
+  SharedPrefix = 'predictor.shared';
+var
+  BufferPos, BranchPos, BlockPos, BlockWidth, BlockInputWidth,
+    StyleNormPos: integer;
+  Blocks: array of TKokoroPlainAdainResBlock;
+  BranchName: string;
+  Projection: TNNetPlainConvWeights;
+
+  // torch nn.LSTM direction Suffix ('' or '_reverse') of layer 0 into Weights.
+  procedure LoadSharedDirection(const Suffix: string;
+    Weights: TNNetPlainLSTMWeights);
+  const
+    TensorKinds: array[0..3] of string = ('weight_ih', 'weight_hh', 'bias_ih',
+      'bias_hh');
+  var
+    Tensors: array[0..3] of TNNetVolume;
+    KindPos: integer;
+    TensorName: string;
+  begin
+    for KindPos := 0 to 3 do Tensors[KindPos] := TNNetVolume.Create();
+    try
+      for KindPos := 0 to 3 do
+      begin
+        TensorName := SharedPrefix + '.' + TensorKinds[KindPos] + '_l0' +
+          Suffix;
+        Reader.LoadTensorFlat(TensorName, Tensors[KindPos]);
+        Consumed.Add(TensorName);
+      end;
+      Weights.LoadTorchLSTM(Tensors[0], Tensors[1], Tensors[2], Tensors[3]);
+    finally
+      for KindPos := 0 to 3 do Tensors[KindPos].Free;
+    end;
+    if (Weights.HiddenSize <> Config.HiddenDim div 2) or
+       (Weights.InChannels <> Config.HiddenDim + Config.StyleDim) then
+      ImportError('Kokoro import: ' + SharedPrefix + Suffix + ' has hidden ' +
+        IntToStr(Weights.HiddenSize) + ' and ' + IntToStr(Weights.InChannels) +
+        ' inputs, expected ' + IntToStr(Config.HiddenDim div 2) + ' and ' +
+        IntToStr(Config.HiddenDim + Config.StyleDim) + '.');
+  end;
+
+begin
+  inherited Create();
+  if Odd(Config.HiddenDim) then
+    ImportError('Kokoro: hidden_dim must be even.');
+  if (Length(NormFcWeights) <> 4 * KokoroF0NBlockCount) or
+     (Length(NormFcBiases) <> 4 * KokoroF0NBlockCount) then
+    ImportError('Kokoro: the plain stage B needs ' +
+      IntToStr(4 * KokoroF0NBlockCount) + ' norm fcs, got ' +
+      IntToStr(Length(NormFcWeights)) + '.');
+  FHiddenDim := Config.HiddenDim;
+  FStyleDim := Config.StyleDim;
+  FFrameFeatures := TNNetVolume.Create();
+  FShared := TNNetVolume.Create();
+  for BufferPos := 0 to High(FBlockOutputs) do
+    FBlockOutputs[BufferPos] := TNNetVolume.Create();
+  FSharedForward := TNNetPlainLSTMWeights.Create();
+  FSharedBackward := TNNetPlainLSTMWeights.Create();
+  LoadSharedDirection('', FSharedForward);
+  LoadSharedDirection('_reverse', FSharedBackward);
+  StyleNormPos := 0;
+  // Branch 0 = F0, branch 1 = N (the StyleNorms order).
+  for BranchPos := 0 to 1 do
+  begin
+    if BranchPos = 0 then BranchName := 'F0' else BranchName := 'N';
+    SetLength(Blocks, KokoroF0NBlockCount);
+    BlockInputWidth := Config.HiddenDim;
+    BlockWidth := Config.HiddenDim;
+    for BlockPos := 0 to KokoroF0NBlockCount - 1 do
+    begin
+      if KokoroF0NBlockHalvesWidth[BlockPos] then
+        BlockWidth := BlockWidth div 2;
+      Blocks[BlockPos] := TKokoroPlainAdainResBlock.Create(Reader,
+        'predictor.' + BranchName + '.' + IntToStr(BlockPos), BlockInputWidth,
+        BlockWidth, {pUpsample=}KokoroF0NBlockHalvesWidth[BlockPos],
+        NormFcWeights[StyleNormPos], NormFcBiases[StyleNormPos],
+        NormFcWeights[StyleNormPos + 1], NormFcBiases[StyleNormPos + 1],
+        Consumed);
+      Inc(StyleNormPos, 2);
+      BlockInputWidth := BlockWidth;
+    end;
+    Projection := TNNetPlainConvWeights.Create();
+    LoadTorchPlainConv(Reader, 'predictor.' + BranchName + '_proj', pclConv,
+      Projection, Consumed);
+    CheckPlainConvShape(Projection, 'predictor.' + BranchName + '_proj', 1,
+      BlockWidth, 1);
+    if BranchPos = 0 then
+    begin
+      FF0Blocks := Blocks;
+      FF0Proj := Projection;
+    end
+    else
+    begin
+      FNBlocks := Blocks;
+      FNProj := Projection;
+    end;
+    Blocks := nil;
+  end;
+end;
+
+destructor TKokoroPlainF0NPredictor.Destroy();
+var
+  BlockPos, BufferPos: integer;
+begin
+  for BlockPos := 0 to High(FF0Blocks) do FF0Blocks[BlockPos].Free;
+  for BlockPos := 0 to High(FNBlocks) do FNBlocks[BlockPos].Free;
+  FF0Proj.Free;
+  FNProj.Free;
+  FSharedForward.Free;
+  FSharedBackward.Free;
+  FFrameFeatures.Free;
+  FShared.Free;
+  for BufferPos := 0 to High(FBlockOutputs) do FBlockOutputs[BufferPos].Free;
+  inherited Destroy();
+end;
+
+procedure TKokoroPlainF0NPredictor.Checkpoint(const CheckpointName: string;
+  Values: TNNetVolume);
+begin
+  if Assigned(FOnCheckpoint) then FOnCheckpoint(CheckpointName, Values);
+end;
+
+procedure TKokoroPlainF0NPredictor.RunBranch(Workspace: TKokoroPlainWorkspace;
+  const Blocks: array of TKokoroPlainAdainResBlock;
+  Projection: TNNetPlainConvWeights; const BranchName: string;
+  const Style: array of TNeuralFloat; Curve: TNNetVolume);
+var
+  BlockPos: integer;
+  BlockInput, BlockOutput: TNNetVolume;
+begin
+  BlockInput := FShared;
+  for BlockPos := 0 to High(Blocks) do
+  begin
+    BlockOutput := FBlockOutputs[BlockPos mod 2];
+    Blocks[BlockPos].Forward(Workspace, BlockInput, BlockOutput, Style);
+    Checkpoint(BranchName + '_block' + IntToStr(BlockPos), BlockOutput);
+    BlockInput := BlockOutput;
+  end;
+  // The (2F,1,1) projection is the curve itself: one channel per position.
+  Workspace.Ops.PointwiseConv(BlockInput, Curve, Projection);
+end;
+
+procedure TKokoroPlainF0NPredictor.Run(Workspace: TKokoroPlainWorkspace;
+  DurationFeatures: TNNetVolume; const PredictedDurations: array of integer;
+  const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
+begin
+  if Length(ProsodyStyle) <> FStyleDim then
+    ImportError('Kokoro: the prosody style has ' +
+      IntToStr(Length(ProsodyStyle)) + ' values, expected style_dim = ' +
+      IntToStr(FStyleDim) + '.');
+  if DurationFeatures.Depth <> FHiddenDim + FStyleDim then
+    ImportError('Kokoro: stage B reads d with ' +
+      IntToStr(FHiddenDim + FStyleDim) + ' channels, got ' +
+      IntToStr(DurationFeatures.Depth) + '.');
+  RepeatTokenRows(DurationFeatures, PredictedDurations, FFrameFeatures);
+  if FFrameFeatures.SizeX < 1 then
+    ImportError('Kokoro: stage B needs at least one frame, got 0.');
+  Checkpoint('en', FFrameFeatures);
+  Workspace.Ops.BiLSTM(FFrameFeatures, FShared, FSharedForward,
+    FSharedBackward);
+  FFrameFeatures.ReSize(0, 0, 0);
+  Checkpoint('f0n_shared', FShared);
+  RunBranch(Workspace, FF0Blocks, FF0Proj, 'F0', ProsodyStyle, F0Curve);
+  RunBranch(Workspace, FNBlocks, FNProj, 'N', ProsodyStyle, NCurve);
+end;
+
+procedure TKokoroPlainF0NPredictor.ReleaseBuffers();
+var
+  BufferPos: integer;
+begin
+  FFrameFeatures.ReSize(0, 0, 0);
+  FShared.ReSize(0, 0, 0);
+  for BufferPos := 0 to High(FBlockOutputs) do
+    FBlockOutputs[BufferPos].ReSize(0, 0, 0);
+end;
+
+function TKokoroPlainF0NPredictor.WeightBytes(): int64;
+
+  function LSTMWeightBytes(Weights: TNNetPlainLSTMWeights): int64;
+  begin
+    Result := (int64(Weights.InputRows.Size) + Weights.RecurrentRows.Size +
+      Weights.Bias.Size) * csNeuralFloatSize;
+  end;
+
+var
+  BlockPos: integer;
+begin
+  Result := LSTMWeightBytes(FSharedForward) + LSTMWeightBytes(FSharedBackward) +
+    PlainConvWeightBytes(FF0Proj) + PlainConvWeightBytes(FNProj);
+  for BlockPos := 0 to High(FF0Blocks) do
+    Result := Result + FF0Blocks[BlockPos].WeightBytes();
+  for BlockPos := 0 to High(FNBlocks) do
+    Result := Result + FNBlocks[BlockPos].WeightBytes();
+end;
+
+function TKokoroPlainF0NPredictor.BufferBytes(): int64;
+var
+  BufferPos: integer;
+begin
+  Result := int64(FFrameFeatures.Size) + FShared.Size;
+  for BufferPos := 0 to High(FBlockOutputs) do
+    Result := Result + FBlockOutputs[BufferPos].Size;
+  Result := Result * csNeuralFloatSize;
+end;
+
+function TKokoroPlainF0NPredictor.BlockCount(): integer;
+begin
+  Result := Length(FF0Blocks);
+end;
+
 // Raises on a tensor under one of StagePrefixes missing from Consumed (an
 // entry ending in '.' consumes every tensor it prefixes).
 procedure RaiseOnUnreadKokoroTensors(Reader: TNNetSafeTensorsReader;
@@ -53280,6 +53548,8 @@ begin
   try
     LoadStageA(Reader, Consumed);
     LoadStageB(Reader, Consumed);
+    FStageBPlain := TKokoroPlainF0NPredictor.Create(Reader, FConfig,
+      FStageBNormFcWeights, FStageBNormFcBiases, Consumed);
     LoadStageCDecoder(Reader, Consumed);
     FStageCDecoderPlain := TKokoroPlainDecoder.Create(Reader, FConfig,
       FStageCDecoderNormFcWeights, FStageCDecoderNormFcBiases, Consumed);
@@ -53317,6 +53587,7 @@ begin
   FStageBOwner.Free;
   FStageCDecoderOwner.Free;
   FStageCGeneratorOwner.Free;
+  FStageBPlain.Free;
   FStageCDecoderPlain.Free;
   FStageCGeneratorPlain.Free;
   FPlainWorkspace.Free;
@@ -53671,6 +53942,20 @@ begin
     F0Curve.FData[CurvePos] := Output.FData[OutputPos];
     NCurve.FData[CurvePos] := Output.FData[OutputPos + 1];
     Inc(OutputPos, 2);
+  end;
+end;
+
+procedure TNNetKokoro.RunStageBPlain(DurationFeatures: TNNetVolume;
+  const PredictedDurations: array of integer;
+  const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
+begin
+  PreparePlainOps();
+  try
+    FStageBPlain.Run(FPlainWorkspace, DurationFeatures, PredictedDurations,
+      ProsodyStyle, F0Curve, NCurve);
+  finally
+    FStageBPlain.ReleaseBuffers();
+    FPlainWorkspace.ReleaseBuffers();
   end;
 end;
 

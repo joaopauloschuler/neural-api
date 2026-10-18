@@ -87,6 +87,11 @@ type
     procedure CheckKokoroStageCGeneratorPlainParity(Kokoro: TNNetKokoro;
       const ReferenceFile: string; Tolerance, PhaseTolerance: TNeuralFloat;
       PlainAudio: TNNetVolume);
+    // RunStageBPlain on the CheckKokoroStageBParity inputs: every checkpoint
+    // that test checks, the curves into F0Curve / NCurve.
+    procedure CheckKokoroStageBPlainParity(Kokoro: TNNetKokoro;
+      const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean;
+      F0Curve, NCurve: TNNetVolume);
     // ShareHostOutputs on vs off over the pico VAE decoder, on OpenCL when
     // OnOpenCL (skipped without a device).
     procedure CheckQwenImage21VaeSharedHostOutputs(OnOpenCL: boolean);
@@ -771,6 +776,12 @@ type
     procedure TestKokoroStageBOpenCLParity;
     // Stage B on the real snapshot vs the real dump; ignored when absent.
     procedure TestKokoroRealStageBParity;
+    // The plain-code stage B vs tiny_kokoro82m_ref (as above) and vs the net
+    // path on the same inputs.
+    procedure TestKokoroStageBPlainTinyParity;
+    // The plain-code stage B on the real snapshot vs the real dump, with its
+    // weight bytes and RSS; ignored when absent.
+    procedure TestKokoroRealStageBPlainParity;
     // Stage-C decoder (asr, F0_conv / N_conv, encode, asr_res, decode blocks)
     // per stage vs tiny_kokoro82m_ref from the dumped t_en / pred_dur / curves.
     procedure TestKokoroStageCDecoderTinyParity;
@@ -25572,18 +25583,27 @@ type
     Test: TTestNeuralPretrained;
     Reference: TNNetSafeTensorsReader;
     Tolerance: TNeuralFloat;
+    Relative: boolean;
+    // Checkpoints dumped as [1, T, C] (the others are [1, C, T]).
+    TokenMajorStages: array of string;
     CheckedCount: integer;
     procedure Check(const CheckpointName: string; Values: TNNetVolume);
   end;
 
 procedure TKokoroPlainCheckpointChecker.Check(const CheckpointName: string;
   Values: TNNetVolume);
+var
+  StagePos: integer;
+  ChannelMajor: boolean;
 begin
   // Older dumps have no gen_conv_post (as in CheckKokoroStageCGeneratorParity).
   if (CheckpointName = 'gen_conv_post') and
      not Reference.HasTensor(CheckpointName) then exit;
-  Test.CheckKokoroStage(Reference, CheckpointName, Values, true, Tolerance,
-    true);
+  ChannelMajor := true;
+  for StagePos := 0 to High(TokenMajorStages) do
+    if TokenMajorStages[StagePos] = CheckpointName then ChannelMajor := false;
+  Test.CheckKokoroStage(Reference, CheckpointName, Values, ChannelMajor,
+    Tolerance, Relative);
   Inc(CheckedCount);
 end;
 
@@ -25612,6 +25632,7 @@ begin
     Checker.Test := Self;
     Checker.Reference := Reference;
     Checker.Tolerance := Tolerance;
+    Checker.Relative := true;
     Generator.OnCheckpoint := @Checker.Check;
     try
       StartTime := Now();
@@ -25692,6 +25713,129 @@ begin
     HarmonicSpectrum.Free;
     DecoderFeatures.Free;
     Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStageBPlainParity(
+  Kokoro: TNNetKokoro; const ReferenceFile: string; Tolerance: TNeuralFloat;
+  Relative: boolean; F0Curve, NCurve: TNNetVolume);
+var
+  Reference: TNNetSafeTensorsReader;
+  DurationFeatures: TNNetVolume;
+  Durations: TNeuralIntegerArray;
+  ProsodyStyle: TNeuralFloatDynArr;
+  Checker: TKokoroPlainCheckpointChecker;
+  Predictor: TKokoroPlainF0NPredictor;
+  StartTime: TDateTime;
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  DurationFeatures := TNNetVolume.Create;
+  Checker := TKokoroPlainCheckpointChecker.Create;
+  Predictor := Kokoro.StageBPlain;
+  try
+    LoadKokoroStageBInputs(Reference, Kokoro.Config.StyleDim, DurationFeatures,
+      Durations, ProsodyStyle);
+    Checker.Test := Self;
+    Checker.Reference := Reference;
+    Checker.Tolerance := Tolerance;
+    Checker.Relative := Relative;
+    Checker.TokenMajorStages := ['f0n_shared'];
+    Predictor.OnCheckpoint := @Checker.Check;
+    try
+      StartTime := Now();
+      Kokoro.RunStageBPlain(DurationFeatures, Durations, ProsodyStyle, F0Curve,
+        NCurve);
+    finally
+      Predictor.OnCheckpoint := nil;
+    end;
+    WriteLn('  Kokoro plain stage B, ', F0Curve.Size div 2, ' frames: ',
+      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms (forward + checks)');
+    // en, f0n_shared, then every F0 and N block.
+    AssertEquals('checkpoints checked', 2 + 2 * Predictor.BlockCount(),
+      Checker.CheckedCount);
+    // F0 is in Hz (max ~140 on the tiny fixture too): relative to max |ref|.
+    CheckKokoroStage(Reference, 'F0_pred', F0Curve, false, Tolerance, true);
+    CheckKokoroStage(Reference, 'N_pred', NCurve, false, Tolerance, true);
+    AssertEquals('no buffer held after the run', 0, Predictor.BufferBytes());
+  finally
+    Checker.Free;
+    DurationFeatures.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroStageBPlainTinyParity;
+var
+  Kokoro: TNNetKokoro;
+  Reference: TNNetSafeTensorsReader;
+  DurationFeatures, PlainF0, PlainN, NetF0, NetN: TNNetVolume;
+  Durations: TNeuralIntegerArray;
+  ProsodyStyle: TNeuralFloatDynArr;
+  ReferenceFile: string;
+  Diff: double;
+begin
+  ReferenceFile := FixturePath('tiny_kokoro82m_ref.safetensors');
+  Kokoro := CreateTinyKokoro();
+  Reference := nil;
+  DurationFeatures := TNNetVolume.Create;
+  PlainF0 := TNNetVolume.Create;
+  PlainN := TNNetVolume.Create;
+  NetF0 := TNNetVolume.Create;
+  NetN := TNNetVolume.Create;
+  try
+    CheckKokoroStageBPlainParity(Kokoro, ReferenceFile, 1e-4,
+      {Relative=}false, PlainF0, PlainN);
+    AssertEquals('F0 block 1 upsamples: (2F,1,1) curves', 1, PlainF0.Depth);
+    Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+    LoadKokoroStageBInputs(Reference, Kokoro.Config.StyleDim, DurationFeatures,
+      Durations, ProsodyStyle);
+    Kokoro.RunStageB(DurationFeatures, Durations, ProsodyStyle, NetF0, NetN);
+    AssertEquals('curve length', NetF0.Size, PlainF0.Size);
+    AssertEquals('curve length', 2 * Kokoro.StageBInput.SizeX, PlainF0.Size);
+    Diff := MaxAbsVolumeDiff(PlainF0, NetF0);
+    WriteLn('  Kokoro stage B plain vs net: F0 max |diff| = ', Diff:0:9,
+      ' (max |net| = ', NetF0.GetMaxAbs():0:4, ')');
+    AssertTrue('plain vs net F0: ' + FloatToStr(Diff),
+      Diff <= 1e-5 * Max(1.0, NetF0.GetMaxAbs()));
+    Diff := MaxAbsVolumeDiff(PlainN, NetN);
+    WriteLn('  Kokoro stage B plain vs net: N max |diff| = ', Diff:0:9,
+      ' (max |net| = ', NetN.GetMaxAbs():0:4, ')');
+    AssertTrue('plain vs net N: ' + FloatToStr(Diff),
+      Diff <= 1e-5 * Max(1.0, NetN.GetMaxAbs()));
+  finally
+    NetN.Free;
+    NetF0.Free;
+    PlainN.Free;
+    PlainF0.Free;
+    DurationFeatures.Free;
+    Reference.Free;
+    Kokoro.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroRealStageBPlainParity;
+var
+  ReferenceFile: string;
+  Kokoro: TNNetKokoro;
+  F0Curve, NCurve: TNNetVolume;
+begin
+  Kokoro := CreateRealKokoroOrIgnore(ReferenceFile);
+  F0Curve := TNNetVolume.Create;
+  NCurve := TNNetVolume.Create;
+  try
+    WriteLn('  Kokoro plain stage B weights: ',
+      (Kokoro.StageBPlain.WeightBytes() / (1024 * 1024)):0:1,
+      ' MB (owner net: ', Kokoro.StageBOwner.CountWeights(), ' weights)');
+    CheckKokoroStageBPlainParity(Kokoro, ReferenceFile, 1e-4, {Relative=}true,
+      F0Curve, NCurve);
+    WriteLn('  Kokoro plain stage B: workspace ',
+      (Kokoro.PlainWorkspace.BufferBytes() / (1024 * 1024)):0:2,
+      ' MB after the run, RSS ', ProcessStatusKB('VmRSS') div 1024,
+      ' MB, peak ', ProcessStatusKB('VmHWM') div 1024, ' MB');
+  finally
+    NCurve.Free;
+    F0Curve.Free;
     Kokoro.Free;
   end;
 end;
