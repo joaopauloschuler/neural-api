@@ -97,12 +97,38 @@ rather than acted on.
         a never-flipped twin, 1e-6) and `TestSetTrainableKeepsInferenceOnlyWeights`.
         Suites green: cpu 3283 (+1 run alone), avx2 3284, opencl 3284; 0 errors,
         0 failures. Not done in part 1: re-arming OpenCL after a flip.
-  - [ ] Part 2: the 32 layers whose `SetTrainable` override only frees
+  - [ ] Part 2: the 35 layers whose `SetTrainable` override only frees
         (`if not pTrainable then FreeBackpropScratch()`), plus AconC, MetaAconC,
         DyT, PReLUChannel and SReLU, lose backprop scratch that the True flip
         does not size again. Add a per-class
         `SizeBackpropScratch` helper called from `SetPrevLayer` and from the
         `SetTrainable` True branch.
+        The 35 overrides in file order, split in two batches:
+    - [x] Batch A (Done 2026-10-18, commit 6caa428a): ArcFace, ForgetGateBias,
+          InducedSetAttention, ProductKeyMemory, AttentionPooling, Retention,
+          CrossAttention, T5RelPosBiasAttention, DifferentialAttention,
+          LinformerAttention, GatedResidual, CapsuleRouting, HardConcrete, GRN,
+          APL, SplineActivation, Invertible1x1Conv, MLSTMCell. Each got a private
+          `SizeBackpropScratch` (sizes what `FreeBackpropScratch` frees), called
+          from `SetPrevLayer` and from the True branch when `FIsTrainable` and
+          `FPrevLayer` is assigned. T5RelPosBiasAttention and DifferentialAttention
+          need nothing: their `Backpropagate` resizes the scratch. New test
+          `TestSetTrainableRoundTripScratchLayersA` (18 nets x 4 modes, 1e-6,
+          shared `CheckSetTrainableRoundTrip` helper); fails on the old code under
+          `-Cr` with a range check error in `TNNetArcFace.Backpropagate`. Suites
+          green: cpu, avx2, opencl 3285 each, 0 errors, 0 failures.
+          Found on the way: `TNNetLinformerAttention.Backpropagate` only
+          accumulates deltas and never applies them when `FBatchUpdate` is false
+          (the helper now calls `TNNet.UpdateWeights`); not changed.
+    - [ ] Batch B: DeltaNet, GatedDeltaNet, GatedLinearAttention, NTMMemory,
+          TestTimeTraining, TitansMemory, SpectralConv1D, DWT1D, SpectralConv2D,
+          CondConv, MonarchLinear, KroneckerLinear, SoftDecisionTree,
+          HouseholderLinear, HyperbolicLinear, HyperbolicDistance, GraphAttention
+          (17 overrides). Also in batch B: the no-override classes AconC,
+          MetaAconC, DyT, PReLUChannel, SReLU; the `PrepareNoForwardMask` mask in
+          `FOutputErrorDeriv` (TNNetDotProducts, TNNetPointwiseSoftMax) that the
+          True flip must rebuild; `TNNet.EnableInputGradient` not setting
+          TNNetInput's `FStruct[3]`.
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
