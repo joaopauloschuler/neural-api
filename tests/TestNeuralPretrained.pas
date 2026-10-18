@@ -14792,13 +14792,10 @@ begin
     SoloInferenceBytes := Solo.GetLastLayer().NonWeightBytes();
     AssertTrue('inference-only DeltaNet below the trainable one',
       8 * SoloInferenceBytes < FirstTrainedDelta.NonWeightBytes());
-    // TNNetLayer.SetTrainable(true) leaves the two error buffers to
-    // SetPrevLayer, so the flipped layer is short of exactly those (they hold
-    // one element each until then); the BPTT caches themselves come back.
+    // SetTrainable(true) restores the BPTT caches and both error buffers.
     Solo.SetTrainable({pTrainable=}true, {pLowMemory=}false);
     AssertEquals('SetTrainable(true) restores the BPTT caches',
-      FirstTrainedDelta.NonWeightBytes() -
-      2 * (int64(FirstTrainedDelta.Output.Size) - 1) * csNeuralFloatSize,
+      FirstTrainedDelta.NonWeightBytes(),
       Solo.GetLastLayer().NonWeightBytes());
     Solo.SetTrainable({pTrainable=}false);
     AssertEquals('SetTrainable(false) releases them again',

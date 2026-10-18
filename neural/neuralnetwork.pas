@@ -517,6 +517,10 @@ type
       // the inference weight footprint minimal. Set by SetTrainable's
       // pLowMemory argument. Default False. (Coded by Claude (AI).)
       FLowMemory: boolean;
+      // Set by SetOutputErrorSize / SetOutputErrorSizeNoDeriv: the class sizes
+      // its error buffers to FOutput, so SetTrainable(True) can regrow them.
+      FOutputErrorTracksOutput: boolean;
+      FOutputErrorDerivUnused: boolean;
       // Persistent magnitude-pruning mask: one volume per neuron (parallel to
       // FNeurons), each element 1.0 = keep, 0.0 = pruned. nil = no mask on this
       // layer. Built by BuildPruneMaskFromMagnitude and re-enforced after every
@@ -919,20 +923,15 @@ type
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       // Memory Initializer for Adam optimizer
       function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
-      // Marks the layer inference-only (forward-only contract afterwards) and
-      // frees every neuron's training-only volumes (see
-      // TNNetNeuron.SetTrainable). Idempotent: it both sets FIsTrainable
-      // - so a subsequent SetNumWeightsForAllNeurons never allocates the
-      // BackInertia/Delta buffers in the first place - and shrinks any buffers
-      // that were already allocated (layers that size weights in their
-      // constructor, before this is chained). Chain it on a freshly-created
-      // layer BEFORE AddLayer to skip the allocation entirely:
-      //   NN.AddLayer( TNNetXxx.Create(...).SetTrainable(pTrainable) )
-      // pTrainable=True is a strict no-op (the layer stays trainable), so
-      // importer code can chain it unconditionally. Coded by Claude (AI).
-      // Virtual so layers that allocate their own backprop-only buffers (per-pass
-      // gradient scratch) can override to release them when marked inference-only.
+      // False: inference-only, training volumes freed (chain before AddLayer to
+      // never allocate them). True: restores them; Adam must be re-initialized.
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; virtual;
+      // True when the weights cannot be trained here: quantized (int8/int4) or
+      // borrowed from another layer (LinkWeightsFrom). Coded by Claude (AI).
+      function HasInferenceOnlyWeights(): boolean; virtual;
+      // Re-reads the size of FPrevLayer's error buffers into any cache this
+      // layer derived from it at wiring time. Default: nothing cached.
+      procedure RefreshPrevLayerErrorCaches(); virtual;
 
       // Appends every layer whose FOutput this layer reads during Compute()
       // to pList (the base implementation appends FPrevLayer). Layer classes
@@ -1271,6 +1270,7 @@ type
       // True while FConcatedWeights and FConcatedWInter are FWeightOwner's
       // arrays (no copy; this layer's bytes are the owner's).
       function WeightCachesSharedWithOwner(): boolean;
+      function HasInferenceOnlyWeights(): boolean; override;
   end;
 
   {$IFDEF FPC}
@@ -1357,6 +1357,8 @@ type
       // Uploads FOutput and leaves the host copy valid, so both locations hold
       // it and a consumer that declines to bind pays nothing.
       procedure Compute(); override;
+      // True restores the error buffers only when error collection is on.
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
 
       function EnableErrorCollection: TNNetInput;
       function DisableErrorCollection: TNNetInput;
@@ -8539,6 +8541,7 @@ type
     // int8 container size instead so parameter counts stay truthful.
     // Coded by Claude (AI).
     function CountWeights(): int64; override;
+    function HasInferenceOnlyWeights(): boolean; override;
     property WeightsQuantizedInt8: boolean read FQuantInt8;
 
     property VocabSize: integer read FVocabSize;
@@ -15196,6 +15199,8 @@ type
       // Sizes FInputCopyInt8 like FInputCopy: the previous layer's output
       // grown by FPadding on each side. Coded by Claude (AI).
       procedure EnableInt8Input(); override;
+      // FCalculatePrevLayerError and FPrevLayerErrorPadded. Coded by Claude (AI).
+      procedure RefreshPrevLayerErrorCaches(); override;
   end;
 
   /// This class does a depthwise convolution.
@@ -20492,13 +20497,12 @@ type
       // 2-D weight-matrix layer; apply with UpdateWeightsAdam. Coded by Claude (AI).
       procedure CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer);
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
-      // Frees the training-only volumes (Delta/BackInertia + Adam siblings)
-      // of every neuron in every layer, reclaiming ~2/3 of weight memory.
-      // INFERENCE-ONLY CONTRACT: only Compute() is valid afterwards; to
-      // train again, rebuild or reload the network. Idempotent - safe to
-      // call repeatedly while a network is still being built (used by the
-      // GPT-2 importer to bound peak memory during construction).
+      // TNNetLayer.SetTrainable on every layer, then RefreshPrevLayerErrorCaches.
+      // After a False->True flip run InitAdam again and re-run EnableOpenCL.
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNet; // Coded by Claude (AI).
+      // Lets every layer re-read its FPrevLayer's error-buffer size; call it
+      // after changing any layer's trainability outside TNNet.SetTrainable.
+      procedure RefreshPrevLayerErrorCaches(); // Coded by Claude (AI).
       // Converts the FP32 weights of every weight-heavy dense/convolutional
       // layer (exact classes: TNNetConvolution/Linear/ReLU, TNNetPointwise
       // Conv/Linear/ReLU, TNNetFullConnect/Linear/ReLU/Sigmoid - the same
@@ -22448,14 +22452,10 @@ type
       //   1. Resizes the input layer's OutputError and OutputErrorDeriv to match
       //      its Output tensor (they are normally a single element) and zero-
       //      fills them.
-      //   2. If the first trainable layer (Layers[1]) is a convolution
-      //      (TNNetConvolutionAbstract), refreshes its cached "calculate
-      //      previous-layer error" flag (convolutions cache it at wiring time,
-      //      when the input error was still 1 element) and, when that conv pads
-      //      its input, resizes its FPrevLayerErrorPadded scratch buffer to the
-      //      now-correct padded input plane so the unpad step lands the gradient
-      //      back on the input layer. A FullConnect (or any non-conv) first
-      //      layer needs only the resize+fill — no conv refresh is performed.
+      //   2. Runs RefreshPrevLayerErrorCaches, so every consumer of the input
+      //      re-reads its error size (a convolution caches its "calculate
+      //      previous-layer error" flag and its padded error buffer at wiring
+      //      time, when the input error was still 1 element).
       // PRECONDITION: the input layer's Output must already be SIZED — i.e. the
       // net must have run at least one forward pass (NN.Compute) (or otherwise
       // have its Output sized) before this is called, since the transient error
@@ -81551,6 +81551,11 @@ begin
       VolumeBytes(FConcatedWInter);
 end;
 
+function TNNetLayerConcatedWeights.HasInferenceOnlyWeights(): boolean;
+begin
+  Result := inherited HasInferenceOnlyWeights() or FQuantInt8 or FQuantInt4;
+end;
+
 function TNNetLayerConcatedWeights.WeightCachesSharedWithOwner(): boolean;
 var
   OwnerCW: TNNetLayerConcatedWeights;
@@ -101209,7 +101214,9 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.Output.Size>0) then
+  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.Output.Size>0) and
+    (FOutputError.Size = FOutput.Size) and
+    (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     ComputeErrorDeriv();
 
@@ -101252,7 +101259,9 @@ begin
       'TNNetFullConnectDiff.Backpropagate should have same sizes.' +
       'Neurons:' + IntToStr(FNeurons.Count) +
       ' Output:' + IntToStr(FOutput.Size) +
-      ' PrevLayer:' + IntToStr(FPrevLayer.Output.Size)
+      ' PrevLayer:' + IntToStr(FPrevLayer.Output.Size) +
+      ' Error:' + IntToStr(FOutputError.Size) +
+      ' Deriv:' + IntToStr(FOutputErrorDeriv.Size)
     );
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -108789,6 +108798,15 @@ begin
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
 end;
 
+procedure TNNetConvolutionAbstract.RefreshPrevLayerErrorCaches();
+begin
+  if not Assigned(FPrevLayer) then exit;
+  RefreshCalculatePrevLayerError();
+  if FPadding > 0 then
+    FPrevLayerErrorPadded.ReSize(FPrevLayer.OutputError.SizeX + FPadding*2,
+      FPrevLayer.OutputError.SizeY + FPaddingY*2, FPrevLayer.OutputError.Depth);
+end;
+
 procedure TNNetConvolutionAbstract.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -108801,7 +108819,6 @@ begin
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
   FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
-  RefreshCalculatePrevLayerError();
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureExtentX, FPadding, FStride);
   FOutputSizeY := CalcOutputSizeY(pPrevLayer.Output.SizeY);
   if (FOutputSizeX < 1) or (FOutputSizeY < 1) then
@@ -108810,10 +108827,7 @@ begin
       ' but the padded input is only ' +
       IntToStr(pPrevLayer.Output.SizeX + 2 * FPadding) + 'x' +
       IntToStr(pPrevLayer.Output.SizeY + 2 * FPaddingY) + '.');
-  if FPadding > 0 then
-  begin
-    FPrevLayerErrorPadded.ReSize( pPrevLayer.OutputError.SizeX + FPadding*2, pPrevLayer.OutputError.SizeY + FPaddingY*2, pPrevLayer.OutputError.Depth );
-  end;
+  RefreshPrevLayerErrorCaches();
 end;
 
 procedure TNNetConvolutionAbstract.RefreshPrevSizeXDepthBytes();
@@ -110530,8 +110544,8 @@ begin
   if ActiveLowMemory() then
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' is in low-memory inference mode (the weight ' +
-      'caches backprop needs were released). Rebuild with ' +
-      'SetTrainable(True, False) to train.');
+      'caches backprop needs were released). Call TNNet.SetTrainable(True) ' +
+      'to rebuild them before training.');
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -112312,7 +112326,10 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.FOutput.Size>0) then
+  // BackpropagateCPU indexes both error buffers per neuron without a check.
+  if (FNeurons.Count = FOutput.Size) and (FPrevLayer.FOutput.Size>0) and
+    (FOutputError.Size = FOutput.Size) and
+    (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     // ComputeErrorDeriv() is not required as it's done by BackpropagateCPU
     StartTime := Now();
@@ -112341,7 +112358,9 @@ begin
       'TNNetLayerFullConnect.Backpropagate should have same sizes.' +
       'Neurons:' + IntToStr(FNeurons.Count) +
       ' Output:' + IntToStr(FOutput.Size) +
-      ' PrevLayer:' + IntToStr(FPrevLayer.Output.Size)
+      ' PrevLayer:' + IntToStr(FPrevLayer.Output.Size) +
+      ' Error:' + IntToStr(FOutputError.Size) +
+      ' Deriv:' + IntToStr(FOutputErrorDeriv.Size)
     );
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -112452,6 +112471,18 @@ begin
   if pError = 1 then
   begin
     EnableErrorCollection();
+  end;
+end;
+
+function TNNetInput.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable and (FStruct[3] = 1) and (FOutputError.Size <> FOutput.Size) then
+  begin
+    FOutputError.ReSize(FOutput);
+    FOutputErrorDeriv.ReSize(FOutput);
+    FOutputError.Fill(0);
+    FOutputErrorDeriv.Fill(0);
   end;
 end;
 
@@ -113011,6 +113042,11 @@ begin
     FQuantTable := TNNetVolumeQuant8.Create();
     FLinkedQuantTable := false;
   end;
+end;
+
+function TNNetEmbedding.HasInferenceOnlyWeights(): boolean;
+begin
+  Result := inherited HasInferenceOnlyWeights() or FQuantInt8;
 end;
 
 function TNNetEmbedding.CountWeights(): int64;
@@ -128987,7 +129023,6 @@ end;
 procedure TNNet.EnableInputGradient();
 var
   InputLayer: TNNetLayer;
-  FirstConv: TNNetConvolutionAbstract;
 begin
   if (FLayers = nil) or (CountLayers() < 1) then Exit;
   // Enable input-gradient flow. By default a network's input layer carries a
@@ -129005,20 +129040,7 @@ begin
   end;
   InputLayer.OutputError.Fill(0);
   InputLayer.OutputErrorDeriv.Fill(0);
-  if (CountLayers() >= 2) and (FLayers[1] is TNNetConvolutionAbstract) then
-  begin
-    FirstConv := TNNetConvolutionAbstract(FLayers[1]);
-    FirstConv.RefreshCalculatePrevLayerError();
-    // The padded previous-error scratch buffer was sized at wiring time from
-    // the (then 1-element) input OutputError; resize it to the now-correct
-    // padded input plane so the unpad step (AddArea) lands the gradient back
-    // on the input layer.
-    if FirstConv.FPadding > 0 then
-      FirstConv.FPrevLayerErrorPadded.ReSize(
-        InputLayer.Output.SizeX + FirstConv.FPadding * 2,
-        InputLayer.Output.SizeY + FirstConv.FPadding * 2,
-        InputLayer.Output.Depth);
-  end;
+  RefreshPrevLayerErrorCaches();
 end;
 
 class function TNNet.SaliencyReport(
@@ -137132,6 +137154,19 @@ begin
   begin
     FLayers[LayerCnt].SetTrainable(pTrainable, pLowMemory);
   end;
+  RefreshPrevLayerErrorCaches();
+end;
+
+procedure TNNet.RefreshPrevLayerErrorCaches();
+var
+  LayerCnt: integer;
+  LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    FLayers[LayerCnt].RefreshPrevLayerErrorCaches();
+  end;
 end;
 
 constructor TQuantRowsTransposeFan.CreateQuant8(Q: TNNetVolumeQuant8;
@@ -138779,6 +138814,7 @@ end;
 
 procedure TNNetLayer.SetOutputErrorSize(pSizeX, pSizeY, pDepth: integer);
 begin
+  FOutputErrorTracksOutput := true;
   if FIsTrainable then
   begin
     FOutputError.ReSize(pSizeX, pSizeY, pDepth);
@@ -138798,6 +138834,8 @@ end;
 
 procedure TNNetLayer.SetOutputErrorSizeNoDeriv(Original: TNNetVolume);
 begin
+  FOutputErrorTracksOutput := true;
+  FOutputErrorDerivUnused := true;
   if FIsTrainable
     then FOutputError.ReSize(Original.SizeX, Original.SizeY, Original.Depth)
     else FOutputError.ReSize(1, 1, 1);
@@ -139374,6 +139412,13 @@ procedure TNNetLayer.ComputeOutputErrorForIdx(pOutput: TNNetVolume;
 var
   Idx: integer;
 begin
+  if (pOutput.Size <> FOutput.Size) or (FOutputError.Size <> FOutput.Size) then
+  begin
+    FErrorProc('ComputeOutputErrorForIdx should have same sizes. Output:' +
+      IntToStr(FOutput.Size) + ' Expected output:' + IntToStr(pOutput.Size) +
+      ' Error:' + IntToStr(FOutputError.Size));
+    exit;
+  end;
   for Idx in aIdx do
   begin
     FOutputError.FData[Idx] := (FOutput.FData[Idx] - pOutput.FData[Idx]);
@@ -139402,6 +139447,14 @@ procedure TNNetLayer.ComputeErrorDeriv();
       FOutputRaw.DataPtr, FOutputError.Size);
   end;
 begin
+  // Every path below writes FOutputError.Size elements of the deriv buffer.
+  if FOutputErrorDeriv.Size < FOutputError.Size then
+  begin
+    FErrorProc(ClassName + '.ComputeErrorDeriv: error buffer ' +
+      IntToStr(FOutputError.Size) + ' elements, deriv buffer ' +
+      IntToStr(FOutputErrorDeriv.Size) + '.');
+    exit;
+  end;
   {$IFDEF FPC}
   if FActivationFn = @RectifiedLinearUnit then
   begin
@@ -139639,25 +139692,27 @@ var
   MaxLayer: integer;
   Cnt: integer;
   AlreadyFreed: boolean;
+  BecomesTrainable: boolean;
+  WasLowMemory: boolean;
 begin
   Result := Self;
+  // Quantized or borrowed weights have no FP32 rows of their own to train, so
+  // such a layer stays inference-only; IsTrainable reports it.
+  if pTrainable and (not FIsTrainable) and HasInferenceOnlyWeights() then exit;
   MaxLayer := FNeurons.Count - 1;
   // A repeated inference-only call finds every neuron already freed. Neurons are
   // only appended to (or popped from) the end, so the last one decides for all.
   AlreadyFreed := (not pTrainable) and (not FIsTrainable) and
     ( (MaxLayer < 0) or (FNeurons[MaxLayer].FDelta = nil) );
+  BecomesTrainable := pTrainable and not FIsTrainable;
+  WasLowMemory := FLowMemory;
   FIsTrainable := pTrainable;
   // Low-memory mode drops the backprop-side weight caches, so it only makes
   // sense for an inference-only layer. Coercing here makes the contradictory
   // SetTrainable(True, True) combination impossible.
   FLowMemory := pLowMemory and not pTrainable;
-  // Shrink any training buffers already allocated (e.g. a layer that sized its
-  // weights in the constructor, before this was chained). When the layer is
-  // attached later, FIsTrainable being False stops them being re-allocated.
-  // The error buffers are normally re-sized by SetPrevLayer (now gated on
-  // FIsTrainable), but shrink them here too so an inference-only flip AFTER the
-  // layer is already attached frees them immediately rather than waiting for a
-  // re-wire that may never come.
+  // An inference-only flip after the layer is attached frees the error buffers
+  // now rather than at a re-wire that may never come.
   if not pTrainable then
   begin
     FOutputError.ReSize(1, 1, 1);
@@ -139668,6 +139723,35 @@ begin
   begin
     FNeurons[Cnt].SetTrainable(pTrainable, pLowMemory);
   end;
+  if BecomesTrainable then
+  begin
+    // SetPrevLayer sized the error buffers while the layer was inference-only,
+    // and many classes size them only there or in the constructor. Consumers
+    // re-read the new size in TNNet.RefreshPrevLayerErrorCaches; the OpenCL
+    // arming read FIsTrainable, so EnableOpenCL has to run again.
+    if FOutputErrorTracksOutput then
+    begin
+      FOutputError.ReSize(FOutput);
+      FOutputError.Fill(0);
+      if not FOutputErrorDerivUnused then
+      begin
+        FOutputErrorDeriv.ReSize(FOutput);
+        FOutputErrorDeriv.Fill(0);
+      end;
+    end;
+    // Low-memory inference released the concatenated weight caches the
+    // trainable forward and backward read.
+    if WasLowMemory and (MaxLayer >= 0) then AfterWeightUpdate();
+  end;
+end;
+
+function TNNetLayer.HasInferenceOnlyWeights(): boolean;
+begin
+  Result := Assigned(FWeightOwner);
+end;
+
+procedure TNNetLayer.RefreshPrevLayerErrorCaches();
+begin
 end;
 
 // ----- AppendInputLayers overrides (inference-scheduler dependency edges) ----
