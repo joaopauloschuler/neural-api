@@ -2896,13 +2896,44 @@ rather than acted on.
         peak RSS 557 -> 466 MB, WAV bit-identical to HEAD. Suites cpu / avx2
         / opencl `TESTS=3280 ERRORS=0 FAILURES=0 IGNORED=4`; lazbuild -B
         Default / Debug / Release of both .lpi, `--selftest` OK.
-  - [ ] 7.3 Measure and decide: the 26 x "Hello" line and the SimpleKokoroTTS
+  - [x] 7.3 Measure and decide: the 26 x "Hello" line and the SimpleKokoroTTS
         story, and if it fits under the 2 GB cap, one full 510-phoneme chunk;
         compare against the Phase 6 Python numbers. Update the README Memory
         section. Then report to the user for two decisions: (i) a lean
         inference-only pointwise layer (new TNNet layer, used only by Kokoro
         stage A, without the per-position bias copy and the separate raw
         output), (ii) investigating the ~89 MB of load heap not reused.
+        Done 2026-10-18: measured at 7fe10b98 (lazbuild -B), real checkpoint,
+        1 core, 2 GB cgroup cap, one process per run, KokoroTTS `--stats`.
+        Load RSS 348 MB (Python 1092). Peak RSS, ours / Python: 1 x "Hello"
+        (5 phonemes, 56 frames) 364 / 1110 MB; 8 x (47, 128) 392 / 1147;
+        26 x (155, 415) 466 / 1345; the SimpleKokoroTTS story (260, 636)
+        531 / 1354; a full chunk, 9 sentences of the fox story (506
+        phonemes, one chunk, 27.70 s, 1108 frames) 648 / 1609 (0.33x to
+        0.40x; Python numbers from 6.6 except the full chunk, run now with
+        pymem.py on our phonemes). Estimate before the full-chunk run:
+        ~0.7 GB ours, <= 1.7 GB Python. Growth, ours: peak = 355 MB + 0.27 MB
+        per frame (least-squares over the 5 lines, residuals <= 6 MB); per
+        token the slope falls 0.67 -> 0.69 -> 0.62 -> 0.48 MB between lines
+        (residuals up to 14 MB). Python: 0.54 MB per frame story -> full
+        chunk. What sets the peak: the per-frame stages (B/C; most likely
+        the generator), not stage A: the peak tracks frames, not tokens, and
+        its per-token slope falls at 508 tokens, which stage A (per-token
+        buffers + a T^2 score matrix) cannot do (inferred from `--stats`, no
+        probe). REPL, two 26 x lines: 465 -> 477 MB. SimpleKokoroTTS (fox +
+        story): peak 538 MB (/usr/bin/time). Synthesis (noisy, VM shared):
+        3.67 / 9.33 / 31.28 / 43.04 / 78.00 s; Python forward on the full
+        chunk 57.63 s. Docs: examples/KokoroTTS/README.md Memory section and
+        examples/README.md Kokoro entry.
+        Pending user decisions, my view: (i) lean inference-only pointwise
+        layer for stage A: no expected change to the line peak, since stage
+        A no longer sets it; it would only lower stage A's own transient,
+        which is already below the per-frame stages. Worth it only after the
+        generator's per-frame memory is cut. (ii) the ~89 MB of load heap
+        not reused (measured before 7.2): load RSS is now 348 MB against
+        312 MB (327.2e6 bytes) of raw FP32 weights in kokoro-v1_0.pth plus
+        17-21 MB of G2P dictionaries, so at most ~20 MB is left to find
+        (~6% of load, ~3% of the full-chunk peak). Low payoff for both.
   - [ ] 7.4 Generator speed: a register-blocked FP32 matrix-multiply routine
         (new routine in `neuralvolume.pas`, called from `neuralplainops`;
         asm must be PIC-safe; scalar fallback; not bit-identical, which is
