@@ -9545,7 +9545,10 @@ type
       // Per-channel backward accumulators (#17: persistent, sized once).
       FgradGammaBuf, FgradBetaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -9657,7 +9660,10 @@ type
       // Per-channel backward accumulator (#17: persistent, sized once).
       FgradAlphaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -9699,7 +9705,10 @@ type
       // Per-channel backward accumulators (#17: persistent, sized once).
       FgradTrBuf, FgradArBuf, FgradTlBuf, FgradAlBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); overload; override;
       constructor Create(pInitialTr, pInitialAr, pInitialTl,
         pInitialAl: TNeuralFloat); reintroduce; overload;
@@ -9828,7 +9837,10 @@ type
       // Per-channel backward accumulators (#17: persistent, sized once).
       FgradP1Buf, FgradP2Buf, FgradBetaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -9876,7 +9888,10 @@ type
       FgradP1Buf, FgradP2Buf, FgradBetaBuf,
         FBetaPathBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -10978,6 +10993,7 @@ type
       FgEArrBuf, FgAArrBuf: array of TNeuralFloat;      // Backpropagate scratch (SlotWidth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
       constructor Create(pNumSlots, pSlotWidth: integer;
         pInitVal: TNeuralFloat = 0.001); reintroduce; overload;
@@ -11187,6 +11203,7 @@ type
       FgqBuf, FgvBuf, FgknBuf, FgkrawBuf: array of TNeuralFloat; // Backpropagate scratch (Depth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -11439,6 +11456,7 @@ type
       FgqBuf, FgvBuf, FgknBuf, FgkrawBuf, FgaBuf: array of TNeuralFloat; // Backpropagate scratch (Depth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -12153,6 +12171,7 @@ type
       FdrBuf, Fdh1Buf, Fda1Buf, FdSBuf: array of TNeuralFloat;   // MLP scratch
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
       // pVariant: 0 = TTT-Linear (matrix inner state), 1 = TTT-MLP (2-layer
       // non-linear inner state). pHidden: MLP hidden width (0 => auto max(2*Depth,8)).
@@ -12242,6 +12261,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // Releases the per-pass Backpropagate scratch (backprop-only buffers).
       procedure FreeBackpropScratch();
+      procedure SizeBackpropScratch();
     public
       // pHidden: inner-MLP hidden width (0 => auto max(2*Depth,8)).
       constructor Create(pHidden: integer = 0); reintroduce; overload;
@@ -13525,6 +13545,8 @@ type
     procedure PrepareNoForwardMask;
     procedure PrepareNoForwardMaskAB(NumAs, NumBs, VectorSize: integer);
   public
+    // A True flip rebuilds the NoForward mask that the False flip freed.
+    function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     constructor Create(A, B: TNNetLayer; NoForward:boolean = false); reintroduce; overload;
     constructor Create(AIdx, BIdx: integer; NoForward:integer = 0); reintroduce; overload;
     destructor Destroy(); override;
@@ -14210,6 +14232,7 @@ type
     FgBuf: array of TNeuralFloat; // backward reflection-walk scratch g (length n)
     procedure ComputePreviousLayerErrorCPU(); override;
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     // pSizeY carries the reflection count K (this is a vector n->n map, so the
     // SizeY output axis is otherwise unused); K<=0 defaults to K=n. pDepth is
@@ -14315,6 +14338,7 @@ type
     procedure SeedCurvatureRaw();        // raw := logit((c0-CMIN)/(CMAX-CMIN))
     procedure AccumulateCurvatureGradient(); // dL/draw -> curvature neuron Delta
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     // pSizeX carries D_out (the map is D_in -> D_out). pCurvature is the fixed
     // (or, when pLearnCurvature, the INITIAL) ball curvature c > 0 (default 1.0).
@@ -14385,6 +14409,7 @@ type
       const Bvec: TNNetVolume; const M: TNNetVolume; const kk: integer;
       const dLdm: array of TNeuralFloat; var dLda, dLdb: array of TNeuralFloat);
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     // pNumProto carries K (the number of learnable prototypes => output Size).
     // pCurvature is the fixed ball curvature c > 0 (default 1.0).
@@ -14599,6 +14624,7 @@ type
     FgColDstBuf: array of TNeuralFloat;  // bwd scratch (sized FNumNodes)
     procedure ComputePreviousLayerErrorCPU(); override;
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
@@ -14712,6 +14738,8 @@ type
     // skipping the derivative can give higher classification accuracy at
     // image classification tasks with 10x smaller learning rate.
     constructor Create(SkipBackpropDerivative: integer = 0; NoForward: integer = 0); reintroduce; overload;
+    // A True flip rebuilds the NoForward mask that the False flip freed.
+    function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     {$IFDEF OpenCL}
@@ -16020,6 +16048,7 @@ type
     procedure BackpropagateCPU();
     function WBase(m, ci, co: integer): integer;
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
     procedure RebuildWeightPlanes();
   public
     constructor Create(pOutDepth, pModes: integer); reintroduce; overload;
@@ -16097,6 +16126,7 @@ type
     procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
     procedure RebuildWeightPlanes();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pOutDepth, pModesX, pModesY: integer); reintroduce; overload;
     destructor Destroy(); override;
@@ -16180,6 +16210,7 @@ type
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pFilter: integer; pLearnable: boolean = false); reintroduce; overload;
     destructor Destroy(); override;
@@ -16664,6 +16695,7 @@ type
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pNumExperts, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
@@ -16993,6 +17025,7 @@ type
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pSuppressBias: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
@@ -17035,6 +17068,7 @@ type
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(pSuppressBias: integer = 0; pP: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
@@ -17164,6 +17198,7 @@ type
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
+    procedure SizeBackpropScratch();
   public
     constructor Create(TreeDepth, OutputDepth: integer; Beta: TNeuralFloat = 1.0); reintroduce; overload;
     destructor Destroy(); override;
@@ -22465,9 +22500,10 @@ type
       // they call this helper once after the net is wired.
       // What it does (touching ONLY transient error tensors — weights, biases
       // and deltas are left completely untouched):
-      //   1. Resizes the input layer's OutputError and OutputErrorDeriv to match
-      //      its Output tensor (they are normally a single element) and zero-
-      //      fills them.
+      //   1. Marks a TNNetInput as collecting error (as Create's pError=1, so a
+      //      SetTrainable round trip keeps it), resizes the input layer's
+      //      OutputError and OutputErrorDeriv to match its Output tensor (they
+      //      are normally a single element) and zero-fills them.
       //   2. Runs RefreshPrevLayerErrorCaches, so every consumer of the input
       //      re-reads its error size (a convolution caches its "calculate
       //      previous-layer error" flag and its padded error buffer at wiring
@@ -23788,10 +23824,15 @@ begin
     FA.Output.SizeX * FA.Output.SizeY
   );
   SetOutputErrorSize(FOutput);
-  if FNoForward then
-  begin
+  // The mask lives in FOutputErrorDeriv, which an inference-only layer keeps at 1x1x1.
+  if FNoForward and FIsTrainable then PrepareNoForwardMask();
+end;
+
+function TNNetDotProducts.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable and FIsTrainable and FNoForward and Assigned(FA) and Assigned(FB) then
     PrepareNoForwardMask();
-  end;
 end;
 
 procedure TNNetDotProducts.PrepareNoForwardMask;
@@ -23974,10 +24015,18 @@ end;
 procedure TNNetPointwiseSoftMax.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  if FNoForward and FSkipBackpropDerivative then PrepareNoForwardMask();
+  // The mask lives in FOutputErrorDeriv, which an inference-only layer keeps at 1x1x1.
+  if FNoForward and FSkipBackpropDerivative and FIsTrainable then PrepareNoForwardMask();
   {$IFDEF OpenCL}
   FShouldOpenCL := (FOutput.size >= 1280*512);
   {$ENDIF}
+end;
+
+function TNNetPointwiseSoftMax.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable and FIsTrainable and FNoForward and FSkipBackpropDerivative and
+    Assigned(FPrevLayer) then PrepareNoForwardMask();
 end;
 
 { TNNetPointwiseSoftMax }
@@ -61971,10 +62020,28 @@ begin
   begin
     FNeurons[2].BackInertia.ReSize(1, 1, 1);
     FNeurons[2].Delta.ReSize(1, 1, 1);
-    SetLength(FgradGammaBuf, FOutput.Depth);
-    SetLength(FgradBetaBuf, FOutput.Depth);
+    SizeBackpropScratch();
   end;
   InitDefault();
+end;
+
+procedure TNNetDyT.FreeBackpropScratch();
+begin
+  SetLength(FgradGammaBuf, 0);
+  SetLength(FgradBetaBuf, 0);
+end;
+
+procedure TNNetDyT.SizeBackpropScratch();
+begin
+  SetLength(FgradGammaBuf, FOutput.Depth);
+  SetLength(FgradBetaBuf, FOutput.Depth);
+end;
+
+function TNNetDyT.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetDyT.Compute();
@@ -62272,8 +62339,25 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   // Base class already allocates FNeurons[0] with Depth weights.
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then SetLength(FgradAlphaBuf, FOutput.Depth);
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
+end;
+
+procedure TNNetPReLUChannel.FreeBackpropScratch();
+begin
+  SetLength(FgradAlphaBuf, 0);
+end;
+
+procedure TNNetPReLUChannel.SizeBackpropScratch();
+begin
+  SetLength(FgradAlphaBuf, FOutput.Depth);
+end;
+
+function TNNetPReLUChannel.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetPReLUChannel.Compute();
@@ -62424,14 +62508,31 @@ begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgradTrBuf, FOutput.Depth);
-    SetLength(FgradArBuf, FOutput.Depth);
-    SetLength(FgradTlBuf, FOutput.Depth);
-    SetLength(FgradAlBuf, FOutput.Depth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
+end;
+
+procedure TNNetSReLU.FreeBackpropScratch();
+begin
+  SetLength(FgradTrBuf, 0);
+  SetLength(FgradArBuf, 0);
+  SetLength(FgradTlBuf, 0);
+  SetLength(FgradAlBuf, 0);
+end;
+
+procedure TNNetSReLU.SizeBackpropScratch();
+begin
+  SetLength(FgradTrBuf, FOutput.Depth);
+  SetLength(FgradArBuf, FOutput.Depth);
+  SetLength(FgradTlBuf, FOutput.Depth);
+  SetLength(FgradAlBuf, FOutput.Depth);
+end;
+
+function TNNetSReLU.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetSReLU.Compute();
@@ -63033,13 +63134,29 @@ begin
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   SizeAconScratch();
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgradP1Buf, FOutput.Depth);
-    SetLength(FgradP2Buf, FOutput.Depth);
-    SetLength(FgradBetaBuf, FOutput.Depth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
+end;
+
+procedure TNNetAconC.FreeBackpropScratch();
+begin
+  SetLength(FgradP1Buf, 0);
+  SetLength(FgradP2Buf, 0);
+  SetLength(FgradBetaBuf, 0);
+end;
+
+procedure TNNetAconC.SizeBackpropScratch();
+begin
+  SetLength(FgradP1Buf, FOutput.Depth);
+  SetLength(FgradP2Buf, FOutput.Depth);
+  SetLength(FgradBetaBuf, FOutput.Depth);
+end;
+
+function TNNetAconC.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetAconC.Compute();
@@ -63181,14 +63298,31 @@ begin
   // accumulators are backprop-only.
   SetLength(FmBuf, FOutput.Depth);
   SetLength(FBetaBuf, FOutput.Depth);
-  if FIsTrainable then
-  begin
-    SetLength(FgradP1Buf, FOutput.Depth);
-    SetLength(FgradP2Buf, FOutput.Depth);
-    SetLength(FgradBetaBuf, FOutput.Depth);
-    SetLength(FBetaPathBuf, FOutput.Depth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
+end;
+
+procedure TNNetMetaAconC.FreeBackpropScratch();
+begin
+  SetLength(FgradP1Buf, 0);
+  SetLength(FgradP2Buf, 0);
+  SetLength(FgradBetaBuf, 0);
+  SetLength(FBetaPathBuf, 0);
+end;
+
+procedure TNNetMetaAconC.SizeBackpropScratch();
+begin
+  SetLength(FgradP1Buf, FOutput.Depth);
+  SetLength(FgradP2Buf, FOutput.Depth);
+  SetLength(FgradBetaBuf, FOutput.Depth);
+  SetLength(FBetaPathBuf, FOutput.Depth);
+end;
+
+function TNNetMetaAconC.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetMetaAconC.Compute();
@@ -72199,10 +72333,20 @@ begin
   SetLength(FgknBuf, 0); SetLength(FgkrawBuf, 0);
 end;
 
+procedure TNNetDeltaNet.SizeBackpropScratch();
+var
+  Depth: integer;
+begin
+  Depth := FOutput.Depth;
+  SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth);
+  SetLength(FgknBuf, Depth); SetLength(FgkrawBuf, Depth);
+end;
+
 function TNNetDeltaNet.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetDeltaNet.Destroy();
@@ -72249,11 +72393,7 @@ begin
   FGradWq.ReSize(Depth, 1, Depth); FGradWk.ReSize(Depth, 1, Depth);
   FGradWv.ReSize(Depth, 1, Depth); FGradWb.ReSize(1, 1, Depth);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth);
-    SetLength(FgknBuf, Depth); SetLength(FgkrawBuf, Depth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
 end;
 
@@ -73618,10 +73758,20 @@ begin
   SetLength(FgkrawBuf, 0); SetLength(FgaBuf, 0);
 end;
 
+procedure TNNetGatedLinearAttention.SizeBackpropScratch();
+var
+  Depth: integer;
+begin
+  Depth := FOutput.Depth;
+  SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth); SetLength(FgknBuf, Depth);
+  SetLength(FgkrawBuf, Depth); SetLength(FgaBuf, Depth);
+end;
+
 function TNNetGatedLinearAttention.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetGatedLinearAttention.Destroy();
@@ -73672,11 +73822,7 @@ begin
   FGradWv.ReSize(Depth, 1, Depth); FGradWa.ReSize(Depth, 1, Depth);
   FGradBa.ReSize(1, 1, Depth);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth); SetLength(FgknBuf, Depth);
-    SetLength(FgkrawBuf, Depth); SetLength(FgaBuf, Depth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
 end;
 
@@ -73959,10 +74105,17 @@ begin
   SetLength(FgEArrBuf, 0); SetLength(FgAArrBuf, 0);
 end;
 
+procedure TNNetNTMMemory.SizeBackpropScratch();
+begin
+  SetLength(FgWArrBuf, FNumSlots); SetLength(FgScoreArrBuf, FNumSlots);
+  SetLength(FgEArrBuf, FSlotWidth); SetLength(FgAArrBuf, FSlotWidth);
+end;
+
 function TNNetNTMMemory.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetNTMMemory.Destroy();
@@ -74031,11 +74184,7 @@ begin
   FGradWe.ReSize(FNeurons[4].FWeights); FGradBe.ReSize(FNeurons[5].FWeights);
   FGradWa.ReSize(FNeurons[6].FWeights); FGradBa.ReSize(FNeurons[7].FWeights);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgWArrBuf, FNumSlots); SetLength(FgScoreArrBuf, FNumSlots);
-    SetLength(FgEArrBuf, FSlotWidth); SetLength(FgAArrBuf, FSlotWidth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   InitMemory();
   InitDefault();
 end;
@@ -74432,10 +74581,27 @@ begin
   SetLength(Fda1Buf, 0); SetLength(FdSBuf, 0);
 end;
 
+procedure TNNetTestTimeTraining.SizeBackpropScratch();
+begin
+  SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
+  if FIsMLP then
+  begin
+    SetLength(FgW1cBuf, FHidden * FDepth); SetLength(FgW2cBuf, FDepth * FHidden);
+    SetLength(FgW1prevBuf, FHidden * FDepth); SetLength(FgW2prevBuf, FDepth * FHidden);
+    SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
+    SetLength(Fda1Buf, FHidden); SetLength(FdSBuf, FHidden);
+  end
+  else
+  begin
+    SetLength(FgWlinBuf, FDepth * FDepth); SetLength(FgWprevBuf, FDepth * FDepth);
+  end;
+end;
+
 function TNNetTestTimeTraining.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetTestTimeTraining.Destroy();
@@ -74507,23 +74673,8 @@ begin
     FWlin.ReSize(SeqLen, FDepth, FDepth);
     FResid.ReSize(SeqLen, 1, FDepth);
   end;
-  // Promote per-pass Backpropagate scratch from method locals. Backprop-only:
-  // skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
-    if FIsMLP then
-    begin
-      SetLength(FgW1cBuf, FHidden * FDepth); SetLength(FgW2cBuf, FDepth * FHidden);
-      SetLength(FgW1prevBuf, FHidden * FDepth); SetLength(FgW2prevBuf, FDepth * FHidden);
-      SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
-      SetLength(Fda1Buf, FHidden); SetLength(FdSBuf, FHidden);
-    end
-    else
-    begin
-      SetLength(FgWlinBuf, FDepth * FDepth); SetLength(FgWprevBuf, FDepth * FDepth);
-    end;
-  end;
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
 end;
 
@@ -75022,12 +75173,24 @@ begin
   SetLength(FgS1pBuf, 0); SetLength(FgS2pBuf, 0);
 end;
 
+procedure TNNetTitansMemory.SizeBackpropScratch();
+begin
+  SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
+  SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
+  SetLength(Fda1Buf, FHidden); SetLength(FdSjBuf, FHidden);
+  SetLength(FgW1Buf, FHidden * FDepth); SetLength(FgW2Buf, FDepth * FHidden);
+  SetLength(FgS1Buf, FHidden * FDepth); SetLength(FgS2Buf, FDepth * FHidden);
+  SetLength(FgW1pBuf, FHidden * FDepth); SetLength(FgW2pBuf, FDepth * FHidden);
+  SetLength(FgS1pBuf, FHidden * FDepth); SetLength(FgS2pBuf, FDepth * FHidden);
+end;
+
 function TNNetTitansMemory.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   // Base shrinks the per-neuron Delta/BackInertia mirrors; also drop our own
   // per-pass Backpropagate scratch (no-op unless transitioning to inference).
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetTitansMemory.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -75081,18 +75244,8 @@ begin
   FAlpha.ReSize(SeqLen, 1, FDepth);
   SetLength(FEtaBuf, FDepth);
   SetLength(FThetaBuf, FDepth);
-  // Promote per-pass Backpropagate scratch from method locals. Backprop-only:
-  // skip on inference-only layers (FreeBackpropScratch frees it if marked later).
-  if FIsTrainable then
-  begin
-    SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
-    SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
-    SetLength(Fda1Buf, FHidden); SetLength(FdSjBuf, FHidden);
-    SetLength(FgW1Buf, FHidden * FDepth); SetLength(FgW2Buf, FDepth * FHidden);
-    SetLength(FgS1Buf, FHidden * FDepth); SetLength(FgS2Buf, FDepth * FHidden);
-    SetLength(FgW1pBuf, FHidden * FDepth); SetLength(FgW2pBuf, FDepth * FHidden);
-    SetLength(FgS1pBuf, FHidden * FDepth); SetLength(FgS2pBuf, FDepth * FHidden);
-  end;
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then SizeBackpropScratch();
   InitDefault();
 end;
 
@@ -89235,10 +89388,23 @@ begin
   SetLength(FdWiPlane, 0);
 end;
 
+procedure TNNetSpectralConv1D.SizeBackpropScratch();
+begin
+  SetLength(FGreBuf, FSeqLen);
+  SetLength(FGimBuf, FSeqLen);
+  SetLength(FdXreBuf, FInDepth, FModes);
+  SetLength(FdXimBuf, FInDepth, FModes);
+  SetLength(FdXrePlane, FModes * FInDepth);
+  SetLength(FdXimPlane, FModes * FInDepth);
+  SetLength(FdWrPlane, FOutDepth * FModes * FInDepth);
+  SetLength(FdWiPlane, FOutDepth * FModes * FInDepth);
+end;
+
 function TNNetSpectralConv1D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetSpectralConv1D.Destroy();
@@ -89301,17 +89467,7 @@ begin
   SetLength(FWiPlane, FOutDepth * FModes * FInDepth);
   SetLength(FxrPlane, FModes * FInDepth);
   SetLength(FximPlane, FModes * FInDepth);
-  if FIsTrainable then
-  begin
-    SetLength(FGreBuf, FSeqLen);
-    SetLength(FGimBuf, FSeqLen);
-    SetLength(FdXreBuf, FInDepth, FModes);
-    SetLength(FdXimBuf, FInDepth, FModes);
-    SetLength(FdXrePlane, FModes * FInDepth);
-    SetLength(FdXimPlane, FModes * FInDepth);
-    SetLength(FdWrPlane, FOutDepth * FModes * FInDepth);
-    SetLength(FdWiPlane, FOutDepth * FModes * FInDepth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
 
   InitDefault();
   AfterWeightUpdate();
@@ -89691,10 +89847,30 @@ begin
   SetLength(FhistDBuf, 0);
 end;
 
+procedure TNNetDWT1D.SizeBackpropScratch();
+var
+  st, StepKindMax: integer;
+begin
+  SetLength(FgsBuf, FHalf);
+  SetLength(FgdBuf, FHalf);
+  SetLength(FsFBuf, FHalf);
+  SetLength(FdFBuf, FHalf);
+  SetLength(FoddInBuf, FHalf);
+  StepKindMax := Length(FStepKind) - 1;
+  SetLength(FhistSBuf, Length(FStepKind));
+  SetLength(FhistDBuf, Length(FStepKind));
+  for st := 0 to StepKindMax do
+  begin
+    SetLength(FhistSBuf[st], FHalf);
+    SetLength(FhistDBuf[st], FHalf);
+  end;
+end;
+
 function TNNetDWT1D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetDWT1D.Destroy();
@@ -89946,7 +90122,6 @@ procedure TNNetDWT1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   WeightCount, t: integer;
   TapCountM1: integer;
-  st, StepKindMax: integer;
 begin
   FPrevLayer := pPrevLayer;
   if pPrevLayer.Output.SizeY <> 1 then
@@ -89984,22 +90159,7 @@ begin
   // FsBuf/FdBuf are forward ComputeCPU scratch; the rest is backprop-only.
   SetLength(FsBuf, FHalf);
   SetLength(FdBuf, FHalf);
-  if FIsTrainable then
-  begin
-    SetLength(FgsBuf, FHalf);
-    SetLength(FgdBuf, FHalf);
-    SetLength(FsFBuf, FHalf);
-    SetLength(FdFBuf, FHalf);
-    SetLength(FoddInBuf, FHalf);
-    StepKindMax := Length(FStepKind) - 1;
-    SetLength(FhistSBuf, Length(FStepKind));
-    SetLength(FhistDBuf, Length(FStepKind));
-    for st := 0 to StepKindMax do
-    begin
-      SetLength(FhistSBuf[st], FHalf);
-      SetLength(FhistDBuf[st], FHalf);
-    end;
-  end;
+  if FIsTrainable then SizeBackpropScratch();
 
   InitDefault();
   AfterWeightUpdate();
@@ -90342,10 +90502,21 @@ begin
   SetLength(FdXimPlane, 0);
 end;
 
+procedure TNNetSpectralConv2D.SizeBackpropScratch();
+begin
+  SetLength(FGreBuf, FSizeX, FSizeY);
+  SetLength(FGimBuf, FSizeX, FSizeY);
+  SetLength(FdXreBuf, FInDepth, FModesX, FModesY);
+  SetLength(FdXimBuf, FInDepth, FModesX, FModesY);
+  SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
+  SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
+end;
+
 function TNNetSpectralConv2D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetSpectralConv2D.Destroy();
@@ -90446,15 +90617,7 @@ begin
   SetLength(FximPlane, FModesX * FModesY * FInDepth);
   SetLength(FFftRowRe, FSizeX);
   SetLength(FFftRowIm, FSizeX);
-  if FIsTrainable then
-  begin
-    SetLength(FGreBuf, FSizeX, FSizeY);
-    SetLength(FGimBuf, FSizeX, FSizeY);
-    SetLength(FdXreBuf, FInDepth, FModesX, FModesY);
-    SetLength(FdXimBuf, FInDepth, FModesX, FModesY);
-    SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
-    SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
 
   InitDefault();
   AfterWeightUpdate();
@@ -92494,10 +92657,16 @@ begin
   SetLength(FdPooledBuf, 0);
 end;
 
+procedure TNNetCondConv.SizeBackpropScratch();
+begin
+  SetLength(FdPooledBuf, FInDepth);
+end;
+
 function TNNetCondConv.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetCondConv.Destroy();
@@ -92571,8 +92740,7 @@ begin
   FPooled.ReSize(FInDepth, 1, 1);
   SetLength(FAlpha, FNumExperts);  // forward routing coefficients
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-    SetLength(FdPooledBuf, FInDepth);  // FInDepth fixed for this instance
+  if FIsTrainable then SizeBackpropScratch();
 
   InitDefault();
   RefreshCalculatePrevLayerError();
@@ -94508,10 +94676,18 @@ begin
   SetLength(FColBuf2, 0);
 end;
 
+procedure TNNetMonarchLinear.SizeBackpropScratch();
+begin
+  SetLength(FdyTBuf, FDim);
+  SetLength(FdxRBuf, FDim);
+  SetLength(FColBuf2, FBlockSize);
+end;
+
 function TNNetMonarchLinear.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetMonarchLinear.Destroy();
@@ -94554,12 +94730,7 @@ begin
   // and the backward L-grad). Length m; needed even in inference.
   SetLength(FColBuf, FBlockSize);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FdyTBuf, N);
-    SetLength(FdxRBuf, N);
-    SetLength(FColBuf2, FBlockSize);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
 
   // neuron 0 = R, neuron 1 = L (each b blocks of m*m), neuron 2 = bias (n).
   BlockWeights := FBlocks * FBlockSize * FBlockSize;
@@ -94876,10 +95047,16 @@ begin
   SetLength(FGBuf, 0);
 end;
 
+procedure TNNetKroneckerLinear.SizeBackpropScratch();
+begin
+  SetLength(FGBuf, FDim); // dY*A scratch is q x p = n reals
+end;
+
 function TNNetKroneckerLinear.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetKroneckerLinear.Destroy();
@@ -94921,8 +95098,7 @@ begin
   SetOutputErrorSize(N, 1, 1);
   FCacheBX.ReSize(N, 1, 1); // B*X is q x p = n reals
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-    SetLength(FGBuf, N); // dY*A scratch is q x p = n reals
+  if FIsTrainable then SizeBackpropScratch();
 
   // neuron 0 = A (p*p), neuron 1 = B (q*q), neuron 2 = bias (n).
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
@@ -95671,10 +95847,18 @@ begin
   SetLength(FBBuf, 0);
 end;
 
+procedure TNNetSoftDecisionTree.SizeBackpropScratch();
+begin
+  SetLength(FrBuf, FNumLeaves);
+  SetLength(FABuf, FNumInner);
+  SetLength(FBBuf, FNumInner);
+end;
+
 function TNNetSoftDecisionTree.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetSoftDecisionTree.Destroy();
@@ -95699,12 +95883,7 @@ begin
   FCacheP.ReSize(FNumInner, 1, 1);
   FCacheLeaf.ReSize(FNumLeaves, 1, 1);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FrBuf, FNumLeaves);
-    SetLength(FABuf, FNumInner);
-    SetLength(FBBuf, FNumInner);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
 
   // Gate neurons: Din weights + bias each.
   MaxInner := FNumInner - 1;
@@ -96145,10 +96324,16 @@ begin
   SetLength(FgBuf, 0);
 end;
 
+procedure TNNetHouseholderLinear.SizeBackpropScratch();
+begin
+  SetLength(FgBuf, FDim);
+end;
+
 function TNNetHouseholderLinear.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetHouseholderLinear.Destroy();
@@ -96194,7 +96379,7 @@ begin
   // Row r = the contiguous run at r*N; it holds the input fed to H_r.
   FCache.ReSize(FNumReflections, 1, N);
   // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then SetLength(FgBuf, N);
+  if FIsTrainable then SizeBackpropScratch();
 
   FVectorSize := FNeurons[0].Weights.Size;
   BuildArrNeurons();
@@ -96440,16 +96625,8 @@ end;
 procedure TNNetHyperbolicLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  // Size the per-instance backward scratch (D_out vectors plus the D_in dL/du).
-  // Backprop-only: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgBuf, FOutput.Size);
-    SetLength(FdLdvBuf, FOutput.Size);
-    SetLength(FdLdbBuf, FOutput.Size);
-    SetLength(FdLdzBuf, FOutput.Size);
-    SetLength(FdLduBuf, pPrevLayer.Output.Size);
-  end;
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then SizeBackpropScratch();
   // Append ONE extra 1-weight neuron holding the raw (pre-sigmoid) curvature,
   // wired like TNNetRetention's learnable gamma. The matrix-row backward loops
   // only touch FArrNeurons[0..D_out-1], so this neuron is invisible to them but
@@ -96504,10 +96681,21 @@ begin
   SetLength(FdzBuf, 0);
 end;
 
+procedure TNNetHyperbolicLinear.SizeBackpropScratch();
+begin
+  // D_out vectors plus the D_in dL/du.
+  SetLength(FgBuf, FOutput.Size);
+  SetLength(FdLdvBuf, FOutput.Size);
+  SetLength(FdLdbBuf, FOutput.Size);
+  SetLength(FdLdzBuf, FOutput.Size);
+  SetLength(FdLduBuf, FPrevLayer.Output.Size);
+end;
+
 function TNNetHyperbolicLinear.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetHyperbolicLinear.Destroy();
@@ -97015,10 +97203,19 @@ begin
   SetLength(FdLdbBuf, 0);
 end;
 
+procedure TNNetHyperbolicDistance.SizeBackpropScratch();
+begin
+  // Each a D_in vector.
+  SetLength(FdLdmBuf, FPrevLayer.Output.Size);
+  SetLength(FdLdaBuf, FPrevLayer.Output.Size);
+  SetLength(FdLdbBuf, FPrevLayer.Output.Size);
+end;
+
 function TNNetHyperbolicDistance.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetHyperbolicDistance.Destroy();
@@ -97036,14 +97233,8 @@ end;
 procedure TNNetHyperbolicDistance.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  // Size the per-instance backward scratch (each a D_in vector).
-  // Backprop-only: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FdLdmBuf, pPrevLayer.Output.Size);
-    SetLength(FdLdaBuf, pPrevLayer.Output.Size);
-    SetLength(FdLdbBuf, pPrevLayer.Output.Size);
-  end;
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then SizeBackpropScratch();
 end;
 
 procedure TNNetHyperbolicDistance.Compute();
@@ -99708,10 +99899,18 @@ begin
   SetLength(FgColDstBuf, 0);
 end;
 
+procedure TNNetGraphAttention.SizeBackpropScratch();
+begin
+  SetLength(FgAttSrcBuf, FOutput.Depth);
+  SetLength(FgAttDstBuf, FOutput.Depth);
+  SetLength(FgColDstBuf, FNumNodes);
+end;
+
 function TNNetGraphAttention.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 destructor TNNetGraphAttention.Destroy();
@@ -99782,12 +99981,7 @@ begin
   // backprop-only and skipped on inference-only layers.
   SetLength(FSrcScoreBuf, FNumNodes);
   SetLength(FDstScoreBuf, FNumNodes);
-  if FIsTrainable then
-  begin
-    SetLength(FgAttSrcBuf, OutFeat);
-    SetLength(FgAttDstBuf, OutFeat);
-    SetLength(FgColDstBuf, FNumNodes);
-  end;
+  if FIsTrainable then SizeBackpropScratch();
   // Size the W neurons (one per output feature) to FeatureDim_in.
   SetNumWeightsForAllNeurons(FInFeat);
   // Append the attention-vector neuron (length 2*OutFeat) if not present yet.
@@ -129113,6 +129307,8 @@ begin
   // (convolutions cache it at wiring time) so the gradient reaches the input.
   // Only transient error tensors are touched; weights are untouched.
   InputLayer := FLayers[0];
+  // Recorded on the input layer, so a later TNNet.SetTrainable(True) regrows it.
+  if InputLayer is TNNetInput then TNNetInput(InputLayer).EnableErrorCollection();
   if InputLayer.OutputError.Size <> InputLayer.Output.Size then
   begin
     InputLayer.OutputError.ReSize(InputLayer.Output);
