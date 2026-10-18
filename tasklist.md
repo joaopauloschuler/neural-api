@@ -2660,9 +2660,40 @@ rather than acted on.
         `TestKokoroRealStageCDecoderPlainParity` (opt-in),
         `TestConcatChannelsMatchesLayer`. Suites cpu / avx2 / opencl
         `TESTS=3285 ERRORS=0 FAILURES=0 IGNORED=5` (was 3282 / 4).
-  - [ ] 6.3 Stage-C generator as plain code (noise convs, ups, AdaINResBlock1
+  - [x] 6.3 Stage-C generator as plain code (noise convs, ups, AdaINResBlock1
         stacks, conv_post, then the existing exp / sin and iSTFT). Parity
         tiny + real dump; memory per frame on short real lines.
+        Done 2026-10-17 (cae177eb): `TKokoroPlainGenerator`,
+        `TKokoroPlainAdaINResBlock1` (weights read once at Create; adain fcs
+        borrowed from `FStageCGeneratorNormFc*`; Snake alphas via
+        `LoadKokoroSnakeAlphaVolume`), entry
+        `TNNetKokoro.RunStageCGeneratorPlain` (same arguments as
+        `RunStageCGenerator`; `ConvPostToAudio` shared with the net path).
+        New op `TNNetPlainOps.NormSnakeConv1D` (prepared instance norm +
+        Snake per 1024-position chunk inside the conv; Accumulate adds conv2
+        into x), `PrepareInstanceNorm` / `ApplyInstanceNorm`, `MaxThreads`
+        (the Kokoro plain decoder and generator now honour `MaxThreads`).
+        Buffers per frame (real, stage 1 = 120F+1 x 128 = 15360 floats):
+        x / x_source, resblock sum, middle resblock, conv1 output = 4 x 15360
+        = 61440 floats = 240 KB per frame at the peak (stage 0: 4 x 5120);
+        conv_post 2640 floats; ~2 MB constant ops scratch. Python ~0.27 MB
+        per frame: 0.89x; 4 full volumes is the floor without recomputation
+        (instance norm needs whole-sequence stats of x and of conv1's output).
+        Parity: tiny every checkpoint as the net test (stage1 noise_res 6.1e-6
+        rel., audio 1.4e-5 rel.), plain vs net audio 0.23 of 47963; real dump
+        (102 frames) conv_post 3.0e-6 rel., gen_spec 1.5e-5, gen_phase
+        1.4e-4 abs (test tolerance 5e-4: sin keeps conv_post's 1.8e-4 abs
+        error), audio 8.4e-5 rel. Memory (real checkpoint, synthetic inputs,
+        AVX2 probe, one process each, 2 GB cap): plain VmHWM delta 13.5 /
+        27.0 / 54.0 / 82.7 MB at F = 56 / 112 / 224 / 344 (240 KB per frame,
+        the 26 x "Hello" line fits: 16.2 s on 1 core); net VmHWM delta 441 /
+        614 / 801 MB at F = 8 / 12 / 16 (45 MB per frame; RSS 34 MB per
+        frame). Both paths loaded: +65.9 MB of plain generator weights until
+        6.5. Tests `TestKokoroStageCGeneratorPlainTinyParity`,
+        `TestKokoroRealStageCGeneratorPlainParity` (opt-in),
+        `TestNormSnakeConv1DMatchesSteps`, `TestMaxThreadsCapsTheJob`. Suites
+        cpu / avx2 / opencl `TESTS=3289 ERRORS=0 FAILURES=0 IGNORED=6` (was
+        3285 / 5).
   - [ ] 6.4 Stage B as plain code (shared bi-LSTM, F0 / N AdainResBlk1d
         branches with the depthwise-transposed upsample, projections). Parity
         tiny + real.
