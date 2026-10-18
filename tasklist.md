@@ -2867,7 +2867,7 @@ rather than acted on.
         0). Synthesis time not comparable on the loaded VM (load average
         ~2.5): HEAD 24.7 / 36.9 s, new 32.8 / 35.0 s. Suites cpu / avx2 /
         opencl `TESTS=3279 ERRORS=0 FAILURES=0 IGNORED=4`.
-  - [ ] 7.2 Free what stage A holds and never reads:
+  - [x] 7.2 Free what stage A holds and never reads:
         (a) TNNetLSTMCell allocates `FGradW` / `FGradB` and the backprop-only
         per-step sequences only when the layer is trainable (small change in
         `neuralnetwork.pas`; training must behave exactly as before; add a
@@ -2878,6 +2878,24 @@ rather than acted on.
         `PrepareStageA`; if they come back, find why (`AfterWeightUpdate`)
         and make the small layer fix. Expected: ~36 MB off the load RSS and
         ~70-100 MB off the line peak. Measure load + the 26 x line (one run).
+        Done 2026-10-18: TNNetLSTMCell sizes its gradient buffers and backward
+        carries only when trainable, keeps two alternating per-step cache rows
+        when inference-only (`SizeSequenceCaches`, re-run by a `SetTrainable`
+        override; `NonWeightBytes` reports them); new test
+        `TestLSTMCellInferenceOnlyBuffers`. Freeing after the build was not
+        enough (owner 441 -> 435 MB, line 557 -> 548 MB): the buffers and
+        weight caches were allocated while each net was still trainable,
+        before `SetTrainable(false)`, and that transient set the high-water
+        mark. So the stage-A builder now creates its layers inference-only:
+        `AddBidirectionalLSTM(..., pTrainable)` (new default-true parameter),
+        and `SetTrainable(false)` chained on bert_encoder, duration_proj and
+        the 3 text-encoder convs (low memory from the start, no concatenated
+        caches); `PrepareStageANet` flushes the remaining borrower caches
+        (the ALBERT attention out-projection) before OpenCL is armed. Real
+        KokoroTTS, 26 x "Hello", 1 core, 2 GB cap: load RSS 441 -> 348 MB,
+        peak RSS 557 -> 466 MB, WAV bit-identical to HEAD. Suites cpu / avx2
+        / opencl `TESTS=3280 ERRORS=0 FAILURES=0 IGNORED=4`; lazbuild -B
+        Default / Debug / Release of both .lpi, `--selftest` OK.
   - [ ] 7.3 Measure and decide: the 26 x "Hello" line and the SimpleKokoroTTS
         story, and if it fits under the 2 GB cap, one full 510-phoneme chunk;
         compare against the Phase 6 Python numbers. Update the README Memory
