@@ -224,27 +224,31 @@ phonemes. A frame is 25 ms of audio (40 frames per second).
 
 | Line | Phonemes | Audio | Frames | KokoroTTS peak RSS | Python peak RSS (forward) |
 | --- | --- | --- | --- | --- | --- |
-| after loading | | | | 462 MB | 1092 MB (1281 MB while loading) |
-| 1 x "Hello" | 5 | 1.40 s | 56 | 512 MB | 1110 MB |
-| 8 x "Hello" | 47 | 3.20 s | 128 | 586 MB | 1147 MB |
-| 26 x "Hello" | 155 | 10.38 s | 415 | 724 MB | 1345 MB |
-| the `SimpleKokoroTTS` story | 260 | 15.90 s | 636 | 862 MB | 1354 MB |
+| after loading | | | | 348 MB | 1092 MB (1281 MB while loading) |
+| 1 x "Hello" | 5 | 1.40 s | 56 | 364 MB | 1110 MB |
+| 8 x "Hello" | 47 | 3.20 s | 128 | 392 MB | 1147 MB |
+| 26 x "Hello" | 155 | 10.38 s | 415 | 466 MB | 1345 MB |
+| the `SimpleKokoroTTS` story | 260 | 15.90 s | 636 | 531 MB | 1354 MB |
+| a full chunk (9 sentences) | 506 | 27.70 s | 1108 | 648 MB | 1609 MB |
 
-* A line adds about 0.6 MB per frame (about 24 MB per second of audio) to
-  the 462 MB that loading takes. Python grows unevenly (0.04 to 0.7 MB per
+* A line adds about 0.27 MB per frame (about 11 MB per second of audio) to
+  the 348 MB that loading takes. Python grows unevenly (0.04 to 0.7 MB per
   frame between these lines) on top of a larger base, so KokoroTTS stays
-  below Python's peak at every measured length (0.46x to 0.64x).
+  below Python's peak at every measured length (0.33x to 0.40x).
 * Memory follows the longest chunk, not the whole line: text is split into
   chunks of at most 510 phonemes, and `TNNetKokoro.Synthesize` frees stage
-  A's net and the other per-chunk buffers before the next chunk starts. A
-  full 510-phoneme chunk (about 31 s of audio) has not been measured; from
-  the slope above it needs about 1.2 GB (estimate).
+  A's net and the other per-chunk buffers before the next chunk starts. The
+  506-phoneme chunk above is close to that limit, so at speed 1 a line of
+  any length peaks near 650 MB. Memory follows frames, so a lower `--speed`
+  (more frames per chunk) needs more.
 * Lines do not add up: in the REPL, a second 26 x "Hello" line raised the
-  peak by only 14 MB (724 MB to 738 MB).
-* `SimpleKokoroTTS` (`fox.wav`, then `story.wav`) peaked at 872 MB.
+  peak by only 12 MB (465 MB to 477 MB).
+* `SimpleKokoroTTS` (`fox.wav`, then `story.wav`) peaked at 538 MB.
 
-Speed on the same VM (1 core): synthesis took 28.8 s for the 10.38 s line
-(real-time factor 2.8); Python's forward took 16.8 s.
+Speed on the same VM (1 core): synthesis took 31.3 s for the 10.38 s line
+and 78.0 s for the 27.70 s chunk (real-time factor 2.8 to 3.0); Python's
+forward took 16.8 s and 57.6 s. Other work was running on the VM, so these
+times can be off by several seconds.
 
 ## Smoke run without the real checkpoint
 
