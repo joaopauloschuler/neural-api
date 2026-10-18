@@ -2694,9 +2694,39 @@ rather than acted on.
         `TestNormSnakeConv1DMatchesSteps`, `TestMaxThreadsCapsTheJob`. Suites
         cpu / avx2 / opencl `TESTS=3289 ERRORS=0 FAILURES=0 IGNORED=6` (was
         3285 / 5).
-  - [ ] 6.4 Stage B as plain code (shared bi-LSTM, F0 / N AdainResBlk1d
+  - [x] 6.4 Stage B as plain code (shared bi-LSTM, F0 / N AdainResBlk1d
         branches with the depthwise-transposed upsample, projections). Parity
         tiny + real.
+        Done 2026-10-17: `TKokoroPlainF0NPredictor` (shared bi-LSTM as two
+        `TNNetPlainLSTMWeights` via `LoadTorchLSTM`, F0 / N branches of
+        `TKokoroPlainAdainResBlock`, F0_proj / N_proj; weights read once at
+        `TNNetKokoro.Create`, norm fcs borrowed from `FStageBNormFc*`; block
+        widths from the shared `KokoroF0NBlockHalvesWidth`), entry
+        `TNNetKokoro.RunStageBPlain` (same arguments as `RunStageB`; honours
+        Parallel / MaxThreads; frees its buffers after). Buffers per frame
+        (real, hidden 512): en 640 floats (freed after the bi-LSTM), bi-LSTM
+        output 512, two block outputs 512 each, workspace Work1 / Work2 /
+        Shortcut up to 512 / 1024 / 512, ops' bi-LSTM projection scratch
+        2048 (kept): peak ~5632 floats = 22 KB per frame; measured end-of-run
+        buffers 20 KB per frame + 0.27 MB constant. Memory (real checkpoint,
+        synthetic d, AVX2 probe, 2 GB cap): plain VmHWM delta 0.19 MB at
+        F = 56 / 112 / 224 / 344 (reuses heap already resident); net VmHWM
+        delta 40 / 64 / 142 / 212 MB (0.60 MB per frame), RSS delta 0.34 MB
+        per frame. Both paths loaded: +27.5 MB of plain stage-B weights until
+        6.5. Parity (same tolerances as the net tests): tiny F0_pred 4.1e-6
+        rel., N_pred 3.8e-6 (net 3.7e-6 / 3.0e-6), plain vs net F0 2.6e-4
+        of 141, N 2.5e-6; real dump (102 frames) F0_pred 5.9e-7 rel., N_pred
+        6.0e-7, every block <= 1.7e-6 rel. (net 4.9e-7 / 6.0e-7). Preview
+        for 6.5, 26 x "Hello" (155 code points, 157 tokens, 415 frames,
+        10.38 s of audio): stage A net (released after) -> plain B -> plain
+        decoder -> harmonic spectrum -> plain generator under the 2 GB cap,
+        peak RSS (VmHWM) 1265 MB, set by stage A (load 1026 MB; B / C add
+        nothing to the peak), 40.6 s total on 1 core (load 14.8 s, A 5.3 s,
+        B 0.4 s, decoder 1.1 s, generator 19.0 s). Tests
+        `TestKokoroStageBPlainTinyParity`, `TestKokoroRealStageBPlainParity`
+        (same gate as `TestKokoroRealStageBParity`: snapshot + dump present).
+        Suites cpu / avx2 / opencl `TESTS=3291 ERRORS=0 FAILURES=0
+        IGNORED=6` (was 3289); lazbuild -B KokoroTTS builds.
   - [ ] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
         release stage A's net after use and drop its spare weight copies
         (`FlushWeightCache` after `SetTrainable(false)`); rewrite the stage
