@@ -823,8 +823,8 @@ type
     // Stage-C generator armed for OpenCL vs the CPU at two frame counts, with
     // a style rewrite on the same net.
     procedure TestKokoroStageCGeneratorOpenCLParity;
-    // SynthesizePhonemes on the tiny fixture: equals the stages run one by one
-    // (x handed over from the decoder's layer); reports the diff to the dump.
+    // SynthesizePhonemes on the tiny fixture: equals the stages run one by
+    // one; reports the diff to the dump.
     procedure TestKokoroTinySynthesizePhonemes;
     // English text on the tiny fixture with the G2P fixture dictionaries: one
     // chunk equals SynthesizePhonemes; several equal the per-chunk audio joined.
@@ -26017,18 +26017,19 @@ begin
     Kokoro.SynthesizePhonemes('h' + #$CB#$88 + 'O.', Voice, 1.0, Audio,
       SkippedSymbols);
     AssertEquals('no skipped symbol', '', SkippedSymbols);
-    // The same stages with x copied on the host.
+    // The same stages called one by one.
     TokenIds := KokoroPhonemesToIds(Config, 'h' + #$CB#$88 + 'O.',
       SkippedSymbols);
     SelectKokoroVoiceStyle(Voice, 4, DecoderStyle, ProsodyStyle);
     Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
       TextFeatures, Durations);
-    Kokoro.RunStageB(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
-    Kokoro.RunStageCDecoder(TextFeatures, Durations, F0Curve, NCurve,
+    Kokoro.RunStageBPlain(DurationFeatures, Durations, ProsodyStyle, F0Curve,
+      NCurve);
+    Kokoro.RunStageCDecoderPlain(TextFeatures, Durations, F0Curve, NCurve,
       DecoderStyle, DecoderFeatures);
     Kokoro.ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum);
-    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
-      ChainAudio);
+    Kokoro.RunStageCGeneratorPlain(DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle, ChainAudio);
     AssertEquals('SynthesizePhonemes vs the stages one by one', 0,
       MaxAbsVolumeDiff(Audio, ChainAudio), 0);
     // The chain up to the generator inputs matches the dump.
@@ -26045,8 +26046,8 @@ begin
     // alone (tasklist 2.9) do to the audio.
     LoadKokoroStageCGeneratorInputs(Reference, Config.StyleDim,
       Config.DecoderBlockCount, DecoderFeatures, ChainAudio, DecoderStyle);
-    Kokoro.RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
-      ChainAudio);
+    Kokoro.RunStageCGeneratorPlain(DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle, ChainAudio);
     MaxDiff := KokoroAudioDiff(Reference, ChainAudio, RMSDiff, ReferenceMaxAbs,
       ReferenceRMS);
     WriteLn('  Kokoro tiny generator on the dump''s x, our harmonic phases: ',

@@ -54216,14 +54216,14 @@ begin
   try
     RunStageA(TokenIds, ProsodyStyle, Speed, DurationFeatures, TextFeatures,
       Durations);
-    RunStageB(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
-    RunStageCDecoder(TextFeatures, Durations, F0Curve, NCurve, DecoderStyle,
-      DecoderFeatures);
+    // Stage A's activations are the largest allocation of a line.
+    ReleaseStageA();
+    RunStageBPlain(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
+    RunStageCDecoderPlain(TextFeatures, Durations, F0Curve, NCurve,
+      DecoderStyle, DecoderFeatures);
     ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum);
-    // x goes over from the decoder's last layer (an OpenCL buffer copy when
-    // it is resident).
-    RunStageCGeneratorFrom(FStageCDecoderNet.GetLastLayer(), DecoderFeatures,
-      HarmonicSpectrum, DecoderStyle, Audio);
+    RunStageCGeneratorPlain(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
+      Audio);
   finally
     HarmonicSpectrum.Free;
     DecoderFeatures.Free;
