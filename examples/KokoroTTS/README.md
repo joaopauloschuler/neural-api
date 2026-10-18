@@ -271,7 +271,7 @@ StyleTTS2 + iSTFTNet, 81.7M parameters) into `TNNetKokoro`
 text -> English G2P (neural/neuralg2p.pas, misaki's dictionaries)
   -> chunks of at most 510 phonemes (split at sentence punctuation, as kokoro's KPipeline)
   -> per chunk: phonemes -> ids (config.json vocab, wrapped in 0s)
-     -> stage A, TNNet (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
+     -> stage A, three TNNets (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
      -> stage B, plain code (F0 and energy curves)
      -> stage-C decoder, plain code
      -> harmonic source + STFT (host)
@@ -279,9 +279,12 @@ text -> English G2P (neural/neuralg2p.pas, misaki's dictionaries)
   -> chunk audio joined with no gap -> WAV
 ```
 
-Stage A is a `TNNet` run by `TNNet.Compute`: its weights are loaded once,
-and per chunk `TNNetKokoro` builds the net for that chunk's length on those
-weights (no second copy) and frees it after stage A has run. Stages B and C
+Stage A is three `TNNet`s run by `TNNet.Compute`: the PL-BERT embeddings,
+ALBERT's one shared layer (run 12 times, each output fed back as the next
+input) and the rest (text encoder, duration predictor). Their weights are
+loaded once, and per chunk `TNNetKokoro` builds the nets for that chunk's
+length on those weights (no second copy) and frees them after stage A has
+run. Stages B and C
 are plain Pascal code on `TNNetVolume` buffers (`neural/neuralplainops.pas`,
 called by `TNNetKokoro`): their weights are loaded once, and each step reuses
 a few buffers instead of keeping one set per layer. `--gpu` runs stage A on

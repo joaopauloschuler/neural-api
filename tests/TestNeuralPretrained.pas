@@ -24110,112 +24110,6 @@ begin
   end;
 end;
 
-procedure TTestNeuralPretrained.CheckKokoroStageAParity(Kokoro: TNNetKokoro;
-  const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean);
-var
-  Reference: TNNetSafeTensorsReader;
-  Values, DurationFeatures, TextFeatures, DurationSums: TNNetVolume;
-  TokenIds, Durations: TNeuralIntegerArray;
-  ProsodyStyle: TNeuralFloatDynArr;
-  Layers: TKokoroStageALayers;
-  TokenPos, StylePos, LayerPos, StyleDim: integer;
-  StartTime: TDateTime;
-
-  procedure CheckStage(const StageName: string; Actual: TNNetVolume;
-    ChannelMajor: boolean);
-  begin
-    CheckKokoroStage(Reference, StageName, Actual, ChannelMajor, Tolerance,
-      Relative);
-  end;
-
-begin
-  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
-  Values := TNNetVolume.Create;
-  DurationFeatures := TNNetVolume.Create;
-  TextFeatures := TNNetVolume.Create;
-  DurationSums := TNNetVolume.Create;
-  try
-    Reference.LoadTensorFlat('input_ids', Values);
-    SetLength(TokenIds, Values.Size);
-    for TokenPos := 0 to Values.Size - 1 do
-      TokenIds[TokenPos] := Round(Values.FData[TokenPos]);
-    // ref_s = [decoder style | prosody style].
-    Reference.LoadTensorFlat('ref_s', Values);
-    StyleDim := Kokoro.Config.StyleDim;
-    AssertEquals('ref_s width', 2 * StyleDim, Values.Size);
-    SetLength(ProsodyStyle, StyleDim);
-    for StylePos := 0 to StyleDim - 1 do
-      ProsodyStyle[StylePos] := Values.FData[StyleDim + StylePos];
-    Kokoro.ShareHostOutputs := false;
-    StartTime := Now();
-    Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
-      TextFeatures, Durations);
-    WriteLn('  Kokoro stage A, ', Length(TokenIds), ' tokens: ',
-      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms (build + forward)');
-    Layers := Kokoro.StageALayers;
-    CheckStage('bert_embeddings', Layers.BertEmbeddings.Output, false);
-    CheckStage('bert_hidden_in', Layers.BertHiddenIn.Output, false);
-    for LayerPos := 0 to High(Layers.BertBlocks) do
-      CheckStage('bert_layer' + IntToStr(LayerPos),
-        Layers.BertBlocks[LayerPos].Output, false);
-    CheckStage('bert', Layers.BertBlocks[High(Layers.BertBlocks)].Output,
-      false);
-    CheckStage('d_en', Layers.BertEncoder.Output, true);
-    for LayerPos := 0 to High(Layers.DurationNorms) do
-      CheckStage('dur_enc_adanorm' + IntToStr(LayerPos),
-        Layers.DurationNorms[LayerPos].Output, false);
-    CheckStage('d', Layers.DurationEncoder.Output, false);
-    CheckStage('d', DurationFeatures, false);
-    CheckStage('duration_lstm', Layers.DurationLSTM.Output, false);
-    CheckStage('duration_logits', Layers.DurationProj.Output, false);
-    // duration is [1, T]: one channel over T tokens.
-    DurationSums.ReSize(Length(TokenIds), 1, 1);
-    for TokenPos := 0 to High(TokenIds) do
-      DurationSums.FData[TokenPos] := TNNetVolume.Sum(
-        Layers.DurationSigmoid.Output.GetRawPtr(TokenPos, 0),
-        Kokoro.Config.MaxDur);
-    CheckStage('duration', DurationSums, false);
-    Reference.LoadTensorFlat('pred_dur', Values);
-    AssertEquals('pred_dur count', Values.Size, Length(Durations));
-    for TokenPos := 0 to High(Durations) do
-      AssertEquals('pred_dur[' + IntToStr(TokenPos) + ']',
-        Round(Values.FData[TokenPos]), Durations[TokenPos]);
-    CheckStage('text_embedding', Layers.TextEmbedding.Output, false);
-    for LayerPos := 0 to High(Layers.TextBlocks) do
-      CheckStage('text_cnn' + IntToStr(LayerPos),
-        Layers.TextBlocks[LayerPos].Output, true);
-    CheckStage('t_en', Layers.TextLSTM.Output, true);
-    CheckStage('t_en', TextFeatures, true);
-  finally
-    DurationSums.Free;
-    TextFeatures.Free;
-    DurationFeatures.Free;
-    Values.Free;
-    Reference.Free;
-  end;
-end;
-
-procedure TTestNeuralPretrained.CheckKokoroStage(
-  Reference: TNNetSafeTensorsReader; const StageName: string;
-  Actual: TNNetVolume; ChannelMajor: boolean; Tolerance: TNeuralFloat;
-  Relative: boolean);
-var
-  MaxDiff, ReferenceMaxAbs, Measure: TNeuralFloat;
-begin
-  MaxDiff := KokoroStageMaxDiff(Reference, StageName, Actual, ChannelMajor,
-    ReferenceMaxAbs);
-  AssertTrue(StageName + ': shape ' + IntToStr(Actual.SizeX) + 'x' +
-    IntToStr(Actual.SizeY) + 'x' + IntToStr(Actual.Depth) + ' vs ' +
-    Reference.ShapeAsString(StageName), MaxDiff >= 0);
-  Measure := MaxDiff;
-  if Relative then Measure := MaxDiff / Max(ReferenceMaxAbs, 1e-30);
-  WriteLn('  Kokoro ', StageName, ': max |diff| = ', MaxDiff:0:9,
-    ' (max |ref| = ', ReferenceMaxAbs:0:4, ', rel. ',
-    (MaxDiff / Max(ReferenceMaxAbs, 1e-30)):0:9, ')');
-  AssertTrue(StageName + ': max |diff| = ' + FloatToStr(MaxDiff) +
-    ', max |ref| = ' + FloatToStr(ReferenceMaxAbs), Measure < Tolerance);
-end;
-
 type
   // OnCheckpoint target of a plain stage: each checkpoint vs the dump.
   TKokoroPlainCheckpointChecker = class
@@ -24245,6 +24139,125 @@ begin
   Test.CheckKokoroStage(Reference, CheckpointName, Values, ChannelMajor,
     Tolerance, Relative);
   Inc(CheckedCount);
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStageAParity(Kokoro: TNNetKokoro;
+  const ReferenceFile: string; Tolerance: TNeuralFloat; Relative: boolean);
+var
+  Reference: TNNetSafeTensorsReader;
+  Values, DurationFeatures, TextFeatures, DurationSums: TNNetVolume;
+  TokenIds, Durations: TNeuralIntegerArray;
+  ProsodyStyle: TNeuralFloatDynArr;
+  Layers: TKokoroStageALayers;
+  TokenPos, StylePos, LayerPos, StyleDim: integer;
+  StartTime: TDateTime;
+  BertChecker: TKokoroPlainCheckpointChecker;
+
+  procedure CheckStage(const StageName: string; Actual: TNNetVolume;
+    ChannelMajor: boolean);
+  begin
+    CheckKokoroStage(Reference, StageName, Actual, ChannelMajor, Tolerance,
+      Relative);
+  end;
+
+begin
+  Reference := TNNetSafeTensorsReader.Create(ReferenceFile);
+  Values := TNNetVolume.Create;
+  DurationFeatures := TNNetVolume.Create;
+  TextFeatures := TNNetVolume.Create;
+  DurationSums := TNNetVolume.Create;
+  BertChecker := TKokoroPlainCheckpointChecker.Create;
+  try
+    // Each ALBERT repeat's output, checked while RunStageA runs.
+    BertChecker.Test := Self;
+    BertChecker.Reference := Reference;
+    BertChecker.Tolerance := Tolerance;
+    BertChecker.Relative := Relative;
+    SetLength(BertChecker.TokenMajorStages,
+      Kokoro.Config.PLBert.NumHiddenLayers);
+    for LayerPos := 0 to High(BertChecker.TokenMajorStages) do
+      BertChecker.TokenMajorStages[LayerPos] := 'bert_layer' + IntToStr(LayerPos);
+    Kokoro.OnStageACheckpoint := @BertChecker.Check;
+    Reference.LoadTensorFlat('input_ids', Values);
+    SetLength(TokenIds, Values.Size);
+    for TokenPos := 0 to Values.Size - 1 do
+      TokenIds[TokenPos] := Round(Values.FData[TokenPos]);
+    // ref_s = [decoder style | prosody style].
+    Reference.LoadTensorFlat('ref_s', Values);
+    StyleDim := Kokoro.Config.StyleDim;
+    AssertEquals('ref_s width', 2 * StyleDim, Values.Size);
+    SetLength(ProsodyStyle, StyleDim);
+    for StylePos := 0 to StyleDim - 1 do
+      ProsodyStyle[StylePos] := Values.FData[StyleDim + StylePos];
+    Kokoro.ShareHostOutputs := false;
+    StartTime := Now();
+    Kokoro.RunStageA(TokenIds, ProsodyStyle, 1.0, DurationFeatures,
+      TextFeatures, Durations);
+    WriteLn('  Kokoro stage A, ', Length(TokenIds), ' tokens: ',
+      ((Now() - StartTime) * MSecsPerDay):0:1, ' ms (build + forward)');
+    Kokoro.OnStageACheckpoint := nil;
+    AssertEquals('ALBERT repeats checked',
+      Kokoro.Config.PLBert.NumHiddenLayers, BertChecker.CheckedCount);
+    Layers := Kokoro.StageALayers;
+    CheckStage('bert_embeddings', Layers.BertEmbeddings.Output, false);
+    CheckStage('bert_hidden_in', Layers.BertHiddenIn.Output, false);
+    CheckStage('bert', Layers.BertBlock.Output, false);
+    CheckStage('d_en', Layers.BertEncoder.Output, true);
+    for LayerPos := 0 to High(Layers.DurationNorms) do
+      CheckStage('dur_enc_adanorm' + IntToStr(LayerPos),
+        Layers.DurationNorms[LayerPos].Output, false);
+    CheckStage('d', Layers.DurationEncoder.Output, false);
+    CheckStage('d', DurationFeatures, false);
+    CheckStage('duration_lstm', Layers.DurationLSTM.Output, false);
+    CheckStage('duration_logits', Layers.DurationProj.Output, false);
+    // duration is [1, T]: one channel over T tokens.
+    DurationSums.ReSize(Length(TokenIds), 1, 1);
+    for TokenPos := 0 to High(TokenIds) do
+      DurationSums.FData[TokenPos] := TNNetVolume.Sum(
+        Layers.DurationSigmoid.Output.GetRawPtr(TokenPos, 0),
+        Kokoro.Config.MaxDur);
+    CheckStage('duration', DurationSums, false);
+    Reference.LoadTensorFlat('pred_dur', Values);
+    AssertEquals('pred_dur count', Values.Size, Length(Durations));
+    for TokenPos := 0 to High(Durations) do
+      AssertEquals('pred_dur[' + IntToStr(TokenPos) + ']',
+        Round(Values.FData[TokenPos]), Durations[TokenPos]);
+    CheckStage('text_embedding', Layers.TextEmbedding.Output, false);
+    for LayerPos := 0 to High(Layers.TextBlocks) do
+      CheckStage('text_cnn' + IntToStr(LayerPos),
+        Layers.TextBlocks[LayerPos].Output, true);
+    CheckStage('t_en', Layers.TextLSTM.Output, true);
+    CheckStage('t_en', TextFeatures, true);
+  finally
+    Kokoro.OnStageACheckpoint := nil;
+    BertChecker.Free;
+    DurationSums.Free;
+    TextFeatures.Free;
+    DurationFeatures.Free;
+    Values.Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckKokoroStage(
+  Reference: TNNetSafeTensorsReader; const StageName: string;
+  Actual: TNNetVolume; ChannelMajor: boolean; Tolerance: TNeuralFloat;
+  Relative: boolean);
+var
+  MaxDiff, ReferenceMaxAbs, Measure: TNeuralFloat;
+begin
+  MaxDiff := KokoroStageMaxDiff(Reference, StageName, Actual, ChannelMajor,
+    ReferenceMaxAbs);
+  AssertTrue(StageName + ': shape ' + IntToStr(Actual.SizeX) + 'x' +
+    IntToStr(Actual.SizeY) + 'x' + IntToStr(Actual.Depth) + ' vs ' +
+    Reference.ShapeAsString(StageName), MaxDiff >= 0);
+  Measure := MaxDiff;
+  if Relative then Measure := MaxDiff / Max(ReferenceMaxAbs, 1e-30);
+  WriteLn('  Kokoro ', StageName, ': max |diff| = ', MaxDiff:0:9,
+    ' (max |ref| = ', ReferenceMaxAbs:0:4, ', rel. ',
+    (MaxDiff / Max(ReferenceMaxAbs, 1e-30)):0:9, ')');
+  AssertTrue(StageName + ': max |diff| = ' + FloatToStr(MaxDiff) +
+    ', max |ref| = ' + FloatToStr(ReferenceMaxAbs), Measure < Tolerance);
 end;
 
 // The stage-B inputs of a Kokoro dump: d as (T,1,C), pred_dur and the
@@ -24314,12 +24327,14 @@ begin
   try
     CheckKokoroStageAParity(Kokoro, FixturePath('tiny_kokoro82m_ref.safetensors'),
       1e-4, {Relative=}false);
-    // One shared ALBERT block: every repeat reads block 0's neurons.
+    // One shared ALBERT block, run once per repeat, borrowing the owner's rows.
     Layers := Kokoro.StageALayers;
-    AssertEquals('ALBERT repeats', 3, Length(Layers.BertBlocks));
-    AssertTrue('repeat 2 shares block 0 gamma',
-      Layers.BertBlocks[2].Neurons[0].Weights =
-      Layers.BertBlocks[0].Neurons[0].Weights);
+    AssertEquals('ALBERT repeats', 3, Kokoro.Config.PLBert.NumHiddenLayers);
+    AssertTrue('the block net ends in the shared block',
+      Kokoro.StageABlockNet.GetLastLayer() = Layers.BertBlock);
+    AssertTrue('the block borrows the owner gamma',
+      Layers.BertBlock.Neurons[0].Weights =
+      Kokoro.StageABlockOwner.GetLastLayer().Neurons[0].Weights);
   finally
     Kokoro.Free;
   end;
@@ -24360,13 +24375,17 @@ begin
     RunTinyKokoroStageA(Kokoro, LongIds, LongD, LongT, LongDurations);
     // Only the three TNNetEmbedding tables: they size in the constructor,
     // before the net is known, and the link frees them.
-    AssertEquals('borrowing net sizes only the embedding tables',
+    AssertEquals('borrowing nets size only the embedding tables',
       (Kokoro.Config.NumTokens + 2) * Kokoro.Config.PLBert.EmbeddingSize +
       Kokoro.Config.NumTokens * Kokoro.Config.HiddenDim,
-      Kokoro.StageANet.WeightElementsSized());
+      Kokoro.StageAFrontNet.WeightElementsSized() +
+      Kokoro.StageABlockNet.WeightElementsSized() +
+      Kokoro.StageATailNet.WeightElementsSized());
     RunTinyKokoroStageA(Kokoro, ShortIds, ShortD, ShortT, ShortDurations);
-    AssertEquals('short net is 4 tokens', 4,
-      Kokoro.StageANet.Layers[0].Output.SizeX);
+    AssertEquals('short block net is 4 tokens', 4,
+      Kokoro.StageABlockNet.Layers[0].Output.SizeX);
+    AssertEquals('short tail net is 4 tokens', 4,
+      Kokoro.StageATailNet.Layers[0].Output.SizeX);
     RunTinyKokoroStageA(FreshKokoro, ShortIds, FreshD, FreshT, FreshDurations);
     AssertEquals('short d vs fresh build', 0, MaxAbsVolumeDiff(ShortD, FreshD), 1e-6);
     AssertEquals('short t_en vs fresh build', 0, MaxAbsVolumeDiff(ShortT, FreshT), 1e-6);
@@ -24398,7 +24417,9 @@ var
   CPUDurations, CLDurations: TNeuralIntegerArray;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  RunPos, TokenPos, LayerPos, MaxLayerPos, OpenCLLayerCount: integer;
+  RunPos, TokenPos, LayerPos, MaxLayerPos, OpenCLLayerCount, NetPos: integer;
+  LayerCount: integer;
+  StageANets: array[0..2] of TNNet;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -24424,7 +24445,9 @@ begin
       else
       begin
         CLKokoro.PrepareStageA(Length(ShortIds));
-        CLKokoro.StageANet.ForceOpenCL(true);
+        CLKokoro.StageAFrontNet.ForceOpenCL(true);
+        CLKokoro.StageABlockNet.ForceOpenCL(true);
+        CLKokoro.StageATailNet.ForceOpenCL(true);
         RunTinyKokoroStageA(CPUKokoro, ShortIds, CPUD, CPUT, CPUDurations,
           0.2 + RunPos);
         RunTinyKokoroStageA(CLKokoro, ShortIds, CLD, CLT, CLDurations,
@@ -24432,12 +24455,20 @@ begin
       end;
       AssertTrue('owner armed', CLKokoro.StageAOwnerOnOpenCL);
       OpenCLLayerCount := 0;
-      MaxLayerPos := CLKokoro.StageANet.GetLastLayerIdx();
-      for LayerPos := 0 to MaxLayerPos do
-        if CLKokoro.StageANet.Layers[LayerPos].ForwardGPUCnt > 0 then
-          Inc(OpenCLLayerCount);
+      LayerCount := 0;
+      StageANets[0] := CLKokoro.StageAFrontNet;
+      StageANets[1] := CLKokoro.StageABlockNet;
+      StageANets[2] := CLKokoro.StageATailNet;
+      for NetPos := 0 to High(StageANets) do
+      begin
+        MaxLayerPos := StageANets[NetPos].GetLastLayerIdx();
+        Inc(LayerCount, MaxLayerPos + 1);
+        for LayerPos := 0 to MaxLayerPos do
+          if StageANets[NetPos].Layers[LayerPos].ForwardGPUCnt > 0 then
+            Inc(OpenCLLayerCount);
+      end;
       WriteLn('  Kokoro stage A OpenCL run ', RunPos, ': ', OpenCLLayerCount,
-        ' of ', MaxLayerPos + 1, ' layers on OpenCL, max |diff| d = ',
+        ' of ', LayerCount, ' layers on OpenCL, max |diff| d = ',
         MaxAbsVolumeDiff(CPUD, CLD):0:9, ', t_en = ',
         MaxAbsVolumeDiff(CPUT, CLT):0:9);
       AssertTrue('layers on OpenCL in run ' + IntToStr(RunPos),

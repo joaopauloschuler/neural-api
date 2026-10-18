@@ -5514,17 +5514,20 @@ procedure RepeatTokenRows(Source: TNNetVolume;
   const Durations: array of integer; Dest: TNNetVolume);
 
 const
-  // Stage-A input channels: token id, token type (always 0), then the
-  // prosody style (style_dim channels, the same on every token).
+  // Stage-A input channels: token id, token type (always 0), the prosody
+  // style (style_dim channels, the same on every token), then PL-BERT's
+  // output (hidden_size channels, written by the host before the tail runs).
   KokoroStageATokenChannel = 0;
   KokoroStageAStyleChannel = 2;
 
 type
-  // The stage-A layers the host reads or writes (BuildKokoroStageANet).
+  // The stage-A layers the host reads or writes (BuildKokoroStageANets).
   TKokoroStageALayers = record
     BertEmbeddings: TNNetLayer;            // embeddings.LayerNorm
     BertHiddenIn: TNNetLayer;              // embedding_hidden_mapping_in
-    BertBlocks: array of TNNetLayer;       // each repeat's full_layer_layer_norm
+    // The shared ALBERT layer's full_layer_layer_norm (the last repeat's
+    // output after a run).
+    BertBlock: TNNetLayer;
     BertEncoder: TNNetLayer;               // bert_encoder: d_en
     // [d_en; style], then each [AdaLayerNorm; style]; the last one is d.
     DurationConcats: array of TNNetLayer;
@@ -5540,10 +5543,16 @@ type
     TextLSTM: TNNetLayer;                  // t_en
   end;
 
-// Adds Kokoro stage A for TokenCount tokens to the empty NN (see the
-// KokoroStageA* channels); the output is [d; sigmoid(duration); t_en] per token.
-function BuildKokoroStageANet(NN: TNNet; const Config: TKokoroConfig;
-  TokenCount: integer): TKokoroStageALayers;
+// Adds Kokoro stage A for TokenCount tokens to three empty nets: FrontNet
+// (PL-BERT embeddings), BlockNet (the shared ALBERT layer, run
+// num_hidden_layers times), TailNet (bert_encoder, duration predictor, text
+// encoder). Front and tail read the KokoroStageA* input; the tail's output is
+// [d; sigmoid(duration); t_en] per token.
+function BuildKokoroStageANets(FrontNet, BlockNet, TailNet: TNNet;
+  const Config: TKokoroConfig; TokenCount: integer): TKokoroStageALayers;
+
+// Stage-A input depth: ids, types, style, PL-BERT output.
+function KokoroStageAInputDepth(const Config: TKokoroConfig): integer;
 
 const
   // AdainResBlk1d count of each ProsodyPredictor F0 / N branch.
@@ -5745,16 +5754,18 @@ type
 
 type
   // Kokoro-82M: stage A (text side: PL-BERT, duration predictor, text
-  // encoder) as a TNNet sized per utterance that borrows the weights of an
-  // owner net built once; stage B (prosody: F0Ntrain), the stage-C decoder
+  // encoder) as three TNNets sized per utterance that borrow the weights of
+  // owner nets built once; stage B (prosody: F0Ntrain), the stage-C decoder
   // and the stage-C generator as plain code on TNNetPlainOps; the harmonic
   // spectrum and the iSTFT as host steps. Coded by Claude (AI).
   TNNetKokoro = class(TObject)
   private
     FConfig: TKokoroConfig;
-    FStageAOwner: TNNet;
-    FStageANet: TNNet;
+    // Weight owners built once; the per-utterance nets borrow their rows.
+    FStageAFrontOwner, FStageABlockOwner, FStageATailOwner: TNNet;
+    FStageAFrontNet, FStageABlockNet, FStageATailNet: TNNet;
     FStageALayers: TKokoroStageALayers;
+    FOnStageACheckpoint: TKokoroPlainCheckpointProc;
     FStageATokenCount: integer;
     FStageAInput: TNNetVolume;
     // predictor.text_encoder AdaLayerNorm fc: [2*hidden_dim, style_dim] + bias.
@@ -5787,6 +5798,8 @@ type
     procedure SetEnglishDictionaryDir(const Value: string);
     // Each loader adds the tensors it reads to Consumed.
     procedure LoadStageA(Reader: TNNetSafeTensorsReader; Consumed: TStrings);
+    // Threads, host-output sharing and OpenCL of one freshly built stage-A net.
+    procedure PrepareStageANet(NN: TNNet);
     // decoder.generator.m_source.l_linear into FHarmonicSource.
     procedure LoadHarmonicSource(Reader: TNNetSafeTensorsReader;
       Consumed: TStrings);
@@ -5800,9 +5813,10 @@ type
     constructor Create(Reader: TNNetSafeTensorsReader;
       const Config: TKokoroConfig);
     destructor Destroy(); override;
-    // (Re)builds StageANet for TokenCount tokens; a same-length call is free.
+    // (Re)builds the stage-A nets for TokenCount tokens; a same-length call
+    // is free.
     procedure PrepareStageA(TokenCount: integer);
-    // Frees StageANet and its activations; the weights stay.
+    // Frees the stage-A nets and their activations; the weights stay.
     procedure ReleaseStageA();
     // Stage A for TokenIds (with the wrapping 0s): d (T,1,hidden+style) into
     // DurationFeatures, t_en (T,1,hidden) into TextFeatures, frames per token.
@@ -5831,7 +5845,7 @@ type
     procedure RunStageCGenerator(DecoderFeatures, HarmonicSpectrum: TNNetVolume;
       const DecoderStyle: array of TNeuralFloat; Audio: TNNetVolume);
     // Every stage: TokenIds (wrapped in 0s) and a voice row -> Audio at 24 kHz.
-    // Frees StageANet once stage A's outputs are copied out.
+    // Frees the stage-A nets once stage A's outputs are copied out.
     procedure Synthesize(const TokenIds: array of integer;
       const DecoderStyle, ProsodyStyle: array of TNeuralFloat;
       Speed: TNeuralFloat; Audio: TNNetVolume);
@@ -5876,10 +5890,18 @@ type
       write SetEnglishDictionaryDir;
     // nil until the first text call.
     property EnglishG2P: TNeuralEnglishG2P read FEnglishG2P;
-    property StageAOwner: TNNet read FStageAOwner;
-    property StageANet: TNNet read FStageANet;
-    // The layers of StageANet (valid until the next rebuild).
+    property StageAFrontOwner: TNNet read FStageAFrontOwner;
+    property StageABlockOwner: TNNet read FStageABlockOwner;
+    property StageATailOwner: TNNet read FStageATailOwner;
+    // nil until PrepareStageA and after ReleaseStageA.
+    property StageAFrontNet: TNNet read FStageAFrontNet;
+    property StageABlockNet: TNNet read FStageABlockNet;
+    property StageATailNet: TNNet read FStageATailNet;
+    // The layers of the stage-A nets (valid until the next rebuild).
     property StageALayers: TKokoroStageALayers read FStageALayers;
+    // Called by RunStageA with 'bert_layer<i>' and each ALBERT repeat's output.
+    property OnStageACheckpoint: TKokoroPlainCheckpointProc
+      read FOnStageACheckpoint write FOnStageACheckpoint;
     property StageB: TKokoroPlainF0NPredictor read FStageB;
     property StageCDecoder: TKokoroPlainDecoder read FStageCDecoder;
     property StageCGenerator: TKokoroPlainGenerator read FStageCGenerator;
@@ -5890,11 +5912,11 @@ type
     property HarmonicSource: TNNetHarmonicSource read FHarmonicSource;
     property HarmonicSTFT: TNNetForwardSTFT read FHarmonicSTFT;
     property HarmonicWave: TNNetVolume read FHarmonicWave;
-    // Parallel and MaxThreads: read when StageANet is built and by each
-    // plain-stage run.
+    // Parallel and MaxThreads: read when the stage-A nets are built and by
+    // each plain-stage run.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
-    // Host-output sharing by liveness on StageANet.
+    // Host-output sharing by liveness on the stage-A nets.
     property ShareHostOutputs: boolean read FShareHostOutputs
       write FShareHostOutputs;
   end;
@@ -26246,13 +26268,68 @@ begin
   Consumed.Add(TName);
 end;
 
+// Adds one POST-LN BERT encoder block after NN's last layer; SegMaskSrc (or
+// nil) is the attention key mask.
+function AddBertBlock(NN: TNNet; const Config: TBertConfig;
+  SegMaskSrc: TNNetLayer; pTrainable: boolean): TBertBlockLayers;
+var
+  HiddenAct, PhiBranch, BranchInput: TNNetLayer;
+begin
+  Result := Default(TBertBlockLayers);
+  // POST-LN attention sub-block:
+  //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
+  BranchInput := NN.GetLastLayer();
+  Result.QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
+  // CausalMask=false: every position attends to all SeqLen keys
+  // (INTERSECTED with the key-padding segment mask when pPaddingMask is
+  // on - SegMaskSrc excludes the [PAD] key positions from every real
+  // query, so a short document is encoded exactly).
+  Result.AttnDense := NN.AddMultiHeadSelfAttention(
+    Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
+    {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
+    {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+    {SegmentSource=}SegMaskSrc);
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  Result.AttnLN := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+  // POST-LN FFN sub-block:
+  //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
+  BranchInput := NN.GetLastLayer();
+  Result.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
+  if Config.HiddenActTanh then
+    NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+  else
+  begin
+    // EXACT erf GELU x*Phi(x) composed from existing layers (see the
+    // unit header): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch,
+    // then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
+    // (TNNetReGLU applies the ReLU to the FIRST depth half, the
+    // Shazeer max(0, xW) (x) xV convention - Phi must come first.)
+    HiddenAct := NN.GetLastLayer();
+    NN.AddLayerAfter(
+      TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+    NN.AddLayer( TNNetErf.Create() );
+    NN.AddLayer( TNNetAddConstant.Create(1.0) );
+    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+    NN.AddLayer( TNNetReGLU.Create() );
+  end;
+  Result.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  Result.OutLN := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+end;
+
 // Adds the BERT-family encoder after InputLayer (channel 0 = token ids, 1 =
 // token-type ids); SegMaskSrc (or nil) is every attention block's key mask.
 function AddBertEncoder(NN: TNNet; const Config: TBertConfig;
   InputLayer, SegMaskSrc: TNNetLayer; PositionRows: integer;
   pTrainable, pQuantizeInt8: boolean): TBertEncoderLayers;
 var
-  SliceLayer, HiddenAct, PhiBranch, BranchInput: TNNetLayer;
+  SliceLayer: TNNetLayer;
   BlockCnt, BlockMax, EmbeddingWidth: integer;
   FirstBlockLayerIdx, BlockLayerIdx, LayerPos, MaxLayerPos: integer;
   IsShared: boolean;
@@ -26303,51 +26380,8 @@ begin
   for BlockCnt := 0 to BlockMax do
   begin
     BlockLayerIdx := NN.GetLastLayerIdx() + 1;
-    // POST-LN attention sub-block:
-    //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
-    BranchInput := NN.GetLastLayer();
-    Result.Blocks[BlockCnt].QKV := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
-    // CausalMask=false: every position attends to all SeqLen keys
-    // (INTERSECTED with the key-padding segment mask when pPaddingMask is
-    // on - SegMaskSrc excludes the [PAD] key positions from every real
-    // query, so a short document is encoded exactly).
-    Result.Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
-      Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
-      {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
-      {RelPosMaxDistance=}128, {QKRMSNorm=}false,
-      {SegmentSource=}SegMaskSrc);
-    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    Result.Blocks[BlockCnt].AttnLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-    // POST-LN FFN sub-block:
-    //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
-    BranchInput := NN.GetLastLayer();
-    Result.Blocks[BlockCnt].Inter := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
-    if Config.HiddenActTanh then
-      NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
-    else
-    begin
-      // EXACT erf GELU x*Phi(x) composed from existing layers (see the
-      // unit header): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch,
-      // then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
-      // (TNNetReGLU applies the ReLU to the FIRST depth half, the
-      // Shazeer max(0, xW) (x) xV convention - Phi must come first.)
-      HiddenAct := NN.GetLastLayer();
-      NN.AddLayerAfter(
-        TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
-      NN.AddLayer( TNNetErf.Create() );
-      NN.AddLayer( TNNetAddConstant.Create(1.0) );
-      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
-      NN.AddLayer( TNNetReGLU.Create() );
-    end;
-    Result.Blocks[BlockCnt].OutDense := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
-    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    Result.Blocks[BlockCnt].OutLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    Result.Blocks[BlockCnt] := AddBertBlock(NN, Config, SegMaskSrc,
+      pTrainable);
     // Shared blocks borrow block 0's rows layer by layer; a borrowing build
     // links them to the owner's root layer instead (LinkBuildWeightOwner).
     if IsShared and (BlockCnt > 0) and not Assigned(NN.BuildWeightOwner) then
@@ -51690,13 +51724,22 @@ begin
   Result.EmbeddingSize := Config.PLBert.EmbeddingSize;
 end;
 
-// BuildKokoroStageANet that also returns the PL-BERT layers (for the loader).
-function AddKokoroStageA(NN: TNNet; const Config: TKokoroConfig;
-  TokenCount: integer; out BertLayers: TBertEncoderLayers): TKokoroStageALayers;
+function KokoroStageAInputDepth(const Config: TKokoroConfig): integer;
+begin
+  Result := KokoroStageAStyleChannel + Config.StyleDim +
+    Config.PLBert.HiddenSize;
+end;
+
+// BuildKokoroStageANets that also returns the PL-BERT layers (for the loader):
+// the embeddings of FrontNet and, as block 0, the shared layer of BlockNet.
+function AddKokoroStageA(FrontNet, BlockNet, TailNet: TNNet;
+  const Config: TKokoroConfig; TokenCount: integer;
+  out BertLayers: TBertEncoderLayers): TKokoroStageALayers;
 var
   InputLayer, StyleLayer: TNNetLayer;
-  BlockPos, MaxBlockPos, LayerPos, MaxLayerPos: integer;
-  LSTMHidden, TextPadding: integer;
+  BertConfig: TBertConfig;
+  LayerPos, MaxLayerPos: integer;
+  LSTMHidden, TextPadding, InputDepth: integer;
 begin
   Result := Default(TKokoroStageALayers);
   if (TokenCount < 1) or (TokenCount > Config.PLBert.MaxPositionEmbeddings) then
@@ -51707,21 +51750,31 @@ begin
     ImportError('Kokoro: hidden_dim must be even and ' +
       'text_encoder_kernel_size odd.');
   LSTMHidden := Config.HiddenDim div 2;
-  InputLayer := NN.AddLayer(TNNetInput.Create(TokenCount, 1,
-    KokoroStageAStyleChannel + Config.StyleDim));
-  StyleLayer := NN.AddLayerAfter(TNNetSplitChannels.Create(
-    KokoroStageAStyleChannel, Config.StyleDim), InputLayer);
-  // PL-BERT (ALBERT, one shared block) reads channels 0 (ids) and 1 (types).
-  BertLayers := AddBertEncoder(NN, KokoroPLBertConfig(Config), InputLayer, nil,
+  InputDepth := KokoroStageAInputDepth(Config);
+  // PL-BERT embeddings (no block) read channels 0 (ids) and 1 (types).
+  InputLayer := FrontNet.AddLayer(TNNetInput.Create(TokenCount, 1, InputDepth));
+  BertConfig := KokoroPLBertConfig(Config);
+  BertConfig.NumLayers := 0;
+  BertLayers := AddBertEncoder(FrontNet, BertConfig, InputLayer, nil,
     Config.PLBert.MaxPositionEmbeddings, {pTrainable=}false,
     {pQuantizeInt8=}false);
   Result.BertEmbeddings := BertLayers.EmbLN;
   Result.BertHiddenIn := BertLayers.EmbProj;
-  MaxBlockPos := Length(BertLayers.Blocks) - 1;
-  SetLength(Result.BertBlocks, MaxBlockPos + 1);
-  for BlockPos := 0 to MaxBlockPos do
-    Result.BertBlocks[BlockPos] := BertLayers.Blocks[BlockPos].OutLN;
-  Result.BertEncoder := NN.AddLayer(
+  FrontNet.SetTrainable(false);
+  // ALBERT's one shared layer; the host feeds each output back as the input.
+  BlockNet.AddLayer(TNNetInput.Create(TokenCount, 1, Config.PLBert.HiddenSize));
+  SetLength(BertLayers.Blocks, 1);
+  BertLayers.Blocks[0] := AddBertBlock(BlockNet, KokoroPLBertConfig(Config),
+    nil, {pTrainable=}false);
+  Result.BertBlock := BertLayers.Blocks[0].OutLN;
+  BlockNet.SetTrainable(false);
+  InputLayer := TailNet.AddLayer(TNNetInput.Create(TokenCount, 1, InputDepth));
+  StyleLayer := TailNet.AddLayerAfter(TNNetSplitChannels.Create(
+    KokoroStageAStyleChannel, Config.StyleDim), InputLayer);
+  TailNet.AddLayerAfter(TNNetSplitChannels.Create(
+    KokoroStageAStyleChannel + Config.StyleDim, Config.PLBert.HiddenSize),
+    InputLayer);
+  Result.BertEncoder := TailNet.AddLayer(
     TNNetPointwiseConvLinear.Create(Config.HiddenDim));
   // DurationEncoder: n_layer x (bi-LSTM, AdaLayerNorm), the style
   // concatenated before every bi-LSTM and at the end.
@@ -51729,29 +51782,29 @@ begin
   SetLength(Result.DurationConcats, Config.NumLayers + 1);
   SetLength(Result.DurationLSTMs, Config.NumLayers);
   SetLength(Result.DurationNorms, Config.NumLayers);
-  Result.DurationConcats[0] := NN.AddLayer(
+  Result.DurationConcats[0] := TailNet.AddLayer(
     TNNetDeepConcat.Create([Result.BertEncoder, StyleLayer]));
   for LayerPos := 0 to MaxLayerPos do
   begin
-    Result.DurationLSTMs[LayerPos] := NN.AddBidirectionalLSTM(LSTMHidden, 1,
+    Result.DurationLSTMs[LayerPos] := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
       {Bidirectional=}true, {CellsReadInputWidth=}true);
-    Result.DurationNorms[LayerPos] := NN.AddLayer(
+    Result.DurationNorms[LayerPos] := TailNet.AddLayer(
       TNNetTokenLayerNorm.Create(1e-5));
-    Result.DurationConcats[LayerPos + 1] := NN.AddLayer(
+    Result.DurationConcats[LayerPos + 1] := TailNet.AddLayer(
       TNNetDeepConcat.Create([Result.DurationNorms[LayerPos], StyleLayer]));
   end;
   Result.DurationEncoder := Result.DurationConcats[Config.NumLayers];
   // Duration head: bi-LSTM, Linear hidden_dim -> max_dur, sigmoid.
-  Result.DurationLSTM := NN.AddBidirectionalLSTM(LSTMHidden, 1,
+  Result.DurationLSTM := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
     {Bidirectional=}true, {CellsReadInputWidth=}true);
-  Result.DurationProj := NN.AddLayer(
+  Result.DurationProj := TailNet.AddLayer(
     TNNetPointwiseConvLinear.Create(Config.MaxDur));
-  Result.DurationSigmoid := NN.AddLayer(TNNetSigmoid.Create());
+  Result.DurationSigmoid := TailNet.AddLayer(TNNetSigmoid.Create());
   // TextEncoder: embedding, n_layer x (Conv1d, LayerNorm, LeakyReLU 0.2),
   // bi-LSTM.
-  NN.AddLayerAfter(TNNetSplitChannels.Create([KokoroStageATokenChannel]),
+  TailNet.AddLayerAfter(TNNetSplitChannels.Create([KokoroStageATokenChannel]),
     InputLayer);
-  Result.TextEmbedding := NN.AddLayer(TNNetEmbedding.Create(Config.NumTokens,
+  Result.TextEmbedding := TailNet.AddLayer(TNNetEmbedding.Create(Config.NumTokens,
     Config.HiddenDim, {EncodeZero=}1));
   TextPadding := (Config.TextEncoderKernelSize - 1) div 2;
   SetLength(Result.TextConvs, Config.NumLayers);
@@ -51759,25 +51812,25 @@ begin
   SetLength(Result.TextBlocks, Config.NumLayers);
   for LayerPos := 0 to MaxLayerPos do
   begin
-    Result.TextConvs[LayerPos] := NN.AddLayer(TNNetConv1DLinear.Create(
+    Result.TextConvs[LayerPos] := TailNet.AddLayer(TNNetConv1DLinear.Create(
       Config.HiddenDim, Config.TextEncoderKernelSize, TextPadding, 1));
-    Result.TextNorms[LayerPos] := NN.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
-    Result.TextBlocks[LayerPos] := NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+    Result.TextNorms[LayerPos] := TailNet.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+    Result.TextBlocks[LayerPos] := TailNet.AddLayer(TNNetLeakyReLU.Create(0.2));
   end;
-  Result.TextLSTM := NN.AddBidirectionalLSTM(LSTMHidden, 1,
+  Result.TextLSTM := TailNet.AddBidirectionalLSTM(LSTMHidden, 1,
     {Bidirectional=}true, {CellsReadInputWidth=}true);
-  NN.AddLayer(TNNetDeepConcat.Create([Result.DurationEncoder,
+  TailNet.AddLayer(TNNetDeepConcat.Create([Result.DurationEncoder,
     Result.DurationSigmoid, Result.TextLSTM]));
-  // Low memory: the shared ALBERT repeats keep no per-layer weight cache.
-  NN.SetTrainable(false);
+  TailNet.SetTrainable(false);
 end;
 
-function BuildKokoroStageANet(NN: TNNet; const Config: TKokoroConfig;
-  TokenCount: integer): TKokoroStageALayers;
+function BuildKokoroStageANets(FrontNet, BlockNet, TailNet: TNNet;
+  const Config: TKokoroConfig; TokenCount: integer): TKokoroStageALayers;
 var
   BertLayers: TBertEncoderLayers;
 begin
-  Result := AddKokoroStageA(NN, Config, TokenCount, BertLayers);
+  Result := AddKokoroStageA(FrontNet, BlockNet, TailNet, Config, TokenCount,
+    BertLayers);
 end;
 
 const
@@ -52830,6 +52883,7 @@ begin
 end;
 
 // Loads every stage-A weight except the AdaLayerNorm fc (the host applies it).
+// NN is the tail net (the bi-LSTMs).
 procedure LoadKokoroStageAWeights(Reader: TNNetSafeTensorsReader; NN: TNNet;
   const Config: TKokoroConfig; const Layers: TKokoroStageALayers;
   const BertLayers: TBertEncoderLayers; Consumed: TStrings);
@@ -52838,6 +52892,7 @@ var
   Prefix: string;
 begin
   LSTMHidden := Config.HiddenDim div 2;
+  // ALBERT: block 0 only, which BertLayers.Blocks holds.
   LoadBertEncoderWeights(Reader, NN, KokoroPLBertConfig(Config), BertLayers,
     Consumed, {pQuantizeInt8=}false);
   LoadLlamaLinearWeights(Reader, Layers.BertEncoder, 'bert_encoder.weight',
@@ -52940,7 +52995,9 @@ begin
   {$IFDEF OpenCL}
   FOpenCLContextNet.Free;
   {$ENDIF}
-  FStageAOwner.Free;
+  FStageAFrontOwner.Free;
+  FStageABlockOwner.Free;
+  FStageATailOwner.Free;
   FStageB.Free;
   FStageCDecoder.Free;
   FStageCGenerator.Free;
@@ -52957,7 +53014,7 @@ begin
   inherited Destroy();
 end;
 
-// The owner is built at KokoroStageAOwnerTokenCount tokens (no conv kernel
+// The owners are built at KokoroStageAOwnerTokenCount tokens (no conv kernel
 // clamped); a stage-A tensor left unread raises.
 procedure TNNetKokoro.LoadStageA(Reader: TNNetSafeTensorsReader;
   Consumed: TStrings);
@@ -52969,17 +53026,30 @@ var
   BertLayers: TBertEncoderLayers;
   OwnerLayers: TKokoroStageALayers;
   LayerPos, MaxLayerPos: integer;
+
+  procedure FlushWeightCaches(Owner: TNNet);
+  var
+    OwnerLayerPos: integer;
+  begin
+    for OwnerLayerPos := 0 to Owner.GetLastLayerIdx() do
+      Owner.Layers[OwnerLayerPos].FlushWeightCache();
+  end;
+
 begin
-  FStageAOwner := TNNet.Create();
-  OwnerLayers := AddKokoroStageA(FStageAOwner, FConfig,
+  FStageAFrontOwner := TNNet.Create();
+  FStageABlockOwner := TNNet.Create();
+  FStageATailOwner := TNNet.Create();
+  OwnerLayers := AddKokoroStageA(FStageAFrontOwner, FStageABlockOwner,
+    FStageATailOwner, FConfig,
     Min(KokoroStageAOwnerTokenCount, FConfig.PLBert.MaxPositionEmbeddings),
     BertLayers);
-  LoadKokoroStageAWeights(Reader, FStageAOwner, FConfig, OwnerLayers,
+  LoadKokoroStageAWeights(Reader, FStageATailOwner, FConfig, OwnerLayers,
     BertLayers, Consumed);
   // As TChatEngine after SetTrainable(false): each layer's weight caches now
-  // match its inference-only state (14 MB less RSS on the real checkpoint).
-  for LayerPos := 0 to FStageAOwner.GetLastLayerIdx() do
-    FStageAOwner.Layers[LayerPos].FlushWeightCache();
+  // match its inference-only state.
+  FlushWeightCaches(FStageAFrontOwner);
+  FlushWeightCaches(FStageABlockOwner);
+  FlushWeightCaches(FStageATailOwner);
   MaxLayerPos := FConfig.NumLayers - 1;
   SetLength(FDurationNormFcWeights, FConfig.NumLayers);
   SetLength(FDurationNormFcBiases, FConfig.NumLayers);
@@ -53035,36 +53105,57 @@ begin
   FHarmonicSTFT.TransformToMagnitudePhase(FHarmonicWave, HarmonicSpectrum);
 end;
 
-procedure TNNetKokoro.PrepareStageA(TokenCount: integer);
+procedure TNNetKokoro.PrepareStageANet(NN: TNNet);
 begin
-  if Assigned(FStageANet) and (TokenCount = FStageATokenCount) then exit;
-  ReleaseStageA();
-  FStageANet := TNNet.Create();
-  FStageANet.BuildWeightOwner := FStageAOwner;
-  FStageALayers := BuildKokoroStageANet(FStageANet, FConfig, TokenCount);
-  FStageANet.BuildWeightOwner := nil;
-  PrepareInferenceThreads(FStageANet, FParallel, FMaxThreads);
-  FStageANet.ShareHostOutputsByLiveness := FShareHostOutputs;
+  PrepareInferenceThreads(NN, FParallel, FMaxThreads);
+  NN.ShareHostOutputsByLiveness := FShareHostOutputs;
   {$IFDEF OpenCL}
   if Assigned(FOpenCLContextNet) then
   begin
-    if not FStageAOwnerOnOpenCL then
-    begin
-      ArmWeightOwnerInOpenCLContext(FStageAOwner, FOpenCLContextNet,
-        FOpenCLHasSharedKernel);
-      FStageAOwnerOnOpenCL := true;
-    end;
-    FStageANet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
-    FStageANet.EnableOpenCLInContextOf(FOpenCLContextNet,
-      FOpenCLHasSharedKernel);
+    NN.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
+    NN.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
   end;
   {$ENDIF}
+end;
+
+procedure TNNetKokoro.PrepareStageA(TokenCount: integer);
+begin
+  if Assigned(FStageATailNet) and (TokenCount = FStageATokenCount) then exit;
+  ReleaseStageA();
+  {$IFDEF OpenCL}
+  if Assigned(FOpenCLContextNet) and not FStageAOwnerOnOpenCL then
+  begin
+    ArmWeightOwnerInOpenCLContext(FStageAFrontOwner, FOpenCLContextNet,
+      FOpenCLHasSharedKernel);
+    ArmWeightOwnerInOpenCLContext(FStageABlockOwner, FOpenCLContextNet,
+      FOpenCLHasSharedKernel);
+    ArmWeightOwnerInOpenCLContext(FStageATailOwner, FOpenCLContextNet,
+      FOpenCLHasSharedKernel);
+    FStageAOwnerOnOpenCL := true;
+  end;
+  {$ENDIF}
+  FStageAFrontNet := TNNet.Create();
+  FStageABlockNet := TNNet.Create();
+  FStageATailNet := TNNet.Create();
+  FStageAFrontNet.BuildWeightOwner := FStageAFrontOwner;
+  FStageABlockNet.BuildWeightOwner := FStageABlockOwner;
+  FStageATailNet.BuildWeightOwner := FStageATailOwner;
+  FStageALayers := BuildKokoroStageANets(FStageAFrontNet, FStageABlockNet,
+    FStageATailNet, FConfig, TokenCount);
+  FStageAFrontNet.BuildWeightOwner := nil;
+  FStageABlockNet.BuildWeightOwner := nil;
+  FStageATailNet.BuildWeightOwner := nil;
+  PrepareStageANet(FStageAFrontNet);
+  PrepareStageANet(FStageABlockNet);
+  PrepareStageANet(FStageATailNet);
   FStageATokenCount := TokenCount;
 end;
 
 procedure TNNetKokoro.ReleaseStageA();
 begin
-  FreeAndNil(FStageANet);
+  FreeAndNil(FStageAFrontNet);
+  FreeAndNil(FStageABlockNet);
+  FreeAndNil(FStageATailNet);
   FStageALayers := Default(TKokoroStageALayers);
   FStageATokenCount := 0;
 end;
@@ -53110,8 +53201,10 @@ procedure TNNetKokoro.RunStageA(const TokenIds: array of integer;
 var
   TokenCount, TokenPos, MaxTokenPos, LayerPos, MaxLayerPos: integer;
   InputDepth, OutputDepth, DurationDepth, RowBase, InputRowBase: integer;
+  BertChannel, BertHiddenSize, RepeatPos, MaxRepeatPos: integer;
   DurationSum: TNeuralFloat;
-  Output: TNNetVolume;
+  Output, BertHidden: TNNetVolume;
+  BlockOutputLayer: TNNetLayer;
 begin
   TokenCount := Length(TokenIds);
   if Length(ProsodyStyle) <> FConfig.StyleDim then
@@ -53121,7 +53214,9 @@ begin
   if Speed <= 0 then
     ImportError('Kokoro: speed must be > 0.');
   PrepareStageA(TokenCount);
-  InputDepth := KokoroStageAStyleChannel + FConfig.StyleDim;
+  InputDepth := KokoroStageAInputDepth(FConfig);
+  BertChannel := KokoroStageAStyleChannel + FConfig.StyleDim;
+  BertHiddenSize := FConfig.PLBert.HiddenSize;
   FStageAInput.ReSize(TokenCount, 1, InputDepth);
   MaxTokenPos := TokenCount - 1;
   InputRowBase := 0;
@@ -53139,14 +53234,36 @@ begin
       FConfig.StyleDim * csNeuralFloatSize);
     Inc(InputRowBase, InputDepth);
   end;
+  FStageAFrontNet.Compute(FStageAInput, 0, FParallel);
+  FStageAFrontNet.GetLastLayer().ForceOutputOnRAM();
+  BertHidden := FStageAFrontNet.GetLastLayer().Output;
+  // ALBERT: the one shared layer, each output fed back as the next input.
+  BlockOutputLayer := FStageABlockNet.GetLastLayer();
+  MaxRepeatPos := FConfig.PLBert.NumHiddenLayers - 1;
+  for RepeatPos := 0 to MaxRepeatPos do
+  begin
+    FStageABlockNet.Compute(BertHidden, 0, FParallel);
+    BlockOutputLayer.ForceOutputOnRAM();
+    BertHidden := BlockOutputLayer.Output;
+    if Assigned(FOnStageACheckpoint) then
+      FOnStageACheckpoint('bert_layer' + IntToStr(RepeatPos), BertHidden);
+  end;
+  InputRowBase := 0;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    Move(BertHidden.FData[TokenPos * BertHiddenSize],
+      FStageAInput.FData[InputRowBase + BertChannel],
+      BertHiddenSize * csNeuralFloatSize);
+    Inc(InputRowBase, InputDepth);
+  end;
   MaxLayerPos := FConfig.NumLayers - 1;
   for LayerPos := 0 to MaxLayerPos do
     WriteStyleIntoChannelAffine(FStageALayers.DurationNorms[LayerPos],
       FDurationNormFcWeights[LayerPos], FDurationNormFcBiases[LayerPos],
       ProsodyStyle);
-  FStageANet.Compute(FStageAInput, 0, FParallel);
-  FStageANet.GetLastLayer().ForceOutputOnRAM();
-  Output := FStageANet.GetLastLayer().Output;
+  FStageATailNet.Compute(FStageAInput, 0, FParallel);
+  FStageATailNet.GetLastLayer().ForceOutputOnRAM();
+  Output := FStageATailNet.GetLastLayer().Output;
   // Host step: per token [d | sigmoid(duration) | t_en].
   DurationDepth := FConfig.HiddenDim + FConfig.StyleDim;
   OutputDepth := Output.Depth;
@@ -53424,7 +53541,7 @@ begin
     pHasSharedKernel);
   if not Assigned(FOpenCLContextNet) then exit(false);
   FOpenCLHasSharedKernel := pHasSharedKernel;
-  // A live StageANet was built on the CPU: the next PrepareStageA arms a new one.
+  // Live stage-A nets were built on the CPU: the next PrepareStageA arms new ones.
   ReleaseStageA();
 end;
 
