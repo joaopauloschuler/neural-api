@@ -141,11 +141,34 @@ rather than acted on.
           nets x 4 modes, 1e-6; DeltaNet lr 0.2, HyperbolicDistance lr 0.01 with
           c=0.01); on the old code under `-Cr -Ct` every class but GatedDeltaNet
           fails. Suites green: cpu, avx2, opencl 3286 each, 0 errors, 0 failures.
-- [ ] BUG (awaits user decision, not fixed): `TNNetLinformerAttention.Backpropagate`
+- [x] BUG: `TNNetLinformerAttention.Backpropagate`
       accumulates its weight deltas but never applies them when `FBatchUpdate`
       is false, so the layer does not train outside batch mode unless the
       caller runs `TNNet.UpdateWeights`. Found during SetTrainable part 2,
-      batch A (the round-trip helper calls `UpdateWeights` to cover it).
+      batch A.
+      Done 2026-10-18: `Backpropagate` now ends with the sibling-layer tail
+      (`if not FBatchUpdate` -> `UpdateWeights(FInertia)` on E and F, then
+      `AfterWeightUpdate`); batch mode still accumulates for
+      `TNNet.UpdateWeights` (base `TNNetLayer.UpdateWeights` / Adam / ClearDeltas
+      already cover both neurons; Linformer has no Q/K/V/O neurons, only E/F).
+      New test `TestLinformerAttentionTrainsWithoutBatchUpdate` (inertia 0 and
+      0.9: E/F move and their deltas are cleared after one per-sample step, and
+      match a batch-mode step + `UpdateWeights` within 1e-6); fails on the old
+      code. The weight/input gradient checks already existed. The
+      `CheckSetTrainableRoundTrip` helper no longer calls `TNNet.UpdateWeights`.
+      Suites green: cpu, avx2, opencl 3287 each, 0 errors, 0 failures.
+      Scan of every `Backpropagate*` that writes neuron deltas without a
+      non-batch apply found no other layer with the same defect (the conv /
+      depthwise / local-connect `BackpropagateAtOutputPos` and the circulant
+      FFT helper are called from routines that apply). The next item is a
+      related defect of a different shape.
+- [ ] BUG (awaits user decision, not fixed): `TNNetWeightStandardizationConv.Backpropagate`
+      (neural/neuralnetwork.pas ~100865) and `TNNetSpectralNormConv.Backpropagate`
+      (~101080) remap the per-call delta increment AFTER `inherited Backpropagate`.
+      Outside batch mode the inherited conv backprop
+      (`BackpropagateFastTiledCPU`) has already applied and cleared the deltas,
+      so the raw weights get the w_hat / w_eff gradient unmapped and the remap
+      sees a zero increment. Batch mode is correct.
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
