@@ -48808,6 +48808,14 @@ begin
           Inc(posdE);
         end;
       end;
+    // Per-sample mode steps E and F here; batch mode leaves the deltas
+    // accumulated for TNNet.UpdateWeights.
+    if (not FBatchUpdate) then
+    begin
+      FArrNeurons[0].UpdateWeights(FInertia);
+      FArrNeurons[1].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();

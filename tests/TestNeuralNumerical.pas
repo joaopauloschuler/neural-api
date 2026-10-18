@@ -1598,6 +1598,9 @@ type
     procedure TestLinformerAttentionInputGradientCheck;
     procedure TestLinformerAttentionWeightGradientCheck;
     procedure TestLinformerAttentionSerializationRoundTrip;
+    // Without batch update one Backpropagate steps E and F and clears their
+    // deltas; the step equals a batch-mode step flushed by UpdateWeights.
+    procedure TestLinformerAttentionTrainsWithoutBatchUpdate;
     procedure TestFiLMForward;
     procedure TestFiLMIdentity;
     procedure TestFiLMGradientCheck;
@@ -25438,6 +25441,86 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLinformerAttentionTrainsWithoutBatchUpdate;
+const
+  cSeqLen = 5;
+  cDk = 4;
+  cProjK = 2;
+var
+  NetPerSample, NetBatch: TNNet;
+  AttnPerSample, AttnBatch: TNNetLinformerAttention;
+  Input, Desired, Before: TNNetVolume;
+  InertiaCnt, Proj, i: integer;
+  Inertia, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 515151;
+  Input := TNNetVolume.Create(cSeqLen, 1, 3 * cDk);
+  Desired := TNNetVolume.Create(cSeqLen, 1, cDk);
+  Before := TNNetVolume.Create();
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    for InertiaCnt := 0 to 1 do
+    begin
+      Inertia := 0.9 * InertiaCnt;
+      NetPerSample := TNNet.Create();
+      NetBatch := TNNet.Create();
+      try
+        NetPerSample.AddLayer(TNNetInput.Create(cSeqLen, 1, 3 * cDk, 1));
+        AttnPerSample := TNNetLinformerAttention.Create(cDk, cProjK);
+        NetPerSample.AddLayer(AttnPerSample);
+        NetBatch.AddLayer(TNNetInput.Create(cSeqLen, 1, 3 * cDk, 1));
+        AttnBatch := TNNetLinformerAttention.Create(cDk, cProjK);
+        NetBatch.AddLayer(AttnBatch);
+        NetBatch.CopyWeights(NetPerSample);
+        NetPerSample.SetLearningRate(0.1, Inertia);
+        NetBatch.SetLearningRate(0.1, Inertia);
+        NetPerSample.SetBatchUpdate(false);
+        NetBatch.SetBatchUpdate(true);
+
+        NetPerSample.Compute(Input);
+        NetPerSample.Backpropagate(Desired);
+        NetBatch.Compute(Input);
+        NetBatch.Backpropagate(Desired);
+        for Proj := 0 to 1 do
+        begin
+          // Batch mode has not stepped yet: its weights are still the start.
+          Before.Copy(AttnBatch.Neurons[Proj].Weights);
+          MaxDiff := 0;
+          for i := 0 to Before.Size - 1 do
+            MaxDiff := Max(MaxDiff, Abs(AttnPerSample.Neurons[Proj].Weights.Raw[i] -
+              Before.Raw[i]));
+          AssertTrue(Format('Linformer proj %d did not move without batch update (inertia %g)',
+            [Proj, Inertia]), MaxDiff > 1e-4);
+          AssertTrue(Format('Linformer proj %d delta not cleared after the per-sample step',
+            [Proj]), AttnPerSample.Neurons[Proj].Delta.GetSumAbs() = 0);
+          AssertTrue(Format('Linformer proj %d batch delta empty', [Proj]),
+            AttnBatch.Neurons[Proj].Delta.GetSumAbs() > 0);
+        end;
+        NetBatch.UpdateWeights();
+        for Proj := 0 to 1 do
+        begin
+          MaxDiff := 0;
+          for i := 0 to AttnBatch.Neurons[Proj].Weights.Size - 1 do
+            MaxDiff := Max(MaxDiff, Abs(AttnPerSample.Neurons[Proj].Weights.Raw[i] -
+              AttnBatch.Neurons[Proj].Weights.Raw[i]));
+          AssertTrue(Format('Linformer proj %d per-sample vs batch step differ by %g (inertia %g)',
+            [Proj, MaxDiff, Inertia]), MaxDiff <= 1e-6);
+        end;
+      finally
+        NetPerSample.Free;
+        NetBatch.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+    Desired.Free;
+    Before.Free;
   end;
 end;
 

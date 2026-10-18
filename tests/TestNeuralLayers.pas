@@ -2946,10 +2946,6 @@ begin
             [Step, MaxDiff]), MaxDiff <= 1e-6);
           TwinA.Backpropagate(TargetVol);
           TwinB.Backpropagate(TargetVol);
-          // Steps the layers that only accumulate deltas (Linformer); a layer
-          // that updated inline has already cleared its deltas.
-          TwinA.UpdateWeights();
-          TwinB.UpdateWeights();
           if Kind >= pFirstInputGradKind then
           begin
             MaxDiff := MaxAbsDiff(TwinA.Layers[0].OutputError,
