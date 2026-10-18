@@ -2565,7 +2565,9 @@ rather than acted on.
         are overwritten without a question; the child program inherits
         stdin, so a program that reads stdin would consume REPL input.
   Phase 6 — memory: stages B and C as plain Pascal code (plan agreed with the
-  user 2026-10-17; route B). Problem: a 26 x "Hello" REPL line (one chunk,
+  user 2026-10-17; route B). DONE 2026-10-17 (6.1-6.6): the 26 x "Hello"
+  line runs at 724 MB peak RSS (Python kokoro 1345 MB); `--gpu` = stage A
+  only. Problem: a 26 x "Hello" REPL line (one chunk,
   ~157 tokens, ~344 frames) ran out of memory on the user's machine. Measured
   on the dev VM (real checkpoint, short lines, 2 GB cgroup cap): the stage-C
   generator holds ~32 MB per frame (~45 MB at the peak) against ~0.27 MB per
@@ -2797,13 +2799,36 @@ rather than acted on.
         end to end audio max |diff| 0.102 (phases), peak 549 MB.
         Suites cpu / avx2 / opencl `TESTS=3279 ERRORS=0 FAILURES=0
         IGNORED=4` (was 3291 / 6: 12 net tests removed).
-  - [ ] 6.6 Measure and document: memory per frame and peak against Python
+  - [x] 6.6 Measure and document: memory per frame and peak against Python
         (same short real lines under the cap, extrapolated to the 26 x
         "Hello" line); update examples/KokoroTTS/README.md (Memory section,
         `--gpu` = stage A only), examples/README.md, and the code examples:
         `SimpleKokoroTTS.lpr` (speak a long multi-sentence text to show it
         fits), `KokoroTTS.lpr` (`--gpu` help text, `--stats`), the README's
         "From your own code" snippet; lazbuild -B every mode.
+        Done 2026-10-17: measured, real checkpoint, 1 core, 2 GB cap, one
+        process per run; ours = KokoroTTS `-p ... --stats`, Python = kokoro
+        `KModel` FP32, `torch.set_num_threads(1)`, VmHWM reset after load
+        (`/proc/self/clear_refs` 5), same phonemes, same audio lengths.
+        Load RSS: ours 462 MB, Python 1092 MB (1281 MB peak while loading).
+        Peak RSS, ours / Python: 1 x "Hello" (56 frames) 512 / 1110 MB;
+        8 x (128) 586 / 1147; 26 x (415) 724 / 1345; the SimpleKokoroTTS
+        story (260 phonemes, 636 frames) 862 / 1354 (0.46x to 0.64x).
+        Per frame: ours 0.48 to 1.03 MB between lines, 0.60 from 1 x to the
+        story; Python 0.04 to 0.69 (uneven). A 510-phoneme chunk (~1250 frames) not measured,
+        estimate ~1.2 GB for ours. REPL: a second 26 x line raised the peak
+        724 -> 738 MB. Synthesis on 1 core: ours 3.8 / 8.3 / 28.8 / 44.1 s,
+        Python forward 2.8 / 5.8 / 16.8 / 28.8 s. Docs: Memory section
+        rewritten (table above), `--gpu` = stage A (options table, session
+        options, How it works: stage A net, B / C plain code in
+        neuralplainops.pas), examples/README.md entry; root README unchanged
+        (still right). Code: SimpleKokoroTTS speaks `fox.wav` + a 5-sentence
+        paragraph `story.wav`; KokoroTTS help for `--gpu` and `--stats`.
+        Real SimpleKokoroTTS run: fox 1.95 s, story 15.90 s (one chunk),
+        peak RSS 872 MB. Tiny fixture smoke: both WAVs written (the fixture
+        dictionaries split or spell 6 story words). lazbuild -B Default /
+        Debug / Release of both .lpi; `--selftest` OK. Script:
+        scratchpad pyk/pymem.py (written for this task).
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
