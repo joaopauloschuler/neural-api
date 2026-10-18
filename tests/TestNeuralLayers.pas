@@ -14,7 +14,22 @@ const
   MAX_NAN_CHECK_ITERATIONS = 100;
 
 type
+  // Builds round-trip net pKind; pTrainable=False adds every layer inference-only.
+  TRoundTripNetBuilder = function(pKind: integer;
+    pTrainable, pLowMemory: boolean): TNNet of object;
+
   TTestNeuralLayers = class(TTestCase)
+  private
+    function InferenceOnlyUnless(pLayer: TNNetLayer;
+      pTrainable, pLowMemory: boolean): TNNetLayer;
+    function BuildRoundTripNet(pKind: integer;
+      pTrainable, pLowMemory: boolean): TNNet;
+    function BuildScratchRoundTripNetA(pKind: integer;
+      pTrainable, pLowMemory: boolean): TNNet;
+    // Every kind x 4 flip modes trains 3 SGD steps like a never-flipped twin
+    // (1e-6); kinds >= pFirstInputGradKind also compare the input gradient.
+    procedure CheckSetTrainableRoundTrip(const pKindName: array of string;
+      pBuild: TRoundTripNetBuilder; pFirstInputGradKind: integer);
   published
     procedure TestFullyConnectedForward;
     procedure TestFullConnectThreadingParity;
@@ -76,6 +91,9 @@ type
     // built inference-only and made trainable, trains exactly like a twin
     // that was never flipped. Coded by Claude (AI).
     procedure TestSetTrainableRoundTripMatchesTwin;
+    // TestSetTrainableRoundTripMatchesTwin for the first half of the layers
+    // whose backprop scratch the inference-only flip frees. Coded by Claude (AI).
+    procedure TestSetTrainableRoundTripScratchLayersA;
     // Quantized and weight-borrowing layers stay inference-only on
     // SetTrainable(True); the FP32 layers of the same net train. Coded by Claude (AI).
     procedure TestSetTrainableKeepsInferenceOnlyWeights;
@@ -2570,84 +2588,217 @@ begin
   end;
 end;
 
-// Importers flip the whole net inference-only once per built block, so the
-// repeated calls must land in the same state as one call after the last block.
-procedure TTestNeuralLayers.TestSetTrainableRoundTripMatchesTwin;
+function TTestNeuralLayers.InferenceOnlyUnless(pLayer: TNNetLayer;
+  pTrainable, pLowMemory: boolean): TNNetLayer;
+begin
+  if pTrainable then Result := pLayer
+  else Result := pLayer.SetTrainable(false, pLowMemory);
+end;
+
+function TTestNeuralLayers.BuildRoundTripNet(pKind: integer;
+  pTrainable, pLowMemory: boolean): TNNet;
+  function T(pLayer: TNNetLayer): TNNetLayer;
+  begin
+    Result := InferenceOnlyUnless(pLayer, pTrainable, pLowMemory);
+  end;
+begin
+  Result := TNNet.Create();
+  case pKind of
+    0: begin
+         Result.AddLayer(TNNetInput.Create(5, 5, 2));
+         Result.AddLayer(T(TNNetConvolutionReLU.Create(3, 3, 1, 1)));
+         Result.AddLayer(T(TNNetConvolutionLinear.Create(2, 3, 1, 1)));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(3)));
+       end;
+    1: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(5)));
+         Result.AddLayer(T(TNNetLayerNorm.Create()));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+       end;
+    2: begin
+         Result.AddLayer(TNNetInput.Create(6));
+         Result.AddLayer(T(TNNetFullConnectReLU.Create(5)));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
+       end;
+    3: begin
+         Result.AddLayer(TNNetInput.Create(5, 1, 3));
+         Result.AddLayer(T(TNNetLSTMCell.Create(4)));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
+       end;
+    4: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
+         Result.AddLayer(T(TNNetTokenRMSNorm.Create(3)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+       end;
+    5: begin
+         // One K head, one V head, Dk = Dv = 4: input depth 2*4 + 2*4 + 2.
+         Result.AddLayer(TNNetInput.Create(4, 1, 5));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(18)));
+         Result.AddLayer(T(TNNetGatedDeltaNet.Create(1, 1, 4, 4)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+       end;
+    6: begin
+         Result.AddLayer(TNNetInput.Create(6, 1, 1, 1));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(3)));
+       end;
+    7: begin
+         Result.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+         Result.AddLayer(T(TNNetConvolutionLinear.Create(3, 3, 1, 1)));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
+       end;
+  end;
+  if not pTrainable then Result.SetTrainable(false, pLowMemory);
+  Result.SetLearningRate(0.05, 0);
+end;
+
+function TTestNeuralLayers.BuildScratchRoundTripNetA(pKind: integer;
+  pTrainable, pLowMemory: boolean): TNNet;
+var
+  QueryLayer, KVLayer: TNNetLayer;
+  function T(pLayer: TNNetLayer): TNNetLayer;
+  begin
+    Result := InferenceOnlyUnless(pLayer, pTrainable, pLowMemory);
+  end;
+begin
+  Result := TNNet.Create();
+  // Every net takes an input gradient, so the check also covers the gradient
+  // the layer under test sends upstream.
+  case pKind of
+    0: begin
+         // Embedding depth 4 + label channel; ArcFace clamps the label to [0,K-1].
+         Result.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(5)));
+         Result.AddLayer(T(TNNetArcFace.Create(3, 0.5, 8.0)));
+       end;
+    1: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         // Last layer: its -1e9 mask cells carry no gradient, and a head
+         // after it would blow up on them.
+         Result.AddLayer(T(TNNetForgetGateBias.Create()));
+       end;
+    2: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetInducedSetAttention.Create(2, 3)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    3: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(4)));
+         Result.AddLayer(T(TNNetProductKeyMemory.Create(16, 3, 2, 1, 4)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    4: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetAttentionPooling.Create(2, 3)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    5: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
+         Result.AddLayer(T(TNNetRetention.Create(2, 0.9, {LearnGamma=}true)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    6: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         QueryLayer := Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+         KVLayer := Result.AddLayerAfter(T(TNNetPointwiseConvLinear.Create(4)), 0);
+         Result.AddLayerAfter(T(TNNetCrossAttention.Create(2, false, KVLayer)),
+           QueryLayer);
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    7: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
+         Result.AddLayer(T(TNNetT5RelPosBiasAttention.Create(2, true, 4, 8)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    8: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
+         Result.AddLayer(T(TNNetDifferentialAttention.Create(2, false, 0.8)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    9: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
+         Result.AddLayer(T(TNNetLinformerAttention.Create(2, 2)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    10: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetGatedResidual.Create(0.7)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    11: begin
+         Result.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(6)));
+         Result.AddLayer(T(TNNetCapsuleRouting.Create(3, 2, 2, 2, 3)));
+         Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
+       end;
+    12: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetHardConcrete.Create()));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    13: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(4)));
+         Result.AddLayer(T(TNNetGRN.Create()));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    14: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetAPL.Create(2)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    15: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetSplineActivation.Create(4, 2.0)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    16: begin
+         Result.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetInvertible1x1Conv.Create(false)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+    17: begin
+         Result.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
+         Result.AddLayer(T(TNNetMLSTMCell.Create()));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
+  end;
+  if not pTrainable then Result.SetTrainable(false, pLowMemory);
+  // Retention has no softmax to bound its scores; 0.05 overflows it in 3 steps.
+  if pKind = 5 then Result.SetLearningRate(0.01, 0)
+  else Result.SetLearningRate(0.05, 0);
+end;
+
+procedure TTestNeuralLayers.CheckSetTrainableRoundTrip(
+  const pKindName: array of string; pBuild: TRoundTripNetBuilder;
+  pFirstInputGradKind: integer);
 const
-  cKindCount = 8;
   cModeCount = 4;
   cSteps = 3;
-  cKindName: array[0..cKindCount - 1] of string = ('conv 3x3 padded x2 + FC',
-    'pointwise + LayerNorm', 'FullConnect', 'LSTM + FC head',
-    'pointwise + TokenRMSNorm', 'pointwise + GatedDeltaNet',
-    'input gradient + FC', 'input gradient + padded conv');
   cModeName: array[0..cModeCount - 1] of string = ('flip false->true',
     'flip false(low memory)->true', 'built inference-only->true',
     'built inference-only low memory->true');
 var
-  Kind, Mode, Step, LayerCnt, NeuronCnt: integer;
+  Kind, MaxKind, Mode, Step, LayerCnt, NeuronCnt: integer;
   TwinA, TwinB, TwinInit: TNNet;
   InputVol, TargetVol, OutputA, OutputB: TNNetVolume;
   MaxDiff: TNeuralFloat;
   Prefix: string;
-
-  function Build(pKind: integer; pTrainable, pLowMemory: boolean): TNNet;
-    function T(pLayer: TNNetLayer): TNNetLayer;
-    begin
-      if pTrainable then Result := pLayer
-      else Result := pLayer.SetTrainable(false, pLowMemory);
-    end;
-  begin
-    Result := TNNet.Create();
-    case pKind of
-      0: begin
-           Result.AddLayer(TNNetInput.Create(5, 5, 2));
-           Result.AddLayer(T(TNNetConvolutionReLU.Create(3, 3, 1, 1)));
-           Result.AddLayer(T(TNNetConvolutionLinear.Create(2, 3, 1, 1)));
-           Result.AddLayer(T(TNNetFullConnectLinear.Create(3)));
-         end;
-      1: begin
-           Result.AddLayer(TNNetInput.Create(4, 1, 3));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(5)));
-           Result.AddLayer(T(TNNetLayerNorm.Create()));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
-         end;
-      2: begin
-           Result.AddLayer(TNNetInput.Create(6));
-           Result.AddLayer(T(TNNetFullConnectReLU.Create(5)));
-           Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
-         end;
-      3: begin
-           Result.AddLayer(TNNetInput.Create(5, 1, 3));
-           Result.AddLayer(T(TNNetLSTMCell.Create(4)));
-           Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
-         end;
-      4: begin
-           Result.AddLayer(TNNetInput.Create(4, 1, 3));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(6)));
-           Result.AddLayer(T(TNNetTokenRMSNorm.Create(3)));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
-         end;
-      5: begin
-           // One K head, one V head, Dk = Dv = 4: input depth 2*4 + 2*4 + 2.
-           Result.AddLayer(TNNetInput.Create(4, 1, 5));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(18)));
-           Result.AddLayer(T(TNNetGatedDeltaNet.Create(1, 1, 4, 4)));
-           Result.AddLayer(T(TNNetPointwiseConvLinear.Create(3)));
-         end;
-      6: begin
-           Result.AddLayer(TNNetInput.Create(6, 1, 1, 1));
-           Result.AddLayer(T(TNNetFullConnectLinear.Create(3)));
-         end;
-      7: begin
-           Result.AddLayer(TNNetInput.Create(4, 4, 2, 1));
-           Result.AddLayer(T(TNNetConvolutionLinear.Create(3, 3, 1, 1)));
-           Result.AddLayer(T(TNNetFullConnectLinear.Create(2)));
-         end;
-    end;
-    if not pTrainable then Result.SetTrainable(false, pLowMemory);
-    Result.SetLearningRate(0.05, 0);
-  end;
 
   function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
   var
@@ -2660,14 +2811,15 @@ var
   end;
 
 begin
-  for Kind := 0 to cKindCount - 1 do
+  MaxKind := High(pKindName);
+  for Kind := 0 to MaxKind do
     for Mode := 0 to cModeCount - 1 do
     begin
-      Prefix := cKindName[Kind] + ', ' + cModeName[Mode];
+      Prefix := pKindName[Kind] + ', ' + cModeName[Mode];
       RandSeed := 20261018 + Kind;
-      TwinA := Build(Kind, true, false);
-      TwinB := Build(Kind, Mode < 2, Mode = 3);
-      TwinInit := Build(Kind, true, false);
+      TwinA := pBuild(Kind, true, false);
+      TwinB := pBuild(Kind, Mode < 2, Mode = 3);
+      TwinInit := pBuild(Kind, true, false);
       InputVol := TNNetVolume.Create(TwinA.Layers[0].Output);
       TargetVol := TNNetVolume.Create(TwinA.GetLastLayer().Output);
       OutputA := TNNetVolume.Create();
@@ -2693,7 +2845,11 @@ begin
             [Step, MaxDiff]), MaxDiff <= 1e-6);
           TwinA.Backpropagate(TargetVol);
           TwinB.Backpropagate(TargetVol);
-          if Kind >= 6 then
+          // Steps the layers that only accumulate deltas (Linformer); a layer
+          // that updated inline has already cleared its deltas.
+          TwinA.UpdateWeights();
+          TwinB.UpdateWeights();
+          if Kind >= pFirstInputGradKind then
           begin
             MaxDiff := MaxAbsDiff(TwinA.Layers[0].OutputError,
               TwinB.Layers[0].OutputError);
@@ -2724,8 +2880,8 @@ begin
               MaxDiff := Max(MaxDiff, MaxAbsDiff(
                 TwinB.Layers[LayerCnt].Neurons[NeuronCnt].Weights,
                 TwinInit.Layers[LayerCnt].Neurons[NeuronCnt].Weights));
-            AssertTrue(Prefix + Format(': layer %d did not train', [LayerCnt]),
-              MaxDiff > 1e-5);
+            AssertTrue(Prefix + Format(': layer %d did not train (max change %g)',
+              [LayerCnt, MaxDiff]), MaxDiff > 1e-5);
           end;
       finally
         OutputA.Free;
@@ -2737,6 +2893,25 @@ begin
         TwinInit.Free;
       end;
     end;
+end;
+
+procedure TTestNeuralLayers.TestSetTrainableRoundTripMatchesTwin;
+begin
+  CheckSetTrainableRoundTrip(['conv 3x3 padded x2 + FC',
+    'pointwise + LayerNorm', 'FullConnect', 'LSTM + FC head',
+    'pointwise + TokenRMSNorm', 'pointwise + GatedDeltaNet',
+    'input gradient + FC', 'input gradient + padded conv'],
+    @BuildRoundTripNet, 6);
+end;
+
+procedure TTestNeuralLayers.TestSetTrainableRoundTripScratchLayersA;
+begin
+  CheckSetTrainableRoundTrip(['ArcFace', 'ForgetGateBias',
+    'InducedSetAttention', 'ProductKeyMemory', 'AttentionPooling',
+    'Retention (learned gamma)', 'CrossAttention', 'T5RelPosBiasAttention',
+    'DifferentialAttention', 'LinformerAttention', 'GatedResidual',
+    'CapsuleRouting', 'HardConcrete', 'GRN', 'APL', 'SplineActivation',
+    'Invertible1x1Conv', 'MLSTMCell'], @BuildScratchRoundTripNetA, 0);
 end;
 
 procedure TTestNeuralLayers.TestSetTrainableKeepsInferenceOnlyWeights;
@@ -2775,6 +2950,8 @@ begin
   end;
 end;
 
+// Importers flip the whole net inference-only once per built block, so the
+// repeated calls must land in the same state as one call after the last block.
 procedure TTestNeuralLayers.TestSetTrainablePerBlockEqualsWholeNet;
 var
   PerBlockNN, WholeNN: TNNet;
