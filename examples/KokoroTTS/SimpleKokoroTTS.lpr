@@ -19,7 +19,12 @@ begin
   Session := TKokoroSession.Create(Options);      // loads the model and voice once
   try
     Session.SpeakTextToWav('A red fox in the snow.', 'fox.wav');
-    Session.SpeakTextToWav('It jumped over the fence.', 'fence.wav');
+    Session.SpeakTextToWav(                       // a long text works too
+      'A small red fox lived at the edge of a quiet forest. ' +
+      'Every morning she ran down to the river to drink. ' +
+      'One cold winter day she counted 3 rabbits in the snow. ' +
+      'They looked at her, and she looked at them. ' +
+      'Then the fox turned around and went home to sleep.', 'story.wav');
   finally
     Session.Free;
   end;

@@ -35,8 +35,9 @@ External programs (--play-cmd, --encode-cmd) run after each WAV, without a
 shell: SplitCommandTemplate splits the template into arguments, then
 ExpandCommandArguments replaces {wav} and {base} inside each argument.
 
---stats prints timing to stderr. --selftest runs the argument-parsing and
-REPL-command checks (no model needed) and exits.
+--stats prints timing and the peak RSS to stderr. --gpu runs stage A on
+OpenCL; stages B and C (plain code) always run on the CPU. --selftest runs
+the argument-parsing and REPL-command checks (no model needed) and exits.
 
 Coded by Claude (AI).
 
@@ -105,14 +106,18 @@ begin
     'no shell');
   WriteLn('  --keep-wav BOOL      false deletes the WAV after a successful ',
     'encode (default true)');
-  WriteLn('  --stats              timing to stderr (load; per line: chunks, ',
-    'phonemes, audio,');
-  WriteLn('                       synthesis time, real-time factor)');
+  WriteLn('  --stats              timing and peak RSS to stderr (load; per ',
+    'line: chunks,');
+  WriteLn('                       phonemes, audio, synthesis time, ',
+    'real-time factor,');
+  WriteLn('                       WAV write)');
   WriteLn('  --serial             single-threaded forward passes');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
     '(default: every CPU thread)');
-  WriteLn('  --gpu                run the stage nets on OpenCL (needs a build ',
-    'with -dOpenCL; default CPU)');
+  WriteLn('  --gpu                run stage A on OpenCL (needs a build with ',
+    '-dOpenCL);');
+  WriteLn('                       stages B and C always run on the CPU ',
+    '(default: all CPU)');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N       OpenCL device index within the platform ',
     '(default 0)');

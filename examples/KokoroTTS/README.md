@@ -32,7 +32,12 @@ begin
   Session := TKokoroSession.Create(Options);      // loads the model and voice once
   try
     Session.SpeakTextToWav('A red fox in the snow.', 'fox.wav');
-    Session.SpeakTextToWav('It jumped over the fence.', 'fence.wav');
+    Session.SpeakTextToWav(                       // a long text works too
+      'A small red fox lived at the edge of a quiet forest. ' +
+      'Every morning she ran down to the river to drink. ' +
+      'One cold winter day she counted 3 rabbits in the snow. ' +
+      'They looked at her, and she looked at them. ' +
+      'Then the fox turned around and went home to sleep.', 'story.wav');
   finally
     Session.Free;
   end;
@@ -42,12 +47,14 @@ end.
 This is `SimpleKokoroTTS.lpr` in this folder. Build it with
 `lazbuild -B neural-api/examples/KokoroTTS/SimpleKokoroTTS.lpi` and run
 `neural-api/bin/x86_64-linux/bin/SimpleKokoroTTS` from the folder that holds
-`k` and `misaki`; it writes `fox.wav` and `fence.wav`.
+`k` and `misaki`; it writes `fox.wav` (one sentence) and `story.wav` (five
+sentences, about 16 s of audio).
 
 * `TKokoroSession.Create` loads the model and the voice once.
 * `SpeakTextToWav` can be called as many times as you like.
 * Set `Options.VoiceName` (e.g. `bf_emma`), `Options.Speed` or
-  `Options.Gpu := true` (OpenCL build) before `Create`.
+  `Options.Gpu := true` (OpenCL build; stage A only, see How it works)
+  before `Create`.
 * `SpeakTextToWav` returns a `TKokoroLineResult`: timing, sample count and a
   per-chunk report (phonemes, unknown words that were split or spelled).
 * One level down, `TNNetKokoro.SynthesizeText` (`neural/neuralpretrained.pas`)
@@ -127,7 +134,7 @@ An unknown command or a failed line prints `Error: ...` and the REPL goes on.
 | `--stats` | off | timing to stderr, see below |
 | `--serial` | off | single-threaded forward passes |
 | `--max-threads N` | every CPU thread | cap the parallel forward at N workers |
-| `--gpu` | off (CPU) | stage nets on OpenCL (build with `-dOpenCL`, as every build mode of `KokoroTTS.lpi` does); host steps stay on the CPU |
+| `--gpu` | off (CPU) | stage A on OpenCL (build with `-dOpenCL`, as every build mode of `KokoroTTS.lpi` does); stages B and C and the host steps stay on the CPU |
 | `--gpu-platform N`, `--gpu-device N` | 0, 0 | OpenCL platform / device |
 | `--no-gpu-shared-kernel` | off | per-layer OpenCL kernels |
 | `--selftest` | | offline checks of the argument parsing and the REPL commands (no model), then exit |
@@ -209,21 +216,35 @@ three define AVX2 and OpenCL). The binary goes to `bin/<cpu>-<os>/bin/`.
 
 ## Memory
 
-Full sentences run on the real checkpoint, but the end-to-end memory peak
-has not been measured yet (`--stats` prints the peak RSS). What was measured
-per stage on the development VM (CPU, real checkpoint):
+Measured on the development VM (1 CPU core, real checkpoint, voice
+`af_heart`, one process per run under a 2 GB memory cap). KokoroTTS numbers
+come from `--stats`; the Python numbers come from the reference `kokoro`
+package (`KModel`, FP32, CPU, `torch.set_num_threads(1)`) on the same
+phonemes. A frame is 25 ms of audio (40 frames per second).
 
-- stages A -> B -> stage-C decoder on a 102-frame sentence (2.55 s of audio):
-  999 MB peak RSS for the test process;
-- the stage-C generator is the largest activation user: about 4.1 MB per
-  frame on a stage-C-like test net, so a long input can need several GB. An
-  earlier real generator run with host-output sharing off was killed at
-  2.7 GB RSS on the 3.9 GB VM.
+| Line | Phonemes | Audio | Frames | KokoroTTS peak RSS | Python peak RSS (forward) |
+| --- | --- | --- | --- | --- | --- |
+| after loading | | | | 462 MB | 1092 MB (1281 MB while loading) |
+| 1 x "Hello" | 5 | 1.40 s | 56 | 512 MB | 1110 MB |
+| 8 x "Hello" | 47 | 3.20 s | 128 | 586 MB | 1147 MB |
+| 26 x "Hello" | 155 | 10.38 s | 415 | 724 MB | 1345 MB |
+| the `SimpleKokoroTTS` story | 260 | 15.90 s | 636 | 862 MB | 1354 MB |
 
-Text is split into chunks of at most 510 phonemes, and each chunk builds its
-own stage nets, so the activation peak follows the longest chunk, not the
-whole line. A full 510-phoneme chunk has not been measured; keep lines to a
-sentence or two until the end-to-end peak is measured.
+* A line adds about 0.6 MB per frame (about 24 MB per second of audio) to
+  the 462 MB that loading takes. Python grows unevenly (0.04 to 0.7 MB per
+  frame between these lines) on top of a larger base, so KokoroTTS stays
+  below Python's peak at every measured length (0.46x to 0.64x).
+* Memory follows the longest chunk, not the whole line: text is split into
+  chunks of at most 510 phonemes, and `TNNetKokoro.Synthesize` frees stage
+  A's net and the other per-chunk buffers before the next chunk starts. A
+  full 510-phoneme chunk (about 31 s of audio) has not been measured; from
+  the slope above it needs about 1.2 GB (estimate).
+* Lines do not add up: in the REPL, a second 26 x "Hello" line raised the
+  peak by only 14 MB (724 MB to 738 MB).
+* `SimpleKokoroTTS` (`fox.wav`, then `story.wav`) peaked at 872 MB.
+
+Speed on the same VM (1 core): synthesis took 28.8 s for the 10.38 s line
+(real-time factor 2.8); Python's forward took 16.8 s.
 
 ## Smoke run without the real checkpoint
 
@@ -250,19 +271,25 @@ StyleTTS2 + iSTFTNet, 81.7M parameters) into `TNNetKokoro`
 text -> English G2P (neural/neuralg2p.pas, misaki's dictionaries)
   -> chunks of at most 510 phonemes (split at sentence punctuation, as kokoro's KPipeline)
   -> per chunk: phonemes -> ids (config.json vocab, wrapped in 0s)
-     -> stage A  (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
-     -> stage B  (F0 and energy curves)
-     -> stage-C decoder
+     -> stage A, TNNet (PL-BERT/ALBERT, text encoder, duration predictor) -> frames per token
+     -> stage B, plain code (F0 and energy curves)
+     -> stage-C decoder, plain code
      -> harmonic source + STFT (host)
-     -> stage-C generator -> exp / sin -> inverse STFT (host)
+     -> stage-C generator, plain code -> exp / sin -> inverse STFT (host)
   -> chunk audio joined with no gap -> WAV
 ```
 
-Stages A, B and C are `TNNet`s run by `TNNet.Compute`; each is built once
-from the checkpoint and resized per chunk by a borrowing rebuild (no second
-copy of the weights). The shared part (loading, voice switching, text ->
-audio -> WAV) is `TKokoroSession` in `neural/neuralkokorosession.pas`, so a
-later TTS server can reuse it; `KokoroTTS.lpr` holds the argument parsing,
+Stage A is a `TNNet` run by `TNNet.Compute`: its weights are loaded once,
+and per chunk `TNNetKokoro` builds the net for that chunk's length on those
+weights (no second copy) and frees it after stage A has run. Stages B and C
+are plain Pascal code on `TNNetVolume` buffers (`neural/neuralplainops.pas`,
+called by `TNNetKokoro`): their weights are loaded once, and each step reuses
+a few buffers instead of keeping one set per layer. `--gpu` runs stage A on
+OpenCL; stages B and C always run on the CPU.
+
+The shared part (loading, voice switching, text -> audio -> WAV) is
+`TKokoroSession` in `neural/neuralkokorosession.pas`, so a later TTS server
+can reuse it; `KokoroTTS.lpr` holds the argument parsing,
 the REPL and the external-program step.
 
 Only the English voices work with text: `a*` (American: `af_*`, `am_*`) and
