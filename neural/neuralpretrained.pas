@@ -52976,6 +52976,10 @@ begin
     BertLayers);
   LoadKokoroStageAWeights(Reader, FStageAOwner, FConfig, OwnerLayers,
     BertLayers, Consumed);
+  // As TChatEngine after SetTrainable(false): each layer's weight caches now
+  // match its inference-only state (14 MB less RSS on the real checkpoint).
+  for LayerPos := 0 to FStageAOwner.GetLastLayerIdx() do
+    FStageAOwner.Layers[LayerPos].FlushWeightCache();
   MaxLayerPos := FConfig.NumLayers - 1;
   SetLength(FDurationNormFcWeights, FConfig.NumLayers);
   SetLength(FDurationNormFcBiases, FConfig.NumLayers);
