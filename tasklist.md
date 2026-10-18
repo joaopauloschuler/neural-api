@@ -73,7 +73,7 @@ rather than acted on.
 
 ## Bugs
 
-- [ ] BUG: `SetTrainable(False)` then `SetTrainable(True)` did not give back a
+- [x] BUG: `SetTrainable(False)` then `SetTrainable(True)` did not give back a
       trainable layer. `TNNetLayer.SetTrainable(False)` shrinks `FOutputError` /
       `FOutputErrorDeriv` to 1x1x1; the True branch only set flags, so nothing
       regrew them. Effects: `TNNetFullConnect.BackpropagateCPU` wrote past the
@@ -97,7 +97,7 @@ rather than acted on.
         a never-flipped twin, 1e-6) and `TestSetTrainableKeepsInferenceOnlyWeights`.
         Suites green: cpu 3283 (+1 run alone), avx2 3284, opencl 3284; 0 errors,
         0 failures. Not done in part 1: re-arming OpenCL after a flip.
-  - [ ] Part 2: the 35 layers whose `SetTrainable` override only frees
+  - [x] Part 2: the 35 layers whose `SetTrainable` override only frees
         (`if not pTrainable then FreeBackpropScratch()`), plus AconC, MetaAconC,
         DyT, PReLUChannel and SReLU, lose backprop scratch that the True flip
         does not size again. Add a per-class
@@ -120,15 +120,32 @@ rather than acted on.
           Found on the way: `TNNetLinformerAttention.Backpropagate` only
           accumulates deltas and never applies them when `FBatchUpdate` is false
           (the helper now calls `TNNet.UpdateWeights`); not changed.
-    - [ ] Batch B: DeltaNet, GatedDeltaNet, GatedLinearAttention, NTMMemory,
-          TestTimeTraining, TitansMemory, SpectralConv1D, DWT1D, SpectralConv2D,
-          CondConv, MonarchLinear, KroneckerLinear, SoftDecisionTree,
-          HouseholderLinear, HyperbolicLinear, HyperbolicDistance, GraphAttention
-          (17 overrides). Also in batch B: the no-override classes AconC,
-          MetaAconC, DyT, PReLUChannel, SReLU; the `PrepareNoForwardMask` mask in
-          `FOutputErrorDeriv` (TNNetDotProducts, TNNetPointwiseSoftMax) that the
-          True flip must rebuild; `TNNet.EnableInputGradient` not setting
-          TNNetInput's `FStruct[3]`.
+    - [x] Batch B (Done 2026-10-18, commit f351b7ac): DeltaNet, GatedDeltaNet,
+          GatedLinearAttention, NTMMemory, TestTimeTraining, TitansMemory,
+          SpectralConv1D, DWT1D, SpectralConv2D, CondConv, MonarchLinear,
+          KroneckerLinear, SoftDecisionTree, HouseholderLinear, HyperbolicLinear,
+          HyperbolicDistance, GraphAttention (17 overrides). Each got the batch-A
+          `SizeBackpropScratch`, except GatedDeltaNet, whose override already
+          re-runs `SizeSequenceCaches`. AconC, MetaAconC, DyT, PReLUChannel and
+          SReLU got `FreeBackpropScratch` + `SizeBackpropScratch` + a
+          `SetTrainable` override (free on False, size on True). No other class
+          needed it: the remaining `if FIsTrainable` blocks in `SetPrevLayer`
+          size neuron Delta/BackInertia (regrown by `TNNetNeuron.SetTrainable`)
+          or already have a regrowing override. The NoForward mask
+          (TNNetDotProducts, TNNetPointwiseSoftMax) is rebuilt on the True flip
+          and built in `SetPrevLayer` only when trainable (an inference-only
+          DotProducts(NoForward) used to write the mask past its 1x1x1 buffer).
+          `TNNet.EnableInputGradient` now calls `TNNetInput.EnableErrorCollection`.
+          examples/GPT2Import/README.md no longer says an inference-only net can
+          never train. New test `TestSetTrainableRoundTripScratchLayersB` (26
+          nets x 4 modes, 1e-6; DeltaNet lr 0.2, HyperbolicDistance lr 0.01 with
+          c=0.01); on the old code under `-Cr -Ct` every class but GatedDeltaNet
+          fails. Suites green: cpu, avx2, opencl 3286 each, 0 errors, 0 failures.
+- [ ] BUG (awaits user decision, not fixed): `TNNetLinformerAttention.Backpropagate`
+      accumulates its weight deltas but never applies them when `FBatchUpdate`
+      is false, so the layer does not train outside batch mode unless the
+      caller runs `TNNet.UpdateWeights`. Found during SetTrainable part 2,
+      batch A (the round-trip helper calls `UpdateWeights` to cover it).
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.

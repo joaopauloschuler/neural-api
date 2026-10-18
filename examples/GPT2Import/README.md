@@ -218,8 +218,11 @@ Both example programs pass `pTrainable=false` to the importer, which
 calls `TNNet.SetTrainable` while building: every neuron's
 `Delta`/`BackInertia` training volumes are shrunk to one element, cutting
 weight memory to ~1/3. That is what lets the full 124M checkpoint run in
-~2.3 GB peak RSS (it needed >3.8 GB before and OOM'd small machines); the
-returned net can only `Compute()`, never train. Slicing remains useful for
+~2.3 GB peak RSS (it needed >3.8 GB before and OOM'd small machines). The
+returned net is inference-only; `TNNet.SetTrainable(True)` makes it
+trainable again (then call `InitAdam` and `EnableOpenCL` again if you use
+them), except for quantized layers and layers that borrow another net's
+weights, which stay inference-only. Slicing remains useful for
 fast iteration (82 MB / ~6 s vs 523 MB / ~16 s).
 
 ## Architecture mapping notes
