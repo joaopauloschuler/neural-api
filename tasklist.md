@@ -2934,12 +2934,35 @@ rather than acted on.
         312 MB (327.2e6 bytes) of raw FP32 weights in kokoro-v1_0.pth plus
         17-21 MB of G2P dictionaries, so at most ~20 MB is left to find
         (~6% of load, ~3% of the full-chunk peak). Low payoff for both.
-  - [ ] 7.4 Generator speed: a register-blocked FP32 matrix-multiply routine
+  - [x] 7.4 Generator speed: a register-blocked FP32 matrix-multiply routine
         (new routine in `neuralvolume.pas`, called from `neuralplainops`;
         asm must be PIC-safe; scalar fallback; not bit-identical, which is
         fine). Do not change `DotProductsTiled` itself. Expected: generator
         14 -> ~7-9 s, decoder -0.5 s on 1 core. Parity tests vs the current
         conv; all three suites; one timed run of the 26 x line.
+        Done 2026-10-18 (de864351): `TNNetVolume.PackDotProductRows` (panels
+        of 16 rows, [element][row]) + `DotProductsPacked`, AVX64 kernel
+        `AVXDotProductsPacked6x16` (6 positions x 16 channels in 12 ymm
+        accumulators, FMA on AVX2, mul + add on AVX; partial blocks via a
+        stack block; Pascal fallback sums in element order, bit-identical
+        to the scalar DotProduct). `TNNetPlainConvWeights` packs its conv /
+        transposed rows at load; Conv1D (bias in registers, writes the
+        output directly), PointwiseConv and ConvTranspose1D (input read in
+        place) call it; default tile 36. Block shape: 6x16 and 4x24 measured
+        equal; 6x16 fits 128 / 256 channels. Micro-benchmark (synthetic,
+        1 core, sustained; the CPU runs ~1.5x faster for the first seconds
+        after idle): convs at generator shapes 9-19 -> 24-46 GMAC/s (ups
+        9 -> 29-35). Real KokoroTTS, 26 x "Hello": synthesis 22.18 s (load
+        average 0.70) -> 16.28 s (1.90), peak RSS 466 / 466 MB; WAV vs HEAD
+        max |diff| 0.038, correlation 0.99959 (the pipeline amplifies ulp
+        changes; end-to-end vs Python is 0.056). Per stage (HelloLineProbe,
+        one run each, throttled): generator 24.0 -> 11.8 s, decoder 2.0 ->
+        0.7 s. Full 506-phoneme chunk 78.0 -> 43.9 s, peak 649 MB. Real
+        generator parity (HEAVY=1) passes: audio rel. 8.3e-5 vs PyTorch.
+        Suites cpu / avx2 / opencl `TESTS=3282 ERRORS=0 FAILURES=0
+        IGNORED=4`; plain-AVX build passes TTestNeuralPlainOps; lazbuild -B
+        all modes of both .lpi, `--selftest` OK. TestConvTranspose1DMatches
+        Layer: exact -> csDotKernelTolerance (exact on scalar builds).
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
