@@ -56,7 +56,7 @@ type
     Speed: TNeuralFloat;     // speaking rate, > 0
     Serial: boolean;         // single-threaded forward passes
     MaxThreads: integer;     // 0 = every CPU thread
-    Gpu: boolean;            // stage nets on OpenCL (builds with -dOpenCL)
+    Gpu: boolean;            // stage A on OpenCL (builds with -dOpenCL)
     GpuPlatform: integer;
     GpuDevice: integer;
     GpuSharedKernel: boolean;
@@ -186,7 +186,7 @@ begin
         FComputeDescription := 'OpenCL on ' +
           FOpenCLDevices.PlatformNames[FOptions.GpuPlatform] + ' / ' +
           FOpenCLDevices.DeviceNames[FOptions.GpuDevice] +
-          ' (stage nets; host steps on the CPU)'
+          ' (stage A; stages B and C on the CPU)'
       else FComputeDescription := 'CPU (the OpenCL program did not build)';
     end
     else FComputeDescription := 'CPU (' + OpenCLProblem + ')';

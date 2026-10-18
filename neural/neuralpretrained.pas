@@ -5545,72 +5545,27 @@ type
 function BuildKokoroStageANet(NN: TNNet; const Config: TKokoroConfig;
   TokenCount: integer): TKokoroStageALayers;
 
-type
-  // An AdainResBlk1d (StyleTTS2 / Kokoro): the layers its loader and the host
-  // style step use.
-  TKokoroAdainResBlockLayers = record
-    Norm1, Norm2: TNNetLayer;  // AdaIN1d InstanceNorms (style written per run)
-    Pool: TNNetLayer;          // depthwise ConvTranspose1d x2; nil without upsample
-    Conv1, Conv2: TNNetLayer;
-    Shortcut: TNNetLayer;      // conv1x1 without bias; nil when dim_in = dim_out
-    Output: TNNetLayer;        // (residual + shortcut) * rsqrt(2)
-  end;
-
-// Adds AdainResBlk1d(InputLayer depth -> DimOut) on InputLayer's (L,1,C)
-// output; Upsample doubles L. Dropout is the identity (inference).
-function AddKokoroAdainResBlock(NN: TNNet; InputLayer: TNNetLayer;
-  DimOut: integer; Upsample: boolean): TKokoroAdainResBlockLayers;
-
-// Loads the AdainResBlk1d convs of Prefix into Block (not the norm fc: the
-// host folds it per utterance with WriteStyleIntoChannelAffine).
-procedure LoadKokoroAdainResBlockWeights(Reader: TNNetSafeTensorsReader;
-  const Prefix: string; const Block: TKokoroAdainResBlockLayers;
-  Consumed: TStrings);
-
 const
   // AdainResBlk1d count of each ProsodyPredictor F0 / N branch.
   KokoroF0NBlockCount = 3;
 
 type
-  // The stage-B layers the host reads or writes (BuildKokoroStageBNet).
-  TKokoroStageBLayers = record
-    SharedLSTM: TNNetLayer;    // predictor.shared: f0n_shared
-    F0Blocks, NBlocks: array of TKokoroAdainResBlockLayers;
-    F0Proj, NProj: TNNetLayer; // F0_pred, N_pred: (2F,1,1)
-    // Every AdaIN1d: F0 blocks then N blocks, norm1 before norm2.
-    StyleNorms: array of TNNetLayer;
+  // Called with a torch dump name ('gen_stage0_leaky', ...) and the values of
+  // that checkpoint while a plain stage runs (Values is reused after).
+  TKokoroPlainCheckpointProc = procedure(const CheckpointName: string;
+    Values: TNNetVolume) of object;
+
+  // Base of the plain-code Kokoro stages: the OnCheckpoint hook.
+  TKokoroPlainStage = class
+  private
+    FOnCheckpoint: TKokoroPlainCheckpointProc;
+  protected
+    procedure Checkpoint(const CheckpointName: string; Values: TNNetVolume);
+  public
+    property OnCheckpoint: TKokoroPlainCheckpointProc read FOnCheckpoint
+      write FOnCheckpoint;
   end;
 
-// Adds Kokoro stage B (ProsodyPredictor.F0Ntrain) for FrameCount frames of en
-// (F,1,hidden+style) to the empty NN; the output is [F0; N] on 2F positions.
-function BuildKokoroStageBNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageBLayers;
-
-const
-  // Stage-C decoder inputs, TNNet.Compute([asr, F0, N]): asr (F,1,hidden),
-  // then stage B's F0 and N curves, (2F,1,1) each.
-  KokoroStageCDecoderAsrInput = 0;
-  KokoroStageCDecoderF0Input = 1;
-  KokoroStageCDecoderNInput = 2;
-
-type
-  // The stage-C decoder layers the host reads or writes
-  // (BuildKokoroStageCDecoderNet).
-  TKokoroStageCDecoderLayers = record
-    F0Conv, NConv: TNNetLayer; // F0_conv / N_conv: the curves at F positions
-    Encode: TKokoroAdainResBlockLayers;
-    AsrRes: TNNetLayer;        // asr_res: (F,1,asr_res width)
-    DecodeBlocks: array of TKokoroAdainResBlockLayers;
-    // Every AdaIN1d: encode, then the decode blocks; norm1 before norm2.
-    StyleNorms: array of TNNetLayer;
-  end;
-
-// Adds Kokoro's Decoder without the generator for FrameCount frames to the
-// empty NN (see the KokoroStageCDecoder* inputs); the output x is (2F,1,512 real).
-function BuildKokoroStageCDecoderNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageCDecoderLayers;
-
-type
   // The TNNetPlainOps instance and the activation buffers the plain-code
   // Kokoro stages share; each stage resizes the buffers at entry.
   TKokoroPlainWorkspace = class
@@ -5634,13 +5589,14 @@ type
     property NormShift: TNNetVolume read FNormShift;
   end;
 
-  // An AdainResBlk1d as plain conv weights read once from the checkpoint; the
-  // norm1 / norm2 fc volumes are borrowed (the caller owns them).
+  // An AdainResBlk1d as plain conv weights and its norm1 / norm2 fc, read
+  // once from the checkpoint.
   TKokoroPlainAdainResBlock = class
   private
     FConv1, FConv2: TNNetPlainConvWeights;
     FPool: TNNetPlainConvWeights;     // nil without upsample
     FShortcut: TNNetPlainConvWeights; // nil when dim_in = dim_out
+    // AdaIN1d fc: [2 * channels, style_dim] + bias.
     FNorm1FcWeight, FNorm1FcBias, FNorm2FcWeight, FNorm2FcBias: TNNetVolume;
     FDimIn, FDimOut: integer;
     FUpsample: boolean;
@@ -5648,8 +5604,7 @@ type
       FcWeight, FcBias: TNNetVolume; const Style: array of TNeuralFloat);
   public
     constructor Create(Reader: TNNetSafeTensorsReader; const Prefix: string;
-      pDimIn, pDimOut: integer; pUpsample: boolean;
-      Norm1FcWeight, Norm1FcBias, Norm2FcWeight, Norm2FcBias: TNNetVolume;
+      pDimIn, pDimOut: integer; pUpsample: boolean; StyleDim: integer;
       Consumed: TStrings);
     destructor Destroy(); override;
     // Input (L,1,DimIn) -> Output (L or 2L,1,DimOut), dropout = identity.
@@ -5663,8 +5618,8 @@ type
   end;
 
   // Kokoro's Decoder without the generator as plain code on TNNetPlainOps
-  // (the same inputs and output as TNNetKokoro.RunStageCDecoder).
-  TKokoroPlainDecoder = class
+  // (TNNetKokoro.RunStageCDecoder runs it).
+  TKokoroPlainDecoder = class(TKokoroPlainStage)
   private
     FHiddenDim, FStyleDim: integer;
     FF0Conv, FNConv, FAsrRes: TNNetPlainConvWeights;
@@ -5675,13 +5630,10 @@ type
     // The concatenated block input and a block output: freed after Run.
     FBlockInput, FBlockOutput: TNNetVolume;
   public
-    // NormFcWeights / NormFcBiases in the TKokoroStageCDecoderLayers.StyleNorms
-    // order, borrowed for the decoder's lifetime.
     constructor Create(Reader: TNNetSafeTensorsReader;
-      const Config: TKokoroConfig;
-      const NormFcWeights, NormFcBiases: array of TNNetVolume;
-      Consumed: TStrings);
+      const Config: TKokoroConfig; Consumed: TStrings);
     destructor Destroy(); override;
+    // OnCheckpoint gets 'dec_encode' and every 'dec_decode<i>'.
     procedure Run(Workspace: TKokoroPlainWorkspace; TextFeatures: TNNetVolume;
       const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
       const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
@@ -5698,78 +5650,21 @@ type
     property AsrResOutput: TNNetVolume read FAsrResOutput;
   end;
 
-type
-  // An AdaINResBlock1 (iSTFTNet resblock 1 with AdaIN1d and per-channel
-  // Snake1D); entry p of each array belongs to dilation pair p.
-  TKokoroAdaINResBlock1Layers = record
-    Norms1, Norms2: array of TNNetLayer;   // adain1[p] / adain2[p] InstanceNorms
-    Snakes1, Snakes2: array of TNNetLayer; // alpha1[p] / alpha2[p]
-    Convs1, Convs2: array of TNNetLayer;   // convs1[p] (dilated) / convs2[p]
-    Output: TNNetLayer;                    // the last residual sum
-  end;
-
-// Adds AdaINResBlock1(channels = InputLayer depth, KernelSize, Dilations) on
-// InputLayer's (L,1,C) output: per dilation d, x + conv2(snake(norm(conv1_d(snake(norm(x)))))).
-function AddKokoroAdaINResBlock1(NN: TNNet; InputLayer: TNNetLayer;
-  KernelSize: integer; const Dilations: array of integer):
-  TKokoroAdaINResBlock1Layers;
-
-const
-  // Stage-C generator inputs, TNNet.Compute([x, harmonic spectrum]): the
-  // decoder output x (2F,1,512 real), then ComputeHarmonicSpectrum's (120F+1,1,22).
-  KokoroStageCGeneratorXInput = 0;
-  KokoroStageCGeneratorHarmonicInput = 1;
-
-type
-  // One upsampling stage of the iSTFTNet generator.
-  TKokoroGeneratorStageLayers = record
-    Leaky: TNNetLayer;       // leaky_relu(x, 0.1)
-    NoiseConv: TNNetLayer;   // noise_convs[i] on the harmonic spectrum
-    NoiseRes: TKokoroAdaINResBlock1Layers;
-    Ups: TNNetLayer;         // ups[i] ConvTranspose1d
-    Pad: TNNetLayer;         // ReflectionPad1d((1, 0)); last stage only, else nil
-    Sum: TNNetLayer;         // x + x_source
-    ResBlocks: array of TKokoroAdaINResBlock1Layers;
-    Mrf: TNNetLayer;         // the mean of ResBlocks
-  end;
-
-  // The stage-C generator layers the host reads or writes
-  // (BuildKokoroStageCGeneratorNet).
-  TKokoroStageCGeneratorLayers = record
-    Stages: array of TKokoroGeneratorStageLayers;
-    PostLeaky: TNNetLayer;   // leaky_relu(x), slope 0.01
-    ConvPost: TNNetLayer;    // conv_post: (120F+1,1,n_fft+2), the net output
-    // Every AdaIN1d: per stage noise_res, then resblocks; per block adain1[p], adain2[p].
-    StyleNorms: array of TNNetLayer;
-  end;
-
-// Adds Kokoro's Generator up to conv_post for FrameCount frames to the empty
-// NN (see the KokoroStageCGenerator* inputs); exp/sin and the iSTFT run on the host.
-function BuildKokoroStageCGeneratorNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageCGeneratorLayers;
-
-type
-  // Called with a torch dump name ('gen_stage0_leaky', ...) and the values of
-  // that checkpoint while the plain generator runs (Values is reused after).
-  TKokoroPlainCheckpointProc = procedure(const CheckpointName: string;
-    Values: TNNetVolume) of object;
-
-  // An AdaINResBlock1 as plain weights read once from the checkpoint; the
-  // adain fc volumes are borrowed (the caller owns them).
+  // An AdaINResBlock1 as plain weights (convs, Snake alphas, adain fcs) read
+  // once from the checkpoint.
   TKokoroPlainAdaINResBlock1 = class
   private
     FChannels: integer;
     FDilations: array of integer;
     FConvs1, FConvs2: array of TNNetPlainConvWeights;
     FAlphas1, FAlphas2: array of TNNetVolume;
+    // adain1[p] / adain2[p] fc: [2 * channels, style_dim] + bias.
     FNorm1FcWeights, FNorm1FcBiases, FNorm2FcWeights, FNorm2FcBiases:
       array of TNNetVolume;
   public
-    // NormFcWeights / NormFcBiases from FirstNormPos: adain1[p], adain2[p] per p.
     constructor Create(Reader: TNNetSafeTensorsReader; const Prefix: string;
       pChannels, KernelSize: integer; const Dilations: array of integer;
-      const NormFcWeights, NormFcBiases: array of TNNetVolume;
-      FirstNormPos: integer; Consumed: TStrings);
+      StyleDim: integer; Consumed: TStrings);
     destructor Destroy(); override;
     // In place on X (L,1,Channels); uses Workspace.Work1 for the conv1 output.
     procedure Forward(Workspace: TKokoroPlainWorkspace; X: TNNetVolume;
@@ -5778,10 +5673,9 @@ type
     property Channels: integer read FChannels;
   end;
 
-  // Kokoro's Generator up to conv_post as plain code on TNNetPlainOps (the
-  // same inputs as TNNetKokoro.RunStageCGenerator; exp / sin and the iSTFT
-  // are the caller's).
-  TKokoroPlainGenerator = class
+  // Kokoro's Generator up to conv_post as plain code on TNNetPlainOps
+  // (TNNetKokoro.RunStageCGenerator runs it, then exp / sin and the iSTFT).
+  TKokoroPlainGenerator = class(TKokoroPlainStage)
   private
     FStyleDim, FInputWidth, FResBlockCount, FHarmonicStride: integer;
     FRates, FUpsKernelSizes, FNoiseStrides: array of integer;
@@ -5795,16 +5689,10 @@ type
     FBuffers: array[0..3] of TNNetVolume;
     FConvPostOutput: TNNetVolume;
     FPeakBufferBytes: int64;
-    FOnCheckpoint: TKokoroPlainCheckpointProc;
     procedure NotePeak(Workspace: TKokoroPlainWorkspace);
-    procedure Checkpoint(const CheckpointName: string; Values: TNNetVolume);
   public
-    // NormFcWeights / NormFcBiases in the TKokoroStageCGeneratorLayers.StyleNorms
-    // order, borrowed for the generator's lifetime.
     constructor Create(Reader: TNNetSafeTensorsReader;
-      const Config: TKokoroConfig;
-      const NormFcWeights, NormFcBiases: array of TNNetVolume;
-      Consumed: TStrings);
+      const Config: TKokoroConfig; Consumed: TStrings);
     destructor Destroy(); override;
     // x (2F,1,512 real) and HarmonicSpectrum (120F+1,1,n_fft+2 real) ->
     // ConvPost (120F+1,1,n_fft+2); frees the stage buffers before conv_post.
@@ -5821,13 +5709,11 @@ type
     property ConvPost: TNNetVolume read FConvPostOutput;
     // Largest BufferBytes + workspace bytes during the last Run.
     property PeakBufferBytes: int64 read FPeakBufferBytes;
-    property OnCheckpoint: TKokoroPlainCheckpointProc read FOnCheckpoint
-      write FOnCheckpoint;
   end;
 
   // Kokoro stage B (ProsodyPredictor.F0Ntrain) as plain code on TNNetPlainOps
-  // (the same inputs and outputs as TNNetKokoro.RunStageB).
-  TKokoroPlainF0NPredictor = class
+  // (TNNetKokoro.RunStageB runs it).
+  TKokoroPlainF0NPredictor = class(TKokoroPlainStage)
   private
     FHiddenDim, FStyleDim: integer;
     FSharedForward, FSharedBackward: TNNetPlainLSTMWeights;
@@ -5837,21 +5723,16 @@ type
     // outputs a branch alternates between: all freed by ReleaseBuffers.
     FFrameFeatures, FShared: TNNetVolume;
     FBlockOutputs: array[0..1] of TNNetVolume;
-    FOnCheckpoint: TKokoroPlainCheckpointProc;
-    procedure Checkpoint(const CheckpointName: string; Values: TNNetVolume);
     // One branch on FShared: its blocks, then Projection into Curve (2F,1,1).
     procedure RunBranch(Workspace: TKokoroPlainWorkspace;
       const Blocks: array of TKokoroPlainAdainResBlock;
       Projection: TNNetPlainConvWeights; const BranchName: string;
       const Style: array of TNeuralFloat; Curve: TNNetVolume);
   public
-    // NormFcWeights / NormFcBiases in the TKokoroStageBLayers.StyleNorms
-    // order, borrowed for the predictor's lifetime.
     constructor Create(Reader: TNNetSafeTensorsReader;
-      const Config: TKokoroConfig;
-      const NormFcWeights, NormFcBiases: array of TNNetVolume;
-      Consumed: TStrings);
+      const Config: TKokoroConfig; Consumed: TStrings);
     destructor Destroy(); override;
+    // OnCheckpoint gets 'en', 'f0n_shared', 'F0_block<i>' and 'N_block<i>'.
     procedure Run(Workspace: TKokoroPlainWorkspace;
       DurationFeatures: TNNetVolume; const PredictedDurations: array of integer;
       const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
@@ -5860,18 +5741,14 @@ type
     // Bytes of the activation buffers this predictor owns now (not the workspace).
     function BufferBytes(): int64;
     function BlockCount(): integer;
-    // Called with 'en', 'f0n_shared', 'F0_block<i>' and 'N_block<i>'.
-    property OnCheckpoint: TKokoroPlainCheckpointProc read FOnCheckpoint
-      write FOnCheckpoint;
   end;
 
 type
-  // Kokoro-82M as TNNet stages run by TNNet.Compute with host steps between
-  // them. Each stage has a weight owner built once from the checkpoint and a
-  // net sized per utterance that borrows the owner's weights. Stage A (text
-  // side: PL-BERT, duration predictor, text encoder), stage B (prosody:
-  // F0Ntrain), the stage-C decoder, the host harmonic spectrum, the stage-C
-  // generator and the host iSTFT. Coded by Claude (AI).
+  // Kokoro-82M: stage A (text side: PL-BERT, duration predictor, text
+  // encoder) as a TNNet sized per utterance that borrows the weights of an
+  // owner net built once; stage B (prosody: F0Ntrain), the stage-C decoder
+  // and the stage-C generator as plain code on TNNetPlainOps; the harmonic
+  // spectrum and the iSTFT as host steps. Coded by Claude (AI).
   TNNetKokoro = class(TObject)
   private
     FConfig: TKokoroConfig;
@@ -5882,36 +5759,10 @@ type
     FStageAInput: TNNetVolume;
     // predictor.text_encoder AdaLayerNorm fc: [2*hidden_dim, style_dim] + bias.
     FDurationNormFcWeights, FDurationNormFcBiases: array of TNNetVolume;
-    FStageBOwner: TNNet;
-    FStageBNet: TNNet;
-    FStageBLayers: TKokoroStageBLayers;
-    FStageBFrameCount: integer;
-    // en: d repeated per predicted duration, the stage-B input.
-    FStageBInput: TNNetVolume;
-    // AdaIN1d fc of each FStageBLayers.StyleNorms entry: [2C, style_dim] + bias.
-    FStageBNormFcWeights, FStageBNormFcBiases: array of TNNetVolume;
-    // Stage B as plain code; borrows the FStageBNormFc* volumes.
-    FStageBPlain: TKokoroPlainF0NPredictor;
-    FStageCDecoderOwner: TNNet;
-    FStageCDecoderNet: TNNet;
-    FStageCDecoderLayers: TKokoroStageCDecoderLayers;
-    FStageCDecoderFrameCount: integer;
-    // asr: t_en repeated per predicted duration, the first decoder input.
-    FStageCDecoderAsr: TNNetVolume;
-    // AdaIN1d fc of each FStageCDecoderLayers.StyleNorms entry.
-    FStageCDecoderNormFcWeights, FStageCDecoderNormFcBiases: array of TNNetVolume;
-    // The decoder as plain code; borrows the FStageCDecoderNormFc* volumes.
-    FStageCDecoderPlain: TKokoroPlainDecoder;
+    FStageB: TKokoroPlainF0NPredictor;
+    FStageCDecoder: TKokoroPlainDecoder;
+    FStageCGenerator: TKokoroPlainGenerator;
     FPlainWorkspace: TKokoroPlainWorkspace;
-    FStageCGeneratorOwner: TNNet;
-    FStageCGeneratorNet: TNNet;
-    FStageCGeneratorLayers: TKokoroStageCGeneratorLayers;
-    FStageCGeneratorFrameCount: integer;
-    // AdaIN1d fc of each FStageCGeneratorLayers.StyleNorms entry.
-    FStageCGeneratorNormFcWeights, FStageCGeneratorNormFcBiases:
-      array of TNNetVolume;
-    // The generator as plain code; borrows the FStageCGeneratorNormFc* volumes.
-    FStageCGeneratorPlain: TKokoroPlainGenerator;
     // spec = exp(conv_post[:bins]) and phase = sin(conv_post[bins:]) of the
     // last generator run: (120F+1,1,n_fft/2+1) each.
     FGeneratorMagnitude, FGeneratorPhase: TNNetVolume;
@@ -5925,10 +5776,9 @@ type
     // English G2P of the last text call (its accent) and its dictionary folder.
     FEnglishG2P: TNeuralEnglishG2P;
     FEnglishDictionaryDir: string;
-    // Set when the stage owner is armed in the OpenCL context.
-    FStageAOwnerOnOpenCL, FStageBOwnerOnOpenCL,
-      FStageCDecoderOwnerOnOpenCL, FStageCGeneratorOwnerOnOpenCL: boolean;
     {$IFDEF OpenCL}
+    // Set when the stage-A owner is armed in the OpenCL context.
+    FStageAOwnerOnOpenCL: boolean;
     // Weightless net owning the OpenCL context and program (EnableOpenCL).
     FOpenCLContextNet: TNNet;
     FOpenCLHasSharedKernel: boolean;
@@ -5937,29 +5787,16 @@ type
     procedure SetEnglishDictionaryDir(const Value: string);
     // Each loader adds the tensors it reads to Consumed.
     procedure LoadStageA(Reader: TNNetSafeTensorsReader; Consumed: TStrings);
-    procedure LoadStageB(Reader: TNNetSafeTensorsReader; Consumed: TStrings);
-    procedure LoadStageCDecoder(Reader: TNNetSafeTensorsReader;
-      Consumed: TStrings);
     // decoder.generator.m_source.l_linear into FHarmonicSource.
     procedure LoadHarmonicSource(Reader: TNNetSafeTensorsReader;
       Consumed: TStrings);
-    procedure LoadStageCGenerator(Reader: TNNetSafeTensorsReader;
-      Consumed: TStrings);
-    // The generator on x from XSource's output when assigned (an OpenCL copy
-    // when it is resident), else from DecoderFeatures; audio via the host iSTFT.
-    procedure RunStageCGeneratorFrom(XSource: TNNetLayer;
-      DecoderFeatures, HarmonicSpectrum: TNNetVolume;
-      const DecoderStyle: array of TNeuralFloat; Audio: TNNetVolume);
     // Host step after conv_post: GeneratorMagnitude = exp(ConvPost[:bins]),
     // GeneratorPhase = sin(ConvPost[bins:]), then the iSTFT into Audio.
     procedure ConvPostToAudio(ConvPost, Audio: TNNetVolume);
     // PlainWorkspace's ops for this call: threaded when Parallel, MaxThreads.
     procedure PreparePlainOps();
-    // After a borrowing build of Net: inference threads, host-output sharing
-    // and, with OpenCL enabled, the owner's arming (once) and Net's.
-    procedure ArmStageNet(Net, Owner: TNNet; var OwnerOnOpenCL: boolean);
   public
-    // Builds the stage owners from an OpenKokoroSnapshot reader and its config.
+    // Reads every weight from an OpenKokoroSnapshot reader and its config.
     constructor Create(Reader: TNNetSafeTensorsReader;
       const Config: TKokoroConfig);
     destructor Destroy(); override;
@@ -5973,50 +5810,28 @@ type
       const ProsodyStyle: array of TNeuralFloat; Speed: TNeuralFloat;
       DurationFeatures, TextFeatures: TNNetVolume;
       out PredictedDurations: TNeuralIntegerArray);
-    // (Re)builds StageBNet for FrameCount frames; a same-length call is free.
-    procedure PrepareStageB(FrameCount: integer);
-    procedure ReleaseStageB();
     // Stage B: DurationFeatures (d from RunStageA) repeated per
     // PredictedDurations, then F0Ntrain; F0_pred and N_pred as (2F,1,1).
+    // Frees stage B's activation buffers after.
     procedure RunStageB(DurationFeatures: TNNetVolume;
       const PredictedDurations: array of integer;
       const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
-    // RunStageB as plain code (StageBPlain on PlainWorkspace, threaded when
-    // Parallel); frees stage B's activation buffers after.
-    procedure RunStageBPlain(DurationFeatures: TNNetVolume;
-      const PredictedDurations: array of integer;
-      const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
-    // (Re)builds StageCDecoderNet for FrameCount frames; a same-length call
-    // is free.
-    procedure PrepareStageCDecoder(FrameCount: integer);
-    procedure ReleaseStageCDecoder();
     // Stage-C decoder: TextFeatures (t_en from RunStageA) repeated per
-    // PredictedDurations, the (2F,1,1) curves of RunStageB; x into DecoderFeatures.
+    // PredictedDurations, the (2F,1,1) curves of RunStageB; x into
+    // DecoderFeatures. Frees the decoder's block buffers after.
     procedure RunStageCDecoder(TextFeatures: TNNetVolume;
-      const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
-      const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
-    // RunStageCDecoder as plain code (StageCDecoderPlain on PlainWorkspace,
-    // threaded when Parallel); frees the decoder's activation buffers after.
-    procedure RunStageCDecoderPlain(TextFeatures: TNNetVolume;
       const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
       const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
     // Generator host step: F0Curve (2F,1,1) -> har_source -> its STFT as
     // HarmonicSpectrum (120F+1,1,22 real): [magnitude; phase] per frame.
     procedure ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum: TNNetVolume);
-    // (Re)builds StageCGeneratorNet for FrameCount frames; a same-length call
-    // is free.
-    procedure PrepareStageCGenerator(FrameCount: integer);
-    procedure ReleaseStageCGenerator();
     // Generator on x (2F,1,512 real) and HarmonicSpectrum, then exp / sin and
     // torch.istft(center=True) on the host: Audio is (600F,1,1) at 24 kHz.
+    // Frees the generator's activation buffers after.
     procedure RunStageCGenerator(DecoderFeatures, HarmonicSpectrum: TNNetVolume;
       const DecoderStyle: array of TNeuralFloat; Audio: TNNetVolume);
-    // RunStageCGenerator as plain code (StageCGeneratorPlain on PlainWorkspace,
-    // threaded when Parallel); frees the generator's activation buffers after.
-    procedure RunStageCGeneratorPlain(DecoderFeatures,
-      HarmonicSpectrum: TNNetVolume; const DecoderStyle: array of TNeuralFloat;
-      Audio: TNNetVolume);
     // Every stage: TokenIds (wrapped in 0s) and a voice row -> Audio at 24 kHz.
+    // Frees StageANet once stage A's outputs are copied out.
     procedure Synthesize(const TokenIds: array of integer;
       const DecoderStyle, ProsodyStyle: array of TNeuralFloat;
       Speed: TNeuralFloat; Audio: TNNetVolume);
@@ -6044,17 +5859,13 @@ type
       const Voice: TKokoroVoicePack; Speed: TNeuralFloat;
       const FileName: string; out Report: TKokoroTextReport);
     {$IFDEF OpenCL}
-    // One OpenCL context and program for every stage net (owner weights
-    // uploaded once, borrowed); false if the program does not build.
+    // One OpenCL context and program for stage A (owner weights uploaded
+    // once, borrowed); stages B and C stay on the CPU. False if the program
+    // does not build.
     function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true): boolean;
     function OpenCLEnabled(): boolean;
     property StageAOwnerOnOpenCL: boolean read FStageAOwnerOnOpenCL;
-    property StageBOwnerOnOpenCL: boolean read FStageBOwnerOnOpenCL;
-    property StageCDecoderOwnerOnOpenCL: boolean
-      read FStageCDecoderOwnerOnOpenCL;
-    property StageCGeneratorOwnerOnOpenCL: boolean
-      read FStageCGeneratorOwnerOnOpenCL;
     property ShareOpenCLOutputs: boolean read FShareOpenCLOutputs
       write FShareOpenCLOutputs;
     {$ENDIF}
@@ -6069,35 +5880,21 @@ type
     property StageANet: TNNet read FStageANet;
     // The layers of StageANet (valid until the next rebuild).
     property StageALayers: TKokoroStageALayers read FStageALayers;
-    property StageBOwner: TNNet read FStageBOwner;
-    property StageBNet: TNNet read FStageBNet;
-    property StageBLayers: TKokoroStageBLayers read FStageBLayers;
-    // en of the last RunStageB: (F,1,hidden+style).
-    property StageBInput: TNNetVolume read FStageBInput;
-    property StageBPlain: TKokoroPlainF0NPredictor read FStageBPlain;
-    property StageCDecoderOwner: TNNet read FStageCDecoderOwner;
-    property StageCDecoderNet: TNNet read FStageCDecoderNet;
-    property StageCDecoderLayers: TKokoroStageCDecoderLayers
-      read FStageCDecoderLayers;
-    // asr of the last RunStageCDecoder: (F,1,hidden).
-    property StageCDecoderAsr: TNNetVolume read FStageCDecoderAsr;
-    property StageCDecoderPlain: TKokoroPlainDecoder read FStageCDecoderPlain;
+    property StageB: TKokoroPlainF0NPredictor read FStageB;
+    property StageCDecoder: TKokoroPlainDecoder read FStageCDecoder;
+    property StageCGenerator: TKokoroPlainGenerator read FStageCGenerator;
     property PlainWorkspace: TKokoroPlainWorkspace read FPlainWorkspace;
-    property StageCGeneratorOwner: TNNet read FStageCGeneratorOwner;
-    property StageCGeneratorNet: TNNet read FStageCGeneratorNet;
-    property StageCGeneratorLayers: TKokoroStageCGeneratorLayers
-      read FStageCGeneratorLayers;
-    property StageCGeneratorPlain: TKokoroPlainGenerator
-      read FStageCGeneratorPlain;
     property GeneratorMagnitude: TNNetVolume read FGeneratorMagnitude;
     property GeneratorPhase: TNNetVolume read FGeneratorPhase;
     // Set RandomNoise / NoiseSeed here; zero noise by default.
     property HarmonicSource: TNNetHarmonicSource read FHarmonicSource;
     property HarmonicSTFT: TNNetForwardSTFT read FHarmonicSTFT;
     property HarmonicWave: TNNetVolume read FHarmonicWave;
-    // Read when a stage net is (re)built, as in TQwenImage21VaeDecoder.
+    // Parallel and MaxThreads: read when StageANet is built and by each
+    // plain-stage run.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    // Host-output sharing by liveness on StageANet.
     property ShareHostOutputs: boolean read FShareHostOutputs
       write FShareHostOutputs;
   end;
@@ -51983,169 +51780,11 @@ begin
   Result := AddKokoroStageA(NN, Config, TokenCount, BertLayers);
 end;
 
-function AddKokoroAdainResBlock(NN: TNNet; InputLayer: TNNetLayer;
-  DimOut: integer; Upsample: boolean): TKokoroAdainResBlockLayers;
-var
-  DimIn: integer;
-  ShortcutSource: TNNetLayer;
-begin
-  Result := Default(TKokoroAdainResBlockLayers);
-  DimIn := InputLayer.Output.Depth;
-  // Residual: AdaIN1d, LeakyReLU, pool, conv1, AdaIN1d, LeakyReLU, conv2.
-  Result.Norm1 := NN.AddLayerAfter(TNNetInstanceNorm.Create(), InputLayer);
-  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
-  if Upsample then
-    Result.Pool := NN.AddLayer(TNNetDeconv1DLinear.Create(DimIn, 3, 2, 1, 1,
-      {pGroups=}DimIn));
-  Result.Conv1 := NN.AddLayer(TNNetConv1DLinear.Create(DimOut, 3, 1, 1));
-  Result.Norm2 := NN.AddLayer(TNNetInstanceNorm.Create());
-  NN.AddLayer(TNNetLeakyReLU.Create(0.2));
-  Result.Conv2 := NN.AddLayer(TNNetConv1DLinear.Create(DimOut, 3, 1, 1));
-  // Shortcut: nearest x2 along X (UpSample1d), then conv1x1 without bias.
-  ShortcutSource := InputLayer;
-  if Upsample then
-    ShortcutSource := NN.AddLayerAfter(TNNetDeMaxPool.Create(2, 0,
-      {pPoolSizeY=}1), InputLayer);
-  if DimIn <> DimOut then
-  begin
-    Result.Shortcut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(DimOut,
-      {pSuppressBias=}1), ShortcutSource);
-    ShortcutSource := Result.Shortcut;
-  end;
-  NN.AddLayer(TNNetSum.Create([Result.Conv2, ShortcutSource]));
-  Result.Output := NN.AddLayer(TNNetMulByConstant.Create(1 / Sqrt(2)));
-end;
-
-procedure LoadKokoroAdainResBlockWeights(Reader: TNNetSafeTensorsReader;
-  const Prefix: string; const Block: TKokoroAdainResBlockLayers;
-  Consumed: TStrings);
-begin
-  LoadTorchConv1DLinear(Reader, Prefix + '.conv1', Block.Conv1, Consumed);
-  LoadTorchConv1DLinear(Reader, Prefix + '.conv2', Block.Conv2, Consumed);
-  if Assigned(Block.Pool) then
-    LoadTorchConvTranspose1DLinear(Reader, Prefix + '.pool', Block.Pool,
-      Consumed);
-  if Assigned(Block.Shortcut) then
-    LoadTorchConv1DLinear(Reader, Prefix + '.conv1x1', Block.Shortcut,
-      Consumed);
-end;
-
 const
   // Per F0 / N block: d_hid -> d_hid, d_hid -> d_hid/2 (x2 upsample),
   // d_hid/2 -> d_hid/2.
   KokoroF0NBlockHalvesWidth: array[0..KokoroF0NBlockCount - 1] of boolean =
     (false, true, false);
-
-function BuildKokoroStageBNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageBLayers;
-const
-  MaxBlockPos = KokoroF0NBlockCount - 1;
-var
-  BranchPos, BlockPos, BlockWidth, StyleNormPos: integer;
-  BranchInput: TNNetLayer;
-  Blocks: array of TKokoroAdainResBlockLayers;
-  Projection: TNNetLayer;
-begin
-  Result := Default(TKokoroStageBLayers);
-  if FrameCount < 1 then
-    ImportError('Kokoro: stage B needs at least one frame, got ' +
-      IntToStr(FrameCount) + '.');
-  if Odd(Config.HiddenDim) then
-    ImportError('Kokoro: hidden_dim must be even.');
-  NN.AddLayer(TNNetInput.Create(FrameCount, 1,
-    Config.HiddenDim + Config.StyleDim));
-  Result.SharedLSTM := NN.AddBidirectionalLSTM(Config.HiddenDim div 2, 1,
-    {Bidirectional=}true, {CellsReadInputWidth=}true);
-  SetLength(Result.StyleNorms, 4 * KokoroF0NBlockCount);
-  StyleNormPos := 0;
-  // Branch 0 = F0, branch 1 = N; both fork from the shared bi-LSTM.
-  for BranchPos := 0 to 1 do
-  begin
-    SetLength(Blocks, KokoroF0NBlockCount);
-    BranchInput := Result.SharedLSTM;
-    BlockWidth := Config.HiddenDim;
-    for BlockPos := 0 to MaxBlockPos do
-    begin
-      if KokoroF0NBlockHalvesWidth[BlockPos] then
-        BlockWidth := BlockWidth div 2;
-      Blocks[BlockPos] := AddKokoroAdainResBlock(NN, BranchInput, BlockWidth,
-        {Upsample=}KokoroF0NBlockHalvesWidth[BlockPos]);
-      Result.StyleNorms[StyleNormPos] := Blocks[BlockPos].Norm1;
-      Result.StyleNorms[StyleNormPos + 1] := Blocks[BlockPos].Norm2;
-      Inc(StyleNormPos, 2);
-      BranchInput := Blocks[BlockPos].Output;
-    end;
-    Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
-    if BranchPos = 0 then
-    begin
-      Result.F0Blocks := Blocks;
-      Result.F0Proj := Projection;
-    end
-    else
-    begin
-      Result.NBlocks := Blocks;
-      Result.NProj := Projection;
-    end;
-    Blocks := nil;
-  end;
-  NN.AddLayer(TNNetDeepConcat.Create([Result.F0Proj, Result.NProj]));
-  // Same inference settings as stage A (low memory). The grouped pool runs the
-  // CPU scatter in either memory mode.
-  NN.SetTrainable(false);
-end;
-
-function BuildKokoroStageCDecoderNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageCDecoderLayers;
-var
-  AsrInput, F0Input, NInput, BlockInput: TNNetLayer;
-  BlockPos, MaxBlockPos, BlockWidth: integer;
-  IsLastBlock: boolean;
-begin
-  Result := Default(TKokoroStageCDecoderLayers);
-  if FrameCount < 1 then
-    ImportError('Kokoro: the stage-C decoder needs at least one frame, got ' +
-      IntToStr(FrameCount) + '.');
-  if Config.DecoderBlockCount < 1 then
-    ImportError('Kokoro: no decoder widths in the config (call ' +
-      'ReadKokoroWidthsFromWeights first).');
-  AsrInput := NN.AddLayer(TNNetInput.Create(FrameCount, 1, Config.HiddenDim));
-  F0Input := NN.AddLayer(TNNetInput.Create(2 * FrameCount, 1, 1));
-  NInput := NN.AddLayer(TNNetInput.Create(2 * FrameCount, 1, 1));
-  // F0_conv / N_conv: Conv1d 1 -> 1, k3 s2 p1 takes the 2F curves to F.
-  Result.F0Conv := NN.AddLayerAfter(TNNetConv1DLinear.Create(1, 3, 1, 2),
-    F0Input);
-  Result.NConv := NN.AddLayerAfter(TNNetConv1DLinear.Create(1, 3, 1, 2),
-    NInput);
-  BlockInput := NN.AddLayer(TNNetDeepConcat.Create([AsrInput, Result.F0Conv,
-    Result.NConv]));
-  Result.Encode := AddKokoroAdainResBlock(NN, BlockInput, Config.DecoderWidth,
-    {Upsample=}false);
-  Result.AsrRes := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.AsrResWidth), AsrInput);
-  MaxBlockPos := Config.DecoderBlockCount - 1;
-  SetLength(Result.DecodeBlocks, Config.DecoderBlockCount);
-  SetLength(Result.StyleNorms, 2 * (Config.DecoderBlockCount + 1));
-  Result.StyleNorms[0] := Result.Encode.Norm1;
-  Result.StyleNorms[1] := Result.Encode.Norm2;
-  BlockInput := Result.Encode.Output;
-  // Only the last block upsamples, so every block reads [x, asr_res, F0, N]
-  // (the package stops the concat after the upsampling block).
-  for BlockPos := 0 to MaxBlockPos do
-  begin
-    IsLastBlock := BlockPos = MaxBlockPos;
-    BlockWidth := Config.DecoderWidth;
-    if IsLastBlock then BlockWidth := Config.DecoderOutputWidth;
-    BlockInput := NN.AddLayer(TNNetDeepConcat.Create([BlockInput,
-      Result.AsrRes, Result.F0Conv, Result.NConv]));
-    Result.DecodeBlocks[BlockPos] := AddKokoroAdainResBlock(NN, BlockInput,
-      BlockWidth, {Upsample=}IsLastBlock);
-    Result.StyleNorms[2 * BlockPos + 2] := Result.DecodeBlocks[BlockPos].Norm1;
-    Result.StyleNorms[2 * BlockPos + 3] := Result.DecodeBlocks[BlockPos].Norm2;
-    BlockInput := Result.DecodeBlocks[BlockPos].Output;
-  end;
-  // Same inference settings as stages A and B (low memory).
-  NN.SetTrainable(false);
-end;
 
 // The AdaIN1d / AdaLayerNorm fc FcName ([2*Channels, style_dim] + bias) into
 // new volumes the caller owns.
@@ -52165,19 +51804,6 @@ begin
   Reader.LoadTensorFlat(FcName + '.bias', FcBias);
   Consumed.Add(FcName + '.weight');
   Consumed.Add(FcName + '.bias');
-end;
-
-// The norm1 and norm2 fc of AdainResBlk1d Prefix into FcWeights / FcBiases
-// at FirstPos and FirstPos + 1 (the StyleNorms order).
-procedure LoadKokoroAdainResBlockStyleFcs(Reader: TNNetSafeTensorsReader;
-  const Prefix: string; const Block: TKokoroAdainResBlockLayers;
-  StyleDim: integer; var FcWeights, FcBiases: array of TNNetVolume;
-  FirstPos: integer; Consumed: TStrings);
-begin
-  LoadKokoroStyleFc(Reader, Prefix + '.norm1.fc', Block.Norm1.Output.Depth,
-    StyleDim, FcWeights[FirstPos], FcBiases[FirstPos], Consumed);
-  LoadKokoroStyleFc(Reader, Prefix + '.norm2.fc', Block.Norm2.Output.Depth,
-    StyleDim, FcWeights[FirstPos + 1], FcBiases[FirstPos + 1], Consumed);
 end;
 
 // The torch conv Prefix (weight_norm folded, bias when present) into Weights:
@@ -52245,6 +51871,14 @@ begin
   else Result := 0;
 end;
 
+{ TKokoroPlainStage }
+
+procedure TKokoroPlainStage.Checkpoint(const CheckpointName: string;
+  Values: TNNetVolume);
+begin
+  if Assigned(FOnCheckpoint) then FOnCheckpoint(CheckpointName, Values);
+end;
+
 { TKokoroPlainWorkspace }
 
 constructor TKokoroPlainWorkspace.Create();
@@ -52293,22 +51927,16 @@ end;
 
 constructor TKokoroPlainAdainResBlock.Create(Reader: TNNetSafeTensorsReader;
   const Prefix: string; pDimIn, pDimOut: integer; pUpsample: boolean;
-  Norm1FcWeight, Norm1FcBias, Norm2FcWeight, Norm2FcBias: TNNetVolume;
-  Consumed: TStrings);
+  StyleDim: integer; Consumed: TStrings);
 begin
   inherited Create();
   FDimIn := pDimIn;
   FDimOut := pDimOut;
   FUpsample := pUpsample;
-  FNorm1FcWeight := Norm1FcWeight;
-  FNorm1FcBias := Norm1FcBias;
-  FNorm2FcWeight := Norm2FcWeight;
-  FNorm2FcBias := Norm2FcBias;
-  if (Norm1FcBias.Size <> 2 * pDimIn) or (Norm2FcBias.Size <> 2 * pDimOut) then
-    ImportError('Kokoro import: the norm fc of "' + Prefix + '" has ' +
-      IntToStr(Norm1FcBias.Size) + ' / ' + IntToStr(Norm2FcBias.Size) +
-      ' outputs, expected ' + IntToStr(2 * pDimIn) + ' / ' +
-      IntToStr(2 * pDimOut) + '.');
+  LoadKokoroStyleFc(Reader, Prefix + '.norm1.fc', pDimIn, StyleDim,
+    FNorm1FcWeight, FNorm1FcBias, Consumed);
+  LoadKokoroStyleFc(Reader, Prefix + '.norm2.fc', pDimOut, StyleDim,
+    FNorm2FcWeight, FNorm2FcBias, Consumed);
   FConv1 := TNNetPlainConvWeights.Create();
   LoadTorchPlainConv(Reader, Prefix + '.conv1', pclConv, FConv1, Consumed);
   CheckPlainConvShape(FConv1, Prefix + '.conv1', pDimOut, pDimIn, 3);
@@ -52337,6 +51965,10 @@ begin
   FConv2.Free;
   FPool.Free;
   FShortcut.Free;
+  FNorm1FcWeight.Free;
+  FNorm1FcBias.Free;
+  FNorm2FcWeight.Free;
+  FNorm2FcBias.Free;
   inherited Destroy();
 end;
 
@@ -52399,15 +52031,15 @@ end;
 function TKokoroPlainAdainResBlock.WeightBytes(): int64;
 begin
   Result := PlainConvWeightBytes(FConv1) + PlainConvWeightBytes(FConv2) +
-    PlainConvWeightBytes(FPool) + PlainConvWeightBytes(FShortcut);
+    PlainConvWeightBytes(FPool) + PlainConvWeightBytes(FShortcut) +
+    (int64(FNorm1FcWeight.Size) + FNorm1FcBias.Size + FNorm2FcWeight.Size +
+    FNorm2FcBias.Size) * csNeuralFloatSize;
 end;
 
 { TKokoroPlainDecoder }
 
 constructor TKokoroPlainDecoder.Create(Reader: TNNetSafeTensorsReader;
-  const Config: TKokoroConfig;
-  const NormFcWeights, NormFcBiases: array of TNNetVolume;
-  Consumed: TStrings);
+  const Config: TKokoroConfig; Consumed: TStrings);
 var
   BlockPos, MaxBlockPos, BlockInputWidth, BlockWidth: integer;
   IsLastBlock: boolean;
@@ -52416,10 +52048,6 @@ begin
   if Config.DecoderBlockCount < 1 then
     ImportError('Kokoro: no decoder widths in the config (call ' +
       'ReadKokoroWidthsFromWeights first).');
-  if Length(NormFcWeights) <> 2 * (Config.DecoderBlockCount + 1) then
-    ImportError('Kokoro: the plain decoder needs ' +
-      IntToStr(2 * (Config.DecoderBlockCount + 1)) + ' norm fcs, got ' +
-      IntToStr(Length(NormFcWeights)) + '.');
   FHiddenDim := Config.HiddenDim;
   FStyleDim := Config.StyleDim;
   FAsr := TNNetVolume.Create();
@@ -52442,12 +52070,12 @@ begin
   // encode reads [asr, F0, N]; every decode block [x, asr_res, F0, N].
   FEncode := TKokoroPlainAdainResBlock.Create(Reader, 'decoder.encode',
     Config.HiddenDim + 2, Config.DecoderWidth, {pUpsample=}false,
-    NormFcWeights[0], NormFcBiases[0], NormFcWeights[1], NormFcBiases[1],
-    Consumed);
+    Config.StyleDim, Consumed);
   MaxBlockPos := Config.DecoderBlockCount - 1;
   SetLength(FDecodeBlocks, Config.DecoderBlockCount);
   BlockInputWidth := Config.DecoderWidth + Config.AsrResWidth + 2;
-  // Only the last block upsamples (see BuildKokoroStageCDecoderNet).
+  // Only the last block upsamples, so every block reads [x, asr_res, F0, N]
+  // (the package stops the concat after the upsampling block).
   for BlockPos := 0 to MaxBlockPos do
   begin
     IsLastBlock := BlockPos = MaxBlockPos;
@@ -52455,9 +52083,7 @@ begin
     if IsLastBlock then BlockWidth := Config.DecoderOutputWidth;
     FDecodeBlocks[BlockPos] := TKokoroPlainAdainResBlock.Create(Reader,
       'decoder.decode.' + IntToStr(BlockPos), BlockInputWidth, BlockWidth,
-      {pUpsample=}IsLastBlock, NormFcWeights[2 * BlockPos + 2],
-      NormFcBiases[2 * BlockPos + 2], NormFcWeights[2 * BlockPos + 3],
-      NormFcBiases[2 * BlockPos + 3], Consumed);
+      {pUpsample=}IsLastBlock, Config.StyleDim, Consumed);
   end;
 end;
 
@@ -52514,16 +52140,23 @@ begin
   Ops.PointwiseConv(FAsr, FAsrResOutput, FAsrRes);
   Ops.ConcatChannels([FAsr, FF0, FN], FBlockInput);
   FEncode.Forward(Workspace, FBlockInput, FBlockOutput, DecoderStyle);
+  Checkpoint('dec_encode', FBlockOutput);
   MaxBlockPos := High(FDecodeBlocks);
   for BlockPos := 0 to MaxBlockPos do
   begin
     Ops.ConcatChannels([FBlockOutput, FAsrResOutput, FF0, FN], FBlockInput);
     if BlockPos = MaxBlockPos then
+    begin
       FDecodeBlocks[BlockPos].Forward(Workspace, FBlockInput, DecoderFeatures,
-        DecoderStyle)
+        DecoderStyle);
+      Checkpoint('dec_decode' + IntToStr(BlockPos), DecoderFeatures);
+    end
     else
+    begin
       FDecodeBlocks[BlockPos].Forward(Workspace, FBlockInput, FBlockOutput,
         DecoderStyle);
+      Checkpoint('dec_decode' + IntToStr(BlockPos), FBlockOutput);
+    end;
   end;
 end;
 
@@ -52555,44 +52188,6 @@ begin
   Result := Length(FDecodeBlocks);
 end;
 
-function AddKokoroAdaINResBlock1(NN: TNNet; InputLayer: TNNetLayer;
-  KernelSize: integer; const Dilations: array of integer):
-  TKokoroAdaINResBlock1Layers;
-var
-  Channels, PairCount, PairPos: integer;
-  Residual: TNNetLayer;
-begin
-  Result := Default(TKokoroAdaINResBlock1Layers);
-  if not Odd(KernelSize) then
-    ImportError('Kokoro: AdaINResBlock1 needs an odd kernel size, got ' +
-      IntToStr(KernelSize) + '.');
-  Channels := InputLayer.Output.Depth;
-  PairCount := Length(Dilations);
-  SetLength(Result.Norms1, PairCount);
-  SetLength(Result.Norms2, PairCount);
-  SetLength(Result.Snakes1, PairCount);
-  SetLength(Result.Snakes2, PairCount);
-  SetLength(Result.Convs1, PairCount);
-  SetLength(Result.Convs2, PairCount);
-  Residual := InputLayer;
-  for PairPos := 0 to PairCount - 1 do
-  begin
-    Result.Norms1[PairPos] := NN.AddLayerAfter(TNNetInstanceNorm.Create(),
-      Residual);
-    Result.Snakes1[PairPos] := NN.AddLayer(TNNetSnake.Create(1, true));
-    // get_padding(k, d) = d * (k - 1) / 2 keeps the length.
-    Result.Convs1[PairPos] := NN.AddLayer(TNNetConv1DLinear.Create(Channels,
-      KernelSize, Dilations[PairPos] * (KernelSize - 1) div 2, 1,
-      Dilations[PairPos]));
-    Result.Norms2[PairPos] := NN.AddLayer(TNNetInstanceNorm.Create());
-    Result.Snakes2[PairPos] := NN.AddLayer(TNNetSnake.Create(1, true));
-    Result.Convs2[PairPos] := NN.AddLayer(TNNetConv1DLinear.Create(Channels,
-      KernelSize, (KernelSize - 1) div 2, 1));
-    Residual := NN.AddLayer(TNNetSum.Create([Result.Convs2[PairPos], Residual]));
-  end;
-  Result.Output := Residual;
-end;
-
 // The torch Snake1D alpha Name ([1, Channels, 1]) into Alphas (Channels values).
 procedure LoadKokoroSnakeAlphaVolume(Reader: TNNetSafeTensorsReader;
   const Name: string; Channels: integer; Alphas: TNNetVolume;
@@ -52606,204 +52201,19 @@ begin
   Consumed.Add(Name);
 end;
 
-// The torch Snake1D alpha Name ([1, C, 1]) into the per-channel TNNetSnake.
-procedure LoadKokoroSnakeAlpha(Reader: TNNetSafeTensorsReader;
-  const Name: string; Snake: TNNetLayer; Consumed: TStrings);
-var
-  Alphas: TNNetVolume;
-begin
-  if not ((Snake is TNNetSnake) and TNNetSnake(Snake).PerChannelAlpha) then
-    ImportError('Kokoro import: ' + Name + ' needs a per-channel TNNetSnake, ' +
-      'got ' + Snake.ClassName + '.');
-  Alphas := TNNetVolume.Create();
-  try
-    LoadKokoroSnakeAlphaVolume(Reader, Name, Snake.Neurons[0].Weights.Size,
-      Alphas, Consumed);
-    Move(Alphas.FData[0], Snake.Neurons[0].Weights.FData[0],
-      Alphas.Size * csNeuralFloatSize);
-    Snake.FlushWeightCache();
-  finally
-    Alphas.Free;
-  end;
-end;
-
-// Loads the convs and Snake alphas of AdaINResBlock1 Prefix, and its AdaIN1d
-// fc into FcWeights / FcBiases from FirstPos (adain1[p], adain2[p] per p).
-procedure LoadKokoroAdaINResBlock1Weights(Reader: TNNetSafeTensorsReader;
-  const Prefix: string; const Block: TKokoroAdaINResBlock1Layers;
-  StyleDim: integer; var FcWeights, FcBiases: array of TNNetVolume;
-  FirstPos: integer; Consumed: TStrings);
-var
-  PairPos, MaxPairPos, FcPos: integer;
-  PairName: string;
-begin
-  MaxPairPos := Length(Block.Convs1) - 1;
-  FcPos := FirstPos;
-  for PairPos := 0 to MaxPairPos do
-  begin
-    PairName := '.' + IntToStr(PairPos);
-    LoadTorchConv1DLinear(Reader, Prefix + '.convs1' + PairName,
-      Block.Convs1[PairPos], Consumed);
-    LoadTorchConv1DLinear(Reader, Prefix + '.convs2' + PairName,
-      Block.Convs2[PairPos], Consumed);
-    LoadKokoroSnakeAlpha(Reader, Prefix + '.alpha1' + PairName,
-      Block.Snakes1[PairPos], Consumed);
-    LoadKokoroSnakeAlpha(Reader, Prefix + '.alpha2' + PairName,
-      Block.Snakes2[PairPos], Consumed);
-    LoadKokoroStyleFc(Reader, Prefix + '.adain1' + PairName + '.fc',
-      Block.Norms1[PairPos].Output.Depth, StyleDim, FcWeights[FcPos],
-      FcBiases[FcPos], Consumed);
-    LoadKokoroStyleFc(Reader, Prefix + '.adain2' + PairName + '.fc',
-      Block.Norms2[PairPos].Output.Depth, StyleDim, FcWeights[FcPos + 1],
-      FcBiases[FcPos + 1], Consumed);
-    Inc(FcPos, 2);
-  end;
-end;
-
 const
   // Generator.noise_res: k7 on every stage but the last (k11), dilations 1, 3, 5.
   KokoroNoiseResDilations: array[0..2] of integer = (1, 3, 5);
   KokoroNoiseResKernelSize = 7;
   KokoroLastNoiseResKernelSize = 11;
 
-function BuildKokoroStageCGeneratorNet(NN: TNNet; const Config: TKokoroConfig;
-  FrameCount: integer): TKokoroStageCGeneratorLayers;
-var
-  XLayer, HarmonicInput, MrfInput: TNNetLayer;
-  StageCount, StagePos, ResBlockCount, ResBlockPos, Channels: integer;
-  Rate, KernelSize, NoiseStride, RatePos, StyleNormCount: integer;
-  IsLastStage: boolean;
-  ResBlockOutputs: array of TNNetLayer;
-
-  procedure AddStyleNorms(const Block: TKokoroAdaINResBlock1Layers);
-  var
-    PairPos: integer;
-  begin
-    for PairPos := 0 to High(Block.Norms1) do
-    begin
-      Result.StyleNorms[StyleNormCount] := Block.Norms1[PairPos];
-      Result.StyleNorms[StyleNormCount + 1] := Block.Norms2[PairPos];
-      Inc(StyleNormCount, 2);
-    end;
-  end;
-
-begin
-  Result := Default(TKokoroStageCGeneratorLayers);
-  if FrameCount < 1 then
-    ImportError('Kokoro: the stage-C generator needs at least one frame, got ' +
-      IntToStr(FrameCount) + '.');
-  StageCount := Length(Config.Generator.UpsampleRates);
-  ResBlockCount := Length(Config.Generator.ResblockKernelSizes);
-  if (StageCount < 1) or
-     (Length(Config.Generator.UpsampleKernelSizes) <> StageCount) or
-     (ResBlockCount < 1) or
-     (Length(Config.Generator.ResblockDilationSizes) <> ResBlockCount) or
-     (Config.DecoderOutputWidth <> Config.Generator.UpsampleInitialChannel) then
-    ImportError('Kokoro: istftnet upsample / resblock fields do not fit a ' +
-      'generator on ' + IntToStr(Config.DecoderOutputWidth) +
-      ' decoder channels.');
-  XLayer := NN.AddLayer(TNNetInput.Create(2 * FrameCount, 1,
-    Config.DecoderOutputWidth));
-  // torch.stft(center=True) of 2F * prod(rates) * hop samples has
-  // 2F * prod(rates) + 1 frames.
-  NoiseStride := 1;
-  for RatePos := 0 to StageCount - 1 do
-    NoiseStride := NoiseStride * Config.Generator.UpsampleRates[RatePos];
-  HarmonicInput := NN.AddLayer(TNNetInput.Create(2 * FrameCount * NoiseStride
-    + 1, 1, Config.ISTFTNFFT + 2));
-  SetLength(Result.Stages, StageCount);
-  StyleNormCount := Length(KokoroNoiseResDilations);
-  for ResBlockPos := 0 to ResBlockCount - 1 do
-    Inc(StyleNormCount,
-      Length(Config.Generator.ResblockDilationSizes[ResBlockPos]));
-  SetLength(Result.StyleNorms, 2 * StageCount * StyleNormCount);
-  StyleNormCount := 0;
-  SetLength(ResBlockOutputs, ResBlockCount);
-  Channels := Config.Generator.UpsampleInitialChannel;
-  for StagePos := 0 to StageCount - 1 do
-  begin
-    IsLastStage := StagePos = StageCount - 1;
-    Rate := Config.Generator.UpsampleRates[StagePos];
-    KernelSize := Config.Generator.UpsampleKernelSizes[StagePos];
-    Channels := Channels div 2;
-    Result.Stages[StagePos].Leaky := NN.AddLayerAfter(
-      TNNetLeakyReLU.Create(0.1), XLayer);
-    // noise_convs[i]: stride prod(rates[i+1:]) maps the STFT frames to this
-    // stage's length; the last stage is a 1x1 conv.
-    if IsLastStage then
-      Result.Stages[StagePos].NoiseConv := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Channels), HarmonicInput)
-    else
-    begin
-      NoiseStride := 1;
-      for RatePos := StagePos + 1 to StageCount - 1 do
-        NoiseStride := NoiseStride * Config.Generator.UpsampleRates[RatePos];
-      Result.Stages[StagePos].NoiseConv := NN.AddLayerAfter(
-        TNNetConv1DLinear.Create(Channels, 2 * NoiseStride,
-          (NoiseStride + 1) div 2, NoiseStride), HarmonicInput);
-    end;
-    if IsLastStage
-      then Result.Stages[StagePos].NoiseRes := AddKokoroAdaINResBlock1(NN,
-        Result.Stages[StagePos].NoiseConv, KokoroLastNoiseResKernelSize,
-        KokoroNoiseResDilations)
-      else Result.Stages[StagePos].NoiseRes := AddKokoroAdaINResBlock1(NN,
-        Result.Stages[StagePos].NoiseConv, KokoroNoiseResKernelSize,
-        KokoroNoiseResDilations);
-    AddStyleNorms(Result.Stages[StagePos].NoiseRes);
-    Result.Stages[StagePos].Ups := NN.AddLayerAfter(TNNetDeconv1DLinear.Create(
-      Channels, KernelSize, Rate, (KernelSize - Rate) div 2),
-      Result.Stages[StagePos].Leaky);
-    MrfInput := Result.Stages[StagePos].Ups;
-    if IsLastStage then
-    begin
-      Result.Stages[StagePos].Pad := NN.AddLayer(TNNetPadXY.Create(1, 0,
-        pmReflect, {TrailingPaddingX=}0));
-      MrfInput := Result.Stages[StagePos].Pad;
-    end;
-    if MrfInput.Output.SizeX <>
-      Result.Stages[StagePos].NoiseRes.Output.Output.SizeX then
-      ImportError('Kokoro: generator stage ' + IntToStr(StagePos) +
-        ' upsamples x to ' + IntToStr(MrfInput.Output.SizeX) +
-        ' positions but the noise branch has ' +
-        IntToStr(Result.Stages[StagePos].NoiseRes.Output.Output.SizeX) + '.');
-    MrfInput := NN.AddLayer(TNNetSum.Create([MrfInput,
-      Result.Stages[StagePos].NoiseRes.Output]));
-    Result.Stages[StagePos].Sum := MrfInput;
-    SetLength(Result.Stages[StagePos].ResBlocks, ResBlockCount);
-    for ResBlockPos := 0 to ResBlockCount - 1 do
-    begin
-      Result.Stages[StagePos].ResBlocks[ResBlockPos] := AddKokoroAdaINResBlock1(
-        NN, MrfInput, Config.Generator.ResblockKernelSizes[ResBlockPos],
-        Config.Generator.ResblockDilationSizes[ResBlockPos]);
-      AddStyleNorms(Result.Stages[StagePos].ResBlocks[ResBlockPos]);
-      ResBlockOutputs[ResBlockPos] :=
-        Result.Stages[StagePos].ResBlocks[ResBlockPos].Output;
-    end;
-    NN.AddLayer(TNNetSum.Create(ResBlockOutputs));
-    Result.Stages[StagePos].Mrf := NN.AddLayer(
-      TNNetMulByConstant.Create(1 / ResBlockCount));
-    XLayer := Result.Stages[StagePos].Mrf;
-  end;
-  // F.leaky_relu default slope.
-  Result.PostLeaky := NN.AddLayer(TNNetLeakyReLU.Create(0.01));
-  Result.ConvPost := NN.AddLayer(TNNetConv1DLinear.Create(Config.ISTFTNFFT + 2,
-    7, 3, 1));
-  NN.SetTrainable(false);
-  // Fast memory lets the dense ups run the CPU GEMM instead of the scatter:
-  // 1.3x at the real ups0/ups1 shapes for a 12 MB weight cache.
-  for StagePos := 0 to StageCount - 1 do
-    Result.Stages[StagePos].Ups.SetTrainable(false, {pLowMemory=}false);
-end;
-
 { TKokoroPlainAdaINResBlock1 }
 
 constructor TKokoroPlainAdaINResBlock1.Create(Reader: TNNetSafeTensorsReader;
   const Prefix: string; pChannels, KernelSize: integer;
-  const Dilations: array of integer;
-  const NormFcWeights, NormFcBiases: array of TNNetVolume;
-  FirstNormPos: integer; Consumed: TStrings);
+  const Dilations: array of integer; StyleDim: integer; Consumed: TStrings);
 var
-  PairCount, PairPos, MaxPairPos, NormPos: integer;
+  PairCount, PairPos, MaxPairPos: integer;
   PairName: string;
 begin
   inherited Create();
@@ -52813,10 +52223,6 @@ begin
     ImportError('Kokoro: AdaINResBlock1 "' + Prefix + '" needs an odd ' +
       'kernel size and a dilation, got kernel ' + IntToStr(KernelSize) +
       ' and ' + IntToStr(PairCount) + ' dilations.');
-  if FirstNormPos + 2 * PairCount > Length(NormFcWeights) then
-    ImportError('Kokoro: AdaINResBlock1 "' + Prefix + '" needs ' +
-      IntToStr(2 * PairCount) + ' norm fcs from ' + IntToStr(FirstNormPos) +
-      ', got ' + IntToStr(Length(NormFcWeights)) + ' in all.');
   SetLength(FDilations, PairCount);
   SetLength(FConvs1, PairCount);
   SetLength(FConvs2, PairCount);
@@ -52827,7 +52233,6 @@ begin
   SetLength(FNorm2FcWeights, PairCount);
   SetLength(FNorm2FcBiases, PairCount);
   MaxPairPos := PairCount - 1;
-  NormPos := FirstNormPos;
   for PairPos := 0 to MaxPairPos do
   begin
     PairName := '.' + IntToStr(PairPos);
@@ -52848,17 +52253,12 @@ begin
     FAlphas2[PairPos] := TNNetVolume.Create();
     LoadKokoroSnakeAlphaVolume(Reader, Prefix + '.alpha2' + PairName,
       pChannels, FAlphas2[PairPos], Consumed);
-    FNorm1FcWeights[PairPos] := NormFcWeights[NormPos];
-    FNorm1FcBiases[PairPos] := NormFcBiases[NormPos];
-    FNorm2FcWeights[PairPos] := NormFcWeights[NormPos + 1];
-    FNorm2FcBiases[PairPos] := NormFcBiases[NormPos + 1];
-    if (FNorm1FcBiases[PairPos].Size <> 2 * pChannels) or
-       (FNorm2FcBiases[PairPos].Size <> 2 * pChannels) then
-      ImportError('Kokoro import: the adain fcs of "' + Prefix + PairName +
-        '" have ' + IntToStr(FNorm1FcBiases[PairPos].Size) + ' / ' +
-        IntToStr(FNorm2FcBiases[PairPos].Size) + ' outputs, expected ' +
-        IntToStr(2 * pChannels) + '.');
-    Inc(NormPos, 2);
+    LoadKokoroStyleFc(Reader, Prefix + '.adain1' + PairName + '.fc',
+      pChannels, StyleDim, FNorm1FcWeights[PairPos], FNorm1FcBiases[PairPos],
+      Consumed);
+    LoadKokoroStyleFc(Reader, Prefix + '.adain2' + PairName + '.fc',
+      pChannels, StyleDim, FNorm2FcWeights[PairPos], FNorm2FcBiases[PairPos],
+      Consumed);
   end;
 end;
 
@@ -52872,6 +52272,10 @@ begin
     FConvs2[PairPos].Free;
     FAlphas1[PairPos].Free;
     FAlphas2[PairPos].Free;
+    FNorm1FcWeights[PairPos].Free;
+    FNorm1FcBiases[PairPos].Free;
+    FNorm2FcWeights[PairPos].Free;
+    FNorm2FcBiases[PairPos].Free;
   end;
   inherited Destroy();
 end;
@@ -52915,19 +52319,19 @@ begin
   for PairPos := 0 to High(FConvs1) do
     Result := Result + PlainConvWeightBytes(FConvs1[PairPos]) +
       PlainConvWeightBytes(FConvs2[PairPos]) +
-      (int64(FAlphas1[PairPos].Size) + FAlphas2[PairPos].Size) *
+      (int64(FAlphas1[PairPos].Size) + FAlphas2[PairPos].Size +
+      FNorm1FcWeights[PairPos].Size + FNorm1FcBiases[PairPos].Size +
+      FNorm2FcWeights[PairPos].Size + FNorm2FcBiases[PairPos].Size) *
       csNeuralFloatSize;
 end;
 
 { TKokoroPlainGenerator }
 
 constructor TKokoroPlainGenerator.Create(Reader: TNNetSafeTensorsReader;
-  const Config: TKokoroConfig;
-  const NormFcWeights, NormFcBiases: array of TNNetVolume;
-  Consumed: TStrings);
+  const Config: TKokoroConfig; Consumed: TStrings);
 var
   UpsampleCount, StagePos, MaxStagePos, ResBlockPos, MaxResBlockPos: integer;
-  RatePos, Channels, NoiseKernelSize, NormPos, BlockPos, BufferPos: integer;
+  RatePos, Channels, NoiseKernelSize, BlockPos, BufferPos: integer;
   StageName, Prefix: string;
 begin
   inherited Create();
@@ -52959,7 +52363,6 @@ begin
   Channels := Config.Generator.UpsampleInitialChannel;
   MaxStagePos := UpsampleCount - 1;
   MaxResBlockPos := FResBlockCount - 1;
-  NormPos := 0;
   for StagePos := 0 to MaxStagePos do
   begin
     StageName := IntToStr(StagePos);
@@ -52984,8 +52387,7 @@ begin
       else NoiseKernelSize := KokoroNoiseResKernelSize;
     FNoiseRes[StagePos] := TKokoroPlainAdaINResBlock1.Create(Reader,
       'decoder.generator.noise_res.' + StageName, Channels, NoiseKernelSize,
-      KokoroNoiseResDilations, NormFcWeights, NormFcBiases, NormPos, Consumed);
-    Inc(NormPos, 2 * Length(KokoroNoiseResDilations));
+      KokoroNoiseResDilations, Config.StyleDim, Consumed);
     Prefix := 'decoder.generator.ups.' + StageName;
     FUps[StagePos] := TNNetPlainConvWeights.Create();
     LoadTorchPlainConv(Reader, Prefix, pclTransposed, FUps[StagePos], Consumed);
@@ -52997,14 +52399,10 @@ begin
       FResBlocks[BlockPos] := TKokoroPlainAdaINResBlock1.Create(Reader,
         'decoder.generator.resblocks.' + IntToStr(BlockPos), Channels,
         Config.Generator.ResblockKernelSizes[ResBlockPos],
-        Config.Generator.ResblockDilationSizes[ResBlockPos], NormFcWeights,
-        NormFcBiases, NormPos, Consumed);
-      Inc(NormPos, 2 * Length(Config.Generator.ResblockDilationSizes[ResBlockPos]));
+        Config.Generator.ResblockDilationSizes[ResBlockPos], Config.StyleDim,
+        Consumed);
     end;
   end;
-  if NormPos <> Length(NormFcWeights) then
-    ImportError('Kokoro: the plain generator reads ' + IntToStr(NormPos) +
-      ' adain fcs, got ' + IntToStr(Length(NormFcWeights)) + '.');
   FConvPost := TNNetPlainConvWeights.Create();
   LoadTorchPlainConv(Reader, 'decoder.generator.conv_post', pclConv, FConvPost,
     Consumed);
@@ -53037,12 +52435,6 @@ var
 begin
   Bytes := BufferBytes() + Workspace.BufferBytes();
   if Bytes > FPeakBufferBytes then FPeakBufferBytes := Bytes;
-end;
-
-procedure TKokoroPlainGenerator.Checkpoint(const CheckpointName: string;
-  Values: TNNetVolume);
-begin
-  if Assigned(FOnCheckpoint) then FOnCheckpoint(CheckpointName, Values);
 end;
 
 procedure TKokoroPlainGenerator.Run(Workspace: TKokoroPlainWorkspace;
@@ -53210,14 +52602,11 @@ end;
 { TKokoroPlainF0NPredictor }
 
 constructor TKokoroPlainF0NPredictor.Create(Reader: TNNetSafeTensorsReader;
-  const Config: TKokoroConfig;
-  const NormFcWeights, NormFcBiases: array of TNNetVolume;
-  Consumed: TStrings);
+  const Config: TKokoroConfig; Consumed: TStrings);
 const
   SharedPrefix = 'predictor.shared';
 var
-  BufferPos, BranchPos, BlockPos, BlockWidth, BlockInputWidth,
-    StyleNormPos: integer;
+  BufferPos, BranchPos, BlockPos, BlockWidth, BlockInputWidth: integer;
   Blocks: array of TKokoroPlainAdainResBlock;
   BranchName: string;
   Projection: TNNetPlainConvWeights;
@@ -53258,11 +52647,6 @@ begin
   inherited Create();
   if Odd(Config.HiddenDim) then
     ImportError('Kokoro: hidden_dim must be even.');
-  if (Length(NormFcWeights) <> 4 * KokoroF0NBlockCount) or
-     (Length(NormFcBiases) <> 4 * KokoroF0NBlockCount) then
-    ImportError('Kokoro: the plain stage B needs ' +
-      IntToStr(4 * KokoroF0NBlockCount) + ' norm fcs, got ' +
-      IntToStr(Length(NormFcWeights)) + '.');
   FHiddenDim := Config.HiddenDim;
   FStyleDim := Config.StyleDim;
   FFrameFeatures := TNNetVolume.Create();
@@ -53273,8 +52657,7 @@ begin
   FSharedBackward := TNNetPlainLSTMWeights.Create();
   LoadSharedDirection('', FSharedForward);
   LoadSharedDirection('_reverse', FSharedBackward);
-  StyleNormPos := 0;
-  // Branch 0 = F0, branch 1 = N (the StyleNorms order).
+  // Branch 0 = F0, branch 1 = N.
   for BranchPos := 0 to 1 do
   begin
     if BranchPos = 0 then BranchName := 'F0' else BranchName := 'N';
@@ -53288,10 +52671,7 @@ begin
       Blocks[BlockPos] := TKokoroPlainAdainResBlock.Create(Reader,
         'predictor.' + BranchName + '.' + IntToStr(BlockPos), BlockInputWidth,
         BlockWidth, {pUpsample=}KokoroF0NBlockHalvesWidth[BlockPos],
-        NormFcWeights[StyleNormPos], NormFcBiases[StyleNormPos],
-        NormFcWeights[StyleNormPos + 1], NormFcBiases[StyleNormPos + 1],
-        Consumed);
-      Inc(StyleNormPos, 2);
+        Config.StyleDim, Consumed);
       BlockInputWidth := BlockWidth;
     end;
     Projection := TNNetPlainConvWeights.Create();
@@ -53327,12 +52707,6 @@ begin
   FShared.Free;
   for BufferPos := 0 to High(FBlockOutputs) do FBlockOutputs[BufferPos].Free;
   inherited Destroy();
-end;
-
-procedure TKokoroPlainF0NPredictor.Checkpoint(const CheckpointName: string;
-  Values: TNNetVolume);
-begin
-  if Assigned(FOnCheckpoint) then FOnCheckpoint(CheckpointName, Values);
 end;
 
 procedure TKokoroPlainF0NPredictor.RunBranch(Workspace: TKokoroPlainWorkspace;
@@ -53509,12 +52883,6 @@ end;
 
 const
   KokoroStageAOwnerTokenCount = 8;
-  // Long enough that no stage-B conv kernel is clamped.
-  KokoroStageBOwnerFrameCount = 8;
-  KokoroStageCDecoderOwnerFrameCount = 8;
-  // No generator kernel is clamped at any length; 2 frames keeps the owner's
-  // activations small (241 positions at the last stage).
-  KokoroStageCGeneratorOwnerFrameCount = 2;
 
 constructor TNNetKokoro.Create(Reader: TNNetSafeTensorsReader;
   const Config: TKokoroConfig);
@@ -53534,8 +52902,6 @@ begin
     GetEnvironmentVariable('NEURAL_OPENCL_SHARE_OUTPUTS') <> '0';
   {$ENDIF}
   FStageAInput := TNNetVolume.Create();
-  FStageBInput := TNNetVolume.Create();
-  FStageCDecoderAsr := TNNetVolume.Create();
   FPlainWorkspace := TKokoroPlainWorkspace.Create();
   FHarmonicWave := TNNetVolume.Create();
   FGeneratorMagnitude := TNNetVolume.Create();
@@ -53547,16 +52913,10 @@ begin
   Consumed.Duplicates := dupIgnore;
   try
     LoadStageA(Reader, Consumed);
-    LoadStageB(Reader, Consumed);
-    FStageBPlain := TKokoroPlainF0NPredictor.Create(Reader, FConfig,
-      FStageBNormFcWeights, FStageBNormFcBiases, Consumed);
-    LoadStageCDecoder(Reader, Consumed);
-    FStageCDecoderPlain := TKokoroPlainDecoder.Create(Reader, FConfig,
-      FStageCDecoderNormFcWeights, FStageCDecoderNormFcBiases, Consumed);
+    FStageB := TKokoroPlainF0NPredictor.Create(Reader, FConfig, Consumed);
+    FStageCDecoder := TKokoroPlainDecoder.Create(Reader, FConfig, Consumed);
     LoadHarmonicSource(Reader, Consumed);
-    LoadStageCGenerator(Reader, Consumed);
-    FStageCGeneratorPlain := TKokoroPlainGenerator.Create(Reader, FConfig,
-      FStageCGeneratorNormFcWeights, FStageCGeneratorNormFcBiases, Consumed);
+    FStageCGenerator := TKokoroPlainGenerator.Create(Reader, FConfig, Consumed);
     // Every tensor of the checkpoint (bert.pooler and position_ids excepted).
     RaiseOnUnreadKokoroTensors(Reader, Consumed, CheckpointPrefixes,
       'checkpoint');
@@ -53577,33 +52937,19 @@ destructor TNNetKokoro.Destroy();
 
 begin
   ReleaseStageA();
-  ReleaseStageB();
-  ReleaseStageCDecoder();
-  ReleaseStageCGenerator();
   {$IFDEF OpenCL}
   FOpenCLContextNet.Free;
   {$ENDIF}
   FStageAOwner.Free;
-  FStageBOwner.Free;
-  FStageCDecoderOwner.Free;
-  FStageCGeneratorOwner.Free;
-  FStageBPlain.Free;
-  FStageCDecoderPlain.Free;
-  FStageCGeneratorPlain.Free;
+  FStageB.Free;
+  FStageCDecoder.Free;
+  FStageCGenerator.Free;
   FPlainWorkspace.Free;
   FreeVolumes(FDurationNormFcWeights);
   FreeVolumes(FDurationNormFcBiases);
-  FreeVolumes(FStageBNormFcWeights);
-  FreeVolumes(FStageBNormFcBiases);
-  FreeVolumes(FStageCDecoderNormFcWeights);
-  FreeVolumes(FStageCDecoderNormFcBiases);
-  FreeVolumes(FStageCGeneratorNormFcWeights);
-  FreeVolumes(FStageCGeneratorNormFcBiases);
   FGeneratorMagnitude.Free;
   FGeneratorPhase.Free;
   FStageAInput.Free;
-  FStageBInput.Free;
-  FStageCDecoderAsr.Free;
   FHarmonicSource.Free;
   FHarmonicSTFT.Free;
   FHarmonicWave.Free;
@@ -53639,97 +52985,6 @@ begin
       FConfig.StyleDim, FDurationNormFcWeights[LayerPos],
       FDurationNormFcBiases[LayerPos], Consumed);
   RaiseOnUnreadKokoroTensors(Reader, Consumed, StageAPrefixes, 'stage-A');
-end;
-
-procedure TNNetKokoro.LoadStageB(Reader: TNNetSafeTensorsReader;
-  Consumed: TStrings);
-const
-  StageBPrefixes: array[0..4] of string = ('predictor.shared.',
-    'predictor.F0.', 'predictor.N.', 'predictor.F0_proj.',
-    'predictor.N_proj.');
-  BranchNames: array[0..1] of string = ('F0', 'N');
-var
-  OwnerLayers: TKokoroStageBLayers;
-  BranchPos, BlockPos, MaxBlockPos, StyleNormPos: integer;
-  Blocks: array of TKokoroAdainResBlockLayers;
-  BlockPrefix: string;
-begin
-  FStageBOwner := TNNet.Create();
-  OwnerLayers := BuildKokoroStageBNet(FStageBOwner, FConfig,
-    KokoroStageBOwnerFrameCount);
-  LoadTorchLSTMInto(Reader, 'predictor.shared', FStageBOwner,
-    OwnerLayers.SharedLSTM, FConfig.HiddenDim div 2, 1, true,
-    FStageBOwner.Layers[0]);
-  Consumed.Add('predictor.shared.');
-  SetLength(FStageBNormFcWeights, Length(OwnerLayers.StyleNorms));
-  SetLength(FStageBNormFcBiases, Length(OwnerLayers.StyleNorms));
-  StyleNormPos := 0;
-  for BranchPos := 0 to 1 do
-  begin
-    if BranchPos = 0 then Blocks := OwnerLayers.F0Blocks
-    else Blocks := OwnerLayers.NBlocks;
-    MaxBlockPos := Length(Blocks) - 1;
-    for BlockPos := 0 to MaxBlockPos do
-    begin
-      BlockPrefix := 'predictor.' + BranchNames[BranchPos] + '.' +
-        IntToStr(BlockPos);
-      LoadKokoroAdainResBlockWeights(Reader, BlockPrefix, Blocks[BlockPos],
-        Consumed);
-      LoadKokoroAdainResBlockStyleFcs(Reader, BlockPrefix, Blocks[BlockPos],
-        FConfig.StyleDim, FStageBNormFcWeights, FStageBNormFcBiases,
-        StyleNormPos, Consumed);
-      Inc(StyleNormPos, 2);
-    end;
-  end;
-  LoadTorchConv1DLinear(Reader, 'predictor.F0_proj', OwnerLayers.F0Proj,
-    Consumed);
-  LoadTorchConv1DLinear(Reader, 'predictor.N_proj', OwnerLayers.NProj,
-    Consumed);
-  RaiseOnUnreadKokoroTensors(Reader, Consumed, StageBPrefixes, 'stage-B');
-end;
-
-// Every decoder tensor except decoder.generator.*; one left unread raises.
-procedure TNNetKokoro.LoadStageCDecoder(Reader: TNNetSafeTensorsReader;
-  Consumed: TStrings);
-const
-  StageCDecoderPrefixes: array[0..4] of string = ('decoder.encode.',
-    'decoder.decode.', 'decoder.F0_conv.', 'decoder.N_conv.',
-    'decoder.asr_res.');
-var
-  OwnerLayers: TKokoroStageCDecoderLayers;
-  BlockPos, MaxBlockPos, StyleNormCount: integer;
-  BlockPrefix: string;
-begin
-  FStageCDecoderOwner := TNNet.Create();
-  OwnerLayers := BuildKokoroStageCDecoderNet(FStageCDecoderOwner, FConfig,
-    KokoroStageCDecoderOwnerFrameCount);
-  LoadTorchConv1DLinear(Reader, 'decoder.F0_conv', OwnerLayers.F0Conv,
-    Consumed);
-  LoadTorchConv1DLinear(Reader, 'decoder.N_conv', OwnerLayers.NConv,
-    Consumed);
-  LoadTorchConv1DLinear(Reader, 'decoder.asr_res.0', OwnerLayers.AsrRes,
-    Consumed);
-  StyleNormCount := Length(OwnerLayers.StyleNorms);
-  SetLength(FStageCDecoderNormFcWeights, StyleNormCount);
-  SetLength(FStageCDecoderNormFcBiases, StyleNormCount);
-  LoadKokoroAdainResBlockWeights(Reader, 'decoder.encode',
-    OwnerLayers.Encode, Consumed);
-  LoadKokoroAdainResBlockStyleFcs(Reader, 'decoder.encode',
-    OwnerLayers.Encode, FConfig.StyleDim, FStageCDecoderNormFcWeights,
-    FStageCDecoderNormFcBiases, 0, Consumed);
-  MaxBlockPos := Length(OwnerLayers.DecodeBlocks) - 1;
-  for BlockPos := 0 to MaxBlockPos do
-  begin
-    BlockPrefix := 'decoder.decode.' + IntToStr(BlockPos);
-    LoadKokoroAdainResBlockWeights(Reader, BlockPrefix,
-      OwnerLayers.DecodeBlocks[BlockPos], Consumed);
-    LoadKokoroAdainResBlockStyleFcs(Reader, BlockPrefix,
-      OwnerLayers.DecodeBlocks[BlockPos], FConfig.StyleDim,
-      FStageCDecoderNormFcWeights, FStageCDecoderNormFcBiases,
-      2 * BlockPos + 2, Consumed);
-  end;
-  RaiseOnUnreadKokoroTensors(Reader, Consumed, StageCDecoderPrefixes,
-    'stage-C decoder');
 end;
 
 procedure TNNetKokoro.LoadHarmonicSource(Reader: TNNetSafeTensorsReader;
@@ -53776,26 +53031,6 @@ begin
   FHarmonicSTFT.TransformToMagnitudePhase(FHarmonicWave, HarmonicSpectrum);
 end;
 
-procedure TNNetKokoro.ArmStageNet(Net, Owner: TNNet;
-  var OwnerOnOpenCL: boolean);
-begin
-  PrepareInferenceThreads(Net, FParallel, FMaxThreads);
-  Net.ShareHostOutputsByLiveness := FShareHostOutputs;
-  {$IFDEF OpenCL}
-  if Assigned(FOpenCLContextNet) then
-  begin
-    if not OwnerOnOpenCL then
-    begin
-      ArmWeightOwnerInOpenCLContext(Owner, FOpenCLContextNet,
-        FOpenCLHasSharedKernel);
-      OwnerOnOpenCL := true;
-    end;
-    Net.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
-    Net.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
-  end;
-  {$ENDIF}
-end;
-
 procedure TNNetKokoro.PrepareStageA(TokenCount: integer);
 begin
   if Assigned(FStageANet) and (TokenCount = FStageATokenCount) then exit;
@@ -53804,7 +53039,22 @@ begin
   FStageANet.BuildWeightOwner := FStageAOwner;
   FStageALayers := BuildKokoroStageANet(FStageANet, FConfig, TokenCount);
   FStageANet.BuildWeightOwner := nil;
-  ArmStageNet(FStageANet, FStageAOwner, FStageAOwnerOnOpenCL);
+  PrepareInferenceThreads(FStageANet, FParallel, FMaxThreads);
+  FStageANet.ShareHostOutputsByLiveness := FShareHostOutputs;
+  {$IFDEF OpenCL}
+  if Assigned(FOpenCLContextNet) then
+  begin
+    if not FStageAOwnerOnOpenCL then
+    begin
+      ArmWeightOwnerInOpenCLContext(FStageAOwner, FOpenCLContextNet,
+        FOpenCLHasSharedKernel);
+      FStageAOwnerOnOpenCL := true;
+    end;
+    FStageANet.ShareOpenCLOutputsByLiveness := FShareOpenCLOutputs;
+    FStageANet.EnableOpenCLInContextOf(FOpenCLContextNet,
+      FOpenCLHasSharedKernel);
+  end;
+  {$ENDIF}
   FStageATokenCount := TokenCount;
 end;
 
@@ -53815,146 +53065,36 @@ begin
   FStageATokenCount := 0;
 end;
 
-procedure TNNetKokoro.PrepareStageB(FrameCount: integer);
-begin
-  if Assigned(FStageBNet) and (FrameCount = FStageBFrameCount) then exit;
-  ReleaseStageB();
-  FStageBNet := TNNet.Create();
-  FStageBNet.BuildWeightOwner := FStageBOwner;
-  FStageBLayers := BuildKokoroStageBNet(FStageBNet, FConfig, FrameCount);
-  FStageBNet.BuildWeightOwner := nil;
-  ArmStageNet(FStageBNet, FStageBOwner, FStageBOwnerOnOpenCL);
-  FStageBFrameCount := FrameCount;
-end;
-
-procedure TNNetKokoro.ReleaseStageB();
-begin
-  FreeAndNil(FStageBNet);
-  FStageBLayers := Default(TKokoroStageBLayers);
-  FStageBFrameCount := 0;
-end;
-
-procedure TNNetKokoro.PrepareStageCDecoder(FrameCount: integer);
-begin
-  if Assigned(FStageCDecoderNet) and (FrameCount = FStageCDecoderFrameCount)
-    then exit;
-  ReleaseStageCDecoder();
-  FStageCDecoderNet := TNNet.Create();
-  FStageCDecoderNet.BuildWeightOwner := FStageCDecoderOwner;
-  FStageCDecoderLayers := BuildKokoroStageCDecoderNet(FStageCDecoderNet,
-    FConfig, FrameCount);
-  FStageCDecoderNet.BuildWeightOwner := nil;
-  ArmStageNet(FStageCDecoderNet, FStageCDecoderOwner,
-    FStageCDecoderOwnerOnOpenCL);
-  FStageCDecoderFrameCount := FrameCount;
-end;
-
-procedure TNNetKokoro.ReleaseStageCDecoder();
-begin
-  FreeAndNil(FStageCDecoderNet);
-  FStageCDecoderLayers := Default(TKokoroStageCDecoderLayers);
-  FStageCDecoderFrameCount := 0;
-end;
-
-procedure TNNetKokoro.RunStageCDecoder(TextFeatures: TNNetVolume;
-  const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
-  const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
-var
-  StyleNormPos, MaxStyleNormPos, FrameCount: integer;
-  Output: TNNetVolume;
-begin
-  if Length(DecoderStyle) <> FConfig.StyleDim then
-    ImportError('Kokoro: the decoder style has ' +
-      IntToStr(Length(DecoderStyle)) + ' values, expected style_dim = ' +
-      IntToStr(FConfig.StyleDim) + '.');
-  if TextFeatures.Depth <> FConfig.HiddenDim then
-    ImportError('Kokoro: the stage-C decoder reads t_en with ' +
-      IntToStr(FConfig.HiddenDim) + ' channels, got ' +
-      IntToStr(TextFeatures.Depth) + '.');
-  RepeatTokenRows(TextFeatures, PredictedDurations, FStageCDecoderAsr);
-  FrameCount := FStageCDecoderAsr.SizeX;
-  if (F0Curve.Size <> 2 * FrameCount) or (NCurve.Size <> 2 * FrameCount) then
-    ImportError('Kokoro: the stage-C decoder takes F0 and N curves of 2 * ' +
-      IntToStr(FrameCount) + ' frames, got ' + IntToStr(F0Curve.Size) +
-      ' and ' + IntToStr(NCurve.Size) + '.');
-  PrepareStageCDecoder(FrameCount);
-  MaxStyleNormPos := Length(FStageCDecoderLayers.StyleNorms) - 1;
-  for StyleNormPos := 0 to MaxStyleNormPos do
-    WriteStyleIntoChannelAffine(FStageCDecoderLayers.StyleNorms[StyleNormPos],
-      FStageCDecoderNormFcWeights[StyleNormPos],
-      FStageCDecoderNormFcBiases[StyleNormPos], DecoderStyle);
-  FStageCDecoderNet.Compute([FStageCDecoderAsr, F0Curve, NCurve], FParallel);
-  FStageCDecoderNet.GetLastLayer().ForceOutputOnRAM();
-  Output := FStageCDecoderNet.GetLastLayer().Output;
-  DecoderFeatures.ReSize(Output);
-  DecoderFeatures.CopyNoChecks(Output);
-end;
-
 procedure TNNetKokoro.PreparePlainOps();
 begin
   FPlainWorkspace.EnsureOps(FParallel);
   FPlainWorkspace.Ops.MaxThreads := FMaxThreads;
 end;
 
-procedure TNNetKokoro.RunStageCDecoderPlain(TextFeatures: TNNetVolume;
+procedure TNNetKokoro.RunStageCDecoder(TextFeatures: TNNetVolume;
   const PredictedDurations: array of integer; F0Curve, NCurve: TNNetVolume;
   const DecoderStyle: array of TNeuralFloat; DecoderFeatures: TNNetVolume);
 begin
   PreparePlainOps();
-  FStageCDecoderPlain.Run(FPlainWorkspace, TextFeatures, PredictedDurations,
-    F0Curve, NCurve, DecoderStyle, DecoderFeatures);
-  FStageCDecoderPlain.ReleaseBuffers();
-  FPlainWorkspace.ReleaseBuffers();
+  try
+    FStageCDecoder.Run(FPlainWorkspace, TextFeatures, PredictedDurations,
+      F0Curve, NCurve, DecoderStyle, DecoderFeatures);
+  finally
+    FStageCDecoder.ReleaseBuffers();
+    FPlainWorkspace.ReleaseBuffers();
+  end;
 end;
 
 procedure TNNetKokoro.RunStageB(DurationFeatures: TNNetVolume;
   const PredictedDurations: array of integer;
   const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
-var
-  StyleNormPos, MaxStyleNormPos, CurvePos, MaxCurvePos, OutputPos: integer;
-  Output: TNNetVolume;
-begin
-  if Length(ProsodyStyle) <> FConfig.StyleDim then
-    ImportError('Kokoro: the prosody style has ' +
-      IntToStr(Length(ProsodyStyle)) + ' values, expected style_dim = ' +
-      IntToStr(FConfig.StyleDim) + '.');
-  if DurationFeatures.Depth <> FConfig.HiddenDim + FConfig.StyleDim then
-    ImportError('Kokoro: stage B reads d with ' +
-      IntToStr(FConfig.HiddenDim + FConfig.StyleDim) + ' channels, got ' +
-      IntToStr(DurationFeatures.Depth) + '.');
-  RepeatTokenRows(DurationFeatures, PredictedDurations, FStageBInput);
-  PrepareStageB(FStageBInput.SizeX);
-  MaxStyleNormPos := Length(FStageBLayers.StyleNorms) - 1;
-  for StyleNormPos := 0 to MaxStyleNormPos do
-    WriteStyleIntoChannelAffine(FStageBLayers.StyleNorms[StyleNormPos],
-      FStageBNormFcWeights[StyleNormPos], FStageBNormFcBiases[StyleNormPos],
-      ProsodyStyle);
-  FStageBNet.Compute(FStageBInput, 0, FParallel);
-  FStageBNet.GetLastLayer().ForceOutputOnRAM();
-  // Host step: the output is [F0; N] per position.
-  Output := FStageBNet.GetLastLayer().Output;
-  F0Curve.ReSize(Output.SizeX, 1, 1);
-  NCurve.ReSize(Output.SizeX, 1, 1);
-  MaxCurvePos := Output.SizeX - 1;
-  OutputPos := 0;
-  for CurvePos := 0 to MaxCurvePos do
-  begin
-    F0Curve.FData[CurvePos] := Output.FData[OutputPos];
-    NCurve.FData[CurvePos] := Output.FData[OutputPos + 1];
-    Inc(OutputPos, 2);
-  end;
-end;
-
-procedure TNNetKokoro.RunStageBPlain(DurationFeatures: TNNetVolume;
-  const PredictedDurations: array of integer;
-  const ProsodyStyle: array of TNeuralFloat; F0Curve, NCurve: TNNetVolume);
 begin
   PreparePlainOps();
   try
-    FStageBPlain.Run(FPlainWorkspace, DurationFeatures, PredictedDurations,
+    FStageB.Run(FPlainWorkspace, DurationFeatures, PredictedDurations,
       ProsodyStyle, F0Curve, NCurve);
   finally
-    FStageBPlain.ReleaseBuffers();
+    FStageB.ReleaseBuffers();
     FPlainWorkspace.ReleaseBuffers();
   end;
 end;
@@ -54025,124 +53165,6 @@ begin
   end;
 end;
 
-// Every decoder.generator tensor; m_source is LoadHarmonicSource's.
-procedure TNNetKokoro.LoadStageCGenerator(Reader: TNNetSafeTensorsReader;
-  Consumed: TStrings);
-const
-  StageCGeneratorPrefixes: array[0..0] of string = ('decoder.generator.');
-var
-  OwnerLayers: TKokoroStageCGeneratorLayers;
-  StagePos, ResBlockPos, ResBlockCount, StyleNormPos, StyleNormCount: integer;
-  StageName: string;
-
-  procedure LoadBlock(const Prefix: string;
-    const Block: TKokoroAdaINResBlock1Layers);
-  begin
-    LoadKokoroAdaINResBlock1Weights(Reader, Prefix, Block, FConfig.StyleDim,
-      FStageCGeneratorNormFcWeights, FStageCGeneratorNormFcBiases,
-      StyleNormPos, Consumed);
-    Inc(StyleNormPos, 2 * Length(Block.Norms1));
-  end;
-
-begin
-  FStageCGeneratorOwner := TNNet.Create();
-  OwnerLayers := BuildKokoroStageCGeneratorNet(FStageCGeneratorOwner, FConfig,
-    KokoroStageCGeneratorOwnerFrameCount);
-  StyleNormCount := Length(OwnerLayers.StyleNorms);
-  SetLength(FStageCGeneratorNormFcWeights, StyleNormCount);
-  SetLength(FStageCGeneratorNormFcBiases, StyleNormCount);
-  StyleNormPos := 0;
-  ResBlockCount := Length(FConfig.Generator.ResblockKernelSizes);
-  for StagePos := 0 to High(OwnerLayers.Stages) do
-  begin
-    StageName := IntToStr(StagePos);
-    LoadTorchConv1DLinear(Reader, 'decoder.generator.noise_convs.' + StageName,
-      OwnerLayers.Stages[StagePos].NoiseConv, Consumed);
-    LoadBlock('decoder.generator.noise_res.' + StageName,
-      OwnerLayers.Stages[StagePos].NoiseRes);
-    LoadTorchConvTranspose1DLinear(Reader, 'decoder.generator.ups.' +
-      StageName, OwnerLayers.Stages[StagePos].Ups, Consumed);
-    for ResBlockPos := 0 to ResBlockCount - 1 do
-      LoadBlock('decoder.generator.resblocks.' +
-        IntToStr(StagePos * ResBlockCount + ResBlockPos),
-        OwnerLayers.Stages[StagePos].ResBlocks[ResBlockPos]);
-  end;
-  LoadTorchConv1DLinear(Reader, 'decoder.generator.conv_post',
-    OwnerLayers.ConvPost, Consumed);
-  RaiseOnUnreadKokoroTensors(Reader, Consumed, StageCGeneratorPrefixes,
-    'stage-C generator');
-end;
-
-procedure TNNetKokoro.PrepareStageCGenerator(FrameCount: integer);
-var
-  StagePos: integer;
-begin
-  if Assigned(FStageCGeneratorNet) and
-    (FrameCount = FStageCGeneratorFrameCount) then exit;
-  ReleaseStageCGenerator();
-  FStageCGeneratorNet := TNNet.Create();
-  FStageCGeneratorNet.BuildWeightOwner := FStageCGeneratorOwner;
-  FStageCGeneratorLayers := BuildKokoroStageCGeneratorNet(FStageCGeneratorNet,
-    FConfig, FrameCount);
-  FStageCGeneratorNet.BuildWeightOwner := nil;
-  // The fast-memory ups rebuild the GEMM weight cache from the borrowed rows.
-  for StagePos := 0 to High(FStageCGeneratorLayers.Stages) do
-    FStageCGeneratorLayers.Stages[StagePos].Ups.FlushWeightCache();
-  ArmStageNet(FStageCGeneratorNet, FStageCGeneratorOwner,
-    FStageCGeneratorOwnerOnOpenCL);
-  FStageCGeneratorFrameCount := FrameCount;
-end;
-
-procedure TNNetKokoro.ReleaseStageCGenerator();
-begin
-  FreeAndNil(FStageCGeneratorNet);
-  FStageCGeneratorLayers := Default(TKokoroStageCGeneratorLayers);
-  FStageCGeneratorFrameCount := 0;
-end;
-
-procedure TNNetKokoro.RunStageCGeneratorFrom(XSource: TNNetLayer;
-  DecoderFeatures, HarmonicSpectrum: TNNetVolume;
-  const DecoderStyle: array of TNeuralFloat; Audio: TNNetVolume);
-var
-  StyleNormPos, MaxStyleNormPos, FrameCount: integer;
-  HarmonicInput: TNNetLayer;
-begin
-  if Length(DecoderStyle) <> FConfig.StyleDim then
-    ImportError('Kokoro: the decoder style has ' +
-      IntToStr(Length(DecoderStyle)) + ' values, expected style_dim = ' +
-      IntToStr(FConfig.StyleDim) + '.');
-  if Odd(DecoderFeatures.SizeX) or (DecoderFeatures.SizeY <> 1) or
-     (DecoderFeatures.Depth <> FConfig.DecoderOutputWidth) then
-    ImportError('Kokoro: the generator reads x as (2F, 1, ' +
-      IntToStr(FConfig.DecoderOutputWidth) + '), got ' +
-      IntToStr(DecoderFeatures.SizeX) + 'x' + IntToStr(DecoderFeatures.SizeY) +
-      'x' + IntToStr(DecoderFeatures.Depth) + '.');
-  FrameCount := DecoderFeatures.SizeX div 2;
-  PrepareStageCGenerator(FrameCount);
-  HarmonicInput := FStageCGeneratorNet.Layers[KokoroStageCGeneratorHarmonicInput];
-  if HarmonicSpectrum.Size <> HarmonicInput.Output.Size then
-    ImportError('Kokoro: the generator takes a (' +
-      IntToStr(HarmonicInput.Output.SizeX) + ', 1, ' +
-      IntToStr(HarmonicInput.Output.Depth) + ') harmonic spectrum for ' +
-      IntToStr(FrameCount) + ' frames, got ' + IntToStr(HarmonicSpectrum.SizeX) +
-      'x' + IntToStr(HarmonicSpectrum.SizeY) + 'x' +
-      IntToStr(HarmonicSpectrum.Depth) + '.');
-  MaxStyleNormPos := Length(FStageCGeneratorLayers.StyleNorms) - 1;
-  for StyleNormPos := 0 to MaxStyleNormPos do
-    WriteStyleIntoChannelAffine(FStageCGeneratorLayers.StyleNorms[StyleNormPos],
-      FStageCGeneratorNormFcWeights[StyleNormPos],
-      FStageCGeneratorNormFcBiases[StyleNormPos], DecoderStyle);
-  // TNNet.Compute([x, spectrum]) writes input 1 the same way.
-  HarmonicInput.Output.CopyNoChecks(HarmonicSpectrum);
-  if Assigned(XSource)
-    then FStageCGeneratorNet.ComputeFromLayerOutput(XSource,
-      KokoroStageCGeneratorXInput, FParallel)
-    else FStageCGeneratorNet.Compute(DecoderFeatures,
-      KokoroStageCGeneratorXInput, FParallel);
-  FStageCGeneratorNet.GetLastLayer().ForceOutputOnRAM();
-  ConvPostToAudio(FStageCGeneratorNet.GetLastLayer().Output, Audio);
-end;
-
 procedure TNNetKokoro.ConvPostToAudio(ConvPost, Audio: TNNetVolume);
 var
   BinCount, PositionPos, MaxPositionPos, BinPos, MaxBinPos, RowBase,
@@ -54180,21 +53202,13 @@ procedure TNNetKokoro.RunStageCGenerator(DecoderFeatures,
   HarmonicSpectrum: TNNetVolume; const DecoderStyle: array of TNeuralFloat;
   Audio: TNNetVolume);
 begin
-  RunStageCGeneratorFrom(nil, DecoderFeatures, HarmonicSpectrum, DecoderStyle,
-    Audio);
-end;
-
-procedure TNNetKokoro.RunStageCGeneratorPlain(DecoderFeatures,
-  HarmonicSpectrum: TNNetVolume; const DecoderStyle: array of TNeuralFloat;
-  Audio: TNNetVolume);
-begin
   PreparePlainOps();
   try
-    FStageCGeneratorPlain.Run(FPlainWorkspace, DecoderFeatures,
-      HarmonicSpectrum, DecoderStyle);
-    ConvPostToAudio(FStageCGeneratorPlain.ConvPost, Audio);
+    FStageCGenerator.Run(FPlainWorkspace, DecoderFeatures, HarmonicSpectrum,
+      DecoderStyle);
+    ConvPostToAudio(FStageCGenerator.ConvPost, Audio);
   finally
-    FStageCGeneratorPlain.ReleaseBuffers();
+    FStageCGenerator.ReleaseBuffers();
     FPlainWorkspace.ReleaseBuffers();
   end;
 end;
@@ -54218,12 +53232,11 @@ begin
       Durations);
     // Stage A's activations are the largest allocation of a line.
     ReleaseStageA();
-    RunStageBPlain(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
-    RunStageCDecoderPlain(TextFeatures, Durations, F0Curve, NCurve,
-      DecoderStyle, DecoderFeatures);
+    RunStageB(DurationFeatures, Durations, ProsodyStyle, F0Curve, NCurve);
+    RunStageCDecoder(TextFeatures, Durations, F0Curve, NCurve, DecoderStyle,
+      DecoderFeatures);
     ComputeHarmonicSpectrum(F0Curve, HarmonicSpectrum);
-    RunStageCGeneratorPlain(DecoderFeatures, HarmonicSpectrum, DecoderStyle,
-      Audio);
+    RunStageCGenerator(DecoderFeatures, HarmonicSpectrum, DecoderStyle, Audio);
   finally
     HarmonicSpectrum.Free;
     DecoderFeatures.Free;
@@ -54407,11 +53420,8 @@ begin
     pHasSharedKernel);
   if not Assigned(FOpenCLContextNet) then exit(false);
   FOpenCLHasSharedKernel := pHasSharedKernel;
-  // A live stage net was built on the CPU: the next Prepare* arms a new one.
+  // A live StageANet was built on the CPU: the next PrepareStageA arms a new one.
   ReleaseStageA();
-  ReleaseStageB();
-  ReleaseStageCDecoder();
-  ReleaseStageCGenerator();
 end;
 
 function TNNetKokoro.OpenCLEnabled(): boolean;
