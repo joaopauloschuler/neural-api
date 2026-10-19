@@ -1,0 +1,24 @@
+{
+  "model": "jev-latest",
+  "state": "Battery life is great and the screen is sharp, but the speaker crackles at high volume and support never answered my email.",
+  "questions": {
+    "sentiment": {
+      "type": "choice",
+      "instructions": "What is the overall sentiment of this product review?",
+      "criteria": {
+        "positive": "the reviewer is mostly satisfied",
+        "mixed": "clear praise and clear complaints",
+        "negative": "the reviewer is mostly dissatisfied"
+      }
+    },
+    "stars": {
+      "type": "score",
+      "instructions": "How many stars would this reviewer most likely give?",
+      "criteria": ["1 star", "2 stars", "3 stars", "4 stars", "5 stars"]
+    },
+    "mentions_support": {
+      "type": "noul",
+      "instructions": "Does the review mention customer support?"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "model": "jev-latest",
+  "state": {
+    "subject": "Parcel says delivered but nothing arrived",
+    "message": "Tracking for order 9812 shows delivered yesterday at 14:02, but there is no parcel at my door or with my neighbours.",
+    "customer_tier": "standard",
+    "previous_contacts": 0
+  },
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this ticket?",
+      "criteria": {
+        "billing": "charges, refunds, invoices and payment methods",
+        "technical": "app crashes, bugs, login and account problems",
+        "shipping": "delivery status, lost or damaged parcels",
+        "other": null
+      }
+    },
+    "priority": {
+      "type": "score",
+      "instructions": "What priority should the ticket get?",
+      "criteria": ["low", "normal", "high", "critical"]
+    },
+    "needs_refund": {
+      "type": "noul",
+      "instructions": "Will resolving this ticket likely need a refund or a replacement?",
+      "criteria": {
+        "true": "the goods or money are lost to the customer",
+        "false": "an answer or a fix is enough"
+      }
+    }
+  }
+}

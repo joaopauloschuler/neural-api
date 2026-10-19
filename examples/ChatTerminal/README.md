@@ -19,6 +19,10 @@ for both). ChatTerminal adds `-p`; ChatServer adds `--host`, `--port` and the
 `--decision-*` flags.
 Each program's page documents only what is specific to it.
 
+`DecisionClient` (FCL only, no neural-api units) calls ChatServer's
+`/v1/systemone` from the command line, and `decision_examples/` holds three
+request files for it (see *Calling it* in [ChatServer.md](ChatServer.md)).
+
 Both programs drive the generic model importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`). It supports: qwen2, qwen2.5, qwen3,
 qwen3_moe, qwen3_5, mamba, gpt2, llama, mistral, phi3, olmoe (see the

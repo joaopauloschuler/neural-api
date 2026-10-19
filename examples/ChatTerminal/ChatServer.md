@@ -268,6 +268,89 @@ python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat
 kill %1
 ```
 
+### Calling it: `DecisionClient` and curl
+
+Start a server with one of the three scorers (the checkpoints are the ones
+cloned above):
+
+```
+# AnyJev L0 on a plain chat model
+neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
+# Kev (LoRA adapter on its base)
+neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
+# Open-Jev (LoRA adapter on its base)
+neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
+```
+
+`DecisionClient` (`DecisionClient.lpr` in this folder) sends one request and
+prints each answer: the choice or the expected level, the probabilities in
+the server's order (`*` marks the chosen option, a score line shows its
+legend), the confidence and the token usage. It uses only FCL units
+(`fphttpclient`, `fpjson`), none of the neural-api units, so it builds in
+about a second and shows that any HTTP client can call the endpoint. Without
+`--request` it sends a built-in support-ticket request (an object state; a
+choice of team with one `null` description, a 3-level frustration score and
+an urgent yes/no question). The folder `decision_examples/` holds three
+request files: ticket routing, review sentiment and a nested-object state.
+
+```
+lazbuild -B neural-api/examples/ChatTerminal/DecisionClient.lpi
+cd neural-api/examples/ChatTerminal
+../../bin/x86_64-linux/bin/DecisionClient --retries 300
+../../bin/x86_64-linux/bin/DecisionClient --request decision_examples/ticket_routing.json
+../../bin/x86_64-linux/bin/DecisionClient --request decision_examples/review_sentiment.json --raw
+curl -s -d @decision_examples/ticket_routing.json http://127.0.0.1:8080/v1/systemone
+curl -s -d @decision_examples/nested_state.json http://127.0.0.1:8080/v1/systemone
+```
+
+```
+model: jev-latest
+team (choice): billing   confidence 0.2794
+    * billing    0.4596
+      technical  0.1395
+      shipping   0.2395
+      other      0.1614
+priority (score): 1.3656 on levels 0..3   confidence 0.2216
+      0  0.2064  low
+      1  0.3515  normal
+      2  0.3121  high
+      3  0.1299  critical
+needs_refund (noul): P(true) = 0.3064
+usage: 5234 input tokens, 0 output tokens
+```
+
+(The numbers above come from the random pico fixture
+`tests/fixtures/anyjev_qwen25` and mean nothing.)
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--server URL` | server root (a trailing `/v1` is accepted) | `http://127.0.0.1:8080` |
+| `--model NAME` | the request's `model`; a request file keeps its own model unless `--model` is given | `jev-latest` |
+| `--request FILE` | send the JSON request in `FILE` | the built-in demo |
+| `--api-key KEY` | send `Authorization: Bearer KEY` | none |
+| `--retries N` | retry a refused connection `N` times, 1 s apart (ChatServer listens only after the model has loaded) | `0` |
+| `--raw` | print the raw JSON response body | off |
+| `--selftest` | run the offline checks and exit | |
+
+On a status other than 200, `DecisionClient` prints the status and the
+`detail` (a string, or one `loc: msg (type)` line per entry of a 422 list)
+and exits with 1; it exits with 2 when it cannot connect (with a hint to
+start ChatServer) and with 3 on a bad command line or request file.
+
+**Authentication.** ChatServer has none: it ignores any `Authorization`
+header and listens on `127.0.0.1` unless `--host` says otherwise.
+`--api-key` exists for other servers that speak the same wire format.
+
+TypeSafe's Python SDK (`typesafe-sdk` 0.7.5, checked by reading its source,
+not run against this server) takes the server root through its `base_url`
+constructor argument or the `TYPESAFE_BASE_URL` environment variable
+(`http://127.0.0.1:8080`, without `/v1`) and sends its default model
+`jev-latest`, which this server accepts; it refuses to start without an API
+key (`api_key` or `TYPESAFE_API_KEY`; any value works, since this server
+ignores it), and it zstd-compresses request bodies of 1024 bytes or more
+when zstd is installed, which this server does not decode, so set its
+`compression` argument to false.
+
 ## Concurrency and cache reuse
 
 Requests are handled strictly one at a time: one model, one live KV cache,
@@ -321,4 +404,6 @@ the launch defaults, `max_completion_tokens` over `max_tokens`, the ignored
 `--decision-*` flags and their refusals, the `--decision-adapter` layout
 detection on placeholder files, and the `/v1/systemone` status codes on a
 fixed test scorer, including the decision-only 501s) without needing any
-model files.
+model files. `DecisionClient --selftest` checks the client offline: the
+built-in request, the request-file handling, and the printing and exit
+status of canned 200, 422 and 501 replies.
