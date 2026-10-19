@@ -44,6 +44,9 @@ type
     // max_length and the context answer 422 before anything is fed; special-token
     // strings are rewritten; a directory without a checkpoint is refused.
     procedure TestOpenJevLimits;
+    // ReadDecisionAdapterInfo on both fixtures: layout, adapter to merge,
+    // recorded base, head input size and the served model name.
+    procedure TestDecisionAdapterInfo;
   end;
 
 implementation
@@ -557,6 +560,41 @@ begin
   finally
     Scorer.Free;
     Engine.Free;
+  end;
+end;
+
+procedure TTestNeuralDecisionHeads.TestDecisionAdapterInfo;
+var
+  Info: TDecisionAdapterInfo;
+  KevDir, OpenJevRoot: string;
+begin
+  KevDir := FixturePath('kev_qwen3_5' + DirectorySeparator + 'adapter');
+  Info := ReadDecisionAdapterInfo(KevDir);
+  AssertTrue('Kev layout', Info.Layout = dalKevLoRA);
+  AssertEquals('Kev adapter', KevDir, Info.LoRAAdapterDir);
+  AssertEquals('Kev head.pt dir', IncludeTrailingPathDelimiter(KevDir), Info.CheckpointDir);
+  AssertEquals('Kev base', 'tests/fixtures/kev_qwen3_5/base', Info.BaseModelId);
+  AssertEquals('Kev base revision (None)', '', Info.BaseRevision);
+  AssertEquals('Kev head input', 16, Info.HeadInputSize);
+  AssertEquals('Kev model name', 'adapter', DecisionAdapterModelName(KevDir));
+  OpenJevRoot := FixturePath(csOpenJevFixture);
+  Info := ReadDecisionAdapterInfo(OpenJevRoot);
+  AssertTrue('Open-Jev layout', Info.Layout = dalOpenJev);
+  AssertEquals('Open-Jev checkpoint', OpenJevCheckpointDir(OpenJevRoot), Info.CheckpointDir);
+  AssertEquals('Open-Jev adapter', Info.CheckpointDir + csOpenJevAdapterSubdir,
+    Info.LoRAAdapterDir);
+  AssertEquals('Open-Jev base', 'Qwen/Qwen3.5-2B', Info.BaseModelId);
+  AssertEquals('Open-Jev base revision', '15852e8c16360a2fea060d615a32b45270f8a8fc',
+    Info.BaseRevision);
+  AssertEquals('Open-Jev head input', 16, Info.HeadInputSize);
+  AssertEquals('Open-Jev model name', csOpenJevFixture,
+    DecisionAdapterModelName(Info.CheckpointDir));
+  try
+    ReadDecisionAdapterInfo(FixturePath('kev_qwen3_5' + DirectorySeparator + 'base'));
+    Fail('a base checkpoint is not a decision checkpoint');
+  except
+    on E: EDecisionHeadError do
+      AssertTrue(E.Message, Pos('not a decision checkpoint', E.Message) > 0);
   end;
 end;
 

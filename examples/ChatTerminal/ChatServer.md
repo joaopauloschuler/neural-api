@@ -14,6 +14,8 @@ one-shot `-p` — plus the server flags below:
 | `--decision-level l0\|raw` | how `POST /v1/systemone` reads the model: `l0` scores every rotation of the options and corrects each by the label prior; `raw` scores one prompt with the options in the order given | `l0` |
 | `--decision-prior content_free\|none` | the label prior of `l0` (ignored by `raw`) | `content_free` |
 | `--decision-max-rotations N` | cap on the cyclic shifts of a choice question under `l0` (fewer prompts, less position-bias correction) | `0` (one per option) |
+| `--decision-adapter DIR` | answer `POST /v1/systemone` with the Kev or Open-Jev checkpoint in `DIR` instead of AnyJev L0; the server becomes decision-only (see *Trained decision checkpoints*). Refused together with the three AnyJev flags above | none (AnyJev L0) |
+| `--decision-temperature T` | with `--decision-adapter`: replace the checkpoint's calibration temperature (`1` = raw head scores; Kev's `KEV_TEMPERATURE`) | the checkpoint's |
 
 ```
 lazbuild neural-api/examples/ChatTerminal/ChatServer.lpi
@@ -74,8 +76,9 @@ end-of-turn marker, generation stops on the tokenizer's EOS id or at
 `POST /v1/systemone` takes a TypeSafe/Jev decision request: a state plus
 typed questions in, option probabilities out, and no text generated. The
 JSON field names follow TypeSafe's OpenAPI 0.2.0 (`api.typesafe.ai`).
-`model` is the name `GET /v1/models` lists for the chat model (the model
-directory's name) or the alias `jev-latest`. `state`, `instructions` and
+`model` is the name `GET /v1/models` lists for the decision model (the
+model directory's name, or the adapter directory's name under
+`--decision-adapter`) or the alias `jev-latest`. `state`, `instructions` and
 the option descriptions may each be a string, an object or an array.
 
 ```
@@ -128,7 +131,7 @@ token. 500 with `{"detail": "..."}` when scoring fails.
 **Not supported.** `box` questions and image `assets`; more than 26 options
 in a choice question; AnyJev's running-mean batch prior (the scorer takes
 the prior from the content-free probes of each request); AnyJev's L1/L2
-levels and adaptive shifts; trained decision heads (Kev, Open-Jev).
+levels and adaptive shifts; Kev full-weight checkpoints (kev-27b).
 
 **Status.** AnyJev L0 is planned (coded): `TestNeuralAnyJev` matches the
 real `anyjev` 0.3.0 package within 3.1e-6 on two pico Qwen fixtures, but
@@ -152,6 +155,90 @@ neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
 pip install anyjev==0.3.0
 pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
 python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
+kill %1
+```
+
+### Trained decision checkpoints: `--decision-adapter`
+
+`--decision-adapter DIR` replaces AnyJev L0 with a trained decision
+checkpoint. The positional model directory stays the BASE checkpoint the
+adapter was trained on; ChatServer merges the adapter's LoRA into it while
+loading (`TChatOptions.LoRAAdapterDir`, FP32 merge in HF tensor space), reads
+the head and scores with it. ChatServer detects the layout of `DIR`
+(`DetectDecisionAdapterLayout` in `neural/neuraldecisionheads.pas`):
+
+| Layout | Files | Scorer |
+| --- | --- | --- |
+| Open-Jev (`ZefanCai/Open-Jev-2B`, ...) | `head.pt` and `temperature.json` in `DIR`, `DIR/checkpoint` or `DIR/package/checkpoint` (the HF repo root works), plus `model.json` and `adapter/` | `TOpenJevScorer`: one chat prompt per candidate, Linear(d, 1) head; the adapter is `<checkpoint>/adapter` when `model.json` has `lora_rank` > 0 |
+| Kev LoRA (`jaredpalmer/kev-0.8b`, `-4b`, `-9b`) | `head.pt`, `adapter_config.json` and `adapter_model.safetensors` in `DIR` | `TKevScorer`: one row per question, pointer head; the adapter is `DIR` |
+| Kev full weights (`jaredpalmer/kev-27b`) | `head.pt`, `config.json`, `model*.safetensors`, no `adapter_config.json` | refused at startup: these safetensors hold the `Qwen3_5TextModel` keys without the `model.` prefix and no LM head, which the importer cannot build yet (task D2.6) |
+
+Any other directory is refused at startup with a message that lists the
+three layouts. At startup ChatServer prints the base the checkpoint records
+(Kev: `head.pt` `base` and `base_revision`; Open-Jev: `model.json`
+`model_id` and `revision`). It cannot check that the model directory holds
+that exact revision; it refuses only a plain mismatch: a head that reads
+hidden states of another size than the base's `config.json` `hidden_size`.
+
+**Decision-only.** With `--decision-adapter` the merged LoRA has changed
+the base weights for decision scoring (and Kev bases are pretrained `-Base`
+models with no chat tuning), so `POST /v1/chat/completions` and
+`POST /v1/completions` answer 501 with that reason, and `GET /v1/models`
+lists only the decision model. Its name is the adapter directory's name
+(`kev-0.8b`, `Open-Jev-2B`; for `.../package/checkpoint` the repo root's
+name); `jev-latest` is accepted too. `--decision-level`, `--decision-prior`
+and `--decision-max-rotations` tune AnyJev only and are refused with
+`--decision-adapter`.
+
+**Memory.** Kev and Open-Jev read the final hidden states and never
+compute the LM head, but the engine still builds it: a vocab x hidden
+matrix (248320 x 1024 for Kev-0.8B, 1.0 GB in FP32; the base ties it to
+the embedding, and how much of that the build shares is not measured). The
+head-less import of task D2.6 could be reused to drop it; this is not done
+yet.
+
+**Status.** Planned (coded), not supported: `TestNeuralDecisionHeads` matches
+kev's and jev's own code on pico fixtures (within 4.1e-6 and 6.4e-7), and
+`tools/decision_real_check.py` passed against both fixtures through a running
+server (max difference 4.6e-5, the server's 4-decimal rounding), but nobody
+has run a real Kev or Open-Jev checkpoint yet.
+
+**Real-checkpoint checks.** `tools/decision_real_check.py BASE ADAPTER`
+sends one fixed request (a choice, a score and a yes/no question) to the
+running server, scores it in Python with the checkpoint's own code on the
+same local base (Kev: `kev.checkpoint.Checkpoint(ADAPTER).load` in FP32 with
+`head.pt`'s base replaced by `BASE`, then `admit` + `DecisionModel.probs`;
+Open-Jev: jev's `compile_request` + `DecisionModel.forward` (the uncached
+path) + `Predictor.predict`, FP32 backbone), prints both side by side and
+exits with status 1 when the largest difference exceeds 5e-3. Launch the
+server with `--fp32`: int8 weights move the probabilities far more than the
+FP32 rounding the check bounds. With `--decision-temperature T`, pass
+`--temperature T` to the script too. kev and jev pin older torch and
+transformers versions, so install them `--no-deps` next to torch,
+transformers, peft and safetensors.
+
+Kev-0.8B (base `Qwen/Qwen3.5-0.8B-Base` at the revision `head.pt` records):
+
+```
+git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
+git -C q08b checkout dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
+git clone https://huggingface.co/jaredpalmer/kev-0.8b
+lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
+pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e
+python3 neural-api/tools/decision_real_check.py q08b/ kev-0.8b/ --server http://127.0.0.1:8080
+kill %1
+```
+
+Open-Jev-2B (base `Qwen/Qwen3.5-2B` at the revision `model.json` records):
+
+```
+git clone https://huggingface.co/Qwen/Qwen3.5-2B q2b
+git -C q2b checkout 15852e8c16360a2fea060d615a32b45270f8a8fc
+git clone https://huggingface.co/ZefanCai/Open-Jev-2B
+neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
+pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
+python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
 kill %1
 ```
 
@@ -205,5 +292,7 @@ slots have not been timed on a real model yet.
 parameter-overlay checks (the `messages` array, per-request overrides of
 the launch defaults, `max_completion_tokens` over `max_tokens`, the ignored
 `stop` field, the `stream` flag, the `--kv-slots` server default, the
-`--decision-*` flags, and the `/v1/systemone` status codes on a fixed test
-scorer) without needing any model files.
+`--decision-*` flags and their refusals, the `--decision-adapter` layout
+detection on placeholder files, and the `/v1/systemone` status codes on a
+fixed test scorer, including the decision-only 501s) without needing any
+model files.

@@ -36,35 +36,12 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anyjev_tiny_fixture import REQUEST, anyjev_questions, rewrite_special_token_strings  # noqa: E402
+from decision_real_check import post_systemone  # noqa: E402
 
 DEFAULT_THRESHOLD = 5e-3
-CONNECT_ATTEMPTS = 30      # the server may still be loading the checkpoint
-CONNECT_RETRY_SECONDS = 10
-
-
-def post_systemone(server, request, timeout):
-    """The server's JSON answer; retries while nothing listens yet."""
-    body = json.dumps(request, ensure_ascii=False).encode('utf-8')
-    url = server.rstrip('/') + '/v1/systemone'
-    for attempt in range(1, CONNECT_ATTEMPTS + 1):
-        req = urllib.request.Request(url, data=body, method='POST',
-                                     headers={'Content-Type': 'application/json'})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            sys.exit(f'{url} answered HTTP {e.code}: {e.read().decode("utf-8", "replace")}')
-        except (urllib.error.URLError, ConnectionError) as e:
-            if attempt == CONNECT_ATTEMPTS:
-                sys.exit(f'{url} unreachable after {attempt} attempts: {e}')
-            print(f'[{url} not answering yet ({e}); retry {attempt}/{CONNECT_ATTEMPTS - 1}'
-                  f' in {CONNECT_RETRY_SECONDS} s]', flush=True)
-            time.sleep(CONNECT_RETRY_SECONDS)
 
 
 def server_probabilities(request, answers):

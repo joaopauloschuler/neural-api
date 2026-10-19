@@ -9,8 +9,9 @@ through the same shared engine (`TChatEngine` in
 - [**ChatServer**](ChatServer.md) — a minimal OpenAI-style HTTP server
   (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming),
   plus `/v1/systemone` for TypeSafe/Jev typed decisions through the AnyJev
-  L0 readout (planned (coded): parity-tested on pico fixtures, not yet run
-  on a real checkpoint).
+  L0 readout, or through a Kev / Open-Jev checkpoint with
+  `--decision-adapter` (both planned (coded): parity-tested on pico
+  fixtures, not yet run on a real checkpoint).
 
 Both take the same command line: a model directory followed by the flags
 listed on this page (`ParseArgs` in `neural/neuralchatengine.pas` parses them

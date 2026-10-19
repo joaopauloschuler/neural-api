@@ -162,6 +162,23 @@ type
     property LastSharedPrefixLen: integer read FLastSharedPrefixLen;
   end;
 
+  // model.json of an Open-Jev checkpoint.
+  TOpenJevModelConfig = record
+    MaxPromptTokens, LoRARank: integer;
+    BaseModelId, BaseRevision: string;
+  end;
+
+  TDecisionAdapterLayout = (dalUnknown, dalKevLoRA, dalKevFullWeights, dalOpenJev);
+
+  // A trained decision checkpoint as found on disk, read without its base model.
+  TDecisionAdapterInfo = record
+    Layout: TDecisionAdapterLayout;
+    CheckpointDir: string;              // holds head.pt
+    LoRAAdapterDir: string;             // the PEFT adapter to merge; '' = none
+    BaseModelId, BaseRevision: string;  // the base it records; '' = not recorded
+    HeadInputSize: integer;             // the hidden size the head reads
+  end;
+
 // kev.api.to_record option texts: noul ("no[: false]", "yes[: true]"),
 // choice "name[: desc]", score the level texts.
 function KevOptionTexts(const Question: TDecisionQuestion): TStringArray;
@@ -172,6 +189,15 @@ function OpenJevCheckpointDir(const Dir: string): string;
 // prompt per option, noul one. Caller text is NOT rewritten here.
 function OpenJevCandidatePrompts(const Request: TDecisionRequest;
   const Question: TDecisionQuestion): TStringArray;
+// Raises EDecisionHeadError when model.json is missing or has no positive max_length.
+function ReadOpenJevModelConfig(const CheckpointDir: string): TOpenJevModelConfig;
+// Kev LoRA: head.pt, adapter_config.json and adapter weights in Dir; Kev full weights:
+// head.pt, config.json and model*.safetensors; Open-Jev: OpenJevCheckpointDir(Dir) <> ''.
+function DetectDecisionAdapterLayout(const Dir: string): TDecisionAdapterLayout;
+// Reads head.pt (and model.json); raises EDecisionHeadError on dalUnknown, naming the layouts.
+function ReadDecisionAdapterInfo(const Dir: string): TDecisionAdapterInfo;
+// Dir's own name, or the repository root's for <root>/checkpoint and <root>/package/checkpoint.
+function DecisionAdapterModelName(const Dir: string): string;
 
 implementation
 
@@ -560,43 +586,39 @@ begin
       #10'Is this proposed answer correct? Answer Yes or No.';
 end;
 
-{ TOpenJevScorer }
-
-constructor TOpenJevScorer.Create(AEngine: TChatEngine;
-  const AModelName, ACheckpointDir: string);
+// The JSON object in FileName; raises EDecisionHeadError when it is missing or not an object.
+function ReadDecisionJSONObject(const FileName: string): TJSONObject;
 var
-  CheckpointDir, HeadFile: string;
+  Text: TStringList;
+  Root: TJSONData;
+begin
+  if not FileExists(FileName) then
+    raise EDecisionHeadError.CreateFmt('%s: file not found', [FileName]);
+  Text := TStringList.Create;
+  try
+    Text.LoadFromFile(FileName);
+    try
+      Root := GetJSON(Text.Text);
+    except
+      on E: Exception do
+        raise EDecisionHeadError.CreateFmt('%s: %s', [FileName, E.Message]);
+    end;
+  finally
+    Text.Free;
+  end;
+  if not (Root is TJSONObject) then
+  begin
+    Root.Free;
+    raise EDecisionHeadError.CreateFmt('%s: not a JSON object', [FileName]);
+  end;
+  Result := TJSONObject(Root);
+end;
+
+function ReadOpenJevModelConfig(const CheckpointDir: string): TOpenJevModelConfig;
+var
+  FileName: string;
   Config: TJSONObject;
   Field: TJSONData;
-  Reader: TNNetTorchBinReader;
-  BiasVolume: TNNetVolume;
-
-  function ReadConfig(const FileName: string): TJSONObject;
-  var
-    Text: TStringList;
-    Root: TJSONData;
-  begin
-    if not FileExists(FileName) then
-      raise EDecisionHeadError.CreateFmt('%s: file not found', [FileName]);
-    Text := TStringList.Create;
-    try
-      Text.LoadFromFile(FileName);
-      try
-        Root := GetJSON(Text.Text);
-      except
-        on E: Exception do
-          raise EDecisionHeadError.CreateFmt('%s: %s', [FileName, E.Message]);
-      end;
-    finally
-      Text.Free;
-    end;
-    if not (Root is TJSONObject) then
-    begin
-      Root.Free;
-      raise EDecisionHeadError.CreateFmt('%s: not a JSON object', [FileName]);
-    end;
-    Result := TJSONObject(Root);
-  end;
 
   function ConfigText(const Name: string): string;
   var
@@ -609,6 +631,37 @@ var
       Result := '';
   end;
 
+begin
+  FileName := IncludeTrailingPathDelimiter(CheckpointDir) + csOpenJevModelFile;
+  Config := ReadDecisionJSONObject(FileName);
+  try
+    Field := Config.Find('max_length');
+    if (Field = nil) or not (Field is TJSONIntegerNumber) or (Field.AsInteger <= 0) then
+      raise EDecisionHeadError.CreateFmt('%s: max_length must be a positive' +
+        ' integer', [FileName]);
+    Result.MaxPromptTokens := Field.AsInteger;
+    Result.LoRARank := 0;
+    Field := Config.Find('lora_rank');
+    if (Field <> nil) and (Field is TJSONIntegerNumber) then
+      Result.LoRARank := Field.AsInteger;
+    Result.BaseModelId := ConfigText('model_id');
+    Result.BaseRevision := ConfigText('revision');
+  finally
+    Config.Free;
+  end;
+end;
+
+{ TOpenJevScorer }
+
+constructor TOpenJevScorer.Create(AEngine: TChatEngine;
+  const AModelName, ACheckpointDir: string);
+var
+  CheckpointDir, HeadFile: string;
+  ModelConfig: TOpenJevModelConfig;
+  Config: TJSONObject;
+  Field: TJSONData;
+  Reader: TNNetTorchBinReader;
+  BiasVolume: TNNetVolume;
 begin
   inherited Create(AEngine, AModelName);
   FSharePrefix := true;
@@ -623,22 +676,12 @@ begin
     raise EDecisionHeadError.CreateFmt('the tokenizer of %s has no <|im_start|>' +
       ' or <|im_end|> token, which Open-Jev''s chat prompts need',
       [FEngine.Opt.ModelDir]);
-  Config := ReadConfig(CheckpointDir + csOpenJevModelFile);
-  try
-    Field := Config.Find('max_length');
-    if (Field = nil) or not (Field is TJSONIntegerNumber) or (Field.AsInteger <= 0) then
-      raise EDecisionHeadError.CreateFmt('%s: max_length must be a positive' +
-        ' integer', [CheckpointDir + csOpenJevModelFile]);
-    FMaxPromptTokens := Field.AsInteger;
-    Field := Config.Find('lora_rank');
-    if (Field <> nil) and (Field is TJSONIntegerNumber) then
-      FLoRARank := Field.AsInteger;
-    FBaseModelId := ConfigText('model_id');
-    FBaseRevision := ConfigText('revision');
-  finally
-    Config.Free;
-  end;
-  Config := ReadConfig(CheckpointDir + csOpenJevTemperatureFile);
+  ModelConfig := ReadOpenJevModelConfig(CheckpointDir);
+  FMaxPromptTokens := ModelConfig.MaxPromptTokens;
+  FLoRARank := ModelConfig.LoRARank;
+  FBaseModelId := ModelConfig.BaseModelId;
+  FBaseRevision := ModelConfig.BaseRevision;
+  Config := ReadDecisionJSONObject(CheckpointDir + csOpenJevTemperatureFile);
   try
     Field := Config.Find('temperature');
     if (Field = nil) or (Field.JSONType <> jtNumber) then
@@ -796,6 +839,106 @@ begin
     SoftMaxInPlace(P);
     Answers[QuestionPos] := DecisionAnswerFromProbabilities(Question.Kind, P);
   end;
+end;
+
+function DetectDecisionAdapterLayout(const Dir: string): TDecisionAdapterLayout;
+var
+  DirPath: string;
+  Shard: TSearchRec;
+  HasShards: boolean;
+begin
+  if OpenJevCheckpointDir(Dir) <> '' then Exit(dalOpenJev);
+  DirPath := IncludeTrailingPathDelimiter(Dir);
+  Result := dalUnknown;
+  if not FileExists(DirPath + csOpenJevHeadFile) then exit;
+  if FileExists(DirPath + 'adapter_config.json') then
+  begin
+    if FileExists(DirPath + 'adapter_model.safetensors') or
+      FileExists(DirPath + 'adapter_model.bin') then
+      Result := dalKevLoRA;
+    exit;
+  end;
+  HasShards := FindFirst(DirPath + 'model*.safetensors', faAnyFile, Shard) = 0;
+  FindClose(Shard);
+  if HasShards and FileExists(DirPath + 'config.json') then
+    Result := dalKevFullWeights;
+end;
+
+function ReadDecisionAdapterInfo(const Dir: string): TDecisionAdapterInfo;
+var
+  HeadFile, InputTensor: string;
+  Reader: TNNetTorchBinReader;
+  ModelConfig: TOpenJevModelConfig;
+
+  function HeadMetadataText(const Name: string): string;
+  var
+    MetadataPos: integer;
+  begin
+    MetadataPos := Reader.FindMetadata(Name);
+    if (MetadataPos >= 0) and (Reader.MetadataAt(MetadataPos).Kind = tmkStr) then
+      Result := Reader.MetadataAt(MetadataPos).StrVal
+    else
+      Result := '';
+  end;
+
+begin
+  Result.Layout := DetectDecisionAdapterLayout(Dir);
+  Result.LoRAAdapterDir := '';
+  Result.BaseModelId := '';
+  Result.BaseRevision := '';
+  Result.HeadInputSize := 0;
+  case Result.Layout of
+    dalUnknown:
+      raise EDecisionHeadError.CreateFmt('%s is not a decision checkpoint: expected' +
+        ' a Kev LoRA checkpoint (head.pt, adapter_config.json and' +
+        ' adapter_model.safetensors), a Kev full-weight checkpoint (head.pt,' +
+        ' config.json and model*.safetensors) or an Open-Jev checkpoint (%s and' +
+        ' %s in it, in checkpoint/ or in package/checkpoint/)',
+        [Dir, csOpenJevHeadFile, csOpenJevTemperatureFile]);
+    dalOpenJev:
+      begin
+        Result.CheckpointDir := OpenJevCheckpointDir(Dir);
+        ModelConfig := ReadOpenJevModelConfig(Result.CheckpointDir);
+        if ModelConfig.LoRARank > 0 then
+          Result.LoRAAdapterDir := Result.CheckpointDir + csOpenJevAdapterSubdir;
+        Result.BaseModelId := ModelConfig.BaseModelId;
+        Result.BaseRevision := ModelConfig.BaseRevision;
+        InputTensor := 'weight';
+      end;
+    else
+      begin
+        Result.CheckpointDir := IncludeTrailingPathDelimiter(Dir);
+        if Result.Layout = dalKevLoRA then
+          Result.LoRAAdapterDir := ExcludeTrailingPathDelimiter(Dir);
+        InputTensor := 'head.q.weight';
+      end;
+  end;
+  HeadFile := Result.CheckpointDir + csOpenJevHeadFile;
+  Reader := TNNetTorchBinReader.Create(HeadFile);
+  try
+    if Result.Layout <> dalOpenJev then
+    begin
+      Result.BaseModelId := HeadMetadataText('base');
+      Result.BaseRevision := HeadMetadataText('base_revision');
+    end;
+    if Reader.HasTensor(InputTensor) and (Reader.DimCount(InputTensor) = 2) then
+      Result.HeadInputSize := Reader.DimSize(InputTensor, 1);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function DecisionAdapterModelName(const Dir: string): string;
+var
+  Path: string;
+begin
+  Path := ExcludeTrailingPathDelimiter(ExpandFileName(Dir));
+  if ExtractFileName(Path) = 'checkpoint' then
+  begin
+    Path := ExtractFileDir(Path);
+    if ExtractFileName(Path) = 'package' then Path := ExtractFileDir(Path);
+  end;
+  Result := ExtractFileName(Path);
 end;
 
 end.

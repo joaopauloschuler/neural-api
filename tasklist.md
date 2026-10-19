@@ -4601,14 +4601,59 @@ rather than acted on.
         oracle = jev's compile_request/candidate_prompts + DecisionModel.forward +
         Predictor.predict (float64 backbone; `score_cached` cannot run on the
         venv's transformers 5.17). Strings and ids exact, p within 6.4e-7.
-  - [ ] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
+  - [x] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
         load the base given by the usual model directory (warn when it differs from
         the adapter's recorded base), merge, read the head, switch to decision-only.
+        Done (coded): `DetectDecisionAdapterLayout` / `ReadDecisionAdapterInfo` /
+        `DecisionAdapterModelName` / `ReadOpenJevModelConfig` in
+        `neuraldecisionheads.pas` (verified against the HF trees of kev-0.8b,
+        kev-27b and Open-Jev-2B). Open-Jev (`OpenJevCheckpointDir` <> '') merges
+        `<checkpoint>/adapter` when `lora_rank` > 0; Kev LoRA (head.pt +
+        adapter_config.json + adapter weights) merges the directory; Kev full
+        weights (kev-27b) are refused naming D2.6; anything else is refused listing
+        the three layouts. Startup prints the recorded base (head.pt `base` +
+        `base_revision`, model.json `model_id` + `revision`); the only check is
+        head input size vs the base `config.json` hidden_size (refused: the scorer
+        would fail after the load). Model name = the adapter directory's name
+        (repo root for `.../package/checkpoint`), plus `jev-latest`; chat endpoints
+        answer 501 with the reason; `/v1/models` lists the decision model only.
+        `--decision-level/-prior/-max-rotations` are refused with
+        `--decision-adapter`; `--decision-temperature T` overrides the head
+        temperature (needs `--decision-adapter`). `tools/decision_real_check.py`
+        (kev's `Checkpoint.load` FP32 with `head.pt`'s base pointed at the local
+        base; jev's `compile_request` + uncached `DecisionModel.forward` +
+        `Predictor.predict`); `anyjev_real_check.py` now imports its HTTP helper.
+        Smoke tests with `--fp32` on both pico fixtures: PASS, max abs difference
+        4.6e-5 (Kev) and 4.0e-5 (Open-Jev), the server's 4-decimal rounding.
+        Not optimized: the engine still builds the LM head (248320 x hidden),
+        which Kev/Open-Jev never compute; D2.6's head-less import could be reused.
+        The hidden-size refusal was run by hand (fixture config with hidden_size 32).
   - [ ] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
         `model.` prefix and without `lm_head` (build ends at the final norm). Pico
         fixture in that layout.
   - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
         Open-Jev-2B against their Python servers; commands written by the agents.
+        Commands (ChatServer.md *Trained decision checkpoints*); PASS = max abs
+        difference <= 5e-3 (exit 0); `--fp32` is required:
+        ```
+        git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
+        git -C q08b checkout dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
+        git clone https://huggingface.co/jaredpalmer/kev-0.8b
+        lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+        neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
+        pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e
+        python3 neural-api/tools/decision_real_check.py q08b/ kev-0.8b/ --server http://127.0.0.1:8080
+        kill %1
+        ```
+        ```
+        git clone https://huggingface.co/Qwen/Qwen3.5-2B q2b
+        git -C q2b checkout 15852e8c16360a2fea060d615a32b45270f8a8fc
+        git clone https://huggingface.co/ZefanCai/Open-Jev-2B
+        neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
+        pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
+        python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
+        kill %1
+        ```
   Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
   `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
   `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
