@@ -138,26 +138,17 @@ levels and adaptive shifts.
 **Status.** AnyJev L0 is planned (coded): `TestNeuralAnyJev` matches the
 real `anyjev` 0.3.0 package within 3.1e-6 on two pico Qwen fixtures. The
 user ran it on a 0.5B chat checkpoint, but its yes/no answer there was
-questionable, so it is not marked supported. The check below is how the
-user runs it on Qwen2.5-0.5B-Instruct.
+questionable, so it is not marked supported.
 
-**Real-checkpoint check.** `tools/anyjev_real_check.py` sends one fixed
-request (a choice, a score and a yes/no question) to a running ChatServer,
-runs the real `anyjev` Decider (`HFBackend`, float32, CPU, L0, content-free
-prior) on the same checkpoint, prints both probability vectors side by side,
-and exits with status 1 when the largest difference exceeds 5e-3. Launch the
-server with `--fp32`: the default int8 weights move the probabilities far
-more than the FP32 rounding the check bounds. The script needs `anyjev`
-0.3.0, `kev` (for Kev's value renderer), `torch` and `transformers`; it
-retries for up to 5 minutes while the server is still loading.
+**Running it on a real checkpoint** (Qwen2.5-0.5B-Instruct as the example;
+any chat checkpoint ChatServer loads works):
 
 ```
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
 lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
-neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
-pip install anyjev==0.3.0
-pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
-python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
+lazbuild -B neural-api/examples/ChatTerminal/DecisionClient.lpi
+neural-api/bin/x86_64-linux/bin/ChatServer q25/ --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
 kill %1
 ```
 
@@ -215,28 +206,16 @@ on its base `Qwen/Qwen3.5-2B` at revision
 `15852e8c16360a2fea060d615a32b45270f8a8fc` with
 `--gpu --int4 --decision-adapter Open-Jev-2B` and called it with
 `DecisionClient`: it answered sensibly, and an obviously urgent ticket got a
-high `P(true)` while an obviously calm one got a low `P(true)`. That run did
-not use `tools/decision_real_check.py`. Open-Jev-9B/27B and every Kev size
-are planned (coded), not supported: `TestNeuralDecisionHeads` matches kev's
-and jev's own code on pico fixtures (Kev LoRA within 4.1e-6, Kev full
-weights within 2.2e-6, Open-Jev within 6.4e-7), and
-`tools/decision_real_check.py` passed against all three fixtures through a
-running server (max difference 4.6e-5, the server's 4-decimal rounding), but
-nobody has run a real Kev checkpoint or a larger Open-Jev checkpoint yet.
+high `P(true)` while an obviously calm one got a low `P(true)`.
+Open-Jev-9B/27B and every Kev size are planned (coded), not supported:
+`TestNeuralDecisionHeads` matches kev's and jev's own code on pico fixtures
+(Kev LoRA within 4.1e-6, Kev full weights within 2.2e-6, Open-Jev within
+6.4e-7), but nobody has run a real Kev checkpoint or a larger Open-Jev
+checkpoint yet.
 
-**Real-checkpoint checks.** `tools/decision_real_check.py BASE ADAPTER`
-sends one fixed request (a choice, a score and a yes/no question) to the
-running server, scores it in Python with the checkpoint's own code on the
-same local base (Kev: `kev.checkpoint.Checkpoint(ADAPTER).load` in FP32 with
-`head.pt`'s base replaced by `BASE`, then `admit` + `DecisionModel.probs`;
-Open-Jev: jev's `compile_request` + `DecisionModel.forward` (the uncached
-path) + `Predictor.predict`, FP32 backbone), prints both side by side and
-exits with status 1 when the largest difference exceeds 5e-3. Launch the
-server with `--fp32`: int8 weights move the probabilities far more than the
-FP32 rounding the check bounds. With `--decision-temperature T`, pass
-`--temperature T` to the script too. kev and jev pin older torch and
-transformers versions, so install them `--no-deps` next to torch,
-transformers, peft and safetensors.
+**Running them on a real checkpoint.** Clone the base and the adapter (with
+Git LFS, see below), start ChatServer with `--decision-adapter`, and call it
+with `DecisionClient` (build both with `lazbuild -B` first, as above).
 
 Kev-0.8B (base `Qwen/Qwen3.5-0.8B-Base` at the revision `head.pt` records):
 
@@ -244,10 +223,8 @@ Kev-0.8B (base `Qwen/Qwen3.5-0.8B-Base` at the revision `head.pt` records):
 git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
 git -C q08b checkout dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
 git clone https://huggingface.co/jaredpalmer/kev-0.8b
-lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
-neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
-pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e
-python3 neural-api/tools/decision_real_check.py q08b/ kev-0.8b/ --server http://127.0.0.1:8080
+neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
 kill %1
 ```
 
@@ -257,25 +234,19 @@ Open-Jev-2B (base `Qwen/Qwen3.5-2B` at the revision `model.json` records):
 git clone https://huggingface.co/Qwen/Qwen3.5-2B q2b
 git -C q2b checkout 15852e8c16360a2fea060d615a32b45270f8a8fc
 git clone https://huggingface.co/ZefanCai/Open-Jev-2B
-neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
-pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
-python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
+neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
 kill %1
 ```
 
 Kev-27B (full weights, fine-tuned from `Qwen/Qwen3.8-27B`; the same
-directory is the model directory, the `--decision-adapter` directory and both
-script arguments). 27B in FP32 needs about 110 GB on each side, so this check
-runs the server on the GPU with its default int8 weights and the Python
-reference in bfloat16 (about 55 GB of host RAM); both move the probabilities
-by more than FP32 rounding, so the threshold is loosened to 5e-2 and the
-printed table is the result to read (the same argmax per question). On a
-GPU that cannot hold the int8 weights, add `--int4`.
+directory is the model directory and the `--decision-adapter` directory). On
+a GPU that cannot hold the int8 weights, add `--int4`.
 
 ```
 git clone https://huggingface.co/jaredpalmer/kev-27b
 neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 8080 &
-python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 120
 kill %1
 ```
 
