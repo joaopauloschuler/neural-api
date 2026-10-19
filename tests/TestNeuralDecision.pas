@@ -485,8 +485,8 @@ begin
   Answers[0] := DecisionAnswerFromProbabilities(dqkChoice, [ParseDouble('0.25'), ParseDouble('0.75')]);
   Answers[1] := DecisionAnswerFromProbabilities(dqkScore, [ParseDouble('0.4'), ParseDouble('0.6')]);
   Answers[2] := DecisionAnswerFromProbabilities(dqkNoul, [ParseDouble('0.123456'), ParseDouble('0.876544')]);
-  Response := DecisionResponseToJSON(Request, Answers, 17, 9);
-  AssertEquals('{"model":"jev-latest","answers":{' +
+  Response := DecisionResponseToJSON(Request, 'q25', Answers, 17, 9);
+  AssertEquals('{"model":"q25","answers":{' +
     '"c":{"type":"choice","choice":"no","probabilities":{"yes":0.25,"no":0.75},' +
       '"confidence":0.5},' +
     '"s":{"type":"score","score":0.6,"legend":{"0":"low","1":{"label":"high"}},' +

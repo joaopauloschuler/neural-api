@@ -13,6 +13,8 @@ Without --request the client sends a built-in support-ticket request (an
 object state, a choice, a score and a noul question). --model sets the
 request's "model" field (default "jev-latest", the alias every ChatServer
 decision scorer accepts); without --model a request file keeps its own.
+The "answered by:" line names the model that answered, plus the requested
+name when the request used another one (such as the jev-latest alias).
 
 Exit status: 0 on HTTP 200, 1 on any other HTTP status (the server's
 "detail" is printed), 2 when the server cannot be reached, 3 on a bad
@@ -334,8 +336,32 @@ begin
     Result := 0;
 end;
 
+// The "model" field of a request body, '' when it has none.
+function RequestModelName(const RequestBody: string): string;
+var
+  Root: TJSONData;
+begin
+  Root := ParseJSONOrNil(RequestBody);
+  try
+    Result := '';
+    if (Root is TJSONObject) and (TJSONObject(Root).Find('model') <> nil) then
+      Result := JSONValueText(TJSONObject(Root).Find('model'));
+  finally
+    Root.Free;
+  end;
+end;
+
+// "answered by: <response model>", plus (requested as "<RequestedModel>") when the two differ.
+function AnsweredByLine(const AnsweredModel, RequestedModel: string): string;
+begin
+  Result := 'answered by: ' + AnsweredModel;
+  if (RequestedModel <> '') and (RequestedModel <> AnsweredModel) then
+    Result := Result + ' (requested as "' + RequestedModel + '")';
+end;
+
 // Human-readable lines for a 200 /v1/systemone body; false when the body has no answers object.
-function FormatDecisionAnswers(const Body: string; Lines: TStrings): boolean;
+function FormatDecisionAnswers(const Body, RequestedModel: string;
+  Lines: TStrings): boolean;
 var
   Root: TJSONData;
   Response, Answers, Answer, Usage: TJSONObject;
@@ -348,7 +374,7 @@ begin
       (TJSONObject(Root).Find('answers') is TJSONObject);
     if not Result then Exit;
     Response := TJSONObject(Root);
-    Lines.Add('model: ' + JSONValueText(Response.Find('model')));
+    Lines.Add(AnsweredByLine(JSONValueText(Response.Find('model')), RequestedModel));
     Answers := TJSONObject(Response.Find('answers'));
     MaxQuestionPos := Answers.Count - 1;
     for QuestionPos := 0 to MaxQuestionPos do
@@ -455,9 +481,10 @@ begin
   end;
 end;
 
-// The lines to print for one HTTP reply and the exit status it maps to.
-function ReplyToLines(StatusCode: integer; const Body: string; PrintRaw: boolean;
-  Lines: TStrings): integer;
+// The lines to print for one HTTP reply and the exit status it maps to;
+// RequestedModel is the request's "model", shown when the answering model differs.
+function ReplyToLines(StatusCode: integer; const Body, RequestedModel: string;
+  PrintRaw: boolean; Lines: TStrings): integer;
 begin
   if StatusCode = 200 then
   begin
@@ -466,7 +493,7 @@ begin
       Lines.Add(Body);
       Exit(ceExitOK);
     end;
-    if FormatDecisionAnswers(Body, Lines) then Exit(ceExitOK);
+    if FormatDecisionAnswers(Body, RequestedModel, Lines) then Exit(ceExitOK);
     Lines.Add('HTTP 200 without an "answers" object:');
     Lines.Add('  ' + Body);
     Exit(ceExitHTTPError);
@@ -532,7 +559,7 @@ end;
 procedure SelfTest();
 const
   csChoiceScoreNoulReply =
-    '{"model":"jev-latest","answers":{' +
+    '{"model":"kev-0.8b","answers":{' +
     '"team":{"type":"choice","choice":"billing","probabilities":' +
       '{"technical":0.15,"billing":0.8,"other":0.05},"confidence":0.7},' +
     '"frustration":{"type":"score","score":1.3,"legend":' +
@@ -640,8 +667,11 @@ begin
       'the endpoint URL from a server root, with or without /v1');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, false, Lines);
+    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, 'jev-latest', false,
+      Lines);
     Check(ExitStatus = ceExitOK, 'a 200 reply exits with 0');
+    Check(HasLine('answered by: kev-0.8b (requested as "jev-latest")'),
+      'the answering model is named, with the alias the request used');
     Check(HasLine('team (choice): billing   confidence 0.7000') and
       (Lines.IndexOf('      technical  0.1500') >= 0) and
       (Lines.IndexOf('    * billing    0.8000') >= 0) and
@@ -657,12 +687,21 @@ begin
       'the usage line follows the answers');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, true, Lines);
+    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, 'jev-latest', true,
+      Lines);
     Check((ExitStatus = ceExitOK) and (Lines.Count = 1) and
       (Lines[0] = csChoiceScoreNoulReply), '--raw prints the body unchanged');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(422, csValidationReply, false, Lines);
+    ReplyToLines(200, csChoiceScoreNoulReply, 'kev-0.8b', false, Lines);
+    Check(HasLine('answered by: kev-0.8b'),
+      'a request naming the answering model prints no "requested as"');
+    Check((RequestModelName(BuildDemoRequest('jev-latest')) = 'jev-latest') and
+      (RequestModelName('{"state":"s"}') = ''),
+      'the requested model is read back from the request body');
+
+    Lines.Clear;
+    ExitStatus := ReplyToLines(422, csValidationReply, 'jev-latest', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('HTTP 422') and
       HasLine('  body.questions.team.criteria: Field required (missing)') and
       HasLine('  body.questions.level.criteria.1: Value error, a score level' +
@@ -670,7 +709,7 @@ begin
       'a 422 detail list prints one loc: msg (type) line per error, exit 1');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(501, csDecisionOnlyReply, false, Lines);
+    ExitStatus := ReplyToLines(501, csDecisionOnlyReply, 'jev-latest', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('HTTP 501') and
       HasLine('  no decision scorer is active on this server, so POST' +
         ' /v1/systemone cannot answer'),
@@ -679,12 +718,12 @@ begin
     Lines.Clear;
     ExitStatus := ReplyToLines(404,
       '{"error":{"message":"no such endpoint","type":"invalid_request_error"}}',
-      false, Lines);
+      'jev-latest', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('  no such endpoint'),
       'an OpenAI-style error body prints its message, exit 1');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(200, '{"model":"x"}', false, Lines);
+    ExitStatus := ReplyToLines(200, '{"model":"x"}', 'x', false, Lines);
     Check(ExitStatus = ceExitHTTPError, 'a 200 reply without answers exits with 1');
 
     Args.CommaText := '--server,http://h:1,--model,m,--retries,5,--raw';
@@ -779,7 +818,8 @@ begin
   end;
 
   Lines := TStringList.Create;
-  ExitStatus := ReplyToLines(StatusCode, ResponseBody, Opt.PrintRaw, Lines);
+  ExitStatus := ReplyToLines(StatusCode, ResponseBody, RequestModelName(Body),
+    Opt.PrintRaw, Lines);
   Write(Lines.Text);
   Lines.Free;
   Halt(ExitStatus);

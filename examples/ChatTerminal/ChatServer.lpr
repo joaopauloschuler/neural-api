@@ -920,8 +920,8 @@ begin
   end;
   try
     DecisionScorer.Score(Request, Answers, InputTokens, OutputTokens);
-    Result := DecisionResponseToJSON(Request, Answers, InputTokens,
-      OutputTokens);
+    Result := DecisionResponseToJSON(Request, DecisionScorer.ModelName, Answers,
+      InputTokens, OutputTokens);
     Code := 200;
   except
     on E: EDecisionUnsupported do
@@ -1801,8 +1801,8 @@ begin
       'systemone with a fixed scorer returns the exact response JSON');
     Reply := Serve(App, 'POST', '/v1/systemone',
       StringReplace(DecisionBody, '"fixed-test"', '"jev-latest"', []), Code);
-    Check((Code = 200) and (Pos('{"model":"jev-latest"', Reply) = 1),
-      'systemone accepts the jev-latest alias and echoes it');
+    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
+      'systemone accepts the jev-latest alias and names the scorer that answered');
     Reply := Serve(App, 'POST', '/v1/systemone',
       StringReplace(DecisionBody, '"fixed-test"', '"other"', []), Code);
     Check((Code = 422) and (Pos('{"detail":"model \"other\"', Reply) = 1),

@@ -169,9 +169,11 @@ function RoundDecisionProbability(X: double): double;
 // Fills the derived fields of an answer from its option probabilities.
 function DecisionAnswerFromProbabilities(Kind: TDecisionQuestionKind;
   const P: TDecisionProbabilities): TDecisionAnswer;
-// {model, answers:{id:{...}}, usage:{input_tokens, output_tokens}}; Answers in question order.
+// {model, answers:{id:{...}}, usage:{...}}; Answers in question order. "model" is
+// AnsweredModel (the scorer that answered), never the request's possibly-alias model.
 function DecisionResponseToJSON(const Request: TDecisionRequest;
-  const Answers: TDecisionAnswers; InputTokens, OutputTokens: integer): string;
+  const AnsweredModel: string; const Answers: TDecisionAnswers;
+  InputTokens, OutputTokens: integer): string;
 
 // Probs (resized to the id count) := softmax over LogitsRow[TokenIds[k]] only.
 procedure RestrictedSoftMax(LogitsRow: TNeuralFloatArrPtr; LogitCount: integer;
@@ -718,7 +720,8 @@ begin
 end;
 
 function DecisionResponseToJSON(const Request: TDecisionRequest;
-  const Answers: TDecisionAnswers; InputTokens, OutputTokens: integer): string;
+  const AnsweredModel: string; const Answers: TDecisionAnswers;
+  InputTokens, OutputTokens: integer): string;
 var
   QuestionPos, MaxQuestionPos, OptionPos, MaxOptionPos: integer;
   Builder: TStringBuilder;
@@ -746,7 +749,7 @@ begin
       ' answers for ' + IntToStr(Length(Request.Questions)) + ' questions');
   Builder := TStringBuilder.Create;
   try
-    Builder.Append('{"model":').Append(DecisionJSONString(Request.Model))
+    Builder.Append('{"model":').Append(DecisionJSONString(AnsweredModel))
       .Append(',"answers":{');
     MaxQuestionPos := High(Request.Questions);
     for QuestionPos := 0 to MaxQuestionPos do

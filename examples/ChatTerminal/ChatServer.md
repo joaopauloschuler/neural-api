@@ -78,8 +78,10 @@ typed questions in, option probabilities out, and no text generated. The
 JSON field names follow TypeSafe's OpenAPI 0.2.0 (`api.typesafe.ai`).
 `model` is the name `GET /v1/models` lists for the decision model (the
 model directory's name, or the adapter directory's name under
-`--decision-adapter`) or the alias `jev-latest`. `state`, `instructions` and
-the option descriptions may each be a string, an object or an array.
+`--decision-adapter`) or `jev-latest`, which is only an alias selecting the
+model this server loaded; the response always names the model that
+answered, never the alias. `state`, `instructions` and the option
+descriptions may each be a string, an object or an array.
 
 ```
 $ curl http://127.0.0.1:8080/v1/systemone -d '{
@@ -92,7 +94,7 @@ $ curl http://127.0.0.1:8080/v1/systemone -d '{
                   "criteria": ["low", "medium", "high"]},
       "angry":   {"type": "noul", "instructions": "Is the customer angry?",
                   "criteria": {"true": "raised voice or threats", "false": "calm"}}}}'
-{"model":"jev-latest","answers":{
+{"model":"Qwen2.5-7B-Instruct","answers":{
   "team":{"type":"choice","choice":"billing","probabilities":{"billing":0.81,"technical":0.19},"confidence":0.62},
   "urgency":{"type":"score","score":1.3,"legend":{"0":"low","1":"medium","2":"high"},
              "probabilities":{"0":0.1,"1":0.5,"2":0.4},"confidence":0.25},
@@ -304,7 +306,7 @@ curl -s -d @decision_examples/nested_state.json http://127.0.0.1:8080/v1/systemo
 ```
 
 ```
-model: jev-latest
+answered by: anyjev_qwen25 (requested as "jev-latest")
 team (choice): billing   confidence 0.2794
     * billing    0.4596
       technical  0.1395
