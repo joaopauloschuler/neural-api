@@ -174,6 +174,8 @@ type
 
   TChatOptions = record
     ModelDir: string;
+    LoRAAdapterDir: string;      // HF PEFT LoRA adapter merged into the
+                                 // weights as they load ('' = none)
     WeightMode: TChatWeightMode; // --fp32 / --int8 (default) / --int4
     LowMemory: boolean;          // true (default) = low-memory forward path
                                  // (drops the concatenated weight cache);
@@ -779,6 +781,7 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
+  Result.LoRAAdapterDir := '';
   Result.WeightMode := cwmInt8; // less RAM, faster; --fp32 and --int4 opt out
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
@@ -2319,8 +2322,12 @@ begin
       NeuralImportInt4FromRows := Opt.WeightMode = cwmInt4;
       NeuralImportInt4LayerCount := 0;
       NeuralImportInt4FromRowsLayerCount := 0;
+      if Opt.LoRAAdapterDir <> '' then
+        Notice('[LoRA adapter ' + Opt.LoRAAdapterDir + ' merged into the' +
+          ' weights as they load]');
       NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+        {pWeightOwner=}nil, Opt.LoRAAdapterDir);
       Int4DirectLayerCount := NeuralImportInt4LayerCount;
       Int4RowLayerCount := NeuralImportInt4FromRowsLayerCount;
       // --prefill-window: the width-N twin borrows NN's weights
@@ -2344,7 +2351,8 @@ begin
         NeuralImportInt4LayerCount := 0;
         NeuralImportInt4FromRowsLayerCount := 0;
         WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
-          {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+          {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+          {pWeightOwner=}nil, Opt.LoRAAdapterDir);
       end;
     finally
       NeuralImportInt4FromQ4_0 := false;

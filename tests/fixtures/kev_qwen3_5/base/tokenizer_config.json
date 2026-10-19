@@ -1,0 +1,63 @@
+{
+ "tokenizer_class": "PreTrainedTokenizerFast",
+ "eos_token": "<|im_end|>",
+ "pad_token": "<|endoftext|>",
+ "added_tokens_decoder": {
+  "0": {
+   "content": "<|endoftext|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "1": {
+   "content": "<|im_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "400": {
+   "content": "<|fim_prefix|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "401": {
+   "content": "<|fim_middle|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "402": {
+   "content": "<|box_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "403": {
+   "content": "<|box_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  "404": {
+   "content": "<|fim_suffix|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ }
+}

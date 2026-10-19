@@ -4560,10 +4560,20 @@ rather than acted on.
         (pissa/olora/corda/loftq/lora_ga). Fixtures `tests/fixtures/
         lora_merge_qwen3_5/` and `lora_merge_qwen3/` by
         `tools/lora_merge_tiny_fixture.py`; FP32 logit diff 3.0e-5 / 2.5e-7.
-  - [ ] D2.3 Kev scorer: row construction, per-question rows from the shared state,
+  - [x] D2.3 Kev scorer: row construction, per-question rows from the shared state,
         pointer head, temperature from `head.pt`, Jev answer mapping, 65536-token state
         limit. Fixture: pico Qwen3.5 + random LoRA + random head through Kev's own
         `kev/model.py` math.
+        Done: `TKevScorer` in `neural/neuraldecisionheads.pas` (Open-Jev joins it);
+        `TChatOptions.LoRAAdapterDir` (no CLI flag yet) goes to the non-borrowing
+        builds. Refuses head.pt `option_isolation`/`special_embeddings` true
+        (`EDecisionHeadError`); `Temperature` overrides the head's (1.0 = raw).
+        Fixture `tests/fixtures/kev_qwen3_5/` by `tools/kev_tiny_fixture.py` (117 KB):
+        kev's own DecisionModel builds the LoRA, `write_meta` writes the head, and
+        `Checkpoint.load` (float64, merged) + `admit` + `probs` is the oracle. Token
+        ids exact, probabilities within 4.1e-6. Open: kev renders an empty list/object
+        description as "name: " (`[] != ""`); the Pascal parser stores '' and writes
+        "name".
   - [ ] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
         the first token where the candidates diverge (check encode(prefix + suffix) =
         encode(prefix) + encode(suffix), else score the full prompt), Linear(d,1) head,
