@@ -462,6 +462,35 @@ type
 //     so string values keep their raw UTF-8 bytes.
 function HFDecodeUnicodeEscapes(const S: string): string;
 function HFParseJSONRaw(const S: string): TJSONData;
+// Reads the 4 hex digits of a JSON \uXXXX escape at HexPos (1-based, just past
+// the 'u'), pairing a high surrogate with a directly following \uDC00-\uDFFF.
+// True: CP and ByteCount (4 or 10) are set. False: ByteCount is the offset of
+// the first missing or non-hex digit.
+function HFReadUnicodeEscape(const S: string; HexPos: integer;
+  out CP: cardinal; out ByteCount: integer): boolean;
+
+// Decodes the UTF-8 code point at byte Position (1-based) and advances past
+// it; invalid bytes come back as-is. CodePointCount uses the same rule.
+function NextCodePoint(const S: string; var Position: integer): cardinal;
+function CodePointCount(const S: string): integer;
+function CodePointToUTF8(CP: cardinal): string;
+// Writes CP as UTF-8 at P[OutPos] and advances OutPos (up to 4 bytes); the
+// same encoding as CodePointToUTF8 without its string allocation.
+procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
+  CP: cardinal); inline;
+
+// Unicode classes and case maps shared with neuralg2p. IsLetterCP is exact
+// \p{L}; the case maps cover ASCII, Latin-1 and Latin Extended-A only.
+function IsWhitespaceCP(CP: cardinal): boolean;
+function IsLetterCP(CP: cardinal): boolean;
+function LowercaseCP(CP: cardinal): cardinal;
+function UppercaseCP(CP: cardinal): cardinal;
+// Unaccented base letter over Latin-1 and Latin Extended-A; 0 = no canonical
+// decomposition (ł, ø, æ, ...), 1 = a bare combining mark (drop it).
+function StripAccentBaseCP(CP: cardinal): cardinal;
+// NFD/NFC (Compat=False) or NFKD/NFKC (Compat=True) of a UTF-8 string.
+function UnicodeNormalize(const S: string; Compose: boolean;
+  Compat: boolean = false): string;
 
 // fpjson's TJSONObject stores member names in a TFPHashObjectList whose
 // keys are SHORTSTRINGS: every object key is silently truncated to its
@@ -486,7 +515,7 @@ function HFUnshieldJSONKey(const Key: string;
 implementation
 
 uses
-  jsonparser, Math, StrUtils;
+  jsonparser, Math, StrUtils, neuralminhash;
 
 const
   csMergeSep = #1;
@@ -598,11 +627,8 @@ begin
       Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
 end;
 
-// Writes CP as UTF-8 into a preallocated buffer at the 0-based OutPos and
-// advances it. Same encoding as CodePointToUTF8, without that function's
-// per-codepoint string allocation.
 procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
-  CP: cardinal); inline;
+  CP: cardinal);
 begin
   if CP < $80 then
   begin
@@ -669,27 +695,42 @@ begin
   Result := 0;
 end;
 
-// One-step canonical decomposition of CP. Returns True and fills A (and B,
-// or 0 for a singleton) when CP has a tabled canonical decomposition.
-function NFCDecomposeStep(CP: cardinal; out A, B: cardinal): boolean;
+type
+  // One row of a 3-column decomposition table: the key CP, then two values.
+  TNFCDecompRow = array[0..2] of cardinal;
+
+// Binary search of a decomposition table sorted by its key column: the row
+// index of CP, or -1.
+function FindNFCDecompRow(const Table: array of TNFCDecompRow;
+  CP: cardinal): integer;
 var
   Lo, Hi, Mid: integer;
 begin
   Lo := 0;
-  Hi := cNFCDecompCount - 1;
+  Hi := High(Table);
   while Lo <= Hi do
   begin
     Mid := (Lo + Hi) div 2;
-    if cNFCDecomp[Mid][0] = CP then
-    begin
-      A := cNFCDecomp[Mid][1];
-      B := cNFCDecomp[Mid][2];
-      Exit(True);
-    end
-    else if cNFCDecomp[Mid][0] < CP then Lo := Mid + 1
+    if Table[Mid][0] = CP then Exit(Mid)
+    else if Table[Mid][0] < CP then Lo := Mid + 1
     else Hi := Mid - 1;
   end;
-  Result := False;
+  Result := -1;
+end;
+
+// One-step canonical decomposition of CP. Returns True and fills A (and B,
+// or 0 for a singleton) when CP has a tabled canonical decomposition.
+function NFCDecomposeStep(CP: cardinal; out A, B: cardinal): boolean;
+var
+  Row: integer;
+begin
+  Row := FindNFCDecompRow(cNFCDecomp, CP);
+  Result := Row >= 0;
+  if Result then
+  begin
+    A := cNFCDecomp[Row][1];
+    B := cNFCDecomp[Row][2];
+  end;
 end;
 
 // Canonical composition of a starter A with following char B. Returns the
@@ -739,23 +780,15 @@ end;
 // tabled compatibility decomposition. Binary search by CP.
 function NFKCDecomposeStep(CP: cardinal; out Offset, Count: integer): boolean;
 var
-  Lo, Hi, Mid: integer;
+  Row: integer;
 begin
-  Lo := 0;
-  Hi := cNFKCDecompCount - 1;
-  while Lo <= Hi do
+  Row := FindNFCDecompRow(cNFKCDecompIdx, CP);
+  Result := Row >= 0;
+  if Result then
   begin
-    Mid := (Lo + Hi) div 2;
-    if cNFKCDecompIdx[Mid][0] = CP then
-    begin
-      Offset := integer(cNFKCDecompIdx[Mid][1]);
-      Count := integer(cNFKCDecompIdx[Mid][2]);
-      Exit(True);
-    end
-    else if cNFKCDecompIdx[Mid][0] < CP then Lo := Mid + 1
-    else Hi := Mid - 1;
+    Offset := integer(cNFKCDecompIdx[Row][1]);
+    Count := integer(cNFKCDecompIdx[Row][2]);
   end;
-  Result := False;
 end;
 
 // Recursively decompose CP, appending resulting codepoints to Buf (1-based
@@ -1133,9 +1166,66 @@ begin
   if (CP >= $179) and (CP <= $17E) and ((CP and 1) = 1) then Exit(CP + 1);
 end;
 
+// Inverse of LowercaseCP over the same blocks (ASCII, Latin-1, Latin
+// Extended-A); every other code point comes back unchanged.
+function UppercaseCP(CP: cardinal): cardinal;
+begin
+  Result := CP;
+  if (CP >= Ord('a')) and (CP <= Ord('z')) then Exit(CP - 32);
+  if (CP >= $E0) and (CP <= $FE) and (CP <> $F7) then Exit(CP - 32);
+  if CP = $FF then Exit($178);
+  if (CP >= $101) and (CP <= $17E) and (LowercaseCP(CP - 1) = CP) then
+    Exit(CP - 1);
+end;
+
 { ---------------------------------------------------------------- }
 { fpjson portability helpers                                        }
 { ---------------------------------------------------------------- }
+
+// The 4 hex digits at HexPos; on failure BadOffset is the offset of the first
+// missing or non-hex digit.
+function ReadHex4(const S: string; HexPos: integer; out Value: cardinal;
+  out BadOffset: integer): boolean;
+var
+  DigitOffset, DigitPos, TextLen: integer;
+  Digit: char;
+begin
+  Value := 0;
+  TextLen := Length(S);
+  for DigitOffset := 0 to 3 do
+  begin
+    DigitPos := HexPos + DigitOffset;
+    BadOffset := DigitOffset;
+    if DigitPos > TextLen then Exit(false);
+    Digit := S[DigitPos];
+    case Digit of
+      '0'..'9': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('0'));
+      'a'..'f': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('a') + 10);
+      'A'..'F': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('A') + 10);
+      else Exit(false);
+    end;
+  end;
+  Result := true;
+end;
+
+function HFReadUnicodeEscape(const S: string; HexPos: integer;
+  out CP: cardinal; out ByteCount: integer): boolean;
+var
+  LowCP: cardinal;
+  LowBadOffset: integer;
+begin
+  Result := ReadHex4(S, HexPos, CP, ByteCount);
+  if not Result then exit;
+  ByteCount := 4;
+  if (CP >= $D800) and (CP <= $DBFF) and (HexPos + 5 <= Length(S)) and
+    (S[HexPos + 4] = '\') and (S[HexPos + 5] = 'u') and
+    ReadHex4(S, HexPos + 6, LowCP, LowBadOffset) and (LowCP >= $DC00) and
+    (LowCP <= $DFFF) then
+  begin
+    CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
+    ByteCount := 10;
+  end;
+end;
 
 // fpjson converts \uXXXX escapes through the widestring manager; without
 // one installed (plain FPC programs that don't use LazUTF8/cwstring) every
@@ -1145,29 +1235,8 @@ end;
 // backslash) is never decoded.
 function DecodeUnicodeEscapes(const S: string): string;
 var
-  Position, Total: integer;
-  CP, LowCP: cardinal;
-
-  function HexAt(StartPos: integer; out Value: cardinal): boolean;
-  var
-    Cnt, EndPos: integer;
-    Digit: char;
-  begin
-    Value := 0;
-    Result := StartPos + 3 <= Length(S);
-    if not Result then exit;
-    EndPos := StartPos + 3;
-    for Cnt := StartPos to EndPos do
-    begin
-      Digit := S[Cnt];
-      case Digit of
-        '0'..'9': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('0'));
-        'a'..'f': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('a') + 10);
-        'A'..'F': Value := (Value shl 4) or cardinal(Ord(Digit) - Ord('A') + 10);
-        else Exit(false);
-      end;
-    end;
-  end;
+  Position, Total, EscapeLen: integer;
+  CP: cardinal;
 
 var
   OutPos: integer;
@@ -1196,17 +1265,10 @@ begin
   begin
     if (S[Position] = '\') and (Position < Total) then
     begin
-      if (S[Position + 1] = 'u') and HexAt(Position + 2, CP) then
+      if (S[Position + 1] = 'u') and
+        HFReadUnicodeEscape(S, Position + 2, CP, EscapeLen) then
       begin
-        Inc(Position, 6);
-        if (CP >= $D800) and (CP <= $DBFF) and (Position + 1 <= Total) and
-          (S[Position] = '\') and (S[Position + 1] = 'u') and
-          HexAt(Position + 2, LowCP) and (LowCP >= $DC00) and
-          (LowCP <= $DFFF) then
-        begin // surrogate pair
-          CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
-          Inc(Position, 6);
-        end;
+        Inc(Position, 2 + EscapeLen);
         // Encodes straight into the buffer: no intermediate string fragment.
         HFWriteCodePointUTF8(PBuf, OutPos, CP);
       end
@@ -1593,33 +1655,12 @@ begin
   else Result := -1;
 end;
 
-// FNV-1a over a stored 'left'#1'right' merge key.
-function HFMergeKeyHash(P: PAnsiChar; Len: integer): cardinal;
-var
-  Cnt: integer;
-begin
-  {$PUSH}{$Q-}{$R-}
-  Result := 2166136261;
-  for Cnt := 0 to Len - 1 do
-    Result := (Result xor cardinal(byte(P[Cnt]))) * 16777619;
-  {$POP}
-end;
-
-// The same FNV-1a over the two symbols with the separator between them: the
-// hash of the concatenated key, computed WITHOUT concatenating.
+// FNV1a32 of the stored key A + csMergeSep + B, computed without concatenating.
 function HFMergePairHash(PA: PAnsiChar; LenA: integer;
   PB: PAnsiChar; LenB: integer): cardinal;
-var
-  Cnt: integer;
 begin
-  {$PUSH}{$Q-}{$R-}
-  Result := 2166136261;
-  for Cnt := 0 to LenA - 1 do
-    Result := (Result xor cardinal(byte(PA[Cnt]))) * 16777619;
-  Result := (Result xor cardinal(byte(csMergeSep))) * 16777619;
-  for Cnt := 0 to LenB - 1 do
-    Result := (Result xor cardinal(byte(PB[Cnt]))) * 16777619;
-  {$POP}
+  Result := FNV1a32Continue(FNV1a32Step(FNV1a32(PA, LenA), byte(csMergeSep)),
+    PB, LenB);
 end;
 
 // Indexes the finished merge table for pair lookup. Runs once per load, from
@@ -1647,7 +1688,7 @@ begin
     FMergeEntry[Cnt].Key := PAnsiChar(Key);
     FMergeEntry[Cnt].KeyLen := Length(Key);
     FMergeEntry[Cnt].Rank := integer(PtrInt(FMerges.Objects[Cnt]));
-    Slot := integer(HFMergeKeyHash(PAnsiChar(Key), Length(Key))) and
+    Slot := integer(FNV1a32(PAnsiChar(Key), Length(Key))) and
       FMergeHashMask;
     while FMergeHash[Slot] <> 0 do Slot := (Slot + 1) and FMergeHashMask;
     FMergeHash[Slot] := Cnt + 1;
@@ -3085,14 +3126,109 @@ begin
     end;
 end;
 
+// Code points of a pre-tokenizer segment, and the 1-based byte offset where
+// each starts (plus a sentinel one past the last byte).
+type
+  TPieceCodePoints = array of cardinal;
+  TPieceByteOffsets = array of integer;
+
+// Decodes Segment into CPs and CPByte; returns the code point count.
+function DecodePieceCodePoints(const Segment: string;
+  var CPs: TPieceCodePoints; var CPByte: TPieceByteOffsets): integer;
+var
+  Position, SegLen: integer;
+begin
+  SegLen := Length(Segment);
+  SetLength(CPs, SegLen);
+  SetLength(CPByte, SegLen + 1);
+  Result := 0;
+  Position := 1;
+  while Position <= SegLen do
+  begin
+    CPByte[Result] := Position;
+    CPs[Result] := NextCodePoint(Segment, Position);
+    Inc(Result);
+  end;
+  CPByte[Result] := Position; // sentinel: one past the last byte
+  SetLength(CPs, Result);
+  SetLength(CPByte, Result + 1);
+end;
+
+// [\r\n]
+function IsNewlineCP(CP: cardinal): boolean; inline;
+begin
+  Result := (CP = 10) or (CP = 13);
+end;
+
+// 's|'t|'re|'ve|'m|'ll|'d at StartIdx (the (?i:...) form when IgnoreCase):
+// the match length, or 0.
+function MatchContractionAt(const CPs: TPieceCodePoints; StartIdx: integer;
+  IgnoreCase: boolean): integer;
+var
+  C1, C2: cardinal;
+  MaxCPPos: integer;
+begin
+  Result := 0;
+  MaxCPPos := High(CPs);
+  if StartIdx > MaxCPPos then Exit;
+  if CPs[StartIdx] <> Ord('''') then Exit;
+  if StartIdx + 1 > MaxCPPos then Exit;
+  C1 := CPs[StartIdx + 1];
+  if IgnoreCase and (C1 >= Ord('A')) and (C1 <= Ord('Z')) then Inc(C1, 32);
+  if (C1 = Ord('s')) or (C1 = Ord('t')) or (C1 = Ord('m')) or
+    (C1 = Ord('d')) then Exit(2);
+  if StartIdx + 2 > MaxCPPos then Exit;
+  C2 := CPs[StartIdx + 2];
+  if IgnoreCase and (C2 >= Ord('A')) and (C2 <= Ord('Z')) then Inc(C2, 32);
+  if ((C1 = Ord('r')) and (C2 = Ord('e'))) or
+    ((C1 = Ord('v')) and (C2 = Ord('e'))) or
+    ((C1 = Ord('l')) and (C2 = Ord('l'))) then Exit(3);
+end;
+
+// \p{N}{1,MaxCount} at the number Idx: the last index of the run.
+function NumberRunEnd(const CPs: TPieceCodePoints; Idx, Total,
+  MaxCount: integer): integer;
+var
+  DigitCnt: integer;
+begin
+  Result := Idx;
+  DigitCnt := 1;
+  while (Result + 1 < Total) and (DigitCnt < MaxCount) and
+    IsNumberCP(CPs[Result + 1]) do
+  begin
+    Inc(Result);
+    Inc(DigitCnt);
+  end;
+end;
+
+// \s*[\r\n]+ | \s+(?!\S) | \s+ at the whitespace Idx: the last index of the
+// piece. HasNewlineAlt=false drops \s*[\r\n]+ (the GPT-2 pattern).
+function WhitespacePieceEnd(const CPs: TPieceCodePoints; Idx, Total: integer;
+  HasNewlineAlt: boolean): integer;
+var
+  RunEnd, Position: integer;
+begin
+  RunEnd := Idx;
+  while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
+    Inc(RunEnd);
+  // \s*[\r\n]+ : up to (and including) the LAST newline in the run
+  if HasNewlineAlt then
+    for Position := RunEnd downto Idx do
+      if IsNewlineCP(CPs[Position]) then Exit(Position);
+  // \s+(?!\S) : a run before non-space leaves its last char to attach to
+  // what follows; a trailing run, or \s+ on a single char, takes it all
+  if (RunEnd + 1 < Total) and (RunEnd > Idx) then Result := RunEnd - 1
+  else Result := RunEnd;
+end;
+
 // Splits a byte-level segment with the GPT-2 pre-tokenization regex:
 // 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 procedure TNeuralHFTokenizer.ByteLevelPieces(const Segment: string;
   Pieces: TStringList);
 var
-  CPs: array of cardinal;
-  CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd, SegLen: integer;
+  CPs: TPieceCodePoints;
+  CPByte: TPieceByteOffsets;
+  Total, Idx, RunEnd: integer;
 
   // #12: slice the byte range in one Copy instead of concatenating per-codepoint
   // substrings (which is O(n^2) across a run).
@@ -3102,48 +3238,14 @@ var
       CPByte[EndIdx + 1] - CPByte[StartIdx]);
   end;
 
-  function MatchContraction(StartIdx: integer): integer; // length or 0
-  begin
-    Result := 0;
-    if CPs[StartIdx] <> Ord('''') then Exit;
-    if StartIdx + 1 <= High(CPs) then
-    begin
-      if (CPs[StartIdx + 1] = Ord('s')) or (CPs[StartIdx + 1] = Ord('t')) or
-        (CPs[StartIdx + 1] = Ord('m')) or (CPs[StartIdx + 1] = Ord('d')) then
-        Exit(2);
-      if StartIdx + 2 <= High(CPs) then
-      begin
-        if ((CPs[StartIdx + 1] = Ord('r')) and (CPs[StartIdx + 2] = Ord('e')))
-          or ((CPs[StartIdx + 1] = Ord('v')) and (CPs[StartIdx + 2] = Ord('e')))
-          or ((CPs[StartIdx + 1] = Ord('l')) and (CPs[StartIdx + 2] = Ord('l')))
-        then Exit(3);
-      end;
-    end;
-  end;
-
 begin
-  // decode UTF-8 into codepoint arrays
-  SegLen := Length(Segment);
-  SetLength(CPs, SegLen);
-  SetLength(CPByte, SegLen + 1);
-  Total := 0;
-  Position := 1;
-  while Position <= SegLen do
-  begin
-    RunStart := Position;
-    CPByte[Total] := RunStart;
-    CPs[Total] := NextCodePoint(Segment, Position);
-    Inc(Total);
-  end;
-  CPByte[Total] := Position; // sentinel: one past the last byte
-  SetLength(CPs, Total);
-  SetLength(CPByte, Total + 1);
+  Total := DecodePieceCodePoints(Segment, CPs, CPByte);
 
   Idx := 0;
   while Idx < Total do
   begin
     // contractions
-    RunEnd := MatchContraction(Idx);
+    RunEnd := MatchContractionAt(CPs, Idx, false);
     if RunEnd > 0 then
     begin
       Pieces.Add(Collect(Idx, Idx + RunEnd - 1));
@@ -3202,21 +3304,9 @@ begin
     end
     else
     begin // whitespace run: \s+(?!\S) | \s+
-      RunEnd := Idx;
-      while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
-        Inc(RunEnd);
-      if (RunEnd + 1 < Total) and (RunEnd > Idx) then
-      begin
-        // leave the last whitespace char to (possibly) attach to the
-        // next piece via the " ?" prefixes
-        Pieces.Add(Collect(Idx, RunEnd - 1));
-        Idx := RunEnd;
-      end
-      else
-      begin
-        Pieces.Add(Collect(Idx, RunEnd));
-        Idx := RunEnd + 1;
-      end;
+      RunEnd := WhitespacePieceEnd(CPs, Idx, Total, false);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
     end;
   end;
 end;
@@ -3403,10 +3493,9 @@ end;
 procedure TNeuralHFTokenizer.SplitCl100kPieces(const Segment: string;
   Pieces: TStringList);
 var
-  CPs: array of cardinal;
-  CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt, DigitsMax,
-    SegLen: integer;
+  CPs: TPieceCodePoints;
+  CPByte: TPieceByteOffsets;
+  Total, Idx, RunEnd, DigitsMax: integer;
   MarksJoin, IdxIsRun: boolean;
 
   // the letter-run class: \p{L}, or [\p{L}\p{M}] in marks-join mode
@@ -3428,60 +3517,16 @@ var
       CPByte[EndIdx + 1] - CPByte[StartIdx]);
   end;
 
-  function LowerAscii(CP: cardinal): cardinal;
-  begin
-    if (CP >= Ord('A')) and (CP <= Ord('Z')) then Result := CP + 32
-    else Result := CP;
-  end;
-
-  // (?i:'s|'t|'re|'ve|'m|'ll|'d) -- returns the match length or 0.
-  function MatchContractionCI(StartIdx: integer): integer;
-  var
-    C1, C2: cardinal;
-  begin
-    Result := 0;
-    if CPs[StartIdx] <> Ord('''') then Exit;
-    if StartIdx + 1 > High(CPs) then Exit;
-    C1 := LowerAscii(CPs[StartIdx + 1]);
-    if (C1 = Ord('s')) or (C1 = Ord('t')) or (C1 = Ord('m')) or
-      (C1 = Ord('d')) then Exit(2);
-    if StartIdx + 2 > High(CPs) then Exit;
-    C2 := LowerAscii(CPs[StartIdx + 2]);
-    if ((C1 = Ord('r')) and (C2 = Ord('e'))) or
-      ((C1 = Ord('v')) and (C2 = Ord('e'))) or
-      ((C1 = Ord('l')) and (C2 = Ord('l'))) then Exit(3);
-  end;
-
-  function IsNewlineCP(CP: cardinal): boolean;
-  begin
-    Result := (CP = 10) or (CP = 13);
-  end;
-
 begin
   MarksJoin := FSplitMarksJoin; // hoisted field read (hot loop)
   DigitsMax := FSplitDigitsMax; // #19: hoisted field read (inner digit loop)
-  // decode UTF-8 into codepoint arrays
-  SegLen := Length(Segment);
-  SetLength(CPs, SegLen);
-  SetLength(CPByte, SegLen + 1);
-  Total := 0;
-  Position := 1;
-  while Position <= SegLen do
-  begin
-    RunStart := Position;
-    CPByte[Total] := RunStart;
-    CPs[Total] := NextCodePoint(Segment, Position);
-    Inc(Total);
-  end;
-  CPByte[Total] := Position; // sentinel: one past the last byte
-  SetLength(CPs, Total);
-  SetLength(CPByte, Total + 1);
+  Total := DecodePieceCodePoints(Segment, CPs, CPByte);
 
   Idx := 0;
   while Idx < Total do
   begin
     // 1. case-insensitive contractions
-    RunEnd := MatchContractionCI(Idx);
+    RunEnd := MatchContractionAt(CPs, Idx, true);
     if RunEnd > 0 then
     begin
       Pieces.Add(Collect(Idx, Idx + RunEnd - 1));
@@ -3506,14 +3551,7 @@ begin
     // 3. \p{N}{1,DigitsMax}
     else if IsNumberCP(CPs[Idx]) then
     begin
-      RunEnd := Idx;
-      DigitCnt := 1;
-      while (RunEnd + 1 < Total) and (DigitCnt < DigitsMax) and
-        IsNumberCP(CPs[RunEnd + 1]) do
-      begin
-        Inc(RunEnd);
-        Inc(DigitCnt);
-      end;
+      RunEnd := NumberRunEnd(CPs, Idx, Total, DigitsMax);
       Pieces.Add(Collect(Idx, RunEnd));
       Idx := RunEnd + 1;
     end
@@ -3531,34 +3569,10 @@ begin
       Idx := RunEnd + 1;
     end
     else
-    begin // whitespace alternatives over the run [Idx..RunEnd]
-      RunEnd := Idx;
-      while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
-        Inc(RunEnd);
-      // 5. \s*[\r\n]+ : up to (and including) the LAST newline in the run
-      LastNL := -1;
-      for Position := Idx to RunEnd do
-        if IsNewlineCP(CPs[Position]) then LastNL := Position;
-      if LastNL >= 0 then
-      begin
-        Pieces.Add(Collect(Idx, LastNL));
-        Idx := LastNL + 1;
-      end
-      else if RunEnd + 1 >= Total then
-      begin // 6. \s+(?!\S) : trailing whitespace takes the whole run
-        Pieces.Add(Collect(Idx, RunEnd));
-        Idx := RunEnd + 1;
-      end
-      else if RunEnd > Idx then
-      begin // 6. \s+(?!\S) : leave the last char to attach to what follows
-        Pieces.Add(Collect(Idx, RunEnd - 1));
-        Idx := RunEnd;
-      end
-      else
-      begin // 7. \s+ : a single whitespace char before non-space
-        Pieces.Add(Collect(Idx, Idx));
-        Inc(Idx);
-      end;
+    begin // 5-7. \s*[\r\n]+ | \s+(?!\S) | \s+
+      RunEnd := WhitespacePieceEnd(CPs, Idx, Total, true);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
     end;
   end;
 end;
@@ -3585,20 +3599,15 @@ end;
 procedure TNeuralHFTokenizer.SplitDeepSeekPieces(const Segment: string;
   Pieces: TStringList);
 var
-  CPs: array of cardinal;
-  CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd, SegLen: integer;
+  CPs: TPieceCodePoints;
+  CPByte: TPieceByteOffsets;
+  Total, Idx, RunEnd: integer;
 
   // #12: slice the byte range in one Copy instead of per-codepoint concat.
   function Collect(StartIdx, EndIdx: integer): string;
   begin
     Result := Copy(Segment, CPByte[StartIdx],
       CPByte[EndIdx + 1] - CPByte[StartIdx]);
-  end;
-
-  function IsNL(CP: cardinal): boolean;
-  begin
-    Result := (CP = 10) or (CP = 13);
   end;
 
   // DeepSeek CJK class: U+0800..U+9FA5 and Hangul U+AC00..U+D7FF.
@@ -3617,39 +3626,24 @@ var
   // \s but NOT CR/LF (those are isolated by the [\r\n] stage first).
   function IsSpace(CP: cardinal): boolean;
   begin
-    Result := IsWhitespaceCP(CP) and (not IsNL(CP));
+    Result := IsWhitespaceCP(CP) and (not IsNewlineCP(CP));
   end;
 
   // punct class: everything that is not space, letter, digit, CJK, newline.
   function IsPunct(CP: cardinal): boolean;
   begin
-    Result := (not IsSpace(CP)) and (not IsNL(CP)) and
+    Result := (not IsSpace(CP)) and (not IsNewlineCP(CP)) and
       (not IsDSLetter(CP)) and (not IsNumberCP(CP)) and (not IsCJK(CP));
   end;
 
 begin
-  // decode UTF-8 into codepoint arrays
-  SegLen := Length(Segment);
-  SetLength(CPs, SegLen);
-  SetLength(CPByte, SegLen + 1);
-  Total := 0;
-  Position := 1;
-  while Position <= SegLen do
-  begin
-    RunStart := Position;
-    CPByte[Total] := RunStart;
-    CPs[Total] := NextCodePoint(Segment, Position);
-    Inc(Total);
-  end;
-  CPByte[Total] := Position; // sentinel: one past the last byte
-  SetLength(CPs, Total);
-  SetLength(CPByte, Total + 1);
+  Total := DecodePieceCodePoints(Segment, CPs, CPByte);
 
   Idx := 0;
   while Idx < Total do
   begin
     // 1. [\r\n] : each CR / LF isolated
-    if IsNL(CPs[Idx]) then
+    if IsNewlineCP(CPs[Idx]) then
     begin
       Pieces.Add(Collect(Idx, Idx));
       Inc(Idx);
@@ -3733,21 +3727,15 @@ end;
 procedure TNeuralHFTokenizer.SplitO200kPieces(const Segment: string;
   Pieces: TStringList);
 var
-  CPs: array of cardinal;
-  CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunEnd, LastNL, SegLen: integer;
+  CPs: TPieceCodePoints;
+  CPByte: TPieceByteOffsets;
+  Total, Idx, RunEnd: integer;
 
   // #12: slice the byte range in one Copy instead of per-codepoint concat.
   function Collect(StartIdx, EndIdx: integer): string;
   begin
     Result := Copy(Segment, CPByte[StartIdx],
       CPByte[EndIdx + 1] - CPByte[StartIdx]);
-  end;
-
-  function LowerAscii(CP: cardinal): cardinal;
-  begin
-    if (CP >= Ord('A')) and (CP <= Ord('Z')) then Result := CP + 32
-    else Result := CP;
   end;
 
   // \p{Lu}\p{Lt}\p{Lm} approximated by ASCII A-Z.
@@ -3760,30 +3748,6 @@ var
   function IsLowerLetterCP(CP: cardinal): boolean;
   begin
     Result := IsLetterCP(CP) and (not IsUpperLetterCP(CP));
-  end;
-
-  function IsNewlineCP(CP: cardinal): boolean;
-  begin
-    Result := (CP = 10) or (CP = 13);
-  end;
-
-  // (?i:'s|'t|'re|'ve|'m|'ll|'d) at StartIdx -- match length or 0.
-  function MatchContractionCI(StartIdx: integer): integer;
-  var
-    C1, C2: cardinal;
-  begin
-    Result := 0;
-    if StartIdx > High(CPs) then Exit;
-    if CPs[StartIdx] <> Ord('''') then Exit;
-    if StartIdx + 1 > High(CPs) then Exit;
-    C1 := LowerAscii(CPs[StartIdx + 1]);
-    if (C1 = Ord('s')) or (C1 = Ord('t')) or (C1 = Ord('m')) or
-      (C1 = Ord('d')) then Exit(2);
-    if StartIdx + 2 > High(CPs) then Exit;
-    C2 := LowerAscii(CPs[StartIdx + 2]);
-    if ((C1 = Ord('r')) and (C2 = Ord('e'))) or
-      ((C1 = Ord('v')) and (C2 = Ord('e'))) or
-      ((C1 = Ord('l')) and (C2 = Ord('l'))) then Exit(3);
   end;
 
   // Tries the two letter alternations starting at Idx. Returns the index of
@@ -3825,7 +3789,7 @@ var
       // alt 1 matched (had at least one lowercase letter). End = LowerEnd
       // (+ optional contraction).
       Result := LowerEnd;
-      Inc(Result, MatchContractionCI(Result + 1));
+      Inc(Result, MatchContractionAt(CPs, Result + 1, true));
       Exit;
     end;
     // alt 2: [\p{Lu}...]+[\p{Ll}...]* -- needs >=1 uppercase letter (no
@@ -3834,7 +3798,7 @@ var
     if UpperEnd >= Idx then
     begin
       Result := UpperEnd;
-      Inc(Result, MatchContractionCI(Result + 1));
+      Inc(Result, MatchContractionAt(CPs, Result + 1, true));
       Exit;
     end;
     // Neither letter alternation produced a letter. If the only thing
@@ -3844,22 +3808,7 @@ var
   end;
 
 begin
-  // decode UTF-8 into codepoint arrays
-  SegLen := Length(Segment);
-  SetLength(CPs, SegLen);
-  SetLength(CPByte, SegLen + 1);
-  Total := 0;
-  Position := 1;
-  while Position <= SegLen do
-  begin
-    LastNL := Position;
-    CPByte[Total] := LastNL;
-    CPs[Total] := NextCodePoint(Segment, Position);
-    Inc(Total);
-  end;
-  CPByte[Total] := Position; // sentinel: one past the last byte
-  SetLength(CPs, Total);
-  SetLength(CPByte, Total + 1);
+  Total := DecodePieceCodePoints(Segment, CPs, CPByte);
 
   Idx := 0;
   while Idx < Total do
@@ -3875,10 +3824,7 @@ begin
     // 3. \p{N}{1,3}
     if IsNumberCP(CPs[Idx]) then
     begin
-      RunEnd := Idx;
-      while (RunEnd + 1 < Total) and (RunEnd - Idx + 1 < 3) and
-        IsNumberCP(CPs[RunEnd + 1]) do
-        Inc(RunEnd);
+      RunEnd := NumberRunEnd(CPs, Idx, Total, 3);
       Pieces.Add(Collect(Idx, RunEnd));
       Idx := RunEnd + 1;
     end
@@ -3896,34 +3842,10 @@ begin
       Idx := RunEnd + 1;
     end
     else
-    begin // whitespace alternatives over the run [Idx..RunEnd]
-      RunEnd := Idx;
-      while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
-        Inc(RunEnd);
-      // 5. \s*[\r\n]+ : up to (and including) the LAST newline in the run
-      LastNL := -1;
-      for Position := Idx to RunEnd do
-        if IsNewlineCP(CPs[Position]) then LastNL := Position;
-      if LastNL >= 0 then
-      begin
-        Pieces.Add(Collect(Idx, LastNL));
-        Idx := LastNL + 1;
-      end
-      else if RunEnd + 1 >= Total then
-      begin // 6. \s+(?!\S) : trailing whitespace takes the whole run
-        Pieces.Add(Collect(Idx, RunEnd));
-        Idx := RunEnd + 1;
-      end
-      else if RunEnd > Idx then
-      begin // 6. \s+(?!\S) : leave the last char to attach to what follows
-        Pieces.Add(Collect(Idx, RunEnd - 1));
-        Idx := RunEnd;
-      end
-      else
-      begin // 7. \s+ : a single whitespace char before non-space
-        Pieces.Add(Collect(Idx, Idx));
-        Inc(Idx);
-      end;
+    begin // 5-7. \s*[\r\n]+ | \s+(?!\S) | \s+
+      RunEnd := WhitespacePieceEnd(CPs, Idx, Total, true);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
     end;
   end;
 end;

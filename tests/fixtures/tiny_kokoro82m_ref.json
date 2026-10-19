@@ -1,0 +1,564 @@
+{
+ "phonemes": "hˈO.",
+ "input_ids": [
+  0,
+  50,
+  156,
+  31,
+  4,
+  0
+ ],
+ "voice": "af_heart",
+ "voice_row": 3,
+ "pred_dur": [
+  1,
+  1,
+  2,
+  2,
+  2,
+  2
+ ],
+ "sample_rate": 24000,
+ "noise": "zero",
+ "speed": 1.0,
+ "style_dim": 8,
+ "seed": 4,
+ "voiced_fraction": 0.6000000238418579,
+ "decoder_width": 8,
+ "asr_res_width": 4,
+ "kokoro_version": "0.9.4",
+ "torch_version": "2.14.0+cpu",
+ "stages": [
+  {
+   "name": "input_ids",
+   "shape": [
+    1,
+    6
+   ]
+  },
+  {
+   "name": "ref_s",
+   "shape": [
+    1,
+    16
+   ]
+  },
+  {
+   "name": "bert_embeddings",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "bert_hidden_in",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "bert_layer0",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "bert_layer1",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "bert_layer2",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "bert",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "d_en",
+   "shape": [
+    1,
+    8,
+    6
+   ]
+  },
+  {
+   "name": "dur_enc_adanorm0",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "dur_enc_adanorm1",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "dur_enc_adanorm2",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "d",
+   "shape": [
+    1,
+    6,
+    16
+   ]
+  },
+  {
+   "name": "duration_lstm",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "duration_logits",
+   "shape": [
+    1,
+    6,
+    3
+   ]
+  },
+  {
+   "name": "duration",
+   "shape": [
+    1,
+    6
+   ]
+  },
+  {
+   "name": "pred_dur",
+   "shape": [
+    6
+   ]
+  },
+  {
+   "name": "en",
+   "shape": [
+    1,
+    16,
+    10
+   ]
+  },
+  {
+   "name": "f0n_shared",
+   "shape": [
+    1,
+    10,
+    8
+   ]
+  },
+  {
+   "name": "F0_block0",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "F0_block1",
+   "shape": [
+    1,
+    4,
+    20
+   ]
+  },
+  {
+   "name": "F0_block2",
+   "shape": [
+    1,
+    4,
+    20
+   ]
+  },
+  {
+   "name": "F0_pred",
+   "shape": [
+    1,
+    20
+   ]
+  },
+  {
+   "name": "N_block0",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "N_block1",
+   "shape": [
+    1,
+    4,
+    20
+   ]
+  },
+  {
+   "name": "N_block2",
+   "shape": [
+    1,
+    4,
+    20
+   ]
+  },
+  {
+   "name": "N_pred",
+   "shape": [
+    1,
+    20
+   ]
+  },
+  {
+   "name": "text_embedding",
+   "shape": [
+    1,
+    6,
+    8
+   ]
+  },
+  {
+   "name": "text_cnn0",
+   "shape": [
+    1,
+    8,
+    6
+   ]
+  },
+  {
+   "name": "text_cnn1",
+   "shape": [
+    1,
+    8,
+    6
+   ]
+  },
+  {
+   "name": "text_cnn2",
+   "shape": [
+    1,
+    8,
+    6
+   ]
+  },
+  {
+   "name": "t_en",
+   "shape": [
+    1,
+    8,
+    6
+   ]
+  },
+  {
+   "name": "asr",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "dec_F0_conv",
+   "shape": [
+    1,
+    1,
+    10
+   ]
+  },
+  {
+   "name": "dec_N_conv",
+   "shape": [
+    1,
+    1,
+    10
+   ]
+  },
+  {
+   "name": "dec_encode",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "dec_asr_res",
+   "shape": [
+    1,
+    4,
+    10
+   ]
+  },
+  {
+   "name": "dec_decode0",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "dec_decode1",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "dec_decode2",
+   "shape": [
+    1,
+    8,
+    10
+   ]
+  },
+  {
+   "name": "dec_decode3",
+   "shape": [
+    1,
+    8,
+    20
+   ]
+  },
+  {
+   "name": "gen_har_source",
+   "shape": [
+    1,
+    6000
+   ]
+  },
+  {
+   "name": "gen_har_spec",
+   "shape": [
+    1,
+    11,
+    1201
+   ]
+  },
+  {
+   "name": "gen_har_phase",
+   "shape": [
+    1,
+    11,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage0_leaky",
+   "shape": [
+    1,
+    8,
+    20
+   ]
+  },
+  {
+   "name": "gen_stage0_noise_conv",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_noise_res",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_ups",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_sum",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_resblock0",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_resblock1",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_resblock2",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage0_mrf",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage1_leaky",
+   "shape": [
+    1,
+    4,
+    200
+   ]
+  },
+  {
+   "name": "gen_stage1_noise_conv",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_noise_res",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_ups",
+   "shape": [
+    1,
+    2,
+    1200
+   ]
+  },
+  {
+   "name": "gen_stage1_pad",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_sum",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_resblock0",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_resblock1",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_resblock2",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_stage1_mrf",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_post_leaky",
+   "shape": [
+    1,
+    2,
+    1201
+   ]
+  },
+  {
+   "name": "gen_spec",
+   "shape": [
+    1,
+    11,
+    1201
+   ]
+  },
+  {
+   "name": "gen_phase",
+   "shape": [
+    1,
+    11,
+    1201
+   ]
+  },
+  {
+   "name": "audio",
+   "shape": [
+    6000
+   ]
+  }
+ ],
+ "skipped_stages": [
+  "gen_f0_upsampled",
+  "gen_uv",
+  "gen_conv_post"
+ ]
+}

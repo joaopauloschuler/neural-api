@@ -218,6 +218,17 @@ procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inlin
 function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer; register; assembler;
 function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
 
+// Win64 port of the AVXDotProductsPacked6x16 kernel from neuralvolume.pas:
+// computes one 6 x 16 block of DotProductsPacked (C row r, CStrideBytes apart,
+// := panel^T * B_r + the 16 floats at PtrBias unless nil). The panel holds
+// VectorSize groups of 16 lane floats (64 bytes per group); each B row holds
+// VectorSize floats. VectorSize must be positive (the FPC reference loops on
+// dec/jnz, so zero would loop endlessly; the caller guarantees positivity).
+procedure _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); register; assembler;
+procedure _AVX512DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); inline;
+
 
 implementation
 
@@ -5735,6 +5746,169 @@ end;
 function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
 begin
   Result := _AVX2Q4BlockExtremeIdx(src);
+end;
+
+{-----------------------------------------------------------------------------
+  _AVX2DotProductsPacked6x16 (Win64)
+
+  Port of the FPC AVXDotProductsPacked6x16 kernel in neuralvolume.pas to
+  Delphi BASM. Twelve YMM accumulators hold one 6 x 16 block: C row r
+  (CStrideBytes apart) := panel^T * B_r (+ the 16 floats at PtrBias unless
+  nil). The panel holds VectorSize groups of 64 bytes (two 8-float strips of
+  lane values per group); B rows advance 4 bytes per group.
+
+  Win64 calling convention: PtrPanel/PtrB0/PtrB1/PtrB2 arrive in RCX/RDX/R8/R9,
+  positions 5..11 sit at [rbp+48] and up (the compiler owns the RBP frame).
+  Non-volatile registers are saved explicitly: RBX/RSI/RDI/R12-R15 via push,
+  YMM6-YMM15 (full 256 bits) via the 320-byte scratch below RSP. All memory
+  operands are unaligned moves.
+-----------------------------------------------------------------------------
+  Stack layout after the prologue:
+    [rsp+0]    .. [rsp+287]  saved YMM6..YMM15 (32 bytes each)
+    [rsp+288]  ..            free scratch
+-----------------------------------------------------------------------------}
+procedure _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64);
+asm
+  push rbx
+  push rsi
+  push rdi
+  push r12
+  push r13
+  push r14
+  push r15
+  sub rsp, 320
+  // Save non-volatile YMM6-YMM15 (the Win64 ABI keeps XMM6-XMM15 and the
+  // upper halves of YMM6-YMM15 preserved across calls).
+  vmovups [rsp], ymm6
+  vmovups [rsp+32], ymm7
+  vmovups [rsp+64], ymm8
+  vmovups [rsp+96], ymm9
+  vmovups [rsp+128], ymm10
+  vmovups [rsp+160], ymm11
+  vmovups [rsp+192], ymm12
+  vmovups [rsp+224], ymm13
+  vmovups [rsp+256], ymm14
+  vmovups [rsp+288], ymm15
+
+  // ---- Load pointer parameters into non-volatile registers ----
+  mov r10, rcx                // r10 = PtrPanel
+  mov r11, rdx                // r11 = PtrB0
+  mov rbx, r8                 // rbx = PtrB1
+  mov rsi, r9                 // rsi = PtrB2
+  mov rdi, [rbp+48]           // rdi = PtrB3
+  mov r12, [rbp+56]           // r12 = PtrB4
+  mov r13, [rbp+64]           // r13 = PtrB5
+  mov r14, [rbp+72]           // r14 = PtrC
+  mov r15, [rbp+80]           // r15 = PtrBias
+  mov rcx, [rbp+88]           // rcx = VectorSize (loop counter)
+
+  vxorps ymm4, ymm4, ymm4
+  vxorps ymm5, ymm5, ymm5
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
+  vxorps ymm8, ymm8, ymm8
+  vxorps ymm9, ymm9, ymm9
+  vxorps ymm10, ymm10, ymm10
+  vxorps ymm11, ymm11, ymm11
+  vxorps ymm12, ymm12, ymm12
+  vxorps ymm13, ymm13, ymm13
+  vxorps ymm14, ymm14, ymm14
+  vxorps ymm15, ymm15, ymm15
+
+  xor rax, rax                // rax = B element offset (bytes)
+  test rcx, rcx
+  jz @StoreRows
+
+@KLoop:
+  vmovups ymm0, [r10]
+  vmovups ymm1, [r10+32]
+  vbroadcastss ymm2, [r11+rax]
+  vbroadcastss ymm3, [rbx+rax]
+  vfmadd231ps ymm4, ymm0, ymm2
+  vfmadd231ps ymm5, ymm1, ymm2
+  vfmadd231ps ymm6, ymm0, ymm3
+  vfmadd231ps ymm7, ymm1, ymm3
+  vbroadcastss ymm2, [rsi+rax]
+  vbroadcastss ymm3, [rdi+rax]
+  vfmadd231ps ymm8, ymm0, ymm2
+  vfmadd231ps ymm9, ymm1, ymm2
+  vfmadd231ps ymm10, ymm0, ymm3
+  vfmadd231ps ymm11, ymm1, ymm3
+  vbroadcastss ymm2, [r12+rax]
+  vbroadcastss ymm3, [r13+rax]
+  vfmadd231ps ymm12, ymm0, ymm2
+  vfmadd231ps ymm13, ymm1, ymm2
+  vfmadd231ps ymm14, ymm0, ymm3
+  vfmadd231ps ymm15, ymm1, ymm3
+  add r10, 64
+  add rax, 4
+  dec rcx
+  jnz @KLoop
+
+@StoreRows:
+  test r15, r15
+  jz @NoBias
+  vmovups ymm0, [r15]
+  vmovups ymm1, [r15+32]
+  vaddps ymm4, ymm4, ymm0
+  vaddps ymm5, ymm5, ymm1
+  vaddps ymm6, ymm6, ymm0
+  vaddps ymm7, ymm7, ymm1
+  vaddps ymm8, ymm8, ymm0
+  vaddps ymm9, ymm9, ymm1
+  vaddps ymm10, ymm10, ymm0
+  vaddps ymm11, ymm11, ymm1
+  vaddps ymm12, ymm12, ymm0
+  vaddps ymm13, ymm13, ymm1
+  vaddps ymm14, ymm14, ymm0
+  vaddps ymm15, ymm15, ymm1
+@NoBias:
+  mov rdx, [rbp+96]           // rdx = CStrideBytes
+  vmovups [r14], ymm4
+  vmovups [r14+32], ymm5
+  add r14, rdx
+  vmovups [r14], ymm6
+  vmovups [r14+32], ymm7
+  add r14, rdx
+  vmovups [r14], ymm8
+  vmovups [r14+32], ymm9
+  add r14, rdx
+  vmovups [r14], ymm10
+  vmovups [r14+32], ymm11
+  add r14, rdx
+  vmovups [r14], ymm12
+  vmovups [r14+32], ymm13
+  add r14, rdx
+  vmovups [r14], ymm14
+  vmovups [r14+32], ymm15
+
+  vzeroupper
+  vmovups ymm6, [rsp]           // restore non-volatile YMM6..YMM15
+  vmovups ymm7, [rsp+32]
+  vmovups ymm8, [rsp+64]
+  vmovups ymm9, [rsp+96]
+  vmovups ymm10, [rsp+128]
+  vmovups ymm11, [rsp+160]
+  vmovups ymm12, [rsp+192]
+  vmovups ymm13, [rsp+224]
+  vmovups ymm14, [rsp+256]
+  vmovups ymm15, [rsp+288]
+  add rsp, 320
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rdi
+  pop rsi
+  pop rbx
+end;
+
+procedure _AVX512DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); inline;
+begin
+  _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3, PtrB4,
+    PtrB5, PtrC, PtrBias, VectorSize, CStrideBytes);
 end;
 
 

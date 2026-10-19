@@ -50,6 +50,9 @@ PUBLIC API:
     EstimateJaccard(SigA, SigB): fraction of matching signature positions.
     BandKey(Sig, BandIdx): the string bucket key of one band.
 
+  FNV1a64 (the shingle hash) and the 32-bit FNV1a32 / FNV1a32Continue /
+  FNV1a32Step that the tokenizer, G2P and safetensors hash tables share.
+
   TrueJaccardOfSets(A, B): the exact Jaccard of two shingle TStringLists.
 
   DeduplicateCorpus(Docs, NumHashes, NGramSize, Threshold, Seed, out KeepMask,
@@ -130,6 +133,14 @@ type
 // 64-bit FNV-1a hash of a string (the base shingle hash; exposed for reuse).
 function FNV1a64(const S: string): UInt64;
 
+// One 32-bit FNV-1a step: folds Value into Hash.
+function FNV1a32Step(Hash: cardinal; Value: byte): cardinal; inline;
+// 32-bit FNV-1a over Len bytes at P, continuing from Hash; chaining calls
+// hashes the concatenation without building it.
+function FNV1a32Continue(Hash: cardinal; P: PAnsiChar; Len: integer): cardinal;
+// 32-bit FNV-1a over Len bytes at P (the hash-table key hash of the loaders).
+function FNV1a32(P: PAnsiChar; Len: integer): cardinal;
+
 // True Jaccard |A intersect B| / |A union B| of two shingle lists (as sets).
 function TrueJaccardOfSets(A, B: TStringList): double;
 
@@ -171,6 +182,30 @@ begin
     Result := Result xor UInt64(Ord(S[I]));
     Result := Result * csPrime;
   end;
+end;
+{$POP}
+
+// The 32-bit FNV prime multiply wraps around cardinal by design, as above.
+{$PUSH}
+{$Q-}{$R-}
+function FNV1a32Step(Hash: cardinal; Value: byte): cardinal;
+begin
+  Result := (Hash xor cardinal(Value)) * 16777619;
+end;
+
+function FNV1a32Continue(Hash: cardinal; P: PAnsiChar; Len: integer): cardinal;
+var
+  BytePos, MaxBytePos: integer;
+begin
+  Result := Hash;
+  MaxBytePos := Len - 1;
+  for BytePos := 0 to MaxBytePos do
+    Result := FNV1a32Step(Result, byte(P[BytePos]));
+end;
+
+function FNV1a32(P: PAnsiChar; Len: integer): cardinal;
+begin
+  Result := FNV1a32Continue(2166136261, P, Len);
 end;
 {$POP}
 

@@ -634,8 +634,8 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
-      /// OpenCL im2col: gathers SrcVol (the conv input, zero-padded by Padding
-      /// on each side inside the gather) into FInputBufferBs, sized here on
+      /// OpenCL im2col: gathers SrcVol (the conv input, zero-padded by PaddingX
+      /// columns and PaddingY rows inside the gather) into FInputBufferBs, sized here on
       /// first use, with the shared cai_im2col kernel, so the host never builds
       /// nor uploads the column matrix. Call it after PrepareForCompute and
       /// BEFORE the matching Compute(..., NewVBs=false), on the same in-order
@@ -645,7 +645,7 @@ type
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
+        OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY, DilationX: longint;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
@@ -659,7 +659,7 @@ type
       /// Compute for an FP32 convolution with B gathered inside the GEMM from
       /// unpadded SrcVol (or borrowed pExternalSrc): no column matrix, no B buffer.
       procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-        OutSizeX, RowSpan, Stride, Padding, pActFN: longint;
+        OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint;
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
@@ -1233,8 +1233,8 @@ begin
 end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
-  SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
-  NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
+  SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY,
+  DilationX: longint; NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
   N, InSizeX, InSizeY, InDepth: longint;
@@ -1270,9 +1270,11 @@ begin
   err := err or clSetKernelArg(k, 5, csLongintSize, @InSizeY);
   err := err or clSetKernelArg(k, 6, csLongintSize, @InDepth);
   err := err or clSetKernelArg(k, 7, csLongintSize, @Stride);
-  err := err or clSetKernelArg(k, 8, csLongintSize, @Padding);
-  err := err or clSetKernelArg(k, 9, csCLMemSize, @SrcBuffer);
-  err := err or clSetKernelArg(k, 10, csCLMemSize, @ColsBuffer);
+  err := err or clSetKernelArg(k, 8, csLongintSize, @PaddingX);
+  err := err or clSetKernelArg(k, 9, csLongintSize, @PaddingY);
+  err := err or clSetKernelArg(k, 10, csLongintSize, @DilationX);
+  err := err or clSetKernelArg(k, 11, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(k, 12, csCLMemSize, @ColsBuffer);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -2251,7 +2253,7 @@ begin
 end;
 
 procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-  OutSizeX, RowSpan, Stride, Padding, pActFN: longint; NewVAs: boolean;
+  OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint; NewVAs: boolean;
   VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
   pExternalSrc: cl_mem);
 var
@@ -2301,7 +2303,9 @@ begin
   err := err or clSetKernelArg(K, 12, csLongintSize, @InSizeY);
   err := err or clSetKernelArg(K, 13, csLongintSize, @InDepth);
   err := err or clSetKernelArg(K, 14, csLongintSize, @Stride);
-  err := err or clSetKernelArg(K, 15, csLongintSize, @Padding);
+  err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
+  err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
+  err := err or clSetKernelArg(K, 17, csLongintSize, @DilationX);
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +

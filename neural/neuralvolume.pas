@@ -46,6 +46,8 @@ uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysut
 {$include neuralnetwork.inc}
 
 const csMinAvxSize = 16;
+// Rows per panel of TNNetVolume.PackDotProductRows (two ymm registers).
+const csDotProductPanelRows = 16;
 
 const
   csEncodeRGB  = 0;
@@ -544,6 +546,14 @@ type
       // it covers spatial convs, not just pointwise. Reuses the same inline
       // kernel - no per-element call overhead. Coded by Claude (AI).
       procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // DotProductsPacked's weight layout: panels of csDotProductPanelRows rows,
+      // each stored [element][row]; rows past NumAs are zero.
+      class procedure PackDotProductRows(PtrDst, PtrSrc: TNeuralFloatArrPtr; NumAs, VectorSize: integer); static;
+      // Floats PackDotProductRows writes: NumAs rounded up to whole panels.
+      class function PackedDotProductFloats(NumAs, VectorSize: integer): integer; static;
+      // Register-blocked PtrC[b * CStride + a] := A row a . B row b (+ PtrBias[a] unless nil)
+      // for a < NumAs, b < NumBs; A from PackDotProductRows, B rows BStride floats apart.
+      class procedure DotProductsPacked(PtrC: TNeuralFloatArrPtr; CStride: integer; PtrPackedA: TNeuralFloatArrPtr; NumAs: integer; PtrB: TNeuralFloatArrPtr; BStride, NumBs, VectorSize: integer; PtrBias: TNeuralFloatArrPtr); static;
       // Fused int8-weight x float32-input dot product: returns the RAW code
       // sum (sum of code_i * b_i) with NO scale applied - the caller multiplies
       // by the per-row quantization scale once, so the kernel never touches a
@@ -2032,6 +2042,167 @@ begin
   Rounded := Bits + $7FFF + ((Bits shr 16) and 1);
   Result := Word(Rounded shr 16);
 end;
+
+{$IFDEF AVX64}
+// One 6 x 16 block of DotProductsPacked in twelve ymm accumulators: C row r
+// (CStrideBytes apart) := panel^T * B_r (+ the 16 floats at PtrBias unless nil).
+procedure AVXDotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: pointer; VectorSize, CStrideBytes: int64);
+{$IFNDEF FPC}
+// Delphi: the FPC asm block below cannot compile here (FPC-only clobber list
+// syntax), so the kernel lives in the Delphi-BASM unit neuralavx64w /
+// neuralavx32w, reached through neuralavx.
+begin
+  _AVXDotProductsPacked6x16(PSingle(PtrPanel), PSingle(PtrB0), PSingle(PtrB1),
+    PSingle(PtrB2), PSingle(PtrB3), PSingle(PtrB4), PSingle(PtrB5),
+    PSingle(PtrC), PSingle(PtrBias), VectorSize, CStrideBytes);
+end;
+{$ELSE}
+var
+  LocalPanel, LocalB0, LocalB1, LocalB2, LocalB3, LocalB4, LocalB5: pointer;
+  LocalC, LocalBias: pointer;
+  LocalVectorSize, LocalStride: int64;
+begin
+  LocalPanel := PtrPanel;
+  LocalB0 := PtrB0;
+  LocalB1 := PtrB1;
+  LocalB2 := PtrB2;
+  LocalB3 := PtrB3;
+  LocalB4 := PtrB4;
+  LocalB5 := PtrB5;
+  LocalC := PtrC;
+  LocalBias := PtrBias;
+  LocalVectorSize := VectorSize;
+  LocalStride := CStrideBytes;
+  asm
+  mov rax, LocalPanel
+  mov rbx, LocalB0
+  mov rsi, LocalB1
+  mov rdi, LocalB2
+  mov r8, LocalB3
+  mov r9, LocalB4
+  mov r10, LocalB5
+  mov rcx, LocalVectorSize
+  xor r11, r11
+  vxorps ymm4, ymm4, ymm4
+  vxorps ymm5, ymm5, ymm5
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
+  vxorps ymm8, ymm8, ymm8
+  vxorps ymm9, ymm9, ymm9
+  vxorps ymm10, ymm10, ymm10
+  vxorps ymm11, ymm11, ymm11
+  vxorps ymm12, ymm12, ymm12
+  vxorps ymm13, ymm13, ymm13
+  vxorps ymm14, ymm14, ymm14
+  vxorps ymm15, ymm15, ymm15
+@KLoop:
+  vmovups ymm0, [rax]
+  vmovups ymm1, [rax+32]
+  {$IFDEF AVX2}
+  vbroadcastss ymm2, [rbx+r11]
+  vbroadcastss ymm3, [rsi+r11]
+  vfmadd231ps ymm4, ymm0, ymm2
+  vfmadd231ps ymm5, ymm1, ymm2
+  vfmadd231ps ymm6, ymm0, ymm3
+  vfmadd231ps ymm7, ymm1, ymm3
+  vbroadcastss ymm2, [rdi+r11]
+  vbroadcastss ymm3, [r8+r11]
+  vfmadd231ps ymm8, ymm0, ymm2
+  vfmadd231ps ymm9, ymm1, ymm2
+  vfmadd231ps ymm10, ymm0, ymm3
+  vfmadd231ps ymm11, ymm1, ymm3
+  vbroadcastss ymm2, [r9+r11]
+  vbroadcastss ymm3, [r10+r11]
+  vfmadd231ps ymm12, ymm0, ymm2
+  vfmadd231ps ymm13, ymm1, ymm2
+  vfmadd231ps ymm14, ymm0, ymm3
+  vfmadd231ps ymm15, ymm1, ymm3
+  {$ELSE}
+  // No FMA: ymm2 holds the broadcast, ymm3 the product.
+  vbroadcastss ymm2, [rbx+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm4, ymm4, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm5, ymm5, ymm3
+  vbroadcastss ymm2, [rsi+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm6, ymm6, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm7, ymm7, ymm3
+  vbroadcastss ymm2, [rdi+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm8, ymm8, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm9, ymm9, ymm3
+  vbroadcastss ymm2, [r8+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm10, ymm10, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm11, ymm11, ymm3
+  vbroadcastss ymm2, [r9+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm12, ymm12, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm13, ymm13, ymm3
+  vbroadcastss ymm2, [r10+r11]
+  vmulps ymm3, ymm0, ymm2
+  vaddps ymm14, ymm14, ymm3
+  vmulps ymm3, ymm1, ymm2
+  vaddps ymm15, ymm15, ymm3
+  {$ENDIF}
+  add rax, 64
+  add r11, 4
+  dec rcx
+  jnz @KLoop
+
+  mov rdx, LocalBias
+  test rdx, rdx
+  jz @StoreRows
+  vmovups ymm0, [rdx]
+  vmovups ymm1, [rdx+32]
+  vaddps ymm4, ymm4, ymm0
+  vaddps ymm5, ymm5, ymm1
+  vaddps ymm6, ymm6, ymm0
+  vaddps ymm7, ymm7, ymm1
+  vaddps ymm8, ymm8, ymm0
+  vaddps ymm9, ymm9, ymm1
+  vaddps ymm10, ymm10, ymm0
+  vaddps ymm11, ymm11, ymm1
+  vaddps ymm12, ymm12, ymm0
+  vaddps ymm13, ymm13, ymm1
+  vaddps ymm14, ymm14, ymm0
+  vaddps ymm15, ymm15, ymm1
+@StoreRows:
+  mov rdx, LocalC
+  mov r11, LocalStride
+  vmovups [rdx], ymm4
+  vmovups [rdx+32], ymm5
+  add rdx, r11
+  vmovups [rdx], ymm6
+  vmovups [rdx+32], ymm7
+  add rdx, r11
+  vmovups [rdx], ymm8
+  vmovups [rdx+32], ymm9
+  add rdx, r11
+  vmovups [rdx], ymm10
+  vmovups [rdx+32], ymm11
+  add rdx, r11
+  vmovups [rdx], ymm12
+  vmovups [rdx+32], ymm13
+  add rdx, r11
+  vmovups [rdx], ymm14
+  vmovups [rdx+32], ymm15
+  vzeroupper
+  end
+  [
+    'RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'R8', 'R9', 'R10', 'R11',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+end;
+{$ENDIF}
+{$ENDIF}
 
 {$IFDEF AVX64}
 {$IFDEF AVX2}
@@ -14279,6 +14450,151 @@ begin
 
     end; // A Tiling.
   end; // B Tiling.
+end;
+
+class function TNNetVolume.PackedDotProductFloats(NumAs, VectorSize: integer): integer;
+begin
+  Result := ((NumAs + csDotProductPanelRows - 1) div csDotProductPanelRows) *
+    csDotProductPanelRows * VectorSize;
+end;
+
+class procedure TNNetVolume.PackDotProductRows(PtrDst, PtrSrc: TNeuralFloatArrPtr;
+  NumAs, VectorSize: integer);
+var
+  PanelPos, MaxPanelPos, LanePos, ElementPos, MaxElementPos: integer;
+  RowPos, SrcPos, DstPos: integer;
+begin
+  MaxPanelPos := (NumAs + csDotProductPanelRows - 1) div csDotProductPanelRows - 1;
+  MaxElementPos := VectorSize - 1;
+  RowPos := 0;
+  for PanelPos := 0 to MaxPanelPos do
+    for LanePos := 0 to csDotProductPanelRows - 1 do
+    begin
+      DstPos := PanelPos * csDotProductPanelRows * VectorSize + LanePos;
+      if RowPos < NumAs then
+      begin
+        SrcPos := RowPos * VectorSize;
+        for ElementPos := 0 to MaxElementPos do
+        begin
+          PtrDst^[DstPos] := PtrSrc^[SrcPos];
+          Inc(SrcPos);
+          Inc(DstPos, csDotProductPanelRows);
+        end;
+      end
+      else
+        for ElementPos := 0 to MaxElementPos do
+        begin
+          PtrDst^[DstPos] := 0;
+          Inc(DstPos, csDotProductPanelRows);
+        end;
+      Inc(RowPos);
+    end;
+end;
+
+class procedure TNNetVolume.DotProductsPacked(PtrC: TNeuralFloatArrPtr;
+  CStride: integer; PtrPackedA: TNeuralFloatArrPtr; NumAs: integer;
+  PtrB: TNeuralFloatArrPtr; BStride, NumBs, VectorSize: integer;
+  PtrBias: TNeuralFloatArrPtr);
+const
+  // B rows per register block, and per cache tile (a multiple of the block).
+  csBlockRows = 6;
+  csTileRows = 48;
+var
+  TileStart, TileEnd, PanelPos, MaxPanelPos, PanelFloats: integer;
+  BlockStart, BlockRows, MaxBlockRowPos, FirstLane, LaneCount, MaxLanePos: integer;
+  RowPos, LanePos, OutPos: integer;
+  PanelPtr, BlockBiasPtr: TNeuralFloatArrPtr;
+  RowPtrs: array[0..csBlockRows - 1] of TNeuralFloatArrPtr;
+  HasBias: boolean;
+  {$IFDEF AVX64}
+  BlockOut: array[0..csBlockRows * csDotProductPanelRows - 1] of TNeuralFloat;
+  BlockOutPos: integer;
+  {$ELSE}
+  Sums: array[0..csDotProductPanelRows - 1] of TNeuralFloat;
+  ElementPos, MaxElementPos, PanelOfs: integer;
+  BValue: TNeuralFloat;
+  RowPtr: TNeuralFloatArrPtr;
+  {$ENDIF}
+begin
+  if (NumAs <= 0) or (NumBs <= 0) or (VectorSize <= 0) then exit;
+  HasBias := Assigned(PtrBias);
+  BlockBiasPtr := nil;
+  PanelFloats := csDotProductPanelRows * VectorSize;
+  MaxPanelPos := (NumAs + csDotProductPanelRows - 1) div csDotProductPanelRows - 1;
+  {$IFNDEF AVX64}
+  MaxElementPos := VectorSize - 1;
+  {$ENDIF}
+  TileStart := 0;
+  while TileStart < NumBs do
+  begin
+    TileEnd := Min(TileStart + csTileRows, NumBs);
+    for PanelPos := 0 to MaxPanelPos do
+    begin
+      PanelPtr := @PtrPackedA^[PanelPos * PanelFloats];
+      FirstLane := PanelPos * csDotProductPanelRows;
+      LaneCount := Min(csDotProductPanelRows, NumAs - FirstLane);
+      MaxLanePos := LaneCount - 1;
+      if HasBias then BlockBiasPtr := @PtrBias^[FirstLane];
+      BlockStart := TileStart;
+      while BlockStart < TileEnd do
+      begin
+        BlockRows := Min(csBlockRows, TileEnd - BlockStart);
+        MaxBlockRowPos := BlockRows - 1;
+        // Rows past the end repeat the last valid row and are not stored.
+        for RowPos := 0 to csBlockRows - 1 do
+          RowPtrs[RowPos] := @PtrB^[(BlockStart + Min(RowPos, MaxBlockRowPos)) * BStride];
+        {$IFDEF AVX64}
+        if (BlockRows = csBlockRows) and (LaneCount = csDotProductPanelRows) then
+          AVXDotProductsPacked6x16(PanelPtr, RowPtrs[0], RowPtrs[1], RowPtrs[2],
+            RowPtrs[3], RowPtrs[4], RowPtrs[5],
+            @PtrC^[BlockStart * CStride + FirstLane], BlockBiasPtr,
+            VectorSize, int64(CStride) * csNeuralFloatSize)
+        else
+        begin
+          AVXDotProductsPacked6x16(PanelPtr, RowPtrs[0], RowPtrs[1], RowPtrs[2],
+            RowPtrs[3], RowPtrs[4], RowPtrs[5], @BlockOut[0], nil,
+            VectorSize, csDotProductPanelRows * csNeuralFloatSize);
+          for RowPos := 0 to MaxBlockRowPos do
+          begin
+            OutPos := (BlockStart + RowPos) * CStride + FirstLane;
+            BlockOutPos := RowPos * csDotProductPanelRows;
+            if HasBias then
+              for LanePos := 0 to MaxLanePos do
+                PtrC^[OutPos + LanePos] :=
+                  BlockOut[BlockOutPos + LanePos] + BlockBiasPtr^[LanePos]
+            else
+              for LanePos := 0 to MaxLanePos do
+                PtrC^[OutPos + LanePos] := BlockOut[BlockOutPos + LanePos];
+          end;
+        end;
+        {$ELSE}
+        // Each sum runs in element order, as the scalar DotProduct does.
+        for RowPos := 0 to MaxBlockRowPos do
+        begin
+          RowPtr := RowPtrs[RowPos];
+          for LanePos := 0 to MaxLanePos do Sums[LanePos] := 0;
+          PanelOfs := 0;
+          for ElementPos := 0 to MaxElementPos do
+          begin
+            BValue := RowPtr^[ElementPos];
+            for LanePos := 0 to MaxLanePos do
+              Sums[LanePos] := Sums[LanePos] + PanelPtr^[PanelOfs + LanePos] * BValue;
+            Inc(PanelOfs, csDotProductPanelRows);
+          end;
+          OutPos := (BlockStart + RowPos) * CStride + FirstLane;
+          if HasBias then
+            for LanePos := 0 to MaxLanePos do
+              PtrC^[OutPos + LanePos] := Sums[LanePos] + BlockBiasPtr^[LanePos]
+          else
+            for LanePos := 0 to MaxLanePos do
+              PtrC^[OutPos + LanePos] := Sums[LanePos];
+        end;
+        {$ENDIF}
+        Inc(BlockStart, csBlockRows);
+      end;
+    end;
+    TileStart := TileEnd;
+  end;
 end;
 
 class function TNNetVolume.DotProductInt8(PtrA: TNeuralInt8ArrPtr;

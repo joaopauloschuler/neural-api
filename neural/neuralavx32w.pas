@@ -220,6 +220,19 @@ procedure _AVX512Q4BlockCodes(src: PSingle; dst: PByte; InvScale: Single); inlin
 function _AVX2Q4BlockExtremeIdx(src: PSingle): Integer; register; assembler;
 function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
 
+// Win32 port of the AVXDotProductsPacked6x16 kernel from neuralvolume.pas:
+// computes one 6 x 16 block of DotProductsPacked (C row r, CStrideBytes apart,
+// := panel^T * B_r + the 16 floats at PtrBias unless nil). The panel holds
+// VectorSize groups of 16 lane floats (64 bytes per group); each B row holds
+// VectorSize floats. VectorSize must be positive (the FPC reference loops on
+// dec/jnz, so zero would loop endlessly; the caller guarantees positivity).
+// 32-bit mode exposes only YMM0-YMM7, so the 6-row block is processed as two
+// 3-row half passes; the panel is read twice.
+procedure _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); register; assembler;
+procedure _AVX512DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); inline;
+
 implementation
 
 
@@ -5393,6 +5406,178 @@ end;
 function _AVX512Q4BlockExtremeIdx(src: PSingle): Integer; inline;
 begin
   Result := _AVX2Q4BlockExtremeIdx(src);
+end;
+
+{-----------------------------------------------------------------------------
+  _AVX2DotProductsPacked6x16 (Win32)
+
+  Port of the FPC AVXDotProductsPacked6x16 kernel in neuralvolume.pas to
+  Delphi BASM. 32-bit mode exposes only YMM0-YMM7, so the twelve accumulators
+  of the 64-bit kernel do not fit: the 6-row block is processed as two 3-row
+  half passes (rows 0..2, then rows 3..5), each holding six accumulators
+  (3 rows x two 8-float panel strips) plus one strip load and one broadcast
+  register. The panel is read twice, once per half pass.
+
+  Win32 register calling convention: PtrPanel/PtrB0/PtrB1 arrive in
+  EAX/EDX/ECX, the remaining parameters are pushed left to right, the last
+  one landing at [ebp+8] (the compiler owns the EBP frame):
+
+    [ebp+8]   CStrideBytes low dword    [ebp+28] PtrC
+    [ebp+12]  CStrideBytes high dword   [ebp+32] PtrB5
+    [ebp+16]  VectorSize low dword      [ebp+36] PtrB4
+    [ebp+20]  VectorSize high dword     [ebp+40] PtrB3
+    [ebp+24]  PtrBias                   [ebp+44] PtrB2
+
+  Only the low dwords of the Int64 sizes are used: a 32-bit process cannot
+  hold buffers making them exceed 2^31 anyway. EBX/ESI/EDI are preserved via
+  push; YMM0-YMM7 are all volatile in the 32-bit ABI.
+-----------------------------------------------------------------------------
+  Scratch below ESP (12 bytes): [esp]=PtrPanel, [esp+4]=PtrB0 / rows 3..5
+  output base, [esp+8]=PtrB1.
+-----------------------------------------------------------------------------}
+procedure _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64);
+asm
+  push ebx
+  push esi
+  push edi
+  sub esp, 12
+  // Spill the register-passed pointers; B2..B5, C and bias stay in the
+  // argument area and are re-read from there.
+  mov [esp], eax               // [esp]   = PtrPanel
+  mov [esp+4], edx             // [esp+4] = PtrB0
+  mov [esp+8], ecx             // [esp+8] = PtrB1
+
+  // ===================== half pass 1: rows 0..2 =====================
+  mov esi, [esp]               // esi = PtrPanel
+  mov ebx, [esp+4]             // ebx = PtrB0
+  mov edi, [esp+8]             // edi = PtrB1
+  mov edx, [ebp+44]            // edx = PtrB2
+  mov ecx, [ebp+16]            // ecx = VectorSize
+  xor eax, eax                 // eax = B element offset (bytes)
+  vxorps ymm0, ymm0, ymm0      // row 0, lanes 0..7
+  vxorps ymm1, ymm1, ymm1      // row 0, lanes 8..15
+  vxorps ymm2, ymm2, ymm2      // row 1, lanes 0..7
+  vxorps ymm3, ymm3, ymm3      // row 1, lanes 8..15
+  vxorps ymm4, ymm4, ymm4      // row 2, lanes 0..7
+  vxorps ymm5, ymm5, ymm5      // row 2, lanes 8..15
+  test ecx, ecx
+  jz @Bias02
+@KLoop02:
+  vmovups ymm6, [esi]          // panel strip A (lanes 0..7)
+  vbroadcastss ymm7, [ebx+eax]
+  vfmadd231ps ymm0, ymm6, ymm7
+  vbroadcastss ymm7, [edi+eax]
+  vfmadd231ps ymm2, ymm6, ymm7
+  vbroadcastss ymm7, [edx+eax]
+  vfmadd231ps ymm4, ymm6, ymm7
+  vmovups ymm6, [esi+32]       // panel strip B (lanes 8..15)
+  vbroadcastss ymm7, [ebx+eax]
+  vfmadd231ps ymm1, ymm6, ymm7
+  vbroadcastss ymm7, [edi+eax]
+  vfmadd231ps ymm3, ymm6, ymm7
+  vbroadcastss ymm7, [edx+eax]
+  vfmadd231ps ymm5, ymm6, ymm7
+  add esi, 64
+  add eax, 4
+  dec ecx
+  jnz @KLoop02
+@Bias02:
+  mov edi, [ebp+28]            // edi = PtrC (row 0)
+  mov edx, [ebp+24]            // edx = PtrBias
+  test edx, edx
+  jz @Store02
+  vmovups ymm6, [edx]
+  vmovups ymm7, [edx+32]
+  vaddps ymm0, ymm0, ymm6
+  vaddps ymm1, ymm1, ymm7
+  vaddps ymm2, ymm2, ymm6
+  vaddps ymm3, ymm3, ymm7
+  vaddps ymm4, ymm4, ymm6
+  vaddps ymm5, ymm5, ymm7
+@Store02:
+  mov eax, [ebp+8]             // eax = CStrideBytes
+  vmovups [edi], ymm0
+  vmovups [edi+32], ymm1
+  add edi, eax
+  vmovups [edi], ymm2
+  vmovups [edi+32], ymm3
+  add edi, eax
+  vmovups [edi], ymm4
+  vmovups [edi+32], ymm5
+  add edi, eax                 // edi = output base of row 3
+
+  // ===================== half pass 2: rows 3..5 =====================
+  mov [esp+4], edi             // remember the rows 3..5 output base
+  mov esi, [esp]               // reload PtrPanel (esi advanced above)
+  mov ebx, [ebp+40]            // ebx = PtrB3
+  mov edi, [ebp+36]            // edi = PtrB4
+  mov edx, [ebp+32]            // edx = PtrB5
+  mov ecx, [ebp+16]            // ecx = VectorSize
+  xor eax, eax                 // eax = B element offset (bytes)
+  vxorps ymm0, ymm0, ymm0
+  vxorps ymm1, ymm1, ymm1
+  vxorps ymm2, ymm2, ymm2
+  vxorps ymm3, ymm3, ymm3
+  vxorps ymm4, ymm4, ymm4
+  vxorps ymm5, ymm5, ymm5
+  test ecx, ecx
+  jz @Bias35
+@KLoop35:
+  vmovups ymm6, [esi]          // panel strip A (lanes 0..7)
+  vbroadcastss ymm7, [ebx+eax]
+  vfmadd231ps ymm0, ymm6, ymm7
+  vbroadcastss ymm7, [edi+eax]
+  vfmadd231ps ymm2, ymm6, ymm7
+  vbroadcastss ymm7, [edx+eax]
+  vfmadd231ps ymm4, ymm6, ymm7
+  vmovups ymm6, [esi+32]       // panel strip B (lanes 8..15)
+  vbroadcastss ymm7, [ebx+eax]
+  vfmadd231ps ymm1, ymm6, ymm7
+  vbroadcastss ymm7, [edi+eax]
+  vfmadd231ps ymm3, ymm6, ymm7
+  vbroadcastss ymm7, [edx+eax]
+  vfmadd231ps ymm5, ymm6, ymm7
+  add esi, 64
+  add eax, 4
+  dec ecx
+  jnz @KLoop35
+@Bias35:
+  mov edx, [ebp+24]            // edx = PtrBias
+  test edx, edx
+  jz @Store35
+  vmovups ymm6, [edx]
+  vmovups ymm7, [edx+32]
+  vaddps ymm0, ymm0, ymm6
+  vaddps ymm1, ymm1, ymm7
+  vaddps ymm2, ymm2, ymm6
+  vaddps ymm3, ymm3, ymm7
+  vaddps ymm4, ymm4, ymm6
+  vaddps ymm5, ymm5, ymm7
+@Store35:
+  mov esi, [esp+4]             // esi = rows 3..5 output base
+  mov eax, [ebp+8]             // eax = CStrideBytes
+  vmovups [esi], ymm0
+  vmovups [esi+32], ymm1
+  add esi, eax
+  vmovups [esi], ymm2
+  vmovups [esi+32], ymm3
+  add esi, eax
+  vmovups [esi], ymm4
+  vmovups [esi+32], ymm5
+
+  vzeroupper
+  add esp, 12
+  pop edi
+  pop esi
+  pop ebx
+end;
+
+procedure _AVX512DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias: PSingle; VectorSize, CStrideBytes: Int64); inline;
+begin
+  _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3, PtrB4,
+    PtrB5, PtrC, PtrBias, VectorSize, CStrideBytes);
 end;
 
 end.

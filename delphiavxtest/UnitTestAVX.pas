@@ -54,6 +54,7 @@ type
     procedure TestExp;
     procedure TestDotProd;
     procedure TestDotProdInt8;
+    procedure TestDotProductsPacked6x16;
     procedure TestMulAddInt8Scalar;
     procedure TestMulAddInt8;
     procedure TestMaxAbsFinite;
@@ -1683,6 +1684,85 @@ begin
   Check(CompareSingleArrays(Delta, RefDelta, N) and
         CompareSingleArrays(M, RefM, N) and
         CompareSingleArrays(V, RefV, N), 'AdamDelta failed');
+end;
+
+{-----------------------------------------------------------------------------
+  TestDotProductsPacked6x16: checks _AVXDotProductsPacked6x16 (the Delphi
+  port of neuralvolume.pas' AVXDotProductsPacked6x16) against a scalar
+  reference with Double accumulation. Covers several VectorSizes and both a
+  nil bias and a real bias. The output stride leaves 8 floats of slack per
+  row, poisoned before the call, so stray writes outside the 16 lane floats
+  of each row are caught.
+-----------------------------------------------------------------------------}
+procedure TTestAVX.TestDotProductsPacked6x16;
+const
+  Rows = 6;
+  Lanes = 16;         // csDotProductPanelRows: 2 strips x 8 floats
+  MaxVectorSize = 64;
+  StrideFloats = 24;  // row pitch in C (> Lanes to catch stray writes)
+  POISON: Single = 12345.0;
+var
+  Panel: array[0..MaxVectorSize * Lanes - 1] of Single;
+  B: array[0..Rows * MaxVectorSize - 1] of Single;
+  C, Ref: array[0..Rows * StrideFloats - 1] of Single;
+  Bias: array[0..Lanes - 1] of Single;
+  VectorSizes: array[0..2] of Integer;
+  VS, StrideBytes, r, k, lane, VSIdx, BiasCase: Integer;
+  BiasPtr: PSingle;
+  Sum: Double;
+begin
+  VectorSizes[0] := 1;
+  VectorSizes[1] := 37;
+  VectorSizes[2] := MaxVectorSize;
+  StrideBytes := StrideFloats * SizeOf(Single);
+
+  for VSIdx := 0 to Length(VectorSizes) - 1 do
+  begin
+    VS := VectorSizes[VSIdx];
+
+    // Random inputs in [-0.25, 0.25] keep the FMA-vs-Double rounding
+    // difference far below the comparison tolerances.
+    for k := 0 to VS * Lanes - 1 do
+      Panel[k] := (Random(2001) - 1000) / 4000.0;
+    for r := 0 to Rows - 1 do
+      for k := 0 to VS - 1 do
+        B[r * MaxVectorSize + k] := (Random(2001) - 1000) / 4000.0;
+    for lane := 0 to Lanes - 1 do
+      Bias[lane] := (Random(2001) - 1000) / 4000.0;
+
+    for BiasCase := 0 to 1 do
+    begin
+      // Scalar reference: C[r, lane] = sum_k Panel[k, lane] * B_r[k] (+bias).
+      // The panel packs lane values in groups of Lanes floats (64 bytes).
+      for r := 0 to Rows - 1 do
+        for lane := 0 to Lanes - 1 do
+        begin
+          Sum := 0;
+          for k := 0 to VS - 1 do
+            Sum := Sum + Double(Panel[k * Lanes + lane]) *
+                          Double(B[r * MaxVectorSize + k]);
+          if BiasCase = 1 then Sum := Sum + Bias[lane];
+          Ref[r * StrideFloats + lane] := Sum;
+        end;
+
+      // Poison every cell, then restore the reference for the computed ones,
+      // so unwritten slack cells are compared against the poison too.
+      for r := 0 to Rows * StrideFloats - 1 do
+      begin
+        C[r] := POISON;
+        if (r mod StrideFloats) >= Lanes then Ref[r] := POISON;
+      end;
+
+      if BiasCase = 1 then BiasPtr := @Bias[0] else BiasPtr := nil;
+      _AVXDotProductsPacked6x16(@Panel[0], @B[0], @B[MaxVectorSize],
+        @B[2 * MaxVectorSize], @B[3 * MaxVectorSize], @B[4 * MaxVectorSize],
+        @B[5 * MaxVectorSize], @C[0], BiasPtr, VS, StrideBytes);
+
+      Check(CompareSingleArrays(C, Ref, Rows * StrideFloats, 1e-4, 1e-6),
+        Format('DotProductsPacked6x16 VectorSize=%d bias case=%d failed',
+          [VS, BiasCase]));
+    end;
+  end;
 end;
 
 procedure TTestAVX.TestAdafactorDelta;

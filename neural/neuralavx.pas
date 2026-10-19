@@ -62,6 +62,8 @@ procedure _AVXReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); i
 procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 procedure _AVXQ4BlockCodes( src : PSingle; dst : PByte; InvScale : Single ); inline;
 function _AVXQ4BlockExtremeIdx( src : PSingle ) : Integer; inline;
+procedure _AVXDotProductsPacked6x16( PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias : PSingle; VectorSize, CStrideBytes : Int64 ); inline;
 
 implementation
 
@@ -649,6 +651,24 @@ begin
   Result := _AVX512Q4BlockExtremeIdx(src);
   {$ELSE}
   Result := _AVX2Q4BlockExtremeIdx(src);
+  {$ENDIF}
+end;
+
+{-----------------------------------------------------------------------------
+  _AVXDotProductsPacked6x16: computes one 6 x 16 block of DotProductsPacked
+  (C row r, CStrideBytes apart, := panel^T * B_r + the 16 floats at PtrBias
+  unless nil), mirroring AVXDotProductsPacked6x16 in neuralvolume.pas.
+  PtrBias may be nil. VectorSize must be positive.
+-----------------------------------------------------------------------------}
+procedure _AVXDotProductsPacked6x16( PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
+  PtrB4, PtrB5, PtrC, PtrBias : PSingle; VectorSize, CStrideBytes : Int64 );
+begin
+  {$IFDEF AVX64}
+  _AVX512DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3, PtrB4,
+    PtrB5, PtrC, PtrBias, VectorSize, CStrideBytes);
+  {$ELSE}
+  _AVX2DotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3, PtrB4,
+    PtrB5, PtrC, PtrBias, VectorSize, CStrideBytes);
   {$ENDIF}
 end;
 
