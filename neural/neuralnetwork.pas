@@ -50,6 +50,7 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
+  {$IFNDEF FPC} neuraldelphi, {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
   neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
@@ -131,6 +132,27 @@ const
   csDWT1DHaar  = 0;   // unnormalised Haar (default)
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
   csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
+
+{$IFDEF OpenCL}
+const
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
+  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
+  // widest head they take (16 column chunks of 256).
+  csFusedSDPAFlashLanes = 256;
+  csFusedSDPAFlashMaxDk = 4096;
+{$ENDIF OpenCL}
+
+{$IFDEF OpenCL}
+// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
+// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
+function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
+  Dk: integer): boolean;
+{$ENDIF OpenCL}
 
 type
   TNNetLayer = class;
@@ -4753,19 +4775,6 @@ type
   end;
 
 {$IFDEF OpenCL}
-const
-  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
-  // tree reductions halve it) within every device's max work-group size.
-  csFusedSDPALocalSize = 256;
-  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
-  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
-  csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
-  // widest head they take (16 column chunks of 256).
-  csFusedSDPAFlashLanes = 256;
-  csFusedSDPAFlashMaxDk = 4096;
-
-type
   // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
   // (cai_sdpa_decode_split + merge) or a flash variant (+ merge when split).
   TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash);
@@ -5002,13 +5011,8 @@ type
     property LastPath: TFusedSDPAOpenCLPath read FLastPath;
   end;
 
-// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
-// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
-function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
-  Dk: integer): boolean;
-{$ENDIF}
 
-type
+{$ENDIF}
 
   /// Fused multi-head scaled-dot-product attention (GQA-aware): ALL query
   /// heads of one attention sub-layer in ONE layer, replacing the per-head
@@ -16151,7 +16155,7 @@ type
     FsBuf, FdBuf: array of Double;                 // ComputeCPU split bands
     FIlsBuf, FIldBuf: array of Double;             // InverseChannel working bands
     FgsBuf, FgdBuf, FsFBuf, FdFBuf, FoddInBuf: array of Double; // BackpropagateCPU
-    FhistSBuf, FhistDBuf: array of array of Double; // [step][FHalf] pre-step forward state
+    FhistSBuf, FhistDBuf: {$IFDEF FPC}array of array of Double;{$ELSE}TNeuralDoubleDynArr2D;{$ENDIF}// [step][FHalf] pre-step forward state
     procedure BuildFilter();
     function TapPtr(): TNNetVolume;     // weights when learnable, nil otherwise
     function GetTap(idx: integer): TNeuralFloat;
@@ -23460,10 +23464,6 @@ type
     RowCount: integer; PairDst: TNeuralByteArrPtr;
     ScaleDst: TNeuralFloatArrPtr);
 
-  {$IFNDEF FPC}
-  procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-  {$ENDIF}
-
 implementation
 
 // nil-tolerant byte counts for NonWeightBytes.
@@ -23495,23 +23495,6 @@ function SelectKthSmallest(var Arr: array of TNeuralFloat;
 // FShouldOpenCL (compared against cNeuralOpenCLMinWork) and WillOpenCL routes the
 // forward, exactly as TNNetConvolution. NeuralForceOpenCL bypasses the size
 // verdict for the parity tests. Coded by Claude (AI).
-{$ENDIF}
-
-{$IFNDEF FPC}
-procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-var
-  P: PCardinal;
-  I: NativeUInt;
-  CountM1: NativeUInt;
-begin
-  P := @X;
-  CountM1 := Count - 1;
-  for I := 0 to CountM1 do
-  begin
-    P^ := Value;
-    Inc(P);
-  end;
-end;
 {$ENDIF}
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
@@ -54809,7 +54792,7 @@ begin
             DestPos := DestBase + TapOfs;
             for groupCount := 0 to GroupMax do
             begin
-              {$IFDEF AVXANY}
+              {$IF Defined(AVXANY) and Defined(FPC)}
               SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
               DestRawPos := FInputPrepared.GetRawPtr(DestPos);
               asm_dword_copy;
@@ -55003,12 +54986,12 @@ begin
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
                   PtrPreparedInput := FInputPrepared.GetRawPtr(InPrepBase + PrevLayerGroupDStart);
-                  {$IFNDEF AVX64}
-                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                  {$ELSE}
+                  {$IF Defined(AVX64) and Defined(FPC)}
                   PtrNeuronDelta := LocalNeuron.Delta.DataPtr;
                   asm_avx64_train_neuron
-                  {$ENDIF}
+                  {$ELSE}
+                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                  {$IFEND}
 
                   {$IFDEF FPC}
                   LocalNeuron.FBiasDelta += LocalLearningErrorDeriv;
@@ -60056,7 +60039,12 @@ begin
               (PrevX + FeatureCntX < LocalPrevSizeX);
             for FeatureCntY := 0 to MaxFeatureY do
             begin
-              {$IFNDEF AVX64}
+              {$IF Defined(AVX64) and Defined(FPC)}
+              PtrA := LocalDelta.GetRawPtr(dPos);
+              PtrB := OutputErrorDerivLearningPtr;
+              PtrC := FInputCopy.GetRawPtr(inPos);
+              asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+              {$ELSE}
               TNNetVolume.MulAdd
               (
                 LocalDelta.GetRawPtr(dPos),
@@ -60064,15 +60052,16 @@ begin
                 FInputCopy.GetRawPtr(inPos),
                 LocalWeightDepth
               );
-              {$ELSE}
-              PtrA := LocalDelta.GetRawPtr(dPos);
-              PtrB := OutputErrorDerivLearningPtr;
-              PtrC := FInputCopy.GetRawPtr(inPos);
-              asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-              {$ENDIF}
+              {$IFEND}
+
               if XInRange and (FeatureCntY <= MaxFeatureYInRange) then
               begin
-                {$IFNDEF AVX64}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                PtrA := LocalPrevError.GetRawPtr(pePos);
+                PtrB := LocalWeight.GetRawPtr(wPos);
+                PtrC := OutputErrorDerivPtr;
+                asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+                {$ELSE}
                 TNNetVolume.MulAdd
                 (
                   LocalPrevError.GetRawPtr(pePos),
@@ -60080,12 +60069,7 @@ begin
                   OutputErrorDerivPtr,
                   LocalWeightDepth
                 );
-                {$ELSE}
-                PtrA := LocalPrevError.GetRawPtr(pePos);
-                PtrB := LocalWeight.GetRawPtr(wPos);
-                PtrC := OutputErrorDerivPtr;
-                asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-                {$ENDIF}
+                {$IFEND}
               end;
               Inc(dPos, dStride);
               Inc(wPos, wStride);
@@ -60354,18 +60338,19 @@ begin
           wPos := LocalW.GetRawPos(CntX, 0);
           for CntY := 0 to FeatureSizeYM1 do
           begin
-            {$IFNDEF AVX64}
+            {$IF Defined(AVX64) and Defined(FPC)}
+            PtrB := FInputCopy.GetRawPtr(inPos);
+            PtrC := LocalW.GetRawPtr(wPos);
+            asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+            {$ELSE}
             TNNetVolume.MulAdd(
               OutputPtr,
               FInputCopy.GetRawPtr(inPos),
               LocalW.GetRawPtr(wPos),
               WeightDepth
             );
-            {$ELSE}
-            PtrB := FInputCopy.GetRawPtr(inPos);
-            PtrC := LocalW.GetRawPtr(wPos);
-            asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-            {$ENDIF}
+            {$IFEND}
+
             Inc(inPos, inYStride);
             Inc(wPos, wYStride);
           end;
@@ -81383,7 +81368,11 @@ end;
 
 procedure TNNetLayerConcatedWeights.CountInt4ImportedRow();
 begin
+  {$IFDEF FPC}
   if InterLockedIncrement(FQuantInt4ImportedRows) > FNeurons.Count then
+  {$ELSE}
+  if TInterLocked.Increment(FQuantInt4ImportedRows) > FNeurons.Count then
+  {$ENDIF}
     FErrorProc(ClassName + '.ImportInt4QuantRow: more rows imported than the ' +
       IntToStr(FNeurons.Count) + ' neurons - a row was imported twice.');
 end;
@@ -90018,7 +90007,7 @@ var
   TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
   tap, g, dsum: Double;
-  histRow: array of Double;
+  histRow: {$IFDEF FPC}array of Double;{$ELSE} TNeuralDoubleDynArr; {$ENDIF}
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
   haveTapGrad, havePrev: boolean;
 begin
@@ -101603,7 +101592,7 @@ begin
     begin
       for Y := 0 to MaxY do
       begin
-        {$IFDEF AVXANY}
+        {$IF Defined(AVXANY) and Defined(FPC)}
         SourceRawPos := LocalOutput.GetRawPtr(X,Y,OrigChannel);
         DestRawPos := FOutput.GetRawPtr(X,Y,OutputDeepCnt);
         asm_dword_copy;
@@ -109561,7 +109550,7 @@ begin
           TapRunDstPos := DstPos;
           for TapRunCnt := 0 to MaxTapRunPos do
           begin
-            {$IFDEF AVXANY}
+            {$IF Defined(AVXANY) and Defined(FPC)}
             SourceRawPos := FInputCopy.GetRawPtr(TapRunSrcPos);
             DestRawPos := FInputPrepared.GetRawPtr(TapRunDstPos);
             asm_dword_copy;
@@ -110732,16 +110721,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
                 asm_avx64_train_neuron
-                {$ENDIF}
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
@@ -110755,18 +110744,18 @@ begin
                   LocalWeight := FArrNeurons[OutputD].Weights;
                   if FPointwise then
                   begin
-                    {$IFNDEF AVX64}
-                    LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
-                    {$ELSE}
-                    {$IFDEF Debug}
+                    {$IF Defined(AVX64) and Defined(FPC)}
+                      {$IFDEF Debug}
                     if PrevNumElements + PrevMissedElements <> FInputCopy.Depth
                     then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): pointwise vector size doesn''t match.');
-                    {$ENDIF}
+                      {$ENDIF}
                     PrevPtrA := LocalDestPtr;
                     PrevPtrB := LocalWeight.DataPtr;
                     SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv;
-                    asm_avx64_prev_backprop;
-                    {$ENDIF}
+                    asm_avx64_prev_backprop;                    
+                    {$ELSE}
+                    LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
+                    {$IFEND}
                   end
                   else
                   begin
@@ -110777,23 +110766,24 @@ begin
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
                       begin
-                        {$IFNDEF AVX64}
+                        {$IF Defined(AVX64) and Defined(FPC)}
+                          {$IFDEF Debug}
+                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
+                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
+                          {$ENDIF}
+                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                        asm_avx64_prev_backprop;                        
+                        {$ELSE}
                         LocalPrevError.MulAdd
                         (
                           PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
                           PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
                           SmoothLocalOutputErrorDeriv,
                           FSizeXDepth
-                        );
-                        {$ELSE}
-                        {$IFDEF Debug}
-                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
-                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
-                        {$ENDIF}
-                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
-                        asm_avx64_prev_backprop;
-                        {$ENDIF}
+                        );                        
+                        {$IFEND}
+
                         if LocalCntY < FFeatureSizeYMinus1 then
                         begin
                           {$IFDEF FPC}
@@ -110959,16 +110949,16 @@ begin
               LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
-                  {$IFNDEF AVX64}
-                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                  {$ELSE}
-                  {$IFDEF Debug}
+                  {$IF Defined(AVX64) and Defined(FPC)}
+                    {$IFDEF Debug}
                   if localNumElements + MissedElements <> LocalNeuron.Delta.Size
                   then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                  {$ENDIF}
+                    {$ENDIF}
                   PtrNeuronDelta := LocalNeuron.Delta.DataPtr;
                   asm_avx64_train_neuron
-                  {$ENDIF}
+                  {$ELSE}
+                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                  {$IFEnD}
 
                   {$IFDEF FPC}
                   LocalNeuron.FBiasDelta += LocalLearningErrorDeriv;
@@ -110982,18 +110972,18 @@ begin
                     LocalWeight := LocalNeuron.Weights;
                     if FPointwise then
                     begin
-                      {$IFNDEF AVX64}
-                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, InCopyDepth);
-                      {$ELSE}
-                      {$IFDEF Debug}
+                      {$IF Defined(AVX64) and Defined(FPC)}
+                        {$IFDEF Debug}
                       if PrevNumElements + PrevMissedElements <> InCopyDepth
                       then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): pointwise vector size doesn''t match.');
-                      {$ENDIF}
+                        {$ENDIF}
                       PrevPtrA := LocalDestPtr;
                       PrevPtrB := LocalWeight.DataPtr;
                       SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv;
-                      asm_avx64_prev_backprop;
-                      {$ENDIF}
+                      asm_avx64_prev_backprop;                      
+                      {$ELSE}
+                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, InCopyDepth);
+                      {$IFEND}
                     end
                     else
                     begin
@@ -111013,7 +111003,10 @@ begin
                           begin
                             PrevPtrA := TNeuralFloatArrPtr(@RowPrevPtr^[TapRunCnt * TapRunSrcStep]);
                             PrevPtrB := TNeuralFloatArrPtr(@RowWeightPtr^[TapRunCnt * TapRunSize]);
-                            {$IFNDEF AVX64}
+
+                            {$IF Defined(AVX64) and Defined(FPC)}
+                            asm_avx64_prev_backprop;
+                            {$ELSE}
                             LocalPrevError.MulAdd
                             (
                               PrevPtrA,
@@ -111021,10 +111014,9 @@ begin
                               SmoothLocalOutputErrorDeriv,
                               TapRunSize
                             );
-                            {$ELSE}
-                            asm_avx64_prev_backprop;
                             {$ENDIF}
                           end;
+
                           if LocalCntY < FFeatureSizeYMinus1 then
                           begin
                             {$IFDEF FPC}
@@ -111160,16 +111152,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
-                asm_avx64_train_neuron
-                {$ENDIF}
+                asm_avx64_train_neuron                
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
@@ -111205,23 +111197,24 @@ begin
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
                       begin
-                        {$IFNDEF AVX64}
+                        {$IF Defined(AVX64) and Defined(FPC)}
+                          {$IFDEF Debug}
+                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
+                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
+                          {$ENDIF}
+                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                        asm_avx64_prev_backprop;                        
+                        {$ELSE}
                         LocalPrevError.MulAdd
                         (
                           PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
                           PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
                           SmoothLocalOutputErrorDeriv,
                           FSizeXDepth
-                        );
-                        {$ELSE}
-                        {$IFDEF Debug}
-                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
-                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
-                        {$ENDIF}
-                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
-                        asm_avx64_prev_backprop;
-                        {$ENDIF}
+                        );                        
+                        {$IFEND}
+                        
                         if LocalCntY < FFeatureSizeYMinus1 then
                         begin
                           {$IFDEF FPC}
@@ -111363,16 +111356,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
-                asm_avx64_train_neuron
-                {$ENDIF}
+                asm_avx64_train_neuron                
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;

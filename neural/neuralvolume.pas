@@ -1919,6 +1919,9 @@ type
 implementation
 
 uses
+  {$IFNDEF FPC}
+    {$IFDEF AVXANY} neuralavx, {$ENDIF}
+  {$ENDIF}
   Math, neuralbit, strutils;
 
 // Scalar IEEE-754 half -> single. Pure bit surgery, so no floating-point
@@ -2045,6 +2048,16 @@ end;
 // (CStrideBytes apart) := panel^T * B_r (+ the 16 floats at PtrBias unless nil).
 procedure AVXDotProductsPacked6x16(PtrPanel, PtrB0, PtrB1, PtrB2, PtrB3,
   PtrB4, PtrB5, PtrC, PtrBias: pointer; VectorSize, CStrideBytes: int64);
+{$IFNDEF FPC}
+// Delphi: the FPC asm block below cannot compile here (FPC-only clobber list
+// syntax), so the kernel lives in the Delphi-BASM unit neuralavx64w /
+// neuralavx32w, reached through neuralavx.
+begin
+  _AVXDotProductsPacked6x16(PSingle(PtrPanel), PSingle(PtrB0), PSingle(PtrB1),
+    PSingle(PtrB2), PSingle(PtrB3), PSingle(PtrB4), PSingle(PtrB5),
+    PSingle(PtrC), PSingle(PtrBias), VectorSize, CStrideBytes);
+end;
+{$ELSE}
 var
   LocalPanel, LocalB0, LocalB1, LocalB2, LocalB3, LocalB4, LocalB5: pointer;
   LocalC, LocalBias: pointer;
@@ -2189,6 +2202,7 @@ begin
   ];
 end;
 {$ENDIF}
+{$ENDIF}
 
 {$IFDEF AVX64}
 {$IFDEF AVX2}
@@ -2200,6 +2214,11 @@ end;
 // Coded by Claude (AI).
 function AVXDotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr;
   NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProdInt8(PShortInt(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -2301,6 +2320,7 @@ begin
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
   end;
 end;
+{$ENDIF FPC}
 
 // Int8 x int8 dot product, 32 elements per iteration: a*b = |a| * (sign(a)*b)
 // makes one operand unsigned for vpmaddubsw (byte pairs -> int16), vpmaddwd
@@ -2308,6 +2328,11 @@ end;
 // sum never saturates while codes stay in [-127, 127]. Coded by Claude (AI).
 function AVXDotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr;
   NumElements: integer): integer;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProductInt8Int8(PShortInt(PtrA), PShortInt(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: integer;
   localNumElements, MissedElements, I, MaxTailPos: integer;
@@ -2361,6 +2386,7 @@ begin
       Result := Result + PtrA^[I] * PtrB^[I];
   end;
 end;
+{$ENDIF FPC}
 
 // Int4 x int8 block dot product. Two blocks per iteration: one 32-byte load
 // unpacks (mask only) into [lo nibbles of both blocks | hi nibbles of both
@@ -2373,6 +2399,11 @@ end;
 function AVXDotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
   PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
   PtrBlockSum8: TNeuralFloatArrPtr; NumBlocks: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProductInt4Int8(PByte(PtrPacked), PSingle(PtrBlockScales), PShortInt(PtrB), PSingle(PtrBlockSum8), NumBlocks);
+end;
+{$ELSE}
 var
   vRes: Single;
   NumPairs, OddBlock, NumOctets, BlockIdx: integer;
@@ -2465,6 +2496,7 @@ begin
   for BlockIdx := NumOctets * 8 to NumBlocks - 1 do
     Result := Result - PtrBlockScales^[BlockIdx] * PtrBlockSum8^[BlockIdx];
 end;
+{$ENDIF FPC}
 
 // Fused int8 axpy PtrA[i] += W * PtrCodes[i]: AVXDotProductInt8's byte->float
 // front end (vpmovsxbd + vcvtdq2ps, the codes stream at 1 byte/element and the
@@ -2474,6 +2506,11 @@ end;
 // pointer 128. Scalar remainder (N mod 4) in Pascal. Coded by Claude (AI).
 procedure AVXMulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
   PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXMulAddInt8Scalar(PSingle(PtrA), PShortInt(PtrCodes), W, NumElements);
+end;
+{$ELSE}
 var
   WPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -2554,6 +2591,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrA^[i] := PtrA^[i] + W * PtrCodes^[i];
 end;
+{$ENDIF FPC}
 
 // Fused int8 elementwise multiply-accumulate PtrA[i] += PtrCodes[i] * PtrB[i]
 // (the depthwise-conv tap kernel): same byte->float front end as above, with
@@ -2562,6 +2600,11 @@ end;
 // Coded by Claude (AI).
 procedure AVXMulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
   PtrCodes: TNeuralInt8ArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXMulAddInt8(PSingle(PtrA), PSingle(PtrB), PShortInt(PtrCodes), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
   i, NumElementsM1: integer;
@@ -2641,6 +2684,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrA^[i] := PtrA^[i] + PtrCodes^[i] * PtrB^[i];
 end;
+{$ENDIF FPC}
 
 // Largest FINITE magnitude of NumElements floats: the sign bit is cleared with
 // a broadcast $7FFFFFFF mask and each vector is masked against MaxSingle with
@@ -2659,6 +2703,11 @@ end;
 // linking of the examples. Coded by Claude (AI).
 function AVXMaxAbsFinite(PtrA: TNeuralFloatArrPtr;
   NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXMaxAbsFinite(PSingle(PtrA), NumElements);
+end;
+{$ELSE}
 var
   vMax: array[0..7] of Single;
   // [0] = the $7FFFFFFF sign-clearing mask, [1] = MaxSingle.
@@ -2758,6 +2807,7 @@ begin
     if (AbsV > Result) and (AbsV <= MaxSingle) then Result := AbsV;
   end;
 end;
+{$ENDIF FPC}
 
 // Symmetric int8 quantization of NumElements floats against a known row max:
 // code = clamp(Round(v * (1/MaxAbs) * 127), -127, 127), NaN -> 0.
@@ -2783,6 +2833,11 @@ end;
 // remainder, then the Pascal tail for the last 1..7. Coded by Claude (AI).
 procedure AVXQuantizeInt8(PtrDst: TNeuralInt8ArrPtr;
   PtrSrc: TNeuralFloatArrPtr; NumElements: integer; MaxAbs: Single);
+{$IFNDEF FPC}
+begin
+  _AVXQuantizeInt8(PShortInt(PtrDst), PSingle(PtrSrc), NumElements, MaxAbs);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1, Code: integer;
   Recip, Scaled, v: Single;
@@ -2915,10 +2970,16 @@ begin
     PtrDst^[i] := ShortInt(Code);
   end;
 end;
+{$ENDIF FPC}
 
 // Q4BlockExtremeIdx's AVX2 path: index of the first of the 32 floats with
 // the largest finite magnitude, -1 when none. Coded by Claude (AI).
 function AVXQ4BlockExtremeIdx(BlockSrc: TNeuralFloatArrPtr): integer;
+{$IFNDEF FPC}
+begin
+  Result := _AVXQ4BlockExtremeIdx(PSingle(BlockSrc));
+end;
+{$ELSE}
 var
   // [0] = $7FFFFFFF sign-clearing mask, [1] = $7F7FFFFF largest finite bits.
   Consts: array[0..1] of LongWord;
@@ -2986,11 +3047,17 @@ begin
     then Result := -1
     else Result := BsfDWord(EqualMask);
 end;
+{$ENDIF}
 
 // Q4BlockCodes's AVX2 path: vmulps then vaddps, the scalar loop's two single
 // roundings, so its codes are bit-identical. Coded by Claude (AI).
 procedure AVXQ4BlockCodes(BlockSrc: TNeuralFloatArrPtr;
   PackedDst: TNeuralByteArrPtr; InvScale: Single);
+{$IFNDEF FPC}
+begin
+  _AVXQ4BlockCodes(PSingle(BlockSrc), PByte(PackedDst), InvScale);
+end;
+{$ELSE}
 var
   // [0] = $7FFFFFFF, [1] = $7F7FFFFF, [2] = InvScale, [3] = 8.5, [4] = 15.
   Consts: array[0..4] of LongWord;
@@ -3061,6 +3128,7 @@ begin
     'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13'
   ];
 end;
+{$ENDIF}
 
 // dst[i] := Scale * src[i] over NumElements symmetric int8 codes. Per 8 lanes:
 // vpmovsxbd sign-extends 8 bytes to dwords, vcvtdq2ps converts, one broadcast
@@ -3077,6 +3145,11 @@ end;
 // AVXMaxAbsFinite. Coded by Claude (AI).
 procedure AVXDequantizeInt8(PtrDst: TNeuralFloatArrPtr;
   PtrSrc: TNeuralInt8ArrPtr; NumElements: integer; Scale: Single);
+{$IFNDEF FPC}
+begin
+  _AVXDequantizeInt8(PSingle(PtrDst), PShortInt(PtrSrc), NumElements, Scale);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   localScale: Single;
@@ -3149,6 +3222,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := Scale * PtrSrc^[i];
 end;
+{$ENDIF FPC}
 
 // dst[i] := bfloat16(src[i]) widened to single. A bfloat16 is literally the
 // high 16 bits of the single, so per 8 lanes vpmovzxwd spreads the halves into
@@ -3160,6 +3234,11 @@ end;
 // remainder, then the Pascal tail for the last 1..7. Coded by Claude (AI).
 procedure AVXDecodeBF16(PtrDst: TNeuralFloatArrPtr;
   PtrSrc: TNeuralHalfArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXDecodeBF16(PSingle(PtrDst), PWord(PtrSrc), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   OutBits: Cardinal;
@@ -3224,7 +3303,7 @@ begin
     PtrDst^[i] := PSingle(@OutBits)^;
   end;
 end;
-
+{$ENDIF FPC}
 // dst[i] := bfloat16(src[i]), round-to-nearest-even. A bfloat16 is the high 16
 // bits of the single, so each lane adds half an ULP plus the round-bias to the
 // dropped low half and takes the top word - the same integer arithmetic the
@@ -3246,6 +3325,11 @@ end;
 // Coded by Claude (AI).
 procedure AVXEncodeBF16(PtrDst: TNeuralHalfArrPtr;
   PtrSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXEncodeBF16(PSingle(PtrDst), PSingle(PtrSrc), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   // [0] = $7FFFFFFF sign mask, [1] = $7F800000 (Inf), [2] = the round-bias
@@ -3376,6 +3460,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralSingleToBFloat16(PtrSrc^[i]);
 end;
+{$ENDIF FPC}
 
 // dst[i] := err[i] where raw[i] > 0, else 0.0 -- the ReLU backward masked
 // select. The GT_OQ predicate (14) is false for NaN and false for both signed
@@ -3392,6 +3477,11 @@ end;
 // Coded by Claude (AI).
 procedure AVXReluGrad(PtrDst, PtrErr, PtrRaw: TNeuralFloatArrPtr;
   NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXReluGrad(PtrDst, PtrErr, PtrRaw, NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
 begin
@@ -3462,6 +3552,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     if PtrRaw^[i] > 0 then PtrDst^[i] := PtrErr^[i] else PtrDst^[i] := 0;
 end;
+{$ENDIF FPC}
 
 // dst[i] := 1.0 when src[i] >= 0, else 0.0 -- the ReLU derivative gate mask.
 // The non-signaling GE_OQ predicate (29) is false for NaN and true for -0.0,
@@ -3477,6 +3568,11 @@ end;
 // of the examples keeps working - see AVXMaxAbsFinite. Coded by Claude (AI).
 procedure AVXReluGateMask(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXReluGateMask(PSingle(PtrDst), PSingle(PtrSrc), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   localOne: Single;
@@ -3551,6 +3647,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     if PtrSrc^[i] >= 0 then PtrDst^[i] := 1 else PtrDst^[i] := 0;
 end;
+{$ENDIF FPC}
 
 // dst[i] := src[i] when src[i] >= 0, else Slope * src[i] - a compare, a
 // multiply and a blend per vector. The slope is broadcast from a local, so the
@@ -3564,6 +3661,11 @@ end;
 // for the 8..31 remainder, then the Pascal tail for the last 1..7.
 procedure AVXLeakyRelu(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   Slope: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXLeakyRelu(PSingle(PtrDst), PSingle(PtrSrc), NumElements, Slope);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   localSlope: Single;
@@ -3646,7 +3748,7 @@ begin
     if PtrSrc^[i] >= 0 then PtrDst^[i] := PtrSrc^[i]
     else PtrDst^[i] := Slope * PtrSrc^[i];
 end;
-
+{$ENDIF FPC}
 // dst[i] := the leaky clamp of src[i] into [LowLimit, HighLimit] - two clamped
 // forms and two blends per vector. Slope and both limits are broadcast from a
 // local array, so the kernel references no global constant and stays position
@@ -3662,6 +3764,11 @@ end;
 // renamer removes, so the chains still issue independently.
 procedure AVXReluL(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+ begin
+   _AVXReluL(PSingle(PtrDst), PSingle(PtrSrc), LowLimit, HighLimit, Slope, NumElements);
+ end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   localParams: array[0..2] of Single;
@@ -3784,6 +3891,7 @@ begin
     else if PtrSrc^[i] > LowLimit then PtrDst^[i] := PtrSrc^[i]
     else PtrDst^[i] := LowLimit + (PtrSrc^[i] - LowLimit) * Slope;
 end;
+{$ENDIF FPC}
 
 // dst[i] := 1 inside (LowLimit, HighLimit] and Slope outside it, the leaky
 // clamp's derivative. The two GT_OQ compares and the vandnps build the same
@@ -3795,6 +3903,11 @@ end;
 // for the 8..31 remainder, then the Pascal tail for the last 1..7.
 procedure AVXReluLGateMask(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXReluLGateMask(PtrDst, PtrSrc, LowLimit, HighLimit, Slope, NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   localParams: array[0..3] of Single;
@@ -3888,6 +4001,8 @@ begin
       PtrDst^[i] := 1
     else PtrDst^[i] := Slope;
 end;
+{$ENDIF FPC}
+{$ENDIF AVX64}
 
 
 {$IFNDEF NOF16C}
@@ -3920,6 +4035,11 @@ end;
 // encoding is verified by disassembling the built binary. Coded by Claude (AI).
 procedure AVXDecodeF16(PtrDst: TNeuralFloatArrPtr;
   PtrSrc: TNeuralHalfArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXDecodeF16(PSingle(PtrDst), PWord(PtrSrc), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   // Three word-wide vector constants, held in LOCALS and reached through a
@@ -4018,7 +4138,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralHalfToSingle(PtrSrc^[i]);
 end;
-
+{$ENDIF FPC}
 // dst[i] := half(src[i]) through F16C's vcvtps2ph with imm8=0 (round-to-
 // nearest-even, the mode NeuralSingleToHalf implements). Unrolled like
 // AVXDecodeF16: 32 singles per iteration, then 8, then the Pascal tail.
@@ -4044,6 +4164,11 @@ end;
 // encoding is verified by disassembling the built binary. Coded by Claude (AI).
 procedure AVXEncodeF16(PtrDst: TNeuralHalfArrPtr;
   PtrSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXEncodeF16(PSingle(PtrDst), PSingle(PtrSrc), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
   SavedMXCSR: DWord;
@@ -4108,7 +4233,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralSingleToHalf(PtrSrc^[i]);
 end;
-{$ENDIF}
+{$ENDIF FPC}
 
 // EXACT centered sum of squares: sum_i (PtrA[i] - Mean)^2, eight lanes at a
 // time. Each vector is loaded, the broadcast mean is subtracted and the
@@ -4125,6 +4250,11 @@ end;
 // Coded by Claude (AI).
 function AVXSumSqrCentered(PtrA: TNeuralFloatArrPtr; Mean: Single;
   NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXSumSqrCentered(PSingle(PtrA), Mean, NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..7] of Single;
   vMean: Single;
@@ -4175,6 +4305,7 @@ begin
     Result := Result + Centered * Centered;
   end;
 end;
+{$ENDIF FPC}
 {$ENDIF}
 {$ENDIF}
 
@@ -11784,9 +11915,11 @@ end;
 {$IFDEF AVX2}
 // AVXAdamDelta is defined later in this section under {$IFDEF AVX64};
 // forward-declare it so AdamDelta can call it here.
+  {$IFDEF FPC}
 procedure AVXAdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
   NumElements: integer); forward;
+  {$ENDIF FPC}
 {$ENDIF}
 class procedure TNNetVolume.AdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
@@ -11796,11 +11929,17 @@ var
   I: integer;
   g, m, v, t1, t2: TNeuralFloat;
 {$ENDIF}
+
 begin
   if N <= 0 then exit;
   {$IFDEF AVX2}
+    {$IFDEF FPC}
   AVXAdamDelta(PtrDelta, PtrM, PtrV,
     Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR, N);
+    {$ELSE}
+  _AVXAdamDelta(PSingle(PtrDelta), PSingle(PtrM), PSingle(PtrV),
+    Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR, N);
+    {$ENDIF FPC}
   {$ELSE}
   // Every intermediate lands in a TNeuralFloat before it is used again, so each
   // operation rounds exactly once - the rounding sequence the composed
@@ -11830,12 +11969,14 @@ end;
 {$IFDEF AVX2}
 // AVXAdafactorDelta / AVXClampAbs are defined later in this file under
 // {$IFDEF AVX64}; forward-declare them so the dispatchers below can call them.
+  {$IFDEF AVX64}
 procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
   Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer); forward;
 procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
   NumElements: integer); forward;
 procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
   Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer); forward;
+  {$ENDIF AVX64}
 {$ENDIF}
 class procedure TNNetVolume.AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
   Beta2, k, c, Epsilon: TNeuralFloat; N: integer);
@@ -11846,8 +11987,13 @@ var
 {$ENDIF}
 begin
   if N <= 0 then exit;
+
   {$IFDEF AVX2}
+    {$IFDEF AVX64}
   AVXAdafactorDelta(PtrDelta, PtrV, Beta2, k, c, Epsilon, N);
+    {$ELSE}
+  _AVXAdafactorDelta(PSingle(PtrDelta), PSingle(PtrV), Beta2, k, c, Epsilon, N);
+    {$ENDIF CPU64}
   {$ELSE}
   // Every intermediate lands in a TNeuralFloat before it is used again, so each
   // operation rounds exactly once - the same rounding sequence the AVX kernel
@@ -11878,7 +12024,11 @@ var
 begin
   if (N <= 0) or (Value <= 0) then exit;
   {$IFDEF AVX2}
+    {$IFDEF FPC}
   AVXClampAbs(PtrA, Value, N);
+    {$ELSE}
+  _AVXClampAbs(PSingle(PtrA), Value, N);
+    {$ENDIF FPC}
   {$ELSE}
   NegValue := -Value;
   for I := 0 to N - 1 do
@@ -11901,7 +12051,11 @@ var
 begin
   if N <= 0 then exit;
   {$IFDEF AVX2}
+    {$IFDEF FPC}
   AVXLionDelta(PtrDelta, PtrM, Beta1, k1, Beta2, k2, NegLR, PosLR, N);
+    {$ELSE}
+  _AVXLionDelta(PSingle(PtrDelta), PSingle(PtrM), Beta1, k1, Beta2, k2, NegLR, PosLR, N);
+    {$ENDIF FPC}
   {$ELSE}
   for I := 0 to N - 1 do
   begin
@@ -12063,7 +12217,11 @@ begin
   if N <= 0 then exit;
   {$IFDEF AVX2}
   {$IFDEF AVX64}
+    {$IFNDEF FPC}
+  _AVXReluLGateMask(pDst, pSrc, LowLimit, HighLimit, Slope, N);
+    {$ELSE}
   AVXReluLGateMask(pDst, pSrc, LowLimit, HighLimit, Slope, N);
+    {$ENDIF FPC}
   {$ELSE}
   for I := 0 to N - 1 do
     if (pSrc^[I] > LowLimit) and not (pSrc^[I] > HighLimit) then pDst^[I] := 1
@@ -13722,8 +13880,13 @@ begin
         {$ENDIF}
         PtrA := VAs.GetRawPtr(AOfs);
 
-        {$IFDEF AVXANY}
-        {$IFDEF AVX32}
+        {$IFNDEF FPC}
+          {$IFDEF AVXANY}
+        Result := _AVXDotProd(PSingle(PtrA), PSingle(PtrB), VectorSize);
+          {$ENDIF AVXANY}
+        {$ELSE}
+          {$IFDEF AVXANY}
+            {$IFDEF AVX32}
         if localNumElements > 0 then
         begin
         asm
@@ -13745,12 +13908,12 @@ begin
         vmovups ymm6, [eax+64]
         vmovups ymm7, [eax+96]
 
-        {$IFDEF AVX2}
+            {$IFDEF AVX2}
         vfmadd231ps ymm0, ymm4, [edx]
         vfmadd231ps ymm1, ymm5, [edx+32]
         vfmadd231ps ymm2, ymm6, [edx+64]
         vfmadd231ps ymm3, ymm7, [edx+96]
-        {$ELSE}
+            {$ELSE}
         vmulps  ymm4, ymm4, [edx]
         vmulps  ymm5, ymm5, [edx+32]
         vmulps  ymm6, ymm6, [edx+64]
@@ -13760,7 +13923,7 @@ begin
         vaddps  ymm1, ymm1, ymm5
         vaddps  ymm2, ymm2, ymm6
         vaddps  ymm3, ymm3, ymm7
-        {$ENDIF}
+            {$ENDIF AVX2}
 
         add eax, 128
         add edx, 128
@@ -13810,8 +13973,9 @@ begin
         begin
           Result := 0;
         end;
-        {$ENDIF}
-        {$IFDEF AVX64}
+            {$ENDIF AVX32}
+
+            {$IFDEF AVX64}
         //Write(localNumElements,' ',MissedElements);
         if localNumElements > 0 then
         begin
@@ -13819,27 +13983,27 @@ begin
         mov ecx, localNumElements
         mov rax, PtrA
         mov rdx, PtrB
-        {$IFDEF AVX512}
+              {$IFDEF AVX512}
         vxorps zmm0, zmm0, zmm0
-        {$ELSE}
+              {$ELSE}
         vxorps ymm0, ymm0, ymm0
-        {$ENDIF}
+              {$ENDIF AVX512}
 
         push rcx
         shr ecx,5  // number of large iterations = number of elements / 32
         jz @SkipLargeAddLoop
 
-        {$IFDEF AVX512}
+              {$IFDEF AVX512}
         vxorps zmm1, zmm1, zmm1
-        {$ELSE}
+              {$ELSE}
         vxorps ymm1, ymm1, ymm1
         vxorps ymm6, ymm6, ymm6
         vxorps ymm7, ymm7, ymm7
-        {$ENDIF}
+              {$ENDIF AVX512}
 
       @LargeAddLoop:
 
-        {$IFDEF AVX512}
+              {$IFDEF AVX512}
         vmovups zmm2, [rax]
         vmovups zmm3, [rax+64]
 
@@ -13848,18 +14012,18 @@ begin
 
         vaddps  zmm0, zmm0, zmm2
         vaddps  zmm1, zmm1, zmm3
-        {$ELSE}
+              {$ELSE}
           vmovups ymm2, [rax]
           vmovups ymm3, [rax+32]
           vmovups ymm4, [rax+64]
           vmovups ymm5, [rax+96]
 
-          {$IFDEF AVX2}
+                {$IFDEF AVX2}
           vfmadd231ps ymm0, ymm2, [rdx]
           vfmadd231ps ymm1, ymm3, [rdx+32]
           vfmadd231ps ymm6, ymm4, [rdx+64]
           vfmadd231ps ymm7, ymm5, [rdx+96]
-          {$ELSE}
+                {$ELSE}
           vmulps  ymm2, ymm2, [rdx]
           vmulps  ymm3, ymm3, [rdx+32]
           vmulps  ymm4, ymm4, [rdx+64]
@@ -13869,15 +14033,15 @@ begin
           vaddps  ymm1, ymm1, ymm3
           vaddps  ymm6, ymm6, ymm4
           vaddps  ymm7, ymm7, ymm5
-          {$ENDIF}
-        {$ENDIF}
+                {$ENDIF AVX2}
+              {$ENDIF AVX512}
 
         add rax, 128
         add rdx, 128
         dec ecx
         jnz @LargeAddLoop
 
-        {$IFDEF AVX512}
+              {$IFDEF AVX512}
         vaddps zmm0, zmm0, zmm1
         VEXTRACTF32x4 xmm2, zmm0, 1
         VEXTRACTF32x4 xmm3, zmm0, 2
@@ -13886,14 +14050,14 @@ begin
         addps  xmm0, xmm2
         addps  xmm0, xmm3
         addps  xmm0, xmm4
-        {$ELSE}
+              {$ELSE}
         vaddps ymm0, ymm0, ymm1
         vaddps ymm6, ymm6, ymm7
         vaddps ymm0, ymm0, ymm6
         VEXTRACTF128 xmm2, ymm0, 1
         vzeroupper
         addps  xmm0, xmm2
-        {$ENDIF}
+              {$ENDIF AVX512}
 
       @SkipLargeAddLoop:
         pop rcx
@@ -13932,7 +14096,7 @@ begin
         begin
           Result := 0;
         end;
-        {$ENDIF}
+            {$ENDIF AVX64}
         //Write(' A:', PtrA^[0],' B:', PtrB^[0],' -> ',Result);
         if MissedElements>0 then
         begin
@@ -13948,10 +14112,13 @@ begin
                  PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
         end;
         //WriteLn(' ', Result);
-        {$ENDIF}
+          {$ENDIF AVXANY}
+        {$ENDIF FPC}
+
         {$IFNDEF AVXANY}
         Result := DotProduct(PtrA, PtrB, VectorSize);
         {$ENDIF}
+
         FData[RowBase + CntA] := Result;
         Inc(AOfs, VectorSize);
         (*
@@ -14038,15 +14205,20 @@ begin
         begin
           PtrA := VAs.GetRawPtr(AOfs);
 
-          {$IFDEF AVXANY}
-          {$IFDEF AVX32}
-          if localNumElements > 0 then
-          begin
-          asm
-          mov ecx, localNumElements
-          mov eax, PtrA
-          mov edx, PtrB
-          vxorps ymm0, ymm0, ymm0
+          {$IFNDEF FPC}
+            {$IFDEF AVXANY}
+          Result := _AVXDotProd(PSingle(PtrA), PSingle(PtrB), VectorSize);
+            {$ENDIF AVXANY}
+          {$ELSE}
+            {$IFDEF AVXANY}
+            {$IFDEF AVX32}
+            if localNumElements > 0 then
+            begin
+            asm
+            mov ecx, localNumElements
+            mov eax, PtrA
+            mov edx, PtrB
+            vxorps ymm0, ymm0, ymm0
 
           push ecx
           shr ecx,5  // number of large iterations = number of elements / 32
@@ -14265,6 +14437,7 @@ begin
           end;
           //WriteLn(' ', Result);
           {$ENDIF}
+  		    {$ENDIF FPC}
           {$IFNDEF AVXANY}
           Result := DotProduct(PtrA, PtrB, VectorSize);
           {$ENDIF}
@@ -15188,15 +15361,21 @@ begin
         for CntB := StartTileB to EndTileB do
         begin
           PtrB := VBs.GetRawPtr(BOfs);
-          {$IFDEF AVXANY}
-          {$IFDEF AVX32}
-          if localNumElements > 0 then
-          begin
-          asm
-          mov ecx, localNumElements
-          mov eax, PtrA
-          mov edx, PtrB
-          vxorps ymm0, ymm0, ymm0
+
+          {$IFNDEF FPC}
+            {$IFDEF AVXANY}
+          Result := _AVXDotProd(PSingle(PtrA), PSingle(PtrB), VectorSize);
+            {$ENDIF AVXANY}
+          {$ELSE}
+            {$IFDEF AVXANY}
+            {$IFDEF AVX32}
+            if localNumElements > 0 then
+            begin
+            asm
+            mov ecx, localNumElements
+            mov eax, PtrA
+            mov edx, PtrB
+            vxorps ymm0, ymm0, ymm0
 
           push ecx
           shr ecx,5  // number of large iterations = number of elements / 32
@@ -15415,6 +15594,7 @@ begin
           end;
           //WriteLn(' ', Result);
           {$ENDIF}
+        {$ENDIF FPC}
           {$IFNDEF AVXANY}
           Result := DotProduct(PtrA, PtrB, VectorSize);
           {$ENDIF}
@@ -15734,7 +15914,12 @@ end;
 {$OVERFLOWCHECKS OFF}
 
 {$IFDEF AVX32}
-procedure AVXFill(PtrA: TNeuralFloatArrPtr; FillOp: TNeuralFloat; NumElements: integer);
+procedure AVXFill(PtrA: TNeuralFloatArrPtr; FillOp: TNeuralFloat; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF}
+  {$IFNDEF FPC}
+begin
+  _AVXFillMem(PSingle(PtrA), FillOp, NumElements);
+end;
+  {$ELSE}
 var
   I: integer;
   localNumElements, MissedElements: integer;
@@ -15802,10 +15987,16 @@ begin
     end;
   end;
 end;
+  {$ENDIF FPC}
 
 // PtrA := PtrA * MulOp1 + PtrB * MulOp2
 // RDX  := RDX  * ymm5   + RAX  * ymm6
-procedure AVXMulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp1, MulOp2: TNeuralFloat; NumElements: integer);
+procedure AVXMulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp1, MulOp2: TNeuralFloat; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF}
+{$IFNDEF FPC}
+begin
+  _AVXMulMulAdd(PSingle(PtrA), PSingle(PtrB), NumElements, MulOp1, MulOp2);
+end;
+{$ELSE}
 var
   MulOpPtr1, MulOpPtr2: pointer;
   localNumElements, MissedElements: integer;
@@ -15906,9 +16097,15 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 
-procedure AVXMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer);
+procedure AVXMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulAddF(PSingle(PtrA), PSingle(PtrB), NumElements, Single(MulOp));
+end;
+{$ELSE}
 var
   MulOpPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -16006,8 +16203,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-procedure AVXMulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; NumElements: integer);  overload;
+procedure AVXMulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulAdd(PSingle(PtrA), PSingle(PtrB), PSingle(PtrC), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -16100,9 +16303,14 @@ begin
     end;
   end;
 end;
+{$ENDIF}
 
-
-procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF}
+{$IFNDEF FPC}
+begin
+  _AVXCopyRelu(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   ZeroVar: TNeuralFloat;
   ZeroVarPtr: pointer;
@@ -16184,8 +16392,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;
+procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulF(PSingle(PtrA), NumElements, MulOp);
+end;
+{$ELSE}
 var
   MulOpPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -16259,8 +16473,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-procedure AVXMul(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload;
+procedure AVXMul(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXMul(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   MulOpPtr1, MulOpPtr2: pointer;
   localNumElements, MissedElements: integer;
@@ -16340,8 +16560,15 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-procedure AVXAdd(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+
+procedure AVXAdd(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXAdd(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   I: integer;
   localNumElements, MissedElements: integer;
@@ -16420,8 +16647,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-procedure AVXMax(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+procedure AVXMax(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXMax(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -16501,8 +16734,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  Result := _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -16617,8 +16856,14 @@ begin
            Abs(PtrA^[localNumElements+2]-PtrB^[localNumElements+2]);
   end;
 end;
+{$ENDIF FPC}
 
-function AVXDistanceSqr(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+function AVXDistanceSqr(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDistanceSqr(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -16721,8 +16966,14 @@ begin
            Sqr(PtrA^[localNumElements+2]-PtrB^[localNumElements+2]);
   end;
 end;
+{$ENDIF}
 
-procedure AVXSub(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+procedure AVXSub(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXSub(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   I: integer;
   localNumElements, MissedElements: integer;
@@ -16801,8 +17052,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
-function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
+function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetSum(PSingle(PtrA), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -16890,8 +17147,14 @@ begin
            PtrA^[localNumElements+2] ;
   end;
 end;
+{$ENDIF FPC}
 
-function AVXGetSumSqr(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
+function AVXGetSumSqr(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetSumSqr(PSingle(PtrA), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -16997,12 +17260,18 @@ begin
            Sqr(PtrA^[localNumElements+2]);
   end;
 end;
+{$ENDIF FPC}
 
 { AVXExp (32-bit): dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 body using only
   ymm0..ymm7 (no extended regs in 32-bit), scalar NeuralExp remainder. Under
   plain-AVX it degrades to a scalar NeuralExp loop. }
-procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
-{$IFDEF AVX2}
+procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer); {$IFNDEF FPC} inline; {$ENDIF} overload;
+{$IFNDEF FPC}
+begin
+  _AVXExp(PSingle(pDst), PSingle(pSrc), NumElements);
+end;
+{$ELSE}
+  {$IFDEF AVX2}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
@@ -17060,7 +17329,7 @@ begin
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := NeuralExp(pSrc^[I]);
 end;
-{$ELSE}
+  {$ELSE}
 var
   I, NumElementsM1: integer;
 begin
@@ -17068,7 +17337,8 @@ begin
   for I := 0 to NumElementsM1 do
     pDst^[I] := NeuralExp(pSrc^[I]);
 end;
-{$ENDIF}
+  {$ENDIF}
+{$ENDIF FPC}
 
 { AVXLn (32-bit): scalar pcr_logf loop. The Cephes log bit-tricks need many ymm
   registers (only ymm0..7 are usable in 32-bit asm), so the 32-bit build falls back
@@ -17112,6 +17382,11 @@ begin
 end;
 
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProd(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -17221,10 +17496,17 @@ begin
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
   end;
 end;
+{$ENDIF FPC}
+
 {$ENDIF}
 
 {$IFDEF AVX64}
 procedure AVXFill(PtrA: TNeuralFloatArrPtr; FillOp: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXFillMem(PSingle(PtrA), FillOp, NumElements);
+end;
+{$ELSE}
 var
   FillOpPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -17301,8 +17583,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer);  overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulAddF(PSingle(PtrA), PSingle(PtrB), NumElements, MulOp);
+end;
+{$ELSE}
 var
   MulOpPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -17417,8 +17705,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXMulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; NumElements: integer);  overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulAdd(PSingle(PtrA), PSingle(PtrB), PSingle(PtrC), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -17426,8 +17720,14 @@ begin
   localNumElements := NumElements xor MissedElements;
   asm_avx64_mulladd_ptra_ptrb_ptrc_num;
 end;
+{$ENDIF FPC}
 
 procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXCopyRelu(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   ZeroVar: TNeuralFloat;
   ZeroVarPtr: pointer;
@@ -17509,11 +17809,16 @@ begin
     end;
   end;
 end;
-
+{$ENDIF FPC}
 
 // PtrA := PtrA * MulOp1 + PtrB * MulOp2
 // RDX  := RDX  * ymm5   + RAX  * ymm4
 procedure AVXMulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; MulOp1, MulOp2: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXMulMulAdd(PSingle(PtrA), PSingle(PtrB), NumElements, MulOp1, MulOp2);
+end;
+{$ELSE}
 var
   MulOpPtr1, MulOpPtr2: pointer;
   localNumElements, MissedElements: integer;
@@ -17638,7 +17943,7 @@ begin
     end;
   end;
 end;
-
+{$ENDIF FPC}
 
 // One fused Adam step over a weight row, eight lanes at a time:
 //   m := Beta1*m + OmBeta1*g
@@ -17652,6 +17957,11 @@ end;
 procedure AVXAdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
   NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXAdamDelta(PSingle(PtrDelta), PSingle(PtrM), PSingle(PtrV), Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR, NumElements);
+end;
+{$ELSE}
 var
   pB1, pOmB1, pB2, pOmB2, pInv, pEps, pLR: pointer;
   localNumElements, MissedElements, I: integer;
@@ -17747,6 +18057,7 @@ begin
     PtrDelta^[I] := t2 / t1;
   end;
 end;
+{$ENDIF FPC}
 
 // Adafactor unfactored step, eight elements per iteration:
 //   v := Beta2*v + (k*d*d + c)
@@ -17759,6 +18070,11 @@ end;
 // so the code stays position independent.
 procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
   Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXAdafactorDelta(PSingle(PtrDelta), PSingle(PtrV), Beta2, k, c, Epsilon, NumElements);
+end;
+{$ELSE}
 var
   pB2, pK, pC, pEps: pointer;
   localNumElements, MissedElements, I: integer;
@@ -17830,6 +18146,7 @@ begin
     PtrDelta^[I] := d / t1;
   end;
 end;
+{$ENDIF FPC}
 
 // In-place clamp of eight elements per iteration into [-Value, +Value].
 // The bound is the FIRST operand of both vmaxps and vminps: x86 min/max return
@@ -17841,6 +18158,11 @@ end;
 // On everything else the two are bit-identical, signed zeros included.
 procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
   NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXClampAbs(PSingle(PtrA), Value, NumElements);
+end;
+{$ELSE}
 var
   pVal, pNeg: pointer;
   NegValue: TNeuralFloat;
@@ -17889,6 +18211,7 @@ begin
     else if v < NegValue then PtrA^[I] := NegValue;
   end;
 end;
+{$ENDIF FPC}
 
 // One whole Lion step, eight elements per iteration. The three-valued sign
 // select is two vcmpps masks ANDed with the two learning-rate broadcasts and
@@ -17904,6 +18227,11 @@ end;
 // independent.
 procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
   Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXLionDelta(PSingle(PtrDelta), PSingle(PtrM), Beta1, k1, Beta2, k2, NegLR, PosLR, NumElements);
+end;
+{$ELSE}
 var
   pB1, pK1, pB2, pK2, pNeg, pPos: pointer;
   localNumElements, MissedElements, I: integer;
@@ -17985,7 +18313,14 @@ begin
     else PtrDelta^[I] := 0;
   end;
 end;
+{$ENDIF FPC}
+
 procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;
+{$IFNDEF FPC}
+begin
+  _AVXMulF(PSingle(PtrA), NumElements, MulOp);
+end;
+{$ELSE}
 var
   MulOpPtr: pointer;
   localNumElements, MissedElements: integer;
@@ -18070,8 +18405,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXMul(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload;
+{$IFNDEF FPC}
+begin
+  _AVXMul(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   MulOpPtr1, MulOpPtr2: pointer;
   localNumElements, MissedElements: integer;
@@ -18162,8 +18503,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXAdd(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXAdd(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -18253,8 +18600,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXMax(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXAdd(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -18346,8 +18699,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -18468,8 +18827,14 @@ begin
            Abs(PtrA^[localNumElements+2]-PtrB^[localNumElements+2]);
   end;
 end;
+{$ENDIF FPC}
 
 function AVXDistanceSqr(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDistanceSqr(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -18585,8 +18950,14 @@ begin
            Sqr(PtrA^[localNumElements+2]-PtrB^[localNumElements+2]);
   end;
 end;
+{$ENDIF FPC}
 
 procedure AVXSub(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXSub(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements: integer;
 begin
@@ -18676,8 +19047,14 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetSum(PSingle(PtrA), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -18792,8 +19169,14 @@ begin
            PtrA^[localNumElements+2];
   end;
 end;
+{$ENDIF FPC}
 
 function AVXGetSumSqr(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetSumSqr(PSingle(PtrA), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -18931,7 +19314,7 @@ begin
            Sqr(PtrA^[localNumElements+2]);
   end;
 end;
-
+{$ENDIF FPC}
 
 {$IFDEF AVX2}
 // Lane-index seeds for the argmax/argmin kernels below: cAVXArgLaneSeed is the
@@ -18972,6 +19355,11 @@ var
   vIdx: array[0..15] of integer;
   I, J, localNumElements: integer;
   v: Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetMaxPos(PSingle(PtrA), NumElements, Pos);
+end;
+{$ELSE}
 begin
   localNumElements := NumElements and (not 15);
   if localNumElements >= 16 then
@@ -19042,12 +19430,18 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 { AVXGetMinPos is AVXGetMaxPos with the compare inverted (predicate 17 =
   _CMP_LT_OQ) and the fold taking the smaller value: it returns the smallest
   element and the flat index of its first occurrence, matching TVolume.GetMin. }
 function AVXGetMinPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
   out Pos: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetMinPos(PSingle(PtrA), NumElements, Pos);
+end;
+{$ELSE}
 var
   vMin: array[0..15] of Single;
   vIdx: array[0..15] of integer;
@@ -19123,6 +19517,7 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 
 { AVXGetMaxAbsPos is AVXGetMaxPos over |x|: each loaded vector has its sign bits
   cleared by cAVXArgAbsMask before the compare, so the returned value is a
@@ -19132,6 +19527,11 @@ end;
   mispredicts on roughly half of a zero-mean tensor. }
 function AVXGetMaxAbsPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
   out Pos: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXGetMaxAbsPos(PSingle(PtrA), NumElements, Pos);
+end;
+{$ELSE}
 var
   vMax: array[0..15] of Single;
   vIdx: array[0..15] of integer;
@@ -19212,6 +19612,7 @@ begin
     end;
   end;
 end;
+{$ENDIF FPC}
 {$ENDIF}
 
 { AVXAddScalar: dst[0..N-1] += Value. Thirty-two elements per iteration through
@@ -19222,6 +19623,11 @@ end;
 {$IFDEF AVX64}
 procedure AVXAddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
   NumElements: integer);
+  {$IFNDEF FPC}
+begin
+  _AVXAddScalar(PSingle(PtrA), Value, NumElements);
+end;
+  {$ELSE}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
   ValuePtr: pointer;
@@ -19256,6 +19662,7 @@ begin
   for I := localNumElements to NumElementsM1 do
     PtrA^[I] := PtrA^[I] + Value;
 end;
+  {$ENDIF FPC}
 {$ENDIF}
 {$ENDIF}
 
@@ -19263,6 +19670,11 @@ end;
   scalar NeuralExp remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
   the whole thing degrades to a scalar NeuralExp loop. }
 procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXExp(PSingle(pDst), PSingle(pSrc), NumElements);
+end;
+{$ELSE}
 {$IFDEF AVX2}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
@@ -19333,6 +19745,7 @@ begin
     pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ENDIF}
+{$ENDIF FPC}
 
 { AVXExpShiftSum: dst[0..N-1] := exp(src[0..N-1] - Shift), returning the sum of
   what was written - the whole numerator-and-denominator half of a numerically
@@ -19358,6 +19771,11 @@ end;
 {$IFDEF AVX64}
 function AVXExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat;
   NumElements: integer): TNeuralFloat;
+{$IFNDEF FPC}
+begin
+  Result := _AVXExpShiftSum(PSingle(pDst), PSingle(pSrc), Shift, NumElements);
+end;
+{$ELSE}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
   LaneSums: array[0..7] of Single;
@@ -19437,6 +19855,7 @@ begin
   end;
   Result := Sum;
 end;
+{$ENDIF FPC}
 {$ENDIF}
 {$ENDIF}
 
@@ -19444,7 +19863,12 @@ end;
   pcr_logf remainder for the (N mod 8) tail. Decomposes x = m*2^e with m in
   [sqrt(0.5),sqrt(2)) and evaluates ln(m) as a degree-8 polynomial in (m-1). }
 procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
-{$IFDEF AVX2}
+{$IFNDEF FPC}
+begin
+  _AVXLn(PSingle(pDst), PSingle(pSrc), NumElements);
+end;
+{$ELSE}
+  {$IFDEF AVX2}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
@@ -19528,7 +19952,7 @@ begin
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
-{$ELSE}
+  {$ELSE}
 var
   I, NumElementsM1: integer;
 begin
@@ -19536,11 +19960,17 @@ begin
   for I := 0 to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
+  {$ENDIF AVX2}
 {$ENDIF}
 
 { AVXSinCos: dst[0..N-1] := sin or cos of src[0..N-1]. 8-wide AVX2 Cephes sinf/cosf
   body (3-part Cody-Waite pi/4 range reduction) plus a scalar RTL remainder. }
 procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
+{$IFNDEF FPC}
+begin
+  _AVXSinCos(PSingle(pDst), PSingle(pSrc), NumElements, IfThen(DoCos, 1));
+end;
+{$ELSE}
 {$IFDEF AVX2}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
@@ -19688,6 +20118,7 @@ begin
       pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 {$ENDIF}
+{$ENDIF FPC}
 
 { AVXSinCosBoth: sin and cos of the same src in one pass. The loop body is the
   AVXSinCos body up to the two polynomial candidates, which that kernel builds
@@ -19698,6 +20129,11 @@ end;
   sources swapped, so the results are bit-identical to Sin followed by Cos. }
 procedure AVXSinCosBoth(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
+  {$IFNDEF FPC}
+begin
+  _AVXSinCosBoth(PSingle(pDstSin), PSingle(pDstCos), PSingle(pSrc), NumElements);
+end;
+  {$ELSE}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
   S, C: Single;
@@ -19787,6 +20223,7 @@ begin
     pDstCos^[I] := C;
   end;
 end;
+  {$ENDIF FPC}
 {$ELSE}
 var
   I, NumElementsM1: integer;
@@ -19803,6 +20240,11 @@ end;
 {$ENDIF}
 
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProd(PSingle(PtrA), PSingle(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
@@ -19946,6 +20388,7 @@ begin
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
   end;
 end;
+{$ENDIF FPC}
 {$ENDIF}
 
 {$IFDEF AVXANY}
@@ -19954,7 +20397,7 @@ begin
   AVXFill(FDataPtr, c, FSize);
 end;
 
-function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat; overload; inline;
+function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat; {$IFDEF FPC} overload; inline; {$ENDIF}
 var
   I: integer;
   vHigh: integer;
@@ -19971,7 +20414,7 @@ begin
       Result := 0;
       vHigh := High(FData);
       for I := 0 to vHigh do
-        Result += FData[I] * Original.FData[I];
+        Result := Result + FData[I] * Original.FData[I];
     end;
 end;
 
@@ -19987,7 +20430,7 @@ begin
       Result := 0;
       vHigh := High(FData);
       for I := 0 to vHigh do
-        Result += FData[I];
+        Result := Result + FData[I];
     end;
 end;
 
@@ -20059,7 +20502,7 @@ begin
     begin
       vHigh := High(FData);
       for I := 0 to vHigh do
-        Result += Sqr(Original.FData[I]-FData[I]);
+        Result := Result + Sqr(Original.FData[I]-FData[I]);
     end;
 end;
 
@@ -20091,11 +20534,11 @@ begin
     begin
       vHigh := High(FData);
       for I := 0 to vHigh do
-        Result += Abs(Original.FData[I]-FData[I]);
+        Result := Result + Abs(Original.FData[I]-FData[I]);
     end;
 end;
 
-class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; inline;
+class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFDEF FPC} overload; inline; {$ENDIF}
 var
   I: integer;
   vHigh: integer;
@@ -20107,7 +20550,7 @@ begin
       Result := 0;
       vHigh := NumElements - 1;
       for I := 0 to vHigh do
-        Result += PtrA^[I] * PtrB^[I];
+        Result := Result + PtrA^[I] * PtrB^[I];
     end;
 end;
 
@@ -20122,7 +20565,7 @@ begin
     begin
       vHigh := High(FData);
       for I := 0 to vHigh do
-        FData[I] *= Value;
+        FData[I] := FData[I] * Value;
     end;
 end;
 
@@ -20273,7 +20716,7 @@ begin
     begin
       vHigh := High(FData);
       for I := 0 to vHigh do
-        FData[I] += Original.FData[I];
+        FData[I] := FData[I] + Original.FData[I];
     end;
 end;
 
@@ -20309,7 +20752,7 @@ begin
     begin
       vHigh := High(FData);
       for I := 0 to vHigh do
-        FData[I] -= Original.FData[I];
+        FData[I] := FData[I] - Original.FData[I];
     end;
 end;
 
@@ -20417,7 +20860,11 @@ begin
   RowSize := Size;
   SourceRawPos := Addr(Original.FData[0]);
   DestRawPos := Addr(FData[0]);
+  {$IFNDEF FPC}
+  Move(SourceRawPos^, DestRawPos^, RowSize * csNeuralFloatSize);
+  {$ELSE}
   asm_dword_copy;
+  {$ENDIF}
 end;
 
 {$ENDIF} // of AVXANY

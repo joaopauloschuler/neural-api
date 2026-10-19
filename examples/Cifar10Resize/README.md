@@ -1,54 +1,36 @@
-# CIFAR-10 / CIFAR-100 super-resolution resizer
+# CIFAR-10 Resized
+This folder contains a program that resizes CIFAR-10 and CIFAR-100 images to 64x64 and 128x128 pixels. 
 
-This program reads the CIFAR-10 (or CIFAR-100) dataset and **resizes every image**
-from its native 32×32 up to **64×64 and 128×128** using the repo's learned
-super-resolution networks, then writes the results out as PNG files. (See the
-companion [`readme.md`](readme.md) for dataset provenance, citation, and links to
-the pre-resized image archives on Kaggle.)
+## Original Work
+The [CIFAR-10 Dataset](https://www.cs.toronto.edu/~kriz/cifar.html) is a fantastic [contribution](https://paperswithcode.com/dataset/cifar-10) to computer science made by the original authors.
+Please refer to https://www.cs.toronto.edu/~kriz/cifar.html and to [Learning Multiple Layers of Features from Tiny Images, Alex Krizhevsky, 2009](https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf) for the original work.
 
-## What it does
+## Resizing Images
+Plenty of modern neural network architectures wont work with small images. 
+You may look at this [API example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SuperResolution) if you are curious to know more about how the resizing internally works. There is also [this bug report](https://github.com/joaopauloschuler/neural-api/issues/26) that gives insights about how it was built.
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/bird.png?raw=true"> </img>
+</p>
+<p>
+  <img src="https://github.com/joaopauloschuler/neural-api/blob/master/examples/SuperResolution/results/stealth.png?raw=true"> </img>
+</p>
 
-For each split (train / validation / test) the program builds two cascaded
-super-resolution networks and runs them per image:
+## Download
+You can download resized images from:
+* https://www.kaggle.com/joaopauloschuler/cifar10-64x64-resized-via-cai-super-resolution
+* https://www.kaggle.com/joaopauloschuler/cifar10-128x128-resized-via-cai-super-resolution
+* https://www.kaggle.com/joaopauloschuler/cifar100-128x128-resized-via-cai-super-resolution
 
+## Citing this Work
+You can cite this work in BibTeX format with:
 ```
-32x32  --CreateResizingNN(32,32)-->  64x64  --CreateResizingNN(64,64)-->  128x128
-```
-
-- **`CreateResizingNN`** (`usuperresolutionexample`) builds a `THistoricalNets`
-  super-resolution network that doubles each spatial dimension; the weights come
-  from the committed example file (`csExampleFileName`). `Compute` / `GetOutput`
-  run the forward pass over `TNNetVolume` images.
-- Work is split across CPU cores with **`TNeuralThreadList`**
-  (`NeuralDefaultThreadCount`): each thread builds its own pair of networks and
-  processes its slice of the volume list.
-- CIFAR images are loaded with **`CreateCifar10Volumes`** /
-  **`CreateCifar100Volumes`** (`neuraldatasets`); the per-channel range is
-  rescaled (`Add(2); Mul(64)`) back to 0..255 before saving with
-  **`SaveImageFromVolumeIntoFile`**.
-
-CIFAR-10 vs CIFAR-100 is selected by the `IsCifar100` flag in the source (default
-`false` = CIFAR-10); flip it and rebuild to resize CIFAR-100.
-
-## Running
-
-```
-cd examples/Cifar10Resize
-lazbuild Cifar10Resize.lpi --build-mode=Release
-./Cifar10Resize
-```
-
-(Or compile the `.lpr` with `fpc -Fu../../neural`.) The program checks for the
-CIFAR files via `CheckCIFARFile()` and exits if they are missing.
-
-## Inputs / outputs
-
-- **Input:** the CIFAR-10 / CIFAR-100 binary dataset files in the working
-  directory (downloaded as the other CIFAR examples expect).
-- **Output:** PNGs under `resized/cifar<10|100>-{32,64,128}/{train,test}/class<N>/imgK.png`
-  — the original 32×32 alongside the 64×64 and 128×128 upscaled versions, one
-  folder per class.
-
-For background on how the resizing network works internally see the
-[SuperResolution example](../SuperResolution) and
-[issue #26](https://github.com/joaopauloschuler/neural-api/issues/26).
+@software{cai_neural_api_2021_5810077,
+  author       = {Joao Paulo Schwarz Schuler},
+  title        = {CAI NEURAL API},
+  month        = dec,
+  year         = 2021,
+  publisher    = {Zenodo},
+  version      = {v1.0.6},
+  doi          = {10.5281/zenodo.5810077},
+  url          = {https://doi.org/10.5281/zenodo.5810077}
+}
