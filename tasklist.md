@@ -4477,12 +4477,19 @@ rather than acted on.
         model name or `jev-latest`), scorer exception -> 500. 18 new selftest cases
         (run by hand: no test script runs ChatServer `--selftest`).
   Stage 1 — AnyJev L0 readout (no trained weights):
-  - [ ] D1.1 AnyJev L0 scorer in `neuraldecision.pas`: prompt builder per kind, label
+  - [x] D1.1 AnyJev L0 scorer (in `neuralanyjev.pas`, not `neuraldecision.pas`): prompt builder per kind, label
         token mapping, rotations, content-free prior, log-mean marginalisation, plus a
         `raw` level (one prompt, no prior). Jev mapping: choice options rendered
         "name: desc", score levels = descriptions, noul criteria appended as
         "Yes means: ..."/"No means: ..." lines. Port AnyJev's model-free tests
         (`tests/test_calibrate.py`).
+        Done: `TAnyJevL0Scorer`, 15 tests in `tests/TestNeuralAnyJev.pas`. Prompts are
+        grouped by state text (request state + the 3 content-free probes); each group
+        prefills its longest common token prefix once, so the model reads exactly the
+        full-prompt encodings (no sentinel split). Open: the Qwen3 closed-think append
+        for cfChatML/cfQwen templates is unchecked against a real template (D1.2); a
+        multi-token Yes/No label answers 500, not 422 (D1.3); batch prior,
+        adaptive_shifts, canonical_order not ported.
   - [ ] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
         Decider (L0, content-free prior) on a pico Qwen-family decoder with a chat
         template; Pascal test compares probabilities.

@@ -57,6 +57,9 @@ const
   csDecisionDefaultModelAlias = 'jev-latest';
 
 type
+  // A valid request this scorer cannot answer (too many options for its
+  // labels, a prompt longer than the context): servers answer it with a 422.
+  EDecisionUnsupported = class(Exception);
   TDecisionQuestionKind = (dqkChoice, dqkScore, dqkNoul);
   TDecisionProbabilities = array of double;
 

@@ -30,8 +30,9 @@ Endpoints (all responses application/json):
        available in every mode). Also honors "stream":true.
   POST /v1/systemone          TypeSafe/Jev typed decision request (a state plus
        typed questions in, option probabilities out; no text generated).
-       Errors use the FastAPI {"detail": ...} body: 422 on validation, 501
-       when no decision scorer is active, 500 when the scorer fails.
+       Errors use the FastAPI {"detail": ...} body: 422 on validation and on
+       a request the scorer cannot answer, 501 when no decision scorer is
+       active, 500 when the scorer fails.
   GET  /v1/models             lists the loaded model (and the decision
        scorer's model when one is active).
 
@@ -893,6 +894,11 @@ begin
       OutputTokens);
     Code := 200;
   except
+    on E: EDecisionUnsupported do
+    begin
+      Code := 422;
+      Result := DecisionErrorMessageToJSON(E.Message);
+    end;
     on E: Exception do
     begin
       Code := 500;
@@ -1004,11 +1010,12 @@ end;
 // --selftest: offline unit checks (no model files needed).
 // ---------------------------------------------------------------------------
 type
-  // --selftest scorer: question k gets FixedProbabilities[k]; raises FailMessage when set.
+  // --selftest scorer: question k gets FixedProbabilities[k]; raises FailMessage
+  // (UnsupportedMessage as EDecisionUnsupported) when set.
   TFixedDecisionScorer = class(TDecisionScorer)
   public
     FixedProbabilities: array of TDecisionProbabilities;
-    FailMessage: string;
+    FailMessage, UnsupportedMessage: string;
     procedure Score(const Request: TDecisionRequest;
       out Answers: TDecisionAnswers;
       out InputTokens, OutputTokens: integer); override;
@@ -1020,6 +1027,8 @@ var
   QuestionPos, MaxQuestionPos: integer;
 begin
   if FailMessage <> '' then raise Exception.Create(FailMessage);
+  if UnsupportedMessage <> '' then
+    raise EDecisionUnsupported.Create(UnsupportedMessage);
   Answers := nil;
   SetLength(Answers, Length(Request.Questions));
   MaxQuestionPos := High(Request.Questions);
@@ -1424,6 +1433,11 @@ begin
     Check((Code = 500) and (Reply = '{"detail":"scorer exploded"}'),
       'a scorer exception answers 500 {"detail": message}');
     Scorer.FailMessage := '';
+    Scorer.UnsupportedMessage := 'too many options';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 422) and (Reply = '{"detail":"too many options"}'),
+      'a request the scorer cannot answer is a 422 {"detail": message}');
+    Scorer.UnsupportedMessage := '';
     Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
     Check(Code = 200, 'systemone answers again after a scorer exception');
     Reply := Serve(App, 'GET', '/v1/models', '', Code);
