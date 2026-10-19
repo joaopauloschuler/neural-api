@@ -4448,12 +4448,17 @@ rather than acted on.
         final hidden state of the last token); choice/score p = softmax(s/T), noul
         p = sigmoid(s/T). Non-string values rendered with json.dumps(sort_keys).
   Stage 0 — shared decision layer:
-  - [ ] D0.1 `neural/neuraldecision.pas`: question/answer records, the Jev request
+  - [x] D0.1 `neural/neuraldecision.pas`: question/answer records, the Jev request
         parser + validator (422 detail list), the response builder, the confidence
         formulas, the value renderer, the special-token rewrite, and a restricted
         softmax over a set of logit ids (search `TNNetVolume`/`neuralvolume.pas` for an
         existing row softmax first). Model-free unit tests, including the 0.355/0.925
         confidence checks and JSON round trips.
+        Done: 20 tests in `tests/TestNeuralDecision.pas`. Servers must call the
+        STRING entry point of `ParseDecisionRequest`: only it can see option names
+        over fpjson's 255-byte key limit. Open: `HFDecodeUnicodeEscapes`
+        (`neuralhftokenizer.pas`) turns an escaped quote or backslash into the raw
+        character, which breaks the JSON; the decision parser decodes escapes itself.
   - [ ] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
         prefix and capture its state; score a branch from that state, returning the
         last-position logits and/or the final hidden state at requested branch
