@@ -32,13 +32,18 @@ Coded by Claude (AI).
 //     option [<|box_end|>])* + [<|fim_suffix|>] continuing after the state.
 //     The state is fed once; each branch is scored from its saved state.
 //     z_i = (K h_</opt>_i + k.bias) . (Q h_decide + q.bias) / sqrt(dp) / T.
+//   - TOpenJevScorer: Zefan-Cai/Open-Jev (jev/api.py compile_request +
+//     candidate_prompts, jev/model.py forward). One prompt per candidate (noul:
+//     one), each a single user turn under the Qwen3.5 chat frame with thinking
+//     off; s = w . h_last + b, choice/score softmax(s / T), noul sigmoid(s / T).
+//     The prompts' longest common token prefix is fed once.
 
 {$mode objfpc}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, neuralvolume, neuralchatengine, neuraldecision,
+  Classes, SysUtils, neuralvolume, neuralchat, neuralchatengine, neuraldecision,
   neuraltorchbin;
 
 const
@@ -52,6 +57,11 @@ const
   // (state + one branch).
   csKevMaxStateTokens = 65536;
   csKevMaxRowTokens = csKevMaxStateTokens + 8192;
+  // An Open-Jev checkpoint directory (package/checkpoint in the HF release).
+  csOpenJevAdapterSubdir = 'adapter';
+  csOpenJevHeadFile = 'head.pt';
+  csOpenJevModelFile = 'model.json';
+  csOpenJevTemperatureFile = 'temperature.json';
 
 type
   // A head.pt this scorer cannot use (missing tensor, wrong shape, a Meta
@@ -67,16 +77,31 @@ type
   end;
   TKevQuestionRows = array of TKevQuestionRow;
 
-  TKevScorer = class(TDecisionScorer)
-  private
+  // A scorer reading a trained head over the final hidden states of FEngine,
+  // with a calibration temperature from the checkpoint that callers may override.
+  TDecisionHeadScorer = class(TDecisionScorer)
+  protected
     FEngine: TChatEngine;
-    FQueryWeights, FQueryBias, FKeyWeights, FKeyBias: TNNetVolume;
-    FHiddenSize, FPointerDim: integer;
+    FHiddenSize: integer;
     FHeadTemperature, FTemperature: double;
+    procedure SetTemperature(Value: double);
+    // FHeadTemperature := Value, and the override back to it; Source names the file.
+    procedure SetHeadTemperature(Value: double; const Source: string);
+  public
+    // AEngine is loaded (adapter merged) and not owned.
+    constructor Create(AEngine: TChatEngine; const AModelName: string);
+    // The checkpoint's temperature; 1.0 = raw logits.
+    property Temperature: double read FTemperature write SetTemperature;
+    property HeadTemperature: double read FHeadTemperature;
+  end;
+
+  TKevScorer = class(TDecisionHeadScorer)
+  private
+    FQueryWeights, FQueryBias, FKeyWeights, FKeyBias: TNNetVolume;
+    FPointerDim: integer;
     FStateId, FQuestionId, FOptionOpenId, FOptionCloseId, FDecideId: integer;
     FLastStateIds: TNeuralIntegerArray;
     FLastRows: TKevQuestionRows;
-    procedure SetTemperature(Value: double);
   public
     // AEngine is loaded (adapter merged) and not owned; AHeadFile is kev's head.pt.
     constructor Create(AEngine: TChatEngine; const AModelName, AHeadFile: string);
@@ -89,22 +114,69 @@ type
     // Softmax of the pointer logits of one branch's final hidden states:
     // rows 0..K-1 = the </opt> tokens, row K = the decide token.
     function PointerProbabilities(Hidden: TNNetVolume): TDecisionProbabilities;
-    // head.pt's temperature; 1.0 = raw logits (kev's KEV_TEMPERATURE).
-    property Temperature: double read FTemperature write SetTemperature;
-    property HeadTemperature: double read FHeadTemperature;
     property PointerDim: integer read FPointerDim;
     property LastStateIds: TNeuralIntegerArray read FLastStateIds;
     property LastRows: TKevQuestionRows read FLastRows;
   end;
 
+  // One Open-Jev candidate prompt as the last request fed it.
+  TOpenJevPrompt = record
+    QuestionPos: integer;
+    Text: string;                // the chat-framed prompt
+    Ids: TNeuralIntegerArray;
+  end;
+  TOpenJevPrompts = array of TOpenJevPrompt;
+
+  TOpenJevScorer = class(TDecisionHeadScorer)
+  private
+    FHeadWeights: TNNetVolume;
+    FHeadBias: double;
+    FMaxPromptTokens, FLoRARank: integer;
+    FBaseModelId, FBaseRevision: string;
+    FSharePrefix: boolean;
+    FLastPrompts: TOpenJevPrompts;
+    FLastScores: TDecisionProbabilities;
+    FLastSharedPrefixLen: integer;
+    procedure SetMaxPromptTokens(Value: integer);
+  public
+    // ACheckpointDir: anything OpenJevCheckpointDir resolves. AEngine was
+    // loaded with <checkpoint>/adapter merged when model.json's lora_rank > 0.
+    constructor Create(AEngine: TChatEngine; const AModelName, ACheckpointDir: string);
+    destructor Destroy(); override;
+    procedure Score(const Request: TDecisionRequest; out Answers: TDecisionAnswers;
+      out InputTokens, OutputTokens: integer); override;
+    // CandidatePrompt (special-token strings rewritten) as one user turn, thinking off.
+    function RenderPrompt(const CandidatePrompt: string): string;
+    // w . h + b over row 0 of Hidden, in double.
+    function HeadScore(Hidden: TNNetVolume): double;
+    // model.json max_length: a longer prompt answers 422 (jev's --max-length overrides it).
+    property MaxPromptTokens: integer read FMaxPromptTokens write SetMaxPromptTokens;
+    property LoRARank: integer read FLoRARank;
+    property BaseModelId: string read FBaseModelId;
+    property BaseRevision: string read FBaseRevision;
+    // Feed the prompts' common token prefix once (default true).
+    property SharePrefix: boolean read FSharePrefix write FSharePrefix;
+    property LastPrompts: TOpenJevPrompts read FLastPrompts;
+    // The head score s of every LastPrompts entry.
+    property LastScores: TDecisionProbabilities read FLastScores;
+    property LastSharedPrefixLen: integer read FLastSharedPrefixLen;
+  end;
+
 // kev.api.to_record option texts: noul ("no[: false]", "yes[: true]"),
 // choice "name[: desc]", score the level texts.
 function KevOptionTexts(const Question: TDecisionQuestion): TStringArray;
+// The directory holding head.pt and temperature.json: Dir itself, Dir/checkpoint
+// or Dir/package/checkpoint (an Open-Jev HF repo clone); '' when none does.
+function OpenJevCheckpointDir(const Dir: string): string;
+// jev.api.compile_request + candidate_prompts for one question: choice/score one
+// prompt per option, noul one. Caller text is NOT rewritten here.
+function OpenJevCandidatePrompts(const Request: TDecisionRequest;
+  const Question: TDecisionQuestion): TStringArray;
 
 implementation
 
 uses
-  Math;
+  Math, fpjson, jsonparser;
 
 // Dest := the flat tensor pName after checking it is [Rows, Cols] (Cols = 0: 1-D [Rows]).
 procedure LoadDecisionHeadTensor(Reader: TNNetTorchBinReader;
@@ -154,6 +226,52 @@ begin
     end;
 end;
 
+procedure SoftMaxInPlace(var Values: TDecisionProbabilities);
+var
+  ValuePos, MaxValuePos: integer;
+  Largest, Total: double;
+begin
+  MaxValuePos := High(Values);
+  Largest := MaxValue(Values);
+  Total := 0;
+  for ValuePos := 0 to MaxValuePos do
+  begin
+    Values[ValuePos] := Exp(Values[ValuePos] - Largest);
+    Total := Total + Values[ValuePos];
+  end;
+  for ValuePos := 0 to MaxValuePos do
+    Values[ValuePos] := Values[ValuePos] / Total;
+end;
+
+{ TDecisionHeadScorer }
+
+constructor TDecisionHeadScorer.Create(AEngine: TChatEngine;
+  const AModelName: string);
+begin
+  inherited Create(AModelName);
+  FEngine := AEngine;
+  FHiddenSize := FEngine.Session.HiddenState().Depth;
+  FHeadTemperature := 1.0;
+  FTemperature := 1.0;
+end;
+
+procedure TDecisionHeadScorer.SetTemperature(Value: double);
+begin
+  if not (Value > 0) or IsInfinite(Value) then
+    raise EDecisionHeadError.CreateFmt('the decision temperature must be' +
+      ' positive and finite, not %g', [Value]);
+  FTemperature := Value;
+end;
+
+procedure TDecisionHeadScorer.SetHeadTemperature(Value: double;
+  const Source: string);
+begin
+  if not (Value > 0) or IsInfinite(Value) then
+    raise EDecisionHeadError.CreateFmt('%s: temperature %g', [Source, Value]);
+  FHeadTemperature := Value;
+  FTemperature := Value;
+end;
+
 { TKevScorer }
 
 constructor TKevScorer.Create(AEngine: TChatEngine;
@@ -170,8 +288,7 @@ var
   end;
 
 begin
-  inherited Create(AModelName);
-  FEngine := AEngine;
+  inherited Create(AEngine, AModelName);
   FQueryWeights := TNNetVolume.Create();
   FQueryBias := TNNetVolume.Create();
   FKeyWeights := TNNetVolume.Create();
@@ -181,7 +298,6 @@ begin
   FOptionOpenId := SpecialId(csKevOptionOpenToken);
   FOptionCloseId := SpecialId(csKevOptionCloseToken);
   FDecideId := SpecialId(csKevDecideToken);
-  FHiddenSize := FEngine.Session.HiddenState().Depth;
   Reader := TNNetTorchBinReader.Create(AHeadFile);
   try
     // Both need what a row-per-question pass cannot give: a packed attention
@@ -203,11 +319,7 @@ begin
     LoadDecisionHeadTensor(Reader, AHeadFile, 'head.k.weight', FPointerDim,
       FHiddenSize, FKeyWeights);
     LoadDecisionHeadTensor(Reader, AHeadFile, 'head.k.bias', FPointerDim, 0, FKeyBias);
-    FHeadTemperature := Reader.GetMetadataFloat('temperature', 1.0);
-    if not (FHeadTemperature > 0) or IsInfinite(FHeadTemperature) then
-      raise EDecisionHeadError.CreateFmt('%s: temperature %g', [AHeadFile,
-        FHeadTemperature]);
-    FTemperature := FHeadTemperature;
+    SetHeadTemperature(Reader.GetMetadataFloat('temperature', 1.0), AHeadFile);
   finally
     Reader.Free;
   end;
@@ -220,14 +332,6 @@ begin
   FQueryBias.Free;
   FQueryWeights.Free;
   inherited Destroy();
-end;
-
-procedure TKevScorer.SetTemperature(Value: double);
-begin
-  if not (Value > 0) or IsInfinite(Value) then
-    raise EDecisionHeadError.CreateFmt('Kev temperature must be positive and' +
-      ' finite, not %g', [Value]);
-  FTemperature := Value;
 end;
 
 function TKevScorer.BuildStateIds(const StateText: string): TNeuralIntegerArray;
@@ -295,7 +399,7 @@ var
   OptionCount, OptionPos, MaxOptionPos, ElemPos, MaxElemPos: integer;
   Keys, Query: TNNetVolume;
   QueryOffset, KeyOffset: integer;
-  Scale, Largest, Total, QueryElem: double;
+  Scale, Total, QueryElem: double;
 begin
   OptionCount := Hidden.SizeX - 1;
   MaxOptionPos := OptionCount - 1;
@@ -327,15 +431,7 @@ begin
     Query.Free;
     Keys.Free;
   end;
-  Largest := MaxValue(Result);
-  Total := 0;
-  for OptionPos := 0 to MaxOptionPos do
-  begin
-    Result[OptionPos] := Exp(Result[OptionPos] - Largest);
-    Total := Total + Result[OptionPos];
-  end;
-  for OptionPos := 0 to MaxOptionPos do
-    Result[OptionPos] := Result[OptionPos] / Total;
+  SoftMaxInPlace(Result);
 end;
 
 procedure TKevScorer.Score(const Request: TDecisionRequest;
@@ -398,6 +494,307 @@ begin
     end;
   finally
     Hidden.Free;
+  end;
+end;
+
+function OpenJevCheckpointDir(const Dir: string): string;
+const
+  Subdirs: array[0..2] of string = ('', 'checkpoint',
+    'package' + DirectorySeparator + 'checkpoint');
+var
+  SubdirPos: integer;
+  Candidate: string;
+begin
+  for SubdirPos := 0 to High(Subdirs) do
+  begin
+    Candidate := IncludeTrailingPathDelimiter(IncludeTrailingPathDelimiter(Dir) +
+      Subdirs[SubdirPos]);
+    if FileExists(Candidate + csOpenJevHeadFile) and
+      FileExists(Candidate + csOpenJevTemperatureFile) then
+      Exit(Candidate);
+  end;
+  Result := '';
+end;
+
+// The option text jev.api.compile_request builds: choice "name" or "name: desc", score the level.
+function OpenJevOptionText(const Question: TDecisionQuestion; OptionPos: integer): string;
+begin
+  if Question.Kind = dqkScore then
+    Result := Question.OpenJevDescriptions[OptionPos]
+  else if Question.OptionHasDescription[OptionPos] then
+    Result := Question.OptionNames[OptionPos] + ': ' +
+      Question.OpenJevDescriptions[OptionPos]
+  else
+    Result := Question.OptionNames[OptionPos];
+end;
+
+function OpenJevCandidatePrompts(const Request: TDecisionRequest;
+  const Question: TDecisionQuestion): TStringArray;
+var
+  Prefix, QuestionText: string;
+  OptionPos, MaxOptionPos: integer;
+begin
+  Result := nil;
+  QuestionText := Question.OpenJevInstructions;
+  if Question.Kind = dqkNoul then
+  begin
+    // compile_request appends the true description first.
+    if Question.OptionHasDescription[1] then
+      QuestionText := QuestionText + #10'Yes means: ' + Question.OpenJevDescriptions[1];
+    if Question.OptionHasDescription[0] then
+      QuestionText := QuestionText + #10'No means: ' + Question.OpenJevDescriptions[0];
+  end;
+  Prefix := 'Context:'#10 + Request.OpenJevState + #10#10'Question: ' +
+    QuestionText + #10;
+  if Question.Kind = dqkNoul then
+  begin
+    SetLength(Result, 1);
+    Result[0] := Prefix + 'Is the answer to this question yes? Answer Yes or No.';
+    exit;
+  end;
+  SetLength(Result, Length(Question.OptionNames));
+  MaxOptionPos := High(Result);
+  for OptionPos := 0 to MaxOptionPos do
+    Result[OptionPos] := Prefix + 'Proposed answer: ' +
+      OpenJevOptionText(Question, OptionPos) +
+      #10'Is this proposed answer correct? Answer Yes or No.';
+end;
+
+{ TOpenJevScorer }
+
+constructor TOpenJevScorer.Create(AEngine: TChatEngine;
+  const AModelName, ACheckpointDir: string);
+var
+  CheckpointDir, HeadFile: string;
+  Config: TJSONObject;
+  Field: TJSONData;
+  Reader: TNNetTorchBinReader;
+  BiasVolume: TNNetVolume;
+
+  function ReadConfig(const FileName: string): TJSONObject;
+  var
+    Text: TStringList;
+    Root: TJSONData;
+  begin
+    if not FileExists(FileName) then
+      raise EDecisionHeadError.CreateFmt('%s: file not found', [FileName]);
+    Text := TStringList.Create;
+    try
+      Text.LoadFromFile(FileName);
+      try
+        Root := GetJSON(Text.Text);
+      except
+        on E: Exception do
+          raise EDecisionHeadError.CreateFmt('%s: %s', [FileName, E.Message]);
+      end;
+    finally
+      Text.Free;
+    end;
+    if not (Root is TJSONObject) then
+    begin
+      Root.Free;
+      raise EDecisionHeadError.CreateFmt('%s: not a JSON object', [FileName]);
+    end;
+    Result := TJSONObject(Root);
+  end;
+
+  function ConfigText(const Name: string): string;
+  var
+    TextField: TJSONData;
+  begin
+    TextField := Config.Find(Name);
+    if (TextField <> nil) and (TextField.JSONType = jtString) then
+      Result := TextField.AsString
+    else
+      Result := '';
+  end;
+
+begin
+  inherited Create(AEngine, AModelName);
+  FSharePrefix := true;
+  FHeadWeights := TNNetVolume.Create();
+  CheckpointDir := OpenJevCheckpointDir(ACheckpointDir);
+  if CheckpointDir = '' then
+    raise EDecisionHeadError.CreateFmt('%s: no Open-Jev checkpoint (%s and %s)' +
+      ' in it, in checkpoint/ or in package/checkpoint/', [ACheckpointDir,
+      csOpenJevHeadFile, csOpenJevTemperatureFile]);
+  if (FEngine.Tokenizer.TokenToId('<|im_start|>') < 0) or
+    (FEngine.Tokenizer.TokenToId('<|im_end|>') < 0) then
+    raise EDecisionHeadError.CreateFmt('the tokenizer of %s has no <|im_start|>' +
+      ' or <|im_end|> token, which Open-Jev''s chat prompts need',
+      [FEngine.Opt.ModelDir]);
+  Config := ReadConfig(CheckpointDir + csOpenJevModelFile);
+  try
+    Field := Config.Find('max_length');
+    if (Field = nil) or not (Field is TJSONIntegerNumber) or (Field.AsInteger <= 0) then
+      raise EDecisionHeadError.CreateFmt('%s: max_length must be a positive' +
+        ' integer', [CheckpointDir + csOpenJevModelFile]);
+    FMaxPromptTokens := Field.AsInteger;
+    Field := Config.Find('lora_rank');
+    if (Field <> nil) and (Field is TJSONIntegerNumber) then
+      FLoRARank := Field.AsInteger;
+    FBaseModelId := ConfigText('model_id');
+    FBaseRevision := ConfigText('revision');
+  finally
+    Config.Free;
+  end;
+  Config := ReadConfig(CheckpointDir + csOpenJevTemperatureFile);
+  try
+    Field := Config.Find('temperature');
+    if (Field = nil) or (Field.JSONType <> jtNumber) then
+      raise EDecisionHeadError.CreateFmt('%s: no numeric "temperature"',
+        [CheckpointDir + csOpenJevTemperatureFile]);
+    SetHeadTemperature(Field.AsFloat, CheckpointDir + csOpenJevTemperatureFile);
+  finally
+    Config.Free;
+  end;
+  HeadFile := CheckpointDir + csOpenJevHeadFile;
+  BiasVolume := TNNetVolume.Create();
+  Reader := TNNetTorchBinReader.Create(HeadFile);
+  try
+    LoadDecisionHeadTensor(Reader, HeadFile, 'weight', 1, FHiddenSize, FHeadWeights);
+    LoadDecisionHeadTensor(Reader, HeadFile, 'bias', 1, 0, BiasVolume);
+    FHeadBias := BiasVolume.FData[0];
+  finally
+    Reader.Free;
+    BiasVolume.Free;
+  end;
+end;
+
+destructor TOpenJevScorer.Destroy();
+begin
+  FHeadWeights.Free;
+  inherited Destroy();
+end;
+
+procedure TOpenJevScorer.SetMaxPromptTokens(Value: integer);
+begin
+  if Value <= 0 then
+    raise EDecisionHeadError.CreateFmt('Open-Jev max_length must be positive,' +
+      ' not %d', [Value]);
+  FMaxPromptTokens := Value;
+end;
+
+function TOpenJevScorer.RenderPrompt(const CandidatePrompt: string): string;
+var
+  Msgs: array[0..0] of TChatMessage;
+begin
+  // The Qwen3.5-2B/9B and Qwen3.8-27B templates render one user turn alike
+  // with thinking off; the 2B template detects as plain ChatML, so the frame is fixed.
+  Msgs[0] := ChatMessage('user', RewriteSpecialTokenStrings(CandidatePrompt));
+  Result := ApplyChatTemplate(cfQwen3_5, Msgs, ChatTemplateOptions(
+    {AddGenerationPrompt=}true, {ContinueFinalMessage=}false, reOff));
+end;
+
+function TOpenJevScorer.HeadScore(Hidden: TNNetVolume): double;
+var
+  ElemPos, MaxElemPos: integer;
+begin
+  Result := FHeadBias;
+  MaxElemPos := FHiddenSize - 1;
+  for ElemPos := 0 to MaxElemPos do
+    Result := Result + FHeadWeights.FData[ElemPos] * Hidden.FData[ElemPos];
+end;
+
+procedure TOpenJevScorer.Score(const Request: TDecisionRequest;
+  out Answers: TDecisionAnswers; out InputTokens, OutputTokens: integer);
+var
+  QuestionPos, MaxQuestionPos, CandidatePos, MaxCandidatePos: integer;
+  PromptCount, PromptPos, MaxPromptPos, PromptLen, PrefixLen, OptionCount: integer;
+  Candidates: TStringArray;
+  Question: TDecisionQuestion;
+  HiddenPositions: TNeuralIntegerArray;
+  Hidden: TNNetVolume;
+  P: TDecisionProbabilities;
+begin
+  InputTokens := 0;
+  OutputTokens := 0;
+  Answers := nil;
+  FLastPrompts := nil;
+  FLastScores := nil;
+  FLastSharedPrefixLen := 0;
+  MaxQuestionPos := High(Request.Questions);
+  PromptCount := 0;
+  // Every prompt is built and checked before the model reads anything.
+  for QuestionPos := 0 to MaxQuestionPos do
+  begin
+    Question := Request.Questions[QuestionPos];
+    Candidates := OpenJevCandidatePrompts(Request, Question);
+    SetLength(FLastPrompts, PromptCount + Length(Candidates));
+    MaxCandidatePos := High(Candidates);
+    for CandidatePos := 0 to MaxCandidatePos do
+    begin
+      FLastPrompts[PromptCount].QuestionPos := QuestionPos;
+      FLastPrompts[PromptCount].Text := RenderPrompt(Candidates[CandidatePos]);
+      FLastPrompts[PromptCount].Ids := FEngine.Tokenizer.Encode(
+        FLastPrompts[PromptCount].Text);
+      PromptLen := Length(FLastPrompts[PromptCount].Ids);
+      if PromptLen > FMaxPromptTokens then
+        raise EDecisionUnsupported.CreateFmt('question "%s": a %d-token prompt' +
+          ' exceeds the checkpoint''s max_length of %d tokens',
+          [Question.Id, PromptLen, FMaxPromptTokens]);
+      if PromptLen > FEngine.SeqLen then
+        raise EDecisionUnsupported.CreateFmt('question "%s": a %d-token prompt' +
+          ' exceeds the %d-token context', [Question.Id, PromptLen, FEngine.SeqLen]);
+      Inc(PromptCount);
+    end;
+  end;
+  if PromptCount = 0 then exit;
+  MaxPromptPos := PromptCount - 1;
+  // jev's common_prefix_length: at least one token of every prompt is left to feed.
+  PrefixLen := 0;
+  if FSharePrefix then
+  begin
+    PrefixLen := Length(FLastPrompts[0].Ids) - 1;
+    for PromptPos := 1 to MaxPromptPos do
+      PrefixLen := Min(PrefixLen, Min(Length(FLastPrompts[PromptPos].Ids) - 1,
+        CommonPrefixLen(FLastPrompts[0].Ids, FLastPrompts[PromptPos].Ids)));
+  end;
+  FLastSharedPrefixLen := PrefixLen;
+  SetLength(FLastScores, PromptCount);
+  FEngine.PrefillDecisionPrefix(Copy(FLastPrompts[0].Ids, 0, PrefixLen));
+  InputTokens := PrefixLen;
+  HiddenPositions := nil;
+  SetLength(HiddenPositions, 1);
+  Hidden := TNNetVolume.Create();
+  try
+    for PromptPos := 0 to MaxPromptPos do
+    begin
+      PromptLen := Length(FLastPrompts[PromptPos].Ids);
+      HiddenPositions[0] := PromptLen - PrefixLen - 1;
+      FEngine.ScoreDecisionBranch(Copy(FLastPrompts[PromptPos].Ids, PrefixLen,
+        MaxInt), HiddenPositions, nil, Hidden);
+      FLastScores[PromptPos] := HeadScore(Hidden);
+      InputTokens := InputTokens + PromptLen - PrefixLen;
+    end;
+  finally
+    Hidden.Free;
+  end;
+  SetLength(Answers, Length(Request.Questions));
+  PromptPos := 0;
+  for QuestionPos := 0 to MaxQuestionPos do
+  begin
+    Question := Request.Questions[QuestionPos];
+    if Question.Kind = dqkNoul then
+    begin
+      // jev reads noul as the softmax of [0, s]: p(true) = sigmoid(s / T).
+      P := nil;
+      SetLength(P, 2);
+      P[0] := 0;
+      P[1] := FLastScores[PromptPos] / FTemperature;
+      Inc(PromptPos);
+    end
+    else
+    begin
+      OptionCount := Length(Question.OptionNames);
+      P := Copy(FLastScores, PromptPos, OptionCount);
+      MaxCandidatePos := OptionCount - 1;
+      for CandidatePos := 0 to MaxCandidatePos do
+        P[CandidatePos] := P[CandidatePos] / FTemperature;
+      Inc(PromptPos, OptionCount);
+    end;
+    SoftMaxInPlace(P);
+    Answers[QuestionPos] := DecisionAnswerFromProbabilities(Question.Kind, P);
   end;
 end;
 

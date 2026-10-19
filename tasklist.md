@@ -4574,10 +4574,33 @@ rather than acted on.
         ids exact, probabilities within 4.1e-6. Open: kev renders an empty list/object
         description as "name: " (`[] != ""`); the Pascal parser stores '' and writes
         "name".
-  - [ ] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
+  - [x] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
         the first token where the candidates diverge (check encode(prefix + suffix) =
         encode(prefix) + encode(suffix), else score the full prompt), Linear(d,1) head,
         `temperature.json`. Fixture as in D2.3.
+        Done: `TOpenJevScorer` (with `TKevScorer` now under `TDecisionHeadScorer`,
+        which owns the temperature override). It takes the checkpoint directory
+        (`head.pt`, `temperature.json`, `model.json`, `adapter/`) or anything
+        `OpenJevCheckpointDir` resolves to one (`<dir>/checkpoint`,
+        `<dir>/package/checkpoint`, the HF repo layout); the engine is loaded with
+        `<checkpoint>/adapter`. The request parser now also keeps Open-Jev's
+        rendering (`OpenJevState`, `OpenJevInstructions`, `OpenJevDescriptions`,
+        `OptionHasDescription`: `""` -> "name: ", null -> "name") via
+        `DecisionValueToSortedJSON` = json.dumps(sort_keys=True,
+        ensure_ascii=False); `DecisionFloatToStr` now prints subnormals like
+        Python (5e-324). Prompts are framed with cfQwen3_5 + reOff whatever the
+        engine detects: the real Qwen3.5-2B template has no `preserve_thinking`,
+        so `DetectChatFormat` calls it cfChatML (also affects chat on that base).
+        Usage counts fed tokens like the other scorers (jev reports the sum of
+        full prompt lengths). The token prefix shared by all prompts of the
+        request is fed once (exact by construction: LCP of full encodings).
+        Divergences from jev: `<|x|>` in caller text is rewritten (jev tokenizes
+        it as a special token); a null noul description is ignored (jev: 422);
+        1-level scores and numeric descriptions are accepted. Fixture
+        `tests/fixtures/openjev_qwen3_5/` (137 KB) by `tools/openjev_tiny_fixture.py`;
+        oracle = jev's compile_request/candidate_prompts + DecisionModel.forward +
+        Predictor.predict (float64 backbone; `score_cached` cannot run on the
+        venv's transformers 5.17). Strings and ids exact, p within 6.4e-7.
   - [ ] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
         load the base given by the usual model directory (warn when it differs from
         the adapter's recorded base), merge, read the head, switch to decision-only.

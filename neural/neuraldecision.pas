@@ -28,7 +28,8 @@ Coded by Claude (AI).
 //   - ParseDecisionRequest validates a request body and reports failures as
 //     FastAPI-style 422 details ({"detail":[{loc, msg, type}]}).
 //   - RenderDecisionValue flattens string/object/array values to the text a
-//     scorer feeds the model (Kev's api.render).
+//     scorer feeds the model (Kev's api.render); RenderDecisionValueOpenJev is
+//     Open-Jev's rendering (the text as is, else sorted json.dumps).
 //   - RewriteSpecialTokenStrings turns "<|x|>" into "<¦x¦>" so caller text
 //     cannot spell a special token.
 //   - DecisionAnswerFromProbabilities + DecisionResponseToJSON derive the
@@ -71,12 +72,16 @@ type
     OptionNames: TStringArray;
     OptionDescriptions: TStringArray;  // rendered; '' for null or absent
     LegendJSON: TStringArray;          // score only: each level's original JSON value
+    OpenJevInstructions: string;       // RenderDecisionValueOpenJev
+    OpenJevDescriptions: TStringArray; // RenderDecisionValueOpenJev; '' for null or absent
+    OptionHasDescription: array of boolean; // false for a null or absent description
   end;
   TDecisionQuestions = array of TDecisionQuestion;
 
   TDecisionRequest = record
     Model: string;
     State: string;                     // rendered
+    OpenJevState: string;              // RenderDecisionValueOpenJev
     Questions: TDecisionQuestions;     // in request key order
   end;
 
@@ -138,10 +143,16 @@ function RenderDecisionValue(Value: TJSONData; Indent: integer = 0;
   ShieldedKeys: TStrings = nil): string;
 // Compact JSON (Python json.dumps separators=(',', ':'), ensure_ascii=False).
 function DecisionValueToJSON(Value: TJSONData; ShieldedKeys: TStrings = nil): string;
+// Python json.dumps(Value, ensure_ascii=False, sort_keys=True): ', ' and ': '
+// separators, object keys in code-point order at every depth.
+function DecisionValueToSortedJSON(Value: TJSONData; ShieldedKeys: TStrings = nil): string;
+// Open-Jev's jev.api._render: a string as is, nil as '', anything else
+// DecisionValueToSortedJSON.
+function RenderDecisionValueOpenJev(Value: TJSONData; ShieldedKeys: TStrings = nil): string;
 // S as a quoted JSON string, non-ASCII kept as raw UTF-8.
 function DecisionJSONString(const S: string): string;
 // Python repr(float): shortest round-trip digits, exponent form below 1e-4 and from
-// 1e16. Subnormals may keep one digit too many (5e-324 -> 4.9e-324).
+// 1e16.
 function DecisionFloatToStr(V: double): string;
 
 // "<|name|>" -> "<¦name¦>" (U+00A6), name = [A-Za-z0-9_]+, as Kev's _SPECIAL_RE.
@@ -272,6 +283,27 @@ end;
 const
   csUnsafeKeyMsg = 'Value error, object keys longer than 255 bytes are not supported';
 
+// V (> 0) to one significant digit as "dE<exp>": FloatToStrF prints at least
+// two digits, which only a subnormal needs to avoid (5e-324 printed 4.9E-324).
+function OneDigitMantissa(V: double): string;
+var
+  Wide: string;
+  ExpPos, Digit, Exp10: integer;
+begin
+  Wide := FloatToStrF(V, ffExponent, 17, 0, DecisionFormat);
+  ExpPos := Pos('E', Wide);
+  if ExpPos = 0 then Exp10 := 0
+  else Exp10 := StrToInt(Copy(Wide, ExpPos + 1, Length(Wide)));
+  Digit := Ord(Wide[1]) - Ord('0');
+  if (Length(Wide) >= 3) and (Wide[3] >= '5') then Inc(Digit);
+  if Digit = 10 then
+  begin
+    Digit := 1;
+    Inc(Exp10);
+  end;
+  Result := IntToStr(Digit) + 'E' + IntToStr(Exp10);
+end;
+
 function DecisionFloatToStr(V: double): string;
 var
   Precision, ExpPos, Exp10, DigitCount, PointPos: integer;
@@ -294,7 +326,10 @@ begin
   Mantissa := '';
   for Precision := 1 to 17 do
   begin
-    Mantissa := FloatToStrF(V, ffExponent, Precision, 0, DecisionFormat);
+    if Precision = 1 then
+      Mantissa := OneDigitMantissa(V)
+    else
+      Mantissa := FloatToStrF(V, ffExponent, Precision, 0, DecisionFormat);
     // StrToFloat returns Extended: round to double (when in range) before comparing.
     ParsedWide := StrToFloat(Mantissa, DecisionFormat);
     if ParsedWide > MaxDouble then continue;
@@ -431,44 +466,105 @@ begin
   end;
 end;
 
-function DecisionValueToJSON(Value: TJSONData; ShieldedKeys: TStrings): string;
+// Sorted = Python's json.dumps(sort_keys=True) defaults; else the compact form.
+procedure AppendDecisionValueJSON(Builder: TStringBuilder; Value: TJSONData;
+  ShieldedKeys: TStrings; Sorted: boolean);
 var
   ItemPos, MaxItemPos: integer;
-  Builder: TStringBuilder;
+  Keys: TStringList;
 begin
-  if Value = nil then Exit('null');
+  if Value = nil then
+  begin
+    Builder.Append('null');
+    exit;
+  end;
   case Value.JSONType of
-    jtNull: Result := 'null';
     jtBoolean:
-      if Value.AsBoolean then Result := 'true' else Result := 'false';
+      if Value.AsBoolean then Builder.Append('true') else Builder.Append('false');
     jtNumber:
       if Value is TJSONFloatNumber then
-        Result := DecisionFloatToStr(Value.AsFloat)
+        Builder.Append(DecisionFloatToStr(Value.AsFloat))
       else
-        Result := Value.AsString;
-    jtString: Result := DecisionJSONString(Value.AsString);
-    jtArray, jtObject:
+        Builder.Append(Value.AsString);
+    jtString: Builder.Append(DecisionJSONString(Value.AsString));
+    jtArray:
     begin
-      Builder := TStringBuilder.Create;
+      Builder.Append('[');
+      MaxItemPos := Value.Count - 1;
+      for ItemPos := 0 to MaxItemPos do
+      begin
+        if ItemPos > 0 then
+          if Sorted then Builder.Append(', ') else Builder.Append(',');
+        AppendDecisionValueJSON(Builder, Value.Items[ItemPos], ShieldedKeys, Sorted);
+      end;
+      Builder.Append(']');
+    end;
+    jtObject:
+    begin
+      Keys := TStringList.Create;
       try
-        if Value.JSONType = jtArray then Builder.Append('[') else Builder.Append('{');
         MaxItemPos := Value.Count - 1;
         for ItemPos := 0 to MaxItemPos do
+          Keys.AddObject(ObjectKey(TJSONObject(Value), ItemPos, ShieldedKeys),
+            TObject(PtrInt(ItemPos)));
+        if Sorted then
         begin
-          if ItemPos > 0 then Builder.Append(',');
-          if Value.JSONType = jtObject then
-            Builder.Append(DecisionJSONString(
-              ObjectKey(TJSONObject(Value), ItemPos, ShieldedKeys))).Append(':');
-          Builder.Append(DecisionValueToJSON(Value.Items[ItemPos], ShieldedKeys));
+          // Byte order of UTF-8 keys = Python's code-point order.
+          Keys.UseLocale := false;
+          Keys.CaseSensitive := true;
+          Keys.Sort;
         end;
-        if Value.JSONType = jtArray then Builder.Append(']') else Builder.Append('}');
-        Result := Builder.ToString();
+        Builder.Append('{');
+        for ItemPos := 0 to MaxItemPos do
+        begin
+          if ItemPos > 0 then
+            if Sorted then Builder.Append(', ') else Builder.Append(',');
+          Builder.Append(DecisionJSONString(Keys[ItemPos]));
+          if Sorted then Builder.Append(': ') else Builder.Append(':');
+          AppendDecisionValueJSON(Builder,
+            Value.Items[PtrInt(Keys.Objects[ItemPos])], ShieldedKeys, Sorted);
+        end;
+        Builder.Append('}');
       finally
-        Builder.Free;
+        Keys.Free;
       end;
     end;
-    else Result := 'null';
+    else Builder.Append('null');
   end;
+end;
+
+function DecisionValueToJSONText(Value: TJSONData; ShieldedKeys: TStrings;
+  Sorted: boolean): string;
+var
+  Builder: TStringBuilder;
+begin
+  Builder := TStringBuilder.Create;
+  try
+    AppendDecisionValueJSON(Builder, Value, ShieldedKeys, Sorted);
+    Result := Builder.ToString();
+  finally
+    Builder.Free;
+  end;
+end;
+
+function DecisionValueToJSON(Value: TJSONData; ShieldedKeys: TStrings): string;
+begin
+  Result := DecisionValueToJSONText(Value, ShieldedKeys, {Sorted=}false);
+end;
+
+function DecisionValueToSortedJSON(Value: TJSONData; ShieldedKeys: TStrings): string;
+begin
+  Result := DecisionValueToJSONText(Value, ShieldedKeys, {Sorted=}true);
+end;
+
+function RenderDecisionValueOpenJev(Value: TJSONData; ShieldedKeys: TStrings): string;
+begin
+  if Value = nil then
+    Result := ''
+  else if Value.JSONType = jtString then
+    Result := Value.AsString
+  else
+    Result := DecisionValueToSortedJSON(Value, ShieldedKeys);
 end;
 
 function RewriteSpecialTokenStrings(const Text: string): string;
@@ -738,6 +834,16 @@ begin
   Result := '{"detail":' + DecisionJSONString(Msg) + '}';
 end;
 
+procedure SetOpenJevDescription(var Question: TDecisionQuestion;
+  OptionPos: integer; Value: TJSONData; ShieldedKeys: TStrings);
+begin
+  Question.OptionHasDescription[OptionPos] := (Value <> nil) and
+    (Value.JSONType <> jtNull);
+  if Question.OptionHasDescription[OptionPos] then
+    Question.OpenJevDescriptions[OptionPos] := RenderDecisionValueOpenJev(Value,
+      ShieldedKeys);
+end;
+
 function ParseDecisionQuestion(const Id: string; QuestionData: TJSONData;
   ShieldedKeys: TStrings; var Question: TDecisionQuestion;
   var Errors: TDecisionErrorDetails): boolean;
@@ -780,6 +886,8 @@ begin
   end;
   Question.Instructions := RenderDecisionValue(QuestionObj.Find('instructions'),
     0, ShieldedKeys);
+  Question.OpenJevInstructions := RenderDecisionValueOpenJev(
+    QuestionObj.Find('instructions'), ShieldedKeys);
   CriteriaLoc[0] := LocName('body');
   CriteriaLoc[1] := LocName('questions');
   CriteriaLoc[2] := LocName(Id);
@@ -803,6 +911,8 @@ begin
         OptionCount := CriteriaObj.Count;
         SetLength(Question.OptionNames, OptionCount);
         SetLength(Question.OptionDescriptions, OptionCount);
+        SetLength(Question.OpenJevDescriptions, OptionCount);
+        SetLength(Question.OptionHasDescription, OptionCount);
         MaxOptionPos := OptionCount - 1;
         for OptionPos := 0 to MaxOptionPos do
         begin
@@ -814,6 +924,8 @@ begin
           Question.OptionNames[OptionPos] := OptionName;
           Question.OptionDescriptions[OptionPos] := RenderDecisionValue(
             CriteriaObj.Items[OptionPos], 0, ShieldedKeys);
+          SetOpenJevDescription(Question, OptionPos, CriteriaObj.Items[OptionPos],
+            ShieldedKeys);
         end;
       end;
     end;
@@ -837,6 +949,8 @@ begin
         SetLength(Question.OptionNames, OptionCount);
         SetLength(Question.OptionDescriptions, OptionCount);
         SetLength(Question.LegendJSON, OptionCount);
+        SetLength(Question.OpenJevDescriptions, OptionCount);
+        SetLength(Question.OptionHasDescription, OptionCount);
         MaxOptionPos := OptionCount - 1;
         for OptionPos := 0 to MaxOptionPos do
         begin
@@ -849,6 +963,8 @@ begin
             Criteria.Items[OptionPos], 0, ShieldedKeys);
           Question.LegendJSON[OptionPos] := DecisionValueToJSON(
             Criteria.Items[OptionPos], ShieldedKeys);
+          SetOpenJevDescription(Question, OptionPos, Criteria.Items[OptionPos],
+            ShieldedKeys);
         end;
       end;
     end;
@@ -856,6 +972,8 @@ begin
     begin
       SetLength(Question.OptionNames, 2);
       SetLength(Question.OptionDescriptions, 2);
+      SetLength(Question.OpenJevDescriptions, 2);
+      SetLength(Question.OptionHasDescription, 2);
       Question.OptionNames[0] := 'false';
       Question.OptionNames[1] := 'true';
       if (Criteria <> nil) and (Criteria.JSONType <> jtNull) then
@@ -870,6 +988,8 @@ begin
             CriteriaObj.Find('false'), 0, ShieldedKeys);
           Question.OptionDescriptions[1] := RenderDecisionValue(
             CriteriaObj.Find('true'), 0, ShieldedKeys);
+          SetOpenJevDescription(Question, 0, CriteriaObj.Find('false'), ShieldedKeys);
+          SetOpenJevDescription(Question, 1, CriteriaObj.Find('true'), ShieldedKeys);
         end;
       end;
     end;
@@ -909,7 +1029,10 @@ begin
     AddDecisionError(Errors, [LocName('body'), LocName('state')], 'Field required',
       'missing')
   else
+  begin
     Request.State := RenderDecisionValue(Field, 0, ShieldedKeys);
+    Request.OpenJevState := RenderDecisionValueOpenJev(Field, ShieldedKeys);
+  end;
   Field := Body.Find('assets');
   if (Field <> nil) and (Field.JSONType <> jtNull) and
     not ((Field.JSONType in [jtArray, jtObject]) and (Field.Count = 0)) then
