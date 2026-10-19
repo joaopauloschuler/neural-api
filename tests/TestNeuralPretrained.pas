@@ -1141,6 +1141,10 @@ type
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
     procedure TestLoadPretrainedEmbedding;
     procedure TestPEFTLoRAAdapterLoadAndMerge;
+    procedure TestLoRAMergeQwen35LogitParity;
+    procedure TestLoRAMergeQwen3LogitParity;
+    procedure TestLoRAMergeQwen35Int8;
+    procedure TestLoRAMergeRejectsUnsupportedAdapters;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
     procedure TestGenerationDefaultsFromJSONFile;
@@ -45336,6 +45340,259 @@ begin
     AdaptNN.Free;
     MergeNN.Free;
   end;
+end;
+
+// LoRA merge in HF tensor space: tests/fixtures/lora_merge_qwen3_5/ is a
+// PEFT adapter (tools/lora_merge_tiny_fixture.py, PEFT's own save_pretrained)
+// on every Kev target module of the tiny_qwen3_5 hybrid, keys
+// "base_model.model.layers.N.<module>" against a checkpoint under
+// "model.language_model.", with rank_pattern/alpha_pattern entries. The
+// oracle is HF float64 logits of merge_and_unload(). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen35LogitParity;
+const
+  WName = 'model.language_model.layers.3.self_attn.q_proj.weight';
+var
+  NN: TNNet;
+  Reader: TNNetLoRAMergeReader;
+  AdapterDir: string;
+  Whole, Rows: TNNetVolume;
+  ElemCnt, MaxElemPos, FirstElem: integer;
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3_5' + DirectorySeparator + 'logits.json'));
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+    {pSeqLen=}0, {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'),
+    {pQuantizeInt8=}false, {pWeightOwner=}nil, AdapterDir);
+  try
+    AssertLogitParityWithFixture(NN, AdapterDir + 'logits.json', 16, 13);
+  finally
+    NN.Free;
+  end;
+  // A row range that does not start on a row boundary (RowSize 4, InDim 8)
+  // must read exactly the matching slice of the whole merged tensor.
+  Reader := TNNetLoRAMergeReader.Create(TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_qwen3_5.safetensors')), AdapterDir);
+  Whole := TNNetVolume.Create;
+  Rows := TNNetVolume.Create;
+  try
+    // 6 linear layers x 5 modules + 2 full layers x 4 + 8 x 3 MLP modules.
+    AssertEquals('adapted tensors', 62, Reader.AdaptedTensorCount);
+    AssertEquals('merged dtype', 'F32', Reader.GetDType(WName));
+    AssertTrue('row view', Reader.CanStreamTensorRows(WName));
+    Reader.LoadTensorFlat(WName, Whole);
+    Reader.LoadTensorRowsFlat(WName, {FirstRow=}3, {RowCount=}5,
+      {RowSize=}4, Rows);
+    FirstElem := 3 * 4;
+    MaxElemPos := Rows.Size - 1;
+    for ElemCnt := 0 to MaxElemPos do
+      AssertEquals('row view element ' + IntToStr(ElemCnt),
+        Whole.FData[FirstElem + ElemCnt], Rows.FData[ElemCnt], 1e-6);
+  finally
+    Rows.Free;
+    Whole.Free;
+    Reader.Free;
+  end;
+end;
+
+// Attention-only twin of TestLoRAMergeQwen35LogitParity: the tiny_qwen3
+// checkpoint keys sit under "model." and its embeddings are tied; the adapter
+// covers q/k/v/o and gate/up/down. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen3LogitParity;
+var
+  NN: TNNet;
+  AdapterDir: string;
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3' + DirectorySeparator + 'logits.json'));
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3.safetensors'),
+    {pSeqLen=}0, {pTrainable=}false, FixturePath('tiny_qwen3_config.json'),
+    {pQuantizeInt8=}false, {pWeightOwner=}nil, AdapterDir);
+  try
+    AssertLogitParityWithFixture(NN, AdapterDir + 'logits.json', 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// The int8 build of the merged Qwen3.5 fixture (direct-to-int8 row streaming
+// reads merged rows) must equal the int8 build of a checkpoint holding the
+// merged weights, and sit closer to the merged oracle than to the base one.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen35Int8;
+var
+  NNQ, NNBaked: TNNet;
+  Reader: TNNetLoRAMergeReader;
+  Writer: TNNetSafeTensorsWriter;
+  AdapterDir, BakedFile: string;
+  RefJson: TStringList;
+  RefRoot, BaseRoot: TJSONData;
+  Sequences, MergedLogits, BaseLogits, RowArr, BaseRowArr: TJSONArray;
+  Input, Output, BakedOutput, Tensor: TNNetVolume;
+  SeqCnt, PosCnt, TokCnt, QuantLayers, LayerCnt, TensorCnt: integer;
+  MergedDiff, BaseDiff, BakedDiff, Value: double;
+
+  function LoadLogits(const FileName: string): TJSONData;
+  begin
+    RefJson.LoadFromFile(FileName);
+    Result := GetJSON(RefJson.Text);
+  end;
+
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3_5' + DirectorySeparator + 'logits.json'));
+  BakedFile := GetTempDir(false) + 'cai_lora_merged_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create(16, 1, 1);
+  Output := TNNetVolume.Create;
+  BakedOutput := TNNetVolume.Create;
+  RefRoot := LoadLogits(AdapterDir + 'logits.json');
+  BaseRoot := nil;
+  NNQ := nil;
+  NNBaked := nil;
+  try
+    BaseRoot := LoadLogits(FixturePath('tiny_qwen3_5_logits.json'));
+    BaseLogits := TJSONArray(TJSONObject(BaseRoot).Find('logits'));
+    Reader := TNNetLoRAMergeReader.Create(TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_qwen3_5.safetensors')), AdapterDir);
+    Writer := TNNetSafeTensorsWriter.Create(BakedFile);
+    Tensor := TNNetVolume.Create;
+    try
+      for TensorCnt := 0 to Reader.Count - 1 do
+      begin
+        Reader.LoadTensorFlat(Reader.TensorName(TensorCnt), Tensor);
+        Writer.AddTensorFlat(Reader.TensorName(TensorCnt),
+          Reader.GetInfo(Reader.TensorName(TensorCnt)).Shape, Tensor);
+      end;
+      Writer.SaveToFile;
+    finally
+      Tensor.Free;
+      Writer.Free;
+      Reader.Free;
+    end;
+    NNQ := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {pSeqLen=}0, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'), {pQuantizeInt8=}true,
+      {pWeightOwner=}nil, AdapterDir);
+    NNBaked := BuildFromPretrained(BakedFile, {pSeqLen=}0, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'), {pQuantizeInt8=}true);
+    QuantLayers := 0;
+    for LayerCnt := 0 to NNQ.GetLastLayerIdx() do
+      if (NNQ.Layers[LayerCnt] is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(NNQ.Layers[LayerCnt]).WeightsQuantizedInt8 then
+        Inc(QuantLayers);
+    AssertTrue('int8 layers present', QuantLayers > 0);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    MergedLogits := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    MergedDiff := 0;
+    BaseDiff := 0;
+    BakedDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      for PosCnt := 0 to 15 do
+        Input.FData[PosCnt] :=
+          TJSONArray(Sequences.Items[SeqCnt]).Items[PosCnt].AsInteger;
+      NNQ.Compute(Input);
+      NNQ.GetOutput(Output);
+      NNBaked.Compute(Input);
+      NNBaked.GetOutput(BakedOutput);
+      for PosCnt := 0 to 15 do
+      begin
+        RowArr := TJSONArray(TJSONArray(MergedLogits.Items[SeqCnt]).Items[PosCnt]);
+        BaseRowArr := TJSONArray(TJSONArray(BaseLogits.Items[SeqCnt]).Items[PosCnt]);
+        for TokCnt := 0 to 12 do
+        begin
+          Value := Output.FData[PosCnt * 13 + TokCnt];
+          MergedDiff := Max(MergedDiff, Abs(Value - RowArr.Items[TokCnt].AsFloat));
+          BaseDiff := Max(BaseDiff, Abs(Value - BaseRowArr.Items[TokCnt].AsFloat));
+          BakedDiff := Max(BakedDiff,
+            Abs(Value - BakedOutput.FData[PosCnt * 13 + TokCnt]));
+        end;
+      end;
+    end;
+    AssertTrue('int8 merged build vs int8 build of the baked merged ' +
+      'checkpoint: max |diff| = ' + FloatToStr(BakedDiff) + ' must be < 1e-5',
+      BakedDiff < 1e-5);
+    AssertTrue('int8 merged build: max |diff| to the merged oracle (' +
+      FloatToStr(MergedDiff) + ') must be below that to the base oracle (' +
+      FloatToStr(BaseDiff) + ')', MergedDiff < BaseDiff);
+  finally
+    NNBaked.Free;
+    NNQ.Free;
+    BaseRoot.Free;
+    RefRoot.Free;
+    BakedOutput.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    DeleteFile(BakedFile);
+  end;
+end;
+
+// adapter_config.json options whose weights are not base + (alpha/r) B A are
+// refused before any tensor is read, and an adapter whose modules match no
+// base tensor is refused too. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeRejectsUnsupportedAdapters;
+const
+  BadOptions: array[0..5] of string = ('"use_rslora": true',
+    '"use_dora": true', '"modules_to_save": ["lm_head"]',
+    '"trainable_token_indices": [1, 2]', '"bias": "all"',
+    '"init_lora_weights": "pissa"');
+var
+  AdapterDir, OptionName: string;
+  ConfigText: TStringList;
+  OptionCnt: integer;
+  Raised: boolean;
+begin
+  AdapterDir := GetTempDir(false) + 'cai_lora_merge_' +
+    IntToStr(Random(1000000)) + DirectorySeparator;
+  AssertTrue('temp adapter dir', ForceDirectories(AdapterDir));
+  ConfigText := TStringList.Create;
+  try
+    for OptionCnt := Low(BadOptions) to High(BadOptions) do
+    begin
+      ConfigText.Text := '{"peft_type": "LORA", "r": 2, "lora_alpha": 4, ' +
+        BadOptions[OptionCnt] + '}';
+      ConfigText.SaveToFile(AdapterDir + 'adapter_config.json');
+      OptionName := Copy(BadOptions[OptionCnt], 2,
+        Pos('"', Copy(BadOptions[OptionCnt], 2, MaxInt)) - 1);
+      Raised := false;
+      try
+        BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'), 0, false,
+          FixturePath('tiny_qwen3_5_config.json'), false, nil,
+          AdapterDir).Free;
+      except
+        on E: EPretrainedImportError do
+        begin
+          Raised := true;
+          AssertTrue('message names ' + OptionName + ': ' + E.Message,
+            Pos(OptionName, E.Message) > 0);
+        end;
+      end;
+      AssertTrue(BadOptions[OptionCnt] + ' must be refused', Raised);
+    end;
+  finally
+    DeleteFile(AdapterDir + 'adapter_config.json');
+    RemoveDir(AdapterDir);
+    ConfigText.Free;
+  end;
+  // The Qwen3 adapter targets self_attn in layer 0, a linear_attention layer
+  // of the Qwen3.5 checkpoint.
+  Raised := false;
+  try
+    BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'), 0, false,
+      FixturePath('tiny_qwen3_5_config.json'), false, nil,
+      ExtractFilePath(FixturePath('lora_merge_qwen3' + DirectorySeparator +
+      'logits.json'))).Free;
+  except
+    on E: EPretrainedImportError do
+    begin
+      Raised := true;
+      AssertTrue('message names the unmatched module: ' + E.Message,
+        Pos('matches no base tensor', E.Message) > 0);
+    end;
+  end;
+  AssertTrue('an adapter for another architecture must be refused', Raised);
 end;
 
 procedure TTestNeuralPretrained.TestMXFP4DequantHandBlock;

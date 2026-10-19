@@ -4540,11 +4540,26 @@ rather than acted on.
         Fixtures `tests/fixtures/torch_head/` by `tools/torch_head_fixture.py`
         (Kev through kev's own `write_meta`; Open-Jev with 'cpu' and 'cuda:0'
         locations). The real kev-0.8b and Open-Jev-2B `head.pt` files parse.
-  - [ ] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
+  - [x] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
         lora_alpha, target_modules), map adapter keys onto base checkpoint keys, merge
         in FP32, and build through the normal importer (export the in-memory tensor
         reader path). Test: pico Qwen3.5 + random adapter; merged build logits = HF
         reference with the merged weights.
+        Done: `TNNetLoRAMergeReader` wraps the base reader and adds
+        `(alpha/r) * B @ A` per load (whole tensor or row range, one module's A/B
+        cached), so the direct-to-int8/int4 row streaming reads merged rows and no
+        second copy of the model exists. Entry point `BuildFromPretrained(...,
+        pLoRAAdapterDir)` (Llama-builder model types; unused with pWeightOwner).
+        Key `base_model.model.<m>` -> `<m>.weight`, else `<text prefix><m>.weight`
+        (prefix of embed_tokens: Qwen3.5-0.8B-Base and Qwen3.5-2B are
+        `model.language_model.`). `ReadPEFTAdapterConfig` now reads
+        target_modules and plain-key rank_pattern/alpha_pattern and refuses DoRA,
+        rsLoRA, qalora, bdlora, lora_bias, bias != none, fan_in_fan_out,
+        modules_to_save, trainable_token_indices, layer_replication,
+        target_parameters, aLoRA, arrow, kasa, monteclora and base-rewriting inits
+        (pissa/olora/corda/loftq/lora_ga). Fixtures `tests/fixtures/
+        lora_merge_qwen3_5/` and `lora_merge_qwen3/` by
+        `tools/lora_merge_tiny_fixture.py`; FP32 logit diff 3.0e-5 / 2.5e-7.
   - [ ] D2.3 Kev scorer: row construction, per-question rows from the shared state,
         pointer head, temperature from `head.pt`, Jev answer mapping, 65536-token state
         limit. Fixture: pico Qwen3.5 + random LoRA + random head through Kev's own
