@@ -7,11 +7,15 @@ through the same shared engine (`TChatEngine` in
 - [**ChatTerminal**](ChatTerminal.md) — an interactive chat REPL in the
   terminal, with a one-shot `-p "prompt"` mode for scripts.
 - [**ChatServer**](ChatServer.md) — a minimal OpenAI-style HTTP server
-  (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming).
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming),
+  plus `/v1/systemone` for TypeSafe/Jev typed decisions through the AnyJev
+  L0 readout (planned (coded): parity-tested on pico fixtures, not yet run
+  on a real checkpoint).
 
 Both take the same command line: a model directory followed by the flags
 listed on this page (`ParseArgs` in `neural/neuralchatengine.pas` parses them
-for both). ChatTerminal adds `-p`; ChatServer adds `--host` and `--port`.
+for both). ChatTerminal adds `-p`; ChatServer adds `--host`, `--port` and the
+`--decision-*` flags.
 Each program's page documents only what is specific to it.
 
 Both programs drive the generic model importer dispatch

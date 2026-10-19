@@ -66,7 +66,8 @@ const
 
 type
   // A tokenizer that cannot spell a label as one token, or spells two alike.
-  EAnyJevLabelTokenError = class(Exception);
+  // A request on such a model is valid but unanswerable, so servers answer 422.
+  EAnyJevLabelTokenError = class(EDecisionUnsupported);
 
   TAnyJevLevel = (ajlRaw, ajlL0);
   TAnyJevPrior = (ajpContentFree, ajpNone);
@@ -621,8 +622,14 @@ begin
         [Question.Id, csAnyJevMaxChoiceOptions, OptionCount]);
     with FLastDiagnostics[QuestionPos] do
     begin
-      ResolveAnyJevLabels(FEngine.Tokenizer, Question.Kind, OptionCount,
-        Labels, LabelIds);
+      try
+        ResolveAnyJevLabels(FEngine.Tokenizer, Question.Kind, OptionCount,
+          Labels, LabelIds);
+      except
+        on E: EAnyJevLabelTokenError do
+          raise EAnyJevLabelTokenError.CreateFmt('question "%s": %s, so the' +
+            ' AnyJev readout cannot score it on this model', [Question.Id, E.Message]);
+      end;
       Rotations := AnyJevRotations(Question.Kind, Length(Labels), FLevel, FMaxRotations);
       SetLength(RawByRotation, Length(Rotations));
       if GroupCount > 1 then

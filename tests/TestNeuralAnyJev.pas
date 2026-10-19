@@ -524,6 +524,8 @@ begin
       on EAnyJevLabelTokenError do Raised := true;
     end;
     AssertTrue('Yes is two tokens: error', Raised);
+    AssertTrue('a label error is a request the scorer cannot answer (422)',
+      EAnyJevLabelTokenError.InheritsFrom(EDecisionUnsupported));
     Raised := false;
     try
       MapAnyJevLabelTokens(Tokenizer, ['A', 'A']);

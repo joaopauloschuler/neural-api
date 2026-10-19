@@ -30,9 +30,11 @@ Endpoints (all responses application/json):
        available in every mode). Also honors "stream":true.
   POST /v1/systemone          TypeSafe/Jev typed decision request (a state plus
        typed questions in, option probabilities out; no text generated).
+       The server scores it with AnyJev L0 (neural/neuralanyjev.pas) on the
+       loaded chat model; --decision-level/-prior/-max-rotations tune it.
        Errors use the FastAPI {"detail": ...} body: 422 on validation and on
-       a request the scorer cannot answer, 501 when no decision scorer is
-       active, 500 when the scorer fails.
+       a request the scorer cannot answer (e.g. a label that is not one
+       token), 501 when no decision scorer is active, 500 when it fails.
   GET  /v1/models             lists the loaded model (and the decision
        scorer's model when one is active).
 
@@ -69,6 +71,9 @@ requests are handled strictly one at a time on the accept loop, which IS
 the serialization. The KV-cache prefix reuse still pays off: consecutive
 requests of a growing conversation share their prompt prefix, so only the
 new tail is prefilled (TTFT stays roughly flat as the conversation grows).
+A /v1/systemone request runs on the same loop, so it never interleaves with
+a chat request; TChatEngine.PrefillDecisionPrefix saves the live
+conversation (to a conversation slot) before it scores.
 
 --selftest runs the offline request-parsing/overlay unit checks (no model
 needed) and exits.
@@ -99,7 +104,7 @@ uses
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   Classes, SysUtils, DateUtils, fpjson, jsonparser, fphttpserver,
-  neuralvolume, neuralchat, neuralchatengine, neuraldecision;
+  neuralvolume, neuralchat, neuralchatengine, neuraldecision, neuralanyjev;
 
 const
   // Conversation slots when --kv-slots is not given: alternating clients
@@ -125,6 +130,13 @@ type
     property Connection;
   end;
 
+  // The --decision-* flags: how the AnyJev L0 scorer reads /v1/systemone.
+  TDecisionServerOptions = record
+    Level: TAnyJevLevel;
+    Prior: TAnyJevPrior;
+    MaxRotations: integer;      // 0 = every cyclic shift of a choice
+  end;
+
 procedure PrintUsage();
 begin
   WriteLn('Usage: ChatServer <model-dir> [options]');
@@ -140,7 +152,7 @@ begin
   WriteLn('back to them. "stream":true streams SSE chunks (one per token) the way');
   WriteLn('the OpenAI client libraries expect; "n">1 is rejected.');
   WriteLn('POST /v1/systemone answers TypeSafe/Jev typed decision requests (no text');
-  WriteLn('generated); it answers 501 while no decision scorer is active.');
+  WriteLn('generated) with the AnyJev L0 readout on the loaded chat model.');
   WriteLn;
   WriteLn('Server options:');
   WriteLn('  --host ADDR           listen address (default 127.0.0.1, loopback only)');
@@ -148,6 +160,11 @@ begin
   WriteLn('  --kv-slots N          conversation slots, see below (default ',
     csChatServerDefaultKVSlots, ' here;');
   WriteLn('                        --kv-slots 0 turns them off)');
+  WriteLn('  --decision-level L    /v1/systemone readout: l0 (default; every option');
+  WriteLn('                        rotation, prior-corrected) or raw (one prompt)');
+  WriteLn('  --decision-prior P    l0 label prior: content_free (default) or none');
+  WriteLn('  --decision-max-rotations N  cap on the cyclic shifts of a choice');
+  WriteLn('                        question (default 0 = one per option)');
   WriteLn;
   PrintChatOptionsHelp();
 end;
@@ -998,12 +1015,84 @@ begin
   end;
 end;
 
-// Parses the command line and applies the server's own defaults; false +
-// Opt.ErrorMsg on a bad argument.
-function ParseServerArgs(Args: TStringList; var Opt: TChatOptions): boolean;
+function DecisionLevelText(const DecisionOpt: TDecisionServerOptions): string;
 begin
-  Result := ParseArgs(Args, Opt);
+  if DecisionOpt.Level = ajlRaw then Exit('raw');
+  Result := 'L0';
+  if DecisionOpt.Prior = ajpContentFree then Result := Result + ', content-free prior'
+  else Result := Result + ', no prior';
+  if DecisionOpt.MaxRotations > 0 then
+    Result := Result + Format(', at most %d rotations', [DecisionOpt.MaxRotations]);
+end;
+
+// Parses the command line and applies the server's own defaults; false +
+// Opt.ErrorMsg on a bad argument. ParseArgs never sees the --decision-* flags.
+function ParseServerArgs(Args: TStringList; var Opt: TChatOptions;
+  out DecisionOpt: TDecisionServerOptions): boolean;
+var
+  ChatArgs: TStringList;
+  ArgPos: integer;
+  Arg, DecisionError: string;
+
+  // Applies one --decision-* flag; returns the error ('' = parsed).
+  function ApplyDecisionFlag(const Flag, Value: string): string;
+  begin
+    Result := '';
+    if Value = '' then Result := Flag + ' needs a value'
+    else if Flag = '--decision-level' then
+    begin
+      if Value = 'l0' then DecisionOpt.Level := ajlL0
+      else if Value = 'raw' then DecisionOpt.Level := ajlRaw
+      else Result := '--decision-level: l0 or raw, not ' + Value;
+    end
+    else if Flag = '--decision-prior' then
+    begin
+      if Value = 'content_free' then DecisionOpt.Prior := ajpContentFree
+      else if Value = 'none' then DecisionOpt.Prior := ajpNone
+      else Result := '--decision-prior: content_free or none, not ' + Value;
+    end
+    else if not (TryStrToInt(Value, DecisionOpt.MaxRotations) and
+      (DecisionOpt.MaxRotations >= 0)) then
+      Result := '--decision-max-rotations: not a count: ' + Value;
+  end;
+
+begin
+  DecisionOpt.Level := ajlL0;
+  DecisionOpt.Prior := ajpContentFree;
+  DecisionOpt.MaxRotations := 0;
+  DecisionError := '';
+  ChatArgs := TStringList.Create();
+  try
+    ArgPos := 0;
+    while ArgPos < Args.Count do
+    begin
+      Arg := Args[ArgPos];
+      if (Arg = '--decision-level') or (Arg = '--decision-prior') or
+        (Arg = '--decision-max-rotations') then
+      begin
+        Inc(ArgPos);
+        // The first bad flag is the one reported.
+        if DecisionError = '' then
+        begin
+          if ArgPos < Args.Count then
+            DecisionError := ApplyDecisionFlag(Arg, Args[ArgPos])
+          else
+            DecisionError := ApplyDecisionFlag(Arg, '');
+        end;
+      end
+      else ChatArgs.Add(Arg);
+      Inc(ArgPos);
+    end;
+    Result := ParseArgs(ChatArgs, Opt);
+  finally
+    ChatArgs.Free;
+  end;
   Opt.DefaultKVSlots := csChatServerDefaultKVSlots;
+  if Result and (DecisionError <> '') then
+  begin
+    Opt.ErrorMsg := DecisionError;
+    Result := false;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -1011,11 +1100,11 @@ end;
 // ---------------------------------------------------------------------------
 type
   // --selftest scorer: question k gets FixedProbabilities[k]; raises FailMessage
-  // (UnsupportedMessage as EDecisionUnsupported) when set.
+  // (UnsupportedMessage, LabelTokenMessage as their exception classes) when set.
   TFixedDecisionScorer = class(TDecisionScorer)
   public
     FixedProbabilities: array of TDecisionProbabilities;
-    FailMessage, UnsupportedMessage: string;
+    FailMessage, UnsupportedMessage, LabelTokenMessage: string;
     procedure Score(const Request: TDecisionRequest;
       out Answers: TDecisionAnswers;
       out InputTokens, OutputTokens: integer); override;
@@ -1029,6 +1118,8 @@ begin
   if FailMessage <> '' then raise Exception.Create(FailMessage);
   if UnsupportedMessage <> '' then
     raise EDecisionUnsupported.Create(UnsupportedMessage);
+  if LabelTokenMessage <> '' then
+    raise EAnyJevLabelTokenError.Create(LabelTokenMessage);
   Answers := nil;
   SetLength(Answers, Length(Request.Questions));
   MaxQuestionPos := High(Request.Questions);
@@ -1089,6 +1180,7 @@ var
 
 var
   Base, GenOpt, ServerOpt: TChatOptions;
+  DecisionOpt: TDecisionServerOptions;
   Req: TJSONObject;
   Msgs: TChatMessages;
   ErrMsg: string;
@@ -1104,13 +1196,35 @@ begin
   ServerArgs := TStringList.Create();
   try
     ServerArgs.Add('model');
-    Check(ParseServerArgs(ServerArgs, ServerOpt) and
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
       (ServerOpt.KVSlots < 0) and
       (ServerOpt.DefaultKVSlots = csChatServerDefaultKVSlots),
       'no --kv-slots: the server default applies');
+    Check((DecisionOpt.Level = ajlL0) and (DecisionOpt.Prior = ajpContentFree) and
+      (DecisionOpt.MaxRotations = 0),
+      'no --decision-* flags: AnyJev L0, content-free prior, every rotation');
     ServerArgs.Add('--kv-slots'); ServerArgs.Add('0');
-    Check(ParseServerArgs(ServerArgs, ServerOpt) and (ServerOpt.KVSlots = 0),
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and (ServerOpt.KVSlots = 0),
       '--kv-slots 0 turns the slots off');
+    ServerArgs.Add('--decision-level'); ServerArgs.Add('raw');
+    ServerArgs.Add('--decision-prior'); ServerArgs.Add('none');
+    ServerArgs.Add('--decision-max-rotations'); ServerArgs.Add('2');
+    ServerArgs.Add('--fp32');
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (DecisionOpt.Level = ajlRaw) and (DecisionOpt.Prior = ajpNone) and
+      (DecisionOpt.MaxRotations = 2) and (ServerOpt.WeightMode = cwmFP32) and
+      (ServerOpt.KVSlots = 0) and (ServerOpt.ModelDir = 'model'),
+      '--decision-* flags parse beside the chat flags');
+    ServerArgs.Add('--decision-level'); ServerArgs.Add('l2');
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-level', ServerOpt.ErrorMsg) = 1),
+      'an unknown --decision-level is an error naming the flag');
+    ServerArgs.Clear;
+    ServerArgs.Add('model');
+    ServerArgs.Add('--decision-max-rotations');
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (ServerOpt.ErrorMsg = '--decision-max-rotations needs a value'),
+      '--decision-max-rotations without a value is an error');
   finally
     ServerArgs.Free;
   end;
@@ -1438,6 +1552,12 @@ begin
     Check((Code = 422) and (Reply = '{"detail":"too many options"}'),
       'a request the scorer cannot answer is a 422 {"detail": message}');
     Scorer.UnsupportedMessage := '';
+    Scorer.LabelTokenMessage := 'label "Yes" is not a single token';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 422) and
+      (Reply = '{"detail":"label \"Yes\" is not a single token"}'),
+      'an AnyJev label that is not one token is a 422 {"detail": message}');
+    Scorer.LabelTokenMessage := '';
     Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
     Check(Code = 200, 'systemone answers again after a scorer exception');
     Reply := Serve(App, 'GET', '/v1/models', '', Code);
@@ -1477,6 +1597,7 @@ end;
 // ---------------------------------------------------------------------------
 var
   Opt: TChatOptions;
+  DecisionOpt: TDecisionServerOptions;
   Args: TStringList;
   App: TServerApp;
   Server: TChatHTTPServer;
@@ -1485,7 +1606,7 @@ var
 begin
   Args := TStringList.Create();
   for Cnt := 1 to ParamCount do Args.Add(ParamStr(Cnt));
-  if not ParseServerArgs(Args, Opt) then
+  if not ParseServerArgs(Args, Opt, DecisionOpt) then
   begin
     WriteLn('Error: ', Opt.ErrorMsg);
     WriteLn;
@@ -1520,6 +1641,10 @@ begin
   App.ModelName :=
     ExtractFileName(ExcludeTrailingPathDelimiter(App.Engine.Opt.ModelDir));
   if App.ModelName = '' then App.ModelName := App.Engine.ModelType;
+  // The decision model name is the chat model name, so /v1/models lists one id.
+  if App.DecisionOnlyReason = '' then
+    App.DecisionScorer := TAnyJevL0Scorer.Create(App.Engine, App.ModelName,
+      DecisionOpt.Level, DecisionOpt.Prior, DecisionOpt.MaxRotations);
 
   Server := TChatHTTPServer.Create(nil);
   try
@@ -1531,6 +1656,10 @@ begin
     WriteLn(Format('Serving %s on http://%s:%d/v1 (SSE streaming with' +
       ' "stream":true; Ctrl+C stops)', [App.ModelName, App.Engine.Opt.Host,
       App.Engine.Opt.Port]));
+    if Assigned(App.DecisionScorer) then
+      WriteLn(Format('POST /v1/systemone: AnyJev %s readout on the chat model' +
+        ' (model "%s" or "%s")', [DecisionLevelText(DecisionOpt),
+        App.ModelName, csDecisionDefaultModelAlias]));
     Server.Active := true; // blocks: the accept/serve loop
   finally
     Server.Free;

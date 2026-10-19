@@ -4501,8 +4501,32 @@ rather than acted on.
         Note for D1.3: on prompts whose prefix has >= 256 tokens AnyJev scores the
         rotations through `score_shared` (prefix and suffix encoded apart, used only
         when that equals the joint encoding), so it matches the Pascal full encoding.
-  - [ ] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
+  - [x] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
         on Qwen2.5-0.5B-Instruct against Python AnyJev.
+        Done (coded): ChatServer creates a `TAnyJevL0Scorer` after the model loads,
+        named like the chat model in `/v1/models` (the model directory's name; also
+        `jev-latest`). Flags `--decision-level l0|raw`, `--decision-prior
+        content_free|none`, `--decision-max-rotations N` (ParseServerArgs takes them
+        out before ParseArgs, so ChatTerminal does not see them).
+        `EAnyJevLabelTokenError` now derives from `EDecisionUnsupported`, so a label
+        that is not one token answers 422 naming the question. Docs: ChatServer.md
+        *Typed decisions*, the folder README and the top README (planned (coded)).
+        Smoke test on `tests/fixtures/anyjev_qwen25` with `--fp32`:
+        `tools/anyjev_real_check.py` max abs difference 3.9e-5 (the server rounds to
+        4 decimals); decision, chat, chat, decision gave identical decision answers
+        and the same greedy chat reply.
+    - [ ] User check on a real checkpoint (this VM cannot hold one):
+          ```
+          git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
+          lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+          neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
+          pip install anyjev==0.3.0
+          pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
+          python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
+          kill %1
+          ```
+          PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
+          weights move the probabilities far more than FP32 rounding.
   Stage 2 — Kev and Open-Jev:
   - [ ] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
         torch.save dict (temperature, head_dim, base, base_revision, lora), keep
