@@ -14,7 +14,7 @@ one-shot `-p` — plus the server flags below:
 | `--decision-level l0\|raw` | how `POST /v1/systemone` reads the model: `l0` scores every rotation of the options and corrects each by the label prior; `raw` scores one prompt with the options in the order given | `l0` |
 | `--decision-prior content_free\|none` | the label prior of `l0` (ignored by `raw`) | `content_free` |
 | `--decision-max-rotations N` | cap on the cyclic shifts of a choice question under `l0` (fewer prompts, less position-bias correction) | `0` (one per option) |
-| `--decision-adapter DIR` | answer `POST /v1/systemone` with the Kev or Open-Jev checkpoint in `DIR` instead of AnyJev L0; the server becomes decision-only (see *Trained decision checkpoints*). Refused together with the three AnyJev flags above | none (AnyJev L0) |
+| `--decision-adapter DIR` | answer `POST /v1/systemone` with the Kev or Open-Jev checkpoint in `DIR` instead of AnyJev L0; the server becomes decision-only and loads the model without its LM head (see *Trained decision checkpoints*; for Kev full weights `DIR` is the model directory too). Refused together with the three AnyJev flags above | none (AnyJev L0) |
 | `--decision-temperature T` | with `--decision-adapter`: replace the checkpoint's calibration temperature (`1` = raw head scores; Kev's `KEV_TEMPERATURE`) | the checkpoint's |
 
 ```
@@ -131,7 +131,7 @@ token. 500 with `{"detail": "..."}` when scoring fails.
 **Not supported.** `box` questions and image `assets`; more than 26 options
 in a choice question; AnyJev's running-mean batch prior (the scorer takes
 the prior from the content-free probes of each request); AnyJev's L1/L2
-levels and adaptive shifts; Kev full-weight checkpoints (kev-27b).
+levels and adaptive shifts.
 
 **Status.** AnyJev L0 is planned (coded): `TestNeuralAnyJev` matches the
 real `anyjev` 0.3.0 package within 3.1e-6 on two pico Qwen fixtures, but
@@ -161,17 +161,21 @@ kill %1
 ### Trained decision checkpoints: `--decision-adapter`
 
 `--decision-adapter DIR` replaces AnyJev L0 with a trained decision
-checkpoint. The positional model directory stays the BASE checkpoint the
-adapter was trained on; ChatServer merges the adapter's LoRA into it while
-loading (`TChatOptions.LoRAAdapterDir`, FP32 merge in HF tensor space), reads
-the head and scores with it. ChatServer detects the layout of `DIR`
-(`DetectDecisionAdapterLayout` in `neural/neuraldecisionheads.pas`):
+checkpoint. For a LoRA checkpoint the positional model directory stays the
+BASE checkpoint the adapter was trained on; ChatServer merges the adapter's
+LoRA into it while loading (`TChatOptions.LoRAAdapterDir`, FP32 merge in HF
+tensor space), reads the head and scores with it. A Kev full-weight
+checkpoint is its own model: pass its directory both as the model directory
+and as `DIR` (`ChatServer kev-27b/ --decision-adapter kev-27b/`); nothing is
+merged and the tokenizer is the checkpoint's copy. ChatServer detects the
+layout of `DIR` (`DetectDecisionAdapterLayout` in
+`neural/neuraldecisionheads.pas`):
 
 | Layout | Files | Scorer |
 | --- | --- | --- |
 | Open-Jev (`ZefanCai/Open-Jev-2B`, ...) | `head.pt` and `temperature.json` in `DIR`, `DIR/checkpoint` or `DIR/package/checkpoint` (the HF repo root works), plus `model.json` and `adapter/` | `TOpenJevScorer`: one chat prompt per candidate, Linear(d, 1) head; the adapter is `<checkpoint>/adapter` when `model.json` has `lora_rank` > 0 |
 | Kev LoRA (`jaredpalmer/kev-0.8b`, `-4b`, `-9b`) | `head.pt`, `adapter_config.json` and `adapter_model.safetensors` in `DIR` | `TKevScorer`: one row per question, pointer head; the adapter is `DIR` |
-| Kev full weights (`jaredpalmer/kev-27b`) | `head.pt`, `config.json`, `model*.safetensors`, no `adapter_config.json` | refused at startup: these safetensors hold the `Qwen3_5TextModel` keys without the `model.` prefix and no LM head, which the importer cannot build yet (task D2.6) |
+| Kev full weights (`jaredpalmer/kev-27b`) | `head.pt`, `config.json`, `model*.safetensors`, no `adapter_config.json` | `TKevScorer` as for Kev LoRA; the weights are `DIR` itself (a `Qwen3_5TextModel` export: flat `qwen3_5_text` config, keys without the `model.` prefix, no `lm_head`), so the model directory must be `DIR` too, else startup refuses. A model directory in this layout without `--decision-adapter` is refused too (it has no LM head to chat with) |
 
 Any other directory is refused at startup with a message that lists the
 three layouts. At startup ChatServer prints the base the checkpoint records
@@ -180,9 +184,10 @@ three layouts. At startup ChatServer prints the base the checkpoint records
 that exact revision; it refuses only a plain mismatch: a head that reads
 hidden states of another size than the base's `config.json` `hidden_size`.
 
-**Decision-only.** With `--decision-adapter` the merged LoRA has changed
-the base weights for decision scoring (and Kev bases are pretrained `-Base`
-models with no chat tuning), so `POST /v1/chat/completions` and
+**Decision-only.** With `--decision-adapter` the merged LoRA (or Kev's full
+fine-tune) has changed the base weights for decision scoring (and Kev bases
+are pretrained `-Base` models with no chat tuning), and the model is loaded
+without its LM head (below), so `POST /v1/chat/completions` and
 `POST /v1/completions` answer 501 with that reason, and `GET /v1/models`
 lists only the decision model. Its name is the adapter directory's name
 (`kev-0.8b`, `Open-Jev-2B`; for `.../package/checkpoint` the repo root's
@@ -191,17 +196,22 @@ and `--decision-max-rotations` tune AnyJev only and are refused with
 `--decision-adapter`.
 
 **Memory.** Kev and Open-Jev read the final hidden states and never
-compute the LM head, but the engine still builds it: a vocab x hidden
-matrix (248320 x 1024 for Kev-0.8B, 1.0 GB in FP32; the base ties it to
-the embedding, and how much of that the build shares is not measured). The
-head-less import of task D2.6 could be reused to drop it; this is not done
-yet.
+compute the LM head, so with `--decision-adapter` ChatServer sets
+`TChatOptions.OmitLMHead`: `BuildFromPretrained(..., pOmitLMHead)` ends the
+net at the final RMSNorm, and the `--prefill-window` twins are built the
+same way. The vocab x hidden LM-head matrix is never allocated: 248320 x 1024
+= 254M weights for Kev-0.8B (1.0 GB in FP32, about 0.25 GB in int8; the
+base ties the head to the embedding, but the build holds a separate copy of
+those rows, and the embedding still loads) and 248320 x 5120 = 1.27G for
+Kev-27B (5.1 GB FP32, about 1.3 GB int8). The probabilities do not change: `TestNeuralDecisionHeads`
+measures them bit-identical with and without the LM head on both fixtures.
 
 **Status.** Planned (coded), not supported: `TestNeuralDecisionHeads` matches
-kev's and jev's own code on pico fixtures (within 4.1e-6 and 6.4e-7), and
-`tools/decision_real_check.py` passed against both fixtures through a running
-server (max difference 4.6e-5, the server's 4-decimal rounding), but nobody
-has run a real Kev or Open-Jev checkpoint yet.
+kev's and jev's own code on pico fixtures (Kev LoRA within 4.1e-6, Kev full
+weights within 2.2e-6, Open-Jev within 6.4e-7), and
+`tools/decision_real_check.py` passed against all three fixtures through a
+running server (max difference 4.6e-5, the server's 4-decimal rounding), but
+nobody has run a real Kev or Open-Jev checkpoint yet.
 
 **Real-checkpoint checks.** `tools/decision_real_check.py BASE ADAPTER`
 sends one fixed request (a choice, a score and a yes/no question) to the
@@ -239,6 +249,22 @@ git clone https://huggingface.co/ZefanCai/Open-Jev-2B
 neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
 pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
 python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
+kill %1
+```
+
+Kev-27B (full weights, fine-tuned from `Qwen/Qwen3.8-27B`; the same
+directory is the model directory, the `--decision-adapter` directory and both
+script arguments). 27B in FP32 needs about 110 GB on each side, so this check
+runs the server on the GPU with its default int8 weights and the Python
+reference in bfloat16 (about 55 GB of host RAM); both move the probabilities
+by more than FP32 rounding, so the threshold is loosened to 5e-2 and the
+printed table is the result to read (the same argmax per question). On a
+GPU that cannot hold the int8 weights, add `--int4`.
+
+```
+git clone https://huggingface.co/jaredpalmer/kev-27b
+neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 8080 &
+python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
 kill %1
 ```
 

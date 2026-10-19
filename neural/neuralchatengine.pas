@@ -176,6 +176,8 @@ type
     ModelDir: string;
     LoRAAdapterDir: string;      // HF PEFT LoRA adapter merged into the
                                  // weights as they load ('' = none)
+    OmitLMHead: boolean;         // build ends at the final norm: hidden
+                                 // states only, no logits (decision heads)
     WeightMode: TChatWeightMode; // --fp32 / --int8 (default) / --int4
     LowMemory: boolean;          // true (default) = low-memory forward path
                                  // (drops the concatenated weight cache);
@@ -782,6 +784,7 @@ function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
   Result.LoRAAdapterDir := '';
+  Result.OmitLMHead := false;
   Result.WeightMode := cwmInt8; // less RAM, faster; --fp32 and --int4 opt out
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
@@ -2325,9 +2328,12 @@ begin
       if Opt.LoRAAdapterDir <> '' then
         Notice('[LoRA adapter ' + Opt.LoRAAdapterDir + ' merged into the' +
           ' weights as they load]');
+      if Opt.OmitLMHead then
+        Notice('[no LM head: the net ends at the final norm (hidden states' +
+          ' for a decision head; no logits, no chat)]');
       NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
         {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
-        {pWeightOwner=}nil, Opt.LoRAAdapterDir);
+        {pWeightOwner=}nil, Opt.LoRAAdapterDir, Opt.OmitLMHead);
       Int4DirectLayerCount := NeuralImportInt4LayerCount;
       Int4RowLayerCount := NeuralImportInt4FromRowsLayerCount;
       // --prefill-window: the width-N twin borrows NN's weights
@@ -2352,7 +2358,7 @@ begin
         NeuralImportInt4FromRowsLayerCount := 0;
         WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
           {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
-          {pWeightOwner=}nil, Opt.LoRAAdapterDir);
+          {pWeightOwner=}nil, Opt.LoRAAdapterDir, Opt.OmitLMHead);
       end;
     finally
       NeuralImportInt4FromQ4_0 := false;
@@ -2406,7 +2412,7 @@ begin
       LoadStart := GetTickCount64();
       WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
         {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
-        {pWeightOwner=}NN);
+        {pWeightOwner=}NN, '', Opt.OmitLMHead);
       WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
       LastIdx := WindowNN.GetLastLayerIdx();
       for Cnt := 0 to LastIdx do
@@ -2415,7 +2421,8 @@ begin
       begin
         TailNN := BuildFromPretrained(Opt.ModelDir,
           {pSeqLen=}Opt.PrefillTailWindow, {pTrainable=}false, '',
-          {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN);
+          {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN, '',
+          Opt.OmitLMHead);
         TailNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
         LastIdx := TailNN.GetLastLayerIdx();
         for Cnt := 0 to LastIdx do
@@ -2510,7 +2517,8 @@ begin
   end;
 
   SeqLen := Opt.CtxLen;
-  VocabSize := NN.GetLastLayer().Output.Depth;
+  if Opt.OmitLMHead then VocabSize := 0
+  else VocabSize := NN.GetLastLayer().Output.Depth;
   // int8 KV cache is armed at construction so the FP32 K/V buffers are never
   // allocated (a post-Create switch frees them, but the allocator arena may
   // keep the pages). Reset and cache-reuse truncation keep the int8 mode
@@ -2547,6 +2555,15 @@ begin
     Notice(Format('[--prefill-window %d: the twins hold %.1f MB of' +
       ' activations and caches in host memory besides the borrowed weights]',
       [Opt.PrefillWindow, TwinBytes / (1024 * 1024)]));
+  end;
+  // ContrastiveHiddenLayer would pick the layer before the final norm.
+  if Opt.OmitLMHead then
+  begin
+    Session.SetHiddenLayer(NN.GetLastLayer());
+    if Assigned(WindowSession) then
+      WindowSession.SetHiddenLayer(WindowNN.GetLastLayer());
+    if Assigned(TailSession) then
+      TailSession.SetHiddenLayer(TailNN.GetLastLayer());
   end;
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +
@@ -2622,8 +2639,10 @@ begin
   end;
   SetLength(CandidateOrder, Length(Checkpoints) +
     Length(KVSlots) * (Ord(High(TConversationSlotPoint)) + 1));
-  Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
-    [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
+  if Opt.OmitLMHead then Line := 'no LM head'
+  else Line := 'vocab ' + IntToStr(VocabSize);
+  Line := Format('Model: %s, %d params, %s, context %d, chat format ',
+    [ModelType, NN.CountWeights(), Line, SeqLen]);
   if RawMode then Line := Line + 'raw (completion)'
   else Line := Line + ChatFormatName(ChatFormat);
   Notice(Line + ', ' + ChatWeightModeName(Opt.WeightMode) + ' weights.');
@@ -2919,6 +2938,9 @@ begin
   BranchLen := Length(BranchIds);
   if BranchLen = 0 then
     raise Exception.Create('TChatEngine.ScoreDecisionBranch: empty branch');
+  if Assigned(Logits) and Opt.OmitLMHead then
+    raise Exception.Create('TChatEngine.ScoreDecisionBranch: logits asked of' +
+      ' a model loaded without its LM head (TChatOptions.OmitLMHead)');
   if PrefixLen + BranchLen > SeqLen then
     raise Exception.CreateFmt('TChatEngine.ScoreDecisionBranch: %d prefix +' +
       ' %d branch ids exceed the %d-token context',
@@ -3165,6 +3187,10 @@ begin
   Result := '';
   if not Loaded then
     raise Exception.Create('TChatEngine.GenerateFromIds before LoadModel');
+  if Opt.OmitLMHead then
+    raise Exception.Create('TChatEngine.GenerateFromIds: the model was loaded' +
+      ' without its LM head (TChatOptions.OmitLMHead), so it has no logits' +
+      ' to generate from');
   Inc(CurrentTurn);
   ContextFull := false;
   LastPromptTokens := Length(PromptIds);

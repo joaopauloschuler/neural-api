@@ -4628,9 +4628,35 @@ rather than acted on.
         Not optimized: the engine still builds the LM head (248320 x hidden),
         which Kev/Open-Jev never compute; D2.6's head-less import could be reused.
         The hidden-size refusal was run by hand (fixture config with hidden_size 32).
-  - [ ] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
+  - [x] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
         `model.` prefix and without `lm_head` (build ends at the final norm). Pico
         fixture in that layout.
+        Done: the real kev-27b `config.json` is flat (`model_type` `qwen3_5_text`,
+        no `text_config`, `tie_word_embeddings` false) and its 850 tensors are
+        `embed_tokens`, `layers.N.*` and `norm` only. The config reader already
+        took the flat form and the builder already found prefix ''; the change is
+        `qwen3_5_text` in `PretrainedModelTypeCanBorrowWeights` (dispatch + twins)
+        and `BuildFromPretrained(..., pOmitLMHead)` (Llama builder only; the net
+        ends at the final RMSNorm, lm_head is neither required nor loaded, a tied
+        embedding still loads). `TChatOptions.OmitLMHead` passes it to every
+        build including the `--prefill-window` twins, points every session's
+        `HiddenLayer` at the last layer (`TNNetStreamingDecoder.SetHiddenLayer`;
+        `ContrastiveHiddenLayer` would pick the pre-norm layer), and makes
+        `GenerateFromIds` and `ScoreDecisionBranch` with Logits raise.
+        ChatServer sets it for every `--decision-adapter` layout. Kev full weights:
+        the model directory must be the checkpoint directory itself (`ChatServer
+        kev-27b/ --decision-adapter kev-27b/`), nothing merged; that directory
+        without `--decision-adapter` is refused. Fixture `tests/fixtures/
+        kev_full_qwen3_5/` (88 KB) by `tools/kev_full_tiny_fixture.py`: the
+        kev_qwen3_5 backbone merged by kev's loader (float32), saved untied by
+        `save_pretrained` as `Qwen3_5TextModel` + head.pt `weights="full"`;
+        oracle `Checkpoint(dir).load` (full path, float64) + `admit` + `probs`.
+        p within 2.2e-6. Head-less vs LM-head builds: bit-identical probabilities
+        on the Kev and Open-Jev fixtures (also through a width-4 twin); the pico
+        net drops 1 layer and 6528 = 408 x 16 weights; Kev-0.8B saves 254M
+        weights (1.0 GB FP32), Kev-27B 1.27G (5.1 GB FP32, ~1.3 GB int8).
+        `tools/decision_real_check.py` takes the full layout and `--dtype
+        bfloat16`; server smoke test on the fixture (`--fp32`): PASS, 4.6e-5.
   - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
         Open-Jev-2B against their Python servers; commands written by the agents.
         Commands (ChatServer.md *Trained decision checkpoints*); PASS = max abs
@@ -4652,6 +4678,15 @@ rather than acted on.
         neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
         pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
         python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
+        kill %1
+        ```
+        Kev-27B (int8 on the GPU against kev in bfloat16, ~55 GB host RAM; a
+        sanity bound, not FP32 parity: read the table, same argmax expected;
+        add `--int4` to the server when the int8 weights do not fit):
+        ```
+        git clone https://huggingface.co/jaredpalmer/kev-27b
+        neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 8080 &
+        python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
         kill %1
         ```
   Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev

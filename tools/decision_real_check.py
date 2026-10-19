@@ -24,6 +24,11 @@ The layout is detected the way ChatServer does it:
     kev.model.admit + DecisionModel.probs. head.pt's `base` is replaced by
     <base>, so kev reads the same local files as the server (nothing is
     downloaded).
+  - Kev full weights (head.pt + config.json + model*.safetensors, kev-27b):
+    the same kev path; Checkpoint.load takes the backbone from <adapter>
+    itself (nothing merged) and the tokenizer from <base>. ChatServer is
+    launched with that directory as both <model-dir> and --decision-adapter,
+    so pass it twice here too.
 
 Launch ChatServer with --fp32: its default int8 weights move the
 probabilities by far more than the FP32 summation-order noise this check
@@ -153,7 +158,7 @@ def load_text_backbone(base, dtype):
     return backbone.eval()
 
 
-def openjev_reference(base, checkpoint, request, temperature):
+def openjev_reference(base, checkpoint, request, temperature, dtype):
     import torch
     from peft import PeftModel
     from torch import nn
@@ -175,7 +180,7 @@ def openjev_reference(base, checkpoint, request, temperature):
     model.model_id, model.revision = base, None
     model.max_length, model.device_name = config['max_length'], 'cpu'
     model.tokenizer, model.sharded = tok, False
-    model.backbone = load_text_backbone(base, torch.float32)
+    model.backbone = load_text_backbone(base, getattr(torch, dtype))
     model.lora_rank = config['lora_rank']
     if model.lora_rank:
         model.backbone = PeftModel.from_pretrained(model.backbone, os.path.join(checkpoint, 'adapter'))
@@ -188,7 +193,7 @@ def openjev_reference(base, checkpoint, request, temperature):
     return answer_probabilities(request, response['answers']), temperature
 
 
-def kev_reference(base, adapter, request, temperature):
+def kev_reference(base, adapter, request, temperature, dtype):
     import torch
     from kev.api import SystemOneRequest, to_record
     from kev.checkpoint import Checkpoint, LoadOptions
@@ -198,7 +203,7 @@ def kev_reference(base, adapter, request, temperature):
     print(f'[head.pt records base {ck.meta.base} at revision {ck.meta.base_revision};'
           f' reading {base} instead]', flush=True)
     ck.meta.base, ck.meta.base_revision = base, None
-    tok, model = ck.load('cpu', LoadOptions(dtype=torch.float32, temperature=temperature))
+    tok, model = ck.load('cpu', LoadOptions(dtype=getattr(torch, dtype), temperature=temperature))
     rec, meta = to_record(SystemOneRequest.model_validate(request))
     enc = admit(model, tok, rec)
     with torch.no_grad():
@@ -214,13 +219,22 @@ def main():
     parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument('--temperature', type=float, default=None,
                         help="override the checkpoint's temperature (as --decision-temperature)")
+    parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='float32',
+                        help='the Python reference backbone dtype (bfloat16 halves its RAM:'
+                             ' 27B checkpoints; the threshold must then be loosened)')
     parser.add_argument('--timeout', type=float, default=1800,
                         help='seconds one /v1/systemone request may take')
     args = parser.parse_args()
 
     checkpoint = openjev_checkpoint_dir(args.adapter)
-    if checkpoint is None and not os.path.isfile(os.path.join(args.adapter, 'adapter_config.json')):
-        sys.exit(f'{args.adapter}: neither an Open-Jev checkpoint nor a Kev LoRA checkpoint')
+    kev_lora = os.path.isfile(os.path.join(args.adapter, 'adapter_config.json'))
+    kev_full = os.path.isfile(os.path.join(args.adapter, 'head.pt')) and \
+        os.path.isfile(os.path.join(args.adapter, 'config.json')) and \
+        any(name.startswith('model') and name.endswith('.safetensors')
+            for name in os.listdir(args.adapter))
+    if checkpoint is None and not kev_lora and not kev_full:
+        sys.exit(f'{args.adapter}: neither an Open-Jev checkpoint nor a Kev LoRA or'
+                 ' full-weight checkpoint')
     print(f'POST {args.server}/v1/systemone ...', flush=True)
     started = time.time()
     response = post_systemone(args.server, REQUEST, args.timeout)
@@ -230,12 +244,15 @@ def main():
 
     started = time.time()
     if checkpoint is not None:
-        print(f'jev on {args.base} + {checkpoint} (float32, CPU, uncached forward) ...', flush=True)
-        reference, temperature = openjev_reference(args.base, checkpoint, REQUEST, args.temperature)
+        print(f'jev on {args.base} + {checkpoint} ({args.dtype}, CPU, uncached forward) ...', flush=True)
+        reference, temperature = openjev_reference(args.base, checkpoint, REQUEST, args.temperature,
+                                                   args.dtype)
         name = 'jev'
     else:
-        print(f'kev on {args.base} + {args.adapter} (float32, CPU) ...', flush=True)
-        reference, temperature = kev_reference(args.base, args.adapter, REQUEST, args.temperature)
+        layout = 'LoRA merged' if kev_lora else 'full weights'
+        print(f'kev on {args.base} + {args.adapter} ({layout}, {args.dtype}, CPU) ...', flush=True)
+        reference, temperature = kev_reference(args.base, args.adapter, REQUEST, args.temperature,
+                                               args.dtype)
         name = 'kev'
     print(f'[{name} answered in {time.time() - started:.1f} s at temperature {temperature}]')
 

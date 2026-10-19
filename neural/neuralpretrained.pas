@@ -13805,16 +13805,20 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // pLoRAAdapterDir: a HF PEFT LoRA adapter directory merged into the weights as
 // they load (TNNetLoRAMergeReader); Llama-builder model types only, and
 // unused with pWeightOwner (the owner's weights already carry the merge).
+// pOmitLMHead: the net ends at the final norm and outputs hidden states (no
+// vocab x hidden LM head; a tied embedding still loads); Llama-builder types
+// only. A twin borrowing from such a net must pass it too.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = ''): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 
 // True for the config.json model_type values BuildFromPretrained routes
 // through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
-// qwen3_vl, qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2,
-// olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
-// twin can borrow an already-loaded net's weights (pWeightOwner).
+// qwen3_vl, qwen3_5, qwen3_5_text, qwen3_5_moe, gemma, gemma2, gemma3_text,
+// phi3, olmo2, olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) -
+// the families whose twin can borrow an already-loaded net's weights.
 function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
 // ---------------------------------------------------------------------------
@@ -18593,13 +18597,15 @@ end;
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
 // raises. pStopBeforeFinalNorm, pDeepStackInputs: see
-// BuildLlamaFromSafeTensorsWithConfig. Coded by Claude (AI).
+// BuildLlamaFromSafeTensorsWithConfig. pOmitLMHead: the net ends at the final
+// RMSNorm (hidden states out); lm_head is neither required nor loaded.
+// Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
   pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
-  pDeepStackInputs: integer = 0): TNNet;
+  pDeepStackInputs: integer = 0; pOmitLMHead: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -18806,7 +18812,7 @@ begin
             '], got ' +
             Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
         if (not Config.TieWordEmbeddings) and (not pStopBeforeFinalNorm) and
-           (not Reader.HasTensor(LMHeadName)) then
+           (not pOmitLMHead) and (not Reader.HasTensor(LMHeadName)) then
           ImportError('Llama import: config says tie_word_embeddings=false ' +
             'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
       end;
@@ -19333,13 +19339,17 @@ begin
       begin
         FinalNorm := NN.AddLayer(
           TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-        LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
-        // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
-        // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
-        // (HF applies it to the logits before any sampling softmax).
-        if Config.FinalLogitSoftCap > 0 then
-          NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        if pOmitLMHead then LMHead := nil
+        else
+        begin
+          LMHead := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+          // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+          // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+          // (HF applies it to the logits before any sampling softmax).
+          if Config.FinalLogitSoftCap > 0 then
+            NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        end;
       end;
       if not pTrainable then NN.SetTrainable();
       if QuantizeSweeps then NN.QuantizeWeightsInt8();
@@ -90042,7 +90052,8 @@ begin
   Result := (ModelType = 'llama') or (ModelType = 'mistral') or
     (ModelType = 'qwen2') or (ModelType = 'qwen3') or
     (ModelType = 'qwen3_moe') or (ModelType = 'qwen3_vl') or
-    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
+    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') or
+    (ModelType = 'qwen3_5_moe') or
     (ModelType = 'gemma') or (ModelType = 'gemma2') or
     (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
     (ModelType = 'olmo2') or (ModelType = 'olmoe') or
@@ -90056,8 +90067,10 @@ end;
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = ''): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 var
+  LlamaReader: TNNetSafeTensorsReader;
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
   Root, ArchData: TJSONData;
@@ -90180,6 +90193,10 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" cannot merge a LoRA adapter - only the Llama-family builders can ' +
       '(PretrainedModelTypeCanBorrowWeights).');
+  if pOmitLMHead and (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot be built without its LM head - only the Llama-family ' +
+      'builders can (PretrainedModelTypeCanBorrowWeights).');
 
   // ---- dispatch ----
   if (ModelType = 'gpt2') and GPT2SeqCls then
@@ -90315,17 +90332,16 @@ begin
     // gated-shared-expert sparse FFN; the vision tower and MTP head are
     // skipped (TEXT decoder only). See BuildQwen35FromSafeTensorsEx.
   begin
-    if (pLoRAAdapterDir <> '') and (not Assigned(pWeightOwner)) then
-    begin
-      IgnoredLlamaConfig := ReadLlamaConfigFromJSONFile(ConfigPath);
-      Result := BuildLlamaFromTensorReaderWithConfig(
-        TNNetLoRAMergeReader.Create(CreatePretrainedTensorReader(WeightsPath),
-          pLoRAAdapterDir), WeightsPath, IgnoredLlamaConfig, pSeqLen,
-        pTrainable, pQuantizeInt8);
-    end
-    else
-      Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-        pSeqLen, pTrainable, ConfigPath, pQuantizeInt8, pWeightOwner);
+    IgnoredLlamaConfig := ReadLlamaConfigFromJSONFile(ConfigPath);
+    // A borrowing build never opens the checkpoint.
+    if Assigned(pWeightOwner) then LlamaReader := nil
+    else if pLoRAAdapterDir <> '' then
+      LlamaReader := TNNetLoRAMergeReader.Create(
+        CreatePretrainedTensorReader(WeightsPath), pLoRAAdapterDir)
+    else LlamaReader := CreatePretrainedTensorReader(WeightsPath);
+    Result := BuildLlamaFromTensorReaderWithConfig(LlamaReader, WeightsPath,
+      IgnoredLlamaConfig, pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner,
+      {pStopBeforeFinalNorm=}false, {pDeepStackInputs=}0, pOmitLMHead);
   end
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then

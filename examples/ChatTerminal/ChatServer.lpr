@@ -1132,8 +1132,15 @@ begin
   end;
 end;
 
+// True when both name the same directory.
+function SameDirectory(const DirA, DirB: string): boolean;
+begin
+  Result := ExcludeTrailingPathDelimiter(ExpandFileName(DirA)) =
+    ExcludeTrailingPathDelimiter(ExpandFileName(DirB));
+end;
+
 // Detects the --decision-adapter layout, prints the base it records, checks the
-// head against <model-dir>/config.json and sets Opt.LoRAAdapterDir; false + ErrorMsg.
+// head against <model-dir>/config.json, sets Opt.LoRAAdapterDir and Opt.OmitLMHead.
 function PrepareDecisionAdapter(var Opt: TChatOptions; const AdapterDir: string;
   out Info: TDecisionAdapterInfo; out ErrorMsg: string): boolean;
 var
@@ -1143,12 +1150,13 @@ var
 begin
   Result := false;
   ErrorMsg := '';
-  if DetectDecisionAdapterLayout(AdapterDir) = dalKevFullWeights then
+  // A full-weight checkpoint is its own model: nothing is merged into a base.
+  if (DetectDecisionAdapterLayout(AdapterDir) = dalKevFullWeights) and
+    not SameDirectory(Opt.ModelDir, AdapterDir) then
   begin
-    ErrorMsg := AdapterDir + ' is a Kev full-weight checkpoint (config.json +' +
-      ' model*.safetensors, no adapter_config.json, as kev-27b): not supported' +
-      ' yet. Its safetensors hold the Qwen3_5TextModel keys without the "model."' +
-      ' prefix and no LM head, which the importer cannot build (task D2.6).';
+    ErrorMsg := AdapterDir + ' is a Kev full-weight checkpoint (its own' +
+      ' config.json and model*.safetensors, as kev-27b): pass that directory' +
+      ' as <model-dir> too, not ' + Opt.ModelDir;
     exit;
   end;
   try
@@ -1164,8 +1172,12 @@ begin
   if RecordedBase = '' then RecordedBase := '(not recorded)';
   if Info.BaseRevision <> '' then
     RecordedBase := RecordedBase + ' at revision ' + Info.BaseRevision;
-  WriteLn('[decision adapter ', AdapterDir, ': trained on ', RecordedBase,
-    '; <model-dir> ', Opt.ModelDir, ' must hold that checkpoint]');
+  if Info.Layout = dalKevFullWeights then
+    WriteLn('[decision checkpoint ', AdapterDir, ': Kev full weights, fine-tuned' +
+      ' from ', RecordedBase, '; nothing to merge]')
+  else
+    WriteLn('[decision adapter ', AdapterDir, ': trained on ', RecordedBase,
+      '; <model-dir> ', Opt.ModelDir, ' must hold that checkpoint]');
   BaseHiddenSize := 0;
   try
     BaseConfig := ReadLlamaConfigFromJSONFile(IncludeTrailingPathDelimiter(
@@ -1184,6 +1196,8 @@ begin
     exit;
   end;
   Opt.LoRAAdapterDir := Info.LoRAAdapterDir;
+  // Both heads read the final hidden states, never the logits.
+  Opt.OmitLMHead := true;
   Result := true;
 end;
 
@@ -1194,10 +1208,14 @@ begin
   Result := 'the server was launched with --decision-adapter ' + AdapterDir;
   if Info.LoRAAdapterDir <> '' then
     Result := Result + ': its LoRA adapter is merged into the base weights,' +
-      ' which are tuned for decision scoring, not for text';
+      ' which are tuned for decision scoring, not for text'
+  else if Info.Layout = dalKevFullWeights then
+    Result := Result + ': its full weights are fine-tuned for decision' +
+      ' scoring, not for text';
   if Info.Layout = dalKevLoRA then
     Result := Result + ' (and Kev bases are pretrained -Base models with no' +
       ' chat tuning)';
+  Result := Result + '; the model is loaded without its LM head';
 end;
 
 // ---------------------------------------------------------------------------
@@ -1452,8 +1470,22 @@ begin
     ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'empty';
     Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
       'kev-27b', AdapterInfo, ErrMsg) and (Pos('Kev full-weight', ErrMsg) > 0) and
-      (Pos('D2.6', ErrMsg) > 0) and (ServerOpt.LoRAAdapterDir = ''),
-      'a Kev full-weight checkpoint is refused at startup naming D2.6');
+      (Pos('as <model-dir> too', ErrMsg) > 0) and not ServerOpt.OmitLMHead,
+      'a Kev full-weight checkpoint with another <model-dir> is refused');
+    ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'kev-27b' +
+      DirectorySeparator;
+    Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
+      'kev-27b', AdapterInfo, ErrMsg) and (Pos('as <model-dir> too', ErrMsg) = 0),
+      'a Kev full-weight checkpoint as <model-dir> passes the directory check' +
+      ' (the empty placeholder head.pt then fails to parse)');
+    AdapterInfo.Layout := dalKevFullWeights;
+    AdapterInfo.LoRAAdapterDir := '';
+    ErrMsg := DecisionOnlyReasonText(AdapterInfo, 'kev-27b');
+    Check((Pos('full weights are fine-tuned', ErrMsg) > 0) and
+      (Pos('without its LM head', ErrMsg) > 0),
+      'the Kev full-weight decision-only reason names the weights and the LM head');
+    ServerOpt := DefaultChatOptions();
+    ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'empty';
     Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
       'empty', AdapterInfo, ErrMsg) and (Pos('not a decision checkpoint', ErrMsg) > 0) and
       (Pos('adapter_config.json', ErrMsg) > 0) and (Pos('temperature.json', ErrMsg) > 0),
@@ -1867,6 +1899,13 @@ begin
     PrintUsage();
     if Opt.ModelDir = '' then Halt(1);
     Halt(0);
+  end;
+  if (DecisionOpt.AdapterDir = '') and
+    (DetectDecisionAdapterLayout(Opt.ModelDir) = dalKevFullWeights) then
+  begin
+    WriteLn('Error: ', Opt.ModelDir, ' is a Kev full-weight decision checkpoint' +
+      ' (no LM head, nothing to chat with): add --decision-adapter ', Opt.ModelDir);
+    Halt(1);
   end;
   if (DecisionOpt.AdapterDir <> '') and
     not PrepareDecisionAdapter(Opt, DecisionOpt.AdapterDir, AdapterInfo, ErrorMsg) then
