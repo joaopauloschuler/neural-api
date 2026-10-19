@@ -26,6 +26,7 @@ type
   published
     procedure TestParseValidRequest;
     procedure TestParseMissingTopLevelFields;
+    procedure TestParseIgnoresModel;
     procedure TestParseQuestionsShape;
     procedure TestParseChoiceCriteriaRules;
     procedure TestParseScoreCriteriaRules;
@@ -97,7 +98,6 @@ begin
       '"criteria":{"zeta":"last letter","alpha":null,"mid":{"why":"x"}}},' +
     '"q_score":{"type":"score","criteria":["low",{"label":"high","w":1.5}]},' +
     '"q_noul":{"type":"noul","instructions":"Is it?"}}}');
-  AssertEquals('model', 'jev-latest', Request.Model);
   AssertEquals('state', 'user: Ann'#10'n: 2', Request.State);
   AssertEquals('question count', 3, Length(Request.Questions));
   AssertEquals('id 0', 'q_choice', Request.Questions[0].Id);
@@ -128,13 +128,19 @@ var
   ErrorsJSON: string;
 begin
   ErrorsJSON := ParseErrors('{}');
-  AssertHasError(ErrorsJSON, '["body","model"]', 'missing');
   AssertHasError(ErrorsJSON, '["body","state"]', 'missing');
   AssertHasError(ErrorsJSON, '["body","questions"]', 'missing');
-  ErrorsJSON := ParseErrors('{"model":5,"state":null,' +
-    '"questions":{"q":{"type":"noul"}}}');
-  AssertHasError(ErrorsJSON, '["body","model"]', 'string_type');
-  AssertFalse('null state is allowed', Pos('"state"', ErrorsJSON) > 0);
+  AssertFalse('model is optional', Pos('"model"', ErrorsJSON) > 0);
+  ParseOK('{"state":null,"questions":{"q":{"type":"noul"}}}');
+end;
+
+procedure TTestNeuralDecision.TestParseIgnoresModel;
+const
+  csStateAndQuestionsJSON = '"state":"s","questions":{"q":{"type":"noul"}}}';
+begin
+  ParseOK('{' + csStateAndQuestionsJSON);
+  ParseOK('{"model":"anything",' + csStateAndQuestionsJSON);
+  ParseOK('{"model":42,' + csStateAndQuestionsJSON);
 end;
 
 procedure TTestNeuralDecision.TestParseQuestionsShape;

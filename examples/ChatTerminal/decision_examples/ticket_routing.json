@@ -1,5 +1,4 @@
 {
-  "model": "jev-latest",
   "state": {
     "subject": "Parcel says delivered but nothing arrived",
     "message": "Tracking for order 9812 shows delivered yesterday at 14:02, but there is no parcel at my door or with my neighbours.",

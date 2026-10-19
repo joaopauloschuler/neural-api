@@ -4476,6 +4476,10 @@ rather than acted on.
         constructor); no scorer -> 501, validation -> 422, wrong model -> 422 (the
         model name or `jev-latest`), scorer exception -> 500. 18 new selftest cases
         (run by hand: no test script runs ChatServer `--selftest`).
+        Changed later (user request): the request `model` is optional and ignored
+        (any value or JSON type); ChatServer serves one model and every response's
+        `model` names the loaded scorer, so the wrong-model 422 and the
+        `jev-latest` alias (`AcceptsModel`, `csDecisionDefaultModelAlias`) are gone.
   Stage 1 — AnyJev L0 readout (no trained weights):
   - [x] D1.1 AnyJev L0 scorer (in `neuralanyjev.pas`, not `neuraldecision.pas`): prompt builder per kind, label
         token mapping, rotations, content-free prior, log-mean marginalisation, plus a

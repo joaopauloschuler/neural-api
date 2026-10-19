@@ -76,16 +76,16 @@ end-of-turn marker, generation stops on the tokenizer's EOS id or at
 `POST /v1/systemone` takes a TypeSafe/Jev decision request: a state plus
 typed questions in, option probabilities out, and no text generated. The
 JSON field names follow TypeSafe's OpenAPI 0.2.0 (`api.typesafe.ai`).
-`model` is the name `GET /v1/models` lists for the decision model (the
-model directory's name, or the adapter directory's name under
-`--decision-adapter`) or `jev-latest`, which is only an alias selecting the
-model this server loaded; the response always names the model that
-answered, never the alias. `state`, `instructions` and the option
-descriptions may each be a string, an object or an array.
+ChatServer serves one decision model and ignores the request's `model`:
+the field is optional, any value is accepted (TypeSafe's SDK sends
+`jev-latest`), and the response's `model` always names the loaded decision
+model, the name `GET /v1/models` lists (the model directory's name, or the
+adapter directory's name under `--decision-adapter`). `state`,
+`instructions` and the option descriptions may each be a string, an object
+or an array.
 
 ```
 $ curl http://127.0.0.1:8080/v1/systemone -d '{
-    "model": "jev-latest",
     "state": {"ticket": "My card was declined twice and the app froze."},
     "questions": {
       "team":    {"type": "choice", "instructions": "Which team should take this ticket?",
@@ -124,11 +124,11 @@ costs about one prefix plus the prompt tails.
 **Status codes.** 200 on success. 422 with the FastAPI detail list
 (`{"detail":[{"loc":...,"msg":...,"type":...}]}`) on a malformed request,
 including a `box` question or image `assets`. 422 with `{"detail": "..."}` on
-a model name the server does not serve and on a valid request the scorer
-cannot answer: a choice question with more than 26 options (the labels are
-the letters `A`-`Z`), a prompt longer than the context (`--ctx`), or a model
-whose tokenizer cannot spell an answer label (`Yes`, `No`, a letter) as one
-token. 500 with `{"detail": "..."}` when scoring fails.
+a valid request the scorer cannot answer: a choice question with more than
+26 options (the labels are the letters `A`-`Z`), a prompt longer than the
+context (`--ctx`), or a model whose tokenizer cannot spell an answer label
+(`Yes`, `No`, a letter) as one token. 500 with `{"detail": "..."}` when
+scoring fails.
 
 **Not supported.** `box` questions and image `assets`; more than 26 options
 in a choice question; AnyJev's running-mean batch prior (the scorer takes
@@ -193,7 +193,8 @@ without its LM head (below), so `POST /v1/chat/completions` and
 `POST /v1/completions` answer 501 with that reason, and `GET /v1/models`
 lists only the decision model. Its name is the adapter directory's name
 (`kev-0.8b`, `Open-Jev-2B`; for `.../package/checkpoint` the repo root's
-name); `jev-latest` is accepted too. `--decision-level`, `--decision-prior`
+name), and every `POST /v1/systemone` response names it whatever `model`
+the request sends. `--decision-level`, `--decision-prior`
 and `--decision-max-rotations` tune AnyJev only and are refused with
 `--decision-adapter`.
 
@@ -290,10 +291,11 @@ the server's order (`*` marks the chosen option, a score line shows its
 legend), the confidence and the token usage. It uses only FCL units
 (`fphttpclient`, `fpjson`), none of the neural-api units, so it builds in
 about a second and shows that any HTTP client can call the endpoint. Without
-`--request` it sends a built-in support-ticket request (an object state; a
-choice of team with one `null` description, a 3-level frustration score and
-an urgent yes/no question). The folder `decision_examples/` holds three
-request files: ticket routing, review sentiment and a nested-object state.
+`--request` it sends a built-in support-ticket request with no `model`
+field (an object state; a choice of team with one `null` description, a
+3-level frustration score and an urgent yes/no question). The folder
+`decision_examples/` holds three request files: ticket routing, review
+sentiment and a nested-object state.
 
 ```
 lazbuild -B neural-api/examples/ChatTerminal/DecisionClient.lpi
@@ -306,7 +308,7 @@ curl -s -d @decision_examples/nested_state.json http://127.0.0.1:8080/v1/systemo
 ```
 
 ```
-answered by: anyjev_qwen25 (requested as "jev-latest")
+answered by: anyjev_qwen25
 team (choice): billing   confidence 0.2794
     * billing    0.4596
       technical  0.1395
@@ -327,7 +329,7 @@ usage: 5234 input tokens, 0 output tokens
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--server URL` | server root (a trailing `/v1` is accepted) | `http://127.0.0.1:8080` |
-| `--model NAME` | the request's `model`; a request file keeps its own model unless `--model` is given | `jev-latest` |
+| `--model NAME` | set the request's `model` (ChatServer ignores it; other servers may need it); a request file keeps its own model unless `--model` is given | none |
 | `--request FILE` | send the JSON request in `FILE` | the built-in demo |
 | `--api-key KEY` | send `Authorization: Bearer KEY` | none |
 | `--retries N` | retry a refused connection `N` times, 1 s apart (ChatServer listens only after the model has loaded) | `0` |
@@ -347,7 +349,7 @@ TypeSafe's Python SDK (`typesafe-sdk` 0.7.5, checked by reading its source,
 not run against this server) takes the server root through its `base_url`
 constructor argument or the `TYPESAFE_BASE_URL` environment variable
 (`http://127.0.0.1:8080`, without `/v1`) and sends its default model
-`jev-latest`, which this server accepts; it refuses to start without an API
+`jev-latest`, which this server ignores; it refuses to start without an API
 key (`api_key` or `TYPESAFE_API_KEY`; any value works, since this server
 ignores it), and it zstd-compresses request bodies of 1024 bytes or more
 when zstd is installed, which this server does not decode, so set its

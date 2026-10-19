@@ -54,8 +54,6 @@ const
   csDecisionMaxScoreLevels = 10;
   // fpjson's TJSONObject member names are shortstrings of at most this length.
   csDecisionMaxJSONKeyBytes = 255;
-  // The TypeSafe SDK's default request model; every scorer answers to it (as Kev does).
-  csDecisionDefaultModelAlias = 'jev-latest';
 
 type
   // A valid request this scorer cannot answer (too many options for its
@@ -79,7 +77,6 @@ type
   TDecisionQuestions = array of TDecisionQuestion;
 
   TDecisionRequest = record
-    Model: string;
     State: string;                     // rendered
     OpenJevState: string;              // RenderDecisionValueOpenJev
     Questions: TDecisionQuestions;     // in request key order
@@ -110,7 +107,7 @@ type
   TDecisionErrorDetails = array of TDecisionErrorDetail;
 
   // A /v1/systemone backend. A descendant takes what it scores with (engine, head)
-  // in its constructor; ModelName is what /v1/models lists and requests must name.
+  // in its constructor; ModelName is what /v1/models lists and every response names.
   TDecisionScorer = class(TObject)
   protected
     FModelName: string;
@@ -119,8 +116,6 @@ type
     // One answer per question, in request order; the token counts fill "usage".
     procedure Score(const Request: TDecisionRequest; out Answers: TDecisionAnswers;
       out InputTokens, OutputTokens: integer); virtual; abstract;
-    // True for ModelName and for csDecisionDefaultModelAlias.
-    function AcceptsModel(const RequestModel: string): boolean; virtual;
     property ModelName: string read FModelName;
   end;
 
@@ -170,7 +165,7 @@ function RoundDecisionProbability(X: double): double;
 function DecisionAnswerFromProbabilities(Kind: TDecisionQuestionKind;
   const P: TDecisionProbabilities): TDecisionAnswer;
 // {model, answers:{id:{...}}, usage:{...}}; Answers in question order. "model" is
-// AnsweredModel (the scorer that answered), never the request's possibly-alias model.
+// AnsweredModel (the scorer that answered); a request's "model" is ignored.
 function DecisionResponseToJSON(const Request: TDecisionRequest;
   const AnsweredModel: string; const Answers: TDecisionAnswers;
   InputTokens, OutputTokens: integer): string;
@@ -1018,15 +1013,6 @@ begin
     Exit(false);
   end;
   Body := TJSONObject(Root);
-  Field := Body.Find('model');
-  if Field = nil then
-    AddDecisionError(Errors, [LocName('body'), LocName('model')], 'Field required',
-      'missing')
-  else if Field.JSONType <> jtString then
-    AddDecisionError(Errors, [LocName('body'), LocName('model')],
-      'Input should be a valid string', 'string_type')
-  else
-    Request.Model := Field.AsString;
   Field := Body.Find('state');
   if Field = nil then
     AddDecisionError(Errors, [LocName('body'), LocName('state')], 'Field required',
@@ -1144,12 +1130,6 @@ constructor TDecisionScorer.Create(const AModelName: string);
 begin
   inherited Create;
   FModelName := AModelName;
-end;
-
-function TDecisionScorer.AcceptsModel(const RequestModel: string): boolean;
-begin
-  Result := (RequestModel = FModelName) or
-    (RequestModel = csDecisionDefaultModelAlias);
 end;
 
 initialization

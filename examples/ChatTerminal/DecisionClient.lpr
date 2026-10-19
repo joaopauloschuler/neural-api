@@ -10,11 +10,11 @@ the neural-api units, to show that any HTTP client can call the endpoint.
   DecisionClient --server http://127.0.0.1:8094 --retries 30 --raw
 
 Without --request the client sends a built-in support-ticket request (an
-object state, a choice, a score and a noul question). --model sets the
-request's "model" field (default "jev-latest", the alias every ChatServer
-decision scorer accepts); without --model a request file keeps its own.
-The "answered by:" line names the model that answered, plus the requested
-name when the request used another one (such as the jev-latest alias).
+object state, a choice, a score and a noul question) with no "model"
+field: ChatServer serves one model and ignores the request's "model".
+--model NAME sets that field, for servers that need it; without --model a
+request file is sent as it is. The "answered by:" line names the model that
+answered, plus the requested name when the request named another one.
 
 Exit status: 0 on HTTP 200, 1 on any other HTTP status (the server's
 "detail" is printed), 2 when the server cannot be reached, 3 on a bad
@@ -50,7 +50,6 @@ uses
 
 const
   csDefaultServerURL = 'http://127.0.0.1:8080';
-  csDefaultDecisionModel = 'jev-latest';
   csSystemOnePath = '/v1/systemone';
   csRetryDelayMs = 1000;
 
@@ -62,7 +61,7 @@ const
 type
   TClientOptions = record
     ServerURL: string;
-    ModelName: string;        // '' = keep the request file's model (demo: jev-latest)
+    ModelName: string;        // '' = send no model (demo) or the request file's own
     RequestFile: string;      // '' = the built-in demo request
     APIKey: string;           // '' = no Authorization header
     RetryCount: integer;      // extra connection attempts, csRetryDelayMs apart
@@ -81,9 +80,8 @@ begin
   WriteLn;
   WriteLn('Options:');
   WriteLn('  --server URL     server root (default ', csDefaultServerURL, ')');
-  WriteLn('  --model NAME     the request''s "model" (default ', csDefaultDecisionModel,
-    '; a request');
-  WriteLn('                   file keeps its own model unless --model is given)');
+  WriteLn('  --model NAME     set the request''s "model" (default: none; ChatServer');
+  WriteLn('                   ignores it; a request file keeps its own)');
   WriteLn('  --request FILE   send the JSON request in FILE instead of the built-in');
   WriteLn('                   support-ticket demo');
   WriteLn('  --api-key KEY    send "Authorization: Bearer KEY" (ChatServer ignores it;');
@@ -193,6 +191,7 @@ begin
   end;
 end;
 
+// The support-ticket demo request; it has a "model" field only when ModelName <> ''.
 function BuildDemoRequest(const ModelName: string): string;
 var
   Root, State, Questions, Team, TeamCriteria, Frustration, Urgent,
@@ -227,25 +226,24 @@ begin
     'team', Team,
     'frustration', Frustration,
     'urgent', Urgent]);
-  Root := TJSONObject.Create([
-    'model', ModelName,
-    'state', State,
-    'questions', Questions]);
+  Root := TJSONObject.Create;
   try
+    if ModelName <> '' then Root.Add('model', ModelName);
+    Root.Add('state', State);
+    Root.Add('questions', Questions);
     Result := Root.AsJSON;
   finally
     Root.Free;
   end;
 end;
 
-// The body to send for request file text: unchanged unless the "model" field
-// must be set (ModelName <> '') or added (the file has none).
+// The body to send for request file text: unchanged unless ModelName <> '',
+// which replaces or adds its "model" field.
 function PrepareRequestBody(const RequestText, ModelName: string;
   out Body, ErrorMsg: string): boolean;
 var
   Root: TJSONData;
   Request: TJSONObject;
-  ModelField: TJSONData;
 begin
   Body := '';
   ErrorMsg := '';
@@ -257,14 +255,12 @@ begin
       Exit(false);
     end;
     Request := TJSONObject(Root);
-    ModelField := Request.Find('model');
-    if (ModelName = '') and (ModelField <> nil) then
+    if ModelName = '' then
       Body := RequestText
     else
     begin
-      if ModelField <> nil then Request.Delete('model');
-      if ModelName = '' then Request.Add('model', csDefaultDecisionModel)
-      else Request.Add('model', ModelName);
+      if Request.Find('model') <> nil then Request.Delete('model');
+      Request.Add('model', ModelName);
       Body := Request.AsJSON;
     end;
     Result := true;
@@ -611,14 +607,14 @@ begin
   Lines := TStringList.Create;
   Args := TStringList.Create;
   try
-    Root := ParseJSONOrNil(BuildDemoRequest(csDefaultDecisionModel));
+    Root := ParseJSONOrNil(BuildDemoRequest(''));
     try
       Check(Root is TJSONObject, 'the built-in demo request is a JSON object');
       if Root is TJSONObject then
       begin
         Request := TJSONObject(Root);
-        Check(Request.Get('model', '') = csDefaultDecisionModel,
-          'the demo request names the jev-latest model');
+        Check(Request.Find('model') = nil,
+          'the demo request names no model');
         Check(Request.Find('state') is TJSONObject,
           'the demo state is an object');
         Questions := TJSONObject(Request.Find('questions'));
@@ -650,13 +646,11 @@ begin
     Check((Root is TJSONObject) and (TJSONObject(Root).Get('model', '') = 'other'),
       '--model replaces the request file''s model');
     Root.Free;
-    Root := nil;
-    if PrepareRequestBody('{"state":"s"}', '', Body, ErrorMsg) then
-      Root := ParseJSONOrNil(Body);
-    Check((Root is TJSONObject) and
-      (TJSONObject(Root).Get('model', '') = csDefaultDecisionModel),
-      'a request file without a model gets jev-latest');
-    Root.Free;
+    Check(PrepareRequestBody('{"state":"s"}', '', Body, ErrorMsg) and
+      (Body = '{"state":"s"}'),
+      'a request file without a model is sent without one');
+    Check(RequestModelName(BuildDemoRequest('m')) = 'm',
+      '--model adds the model to the demo request');
     Check(not PrepareRequestBody('[1,2]', '', Body, ErrorMsg) and
       not PrepareRequestBody('{not json', '', Body, ErrorMsg),
       'a request file that is not a JSON object is refused');
@@ -667,11 +661,10 @@ begin
       'the endpoint URL from a server root, with or without /v1');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, 'jev-latest', false,
-      Lines);
+    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, '', false, Lines);
     Check(ExitStatus = ceExitOK, 'a 200 reply exits with 0');
-    Check(HasLine('answered by: kev-0.8b (requested as "jev-latest")'),
-      'the answering model is named, with the alias the request used');
+    Check((Lines.Count > 0) and (Lines[0] = 'answered by: kev-0.8b'),
+      'the first line names the answering model');
     Check(HasLine('team (choice): billing   confidence 0.7000') and
       (Lines.IndexOf('      technical  0.1500') >= 0) and
       (Lines.IndexOf('    * billing    0.8000') >= 0) and
@@ -687,8 +680,7 @@ begin
       'the usage line follows the answers');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, 'jev-latest', true,
-      Lines);
+    ExitStatus := ReplyToLines(200, csChoiceScoreNoulReply, '', true, Lines);
     Check((ExitStatus = ceExitOK) and (Lines.Count = 1) and
       (Lines[0] = csChoiceScoreNoulReply), '--raw prints the body unchanged');
 
@@ -696,12 +688,16 @@ begin
     ReplyToLines(200, csChoiceScoreNoulReply, 'kev-0.8b', false, Lines);
     Check(HasLine('answered by: kev-0.8b'),
       'a request naming the answering model prints no "requested as"');
-    Check((RequestModelName(BuildDemoRequest('jev-latest')) = 'jev-latest') and
+    Lines.Clear;
+    ReplyToLines(200, csChoiceScoreNoulReply, 'whatever', false, Lines);
+    Check(HasLine('answered by: kev-0.8b (requested as "whatever")'),
+      'a request naming another model prints the name it was requested as');
+    Check((RequestModelName(BuildDemoRequest('whatever')) = 'whatever') and
       (RequestModelName('{"state":"s"}') = ''),
       'the requested model is read back from the request body');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(422, csValidationReply, 'jev-latest', false, Lines);
+    ExitStatus := ReplyToLines(422, csValidationReply, '', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('HTTP 422') and
       HasLine('  body.questions.team.criteria: Field required (missing)') and
       HasLine('  body.questions.level.criteria.1: Value error, a score level' +
@@ -709,7 +705,7 @@ begin
       'a 422 detail list prints one loc: msg (type) line per error, exit 1');
 
     Lines.Clear;
-    ExitStatus := ReplyToLines(501, csDecisionOnlyReply, 'jev-latest', false, Lines);
+    ExitStatus := ReplyToLines(501, csDecisionOnlyReply, '', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('HTTP 501') and
       HasLine('  no decision scorer is active on this server, so POST' +
         ' /v1/systemone cannot answer'),
@@ -718,7 +714,7 @@ begin
     Lines.Clear;
     ExitStatus := ReplyToLines(404,
       '{"error":{"message":"no such endpoint","type":"invalid_request_error"}}',
-      'jev-latest', false, Lines);
+      '', false, Lines);
     Check((ExitStatus = ceExitHTTPError) and HasLine('  no such endpoint'),
       'an OpenAI-style error body prints its message, exit 1');
 
@@ -783,10 +779,7 @@ begin
   end;
 
   if Opt.RequestFile = '' then
-  begin
-    if Opt.ModelName = '' then Body := BuildDemoRequest(csDefaultDecisionModel)
-    else Body := BuildDemoRequest(Opt.ModelName);
-  end
+    Body := BuildDemoRequest(Opt.ModelName)
   else
   begin
     if not FileExists(Opt.RequestFile) then

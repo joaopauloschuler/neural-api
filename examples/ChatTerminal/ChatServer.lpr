@@ -35,6 +35,8 @@ Endpoints (all responses application/json):
        --decision-adapter DIR scores it instead with a Kev or Open-Jev
        checkpoint (neural/neuraldecisionheads.pas) whose LoRA is merged into
        the model directory (its base); the chat endpoints then answer 501.
+       The request's "model" is optional and ignored: the response's
+       "model" always names the scorer that answered.
        Errors use the FastAPI {"detail": ...} body: 422 on validation and on
        a request the scorer cannot answer (e.g. a label that is not one
        token), 501 when no decision scorer is active, 500 when it fails.
@@ -910,13 +912,6 @@ begin
   begin
     Code := 422;
     Exit(DecisionErrorsToJSON(Errors));
-  end;
-  if not DecisionScorer.AcceptsModel(Request.Model) then
-  begin
-    Code := 422;
-    Exit(DecisionErrorMessageToJSON('model "' + Request.Model + '" is not' +
-      ' served here; use "' + DecisionScorer.ModelName + '" or "' +
-      csDecisionDefaultModelAlias + '"'));
   end;
   try
     DecisionScorer.Score(Request, Answers, InputTokens, OutputTokens);
@@ -1800,13 +1795,13 @@ begin
       '"noul":0.8}},"usage":{"input_tokens":11,"output_tokens":3}}'),
       'systemone with a fixed scorer returns the exact response JSON');
     Reply := Serve(App, 'POST', '/v1/systemone',
-      StringReplace(DecisionBody, '"fixed-test"', '"jev-latest"', []), Code);
-    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
-      'systemone accepts the jev-latest alias and names the scorer that answered');
-    Reply := Serve(App, 'POST', '/v1/systemone',
       StringReplace(DecisionBody, '"fixed-test"', '"other"', []), Code);
-    Check((Code = 422) and (Pos('{"detail":"model \"other\"', Reply) = 1),
-      'systemone rejects a model the scorer does not serve with 422');
+    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
+      'systemone answers any model name with the loaded scorer''s name');
+    Reply := Serve(App, 'POST', '/v1/systemone',
+      StringReplace(DecisionBody, '"model":"fixed-test",', '', []), Code);
+    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
+      'systemone answers a request without a model');
     Reply := Serve(App, 'POST', '/v1/systemone', '{"model":"fixed-test",' +
       '"questions":{"q":{"type":"box"}}}', Code);
     Check((Code = 422) and (Pos('{"detail":[{"loc":["body",', Reply) = 1),
@@ -1986,8 +1981,8 @@ begin
       WriteLn(Format('Serving decision model %s on http://%s:%d/v1, POST' +
         ' /v1/systemone only (Ctrl+C stops)', [App.ModelName,
         App.Engine.Opt.Host, App.Engine.Opt.Port]));
-    WriteLn(Format('POST /v1/systemone: %s (model "%s" or "%s")', [ScorerText,
-      App.DecisionScorer.ModelName, csDecisionDefaultModelAlias]));
+    WriteLn(Format('POST /v1/systemone: %s (answers as "%s" whatever model' +
+      ' the request names)', [ScorerText, App.DecisionScorer.ModelName]));
     Server.Active := true; // blocks: the accept/serve loop
   finally
     Server.Free;
