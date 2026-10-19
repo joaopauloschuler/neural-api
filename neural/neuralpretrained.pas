@@ -14118,6 +14118,14 @@ begin
   raise EPretrainedImportError.Create(Msg);
 end;
 
+// Loads the text file FileName into JsonText; a Git LFS pointer file raises
+// EPretrainedImportError instead.
+procedure LoadImportJSONText(JsonText: TStrings; const FileName: string);
+begin
+  RaiseIfGitLfsPointer(FileName, EPretrainedImportError);
+  JsonText.LoadFromFile(FileName);
+end;
+
 function CreatePretrainedTensorReader(
   const FileName: string): TNNetSafeTensorsReader;
 const
@@ -15250,7 +15258,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -17036,7 +17044,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -22508,7 +22516,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -22945,7 +22953,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -23683,7 +23691,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24150,7 +24158,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24596,7 +24604,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24960,7 +24968,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -25417,7 +25425,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26012,7 +26020,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26596,7 +26604,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -27301,7 +27309,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -27375,7 +27383,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -28863,7 +28871,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       try
         Root := GetJSON(JsonText.Text);
       except
@@ -29622,7 +29630,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -30339,7 +30347,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -31023,7 +31031,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -31775,7 +31783,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -32413,7 +32421,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -33887,7 +33895,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34398,7 +34406,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -35010,7 +35018,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -35314,7 +35322,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen import: config "' + FileName +
@@ -35410,7 +35418,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       Root := GetJSON(JsonText.Text);
     except
       // Corrupt/unreadable JSON behaves the same as an absent file.
@@ -36558,7 +36566,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Parler-TTS import: config "' + FileName +
@@ -37264,7 +37272,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen Melody import: config "' + FileName +
@@ -38223,7 +38231,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Bark import: config root is not a JSON object.');
@@ -38709,7 +38717,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -39087,7 +39095,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -39449,7 +39457,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -40344,7 +40352,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -41532,7 +41540,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42200,7 +42208,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42741,7 +42749,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -43132,7 +43140,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -43402,7 +43410,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -44356,7 +44364,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('EnCodec import: config "' + FileName +
@@ -46019,7 +46027,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Mimi import: config "' + FileName + '" is not a JSON object.');
@@ -47602,7 +47610,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DAC import: config "' + FileName + '" is not a JSON object.');
@@ -48591,7 +48599,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -49400,7 +49408,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -50195,7 +50203,7 @@ begin
   Root := nil;
   CfgRoot := nil;
   try
-    JsonText.LoadFromFile(VocabFile);
+    LoadImportJSONText(JsonText, VocabFile);
     // Parse WITHOUT joUTF8 so multibyte char keys (e.g. the en-dash in
     // mms-tts-eng) survive as raw UTF-8 bytes.
     try
@@ -50229,7 +50237,7 @@ begin
     begin
       if not FileExists(ConfigFile) then
         ImportError('VITS tokenizer: config file not found: ' + ConfigFile);
-      JsonText.LoadFromFile(ConfigFile);
+      LoadImportJSONText(JsonText, ConfigFile);
       try
         CfgRoot := HFParseJSONRaw(JsonText.Text);
       except
@@ -51172,7 +51180,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -51647,7 +51655,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     // The HF config.json escapes some vocab keys (̃); decode them to
     // raw UTF-8 and parse without joUTF8 so every key keeps its bytes.
     try
@@ -54080,7 +54088,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -54522,7 +54530,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -55675,7 +55683,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56070,7 +56078,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56672,7 +56680,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -57261,7 +57269,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -57980,7 +57988,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -58387,7 +58395,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -58948,7 +58956,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -59693,7 +59701,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61142,7 +61150,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61386,7 +61394,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61533,7 +61541,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -62154,7 +62162,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63016,7 +63024,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63447,7 +63455,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63771,7 +63779,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64333,7 +64341,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64738,7 +64746,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65251,7 +65259,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65728,7 +65736,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66289,7 +66297,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66822,7 +66830,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67252,7 +67260,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67544,7 +67552,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67990,7 +67998,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -68446,7 +68454,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -69440,7 +69448,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -69882,7 +69890,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -70530,7 +70538,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -71154,7 +71162,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -71768,7 +71776,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
@@ -73076,7 +73084,7 @@ begin
     ImportError('SD UNet import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Result := ReadSDUNetConfigFromJSONText(JsonText.Text, FileName);
   finally
     JsonText.Free;
@@ -74323,7 +74331,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -74814,7 +74822,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75197,7 +75205,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75454,7 +75462,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75637,7 +75645,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76192,7 +76200,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76446,7 +76454,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76660,7 +76668,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76973,7 +76981,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -77423,7 +77431,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78124,7 +78132,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78535,7 +78543,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78902,7 +78910,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79241,7 +79249,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79576,7 +79584,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('SAM mask decoder: config is not a JSON object.');
@@ -80464,7 +80472,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -81100,7 +81108,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -81684,7 +81692,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -82072,7 +82080,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -82903,7 +82911,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -83791,7 +83799,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84362,7 +84370,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84573,7 +84581,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84961,7 +84969,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85260,7 +85268,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85687,7 +85695,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen2-VL import: config root is not a JSON object.');
@@ -86004,7 +86012,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
     Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
@@ -86619,7 +86627,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
@@ -87027,7 +87035,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwen3VLVisionImporter + ': "' + FileName +
@@ -88642,7 +88650,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(IndexFile);
+    LoadImportJSONText(JsonText, IndexFile);
     Root := GetJSON(JsonText.Text);
     PipelineClass := '';
     if Root is TJSONObject then
@@ -89606,7 +89614,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -90138,7 +90146,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(ConfigPath);
+    LoadImportJSONText(JsonText, ConfigPath);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -90623,7 +90631,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DiT import: ' + FileName + ' is not a JSON object.');
@@ -91082,7 +91090,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('VAR import: ' + FileName + ' is not a JSON object.');
@@ -91690,7 +91698,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('PixArt import: ' + FileName + ' is not a JSON object.');
@@ -92186,7 +92194,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MMDiT import: ' + FileName + ' is not a JSON object.');
@@ -92490,7 +92498,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -93003,7 +93011,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -93408,7 +93416,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('F5-TTS import: config "' + FileName + '" is not a JSON object.');

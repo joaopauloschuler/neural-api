@@ -1895,75 +1895,84 @@ begin
     if Opt.ModelDir = '' then Halt(1);
     Halt(0);
   end;
-  if (DecisionOpt.AdapterDir = '') and
-    (DetectDecisionAdapterLayout(Opt.ModelDir) = dalKevFullWeights) then
-  begin
-    WriteLn('Error: ', Opt.ModelDir, ' is a Kev full-weight decision checkpoint' +
-      ' (no LM head, nothing to chat with): add --decision-adapter ', Opt.ModelDir);
-    Halt(1);
-  end;
-  if (DecisionOpt.AdapterDir <> '') and
-    not PrepareDecisionAdapter(Opt, DecisionOpt.AdapterDir, AdapterInfo, ErrorMsg) then
-  begin
-    WriteLn('Error: --decision-adapter: ', ErrorMsg);
-    Halt(1);
-  end;
-
-  App := TServerApp.Create();
-  App.Engine := TChatEngine.Create();
-  App.Engine.OnNotice := @App.NoticeOut; // load progress + notices to console
-  App.RequestCount := 0;
-  if not App.Engine.LoadModel(Opt, ErrorMsg) then
-  begin
-    WriteLn(ErrorMsg);
-    App.Engine.Free;
-    App.Free;
-    Halt(1);
-  end;
-  App.ModelName :=
-    ExtractFileName(ExcludeTrailingPathDelimiter(App.Engine.Opt.ModelDir));
-  if App.ModelName = '' then App.ModelName := App.Engine.ModelType;
-  if DecisionOpt.AdapterDir = '' then
-  begin
-    // The decision model name is the chat model name, so /v1/models lists one id.
-    App.DecisionScorer := TAnyJevL0Scorer.Create(App.Engine, App.ModelName,
-      DecisionOpt.Level, DecisionOpt.Prior, DecisionOpt.MaxRotations);
-    ScorerText := 'AnyJev ' + DecisionLevelText(DecisionOpt) +
-      ' readout on the chat model';
-  end
-  else
-  begin
-    try
-      if AdapterInfo.Layout = dalOpenJev then
-      begin
-        HeadScorer := TOpenJevScorer.Create(App.Engine,
-          DecisionAdapterModelName(DecisionOpt.AdapterDir), AdapterInfo.CheckpointDir);
-        ScorerText := 'Open-Jev candidate head';
-      end
-      else
-      begin
-        HeadScorer := TKevScorer.Create(App.Engine,
-          DecisionAdapterModelName(DecisionOpt.AdapterDir),
-          AdapterInfo.CheckpointDir + csOpenJevHeadFile);
-        ScorerText := 'Kev pointer head';
-      end;
-    except
-      on E: Exception do
-      begin
-        WriteLn('Error: --decision-adapter: ', E.Message);
-        App.Engine.Free;
-        App.Free;
-        Halt(1);
-      end;
+  // A load error is one stderr line and exit code 1, never an unhandled exception.
+  try
+    if (DecisionOpt.AdapterDir = '') and
+      (DetectDecisionAdapterLayout(Opt.ModelDir) = dalKevFullWeights) then
+    begin
+      WriteLn(StdErr, 'Error: ', Opt.ModelDir, ' is a Kev full-weight decision checkpoint' +
+        ' (no LM head, nothing to chat with): add --decision-adapter ', Opt.ModelDir);
+      Halt(1);
     end;
-    App.DecisionScorer := HeadScorer;
-    if DecisionOpt.Temperature > 0 then HeadScorer.Temperature := DecisionOpt.Temperature;
-    ScorerText := Format('%s from %s, temperature %.6g (checkpoint %.6g)',
-      [ScorerText, DecisionOpt.AdapterDir, HeadScorer.Temperature,
-      HeadScorer.HeadTemperature]);
-    App.DecisionOnlyReason := DecisionOnlyReasonText(AdapterInfo,
-      DecisionOpt.AdapterDir);
-    App.ModelName := HeadScorer.ModelName;
+    if (DecisionOpt.AdapterDir <> '') and
+      not PrepareDecisionAdapter(Opt, DecisionOpt.AdapterDir, AdapterInfo, ErrorMsg) then
+    begin
+      WriteLn(StdErr, 'Error: --decision-adapter: ', ErrorMsg);
+      Halt(1);
+    end;
+
+    App := TServerApp.Create();
+    App.Engine := TChatEngine.Create();
+    App.Engine.OnNotice := @App.NoticeOut; // load progress + notices to console
+    App.RequestCount := 0;
+    if not App.Engine.LoadModel(Opt, ErrorMsg) then
+    begin
+      WriteLn(StdErr, 'Error: ', ErrorMsg);
+      App.Engine.Free;
+      App.Free;
+      Halt(1);
+    end;
+    App.ModelName :=
+      ExtractFileName(ExcludeTrailingPathDelimiter(App.Engine.Opt.ModelDir));
+    if App.ModelName = '' then App.ModelName := App.Engine.ModelType;
+    if DecisionOpt.AdapterDir = '' then
+    begin
+      // The decision model name is the chat model name, so /v1/models lists one id.
+      App.DecisionScorer := TAnyJevL0Scorer.Create(App.Engine, App.ModelName,
+        DecisionOpt.Level, DecisionOpt.Prior, DecisionOpt.MaxRotations);
+      ScorerText := 'AnyJev ' + DecisionLevelText(DecisionOpt) +
+        ' readout on the chat model';
+    end
+    else
+    begin
+      try
+        if AdapterInfo.Layout = dalOpenJev then
+        begin
+          HeadScorer := TOpenJevScorer.Create(App.Engine,
+            DecisionAdapterModelName(DecisionOpt.AdapterDir), AdapterInfo.CheckpointDir);
+          ScorerText := 'Open-Jev candidate head';
+        end
+        else
+        begin
+          HeadScorer := TKevScorer.Create(App.Engine,
+            DecisionAdapterModelName(DecisionOpt.AdapterDir),
+            AdapterInfo.CheckpointDir + csOpenJevHeadFile);
+          ScorerText := 'Kev pointer head';
+        end;
+      except
+        on E: Exception do
+        begin
+          WriteLn(StdErr, 'Error: --decision-adapter: ', E.Message);
+          App.Engine.Free;
+          App.Free;
+          Halt(1);
+        end;
+      end;
+      App.DecisionScorer := HeadScorer;
+      if DecisionOpt.Temperature > 0 then HeadScorer.Temperature := DecisionOpt.Temperature;
+      ScorerText := Format('%s from %s, temperature %.6g (checkpoint %.6g)',
+        [ScorerText, DecisionOpt.AdapterDir, HeadScorer.Temperature,
+        HeadScorer.HeadTemperature]);
+      App.DecisionOnlyReason := DecisionOnlyReasonText(AdapterInfo,
+        DecisionOpt.AdapterDir);
+      App.ModelName := HeadScorer.ModelName;
+    end;
+  except
+    on E: Exception do
+    begin
+      WriteLn(StdErr, 'Error: ', E.Message);
+      Halt(1);
+    end;
   end;
 
   Server := TChatHTTPServer.Create(nil);

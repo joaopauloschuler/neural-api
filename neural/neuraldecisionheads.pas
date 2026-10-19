@@ -594,6 +594,7 @@ var
 begin
   if not FileExists(FileName) then
     raise EDecisionHeadError.CreateFmt('%s: file not found', [FileName]);
+  RaiseIfGitLfsPointer(FileName, EDecisionHeadError);
   Text := TStringList.Create;
   try
     Text.LoadFromFile(FileName);

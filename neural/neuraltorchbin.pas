@@ -330,6 +330,7 @@ begin
   if not FileExists(pShardFileName) then
     raise ETorchBinError.CreateFmt('torch.bin: file not found: %s',
       [pShardFileName]);
+  RaiseIfGitLfsPointer(pShardFileName, ETorchBinError);
   Stream := TFileStream.Create(pShardFileName,
     fmOpenRead or fmShareDenyWrite);
   // Register the stream in the inherited shard table immediately so the
@@ -374,6 +375,7 @@ var
   i, ShardIdx, TensorIdx, WeightMapCount, WeightMapMax: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
+  RaiseIfGitLfsPointer(pIndexFileName, ETorchBinError);
   IndexText := TStringList.Create;
   ShardFiles := TStringList.Create;
   Root := nil;

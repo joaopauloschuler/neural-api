@@ -23,7 +23,7 @@ uses
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralg2p,
-  neuralchatengine, neuralchat, neuralkokorosession,
+  neuralchatengine, neuralchat, neuralkokorosession, neuraldecisionheads,
   neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
 type
@@ -270,6 +270,12 @@ type
     // directories - config.json + model.safetensors - in a temp dir for
     // the BuildFromPretrained directory-dispatch tests).
     procedure CopyFileTo(const Src, Dst: string);
+    // Writes Contents as the text file FileName.
+    procedure WriteTextFile(const FileName, Contents: string);
+    // Writes a Git LFS pointer text (what a clone without "git lfs pull" leaves) to FileName.
+    procedure WriteGitLfsPointer(const FileName: string);
+    // Asserts that Msg is the Git LFS pointer error naming FileName.
+    procedure AssertGitLfsPointerMessage(const What, Msg, FileName: string);
     // Shared body for the EnCodec round-trip parity tests, parameterized by
     // fixture base name. MUST stay PRIVATE: a published parameterized method
     // is auto-run by FPCUnit with an empty BaseName and fails on the missing
@@ -392,6 +398,9 @@ type
     procedure TestTorchBinKevHeadMetadata;
     procedure TestTorchBinOpenJevHeadAnyLocation;
     procedure TestTorchBinHeadRejectsHostileMetadata;
+    procedure TestGitLfsPointerDetection;
+    procedure TestGitLfsPointerCheckpointReaders;
+    procedure TestGitLfsPointerTokenizerAndConfigs;
     procedure TestGPT2LogitParityFromTorchBin;
     procedure TestShardedTorchBinMatchesSingleFile;
     procedure TestShardedTorchBinIndexErrors;
@@ -1312,6 +1321,239 @@ begin
     end;
   finally
     SrcStream.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.WriteTextFile(const FileName, Contents: string);
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Contents;
+    Lines.SaveToFile(FileName);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.WriteGitLfsPointer(const FileName: string);
+begin
+  WriteTextFile(FileName, 'version https://git-lfs.github.com/spec/v1' + LineEnding +
+    'oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393' +
+    LineEnding + 'size 1543215232');
+end;
+
+procedure TTestNeuralPretrained.AssertGitLfsPointerMessage(const What, Msg,
+  FileName: string);
+begin
+  AssertTrue(What + ' names the Git LFS pointer file, got: "' + Msg + '"',
+    Pos(FileName + ' is a Git LFS pointer file', Msg) > 0);
+  AssertTrue(What + ' says to run git lfs pull, got: "' + Msg + '"',
+    Pos('"git lfs pull"', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerDetection;
+var
+  Dir, PointerFile, LargeFile, JsonFile: string;
+  Large: TFileStream;
+  Signature: string;
+  Padding: array[0..1499] of byte;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_detect_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  PointerFile := Dir + 'model.safetensors';
+  LargeFile := Dir + 'large.bin';
+  JsonFile := Dir + 'config.json';
+  try
+    WriteGitLfsPointer(PointerFile);
+    AssertTrue('a pointer file is detected', IsGitLfsPointerFile(PointerFile));
+    // The signature followed by more than a pointer's 1023 bytes is real data.
+    Signature := 'version https://git-lfs.github.com/spec/v1';
+    FillChar(Padding, SizeOf(Padding), 0);
+    Large := TFileStream.Create(LargeFile, fmCreate);
+    try
+      Large.WriteBuffer(Signature[1], Length(Signature));
+      Large.WriteBuffer(Padding, SizeOf(Padding));
+    finally
+      Large.Free;
+    end;
+    AssertFalse('a 1.5 KB file is never a pointer', IsGitLfsPointerFile(LargeFile));
+    WriteTextFile(JsonFile, '{"model_type": "llama"}');
+    AssertFalse('a JSON file is not a pointer', IsGitLfsPointerFile(JsonFile));
+    AssertFalse('a missing file is not a pointer',
+      IsGitLfsPointerFile(Dir + 'missing.json'));
+  finally
+    DeleteFile(PointerFile);
+    DeleteFile(LargeFile);
+    DeleteFile(JsonFile);
+    RemoveDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerCheckpointReaders;
+var
+  Dir, PointerFile, IndexFile, ValidFile, Msg: string;
+  Reader: TNNetSafeTensorsReader;
+  Vol: TNNetVolume;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_ckpt_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  PointerFile := Dir + 'model-00001-of-00001.safetensors';
+  IndexFile := Dir + 'model.safetensors.index.json';
+  ValidFile := '';
+  try
+    WriteGitLfsPointer(PointerFile);
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(PointerFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors file', Msg, PointerFile);
+
+    // A real index whose shard is a pointer reports the shard.
+    WriteTextFile(IndexFile, '{"weight_map": {"w": "model-00001-of-00001.safetensors"}}');
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(IndexFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors shard', Msg, PointerFile);
+
+    WriteGitLfsPointer(IndexFile);
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(IndexFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors index', Msg, IndexFile);
+
+    Msg := '';
+    try
+      TNNetTorchBinReader.Create(PointerFile).Free;
+    except
+      on E: ETorchBinError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('torch.save file', Msg, PointerFile);
+
+    Msg := '';
+    try
+      TNNetTorchBinReader.Create(IndexFile).Free;
+    except
+      on E: ETorchBinError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('torch.bin index', Msg, IndexFile);
+
+    Msg := '';
+    try
+      TNNetGGUFReader.Create(PointerFile).Free;
+    except
+      on E: EGGUFError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('GGUF file', Msg, PointerFile);
+
+    // Real files still load.
+    ValidFile := WriteTempSafeTensors(
+      '{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}', [0, 0, 128, 63]);
+    Reader := TNNetSafeTensorsReader.Create(ValidFile);
+    Vol := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('w', Vol);
+      AssertEquals('a real safetensors file still loads', 1.0, Vol.FData[0], 0);
+    finally
+      Vol.Free;
+      Reader.Free;
+    end;
+    TNNetTorchBinReader.Create(FixturePath('torch_head' + DirectorySeparator +
+      'kev' + DirectorySeparator + 'head.pt')).Free;
+  finally
+    DeleteFile(PointerFile);
+    DeleteFile(IndexFile);
+    if ValidFile <> '' then DeleteFile(ValidFile);
+    RemoveDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerTokenizerAndConfigs;
+var
+  Dir, TokenizerFile, ModelFile, TokenizerConfigFile, ConfigFile,
+    CheckpointFile, Msg: string;
+  Tokenizer: TNeuralHFTokenizer;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_tok_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  TokenizerFile := Dir + 'tokenizer.json';
+  ModelFile := Dir + 'tokenizer.model';
+  TokenizerConfigFile := Dir + 'tokenizer_config.json';
+  ConfigFile := Dir + 'config.json';
+  CheckpointFile := Dir + 'model.json';
+  Tokenizer := TNeuralHFTokenizer.Create;
+  try
+    WriteGitLfsPointer(TokenizerFile);
+    WriteGitLfsPointer(ModelFile);
+    WriteGitLfsPointer(TokenizerConfigFile);
+    WriteGitLfsPointer(ConfigFile);
+    WriteGitLfsPointer(CheckpointFile);
+    Msg := '';
+    try
+      Tokenizer.LoadFromFile(TokenizerFile);
+    except
+      on E: EHFTokenizerError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('tokenizer.json', Msg, TokenizerFile);
+
+    Msg := '';
+    try
+      Tokenizer.LoadFromFile(ModelFile);
+    except
+      on E: EHFTokenizerError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('SentencePiece .model', Msg, ModelFile);
+
+    Msg := '';
+    try
+      LoadChatTemplateString(TokenizerConfigFile);
+    except
+      on E: ENeuralChatError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('tokenizer_config.json', Msg, TokenizerConfigFile);
+
+    Msg := '';
+    try
+      ReadLlamaConfigFromJSONFile(ConfigFile);
+    except
+      on E: EPretrainedImportError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('config.json', Msg, ConfigFile);
+
+    Msg := '';
+    try
+      ReadOpenJevModelConfig(Dir);
+    except
+      on E: EDecisionHeadError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('Open-Jev model.json', Msg, CheckpointFile);
+
+    // Real files still load.
+    Tokenizer.LoadFromFile(FixturePath('anyjev_qwen25' + DirectorySeparator +
+      'tokenizer.json'));
+    AssertTrue('a real tokenizer.json still loads', Tokenizer.GetVocabSize() > 0);
+    AssertTrue('a real config.json still loads', ReadLlamaConfigFromJSONFile(
+      FixturePath('anyjev_qwen25' + DirectorySeparator + 'config.json')).HiddenSize > 0);
+  finally
+    Tokenizer.Free;
+    DeleteFile(TokenizerFile);
+    DeleteFile(ModelFile);
+    DeleteFile(TokenizerConfigFile);
+    DeleteFile(ConfigFile);
+    DeleteFile(CheckpointFile);
+    RemoveDir(Dir);
   end;
 end;
 

@@ -511,6 +511,7 @@ begin
   if not FileExists(pShardFileName) then
     raise ESafeTensorsError.CreateFmt('safetensors: file not found: %s',
       [pShardFileName]);
+  RaiseIfGitLfsPointer(pShardFileName, ESafeTensorsError);
   Stream := TFileStream.Create(pShardFileName,
     fmOpenRead or fmShareDenyWrite);
   Result := Length(FStreams);
@@ -551,6 +552,7 @@ var
   i, ShardIdx, TensorIdx, WeightMapCount, MaxIdx: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
+  RaiseIfGitLfsPointer(pIndexFileName, ESafeTensorsError);
   IndexText := TStringList.Create;
   ShardFiles := TStringList.Create;
   Root := nil;

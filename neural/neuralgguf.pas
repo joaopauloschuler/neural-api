@@ -995,6 +995,7 @@ begin
   FFileName := pFileName;
   if not FileExists(pFileName) then
     raise EGGUFError.CreateFmt('gguf: file not found: %s', [pFileName]);
+  RaiseIfGitLfsPointer(pFileName, EGGUFError);
   Stream := TFileStream.Create(pFileName, fmOpenRead or fmShareDenyWrite);
   // Single "shard": the inherited LoadTensorFlat machinery (and Destroy)
   // sees one open stream whose data section starts at the aligned offset

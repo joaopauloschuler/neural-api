@@ -516,6 +516,7 @@ var
   FS: TFileStream;
 begin
   Result := '';
+  RaiseIfGitLfsPointer(FileName, ENeuralChatError);
   FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
   try
     SetLength(Result, FS.Size);
