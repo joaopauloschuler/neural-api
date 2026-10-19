@@ -198,8 +198,9 @@ var
     UrgentCriteria: TJSONObject;
 begin
   State := TJSONObject.Create([
-    'ticket', 'I was charged twice for order 4471 and the refund button in the' +
-      ' app just spins. This is the third time I am writing!',
+    'ticket', 'My card was charged twice for order 4471 and now I cannot pay my' +
+      ' rent tomorrow. The refund button in the app just spins. This is the' +
+      ' third time I am writing!',
     'customer_tier', 'premium',
     'open_tickets', 2]);
   TeamCriteria := TJSONObject.Create([

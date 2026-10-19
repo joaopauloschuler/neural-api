@@ -4693,6 +4693,16 @@ rather than acted on.
         python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
         kill %1
         ```
+        - [x] Open-Jev-2B (2026-10-19, user box): `Qwen/Qwen3.5-2B` at
+              15852e8c16360a2fea060d615a32b45270f8a8fc + `ZefanCai/Open-Jev-2B`,
+              `ChatServer q2b/ --gpu --int4 --port 5000 --decision-adapter Open-Jev-2B`,
+              called with `DecisionClient`: sensible answers; an obviously urgent
+              ticket gave a high P(true), an obviously calm one a low P(true). Now
+              SUPPORTED in the docs. The `--fp32` `decision_real_check.py` parity run
+              was not part of this check.
+        - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
+        - [ ] AnyJev L0: ran on a 0.5B chat checkpoint, but the yes/no answer was
+              questionable; stays planned (coded).
   Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
   `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
   `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer

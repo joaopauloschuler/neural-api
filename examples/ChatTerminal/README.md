@@ -10,8 +10,9 @@ through the same shared engine (`TChatEngine` in
   (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming),
   plus `/v1/systemone` for TypeSafe/Jev typed decisions through the AnyJev
   L0 readout, or through a Kev / Open-Jev checkpoint with
-  `--decision-adapter` (both planned (coded): parity-tested on pico
-  fixtures, not yet run on a real checkpoint).
+  `--decision-adapter`. Open-Jev-2B is supported (user-tested on its
+  `Qwen/Qwen3.5-2B` base with `--int4 --gpu`); AnyJev L0, Kev and
+  Open-Jev-9B/27B are planned (coded): parity-tested on pico fixtures only.
 
 Both take the same command line: a model directory followed by the flags
 listed on this page (`ParseArgs` in `neural/neuralchatengine.pas` parses them
@@ -48,7 +49,8 @@ neural-api/bin/x86_64-linux/bin/ChatServer q2/ --gpu --port 8080
 
 ### Tested models
 
-These models have been run/verified through ChatTerminal:
+These models have been run/verified through ChatTerminal (the Open-Jev
+row: through ChatServer's `POST /v1/systemone`):
 
 | Model | model_type |
 |---|---|
@@ -66,6 +68,7 @@ These models have been run/verified through ChatTerminal:
 | allenai/OLMoE-1B-7B-0125-Instruct | olmoe |
 | state-spaces/mamba-130m-hf | mamba |
 | openai-community/gpt2 | gpt2 |
+| ZefanCai/Open-Jev-2B on Qwen/Qwen3.5-2B (`--decision-adapter`, `--int4 --gpu`) | qwen3_5 |
 
 ## From your own code
 

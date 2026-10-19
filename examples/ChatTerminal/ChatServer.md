@@ -136,9 +136,10 @@ the prior from the content-free probes of each request); AnyJev's L1/L2
 levels and adaptive shifts.
 
 **Status.** AnyJev L0 is planned (coded): `TestNeuralAnyJev` matches the
-real `anyjev` 0.3.0 package within 3.1e-6 on two pico Qwen fixtures, but
-nobody has run it on a real checkpoint yet. The check below is how the user
-runs it on Qwen2.5-0.5B-Instruct.
+real `anyjev` 0.3.0 package within 3.1e-6 on two pico Qwen fixtures. The
+user ran it on a 0.5B chat checkpoint, but its yes/no answer there was
+questionable, so it is not marked supported. The check below is how the
+user runs it on Qwen2.5-0.5B-Instruct.
 
 **Real-checkpoint check.** `tools/anyjev_real_check.py` sends one fixed
 request (a choice, a score and a yes/no question) to a running ChatServer,
@@ -209,12 +210,19 @@ those rows, and the embedding still loads) and 248320 x 5120 = 1.27G for
 Kev-27B (5.1 GB FP32, about 1.3 GB int8). The probabilities do not change: `TestNeuralDecisionHeads`
 measures them bit-identical with and without the LM head on both fixtures.
 
-**Status.** Planned (coded), not supported: `TestNeuralDecisionHeads` matches
-kev's and jev's own code on pico fixtures (Kev LoRA within 4.1e-6, Kev full
+**Status.** Open-Jev-2B is supported. The user ran `ZefanCai/Open-Jev-2B`
+on its base `Qwen/Qwen3.5-2B` at revision
+`15852e8c16360a2fea060d615a32b45270f8a8fc` with
+`--gpu --int4 --decision-adapter Open-Jev-2B` and called it with
+`DecisionClient`: it answered sensibly, and an obviously urgent ticket got a
+high `P(true)` while an obviously calm one got a low `P(true)`. That run did
+not use `tools/decision_real_check.py`. Open-Jev-9B/27B and every Kev size
+are planned (coded), not supported: `TestNeuralDecisionHeads` matches kev's
+and jev's own code on pico fixtures (Kev LoRA within 4.1e-6, Kev full
 weights within 2.2e-6, Open-Jev within 6.4e-7), and
 `tools/decision_real_check.py` passed against all three fixtures through a
 running server (max difference 4.6e-5, the server's 4-decimal rounding), but
-nobody has run a real Kev or Open-Jev checkpoint yet.
+nobody has run a real Kev checkpoint or a larger Open-Jev checkpoint yet.
 
 **Real-checkpoint checks.** `tools/decision_real_check.py BASE ADAPTER`
 sends one fixed request (a choice, a score and a yes/no question) to the
@@ -271,6 +279,11 @@ python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat
 kill %1
 ```
 
+**Troubleshooting: Git LFS.** Hugging Face stores the weights with Git LFS.
+Run `git lfs install` before `git clone`, or `git lfs pull` inside a clone
+made without it. Without that, the files are small pointer texts, and the
+loaders stop with `<file> is a Git LFS pointer file, not the real file`.
+
 ### Calling it: `DecisionClient` and curl
 
 Start a server with one of the three scorers (the checkpoints are the ones
@@ -323,7 +336,8 @@ needs_refund (noul): P(true) = 0.3064
 usage: 5234 input tokens, 0 output tokens
 ```
 
-(The numbers above come from the random pico fixture
+(This is the output for `--request decision_examples/ticket_routing.json`.
+The numbers come from the random pico fixture
 `tests/fixtures/anyjev_qwen25` and mean nothing.)
 
 | Option | Meaning | Default |
