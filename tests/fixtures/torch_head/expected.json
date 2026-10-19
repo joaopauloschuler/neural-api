@@ -1,0 +1,221 @@
+{
+ "kev": {
+  "tensors": {
+   "head.q.weight": {
+    "shape": [
+     4,
+     8
+    ],
+    "values": [
+     -0.3464442193508148,
+     0.20055148005485535,
+     -0.09153714030981064,
+     -0.029240639880299568,
+     0.048171527683734894,
+     -0.2363930344581604,
+     0.2918894290924072,
+     -0.1902848482131958,
+     0.15529878437519073,
+     0.18661902844905853,
+     0.030168039724230766,
+     0.11252369731664658,
+     0.25660935044288635,
+     -0.1113799586892128,
+     -0.35038504004478455,
+     -0.1970546394586563,
+     -0.1361149698495865,
+     0.1893368810415268,
+     -0.0583898201584816,
+     -0.1159660816192627,
+     -0.34525609016418457,
+     0.09766444563865662,
+     -0.30154067277908325,
+     -0.010346966795623302,
+     0.24706082046031952,
+     0.24935272336006165,
+     -0.20586226880550385,
+     0.154465451836586,
+     0.00792917050421238,
+     -0.062210094183683395,
+     0.10627003014087677,
+     0.20548291504383087
+    ]
+   },
+   "head.q.bias": {
+    "shape": [
+     4
+    ],
+    "values": [
+     0.2032472789287567,
+     -0.26997336745262146,
+     -0.3227098286151886,
+     -0.31264573335647583
+    ]
+   },
+   "head.k.weight": {
+    "shape": [
+     4,
+     8
+    ],
+    "values": [
+     -0.10464063286781311,
+     0.12300827354192734,
+     -0.021160414442420006,
+     0.3531073331832886,
+     0.2212885320186615,
+     -0.1695653200149536,
+     0.11309807002544403,
+     -0.18766537308692932,
+     0.1253720372915268,
+     -0.2577965557575226,
+     -0.10234523564577103,
+     0.017445171251893044,
+     -0.036964092403650284,
+     0.16377569735050201,
+     -0.197932168841362,
+     0.281949520111084,
+     0.2706220746040344,
+     0.10763613879680634,
+     -0.3246143162250519,
+     0.26397258043289185,
+     0.1476670503616333,
+     -0.236495241522789,
+     0.3278954327106476,
+     -0.2771778106689453,
+     0.13048693537712097,
+     0.008951864205300808,
+     0.17350155115127563,
+     -0.17208023369312286,
+     -0.19375942647457123,
+     -0.28610333800315857,
+     -0.07691879570484161,
+     0.03767359256744385
+    ]
+   },
+   "head.k.bias": {
+    "shape": [
+     4
+    ],
+    "values": [
+     0.04048963263630867,
+     -0.11129136383533478,
+     -0.2836799919605255,
+     -0.348058819770813
+    ]
+   }
+  },
+  "metadata": {
+   "args.base": "Qwen/Qwen3.5-0.8B-Base",
+   "args.n_per_source": 1000,
+   "args.epochs": 1,
+   "args.lr": 2e-05,
+   "args.head_lr": 0.0,
+   "args.lora": 16,
+   "args.holdout": "",
+   "args.train_sources": "",
+   "args.max_state": 7552,
+   "args.seed": 1,
+   "args.offset": -3,
+   "args.big_seed": 1099511627776,
+   "args.init_from": "jaredpalmer/kev-0.8b",
+   "suite_sha256": "a8f50e481b7d90b97da049e0ff6a01cee2f1ed204aed61a8265af0edbb5514d2",
+   "init_source.resolved": "/hub/models--jaredpalmer--kev-0.8b",
+   "init_source.adapter_tensors": 372,
+   "temperature_fit.n": 1264,
+   "temperature_fit.method": "min micro mean NLL over a 121-point log grid",
+   "temperature_fit.cross_validation.raw.n": 1264,
+   "temperature_fit.cross_validation.raw.ece": 0.10212917934363491,
+   "temperature_fit.cross_validation.ece_ci95.raw.0": 0.08454655575092548,
+   "temperature_fit.cross_validation.ece_ci95.raw.1": 0.12585968478253243,
+   "temperature_fit.cross_validation.ece_ci95.delta.0": -0.08723685319536686,
+   "temperature_fit.cross_validation.ece_ci95.delta.1": -0.04532170327333796,
+   "temperature_fit.cross_validation.separated": true,
+   "temperature_fit.cross_validation.temperatures.0": 2.406050072164233,
+   "temperature_fit.cross_validation.temperatures.1": 2.3510958125672174,
+   "temperature_fit.cross_validation.mixed.0": 1,
+   "temperature_fit.cross_validation.mixed.1": 2.5,
+   "temperature_fit.cross_validation.mixed.2": "x",
+   "temperature_fit.cross_validation.mixed.3": true,
+   "temperature_fit.cross_validation.mixed.4": null,
+   "temperature_fit.cross_validation.folds": 5,
+   "lora_placement": "full",
+   "base": "Qwen/Qwen3.5-0.8B-Base",
+   "base_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+   "lora": 16,
+   "head_dim": 4,
+   "option_isolation": false,
+   "special_embeddings": false,
+   "weights_dtype": "fp32",
+   "temperature": 2.3510958125672174,
+   "weights": "lora"
+  },
+  "lists": {
+   "temperature_fit.cross_validation.ece_ci95.raw": 2,
+   "temperature_fit.cross_validation.ece_ci95.delta": 2,
+   "temperature_fit.cross_validation.temperatures": 2,
+   "temperature_fit.cross_validation.mixed": 6,
+   "temperature_fit.cross_validation.mixed.5": 0,
+   "holdout": 0
+  }
+ },
+ "openjev": {
+  "tensors": {
+   "weight": {
+    "shape": [
+     1,
+     8
+    ],
+    "values": [
+     -0.08239345997571945,
+     0.20009051263332367,
+     0.12780116498470306,
+     -0.34211599826812744,
+     -0.08438953757286072,
+     0.21204964816570282,
+     0.09037742763757706,
+     0.1816122829914093
+    ]
+   },
+   "bias": {
+    "shape": [
+     1
+    ],
+    "values": [
+     0.03103714995086193
+    ]
+   }
+  },
+  "metadata": {},
+  "lists": {}
+ },
+ "openjev_cuda": {
+  "tensors": {
+   "weight": {
+    "shape": [
+     1,
+     8
+    ],
+    "values": [
+     -0.08239345997571945,
+     0.20009051263332367,
+     0.12780116498470306,
+     -0.34211599826812744,
+     -0.08438953757286072,
+     0.21204964816570282,
+     0.09037742763757706,
+     0.1816122829914093
+    ]
+   },
+   "bias": {
+    "shape": [
+     1
+    ],
+    "values": [
+     0.03103714995086193
+    ]
+   }
+  },
+  "metadata": {},
+  "lists": {}
+ }
+}

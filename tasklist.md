@@ -4528,10 +4528,18 @@ rather than acted on.
           PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
           weights move the probabilities far more than FP32 rounding.
   Stage 2 — Kev and Open-Jev:
-  - [ ] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
+  - [x] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
         torch.save dict (temperature, head_dim, base, base_revision, lora), keep
         nested-dict tensors under dotted names (`head.q.weight`), accept any storage
         location string. Unit test on a generated `head.pt`-shaped fixture.
+        Done: every non-tensor leaf (None/bool/int/float/str, list lengths) is
+        metadata named by its dotted path from the pickle root (list items by index,
+        `temperature_fit.cross_validation.temperatures.1`); `GetMetadata{Str,Int,
+        Float,Bool}(name, default)` return the default when absent and raise on a
+        kind mismatch. A depth cap (64) refuses self-containing containers.
+        Fixtures `tests/fixtures/torch_head/` by `tools/torch_head_fixture.py`
+        (Kev through kev's own `write_meta`; Open-Jev with 'cpu' and 'cuda:0'
+        locations). The real kev-0.8b and Open-Jev-2B `head.pt` files parse.
   - [ ] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
         lora_alpha, target_modules), map adapter keys onto base checkpoint keys, merge
         in FP32, and build through the normal importer (export the in-memory tensor

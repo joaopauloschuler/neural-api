@@ -27,6 +27,8 @@ unit neuraltorchbin;
 //     only as a dict's attribute dict (dropped), INST / OBJ / NEWOBJ not
 //     at all.
 // Nothing is ever executed; the unpickler only builds a passive object tree.
+// Non-tensor leaves (None/bool/int/float/str and list lengths) become
+// read-only metadata named by their dotted path from the pickle root.
 //
 // The reader subclasses TNNetSafeTensorsReader and populates the same
 // tensor table (same dtype strings, same flat row-major semantics), so the
@@ -65,6 +67,20 @@ const
 type
   ETorchBinError = class(Exception);
 
+  TTorchBinMetadataKind = (tmkNone, tmkBool, tmkInt, tmkFloat, tmkStr,
+    tmkList);
+  TTorchBinMetadataKindSet = set of TTorchBinMetadataKind;
+
+  // One non-tensor value of a torch.save dict. Name is the dotted path from
+  // the pickle root (list items are named by index: 'holdout.0').
+  TTorchBinMetadata = record
+    Name: string;
+    Kind: TTorchBinMetadataKind;
+    IntVal: Int64;    // tmkInt value; tmkBool 0/1; tmkList item count
+    FloatVal: double; // tmkFloat value
+    StrVal: string;   // tmkStr value
+  end;
+
   { TNNetTorchBinReader }
   // Opens a torch.save zip checkpoint, parses the central directory, runs
   // the restricted unpickler over <archive>/data.pkl and exposes every
@@ -84,6 +100,12 @@ type
     FZipLocalOfs: array of QWord; // local-header offset
     FArchivePrefix: string;       // "<archive>/" before data.pkl and data/
     FCurShard: integer;           // shard index currently being parsed
+    FMetadata: array of TTorchBinMetadata; // [0..FMetadataCount-1] in use
+    FMetadataCount: integer;
+    // FMetadata index of pName, raising when it holds a kind outside
+    // pKinds; -1 when absent.
+    function FindMetadataOfKind(const pName: string;
+      pKinds: TTorchBinMetadataKindSet): integer;
     // Current shard's file path - for error messages.
     function ShardPath: string;
     procedure ParseZipDirectory(Stream: TFileStream);
@@ -104,6 +126,18 @@ type
     procedure OpenFromBinIndex(const pIndexFileName: string);
   public
     constructor Create(const pFileName: string);
+    function MetadataCount: integer;
+    function MetadataAt(Idx: integer): TTorchBinMetadata;
+    // Index of the metadata named pName (a dotted path such as 'args.lr');
+    // -1 when absent.
+    function FindMetadata(const pName: string): integer;
+    function HasMetadata(const pName: string): boolean;
+    // Typed getters: pDefault when pName is absent; ETorchBinError when it
+    // holds another kind. Int also takes a bool, Float an int, Bool an int.
+    function GetMetadataStr(const pName, pDefault: string): string;
+    function GetMetadataInt(const pName: string; pDefault: Int64): Int64;
+    function GetMetadataFloat(const pName: string; pDefault: double): double;
+    function GetMetadataBool(const pName: string; pDefault: boolean): boolean;
   end;
 
 implementation
@@ -134,6 +168,14 @@ type
     Shape: array of Int64;
     Stride: array of Int64;
   end;
+
+const
+  // Bounds the recursive walks over the unpickled tree: the memo lets a
+  // hostile pickle build a container that contains itself.
+  MaxPickleNestingDepth = 64;
+  // Bounds the nodes RecordMetadata visits: memo-shared containers can make
+  // a small pickle expand exponentially when walked as a tree.
+  MaxPickleVisitCount = 1 shl 20;
 
 function DTypeOfStorageClass(const pClassName: string;
   out ByteSize: integer): string;
@@ -190,6 +232,91 @@ end;
 function TNNetTorchBinReader.ShardPath: string;
 begin
   Result := FShardNames[FCurShard];
+end;
+
+function TNNetTorchBinReader.MetadataCount: integer;
+begin
+  Result := FMetadataCount;
+end;
+
+function TNNetTorchBinReader.MetadataAt(Idx: integer): TTorchBinMetadata;
+begin
+  if (Idx < 0) or (Idx >= FMetadataCount) then
+    raise ETorchBinError.CreateFmt(
+      'torch.bin: metadata index %d out of range (0..%d): %s',
+      [Idx, FMetadataCount - 1, FFileName]);
+  Result := FMetadata[Idx];
+end;
+
+function TNNetTorchBinReader.FindMetadata(const pName: string): integer;
+var
+  MetadataIdx, MaxMetadataPos: integer;
+begin
+  MaxMetadataPos := FMetadataCount - 1;
+  for MetadataIdx := 0 to MaxMetadataPos do
+    if FMetadata[MetadataIdx].Name = pName then exit(MetadataIdx);
+  Result := -1;
+end;
+
+function TNNetTorchBinReader.HasMetadata(const pName: string): boolean;
+begin
+  Result := FindMetadata(pName) >= 0;
+end;
+
+function TNNetTorchBinReader.FindMetadataOfKind(const pName: string;
+  pKinds: TTorchBinMetadataKindSet): integer;
+const
+  KindNames: array[TTorchBinMetadataKind] of string =
+    ('None', 'bool', 'int', 'float', 'str', 'list');
+begin
+  Result := FindMetadata(pName);
+  if (Result >= 0) and not (FMetadata[Result].Kind in pKinds) then
+    raise ETorchBinError.CreateFmt(
+      'torch.bin: metadata "%s" is a %s, not the requested type: %s',
+      [pName, KindNames[FMetadata[Result].Kind], FFileName]);
+end;
+
+function TNNetTorchBinReader.GetMetadataStr(
+  const pName, pDefault: string): string;
+var
+  Idx: integer;
+begin
+  Idx := FindMetadataOfKind(pName, [tmkStr]);
+  if Idx < 0 then exit(pDefault);
+  Result := FMetadata[Idx].StrVal;
+end;
+
+function TNNetTorchBinReader.GetMetadataInt(const pName: string;
+  pDefault: Int64): Int64;
+var
+  Idx: integer;
+begin
+  Idx := FindMetadataOfKind(pName, [tmkInt, tmkBool]);
+  if Idx < 0 then exit(pDefault);
+  Result := FMetadata[Idx].IntVal;
+end;
+
+function TNNetTorchBinReader.GetMetadataFloat(const pName: string;
+  pDefault: double): double;
+var
+  Idx: integer;
+begin
+  Idx := FindMetadataOfKind(pName, [tmkFloat, tmkInt]);
+  if Idx < 0 then exit(pDefault);
+  if FMetadata[Idx].Kind = tmkInt then
+    Result := FMetadata[Idx].IntVal
+  else
+    Result := FMetadata[Idx].FloatVal;
+end;
+
+function TNNetTorchBinReader.GetMetadataBool(const pName: string;
+  pDefault: boolean): boolean;
+var
+  Idx: integer;
+begin
+  Idx := FindMetadataOfKind(pName, [tmkBool, tmkInt]);
+  if Idx < 0 then exit(pDefault);
+  Result := FMetadata[Idx].IntVal <> 0;
 end;
 
 function TNNetTorchBinReader.OpenBinShard(
@@ -566,6 +693,7 @@ var
   MemoHi, LongLenM1, NodeItemsHi, RootKeysHi, NodeShapeHi, OwnedMax: integer;
   PairCnt, KeyBase: integer;
   HasNested: boolean;
+  VisitCount: integer;  // nodes RecordMetadata has walked
 
   procedure Fail(const Msg: string);
   begin
@@ -694,12 +822,16 @@ var
   // levels with a dot exactly as torch's own state_dict names them. A
   // non-string key is copied verbatim so the materialization loop below
   // still rejects it loudly.
-  procedure FlattenInto(Src, Dst: TPickleNode; const Prefix: string);
+  procedure FlattenInto(Src, Dst: TPickleNode; const Prefix: string;
+    Depth: integer);
   var
     n, SrcKeysHi: integer;
     KeyNode: TPickleNode;
     FullName: string;
   begin
+    if Depth > MaxPickleNestingDepth then
+      Fail(Format('dicts nested deeper than %d levels (or a cyclic dict)',
+        [MaxPickleNestingDepth]));
     SrcKeysHi := High(Src.Keys);
     for n := 0 to SrcKeysHi do
     begin
@@ -710,13 +842,85 @@ var
       end;
       FullName := Prefix + Src.Keys[n].StrVal;
       if Src.Vals[n].Kind = pkDict then
-        FlattenInto(Src.Vals[n], Dst, FullName + '.')
+        FlattenInto(Src.Vals[n], Dst, FullName + '.', Depth + 1)
       else
       begin
         KeyNode := NewNode(pkStr);
         KeyNode.StrVal := FullName;
         DictSetItem(Dst, KeyNode, Src.Vals[n]);
       end;
+    end;
+  end;
+
+  function AddMetadata(const pName: string;
+    pKind: TTorchBinMetadataKind): integer;
+  begin
+    Result := FMetadataCount;
+    if Result = Length(FMetadata) then
+      SetLength(FMetadata, 2 * Result + 16);
+    Inc(FMetadataCount);
+    FMetadata[Result].Name := pName;
+    FMetadata[Result].Kind := pKind;
+    FMetadata[Result].IntVal := 0;
+    FMetadata[Result].FloatVal := 0;
+    FMetadata[Result].StrVal := '';
+  end;
+
+  // Records every non-tensor leaf under pNode as FMetadata, named by its
+  // dotted path. Tensors, globals and persistent ids are not metadata.
+  procedure RecordMetadata(pNode: TPickleNode; const pName: string;
+    Depth: integer);
+  var
+    n, MaxItemPos, MetadataIdx: integer;
+    Prefix: string;
+  begin
+    if Depth > MaxPickleNestingDepth then
+      Fail(Format('values nested deeper than %d levels (or a cyclic ' +
+        'container)', [MaxPickleNestingDepth]));
+    Inc(VisitCount);
+    if VisitCount > MaxPickleVisitCount then
+      Fail(Format('more than %d values when walked as a tree (shared ' +
+        'containers expand exponentially?)', [MaxPickleVisitCount]));
+    case pNode.Kind of
+      pkDict:
+        begin
+          if pName = '' then Prefix := '' else Prefix := pName + '.';
+          MaxItemPos := High(pNode.Keys);
+          for n := 0 to MaxItemPos do
+            if pNode.Keys[n].Kind = pkStr then
+              RecordMetadata(pNode.Vals[n], Prefix + pNode.Keys[n].StrVal,
+                Depth + 1);
+        end;
+      pkList, pkTuple:
+        begin
+          MetadataIdx := AddMetadata(pName, tmkList);
+          FMetadata[MetadataIdx].IntVal := Length(pNode.Items);
+          MaxItemPos := High(pNode.Items);
+          for n := 0 to MaxItemPos do
+            RecordMetadata(pNode.Items[n], pName + '.' + IntToStr(n),
+              Depth + 1);
+        end;
+      pkNone: AddMetadata(pName, tmkNone);
+      // AddMetadata regrows FMetadata, so its index is taken before the
+      // element is addressed.
+      pkBool, pkInt:
+        begin
+          if pNode.Kind = pkBool then
+            MetadataIdx := AddMetadata(pName, tmkBool)
+          else
+            MetadataIdx := AddMetadata(pName, tmkInt);
+          FMetadata[MetadataIdx].IntVal := pNode.IntVal;
+        end;
+      pkFloat:
+        begin
+          MetadataIdx := AddMetadata(pName, tmkFloat);
+          FMetadata[MetadataIdx].FloatVal := pNode.FloatVal;
+        end;
+      pkStr:
+        begin
+          MetadataIdx := AddMetadata(pName, tmkStr);
+          FMetadata[MetadataIdx].StrVal := pNode.StrVal;
+        end;
     end;
   end;
 
@@ -1042,6 +1246,8 @@ begin
       raise ETorchBinError.CreateFmt(
         'torch.bin: the pickled object is neither a dict/state_dict nor a ' +
         'tensor: %s', [ShardPath]);
+    VisitCount := 0;
+    RecordMetadata(Root, '', 0);
 
     // ---- unwrap a nested checkpoint dict --------------------------------
     // Many checkpoints (e.g. Real-ESRGAN .pth) wrap the actual state_dict in
@@ -1085,7 +1291,7 @@ begin
     if HasNested then
     begin
       Node := NewNode(pkDict);
-      FlattenInto(Root, Node, '');
+      FlattenInto(Root, Node, '', 0);
       Root := Node;
     end;
 
@@ -1098,12 +1304,12 @@ begin
     RootKeysHi := High(Root.Keys);
     for i := 0 to RootKeysHi do
     begin
+      ValNode := Root.Vals[i];
+      if ValNode.Kind <> pkTensor then continue; // RecordMetadata kept it
       if (Root.Keys[i].Kind <> pkStr) then
         raise ETorchBinError.CreateFmt(
           'torch.bin: state_dict key %d is not a string: %s',
           [i, ShardPath]);
-      ValNode := Root.Vals[i];
-      if ValNode.Kind <> pkTensor then continue; // tolerate metadata values
       Node := ValNode;
       if FindTensor(Root.Keys[i].StrVal) >= 0 then
         raise ETorchBinError.CreateFmt(

@@ -43,6 +43,9 @@ type
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
+    // Checks tests/fixtures/torch_head/<pFixtureName>/head.pt against that
+    // entry of torch_head/expected.json: every tensor and metadata leaf.
+    procedure CheckTorchHeadFixture(const pFixtureName: string);
     // The hexgrad/Kokoro-82M snapshot folder (NEURAL_KOKORO82M_DIR, else the
     // HF cache); '' when it has no voices/af_heart.pt.
     function KokoroRealSnapshotDir(): string;
@@ -386,6 +389,9 @@ type
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
+    procedure TestTorchBinKevHeadMetadata;
+    procedure TestTorchBinOpenJevHeadAnyLocation;
+    procedure TestTorchBinHeadRejectsHostileMetadata;
     procedure TestGPT2LogitParityFromTorchBin;
     procedure TestShardedTorchBinMatchesSingleFile;
     procedure TestShardedTorchBinIndexErrors;
@@ -4008,6 +4014,210 @@ begin
     Failed);
   AssertTrue('the error must name the refused symbol, got: ' + Msg,
     Pos('posix system', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.CheckTorchHeadFixture(
+  const pFixtureName: string);
+var
+  RefJson: TStringList;
+  RefRoot, ExpectedValue: TJSONData;
+  Expected, Tensors, Metadata, Lists, TensorObj: TJSONObject;
+  ShapeArr, ValuesArr: TJSONArray;
+  Reader: TNNetTorchBinReader;
+  Vol: TNNetVolume;
+  Entry: TTorchBinMetadata;
+  EntryName, FixtureDir: string;
+  TensorCnt, DimCnt, ElemCnt, MetadataCnt, MetadataIdx: integer;
+begin
+  FixtureDir := 'torch_head' + DirectorySeparator;
+  RefJson := TStringList.Create;
+  Vol := TNNetVolume.Create;
+  RefRoot := nil;
+  Reader := nil;
+  try
+    RefJson.LoadFromFile(FixturePath(FixtureDir + 'expected.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Expected := TJSONObject(RefRoot).Objects[pFixtureName];
+    Tensors := Expected.Objects['tensors'];
+    Metadata := Expected.Objects['metadata'];
+    Lists := Expected.Objects['lists'];
+    Reader := TNNetTorchBinReader.Create(FixturePath(FixtureDir +
+      pFixtureName + DirectorySeparator + 'head.pt'));
+    AssertEquals(pFixtureName + ' tensor count', Tensors.Count, Reader.Count);
+    for TensorCnt := 0 to Tensors.Count - 1 do
+    begin
+      EntryName := Tensors.Names[TensorCnt];
+      TensorObj := TJSONObject(Tensors.Items[TensorCnt]);
+      AssertTrue(pFixtureName + ' has tensor ' + EntryName,
+        Reader.HasTensor(EntryName));
+      AssertEquals('dtype of ' + EntryName, 'F32', Reader.GetDType(EntryName));
+      ShapeArr := TensorObj.Arrays['shape'];
+      AssertEquals('dim count of ' + EntryName, ShapeArr.Count,
+        Reader.DimCount(EntryName));
+      for DimCnt := 0 to ShapeArr.Count - 1 do
+        AssertEquals('dim ' + IntToStr(DimCnt) + ' of ' + EntryName,
+          ShapeArr.Integers[DimCnt], Reader.DimSize(EntryName, DimCnt));
+      Reader.LoadTensorFlat(EntryName, Vol);
+      ValuesArr := TensorObj.Arrays['values'];
+      AssertEquals('element count of ' + EntryName, ValuesArr.Count,
+        Vol.Size);
+      // expected.json holds the fp32 values widened to float64, so the
+      // narrowed reference must match bit for bit.
+      for ElemCnt := 0 to ValuesArr.Count - 1 do
+        AssertTrue(EntryName + '[' + IntToStr(ElemCnt) + ']',
+          Single(ValuesArr.Floats[ElemCnt]) = Vol.FData[ElemCnt]);
+    end;
+    AssertEquals(pFixtureName + ' metadata count',
+      Metadata.Count + Lists.Count, Reader.MetadataCount);
+    for MetadataCnt := 0 to Metadata.Count - 1 do
+    begin
+      EntryName := Metadata.Names[MetadataCnt];
+      ExpectedValue := Metadata.Items[MetadataCnt];
+      MetadataIdx := Reader.FindMetadata(EntryName);
+      AssertTrue(pFixtureName + ' has metadata ' + EntryName,
+        MetadataIdx >= 0);
+      Entry := Reader.MetadataAt(MetadataIdx);
+      case ExpectedValue.JSONType of
+        jtNull:
+          AssertTrue(EntryName + ' is None', Entry.Kind = tmkNone);
+        jtBoolean:
+          begin
+            AssertTrue(EntryName + ' is a bool', Entry.Kind = tmkBool);
+            AssertEquals(EntryName, ExpectedValue.AsBoolean,
+              Reader.GetMetadataBool(EntryName, not ExpectedValue.AsBoolean));
+          end;
+        jtString:
+          begin
+            AssertTrue(EntryName + ' is a str', Entry.Kind = tmkStr);
+            AssertEquals(EntryName, ExpectedValue.AsString,
+              Reader.GetMetadataStr(EntryName, '<absent>'));
+          end;
+        jtNumber:
+          if ExpectedValue is TJSONFloatNumber then
+          begin
+            AssertTrue(EntryName + ' is a float', Entry.Kind = tmkFloat);
+            AssertEquals(EntryName, ExpectedValue.AsFloat,
+              Reader.GetMetadataFloat(EntryName, -1), 1e-15);
+          end
+          else
+          begin
+            AssertTrue(EntryName + ' is an int', Entry.Kind = tmkInt);
+            AssertEquals(EntryName, ExpectedValue.AsInt64,
+              Reader.GetMetadataInt(EntryName, -1));
+          end;
+      else
+        Fail('unexpected JSON type for ' + EntryName);
+      end;
+    end;
+    for MetadataCnt := 0 to Lists.Count - 1 do
+    begin
+      EntryName := Lists.Names[MetadataCnt];
+      MetadataIdx := Reader.FindMetadata(EntryName);
+      AssertTrue(pFixtureName + ' has list ' + EntryName, MetadataIdx >= 0);
+      Entry := Reader.MetadataAt(MetadataIdx);
+      AssertTrue(EntryName + ' is a list', Entry.Kind = tmkList);
+      AssertEquals(EntryName + ' length', Lists.Items[MetadataCnt].AsInt64,
+        Entry.IntVal);
+    end;
+  finally
+    Reader.Free;
+    RefRoot.Free;
+    Vol.Free;
+    RefJson.Free;
+  end;
+end;
+
+// A Kev head.pt (tools/torch_head_fixture.py writes it through kev's own
+// write_meta): the pointer head tensors under "head." and the Meta fields
+// plus nested training metadata through the typed getters.
+procedure TTestNeuralPretrained.TestTorchBinKevHeadMetadata;
+var
+  Reader: TNNetTorchBinReader;
+  Failed: boolean;
+begin
+  CheckTorchHeadFixture('kev');
+  Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+    DirectorySeparator + 'kev' + DirectorySeparator + 'head.pt'));
+  try
+    AssertEquals('temperature', 2.3510958125672174,
+      Reader.GetMetadataFloat('temperature', 1.0), 1e-15);
+    AssertEquals('head_dim', 4, Reader.GetMetadataInt('head_dim', 256));
+    AssertEquals('lora', 16, Reader.GetMetadataInt('lora', 0));
+    AssertEquals('lora as float', 16.0, Reader.GetMetadataFloat('lora', 0),
+      0);
+    AssertEquals('base', 'Qwen/Qwen3.5-0.8B-Base',
+      Reader.GetMetadataStr('base', ''));
+    AssertEquals('weights', 'lora', Reader.GetMetadataStr('weights', ''));
+    AssertFalse('option_isolation',
+      Reader.GetMetadataBool('option_isolation', true));
+    AssertEquals('64-bit int', Int64(1) shl 40,
+      Reader.GetMetadataInt('args.big_seed', 0));
+    AssertEquals('negative int', -3, Reader.GetMetadataInt('args.offset', 0));
+    AssertEquals('absent key gives the default', 'dflt',
+      Reader.GetMetadataStr('no.such.key', 'dflt'));
+    AssertFalse('the BUILD-set _metadata is not exposed',
+      Reader.HasMetadata('head._metadata'));
+    Failed := false;
+    try
+      Reader.GetMetadataInt('base', 0);
+    except
+      on E: ETorchBinError do Failed := true;
+    end;
+    AssertTrue('a str read as an int must raise ETorchBinError', Failed);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Open-Jev's head.pt is a bare Linear(d, 1) state_dict; the released files
+// record storage location 'cuda:0', which the reader must accept unread.
+procedure TTestNeuralPretrained.TestTorchBinOpenJevHeadAnyLocation;
+var
+  Reader: TNNetTorchBinReader;
+begin
+  CheckTorchHeadFixture('openjev');
+  CheckTorchHeadFixture('openjev_cuda');
+  Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+    DirectorySeparator + 'openjev_cuda' + DirectorySeparator + 'head.pt'));
+  try
+    AssertEquals('no metadata', 0, Reader.MetadataCount);
+    AssertEquals('absent temperature gives the default', 1.5,
+      Reader.GetMetadataFloat('temperature', 1.5), 0);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Kev-shaped files whose metadata holds a non-whitelisted GLOBAL (os.system),
+// a list that contains itself or memo-shared lists must raise ETorchBinError.
+procedure TTestNeuralPretrained.TestTorchBinHeadRejectsHostileMetadata;
+
+  function OpenErrorMessage(const pFixtureName: string): string;
+  var
+    Reader: TNNetTorchBinReader;
+  begin
+    Result := '';
+    try
+      Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+        DirectorySeparator + pFixtureName + DirectorySeparator + 'head.pt'));
+      Reader.Free;
+    except
+      on E: ETorchBinError do Result := E.Message;
+    end;
+  end;
+
+var
+  Msg: string;
+begin
+  Msg := OpenErrorMessage('evil_meta');
+  AssertTrue('a metadata GLOBAL "posix system" must be refused, got: ' + Msg,
+    Pos('posix system', Msg) > 0);
+  Msg := OpenErrorMessage('cyclic');
+  AssertTrue('a self-containing list must raise, got: ' + Msg,
+    Pos('nested deeper', Msg) > 0);
+  Msg := OpenErrorMessage('shared_bomb');
+  AssertTrue('exponentially shared lists must raise, got: ' + Msg,
+    Pos('walked as a tree', Msg) > 0);
 end;
 
 // End-to-end through the importer: tiny_gpt2.bin is the existing
