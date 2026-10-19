@@ -7,7 +7,7 @@ the neural-api units, to show that any HTTP client can call the endpoint.
 
   DecisionClient                                  the built-in demo request
   DecisionClient --request decision_examples/ticket_routing.json
-  DecisionClient --server http://127.0.0.1:8094 --retries 30 --raw
+  DecisionClient --server http://127.0.0.1:5000 --retries 30 --raw
 
 Without --request the client sends a built-in support-ticket request (an
 object state, a choice, a score and a noul question) with no "model"
@@ -551,6 +551,38 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// The decision_examples folder: under the current directory (the
+// examples/ChatTerminal folder) or found from the binary in bin/<cpu-os>/bin.
+function DecisionExamplesDir(): string;
+begin
+  Result := 'decision_examples' + DirectorySeparator;
+  if not DirectoryExists(Result) then
+    Result := ExpandFileName(ExtractFilePath(ParamStr(0)) +
+      '../../../examples/ChatTerminal/decision_examples') + DirectorySeparator;
+end;
+
+// The request in a decision_examples file as a JSON object, or nil when the
+// file is missing, is not a JSON object or is refused by PrepareRequestBody.
+function LoadExampleRequest(const FileName: string): TJSONObject;
+var
+  RequestLines: TStringList;
+  Body, ErrorMsg: string;
+  Root: TJSONData;
+begin
+  Result := nil;
+  if not FileExists(DecisionExamplesDir() + FileName) then Exit;
+  RequestLines := TStringList.Create;
+  try
+    RequestLines.LoadFromFile(DecisionExamplesDir() + FileName);
+    if not PrepareRequestBody(RequestLines.Text, '', Body, ErrorMsg) then Exit;
+  finally
+    RequestLines.Free;
+  end;
+  Root := ParseJSONOrNil(Body);
+  if Root is TJSONObject then Result := TJSONObject(Root)
+  else Root.Free;
+end;
+
 // --selftest: offline checks (no server needed).
 // ---------------------------------------------------------------------------
 procedure SelfTest();
@@ -576,7 +608,7 @@ var
   Failures: integer;
   Lines, Args: TStringList;
   Root: TJSONData;
-  Request, Questions: TJSONObject;
+  Request, Questions, UrgentRequest, CalmRequest: TJSONObject;
   Body, ErrorMsg: string;
   ExitStatus: integer;
   Opt: TClientOptions;
@@ -655,6 +687,31 @@ begin
     Check(not PrepareRequestBody('[1,2]', '', Body, ErrorMsg) and
       not PrepareRequestBody('{not json', '', Body, ErrorMsg),
       'a request file that is not a JSON object is refused');
+
+    UrgentRequest := LoadExampleRequest('urgent_ticket.json');
+    CalmRequest := LoadExampleRequest('calm_ticket.json');
+    try
+      Check((UrgentRequest <> nil) and (CalmRequest <> nil),
+        'urgent_ticket.json and calm_ticket.json load as request objects');
+      if (UrgentRequest <> nil) and (CalmRequest <> nil) then
+      begin
+        Check((UrgentRequest.Find('model') = nil) and (CalmRequest.Find('model') = nil) and
+          (UrgentRequest.Find('state') is TJSONString) and
+          (CalmRequest.Find('state') is TJSONString) and
+          (UrgentRequest.Get('state', '') <> CalmRequest.Get('state', '')),
+          'the two ticket files name no model and each has its own string state');
+        Check((UrgentRequest.FindPath('questions.urgent.type') <> nil) and
+          (UrgentRequest.FindPath('questions.urgent.type').AsString = 'noul') and
+          (UrgentRequest.FindPath('questions.urgent.criteria.true') <> nil) and
+          (UrgentRequest.FindPath('questions.urgent.criteria.false') <> nil) and
+          (CalmRequest.Find('questions') <> nil) and
+          (UrgentRequest.Find('questions').AsJSON = CalmRequest.Find('questions').AsJSON),
+          'the two ticket files ask the same noul question "urgent"');
+      end;
+    finally
+      UrgentRequest.Free;
+      CalmRequest.Free;
+    end;
 
     Check((SystemOneURL('http://127.0.0.1:8080') = 'http://127.0.0.1:8080/v1/systemone') and
       (SystemOneURL('http://h:1/') = 'http://h:1/v1/systemone') and
@@ -806,7 +863,8 @@ begin
   begin
     WriteLn('Error: cannot reach ', URL, ': ', ErrorMsg);
     WriteLn('Start ChatServer first (it answers once the model has loaded), e.g.');
-    WriteLn('  ChatServer /path/to/model --port 8080');
+    WriteLn('  ChatServer /path/to/model --port 5000');
+    WriteLn('  DecisionClient --server http://127.0.0.1:5000');
     WriteLn('or wait for a loading server with --retries N.');
     Halt(ceExitUnreachable);
   end;

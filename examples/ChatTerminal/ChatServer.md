@@ -17,19 +17,23 @@ one-shot `-p` — plus the server flags below:
 | `--decision-adapter DIR` | answer `POST /v1/systemone` with the Kev or Open-Jev checkpoint in `DIR` instead of AnyJev L0; the server becomes decision-only and loads the model without its LM head (see *Trained decision checkpoints*; for Kev full weights `DIR` is the model directory too). Refused together with the three AnyJev flags above | none (AnyJev L0) |
 | `--decision-temperature T` | with `--decision-adapter`: replace the checkpoint's calibration temperature (`1` = raw head scores; Kev's `KEV_TEMPERATURE`) | the checkpoint's |
 
+The examples on this page pass `--port 5000` to ChatServer and
+`--server http://127.0.0.1:5000` to `DecisionClient`, because Google Colab
+does not allow port 8080. Both programs still default to port 8080.
+
 ```
 lazbuild neural-api/examples/ChatTerminal/ChatServer.lpi
 ```
 
 ```
-$ ChatServer /path/to/model --temperature 0.7 --top-p 0.9 --port 8080
+$ ChatServer /path/to/model --temperature 0.7 --top-p 0.9 --port 5000
 ...
-Serving model on http://127.0.0.1:8080/v1 (SSE streaming with "stream":true; Ctrl+C stops)
+Serving model on http://127.0.0.1:5000/v1 (SSE streaming with "stream":true; Ctrl+C stops)
 
-$ curl http://127.0.0.1:8080/v1/chat/completions \
+$ curl http://127.0.0.1:5000/v1/chat/completions \
     -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64}'
 
-$ curl -N http://127.0.0.1:8080/v1/chat/completions \
+$ curl -N http://127.0.0.1:5000/v1/chat/completions \
     -d '{"messages":[{"role":"user","content":"Hi!"}],"stream":true}'
 data: {"id":"chatcmpl-1","object":"chat.completion.chunk", ... "delta":{"role":"assistant","content":""} ...}
 data: {"id":"chatcmpl-1","object":"chat.completion.chunk", ... "delta":{"content":"Hello"} ...}
@@ -85,7 +89,7 @@ adapter directory's name under `--decision-adapter`). `state`,
 or an array.
 
 ```
-$ curl http://127.0.0.1:8080/v1/systemone -d '{
+$ curl http://127.0.0.1:5000/v1/systemone -d '{
     "state": {"ticket": "My card was declined twice and the app froze."},
     "questions": {
       "team":    {"type": "choice", "instructions": "Which team should take this ticket?",
@@ -147,8 +151,8 @@ any chat checkpoint ChatServer loads works):
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
 lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
 lazbuild -B neural-api/examples/ChatTerminal/DecisionClient.lpi
-neural-api/bin/x86_64-linux/bin/ChatServer q25/ --ctx 4096 --port 8080 &
-neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
+neural-api/bin/x86_64-linux/bin/ChatServer q25/ --ctx 4096 --port 5000 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --retries 60
 kill %1
 ```
 
@@ -223,8 +227,8 @@ Kev-0.8B (base `Qwen/Qwen3.5-0.8B-Base` at the revision `head.pt` records):
 git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
 git -C q08b checkout dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
 git clone https://huggingface.co/jaredpalmer/kev-0.8b
-neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --ctx 4096 --port 8080 &
-neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
+neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --ctx 4096 --port 5000 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --retries 60
 kill %1
 ```
 
@@ -234,8 +238,8 @@ Open-Jev-2B (base `Qwen/Qwen3.5-2B` at the revision `model.json` records):
 git clone https://huggingface.co/Qwen/Qwen3.5-2B q2b
 git -C q2b checkout 15852e8c16360a2fea060d615a32b45270f8a8fc
 git clone https://huggingface.co/ZefanCai/Open-Jev-2B
-neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --ctx 4096 --port 8080 &
-neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 60
+neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --ctx 4096 --port 5000 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --retries 60
 kill %1
 ```
 
@@ -245,8 +249,8 @@ a GPU that cannot hold the int8 weights, add `--int4`.
 
 ```
 git clone https://huggingface.co/jaredpalmer/kev-27b
-neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 8080 &
-neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:8080 --retries 120
+neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 5000 &
+neural-api/bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --retries 120
 kill %1
 ```
 
@@ -262,11 +266,11 @@ cloned above):
 
 ```
 # AnyJev L0 on a plain chat model
-neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 5000 &
 # Kev (LoRA adapter on its base)
-neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 5000 &
 # Open-Jev (LoRA adapter on its base)
-neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
+neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 5000 &
 ```
 
 `DecisionClient` (`DecisionClient.lpr` in this folder) sends one request and
@@ -278,17 +282,18 @@ about a second and shows that any HTTP client can call the endpoint. Without
 `--request` it sends a built-in support-ticket request with no `model`
 field (an object state; a choice of team with one `null` description, a
 3-level frustration score and an urgent yes/no question). The folder
-`decision_examples/` holds three request files: ticket routing, review
-sentiment and a nested-object state.
+`decision_examples/` holds five request files: ticket routing, review
+sentiment, a nested-object state, and the urgent and calm tickets of the
+sanity check below.
 
 ```
 lazbuild -B neural-api/examples/ChatTerminal/DecisionClient.lpi
 cd neural-api/examples/ChatTerminal
-../../bin/x86_64-linux/bin/DecisionClient --retries 300
-../../bin/x86_64-linux/bin/DecisionClient --request decision_examples/ticket_routing.json
-../../bin/x86_64-linux/bin/DecisionClient --request decision_examples/review_sentiment.json --raw
-curl -s -d @decision_examples/ticket_routing.json http://127.0.0.1:8080/v1/systemone
-curl -s -d @decision_examples/nested_state.json http://127.0.0.1:8080/v1/systemone
+../../bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --retries 300
+../../bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --request decision_examples/ticket_routing.json
+../../bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --request decision_examples/review_sentiment.json --raw
+curl -s -d @decision_examples/ticket_routing.json http://127.0.0.1:5000/v1/systemone
+curl -s -d @decision_examples/nested_state.json http://127.0.0.1:5000/v1/systemone
 ```
 
 ```
@@ -333,12 +338,40 @@ header and listens on `127.0.0.1` unless `--host` says otherwise.
 TypeSafe's Python SDK (`typesafe-sdk` 0.7.5, checked by reading its source,
 not run against this server) takes the server root through its `base_url`
 constructor argument or the `TYPESAFE_BASE_URL` environment variable
-(`http://127.0.0.1:8080`, without `/v1`) and sends its default model
+(`http://127.0.0.1:5000`, without `/v1`) and sends its default model
 `jev-latest`, which this server ignores; it refuses to start without an API
 key (`api_key` or `TYPESAFE_API_KEY`; any value works, since this server
 ignores it), and it zstd-compresses request bodies of 1024 bytes or more
 when zstd is installed, which this server does not decode, so set its
 `compression` argument to false.
+
+#### Sanity check: does the model read the state?
+
+Send the two ticket files to a running server:
+
+```
+cd neural-api/examples/ChatTerminal
+../../bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --request decision_examples/urgent_ticket.json
+../../bin/x86_64-linux/bin/DecisionClient --server http://127.0.0.1:5000 --request decision_examples/calm_ticket.json
+```
+
+`urgent_ticket.json` and `calm_ticket.json` ask the same `noul` question
+(`urgent`) with the same criteria and differ only in the `state`: a checkout
+outage that loses money every minute, and a no-rush question about an avatar
+picture. So any difference between the two answers comes from the model
+reading the `state`.
+
+**Expected result.** For `urgent_ticket.json`, `P(true)` is clearly high
+(roughly above 0.7). For `calm_ticket.json`, `P(true)` is clearly low.
+
+**Failure.** Both answers low, both high, or the two reversed means that the
+scorer or the server's configuration is wrong. First start ChatServer again
+without `--int4`: the int4 path is the least-tested one.
+
+This is the check behind Open-Jev-2B's supported status (see *Status* under
+*Trained decision checkpoints*); its numbers were not recorded. The check
+means nothing on the pico test fixtures (`tests/fixtures/...`): their weights
+are random.
 
 ## Concurrency and cache reuse
 
@@ -376,8 +409,8 @@ A server for a few alternating clients (4 conversation slots by default),
 and the same server without slots:
 
 ```
-$ ChatServer /path/to/model --gpu --stats --port 8080
-$ ChatServer /path/to/model --gpu --stats --port 8080 --kv-slots 0
+$ ChatServer /path/to/model --gpu --stats --port 5000
+$ ChatServer /path/to/model --gpu --stats --port 5000 --kv-slots 0
 ```
 
 `--stats` prints, per request, where the prompt resumed from (`live cache`,
@@ -394,5 +427,6 @@ the launch defaults, `max_completion_tokens` over `max_tokens`, the ignored
 detection on placeholder files, and the `/v1/systemone` status codes on a
 fixed test scorer, including the decision-only 501s) without needing any
 model files. `DecisionClient --selftest` checks the client offline: the
-built-in request, the request-file handling, and the printing and exit
+built-in request, the request-file handling, the two ticket files of the
+sanity check (both load, name no model and ask the same question), and the printing and exit
 status of canned 200, 422 and 501 replies.

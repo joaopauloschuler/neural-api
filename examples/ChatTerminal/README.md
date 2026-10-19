@@ -21,8 +21,10 @@ for both). ChatTerminal adds `-p`; ChatServer adds `--host`, `--port` and the
 Each program's page documents only what is specific to it.
 
 `DecisionClient` (FCL only, no neural-api units) calls ChatServer's
-`/v1/systemone` from the command line, and `decision_examples/` holds three
+`/v1/systemone` from the command line, and `decision_examples/` holds five
 request files for it (see *Calling it* in [ChatServer.md](ChatServer.md)).
+To check that a decision model reads the state, send the urgent and the calm
+ticket (see *Sanity check: does the model read the state?* in [ChatServer.md](ChatServer.md)).
 
 Both programs drive the generic model importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`). It supports: qwen2, qwen2.5, qwen3,
@@ -44,7 +46,7 @@ lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
 lazbuild neural-api/examples/ChatTerminal/ChatServer.lpi
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
-neural-api/bin/x86_64-linux/bin/ChatServer q2/ --gpu --port 8080
+neural-api/bin/x86_64-linux/bin/ChatServer q2/ --gpu --port 5000
 ```
 
 ### Tested models
