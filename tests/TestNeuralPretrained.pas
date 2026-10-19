@@ -201,6 +201,10 @@ type
       const ExtraArgs: array of string);
     // Thinking A1, A1 regenerated, B, then A2 with --kv-slots 1.
     procedure RunChatKVSlotRegenerate(const Stem: string);
+    // Decision branches B1, B2, B1 after one prefix (and after none) against a
+    // width-1 forward of prefix + branch; then chat replies against a fresh engine.
+    procedure RunChatDecisionBranchParity(const Stem: string;
+      const ExtraArgs: array of string);
     // A growing conversation never saves a slot; three conversations in two
     // slots evict by the single rule.
     procedure RunChatKVSlotGrowingAndEviction(const Stem: string);
@@ -519,6 +523,9 @@ type
     procedure TestChatKVSlotSwitch;
     procedure TestChatKVSlotSwitchPrefillWindow;
     procedure TestChatKVSlotSwitchOpenCL;
+    procedure TestChatDecisionBranchParity;
+    procedure TestChatDecisionBranchPrefillWindow;
+    procedure TestChatDecisionBranchOpenCL;
     procedure TestChatKVSlotRegenerateKeepsPoints;
     procedure TestChatKVSlotSystemPointNoOverwrite;
     procedure TestChatKVSlotSingleSlot;
@@ -13312,6 +13319,264 @@ begin
   end;
   RunChatKVSlotSwitch('qwen3_5', ['--prefill-window', '4',
     '--prefill-tail-window', '2', '--int8', '--kv-int8', '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// Decision scoring: prefix P (5 ids), then branches B1 (7 ids), B2 (3 ids)
+// and B1 again. Each branch's last-id logits and its hidden states at the
+// requested positions must equal a width-1 forward of P + branch from an
+// empty session on a reference engine; B1 again must equal B1 bit for bit.
+// The same with an empty prefix. CachedTokens must list the session, so a
+// chat reply afterwards equals a fresh engine's, a chat prompt that keeps P
+// leaves the prefix scoreable, and one that drops it makes scoring raise.
+// Tolerance: 0 when every id is fed one at a time (the same arithmetic as the
+// reference); 1e-5 with the prefill windows (another summation order), 1e-2
+// under OpenCL (the kernels sum in another order). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatDecisionBranchParity(
+  const Stem: string; const ExtraArgs: array of string);
+const
+  Ctx = 16;
+  Vocab = 12;
+  PrefixLen = 5;
+  Branch1Len = 7;
+  Branch2Len = 3;
+var
+  Dir, Tag: string;
+  Engine, Ref, Fresh: TChatEngine;
+  Prefix, Branch1, Branch2, Positions1, Positions2, EmptyIds: TNeuralIntegerArray;
+  ChatPrompt, OtherPrompt, Expected: TNeuralIntegerArray;
+  Logits, Hidden, Logits1, Hidden1: TNNetVolume;
+  RefLogits, RefHidden, StepIn: TNNetVolume;
+  Tolerance: TNeuralFloat;
+  Windowed, OnOpenCL, Raised: boolean;
+  ArgPos: integer;
+  EngineTurn, FreshTurn: TChatTurnRecord;
+
+  function MakeIds(Len, Mul, Add: integer): TNeuralIntegerArray;
+  var
+    Pos: integer;
+  begin
+    SetLength(Result, Len);
+    for Pos := 0 to Len - 1 do Result[Pos] := (Mul * Pos + Add) mod Vocab;
+  end;
+
+  function Concat(const A, B: TNeuralIntegerArray): TNeuralIntegerArray;
+  begin
+    SetLength(Result, Length(A) + Length(B));
+    if Length(A) > 0 then Move(A[0], Result[0], Length(A) * SizeOf(integer));
+    if Length(B) > 0 then
+      Move(B[0], Result[Length(A)], Length(B) * SizeOf(integer));
+  end;
+
+  // Ref's session fed Ids one at a time from empty: the last logits row and
+  // the hidden state at Base + Positions[k].
+  procedure ReferenceForward(const Ids, Positions: TNeuralIntegerArray;
+    Base: integer);
+  var
+    Pos, RequestPos, Depth: integer;
+  begin
+    Depth := Ref.Session.HiddenState().Depth;
+    RefHidden.ReSize(Length(Positions), 1, Depth);
+    Ref.Session.Reset();
+    for Pos := 0 to High(Ids) do
+    begin
+      StepIn.FData[0] := Ids[Pos];
+      Ref.Session.StepForward(StepIn, Pos);
+      for RequestPos := 0 to High(Positions) do
+        if Base + Positions[RequestPos] = Pos then
+          Move(Ref.Session.HiddenState().FData[0],
+            RefHidden.FData[RequestPos * Depth], Depth * SizeOf(TNeuralFloat));
+    end;
+    RefLogits.Copy(Ref.Session.Output());
+  end;
+
+  procedure AssertBranch(const What: string; const Branch,
+    Positions: TNeuralIntegerArray; const PrefixIds: TNeuralIntegerArray);
+  begin
+    Engine.ScoreDecisionBranch(Branch, Positions, Logits, Hidden);
+    ReferenceForward(Concat(PrefixIds, Branch), Positions, Length(PrefixIds));
+    AssertTrue(Tag + What + ': logits within tolerance',
+      MaxAbsRowDiffFrom(RefLogits, Logits, 0) <= Tolerance);
+    AssertEquals(Tag + What + ': hidden rows', Length(Positions), Hidden.SizeX);
+    AssertTrue(Tag + What + ': hidden states within tolerance',
+      MaxAbsRowDiffFrom(RefHidden, Hidden, 0) <= Tolerance);
+    Expected := Concat(PrefixIds, Branch);
+    AssertEquals(Tag + What + ': cached ids', Length(Expected),
+      Length(Engine.CachedTokens));
+    AssertEquals(Tag + What + ': cached ids are prefix + branch',
+      Length(Expected), CommonPrefixLen(Expected, Engine.CachedTokens));
+  end;
+
+  procedure ChatTurn(AEngine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := AEngine.GenerateFromIds(Prompt, AEngine.Opt);
+    Turn.Completion := AEngine.LastCompletionTokens;
+    Turn.Cached := Copy(AEngine.CachedTokens);
+  end;
+
+begin
+  Tag := Stem + ': ';
+  if Length(ExtraArgs) > 0 then Tag := Stem + ' ' + ExtraArgs[0] + ': ';
+  Tolerance := 0;
+  Windowed := false;
+  for ArgPos := 0 to High(ExtraArgs) do
+    if ExtraArgs[ArgPos] = '--prefill-window' then Windowed := true;
+  if Windowed then Tolerance := 1e-5;
+  OnOpenCL := false;
+  for ArgPos := 0 to High(ExtraArgs) do
+    if ExtraArgs[ArgPos] = '--gpu' then OnOpenCL := true;
+  if OnOpenCL then Tolerance := 1e-2;
+  RandSeed := 919191;
+  Prefix := MakeIds(PrefixLen, 5, 2);
+  Branch1 := MakeIds(Branch1Len, 7, 3);
+  Branch2 := MakeIds(Branch2Len, 3, 1);
+  SetLength(Positions1, 3);
+  Positions1[0] := 0; Positions1[1] := 3; Positions1[2] := Branch1Len - 1;
+  SetLength(Positions2, 2);
+  Positions2[0] := 1; Positions2[1] := Branch2Len - 1;
+  SetLength(EmptyIds, 0);
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  Ref := nil;
+  Fresh := nil;
+  Logits := TNNetVolume.Create();
+  Hidden := TNNetVolume.Create();
+  Logits1 := TNNetVolume.Create();
+  Hidden1 := TNNetVolume.Create();
+  RefLogits := TNNetVolume.Create();
+  RefHidden := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 0, ExtraArgs);
+    Ref := NewChatSlotEngine(Dir, Ctx, 0, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, ExtraArgs);
+    AssertEquals(Tag + 'twin present exactly when windowed', Windowed,
+      Assigned(Engine.WindowSession));
+    {$IFDEF OpenCL}
+    if OnOpenCL then AssertTrue(Tag + 'OpenCL is on', Assigned(Engine.GpuCL));
+    {$ENDIF}
+    AssertTrue(Tag + 'the hidden state is the LM head''s input',
+      Engine.Session.HiddenLayer() = Engine.NN.GetLastLayer().PrevLayer);
+
+    Engine.PrefillDecisionPrefix(Prefix);
+    if Windowed then
+      AssertEquals(Tag + 'the prefix went through one window', 1,
+        Engine.LastPrefillWindows);
+    AssertEquals(Tag + 'prefix cached', PrefixLen, Length(Engine.CachedTokens));
+    AssertBranch('B1', Branch1, Positions1, Prefix);
+    if Windowed then
+      AssertTrue(Tag + 'B1 went through the twins',
+        (Engine.LastPrefillWindows = 1) and (Engine.LastPrefillTailWindows = 1));
+    Logits1.Copy(Logits);
+    Hidden1.Copy(Hidden);
+    AssertBranch('B2', Branch2, Positions2, Prefix);
+    AssertBranch('B1 again', Branch1, Positions1, Prefix);
+    AssertEquals(Tag + 'B1 again: logits bit for bit', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+    AssertEquals(Tag + 'B1 again: hidden bit for bit', 0,
+      MaxAbsRowDiffFrom(Hidden1, Hidden, 0), 0);
+    // Logits only, hidden only.
+    Engine.ScoreDecisionBranch(Branch1, nil, Logits, nil);
+    AssertEquals(Tag + 'B1 logits alone', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+    Engine.ScoreDecisionBranch(Branch1, Positions1, nil, Hidden);
+    AssertEquals(Tag + 'B1 hidden alone', 0,
+      MaxAbsRowDiffFrom(Hidden1, Hidden, 0), 0);
+
+    // A chat prompt that keeps P and B1's first 3 ids: the live cache reuses
+    // them on a pure-attention net, and the reply equals a fresh engine's.
+    ChatPrompt := Concat(Concat(Prefix, Copy(Branch1, 0, 3)), MakeIds(2, 1, 4));
+    ChatTurn(Engine, ChatPrompt, EngineTurn);
+    ChatTurn(Fresh, ChatPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat after scoring');
+    if Engine.ReuseOK then
+      AssertEquals(Tag + 'the chat reused the decision ids', PrefixLen + 3,
+        Engine.LastReusedTokens)
+    else
+      AssertEquals(Tag + 'hybrid: nothing to resume from', 0,
+        Engine.LastReusedTokens);
+    // The chat kept P in the cache, so the prefix is still scoreable.
+    AssertBranch('B2 after a chat', Branch2, Positions2, Prefix);
+    // A chat prompt that leaves P: scoring raises until P is fed again.
+    OtherPrompt := MakeIds(4, 1, 7);
+    ChatTurn(Engine, OtherPrompt, EngineTurn);
+    ChatTurn(Fresh, OtherPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat that leaves P');
+    Raised := false;
+    try
+      Engine.ScoreDecisionBranch(Branch1, Positions1, Logits, Hidden);
+    except
+      on Exception do Raised := true;
+    end;
+    AssertTrue(Tag + 'scoring without the prefix raises', Raised);
+
+    // Empty prefix.
+    Engine.PrefillDecisionPrefix(EmptyIds);
+    AssertEquals(Tag + 'empty prefix: nothing cached', 0,
+      Length(Engine.CachedTokens));
+    AssertBranch('empty prefix B1', Branch1, Positions1, EmptyIds);
+    AssertBranch('empty prefix B2', Branch2, Positions2, EmptyIds);
+    Logits1.Copy(Logits);
+    AssertBranch('empty prefix B2 again', Branch2, Positions2, EmptyIds);
+    AssertEquals(Tag + 'empty prefix B2 again: logits bit for bit', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+
+    // P again; the chat after it still equals a fresh engine.
+    Engine.PrefillDecisionPrefix(Prefix);
+    AssertBranch('P again B1', Branch1, Positions1, Prefix);
+    ChatTurn(Engine, ChatPrompt, EngineTurn);
+    ChatTurn(Fresh, ChatPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat after P again');
+  finally
+    StepIn.Free;
+    RefHidden.Free;
+    RefLogits.Free;
+    Hidden1.Free;
+    Logits1.Free;
+    Hidden.Free;
+    Logits.Free;
+    Fresh.Free;
+    Ref.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatDecisionBranchParity;
+begin
+  RunChatDecisionBranchParity('qwen2', []);
+  RunChatDecisionBranchParity('qwen3_5', []);
+end;
+
+// The prefix and the branches go through the width-4 and width-2 twins.
+procedure TTestNeuralPretrained.TestChatDecisionBranchPrefillWindow;
+begin
+  RunChatDecisionBranchParity('qwen2', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+  RunChatDecisionBranchParity('qwen3_5', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+end;
+
+// The same with OpenCL: the hidden states are read from a non-last layer.
+procedure TTestNeuralPretrained.TestChatDecisionBranchOpenCL;
+{$IFDEF OpenCL}
+var
+  APlatform: cl_platform_id;
+  ADevice: cl_device_id;
+{$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if not AcquireFirstOpenCLDevice(APlatform, ADevice) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  RunChatDecisionBranchParity('qwen3_5', ['--gpu', '--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+  RunChatDecisionBranchParity('qwen2', ['--gpu']);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}

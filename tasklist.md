@@ -4459,12 +4459,17 @@ rather than acted on.
         over fpjson's 255-byte key limit. Open: `HFDecodeUnicodeEscapes`
         (`neuralhftokenizer.pas`) turns an escaped quote or backslash into the raw
         character, which breaks the JSON; the decision parser decodes escapes itself.
-  - [ ] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
+  - [x] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
         prefix and capture its state; score a branch from that state, returning the
         last-position logits and/or the final hidden state at requested branch
         positions; leave the engine consistent (`CachedTokens` = session contents, or
         cleared) on success and on exception. Tests on the Qwen3.5 hybrid pico and an
         attention-only pico: branch-after-restore equals a full fresh forward.
+        Done: `PrefillDecisionPrefix` + `ScoreDecisionBranch`; `CachedTokens` stays
+        exact (a later chat reuses what the session holds). Prefill windowing is
+        shared with chat through `PlanPrefillLadder`/`FeedPrefillLadder`. Tests
+        `TestChatDecisionBranch{Parity,PrefillWindow,OpenCL}` (OpenCL run on PoCL
+        only, no real GPU).
   - [ ] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
         decision-only mode switch for later stage-2 use, `--selftest` cases.
   Stage 1 — AnyJev L0 readout (no trained weights):
