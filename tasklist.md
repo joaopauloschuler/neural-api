@@ -4470,8 +4470,12 @@ rather than acted on.
         shared with chat through `PlanPrefillLadder`/`FeedPrefillLadder`. Tests
         `TestChatDecisionBranch{Parity,PrefillWindow,OpenCL}` (OpenCL run on PoCL
         only, no real GPU).
-  - [ ] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
+  - [x] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
         decision-only mode switch for later stage-2 use, `--selftest` cases.
+        Done: `TDecisionScorer` base (scorers take their engine/head in the
+        constructor); no scorer -> 501, validation -> 422, wrong model -> 422 (the
+        model name or `jev-latest`), scorer exception -> 500. 18 new selftest cases
+        (run by hand: no test script runs ChatServer `--selftest`).
   Stage 1 — AnyJev L0 readout (no trained weights):
   - [ ] D1.1 AnyJev L0 scorer in `neuraldecision.pas`: prompt builder per kind, label
         token mapping, rotations, content-free prior, log-mean marginalisation, plus a

@@ -34,6 +34,8 @@ Coded by Claude (AI).
 //   - DecisionAnswerFromProbabilities + DecisionResponseToJSON derive the
 //     answer fields (argmax, expected level, confidence) and write the response.
 //   - RestrictedSoftMax turns a logits row into probabilities over a few ids.
+//   - TDecisionScorer is the base class every backend (AnyJev, Kev, Open-Jev)
+//     derives from; a server dispatches a parsed request to one of them.
 //
 // fpjson 3.2.2 keeps object keys in 255-byte shortstrings, so the string entry
 // point shields longer keys (HFShieldLongJSONKeys) and rejects question ids and
@@ -51,6 +53,8 @@ const
   csDecisionMaxScoreLevels = 10;
   // fpjson's TJSONObject member names are shortstrings of at most this length.
   csDecisionMaxJSONKeyBytes = 255;
+  // The TypeSafe SDK's default request model; every scorer answers to it (as Kev does).
+  csDecisionDefaultModelAlias = 'jev-latest';
 
 type
   TDecisionQuestionKind = (dqkChoice, dqkScore, dqkNoul);
@@ -96,6 +100,21 @@ type
     ErrorType: string;
   end;
   TDecisionErrorDetails = array of TDecisionErrorDetail;
+
+  // A /v1/systemone backend. A descendant takes what it scores with (engine, head)
+  // in its constructor; ModelName is what /v1/models lists and requests must name.
+  TDecisionScorer = class(TObject)
+  protected
+    FModelName: string;
+  public
+    constructor Create(const AModelName: string);
+    // One answer per question, in request order; the token counts fill "usage".
+    procedure Score(const Request: TDecisionRequest; out Answers: TDecisionAnswers;
+      out InputTokens, OutputTokens: integer); virtual; abstract;
+    // True for ModelName and for csDecisionDefaultModelAlias.
+    function AcceptsModel(const RequestModel: string): boolean; virtual;
+    property ModelName: string read FModelName;
+  end;
 
 // Parses and validates a /v1/systemone body. False: Errors holds the 422 details.
 function ParseDecisionRequest(const Body: string; out Request: TDecisionRequest;
@@ -559,10 +578,13 @@ begin
   if Result < 0 then Result := 0;
 end;
 
+// FASTMATH (-O4) turns "/ 10000" into "* (1/10000)": 0.57 would print as 0.5700000000000001.
+{$PUSH}{$OPTIMIZATION NOFASTMATH}
 function RoundDecisionProbability(X: double): double;
 begin
   Result := Round(X * 10000) / 10000;
 end;
+{$POP}
 
 function DecisionAnswerFromProbabilities(Kind: TDecisionQuestionKind;
   const P: TDecisionProbabilities): TDecisionAnswer;
@@ -987,6 +1009,18 @@ begin
   MaxElementPos := V.Size - 1;
   for ElementPos := 0 to MaxElementPos do
     Result[ElementPos] := V.FData[ElementPos];
+end;
+
+constructor TDecisionScorer.Create(const AModelName: string);
+begin
+  inherited Create;
+  FModelName := AModelName;
+end;
+
+function TDecisionScorer.AcceptsModel(const RequestModel: string): boolean;
+begin
+  Result := (RequestModel = FModelName) or
+    (RequestModel = csDecisionDefaultModelAlias);
 end;
 
 initialization

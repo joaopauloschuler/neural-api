@@ -28,7 +28,12 @@ Endpoints (all responses application/json):
        Plain text completion: the prompt is encoded WITHOUT any chat
        template and the model continues it (the --format raw path, but
        available in every mode). Also honors "stream":true.
-  GET  /v1/models             lists the single loaded model.
+  POST /v1/systemone          TypeSafe/Jev typed decision request (a state plus
+       typed questions in, option probabilities out; no text generated).
+       Errors use the FastAPI {"detail": ...} body: 422 on validation, 501
+       when no decision scorer is active, 500 when the scorer fails.
+  GET  /v1/models             lists the loaded model (and the decision
+       scorer's model when one is active).
 
 STREAMING: with "stream":true the reply is sent as Server-Sent Events -
 one "data: {chunk JSON}" frame per decoded token (chat.completion.chunk
@@ -93,7 +98,7 @@ uses
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   Classes, SysUtils, DateUtils, fpjson, jsonparser, fphttpserver,
-  neuralvolume, neuralchat, neuralchatengine;
+  neuralvolume, neuralchat, neuralchatengine, neuraldecision;
 
 const
   // Conversation slots when --kv-slots is not given: alternating clients
@@ -133,6 +138,8 @@ begin
   WriteLn('max_tokens override the launch defaults per request; absent fields fall');
   WriteLn('back to them. "stream":true streams SSE chunks (one per token) the way');
   WriteLn('the OpenAI client libraries expect; "n">1 is rejected.');
+  WriteLn('POST /v1/systemone answers TypeSafe/Jev typed decision requests (no text');
+  WriteLn('generated); it answers 501 while no decision scorer is active.');
   WriteLn;
   WriteLn('Server options:');
   WriteLn('  --host ADDR           listen address (default 127.0.0.1, loopback only)');
@@ -398,6 +405,9 @@ type
     Engine: TChatEngine;
     ModelName: string;          // reported in responses: the model dir's name
     RequestCount: integer;      // completion ids + console log lines
+    DecisionScorer: TDecisionScorer;  // owned; nil = /v1/systemone answers 501
+    // Non-empty = decision-only: the chat endpoints answer 501 with this reason.
+    DecisionOnlyReason: string;
     procedure NoticeOut(const S: string);
     procedure HandleRequest(Sender: TObject;
       var ARequest: TFPHTTPConnectionRequest;
@@ -420,6 +430,9 @@ type
     procedure HandleCompletions(Req: TJSONObject;
       var AResponse: TFPHTTPConnectionResponse);
     procedure HandleModels(var AResponse: TFPHTTPConnectionResponse);
+    function DecisionResponse(const Body: string; out Code: integer): string;
+    procedure HandleDecision(const Body: string;
+      var AResponse: TFPHTTPConnectionResponse);
     function UsageObject(): TJSONObject;
     function StreamChunkFrame(const ContentDelta: string; WithRole: boolean;
       const FinishReason: string): string;
@@ -826,16 +839,87 @@ end;
 
 procedure TServerApp.HandleModels(var AResponse: TFPHTTPConnectionResponse);
 var
-  Model: TJSONObject;
+  Models: TJSONArray;
+
+  procedure AddModel(const Id: string);
+  begin
+    Models.Add(TJSONObject.Create([
+      'id', Id,
+      'object', 'model',
+      'created', DateTimeToUnix(Now, false),
+      'owned_by', 'neural-api']));
+  end;
+
 begin
-  Model := TJSONObject.Create([
-    'id', ModelName,
-    'object', 'model',
-    'created', DateTimeToUnix(Now, false),
-    'owned_by', 'neural-api']);
-  SendJSON(AResponse, 200, TJSONObject.Create([
-    'object', 'list',
-    'data', TJSONArray.Create([Model])]));
+  Models := TJSONArray.Create();
+  if DecisionOnlyReason = '' then AddModel(ModelName);
+  if Assigned(DecisionScorer) and
+    ((DecisionOnlyReason <> '') or (DecisionScorer.ModelName <> ModelName)) then
+    AddModel(DecisionScorer.ModelName);
+  SendJSON(AResponse, 200, TJSONObject.Create(['object', 'list', 'data', Models]));
+end;
+
+// The /v1/systemone reply to a raw request body. The raw string goes to
+// ParseDecisionRequest: only it sees option names over fpjson's 255-byte keys.
+function TServerApp.DecisionResponse(const Body: string;
+  out Code: integer): string;
+var
+  Request: TDecisionRequest;
+  Errors: TDecisionErrorDetails;
+  Answers: TDecisionAnswers;
+  InputTokens, OutputTokens: integer;
+begin
+  if DecisionScorer = nil then
+  begin
+    Code := 501;
+    Exit(DecisionErrorMessageToJSON('no decision scorer is active on this' +
+      ' server, so POST /v1/systemone cannot answer'));
+  end;
+  if not ParseDecisionRequest(Body, Request, Errors) then
+  begin
+    Code := 422;
+    Exit(DecisionErrorsToJSON(Errors));
+  end;
+  if not DecisionScorer.AcceptsModel(Request.Model) then
+  begin
+    Code := 422;
+    Exit(DecisionErrorMessageToJSON('model "' + Request.Model + '" is not' +
+      ' served here; use "' + DecisionScorer.ModelName + '" or "' +
+      csDecisionDefaultModelAlias + '"'));
+  end;
+  try
+    DecisionScorer.Score(Request, Answers, InputTokens, OutputTokens);
+    Result := DecisionResponseToJSON(Request, Answers, InputTokens,
+      OutputTokens);
+    Code := 200;
+  except
+    on E: Exception do
+    begin
+      Code := 500;
+      Result := DecisionErrorMessageToJSON(E.Message);
+      WriteLn('[systemone scorer failed] ', E.ClassName, ': ', E.Message);
+    end;
+  end;
+end;
+
+procedure TServerApp.HandleDecision(const Body: string;
+  var AResponse: TFPHTTPConnectionResponse);
+var
+  Code: integer;
+  TStart: QWord;
+begin
+  TStart := GetTickCount64();
+  AResponse.Content := DecisionResponse(Body, Code);
+  AResponse.Code := Code;
+  AResponse.ContentType := 'application/json';
+  if Code = 200 then
+  begin
+    Inc(RequestCount);
+    WriteLn(Format('[systemone %d] %.1fs', [RequestCount,
+      (GetTickCount64() - TStart) / 1000]));
+  end
+  else
+    WriteLn('[error ', Code, '] ', AResponse.Content);
 end;
 
 procedure TServerApp.HandleRequest(Sender: TObject;
@@ -853,9 +937,20 @@ begin
       HandleModels(AResponse);
       exit;
     end;
+    if (ARequest.Method = 'POST') and (Path = '/v1/systemone') then
+    begin
+      HandleDecision(ARequest.Content, AResponse);
+      exit;
+    end;
     if (ARequest.Method = 'POST') and
       ((Path = '/v1/chat/completions') or (Path = '/v1/completions')) then
     begin
+      if DecisionOnlyReason <> '' then
+      begin
+        SendError(AResponse, 501, DecisionOnlyReason +
+          ', so this server only answers POST /v1/systemone');
+        exit;
+      end;
       Root := nil;
       try
         try
@@ -888,7 +983,7 @@ begin
     end;
     SendError(AResponse, 404, 'no such endpoint: ' + ARequest.Method + ' ' +
       Path + ' (POST /v1/chat/completions, POST /v1/completions,' +
-      ' GET /v1/models)');
+      ' POST /v1/systemone, GET /v1/models)');
   except
     // Nothing may escape into the accept loop: any unexpected failure
     // becomes a 500 and the server keeps serving.
@@ -908,6 +1003,33 @@ end;
 // ---------------------------------------------------------------------------
 // --selftest: offline unit checks (no model files needed).
 // ---------------------------------------------------------------------------
+type
+  // --selftest scorer: question k gets FixedProbabilities[k]; raises FailMessage when set.
+  TFixedDecisionScorer = class(TDecisionScorer)
+  public
+    FixedProbabilities: array of TDecisionProbabilities;
+    FailMessage: string;
+    procedure Score(const Request: TDecisionRequest;
+      out Answers: TDecisionAnswers;
+      out InputTokens, OutputTokens: integer); override;
+  end;
+
+procedure TFixedDecisionScorer.Score(const Request: TDecisionRequest;
+  out Answers: TDecisionAnswers; out InputTokens, OutputTokens: integer);
+var
+  QuestionPos, MaxQuestionPos: integer;
+begin
+  if FailMessage <> '' then raise Exception.Create(FailMessage);
+  Answers := nil;
+  SetLength(Answers, Length(Request.Questions));
+  MaxQuestionPos := High(Request.Questions);
+  for QuestionPos := 0 to MaxQuestionPos do
+    Answers[QuestionPos] := DecisionAnswerFromProbabilities(
+      Request.Questions[QuestionPos].Kind, FixedProbabilities[QuestionPos]);
+  InputTokens := 11;
+  OutputTokens := 3;
+end;
+
 procedure SelfTest();
 var
   Failures: integer;
@@ -934,6 +1056,28 @@ var
     end;
   end;
 
+  // Runs one request through TServerApp.HandleRequest; returns the body.
+  function Serve(App: TServerApp; const Method, URI, Body: string;
+    out Code: integer): string;
+  var
+    Request: TFPHTTPConnectionRequest;
+    Response: TFPHTTPConnectionResponse;
+  begin
+    Request := TFPHTTPConnectionRequest.Create();
+    Response := TFPHTTPConnectionResponse.Create(Request);
+    try
+      Request.Method := Method;
+      Request.URI := URI;
+      Request.Content := Body;
+      App.HandleRequest(nil, Request, Response);
+      Code := Response.Code;
+      Result := Trim(Response.Content);
+    finally
+      Response.Free;
+      Request.Free;
+    end;
+  end;
+
 var
   Base, GenOpt, ServerOpt: TChatOptions;
   Req: TJSONObject;
@@ -941,6 +1085,10 @@ var
   ErrMsg: string;
   IgnoredStop, Stream, IncludeUsage: boolean;
   ServerArgs: TStringList;
+  App: TServerApp;
+  Scorer: TFixedDecisionScorer;
+  Code: integer;
+  Reply, DecisionBody: string;
 begin
   Failures := 0;
   // Conversation slots: on by default here, an explicit --kv-slots wins.
@@ -1229,6 +1377,79 @@ begin
     Req.Free;
   end;
 
+  // POST /v1/systemone through HandleRequest (Engine stays nil: no route here may touch it).
+  DecisionBody := '{"model":"fixed-test","state":"s","questions":{' +
+    '"pick":{"type":"choice","instructions":"which?",' +
+    '"criteria":{"a":"first","b":null}},' +
+    '"level":{"type":"score","criteria":["low","mid","high"]},' +
+    '"yes":{"type":"noul"}}}';
+  App := TServerApp.Create();
+  try
+    App.ModelName := 'chat-test';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 501) and (Pos('"detail":', Reply) = 2) and
+      (Pos('no decision scorer', Reply) > 0),
+      'systemone without a scorer answers 501 {"detail": reason}');
+    Scorer := TFixedDecisionScorer.Create('fixed-test');
+    App.DecisionScorer := Scorer;
+    SetLength(Scorer.FixedProbabilities, 3);
+    Scorer.FixedProbabilities[0] := [0.75, 0.25];
+    Scorer.FixedProbabilities[1] := [0, 0.57, 0.43];
+    Scorer.FixedProbabilities[2] := [0.2, 0.8];
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 200) and (Reply = '{"model":"fixed-test","answers":{' +
+      '"pick":{"type":"choice","choice":"a","probabilities":{"a":0.75,' +
+      '"b":0.25},"confidence":0.5},"level":{"type":"score","score":1.43,' +
+      '"legend":{"0":"low","1":"mid","2":"high"},"probabilities":{"0":0.0,' +
+      '"1":0.57,"2":0.43},"confidence":0.355},"yes":{"type":"noul",' +
+      '"noul":0.8}},"usage":{"input_tokens":11,"output_tokens":3}}'),
+      'systemone with a fixed scorer returns the exact response JSON');
+    Reply := Serve(App, 'POST', '/v1/systemone',
+      StringReplace(DecisionBody, '"fixed-test"', '"jev-latest"', []), Code);
+    Check((Code = 200) and (Pos('{"model":"jev-latest"', Reply) = 1),
+      'systemone accepts the jev-latest alias and echoes it');
+    Reply := Serve(App, 'POST', '/v1/systemone',
+      StringReplace(DecisionBody, '"fixed-test"', '"other"', []), Code);
+    Check((Code = 422) and (Pos('{"detail":"model \"other\"', Reply) = 1),
+      'systemone rejects a model the scorer does not serve with 422');
+    Reply := Serve(App, 'POST', '/v1/systemone', '{"model":"fixed-test",' +
+      '"questions":{"q":{"type":"box"}}}', Code);
+    Check((Code = 422) and (Pos('{"detail":[{"loc":["body",', Reply) = 1),
+      'systemone answers a malformed request with the 422 detail list');
+    Reply := Serve(App, 'POST', '/v1/systemone', '{not json', Code);
+    Check((Code = 422) and (Pos('json_invalid', Reply) > 0),
+      'systemone answers invalid JSON with a 422 json_invalid detail');
+    Scorer.FailMessage := 'scorer exploded';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 500) and (Reply = '{"detail":"scorer exploded"}'),
+      'a scorer exception answers 500 {"detail": message}');
+    Scorer.FailMessage := '';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check(Code = 200, 'systemone answers again after a scorer exception');
+    Reply := Serve(App, 'GET', '/v1/models', '', Code);
+    Check((Code = 200) and (Pos('"chat-test"', Reply) > 0) and
+      (Pos('"fixed-test"', Reply) > 0),
+      '/v1/models lists the chat model and the decision scorer model');
+    App.DecisionOnlyReason := 'the server was launched with --decision-adapter';
+    Reply := Serve(App, 'POST', '/v1/chat/completions',
+      '{"messages":[{"role":"user","content":"hi"}]}', Code);
+    Check((Code = 501) and (Pos('--decision-adapter', Reply) > 0) and
+      (Pos('"error"', Reply) > 0),
+      'decision-only mode answers chat completions with 501 naming the reason');
+    Reply := Serve(App, 'POST', '/v1/completions', '{"prompt":"hi"}', Code);
+    Check((Code = 501) and (Pos('--decision-adapter', Reply) > 0),
+      'decision-only mode answers completions with 501 naming the reason');
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check(Code = 200, 'decision-only mode still answers systemone');
+    Reply := Serve(App, 'GET', '/v1/models', '', Code);
+    Check((Code = 200) and (Pos('"chat-test"', Reply) = 0) and
+      (Pos('"fixed-test"', Reply) > 0),
+      'decision-only /v1/models lists only the decision scorer model');
+  finally
+    App.DecisionScorer.Free;
+    App.Free;
+  end;
+
   if Failures = 0 then WriteLn('SELFTEST OK')
   else
   begin
@@ -1299,6 +1520,7 @@ begin
     Server.Active := true; // blocks: the accept/serve loop
   finally
     Server.Free;
+    App.DecisionScorer.Free;
     App.Engine.Free;
     App.Free;
   end;
