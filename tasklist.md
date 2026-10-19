@@ -4490,9 +4490,17 @@ rather than acted on.
         for cfChatML/cfQwen templates is unchecked against a real template (D1.2); a
         multi-token Yes/No label answers 500, not 422 (D1.3); batch prior,
         adaptive_shifts, canonical_order not ported.
-  - [ ] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
+  - [x] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
         Decider (L0, content-free prior) on a pico Qwen-family decoder with a chat
         template; Pascal test compares probabilities.
+        Done: fixtures `tests/fixtures/anyjev_qwen25/` (Qwen2, verbatim Qwen2.5
+        template -> cfQwen) and `anyjev_qwen3/` (Qwen3, verbatim Qwen3-0.6B template
+        -> cfChatML + closed think, which matches HF `enable_thinking=False`). Prompt
+        ids and label ids are exact; raw rows, priors and answers agree within 3.1e-6
+        (HFBackend runs float64 but casts logits to float32 before log_softmax).
+        Note for D1.3: on prompts whose prefix has >= 256 tokens AnyJev scores the
+        rotations through `score_shared` (prefix and suffix encoded apart, used only
+        when that equals the joint encoding), so it matches the Pascal full encoding.
   - [ ] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
         on Qwen2.5-0.5B-Instruct against Python AnyJev.
   Stage 2 — Kev and Open-Jev:

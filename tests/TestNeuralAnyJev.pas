@@ -4,7 +4,9 @@ Tests for neuralanyjev.pas, the AnyJev L0 readout. The model-free half ports
 anyjev 0.3.0's tests/test_calibrate.py and the synthetic-bias checks of
 tests/test_decider_fake.py; expected prompt strings and probabilities come
 from the real anyjev package (readout.build_prompt and the calibrate
-routines). The engine half runs the scorer on a random pico Qwen2 chat model.
+routines). The engine half runs the scorer on a random pico Qwen2 chat model,
+and on the anyjev_qwen25 / anyjev_qwen3 fixtures against the real anyjev
+Decider (tools/anyjev_tiny_fixture.py).
 Coded by Claude (AI).
 *)
 
@@ -29,6 +31,10 @@ type
     procedure AssertProbabilities(const Msg: string;
       const Expected: array of double; const Actual: TDecisionProbabilities;
       Tolerance: double);
+    // Scores the fixture's Jev request and compares every prompt, label id,
+    // raw row, prior row and answer with the anyjev Decider's oracle.
+    procedure CheckAnyJevOracle(const FixtureDirName: string;
+      ExpectedFormat: TNeuralChatFormat);
   published
     procedure TestContextualRemovesAdditivePriorExactly;
     // README: raw P(Yes) 0.62 with prior 0.70 -> 0.4115.
@@ -49,6 +55,10 @@ type
     // Choice, score and noul end to end: sums, sharing on = off, raw level,
     // 422 cases, and the engine chats afterwards like a fresh one.
     procedure TestScorerOnPicoChatModel;
+    // Qwen2.5 chat template (cfQwen with an explicit system message).
+    procedure TestParityWithAnyJevQwen25;
+    // Qwen3 template: cfChatML plus the closed thinking block.
+    procedure TestParityWithAnyJevQwen3;
   end;
 
 implementation
@@ -58,6 +68,9 @@ const
   csPicoHidden = 8;
   csPicoKVDim = 4;
   csPicoIntermediate = 12;
+  // FP32 forward and label softmax against anyjev's float64 model with float32
+  // logits; the largest measured gap is 3.1e-6 (a raw row).
+  csAnyJevParityTolerance = 1e-5;
 
 var
   TestFormat: TFormatSettings;
@@ -779,6 +792,132 @@ begin
     Engine.Free;
     RemoveAnyJevModelDir(Dir);
   end;
+end;
+
+function JSONProbabilities(Items: TJSONArray): TDecisionProbabilities;
+var
+  ItemPos: integer;
+begin
+  Result := nil;
+  SetLength(Result, Items.Count);
+  for ItemPos := 0 to Items.Count - 1 do Result[ItemPos] := Items.Floats[ItemPos];
+end;
+
+procedure AssertIdsEqual(const Msg: string; Expected: TJSONArray;
+  const Actual: TNeuralIntegerArray);
+var
+  IdPos: integer;
+begin
+  for IdPos := 0 to Min(Expected.Count, Length(Actual)) - 1 do
+    if Expected.Integers[IdPos] <> Actual[IdPos] then
+      TAssert.Fail(Format('%s: first difference at token %d: expected %d, got %d',
+        [Msg, IdPos, Expected.Integers[IdPos], Actual[IdPos]]));
+  TAssert.AssertEquals(Msg + ': token count', Expected.Count, Length(Actual));
+end;
+
+procedure TTestNeuralAnyJev.CheckAnyJevOracle(const FixtureDirName: string;
+  ExpectedFormat: TNeuralChatFormat);
+var
+  OracleFile, QuestionText, StateText, Where: string;
+  Stream: TFileStream;
+  Oracle, QuestionOracle, PromptOracle: TJSONObject;
+  Prompts, Perms: TJSONArray;
+  Engine: TChatEngine;
+  Scorer: TAnyJevL0Scorer;
+  Request: TDecisionRequest;
+  Errors: TDecisionErrorDetails;
+  Answers: TDecisionAnswers;
+  Diagnostics: TAnyJevQuestionDiagnostics;
+  Options: TStringArray;
+  InputTokens, OutputTokens, QuestionPos, RotationPos, PromptPos, ItemPos: integer;
+begin
+  OracleFile := FixturePath(FixtureDirName + DirectorySeparator + 'anyjev_oracle.json');
+  Stream := TFileStream.Create(OracleFile, fmOpenRead or fmShareDenyWrite);
+  try
+    Oracle := GetJSON(Stream) as TJSONObject;
+  finally
+    Stream.Free;
+  end;
+  Engine := nil;
+  Scorer := nil;
+  try
+    Engine := NewEngine(ExtractFilePath(OracleFile));
+    Scorer := TAnyJevL0Scorer.Create(Engine, 'anyjev-parity');
+    AssertTrue('parse', ParseDecisionRequest(Oracle.Strings['request'], Request, Errors));
+    Scorer.Score(Request, Answers, InputTokens, OutputTokens);
+    AssertEquals('rendered chat prompt',
+      Oracle.Objects['render_check'].Strings['rendered'],
+      Scorer.RenderPrompt(Oracle.Objects['render_check'].Strings['user']));
+    AssertEquals('rendered state', Oracle.Strings['state_text'],
+      RewriteSpecialTokenStrings(Request.State));
+    AssertEquals('question count', Oracle.Arrays['questions'].Count,
+      Length(Scorer.LastDiagnostics));
+    for QuestionPos := 0 to High(Scorer.LastDiagnostics) do
+    begin
+      QuestionOracle := Oracle.Arrays['questions'].Objects[QuestionPos];
+      Diagnostics := Scorer.LastDiagnostics[QuestionPos];
+      Where := QuestionOracle.Strings['id'];
+      AssertEquals(Where + ': labels', QuestionOracle.Arrays['labels'].Count,
+        Length(Diagnostics.Labels));
+      for ItemPos := 0 to High(Diagnostics.Labels) do
+      begin
+        AssertEquals(Where + ': label', QuestionOracle.Arrays['labels'].Strings[ItemPos],
+          Diagnostics.Labels[ItemPos]);
+        AssertEquals(Where + ': label id', QuestionOracle.Arrays['label_ids'].Integers[ItemPos],
+          Diagnostics.LabelIds[ItemPos]);
+      end;
+      Perms := QuestionOracle.Arrays['perms'];
+      AssertEquals(Where + ': rotations', Perms.Count, Length(Diagnostics.Rotations));
+      for RotationPos := 0 to Perms.Count - 1 do
+        AssertIdsEqual(Where + ': rotation', Perms.Arrays[RotationPos],
+          Diagnostics.Rotations[RotationPos]);
+      AnyJevQuestionParts(Request.Questions[QuestionPos], QuestionText, Options);
+      AssertEquals(Where + ': question text', QuestionOracle.Strings['question_text'],
+        QuestionText);
+      Prompts := QuestionOracle.Arrays['prompts'];
+      for PromptPos := 0 to Prompts.Count - 1 do
+      begin
+        PromptOracle := Prompts.Objects[PromptPos];
+        RotationPos := PromptOracle.Integers['rotation'];
+        if PromptOracle.Nulls['probe'] then StateText := Request.State
+        else StateText := PromptOracle.Strings['probe'];
+        AssertIdsEqual(Format('%s: prompt ids, rotation %d, state "%s"',
+          [Where, RotationPos, Copy(StateText, 1, 8)]), PromptOracle.Arrays['ids'],
+          Engine.Tokenizer.Encode(Scorer.RenderPrompt(BuildAnyJevUserMessage(
+            RewriteSpecialTokenStrings(StateText), QuestionText,
+            Request.Questions[QuestionPos].Kind, Options,
+            Diagnostics.Rotations[RotationPos], Diagnostics.Labels))));
+      end;
+      for RotationPos := 0 to Perms.Count - 1 do
+      begin
+        AssertProbabilities(Where + ': raw row ' + IntToStr(RotationPos),
+          JSONProbabilities(QuestionOracle.Arrays['p_pos_raw'].Arrays[RotationPos]),
+          Diagnostics.RawByRotation[RotationPos], csAnyJevParityTolerance);
+        AssertProbabilities(Where + ': content-free prior row ' + IntToStr(RotationPos),
+          JSONProbabilities(QuestionOracle.Arrays['cf_prior'].Arrays[RotationPos]),
+          Diagnostics.PriorByRotation[RotationPos], csAnyJevParityTolerance);
+      end;
+      AssertProbabilities(Where + ': probabilities',
+        JSONProbabilities(QuestionOracle.Arrays['probs']), Diagnostics.Probabilities,
+        csAnyJevParityTolerance);
+    end;
+    AssertTrue('chat format', Engine.ChatFormat = ExpectedFormat);
+    AssertEquals('nothing generated', 0, OutputTokens);
+  finally
+    Scorer.Free;
+    Engine.Free;
+    Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralAnyJev.TestParityWithAnyJevQwen25;
+begin
+  CheckAnyJevOracle('anyjev_qwen25', cfQwen);
+end;
+
+procedure TTestNeuralAnyJev.TestParityWithAnyJevQwen3;
+begin
+  CheckAnyJevOracle('anyjev_qwen3', cfChatML);
 end;
 
 initialization
