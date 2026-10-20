@@ -2012,11 +2012,16 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       ChannelAffine opcode 46 does the tail; inference only, resident in and out.
       Follow-up: the table kernel is one work-group, so on a big map (56x56x384)
       it runs on one compute unit; split positions across groups if it shows up.
+- [X] `TNNetLearnedPositionalEmbedding` device forward: cai_activation's
+      AddChannel opcode over a SizeX*Depth table (new virtual
+      `ActivationChannelCount`), the table resident and re-uploaded on a weight
+      change; a non-zero PositionOffset copies the used rows into the queue
+      scratch buffer (`CopyBuffer` gains a source offset). Inference only.
+      Covered by `TestLearnedPositionalEmbeddingOpenCLParity`.
 - [ ] Diffusion-step conditioning recomputed on every denoise step:
-      `TNNetSinusoidalTimeEmbedding`, `TNNetLearnedPositionalEmbedding` and
-      `TNNetSoftPrompt`. Individually small; they matter because a sampler runs
-      them 20-50 times per image, each time bouncing the conditioning vector
-      through the host.
+      `TNNetSinusoidalTimeEmbedding` and `TNNetSoftPrompt`. Individually small;
+      they matter because a sampler runs them 20-50 times per image, each time
+      bouncing the conditioning vector through the host.
 - [ ] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
       segmentation frontend and the ECAPA-TDNN trunk. Both are convolutions
       whose kernel is generated (sinc band-pass) or dilated, so the existing

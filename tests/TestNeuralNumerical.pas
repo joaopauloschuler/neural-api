@@ -603,6 +603,7 @@ type
     // TNNetGRN chained resident (cai_grn_table + ChannelAffine) at two depths,
     // then after a gamma/beta update, against a host-only twin net.
     procedure TestGRNOpenCLParity;
+    procedure TestLearnedPositionalEmbeddingOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -72058,6 +72059,119 @@ begin
       OutCPU.Free;
       Input.Free;
       NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestLearnedPositionalEmbeddingOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // SizeX, SizeY, Depth, MaxPosition, PositionOffset.
+  csCases: array[0..1, 0..4] of integer = ((6, 1, 5, 6, 0), (4, 3, 7, 9, 3));
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  PosLayer: TNNetLearnedPositionalEmbedding;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  HostDiff, MaxDiff, RefreshDiff: TNeuralFloat;
+
+  procedure BuildExpected();
+  var
+    Table: TNNetVolume;
+    CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
+  begin
+    Table := PosLayer.Neurons[0].Weights;
+    MaxX := Input.SizeX - 1;
+    MaxY := Input.SizeY - 1;
+    MaxD := Input.Depth - 1;
+    for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
+        for CntD := 0 to MaxD do
+          Expected[CntX, CntY, CntD] := Max(TNeuralFloat(0),
+            Input[CntX, CntY, CntD] +
+            Table[CntX + PosLayer.PositionOffset, 0, CntD]);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CasePos := 0 to High(csCases) do
+  begin
+    RandSeed := 20261020 + CasePos;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csCases[CasePos, 0], csCases[CasePos, 1],
+      csCases[CasePos, 2]);
+    Expected := TNNetVolume.Create(Input);
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      PosLayer := TNNetLearnedPositionalEmbedding(NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(csCases[CasePos, 3], 0.5)));
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      PosLayer.PositionOffset := csCases[CasePos, 4];
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) - 0.2;
+      BuildExpected();
+      NN.Compute(Input);
+      HostDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+
+      // ForceOpenCL off: the resident input carries the layer to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      PosLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to MaxPos do
+        if PosLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+
+      // A table update must reach the device copy.
+      SetRandomNeuronWeights(PosLayer, 0, 0.1, 2);
+      PosLayer.FlushWeightCache();
+      BuildExpected();
+      NN.Compute(Input);
+      RefreshDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      WriteLn('  LearnedPositionalEmbedding OpenCL ', Input.SizeX, 'x',
+        Input.SizeY, 'x', Input.Depth, ' offset ', PosLayer.PositionOffset,
+        ': host max|diff|=', HostDiff:0:9, ' OpenCL=', MaxDiff:0:9,
+        ' after update=', RefreshDiff:0:9, ' sentinels=', SentinelSurvivors,
+        '/', Input.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('ran every OpenCL forward on OpenCL', 3, PosLayer.ForwardGPUCnt);
+      AssertEquals('the output is bound, not downloaded', Input.Size,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('host vs reference must be exact', HostDiff = 0);
+      AssertTrue('OpenCL vs reference must be exact', MaxDiff = 0);
+      AssertTrue('OpenCL after a table update must be exact', RefreshDiff = 0);
+      AssertTrue('the reference is not degenerate', Expected.GetMaxAbs() > 0);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      Expected.Free;
+      Input.Free;
       NN.Free;
     end;
   end;

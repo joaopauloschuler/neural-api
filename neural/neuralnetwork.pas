@@ -112,7 +112,7 @@ const
   csActGaussian     = 42;
   csActISRU         = 43; // ParamA = alpha
   // 44..46 read the channel-parameter buffer (ActivationChannelParams).
-  csActAddChannel    = 44; // x + c[i mod n]: TNNetChannelBias, TNNetCellBias
+  csActAddChannel    = 44; // x + c[i mod n]: TNNetChannelBias, TNNetCellBias, TNNetLearnedPositionalEmbedding
   csActMulChannel    = 45; // x * c[i mod n]: TNNetChannelMul
   csActChannelAffine = 46; // x * gamma[d] + beta[d], gamma|beta packed: TNNetFiLM, TNNetGRN
   csActSubMulConstant = 47; // (x - ParamA) * ParamB: TNNetMovingStdNormalization
@@ -1566,6 +1566,9 @@ type
       function ActivationChannelParamsChanged(): boolean; virtual;
       // How many equal-length tables ActivationChannelParams packs (default 1).
       function ActivationChannelTableCount(): integer; virtual;
+      // Table length cai_activation indexes modulo (FChannels) for ChannelParams;
+      // default ChannelParams.Size div ActivationChannelTableCount.
+      function ActivationChannelCount(ChannelParams: TNNetVolume): integer; virtual;
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
       // already downloaded. Descendants whose activation takes constants pass
@@ -8542,7 +8545,21 @@ type
     FScaleEmbedding: TNeuralFloat;
     FPositionOffset: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  protected
+    // The whole table; cai_activation's AddChannel reads its SizeX rows from
+    // PositionOffset on, indexed per element modulo SizeX*Depth.
+    function ActivationChannelParams(): TNNetVolume; override;
+    function ActivationChannelCount(ChannelParams: TNNetVolume): integer; override;
+    {$IFDEF OpenCL}
+    // The table itself at PositionOffset 0, else its used rows copied into
+    // the queue scratch buffer.
+    function ActivationChannelBufferOnOpenCL(SourceBuffer,
+      WeightBuffer: cl_mem): cl_mem; override;
+    {$ENDIF}
   public
+    {$IFDEF OpenCL}
+    function WillOpenCL(): boolean; override;
+    {$ENDIF}
     constructor Create(pMaxPosition: integer;
       ScaleEmbedding: TNeuralFloat = 0.02); reintroduce; overload;
     procedure InitDefault(); override;
@@ -107983,7 +108000,7 @@ begin
   iChannels := FOutput.Depth;
   if Assigned(ChannelParams) then
   begin
-    iChannels := ChannelParams.Size div ActivationChannelTableCount();
+    iChannels := ActivationChannelCount(ChannelParams);
     ChannelBuffer := Kern.EnsureWriteBuffer(FActivationChannelBuffer,
       FActivationChannelBufBytes, ChannelParams,
       {DoWrite=}ActivationChannelParamsChanged());
@@ -108038,6 +108055,11 @@ end;
 function TNNetIdentity.ActivationChannelTableCount(): integer;
 begin
   Result := 1;
+end;
+
+function TNNetIdentity.ActivationChannelCount(ChannelParams: TNNetVolume): integer;
+begin
+  Result := ChannelParams.Size div ActivationChannelTableCount();
 end;
 
 function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
@@ -115271,7 +115293,41 @@ begin
   FScaleEmbedding := ScaleEmbedding;
   FStruct[0] := pMaxPosition;
   FFloatSt[0] := ScaleEmbedding;
+  FActivationOpcode := csActAddChannel;
 end;
+
+function TNNetLearnedPositionalEmbedding.ActivationChannelParams(): TNNetVolume;
+begin
+  Result := FNeurons[0].FWeights;
+end;
+
+function TNNetLearnedPositionalEmbedding.ActivationChannelCount(
+  ChannelParams: TNNetVolume): integer;
+begin
+  Result := FOutput.SizeX * FOutput.Depth;
+end;
+
+{$IFDEF OpenCL}
+function TNNetLearnedPositionalEmbedding.ActivationChannelBufferOnOpenCL(
+  SourceBuffer, WeightBuffer: cl_mem): cl_mem;
+var
+  RowsBytes: csize_t;
+  ScratchGeneration: integer;
+begin
+  if FPositionOffset = 0 then exit(WeightBuffer);
+  RowsBytes := csize_t(FOutput.SizeX * FOutput.Depth) * csNeuralFloatSize;
+  Result := FActivationKernel.QueueScratchBuffer(RowsBytes, ScratchGeneration);
+  FActivationKernel.CopyBuffer(WeightBuffer, Result, RowsBytes, 0,
+    csize_t(FPositionOffset * FOutput.Depth) * csNeuralFloatSize);
+end;
+
+function TNNetLearnedPositionalEmbedding.WillOpenCL(): boolean;
+begin
+  // The table rows the window reads must exist; the host path does not check.
+  Result := (FPositionOffset >= 0) and
+    (FOutput.SizeX + FPositionOffset <= FMaxPosition) and inherited WillOpenCL();
+end;
+{$ENDIF}
 
 procedure TNNetLearnedPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
@@ -115304,6 +115360,11 @@ var
   wPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   LocalWeights := FNeurons[0].FWeights;
   {$IFDEF Debug}
