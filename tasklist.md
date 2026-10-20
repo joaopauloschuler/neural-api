@@ -562,8 +562,9 @@ rather than acted on.
   - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
         weights are large / not redistributable; importer uses the canonical
         NAFNet state_dict key scheme so a real checkpoint should drop in).
-  - [ ] PNG input/output (the example uses deterministic synthetic images + PPM;
-        no PNG decoder in-tree).
+  - [ ] PNG input/output in examples/ImageRestoration (the example uses
+        deterministic synthetic images + PPM; the PNG reader/writer already
+        exists via `LoadImageFromFileIntoVolume` in neuraldatasets.pas).
   - [ ] NAFBlock dropout + the wider official width/block configs are wired by
         config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer follow-ups
@@ -948,8 +949,6 @@ rather than acted on.
         - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
-  - [x] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
-        LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
   - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
         1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
         ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
@@ -1565,11 +1564,10 @@ rather than acted on.
         36.3 s/step (16.5x the 256x256 step for 16x the tokens: linear, so
         attention does not dominate; ~75 TFLOP/step, ~2 TFLOPS achieved),
         denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
-        transformer 245.2 s, peak RSS 10.9 GB. B1f runs before B1d2 to tell
-        the int4 projection kernel, the host layers and the transfers apart.
+        transformer 245.2 s, peak RSS 10.9 GB.
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
-          TNNet.Compute when the last layer ends on the host (worth it
-          now that B1d2 has landed: these writes are the only mid-block waits).
+          TNNet.Compute when the last layer ends on the host (these writes
+          are the only mid-block waits).
     - [ ] B1d1 follow-up: Shared "bind or upload the operand" helper for
           TNNetChannelMulByLayer and TNNetCellMulByCell.
     - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
@@ -1962,14 +1960,17 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetGptOssSinkAttention` (GPT-OSS is a live importer, and the sink is
       `TNNetFusedSDPA` plus one per-head scalar, so it should reuse the fused
-      decode kernels) and `TNNetDifferentialAttention` (`TNNetWindowAttention`
-      is in the vision attention item below). Take the sink first.
-- [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and the
-      CAUSAL half of `TNNetLinearAttention`. COUPLED, not independent: each is a
-      strict per-token scan today, so there is no GEMM-shaped kernel to offload
-      until the chunked/parallel forward tasks in "Layer follow-ups that fix real
-      limitations" land. Sequence them after those, or fold the device path into
-      each chunked rewrite.
+      decode kernels), `TNNetSinkAttention` and `TNNetDifferentialAttention`.
+      Take the GPT-OSS sink first.
+- [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
+      `TNNetCausalLinearAttention` (the non-causal `TNNetLinearAttention` already
+      has a two-GEMM `ComputeOpenCL`). COUPLED, not independent: each is a
+      strict per-token scan today (the causal linear attention is a prefix-sum
+      `S_t = S_{t-1} + phi(K_t) x V_t`), so there is no GEMM-shaped kernel to
+      offload until the chunked/parallel forward tasks in "Layer follow-ups that
+      fix real limitations" are done (intra-chunk dense GEMM + inter-chunk
+      running state). Sequence them after those, or fold the device path into
+      each chunked rewrite, with an exact-vs-CPU parity test each.
 - [ ] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
       int8 device gather (`cai_embedding_gather_int8`) and leaves its rows
       resident; its sibling still gathers on the host. Reuse the same entry
@@ -1994,18 +1995,6 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [X] `TNNetCausalConv1D` (the CogVideoX VAE decoder) device forward. Done on
-      `cai_conv_implicit` with no kernel change: a K x 1 kernel, PaddingX =
-      Dilation*(K-1), PaddingY 0, DilationX = Dilation and OutSizeX = SeqLen
-      (the kernel's bounds check is the missing right pad). Covered by
-      `TestCausalConv1DOpenCLParity` (5 shapes, tiled and untiled, a weight update).
-- [X] `TNNetConvolution3D` (VideoMAE tubelet embedding, 3-D VAEs) device
-      forward on `cai_conv_implicit`, no new kernel: output frame ot reads ONE
-      contiguous depth window [ot*C, ot*C + FeatureSizeT*C) per source pixel,
-      so `cai_conv_gather` gained a source pixel stride and an output-frame
-      axis folded into the column (b = pixel*OutT + ot; the result
-      [b*NumFeatures + f] is the packed output as it is). Covered by
-      `TestConvolution3DOpenCLParity` (5 shapes incl. the tubelet stride).
 - [ ] VideoMAE tubelet embedding computes ~tubelet x too many frames: the
       `TNNetConvolution3D` emits every overlapping output frame (T - tubelet + 1)
       and the builder keeps every tubelet-th one via `TNNetSplitChannels` +
@@ -2029,18 +2018,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       per-row scale on `cai_conv_implicit`, with d[o] from a resident
       sum_t w[o,t,i]^2 table times s^2). Measure the upload share on the GPU
       box first; at 1024x1024 the contraction should dominate.
-- [X] `TNNetWindowAttention` (Swin / MaxViT / BEiT / SwinIR / the CLAP audio
-      tower) and `TNNetT5RelPosBiasAttention` device forward on
-      `cai_sdpa_flash`: the kernel gained an additive score bias
-      `FScoreBias[FBiasBase + t*FBiasRowStride + key]` (FGroupSize 1 only; a
-      biased score <= -1e8 counts as masked, as on the host). Window attention
-      passes its SeqLen x SeqLen bias matrix (row stride SeqLen), T5 a per-offset
-      table of 2*SeqLen-1 bucket biases (row stride -1); both re-upload after
-      `AfterWeightUpdate`. T5's cached decode stays on the host. Covered by
-      `WindowAttentionOpenCLParity` (2-3 windows x 2-3 heads, -1e9 and -100
-      shift masks, sentinels, a bias update) and `T5RelPosBiasAttentionOpenCLParity`
-      (non-causal, causal, causal + window). The extra uniform branch per score
-      in the decode flash kernel is not timed on a GPU yet.
 - [ ] The rest of the vision attention subclasses that override `Compute` and
       so lose `TNNetScaledDotProductAttention`'s device path:
       - `TNNetSwinV2WindowAttention`: cosine attention, so Q and K rows must be
@@ -2065,47 +2042,15 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       the open FFT denormal-trap item, since the device path would move that
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
-- [X] `TNNetGRN` device forward (ConvNeXt, RIFE, StyleGAN2, SAM), the last
-      conv-stack member of the per-channel glue. It needs a per-channel
-      spatial L2 reduction (Gx[c] = ||X[:,:,c]||) and the channel mean of Gx
-      before an elementwise tail, so it is not a `cai_activation` opcode. First
-      check whether `cai_group_norm`'s per-group statistics (groups = Depth)
-      can supply the per-channel sum of squares.
-      DONE: `cai_group_norm` cannot (it keeps its statistics in local memory and
-      writes only the normalized output). A new one-work-group `cai_grn_table`
-      writes the coef|beta table on `cai_activation`'s queue, and the existing
-      ChannelAffine opcode 46 does the tail; inference only, resident in and out.
-      Follow-up: the table kernel is one work-group, so on a big map (56x56x384)
-      it runs on one compute unit; split positions across groups if it shows up.
-- [X] `TNNetLearnedPositionalEmbedding` device forward: cai_activation's
-      AddChannel opcode over a SizeX*Depth table (new virtual
-      `ActivationChannelCount`), the table resident and re-uploaded on a weight
-      change; a non-zero PositionOffset copies the used rows into the queue
-      scratch buffer (`CopyBuffer` gains a source offset). Inference only.
-      Covered by `TestLearnedPositionalEmbeddingOpenCLParity`.
-- [X] `TNNetSoftPrompt` device forward: a `cai_gather_copy` plan writes the
-      source rows after K zero rows, then one `CopyBuffer` lands the resident
-      bank (re-uploaded on a weight change) in rows 0..K-1. Inference only.
-      Covered by `TestSoftPromptOpenCLParity`.
-- [X] `TNNetSinusoidalTimeEmbedding`: SKIPPED, no transfer to save. Its source
-      is the 1x1x1 timestep the sampler writes on the host each step
-      (`TimeIn.Output.FData[0] := t` in the diffusion examples), and its output
-      is one EmbeddingSize vector. Host compute costs one upload of that vector
-      to the next layer; a kernel would cost one upload of t plus a launch.
+- [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
+      ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
+      big map (56x56x384) it runs on one compute unit; split positions
+      across groups if it shows up on the GPU box.
 - [ ] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
       segmentation frontend and the ECAPA-TDNN trunk. Both are convolutions
       whose kernel is generated (sinc band-pass) or dilated, so the existing
       conv offload applies once the kernel slab is materialized; the closest
       thing to a free win on the audio side.
-- [X] `TNNetFlipX`, the one host hop inside an otherwise device-capable
-      bidirectional stack. Done: its forward is a `cai_gather_copy` plan (the X
-      axis table reversed), covered by `TestGatherCopyOpenCLParity` and the
-      resident chain of `TestGatherCopyResidentOpenCLParity`.
-- [X] `TNNetFlipY` and `TNNetReverseXY` on the same `cai_gather_copy` plan
-      (reversed Y table / reversed position table), in both gather-copy tests.
-- [X] `TNNetReverseChannels` and `TNNetRoll` on the same `cai_gather_copy`
-      plan (reversed depth table / cyclic table on the rolled X, Y or depth
-      axis), in both gather-copy tests.
 - [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
       new kernel (per-channel softmax over time, then the two weighted moments)
       reading two sources, the features and `FLogitLayer`. It runs once per
@@ -2141,11 +2086,6 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [X] `TNNetArcSinh` (host and opcode 56) used ln(x + sqrt(x^2 + 1)), which
-      cancels in float32 for x << 0. Done: both now compute
-      sign(x) * ln(|x| + sqrt(x^2 + 1)), exact to |x| = 2^125 and saturating past
-      it; the host derivative no longer overflows x^2; pinned by
-      `TestArcSinhLargeMagnitude`, and the 1e30 extreme-input parity now compares values.
 - [ ] `TNNetMetaAconC`, the one per-channel learnable activation still with
       no device forward. Its beta is sigmoid(gamma[c] * mean_c(x) + delta[c]),
       so it needs a per-sample spatial channel mean before the elementwise
@@ -2187,16 +2127,6 @@ cannot pay for its own transfer.
         the same any-input-width form, then add a 2-layer bidirectional
         pico-oracle parity fixture for LSTM and GRU (the generator already
         supports the shape — `tools/torch_rnn_tiny_fixture.py`).
-
-- [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
-      `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
-      `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
-      max|diff| ≈ 1.5e-8). The causal sibling was deliberately LEFT CPU-only: its
-      forward is a left-to-right prefix-sum scan (`S_t = S_{t-1} + ϕ(K_t)⊗V_t`,
-      per-query `Out_t = ϕ(Q_t)·S_t / ϕ(Q_t)·Z_t`), NOT a pair of dense GEMMs, so it
-      does not map onto the `FDotCL` matmul kernel without a chunked-scan rewrite.
-      Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
-      inter-chunk running state), then add a causal parity test alongside.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
@@ -2268,15 +2198,11 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
       memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
       mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
-- [ ] Segment-mask MHA-builder wiring follow-up (the SDPA-layer + packer half
-      landed above): thread an optional segment-id source through the
-      multi-head attention BUILDERS (AddMultiHeadSelfAttention and friends) so
-      packed-window training masks cross-document attention end-to-end, not just
-      at the bare TNNetScaledDotProductAttention layer. Each per-head SDPA in the
-      builder takes the same shared `pSegmentSource`; assert a packed two-doc MHA
-      stack matches the concatenation of independent per-document MHA runs (the
-      builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
-      incremental decode stays intentionally unmasked (single-stream = one doc).
+- [ ] Segment-mask MHA-builder test: `AddMultiHeadSDPAConcat` /
+      `AddMultiHeadSelfAttention` already take `SegmentSource` (avSDPA only), but
+      no test passes one. Assert a packed two-doc MHA stack matches the
+      concatenation of independent per-document MHA runs (the builder-level
+      analogue of TestSegmentMaskMatchesUnpackedBaseline).
 
 - [ ] Residual scalar backward loops left by the AVX/OpenCL vectorization batch
       (the forward + cleanly-mappable backward paths are done; these are the
@@ -2292,9 +2218,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       layer type fixed) for the 6 most recently landed layers. Catches
       shape-edge bugs hand-written tests miss.
 - [ ] Continue upsampling/deconvolution audit: TNNetDeconvolution input-
-      gradient and full weight-gradient finite-difference checks (one-weight
-      check in TestDeconvolutionGradient only; Upsample / DeMaxPool / DeAvgPool
-      already covered). Likely benefits from the Double-precision accumulator
+      gradient and full weight-gradient FINITE-DIFFERENCE checks
+      (TestDeconvolutionDepthVectorEquality already checks both against an
+      analytic reference; Upsample / DeMaxPool / DeAvgPool already covered). Likely benefits from the Double-precision accumulator
       of DeMaxPoolFamilyGradientCheck (tests/TestNeuralNumerical.pas).
 - [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient path
       (sparse-update pattern — easy place for a silent broadcast/reduction
@@ -2434,11 +2360,7 @@ then — only int8 + MXFP4-dequant did.)
         Llama/Qwen slicer fixture is RAM/network-gated; today's parity is the
         random pico numpy oracle only.
 
-## Lucky-day batch 2026-06-28f (follow-ups surfaced by 28e landings)
-
-(All three 28e items LANDED: Heun sampler [891e7537], Min-SNR-gamma loss
-weighting [f8e1823c], tiled VAE decode [2e28a44b]. Genuinely-novel follow-ups
-surfaced while landing them:)
+## Tiled VAE decode follow-ups (from 2e28a44b)
 
 - [ ] Fully-convolutional VAE-decoder Compute path so `TiledVaeDecode`
       (neuralpretrained.pas) can reuse ONE decoder net across tiles instead of
@@ -2456,15 +2378,7 @@ surfaced while landing them:)
       (trained) checkpoint so users know the quality trade-off. Pure host /
       analysis; no new layer.
 
-## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port) — ALL THREE LANDED
-
-(All three 28j items LANDED and removed: AVX per-channel + OpenCL per-depth
-forward for `TNNetL2Normalize` (`cai_l2norm_perdepth` kernel + `TNNetL2NormCL`,
-commit b01eab21); OpenCL per-pixel RMS forward for `TNNetPixelNorm` reusing that
-kernel with InvScale=1/Depth + Eps (commit d50725e5); `TNNetResize2D` unified
-arbitrary-size resize — nearest/bilinear/bicubic + align_corners, size-based
-source maps for down/non-integer ratios, exact-transpose backward, FStruct[0..3]
-round-trip (commit e37d07bb). Open follow-ups surfaced by the Resize2D landing:)
+## TNNetResize2D follow-ups (from e37d07bb)
 
 - [ ] `TNNetResize2D` `antialias=True` box-prefilter for downscale was SCOPED OUT
       of v1 (it changes the kernel support to scale-dependent, breaking the fixed
