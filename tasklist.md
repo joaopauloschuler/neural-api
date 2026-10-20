@@ -1942,6 +1942,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       PixelShuffle) is expressible as a `cai_gather_copy` plan too. The gather
       layers do not take part in OpenCL output sharing by liveness
       (`CanShareOpenCLOutput` is False).
+- [ ] Move the `cai_gather_copy` plan build out of the forward (rule #17,
+      no allocation in `Compute`): `TNNetGatherCopyCL` grows `FTable` /
+      `FPlanHost` with `SetLength` lazily on the first device forward after a
+      shape change. Build the plan in `EnableOpenCL` / after `SetPrevLayer`
+      (and on `ReSize`) instead, so `Compute` only binds and launches.
 - [X] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward. Both
       now descend from `TNNetGLUGateBase` and reach `cai_glu_gate` through two
       new gate flags: 4 = ReLU(A) * B (ReGLU gates the FIRST half, unlike the
