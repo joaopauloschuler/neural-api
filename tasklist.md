@@ -1709,17 +1709,16 @@ rather than acted on.
       `tools/make_pico_taesd_fixture.py`). Not covered: a real checkpoint run, the
       OpenCL forward of the composed net, the original (non-diffusers)
       `taesd_decoder.safetensors` key layout.
-- [ ] TAESD per-step previews and draft decode: a `--preview N` flag in
-      examples/LatentTextToImage that decodes the current x0 estimate every N
-      steps with `BuildTinyVaeDecoderFromSafeTensors` to a PPM/PNG at a few ms per
-      image, instead of waiting for the full VAE; a `--fast-vae` final decode for
-      drafts. PixArt-alpha uses the SD VAE latent space, so `taesd` (4-ch,
-      scaling_factor 1.0) takes the sampled latent directly. examples/QwenImage
+- [X] TAESD per-step previews and draft decode in examples/LatentTextToImage:
+      `--tiny-vae DIR`, `--preview N` (x0 estimate via the public
+      `TNNetDiffusionScheduler.PredictX0`, all four samplers, one PPM per preview)
+      and `--fast-vae` (tiny final decode, full VAE not loaded). Smoke-checked on
+      the pico `tiny_taesd4_decoder` fixture. Not covered: a real `taesd` run.
+- [ ] TAESD previews for examples/QwenImage: examples/QwenImage
       has NO matching tiny decoder: Qwen-Image-2.1's VAE is z_dim 64 at 16x
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
       `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
       trained for that latent space (or a cheap latent->RGB linear projection).
-      README section in each example touched.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1

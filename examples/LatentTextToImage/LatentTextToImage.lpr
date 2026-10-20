@@ -57,6 +57,12 @@ Optional trailing flags:
                  pico fixtures here are NOT LCM-distilled, so this is a wiring
                  SMOKE -- it proves the few-step loop runs, not that 4 LCM steps
                  match the teacher.)
+  --tiny-vae DIR TAESD folder (diffusion_pytorch_model.safetensors + config.json,
+                 e.g. madebyollin/taesd); defaults to the pico TAESD fixture
+                 when no checkpoints are passed
+  --preview N    every N steps, decode the current x0 estimate with the tiny
+                 decoder into latent_text_to_image_preview_NNN.ppm
+  --fast-vae     final decode with the tiny decoder instead of the full VAE
   --smoke        run, assert finiteness, print OK/FAIL and exit (no PPM)
 
 OUTPUT
@@ -85,8 +91,11 @@ const
   cFixturePixArtCfg = '../../tests/fixtures/tiny_pixart_config.json';
   cFixtureVaeST     = '../../tests/fixtures/tiny_vae_decoder_ltt.safetensors';
   cFixtureVaeCfg    = '../../tests/fixtures/tiny_vae_decoder_ltt_config.json';
+  cFixtureTinyVaeST  = '../../tests/fixtures/tiny_taesd4_decoder.safetensors';
+  cFixtureTinyVaeCfg = '../../tests/fixtures/tiny_taesd4_decoder_config.json';
   cTextSeqLen       = 5;
   cOutFile          = 'latent_text_to_image.ppm';
+  cPreviewPrefix    = 'latent_text_to_image_preview_';
 
 // Map a roughly-[-1,1] value to a byte (clamped). The pico fixtures are random
 // so the dynamic range is arbitrary; this is just a viewable mapping.
@@ -142,26 +151,6 @@ begin
   end;
 end;
 
-// Single-pass denoiser wrapper for the LCM few-step driver. TNNetLCMScheduler.
-// LCMSample wants a method-of-object callback (Xt,Output,Tt) that returns the
-// raw model output for ONE forward pass -- guidance is baked into a distilled
-// consistency model, so the LCM branch uses ONLY the conditional (prompt) pass,
-// no cond/uncond CFG. This object just closes over the net/config/prompt states.
-type
-  TLCMDenoiser = class
-  public
-    Net: TNNet;
-    Cfg: TPixArtConfig;
-    Prompt: TNNetVolume;
-    procedure Denoise(Xt, Output: TNNetVolume; Tt: integer);
-  end;
-
-procedure TLCMDenoiser.Denoise(Xt, Output: TNNetVolume; Tt: integer);
-begin
-  // ONE conditional model pass -- no classifier-free guidance in the LCM path.
-  PixArtDenoise(Net, Cfg, Xt, Tt, Prompt, Output);
-end;
-
 function AllFinite(V: TNNetVolume): boolean;
 var i: integer;
 begin
@@ -175,19 +164,99 @@ begin
     end;
 end;
 
+type
+  TTinyVaePreview = class
+  public
+    Scheduler: TNNetDiffusionScheduler;
+    Net: TNNet;
+    Every: integer;
+    WriteFiles, AllFiniteSoFar: boolean;
+    X0: TNNetVolume;
+    constructor Create;
+    destructor Destroy; override;
+    // When StepNo is a multiple of Every, decodes the x0 estimate of (Xt, RawPred,
+    // Tt) with the tiny decoder Net into a preview PPM.
+    procedure MaybeEmit(Xt, RawPred: TNNetVolume; Tt, StepNo: integer);
+  end;
+
+constructor TTinyVaePreview.Create;
+begin
+  inherited Create;
+  X0 := TNNetVolume.Create;
+  AllFiniteSoFar := true;
+end;
+
+destructor TTinyVaePreview.Destroy;
+begin
+  X0.Free;
+  inherited Destroy;
+end;
+
+procedure TTinyVaePreview.MaybeEmit(Xt, RawPred: TNNetVolume; Tt, StepNo: integer);
 var
-  PixArtNet, VaeNet: TNNet;
+  PreviewImg: TNNetVolume;
+  PreviewFile: string;
+  IsFinite: boolean;
+begin
+  if (Net = nil) or (Every <= 0) or (StepNo mod Every <> 0) then Exit;
+  Scheduler.PredictX0(Xt, RawPred, X0, Tt);
+  Net.Compute(X0);
+  Net.GetLastLayer().ForceOutputOnRAM();
+  PreviewImg := Net.GetLastLayer().Output;
+  IsFinite := AllFinite(X0) and AllFinite(PreviewImg);
+  AllFiniteSoFar := AllFiniteSoFar and IsFinite;
+  if WriteFiles then
+  begin
+    PreviewFile := Format('%s%.3d.ppm', [cPreviewPrefix, StepNo]);
+    WriteColorPPM(PreviewImg, PreviewFile);
+    WriteLn('    preview step ', StepNo, ' -> ', PreviewFile);
+  end
+  else
+    WriteLn('    preview step ', StepNo, ' ', PreviewImg.SizeX, 'x',
+      PreviewImg.SizeY, '  finite=', BoolToStr(IsFinite, true));
+end;
+
+// Single-pass denoiser wrapper for the LCM few-step driver. TNNetLCMScheduler.
+// LCMSample wants a method-of-object callback (Xt,Output,Tt) that returns the
+// raw model output for ONE forward pass -- guidance is baked into a distilled
+// consistency model, so the LCM branch uses ONLY the conditional (prompt) pass,
+// no cond/uncond CFG. This object just closes over the net/config/prompt states.
+type
+  TLCMDenoiser = class
+  public
+    Net: TNNet;
+    Cfg: TPixArtConfig;
+    Prompt: TNNetVolume;
+    Preview: TTinyVaePreview;
+    StepNo: integer;
+    procedure Denoise(Xt, Output: TNNetVolume; Tt: integer);
+  end;
+
+procedure TLCMDenoiser.Denoise(Xt, Output: TNNetVolume; Tt: integer);
+begin
+  // ONE conditional model pass -- no classifier-free guidance in the LCM path.
+  PixArtDenoise(Net, Cfg, Xt, Tt, Prompt, Output);
+  Inc(StepNo);
+  Preview.MaybeEmit(Xt, Output, Tt, StepNo);
+end;
+
+var
+  PixArtNet, VaeNet, TinyVaeNet: TNNet;
   PixCfg: TPixArtConfig;
   VaeCfg: TVaeDecoderConfig;
+  TinyCfg: TTinyVaeDecoderConfig;
+  Preview: TTinyVaePreview;
   Scheduler: TNNetDiffusionScheduler;
   LCMScheduler: TNNetLCMScheduler;
   LCMDenoiser: TLCMDenoiser;
   Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
-  PixST, PixCfgPath, VaeST, VaeCfgPath: string;
+  PixST, PixCfgPath, VaeST, VaeCfgPath, TinyVaeDir, TinyST, TinyCfgPath: string;
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i: integer;
   Guidance: TNeuralFloat;
-  SmokeMode, UseLCM, LatentOk, ImageOk, UseTiling: boolean;
+  SmokeMode, UseLCM, LatentOk, ImageOk, UseTiling, UseFastVae: boolean;
+  UsingFixtures: boolean;
+  PreviewEvery: integer;
   TileLatent: integer;
   Arg: string;
 begin
@@ -200,6 +269,10 @@ begin
   SmokeMode := false;
   UseLCM := false;
   UseTiling := false;
+  UseFastVae := false;
+  PreviewEvery := 0;
+  TinyVaeDir := '';
+  UsingFixtures := true;
   // Positional checkpoint args (the first two non-flag args).
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
@@ -207,6 +280,7 @@ begin
     PixST := ParamStr(1);
     PixCfgPath := ExtractFilePath(PixST) + 'config.json';
     i := 2;
+    UsingFixtures := false;
     if (ParamCount >= 2) and (Copy(ParamStr(2), 1, 2) <> '--') then
     begin
       VaeST := ParamStr(2);
@@ -227,16 +301,59 @@ begin
     else if Arg = '--unipc' then Method := smUniPC
     else if Arg = '--lcm' then UseLCM := true
     else if Arg = '--vae-tiling' then UseTiling := true
+    else if Arg = '--tiny-vae' then begin Inc(i); TinyVaeDir := ParamStr(i); end
+    else if Arg = '--preview' then begin Inc(i); PreviewEvery := StrToIntDef(ParamStr(i), PreviewEvery); end
+    else if Arg = '--fast-vae' then UseFastVae := true
     else if Arg = '--smoke' then SmokeMode := true
     else WriteLn('Ignoring unknown argument: ', Arg);
     Inc(i);
   end;
 
+  if TinyVaeDir <> '' then
+  begin
+    TinyST := IncludeTrailingPathDelimiter(TinyVaeDir) +
+      'diffusion_pytorch_model.safetensors';
+    TinyCfgPath := IncludeTrailingPathDelimiter(TinyVaeDir) + 'config.json';
+  end
+  else if UsingFixtures then
+  begin
+    TinyST := cFixtureTinyVaeST;
+    TinyCfgPath := cFixtureTinyVaeCfg;
+  end
+  else if (PreviewEvery > 0) or UseFastVae then
+  begin
+    WriteLn('--preview / --fast-vae need --tiny-vae DIR with real checkpoints.');
+    Halt(2);
+  end;
+  if UseFastVae and UseTiling then
+  begin
+    WriteLn('--fast-vae decodes with the tiny decoder; ignoring --vae-tiling.');
+    UseTiling := false;
+  end;
+
   RandSeed := 424242;
   PixArtNet := BuildPixArtFromSafeTensors(PixST, cTextSeqLen, PixCfg,
     {pTrainable=}false, PixCfgPath);
-  VaeNet := BuildVaeDecoderFromSafeTensors(VaeST, VaeCfg,
-    {pTrainable=}false, VaeCfgPath);
+  VaeNet := nil;
+  if not UseFastVae then
+    VaeNet := BuildVaeDecoderFromSafeTensors(VaeST, VaeCfg,
+      {pTrainable=}false, VaeCfgPath);
+  // One tiny decoder, sized to the sampled latent grid (TAESD configs carry no size).
+  TinyVaeNet := nil;
+  if (PreviewEvery > 0) or UseFastVae then
+  begin
+    TinyCfg := ReadTinyVaeDecoderConfigFromJSONFile(TinyCfgPath);
+    if TinyCfg.LatentChannels <> PixCfg.InChannels then
+      raise Exception.Create('PixArt in_channels must equal the tiny VAE latent_channels.');
+    TinyCfg.LatentWidth := PixCfg.SampleSize;
+    TinyCfg.LatentHeight := PixCfg.SampleSize;
+    TinyVaeNet := BuildTinyVaeDecoderFromSafeTensorsEx(TinyST, TinyCfg,
+      {pTrainable=}false);
+  end;
+  Preview := TTinyVaePreview.Create;
+  Preview.Net := TinyVaeNet;
+  Preview.Every := PreviewEvery;
+  Preview.WriteFiles := not SmokeMode;
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
   LCMScheduler := TNNetLCMScheduler.Create(100, dsLinear, dpEps);
   LCMDenoiser := TLCMDenoiser.Create;
@@ -249,12 +366,21 @@ begin
   Image := TNNetVolume.Create;
   try
     WriteLn(PixArtConfigToString(PixCfg));
-    WriteLn('VAE decoder: latent grid ', VaeCfg.LatentGrid, ', latent ch ',
-      VaeCfg.LatentChannels, ', out ch ', VaeCfg.OutChannels);
-    if PixCfg.InChannels <> VaeCfg.LatentChannels then
-      raise Exception.Create('PixArt in_channels must equal VAE latent_channels.');
-    if PixCfg.SampleSize <> VaeCfg.LatentGrid then
-      raise Exception.Create('PixArt sample_size must equal VAE latent grid.');
+    if Assigned(VaeNet) then
+    begin
+      WriteLn('VAE decoder: latent grid ', VaeCfg.LatentGrid, ', latent ch ',
+        VaeCfg.LatentChannels, ', out ch ', VaeCfg.OutChannels);
+      if PixCfg.InChannels <> VaeCfg.LatentChannels then
+        raise Exception.Create('PixArt in_channels must equal VAE latent_channels.');
+      if PixCfg.SampleSize <> VaeCfg.LatentGrid then
+        raise Exception.Create('PixArt sample_size must equal VAE latent grid.');
+    end;
+    if Assigned(TinyVaeNet) then
+      WriteLn('Tiny VAE decoder (', TinyST, '): latent ', TinyCfg.LatentWidth,
+        'x', TinyCfg.LatentHeight, 'x', TinyCfg.LatentChannels, ' -> image ',
+        TinyVaeNet.GetLastLayer().Output.SizeX, 'x',
+        TinyVaeNet.GetLastLayer().Output.SizeY, '; preview every ', PreviewEvery,
+        ', fast final decode ', BoolToStr(UseFastVae, true));
     if UseLCM then
       WriteLn('Sampler: LCM (Latent Consistency Model, single pass/step, ',
         'guidance baked in), steps ', NumSteps)
@@ -295,6 +421,8 @@ begin
       LCMDenoiser.Net := PixArtNet;
       LCMDenoiser.Cfg := PixCfg;
       LCMDenoiser.Prompt := TextStates;
+      LCMDenoiser.Preview := Preview;
+      Preview.Scheduler := LCMScheduler;
       LCMScheduler.LCMSample(Latent, @LCMDenoiser.Denoise, NumSteps, tsUniform);
       WriteLn('  LCM done in ', NumSteps, ' step(s)  |latent|=',
         Latent.GetMagnitude():0:4);
@@ -302,6 +430,7 @@ begin
     else
     begin
       Scheduler.ResetMultistep;
+      Preview.Scheduler := Scheduler;
       for StepCnt := 0 to NumSteps - 1 do
       begin
         T := Scheduler.NumTimesteps -
@@ -316,6 +445,7 @@ begin
         // high CFG by pulling the result's std back toward the conditional's.
         TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided,
           Guidance, 0.7);
+        Preview.MaybeEmit(Latent, EpsGuided, T, StepCnt + 1);
         Scheduler.Step(Latent, EpsGuided, T, TPrev, Method, 0.0);
         WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
           '  |latent|=', Latent.GetMagnitude():0:4);
@@ -327,7 +457,14 @@ begin
       Latent.Depth, '  finite=', BoolToStr(LatentOk, true));
 
     // Step 2: decode the latent to RGB (the /0.18215 scaling is inside the net).
-    if UseTiling then
+    if UseFastVae then
+    begin
+      TinyVaeNet.Compute(Latent);
+      TinyVaeNet.GetLastLayer().ForceOutputOnRAM();
+      Image.Copy(TinyVaeNet.GetLastLayer().Output);
+      WriteLn('Fast VAE: final decode with the tiny decoder.');
+    end
+    else if UseTiling then
     begin
       // diffusers enable_vae_tiling: decode the latent in OVERLAPPING tiles and
       // feather-blend the seams, bounding peak memory to a single tile. The
@@ -357,7 +494,9 @@ begin
 
     if SmokeMode then
     begin
-      if LatentOk and ImageOk then
+      if Assigned(TinyVaeNet) then
+        WriteLn('Previews finite=', BoolToStr(Preview.AllFiniteSoFar, true));
+      if LatentOk and ImageOk and Preview.AllFiniteSoFar then
       begin
         WriteLn('SMOKE OK');
         ExitCode := 0;
@@ -383,6 +522,8 @@ begin
     TextStates.Free;
     Latent.Free;
     LCMDenoiser.Free;
+    Preview.Free;
+    TinyVaeNet.Free;
     LCMScheduler.Free;
     Scheduler.Free;
     VaeNet.Free;

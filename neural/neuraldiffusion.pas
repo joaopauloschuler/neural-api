@@ -174,12 +174,10 @@ type
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
-    // Convert a raw model prediction at Tt into the predicted clean image x0:
-    //   x0 = (x_t - sqrt(1-ab_t)*eps)/sqrt(ab_t),  eps = ToEps(raw).
-    // The subclasses (LCM) reuse this to share one parameterization with the
-    // iterative samplers (eps/v plumbing). X0Out may alias RawPred.
-    procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
   public
+    // x0 = (x_t - sqrt(1-ab_t)*eps)/sqrt(ab_t), eps = ToEps(raw); used by LCM and
+    // by sampler previews. X0Out may alias RawPred, never Xt.
+    procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
     // T = number of diffusion steps. Beta1/BetaT used by linear & scaled-linear;
     // CosineS is the small offset of the cosine schedule (default 0.008).
     constructor Create(pT: integer; pSchedule: TNNetBetaSchedule = dsLinear;
