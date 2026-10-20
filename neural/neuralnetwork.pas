@@ -10579,9 +10579,9 @@ type
   // conv) and output frame ot:
   //   y[ox,oy, ot*NumFeatures + f] = bias[f]
   //     + sum_{kt=0..T-1} sum_{ky,kx} sum_{c} W[f][kx,ky, kt*C+c]
-  //                                          * x[ix, iy, (ot+kt)*C + c]
-  // Time is a VALID (no-pad) convolution -- output frame count
-  // OutputSizeT = InT - FeatureSizeT + 1 -- so the output Depth is
+  //                                          * x[ix, iy, (ot*StrideT+kt)*C + c]
+  // Time is a VALID (no-pad) convolution with temporal stride StrideT --
+  // OutputSizeT = (InT - FeatureSizeT) div StrideT + 1 -- so the output Depth is
   // OutputSizeT * NumFeatures, frames packed the same way. Spatial uses the
   // standard padded/strided convolution geometry; padded positions contribute
   // zero. Setting FeatureSizeXY = 1 yields a purely TEMPORAL (Conv1D-over-time)
@@ -10591,7 +10591,8 @@ type
   // bias, so weights/bias serialize automatically via the base neuron
   // save/load. FStruct round-trips the geometry: [0]=NumFeatures,
   // [1]=FeatureSizeXY, [2]=Padding, [3]=Stride, [4]=SuppressBias,
-  // [5]=FeatureSizeT, [6]=InChannelsPerFrame (C). Linear (Identity) activation.
+  // [5]=FeatureSizeT, [6]=InChannelsPerFrame (C), [7]=StrideT (0 in nets saved
+  // before StrideT existed, read as 1). Linear (Identity) activation.
   // Coded by Claude (AI).
   TNNetConvolution3D = class(TNNetLayer)
     private
@@ -10599,9 +10600,10 @@ type
       FFeatureSizeXY: integer;  // spatial (square) kernel extent
       FPadding: integer;        // spatial zero-padding
       FStride: integer;         // spatial stride
+      FStrideT: integer;        // temporal stride (frames)
       FChannels: integer;       // C: channels per frame (input Depth = InT*C)
       FInputT: integer;         // input frame count
-      FOutputT: integer;        // output frame count = InputT-FeatureSizeT+1
+      FOutputT: integer;        // output frame count
       FInputW, FInputH: integer;
       {$IFDEF OpenCL}
       FWeightsCL, FBiasCL: TNNetVolume; // implicit-conv A operand and bias
@@ -10611,11 +10613,11 @@ type
     public
       constructor Create(pNumFeatures, pFeatureSizeT, pFeatureSizeXY,
         pInputPadding, pStride, pInputChannels: integer;
-        pSuppressBias: integer = 0); reintroduce; overload;
+        pSuppressBias: integer = 0; pStrideT: integer = 1); reintroduce; overload;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
-      // Inference forward is cai_conv_implicit with the output frame folded
-      // into the column: frame ot reads depth window [ot*C, ot*C+FeatureSizeT*C).
+      // Inference forward is cai_conv_implicit with the output frame folded into
+      // the column: frame ot reads depth window [ot*StrideT*C, +FeatureSizeT*C).
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
@@ -10625,6 +10627,7 @@ type
       procedure InitDefault(); override;
       property FeatureSizeT: integer read FFeatureSizeT;
       property FeatureSizeXY: integer read FFeatureSizeXY;
+      property StrideT: integer read FStrideT;
       property Channels: integer read FChannels;
       property OutputT: integer read FOutputT;
   end;
@@ -66657,10 +66660,11 @@ end;
 { TNNetConvolution3D }
 constructor TNNetConvolution3D.Create(pNumFeatures, pFeatureSizeT,
   pFeatureSizeXY, pInputPadding, pStride, pInputChannels: integer;
-  pSuppressBias: integer = 0);
+  pSuppressBias: integer = 0; pStrideT: integer = 1);
 begin
   inherited Create();
   FFeatureSizeT := Max(pFeatureSizeT, 1);
+  FStrideT := Max(pStrideT, 1);
   FFeatureSizeXY := Max(pFeatureSizeXY, 1);
   FPadding := Max(pInputPadding, 0);
   FStride := Max(pStride, 1);
@@ -66674,6 +66678,7 @@ begin
   FStruct[4] := FSuppressBias;
   FStruct[5] := FFeatureSizeT;
   FStruct[6] := FChannels;
+  FStruct[7] := FStrideT;
 end;
 
 destructor TNNetConvolution3D.Destroy();
@@ -66729,7 +66734,7 @@ begin
     {PaddingX}FPadding, {PaddingY}FPadding, {DilationX}1, csActNone,
     {NewVAs}WUpdated, BiasVol, {NewVBias}WUpdated,
     {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer, {OutFrames}FOutputT,
-    {FrameStep}FChannels, WindowDepth);
+    {FrameStep}FStrideT * FChannels, WindowDepth);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
 end;
@@ -66756,8 +66761,8 @@ begin
   OutH := (FInputH + 2*FPadding - FFeatureSizeXY) div FStride + 1;
   if (OutW < 1) or (OutH < 1) then
     FErrorProc('TNNetConvolution3D produced empty spatial output.');
-  // Temporal: VALID conv (no temporal padding).
-  FOutputT := FInputT - FFeatureSizeT + 1;
+  // Temporal: VALID strided conv (no temporal padding).
+  FOutputT := (FInputT - FFeatureSizeT) div FStrideT + 1;
   FOutput.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
   SetOutputErrorSize(OutW, OutH, FOutputT * FNeurons.Count);
   // Each feature reads a (FeatureSizeXY, FeatureSizeXY, FeatureSizeT*C) window.
@@ -66782,6 +66787,7 @@ var
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
   MaxFeat, MaxOT, MaxFST, MaxFXY: integer;
   inDepthBase, wDepthBase, inFrameBase, outDepth, iyBase, ixBase: integer;
+  FrameStep: integer;
   sum, BiasInit: TNeuralFloat;
   localNeuron: TNNetNeuron;
   W: TNNetVolume;
@@ -66806,6 +66812,7 @@ begin
   MaxOT := FOutputT - 1;
   MaxFST := FFeatureSizeT - 1;
   MaxFXY := FFeatureSizeXY - 1;
+  FrameStep := FStrideT * FChannels;
   MaxOutputY := FOutput.SizeY - 1;
   MaxOutputX := FOutput.SizeX - 1;
   for f := 0 to MaxFeat do
@@ -66818,7 +66825,7 @@ begin
     for ot := 0 to MaxOT do
     begin
       outDepth := ot * NumFeat + f;
-      inFrameBase := ot * FChannels;              // input frame ot, tap kt=0
+      inFrameBase := ot * FrameStep;              // input frame ot*StrideT, tap kt=0
       for oy := 0 to MaxOutputY do
       begin
         iyBase := oy * FStride - FPadding;
@@ -66864,6 +66871,7 @@ var
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
   MaxFeat, MaxOT, MaxFST, MaxFXY: integer;
   inDepthBase, wDepthBase, inFrameBase, outDepth, iyBase, ixBase: integer;
+  FrameStep: integer;
   gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
   W, GW: TNNetVolume;
@@ -66879,14 +66887,15 @@ begin
   MaxOT := FOutputT - 1;
   MaxFST := FFeatureSizeT - 1;
   MaxFXY := FFeatureSizeXY - 1;
+  FrameStep := FStrideT * FChannels;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = Prev.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
   // Standard conv backward (over the contiguous C axis with AVX MulAdd):
-  //   dL/dW[f][kx,ky,kt*C+c] += OutErr[ox,oy,ot] * x[ix,iy,(ot+kt)*C+c]
-  //   dL/dx[ix,iy,(ot+kt)*C+c] += OutErr[ox,oy,ot] * W[f][kx,ky,kt*C+c]
+  //   dL/dW[f][kx,ky,kt*C+c] += OutErr[ox,oy,ot] * x[ix,iy,(ot*StrideT+kt)*C+c]
+  //   dL/dx[ix,iy,(ot*StrideT+kt)*C+c] += OutErr[ox,oy,ot] * W[f][kx,ky,kt*C+c]
   //   dL/dbias[f] += OutErr[ox,oy,ot]
   // -FLearningRate convention on the accumulated weight/bias deltas.
   negLR := -FLearningRate;                        // #5
@@ -66900,7 +66909,7 @@ begin
     for ot := 0 to MaxOT do
     begin
       outDepth := ot * NumFeat + f;
-      inFrameBase := ot * FChannels;              // input frame ot, tap kt=0
+      inFrameBase := ot * FrameStep;              // input frame ot*StrideT, tap kt=0
       for oy := 0 to MaxOutputY do
       begin
         iyBase := oy * FStride - FPadding;
@@ -134860,7 +134869,7 @@ begin
       'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
       'TNNetTDNNConv1D' :           Result := TNNetTDNNConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
       'TNNetDepthwiseConv1D' :      Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]);
-      'TNNetConvolution3D' :        Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4]);
+      'TNNetConvolution3D' :        Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4], Max(St[7], 1));
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
@@ -135307,7 +135316,7 @@ begin
       if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
       if S[0] = 'TNNetTDNNConv1D' then Result := TNNetTDNNConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
       if S[0] = 'TNNetDepthwiseConv1D' then Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]) else
-      if S[0] = 'TNNetConvolution3D' then Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4]) else
+      if S[0] = 'TNNetConvolution3D' then Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4], Max(St[7], 1)) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else

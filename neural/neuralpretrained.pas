@@ -93651,11 +93651,10 @@ var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   TubeletConv, PosEmb, FcNorm, Classifier: TNNetLayer;
-  TubeletSlices: array of TNNetLayer;
   Blocks: TClipBlockLayersArray;
   Tower: TClipTowerConfig;
   HGrid, WGrid, TGrid, NumTokens, BlockCnt: integer;
-  TGridM1, NumLayersM1: integer;
+  NumLayersM1: integer;
   Prefix, BP: string;
   d: integer;
 begin
@@ -93668,7 +93667,6 @@ begin
       TGrid := Config.NumFrames div Config.TubeletSize;
       NumTokens := TGrid * HGrid * WGrid;
       d := Config.HiddenSize;
-      TGridM1 := TGrid - 1;
       NumLayersM1 := Config.NumLayers - 1;
       Prefix := 'videomae.';
 
@@ -93685,32 +93683,12 @@ begin
       // Clip volume: (W, H, T*C), frame t's C channels at depth [t*C..t*C+C).
       NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
         Config.NumFrames * Config.NumChannels) );
-      // Tubelet 3-D conv: spatial kernel = stride = patch (no pad), temporal
-      // kernel = tubelet. The Conv3D has no temporal STRIDE - it emits every
-      // overlapping output frame OutT = T - tubelet + 1, output volume
-      // (W', H', OutT*hidden) with frame ot's hidden channels at depth
-      // [ot*hidden .. ot*hidden+hidden). VideoMAE's tubelets are
-      // NON-overlapping (temporal stride = tubelet), so we select only the
-      // T' = T/tubelet frames {0, tubelet, 2*tubelet, ...}: frame k's depth
-      // slab is [k*tubelet*hidden .. +hidden). T' depth-slices concatenated
-      // give the (W', H', T'*hidden) tubelet grid (last slice ot = T-tubelet
-      // = OutT-1 exists exactly).
+      // Tubelet 3-D conv: spatial and temporal kernel = stride (non-overlapping
+      // tubelets, no pad) -> (W', H', T'*hidden), T' = T/tubelet.
       TubeletConv := NN.AddLayer( TNNetConvolution3D.Create(
         Config.HiddenSize, Config.TubeletSize, Config.PatchSize,
-        {pInputPadding=}0, {pStride=}Config.PatchSize, Config.NumChannels) );
-      if TGrid = 1 then
-        // Single tubelet: keep the first (and only) output frame's hidden slab.
-        NN.AddLayer( TNNetSplitChannels.Create(0, Config.HiddenSize) )
-      else
-      begin
-        SetLength(TubeletSlices, TGrid);
-        for BlockCnt := 0 to TGridM1 do
-          TubeletSlices[BlockCnt] := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(
-              BlockCnt * Config.TubeletSize * Config.HiddenSize,
-              Config.HiddenSize), TubeletConv);
-        NN.AddLayer( TNNetDeepConcat.Create(TubeletSlices) );
-      end;
+        {pInputPadding=}0, {pStride=}Config.PatchSize, Config.NumChannels,
+        {pSuppressBias=}0, {pStrideT=}Config.TubeletSize) );
       // Now (W', H', T'*hidden); reshape to the token sequence
       // (W'*H'*T', 1, hidden) in native (h, w, t) order (token (h*W'+w)*T'+t).
       NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.HiddenSize) );

@@ -38235,8 +38235,8 @@ end;
 // table + stock pre-LN transformer encoder + mean-pool -> fc_norm -> classifier)
 // with re-randomized O(1) weights; the reference action logits come from the
 // REAL transformers float64 forward. Asserts max |diff| < 1e-4 over the
-// num_labels logits - exercising the tubelet patchifier (Conv3D + temporal
-// tubelet selection), the fixed sin-cos position add, the joint space-time
+// num_labels logits - exercising the tubelet patchifier (Conv3D with temporal
+// stride = tubelet), the fixed sin-cos position add, the joint space-time
 // encoder, and the mean-pool classification head.
 procedure TTestNeuralPretrained.TestVideoMAEClassificationParity;
 var

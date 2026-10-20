@@ -1360,6 +1360,9 @@ type
     procedure TestConvolution3DInputGradientCheck;
     procedure TestConvolution3DWeightGradientCheck;
     procedure TestConvolution3DSerializationRoundTrip;
+    procedure TestConvolution3DTemporalStrideForward;
+    procedure TestConvolution3DTemporalStrideGradientCheck;
+    procedure TestConvolution3DTemporalStrideSerialization;
     procedure TestDepthwiseConv1DInputGradientCheck;
     procedure TestDepthwiseConv1DWeightGradientCheck;
     procedure TestDepthwiseConv1DSerializationRoundTrip;
@@ -48579,6 +48582,230 @@ begin
   end;
 end;
 
+// A temporal stride s equals the stride-1 conv with every s-th output frame
+// kept: same taps in the same order, so the match is exact.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalStrideForward;
+const
+  // W, H, C, InT, NumFeat, KT, KXY, Padding, Stride, StrideT
+  csCases: array[0..2, 0..9] of integer = ((5, 4, 2, 7, 3, 2, 3, 1, 1, 2),
+    (6, 6, 3, 8, 4, 3, 3, 1, 2, 3), (4, 4, 2, 6, 2, 2, 2, 0, 2, 2));
+var
+  NNRef, NNStrided: TNNet;
+  Input: TNNetVolume;
+  RefConv, StridedConv: TNNetConvolution3D;
+  CasePos, Pos, MaxPos, OutT, NumFeat, StrideT: integer;
+  ot, f, x, y, MaxOutputTPos, MaxFeatPos, MaxOutputX, MaxOutputY: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  for CasePos := 0 to High(csCases) do
+  begin
+    RandSeed := 31337 + CasePos;
+    NumFeat := csCases[CasePos, 4];
+    StrideT := csCases[CasePos, 9];
+    NNRef := TNNet.Create();
+    NNStrided := TNNet.Create();
+    Input := TNNetVolume.Create(csCases[CasePos, 0], csCases[CasePos, 1],
+      csCases[CasePos, 2] * csCases[CasePos, 3]);
+    try
+      NNRef.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      RefConv := TNNetConvolution3D.Create(NumFeat, csCases[CasePos, 5],
+        csCases[CasePos, 6], csCases[CasePos, 7], csCases[CasePos, 8],
+        csCases[CasePos, 2]);
+      NNRef.AddLayer(RefConv);
+      NNStrided.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      StridedConv := TNNetConvolution3D.Create(NumFeat, csCases[CasePos, 5],
+        csCases[CasePos, 6], csCases[CasePos, 7], csCases[CasePos, 8],
+        csCases[CasePos, 2], {pSuppressBias=}0, StrideT);
+      NNStrided.AddLayer(StridedConv);
+      for Pos := 0 to NumFeat - 1 do
+        RefConv.Neurons[Pos].BiasWeight := 0.1 * Pos - 0.2;
+      NNStrided.CopyWeights(NNRef);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.53) + 0.3 * Cos(Pos * 1.7);
+      NNRef.Compute(Input);
+      NNStrided.Compute(Input);
+      OutT := (csCases[CasePos, 3] - csCases[CasePos, 5]) div StrideT + 1;
+      AssertEquals('strided OutputT', OutT, StridedConv.OutputT);
+      AssertEquals('strided output depth', OutT * NumFeat,
+        StridedConv.Output.Depth);
+      AssertEquals('StrideT property', StrideT, StridedConv.StrideT);
+      MaxDiff := 0;
+      MaxOutputTPos := OutT - 1;
+      MaxFeatPos := NumFeat - 1;
+      MaxOutputX := StridedConv.Output.SizeX - 1;
+      MaxOutputY := StridedConv.Output.SizeY - 1;
+      for ot := 0 to MaxOutputTPos do
+        for f := 0 to MaxFeatPos do
+          for y := 0 to MaxOutputY do
+            for x := 0 to MaxOutputX do
+              MaxDiff := Max(MaxDiff, Abs(
+                StridedConv.Output[x, y, ot * NumFeat + f] -
+                RefConv.Output[x, y, ot * StrideT * NumFeat + f]));
+      AssertTrue('the reference is not degenerate', RefConv.Output.GetMaxAbs() > 0);
+      AssertEquals('Convolution3D StrideT=' + IntToStr(StrideT) +
+        ' vs every StrideT-th stride-1 frame, case ' + IntToStr(CasePos),
+        0, MaxDiff, 0);
+    finally
+      Input.Free;
+      NNStrided.Free;
+      NNRef.Free;
+    end;
+  end;
+end;
+
+// Input and weight gradients of a StrideT=2 conv whose last input frame is
+// read by no output frame (its input gradient must stay 0).
+procedure TTestNeuralNumerical.TestConvolution3DTemporalStrideGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n, MaxInputPos, MaxNeuronPos, MaxWeightPos: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424243;
+  // (W,H,InT,C)=(4,4,5,2); KT=2, KXY=3, pad=1, stride=1, StrideT=2 -> OutT=2.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 5 * 2);
+  InputPlus := TNNetVolume.Create(4, 4, 5 * 2);
+  Desired := nil;
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 5 * 2, 1));
+    LConv := TNNetConvolution3D.Create(2, 2, 3, 1, 1, 2, 0, 2);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    AssertEquals('OutputT', 2, LConv.OutputT);
+    MaxInputPos := Input.Size - 1;
+    for i := 0 to MaxInputPos do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    Desired := TNNetVolume.Create(LConv.Output.SizeX, LConv.Output.SizeY,
+      LConv.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    MaxNeuronPos := LConv.Neurons.Count - 1;
+    for n := 0 to MaxNeuronPos do
+      LConv.Neurons[n].Weights.Raw[0] := LConv.Neurons[n].Weights.Raw[0] + 0.3;
+
+    for i := 0 to MaxInputPos do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('StrideT Convolution3D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+      // Depth 8..9 is input frame 4, outside every tap window.
+      if (i mod 10) >= 8 then
+        AssertEquals('unread frame has no input gradient', 0, analyticalGrad, 0);
+    end;
+
+    for n := 0 to MaxNeuronPos do
+    begin
+      MaxWeightPos := LConv.Neurons[n].Weights.Size - 1;
+      for i := 0 to MaxWeightPos do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+        AssertTrue('StrideT Convolution3D weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+// StrideT round-trips through FStruct[7]; a structure string saved before
+// StrideT existed (FStruct[7] = 0) loads as StrideT = 1.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalStrideSerialization;
+const
+  csCurrentStruct = 'TNNetConvolution3D:3;3;1;1;0;2;2;1::';
+  csLegacyStruct = 'TNNetConvolution3D:3;3;1;1;0;2;2;0::';
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  StrideT, i: integer;
+begin
+  Input := TNNetVolume.Create(5, 5, 6 * 2);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    for StrideT := 1 to 3 do
+    begin
+      RandSeed := 424242 + StrideT;
+      NN := TNNet.Create();
+      NN2 := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(5, 5, 6 * 2, 1));
+        NN.AddLayer(TNNetConvolution3D.Create(3, 2, 3, 1, 1, 2, 0, StrideT));
+        NN.Compute(Input);
+        Saved := NN.SaveToString();
+        if StrideT = 1 then
+        begin
+          AssertTrue('stride-1 structure string', Pos(csCurrentStruct, Saved) > 0);
+          Saved := StringReplace(Saved, csCurrentStruct, csLegacyStruct, []);
+        end;
+        NN2.LoadFromString(Saved);
+        AssertTrue('class identity', NN2.GetLastLayer is TNNetConvolution3D);
+        AssertEquals('StrideT after load', StrideT,
+          TNNetConvolution3D(NN2.GetLastLayer).StrideT);
+        NN2.Compute(Input);
+        AssertEquals('output size after load', NN.GetLastLayer.Output.Size,
+          NN2.GetLastLayer.Output.Size);
+        for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+          AssertEquals('StrideT=' + IntToStr(StrideT) + ' round-trip output at ' +
+            IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+            NN2.GetLastLayer.Output.Raw[i], 1e-5);
+      finally
+        NN2.Free;
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestPReLUChannelInputGradientCheck;
 var
   NN: TNNet;
@@ -72851,7 +73078,7 @@ begin
 end;
 {$ENDIF}
 
-// Input (W,H,InT*C) -> Convolution3D(OutC,KT,KXY,Pad,Stride,C,SuppressBias) ->
+// Input (W,H,InT*C) -> Convolution3D(OutC,KT,KXY,Pad,Stride,C,SuppressBias,StrideT) ->
 // Convolution3D(3, 1, 3, 1, 1, OutC) -> ReLU, with non-trivial weights and biases.
 function BuildConvolution3DParityNet(const Shape: array of integer;
   out FirstConv, SecondConv: TNNetLayer): TNNet;
@@ -72861,7 +73088,7 @@ begin
   Result := TNNet.Create();
   Result.AddLayer(TNNetInput.Create(Shape[0], Shape[1], Shape[2] * Shape[3]));
   FirstConv := Result.AddLayer(TNNetConvolution3D.Create(Shape[4], Shape[5],
-    Shape[6], Shape[7], Shape[8], Shape[2], Shape[9]));
+    Shape[6], Shape[7], Shape[8], Shape[2], Shape[9], Shape[10]));
   SecondConv := Result.AddLayer(TNNetConvolution3D.Create(3, 1, 3, 1, 1, Shape[4]));
   Result.AddLayer(TNNetReLU.Create());
   Result.SetTrainable(False, False);
@@ -72884,12 +73111,14 @@ procedure TTestNeuralNumerical.TestConvolution3DOpenCLParity;
 const
   csSentinel = -7777;
   // W, H, C, InT, OutC, FeatureSizeT, FeatureSizeXY, Padding, Stride,
-  // SuppressBias. The third is the VideoMAE tubelet shape (kernel = stride =
-  // patch) with 70 rows, so the tiled kernel runs; the fourth has one output
-  // frame, the fifth a per-frame 2-D kernel.
-  csCases: array[0..4, 0..9] of integer = ((6, 5, 3, 4, 8, 2, 3, 1, 1, 0),
-    (7, 7, 2, 5, 6, 3, 3, 0, 2, 1), (16, 16, 3, 4, 70, 2, 4, 0, 4, 0),
-    (5, 4, 4, 3, 5, 3, 1, 0, 1, 0), (6, 6, 2, 6, 4, 1, 3, 2, 1, 0));
+  // SuppressBias, StrideT. The third is the VideoMAE tubelet shape (kernel =
+  // stride = patch) with 70 rows, so the tiled kernel runs; the fourth has one
+  // output frame, the fifth a per-frame 2-D kernel; the sixth is the VideoMAE
+  // tubelet with temporal stride = tubelet, the seventh leaves frames unread.
+  csCases: array[0..6, 0..10] of integer = ((6, 5, 3, 4, 8, 2, 3, 1, 1, 0, 1),
+    (7, 7, 2, 5, 6, 3, 3, 0, 2, 1, 1), (16, 16, 3, 4, 70, 2, 4, 0, 4, 0, 1),
+    (5, 4, 4, 3, 5, 3, 1, 0, 1, 0, 1), (6, 6, 2, 6, 4, 1, 3, 2, 1, 0, 1),
+    (16, 16, 3, 4, 70, 2, 4, 0, 4, 0, 2), (7, 6, 2, 8, 6, 2, 3, 1, 1, 0, 3));
 var
   NN, NNCPU: TNNet;
   Input, Out1CPU, Out2CPU, LastCPU: TNNetVolume;

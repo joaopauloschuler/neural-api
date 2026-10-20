@@ -1996,7 +1996,7 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [ ] VideoMAE tubelet embedding computes ~tubelet x too many frames: the
+- [X] VideoMAE tubelet embedding computes ~tubelet x too many frames: the
       `TNNetConvolution3D` emits every overlapping output frame (T - tubelet + 1)
       and the builder keeps every tubelet-th one via `TNNetSplitChannels` +
       `TNNetDeepConcat`. Add a temporal stride to `TNNetConvolution3D` (host and
