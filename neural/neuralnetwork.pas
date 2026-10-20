@@ -116,6 +116,15 @@ const
   csActMulChannel    = 45; // x * c[i mod n]: TNNetChannelMul
   csActChannelAffine = 46; // x * gamma[d] + beta[d], gamma|beta packed: TNNetFiLM
   csActSubMulConstant = 47; // (x - ParamA) * ParamB: TNNetMovingStdNormalization
+  csActSwishBeta      = 48; // x * sigmoid(ParamA * x): TNNetSwishLearnable
+  csActMishAlpha      = 49; // x * tanh(softplus(ParamA * x)): TNNetMishLearnable
+  // 50..55 read one Depth-long table per neuron, packed in neuron order.
+  csActPReLUChannel   = 50;
+  csActSReLU          = 51;
+  csActAconC          = 52;
+  csActPolynomial     = 53;
+  csActAPL            = 54; // ParamA = hinge count
+  csActSpline         = 55; // ParamA = range, ParamB = 1/knot spacing, ParamC = intervals
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1527,12 +1536,14 @@ type
       // place of an upload and leave its own result there. Coded by Claude (AI).
       function ShouldStayOnOpenCL(): boolean;
       {$ENDIF}
-      // One constant per channel (Depth long) for a per-channel opcode, read by
-      // cai_activation; nil (the default) for the other opcodes.
+      // Per-channel constants for a per-channel opcode (ActivationChannelTableCount
+      // packed tables), read by cai_activation; nil (the default) for the others.
       function ActivationChannelParams(): TNNetVolume; virtual;
       // True when ActivationChannelParams changed since its last upload. The
       // default answers True, so the table uploads every forward.
       function ActivationChannelParamsChanged(): boolean; virtual;
+      // How many equal-length tables ActivationChannelParams packs (default 1).
+      function ActivationChannelTableCount(): integer; virtual;
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
       // already downloaded. Descendants whose activation takes constants pass
@@ -9332,17 +9343,28 @@ type
       // beta*(p1-p2), and the current pixel row's sigmoid. Sized by the ACON
       // layers' SetPrevLayer; left empty on the other descendants.
       FAconGain, FAconBetaGain, FAconSigmoid: TNNetVolume;
+      // Every neuron's Depth-long weights packed in neuron order, for the
+      // multi-table opcodes; sized and filled in EnableOpenCL.
+      FActivationChannelPack: TNNetVolume;
       procedure SizeAconScratch();
       // Writes the shared ACON map y = d*sigmoid(beta*d) + p2*x, d = (p1-p2)*x,
       // over the whole of FOutput. beta is per-channel (fixed or data-dependent).
       procedure ComputeAconMap(Prev: TNNetVolume;
         P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr);
-      // FNeurons[0], the per-channel weights, for the channel-table opcodes
-      // (TNNetChannelBias, TNNetChannelMul); nil for any other opcode.
+      // Copies every neuron's weights into FActivationChannelPack.
+      procedure PackActivationChannelTables();
+      // True when FActivationOpcode reads per-channel tables from the neurons.
+      function HasActivationChannelTable(): boolean;
+      // The per-channel weights for the table opcodes: FNeurons[0] itself, or
+      // the pack (refilled on a weight update) when there are several neurons.
       function ActivationChannelParams(): TNNetVolume; override;
+      function ActivationChannelTableCount(): integer; override;
     public
       constructor Create(); override;
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      {$ENDIF}
   end;
 
   /// This is a base class. Do not use it directly.
@@ -26025,6 +26047,7 @@ end;
 constructor TNNetSwishLearnable.Create(pInitialBeta: TNeuralFloat);
 begin
   inherited Create();
+  FActivationOpcode := csActSwishBeta;
   FInitialBeta := pInitialBeta;
   FFloatSt[0] := pInitialBeta;
   InitDefault();
@@ -26047,7 +26070,11 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FNeurons[0].FWeights.Raw[0]) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -26189,6 +26216,7 @@ end;
 constructor TNNetMishLearnable.Create(pInitialAlpha: TNeuralFloat);
 begin
   inherited Create();
+  FActivationOpcode := csActMishAlpha;
   FInitialAlpha := pInitialAlpha;
   FFloatSt[0] := pInitialAlpha;
   InitDefault();
@@ -26211,7 +26239,11 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FNeurons[0].FWeights.Raw[0]) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -51368,6 +51400,7 @@ begin
   inherited Create();
   if pInitialBeta <= 0 then
     FErrorProc('TNNetSoftPlusBetaLearnable requires beta > 0.');
+  FActivationOpcode := csActSoftPlusBeta;
   FInitialBeta := pInitialBeta;
   FFloatSt[0] := pInitialBeta;
   InitDefault();
@@ -51390,7 +51423,14 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  beta := FNeurons[0].FWeights.Raw[0];
+  if beta <= 0 then beta := 1.0;
+  invBeta := 1.0 / beta;
+  if ComputeActivationOnOpenCL(beta, invBeta) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -51398,9 +51438,6 @@ begin
     FErrorProc('Neuron weight count must be 1 at TNNetSoftPlusBetaLearnable.');
   end;
   {$ENDIF}
-  beta := FNeurons[0].FWeights.Raw[0];
-  if beta <= 0 then beta := 1.0;
-  invBeta := 1.0 / beta;
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -62992,6 +63029,7 @@ end;
 constructor TNNetPReLU.Create(pInitialAlpha: TNeuralFloat);
 begin
   inherited Create();
+  FActivationOpcode := csActLeakyReLU;
   FInitialAlpha := pInitialAlpha;
   FFloatSt[0] := pInitialAlpha;
   InitDefault();
@@ -63015,7 +63053,11 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FNeurons[0].FWeights.Raw[0]) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -63124,6 +63166,7 @@ end;
 constructor TNNetPReLUChannel.Create();
 begin
   inherited Create();
+  FActivationOpcode := csActPReLUChannel;
   InitDefault();
 end;
 
@@ -63164,7 +63207,11 @@ var
   AlphaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W := FNeurons[0].FWeights;
@@ -63279,6 +63326,7 @@ constructor TNNetSReLU.Create(pInitialTr, pInitialAr, pInitialTl,
   pInitialAl: TNeuralFloat);
 begin
   inherited Create();
+  FActivationOpcode := csActSReLU;
   FInitialTr := pInitialTr;
   FInitialAr := pInitialAr;
   FInitialTl := pInitialTl;
@@ -63339,7 +63387,11 @@ var
   TrPtr, ArPtr, TlPtr, AlPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   Wtr := FNeurons[0].FWeights;
@@ -63510,6 +63562,7 @@ begin
   if NumHinges < 1 then
     raise Exception.Create('TNNetAPL requires NumHinges >= 1.');
   FNumHinges := NumHinges;
+  FActivationOpcode := csActAPL;
   // Persist S in the structure string so CreateLayer / LoadFromString can
   // reconstruct the layer with the right number of hinges.
   FStruct[0] := NumHinges;
@@ -63562,7 +63615,11 @@ var
   xv, acc, a_sd, b_sd: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FNumHinges) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -63720,6 +63777,7 @@ begin
     raise Exception.Create('TNNetSplineActivation requires Range > 0.');
   FNumIntervals := NumIntervals;
   FRange := Range;
+  FActivationOpcode := csActSpline;
   // Persist K and Range so CreateLayer / LoadFromString reconstruct the layer.
   FStruct[0] := NumIntervals;
   FFloatSt[0] := Range;
@@ -63790,7 +63848,11 @@ var
   xv, frac, y0, y1: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FRange, FNumIntervals / (2 * FRange), FNumIntervals) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -63913,6 +63975,7 @@ end;
 constructor TNNetAconC.Create();
 begin
   inherited Create();
+  FActivationOpcode := csActAconC;
   // Per-channel weight buffers are allocated in SetPrevLayer once Depth is
   // known.
   InitDefault();
@@ -63960,7 +64023,11 @@ var
   Depth: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
@@ -78546,6 +78613,7 @@ end;
 constructor TNNetPolynomialActivation.Create();
 begin
   inherited Create();
+  FActivationOpcode := csActPolynomial;
   // Depth-dependent weight buffers are allocated in SetPrevLayer.
   InitDefault();
 end;
@@ -78571,7 +78639,11 @@ var
   xv: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   // Do NOT call inherited Compute (which copies the input into FOutput); we
   // compute the polynomial directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -79435,6 +79507,7 @@ constructor TNNetChannelTransformBase.Create();
 begin
   inherited Create();
   FAuxDepth := TNNetVolume.Create();
+  FActivationChannelPack := TNNetVolume.Create();
   FAconGain := TNNetVolume.Create();
   FAconBetaGain := TNNetVolume.Create();
   FAconSigmoid := TNNetVolume.Create();
@@ -79447,6 +79520,7 @@ begin
   FAconSigmoid.Free;
   FAconBetaGain.Free;
   FAconGain.Free;
+  FActivationChannelPack.Free;
   FAuxDepth.Free;
   inherited Destroy();
 end;
@@ -79518,13 +79592,54 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+function TNNetChannelTransformBase.HasActivationChannelTable(): boolean;
+begin
+  // TNNetReZero and the scalar learnable activations pass constants instead.
+  case FActivationOpcode of
+    csActAddChannel, csActMulChannel, csActPReLUChannel..csActSpline:
+      Result := true;
+  else
+    Result := false;
+  end;
+end;
+
 function TNNetChannelTransformBase.ActivationChannelParams(): TNNetVolume;
 begin
-  // TNNetReZero passes its one weight as a constant, so it gets no table.
-  if (FActivationOpcode = csActAddChannel) or (FActivationOpcode = csActMulChannel)
-    then Result := FNeurons[0].FWeights
-    else Result := nil;
+  if not HasActivationChannelTable() then exit(nil);
+  if FNeurons.Count = 1 then exit(FNeurons[0].FWeights);
+  if ActivationChannelParamsChanged() then PackActivationChannelTables();
+  Result := FActivationChannelPack;
 end;
+
+function TNNetChannelTransformBase.ActivationChannelTableCount(): integer;
+begin
+  Result := FNeurons.Count;
+end;
+
+procedure TNNetChannelTransformBase.PackActivationChannelTables();
+var
+  NeuronPos, MaxNeuronPos, TableLen: integer;
+begin
+  TableLen := FNeurons[0].FWeights.Size;
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+    system.Move(FNeurons[NeuronPos].FWeights.FData[0],
+      FActivationChannelPack.FData[NeuronPos * TableLen],
+      TableLen * csNeuralFloatSize);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetChannelTransformBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  // Sized here, after the descendant's SetPrevLayer added its neurons.
+  if (FNeurons.Count > 1) and HasActivationChannelTable() then
+  begin
+    FActivationChannelPack.ReSize(FNeurons.Count * FNeurons[0].FWeights.Size, 1, 1);
+    PackActivationChannelTables();
+  end;
+end;
+{$ENDIF}
 
 procedure TNNetChannelShiftBase.InitDefault();
 begin
@@ -107378,7 +107493,7 @@ begin
   iChannels := FOutput.Depth;
   if Assigned(ChannelParams) then
   begin
-    iChannels := ChannelParams.Size;
+    iChannels := ChannelParams.Size div ActivationChannelTableCount();
     ChannelBuffer := Kern.EnsureWriteBuffer(FActivationChannelBuffer,
       FActivationChannelBufBytes, ChannelParams,
       {DoWrite=}ActivationChannelParamsChanged());
@@ -107421,6 +107536,11 @@ end;
 function TNNetIdentity.ActivationChannelParamsChanged(): boolean;
 begin
   Result := true;
+end;
+
+function TNNetIdentity.ActivationChannelTableCount(): integer;
+begin
+  Result := 1;
 end;
 
 function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;

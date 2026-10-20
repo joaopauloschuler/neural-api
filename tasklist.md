@@ -2030,21 +2030,12 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       the open FFT denormal-trap item, since the device path would move that
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
-- [ ] Extend the per-channel affine glue (commit ebf76243) to the conv-stack members:
-      `TNNetPReLUChannel` and `TNNetGRN` (ConvNeXt, RIFE, StyleGAN2, SAM).
-      `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26), and so is
-      `TNNetMovingStdNormalization`: opcode 47 SubMulConstant,
-      (x - w0) * (1/w1), the host's own reciprocal Mul, with both weights
-      passed as kernel arguments every forward so an update needs no upload
-      (`TestActivationOpenCLParity` 1.2e-7, `TestConvStackResidentOpenCLParity`).
-      PReLUChannel is one more channel-table opcode. GRN needs a per-channel
-      spatial reduction first.
-- [ ] Activations with no `cai_activation` opcode, reachable from the
-      vision and audio towers: `TNNetSwishLearnable` (`TNNetErf` now has
-      opcode 29; `TNNetReGLU` runs through `cai_glu_gate`, commit 4266dc65).
-      These are the vision and audio members of the full opcode gap; the
-      activation subsection below carries the whole list and the two cautions
-      that come with it.
+- [ ] `TNNetGRN` device forward (ConvNeXt, RIFE, StyleGAN2, SAM), the last
+      conv-stack member of the per-channel glue. It needs a per-channel
+      spatial L2 reduction (Gx[c] = ||X[:,:,c]||) and the channel mean of Gx
+      before an elementwise tail, so it is not a `cai_activation` opcode. First
+      check whether `cai_group_norm`'s per-group statistics (groups = Depth)
+      can supply the per-channel sum of squares.
 - [ ] Diffusion-step conditioning recomputed on every denoise step:
       `TNNetSinusoidalTimeEmbedding`, `TNNetLearnedPositionalEmbedding` and
       `TNNetSoftPrompt`. Individually small; they matter because a sampler runs
@@ -2078,7 +2069,7 @@ it implements exactly three opcodes — 1=ReLU, 2=Sigmoid, 3=Tanh — with the s
 three copied into `cai_dot_product_int8` and into `cai_fused_act` (the split-K
 reduce helper). `TNNetLayer.IsActivationFunctionInOpenCL` mirrors that set on
 the host and returns false for everything else. (2) The STANDALONE
-`cai_activation` kernel, which has 47 opcodes, each wired to its layer classes
+`cai_activation` kernel, which has 55 opcodes, each wired to its layer classes
 through `ComputeActivationOnOpenCL()`.
 
 Both are forward-only by construction: neither produces `FOutputRaw` or the
@@ -2108,17 +2099,22 @@ cannot pay for its own transfer.
       clamping policy there BEFORE pinning device parity. The gated
       `TNNetReGLU` is a different shape and already runs on the device through
       `TNNetGLUGateBase` / `cai_glu_gate` (commit 4266dc65).
-- [ ] The 11 per-channel LEARNABLE activations, which need a kernel shape the
-      current one does not have — a parameter VECTOR indexed by channel rather
-      than the scalar `FParamA`/`FParamB`/`FParamC`: `TNNetPReLU`,
-      `TNNetPReLUChannel`, `TNNetAPL`, `TNNetAconC`, `TNNetMetaAconC`,
-      `TNNetSReLU`, `TNNetSplineActivation`, `TNNetSwishLearnable`,
-      `TNNetMishLearnable`, `TNNetSoftPlusBetaLearnable`,
-      `TNNetPolynomialActivation`. All descend from
-      `TNNetChannelTransformBase`, so one kernel taking a `__global const
-      float*` parameter table plus an opcode covers the family; the per-channel
-      broadcast is the same indexing `cai_group_norm`'s affine tail already
-      does. Forward only — the learnable parameters' gradients stay on the host.
+- [ ] `TNNetMetaAconC`, the one per-channel learnable activation still with
+      no device forward. Its beta is sigmoid(gamma[c] * mean_c(x) + delta[c]),
+      so it needs a per-sample spatial channel mean before the elementwise
+      ACON map; the map itself is opcode 52 (`TNNetAconC`) with a third table
+      computed on the device. The other ten (PReLU, PReLUChannel, SReLU, APL,
+      AconC, Spline, Swish/Mish/SoftPlusBeta learnable, Polynomial) run on
+      opcodes 15, 40 and 48-55: the scalar ones pass their weight as a kernel
+      argument, the per-channel ones read their neurons packed into one table
+      (`TNNetChannelTransformBase.PackActivationChannelTables`).
+- [ ] Audit the older `cai_activation` cases for traps under speculation.
+      PoCL evaluated case 55's math for every opcode (a SIGFPE in
+      `TestActivationOpenCLParity` until the conversion was clamped), and FPC
+      leaves overflow/invalid/zero-divide unmasked in PoCL's worker threads.
+      Cases 35 (Mish), 36 (SoftPlus) and 40 (SoftPlusBeta) call `exp` on an
+      unclamped argument, so a speculated `exp` would overflow for |x| > 88; no
+      test feeds such inputs, so whether PoCL speculates them is unverified.
 
 
 ## Layer follow-ups that fix real limitations

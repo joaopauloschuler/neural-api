@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases for the parameterized activations
-// (9, 10, 15, 18-21, 24-28, 40, 41, 43-46) and for the standalone-only ones that
+// (9, 10, 15, 18-21, 24-28, 40, 41, 43-55) and for the standalone-only ones that
 // no GEMM fuses. Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
@@ -3141,7 +3141,8 @@ __kernel void cai_softmax
 // 24 = ReLUL, 25 = AddConstant, 26 = MulConstant, 27/28 = Snake,
 // 29..43 = the transcendental activations (Erf through ISRU),
 // 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine),
-// 47 = SubMulConstant (TNNetMovingStdNormalization).
+// 47 = SubMulConstant (TNNetMovingStdNormalization),
+// 48/49 = SwishBeta/MishAlpha, 50..55 = the per-channel learnable activations.
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3152,7 +3153,9 @@ __kernel void cai_softmax
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
 // result tracks the host to ~1e-6 (exp here is more accurate than the CPU
-// polynomial pcr_expf, not less). Coded by Claude (AI).
+// polynomial pcr_expf, not less). PoCL may evaluate a case's math for every
+// opcode, with FP traps on, so no case may overflow or convert out of range.
+// Coded by Claude (AI).
 __kernel void cai_activation
 (
   const int FSize,
@@ -3337,6 +3340,75 @@ __kernel void cai_activation
     case 47: // SubMulConstant: (x - FParamA) * FParamB, the host Sub then Mul
       y = (x - FParamA) * FParamB;
       break;
+    case 48: // SwishBeta: x * sigmoid(beta*x). FParamA = beta.
+      y = x * cai_fused_act(FParamA * x, 2);
+      break;
+    case 49: // MishAlpha: x * tanh(softplus(alpha*x)), saturated beyond +-30. FParamA = alpha.
+    {
+      const float ax = FParamA * x;
+      const float ExpAx = exp(fmin(ax, 30.0f)); // capped: never overflows if speculated
+      float sp;
+      if (ax > 30.0f) sp = ax;
+      else if (ax < -30.0f) sp = ExpAx;
+      else sp = log(1.0f + ExpAx);
+      y = x * cai_fused_act(sp, 3);
+      break;
+    }
+    // 50..55 read FChannelParam as packed per-channel tables, table k at k*FChannels.
+    case 50: // PReLUChannel: x >= 0 ? x : alpha[c]*x
+      y = (x >= 0.0f) ? x : FChannelParam[i % FChannels] * x;
+      break;
+    case 51: // SReLU, tables t_r|a_r|t_l|a_l
+    {
+      const int c = i % FChannels;
+      const float tr = FChannelParam[c];
+      const float tl = FChannelParam[2 * FChannels + c];
+      if (x >= tr) y = tr + FChannelParam[FChannels + c] * (x - tr);
+      else if (x <= tl) y = tl + FChannelParam[3 * FChannels + c] * (x - tl);
+      else y = x;
+      break;
+    }
+    case 52: // AconC, tables p1|p2|beta: d*sigmoid(beta*d) + p2*x, d = (p1-p2)*x
+    {
+      const int c = i % FChannels;
+      const float p2 = FChannelParam[FChannels + c];
+      const float gain = FChannelParam[c] - p2;
+      const float BetaGain = FChannelParam[2 * FChannels + c] * gain;
+      y = gain * x * cai_fused_act(BetaGain * x, 2) + p2 * x;
+      break;
+    }
+    case 53: // Polynomial, tables a|b|c0: (a*x + b)*x + c0
+    {
+      const int c = i % FChannels;
+      y = (FChannelParam[c] * x + FChannelParam[FChannels + c]) * x +
+        FChannelParam[2 * FChannels + c];
+      break;
+    }
+    // The float-to-int conversions below are clamped first: PoCL may evaluate
+    // them speculatively for other opcodes, where an out-of-range one traps.
+    case 54: // APL, tables a[0..S-1]|b[0..S-1]: max(0,x) + sum a*max(0, b-x). FParamA = S.
+    {
+      const int HingeCount = (int)clamp(FParamA, 0.0f, 65536.0f);
+      const int c = i % FChannels;
+      float acc = (x > 0.0f) ? x : 0.0f;
+      for (int s = 0; s < HingeCount; s++)
+      {
+        const float b = FChannelParam[(HingeCount + s) * FChannels + c];
+        if (x < b) acc += FChannelParam[s * FChannels + c] * (b - x);
+      }
+      y = acc;
+      break;
+    }
+    case 55: // Spline, tables y[0..K] at knots -R + dt*k, boundary segments extrapolate.
+    {        // FParamA = R, FParamB = 1/dt, FParamC = K.
+      const int c = i % FChannels;
+      const float SegmentPos = (x + FParamA) * FParamB;
+      const int seg = (int)clamp(SegmentPos, 0.0f, fmax(FParamC - 1.0f, 0.0f));
+      const float y0 = FChannelParam[seg * FChannels + c];
+      const float y1 = FChannelParam[(seg + 1) * FChannels + c];
+      y = y0 + (SegmentPos - (float)seg) * (y1 - y0);
+      break;
+    }
     default: // csActNone / unknown: pass through
       y = x;
   }

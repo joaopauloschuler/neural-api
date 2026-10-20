@@ -588,6 +588,12 @@ type
     // projection then binds as its B operand. Coded by Claude (AI).
     procedure TestActivationResidentChainOpenCLParity;
     procedure TestActivationOpenCLParity;
+    // The per-channel learnable activations under ForceOpenCL, with random
+    // per-channel weights, against their own host forward.
+    procedure TestLearnableActivationOpenCLParity;
+    // The same family chained resident with ForceOpenCL off: sentinels,
+    // transfer counts, and a packed-table and a scalar weight refresh.
+    procedure TestLearnableActivationResidentOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -71454,6 +71460,322 @@ begin
       Input.Free;
       NN.Free;
     end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Fills every weight of neuron NeuronPos with Center + Spread*(Random - 0.5).
+procedure SetRandomNeuronWeights(Layer: TNNetLayer; NeuronPos: integer;
+  Center, Spread: TNeuralFloat);
+var
+  WeightPos, MaxWeightPos: integer;
+begin
+  MaxWeightPos := Layer.Neurons[NeuronPos].Weights.Size - 1;
+  for WeightPos := 0 to MaxWeightPos do
+    Layer.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+      Center + Spread * (Random - 0.5);
+end;
+
+// Gives each learnable activation non-trivial per-channel weights (after
+// SetPrevLayer, whose InitDefault would reset them).
+procedure RandomizeLearnableActivation(Layer: TNNetLayer);
+var
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  MaxNeuronPos := Layer.Neurons.Count - 1;
+  if Layer is TNNetSReLU then
+  begin
+    SetRandomNeuronWeights(Layer, 0, 0.5, 1);   // t_r
+    SetRandomNeuronWeights(Layer, 1, 1, 1);     // a_r
+    SetRandomNeuronWeights(Layer, 2, -0.5, 1);  // t_l
+    SetRandomNeuronWeights(Layer, 3, 0.1, 0.4); // a_l
+  end
+  else if Layer is TNNetAconC then
+  begin
+    SetRandomNeuronWeights(Layer, 0, 1, 1);     // p1
+    SetRandomNeuronWeights(Layer, 1, 0, 1);     // p2
+    SetRandomNeuronWeights(Layer, 2, 1, 2);     // beta
+  end
+  else if Layer is TNNetPolynomialActivation then
+  begin
+    SetRandomNeuronWeights(Layer, 0, 0, 1);     // a
+    SetRandomNeuronWeights(Layer, 1, 1, 1);     // b
+    SetRandomNeuronWeights(Layer, 2, 0, 1);     // c0
+  end
+  else if Layer is TNNetAPL then
+  begin
+    // Slopes in the first half of the neurons, knees in the second.
+    for NeuronPos := 0 to MaxNeuronPos do
+      if NeuronPos < Layer.Neurons.Count div 2
+        then SetRandomNeuronWeights(Layer, NeuronPos, 0.25, 0.5)
+        else SetRandomNeuronWeights(Layer, NeuronPos, 0, 2);
+  end
+  else if Layer is TNNetSplineActivation then
+  begin
+    // The identity control points (2 intervals per unit of range) plus noise.
+    for NeuronPos := 0 to MaxNeuronPos do
+      SetRandomNeuronWeights(Layer, NeuronPos,
+        -2 + 4 * NeuronPos / MaxNeuronPos, 1);
+  end
+  else if (Layer is TNNetSoftPlusBetaLearnable) or (Layer is TNNetSwishLearnable) or
+    (Layer is TNNetMishLearnable) then
+    SetRandomNeuronWeights(Layer, 0, 1.5, 1)
+  else
+    SetRandomNeuronWeights(Layer, 0, 0.25, 1); // PReLU, PReLUChannel
+  Layer.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestLearnableActivationOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Names: array[0..9] of string = ('PReLU', 'PReLUChannel', 'SwishLearnable',
+    'MishLearnable', 'SoftPlusBetaLearnable', 'SReLU', 'AconC',
+    'PolynomialActivation', 'APL 3 hinges', 'SplineActivation K=5');
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  ActLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos, VariantCnt, ScaleCnt: integer;
+  InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
+
+  function CreateActivation(Variant: integer): TNNetLayer;
+  begin
+    case Variant of
+      0: Result := TNNetPReLU.Create();
+      1: Result := TNNetPReLUChannel.Create();
+      2: Result := TNNetSwishLearnable.Create();
+      3: Result := TNNetMishLearnable.Create();
+      4: Result := TNNetSoftPlusBetaLearnable.Create();
+      5: Result := TNNetSReLU.Create();
+      6: Result := TNNetAconC.Create();
+      7: Result := TNNetPolynomialActivation.Create();
+      8: Result := TNNetAPL.Create(3);
+      9: Result := TNNetSplineActivation.Create(5, 2.0);
+    else Result := nil;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for VariantCnt := 0 to High(Names) do
+  for ScaleCnt := 0 to 1 do
+  begin
+    RandSeed := 20261020;
+    // Scale 6 crosses every knee, hinge and spline knot and extrapolates the
+    // spline past its range.
+    if ScaleCnt = 0 then InScale := 0.6 else InScale := 6;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      ActLayer := NN.AddLayer(CreateActivation(VariantCnt));
+      NN.SetTrainable(False, False);
+      RandomizeLearnableActivation(ActLayer);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := InScale * Sin(Pos * 0.37);
+
+      NN.Compute(Input);
+      OutCPU.Copy(ActLayer.Output);
+      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+        ActLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        ActLayer.Output.Fill(0);
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+
+      MaxDiff := 0;
+      AssertEquals(Names[VariantCnt] + ' output size match',
+        OutCPU.Size, ActLayer.Output.Size);
+      for Pos := 0 to MaxPos do
+      begin
+        RefMagnitude := Abs(OutCPU.Raw[Pos]);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(OutCPU.Raw[Pos] - ActLayer.Output.Raw[Pos]) / RefMagnitude;
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', Names[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
+        ' max rel diff=', MaxDiff:0:9, ' gpu forwards=', ActLayer.ForwardGPUCnt);
+      AssertTrue(Names[VariantCnt] + ' must reach the device',
+        ActLayer.ForwardGPUCnt > 0);
+      AssertTrue(Names[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
+        FloatToStr(InScale) + '): max relative diff = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestLearnableActivationResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csDepth = 8;
+  csChainCount = 10;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  PReLUChannelLayer, PReLULayer, SoftPlusLayer, SReLULayer: TNNetLayer;
+  ChainLayers: array[0..csChainCount - 1] of TNNetLayer;
+  OutCPU: array[0..csChainCount - 1] of TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, Pos, SentinelSurvivors, SentinelCount, MaxPos, Channel: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter, TransfersRefresh: TOpenCLTransferCounts;
+  MaxDiff, LayerDiff, RefreshDiff, Alpha, X, Tr, Tl, Ref: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, csDepth);
+  Expected := TNNetVolume.Create();
+  for LayerPos := 0 to csChainCount - 1 do
+    OutCPU[LayerPos] := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, csDepth));
+    PReLUChannelLayer := NN.AddLayer(TNNetPReLUChannel.Create());
+    PReLULayer := NN.AddLayer(TNNetPReLU.Create());
+    ChainLayers[2] := NN.AddLayer(TNNetSwishLearnable.Create());
+    ChainLayers[3] := NN.AddLayer(TNNetMishLearnable.Create());
+    SoftPlusLayer := NN.AddLayer(TNNetSoftPlusBetaLearnable.Create());
+    SReLULayer := NN.AddLayer(TNNetSReLU.Create());
+    ChainLayers[6] := NN.AddLayer(TNNetAconC.Create());
+    ChainLayers[7] := NN.AddLayer(TNNetPolynomialActivation.Create());
+    ChainLayers[8] := NN.AddLayer(TNNetAPL.Create(2));
+    ChainLayers[9] := NN.AddLayer(TNNetSplineActivation.Create(4, 2.0));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.SetTrainable(False, False);
+    ChainLayers[0] := PReLUChannelLayer;
+    ChainLayers[1] := PReLULayer;
+    ChainLayers[4] := SoftPlusLayer;
+    ChainLayers[5] := SReLULayer;
+    for LayerPos := 0 to csChainCount - 1 do
+      RandomizeLearnableActivation(ChainLayers[LayerPos]);
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := 2 * Sin(Pos * 0.37);
+
+    NN.Compute(Input);
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Copy(ChainLayers[LayerPos].Output);
+    Expected.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // A download or a host forward of any chain layer would overwrite these.
+    SentinelCount := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].Output.Fill(csSentinel);
+      Inc(SentinelCount, ChainLayers[LayerPos].Output.Size);
+    end;
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+    SentinelSurvivors := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+      for Pos := 0 to ChainLayers[LayerPos].Output.Size - 1 do
+        if ChainLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+          Inc(SentinelSurvivors);
+    Write('  Learnable activation chain resident: per-layer max|diff|=');
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsDiffToOutput(OutCPU[LayerPos], ChainLayers[LayerPos].Output);
+      Write(ChainLayers[LayerPos].ClassName, '=', LayerDiff:0:9, ' ');
+      MaxDiff := Max(MaxDiff, LayerDiff);
+    end;
+    WriteLn('sentinels=', SentinelSurvivors, '/', SentinelCount, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    for LayerPos := 0 to csChainCount - 1 do
+      AssertEquals(ChainLayers[LayerPos].ClassName +
+        ' ran both forwards on OpenCL', 2, ChainLayers[LayerPos].ForwardGPUCnt);
+    AssertEquals('the chain is bound, not downloaded', SentinelCount,
+      SentinelSurvivors);
+    // The input is the only upload: the unchanged weight tables stay resident.
+    AssertEquals('uploads per forward', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('learnable activation chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // A packed-table update re-uploads one table; a scalar one travels as a
+    // kernel argument and uploads nothing.
+    RandomizeLearnableActivation(SReLULayer);
+    Alpha := 0.6;
+    PReLULayer.Neurons[0].Weights.Raw[0] := Alpha;
+    PReLULayer.FlushWeightCache();
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersRefresh := OpenCLProcessTransferTotals();
+    PReLUChannelLayer.ForceOutputOnRAM();
+    PReLULayer.ForceOutputOnRAM();
+    SoftPlusLayer.ForceOutputOnRAM();
+    SReLULayer.ForceOutputOnRAM();
+    RefreshDiff := 0;
+    for Pos := 0 to MaxPos do
+    begin
+      X := PReLUChannelLayer.Output.Raw[Pos];
+      if X > 0 then Ref := X else Ref := Alpha * X;
+      RefreshDiff := Max(RefreshDiff, Abs(PReLULayer.Output.Raw[Pos] - Ref));
+      Channel := Pos mod csDepth;
+      X := SoftPlusLayer.Output.Raw[Pos];
+      Tr := SReLULayer.Neurons[0].Weights.Raw[Channel];
+      Tl := SReLULayer.Neurons[2].Weights.Raw[Channel];
+      if X >= Tr then Ref := Tr + SReLULayer.Neurons[1].Weights.Raw[Channel] * (X - Tr)
+      else if X <= Tl then Ref := Tl + SReLULayer.Neurons[3].Weights.Raw[Channel] * (X - Tl)
+      else Ref := X;
+      RefreshDiff := Max(RefreshDiff, Abs(SReLULayer.Output.Raw[Pos] - Ref));
+    end;
+    WriteLn('  after a weight update: uploads=',
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount,
+      ' PReLU+SReLU max|diff|=', RefreshDiff:0:9);
+    AssertEquals('only the changed SReLU table is uploaded', 2,
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount);
+    AssertTrue('PReLU and SReLU read the updated weights: max |diff| = ' +
+      FloatToStr(RefreshDiff), RefreshDiff < 1e-5);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Free;
+    Expected.Free;
+    Input.Free;
+    NN.Free;
   end;
 end;
 {$ELSE}
