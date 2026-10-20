@@ -1881,7 +1881,7 @@ rather than acted on.
   "specials as plain text" flag for chat requests; live (unmerged) LoRA.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
-  - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
+  - [X] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
         `Xt.FData[i] + dt*Vel.FData[i]` with `TNNetVolume.MulAdd`. Upstream F5-TTS
         also uses sway sampling, which the scheduler does not cover.
   - [ ] `examples/FlowMatching/FlowMatching.lpr` (~296-312): optionally drive the
