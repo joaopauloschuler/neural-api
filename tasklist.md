@@ -1597,7 +1597,7 @@ rather than acted on.
         the int4 projection kernel, the host layers and the transfers apart.
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (worth it
-          after B1d2, when these writes are the only mid-block waits).
+          now that B1d2 has landed: these writes are the only mid-block waits).
     - [ ] B1d1 follow-up: Shared "bind or upload the operand" helper for
           TNNetChannelMulByLayer and TNNetCellMulByCell.
     - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
@@ -1632,8 +1632,6 @@ rather than acted on.
         31 s measured at 256x256), so it is the next bottleneck.
     - [ ] B2b follow-up: Drop the armed nets' host FConcatedWeights/FConcatedWInter
           copies (~2 GB) after the upload.
-    - [ ] B2b follow-up: One OpenCL context per pipeline (today the transformer and the
-          VAE each build the program per image).
     - [ ] B2b follow-up: Parallel scheduler + OpenCL on PoCL is 20-90x slower than
           --serial (CPU oversubscription with PoCL's threads; worker
           count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
@@ -1912,9 +1910,6 @@ rather than acted on.
   "specials as plain text" flag for chat requests; live (unmerged) LoRA.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
-  - [X] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
-        `Xt.FData[i] + dt*Vel.FData[i]` with `TNNetVolume.MulAdd`. Upstream F5-TTS
-        also uses sway sampling, which the scheduler does not cover.
   - [ ] `examples/FlowMatching/FlowMatching.lpr` (~296-312): optionally drive the
         loop with `TNNetFlowMatchEulerScheduler`. The example integrates t from 0
         (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
@@ -1945,26 +1940,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [X] Reshape/gather glue: `TNNetCrop`, `TNNetPadXY`, `TNNetTransposeXD`,
-      `TNNetDepthToSpace`, `TNNetGatherTokens`. None of them is a re-label:
-      in the `((y*SizeX + x)*Depth + d)` layout every one moves bytes, so the
-      `TNNetReshape` view does not apply. They share one kernel instead,
-      `cai_gather_copy`: the output splits into up to 6 axes, each axis
-      coordinate maps to a source offset through a small table (negative = zero),
-      and the offsets add up. `TNNetGatherCopyCL` holds the table and rebuilds
-      it on a shape change; the layer only describes it
-      (`BuildGatherCopyPlan`), and the residency plumbing (`WillOpenCL`, output
-      buffer/kernel, `DisableOpenCL`) lives once on `TNNetLayer`. Inference with
-      a resident source or ForceOpenCL; every `TNNetPadXY` mode (zero, reflect,
-      replicate, circular, trailing X) goes through `NeuralPadSourceIndex`, the
-      host's own mapping. Pinned by `TestGatherCopyOpenCLParity` (17 cases,
-      exact 0.0) and `TestGatherCopyResidentOpenCLParity` (11 glue layers,
-      1572/1572 sentinels, 1 upload + 1 download).
 - [ ] `TNNetConcat` device forward. Left open: it is multi-source (a flat
       back-to-back concatenation of every source's bytes), so it does not fit
       the single-source `cai_gather_copy`; one `clEnqueueCopyBuffer` per
       source into the output buffer is the likely shape.
-- [ ] Follow-ups of the glue item: `TNNetExpandDims` and `TNNetSqueeze` ARE
+- [ ] Follow-ups of the `cai_gather_copy` glue (commit 905c2b71):
+      `TNNetExpandDims` and `TNNetSqueeze` ARE
       true re-labels and still download their source - give them the
       `TNNetReshape` view (move that mechanism to a shared place first).
       `TNNetPad`, `TNNetGather`, `TNNetGatherChannels` and
@@ -1978,29 +1959,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       `FPlanHost` with `SetLength` lazily on the first device forward after a
       shape change. Build the plan in `EnableOpenCL` / after `SetPrevLayer`
       (and on `ReSize`) instead, so `Compute` only binds and launches.
-- [X] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward. Both
-      now descend from `TNNetGLUGateBase` and reach `cai_glu_gate` through two
-      new gate flags: 4 = ReLU(A) * B (ReGLU gates the FIRST half, unlike the
-      rest of the family) and 5 = A * ReLU(B)^2. Pinned by
-      `TestGLUGateResidentOpenCLParity` (linear-conv source, so both ReLU
-      branches are exercised): ReGLU 0.0, ReGLUSquared 1.2e-7. `TNNetTanhGLU`
-      joined the base the same way (flag 6 = A * tanh(B), the clamped
-      `cai_fused_act` tanh): 1.2e-7 relative in the same test.
-- [X] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
-      `TNNetFiLM`, `TNNetAvgChannel` (plus `TNNetCellBias` and `TNNetReZero`).
-      No new kernel: `cai_activation` gained opcodes 44 AddChannel, 45
-      MulChannel and 46 ChannelAffine. ChannelBias/ChannelMul/CellBias opt in
-      through the `TNNetIdentity` plumbing with their weights as the channel
-      table, uploaded only after `AfterWeightUpdate`/`FlushWeightCache`; ReZero
-      uses the existing MulConstant opcode. `TNNetFiLM` borrows the same kernel
-      with both sources bound (a host-only conditioning vector is uploaded).
-      `TNNetPool2DCL.Pool` binds a resident source and keeps its result, so
-      `TNNetAvgPool` and `TNNetAvgChannel` stay resident. Pinned by
-      `TestChannelAffineResidentOpenCLParity` (unforced chain, 1072/1072
-      sentinels, 1 upload + 1 download per forward, weight refresh) and
-      `TestFiLMHostCondOpenCLParity`. Not opted in: `TNNetChannelZeroCenter`
-      (its descendants post-process `FOutput` on the host after the shared
-      forward).
 - [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
       per token, but the router sits between two resident MoE banks, so running
       it on the host costs two transfers per token. Only worth landing together
@@ -2049,7 +2007,7 @@ own `Compute`, or inherits one of those without overriding `Compute`. 310 of
 the 487 classes fail that test; the ones below are the subset the vision and
 audio builders actually instantiate. Note the third case: a class that
 overrides `Compute` with no device branch silently loses its parent's kernel
-(`TNNetMaxPoolPortable` lost `TNNetMaxPool`'s that way; fixed below).
+(`TNNetMaxPoolPortable` lost `TNNetMaxPool`'s that way; fixed in commit abd639f0).
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
@@ -2063,19 +2021,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       on. The per-sample weight modulation/demodulation folds into the column
       gather, so this is a conv kernel with a scaled weight slab, not a new
       contraction.
-- [X] `TNNetMaxPoolPortable` device forward (ResNet, Inception-V3 and DETR
-      stems). Portable differs from `TNNetMaxPool` only in its output size,
-      floor((In - Pool + 2*Pad) / Stride) + 1, and in always taking the
-      clipped-window `ComputeWithStride`; `cai_pool2d` already clips windows
-      the same way. The kernel gained a padding argument (zero cells, the
-      `CopyPadding` convention), so both classes now share one
-      `TNNetMaxPool.ComputeOpenCL` that binds a resident source and keeps its
-      result resident (the bind/keep plumbing moved up from `TNNetAvgPool`).
-      The device path is inference-only for both: the backward reads the
-      argmax positions only the host forward records, which a trainable
-      `TNNetMaxPool` under `FShouldOpenCL` used to leave stale. Pinned by
-      `MaxPoolPortableOpenCLParity` (7 geometries, exact) and
-      `TestConvStackResidentOpenCLParity`.
 - [ ] Vision attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,
@@ -2090,16 +2035,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       the open FFT denormal-trap item, since the device path would move that
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
-- [X] Extend the reshape/gather glue item above to its vision members:
-      `TNNetSpaceToDepth`, `TNNetInterleaveChannels`, `TNNetMobileViTUnfold`,
-      `TNNetMobileViTFold` and `TNNetTransposeYD` take the same
-      `cai_gather_copy` path (`TNNetDepthToSpace` is in the item above). They
-      are not re-labels either: each is a permutation in this layout.
-      `TNNetInterleaveChannels` keeps the host's collision rule (a later source
-      channel wins, an unreached channel stays zero), so non-bijective steps
-      match too. `TNNetMobileViTPatchSegments` needs no device path: it reads
-      only its source's shape, never the data, so it does not evict the chain.
-- [ ] Extend the per-channel affine item above to the conv-stack members:
+- [ ] Extend the per-channel affine glue (commit ebf76243) to the conv-stack members:
       `TNNetPReLUChannel` and `TNNetGRN` (ConvNeXt, RIFE, StyleGAN2, SAM).
       `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26), and so is
       `TNNetMovingStdNormalization`: opcode 47 SubMulConstant,
@@ -2110,7 +2046,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       spatial reduction first.
 - [ ] Activations with no `cai_activation` opcode, reachable from the
       vision and audio towers: `TNNetSwishLearnable` (`TNNetErf` now has
-      opcode 29; `TNNetReGLU` is done above).
+      opcode 29; `TNNetReGLU` runs through `cai_glu_gate`, commit 4266dc65).
       These are the vision and audio members of the full opcode gap; the
       activation subsection below carries the whole list and the two cautions
       that come with it.
@@ -2147,7 +2083,7 @@ it implements exactly three opcodes — 1=ReLU, 2=Sigmoid, 3=Tanh — with the s
 three copied into `cai_dot_product_int8` and into `cai_fused_act` (the split-K
 reduce helper). `TNNetLayer.IsActivationFunctionInOpenCL` mirrors that set on
 the host and returns false for everything else. (2) The STANDALONE
-`cai_activation` kernel, which has 43 opcodes, each wired to its layer classes
+`cai_activation` kernel, which has 47 opcodes, each wired to its layer classes
 through `ComputeActivationOnOpenCL()`.
 
 Both are forward-only by construction: neither produces `FOutputRaw` or the
@@ -2175,8 +2111,8 @@ cannot pay for its own transfer.
       and `TNNetESwish` raise hardware FP exceptions at far-extreme inputs on
       the host (see the FP-exception item in the test section), so pick the
       clamping policy there BEFORE pinning device parity. The gated
-      `TNNetReGLU` is a different shape and stays with the `TNNetGLUGateBase`
-      item above.
+      `TNNetReGLU` is a different shape and already runs on the device through
+      `TNNetGLUGateBase` / `cai_glu_gate` (commit 4266dc65).
 - [ ] The 11 per-channel LEARNABLE activations, which need a kernel shape the
       current one does not have — a parameter VECTOR indexed by channel rather
       than the scalar `FParamA`/`FParamB`/`FParamC`: `TNNetPReLU`,
