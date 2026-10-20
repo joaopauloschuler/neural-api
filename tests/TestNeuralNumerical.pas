@@ -594,6 +594,9 @@ type
     // The per-channel learnable activations under ForceOpenCL, with random
     // per-channel weights, against their own host forward.
     procedure TestLearnableActivationOpenCLParity;
+    // Every cai_activation case at |x| ~ 1e3 and ~ 1e30: finite device output,
+    // equal to the host wherever the host is finite.
+    procedure TestActivationOpenCLExtremeInputs;
     // The same family chained resident with ForceOpenCL off: sentinels,
     // transfer counts, and a packed-table and a scalar weight refresh.
     procedure TestLearnableActivationResidentOpenCLParity;
@@ -71293,13 +71296,10 @@ begin
 end;
 {$ENDIF}
 
-// Every activation that carries a cai_activation opcode, checked against its own
-// CPU forward. One entry per opcode: adding an activation is a line in Names and
-// a line in CreateActivation. Coded by Claude (AI).
-procedure TTestNeuralNumerical.TestActivationOpenCLParity;
-{$IFDEF OpenCL}
+// The activations TestActivationOpenCLParity and TestActivationOpenCLExtremeInputs
+// cover, one per variant: adding one is a name here and a line in CreateParityActivation.
 const
-  Names: array[0..53] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  csActivationParityNames: array[0..53] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
@@ -71310,6 +71310,79 @@ const
     'LiSHT', 'SoftPlusBeta', 'SoftPlusBeta beta 2', 'CELU', 'CELU alpha 0.5',
     'GaussianActivation', 'ISRU', 'ISRU alpha 0.5', 'MovingStdNormalization',
     'MovingStdNormalization w1 <= 0');
+
+function CreateParityActivation(Variant: integer): TNNetLayer;
+begin
+  case Variant of
+    0: Result := TNNetReLU.Create();
+    1: Result := TNNetSigmoid.Create();
+    2: Result := TNNetHyperbolicTangent.Create();
+    3: Result := TNNetSwish.Create();
+    4: Result := TNNetSiLU.Create();
+    5: Result := TNNetGELU.Create();
+    6: Result := TNNetGELUErf.Create();
+    7: Result := TNNetHardSwish.Create();
+    8: Result := TNNetHardSigmoid.Create();
+    9: Result := TNNetELU.Create();
+    10: Result := TNNetELU.Create(0.5);
+    11: Result := TNNetSELU.Create();
+    12: Result := TNNetReLUP.Create();
+    13: Result := TNNetAbs.Create();
+    14: Result := TNNetSign.Create();
+    15: Result := TNNetSquare.Create();
+    16: Result := TNNetSquaredReLU.Create();
+    17: Result := TNNetLeakyReLU.Create();
+    18: Result := TNNetVeryLeakyReLU.Create();
+    19: Result := TNNetShiftedReLU.Create();
+    20: Result := TNNetHardTanh.Create();
+    21: Result := TNNetHardShrink.Create();
+    22: Result := TNNetSoftShrink.Create();
+    23: Result := TNNetThreshold.Create(0.5, -2);
+    24: Result := TNNetClamp.Create(-0.5, 2);
+    25: Result := TNNetSoftSign.Create();
+    26: Result := TNNetReLUL.Create(-2, 2, 0);
+    27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
+    28: Result := TNNetReLU6.Create();
+    29: Result := TNNetBentIdentity.Create();
+    30: Result := TNNetAddConstant.Create(-0.375);
+    31: Result := TNNetMulByConstant.Create(-0.75);
+    32: Result := TNNetSnake.Create(0.8);
+    33: Result := TNNetSnake.Create(1.7, true);
+    34: Result := TNNetErf.Create();
+    35: Result := TNNetExp.Create();
+    36: Result := TNNetLog.Create(); // the negative half hits the 1e-8 floor
+    37: Result := TNNetSqrt.Create(); // the negative half hits the 1e-6 floor
+    38: Result := TNNetSin.Create();
+    39: Result := TNNetCos.Create();
+    40: Result := TNNetMish.Create();
+    41: Result := TNNetSoftPlus.Create();
+    42: Result := TNNetLogSigmoid.Create();
+    43: Result := TNNetTanhShrink.Create();
+    44: Result := TNNetLisht.Create();
+    45: Result := TNNetSoftPlusBeta.Create();
+    46: Result := TNNetSoftPlusBeta.Create(2.0);
+    47: Result := TNNetCELU.Create();
+    48: Result := TNNetCELU.Create(0.5);
+    49: Result := TNNetGaussianActivation.Create();
+    50: Result := TNNetISRU.Create();
+    51: Result := TNNetISRU.Create(0.5);
+    52, 53:
+    begin
+      // The default weights (0, 1) are the identity; these exercise both halves.
+      Result := TNNetMovingStdNormalization.Create();
+      Result.Neurons[0].Weights.Raw[0] := 0.3;
+      if Variant = 52
+        then Result.Neurons[0].Weights.Raw[1] := 1.7
+        else Result.Neurons[0].Weights.Raw[1] := -0.5; // no divide on the host
+    end;
+  else Result := nil;
+  end;
+end;
+
+// Every activation that carries a cai_activation opcode, checked against its own
+// CPU forward. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestActivationOpenCLParity;
+{$IFDEF OpenCL}
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -71318,82 +71391,13 @@ var
   DeviceId: cl_device_id;
   i, InSize, VariantCnt, ScaleCnt: integer;
   InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
-
-  function CreateActivation(Variant: integer): TNNetLayer;
-  begin
-    case Variant of
-      0: Result := TNNetReLU.Create();
-      1: Result := TNNetSigmoid.Create();
-      2: Result := TNNetHyperbolicTangent.Create();
-      3: Result := TNNetSwish.Create();
-      4: Result := TNNetSiLU.Create();
-      5: Result := TNNetGELU.Create();
-      6: Result := TNNetGELUErf.Create();
-      7: Result := TNNetHardSwish.Create();
-      8: Result := TNNetHardSigmoid.Create();
-      9: Result := TNNetELU.Create();
-      10: Result := TNNetELU.Create(0.5);
-      11: Result := TNNetSELU.Create();
-      12: Result := TNNetReLUP.Create();
-      13: Result := TNNetAbs.Create();
-      14: Result := TNNetSign.Create();
-      15: Result := TNNetSquare.Create();
-      16: Result := TNNetSquaredReLU.Create();
-      17: Result := TNNetLeakyReLU.Create();
-      18: Result := TNNetVeryLeakyReLU.Create();
-      19: Result := TNNetShiftedReLU.Create();
-      20: Result := TNNetHardTanh.Create();
-      21: Result := TNNetHardShrink.Create();
-      22: Result := TNNetSoftShrink.Create();
-      23: Result := TNNetThreshold.Create(0.5, -2);
-      24: Result := TNNetClamp.Create(-0.5, 2);
-      25: Result := TNNetSoftSign.Create();
-      26: Result := TNNetReLUL.Create(-2, 2, 0);
-      27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
-      28: Result := TNNetReLU6.Create();
-      29: Result := TNNetBentIdentity.Create();
-      30: Result := TNNetAddConstant.Create(-0.375);
-      31: Result := TNNetMulByConstant.Create(-0.75);
-      32: Result := TNNetSnake.Create(0.8);
-      33: Result := TNNetSnake.Create(1.7, true);
-      34: Result := TNNetErf.Create();
-      35: Result := TNNetExp.Create();
-      36: Result := TNNetLog.Create(); // the negative half hits the 1e-8 floor
-      37: Result := TNNetSqrt.Create(); // the negative half hits the 1e-6 floor
-      38: Result := TNNetSin.Create();
-      39: Result := TNNetCos.Create();
-      40: Result := TNNetMish.Create();
-      41: Result := TNNetSoftPlus.Create();
-      42: Result := TNNetLogSigmoid.Create();
-      43: Result := TNNetTanhShrink.Create();
-      44: Result := TNNetLisht.Create();
-      45: Result := TNNetSoftPlusBeta.Create();
-      46: Result := TNNetSoftPlusBeta.Create(2.0);
-      47: Result := TNNetCELU.Create();
-      48: Result := TNNetCELU.Create(0.5);
-      49: Result := TNNetGaussianActivation.Create();
-      50: Result := TNNetISRU.Create();
-      51: Result := TNNetISRU.Create(0.5);
-      52, 53:
-      begin
-        // The default weights (0, 1) are the identity; these exercise both halves.
-        Result := TNNetMovingStdNormalization.Create();
-        Result.Neurons[0].Weights.Raw[0] := 0.3;
-        if Variant = 52
-          then Result.Neurons[0].Weights.Raw[1] := 1.7
-          else Result.Neurons[0].Weights.Raw[1] := -0.5; // no divide on the host
-      end;
-    else Result := nil;
-    end;
-  end;
-
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for VariantCnt := 0 to High(Names) do
+  for VariantCnt := 0 to High(csActivationParityNames) do
   for ScaleCnt := 0 to 1 do
   begin
     RandSeed := 424242;
@@ -71408,7 +71412,7 @@ begin
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
-      ActLayer := NN.AddLayer(CreateActivation(VariantCnt));
+      ActLayer := NN.AddLayer(CreateParityActivation(VariantCnt));
       // The device path is inference-only: it writes FOutput but neither
       // FOutputRaw nor the derivative mask the backward pass reads.
       NN.SetTrainable(False, False);
@@ -71422,7 +71426,7 @@ begin
       // forward-only CPU branch - which is the one the kernel must match.
       NN.Compute(Input);
       OutCPU.Copy(ActLayer.Output);
-      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+      AssertEquals(csActivationParityNames[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
         ActLayer.ForwardGPUCnt);
 
       NN.ForceOpenCL(True);
@@ -71440,7 +71444,7 @@ begin
       // Relative to the reference where that exceeds 1; below 1 the divisor is
       // 1, which is the plain absolute difference.
       MaxDiff := 0;
-      AssertEquals(Names[VariantCnt] + ' output size match',
+      AssertEquals(csActivationParityNames[VariantCnt] + ' output size match',
         OutCPU.Size, ActLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
       begin
@@ -71449,13 +71453,13 @@ begin
         Diff := Abs(OutCPU.Raw[i] - ActLayer.Output.Raw[i]) / RefMagnitude;
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
-      WriteLn('  ', Names[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
+      WriteLn('  ', csActivationParityNames[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
         ' max rel diff=', MaxDiff:0:9, ' gpu forwards=', ActLayer.ForwardGPUCnt);
       // Without this a silent fall back to the CPU would compare the reference
       // against itself and pass while covering nothing.
-      AssertTrue(Names[VariantCnt] + ' must reach the device',
+      AssertTrue(csActivationParityNames[VariantCnt] + ' must reach the device',
         ActLayer.ForwardGPUCnt > 0);
-      AssertTrue(Names[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
+      AssertTrue(csActivationParityNames[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
         FloatToStr(InScale) + '): max relative diff = ' + FloatToStr(MaxDiff) +
         ' must be < 1e-4', MaxDiff < 1e-4);
     finally
@@ -71532,12 +71536,30 @@ begin
   Layer.FlushWeightCache();
 end;
 
-procedure TTestNeuralNumerical.TestLearnableActivationOpenCLParity;
-{$IFDEF OpenCL}
 const
-  Names: array[0..9] of string = ('PReLU', 'PReLUChannel', 'SwishLearnable',
+  csLearnableActivationParityNames: array[0..9] of string = ('PReLU', 'PReLUChannel', 'SwishLearnable',
     'MishLearnable', 'SoftPlusBetaLearnable', 'SReLU', 'AconC',
     'PolynomialActivation', 'APL 3 hinges', 'SplineActivation K=5');
+
+function CreateLearnableParityActivation(Variant: integer): TNNetLayer;
+begin
+  case Variant of
+    0: Result := TNNetPReLU.Create();
+    1: Result := TNNetPReLUChannel.Create();
+    2: Result := TNNetSwishLearnable.Create();
+    3: Result := TNNetMishLearnable.Create();
+    4: Result := TNNetSoftPlusBetaLearnable.Create();
+    5: Result := TNNetSReLU.Create();
+    6: Result := TNNetAconC.Create();
+    7: Result := TNNetPolynomialActivation.Create();
+    8: Result := TNNetAPL.Create(3);
+    9: Result := TNNetSplineActivation.Create(5, 2.0);
+  else Result := nil;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLearnableActivationOpenCLParity;
+{$IFDEF OpenCL}
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -71546,31 +71568,13 @@ var
   DeviceId: cl_device_id;
   Pos, MaxPos, VariantCnt, ScaleCnt: integer;
   InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
-
-  function CreateActivation(Variant: integer): TNNetLayer;
-  begin
-    case Variant of
-      0: Result := TNNetPReLU.Create();
-      1: Result := TNNetPReLUChannel.Create();
-      2: Result := TNNetSwishLearnable.Create();
-      3: Result := TNNetMishLearnable.Create();
-      4: Result := TNNetSoftPlusBetaLearnable.Create();
-      5: Result := TNNetSReLU.Create();
-      6: Result := TNNetAconC.Create();
-      7: Result := TNNetPolynomialActivation.Create();
-      8: Result := TNNetAPL.Create(3);
-      9: Result := TNNetSplineActivation.Create(5, 2.0);
-    else Result := nil;
-    end;
-  end;
-
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for VariantCnt := 0 to High(Names) do
+  for VariantCnt := 0 to High(csLearnableActivationParityNames) do
   for ScaleCnt := 0 to 1 do
   begin
     RandSeed := 20261020;
@@ -71582,7 +71586,7 @@ begin
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
-      ActLayer := NN.AddLayer(CreateActivation(VariantCnt));
+      ActLayer := NN.AddLayer(CreateLearnableParityActivation(VariantCnt));
       NN.SetTrainable(False, False);
       RandomizeLearnableActivation(ActLayer);
       MaxPos := Input.Size - 1;
@@ -71591,7 +71595,7 @@ begin
 
       NN.Compute(Input);
       OutCPU.Copy(ActLayer.Output);
-      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+      AssertEquals(csLearnableActivationParityNames[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
         ActLayer.ForwardGPUCnt);
 
       NN.ForceOpenCL(True);
@@ -71605,7 +71609,7 @@ begin
       end;
 
       MaxDiff := 0;
-      AssertEquals(Names[VariantCnt] + ' output size match',
+      AssertEquals(csLearnableActivationParityNames[VariantCnt] + ' output size match',
         OutCPU.Size, ActLayer.Output.Size);
       for Pos := 0 to MaxPos do
       begin
@@ -71614,13 +71618,131 @@ begin
         Diff := Abs(OutCPU.Raw[Pos] - ActLayer.Output.Raw[Pos]) / RefMagnitude;
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
-      WriteLn('  ', Names[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
+      WriteLn('  ', csLearnableActivationParityNames[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
         ' max rel diff=', MaxDiff:0:9, ' gpu forwards=', ActLayer.ForwardGPUCnt);
-      AssertTrue(Names[VariantCnt] + ' must reach the device',
+      AssertTrue(csLearnableActivationParityNames[VariantCnt] + ' must reach the device',
         ActLayer.ForwardGPUCnt > 0);
-      AssertTrue(Names[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
+      AssertTrue(csLearnableActivationParityNames[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
         FloatToStr(InScale) + '): max relative diff = ' + FloatToStr(MaxDiff) +
         ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Feeds |x| ~ 1e3 and ~ 1e30 through every cai_activation case: PoCL runs the
+// kernel with FP traps on, so any case that overflows kills the process. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestActivationOpenCLExtremeInputs;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  ActLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  OldMask: TFPUExceptionMask;
+  Pos, MaxPos, VariantCnt, ScaleCnt, StandardCount: integer;
+  VariantName: string;
+  InScale, HostValue, DeviceValue, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
+  DeviceAllFinite, IsPeriodic, HostRaised: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  StandardCount := Length(csActivationParityNames);
+  for VariantCnt := 0 to StandardCount + High(csLearnableActivationParityNames) do
+  for ScaleCnt := 0 to 1 do
+  begin
+    RandSeed := 20261020;
+    if ScaleCnt = 0 then InScale := 1e3 else InScale := 1e30;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      if VariantCnt < StandardCount then
+      begin
+        VariantName := csActivationParityNames[VariantCnt];
+        ActLayer := NN.AddLayer(CreateParityActivation(VariantCnt));
+        NN.SetTrainable(False, False);
+      end
+      else
+      begin
+        VariantName := csLearnableActivationParityNames[VariantCnt - StandardCount];
+        ActLayer := NN.AddLayer(CreateLearnableParityActivation(VariantCnt - StandardCount));
+        NN.SetTrainable(False, False);
+        RandomizeLearnableActivation(ActLayer);
+      end;
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := InScale * Sin(Pos * 0.37);
+
+      // The host oracle may legitimately overflow at these magnitudes. When it
+      // raises invalid/zero-divide/overflow, its values (even finite ones, such
+      // as ISRU's x/Inf = 0) are not a reference: only finiteness is checked.
+      OldMask := GetExceptionMask;
+      SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+        exDenormalized, exUnderflow, exPrecision]);
+      HostRaised := false;
+      try
+        {$IFDEF CPUX86_64} SetMXCSR(GetMXCSR and not dword($3F)); {$ENDIF}
+        NN.Compute(Input);
+        OutCPU.Copy(ActLayer.Output);
+        // MXCSR status bits: 1 = invalid, 4 = zero divide, 8 = overflow.
+        {$IFDEF CPUX86_64} HostRaised := (GetMXCSR and $0D) <> 0; {$ENDIF}
+      finally
+        ClearExceptions(False);
+        {$IFDEF CPUX86_64} SetMXCSR(GetMXCSR and not dword($3F)); {$ENDIF}
+        SetExceptionMask(OldMask);
+      end;
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertTrue(VariantName + ' must reach the device', ActLayer.ForwardGPUCnt > 0);
+
+      MaxDiff := 0;
+      DeviceAllFinite := true;
+      // Past |x| = 1e8 float spacing exceeds 2*pi, so sin/cos are noise on both
+      // sides: only finiteness is checked there.
+      IsPeriodic := (VariantName = 'Sin') or (VariantName = 'Cos');
+      for Pos := 0 to MaxPos do
+      begin
+        DeviceValue := ActLayer.Output.Raw[Pos];
+        if IsNan(DeviceValue) or IsInfinite(DeviceValue) then
+        begin
+          DeviceAllFinite := false;
+          continue;
+        end;
+        HostValue := OutCPU.Raw[Pos];
+        if HostRaised or IsNan(HostValue) or IsInfinite(HostValue) then continue;
+        if IsPeriodic and (Abs(Input.Raw[Pos]) > 1e8) then continue;
+        RefMagnitude := Abs(HostValue);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(HostValue - DeviceValue) / RefMagnitude;
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', VariantName, ' OpenCL extreme input: scale ', InScale:0:0,
+        ' max rel diff=', MaxDiff:0:9, ' host raised=', HostRaised);
+      AssertTrue(VariantName + ' device output must be finite (scale ' +
+        FloatToStr(InScale) + ')', DeviceAllFinite);
+      AssertTrue(VariantName + ' OpenCL vs CPU at scale ' + FloatToStr(InScale) +
+        ': max relative diff = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
     finally
       OutCPU.Free;
       Input.Free;

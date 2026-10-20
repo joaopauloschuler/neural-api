@@ -2111,14 +2111,20 @@ cannot pay for its own transfer.
       opcodes 15, 40 and 48-55: the scalar ones pass their weight as a kernel
       argument, the per-channel ones read their neurons packed into one table
       (`TNNetChannelTransformBase.PackActivationChannelTables`).
-- [ ] Audit the older `cai_activation` cases for traps under speculation.
-      PoCL evaluated case 55's math for every opcode (a SIGFPE in
-      `TestActivationOpenCLParity` until the conversion was clamped), and FPC
-      leaves overflow/invalid/zero-divide unmasked in PoCL's worker threads.
-      Cases 35 (Mish), 36 (SoftPlus) and 40 (SoftPlusBeta) call `exp` on an
-      unclamped argument, so a speculated `exp` would overflow for |x| > 88; no
-      test feeds such inputs, so whether PoCL speculates them is unverified.
-
+- [ ] Extend the `cai_activation` trap audit to the other kernels. The
+      kernels build with `-cl-fast-relaxed-math` and PoCL runs them with FP
+      traps unmasked; `TestActivationOpenCLExtremeInputs` showed PoCL's
+      `exp` trapping below ~-88 (not underflowing), `erf`/`sin`/`cos`/`log`
+      trapping on huge arguments, both sides of data-dependent branches
+      running, and `x * tanh` reassociated into an overflowing `x * (1 - e)`.
+      `cai_activation`, `cai_fused_act` and `cai_glu_gate` now go through the
+      `cai_exp_floored`/`cai_erf`/`cai_sin`/`cai_log`/`cai_tanh` helpers at the
+      top of `neural.cl`. Still raw: `cai_gated_delta_net` (two-branch sigmoid
+      and softplus on raw `exp`, `exp(-zv)` in the SiLU gate), `cai_softmax`
+      (`exp` of an argument clamped only to +-4000), the SDPA row softmax
+      `exp(row[r] - RowMax)` without the -80 floor its siblings use, and the
+      RoPE `sin`/`cos` of an unclamped angle. Each needs an extreme-input
+      device test before and after.
 
 ## Layer follow-ups that fix real limitations
 

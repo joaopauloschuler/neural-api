@@ -2,6 +2,72 @@
 // located at:
 // https://sourceforge.net/projects/cai/
 
+// The kernels build with -cl-fast-relaxed-math and PoCL runs them with the
+// host's FP traps unmasked, so the helpers below keep every intermediate finite.
+// Squares are taken of |x| capped here (or at CAI_SQUARE_CAP where a product
+// follows), so they stay finite.
+#define CAI_SQRT_FLT_MAX 1.8e19f
+#define CAI_SQUARE_CAP 1e15f
+
+// sqrt(x*x + 1), which is |x| in single precision once |x| > 1e4.
+static inline float cai_sqrt_square_plus1(const float x)
+{
+  const float a = fabs(x);
+  const float ac = fmin(a, CAI_SQUARE_CAP);
+  return (a > CAI_SQUARE_CAP) ? a : sqrt(ac * ac + 1.0f);
+}
+
+// ISRU: x / sqrt(1 + alpha*x^2). Past |x| = 1e15 the result is +-1/sqrt(alpha)
+// in single precision, so the clamp is exact for alpha > 1e-22.
+static inline float cai_isru(const float x, const float alpha)
+{
+  const float xc = clamp(x, -CAI_SQUARE_CAP, CAI_SQUARE_CAP);
+  return xc / sqrt(fmax(1.0f + alpha * xc * xc, FLT_MIN));
+}
+
+// exp with its argument floored at -87 (exp(-87) = 1.6e-38): PoCL's exp traps
+// on far-negative arguments under unmasked FP exceptions instead of underflowing.
+static inline float cai_exp_floored(const float x)
+{
+  return exp(fmax(x, -87.0f));
+}
+
+// erf with its argument clamped to [-10, 10], where it is already +-1.0f: PoCL's
+// erf traps on huge arguments.
+static inline float cai_erf(const float x)
+{
+  return erf(clamp(x, -10.0f, 10.0f));
+}
+
+// sin/cos with the argument clamped to +-1e8, past which float spacing exceeds
+// 2*pi and the result is noise anyway: PoCL's range reduction traps on huge ones.
+#define CAI_TRIG_ARG_CAP 1e8f
+static inline float cai_sin(const float x)
+{
+  return sin(clamp(x, -CAI_TRIG_ARG_CAP, CAI_TRIG_ARG_CAP));
+}
+static inline float cai_cos(const float x)
+{
+  return cos(clamp(x, -CAI_TRIG_ARG_CAP, CAI_TRIG_ARG_CAP));
+}
+
+// log of a positive x; above 1e18 it is taken of x*2^-64 plus 64*ln(2), since
+// PoCL's log traps on large arguments (its denormal rescale overflows).
+static inline float cai_log(const float x)
+{
+  const bool IsLarge = (x > 1e18f);
+  const float scaled = IsLarge ? x * 0x1p-64f : x;
+  return log(scaled) + (IsLarge ? 44.361419555836500f : 0.0f);
+}
+
+// tanh of x clamped to [-10, 10] (already +-1.0f there), from e = exp(-2|x|) so
+// every intermediate stays in [0, 1] and a reassociated x * tanh cannot overflow.
+static inline float cai_tanh(const float x)
+{
+  const float e = exp(-2.0f * fmin(fabs(x), 10.0f));
+  return copysign((1.0f - e) / (1.0f + e), x);
+}
+
 // The activation applied in-register by the GEMM kernels after their fused
 // bias-add, and by cai_activation for the same opcodes. Opcodes are the csAct*
 // constants: 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish/SiLU,
@@ -11,7 +77,8 @@
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases for the parameterized activations
 // (9, 10, 15, 18-21, 24-28, 40, 41, 43-55) and for the standalone-only ones that
-// no GEMM fuses. Coded by Claude (AI).
+// no GEMM fuses. PoCL if-converts the branches on v, so both sides of every
+// branch run: each must stay finite for any finite v. Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -20,45 +87,40 @@ static inline float cai_fused_act(float v, const int ActFN)
   }
   else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
   {
-    if (v > 0.0f) return 1.0f / (1.0f + exp(-v));
-    const float s = exp(v);
-    return s / (1.0f + s);
+    const float e = cai_exp_floored(-fabs(v)); // exp(-v) above zero, exp(v) below
+    return (v > 0.0f) ? 1.0f / (1.0f + e) : e / (1.0f + e);
   }
-  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+  else if (ActFN == 3) // HyperbolicTangent
   {
-    float xc = v;
-    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-    const float e = exp(-2.0f * xc);
-    return (1.0f - e) / (1.0f + e);
+    return cai_tanh(v);
   }
   else if (ActFN == 4) // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
   {
-    if (v > 0.0f) return v / (1.0f + exp(-v));
-    const float s = exp(v);
-    return v * s / (1.0f + s);
+    const float e = cai_exp_floored(-fabs(v));
+    return (v > 0.0f) ? v / (1.0f + e) : v * e / (1.0f + e);
   }
   else if (ActFN == 5) // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
   {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float GELU_CONST = 0.044715f;
     // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
-    // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
-    // representable result and keeps exp(-2*arg) at exp(20).
-    float arg = SQRT_2_OVER_PI * (v + GELU_CONST * v * v * v);
-    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
-    const float e = exp(-2.0f * arg);
-    return v * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
+    // in single precision by |arg| ~ 9, so clamping x to [-10,10] for the cube
+    // changes no representable result.
+    const float vc = clamp(v, -10.0f, 10.0f);
+    const float arg = SQRT_2_OVER_PI * (vc + GELU_CONST * vc * vc * vc);
+    return v * 0.5f * (1.0f + cai_tanh(arg));
   }
   else if (ActFN == 6) // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
   {
     const float INV_SQRT_2 = 0.7071067811865476f;
-    return v * 0.5f * (1.0f + erf(v * INV_SQRT_2));
+    return v * 0.5f * (1.0f + cai_erf(v * INV_SQRT_2));
   }
   else if (ActFN == 7) // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
   {
+    const float vc = clamp(v, -3.0f, 3.0f); // keeps the speculated product finite
     if (v > 3.0f) return v;
     if (v < -3.0f) return 0.0f;
-    return v * (v + 3.0f) / 6.0f;
+    return vc * (vc + 3.0f) / 6.0f;
   }
   else if (ActFN == 8) // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
   {
@@ -2632,34 +2694,15 @@ __kernel void cai_glu_gate
   float gated;
   if (FActFlag <= 1)            // GLU: sigmoid(B) / SwiGLU: swish(B) = B*sigmoid(B)
   {
-    // Two-branch sigmoid: the negative side evaluates exp(b), which UNDERFLOWS
-    // to zero instead of overflowing, so no clamp is needed on either side.
-    float sig;
-    if (b > 0.0f)
-      sig = 1.0f / (1.0f + exp(-b));
-    else
-    {
-      const float s = exp(b);
-      sig = s / (1.0f + s);
-    }
+    const float sig = cai_fused_act(b, 2);
     if (FActFlag == 0) gated = sig; else gated = b * sig;
   }
   else if (FActFlag == 2)       // GEGLU: gelu_tanh(B)
-  {
-    const float SQRT_2_OVER_PI = 0.7978845608f;
-    const float GELU_CONST = 0.044715f;
-    // The cubic term drives arg past 100 by |B| ~ 15, and tanh is already 1.0f
-    // in single precision by |arg| ~ 9, so clamping to cai_activation's [-10,10]
-    // changes no representable result and keeps exp(-2*arg) at exp(20).
-    float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
-    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
-    const float e = exp(-2.0f * arg);
-    gated = b * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
-  }
+    gated = cai_fused_act(b, 5);
   else if (FActFlag == 3)       // GEGLUErf: gelu_erf(B)
   {
     const float INV_SQRT_2 = 0.7071067811865476f;
-    gated = b * 0.5f * (1.0f + erf(b * INV_SQRT_2));
+    gated = b * 0.5f * (1.0f + cai_erf(b * INV_SQRT_2));
   }
   else if (FActFlag == 4)       // ReGLU: the gate is on A, so ReLU(A) * B
   {
@@ -2668,11 +2711,11 @@ __kernel void cai_glu_gate
   }
   else if (FActFlag == 5)       // ReGLUSquared: ReLU(B)^2
   {
-    const float r = (b > 0.0f) ? b : 0.0f;
+    const float r = clamp(b, 0.0f, CAI_SQRT_FLT_MAX);
     gated = r * r;
   }
-  else                          // TanhGLU: tanh(B), the clamped cai_activation form
-    gated = cai_fused_act(b, 3);
+  else                          // TanhGLU: tanh(B), cai_tanh's clamped form
+    gated = cai_tanh(b);
   FY[gid] = a * gated;
 }
 
@@ -3190,14 +3233,13 @@ __kernel void cai_activation
       y = cai_fused_act(x, FOpcode);
       break;
     case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
-      // exp is evaluated only on the negative branch, where it underflows
-      // towards zero rather than overflowing, so no clamp is needed.
-      if (x > 0.0f) y = x; else y = FParamA * (exp(x) - 1.0f);
+      // Both branches run, so exp's argument is capped at the branch point.
+      y = (x > 0.0f) ? x : FParamA * (cai_exp_floored(fmin(x, 0.0f)) - 1.0f);
       break;
     case 10: // SELU: scale*x for x > 0, else scale*alpha*exp(x) - scale*alpha.
       // FParamA = scale*alpha and FParamB = scale, both passed in from the layer
       // so the device uses the very floats the host multiplied.
-      if (x > 0.0f) y = FParamB * x; else y = FParamA * exp(x) - FParamA;
+      y = (x > 0.0f) ? FParamB * x : FParamA * cai_exp_floored(fmin(x, 0.0f)) - FParamA;
       break;
     case 11: // Abs
       y = fabs(x);
@@ -3206,11 +3248,17 @@ __kernel void cai_activation
       if (x > 0.0f) y = 1.0f; else if (x < 0.0f) y = -1.0f; else y = 0.0f;
       break;
     case 13: // Square
-      y = x * x;
+    {
+      const float a = fmin(fabs(x), CAI_SQRT_FLT_MAX);
+      y = a * a;
       break;
+    }
     case 14: // SquaredReLU: x*x for x > 0, else 0
-      y = (x > 0.0f) ? x * x : 0.0f;
+    {
+      const float r = clamp(x, 0.0f, CAI_SQRT_FLT_MAX);
+      y = r * r;
       break;
+    }
     case 15: // LeakyReLU: x for x > 0, else slope*x. FParamA = slope.
       y = (x > 0.0f) ? x : FParamA * x;
       break;
@@ -3240,7 +3288,7 @@ __kernel void cai_activation
       y = x / (1.0f + fabs(x));
       break;
     case 23: // BentIdentity: (sqrt(x^2 + 1) - 1)/2 + x
-      y = (sqrt(x * x + 1.0f) - 1.0f) * 0.5f + x;
+      y = (cai_sqrt_square_plus1(x) - 1.0f) * 0.5f + x;
       break;
     case 24: // ReLUL: leaky clamp into [FParamA, FParamB]. FParamC = slope.
       if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
@@ -3255,73 +3303,80 @@ __kernel void cai_activation
       break;
     case 27: // Snake: x + sin(alpha*x)^2 / alpha. FParamA = alpha, FParamB = 1/alpha.
     {
-      const float s = sin(FParamA * x);
+      const float s = cai_sin(FParamA * x);
       y = mad(FParamB * s, s, x);
       break;
     }
     case 28: // Snake with alpha = FChannelParam[channel].
     {
       const float a = FChannelParam[i % FChannels];
-      const float s = sin(a * x);
+      const float s = cai_sin(a * x);
       y = mad(s / a, s, x);
       break;
     }
     // 29..43 mirror the host Compute forms, including their input clamps and
-    // saturation thresholds. tanh is cai_fused_act's clamped form throughout.
+    // saturation thresholds. tanh is cai_tanh's clamped form throughout.
     case 29: // Erf
-      y = erf(x);
+      y = cai_erf(x);
       break;
     case 30: // Exp: exp(min(x, 30))
-      y = exp((x > 30.0f) ? 30.0f : x);
+      y = cai_exp_floored(fmin(x, 30.0f));
       break;
     case 31: // Log: ln(max(x, 1e-8))
-      y = log((x < 1e-8f) ? 1e-8f : x);
+      y = cai_log(fmax(x, 1e-8f));
       break;
     case 32: // Sqrt: sqrt(max(x, 1e-6))
       y = sqrt((x < 1e-6f) ? 1e-6f : x);
       break;
     case 33: // Sin
-      y = sin(x);
+      y = cai_sin(x);
       break;
     case 34: // Cos
-      y = cos(x);
+      y = cai_cos(x);
       break;
     case 35: // Mish: x * tanh(softplus(x)), softplus saturated beyond +-20
     {
+      const float e = cai_exp_floored(fmin(x, 20.0f));
       float sp;
       if (x > 20.0f) sp = x;
-      else if (x < -20.0f) sp = exp(x);
-      else sp = log1p(exp(x));
-      y = x * cai_fused_act(sp, 3);
+      else if (x < -20.0f) sp = e;
+      else sp = log1p(e);
+      y = x * cai_tanh(sp);
       break;
     }
     case 36: // SoftPlus: ln(1 + exp(x)), x itself beyond 30
-      y = (x > 30.0f) ? x : log1p(exp(x));
+      y = (x > 30.0f) ? x : log1p(cai_exp_floored(fmin(x, 30.0f)));
       break;
     case 37: // LogSigmoid: -softplus(-x), the exp argument kept non-positive
-      if (x >= 0.0f) y = -log1p(exp(-x)); else y = x - log1p(exp(x));
+    {
+      const float e = cai_exp_floored(-fabs(x));
+      y = (x >= 0.0f) ? -log1p(e) : x - log1p(e);
       break;
+    }
     case 38: // TanhShrink: x - tanh(x)
-      y = x - cai_fused_act(x, 3);
+      y = x - cai_tanh(x);
       break;
     case 39: // LiSHT: x * tanh(x)
-      y = x * cai_fused_act(x, 3);
+      y = x * cai_tanh(x);
       break;
     case 40: // SoftPlusBeta: ln(1 + exp(beta*x))/beta, x beyond beta*x > 30.
     {        // FParamA = beta, FParamB = 1/beta.
       const float bx = FParamA * x;
-      y = (bx > 30.0f) ? x : FParamB * log(1.0f + exp(bx));
+      y = (bx > 30.0f) ? x : FParamB * log(1.0f + cai_exp_floored(fmin(bx, 30.0f)));
       break;
     }
     case 41: // CELU: x for x > 0, else alpha*(exp(x/alpha)-1).
       // FParamA = alpha, FParamB = 1/alpha.
-      y = (x > 0.0f) ? x : FParamA * (exp(x * FParamB) - 1.0f);
+      y = (x > 0.0f) ? x : FParamA * (cai_exp_floored(fmin(x * FParamB, 0.0f)) - 1.0f);
       break;
     case 42: // GaussianActivation: exp(-x^2)
-      y = exp(-x * x);
+    {
+      const float a = fmin(fabs(x), CAI_SQUARE_CAP);
+      y = cai_exp_floored(-a * a);
       break;
+    }
     case 43: // ISRU: x / sqrt(1 + alpha*x^2). FParamA = alpha.
-      y = x / sqrt(1.0f + FParamA * x * x);
+      y = cai_isru(x, FParamA);
       break;
     // 44..46 read FChannelParam as a table of FChannels entries: one per
     // channel, or one per element when FChannels = FSize (TNNetCellBias).
@@ -3346,12 +3401,12 @@ __kernel void cai_activation
     case 49: // MishAlpha: x * tanh(softplus(alpha*x)), saturated beyond +-30. FParamA = alpha.
     {
       const float ax = FParamA * x;
-      const float ExpAx = exp(fmin(ax, 30.0f)); // capped: never overflows if speculated
+      const float ExpAx = cai_exp_floored(fmin(ax, 30.0f)); // capped: never overflows if speculated
       float sp;
       if (ax > 30.0f) sp = ax;
       else if (ax < -30.0f) sp = ExpAx;
       else sp = log(1.0f + ExpAx);
-      y = x * cai_fused_act(sp, 3);
+      y = x * cai_tanh(sp);
       break;
     }
     // 50..55 read FChannelParam as packed per-channel tables, table k at k*FChannels.
@@ -3380,7 +3435,8 @@ __kernel void cai_activation
     case 53: // Polynomial, tables a|b|c0: (a*x + b)*x + c0
     {
       const int c = i % FChannels;
-      y = (FChannelParam[c] * x + FChannelParam[FChannels + c]) * x +
+      const float xc = clamp(x, -CAI_SQUARE_CAP, CAI_SQUARE_CAP); // saturates past 1e15
+      y = (FChannelParam[c] * xc + FChannelParam[FChannels + c]) * xc +
         FChannelParam[2 * FChannels + c];
       break;
     }
