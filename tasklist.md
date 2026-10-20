@@ -1985,6 +1985,21 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       axis folded into the column (b = pixel*OutT + ot; the result
       [b*NumFeatures + f] is the packed output as it is). Covered by
       `TestConvolution3DOpenCLParity` (5 shapes incl. the tubelet stride).
+- [ ] VideoMAE tubelet embedding computes ~tubelet x too many frames: the
+      `TNNetConvolution3D` emits every overlapping output frame (T - tubelet + 1)
+      and the builder keeps every tubelet-th one via `TNNetSplitChannels` +
+      `TNNetDeepConcat`. Add a temporal stride to `TNNetConvolution3D` (host and
+      device: the `cai_conv_gather` frame step becomes stride*C, frame count
+      T/stride) and drop the split/concat layers from the builder. Keep the
+      VideoMAE parity test green.
+- [ ] CogVideoX VAE decoder runs its `TNNetCausalConv1D` pair once per spatial
+      cell on a tiny (T,1,Clat) net, so the size verdict keeps it on the CPU
+      and the new device forward rarely fires. Batch all H*W cells into one
+      forward (cells along Y, SizeY = H*W) so one launch covers the frame.
+- [ ] GPU-box check: `cai_sdpa_flash` gained a uniform score-bias branch
+      (13282df0) that the decode path also runs. Measure decode tok/s on a
+      Qwen checkpoint before/after; if it costs anything, split the biased
+      variant into its own entry point.
 - [ ] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
       style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
       re-laid out k-major on the host and uploaded every forward before
