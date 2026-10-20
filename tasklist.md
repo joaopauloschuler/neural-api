@@ -1944,16 +1944,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       back-to-back concatenation of every source's bytes), so it does not fit
       the single-source `cai_gather_copy`; one `clEnqueueCopyBuffer` per
       source into the output buffer is the likely shape.
-- [ ] Follow-ups of the `cai_gather_copy` glue (commit 905c2b71):
-      `TNNetExpandDims` and `TNNetSqueeze` ARE
-      true re-labels and still download their source - give them the
-      `TNNetReshape` view (move that mechanism to a shared place first).
-      `TNNetPad`, `TNNetGather`, `TNNetGatherChannels` and
-      `TNNetChannelShuffle` are copies that fit `cai_gather_copy` with a
-      two-method override each. `cai_upsample_gather` (DeMaxPool, Upsample,
-      PixelShuffle) is expressible as a `cai_gather_copy` plan too. The gather
-      layers do not take part in OpenCL output sharing by liveness
-      (`CanShareOpenCLOutput` is False).
+- [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
+      (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
+      plan too (DeMaxPool's random spacing would need a per-forward plan, so
+      it stays out). The gather-copy layers do not take part in OpenCL output
+      sharing by liveness (`CanShareOpenCLOutput` is False).
 - [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
       per token, but the router sits between two resident MoE banks, so running
       it on the host costs two transfers per token. Only worth landing together

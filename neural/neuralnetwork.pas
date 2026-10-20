@@ -1569,6 +1569,10 @@ type
     FPadding: integer;
     FPadMode: TNNetPadMode;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    {$IFDEF OpenCL}
+    function HasGatherCopyPlan(): boolean; override;
+    procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+    {$ENDIF}
   public
     constructor Create(Padding: integer); reintroduce; overload;
     constructor Create(Padding: integer; PadMode: TNNetPadMode); reintroduce; overload;
@@ -5470,6 +5474,14 @@ type
     // Points output coordinate OutCoord of the last axis added at source
     // coordinate SrcCoord; SrcCoord < 0 makes that coordinate read zero.
     procedure SetAxisSource(OutCoord, SrcCoord: integer);
+    // Appends the Y, X and depth axes of an OutSizeX x OutSizeY padded copy of
+    // Src: leading pads PadX/PadY, borders per NeuralPadSourceIndex.
+    procedure AddPaddedAxes(Src: TNNetVolume; OutSizeX, OutSizeY, PadX,
+      PadY: integer; PadMode: TNNetPadMode);
+    // Appends a PosCount position axis and a depth axis where channel
+    // ToChannels[d] reads channel d (the later d wins; unreached = zero).
+    procedure AddChannelScatterAxes(PosCount, Depth: integer;
+      const ToChannels: TNeuralIntegerArray);
     // Rebuilds and uploads the plan when Consumer's shapes differ from FPlanShape.
     procedure EnsurePlan(Consumer: TNNetLayer);
     function ResultBuffer(): cl_mem;
@@ -13007,6 +13019,10 @@ type
   TNNetGather = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(); overload; override;
       constructor Create(AChannel: integer); reintroduce; overload;
@@ -13064,6 +13080,10 @@ type
     private
       ToChannels: TNeuralIntegerArray;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(pGroups: integer); reintroduce; overload;
       destructor Destroy(); override;
@@ -13364,16 +13384,18 @@ type
     procedure Compute(); override;
   end;
 
-  /// This layer reshapes the input into the output.
-  TNNetReshape = class(TNNetLayer)
-    private
+  /// This is a base class. Do not use it directly. A layer whose output is
+  // its source's data with a new shape: the copy keeps the element order, so
+  // with a resident source the output is a view of the source's OpenCL buffer.
+  // Coded by Claude (AI).
+  TNNetReshapeBase = class(TNNetLayer)
+    protected
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       {$IFDEF OpenCL}
       // The alias's host copy comes from the source's host copy.
       procedure MoveOutputToRAM(); override;
       {$ENDIF}
     public
-      constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); override;
       // Inference with a resident source of the same Size: the output is the
@@ -13386,6 +13408,12 @@ type
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
+  end;
+
+  /// This layer reshapes the input into the output.
+  TNNetReshape = class(TNNetReshapeBase)
+    public
+      constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
   end;
 
   /// numpy-style single-axis shape helper. TNNetExpandDims lays the entire
@@ -13402,14 +13430,11 @@ type
   // Use case: place a flat feature vector onto a chosen spatial/channel axis so
   // a following layer (e.g. a 1-D convolution) sees it on the expected axis.
   // Coded by Claude (AI).
-  TNNetExpandDims = class(TNNetLayer)
-    private
+  TNNetExpandDims = class(TNNetReshapeBase)
+    protected
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pAxis: integer = 2); reintroduce; overload;
-
-      procedure Compute(); override;
-      procedure Backpropagate(); override;
   end;
 
   /// numpy-style single-axis shape helper. TNNetSqueeze removes unit axes by
@@ -13440,15 +13465,12 @@ type
   // so its serialized string is byte-identical to earlier versions.
   // Use case: flatten a (1,N,1)/(N,1,1) shape back to a plain feature vector.
   // Coded by Claude (AI).
-  TNNetSqueeze = class(TNNetLayer)
-    private
+  TNNetSqueeze = class(TNNetReshapeBase)
+    protected
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
       constructor Create(pAxis: integer); reintroduce; overload;
-
-      procedure Compute(); override;
-      procedure Backpropagate(); override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -25431,22 +25453,9 @@ begin
 end;
 
 procedure TNNetPadXY.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
-var
-  Src: TNNetVolume;
-  OutPos, MaxOutPos: integer;
 begin
-  Src := FPrevLayer.FOutput;
-  Plan.AddAxis(FOutput.SizeY, Src.SizeX * Src.Depth);
-  MaxOutPos := FOutput.SizeY - 1;
-  for OutPos := 0 to MaxOutPos do
-    Plan.SetAxisSource(OutPos,
-      NeuralPadSourceIndex(OutPos, FPaddingY, Src.SizeY, FPadMode));
-  Plan.AddAxis(FOutput.SizeX, Src.Depth);
-  MaxOutPos := FOutput.SizeX - 1;
-  for OutPos := 0 to MaxOutPos do
-    Plan.SetAxisSource(OutPos,
-      NeuralPadSourceIndex(OutPos, FPaddingX, Src.SizeX, FPadMode));
-  Plan.AddAxis(FOutput.Depth, 1);
+  Plan.AddPaddedAxes(FPrevLayer.FOutput, FOutput.SizeX, FOutput.SizeY,
+    FPaddingX, FPaddingY, FPadMode);
 end;
 {$ENDIF}
 
@@ -39546,6 +39555,34 @@ begin
     else FTable[TablePos] := -1;
 end;
 
+procedure TNNetGatherCopyCL.AddPaddedAxes(Src: TNNetVolume; OutSizeX,
+  OutSizeY, PadX, PadY: integer; PadMode: TNNetPadMode);
+var
+  OutPos, MaxOutPos: integer;
+begin
+  AddAxis(OutSizeY, Src.SizeX * Src.Depth);
+  MaxOutPos := OutSizeY - 1;
+  for OutPos := 0 to MaxOutPos do
+    SetAxisSource(OutPos, NeuralPadSourceIndex(OutPos, PadY, Src.SizeY, PadMode));
+  AddAxis(OutSizeX, Src.Depth);
+  MaxOutPos := OutSizeX - 1;
+  for OutPos := 0 to MaxOutPos do
+    SetAxisSource(OutPos, NeuralPadSourceIndex(OutPos, PadX, Src.SizeX, PadMode));
+  AddAxis(Src.Depth, 1);
+end;
+
+procedure TNNetGatherCopyCL.AddChannelScatterAxes(PosCount, Depth: integer;
+  const ToChannels: TNeuralIntegerArray);
+var
+  CntDepth, MaxDepth: integer;
+begin
+  AddAxis(PosCount, Depth);
+  AddAxis(Depth, 1, 0, 0);
+  MaxDepth := Depth - 1;
+  for CntDepth := 0 to MaxDepth do
+    SetAxisSource(ToChannels[CntDepth], CntDepth);
+end;
+
 procedure TNNetGatherCopyCL.EnsurePlan(Consumer: TNNetLayer);
 var
   Src, Y: TNNetVolume;
@@ -53384,16 +53421,9 @@ begin
 end;
 
 procedure TNNetInterleaveChannels.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
-var
-  CntDepth, MaxDepth: integer;
 begin
-  // The host writes channel ToChannels[d] from channel d, the later d winning
-  // a collision; a channel no d reaches stays zero.
-  Plan.AddAxis(FOutput.SizeX * FOutput.SizeY, FOutput.Depth);
-  Plan.AddAxis(FOutput.Depth, 1, 0, 0);
-  MaxDepth := FOutput.Depth - 1;
-  for CntDepth := 0 to MaxDepth do
-    Plan.SetAxisSource(ToChannels[CntDepth], CntDepth);
+  Plan.AddChannelScatterAxes(FOutput.SizeX * FOutput.SizeY, FOutput.Depth,
+    ToChannels);
 end;
 {$ENDIF}
 
@@ -53465,6 +53495,22 @@ begin
   SetOutputErrorSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, 1);
 end;
 
+{$IFDEF OpenCL}
+function TNNetGather.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetGather.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+begin
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeX * Src.SizeY, Src.Depth);
+  Plan.AddAxis(1, 1, FStruct[0]);
+end;
+{$ENDIF}
+
 procedure TNNetGather.Compute();
 var
   StartTime: double;
@@ -53473,7 +53519,7 @@ var
   DstPos: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   Prev := FPrevLayer.Output;
   Channel := FStruct[0];
   MaxX := Prev.SizeX - 1;
@@ -53741,6 +53787,19 @@ begin
   inherited Destroy();
 end;
 
+{$IFDEF OpenCL}
+function TNNetChannelShuffle.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetChannelShuffle.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+begin
+  Plan.AddChannelScatterAxes(FOutput.SizeX * FOutput.SizeY, FOutput.Depth,
+    ToChannels);
+end;
+{$ENDIF}
+
 procedure TNNetChannelShuffle.Compute();
 var
   CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
@@ -53748,7 +53807,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   MaxDepth := FOutput.Depth - 1;
   Depth := FOutput.Depth;
@@ -57555,6 +57614,19 @@ begin
   FPadMode := PadMode;
 end;
 
+{$IFDEF OpenCL}
+function TNNetPad.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetPad.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+begin
+  Plan.AddPaddedAxes(FPrevLayer.FOutput, FOutput.SizeX, FOutput.SizeY,
+    FPadding, FPadding, FPadMode);
+end;
+{$ENDIF}
+
 procedure TNNetPad.Compute();
 var
   StartTime: double;
@@ -57565,7 +57637,7 @@ var
   LocalPrevOutput: TNNetVolume;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -106826,26 +106898,16 @@ begin
   BackpropagateConcat();
 end;
 
-{ TNNetReshape }
-procedure TNNetReshape.SetPrevLayer(pPrevLayer: TNNetLayer);
+{ TNNetReshapeBase }
+procedure TNNetReshapeBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FActivationFn := pPrevLayer.ActivationFn;
   FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
 end;
 
-constructor TNNetReshape.Create(pSizeX, pSizeY, pDepth: integer);
-begin
-  inherited Create();
-  FOutput.Resize(pSizeX, pSizeY, pDepth);
-  SetOutputErrorSize(pSizeX, pSizeY, pDepth);
-  FStruct[0] := pSizeX;
-  FStruct[1] := pSizeY;
-  FStruct[2] := pDepth;
-end;
-
 {$IFDEF OpenCL}
-procedure TNNetReshape.MoveOutputToRAM();
+procedure TNNetReshapeBase.MoveOutputToRAM();
 begin
   if FPrevLayer.ForceOutputOnRAM() then
   begin
@@ -106857,7 +106919,7 @@ begin
       IntToStr(FLayerIdx) + ':' + ClassName);
 end;
 
-procedure TNNetReshape.DisableOpenCL();
+procedure TNNetReshapeBase.DisableOpenCL();
 begin
   // TNNet.DisableOpenCL has already disabled the source, which may have
   // released its buffer: then FOutputOnOpenCL stays set, so ForceOutputOnRAM
@@ -106869,30 +106931,30 @@ begin
   inherited DisableOpenCL();
 end;
 
-function TNNetReshape.WillOpenCL(): boolean;
+function TNNetReshapeBase.WillOpenCL(): boolean;
 begin
   Result := FHasOpenCL and (not FIsTrainable) and PrevOutputOnOpenCLSameSize();
 end;
 
-function TNNetReshape.OpenCLOutputBuffer(): cl_mem;
+function TNNetReshapeBase.OpenCLOutputBuffer(): cl_mem;
 begin
   if Assigned(FPrevLayer) then Result := FPrevLayer.OpenCLOutputBuffer()
   else Result := nil;
 end;
 
-function TNNetReshape.OpenCLOutputKernel(): TNeuralKernel;
+function TNNetReshapeBase.OpenCLOutputKernel(): TNeuralKernel;
 begin
   if Assigned(FPrevLayer) then Result := FPrevLayer.OpenCLOutputKernel()
   else Result := nil;
 end;
 {$ENDIF}
 
-function TNNetReshape.OutputAliasSource(): TNNetLayer;
+function TNNetReshapeBase.OutputAliasSource(): TNNetLayer;
 begin
   Result := FPrevLayer;
 end;
 
-procedure TNNetReshape.Compute;
+procedure TNNetReshapeBase.Compute;
 var
   Len: integer;
   StartTime: double;
@@ -106917,7 +106979,7 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNetReshape.Backpropagate;
+procedure TNNetReshapeBase.Backpropagate;
 var
   Len: integer;
   StartTime: double;
@@ -106933,6 +106995,17 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetReshape }
+constructor TNNetReshape.Create(pSizeX, pSizeY, pDepth: integer);
+begin
+  inherited Create();
+  FOutput.Resize(pSizeX, pSizeY, pDepth);
+  SetOutputErrorSize(pSizeX, pSizeY, pDepth);
+  FStruct[0] := pSizeX;
+  FStruct[1] := pSizeY;
+  FStruct[2] := pDepth;
+end;
+
 { TNNetExpandDims }
 constructor TNNetExpandDims.Create(pAxis: integer);
 begin
@@ -106945,8 +107018,6 @@ var
   N: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
-  FActivationFn := pPrevLayer.ActivationFn;
-  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
   N := pPrevLayer.FOutput.Size;
   case FStruct[0] of
     0: begin FOutput.Resize(N, 1, 1); end;
@@ -106957,30 +107028,6 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
-procedure TNNetExpandDims.Compute;
-var
-  Len: integer;
-  StartTime: double;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
-  FOutput.Copy(FPrevLayer.FOutput, Len);
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-procedure TNNetExpandDims.Backpropagate;
-var
-  StartTime: double;
-begin
-  StartTime := Now();
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  FPrevLayer.FOutputError.Add(FOutputError);
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  FPrevLayer.Backpropagate();
-end;
 
 { TNNetSqueeze }
 constructor TNNetSqueeze.Create();
@@ -107004,8 +107051,6 @@ var
   N: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
-  FActivationFn := pPrevLayer.ActivationFn;
-  FActivationFnDerivative := pPrevLayer.ActivationFnDerivative;
   if FStruct[0] = 1 then
   begin
     // Single-axis mode: drop ONLY the requested unit axis, asserting that the
@@ -107038,30 +107083,6 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
-procedure TNNetSqueeze.Compute;
-var
-  Len: integer;
-  StartTime: double;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
-  FOutput.Copy(FPrevLayer.FOutput, Len);
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-procedure TNNetSqueeze.Backpropagate;
-var
-  StartTime: double;
-begin
-  StartTime := Now();
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  FPrevLayer.FOutputError.Add(FOutputError);
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  FPrevLayer.Backpropagate();
-end;
 
 { TNNetIdentity }
 constructor TNNetIdentity.Create();
