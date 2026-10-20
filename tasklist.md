@@ -106,13 +106,9 @@ rather than acted on.
       not yet met.
 
 - [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
-      re-prefill (design agreed with the user 2026-10-02). Today TChatEngine is
-      single-session (one KV cache, one position; neuralchatengine.pas header):
-      each request is diffed (CommonPrefixLen) against the ONE resident token
-      sequence, so two clients taking turns diverge right after the shared system
-      prompt and every request pays a near-full prefill; for hybrid/recurrent nets
-      DropCheckpointsAbove also frees the other chat's checkpoints. Compute stays
-      serialized (one request at a time). Process: one Opus coder per task, then
+      re-prefill (design agreed with the user 2026-10-02). Conversation slots
+      (`--kv-slots`, `TConversationSlot`, T1-T5) are coded; open items below.
+      Compute stays serialized (one request at a time). Process: one Opus coder per task, then
       an independent Opus review, commit after review + green suites
       (lazbuild -B; default AND -dAVX2 suites; the PoCL suite when OpenCL code is
       touched; 3 GB ulimit). Each task ships its own tests.
@@ -345,14 +341,6 @@ rather than acted on.
       `examples/BackgroundRemoval` cutting a subject out of a tiny CPU image
       (sigmoid mask -> RGBA composite).
 
-- [ ] SDXL residual: real stabilityai/stable-diffusion-xl-base-1.0 checkpoint
-      parity still deferred (only the pico oracle is verified). The 2048 cross
-      width is already just CrossAttentionDim, and the highest-res "no attn"
-      block layout is handled by down_block_types=DownBlock2D (DownHasAttn=false
-      skips the Transformer2DModel) — transformer_layers_per_block list (e.g.
-      [1,2,10]) already supported; no depth=0 special case needed. The dual
-      text-encoder concatenation lives in the (still-deferred) SDXL pipeline
-      driver, not the UNet importer.
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
       DiT from the landed PixArt/MMDiT/Sana stacks: a cross-attention DiT
@@ -485,15 +473,6 @@ rather than acted on.
         "metric") untested on a real ckpt.
   - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
 
-- [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
-      317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
-      reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
-      torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
-      modern-CNN stretch goal on the same path):
-  - [ ] real downloaded torchvision resnet18/50 top-1 over ImageNet val
-        (torchvision not installed here); ConvNeXt modern-CNN stretch goal. (The
-        torchvision .pth load path + PyTorch stem maxpool reconciliation have
-        landed.)
 - [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
       LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
       mid block single self-attention over HxW -> up blocks of ResNet groups +
@@ -501,17 +480,10 @@ rather than acted on.
       upsample = TNNetDeMaxPool(2) FSpacing=0; mid attention flattens (H,W,C)->
       (H*W,1,C) per-token SDPA; added GroupNormEpsilon to TNNetGroupNorm to pin
       diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
-  - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
-        installable; SDXL VAE uses different group counts / multi-head attention.
+  - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity (diffusers is in the
+        ~/x venv; not run yet); SDXL VAE uses different group counts / multi-head attention.
   - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
         UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
-    - [ ] real-checkpoint parity (runwayml/stable-diffusion-v1-5 / SDXL unet)
-          once diffusers is installable. (Per-block attention-head arrays —
-          SDXL-style attention_head_dim list via Config.HeadsPerBlock — have
-          landed, parity < 1e-4.)
-    - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
-          scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
-          embedding + real-checkpoint parity.
     - [ ] Real Stable Diffusion text-to-image from a diffusers folder (audit
           2026-10-02). No example loads a real SD checkpoint today: every SD
           example defaults to the tests/fixtures pico nets, and all of them fill
@@ -558,7 +530,7 @@ rather than acted on.
             then SDXL.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
-      shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2 / Pixtral):
+      shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
       CogVLM routes IMAGE tokens and TEXT tokens through SEPARATE per-block
       weights — a dedicated "visual expert" with its own QKV and FFN matrices
       running in parallel with the language QKV/FFN, selected per token by
@@ -938,9 +910,9 @@ rather than acted on.
         - [ ] `ShouldUseInterleavedDotProduct` picks `InterleavedDotProduct` for
           every conv with a multiple of 32 neurons; on 1D convs it is slower than
           `DotProductsTiled`: same conv at 250 ch (tiled) 199 ms serial / 89 ms
-          threaded vs 256 ch (interleaved) 260 / 161-189 ms. Kokoro's 128/256/512
-          channel convs all take the interleaved path. Measure on 2D convs too
-          before changing the heuristic.
+          threaded vs 256 ch (interleaved) 260 / 161-189 ms. Kokoro stage A's
+          128/256/512 channel convs take the interleaved path. Measure on 2D convs
+          too before changing the heuristic.
         - [ ] OpenCL weight borrowing (`BuildWeightOwner` + `EnableOpenCLInContextOf`)
           is not tested for `TNNetConv1DLinear` (the CPU borrowing build is).
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
@@ -959,11 +931,8 @@ rather than acted on.
           `pcr_sinf` loop; the per-channel path is vectorized.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
           activation chain are unmeasured on a GPU (PoCL parity only).
-  - [ ] 0.5 Stage-net holder for Kokoro: owner nets for stages A/B/C built once
-        from the checkpoint, `PrepareNet(T)` / `PrepareNet(F)` borrowing rebuild that
-        exits early when the length is unchanged, OpenCL arming as in
-        `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
-        code path; do not clone it.
+  - [ ] 0.5 Stage-net holder for Kokoro (stage A: `TNNetKokoro.PrepareStageA`;
+        stages B/C run as plain code). Open:
         - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
           is known), so a borrowing build allocates and frees each table: 3
           tables, 114,176 floats on the real checkpoint. Other layers size none.
@@ -981,14 +950,12 @@ rather than acted on.
           "albert"; pooler / classifier / int8 refused.
   - [x] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
         LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
-        - [ ] `TNNetGRUCell` has no input-width option.
   - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
         1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
         ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
         `THiFiGANConv` (or the `TNNet` equivalent).
         - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
-          pool downloads its source and re-uploads its output (2 pools in stage
-          B, 9 of 63 layers off OpenCL in a forced run; stage C has more).
+          grouped deconvolution downloads its source and re-uploads its output.
         - [ ] A Y factor other than the X factor on SizeY > 1 runs
           `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
   - [x] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
@@ -1164,9 +1131,10 @@ rather than acted on.
       neuralimagemetrics.pas, examples/ImageNetEval; synthetic smoke + --full <dir>
       real-val hook, TestNeuralImageMetrics green). Open follow-up:
   - [ ] Run against REAL ImageNet-val: wire one landed classifier importer
-        (BuildResNetFromSafeTensors etc.) over a real checkpoint + the 50k-image
-        ImageNet-val set and compare top-1/top-5 to the published torchvision numbers
-        (the smoke is synthetic-only by design). Mind the multi-GB RAM budget.
+        (BuildResNetFromSafeTensors resnet18/50 etc.) over a real checkpoint + the
+        50k-image ImageNet-val set and compare top-1/top-5 to the published
+        torchvision numbers (the smoke is synthetic-only by design; torchvision
+        not installed here). Mind the multi-GB RAM budget.
 
 - [ ] End-to-end latent text-to-image generation example (examples/LatentTextToImage)
       that finally CHAINS the imported generative pieces into one pipeline on CPU.
@@ -1682,32 +1650,7 @@ rather than acted on.
       `QwenImageInpaintPipeline` (`pipelines/qwenimage/pipeline_qwenimage_inpaint.py`
       in the ~/x venv), the no-retrain blended mode; the img2img path it extends
       is already in `TQwenImage21Pipeline` (`EncodeImage`, `Img2ImgStartStep`,
-      `ScaleNoise` in `DenoiseAt`). What is new:
-      - Mask to latents: grayscale, binarize at 0.5, nearest-resize to the VAE
-        latent grid (image side / 8), then pack each 2x2 patch the way the image
-        latents are packed, so the mask has the (GridH*GridW,1,in_channels)
-        layout of `Latents` (each token's 64 channels take the mask value of
-        their own sub-pixel). Put this next to `EncodeImage`, not in the example.
-      - `DenoiseAt` calls `ScaleNoise(Latents, ImageLatents, StartStep)`, which
-        overwrites the noise in place, so copy the noise first and keep it.
-        After every `FScheduler.Step`, set `Known` to that noise and run
-        `ScaleNoise(Known, ImageLatents, StepPos + 1)` (after the last step,
-        `Known` is the clean `ImageLatents`). Then blend
-        `Latents := Known + Mask * (Latents - Known)`. `SDUNetDenoiseInpaint`
-        already runs that blend inline (Sub, `TNNetVolume.Mul` by the mask, Add);
-        move it into one shared helper used by both samplers rather than writing
-        a second copy. Allocate `Known` and the noise copy once per image,
-        outside the step loop.
-      - Optional `--mask-blur N` and diffusers' `padding_mask_crop` (crop to the
-        mask's bounding box plus padding, generate at full resolution, paste
-        back) are follow-ups; the second is what makes a small hole in a large
-        photo cheap.
-      Tests: a pico-fixture test where the kept latent region equals
-      `ImageLatents` exactly after the last step and the hole differs, plus a
-      latent-trajectory parity check against diffusers on `tests/fixtures/
-      tiny_qwenimage21`, modelled on `tiny_qwenimage21_img2img_io.json` (the
-      oracle comes from the ~/x venv; the test itself stays Pascal). Update the examples/QwenImage README with one real
-      1024x1024 inpaint on the GPU box (user run).
+      `ScaleNoise` in `DenoiseAt`).
       Status (2026-10-20): CODED and parity-tested on the pico checkpoint.
       `QwenImage21MaskToLatents` / `TQwenImage21Pipeline.EncodeMask`, a
       `MaskLatents` argument on `Denoise` / `GenerateFromEmbeds`, the shared
@@ -1716,7 +1659,7 @@ rather than acted on.
       `TestQwenImage21InpaintMaskLatents`, `...InpaintKeepsKnown`,
       `...InpaintParity` (oracle `tiny_qwenimage21_inpaint_io.json` from
       `tools/make_pico_qwenimage21_img2img_fixture.py --inpaint-only`).
-      Correction to the plan above: 2.1 latents are unpatched (VAE factor 16,
+      Note: 2.1 latents are unpatched (VAE factor 16,
       diffusers 2.1 `_pack_latents` is a plain flatten), so there is no 2x2
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
@@ -2258,10 +2201,11 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Property-based gradient harness v0: randomize input shape (keeping
       layer type fixed) for the 6 most recently landed layers. Catches
       shape-edge bugs hand-written tests miss.
-- [ ] Continue upsampling/deconvolution audit: TNNetDeconvolution input
-      AND weight gradients (Upsample / DeMaxPool / DeAvgPool already
-      covered). Likely benefits from the Double-precision SSE accumulator
-      helper above.
+- [ ] Continue upsampling/deconvolution audit: TNNetDeconvolution input-
+      gradient and full weight-gradient finite-difference checks (one-weight
+      check in TestDeconvolutionGradient only; Upsample / DeMaxPool / DeAvgPool
+      already covered). Likely benefits from the Double-precision accumulator
+      of DeMaxPoolFamilyGradientCheck (tests/TestNeuralNumerical.pas).
 - [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient path
       (sparse-update pattern — easy place for a silent broadcast/reduction
       bug), TNNetTokenAndPositionalEmbedding, etc.
