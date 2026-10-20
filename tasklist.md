@@ -1674,7 +1674,7 @@ rather than acted on.
         prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope after C3a with an L4 measurement.
-- [ ] Qwen-Image inpainting: `--init-image FILE --mask FILE` in examples/QwenImage
+- [~] Qwen-Image inpainting: `--init-image FILE --mask FILE` in examples/QwenImage
       (and `/mask FILE|off` in the REPL) regenerates only the white region of a
       mask image and keeps the rest of the init image. Port of diffusers
       `QwenImageInpaintPipeline` (`pipelines/qwenimage/pipeline_qwenimage_inpaint.py`
@@ -1706,6 +1706,23 @@ rather than acted on.
       tiny_qwenimage21`, modelled on `tiny_qwenimage21_img2img_io.json` (the
       oracle comes from the ~/x venv; the test itself stays Pascal). Update the examples/QwenImage README with one real
       1024x1024 inpaint on the GPU box (user run).
+      Status (2026-10-20): CODED and parity-tested on the pico checkpoint.
+      `QwenImage21MaskToLatents` / `TQwenImage21Pipeline.EncodeMask`, a
+      `MaskLatents` argument on `Denoise` / `GenerateFromEmbeds`, the shared
+      `InpaintBlend` (neuraldiffusion.pas, also used by `SDUNetDenoiseInpaint`),
+      `--mask` / `/mask` and the README section. Tests
+      `TestQwenImage21InpaintMaskLatents`, `...InpaintKeepsKnown`,
+      `...InpaintParity` (oracle `tiny_qwenimage21_inpaint_io.json` from
+      `tools/make_pico_qwenimage21_img2img_fixture.py --inpaint-only`).
+      Correction to the plan above: 2.1 latents are unpatched (VAE factor 16,
+      diffusers 2.1 `_pack_latents` is a plain flatten), so there is no 2x2
+      packing; each token's channels all take that token's mask value.
+      - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
+            example output.
+      - [ ] `--mask-blur N` (diffusers `mask_processor.blur`).
+      - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
+            generate at full resolution, paste back (`apply_overlay`); makes a
+            small hole in a large photo cheap.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1

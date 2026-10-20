@@ -370,6 +370,12 @@ type
     property MaxShift: double read FMaxShift;
   end;
 
+// Blended (no-retrain) inpainting composite, in place on Latents:
+// Latents := Known + Mask * (Latents - Known). Mask is 1 in the hole (follow
+// the sampler) and 0 where Known is kept; a 0 keeps Known exactly. All three
+// have the same size.
+procedure InpaintBlend(Latents, Known, Mask: TNNetVolume);
+
 implementation
 
 uses
@@ -1561,6 +1567,18 @@ begin
     raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
       ' with ' + IntToStr(NumSteps) + ' steps leaves no step to run; raise ' +
       'the strength or the step count.');
+end;
+
+procedure InpaintBlend(Latents, Known, Mask: TNNetVolume);
+begin
+  if (Known.Size <> Latents.Size) or (Mask.Size <> Latents.Size) then
+    raise Exception.Create('InpaintBlend: ' + IntToStr(Latents.Size) +
+      ' latent values, ' + IntToStr(Known.Size) + ' known and ' +
+      IntToStr(Mask.Size) + ' mask values.');
+  // m*L + (1-m)*K = K + m*(L-K), in place (rule #13, no scratch).
+  Latents.Sub(Known);
+  TNNetVolume.Mul(Latents.GetRawPtr(0), Mask.GetRawPtr(0), Latents.Size);
+  Latents.Add(Known);
 end;
 
 procedure TNNetFlowMatchEulerScheduler.ScaleNoise(Noise, Sample: TNNetVolume;

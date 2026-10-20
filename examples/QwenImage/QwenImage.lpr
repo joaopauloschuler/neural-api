@@ -24,8 +24,8 @@ input ends the session). Images go to numbered files from the --output base
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
-/images [clear], /init-image FILE|off, /strength S, /profile on|off,
-/stats on|off, /quit.
+/images [clear], /init-image FILE|off, /mask FILE|off, /strength S,
+/profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -43,6 +43,16 @@ The output keeps the init image's aspect ratio at the area of --width x
 --height (sides multiples of 32, as diffusers' calculate_dimensions).
 Images are resized with PIL's Lanczos coefficients in float. EXIF
 orientation is not applied.
+
+Inpainting (--init-image FILE --mask FILE, or /mask FILE in the REPL): img2img
+that regenerates only the white region of the mask and keeps the rest of the
+init image (diffusers QwenImageInpaintPipeline's blended mode, no retrained
+model). The mask is read as grayscale (alpha ignored), stretched to the
+output size, binarized at 50% and taken per 16x16-pixel latent cell (each
+cell's top-left pixel decides). After every step the kept cells are reset to
+the init image's latents at the next noise level, and to the latents
+themselves after the last step. --strength 1 regenerates the hole from pure
+noise; lower values keep more of the init image inside the hole too.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -54,7 +64,8 @@ USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
-            [--repeat N] [--image FILE ... | --init-image FILE [--strength 0.6]]
+            [--repeat N] [--image FILE ... |
+             --init-image FILE [--mask FILE] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -435,6 +446,12 @@ begin
   WriteLn('                       ratio at the area of --width x --height. It ',
     're-styles the image;');
   WriteLn('                       it does not follow edit instructions.');
+  WriteLn('  --mask FILE          with --init-image: inpaint; only the ',
+    'mask''s white region is');
+  WriteLn('                       regenerated (grayscale, 50% threshold, ',
+    'stretched to the output');
+  WriteLn('                       size, decided per 16x16 cell), the rest ',
+    'keeps the init image');
   WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
     csDefaultStrength:0:1, '): runs only the last');
   WriteLn('                       part of the schedule (18 steps at 0.6: the ',
@@ -528,6 +545,9 @@ begin
   WriteLn('                       the vision tower and the VAE encoder');
   WriteLn('  /init-image FILE     init image for the next prompts (img2img); ',
     '/init-image off clears it');
+  WriteLn('  /mask FILE           inpaint mask for the init image (white = ',
+    'regenerate); /mask off');
+  WriteLn('                       clears it');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
@@ -688,6 +708,13 @@ var
   InitImageFile: string;
   InitImage, ImageLatents: TNNetVolume;
   ImageLatentsWidth, ImageLatentsHeight: integer;
+  // Inpainting: the mask as read (0..255) and its latents, encoded at
+  // MaskLatentsWidth x MaskLatentsHeight (0: not encoded yet). It only
+  // applies while an init image is set.
+  HasMask: boolean;
+  MaskFile: string;
+  MaskImage, MaskLatents: TNNetVolume;
+  MaskLatentsWidth, MaskLatentsHeight: integer;
   // Edit: the condition images as read (0..255) and their files; the
   // pipeline holds their encoding at ConditionEncodedArea pixels (0: none).
   // ImageArgFiles: the --image files, read once the output area is known.
@@ -827,6 +854,46 @@ var
     ImageLatentsHeight := 0;
   end;
 
+  // Loads FileName as the inpaint mask (any size: it is stretched to the
+  // output size); otherwise returns what is wrong and changes nothing.
+  function LoadMask(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    Result := '';
+    Loaded := TNNetVolume.Create();
+    try
+      try
+        if not LoadImageFromFileIntoVolume(FileName, Loaded, true) then
+          Result := 'could not read ' + FileName + '.';
+      except
+        on E: Exception do Result := 'could not read ' + FileName + ': ' +
+          E.Message;
+      end;
+      if Result <> '' then exit;
+      MaskImage.Copy(Loaded);
+    finally
+      Loaded.Free;
+    end;
+    HasMask := true;
+    MaskFile := FileName;
+    MaskLatentsWidth := 0;
+    MaskLatentsHeight := 0;
+  end;
+
+  // An init image and a mask are set.
+  function IsInpainting(): boolean;
+  begin
+    Result := HasInitImage and HasMask;
+  end;
+
+  // The mask latents for GenerateFromEmbeds: nil unless inpainting.
+  function ActiveMaskLatents(): TNNetVolume;
+  begin
+    if IsInpainting() then Result := MaskLatents
+    else Result := nil;
+  end;
+
   // Appends FileName to the condition images when it reads and fits;
   // otherwise returns what is wrong and changes nothing.
   function AddConditionImage(const FileName: string): string;
@@ -919,6 +986,14 @@ var
     // Raises when the strength leaves no step.
     TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
     GetOutputSize(OutputWidth, OutputHeight);
+    if IsInpainting() and ((MaskLatentsWidth <> OutputWidth) or
+      (MaskLatentsHeight <> OutputHeight)) then
+    begin
+      MaskLatentsWidth := 0;
+      Pipeline.EncodeMask(MaskImage, OutputWidth, OutputHeight, MaskLatents);
+      MaskLatentsWidth := OutputWidth;
+      MaskLatentsHeight := OutputHeight;
+    end;
     if (ImageLatentsWidth = OutputWidth) and
       (ImageLatentsHeight = OutputHeight) then exit;
     ImageLatentsWidth := 0;
@@ -966,6 +1041,9 @@ var
     WriteLn('Init image : ', InitImageFile, ' (', InitImage.SizeX, 'x',
       InitImage.SizeY, '), strength ', StrengthText(Strength), ', the last ',
       StepCount - StartStep, ' of ', StepCount, ' steps');
+    if IsInpainting() then
+      WriteLn('Mask       : ', MaskFile, ' (', MaskImage.SizeX, 'x',
+        MaskImage.SizeY, '), only its white region is regenerated');
   end;
 
   // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
@@ -1012,7 +1090,8 @@ var
     GetOutputSize(OutputWidth, OutputHeight);
     if HasInitImage then
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
-        StepCount, Seed, Image, nil, ImageLatents, Strength)
+        StepCount, Seed, Image, nil, ImageLatents, Strength,
+        ActiveMaskLatents())
     else if IsEditing() then
       Pipeline.GenerateEditFromEmbeds(PromptEmbeds, TextLengths, OutputWidth,
         OutputHeight, StepCount, Seed, Image)
@@ -1050,6 +1129,8 @@ var
   // One image at Seed to the next numbered --output file (Numbered) or to
   // --output; the seed then grows by one, also when the image fails.
   procedure GenerateNextImage(Numbered: boolean);
+  const
+    ModeText: array[boolean] of string = ('img2img', 'inpaint');
   var
     ImageFile, StepText: string;
     OutputWidth, OutputHeight: integer;
@@ -1060,8 +1141,8 @@ var
     GetOutputSize(OutputWidth, OutputHeight);
     StepText := IntToStr(StepCount) + ' steps';
     if HasInitImage then
-      StepText := Format('img2img strength %s, the last %d of %d steps',
-        [StrengthText(Strength), StepCount -
+      StepText := Format('%s strength %s, the last %d of %d steps',
+        [ModeText[IsInpainting()], StrengthText(Strength), StepCount -
         TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength),
         StepCount])
     else if IsEditing() then
@@ -1325,6 +1406,34 @@ var
         end;
       end;
     end
+    else if Command = 'mask' then
+    begin
+      if Argument = '' then
+        WriteLn('[/mask: expected /mask FILE or /mask off]')
+      else if LowerCase(Argument) = 'off' then
+      begin
+        HasMask := false;
+        MaskLatentsWidth := 0;
+        if HasInitImage then WriteLn('[mask off: img2img]')
+        else WriteLn('[mask off]');
+      end
+      else
+      begin
+        Problem := LoadMask(Argument);
+        if Problem <> '' then
+        begin
+          if HasMask then
+            WriteLn('[/mask: ', Problem, ' - the mask ', MaskFile,
+              ' stays active]')
+          else WriteLn('[/mask: ', Problem, ' - no mask is set]');
+        end
+        else if HasInitImage then
+          WriteLn('[mask ', MaskFile, ' (', MaskImage.SizeX, 'x',
+            MaskImage.SizeY, '): inpainting ', InitImageFile, ']')
+        else WriteLn('[mask ', MaskFile, ' (', MaskImage.SizeX, 'x',
+          MaskImage.SizeY, '): applies once /init-image sets an init image]');
+      end;
+    end
     else if Command = 'strength' then
     begin
       Problem := ParseStrength(Argument, NewStrength);
@@ -1352,8 +1461,8 @@ var
       end;
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
-      '/tile, /repeat, /image, /images, /init-image, /strength, /profile, ',
-      '/stats, /quit]');
+      '/tile, /repeat, /image, /images, /init-image, /mask, /strength, ',
+      '/profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -1366,8 +1475,8 @@ var
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
-      '/init-image FILE|off, /strength S, /profile on|off, /stats on|off, ',
-      '/quit.');
+      '/init-image FILE|off, /mask FILE|off, /strength S, /profile on|off, ',
+      '/stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -1420,6 +1529,10 @@ begin
   InitImageFile := '';
   ImageLatentsWidth := 0;
   ImageLatentsHeight := 0;
+  HasMask := false;
+  MaskFile := '';
+  MaskLatentsWidth := 0;
+  MaskLatentsHeight := 0;
   InputImageEncodeNumber := 0;
   ConditionFiles := TStringList.Create;
   ImageArgFiles := TStringList.Create;
@@ -1470,6 +1583,7 @@ begin
       ImageArgFiles.Add(NextArg());
     end
     else if Arg = '--init-image' then InitImageFile := NextArg()
+    else if Arg = '--mask' then MaskFile := NextArg()
     else if Arg = '--strength' then
     begin
       HasStrengthArg := true;
@@ -1551,6 +1665,12 @@ begin
     WriteLn('--image (edit) and --init-image (img2img) are exclusive.');
     Halt(2);
   end;
+  if (MaskFile <> '') and (InitImageFile = '') and
+    (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--mask needs --init-image (the image it keeps).');
+    Halt(2);
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
@@ -1564,6 +1684,8 @@ begin
   Image := TNNetVolume.Create();
   InitImage := TNNetVolume.Create();
   ImageLatents := TNNetVolume.Create();
+  MaskImage := TNNetVolume.Create();
+  MaskLatents := TNNetVolume.Create();
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -1629,6 +1751,14 @@ begin
       if ArgProblem <> '' then
         raise Exception.Create('--init-image: ' + ArgProblem);
     end;
+    if MaskFile <> '' then
+    begin
+      ArgProblem := LoadMask(MaskFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--mask: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--mask applies once /init-image sets an init image]');
+    end;
     for ArgPos := 0 to ImageArgFiles.Count - 1 do
     begin
       ArgProblem := AddConditionImage(ImageArgFiles[ArgPos]);
@@ -1681,6 +1811,8 @@ begin
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}
+    MaskLatents.Free;
+    MaskImage.Free;
     ImageLatents.Free;
     InitImage.Free;
     Image.Free;

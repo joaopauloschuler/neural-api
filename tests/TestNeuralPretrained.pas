@@ -966,6 +966,9 @@ type
     procedure TestQwenImage21SizeForAspect;
     procedure TestQwenImage21Img2ImgParity;
     procedure TestQwenImage21Img2ImgKeepLoaded;
+    procedure TestQwenImage21InpaintMaskLatents;
+    procedure TestQwenImage21InpaintKeepsKnown;
+    procedure TestQwenImage21InpaintParity;
     procedure TestQwen3VLVisionConfig;
     procedure TestQwen3VLVisionPreprocessParity;
     procedure TestQwen3VLVisionRope;
@@ -35066,6 +35069,373 @@ begin
     LatentsOneShot.Free;
     InitImage.Free;
     Embeds.Free;
+  end;
+end;
+
+// QwenImage21MaskToLatents: the oracle's RGB mask bit for bit (PIL 'L' luma,
+// binarized at 0.5, nearest to the latent grid, every channel of a token),
+// a gray mask at the 127/128 edge, RGBA (alpha ignored), a resized mask and
+// the refusals.
+procedure TTestNeuralPretrained.TestQwenImage21InpaintMaskLatents;
+const
+  Channels = 3;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Loaded, Mask, MaskLatents, Expected: TNNetVolume;
+  ValuePos, MaxValuePos, X, Y, TokenPos: integer;
+  ExpectedValue: TNeuralFloat;
+
+  // Every channel of token (X, Y) of the 4x4 grid holds Value.
+  procedure AssertToken(const What: string; TokenX, TokenY: integer;
+    Value: TNeuralFloat);
+  var
+    ChannelPos: integer;
+  begin
+    for ChannelPos := 0 to Channels - 1 do
+      AssertEquals(What + ' token (' + IntToStr(TokenX) + ', ' +
+        IntToStr(TokenY) + ') channel ' + IntToStr(ChannelPos), Value,
+        MaskLatents.FData[(TokenY * 4 + TokenX) * Channels + ChannelPos]);
+  end;
+
+  function IsRefused(Width, Height, Depth: integer): boolean;
+  begin
+    Result := false;
+    Mask.ReSize(Width, Height, Depth);
+    Mask.Fill(255);
+    try
+      QwenImage21MaskToLatents(Mask, Width, Height, Channels, MaskLatents);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Loaded := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  MaskLatents := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_inpaint_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(RefRoot, 'mask_hwc', Loaded);
+    Mask.ReSize(64, 64, 3);
+    AssertEquals('oracle mask size', Mask.Size, Loaded.Size);
+    MaxValuePos := Mask.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Mask.FData[ValuePos] := Loaded.FData[ValuePos];
+    LoadOracleTokenTensor(RefRoot, 'mask_latents', Expected);
+    QwenImage21MaskToLatents(Mask, 64, 64, Expected.Depth, MaskLatents);
+    AssertEquals('mask tokens', Expected.SizeX, MaskLatents.SizeX);
+    AssertEquals('mask rows', 1, MaskLatents.SizeY);
+    AssertEquals('mask channels', Expected.Depth, MaskLatents.Depth);
+    AssertEquals('oracle mask latents', 0, MaxAbsVolumeDiff(MaskLatents,
+      Expected), 0);
+
+    // Gray: 128 regenerates, 127 keeps; only each cell's top-left counts.
+    Mask.ReSize(64, 64, 1);
+    Mask.Fill(255);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        if (X + Y) mod 2 = 0 then Mask[X * 16, Y * 16, 0] := 128
+        else Mask[X * 16, Y * 16, 0] := 127;
+    QwenImage21MaskToLatents(Mask, 64, 64, Channels, MaskLatents);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+      begin
+        if (X + Y) mod 2 = 0 then ExpectedValue := 1 else ExpectedValue := 0;
+        AssertToken('gray', X, Y, ExpectedValue);
+      end;
+
+    // RGBA: a transparent white mask still regenerates everything.
+    Mask.ReSize(64, 64, 4);
+    Mask.Fill(255);
+    Mask.FillAtDepth(3, 0);
+    QwenImage21MaskToLatents(Mask, 64, 64, Channels, MaskLatents);
+    for TokenPos := 0 to 15 do
+      AssertToken('rgba', TokenPos mod 4, TokenPos div 4, 1);
+
+    // 8x8 -> 64x64: columns 0..4 white end at source x 4.5; the cells sample
+    // source x -0.44, 1.56, 3.56 (white) and 5.56 (black).
+    Mask.ReSize(8, 8, 3);
+    Mask.Fill(0);
+    for Y := 0 to 7 do
+      for X := 0 to 4 do
+      begin
+        Mask[X, Y, 0] := 255;
+        Mask[X, Y, 1] := 255;
+        Mask[X, Y, 2] := 255;
+      end;
+    QwenImage21MaskToLatents(Mask, 64, 64, Channels, MaskLatents);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+      begin
+        if X < 3 then ExpectedValue := 1 else ExpectedValue := 0;
+        AssertToken('resized', X, Y, ExpectedValue);
+      end;
+
+    AssertTrue('a side off the 16-pixel grid is refused',
+      IsRefused(40, 64, 3));
+    AssertTrue('a two-channel mask is refused', IsRefused(64, 64, 2));
+  finally
+    Expected.Free;
+    MaskLatents.Free;
+    Mask.Free;
+    Loaded.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Inpainting on the pico pipeline: after every step the kept tokens (mask 0)
+// equal the image latents noised with the same noise to the next sigma, bit
+// for bit, and the image latents themselves after the last step; the hole
+// differs from them. Plus Denoise's mask refusals.
+procedure TTestNeuralPretrained.TestQwenImage21InpaintKeepsKnown;
+const
+  StepCount = 4;
+  Strength = 0.75;
+  Side = 64;
+  GridSide = Side div 16;
+var
+  RefJson: TStringList;
+  EmbedsRoot: TJSONData;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, InitImage, ImageLatents, MaskLatents, Mask, Noise, Known, Latents,
+    Image, SmallMask: TNNetVolume;
+  StartStep, StepPos, RecordPos, TokenPos, ChannelPos, ValuePos, X, Y,
+    Channels, HoleCount: integer;
+  HoleDiff, Diff: double;
+
+  function IsDenoiseRefused(ImageLatentsArg, MaskArg: TNNetVolume): boolean;
+  begin
+    Result := false;
+    Latents.Copy(Noise);
+    try
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents, 0,
+        ImageLatentsArg, MaskArg);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  MaskLatents := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Known := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  SmallMask := TNNetVolume.Create;
+  SetLength(FQwenImage21Phases, 0);
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    FillQwenImage21FormulaImage(InitImage, Side, Side, 3);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    Pipeline.EncodeImage(InitImage, Side, Side, ImageLatents);
+    // Cells (1, 0), (2, 1) and (0, 3) are the hole.
+    Mask.ReSize(Side, Side, 3);
+    Mask.Fill(0);
+    for Y := 0 to Side - 1 do
+      for X := 0 to Side - 1 do
+        if ((X div 16 = 1) and (Y div 16 = 0)) or
+          ((X div 16 = 2) and (Y div 16 = 1)) or
+          ((X div 16 = 0) and (Y div 16 = 3)) then
+          for ChannelPos := 0 to 2 do Mask[X, Y, ChannelPos] := 255;
+    Pipeline.EncodeMask(Mask, Side, Side, MaskLatents);
+    Channels := Pipeline.TransformerConfig.InChannels;
+    AssertEquals('mask size', ImageLatents.Size, MaskLatents.Size);
+    Pipeline.MakeInitialLatents(Side, Side, 7, Noise);
+
+    Pipeline.GenerateFromEmbeds(Embeds, Side, Side, StepCount, {Seed=}0,
+      Image, Noise, ImageLatents, Strength, MaskLatents);
+    AssertTrue('stats: init image', Pipeline.ImageStats.UsedInitImage);
+    AssertTrue('stats: mask', Pipeline.ImageStats.UsedMask);
+    StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount,
+      Strength);
+    AssertEquals('steps run', StepCount - StartStep,
+      Length(FQwenImage21StepLatents));
+    HoleDiff := 0;
+    for RecordPos := 0 to High(FQwenImage21StepLatents) do
+    begin
+      StepPos := StartStep + RecordPos;
+      if StepPos < StepCount - 1 then
+      begin
+        Known.Copy(Noise);
+        Pipeline.Scheduler.ScaleNoise(Known, ImageLatents, StepPos + 1);
+      end
+      else Known.Copy(ImageLatents);
+      HoleCount := 0;
+      for TokenPos := 0 to GridSide * GridSide - 1 do
+      begin
+        if MaskLatents.FData[TokenPos * Channels] = 0 then
+        begin
+          for ChannelPos := 0 to Channels - 1 do
+          begin
+            ValuePos := TokenPos * Channels + ChannelPos;
+            AssertEquals('step ' + IntToStr(RecordPos) + ' kept token ' +
+              IntToStr(TokenPos), Known.FData[ValuePos],
+              FQwenImage21StepLatents[RecordPos].FData[ValuePos], 0);
+          end;
+        end
+        else
+        begin
+          Inc(HoleCount);
+          if RecordPos = High(FQwenImage21StepLatents) then
+            for ChannelPos := 0 to Channels - 1 do
+            begin
+              ValuePos := TokenPos * Channels + ChannelPos;
+              Diff := Abs(ImageLatents.FData[ValuePos] -
+                FQwenImage21StepLatents[RecordPos].FData[ValuePos]);
+              if Diff > HoleDiff then HoleDiff := Diff;
+            end;
+        end;
+      end;
+      AssertEquals('hole tokens', 3, HoleCount);
+    end;
+    WriteLn('  Qwen-Image-2.1 inpaint hole vs image latents: max|diff|=',
+      HoleDiff:0:6);
+    AssertTrue('the hole is regenerated', HoleDiff > 1e-3);
+    AssertEquals('image width', Side, Image.SizeX);
+
+    AssertTrue('a mask without image latents is refused',
+      IsDenoiseRefused(nil, MaskLatents));
+    Pipeline.EncodeMask(Mask, Side, Side div 2, SmallMask);
+    AssertTrue('a mask of another size is refused',
+      IsDenoiseRefused(ImageLatents, SmallMask));
+  finally
+    for RecordPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[RecordPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    SmallMask.Free;
+    Image.Free;
+    Latents.Free;
+    Known.Free;
+    Noise.Free;
+    Mask.Free;
+    MaskLatents.Free;
+    ImageLatents.Free;
+    InitImage.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Inpainting on the pico pipeline vs the float64 diffusers oracle (the v1
+// QwenImageInpaintPipeline's mask and blend on the 2.1 pipeline): the mask
+// latents exactly, then every step's blended latents (img2img's 5e-5).
+procedure TTestNeuralPretrained.TestQwenImage21InpaintParity;
+const
+  LatentTolerance = 5e-5;
+var
+  RefJson: TStringList;
+  RefRoot, EmbedsRoot: TJSONData;
+  StepArr, TimestepArr: TJSONArray;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, InitImage, ImageLatents, Loaded, Mask, MaskLatents, Noise,
+    Expected, Image: TNNetVolume;
+  Width, Height, StepCount, StepsRun, StepPos, ValuePos,
+    MaxValuePos: integer;
+  Strength, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  Loaded := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  MaskLatents := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  SetLength(FQwenImage21Phases, 0);
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_inpaint_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    StepCount := TJSONObject(RefRoot).Get('num_inference_steps', 0);
+    Strength := TJSONObject(RefRoot).Get('strength', 0.0);
+    StepsRun := TJSONObject(RefRoot).Get('steps_run', 0);
+    LoadOracleTokenTensor(RefRoot, 'noise', Noise);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    FillQwenImage21FormulaImage(InitImage, Width, Height, 4);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    Pipeline.EncodeImage(InitImage, Width, Height, ImageLatents);
+
+    LoadOracleTokenTensor(RefRoot, 'mask_hwc', Loaded);
+    Mask.ReSize(Width, Height, 3);
+    AssertEquals('oracle mask size', Mask.Size, Loaded.Size);
+    MaxValuePos := Mask.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Mask.FData[ValuePos] := Loaded.FData[ValuePos];
+    Pipeline.EncodeMask(Mask, Width, Height, MaskLatents);
+    LoadOracleTokenTensor(RefRoot, 'mask_latents', Expected);
+    AssertEquals('mask latents', 0, MaxAbsVolumeDiff(MaskLatents, Expected),
+      0);
+
+    Pipeline.GenerateFromEmbeds(Embeds, Width, Height, StepCount, {Seed=}0,
+      Image, Noise, ImageLatents, Strength, MaskLatents);
+    StepArr := TJSONArray(TJSONObject(RefRoot).Find('step_latents'));
+    TimestepArr := TJSONArray(TJSONObject(RefRoot).Find('timesteps'));
+    AssertEquals('steps run', StepsRun, Length(FQwenImage21StepLatents));
+    AssertEquals('oracle steps', StepsRun, StepArr.Count);
+    for StepPos := 0 to StepsRun - 1 do
+    begin
+      AssertEquals('timestep ' + IntToStr(StepPos),
+        TimestepArr.Floats[StepPos], FQwenImage21StepTimesteps[StepPos], 5e-4);
+      LoadOracleTokenTensorObject(StepArr.Items[StepPos], 'step_latents',
+        Expected);
+      MaxDiff := MaxAbsVolumeDiff(FQwenImage21StepLatents[StepPos], Expected);
+      WriteLn('  Qwen-Image-2.1 inpaint latents after step ', StepPos,
+        ': max|diff|=', MaxDiff:0:9);
+      AssertTrue('inpaint latents after step ' + IntToStr(StepPos) +
+        ': max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < LatentTolerance);
+    end;
+  finally
+    for StepPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[StepPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    Image.Free;
+    Expected.Free;
+    Noise.Free;
+    MaskLatents.Free;
+    Mask.Free;
+    Loaded.Free;
+    ImageLatents.Free;
+    InitImage.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 

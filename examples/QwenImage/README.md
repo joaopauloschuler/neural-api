@@ -38,7 +38,9 @@ itself when it finds no usable OpenCL device.
 `--image FILE` (repeatable) gives condition images to edit by the prompt
 (see [Image editing](#image-editing)). `--init-image FILE` starts from an
 init image instead of pure noise (SDEdit img2img, see
-[img2img](#img2img-sdedit)): it re-styles the image.
+[img2img](#img2img-sdedit)): it re-styles the image. Adding `--mask FILE`
+regenerates only the mask's white region and keeps the rest of the init
+image (see [Inpainting](#inpainting)).
 
 **Flag change:** SDEdit img2img used to be `--image FILE` and `/image FILE`.
 It is now `--init-image FILE` and `/init-image FILE|off`; `--image` and
@@ -144,6 +146,7 @@ follow:
 | `/image FILE` | add a condition image (edit, as `--image`) for the next prompts, up to 10 |
 | `/images` | list the condition images; `/images clear` removes them all (back to text-to-image) and frees the vision tower and the VAE encoder |
 | `/init-image FILE` | init image for the next prompts (img2img, as `--init-image`); `/init-image off` clears it |
+| `/mask FILE` | inpaint mask for the init image (as `--mask`); `/mask off` clears it |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/profile on\|off` | `--profile` from the next image |
@@ -290,6 +293,45 @@ seed. In keep-loaded mode (the REPL, `--repeat N` > 1) the first encode
 loads the VAE encoder and keeps it beside the other components; a one-shot
 run loads it and frees it after the encode.
 
+### Inpainting
+
+`--mask FILE` with `--init-image FILE` (or `/mask FILE` in the REPL while an
+init image is set) regenerates only the white region of the mask and keeps
+the black region of the init image:
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image room.png \
+  --mask room_mask.png --strength 1 -p "a red armchair by the window" \
+  --output armchair.png
+```
+
+This is the blended (no-retrain) mode of the diffusers Qwen-Image v1
+`QwenImageInpaintPipeline` on top of the img2img path above; diffusers ships
+no inpaint pipeline for 2.1.
+
+1. The mask is read as grayscale (PIL's `L` weights, alpha ignored),
+   stretched to the output size (the init image's), binarized at 50% and
+   reduced to the latent grid by nearest sampling: one value per 16x16-pixel
+   cell, taken from the cell's top-left pixel. In 2.1 a latent cell is one
+   transformer token, so a cell is either regenerated or kept as a whole.
+2. The init image is noised and the schedule cut by `--strength` exactly as
+   for img2img. `--strength 1` fills the hole from pure noise; lower values
+   keep the init image's layout and colours inside the hole too.
+3. After every step the kept cells are reset to the init latents noised
+   with the same noise to the next step's sigma, and to the clean init
+   latents after the last step, so the kept latents equal the init latents
+   exactly.
+
+The VAE decoder mixes neighbouring latents, so pixels next to the hole (and,
+through its attention, a little everywhere) can change slightly even though
+the kept latents are exact. A mask of another aspect ratio than the init
+image is stretched, not cropped. The mask is encoded once per output size;
+`/mask off` (or `/init-image off`) goes back to img2img (or text-to-image).
+
+Status: the inpaint path matches diffusers on the pico checkpoint
+(`TestQwenImage21InpaintParity`); a real 1024x1024 inpaint on the GPU box
+is still pending (user run).
+
 ## Options
 
 `QwenImage --help` prints this list.
@@ -328,6 +370,7 @@ and `--fp32`, the last one given wins.
 | `--seed N` | seed of the initial noise | 42 |
 | `--image FILE` | edit: a condition image (PNG, JPEG, ...); repeat for up to 10; see [Image editing](#image-editing) | — |
 | `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
+| `--mask FILE` | with `--init-image`: inpaint, regenerate only the mask's white region; see [Inpainting](#inpainting) | — |
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
@@ -482,7 +525,10 @@ under [VAE tiles](#vae-tiles).
   yet reported as written. Watch the log for OpenCL error lines.
 - The negative prompt (classifier-free guidance) is not implemented.
 - Editing is tested only against diffusers on the pico checkpoint; it has
-  not run on the real checkpoint yet.
+  not run on the real checkpoint yet. The same holds for inpainting.
+- Inpainting has no mask blur and no `padding_mask_crop` (crop to the
+  mask's bounding box, generate at full resolution, paste back), so a small
+  hole in a large photo costs a full-size image.
 - The VAE encoder and the vision tower run untiled on the CPU, so their
   memory grows with the output size. They have not been measured at
   1024x1024 on the real checkpoint.
@@ -512,7 +558,9 @@ in `tests/fixtures/tiny_qwenimage21/` (generated by
 `TestQwenImage21LanczosResizeVsPIL`, `TestQwenImage21PrepareVaeImage`,
 `TestQwenImage21SizeForAspect`, `TestFlowMatchImg2ImgStartStepVsOracle`,
 `TestFlowMatchScaleNoiseVsOracle`) read the oracle of
-`tools/make_pico_qwenimage21_img2img_fixture.py`. The edit tests
+`tools/make_pico_qwenimage21_img2img_fixture.py`, as do the inpaint tests
+(`TestQwenImage21Inpaint*`: the mask latents, the kept latents bit for bit
+after every step, and the step latents against diffusers' blend). The edit tests
 (`TestQwenImage21Edit*`) read the oracle of
 `tools/make_pico_qwenimage21_edit_pipeline_fixture.py`: the diffusers
 pipeline with one and two condition images.
