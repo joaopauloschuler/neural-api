@@ -658,10 +658,13 @@ type
       function PrepareImplicitConv(): boolean;
       /// Compute for an FP32 convolution with B gathered inside the GEMM from
       /// unpadded SrcVol (or borrowed pExternalSrc): no column matrix, no B buffer.
+      /// OutFrames > 1 is the frames-along-depth 3-D conv: each output pixel has
+      /// OutFrames columns, frame t's tap window is WindowDepth floats at t*FrameStep.
       procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
         OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint;
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-        NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
+        NewSrc: boolean = true; pExternalSrc: cl_mem = nil;
+        OutFrames: longint = 1; FrameStep: longint = 0; WindowDepth: longint = 0);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -2255,10 +2258,11 @@ end;
 procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
   OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint; NewVAs: boolean;
   VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
-  pExternalSrc: cl_mem);
+  pExternalSrc: cl_mem; OutFrames: longint; FrameStep: longint;
+  WindowDepth: longint);
 var
   err: integer;
-  UseBias, InSizeX, InSizeY, InDepth: longint;
+  UseBias, InSizeX, InSizeY, InDepth, PixelStride: longint;
   K: cl_kernel;
   SrcBuffer: cl_mem;
   UseTiled: boolean;
@@ -2279,7 +2283,8 @@ begin
   FActFun := pActFN;
   InSizeX := SrcVol.SizeX;
   InSizeY := SrcVol.SizeY;
-  InDepth := SrcVol.Depth;
+  PixelStride := SrcVol.Depth;
+  if WindowDepth > 0 then InDepth := WindowDepth else InDepth := PixelStride;
   err := CL_SUCCESS;
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
   SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
@@ -2306,6 +2311,9 @@ begin
   err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
   err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
   err := err or clSetKernelArg(K, 17, csLongintSize, @DilationX);
+  err := err or clSetKernelArg(K, 18, csLongintSize, @PixelStride);
+  err := err or clSetKernelArg(K, 19, csLongintSize, @OutFrames);
+  err := err or clSetKernelArg(K, 20, csLongintSize, @FrameStep);
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +

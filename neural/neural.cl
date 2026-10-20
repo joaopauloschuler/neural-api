@@ -910,6 +910,10 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
 // + d - the im2col layout of cai_im2col - so the tile stage reads the
 // unpadded source directly and the column matrix never exists. Taps in the
 // zero padding stage 0, exactly as cai_im2col writes them.
+// A 3-D conv over frames packed along depth (TNNetConvolution3D) folds the
+// output frame into the column, b = pixel * OutFrames + frame: the tap window
+// is the InDepth floats at frame * FrameStep of a PixelStride-float pixel.
+// A 2-D conv has OutFrames 1, FrameStep 0 and PixelStride = InDepth.
 typedef struct
 {
   int OutSizeX;  // FOutput.SizeX
@@ -919,6 +923,9 @@ typedef struct
   int PaddingX;  // zero columns left and right of the source
   int PaddingY;  // zero rows above and below the source
   int DilationX; // spacing of the kernel taps along X
+  int PixelStride; // source floats per pixel
+  int OutFrames;   // output frames per output pixel
+  int FrameStep;   // source depth offset between consecutive output frames
 } cai_conv_gather;
 
 // cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
@@ -932,19 +939,23 @@ typedef struct
 #define CAI_TILED_B_COLS_PER_LANE (CAI_TILED_B_ELEMS / CAI_TILED_LANES)
 #define CAI_TILED_B_COL_STEP (CAI_TILED_LANES / CAI_TILED_KSTEP)
 
-// Top-left source tap of each column this lane stages, once per work-group;
-// a column past FNumBs gets a first row no tap can reach, so it stages zeros.
+// Top-left source tap and frame offset of each column this lane stages, once
+// per work-group; a column past FNumBs gets a first row no tap can reach.
 static inline void cai_conv_gather_columns(const cai_conv_gather G,
-  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX)
+  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX,
+  int* FirstD)
 {
   #pragma unroll
   for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
   {
     const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
-    const int oy = gb / G.OutSizeX;
-    const int ox = gb - oy * G.OutSizeX;
+    const int pixel = gb / G.OutFrames;
+    const int frame = gb - pixel * G.OutFrames;
+    const int oy = pixel / G.OutSizeX;
+    const int ox = pixel - oy * G.OutSizeX;
     FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.PaddingY : G.InSizeY;
     FirstX[j] = ox * G.Stride - G.PaddingX;
+    FirstD[j] = frame * G.FrameStep;
   }
 }
 
@@ -952,7 +963,8 @@ static inline void cai_conv_gather_columns(const cai_conv_gather G,
 // layout and the same zeros, so the tile math after it is unchanged.
 static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
   const int FSize, const int k0, __global const float* Src,
-  __local float* Bs, const int lid, const int* FirstY, const int* FirstX)
+  __local float* Bs, const int lid, const int* FirstY, const int* FirstX,
+  const int* FirstD)
 {
   const int kLane = lid % CAI_TILED_KSTEP;
   const int bLane = lid / CAI_TILED_KSTEP;
@@ -970,7 +982,7 @@ static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
     const int x = FirstX[j] + TapX;
     float v = 0.0f;
     if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
-      v = Src[(y * G.InSizeX + x) * G.InDepth + d];
+      v = Src[(y * G.InSizeX + x) * G.PixelStride + FirstD[j] + d];
     Bs[(bLane + j * CAI_TILED_B_COL_STEP) * CAI_TILED_KSTEP + kLane] = v;
   }
 }
@@ -999,7 +1011,9 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
 
   int FirstY[CAI_TILED_B_COLS_PER_LANE];
   int FirstX[CAI_TILED_B_COLS_PER_LANE];
-  if (BIsConv) cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX);
+  int FirstD[CAI_TILED_B_COLS_PER_LANE];
+  if (BIsConv)
+    cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX, FirstD);
 
   const int RowStep4 = 4 * FNumAs;
   for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
@@ -1007,7 +1021,8 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     // The previous step's reads must finish before the tile is overwritten.
     barrier(CLK_LOCAL_MEM_FENCE);
     if (BIsConv)
-      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX);
+      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX,
+        FirstD);
     else
       cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, 0, 0, Bs, lid,
         CAI_TILED_LANES);
@@ -1073,7 +1088,7 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
-  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1353,12 +1368,15 @@ __kernel void cai_conv_implicit_tiled
   const int Stride,
   const int PaddingX,
   const int PaddingY,
-  const int DilationX
+  const int DilationX,
+  const int PixelStride,
+  const int OutFrames,
+  const int FrameStep
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-    Stride, PaddingX, PaddingY, DilationX};
+    Stride, PaddingX, PaddingY, DilationX, PixelStride, OutFrames, FrameStep};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1384,7 +1402,10 @@ __kernel void cai_conv_implicit
   const int Stride,
   const int PaddingX,
   const int PaddingY,
-  const int DilationX
+  const int DilationX,
+  const int PixelStride,
+  const int OutFrames,
+  const int FrameStep
 )
 {
   const int a_id = get_global_id(0);
@@ -1392,8 +1413,10 @@ __kernel void cai_conv_implicit
   if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
   const int FeatureSizeX = RowSpan / InDepth;
   const int FeatureSizeY = FSize / RowSpan;
-  const int oy = b_id / OutSizeX;
-  const int ox = b_id - oy * OutSizeX;
+  const int pixel = b_id / OutFrames;
+  const int FrameOffset = (b_id - pixel * OutFrames) * FrameStep;
+  const int oy = pixel / OutSizeX;
+  const int ox = pixel - oy * OutSizeX;
   const int FirstY = oy * Stride - PaddingY;
   const int FirstX = ox * Stride - PaddingX;
   const int TapStep = InDepth * FNumAs;
@@ -1409,7 +1432,7 @@ __kernel void cai_conv_implicit
       const int x = FirstX + kx * DilationX;
       if (RowInside && (x >= 0) && (x < InSizeX))
       {
-        const int SrcPos = (y * InSizeX + x) * InDepth;
+        const int SrcPos = (y * InSizeX + x) * PixelStride + FrameOffset;
         int TapAPos = APos;
         for (int d = 0; d < InDepth; d++)
         {

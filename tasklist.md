@@ -1978,14 +1978,13 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       Dilation*(K-1), PaddingY 0, DilationX = Dilation and OutSizeX = SeqLen
       (the kernel's bounds check is the missing right pad). Covered by
       `TestCausalConv1DOpenCLParity` (5 shapes, tiled and untiled, a weight update).
-- [ ] `TNNetConvolution3D` (VideoMAE tubelet embedding, 3-D VAEs) device
-      forward. The temporal taps of output frame ot are ONE contiguous depth
-      window [ot*C, ot*C + FeatureSizeT*C) of each source pixel, and the
-      weights are already laid out as a 2-D conv kernel over that window, so
-      no new kernel is needed, but `cai_conv_gather` must learn two things: a
-      source pixel stride (InT*C) apart from the window depth, and an output
-      frame axis folded into the column index (b = pixel*OutT + ot, so the
-      result [b*NumFeatures + f] is exactly the packed output layout).
+- [X] `TNNetConvolution3D` (VideoMAE tubelet embedding, 3-D VAEs) device
+      forward on `cai_conv_implicit`, no new kernel: output frame ot reads ONE
+      contiguous depth window [ot*C, ot*C + FeatureSizeT*C) per source pixel,
+      so `cai_conv_gather` gained a source pixel stride and an output-frame
+      axis folded into the column (b = pixel*OutT + ot; the result
+      [b*NumFeatures + f] is the packed output as it is). Covered by
+      `TestConvolution3DOpenCLParity` (5 shapes incl. the tubelet stride).
 - [ ] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
       style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
       re-laid out k-major on the host and uploaded every forward before
