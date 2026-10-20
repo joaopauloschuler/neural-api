@@ -73,193 +73,11 @@ rather than acted on.
 
 ## Bugs
 
-- [x] BUG: `SetTrainable(False)` then `SetTrainable(True)` did not give back a
-      trainable layer. `TNNetLayer.SetTrainable(False)` shrinks `FOutputError` /
-      `FOutputErrorDeriv` to 1x1x1; the True branch only set flags, so nothing
-      regrew them. Effects: `TNNetFullConnect.BackpropagateCPU` wrote past the
-      end of both buffers, convolutions kept the `FCalculatePrevLayerError` flag
-      and `FPrevLayerErrorPadded` size they cached at wiring time, a layer
-      flipped from low-memory inference kept its 1x1x1 concatenated weight
-      caches (wrong output), and a `TNNetInput(pError=1)` lost its input
-      gradient. Adam moments are freed by the False flip and are not restored:
-      run `InitAdam` again after the True flip.
-  - [x] Part 1 (Done 2026-10-18, commit 4c39cee9): `TNNetLayer.SetTrainable(True)` on an
-        inference-only layer regrows the error buffers to `FOutput` (a class that
-        uses `SetOutputErrorSizeNoDeriv` keeps its deriv buffer at 1x1x1) and runs
-        `AfterWeightUpdate` when low-memory mode was on. Quantized and
-        weight-borrowing layers (`HasInferenceOnlyWeights`) stay inference-only.
-        `TNNetInput` regrows its buffers when `FStruct[3]=1`. `TNNet.SetTrainable`
-        then runs the new `TNNet.RefreshPrevLayerErrorCaches` (conv family:
-        flag + padded error buffer; `EnableInputGradient` uses it too). Size
-        checks added in `ComputeOutputErrorForIdx`, `ComputeErrorDeriv`,
-        `TNNetFullConnect.Backpropagate` and `TNNetFullConnectDiff.Backpropagate`.
-        New tests `TestSetTrainableRoundTripMatchesTwin` (8 nets x 4 flip modes vs
-        a never-flipped twin, 1e-6) and `TestSetTrainableKeepsInferenceOnlyWeights`.
-        Suites green: cpu 3283 (+1 run alone), avx2 3284, opencl 3284; 0 errors,
-        0 failures. Not done in part 1: re-arming OpenCL after a flip.
-  - [x] Part 2: the 35 layers whose `SetTrainable` override only frees
-        (`if not pTrainable then FreeBackpropScratch()`), plus AconC, MetaAconC,
-        DyT, PReLUChannel and SReLU, lose backprop scratch that the True flip
-        does not size again. Add a per-class
-        `SizeBackpropScratch` helper called from `SetPrevLayer` and from the
-        `SetTrainable` True branch.
-        The 35 overrides in file order, split in two batches:
-    - [x] Batch A (Done 2026-10-18, commit 6caa428a): ArcFace, ForgetGateBias,
-          InducedSetAttention, ProductKeyMemory, AttentionPooling, Retention,
-          CrossAttention, T5RelPosBiasAttention, DifferentialAttention,
-          LinformerAttention, GatedResidual, CapsuleRouting, HardConcrete, GRN,
-          APL, SplineActivation, Invertible1x1Conv, MLSTMCell. Each got a private
-          `SizeBackpropScratch` (sizes what `FreeBackpropScratch` frees), called
-          from `SetPrevLayer` and from the True branch when `FIsTrainable` and
-          `FPrevLayer` is assigned. T5RelPosBiasAttention and DifferentialAttention
-          need nothing: their `Backpropagate` resizes the scratch. New test
-          `TestSetTrainableRoundTripScratchLayersA` (18 nets x 4 modes, 1e-6,
-          shared `CheckSetTrainableRoundTrip` helper); fails on the old code under
-          `-Cr` with a range check error in `TNNetArcFace.Backpropagate`. Suites
-          green: cpu, avx2, opencl 3285 each, 0 errors, 0 failures.
-          Found on the way: `TNNetLinformerAttention.Backpropagate` only
-          accumulates deltas and never applies them when `FBatchUpdate` is false
-          (the helper now calls `TNNet.UpdateWeights`); not changed.
-    - [x] Batch B (Done 2026-10-18, commit f351b7ac): DeltaNet, GatedDeltaNet,
-          GatedLinearAttention, NTMMemory, TestTimeTraining, TitansMemory,
-          SpectralConv1D, DWT1D, SpectralConv2D, CondConv, MonarchLinear,
-          KroneckerLinear, SoftDecisionTree, HouseholderLinear, HyperbolicLinear,
-          HyperbolicDistance, GraphAttention (17 overrides). Each got the batch-A
-          `SizeBackpropScratch`, except GatedDeltaNet, whose override already
-          re-runs `SizeSequenceCaches`. AconC, MetaAconC, DyT, PReLUChannel and
-          SReLU got `FreeBackpropScratch` + `SizeBackpropScratch` + a
-          `SetTrainable` override (free on False, size on True). No other class
-          needed it: the remaining `if FIsTrainable` blocks in `SetPrevLayer`
-          size neuron Delta/BackInertia (regrown by `TNNetNeuron.SetTrainable`)
-          or already have a regrowing override. The NoForward mask
-          (TNNetDotProducts, TNNetPointwiseSoftMax) is rebuilt on the True flip
-          and built in `SetPrevLayer` only when trainable (an inference-only
-          DotProducts(NoForward) used to write the mask past its 1x1x1 buffer).
-          `TNNet.EnableInputGradient` now calls `TNNetInput.EnableErrorCollection`.
-          examples/GPT2Import/README.md no longer says an inference-only net can
-          never train. New test `TestSetTrainableRoundTripScratchLayersB` (26
-          nets x 4 modes, 1e-6; DeltaNet lr 0.2, HyperbolicDistance lr 0.01 with
-          c=0.01); on the old code under `-Cr -Ct` every class but GatedDeltaNet
-          fails. Suites green: cpu, avx2, opencl 3286 each, 0 errors, 0 failures.
-- [x] BUG: `TNNetLinformerAttention.Backpropagate`
-      accumulates its weight deltas but never applies them when `FBatchUpdate`
-      is false, so the layer does not train outside batch mode unless the
-      caller runs `TNNet.UpdateWeights`. Found during SetTrainable part 2,
-      batch A.
-      Done 2026-10-18: `Backpropagate` now ends with the sibling-layer tail
-      (`if not FBatchUpdate` -> `UpdateWeights(FInertia)` on E and F, then
-      `AfterWeightUpdate`); batch mode still accumulates for
-      `TNNet.UpdateWeights` (base `TNNetLayer.UpdateWeights` / Adam / ClearDeltas
-      already cover both neurons; Linformer has no Q/K/V/O neurons, only E/F).
-      New test `TestLinformerAttentionTrainsWithoutBatchUpdate` (inertia 0 and
-      0.9: E/F move and their deltas are cleared after one per-sample step, and
-      match a batch-mode step + `UpdateWeights` within 1e-6); fails on the old
-      code. The weight/input gradient checks already existed. The
-      `CheckSetTrainableRoundTrip` helper no longer calls `TNNet.UpdateWeights`.
-      Suites green: cpu, avx2, opencl 3287 each, 0 errors, 0 failures.
-      Scan of every `Backpropagate*` that writes neuron deltas without a
-      non-batch apply found no other layer with the same defect (the conv /
-      depthwise / local-connect `BackpropagateAtOutputPos` and the circulant
-      FFT helper are called from routines that apply). The next item is a
-      related defect of a different shape.
-- [x] BUG: `TNNetWeightStandardizationConv.Backpropagate`
-      (neural/neuralnetwork.pas ~100865) and `TNNetSpectralNormConv.Backpropagate`
-      (~101080) remap the per-call delta increment AFTER `inherited Backpropagate`.
-      Outside batch mode the inherited conv backprop
-      (`BackpropagateFastTiledCPU`) has already applied and cleared the deltas,
-      so the raw weights get the w_hat / w_eff gradient unmapped and the remap
-      sees a zero increment. Batch mode is correct.
-      Done 2026-10-18 (430b02a4): worse than reported - the inherited step went
-      to the in-place standardised / scaled copy, which `RestoreRawFilters`
-      overwrote, so the raw weights never moved (only the bias did). Both
-      overrides now run the inherited backward with `FBatchUpdate` forced true,
-      remap, then call `UpdateWeights()` when not in batch mode and the output
-      error is non-zero (the inherited `MaxError > 0` guard). `TNNetConvolution`
-      is unchanged; the conv OpenCL backward is disabled, so both layers use the
-      CPU path. New tests `TestWeightStandardizationConvTrainsWithoutBatchUpdate`
-      and `TestSpectralNormConvTrainsWithoutBatchUpdate` (inertia 0 and 0.9;
-      step and next forward match batch + `UpdateWeights` within 1e-6 / 1e-5)
-      fail on the old code; `TestSpectralNormConvWeightGradientMatchesScaledConv`
-      adds the missing raw-weight check (constant-sigma, so against a plain conv
-      holding W/sigma, not finite differences). Scan of every `Backpropagate`
-      override in neural/ for delta work or weight restore after `inherited`
-      found no other layer with this shape. Suites green: cpu, avx2, opencl 3290
-      each, 0 errors, 0 failures.
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
-- [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
-      drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
-      during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
-      Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
-      tolerance; either loosen that one assertion to a small epsilon or pin the
-      reassociation. Whole suite is otherwise 0/0 on both builds.
-      FIXED (commit b04218db): the two forwards did not use the same kernel.
-      SetTrainable's pLowMemory defaults to True, which drops the concatenated-
-      weight caches and computes per-neuron - a different accumulation order from
-      the interleaved/pointwise kernels (5.6e-7 relative on the conv diamond,
-      1.3e-6 on tiny GPT-2). The test now compares the low-memory build at 1e-4
-      and pins pLowMemory=False for the exact-equality half. Both builds green.
-- [X] BUG (FIXED): `MRoPEOpenCLIncrementalCacheParity` (TestNeuralNumerical.pas, proc at
-      ~line 63088) fails NONDETERMINISTICALLY — `max|diff|` swings between
-      `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
-      ROOT CAUSE confirmed = the suspected `FOutput` SizeX mismatch below. SetPrevLayer
-      (TNNetIdentity) sizes `FOutput` to the FULL `(MaxLen,1,Depth)` and RoPE's
-      Compute/ComputeOpenCL never resized it per step, so on an incremental forward
-      (`SeqLen < MaxLen`) `FMRoPECL.Rotate` allocated a `MaxLen*Depth` device output
-      buffer (`CreateOutputBuffer(FOutput)`), the kernel wrote only the `SeqLen*Depth`
-      prefix, and `ReadBuffer` copied the WHOLE buffer back — so the tail
-      `[SeqLen*Depth..MaxLen*Depth)` was uninitialized device memory (nondeterministic
-      garbage). Both cached and reference paths copy the full `FOutput`; identical
-      prefix, differing garbage tail → exploding `max|diff|`. FIX: resize `FOutput` to
-      `(SeqLen,1,Depth)` before the `Rotate` round-trip in BOTH
-      `TNNetMRotaryEmbedding.ComputeOpenCL` (~39664) and `TNNetRotaryEmbedding.
-      ComputeOpenCL` (~39129) — no-op when SeqLen is the full length. Verified: test
-      now `max|diff|=0.0` deterministically over 5 isolated runs; all RoPE/MRoPE
-      forward+parity+grad tests pass; full numerical suite 1307/1307; clean
-      non-OpenCL `-B` build. Original diagnosis kept below for the record.
-- [x] (original report) `max|diff|` swings between
-      `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
-      It passed 1306/1307 inside the full suite on one run but fails ~5/5 when run
-      in ISOLATION (`./RunTests --suite=MRoPEOpenCLIncrementalCacheParity`); the
-      outcome depends on surrounding allocations, i.e. an UNINITIALIZED-MEMORY /
-      heap over-read, not a logic error. Surfaced during the per-layer
-      `WillOpenCL`/`FShouldOpenCL` dispatch refactor (drop of the global
-      `NeuralConvOpenCLMinWork` gate): adding the `FForceOpenCL: boolean` field to
-      every `TNNetLayer` shifted heap layout and EXPOSED a pre-existing latent bug
-      — it is NOT caused by the dispatch change. Evidence it is pre-existing/
-      memory, not dispatch logic: (1) the M-RoPE dispatch predicate is
-      functionally identical before/after (old guard `FHasOpenCL and FShouldOpenCL
-      and Assigned(FMRoPECL) and (FOutput.Size >= NeuralConvOpenCLMinWork)` forced
-      via the test's old `SetNeuralConvOpenCLMinWork(0)`; new
-      `Assigned(FMRoPECL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL)`
-      forced via the test's new `NN.ForceOpenCL(True)` — both dispatch the GPU
-      path on every step); (2) on the PRISTINE tree the test passes 8/8 in
-      isolation (rebuilt `-dOpenCL`, PoCL CPU device); (3) the NON-incremental
-      `M-RoPE OpenCL parity` test passes (~6e-8), so only the incremental-cache
-      REUSE path is affected; (4) the value is a garbage float, and context-
-      dependence = uninitialized read. Ruled out so far: `TVolume.ReSize`
-      (neuralvolume.pas ~6080) uses `SetLength(FData,...)` which PRESERVES the
-      cached prefix on grow, so `FAngleTable`'s reused rows `[0,FAngleCacheRows)`
-      survive; `BuildThetaCache`/`FTheta` and the SetPositions length check run
-      BEFORE the `WillOpenCL` dispatch so `FTheta[k]` is valid; `HalfD` is held
-      constant by the `FCachedHalfD = HalfD` reuse guard. Suspected remaining
-      cause: a heap over-read in `TNNetMRotaryEmbedding.ComputeOpenCL`
-      (neuralnetwork.pas ~39622) and/or the `FMRoPECL.Rotate(FPrevLayer.FOutput,
-      FAngleTable, FOutput, SeqLen, Depth, HalfD, FOutScale)` device-buffer
-      handling — note `FOutput` is NOT resized per incremental step (stays at the
-      SetPrevLayer full `(MaxLen,1,Depth)`) while `FPrevLayer.FOutput` IS resized
-      to the length-`step` prefix by the test, so the kernel runs with mismatched
-      input/output `SizeX` (input SizeX=step, output SizeX=MaxLen) though both
-      stride by `Depth`; verify the OpenCL input/output buffer sizes and the cache
-      snapshot arrays (`FCachedPosT/H/W`, sized via `SetLength(...,SeqLen)`) for an
-      out-of-range index when `SeqLen < FOutput.SizeX`. Repro: build RunTests with
-      `-dOpenCL` (PoCL device present), `./RunTests --suite=MRoPEOpenCLIncrementalCacheParity`
-      a few times. Next step: run under valgrind/heaptrc to pinpoint the exact
-      uninitialized read, then fix the M-RoPE GPU incremental cache (this is GPU
-      kernel/cache code, separate from the dispatch refactor).
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
@@ -268,41 +86,6 @@ rather than acted on.
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
       normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
       landed); only the embedded charsmap is unhandled.
-- [X] `TNNetKANConv` OpenCL forward allocated a `Taps²`-blown-up result buffer
-      and OOMed/segfaulted for any realistic conv shape (the `{$IFDEF OpenCL}`
-      GEMM path materialized the FULL all-pairs `cai_dot_product` cross product
-      `NumAs x NumBs = OutDepth*NumPos*Taps^2`, then kept only the tap-diagonal).
-      Concrete repro (Input 32x32x64 -> `TNNetKANConv.Create(64,3,1,1)`, degree 3):
-      result = 21,743,271,936 floats (~81 GB) -> `clCreateBuffer :-61` then an
-      uncatchable `EAccessViolation` inside the driver. FIXED (commit on `a3`):
-      the wanted output `out[p,oo] = sum_tap sum_k A[oo,tap,k]*B[p,tap,k]` is one
-      dot product over the COMBINED `Taps*C` axis, so KANConv now lays A out as
-      `[OutDepth x (Taps*C)]` (B was already in that layout), calls
-      `PrepareForCompute(..., Taps*C)` with `NumAs=OutDepth, NumBs=NumPos`, and
-      reads `Res[p*OutDepth + oo]` directly. Buffer drops `OutDepth*NumPos*Taps^2`
-      -> `OutDepth*NumPos` (~331,000x at that shape: 81 GB -> ~256 KB) with NO
-      wasted off-diagonal compute - on POCL it went from OOM to a 6.43x speedup.
-      SHARED PATTERN (RESOLVED) — the same all-pairs-then-extract-diagonal offload
-      was used by three more layers; status after this batch:
-      * `TNNetDepthwiseConv1D` (~51931, was `Channels^2*SeqLen`, channel-diagonal)
-        and `TNNetDepthwiseConv` (~48751, was `NumAs*NumBs`, depth-diagonal) are
-        GENUINELY block-diagonal (each group feeds a different output, so the
-        group axis canNOT be folded into the contraction the way KAN's tap axis
-        can). They now TILE the B axis so the transient result never exceeds
-        `csOpenCLMaxGemmResElems` (2^24 floats = 64 MB) - numerics identical to the
-        un-tiled GEMM (DepthwiseConv1D is bit-exact), no OOM at any shape. The
-        per-group cross-product waste remains (a perf, not correctness, issue);
-        a true batched/grouped dot-product kernel would remove it - left as a
-        follow-up.
-      * `TNNetDeconvolution.ComputeOpenCL` (~86547 `FGemmRes.ReSize(NumBs*NumAs)`)
-        was MISCLASSIFIED here: its scatter step consumes the FULL `NumBs x NumAs`
-        result (every input cell x tap x out-channel), so it is a legitimate dense
-        GEMM, not a diagonal-extraction waste. No change; buffer is proportional to
-        real deconv FLOPs.
-      Verified on the POCL CPU device via a device-vs-CPU parity harness: all
-      four layers fire on the device with max abs diff at f32 rounding (~1e-6),
-      and the two previously-OOMing shapes (KAN 81 GB, DepthwiseConv1D 2 GB) now
-      run. `OpenCLForwardBenchmark` re-includes `TNNetKANConv`.
 
 ## Hardware Support
   - [ ] CUDA/HIP Support
@@ -318,24 +101,9 @@ rather than acted on.
       pass 95 s vs 3.3 s serial, 415k clock syscalls); neural.cl is built again
       for every EnableOpenCL; a few heavy test shapes. Serial tasks, each with a
       fresh read-only Opus reviewer, the three suites and a commit:
-  - [x] S1. Scheduler: with OpenCL armed, only worker 0 stays hot (OpenCL layers
-        all go to it on a shared kernel); the hot loop reads the clock every N
-        passes, not every pass (PrepareInferenceThreads in neuralpretrained.pas,
-        StartThreadWorkers and the hot loop in neuralnetwork.pas). Coverage
-        identical. Also a product fix: frees CPU cores during OpenCL passes.
-  - [x] S2. Build neural.cl once per process and share the context and program,
-        keyed by platform, device, source and build options. Coverage identical.
-  - [x] S3. Shrink the slowest test shapes (depth-4096 norm chains, Reptile
-        meta-iterations, the tiled VAE grid, the Qwen-Image pipeline steps and
-        tokens) without weakening what they check; also helps the default and
-        AVX2 suites.
-  - [x] S4. Fewer distinct work-group sizes per kernel (e.g. cai_volume_sum 6,
-        cai_dot_product 15+): each size is a separate cold PoCL compile, ~200 s
-        on the first run after a neural.cl edit. User-approved 2026-10-05.
-  - [x] S5. Move the end-to-end Qwen-Image OpenCL tests (PipelineOpenCLKeepLoaded,
-        EditPipelineOpenCL, the VAE shared-output pair, TransformerOpenCLAttention;
-        or merge KeepLoaded with PipelineOpenCL) to an opt-in slow runner. Reduces
-        the default coverage; user-approved 2026-10-05.
+      S1-S5 (hot worker 0 only, neural.cl built once per process, smaller test
+      shapes, fewer work-group sizes, opt-in slow set) are done; the goal is
+      not yet met.
 
 - [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
       re-prefill (design agreed with the user 2026-10-02). Today TChatEngine is
@@ -348,85 +116,6 @@ rather than acted on.
       an independent Opus review, commit after review + green suites
       (lazbuild -B; default AND -dAVX2 suites; the PoCL suite when OpenCL code is
       touched; 3 GB ulimit). Each task ships its own tests.
-  - [x] T1. Token-prefix hash primitive. A running 64-bit hash over token ids
-        (h := Mix(h, Token[i]), {$PUSH}{$Q-}{$R-} around the wrapping math) plus
-        a last-64-token guard compared exactly on a hash match. Search for an
-        existing 64-bit mix first (coding guide #3). Tests: equal prefixes give
-        equal hashes, a one-token change at any position changes it, the guard
-        rejects a forced hash collision.
-  - [x] T2. One eviction policy + hash matching for the cache checkpoints.
-        Per checkpoint slot: PrefixHash, the guard tokens and LastUsedTurn
-        (engine-side records; one GenerateFromIds call = one turn). Replace
-        CheckpointBand, RetainCheckpointsBefore and DropCheckpointsAbove with
-        ONE routine, DeleteTheLongestUnusedCheckpoint, run only when a capture
-        finds no free slot (ties: the shallowest goes first). A request never
-        frees a checkpoint because the prompt diverged. Resume: ONE pass over the
-        prompt computes the running hash, finds the deepest matching checkpoint
-        and the live-cache common prefix together (no second CommonPrefixLen
-        pass). Only the checkpoint a request actually resumes from (and a new
-        capture) is marked used this turn; a matching checkpoint that is not
-        resumed keeps its old turn, so unused ones age out. CORRECTNESS: on a net with
-        attention layers a checkpoint is resumable only when its Position <= the
-        live-cache common prefix (its K/V rows must still be in the live cache);
-        a pure recurrent net has no such limit. Tests: a growing single
-        conversation still resumes at the previous reply end; a diverging prompt
-        leaves the old checkpoints in place; LRU order of eviction; resumed
-        output equals a full re-prefill.
-  - [x] T3. Capture points. Capture at the end of the system prompt, the end of
-        the prompt and the end of the reply only; remove the per-window captures
-        in FeedWindows (one long prefill must not flush the store). The
-        system-prompt token length comes from the chat format (e.g. render the
-        system message alone and confirm it is a token prefix of the full
-        prompt); under a windowed prefill the capture lands on the last window
-        end at or below that boundary. Raw mode (no system role): prompt end and
-        reply end only. Revisit the --cache-checkpoints default (16/8) once the
-        store no longer holds per-window captures.
-  - [x] T4a. Session snapshots copy only the live KV rows (per KV head, int8
-        codes+scales verbatim), keep an OpenCL-resident KV cache resident on
-        capture and mark it stale on restore, validate every layer before
-        writing (RestoreSnapshot raises), and take a capacity hint so the twin
-        SwitchTo allocates nothing. Open: GatedDeltaNet / DepthwiseConv1D
-        recurrent state still leaves OpenCL memory on capture (one extra
-        upload per capture).
-  - [x] T3 fix (with T4b): capture also at the end of the LAST USER message
-        (conversation rendered without the generation prompt, accepted only
-        as a token prefix). cfQwen3_5 re-renders earlier assistant turns
-        without <think>, so prompts diverge one token before the previous
-        end-of-prompt; without this point qwen3_5 resumed only at the system
-        checkpoint. Max 4 captures per turn.
-  - [x] T4 (T4b). Conversation slots (--kv-slots N, default 0): a slot holds
-        the reply-end session snapshot (host RAM, truncatable K/V) plus its
-        resume points (system, last-user, reply end) and, on recurrent nets,
-        the recurrent state at the last-user point (OpenCL memory under
-        --gpu). Saved when a request leaves the live conversation; matched in
-        the same one pass; same single eviction rule. Open: the twin-in-own-
-        OpenCL-context restore branch and a forced save failure are untested;
-        not yet run on a real model. Original plan text:
-        Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
-        session state (attention K/V rows + recurrent state, via
-        TNNetDecoderSessionSnapshot / SnapshotInto) per slot, with PrefixHash,
-        guard tokens and LastUsedTurn. When a request diverges from the live
-        conversation and a slot matches deeper than the live cache, save the
-        live conversation into a slot (DeleteTheLongestUnusedCheckpoint-style
-        LRU when full) and restore the matching slot; prefill only the tail.
-        Each slot costs up to one full KV cache (the live cache size at that
-        position), so slots live in host RAM and follow --kv-int8. Check first:
-        whether SnapshotInto copies only the live rows or the whole
-        MaxCacheLen buffers, and how it handles a KV cache resident in OpenCL
-        memory (FusedSDPA resident KV); fix to copy live rows only. Covers
-        hybrid AND pure-attention nets (Llama/Qwen2.5 have no recurrent
-        checkpoints, only KV).
-  - [x] T5. Flags, stats, docs: --kv-slots in ParseArgs + help text; --stats
-        reports which checkpoint/slot matched, reused tokens, and slot memory;
-        update examples/ChatTerminal/ChatServer.md "Concurrency and cache
-        reuse", the ChatTerminal README and the neuralchatengine.pas header
-        ("The engine is single-session").
-  - [x] T6. (covered in T4b: TestChatKVSlotSwitch [+PrefillWindow, +OpenCL],
-        TestChatThinkingResume, TestChatKVSlotSingleSlot,
-        TestChatKVSlotSystemPointNoOverwrite, TestChatKVSlotRegenerateKeepsPoints)
-        End-to-end tests on pico nets (pure attention, hybrid, pure
-        recurrent): requests A, B, A, B - the second A and B resume deep, and
-        every reply equals the full re-prefill reply.
   - [ ] T7. User acceptance on the GPU box: TTFT of two alternating real
         conversations on a real hybrid (qwen3_5) before and after.
   - [ ] Follow-up (not in this task): shared paged KV blocks, so conversations
@@ -444,13 +133,6 @@ rather than acted on.
         gpt2/neox, MoE families) once each has an offline parity oracle.
 - [ ] ONNX import
 - [ ] Gemma 4 import
-- [x] Qwen 3.5 import
-      DONE (commit bfe209ed): BuildQwen35FromSafeTensors[Ex] /
-      BuildQwen35MoeFromSafeTensors[Ex] import model_type qwen3_5 / qwen3_5_moe
-      (the Qwen3.5/3.6 hybrid GatedDeltaNet + MoE trunk). neuralchat.pas renders
-      the family's chat template as cfQwen3_5, and Qwen3.8 as cfQwen3_8 with the
-      reasoning-effort spans; Qwen3.6-27B and Qwen3.8-27B are user-tested in
-      ChatTerminal.
 - [ ] MiniCPM importer follow-ups (`BuildMiniCPMFromSafeTensors[Ex]` LANDED,
       model_type `minicpm`; OpenBMB μP-style scale_emb / per-sublayer
       scale_depth / dim_model_base logits folds on the core Llama path +
@@ -569,42 +251,10 @@ rather than acted on.
       pooling over the variable grid and a padding/attention mask — needs a
       variable-SeqLen vision input, an interpolated/resampled position table,
       and key-padding-masked MAP pooling. Not yet wired.
-- [x] examples/TCNClassifier — a Temporal Convolutional Network (Bai, Kolter &
-      Koltun 2018, arXiv:1803.01271) for MULTIVARIATE time-series
-      classification, built only from existing layers (no new leaf class). A
-      user asked whether CAI Neural supports a standard TCN; it does, but no
-      example shows the layer structure (`examples/TimeSeriesForecast` is a
-      2-layer univariate causal-conv stack with no residuals). Scope:
-      - Input `(WindowLen, 1, NumFeatures)`: time on X, features on Depth;
-        fixed rolling windows cut from a synthetic multivariate series
-        generated in-code (no downloads, fixed RandSeed).
-      - Residual block: `TNNetCausalConv1D(C, K, 0, Dilation)` -> ReLU ->
-        `TNNetSpatialDropout1D` -> same again -> `TNNetSum` with the skip path
-        (a `TNNetPointwiseConvLinear(C)` 1x1 projection when the channel
-        count changes) -> ReLU. Dropout optional (README must say so).
-      - Dilations 1, 2, 4, 8, 16; print the receptive field
-        (1 + 2*(K-1)*sum(dilations)) and choose WindowLen >= it.
-      - Head: `TNNetCrop(WindowLen-1, 0, 1, 1)` (last time step) ->
-        `TNNetFullConnectLinear(NumClasses)` -> `TNNetSoftMax`; trained with
-        `TNeuralFit`. Report test accuracy vs chance.
-      - Synthetic task should need the long receptive field (e.g. the class
-        depends on an event far back in the window), so a non-dilated stack
-        scores worse; print both.
-      - Pure CPU, under 3 GB (`ulimit -v 3145728`), a few minutes at most;
-        .lpr (with `cthreads` first in uses) + .lpi + README + an
-        examples/README.md entry.
-      Related follow-ups (separate, each needs user OK): a
-      `TNNet.AddTCNBlock` builder; a dilated INPUT-gradient check for
-      `TNNetCausalConv1D` (only the dilated weight gradient is checked
-      today); a faster `TNNetCausalConv1D` forward/backward for narrow
-      InputDepth (one AVX call per tap is overhead-bound at e.g. 5 features).
-      DONE: builder `TNNet.AddTCNBlock` (68cf0d77, tests tightened 777a6d08)
-      and examples/TCNClassifier using it. Measured (window 64, 4 channels,
-      KernelSize 2, receptive field 63): dilated TCN 97.11% test accuracy vs
-      non-dilated baseline 39.46% (receptive field 11, same 4864 weights);
-      chance 25%. Peak RSS 36 MB. Wall clock varies widely, cause not yet
-      diagnosed: 8:08 and 33:34 measured. The builder and the dilated input-gradient
-      check are done; the narrow-InputDepth speedup is still open.
+- [ ] examples/TCNClassifier follow-up (needs user OK): a faster
+      `TNNetCausalConv1D` forward/backward for narrow InputDepth (one AVX call
+      per tap is overhead-bound at e.g. 5 features). The example's wall clock
+      varies widely (8:08 and 33:34 measured), cause not yet diagnosed.
 
 ### Computer vision & generative models
 
@@ -992,40 +642,19 @@ rather than acted on.
       baseline (what the oracle pins). OPEN: (a) ship/import the OFFICIAL
       richzhang/PerceptualSimilarity lin{0..4}.model 1x1-conv weights + parity vs
       the reference calibrated LPIPS (needs the `lpips` weights, unobtainable
-      offline here). (b) DONE: ComputePerceptualLossAndGradient (neuralpretrained.pas)
-      exposes the Johnson-2016 deep-feature perceptual loss WITH the d(Loss)/d(pixels)
-      gradient (per-stage feature L2, plain — calibrated unit-normalize is a follow-up),
-      driving a multi-tap backward through the frozen VGG to the input layer; tests
-      TestPerceptualLossGradientCheck (FD max rel err 7.1e-3) + TestPerceptualLossSelfZero.
-      Added public TNNetLayer.GetDepartingBranchesCnt for the idempotent intermediate-tap
-      IncDepartingBranchesCnt guard. OPEN: wire it into an SR example as an opt-in objective.
+      offline here). (b) wire ComputePerceptualLossAndGradient (neuralpretrained.pas,
+      the Johnson-2016 perceptual loss + d(Loss)/d(pixels) gradient through the
+      frozen VGG; calibrated unit-normalize is a follow-up) into an SR example as
+      an opt-in objective.
 - [ ] ControlNet spatial-conditioning importer LANDED
       (BuildControlNetFromSafeTensors[Ex], lllyasviel/sd-controlnet-canny;
       hint stem + per-resolution zero-conv residual taps + ControlNetResiduals driver,
       TestControlNetParity 2.89e-6 < 1e-4). First conditioning-by-feature-injection model.
-      DEFERRED follow-ups: (a) end-to-end base-UNet-plus-ControlNet generation
-      LANDED — BuildSDUNet(..., pWithControl=true) splices a zero-default
-      TNNetInput+TNNetSum onto every down-path skip + the mid output (encoder
-      forward unperturbed, plain SDUNetDenoise stays bit-identical), and the new
-      SDUNetDenoiseWithControl driver ADDS the ControlNetResiduals into those
-      skips exactly as diffusers (down += controlnet_down, mid += controlnet_mid);
-      combined forward parity-checked < 1e-4 in TestControlNetCombinedParity
-      (tools/controlnet_combined_fixture.py reuses the two config-compatible pico
-      fixtures) + examples/ControlNetCanny smoke. (b) real-checkpoint slicer (slice sd-controlnet-canny like
+      DEFERRED follow-ups: (a) real-checkpoint slicer (slice sd-controlnet-canny like
       slice_llama.py) for parity vs real weights on top of the synthetic fixture;
-      (c) the diffusers per-residual conditioning_scale multiplier (constant 1.0
-      here); (d) T2I-Adapter (lighter feature-injection sibling) LANDED —
-      BuildT2IAdapterFromSafeTensors[Ex] imports the diffusers T2IAdapter
-      full_adapter (PixelUnshuffle hint stem via TNNetSpaceToDepth with a conv_in
-      input-channel permutation, an AvgPool ResNet-ish ladder of block1 3x3 ->
-      ReLU -> block2 1x1 -> +identity ResnetBlocks, 1x1 in_conv channel changes);
-      the T2IAdapterFeatures driver produces the per-stage feature pyramid and
-      BuildSDUNet(..., pWithAdapter=true) + SDUNetDenoiseWithAdapter ADD those
-      features into the SD UNet down-block hidden state (diffusers
-      down_intrablock_additional_residuals); reuses existing layers (no new
-      class). Feature parity < 1e-4 in TestT2IAdapterParity vs a numpy float64
-      oracle (tools/t2i_adapter_tiny_fixture.py, diffusers not installed).
-      Follow-ups: real-checkpoint slicer (TencentARC/t2iadapter_*_sd15v2),
+      (b) the diffusers per-residual conditioning_scale multiplier (constant 1.0
+      here); (c) T2I-Adapter (BuildT2IAdapterFromSafeTensors[Ex], landed)
+      follow-ups: real-checkpoint slicer (TencentARC/t2iadapter_*_sd15v2),
       light_adapter variant, multi-adapter blending.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
@@ -1039,43 +668,13 @@ rather than acted on.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
-- [ ] Quantized inference follow-up (int8 weight-only v1 is landed): int8
-      activation quantization + true
-      int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
-      layers stop paying the per-forward dequantize cost; today the int8
-      win is RAM only — compute still runs the FP32 kernels.
 - [ ] Quantized inference follow-up: GPTQ/AWQ-style calibrated quantization
       (error-compensating rounding / activation-aware scale search) and
-      4-bit (int4 pairs packed per byte, group-wise scales); also quantized
-      EMBEDDING table storage (the one remaining FP32 heavyweight — vocab x
-      d_model stays FP32 in v1, e.g. ~262MB for TinyLlama) and FP16/BF16
-      weight storage as a zero-drift middle rung. GGUF dovetails (reader
+      FP16/BF16 weight storage as a zero-drift middle rung. GGUF dovetails (reader
       landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [X] Quantization-aware training (QAT) — port torch.ao.quantization's
-      fake-quantize-during-training so accuracy lost to post-training int8 can be
-      recovered (the landed int8 path is post-training, inference-only). LANDED:
-      `TNNetFakeQuantize` (neural/neuralnetwork.pas) per-tensor SYMMETRIC int8
-      fake-quant of the layer INPUT — FORWARD `x_q = round(clip(x/scale,-127,127))
-      *scale = dequant(quant(x))` with `scale = max|x|/127` (exactly the landed
-      `QuantizeWeightsInt8` weight-path convention, so QAT activation scales line
-      up with the int8 weight-only export format); observer-driven scale via a
-      MovingAverageMinMaxObserver-style running max-abs EMA (first obs seeds
-      directly, frozen at inference / via `Freeze`); BACKWARD straight-through,
-      reusing the `TNNetSoftCapping`/`TNNetStraightThroughEstimator` deriv-mask
-      clamp machinery (grad passes through inside `[-qmax*scale,qmax*scale]`, zero
-      outside). Registered in both CreateLayer dispatch tables; round-trips via
-      Save/Load (FStruct[0]=qmax, FStruct[1]=frozen, FFloatSt[0]=momentum,
-      FFloatSt[1]=running max-abs). Tests (all pass, full suite 2521/0/0):
-      TestFakeQuantizeForwardDequantQuant (forward = dequant(quant(x))),
-      TestFakeQuantizeSTEGradientCheck (STE grad = upstream inside band, 0
-      outside), TestFakeQuantizeObserverAndRoundTrip (EMA + freeze + round-trip),
-      plus registry round-trip builder #376. README layer table updated.
-      FOLLOW-UPS (v1 scope = activations only): weight fake-quant, learned scale,
-      per-channel/asymmetric variants, full int8 export wiring, and an
-      `examples/QATFineTune` PTQ-drop-then-QAT-recover smoke run were deferred.
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
@@ -1100,127 +699,13 @@ rather than acted on.
       tolerance on a fixed fixture. Distinct from the int8 work (this is a
       GPU compute path, not CPU storage) and from FP16 weight storage (this
       is the missing compute half).
-- [x] Keep activations resident on the OpenCL device across consecutive offloaded
-      matmul/SDPA layers (eliminate the per-layer host round-trip during decode).
-      Today each offloaded layer copies its input host->device, runs the kernel, and
-      reads the result device->host (`FInputPrepared` in, `FOutput` out); the next
-      offloaded layer immediately re-uploads that same buffer. For an LLM decode step
-      a single block is qkv-proj -> SDPA -> o-proj -> FFN-up -> FFN-down, i.e. ~5
-      back-to-back GEMM/attention layers whose intermediate tensors never need to
-      touch the host. The weight buffers are already device-resident (the
-      TDotProductSharedKernel weight-residency machinery the FP16 note references);
-      this is the missing ACTIVATION half. Scope: add an opt-in "device output
-      handle" so a layer can leave its result in a `cl_mem` buffer and the next
-      offloaded layer can consume that buffer directly, with an automatic
-      read-back only when the consumer is a CPU layer (norm, softmax, activation)
-      or when the caller reads `.Output`. The non-offloaded layers in between
-      (RMSNorm, RoPE, residual add) still run on host, so a first cut can fuse just
-      the adjacent GEMM pairs (qkv->split, up->down) and measure; a full
-      block-resident path is the stretch goal. Real value: device<->host traffic,
-      not FLOPs, dominates the GPU decode wall-clock for ChatTerminal-scale models,
-      so removing the redundant copies should lift tokens/sec materially. Guard
-      everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
-      fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
-      DONE: TNNetLayer carries FOutputOnOpenCL / FOutputOnRAM plus
-      OpenCLOutputBuffer(), so a producer offers its result in OpenCL memory and
-      the consumer binds that buffer instead of downloading it. Wired through
-      TNNetInput, the convolution/fullconnect GEMM family (whatever the size
-      verdict), TNNetRMSNorm, TNNetTokenRMSNorm, TNNetRotaryEmbedding, the
-      activation layers, TNNetPointwiseSoftMax, TNNetCellMulByCell,
-      TNNetChannelMulByLayer, TNNetEmbedding (int8 device gather),
-      TNNetDepthwiseConv1D, TNNetGatedDeltaNet and TNNetFusedSDPA (FP32 and int8
-      resident KV cache). ForceOutputOnRAM stays the fallback for a host reader.
-- [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
-      (b) DONE — raw SentencePiece .model protobuf path landed
-      (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
-      vendored proto lib; auto-dispatched from LoadFromFile by the '.model'
-      extension or a non-'{' first byte). Populates the SAME Unigram
-      structures as the tokenizer.json path; pico fixture + spm-oracle parity
-      test (tools/make_pico_spm_fixture.py, tests/fixtures/tiny_spm.model,
-      TestSentencePieceModelParity). UNIGRAM model_type only; a BPE/WORD/CHAR
-      ModelProto raises EHFTokenizerError ("use tokenizer.json").
-      BPE-in-.model is now DONE — model_type=BPE (NLLB/mBART-BPE/DeBERTa-v3
-      sentencepiece.bpe.model exports): LoadSentencePieceModel reconstructs the
-      merges from the scored pieces (ReconstructBPEMerges, byte-for-byte the
-      HF transformers generate_merges algorithm — per piece, every codepoint
-      split whose both halves are in the vocab becomes a candidate ordered by
-      (id_l,id_r), then a stable sort by (piece_id,len_l,len_r) gives the merge
-      rank), sets FUnigram=false and routes encode/decode through the SAME
-      metaspace + byte-level-BPE (BPEWord/EmitTokenOrFallback) machinery the
-      tokenizer.json/GGUF-gpt2 BPE paths use; byte_fallback (type-6 pieces)
-      covers non-ASCII via <0xNN>. Pico fixture tiny_spm_bpe.model
-      (tools/make_pico_spm_fixture.py BPE variant) + TestSentencePieceBPEModelParity.
-      Parity is FULL (exact), NOT an approximation: verified id-identical to the
-      sentencepiece encoder over ASCII *and* non-ASCII (café/CJK/emoji/control-
-      byte) inputs, and that encoder is itself id-identical to a tokenizers BPE
-      model built from these same reconstructed merges. WORD/CHAR model_types
-      still raise EHFTokenizerError. This UNBLOCKED the mBART/NLLB BART-family
-      import (BuildMBartFromSafeTensors / BuildM2M100FromSafeTensors, LANDED)
-      and the DeBERTa-v3 import (BuildDebertaV2FromSafeTensors, LANDED). No
-      residual non-ASCII parity gap. BYTE
-      (type=6) byte-fallback is now DONE: LoadSentencePieceModel sets
-      FByteFallback when any type-6 piece is present, so (1) encode routes
-      unknown chars through the <0xNN> BYTE pieces — the Unigram Viterbi
-      unk node now decomposes the char into its UTF-8 bytes via byte
-      pieces (EmitByteFallback) instead of one fused <unk>; and (2) decode
-      emits the RAW byte for each <0xNN> piece (DecodeToken), so a run of
-      byte pieces reassembles into the original multi-byte UTF-8 string
-      (the metaspace U+2581 handling is unaffected). Round-trip parity test
-      TestSentencePieceByteFallbackRoundTrip + tiny_spm_bytefallback.model
-      fixture (tools/make_pico_spm_fixture.py byte_fallback variant; cases
-      read via TJSONParser(s,[]) to keep their UTF-8 bytes intact). This
-      UNBLOCKED the mBART/NLLB BART-family import and the DeBERTa-v3 import
-      (both ship raw sentencepiece .model and are Unigram; all LANDED).
-      (c) exact full-Unicode \p{L}/\p{N} tables (current
-      classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
-      Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
-      punctuation class of the GPT-2 regex); (d) DONE — build a tokenizer from
-      GGUF tokenizer.ggml.* metadata (TNeuralHFTokenizer.LoadFromGGUF: opens
-      via TNNetGGUFReader, reads tokenizer.ggml.model + tokens/scores/
-      token_type [+ merges] and the bos/eos/unknown_token_id scalars, and
-      populates the SAME internal structures the tokenizer.json/.model loaders
-      use), so a single .gguf is self-contained for generation. SUPPORTED
-      tokenizer.ggml.model values: "llama" (SentencePiece-with-scores →
-      Unigram/Viterbi path: metaspace U+2581, <0xNN> byte fallback, CONTROL/
-      UNKNOWN/USER_DEFINED pieces exposed as added tokens) and "gpt2" (byte-
-      level BPE → GPT-2 byte table + cl100k Split pre-tokenizer + merges).
-      DEFERRED: "bert" (WordPiece) and "no_vocab" raise EHFTokenizerError;
+- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: GGUF tokenizer
+      (LoadFromGGUF) DEFERRED: "bert" (WordPiece) and "no_vocab" raise EHFTokenizerError;
       gpt2 path assumes the cl100k Split pre-tok (GGUF carries no pre-tok
-      config). Oracle = write-then-read round-trip: a tokenizer.json fixture's
-      vocab/scores(+merges) is emitted to a temp .gguf via TNNetGGUFWriter and
-      read back, then Encode/Decode are asserted id-identical to the
-      tokenizer.json source (TestLoadFromGGUF{Llama,Gpt2}RoundTrip,
-      TestLoadFromGGUFRejectsUnsupportedModel in TestNeuralHFTokenizer.pas).
+      config).
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
-      batch: ~~(a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
-      silently applies the GPT-2 regex anyway (the flag is only honored
-      implicitly inside the Sequence[Split, ByteLevel] path, which bypasses
-      ByteLevelPieces; parse use_regex and skip the regex split when false)~~
-      DONE: FByteLevelUseRegex parsed; standalone ByteLevel(use_regex=false)
-      now feeds the whole segment as ONE chunk to the byte alphabet (no GPT-2
-      regex). Test TestByteLevelNoRegexParityWithHF + bytelevel_noregex
-      fixture group.
-      (b) only the Qwen2 and Llama-3/cl100k Split pattern literals are
-      recognized — the o200k (GPT-4o-family) and DeepSeek pattern strings
-      raise EHFTokenizerError. ~~the DeepSeek family is now importable
-      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap~~ DONE
-      for DeepSeek-V2/V2-Lite: the multi-Split+Digits Sequence is detected as
-      a WHOLE (MatchesDeepSeekSequence) and dispatched to SplitDeepSeekPieces
-      (a distinct splitter: \s?-prefixed letter/punct runs, separate CJK run,
-      individual digits, \s+$ trailing). Test TestSplitDeepSeekParityWithHF +
-      split_deepseek fixture. REMAINING sub-tasks: (i) DONE — o200k_base
-      (GPT-4o family: gpt-4o/gpt-4o-mini/o1/o3) Split pattern recognized
-      verbatim (csO200kSplitPattern) and dispatched to a dedicated
-      case-aware SplitO200kPieces splitter (two letter alternations
-      [\p{Lu}...]*[\p{Ll}...]+ and [\p{Lu}...]+[\p{Ll}...]*, \p{N}{1,3}
-      digits, the [\r\n/]* punct trailing run that adds '/'). The Lu/Ll
-      split uses the ASCII case tables; non-ASCII letters fall into the
-      Ll/Lo class, so byte parity is guaranteed over ASCII letters (incl
-      case transitions like HelloWorld->Hello+World, iPhone->i+Phone),
-      digits, punct (incl '/'), and whitespace — the SAME approximation
-      stance as the cl100k/DeepSeek splitters. Test
-      TestSplitO200kParityWithHF + split_o200k fixture group
-      (tools/hf_pretok_fixture.py build_o200k_split). RESIDUAL GAP: non-ASCII
+      batch (o200k_base and DeepSeek-V2/V2-Lite Split patterns are recognized).
+      REMAINING sub-tasks: (i) RESIDUAL GAP: non-ASCII
       Latin AND CJK parity for SplitO200kPieces (would need the exact o200k
       Lu/Ll/Lo class tables ported to Pascal); (ii) DeepSeek-V3
       pre-tokenizer (different shape: \p{N}{1,3} + packed punct+letter Split,
@@ -1232,37 +717,11 @@ rather than acted on.
       same approximation stance as the cl100k splitter; would need the exact
       DeepSeek letter-class range table ported to Pascal). Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
-      (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
-      llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
-      only takes a plain `Tokens` array (SP "llama" model) — route the gpt2
-      tokenizer block through SaveTokenizerToGGUF from the MODEL exporter (not
-      just the tokenizer unit test). DONE — SaveLlamaToGGUFEx gained an optional
-      `Tokenizer: TNeuralHFTokenizer` arg (+ SaveLlamaToGGUFExWithTokenizer
-      convenience overload) that, when non-nil, routes the FULL block through
-      TNeuralHFTokenizer.SaveTokenizerToGGUF (gpt2 vocab+merges+ids / llama
-      Unigram scores), taking precedence over the plain Tokens SP path (which is
-      unchanged); covered by TestGGUFWriterGpt2TokenizerRoundTrip (one-call
-      weights+gpt2-tokenizer export, read back self-contained: model logits
-      < 1e-5 + Encode/Decode id-identical via LoadFromGGUF on the SAME file).
-      Also: the llama-cpp-python parity arm is
+- [ ] GGUF writer follow-up: the llama-cpp-python parity arm is
       wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
       be too small for llama.cpp) — confirm argmax/ranking agree on a real
       checkpoint once the lib is available.
 - [ ] Optimizer zoo expansion (SGD/Adam/AdamW + Lion + Adafactor exist now):
-      Lion + Adafactor DONE (commit 89da1f9). TNeuralOptimizerLion (Chen et al.
-      2023, sign-based update with ONE momentum buffer vs Adam's two; decoupled
-      AdamW-style weight decay via TNNet.ApplyDecoupledWeightDecay) and
-      TNeuralOptimizerAdafactor (Shazeer & Stern 2018, factored R+C second-moment
-      vectors vs Adam's R*C — 12<27 buffers proven for a 3x3x3 kernel; full
-      per-element fallback for 1-D/non-factorable params) added to neuralfit.pas,
-      with the per-neuron math in neuralnetwork.pas mirroring the
-      CalcAdamDelta/UpdateWeightsAdam chain. Both require SetBatchUpdate(True)
-      (TNeuralFit already sets it). Tests TestLionOptimizer / TestAdafactorOptimizer
-      / TestAdafactorUsesFewerBuffersThanAdam (convergence + buffer count); full
-      suite 0/0. Adafactor knobs deliberately omitted (documented in the class
-      header): optional first-moment beta1 EMA + update RMS clipping; LR comes from
-      the host fit schedule, not Adafactor's internal relative-step rule.
       REMAINING:
   - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
         RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
@@ -1299,13 +758,8 @@ rather than acted on.
       loss-formula deltas LANDED on TNeuralDPOTrainer as a TNeuralPreferenceLossMode
       (plmSimPO/plmORPO are reference-free via CreateReferenceFree; plmKTO uses a
       reference, paired-batch simplification documented in the unit header), tests
-      in tests/TestNeuralPreference.pas. Bradley-Terry pairwise reward-model
-      trainer DONE: TNeuralRewardModelTrainer in neural/neuraldpo.pas learns a
-      scalar reward head r(x)=RewardNet(prompt+response) from (chosen,rejected)
-      pairs with loss=-ln sigmoid(r_w-r_l) and the sigmoid-margin gradient
-      (dL/dr_w=-(1-sigmoid(delta)), dL/dr_l=+(...)) via the DPO batch-update +
-      direct-output-error plumbing; plugs into GRPO/Best-of-N as a learned
-      reward; tests in tests/TestNeuralRewardModel.pas. REMAINING: a full
+      in tests/TestNeuralPreference.pas; Bradley-Terry TNeuralRewardModelTrainer
+      also exists. REMAINING: a full
       unpaired-batch KTO variant (current KTO uses the paired pair-mean KL point).
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
@@ -1315,18 +769,6 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [x] Streaming/lazy tensor materialization with load-time quantization:
-      the import path materializes full FP32 tensor buffers before copying
-      into layers, so PEAK import memory, not steady-state, can be the gate
-      on commodity RAM (the TinyLlama ~4.4GB case). Read one tensor at a
-      time from the (seekable) safetensors stream straight into the
-      destination layer — or straight into the landed int8 storage —
-      keeping only one tensor-sized scratch buffer. Assert peak RSS during import
-      stays within tensor-size + model-size on the parity fixture.
-      DONE: TNNetSafeTensorsReader.CanStreamTensorRows plus the row-streaming
-      loaders in neuralpretrained.pas read one tensor row at a time straight into
-      the layer's int8 storage, so no FP32 copy of the checkpoint is ever
-      allocated. Qwen2.5-7B peak import RSS dropped from 2431 MB to 1018 MB.
 - [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
       is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
       zip64 / >4GB archive support (reader currently rejects zip64).
@@ -1359,24 +801,6 @@ rather than acted on.
       TokenShift/WKV/SelectiveSSM/DiagonalSSM LANDED, commits 62165c1/cc1bfcb):
   - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
         gate — non-trivial, deferred).
-  - [x] Wire the net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens*
-        drives TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder
-        currently only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
-        DONE: TNNetStreamingDecoder.IsRecurrentStateLayer collects every
-        TNNetRecurrentDecodeBase descendant plus TNNetDiagonalSSM and
-        TNNetTokenShift, and drives Begin/End/Reset/Capture/RestoreState on them
-        alongside the SDPA KV-cache.
-- [x] Mamba decode follow-up (O(1) incremental TNNetSelectiveSSM state-carry decode
-      LANDED, commit 27ba256):
-      DONE (see the sub-item).
-  - [x] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
-        its (kernel-1)-token ring buffer + in/out projections driven one token at a
-        time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
-        block-integration follow-up).
-        DONE: TNNetDepthwiseConv1D is a TNNetRecurrentDecodeBase descendant that
-        carries its (kernel-1)-token history ring buffer across steps, and
-        TNNetStreamingDecoder drives it, so a whole Mamba block decodes one token
-        at a time. Verified end-to-end against HF on a real mamba-130m checkpoint.
 - [ ] Refactor examples/WhisperTranscribe to USE the landed cached forced-prefix
       seq2seq decode helper (`DecodeSeq2SeqForcedPrefixCached`, neural/neuraldecode.pas).
       NOT a clean drop-in today: the word-timestamp cross-attention alignment step
@@ -1421,62 +845,15 @@ rather than acted on.
       loops in the self-contained audio holders — `TEnCodecModel`, `TNNetHiFiGAN`,
       `TNNetVits`, `TNNetMimi`, and the MusicGen EnCodec decode path. These holders
       deliberately do the conv1d / ConvTranspose1d math DIRECTLY on channel-major
-      arrays (not via TNNet layers), and those inner loops are currently scalar
-      Pascal. After the EnCodec LSTM was AVX'd (~12.9x, real-T4 profiled), the 1D
-      convolutions became the dominant cost of audio decode, so this is the next
-      profiled bottleneck rather than a speculative optimization.
-      FORWARD conv1d DONE (commit 8e15052): EnCodec (RunEnCodecConv serial +
-      threaded TEnCodecConvWorker — covers TEnCodecModel + MusicGen EnCodec decode)
-      and HiFiGAN/Vits (RunHiFiGANConv — covers TNNetHiFiGAN and the nested Vits
-      decoder) now gather an im2col receptive-field patch (size InCh*K) per output
-      position and run each output channel as one contiguous TNNetVolume.DotProduct;
-      all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
-      builds.
-      CONVTRANSPOSE1D (upsample) DONE (commit 2873a1f for EnCodec + HiFiGAN/Vits;
-      Mimi grouped transpose in 30c2342 and DAC ungrouped transpose in 8277d25 were
-      vectorized inline when those holders landed): the overlap-add scatter is now a
-      transposed-im2col — InT packs InSig as [t*InCh+i] (each output column
-      InCh-contiguous) and WT repacks W as [(o*K+k2)*InCh+i] (each (o,k2) tap
-      InCh-contiguous), so Full[o][t*Stride+k2] += DotProduct(WT_{o,k2}, InT_t, InCh)
-      dispatches to AVX (Mimi/DAC use the Double-precision MimiDotProductD per group).
-      EnCodec's threaded TEnCodecConvWorker.RunTranspose splits over output channels.
-      The (t,k2) overlap-add order matches the original scatter; only the inner
-      in-channel sum reassociates (parity < 1e-4). Re-verified all 17 audio parity
-      tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
-      TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
-      pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
+      arrays (not via TNNet layers).
+      Forward conv1d (commit 8e15052) and ConvTranspose1d (commit 2873a1f; Mimi
+      30c2342, DAC 8277d25) are AVX-vectorized in all of these holders. REMAINING:
   - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
         blocked on a Double-precision shared dot-product kernel (their oracle gate
         is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
         (Forward conv1d + ConvTranspose1d OpenCL offload for EnCodec/HiFiGAN/Vits
         has landed via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gated path.)
-      Design note (the landed forward path follows this): channel-major layout
-      means the contraction (sum over in-channels for a fixed kernel tap) is
-      depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` / `MulAdd`
-      already vectorize — so the win is reusing the existing AVX volume primitives
-      (or a small im2col-into-DotProduct reshape) for the per-tap accumulation
-      instead of triple-nested scalar loops. Gate any remaining rewrite on the
-      existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
-      EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
-      before/after.
 
-- [x] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
-      `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
-      FullConnect/FullConnectLinear/FullConnectReLU — off by default, bit-identical
-      to serial, work-thresholded via `SetFullConnectThreadingMinWork`):
-      (a) the per-token projection HOLDERS (ChatTerminal / MusicGenText /
-      `RunLlama`-style decoders) still need to call
-      `EnableFullConnectThreading(true)` to opt in — wire it into the imported-model
-      run paths; (b) re-profile one-token decode wall-clock before/after on a real
-      imported decoder to tune the default threshold; (c) the int8-quantized
-      `ComputeQuantizedInt8CPU` and `TNNetFullConnectSigmoid`/other activation
-      siblings are still serial.
-      DONE: EnableFullConnectThreading is gone - the inference scheduler chunks
-      any layer that overrides ComputeRange, and TNNetFullConnect,
-      TNNetFullConnectLinear and TNNetFullConnectReLU all do, int8 included
-      (ComputeQuantizedInt8Range is the body of both the serial and the chunked
-      path). ChatTerminal computes parallel by default (--serial opts out);
-      measured ~2x fast-memory / ~1.3x low-memory on real Qwen decode.
 - [ ] Parler-TTS importer end-to-end follow-up (`BuildParlerTTSFromSafeTensors[Ex]`
       + `TParlerConfig` + `TParlerTTSModel` holder + `examples/ParlerTTS` LANDED,
       model_type `parler_tts`; (By)T5 description encoder cross-attention + shared
@@ -1534,7 +911,8 @@ rather than acted on.
       - Code structure: `TNNet` stages run by `TNNet.Compute`, so OpenCL comes with
         the layers; as many `TNNet`s as needed, host steps between them (duration
         rounding + frame repeat, sine source + forward STFT).
-      - G2P comes later (task 3.2). Until then the input is a phoneme string.
+      - English text goes through the G2P in `neuralg2p.pas`; a phoneme string
+        is also accepted as input.
       Checkpoint facts (from the cached snapshot and the package source):
       - 81.7M parameters, 327 MB FP32; fits under the 3 GB ulimit, so real-checkpoint
         runs are possible on the dev box.
@@ -1552,56 +930,7 @@ rather than acted on.
       - frame rate: decoder upsamples x2, generator x10 x6, iSTFT hop 5 = 600 samples
         per predicted frame = 40 frames/s at 24 kHz.
   Phase 0 — oracle and structure:
-  - [x] 0.1 `tools/` script: run the installed `KModel` on a fixed phoneme string
-        with `af_heart`; dump every stage (BERT out, durations, F0/N, decoder blocks,
-        harmonic source, waveform) as the real-checkpoint reference. Patch `SineGen`
-        noise to zero (or dump it) so Pascal can match.
-        Done: `tools/make_kokoro82m_fixture.py real` -> ~/.cache/neural-api/kokoro82m_ref/
-        `kokoro82m_ref.{safetensors,json,wav}` (not committed, 92 MB).
-  - [x] 0.2 Same script: tiny real-architecture fixture (the package's torch
-        classes, small dims, random weights) -> `tests/fixtures/`, replacing the
-        numpy pico fixture.
-        Done: `tools/make_kokoro82m_fixture.py tiny` -> `tests/fixtures/tiny_kokoro82m/`
-        (`config.json`, `kokoro-v1_0.pth`, `voices/af_heart.pt`) + `tiny_kokoro82m_ref.{safetensors,json}`.
-  - [x] 0.3 Per-utterance length: token count and frame count change every
-        sentence, and a `TNNet`'s length is fixed when it is built. Measure the cost
-        of rebuilding the stage nets from in-memory weights vs. padded buckets
-        (padding changes InstanceNorm statistics and the reverse LSTM, so buckets need
-        masking). Report before Phase 2.
-        Done: use a BORROWING REBUILD per utterance, the `TQwenImage21VaeDecoder`
-        pattern: one owner net per stage built once at a small length, then per
-        utterance `Net.BuildWeightOwner := Owner`, build at T/F, `BuildWeightOwner :=
-        nil` (layers link the owner's neurons, size no weights; OpenCL: arm the owner,
-        `EnableOpenCLInContextOf`, layers borrow its device weights). Measured on a
-        stage-C-like net (133 layers, 78.7M weights: 4 TDNN k3 blocks at 1024 ch,
-        Deconvolution stand-ins x2/x10/x6, 2 MRFs of TDNN k3/7/11 d1/3/5 at 256/128 ch),
-        CPU, F=100 frames, two runs (VM noise ~2-3x): owner build at F=8 119-690 ms,
-        355 MB; borrowing build 244-863 ms, 0 weight elements, +410 MB (activations
-        only, ~4.1 MB/frame; F=300 +1225 MB); rebuild + CopyWeights 350-1174 ms +
-        38-101 ms copy, +720 MB (a second 315 MB weight copy); forward 6.2-8.9 s.
-        Borrow output == copy output bit-exact. In the same run the borrowing build
-        (863 ms) is ~13% of one stage-C forward. Rejected: re-propagating sizes in place (`SetPrevLayer` is private,
-        many overrides call `InitDefault` and wipe weights, `TNNetSum`/concat size in
-        their constructor, OpenCL buffers are sized at `EnableOpenCL`); padded buckets
-        (needs a valid length on ~58 AdaIN InstanceNorms + ~65 conv inputs re-zeroed
-        in stage C, the reverse LSTM start, an ALBERT key mask, and pays the padding
-        in compute) to save ~13%. Traps: `TNNetInstanceNorm.Create(false)` is
-        a PER-ELEMENT affine sized by length (use the default `true`, gamma 1 beta 0);
-        build the owner long enough that `TNNetConvolutionAbstract.SetPrevLayer` does
-        not clamp a kernel (Deconvolution K20 p5 needs input >= 10). OpenCL arming
-        per rebuild not measured (no GPU here).
   - [ ] 0.4 Layers for the `TNNet` route:
-        - [x] dilated / strided 1D conv (torch Conv1d geometry). Done: new
-          `TNNetConv1DLinear` (a `TNNetConvolutionLinear` with a Kx1 kernel,
-          X-only padding, dilation along X) instead of extending `TNNetTDNNConv1D`:
-          `TNNetConvolutionAbstract` gained `FPaddingY`/`FDilationX`, the CPU im2col
-          (FP32 and int8), `BackpropagateFastTiledCPU`, `cai_im2col` and the implicit
-          GEMM honour them, so the tiled/threaded CPU and both OpenCL forwards serve
-          every Kokoro geometry (commit 2ff0b5d4). Tests: `TestConv1DLinear{TorchParity,OpenCLParity,
-          SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
-          `tests/fixtures/conv1d_oracle.json` (`tools/conv1d_oracle.py`, torch).
-          CPU, 256 ch k7 d3 L=2000: old TDNN 304-335 ms, new 260-266 ms serial,
-          161-189 ms threaded (4 vCPU VM).
         - [ ] `ShouldUseInterleavedDotProduct` picks `InterleavedDotProduct` for
           every conv with a multiple of 32 neurons; on 1D convs it is slower than
           `DotProductsTiled`: same conv at 250 ch (tiled) 199 ms serial / 89 ms
@@ -1613,89 +942,15 @@ rather than acted on.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
-        - [x] transposed 1D conv (torch ConvTranspose1d). Done: new
-          `TNNetDeconv1DLinear(NumFeatures, K, Stride, Padding, OutputPadding,
-          Groups=1, SuppressBias=0)`, a `TNNetDeconvolutionLinear` with a Kx1
-          kernel, no Y padding / output padding, no kernel clamp, groups in
-          FStruct[6] (commit cf181f32). `TNNetDeconvolution` gained
-          `FOutputPaddingY`, `FGroups` (grouped CPU scatter forward + backward;
-          grouped layers stay off OpenCL) and a CPU GEMM forward for dense
-          inference-only layers (`FConcatedWeights` x input positions with
-          `DotProductsTiled`, chunked, then a host scatter shared with the OpenCL
-          path). The old "11x wasted work" was weight memory, not CPU time: the
-          scatter skipped out-of-range rows. CPU, ups1 512->256 k20 s10 p5, L=200:
-          old 2D stand-in (20x11) 397-459 ms, new 1D inference 90-109 ms, new 1D
-          trainable (scatter) 394-470 ms. Tests: `TestDeconv1DLinear{TorchParity,
-          OpenCLParity,SaveLoadRoundTrip,BorrowingBuild,GradientCheck}` against
-          `tests/fixtures/conv_transpose1d_oracle.json`
-          (`tools/conv_transpose1d_oracle.py`, torch). Loader mapping: torch weight
-          [In, Out/G, K]; neuron Oc, group g = Oc div (Out/G), gets
-          `Weights[k, 0, c] := w[g*(In/G) + c, Oc mod (Out/G), k]` (no flip; dense:
-          `w[c, Oc, k]`), bias as is, then `FlushWeightCache`.
-        - [ ] The CPU GEMM needs `SetTrainable(False, {pLowMemory=}False)`: with the
-          default low memory (and when trainable) the deconv runs the per-neuron
-          scatter, ~4x slower at ups1. Decide for the Kokoro stage nets.
         - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
           neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
           scratch.
-        - [ ] Depthwise pool runs one length-1 `DotProduct` per (position, tap,
-          channel); vectorize over channels if it shows in a stage-C profile.
         - [ ] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
           products and scatters on the host; no resident source/output, and no
           borrowing (`EnableOpenCLInContextOf`) test for the deconv.
         - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
           deconv) for 32-multiple channel counts: one extra weight copy (dense
           deconvs only now).
-        - [x] Grouped deconv under AVX: the base `SetPrevLayer` armed the
-          interleaved copy with the dense vector size (K*InDepth) over the
-          K*InDepth/G rows, so `InterleaveWithXFrom` divided by zero at >= 32
-          channels and >= 40 output positions (real stage B at 102 frames; the
-          8-frame owner never reached it). Fixed: `FNoInterleavedWeights` (set
-          for groups > 1) keeps `ShouldUseInterleavedDotProduct` false. Test
-          `TestDeconv1DLinearDepthwiseWide` (raised EDivByZero under -dAVX2
-          before the fix).
-        - [x] per-channel Snake. Done: `TNNetSnake.Create(Alpha, PerChannelAlpha=
-          true)` learns one alpha per channel in `Neurons[0].Weights` (Depth long,
-          FStruct[0] = 1; scalar files unchanged); inference forward is row-wise
-          `TNNetVolume` Mul/Sin/Mul/Mul/Add, trainable forward a scalar loop with
-          the derivative; backward has the alpha gradient (commit 9a6ec901). Loader: torch
-          `alpha1[j]` [1,C,1] -> `Weights.Raw[c]`, then `FlushWeightCache`.
-        - [x] AdaIN1d / AdaLayerNorm / channel LayerNorm, no new class. AdaIN1d =
-          `TNNetInstanceNorm` (default per-channel affine; reduces over time per
-          channel, torch InstanceNorm1d), AdaLayerNorm and TextEncoder `LayerNorm` =
-          `TNNetTokenLayerNorm(1e-5)` (commit 9a6ec901). Per utterance the HOST computes
-          [gamma; beta] = fc(s) and writes `Neurons[0].Weights[c] := (1+gamma)*w`,
-          `Neurons[1].Weights[c] := (1+gamma)*b + beta` (w/b = the norm's own affine,
-          1/0 when absent), then calls `FlushWeightCache` on the layer of the net
-          that runs (a borrowing net's layers share the owner's neurons; the
-          TokenLayerNorm re-uploads its OpenCL gamma/beta only on that flag,
-          the InstanceNorm and the per-channel Snake upload theirs every forward).
-          `TNNetGroupNorm`/`TNNetInstanceNorm` OpenCL: `cai_group_norm` is now one
-          work-group per group (local tree reduction, was one work-item per
-          group), binds a source in OpenCL memory and keeps its output there when
-          not trainable. Activations: `TNNetLeakyReLU.Create(0.2 / 0.1 / 0.01)`,
-          `TNNetHyperbolicTangent`, `TNNetSigmoid` (all OpenCL already); new
-          `cai_activation` opcodes MulConstant (`TNNetMulByConstant`, for the
-          rsqrt(2) and /3 scalings after `TNNetSum`), Snake and per-channel Snake
-          (a per-layer channel-parameter buffer on `TNNetIdentity`). Tests:
-          `TestKokoroStyleNormTorchParity`, `TestKokoroActivationTorchParity`
-          (tests/fixtures/kokoro_norm_activation_oracle.json from
-          `tools/kokoro_norm_activation_oracle.py`, the kokoro classes),
-          `TestKokoroLayersOpenCLParity` (chain stays in OpenCL memory, then a
-          host style rewrite), `TestSnakePerChannelSaveLoadRoundTrip`,
-          `TestKokoroLayersBorrowingBuild`, `TestSnakePerChannelGradientCheck`;
-          `TestActivationOpenCLParity` gained the 3 opcodes.
-        - [x] Generator head `exp(x[:, :11])` / `sin(x[:, 11:])`: `TNNetExp` /
-          `TNNetSin` exist on CPU only (no opcode); 22 x frames, so either
-          `TNNetSplitChannels` + those layers or a host step before the iSTFT.
-          Done: host step (the net ends at conv_post; 22 x (120F+1) floats,
-          one download, and the iSTFT is on the host anyway).
-        - [x] Host helper for the style fold (fc(s) -> per-channel gamma/beta)
-          lives only in the test (`WriteStyleIntoChannelAffine`); move it into the
-          Kokoro loader (2.5) rather than writing a second copy.
-          Done: `WriteStyleIntoChannelAffine(NormLayer, FcWeight, FcBias, Style,
-          NormWeight, NormBias)` in neuralpretrained (TNNetVolume arguments); the
-          test helper converts the oracle JSON and calls it (commit 3f1f670e).
         - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
           `pcr_sinf` loop; the per-channel path is vectorized.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
@@ -1705,1381 +960,46 @@ rather than acted on.
         exits early when the length is unchanged, OpenCL arming as in
         `TQwenImage21VaeDecoder.PrepareNet` (neuralpretrained.pas:69716). Reuse that
         code path; do not clone it.
-        Stage A done (commit 3f1f670e): `TNNetKokoro.Create(Reader, Config)` builds
-        the stage-A owner once at 8 tokens and loads it (a stage-A tensor left
-        unread raises); `PrepareStageA(T)` = `BuildWeightOwner := owner`, build,
-        `nil`, `PrepareInferenceThreads`, `ShareHostOutputsByLiveness`, OpenCL
-        arming; `RunStageA(Ids, ProsodyStyle, Speed, d, t_en, PredDur)`. The VAE
-        decoder's context-net creation and owner arming became
-        `CreateOpenCLContextNet` / `ArmWeightOwnerInOpenCLContext`, used by both.
-        Inference: `SetTrainable(False)` with low memory: the shared ALBERT
-        repeats keep no per-layer weight cache. Measured (real, 32 tokens, CPU,
-        AVX2 release, VM noise): fast memory gave no gain and +1.2 s per rebuild;
-        switching the sized net to fast memory after the build without
-        `FlushWeightCache` raised EInvalidOp (empty caches). Real stage A: owner
-        load 1.2-2.2 s, PrepareStageA 0.09-0.22 s, forward 0.32-0.44 s parallel /
-        0.56-0.88 s serial (other runs on a busy VM: 1.3-3.9 s).
-        - [x] Stage C: add it beside stages A and B (`FStage*Owner`,
-          `FStage*Net`, one shared `FOpenCLContextNet`, `ArmStageNet`).
-          Decoder part done: `TNNetKokoro.LoadStageCDecoder` builds the owner
-          once at 8 frames (`KokoroStageCDecoderOwnerFrameCount`) and loads
-          every `decoder.*` tensor except `decoder.generator.*` (one left unread
-          raises); `PrepareStageCDecoder(F)` / `ReleaseStageCDecoder` /
-          `RunStageCDecoder(t_en, PredDur, F0Curve, NCurve, DecoderStyle, x)`,
-          same borrowing rebuild, `ArmStageNet` and inference settings as
-          stages A and B. Real decoder, 102 frames (`fpc -O2` test build, no
-          AVX2, threaded, CPU): owner 31,155,936 weights (124.6 MB); 3.1-4.5 s
-          build + forward (2 runs); activations 171.5 MB with host-output
-          sharing off, 163.5 MB on (20 of 58 layers shared); the test process
-          (all three owners + the decoder net) peaks at 802 MB RSS.
-        - [x] Stage C generator: recommended as a FOLLOWING net
-          (`StageCGenerator`), not appended to the decoder net. Inputs: x
-          (2F,1,512) at index 0, the host harmonic spectrum (120F+1,1,22) at
-          index 1. The host writes `Layers[1].Output`, then
-          `ComputeFromLayerOutput(StageCDecoderNet.GetLastLayer())` hands x
-          over (an OpenCL buffer copy when x is resident; `RunStageCDecoder`
-          would then skip its host copy). Why: generator parity can start from
-          the dump's dec_decode3 alone; one net would share no host storage
-          across the two (exact-size liveness slots, no common shapes); the
-          hand-over costs one 0.4 MB copy.
-          Done as recommended: `LoadStageCGenerator` builds the owner once at
-          2 frames (`KokoroStageCGeneratorOwnerFrameCount`; no generator kernel
-          clamps at any length); `PrepareStageCGenerator(F)` /
-          `ReleaseStageCGenerator` / `RunStageCGenerator(x, spectrum, style,
-          Audio)`, same borrowing rebuild and `ArmStageNet`. `Synthesize`
-          hands x over with `ComputeFromLayerOutput(StageCDecoderNet last
-          layer)`; `RunStageCDecoder` still downloads and copies x (0.4 MB)
-          because it returns it. Inference: low memory, except the two ups
-          deconvs in fast memory (`SetTrainable(False, False)` +
-          `FlushWeightCache` after the borrowing build) so they run the CPU
-          GEMM: standalone real shapes, CPU, best of 4: ups0 512->256 k20 s10
-          L=204 407 -> 285 ms (borrowed weights 398 -> 284 ms), ups1 256->128
-          k12 s6 L=2040 471 -> 378 ms; +12 MB weight cache. Not measured
-          inside the real generator (no real-size runs on the dev VM).
-          `TNNetKokoro.Create` now checks EVERY checkpoint tensor is consumed
-          (one shared Consumed list, `RaiseOnUnreadKokoroTensors` over
-          bert/bert_encoder/predictor/text_encoder/decoder; real file passes).
-          - [ ] Real-size generator memory / time not measured here: the
-            generator parity and end-to-end tests on the real checkpoint (and
-            the real stage-C decoder ones) are opt-in,
-            `NEURAL_KOKORO82M_REAL_HEAVY=1`; an earlier real generator run hit
-            the VM's OOM killer (2.7 GB RSS + swap) with host-output sharing off.
-          - [ ] OpenCL: `TNNetPadXY` (the reflection pad) has no kernel, so it
-            downloads ups1's output and its consumer re-uploads (6 MB at 102
-            frames); the ups deconvs scatter on the host (see 0.4). Not
-            measured on a GPU (PoCL parity only).
-        Stage B done: `TNNetKokoro.LoadStageB` builds the stage-B owner once at 8
-        frames (`KokoroStageBOwnerFrameCount`) and loads it (a stage-B tensor left
-        unread raises, via `RaiseOnUnreadKokoroTensors`, now shared with stage A);
-        `PrepareStageB(F)` = the stage-A borrowing rebuild with early exit; the
-        post-build steps (threads, host-output sharing, OpenCL owner arming once,
-        `EnableOpenCLInContextOf`) are `ArmStageNet`, used by both stages.
-        `RunStageB(d, PredDur, ProsodyStyle, F0Curve, NCurve)`: host frame
-        expansion (`RepeatTokenRows`), 12 AdaIN1d style folds
-        (`WriteStyleIntoChannelAffine`), `TNNet.Compute`, then the (2F,1,2)
-        output split into F0_pred / N_pred (2F,1,1). Inference settings as stage A
-        (`SetTrainable(False)`, low memory): the depthwise pool is grouped, and
-        grouped `TNNetDeconvolution` runs the CPU scatter in either memory mode
-        (the GEMM path is dense-only), so fast memory buys nothing here. The
-        borrowing net sizes no weights (`WeightElementsSized` = 0). Real stage B,
-        102 frames, CPU (`fpc -O2` test build, no AVX2, threaded, one run):
-        236 ms build + forward.
         - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
           is known), so a borrowing build allocates and frees each table: 3
           tables, 114,176 floats on the real checkpoint. Other layers size none.
-        - [ ] The owner build sizes each ALBERT repeat's rows before
-          `LinkWeightsFrom` frees them (transient, one block at a time).
         - [ ] CPU profile of the real stage A: `TNNetLSTMCell` ~51% of layer time
           (the CPU input projection is per-step dot products, no GEMM; the OpenCL
           path batches it only at Depth >= 32), `TNNetPointwiseConvLinear` ~44%.
         - [ ] Real-checkpoint stage A on a GPU: not run (PoCL parity on the tiny
           fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
           unless forced, because the LSTM output is on RAM.
-  - [x] 0.6 `TNNetLSTMCell.SetPrevLayer` sizes its 12 rows directly, so a borrowing
-        build allocates and `InitDefault`s them, then `LinkNeuronsFrom` frees them.
-        Correct but wasted; honour `DeferWeightSizingToBuildLink` there (~5 lines).
-        Done: `TNNetLSTMCell` and `TNNetGRUCell` (same issue) skip sizing under
-        `DeferWeightSizingToBuildLink` (the `TNNetGatedDeltaNet` pattern) and now
-        count `WeightElementsSized`. Test `TestBidirectionalRecurrentBorrowingBuild`
-        (LSTM and GRU stacks, owner at 6, borrower at 11). Commit 74287878.
-  - [ ] 0.7 Stage-C activation memory is ~4.1 MB/frame, so > 3 GB above ~600 frames
-        (15 s of audio). `ShareHostOutputsByLiveness` shared only 14 of 133 layers
-        (32 MB) on the test net: find out why before Phase 4, or cap F per chunk.
-        Same on the real stage-C decoder: 20 of 58 layers shared, 171.5 -> 163.5 MB.
-  Phase 1 — loading:
-  - [x] 1.1 Read `kokoro-v1_0.pth` with `TNNetTorchBinReader` (first check: its
-        pickle parser accepts this file's `OrderedDict`s); map names (strip `module.`).
-        Done: the unpickler accepts BUILD only as a dict's attribute dict (the
-        state dicts' `_metadata`, dropped); the five nested state dicts flatten
-        to `<component>.module.<name>` and `OpenKokoroCheckpoint` renames them to
-        `<component>.<name>` (`RenameTensorPrefix`, no reader copy). Real file:
-        548 tensors, 81,763,410 parameters, all F32; every tensor read once
-        (1.45 s, 19.5 MB RSS); counts and sum/sum-abs match torch. The extra zip
-        entries of the tiny fixture (`.format_version`, `.storage_alignment`)
-        needed no change.
-  - [x] 1.2 `TNNetTorchBinReader`: accept a bare-tensor root (rejected today at
-        neuraltorchbin.pas:1018); voice-pack row selection.
-        Done: a bare-tensor root is exposed as the one tensor
-        `TorchBinBareTensorName` ('tensor'). `LoadKokoroVoicePack` (checks
-        [rows, 1, 2*style_dim]) + `SelectKokoroVoiceStyle(Pack, PhonemeCount,
-        DecoderStyle, ProsodyStyle)`: row PhonemeCount-1 (kokoro's
-        `pack[len(ps)-1]`, code points of the phoneme string incl. symbols the
-        vocab skips); raises outside 1..rows.
-  - [x] 1.3 Config reader: `plbert`, `istftnet`, `vocab` (keys are multibyte IPA
-        characters: look up per UTF-8 code point).
-        Done: `TKokoroConfig` / `ReadKokoroConfigFromJSONFile` (escapes decoded,
-        raw-UTF-8 parse; each vocab key must be one code point; embedding_size
-        defaults to 128). The istftnet arrays go into a `THiFiGANConfig` through
-        the new `ReadHiFiGANGeneratorFields`, now shared by the HiFi-GAN and VITS
-        config readers. `KokoroPhonemesToIds` (binary search per code point,
-        skipped symbols returned, raises past max_position_embeddings).
-        `ReadKokoroWidthsFromWeights` sets DecoderWidth / DecoderBlockInputWidth /
-        DecoderOutputWidth / AsrResWidth / DecoderBlockCount (real 1024 / 1090 /
-        512 / 64 / 4) and checks word-embedding and conv_post shapes against the
-        config. The fpjson 255-byte key limit does not apply (keys are 1-3 bytes).
-  - [x] 1.4 Load from the snapshot folder: one call takes the folder plus a voice
-        name (`af_heart`) and finds the three files. The example takes the folder as
-        a command-line argument (the HF cache path contains a commit hash).
-        Done: `OpenKokoroSnapshot(Dir, VoiceName, out Config, out Voice)` returns
-        the reader; errors name the missing folder / config.json / voice, and
-        list the *.pth files when there is not exactly one.
-        Tests: `TestKokoroCheckpointTensors`, `TestKokoroVoicePackRowSelection`,
-        `TestKokoroConfigFromJSONFile`, `TestKokoroPhonemesToIds`,
-        `TestKokoroSnapshotLoad`, `TestKokoroRealSnapshotSmoke` (Ignored when no
-        snapshot is in the HF cache; `NEURAL_KOKORO82M_DIR` overrides).
-        Commit d6db9f49.
   Phase 2 — components, in graph order:
   - [x] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
         and one shared layer (do not clone it); then `bert_encoder` 768->512.
-        Done (a77647bb, 3f1f670e): the BERT builder's encoder and loader became
-        `AddBertEncoder` / `LoadBertEncoderWeights`; family `bfAlbert` adds
-        `EmbeddingSize` tables, `embedding_hidden_mapping_in`, and repeats 1.. that
-        `LinkWeightsFrom` block 0 (one weight copy; the borrowing build links the
-        owner's root via `LinkBuildWeightOwner`). AlbertConfig defaults: gelu_new
-        (`TNNetGELU`), eps 1e-12, 2 token types. Tiny max |diff| <= 1.1e-6; real
-        bert_layer0..11 <= 2.0e-5 abs (max |ref| ~11.4), d_en 3.3e-5.
         - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
   - [x] 2.2 TextEncoder: embedding, 3x (weight-norm Conv1d k5, channel LayerNorm,
         LeakyReLU 0.2), bi-LSTM 512 -> 2x256.
-        Done (3f1f670e): `TNNetEmbedding`, `TNNetConv1DLinear` k5 p2 loaded by
-        `LoadTorchConv1DLinear` (weight_norm fold `LoadTorchConv1DWeight`, now
-        shared with `LoadHiFiGANConv`), `TNNetTokenLayerNorm(1e-5)`,
-        `TNNetLeakyReLU(0.2)`, bi-LSTM. The bi-LSTMs need input != hidden: new
-        `TNNetLSTMCell.Create(Hidden)` + `AddBidirectionalLSTM(...,
-        CellsReadInputWidth)` (b5381f69); `LoadTorchLSTMInto(..., StackInput)`
-        loads one stack of several. Real: text_cnn <= 8.6e-6, t_en 1.9e-6.
         - [ ] `TNNetGRUCell` has no input-width option.
-  - [x] 2.3 `AdaLayerNorm` (LayerNorm, `(1+gamma)`, beta from Linear(style)) and the
-        `DurationEncoder` loop (3x bi-LSTM + AdaLayerNorm, style concatenated each
-        round).
-        Done (3f1f670e): the style is input channels 2.. of stage A (host-filled,
-        the same row on every token); one `TNNetSplitChannels` feeds every
-        `[norm; style]` `TNNetDeepConcat`. No weights (nothing to borrow), one
-        upload with the ids, OpenCL-resident after. `RunStageA` writes each
-        AdaLayerNorm's gamma/beta with `WriteStyleIntoChannelAffine` before the
-        forward. Real: dur_enc_adanorm0..2 <= 8.4e-5 abs (rel. 1.7e-5), d 1.9e-5.
-  - [x] 2.4 Duration head: bi-LSTM, Linear 512->50, sigmoid, sum, /speed, round,
-        clamp >= 1; frame expansion by repeat (no alignment matmul).
-        Done (3f1f670e) up to the durations: bi-LSTM, `TNNetPointwiseConvLinear`,
-        `TNNetSigmoid` in the net; sum / speed / `Round` (half to even, as
-        torch.round) / clamp on the host. pred_dur exact on tiny and real.
-        Tests: `TestKokoroStageATinyParity`, `TestKokoroStageABorrowingRebuild`,
-        `TestKokoroStageAOpenCLParity`, `TestKokoroRealStageAParity`.
-        - [x] Frame expansion by repeat (d and t_en, per pred_dur): the host step
-          before stage B. Done: `RepeatTokenRows(Source, Durations, Dest)` (one
-          `Move` per frame); stage C reuses it for t_en -> asr.
-  - [x] 2.5 AdaIN1d as above.
-        Done: `TNNetInstanceNorm` + the host fold `WriteStyleIntoChannelAffine`;
-        the fc of each AdaIN1d is loaded by `LoadKokoroStyleFc` (shape-checked,
-        shared with stage A's AdaLayerNorms). The checkpoint has no InstanceNorm
-        affine (torch builds `affine=True` and leaves it at 1/0).
-        Bug fixed on the way: `NeuralPerChannelMeanInvStd` (the CPU
-        instance-norm path of `TNNetGroupNorm` and `TNNetAdaIN`) computed the
-        variance as E[x^2] - mean^2, contrary to its declared contract; on a
-        near-constant channel (tiny F0_block0 norm1: variance 2e-5, eps 1e-5)
-        that cancelled to a 2.4e-4 norm1 error. Now centered (sum then
-        sum((x-mean)^2)); norm1 error 1.9e-6. Costs one extra pass (a `Move` +
-        2 `MulAdd` per position); not timed. The OpenCL kernel was already
-        centered.
   - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
         1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
         ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
         `THiFiGANConv` (or the `TNNet` equivalent).
-        Done: `AddKokoroAdainResBlock(NN, InputLayer, DimOut, Upsample)` returns
-        `TKokoroAdainResBlockLayers` (Norm1/Norm2/Pool/Conv1/Conv2/Shortcut/
-        Output) for stage C's encode/decode blocks too: InstanceNorm, LeakyReLU
-        0.2, pool = `TNNetDeconv1DLinear(C, 3, 2, 1, 1, groups=C)`, conv1/conv2 =
-        `TNNetConv1DLinear` k3 p1; shortcut = `TNNetDeMaxPool(2, 0, pPoolSizeY=1)`
-        (new Y factor: an X-only nearest x2 on (L,1,C); `FStruct[3]`, 0 = old
-        behaviour; OpenCL gather when Y factor = X factor or SizeY = 1) then
-        `TNNetPointwiseConvLinear(DimOut, SuppressBias=1)`; `TNNetSum` +
-        `TNNetMulByConstant(1/sqrt 2)`. `LoadKokoroAdainResBlockWeights` loads
-        the convs; new `LoadTorchConvTranspose1DLinear` (grouped torch layout,
-        weight_norm folded) and `LoadTorchConv1DLinear` accept a conv without
-        bias (shared `LoadTorchConvBias`). Test `TestDeMaxPoolAlongXOnly`.
         - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
           pool downloads its source and re-uploads its output (2 pools in stage
           B, 9 of 63 layers off OpenCL in a forced run; stage C has more).
         - [ ] A Y factor other than the X factor on SizeY > 1 runs
           `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
-  - [x] 2.7 `F0Ntrain` (shared bi-LSTM, 2x3 `AdainResBlk1d`, 1x1 projections) and
-        the Decoder (`F0_conv`/`N_conv` k3 s2, `encode`, `asr_res`, 4 `decode` blocks
-        with the concat).
-        F0Ntrain done: `BuildKokoroStageBNet(NN, Config, F)`: input en (F,1,
-        hidden+style = 640 real), shared bi-LSTM (cells read the input width),
-        then the F0 and N branches fork from it in one net (3 blocks each:
-        d_hid->d_hid, d_hid->d_hid/2 x2, d_hid/2->d_hid/2), `F0_proj`/`N_proj` as
-        `TNNetPointwiseConvLinear(1)`, `TNNetDeepConcat` -> (2F,1,2). Tests:
-        `TestKokoroStageBTinyParity` (abs: en 0, f0n_shared 6.0e-8, F0_block0..2
-        4.5e-6/1.3e-5/1.8e-5, N_block0..2 5.2e-6/3.4e-6/8.8e-6; F0_pred / N_pred
-        checked relative because F0 is in Hz: 5.2e-4 of 140.7 = 3.7e-6, 6.3e-6 of
-        2.1), `TestKokoroStageBBorrowingRebuild` (F = 10 and 6, vs a fresh build),
-        `TestKokoroStageBOpenCLParity` (PoCL, incl. a style rewrite),
-        `TestKokoroRealStageBParity` (real dump, 102 frames, max rel. diff
-        1.6e-6: f0n_shared 1.2e-6 abs, F0_block1 5.3e-5 of 35.9, F0_pred 1.5e-4 of
-        312.6 Hz, N_pred 5.7e-6 of 9.6). Stage-B parity feeds the dump's d and
-        pred_dur, so it does not include stage A's error (d: 7.4e-6 rel.).
-        - [x] Decoder half (stage C).
-          Done: `BuildKokoroStageCDecoderNet(NN, Config, F)`: three
-          `TNNetInput`s, the first layers of the net, fed by
-          `TNNet.Compute([asr, F0, N])` (the RAFT / F5-TTS multi-input idiom;
-          inputs of different lengths need no packing): asr (F,1,hidden),
-          F0 and N (2F,1,1). F0_conv / N_conv = `TNNetConv1DLinear(1, 3, 1, 2)`
-          on the curves, `TNNetDeepConcat([asr, F0, N])`, encode =
-          `AddKokoroAdainResBlock(.., 1024)`, asr_res =
-          `TNNetPointwiseConvLinear(64)` on asr, then per decode block
-          `TNNetDeepConcat([x, asr_res, F0, N])` (torch order) and
-          `AddKokoroAdainResBlock`; only the last block upsamples (to 2F, 512
-          out), so the package's `res` flag never stops the concat. The host
-          expands t_en to asr with `RepeatTokenRows`; the decoder style is the
-          FIRST half of ref_s. The norm1/norm2 fc loader is now
-          `LoadKokoroAdainResBlockStyleFcs`, shared with stage B. Tests:
-          `TestKokoroStageCDecoderTinyParity` (abs: asr 0, dec_N_conv 2.4e-7,
-          dec_encode 3.8e-6 of 49.7, dec_asr_res 1.5e-8, dec_decode0..3
-          1.5e-5/1.1e-5/7.6e-6/1.5e-5 of up to 106; dec_F0_conv relative
-          9.2e-8), `TestKokoroStageCDecoderBorrowingRebuild` (F = 10 and 6 vs a
-          fresh build), `TestKokoroStageCDecoderOpenCLParity` (PoCL, incl. a
-          style rewrite: 57 of 58 layers on OpenCL, the grouped pool stays on
-          the CPU; max |diff| x 7.6e-6 of 49.6), `TestKokoroRealStageCDecoderParity` (real dump, 102
-          frames, max rel. diff 2.6e-6: dec_F0_conv 1.5e-7, dec_N_conv 6.6e-8,
-          dec_encode 1.3e-6, dec_asr_res 8.1e-7, dec_decode0..3 6.9e-7/7.5e-7/
-          8.4e-7/2.6e-6; host-output sharing on == off).
-        - [x] Real stage A + B chained (our d into stage B) not compared to the dump.
-          Done: `TestKokoroRealStagesChainedToDecoder` runs A -> B -> decoder on
-          the real sentence from input_ids and ref_s only: pred_dur exact,
-          F0_pred 4.8e-4 Hz (rel. 1.5e-6), dec_decode3 1.5e-4 abs of 35.3 (rel. 4.2e-6);
-          3.3 s for the three stages, 999 MB peak RSS. Tolerance 1e-3 relative.
-        - [ ] CPU profile of the real decoder (3.1-4.5 s at 102 frames is slow
-          for ~31M weights x 102-204 frames); not run. Real decoder on a GPU:
-          not run.
-        - [ ] Stage B on a GPU and a CPU profile: not run.
-  - [x] 2.8 `SineGen` / `SourceModuleHnNSF`: F0 upsampled x300, 9 harmonics, the
-        down / cumsum / up linear-interpolation phase, voiced threshold 10, Linear
-        9->1 + tanh.
-        Done: `TNNetHarmonicSource` in neuralaudio.pas (a general hn-NSF piece,
-        not Kokoro-specific): `Create(SampleRate, UpsampleScale, HarmonicCount,
-        SineAmp, NoiseStd, VoicedThreshold)`, `SetMergeWeights`, `Compute(F0,
-        HarmonicSource)`, `ComputeUpsampledF0AndVoicing`. Zero noise by default;
-        `RandomNoise` + `NoiseSeed` (FPC RNG, global RandSeed restored, the seed
-        advances per call) add rand_ini and the Gaussian noise. Torch semantics
-        verified bit-exact in Python against the real dump (scratch scripts):
-        nearest index = floor(float(i) * float(1/300)); interpolate with
-        scale_factor uses the coordinate scale float(1/scale_factor)
-        (recompute_scale_factor unset) and output length floor(L * scale_factor)
-        in double; the source coordinate is FMA-contracted,
-        fma(scale, i + 0.5, -0.5) in float, clamped at 0; the blend is
-        fma(x0, w0, x1 * w1); cumsum accumulates in double; phase =
-        ((float(cumsum) * 2) * float(pi)) * 300. The down-sample reads samples
-        300j+149/150 with weight 0.5, so rand_ini (added to sample 0 only) never
-        reaches the phase: the random initial phase is a no-op in Kokoro.
-        Tests: `TestHarmonicSourceTorchParity` (kokoro SourceModuleHnNSF, U=6,
-        negative / unvoiced / high F0; f0 up and uv exact, har_source < 1e-6),
-        `TestHarmonicSourceRandomNoise`; fixture
-        tests/fixtures/stft_harmonic_source_oracle.json
-        (`tools/stft_harmonic_source_oracle.py`).
   - [x] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
         in neuralaudio.pas; only power-spectrum and private FFT routines exist.
-        Done: `TNNetForwardSTFT(NFFT, Hop)`: torch.stft defaults and sign,
-        `Transform(Wave, Re, Im)`, `TransformToMagnitudePhase(Wave, Dest)`
-        (Dest = [|X|; atan2] along Depth, torch.cat order). Direct DFT with
-        `TNNetVolume.DotProduct` against window-premultiplied cos / -sin tables
-        built in Create (the radix-2 FFT does not take 20; `RealFramePowerSpectrum`
-        returns power only); interior frames read the wave in place, edge frames
-        a reflect-padded scratch; DC / Nyquist Im forced to +0 (torch gives
-        phase 0 or +pi there). Tests: `TestForwardSTFTTorchParity` (n_fft
-        20/16/15), `TestForwardSTFTCosinePeakBins`.
-        Kokoro wiring: `TNNetKokoro.ComputeHarmonicSpectrum(F0Curve, Spectrum)`
-        -> (120F+1, 1, 22), the generator's second input; `LoadHarmonicSource`
-        reads `decoder.generator.m_source.l_linear` (upsample scale =
-        prod(upsample_rates) * hop = 300). Tests:
-        `TestKokoroHarmonicSpectrumTinyParity`, `TestKokoroRealHarmonicSpectrumParity`.
-        Real sentence (204 F0 frames -> 61200 samples -> 12241 STFT frames):
-        gen_f0_upsampled and gen_uv exact; gen_har_source 3.0e-8 abs (rel.
-        2.1e-7, phases up to ~3.8e4 rad); gen_har_spec 2.4e-7 (rel. 1.9e-7);
-        complex spectrum 2.4e-7; phase (only where |X| > 1e-4 max |X|, wrapped)
-        4.0e-4 rad. Tiny: har_source 1.5e-8, spec 2.4e-7, phase 3.9e-4 rad.
-        Host step 41 ms on the real sentence (`fpc -O2` test build, no AVX2).
-        - [x] ARBITRARY PHASE BINS (kept, user decision 2026-10-14): zero noise makes har_source the constant
-          tanh(bias) on unvoiced spans, so bins 2..10 of those frames are
-          rounding noise. Real sentence: 44,238 of 134,651 bins at |X| <=
-          1e-7 max (52,990 at <= 1e-4). Torch (MKL FFT) is deterministic there
-          (same pattern on every constant frame, e.g. bin 2 phase 2.03) but the
-          values are MKL rounding artefacts, so no Pascal FFT can reproduce
-          them. They feed the generator's noise_convs: replacing torch's
-          phases with a float64 STFT's (a stand-in for any other FFT) moved
-          the torch audio by 0.087 max abs (peak 0.32), RMS 0.0037 vs signal
-          RMS 0.047. So: generator parity (2.11) must feed the dump's
-          gen_har_spec / gen_har_phase; end-to-end audio parity will not get
-          below ~0.1 abs; decide whether to zero or keep those phases.
         - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
         - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
-  - [x] 2.10 `AdaINResBlock1`: HiFi-GAN resblock1 + AdaIN + per-channel Snake
-        (`TNNetDAC.RunSnake`); extend `THiFiGANResBlock` rather than clone it.
-        Done as `TNNet` layers instead (the host-run `THiFiGANResBlock` does not
-        fit the TNNet-stage decision): `AddKokoroAdaINResBlock1(NN, Input, K,
-        Dilations)` -> `TKokoroAdaINResBlock1Layers`; per dilation d:
-        `TNNetInstanceNorm`, per-channel `TNNetSnake`, `TNNetConv1DLinear(C, K,
-        d*(K-1)/2, 1, d)`, again with d = 1, `TNNetSum` with the residual.
-        `LoadKokoroAdaINResBlock1Weights` loads convs1/convs2 (weight_norm
-        folded), alpha1/alpha2 (`LoadKokoroSnakeAlpha`) and the adain fc
-        (`LoadKokoroStyleFc`). Used for noise_res and the MRF resblocks.
   - [x] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
         ups, reflection pad (1,0) on the last stage, MRF average of 3 resblocks,
         `conv_post` 128->22, exp (magnitude) / sin (phase), iSTFT via
         `ISTFTOverlapAdd` with the centre trim and the phase-sign flip.
-        Done: `BuildKokoroStageCGeneratorNet(NN, Config, F)`: inputs x
-        (2F,1,512) and the harmonic spectrum (120F+1,1,22); per stage
-        `TNNetLeakyReLU(0.1)`, noise conv (`TNNetConv1DLinear(c, 2*s, (s+1)
-        div 2, s)`, s = prod(rates[i+1:]); last stage
-        `TNNetPointwiseConvLinear`), noise_res (k7 / last k11, d 1,3,5), ups
-        `TNNetDeconv1DLinear(c, k, u, (k-u) div 2)`, on the last stage
-        `TNNetPadXY(1, 0, pmReflect, 0)`, `TNNetSum`, 3 resblocks, `TNNetSum` +
-        `TNNetMulByConstant(1/3)`; then `TNNetLeakyReLU(0.01)` and conv_post.
-        Lengths (real): x 2F -> ups0 20F (= noise conv0 (120F+1+6-12) div 6 +
-        1) -> ups1 120F -> pad 120F+1 (= the 1x1 noise conv); the builder
-        raises on a mismatch. `TNNetPadXY` gained `TrailingPaddingX`
-        (FStruct[3] = it + 1, 0 = symmetric as before; test
-        `TestPadXYTrailingPaddingX`). Host: exp / sin per element, then new
-        `ISTFTCenteredMagnitudePhase` (neuralaudio: torch.istft center=True:
-        `ISTFTOverlapAddReIm` with Im negated, NFFT div 2 trimmed at both ends,
-        600F samples). Top level: `Synthesize(ids, decoder style, prosody
-        style, speed, Audio)`, `SynthesizePhonemes(phonemes, voice, ...)`,
-        `SynthesizePhonemesToWav` (`SaveVolumeToWav16`, 24 kHz). Tests (tiny,
-        relative to max |ref|): gen_stage0 leaky 0, noise_conv 3.7e-7,
-        noise_res 8.4e-7, ups 1.8e-7, sum 5.7e-7, resblock0..2 8.7e-7/7.2e-7/
-        6.2e-7, mrf 5.9e-7; gen_stage1 noise_conv 1.4e-7, noise_res 6.2e-6,
-        ups / pad 5.4e-7, sum 5.6e-6, resblock0..2 4.4e-6/4.3e-6/3.8e-6, mrf
-        4.3e-6; post_leaky 3.8e-6; gen_spec 9.4e-6; gen_phase 7.0e-5 abs;
-        audio 0.81 of 47963 (1.7e-5) (`TestKokoroStageCGeneratorTinyParity`);
-        `TestKokoroISTFTTinyParity` (dump gen_spec/gen_phase -> audio, 1.2e-7);
-        `TestKokoroStageCGeneratorBorrowingRebuild` (F = 10 and 6 vs a fresh
-        build); `TestKokoroStageCGeneratorOpenCLParity` (PoCL: 120 of 185
-        layers on OpenCL as armed, 162 forced; conv_post <= 2.0e-5 abs of ~7,
-        audio <= 3.8e-5 of ~8);
-        `TestKokoroTinySynthesizePhonemes` (equals the stages one by one;
-        dec_decode3 7.4e-6, F0_pred 9.0e-6 rel.).
-        - [ ] Tiny end to end vs the dump audio: 43763 of 47963 max abs. The
-          generator on the dump's x with OUR harmonic spectrum gives the same
-          43763, so it is the arbitrary phase bins of 2.9 (random tiny weights
-          and exp() amplify them). Real-checkpoint end-to-end diff not
-          measured here (opt-in test `TestKokoroRealEndToEnd`, writes
-          pascal.wav beside the dump).
         - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
           their scratch per call (once per utterance).
-  Phase 3 — text input:
-  - [x] 3.1 Phoneme string -> ids (vocab), wrapped `0 ... 0`, at most 510 tokens;
-        split long input into chunks.
-        Done: ids by `KokoroPhonemesToIds` (1.3; raises past
-        max_position_embeddings, as KModel's assert); chunking of text by 5.6.
-        A raw phoneme string (`--phonemes`) is not chunked, as in KPipeline
-        (`generate_from_tokens` raises on a phoneme string over 510).
-  - [ ] 3.2 G2P (text -> phonemes). misaki English = gold/silver dictionaries
-        (~6 MB JSON), spaCy part-of-speech tagging, num2words, espeak-ng fallback.
-        Options: (a) phonemes as input (user runs misaki); (b) Pascal dictionary
-        lookup, English only (`a*`/`b*` voices); (c) espeak-ng shared-library
-        binding. With (a) every voice works; (b) covers English only.
-        User 2026-10-12: no Python dependency, so (a) is out. Found: misaki
-        `us_gold.json` 90,201 + `us_silver.json` 93,361 entries (Apache-2.0), only 790
-        keyed by part of speech (`read`: DEFAULT `ɹˈid`, VBD `ɹˈɛd`);
-        `libespeak-ng.so.1` (1.51, GPL-3.0) is installed on the dev box.
-        User 2026-10-12: no C library either (pure Pascal), so (c) is out. Scope:
-        (b), English only (`a*`/`b*` voices), DEFERRED until synthesis works.
-        SUPERSEDED 2026-10-13 by Phase 5 below (no download: the user passes the
-        dictionaries in a folder; unknown words go through sub-word splitting).
-  Phase 4 — integration:
-  - [x] 4.1 examples/KokoroTTS: `--model-dir`, `--voice`, `--speed`, `--phonemes`,
-        writes 24 kHz WAV. The pico example of that name was removed in 403d17f2:
-        recreate it (new .lpr needs cthreads first; re-add its `.gitignore` entry
-        for the output WAV, the binary entry is still there) and its
-        examples/README.md entry.
-        Done: `KokoroTTS --model-dir DIR --phonemes "IPA" [--voice af_heart]
-        [--speed 1] [--out kokoro.wav] [--serial] [--max-threads N] [--gpu]
-        [--gpu-platform N] [--gpu-device N] [--no-gpu-shared-kernel]` (OpenCL and
-        thread flags named as in QwenImage; OpenCL off by default because no
-        Kokoro stage has run on a GPU). `OpenKokoroSnapshot` + `TNNetKokoro` +
-        `SynthesizePhonemes` + `SaveVolumeToWav16`; prints skipped symbols, token
-        count, frame count, audio seconds, load / synthesis / WAV-write / total
-        time and peak RSS (VmHWM). No per-stage times: `Synthesize` does not
-        report them. README: phonemes from misaki's English G2P (reference
-        `həlˈO wˈɜɹld. ðˌɪs ɪz ɐ tˈɛst.`), the three files to download, zero
-        noise, English voices only until G2P, and only the memory figures
-        measured here (no real end-to-end peak yet). `lazbuild -B` Default,
-        Debug, Release: all build. Tiny-fixture smoke (`hˈO.`): 6 tokens, 10
-        frames, 0.25 s audio, WAV written, peak RSS 21 MB (CPU); the Debug build
-        (range checks) and `--gpu` on PoCL also wrote it.
-  - [ ] 4.2 Per-stage parity on the tiny fixture (< 1e-4) + one real-checkpoint
-        test against the 0.1 dump, under the 3 GB ulimit.
-        Tiny per-stage parity is in the default suite (see 2.x). The real
-        checkpoint part stays open: the real stage-C decoder, chained, generator
-        and end-to-end tests (`TestKokoroRealStageCDecoderParity`,
-        `TestKokoroRealStagesChainedToDecoder`,
-        `TestKokoroRealStageCGeneratorParity`, `TestKokoroRealEndToEnd`) are
-        opt-in (`NEURAL_KOKORO82M_REAL_HEAVY=1`, plus the dump from
-        `tools/make_kokoro82m_fixture.py real`) and have not run end to end on
-        this VM; the user's real-machine check is those tests and
-        `KokoroTTS --model-dir <snapshot> --phonemes "həlˈO wˈɜɹld. ðˌɪs ɪz ɐ
-        tˈɛst." --out hello.wav`.
-        - [x] DECIDED (2.9, 2026-10-14, after the user's listening test): keep
-          the arbitrary harmonic-spectrum phase bins on unvoiced spans (our
-          STFT's rounding values).
-  - [x] 4.3 README (planned vs supported split; "supported" only after the user
-        tests it), this entry.
-        Done: root README "More audio" highlight names `KokoroTTS` as planned
-        (coded), not yet tested on the real checkpoint; examples/README.md entry
-        and examples/KokoroTTS/README.md say the same. Moved to supported on
-        2026-10-14 after the user's real run.
-  Phase 5 — text input and REPL (plan agreed with the user 2026-10-13; order:
-  5.1-5.7 G2P, then 5.8 positional model folder, then 5.9 REPL). CODED:
-  5.1-5.9 done; the real checkpoint with text input is untested (user run
-  pending).
-  Rules: pure Pascal at run time (no Python, no C library, no OpenSSL download);
-  no Python at test time (a `tools/` script writes fixtures once on the dev box).
-  - [x] 5.1 New unit `neural/neuralg2p.pas`: English G2P, not Kokoro-specific
-        (a later TTS model can reuse it); `TNNetKokoro` calls it. Port of misaki
-        `en.py` (0.9.4, 712 lines) WITHOUT spaCy: word splitting, capital letters
-        and acronyms, possessives (`'s`), contractions, hyphenated words, the
-        -s / -ed / -ing suffix rules for words found only as their stem, stress
-        adjustment, punctuation passed through (Kokoro's vocab has
-        `, . ! ? ; : — …` and quotes).
-        Done (commits c1af8ee1, 51b1c903). API: `TNeuralEnglishG2P.Create(DictDir,
-        g2pAmerican|g2pBritish)` (neuralg2p.pas:248), `Phonemize(Text): string`
-        and `Phonemize(Text, out Tokens)`; each `TNeuralG2PToken` (:73) has
-        Text, Whitespace, Tag (rule tagger, Penn tags), Phonemes, IsKnown and
-        Resolutions, a set of punctuation / dictionary / context rule / POS
-        rule / stem rule / spelled / unknown / number pending
-        (`G2PResolutionName` prints them, for `/show`). Also exported:
-        `ApplyG2PStress`, `G2PSubTokenize` (misaki's sub-token regex, matched by
-        hand), `EnglishG2PAccentFromVoice` (`a*` US, `b*` GB, others raise; it
-        lives in neuralg2p, not in the Kokoro code), `EnglishG2PDictionaryFileName`.
-        `TNNetKokoro.SynthesizeText` calls it (5.6); 5.8/5.9 wire it into the example.
-        Ported as in en.py: retokenize grouping, the right-to-left loop with
-        future_vowel / future_to, the longest-merge loop over sub-tokens,
-        resolve_tokens (junk pieces, prespace, demotion of the lighter
-        primaries), merge_tokens, get_special_case (a/am/an/I/by/to/in/the/vs/
-        used, % & + @, ADD dot/slash), get_NNP spelling, is_known, lookup
-        (grown keys, gold then silver, the "None" key at a clause end, NNP
-        spelling when the entry has no primary stress), get_word (case folding,
-        `s'` and `'` endings, stems), _s/_ed/_ing (US ᵻ, GB ɪ, US flap, GB
-        refuses -ing after ə/ː), the ɾ -> T / ʔ -> t mapping. spaCy's tokenizer
-        is approximated: whitespace chunks; prefixes `( { " “ ‘ /`, the
-        backtick and `$ £ € ¥` (read ''); suffixes `. , ! ? ; : … ) } " ” %` (and `’` only after an
-        opening `‘`), one token per character; a final `.` stays on a dictionary
-        abbreviation (Dr., Mr.) or a dotted one (U.S., Ph.D.); infixes `--`, `—`,
-        `–` between letters/digits; clitics `'s n't 're 've 'll 'd 'm` and
-        plural `s'` split off (straight and curly). Unicode helpers come from
-        neuralhftokenizer (IsLetterCP, LowercaseCP, the new UppercaseCP, NFKC
-        UnicodeNormalize); \p{Lu}/\p{Ll} are exact for ASCII, Latin-1 and
-        Latin Extended-A only.
-        Hook points: numbers (5.3, now done: `ReadWord`'s `IsNumberWord`
-        branch calls `ReadNumber`);
-        unknown words (5.5): tokens/pieces with g2prUnknown, empty phonemes as
-        misaki with fallback=None; chunking (5.6): the per-token output.
-        Gaps: misaki's markdown overrides (`[word](/IPA/)`, `[w](+1)`,
-        `[n](#flags#)`) are not parsed (brackets read as text); numeric_if_needed
-        (Unicode digits) not ported; merges inside one word are capped at 32
-        sub-tokens (`csMaxMergedPieces`; misaki's loop is cubic, the longest key
-        in its four files has 13; a pathological 8000-sub-token word takes
-        3.4 s); a run of 2+ spaces keeps only the first character, like spaCy.
-        Speed: ~0.2 ms per 20-word sentence on this VM.
-        Tests (`TestNeuralG2P`, 15): dictionary parse/lookup, missing-file
-        error, voice -> accent, ApplyG2PStress, sub-token regex, US and GB stem
-        rules, stress demotion, acronyms / dotted abbreviations / shouting
-        sentences, next-word context, POS rules, per-token resolutions, the
-        fixture agreement (US, GB) and the real-dictionary load (ignored when
-        misaki's data/ is missing; `NEURAL_MISAKI_DATA_DIR`).
-        Fixture agreement (both accents identical in shape; numbers, currency,
-        percent groups and every token with a digit or money sign excluded =
-        5.3; tokens misaki left unknown excluded = 5.5; POS-keyed tokens
-        counted apart):
-        | group | tokens US | tokens GB | sentences |
-        | plain | 203/203 | 203/203 | 25/25 |
-        | punctuation | 212/212 | 212/212 | 26/26 |
-        | capitals_acronyms | 182/183 | 182/183 | 24/26 |
-        | possessives | 109/109 | 109/109 | 20/20 |
-        | contractions | 115/115 | 115/115 | 20/20 |
-        | hyphenated | 99/99 | 98/98 | 20/20 |
-        | suffix_stems | 178/178 | 177/177 | 30/30 |
-        | heteronyms | 216/216 | 216/216 | 36/38 |
-        | unknown_and_names | 85/85 | 85/85 | 24/24 |
-        | long_mixed | 542/543 | 542/543 | 0/6 (numbers) |
-        | total | 1941/1943 (99.9%) | 1939/1941 (99.9%) | 225/235 |
-        Asserted: 100% for every group except capitals_acronyms and long_mixed
-        (>= 99%). Remaining mismatch classes (same in US and GB): (1) `NEAR` in
-        the all-caps "THE END IS NEAR": spaCy tagged it NNP and misaki spelled
-        it; the port reads a sentence whose words are all upper case as words.
-        (2) `the` before a number in long_mixed ("the 1st of June", sentence
-        296): misaki's context comes from the number reading (5.3); the port
-        skips the unread number and sees "of". The POS-keyed mismatches are listed under 5.4.
-        Suites after the commit: cpu, avx2, opencl all `TESTS=3259 ERRORS=0
-        FAILURES=0 IGNORED=4` (was 3244).
-  - [x] 5.2 Dictionaries: misaki's `us_gold.json` + `us_silver.json` (US) and
-        `gb_gold.json` + `gb_silver.json` (GB), Apache-2.0, from misaki's GitHub
-        repository (`misaki/data/`). The USER downloads them, like the model: by
-        default the program looks in `<model-dir>/misaki/`; `--dict-dir <folder>`
-        overrides. Never downloaded by the program, never committed to the repo.
-        Clear error naming the missing file. Dictionary picked from the voice:
-        `a*` = US, `b*` = GB; other voices raise until their language has a G2P.
-        Load cost matters (~183k entries per accent): parse once at startup,
-        hash lookup (reuse an existing string hash map; search first).
-        Done (commit 51b1c903), library side: `TNeuralG2PDictionary`
-        (neuralg2p.pas:99) `LoadFromFile` / `LoadFromString`, `IndexOf`,
-        `IndexOfGrown` (misaki grow_dictionary: a lowercase key also answers
-        its Capitalized form and vice versa, computed at lookup time instead
-        of doubling the table), `TagReading` (POS-keyed values incl. "None"
-        and null), `DefaultReading`, `KeyAt`. Search result: no public string
-        hash map in the repo (neuralhftokenizer's merge table and
-        neuralsafetensors' name table are private FNV tables), so the unit has
-        its own FNV-1a open-addressing index. Parsing bypasses TJSONObject
-        entirely (no 255-byte key limit; misaki's longest key is 45 bytes):
-        a dedicated scanner keeps keys and readings as byte spans inside the
-        file text (JSON escapes decoded in place; a repeated key keeps the last
-        value, as Python). Missing files raise `ENeuralG2PError` naming every
-        missing path and where to get them. Measured on the real files
-        (`x` venv, misaki 0.9.4 data/, release -O2, this VM, 2 runs each):
-        US 90,201 gold + 93,361 silver entries in 82-184 ms, +16.5 MB RSS
-        (peak +19 MB); GB 87,352 + 109,766 in 92-131 ms, +17.7 MB RSS (peak
-        +21 MB); the suite's load test saw 67-74 ms. Entry counts equal
-        notes.json's `full_entries`. NOT done here: the `<model-dir>/misaki/`
-        default and `--dict-dir` belong to the example (5.8/5.9); the
-        constructor takes the folder. The example part is done in 5.8.
-  - [x] 5.3 Text normalization, matching misaki and no more: cardinals,
-        ordinals (`3rd`), years (`1984`), decimals, currency (`$`, `£`, `€`),
-        `%`. Small English number-to-words port (misaki uses `num2words`).
-        Done (commits 71db06b4 fixture, db271fb1 code). API in neuralg2p.pas:
-        `EnglishCardinalWords` / `EnglishOrdinalWords` / `EnglishYearWords` /
-        `EnglishDecimalWords` (:281-288), num2words 0.5.14's exact English
-        strings ("one hundred and one", "twenty-first", "ten sixty-six",
-        "nineteen oh-five", "two thousand and one", "2.0" -> "two"), computed
-        on digit strings up to num2words' 10^306 limit; they stay in
-        neuralg2p because the English G2P is their only consumer.
-        `TNeuralEnglishG2P.ReadNumber` (:2779) ports get_number: ordinals,
-        bare 4-digit years (not after a currency sign), digits glued to
-        letters (A380 three eighty, A305 three O five, 555-1234), version
-        numbers, minus only at a word head, commas removed, leading zeros
-        dropped, unstressed "point", `$ £ €` with at most 2 decimals (dollars
-        and cents, pence never plural, zero part dropped), -s/-ed/-ing
-        (1990s, 80s), num2words' "and" dropped. Currency follows retokenize
-        (`BuildPiecesAndGroups`): the last piece of a CD token after the sign,
-        unless the next token is CD, so "$12 million" puts "dollars" after
-        million (append_currency); ¥ reads nothing. The tagger now tags
-        number tokens and cardinal words CD; g2prNumberPending became
-        g2prNumber. Two tagger fixes found by the new group: A380-like
-        pieces keep the token's tag (only hyphenated words are tagged piece
-        by piece), "A" before % & + @ is NNP.
-        Fixture: new group numbers_more (23 sentences, ids 297-319, earlier
-        output byte-identical, subsets regrown under the same rule).
-        Agreement, US = GB (non-POS tokens; sentences): numbers 213/213,
-        32/32; currency 138/138, 20/20; percent 54/54, 9/10; numbers_more
-        188/188, 23/23; long_mixed 580/580, 5/6; capitals_acronyms 182/183;
-        total US 2572/2573, GB 2570/2571 tokens, 314/320 sentences. Asserted
-        100% for every group but capitals_acronyms (99%). Every remaining
-        mismatch is an earlier class: NEAR (5.1) and the POS-keyed tokens
-        (5.4: "content" in percent #228, "minute" in long_mixed #292).
-        Deviations, only where misaki/num2words would crash or round: 10^306
-        and above reads digit by digit; a number word missing from the
-        dictionary is skipped; decimals read their written digits (num2words
-        reads the float64, which differs past 15 significant digits).
-        Not done: number flags from markdown (`[n](#&a#)`, no markdown
-        parser), Unicode digits (numeric_if_needed). Tests:
-        TestEnglishNumberWords, TestNumberReading, fixture agreement now
-        counts every digit/money token. Suites: cpu, avx2, opencl
-        `TESTS=3261 ERRORS=0 FAILURES=0 IGNORED=4`.
-  - [x] 5.4 Words spelled the same but pronounced differently (790 entries keyed
-        by part of speech, e.g. `read`, `record`): use the dictionary's DEFAULT
-        reading (user asked me to pick, 2026-10-13). The 5.7 fixture reports how
-        often this differs from misaki's spaCy choice; context rules (after "to"
-        -> verb, after "the"/"a" -> noun) only if that rate is noticeable.
-        Done (commit 51b1c903) with context rules, since DEFAULT disagreed on
-        30%: `TNeuralEnglishG2P.TagRawTokens` / `TagWord`, tables at
-        neuralg2p.pas:309 (`cPreviousWordCues`), `cPreviousSuffixCues`,
-        `cObjectPronouns`, `cDeterminers`, `cConjunctions`,
-        `cThatComplementNext`, `cClosedClassTags`. Order: `@` in a word -> ADD;
-        ALL-CAPS (2+ letters) -> NNP unless the whole sentence is upper case;
-        closed class (a/an/the DT, `A` alone before punctuation NNP, I PRP,
-        to TO, in/by/vs IN, be/have/do forms VB*; a contraction tags as its
-        first word, that'll -> that); `used` VBD before "to"; `that` IN when
-        a determiner or subject pronoun follows, else DT; Capitalized inside a
-        sentence -> NNP; previous word: to/modals/do/not/please -> VB,
-        I/you/we/they -> VBP, he/she/it -> VBD (VBZ for an -s word),
-        had/has/have/was/were/been -> VBN, is/are/am/be/very/so/too/stay -> JJ,
-        determiners/possessives/prepositions -> NN, `'ll`/`n't`/`'d` -> VB,
-        `'ve` -> VBN; next word: me/him/them/us -> VB; a determiner after a
-        clause start or and/or/but -> VB; before punctuation -> NN; -ed VBD,
-        -ing VBG; otherwise no tag (DEFAULT). Pieces of a hyphenated word take
-        their own closed-class tag (spaCy tags them one by one), so the `a` in
-        one-of-a-kind reads ɐ.
-        Result on the fixture's 158 POS-keyed tokens (all groups): 153/158
-        (96.8%) in US and GB, vs 111/158 (70.3%) reading DEFAULT; asserted
-        >= 95%. Heteronym group 74/76. Remaining 5 (US = GB): "LOL, that was
-        funny" (spaCy WDT, port DT); "Fat content changed" (spaCy NN after an
-        adjective; the port has no adjective list -> DEFAULT); "the change is minute" (port JJ -> mInˈut, the right
-        English; spaCy NN -> DEFAULT mˈɪnət); "the minute hand" (spaCy JJ ->
-        mInˈut; port NN -> DEFAULT mˈɪnət, again the right English); "Have you
-        read it?" (spaCy VB -> ɹˈid; port VBP -> ɹˈɛd, the right English).
-        Three of the five are spaCy errors the port does not copy.
-  - [x] 5.5 Unknown words, in this order: (1) misaki's own rules (suffixes,
-        possessives, hyphen parts); (2) SPLIT the word into dictionary words by
-        dynamic programming, fewest pieces, each piece at least 2 letters
-        ("sunflowerfield" -> sun + flower + field), join their phonemes; only
-        the first piece keeps primary stress (ˈ), later primary stresses become
-        secondary (ˌ); (3) SPELL letter by letter (the dictionaries' own letter
-        entries: `A` -> `ˈA`, `B` -> `bˈi`) ONLY for unknown ALL-CAPS strings and
-        for leftover single characters the split cannot cover. Report which
-        words took route 2 or 3. Names may split oddly; that is accepted.
-        Done (commit 95cb6312). Rule as implemented, after misaki's own rules
-        fail: `TNeuralEnglishG2P.ReadUnknownWord` (neuralg2p.pas:300, body
-        :3273). (a) Letters folded to ASCII: NFKC, apostrophes dropped,
-        Latin-1 / Latin Extended-A accents stripped with neuralhftokenizer's
-        `StripAccentBaseCP` (now exported, :480); any other character (ł, ø,
-        æ, digits, symbols) leaves the word unknown. Folding is a table
-        lookup, so it is safe mechanically, but it can pick the wrong word:
-        résumé -> resume reads the verb (ɹəzˈum). (b) An ALL-CAPS string of 2+
-        letters is spelled as misaki spells acronyms (all secondary, last
-        primary); misaki already spells ASCII ALL-CAPS words itself, so in
-        practice this fires after folding (ÉCOLE -> E+C+O+L+E). (c) Any other word,
-        lowercased, at most `csG2PMaxSplitLetters` = 64 letters (:72; longer
-        stays unknown), is covered by dynamic programming
-        (`SplitIntoWords`, :3154): pieces are dictionary words of 2+ letters
-        that contain a vowel letter a e i o u y (this keeps out abbreviation
-        keys such as mr, dr, st, ft, which read as whole words), or single
-        letters spelled with their gold letter entry. Cost: fewest spelled
-        letters, then fewest pieces, then the longest first piece. So a full
-        cover always exists for ASCII letters; "leftover single characters"
-        = the spelled letters of the best cover, and a word with no
-        dictionary piece is spelled letter by letter (Qwrtz, Hrrm, shh,
-        Bpsa) — the literal reading of the rule; kept (user decision
-        2026-10-14: spell, not silent). A piece reads its DEFAULT (POS-free) reading,
-        gold before silver, the exact key before its Capitalized form
-        (misaki grow_dictionary), null entries skipped. Readings are joined
-        without spaces; only the first piece keeps ˈ, later ˈ become ˌ. A
-        Capitalized or mixed-case word then gets misaki's capital stress
-        (ApplyG2PStress 0.5, which only adds a mark when the result has
-        none). Fewest pieces means sunflowerfield -> sunflower+field (2
-        pieces), not sun+flower+field. DP cost: at most 64 start positions
-        x the longest dictionary key (45 bytes) x 4 hash probes, no string
-        built per probe (`TNeuralG2PDictionary.IndexOfBytes` :152,
-        `MaxKeyLength` :165). (d) Multi-piece words (`ResolveUnknownRuns`,
-        :3636): after misaki's merge loop, the run of adjacent letter pieces
-        around an unread piece (taking whole any misaki merge made only of
-        letter pieces) is read as one word, so camelCase WiFi -> wifi,
-        PyTorch -> pytorch, possessive Schuler's -> schuler + misaki's 's,
-        blorp-zing -> blorp + misaki's zing. A clitic piece after an
-        apostrophe piece (I'd've, GB that'll) stays unread as in misaki.
-        The word before a now-read word sees its first sound (misaki's
-        right-to-left context). Report: new kinds `g2prUnknownSplit` /
-        `g2prUnknownSpelled` (:90; `G2PResolutionName`: "unknown word
-        split" / "unknown word spelled"); a cover with both words and
-        spelled letters has both; `TNeuralG2PToken.Pieces` (:106) holds the
-        pieces, '+'-joined, spelled letters upper case ("pa+U+lo").
-        Tests (3 new, 20 in TestNeuralG2P): TestUnknownWords (pieces,
-        one primary, kinds, folding, Wrocław unknown, camelCase, possessive,
-        clitic, context "the applegarden" -> ði, the 64/65-letter cap),
-        TestUnknownWordReport (prints the table below), and
-        TestUnknownWordRealDictionaries (full misaki files, ignored when
-        missing): with the full files only the 4 folded words differ —
-        Café -> cafe kæfˈA (GB kˈafA), naïve -> naive nɑˈiv (GB nIˈiːv),
-        résumé -> resume ɹəzˈum (GB ɹɪzjˈuːm), Raphaël -> raphael ɹˈæfiəl
-        (GB ɹˈafAəl); the subset lacks cafe/naive/resume/raphael because
-        they are not substrings of the accented fixture words. Every other
-        row is identical. Fixture agreement: tokens misaki read are
-        unchanged except 8 it read only in part, now read whole and not
-        counted (blorp-zing, Mia's, Nguyen's, PyTorch, Schuler's,
-        usr/local/bin, WiFi, www.example.org/page; asserted as a list) and
-        one context change not counted ("got" before "hashtagged" in #293:
-        misaki's clause-end "None" reading ɡˈɑt -> ɡɑt). Totals US
-        2563/2564, GB 2561/2562 (same mismatches as before: NEAR + the 5.4
-        POS cases); sentence agreement drops to 270/320 (US) and 269/320
-        (GB) because sentences with unknown words now have phonemes where
-        misaki has none. The fixture's `*` and `#` stay as before (not
-        letters). Suites: cpu, avx2, opencl `TESTS=3264 ERRORS=0
-        FAILURES=0 IGNORED=4`.
-        Every fixture word misaki left unknown (or read in part), dictionary
-        subset; pieces -> phonemes (US | GB; ɾ already mapped to T):
-        | word | US | GB |
-        | --- | --- | --- |
-        | usr/local/bin | us+R -> ˌʌsˌɑɹ lˈOkəl bˈɪn | us+R -> ˌʌsˌɑː lˈQkᵊl bˈɪn |
-        | www.example.org/page | W+W+W -> dˈʌbᵊljudˌʌbᵊljudˌʌbᵊlju ɪɡzˈæmpəl ˈɔɹɡ pˈAʤ | W+W+W, or+G -> dˈʌbᵊljuːdˌʌbᵊljuːdˌʌbᵊljuː ɪɡzˈɑːmpᵊl ɔːʤˌiː pˈAʤ |
-        | PyTorch | P+Y+torch -> pˈiwˌItˌɔɹʧ | P+Y+torch -> pˈiːwˌItˌɔːʧ |
-        | WiFi | W+if+I -> dˈʌbᵊljuɪfˌI | W+if+I -> dˈʌbᵊljuːɪfˌI |
-        | Schuler's | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹs | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜːs |
-        | Nguyen's | N+guy+en -> ˈɛnɡˌIˌɛns | N+guy+en -> ˈɛnɡˌIˌɛns |
-        | Mia's | mi+A -> mˈiˌAs | M+I+A -> ˈɛmˌIˌAs |
-        | blorp-zing | blo+R+P -> blˈOˌɑɹpˌizˌɪŋ | blo+R+P -> blˈQˌɑːpˌiːzˌɪŋ |
-        | blogged | B+logged -> bˈilˌɔɡd | blog+G+E+D -> blˈɒɡʤˌiːˌiːdˌiː |
-        | livestreamed | livest+reamed -> lˈIvstɹˌimd | livest+reamed -> lˈIvstɹˌiːmd |
-        | livestreaming | livest+reaming -> lˈIvstɹˌimɪŋ | livest+reaming -> lˈIvstɹˌiːmɪŋ |
-        | photoshopped | photos+hopped -> fˈOTOzhˌɑpt | photo+shopped -> fˈQtQʃˌɒpt |
-        | hashtagged | hash+tagged -> hˈæʃtˌæɡd | hashtag+G+E+D -> hˈaʃtaɡʤˌiːˌiːdˌiː |
-        | facetimed | face+timed -> fˈAstˌImd | face+timed -> fˈAstˌImd |
-        | smurfs | S+M+urf+S -> ˈɛsˌɛmˌɜɹfˌɛs | S+M+urf+S -> ˈɛsˌɛmˌɜːfˌɛs |
-        | photocopied | photo+co+pied -> fˈOTOkˌOpˌId | photo+co+pied -> fˈQtQkˌQpˌId |
-        | vlogged | V+logged -> vˈilˌɔɡd | vlog+G+E+D -> vlˈɒɡʤˌiːˌiːdˌiː |
-        | geotagged | geotag+G+E+D -> ʤˈiOtˌæɡʤˌiˌidˌi | geotag+G+E+D -> ʤˈiːQtaɡʤˌiːˌiːdˌiː |
-        | deduped | D+E+duped -> dˈiˌidˌupt | D+E+duped -> dˈiːˌiːdjˌuːpt |
-        | sunflowerfield | sunflower+field -> sˈʌnflˌWəɹfˌild | sunflower+field -> sˈʌnflˌWəfˌiːld |
-        | keyboardstand | keyboard+stand -> kˈibˌɔɹdstˌænd | keyboard+stand -> kˈiːbɔːdstˌand |
-        | rainbowbridge | rainbow+bridge -> ɹˈAnbˌObɹˌɪʤ | rainbow+bridge -> ɹˈAnbQbɹˌɪʤ |
-        | moonlightgarden | moonlight+garden -> mˈunlˌItɡˌɑɹdən | moonlight+garden -> mˈuːnlItɡˌɑːdᵊn |
-        | Joao | J+O+A+O -> ʤˈAˌOˌAˌO | jo+A+O -> ʤˈQˌAˌQ |
-        | Paulo | pa+U+lo -> pˈɑjˌulˌO | pa+U+lo -> pˈɑːjˌuːlˌQ |
-        | Schuler | S+C+H+U+ler -> ˈɛssˌiˌAʧjˌulˌɜɹ | S+C+H+U+ler -> ˈɛssˌiːˌAʧjˌuːlˌɜː |
-        | Nguyen | N+guy+en -> ˈɛnɡˌIˌɛn | N+guy+en -> ˈɛnɡˌIˌɛn |
-        | Xochitl | X+O+chit+L -> ˈɛksˌOʧˌɪtˌɛl | X+och+it+L -> ˈɛksˌɒkɪtˌɛl |
-        | Siobhan | si+ob+han -> sˈiˌɑbhˌæn | si+ob+han -> sˈiːˌɒbhˌan |
-        | Okonkwo | ok+on+K+W+O -> ˌOkˈAˌɔnkˌAdˌʌbᵊljuˌO | ok+on+K+wo -> ˌQkˈAˌɒnkˌAwˌQ |
-        | blorptastic | blo+R+P+ta+S+tic -> blˈOˌɑɹpˌitˌɑˌɛstˌɪk | blo+R+P+ta+S+tic -> blˈQˌɑːpˌiːtˌɑːˌɛstˌɪk |
-        | zingwhizzle | zing+whizzle -> zˈɪŋwˌɪzᵊl | zing+whizzle -> zˈɪŋwˌɪzᵊl |
-        | Llanfairpwllgwyngyll | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌænfˌɛɹpˌidˌʌbᵊljuˌɛlˌɛlʤˌidˌʌbᵊljuwˌIˌɛnʤˌiwˌIˌɛlˌɛl | L+lan+fair+P+W+L+L+G+W+Y+N+G+Y+L+L -> ˈɛllˌanfˌɛːpˌiːdˌʌbᵊljuːˌɛlˌɛlʤˌiːdˌʌbᵊljuːwˌIˌɛnʤˌiːwˌIˌɛlˌɛl |
-        | Zbigniew | Z+big+N+I+ew -> zˈibˌɪɡˌɛnˌIjˌɪw | Z+big+N+I+ew -> zˈiːbˌɪɡˌɛnˌIjˌɪw |
-        | Brzezinski | B+R+ze+zin+ski -> bˈiˌɑɹzˌizˌɪnskˌi | B+R+ze+zin+ski -> bˈiːˌɑːzˌiːzˌɪnskˌiː |
-        | Dmitri | D+mi+T+R+I -> dˈimˌitˌiˌɑɹˌI | D+M+it+R+I -> dˈiːˌɛmɪtˌɑːˌI |
-        | Shostakovich | sho+sta+K+O+V+I+C+H -> ʃˈOstˌɑkˌAˌOvˌiˌIsˌiˌAʧ | sho+sta+K+O+V+I+C+H -> ʃˈQstˌɑːkˌAˌQvˌiːˌIsˌiːˌAʧ |
-        | Qwrtz | Q+W+R+T+Z -> kjˈudˌʌbᵊljuˌɑɹtˌizˌi | Q+W+R+T+Z -> kjˈuːdˌʌbᵊljuːˌɑːtˌiːzˌiː |
-        | Wrocław | stays unknown (ł has no ASCII base) | stays unknown |
-        | Café | C+A+F+E -> sˈiˌAˌɛfˌi | C+A+F+E -> sˈiːˌAˌɛfˌiː |
-        | naïve | na+I+V+E -> nˈʌˌIvˌiˌi | na+I+V+E -> nˈʌˌIvˌiːˌiː |
-        | résumé | re+sum+E -> ɹˌAsˌʌmˌi | res+um+E -> ɹˈiːzˌʌmˌiː |
-        | Okafor | oka+for -> ˈOkəfɔɹ | oka+for -> ˈQkəfɔː |
-        | Tanaka | ta+na+ka -> tˈɑnˌʌkˌɑ | tana+ka -> tˈɑːnəkˌɑː |
-        | Hrrm | H+R+R+M -> ˈAʧˌɑɹˌɑɹˌɛm | H+R+R+M -> ˈAʧˌɑːˌɑːˌɛm |
-        | shh | S+H+H -> ˈɛsˌAʧˌAʧ | S+H+H -> ˈɛsˌAʧˌAʧ |
-        | firetruckladder | fire+truck+ladder -> fˈIəɹtɹˌʌklˌædəɹ | fire+truck+ladder -> fˈIətɹˌʌklˌadə |
-        | Greenhousegas | greenhouse+gas -> ɡɹˈinhˌWsɡˌæs | greenhouse+gas -> ɡɹˈiːnhWsɡˌas |
-        | snowmanhat | snowman+hat -> snˈOmˌænhˌæt | snowman+hat -> snˈQmanhˌat |
-        | Bpsa | B+P+S+A -> bˈipˌiˌɛsˌA | B+P+S+A -> bˈiːpˌiːˌɛsˌA |
-        | joaopauloschuler | J+O+A+opa+U+lo+S+C+H+U+ler -> ʤˈAˌOˌAˌOpəjˌulˌOˌɛssˌiˌAʧjˌulˌɜɹ | jo+A+opa+U+lo+S+C+H+U+ler -> ʤˈQˌAˌQpəjˌuːlˌQˌɛssˌiːˌAʧjˌuːlˌɜː |
-        | Kokoro | K+ok+or+O -> kˈAˌOkˌAɔɹˌO | K+O+koro -> kˈAˌQkˌɔːɹQ |
-        | Raphaël | rap+ha+el -> ɹˈæphˌɑˌɛl | rap+ha+el -> ɹˈaphˌɑːˌɛl |
-        | Zoë | Z+O+E -> zˈiˌOˌi | Z+O+E -> zˈiːˌQˌiː |
-        | tokenizer | tokenize+R -> tˈOkənˌIzˌɑɹ | tokenize+R -> tˈQkənIzˌɑː |
-        | hummed | (misaki reads it) | hum+med -> hˈʌmmˌɛd |
-        | refactoring | (misaki reads it) | refactor+ing -> ɹiːfˈaktəˌɪŋ |
-        Seen in the table, for the user to judge: words with a doubled
-        consonant before -ed come out as spelled letters (blogged B+logged
-        US, blog+G+E+D GB; hashtagged, vlogged, geotagged), because pieces
-        are dictionary words only and -ed is not one; a doubled-consonant
-        -ed stem rule (not in misaki) would fix that group. Names mostly
-        spell (Joao J+O+A+O, Schuler S+C+H+U+ler). Not done: no stem rules
-        on pieces, no letter-to-sound rules, no folding beyond Latin-1 /
-        Latin Extended-A.
-        Done (user-approved follow-up): the doubled-consonant -ed stem rule.
-        `StemEd` gets a third branch after misaki's two: a word of 6+ letters
-        ending in `([bcdgklmnprstvxz])\1ed` or `cked` whose word[:-3] is known
-        reads as that stem + `SuffixEd` (stem_ing's branch, shared through
-        `EndsWithDoubledConsonant`). Fixture words leaving the unknown routes
-        (US | GB): blogged blˈɑɡd | blˈɒɡd, vlogged vlˈɑɡd | vlˈɒɡd,
-        hashtagged hˈæʃtˌæɡd | hˈaʃtaɡd, geotagged ʤˈiOtˌæɡd | ʤˈiːQtaɡd,
-        photoshopped fˈOTəʃˌɑpt | fˈQtQʃɒpt (grown key `Photoshop`), GB hummed
-        hˈʌmd.
-        No counted fixture token changes; the agreement test treats the word
-        before such a token as context, as it does for the unknown routes.
-  - [x] 5.6 Long text (also closes 3.1's chunking): split at sentence
-        punctuation into chunks of at most 510 tokens, synthesize each, join the
-        audio into one WAV (as Kokoro's own pipeline does).
-        Done. Chunking lives in neuralg2p (guide rule 4: it reads only
-        `TNeuralG2PToken` fields, and the limit is a parameter, so a later TTS
-        model reuses it): `SplitG2PTokensIntoChunks` (neuralg2p.pas:337) ports
-        KPipeline.en_tokenize + waterfall_last exactly (code-point counts,
-        the pending trailing space counted, cut after the last `! . ? …`, then
-        `: ;`, then `, —` whose cut leaves the rest within the limit, a `)` or
-        `”` right after the cut goes with the first chunk, no punctuation =
-        cut before the overflowing token, an empty chunk when the first token
-        alone is over the limit); `TNeuralEnglishG2P.PhonemizeInChunks`
-        (:314) ports KPipeline.__call__ for English: `re.split('\n+',
-        text.strip())` into paragraphs (a blank part keeps its index), G2P per
-        paragraph, empty chunks dropped, a chunk over the limit cut to the
-        limit in code points (`IsTruncated`; KPipeline's `ps[:510]`); the
-        chunk (`TNeuralG2PChunk`, :115) keeps its tokens.
-        `DescribeG2PUnknownWords` (:342) prints "word: routes (pieces) ->
-        phonemes" for split / spelled / unknown tokens. KPipeline inserts no
-        silence: it yields one audio per chunk and `python -m kokoro` writes
-        them back to back, so `SynthesizeText` joins them with no gap.
-        TNNetKokoro (neuralpretrained.pas): `KokoroMaxChunkPhonemes` = 510
-        (:5383); `MaxChunkPhonemes(Voice)` (:5799) = min(510,
-        max_position_embeddings - 2, voice rows), 510 on the real checkpoint,
-        30 on the tiny fixture; `EnglishG2PForVoice(Voice)` (:5802) owns one
-        `TNeuralEnglishG2P`, accent from `EnglishG2PAccentFromVoice(Voice.Name)`,
-        re-created only when the accent changes (the new one is loaded before
-        the old is freed, so a failed load keeps the old); property
-        `EnglishDictionaryDir` (a new folder drops the G2P), `EnglishG2P`;
-        `SynthesizeText(Text, Voice, Speed, Audio, out Report)` (:5805): each
-        chunk through `SynthesizePhonemes`, so each takes its own voice row
-        (pack[len(ps)-1]) and builds stage nets for that chunk only; raises
-        when no chunk has phonemes; `SynthesizeTextToWav` (:5808).
-        `TKokoroTextReport` (:5449) = per chunk the G2P chunk, the symbols
-        outside the vocab and FirstSample/SampleCount;
-        `DescribeKokoroTextReport` (:5483) prints it for `/show` (5.9);
-        `KokoroEnglishDictionaryDir(SnapshotDir)` (:5479) = `<dir>/misaki` for
-        the example and a future server. `SynthesizePhonemes` unchanged as
-        the expert path (now counts code points with `CodePointCount`).
-        examples/KokoroTTS command line unchanged (5.8/5.9); lazbuild -B
-        Default, Debug, Release build.
-        Chunk fixture (long_mixed, 6 sentences, US and GB): misaki's own
-        tokens through `SplitG2PTokensIntoChunks` give the fixture's chunks
-        exactly (text and phonemes, 12/12 sentences). The port's own tokens
-        give the same cuts in 5 of 6 per accent; #294 differs (US and GB): the
-        port reads Qwrtz and moonlightgarden (5.5), which misaki left empty,
-        so the first chunk would pass 510 and the cut moves one sentence
-        earlier ("... since dawn." / rest). Chunk phonemes differ in #291,
-        #293, #295 (unknown words now read) and #292 ("minute", 5.4).
-        Tests: TestChunkSplitRules, TestChunksMatchKPipelineUS/GB
-        (TestNeuralG2P), TestKokoroTinySynthesizeText (one chunk =
-        SynthesizePhonemes of the G2P phonemes, bit-equal; "The quick brown
-        fox jumps over the lazy dog.\n\nThe sunflowerfield." = 3 chunks of
-        27/20/19 phonemes = the per-chunk audio joined, bit-equal; the report
-        names sunflowerfield split sunflower+field),
-        TestKokoroEnglishG2PAccentSwitch (a* -> a* same object, a* -> b*
-        new, jf_* raises and keeps the G2P, no folder raises).
-  - [x] 5.7 Tests: a `tools/` script runs misaki ONCE on a few hundred varied
-        English sentences (numbers, currency, acronyms, contractions,
-        possessives, hyphens, heteronyms, unknown words) for US and GB and writes
-        a fixture of sentence -> expected phonemes. Pascal tests read only the
-        fixture and report the phoneme agreement rate; unit tests for number
-        words, sub-word splitting and spelling. Test dictionaries: a small
-        committed subset (or the fixture's own word list), never the full files.
-        Fixture part DONE 2026-10-13: `tools/make_g2p_english_fixture.py`
-        writes `tests/fixtures/g2p_english/` (sentences.json 297 sentences in
-        13 groups, US + GB, per-token output; 4 dictionary subsets in misaki's
-        format, 101.5 KB total, verified to reproduce misaki exactly;
-        notes.json with counts, en.py behaviours and quirks). misaki left
-        62 (US) / 64 (GB) of 2605 tokens empty. Forcing DEFAULT changes 47 of
-        158 POS-keyed tokens (30 of 76 in the heteronym group), so 5.4's
-        context rules look worth doing. Pascal tests come with 5.1-5.6.
-        Pascal tests DONE with 5.1-5.6: fixture agreement per group, US and
-        GB (`TestNeuralG2P`, rates printed and asserted), number words
-        (`TestEnglishNumberWords`, `TestNumberReading`), sub-word splitting
-        and spelling (`TestUnknownWords`, `TestUnknownWordReport`), chunks
-        (`TestChunkSplitRules`, `TestChunksMatchKPipelineUS/GB`).
-  - [x] 5.8 examples/KokoroTTS: the model folder becomes the first POSITIONAL
-        argument, as in ChatTerminal (`KokoroTTS <model-dir> [options]`;
-        `--model-dir` removed). Text input by default; `--phonemes "<IPA>"` stays
-        as an expert override.
-        Done (with 5.9, same commits). `KokoroTTS <model-dir> [options]`; the
-        first argument without a leading `-` is the folder, a second one is
-        an error, `--model-dir` is rejected with a hint. `--dict-dir`
-        overrides the default `<model-dir>/misaki`
-        (`KokoroEnglishDictionaryDir`). Text needs the dictionaries, so the
-        program loads the G2P at startup (`TKokoroSession.CheckTextInput`); a
-        missing file stops it with exit code 1, the G2P's list of missing
-        paths and one line naming misaki/data/{us,gb}_{gold,silver}.json on
-        github.com/hexgrad/misaki, `<model-dir>/misaki` and `--dict-dir`.
-        `--phonemes` skips the G2P (no dictionaries needed; non-English
-        voices work there). Kept: `--voice`, `--speed`, `--serial`,
-        `--max-threads`, `--gpu`, `--gpu-platform`, `--gpu-device`,
-        `--no-gpu-shared-kernel` (CPU stays the default, unlike ChatTerminal).
-        New `KokoroVoiceFileName(SnapshotDir, VoiceName)` in neuralpretrained
-        (`OpenKokoroSnapshot` uses it too).
-  - [x] 5.9 REPL following ChatTerminal: REPL by default (model loaded once,
-        each typed line synthesized to a WAV); `-p "text"` one-shot that never
-        reads stdin; `--stats` timing to stderr; `--selftest` (argument parsing
-        and REPL commands, no model). Output names from `--out <pattern>`
-        (default `kokoro_%03d.wav`). Commands: `/exit`, `/help`,
-        `/voice <name>`, `/speed <x>`, `/out <pattern>`, `/phonemes <IPA>`,
-        `/show` (phonemes of the last line). Errors print and the REPL goes on.
-        External programs (not linked libraries, so pure Pascal holds), unset
-        by default: `--play-cmd "aplay {wav}"` and `--encode-cmd "lame --quiet
-        {wav} {base}.mp3"` run after each WAV (`{wav}` = WAV path, `{base}` =
-        path without `.wav`); `--keep-wav false` deletes the WAV after a
-        successful encode. Library side (load, voice switch, text -> phonemes ->
-        audio) lives in neural/, the `.lpr` keeps only the REPL loop and argument
-        parsing, so a later TTS HTTP server can reuse it (as ChatServer reuses
-        `neuralchatengine.pas`).
-        Done. Library: new unit `neural/neuralkokorosession.pas`,
-        `TKokoroSession` + `TKokoroSessionOptions` (folder, dictionary
-        folder, voice, speed, threads, OpenCL). Why a unit and not methods
-        of `TNNetKokoro` (guide rule 4): the session owns things the model
-        holder does not know about (the snapshot folder layout for voice
-        switching, the `TEasyOpenCL` device object, the current voice and
-        speed, the result of the last line), as `TChatEngine` owns them for
-        the chat frontends; it uses only `TNNetKokoro`'s public API.
-        `Create` = `OpenKokoroSnapshot` + `TNNetKokoro.Create`, threads,
-        `EnableOpenCL`, `EnglishDictionaryDir`; `CheckTextInput`;
-        `SelectVoice(Name, CheckText=true)` loads `voices/<name>.pt`, then
-        `EnglishG2PForVoice` (accent switch re-creates the G2P), and keeps the
-        old voice on any error (missing file, non-English voice, missing
-        dictionaries, a name with a path); `SpeakTextToWav(Text, File)` =
-        `SynthesizeText` + `SaveVolumeToWav16`, `SpeakPhonemesToWav` =
-        `SynthesizePhonemes` as a one-chunk report; `TKokoroLineResult`
-        (file, `TKokoroTextReport`, phoneme count, samples, synthesis and
-        write ms) and `LastLine` for `/show`. Argument parsing stays in the
-        .lpr as agreed (a server can move `ParseKokoroArgs` later).
-        Example: REPL by default; `-p "text"` / `--phonemes` one-shot, stdin
-        never read, exit 0 or 1 (1 also when a play/encode command fails;
-        `-p` with `--phonemes` is an error). `--out` pattern: `%d`, `%Nd`,
-        `%0Nd` (N <= 9) = line counter, 1 for the first WAV written, +1 per
-        WAV written (failed lines do not count; `/out` keeps the counter);
-        `%%` = `%`; other `%` sequences rejected at parse time; a pattern
-        without a counter is used as is, so -p "Hi" --out hello.wav writes
-        hello.wav and REPL lines overwrite it. Commands `/exit`, `/help`,
-        `/voice [name]`, `/speed [x]`, `/out [pattern]` (no argument prints
-        the current value), `/phonemes <IPA>`, `/show`
-        (`DescribeKokoroTextReport` of the last line); unknown commands and
-        failed lines print `Error: ...` and the REPL goes on. External
-        programs: `SplitCommandTemplate` splits the template once at startup
-        (spaces/tabs separate, '...' and "..." group with the quotes
-        removed, no escapes, "" = empty argument, unbalanced quote = parse
-        error), `ExpandCommandArguments` replaces `{wav}` / `{base}` inside
-        each argument in one pass (a substituted path stays one argument and
-        is not re-scanned; `{base}` = path without a final .wav, any case),
-        `RunExternalCommand` runs it with FPC `TProcess` (`poWaitOnExit`, no
-        shell, program searched in PATH, inherits the terminal). Order: play,
-        encode, then delete the WAV when `--keep-wav false` and the encode
-        exited 0 (`--keep-wav false` without `--encode-cmd` is a parse
-        error). A failure prints the exit code (FPC on Unix: `ExitStatus`
-        after `poWaitOnExit` is the exit code, minus the wait status for a
-        signal; `ExitCode` read 0 for `false`). `--stats` to stderr: load
-        time + peak RSS once; per line chunks, phonemes, audio s, synthesis
-        s, real-time factor (synthesis / audio), WAV write s, peak RSS.
-        `--selftest`: 73 checks (positional folder, every option, -p /
-        --phonemes, --out patterns, command splitting and placeholders,
-        --keep-wav, every REPL command), no model.
-        Test `TestKokoroSessionLinesAndVoiceSwitch` (tiny fixture copied to a
-        temp folder with the G2P subsets in `misaki/`, so the default folder
-        is used): line 1 = `SynthesizeText` (samples, chunks, phonemes, WAV
-        size), switch to a b* copy of the voice (British G2P), line 2 at
-        speed 1.5, refused switches (missing, `../af_heart`, a jf* copy) keep
-        the voice and the G2P, speed 0 raises, a phoneme line, a dictionary
-        folder without the files names us_gold.json.
-        Smoke runs (tiny fixture, `--dict-dir tests/fixtures/g2p_english`,
-        REPL fed from a here-doc): text, /show, /voice to a missing and a
-        non-English voice (refused), /speed, /out, /phonemes, /bogus, /help,
-        /exit; a b* copy switched accent; -p with `--out hello.wav`; encode
-        with `cp {wav} '{base} copy.bin'` + `--keep-wav false` (WAV
-        deleted); `false` as play and as encode (exit code 1 printed, WAV
-        kept, process exit 1); a missing program; `sh -c 'kill -9 $$'`
-        (signal reported); --phonemes with a jf* voice; missing dictionaries
-        (exit 1). Debug build (range/overflow checks) ran the REPL smoke too.
-        lazbuild -B Default, Debug, Release build.
-        Suites: cpu, avx2, opencl `TESTS=3270 ERRORS=0 FAILURES=0 IGNORED=4`
-        (was 3269).
-        Not done: no real-checkpoint run (dev-box rule); the README's raw
-        GitHub download URLs (branch `main`) were not fetched; output files
-        are overwritten without a question; the child program inherits
-        stdin, so a program that reads stdin would consume REPL input.
-  Phase 6 — memory: stages B and C as plain Pascal code (plan agreed with the
-  user 2026-10-17; route B). DONE 2026-10-17 (6.1-6.6): the 26 x "Hello"
-  line runs at 724 MB peak RSS (Python kokoro 1345 MB); `--gpu` = stage A
-  only. Problem: a 26 x "Hello" REPL line (one chunk,
-  ~157 tokens, ~344 frames) ran out of memory on the user's machine. Measured
-  on the dev VM (real checkpoint, short lines, 2 GB cgroup cap): the stage-C
-  generator holds ~32 MB per frame (~45 MB at the peak) against ~0.27 MB per
-  frame for the Python `kokoro` package (FP32, `torch.no_grad()`, eager
-  freeing; it does not split text further than we do). Cause: every layer of
-  the stage nets keeps its own buffers (per-conv im2col `FInputPrepared`,
-  `FBiasOutput`, `FOutputRaw` + `FOutput`, padded `FInputCopy`), and the stage
-  nets are never released in `Synthesize`. Stage B is ~0.29 MB per frame,
-  the decoder ~0.44 MB per frame.
-  User decisions: rewrite stages B and C (prosody F0/N predictor, decoder,
-  generator) as plain Pascal code on `TNNetVolume` buffers with a few reused
-  buffers, like PyTorch eager mode; stage A stays a `TNNet`; do not change
-  `TNNet` much; do NOT remove working TNNet layers (`TNNetConv1DLinear`,
-  `TNNetDeconv1DLinear`, per-channel `TNNetSnake` stay, with their tests);
-  CPU only for now (`--gpu` then covers stage A only).
-  Goal: memory per frame close to Python's ~0.27 MB (report the ratio), peak
-  for the 26 x "Hello" line near Python's ~1.2 GB, audio unchanged (parity
-  with the existing torch dumps at today's tolerances).
-  Finding (2026-10-17, read-only check + scratch program): the conv math can
-  be reused without touching neuralnetwork.pas/neuralvolume.pas: a tile im2col
-  gather (new) + `TNNetVolume.DotProductsTiled` + bias `Add` matched
-  `TNNetConv1DLinear` with max abs diff 0 on every Kokoro conv shape; scratch
-  for the widest generator conv (128 ch, k11) is 192 KiB per thread at 32
-  positions per tile, independent of length (today ~920 KB per frame per such
-  layer). Reusable as is: `NeuralPerChannelMeanInvStd` + `MulChannels` /
-  `AddToChannels` (instance norm with the style folded into scale and shift),
-  the elementwise class procedures (LeakyRelu, Add, Mul, MulAdd, Sigmoid,
-  Tanh, Sin), the neuralaudio host steps, the thread pool (`fNTL`).
-  Prior art: `RunEnCodecConv` (neuralpretrained.pas) already does a host
-  im2col conv; the new routines go in one reusable place so EnCodec can move
-  to them later (no second copy).
-  Every task: one Opus agent at a time; parity tests; the 2 GB cgroup cap
-  (`tests/run_suite_capped.sh`, `systemd-run ... MemoryMax=2G`); no real-size
-  forwards on the dev VM (short real lines only); before/after memory numbers;
-  commit per task.
-  - [x] 6.1 Plain-volume ops, reusable (not Kokoro-specific), CPU, threaded
-        over time tiles with per-thread scratch allocated once (never inside
-        the per-tile work): 1D conv with stride / dilation / zero padding
-        (tile gather + `DotProductsTiled` + bias), pointwise conv, dense
-        transposed 1D conv (GEMM + a scatter written in this code, not
-        extracted from `TNNetDeconvolution`), depthwise transposed 1D conv
-        (k3 s2 p1 op1, groups = C), nearest x2 upsample, reflect pad, instance
-        norm + style affine, Snake per channel, LeakyReLU, residual sum,
-        bidirectional LSTM keeping only h and c. Unit tests against the
-        existing layers on small random cases (exact where the arithmetic
-        order is the same).
-        Done 2026-10-17: `neural/neuralplainops.pas` (no change to
-        neuralnetwork.pas / neuralvolume.pas). `TNNetPlainConvWeights` (rows
-        per op: conv [Cout][K][Cin], transposed [K][Cout][Cin], depthwise
-        taps [K][C]; loaders from the layers and from torch tensors),
-        `TNNetPlainLSTMWeights` (from `TNNetLSTMCell` or torch ih/hh),
-        `TNNetPlainOps` (Conv1D, PointwiseConv, ConvTranspose1D,
-        DepthwiseConvTranspose1D, UpsampleNearest, ReflectPad, InstanceNorm,
-        Snake, LeakyReLU, BiLSTM; residual sum / x constant stay
-        `TNNetVolume.Add` / `Mul`), `ComputeStyleChannelAffine`. Scratch per
-        pool thread, grown at op entry and kept: patch + tile result, 1.02 MiB
-        per thread at 32 positions after the widest Kokoro ops (decoder conv
-        1090 -> 1024 k3 patch, ups0 512 -> 256 k20 products); BiLSTM keeps
-        an input projection of 8 KiB per frame (H 256). Tests
-        `TestNeuralPlainOps` (12): conv / pointwise / transposed / Snake /
-        upsample / pad / LeakyReLU / style affine exact on cpu (conv and
-        pointwise <= 2.4e-7 under AVX2: the layers' low-memory DotProduct
-        kernel), depthwise 0, instance norm 1.2e-7, BiLSTM 6.7e-8; serial ==
-        threaded (3-thread pool). Suites cpu / avx2 / opencl
-        `TESTS=3282 ERRORS=0 FAILURES=0 IGNORED=4` (was 3270).
-  - [x] 6.2 Stage-C decoder as plain code: its weights loaded once into
-        plain volumes owned by `TNNetKokoro` (concatenated [Cout][K][Cin]
-        conv rows; no owner net), the style projections reused
-        (`LoadKokoroStyleFc`; split a scale/shift routine out of
-        `WriteStyleIntoChannelAffine` if useful). Parity on the tiny fixture
-        and the real dump (opt-in heavy test). The old net path stays until
-        6.5. Measure memory per frame.
-        Done 2026-10-17: `TKokoroPlainDecoder` (weights read once at
-        `TNNetKokoro.Create` via `LoadTorchPlainConv`, weight_norm folded by
-        `LoadTorchConv1DWeight`; norm fcs borrowed from
-        `FStageCDecoderNormFc*`), `TKokoroPlainAdainResBlock` (reusable for
-        stage B; conv1x1 runs before the nearest x2), `TKokoroPlainWorkspace`
-        (one `TNNetPlainOps` + Work1 / Work2 / Shortcut / norm scale+shift),
-        new op `TNNetPlainOps.ConcatChannels`. Entry
-        `TNNetKokoro.RunStageCDecoderPlain` (same arguments as
-        `RunStageCDecoder`; frees block and work buffers after). Parity: tiny
-        dec_decode3 1.5e-5 abs (same as the net), plain vs net 5.7e-6 (max
-        |x| 106); real dump (102 frames) dec_decode3 9.4e-5 abs, rel.
-        2.7e-6, RSS 894 MB. Memory (real checkpoint, synthetic F = 56 / 112
-        / 224, scratch probe): plain buffers ~24.5 KB per frame (decoder
-        10.5 + workspace 10 + x 4) + 0.55 MB ops scratch, measured VmHWM
-        delta 0.3 MB (reuses heap already resident); net RSS delta
-        124 / 154 / 204 MB (0.48 MB per frame + ~97 MB fixed), VmHWM delta
-        129 / 188 / 299 MB (1.0 MB per frame). Both paths loaded: +118.8 MB
-        of plain decoder weights until 6.5. Tests
-        `TestKokoroStageCDecoderPlainTinyParity`,
-        `TestKokoroRealStageCDecoderPlainParity` (opt-in),
-        `TestConcatChannelsMatchesLayer`. Suites cpu / avx2 / opencl
-        `TESTS=3285 ERRORS=0 FAILURES=0 IGNORED=5` (was 3282 / 4).
-  - [x] 6.3 Stage-C generator as plain code (noise convs, ups, AdaINResBlock1
-        stacks, conv_post, then the existing exp / sin and iSTFT). Parity
-        tiny + real dump; memory per frame on short real lines.
-        Done 2026-10-17 (cae177eb): `TKokoroPlainGenerator`,
-        `TKokoroPlainAdaINResBlock1` (weights read once at Create; adain fcs
-        borrowed from `FStageCGeneratorNormFc*`; Snake alphas via
-        `LoadKokoroSnakeAlphaVolume`), entry
-        `TNNetKokoro.RunStageCGeneratorPlain` (same arguments as
-        `RunStageCGenerator`; `ConvPostToAudio` shared with the net path).
-        New op `TNNetPlainOps.NormSnakeConv1D` (prepared instance norm +
-        Snake per 1024-position chunk inside the conv; Accumulate adds conv2
-        into x), `PrepareInstanceNorm` / `ApplyInstanceNorm`, `MaxThreads`
-        (the Kokoro plain decoder and generator now honour `MaxThreads`).
-        Buffers per frame (real, stage 1 = 120F+1 x 128 = 15360 floats):
-        x / x_source, resblock sum, middle resblock, conv1 output = 4 x 15360
-        = 61440 floats = 240 KB per frame at the peak (stage 0: 4 x 5120);
-        conv_post 2640 floats; ~2 MB constant ops scratch. Python ~0.27 MB
-        per frame: 0.89x; 4 full volumes is the floor without recomputation
-        (instance norm needs whole-sequence stats of x and of conv1's output).
-        Parity: tiny every checkpoint as the net test (stage1 noise_res 6.1e-6
-        rel., audio 1.4e-5 rel.), plain vs net audio 0.23 of 47963; real dump
-        (102 frames) conv_post 3.0e-6 rel., gen_spec 1.5e-5, gen_phase
-        1.4e-4 abs (test tolerance 5e-4: sin keeps conv_post's 1.8e-4 abs
-        error), audio 8.4e-5 rel. Memory (real checkpoint, synthetic inputs,
-        AVX2 probe, one process each, 2 GB cap): plain VmHWM delta 13.5 /
-        27.0 / 54.0 / 82.7 MB at F = 56 / 112 / 224 / 344 (240 KB per frame,
-        the 26 x "Hello" line fits: 16.2 s on 1 core); net VmHWM delta 441 /
-        614 / 801 MB at F = 8 / 12 / 16 (45 MB per frame; RSS 34 MB per
-        frame). Both paths loaded: +65.9 MB of plain generator weights until
-        6.5. Tests `TestKokoroStageCGeneratorPlainTinyParity`,
-        `TestKokoroRealStageCGeneratorPlainParity` (opt-in),
-        `TestNormSnakeConv1DMatchesSteps`, `TestMaxThreadsCapsTheJob`. Suites
-        cpu / avx2 / opencl `TESTS=3289 ERRORS=0 FAILURES=0 IGNORED=6` (was
-        3285 / 5).
-  - [x] 6.4 Stage B as plain code (shared bi-LSTM, F0 / N AdainResBlk1d
-        branches with the depthwise-transposed upsample, projections). Parity
-        tiny + real.
-        Done 2026-10-17: `TKokoroPlainF0NPredictor` (shared bi-LSTM as two
-        `TNNetPlainLSTMWeights` via `LoadTorchLSTM`, F0 / N branches of
-        `TKokoroPlainAdainResBlock`, F0_proj / N_proj; weights read once at
-        `TNNetKokoro.Create`, norm fcs borrowed from `FStageBNormFc*`; block
-        widths from the shared `KokoroF0NBlockHalvesWidth`), entry
-        `TNNetKokoro.RunStageBPlain` (same arguments as `RunStageB`; honours
-        Parallel / MaxThreads; frees its buffers after). Buffers per frame
-        (real, hidden 512): en 640 floats (freed after the bi-LSTM), bi-LSTM
-        output 512, two block outputs 512 each, workspace Work1 / Work2 /
-        Shortcut up to 512 / 1024 / 512, ops' bi-LSTM projection scratch
-        2048 (kept): peak ~5632 floats = 22 KB per frame; measured end-of-run
-        buffers 20 KB per frame + 0.27 MB constant. Memory (real checkpoint,
-        synthetic d, AVX2 probe, 2 GB cap): plain VmHWM delta 0.19 MB at
-        F = 56 / 112 / 224 / 344 (reuses heap already resident); net VmHWM
-        delta 40 / 64 / 142 / 212 MB (0.60 MB per frame), RSS delta 0.34 MB
-        per frame. Both paths loaded: +27.5 MB of plain stage-B weights until
-        6.5. Parity (same tolerances as the net tests): tiny F0_pred 4.1e-6
-        rel., N_pred 3.8e-6 (net 3.7e-6 / 3.0e-6), plain vs net F0 2.6e-4
-        of 141, N 2.5e-6; real dump (102 frames) F0_pred 5.9e-7 rel., N_pred
-        6.0e-7, every block <= 1.7e-6 rel. (net 4.9e-7 / 6.0e-7). Preview
-        for 6.5, 26 x "Hello" (155 code points, 157 tokens, 415 frames,
-        10.38 s of audio): stage A net (released after) -> plain B -> plain
-        decoder -> harmonic spectrum -> plain generator under the 2 GB cap,
-        peak RSS (VmHWM) 1265 MB, set by stage A (load 1026 MB; B / C add
-        nothing to the peak), 40.6 s total on 1 core (load 14.8 s, A 5.3 s,
-        B 0.4 s, decoder 1.1 s, generator 19.0 s). Tests
-        `TestKokoroStageBPlainTinyParity`, `TestKokoroRealStageBPlainParity`
-        (same gate as `TestKokoroRealStageBParity`: snapshot + dump present).
-        Suites cpu / avx2 / opencl `TESTS=3291 ERRORS=0 FAILURES=0
-        IGNORED=6` (was 3289); lazbuild -B KokoroTTS builds.
-  - [x] 6.5 Switch `Synthesize` / `SynthesizeText` to the plain-code stages;
-        release stage A's net after use and drop its spare weight copies
-        (`FlushWeightCache` after `SetTrainable(false)`); rewrite the stage
-        B / C parity tests on the new code. Full cpu / avx2 / opencl suites.
-        REMOVE (neuralpretrained.pas unless noted):
-        - stage B net: `BuildKokoroStageBNet`, `TNNetKokoro.LoadStageB`,
-          `PrepareStageB`, `ReleaseStageB`, `RunStageB`,
-          `AddKokoroAdainResBlock`, `LoadKokoroAdainResBlockWeights`, types
-          `TKokoroStageBLayers`, `TKokoroAdainResBlockLayers`, fields and
-          properties `StageBOwner`, `StageBNet`, `StageBLayers`,
-          `StageBInput`, `StageBOwnerOnOpenCL`;
-        - decoder net: `BuildKokoroStageCDecoderNet`,
-          `TNNetKokoro.LoadStageCDecoder`, `PrepareStageCDecoder`,
-          `ReleaseStageCDecoder`, `RunStageCDecoder`, type
-          `TKokoroStageCDecoderLayers`, fields and properties
-          `StageCDecoderOwner`, `StageCDecoderNet`, `StageCDecoderLayers`,
-          `StageCDecoderAsr`, `StageCDecoderOwnerOnOpenCL`,
-          `FStageCDecoderNormFcWeights` / `FStageCDecoderNormFcBiases`;
-        - generator net: `BuildKokoroStageCGeneratorNet`,
-          `AddKokoroAdaINResBlock1`, `LoadKokoroAdaINResBlock1Weights`,
-          `LoadKokoroSnakeAlpha`, `TNNetKokoro.LoadStageCGenerator`,
-          `PrepareStageCGenerator`, `ReleaseStageCGenerator`,
-          `RunStageCGenerator`, `RunStageCGeneratorFrom`, types
-          `TKokoroAdaINResBlock1Layers`, `TKokoroGeneratorStageLayers`,
-          `TKokoroStageCGeneratorLayers`, fields and properties
-          `StageCGeneratorOwner`, `StageCGeneratorNet`,
-          `StageCGeneratorLayers`, `StageCGeneratorOwnerOnOpenCL`,
-          `FStageCGeneratorNormFcWeights` / `FStageCGeneratorNormFcBiases`;
-        - the stage B / C parts of `ArmStageNet` and `EnableOpenCL`, and
-          `ShareOpenCLOutputs` if stage A does not need it;
-        - tests (tests/TestNeuralPretrained.pas):
-          `TestKokoroStageB/StageCDecoder/StageCGeneratorBorrowingRebuild`,
-          `TestKokoroStageB/StageCDecoder/StageCGeneratorOpenCLParity`.
-        REWRITE on the new code (same fixture dumps):
-        `TestKokoroStageBTinyParity`, `TestKokoroRealStageBParity`,
-        `TestKokoroStageCDecoderTinyParity`,
-        `TestKokoroRealStageCDecoderParity`,
-        `TestKokoroStageCGeneratorTinyParity`,
-        `TestKokoroRealStageCGeneratorParity`,
-        `TestKokoroRealStagesChainedToDecoder`, `TestKokoroRealEndToEnd`.
-        KEEP: every TNNet layer (`TNNetConv1DLinear`, `TNNetDeconv1DLinear`,
-        per-channel `TNNetSnake`, `TNNetDeMaxPool`, `TNNetPadXY`,
-        `TNNetInstanceNorm`, `TNNetLSTMCell`) with their own tests and
-        OpenCL kernels; stage A as a net (`BuildKokoroStageANet`,
-        `RunStageA`); `WriteStyleIntoChannelAffine` (stage A uses it);
-        `LoadKokoroStyleFc`; loaders and voice packs; neuralaudio host
-        steps; tools/make_kokoro82m_fixture.py.
-        Done 2026-10-17 (7e5929da switch, 6a9c17fd removal + tests,
-        d48c6ff4 stage-A flush): `Synthesize` runs stage A (net), frees
-        StageANet (`ReleaseStageA`), then plain B, decoder, harmonic
-        spectrum, plain generator. The REMOVE list is gone (also
-        `ArmStageNet`, folded into `PrepareStageA`); `ShareOpenCLOutputs`
-        kept (stage A reads it). The plain blocks read and own their style
-        fc volumes; `TKokoroPlainStage` holds `OnCheckpoint` (the decoder now
-        reports dec_encode / dec_decode<i>). The plain entry points and
-        properties took the old names (`RunStageB` / `RunStageCDecoder` /
-        `RunStageCGenerator`, `StageB` / `StageCDecoder` /
-        `StageCGenerator`). `--gpu` / `EnableOpenCL` = stage A only.
-        Stage A: `FlushWeightCache` per owner layer after load: load RSS
-        456 -> 442 MB; inference-only owner build skipped (load VmHWM = RSS,
-        no transient peak; the bi-LSTMs come from neuralnetwork.pas).
-        Real KokoroTTS, 26 x "Hello" (155 phonemes, 10.38 s audio), 2 GB
-        cap, 1 core: load 1.72 s / 462 MB, synthesis 30.19 s, peak RSS
-        724 MB (6.4 preview: 1265 MB). REPL, 2 lines: both written, peak
-        724 MB after each. Real heavy tests (one run each, cpu):
-        decoder dec_decode3 2.7e-6 rel., generator audio 8.4e-5 rel. /
-        phase 1.4e-4 (tolerance 5e-4 kept), chained dec_decode3 4.0e-6,
-        end to end audio max |diff| 0.102 (phases), peak 549 MB.
-        Suites cpu / avx2 / opencl `TESTS=3279 ERRORS=0 FAILURES=0
-        IGNORED=4` (was 3291 / 6: 12 net tests removed).
-  - [x] 6.6 Measure and document: memory per frame and peak against Python
-        (same short real lines under the cap, extrapolated to the 26 x
-        "Hello" line); update examples/KokoroTTS/README.md (Memory section,
-        `--gpu` = stage A only), examples/README.md, and the code examples:
-        `SimpleKokoroTTS.lpr` (speak a long multi-sentence text to show it
-        fits), `KokoroTTS.lpr` (`--gpu` help text, `--stats`), the README's
-        "From your own code" snippet; lazbuild -B every mode.
-        Done 2026-10-17: measured, real checkpoint, 1 core, 2 GB cap, one
-        process per run; ours = KokoroTTS `-p ... --stats`, Python = kokoro
-        `KModel` FP32, `torch.set_num_threads(1)`, VmHWM reset after load
-        (`/proc/self/clear_refs` 5), same phonemes, same audio lengths.
-        Load RSS: ours 462 MB, Python 1092 MB (1281 MB peak while loading).
-        Peak RSS, ours / Python: 1 x "Hello" (56 frames) 512 / 1110 MB;
-        8 x (128) 586 / 1147; 26 x (415) 724 / 1345; the SimpleKokoroTTS
-        story (260 phonemes, 636 frames) 862 / 1354 (0.46x to 0.64x).
-        Per frame: ours 0.48 to 1.03 MB between lines, 0.60 from 1 x to the
-        story; Python 0.04 to 0.69 (uneven). A 510-phoneme chunk (~1250 frames) not measured,
-        estimate ~1.2 GB for ours. REPL: a second 26 x line raised the peak
-        724 -> 738 MB. Synthesis on 1 core: ours 3.8 / 8.3 / 28.8 / 44.1 s,
-        Python forward 2.8 / 5.8 / 16.8 / 28.8 s. Docs: Memory section
-        rewritten (table above), `--gpu` = stage A (options table, session
-        options, How it works: stage A net, B / C plain code in
-        neuralplainops.pas), examples/README.md entry; root README unchanged
-        (still right). Code: SimpleKokoroTTS speaks `fox.wav` + a 5-sentence
-        paragraph `story.wav`; KokoroTTS help for `--gpu` and `--stats`.
-        Real SimpleKokoroTTS run: fox 1.95 s, story 15.90 s (one chunk),
-        peak RSS 872 MB. Tiny fixture smoke: both WAVs written (the fixture
-        dictionaries split or spell 6 story words). lazbuild -B Default /
-        Debug / Release of both .lpi; `--selftest` OK. Script:
-        scratchpad pyk/pymem.py (written for this task).
-  Phase 7 — stage A memory, then generator speed (plan agreed with the
-  user 2026-10-18, after a read-only diagnosis). Measured on the dev VM
-  (26 x "Hello", 157 tokens, 415 frames, 1 core, 2 GB cap): the peak
-  (708 MB in the probe, 724 MB in KokoroTTS) is reached during the stage-A
-  compute; stage A holds 260 MB = ~98 MB fixed + ~0.96 MB per token +
-  5.2e-4 * T^2 MB (one T x T score matrix per attention head). Largest
-  holders: the 51 TNNetPointwiseConvLinear layers (`FOutputRaw` +
-  `FBiasOutput`, 120 MB), the 10 TNNetLSTMCell (`FGradW` / `FGradB` training
-  accumulators allocated when not trainable, 46 MB), the 3 TNNetConv1DLinear
-  (own weight caches, 39 MB), attention 19 MB. The stage-A owner also keeps
-  ~35 MB of LSTM `FGradW` for the whole session; ~89 MB of heap freed during
-  load is not reused. The generator peaks 146 MB below stage A. Time
-  (ours / Python, s): stage A 2.2-3.1 / 0.56, decoder ~1.0 / 0.39,
-  generator 14-16 / 9.3. The generator (~254 GMAC of 1D convs) runs at
-  14-18 GMAC/s against PyTorch's ~27: `TNNetVolume.DotProductsTiled` computes
-  each output as its own dot product (not register-blocked).
-  User rules: adding TNNet layers is fine; small changes inside TNNet layers
-  are fine when required; do not remove working layers; CPU only; pure
-  Pascal. One Opus agent at a time; test and commit after each task.
-  - [x] 7.1 Build ALBERT's shared layer once and run it 12 times, instead of
-        12 unrolled copies in the stage-A net (`neuralpretrained.pas`:
-        stage-A builder and `RunStageA`). Expected: ~150 MB less at 157 tokens
-        (per-token buffers ~112, attention T^2 ~13, out-projection weight
-        caches ~26), ~500 MB less on a 510-phoneme chunk, build -0.3 s.
-        Parity: the existing stage-A tests must still pass at their current
-        tolerances. Measure the 26 x "Hello" line peak (one run).
-        Done 2026-10-18 (1cf2fbbf): stage A = three nets with their own
-        weight owners: front (PL-BERT embeddings), block (one ALBERT layer,
-        `RunStageA` runs it 12 times feeding each output back), tail
-        (bert_encoder, duration predictor, text encoder; its input carries
-        the PL-BERT output, written by the host). `AddBertBlock` extracted
-        from `AddBertEncoder`; `OnStageACheckpoint` reports bert_layer<i>
-        for the parity tests (tolerances unchanged). Real KokoroTTS,
-        26 x "Hello", 1 core, 2 GB cap: peak RSS 723 -> 557 MB (-166 MB),
-        load RSS 459-462 -> 441 MB, WAV bit-identical to HEAD (max |diff|
-        0). Synthesis time not comparable on the loaded VM (load average
-        ~2.5): HEAD 24.7 / 36.9 s, new 32.8 / 35.0 s. Suites cpu / avx2 /
-        opencl `TESTS=3279 ERRORS=0 FAILURES=0 IGNORED=4`.
-  - [x] 7.2 Free what stage A holds and never reads:
-        (a) TNNetLSTMCell allocates `FGradW` / `FGradB` and the backprop-only
-        per-step sequences only when the layer is trainable (small change in
-        `neuralnetwork.pas`; training must behave exactly as before; add a
-        test that a non-trainable LSTM holds no gradient buffers);
-        (b) drop the weight caches on the stage-A borrower layers the
-        low-memory path never reads (out-projections, bert_encoder, the
-        text-encoder convs): first try `FlushWeightCache` after
-        `PrepareStageA`; if they come back, find why (`AfterWeightUpdate`)
-        and make the small layer fix. Expected: ~36 MB off the load RSS and
-        ~70-100 MB off the line peak. Measure load + the 26 x line (one run).
-        Done 2026-10-18: TNNetLSTMCell sizes its gradient buffers and backward
-        carries only when trainable, keeps two alternating per-step cache rows
-        when inference-only (`SizeSequenceCaches`, re-run by a `SetTrainable`
-        override; `NonWeightBytes` reports them); new test
-        `TestLSTMCellInferenceOnlyBuffers`. Freeing after the build was not
-        enough (owner 441 -> 435 MB, line 557 -> 548 MB): the buffers and
-        weight caches were allocated while each net was still trainable,
-        before `SetTrainable(false)`, and that transient set the high-water
-        mark. So the stage-A builder now creates its layers inference-only:
-        `AddBidirectionalLSTM(..., pTrainable)` (new default-true parameter),
-        and `SetTrainable(false)` chained on bert_encoder, duration_proj and
-        the 3 text-encoder convs (low memory from the start, no concatenated
-        caches); `PrepareStageANet` flushes the remaining borrower caches
-        (the ALBERT attention out-projection) before OpenCL is armed. Real
-        KokoroTTS, 26 x "Hello", 1 core, 2 GB cap: load RSS 441 -> 348 MB,
-        peak RSS 557 -> 466 MB, WAV bit-identical to HEAD. Suites cpu / avx2
-        / opencl `TESTS=3280 ERRORS=0 FAILURES=0 IGNORED=4`; lazbuild -B
-        Default / Debug / Release of both .lpi, `--selftest` OK.
-  - [x] 7.3 Measure and decide: the 26 x "Hello" line and the SimpleKokoroTTS
-        story, and if it fits under the 2 GB cap, one full 510-phoneme chunk;
-        compare against the Phase 6 Python numbers. Update the README Memory
-        section. Then report to the user for two decisions: (i) a lean
-        inference-only pointwise layer (new TNNet layer, used only by Kokoro
-        stage A, without the per-position bias copy and the separate raw
-        output), (ii) investigating the ~89 MB of load heap not reused.
-        Done 2026-10-18: measured at 7fe10b98 (lazbuild -B), real checkpoint,
-        1 core, 2 GB cgroup cap, one process per run, KokoroTTS `--stats`.
-        Load RSS 348 MB (Python 1092). Peak RSS, ours / Python: 1 x "Hello"
-        (5 phonemes, 56 frames) 364 / 1110 MB; 8 x (47, 128) 392 / 1147;
-        26 x (155, 415) 466 / 1345; the SimpleKokoroTTS story (260, 636)
-        531 / 1354; a full chunk, 9 sentences of the fox story (506
-        phonemes, one chunk, 27.70 s, 1108 frames) 648 / 1609 (0.33x to
-        0.40x; Python numbers from 6.6 except the full chunk, run now with
-        pymem.py on our phonemes). Estimate before the full-chunk run:
-        ~0.7 GB ours, <= 1.7 GB Python. Growth, ours: peak = 355 MB + 0.27 MB
-        per frame (least-squares over the 5 lines, residuals <= 6 MB); per
-        token the slope falls 0.67 -> 0.69 -> 0.62 -> 0.48 MB between lines
-        (residuals up to 14 MB). Python: 0.54 MB per frame story -> full
-        chunk. What sets the peak: the per-frame stages (B/C; most likely
-        the generator), not stage A: the peak tracks frames, not tokens, and
-        its per-token slope falls at 508 tokens, which stage A (per-token
-        buffers + a T^2 score matrix) cannot do (inferred from `--stats`, no
-        probe). REPL, two 26 x lines: 465 -> 477 MB. SimpleKokoroTTS (fox +
-        story): peak 538 MB (/usr/bin/time). Synthesis (noisy, VM shared):
-        3.67 / 9.33 / 31.28 / 43.04 / 78.00 s; Python forward on the full
-        chunk 57.63 s. Docs: examples/KokoroTTS/README.md Memory section and
-        examples/README.md Kokoro entry.
-        Pending user decisions, my view: (i) lean inference-only pointwise
-        layer for stage A: no expected change to the line peak, since stage
-        A no longer sets it; it would only lower stage A's own transient,
-        which is already below the per-frame stages. Worth it only after the
-        generator's per-frame memory is cut. (ii) the ~89 MB of load heap
-        not reused (measured before 7.2): load RSS is now 348 MB against
-        312 MB (327.2e6 bytes) of raw FP32 weights in kokoro-v1_0.pth plus
-        17-21 MB of G2P dictionaries, so at most ~20 MB is left to find
-        (~6% of load, ~3% of the full-chunk peak). Low payoff for both.
-  - [x] 7.4 Generator speed: a register-blocked FP32 matrix-multiply routine
-        (new routine in `neuralvolume.pas`, called from `neuralplainops`;
-        asm must be PIC-safe; scalar fallback; not bit-identical, which is
-        fine). Do not change `DotProductsTiled` itself. Expected: generator
-        14 -> ~7-9 s, decoder -0.5 s on 1 core. Parity tests vs the current
-        conv; all three suites; one timed run of the 26 x line.
-        Done 2026-10-18 (de864351): `TNNetVolume.PackDotProductRows` (panels
-        of 16 rows, [element][row]) + `DotProductsPacked`, AVX64 kernel
-        `AVXDotProductsPacked6x16` (6 positions x 16 channels in 12 ymm
-        accumulators, FMA on AVX2, mul + add on AVX; partial blocks via a
-        stack block; Pascal fallback sums in element order, bit-identical
-        to the scalar DotProduct). `TNNetPlainConvWeights` packs its conv /
-        transposed rows at load; Conv1D (bias in registers, writes the
-        output directly), PointwiseConv and ConvTranspose1D (input read in
-        place) call it; default tile 36. Block shape: 6x16 and 4x24 measured
-        equal; 6x16 fits 128 / 256 channels. Micro-benchmark (synthetic,
-        1 core, sustained; the CPU runs ~1.5x faster for the first seconds
-        after idle): convs at generator shapes 9-19 -> 24-46 GMAC/s (ups
-        9 -> 29-35). Real KokoroTTS, 26 x "Hello": synthesis 22.18 s (load
-        average 0.70) -> 16.28 s (1.90), peak RSS 466 / 466 MB; WAV vs HEAD
-        max |diff| 0.038, correlation 0.99959 (the pipeline amplifies ulp
-        changes; end-to-end vs Python is 0.056). Per stage (HelloLineProbe,
-        one run each, throttled): generator 24.0 -> 11.8 s, decoder 2.0 ->
-        0.7 s. Full 506-phoneme chunk 78.0 -> 43.9 s, peak 649 MB. Real
-        generator parity (HEAVY=1) passes: audio rel. 8.3e-5 vs PyTorch.
-        Suites cpu / avx2 / opencl `TESTS=3282 ERRORS=0 FAILURES=0
-        IGNORED=4`; plain-AVX build passes TTestNeuralPlainOps; lazbuild -B
-        all modes of both .lpi, `--selftest` OK. TestConvTranspose1DMatches
-        Layer: exact -> csDotKernelTolerance (exact on scalar builds).
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.
@@ -3176,20 +1096,7 @@ rather than acted on.
         validation saturates at epoch 2 — so it proves the path, not a hard
         benchmark).
 - [ ] Whisper word-timestamp follow-ups (v1 landed, scoped to one 30 s
-      greedy window). DONE in commit d0b27b9: (a)(e)(d) + partial (c) —
-      (a) median-filter smoothing (WhisperMedianFilterRow, odd-kernel reflect-
-      padded median along the audio-frame axis; optional MedianKernel param on
-      WhisperCollectCrossAttention + WhisperWordTimestamps, default 0 = disabled =
-      bit-identical to v1, 7 = openai-whisper default); (e) per-word confidence
-      (Confidence: TNeuralFloat field on TWhisperWordTimestamp = mean DTW-path
-      attention over the word's frame segment); (d) examples/WhisperTranscribe
-      `--word-timestamps` flag printing `start - end [confidence] word`, documented
-      in both READMEs; (c partial) baked-in alignment heads added for medium
-      (24L/16H) and large (32L/20H) shapes. Tests in TestWhisperWordTimestamps
-      (kernel-1 bit-identical to no-smoothing, kernel-7 monotonic non-decreasing
-      boundaries + valid prob rows, confidence in [0,1.0001], non-empty
-      medium/large head lists); suite 2273/0/0; example compiles (not run e2e — no
-      checkpoint). REMAINING:
+      greedy window). REMAINING:
   - [ ] (b) multi-window stitching for clips > 30 s (carry the running time offset
         and merge the per-window word lists).
   - [ ] (c rest) read `generation_config.alignment_heads` from arbitrary model
@@ -3560,47 +1467,14 @@ rather than acted on.
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
 
-- [~] Stable Diffusion img2img + inpainting pipelines. DONE (commit 2191b80): the
-      VAE ENCODER gap is closed — BuildVaeEncoderFromSafeTensors[Ex] +
-      ReadVaeEncoderConfigFromJSONFile land the diffusers AutoencoderKL encoder
-      (conv_in -> down blocks with stride-2 downsample convs reproducing the
-      asymmetric (0,1,0,1) pad -> mid self-attn -> conv_norm_out/conv_out ->
-      quant_conv), reusing every decoder helper (TVaeDecoderConfig,
-      AddVaeResnetBlock, AddVaeAttention, LoadVaeConv). The net's final layer crops
-      to mean and applies the 0.18215 scaling_factor = the deterministic img2img
-      init-latent setup. Pico fixture (tools/vae_encoder_tiny_fixture.py ->
-      tests/fixtures/tiny_vae_encoder*) + TestVaeEncoderParity (numpy float64
-      oracle, max|diff| < 1e-4) + TestVaeRoundTrip (encode->decode end to end).
-      DONE (img2img sampler loop): examples/ImageToImage drives the full
-      encode->partial-noise->denoise->decode SDEdit trajectory (strength knob).
-      DONE (blended inpainting): SDUNetDenoiseInpaint (neuralpretrained.pas) runs a
-      complete reverse loop on the standard 4-channel SD UNet and at EVERY step
-      blends the known region back in (latents = mask*denoised + (1-mask)*AddNoise(
-      z0,t)); examples/DiffusionInpainting smoke-runs it on the pico VAE+SD-UNet
-      fixtures (right-half hole), writing masked_input.ppm/inpainted.ppm, and
-      TestDiffusionInpaintSmoke asserts the kept latent region equals z0 exactly
-      while the masked hole changes. This is the no-retrain blended mode.
+- [~] Stable Diffusion img2img + inpainting pipelines (VAE encoder
+      BuildVaeEncoderFromSafeTensors, examples/ImageToImage SDEdit loop and blended
+      SDUNetDenoiseInpaint / examples/DiffusionInpainting are in place).
       STILL OPEN: (1) the non-deterministic VAE reparameterize head
       (mean+exp(0.5*logvar)*noise); (2) the 9-channel inpaint-specialized UNet
-      (conv_in widened to 4 latent + 1 mask + 4 masked-latent) importer support.
-      ORIGINAL NOTE — The landed SD path
-      (BuildVaeDecoderFromSafeTensors + BuildSDUNetFromSafeTensors + SDUNetDenoise +
-      the neuraldiffusion sampler zoo) does text-to-image only — it starts denoising
-      from pure Gaussian latents. The two highest-value missing modes reuse ALL of
-      that and add only the latent setup/blend: (a) img2img — VAE-ENCODE an init
-      image to latents (the VAE decoder importer's encoder twin is the gap; add
-      BuildVaeEncoderFromSafeTensors for the down-blocks + the
-      `mean,logvar`->reparameterize sampling head), then start the existing sampler
-      at timestep `int(strength * num_steps)` with noise added to those latents
-      (`scheduler.add_noise` — already have the alphas_cumprod schedule); (b)
-      inpainting — keep img2img's noised init but at every denoise step BLEND the
-      known region back in (`latents = mask*denoised + (1-mask)*noised_known`), and
-      support the 9-channel inpaint UNet (4 latent + 1 mask + 4 masked-latent in
-      `conv_in`) by widening the importer's first-conv loader. Real value: img2img
-      and inpainting are the two most-used SD modes after txt2img and unlock the
-      ImageToImage/Inpainting example stubs. Pico parity: VAE-encode round-trip <
-      1e-4 vs a float64 HF AutoencoderKL.encode, and a fixed-seed img2img latent
-      trajectory matching diffusers `StableDiffusionImg2ImgPipeline` step-for-step.
+      (conv_in widened to 4 latent + 1 mask + 4 masked-latent) importer support;
+      (3) a fixed-seed img2img latent trajectory matching diffusers
+      `StableDiffusionImg2ImgPipeline` step-for-step.
 - [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
       model_type "kosmos-2", e.g. microsoft/kosmos-2-patch14-224). DISTINCT from the
       landed caption VLMs (LLaVA/Blip2/Florence-2 fuse image features as prepended
@@ -3690,103 +1564,12 @@ rather than acted on.
         steps (2048x2048 ~6x more). Compute-bound GEMM, not decode GEMV. int8:
         transformer ~7 GB, text encoder ~8 GB, loaded one after the other.
   Phase A — text-to-image, correctness first:
-  - [x] A0. Parity oracle: install diffusers (git main) + transformers >= 5.17 into
-        the `x` venv; a script that builds tiny random-weight versions of each
-        component and writes float64 inputs/outputs to `tests/fixtures/`.
-        Done: `tools/make_pico_qwenimage21_fixture.py` -> `tests/fixtures/tiny_qwenimage21/` (pico diffusers folder), `qwenimage21_{scheduler_oracle,prompt_tokens}.json`, `tiny_qwenimage21_{text_encoder,rope,transformer,vae,pipeline}_io.json`.
-  - [x] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
-        `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
-        `shift_terminal`, velocity step. JSON oracle test. Independent.
-        Done: new class `TNNetFlowMatchEulerScheduler` (CalculateShift, TimeShift, SetSigmas, SetTimesteps, Step); tests `TestFlowMatch*` in `tests/TestNeuralDiffusion.pas`.
-  - [x] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
-        builder (`model.language_model.` prefix, skip `model.visual.*` and `lm_head`,
-        int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning
-        pre-final-norm last-layer hidden states; template + tokenization + drop_idx.
-        Done: `BuildQwen3VLTextEncoderFromSafeTensors` (Llama builder, `pStopBeforeFinalNorm`), `Qwen3VLEncodeHiddenStates`, `QwenImage21TextToImagePrompt`, `QwenImage21EncodeTextToImagePrompt`; `qwen3_vl` also in `BuildFromPretrained`; tests `TestQwen3VL*`, `TestQwenImage21PromptTemplateIds`.
-  - [x] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
-        layout, 16/56/56 sections and negative positions; position builder (text
-        0..L-1, image frame = L, centred h/w grid).
-        Done: subclass `TNNetAxialRotaryEmbedding` (per-axis tables; M-RoPE gained `pRotaryHeadDim` head tiling), `BuildQwenImage21RopePositions`; tests `TestQwenImage21Rope*`, `TestAxialRoPE*`, `AxialRoPEOpenCLParity`, `TestMRoPETiledMatchesPerHead`.
-  - [x] A4. Transformer block, step pass: image-token queries attend (no causal mask)
-        to [cached prefix K/V ; own K/V]. Reuse `TNNetHeadRMSNorm`, `TNNetLayerNorm`,
-        `TNNetFiLM` / `TNNetChannelMulByLayer`, the fused SDPA KV cache and batched
-        prefill where they fit; fold the zero-centred +1 into the RMSNorm weight at
-        load. Single-block parity vs HF.
-        Done: `AddQwenImage21Block` (qibStep / qibPrefix), `AddQwenImage21Modulation`, `AddQwenImage21TextProjection`, `LoadQwenImage21BlockWeights`, `ReadQwenImage21TransformerConfig`; `TNNetFusedSDPA` gained `CachedForwardNonCausal` + `AppendCacheRowsFrom`; tests `TestQwenImage21StepBlockParity`, `TestQwenImage21PrefixBlockKVParity`, `TestCachedForwardNonCausal`.
-  - [x] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
-        modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
-        embedding, shared modulation computed once per step, `norm_out`, `proj_out`;
-        sharded diffusers-folder loader. Parity vs HF extract and cached modes.
-        Depends on A3 + A4. Memory: ONE reusable step block whose layers are pointed
-        at block i's weights before block i runs (each block keeps its own KV cache);
-        32 blocks in one TNNet would need ~64 GB of activations at 1024x1024 (~2 GB
-        per block at N=4096). One code path for every image size.
-        Done: class `TQwenImage21Transformer` (weight store `BlockStore[i]`, `SelectBlockWeights` re-links via `TNNet.LinkWeightsFrom`, `EncodePrefix`, `PredictVelocity`, `qiwFP32/qiwInt8/qiwInt4`), `QwenImage21SetRopePositions`; `TNNetLayer.LinkWeightsFrom` may re-link; tests `TestQwenImage21Transformer*`.
-  - [x] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
-        channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
-        tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
-        parity. Independent.
-        Done: class `TQwenImage21VaeDecoder` (1x1-latent weight owner + borrowing sized net; `Decode`, `DecodeTiled` = diffusers tiled_decode), `ReadQwenImage21VaeConfig`, `BuildQwenImage21VaeDecoderNet`, `LoadQwenImage21VaeDecoderWeights` (skips time_conv, folds latents_mean/std into post_quant_conv), `QwenImage21DupUpChannels` + `AddQwenImage21DupUp`; conv kernels now clamp to the PADDED input; tests `TestQwenImage21Vae*`. Real-size activations (weights 1.01 GB): 0.58 GB at 64x64, ~9.3 GB at 256x256 (one default tile), ~149 GB untiled at 1024x1024, ~73% of it per-conv im2col/pad/raw buffers.
-  - [x] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
-        tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
-        (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height
-        --steps --seed --int8/--int4 --opencl`. End-to-end pico parity with fixed
-        initial latents (torch RNG is not reproducible). Test sizes: 64x64 with the
-        pico checkpoint on the dev box (extend the generator with a 64x64 case);
-        real weights on the GPU box, a 256x256 smoke test first, then 1024x1024 and
-        beyond, compared per step against diffusers with the same initial latents.
-        Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`.
-        Follow-ups: `cthreads` in the example's uses clause (a26c3f72; without it the
-        first worker thread aborted with runtime error 232); parallel forward on every
-        core (74fa882d: `Parallel` / `MaxThreads` on the pipeline, transformer and VAE,
-        `PrepareInferenceThreads`, CLI `--serial` / `--max-threads N`; bit-identical to
-        serial). First real run (user, 2026-09-24, real Qwen/Qwen-Image-2.1, 12 threads):
-        256x256, `--int4`, 10 steps -> the image shows a fox. Step time 16.4 s int4,
-        34.3 s int8 (was ~162 s int8 single-threaded); load transformer 148 s int4 /
-        64 s int8; VAE decode 31 s.
-  - [x] A8. Docs: README entry for Qwen-Image-2.1 text-to-image (no tested-configuration
-        list, user decision 2026-10-04; measured numbers labelled as the user's L4 run).
-        Build line and binary path: `cd examples/QwenImage && lazbuild -B QwenImage.lpi`
-        writes `bin/x86_64-linux/bin/QwenImage` at the REPO ROOT (the A7 report gave a
-        path inside `examples/QwenImage`, which is wrong).
-        DONE: `examples/QwenImage/README.md` (model, build, one-shot + REPL, options, the L4 run, limitations; no tested-configuration table, user decision) + entries in `README.md` and `examples/README.md`.
-  - [x] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
-        `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
-        today's load-and-free order). The text encoder is built once for a maximum
-        prompt length (padding is exact, A2); prefix/step/VAE nets are rebuilt per
-        image by borrowing weights; activations are freed between images, weights
-        kept. `examples/QwenImage` follows ChatTerminal: `-p "prompt"` (or
-        `--token-ids`) is a one-shot run that keeps the load-and-free order;
-        `--prompt` is removed (no alias). Without either, the REPL starts: one
-        prompt per line from stdin (so a piped file is a batch), output files
-        numbered from the `--output` base (`out.png` -> `out_0001.png`, ...),
-        `/size WxH`, `/steps N`, `/seed N` (else the seed increments),
-        `/tile SIZE[,STRIDE]`, `/quit`; weights stay resident between prompts;
-        print resident memory at startup (user decisions, 2026-10-03). Test: two
-        prompts through one loaded pipeline equal two one-shot runs (pico). Estimated
-        resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
-        Removes the per-image loads measured on the first real run: text encoder
-        49-67 s, transformer 64 s int8 / 148 s int4.
-        DONE: `LoadComponents` / `UnloadComponents` / `ComponentsLoaded` and the
-        `Loaded*` properties; the text encoder keeps a 1-token weight owner and
-        builds a borrowing twin per prompt (bit-identical to one-shot, no length
-        cap) instead of a max-length net; the tokenizer stays loaded;
-        `TQwenImage21Transformer.ReleasePasses` frees the per-image nets and the
-        prefix K/V; format/int8/OpenCL settings refuse changes while loaded. REPL
-        numbers outputs past existing files, `.png` when the base has none,
-        prints the prompt per image, sides 32..8192. Tests
-        `TestQwenImage21PipelineKeepLoaded` (FP32 + int8 encoder, recovery after
-        a failed image), `...UnloadComponents`, `...OpenCLKeepLoaded`. Computed resident memory at
-        1024x1024 int4 during the VAE decode: ~16 GB OpenCL (transformer codes
-        ~4.4 + VAE weights 1 + 256-px tile buffers ~10.7), ~24-26 GB host; int8
-        ~18.7 GB OpenCL (tight on a 24 GB L4; `/tile 128` lowers it). Unmeasured.
-        Follow-ups:
-        - [ ] OpenCL errors only print (`FErrorProc`); nothing lets the pipeline
-              detect a failed allocation, so a REPL image can be wrong yet
-              reported as written. Needs a counting error hook on the armed nets.
-        - [ ] `--steps 1` raises EInvalidOp in
-              `TNNetFlowMatchEulerScheduler.SetSigmas` (shift_terminal stretch
-              divides 0/0; diffusers yields NaN). One-shot too.
+  - [ ] A9 follow-up: OpenCL errors only print (`FErrorProc`); nothing lets the pipeline
+        detect a failed allocation, so a REPL image can be wrong yet
+        reported as written. Needs a counting error hook on the armed nets.
+  - [ ] A9 follow-up: `--steps 1` raises EInvalidOp in
+        `TNNetFlowMatchEulerScheduler.SetSigmas` (shift_terminal stretch
+        divides 0/0; diffusers yields NaN). One-shot too.
   Phase B — speed (after a first real measurement on the GPU box):
   - [ ] B1. OpenCL for the transformer step pass. Int4 is required; int8 comes along
         with it (the tiled OpenCL kernels share one layout). The text encoder and
@@ -3812,188 +1595,22 @@ rather than acted on.
         denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
         transformer 245.2 s, peak RSS 10.9 GB. B1f runs before B1d2 to tell
         the int4 projection kernel, the host layers and the transfers apart.
-    - [x] B1f. Per-layer time profile of one GPU step (user's GPU box), to
-          measure where the step time goes before further kernel work.
-          DONE: `examples/QwenImage --profile` (TNNet.LayerProfiling drains the
-          net queue and the layer's output queue after every layer that
-          enqueued OpenCL work; per-role and per-class tables with OpenCL
-          forwards and host<->OpenCL transfer counts/MB). User run pending:
-          `--int4 --width 1024 --height 1024 --steps 2 --profile`.
-          L4 profile (user, 1024x1024 int4, b03fae2f): 34.6 s/step; transfers
-          22.5 GB up + 12.3 GB down per step at only ~2 GB/s effective, so about
-          half the step is host layers + transfers (Q/K RoPE 5.2 s, Norm2 2.6,
-          QKV concat 1.9, Norm1 1.5, Modulated1/2 2.2, BlockInput 1.0, input
-          uploads in Q/K/V/GateUp ~4). Attention ~7.8 s/step (~1.1 TFLOPS, the
-          weakest OpenCL kernel). Projections with a resident input are fine
-          (OutProj 13.7 ms/block, ~10 TFLOPS). Image-in net 1.16 s/step on the
-          CPU for ~2 GFLOP (odd; look later). Order chosen: B1d2 -> B1d3 ->
-          B1d4, then B2 (VAE 519 s), then the B1c deferred attention items.
-    - [x] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
-          find the extra ~92 s (suspect: the host-side int4 repack loop in
-          `PrepareInt4DotCL`, one nested call per weight pair; unverified).
-          Investigated 2026-10-02 (real-shape block, this box): the extra time
-          is the host repack in `PrepareInt4DotCL` (2.4-2.9 s/block, ~76-92 s
-          for 32 blocks; byte-at-a-time writes with a NumAs stride, each on a
-          new cache line). The upload is ~2 s total. A 64-row tiled loop gives
-          byte-identical output ~3.5-4x faster single-threaded. The CPU int4
-          load is slow for a second reason: `QuantizeWeightsInt4` (int8 ->
-          dequantize -> int4, serial, scalar `QuantizeRow` with per-element
-          IsNan/IsInfinite) costs 2.4-3.9 s/block (~80 s). Neuron object
-          construction costs ~0.6-0.8 s/block (also the text encoder).
-      - [x] B1g1. Tiled + threaded repack in PrepareInt4DotCL and the int8
-            transpose in PrepareInt8DotCL (byte-identical layout).
-            DONE: 64-row tiles (TransposeByteTile; TNNetVolumeQuant8
-            .CopyRowsTransposedTo, TNNetVolumeQuant4
-            .CopyRowsAsPairedTransposedTo) fanned by TQuantRowsTransposeFan.
-            Arming one int4 block on PoCL 2.8-4.6 s -> 0.7-1.1 s (32 blocks
-            ~90-145 s -> ~23-36 s, extrapolated). Found: the shared fNTL pool
-            is 1 thread on Linux (FPC 3.2.2 TThread.ProcessorCount = 1), so
-            every fNTL fan runs inline; fix awaits the user's decision.
-      - [x] B1g2. Quantize to int4 directly in the loader (FP32/BF16 rows ->
-            Q4_0 in the threaded row fan), branch-free QuantizeRow.
-            DONE: TNNet.BeginInt4QuantImports + LoadLlamaLinearWeights'
-            DirectInt4FromRows route (Qwen-Image transformer only); QuantizeRow
-            branch-free with an AVX2 path (~15x, output identical for finite
-            input; tiny-max blocks no longer raise EOverflow). One real-shape
-            int4 block loads in 0.8-2.3 s instead of 3.9-7.5 s (this box).
-            Int4 results change slightly (one rounding instead of two).
-            Follow-up:
-            - [x] ChatTerminal / LLM --int4 quantize streamed rows straight
-                  to int4 too (NeuralImportInt4FromRows, set by TChatEngine;
-                  LoadLlamaLinearWeights and the tied LM head open the import;
-                  BuildFromPretrained refuses partial imports). The borrowing
-                  twin reads no checkpoint; the fallback twin takes the same
-                  route. Layers that cannot stream rows keep the int8 -> int4
-                  sweep; the MoE banks have no int4 forward and stay int8.
-      - [x] B1g3. Skip creating the four training volumes per neuron in
-            inference-only builds.
-            DONE differently: the cost was TVolume's per-volume TFormatSettings
-            copy (~45 managed strings per constructor/destructor), not the
-            training volumes. The field is gone (TNNetVolume 432 -> 56 bytes);
-            formatting reads GetDefaultNumericFormat at conversion time.
-            Neuron Create+Free 12.4 -> ~1.1 us; real-shape block build median
-            ~830 -> ~170 ms (~21 s per 32-block transformer load; text encoder
-            ~15 s, extrapolated). Skipping the training volumes would now save
-            only ~0.7 s per load (not done).
-    - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
-          probe in the session scratchpad, not in the repo). Only 9 of the
-          block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);
-          the activation chain leaves OpenCL memory ~6 times per block, ~1 GB of
-          transfers per block at 1024x1024 (estimate). Parity where OpenCL runs:
-          int8 block 2.7e-7, int4 tiled GEMM 1.1e-6, HeadRMSNorm + forced axial
-          RoPE 7.2e-7. PARITY-TEST TRAP: the CPU int4 path quantizes the input to
-          int8, OpenCL keeps it FP32 (3.6e-2 apart, both correct), so B1 parity
-          tests compare against an FP32-input oracle. Verified arming order that
-          shares one copy of the codes: BlockStore[0].EnableOpenCL, then
-          EnableOpenCLInContextOf(BlockStore[0]) for blocks 1-31 and the step net.
-    - [x] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
-          DONE 88aad8ca (handle swap + RefreshResidentBias); GPU-by-default CLI
-          with --cpu: 807d61c5.
-          context, uploaded once. `SelectBlockWeights` swaps only handles: in
-          `TDotProductSharedKernel` FCodesBuffer / FScalesBuffer /
-          FBlockScalesBuffer (+ caps, FCodesBorrowed, FInt8Ready/FInt4Ready;
-          retain new, release old), AND re-set the tiled OpenCL kernel's args
-          4/9/10 (`PrepareTiled` binds them once; split-K and single-pass compare
-          handles and re-bind by themselves). `PrepareForComputeBorrowingCodes`
-          cannot be used per block (it re-creates the result and input buffers,
-          403 MB for GateUp at 4096 tokens). Layer side:
-          `TNNetLayerConcatedWeights.LinkWeightsFrom` refuses when FHasOpenCL, and
-          the host tables (FQuantTable, FQuantTableInt4, FWeightOwner, FNeurons)
-          must follow the swap for the CPU fallback. The prefix net stays on the
-          CPU. Parity test: pico, PoCL vs FP32-input oracle.
-    - [x] B1c. Tiled non-causal attention OpenCL kernel for
-          `CachedForwardNonCausal` (query tile + key tile in local memory, online
-          softmax, keys = text prefix + image rows). The decode kernel
-          (`cai_sdpa_decode_split`) re-reads all K/V per query row: ~540 GB per
-          block at 1024x1024. Keep the 32 blocks' prefix K/V resident once per
-          prompt (today `AppendCacheRowsFrom` goes through the host and
-          `UploadCache` re-uploads them every block of every step); the image
-          rows' K/V can be read straight from the packed QKV input. `WillOpenCL`
-          accepts FCachedForwardNonCausal when the new kernel fits (its own
-          local-memory test, not `QueryTileFits`). Parity test: pico, PoCL vs CPU.
-          DONE: `cai_sdpa_noncausal_tiled` (query tile x key tile in local
-          memory, online softmax; PoCL 64x32 tiles, NVIDIA 48 KB computed 26x32);
-          prefix K/V uploaded once per EncodePrefix and appended per block inside
-          OpenCL memory (`NewCacheRowsOnOpenCL` / `AppendCacheRowsFromOpenCL`).
-          Parity vs CPU 1.8e-7..3.0e-7 (layer), 6.0e-7 (pico velocity). Resident
-          prefixes cost NumLayers x L x hidden x 8 B of OpenCL memory (~256 MB at
-          L=256, ~1 GB at L=1024). Deferred until a GPU measurement:
-          - [x] O accumulator in private registers (raises R on 48 KB devices).
-          - [x] Register-blocked score and P.V loops (today 2 local reads per mad).
-          - [x] Tree reduction for the running-max fold (one lane per row today).
-          DONE (kernel rewrite): O in registers (3x2 float4 per lane), 3x2
-          score and P.V blocking with float4 local loads, parallel row max and
-          per-lane partial sums, one work-group per 128 head-dim columns,
-          reqd_work_group_size(16,16,1); 48 KB tiles 26x32 -> 42x32 (computed),
-          PoCL ~2.1x on one shape (not a GPU timing). L4 gain unmeasured.
-    - [x] B1d. Layers that send the activations back to RAM (B1a), worst first:
-      - [x] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
-            row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow
-            their host source). Accept a host-only FLayerMul of Depth floats,
-            upload it to a small per-layer buffer once per step.
-            DONE: Gated1/Gated2 bind OutProj/Down and upload the host row (16 KB,
-            blocking write) every forward; both TNNetSum layers follow onto
-            OpenCL. Modulated1/2 stay on the host until B1d2. Follow-ups:
-            - [ ] Non-blocking row write + a queue Finish at the end of
-                  TNNet.Compute when the last layer ends on the host (worth it
-                  after B1d2, when these writes are the only mid-block waits).
-            - [ ] Run the modulation chain (SplitChannels, AddConstant, tanh) on
-                  OpenCL so the four rows stay resident for all 32 blocks.
-            - [ ] Shared "bind or upload the operand" helper for
-                  TNNetChannelMulByLayer and TNNetCellMulByCell.
-            - [ ] SE / CBAM / DiT importers now take this OpenCL path with no
-                  OpenCL parity test.
-      - [x] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
-            (deliberate: OpenCLForwardBenchmark ~0.54x standalone), Compute
-            downloads before WillOpenCL, no residency clause, no bind/keep, no
-            OpenCLOutputBuffer. Mirror TNNetTokenRMSNorm; one work-item per token
-            is weak at depth 4096.
-            DONE: TNNetTokenLayerNorm binds a resident source and keeps its
-            output (FShouldOpenCL stays pinned for host sources);
-            cai_volume_norm runs one segment per work-group (cai_token_norm
-            removed; TokenRMSNorm/HeadRMSNorm share it); TNNetLayer
-            .PrevOutputOnOpenCLSameSize replaces 5 copies. Norm1/2,
-            Modulated1/2 on OpenCL; Q/K/V/GateUp no longer upload, Norm2 no
-            longer downloads (~10.7 GB/step less at 1024x1024, computed).
-            Follow-ups:
-            - [ ] Shared parent class for the four norm layers' identical
-                  FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
-            - [ ] Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
-                  never fills FNormalized/FInvStd (FInvRMS): backprop reads
-                  stale values (pre-existing). TNNetRMSNorm.WillOpenCL has no
-                  trainable exclusion.
-      - [x] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
-            Compute downloads before WillOpenCL, no residency clause,
-            `TNNetMRoPECL.Rotate` has no bind/keep and uploads the whole angle
-            table every forward (32x redundant across heads). Add bind/keep as
-            TNNetRoPECL.Rotate has; keep the table resident, re-upload only when
-            positions change.
-            DONE: TNNetMRotaryEmbedding binds a resident source and keeps its
-            output (no size test: growing decode); the angle table is one
-            head's worth (cai_mrope FHalfTile) and stays resident, re-uploaded
-            only when positions/offset change. QRope/KRope, the QKV concat and
-            the Attn input stay in OpenCL memory (~23.6 GB/step less at
-            1024x1024, computed). Follow-up:
-            - [ ] Qwen2-VL/Qwen3-VL decode: M-RoPE is per head there and the
-                  positions change every token, so the blocking table write
-                  waits ~900 times per token (no worse than before; a
-                  non-blocking write would be safe in current graphs).
-      - [x] B1d4. Block boundary: TNNet.Compute downloads the last layer and
-            TNNetInput re-uploads it every block. Copy block i's output buffer
-            into the next pass's input inside OpenCL memory; download only after
-            block 31.
-            DONE: TNNet.KeepLastOutputOnOpenCL (a full forward drains the
-            queue instead of downloading the last layer) +
-            TNNet.ComputeFromLayerOutput (TNNetInput.CopyNextInputFrom: its
-            next Compute copies the source buffer with clEnqueueCopyBuffer on
-            the input's queue).
-            PredictVelocity: 1 upload + 1 download of the activation per step
-            instead of 32 + 32 (~4.2 GB/step less at 1024x1024, computed); 31
-            copies inside OpenCL memory (64 MiB each).
-      TNNetSum and TNNetDeepConcat follow once these are fixed.
-    - [ ] B1e. Pipeline wiring + `examples/QwenImage --gpu` (int4 and int8). User
-          runs on the GPU box: 256x256 first, then 1024x1024 and larger; record
-          s/step and peak GPU memory.
+    - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
+          TNNet.Compute when the last layer ends on the host (worth it
+          after B1d2, when these writes are the only mid-block waits).
+    - [ ] B1d1 follow-up: Shared "bind or upload the operand" helper for
+          TNNetChannelMulByLayer and TNNetCellMulByCell.
+    - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
+          OpenCL parity test.
+    - [ ] B1d2 follow-up: Shared parent class for the four norm layers' identical
+          FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
+    - [ ] B1d2 follow-up: Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
+          never fills FNormalized/FInvStd (FInvRMS): backprop reads
+          stale values (pre-existing).
+    - [ ] B1d3 follow-up: Qwen2-VL/Qwen3-VL decode: M-RoPE is per head there and the
+          positions change every token, so the blocking table write
+          waits ~900 times per token (no worse than before; a
+          non-blocking write would be safe in current graphs).
       Risks from B1a (not measured): the tiled int4/int8 OpenCL kernel streams
       the whole weight matrix once per 16-token tile (~35 GB of int4 codes per
       block at 4096 tokens unless L2 absorbs it; a wider token tile is the likely
@@ -4012,64 +1629,15 @@ rather than acted on.
         today's rate is ~9 min per step.
   - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
         Estimate (not measured): a CPU VAE decode at 1024x1024 is ~8 min (16x the
-        31 s measured at 256x256), so it is the next bottleneck once B1 lands.
-    - [x] B2a. Read-only audit (2026-10-01, pico VAE armed on PoCL: all 44
-          convolutions ran on OpenCL, clamped image 2.5e-6 vs CPU). Limits:
-          the FP32 GEMM is the naive `cai_dot_product` (one work-item per
-          output); every padded 3x3 conv downloads its source, pads on the host
-          and uploads (`ShouldBindPrevOutputAsIm2ColSrc` needs FPadding = 0);
-          Reshape, DeMaxPool, GatherChannels, PixelShuffle, the mid SDPA and its
-          one-source DeepConcat have no resident path, so the residual stream
-          drops to RAM after attention and at every upsampler. Memory with
-          today's per-layer buffers: 3.4 GB at 128 px tiles, 10.7 GB at 256,
-          22.8 GB at 384; untiled 1024 needs ~155 GB and overflows int32 im2col
-          indexing (2.72e9 elements). CPU decode measured ~56 GFLOPS (29 TFLOP
-          with 128/96 tile overlap in 519 s).
-    - [x] B2b. Arm OpenCL on the VAE in the pipeline
-          (`TQwenImage21VaeDecoder.EnableOpenCL`, sized nets in one context).
-          DONE: the CLI arms it by default (also with FP32 transformer
-          weights); closing "Compute :" line names where the VAE ran;
-          --profile prints a VAE table per tile shape. Follow-ups:
-          - [ ] FP32 weight sharing across the tile-shape nets (each uploads
-                the 1 GB of weights again).
-          - [ ] Drop the armed nets' host FConcatedWeights/FConcatedWInter
-                copies (~2 GB) after the upload.
-          - [ ] One OpenCL context per pipeline (today the transformer and the
-                VAE each build the program per image).
-          - [ ] Parallel scheduler + OpenCL on PoCL is 20-90x slower than
-                --serial (CPU oversubscription with PoCL's threads; worker
-                count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
-                on the L4; cap the workers for CPU OpenCL devices.
-    - [x] B2c. FP32 tiled GEMM OpenCL kernel (twin of
-          `cai_dot_product_int8_tiled`), used by every FP32 conv/FC with >= 16
-          columns.
-          DONE: `cai_dot_product_tiled` shares `cai_dot_product_tiled_body`
-          with the int8 kernel; FP32 Compute takes it when FNumBs >= 16 and
-          FNumAs >= 64 (small-row GEMMs such as gram / attention P.V stay on
-          `cai_dot_product`). GPU speed unmeasured.
-    - [x] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
-          DONE: `cai_im2col` / `cai_im2col_h` take InSizeY and Padding and
-          write zeros for out-of-source taps; a padded conv binds a resident
-          source (no download + host pad + upload). Pico VAE: 26 of 40 3x3
-          convs move 0 bytes, 14 still read a host source until B2e (~22 of
-          ~39 GB per 1024x1024 decode removed, computed). OpenCL binaries must
-          be rebuilt with the new neural.cl (kernel arguments changed).
-    - [x] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
-          DupUp gather/pixel shuffle bind+keep, SDPA output.
-          DONE (inference only): TNNetReshape offers its source's OpenCL
-          buffer when the Size matches (alias, no copy; MoveOutputToRAM copies
-          from the source's host copy); `cai_upsample_gather` (replaces
-          `cai_pixel_shuffle`, integer indexing, no index map) serves
-          TNNetDeMaxPool, TNNetUpsample and TNNetPixelShuffle forwards (bind a
-          resident source, keep the output); TNNetGatherChannels is now a
-          TNNetSplitChannels descendant (cai_split_channels). Pico VAE: all 40
-          3x3 convs bind; per decode 20 up / 17 down -> 2 up / 1 down besides
-          the image download. 1024x1024 at 128/96 tiles: ~17.6 GB -> ~0.16 GB
-          of activation transfers (computed). Left on the host: the mid-block
-          SDPA (downloads Q|K|V, the out-projection uploads; softmax on host).
-          TNNetSum needed no change. Follow-up:
-          - [ ] Mid-block attention in OpenCL memory (device softmax, or the
-                VAE through TNNetFusedSDPA's non-causal tiled kernel).
+        31 s measured at 256x256), so it is the next bottleneck.
+    - [ ] B2b follow-up: Drop the armed nets' host FConcatedWeights/FConcatedWInter
+          copies (~2 GB) after the upload.
+    - [ ] B2b follow-up: One OpenCL context per pipeline (today the transformer and the
+          VAE each build the program per image).
+    - [ ] B2b follow-up: Parallel scheduler + OpenCL on PoCL is 20-90x slower than
+          --serial (CPU oversubscription with PoCL's threads; worker
+          count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
+          on the L4; cap the workers for CPU OpenCL devices.
     - [ ] B2f. Big tiles / untiled decode. Plan (2026-10-03, computed from the
           code and the real config, not measured; dims 1152/1152/1152/576/288/
           144, 1.06 TFLOP per 256-px tile; 1024x1024 = 29.2 TFLOP at 256/192,
@@ -4086,70 +1654,6 @@ rather than acted on.
           also overflows on the host (`TVolume.ReSize` integer size;
           `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
           resident, so the VAE has ~10-14 GB on a 24 GB L4.
-          - [x] B2f0. Phase timers in `TQwenImage21VaeDecoder` under --profile
-                (build, PrepareInferenceThreads, arming split into
-                AfterWeightUpdate vs buffers, forwards, blend, release) and
-                `TNNet.OpenCLBufferBytes()`. No behaviour change. L4 run with
-                --profile and --serial.
-                DONE: per-shape phase table + a decode-wall split line; arming
-                weight prep via `TimedAfterWeightUpdate`; OpenCLBufferBytes from
-                `clGetMemObjectInfo` (partial: FDotCL + overriding classes; the
-                VAE's classes are covered). Pico shows no real-size signal;
-                waiting for the user's L4 run.
-          - [x] B2f1. Implicit-GEMM conv on OpenCL (FP32, inference-only):
-                gather stage in `cai_dot_product_tiled_body`, naive twin for
-                Cout < 64 (conv_out); lazy `FInputBufferBs`; inference-only
-                spatial convs stop sizing host `FInputPrepared`. Int8 keeps
-                im2col. Fixes the int32 overflow.
-                DONE: `cai_conv_implicit_tiled` (BIsConv + `cai_tiled_stage_b_conv`,
-                same Bs layout, equal to explicit on PoCL) and the untiled
-                `cai_conv_implicit`; `TNNetConvolution.ShouldOpenCLImplicitConv`;
-                `NEURAL_OPENCL_IMPLICIT_CONV=0` / `SetOpenCLImplicitConv` for an
-                A/B. Pico VAE OpenCL bytes per net 12.6 -> 4.7 MB (-63%), image
-                byte-identical. Computed at a real 256 tile: -6.1 GB OpenCL and
-                -6.1 GB host per net. GPU speed unmeasured. Deferred: int8 convs
-                keep the host column matrix; `SetTrainable(false)` after the
-                build keeps it too; the CPU path still overflows untiled 1024.
-          - [x] B2f2. Per-row bias in OpenCL (`Bias[row]`); lazy host
-                `FBiasOutput` / `FOutputRaw`.
-                DONE: every dot-product kernel reads `Bias[row]`; a conv's
-                OpenCL bias buffer is Cout*4 bytes (`FNeuronBias`); a wrong-size
-                bias raises. `TNNetConvolution.PrepareHostOutput` sizes host
-                `FOutputRaw` and the per-position `FBiasOutput` on the first host
-                forward, so a fused OpenCL forward holds neither. Pico VAE 64x64:
-                OpenCL 4.5 -> 3.6 MB, host 5.8 -> 4.0 MB, image byte-identical.
-                Computed at a real 256 tile: -0.65 GB OpenCL, -1.3 GB host per
-                net. Deferred: `TNNetGroupedConvolutionLinear` keeps its
-                per-position buffers; host buffers built once stay allocated.
-          - [x] B2f3. OpenCL output buffer reuse by liveness (opt-in per TNNet;
-                reuse only when every consumer of the producer is an ancestor;
-                single in-order queue; last layer pinned).
-                DONE: `TNNet.ShareOpenCLOutputsByLiveness`, planned when armed;
-                on for the VAE nets (`NEURAL_OPENCL_SHARE_OUTPUTS=0` turns it
-                off). Adopters: conv, identity/SiLU, Sum, DeepConcat, Split/
-                Gather, TokenRMSNorm, DeMaxPool, PixelShuffle. Forwards from
-                FromLayerIdx > 0 raise on a sharing net. Pico VAE 4x4 latent
-                3.78 -> 1.07 MB OpenCL, images byte-identical. Computed: 256
-                tile ~3.5 -> ~1.4 GB per net, 512 ~11 -> ~2.7, untiled 1024
-                ~41 -> ~7.7 GB (the ancestor rule keeps the DupUp shortcut in
-                its own slot; a serial-only index-order rule or extra scheduler
-                edges would give ~4.9 GB untiled; not done, user decision).
-                Not adopted yet: RMSNorm, LayerNorm, TokenLayerNorm, RoPE,
-                fused SDPA, GLU.
-          - [x] B2f4. Host `FOutput` sharing by liveness (exact-size aliases,
-                opt-in).
-                DONE: `TNNet.ShareHostOutputsByLiveness` (same planner as B2f3,
-                exact-size slots, `TNNetVolume.ShareDataWith`/`UnshareData`);
-                on for the VAE nets (`NEURAL_SHARE_HOST_OUTPUTS=0` turns it
-                off); inference only (any trainable layer unshares). On armed
-                nets a shared layer drains the queue only while a non-blocking
-                upload is pending. Pico VAE host MB 1.3 -> 0.7 (OpenCL) and
-                3.1 -> 2.5 (CPU), images byte-identical. Computed host FOutput
-                per net: 256 tile ~2.4 -> ~0.56 GB, untiled 1024 ~38 -> ~9 GB.
-                Follow-ups: the net build still sizes every FOutput before the
-                first forward unshares them (untiled 1024 build peak ~38 GB
-                host); exact size and the DupUp branch limit the saving; the
-                drain cost on the L4 is unmeasured.
           - [ ] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
                 OpenCL (-17% of decode FLOPs); CPU path unchanged.
           - [ ] B2f6. Untiled path: memory estimator vs the device limits,
@@ -4159,17 +1663,6 @@ rather than acted on.
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
-  Phase D — example usability (`examples/QwenImage`):
-  - [x] D1. Defaults int8 weights and 18 steps; `--fp32` asks for FP32.
-  - [x] D2. Step line rewritten in place (`#13` + `ESC[K`) when stdout is a
-        terminal; one line per step when it is a pipe or a file.
-  - [x] D3. `/repeat N PROMPT` in the REPL and `--repeat N` with `-p`: N images,
-        consecutive seeds, prompt encoded once.
-  - [x] D4. `GPU %` column (forward count share) and a count/time share summary
-        line in `TNNet.LayerGroupTimingReport`.
-  - [x] D5. QwenImage per-image stage table (CPU/OpenCL, wall, % of image),
-        `--stats`, host<->OpenCL MB per step and per VAE tile, peak OpenCL
-        bytes, `/profile` and `/stats` REPL toggles.
   Phase C — editing and reference images (plan from source reading of
   diffusers 0.41.0.dev0 `pipeline_qwenimage21.py` / `transformer_qwenimage21.py`
   / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`;
@@ -4177,174 +1670,10 @@ rather than acted on.
   one pipeline for text-to-image and editing (`image=`): no strength, no mask, no
   second-image input; masks and circles are extra input images. Condition images
   are resized with our own resize, not PIL Lanczos (accepted divergence).
-  - [x] C2. VAE encoder: conv_in 4->base, 5 residual down blocks, mid
-        (res, attn, res), RMS norm, SiLU, conv_out -> 2z, quant_conv 1x1, posterior
-        mean, `(z - mean)/std` folded into quant_conv. Trap: the AvgDown3D shortcut
-        (blocks 1-3 pad a zero frame in front: channel 2c+ft, even channels 0).
-        `time_conv` unused for one frame. The pico fixture already has the weights.
-  - [x] C2b. SDEdit img2img: `--image FILE --strength S` (default 0.6) VAE-encodes
-        the image, `latents = sigma[t_start]*noise + (1 - sigma[t_start])*x0` with
-        `t_start = int(N - min(N*strength, N))` on the shifted sigmas (Qwen-Image v1
-        img2img formula; 2.1 has no img2img pipeline), denoises from t_start. Error
-        when no step remains. Re-styles; does not follow edit instructions.
-  - [x] C1a. Qwen3-VL vision tower: patch 16 (the 2 temporal kernel slices summed),
-        learned 48x48 position table bilinear (align_corners), 2-D RoPE (rotate-half
-        -> interleaved permutation), 27 pre-LN blocks, bidirectional attention via the
-        `TNNetFusedSDPA` cached path (no 1 GB score map), 2x2 merger + DeepStack
-        mergers (layers 8/16/24). Preprocessing: composite over white, mean/std and
-        max_pixels from `preprocessor_config.json`. Pico fixture regenerated with
-        vision patch 16, depth 3, deepstack [0, 2].
-  - [x] C1b. Text encoder with images: vision embeddings spliced into the
-        `<|image_pad|>` rows, DeepStack features added after decoder layers 0-2,
-        interleaved M-RoPE sections, N-image `get_rope_index` positions, edit template
-        `<image1><|vision_start|><|image_pad|><|vision_end|> <image2>...`, image-pad
-        mask output.
-  - [x] C3a. Transformer prefix with condition images: each image slot expanded x4
-        and filled with `img_in(VAE latents)`, t = 0 modulation, block-causal mask
-        (causal text, bidirectional per image) via a per-row key limit in
-        `TNNetFusedSDPA.ComputeCachedRows`; `PrepareStepPass` must place the target
-        RoPE frame after the images (today it assumes a text-only prefix).
-  - [x] C3b. Edit pipeline and example: target size from the last condition
-        image's aspect, per-image resize, RGBA to the VAE and white-composited RGB to
-        the vision tower; `--image FILE` repeatable, `/image FILE` and
-        `/images clear` in the REPL.
   - [ ] C4. Prefix pass on OpenCL, int8 prefix K/V and a windowed text-encoder
         prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope after C3a with an L4 measurement.
-  Phase F — OpenCL residency of the step pass:
-  - [x] F1. Modulation chain in OpenCL memory (L4 int8 1024^2 run 2026-10-04:
-        1280 blocking 16 KB operand uploads per image, all modulation layers
-        on the host).
-        (a) `TNNetInput.ComputeOpenCL`: move the upload that `TNNetInput.Compute`
-        does inline into its own ComputeOpenCL; it only puts FOutput into the
-        OpenCL buffer and sets FOutputOnOpenCL. FOutputOnRAM stays true (the
-        host copy is current; producers offer, consumers decide).
-        (b) Consumers bind any source with FOutputOnOpenCL, whether or not it
-        also has a RAM copy: first `TNNetSplitChannels.WillOpenCL` (ends with
-        `Result := not FPrevLayer.FOutputOnRAM`); read-only grep of the other
-        WillOpenCL predicates that fall back to the host when the source is in
-        RAM before changing them.
-        (c) `TNNetAddConstant` opcode in `cai_activation` (ParamA = constant),
-        Compute through ComputeActivationOnOpenCL (also fixes its "-" count).
-        Then tanh follows and `TNNetChannelMulByLayer` binds its operand.
-        Doing (b) without (c) is worse (AddConstant would download).
-        Tests: PoCL sentinel test that the split/tanh/AddConstant/ChannelMul
-        chain binds (no activation upload), parity, counts.
-  - [x] F2. Image-in net and output net on OpenCL (L4 run: image-in 880 ms +
-        output 216 ms + "outside the nets" 126 ms per step; 64 MB up + 64 MB
-        down per step). Arm FImageInNet and FOutputNet in the step net's
-        context (EnableOpenCLInContextOf(FBlockStore[0], ...)), run block 0 as
-        FStepNet.ComputeFromLayerOutput(FImageInNet.GetLastLayer()) and the head
-        as FOutputNet.ComputeFromLayerOutput(FStepNet.GetLastLayer()), download
-        only the velocity. Check first that a net whose weights come from a
-        host-only build owner (FImageInOwner/FOutputOwner) can arm its own
-        buffers.
-  - [x] F3. Per-layer residency statistic in LayerGroupTimingReport, counted in
-        TNNetLayer.RunProfiled only (zero cost without profiling): per layer,
-        forwards whose source was bound in OpenCL memory / pulled to RAM /
-        activation-uploaded / host forward with a resident-only source (stale
-        suspect) / output left resident; plus a net-level "transfers outside
-        layer rows" line from OpenCLProcessTransferTotals. Source lists built
-        in SetLayerProfiling(true) (no alloc in Compute). PoCL tests incl. a
-        deliberate stale-read layer.
-  - [x] F4. VAE mid-block attention as one non-causal TNNetFusedSDPA reading the
-        QKV slab (as the transformer block does: BeginIncrementalDecode(N)
-        before AddLayer, TruncateCache(0) per tile pass), replacing the split /
-        TNNetScaledDotProductAttention (host softmax, 4 uploads + 3 blocking
-        downloads per pass) / one-input TNNetDeepConcat. Check
-        FlashTilesFit at the VAE width on 48 KB local memory.
-  - [x] F5. Norm1/Norm2 (non-affine TNNetTokenLayerNorm) re-upload gamma=1 /
-        beta=0 on every block weight swap (20 MB per image): weightless variant
-        or no re-upload when unchanged.
-  - [x] F6. VAE weights shared across the tile-shape nets: each of the 4 nets
-        prepares and uploads the same 945 MB of conv weights (weight prep
-        11.3 s of the 26.2 s decode on the L4).
-  Phase E — speed gap against other implementations:
-  - [ ] E1. The Unsloth build of Qwen-Image-2.1 is reported to be at least 20x
-        faster than ours (our L4 int8 1024^2, 10 steps, --profile, 2026-10-04:
-        322 s total, 19.7 s/step, projections 15.0 s/step = ~3.8 TFLOPS, VAE
-        decode 26.2 s of which 11.3 s weight preparation). Find why, stage by
-        stage. First pin down the comparison: Unsloth artifact and runner (GGUF
-        in ComfyUI / diffusers / other), quantization, steps (distilled or
-        lightning LoRA?), CFG, resolution, GPU, and whether its time includes the
-        loads. Then compare per stage: projections (tensor-core FP16/BF16 or
-        int8 MMA via cuBLAS vs our OpenCL dot-product kernels), attention (flash
-        attention vs cai_sdpa_noncausal_tiled), text encoder and VAE on the GPU vs
-        ours on the CPU / per-tile-net arming, weight load. Output: a ranked list
-        of the gaps with measured or estimated seconds each, and which are
-        reachable in OpenCL (no tensor cores in portable OpenCL; NVIDIA-only
-        inline PTX was an earlier idea).
-        Done as a read-only analysis 2026-10-04: a 1024^2 step is ~66 TFLOP, so
-        ~1 s/step needs tensor cores; our projections run at 3.8 TFLOPS (int8
-        tiled GEMM bound by one-byte weight loads, 2x16 micro-tile), attention at
-        3.0 TFLOPS. L4 clinfo (driver 580.82.07): no cl_khr_integer_dot_product,
-        no cl_khr_fp16, no sub-groups, OpenCL C 1.2, 48 KB local memory, max
-        single allocation 5.5 GB. Portable ceiling ~4-5 s/step.
-  - [ ] E2. Generic masked flash attention (FP32) in TNNetFusedSDPA (user-
-        authorized 2026-10-05). One tiled OpenCL kernel replacing
-        cai_sdpa_noncausal_tiled, with a mask mode (none / causal / per-row key
-        end / window), used for many query rows; cai_sdpa_decode_split stays for
-        one or few rows. Users: Qwen-Image step pass, Qwen3-VL vision tower, LLM
-        prefill (--prefill-window, ChatTerminal TTFT), the edit prefix (C4), the
-        VAE attention (F4). Target: attention 2.9 -> ~0.6-1.0 s/step at 1024^2
-        (unmeasured). Serial stages, each with a fresh read-only reviewer, the
-        three suites and a commit:
-    - [x] E2.0 Read-only design: mask encoding, tile shapes and register /
-          local-memory budget (48 KB, 64K registers, OpenCL C 1.2, no
-          sub-groups), dispatch rule tiled vs decode-split, test plan, benchmark
-          spec. Brought to the user before coding.
-    - [x] E2.1 Kernel (coder A): non-causal mode first, register tiling, vector
-          loads, fewer barriers, 2-3 tile variants behind an environment switch;
-          a small benchmark example timing the kernel at given shapes without a
-          model. User times the variants on the L4.
-    - [x] E2.2 (coder A continued): lock in the winning tiles; causal mode and
-          the TNNetFusedSDPA dispatch for LLM prefill windows; parity on LLM
-          prefill and Qwen-Image. User measures ChatTerminal TTFT and a Qwen-Image
-          --profile run.
-    - [x] E2.3 (coder B): per-row key ends (C3a edit prefix, unblocks C4) and
-          int8 K/V tiles (ChatTerminal's default KV cache).
-    - [x] E2.4 (coder B continued): head-dimension (Dk) splitting for wide
-          single heads, then TNNetScaledDotProductAttention and TNNetDeepConcat
-          on OpenCL (user request 2026-10-05): the generic
-          TNNetScaledDotProductAttention (AddMultiHeadSelfAttention and ~90 other
-          call sites, incl. the Qwen-Image VAE mid-block) runs its whole
-          forward on the flash kernel, binds its source and leaves its output in
-          OpenCL memory (today: Q.K^T and P.V on OpenCL, softmax on the host, 4
-          uploads + 3 blocking downloads per pass, output never resident); the
-          following TNNetDeepConcat then binds a resident source and runs on
-          OpenCL (today 0% on the VAE nets). Its other modes (masks, causal,
-          training/backprop) keep their current paths unless the flash kernel
-          covers them. Resolves F4 without changing the VAE graph. One L4 VAE
-          profile.
-  - [ ] E3. Faster int8/int4 tiled GEMM for TNNetPointwiseConvLinear
-        (ComputeResidentCodes -> RunTiledGemm; user-authorized 2026-10-06).
-        Projections are 14.1 of 16.1 s/step on the L4 (GateUp 3.6 TFLOPS, Down
-        4.0, Q/K/V/O 4.7-5.1); the kernel is latency-bound at ~12.5% of FMA peak
-        (one-byte weight loads inside the FMA loop, int8 K loop with a run-time
-        bound and no unroll). Serial stages, each with a fresh read-only
-        reviewer, the three suites and a commit; the user times each on the L4:
-    - [x] E3.1 GEMM fix 1 (fdde6fc6): a kernel-only benchmark example at the Qwen-Image
-          projection shapes, then a constant-32 unrolled K loop, 4 rows per
-          lane read as 4-byte codes, 4x16 micro-tile per lane (int8 and int4).
-          Estimate: 16 -> 8-10 s/step.
-    - [x] E3.2 GEMM fix 2 (451a6b5f): 128x128 register-blocked tiled GEMM (8x8 per lane,
-          local-memory staging of codes and inputs). Estimate: 5-7 s/step.
-          L4 measured 2026-10-06: int8 block 9.9-11.4 TFLOPS, Qwen-Image step
-          16.1 -> 7.4 s.
-    - [x] E3.3 (076c1d0a) Remove the _small grid (user-authorized 2026-10-06): on the L4
-          it lost every measured window shape (1024/2560 rows x 2560 x 16/64
-          tokens: int8 13-17% and int4 52-56% slower than the large grid).
-    - [x] E3.4 (39e37080; L4 GemmBench: window shapes 1.1-12.8x, auto S best or tied everywhere) Split-K with plain FP32 partials for tiled code GEMMs with too
-          few tiles to fill the compute units (user-authorized 2026-10-06):
-          every measured window shape takes a flat ~0.2 ms (serial K loop over
-          1-20 work-groups) against a ~10 us weight-read floor. GemmBench A/B,
-          then the user measures ChatTerminal TTFT with --prefill-window.
-    - [x] E3.5 (efd64173; L4 run pending) GemmBench FP16-activation option (user-authorized 2026-10-06):
-          time the int8 code kernels with the B operand in FP16 (the existing
-          _h kernels) next to FP32 at the Qwen-Image shapes, to test whether
-          the block kernel (10-11 TFLOPS of ~30) is bound by FP32 activation
-          traffic (64 MB at 4096 tokens > 48 MB L2). Measurement only.
 - [ ] Qwen-Image inpainting: `--init-image FILE --mask FILE` in examples/QwenImage
       (and `/mask FILE|off` in the REPL) regenerates only the white region of a
       mask image and keeps the rest of the init image. Port of diffusers
@@ -4479,220 +1808,20 @@ rather than acted on.
         "\nYes means: ..."/"\nNo means: ..." appended to the question. Score s = head(
         final hidden state of the last token); choice/score p = softmax(s/T), noul
         p = sigmoid(s/T). Non-string values rendered with json.dumps(sort_keys).
-  Stage 0 — shared decision layer:
-  - [x] D0.1 `neural/neuraldecision.pas`: question/answer records, the Jev request
-        parser + validator (422 detail list), the response builder, the confidence
-        formulas, the value renderer, the special-token rewrite, and a restricted
-        softmax over a set of logit ids (search `TNNetVolume`/`neuralvolume.pas` for an
-        existing row softmax first). Model-free unit tests, including the 0.355/0.925
-        confidence checks and JSON round trips.
-        Done: 20 tests in `tests/TestNeuralDecision.pas`. Servers must call the
-        STRING entry point of `ParseDecisionRequest`: only it can see option names
-        over fpjson's 255-byte key limit. Open: `HFDecodeUnicodeEscapes`
-        (`neuralhftokenizer.pas`) turns an escaped quote or backslash into the raw
-        character, which breaks the JSON; the decision parser decodes escapes itself.
-  - [x] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
-        prefix and capture its state; score a branch from that state, returning the
-        last-position logits and/or the final hidden state at requested branch
-        positions; leave the engine consistent (`CachedTokens` = session contents, or
-        cleared) on success and on exception. Tests on the Qwen3.5 hybrid pico and an
-        attention-only pico: branch-after-restore equals a full fresh forward.
-        Done: `PrefillDecisionPrefix` + `ScoreDecisionBranch`; `CachedTokens` stays
-        exact (a later chat reuses what the session holds). Prefill windowing is
-        shared with chat through `PlanPrefillLadder`/`FeedPrefillLadder`. Tests
-        `TestChatDecisionBranch{Parity,PrefillWindow,OpenCL}` (OpenCL run on PoCL
-        only, no real GPU).
-  - [x] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
-        decision-only mode switch for later stage-2 use, `--selftest` cases.
-        Done: `TDecisionScorer` base (scorers take their engine/head in the
-        constructor); no scorer -> 501, validation -> 422, wrong model -> 422 (the
-        model name or `jev-latest`), scorer exception -> 500. 18 new selftest cases
-        (run by hand: no test script runs ChatServer `--selftest`).
-        Changed later (user request): the request `model` is optional and ignored
-        (any value or JSON type); ChatServer serves one model and every response's
-        `model` names the loaded scorer, so the wrong-model 422 and the
-        `jev-latest` alias (`AcceptsModel`, `csDecisionDefaultModelAlias`) are gone.
   Stage 1 — AnyJev L0 readout (no trained weights):
-  - [x] D1.1 AnyJev L0 scorer (in `neuralanyjev.pas`, not `neuraldecision.pas`): prompt builder per kind, label
-        token mapping, rotations, content-free prior, log-mean marginalisation, plus a
-        `raw` level (one prompt, no prior). Jev mapping: choice options rendered
-        "name: desc", score levels = descriptions, noul criteria appended as
-        "Yes means: ..."/"No means: ..." lines. Port AnyJev's model-free tests
-        (`tests/test_calibrate.py`).
-        Done: `TAnyJevL0Scorer`, 15 tests in `tests/TestNeuralAnyJev.pas`. Prompts are
-        grouped by state text (request state + the 3 content-free probes); each group
-        prefills its longest common token prefix once, so the model reads exactly the
-        full-prompt encodings (no sentinel split). Open: the Qwen3 closed-think append
-        for cfChatML/cfQwen templates is unchecked against a real template (D1.2); a
-        multi-token Yes/No label answers 500, not 422 (D1.3); batch prior,
-        adaptive_shifts, canonical_order not ported.
-  - [x] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
-        Decider (L0, content-free prior) on a pico Qwen-family decoder with a chat
-        template; Pascal test compares probabilities.
-        Done: fixtures `tests/fixtures/anyjev_qwen25/` (Qwen2, verbatim Qwen2.5
-        template -> cfQwen) and `anyjev_qwen3/` (Qwen3, verbatim Qwen3-0.6B template
-        -> cfChatML + closed think, which matches HF `enable_thinking=False`). Prompt
-        ids and label ids are exact; raw rows, priors and answers agree within 3.1e-6
-        (HFBackend runs float64 but casts logits to float32 before log_softmax).
-        Note for D1.3: on prompts whose prefix has >= 256 tokens AnyJev scores the
-        rotations through `score_shared` (prefix and suffix encoded apart, used only
-        when that equals the joint encoding), so it matches the Pascal full encoding.
-  - [x] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
-        on Qwen2.5-0.5B-Instruct against Python AnyJev.
-        Done (coded): ChatServer creates a `TAnyJevL0Scorer` after the model loads,
-        named like the chat model in `/v1/models` (the model directory's name; also
-        `jev-latest`). Flags `--decision-level l0|raw`, `--decision-prior
-        content_free|none`, `--decision-max-rotations N` (ParseServerArgs takes them
-        out before ParseArgs, so ChatTerminal does not see them).
-        `EAnyJevLabelTokenError` now derives from `EDecisionUnsupported`, so a label
-        that is not one token answers 422 naming the question. Docs: ChatServer.md
-        *Typed decisions*, the folder README and the top README (planned (coded)).
-        Smoke test on `tests/fixtures/anyjev_qwen25` with `--fp32`:
-        `tools/anyjev_real_check.py` max abs difference 3.9e-5 (the server rounds to
-        4 decimals); decision, chat, chat, decision gave identical decision answers
-        and the same greedy chat reply.
-    - [ ] User check on a real checkpoint (this VM cannot hold one):
-          ```
-          git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
-          lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
-          neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
-          pip install anyjev==0.3.0
-          pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
-          python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
-          kill %1
-          ```
-          PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
-          weights move the probabilities far more than FP32 rounding.
+  - [ ] D1.3 user check of the coded AnyJev L0 default scorer on a real checkpoint (this VM cannot hold one):
+        ```
+        git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
+        lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+        neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
+        pip install anyjev==0.3.0
+        pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
+        python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
+        kill %1
+        ```
+        PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
+        weights move the probabilities far more than FP32 rounding.
   Stage 2 — Kev and Open-Jev:
-  - [x] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
-        torch.save dict (temperature, head_dim, base, base_revision, lora), keep
-        nested-dict tensors under dotted names (`head.q.weight`), accept any storage
-        location string. Unit test on a generated `head.pt`-shaped fixture.
-        Done: every non-tensor leaf (None/bool/int/float/str, list lengths) is
-        metadata named by its dotted path from the pickle root (list items by index,
-        `temperature_fit.cross_validation.temperatures.1`); `GetMetadata{Str,Int,
-        Float,Bool}(name, default)` return the default when absent and raise on a
-        kind mismatch. A depth cap (64) refuses self-containing containers.
-        Fixtures `tests/fixtures/torch_head/` by `tools/torch_head_fixture.py`
-        (Kev through kev's own `write_meta`; Open-Jev with 'cpu' and 'cuda:0'
-        locations). The real kev-0.8b and Open-Jev-2B `head.pt` files parse.
-  - [x] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
-        lora_alpha, target_modules), map adapter keys onto base checkpoint keys, merge
-        in FP32, and build through the normal importer (export the in-memory tensor
-        reader path). Test: pico Qwen3.5 + random adapter; merged build logits = HF
-        reference with the merged weights.
-        Done: `TNNetLoRAMergeReader` wraps the base reader and adds
-        `(alpha/r) * B @ A` per load (whole tensor or row range, one module's A/B
-        cached), so the direct-to-int8/int4 row streaming reads merged rows and no
-        second copy of the model exists. Entry point `BuildFromPretrained(...,
-        pLoRAAdapterDir)` (Llama-builder model types; unused with pWeightOwner).
-        Key `base_model.model.<m>` -> `<m>.weight`, else `<text prefix><m>.weight`
-        (prefix of embed_tokens: Qwen3.5-0.8B-Base and Qwen3.5-2B are
-        `model.language_model.`). `ReadPEFTAdapterConfig` now reads
-        target_modules and plain-key rank_pattern/alpha_pattern and refuses DoRA,
-        rsLoRA, qalora, bdlora, lora_bias, bias != none, fan_in_fan_out,
-        modules_to_save, trainable_token_indices, layer_replication,
-        target_parameters, aLoRA, arrow, kasa, monteclora and base-rewriting inits
-        (pissa/olora/corda/loftq/lora_ga). Fixtures `tests/fixtures/
-        lora_merge_qwen3_5/` and `lora_merge_qwen3/` by
-        `tools/lora_merge_tiny_fixture.py`; FP32 logit diff 3.0e-5 / 2.5e-7.
-  - [x] D2.3 Kev scorer: row construction, per-question rows from the shared state,
-        pointer head, temperature from `head.pt`, Jev answer mapping, 65536-token state
-        limit. Fixture: pico Qwen3.5 + random LoRA + random head through Kev's own
-        `kev/model.py` math.
-        Done: `TKevScorer` in `neural/neuraldecisionheads.pas` (Open-Jev joins it);
-        `TChatOptions.LoRAAdapterDir` (no CLI flag yet) goes to the non-borrowing
-        builds. Refuses head.pt `option_isolation`/`special_embeddings` true
-        (`EDecisionHeadError`); `Temperature` overrides the head's (1.0 = raw).
-        Fixture `tests/fixtures/kev_qwen3_5/` by `tools/kev_tiny_fixture.py` (117 KB):
-        kev's own DecisionModel builds the LoRA, `write_meta` writes the head, and
-        `Checkpoint.load` (float64, merged) + `admit` + `probs` is the oracle. Token
-        ids exact, probabilities within 4.1e-6. Open: kev renders an empty list/object
-        description as "name: " (`[] != ""`); the Pascal parser stores '' and writes
-        "name".
-  - [x] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
-        the first token where the candidates diverge (check encode(prefix + suffix) =
-        encode(prefix) + encode(suffix), else score the full prompt), Linear(d,1) head,
-        `temperature.json`. Fixture as in D2.3.
-        Done: `TOpenJevScorer` (with `TKevScorer` now under `TDecisionHeadScorer`,
-        which owns the temperature override). It takes the checkpoint directory
-        (`head.pt`, `temperature.json`, `model.json`, `adapter/`) or anything
-        `OpenJevCheckpointDir` resolves to one (`<dir>/checkpoint`,
-        `<dir>/package/checkpoint`, the HF repo layout); the engine is loaded with
-        `<checkpoint>/adapter`. The request parser now also keeps Open-Jev's
-        rendering (`OpenJevState`, `OpenJevInstructions`, `OpenJevDescriptions`,
-        `OptionHasDescription`: `""` -> "name: ", null -> "name") via
-        `DecisionValueToSortedJSON` = json.dumps(sort_keys=True,
-        ensure_ascii=False); `DecisionFloatToStr` now prints subnormals like
-        Python (5e-324). Prompts are framed with cfQwen3_5 + reOff whatever the
-        engine detects: the real Qwen3.5-2B template has no `preserve_thinking`,
-        so `DetectChatFormat` calls it cfChatML (also affects chat on that base).
-        Usage counts fed tokens like the other scorers (jev reports the sum of
-        full prompt lengths). The token prefix shared by all prompts of the
-        request is fed once (exact by construction: LCP of full encodings).
-        Divergences from jev: `<|x|>` in caller text is rewritten (jev tokenizes
-        it as a special token); a null noul description is ignored (jev: 422);
-        1-level scores and numeric descriptions are accepted. Fixture
-        `tests/fixtures/openjev_qwen3_5/` (137 KB) by `tools/openjev_tiny_fixture.py`;
-        oracle = jev's compile_request/candidate_prompts + DecisionModel.forward +
-        Predictor.predict (float64 backbone; `score_cached` cannot run on the
-        venv's transformers 5.17). Strings and ids exact, p within 6.4e-7.
-  - [x] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
-        load the base given by the usual model directory (warn when it differs from
-        the adapter's recorded base), merge, read the head, switch to decision-only.
-        Done (coded): `DetectDecisionAdapterLayout` / `ReadDecisionAdapterInfo` /
-        `DecisionAdapterModelName` / `ReadOpenJevModelConfig` in
-        `neuraldecisionheads.pas` (verified against the HF trees of kev-0.8b,
-        kev-27b and Open-Jev-2B). Open-Jev (`OpenJevCheckpointDir` <> '') merges
-        `<checkpoint>/adapter` when `lora_rank` > 0; Kev LoRA (head.pt +
-        adapter_config.json + adapter weights) merges the directory; Kev full
-        weights (kev-27b) are refused naming D2.6; anything else is refused listing
-        the three layouts. Startup prints the recorded base (head.pt `base` +
-        `base_revision`, model.json `model_id` + `revision`); the only check is
-        head input size vs the base `config.json` hidden_size (refused: the scorer
-        would fail after the load). Model name = the adapter directory's name
-        (repo root for `.../package/checkpoint`), plus `jev-latest`; chat endpoints
-        answer 501 with the reason; `/v1/models` lists the decision model only.
-        `--decision-level/-prior/-max-rotations` are refused with
-        `--decision-adapter`; `--decision-temperature T` overrides the head
-        temperature (needs `--decision-adapter`). `tools/decision_real_check.py`
-        (kev's `Checkpoint.load` FP32 with `head.pt`'s base pointed at the local
-        base; jev's `compile_request` + uncached `DecisionModel.forward` +
-        `Predictor.predict`); `anyjev_real_check.py` now imports its HTTP helper.
-        Smoke tests with `--fp32` on both pico fixtures: PASS, max abs difference
-        4.6e-5 (Kev) and 4.0e-5 (Open-Jev), the server's 4-decimal rounding.
-        Not optimized: the engine still builds the LM head (248320 x hidden),
-        which Kev/Open-Jev never compute; D2.6's head-less import could be reused.
-        The hidden-size refusal was run by hand (fixture config with hidden_size 32).
-  - [x] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
-        `model.` prefix and without `lm_head` (build ends at the final norm). Pico
-        fixture in that layout.
-        Done: the real kev-27b `config.json` is flat (`model_type` `qwen3_5_text`,
-        no `text_config`, `tie_word_embeddings` false) and its 850 tensors are
-        `embed_tokens`, `layers.N.*` and `norm` only. The config reader already
-        took the flat form and the builder already found prefix ''; the change is
-        `qwen3_5_text` in `PretrainedModelTypeCanBorrowWeights` (dispatch + twins)
-        and `BuildFromPretrained(..., pOmitLMHead)` (Llama builder only; the net
-        ends at the final RMSNorm, lm_head is neither required nor loaded, a tied
-        embedding still loads). `TChatOptions.OmitLMHead` passes it to every
-        build including the `--prefill-window` twins, points every session's
-        `HiddenLayer` at the last layer (`TNNetStreamingDecoder.SetHiddenLayer`;
-        `ContrastiveHiddenLayer` would pick the pre-norm layer), and makes
-        `GenerateFromIds` and `ScoreDecisionBranch` with Logits raise.
-        ChatServer sets it for every `--decision-adapter` layout. Kev full weights:
-        the model directory must be the checkpoint directory itself (`ChatServer
-        kev-27b/ --decision-adapter kev-27b/`), nothing merged; that directory
-        without `--decision-adapter` is refused. Fixture `tests/fixtures/
-        kev_full_qwen3_5/` (88 KB) by `tools/kev_full_tiny_fixture.py`: the
-        kev_qwen3_5 backbone merged by kev's loader (float32), saved untied by
-        `save_pretrained` as `Qwen3_5TextModel` + head.pt `weights="full"`;
-        oracle `Checkpoint(dir).load` (full path, float64) + `admit` + `probs`.
-        p within 2.2e-6. Head-less vs LM-head builds: bit-identical probabilities
-        on the Kev and Open-Jev fixtures (also through a width-4 twin); the pico
-        net drops 1 layer and 6528 = 408 x 16 weights; Kev-0.8B saves 254M
-        weights (1.0 GB FP32), Kev-27B 1.27G (5.1 GB FP32, ~1.3 GB int8).
-        `tools/decision_real_check.py` takes the full layout and `--dtype
-        bfloat16`; server smoke test on the fixture (`--fp32`): PASS, 4.6e-5.
   - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
         Open-Jev-2B against their Python servers; commands written by the agents.
         Commands (ChatServer.md *Trained decision checkpoints*); PASS = max abs
@@ -4725,13 +1854,7 @@ rather than acted on.
         python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
         kill %1
         ```
-        - [x] Open-Jev-2B (2026-10-19, user box): `Qwen/Qwen3.5-2B` at
-              15852e8c16360a2fea060d615a32b45270f8a8fc + `ZefanCai/Open-Jev-2B`,
-              `ChatServer q2b/ --gpu --int4 --port 5000 --decision-adapter Open-Jev-2B`,
-              called with `DecisionClient`: sensible answers; an obviously urgent
-              ticket gave a high P(true), an obviously calm one a low P(true). Now
-              SUPPORTED in the docs. The `--fp32` `decision_real_check.py` parity run
-              was not part of this check.
+        - Open-Jev-2B: sanity check done on the user box 2026-10-19 (`--gpu --int4`, now SUPPORTED); its `--fp32` parity run above is still open.
         - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
         - [ ] AnyJev L0: ran on a 0.5B chat checkpoint, but the yes/no answer was
               questionable; stays planned (coded).
@@ -4774,15 +1897,14 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [ ] Reshape/gather glue: `TNNetReshape`, `TNNetCrop`, `TNNetPadXY`,
+- [ ] Reshape/gather glue: `TNNetCrop`, `TNNetPadXY`,
       `TNNetTransposeXD`, `TNNetDepthToSpace`, `TNNetGatherTokens`,
       `TNNetConcat`. None has a device path, and several sit between attention
       and FFN in the importers, so each one evicts the chain. For most of these
       a kernel is the wrong answer: the bytes do not change, only the shape, so
       the layer should re-label the resident buffer (a view) rather than copy
-      it. Scope `TNNetReshape` FIRST as the test case for that view mechanism —
-      whether `OpenCLOutputBuffer()` can hand back the source's buffer with a
-      different declared shape — then apply the outcome to the rest.
+      it. `TNNetReshape` already does this (its `OpenCLOutputBuffer()` hands
+      back the source's buffer); apply the same view mechanism to the rest.
       `TNNetCrop`/`TNNetPadXY`/`TNNetTransposeXD` DO move bytes and need a real
       copy/gather kernel; keep the two halves separate.
 - [ ] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward.
@@ -4791,12 +1913,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       whether re-parenting onto `TNNetGLUGateBase` (with the ReLU gate as the
       activation opcode) is the whole fix before writing a kernel.
 - [ ] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
-      `TNNetFiLM`, `TNNetMulByConstant`, `TNNetAddConstant`, `TNNetAvgChannel`.
+      `TNNetFiLM`, `TNNetAvgChannel`.
       All are one scale/shift per channel over a resident volume.
       `TNNetChannelMulByLayer` and `TNNetCellMulByCell` already show the
       two-source resident pattern, and `TNNetFiLM` is that same shape, so it
-      follows them directly; the constant-parameter ones fit the
-      `cai_activation` ParamA/ParamB convention.
+      follows them directly.
 - [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
       per token, but the router sits between two resident MoE banks, so running
       it on the host costs two transfers per token. Only worth landing together
@@ -4859,13 +1980,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       on. The per-sample weight modulation/demodulation folds into the column
       gather, so this is a conv kernel with a scaled weight slab, not a new
       contraction.
-- [ ] The decoder upsample inverses: `TNNetDeMaxPool`, `TNNetDeAvgPool`,
-      `TNNetUpsample`, plus `TNNetMaxPoolPortable`. `TNNetMaxPool` and
-      `TNNetAvgPool` have kernels but their inverses do not, so UNet, SD UNet,
-      the VAE decoder, RRDBNet, StyleGAN2, Mask R-CNN and SuperResolution all
-      drop to the host on every upsample step. `TNNetMaxPoolPortable` is a
-      different fault - it overrides `Compute` and loses the pooling kernel it
-      inherits - and it sits in the ResNet, Inception-V3 and DETR stems.
+- [ ] `TNNetMaxPoolPortable` device forward. It overrides `Compute` and loses
+      the pooling kernel it inherits from `TNNetMaxPool`, and it sits in the
+      ResNet, Inception-V3 and DETR stems.
 - [ ] Vision attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,
@@ -4881,7 +1998,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
 - [ ] Extend the reshape/gather glue item above to its vision members. Pure
-      re-label, so they want the view mechanism `TNNetReshape` is scoping:
+      re-label, so they want the view mechanism `TNNetReshape` already uses:
       `TNNetDepthToSpace`, `TNNetSpaceToDepth`, `TNNetInterleaveChannels` and
       the MobileViT trio (`TNNetMobileViTFold`, `TNNetMobileViTUnfold`,
       `TNNetMobileViTPatchSegments`, which are three reshapes wearing a
@@ -4893,11 +2010,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       `TNNetMovingStdNormalization` (ConvNeXt, RIFE, StyleGAN2, SAM, the moving
       -norm blocks). Same one-scale-and-shift-per-channel shape as the
       `TNNetChannelBias`/`TNNetChannelMul`/`TNNetFiLM` group.
-- [ ] Activations with no `cai_activation` opcode, all reachable from the
-      vision and audio towers: `TNNetErf`, `TNNetGEGLU`, `TNNetGEGLUErf`,
-      `TNNetGLU` (Conformer) and `TNNetSwishLearnable`. `TNNetReGLU` is listed
-      above. Each is an opcode plus a `neural.cl` switch case, except the
-      gated ones, which need the `TNNetGLUGateBase` split-and-multiply shape.
+- [ ] Activations with no `cai_activation` opcode, reachable from the
+      vision and audio towers: `TNNetErf` and `TNNetSwishLearnable`.
+      `TNNetReGLU` is listed above.
       These are the vision and audio members of the full opcode gap; the
       activation subsection below carries the whole list and the two cautions
       that come with it.
@@ -4911,9 +2026,8 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       whose kernel is generated (sinc band-pass) or dilated, so the existing
       conv offload applies once the kernel slab is materialized; the closest
       thing to a free win on the audio side.
-- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN), `TNNetGLU` (Conformer, also
-      listed with the activations) and `TNNetFlipX`. `TNNetFlipX` is the one
-      host hop inside an otherwise device-capable bidirectional stack -
+- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN) and `TNNetFlipX`. `TNNetFlipX`
+      is the one host hop inside an otherwise device-capable bidirectional stack -
       `TNNetLSTMCell` and `TNNetGRUCell` both have kernels - and reversing a
       sequence is a copy kernel or, better, an index flip in the consumer.
 
@@ -4945,57 +2059,11 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [x] Widen the fused GEMM tail beyond ReLU/Sigmoid/Tanh, starting with
-      Swish/SiLU and GELU. The math already exists as `cai_activation` opcodes
-      4 and 5, parity-tested, so this is mostly moving code: extend the tail's
-      switch, widen `IsActivationFunctionInOpenCL` to match, and dedup the
-      THREE copies of the tail (`cai_dot_product` inline,
-      `cai_dot_product_int8` inline, `cai_fused_act`) through the helper that
-      already exists. Why it matters beyond one saved kernel launch: when the
-      verdict is false, `TNNetConvolution.ComputeOpenCL` does not merely skip
-      the fusion — it sets `FOutputOnOpenCL := false`, downloads `FOutputRaw`
-      and runs the bias add and the activation sweep on the host, so the whole
-      residency chain breaks at the GEMM. Today only
-      `TNNetConvolutionSwish`, `TNNetConvolutionHardSwish` (the CAI CIFAR
-      examples) and `TNNetFullConnectDiff` carry a non-fusable fused
-      activation, since the importers build Linear convolutions with separate
-      activation layers — so measure before assuming a win, and treat the
-      residency break as the reason rather than the launch count.
-      DONE: `cai_fused_act` moved to the top of `neural.cl` and gained opcodes
-      4, 5 and 7, and it is now the ONLY copy of that math — `cai_dot_product`,
-      `cai_dot_product_int8`, the split-K reduce and `cai_activation`'s own
-      cases for those opcodes all call it (four copies collapsed into one).
-      `IsActivationFunctionInOpenCL` accepts `@Swish` and `@HardSwish`, so
-      those convolutions and FullConnects now fuse and stay resident.
-      Device-vs-CPU parity cases added to all three harnesses — `TestConvDeviceIm2ColOpenCLParity` (FP32,
-      9.5e-7), `TestInt8QuantizedOpenCLParity` (int8 GEMM, 3.9e-7) and
-      `TestInt8SplitKOpenCLParity` (split-K, 2.0e-6) — and the conv harness now
-      asserts `OutputBindableOnOpenCL` so a silent fallback to the host can no
-      longer pass as parity. Suite 2837/0/0 on both the scalar and the
-      `-dOpenCL` build. Two notes: the tail's ReLU is now `(v > 0) ? v : 0`
-      like `cai_activation`, which differs from the old `if (v < 0) v = 0` only
-      in returning +0.0f for a -0.0f input; and GELU rides in the kernel but no
-      host layer can request it yet — `TNNetGELU` is a standalone layer and
-      there is no `@GELU` activation-function pointer, so the complete set a
-      layer can carry is Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish/DiffAct.
-  - [x] `@HardSwish` (opcode 7) landed the same way in a follow-up, so
-        `TNNetConvolutionHardSwish` fuses and stays resident too. Opcodes 6
-        (GELUErf) and 8 (HardSigmoid) followed, so `cai_fused_act` now holds
-        EVERY parameterless opcode (1-8) and `cai_activation` keeps only the
-        parameterized cases (9, 10, 15, 18-21, 24). The remaining limit is on
-        the host, not in the kernel: GELU, GELUErf and HardSigmoid exist only as
-        standalone layers with no activation-function pointer, so no layer can
-        request them fused, and `@DiffAct` is the one pointer with no opcode.
-        Fused parity cases for Swish and HardSwish (bias and bias-suppressed)
-        live in `TestConvActivationFusionOpenCLParity` and
-        `TestFullConnectActivationFusionOpenCLParity`;
-        `TestActivationOpenCLParity` already sweeps all 30 standalone variants,
-        which covers the delegation for 6 and 8.
-- [ ] The 34 elementwise activations with no `cai_activation` opcode, all
+- [ ] The 33 elementwise activations with no `cai_activation` opcode, all
       `TNNetReLUBase` descendants: `TNNetErf`, `TNNetExp`, `TNNetLog`,
       `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetArcSinh`, `TNNetSinhAct`,
       `TNNetReciprocal`, `TNNetPower`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
-      `TNNetPhish`, `TNNetSnake`, `TNNetSinc`, `TNNetLisht`,
+      `TNNetPhish`, `TNNetSinc`, `TNNetLisht`,
       `TNNetLogCoshActivation`, `TNNetLogSigmoid`, `TNNetTanhExp`,
       `TNNetTanhShrink`, `TNNetLeCunTanh`, `TNNetPenalizedTanh`,
       `TNNetSoftPlus`, `TNNetSoftPlusBeta`, `TNNetSoftExponential`,
@@ -5009,8 +2077,8 @@ cannot pay for its own transfer.
       and `TNNetESwish` raise hardware FP exceptions at far-extreme inputs on
       the host (see the FP-exception item in the test section), so pick the
       clamping policy there BEFORE pinning device parity. The gated
-      activations (`TNNetGEGLU`, `TNNetGLU`, `TNNetReGLU`, `TNNetGEGLUErf`)
-      are a different shape and stay with the `TNNetGLUGateBase` items above.
+      `TNNetReGLU` is a different shape and stays with the `TNNetGLUGateBase`
+      item above.
 - [ ] The 11 per-channel LEARNABLE activations, which need a kernel shape the
       current one does not have — a parameter VECTOR indexed by channel rather
       than the scalar `FParamA`/`FParamB`/`FParamC`: `TNNetPReLU`,
@@ -5030,34 +2098,17 @@ cannot pay for its own transfer.
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
       importer). The single-cell `TNNetLSTMCell`/`TNNetGRUCell` (torch fused
       `weight_ih`/`weight_hh` gate layout, full forward + exact BPTT) have landed.
-      DONE: `TNNet.AddBidirectionalLSTM(Hidden,NumLayers,Bidirectional)` and
-      `AddBidirectionalGRU(...)` builders (shared `AddBidirectionalRecurrentStack`
-      engine) — pure composition of cells + `TNNetFlipX` reversal + `TNNetDeepConcat`
-      ([forward;backward] torch concat order); multi-layer feeds layer k's output
-      into k+1, each direction gets a `TNNetPointwiseConvLinear` projection to
-      Hidden when incoming Depth≠Hidden (covers layer 0 and the 2*Hidden→Hidden
-      feed above a bidirectional layer, matching nn.LSTM input_size). Tests:
-      builder wiring/shape/SaveToString round-trip (LSTM+GRU), unidirectional
-      1-layer == bare cell equivalence, bidirectional forward-half == forward cell
-      alone (pins concat order), and a 2-layer bidirectional stack input-gradient
-      check (all in TestNeuralNumerical, passing; full suite green 2376/0/0). This
-      was applied to the pyannote `segmentation-3.0` trunk, which now uses true
-      nn.LSTM cells.
-  - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up: the
-        `AddBidirectionalRecurrentStack` engine inserts a learned
-        `TNNetPointwiseConvLinear` projection on every incoming Depth≠Hidden feed
-        (layer-0 input_size≠Hidden, and the 2*Hidden→Hidden feed above each
-        bidirectional layer). torch nn.LSTM/nn.GRU has NO such projection — layer
-        k's `weight_ih_l{k}` is a plain `[gates*Hidden, 2*Hidden]` slab consuming
-        the concatenated [forward;backward] hidden directly. To import a real
-        multi-layer bidirectional checkpoint, add an opt-in builder mode that
-        feeds the 2*Hidden concat straight into the next layer's cell (cell
-        input_size = 2*Hidden, no projection) so the torch `weight_ih_l{k}` rows
-        map 1:1. Then extend `LoadTorchLSTMInto`/`LoadTorchGRUInto` to accept that
-        projection-free stack and drop the loud rejection; add a 2-layer
-        bidirectional pico-oracle parity fixture (the generator already supports
-        the shape — `tools/torch_rnn_tiny_fixture.py`). Unblocks the pyannote
-        `segmentation-3.0` real bidirectional-LSTM trunk drop-in.
+      The `AddBidirectionalLSTM`/`AddBidirectionalGRU` builders exist too.
+  - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up, GRU half and
+        the multi-layer fixture: the LSTM half exists (`CellsReadInputWidth`
+        builds projection-free `TNNetLSTMCell.Create(Hidden)` cells that
+        `LoadTorchLSTMInto` loads), but `AddBidirectionalRecurrentStack` still
+        inserts a learned `TNNetPointwiseConvLinear` projection on every
+        incoming Depth≠Hidden feed for GRU cells, which torch nn.GRU does not
+        have, so `LoadTorchGRUInto` rejects those stacks. Give `TNNetGRUCell`
+        the same any-input-width form, then add a 2-layer bidirectional
+        pico-oracle parity fixture for LSTM and GRU (the generator already
+        supports the shape — `tools/torch_rnn_tiny_fixture.py`).
 
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
@@ -5068,29 +2119,6 @@ cannot pay for its own transfer.
       does not map onto the `FDotCL` matmul kernel without a chunked-scan rewrite.
       Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
       inter-chunk running state), then add a causal parity test alongside.
-
-- [X] AVX-vectorize the remaining trig/inverse-hyperbolic activation FORWARD
-      loops left scalar: `TNNetSin` / `TNNetCos` / `TNNetArcSinh`. DONE — added
-      three dedicated 8-wide AVX2 kernels to `neuralvolume.pas`: `AVXLn` (Cephes
-      `logf`, x=m*2^e decompose + degree-8 poly in (m-1)), `AVXSinCos` (Cephes
-      `sinf`/`cosf` with 3-part Cody-Waite pi/4 range reduction, octant sign/poly
-      select via `vpandn`/`vblendvps`; cos uses the `(~m)&4` sign and `(m&2)==0`
-      poly convention), plus alias-safe class wrappers `TNNetVolume.VectorLn` /
-      `VectorSin` / `VectorCos`. `VectorArcSinh` = `ln(x+sqrt(x^2+1))` is built on
-      `VectorLn` (scratch-buffer prep so dst may alias src). 32-bit / non-AVX2
-      builds fall back to scalar RTL loops (register pressure on the bit-tricks).
-      `TNNetSin.Compute` / `TNNetCos.Compute` / `TNNetArcSinh.Compute` converted to
-      the new vector primitives (forward vectorized; derivative filled by a scalar
-      finishing pass reading x back, so backward math is byte-identical). Parity
-      tests `TestVectorLnScalarParity` / `TestVectorSinScalarParity` /
-      `TestVectorCosScalarParity` / `TestVectorArcSinhScalarParity` (< 1e-4,
-      body+tail+aliased+large-magnitude) green on both builds; measured AVX2 max abs
-      err ~2.4e-7 (ln), ~6e-8 (sin/cos), ~4.8e-7 (arcsinh). Earlier `TNNetSinhAct`
-      was DONE via two `VectorExp` passes (`VectorSinh`). Earlier tanh/erf batch:
-      `TNNetGELU`, `TNNetGELUErf`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
-      `TNNetPhish`, `TNNetLogCoshActivation`, `TNNetLisht` vectorized via
-      `VectorTanh`/`VectorErf` (built on `VectorExp`); parity tests
-      `TestVectorTanhScalarParity` / `TestVectorErfScalarParity` (< 1e-4) green.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
@@ -5162,14 +2190,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
       memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
       mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
-- [ ] SDPA-level KV-cache aliasing for GQA decode (follow-up to the GQA
-      verification batch, commit c1f8c8a): `AddMultiHeadGroupedQueryAttention`'s
-      PARAMETER saving is real, but at decode time `TNNetStreamingDecoder` keeps
-      one KV cache per SDPA layer, so the QueryHeads/KVHeads heads in a group
-      each cache an identical K/V copy. Let grouped SDPA layers share a single
-      KVHeads-sized cache (cache aliasing keyed by the shared K/V projection
-      layers) so the GQA memory win materializes at inference; assert streamed
-      output stays bit-identical to the unaliased path.
 - [ ] Segment-mask MHA-builder wiring follow-up (the SDPA-layer + packer half
       landed above): thread an optional segment-id source through the
       multi-head attention BUILDERS (AddMultiHeadSelfAttention and friends) so
@@ -5333,26 +2353,6 @@ then — only int8 + MXFP4-dequant did.)
         Llama/Qwen slicer fixture is RAM/network-gated; today's parity is the
         random pico numpy oracle only.
 
-## Accelerator & dedup batch 2026-06-27f
-
-(All LANDED and removed: OpenCL softmax-head offload — new `cai_softmax` kernel +
-`TNNetSoftMaxCL` host helper for `TNNetPointwiseSoftMax`/`TNNetSoftMax`, commit
-e8042aa0; AVX `TNNetReLU` forward via `AVXCopyRelu`, commit 10433bfd; AVX
-SoftPlus/Gaussian/SoftExponential forwards via `AVXExp` — note `AVXExp`'s scalar
-remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
-[-88,88] before the call, commit 3e5e649d. Open follow-ups surfaced by this batch:)
-
-- [x] Keep the softmax-head activation resident on the OpenCL device across the
-      SDPA score-matrix producer -> `cai_softmax` -> consumer chain. The new
-      `cai_softmax` offload (e8042aa0) still uploads/downloads the volume per call;
-      when the producer is already device-resident this is a wasted round-trip.
-      Tie into the existing "keep activations resident across consecutive offloaded
-      layers" follow-up in the vision/generative section so attention blocks chain
-      device-side. Forward-only, parity-tested, skip-clean when no device.
-      DONE: TNNetPointwiseSoftMax binds a resident source and leaves its result in
-      OpenCL memory, so the SDPA producer -> cai_softmax -> consumer chain stays
-      device-side; TNNetSoftMax shares the same helper.
-
 ## Lucky-day batch 2026-06-28f (follow-ups surfaced by 28e landings)
 
 (All three 28e items LANDED: Heun sampler [891e7537], Min-SNR-gamma loss
@@ -5375,39 +2375,6 @@ surfaced while landing them:)
       (trained) checkpoint so users know the quality trade-off. Pure host /
       analysis; no new layer.
 
-## Lucky-day batch 2026-06-28g (follow-ups surfaced by 28g landings)
-
-(All five 28g items LANDED and removed: SDPA attention-variant OpenCL safety
-guard for all four variants + correct ALiBi device offload [9957892f]; AVX
-`TNNetSoftPool` [6e373ae4]; AVX `TNNetCumSum` depth-axis [ff593de0];
-`TNNetFiniteScalarQuant`/FSQ [dfaa9c41]; `TNNetLookupFreeQuant`/LFQ [8cfaea3b].
-The open OpenCL follow-up LANDED and removed: device offload for the remaining
-three SDPA variants (cosine-sim / disentangled / conformer) via per-variant
-EnableOpenCL + ComputeOpenCL, gathered position dots stay on the CPU gap, new
-CosineSimilarity/Disentangled/ConformerRelPosAttentionOpenCLParity tests RAN on
-PoCL at max|diff| ~1e-7, suite 2493/2493 on both builds [914cbdc9].)
-
-## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup) — ALL LANDED
-
-(All three 28h items LANDED and removed: AVX-vectorized SDPA `ComputeTiled`
-online-softmax accumulation via `TNNetVolume.Mul`/`MulAdd` depth-contiguous ops,
-tiled-vs-naive parity green on scalar + -dAVX2 [02d11b09]; fused-QKV unpackers
-unified into `LoadFusedQKVWeights` + `TQKVPackLayout` enum, three importer
-wrappers preserved, pico fixtures bit-identical [6083a4d0]; GPT-2/Llama/Cohere/
-Bark affine norm-weight loaders unified into `LoadAffineNormWeights`, four thin
-wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
-
-## Lucky-day batch 2026-06-28i (verified-novel vision dedup / AVX / torch port) — ALL LANDED
-
-(All three 28i items LANDED and removed: reusable `TNNetGridSample` layer — torch
-`F.grid_sample` bilinear/nearest x zeros/border x align_corners, with a shared
-`NeuralBilinearGatherColumn` depth-column gather helper that `TNNetAffineGridSample`
-now delegates to [d9f91ab4]; AVX-vectorized `TNNetDeformableConv` bilinear gather
-routed through that same shared helper (+ DCNv2 sigmoid modulation applied after the
-gather), forward bit-identical / backward parity-tested [ab92389f]; reusable
-`TNNet.AddPatchEmbedding` ViT patchify builder (conv-stride-patch -> reshape ->
-optional CLS + positional embedding) + `examples/TinyViT` regression [91024a9e].)
-
 ## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port) — ALL THREE LANDED
 
 (All three 28j items LANDED and removed: AVX per-channel + OpenCL per-depth
@@ -5422,60 +2389,3 @@ round-trip (commit e37d07bb). Open follow-ups surfaced by the Resize2D landing:)
       of v1 (it changes the kernel support to scale-dependent, breaking the fixed
       2-tap / 4-tap separable gather; torch's antialias widens the kernel and
       renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
-- [X] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
-      risk note said not to force it. `TNNetBilinearUpsample`/`Upsample` keep
-      their OpenCL gather/scatter paths. The OpenCL forward IS NOW DONE (the dedup
-      was deliberately left out): `TNNetResize2D.EnableOpenCL`/`ComputeOpenCL`
-      reuse `TNNetBilinearGatherCL` (4 corners, bilinear mode) and
-      `TNNetBicubicGatherCL` (16 corners, bicubic mode) exactly as
-      `TNNetBilinearResize`/`TNNetBicubicUpsample` do; the SIZE-based source maps
-      (`BilinearResizeMap`/`BicubicResizeMap`) drive the gather, nearest stays a
-      pure host Move, backward stays on the CPU, host round-trip is the
-      `FShouldOpenCL` fallback. `TestResize2DOpenCLParity` covers bilinear
-      upscale/downscale/rectangular + bicubic upscale/rectangular vs CPU < 1e-4
-      (ran on the PoCL CPU device); skips cleanly with no device.
-
-## Lucky-day batch 2026-06-28k (verified-novel AVX / dedup / OpenCL — generative vision)
-
-(Checked against `neural/*.pas` before listing on 2026-06-28. `TNNetAdaIN`
-exists with a full CPU `Compute`/`Backpropagate` but has NO `ComputeOpenCL`/
-`EnableOpenCL` — `grep -c 'TNNetAdaIN.ComputeOpenCL' neuralnetwork.pas` = 0 — and
-its forward uses strided per-channel scalar access, unlike the AVX'd GroupNorm/
-L2Normalize/PixelNorm reductions that already landed.)
-
-- [X] AVX + dedup the `TNNetAdaIN.Compute` per-channel spatial statistics, and
-      add a forward-only OpenCL offload. (DONE commit 1d86f6b3: depth-contiguous
-      Add/MulAdd reduction, shared `NeuralPerChannelMeanInvStd` helper reused by
-      GroupNorm ChannelsPerGroup=1 fast path, `cai_group_norm` Groups=Depth OpenCL
-      offload; `TestAdaINForwardAVXParity` 3.58e-7 + `AdaINOpenCLParity`.) AdaIN (Adaptive Instance Normalization,
-      Huang & Belongie 2017) is the core layer of `examples/AdaINStyleTransfer`
-      and the StyleGAN-style generators. Today its forward computes the content
-      mean/variance and the style mean/variance with FOUR nested
-      `for CntX/CntY` loops that index `ContentOut[CntX, CntY, C]` /
-      `StyleOut[CntX, CntY, C]` ONE element at a time — the stride-`Depth`
-      column-gather pattern the depth-axis-contiguous rule warns against
-      (`neuralnetwork.pas` ~line 44034). Every other per-channel/per-position
-      reduction in the library was already converted to a depth-contiguous AVX
-      accumulation: GroupNorm reduces each `(x,y)` column with `DotProduct`
-      against a ones vector (~line 64560), and the per-CHANNEL L2Normalize path
-      accumulates `ss[d] += x[d]*x[d]` over whole depth columns via the 3-pointer
-      `TVolume.MulAdd` form (commit b01eab21). Do the same here: walk the spatial
-      positions ONCE, accumulating per-channel `sum[d] += col[d]` (via `Add`) and
-      `sumsq[d] += col[d]*col[d]` (via `MulAdd`) into two `Depth`-length scratch
-      vectors, then finish mean/inv-std element-wise — no transpose, no
-      stride-`Depth` scalar gather. The content half of this is exactly the
-      InstanceNorm reduction (`TNNetInstanceNorm` = `TNNetGroupNorm` with
-      `Groups=Depth`, where GroupNorm's column `DotProduct` degenerates to a
-      single-element call per `(x,y)`), so factor the per-channel mean/inv-std
-      accumulation into a shared `NeuralPerChannelMeanInvStd` helper that AdaIN
-      and InstanceNorm both call (dedup, not a fork). Then add
-      `TNNetAdaIN.EnableOpenCL`/`ComputeOpenCL`: the content instance-normalize
-      reuses the existing per-position reduction kernel family (`cai_group_norm`
-      with `Groups=Depth`, or the `cai_l2norm_perdepth` mean/rsqrt shape) and the
-      `style_std*(x-mean)*inv_std + style_mean` affine is a per-channel
-      scale+shift on the device — keeping a device-resident generator stack from
-      bouncing the activation to the host between convs. Forward-only (backward,
-      and the `FNormContent`/`FContentMean`/`FContentInvStd` caches it needs, stay
-      on CPU); parity-test scalar-vs-AVX (wide `Depth`, `SizeX<>SizeY`) and
-      device-vs-CPU, skip-clean when no device. Hot path of `AdaINStyleTransfer`
-      and `StyleGAN2Generate`.
