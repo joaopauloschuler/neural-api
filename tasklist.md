@@ -2022,10 +2022,15 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       whose kernel is generated (sinc band-pass) or dilated, so the existing
       conv offload applies once the kernel slab is materialized; the closest
       thing to a free win on the audio side.
-- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN) and `TNNetFlipX`. `TNNetFlipX`
-      is the one host hop inside an otherwise device-capable bidirectional stack -
-      `TNNetLSTMCell` and `TNNetGRUCell` both have kernels - and reversing a
-      sequence is a copy kernel or, better, an index flip in the consumer.
+- [X] `TNNetFlipX`, the one host hop inside an otherwise device-capable
+      bidirectional stack. Done: its forward is a `cai_gather_copy` plan (the X
+      axis table reversed), covered by `TestGatherCopyOpenCLParity` and the
+      resident chain of `TestGatherCopyResidentOpenCLParity`. `TNNetFlipY` and
+      `TNNetReverseXY` are the same shape of plan and still run on the host.
+- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
+      new kernel (per-channel softmax over time, then the two weighted moments)
+      reading two sources, the features and `FLogitLayer`. It runs once per
+      utterance and reduces T x C to 2C, so its host hop is one T x C download per source.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

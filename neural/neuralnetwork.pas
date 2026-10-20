@@ -13294,6 +13294,11 @@ type
   // the same involution to OutputError.
   // Coded by Claude (AI).
   TNNetFlipX = class(TNNetIdentity)
+    private
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -54277,6 +54282,28 @@ end;
 
 { TNNetFlipX }
 
+{$IFDEF OpenCL}
+function TNNetFlipX.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetFlipX.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  OutX, MaxOutX: integer;
+begin
+  // Output (x, y, d) reads source (SizeX - 1 - x, y, d).
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeY, Src.SizeX * Src.Depth);
+  Plan.AddAxis(Src.SizeX, Src.Depth);
+  MaxOutX := Src.SizeX - 1;
+  for OutX := 0 to MaxOutX do
+    Plan.SetAxisSource(OutX, MaxOutX - OutX);
+  Plan.AddAxis(Src.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetFlipX.Compute();
 var
   CntX, CntY, MaxX, MaxY, Depth, DepthBytes: integer;
@@ -54285,7 +54312,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
