@@ -503,6 +503,13 @@ type
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
+    // Per-channel affine glue, ForceOpenCL off: TNNetInput -> ReLU -> ChannelMul
+    // -> ChannelBias -> ReZero -> CellBias -> DeepConcat -> AvgChannel -> FiLM ->
+    // AvgPool -> ReLU stays resident (sentinels, transfers, weight refresh).
+    procedure TestChannelAffineResidentOpenCLParity;
+    // TNNetFiLM with a host-only conditioning vector: the feature map is bound,
+    // the vector is uploaded per forward.
+    procedure TestFiLMHostCondOpenCLParity;
     // OpenCLLocalSizeCap: each chosen local size divides its global size, and a
     // forward on odd/composite shapes matches the driver-chosen local size.
     procedure TestOpenCLLocalSizeCapParity;
@@ -69303,6 +69310,241 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestChannelAffineResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csDepth = 8;
+  csChainCount = 9;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  InputLayer, ReZeroLayer, CellBiasLayer, ConcatLayer, AvgChannelLayer: TNNetLayer;
+  ReLULayer, ChannelMulLayer, ChannelBiasLayer, FiLMLayer, AvgPoolLayer: TNNetLayer;
+  ChainLayers: array[0..csChainCount - 1] of TNNetLayer;
+  OutCPU: array[0..csChainCount - 1] of TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, Pos, SentinelSurvivors, SentinelCount, MaxPos: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter, TransfersRefresh: TOpenCLTransferCounts;
+  MaxDiff, LayerDiff, RefreshDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261020;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, csDepth);
+  Expected := TNNetVolume.Create();
+  for LayerPos := 0 to csChainCount - 1 do
+    OutCPU[LayerPos] := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 4, csDepth));
+    ReLULayer := NN.AddLayer(TNNetReLU.Create());
+    ChannelMulLayer := NN.AddLayer(TNNetChannelMul.Create());
+    ChannelBiasLayer := NN.AddLayer(TNNetChannelBias.Create());
+    ReZeroLayer := NN.AddLayer(TNNetReZero.Create(0.7));
+    CellBiasLayer := NN.AddLayer(TNNetCellBias.Create());
+    // (4,4,2*Depth) averaged to the (1,1,2*Depth) gamma|beta FiLM reads.
+    ConcatLayer := NN.AddLayer(TNNetDeepConcat.Create([ReZeroLayer, CellBiasLayer]));
+    AvgChannelLayer := NN.AddLayer(TNNetAvgChannel.Create());
+    FiLMLayer := NN.AddLayer(TNNetFiLM.Create([CellBiasLayer, AvgChannelLayer]));
+    AvgPoolLayer := NN.AddLayer(TNNetAvgPool.Create(2));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.SetTrainable(False, False);
+    ChainLayers[0] := ReLULayer;
+    ChainLayers[1] := ChannelMulLayer;
+    ChainLayers[2] := ChannelBiasLayer;
+    ChainLayers[3] := ReZeroLayer;
+    ChainLayers[4] := CellBiasLayer;
+    ChainLayers[5] := ConcatLayer;
+    ChainLayers[6] := AvgChannelLayer;
+    ChainLayers[7] := FiLMLayer;
+    ChainLayers[8] := AvgPoolLayer;
+    for Pos := 0 to csDepth - 1 do
+    begin
+      ChannelMulLayer.Neurons[0].Weights.Raw[Pos] := 0.5 + 0.17 * Pos;
+      ChannelBiasLayer.Neurons[0].Weights.Raw[Pos] := 0.05 * Pos - 0.2;
+    end;
+    CellBiasLayer.Neurons[0].Weights.RandomizeGaussian();
+    ChannelMulLayer.FlushWeightCache();
+    ChannelBiasLayer.FlushWeightCache();
+    CellBiasLayer.FlushWeightCache();
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := Sin(Pos * 0.37);
+
+    NN.Compute(Input);
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Copy(ChainLayers[LayerPos].Output);
+    Expected.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // A download or a host forward of any chain layer would overwrite these.
+    SentinelCount := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].Output.Fill(csSentinel);
+      Inc(SentinelCount, ChainLayers[LayerPos].Output.Size);
+    end;
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+    SentinelSurvivors := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+      for Pos := 0 to ChainLayers[LayerPos].Output.Size - 1 do
+        if ChainLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+          Inc(SentinelSurvivors);
+    Write('  Channel affine chain resident: per-layer max|diff|=');
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsDiffToOutput(OutCPU[LayerPos], ChainLayers[LayerPos].Output);
+      Write(ChainLayers[LayerPos].ClassName, '=', LayerDiff:0:9, ' ');
+      MaxDiff := Max(MaxDiff, LayerDiff);
+    end;
+    WriteLn('sentinels=', SentinelSurvivors, '/', SentinelCount, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    for LayerPos := 0 to csChainCount - 1 do
+      AssertEquals(ChainLayers[LayerPos].ClassName +
+        ' ran both forwards on OpenCL', 2, ChainLayers[LayerPos].ForwardGPUCnt);
+    AssertEquals('the chain is bound, not downloaded', SentinelCount,
+      SentinelSurvivors);
+    // The input is the only upload: the unchanged weight tables stay resident.
+    AssertEquals('uploads per forward', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('channel affine chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+
+    // A weight update must reach the resident table on the next forward.
+    for Pos := 0 to csDepth - 1 do
+      ChannelMulLayer.Neurons[0].Weights.Raw[Pos] := 1.3 - 0.11 * Pos;
+    ChannelMulLayer.FlushWeightCache();
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersRefresh := OpenCLProcessTransferTotals();
+    ReLULayer.ForceOutputOnRAM();
+    ChannelMulLayer.ForceOutputOnRAM();
+    RefreshDiff := 0;
+    MaxPos := ChannelMulLayer.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+      RefreshDiff := Max(RefreshDiff, Abs(ChannelMulLayer.Output.Raw[Pos] -
+        ReLULayer.Output.Raw[Pos] *
+        ChannelMulLayer.Neurons[0].Weights.Raw[Pos mod csDepth]));
+    WriteLn('  after a weight update: uploads=',
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount,
+      ' ChannelMul max|diff|=', RefreshDiff:0:9);
+    AssertEquals('the changed table is uploaded once', 2,
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount);
+    AssertTrue('ChannelMul reads the updated weights: max |diff| = ' +
+      FloatToStr(RefreshDiff), RefreshDiff = 0);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Free;
+    Expected.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestFiLMHostCondOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csDepth = 8;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  ReLULayer, ConcatLayer, CondLayer, FiLMLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos, SentinelSurvivors: integer;
+  MaxDiff: TNeuralFloat;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, csDepth);
+  Expected := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, csDepth));
+    ReLULayer := NN.AddLayer(TNNetReLU.Create());
+    ConcatLayer := NN.AddLayer(TNNetDeepConcat.Create([ReLULayer, ReLULayer]));
+    NN.AddLayer(TNNetAvgChannel.Create());
+    // TNNetIdentity has no OpenCL path, so the conditioning vector is host-only.
+    CondLayer := NN.AddLayer(TNNetIdentity.Create());
+    FiLMLayer := NN.AddLayer(TNNetFiLM.Create([ReLULayer, CondLayer]));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.SetTrainable(False, False);
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := Cos(Pos * 0.29);
+    NN.Compute(Input);
+    Expected.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // ReLULayer is read by DeepConcat and FiLM; both must bind it.
+    ReLULayer.Output.Fill(csSentinel);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+    SentinelSurvivors := 0;
+    for Pos := 0 to ReLULayer.Output.Size - 1 do
+      if ReLULayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+    WriteLn('  FiLM host conditioning: max|diff|=', MaxDiff:0:9,
+      ' FiLM gpu forwards=', FiLMLayer.ForwardGPUCnt,
+      ' sentinels=', SentinelSurvivors, '/', ReLULayer.Output.Size,
+      ' uploads=', TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('TNNetFiLM ran both forwards on OpenCL', 2, FiLMLayer.ForwardGPUCnt);
+    // The input, then the host-only conditioning vector FiLM copies over.
+    AssertEquals('uploads per forward', 2,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('bytes uploaded per forward',
+      (Input.Size + CondLayer.Output.Size) * SizeOf(TNeuralFloat),
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+    AssertEquals('the feature map is bound, not downloaded', ReLULayer.Output.Size,
+      SentinelSurvivors);
+    AssertTrue('FiLM OpenCL vs CPU: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-5', MaxDiff < 1e-5);
+    AssertTrue('the CPU reference is not degenerate', Expected.GetMaxAbs() > 0);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    Expected.Free;
     Input.Free;
     NN.Free;
   end;

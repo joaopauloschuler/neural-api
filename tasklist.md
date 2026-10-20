@@ -1930,12 +1930,21 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       rest of the family) and 5 = A * ReLU(B)^2. Pinned by
       `TestGLUGateResidentOpenCLParity` (linear-conv source, so both ReLU
       branches are exercised): ReGLU 0.0, ReGLUSquared 1.2e-7.
-- [ ] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
-      `TNNetFiLM`, `TNNetAvgChannel`.
-      All are one scale/shift per channel over a resident volume.
-      `TNNetChannelMulByLayer` and `TNNetCellMulByCell` already show the
-      two-source resident pattern, and `TNNetFiLM` is that same shape, so it
-      follows them directly.
+- [X] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
+      `TNNetFiLM`, `TNNetAvgChannel` (plus `TNNetCellBias` and `TNNetReZero`).
+      No new kernel: `cai_activation` gained opcodes 44 AddChannel, 45
+      MulChannel and 46 ChannelAffine. ChannelBias/ChannelMul/CellBias opt in
+      through the `TNNetIdentity` plumbing with their weights as the channel
+      table, uploaded only after `AfterWeightUpdate`/`FlushWeightCache`; ReZero
+      uses the existing MulConstant opcode. `TNNetFiLM` borrows the same kernel
+      with both sources bound (a host-only conditioning vector is uploaded).
+      `TNNetPool2DCL.Pool` binds a resident source and keeps its result, so
+      `TNNetAvgPool` and `TNNetAvgChannel` stay resident. Pinned by
+      `TestChannelAffineResidentOpenCLParity` (unforced chain, 1072/1072
+      sentinels, 1 upload + 1 download per forward, weight refresh) and
+      `TestFiLMHostCondOpenCLParity`. Not opted in: `TNNetChannelZeroCenter`
+      (its descendants post-process `FOutput` on the host after the shared
+      forward).
 - [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
       per token, but the router sits between two resident MoE banks, so running
       it on the host costs two transfers per token. Only worth landing together
@@ -2024,10 +2033,12 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       beside the already-listed `TNNetTransposeXD`, `TNNetCrop` and
       `TNNetPadXY`.
 - [ ] Extend the per-channel affine item above to the conv-stack members:
-      `TNNetCellBias`, `TNNetReZero`, `TNNetPReLUChannel`, `TNNetGRN` and
-      `TNNetMovingStdNormalization` (ConvNeXt, RIFE, StyleGAN2, SAM, the moving
-      -norm blocks). Same one-scale-and-shift-per-channel shape as the
-      `TNNetChannelBias`/`TNNetChannelMul`/`TNNetFiLM` group.
+      `TNNetPReLUChannel`, `TNNetGRN` and `TNNetMovingStdNormalization`
+      (ConvNeXt, RIFE, StyleGAN2, SAM, the moving-norm blocks).
+      `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26).
+      PReLUChannel is one more channel-table opcode. The moving norm's forward
+      is two stored scalars, `(x - w0) / w1`, so a scalar-affine opcode covers
+      it. GRN needs a per-channel spatial reduction first.
 - [ ] Activations with no `cai_activation` opcode, reachable from the
       vision and audio towers: `TNNetSwishLearnable` (`TNNetErf` now has
       opcode 29; `TNNetReGLU` is done above).

@@ -10,7 +10,7 @@
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases for the parameterized activations
-// (9, 10, 15, 18-21, 24-28, 40, 41, 43) and for the standalone-only ones that
+// (9, 10, 15, 18-21, 24-28, 40, 41, 43-46) and for the standalone-only ones that
 // no GEMM fuses. Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
@@ -3094,7 +3094,8 @@ __kernel void cai_softmax
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
 // 24 = ReLUL, 25 = AddConstant, 26 = MulConstant, 27/28 = Snake,
-// 29..43 = the transcendental activations (Erf through ISRU).
+// 29..43 = the transcendental activations (Erf through ISRU),
+// 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3273,6 +3274,20 @@ __kernel void cai_activation
     case 43: // ISRU: x / sqrt(1 + alpha*x^2). FParamA = alpha.
       y = x / sqrt(1.0f + FParamA * x * x);
       break;
+    // 44..46 read FChannelParam as a table of FChannels entries: one per
+    // channel, or one per element when FChannels = FSize (TNNetCellBias).
+    case 44: // AddChannel: x + c
+      y = x + FChannelParam[i % FChannels];
+      break;
+    case 45: // MulChannel: x * c
+      y = x * FChannelParam[i % FChannels];
+      break;
+    case 46: // ChannelAffine (FiLM): x * gamma + beta, gamma|beta packed 2*FChannels long.
+    {        // -cl-mad-enable may fuse this, so it can differ from the host by 1 ulp.
+      const int c = i % FChannels;
+      y = x * FChannelParam[c] + FChannelParam[FChannels + c];
+      break;
+    }
     default: // csActNone / unknown: pass through
       y = x;
   }

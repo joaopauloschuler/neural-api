@@ -111,6 +111,10 @@ const
   csActCELU         = 41; // ParamA = alpha, ParamB = 1/alpha
   csActGaussian     = 42;
   csActISRU         = 43; // ParamA = alpha
+  // 44..46 read the channel-parameter buffer (ActivationChannelParams).
+  csActAddChannel    = 44; // x + c[i mod n]: TNNetChannelBias, TNNetCellBias
+  csActMulChannel    = 45; // x * c[i mod n]: TNNetChannelMul
+  csActChannelAffine = 46; // x * gamma[d] + beta[d], gamma|beta packed: TNNetFiLM
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1494,6 +1498,9 @@ type
       // One constant per channel (Depth long) for a per-channel opcode, read by
       // cai_activation; nil (the default) for the other opcodes.
       function ActivationChannelParams(): TNNetVolume; virtual;
+      // True when ActivationChannelParams changed since its last upload. The
+      // default answers True, so the table uploads every forward.
+      function ActivationChannelParamsChanged(): boolean; virtual;
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
       // already downloaded. Descendants whose activation takes constants pass
@@ -1601,6 +1608,10 @@ type
   TNNetIdentityWithoutL2 = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    protected
+      // The per-channel tables here are neuron weights, so AfterWeightUpdate
+      // is what marks their resident copy stale (as for the conv weights).
+      function ActivationChannelParamsChanged(): boolean; override;
     public
       procedure ComputeL2Decay(); override;
   end;
@@ -5547,14 +5558,20 @@ type
     // this is the post-CopyPadding FInputCopy). Y receives the pooled output.
     // Reduce: 0 = max, 1 = average (sum / Divisor). Stride is the window stride;
     // Divisor is the average-pool divisor (PoolSize*PoolSize for TNNetAvgPool,
-    // ignored for max).
+    // ignored for max). pExternalSrc is borrowed in place of uploading X.
     procedure Pool(X: TNNetVolume; Y: TNNetVolume;
       InW, InH, Depth, OutW, OutH, PoolSize, Stride, Reduce: integer;
-      Divisor: TNeuralFloat);
+      Divisor: TNeuralFloat; pExternalSrc: cl_mem = nil;
+      pKeepResultOnOpenCL: boolean = false);
+    // The buffer the last call wrote Y into, and the kernel that wrote it.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
   private
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufY: cl_mem;
     FCapX, FCapY: csize_t;
+    // The kernel that wrote FBufY; nil before the first forward.
+    FOutputKernel: TNeuralKernel;
   end;
 
   /// OpenCL forward helper for the depthwise 2-D convolution (TNNetDepthwiseConv).
@@ -9236,6 +9253,9 @@ type
       // over the whole of FOutput. beta is per-channel (fixed or data-dependent).
       procedure ComputeAconMap(Prev: TNNetVolume;
         P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr);
+      // FNeurons[0], the per-channel weights, for the channel-table opcodes
+      // (TNNetChannelBias, TNNetChannelMul); nil for any other opcode.
+      function ActivationChannelParams(): TNNetVolume; override;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -9251,12 +9271,14 @@ type
   /// This layer adds a trainable bias to each channel.
   TNNetChannelBias = class(TNNetChannelShiftBase)
     public
+      constructor Create(); override;
       procedure Backpropagate(); override;
   end;
 
   /// This layer multiplies (scales) each channel by a trainable number.
   TNNetChannelMul = class(TNNetChannelTransformBase)
     public
+      constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -12804,7 +12826,10 @@ type
   TNNetCellBias = class(TNNetIdentityWithoutL2)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    protected
+      function ActivationChannelParams(): TNNetVolume; override;
     public
+      constructor Create(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -13484,9 +13509,31 @@ type
   TNNetFiLM = class(TNNetConcatBase)
   private
     FDepth: integer; // channel count of the modulated feature map (input0)
+    {$IFDEF OpenCL}
+    // Net-wide cai_activation handle (opcode csActChannelAffine), borrowed from
+    // FNN in EnableOpenCL; the net owns and frees it.
+    FAffineKernel: TNeuralKernel;
+    // This layer's resident output, allocated in EnableOpenCL.
+    FAffineBuffer: cl_mem;
+    FAffineBufSize: integer; // element capacity of FAffineBuffer
+    // Copy of a host-only conditioning vector (2*Depth floats).
+    FCondUploadBuffer: cl_mem;
+    FCondUploadCapBytes: csize_t;
+    // Frees both buffers and drops the kernel; called by DisableOpenCL and Destroy.
+    procedure ReleaseAffineOpenCL();
+    // Modulates the resident feature map into FAffineBuffer. The caller checks WillOpenCL().
+    procedure ComputeOpenCL();
+    {$ENDIF}
   public
     constructor Create(aL: array of TNNetLayer); reintroduce; overload;
     destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function WillOpenCL(): boolean; override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -17707,6 +17754,9 @@ type
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -39614,9 +39664,19 @@ begin
   inherited Destroy();
 end;
 
+function TNNetPool2DCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetPool2DCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
 procedure TNNetPool2DCL.Pool(X: TNNetVolume; Y: TNNetVolume;
   InW, InH, Depth, OutW, OutH, PoolSize, Stride, Reduce: integer;
-  Divisor: TNeuralFloat);
+  Divisor: TNeuralFloat; pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
 var
   bufX, bufY: cl_mem;
   k: cl_kernel;
@@ -39624,8 +39684,10 @@ var
 begin
   k := FKernel.Kernel;
   fDivisor := Divisor;
-  // Upload the input volume; allocate the device result.
-  bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  // Upload the input volume (unless bound); allocate the device result.
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @InW);
   clSetKernelArg(k, 1, csLongintSize, @InH);
@@ -39640,8 +39702,12 @@ begin
   clSetKernelArg(k, 10, csCLMemSize, @bufY);
   // One work-item per output (x,y,depth) cell.
   FKernel.RunKernel(k, OutW * OutH * Depth);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
@@ -59949,6 +60015,11 @@ begin
 end;
 
 { TNNetIdentityWithoutL2 }
+function TNNetIdentityWithoutL2.ActivationChannelParamsChanged(): boolean;
+begin
+  Result := FAfterWeightUpdateHasBeenCalled;
+end;
+
 procedure TNNetIdentityWithoutL2.ComputeL2Decay();
 begin
   // class intended to hide L2.
@@ -60937,11 +61008,22 @@ begin
 end;
 
 { TNNetChannelMul }
+constructor TNNetChannelMul.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActMulChannel;
+end;
+
 procedure TNNetChannelMul.Compute();
 var
   StartTime: double;
 begin
   StartTime := Now();
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> FOutput.Depth then
@@ -61011,6 +61093,8 @@ begin
   inherited Create();
   FInitialAlpha := pInitialAlpha;
   FFloatSt[0] := pInitialAlpha;
+  // alpha reaches cai_activation as its scalar constant, not as a table.
+  FActivationOpcode := csActMulConstant;
   InitDefault();
 end;
 
@@ -61029,7 +61113,6 @@ var
   alpha: TNeuralFloat;
 begin
   StartTime := Now();
-  inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
   begin
@@ -61038,6 +61121,12 @@ begin
   {$ENDIF}
   // Output[x,y,d] = alpha * Input[x,y,d]
   alpha := FNeurons[0].FWeights.Raw[0];
+  if ComputeActivationOnOpenCL(alpha) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  inherited Compute;
   FOutput.Mul(alpha);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -78416,11 +78505,28 @@ begin
   FLayerMul.Backpropagate();
 end;
 
+constructor TNNetCellBias.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActAddChannel;
+end;
+
+function TNNetCellBias.ActivationChannelParams(): TNNetVolume;
+begin
+  // Output-sized, so cai_activation indexes it per element.
+  Result := FNeurons[0].FWeights;
+end;
+
 procedure TNNetCellBias.Compute();
 var
   StartTime: double;
 begin
   StartTime := Now();
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   FOutput.Add(FNeurons[0].FWeights);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -78843,6 +78949,11 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> FOutput.Depth then
@@ -78855,11 +78966,27 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+function TNNetChannelTransformBase.ActivationChannelParams(): TNNetVolume;
+begin
+  // TNNetReZero passes its one weight as a constant, so it gets no table.
+  if (FActivationOpcode = csActAddChannel) or (FActivationOpcode = csActMulChannel)
+    then Result := FNeurons[0].FWeights
+    else Result := nil;
+end;
+
 procedure TNNetChannelShiftBase.InitDefault();
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   inherited InitDefault();
   FNeurons[0].Weights.Fill(0);
+end;
+
+constructor TNNetChannelBias.Create();
+begin
+  inherited Create();
+  // TNNetChannelZeroCenter shares this forward but not the opt-in: its
+  // descendants post-process FOutput on the host after inherited Compute.
+  FActivationOpcode := csActAddChannel;
 end;
 
 procedure TNNetChannelBias.Backpropagate();
@@ -83045,12 +83172,153 @@ begin
   end;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
+  {$IFDEF OpenCL}
+  FAffineKernel := nil;
+  FAffineBuffer := nil;
+  FAffineBufSize := 0;
+  FCondUploadBuffer := nil;
+  FCondUploadCapBytes := 0;
+  {$ENDIF}
 end;
 
 destructor TNNetFiLM.Destroy();
 begin
+  {$IFDEF OpenCL} ReleaseAffineOpenCL(); {$ENDIF}
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetFiLM.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  // Acquire once: a second call would leak a private handle.
+  if Assigned(FNN) and (not Assigned(FAffineKernel)) then
+    FAffineKernel := FNN.GetKernel('cai_activation');
+  if Assigned(FAffineBuffer) and (FAffineBufSize <> FOutput.Size) then
+  begin
+    clReleaseMemObject(FAffineBuffer);
+    FAffineBuffer := nil;
+    // The output this buffer held is gone with it; only the host copy is left.
+    FOutputOnOpenCL := false;
+  end;
+  if not Assigned(FAffineBuffer) then
+  begin
+    FAffineBufSize := FOutput.Size;
+    FAffineBuffer := DotProductKernel.CreateBuffer(
+      CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
+  end;
+  DotProductKernel.EnsureBuffer(FCondUploadBuffer, FCondUploadCapBytes,
+    CL_MEM_READ_ONLY, 2 * FDepth * csNeuralFloatSize);
+end;
+
+procedure TNNetFiLM.ReleaseAffineOpenCL();
+begin
+  if Assigned(FAffineBuffer) then
+  begin
+    clReleaseMemObject(FAffineBuffer);
+    FAffineBuffer := nil;
+    FAffineBufSize := 0;
+  end;
+  if Assigned(FCondUploadBuffer) then
+  begin
+    clReleaseMemObject(FCondUploadBuffer);
+    FCondUploadBuffer := nil;
+    FCondUploadCapBytes := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_activation', FAffineKernel);
+end;
+
+procedure TNNetFiLM.DisableOpenCL();
+begin
+  // FAffineBuffer is read through FAffineKernel's queue, so the output has to
+  // come back to RAM while that handle is still alive.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  ReleaseAffineOpenCL();
+end;
+
+function TNNetFiLM.WillOpenCL(): boolean;
+var
+  FeatureLayer, CondLayer: TNNetLayer;
+begin
+  Result := false;
+  // Forward only: Backpropagate reads both source outputs on the host.
+  if FIsTrainable or (not FHasOpenCL) then exit;
+  if (not Assigned(FAffineKernel)) or (not Assigned(FAffineBuffer)) then exit;
+  if (FPrevLayerList.Count <> 2) or (FDepth < 1) then exit;
+  FeatureLayer := FPrevLayerList[0];
+  CondLayer := FPrevLayerList[1];
+  // The constructor only reports a shape mismatch through FErrorProc, which
+  // prints and continues, so the sizes the kernel indexes with are checked here.
+  if (FeatureLayer.Output.Size <> FOutput.Size) or
+     (CondLayer.Output.Size <> 2 * FDepth) or
+     (FOutput.Size > FAffineBufSize) then exit;
+  // A host-only conditioning vector is uploaded into FCondUploadBuffer.
+  Result := FeatureLayer.OutputBindableOnOpenCL() and
+    (CondLayer.OutputBindableOnOpenCL() or (Assigned(FCondUploadBuffer) and
+    (FCondUploadCapBytes >= csize_t(2 * FDepth) * csNeuralFloatSize)));
+end;
+
+function TNNetFiLM.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FAffineBuffer;
+end;
+
+function TNNetFiLM.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FAffineKernel;
+end;
+
+procedure TNNetFiLM.ComputeOpenCL();
+var
+  Kern: cl_kernel;
+  iSize, iOpcode, iChannels: longint;
+  ParamUnused: TNeuralFloat;
+  FeatureLayer, CondLayer: TNNetLayer;
+  FeatureBuffer, CondBuffer: cl_mem;
+begin
+  FeatureLayer := FPrevLayerList[0];
+  CondLayer := FPrevLayerList[1];
+  FeatureLayer.OpenCLWaitOutputIfAnotherQueue(FAffineKernel);
+  // Read per forward, never cached: a source can replace its result buffer.
+  FeatureBuffer := FeatureLayer.OpenCLOutputBuffer();
+  if CondLayer.OutputBindableOnOpenCL() then
+  begin
+    CondLayer.OpenCLWaitOutputIfAnotherQueue(FAffineKernel);
+    CondBuffer := CondLayer.OpenCLOutputBuffer();
+  end
+  else
+  begin
+    // Blocking: the next forward may rewrite CondLayer.Output on the host
+    // before this queue drains.
+    CondLayer.ForceOutputOnRAM();
+    FAffineKernel.WriteBuffer(FCondUploadBuffer, CondLayer.Output, CL_TRUE);
+    CondBuffer := FCondUploadBuffer;
+  end;
+  Kern := FAffineKernel.Kernel;
+  iSize := FOutput.Size;
+  iOpcode := csActChannelAffine;
+  iChannels := FDepth;
+  ParamUnused := 0;
+  clSetKernelArg(Kern, 0, csLongintSize, @iSize);
+  clSetKernelArg(Kern, 1, csLongintSize, @iOpcode);
+  clSetKernelArg(Kern, 2, csNeuralFloatSize, @ParamUnused);
+  clSetKernelArg(Kern, 3, csNeuralFloatSize, @ParamUnused);
+  clSetKernelArg(Kern, 4, csNeuralFloatSize, @ParamUnused);
+  clSetKernelArg(Kern, 5, csCLMemSize, @FeatureBuffer);
+  clSetKernelArg(Kern, 6, csCLMemSize, @FAffineBuffer);
+  clSetKernelArg(Kern, 7, csLongintSize, @iChannels);
+  clSetKernelArg(Kern, 8, csCLMemSize, @CondBuffer);
+  FAffineKernel.RunKernel(Kern, iSize);
+  // No read back here: the result stays on the device until a host reader
+  // calls ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetFiLM.Compute();
 var
@@ -83062,7 +83330,21 @@ var
   OutPtr, FeatPtr, GammaPtr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayerList.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Feature := FPrevOutput[0];
   Cond    := FPrevOutput[1];
   // Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]; gamma/beta broadcast over XY.
@@ -103957,8 +104239,30 @@ end;
 {$IFDEF OpenCL}
 function TNNetAvgPool.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FPool2DCL) and FHasOpenCL and (Self.ClassType = TNNetAvgPool)
-            and (FShouldOpenCL or FForceOpenCL);
+  // TNNetAvgChannel only fixes the geometry; other descendants keep the host path.
+  Result := Assigned(FPool2DCL) and FHasOpenCL and
+    ((Self.ClassType = TNNetAvgPool) or (Self.ClassType = TNNetAvgChannel)) and
+    (FShouldOpenCL or FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+procedure TNNetAvgPool.DisableOpenCL();
+begin
+  // FPool2DCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+end;
+
+function TNNetAvgPool.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetAvgPool.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.OutputKernel()
+  else Result := nil;
 end;
 {$ENDIF}
 
@@ -103968,25 +104272,47 @@ var
   MaxX, MaxY: integer;
   OutX, OutY: integer;
   StartTime: double;
+  {$IFDEF OpenCL}
+  SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
+  {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
-  // Device avg-pool forward (exactly TNNetAvgPool; AvgChannel and other subclasses
-  // keep the scalar path). Sum over the clipped window divided by the FULL
+  // Device avg-pool forward. Sum over the clipped window divided by the FULL
   // FPoolSize*FPoolSize -- matching the scalar Output.Divi(FPoolSize*FPoolSize)
   // even for edge windows. Stride == FPoolSize, no padding. Forward-only.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FPool2DCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    // Inference keeps the result in OpenCL memory (a host reader calls
+    // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
+    KeepOnOpenCL := not FIsTrainable;
     FPool2DCL.Pool(FPrevLayer.Output, FOutput,
       FPrevLayer.Output.SizeX, FPrevLayer.Output.SizeY, FOutput.Depth,
       FOutput.SizeX, FOutput.SizeY, FPoolSize, FPoolSize, 1,
-      FPoolSize * FPoolSize);
+      FPoolSize * FPoolSize, SourceBuffer, KeepOnOpenCL);
+    FOutputOnOpenCL := KeepOnOpenCL;
+    FOutputOnRAM := not KeepOnOpenCL;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -106451,13 +106777,19 @@ begin
   iSize := FPrevLayer.FOutput.Size;
   iOpcode := FActivationOpcode;
   if not StayOnOpenCL then Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
-  // The per-channel constants are Depth floats: they upload every forward, so
-  // a host write to them needs no flag. Other opcodes get a valid dummy handle.
+  // The constant table is indexed i mod its length, so a Depth-long table is
+  // per channel and an output-sized one per element. Other opcodes get a valid
+  // dummy handle.
   ChannelParams := ActivationChannelParams();
   iChannels := FOutput.Depth;
   if Assigned(ChannelParams) then
+  begin
+    iChannels := ChannelParams.Size;
     ChannelBuffer := Kern.EnsureWriteBuffer(FActivationChannelBuffer,
-      FActivationChannelBufBytes, ChannelParams)
+      FActivationChannelBufBytes, ChannelParams,
+      {DoWrite=}ActivationChannelParamsChanged());
+    FAfterWeightUpdateHasBeenCalled := false;
+  end
   else
     ChannelBuffer := FActivationBuffer;
   clSetKernelArg(k, 0, csLongintSize, @iSize);
@@ -106490,6 +106822,11 @@ end;
 function TNNetIdentity.ActivationChannelParams(): TNNetVolume;
 begin
   Result := nil;
+end;
+
+function TNNetIdentity.ActivationChannelParamsChanged(): boolean;
+begin
+  Result := true;
 end;
 
 function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
