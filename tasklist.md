@@ -2025,8 +2025,12 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 - [X] `TNNetFlipX`, the one host hop inside an otherwise device-capable
       bidirectional stack. Done: its forward is a `cai_gather_copy` plan (the X
       axis table reversed), covered by `TestGatherCopyOpenCLParity` and the
-      resident chain of `TestGatherCopyResidentOpenCLParity`. `TNNetFlipY` and
-      `TNNetReverseXY` are the same shape of plan and still run on the host.
+      resident chain of `TestGatherCopyResidentOpenCLParity`.
+- [X] `TNNetFlipY` and `TNNetReverseXY` on the same `cai_gather_copy` plan
+      (reversed Y table / reversed position table), in both gather-copy tests.
+- [ ] `TNNetReverseChannels` and `TNNetRoll` are pure reorders that still
+      download their source in Compute: a reversed depth table, and a cyclic
+      table on the rolled axis (X, Y or depth), on `cai_gather_copy`.
 - [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
       new kernel (per-channel softmax over time, then the two weighted moments)
       reading two sources, the features and `FLogitLayer`. It runs once per

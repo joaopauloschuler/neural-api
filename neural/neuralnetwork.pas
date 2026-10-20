@@ -13284,6 +13284,11 @@ type
   // Backward applies the same involution to OutputError.
   // Coded by Claude (AI).
   TNNetReverseXY = class(TNNetIdentity)
+    private
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -13309,6 +13314,11 @@ type
   // the same involution to OutputError.
   // Coded by Claude (AI).
   TNNetFlipY = class(TNNetIdentity)
+    private
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -54219,6 +54229,27 @@ end;
 
 { TNNetReverseXY }
 
+{$IFDEF OpenCL}
+function TNNetReverseXY.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetReverseXY.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  OutPos, MaxOutPos: integer;
+begin
+  // Output position p (x + y*SizeX) reads source position SizeX*SizeY - 1 - p.
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeX * Src.SizeY, Src.Depth);
+  MaxOutPos := Src.SizeX * Src.SizeY - 1;
+  for OutPos := 0 to MaxOutPos do
+    Plan.SetAxisSource(OutPos, MaxOutPos - OutPos);
+  Plan.AddAxis(Src.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetReverseXY.Compute();
 var
   CntPos, MaxPos, Depth, DepthBytes: integer;
@@ -54227,7 +54258,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   Depth := FOutput.Depth;
   DepthBytes := Depth * csNeuralFloatSize;
@@ -54380,6 +54411,27 @@ end;
 
 { TNNetFlipY }
 
+{$IFDEF OpenCL}
+function TNNetFlipY.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetFlipY.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  OutY, MaxOutY: integer;
+begin
+  // Output row y reads source row SizeY - 1 - y; a row is SizeX*Depth contiguous.
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeY, Src.SizeX * Src.Depth);
+  MaxOutY := Src.SizeY - 1;
+  for OutY := 0 to MaxOutY do
+    Plan.SetAxisSource(OutY, MaxOutY - OutY);
+  Plan.AddAxis(Src.SizeX * Src.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetFlipY.Compute();
 var
   CntY, MaxY, RowLen: integer;
@@ -54387,7 +54439,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   MaxY := FOutput.SizeY - 1;
   // A row is SizeX*Depth contiguous floats and the flip permutes whole rows,
   // so each row is a single Move.
