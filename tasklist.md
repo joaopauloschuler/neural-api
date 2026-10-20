@@ -1723,6 +1723,37 @@ rather than acted on.
       - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
             generate at full resolution, paste back (`apply_overlay`); makes a
             small hole in a large photo cheap.
+- [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
+      examples/QwenImage, merged into the transformer weights at load. Today
+      `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
+      text models (`pLoRAAdapterDir` of `BuildFromPretrained`); the image side has
+      no adapter path at all, yet community LoRAs (styles, characters, and
+      step-distilled "Lightning"-type adapters that cut 40 steps to 4-8) are how
+      people use diffusion checkpoints. The transformer reads every tensor through
+      one `TNNetSafeTensorsReader` in `TQwenImage21Transformer.Create`, so wrapping
+      that reader is the whole hook; int8/int4 quantization then sees the merged
+      weights, as on the LLM side. What `TNNetLoRAMergeReader` needs (extend it,
+      do not fork a second reader):
+      - Key prefixes besides `base_model.model.`: diffusers saves
+        `transformer.<m>.lora_A.weight`, ComfyUI-style files use
+        `diffusion_model.<m>`; replace the text-decoder prefix probe with a
+        caller-supplied list of strip prefixes.
+      - The kohya layout: `lora_unet_<m with dots as underscores>.lora_down.weight`
+        / `.lora_up.weight` plus a per-module `.alpha` scalar (scale = alpha /
+        rank, no adapter_config.json). Resolve the flattened name against the
+        base reader's tensor names (dots -> underscores index built once).
+      - Per-adapter user scale multiplied into `Scale`; several adapters stack by
+        chaining merge readers (each one is a `TNNetSafeTensorsReader` base).
+      - Fail loudly on an adapter key with no base tensor (wrong model family)
+        and on LoRA-on-conv tensors the reader cannot merge yet.
+      Tests: a pico adapter on `tests/fixtures/tiny_qwenimage21` in both the
+      diffusers and the kohya key layouts, oracle from the ~/x venv
+      (`pipe.load_lora_weights` + `fuse_lora`, latent after one step), the test
+      itself Pascal; plus an unchanged-tensor pass-through check. README section in
+      examples/QwenImage. Before promising a step cut, check that a step-distilled
+      LoRA exists for Qwen-Image-2.1 (the known Lightning adapters target earlier
+      Qwen-Image releases). The SD UNet path (`BuildSDUNetFromSafeTensors`) can
+      take the same reader once the real Stable Diffusion pipeline item above lands.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
