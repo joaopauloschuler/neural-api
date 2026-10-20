@@ -1894,7 +1894,7 @@ rather than acted on.
 
 Forward pass only; a device backward is a separate project (nothing in the tree
 has one today). 52 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
-`ComputeOpenCL`, and `cai_activation` covers 24 elementwise opcodes on top of
+`ComputeOpenCL`, and `cai_activation` covers 43 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
 "does this layer evict a resident chain to RAM", not by FLOPs.
@@ -1924,11 +1924,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       back the source's buffer); apply the same view mechanism to the rest.
       `TNNetCrop`/`TNNetPadXY`/`TNNetTransposeXD` DO move bytes and need a real
       copy/gather kernel; keep the two halves separate.
-- [ ] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward.
-      `TNNetSwiGLU` and `TNNetGEGLU` inherit `TNNetGLUGateBase.ComputeOpenCL`;
-      `TNNetReGLU` descends straight from `TNNetLayer` and misses it. Check
-      whether re-parenting onto `TNNetGLUGateBase` (with the ReLU gate as the
-      activation opcode) is the whole fix before writing a kernel.
+- [X] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward. Both
+      now descend from `TNNetGLUGateBase` and reach `cai_glu_gate` through two
+      new gate flags: 4 = ReLU(A) * B (ReGLU gates the FIRST half, unlike the
+      rest of the family) and 5 = A * ReLU(B)^2. Pinned by
+      `TestGLUGateResidentOpenCLParity` (linear-conv source, so both ReLU
+      branches are exercised): ReGLU 0.0, ReGLUSquared 1.2e-7.
 - [ ] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
       `TNNetFiLM`, `TNNetAvgChannel`.
       All are one scale/shift per channel over a resident volume.
@@ -2028,8 +2029,8 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       -norm blocks). Same one-scale-and-shift-per-channel shape as the
       `TNNetChannelBias`/`TNNetChannelMul`/`TNNetFiLM` group.
 - [ ] Activations with no `cai_activation` opcode, reachable from the
-      vision and audio towers: `TNNetErf` and `TNNetSwishLearnable`.
-      `TNNetReGLU` is listed above.
+      vision and audio towers: `TNNetSwishLearnable` (`TNNetErf` now has
+      opcode 29; `TNNetReGLU` is done above).
       These are the vision and audio members of the full opcode gap; the
       activation subsection below carries the whole list and the two cautions
       that come with it.
@@ -2066,7 +2067,7 @@ it implements exactly three opcodes — 1=ReLU, 2=Sigmoid, 3=Tanh — with the s
 three copied into `cai_dot_product_int8` and into `cai_fused_act` (the split-K
 reduce helper). `TNNetLayer.IsActivationFunctionInOpenCL` mirrors that set on
 the host and returns false for everything else. (2) The STANDALONE
-`cai_activation` kernel, which has 24 opcodes and 25 layer classes wired to it
+`cai_activation` kernel, which has 43 opcodes, each wired to its layer classes
 through `ComputeActivationOnOpenCL()`.
 
 Both are forward-only by construction: neither produces `FOutputRaw` or the
@@ -2076,20 +2077,20 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [ ] The 33 elementwise activations with no `cai_activation` opcode, all
-      `TNNetReLUBase` descendants: `TNNetErf`, `TNNetExp`, `TNNetLog`,
-      `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetArcSinh`, `TNNetSinhAct`,
-      `TNNetReciprocal`, `TNNetPower`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
-      `TNNetPhish`, `TNNetSinc`, `TNNetLisht`,
-      `TNNetLogCoshActivation`, `TNNetLogSigmoid`, `TNNetTanhExp`,
-      `TNNetTanhShrink`, `TNNetLeCunTanh`, `TNNetPenalizedTanh`,
-      `TNNetSoftPlus`, `TNNetSoftPlusBeta`, `TNNetSoftExponential`,
-      `TNNetGaussianActivation`, `TNNetISRU`, `TNNetISRLU`, `TNNetCELU`,
-      `TNNetESwish`, `TNNetSwish6`, `TNNetReLUSqrt`, `TNNetRReLU`. Each is one
-      `case` in the `cai_activation` switch plus one constant and the
-      `ComputeActivationOnOpenCL()` call at the top of `Compute`. Take
-      `TNNetErf` first — it is on the ModernBERT, CLIP, Whisper and BART paths.
-      Two cautions: `TNNetRReLU` draws a random slope, so its device form must
+- [ ] The 18 elementwise activations still with no `cai_activation` opcode,
+      all `TNNetReLUBase` descendants: `TNNetArcSinh`, `TNNetSinhAct`,
+      `TNNetReciprocal`, `TNNetPower`, `TNNetSerf`, `TNNetSmish`,
+      `TNNetPhish`, `TNNetSinc`, `TNNetLogCoshActivation`, `TNNetTanhExp`,
+      `TNNetLeCunTanh`, `TNNetPenalizedTanh`, `TNNetSoftExponential`,
+      `TNNetISRLU`, `TNNetESwish`, `TNNetSwish6`, `TNNetReLUSqrt`,
+      `TNNetRReLU`. Each is one `case` in the `cai_activation` switch plus one
+      constant and the `ComputeActivationOnOpenCL()` call at the top of
+      `Compute`. LANDED as opcodes 29-43: `TNNetErf`, `TNNetExp`, `TNNetLog`,
+      `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetMish`, `TNNetSoftPlus`,
+      `TNNetLogSigmoid`, `TNNetTanhShrink`, `TNNetLisht`, `TNNetSoftPlusBeta`,
+      `TNNetCELU`, `TNNetGaussianActivation`, `TNNetISRU`, all in
+      `TestActivationOpenCLParity` at <= 2.9e-7 (Erf 6e-8 against the host's
+      correctly-rounded `SerfErf`). Two cautions: `TNNetRReLU` draws a random slope, so its device form must
       reproduce the host draw or stay inference-frozen; and `TNNetSoftSign`
       and `TNNetESwish` raise hardware FP exceptions at far-extreme inputs on
       the host (see the FP-exception item in the test section), so pick the

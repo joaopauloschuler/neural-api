@@ -70371,7 +70371,8 @@ end;
 procedure TTestNeuralNumerical.TestGLUGateResidentOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..3] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf');
+  Names: array[0..5] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf',
+    'ReGLU', 'ReGLUSquared');
 var
   NN, RefNN: TNNet;
   Input: TNNetVolume;
@@ -70390,7 +70391,9 @@ var
       0: Result := TNNetGLU.Create();
       1: Result := TNNetSwiGLU.Create();
       2: Result := TNNetGEGLU.Create();
-    else Result := TNNetGEGLUErf.Create();
+      3: Result := TNNetGEGLUErf.Create();
+      4: Result := TNNetReGLU.Create();
+    else Result := TNNetReGLUSquared.Create();
     end;
   end;
 
@@ -70400,7 +70403,7 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for VariantCnt := 0 to 3 do
+  for VariantCnt := 0 to 5 do
   for DepthCnt := 0 to 1 do
   for ScaleCnt := 0 to 1 do
   begin
@@ -70419,8 +70422,14 @@ begin
       InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, InDepth, 1));
       // A ReLU convolution: cai_dot_product applies the activation on the
       // device, which is what leaves the source output in device memory.
-      SourceLayer := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(InDepth, 3, 1, 1), InputLayer);
+      // The ReLU-gated variants take a linear convolution instead, so their
+      // gate sees negative inputs and both ReLU branches are exercised.
+      if VariantCnt >= 4 then
+        SourceLayer := NN.AddLayerAfter(
+          TNNetConvolutionLinear.Create(InDepth, 3, 1, 1), InputLayer)
+      else
+        SourceLayer := NN.AddLayerAfter(
+          TNNetConvolutionReLU.Create(InDepth, 3, 1, 1), InputLayer);
       GateLayer := CreateGate(VariantCnt);
       NN.AddLayerAfter(GateLayer, SourceLayer);
       // The device path is inference-only, so the gate never fires without this.
@@ -70502,13 +70511,16 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..33] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..51] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
     'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity', 'AddConstant',
-    'MulByConstant', 'Snake', 'Snake per channel');
+    'MulByConstant', 'Snake', 'Snake per channel', 'Erf', 'Exp', 'Log',
+    'Sqrt', 'Sin', 'Cos', 'Mish', 'SoftPlus', 'LogSigmoid', 'TanhShrink',
+    'LiSHT', 'SoftPlusBeta', 'SoftPlusBeta beta 2', 'CELU', 'CELU alpha 0.5',
+    'GaussianActivation', 'ISRU', 'ISRU alpha 0.5');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -70554,7 +70566,25 @@ var
       30: Result := TNNetAddConstant.Create(-0.375);
       31: Result := TNNetMulByConstant.Create(-0.75);
       32: Result := TNNetSnake.Create(0.8);
-    else Result := TNNetSnake.Create(1.7, true);
+      33: Result := TNNetSnake.Create(1.7, true);
+      34: Result := TNNetErf.Create();
+      35: Result := TNNetExp.Create();
+      36: Result := TNNetLog.Create(); // the negative half hits the 1e-8 floor
+      37: Result := TNNetSqrt.Create(); // the negative half hits the 1e-6 floor
+      38: Result := TNNetSin.Create();
+      39: Result := TNNetCos.Create();
+      40: Result := TNNetMish.Create();
+      41: Result := TNNetSoftPlus.Create();
+      42: Result := TNNetLogSigmoid.Create();
+      43: Result := TNNetTanhShrink.Create();
+      44: Result := TNNetLisht.Create();
+      45: Result := TNNetSoftPlusBeta.Create();
+      46: Result := TNNetSoftPlusBeta.Create(2.0);
+      47: Result := TNNetCELU.Create();
+      48: Result := TNNetCELU.Create(0.5);
+      49: Result := TNNetGaussianActivation.Create();
+      50: Result := TNNetISRU.Create();
+    else Result := TNNetISRU.Create(0.5);
     end;
   end;
 

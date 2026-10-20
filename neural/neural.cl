@@ -9,8 +9,9 @@
 // 0/other = pass-through. This is every parameterless opcode, which is what the
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
-// cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24-28). Coded by Claude (AI).
+// cai_activation keeps its own cases for the parameterized activations
+// (9, 10, 15, 18-21, 24-28, 40, 41, 43) and for the standalone-only ones that
+// no GEMM fuses. Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -2570,6 +2571,8 @@ __kernel void cai_l2norm_perdepth
 //   1 = swish       -> SwiGLU    (A * B * sigmoid(B))
 //   2 = gelu-tanh   -> GEGLU     (A * B * 0.5*(1+tanh(sqrt(2/pi)*(B+0.044715*B^3))))
 //   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
+//   4 = relu on A   -> ReGLU     (ReLU(A) * B - the one flag that gates A)
+//   5 = relu^2      -> ReGLUSquared (A * ReLU(B)^2)
 // One work-item per (token, output-channel). Forward-only; the formulas are the
 // exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
 // The sigmoid and tanh here are cai_activation's stable forms, not the direct
@@ -2620,10 +2623,20 @@ __kernel void cai_glu_gate
     const float e = exp(-2.0f * arg);
     gated = b * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
   }
-  else                          // GEGLUErf: gelu_erf(B)
+  else if (FActFlag == 3)       // GEGLUErf: gelu_erf(B)
   {
     const float INV_SQRT_2 = 0.7071067811865476f;
     gated = b * 0.5f * (1.0f + erf(b * INV_SQRT_2));
+  }
+  else if (FActFlag == 4)       // ReGLU: the gate is on A, so ReLU(A) * B
+  {
+    FY[gid] = ((a > 0.0f) ? a : 0.0f) * b;
+    return;
+  }
+  else                          // ReGLUSquared: ReLU(B)^2
+  {
+    const float r = (b > 0.0f) ? b : 0.0f;
+    gated = r * r;
   }
   FY[gid] = a * gated;
 }
@@ -3080,7 +3093,8 @@ __kernel void cai_softmax
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
-// 24 = ReLUL, 25 = AddConstant.
+// 24 = ReLUL, 25 = AddConstant, 26 = MulConstant, 27/28 = Snake,
+// 29..43 = the transcendental activations (Erf through ISRU).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3202,6 +3216,63 @@ __kernel void cai_activation
       y = mad(s / a, s, x);
       break;
     }
+    // 29..43 mirror the host Compute forms, including their input clamps and
+    // saturation thresholds. tanh is cai_fused_act's clamped form throughout.
+    case 29: // Erf
+      y = erf(x);
+      break;
+    case 30: // Exp: exp(min(x, 30))
+      y = exp((x > 30.0f) ? 30.0f : x);
+      break;
+    case 31: // Log: ln(max(x, 1e-8))
+      y = log((x < 1e-8f) ? 1e-8f : x);
+      break;
+    case 32: // Sqrt: sqrt(max(x, 1e-6))
+      y = sqrt((x < 1e-6f) ? 1e-6f : x);
+      break;
+    case 33: // Sin
+      y = sin(x);
+      break;
+    case 34: // Cos
+      y = cos(x);
+      break;
+    case 35: // Mish: x * tanh(softplus(x)), softplus saturated beyond +-20
+    {
+      float sp;
+      if (x > 20.0f) sp = x;
+      else if (x < -20.0f) sp = exp(x);
+      else sp = log1p(exp(x));
+      y = x * cai_fused_act(sp, 3);
+      break;
+    }
+    case 36: // SoftPlus: ln(1 + exp(x)), x itself beyond 30
+      y = (x > 30.0f) ? x : log1p(exp(x));
+      break;
+    case 37: // LogSigmoid: -softplus(-x), the exp argument kept non-positive
+      if (x >= 0.0f) y = -log1p(exp(-x)); else y = x - log1p(exp(x));
+      break;
+    case 38: // TanhShrink: x - tanh(x)
+      y = x - cai_fused_act(x, 3);
+      break;
+    case 39: // LiSHT: x * tanh(x)
+      y = x * cai_fused_act(x, 3);
+      break;
+    case 40: // SoftPlusBeta: ln(1 + exp(beta*x))/beta, x beyond beta*x > 30.
+    {        // FParamA = beta, FParamB = 1/beta.
+      const float bx = FParamA * x;
+      y = (bx > 30.0f) ? x : FParamB * log(1.0f + exp(bx));
+      break;
+    }
+    case 41: // CELU: x for x > 0, else alpha*(exp(x/alpha)-1).
+      // FParamA = alpha, FParamB = 1/alpha.
+      y = (x > 0.0f) ? x : FParamA * (exp(x * FParamB) - 1.0f);
+      break;
+    case 42: // GaussianActivation: exp(-x^2)
+      y = exp(-x * x);
+      break;
+    case 43: // ISRU: x / sqrt(1 + alpha*x^2). FParamA = alpha.
+      y = x / sqrt(1.0f + FParamA * x * x);
+      break;
     default: // csActNone / unknown: pass through
       y = x;
   }
