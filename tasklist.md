@@ -1912,7 +1912,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       host-only source straight into its slice of the output; DeepConcat's
       channel-interleaved layout needs an upload buffer per such source (or,
       when SizeX*SizeY = 1, the same flat `WriteBufferAt` into the output).
-- [ ] `TNNetSum` repeats the `TNNetConcatOpenCLBase` output-buffer lifecycle
+- [X] `TNNetSum` repeats the `TNNetConcatOpenCLBase` output-buffer lifecycle
       (`FSumKernel`/`FSumBuffer`, release, adopt, share). Deriving it from that
       base with `ConcatKernelName = 'cai_volume_sum'` would delete the copy;
       the field names would then need a neutral rename (`FOutputKernel`/...).

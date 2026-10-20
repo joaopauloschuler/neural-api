@@ -13755,24 +13755,24 @@ type
     {$ENDIF}
   end;
 
-  /// Base of the concatenations whose device forward writes one persistent
-  // OpenCL output buffer. Do not use it directly.
+  /// Base of the multi-source layers (concatenations, sum) whose OpenCL forward
+  // writes one persistent OpenCL output buffer. Do not use it directly.
   // Coded by Claude (AI).
   TNNetConcatOpenCLBase = class(TNNetConcatBase)
   protected
     {$IFDEF OpenCL}
     // Borrowed from FNN in EnableOpenCL; the net owns and frees it. The copies or
-    // kernels writing FConcatBuffer run on its queue.
-    FConcatKernel: TNeuralKernel;
-    // Persistent device buffer holding this layer's output. Allocated ONCE in
+    // kernels writing FOutputBuffer run on its queue.
+    FOutputKernel: TNeuralKernel;
+    // Persistent OpenCL buffer holding this layer's output. Allocated ONCE in
     // EnableOpenCL and reused by every forward, so no forward pass allocates.
-    FConcatBuffer: cl_mem;
-    FConcatBufSize: integer; // element capacity of FConcatBuffer
-    // Name FConcatKernel is acquired and freed under; must not change between.
-    function ConcatKernelName(): string; virtual;
-    // Releases the device buffer, then the borrowed FConcatKernel handle. Called
+    FOutputBuffer: cl_mem;
+    FOutputBufSize: integer; // element capacity of FOutputBuffer
+    // Name FOutputKernel is acquired and freed under; must not change between.
+    function OutputKernelName(): string; virtual;
+    // Releases the OpenCL buffer, then the borrowed FOutputKernel handle. Called
     // from DisableOpenCL AND from Destroy (a layer can skip DisableOpenCL).
-    procedure ReleaseConcatOpenCL();
+    procedure ReleaseOutputOpenCL();
     {$ENDIF}
   public
     destructor Destroy(); override;
@@ -13793,7 +13793,7 @@ type
   TNNetConcat = class(TNNetConcatOpenCLBase)
   protected
     {$IFDEF OpenCL}
-    // Copies each source into FConcatBuffer at its offset: resident sources on
+    // Copies each source into FOutputBuffer at its offset: resident sources on
     // the device, host-only ones by upload. The caller checks WillOpenCL().
     procedure ComputeOpenCL();
     {$ENDIF}
@@ -13824,8 +13824,8 @@ type
     // the per-source path: the fused kernels bind the same buffer to every slot.
     FIsBroadcast: boolean;
     // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
-    function ConcatKernelName(): string; override;
-    // Scatters the already-resident source outputs into FConcatBuffer. The caller
+    function OutputKernelName(): string; override;
+    // Scatters the already-resident source outputs into FOutputBuffer. The caller
     // checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
@@ -13844,37 +13844,19 @@ type
   end;
 
   /// This layer sums layers of same size allowing resnet style layers.
-  TNNetSum = class(TNNetConcatBase)
+  TNNetSum = class(TNNetConcatOpenCLBase)
   protected
     {$IFDEF OpenCL}
-    // Net-wide cai_volume_sum handle, borrowed from FNN in EnableOpenCL; the net
-    // owns and frees it. Its queue is also the queue the sources produced on.
-    FSumKernel: TNeuralKernel;
-    // Persistent device buffer holding this layer's output. Allocated ONCE in
-    // EnableOpenCL and reused by every forward, so no forward pass allocates.
-    FSumBuffer: cl_mem;
-    FSumBufSize: integer; // element capacity of FSumBuffer
-    // Releases this layer's OpenCL resources: the device buffer, then the
-    // borrowed FSumKernel handle. Called from DisableOpenCL AND from Destroy -
-    // a layer is destroyed without a DisableOpenCL first, so neither may be
-    // the only caller. Coded by Claude (AI).
-    procedure ReleaseSumOpenCL();
-    // Adds the already-resident source outputs into FSumBuffer and leaves the
+    // cai_volume_sum: the kernel FOutputKernel is acquired and freed under.
+    function OutputKernelName(): string; override;
+    // Adds the already-resident source outputs into FOutputBuffer and leaves the
     // result there. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
   public
     constructor Create(aL: array of TNNetLayer); reintroduce; overload;
-    destructor Destroy(); override;
     {$IFDEF OpenCL}
-    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
-    function OpenCLOutputBuffer(): cl_mem; override;
-    function OpenCLBufferBytes(): int64; override;
-    function CanShareOpenCLOutput(): boolean; override;
-    procedure AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t); override;
-    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
     procedure Compute(); override;
@@ -84706,62 +84688,12 @@ begin
   end;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
-  {$IFDEF OpenCL}
-  FSumKernel := nil;
-  FSumBuffer := nil;
-  FSumBufSize := 0;
-  {$ENDIF}
-end;
-
-destructor TNNetSum.Destroy();
-begin
-  {$IFDEF OpenCL}
-  ReleaseSumOpenCL();
-  {$ENDIF}
-  inherited Destroy();
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetSum.EnableOpenCL(DotProductKernel: TNeuralKernel);
+function TNNetSum.OutputKernelName(): string;
 begin
-  inherited EnableOpenCL(DotProductKernel);
-  // Acquire once: a second call would leak a private handle.
-  if Assigned(FNN) and (not Assigned(FSumKernel)) then
-    FSumKernel := FNN.GetKernel('cai_volume_sum');
-  if Assigned(FSumBuffer) and (FSumBufSize <> FOutput.Size) then
-  begin
-    clReleaseMemObject(FSumBuffer);
-    FSumBuffer := nil;
-  end;
-  if not Assigned(FSumBuffer) then
-  begin
-    FSumBufSize := FOutput.Size;
-    FSumBuffer := DotProductKernel.CreateBuffer(
-      CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
-  end;
-end;
-
-procedure TNNetSum.ReleaseSumOpenCL();
-begin
-  if Assigned(FSumBuffer) then
-  begin
-    clReleaseMemObject(FSumBuffer);
-    FSumBuffer := nil;
-    FSumBufSize := 0;
-  end;
-  // With the buffer gone nothing of this layer's output is in OpenCL
-  // memory: leaving the flag set would hand a consumer a released buffer.
-  FOutputOnOpenCL := false;
-  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_volume_sum', FSumKernel);
-end;
-
-procedure TNNetSum.DisableOpenCL();
-begin
-  // FSumBuffer is read through FSumKernel's queue, so the output has to come
-  // back to RAM while that handle is still alive.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  ReleaseSumOpenCL();
+  Result := 'cai_volume_sum';
 end;
 
 function TNNetSum.WillOpenCL(): boolean;
@@ -84770,39 +84702,13 @@ begin
   // Forward only: this path leaves the output on the device, and the backward
   // pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) then exit;
-  if (not Assigned(FSumKernel)) or (not Assigned(FSumBuffer)) then exit;
-  // EnableOpenCL sized FSumBuffer for the output of that moment; a wider
+  if (not Assigned(FOutputKernel)) or (not Assigned(FOutputBuffer)) then exit;
+  // EnableOpenCL sized FOutputBuffer for the output of that moment; a wider
   // output would overrun it, so such a forward stays on the host.
-  if FOutput.Size > FSumBufSize then exit;
+  if FOutput.Size > FOutputBufSize then exit;
   // A single source is a copy, not a sum: nothing to win on the device.
   if FPrevOutput.Count < 2 then exit;
-  Result := SourcesReadyOnOpenCL(FSumKernel);
-end;
-
-function TNNetSum.OpenCLOutputBuffer(): cl_mem;
-begin
-  Result := FSumBuffer;
-end;
-
-function TNNetSum.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FSumBuffer);
-end;
-
-function TNNetSum.CanShareOpenCLOutput(): boolean;
-begin
-  Result := (not FIsTrainable) and Assigned(FSumBuffer);
-end;
-
-procedure TNNetSum.AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t);
-begin
-  AdoptRetainedOpenCLBuffer(FSumBuffer, Buffer);
-  FSumBufSize := FOutput.Size;
-end;
-
-function TNNetSum.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  Result := FSumKernel;
+  Result := SourcesReadyOnOpenCL(FOutputKernel);
 end;
 
 procedure TNNetSum.ComputeOpenCL();
@@ -84812,14 +84718,14 @@ var
   iSize, iCount, iAccumulate: longint;
   SlotBuffer: array[0..3] of cl_mem;
 begin
-  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FSumKernel);
-  Kern := FSumKernel.Kernel;
+  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
+  Kern := FOutputKernel.Kernel;
   iSize := FOutput.Size;
   MaxSourcePos := FPrevLayerList.Count - 1;
   SourcePos := 0;
   iAccumulate := 0;
   // Four sources per launch: the residual (2) and the fused residual (3) take
-  // one launch, and any wider sum accumulates into FSumBuffer across launches.
+  // one launch, and any wider sum accumulates into FOutputBuffer across launches.
   while SourcePos <= MaxSourcePos do
   begin
     SlotCnt := 0;
@@ -84838,8 +84744,8 @@ begin
     clSetKernelArg(Kern, 4, csCLMemSize, @SlotBuffer[1]);
     clSetKernelArg(Kern, 5, csCLMemSize, @SlotBuffer[2]);
     clSetKernelArg(Kern, 6, csCLMemSize, @SlotBuffer[3]);
-    clSetKernelArg(Kern, 7, csCLMemSize, @FSumBuffer);
-    FSumKernel.RunKernel(Kern, iSize);
+    clSetKernelArg(Kern, 7, csCLMemSize, @FOutputBuffer);
+    FOutputKernel.RunKernel(Kern, iSize);
     iAccumulate := 1;
   end;
   // No read back here: the result stays on the device until a host reader calls
@@ -103896,13 +103802,13 @@ end;
 destructor TNNetConcatOpenCLBase.Destroy();
 begin
   {$IFDEF OpenCL}
-  ReleaseConcatOpenCL();
+  ReleaseOutputOpenCL();
   {$ENDIF}
   inherited Destroy();
 end;
 
 {$IFDEF OpenCL}
-function TNNetConcatOpenCLBase.ConcatKernelName(): string;
+function TNNetConcatOpenCLBase.OutputKernelName(): string;
 begin
   Result := 'cai_deep_concat';
 end;
@@ -103911,72 +103817,72 @@ procedure TNNetConcatOpenCLBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   // Acquire once: a second call would leak a private handle.
-  if Assigned(FNN) and (not Assigned(FConcatKernel)) then
-    FConcatKernel := FNN.GetKernel(ConcatKernelName());
-  if Assigned(FConcatBuffer) and (FConcatBufSize <> FOutput.Size) then
+  if Assigned(FNN) and (not Assigned(FOutputKernel)) then
+    FOutputKernel := FNN.GetKernel(OutputKernelName());
+  if Assigned(FOutputBuffer) and (FOutputBufSize <> FOutput.Size) then
   begin
-    clReleaseMemObject(FConcatBuffer);
-    FConcatBuffer := nil;
+    clReleaseMemObject(FOutputBuffer);
+    FOutputBuffer := nil;
   end;
-  if not Assigned(FConcatBuffer) then
+  if not Assigned(FOutputBuffer) then
   begin
-    FConcatBufSize := FOutput.Size;
-    FConcatBuffer := DotProductKernel.CreateBuffer(
+    FOutputBufSize := FOutput.Size;
+    FOutputBuffer := DotProductKernel.CreateBuffer(
       CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
   end;
 end;
 
-procedure TNNetConcatOpenCLBase.ReleaseConcatOpenCL();
+procedure TNNetConcatOpenCLBase.ReleaseOutputOpenCL();
 begin
-  if Assigned(FConcatBuffer) then
+  if Assigned(FOutputBuffer) then
   begin
-    clReleaseMemObject(FConcatBuffer);
-    FConcatBuffer := nil;
-    FConcatBufSize := 0;
+    clReleaseMemObject(FOutputBuffer);
+    FOutputBuffer := nil;
+    FOutputBufSize := 0;
   end;
   // With the buffer gone nothing of this layer's output is in OpenCL
   // memory: leaving the flag set would hand a consumer a released buffer.
   FOutputOnOpenCL := false;
-  if Assigned(FNN) then FNN.FreeKernelIfNotShared(ConcatKernelName(), FConcatKernel);
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared(OutputKernelName(), FOutputKernel);
 end;
 
 procedure TNNetConcatOpenCLBase.DisableOpenCL();
 begin
-  // FConcatBuffer is read through FConcatKernel's queue, so the output has to
+  // FOutputBuffer is read through FOutputKernel's queue, so the output has to
   // come back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseConcatOpenCL();
+  ReleaseOutputOpenCL();
 end;
 
 function TNNetConcatOpenCLBase.OpenCLOutputBuffer(): cl_mem;
 begin
-  Result := FConcatBuffer;
+  Result := FOutputBuffer;
 end;
 
 function TNNetConcatOpenCLBase.OpenCLBufferBytes(): int64;
 begin
-  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FConcatBuffer);
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FOutputBuffer);
 end;
 
 function TNNetConcatOpenCLBase.CanShareOpenCLOutput(): boolean;
 begin
-  Result := (not FIsTrainable) and Assigned(FConcatBuffer);
+  Result := (not FIsTrainable) and Assigned(FOutputBuffer);
 end;
 
 procedure TNNetConcatOpenCLBase.AdoptOpenCLOutputBuffer(Buffer: cl_mem;
   Bytes: csize_t);
 begin
-  AdoptRetainedOpenCLBuffer(FConcatBuffer, Buffer);
-  FConcatBufSize := FOutput.Size;
+  AdoptRetainedOpenCLBuffer(FOutputBuffer, Buffer);
+  FOutputBufSize := FOutput.Size;
 end;
 
 function TNNetConcatOpenCLBase.OpenCLOutputKernel(): TNeuralKernel;
 begin
-  Result := FConcatKernel;
+  Result := FOutputKernel;
 end;
 
-function TNNetDeepConcat.ConcatKernelName(): string;
+function TNNetDeepConcat.OutputKernelName(): string;
 begin
   case FFusedSlotCount of
     2: Result := 'cai_deep_concat2';
@@ -104014,11 +103920,11 @@ begin
   // Forward only: this path leaves the output on the device, and the backward
   // pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) then exit;
-  if (not Assigned(FConcatKernel)) or (not Assigned(FConcatBuffer)) then exit;
-  // EnableOpenCL sized FConcatBuffer for the output of that moment; a wider
+  if (not Assigned(FOutputKernel)) or (not Assigned(FOutputBuffer)) then exit;
+  // EnableOpenCL sized FOutputBuffer for the output of that moment; a wider
   // output would overrun it, so such a forward stays on the host.
-  if FOutput.Size > FConcatBufSize then exit;
-  Result := SourcesReadyOnOpenCL(FConcatKernel);
+  if FOutput.Size > FOutputBufSize then exit;
+  Result := SourcesReadyOnOpenCL(FOutputKernel);
 end;
 
 procedure TNNetDeepConcat.ComputeOpenCL();
@@ -104028,8 +103934,8 @@ var
   MaxSourcePos, SourcePos, FirstSourceArg: integer;
   iPositionCount, iOutDepth, iInDepth, iDestChannel: longint;
 begin
-  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FConcatKernel);
-  Kern := FConcatKernel.Kernel;
+  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
+  Kern := FOutputKernel.Kernel;
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
   iOutDepth := FOutput.Depth;
   clSetKernelArg(Kern, 0, csLongintSize, @iPositionCount);
@@ -104052,15 +103958,15 @@ begin
         clSetKernelArg(Kern, 2 + SourcePos, csLongintSize, @iInDepth);
       end;
     end;
-    clSetKernelArg(Kern, FirstSourceArg + FFusedSlotCount, csCLMemSize, @FConcatBuffer);
+    clSetKernelArg(Kern, FirstSourceArg + FFusedSlotCount, csCLMemSize, @FOutputBuffer);
     // Dim 0 is the channel, not the position: it varies fastest across
     // work-items and the channel axis is the contiguous one, so the read and the
     // write both coalesce.
-    FConcatKernel.RunKernel2D(Kern, iOutDepth, iPositionCount);
+    FOutputKernel.RunKernel2D(Kern, iOutDepth, iPositionCount);
   end
   else
   begin
-    clSetKernelArg(Kern, 5, csCLMemSize, @FConcatBuffer);
+    clSetKernelArg(Kern, 5, csCLMemSize, @FOutputBuffer);
     if FIsBroadcast then
     begin
       // One launch over the whole output depth: the kernel's modulo tiles the
@@ -104071,7 +103977,7 @@ begin
       clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
       clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
       clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
-      FConcatKernel.RunKernel2D(Kern, iPositionCount, iOutDepth);
+      FOutputKernel.RunKernel2D(Kern, iPositionCount, iOutDepth);
     end
     else
     begin
@@ -104086,7 +103992,7 @@ begin
         clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
         clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
         clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
-        FConcatKernel.RunKernel2D(Kern, iPositionCount, iInDepth);
+        FOutputKernel.RunKernel2D(Kern, iPositionCount, iInDepth);
         Inc(iDestChannel, iInDepth);
       end;
     end;
@@ -108155,10 +108061,10 @@ begin
   // Forward only: this path leaves the output on the device, and the backward
   // pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) then exit;
-  if (not Assigned(FConcatKernel)) or (not Assigned(FConcatBuffer)) then exit;
+  if (not Assigned(FOutputKernel)) or (not Assigned(FOutputBuffer)) then exit;
   // The host path resizes an output the sources do not fill exactly, and a
   // wider output would overrun the buffer EnableOpenCL sized.
-  if (FOutput.Size > FConcatBufSize) or
+  if (FOutput.Size > FOutputBufSize) or
     (FOutput.Size <> FPrevOutput.GetTotalSize()) then exit;
   // With every source on the host, the host concat moves no data at all.
   Result := FPrevLayerList.AnyOutputBindableOnOpenCL();
@@ -108170,7 +108076,7 @@ var
   MaxSourcePos, SourcePos: integer;
   SourceBytes, DestOffsetBytes: csize_t;
 begin
-  // FConcatKernel lends only its queue: each source is one enqueued transfer.
+  // FOutputKernel lends only its queue: each source is one enqueued transfer.
   DestOffsetBytes := 0;
   MaxSourcePos := FPrevLayerList.Count - 1;
   for SourcePos := 0 to MaxSourcePos do
@@ -108181,8 +108087,8 @@ begin
     begin
       if Source.OutputBindableOnOpenCL() then
       begin
-        Source.OpenCLWaitOutputIfAnotherQueue(FConcatKernel);
-        FConcatKernel.CopyBuffer(Source.OpenCLOutputBuffer(), FConcatBuffer,
+        Source.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
+        FOutputKernel.CopyBuffer(Source.OpenCLOutputBuffer(), FOutputBuffer,
           SourceBytes, DestOffsetBytes);
       end
       else
@@ -108190,7 +108096,7 @@ begin
         // Blocking: a forward whose last layer ends on the host does not drain
         // this queue, and the next forward rewrites the source on the host.
         Source.ForceOutputOnRAM();
-        FConcatKernel.WriteBufferAt(FConcatBuffer, DestOffsetBytes, SourceBytes,
+        FOutputKernel.WriteBufferAt(FOutputBuffer, DestOffsetBytes, SourceBytes,
           FPrevOutput[SourcePos].GetRawPtr(0), CL_TRUE);
       end;
     end;
