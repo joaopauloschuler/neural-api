@@ -115,6 +115,7 @@ const
   csActAddChannel    = 44; // x + c[i mod n]: TNNetChannelBias, TNNetCellBias
   csActMulChannel    = 45; // x * c[i mod n]: TNNetChannelMul
   csActChannelAffine = 46; // x * gamma[d] + beta[d], gamma|beta packed: TNNetFiLM
+  csActSubMulConstant = 47; // (x - ParamA) * ParamB: TNNetMovingStdNormalization
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -2495,7 +2496,7 @@ type
   {$ENDIF}
 
   /// Shared base for the GLU-family gated activations (TNNetGLU / TNNetSwiGLU /
-  // TNNetGEGLU / TNNetGEGLUErf / TNNetReGLU / TNNetReGLUSquared). Splits the
+  // TNNetGEGLU / TNNetGEGLUErf / TNNetReGLU / TNNetReGLUSquared / TNNetTanhGLU). Splits the
   // input depth into two contiguous halves A|B and emits A * act(B) (ReGLU:
   // ReLU(A) * B), act selected by FGateActFlag - which a
   // descendant sets in its constructor and which is the ONLY thing the device
@@ -2504,7 +2505,7 @@ type
   TNNetGLUGateBase = class(TNNetLayer)
   protected
     // cai_glu_gate selector: 0=sigmoid, 1=swish, 2=gelu-tanh, 3=gelu-erf,
-    // 4=ReLU on A (ReGLU), 5=squared ReLU (ReGLUSquared).
+    // 4=ReLU on A (ReGLU), 5=squared ReLU (ReGLUSquared), 6=tanh (TanhGLU).
     FGateActFlag: integer;
     {$IFDEF OpenCL}
     FGLUGateCL: TNNetGLUGateCL;
@@ -2675,9 +2676,7 @@ type
   // Parameter-free; the input depth must be even. Mirrors TNNetGLU with
   // the sigmoid gate swapped for tanh; tanh'(b) = 1 - tanh^2(b).
   // Coded by Claude (AI).
-  TNNetTanhGLU = class(TNNetLayer)
-  private
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  TNNetTanhGLU = class(TNNetGLUGateBase)
   public
     constructor Create(); override;
     procedure Compute(); override;
@@ -5543,26 +5542,22 @@ type
   end;
 
   /// OpenCL forward helper for the windowed 2-D pooling layers (TNNetMaxPool /
-  // TNNetAvgPool). Binds the cai_pool2d entry point on the shared dot-product
-  // program's device, uploads the (already padding-prepared) input volume, runs
-  // one work-item per output (x,y,depth) cell -- each reducing its clipped
-  // PoolSize*PoolSize stride window by max or sum/divisor -- and reads the pooled
-  // result back. Forward-only (backward stays on CPU).
+  // TNNetMaxPoolPortable / TNNetAvgPool). Binds the cai_pool2d entry point on the
+  // shared dot-product program's device and runs one work-item per output
+  // (x,y,depth) cell -- each reducing its clipped, zero-padded PoolSize*PoolSize
+  // stride window by max or sum/divisor. Forward-only (backward stays on CPU).
   // Coded by Claude (AI).
   TNNetPool2DCL = class(TNNetKernelCL)
   private
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // X is the input volume to pool over (for TNNetMaxPool with padding/stride
-    // this is the post-CopyPadding FInputCopy). Y receives the pooled output.
-    // Reduce: 0 = max, 1 = average (sum / Divisor). Stride is the window stride;
-    // Divisor is the average-pool divisor (PoolSize*PoolSize for TNNetAvgPool,
-    // ignored for max). pExternalSrc is borrowed in place of uploading X.
+    // Pools X (unpadded InW x InH, read as if ringed by pPadding zero cells) into Y.
+    // Reduce: 0 = max, 1 = sum / Divisor; pExternalSrc is bound instead of uploading X.
     procedure Pool(X: TNNetVolume; Y: TNNetVolume;
       InW, InH, Depth, OutW, OutH, PoolSize, Stride, Reduce: integer;
       Divisor: TNeuralFloat; pExternalSrc: cl_mem = nil;
-      pKeepResultOnOpenCL: boolean = false);
+      pKeepResultOnOpenCL: boolean = false; pPadding: integer = 0);
     // The buffer the last call wrote Y into, and the kernel that wrote it.
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
@@ -17667,14 +17662,21 @@ type
       // called relative to AddLayer.
       function NeedsArgMax(): boolean; virtual;
       {$IFDEF OpenCL}
+      // Binds a resident source (or uploads the host one) and leaves the pooled
+      // result in OpenCL memory. The caller checks WillOpenCL first.
       procedure ComputeOpenCL();
       {$ENDIF}
+      // True when the device pool ran. False means the CPU path follows, with
+      // the source already downloaded and both residency flags reset.
+      function ComputePoolOnOpenCL(): boolean;
     public
       {$IFDEF OpenCL}
       destructor Destroy(); override;
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
   end;
@@ -17754,9 +17756,6 @@ type
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure DisableOpenCL(); override;
-    function OpenCLOutputBuffer(): cl_mem; override;
-    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -28389,19 +28388,7 @@ end;
 constructor TNNetTanhGLU.Create();
 begin
   inherited Create();
-end;
-
-procedure TNNetTanhGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
-  begin
-    FErrorProc('TNNetTanhGLU requires an even input depth. Input depth: ' +
-      IntToStr(pPrevLayer.FOutput.Depth));
-  end;
-  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
-    pPrevLayer.FOutput.Depth div 2);
-  SetOutputErrorSize(FOutput);
+  FGateActFlag := 6; // tanh on B
 end;
 
 procedure TNNetTanhGLU.Compute();
@@ -28416,7 +28403,11 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGateOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -39676,7 +39667,8 @@ end;
 
 procedure TNNetPool2DCL.Pool(X: TNNetVolume; Y: TNNetVolume;
   InW, InH, Depth, OutW, OutH, PoolSize, Stride, Reduce: integer;
-  Divisor: TNeuralFloat; pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+  Divisor: TNeuralFloat; pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean;
+  pPadding: integer);
 var
   bufX, bufY: cl_mem;
   k: cl_kernel;
@@ -39700,6 +39692,7 @@ begin
   clSetKernelArg(k, 8, csNeuralFloatSize, @fDivisor);
   clSetKernelArg(k, 9, csCLMemSize, @bufX);
   clSetKernelArg(k, 10, csCLMemSize, @bufY);
+  clSetKernelArg(k, 11, csLongintSize, @pPadding);
   // One work-item per output (x,y,depth) cell.
   FKernel.RunKernel(k, OutW * OutH * Depth);
   FOutputKernel := FKernel;
@@ -57871,7 +57864,11 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputePoolOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   Output.Fill(-1000000);
 
   if FPadding > 0
@@ -81363,18 +81360,30 @@ end;
 constructor TNNetMovingStdNormalization.Create();
 begin
   inherited Create();
+  // Both weights reach cai_activation as scalar constants on every forward.
+  FActivationOpcode := csActSubMulConstant;
   InitDefault;
 end;
 
 procedure TNNetMovingStdNormalization.Compute();
 var
   StartTime: double;
-  StdDev: TNeuralFloat;
+  StdDev, InvStdDev: TNeuralFloat;
 begin
   StartTime := Now();
+  StdDev := FNeurons[0].FWeights.FData[1];
+  // TNNetVolume.Divi multiplies by the single-precision reciprocal, so the
+  // device gets that same factor.
+  if (StdDev > 0) and (StdDev<>1)
+    then InvStdDev := 1/StdDev
+    else InvStdDev := 1;
+  if ComputeActivationOnOpenCL(FNeurons[0].FWeights.FData[0], InvStdDev) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   inherited Compute;
   FOutput.Sub(FNeurons[0].FWeights.FData[0]);
-  StdDev := FNeurons[0].FWeights.FData[1];
   if (StdDev > 0) and (StdDev<>1) then
   begin
     FOutput.Divi(StdDev);
@@ -104244,26 +104253,6 @@ begin
     ((Self.ClassType = TNNetAvgPool) or (Self.ClassType = TNNetAvgChannel)) and
     (FShouldOpenCL or FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
-
-procedure TNNetAvgPool.DisableOpenCL();
-begin
-  // FPool2DCL owns the buffer a kept output lives in.
-  ForceOutputOnRAM();
-  FOutputOnOpenCL := false;
-  inherited DisableOpenCL();
-end;
-
-function TNNetAvgPool.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FPool2DCL) then Result := FPool2DCL.ResultBuffer()
-  else Result := nil;
-end;
-
-function TNNetAvgPool.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  if Assigned(FPool2DCL) then Result := FPool2DCL.OutputKernel()
-  else Result := nil;
-end;
 {$ENDIF}
 
 procedure TNNetAvgPool.Compute();
@@ -109154,26 +109143,15 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputePoolOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
 
   if FPadding > 0
     then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
     else FInputCopy := FPrevLayer.Output;
-
-  {$IFDEF OpenCL}
-  // Device max-pool forward keeps the activation resident on the GPU between the
-  // conv stacks of image backbones (forward-only; backward stays on CPU and does
-  // not depend on cached state here). Restricted to exactly TNNetMaxPool: the
-  // argmax-tracking / channel / position subclasses keep the scalar path.
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
 
   Output.Fill(-1000000);
   if ((FStride = FPoolSize) and (FPadding = 0)) then
@@ -109196,8 +109174,23 @@ end;
 
 procedure TNNetMaxPool.DisableOpenCL();
 begin
+  // FPool2DCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
   inherited DisableOpenCL();
   FreeAndNil(FPool2DCL);
+end;
+
+function TNNetMaxPool.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetMaxPool.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.OutputKernel()
+  else Result := nil;
 end;
 
 procedure TNNetMaxPool.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -109209,22 +109202,57 @@ end;
 
 function TNNetMaxPool.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FPool2DCL) and FHasOpenCL and (Self.ClassType = TNNetMaxPool)
-            and (FShouldOpenCL or FForceOpenCL);
+  // Forward only: the backward reads the argmax positions the host forward
+  // records. TNNetMaxPoolPortable differs only in its output size.
+  Result := Assigned(FPool2DCL) and FHasOpenCL and (not NeedsArgMax()) and
+    ((Self.ClassType = TNNetMaxPool) or (Self.ClassType = TNNetMaxPoolPortable)) and
+    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
 end;
 
-// Device windowed max reduction faithful to the scalar Compute() above. The
-// window is clipped to the (post-CopyPadding) input exactly like the scalar
-// ComputeDefaultStride/ComputeWithStride loops; FInputCopy is the padded copy
-// when padding>0, so zero-padded border cells are real window members.
+// The kernel clips each window to the zero-padded input exactly like the scalar
+// ComputeDefaultStride/ComputeWithStride loops, so no host CopyPadding is needed.
 procedure TNNetMaxPool.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FPool2DCL.Pool(FInputCopy, FOutput,
-    FInputCopy.SizeX, FInputCopy.SizeY, FOutput.Depth,
-    FOutput.SizeX, FOutput.SizeY, FPoolSize, FStride, 0, 1.0);
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FPool2DCL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  FPool2DCL.Pool(FPrevLayer.Output, FOutput,
+    FPrevLayer.Output.SizeX, FPrevLayer.Output.SizeY, FOutput.Depth,
+    FOutput.SizeX, FOutput.SizeY, FPoolSize, FStride, 0, 1.0,
+    SourceBuffer, {pKeepResultOnOpenCL=}true, FPadding);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
+
+function TNNetMaxPool.ComputePoolOnOpenCL(): boolean;
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    Result := true;
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
 
 function TNNetMaxPool.NeedsArgMax(): boolean;
 begin

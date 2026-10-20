@@ -2573,6 +2573,7 @@ __kernel void cai_l2norm_perdepth
 //   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
 //   4 = relu on A   -> ReGLU     (ReLU(A) * B - the one flag that gates A)
 //   5 = relu^2      -> ReGLUSquared (A * ReLU(B)^2)
+//   6 = tanh        -> TanhGLU   (A * tanh(B))
 // One work-item per (token, output-channel). Forward-only; the formulas are the
 // exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
 // The sigmoid and tanh here are cai_activation's stable forms, not the direct
@@ -2633,11 +2634,13 @@ __kernel void cai_glu_gate
     FY[gid] = ((a > 0.0f) ? a : 0.0f) * b;
     return;
   }
-  else                          // ReGLUSquared: ReLU(B)^2
+  else if (FActFlag == 5)       // ReGLUSquared: ReLU(B)^2
   {
     const float r = (b > 0.0f) ? b : 0.0f;
     gated = r * r;
   }
+  else                          // TanhGLU: tanh(B), the clamped cai_activation form
+    gated = cai_fused_act(b, 3);
   FY[gid] = a * gated;
 }
 
@@ -2723,18 +2726,19 @@ __kernel void cai_group_norm
   }
 }
 
-// Windowed 2-D pooling forward (TNNetMaxPool / TNNetAvgPool). The input volume is
-// laid out depth-axis contiguous in the TVolume convention: element (x,y,d) lives
-// at FX[((FInW * y) + x) * FDepth + d], with row stride FInW*FDepth and x stride
-// FDepth. One work-item per OUTPUT (x,y,d) cell: it reduces its pooling window
-//   ix in [ox*FStride .. min(ox*FStride + FPoolSize - 1, FInW - 1)]
-//   iy in [oy*FStride .. min(oy*FStride + FPoolSize - 1, FInH - 1)]
-// (window edges are clipped to the input, exactly like the scalar loops). FReduce
-// selects the reduction:
-//   0 = MAX  : maximum over the actual (clipped) window cells. For TNNetMaxPool
-//              the host passes the post-CopyPadding input when padding>0 / strided
-//              so the zero-padded border cells are real window members, matching
-//              the scalar FInputCopy path. FStride is the layer stride.
+// Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
+// The input volume is laid out depth-axis contiguous in the TVolume convention:
+// element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride
+// FInW*FDepth and x stride FDepth. FInW/FInH are the UNPADDED input sizes; the
+// input is read as if surrounded by FPadding zero cells, the host CopyPadding
+// convention. One work-item per OUTPUT (x,y,d) cell: in padded coordinates it
+// reduces the window
+//   px in [ox*FStride .. min(ox*FStride + FPoolSize - 1, FInW + 2*FPadding - 1)]
+//   py in [oy*FStride .. min(oy*FStride + FPoolSize - 1, FInH + 2*FPadding - 1)]
+// (window edges are clipped to the padded input, exactly like the scalar loops).
+// FReduce selects the reduction:
+//   0 = MAX  : maximum over the (clipped) window cells; a window that reaches
+//              into the padding also sees its zero cells.
 //   1 = AVG  : sum over the window divided by FDivisor (TNNetAvgPool divides by
 //              the FULL FPoolSize*FPoolSize, NOT the clipped cell count; the host
 //              passes FStride = FPoolSize and FDivisor = FPoolSize*FPoolSize).
@@ -2751,7 +2755,8 @@ __kernel void cai_pool2d
   const int FReduce,
   const float FDivisor,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  const int FPadding
 )
 {
   const int gid = get_global_id(0);
@@ -2763,15 +2768,23 @@ __kernel void cai_pool2d
   const int ox = t % FOutW;
   const int oy = t / FOutW;
 
-  const int ix0 = ox * FStride;
-  const int iy0 = oy * FStride;
-  int ixMax = ix0 + FPoolSize - 1; if (ixMax > FInW - 1) ixMax = FInW - 1;
-  int iyMax = iy0 + FPoolSize - 1; if (iyMax > FInH - 1) iyMax = FInH - 1;
+  // Window bounds in unpadded coordinates, clipped to the padded extent first.
+  int ix0 = ox * FStride - FPadding;
+  int iy0 = oy * FStride - FPadding;
+  int ixMax = ix0 + FPoolSize - 1; if (ixMax > FInW - 1 + FPadding) ixMax = FInW - 1 + FPadding;
+  int iyMax = iy0 + FPoolSize - 1; if (iyMax > FInH - 1 + FPadding) iyMax = FInH - 1 + FPadding;
+  // The padding cells are zeros: they join the reduction once, through its
+  // starting value, and the loops below visit only the real cells.
+  const int touchesPadding = (ix0 < 0) || (iy0 < 0) || (ixMax > FInW - 1) || (iyMax > FInH - 1);
+  if (ix0 < 0) ix0 = 0;
+  if (iy0 < 0) iy0 = 0;
+  if (ixMax > FInW - 1) ixMax = FInW - 1;
+  if (iyMax > FInH - 1) iyMax = FInH - 1;
 
   const int rowStride = FInW * FDepth;
   if (FReduce == 0)
   {
-    float m = -1e30f;
+    float m = touchesPadding ? 0.0f : -1e30f;
     for (int iy = iy0; iy <= iyMax; iy++)
     {
       const int rowBase = iy * rowStride + d;
@@ -3095,7 +3108,8 @@ __kernel void cai_softmax
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
 // 24 = ReLUL, 25 = AddConstant, 26 = MulConstant, 27/28 = Snake,
 // 29..43 = the transcendental activations (Erf through ISRU),
-// 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine).
+// 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine),
+// 47 = SubMulConstant (TNNetMovingStdNormalization).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3288,6 +3302,9 @@ __kernel void cai_activation
       y = x * FChannelParam[c] + FChannelParam[FChannels + c];
       break;
     }
+    case 47: // SubMulConstant: (x - FParamA) * FParamB, the host Sub then Mul
+      y = (x - FParamA) * FParamB;
+      break;
     default: // csActNone / unknown: pass through
       y = x;
   }

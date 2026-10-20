@@ -507,6 +507,9 @@ type
     // -> ChannelBias -> ReZero -> CellBias -> DeepConcat -> AvgChannel -> FiLM ->
     // AvgPool -> ReLU stays resident (sentinels, transfers, weight refresh).
     procedure TestChannelAffineResidentOpenCLParity;
+    // Conv-stack glue, ForceOpenCL off: TNNetInput -> MovingStdNormalization ->
+    // MaxPoolPortable -> TanhGLU -> MaxPoolPortable -> MaxPool -> ReLU stays resident.
+    procedure TestConvStackResidentOpenCLParity;
     // TNNetFiLM with a host-only conditioning vector: the feature map is bound,
     // the vector is uploaded per forward.
     procedure TestFiLMHostCondOpenCLParity;
@@ -843,6 +846,9 @@ type
     // OpenCL windowed-reduction forward offload parity (vs CPU) for the pooling
     // layers TNNetMaxPool / TNNetAvgPool.
     procedure MaxPoolOpenCLParity;
+    // TNNetMaxPoolPortable and TNNetMaxPool under ForceOpenCL over several
+    // pool/stride/padding geometries (exact); a trainable layer stays on the host.
+    procedure MaxPoolPortableOpenCLParity;
     procedure AvgPoolOpenCLParity;
     // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
     procedure EmbeddingOpenCLParity;
@@ -69473,6 +69479,142 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.TestConvStackResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csDepth = 8;
+  csChainCount = 5;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  NormLayer, PortableLayer, GateLayer, PortableNoPadLayer, MaxPoolLayer: TNNetLayer;
+  ChainLayers: array[0..csChainCount - 1] of TNNetLayer;
+  OutCPU: array[0..csChainCount - 1] of TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, Pos, SentinelSurvivors, SentinelCount, MaxPos: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter, TransfersRefresh: TOpenCLTransferCounts;
+  MaxDiff, LayerDiff, RefreshDiff, Shift, StdDev: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 7, csDepth);
+  Expected := TNNetVolume.Create();
+  for LayerPos := 0 to csChainCount - 1 do
+    OutCPU[LayerPos] := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(9, 7, csDepth));
+    NormLayer := NN.AddLayer(TNNetMovingStdNormalization.Create());
+    PortableLayer := NN.AddLayer(TNNetMaxPoolPortable.Create(3, 2, 1));
+    GateLayer := NN.AddLayer(TNNetTanhGLU.Create());
+    PortableNoPadLayer := NN.AddLayer(TNNetMaxPoolPortable.Create(3, 1, 0));
+    MaxPoolLayer := NN.AddLayer(TNNetMaxPool.Create(2));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.SetTrainable(False, False);
+    ChainLayers[0] := NormLayer;
+    ChainLayers[1] := PortableLayer;
+    ChainLayers[2] := GateLayer;
+    ChainLayers[3] := PortableNoPadLayer;
+    ChainLayers[4] := MaxPoolLayer;
+    NormLayer.Neurons[0].Weights.Raw[0] := 0.2;
+    NormLayer.Neurons[0].Weights.Raw[1] := 1.6;
+    MaxPos := Input.Size - 1;
+    // Mostly negative after the shift, so padded windows must answer 0.
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := Sin(Pos * 0.37) - 0.3;
+
+    NN.Compute(Input);
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Copy(ChainLayers[LayerPos].Output);
+    Expected.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // A download or a host forward of any chain layer would overwrite these.
+    SentinelCount := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].Output.Fill(csSentinel);
+      Inc(SentinelCount, ChainLayers[LayerPos].Output.Size);
+    end;
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+    SentinelSurvivors := 0;
+    for LayerPos := 0 to csChainCount - 1 do
+      for Pos := 0 to ChainLayers[LayerPos].Output.Size - 1 do
+        if ChainLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+          Inc(SentinelSurvivors);
+    Write('  Conv-stack chain resident: per-layer max|diff|=');
+    for LayerPos := 0 to csChainCount - 1 do
+    begin
+      ChainLayers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsDiffToOutput(OutCPU[LayerPos], ChainLayers[LayerPos].Output);
+      Write(ChainLayers[LayerPos].ClassName, '=', LayerDiff:0:9, ' ');
+      MaxDiff := Max(MaxDiff, LayerDiff);
+    end;
+    WriteLn('sentinels=', SentinelSurvivors, '/', SentinelCount, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    for LayerPos := 0 to csChainCount - 1 do
+      AssertEquals(ChainLayers[LayerPos].ClassName +
+        ' ran both forwards on OpenCL', 2, ChainLayers[LayerPos].ForwardGPUCnt);
+    AssertEquals('the chain is bound, not downloaded', SentinelCount,
+      SentinelSurvivors);
+    AssertEquals('only the input is uploaded', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('conv-stack chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+
+    // The two weights travel as kernel arguments, so an update reaches the
+    // next forward with no upload.
+    Shift := -0.1;
+    StdDev := 0.8;
+    NormLayer.Neurons[0].Weights.Raw[0] := Shift;
+    NormLayer.Neurons[0].Weights.Raw[1] := StdDev;
+    NormLayer.FlushWeightCache();
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersRefresh := OpenCLProcessTransferTotals();
+    NormLayer.ForceOutputOnRAM();
+    RefreshDiff := 0;
+    MaxPos := NormLayer.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+      RefreshDiff := Max(RefreshDiff, Abs(NormLayer.Output.Raw[Pos] -
+        (Input.Raw[Pos] - Shift) / StdDev));
+    WriteLn('  after a weight update: uploads=',
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount,
+      ' MovingStdNormalization max|diff|=', RefreshDiff:0:9);
+    AssertEquals('a weight update costs no upload', 1,
+      TransfersRefresh.UploadCount - TransfersBefore.UploadCount);
+    AssertTrue('MovingStdNormalization reads the updated weights: max |diff| = ' +
+      FloatToStr(RefreshDiff), RefreshDiff < 1e-6);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    for LayerPos := 0 to csChainCount - 1 do
+      OutCPU[LayerPos].Free;
+    Expected.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.TestFiLMHostCondOpenCLParity;
 {$IFDEF OpenCL}
 const
@@ -70613,8 +70755,8 @@ end;
 procedure TTestNeuralNumerical.TestGLUGateResidentOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..5] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf',
-    'ReGLU', 'ReGLUSquared');
+  Names: array[0..6] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf',
+    'ReGLU', 'ReGLUSquared', 'TanhGLU');
 var
   NN, RefNN: TNNet;
   Input: TNNetVolume;
@@ -70635,7 +70777,8 @@ var
       2: Result := TNNetGEGLU.Create();
       3: Result := TNNetGEGLUErf.Create();
       4: Result := TNNetReGLU.Create();
-    else Result := TNNetReGLUSquared.Create();
+      5: Result := TNNetReGLUSquared.Create();
+    else Result := TNNetTanhGLU.Create();
     end;
   end;
 
@@ -70645,7 +70788,7 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for VariantCnt := 0 to 5 do
+  for VariantCnt := 0 to High(Names) do
   for DepthCnt := 0 to 1 do
   for ScaleCnt := 0 to 1 do
   begin
@@ -70664,8 +70807,8 @@ begin
       InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, InDepth, 1));
       // A ReLU convolution: cai_dot_product applies the activation on the
       // device, which is what leaves the source output in device memory.
-      // The ReLU-gated variants take a linear convolution instead, so their
-      // gate sees negative inputs and both ReLU branches are exercised.
+      // The ReLU- and tanh-gated variants take a linear convolution instead, so
+      // their gate sees negative inputs and both branches are exercised.
       if VariantCnt >= 4 then
         SourceLayer := NN.AddLayerAfter(
           TNNetConvolutionLinear.Create(InDepth, 3, 1, 1), InputLayer)
@@ -70753,7 +70896,7 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..51] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..53] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
@@ -70762,7 +70905,8 @@ const
     'MulByConstant', 'Snake', 'Snake per channel', 'Erf', 'Exp', 'Log',
     'Sqrt', 'Sin', 'Cos', 'Mish', 'SoftPlus', 'LogSigmoid', 'TanhShrink',
     'LiSHT', 'SoftPlusBeta', 'SoftPlusBeta beta 2', 'CELU', 'CELU alpha 0.5',
-    'GaussianActivation', 'ISRU', 'ISRU alpha 0.5');
+    'GaussianActivation', 'ISRU', 'ISRU alpha 0.5', 'MovingStdNormalization',
+    'MovingStdNormalization w1 <= 0');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -70826,7 +70970,17 @@ var
       48: Result := TNNetCELU.Create(0.5);
       49: Result := TNNetGaussianActivation.Create();
       50: Result := TNNetISRU.Create();
-    else Result := TNNetISRU.Create(0.5);
+      51: Result := TNNetISRU.Create(0.5);
+      52, 53:
+      begin
+        // The default weights (0, 1) are the identity; these exercise both halves.
+        Result := TNNetMovingStdNormalization.Create();
+        Result.Neurons[0].Weights.Raw[0] := 0.3;
+        if Variant = 52
+          then Result.Neurons[0].Weights.Raw[1] := 1.7
+          else Result.Neurons[0].Weights.Raw[1] := -0.5; // no divide on the host
+      end;
+    else Result := nil;
     end;
   end;
 
@@ -81301,6 +81455,8 @@ begin
   try
     NN.AddLayer(TNNetInput.Create(7, 6, 5, 1));
     NN.AddLayer(TNNetMaxPool.Create(3, 2, 1)); // pool 3, stride 2, pad 1
+    // The device path is inference-only: the backward reads host argmax positions.
+    NN.SetTrainable(False, False);
     for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
 
     NN.Compute(Input);
@@ -81321,10 +81477,103 @@ begin
       NN.ForceOpenCL(False);
     end;
     WriteLn('  MaxPool OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('TNNetMaxPool must reach the device',
+      NN.GetLastLayer.ForwardGPUCnt > 0);
     AssertTrue('MaxPool OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetMaxPoolPortable sizes its output by floor((In - Pool + 2*Pad) / Stride) + 1
+// and always takes the clipped-window ComputeWithStride; cai_pool2d reads the
+// zero padding itself. The sine input is negative in places, so a window that
+// reaches into the padding must answer 0. Coded by Claude (AI).
+procedure TTestNeuralNumerical.MaxPoolPortableOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csVariantCount = 7;
+  csFirstMaxPoolVariant = 5;
+  // Pool, stride, padding. Rows from csFirstMaxPoolVariant on are TNNetMaxPool.
+  Geometry: array[0..csVariantCount - 1, 0..2] of integer = (
+    (3, 2, 1), (3, 2, 0), (5, 1, 2), (2, 2, 0), (3, 1, 1), (2, 2, 0), (3, 2, 1));
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PoolLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  VariantCnt, Pos, MaxPos, TrainableCnt: integer;
+  MaxDiff: TNeuralFloat;
+  VariantName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for VariantCnt := 0 to csVariantCount - 1 do
+  for TrainableCnt := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(9, 7, 5);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(9, 7, 5, 1));
+      if VariantCnt < csFirstMaxPoolVariant then
+        PoolLayer := NN.AddLayer(TNNetMaxPoolPortable.Create(
+          Geometry[VariantCnt, 0], Geometry[VariantCnt, 1], Geometry[VariantCnt, 2]))
+      else
+        PoolLayer := NN.AddLayer(TNNetMaxPool.Create(
+          Geometry[VariantCnt, 0], Geometry[VariantCnt, 1], Geometry[VariantCnt, 2]));
+      VariantName := PoolLayer.ClassName + '(' + IntToStr(Geometry[VariantCnt, 0]) +
+        ',' + IntToStr(Geometry[VariantCnt, 1]) + ',' +
+        IntToStr(Geometry[VariantCnt, 2]) + ')';
+      if TrainableCnt = 0 then NN.SetTrainable(False, False);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 0.6 * Sin(Pos * 0.31) - 0.15;
+
+      NN.Compute(Input);
+      OutCPU.Copy(PoolLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Wipe the host copy, so a device path that never writes back compares
+        // as zeros instead of as its own reference.
+        PoolLayer.Output.Fill(0);
+        NN.Compute(Input);
+        PoolLayer.ForceOutputOnRAM();
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals(VariantName + ' output size match', OutCPU.Size,
+        PoolLayer.Output.Size);
+      MaxDiff := MaxAbsDiffToOutput(OutCPU, PoolLayer.Output);
+      WriteLn('  ', VariantName, ' trainable=', TrainableCnt, ' OpenCL parity: max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', PoolLayer.ForwardGPUCnt);
+      if TrainableCnt = 0 then
+        AssertTrue(VariantName + ' must reach the device', PoolLayer.ForwardGPUCnt > 0)
+      else
+        // The backward reads the argmax positions only the host forward records.
+        AssertEquals(VariantName + ' trainable stays on the host', 0,
+          PoolLayer.ForwardGPUCnt);
+      // A max selects one input value, so the device answer is exact.
+      AssertTrue(VariantName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff = 0);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
   end;
 end;
 {$ELSE}

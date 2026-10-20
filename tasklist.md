@@ -1894,7 +1894,7 @@ rather than acted on.
 
 Forward pass only; a device backward is a separate project (nothing in the tree
 has one today). 52 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
-`ComputeOpenCL`, and `cai_activation` covers 43 elementwise opcodes on top of
+`ComputeOpenCL`, and `cai_activation` covers 47 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
 "does this layer evict a resident chain to RAM", not by FLOPs.
@@ -1929,7 +1929,9 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       new gate flags: 4 = ReLU(A) * B (ReGLU gates the FIRST half, unlike the
       rest of the family) and 5 = A * ReLU(B)^2. Pinned by
       `TestGLUGateResidentOpenCLParity` (linear-conv source, so both ReLU
-      branches are exercised): ReGLU 0.0, ReGLUSquared 1.2e-7.
+      branches are exercised): ReGLU 0.0, ReGLUSquared 1.2e-7. `TNNetTanhGLU`
+      joined the base the same way (flag 6 = A * tanh(B), the clamped
+      `cai_fused_act` tanh): 1.2e-7 relative in the same test.
 - [X] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
       `TNNetFiLM`, `TNNetAvgChannel` (plus `TNNetCellBias` and `TNNetReZero`).
       No new kernel: `cai_activation` gained opcodes 44 AddChannel, 45
@@ -1992,8 +1994,8 @@ Derived by walking the class graph: a layer counts as covered if it declares
 own `Compute`, or inherits one of those without overriding `Compute`. 310 of
 the 487 classes fail that test; the ones below are the subset the vision and
 audio builders actually instantiate. Note the third case: a class that
-overrides `Compute` with no device branch silently loses its parent's kernel,
-which is how `TNNetMaxPoolPortable` lost `TNNetMaxPool`'s.
+overrides `Compute` with no device branch silently loses its parent's kernel
+(`TNNetMaxPoolPortable` lost `TNNetMaxPool`'s that way; fixed below).
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
@@ -2007,9 +2009,19 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       on. The per-sample weight modulation/demodulation folds into the column
       gather, so this is a conv kernel with a scaled weight slab, not a new
       contraction.
-- [ ] `TNNetMaxPoolPortable` device forward. It overrides `Compute` and loses
-      the pooling kernel it inherits from `TNNetMaxPool`, and it sits in the
-      ResNet, Inception-V3 and DETR stems.
+- [X] `TNNetMaxPoolPortable` device forward (ResNet, Inception-V3 and DETR
+      stems). Portable differs from `TNNetMaxPool` only in its output size,
+      floor((In - Pool + 2*Pad) / Stride) + 1, and in always taking the
+      clipped-window `ComputeWithStride`; `cai_pool2d` already clips windows
+      the same way. The kernel gained a padding argument (zero cells, the
+      `CopyPadding` convention), so both classes now share one
+      `TNNetMaxPool.ComputeOpenCL` that binds a resident source and keeps its
+      result resident (the bind/keep plumbing moved up from `TNNetAvgPool`).
+      The device path is inference-only for both: the backward reads the
+      argmax positions only the host forward records, which a trainable
+      `TNNetMaxPool` under `FShouldOpenCL` used to leave stale. Pinned by
+      `MaxPoolPortableOpenCLParity` (7 geometries, exact) and
+      `TestConvStackResidentOpenCLParity`.
 - [ ] Vision attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,
@@ -2033,12 +2045,14 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       beside the already-listed `TNNetTransposeXD`, `TNNetCrop` and
       `TNNetPadXY`.
 - [ ] Extend the per-channel affine item above to the conv-stack members:
-      `TNNetPReLUChannel`, `TNNetGRN` and `TNNetMovingStdNormalization`
-      (ConvNeXt, RIFE, StyleGAN2, SAM, the moving-norm blocks).
-      `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26).
-      PReLUChannel is one more channel-table opcode. The moving norm's forward
-      is two stored scalars, `(x - w0) / w1`, so a scalar-affine opcode covers
-      it. GRN needs a per-channel spatial reduction first.
+      `TNNetPReLUChannel` and `TNNetGRN` (ConvNeXt, RIFE, StyleGAN2, SAM).
+      `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26), and so is
+      `TNNetMovingStdNormalization`: opcode 47 SubMulConstant,
+      (x - w0) * (1/w1), the host's own reciprocal Mul, with both weights
+      passed as kernel arguments every forward so an update needs no upload
+      (`TestActivationOpenCLParity` 1.2e-7, `TestConvStackResidentOpenCLParity`).
+      PReLUChannel is one more channel-table opcode. GRN needs a per-channel
+      spatial reduction first.
 - [ ] Activations with no `cai_activation` opcode, reachable from the
       vision and audio towers: `TNNetSwishLearnable` (`TNNetErf` now has
       opcode 29; `TNNetReGLU` is done above).
