@@ -2106,6 +2106,9 @@ type
     // Byte-processing skip connection on an input depth that is not a multiple
     // of 8 (added at the END to avoid disturbing the shared-RNG ordering).
     procedure TestByteProcessingSkipUnalignedDepth;
+    // TNNetDeepConcat with resident and host-only sources, 4x3 and 1x1, fused and
+    // per-source launches: exact vs CPU, only host-only sources are uploaded.
+    procedure TestDeepConcatHostSourceOpenCLParity;
   end;
 
 implementation
@@ -72810,6 +72813,148 @@ begin
         AssertEquals('with every source on the host the concat stays there', 0,
           ConcatLayer.ForwardGPUCnt);
       AssertTrue('TNNetConcat OpenCL vs CPU (' + CaseName + '): max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
+      AssertTrue('the CPU reference is not degenerate', Expected.GetMaxAbs() > 0);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      ConcatCPU.Free;
+      Expected.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDeepConcatHostSourceOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, Expected, ConcatCPU: TNNetVolume;
+  InputLayer, ShuffleLayer, ReLULayer, IdentityLayer, ScaleLayer: TNNetLayer;
+  ConcatLayer: TNNetDeepConcat;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, Pos, MaxPos, SizeX, SizeY, SentinelSurvivors, SentinelCount: integer;
+  HostSourceBytes: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+
+  function CountSentinels(V: TNNetVolume): integer;
+  var
+    RawPos, MaxRawPos: integer;
+  begin
+    Result := 0;
+    MaxRawPos := V.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      if V.Raw[RawPos] = csSentinel then Inc(Result);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CaseCnt := 0 to 3 do
+  begin
+    // Cases 0..1 have 4x3 positions, 2..3 a single position (the decode shape).
+    if CaseCnt < 2 then
+    begin
+      SizeX := 4;
+      SizeY := 3;
+    end
+    else
+    begin
+      SizeX := 1;
+      SizeY := 1;
+    end;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, 6);
+    Expected := TNNetVolume.Create();
+    ConcatCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(SizeX, SizeY, 6));
+      ShuffleLayer := NN.AddLayerAfter(TNNetChannelShuffle.Create(3), InputLayer);
+      ReLULayer := NN.AddLayerAfter(TNNetReLU.Create(), InputLayer);
+      // TNNetIdentity and THostOnlyMulByConstant have no OpenCL path.
+      IdentityLayer := NN.AddLayerAfter(TNNetIdentity.Create(), InputLayer);
+      ScaleLayer := NN.AddLayerAfter(THostOnlyMulByConstant.Create(0.5), InputLayer);
+      if (CaseCnt mod 2) = 0 then
+      begin
+        // Three sources: one cai_deep_concat3 launch.
+        CaseName := 'fused 3 sources';
+        ConcatLayer := TNNetDeepConcat.Create([ShuffleLayer, IdentityLayer, ReLULayer]);
+        HostSourceBytes := IdentityLayer.Output.Size * SizeOf(TNeuralFloat);
+      end
+      else
+      begin
+        // Five sources: one cai_deep_concat launch per source.
+        CaseName := 'per-source 5 sources';
+        ConcatLayer := TNNetDeepConcat.Create(
+          [ScaleLayer, ShuffleLayer, IdentityLayer, ReLULayer, ShuffleLayer]);
+        HostSourceBytes := (ScaleLayer.Output.Size + IdentityLayer.Output.Size) *
+          SizeOf(TNeuralFloat);
+      end;
+      CaseName := CaseName + ' at ' + IntToStr(SizeX) + 'x' + IntToStr(SizeY);
+      NN.AddLayer(ConcatLayer);
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) - 0.3;
+
+      NN.Compute(Input);
+      Expected.Copy(NN.GetLastLayer.Output);
+      ConcatCPU.Copy(ConcatLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      // A download or a host forward would overwrite these.
+      ShuffleLayer.Output.Fill(csSentinel);
+      ReLULayer.Output.Fill(csSentinel);
+      ConcatLayer.Output.Fill(csSentinel);
+      SentinelCount := ShuffleLayer.Output.Size + ReLULayer.Output.Size +
+        ConcatLayer.Output.Size;
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      OpenCLTransferCounting := WasCounting;
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      SentinelSurvivors := CountSentinels(ShuffleLayer.Output) +
+        CountSentinels(ReLULayer.Output) + CountSentinels(ConcatLayer.Output);
+      ConcatLayer.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(ConcatCPU, ConcatLayer.Output));
+      WriteLn('  DeepConcat host source (', CaseName, '): max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', ConcatLayer.ForwardGPUCnt,
+        ' sentinels=', SentinelSurvivors, '/', SentinelCount,
+        ' uploads=', TransfersAfter.UploadCount - TransfersBefore.UploadCount,
+        ' downloads=', TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertFalse('the TNNetIdentity source is host-only (' + CaseName + ')',
+        IdentityLayer.OutputBindableOnOpenCL());
+      AssertFalse('the THostOnlyMulByConstant source is host-only (' + CaseName + ')',
+        ScaleLayer.OutputBindableOnOpenCL());
+      AssertEquals('TNNetDeepConcat ran both forwards on OpenCL (' + CaseName + ')',
+        2, ConcatLayer.ForwardGPUCnt);
+      AssertEquals('resident sources and the concat are bound, not downloaded (' +
+        CaseName + ')', SentinelCount, SentinelSurvivors);
+      // The input, then one upload per host-only source position.
+      AssertEquals('bytes uploaded per forward (' + CaseName + ')',
+        Input.Size * SizeOf(TNeuralFloat) + HostSourceBytes,
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+      AssertEquals('only the last layer is downloaded (' + CaseName + ')', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('TNNetDeepConcat OpenCL vs CPU (' + CaseName + '): max |diff| = ' +
         FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
       AssertTrue('the CPU reference is not degenerate', Expected.GetMaxAbs() > 0);
     finally

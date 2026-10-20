@@ -1907,7 +1907,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [ ] `TNNetDeepConcat` with one host-only source falls back to the host and
+- [X] `TNNetDeepConcat` with one host-only source falls back to the host and
       downloads every resident source. `TNNetConcat.ComputeOpenCL` uploads a
       host-only source straight into its slice of the output; DeepConcat's
       channel-interleaved layout needs an upload buffer per such source (or,

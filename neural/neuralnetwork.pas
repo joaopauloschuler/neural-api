@@ -13772,7 +13772,7 @@ type
     function OutputKernelName(): string; virtual;
     // Releases the OpenCL buffer, then the borrowed FOutputKernel handle. Called
     // from DisableOpenCL AND from Destroy (a layer can skip DisableOpenCL).
-    procedure ReleaseOutputOpenCL();
+    procedure ReleaseOutputOpenCL(); virtual;
     {$ENDIF}
   public
     destructor Destroy(); override;
@@ -13823,10 +13823,19 @@ type
     // it across the output depth instead of one launch per replica. Only read on
     // the per-source path: the fused kernels bind the same buffer to every slot.
     FIsBroadcast: boolean;
+    // Per source position: the OpenCL copy of a host-only source's output and
+    // its byte capacity. Sized in EnableOpenCL, allocated on a source's first upload.
+    FUploadBuffers: array of cl_mem;
+    FUploadBufBytes: array of csize_t;
     // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
     function OutputKernelName(): string; override;
-    // Scatters the already-resident source outputs into FOutputBuffer. The caller
-    // checks WillOpenCL() and bumps FForwardGPUCnt.
+    // Releases the upload buffers, then the inherited output buffer and kernel.
+    procedure ReleaseOutputOpenCL(); override;
+    // The OpenCL buffer the kernels read source SourcePos from: its own output
+    // when resident, else its upload buffer refreshed from RAM (blocking).
+    function SourceBufferOnOpenCL(SourcePos: integer): cl_mem;
+    // Scatters the source outputs into FOutputBuffer, uploading host-only ones
+    // first. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
   public
@@ -13836,6 +13845,7 @@ type
     {$IFDEF OpenCL}
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     function WillOpenCL(): boolean; override;
+    function OpenCLBufferBytes(): int64; override;
     {$ENDIF}
 
     procedure Compute(); override;
@@ -103912,6 +103922,54 @@ begin
       FIsBroadcast := false;
       Break;
     end;
+  // SetLength keeps existing handles and zeroes new slots, so a re-arm leaks nothing.
+  SetLength(FUploadBuffers, FPrevLayerList.Count);
+  SetLength(FUploadBufBytes, FPrevLayerList.Count);
+end;
+
+procedure TNNetDeepConcat.ReleaseOutputOpenCL();
+var
+  MaxSourcePos, SourcePos: integer;
+begin
+  MaxSourcePos := High(FUploadBuffers);
+  for SourcePos := 0 to MaxSourcePos do
+    if Assigned(FUploadBuffers[SourcePos]) then
+    begin
+      clReleaseMemObject(FUploadBuffers[SourcePos]);
+      FUploadBuffers[SourcePos] := nil;
+      FUploadBufBytes[SourcePos] := 0;
+    end;
+  inherited ReleaseOutputOpenCL();
+end;
+
+function TNNetDeepConcat.OpenCLBufferBytes(): int64;
+var
+  MaxSourcePos, SourcePos: integer;
+begin
+  Result := inherited OpenCLBufferBytes();
+  MaxSourcePos := High(FUploadBuffers);
+  for SourcePos := 0 to MaxSourcePos do
+    Result := Result + OpenCLMemBytes(FUploadBuffers[SourcePos]);
+end;
+
+function TNNetDeepConcat.SourceBufferOnOpenCL(SourcePos: integer): cl_mem;
+var
+  Source: TNNetLayer;
+begin
+  Source := FPrevLayerList[SourcePos];
+  if Source.OutputBindableOnOpenCL() then
+  begin
+    Source.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
+    Result := Source.OpenCLOutputBuffer();
+  end
+  else
+  begin
+    // Blocking: a forward whose last layer ends on the host does not drain
+    // this queue, and the next forward rewrites the source on the host.
+    Source.ForceOutputOnRAM();
+    Result := FOutputKernel.EnsureWriteBuffer(FUploadBuffers[SourcePos],
+      FUploadBufBytes[SourcePos], FPrevOutput[SourcePos], true, true);
+  end;
 end;
 
 function TNNetDeepConcat.WillOpenCL(): boolean;
@@ -103924,7 +103982,8 @@ begin
   // EnableOpenCL sized FOutputBuffer for the output of that moment; a wider
   // output would overrun it, so such a forward stays on the host.
   if FOutput.Size > FOutputBufSize then exit;
-  Result := SourcesReadyOnOpenCL(FOutputKernel);
+  // With every source on the host, the host concat moves no data at all.
+  Result := FPrevLayerList.AnyOutputBindableOnOpenCL();
 end;
 
 procedure TNNetDeepConcat.ComputeOpenCL();
@@ -103934,7 +103993,6 @@ var
   MaxSourcePos, SourcePos, FirstSourceArg: integer;
   iPositionCount, iOutDepth, iInDepth, iDestChannel: longint;
 begin
-  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
   Kern := FOutputKernel.Kernel;
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
   iOutDepth := FOutput.Depth;
@@ -103950,7 +104008,7 @@ begin
     FirstSourceArg := 2 + MaxSourcePos;
     for SourcePos := 0 to MaxSourcePos do
     begin
-      SourceBuffer := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+      SourceBuffer := SourceBufferOnOpenCL(SourcePos);
       clSetKernelArg(Kern, FirstSourceArg + SourcePos, csCLMemSize, @SourceBuffer);
       if SourcePos < MaxSourcePos then
       begin
@@ -103973,7 +104031,7 @@ begin
       // single source across it.
       iInDepth := FPrevOutput[0].Depth;
       iDestChannel := 0;
-      SourceBuffer := FPrevLayerList[0].OpenCLOutputBuffer();
+      SourceBuffer := SourceBufferOnOpenCL(0);
       clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
       clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
       clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
@@ -103988,7 +104046,7 @@ begin
       for SourcePos := 0 to MaxSourcePos do
       begin
         iInDepth := FPrevOutput[SourcePos].Depth;
-        SourceBuffer := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+        SourceBuffer := SourceBufferOnOpenCL(SourcePos);
         clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
         clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
         clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
@@ -103998,7 +104056,7 @@ begin
     end;
   end;
   // No read back here: the result stays on the device until a host reader calls
-  // ForceOutputOnRAM, so the sources never make a round trip.
+  // ForceOutputOnRAM, so the resident sources never make a round trip.
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
 end;
