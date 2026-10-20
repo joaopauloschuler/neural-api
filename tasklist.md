@@ -1699,6 +1699,27 @@ rather than acted on.
       LoRA exists for Qwen-Image-2.1 (the known Lightning adapters target earlier
       Qwen-Image releases). The SD UNet path (`BuildSDUNetFromSafeTensors`) can
       take the same reader once the real Stable Diffusion pipeline item above lands.
+- [ ] Tiny AutoEncoder (TAESD, diffusers `AutoencoderTiny`) decoder importer +
+      per-step previews. `BuildTinyVaeDecoderFromSafeTensors[Ex]` for
+      `madebyollin/taesd` (SD 1.x/2.x, 4-ch latents), `taesdxl`, `taesd3` and
+      `taef1` (16-ch). The decoder is about 1M parameters of plain layers, so it is
+      pure composition over existing classes, no new layer: `tanh(x/3)*3` latent
+      clamp, then 3x3 `TNNetConvolutionReLU` stages, `AutoencoderTinyBlock` =
+      three 3x3 convs + identity skip (`TNNetSum`) + ReLU, nearest-2x between
+      stages (`TNNetDeMaxPool(2)`, as in `BuildVaeDecoderFromSafeTensors`'s
+      Upsample2D), and the output mapped [0,1] -> [-1,1]. Every
+      piece has a device forward, so the whole decoder stays resident under
+      OpenCL. Two uses: (1) a `--preview N` flag in examples/QwenImage and
+      examples/LatentTextToImage that decodes the current x0 estimate every N
+      steps to a PPM/PNG at a few ms per image, instead of waiting for the full
+      VAE (task B2: 3x3 convs at 1152 channels); (2) a `--fast-vae` final
+      decode for drafts. For QwenImage, first check that Qwen-Image-2.1 still uses
+      the Wan-2.1-style latent space; if so, the matching tiny decoder is
+      `taew2_1` in `madebyollin/taehv` (a video variant with temporal blocks; a
+      single image is T=1, so verify which output frame to keep). Do not add an
+      encoder in v1. Tests: a pico `AutoencoderTiny` fixture built in the ~/x
+      venv (random weights, `latent_channels` 4 and 16), decoded image as the
+      oracle, the test itself Pascal; README section in each example touched.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
