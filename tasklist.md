@@ -2021,7 +2021,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       box first; at 1024x1024 the contraction should dominate.
 - [ ] The rest of the vision attention subclasses that override `Compute` and
       so lose `TNNetScaledDotProductAttention`'s device path:
-      - `TNNetSwinV2WindowAttention`: cosine attention, so Q and K rows must be
+      - [X] `TNNetSwinV2WindowAttention`: cosine attention, so Q and K rows must be
         L2-normalized before the dot and the scale is the per-head
         logit_scale, not 1/sqrt(d_k). Route: a row-normalize pre-pass into a
         packed [Qn|Kn|V] buffer (allocated in EnableOpenCL), then

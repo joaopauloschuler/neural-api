@@ -33,6 +33,9 @@ type
     // Last message handed to TEasyOpenCL.ErrorProc by a deliberate bad build.
     FLastCompileError: string;
     procedure CaptureCompileError(const AMessage: string);
+    // Window attention (Cosine = SwinV2) on OpenCL vs the CPU: several windows
+    // and heads, shift masks, resident outputs, a bias and logit_scale update.
+    procedure CheckWindowAttentionOpenCLParity(Cosine: boolean);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -756,6 +759,7 @@ type
     // variants that DON'T ship a correct offload must NOT arm the device path.
     procedure ALiBiAttentionOpenCLParity;
     procedure WindowAttentionOpenCLParity;
+    procedure SwinV2WindowAttentionOpenCLParity;
     procedure T5RelPosBiasAttentionOpenCLParity;
     // OpenCL forward offload parity (vs CPU) for the three remaining score-math
     // SDPA variants: cosine-similarity (Q/K L2-renorm on the host before the
@@ -78107,7 +78111,7 @@ end;
 // device forward must match the CPU Compute() within FP32 GEMM-reorder noise.
 // SeqLen >= 32 so the device path fires; causal+sliding-window are exercised so
 // the masking branch is covered. The test also pins the SAFETY guard: a sibling
-// variant (TNNetT5RelPosBiasAttention) that ships NO correct offload must have
+// variant (TNNetSinkAttention) that ships NO correct offload must have
 // ShouldOpenCL = false after EnableOpenCL, i.e. it falls back to its CPU
 // Compute() rather than the wrong inherited plain-SDPA device path. (Cosine /
 // disentangled / conformer now DO ship correct offloads, so they are armed and
@@ -78124,7 +78128,7 @@ var
   XData, OutCPU: TNNetVolume;
   InputLayer: TNNetLayer;
   Attn: TNNetALiBiAttention;
-  NoOffload: TNNetSwinV2WindowAttention;
+  NoOffload: TNNetSinkAttention;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   i: integer;
@@ -78179,10 +78183,10 @@ begin
   NN := TNNet.Create();
   try
     InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
-    NoOffload := TNNetSwinV2WindowAttention.Create(Dk, SeqLen);
+    NoOffload := TNNetSinkAttention.Create(Dk, {CausalMask}true, 2);
     NN.AddLayerAfter(NoOffload, InputLayer);
     NN.EnableOpenCL(PlatformId, DeviceId);
-    AssertTrue('SwinV2 window attention must fall back to CPU (ShouldOpenCL=false)',
+    AssertTrue('sink attention must fall back to CPU (ShouldOpenCL=false)',
       not NoOffload.ShouldOpenCL);
   finally
     NN.Free;
@@ -78195,10 +78199,10 @@ end;
 {$ENDIF}
 
 {$IFDEF OpenCL}
-// Windows x Heads TNNetWindowAttention layers over one packed input, wired as
-// the Swin builders do (crop a window, split a head's Q|K|V, concat back).
+// Windows x Heads TNNetWindowAttention (Cosine: TNNetSwinV2WindowAttention)
+// layers over one packed input, wired as the Swin builders do.
 function BuildWindowAttentionParityNet(SeqLen, Dk, Heads, Windows: integer;
-  out AttnLayers: TNNetLayerRefArr): TNNet;
+  Cosine: boolean; out AttnLayers: TNNetLayerRefArr): TNNet;
 var
   WinSlice: TNNetLayer;
   HeadOuts, WindowOuts: TNNetLayerRefArr;
@@ -78219,8 +78223,11 @@ begin
     begin
       Result.AddLayerAfter(
         TNNetSplitChannels.Create(HeadPos * 3 * Dk, 3 * Dk), WinSlice);
-      HeadOuts[HeadPos] := Result.AddLayer(
-        TNNetWindowAttention.Create(Dk, SeqLen));
+      if Cosine
+        then HeadOuts[HeadPos] := Result.AddLayer(
+          TNNetSwinV2WindowAttention.Create(Dk, SeqLen))
+        else HeadOuts[HeadPos] := Result.AddLayer(
+          TNNetWindowAttention.Create(Dk, SeqLen));
       AttnLayers[WindowPos * Heads + HeadPos] := HeadOuts[HeadPos];
     end;
     WindowOuts[WindowPos] := Result.AddLayer(TNNetDeepConcat.Create(HeadOuts));
@@ -78256,6 +78263,19 @@ end;
 // HF's -100) and heads must match the CPU forward, keep their outputs resident
 // and pick up a bias update.
 procedure TTestNeuralNumerical.WindowAttentionOpenCLParity;
+begin
+  CheckWindowAttentionOpenCLParity({Cosine=}false);
+end;
+
+// TNNetSwinV2WindowAttention: the same over L2-normalized Q and K rows with a
+// per-layer logit_scale; one query row is all zeros.
+procedure TTestNeuralNumerical.SwinV2WindowAttentionOpenCLParity;
+begin
+  CheckWindowAttentionOpenCLParity({Cosine=}true);
+end;
+
+procedure TTestNeuralNumerical.CheckWindowAttentionOpenCLParity(
+  Cosine: boolean);
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
@@ -78268,7 +78288,7 @@ var
   AttnLayers, AttnCPU: TNNetLayerRefArr;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  ShapePos, SeqLen, Heads, LayerPos, MaxLayerPos, Pos, MaxPos: integer;
+  ShapePos, SeqLen, Dk, Heads, LayerPos, MaxLayerPos, Pos, MaxPos: integer;
   SentinelSurvivors, SentinelTotal, GPUForwards: integer;
   MaxDiff, RefreshDiff: TNeuralFloat;
 begin
@@ -78280,13 +78300,14 @@ begin
   for ShapePos := 0 to High(csShapes) do
   begin
     SeqLen := csShapes[ShapePos, 0];
+    Dk := csShapes[ShapePos, 1];
     Heads := csShapes[ShapePos, 2];
-    NN := BuildWindowAttentionParityNet(SeqLen, csShapes[ShapePos, 1], Heads,
-      csShapes[ShapePos, 3], AttnLayers);
-    NNCPU := BuildWindowAttentionParityNet(SeqLen, csShapes[ShapePos, 1], Heads,
-      csShapes[ShapePos, 3], AttnCPU);
+    NN := BuildWindowAttentionParityNet(SeqLen, Dk, Heads,
+      csShapes[ShapePos, 3], Cosine, AttnLayers);
+    NNCPU := BuildWindowAttentionParityNet(SeqLen, Dk, Heads,
+      csShapes[ShapePos, 3], Cosine, AttnCPU);
     Input := TNNetVolume.Create(SeqLen * csShapes[ShapePos, 3], 1,
-      Heads * 3 * csShapes[ShapePos, 1]);
+      Heads * 3 * Dk);
     Bias := TNNetVolume.Create(SeqLen * SeqLen, 1, 1);
     try
       MaxLayerPos := High(AttnLayers);
@@ -78296,10 +78317,24 @@ begin
           csMaskValues[ShapePos]);
         TNNetWindowAttention(AttnLayers[LayerPos]).SetBiasMatrix(Bias);
         TNNetWindowAttention(AttnCPU[LayerPos]).SetBiasMatrix(Bias);
+        if Cosine then
+        begin
+          TNNetSwinV2WindowAttention(AttnLayers[LayerPos]).SetLogitScale(
+            4 + 3 * LayerPos);
+          TNNetSwinV2WindowAttention(AttnCPU[LayerPos]).SetLogitScale(
+            4 + 3 * LayerPos);
+        end;
       end;
       MaxPos := Input.Size - 1;
       for Pos := 0 to MaxPos do
         Input.Raw[Pos] := 1.5 * Sin(Pos * 0.37) + 0.4 * Cos(Pos * 1.7);
+      // Token 0's first query row is zero: its cosine scores are bias only.
+      if Cosine then
+      begin
+        MaxPos := Dk - 1;
+        for Pos := 0 to MaxPos do
+          Input.Raw[Pos] := 0;
+      end;
       NNCPU.Compute(Input);
 
       NN.EnableOpenCL(PlatformId, DeviceId);
@@ -78335,13 +78370,20 @@ begin
           csMaskValues[ShapePos]);
         TNNetWindowAttention(AttnLayers[LayerPos]).SetBiasMatrix(Bias);
         TNNetWindowAttention(AttnCPU[LayerPos]).SetBiasMatrix(Bias);
+        if Cosine then
+        begin
+          TNNetSwinV2WindowAttention(AttnLayers[LayerPos]).SetLogitScale(
+            20 - LayerPos);
+          TNNetSwinV2WindowAttention(AttnCPU[LayerPos]).SetLogitScale(
+            20 - LayerPos);
+        end;
       end;
       NNCPU.Compute(Input);
       NN.Compute(Input);
       RefreshDiff := MaxAbsDiffToOutput(NNCPU.GetLastLayer.Output,
         NN.GetLastLayer.Output);
-      WriteLn('  WindowAttention OpenCL seq=', SeqLen, ' dk=',
-        csShapes[ShapePos, 1], ' heads=', Heads, ' windows=',
+      WriteLn('  WindowAttention OpenCL cosine=', Cosine, ' seq=', SeqLen,
+        ' dk=', Dk, ' heads=', Heads, ' windows=',
         csShapes[ShapePos, 3], ': max|diff|=', MaxDiff:0:9, ' after update=',
         RefreshDiff:0:9, ' sentinels=', SentinelSurvivors, '/', SentinelTotal);
       AssertEquals('every TNNetWindowAttention forward ran on OpenCL',

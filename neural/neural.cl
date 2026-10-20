@@ -4245,6 +4245,40 @@ __kernel void cai_sdpa_append_kv
   }
 }
 
+// Cosine-attention pre-pass for TNNetSwinV2WindowAttention: copies the packed
+// [ Q | K | V ] rows of FX into FY with the Q and K slices scaled to unit L2
+// norm, qn = q / sqrt(sum(q^2) + FEps), and V unchanged. One work-item per
+// (token row, slice): global id p carries t*3 + slice. FEps > 0 keeps the
+// reciprocal finite on an all-zero row. Shares the flash kernels' queue.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_qk_l2norm_packed
+(
+  const int FTokenCnt,
+  const int FDk,
+  const float FEps,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  if (p >= FTokenCnt * 3) return;
+  const int slice = p % 3;
+  const int base = p * FDk;
+  float invN = 1.0f;
+  if (slice < 2)
+  {
+    float ss = 0.0f;
+    for (int d = 0; d < FDk; d++)
+    {
+      const float v = FX[base + d];
+      ss = mad(v, v, ss);
+    }
+    invN = 1.0f / sqrt(ss + FEps);
+  }
+  for (int d = 0; d < FDk; d++)
+    FY[base + d] = FX[base + d] * invN;
+}
+
 // Query heads a lane scores against one K row at a time in the split-row
 // decode kernels: a fixed slab so the accumulators stay in registers. A head
 // group wider than this re-reads the K row once per slab. The slab loops clamp

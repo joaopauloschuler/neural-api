@@ -4621,6 +4621,11 @@ type
     function FlashForwardIsExact(): boolean; virtual;
     // Additive bias of score (t, j) = Result[Base + t*RowStride + j]; nil = none.
     function ScoreBiasTable(out Base, RowStride: integer): TNNetVolume; virtual;
+    // The packed [Q|K|V] buffer the flash forward reads, given the bound source
+    // (nil = upload the source); the base class passes it through.
+    function FlashPackedSource(SourceBuffer: cl_mem): cl_mem; virtual;
+    // The factor of every flash score (Q . K); the base class uses 1/sqrt(d_k).
+    function FlashScoreScale(): TNeuralFloat; virtual;
     // Runs ComputeFlashOpenCL when WillOpenCL and returns true; otherwise marks
     // the output host-written, downloads the source and returns false.
     function ForwardOnOpenCL(): boolean;
@@ -4959,6 +4964,10 @@ type
     // ComputeFlashPacked's additive score bias table (grow-only).
     FBufScoreBias: cl_mem;
     FCapScoreBias: csize_t;
+    // cai_sdpa_qk_l2norm_packed and its [Qn|Kn|V] result (grow-only).
+    FQKNormKernel: cl_kernel;
+    FBufQKNorm: cl_mem;
+    FCapQKNorm: csize_t;
     FRowKeyEndsVersion, FRowKeyEndCnt: integer;
     // The last flash launch's tiles and key splits, test-only split count and
     // flash row threshold (0 = automatic), and the path of the last forward.
@@ -5127,6 +5136,12 @@ type
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
       pScoreBias: TNNetVolume = nil; pScoreBiasBase: integer = 0;
       pScoreBiasRowStride: integer = 0; pScoreBiasChanged: boolean = true);
+    // Sizes NormalizeQKPacked's result for TokenCnt rows of [Q|K|V] (grow-only).
+    procedure EnsureQKNormBuffer(TokenCnt, Dk: integer);
+    // X = (TokenCnt, 1, [Q|K|V]) (or pExternalSrc) with the Q and K slices
+    // L2-normalized, on the flash queue; returns the buffer, a packed source.
+    function NormalizeQKPacked(X: TNNetVolume; Dk: integer; Eps: TNeuralFloat;
+      pExternalSrc: cl_mem = nil): cl_mem;
     // The same over the int8 cache on cai_sdpa_flash_int8 (ComputeInt8's append).
     procedure ComputeFlashInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
@@ -7521,6 +7536,9 @@ type
     FSeqLen: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     {$IFDEF OpenCL}
+    // True when the score adds only the bias matrix: no soft-cap, causal mask
+    // or window, and the matrix is SeqLen x SeqLen.
+    function BiasFlashFits(): boolean;
     // The flash forward with the bias matrix as its score bias (rows SeqLen).
     function FlashForwardIsExact(): boolean; override;
     function ScoreBiasTable(out Base, RowStride: integer): TNNetVolume; override;
@@ -7555,10 +7573,21 @@ type
     FQNorm: TNNetVolume; // L2-normalized query rows, [SeqLen,1,d_k]
     FKNorm: TNNetVolume; // L2-normalized key rows,   [SeqLen,1,d_k]
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    {$IFDEF OpenCL}
+    // The flash forward over cai_sdpa_qk_l2norm_packed's [Qn|Kn|V] rows with
+    // logit_scale as the score factor and the bias matrix as the score bias.
+    function FlashForwardIsExact(): boolean; override;
+    function FlashPackedSource(SourceBuffer: cl_mem): cl_mem; override;
+    function FlashScoreScale(): TNeuralFloat; override;
+    {$ENDIF}
   public
     constructor Create(d_k: integer; pSeqLen: integer); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
+    {$IFDEF OpenCL}
+    // Also sizes the OpenCL [Qn|Kn|V] buffer when the flash forward is armed.
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    {$ENDIF}
     // Per-head cosine logit_scale (HF clamp(raw,max=log(1/0.01)).exp()). Set at
     // load time; persisted in FFloatSt[1] so it round-trips through save/load.
     procedure SetLogitScale(pScale: TNeuralFloat);
@@ -35473,6 +35502,17 @@ begin
   Result := nil;
 end;
 
+function TNNetScaledDotProductAttention.FlashPackedSource(
+  SourceBuffer: cl_mem): cl_mem;
+begin
+  Result := SourceBuffer;
+end;
+
+function TNNetScaledDotProductAttention.FlashScoreScale(): TNeuralFloat;
+begin
+  Result := FInvSqrtDk;
+end;
+
 function TNNetScaledDotProductAttention.ForwardOnOpenCL(): boolean;
 begin
   Result := WillOpenCL();
@@ -35531,8 +35571,9 @@ begin
     SourceBuffer := nil;
     FPrevLayer.ForceOutputOnRAM();
   end;
+  SourceBuffer := FlashPackedSource(SourceBuffer);
   FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk, FWindow,
-    FCausal, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
+    FCausal, FlashScoreScale(), FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
     {pKeepResultOnOpenCL=}true, ScoreBias, BiasBase, BiasRowStride,
     {pScoreBiasChanged=}FAfterWeightUpdateHasBeenCalled);
   if Assigned(ScoreBias) then FAfterWeightUpdateHasBeenCalled := false;
@@ -40847,6 +40888,7 @@ begin
   FAppendInt8Kernel := FKernel.CreateKernel('cai_sdpa_append_kv_int8');
   FSplitInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_split_int8');
   FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
+  FQKNormKernel := FKernel.CreateKernel('cai_sdpa_qk_l2norm_packed');
   FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
   FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
   FFlashKernels[false] := FKernel.CreateKernel('cai_sdpa_flash');
@@ -40877,11 +40919,13 @@ begin
   if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
   if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
   if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
+  if Assigned(FQKNormKernel)     then clReleaseKernel(FQKNormKernel);
   for Int8KV := false to true do
     if Assigned(FFlashKernels[Int8KV]) then
       clReleaseKernel(FFlashKernels[Int8KV]);
   if Assigned(FBufRowKeyEnds) then clReleaseMemObject(FBufRowKeyEnds);
   if Assigned(FBufScoreBias) then clReleaseMemObject(FBufScoreBias);
+  if Assigned(FBufQKNorm) then clReleaseMemObject(FBufQKNorm);
   if Assigned(FBufX)        then clReleaseMemObject(FBufX);
   if Assigned(FBufK)        then clReleaseMemObject(FBufK);
   if Assigned(FBufV)        then clReleaseMemObject(FBufV);
@@ -41537,6 +41581,32 @@ begin
     [], 0, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, FBufK, FBufV,
     pKeepResultOnOpenCL, bufBias, pScoreBiasBase, pScoreBiasRowStride,
     BiasLen);
+end;
+
+procedure TNNetFusedSDPACL.EnsureQKNormBuffer(TokenCnt, Dk: integer);
+begin
+  FKernel.EnsureBuffer(FBufQKNorm, FCapQKNorm, CL_MEM_READ_WRITE,
+    csize_t(TokenCnt) * 3 * Dk * csNeuralFloatSize);
+end;
+
+function TNNetFusedSDPACL.NormalizeQKPacked(X: TNNetVolume; Dk: integer;
+  Eps: TNeuralFloat; pExternalSrc: cl_mem = nil): cl_mem;
+var
+  bufX: cl_mem;
+  TokenCnt: integer;
+  fEps: single;
+begin
+  TokenCnt := X.SizeX;
+  fEps := Eps;
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  EnsureQKNormBuffer(TokenCnt, Dk);
+  clSetKernelArg(FQKNormKernel, 0, csLongintSize, @TokenCnt);
+  clSetKernelArg(FQKNormKernel, 1, csLongintSize, @Dk);
+  clSetKernelArg(FQKNormKernel, 2, csNeuralFloatSize, @fEps);
+  clSetKernelArg(FQKNormKernel, 3, csCLMemSize, @bufX);
+  clSetKernelArg(FQKNormKernel, 4, csCLMemSize, @FBufQKNorm);
+  FKernel.RunKernel(FQKNormKernel, TokenCnt * 3);
+  Result := FBufQKNorm;
 end;
 
 procedure TNNetFusedSDPACL.ComputeFlashInt8(X, Y: TNNetVolume;
@@ -48094,12 +48164,16 @@ begin
 end;
 
 {$IFDEF OpenCL}
+function TNNetWindowAttention.BiasFlashFits(): boolean;
+begin
+  Result := (FScoreSoftCap = 0) and (not FCausal) and (FWindow = 0)
+    and (FNeurons.Count > 0)
+    and (FNeurons[0].FWeights.Size = FSeqLen * FSeqLen);
+end;
+
 function TNNetWindowAttention.FlashForwardIsExact(): boolean;
 begin
-  // Compute applies no soft-cap and no mask beyond the bias matrix.
-  Result := (Self.ClassType = TNNetWindowAttention) and (FScoreSoftCap = 0)
-    and (not FCausal) and (FWindow = 0) and (FNeurons.Count > 0)
-    and (FNeurons[0].FWeights.Size = FSeqLen * FSeqLen);
+  Result := (Self.ClassType = TNNetWindowAttention) and BiasFlashFits();
 end;
 
 function TNNetWindowAttention.ScoreBiasTable(
@@ -48193,6 +48267,9 @@ end;
 
 { TNNetSwinV2WindowAttention }
 
+const
+  csSwinV2NormEps = 1e-12; // matches TNNetCosineSimilarityAttention
+
 constructor TNNetSwinV2WindowAttention.Create(d_k: integer; pSeqLen: integer);
 begin
   inherited Create(d_k, pSeqLen);
@@ -48226,10 +48303,36 @@ begin
   Result := FFloatSt[1];
 end;
 
+{$IFDEF OpenCL}
+procedure TNNetSwinV2WindowAttention.EnableOpenCL(
+  DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FFusedSDPACL) then
+    FFusedSDPACL.EnsureQKNormBuffer(FSeqLen, FDk);
+end;
+
+function TNNetSwinV2WindowAttention.FlashForwardIsExact(): boolean;
+begin
+  Result := (Self.ClassType = TNNetSwinV2WindowAttention) and BiasFlashFits();
+end;
+
+function TNNetSwinV2WindowAttention.FlashPackedSource(
+  SourceBuffer: cl_mem): cl_mem;
+begin
+  Result := FFusedSDPACL.NormalizeQKPacked(FPrevLayer.FOutput, FDk,
+    csSwinV2NormEps, SourceBuffer);
+end;
+
+function TNNetSwinV2WindowAttention.FlashScoreScale(): TNeuralFloat;
+begin
+  Result := FFloatSt[1];
+end;
+{$ENDIF}
+
 procedure TNNetSwinV2WindowAttention.Compute();
 const
   cMaskFloor = -1e8; // same all-masked-row floor as the parent
-  cEps = 1e-12;      // matches TNNetCosineSimilarityAttention
 var
   pos, AttnRow: integer;
   StartTime: double;
@@ -48240,8 +48343,8 @@ var
   Prev: TNNetVolume;
   OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} if ForwardOnOpenCL() then exit; {$ENDIF}
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;
@@ -48257,13 +48360,13 @@ begin
   begin
     QPtr := Prev.GetRawPtr(i, 0);                       // #4
     SumSq := TNNetVolume.DotProduct(QPtr, QPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + cEps);
+    InvN := pcr_rsqrtf(SumSq + csSwinV2NormEps);
     QnPtr := FQNorm.GetRawPtr(i, 0);                     // #4
     Move(QPtr^, QnPtr^, FDk * csNeuralFloatSize);
     TNNetVolume.Mul(QnPtr, InvN, FDk);
     KPtr := Prev.GetRawPtr(i, 0, FDk);                   // #4
     SumSq := TNNetVolume.DotProduct(KPtr, KPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + cEps);
+    InvN := pcr_rsqrtf(SumSq + csSwinV2NormEps);
     KnPtr := FKNorm.GetRawPtr(i, 0);                     // #4
     Move(KPtr^, KnPtr^, FDk * csNeuralFloatSize);
     TNNetVolume.Mul(KnPtr, InvN, FDk);
