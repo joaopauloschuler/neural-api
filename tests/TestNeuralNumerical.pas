@@ -69728,6 +69728,12 @@ begin
   CheckLayer('FlipX', TNNetFlipX.Create(), 5, 3, 2);
   CheckLayer('FlipY', TNNetFlipY.Create(), 5, 3, 2);
   CheckLayer('ReverseXY', TNNetReverseXY.Create(), 5, 3, 2);
+  CheckLayer('ReverseChannels', TNNetReverseChannels.Create(), 3, 2, 5);
+  CheckLayer('Roll depth +2', TNNetRoll.Create(2), 3, 2, 5);
+  CheckLayer('Roll depth -7', TNNetRoll.Create(-7), 3, 2, 5);
+  CheckLayer('Roll X +3', TNNetRoll.Create(3, 0), 5, 3, 2);
+  CheckLayer('Roll Y -1', TNNetRoll.Create(-1, 1), 5, 3, 2);
+  CheckLayer('Roll X 0', TNNetRoll.Create(0, 0), 5, 3, 2);
 end;
 {$ELSE}
 begin
@@ -69739,7 +69745,7 @@ procedure TTestNeuralNumerical.TestGatherCopyResidentOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
-  csChainCount = 14;
+  csChainCount = 19;
 var
   NN: TNNet;
   Input, Expected: TNNetVolume;
@@ -69779,6 +69785,11 @@ begin
     ChainLayers[11] := NN.AddLayer(TNNetFlipX.Create());              // 4x7x1
     ChainLayers[12] := NN.AddLayer(TNNetFlipY.Create());              // 4x7x1
     ChainLayers[13] := NN.AddLayer(TNNetReverseXY.Create());          // 4x7x1
+    ChainLayers[14] := NN.AddLayer(TNNetRoll.Create(2, 0));           // 4x7x1
+    ChainLayers[15] := NN.AddLayer(TNNetRoll.Create(-3, 1));          // 4x7x1
+    ChainLayers[16] := NN.AddLayer(TNNetTransposeXD.Create());        // 1x7x4
+    ChainLayers[17] := NN.AddLayer(TNNetReverseChannels.Create());    // 1x7x4
+    ChainLayers[18] := NN.AddLayer(TNNetRoll.Create(1));              // 1x7x4
     NN.AddLayer(TNNetReLU.Create());
     NN.SetTrainable(False, False);
     MaxPos := Input.Size - 1;

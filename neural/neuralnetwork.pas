@@ -13229,6 +13229,11 @@ type
   // the same involution to OutputError.
   // Coded by Claude (AI).
   TNNetReverseChannels = class(TNNetIdentity)
+    private
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -13308,6 +13313,10 @@ type
       // 2 = Y). Used by the serializer so the stored value passes through
       // unchanged on load.
       constructor CreateFromStoredAxis(AShift: integer; AStoredAxis: integer);
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(AShift: integer); reintroduce; overload;
       constructor Create(AShift: integer; AAxis: integer); reintroduce; overload;
@@ -55532,6 +55541,27 @@ end;
 
 { TNNetReverseChannels }
 
+{$IFDEF OpenCL}
+function TNNetReverseChannels.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetReverseChannels.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  OutD, MaxOutD: integer;
+begin
+  // Output (x, y, d) reads source (x, y, Depth - 1 - d).
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeX * Src.SizeY, Src.Depth);
+  Plan.AddAxis(Src.Depth, 1);
+  MaxOutD := Src.Depth - 1;
+  for OutD := 0 to MaxOutD do
+    Plan.SetAxisSource(OutD, MaxOutD - OutD);
+end;
+{$ENDIF}
+
 procedure TNNetReverseChannels.Compute();
 var
   CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
@@ -55539,7 +55569,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   MaxDepth := FOutput.Depth - 1;
   Depth := FOutput.Depth;
@@ -55898,6 +55928,45 @@ begin
   else FStruct[1] := 0;
 end;
 
+{$IFDEF OpenCL}
+function TNNetRoll.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetRoll.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  AxisExtent, AxisStride: array[0..2] of integer;
+  AxisPos, RolledAxis, RollExtent, Sh, OutCoord, MaxOutCoord: integer;
+begin
+  // Plan axes are Y, X, depth; output coordinate c on the rolled axis reads
+  // source (c - Shift) mod extent.
+  Src := FPrevLayer.FOutput;
+  AxisExtent[0] := Src.SizeY;  AxisStride[0] := Src.SizeX * Src.Depth;
+  AxisExtent[1] := Src.SizeX;  AxisStride[1] := Src.Depth;
+  AxisExtent[2] := Src.Depth;  AxisStride[2] := 1;
+  case FStruct[1] of
+    1: RolledAxis := 1;
+    2: RolledAxis := 0;
+  else
+    RolledAxis := 2;
+  end;
+  for AxisPos := 0 to 2 do
+  begin
+    Plan.AddAxis(AxisExtent[AxisPos], AxisStride[AxisPos]);
+    if AxisPos = RolledAxis then
+    begin
+      RollExtent := AxisExtent[AxisPos];
+      Sh := ((FStruct[0] mod RollExtent) + RollExtent) mod RollExtent;
+      MaxOutCoord := RollExtent - 1;
+      for OutCoord := 0 to MaxOutCoord do
+        Plan.SetAxisSource(OutCoord, (OutCoord - Sh + RollExtent) mod RollExtent);
+    end;
+  end;
+end;
+{$ENDIF}
+
 procedure TNNetRoll.Compute();
 var
   CntX, CntY, MaxX, MaxY, SizeX, SizeY, Depth, Shift, Axis: integer;
@@ -55905,7 +55974,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;

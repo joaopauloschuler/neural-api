@@ -2038,9 +2038,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       resident chain of `TestGatherCopyResidentOpenCLParity`.
 - [X] `TNNetFlipY` and `TNNetReverseXY` on the same `cai_gather_copy` plan
       (reversed Y table / reversed position table), in both gather-copy tests.
-- [ ] `TNNetReverseChannels` and `TNNetRoll` are pure reorders that still
-      download their source in Compute: a reversed depth table, and a cyclic
-      table on the rolled axis (X, Y or depth), on `cai_gather_copy`.
+- [X] `TNNetReverseChannels` and `TNNetRoll` on the same `cai_gather_copy`
+      plan (reversed depth table / cyclic table on the rolled X, Y or depth
+      axis), in both gather-copy tests.
 - [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
       new kernel (per-channel softmax over time, then the two weighted moments)
       reading two sources, the features and `FLogitLayer`. It runs once per
