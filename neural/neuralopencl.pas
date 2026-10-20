@@ -220,9 +220,9 @@ type
     function QueueScratchBuffer(pBytes: csize_t; out pGeneration: integer): cl_mem;
     // Bytes of this command queue's scratch buffer (0 before the first use).
     function QueueScratchBytes(): csize_t;
-    // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
-    // memory; ordered after earlier work on the queue and returns at once.
-    function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+    // Enqueues a cb-byte copy from src to dst at dstOffsetBytes on this queue, both
+    // in OpenCL memory; ordered after earlier work on the queue, returns at once.
+    function CopyBuffer(src, dst: cl_mem; cb: csize_t; dstOffsetBytes: csize_t = 0): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -3907,9 +3907,10 @@ begin
   end;
 end;
 
-function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t;
+  dstOffsetBytes: csize_t): integer;
 begin
-  Result := clEnqueueCopyBuffer(FCommands, src, dst, 0, 0, cb, 0, nil, nil);
+  Result := clEnqueueCopyBuffer(FCommands, src, dst, 0, dstOffsetBytes, cb, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to copy buffer: ' + IntToStr(Result) +

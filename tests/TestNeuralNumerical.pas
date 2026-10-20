@@ -558,6 +558,9 @@ type
     // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
     // broadcast (one launch instead of one per replica).
     procedure TestDeepConcatOpenCLParity;
+    // TNNetConcat device forward: exact vs CPU; resident sources are copied in
+    // OpenCL memory (sentinels survive), host-only sources are uploaded.
+    procedure TestConcatResidentOpenCLParity;
     // Device-side gated activation (cai_glu_gate) forward parity over an
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
@@ -71582,6 +71585,151 @@ begin
       SetLength(Branches, 0);
       SetLength(Depths, 0);
       OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConcatResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, Expected, ConcatCPU: TNNetVolume;
+  InputLayer, PadLayer, ShuffleLayer, HostLayer: TNNetLayer;
+  ConcatLayer: TNNetConcat;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, Pos, MaxPos, SentinelSurvivors, SentinelCount: integer;
+  HostSourceCount, HostSourceBytes: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CaseCnt := 0 to 2 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(4, 3, 6);
+    Expected := TNNetVolume.Create();
+    ConcatCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(4, 3, 6));
+      PadLayer := NN.AddLayer(TNNetPad.Create(1, pmReflect));        // 180
+      ShuffleLayer := NN.AddLayerAfter(TNNetChannelShuffle.Create(3), InputLayer); // 72
+      // A plain TNNetIdentity has no OpenCL path, so its output is host-only.
+      HostLayer := NN.AddLayerAfter(TNNetIdentity.Create(), InputLayer); // 72
+      case CaseCnt of
+        0:
+        begin
+          // The same source twice: two copies from one buffer.
+          CaseName := 'all resident';
+          ConcatLayer := TNNetConcat.Create([PadLayer, ShuffleLayer, PadLayer]);
+        end;
+        1:
+        begin
+          // An explicit output shape the sources fill exactly (180+72+72 = 18x18).
+          CaseName := 'mixed resident + host';
+          ConcatLayer := TNNetConcat.Create(18, 18, 1,
+            [PadLayer, HostLayer, ShuffleLayer]);
+        end;
+      else
+        CaseName := 'all host';
+        ConcatLayer := TNNetConcat.Create([HostLayer, HostLayer]);
+      end;
+      NN.AddLayer(ConcatLayer);
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) - 0.3;
+
+      NN.Compute(Input);
+      Expected.Copy(NN.GetLastLayer.Output);
+      ConcatCPU.Copy(ConcatLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      // A download or a host forward would overwrite these.
+      SentinelCount := 0;
+      HostSourceCount := 0;
+      HostSourceBytes := 0;
+      if CaseCnt = 1 then
+      begin
+        HostSourceCount := 1;
+        HostSourceBytes := HostLayer.Output.Size * SizeOf(TNeuralFloat);
+      end;
+      if CaseCnt < 2 then
+      begin
+        PadLayer.Output.Fill(csSentinel);
+        ShuffleLayer.Output.Fill(csSentinel);
+        ConcatLayer.Output.Fill(csSentinel);
+        SentinelCount := PadLayer.Output.Size + ShuffleLayer.Output.Size +
+          ConcatLayer.Output.Size;
+      end;
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      OpenCLTransferCounting := WasCounting;
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      SentinelSurvivors := 0;
+      if CaseCnt < 2 then
+      begin
+        for Pos := 0 to PadLayer.Output.Size - 1 do
+          if PadLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        for Pos := 0 to ShuffleLayer.Output.Size - 1 do
+          if ShuffleLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        for Pos := 0 to ConcatLayer.Output.Size - 1 do
+          if ConcatLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      end;
+      ConcatLayer.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(ConcatCPU, ConcatLayer.Output));
+      WriteLn('  Concat resident (', CaseName, '): max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', ConcatLayer.ForwardGPUCnt,
+        ' sentinels=', SentinelSurvivors, '/', SentinelCount,
+        ' uploads=', TransfersAfter.UploadCount - TransfersBefore.UploadCount,
+        ' downloads=', TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertFalse('the TNNetIdentity source is host-only (' + CaseName + ')',
+        HostLayer.OutputBindableOnOpenCL());
+      if CaseCnt < 2 then
+      begin
+        AssertEquals('TNNetConcat ran both forwards on OpenCL (' + CaseName + ')',
+          2, ConcatLayer.ForwardGPUCnt);
+        AssertEquals('resident sources and the concat are bound, not downloaded (' +
+          CaseName + ')', SentinelCount, SentinelSurvivors);
+        // The input, then each host-only source written into the concat buffer.
+        AssertEquals('uploads per forward (' + CaseName + ')', 1 + HostSourceCount,
+          TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+        AssertEquals('bytes uploaded per forward (' + CaseName + ')',
+          Input.Size * SizeOf(TNeuralFloat) + HostSourceBytes,
+          TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+        AssertEquals('only the last layer is downloaded (' + CaseName + ')', 1,
+          TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      end
+      else
+        AssertEquals('with every source on the host the concat stays there', 0,
+          ConcatLayer.ForwardGPUCnt);
+      AssertTrue('TNNetConcat OpenCL vs CPU (' + CaseName + '): max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
+      AssertTrue('the CPU reference is not degenerate', Expected.GetMaxAbs() > 0);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      ConcatCPU.Free;
+      Expected.Free;
       Input.Free;
       NN.Free;
     end;

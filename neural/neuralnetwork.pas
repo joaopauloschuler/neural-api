@@ -1325,6 +1325,8 @@ type
       // A source already on pKernel's queue is ordered ahead of what follows,
       // so only the sources that are not cost a wait.
       procedure OpenCLWaitOutputIfAnotherQueue(pKernel: TNeuralKernel);
+      // True when at least one listed layer is bindable (False for an empty list).
+      function AnyOutputBindableOnOpenCL(): boolean;
       {$ENDIF}
   end;
   {$ELSE}
@@ -1340,6 +1342,8 @@ type
       // A source already on pKernel's queue is ordered ahead of what follows,
       // so only the sources that are not cost a wait.
       procedure OpenCLWaitOutputIfAnotherQueue(pKernel: TNeuralKernel);
+      // True when at least one listed layer is bindable (False for an empty list).
+      function AnyOutputBindableOnOpenCL(): boolean;
       {$ENDIF}
       property Items[Index: Integer]: TNNetLayer read GetItem write SetItem; default;
   end;
@@ -13499,13 +13503,54 @@ type
     {$ENDIF}
   end;
 
+  /// Base of the concatenations whose device forward writes one persistent
+  // OpenCL output buffer. Do not use it directly.
+  // Coded by Claude (AI).
+  TNNetConcatOpenCLBase = class(TNNetConcatBase)
+  protected
+    {$IFDEF OpenCL}
+    // Borrowed from FNN in EnableOpenCL; the net owns and frees it. The copies or
+    // kernels writing FConcatBuffer run on its queue.
+    FConcatKernel: TNeuralKernel;
+    // Persistent device buffer holding this layer's output. Allocated ONCE in
+    // EnableOpenCL and reused by every forward, so no forward pass allocates.
+    FConcatBuffer: cl_mem;
+    FConcatBufSize: integer; // element capacity of FConcatBuffer
+    // Name FConcatKernel is acquired and freed under; must not change between.
+    function ConcatKernelName(): string; virtual;
+    // Releases the device buffer, then the borrowed FConcatKernel handle. Called
+    // from DisableOpenCL AND from Destroy (a layer can skip DisableOpenCL).
+    procedure ReleaseConcatOpenCL();
+    {$ENDIF}
+  public
+    destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLBufferBytes(): int64; override;
+    function CanShareOpenCLOutput(): boolean; override;
+    procedure AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t); override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
+  end;
+
   /// This layer concatenates previous layers into the X axis. Consider using
   // TNNetDeepConcat if you intend to concatenate outputs/volumes with same
   // XY size.
-  TNNetConcat = class(TNNetConcatBase)
+  TNNetConcat = class(TNNetConcatOpenCLBase)
+  protected
+    {$IFDEF OpenCL}
+    // Copies each source into FConcatBuffer at its offset: resident sources on
+    // the device, host-only ones by upload. The caller checks WillOpenCL().
+    procedure ComputeOpenCL();
+    {$ENDIF}
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; aL: array of TNNetLayer); reintroduce; overload;
     constructor Create(aL: array of TNNetLayer); reintroduce; overload;
+    {$IFDEF OpenCL}
+    function WillOpenCL(): boolean; override;
+    {$ENDIF}
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -13513,19 +13558,12 @@ type
 
   /// This layer concatenates other layers into the deep/depth dimension.
   // You should concatenate outputs/volumes with same XY size.
-  TNNetDeepConcat = class(TNNetConcatBase)
+  TNNetDeepConcat = class(TNNetConcatOpenCLBase)
   protected
     FDeepsLayer: TNeuralIntegerArray;
     FDeepsChannel: TNeuralIntegerArray;
     FRemainingChannels: TNeuralIntegerArray;
     {$IFDEF OpenCL}
-    // Net-wide cai_deep_concat* handle, borrowed from FNN in EnableOpenCL; the net
-    // owns and frees it. Its queue is also the queue the sources produced on.
-    FConcatKernel: TNeuralKernel;
-    // Persistent device buffer holding this layer's output. Allocated ONCE in
-    // EnableOpenCL and reused by every forward, so no forward pass allocates.
-    FConcatBuffer: cl_mem;
-    FConcatBufSize: integer; // element capacity of FConcatBuffer
     // 2..4 when a fused kernel binds every source and writes the whole output in
     // one launch; 0 when the source count needs the per-source launch loop.
     FFusedSlotCount: integer;
@@ -13534,12 +13572,7 @@ type
     // the per-source path: the fused kernels bind the same buffer to every slot.
     FIsBroadcast: boolean;
     // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
-    function ConcatKernelName(): string;
-    // Releases this layer's OpenCL resources: the device buffer, then the
-    // borrowed FConcatKernel handle. Called from DisableOpenCL AND from Destroy -
-    // a layer is destroyed without a DisableOpenCL first, so neither may be
-    // the only caller. Coded by Claude (AI).
-    procedure ReleaseConcatOpenCL();
+    function ConcatKernelName(): string; override;
     // Scatters the already-resident source outputs into FConcatBuffer. The caller
     // checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
@@ -13550,13 +13583,7 @@ type
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
     function WillOpenCL(): boolean; override;
-    function OpenCLOutputBuffer(): cl_mem; override;
-    function OpenCLBufferBytes(): int64; override;
-    function CanShareOpenCLOutput(): boolean; override;
-    procedure AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t); override;
-    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
     procedure Compute(); override;
@@ -83286,6 +83313,21 @@ begin
   for CntLayer := 0 to MaxLayer do
     Self[CntLayer].OpenCLWaitOutputIfAnotherQueue(pKernel);
 end;
+
+function TNNetLayerList.AnyOutputBindableOnOpenCL(): boolean;
+var
+  MaxLayer: integer;
+  CntLayer: integer;
+begin
+  Result := false;
+  MaxLayer := Count - 1;
+  CntLayer := 0;
+  while (not Result) and (CntLayer <= MaxLayer) do
+  begin
+    Result := Self[CntLayer].OutputBindableOnOpenCL();
+    Inc(CntLayer);
+  end;
+end;
 {$ENDIF}
 
 { TNNetReLU }
@@ -102629,37 +102671,30 @@ end;
 
 destructor TNNetDeepConcat.Destroy();
 begin
-  {$IFDEF OpenCL}
-  ReleaseConcatOpenCL();
-  {$ENDIF}
   SetLength(FRemainingChannels, 0);
   SetLength(FDeepsLayer, 0);
   SetLength(FDeepsChannel, 0);
   inherited Destroy();
 end;
 
-{$IFDEF OpenCL}
-function TNNetDeepConcat.ConcatKernelName(): string;
+{ TNNetConcatOpenCLBase }
+destructor TNNetConcatOpenCLBase.Destroy();
 begin
-  case FFusedSlotCount of
-    2: Result := 'cai_deep_concat2';
-    3: Result := 'cai_deep_concat3';
-    4: Result := 'cai_deep_concat4';
-    else Result := 'cai_deep_concat';
-  end;
+  {$IFDEF OpenCL}
+  ReleaseConcatOpenCL();
+  {$ENDIF}
+  inherited Destroy();
 end;
 
-procedure TNNetDeepConcat.EnableOpenCL(DotProductKernel: TNeuralKernel);
-var
-  MaxSourcePos, SourcePos, SourceCount: integer;
+{$IFDEF OpenCL}
+function TNNetConcatOpenCLBase.ConcatKernelName(): string;
+begin
+  Result := 'cai_deep_concat';
+end;
+
+procedure TNNetConcatOpenCLBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
-  // The source list is fixed at construction, so the arity verdict is too, and it
-  // has to precede the acquire below: it picks which kernel name to bind.
-  SourceCount := FPrevLayerList.Count;
-  if (SourceCount >= 2) and (SourceCount <= 4)
-    then FFusedSlotCount := SourceCount
-    else FFusedSlotCount := 0;
   // Acquire once: a second call would leak a private handle.
   if Assigned(FNN) and (not Assigned(FConcatKernel)) then
     FConcatKernel := FNN.GetKernel(ConcatKernelName());
@@ -102674,18 +102709,9 @@ begin
     FConcatBuffer := DotProductKernel.CreateBuffer(
       CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
   end;
-  // The source list is fixed at construction, so the broadcast verdict is too.
-  MaxSourcePos := FPrevLayerList.Count - 1;
-  FIsBroadcast := MaxSourcePos > 0;
-  for SourcePos := 1 to MaxSourcePos do
-    if FPrevLayerList[SourcePos] <> FPrevLayerList[0] then
-    begin
-      FIsBroadcast := false;
-      Break;
-    end;
 end;
 
-procedure TNNetDeepConcat.ReleaseConcatOpenCL();
+procedure TNNetConcatOpenCLBase.ReleaseConcatOpenCL();
 begin
   if Assigned(FConcatBuffer) then
   begin
@@ -102699,13 +102725,72 @@ begin
   if Assigned(FNN) then FNN.FreeKernelIfNotShared(ConcatKernelName(), FConcatKernel);
 end;
 
-procedure TNNetDeepConcat.DisableOpenCL();
+procedure TNNetConcatOpenCLBase.DisableOpenCL();
 begin
   // FConcatBuffer is read through FConcatKernel's queue, so the output has to
   // come back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
   ReleaseConcatOpenCL();
+end;
+
+function TNNetConcatOpenCLBase.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FConcatBuffer;
+end;
+
+function TNNetConcatOpenCLBase.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FConcatBuffer);
+end;
+
+function TNNetConcatOpenCLBase.CanShareOpenCLOutput(): boolean;
+begin
+  Result := (not FIsTrainable) and Assigned(FConcatBuffer);
+end;
+
+procedure TNNetConcatOpenCLBase.AdoptOpenCLOutputBuffer(Buffer: cl_mem;
+  Bytes: csize_t);
+begin
+  AdoptRetainedOpenCLBuffer(FConcatBuffer, Buffer);
+  FConcatBufSize := FOutput.Size;
+end;
+
+function TNNetConcatOpenCLBase.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FConcatKernel;
+end;
+
+function TNNetDeepConcat.ConcatKernelName(): string;
+begin
+  case FFusedSlotCount of
+    2: Result := 'cai_deep_concat2';
+    3: Result := 'cai_deep_concat3';
+    4: Result := 'cai_deep_concat4';
+    else Result := 'cai_deep_concat';
+  end;
+end;
+
+procedure TNNetDeepConcat.EnableOpenCL(DotProductKernel: TNeuralKernel);
+var
+  MaxSourcePos, SourcePos, SourceCount: integer;
+begin
+  // The source list is fixed at construction, so the arity verdict is too, and it
+  // has to precede the inherited acquire: it picks which kernel name to bind.
+  SourceCount := FPrevLayerList.Count;
+  if (SourceCount >= 2) and (SourceCount <= 4)
+    then FFusedSlotCount := SourceCount
+    else FFusedSlotCount := 0;
+  inherited EnableOpenCL(DotProductKernel);
+  // The source list is fixed at construction, so the broadcast verdict is too.
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  FIsBroadcast := MaxSourcePos > 0;
+  for SourcePos := 1 to MaxSourcePos do
+    if FPrevLayerList[SourcePos] <> FPrevLayerList[0] then
+    begin
+      FIsBroadcast := false;
+      Break;
+    end;
 end;
 
 function TNNetDeepConcat.WillOpenCL(): boolean;
@@ -102719,33 +102804,6 @@ begin
   // output would overrun it, so such a forward stays on the host.
   if FOutput.Size > FConcatBufSize then exit;
   Result := SourcesReadyOnOpenCL(FConcatKernel);
-end;
-
-function TNNetDeepConcat.OpenCLOutputBuffer(): cl_mem;
-begin
-  Result := FConcatBuffer;
-end;
-
-function TNNetDeepConcat.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FConcatBuffer);
-end;
-
-function TNNetDeepConcat.CanShareOpenCLOutput(): boolean;
-begin
-  Result := (not FIsTrainable) and Assigned(FConcatBuffer);
-end;
-
-procedure TNNetDeepConcat.AdoptOpenCLOutputBuffer(Buffer: cl_mem;
-  Bytes: csize_t);
-begin
-  AdoptRetainedOpenCLBuffer(FConcatBuffer, Buffer);
-  FConcatBufSize := FOutput.Size;
-end;
-
-function TNNetDeepConcat.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  Result := FConcatKernel;
 end;
 
 procedure TNNetDeepConcat.ComputeOpenCL();
@@ -106875,12 +106933,79 @@ begin
   Self.Create(0, 0, 0, aL);
 end;
 
+{$IFDEF OpenCL}
+function TNNetConcat.WillOpenCL(): boolean;
+begin
+  Result := false;
+  // Forward only: this path leaves the output on the device, and the backward
+  // pass still has readers of Output that never call ForceOutputOnRAM.
+  if FIsTrainable or (not FHasOpenCL) then exit;
+  if (not Assigned(FConcatKernel)) or (not Assigned(FConcatBuffer)) then exit;
+  // The host path resizes an output the sources do not fill exactly, and a
+  // wider output would overrun the buffer EnableOpenCL sized.
+  if (FOutput.Size > FConcatBufSize) or
+    (FOutput.Size <> FPrevOutput.GetTotalSize()) then exit;
+  // With every source on the host, the host concat moves no data at all.
+  Result := FPrevLayerList.AnyOutputBindableOnOpenCL();
+end;
+
+procedure TNNetConcat.ComputeOpenCL();
+var
+  Source: TNNetLayer;
+  MaxSourcePos, SourcePos: integer;
+  SourceBytes, DestOffsetBytes: csize_t;
+begin
+  // FConcatKernel lends only its queue: each source is one enqueued transfer.
+  DestOffsetBytes := 0;
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  for SourcePos := 0 to MaxSourcePos do
+  begin
+    Source := FPrevLayerList[SourcePos];
+    SourceBytes := csize_t(FPrevOutput[SourcePos].Size) * csNeuralFloatSize;
+    if SourceBytes > 0 then
+    begin
+      if Source.OutputBindableOnOpenCL() then
+      begin
+        Source.OpenCLWaitOutputIfAnotherQueue(FConcatKernel);
+        FConcatKernel.CopyBuffer(Source.OpenCLOutputBuffer(), FConcatBuffer,
+          SourceBytes, DestOffsetBytes);
+      end
+      else
+      begin
+        // Blocking: a forward whose last layer ends on the host does not drain
+        // this queue, and the next forward rewrites the source on the host.
+        Source.ForceOutputOnRAM();
+        FConcatKernel.WriteBufferAt(FConcatBuffer, DestOffsetBytes, SourceBytes,
+          FPrevOutput[SourcePos].GetRawPtr(0), CL_TRUE);
+      end;
+    end;
+    Inc(DestOffsetBytes, SourceBytes);
+  end;
+  // No read back here: the result stays on the device until a host reader calls
+  // ForceOutputOnRAM, so the resident sources never make a round trip.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
+
 procedure TNNetConcat.Compute;
 var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayerList.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   FPrevOutput.ConcatInto(FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

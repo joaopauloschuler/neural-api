@@ -1940,10 +1940,15 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [ ] `TNNetConcat` device forward. Left open: it is multi-source (a flat
-      back-to-back concatenation of every source's bytes), so it does not fit
-      the single-source `cai_gather_copy`; one `clEnqueueCopyBuffer` per
-      source into the output buffer is the likely shape.
+- [ ] `TNNetDeepConcat` with one host-only source falls back to the host and
+      downloads every resident source. `TNNetConcat.ComputeOpenCL` uploads a
+      host-only source straight into its slice of the output; DeepConcat's
+      channel-interleaved layout needs an upload buffer per such source (or,
+      when SizeX*SizeY = 1, the same flat `WriteBufferAt` into the output).
+- [ ] `TNNetSum` repeats the `TNNetConcatOpenCLBase` output-buffer lifecycle
+      (`FSumKernel`/`FSumBuffer`, release, adopt, share). Deriving it from that
+      base with `ConcatKernelName = 'cai_volume_sum'` would delete the copy;
+      the field names would then need a neutral rename (`FOutputKernel`/...).
 - [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
       (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
       plan too (DeMaxPool's random spacing would need a per-forward plan, so
