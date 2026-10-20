@@ -1973,11 +1973,19 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [ ] `TNNetConvolution3D` (VideoMAE, 3-D VAEs) and `TNNetCausalConv1D` (the
-      CogVideoX VAE decoder) device forward. Both are the existing conv
-      contraction with one extra axis, so the question to answer first is
-      whether `cai_dot_product`'s im2col can be fed a 3-D receptive field
-      instead of a new kernel.
+- [X] `TNNetCausalConv1D` (the CogVideoX VAE decoder) device forward. Done on
+      `cai_conv_implicit` with no kernel change: a K x 1 kernel, PaddingX =
+      Dilation*(K-1), PaddingY 0, DilationX = Dilation and OutSizeX = SeqLen
+      (the kernel's bounds check is the missing right pad). Covered by
+      `TestCausalConv1DOpenCLParity` (5 shapes, tiled and untiled, a weight update).
+- [ ] `TNNetConvolution3D` (VideoMAE tubelet embedding, 3-D VAEs) device
+      forward. The temporal taps of output frame ot are ONE contiguous depth
+      window [ot*C, ot*C + FeatureSizeT*C) of each source pixel, and the
+      weights are already laid out as a 2-D conv kernel over that window, so
+      no new kernel is needed, but `cai_conv_gather` must learn two things: a
+      source pixel stride (InT*C) apart from the window depth, and an output
+      frame axis folded into the column index (b = pixel*OutT + ot, so the
+      result [b*NumFeatures + f] is exactly the packed output layout).
 - [ ] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
       style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
       re-laid out k-major on the host and uploaded every forward before

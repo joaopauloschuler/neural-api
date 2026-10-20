@@ -564,6 +564,9 @@ type
     // TNNetModulatedConv2D device forward (cai_conv_implicit on the w'' slab):
     // vs CPU with a non-trivial style; the output stays resident for a ReLU.
     procedure TestModulatedConv2DOpenCLParity;
+    // TNNetCausalConv1D device forward (cai_conv_implicit, K x 1 kernel, left
+    // padding only): vs CPU over dilations, biases and a weight update.
+    procedure TestCausalConv1DOpenCLParity;
     // Device-side gated activation (cai_glu_gate) forward parity over an
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
@@ -72684,6 +72687,155 @@ begin
       Expected.Free;
       SData.Free;
       XData.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Input (SeqLen,1,InC) -> CausalConv1D(OutC,K,SuppressBias,Dil) ->
+// CausalConv1D(5,2) -> ReLU, with non-trivial weights and biases.
+function BuildCausalConv1DParityNet(SeqLen, InC, OutC, K, SuppressBias,
+  Dil: integer; out FirstConv, SecondConv: TNNetLayer): TNNet;
+var
+  NeuronPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(SeqLen, 1, InC));
+  FirstConv := Result.AddLayer(TNNetCausalConv1D.Create(OutC, K, SuppressBias, Dil));
+  SecondConv := Result.AddLayer(TNNetCausalConv1D.Create(5, 2));
+  Result.AddLayer(TNNetReLU.Create());
+  Result.SetTrainable(False, False);
+  for NeuronPos := 0 to OutC - 1 do
+  begin
+    SetRandomNeuronWeights(FirstConv, NeuronPos, 0, 0.6);
+    FirstConv.Neurons[NeuronPos].BiasWeight := 0.1 * (NeuronPos mod 7) - 0.3;
+  end;
+  for NeuronPos := 0 to 4 do
+  begin
+    SetRandomNeuronWeights(SecondConv, NeuronPos, 0, 0.6);
+    SecondConv.Neurons[NeuronPos].BiasWeight := 0.05 * NeuronPos;
+  end;
+  FirstConv.FlushWeightCache();
+  SecondConv.FlushWeightCache();
+end;
+
+procedure TTestNeuralNumerical.TestCausalConv1DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // SeqLen, InC, OutC, K, SuppressBias, Dilation. The third shape takes the
+  // tiled kernel (>= 64 rows); in the fourth the left pad exceeds SeqLen.
+  csCases: array[0..4, 0..5] of integer = ((17, 8, 12, 3, 0, 1),
+    (20, 5, 7, 4, 1, 3), (24, 16, 70, 3, 0, 2), (6, 3, 4, 3, 0, 4),
+    (9, 6, 10, 1, 0, 1));
+var
+  NN, NNCPU: TNNet;
+  Input, Out1CPU, Out2CPU, LastCPU: TNNetVolume;
+  Conv1, Conv2, Conv1CPU, Conv2CPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, NeuronPos, Pos, MaxPos, SentinelSurvivors, SentinelCount: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff, RelDiff, RefreshDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CasePos := 0 to High(csCases) do
+  begin
+    RandSeed := 20261020 + CasePos;
+    NN := BuildCausalConv1DParityNet(csCases[CasePos, 0], csCases[CasePos, 1],
+      csCases[CasePos, 2], csCases[CasePos, 3], csCases[CasePos, 4],
+      csCases[CasePos, 5], Conv1, Conv2);
+    NNCPU := BuildCausalConv1DParityNet(csCases[CasePos, 0], csCases[CasePos, 1],
+      csCases[CasePos, 2], csCases[CasePos, 3], csCases[CasePos, 4],
+      csCases[CasePos, 5], Conv1CPU, Conv2CPU);
+    Input := TNNetVolume.Create(csCases[CasePos, 0], 1, csCases[CasePos, 1]);
+    Out1CPU := TNNetVolume.Create();
+    Out2CPU := TNNetVolume.Create();
+    LastCPU := TNNetVolume.Create();
+    try
+      NNCPU.CopyWeights(NN);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) + 0.4 * Cos(Pos * 1.3);
+      NNCPU.Compute(Input);
+      Out1CPU.Copy(Conv1CPU.Output);
+      Out2CPU.Copy(Conv2CPU.Output);
+      LastCPU.Copy(NNCPU.GetLastLayer.Output);
+
+      // ForceOpenCL off: the resident input carries both convs to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      Conv1.Output.Fill(csSentinel);
+      Conv2.Output.Fill(csSentinel);
+      SentinelCount := Conv1.Output.Size + Conv2.Output.Size;
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to Conv1.Output.Size - 1 do
+        if Conv1.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      for Pos := 0 to Conv2.Output.Size - 1 do
+        if Conv2.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(LastCPU, NN.GetLastLayer.Output);
+      Conv1.ForceOutputOnRAM();
+      Conv2.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(Out1CPU, Conv1.Output));
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(Out2CPU, Conv2.Output));
+      RelDiff := MaxDiff / Max(Out1CPU.GetMaxAbs(), Out2CPU.GetMaxAbs());
+
+      // A weight and bias update must reach the device operand.
+      for NeuronPos := 0 to csCases[CasePos, 2] - 1 do
+      begin
+        SetRandomNeuronWeights(Conv1, NeuronPos, 0.1, 1);
+        Conv1.Neurons[NeuronPos].BiasWeight := 0.2 - 0.03 * NeuronPos;
+      end;
+      Conv1.FlushWeightCache();
+      NNCPU.CopyWeights(NN);
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      Conv1.ForceOutputOnRAM();
+      RefreshDiff := MaxAbsDiffToOutput(Conv1CPU.Output, Conv1.Output) /
+        Conv1CPU.Output.GetMaxAbs();
+      WriteLn('  CausalConv1D OpenCL case ', CasePos, ': rel max|diff|=',
+        RelDiff:0:9, ' after update=', RefreshDiff:0:9, ' sentinels=',
+        SentinelSurvivors, '/', SentinelCount, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('first TNNetCausalConv1D ran every forward on OpenCL', 3,
+        Conv1.ForwardGPUCnt);
+      AssertEquals('second TNNetCausalConv1D ran every forward on OpenCL', 3,
+        Conv2.ForwardGPUCnt);
+      AssertEquals('both conv outputs are bound, not downloaded', SentinelCount,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('the CPU reference is not degenerate', Out1CPU.GetMaxAbs() > 0);
+      AssertTrue('CausalConv1D OpenCL vs CPU: rel max |diff| = ' +
+        FloatToStr(RelDiff) + ' must be < 1e-4', RelDiff < 1e-4);
+      AssertTrue('CausalConv1D OpenCL vs CPU after a weight update: rel max ' +
+        '|diff| = ' + FloatToStr(RefreshDiff) + ' must be < 1e-4',
+        RefreshDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      LastCPU.Free;
+      Out2CPU.Free;
+      Out1CPU.Free;
+      Input.Free;
+      NNCPU.Free;
       NN.Free;
     end;
   end;

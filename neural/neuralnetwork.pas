@@ -630,6 +630,13 @@ type
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure MoveOutputToRAM(); virtual;
+      // Sizes WeightsInter (taps x neurons) and Bias to the neurons and arms
+      // FDotCL as an implicit conv over PositionCount output positions.
+      procedure ArmNeuronImplicitConv(WeightsInter, Bias: TNNetVolume;
+        PositionCount: integer);
+      // After AfterWeightUpdate, packs the neuron weights k-major into
+      // WeightsInter and the biases into Bias; True when it packed.
+      function RefreshNeuronImplicitConv(WeightsInter, Bias: TNNetVolume): boolean;
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
@@ -10227,10 +10234,22 @@ type
     private
       FFeatureSize: integer; // kernel size K
       FDilation: integer;    // WaveNet-style dilation (>=1); 1 == dense causal conv
+      {$IFDEF OpenCL}
+      FWeightsCL, FBiasCL: TNNetVolume; // implicit-conv A operand and bias
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0;
         pDilation: integer = 1); reintroduce; overload;
+      destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      // Inference forward is cai_conv_implicit: a K x 1 kernel, left padding
+      // Dilation*(K-1) and no right padding, with the bias fused.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -65319,6 +65338,71 @@ begin
   FStruct[5] := FDilation;
 end;
 
+destructor TNNetCausalConv1D.Destroy();
+begin
+  {$IFDEF OpenCL}
+  FWeightsCL.Free;
+  FBiasCL.Free;
+  {$ENDIF}
+  inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetCausalConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := NewDotProductCL(GetDotProductKernel());
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FWeightsCL) then FWeightsCL := TNNetVolume.Create();
+  if not Assigned(FBiasCL) then FBiasCL := TNNetVolume.Create();
+  ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX);
+end;
+
+procedure TNNetCausalConv1D.DisableOpenCL();
+begin
+  // A kept output lives in FDotCL's result buffer, which the inherited call frees.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+end;
+
+// A resident source overrides the size verdict, as it does for TNNetConvolution.
+function TNNetCausalConv1D.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FDotCL) and FHasOpenCL and (not FIsTrainable) and
+    FDotCL.ImplicitConvReady and (FNeurons.Count > 0) and
+    (FWeightsCL.Size = FNeurons[0].Weights.Size * FNeurons.Count) and
+    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetCausalConv1D.ComputeOpenCL();
+var
+  GatherSrcBuffer: cl_mem;
+  BiasVol: TNNetVolume;
+  WUpdated: boolean;
+begin
+  GatherSrcBuffer := nil;
+  if PrevOutputOnOpenCL() then
+  begin
+    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+    FPrevLayer.ForceOutputOnRAM();
+  WUpdated := RefreshNeuronImplicitConv(FWeightsCL, FBiasCL);
+  if FSuppressBias = 0 then BiasVol := FBiasCL else BiasVol := nil;
+  FDotCL.ComputeImplicitConv(FWeightsCL, FPrevLayer.FOutput,
+    {OutSizeX}FOutput.SizeX, {RowSpan}FPrevLayer.FOutput.Depth * FFeatureSize,
+    {Stride}1, {PaddingX}FDilation * (FFeatureSize - 1), {PaddingY}0,
+    {DilationX}FDilation, csActNone, {NewVAs}WUpdated, BiasVol,
+    {NewVBias}WUpdated, {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
+
 procedure TNNetCausalConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   SeqLen, InputDepth: integer;
@@ -65336,6 +65420,12 @@ begin
   SetNumWeightsForAllNeurons(FFeatureSize, 1, InputDepth);
   InitDefault();
   AfterWeightUpdate();
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (Int64(FOutput.Size) * FFeatureSize * InputDepth >= cNeuralOpenCLMinWork);
+  // The device GEMM is shaped by this layer's sizes: a re-wire re-arms it.
+  if FHasOpenCL and Assigned(FDotCL) then
+    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX);
+  {$ENDIF}
 end;
 
 procedure TNNetCausalConv1D.Compute();
@@ -65350,7 +65440,19 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
@@ -141508,6 +141610,49 @@ begin
   begin
     Result := 0;
   end;
+end;
+
+procedure TNNetLayer.ArmNeuronImplicitConv(WeightsInter, Bias: TNNetVolume;
+  PositionCount: integer);
+var
+  TapCount: integer;
+begin
+  if (FNeurons.Count = 0) or (PositionCount = 0) then exit;
+  TapCount := FNeurons[0].Weights.Size;
+  if TapCount = 0 then exit;
+  WeightsInter.ReSize(TapCount, 1, FNeurons.Count);
+  Bias.ReSize(FNeurons.Count, 1, 1);
+  // PrepareForCompute releases the result buffer a resident output lives in.
+  FOutputOnOpenCL := false;
+  FDotCL.PrepareForCompute(WeightsInter, PositionCount, TapCount);
+  FDotCL.PrepareImplicitConv();
+  FAfterWeightUpdateHasBeenCalled := true;
+end;
+
+function TNNetLayer.RefreshNeuronImplicitConv(WeightsInter,
+  Bias: TNNetVolume): boolean;
+var
+  NeuronPos, MaxNeuronPos, TapPos, MaxTapPos, InterPos, NeuronCount: integer;
+  Weights: TNNetVolume;
+begin
+  Result := FAfterWeightUpdateHasBeenCalled;
+  if not Result then exit;
+  NeuronCount := FNeurons.Count;
+  MaxNeuronPos := NeuronCount - 1;
+  MaxTapPos := WeightsInter.SizeX - 1;
+  // A element (neuron, tap) sits at neuron + tap * NeuronCount.
+  for NeuronPos := 0 to MaxNeuronPos do
+  begin
+    Weights := FNeurons[NeuronPos].Weights;
+    InterPos := NeuronPos;
+    for TapPos := 0 to MaxTapPos do
+    begin
+      WeightsInter.FData[InterPos] := Weights.FData[TapPos];
+      Inc(InterPos, NeuronCount);
+    end;
+    Bias.FData[NeuronPos] := FNeurons[NeuronPos].BiasWeight;
+  end;
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 
 procedure TNNetLayer.MoveOutputToRAM();
