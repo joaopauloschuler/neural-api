@@ -2011,11 +2011,14 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       contraction with one extra axis, so the question to answer first is
       whether `cai_dot_product`'s im2col can be fed a 3-D receptive field
       instead of a new kernel.
-- [ ] `TNNetModulatedConv2D` device forward — the core operator of
-      `BuildStyleGAN2Generator`, and the layer the whole generator stack waits
-      on. The per-sample weight modulation/demodulation folds into the column
-      gather, so this is a conv kernel with a scaled weight slab, not a new
-      contraction.
+- [ ] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
+      style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
+      re-laid out k-major on the host and uploaded every forward before
+      `cai_conv_implicit` runs. To keep the base kernel resident instead,
+      fold s[i] into the gather and d[o] into the epilogue (a per-column and a
+      per-row scale on `cai_conv_implicit`, with d[o] from a resident
+      sum_t w[o,t,i]^2 table times s^2). Measure the upload share on the GPU
+      box first; at 1024x1024 the contraction should dominate.
 - [ ] Vision attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,

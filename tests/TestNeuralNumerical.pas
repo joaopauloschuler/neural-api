@@ -561,6 +561,9 @@ type
     // TNNetConcat device forward: exact vs CPU; resident sources are copied in
     // OpenCL memory (sentinels survive), host-only sources are uploaded.
     procedure TestConcatResidentOpenCLParity;
+    // TNNetModulatedConv2D device forward (cai_conv_implicit on the w'' slab):
+    // vs CPU with a non-trivial style; the output stays resident for a ReLU.
+    procedure TestModulatedConv2DOpenCLParity;
     // Device-side gated activation (cai_glu_gate) forward parity over an
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
@@ -72053,6 +72056,112 @@ begin
       ConcatCPU.Free;
       Expected.Free;
       Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestModulatedConv2DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csSizeX = 9;
+  csSizeY = 7;
+  csInC = 8;
+var
+  NN: TNNet;
+  XData, SData, Expected, ModCPU: TNNetVolume;
+  XInput, SInput, Affine: TNNetLayer;
+  ModConv: TNNetModulatedConv2D;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, OutC, KSz, SuppressBias, Demod, Pos, MaxPos, MaxNeuronPos: integer;
+  SentinelSurvivors: integer;
+  MaxDiff, RelDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 1 do
+  begin
+    if CaseCnt = 0 then
+    begin
+      // The synthesis conv: 3x3, demodulated, with bias.
+      CaseName := '3x3 demod + bias';
+      OutC := 16; KSz := 3; SuppressBias := 0; Demod := 1;
+    end
+    else
+    begin
+      // The toRGB conv: 1x1, no demodulation, no bias.
+      CaseName := '1x1 no demod, no bias';
+      OutC := 3; KSz := 1; SuppressBias := 1; Demod := 0;
+    end;
+    NN := TNNet.Create();
+    XData := TNNetVolume.Create(csSizeX, csSizeY, csInC);
+    SData := TNNetVolume.Create(csInC, 1, 1);
+    Expected := TNNetVolume.Create();
+    ModCPU := TNNetVolume.Create();
+    try
+      XInput := NN.AddLayer(TNNetInput.Create(csSizeX, csSizeY, csInC));
+      SInput := NN.AddLayerAfter(TNNetInput.Create(csInC, 1, 1), 0);
+      Affine := NN.AddLayerAfter(TNNetFullConnectLinear.Create(csInC), SInput);
+      ModConv := TNNetModulatedConv2D.Create(OutC, KSz, SuppressBias, Demod,
+        Affine);
+      NN.AddLayerAfter(ModConv, XInput);
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      MaxPos := XData.Size - 1;
+      for Pos := 0 to MaxPos do XData.Raw[Pos] := Sin(Pos * 0.37) - 0.2;
+      MaxPos := SData.Size - 1;
+      for Pos := 0 to MaxPos do SData.Raw[Pos] := Cos(Pos * 0.41) * 0.9 + 0.3;
+      MaxNeuronPos := OutC - 1;
+      for Pos := 0 to MaxNeuronPos do
+        ModConv.Neurons[OutC].Weights.Raw[Pos] := 0.05 * (Pos - 1);
+
+      SInput.Output.Copy(SData);
+      NN.Compute(XData);
+      Expected.Copy(NN.GetLastLayer.Output);
+      ModCPU.Copy(ModConv.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      SInput.Output.Copy(SData);
+      NN.Compute(XData);
+      // A download or a host forward would overwrite these.
+      ModConv.Output.Fill(csSentinel);
+      SInput.Output.Copy(SData);
+      NN.Compute(XData);
+      SentinelSurvivors := 0;
+      MaxPos := ModConv.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        if ModConv.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      ModConv.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(ModCPU, ModConv.Output));
+      RelDiff := MaxDiff / ModCPU.GetMaxAbs();
+      WriteLn('  ModulatedConv2D OpenCL (', CaseName, '): max|diff|=',
+        MaxDiff:0:9, ' rel=', RelDiff:0:9, ' gpu forwards=',
+        ModConv.ForwardGPUCnt, ' sentinels=', SentinelSurvivors, '/',
+        ModConv.Output.Size);
+      AssertEquals('TNNetModulatedConv2D ran both forwards on OpenCL (' +
+        CaseName + ')', 2, ModConv.ForwardGPUCnt);
+      AssertEquals('the ReLU binds the resident output (' + CaseName + ')',
+        ModConv.Output.Size, SentinelSurvivors);
+      AssertTrue('the CPU reference is not degenerate', ModCPU.GetMaxAbs() > 0);
+      AssertTrue('TNNetModulatedConv2D OpenCL vs CPU (' + CaseName +
+        '): relative max |diff| = ' + FloatToStr(RelDiff), RelDiff < 1e-5);
+    finally
+      ModCPU.Free;
+      Expected.Free;
+      SData.Free;
+      XData.Free;
       NN.Free;
     end;
   end;
