@@ -703,6 +703,7 @@ var
   Transcript: string;           // raw mode's running document (turns append)
   Cnt: integer;
   OneShotOK: boolean;           // -p: did the single turn render and generate?
+  LoadOK: boolean;              // LoadModel returned true without raising
   Effort: TChatReasoningEffort; // /reasoning target
   Line, Cmd, Arg, Reply, ErrorMsg: string;
 begin
@@ -734,9 +735,19 @@ begin
   Engine.OnToken := @Sink.TokenOut;
   Engine.OnNotice := @Sink.NoticeOut;
   Engine.OnReplyDone := @Sink.ReplyDone;
-  if not Engine.LoadModel(Opt, ErrorMsg) then
+  // A load error is one stderr line and exit code 1, never an unhandled exception.
+  try
+    LoadOK := Engine.LoadModel(Opt, ErrorMsg);
+  except
+    on E: Exception do
+    begin
+      WriteLn(StdErr, 'Error: ', E.Message);
+      Halt(1);
+    end;
+  end;
+  if not LoadOK then
   begin
-    WriteLn(ErrorMsg);
+    WriteLn(StdErr, 'Error: ', ErrorMsg);
     Engine.Free;
     Sink.Free;
     Halt(1);

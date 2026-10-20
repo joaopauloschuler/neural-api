@@ -114,6 +114,11 @@ interface
 uses
   Classes, SysUtils, neuralvolume, neuralhftokenizer;
 
+const
+  // What the Qwen3 family's generation prompt ends with under
+  // enable_thinking=false: an empty, already closed reasoning block.
+  csQwenThinkClosed = '<think>' + #10#10 + '</think>' + #10#10;
+
 type
   ENeuralChatError = class(Exception);
   // Raised by the mini-Jinja interpreter on an unsupported construct or a
@@ -511,6 +516,7 @@ var
   FS: TFileStream;
 begin
   Result := '';
+  RaiseIfGitLfsPointer(FileName, ENeuralChatError);
   FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
   try
     SetLength(Result, FS.Size);
@@ -646,11 +652,9 @@ const
   csQwen3_8LowReasoning =
     'Reasoning effort is set to low. Keep your thinking brief and focused, ' +
     'moving directly to the conclusion without unnecessary elaboration.';
-  // Generation-prompt suffix of the Qwen thinking templates: reasoning
-  // OPENED (every effort but reOff) versus closed empty (enable_thinking
-  // false).
+  // Generation-prompt suffix of the Qwen thinking templates with reasoning
+  // OPENED (every effort but reOff); csQwenThinkClosed is the reOff one.
   csQwenThinkOpen = '<think>' + #10;
-  csQwenThinkClosed = '<think>' + #10#10 + '</think>' + #10#10;
 
 // Plain-ChatML defaults (cfChatML with InjectQwenDefaultSystem=false,
 // cfQwen with true).

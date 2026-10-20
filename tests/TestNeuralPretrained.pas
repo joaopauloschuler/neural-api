@@ -23,7 +23,7 @@ uses
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralg2p,
-  neuralchatengine, neuralchat, neuralkokorosession,
+  neuralchatengine, neuralchat, neuralkokorosession, neuraldecisionheads,
   neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
 type
@@ -43,6 +43,9 @@ type
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
+    // Checks tests/fixtures/torch_head/<pFixtureName>/head.pt against that
+    // entry of torch_head/expected.json: every tensor and metadata leaf.
+    procedure CheckTorchHeadFixture(const pFixtureName: string);
     // The hexgrad/Kokoro-82M snapshot folder (NEURAL_KOKORO82M_DIR, else the
     // HF cache); '' when it has no voices/af_heart.pt.
     function KokoroRealSnapshotDir(): string;
@@ -201,6 +204,10 @@ type
       const ExtraArgs: array of string);
     // Thinking A1, A1 regenerated, B, then A2 with --kv-slots 1.
     procedure RunChatKVSlotRegenerate(const Stem: string);
+    // Decision branches B1, B2, B1 after one prefix (and after none) against a
+    // width-1 forward of prefix + branch; then chat replies against a fresh engine.
+    procedure RunChatDecisionBranchParity(const Stem: string;
+      const ExtraArgs: array of string);
     // A growing conversation never saves a slot; three conversations in two
     // slots evict by the single rule.
     procedure RunChatKVSlotGrowingAndEviction(const Stem: string);
@@ -263,6 +270,12 @@ type
     // directories - config.json + model.safetensors - in a temp dir for
     // the BuildFromPretrained directory-dispatch tests).
     procedure CopyFileTo(const Src, Dst: string);
+    // Writes Contents as the text file FileName.
+    procedure WriteTextFile(const FileName, Contents: string);
+    // Writes a Git LFS pointer text (what a clone without "git lfs pull" leaves) to FileName.
+    procedure WriteGitLfsPointer(const FileName: string);
+    // Asserts that Msg is the Git LFS pointer error naming FileName.
+    procedure AssertGitLfsPointerMessage(const What, Msg, FileName: string);
     // Shared body for the EnCodec round-trip parity tests, parameterized by
     // fixture base name. MUST stay PRIVATE: a published parameterized method
     // is auto-run by FPCUnit with an empty BaseName and fails on the missing
@@ -382,6 +395,12 @@ type
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
+    procedure TestTorchBinKevHeadMetadata;
+    procedure TestTorchBinOpenJevHeadAnyLocation;
+    procedure TestTorchBinHeadRejectsHostileMetadata;
+    procedure TestGitLfsPointerDetection;
+    procedure TestGitLfsPointerCheckpointReaders;
+    procedure TestGitLfsPointerTokenizerAndConfigs;
     procedure TestGPT2LogitParityFromTorchBin;
     procedure TestShardedTorchBinMatchesSingleFile;
     procedure TestShardedTorchBinIndexErrors;
@@ -519,6 +538,9 @@ type
     procedure TestChatKVSlotSwitch;
     procedure TestChatKVSlotSwitchPrefillWindow;
     procedure TestChatKVSlotSwitchOpenCL;
+    procedure TestChatDecisionBranchParity;
+    procedure TestChatDecisionBranchPrefillWindow;
+    procedure TestChatDecisionBranchOpenCL;
     procedure TestChatKVSlotRegenerateKeepsPoints;
     procedure TestChatKVSlotSystemPointNoOverwrite;
     procedure TestChatKVSlotSingleSlot;
@@ -1128,6 +1150,10 @@ type
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
     procedure TestLoadPretrainedEmbedding;
     procedure TestPEFTLoRAAdapterLoadAndMerge;
+    procedure TestLoRAMergeQwen35LogitParity;
+    procedure TestLoRAMergeQwen3LogitParity;
+    procedure TestLoRAMergeQwen35Int8;
+    procedure TestLoRAMergeRejectsUnsupportedAdapters;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
     procedure TestGenerationDefaultsFromJSONFile;
@@ -1295,6 +1321,239 @@ begin
     end;
   finally
     SrcStream.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.WriteTextFile(const FileName, Contents: string);
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Contents;
+    Lines.SaveToFile(FileName);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.WriteGitLfsPointer(const FileName: string);
+begin
+  WriteTextFile(FileName, 'version https://git-lfs.github.com/spec/v1' + LineEnding +
+    'oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393' +
+    LineEnding + 'size 1543215232');
+end;
+
+procedure TTestNeuralPretrained.AssertGitLfsPointerMessage(const What, Msg,
+  FileName: string);
+begin
+  AssertTrue(What + ' names the Git LFS pointer file, got: "' + Msg + '"',
+    Pos(FileName + ' is a Git LFS pointer file', Msg) > 0);
+  AssertTrue(What + ' says to run git lfs pull, got: "' + Msg + '"',
+    Pos('"git lfs pull"', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerDetection;
+var
+  Dir, PointerFile, LargeFile, JsonFile: string;
+  Large: TFileStream;
+  Signature: string;
+  Padding: array[0..1499] of byte;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_detect_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  PointerFile := Dir + 'model.safetensors';
+  LargeFile := Dir + 'large.bin';
+  JsonFile := Dir + 'config.json';
+  try
+    WriteGitLfsPointer(PointerFile);
+    AssertTrue('a pointer file is detected', IsGitLfsPointerFile(PointerFile));
+    // The signature followed by more than a pointer's 1023 bytes is real data.
+    Signature := 'version https://git-lfs.github.com/spec/v1';
+    FillChar(Padding, SizeOf(Padding), 0);
+    Large := TFileStream.Create(LargeFile, fmCreate);
+    try
+      Large.WriteBuffer(Signature[1], Length(Signature));
+      Large.WriteBuffer(Padding, SizeOf(Padding));
+    finally
+      Large.Free;
+    end;
+    AssertFalse('a 1.5 KB file is never a pointer', IsGitLfsPointerFile(LargeFile));
+    WriteTextFile(JsonFile, '{"model_type": "llama"}');
+    AssertFalse('a JSON file is not a pointer', IsGitLfsPointerFile(JsonFile));
+    AssertFalse('a missing file is not a pointer',
+      IsGitLfsPointerFile(Dir + 'missing.json'));
+  finally
+    DeleteFile(PointerFile);
+    DeleteFile(LargeFile);
+    DeleteFile(JsonFile);
+    RemoveDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerCheckpointReaders;
+var
+  Dir, PointerFile, IndexFile, ValidFile, Msg: string;
+  Reader: TNNetSafeTensorsReader;
+  Vol: TNNetVolume;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_ckpt_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  PointerFile := Dir + 'model-00001-of-00001.safetensors';
+  IndexFile := Dir + 'model.safetensors.index.json';
+  ValidFile := '';
+  try
+    WriteGitLfsPointer(PointerFile);
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(PointerFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors file', Msg, PointerFile);
+
+    // A real index whose shard is a pointer reports the shard.
+    WriteTextFile(IndexFile, '{"weight_map": {"w": "model-00001-of-00001.safetensors"}}');
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(IndexFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors shard', Msg, PointerFile);
+
+    WriteGitLfsPointer(IndexFile);
+    Msg := '';
+    try
+      TNNetSafeTensorsReader.Create(IndexFile).Free;
+    except
+      on E: ESafeTensorsError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('safetensors index', Msg, IndexFile);
+
+    Msg := '';
+    try
+      TNNetTorchBinReader.Create(PointerFile).Free;
+    except
+      on E: ETorchBinError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('torch.save file', Msg, PointerFile);
+
+    Msg := '';
+    try
+      TNNetTorchBinReader.Create(IndexFile).Free;
+    except
+      on E: ETorchBinError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('torch.bin index', Msg, IndexFile);
+
+    Msg := '';
+    try
+      TNNetGGUFReader.Create(PointerFile).Free;
+    except
+      on E: EGGUFError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('GGUF file', Msg, PointerFile);
+
+    // Real files still load.
+    ValidFile := WriteTempSafeTensors(
+      '{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}', [0, 0, 128, 63]);
+    Reader := TNNetSafeTensorsReader.Create(ValidFile);
+    Vol := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('w', Vol);
+      AssertEquals('a real safetensors file still loads', 1.0, Vol.FData[0], 0);
+    finally
+      Vol.Free;
+      Reader.Free;
+    end;
+    TNNetTorchBinReader.Create(FixturePath('torch_head' + DirectorySeparator +
+      'kev' + DirectorySeparator + 'head.pt')).Free;
+  finally
+    DeleteFile(PointerFile);
+    DeleteFile(IndexFile);
+    if ValidFile <> '' then DeleteFile(ValidFile);
+    RemoveDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGitLfsPointerTokenizerAndConfigs;
+var
+  Dir, TokenizerFile, ModelFile, TokenizerConfigFile, ConfigFile,
+    CheckpointFile, Msg: string;
+  Tokenizer: TNeuralHFTokenizer;
+begin
+  Dir := GetTempDir(false) + 'cai_lfs_tok_' + IntToStr(Random(1000000)) +
+    DirectorySeparator;
+  ForceDirectories(Dir);
+  TokenizerFile := Dir + 'tokenizer.json';
+  ModelFile := Dir + 'tokenizer.model';
+  TokenizerConfigFile := Dir + 'tokenizer_config.json';
+  ConfigFile := Dir + 'config.json';
+  CheckpointFile := Dir + 'model.json';
+  Tokenizer := TNeuralHFTokenizer.Create;
+  try
+    WriteGitLfsPointer(TokenizerFile);
+    WriteGitLfsPointer(ModelFile);
+    WriteGitLfsPointer(TokenizerConfigFile);
+    WriteGitLfsPointer(ConfigFile);
+    WriteGitLfsPointer(CheckpointFile);
+    Msg := '';
+    try
+      Tokenizer.LoadFromFile(TokenizerFile);
+    except
+      on E: EHFTokenizerError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('tokenizer.json', Msg, TokenizerFile);
+
+    Msg := '';
+    try
+      Tokenizer.LoadFromFile(ModelFile);
+    except
+      on E: EHFTokenizerError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('SentencePiece .model', Msg, ModelFile);
+
+    Msg := '';
+    try
+      LoadChatTemplateString(TokenizerConfigFile);
+    except
+      on E: ENeuralChatError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('tokenizer_config.json', Msg, TokenizerConfigFile);
+
+    Msg := '';
+    try
+      ReadLlamaConfigFromJSONFile(ConfigFile);
+    except
+      on E: EPretrainedImportError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('config.json', Msg, ConfigFile);
+
+    Msg := '';
+    try
+      ReadOpenJevModelConfig(Dir);
+    except
+      on E: EDecisionHeadError do Msg := E.Message;
+    end;
+    AssertGitLfsPointerMessage('Open-Jev model.json', Msg, CheckpointFile);
+
+    // Real files still load.
+    Tokenizer.LoadFromFile(FixturePath('anyjev_qwen25' + DirectorySeparator +
+      'tokenizer.json'));
+    AssertTrue('a real tokenizer.json still loads', Tokenizer.GetVocabSize() > 0);
+    AssertTrue('a real config.json still loads', ReadLlamaConfigFromJSONFile(
+      FixturePath('anyjev_qwen25' + DirectorySeparator + 'config.json')).HiddenSize > 0);
+  finally
+    Tokenizer.Free;
+    DeleteFile(TokenizerFile);
+    DeleteFile(ModelFile);
+    DeleteFile(TokenizerConfigFile);
+    DeleteFile(ConfigFile);
+    DeleteFile(CheckpointFile);
+    RemoveDir(Dir);
   end;
 end;
 
@@ -4001,6 +4260,210 @@ begin
     Failed);
   AssertTrue('the error must name the refused symbol, got: ' + Msg,
     Pos('posix system', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.CheckTorchHeadFixture(
+  const pFixtureName: string);
+var
+  RefJson: TStringList;
+  RefRoot, ExpectedValue: TJSONData;
+  Expected, Tensors, Metadata, Lists, TensorObj: TJSONObject;
+  ShapeArr, ValuesArr: TJSONArray;
+  Reader: TNNetTorchBinReader;
+  Vol: TNNetVolume;
+  Entry: TTorchBinMetadata;
+  EntryName, FixtureDir: string;
+  TensorCnt, DimCnt, ElemCnt, MetadataCnt, MetadataIdx: integer;
+begin
+  FixtureDir := 'torch_head' + DirectorySeparator;
+  RefJson := TStringList.Create;
+  Vol := TNNetVolume.Create;
+  RefRoot := nil;
+  Reader := nil;
+  try
+    RefJson.LoadFromFile(FixturePath(FixtureDir + 'expected.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Expected := TJSONObject(RefRoot).Objects[pFixtureName];
+    Tensors := Expected.Objects['tensors'];
+    Metadata := Expected.Objects['metadata'];
+    Lists := Expected.Objects['lists'];
+    Reader := TNNetTorchBinReader.Create(FixturePath(FixtureDir +
+      pFixtureName + DirectorySeparator + 'head.pt'));
+    AssertEquals(pFixtureName + ' tensor count', Tensors.Count, Reader.Count);
+    for TensorCnt := 0 to Tensors.Count - 1 do
+    begin
+      EntryName := Tensors.Names[TensorCnt];
+      TensorObj := TJSONObject(Tensors.Items[TensorCnt]);
+      AssertTrue(pFixtureName + ' has tensor ' + EntryName,
+        Reader.HasTensor(EntryName));
+      AssertEquals('dtype of ' + EntryName, 'F32', Reader.GetDType(EntryName));
+      ShapeArr := TensorObj.Arrays['shape'];
+      AssertEquals('dim count of ' + EntryName, ShapeArr.Count,
+        Reader.DimCount(EntryName));
+      for DimCnt := 0 to ShapeArr.Count - 1 do
+        AssertEquals('dim ' + IntToStr(DimCnt) + ' of ' + EntryName,
+          ShapeArr.Integers[DimCnt], Reader.DimSize(EntryName, DimCnt));
+      Reader.LoadTensorFlat(EntryName, Vol);
+      ValuesArr := TensorObj.Arrays['values'];
+      AssertEquals('element count of ' + EntryName, ValuesArr.Count,
+        Vol.Size);
+      // expected.json holds the fp32 values widened to float64, so the
+      // narrowed reference must match bit for bit.
+      for ElemCnt := 0 to ValuesArr.Count - 1 do
+        AssertTrue(EntryName + '[' + IntToStr(ElemCnt) + ']',
+          Single(ValuesArr.Floats[ElemCnt]) = Vol.FData[ElemCnt]);
+    end;
+    AssertEquals(pFixtureName + ' metadata count',
+      Metadata.Count + Lists.Count, Reader.MetadataCount);
+    for MetadataCnt := 0 to Metadata.Count - 1 do
+    begin
+      EntryName := Metadata.Names[MetadataCnt];
+      ExpectedValue := Metadata.Items[MetadataCnt];
+      MetadataIdx := Reader.FindMetadata(EntryName);
+      AssertTrue(pFixtureName + ' has metadata ' + EntryName,
+        MetadataIdx >= 0);
+      Entry := Reader.MetadataAt(MetadataIdx);
+      case ExpectedValue.JSONType of
+        jtNull:
+          AssertTrue(EntryName + ' is None', Entry.Kind = tmkNone);
+        jtBoolean:
+          begin
+            AssertTrue(EntryName + ' is a bool', Entry.Kind = tmkBool);
+            AssertEquals(EntryName, ExpectedValue.AsBoolean,
+              Reader.GetMetadataBool(EntryName, not ExpectedValue.AsBoolean));
+          end;
+        jtString:
+          begin
+            AssertTrue(EntryName + ' is a str', Entry.Kind = tmkStr);
+            AssertEquals(EntryName, ExpectedValue.AsString,
+              Reader.GetMetadataStr(EntryName, '<absent>'));
+          end;
+        jtNumber:
+          if ExpectedValue is TJSONFloatNumber then
+          begin
+            AssertTrue(EntryName + ' is a float', Entry.Kind = tmkFloat);
+            AssertEquals(EntryName, ExpectedValue.AsFloat,
+              Reader.GetMetadataFloat(EntryName, -1), 1e-15);
+          end
+          else
+          begin
+            AssertTrue(EntryName + ' is an int', Entry.Kind = tmkInt);
+            AssertEquals(EntryName, ExpectedValue.AsInt64,
+              Reader.GetMetadataInt(EntryName, -1));
+          end;
+      else
+        Fail('unexpected JSON type for ' + EntryName);
+      end;
+    end;
+    for MetadataCnt := 0 to Lists.Count - 1 do
+    begin
+      EntryName := Lists.Names[MetadataCnt];
+      MetadataIdx := Reader.FindMetadata(EntryName);
+      AssertTrue(pFixtureName + ' has list ' + EntryName, MetadataIdx >= 0);
+      Entry := Reader.MetadataAt(MetadataIdx);
+      AssertTrue(EntryName + ' is a list', Entry.Kind = tmkList);
+      AssertEquals(EntryName + ' length', Lists.Items[MetadataCnt].AsInt64,
+        Entry.IntVal);
+    end;
+  finally
+    Reader.Free;
+    RefRoot.Free;
+    Vol.Free;
+    RefJson.Free;
+  end;
+end;
+
+// A Kev head.pt (tools/torch_head_fixture.py writes it through kev's own
+// write_meta): the pointer head tensors under "head." and the Meta fields
+// plus nested training metadata through the typed getters.
+procedure TTestNeuralPretrained.TestTorchBinKevHeadMetadata;
+var
+  Reader: TNNetTorchBinReader;
+  Failed: boolean;
+begin
+  CheckTorchHeadFixture('kev');
+  Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+    DirectorySeparator + 'kev' + DirectorySeparator + 'head.pt'));
+  try
+    AssertEquals('temperature', 2.3510958125672174,
+      Reader.GetMetadataFloat('temperature', 1.0), 1e-15);
+    AssertEquals('head_dim', 4, Reader.GetMetadataInt('head_dim', 256));
+    AssertEquals('lora', 16, Reader.GetMetadataInt('lora', 0));
+    AssertEquals('lora as float', 16.0, Reader.GetMetadataFloat('lora', 0),
+      0);
+    AssertEquals('base', 'Qwen/Qwen3.5-0.8B-Base',
+      Reader.GetMetadataStr('base', ''));
+    AssertEquals('weights', 'lora', Reader.GetMetadataStr('weights', ''));
+    AssertFalse('option_isolation',
+      Reader.GetMetadataBool('option_isolation', true));
+    AssertEquals('64-bit int', Int64(1) shl 40,
+      Reader.GetMetadataInt('args.big_seed', 0));
+    AssertEquals('negative int', -3, Reader.GetMetadataInt('args.offset', 0));
+    AssertEquals('absent key gives the default', 'dflt',
+      Reader.GetMetadataStr('no.such.key', 'dflt'));
+    AssertFalse('the BUILD-set _metadata is not exposed',
+      Reader.HasMetadata('head._metadata'));
+    Failed := false;
+    try
+      Reader.GetMetadataInt('base', 0);
+    except
+      on E: ETorchBinError do Failed := true;
+    end;
+    AssertTrue('a str read as an int must raise ETorchBinError', Failed);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Open-Jev's head.pt is a bare Linear(d, 1) state_dict; the released files
+// record storage location 'cuda:0', which the reader must accept unread.
+procedure TTestNeuralPretrained.TestTorchBinOpenJevHeadAnyLocation;
+var
+  Reader: TNNetTorchBinReader;
+begin
+  CheckTorchHeadFixture('openjev');
+  CheckTorchHeadFixture('openjev_cuda');
+  Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+    DirectorySeparator + 'openjev_cuda' + DirectorySeparator + 'head.pt'));
+  try
+    AssertEquals('no metadata', 0, Reader.MetadataCount);
+    AssertEquals('absent temperature gives the default', 1.5,
+      Reader.GetMetadataFloat('temperature', 1.5), 0);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Kev-shaped files whose metadata holds a non-whitelisted GLOBAL (os.system),
+// a list that contains itself or memo-shared lists must raise ETorchBinError.
+procedure TTestNeuralPretrained.TestTorchBinHeadRejectsHostileMetadata;
+
+  function OpenErrorMessage(const pFixtureName: string): string;
+  var
+    Reader: TNNetTorchBinReader;
+  begin
+    Result := '';
+    try
+      Reader := TNNetTorchBinReader.Create(FixturePath('torch_head' +
+        DirectorySeparator + pFixtureName + DirectorySeparator + 'head.pt'));
+      Reader.Free;
+    except
+      on E: ETorchBinError do Result := E.Message;
+    end;
+  end;
+
+var
+  Msg: string;
+begin
+  Msg := OpenErrorMessage('evil_meta');
+  AssertTrue('a metadata GLOBAL "posix system" must be refused, got: ' + Msg,
+    Pos('posix system', Msg) > 0);
+  Msg := OpenErrorMessage('cyclic');
+  AssertTrue('a self-containing list must raise, got: ' + Msg,
+    Pos('nested deeper', Msg) > 0);
+  Msg := OpenErrorMessage('shared_bomb');
+  AssertTrue('exponentially shared lists must raise, got: ' + Msg,
+    Pos('walked as a tree', Msg) > 0);
 end;
 
 // End-to-end through the importer: tiny_gpt2.bin is the existing
@@ -13317,6 +13780,264 @@ begin
   {$ENDIF}
 end;
 
+// Decision scoring: prefix P (5 ids), then branches B1 (7 ids), B2 (3 ids)
+// and B1 again. Each branch's last-id logits and its hidden states at the
+// requested positions must equal a width-1 forward of P + branch from an
+// empty session on a reference engine; B1 again must equal B1 bit for bit.
+// The same with an empty prefix. CachedTokens must list the session, so a
+// chat reply afterwards equals a fresh engine's, a chat prompt that keeps P
+// leaves the prefix scoreable, and one that drops it makes scoring raise.
+// Tolerance: 0 when every id is fed one at a time (the same arithmetic as the
+// reference); 1e-5 with the prefill windows (another summation order), 1e-2
+// under OpenCL (the kernels sum in another order). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatDecisionBranchParity(
+  const Stem: string; const ExtraArgs: array of string);
+const
+  Ctx = 16;
+  Vocab = 12;
+  PrefixLen = 5;
+  Branch1Len = 7;
+  Branch2Len = 3;
+var
+  Dir, Tag: string;
+  Engine, Ref, Fresh: TChatEngine;
+  Prefix, Branch1, Branch2, Positions1, Positions2, EmptyIds: TNeuralIntegerArray;
+  ChatPrompt, OtherPrompt, Expected: TNeuralIntegerArray;
+  Logits, Hidden, Logits1, Hidden1: TNNetVolume;
+  RefLogits, RefHidden, StepIn: TNNetVolume;
+  Tolerance: TNeuralFloat;
+  Windowed, OnOpenCL, Raised: boolean;
+  ArgPos: integer;
+  EngineTurn, FreshTurn: TChatTurnRecord;
+
+  function MakeIds(Len, Mul, Add: integer): TNeuralIntegerArray;
+  var
+    Pos: integer;
+  begin
+    SetLength(Result, Len);
+    for Pos := 0 to Len - 1 do Result[Pos] := (Mul * Pos + Add) mod Vocab;
+  end;
+
+  function Concat(const A, B: TNeuralIntegerArray): TNeuralIntegerArray;
+  begin
+    SetLength(Result, Length(A) + Length(B));
+    if Length(A) > 0 then Move(A[0], Result[0], Length(A) * SizeOf(integer));
+    if Length(B) > 0 then
+      Move(B[0], Result[Length(A)], Length(B) * SizeOf(integer));
+  end;
+
+  // Ref's session fed Ids one at a time from empty: the last logits row and
+  // the hidden state at Base + Positions[k].
+  procedure ReferenceForward(const Ids, Positions: TNeuralIntegerArray;
+    Base: integer);
+  var
+    Pos, RequestPos, Depth: integer;
+  begin
+    Depth := Ref.Session.HiddenState().Depth;
+    RefHidden.ReSize(Length(Positions), 1, Depth);
+    Ref.Session.Reset();
+    for Pos := 0 to High(Ids) do
+    begin
+      StepIn.FData[0] := Ids[Pos];
+      Ref.Session.StepForward(StepIn, Pos);
+      for RequestPos := 0 to High(Positions) do
+        if Base + Positions[RequestPos] = Pos then
+          Move(Ref.Session.HiddenState().FData[0],
+            RefHidden.FData[RequestPos * Depth], Depth * SizeOf(TNeuralFloat));
+    end;
+    RefLogits.Copy(Ref.Session.Output());
+  end;
+
+  procedure AssertBranch(const What: string; const Branch,
+    Positions: TNeuralIntegerArray; const PrefixIds: TNeuralIntegerArray);
+  begin
+    Engine.ScoreDecisionBranch(Branch, Positions, Logits, Hidden);
+    ReferenceForward(Concat(PrefixIds, Branch), Positions, Length(PrefixIds));
+    AssertTrue(Tag + What + ': logits within tolerance',
+      MaxAbsRowDiffFrom(RefLogits, Logits, 0) <= Tolerance);
+    AssertEquals(Tag + What + ': hidden rows', Length(Positions), Hidden.SizeX);
+    AssertTrue(Tag + What + ': hidden states within tolerance',
+      MaxAbsRowDiffFrom(RefHidden, Hidden, 0) <= Tolerance);
+    Expected := Concat(PrefixIds, Branch);
+    AssertEquals(Tag + What + ': cached ids', Length(Expected),
+      Length(Engine.CachedTokens));
+    AssertEquals(Tag + What + ': cached ids are prefix + branch',
+      Length(Expected), CommonPrefixLen(Expected, Engine.CachedTokens));
+  end;
+
+  procedure ChatTurn(AEngine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := AEngine.GenerateFromIds(Prompt, AEngine.Opt);
+    Turn.Completion := AEngine.LastCompletionTokens;
+    Turn.Cached := Copy(AEngine.CachedTokens);
+  end;
+
+begin
+  Tag := Stem + ': ';
+  if Length(ExtraArgs) > 0 then Tag := Stem + ' ' + ExtraArgs[0] + ': ';
+  Tolerance := 0;
+  Windowed := false;
+  for ArgPos := 0 to High(ExtraArgs) do
+    if ExtraArgs[ArgPos] = '--prefill-window' then Windowed := true;
+  if Windowed then Tolerance := 1e-5;
+  OnOpenCL := false;
+  for ArgPos := 0 to High(ExtraArgs) do
+    if ExtraArgs[ArgPos] = '--gpu' then OnOpenCL := true;
+  if OnOpenCL then Tolerance := 1e-2;
+  RandSeed := 919191;
+  Prefix := MakeIds(PrefixLen, 5, 2);
+  Branch1 := MakeIds(Branch1Len, 7, 3);
+  Branch2 := MakeIds(Branch2Len, 3, 1);
+  SetLength(Positions1, 3);
+  Positions1[0] := 0; Positions1[1] := 3; Positions1[2] := Branch1Len - 1;
+  SetLength(Positions2, 2);
+  Positions2[0] := 1; Positions2[1] := Branch2Len - 1;
+  SetLength(EmptyIds, 0);
+  Dir := MakeChatModelDir(Stem);
+  Engine := nil;
+  Ref := nil;
+  Fresh := nil;
+  Logits := TNNetVolume.Create();
+  Hidden := TNNetVolume.Create();
+  Logits1 := TNNetVolume.Create();
+  Hidden1 := TNNetVolume.Create();
+  RefLogits := TNNetVolume.Create();
+  RefHidden := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Engine := NewChatSlotEngine(Dir, Ctx, 0, ExtraArgs);
+    Ref := NewChatSlotEngine(Dir, Ctx, 0, []);
+    Fresh := NewChatSlotEngine(Dir, Ctx, 0, ExtraArgs);
+    AssertEquals(Tag + 'twin present exactly when windowed', Windowed,
+      Assigned(Engine.WindowSession));
+    {$IFDEF OpenCL}
+    if OnOpenCL then AssertTrue(Tag + 'OpenCL is on', Assigned(Engine.GpuCL));
+    {$ENDIF}
+    AssertTrue(Tag + 'the hidden state is the LM head''s input',
+      Engine.Session.HiddenLayer() = Engine.NN.GetLastLayer().PrevLayer);
+
+    Engine.PrefillDecisionPrefix(Prefix);
+    if Windowed then
+      AssertEquals(Tag + 'the prefix went through one window', 1,
+        Engine.LastPrefillWindows);
+    AssertEquals(Tag + 'prefix cached', PrefixLen, Length(Engine.CachedTokens));
+    AssertBranch('B1', Branch1, Positions1, Prefix);
+    if Windowed then
+      AssertTrue(Tag + 'B1 went through the twins',
+        (Engine.LastPrefillWindows = 1) and (Engine.LastPrefillTailWindows = 1));
+    Logits1.Copy(Logits);
+    Hidden1.Copy(Hidden);
+    AssertBranch('B2', Branch2, Positions2, Prefix);
+    AssertBranch('B1 again', Branch1, Positions1, Prefix);
+    AssertEquals(Tag + 'B1 again: logits bit for bit', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+    AssertEquals(Tag + 'B1 again: hidden bit for bit', 0,
+      MaxAbsRowDiffFrom(Hidden1, Hidden, 0), 0);
+    // Logits only, hidden only.
+    Engine.ScoreDecisionBranch(Branch1, nil, Logits, nil);
+    AssertEquals(Tag + 'B1 logits alone', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+    Engine.ScoreDecisionBranch(Branch1, Positions1, nil, Hidden);
+    AssertEquals(Tag + 'B1 hidden alone', 0,
+      MaxAbsRowDiffFrom(Hidden1, Hidden, 0), 0);
+
+    // A chat prompt that keeps P and B1's first 3 ids: the live cache reuses
+    // them on a pure-attention net, and the reply equals a fresh engine's.
+    ChatPrompt := Concat(Concat(Prefix, Copy(Branch1, 0, 3)), MakeIds(2, 1, 4));
+    ChatTurn(Engine, ChatPrompt, EngineTurn);
+    ChatTurn(Fresh, ChatPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat after scoring');
+    if Engine.ReuseOK then
+      AssertEquals(Tag + 'the chat reused the decision ids', PrefixLen + 3,
+        Engine.LastReusedTokens)
+    else
+      AssertEquals(Tag + 'hybrid: nothing to resume from', 0,
+        Engine.LastReusedTokens);
+    // The chat kept P in the cache, so the prefix is still scoreable.
+    AssertBranch('B2 after a chat', Branch2, Positions2, Prefix);
+    // A chat prompt that leaves P: scoring raises until P is fed again.
+    OtherPrompt := MakeIds(4, 1, 7);
+    ChatTurn(Engine, OtherPrompt, EngineTurn);
+    ChatTurn(Fresh, OtherPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat that leaves P');
+    Raised := false;
+    try
+      Engine.ScoreDecisionBranch(Branch1, Positions1, Logits, Hidden);
+    except
+      on Exception do Raised := true;
+    end;
+    AssertTrue(Tag + 'scoring without the prefix raises', Raised);
+
+    // Empty prefix.
+    Engine.PrefillDecisionPrefix(EmptyIds);
+    AssertEquals(Tag + 'empty prefix: nothing cached', 0,
+      Length(Engine.CachedTokens));
+    AssertBranch('empty prefix B1', Branch1, Positions1, EmptyIds);
+    AssertBranch('empty prefix B2', Branch2, Positions2, EmptyIds);
+    Logits1.Copy(Logits);
+    AssertBranch('empty prefix B2 again', Branch2, Positions2, EmptyIds);
+    AssertEquals(Tag + 'empty prefix B2 again: logits bit for bit', 0,
+      MaxAbsRowDiffFrom(Logits1, Logits, 0), 0);
+
+    // P again; the chat after it still equals a fresh engine.
+    Engine.PrefillDecisionPrefix(Prefix);
+    AssertBranch('P again B1', Branch1, Positions1, Prefix);
+    ChatTurn(Engine, ChatPrompt, EngineTurn);
+    ChatTurn(Fresh, ChatPrompt, FreshTurn);
+    AssertSameChatTurn(FreshTurn, EngineTurn, Tag + 'chat after P again');
+  finally
+    StepIn.Free;
+    RefHidden.Free;
+    RefLogits.Free;
+    Hidden1.Free;
+    Logits1.Free;
+    Hidden.Free;
+    Logits.Free;
+    Fresh.Free;
+    Ref.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatDecisionBranchParity;
+begin
+  RunChatDecisionBranchParity('qwen2', []);
+  RunChatDecisionBranchParity('qwen3_5', []);
+end;
+
+// The prefix and the branches go through the width-4 and width-2 twins.
+procedure TTestNeuralPretrained.TestChatDecisionBranchPrefillWindow;
+begin
+  RunChatDecisionBranchParity('qwen2', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+  RunChatDecisionBranchParity('qwen3_5', ['--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+end;
+
+// The same with OpenCL: the hidden states are read from a non-last layer.
+procedure TTestNeuralPretrained.TestChatDecisionBranchOpenCL;
+{$IFDEF OpenCL}
+var
+  APlatform: cl_platform_id;
+  ADevice: cl_device_id;
+{$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if not AcquireFirstOpenCLDevice(APlatform, ADevice) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  RunChatDecisionBranchParity('qwen3_5', ['--gpu', '--prefill-window', '4',
+    '--prefill-tail-window', '2']);
+  RunChatDecisionBranchParity('qwen2', ['--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
 // One slot. A1, then A1 again with a shorter reply (a regenerate: it resumes
 // past its own last user message, so it captures no last-user point of its
 // own), then B (whose save of the regenerated A takes the only slot), then
@@ -14792,13 +15513,10 @@ begin
     SoloInferenceBytes := Solo.GetLastLayer().NonWeightBytes();
     AssertTrue('inference-only DeltaNet below the trainable one',
       8 * SoloInferenceBytes < FirstTrainedDelta.NonWeightBytes());
-    // TNNetLayer.SetTrainable(true) leaves the two error buffers to
-    // SetPrevLayer, so the flipped layer is short of exactly those (they hold
-    // one element each until then); the BPTT caches themselves come back.
+    // SetTrainable(true) restores the BPTT caches and both error buffers.
     Solo.SetTrainable({pTrainable=}true, {pLowMemory=}false);
     AssertEquals('SetTrainable(true) restores the BPTT caches',
-      FirstTrainedDelta.NonWeightBytes() -
-      2 * (int64(FirstTrainedDelta.Output.Size) - 1) * csNeuralFloatSize,
+      FirstTrainedDelta.NonWeightBytes(),
       Solo.GetLastLayer().NonWeightBytes());
     Solo.SetTrainable({pTrainable=}false);
     AssertEquals('SetTrainable(false) releases them again',
@@ -44864,6 +45582,259 @@ begin
     AdaptNN.Free;
     MergeNN.Free;
   end;
+end;
+
+// LoRA merge in HF tensor space: tests/fixtures/lora_merge_qwen3_5/ is a
+// PEFT adapter (tools/lora_merge_tiny_fixture.py, PEFT's own save_pretrained)
+// on every Kev target module of the tiny_qwen3_5 hybrid, keys
+// "base_model.model.layers.N.<module>" against a checkpoint under
+// "model.language_model.", with rank_pattern/alpha_pattern entries. The
+// oracle is HF float64 logits of merge_and_unload(). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen35LogitParity;
+const
+  WName = 'model.language_model.layers.3.self_attn.q_proj.weight';
+var
+  NN: TNNet;
+  Reader: TNNetLoRAMergeReader;
+  AdapterDir: string;
+  Whole, Rows: TNNetVolume;
+  ElemCnt, MaxElemPos, FirstElem: integer;
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3_5' + DirectorySeparator + 'logits.json'));
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+    {pSeqLen=}0, {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'),
+    {pQuantizeInt8=}false, {pWeightOwner=}nil, AdapterDir);
+  try
+    AssertLogitParityWithFixture(NN, AdapterDir + 'logits.json', 16, 13);
+  finally
+    NN.Free;
+  end;
+  // A row range that does not start on a row boundary (RowSize 4, InDim 8)
+  // must read exactly the matching slice of the whole merged tensor.
+  Reader := TNNetLoRAMergeReader.Create(TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_qwen3_5.safetensors')), AdapterDir);
+  Whole := TNNetVolume.Create;
+  Rows := TNNetVolume.Create;
+  try
+    // 6 linear layers x 5 modules + 2 full layers x 4 + 8 x 3 MLP modules.
+    AssertEquals('adapted tensors', 62, Reader.AdaptedTensorCount);
+    AssertEquals('merged dtype', 'F32', Reader.GetDType(WName));
+    AssertTrue('row view', Reader.CanStreamTensorRows(WName));
+    Reader.LoadTensorFlat(WName, Whole);
+    Reader.LoadTensorRowsFlat(WName, {FirstRow=}3, {RowCount=}5,
+      {RowSize=}4, Rows);
+    FirstElem := 3 * 4;
+    MaxElemPos := Rows.Size - 1;
+    for ElemCnt := 0 to MaxElemPos do
+      AssertEquals('row view element ' + IntToStr(ElemCnt),
+        Whole.FData[FirstElem + ElemCnt], Rows.FData[ElemCnt], 1e-6);
+  finally
+    Rows.Free;
+    Whole.Free;
+    Reader.Free;
+  end;
+end;
+
+// Attention-only twin of TestLoRAMergeQwen35LogitParity: the tiny_qwen3
+// checkpoint keys sit under "model." and its embeddings are tied; the adapter
+// covers q/k/v/o and gate/up/down. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen3LogitParity;
+var
+  NN: TNNet;
+  AdapterDir: string;
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3' + DirectorySeparator + 'logits.json'));
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3.safetensors'),
+    {pSeqLen=}0, {pTrainable=}false, FixturePath('tiny_qwen3_config.json'),
+    {pQuantizeInt8=}false, {pWeightOwner=}nil, AdapterDir);
+  try
+    AssertLogitParityWithFixture(NN, AdapterDir + 'logits.json', 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// The int8 build of the merged Qwen3.5 fixture (direct-to-int8 row streaming
+// reads merged rows) must equal the int8 build of a checkpoint holding the
+// merged weights, and sit closer to the merged oracle than to the base one.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeQwen35Int8;
+var
+  NNQ, NNBaked: TNNet;
+  Reader: TNNetLoRAMergeReader;
+  Writer: TNNetSafeTensorsWriter;
+  AdapterDir, BakedFile: string;
+  RefJson: TStringList;
+  RefRoot, BaseRoot: TJSONData;
+  Sequences, MergedLogits, BaseLogits, RowArr, BaseRowArr: TJSONArray;
+  Input, Output, BakedOutput, Tensor: TNNetVolume;
+  SeqCnt, PosCnt, TokCnt, QuantLayers, LayerCnt, TensorCnt: integer;
+  MergedDiff, BaseDiff, BakedDiff, Value: double;
+
+  function LoadLogits(const FileName: string): TJSONData;
+  begin
+    RefJson.LoadFromFile(FileName);
+    Result := GetJSON(RefJson.Text);
+  end;
+
+begin
+  AdapterDir := ExtractFilePath(
+    FixturePath('lora_merge_qwen3_5' + DirectorySeparator + 'logits.json'));
+  BakedFile := GetTempDir(false) + 'cai_lora_merged_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create(16, 1, 1);
+  Output := TNNetVolume.Create;
+  BakedOutput := TNNetVolume.Create;
+  RefRoot := LoadLogits(AdapterDir + 'logits.json');
+  BaseRoot := nil;
+  NNQ := nil;
+  NNBaked := nil;
+  try
+    BaseRoot := LoadLogits(FixturePath('tiny_qwen3_5_logits.json'));
+    BaseLogits := TJSONArray(TJSONObject(BaseRoot).Find('logits'));
+    Reader := TNNetLoRAMergeReader.Create(TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_qwen3_5.safetensors')), AdapterDir);
+    Writer := TNNetSafeTensorsWriter.Create(BakedFile);
+    Tensor := TNNetVolume.Create;
+    try
+      for TensorCnt := 0 to Reader.Count - 1 do
+      begin
+        Reader.LoadTensorFlat(Reader.TensorName(TensorCnt), Tensor);
+        Writer.AddTensorFlat(Reader.TensorName(TensorCnt),
+          Reader.GetInfo(Reader.TensorName(TensorCnt)).Shape, Tensor);
+      end;
+      Writer.SaveToFile;
+    finally
+      Tensor.Free;
+      Writer.Free;
+      Reader.Free;
+    end;
+    NNQ := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {pSeqLen=}0, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'), {pQuantizeInt8=}true,
+      {pWeightOwner=}nil, AdapterDir);
+    NNBaked := BuildFromPretrained(BakedFile, {pSeqLen=}0, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'), {pQuantizeInt8=}true);
+    QuantLayers := 0;
+    for LayerCnt := 0 to NNQ.GetLastLayerIdx() do
+      if (NNQ.Layers[LayerCnt] is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(NNQ.Layers[LayerCnt]).WeightsQuantizedInt8 then
+        Inc(QuantLayers);
+    AssertTrue('int8 layers present', QuantLayers > 0);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    MergedLogits := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    MergedDiff := 0;
+    BaseDiff := 0;
+    BakedDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      for PosCnt := 0 to 15 do
+        Input.FData[PosCnt] :=
+          TJSONArray(Sequences.Items[SeqCnt]).Items[PosCnt].AsInteger;
+      NNQ.Compute(Input);
+      NNQ.GetOutput(Output);
+      NNBaked.Compute(Input);
+      NNBaked.GetOutput(BakedOutput);
+      for PosCnt := 0 to 15 do
+      begin
+        RowArr := TJSONArray(TJSONArray(MergedLogits.Items[SeqCnt]).Items[PosCnt]);
+        BaseRowArr := TJSONArray(TJSONArray(BaseLogits.Items[SeqCnt]).Items[PosCnt]);
+        for TokCnt := 0 to 12 do
+        begin
+          Value := Output.FData[PosCnt * 13 + TokCnt];
+          MergedDiff := Max(MergedDiff, Abs(Value - RowArr.Items[TokCnt].AsFloat));
+          BaseDiff := Max(BaseDiff, Abs(Value - BaseRowArr.Items[TokCnt].AsFloat));
+          BakedDiff := Max(BakedDiff,
+            Abs(Value - BakedOutput.FData[PosCnt * 13 + TokCnt]));
+        end;
+      end;
+    end;
+    AssertTrue('int8 merged build vs int8 build of the baked merged ' +
+      'checkpoint: max |diff| = ' + FloatToStr(BakedDiff) + ' must be < 1e-5',
+      BakedDiff < 1e-5);
+    AssertTrue('int8 merged build: max |diff| to the merged oracle (' +
+      FloatToStr(MergedDiff) + ') must be below that to the base oracle (' +
+      FloatToStr(BaseDiff) + ')', MergedDiff < BaseDiff);
+  finally
+    NNBaked.Free;
+    NNQ.Free;
+    BaseRoot.Free;
+    RefRoot.Free;
+    BakedOutput.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    DeleteFile(BakedFile);
+  end;
+end;
+
+// adapter_config.json options whose weights are not base + (alpha/r) B A are
+// refused before any tensor is read, and an adapter whose modules match no
+// base tensor is refused too. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeRejectsUnsupportedAdapters;
+const
+  BadOptions: array[0..5] of string = ('"use_rslora": true',
+    '"use_dora": true', '"modules_to_save": ["lm_head"]',
+    '"trainable_token_indices": [1, 2]', '"bias": "all"',
+    '"init_lora_weights": "pissa"');
+var
+  AdapterDir, OptionName: string;
+  ConfigText: TStringList;
+  OptionCnt: integer;
+  Raised: boolean;
+begin
+  AdapterDir := GetTempDir(false) + 'cai_lora_merge_' +
+    IntToStr(Random(1000000)) + DirectorySeparator;
+  AssertTrue('temp adapter dir', ForceDirectories(AdapterDir));
+  ConfigText := TStringList.Create;
+  try
+    for OptionCnt := Low(BadOptions) to High(BadOptions) do
+    begin
+      ConfigText.Text := '{"peft_type": "LORA", "r": 2, "lora_alpha": 4, ' +
+        BadOptions[OptionCnt] + '}';
+      ConfigText.SaveToFile(AdapterDir + 'adapter_config.json');
+      OptionName := Copy(BadOptions[OptionCnt], 2,
+        Pos('"', Copy(BadOptions[OptionCnt], 2, MaxInt)) - 1);
+      Raised := false;
+      try
+        BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'), 0, false,
+          FixturePath('tiny_qwen3_5_config.json'), false, nil,
+          AdapterDir).Free;
+      except
+        on E: EPretrainedImportError do
+        begin
+          Raised := true;
+          AssertTrue('message names ' + OptionName + ': ' + E.Message,
+            Pos(OptionName, E.Message) > 0);
+        end;
+      end;
+      AssertTrue(BadOptions[OptionCnt] + ' must be refused', Raised);
+    end;
+  finally
+    DeleteFile(AdapterDir + 'adapter_config.json');
+    RemoveDir(AdapterDir);
+    ConfigText.Free;
+  end;
+  // The Qwen3 adapter targets self_attn in layer 0, a linear_attention layer
+  // of the Qwen3.5 checkpoint.
+  Raised := false;
+  try
+    BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'), 0, false,
+      FixturePath('tiny_qwen3_5_config.json'), false, nil,
+      ExtractFilePath(FixturePath('lora_merge_qwen3' + DirectorySeparator +
+      'logits.json'))).Free;
+  except
+    on E: EPretrainedImportError do
+    begin
+      Raised := true;
+      AssertTrue('message names the unmatched module: ' + E.Message,
+        Pos('matches no base tensor', E.Message) > 0);
+    end;
+  end;
+  AssertTrue('an adapter for another architecture must be refused', Raised);
 end;
 
 procedure TTestNeuralPretrained.TestMXFP4DequantHandBlock;

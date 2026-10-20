@@ -73,6 +73,123 @@ rather than acted on.
 
 ## Bugs
 
+- [x] BUG: `SetTrainable(False)` then `SetTrainable(True)` did not give back a
+      trainable layer. `TNNetLayer.SetTrainable(False)` shrinks `FOutputError` /
+      `FOutputErrorDeriv` to 1x1x1; the True branch only set flags, so nothing
+      regrew them. Effects: `TNNetFullConnect.BackpropagateCPU` wrote past the
+      end of both buffers, convolutions kept the `FCalculatePrevLayerError` flag
+      and `FPrevLayerErrorPadded` size they cached at wiring time, a layer
+      flipped from low-memory inference kept its 1x1x1 concatenated weight
+      caches (wrong output), and a `TNNetInput(pError=1)` lost its input
+      gradient. Adam moments are freed by the False flip and are not restored:
+      run `InitAdam` again after the True flip.
+  - [x] Part 1 (Done 2026-10-18, commit 4c39cee9): `TNNetLayer.SetTrainable(True)` on an
+        inference-only layer regrows the error buffers to `FOutput` (a class that
+        uses `SetOutputErrorSizeNoDeriv` keeps its deriv buffer at 1x1x1) and runs
+        `AfterWeightUpdate` when low-memory mode was on. Quantized and
+        weight-borrowing layers (`HasInferenceOnlyWeights`) stay inference-only.
+        `TNNetInput` regrows its buffers when `FStruct[3]=1`. `TNNet.SetTrainable`
+        then runs the new `TNNet.RefreshPrevLayerErrorCaches` (conv family:
+        flag + padded error buffer; `EnableInputGradient` uses it too). Size
+        checks added in `ComputeOutputErrorForIdx`, `ComputeErrorDeriv`,
+        `TNNetFullConnect.Backpropagate` and `TNNetFullConnectDiff.Backpropagate`.
+        New tests `TestSetTrainableRoundTripMatchesTwin` (8 nets x 4 flip modes vs
+        a never-flipped twin, 1e-6) and `TestSetTrainableKeepsInferenceOnlyWeights`.
+        Suites green: cpu 3283 (+1 run alone), avx2 3284, opencl 3284; 0 errors,
+        0 failures. Not done in part 1: re-arming OpenCL after a flip.
+  - [x] Part 2: the 35 layers whose `SetTrainable` override only frees
+        (`if not pTrainable then FreeBackpropScratch()`), plus AconC, MetaAconC,
+        DyT, PReLUChannel and SReLU, lose backprop scratch that the True flip
+        does not size again. Add a per-class
+        `SizeBackpropScratch` helper called from `SetPrevLayer` and from the
+        `SetTrainable` True branch.
+        The 35 overrides in file order, split in two batches:
+    - [x] Batch A (Done 2026-10-18, commit 6caa428a): ArcFace, ForgetGateBias,
+          InducedSetAttention, ProductKeyMemory, AttentionPooling, Retention,
+          CrossAttention, T5RelPosBiasAttention, DifferentialAttention,
+          LinformerAttention, GatedResidual, CapsuleRouting, HardConcrete, GRN,
+          APL, SplineActivation, Invertible1x1Conv, MLSTMCell. Each got a private
+          `SizeBackpropScratch` (sizes what `FreeBackpropScratch` frees), called
+          from `SetPrevLayer` and from the True branch when `FIsTrainable` and
+          `FPrevLayer` is assigned. T5RelPosBiasAttention and DifferentialAttention
+          need nothing: their `Backpropagate` resizes the scratch. New test
+          `TestSetTrainableRoundTripScratchLayersA` (18 nets x 4 modes, 1e-6,
+          shared `CheckSetTrainableRoundTrip` helper); fails on the old code under
+          `-Cr` with a range check error in `TNNetArcFace.Backpropagate`. Suites
+          green: cpu, avx2, opencl 3285 each, 0 errors, 0 failures.
+          Found on the way: `TNNetLinformerAttention.Backpropagate` only
+          accumulates deltas and never applies them when `FBatchUpdate` is false
+          (the helper now calls `TNNet.UpdateWeights`); not changed.
+    - [x] Batch B (Done 2026-10-18, commit f351b7ac): DeltaNet, GatedDeltaNet,
+          GatedLinearAttention, NTMMemory, TestTimeTraining, TitansMemory,
+          SpectralConv1D, DWT1D, SpectralConv2D, CondConv, MonarchLinear,
+          KroneckerLinear, SoftDecisionTree, HouseholderLinear, HyperbolicLinear,
+          HyperbolicDistance, GraphAttention (17 overrides). Each got the batch-A
+          `SizeBackpropScratch`, except GatedDeltaNet, whose override already
+          re-runs `SizeSequenceCaches`. AconC, MetaAconC, DyT, PReLUChannel and
+          SReLU got `FreeBackpropScratch` + `SizeBackpropScratch` + a
+          `SetTrainable` override (free on False, size on True). No other class
+          needed it: the remaining `if FIsTrainable` blocks in `SetPrevLayer`
+          size neuron Delta/BackInertia (regrown by `TNNetNeuron.SetTrainable`)
+          or already have a regrowing override. The NoForward mask
+          (TNNetDotProducts, TNNetPointwiseSoftMax) is rebuilt on the True flip
+          and built in `SetPrevLayer` only when trainable (an inference-only
+          DotProducts(NoForward) used to write the mask past its 1x1x1 buffer).
+          `TNNet.EnableInputGradient` now calls `TNNetInput.EnableErrorCollection`.
+          examples/GPT2Import/README.md no longer says an inference-only net can
+          never train. New test `TestSetTrainableRoundTripScratchLayersB` (26
+          nets x 4 modes, 1e-6; DeltaNet lr 0.2, HyperbolicDistance lr 0.01 with
+          c=0.01); on the old code under `-Cr -Ct` every class but GatedDeltaNet
+          fails. Suites green: cpu, avx2, opencl 3286 each, 0 errors, 0 failures.
+- [x] BUG: `TNNetLinformerAttention.Backpropagate`
+      accumulates its weight deltas but never applies them when `FBatchUpdate`
+      is false, so the layer does not train outside batch mode unless the
+      caller runs `TNNet.UpdateWeights`. Found during SetTrainable part 2,
+      batch A.
+      Done 2026-10-18: `Backpropagate` now ends with the sibling-layer tail
+      (`if not FBatchUpdate` -> `UpdateWeights(FInertia)` on E and F, then
+      `AfterWeightUpdate`); batch mode still accumulates for
+      `TNNet.UpdateWeights` (base `TNNetLayer.UpdateWeights` / Adam / ClearDeltas
+      already cover both neurons; Linformer has no Q/K/V/O neurons, only E/F).
+      New test `TestLinformerAttentionTrainsWithoutBatchUpdate` (inertia 0 and
+      0.9: E/F move and their deltas are cleared after one per-sample step, and
+      match a batch-mode step + `UpdateWeights` within 1e-6); fails on the old
+      code. The weight/input gradient checks already existed. The
+      `CheckSetTrainableRoundTrip` helper no longer calls `TNNet.UpdateWeights`.
+      Suites green: cpu, avx2, opencl 3287 each, 0 errors, 0 failures.
+      Scan of every `Backpropagate*` that writes neuron deltas without a
+      non-batch apply found no other layer with the same defect (the conv /
+      depthwise / local-connect `BackpropagateAtOutputPos` and the circulant
+      FFT helper are called from routines that apply). The next item is a
+      related defect of a different shape.
+- [x] BUG: `TNNetWeightStandardizationConv.Backpropagate`
+      (neural/neuralnetwork.pas ~100865) and `TNNetSpectralNormConv.Backpropagate`
+      (~101080) remap the per-call delta increment AFTER `inherited Backpropagate`.
+      Outside batch mode the inherited conv backprop
+      (`BackpropagateFastTiledCPU`) has already applied and cleared the deltas,
+      so the raw weights get the w_hat / w_eff gradient unmapped and the remap
+      sees a zero increment. Batch mode is correct.
+      Done 2026-10-18 (430b02a4): worse than reported - the inherited step went
+      to the in-place standardised / scaled copy, which `RestoreRawFilters`
+      overwrote, so the raw weights never moved (only the bias did). Both
+      overrides now run the inherited backward with `FBatchUpdate` forced true,
+      remap, then call `UpdateWeights()` when not in batch mode and the output
+      error is non-zero (the inherited `MaxError > 0` guard). `TNNetConvolution`
+      is unchanged; the conv OpenCL backward is disabled, so both layers use the
+      CPU path. New tests `TestWeightStandardizationConvTrainsWithoutBatchUpdate`
+      and `TestSpectralNormConvTrainsWithoutBatchUpdate` (inertia 0 and 0.9;
+      step and next forward match batch + `UpdateWeights` within 1e-6 / 1e-5)
+      fail on the old code; `TestSpectralNormConvWeightGradientMatchesScaledConv`
+      adds the missing raw-weight check (constant-sigma, so against a plain conv
+      holding W/sigma, not finite differences). Scan of every `Backpropagate`
+      override in neural/ for delta work or weight restore after `inherited`
+      found no other layer with this shape. Suites green: cpu, avx2, opencl 3290
+      each, 0 errors, 0 failures.
+- [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
+      (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
+      (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
+      applies; its declaration comment calls this intended, but dL/dW =
+      (1/sigma) dL/dw_eff under the same constant-sigma rule.
 - [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
@@ -4228,6 +4345,368 @@ rather than acted on.
           _h kernels) next to FP32 at the Qwen-Image shapes, to test whether
           the block kernel (10-11 TFLOPS of ~30) is bound by FP32 activation
           traffic (64 MB at 4096 tokens > 48 MB L2). Measurement only.
+- [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
+      calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
+      branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
+      (AnyJev L0 readout on any loaded decoder), stage 2 (Kev and Open-Jev: Qwen3.5 +
+      LoRA + a small head). Laya (ModernBERT encoder + decision head) is LATER, not in
+      this plan. One Opus agent per task, run serially, test + commit after each.
+      Decisions:
+      - Wire format = TypeSafe's `POST /v1/systemone` (OpenAPI 0.2.0 at
+        api.typesafe.ai/openapi.json). Request `{model, state, questions:{id:{type,
+        instructions, criteria}}}`; `state`/`instructions`/descriptions may be a
+        string, an object or an array. `choice.criteria` = name -> description map
+        (1..255, key order = option order, null description allowed);
+        `score.criteria` = ordered array of level descriptions (1..10, levels 0..n-1);
+        `noul.criteria` = optional `{true, false}`. Response `{model, answers, usage:
+        {input_tokens, output_tokens}}`; choice `{type, choice, probabilities (by
+        name), confidence}`; score `{type, score (= sum i*p_i), legend, probabilities
+        (keys "0".."n-1"), confidence}`; noul `{type, noul}` only. Validation errors
+        = HTTP 422 `{"detail":[{loc, msg, type}]}`; other errors `{"detail": str}`.
+        `box` questions and image `assets` are rejected (422).
+      - Confidence = Jev's published formulas on EVERY scorer, computed from the
+        probabilities only: choice `(p_max-1/n)/(1-1/n)`; score
+        `max(0, 1 - sum p_i|i-mode| / D)`, `D = (1/n) sum |i-(n-1)/2|`, mode = first
+        argmax; both 1.0 when n = 1; all-zero p -> uniform. Noul has no confidence.
+        Checks: score (0,0.57,0.43) -> 0.355; (0,0.95,0.05) -> 0.925.
+      - Rendering of object/array values (state, instructions, descriptions): Kev's
+        `api.render` (str/number/bool as text, list -> "- item" lines, dict ->
+        "key: value" lines, nested values indented). One renderer for all scorers.
+      - Special-token strings in caller text: rewrite `<|x|>` -> `<¦x¦>` before
+        tokenizing (Kev's rule), on every scorer. A general "specials as plain text"
+        tokenizer flag is a separate follow-up.
+      - ChatServer always registers `/v1/systemone`. Without `--decision-adapter` it
+        answers with AnyJev L0 on the loaded chat model (nothing extra is loaded).
+        With `--decision-adapter <dir>` the server merges the adapter, reads the head
+        and becomes decision-only: the chat endpoints return an error naming the
+        reason. ChatTerminal does not change.
+      - LoRA is merged in HF TENSOR space before the build (base + scale*B@A in FP32,
+        rounded once), so the importer's row permutations (rotate_half q/k, the
+        Qwen3.5 q/gate split, fused gate+up, fused z/b/a) apply unchanged and
+        int8/int4 quantization follows as usual. No live (unmerged) LoRA path.
+      - `head.pt` is read by `neuraltorchbin.pas` (extended for top-level scalar /
+        string metadata). No Python conversion step for users.
+      - Multi-question and multi-candidate scoring: prefill the shared prefix once,
+        then per branch `TruncateTo(PrefixLen)` + `RestoreStateFrom(checkpoint)`,
+        then feed the branch. Exact on attention-only and GatedDeltaNet hybrids; no
+        new attention masks, no per-token RoPE positions.
+      - AnyJev label prior: the content-free prior (states "N/A", "" and "[MASK]",
+        alpha 1.0) is the default. The running-mean batch prior (stateful across
+        requests) is a follow-up. AnyJev L1/L2 are out of scope (removed upstream in
+        0.3.0, and both need labelled data).
+      - GPT-AGI/OpenJev is not ported: AnyJev L0 covers it, and its first-token-only
+        label scoring is a correctness bug.
+      - Tests: pico fixtures with an HF/PyTorch float64 oracle made by
+        `tools/*_fixture.py` scripts in the `~/x` venv under the 2 GB cap, plus
+        model-free unit tests. Real-checkpoint checks run on the user's box.
+      Reference facts (research 2026-10-18):
+      - AnyJev L0 (`anyjev` 0.3.0 `readout.py`, `calibrate/permute.py`,
+        `calibrate/contextual.py`): system prompt "You are a decision function. You
+        will be given a state and one question. Reply with the answer label only: no
+        words, no punctuation, no explanation."; user message lines "State:", state
+        (or "(empty)"), "", "Question: <q>", then per kind: choice "Options:" + "A. opt"
+        lines + "Answer with the letter only."; score "Pick the level that applies (the
+        levels are ordered):" + "1. lvl" lines + "Answer with the number only."; noul
+        "Answer Yes or No." / "Answer No or Yes.". Chat template with
+        add_generation_prompt and thinking OFF; no template -> "{system}\n\n{user}\n
+        Answer:". Encoded without special tokens. Labels: choice A..Z (max 26), score
+        "1".."K" (letters if a digit is not one token), noul Yes/No. Each label = the
+        first of `lab`, `" "+lab` that is ONE token, else error. Readout = full-vocab
+        log_softmax at the last position, then softmax over the label logits.
+        Rotations: choice cyclic shifts `perm[j] = (j+s) mod K`, noul both orders,
+        score none. Per rotation p = p_raw / prior^alpha, clip 1e-8, renormalise; then
+        map positions back to options and combine by log-mean (mean of log(clip
+        1e-12), subtract max, exp, normalise). Content-free prior = mean over the 3
+        empty-state probes per rotation, clip 1e-8, renormalise. Model-free oracle:
+        raw (0.62,0.38), prior (0.70,0.30), alpha 1 -> 0.4115.
+      - Kev (`jaredpalmer/kev`, HF `jaredpalmer/kev-0.8b|4b|9b|27b`): bases
+        `Qwen/Qwen3.5-{0.8B,4B,9B}-Base` (frozen, LoRA r16 alpha32 on q/k/v/o,
+        gate/up/down, in_proj_qkv/z/a/b, out_proj) and `Qwen/Qwen3.8-27B` (27B = full
+        fine-tune, `Qwen3_5TextModel` keys without `model.` prefix, no lm_head).
+        Adapter keys `base_model.model.layers.N.<module>.lora_{A,B}.weight`, F32.
+        Tokens reused: state `<|fim_prefix|>`, question `<|fim_middle|>`, option open
+        `<|box_start|>`, option close `<|box_end|>`, decide `<|fim_suffix|>`. Row =
+        `[<|fim_prefix|>] + state` then per question `[<|fim_middle|>] + instructions
+        + (<|box_start|> opt <|box_end|>)* + [<|fim_suffix|>]`; no BOS, no chat
+        template. Options: noul `["no[: false desc]", "yes[: true desc]"]` -> answer
+        p[1]; choice "name" or "name: desc"; score rendered level text. Head reads the
+        FINAL hidden state (after the final RMSNorm): `z = (K h_</opt>) . (Q h_decide)
+        / sqrt(256) / T`, Q and K = Linear(d -> 256) with bias. `head.pt` = torch.save
+        dict: `head` (OrderedDict q.weight/q.bias/k.weight/k.bias, fp32), `temperature`
+        (0.8B 2.3510958), `head_dim` 256, `base`, `base_revision`, `lora`, plus nested
+        training metadata. State limit 65536 tokens (422 above it).
+      - Open-Jev (`Zefan-Cai/Open-Jev`, MIT code; HF `ZefanCai/Open-Jev-2B|9B|27B-v1.1`,
+        Apache-2.0): bases `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`
+        (post-trained). Package `package/checkpoint/{adapter/, head.pt, model.json,
+        temperature.json}`. LoRA r8 alpha16 on q/k/v/o, in_proj_qkv, out_proj, same key
+        naming as Kev. Head = plain state_dict `weight [1,d]`, `bias [1]` (storage
+        location may be 'cuda:0'). One chat-template prompt per candidate (user turn
+        only, thinking off): "Context:\n{state}\n\nQuestion: {q}\n" + "Proposed
+        answer: {option}\nIs this proposed answer correct? Answer Yes or No."; noul =
+        ONE prompt "...Is the answer to this question yes? Answer Yes or No." with
+        "\nYes means: ..."/"\nNo means: ..." appended to the question. Score s = head(
+        final hidden state of the last token); choice/score p = softmax(s/T), noul
+        p = sigmoid(s/T). Non-string values rendered with json.dumps(sort_keys).
+  Stage 0 — shared decision layer:
+  - [x] D0.1 `neural/neuraldecision.pas`: question/answer records, the Jev request
+        parser + validator (422 detail list), the response builder, the confidence
+        formulas, the value renderer, the special-token rewrite, and a restricted
+        softmax over a set of logit ids (search `TNNetVolume`/`neuralvolume.pas` for an
+        existing row softmax first). Model-free unit tests, including the 0.355/0.925
+        confidence checks and JSON round trips.
+        Done: 20 tests in `tests/TestNeuralDecision.pas`. Servers must call the
+        STRING entry point of `ParseDecisionRequest`: only it can see option names
+        over fpjson's 255-byte key limit. Open: `HFDecodeUnicodeEscapes`
+        (`neuralhftokenizer.pas`) turns an escaped quote or backslash into the raw
+        character, which breaks the JSON; the decision parser decodes escapes itself.
+  - [x] D0.2 `TChatEngine` public decision primitives: tokenize + prefill a shared
+        prefix and capture its state; score a branch from that state, returning the
+        last-position logits and/or the final hidden state at requested branch
+        positions; leave the engine consistent (`CachedTokens` = session contents, or
+        cleared) on success and on exception. Tests on the Qwen3.5 hybrid pico and an
+        attention-only pico: branch-after-restore equals a full fresh forward.
+        Done: `PrefillDecisionPrefix` + `ScoreDecisionBranch`; `CachedTokens` stays
+        exact (a later chat reuses what the session holds). Prefill windowing is
+        shared with chat through `PlanPrefillLadder`/`FeedPrefillLadder`. Tests
+        `TestChatDecisionBranch{Parity,PrefillWindow,OpenCL}` (OpenCL run on PoCL
+        only, no real GPU).
+  - [x] D0.3 ChatServer: `POST /v1/systemone` route (dispatch to the active scorer),
+        decision-only mode switch for later stage-2 use, `--selftest` cases.
+        Done: `TDecisionScorer` base (scorers take their engine/head in the
+        constructor); no scorer -> 501, validation -> 422, wrong model -> 422 (the
+        model name or `jev-latest`), scorer exception -> 500. 18 new selftest cases
+        (run by hand: no test script runs ChatServer `--selftest`).
+        Changed later (user request): the request `model` is optional and ignored
+        (any value or JSON type); ChatServer serves one model and every response's
+        `model` names the loaded scorer, so the wrong-model 422 and the
+        `jev-latest` alias (`AcceptsModel`, `csDecisionDefaultModelAlias`) are gone.
+  Stage 1 — AnyJev L0 readout (no trained weights):
+  - [x] D1.1 AnyJev L0 scorer (in `neuralanyjev.pas`, not `neuraldecision.pas`): prompt builder per kind, label
+        token mapping, rotations, content-free prior, log-mean marginalisation, plus a
+        `raw` level (one prompt, no prior). Jev mapping: choice options rendered
+        "name: desc", score levels = descriptions, noul criteria appended as
+        "Yes means: ..."/"No means: ..." lines. Port AnyJev's model-free tests
+        (`tests/test_calibrate.py`).
+        Done: `TAnyJevL0Scorer`, 15 tests in `tests/TestNeuralAnyJev.pas`. Prompts are
+        grouped by state text (request state + the 3 content-free probes); each group
+        prefills its longest common token prefix once, so the model reads exactly the
+        full-prompt encodings (no sentinel split). Open: the Qwen3 closed-think append
+        for cfChatML/cfQwen templates is unchecked against a real template (D1.2); a
+        multi-token Yes/No label answers 500, not 422 (D1.3); batch prior,
+        adaptive_shifts, canonical_order not ported.
+  - [x] D1.2 Parity: `tools/anyjev_tiny_fixture.py` runs the real `anyjev` 0.3.0
+        Decider (L0, content-free prior) on a pico Qwen-family decoder with a chat
+        template; Pascal test compares probabilities.
+        Done: fixtures `tests/fixtures/anyjev_qwen25/` (Qwen2, verbatim Qwen2.5
+        template -> cfQwen) and `anyjev_qwen3/` (Qwen3, verbatim Qwen3-0.6B template
+        -> cfChatML + closed think, which matches HF `enable_thinking=False`). Prompt
+        ids and label ids are exact; raw rows, priors and answers agree within 3.1e-6
+        (HFBackend runs float64 but casts logits to float32 before log_softmax).
+        Note for D1.3: on prompts whose prefix has >= 256 tokens AnyJev scores the
+        rotations through `score_shared` (prefix and suffix encoded apart, used only
+        when that equals the joint encoding), so it matches the Pascal full encoding.
+  - [x] D1.3 Wire L0 as ChatServer's default scorer; user runs the real-model check
+        on Qwen2.5-0.5B-Instruct against Python AnyJev.
+        Done (coded): ChatServer creates a `TAnyJevL0Scorer` after the model loads,
+        named like the chat model in `/v1/models` (the model directory's name; also
+        `jev-latest`). Flags `--decision-level l0|raw`, `--decision-prior
+        content_free|none`, `--decision-max-rotations N` (ParseServerArgs takes them
+        out before ParseArgs, so ChatTerminal does not see them).
+        `EAnyJevLabelTokenError` now derives from `EDecisionUnsupported`, so a label
+        that is not one token answers 422 naming the question. Docs: ChatServer.md
+        *Typed decisions*, the folder README and the top README (planned (coded)).
+        Smoke test on `tests/fixtures/anyjev_qwen25` with `--fp32`:
+        `tools/anyjev_real_check.py` max abs difference 3.9e-5 (the server rounds to
+        4 decimals); decision, chat, chat, decision gave identical decision answers
+        and the same greedy chat reply.
+    - [ ] User check on a real checkpoint (this VM cannot hold one):
+          ```
+          git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q25
+          lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+          neural-api/bin/x86_64-linux/bin/ChatServer q25/ --fp32 --ctx 4096 --port 8080 &
+          pip install anyjev==0.3.0
+          pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e  # kev pins torch<2.9
+          python3 neural-api/tools/anyjev_real_check.py q25/ --server http://127.0.0.1:8080
+          kill %1
+          ```
+          PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
+          weights move the probabilities far more than FP32 rounding.
+  Stage 2 — Kev and Open-Jev:
+  - [x] D2.1 `neuraltorchbin.pas`: expose top-level scalar and string values of a
+        torch.save dict (temperature, head_dim, base, base_revision, lora), keep
+        nested-dict tensors under dotted names (`head.q.weight`), accept any storage
+        location string. Unit test on a generated `head.pt`-shaped fixture.
+        Done: every non-tensor leaf (None/bool/int/float/str, list lengths) is
+        metadata named by its dotted path from the pickle root (list items by index,
+        `temperature_fit.cross_validation.temperatures.1`); `GetMetadata{Str,Int,
+        Float,Bool}(name, default)` return the default when absent and raise on a
+        kind mismatch. A depth cap (64) refuses self-containing containers.
+        Fixtures `tests/fixtures/torch_head/` by `tools/torch_head_fixture.py`
+        (Kev through kev's own `write_meta`; Open-Jev with 'cpu' and 'cuda:0'
+        locations). The real kev-0.8b and Open-Jev-2B `head.pt` files parse.
+  - [x] D2.2 LoRA merge in HF tensor space: read `adapter_config.json` (r,
+        lora_alpha, target_modules), map adapter keys onto base checkpoint keys, merge
+        in FP32, and build through the normal importer (export the in-memory tensor
+        reader path). Test: pico Qwen3.5 + random adapter; merged build logits = HF
+        reference with the merged weights.
+        Done: `TNNetLoRAMergeReader` wraps the base reader and adds
+        `(alpha/r) * B @ A` per load (whole tensor or row range, one module's A/B
+        cached), so the direct-to-int8/int4 row streaming reads merged rows and no
+        second copy of the model exists. Entry point `BuildFromPretrained(...,
+        pLoRAAdapterDir)` (Llama-builder model types; unused with pWeightOwner).
+        Key `base_model.model.<m>` -> `<m>.weight`, else `<text prefix><m>.weight`
+        (prefix of embed_tokens: Qwen3.5-0.8B-Base and Qwen3.5-2B are
+        `model.language_model.`). `ReadPEFTAdapterConfig` now reads
+        target_modules and plain-key rank_pattern/alpha_pattern and refuses DoRA,
+        rsLoRA, qalora, bdlora, lora_bias, bias != none, fan_in_fan_out,
+        modules_to_save, trainable_token_indices, layer_replication,
+        target_parameters, aLoRA, arrow, kasa, monteclora and base-rewriting inits
+        (pissa/olora/corda/loftq/lora_ga). Fixtures `tests/fixtures/
+        lora_merge_qwen3_5/` and `lora_merge_qwen3/` by
+        `tools/lora_merge_tiny_fixture.py`; FP32 logit diff 3.0e-5 / 2.5e-7.
+  - [x] D2.3 Kev scorer: row construction, per-question rows from the shared state,
+        pointer head, temperature from `head.pt`, Jev answer mapping, 65536-token state
+        limit. Fixture: pico Qwen3.5 + random LoRA + random head through Kev's own
+        `kev/model.py` math.
+        Done: `TKevScorer` in `neural/neuraldecisionheads.pas` (Open-Jev joins it);
+        `TChatOptions.LoRAAdapterDir` (no CLI flag yet) goes to the non-borrowing
+        builds. Refuses head.pt `option_isolation`/`special_embeddings` true
+        (`EDecisionHeadError`); `Temperature` overrides the head's (1.0 = raw).
+        Fixture `tests/fixtures/kev_qwen3_5/` by `tools/kev_tiny_fixture.py` (117 KB):
+        kev's own DecisionModel builds the LoRA, `write_meta` writes the head, and
+        `Checkpoint.load` (float64, merged) + `admit` + `probs` is the oracle. Token
+        ids exact, probabilities within 4.1e-6. Open: kev renders an empty list/object
+        description as "name: " (`[] != ""`); the Pascal parser stores '' and writes
+        "name".
+  - [x] D2.4 Open-Jev scorer: chat-template prompt per candidate, shared prefix up to
+        the first token where the candidates diverge (check encode(prefix + suffix) =
+        encode(prefix) + encode(suffix), else score the full prompt), Linear(d,1) head,
+        `temperature.json`. Fixture as in D2.3.
+        Done: `TOpenJevScorer` (with `TKevScorer` now under `TDecisionHeadScorer`,
+        which owns the temperature override). It takes the checkpoint directory
+        (`head.pt`, `temperature.json`, `model.json`, `adapter/`) or anything
+        `OpenJevCheckpointDir` resolves to one (`<dir>/checkpoint`,
+        `<dir>/package/checkpoint`, the HF repo layout); the engine is loaded with
+        `<checkpoint>/adapter`. The request parser now also keeps Open-Jev's
+        rendering (`OpenJevState`, `OpenJevInstructions`, `OpenJevDescriptions`,
+        `OptionHasDescription`: `""` -> "name: ", null -> "name") via
+        `DecisionValueToSortedJSON` = json.dumps(sort_keys=True,
+        ensure_ascii=False); `DecisionFloatToStr` now prints subnormals like
+        Python (5e-324). Prompts are framed with cfQwen3_5 + reOff whatever the
+        engine detects: the real Qwen3.5-2B template has no `preserve_thinking`,
+        so `DetectChatFormat` calls it cfChatML (also affects chat on that base).
+        Usage counts fed tokens like the other scorers (jev reports the sum of
+        full prompt lengths). The token prefix shared by all prompts of the
+        request is fed once (exact by construction: LCP of full encodings).
+        Divergences from jev: `<|x|>` in caller text is rewritten (jev tokenizes
+        it as a special token); a null noul description is ignored (jev: 422);
+        1-level scores and numeric descriptions are accepted. Fixture
+        `tests/fixtures/openjev_qwen3_5/` (137 KB) by `tools/openjev_tiny_fixture.py`;
+        oracle = jev's compile_request/candidate_prompts + DecisionModel.forward +
+        Predictor.predict (float64 backbone; `score_cached` cannot run on the
+        venv's transformers 5.17). Strings and ids exact, p within 6.4e-7.
+  - [x] D2.5 ChatServer `--decision-adapter <dir>`: detect Kev vs Open-Jev layout,
+        load the base given by the usual model directory (warn when it differs from
+        the adapter's recorded base), merge, read the head, switch to decision-only.
+        Done (coded): `DetectDecisionAdapterLayout` / `ReadDecisionAdapterInfo` /
+        `DecisionAdapterModelName` / `ReadOpenJevModelConfig` in
+        `neuraldecisionheads.pas` (verified against the HF trees of kev-0.8b,
+        kev-27b and Open-Jev-2B). Open-Jev (`OpenJevCheckpointDir` <> '') merges
+        `<checkpoint>/adapter` when `lora_rank` > 0; Kev LoRA (head.pt +
+        adapter_config.json + adapter weights) merges the directory; Kev full
+        weights (kev-27b) are refused naming D2.6; anything else is refused listing
+        the three layouts. Startup prints the recorded base (head.pt `base` +
+        `base_revision`, model.json `model_id` + `revision`); the only check is
+        head input size vs the base `config.json` hidden_size (refused: the scorer
+        would fail after the load). Model name = the adapter directory's name
+        (repo root for `.../package/checkpoint`), plus `jev-latest`; chat endpoints
+        answer 501 with the reason; `/v1/models` lists the decision model only.
+        `--decision-level/-prior/-max-rotations` are refused with
+        `--decision-adapter`; `--decision-temperature T` overrides the head
+        temperature (needs `--decision-adapter`). `tools/decision_real_check.py`
+        (kev's `Checkpoint.load` FP32 with `head.pt`'s base pointed at the local
+        base; jev's `compile_request` + uncached `DecisionModel.forward` +
+        `Predictor.predict`); `anyjev_real_check.py` now imports its HTTP helper.
+        Smoke tests with `--fp32` on both pico fixtures: PASS, max abs difference
+        4.6e-5 (Kev) and 4.0e-5 (Open-Jev), the server's 4-decimal rounding.
+        Not optimized: the engine still builds the LM head (248320 x hidden),
+        which Kev/Open-Jev never compute; D2.6's head-less import could be reused.
+        The hidden-size refusal was run by hand (fixture config with hidden_size 32).
+  - [x] D2.6 Kev-27B full weights: import `Qwen3_5TextModel` keys without the
+        `model.` prefix and without `lm_head` (build ends at the final norm). Pico
+        fixture in that layout.
+        Done: the real kev-27b `config.json` is flat (`model_type` `qwen3_5_text`,
+        no `text_config`, `tie_word_embeddings` false) and its 850 tensors are
+        `embed_tokens`, `layers.N.*` and `norm` only. The config reader already
+        took the flat form and the builder already found prefix ''; the change is
+        `qwen3_5_text` in `PretrainedModelTypeCanBorrowWeights` (dispatch + twins)
+        and `BuildFromPretrained(..., pOmitLMHead)` (Llama builder only; the net
+        ends at the final RMSNorm, lm_head is neither required nor loaded, a tied
+        embedding still loads). `TChatOptions.OmitLMHead` passes it to every
+        build including the `--prefill-window` twins, points every session's
+        `HiddenLayer` at the last layer (`TNNetStreamingDecoder.SetHiddenLayer`;
+        `ContrastiveHiddenLayer` would pick the pre-norm layer), and makes
+        `GenerateFromIds` and `ScoreDecisionBranch` with Logits raise.
+        ChatServer sets it for every `--decision-adapter` layout. Kev full weights:
+        the model directory must be the checkpoint directory itself (`ChatServer
+        kev-27b/ --decision-adapter kev-27b/`), nothing merged; that directory
+        without `--decision-adapter` is refused. Fixture `tests/fixtures/
+        kev_full_qwen3_5/` (88 KB) by `tools/kev_full_tiny_fixture.py`: the
+        kev_qwen3_5 backbone merged by kev's loader (float32), saved untied by
+        `save_pretrained` as `Qwen3_5TextModel` + head.pt `weights="full"`;
+        oracle `Checkpoint(dir).load` (full path, float64) + `admit` + `probs`.
+        p within 2.2e-6. Head-less vs LM-head builds: bit-identical probabilities
+        on the Kev and Open-Jev fixtures (also through a width-4 twin); the pico
+        net drops 1 layer and 6528 = 408 x 16 weights; Kev-0.8B saves 254M
+        weights (1.0 GB FP32), Kev-27B 1.27G (5.1 GB FP32, ~1.3 GB int8).
+        `tools/decision_real_check.py` takes the full layout and `--dtype
+        bfloat16`; server smoke test on the fixture (`--fp32`): PASS, 4.6e-5.
+  - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
+        Open-Jev-2B against their Python servers; commands written by the agents.
+        Commands (ChatServer.md *Trained decision checkpoints*); PASS = max abs
+        difference <= 5e-3 (exit 0); `--fp32` is required:
+        ```
+        git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
+        git -C q08b checkout dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68
+        git clone https://huggingface.co/jaredpalmer/kev-0.8b
+        lazbuild -B neural-api/examples/ChatTerminal/ChatServer.lpi
+        neural-api/bin/x86_64-linux/bin/ChatServer q08b/ --decision-adapter kev-0.8b/ --fp32 --ctx 4096 --port 8080 &
+        pip install --no-deps git+https://github.com/jaredpalmer/kev@1f04cfa28e6a708485b28a9585010b9e436b776e
+        python3 neural-api/tools/decision_real_check.py q08b/ kev-0.8b/ --server http://127.0.0.1:8080
+        kill %1
+        ```
+        ```
+        git clone https://huggingface.co/Qwen/Qwen3.5-2B q2b
+        git -C q2b checkout 15852e8c16360a2fea060d615a32b45270f8a8fc
+        git clone https://huggingface.co/ZefanCai/Open-Jev-2B
+        neural-api/bin/x86_64-linux/bin/ChatServer q2b/ --decision-adapter Open-Jev-2B/ --fp32 --ctx 4096 --port 8080 &
+        pip install --no-deps git+https://github.com/Zefan-Cai/Open-Jev@bd4118882f733574a3250a4b65fe4d884130c08b
+        python3 neural-api/tools/decision_real_check.py q2b/ Open-Jev-2B/ --server http://127.0.0.1:8080
+        kill %1
+        ```
+        Kev-27B (int8 on the GPU against kev in bfloat16, ~55 GB host RAM; a
+        sanity bound, not FP32 parity: read the table, same argmax expected;
+        add `--int4` to the server when the int8 weights do not fit):
+        ```
+        git clone https://huggingface.co/jaredpalmer/kev-27b
+        neural-api/bin/x86_64-linux/bin/ChatServer kev-27b/ --decision-adapter kev-27b/ --gpu --ctx 4096 --port 8080 &
+        python3 neural-api/tools/decision_real_check.py kev-27b/ kev-27b/ --dtype bfloat16 --threshold 5e-2 --server http://127.0.0.1:8080
+        kill %1
+        ```
+        - [x] Open-Jev-2B (2026-10-19, user box): `Qwen/Qwen3.5-2B` at
+              15852e8c16360a2fea060d615a32b45270f8a8fc + `ZefanCai/Open-Jev-2B`,
+              `ChatServer q2b/ --gpu --int4 --port 5000 --decision-adapter Open-Jev-2B`,
+              called with `DecisionClient`: sensible answers; an obviously urgent
+              ticket gave a high P(true), an obviously calm one a low P(true). Now
+              SUPPORTED in the docs. The `--fp32` `decision_real_check.py` parity run
+              was not part of this check.
+        - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
+        - [ ] AnyJev L0: ran on a 0.5B chat checkpoint, but the yes/no answer was
+              questionable; stays planned (coded).
+  Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
+  `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
+  `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
+  "specials as plain text" flag for chat requests; live (unmerged) LoRA.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
   - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop

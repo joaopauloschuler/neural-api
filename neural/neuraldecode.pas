@@ -1374,6 +1374,9 @@ type
     // The LM-head input layer (ContrastiveHiddenLayer), resolved once: the
     // layer HiddenState reads and StepForwardToHidden stops at.
     function HiddenLayer(): TNNetLayer;
+    // Replaces that heuristic: a net built without an LM head passes its last
+    // layer (the final norm), so HiddenState reads it.
+    procedure SetHiddenLayer(Layer: TNNetLayer);
     // Speculative-decode rollback: TruncateCache(CommittedLen) on every
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
@@ -6557,6 +6560,11 @@ begin
   // The same heuristic as the cache-less path (ContrastiveHiddenLayer).
   if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
   Result := FHiddenLayer;
+end;
+
+procedure TNNetStreamingDecoder.SetHiddenLayer(Layer: TNNetLayer);
+begin
+  FHiddenLayer := Layer;
 end;
 
 function TNNetStreamingDecoder.HiddenState(): TNNetVolume;
