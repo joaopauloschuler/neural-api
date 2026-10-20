@@ -1697,27 +1697,29 @@ rather than acted on.
       LoRA exists for Qwen-Image-2.1 (the known Lightning adapters target earlier
       Qwen-Image releases). The SD UNet path (`BuildSDUNetFromSafeTensors`) can
       take the same reader once the real Stable Diffusion pipeline item above lands.
-- [ ] Tiny AutoEncoder (TAESD, diffusers `AutoencoderTiny`) decoder importer +
-      per-step previews. `BuildTinyVaeDecoderFromSafeTensors[Ex]` for
-      `madebyollin/taesd` (SD 1.x/2.x, 4-ch latents), `taesdxl`, `taesd3` and
-      `taef1` (16-ch). The decoder is about 1M parameters of plain layers, so it is
-      pure composition over existing classes, no new layer: `tanh(x/3)*3` latent
-      clamp, then 3x3 `TNNetConvolutionReLU` stages, `AutoencoderTinyBlock` =
-      three 3x3 convs + identity skip (`TNNetSum`) + ReLU, nearest-2x between
-      stages (`TNNetDeMaxPool(2)`, as in `BuildVaeDecoderFromSafeTensors`'s
-      Upsample2D), and the output mapped [0,1] -> [-1,1]. Every
-      piece has a device forward, so the whole decoder stays resident under
-      OpenCL. Two uses: (1) a `--preview N` flag in examples/QwenImage and
+- [X] Tiny AutoEncoder (TAESD, diffusers `AutoencoderTiny`) decoder importer:
+      `BuildTinyVaeDecoderFromSafeTensors[Ex]` + `TTinyVaeDecoderConfig`
+      (neuralpretrained.pas, next to `BuildVaeDecoderFromSafeTensors`) for
+      `madebyollin/taesd`, `taesdxl` (4-ch latents), `taesd3` and `taef1` (16-ch).
+      Pure composition, no new layer. Input = the denoiser latent; the builder
+      applies the pipeline's `z / scaling_factor + shift_factor`, the
+      `tanh(x/3)*3` clamp, and folds the `*3` and the [0,1] -> [-1,1] output map
+      into the first/last conv. Parity < 1e-4 vs diffusers on two pico fixtures
+      (`TestTinyVaeDecoder4ChParity`, `TestTinyVaeDecoder16ChParity`,
+      `tools/make_pico_taesd_fixture.py`). Not covered: a real checkpoint run, the
+      OpenCL forward of the composed net, the original (non-diffusers)
+      `taesd_decoder.safetensors` key layout.
+- [ ] TAESD per-step previews and draft decode: a `--preview N` flag in
       examples/LatentTextToImage that decodes the current x0 estimate every N
-      steps to a PPM/PNG at a few ms per image, instead of waiting for the full
-      VAE (task B2: 3x3 convs at 1152 channels); (2) a `--fast-vae` final
-      decode for drafts. For QwenImage, first check that Qwen-Image-2.1 still uses
-      the Wan-2.1-style latent space; if so, the matching tiny decoder is
-      `taew2_1` in `madebyollin/taehv` (a video variant with temporal blocks; a
-      single image is T=1, so verify which output frame to keep). Do not add an
-      encoder in v1. Tests: a pico `AutoencoderTiny` fixture built in the ~/x
-      venv (random weights, `latent_channels` 4 and 16), decoded image as the
-      oracle, the test itself Pascal; README section in each example touched.
+      steps with `BuildTinyVaeDecoderFromSafeTensors` to a PPM/PNG at a few ms per
+      image, instead of waiting for the full VAE; a `--fast-vae` final decode for
+      drafts. PixArt-alpha uses the SD VAE latent space, so `taesd` (4-ch,
+      scaling_factor 1.0) takes the sampled latent directly. examples/QwenImage
+      has NO matching tiny decoder: Qwen-Image-2.1's VAE is z_dim 64 at 16x
+      spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
+      `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
+      trained for that latent space (or a cheap latent->RGB linear projection).
+      README section in each example touched.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1

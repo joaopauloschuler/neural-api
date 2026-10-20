@@ -51,6 +51,10 @@ type
     function KokoroRealSnapshotDir(): string;
     // TNNetKokoro over the tiny_kokoro82m fixture.
     function CreateTinyKokoro(): TNNetKokoro;
+    // Decodes tests/fixtures/<FixtureName>_io.safetensors "latent" with the
+    // pico AutoencoderTiny decoder and checks "image" to 1e-4.
+    procedure CheckTinyVaeDecoderParity(const FixtureName: string;
+      ExpectedLatentChannels: integer);
     // Runs stage A on the dump's input_ids / ref_s and checks every stage-A
     // stage of the dump; Relative divides each max |diff| by max |reference|.
     procedure CheckKokoroStageAParity(Kokoro: TNNetKokoro;
@@ -1057,6 +1061,9 @@ type
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestTiledVaeDecodeParity;
+    procedure TestTinyVaeDecoderConfigFromJSONFile;
+    procedure TestTinyVaeDecoder4ChParity;
+    procedure TestTinyVaeDecoder16ChParity;
     procedure TestVaeEncoderParity;
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
@@ -41236,6 +41243,84 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// Verifies ReadTinyVaeDecoderConfigFromJSONFile on the pico taesd3/taef1-style
+// config (16 latent channels, non-trivial scaling and shift).
+procedure TTestNeuralPretrained.TestTinyVaeDecoderConfigFromJSONFile;
+var
+  Config: TTinyVaeDecoderConfig;
+begin
+  Config := ReadTinyVaeDecoderConfigFromJSONFile(
+    FixturePath('tiny_taesd16_decoder_config.json'));
+  AssertEquals('latent_channels', 16, Config.LatentChannels);
+  AssertEquals('out_channels', 3, Config.OutChannels);
+  AssertEquals('stages', 3, Config.NumStages);
+  AssertEquals('decoder_block_out_channels[2]', 8, Config.StageChannels[2]);
+  AssertEquals('num_decoder_blocks[0]', 2, Config.StageBlocks[0]);
+  AssertEquals('num_decoder_blocks[2]', 1, Config.StageBlocks[2]);
+  AssertEquals('upsampling_scaling_factor', 2, Config.UpsampleFactor);
+  AssertEquals('latent width', 4, Config.LatentWidth);
+  AssertEquals('latent height', 4, Config.LatentHeight);
+  AssertTrue('scaling_factor', Abs(Config.ScalingFactor - 1.5305) < 1e-6);
+  AssertTrue('shift_factor', Abs(Config.ShiftFactor - 0.0609) < 1e-6);
+end;
+
+procedure TTestNeuralPretrained.CheckTinyVaeDecoderParity(
+  const FixtureName: string; ExpectedLatentChannels: integer);
+var
+  NN: TNNet;
+  Config: TTinyVaeDecoderConfig;
+  Reference: TNNetSafeTensorsReader;
+  Latent, Image: TNNetVolume;
+  ImageSize: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  NN := BuildTinyVaeDecoderFromSafeTensors(
+    FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false,
+    FixturePath(FixtureName + '_config.json'));
+  Reference := TNNetSafeTensorsReader.Create(
+    FixturePath(FixtureName + '_io.safetensors'));
+  Latent := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    AssertEquals('latent channels', ExpectedLatentChannels,
+      Config.LatentChannels);
+    ImageSize := Config.LatentWidth * 4;
+    AssertEquals('output width', ImageSize, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output height', ImageSize, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('output channels', 3, NN.GetLastLayer().Output.Depth);
+    // Both fixture tensors are stored [H, W, C], the CAI volume order.
+    Reference.LoadTensorFlat('latent', Latent);
+    Latent.ReSize(Config.LatentWidth, Config.LatentHeight,
+      Config.LatentChannels);
+    Reference.LoadTensorFlat('image', Image);
+    AssertEquals('reference image size', NN.GetLastLayer().Output.Size,
+      Image.Size);
+    NN.Compute(Latent);
+    NN.GetLastLayer().ForceOutputOnRAM();
+    Image.Sub(NN.GetLastLayer().Output);
+    MaxDiff := Image.GetMaxAbs();
+    AssertTrue(FixtureName + ': decoded RGB max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Image.Free;
+    Latent.Free;
+    Reference.Free;
+    NN.Free;
+  end;
+end;
+
+// Pico taesd/taesdxl layout: 4 latent channels, scaling 1, no shift.
+procedure TTestNeuralPretrained.TestTinyVaeDecoder4ChParity;
+begin
+  CheckTinyVaeDecoderParity('tiny_taesd4_decoder', 4);
+end;
+
+// Pico taesd3/taef1 layout: 16 latent channels, scaling + shift folded in.
+procedure TTestNeuralPretrained.TestTinyVaeDecoder16ChParity;
+begin
+  CheckTinyVaeDecoderParity('tiny_taesd16_decoder', 16);
 end;
 
 // Tiled VAE decode parity (diffusers enable_vae_tiling port). Two checks on the

@@ -11502,6 +11502,37 @@ function BuildVaeDecoderFromSafeTensors(const FileName: string;
   out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
+type
+  // diffusers AutoencoderTiny (TAESD / taesdxl / taesd3 / taef1) decoder shape.
+  TTinyVaeDecoderConfig = record
+    LatentChannels: integer;                  // 4 (taesd, taesdxl) or 16
+    OutChannels: integer;                     // RGB output channels (3)
+    NumStages: integer;                       // length of num_decoder_blocks
+    StageChannels: array[0..7] of integer;    // decoder_block_out_channels
+    StageBlocks: array[0..7] of integer;      // num_decoder_blocks
+    UpsampleFactor: integer;                  // upsampling_scaling_factor
+    LatentWidth, LatentHeight: integer;       // latent grid of the TNNetInput
+    ScalingFactor, ShiftFactor: TNeuralFloat; // pipeline latent normalization
+  end;
+
+// Reads a diffusers AutoencoderTiny config.json. The latent grid comes from
+// "latent_size" when present, else defaults to 64x64 (a 512x512 image).
+function ReadTinyVaeDecoderConfigFromJSONFile(
+  const FileName: string): TTinyVaeDecoderConfig;
+
+// Builds the AutoencoderTiny DECODER. Input: a (LatentWidth, LatentHeight,
+// LatentChannels) denoiser latent; output: RGB in [-1, 1] (diffusers decode).
+function BuildTinyVaeDecoder(Reader: TNNetSafeTensorsReader;
+  const Config: TTinyVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+
+function BuildTinyVaeDecoderFromSafeTensorsEx(const FileName: string;
+  const Config: TTinyVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+
+// ConfigFileName defaults to config.json next to FileName.
+function BuildTinyVaeDecoderFromSafeTensors(const FileName: string;
+  out Config: TTinyVaeDecoderConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
 // Tiled VAE decode (port of diffusers' AutoencoderKL.enable_vae_tiling +
 // tiled_decode). Decodes a LARGE latent volume in OVERLAPPING spatial tiles
 // and feather-blends the seams so peak working-set memory is bounded by the
@@ -71172,9 +71203,8 @@ begin
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
 end;
 
-// Reads the config file, then hands the parsed object to the shared parser.
-function ReadVaeDecoderConfigFromJSONFile(
-  const FileName: string): TVaeDecoderConfig;
+// Reads and parses a VAE config file; the caller frees the returned object.
+function LoadVaeConfigJSONObject(const FileName: string): TJSONObject;
 var
   JsonText: TStringList;
   Root: TJSONData;
@@ -71193,12 +71223,27 @@ begin
           '" is not valid JSON (' + E.Message + ').');
     end;
     if not (Root is TJSONObject) then
+    begin
+      FreeAndNil(Root);
       ImportError('VAE import: config "' + FileName +
         '" is not a JSON object.');
-    Result := ParseVaeDecoderConfigObject(TJSONObject(Root), FileName);
+    end;
   finally
-    Root.Free;
     JsonText.Free;
+  end;
+  Result := TJSONObject(Root);
+end;
+
+function ReadVaeDecoderConfigFromJSONFile(
+  const FileName: string): TVaeDecoderConfig;
+var
+  Obj: TJSONObject;
+begin
+  Obj := LoadVaeConfigJSONObject(FileName);
+  try
+    Result := ParseVaeDecoderConfigObject(Obj, FileName);
+  finally
+    Obj.Free;
   end;
 end;
 
@@ -71591,6 +71636,255 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// TINY AUTOENCODER DECODER IMPORT (diffusers AutoencoderTiny / TAESD)
+// ===========================================================================
+
+function ReadTinyVaeDecoderConfigFromJSONFile(
+  const FileName: string): TTinyVaeDecoderConfig;
+var
+  Obj: TJSONObject;
+  ClassName, ActFn, UpsampleFn: string;
+  ChannelCount, StagePos, MaxStagePos, LatentSize: integer;
+
+  procedure ReadStageArray(const Key: string; var Dest: array of integer;
+    out Count: integer);
+  var
+    ArrData: TJSONData;
+    Arr: TJSONArray;
+    ItemPos, MaxItemPos: integer;
+  begin
+    ArrData := Obj.Find(Key);
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('Tiny VAE import: config "' + FileName +
+        '" is missing the required array "' + Key + '".');
+    Arr := TJSONArray(ArrData);
+    Count := Arr.Count;
+    if (Count < 1) or (Count > Length(Dest)) then
+      ImportError('Tiny VAE import: "' + Key + '" must have 1..' +
+        IntToStr(Length(Dest)) + ' entries, got ' + IntToStr(Count) + '.');
+    MaxItemPos := Count - 1;
+    for ItemPos := 0 to MaxItemPos do Dest[ItemPos] := Arr.Integers[ItemPos];
+  end;
+
+begin
+  Obj := LoadVaeConfigJSONObject(FileName);
+  try
+    ClassName := Obj.Get('_class_name', 'AutoencoderTiny');
+    if ClassName <> 'AutoencoderTiny' then
+      ImportError('Tiny VAE import: _class_name is "' + ClassName +
+        '" - only AutoencoderTiny is supported here.');
+    ActFn := Obj.Get('act_fn', 'relu');
+    if ActFn <> 'relu' then
+      ImportError('Tiny VAE import: act_fn "' + ActFn +
+        '" is not supported (only "relu").');
+    UpsampleFn := Obj.Get('upsample_fn', 'nearest');
+    if UpsampleFn <> 'nearest' then
+      ImportError('Tiny VAE import: upsample_fn "' + UpsampleFn +
+        '" is not supported (only "nearest").');
+    ReadStageArray('decoder_block_out_channels', Result.StageChannels,
+      ChannelCount);
+    ReadStageArray('num_decoder_blocks', Result.StageBlocks, Result.NumStages);
+    if ChannelCount <> Result.NumStages then
+      ImportError('Tiny VAE import: decoder_block_out_channels and ' +
+        'num_decoder_blocks must have the same length.');
+    // DecoderTiny's inter-stage convs keep the width, so every stage must match.
+    MaxStagePos := Result.NumStages - 1;
+    for StagePos := 0 to MaxStagePos do
+    begin
+      if Result.StageChannels[StagePos] <> Result.StageChannels[0] then
+        ImportError('Tiny VAE import: decoder_block_out_channels must all ' +
+          'be equal (DecoderTiny keeps one width across stages).');
+      if Result.StageBlocks[StagePos] < 0 then
+        ImportError('Tiny VAE import: num_decoder_blocks must be >= 0.');
+    end;
+    if Result.StageChannels[0] < 1 then
+      ImportError('Tiny VAE import: decoder_block_out_channels must be >= 1.');
+    Result.LatentChannels := Obj.Get('latent_channels', 4);
+    Result.OutChannels := Obj.Get('out_channels', 3);
+    Result.UpsampleFactor := Obj.Get('upsampling_scaling_factor', 2);
+    Result.ScalingFactor := Obj.Get('scaling_factor', TJSONFloat(1));
+    Result.ShiftFactor := Obj.Get('shift_factor', TJSONFloat(0));
+    LatentSize := Obj.Get('latent_size', 64);
+    Result.LatentWidth := LatentSize;
+    Result.LatentHeight := LatentSize;
+    if (Result.LatentChannels < 1) or (Result.OutChannels < 1) or
+       (Result.UpsampleFactor < 1) or (LatentSize < 1) then
+      ImportError('Tiny VAE import: latent_channels, out_channels, ' +
+        'upsampling_scaling_factor and latent_size must be >= 1.');
+    if Result.ScalingFactor = 0 then
+      ImportError('Tiny VAE import: scaling_factor must be non-zero.');
+  finally
+    Obj.Free;
+  end;
+end;
+
+// Folds y := y * OutMul + OutAdd into a conv whose input is scaled by InMul.
+procedure FoldAffineIntoConv(Layer: TNNetLayer; InMul, OutMul,
+  OutAdd: TNeuralFloat);
+var
+  NeuronPos, MaxNeuronPos: integer;
+  Neuron: TNNetNeuron;
+begin
+  MaxNeuronPos := Layer.Neurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+  begin
+    Neuron := Layer.FArrNeurons[NeuronPos];
+    Neuron.Weights.Mul(InMul * OutMul);
+    Neuron.BiasWeight := Neuron.BiasWeight * OutMul + OutAdd;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TTinyVaeBlockLayers = record
+    Conv1, Conv2, Conv3: TNNetLayer;
+  end;
+
+// AutoencoderTinyBlock: relu(conv3(relu(conv2(relu(conv1(x))))) + x).
+procedure AddTinyVaeBlock(NN: TNNet; Channels: integer;
+  out Refs: TTinyVaeBlockLayers; pTrainable: boolean);
+var
+  Input: TNNetLayer;
+begin
+  Input := NN.GetLastLayer();
+  Refs.Conv1 := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionReLU.Create(
+    Channels, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
+  Refs.Conv2 := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionReLU.Create(
+    Channels, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
+  Refs.Conv3 := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionLinear.Create(
+    Channels, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(TNNetSum.Create([Refs.Conv3, Input]),
+    pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(TNNetReLU.Create(), pTrainable) );
+end;
+
+function BuildTinyVaeDecoder(Reader: TNNetSafeTensorsReader;
+  const Config: TTinyVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  ConvIn: TNNetLayer;
+  StageConv: array of TNNetLayer;
+  Blocks: array of array of TTinyVaeBlockLayers;
+  Channels, StagePos, MaxStagePos, BlockPos, MaxBlockPos, LayerIdx: integer;
+  Prefix: string;
+begin
+  if (Config.NumStages < 1) or (Config.NumStages > 8) then
+    ImportError('Tiny VAE import: NumStages must be 1..8.');
+  if (Config.LatentWidth < 1) or (Config.LatentHeight < 1) then
+    ImportError('Tiny VAE import: the latent grid must be >= 1x1.');
+  if Config.ScalingFactor = 0 then
+    ImportError('Tiny VAE import: scaling_factor must be non-zero.');
+  Channels := Config.StageChannels[0];
+  MaxStagePos := Config.NumStages - 1;
+  SetLength(StageConv, Config.NumStages);
+  SetLength(Blocks, Config.NumStages);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.LatentWidth, Config.LatentHeight,
+      Config.LatentChannels) );
+    // tanh((z / scaling + shift) / 3) * 3; the final * 3 is folded into ConvIn.
+    NN.AddLayer( VaeLayerTrainable(TNNetMulByConstant.Create(
+      1.0 / (3.0 * Config.ScalingFactor)), pTrainable) );
+    if Config.ShiftFactor <> 0 then
+      NN.AddLayer( VaeLayerTrainable(TNNetAddConstant.Create(
+        Config.ShiftFactor / 3.0), pTrainable) );
+    NN.AddLayer( VaeLayerTrainable(TNNetHyperbolicTangent.Create(),
+      pTrainable) );
+    ConvIn := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionReLU.Create(
+      Channels, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
+    for StagePos := 0 to MaxStagePos do
+    begin
+      SetLength(Blocks[StagePos], Config.StageBlocks[StagePos]);
+      MaxBlockPos := Config.StageBlocks[StagePos] - 1;
+      for BlockPos := 0 to MaxBlockPos do
+        AddTinyVaeBlock(NN, Channels, Blocks[StagePos][BlockPos], pTrainable);
+      if StagePos < MaxStagePos then
+      begin
+        NN.AddLayer( VaeLayerTrainable(TNNetDeMaxPool.Create(
+          Config.UpsampleFactor), pTrainable) );
+        StageConv[StagePos] := NN.AddLayer( VaeLayerTrainable(
+          TNNetConvolutionLinear.Create(Channels, 3, 1, 1, 0), pTrainable) );
+      end
+      else
+        StageConv[StagePos] := NN.AddLayer( VaeLayerTrainable(
+          TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0),
+          pTrainable) );
+    end;
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    // decoder.layers.N follows nn.Sequential order: conv, ReLU, then per stage
+    // its blocks, an Upsample (all but the last stage) and a conv.
+    LoadVaeConv(Reader, ConvIn, 'decoder.layers.0.weight',
+      'decoder.layers.0.bias', Channels, Config.LatentChannels, 3);
+    FoldAffineIntoConv(ConvIn, 3.0, 1.0, 0.0);
+    LayerIdx := 2;
+    for StagePos := 0 to MaxStagePos do
+    begin
+      MaxBlockPos := Config.StageBlocks[StagePos] - 1;
+      for BlockPos := 0 to MaxBlockPos do
+      begin
+        Prefix := 'decoder.layers.' + IntToStr(LayerIdx) + '.conv.';
+        LoadVaeConv(Reader, Blocks[StagePos][BlockPos].Conv1,
+          Prefix + '0.weight', Prefix + '0.bias', Channels, Channels, 3);
+        LoadVaeConv(Reader, Blocks[StagePos][BlockPos].Conv2,
+          Prefix + '2.weight', Prefix + '2.bias', Channels, Channels, 3);
+        LoadVaeConv(Reader, Blocks[StagePos][BlockPos].Conv3,
+          Prefix + '4.weight', Prefix + '4.bias', Channels, Channels, 3);
+        Inc(LayerIdx);
+      end;
+      Prefix := 'decoder.layers.';
+      if StagePos < MaxStagePos then
+      begin
+        Inc(LayerIdx); // the Upsample has no weights
+        LoadVaeConv(Reader, StageConv[StagePos],
+          Prefix + IntToStr(LayerIdx) + '.weight', '', Channels, Channels, 3);
+      end
+      else
+      begin
+        LoadVaeConv(Reader, StageConv[StagePos],
+          Prefix + IntToStr(LayerIdx) + '.weight',
+          Prefix + IntToStr(LayerIdx) + '.bias',
+          Config.OutChannels, Channels, 3);
+        // diffusers maps the [0, 1] output to [-1, 1]: x * 2 - 1.
+        FoldAffineIntoConv(StageConv[StagePos], 1.0, 2.0, -1.0);
+      end;
+      Inc(LayerIdx);
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildTinyVaeDecoderFromSafeTensorsEx(const FileName: string;
+  const Config: TTinyVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildTinyVaeDecoder(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildTinyVaeDecoderFromSafeTensors(const FileName: string;
+  out Config: TTinyVaeDecoderConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadTinyVaeDecoderConfigFromJSONFile(ConfigPath);
+  Result := BuildTinyVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // Decode one latent tile (already cropped to the decoder's input size) and
@@ -75462,31 +75756,14 @@ end;
 function ReadVaeEncoderConfigFromJSONFile(
   const FileName: string): TVaeDecoderConfig;
 var
-  JsonText: TStringList;
-  Root: TJSONData;
   Obj: TJSONObject;
   ImgSize: integer;
 begin
   // ONE read + ONE parse: the shared parser resolves LatentGrid and validates
   // the config, then the three encoder-only fields are taken from the SAME
   // object (in_channels; the decoder parse stored out_channels=3).
-  if not FileExists(FileName) then
-    ImportError('VAE import: config file not found: ' + FileName);
-  JsonText := TStringList.Create;
-  Root := nil;
+  Obj := LoadVaeConfigJSONObject(FileName);
   try
-    LoadImportJSONText(JsonText, FileName);
-    try
-      Root := GetJSON(JsonText.Text);
-    except
-      on E: Exception do
-        ImportError('VAE import: config "' + FileName +
-          '" is not valid JSON (' + E.Message + ').');
-    end;
-    if not (Root is TJSONObject) then
-      ImportError('VAE import: config "' + FileName +
-        '" is not a JSON object.');
-    Obj := TJSONObject(Root);
     Result := ParseVaeDecoderConfigObject(Obj, FileName);
     Result.OutChannels := Obj.Get('in_channels', 3); // RGB input channels
     // If the config pins the image grid directly, recompute LatentGrid from it.
@@ -75498,8 +75775,7 @@ begin
       ImportError('VAE encoder import: resolved latent grid is ' +
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
   finally
-    Root.Free;
-    JsonText.Free;
+    Obj.Free;
   end;
 end;
 
