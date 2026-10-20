@@ -2018,10 +2018,15 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       change; a non-zero PositionOffset copies the used rows into the queue
       scratch buffer (`CopyBuffer` gains a source offset). Inference only.
       Covered by `TestLearnedPositionalEmbeddingOpenCLParity`.
-- [ ] Diffusion-step conditioning recomputed on every denoise step:
-      `TNNetSinusoidalTimeEmbedding` and `TNNetSoftPrompt`. Individually small;
-      they matter because a sampler runs them 20-50 times per image, each time
-      bouncing the conditioning vector through the host.
+- [X] `TNNetSoftPrompt` device forward: a `cai_gather_copy` plan writes the
+      source rows after K zero rows, then one `CopyBuffer` lands the resident
+      bank (re-uploaded on a weight change) in rows 0..K-1. Inference only.
+      Covered by `TestSoftPromptOpenCLParity`.
+- [X] `TNNetSinusoidalTimeEmbedding`: SKIPPED, no transfer to save. Its source
+      is the 1x1x1 timestep the sampler writes on the host each step
+      (`TimeIn.Output.FData[0] := t` in the diffusion examples), and its output
+      is one EmbeddingSize vector. Host compute costs one upload of that vector
+      to the next layer; a kernel would cost one upload of t plus a launch.
 - [ ] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
       segmentation frontend and the ECAPA-TDNN trunk. Both are convolutions
       whose kernel is generated (sinc band-pass) or dilated, so the existing

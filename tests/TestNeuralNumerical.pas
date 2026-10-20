@@ -604,6 +604,7 @@ type
     // then after a gamma/beta update, against a host-only twin net.
     procedure TestGRNOpenCLParity;
     procedure TestLearnedPositionalEmbeddingOpenCLParity;
+    procedure TestSoftPromptOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -72167,6 +72168,121 @@ begin
       AssertTrue('host vs reference must be exact', HostDiff = 0);
       AssertTrue('OpenCL vs reference must be exact', MaxDiff = 0);
       AssertTrue('OpenCL after a table update must be exact', RefreshDiff = 0);
+      AssertTrue('the reference is not degenerate', Expected.GetMaxAbs() > 0);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      Expected.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSoftPromptOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // SeqLen, d, NumVirtualTokens.
+  csCases: array[0..1, 0..2] of integer = ((5, 6, 1), (3, 9, 4));
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  PromptLayer: TNNetSoftPrompt;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  HostDiff, MaxDiff, RefreshDiff: TNeuralFloat;
+
+  procedure BuildExpected();
+  var
+    Bank: TNNetVolume;
+    OutPos, MaxOutPos, BankLen: integer;
+    Value: TNeuralFloat;
+  begin
+    Bank := PromptLayer.Neurons[0].Weights;
+    BankLen := Bank.Size;
+    MaxOutPos := Expected.Size - 1;
+    for OutPos := 0 to MaxOutPos do
+    begin
+      if OutPos < BankLen
+        then Value := Bank.Raw[OutPos]
+        else Value := Input.Raw[OutPos - BankLen];
+      Expected.Raw[OutPos] := Max(TNeuralFloat(0), Value);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CasePos := 0 to High(csCases) do
+  begin
+    RandSeed := 20261021 + CasePos;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csCases[CasePos, 0], 1, csCases[CasePos, 1]);
+    Expected := TNNetVolume.Create(csCases[CasePos, 0] + csCases[CasePos, 2], 1,
+      csCases[CasePos, 1]);
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+      PromptLayer := TNNetSoftPrompt(NN.AddLayer(
+        TNNetSoftPrompt.Create(csCases[CasePos, 2], csCases[CasePos, 1])));
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      SetRandomNeuronWeights(PromptLayer, 0, 0.1, 2);
+      PromptLayer.FlushWeightCache();
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) - 0.2;
+      BuildExpected();
+      NN.Compute(Input);
+      HostDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+
+      // ForceOpenCL off: the resident input carries the layer to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      PromptLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      MaxPos := PromptLayer.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        if PromptLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+
+      // A bank update must reach the device copy.
+      SetRandomNeuronWeights(PromptLayer, 0, -0.1, 2);
+      PromptLayer.FlushWeightCache();
+      BuildExpected();
+      NN.Compute(Input);
+      RefreshDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      WriteLn('  SoftPrompt OpenCL K=', csCases[CasePos, 2], ' SeqLen=',
+        Input.SizeX, ' d=', Input.Depth, ': host max|diff|=', HostDiff:0:9,
+        ' OpenCL=', MaxDiff:0:9, ' after update=', RefreshDiff:0:9,
+        ' sentinels=', SentinelSurvivors, '/', Expected.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('ran every OpenCL forward on OpenCL', 3, PromptLayer.ForwardGPUCnt);
+      AssertEquals('the output is bound, not downloaded', Expected.Size,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('host vs reference must be exact', HostDiff = 0);
+      AssertTrue('OpenCL vs reference must be exact', MaxDiff = 0);
+      AssertTrue('OpenCL after a bank update must be exact', RefreshDiff = 0);
       AssertTrue('the reference is not degenerate', Expected.GetMaxAbs() > 0);
     finally
       OpenCLTransferCounting := WasCounting;

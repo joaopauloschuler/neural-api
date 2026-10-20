@@ -6916,9 +6916,29 @@ type
     private
       FNumVirtual: integer;  // K learnable virtual tokens
       FDim: integer;         // feature width d
+      {$IFDEF OpenCL}
+      // Resident copy of the soft-prompt bank, copied into rows 0..K-1 of the
+      // cai_gather_copy result after each OpenCL forward.
+      FVirtualTokenBuffer: cl_mem;
+      FVirtualTokenBufBytes: csize_t;
+      procedure ReleaseVirtualTokenBuffer();
+      // Rows K.. read the source rows; rows 0..K-1 read zero until the bank lands.
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      // Re-uploads the bank after a weight update, then copies it into rows 0..K-1.
+      procedure CopyVirtualTokensOnOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(NumVirtualTokens, d: integer); reintroduce; overload;
+      destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      // Inference only: the bank copy lands after the gather, so the result must stay resident.
+      function WillOpenCL(): boolean; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -38599,6 +38619,81 @@ begin
   AddMissingNeurons(1);
 end;
 
+destructor TNNetSoftPrompt.Destroy();
+begin
+  {$IFDEF OpenCL} ReleaseVirtualTokenBuffer(); {$ENDIF}
+  inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetSoftPrompt.ReleaseVirtualTokenBuffer();
+begin
+  if Assigned(FVirtualTokenBuffer) then clReleaseMemObject(FVirtualTokenBuffer);
+  FVirtualTokenBuffer := nil;
+  FVirtualTokenBufBytes := 0;
+end;
+
+function TNNetSoftPrompt.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetSoftPrompt.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+begin
+  // Output row x reads source row x - K; rows below K read zero.
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(FOutput.SizeX, Src.Depth, -FNumVirtual, Src.SizeX);
+  Plan.AddAxis(Src.Depth, 1);
+end;
+
+procedure TNNetSoftPrompt.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FGatherCopyCL) then
+  begin
+    FGatherCopyCL.OutputKernel().EnsureWriteBuffer(FVirtualTokenBuffer,
+      FVirtualTokenBufBytes, FNeurons[0].FWeights, {DoWrite=}true,
+      {pBlocking=}true);
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
+end;
+
+procedure TNNetSoftPrompt.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  ReleaseVirtualTokenBuffer();
+end;
+
+function TNNetSoftPrompt.WillOpenCL(): boolean;
+begin
+  Result := (not FIsTrainable) and Assigned(FVirtualTokenBuffer) and
+    inherited WillOpenCL();
+end;
+
+function TNNetSoftPrompt.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FVirtualTokenBuffer);
+end;
+
+procedure TNNetSoftPrompt.CopyVirtualTokensOnOpenCL();
+var
+  Kern: TNeuralKernel;
+begin
+  Kern := FGatherCopyCL.OutputKernel();
+  if FAfterWeightUpdateHasBeenCalled then
+  begin
+    // Blocking: the host bank may change again before this queue drains.
+    Kern.EnsureWriteBuffer(FVirtualTokenBuffer, FVirtualTokenBufBytes,
+      FNeurons[0].FWeights, {DoWrite=}true, {pBlocking=}true);
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
+  Kern.CopyBuffer(FVirtualTokenBuffer, FGatherCopyCL.ResultBuffer(),
+    csize_t(FNumVirtual * FDim) * csNeuralFloatSize);
+end;
+{$ENDIF}
+
 procedure TNNetSoftPrompt.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   SeqLen: integer;
@@ -38634,7 +38729,11 @@ var
   SeqLen: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then
+  begin
+    {$IFDEF OpenCL} CopyVirtualTokensOnOpenCL(); {$ENDIF}
+    exit;
+  end;
   X := FPrevLayer.FOutput;
   P := FNeurons[0].FWeights;
   SeqLen := X.SizeX;
