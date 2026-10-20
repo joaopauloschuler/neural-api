@@ -125,6 +125,24 @@ const
   csActPolynomial     = 53;
   csActAPL            = 54; // ParamA = hinge count
   csActSpline         = 55; // ParamA = range, ParamB = 1/knot spacing, ParamC = intervals
+  // 56..72: parameterless unless noted. TNNetRReLU reuses csActLeakyReLU.
+  csActArcSinh         = 56;
+  csActSinh            = 57;
+  csActReciprocal      = 58;
+  csActPower           = 59; // ParamA = the integer exponent
+  csActSerf            = 60;
+  csActSmish           = 61;
+  csActPhish           = 62;
+  csActSinc            = 63;
+  csActLogCosh         = 64;
+  csActTanhExp         = 65;
+  csActLeCunTanh       = 66;
+  csActPenalizedTanh   = 67;
+  csActSoftExponential = 68; // ParamA = alpha, ParamB = 1/alpha (0 when alpha = 0)
+  csActISRLU           = 69; // ParamA = alpha
+  csActESwish          = 70; // ParamA = beta
+  csActSwish6          = 71;
+  csActReLUSqrt        = 72;
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1954,6 +1972,7 @@ type
   // Coded by Claude (AI).
   TNNetSerf = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1967,6 +1986,7 @@ type
   // Coded by Claude (AI).
   TNNetSmish = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1986,6 +2006,7 @@ type
   // Coded by Claude (AI).
   TNNetPhish = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -2021,6 +2042,7 @@ type
     FExpBuf: array of TNeuralFloat; // persistent, lazily-sized scratch for AVXExp (rule #17)
   {$ENDIF}
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -2040,6 +2062,7 @@ type
     FTanhBuf: array of TNeuralFloat; // persistent, lazily-sized scratch for Tanh (rule #17)
   {$ENDIF}
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2182,6 +2205,7 @@ type
   // Coded by Claude (AI).
   TNNetReciprocal = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2216,6 +2240,7 @@ type
   // Coded by Claude (AI).
   TNNetSinhAct = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2229,6 +2254,7 @@ type
   // Coded by Claude (AI).
   TNNetArcSinh = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2241,6 +2267,7 @@ type
   // Coded by Claude (AI).
   TNNetLeCunTanh = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2256,6 +2283,7 @@ type
   // Coded by Claude (AI).
   TNNetLogCoshActivation = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2299,6 +2327,7 @@ type
   // Coded by Claude (AI).
   TNNetSinc = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2439,6 +2468,7 @@ type
   /// Swish activation function with maximum limit of 6
   TNNetSwish6 = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -2834,6 +2864,7 @@ type
   //Does a ReLU followed by a Square Root
   TNNetReLUSqrt = class(TNNetReLUBase)
     public
+      constructor Create(); override;
       procedure Compute(); override;
   end;
 
@@ -8362,6 +8393,10 @@ type
       constructor Create(); overload; override;
       constructor Create(pLower, pUpper: TNeuralFloat); reintroduce; overload;
       procedure Compute(); override;
+      {$IFDEF OpenCL}
+      // The device path takes the fixed inference slope only, never a draw.
+      function WillOpenCL(): boolean; override;
+      {$ENDIF}
       property Enabled: boolean read FEnabled write FEnabled;
       property LastSlope: TNeuralFloat read FLastSlope;
   end;
@@ -25827,6 +25862,12 @@ begin
   FBackwardTime := FBackwardTime + (Now() - StartTime);
 end;
 
+constructor TNNetSwish6.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSwish6;
+end;
+
 procedure TNNetSwish6.Compute();
 var
   SizeM1: integer;
@@ -25838,7 +25879,11 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -25994,6 +26039,7 @@ begin
   if pBeta <= 0 then
     FErrorProc('TNNetESwish requires beta > 0.');
   FFloatSt[0] := pBeta;
+  FActivationOpcode := csActESwish;
 end;
 
 procedure TNNetESwish.Compute();
@@ -26005,7 +26051,11 @@ var
   PrevValue, Beta, BetaX, SigmoidValue: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FFloatSt[0]) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Beta := FFloatSt[0];
@@ -26511,6 +26561,7 @@ begin
   if pAlpha <= 0 then
     FErrorProc('TNNetISRLU requires alpha > 0.');
   FFloatSt[0] := pAlpha;
+  FActivationOpcode := csActISRLU;
 end;
 
 procedure TNNetISRLU.Compute();
@@ -26522,7 +26573,11 @@ var
   PrevValue, Alpha, InvSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FFloatSt[0]) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -26568,6 +26623,12 @@ end;
 
 { TNNetSmish }
 
+constructor TNNetSmish.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSmish;
+end;
+
 procedure TNNetSmish.Compute();
 var
   SizeM1: integer;
@@ -26577,7 +26638,11 @@ var
   x, s, t, dL: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -26641,6 +26706,12 @@ end;
 
 { TNNetTanhExp }
 
+constructor TNNetTanhExp.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActTanhExp;
+end;
+
 procedure TNNetTanhExp.Compute();
 var
   SizeM1: integer;
@@ -26653,7 +26724,11 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -26779,6 +26854,12 @@ end;
 
 { TNNetPenalizedTanh }
 
+constructor TNNetPenalizedTanh.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActPenalizedTanh;
+end;
+
 procedure TNNetPenalizedTanh.Compute();
 var
   SizeM1: integer;
@@ -26791,7 +26872,11 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -50870,6 +50955,12 @@ end;
 
 { TNNetPhish }
 
+constructor TNNetPhish.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActPhish;
+end;
+
 procedure TNNetPhish.Compute();
 var
   SizeM1: integer;
@@ -50882,7 +50973,11 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -50966,6 +51061,12 @@ begin
   Result := pcr_erff(x);
 end;
 
+constructor TNNetSerf.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSerf;
+end;
+
 procedure TNNetSerf.Compute();
 var
   SizeM1: integer;
@@ -50976,7 +51077,11 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
@@ -51712,6 +51817,7 @@ constructor TNNetSoftExponential.Create(pAlpha: TNeuralFloat);
 begin
   inherited Create();
   FFloatSt[0] := pAlpha;
+  FActivationOpcode := csActSoftExponential;
 end;
 
 procedure TNNetSoftExponential.Compute();
@@ -51728,13 +51834,18 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  Alpha := FFloatSt[0];
+  if Alpha <> 0 then InvAlpha := 1.0 / Alpha else InvAlpha := 0;
+  if ComputeActivationOnOpenCL(Alpha, InvAlpha) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   {$IFDEF AVXANY}
   Size := LocalPrevOutput.Size;
   {$ENDIF}
-  Alpha := FFloatSt[0];
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -52445,6 +52556,12 @@ end;
 
 { TNNetReciprocal }
 
+constructor TNNetReciprocal.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActReciprocal;
+end;
+
 procedure TNNetReciprocal.Compute();
 const
   RECIP_EPS: TNeuralFloat = 1e-6;
@@ -52456,7 +52573,11 @@ var
   x, ax, s, denom, y: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52561,6 +52682,12 @@ end;
 
 { TNNetSinhAct }
 
+constructor TNNetSinhAct.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSinh;
+end;
+
 procedure TNNetSinhAct.Compute();
 var
   SizeM1: integer;
@@ -52570,7 +52697,11 @@ var
   SinhVal: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52600,6 +52731,12 @@ end;
 
 { TNNetArcSinh }
 
+constructor TNNetArcSinh.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActArcSinh;
+end;
+
 procedure TNNetArcSinh.Compute();
 var
   SizeM1: integer;
@@ -52609,7 +52746,11 @@ var
   x, SqrtVal: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52634,6 +52775,12 @@ end;
 
 { TNNetLogCoshActivation }
 
+constructor TNNetLogCoshActivation.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActLogCosh;
+end;
+
 procedure TNNetLogCoshActivation.Compute();
 const
   cLn2: TNeuralFloat = 0.6931471805599453;
@@ -52645,7 +52792,11 @@ var
   x, absX, logCoshVal: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52695,6 +52846,12 @@ end;
 
 { TNNetLeCunTanh }
 
+constructor TNNetLeCunTanh.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActLeCunTanh;
+end;
+
 procedure TNNetLeCunTanh.Compute();
 const
   cScale: TNeuralFloat = 1.7159;
@@ -52708,7 +52865,11 @@ var
   y: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -52953,6 +53114,12 @@ end;
 
 { TNNetSinc }
 
+constructor TNNetSinc.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSinc;
+end;
+
 procedure TNNetSinc.Compute();
 const
   SINC_EPS: TNeuralFloat = 1e-6;
@@ -52964,7 +53131,11 @@ var
   x, SinX, CosX, SincVal: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -58077,6 +58248,7 @@ begin
   FPower := iPower;
   FIntPower := iPower;
   FStruct[0] := iPower;
+  FActivationOpcode := csActPower;
 end;
 
 procedure TNNetPower.Compute();
@@ -58088,7 +58260,11 @@ var
   x, xx, PowVal, PowerM1: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FIntPower) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -58307,6 +58483,12 @@ end;
 
 { TNNetReLUSqrt }
 
+constructor TNNetReLUSqrt.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActReLUSqrt;
+end;
+
 procedure TNNetReLUSqrt.Compute();
 var
   SizeM1: integer;
@@ -58316,7 +58498,11 @@ var
   VSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -60560,7 +60746,16 @@ begin
   // Dropout defaults to Enabled = true.
   FEnabled := true;
   FLastSlope := (pLower + pUpper) / 2;
+  // x >= 0 ? x : x*slope equals LeakyReLU's x > 0 ? x : slope*x.
+  FActivationOpcode := csActLeakyReLU;
 end;
+
+{$IFDEF OpenCL}
+function TNNetRReLU.WillOpenCL(): boolean;
+begin
+  Result := (not FEnabled) and inherited WillOpenCL();
+end;
+{$ENDIF}
 
 procedure TNNetRReLU.Compute();
 var
@@ -60571,9 +60766,6 @@ var
   Lower, Upper, Slope, x: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
   Lower := FFloatSt[0];
   Upper := FFloatSt[1];
   if Upper < Lower then Upper := Lower;
@@ -60587,6 +60779,14 @@ begin
     Slope := (Lower + Upper) / 2;
   // Store the slope so the matching Backpropagate uses the same value.
   FLastSlope := Slope;
+  // WillOpenCL is false while Enabled, so the device only sees the fixed slope.
+  if ComputeActivationOnOpenCL(Slope) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
 
   // y = x for x >= 0; y = Slope*x for x < 0. Derivative cached in
   // FOutputErrorDeriv (1 for x >= 0, Slope for x < 0).

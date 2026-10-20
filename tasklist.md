@@ -1920,7 +1920,7 @@ rather than acted on.
 
 Forward pass only; a device backward is a separate project (nothing in the tree
 has one today). 52 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
-`ComputeOpenCL`, and `cai_activation` covers 47 elementwise opcodes on top of
+`ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
 "does this layer evict a resident chain to RAM", not by FLOPs.
@@ -2067,13 +2067,15 @@ above (blocked on a Double-precision shared dot-product kernel).
 ### Activation coverage — the fused GEMM tail and the standalone kernel
 
 Two separate mechanisms, easy to confuse. (1) The FUSED tail inside the matmul
-kernels: `cai_dot_product` applies `ActFN` in-register after the bias add, and
-it implements exactly three opcodes — 1=ReLU, 2=Sigmoid, 3=Tanh — with the same
-three copied into `cai_dot_product_int8` and into `cai_fused_act` (the split-K
-reduce helper). `TNNetLayer.IsActivationFunctionInOpenCL` mirrors that set on
-the host and returns false for everything else. (2) The STANDALONE
-`cai_activation` kernel, which has 55 opcodes, each wired to its layer classes
-through `ComputeActivationOnOpenCL()`.
+kernels: `cai_dot_product` and its int8/split-K siblings apply `ActFN`
+in-register after the bias add through `cai_fused_act`, which implements the
+eight parameterless opcodes 1-8. `TNNetLayer.IsActivationFunctionInOpenCL` maps
+five host activation functions onto them (ReLU, Sigmoid, Tanh, Swish,
+HardSwish) and returns false for everything else. (2) The STANDALONE
+`cai_activation` kernel, which has 72 opcodes, each wired to its layer classes
+through `ComputeActivationOnOpenCL()`. Every elementwise `TNNetReLUBase`
+activation now has one (`TNNetRReLU` reuses 15 = LeakyReLU, device path only
+while `Enabled = false`, i.e. at its fixed inference slope).
 
 Both are forward-only by construction: neither produces `FOutputRaw` or the
 derivative mask, so `IsActivationFunctionInOpenCL` requires `not FIsTrainable`
@@ -2082,26 +2084,11 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [ ] The 18 elementwise activations still with no `cai_activation` opcode,
-      all `TNNetReLUBase` descendants: `TNNetArcSinh`, `TNNetSinhAct`,
-      `TNNetReciprocal`, `TNNetPower`, `TNNetSerf`, `TNNetSmish`,
-      `TNNetPhish`, `TNNetSinc`, `TNNetLogCoshActivation`, `TNNetTanhExp`,
-      `TNNetLeCunTanh`, `TNNetPenalizedTanh`, `TNNetSoftExponential`,
-      `TNNetISRLU`, `TNNetESwish`, `TNNetSwish6`, `TNNetReLUSqrt`,
-      `TNNetRReLU`. Each is one `case` in the `cai_activation` switch plus one
-      constant and the `ComputeActivationOnOpenCL()` call at the top of
-      `Compute`. LANDED as opcodes 29-43: `TNNetErf`, `TNNetExp`, `TNNetLog`,
-      `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetMish`, `TNNetSoftPlus`,
-      `TNNetLogSigmoid`, `TNNetTanhShrink`, `TNNetLisht`, `TNNetSoftPlusBeta`,
-      `TNNetCELU`, `TNNetGaussianActivation`, `TNNetISRU`, all in
-      `TestActivationOpenCLParity` at <= 2.9e-7 (Erf 6e-8 against the host's
-      correctly-rounded `SerfErf`). Two cautions: `TNNetRReLU` draws a random slope, so its device form must
-      reproduce the host draw or stay inference-frozen; and `TNNetSoftSign`
-      and `TNNetESwish` raise hardware FP exceptions at far-extreme inputs on
-      the host (see the FP-exception item in the test section), so pick the
-      clamping policy there BEFORE pinning device parity. The gated
-      `TNNetReGLU` is a different shape and already runs on the device through
-      `TNNetGLUGateBase` / `cai_glu_gate` (commit 4266dc65).
+- [ ] `TNNetArcSinh` (host and opcode 56) use ln(x + sqrt(x^2 + 1)), which
+      cancels in float32 for x << 0: -7.625 instead of -7.601 at x = -1000,
+      -8.318 instead of -8.700 at x = -3000, and -Inf from x = -4097 on (x^2 + 1
+      rounds to x^2). Host and device agree, so parity hides it. Fix both to
+      sign(x) * ln(|x| + sqrt(x^2 + 1)) and pin a host value at x = -1e4.
 - [ ] `TNNetMetaAconC`, the one per-channel learnable activation still with
       no device forward. Its beta is sigmoid(gamma[c] * mean_c(x) + delta[c]),
       so it needs a per-sample spatial channel mean before the elementwise
@@ -2327,6 +2314,8 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       to 0 / the sigmoid to its asymptote) so the layers stay finite at any
       input like HardTanh/SoftCapping do, or document the input-range contract.
       Then extend the tests to the far-extreme range under the chosen policy.
+      The device forward (opcodes 22, 70) is already finite at any finite input
+      (`TestActivationOpenCLExtremeInputs`); this item is the host path only.
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
       grow unboundedly, finite-difference eps must scale with input
       magnitude.

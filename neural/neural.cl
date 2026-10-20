@@ -76,9 +76,10 @@ static inline float cai_tanh(const float x)
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
 // cai_activation keeps its own cases for the parameterized activations
-// (9, 10, 15, 18-21, 24-28, 40, 41, 43-55) and for the standalone-only ones that
-// no GEMM fuses. PoCL if-converts the branches on v, so both sides of every
-// branch run: each must stay finite for any finite v. Coded by Claude (AI).
+// (9, 10, 15, 18-21, 24-28, 40, 41, 43-55, 59, 68-70) and for the
+// standalone-only ones that no GEMM fuses. PoCL if-converts the branches on v,
+// so both sides of every branch run: each must stay finite for any finite v.
+// Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -3185,7 +3186,8 @@ __kernel void cai_softmax
 // 29..43 = the transcendental activations (Erf through ISRU),
 // 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine),
 // 47 = SubMulConstant (TNNetMovingStdNormalization),
-// 48/49 = SwishBeta/MishAlpha, 50..55 = the per-channel learnable activations.
+// 48/49 = SwishBeta/MishAlpha, 50..55 = the per-channel learnable activations,
+// 56..72 = the remaining TNNetReLUBase activations (ArcSinh through ReLUSqrt).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3465,6 +3467,111 @@ __kernel void cai_activation
       y = y0 + (SegmentPos - (float)seg) * (y1 - y0);
       break;
     }
+    // 56..72 mirror the host Compute forms, thresholds included.
+    case 56: // ArcSinh: ln(x + sqrt(x^2 + 1)), the host's form
+      y = cai_log(fmax(x + cai_sqrt_square_plus1(x), FLT_MIN));
+      break;
+    case 57: // SinhAct: sinh(clamp(x, -88, 88)), from e = exp(|x|) >= 1 so 1/e is finite
+    {
+      const float xc = clamp(x, -88.0f, 88.0f);
+      const float e = exp(fabs(xc));
+      y = copysign((e - 1.0f / e) * 0.5f, xc);
+      break;
+    }
+    case 58: // Reciprocal: 1 / (sign(x) * max(|x|, 1e-6)), sign(0) = +1
+    {
+      const float a = fmax(fabs(x), 1e-6f);
+      y = 1.0f / ((x < 0.0f) ? -a : a);
+      break;
+    }
+    case 59: // Power: x^n by squaring, n = FParamA. |x| is capped (n > 0) or floored
+    {        // (n < 0) at 2^(126/|n|), which keeps every product finite.
+      const int n = (int)clamp(FParamA, -65536.0f, 65536.0f);
+      int RemainingExponent = abs(n);
+      const float bound = exp2(126.0f / (float)max(RemainingExponent, 1));
+      const float magnitude = (n >= 0) ? fmin(fabs(x), bound) :
+        1.0f / fmax(fabs(x), 1.0f / bound);
+      float base = copysign(magnitude, x);
+      float result = 1.0f;
+      while (RemainingExponent > 0)
+      {
+        if ((RemainingExponent & 1) != 0) result *= base;
+        RemainingExponent >>= 1;
+        if (RemainingExponent > 0) base *= base;
+      }
+      y = result;
+      break;
+    }
+    case 60: // Serf: x * erf(softplus(x)), softplus saturated beyond +-30
+    {
+      const float e = cai_exp_floored(fmin(x, 30.0f));
+      float sp;
+      if (x > 30.0f) sp = x;
+      else if (x < -30.0f) sp = e;
+      else sp = log1p(e);
+      y = x * cai_erf(sp);
+      break;
+    }
+    case 61: // Smish: x * tanh(ln(1 + sigmoid(x)))
+      y = x * cai_tanh(log(1.0f + cai_fused_act(x, 2)));
+      break;
+    case 62: // Phish: x * tanh(GELU(x))
+      y = x * cai_tanh(cai_fused_act(x, 5));
+      break;
+    case 63: // Sinc: sin(x)/x, and 1 for |x| < 1e-6
+    {
+      const bool IsNearZero = (fabs(x) < 1e-6f);
+      y = IsNearZero ? 1.0f : cai_sin(x) / (IsNearZero ? 1.0f : x);
+      break;
+    }
+    case 64: // LogCoshActivation: |x| + ln(1 + exp(-2|x|)) - ln 2, and |x| - ln 2 beyond 15
+    {
+      const float LN2 = 0.6931471805599453f;
+      const float a = fabs(x);
+      const float e = exp(-2.0f * fmin(a, 15.0f));
+      y = (a > 15.0f) ? a - LN2 : a + log1p(e) - LN2;
+      break;
+    }
+    case 65: // TanhExp: x * tanh(exp(x)), x beyond 20 and 0 below -20
+    {
+      const float e = cai_exp_floored(fmin(x, 20.0f));
+      if (x > 20.0f) y = x;
+      else if (x < -20.0f) y = 0.0f;
+      else y = x * cai_tanh(e);
+      break;
+    }
+    case 66: // LeCunTanh: 1.7159 * tanh(2x/3)
+      y = 1.7159f * cai_tanh(x * (2.0f / 3.0f));
+      break;
+    case 67: // PenalizedTanh: tanh(x) above zero, 0.25 * tanh(x) otherwise
+    {
+      const float t = cai_tanh(x);
+      y = (x > 0.0f) ? t : 0.25f * t;
+      break;
+    }
+    case 68: // SoftExponential, FParamA = alpha, FParamB = 1/alpha: x when alpha = 0,
+    {        // (exp(alpha*x) - 1)/alpha + alpha above, -ln(1 - alpha*(x + alpha))/alpha below.
+      // The exponent cap keeps (e - 1)/alpha finite for alpha < 1.
+      const float MaxExponent = 88.0f + fmin(0.0f, cai_log(fmax(FParamA, 1e-30f)));
+      const float e = cai_exp_floored(fmin(FParamA * x, MaxExponent));
+      const float LogArg = fmax(1.0f - FParamA * (x + FParamA), FLT_MIN);
+      if (FParamA == 0.0f) y = x;
+      else if (FParamA > 0.0f) y = (e - 1.0f) * FParamB + FParamA;
+      else y = -cai_log(LogArg) * FParamB;
+      break;
+    }
+    case 69: // ISRLU: x at or above zero, else x / sqrt(1 + alpha*x^2). FParamA = alpha.
+      y = (x >= 0.0f) ? x : cai_isru(x, FParamA);
+      break;
+    case 70: // ESwish: beta * x * sigmoid(beta*x). FParamA = beta.
+      y = FParamA * x * cai_fused_act(FParamA * x, 2);
+      break;
+    case 71: // Swish6: min(x * sigmoid(x), 6)
+      y = fmin(x * cai_fused_act(x, 2), 6.0f);
+      break;
+    case 72: // ReLUSqrt: sqrt(max(x, 0))
+      y = sqrt(fmax(x, 0.0f));
+      break;
     default: // csActNone / unknown: pass through
       y = x;
   }

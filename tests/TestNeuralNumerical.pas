@@ -71299,7 +71299,7 @@ end;
 // The activations TestActivationOpenCLParity and TestActivationOpenCLExtremeInputs
 // cover, one per variant: adding one is a name here and a line in CreateParityActivation.
 const
-  csActivationParityNames: array[0..53] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  csActivationParityNames: array[0..75] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
@@ -71309,7 +71309,12 @@ const
     'Sqrt', 'Sin', 'Cos', 'Mish', 'SoftPlus', 'LogSigmoid', 'TanhShrink',
     'LiSHT', 'SoftPlusBeta', 'SoftPlusBeta beta 2', 'CELU', 'CELU alpha 0.5',
     'GaussianActivation', 'ISRU', 'ISRU alpha 0.5', 'MovingStdNormalization',
-    'MovingStdNormalization w1 <= 0');
+    'MovingStdNormalization w1 <= 0', 'ArcSinh', 'SinhAct', 'Reciprocal',
+    'Power 2', 'Power 3', 'Power 5', 'Serf', 'Smish', 'Phish', 'Sinc',
+    'LogCoshActivation', 'TanhExp', 'LeCunTanh', 'PenalizedTanh',
+    'SoftExponential alpha 0', 'SoftExponential alpha 0.5',
+    'SoftExponential alpha -0.1', 'ISRLU', 'ESwish', 'Swish6', 'ReLUSqrt',
+    'RReLU inference');
 
 function CreateParityActivation(Variant: integer): TNNetLayer;
 begin
@@ -71374,6 +71379,34 @@ begin
       if Variant = 52
         then Result.Neurons[0].Weights.Raw[1] := 1.7
         else Result.Neurons[0].Weights.Raw[1] := -0.5; // no divide on the host
+    end;
+    54: Result := TNNetArcSinh.Create();
+    55: Result := TNNetSinhAct.Create();
+    56: Result := TNNetReciprocal.Create(); // x = 0 hits the 1e-6 floor
+    57: Result := TNNetPower.Create(2);
+    58: Result := TNNetPower.Create(3);
+    59: Result := TNNetPower.Create(5); // the host's pcr_powf branch
+    60: Result := TNNetSerf.Create();
+    61: Result := TNNetSmish.Create();
+    62: Result := TNNetPhish.Create();
+    63: Result := TNNetSinc.Create(); // x = 0 hits the 1e-6 guard
+    64: Result := TNNetLogCoshActivation.Create();
+    65: Result := TNNetTanhExp.Create();
+    66: Result := TNNetLeCunTanh.Create();
+    67: Result := TNNetPenalizedTanh.Create();
+    68: Result := TNNetSoftExponential.Create(0);
+    69: Result := TNNetSoftExponential.Create(0.5);
+    // ln(1 + 0.1*(x - 0.1)) stays defined down to x = -9.9.
+    70: Result := TNNetSoftExponential.Create(-0.1);
+    71: Result := TNNetISRLU.Create();
+    72: Result := TNNetESwish.Create();
+    73: Result := TNNetSwish6.Create();
+    74: Result := TNNetReLUSqrt.Create();
+    75:
+    begin
+      // Disabled, RReLU uses the fixed slope (lower + upper)/2.
+      Result := TNNetRReLU.Create();
+      TNNetRReLU(Result).Enabled := false;
     end;
   else Result := nil;
   end;
