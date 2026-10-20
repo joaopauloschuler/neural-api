@@ -78,6 +78,12 @@ rather than acted on.
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
+- [ ] Check (not verified): `TNNetSwinV2WindowAttention` inherits the plain
+      `TNNetScaledDotProductAttention` backward, which differentiates
+      softmax(Q.K * scale) without the Q/K L2-normalization and the learnable
+      logit_scale of the cosine-attention forward. Add a numerical gradient
+      check; if it fails, give the layer its own backward (or document it as
+      inference-only).
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
@@ -1714,6 +1720,10 @@ rather than acted on.
       `TNNetDiffusionScheduler.PredictX0`, all four samplers, one PPM per preview)
       and `--fast-vae` (tiny final decode, full VAE not loaded). Smoke-checked on
       the pico `tiny_taesd4_decoder` fixture. Not covered: a real `taesd` run.
+- [ ] TAESD real-checkpoint check: run examples/LatentTextToImage with a
+      downloaded `madebyollin/taesd` (`--tiny-vae DIR --fast-vae`) and compare
+      the image against the full SD VAE decode; add an OpenCL parity test of
+      the composed tiny decoder (the pico tests run on the CPU only).
 - [ ] TAESD previews for examples/QwenImage: examples/QwenImage
       has NO matching tiny decoder: Qwen-Image-2.1's VAE is z_dim 64 at 16x
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
@@ -1916,6 +1926,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       (`FSumKernel`/`FSumBuffer`, release, adopt, share). Deriving it from that
       base with `ConcatKernelName = 'cai_volume_sum'` would delete the copy;
       the field names would then need a neutral rename (`FOutputKernel`/...).
+- [ ] `TNNetDeepConcat` upload follow-ups (from 1b292c2f): a zero-depth
+      host-only source is not skipped (TNNetConcat skips 0-byte sources; the
+      deep concat would create a 0-byte buffer), and a host-only layer listed at
+      two source positions is uploaded twice. Guard the first; share one upload
+      per distinct layer for the second.
 - [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
       (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
       plan too (DeMaxPool's random spacing would need a per-forward plan, so
@@ -2027,6 +2042,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         packed [Qn|Kn|V] buffer (allocated in EnableOpenCL), then
         `ComputeFlashPacked` with InvSqrtDk = logit_scale and the bias matrix
         exactly as `TNNetWindowAttention` passes it.
+      - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item
+        per (token, Q/K/V part) with a serial d_k loop; fine for Swin windows
+        (49 tokens, d_k 32), use work-groups if a large-d_k user appears.
       - `TNNetSAMVisionAttention` (SAM): not an SDPA subclass; it fuses the qkv
         projection, the padded window partition, the out projection and a
         QUERY-DEPENDENT decomposed rel-pos bias (Q . rel_pos_h + Q . rel_pos_w),
