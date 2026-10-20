@@ -518,6 +518,9 @@ type
     // DepthToSpace -> Crop -> InterleaveChannels -> MobileViTUnfold/Fold ->
     // GatherTokens -> TransposeXD -> TransposeYD -> ReLU stays resident.
     procedure TestGatherCopyResidentOpenCLParity;
+    // The cai_gather_copy plan is uploaded by EnableOpenCL, not by the first
+    // forward, and a later source shape change rebuilds it.
+    procedure TestGatherCopyPlanBuiltAtArmOpenCL;
     // TNNetFiLM with a host-only conditioning vector: the feature map is bound,
     // the vector is uploaded per forward.
     procedure TestFiLMHostCondOpenCLParity;
@@ -69798,6 +69801,85 @@ begin
       OutCPU[LayerPos].Free;
     Expected.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGatherCopyPlanBuiltAtArmOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  CropLayer: TNNetLayer;
+  InputA, InputB, ExpectedA, ExpectedB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos: integer;
+  WasCounting: boolean;
+  Before, AfterA, AfterB: TOpenCLTransferCounts;
+  DiffA, DiffB: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  InputA := TNNetVolume.Create(5, 6, 3);
+  InputB := TNNetVolume.Create(7, 6, 3);
+  ExpectedA := TNNetVolume.Create();
+  ExpectedB := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 6, 3));
+    CropLayer := NN.AddLayer(TNNetCrop.Create(1, 2, 3, 2));
+    NN.SetTrainable(False, False);
+    MaxPos := InputA.Size - 1;
+    for Pos := 0 to MaxPos do InputA.Raw[Pos] := Sin(Pos * 0.31) + 0.5;
+    MaxPos := InputB.Size - 1;
+    for Pos := 0 to MaxPos do InputB.Raw[Pos] := Cos(Pos * 0.17) - 0.25;
+    NN.Compute(InputA);
+    ExpectedA.Copy(CropLayer.Output);
+    NN.Layers[0].Output.ReSize(7, 6, 3);
+    NN.Compute(InputB);
+    ExpectedB.Copy(CropLayer.Output);
+    NN.Layers[0].Output.ReSize(5, 6, 3);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(True);
+    OpenCLTransferCounting := true;
+    Before := OpenCLProcessTransferTotals();
+    NN.Compute(InputA);
+    AfterA := OpenCLProcessTransferTotals();
+    DiffA := MaxAbsDiffToOutput(ExpectedA, CropLayer.Output);
+    // The source row stride changes from 5 to 7 pixels: the old plan is wrong.
+    NN.Layers[0].Output.ReSize(7, 6, 3);
+    NN.Compute(InputB);
+    AfterB := OpenCLProcessTransferTotals();
+    DiffB := MaxAbsDiffToOutput(ExpectedB, CropLayer.Output);
+    NN.ForceOpenCL(False);
+    WriteLn('  Gather-copy plan at arm: uploads first=',
+      AfterA.UploadCount - Before.UploadCount, ' after reshape=',
+      AfterB.UploadCount - AfterA.UploadCount, ' max|diff|=', DiffA:0:9, ' ',
+      DiffB:0:9);
+    AssertEquals('both forwards ran on OpenCL', 2, CropLayer.ForwardGPUCnt);
+    AssertEquals('the first forward uploads only the input', 1,
+      AfterA.UploadCount - Before.UploadCount);
+    AssertEquals('a source shape change uploads the input and a new plan', 2,
+      AfterB.UploadCount - AfterA.UploadCount);
+    AssertTrue('first forward equals the host copy', DiffA = 0);
+    AssertTrue('reshaped forward equals the host copy', DiffB = 0);
+    AssertTrue('the reshape changes the result', ExpectedA.SumDiff(ExpectedB) > 0);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    ExpectedB.Free;
+    ExpectedA.Free;
+    InputB.Free;
+    InputA.Free;
     NN.Free;
   end;
 end;

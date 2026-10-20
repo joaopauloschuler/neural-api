@@ -5460,8 +5460,6 @@ type
     FPlanShape: array[0..5] of integer;
     FPlanBuf, FBufSrc, FBufDst: cl_mem;
     FCapPlan, FCapSrc, FCapDst: csize_t;
-    // Rebuilds and uploads the plan when Consumer's shapes differ from FPlanShape.
-    procedure EnsurePlan(Consumer: TNNetLayer);
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -5472,6 +5470,8 @@ type
     // Points output coordinate OutCoord of the last axis added at source
     // coordinate SrcCoord; SrcCoord < 0 makes that coordinate read zero.
     procedure SetAxisSource(OutCoord, SrcCoord: integer);
+    // Rebuilds and uploads the plan when Consumer's shapes differ from FPlanShape.
+    procedure EnsurePlan(Consumer: TNNetLayer);
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
     function BufferBytes(): int64; override;
@@ -140595,6 +140595,14 @@ begin
   FHasOpenCL := true;
   if Assigned(FNN) and (not Assigned(FGatherCopyCL)) and HasGatherCopyPlan() then
     FGatherCopyCL := TNNetGatherCopyCL.Create(FNN);
+  // Plan built here so the forward only binds and launches; a plan this layer
+  // cannot describe yet is left to the forward, which reports it.
+  if Assigned(FGatherCopyCL) and Assigned(FPrevLayer) and (FOutput.Size > 0) then
+  try
+    FGatherCopyCL.EnsurePlan(Self);
+  except
+    on Exception do ;
+  end;
 end;
 {$ENDIF}
 
