@@ -2249,12 +2249,11 @@ type
   end;
 
   /// ArcSinh (inverse hyperbolic sine) activation function.
-  // ArcSinh(x) = ln(x + sqrt(x^2 + 1)). Parameter-free. Derivative is
+  // ArcSinh(x) = sign(x) * ln(|x| + sqrt(x^2 + 1)). Parameter-free. Derivative
   // 1 / sqrt(x^2 + 1), cached into FOutputErrorDeriv so TNNetReLUBase handles
   // the backward chain rule with one multiply. Monotonic, smooth, unbounded;
   // grows like ln|x| for large |x|. A tanh sibling that never saturates and
-  // a sinh sibling that never explodes. Sqrt argument is always >= 1, so no
-  // special-case handling needed.
+  // a sinh sibling that never explodes.
   // Coded by Claude (AI).
   TNNetArcSinh = class(TNNetReLUBase)
   public
@@ -52767,7 +52766,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x, SqrtVal: TNeuralFloat;
+  AbsX: TNeuralFloat;
 begin
   StartTime := Now();
   if ComputeActivationOnOpenCL() then
@@ -52778,20 +52777,19 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
-  // arcsinh(x) = ln(x + sqrt(x^2 + 1)). Derivative is 1/sqrt(x^2 + 1).
-  // The forward ln(x+sqrt(x^2+1)) pass is vectorized via TNNetVolume.ArcSinh
-  // (built on the AVX2 Ln); the 1/sqrt(x^2+1) derivative is filled by a scalar
-  // finishing pass that reads x back from LocalPrevOutput, so the backward math is
-  // byte-identical to the previous per-element path. sqrt argument is always >= 1.
+  // Derivative 1/sqrt(x^2 + 1), which is 1/|x| past csArcSinhSquareCap, where
+  // x^2 would otherwise overflow single precision from |x| = 1.8e19 on.
   TNNetVolume.ArcSinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      SqrtVal := Sqrt(x * x + 1.0);
-      FOutputErrorDeriv.FData[OutputCnt] := 1.0 / SqrtVal;
+      AbsX := Abs(LocalPrevOutput.FData[OutputCnt]);
+      if AbsX < csArcSinhSquareCap then
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0 / Sqrt(AbsX * AbsX + 1.0)
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0 / AbsX;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);

@@ -48,6 +48,10 @@ uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysut
 const csMinAvxSize = 16;
 // Rows per panel of TNNetVolume.PackDotProductRows (two ymm registers).
 const csDotProductPanelRows = 16;
+// ArcSinh: past csArcSinhSquareCap sqrt(x^2 + 1) = |x| in single precision, and
+// |x| saturates at csArcSinhMagnitudeCap = 2^125 so 1/(2|x|) stays a normal float.
+const csArcSinhSquareCap = 1e15;
+const csArcSinhMagnitudeCap = 4.2535295865117308e37;
 
 const
   csEncodeRGB  = 0;
@@ -859,10 +863,8 @@ type
       // pays one pass over src instead of two. Bit-identical to calling Sin then
       // Cos. Either destination may alias src.
       class procedure SinCos(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // ArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
-      // Built on Ln (and a vectorized sqrt in the prep pass) so it inherits the
-      // AVX2 path. The sqrt argument is always >= 1 so ln stays in its accurate range
-      // and dst may alias src (the prep pass reads src into a scratch before Ln).
+      // ArcSinh writes dst[0..N-1] := arcsinh(src) = sign(x) * ln(|x| + sqrt(x^2 + 1)),
+      // built on Ln; exact to |x| = 2^125, saturating past it. dst may alias src.
       class procedure ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -12266,18 +12268,25 @@ end;
 class procedure TNNetVolume.ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
-  X: TNeuralFloat;
+  X, AX, A: TNeuralFloat;
 begin
   if N <= 0 then exit;
   NM1 := N - 1;
-  // arcsinh(x) = ln(x + sqrt(x^2 + 1)). The argument x + sqrt(x^2+1) is always >= 1
-  // and is built directly into pDst; pSrc^[I] is read before pDst^[I] is written at
-  // the same index, so dst may alias src elementwise. Ln then supplies the
-  // AVX2 ln pass in place.
+  // arcsinh(x) = sign(x) * ln(A), A = |x| + sqrt(x^2 + 1) >= 1; the unsigned form
+  // cancels for x << 0. A negative x stores 1/A so Ln yields -ln(A) directly, and
+  // pSrc^[I] is read before pDst^[I] is written, so dst may alias src.
   for I := 0 to NM1 do
   begin
     X := pSrc^[I];
-    pDst^[I] := X + Sqrt(X * X + 1.0);
+    AX := Abs(X);
+    if AX < csArcSinhSquareCap then
+      A := AX + Sqrt(AX * AX + 1.0)
+    else if AX >= csArcSinhMagnitudeCap then
+      A := csArcSinhMagnitudeCap + csArcSinhMagnitudeCap
+    else
+      A := AX + AX;
+    if X < 0 then A := 1.0 / A;
+    pDst^[I] := A;
   end;
   Ln(pDst, pDst, N);
 end;

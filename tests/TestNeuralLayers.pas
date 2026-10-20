@@ -66,6 +66,7 @@ type
     procedure TestCosScalarParity;
     procedure TestSinCosMatchesSeparateSinAndCos;
     procedure TestArcSinhScalarParity;
+    procedure TestArcSinhLargeMagnitude;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -1927,6 +1928,44 @@ begin
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestArcSinhLargeMagnitude;
+// TNNetArcSinh host forward and derivative where ln(x + sqrt(x^2 + 1)) cancels
+// (x << 0) or x^2 overflows single precision (|x| = 1e30), against double asinh.
+const
+  csInputs: array[0..6] of TNeuralFloat = (-1e4, -1000, -3000, -5000, 1e30, -1e30, -1e-3);
+  csExpected: array[0..6] of double = (-9.903487555036127, -7.600902709541988,
+    -8.699514775987968, -9.210340381976183, 69.77069997038132, -69.77069997038132,
+    -0.0009999998333334083);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ActLayer: TNNetLayer;
+  InputPos: integer;
+  X, ExpectedDeriv: double;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Length(csInputs), 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(Length(csInputs)));
+    ActLayer := NN.AddLayer(TNNetArcSinh.Create());
+    for InputPos := 0 to High(csInputs) do
+      Input.FData[InputPos] := csInputs[InputPos];
+    NN.Compute(Input);
+    for InputPos := 0 to High(csInputs) do
+    begin
+      X := csInputs[InputPos];
+      AssertEquals('ArcSinh(' + FloatToStr(X) + ')', csExpected[InputPos],
+        ActLayer.Output.FData[InputPos], 1e-6 * Max(1.0, Abs(csExpected[InputPos])));
+      ExpectedDeriv := 1.0 / Sqrt(X * X + 1.0);
+      AssertEquals('ArcSinh derivative at ' + FloatToStr(X), ExpectedDeriv,
+        ActLayer.OutputErrorDeriv.FData[InputPos], 1e-6 * ExpectedDeriv);
+    end;
+  finally
+    Input.Free;
+    NN.Free;
   end;
 end;
 

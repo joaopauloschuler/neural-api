@@ -2057,11 +2057,11 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [ ] `TNNetArcSinh` (host and opcode 56) use ln(x + sqrt(x^2 + 1)), which
-      cancels in float32 for x << 0: -7.625 instead of -7.601 at x = -1000,
-      -8.318 instead of -8.700 at x = -3000, and -Inf from x = -4097 on (x^2 + 1
-      rounds to x^2). Host and device agree, so parity hides it. Fix both to
-      sign(x) * ln(|x| + sqrt(x^2 + 1)) and pin a host value at x = -1e4.
+- [X] `TNNetArcSinh` (host and opcode 56) used ln(x + sqrt(x^2 + 1)), which
+      cancels in float32 for x << 0. Done: both now compute
+      sign(x) * ln(|x| + sqrt(x^2 + 1)), exact to |x| = 2^125 and saturating past
+      it; the host derivative no longer overflows x^2; pinned by
+      `TestArcSinhLargeMagnitude`, and the 1e30 extreme-input parity now compares values.
 - [ ] `TNNetMetaAconC`, the one per-channel learnable activation still with
       no device forward. Its beta is sigmoid(gamma[c] * mean_c(x) + delta[c]),
       so it needs a per-sample spatial channel mean before the elementwise

@@ -3522,9 +3522,12 @@ __kernel void cai_activation
       break;
     }
     // 56..72 mirror the host Compute forms, thresholds included.
-    case 56: // ArcSinh: ln(x + sqrt(x^2 + 1)), the host's form
-      y = cai_log(fmax(x + cai_sqrt_square_plus1(x), FLT_MIN));
+    case 56: // ArcSinh: sign(x) * ln(|x| + sqrt(x^2 + 1)), |x| saturating at 2^125
+    {
+      const float a = fmin(fabs(x), 0x1p125f);
+      y = copysign(cai_log(a + cai_sqrt_square_plus1(a)), x);
       break;
+    }
     case 57: // SinhAct: sinh(clamp(x, -88, 88)), from e = exp(|x|) >= 1 so 1/e is finite
     {
       const float xc = clamp(x, -88.0f, 88.0f);
