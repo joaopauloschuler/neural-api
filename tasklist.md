@@ -4345,6 +4345,38 @@ rather than acted on.
           _h kernels) next to FP32 at the Qwen-Image shapes, to test whether
           the block kernel (10-11 TFLOPS of ~30) is bound by FP32 activation
           traffic (64 MB at 4096 tokens > 48 MB L2). Measurement only.
+- [ ] Qwen-Image inpainting: `--init-image FILE --mask FILE` in examples/QwenImage
+      (and `/mask FILE|off` in the REPL) regenerates only the white region of a
+      mask image and keeps the rest of the init image. Port of diffusers
+      `QwenImageInpaintPipeline` (`pipelines/qwenimage/pipeline_qwenimage_inpaint.py`
+      in the ~/x venv), the no-retrain blended mode; the img2img path it extends
+      is already in `TQwenImage21Pipeline` (`EncodeImage`, `Img2ImgStartStep`,
+      `ScaleNoise` in `DenoiseAt`). What is new:
+      - Mask to latents: grayscale, binarize at 0.5, nearest-resize to the VAE
+        latent grid (image side / 8), then pack each 2x2 patch the way the image
+        latents are packed, so the mask has the (GridH*GridW,1,in_channels)
+        layout of `Latents` (each token's 64 channels take the mask value of
+        their own sub-pixel). Put this next to `EncodeImage`, not in the example.
+      - `DenoiseAt` calls `ScaleNoise(Latents, ImageLatents, StartStep)`, which
+        overwrites the noise in place, so copy the noise first and keep it.
+        After every `FScheduler.Step`, set `Known` to that noise and run
+        `ScaleNoise(Known, ImageLatents, StepPos + 1)` (after the last step,
+        `Known` is the clean `ImageLatents`). Then blend
+        `Latents := Known + Mask * (Latents - Known)`. `SDUNetDenoiseInpaint`
+        already runs that blend inline (Sub, `TNNetVolume.Mul` by the mask, Add);
+        move it into one shared helper used by both samplers rather than writing
+        a second copy. Allocate `Known` and the noise copy once per image,
+        outside the step loop.
+      - Optional `--mask-blur N` and diffusers' `padding_mask_crop` (crop to the
+        mask's bounding box plus padding, generate at full resolution, paste
+        back) are follow-ups; the second is what makes a small hole in a large
+        photo cheap.
+      Tests: a pico-fixture test where the kept latent region equals
+      `ImageLatents` exactly after the last step and the hole differs, plus a
+      latent-trajectory parity check against diffusers on `tests/fixtures/
+      tiny_qwenimage21`, modelled on `tiny_qwenimage21_img2img_io.json` (the
+      oracle comes from the ~/x venv; the test itself stays Pascal). Update the examples/QwenImage README with one real
+      1024x1024 inpaint on the GPU box (user run).
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
