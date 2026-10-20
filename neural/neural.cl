@@ -2329,6 +2329,38 @@ __kernel void cai_upsample_gather
     (OX - x * FFactor) * FXStride + (OY - y * FFactor) * FYStride];
 }
 
+// CAI gather copy: the forward of the layers whose output elements each copy
+// one source element or read zero (crop, padding, transposes, space/depth and
+// MobileViT reshuffles, token and channel gathers; TNNetGatherCopyCL).
+// FPlan = [AxisCount, Extent[AxisCount], TableStart[AxisCount], tables]. The
+// output index splits into one coordinate per axis, outermost first, and each
+// coordinate's table entry is a source offset; the offsets add up, and a
+// negative entry makes the element zero. One work-item per OUTPUT element.
+__kernel void cai_gather_copy
+(
+  const int FNumOut,
+  __global const int* FPlan,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int AxisCount = FPlan[0];
+  int Rest = g_id;
+  int SrcPos = 0;
+  int IsZero = 0;
+  for (int Axis = AxisCount - 1; Axis >= 0; Axis--)
+  {
+    const int Extent = FPlan[1 + Axis];
+    const int Next = Rest / Extent;
+    const int Offset = FPlan[FPlan[1 + AxisCount + Axis] + Rest - Next * Extent];
+    Rest = Next;
+    if (Offset < 0) IsZero = 1; else SrcPos += Offset;
+  }
+  FDst[g_id] = IsZero ? 0.0f : FSrc[SrcPos];
+}
+
 // CAI Bicubic Gather (separable 4x4 weighted gather forward)
 // Coded by Claude (AI).
 // Device forward for TNNetBicubicUpsample, the 16-corner sibling of

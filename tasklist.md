@@ -1914,16 +1914,34 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [ ] Reshape/gather glue: `TNNetCrop`, `TNNetPadXY`,
-      `TNNetTransposeXD`, `TNNetDepthToSpace`, `TNNetGatherTokens`,
-      `TNNetConcat`. None has a device path, and several sit between attention
-      and FFN in the importers, so each one evicts the chain. For most of these
-      a kernel is the wrong answer: the bytes do not change, only the shape, so
-      the layer should re-label the resident buffer (a view) rather than copy
-      it. `TNNetReshape` already does this (its `OpenCLOutputBuffer()` hands
-      back the source's buffer); apply the same view mechanism to the rest.
-      `TNNetCrop`/`TNNetPadXY`/`TNNetTransposeXD` DO move bytes and need a real
-      copy/gather kernel; keep the two halves separate.
+- [X] Reshape/gather glue: `TNNetCrop`, `TNNetPadXY`, `TNNetTransposeXD`,
+      `TNNetDepthToSpace`, `TNNetGatherTokens`. None of them is a re-label:
+      in the `((y*SizeX + x)*Depth + d)` layout every one moves bytes, so the
+      `TNNetReshape` view does not apply. They share one kernel instead,
+      `cai_gather_copy`: the output splits into up to 6 axes, each axis
+      coordinate maps to a source offset through a small table (negative = zero),
+      and the offsets add up. `TNNetGatherCopyCL` holds the table and rebuilds
+      it on a shape change; the layer only describes it
+      (`BuildGatherCopyPlan`), and the residency plumbing (`WillOpenCL`, output
+      buffer/kernel, `DisableOpenCL`) lives once on `TNNetLayer`. Inference with
+      a resident source or ForceOpenCL; every `TNNetPadXY` mode (zero, reflect,
+      replicate, circular, trailing X) goes through `NeuralPadSourceIndex`, the
+      host's own mapping. Pinned by `TestGatherCopyOpenCLParity` (17 cases,
+      exact 0.0) and `TestGatherCopyResidentOpenCLParity` (11 glue layers,
+      1572/1572 sentinels, 1 upload + 1 download).
+- [ ] `TNNetConcat` device forward. Left open: it is multi-source (a flat
+      back-to-back concatenation of every source's bytes), so it does not fit
+      the single-source `cai_gather_copy`; one `clEnqueueCopyBuffer` per
+      source into the output buffer is the likely shape.
+- [ ] Follow-ups of the glue item: `TNNetExpandDims` and `TNNetSqueeze` ARE
+      true re-labels and still download their source - give them the
+      `TNNetReshape` view (move that mechanism to a shared place first).
+      `TNNetPad`, `TNNetGather`, `TNNetGatherChannels` and
+      `TNNetChannelShuffle` are copies that fit `cai_gather_copy` with a
+      two-method override each. `cai_upsample_gather` (DeMaxPool, Upsample,
+      PixelShuffle) is expressible as a `cai_gather_copy` plan too. The gather
+      layers do not take part in OpenCL output sharing by liveness
+      (`CanShareOpenCLOutput` is False).
 - [X] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward. Both
       now descend from `TNNetGLUGateBase` and reach `cai_glu_gate` through two
       new gate flags: 4 = ReLU(A) * B (ReGLU gates the FIRST half, unlike the
@@ -2036,14 +2054,15 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       the open FFT denormal-trap item, since the device path would move that
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
-- [ ] Extend the reshape/gather glue item above to its vision members. Pure
-      re-label, so they want the view mechanism `TNNetReshape` already uses:
-      `TNNetDepthToSpace`, `TNNetSpaceToDepth`, `TNNetInterleaveChannels` and
-      the MobileViT trio (`TNNetMobileViTFold`, `TNNetMobileViTUnfold`,
-      `TNNetMobileViTPatchSegments`, which are three reshapes wearing a
-      model-specific name). Real byte movement, so a kernel: `TNNetTransposeYD`
-      beside the already-listed `TNNetTransposeXD`, `TNNetCrop` and
-      `TNNetPadXY`.
+- [X] Extend the reshape/gather glue item above to its vision members:
+      `TNNetSpaceToDepth`, `TNNetInterleaveChannels`, `TNNetMobileViTUnfold`,
+      `TNNetMobileViTFold` and `TNNetTransposeYD` take the same
+      `cai_gather_copy` path (`TNNetDepthToSpace` is in the item above). They
+      are not re-labels either: each is a permutation in this layout.
+      `TNNetInterleaveChannels` keeps the host's collision rule (a later source
+      channel wins, an unreached channel stays zero), so non-bijective steps
+      match too. `TNNetMobileViTPatchSegments` needs no device path: it reads
+      only its source's shape, never the data, so it does not evict the chain.
 - [ ] Extend the per-channel affine item above to the conv-stack members:
       `TNNetPReLUChannel` and `TNNetGRN` (ConvNeXt, RIFE, StyleGAN2, SAM).
       `TNNetCellBias` and `TNNetReZero` are done (opcodes 44 and 26), and so is

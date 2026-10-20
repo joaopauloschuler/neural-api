@@ -127,6 +127,9 @@ const
   // output in OpenCL memory (ShouldStayOnOpenCL). Coded by Claude (AI).
   csActivationOpenCLMinSize = 64*1024*1024;
 
+  // Most output axes a cai_gather_copy plan describes (TNNetGatherCopyCL).
+  csGatherCopyMaxAxes = 6;
+
   // Channel count from which the bilinear-sampler backward passes
   // (TNNetFlowWarp, TNNetBackwardWarp, TNNetAffineGridSample, TNNetGridSample)
   // switch from the scalar depth loop to whole-column MulAdd/DotProduct over the
@@ -157,6 +160,7 @@ type
   TNNet = class;
   {$IFDEF OpenCL}
   TNNetFusedSDPACL = class;
+  TNNetGatherCopyCL = class;
   {$ENDIF}
 
   // 2-D dynamic double matrix used by TNNetSpectralConv2D's separable 2-D FFT
@@ -587,6 +591,15 @@ type
       FOutputOnOpenCL: boolean;     // output is in device memory
       FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
       FErrorOnOpenCL: boolean;      // gradient is in device memory
+      // cai_gather_copy helper of a layer whose HasGatherCopyPlan is True, made
+      // by EnableOpenCL; nil on every other layer.
+      FGatherCopyCL: TNNetGatherCopyCL;
+      // True when BuildGatherCopyPlan describes this layer's forward as one
+      // cai_gather_copy. False here.
+      function HasGatherCopyPlan(): boolean; virtual;
+      // Describes the forward to Plan, one AddAxis per output axis; called again
+      // whenever the source or output shape changed. Does nothing here.
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); virtual;
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure MoveOutputToRAM(); virtual;
@@ -595,6 +608,9 @@ type
       procedure ComputeL2Decay(); virtual;
       procedure ComputePreviousLayerError(); virtual;
       function IsActivationFunctionInOpenCL(var ActOpcode: integer): boolean;
+      // True when cai_gather_copy ran the forward, its time added from StartTime.
+      // False: the host copy follows, with the source in RAM and the flags reset.
+      function ComputeGatherCopyOnOpenCL(StartTime: double): boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); virtual;
       procedure ApplyActivationFunctionToOutput(); virtual;
       // Applies FActivationFn to the output ELEMENT range [pFirst..pLast]
@@ -681,6 +697,9 @@ type
       procedure FreeDotProductCL(var pDotCL: TDotProductSharedKernel);
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
+      // The cai_gather_copy verdict: inference with a resident source, or
+      // ForceOpenCL. False on a layer without FGatherCopyCL.
+      function WillOpenCL(): boolean; override;
       // Device buffer holding this layer's finished forward output
       // Override when required.
       function OpenCLOutputBuffer(): cl_mem; virtual;
@@ -1388,6 +1407,10 @@ type
   TNNetTransposeXD = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -1397,6 +1420,10 @@ type
   TNNetTransposeYD = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -1559,6 +1586,10 @@ type
     FPaddingX, FPaddingY, FTrailingPaddingX: integer;
     FPadMode: TNNetPadMode;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    {$IFDEF OpenCL}
+    function HasGatherCopyPlan(): boolean; override;
+    procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+    {$ENDIF}
   public
     constructor Create(PaddingX, PaddingY: integer); reintroduce; overload;
     // TrailingPaddingX >= 0 pads the end of X by that many columns instead of
@@ -1599,6 +1630,10 @@ type
     FStartX, FStartY: integer;
     FLenX, FLenY: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    {$IFDEF OpenCL}
+    function HasGatherCopyPlan(): boolean; override;
+    procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+    {$ENDIF}
   public
     constructor Create(StartX, StartY, LenX, LenY: integer); reintroduce; overload;
     procedure Compute(); override;
@@ -5405,6 +5440,44 @@ type
     // resident source and keeps the result in OpenCL memory unless trainable.
     procedure GatherFromPrevLayer(Consumer: TNNetLayer;
       Factor, ChannelStride, XStride, YStride: integer);
+  end;
+
+  /// OpenCL forward of the layers whose output elements are each one source
+  // element or zero (cai_gather_copy). The output splits into up to
+  // csGatherCopyMaxAxes axes, outermost first; each axis coordinate maps to a
+  // source offset through a table, and the offsets add up. The layer describes
+  // the tables in BuildGatherCopyPlan; the helper rebuilds them on a shape change.
+  TNNetGatherCopyCL = class(TNNetKernelCL)
+  private
+    FAxisCount: integer;
+    FAxisExtent, FAxisTableStart: array[0..csGatherCopyMaxAxes - 1] of integer;
+    FLastAxisStride: integer;
+    // The offset tables back to back, then the uploaded plan (a header of
+    // AxisCount, the extents and the table starts, then the tables).
+    FTable, FPlanHost: TNeuralIntegerArray;
+    FTableLen: integer;
+    // Source and output shape the uploaded plan was built for (0 = none yet).
+    FPlanShape: array[0..5] of integer;
+    FPlanBuf, FBufSrc, FBufDst: cl_mem;
+    FCapPlan, FCapSrc, FCapDst: csize_t;
+    // Rebuilds and uploads the plan when Consumer's shapes differ from FPlanShape.
+    procedure EnsurePlan(Consumer: TNNetLayer);
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Appends the next output axis: output coordinate o reads source coordinate
+    // SrcFirst + o (a step of SrcStride elements), or zero outside [0, SrcLen).
+    procedure AddAxis(Extent, SrcStride: integer; SrcFirst: integer = 0;
+      SrcLen: integer = High(integer));
+    // Points output coordinate OutCoord of the last axis added at source
+    // coordinate SrcCoord; SrcCoord < 0 makes that coordinate read zero.
+    procedure SetAxisSource(OutCoord, SrcCoord: integer);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+    // Copies Consumer.PrevLayer's output into Consumer.Output per the plan:
+    // binds a resident source and keeps the result in OpenCL memory unless trainable.
+    procedure GatherFromPrevLayer(Consumer: TNNetLayer);
   end;
 
   /// OpenCL forward helper for TNNetBicubicUpsample, the 16-corner sibling of
@@ -12908,6 +12981,10 @@ type
     private
       ToChannels: TNeuralIntegerArray;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(StepSize: integer); reintroduce; overload;
       destructor Destroy(); override;
@@ -12956,6 +13033,10 @@ type
     private
       FTokens: TNeuralIntegerArray;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(); overload; override;
       constructor Create(pTokens: array of integer); reintroduce; overload;
@@ -13123,6 +13204,10 @@ type
   TNNetSpaceToDepth = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(BlockSize: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -13138,6 +13223,10 @@ type
   TNNetDepthToSpace = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(BlockSize: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -13163,6 +13252,10 @@ type
   TNNetMobileViTUnfold = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(pPatchSize: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -13178,6 +13271,10 @@ type
   TNNetMobileViTFold = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
+      {$ENDIF}
     public
       constructor Create(pPatchSize, pOutW, pOutH: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -24540,12 +24637,30 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetTransposeYD.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetTransposeYD.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+begin
+  // Output (x, y, d) reads source (x, d, y).
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.Depth, 1);
+  Plan.AddAxis(Src.SizeX, Src.Depth);
+  Plan.AddAxis(Src.SizeY, Src.SizeX * Src.Depth);
+end;
+{$ENDIF}
+
 procedure TNNetTransposeYD.Compute;
 var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   FOutput.CopyTransposingYD(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -24579,12 +24694,30 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetTransposeXD.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetTransposeXD.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+begin
+  // Output (x, y, d) reads source (d, y, x).
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(Src.SizeY, Src.SizeX * Src.Depth);
+  Plan.AddAxis(Src.Depth, 1);
+  Plan.AddAxis(Src.SizeX, Src.Depth);
+end;
+{$ENDIF}
+
 procedure TNNetTransposeXD.Compute;
 var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   FOutput.CopyTransposingXD(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -25155,12 +25288,29 @@ begin
   FStruct[3] := FLenY;
 end;
 
+{$IFDEF OpenCL}
+function TNNetCrop.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetCrop.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+begin
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(FOutput.SizeY, Src.SizeX * Src.Depth, FStartY, Src.SizeY);
+  Plan.AddAxis(FOutput.SizeX, Src.Depth, FStartX, Src.SizeX);
+  Plan.AddAxis(FOutput.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetCrop.Compute;
 var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -25274,6 +25424,32 @@ begin
     else FTrailingPaddingX := PaddingX;
 end;
 
+{$IFDEF OpenCL}
+function TNNetPadXY.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetPadXY.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  Src: TNNetVolume;
+  OutPos, MaxOutPos: integer;
+begin
+  Src := FPrevLayer.FOutput;
+  Plan.AddAxis(FOutput.SizeY, Src.SizeX * Src.Depth);
+  MaxOutPos := FOutput.SizeY - 1;
+  for OutPos := 0 to MaxOutPos do
+    Plan.SetAxisSource(OutPos,
+      NeuralPadSourceIndex(OutPos, FPaddingY, Src.SizeY, FPadMode));
+  Plan.AddAxis(FOutput.SizeX, Src.Depth);
+  MaxOutPos := FOutput.SizeX - 1;
+  for OutPos := 0 to MaxOutPos do
+    Plan.SetAxisSource(OutPos,
+      NeuralPadSourceIndex(OutPos, FPaddingX, Src.SizeX, FPadMode));
+  Plan.AddAxis(FOutput.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetPadXY.Compute;
 var
   StartTime: double;
@@ -25283,7 +25459,7 @@ var
   RowBytes, SrcW, SrcH: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -39318,6 +39494,158 @@ begin
   end;
 end;
 
+{ TNNetGatherCopyCL }
+
+constructor TNNetGatherCopyCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_gather_copy');
+end;
+
+destructor TNNetGatherCopyCL.Destroy();
+begin
+  if Assigned(FPlanBuf) then clReleaseMemObject(FPlanBuf);
+  if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
+  if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
+  inherited Destroy();
+end;
+
+procedure TNNetGatherCopyCL.AddAxis(Extent, SrcStride: integer;
+  SrcFirst: integer; SrcLen: integer);
+var
+  OutCoord, MaxOutCoord, SrcCoord, TablePos: integer;
+begin
+  if FAxisCount >= csGatherCopyMaxAxes then
+    raise Exception.Create('TNNetGatherCopyCL.AddAxis: more than ' +
+      IntToStr(csGatherCopyMaxAxes) + ' axes.');
+  if Length(FTable) < FTableLen + Extent then SetLength(FTable, FTableLen + Extent);
+  FAxisExtent[FAxisCount] := Extent;
+  FAxisTableStart[FAxisCount] := FTableLen;
+  FLastAxisStride := SrcStride;
+  Inc(FAxisCount);
+  MaxOutCoord := Extent - 1;
+  SrcCoord := SrcFirst;
+  TablePos := FTableLen;
+  for OutCoord := 0 to MaxOutCoord do
+  begin
+    if (SrcCoord >= 0) and (SrcCoord < SrcLen)
+      then FTable[TablePos] := SrcCoord * SrcStride
+      else FTable[TablePos] := -1;
+    Inc(SrcCoord);
+    Inc(TablePos);
+  end;
+  Inc(FTableLen, Extent);
+end;
+
+procedure TNNetGatherCopyCL.SetAxisSource(OutCoord, SrcCoord: integer);
+var
+  TablePos: integer;
+begin
+  TablePos := FAxisTableStart[FAxisCount - 1] + OutCoord;
+  if SrcCoord >= 0
+    then FTable[TablePos] := SrcCoord * FLastAxisStride
+    else FTable[TablePos] := -1;
+end;
+
+procedure TNNetGatherCopyCL.EnsurePlan(Consumer: TNNetLayer);
+var
+  Src, Y: TNNetVolume;
+  AxisPos, MaxAxisPos, HeaderLen, PlanLen, OutCount: integer;
+begin
+  Src := Consumer.FPrevLayer.FOutput;
+  Y := Consumer.FOutput;
+  if (FPlanShape[0] = Src.SizeX) and (FPlanShape[1] = Src.SizeY) and
+    (FPlanShape[2] = Src.Depth) and (FPlanShape[3] = Y.SizeX) and
+    (FPlanShape[4] = Y.SizeY) and (FPlanShape[5] = Y.Depth) then exit;
+  FAxisCount := 0;
+  FTableLen := 0;
+  Consumer.BuildGatherCopyPlan(Self);
+  OutCount := 1;
+  MaxAxisPos := FAxisCount - 1;
+  for AxisPos := 0 to MaxAxisPos do OutCount := OutCount * FAxisExtent[AxisPos];
+  if (FAxisCount = 0) or (OutCount <> Y.Size) then
+    raise Exception.Create(Consumer.ClassName + ': the cai_gather_copy plan ' +
+      'covers ' + IntToStr(OutCount) + ' of ' + IntToStr(Y.Size) + ' outputs.');
+  HeaderLen := 1 + 2 * FAxisCount;
+  PlanLen := HeaderLen + FTableLen;
+  if Length(FPlanHost) < PlanLen then SetLength(FPlanHost, PlanLen);
+  FPlanHost[0] := FAxisCount;
+  for AxisPos := 0 to MaxAxisPos do
+  begin
+    FPlanHost[1 + AxisPos] := FAxisExtent[AxisPos];
+    FPlanHost[1 + FAxisCount + AxisPos] := HeaderLen + FAxisTableStart[AxisPos];
+  end;
+  Move(FTable[0], FPlanHost[HeaderLen], FTableLen * csLongintSize);
+  FKernel.EnsureBuffer(FPlanBuf, FCapPlan, CL_MEM_READ_ONLY,
+    PlanLen * csLongintSize);
+  FKernel.WriteBuffer(FPlanBuf, PlanLen * csLongintSize, @FPlanHost[0], CL_TRUE);
+  FPlanShape[0] := Src.SizeX;
+  FPlanShape[1] := Src.SizeY;
+  FPlanShape[2] := Src.Depth;
+  FPlanShape[3] := Y.SizeX;
+  FPlanShape[4] := Y.SizeY;
+  FPlanShape[5] := Y.Depth;
+end;
+
+function TNNetGatherCopyCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufDst;
+end;
+
+function TNNetGatherCopyCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetGatherCopyCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FPlanBuf) + OpenCLMemBytes(FBufSrc) +
+    OpenCLMemBytes(FBufDst);
+end;
+
+procedure TNNetGatherCopyCL.GatherFromPrevLayer(Consumer: TNNetLayer);
+var
+  Prev: TNNetLayer;
+  Y: TNNetVolume;
+  bufSrc, bufDst: cl_mem;
+  k: cl_kernel;
+  NumOut: longint;
+  KeepResult: boolean;
+begin
+  Prev := Consumer.FPrevLayer;
+  Y := Consumer.FOutput;
+  EnsurePlan(Consumer);
+  KeepResult := not Consumer.FIsTrainable;
+  if KeepResult and Prev.OutputBindableOnOpenCL() then
+  begin
+    bufSrc := Prev.OpenCLOutputBuffer();
+    Prev.OpenCLWaitOutputIfAnotherQueue(FKernel);
+  end
+  else
+  begin
+    Prev.ForceOutputOnRAM();
+    bufSrc := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Prev.FOutput);
+  end;
+  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Y);
+  k := FKernel.Kernel;
+  NumOut := Y.Size;
+  clSetKernelArg(k, 0, csLongintSize, @NumOut);
+  clSetKernelArg(k, 1, csCLMemSize, @FPlanBuf);
+  clSetKernelArg(k, 2, csCLMemSize, @bufSrc);
+  clSetKernelArg(k, 3, csCLMemSize, @bufDst);
+  FKernel.RunKernel(k, NumOut);
+  if KeepResult then
+  begin
+    Consumer.FOutputOnOpenCL := true;
+    Consumer.FOutputOnRAM := false;
+  end
+  else
+  begin
+    FKernel.ReadBuffer(bufDst, Y, CL_TRUE);
+    Consumer.FOutputOnOpenCL := false;
+    Consumer.FOutputOnRAM := true;
+  end;
+end;
+
 { TNNetBicubicGatherCL }
 
 constructor TNNetBicubicGatherCL.Create(NN: TNNet);
@@ -53049,13 +53377,33 @@ begin
   inherited Destroy();
 end;
 
+{$IFDEF OpenCL}
+function TNNetInterleaveChannels.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetInterleaveChannels.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  CntDepth, MaxDepth: integer;
+begin
+  // The host writes channel ToChannels[d] from channel d, the later d winning
+  // a collision; a channel no d reaches stays zero.
+  Plan.AddAxis(FOutput.SizeX * FOutput.SizeY, FOutput.Depth);
+  Plan.AddAxis(FOutput.Depth, 1, 0, 0);
+  MaxDepth := FOutput.Depth - 1;
+  for CntDepth := 0 to MaxDepth do
+    Plan.SetAxisSource(ToChannels[CntDepth], CntDepth);
+end;
+{$ENDIF}
+
 procedure TNNetInterleaveChannels.Compute();
 var
   CntDepth, MaxDepth: integer;
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
   begin
@@ -53267,6 +53615,24 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetGatherTokens.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetGatherTokens.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  TokenPos, MaxTokenPos: integer;
+begin
+  Plan.AddAxis(FOutput.SizeX, FOutput.Depth);
+  MaxTokenPos := FOutput.SizeX - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    Plan.SetAxisSource(TokenPos, FTokens[TokenPos]);
+  Plan.AddAxis(FOutput.Depth, 1);
+end;
+{$ENDIF}
+
 procedure TNNetGatherTokens.Compute();
 var
   StartTime: double;
@@ -53275,7 +53641,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   Prev := FPrevLayer.Output;
   MaxX := Length(FTokens) - 1;
   MaxD := Prev.Depth - 1;
@@ -53660,6 +54026,28 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetSpaceToDepth.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetSpaceToDepth.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  P, C, SrcRowStride: integer;
+begin
+  // Output (OX, OY, (SX*P + SY)*C + IC) reads source (OX*P + SX, OY*P + SY, IC).
+  P := FStruct[0];
+  C := FPrevLayer.FOutput.Depth;
+  SrcRowStride := FPrevLayer.FOutput.SizeX * C;
+  Plan.AddAxis(FOutput.SizeY, P * SrcRowStride);
+  Plan.AddAxis(FOutput.SizeX, P * C);
+  Plan.AddAxis(P, C);
+  Plan.AddAxis(P, SrcRowStride);
+  Plan.AddAxis(C, 1);
+end;
+{$ENDIF}
+
 procedure TNNetSpaceToDepth.Compute();
 var
   P, C: integer;
@@ -53671,7 +54059,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := LocalPrevOutput.Depth;
@@ -53788,6 +54176,28 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetDepthToSpace.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetDepthToSpace.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  P, C, SrcDepth: integer;
+begin
+  // Output (IX*P + SX, IY*P + SY, IC) reads source (IX, IY, (SX*P + SY)*C + IC).
+  P := FStruct[0];
+  C := FOutput.Depth;
+  SrcDepth := FPrevLayer.FOutput.Depth;
+  Plan.AddAxis(FPrevLayer.FOutput.SizeY, FPrevLayer.FOutput.SizeX * SrcDepth);
+  Plan.AddAxis(P, C);
+  Plan.AddAxis(FPrevLayer.FOutput.SizeX, SrcDepth);
+  Plan.AddAxis(P, P * C);
+  Plan.AddAxis(C, 1);
+end;
+{$ENDIF}
+
 procedure TNNetDepthToSpace.Compute();
 var
   P, C: integer;
@@ -53799,7 +54209,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := FOutput.Depth;
@@ -53919,6 +54329,29 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetMobileViTUnfold.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetMobileViTUnfold.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  P, C, SrcRowStride: integer;
+begin
+  // Output slot (DY*P + DX)*NumPatches + PH*NPW + PW reads pixel
+  // (PW*P + DX, PH*P + DY).
+  P := FStruct[0];
+  C := FPrevLayer.FOutput.Depth;
+  SrcRowStride := FPrevLayer.FOutput.SizeX * C;
+  Plan.AddAxis(P, SrcRowStride);
+  Plan.AddAxis(P, C);
+  Plan.AddAxis(FPrevLayer.FOutput.SizeY div P, P * SrcRowStride);
+  Plan.AddAxis(FPrevLayer.FOutput.SizeX div P, P * C);
+  Plan.AddAxis(C, 1);
+end;
+{$ENDIF}
+
 procedure TNNetMobileViTUnfold.Compute();
 var
   P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
@@ -53930,7 +54363,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := LocalPrevOutput.Depth;
@@ -54063,6 +54496,29 @@ begin
   SetOutputErrorSize(FOutput);
 end;
 
+{$IFDEF OpenCL}
+function TNNetMobileViTFold.HasGatherCopyPlan(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetMobileViTFold.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+var
+  P, C, NPW, NumPatchesC: integer;
+begin
+  // Pixel (PW*P + DX, PH*P + DY) reads slot (DY*P + DX)*NumPatches + PH*NPW + PW.
+  P := FStruct[0];
+  C := FOutput.Depth;
+  NPW := FOutput.SizeX div P;
+  NumPatchesC := NPW * (FOutput.SizeY div P) * C;
+  Plan.AddAxis(FOutput.SizeY div P, NPW * C);
+  Plan.AddAxis(P, P * NumPatchesC);
+  Plan.AddAxis(NPW, C);
+  Plan.AddAxis(P, NumPatchesC);
+  Plan.AddAxis(C, 1);
+end;
+{$ENDIF}
+
 procedure TNNetMobileViTFold.Compute();
 var
   P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
@@ -54074,7 +54530,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeGatherCopyOnOpenCL(StartTime) then exit;
   LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := FOutput.Depth;
@@ -106689,6 +107145,7 @@ end;
 
 function TNNetIdentity.WillOpenCL(): boolean;
 begin
+  if Assigned(FGatherCopyCL) then exit(inherited WillOpenCL());
   Result := (FActivationOpcode <> csActNone) and Assigned(FActivationBuffer)
     and Assigned(FActivationKernel) and FHasOpenCL
     and ((FShouldOpenCL and (FOutput.Size >= csActivationOpenCLMinSize))
@@ -106706,7 +107163,8 @@ end;
 
 function TNNetIdentity.OpenCLOutputBuffer(): cl_mem;
 begin
-  Result := FActivationBuffer;
+  if Assigned(FGatherCopyCL) then Result := inherited OpenCLOutputBuffer()
+  else Result := FActivationBuffer;
 end;
 
 function TNNetIdentity.OpenCLBufferBytes(): int64;
@@ -106729,7 +107187,8 @@ end;
 
 function TNNetIdentity.OpenCLOutputKernel(): TNeuralKernel;
 begin
-  Result := FActivationKernel;
+  if Assigned(FGatherCopyCL) then Result := inherited OpenCLOutputKernel()
+  else Result := FActivationKernel;
 end;
 
 procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
@@ -139931,6 +140390,7 @@ destructor TNNetLayer.Destroy();
 begin
   {$IFDEF OpenCL}
   ReleaseDotProductCL();
+  if Assigned(FGatherCopyCL) then FreeAndNil(FGatherCopyCL);
   {$ENDIF}
   UnlinkWeightBorrowers();
   if Assigned(FWeightOwner) then FWeightOwner.FWeightBorrowers.Remove(Self);
@@ -139964,12 +140424,31 @@ end;
 
 function TNNetLayer.OpenCLOutputBuffer(): cl_mem;
 begin
-  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
+  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer
+  else if Assigned(FGatherCopyCL) then Result := FGatherCopyCL.ResultBuffer()
+  else Result := nil;
 end;
 
 function TNNetLayer.OpenCLOutputKernel(): TNeuralKernel;
 begin
-  if Assigned(FDotCL) then Result := FDotCL.DotProductKernel else Result := nil;
+  if Assigned(FDotCL) then Result := FDotCL.DotProductKernel
+  else if Assigned(FGatherCopyCL) then Result := FGatherCopyCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetLayer.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FGatherCopyCL) and FHasOpenCL and
+    (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+function TNNetLayer.HasGatherCopyPlan(): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetLayer.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
+begin
 end;
 
 procedure TNNetLayer.OpenCLWaitOutputIfAnotherQueue(pConsumerKernel: TNeuralKernel);
@@ -140100,6 +140579,13 @@ end;
 // FHasOpenCL (or an allocated helper), which this call does clear.
 procedure TNNetLayer.DisableOpenCL();
 begin
+  if Assigned(FGatherCopyCL) then
+  begin
+    // A resident output lives in the helper's buffer.
+    ForceOutputOnRAM();
+    FreeAndNil(FGatherCopyCL);
+    FOutputOnOpenCL := false;
+  end;
   ReleaseDotProductCL();
   FHasOpenCL := false;
 end;
@@ -140107,8 +140593,32 @@ end;
 procedure TNNetLayer.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
+  if Assigned(FNN) and (not Assigned(FGatherCopyCL)) and HasGatherCopyPlan() then
+    FGatherCopyCL := TNNetGatherCopyCL.Create(FNN);
 end;
 {$ENDIF}
+
+function TNNetLayer.ComputeGatherCopyOnOpenCL(StartTime: double): boolean;
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if Assigned(FGatherCopyCL) then
+  begin
+    if WillOpenCL() then
+    begin
+      Inc(FForwardGPUCnt);
+      FGatherCopyCL.GatherFromPrevLayer(Self);
+      FForwardTime := FForwardTime + (Now() - StartTime);
+      Result := true;
+      exit;
+    end;
+    Inc(FForwardCPUCnt);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
 
 // TNNet.EnableInt8Input calls this on layers that own no weights too, so a
 // layer with no int8 input copy simply has nothing to do here.
@@ -140498,6 +141008,7 @@ begin
   Result := 0;
   {$IFDEF OpenCL}
   if Assigned(FDotCL) then Result := FDotCL.BufferBytes();
+  if Assigned(FGatherCopyCL) then Result := Result + FGatherCopyCL.BufferBytes();
   {$ENDIF}
 end;
 
