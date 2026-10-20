@@ -4568,7 +4568,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // FLASH ATTENTION OVER THE KV CACHE (TNNetFusedSDPA): the arguments of
 // cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
 // arguments (FColChunk: output columns per work-group, a multiple of 4 up to
-// 256; FKeySplits > 1 writes partials).
+// 256; FKeySplits > 1 writes partials; FBiasLen > 0, which needs FGroupSize 1,
+// adds FScoreBias[FBiasBase + t*FBiasRowStride + key] to each score).
 #define CAI_FLASH_LEADING_PARAMS \
   const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
   const int FDk, const int FCacheMax, const int FKeyBase, \
@@ -4578,7 +4579,9 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
   const float FScoreSoftCap, const float FInvScoreSoftCap, \
   __global const float* FX, __global const int* FRowKeyEnds
 #define CAI_FLASH_TRAILING_PARAMS \
-  __global float* FY, __global float* FPartials, __local float4* FScratch
+  __global float* FY, __global float* FPartials, __local float4* FScratch, \
+  __global const float* FScoreBias, const int FBiasBase, \
+  const int FBiasRowStride, const int FBiasLen
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
 // only: PoCL miscompiles a lane id divided by a run-time value.
@@ -4738,6 +4741,17 @@ static inline float cai_flash_score(const float Dot, const int Key,
   float sc = Dot * ScoreScale;
   if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
   return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
+}
+
+// Score plus FScoreBias[Index] (clamped into the table) when FBiasLen > 0; a
+// biased score at or below -1e8 is a masked key, as the host forward has it.
+static inline float cai_flash_add_bias(const float Score,
+  __global const float* FScoreBias, const int Index, const int FBiasLen)
+{
+  if (FBiasLen <= 0) return Score;
+  const float Biased =
+    Score + FScoreBias[clamp(Index, 0, max(FBiasLen - 1, 0))];
+  return (Biased > -1e8f) ? Biased : -1e30f;
 }
 
 // exp(Score - RowMax) in [exp(-80), 1], and exactly 0 for a masked key.
@@ -4951,6 +4965,9 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
         const int row = sy + RowLanes * i; \
         const int KeyLo = RowTable[2 * Br + row]; \
         const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
+        /* The bias row of token row t = Row0 + row (FGroupSize 1). */ \
+        const int BiasRow = FBiasBase \
+          + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride + kt + sx; \
         float PartMax = -1e30f; \
         _Pragma("unroll") \
         for (j = 0; j < 4; j++) \
@@ -4958,6 +4975,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
           s[i][j] = cai_flash_score(s[i][j], kt + sx + 16 * j, KeyLo, \
             KeyHi, Interior, KScaleAt(sx + 16 * j) * FInvSqrtDk, \
             FScoreSoftCap, FInvScoreSoftCap); \
+          s[i][j] = cai_flash_add_bias(s[i][j], FScoreBias, \
+            BiasRow + 16 * j, FBiasLen); \
           PartMax = fmax(PartMax, s[i][j]); \
         } \
         RowPartF[row * 16 + sx] = PartMax; \

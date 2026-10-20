@@ -1993,12 +1993,34 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       per-row scale on `cai_conv_implicit`, with d[o] from a resident
       sum_t w[o,t,i]^2 table times s^2). Measure the upload share on the GPU
       box first; at 1024x1024 the contraction should dominate.
-- [ ] Vision attention subclasses that override `Compute` and so lose
-      `TNNetScaledDotProductAttention`'s device path:
-      `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,
-      `TNNetWindowAttention` (Swin / MaxViT / BEiT / SwinIR / the CLAP audio
-      tower) and `TNNetT5RelPosBiasAttention`. `TNNetDotProducts`, the raw
-      contraction behind the CAI self-attention builders, has the same problem.
+- [X] `TNNetWindowAttention` (Swin / MaxViT / BEiT / SwinIR / the CLAP audio
+      tower) and `TNNetT5RelPosBiasAttention` device forward on
+      `cai_sdpa_flash`: the kernel gained an additive score bias
+      `FScoreBias[FBiasBase + t*FBiasRowStride + key]` (FGroupSize 1 only; a
+      biased score <= -1e8 counts as masked, as on the host). Window attention
+      passes its SeqLen x SeqLen bias matrix (row stride SeqLen), T5 a per-offset
+      table of 2*SeqLen-1 bucket biases (row stride -1); both re-upload after
+      `AfterWeightUpdate`. T5's cached decode stays on the host. Covered by
+      `WindowAttentionOpenCLParity` (2-3 windows x 2-3 heads, -1e9 and -100
+      shift masks, sentinels, a bias update) and `T5RelPosBiasAttentionOpenCLParity`
+      (non-causal, causal, causal + window). The extra uniform branch per score
+      in the decode flash kernel is not timed on a GPU yet.
+- [ ] The rest of the vision attention subclasses that override `Compute` and
+      so lose `TNNetScaledDotProductAttention`'s device path:
+      - `TNNetSwinV2WindowAttention`: cosine attention, so Q and K rows must be
+        L2-normalized before the dot and the scale is the per-head
+        logit_scale, not 1/sqrt(d_k). Route: a row-normalize pre-pass into a
+        packed [Qn|Kn|V] buffer (allocated in EnableOpenCL), then
+        `ComputeFlashPacked` with InvSqrtDk = logit_scale and the bias matrix
+        exactly as `TNNetWindowAttention` passes it.
+      - `TNNetSAMVisionAttention` (SAM): not an SDPA subclass; it fuses the qkv
+        projection, the padded window partition, the out projection and a
+        QUERY-DEPENDENT decomposed rel-pos bias (Q . rel_pos_h + Q . rel_pos_w),
+        so no static bias table fits. Route: the projections on the existing
+        dot-product kernels, a small kernel writing the per-window bias into a
+        SeqLen x SeqLen buffer each forward, then the flash bias argument.
+      - `TNNetDotProducts`, the raw contraction behind the CAI self-attention
+        builders.
       `TNNetSinkAttention` and `TNNetDifferentialAttention` are named in the
       decode-path group above; landing them there covers the vision builders
       that also use them.

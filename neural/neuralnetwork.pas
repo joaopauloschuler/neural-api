@@ -4616,6 +4616,14 @@ type
     // The whole forward on cai_sdpa_flash with the source bound when resident;
     // the output stays in OpenCL memory. The caller checks WillOpenCL.
     procedure ComputeFlashOpenCL();
+    // True when ComputeFlashOpenCL, with ScoreBiasTable's bias, computes
+    // exactly what this class's Compute does.
+    function FlashForwardIsExact(): boolean; virtual;
+    // Additive bias of score (t, j) = Result[Base + t*RowStride + j]; nil = none.
+    function ScoreBiasTable(out Base, RowStride: integer): TNNetVolume; virtual;
+    // Runs ComputeFlashOpenCL when WillOpenCL and returns true; otherwise marks
+    // the output host-written, downloads the source and returns false.
+    function ForwardOnOpenCL(): boolean;
     {$ENDIF}
     // True when score (query i, key j) is masked out (causal / sliding-window /
     // bidirectional-window / segment / prefix-LM). Extracted so the CPU and
@@ -4948,6 +4956,9 @@ type
     // version and count of the last upload.
     FBufRowKeyEnds: cl_mem;
     FCapRowKeyEnds: csize_t;
+    // ComputeFlashPacked's additive score bias table (grow-only).
+    FBufScoreBias: cl_mem;
+    FCapScoreBias: csize_t;
     FRowKeyEndsVersion, FRowKeyEndCnt: integer;
     // The last flash launch's tiles and key splits, test-only split count and
     // flash row threshold (0 = automatic), and the path of the last forward.
@@ -5001,7 +5012,9 @@ type
       Causal: boolean; const RowKeyEnds: array of integer;
       RowKeyEndsVersion: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-      bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean);
+      bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean;
+      bufBias: cl_mem = nil; BiasBase: integer = 0;
+      BiasRowStride: integer = 0; BiasLen: integer = 0);
     // cai_sdpa_append_kv_int8: quantizes TokenCnt source rows into the int8
     // cache at slots CacheSlot..; layout as RunAppend.
     procedure RunAppendInt8(bufSrc: cl_mem; KVHeads, TokenCnt, Dk, CacheMax,
@@ -5107,10 +5120,13 @@ type
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
     // One head over X = (TokenCnt, 1, [Q|K|V]): copies K and V into the FP32
-    // cache buffers (CacheMax = TokenCnt), then runs cai_sdpa_flash.
+    // cache buffers (CacheMax = TokenCnt), then runs cai_sdpa_flash. Score
+    // (t, j) gains pScoreBias[Base + t*RowStride + j], uploaded when Changed.
     procedure ComputeFlashPacked(X, Y: TNNetVolume; Dk, Window: integer;
       Causal: boolean; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
+      pScoreBias: TNNetVolume = nil; pScoreBiasBase: integer = 0;
+      pScoreBiasRowStride: integer = 0; pScoreBiasChanged: boolean = true);
     // The same over the int8 cache on cai_sdpa_flash_int8 (ComputeInt8's append).
     procedure ComputeFlashInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
@@ -7228,9 +7244,18 @@ type
     // Per-instance Backpropagate scratch for the per-bucket bias gradient,
     // sized FNumBuckets (fixed at Create) so pinned in SetPrevLayer.
     FgBiasBuf: array of TNeuralFloat;
+    {$IFDEF OpenCL}
+    // Bias per relative offset j - i, FBiasByOffset[(j - i) + SeqLen - 1]: the
+    // flash forward's score bias (row stride -1), refilled per forward.
+    FBiasByOffset: TNNetVolume;
+    {$ENDIF}
     procedure ComputeIncrementalT5();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure FreeBackpropScratch();
+    {$IFDEF OpenCL}
+    function FlashForwardIsExact(): boolean; override;
+    function ScoreBiasTable(out Base, RowStride: integer): TNNetVolume; override;
+    {$ENDIF}
   public
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       pNumBuckets: integer = 32; pMaxDistance: integer = 128;
@@ -7495,6 +7520,11 @@ type
   private
     FSeqLen: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    {$IFDEF OpenCL}
+    // The flash forward with the bias matrix as its score bias (rows SeqLen).
+    function FlashForwardIsExact(): boolean; override;
+    function ScoreBiasTable(out Base, RowStride: integer): TNNetVolume; override;
+    {$ENDIF}
   public
     constructor Create(d_k: integer; pSeqLen: integer); overload;
     procedure Compute(); override;
@@ -35417,13 +35447,41 @@ begin
   // ALiBi) override Compute() but inherit this device path; running it would
   // silently DROP their extra score term (cosine renorm / relative-position
   // bias / linear ALiBi bias) and return wrong results. So only ARM the device
-  // path for the EXACT base class here. A variant that ships a CORRECT offload
-  // overrides EnableOpenCL and arms FShouldOpenCL itself (see
+  // path where FlashForwardIsExact says the flash forward (plus the class's
+  // ScoreBiasTable) is exact. A variant with its own offload overrides
+  // EnableOpenCL and arms FShouldOpenCL itself (see
   // TNNetALiBiAttention.EnableOpenCL); a variant without one falls back to its
   // own correct CPU Compute() (FShouldOpenCL stays false). Coded by Claude (AI).
-  FShouldOpenCL := (Self.ClassType = TNNetScaledDotProductAttention);
+  FShouldOpenCL := FlashForwardIsExact();
   if FShouldOpenCL and (not Assigned(FFusedSDPACL)) then
     FFusedSDPACL := TNNetFusedSDPACL.Create(FNN);
+end;
+
+function TNNetScaledDotProductAttention.FlashForwardIsExact(): boolean;
+begin
+  Result := (Self.ClassType = TNNetScaledDotProductAttention);
+end;
+
+function TNNetScaledDotProductAttention.ScoreBiasTable(
+  out Base, RowStride: integer): TNNetVolume;
+begin
+  Base := 0;
+  RowStride := 0;
+  Result := nil;
+end;
+
+function TNNetScaledDotProductAttention.ForwardOnOpenCL(): boolean;
+begin
+  Result := WillOpenCL();
+  if Result then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeFlashOpenCL();
+    exit;
+  end;
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
 end;
 
 procedure TNNetScaledDotProductAttention.DisableOpenCL();
@@ -35439,7 +35497,7 @@ var
   SeqLen: integer;
 begin
   Result := Assigned(FFusedSDPACL) and FHasOpenCL and FShouldOpenCL
-    and (Self.ClassType = TNNetScaledDotProductAttention)
+    and FlashForwardIsExact()
     and (not FIsTrainable) and (not FKeepAttentionWeights)
     and (not FCacheEnabled) and Assigned(FPrevLayer)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
@@ -35455,8 +35513,11 @@ procedure TNNetScaledDotProductAttention.ComputeFlashOpenCL();
 var
   SourceBuffer: cl_mem;
   StartTime: double;
+  ScoreBias: TNNetVolume;
+  BiasBase, BiasRowStride: integer;
 begin
   StartTime := Now();
+  ScoreBias := ScoreBiasTable(BiasBase, BiasRowStride);
   if PrevOutputOnOpenCL() then
   begin
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
@@ -35469,7 +35530,9 @@ begin
   end;
   FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk, FWindow,
     FCausal, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
-    {pKeepResultOnOpenCL=}true);
+    {pKeepResultOnOpenCL=}true, ScoreBias, BiasBase, BiasRowStride,
+    {pScoreBiasChanged=}FAfterWeightUpdateHasBeenCalled);
+  if Assigned(ScoreBias) then FAfterWeightUpdateHasBeenCalled := false;
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -35641,16 +35704,7 @@ var
   HasSeg, HasSoftCap: boolean;
 begin
   {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeFlashOpenCL();
-    exit;
-  end;
-  // Every path below writes Output on the host.
-  FOutputOnOpenCL := false;
-  FOutputOnRAM := true;
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if ForwardOnOpenCL() then exit;
   if Assigned(FSegLayer) then FSegLayer.ForceOutputOnRAM();
   {$ENDIF}
   if FCacheEnabled then
@@ -40824,6 +40878,7 @@ begin
     if Assigned(FFlashKernels[Int8KV]) then
       clReleaseKernel(FFlashKernels[Int8KV]);
   if Assigned(FBufRowKeyEnds) then clReleaseMemObject(FBufRowKeyEnds);
+  if Assigned(FBufScoreBias) then clReleaseMemObject(FBufScoreBias);
   if Assigned(FBufX)        then clReleaseMemObject(FBufX);
   if Assigned(FBufK)        then clReleaseMemObject(FBufK);
   if Assigned(FBufV)        then clReleaseMemObject(FBufV);
@@ -41324,7 +41379,9 @@ procedure TNNetFusedSDPACL.RunFlash(X, Y: TNNetVolume; bufX: cl_mem;
   Window: integer; Causal: boolean; const RowKeyEnds: array of integer;
   RowKeyEndsVersion: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-  bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean);
+  bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean;
+  bufBias: cl_mem = nil; BiasBase: integer = 0;
+  BiasRowStride: integer = 0; BiasLen: integer = 0);
 var
   bufPartials, bufY, bufEnds: cl_mem;
   kFlash: cl_kernel;
@@ -41409,6 +41466,16 @@ begin
   clSetKernelArg(kFlash, NextArg, csCLMemSize, @bufY);
   clSetKernelArg(kFlash, NextArg + 1, csCLMemSize, @bufPartials);
   clSetKernelArg(kFlash, NextArg + 2, FLastScratchBytes, nil);
+  // Without a bias the kernel still needs a valid buffer to address.
+  if (BiasLen <= 0) or (bufBias = nil) then
+  begin
+    bufBias := bufX;
+    BiasLen := 0;
+  end;
+  clSetKernelArg(kFlash, NextArg + 3, csCLMemSize, @bufBias);
+  clSetKernelArg(kFlash, NextArg + 4, csLongintSize, @BiasBase);
+  clSetKernelArg(kFlash, NextArg + 5, csLongintSize, @BiasRowStride);
+  clSetKernelArg(kFlash, NextArg + 6, csLongintSize, @BiasLen);
   FKernel.RunKernel2D(kFlash, csFusedSDPAFlashLanes,
     KVHeads * RowTiles * KeySplits * ColChunks, csFusedSDPAFlashLanes, 1);
   if KeySplits > 1 then
@@ -41438,10 +41505,12 @@ end;
 procedure TNNetFusedSDPACL.ComputeFlashPacked(X, Y: TNNetVolume;
   Dk, Window: integer; Causal: boolean;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
+  pScoreBias: TNNetVolume = nil; pScoreBiasBase: integer = 0;
+  pScoreBiasRowStride: integer = 0; pScoreBiasChanged: boolean = true);
 var
-  bufX: cl_mem;
-  TokenCnt: integer;
+  bufX, bufBias: cl_mem;
+  TokenCnt, BiasLen: integer;
   CacheBytes: csize_t;
 begin
   TokenCnt := X.SizeX;
@@ -41449,12 +41518,22 @@ begin
   bufX := StepSourceBuffer(X, pExternalSrc);
   FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, CacheBytes);
   FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, CacheBytes);
+  bufBias := nil;
+  BiasLen := 0;
+  if Assigned(pScoreBias) then
+  begin
+    // Blocking: the caller may change the host table once this returns.
+    bufBias := FKernel.EnsureWriteBuffer(FBufScoreBias, FCapScoreBias,
+      pScoreBias, pScoreBiasChanged, {pBlocking=}true);
+    BiasLen := pScoreBias.Size;
+  end;
   RunAppend(bufX, FBufK, FBufV, {KVHeads=}1, TokenCnt, Dk,
     {CacheMax=}TokenCnt, {CacheSlot=}0, {QW=}Dk, {KVOffset=}Dk, X.Depth);
   RunFlash(X, Y, bufX, {Int8KV=}false, {QHeads=}1, {KVHeads=}1,
     {GroupSize=}1, Dk, {CacheMax=}TokenCnt, {CacheSlot=}0, Window, Causal,
     [], 0, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, FBufK, FBufV,
-    pKeepResultOnOpenCL);
+    pKeepResultOnOpenCL, bufBias, pScoreBiasBase, pScoreBiasRowStride,
+    BiasLen);
 end;
 
 procedure TNNetFusedSDPACL.ComputeFlashInt8(X, Y: TNNetVolume;
@@ -46352,6 +46431,7 @@ begin
   // causal flag, window).
   FStruct[3] := FNumBuckets;
   FStruct[4] := FMaxDistance;
+  {$IFDEF OpenCL} FBiasByOffset := TNNetVolume.Create(); {$ENDIF}
 end;
 
 // EXACT port of the T5 relative_position_bucket function (Raffel et al. 2020;
@@ -46425,9 +46505,37 @@ begin
   for Ofs := NegSeqLenM1 to SeqLenM1 do
     FBucketOfs[Ofs + SeqLen - 1] :=
       RelativePositionBucket(Ofs, not FCausal, FNumBuckets, FMaxDistance);
+  {$IFDEF OpenCL} FBiasByOffset.ReSize(2 * SeqLen - 1, 1, 1); {$ENDIF}
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then SetLength(FgBiasBuf, FNumBuckets);
 end;
+
+{$IFDEF OpenCL}
+function TNNetT5RelPosBiasAttention.FlashForwardIsExact(): boolean;
+begin
+  // Compute applies no soft-cap; the bucket rows match the source width.
+  Result := (Self.ClassType = TNNetT5RelPosBiasAttention)
+    and (FScoreSoftCap = 0) and Assigned(FPrevLayer)
+    and (FBiasByOffset.Size = 2 * FPrevLayer.FOutput.SizeX - 1)
+    and (Length(FBucketOfs) = FBiasByOffset.Size) and (FNeurons.Count > 0)
+    and (FNeurons[0].FWeights.Size = FNumBuckets);
+end;
+
+function TNNetT5RelPosBiasAttention.ScoreBiasTable(
+  out Base, RowStride: integer): TNNetVolume;
+var
+  OffsetPos, MaxOffsetPos: integer;
+  Bias: TNeuralFloatArrPtr;
+begin
+  Bias := FNeurons[0].FWeights.GetRawPtr(0, 0);
+  MaxOffsetPos := FBiasByOffset.Size - 1;
+  for OffsetPos := 0 to MaxOffsetPos do
+    FBiasByOffset.FData[OffsetPos] := Bias^[FBucketOfs[OffsetPos]];
+  Base := FPrevLayer.FOutput.SizeX - 1;
+  RowStride := -1;
+  Result := FBiasByOffset;
+end;
+{$ENDIF}
 
 procedure TNNetT5RelPosBiasAttention.FreeBackpropScratch();
 begin
@@ -46437,6 +46545,7 @@ end;
 destructor TNNetT5RelPosBiasAttention.Destroy();
 begin
   FreeBackpropScratch();
+  {$IFDEF OpenCL} FBiasByOffset.Free; {$ENDIF}
   inherited Destroy();
 end;
 
@@ -46471,7 +46580,7 @@ var
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   Bias: TNeuralFloatArrPtr;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL} if ForwardOnOpenCL() then exit; {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncrementalT5();
@@ -47981,6 +48090,24 @@ begin
   Result := FNeurons[0].FWeights.FData[QueryI * FSeqLen + KeyJ];
 end;
 
+{$IFDEF OpenCL}
+function TNNetWindowAttention.FlashForwardIsExact(): boolean;
+begin
+  // Compute applies no soft-cap and no mask beyond the bias matrix.
+  Result := (Self.ClassType = TNNetWindowAttention) and (FScoreSoftCap = 0)
+    and (not FCausal) and (FWindow = 0) and (FNeurons.Count > 0)
+    and (FNeurons[0].FWeights.Size = FSeqLen * FSeqLen);
+end;
+
+function TNNetWindowAttention.ScoreBiasTable(
+  out Base, RowStride: integer): TNNetVolume;
+begin
+  Base := 0;
+  RowStride := FSeqLen;
+  Result := FNeurons[0].FWeights;
+end;
+{$ENDIF}
+
 procedure TNNetWindowAttention.Compute();
 const
   cMaskFloor = -1e8; // same all-masked-row floor as the parent
@@ -47994,8 +48121,8 @@ var
   Prev: TNNetVolume;
   OutPtr, Bias, BiasRow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} if ForwardOnOpenCL() then exit; {$ENDIF}
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;

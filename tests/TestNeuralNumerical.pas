@@ -755,6 +755,8 @@ type
     // CPU mask/softmax gap. Also asserts the SAFETY fallback: the sibling
     // variants that DON'T ship a correct offload must NOT arm the device path.
     procedure ALiBiAttentionOpenCLParity;
+    procedure WindowAttentionOpenCLParity;
+    procedure T5RelPosBiasAttentionOpenCLParity;
     // OpenCL forward offload parity (vs CPU) for the three remaining score-math
     // SDPA variants: cosine-similarity (Q/K L2-renorm on the host before the
     // score GEMM), DeBERTa disentangled (c2p+p2c position bias in the CPU gap),
@@ -77893,7 +77895,7 @@ var
   XData, OutCPU: TNNetVolume;
   InputLayer: TNNetLayer;
   Attn: TNNetALiBiAttention;
-  NoOffload: TNNetT5RelPosBiasAttention;
+  NoOffload: TNNetSwinV2WindowAttention;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   i: integer;
@@ -77943,18 +77945,285 @@ begin
   end;
 
   // SAFETY guard: a variant WITHOUT a correct offload must NOT arm the device
-  // path (else it would silently run the wrong inherited plain-SDPA kernel).
+  // path (else it would silently run the wrong inherited flash forward).
   RandSeed := 424242;
   NN := TNNet.Create();
   try
     InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
-    NoOffload := TNNetT5RelPosBiasAttention.Create(Dk, {CausalMask}true);
+    NoOffload := TNNetSwinV2WindowAttention.Create(Dk, SeqLen);
     NN.AddLayerAfter(NoOffload, InputLayer);
     NN.EnableOpenCL(PlatformId, DeviceId);
-    AssertTrue('T5RelPosBias variant must fall back to CPU (ShouldOpenCL=false)',
+    AssertTrue('SwinV2 window attention must fall back to CPU (ShouldOpenCL=false)',
       not NoOffload.ShouldOpenCL);
   finally
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Windows x Heads TNNetWindowAttention layers over one packed input, wired as
+// the Swin builders do (crop a window, split a head's Q|K|V, concat back).
+function BuildWindowAttentionParityNet(SeqLen, Dk, Heads, Windows: integer;
+  out AttnLayers: TNNetLayerRefArr): TNNet;
+var
+  WinSlice: TNNetLayer;
+  HeadOuts, WindowOuts: TNNetLayerRefArr;
+  WindowPos, HeadPos, MaxWindowPos, MaxHeadPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(Windows * SeqLen, 1, Heads * 3 * Dk));
+  SetLength(AttnLayers, Windows * Heads);
+  SetLength(HeadOuts, Heads);
+  SetLength(WindowOuts, Windows);
+  MaxWindowPos := Windows - 1;
+  MaxHeadPos := Heads - 1;
+  for WindowPos := 0 to MaxWindowPos do
+  begin
+    WinSlice := Result.AddLayerAfter(
+      TNNetCrop.Create(WindowPos * SeqLen, 0, SeqLen, 1), 0);
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      Result.AddLayerAfter(
+        TNNetSplitChannels.Create(HeadPos * 3 * Dk, 3 * Dk), WinSlice);
+      HeadOuts[HeadPos] := Result.AddLayer(
+        TNNetWindowAttention.Create(Dk, SeqLen));
+      AttnLayers[WindowPos * Heads + HeadPos] := HeadOuts[HeadPos];
+    end;
+    WindowOuts[WindowPos] := Result.AddLayer(TNNetDeepConcat.Create(HeadOuts));
+  end;
+  Result.AddLayer(TNNetConcat.Create(Windows * SeqLen, 1, Heads * Dk,
+    WindowOuts));
+  Result.SetTrainable(False, False);
+end;
+
+// Relative-position-like bias in [-1, 1]; windows past the first add a
+// cyclic-shift mask (MaskValue) on pairs from different regions.
+procedure FillWindowAttentionBias(Bias: TNNetVolume; SeqLen, LayerPos,
+  WindowPos: integer; MaskValue: TNeuralFloat);
+var
+  QueryPos, KeyPos, MaxTokenPos: integer;
+begin
+  MaxTokenPos := SeqLen - 1;
+  for QueryPos := 0 to MaxTokenPos do
+    for KeyPos := 0 to MaxTokenPos do
+    begin
+      Bias.Raw[QueryPos * SeqLen + KeyPos] :=
+        Sin((QueryPos - KeyPos) * 0.7 + LayerPos * 1.3);
+      if (WindowPos > 0) and
+        (((QueryPos * 3) div SeqLen) <> ((KeyPos * 3) div SeqLen)) then
+        Bias.Raw[QueryPos * SeqLen + KeyPos] :=
+          Bias.Raw[QueryPos * SeqLen + KeyPos] + MaskValue;
+    end;
+end;
+{$ENDIF}
+
+// TNNetWindowAttention runs on cai_sdpa_flash with its bias matrix as the
+// score bias. Several windows (one unshifted, the rest masked with -1e9 or
+// HF's -100) and heads must match the CPU forward, keep their outputs resident
+// and pick up a bias update.
+procedure TTestNeuralNumerical.WindowAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // SeqLen (window tokens), Dk, Heads, Windows.
+  csShapes: array[0..1, 0..3] of integer = ((49, 8, 2, 2), (36, 32, 3, 3));
+  csMaskValues: array[0..1] of TNeuralFloat = (-1e9, -100);
+var
+  NN, NNCPU: TNNet;
+  Input, Bias: TNNetVolume;
+  AttnLayers, AttnCPU: TNNetLayerRefArr;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, SeqLen, Heads, LayerPos, MaxLayerPos, Pos, MaxPos: integer;
+  SentinelSurvivors, SentinelTotal, GPUForwards: integer;
+  MaxDiff, RefreshDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    SeqLen := csShapes[ShapePos, 0];
+    Heads := csShapes[ShapePos, 2];
+    NN := BuildWindowAttentionParityNet(SeqLen, csShapes[ShapePos, 1], Heads,
+      csShapes[ShapePos, 3], AttnLayers);
+    NNCPU := BuildWindowAttentionParityNet(SeqLen, csShapes[ShapePos, 1], Heads,
+      csShapes[ShapePos, 3], AttnCPU);
+    Input := TNNetVolume.Create(SeqLen * csShapes[ShapePos, 3], 1,
+      Heads * 3 * csShapes[ShapePos, 1]);
+    Bias := TNNetVolume.Create(SeqLen * SeqLen, 1, 1);
+    try
+      MaxLayerPos := High(AttnLayers);
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        FillWindowAttentionBias(Bias, SeqLen, LayerPos, LayerPos div Heads,
+          csMaskValues[ShapePos]);
+        TNNetWindowAttention(AttnLayers[LayerPos]).SetBiasMatrix(Bias);
+        TNNetWindowAttention(AttnCPU[LayerPos]).SetBiasMatrix(Bias);
+      end;
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 1.5 * Sin(Pos * 0.37) + 0.4 * Cos(Pos * 1.7);
+      NNCPU.Compute(Input);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      for LayerPos := 0 to MaxLayerPos do
+        AttnLayers[LayerPos].Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      SentinelTotal := 0;
+      GPUForwards := 0;
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        Inc(GPUForwards, AttnLayers[LayerPos].ForwardGPUCnt);
+        MaxPos := AttnLayers[LayerPos].Output.Size - 1;
+        Inc(SentinelTotal, MaxPos + 1);
+        for Pos := 0 to MaxPos do
+          if AttnLayers[LayerPos].Output.Raw[Pos] = csSentinel then
+            Inc(SentinelSurvivors);
+      end;
+      MaxDiff := MaxAbsDiffToOutput(NNCPU.GetLastLayer.Output,
+        NN.GetLastLayer.Output);
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        AttnLayers[LayerPos].ForceOutputOnRAM();
+        MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(AttnCPU[LayerPos].Output,
+          AttnLayers[LayerPos].Output));
+      end;
+
+      // A bias update must reach the OpenCL copy.
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        FillWindowAttentionBias(Bias, SeqLen, LayerPos + 5, LayerPos div Heads,
+          csMaskValues[ShapePos]);
+        TNNetWindowAttention(AttnLayers[LayerPos]).SetBiasMatrix(Bias);
+        TNNetWindowAttention(AttnCPU[LayerPos]).SetBiasMatrix(Bias);
+      end;
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      RefreshDiff := MaxAbsDiffToOutput(NNCPU.GetLastLayer.Output,
+        NN.GetLastLayer.Output);
+      WriteLn('  WindowAttention OpenCL seq=', SeqLen, ' dk=',
+        csShapes[ShapePos, 1], ' heads=', Heads, ' windows=',
+        csShapes[ShapePos, 3], ': max|diff|=', MaxDiff:0:9, ' after update=',
+        RefreshDiff:0:9, ' sentinels=', SentinelSurvivors, '/', SentinelTotal);
+      AssertEquals('every TNNetWindowAttention forward ran on OpenCL',
+        2 * Length(AttnLayers), GPUForwards);
+      AssertEquals('the attention outputs are bound, not downloaded',
+        SentinelTotal, SentinelSurvivors);
+      AssertTrue('WindowAttention OpenCL vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('WindowAttention OpenCL vs CPU after a bias update: ' +
+        'max |diff| = ' + FloatToStr(RefreshDiff) + ' must be < 1e-4',
+        RefreshDiff < 1e-4);
+    finally
+      Bias.Free;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetT5RelPosBiasAttention runs on cai_sdpa_flash with its bucket bias as a
+// per-offset score bias (row stride -1): non-causal, causal and causal with a
+// sliding window must match the CPU forward and pick up a bias update.
+procedure TTestNeuralNumerical.T5RelPosBiasAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40;
+  // Causal (0/1), Window.
+  csCases: array[0..2, 0..1] of integer = ((0, 0), (1, 0), (1, 9));
+var
+  NN, NNCPU: TNNet;
+  Input: TNNetVolume;
+  Attn, AttnCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, Pos, MaxPos, SentinelSurvivors: integer;
+  MaxDiff, RefreshDiff: TNeuralFloat;
+
+  function BuildNet(out AttnLayer: TNNetLayer): TNNet;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    AttnLayer := Result.AddLayer(TNNetT5RelPosBiasAttention.Create(Dk,
+      csCases[CasePos, 0] = 1, 16, 40, csCases[CasePos, 1]));
+    Result.AddLayer(TNNetReLU.Create());
+    Result.SetTrainable(False, False);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to High(csCases) do
+  begin
+    NN := BuildNet(Attn);
+    NNCPU := BuildNet(AttnCPU);
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      SetRandomNeuronWeights(Attn, 0, 0, 2);
+      AttnCPU.Neurons[0].Weights.Copy(Attn.Neurons[0].Weights);
+      AttnCPU.FlushWeightCache();
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 0.9 * Sin(Pos * 0.3) + 0.3 * Cos(Pos * 0.11);
+      NNCPU.Compute(Input);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      Attn.Output.Fill(-7777);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      MaxPos := Attn.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        if Attn.Output.Raw[Pos] = -7777 then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(NNCPU.GetLastLayer.Output,
+        NN.GetLastLayer.Output);
+      Attn.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(AttnCPU.Output, Attn.Output));
+
+      SetRandomNeuronWeights(Attn, 0, 0, 3);
+      Attn.FlushWeightCache();
+      AttnCPU.Neurons[0].Weights.Copy(Attn.Neurons[0].Weights);
+      AttnCPU.FlushWeightCache();
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      Attn.ForceOutputOnRAM();
+      RefreshDiff := MaxAbsDiffToOutput(AttnCPU.Output, Attn.Output);
+      WriteLn('  T5RelPosBiasAttention OpenCL causal=', csCases[CasePos, 0],
+        ' window=', csCases[CasePos, 1], ': max|diff|=', MaxDiff:0:9,
+        ' after update=', RefreshDiff:0:9, ' sentinels=', SentinelSurvivors,
+        '/', MaxPos + 1);
+      AssertEquals('every T5 forward ran on OpenCL', 3, Attn.ForwardGPUCnt);
+      AssertEquals('the T5 output is bound, not downloaded', MaxPos + 1,
+        SentinelSurvivors);
+      AssertTrue('T5RelPosBias OpenCL vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('T5RelPosBias OpenCL vs CPU after a bias update: max |diff| = ' +
+        FloatToStr(RefreshDiff) + ' must be < 1e-4', RefreshDiff < 1e-4);
+    finally
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
   end;
 end;
 {$ELSE}
