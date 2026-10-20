@@ -600,6 +600,9 @@ type
     // The same family chained resident with ForceOpenCL off: sentinels,
     // transfer counts, and a packed-table and a scalar weight refresh.
     procedure TestLearnableActivationResidentOpenCLParity;
+    // TNNetGRN chained resident (cai_grn_table + ChannelAffine) at two depths,
+    // then after a gamma/beta update, against a host-only twin net.
+    procedure TestGRNOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -71934,6 +71937,123 @@ begin
     Expected.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Builds Input -> TNNetGRN -> TNNetReLU with random gamma/beta (inference only).
+function BuildGRNParityNet(SizeX, SizeY, Depth: integer;
+  out GRNLayer: TNNetLayer): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth));
+  GRNLayer := Result.AddLayer(TNNetGRN.Create());
+  Result.AddLayer(TNNetReLU.Create());
+  Result.SetTrainable(False, False);
+  SetRandomNeuronWeights(GRNLayer, 0, 0.5, 2); // gamma
+  SetRandomNeuronWeights(GRNLayer, 1, 0, 1);   // beta
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGRNOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // Depth 40 leaves lanes idle; depth 300 gives some lanes two channels.
+  csShapes: array[0..1, 0..2] of integer = ((6, 5, 40), (3, 4, 300));
+var
+  NN, NNCPU: TNNet;
+  Input, OutCPU, LastCPU: TNNetVolume;
+  GRNLayer, GRNCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff, RefreshDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    RandSeed := 20261022 + ShapePos;
+    NN := BuildGRNParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], GRNLayer);
+    NNCPU := BuildGRNParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], GRNCPU);
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    OutCPU := TNNetVolume.Create();
+    LastCPU := TNNetVolume.Create();
+    try
+      GRNCPU.Neurons[0].Weights.Copy(GRNLayer.Neurons[0].Weights);
+      GRNCPU.Neurons[1].Weights.Copy(GRNLayer.Neurons[1].Weights);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 2 * Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7);
+      NNCPU.Compute(Input);
+      OutCPU.Copy(GRNCPU.Output);
+      LastCPU.Copy(NNCPU.GetLastLayer.Output);
+
+      // ForceOpenCL off: the resident input carries GRN and ReLU to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      GRNLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to MaxPos do
+        if GRNLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(LastCPU, NN.GetLastLayer.Output);
+      GRNLayer.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(OutCPU, GRNLayer.Output));
+
+      // A gamma/beta update must reach the device table.
+      SetRandomNeuronWeights(GRNLayer, 0, -0.5, 2);
+      SetRandomNeuronWeights(GRNLayer, 1, 0.2, 1);
+      GRNLayer.FlushWeightCache();
+      GRNCPU.Neurons[0].Weights.Copy(GRNLayer.Neurons[0].Weights);
+      GRNCPU.Neurons[1].Weights.Copy(GRNLayer.Neurons[1].Weights);
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      GRNLayer.ForceOutputOnRAM();
+      RefreshDiff := MaxAbsDiffToOutput(GRNCPU.Output, GRNLayer.Output);
+      WriteLn('  GRN OpenCL ', csShapes[ShapePos, 0], 'x', csShapes[ShapePos, 1],
+        'x', csShapes[ShapePos, 2], ': max|diff|=', MaxDiff:0:9,
+        ' after update=', RefreshDiff:0:9, ' sentinels=', SentinelSurvivors,
+        '/', Input.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('TNNetGRN ran every forward on OpenCL', 3, GRNLayer.ForwardGPUCnt);
+      AssertEquals('the GRN output is bound, not downloaded', Input.Size,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('GRN OpenCL vs CPU: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('GRN OpenCL vs CPU after a weight update: max |diff| = ' +
+        FloatToStr(RefreshDiff) + ' must be < 1e-4', RefreshDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      LastCPU.Free;
+      OutCPU.Free;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
   end;
 end;
 {$ELSE}

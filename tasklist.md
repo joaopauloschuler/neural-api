@@ -2000,12 +2000,18 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       the open FFT denormal-trap item, since the device path would move that
       math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
-- [ ] `TNNetGRN` device forward (ConvNeXt, RIFE, StyleGAN2, SAM), the last
+- [X] `TNNetGRN` device forward (ConvNeXt, RIFE, StyleGAN2, SAM), the last
       conv-stack member of the per-channel glue. It needs a per-channel
       spatial L2 reduction (Gx[c] = ||X[:,:,c]||) and the channel mean of Gx
       before an elementwise tail, so it is not a `cai_activation` opcode. First
       check whether `cai_group_norm`'s per-group statistics (groups = Depth)
       can supply the per-channel sum of squares.
+      DONE: `cai_group_norm` cannot (it keeps its statistics in local memory and
+      writes only the normalized output). A new one-work-group `cai_grn_table`
+      writes the coef|beta table on `cai_activation`'s queue, and the existing
+      ChannelAffine opcode 46 does the tail; inference only, resident in and out.
+      Follow-up: the table kernel is one work-group, so on a big map (56x56x384)
+      it runs on one compute unit; split positions across groups if it shows up.
 - [ ] Diffusion-step conditioning recomputed on every denoise step:
       `TNNetSinusoidalTimeEmbedding`, `TNNetLearnedPositionalEmbedding` and
       `TNNetSoftPrompt`. Individually small; they matter because a sampler runs

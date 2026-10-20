@@ -2802,6 +2802,60 @@ __kernel void cai_group_norm
   }
 }
 
+// Global Response Normalization table (TNNetGRN forward, ConvNeXt-V2). From one
+// depth-contiguous volume of FNumPositions positions x FDepth channels it writes
+// the cai_activation ChannelAffine table (opcode 46), 2*FDepth long:
+//   Gx[c]          = sqrt(sum_p x[p,c]^2 + FEps)
+//   FTable[c]      = 1 + gamma[c] * Gx[c] / mean_c(Gx)
+//   FTable[D + c]  = beta[c]
+// so cai_activation then computes y = x * FTable[c] + FTable[D + c]. FWeights is
+// gamma|beta packed (2*FDepth). ONE work-group (a power-of-two local size, with
+// FScratch = get_local_size(0) floats of __local memory): lane l owns channels
+// l, l+lsize, ..., so adjacent lanes read adjacent addresses. Gx >= sqrt(FEps) >
+// 0, so the channel mean is never zero. Forward-only.
+__kernel void cai_grn_table
+(
+  const int FNumPositions,
+  const int FDepth,
+  const float FEps,
+  __global const float* FWeights,
+  __global const float* FX,
+  __global float* FTable,
+  __local float* FScratch
+)
+{
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s;
+  float gxSum = 0.0f;
+  for (int c = lid; c < FDepth; c += lsize)
+  {
+    float ss = 0.0f;
+    for (int p = 0; p < FNumPositions; p++)
+    {
+      const float v = FX[p * FDepth + c];
+      ss = mad(v, v, ss);
+    }
+    const float gx = sqrt(ss + FEps);
+    FTable[c] = gx;
+    gxSum += gx;
+  }
+  FScratch[lid] = gxSum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float invMean = (float)FDepth / FScratch[0];
+  // Each lane rewrites only the Gx entries it wrote above.
+  for (int c = lid; c < FDepth; c += lsize)
+  {
+    FTable[c] = mad(FWeights[c], FTable[c] * invMean, 1.0f);
+    FTable[FDepth + c] = FWeights[FDepth + c];
+  }
+}
+
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
 // The input volume is laid out depth-axis contiguous in the TVolume convention:
 // element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride
