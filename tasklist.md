@@ -676,7 +676,11 @@ rather than acted on.
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
-      offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
+      offload. PARTLY LANDED: `--gpu-fp16` narrows the activation (B operand)
+      and the split-K partials to half for the int8/int4 GEMV/GEMM
+      (`cai_dot_product_int8_h`, `cai_f32_to_half`, `cai_im2col_h`); user-measured
+      +10.2% decode on the 27B. What remains below is the FP32-weight path
+      (half weight buffers for non-quantized nets). ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
       "Half-precision Floating-point support (n/a)"). The detection + opt-in
       buffer/kernel path can be written and the FP32-fallback verified, but the
@@ -1958,6 +1962,26 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       per token, but the router sits between two resident MoE banks, so running
       it on the host costs two transfers per token. Only worth landing together
       with the gate/up bank item above.
+- [ ] `--gpu-fp16`: narrow each resident FP32 source to half ONCE per forward,
+      not once per consumer. `TDotProductSharedKernel.PrepareInt8BOperand` calls
+      `CastBOperandToFP16` (`cai_f32_to_half`) into the layer's own
+      `FInputBufferBsFP16` on every forward, so consumers sharing one source
+      each re-cast it: in a Qwen3.5/3.8 block the attention norm feeds Q/K/V and
+      the post-attention norm feeds gate/up, which is five casts (and five half
+      buffers) for two distinct sources, up to ~337 extra launches per token on
+      the 27B. The user's 27B A/B (2026-08-24) showed host enqueue is now the
+      limit (+12% enqueue in FP16 mode, `TNNetPointwiseConvLinear` +31%), so
+      launch count is what pays. Proposed: a net-level cache of the narrowed
+      copy keyed by source `cl_mem` plus a version counter the producing layer
+      bumps when it rewrites its output; consumers bind the cached half buffer
+      instead of casting. Rejected alternative: producers emitting a half
+      output directly (larger, and non-int8 consumers still need the FP32
+      copy). Traps: the per-layer queues of `--no-gpu-shared-kernel` need an
+      event or the shared queue between the cast and every reader; output
+      sharing by liveness (`CanShareOpenCLOutput`) reuses a `cl_mem` across
+      producers, so the key must not be the buffer alone. Test: PoCL parity of
+      a two-consumer net with the cache on vs off, plus a launch-count check;
+      the throughput number comes from the GPU box.
 
 ### Real device-side work still running on the host
 
@@ -1974,8 +1998,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       `TNNetScaledDotProductAttention`'s device path:
       `TNNetGptOssSinkAttention` (GPT-OSS is a live importer, and the sink is
       `TNNetFusedSDPA` plus one per-head scalar, so it should reuse the fused
-      decode kernels), `TNNetDifferentialAttention` and `TNNetWindowAttention`
-      (Swin). Take the sink first.
+      decode kernels) and `TNNetDifferentialAttention` (`TNNetWindowAttention`
+      is in the vision attention item below). Take the sink first.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and the
       CAUSAL half of `TNNetLinearAttention`. COUPLED, not independent: each is a
       strict per-token scan today, so there is no GEMM-shaped kernel to offload
@@ -2299,9 +2323,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Kink-region test parametric helper: with Clamp / HardShrink /
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
       "no-central-difference, hand-picked kink convention" pattern
-      repeats. Capture as `AssertKinkDerivative(layer, x_kink, expected_dydx)`.
-- [ ] TNNetHardShrink / TNNetSoftShrink kink-region tests at hand-picked
-      inputs (no central differences).
+      repeats. Capture as `AssertKinkDerivative(layer, x_kink, expected_dydx)`
+      and use it first for the missing TNNetHardShrink / TNNetSoftShrink
+      kink-region tests at hand-picked inputs (no central differences).
 - [ ] FP-exception robustness for TNNetSoftSign / TNNetESwish at truly extreme
       inputs (surfaced 2026-05-31 while writing the saturation tests above):
       both raise a HARDWARE FP exception rather than returning a finite value
