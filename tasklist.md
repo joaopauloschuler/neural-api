@@ -614,9 +614,11 @@ rather than acted on.
   - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
         weights are large / not redistributable; importer uses the canonical
         NAFNet state_dict key scheme so a real checkpoint should drop in).
-  - [ ] PNG input/output in examples/ImageRestoration (the example uses
+  - [X] PNG input/output in examples/ImageRestoration (the example uses
         deterministic synthetic images + PPM; the PNG reader/writer already
         exists via `LoadImageFromFileIntoVolume` in neuraldatasets.pas).
+        Landed: `--input FILE` / `--output FILE`, [0, 1] RGB pixels, any image
+        size via the new `TNAFNetConfig.InputSizeY` (pad to 2^levels, crop back).
   - [ ] NAFBlock dropout + the wider official width/block configs are wired by
         config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer follow-ups

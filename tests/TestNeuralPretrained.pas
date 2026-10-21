@@ -1103,6 +1103,7 @@ type
     procedure TestRRDBNetParityScale2;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
+    procedure TestNAFNetNonSquareInput;
     procedure TestLaMaParity;
     procedure TestLaMaRejectsUnpaddedInput;
     procedure TestRIFEConfigFromJSONFile;
@@ -44250,6 +44251,42 @@ begin
   AssertEquals('dec levels', 1, Length(Config.DecBlkNums));
   AssertEquals('dec[0] blocks', 1, Config.DecBlkNums[0]);
   AssertEquals('input_size', 8, Config.InputSize);
+  AssertEquals('InputSizeY 0 = square', 0, Config.InputSizeY);
+end;
+
+// BuildNAFNetFromSafeTensorsEx with InputSize 12 and InputSizeY 6 builds a
+// 12x6 net whose restored output keeps that shape and stays finite.
+procedure TTestNeuralPretrained.TestNAFNetNonSquareInput;
+var
+  NN: TNNet;
+  Config: TNAFNetConfig;
+  Image, Output: TNNetVolume;
+  ElementPos: integer;
+begin
+  Config := ReadNAFNetConfigFromJSONFile(
+    FixturePath('tiny_nafnet_config.json'));
+  Config.InputSize := 12;
+  Config.InputSizeY := 6;
+  NN := BuildNAFNetFromSafeTensorsEx(FixturePath('tiny_nafnet.safetensors'),
+    Config, {pTrainable=}false);
+  Image := TNNetVolume.Create(12, 6, Config.ImgChannel);
+  try
+    AssertEquals('input width', 12, NN.Layers[0].Output.SizeX);
+    AssertEquals('input height', 6, NN.Layers[0].Output.SizeY);
+    for ElementPos := 0 to Image.Size - 1 do
+      Image.FData[ElementPos] := ((ElementPos * 37) mod 101) / 100;
+    NN.Compute(Image);
+    Output := NN.GetLastLayer().Output;
+    AssertEquals('output width', 12, Output.SizeX);
+    AssertEquals('output height', 6, Output.SizeY);
+    AssertEquals('output channels', Config.ImgChannel, Output.Depth);
+    for ElementPos := 0 to Output.Size - 1 do
+      AssertFalse('finite output', IsNan(Output.FData[ElementPos]) or
+        IsInfinite(Output.FData[ElementPos]));
+  finally
+    Image.Free;
+    NN.Free;
+  end;
 end;
 
 // Parity test for the NAFNet image-restoration importer

@@ -46,7 +46,25 @@ out = y + gamma .* x2
 ```
 ./ImageRestoration                          # uses the committed pico fixture
 ./ImageRestoration model.safetensors [config.json]   # your own checkpoint
+./ImageRestoration model.safetensors --input noisy.png --output restored.png
 ```
+
+| option | meaning | default |
+| --- | --- | --- |
+| `model.safetensors [config.json]` | checkpoint and its config (positional; config defaults to the `config.json` beside the checkpoint) | the pico fixture |
+| `--input FILE` | restore this image instead of the synthetic one (PNG, JPEG, BMP, TIFF, ... via `LoadImageFromFileIntoVolume`, `neuraldatasets.pas`); no synthetic noise is added | — |
+| `--output FILE` | where the restored image goes; the format comes from the extension (`SaveImageFromVolumeIntoFile`: PNG, BMP, JPEG, PPM, ...) | `nafnet_restored.ppm` |
+
+Pixels enter the net as RGB in [0, 1] (`/255`), the official NAFNet
+convention, and leave it the same way (`*255`, clipped to 0..255 on save).
+With `--input`, the example builds the net at the image's own size instead of
+`input_size`: each side is rounded up to a multiple of `2^levels` (levels =
+`len(enc_blk_nums)`, for the stride-2 down convs), the image is zero-padded on
+the right and bottom as the official `check_image_size` does, and the output
+is cropped back. Non-square images are fine (`TNAFNetConfig.InputSizeY`).
+Memory and time grow with the image area. The ASCII preview is printed only
+for images of at most 64x64 pixels. fcl-image's PNM reader fails on P6 files
+(including the ones this example writes), so use PNG for `--input`.
 
 No network access is required: the official NAFNet checkpoints are large and not
 obtainable offline, so — exactly like the repo's RRDBNet / VAE-decoder pico
@@ -57,9 +75,10 @@ and parity-checked `< 1e-4` against a float64 numpy oracle in
 are random (not trained to denoise), this is a **wiring / throughput smoke
 demo**: it builds the net, adds synthetic Gaussian noise to a deterministic test
 image, runs the restoration forward pass, writes `nafnet_noisy.ppm` /
-`nafnet_restored.ppm` plus an ASCII preview, and reports the round-trip RMSE.
-Point it at a real `.safetensors` (+ `config.json` sibling) to restore with your
-own trained checkpoint.
+`nafnet_restored.ppm` (or the `--output` file) plus an ASCII preview, and
+reports the RMSE before and after. Point it at a real `.safetensors` (+
+`config.json` sibling) to restore with your own trained checkpoint, and add
+`--input FILE` to restore a real image.
 
 Pure CPU, well under a second on the fixture.
 
@@ -73,7 +92,7 @@ Pure CPU, well under a second on the fixture.
 | `enc_blk_nums`   | NAFBlocks per encoder stage (list)       | `[1]`   |
 | `middle_blk_num` | NAFBlocks in the bottleneck              | 1       |
 | `dec_blk_nums`   | NAFBlocks per decoder stage (list)       | `[1]`   |
-| `input_size`     | input grid H=W for the `Input` layer     | —       |
+| `input_size`     | input grid H=W for the `Input` layer (`--input` replaces it with the image size) | —       |
 
 `enc_blk_nums` and `dec_blk_nums` must have the same length (one entry per
 U-Net level).

@@ -24,16 +24,22 @@ tests/TestNeuralPretrained.pas). The pico net is random (not trained to
 denoise), so this is a wiring/throughput SMOKE demo: it builds the net, adds
 synthetic Gaussian noise to a deterministic test image, runs the restoration
 forward pass, and reports the round-trip. Pass a real .safetensors (+ config.json
-sibling) to restore with your own trained checkpoint.
+sibling) to restore with your own trained checkpoint, and --input FILE to
+restore a real image (PNG, JPEG, BMP, PPM, ...) instead of the synthetic one.
+Pixels enter the net in [0, 1] RGB, as the official NAFNet.
 
 USAGE
-  ./ImageRestoration                 use the committed pico fixture
-  ./ImageRestoration model.safetensors [config.json]
-                                     use a real checkpoint
+  ./ImageRestoration [model.safetensors [config.json]]
+                     [--input FILE] [--output FILE]
+  No checkpoint: the committed pico fixture. --input FILE: restore this image
+  (no synthetic noise); the net is built at its size, padded on the right and
+  bottom to a multiple of 2^levels, and the output is cropped back.
 
 OUTPUT
-  Writes nafnet_noisy.ppm and nafnet_restored.ppm (P6 color images) and prints
-  the config plus a small ASCII intensity preview of input / noisy / restored.
+  The restored image goes to --output (format from the extension; default
+  nafnet_restored.ppm). The synthetic run also writes nafnet_noisy.ppm and
+  prints the config plus a small ASCII intensity preview of clean / noisy /
+  restored.
 
 Coded by Claude (AI).
 
@@ -47,57 +53,32 @@ any later version.
 {$mode objfpc}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, Math,
-  neuralnetwork, neuralvolume, neuralpretrained;
+  neuralnetwork, neuralvolume, neuralpretrained, neuraldatasets;
 
 const
   cFixtureST  = '../../tests/fixtures/tiny_nafnet.safetensors';
   cFixtureCfg = '../../tests/fixtures/tiny_nafnet_config.json';
   cNoisyFile  = 'nafnet_noisy.ppm';
   cRestoredFile = 'nafnet_restored.ppm';
+  cMaxPixelValue = 255;
+  // Largest image side previewed as ASCII art.
+  cMaxPreviewSide = 64;
 
-function ToByte(V: TNeuralFloat): byte;
-begin
-  // Map a roughly-[-1,1] activation into [0,255]; clamp out-of-range.
-  V := (V + 1) * 0.5;
-  if V < 0 then V := 0;
-  if V > 1 then V := 1;
-  Result := Round(V * 255);
-end;
-
-procedure WriteColorPPM(Img: TNNetVolume; const FileName: string);
+// Writes a [0, 1] RGB image to FileName, in the format of its extension.
+procedure SaveUnitRangeImage(Img: TNNetVolume; const FileName: string);
 var
-  F: TextFile;
-  Bin: TFileStream;
-  X, Y, W, H, RowOff: integer;
-  R, G, B: byte;
-  Row: array of byte;
+  ByteImage: TNNetVolume;
 begin
-  W := Img.SizeX; H := Img.SizeY;
-  AssignFile(F, FileName); Rewrite(F);
-  WriteLn(F, 'P6'); WriteLn(F, W, ' ', H); WriteLn(F, 255);
-  CloseFile(F);
-  Bin := TFileStream.Create(FileName, fmOpenReadWrite);
+  ByteImage := TNNetVolume.Create();
   try
-    Bin.Seek(0, soEnd);
-    // One buffered WriteBuffer per scanline instead of 3 WriteByte calls per
-    // pixel.
-    SetLength(Row, W * 3);
-    for Y := 0 to H - 1 do
-    begin
-      RowOff := 0;
-      for X := 0 to W - 1 do
-      begin
-        R := ToByte(Img[X, Y, 0]);
-        if Img.Depth > 1 then G := ToByte(Img[X, Y, 1]) else G := R;
-        if Img.Depth > 2 then B := ToByte(Img[X, Y, 2]) else B := R;
-        Row[RowOff] := R; Row[RowOff + 1] := G; Row[RowOff + 2] := B;
-        Inc(RowOff, 3);
-      end;
-      Bin.WriteBuffer(Row[0], W * 3);
-    end;
+    ByteImage.Copy(Img);
+    ByteImage.Mul(cMaxPixelValue);
+    if not SaveImageFromVolumeIntoFile(ByteImage, FileName) then
+      raise Exception.Create('Could not write ' + FileName + '.');
   finally
-    Bin.Free;
+    ByteImage.Free;
   end;
 end;
 
@@ -111,7 +92,7 @@ begin
     begin
       v := Img[X, Y, 0];
       if Img.Depth > 2 then v := (Img[X, Y, 0] + Img[X, Y, 1] + Img[X, Y, 2]) / 3;
-      v := (v + 1) * 0.5; if v < 0 then v := 0; if v > 1 then v := 1;
+      if v < 0 then v := 0; if v > 1 then v := 1;
       idx := Round(v * (Length(cRamp) - 1)) + 1;
       Write(cRamp[idx]);
     end;
@@ -119,7 +100,7 @@ begin
   end;
 end;
 
-// Deterministic "clean" test image: a smooth radial/striped pattern in [-1,1].
+// Deterministic "clean" test image: a smooth radial/striped pattern in [0,1].
 procedure FillCleanImage(Img: TNNetVolume);
 var X, Y, C: integer; v: TNeuralFloat;
 begin
@@ -127,8 +108,8 @@ begin
     for X := 0 to Img.SizeX - 1 do
       for C := 0 to Img.Depth - 1 do
       begin
-        v := Sin((X + C * 2) * 0.6) * 0.5 + Cos(Y * 0.5) * 0.4;
-        if v < -1 then v := -1; if v > 1 then v := 1;
+        v := Sin((X + C * 2) * 0.6) * 0.25 + Cos(Y * 0.5) * 0.2 + 0.5;
+        if v < 0 then v := 0; if v > 1 then v := 1;
         Img[X, Y, C] := v;
       end;
 end;
@@ -152,17 +133,52 @@ begin
   Result := Sqrt(A.GetDistanceSqr(B) / A.Size);
 end;
 
+// Side rounded up to a multiple of Multiple.
+function RoundUpToMultiple(Side, Multiple: integer): integer;
+begin
+  Result := ((Side + Multiple - 1) div Multiple) * Multiple;
+end;
+
+procedure PrintUsageAndHalt(const Problem: string);
+begin
+  WriteLn(Problem);
+  WriteLn('Usage: ImageRestoration [model.safetensors [config.json]] ',
+    '[--input FILE] [--output FILE]');
+  Halt(2);
+end;
+
 var
   NN: TNNet;
   Config: TNAFNetConfig;
-  Clean, Noisy: TNNetVolume;
-  STPath, CfgPath: string;
+  Clean, Degraded, Padded, Restored: TNNetVolume;
+  STPath, CfgPath, InputFile, OutputFile, Arg: string;
+  ArgPos, SizeMultiple: integer;
 begin
-  if ParamCount >= 1 then
+  STPath := '';
+  CfgPath := '';
+  InputFile := '';
+  OutputFile := cRestoredFile;
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
   begin
-    STPath := ParamStr(1);
-    if ParamCount >= 2 then CfgPath := ParamStr(2)
-    else CfgPath := ExtractFilePath(STPath) + 'config.json';
+    Arg := ParamStr(ArgPos);
+    if (Arg = '--input') or (Arg = '--output') then
+    begin
+      if ArgPos = ParamCount then PrintUsageAndHalt(Arg + ' needs a file name.');
+      Inc(ArgPos);
+      if Arg = '--input' then InputFile := ParamStr(ArgPos)
+      else OutputFile := ParamStr(ArgPos);
+    end
+    else if Copy(Arg, 1, 1) = '-' then
+      PrintUsageAndHalt('Unknown option ' + Arg + '.')
+    else if STPath = '' then STPath := Arg
+    else if CfgPath = '' then CfgPath := Arg
+    else PrintUsageAndHalt('Unexpected argument ' + Arg + '.');
+    Inc(ArgPos);
+  end;
+  if STPath <> '' then
+  begin
+    if CfgPath = '' then CfgPath := ExtractFilePath(STPath) + 'config.json';
     WriteLn('Loading NAFNet from checkpoint: ', STPath);
   end
   else
@@ -173,36 +189,80 @@ begin
       '(random weights -- wiring SMOKE demo).');
   end;
 
-  NN := BuildNAFNetFromSafeTensors(STPath, Config,
-    {pTrainable=}false, CfgPath);
+  Config := ReadNAFNetConfigFromJSONFile(CfgPath);
+  if Config.ImgChannel <> 3 then
+    PrintUsageAndHalt('This example reads and writes RGB images; the config ' +
+      'has img_channel=' + IntToStr(Config.ImgChannel) + '.');
+  Clean := TNNetVolume.Create();
+  Degraded := TNNetVolume.Create();
+  Padded := TNNetVolume.Create();
+  Restored := TNNetVolume.Create();
+  NN := nil;
   try
-    WriteLn(NAFNetConfigToString(Config));
-    Clean := TNNetVolume.Create(Config.InputSize, Config.InputSize,
-      Config.ImgChannel);
-    Noisy := TNNetVolume.Create(Config.InputSize, Config.InputSize,
-      Config.ImgChannel);
-    try
+    if InputFile <> '' then
+    begin
+      try
+        if not LoadImageFromFileIntoVolume(InputFile, Degraded) then
+          PrintUsageAndHalt('Could not read ' + InputFile + '.');
+      except
+        on E: Exception do
+          PrintUsageAndHalt('Could not read ' + InputFile + ': ' + E.Message);
+      end;
+      Degraded.Mul(1 / cMaxPixelValue);
+      // The stride-2 down convs need sides divisible by 2^levels; the official
+      // NAFNet zero-pads on the right and bottom the same way.
+      SizeMultiple := 1 shl Length(Config.EncBlkNums);
+      Config.InputSize := RoundUpToMultiple(Degraded.SizeX, SizeMultiple);
+      Config.InputSizeY := RoundUpToMultiple(Degraded.SizeY, SizeMultiple);
+      WriteLn('Input image: ', InputFile, ' (', Degraded.SizeX, 'x',
+        Degraded.SizeY, '), net input ', Config.InputSize, 'x',
+        Config.InputSizeY);
+    end
+    else
+    begin
+      Clean.ReSize(Config.InputSize, Config.InputSize, Config.ImgChannel);
+      Degraded.ReSize(Config.InputSize, Config.InputSize, Config.ImgChannel);
       FillCleanImage(Clean);
-      AddNoise(Clean, Noisy, 0.25);
-      WriteLn('Clean vs noisy RMSE: ', FormatFloat('0.0000', RMSE(Clean, Noisy)));
+      AddNoise(Clean, Degraded, 0.125);
+      WriteLn('Clean vs noisy RMSE: ', FormatFloat('0.0000', RMSE(Clean, Degraded)));
+    end;
+    NN := BuildNAFNetFromSafeTensorsEx(STPath, Config, {pTrainable=}false);
+    WriteLn(NAFNetConfigToString(Config));
 
-      NN.Compute(Noisy);
-      WriteLn('Restored image: ', NN.GetLastLayer().Output.SizeX, 'x',
-        NN.GetLastLayer().Output.SizeY, 'x',
-        NN.GetLastLayer().Output.Depth, ' (same size as input -- restoration).');
+    Padded.ReSize(NN.Layers[0].Output.SizeX, NN.Layers[0].Output.SizeY,
+      Config.ImgChannel);
+    Padded.Fill(0);
+    Padded.AddArea(0, 0, 0, 0, Degraded.SizeX, Degraded.SizeY, Degraded);
+    NN.Compute(Padded);
+    Restored.CopyCropping(NN.GetLastLayer().Output, 0, 0, Degraded.SizeX,
+      Degraded.SizeY);
+    WriteLn('Restored image: ', Restored.SizeX, 'x', Restored.SizeY, 'x',
+      Restored.Depth, ' (same size as input -- restoration).');
+    WriteLn('Input vs restored RMSE: ',
+      FormatFloat('0.0000', RMSE(Degraded, Restored)));
 
-      WriteColorPPM(Noisy, cNoisyFile);
-      WriteColorPPM(NN.GetLastLayer().Output, cRestoredFile);
-      WriteLn('Wrote ', cNoisyFile, ' and ', cRestoredFile, '.');
+    SaveUnitRangeImage(Restored, OutputFile);
+    if InputFile = '' then
+    begin
+      SaveUnitRangeImage(Degraded, cNoisyFile);
+      WriteLn('Wrote ', cNoisyFile, ' and ', OutputFile, '.');
+    end
+    else WriteLn('Wrote ', OutputFile, '.');
 
-      WriteLn; WriteLn('clean:');    AsciiPreview(Clean);
-      WriteLn; WriteLn('noisy:');    AsciiPreview(Noisy);
-      WriteLn; WriteLn('restored:'); AsciiPreview(NN.GetLastLayer().Output);
-    finally
-      Clean.Free;
-      Noisy.Free;
+    if Max(Restored.SizeX, Restored.SizeY) <= cMaxPreviewSide then
+    begin
+      if InputFile = '' then
+      begin
+        WriteLn; WriteLn('clean:'); AsciiPreview(Clean);
+      end;
+      WriteLn; WriteLn('input:');    AsciiPreview(Degraded);
+      WriteLn; WriteLn('restored:'); AsciiPreview(Restored);
     end;
   finally
     NN.Free;
+    Restored.Free;
+    Padded.Free;
+    Degraded.Free;
+    Clean.Free;
   end;
 end.

@@ -12854,7 +12854,8 @@ type
     EncBlkNums: TNeuralIntegerArray; // NAFBlocks per encoder stage
     MiddleBlkNum: integer;          // NAFBlocks in the bottleneck
     DecBlkNums: TNeuralIntegerArray; // NAFBlocks per decoder stage
-    InputSize: integer;             // input grid H=W for the Input layer
+    InputSize: integer;             // input grid width (and height when InputSizeY = 0)
+    InputSizeY: integer;            // input grid height; 0 = InputSize (square)
     ModelType: string;              // 'nafnet'
   end;
 
@@ -12868,8 +12869,7 @@ function ReadNAFNetConfigFromJSONFile(
 function NAFNetConfigToString(const Config: TNAFNetConfig): string;
 
 // Builds the NAFNet described by Config and loads every weight from Reader
-// (caller owns Reader). The net takes a (InputSize, InputSize, ImgChannel)
-// image and outputs the SAME shape (restored image, raw).
+// (caller owns Reader). In and out: an (InputSize, InputSizeY, ImgChannel) image.
 function BuildNAFNet(Reader: TNNetSafeTensorsReader;
   const Config: TNAFNetConfig; pTrainable: boolean = true): TNNet;
 
@@ -77045,6 +77045,7 @@ begin
     Result.MiddleBlkNum := Obj.Get('middle_blk_num', 1);
     Result.DecBlkNums := ReadIntArray('dec_blk_nums', [1]);
     Result.InputSize := Obj.Get('input_size', 0);
+    Result.InputSizeY := 0;
   finally
     Root.Free;
     JsonText.Free;
@@ -77075,6 +77076,8 @@ begin
     ', enc_blk_nums=[' + EncStr + '], middle_blk_num=' +
     IntToStr(Config.MiddleBlkNum) + ', dec_blk_nums=[' + DecStr + ']' +
     ', input_size=' + IntToStr(Config.InputSize);
+  if Config.InputSizeY > 0 then
+    Result := Result + 'x' + IntToStr(Config.InputSizeY);
 end;
 
 type
@@ -77158,7 +77161,7 @@ var
   DecRefs: array of array of TNAFBlockLayers;
   NumLevels, lvl, b, C, ChDown, ChUp: integer;
   NumLevelsM1, MiddleBlkNumM1: integer;
-  EncBlkM1, DecBlkM1: integer;
+  EncBlkM1, DecBlkM1, InputSizeY: integer;
   Cur, Up, DecIn: TNNetLayer;
 begin
   if Config.Width < 1 then
@@ -77166,7 +77169,7 @@ begin
   if (Config.Width mod 2) <> 0 then
     ImportError('NAFNet import: width must be even (SimpleGate needs an even ' +
       'channel count), got ' + IntToStr(Config.Width) + '.');
-  if Config.InputSize < 1 then
+  if (Config.InputSize < 1) or (Config.InputSizeY < 0) then
     ImportError('NAFNet import: input_size must be >= 1.');
   if Length(Config.EncBlkNums) <> Length(Config.DecBlkNums) then
     ImportError('NAFNet import: enc_blk_nums and dec_blk_nums must have the ' +
@@ -77184,7 +77187,9 @@ begin
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    NN.AddLayer(TNNetInput.Create(Config.InputSize, Config.InputSize,
+    if Config.InputSizeY > 0 then InputSizeY := Config.InputSizeY
+    else InputSizeY := Config.InputSize;
+    NN.AddLayer(TNNetInput.Create(Config.InputSize, InputSizeY,
       Config.ImgChannel));
     Intro := NN.AddLayer(
       TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0).SetTrainable(pTrainable));
