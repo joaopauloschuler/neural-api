@@ -1269,6 +1269,9 @@ type
     procedure TestCLIPSegComplexUpsampleParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
+    procedure TestStyleGAN2BroadcastNoiseMatchesTiled;
+    procedure TestStyleGAN2RandomNoiseSeeded;
+    procedure TestStyleGAN2NoNoiseEqualsZeroStrength;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestDINOv3ConfigFromJSONFile;
@@ -49674,6 +49677,257 @@ begin
     ZInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+type
+  TStyleGAN2FixtureVariant = (sfvBroadcastNoise, sfvTiledNoise, sfvZeroStrength);
+
+// Copies the StyleGAN2 pico fixture into DestFile with one edit: every
+// [ch,H,W] "noise" map becomes its channel 0 as [1,1,H,W] (sfvBroadcastNoise) or
+// channel 0 tiled over ch (sfvTiledNoise), or every noise_strength is zeroed.
+procedure WriteStyleGAN2FixtureVariant(const SourceFile, DestFile: string;
+  Variant: TStyleGAN2FixtureVariant);
+const
+  cNoiseSuffix = '.noise';
+  cStrengthSuffix = '.noise_strength';
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Tensor, Edited: TNNetVolume;
+  TensorName: string;
+  Shape: array of Int64;
+  TensorPos, DimPos, MapSize, ChannelCount, ChannelPos: integer;
+  IsNoise, IsStrength: boolean;
+begin
+  Reader := TNNetSafeTensorsReader.Create(SourceFile);
+  Writer := TNNetSafeTensorsWriter.Create(DestFile);
+  Tensor := TNNetVolume.Create();
+  Edited := TNNetVolume.Create();
+  try
+    for TensorPos := 0 to Reader.Count - 1 do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      Reader.LoadTensorFlat(TensorName, Tensor);
+      SetLength(Shape, Reader.DimCount(TensorName));
+      for DimPos := 0 to High(Shape) do
+        Shape[DimPos] := Reader.DimSize(TensorName, DimPos);
+      IsNoise := Copy(TensorName, Length(TensorName) - Length(cNoiseSuffix) + 1,
+        Length(cNoiseSuffix)) = cNoiseSuffix;
+      IsStrength := Copy(TensorName,
+        Length(TensorName) - Length(cStrengthSuffix) + 1,
+        Length(cStrengthSuffix)) = cStrengthSuffix;
+      if IsNoise and (Variant <> sfvZeroStrength) then
+      begin
+        ChannelCount := Shape[0];
+        MapSize := Tensor.Size div ChannelCount;
+        if Variant = sfvBroadcastNoise then
+        begin
+          Edited.ReSize(MapSize, 1, 1);
+          Move(Tensor.FData[0], Edited.FData[0], MapSize * csNeuralFloatSize);
+          Writer.AddTensorFlat(TensorName, [1, 1, Shape[1], Shape[2]], Edited);
+        end
+        else
+        begin
+          Edited.ReSize(Tensor.Size, 1, 1);
+          for ChannelPos := 0 to ChannelCount - 1 do
+            Move(Tensor.FData[0], Edited.FData[ChannelPos * MapSize],
+              MapSize * csNeuralFloatSize);
+          Writer.AddTensorFlat(TensorName, Shape, Edited);
+        end;
+      end
+      else
+      begin
+        if IsStrength and (Variant = sfvZeroStrength) then Tensor.Fill(0);
+        Writer.AddTensorFlat(TensorName, Shape, Tensor);
+      end;
+    end;
+    Writer.SaveToFile;
+  finally
+    Edited.Free;
+    Tensor.Free;
+    Writer.Free;
+    Reader.Free;
+  end;
+end;
+
+// Runs NN on the fixed latent ramp the StyleGAN2Generate example uses and
+// copies the generated image into Image.
+procedure ComputeStyleGAN2Image(NN: TNNet; LatentDim: integer;
+  Image: TNNetVolume);
+var
+  Latent: TNNetVolume;
+  LatentPos: integer;
+begin
+  Latent := TNNetVolume.Create(LatentDim, 1, 1);
+  try
+    for LatentPos := 0 to LatentDim - 1 do
+      Latent.FData[LatentPos] := Sin(LatentPos * 0.7 + 0.3) * 0.9;
+    NN.Compute(Latent);
+    Image.Copy(NN.GetLastLayer().Output);
+  finally
+    Latent.Free;
+  end;
+end;
+
+function StyleGAN2ImagesEqual(A, B: TNNetVolume): boolean;
+var
+  ElementPos: integer;
+begin
+  Result := A.Size = B.Size;
+  if not Result then exit;
+  for ElementPos := 0 to A.Size - 1 do
+    if A.FData[ElementPos] <> B.FData[ElementPos] then exit(false);
+end;
+
+// A 1-channel [1,1,H,W] noise map broadcast over depth (the real-checkpoint
+// layout) must give the bit-identical image of the same map tiled to full
+// depth through the v1 element-wise path.
+procedure TTestNeuralPretrained.TestStyleGAN2BroadcastNoiseMatchesTiled;
+var
+  Config: TStyleGAN2Config;
+  BroadcastNN, TiledNN: TNNet;
+  BroadcastImage, TiledImage: TNNetVolume;
+  BroadcastPath, TiledPath: string;
+  ConvCount: integer;
+begin
+  Config := ReadStyleGAN2ConfigFromJSONFile(
+    FixturePath('tiny_stylegan2_config.json'));
+  BroadcastPath := GetTempDir(false) + 'cai_sg2_broadcast_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  TiledPath := GetTempDir(false) + 'cai_sg2_tiled_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BroadcastNN := nil;
+  TiledNN := nil;
+  BroadcastImage := TNNetVolume.Create();
+  TiledImage := TNNetVolume.Create();
+  try
+    WriteStyleGAN2FixtureVariant(FixturePath('tiny_stylegan2.safetensors'),
+      BroadcastPath, sfvBroadcastNoise);
+    WriteStyleGAN2FixtureVariant(FixturePath('tiny_stylegan2.safetensors'),
+      TiledPath, sfvTiledNoise);
+    BroadcastNN := BuildStyleGAN2GeneratorFromSafeTensorsEx(BroadcastPath,
+      Config, false, snmConst);
+    TiledNN := BuildStyleGAN2GeneratorFromSafeTensorsEx(TiledPath,
+      Config, false, snmConst);
+    // One TNNetDeepConcat.Replicate per modulated conv pass on the broadcast net.
+    ConvCount := 2 * Config.NumBlocks - 1;
+    AssertEquals('broadcast net adds one replicate layer per conv pass',
+      TiledNN.CountLayers() + ConvCount, BroadcastNN.CountLayers());
+    ComputeStyleGAN2Image(BroadcastNN, Config.LatentDim, BroadcastImage);
+    ComputeStyleGAN2Image(TiledNN, Config.LatentDim, TiledImage);
+    AssertTrue('broadcast noise image must be bit-identical to the tiled one',
+      StyleGAN2ImagesEqual(BroadcastImage, TiledImage));
+  finally
+    TiledImage.Free;
+    BroadcastImage.Free;
+    TiledNN.Free;
+    BroadcastNN.Free;
+    DeleteFile(BroadcastPath);
+    DeleteFile(TiledPath);
+  end;
+end;
+
+// snmRandom draws a fresh N(0,1) map per forward: the same RestartRandSeed seed
+// reproduces the image, another seed (or no reseed) changes it.
+procedure TTestNeuralPretrained.TestStyleGAN2RandomNoiseSeeded;
+var
+  Config: TStyleGAN2Config;
+  NN: TNNet;
+  FirstImage, SameSeedImage, OtherSeedImage, NextForwardImage: TNNetVolume;
+  NoiseOutput: TNNetVolume;
+  LayerPos, ElementPos, NoiseLayerCount, ElementCount: integer;
+  NoiseSum, NoiseSqSum, NoiseMean, NoiseStd: double;
+begin
+  NN := BuildStyleGAN2GeneratorFromSafeTensors(
+    FixturePath('tiny_stylegan2.safetensors'), Config, false,
+    FixturePath('tiny_stylegan2_config.json'), snmRandom);
+  FirstImage := TNNetVolume.Create();
+  SameSeedImage := TNNetVolume.Create();
+  OtherSeedImage := TNNetVolume.Create();
+  NextForwardImage := TNNetVolume.Create();
+  try
+    RestartRandSeed(1234);
+    ComputeStyleGAN2Image(NN, Config.LatentDim, FirstImage);
+    NoiseLayerCount := 0;
+    ElementCount := 0;
+    NoiseSum := 0;
+    NoiseSqSum := 0;
+    for LayerPos := 0 to NN.GetLastLayerIdx() do
+      if NN.Layers[LayerPos] is TNNetGaussianNoise then
+      begin
+        Inc(NoiseLayerCount);
+        NoiseOutput := NN.Layers[LayerPos].Output;
+        AssertEquals('random noise map is one channel', 1, NoiseOutput.Depth);
+        for ElementPos := 0 to NoiseOutput.Size - 1 do
+        begin
+          NoiseSum := NoiseSum + NoiseOutput.FData[ElementPos];
+          NoiseSqSum := NoiseSqSum + Sqr(NoiseOutput.FData[ElementPos]);
+        end;
+        Inc(ElementCount, NoiseOutput.Size);
+      end;
+    AssertEquals('one noise generator per conv pass',
+      2 * Config.NumBlocks - 1, NoiseLayerCount);
+    NoiseMean := NoiseSum / ElementCount;
+    NoiseStd := Sqrt(NoiseSqSum / ElementCount - Sqr(NoiseMean));
+    AssertTrue('noise mean ' + FloatToStr(NoiseMean) + ' near 0',
+      Abs(NoiseMean) < 0.2);
+    AssertTrue('noise std ' + FloatToStr(NoiseStd) + ' near 1',
+      (NoiseStd > 0.8) and (NoiseStd < 1.2));
+    ComputeStyleGAN2Image(NN, Config.LatentDim, NextForwardImage);
+    RestartRandSeed(1234);
+    ComputeStyleGAN2Image(NN, Config.LatentDim, SameSeedImage);
+    RestartRandSeed(4321);
+    ComputeStyleGAN2Image(NN, Config.LatentDim, OtherSeedImage);
+    AssertTrue('same seed -> identical image',
+      StyleGAN2ImagesEqual(FirstImage, SameSeedImage));
+    AssertFalse('different seed -> different image',
+      StyleGAN2ImagesEqual(FirstImage, OtherSeedImage));
+    AssertFalse('each forward draws fresh noise',
+      StyleGAN2ImagesEqual(FirstImage, NextForwardImage));
+  finally
+    NextForwardImage.Free;
+    OtherSeedImage.Free;
+    SameSeedImage.Free;
+    FirstImage.Free;
+    NN.Free;
+  end;
+end;
+
+// snmNone (no noise branch) must equal the const-noise net with every
+// noise_strength zeroed.
+procedure TTestNeuralPretrained.TestStyleGAN2NoNoiseEqualsZeroStrength;
+var
+  Config: TStyleGAN2Config;
+  NoNoiseNN, ZeroStrengthNN: TNNet;
+  NoNoiseImage, ZeroStrengthImage: TNNetVolume;
+  ZeroStrengthPath: string;
+begin
+  Config := ReadStyleGAN2ConfigFromJSONFile(
+    FixturePath('tiny_stylegan2_config.json'));
+  ZeroStrengthPath := GetTempDir(false) + 'cai_sg2_zero_strength_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NoNoiseNN := nil;
+  ZeroStrengthNN := nil;
+  NoNoiseImage := TNNetVolume.Create();
+  ZeroStrengthImage := TNNetVolume.Create();
+  try
+    WriteStyleGAN2FixtureVariant(FixturePath('tiny_stylegan2.safetensors'),
+      ZeroStrengthPath, sfvZeroStrength);
+    NoNoiseNN := BuildStyleGAN2GeneratorFromSafeTensorsEx(
+      FixturePath('tiny_stylegan2.safetensors'), Config, false, snmNone);
+    ZeroStrengthNN := BuildStyleGAN2GeneratorFromSafeTensorsEx(
+      ZeroStrengthPath, Config, false, snmConst);
+    ComputeStyleGAN2Image(NoNoiseNN, Config.LatentDim, NoNoiseImage);
+    ComputeStyleGAN2Image(ZeroStrengthNN, Config.LatentDim, ZeroStrengthImage);
+    AssertTrue('no-noise image must equal the zero-strength image',
+      StyleGAN2ImagesEqual(NoNoiseImage, ZeroStrengthImage));
+  finally
+    ZeroStrengthImage.Free;
+    NoNoiseImage.Free;
+    ZeroStrengthNN.Free;
+    NoNoiseNN.Free;
+    DeleteFile(ZeroStrengthPath);
   end;
 end;
 

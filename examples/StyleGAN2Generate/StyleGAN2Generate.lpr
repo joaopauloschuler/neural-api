@@ -26,9 +26,16 @@ float64 numpy oracle in tests/TestNeuralPretrained.pas). Pass a real
 .safetensors (+ config.json sibling) to synthesize from your own checkpoint.
 
 USAGE
-  ./StyleGAN2Generate                 use the committed pico fixture
-  ./StyleGAN2Generate model.safetensors [config.json]
+  ./StyleGAN2Generate [options]       use the committed pico fixture
+  ./StyleGAN2Generate [options] model.safetensors [config.json]
                                       use a real checkpoint
+OPTIONS
+  --noise const|random|none  per-pixel noise after every modulated conv:
+                             const  = the checkpoint's stored maps (default),
+                             random = fresh N(0,1) per forward (StyleGAN2's
+                                      noise_mode='random'),
+                             none   = no noise
+  --seed N                   seed for --noise random (default 1)
 
 OUTPUT
   Writes stylegan2_sample.ppm (a P6 color image) from a fixed latent and prints
@@ -45,7 +52,7 @@ any later version.
 *)
 {$mode objfpc}{$H+}
 
-uses
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes,
   neuralnetwork, neuralvolume, neuralpretrained;
 
@@ -109,17 +116,58 @@ begin
   end;
 end;
 
+function ParseNoiseMode(const ModeName: string): TStyleGAN2NoiseMode;
+begin
+  if ModeName = 'const' then Result := snmConst
+  else if ModeName = 'random' then Result := snmRandom
+  else if ModeName = 'none' then Result := snmNone
+  else
+  begin
+    WriteLn('Unknown --noise mode "', ModeName, '"; use const, random or none.');
+    Halt(1);
+  end;
+end;
+
 var
   NN: TNNet;
   Config: TStyleGAN2Config;
   Z: TNNetVolume;
-  STPath, CfgPath: string;
-  i: integer;
+  STPath, CfgPath, ModeName: string;
+  Positional: array of string;
+  NoiseMode: TStyleGAN2NoiseMode;
+  Seed: cardinal;
+  i, ArgPos: integer;
 begin
-  if ParamCount >= 1 then
+  NoiseMode := snmConst;
+  ModeName := 'const';
+  Seed := 1;
+  SetLength(Positional, 0);
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
   begin
-    STPath := ParamStr(1);
-    if ParamCount >= 2 then CfgPath := ParamStr(2)
+    if (ParamStr(ArgPos) = '--noise') and (ArgPos < ParamCount) then
+    begin
+      Inc(ArgPos);
+      ModeName := ParamStr(ArgPos);
+      NoiseMode := ParseNoiseMode(ModeName);
+    end
+    else if (ParamStr(ArgPos) = '--seed') and (ArgPos < ParamCount) then
+    begin
+      Inc(ArgPos);
+      Seed := StrToDWord(ParamStr(ArgPos));
+    end
+    else
+    begin
+      SetLength(Positional, Length(Positional) + 1);
+      Positional[High(Positional)] := ParamStr(ArgPos);
+    end;
+    Inc(ArgPos);
+  end;
+
+  if Length(Positional) >= 1 then
+  begin
+    STPath := Positional[0];
+    if Length(Positional) >= 2 then CfgPath := Positional[1]
     else CfgPath := ExtractFilePath(STPath) + 'config.json';
     WriteLn('Loading StyleGAN2 generator from checkpoint: ', STPath);
   end
@@ -131,9 +179,16 @@ begin
   end;
 
   NN := BuildStyleGAN2GeneratorFromSafeTensors(STPath, Config,
-    {pTrainable=}false, CfgPath);
+    {pTrainable=}false, CfgPath, NoiseMode);
   try
     WriteLn(StyleGAN2ConfigToString(Config));
+    Write('Noise mode: ', ModeName);
+    if NoiseMode = snmRandom then
+    begin
+      Write(' (seed ', Seed, ')');
+      RestartRandSeed(Seed);
+    end;
+    WriteLn;
     Z := TNNetVolume.Create(Config.LatentDim, 1, 1);
     try
       // A FIXED, reproducible latent (no RNG): a smooth deterministic ramp.

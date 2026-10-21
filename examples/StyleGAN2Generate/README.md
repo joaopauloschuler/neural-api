@@ -12,7 +12,7 @@ The synthesis path the importer builds and this example runs:
 * the **synthesis network** grows the image from a learned constant through a
   tower of resolution blocks, each = nearest-`×2` upsample (after the first) →
   [modulated/demodulated conv (the `TNNetModulatedConv2D` primitive) + per-pixel
-  noise injection (scaled by a learned strength) + LeakyReLU(0.2)] → a `toRGB`
+  noise injection (`x + noise_strength * noise`, see below) + LeakyReLU(0.2)] → a `toRGB`
   modulated `1×1` conv (no demod) summed into an upsampled RGB skip.
 
 Each modulated conv reads a per-input-channel style vector from a small affine
@@ -24,10 +24,24 @@ path-length reg / training in v1).
 ```
 cd examples/StyleGAN2Generate
 lazbuild StyleGAN2Generate.lpi --build-mode=Release
-# run from the repo root so the fixture path resolves:
+# run from this folder so the fixture path resolves:
 ../../bin/x86_64-linux/bin/StyleGAN2Generate
+../../bin/x86_64-linux/bin/StyleGAN2Generate --noise random --seed 7
 ../../bin/x86_64-linux/bin/StyleGAN2Generate model.safetensors [config.json]
 ```
+
+## Noise modes
+
+`--noise const|random|none` picks the per-pixel noise each modulated conv adds
+(`BuildStyleGAN2Generator`'s `NoiseMode` argument, `TStyleGAN2NoiseMode`):
+
+* `const` (default) — the fixed `noise` map stored in the checkpoint. A
+  `[1,1,H,W]` map (the real StyleGAN2 layout, one channel) is broadcast over all
+  channels; a full-depth `[C,H,W]` map (the pico fixture) is added element-wise.
+* `random` — a fresh one-channel N(0,1) map per forward, broadcast over all
+  channels (StyleGAN2's `noise_mode='random'`). `--seed N` (default 1) seeds it,
+  so the same seed reproduces the same image.
+* `none` — no noise is added.
 
 ## Input
 

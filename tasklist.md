@@ -1191,9 +1191,6 @@ rather than acted on.
       TNNetModulatedConv2D LANDED, commit 8d72b95; mapping MLP z->w + synthesis tower of
       modulated conv + ReZero noise + LeakyReLU + summed toRGB skips, inference-only,
       TestStyleGAN2GeneratorParity < 1e-4 vs a numpy float64 oracle + examples/StyleGAN2Generate):
-  - [ ] per-pixel 1-channel BROADCAST random noise (v1 stores full-depth fixed noise maps
-        in the safetensors for deterministic oracle-exact synthesis — wire the standard
-        per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
 - [ ] MMDiT (Stable Diffusion 3 / FLUX.1) full text-to-image importer + sampler

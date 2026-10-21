@@ -13715,6 +13715,10 @@ type
     ModelType: string;        // 'stylegan2'
   end;
 
+  // Per-pixel noise injected after every modulated conv: snmConst reads the
+  // checkpoint's fixed map, snmRandom draws N(0,1) per forward, snmNone adds none.
+  TStyleGAN2NoiseMode = (snmConst, snmRandom, snmNone);
+
 // Reads a StyleGAN2 generator config. Required: latent_dim, num_blocks,
 // channels. Optional: mapping_layers (8), start_size (4), num_out_ch (3),
 // model_type ('stylegan2').
@@ -13724,19 +13728,31 @@ function ReadStyleGAN2ConfigFromJSONFile(
 function StyleGAN2ConfigToString(const Config: TStyleGAN2Config): string;
 
 // Builds the StyleGAN2 generator described by Config and loads every weight from
-// Reader (caller owns Reader). INPUT 0 = latent z (LatentDim,1,1). INPUTS 1..N =
-// per-block per-pixel noise maps (one (Size,Size,1) image per modulated conv,
-// in synthesis order). OUTPUT = a (FinalSize, FinalSize, NumOutCh) raw RGB
-// image, FinalSize = StartSize * 2^(NumBlocks-1).
+// Reader (caller owns Reader). The only fed input is layer 0 = latent z
+// (LatentDim,1,1); the learned constant and the noise maps are pre-filled
+// TNNetInput layers. Each modulated conv adds noise_strength * noise, where the
+// noise is one of (per NoiseMode):
+//   snmConst  - the stored "noise" tensor: a (size,size) map ([1,1,H,W], the
+//               real-checkpoint layout) broadcast over depth, or a full-depth
+//               [ch,size,size] map added element-wise;
+//   snmRandom - a fresh N(0,1) (size,size,1) map per forward, broadcast over
+//               depth (TNNetGaussianNoise on the global Random: seed it with
+//               RestartRandSeed; NN.EnableDropouts(false) turns it off);
+//   snmNone   - no noise branch ("noise" / "noise_strength" are not read).
+// OUTPUT = a (FinalSize, FinalSize, NumOutCh) raw RGB image,
+// FinalSize = StartSize * 2^(NumBlocks-1).
 function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
-  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 
 function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
-  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 
 function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
   out Config: TStyleGAN2Config; pTrainable: boolean = true;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = '';
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 
 // ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
@@ -81423,13 +81439,14 @@ begin
 end;
 
 function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
-  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 type
   TConvRefs = record
     Affine: TNNetLayer;
     ModConv: TNNetModulatedConv2D;
-    Noise: TNNetLayer;
-    NoiseScale: TNNetLayer;
+    Noise: TNNetLayer;       // nil under snmNone
+    NoiseScale: TNNetLayer;  // nil under snmNone
   end;
 var
   NN: TNNet;
@@ -81445,21 +81462,54 @@ var
   TgtVol: TNNetVolume;
   pfx: string;
 
+  // Depth of the noise map a conv pass injects: 1 (broadcast over the ch
+  // channels) unless snmConst finds a full-depth [ch,size,size] tensor.
+  function NoiseMapDepth(const Prefix: string): integer;
+  var
+    NoiseElements: Int64;
+  begin
+    Result := 1;
+    if NoiseMode <> snmConst then exit;
+    if not Reader.HasTensor(Prefix + 'noise') then
+      ImportError('StyleGAN2 import: missing "' + Prefix + 'noise".');
+    NoiseElements := Reader.ElementCount(Prefix + 'noise');
+    if NoiseElements = Int64(ch) * size * size then Result := ch
+    else if NoiseElements <> Int64(size) * size then
+      ImportError('StyleGAN2 import: "' + Prefix + 'noise" must hold ' +
+        IntToStr(size * size) + ' (broadcast) or ' + IntToStr(ch * size * size) +
+        ' (full-depth) elements, got ' + Reader.ShapeAsString(Prefix + 'noise'));
+  end;
+
   function AddConvPass(const Prefix: string): TConvRefs;
+  var
+    NoiseBranch: TNNetLayer;
+    NoiseDepth: integer;
   begin
     Result.Affine := NN.AddLayerAfter(
       TNNetFullConnectLinear.Create(ch).SetTrainable(pTrainable), WLatent);
     Result.ModConv := TNNetModulatedConv2D.Create(ch, 3, 0, 1, Result.Affine);
     NN.AddLayerAfter(Result.ModConv, Feat);
     Feat := Result.ModConv;
-    // Per-pixel noise injection: noise input (size,size,1) -> learned scalar
-    // strength (TNNetReZero) -> Sum into the conv output (broadcast over depth
-    // is handled because the noise depth is 1 and TNNetSum broadcasts? -- no:
-    // build a noise map of full depth so Sum is element-wise on (size,size,ch)).
-    Result.Noise := NN.AddLayerAfter(
-      TNNetInput.Create(size, size, ch, 1), 0);
-    Result.NoiseScale := NN.AddLayerAfter(TNNetReZero.Create(), Result.Noise);
-    Feat := NN.AddLayerAfter(TNNetSum.Create([Feat, Result.NoiseScale]), Feat);
+    Result.Noise := nil;
+    Result.NoiseScale := nil;
+    if NoiseMode <> snmNone then
+    begin
+      // noise map -> [fresh N(0,1)] -> learned scalar strength (TNNetReZero) ->
+      // [replicate over depth] -> Sum into the conv output.
+      NoiseDepth := NoiseMapDepth(Prefix);
+      Result.Noise := NN.AddLayerAfter(
+        TNNetInput.Create(size, size, NoiseDepth, 1), 0);
+      NoiseBranch := Result.Noise;
+      if NoiseMode = snmRandom then
+        NoiseBranch := NN.AddLayerAfter(TNNetGaussianNoise.Create(1.0),
+          NoiseBranch);
+      Result.NoiseScale := NN.AddLayerAfter(TNNetReZero.Create(), NoiseBranch);
+      NoiseBranch := Result.NoiseScale;
+      if NoiseDepth < ch then
+        NoiseBranch := NN.AddLayerAfter(
+          TNNetDeepConcat.Replicate(ch, NoiseBranch), NoiseBranch);
+      Feat := NN.AddLayerAfter(TNNetSum.Create([Feat, NoiseBranch]), Feat);
+    end;
     Feat := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2), Feat);
   end;
 
@@ -81568,6 +81618,7 @@ begin
           pfx + 'affine.bias', ch, lat);
         LoadStyleGAN2ModConv(Reader, Convs[b][c].ModConv, pfx + 'weight',
           pfx + 'bias', ch, ch, 3);
+        if NoiseMode = snmNone then continue;
         // noise_strength scalar -> ReZero alpha (FNeurons[0].Weights[0]).
         if not Reader.HasTensor(pfx + 'noise_strength') then
           ImportError('StyleGAN2 import: missing "' + pfx + 'noise_strength".');
@@ -81575,24 +81626,31 @@ begin
         EnsureWritableImportWeights(Convs[b][c].NoiseScale);
         Convs[b][c].NoiseScale.FArrNeurons[0].Weights.FData[0] := NoiseW.FData[0];
         Convs[b][c].NoiseScale.FlushWeightCache();
-        // Fixed per-pixel noise map (stored CHW [ch,size,size]) -> noise input.
-        if not Reader.HasTensor(pfx + 'noise') then
-          ImportError('StyleGAN2 import: missing "' + pfx + 'noise".');
-        Reader.LoadTensorFlat(pfx + 'noise', NoiseW);
-        if NoiseW.Size <> ch * size * size then
-          ImportError('StyleGAN2 import: "' + pfx + 'noise" size mismatch.');
-        // CHW -> HWC, same carried-index shape as the learned constant above.
         TgtVol := Convs[b][c].Noise.Output;
-        SrcIdx := 0;                         // l * SizeSq
-        for l := 0 to chM1 do
+        // snmRandom: the zero map is the TNNetGaussianNoise base.
+        if NoiseMode = snmRandom then
         begin
-          DstIdx := l;
-          for noiseIdx := 0 to SizeSqM1 do
+          TgtVol.Fill(0);
+          continue;
+        end;
+        // Fixed per-pixel noise map (NoiseMapDepth checked its size).
+        Reader.LoadTensorFlat(pfx + 'noise', NoiseW);
+        if TgtVol.Depth = 1 then
+          Move(NoiseW.FData[0], TgtVol.FData[0], SizeSq * csNeuralFloatSize)
+        else
+        begin
+          // CHW -> HWC, same carried-index shape as the learned constant above.
+          SrcIdx := 0;                         // l * SizeSq
+          for l := 0 to chM1 do
           begin
-            TgtVol.FData[DstIdx] := NoiseW.FData[SrcIdx + noiseIdx];
-            Inc(DstIdx, ch);
+            DstIdx := l;
+            for noiseIdx := 0 to SizeSqM1 do
+            begin
+              TgtVol.FData[DstIdx] := NoiseW.FData[SrcIdx + noiseIdx];
+              Inc(DstIdx, ch);
+            end;
+            Inc(SrcIdx, SizeSq);
           end;
-          Inc(SrcIdx, SizeSq);
         end;
       end;
       pfx := 'block.' + IntToStr(b) + '.torgb.';
@@ -81611,13 +81669,14 @@ begin
 end;
 
 function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
-  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildStyleGAN2Generator(Reader, Config, pTrainable);
+    Result := BuildStyleGAN2Generator(Reader, Config, pTrainable, NoiseMode);
   finally
     Reader.Free;
   end;
@@ -81625,7 +81684,8 @@ end;
 
 function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
   out Config: TStyleGAN2Config; pTrainable: boolean = true;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = '';
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
 var
   ConfigPath: string;
 begin
@@ -81633,7 +81693,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadStyleGAN2ConfigFromJSONFile(ConfigPath);
   Result := BuildStyleGAN2GeneratorFromSafeTensorsEx(FileName, Config,
-    pTrainable);
+    pTrainable, NoiseMode);
 end;
 
 // ===========================================================================
