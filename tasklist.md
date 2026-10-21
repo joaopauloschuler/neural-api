@@ -1635,7 +1635,7 @@ rather than acted on.
         7x7 conv 64->3, sigmoid. The pipeline composites
         mask*pred + (1-mask)*image and pads the input to a multiple of 8.
       Plan:
-      1. [DONE] One shared FFT routine. The radix-2 complex FFT is copied three times
+      1. [DONE 5a2f88e5] One shared FFT routine. The radix-2 complex FFT is copied three times
          today: `FourierMixFFT` (FourierMix and SpectralConv2D call it),
          `CirculantFFT` (TNNetCirculantLinear) and the table-driven
          `FFTRadix2InPlace` (neuralaudio.pas). Merge them into one routine with
