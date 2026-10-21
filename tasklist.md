@@ -126,22 +126,6 @@ rather than acted on.
   - [ ] Follow-up (not in this task): shared paged KV blocks, so conversations
         share the blocks of their common prefix instead of one full KV copy per
         slot (vLLM-style); a large KV-cache rewrite.
-- [X] One shared standard-normal sampler instead of ~40 private copies.
-      DONE 2026-10-21. `RandomStdNormal()` (Marsaglia polar, global `Random`)
-      is in the neuralvolume.pas interface and `TVolume.RandomGaussianValue`
-      calls it. `TStdNormalStream` + `StdNormalStreamInit/Uniform/Next` is the
-      seeded private stream (32-bit LCG + polar, cached spare) used by
-      LayerSensitivityReport and the saliency report; the LLC SGLD chain and
-      the Kalman test use `RandomStdNormal`. 36 examples lost their private
-      Box-Muller helpers (KalmanFilter and HamiltonianPendulum keep a private
-      reproducible stream via `TStdNormalStream`); all 36 build with
-      `lazbuild -B`. Every README sample output was re-run and refreshed (all
-      finished in under 30 s); the new draws flipped the printed verdict in
-      LabelSmoothingCalibration, DiceSegmentation and MahalanobisOOD (tied vs
-      untied), and the prose was rewritten to match.
-      Left alone on purpose: FPC `Math.RandG` calls (neuraldiffusion.pas and a
-      few tests) are an RTL routine, not a private copy; TinyTransformerFFN's
-      `RandNoise` is uniform noise, not a Gaussian sampler.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
@@ -1671,15 +1655,6 @@ rather than acted on.
             column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
             `FInputPrepared` after the forward, in both memory modes; tiling or
             releasing it is a library-wide decision, not made here.
-      - [X] OpenCL: the 3x3 and 1x1 convs already have OpenCL paths, and the
-            `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` pair now has a device
-            forward too (`TNNetRealFFT2DCL`: direct DFTs per row and column in
-            `cai_rfft2_rows_r2c`, `cai_rfft2_cols_c2c`, `cai_irfft2_rows_c2r`, any
-            W and H, O(N^2) per line), binding a resident source and keeping its
-            output resident; `TestRealFFT2DOpenCLParity` and
-            `TestInverseRealFFT2DOpenCLParity`. Whole-generator residency and
-            timing are unmeasured on a real GPU; if the FFT shows up in a
-            512x512 profile, a radix-2/mixed-radix kernel is the next step.
 - [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
       examples/QwenImage, merged into the transformer weights at load. Today
       `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
@@ -1992,21 +1967,6 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [X] CogVideoX VAE decoder runs its `TNNetCausalConv1D` pair once per spatial
-      cell on a tiny (T,1,Clat) net, so the size verdict keeps it on the CPU
-      and the new device forward rarely fires. Batch all H*W cells into one
-      forward (cells along Y, SizeY = H*W) so one launch covers the frame.
-      DONE: `TNNetCausalConv1D` now takes SizeY>1 as independent rows (host
-      forward/backward row loop; OpenCL position count = SizeX*SizeY on the
-      unchanged cai_conv_implicit). `BuildCogVideoXVaeDecoderFromSafeTensorsEx`
-      builds the net once at (T, Min(H*W, MaxCellsPerForward), Clat), default
-      cap `csCogVideoXVaeMaxCellsPerForward` = 4096 cells; `DecodeCogVideoXVae`
-      feeds the latent straight in when the block covers the frame, else one
-      Move per row block (zero-filled short last block). Tests:
-      TestCausalConv1DRowsIndependent (CPU forward vs per-row nets + input and
-      weight gradients), TestCausalConv1DOpenCLParity +2 SizeY>1 cases,
-      TestCogVideoXParity checks whole-frame vs per-cell vs 3-cell blocks.
-      Not measured on a GPU box (no timing claim).
 - [ ] GPU-box checks for two a20 device paths, unmeasured on the dev box:
       (a) `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` (d7c177dd, direct O(N^2)
       DFT per line) inside examples/LaMaInpaint at 512x512: FFT share of the
@@ -2106,26 +2066,6 @@ cannot pay for its own transfer.
 
 ## Layer follow-ups that fix real limitations
 
-- [X] Move the remaining FFT callers onto the shared `TFFTPlan` (Bluestein, any N;
-      neuralvolume.pas, 5a2f88e5) so they stop requiring power-of-two sizes.
-      DONE: `TNNetFourierMix` (UseFFT), `TNNetCirculantLinear` (UseFFT),
-      `TNNetSpectralConv1D` and `TNNetSpectralConv2D` run on plan fields built in
-      SetPrevLayer and no longer reject non-power-of-two lengths (none of them
-      has a chunked path, so one plan per axis). neuralaudio.pas:
-      `ISTFTOverlapAddReIm` uses the plan for a power-of-two NFFT or NFFT >= 64
-      and keeps the direct inverse DFT below that (measured: direct 0.33 us vs
-      Bluestein 2.0 us per frame at NFFT 20, Kokoro's size; Bluestein wins from
-      ~100); its mirrored spectrum was wrong for odd NFFT on the FFT path (only
-      reachable with Bluestein) and is fixed. `ComputeMusicgenMelodyChroma` uses
-      the plan and accepts any NFFT. No `FFTRadix2InPlace` caller remains
-      outside neuralvolume.pas. Left: `RealFramePowerSpectrum` (Whisper's
-      400-point two-factor 20x20 DFT, ~N*(N1+N2) and oracle-pinned, not slower
-      than three 1024-point FFTs) and `TNNetForwardSTFT` (direct DFT for short
-      NFFT; see the 2.9 follow-up). TNNetImplicitLongConv / Hyena have no FFT
-      yet (separate item below). Tests: non-pow2 gradient checks for all four
-      layers, SpectralConv1D/2D forward vs a naive DFT, FourierMix FFT vs the
-      naive cos sum, CirculantLinear FFT vs direct at n = 12 and 7, ISTFT at
-      NFFT 20/100/101/400 vs the product-table reference, chroma at NFFT 1000.
 - [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
       (the even/odd split trick) to halve the row cost. Low priority: the FFTs
       are small next to LaMa's convolutions; do it only if a profile shows them.
@@ -2405,19 +2345,6 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [X] Antialiased downscale in the HF image preprocessing helpers. DONE:
-      neuralimageresize.ResizeImagePIL (all six PIL filters through the one
-      BuildAxis; RoundToBytes = PIL's 8-bit path: 22-bit fixed-point weights,
-      uint8 after each pass; verified 0-diff vs PIL RGB and ~5e-7 vs mode 'F'
-      out of repo) + ResizeByteImageShortestEdge (long side Trunc as HF and
-      torchvision, not Round). `ClipPreprocessImage` uses the config's
-      "resample" (TClipImageProcessorConfig.Resample, default BICUBIC);
-      `PreprocessImageForVisionModel`/`LoadImageForVisionModel` take a Filter
-      (default bilinear = torchvision Resize); TNNetImagePreprocess.Resample is
-      read from the config. Tests: TestClipImagePreprocess gained a 20x13 HF
-      CLIPImageProcessor shrink (4.8e-7), plus a hand-computed bilinear 4x4->2x2
-      and a 10x7 bicubic shrink vs ResizeImagePIL. No old expectation changed
-      (all earlier tests used identity resizes).
 - [ ] HF processors whose `size` is {"height","width"} (ViTImageProcessor,
       SiglipImageProcessor) resize straight to (H,W) without keeping the aspect
       ratio; `ClipPreprocessImage` and `ReadImagePreprocessConfig` turn that into
