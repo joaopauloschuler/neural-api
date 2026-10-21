@@ -1903,6 +1903,10 @@ type
   // Standard normal sample (Marsaglia polar) drawn from the global Random RNG.
   function RandomStdNormal(): TNeuralFloat;
 
+  // RandSeed := Seed, and the next Random starts Seed's sequence even when FPC's
+  // generator would skip the reseed (it reseeds only when RandSeed changed).
+  procedure RestartRandSeed(Seed: cardinal);
+
   { MixVolumes computes the convex combination
       Output := Lambda*A + (1-Lambda)*B
     Output is resized to match A. A and B must have matching sizes. }
@@ -5723,6 +5727,15 @@ begin
   if Abs(x) < Tolerance
   then WriteLn(' Passed.')
   else WriteLn(' FAILED.');
+end;
+
+// FPC reseeds when RandSeed differs from its last-seed marker; a Random call
+// with RandSeed = A leaves the marker at A or not(A), and A = Seed xor 1.
+procedure RestartRandSeed(Seed: cardinal);
+begin
+  RandSeed := Seed xor 1;
+  Random(2);
+  RandSeed := Seed;
 end;
 
 // Standard normal sample (Marsaglia polar) using the global Random RNG.

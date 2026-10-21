@@ -92273,7 +92273,7 @@ begin
     (Height div csQwenImage21PixelsPerLatent), 1,
     FTransformerConfig.InChannels);
   SavedSeed := RandSeed;
-  RandSeed := Seed;
+  RestartRandSeed(Seed);
   Latents.RandomizeGaussian(1.0);
   RandSeed := SavedSeed;
 end;

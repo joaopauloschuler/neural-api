@@ -35741,6 +35741,16 @@ begin
     Pipeline.MakeInitialLatents(128, 64, 42, LatentsB);
     AssertEquals('same seed, same latents', 0, MaxAbsVolumeDiff(LatentsA,
       LatentsB), 0);
+    // Seeding with not(42) leaves RandSeed and FPC's last-seed marker at 42,
+    // so a plain RandSeed := 42 would continue the stream, not restart it.
+    RandSeed := 1;
+    Random(2);
+    RandSeed := not cardinal(42);
+    Random(2);
+    AssertEquals('RandSeed after seeding with not(42)', 42, int64(RandSeed));
+    Pipeline.MakeInitialLatents(128, 64, 42, LatentsB);
+    AssertEquals('same seed after RandSeed = marker = seed', 0,
+      MaxAbsVolumeDiff(LatentsA, LatentsB), 0);
     Pipeline.MakeInitialLatents(128, 64, 43, LatentsB);
     AssertTrue('another seed, other latents',
       MaxAbsVolumeDiff(LatentsA, LatentsB) > 0.1);
