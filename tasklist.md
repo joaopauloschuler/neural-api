@@ -2032,36 +2032,28 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           passes sinks to it yet; cover it with the item above.
     - [ ] GPU-box: GPT-OSS prefill tok/s with the sink heads on
           `cai_sdpa_flash` against the parent commit.
-  - [ ] `TNNetSinkAttention` (StreamingLLM learnable key/value slots, only
-        built by `AddMultiHeadSelfAttention`'s sink variant; no importer).
-        Fits `cai_sdpa_flash` with NO kernel change: put the K sink slots in
-        cache rows 0..K-1 (uploaded from the 2K neurons when the weights
-        change) and append the real K/V at slot K; mask mode 1 then gives row
-        t the keys [0, K + t + 1), i.e. sinks never masked plus causal, and
-        mode 0 the non-causal case. Needs a `ComputeFlashPacked` variant
-        that keeps a prefix of uploaded rows (CacheMax = K + T). Note
-        FStruct[2] holds K, so the inherited window is always 0. The CPU
-        KV-cache decode is fixed (c4372a7b): an overridden `ComputeIncremental`
-        scores the sink slots beside the cached keys, FP32 and int8 KV
-        (`TestSinkAttentionCachedDecodeParity`,
-        `TestStreamingDecoderSinkAndDifferentialMatchFullForward`); only the
-        OpenCL device forward remains.
-  - [ ] `TNNetDifferentialAttention` (only built by
-        `AddMultiHeadSelfAttention`'s differential variant; no importer).
-        Two softmax maps over half-width Q1.K1 and Q2.K2 with a shared
-        full-width V, out = A1.V - lambda * A2.V. The flash kernel uses one
-        Dk for Q.K and V, so zero-pad Q instead of splitting: packs
-        [Q1,0|K|V] and [0,Q2|K|V] give Q1.K1 and Q2.K2 against the
-        unchanged K and V; run `cai_sdpa_flash` twice with score scale
-        1/sqrt(d_k/2) (`FlashScoreScale`) into two buffers, then one
-        elementwise kernel Y1 - lambda*Y2 (lambda read from the weight on
-        the device, or uploaded when changed). Needs a small packing kernel
-        (the `FlashPackedSource` hook, as `cai_sdpa_qk_l2norm_packed` does)
-        and a second result buffer in the helper. The CPU KV-cache decode is
-        fixed (c4372a7b): an overridden `ComputeIncremental` runs both maps over
-        the cached half-width keys, FP32 and int8 KV
-        (`TestDifferentialAttentionCachedDecodeParity`); only the OpenCL
-        device forward remains.
+  - [x] `TNNetSinkAttention` full forward on `cai_sdpa_flash` (732bbaa5): the
+        K sink slots are cache rows 0..K-1 (a prefix `ComputeFlashPacked`
+        uploads only when the weights change or the cache buffer regrows), the
+        real K/V sit at slot K, and CacheSlot = K gives mask mode 1 the keys
+        [0, K + t + 1). Source bound, result resident, host fallback
+        (`SinkAttentionFlashOpenCLParity`, max|diff| < 8e-7 on PoCL). Open:
+    - [ ] The cached decode (`ComputeIncremental`, FP32 and int8 KV) still runs
+          on the host: every decode step pulls the [Q|K|V] pack to RAM. Route:
+          a resident cache with the sink rows as a fixed prefix, as the full
+          forward does, on `TNNetFusedSDPACL.Compute` / `ComputeInt8`.
+    - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit.
+  - [x] `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
+        (732bbaa5): one launch with two query heads per KV head
+        (`cai_sdpa_diff_pack_q` writes [Q1,0 | 0,Q2], score scale
+        1/sqrt(d_k/2)), then `cai_sdpa_diff_combine` writes Y1 - lambda*Y2
+        into a second result buffer. Source bound, result resident, host
+        fallback (`DifferentialAttentionFlashOpenCLParity`, max|diff| < 1.5e-6
+        on PoCL). Open:
+    - [ ] The cached decode (`ComputeIncremental`, FP32 and int8 KV) still runs
+          on the host, pulling the [Q|K|V] pack to RAM every step.
+    - [ ] GPU-box: prefill tok/s of an `avDifferential` stack against the
+          parent commit.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
       `TNNetCausalLinearAttention` (the non-causal `TNNetLinearAttention` already
       has a two-GEMM `ComputeOpenCL`). COUPLED, not independent: each is a
@@ -2123,9 +2115,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         SeqLen x SeqLen buffer each forward, then the flash bias argument.
       - `TNNetDotProducts`, the raw contraction behind the CAI self-attention
         builders.
-      `TNNetSinkAttention` and `TNNetDifferentialAttention` are named in the
-      decode-path group above; landing them there covers the vision builders
-      that also use them.
+      `TNNetSinkAttention` and `TNNetDifferentialAttention` got their full
+      forward in the decode-path group above (732bbaa5), which covers the
+      vision builders that use them too.
 - [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO -
       coordinate with the open FFT denormal-trap item, since the device path
       would move that math off the host FPU entirely).
