@@ -21,6 +21,9 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
  - The Karras sigma table sigma_t = sqrt((1-ab_t)/ab_t) is strictly increasing,
    and a full Karras-spaced stochastic Euler-ancestral run is finite and stays
    near the DDIM baseline.
+ - tsTrailing reproduces diffusers' "trailing" timesteps; the zero-terminal-SNR
+   rescale gives ab_T = 0 with ab_1 unchanged, and every sampler stays finite
+   there (DDIM with v-prediction exactly: x0 = -v, eps = x_t at ab_T = 0).
  - TNNetFlowMatchEulerScheduler matches the Qwen-Image-2.1 diffusers oracle
    (tests/fixtures/qwenimage21_scheduler_oracle.json, from
    tools/make_pico_qwenimage21_fixture.py): mu, sigmas, timesteps, two steps.
@@ -85,6 +88,10 @@ type
     procedure TestFlowMatchFromDiffusersConfig;
     procedure TestFlowMatchImg2ImgStartStepVsOracle;
     procedure TestFlowMatchScaleNoiseVsOracle;
+    procedure TestTrailingSpacingMatchesDiffusers;
+    procedure TestZeroTerminalSNRRescale;
+    procedure TestZeroTerminalSNRDDIMVEndpoint;
+    procedure TestZeroTerminalSNRTrailingSamplersFinite;
   end;
 
 implementation
@@ -1180,6 +1187,146 @@ begin
     Noise.Free;
     Sample.Free;
     Root.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestTrailingSpacingMatchesDiffusers;
+const
+  // diffusers DDIMScheduler(1000, timestep_spacing="trailing") gives
+  // [999, 749, 499, 249] for N=4 and [999, 666, 332] for N=3; Tt = t + 1 here.
+  cTrailing4: array[0..3] of integer = (1000, 750, 500, 250);
+  cTrailing3: array[0..2] of integer = (1000, 667, 333);
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  k: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+    0.00085, 0.012);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    FRecN := 0;
+    Sched.Sample(X, @RecordingModel, 4, smDDIM, 0.0, tsTrailing);
+    AssertEquals('N=4 call count', 4, FRecN);
+    for k := 0 to 3 do
+      AssertEquals('trailing N=4 @ ' + IntToStr(k), cTrailing4[k], FRecT[k]);
+    FRecN := 0;
+    Sched.Sample(X, @RecordingModel, 3, smDDIM, 0.0, tsTrailing);
+    AssertEquals('N=3 call count', 3, FRecN);
+    for k := 0 to 2 do
+      AssertEquals('trailing N=3 @ ' + IntToStr(k), cTrailing3[k], FRecT[k]);
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestZeroTerminalSNRRescale;
+const
+  cTZ = 1000;
+var
+  Base, Zero: TNNetDiffusionScheduler;
+  t: integer;
+  sqrtFirst, sqrtLast, expected: double;
+begin
+  // Marigold's scheduler_config: scaled_linear 0.00085..0.012, rescaled.
+  Base := TNNetDiffusionScheduler.Create(cTZ, dsScaledLinear, dpV,
+    0.00085, 0.012);
+  Zero := TNNetDiffusionScheduler.Create(cTZ, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true);
+  try
+    AssertTrue('flag', Zero.RescaleZeroTerminalSNR);
+    AssertEquals('ab_T is exactly 0', 0.0, Zero.AlphaBar[cTZ], 0.0);
+    AssertEquals('beta_T is 1', 1.0, Zero.Beta[cTZ], 1e-7);
+    AssertEquals('ab_1 unchanged', Base.AlphaBar[1], Zero.AlphaBar[1], 1e-7);
+    AssertEquals('beta_1 unchanged', Base.Beta[1], Zero.Beta[1], 1e-7);
+    // Algorithm 1 applied by hand to the unrescaled table.
+    sqrtFirst := Sqrt(Base.AlphaBar[1]);
+    sqrtLast := Sqrt(Base.AlphaBar[cTZ]);
+    for t := 1 to cTZ do
+    begin
+      expected := Sqr((Sqrt(Base.AlphaBar[t]) - sqrtLast) * sqrtFirst /
+        (sqrtFirst - sqrtLast));
+      AssertEquals('rescaled ab @ ' + IntToStr(t), expected, Zero.AlphaBar[t], 2e-6);
+      AssertTrue('non-increasing @ ' + IntToStr(t),
+        Zero.AlphaBar[t] <= Zero.AlphaBar[t - 1]);
+    end;
+    // Reciprocal-based quantities stay finite at ab_T = 0.
+    AssertFalse('sigma_T finite', IsNan(Zero.SigmaAt[cTZ]) or IsInfinite(Zero.SigmaAt[cTZ]));
+    AssertTrue('sigma_T above sigma_{T-1}', Zero.SigmaAt[cTZ] > Zero.SigmaAt[cTZ - 1]);
+    AssertEquals('v SNR weight at SNR 0', 0.0, Zero.SNRWeight(cTZ), 1e-7);
+  finally
+    Base.Free; Zero.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestZeroTerminalSNRDDIMVEndpoint;
+const
+  cTZ = 1000;
+  cTPrev = 750;
+var
+  Sched: TNNetDiffusionScheduler;
+  Xt, V, Got: TNNetVolume;
+  i: integer;
+  sqrtAbPrev, somabPrev: double;
+begin
+  // At ab_T = 0 the v identities give x0 = -v and eps = x_t, so DDIM (eta 0)
+  // must land on sqrt(ab_prev)*(-v) + sqrt(1-ab_prev)*x_t.
+  Sched := TNNetDiffusionScheduler.Create(cTZ, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true);
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  V := TNNetVolume.Create(cN, 1, 1);
+  Got := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Xt.FData[i] := 0.25 * i - 0.9;
+      V.FData[i] := 0.4 * Cos(i);
+    end;
+    Sched.PredictX0(Xt, V, Got, cTZ);
+    for i := 0 to cN - 1 do
+      AssertEquals('x0 = -v @ ' + IntToStr(i), -V.FData[i], Got.FData[i], 1e-7);
+    sqrtAbPrev := Sqrt(Sched.AlphaBar[cTPrev]);
+    somabPrev := Sqrt(1.0 - Sched.AlphaBar[cTPrev]);
+    Got.Copy(Xt);
+    Sched.Step(Got, V, cTZ, cTPrev, smDDIM, 0.0);
+    for i := 0 to cN - 1 do
+      AssertEquals('DDIM endpoint @ ' + IntToStr(i),
+        -sqrtAbPrev * V.FData[i] + somabPrev * Xt.FData[i], Got.FData[i], 1e-6);
+  finally
+    Sched.Free; Xt.Free; V.Free; Got.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestZeroTerminalSNRTrailingSamplersFinite;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  Method: TNNetSamplerMethod;
+  Prediction: TNNetPredictionType;
+  i: integer;
+  Eta: TNeuralFloat;
+begin
+  // Every sampler, both prediction types, starting at the ab_T = 0 endpoint:
+  // no FP trap and a finite result. Eta 1 also covers the stochastic branches.
+  for Prediction := Low(TNNetPredictionType) to High(TNNetPredictionType) do
+  begin
+    Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, Prediction,
+      0.00085, 0.012, 0.008, true);
+    X := TNNetVolume.Create(cN, 1, 1);
+    try
+      for Method := Low(TNNetSamplerMethod) to High(TNNetSamplerMethod) do
+        for Eta in [0.0, 1.0] do
+        begin
+          for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+          Sched.Sample(X, @ToyModel, 4, Method, Eta, tsTrailing);
+          for i := 0 to cN - 1 do
+            AssertFalse('finite method ' + IntToStr(Ord(Method)) + ' pred ' +
+              IntToStr(Ord(Prediction)) + ' @ ' + IntToStr(i),
+              IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+        end;
+    finally
+      Sched.Free; X.Free;
+    end;
   end;
 end;
 

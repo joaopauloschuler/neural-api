@@ -103,7 +103,12 @@ type
   //     are placed geometrically-warped between sigma_min and sigma_max and then
   //     mapped back to the nearest schedule timestep. Pairs naturally with the
   //     Euler-ancestral sampler but works with any method.
-  TNNetTimestepSpacing = (tsUniform, tsKarras);
+  //   tsTrailing : diffusers timestep_spacing="trailing", round(arange(T,0,-T/N))-1
+  //     in diffusers' 0-based timesteps, i.e. Tt = round(T - k*T/N) here, so the
+  //     first step is always Tt=T (T=1000, N=4: 1000,750,500,250). A plain
+  //     timestep list, so it works with every method; it replaces tsKarras
+  //     rather than combining with it. Used with the zero-terminal-SNR rescale.
+  TNNetTimestepSpacing = (tsUniform, tsKarras, tsTrailing);
 
   // Caller-supplied denoiser. Given noisy Xt at integer timestep Tt (1..T) it
   // must write the model prediction (eps or v, per the scheduler's
@@ -126,6 +131,10 @@ type
     // FAlphaBar, so they are tabulated once in BuildTables instead of paying an
     // Ln pair / a Sqrt per sampling step (rule #27).
     FLambda, FSigma: array of TNeuralFloat;
+    // 1/sqrt(ab_t); where ab_t = 0 (zero terminal SNR) it uses cMinAlphaBar,
+    // as do FSigma and FLambda, so no sampler divides by zero.
+    FInvSqrtAlphaBar: array of TNeuralFloat;
+    FRescaleZeroTerminalSNR: boolean;
     // DPM-Solver++ multistep state (previous step's converted x0 prediction).
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
@@ -151,6 +160,9 @@ type
     FEpsScratch: TNNetVolume;
     FX0HatScratch: TNNetVolume;
     procedure BuildTables(Beta1, BetaT, CosineS: TNeuralFloat);
+    // Lin et al. 2023 Algorithm 1 (diffusers rescale_zero_terminal_snr): shifts
+    // sqrt(ab) so ab_T = 0, keeps ab_1, and rewrites beta/alpha/ab to match.
+    procedure RescaleToZeroTerminalSNR;
     function GetBeta(Tt: integer): TNeuralFloat;
     function GetAlpha(Tt: integer): TNeuralFloat;
     function GetAlphaBar(Tt: integer): TNeuralFloat;
@@ -175,15 +187,16 @@ type
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
   public
-    // x0 = (x_t - sqrt(1-ab_t)*eps)/sqrt(ab_t), eps = ToEps(raw); used by LCM and
-    // by sampler previews. X0Out may alias RawPred, never Xt.
+    // x0 from eps or v (dpV: sqrt(ab_t)*x_t - sqrt(1-ab_t)*v, exact at ab_t = 0).
+    // X0Out may alias RawPred, never Xt.
     procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
     // T = number of diffusion steps. Beta1/BetaT used by linear & scaled-linear;
     // CosineS is the small offset of the cosine schedule (default 0.008).
+    // pRescaleZeroTerminalSNR forces ab_T = 0 (needs pT >= 2; pair with dpV + DDIM).
     constructor Create(pT: integer; pSchedule: TNNetBetaSchedule = dsLinear;
       pPrediction: TNNetPredictionType = dpEps;
       Beta1: TNeuralFloat = 1.0e-4; BetaT: TNeuralFloat = 0.02;
-      CosineS: TNeuralFloat = 0.008);
+      CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false);
     destructor Destroy; override;
 
     // Schedule tables (1-based timesteps; index 0 = clean anchor).
@@ -192,6 +205,7 @@ type
     property AlphaBar[Tt: integer]: TNeuralFloat read GetAlphaBar;
     property NumTimesteps: integer read FT;
     property PredictionType: TNNetPredictionType read FPrediction;
+    property RescaleZeroTerminalSNR: boolean read FRescaleZeroTerminalSNR;
 
     // FORWARD process. Xt := sqrt(ab_t)*X0 + sqrt(1-ab_t)*Noise. If NoiseOut is
     // given it receives the sampled noise (the eps training target). When
@@ -379,15 +393,22 @@ implementation
 uses
   fpjson, jsonparser;
 
+const
+  // Stand-in for an alpha_bar of exactly 0 in reciprocals (diffusers uses 2**-24).
+  cMinAlphaBar = 5.9604644775390625e-8;
+
 constructor TNNetDiffusionScheduler.Create(pT: integer;
   pSchedule: TNNetBetaSchedule; pPrediction: TNNetPredictionType;
-  Beta1, BetaT, CosineS: TNeuralFloat);
+  Beta1, BetaT, CosineS: TNeuralFloat; pRescaleZeroTerminalSNR: boolean);
 begin
   inherited Create;
   if pT < 1 then raise Exception.Create('Diffusion T must be >= 1.');
+  if pRescaleZeroTerminalSNR and (pT < 2) then
+    raise Exception.Create('Zero-terminal-SNR rescale needs T >= 2.');
   FT := pT;
   FSchedule := pSchedule;
   FPrediction := pPrediction;
+  FRescaleZeroTerminalSNR := pRescaleZeroTerminalSNR;
   SetLength(FBeta, FT + 1);
   SetLength(FAlpha, FT + 1);
   SetLength(FAlphaBar, FT + 1);
@@ -395,6 +416,7 @@ begin
   SetLength(FSqrtOneMinusAlphaBar, FT + 1);
   SetLength(FLambda, FT + 1);
   SetLength(FSigma, FT + 1);
+  SetLength(FInvSqrtAlphaBar, FT + 1);
   BuildTables(Beta1, BetaT, CosineS);
   FPrevX0 := nil;
   FUniPrevSample := nil;
@@ -485,29 +507,61 @@ begin
         end;
       end;
   end;
-  // Derived per-timestep tables: lambda_t = 0.5*(ln ab - ln(1-ab)) and
-  // sigma_t = sqrt((1-ab)/ab). Both are read once per sampling step (sigma also
-  // FT times per Karras snap), so the transcendentals are paid here instead.
-  // Entries where the closed form is not finite are left at the limit value
-  // (sigma) or unused (lambda: SigmaOf/Lambda keep the direct form there).
+  if FRescaleZeroTerminalSNR then RescaleToZeroTerminalSNR;
+  // Derived per-timestep tables: lambda_t = 0.5*(ln ab - ln(1-ab)),
+  // sigma_t = sqrt((1-ab)/ab) and 1/sqrt(ab), paid once here instead of per
+  // sampling step. An ab of 0 (zero terminal SNR) is read as cMinAlphaBar, as
+  // diffusers' Euler/DPM/UniPC schedulers do, so the reciprocals stay finite.
   for i := 0 to FT do
   begin
     abCur := FAlphaBar[i];
+    if abCur <= 0.0 then abCur := cMinAlphaBar;
     if abCur >= 1.0 then
     begin
       FSigma[i] := 0;          // clean anchor
       FLambda[i] := 0;         // unused: Lambda() falls back to the direct form
-    end
-    else if abCur <= 0.0 then
-    begin
-      FSigma[i] := MaxSingle;  // keeps the table monotone for the sigma search
-      FLambda[i] := 0;         // unused, as above
+      FInvSqrtAlphaBar[i] := 1;
     end
     else
     begin
       FSigma[i] := Sqrt((1.0 - abCur) / abCur);
       FLambda[i] := 0.5 * (Ln(abCur) - Ln(1.0 - abCur));
+      FInvSqrtAlphaBar[i] := 1.0 / Sqrt(abCur);
     end;
+  end;
+end;
+
+procedure TNNetDiffusionScheduler.RescaleToZeroTerminalSNR;
+var
+  i: integer;
+  SqrtAlphaBar: array of double;
+  prod, sqrtFirst, sqrtLast, shiftScale, abPrev, abCur: double;
+begin
+  // Double-precision cumprod of the base betas, then sqrt(ab).
+  SetLength(SqrtAlphaBar, FT + 1);
+  prod := 1.0;
+  for i := 1 to FT do
+  begin
+    prod := prod * (1.0 - FBeta[i]);
+    SqrtAlphaBar[i] := Sqrt(prod);
+  end;
+  sqrtFirst := SqrtAlphaBar[1];
+  sqrtLast := SqrtAlphaBar[FT];
+  if sqrtFirst <= sqrtLast then
+    raise Exception.Create('Zero-terminal-SNR rescale needs a decreasing alpha_bar.');
+  shiftScale := sqrtFirst / (sqrtFirst - sqrtLast);
+  abPrev := 1.0;
+  for i := 1 to FT do
+  begin
+    // Shift so the last entry is 0, scale so the first is unchanged, square.
+    if i = FT then abCur := 0.0
+    else abCur := Sqr((SqrtAlphaBar[i] - sqrtLast) * shiftScale);
+    FAlpha[i] := abCur / abPrev;
+    FBeta[i] := 1.0 - FAlpha[i];
+    FAlphaBar[i] := abCur;
+    FSqrtAlphaBar[i] := Sqrt(abCur);
+    FSqrtOneMinusAlphaBar[i] := Sqrt(1.0 - abCur);
+    abPrev := abCur;
   end;
 end;
 
@@ -525,19 +579,16 @@ var ab: double;
 begin
   ab := FAlphaBar[Tt];
   // lambda = log( sqrt(ab) / sqrt(1-ab) ) = 0.5*(log ab - log(1-ab)), tabulated
-  // in BuildTables wherever it is finite (0 < ab < 1).
-  if (ab > 0.0) and (ab < 1.0) then Result := FLambda[Tt]
+  // in BuildTables for every ab < 1 (ab = 0 reads as cMinAlphaBar).
+  if ab < 1.0 then Result := FLambda[Tt]
   else Result := 0.5 * (Ln(ab) - Ln(1.0 - ab));
 end;
 
 function TNNetDiffusionScheduler.SigmaOf(Tt: integer): TNeuralFloat;
-var ab: double;
 begin
-  // sigma_t = sqrt((1-ab_t)/ab_t), tabulated in BuildTables. At Tt=0 (clean
-  // anchor) this is 0.
-  ab := FAlphaBar[Tt];
-  if ab > 0.0 then Result := FSigma[Tt]
-  else Result := Sqrt((1.0 - ab) / ab);
+  // sigma_t = sqrt((1-ab_t)/ab_t), tabulated in BuildTables (0 at the clean
+  // anchor Tt=0, cMinAlphaBar-based where ab_t = 0).
+  Result := FSigma[Tt];
 end;
 
 function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
@@ -556,8 +607,8 @@ begin
       // v-prediction: divide by (SNR + 1). Gamma = +Inf -> SNR/(SNR+1).
       Result := clamped / (snr + 1.0);
     else // dpEps
-      // eps-prediction: divide by SNR. Gamma = +Inf -> 1.
-      Result := clamped / snr;
+      // eps-prediction: min(SNR, Gamma)/SNR, written so SNR = 0 gives 1.
+      if snr < Gamma then Result := 1.0 else Result := Gamma / snr;
   end;
 end;
 
@@ -588,7 +639,7 @@ var
   k, Tt: integer;
   NumStepsM1, FTM1: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
-  pMax, pMin: double;
+  pMax, pMin, trailingStride: double;
 const
   cRho = 7.0; // Karras et al. (2022) recommended rho.
 begin
@@ -621,6 +672,19 @@ begin
             Result[k] := Tt;
           end;
         Result[NumSteps] := 0; // clean-image anchor.
+      end;
+    tsTrailing:
+      begin
+        // Tt = round(T - k*T/N); diffusers' 0-based t is Tt-1. Both use
+        // round-half-to-even. Clamped to 1 when N > T would reach 0.
+        trailingStride := FT / NumSteps;
+        for k := 0 to NumStepsM1 do
+        begin
+          Tt := Round(FT - k * trailingStride);
+          if Tt < 1 then Tt := 1;
+          Result[k] := Tt;
+        end;
+        Result[NumSteps] := 0;
       end;
     else // tsUniform
       begin
@@ -663,22 +727,23 @@ end;
 procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;
   Tt: integer);
 var
-  somab, invSqrtAb: TNeuralFloat;
-  Eps: TNNetVolume;
+  RawCoef, XtCoef: TNeuralFloat;
 begin
-  // Reuse the shared eps plumbing, then map eps -> x0. Use a persistent scratch
-  // buffer (rule #17) so X0Out may safely alias RawPred.
-  if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
-  else FEpsScratch.ReSize(Xt);
-  Eps := FEpsScratch;
-  ToEps(Xt, RawPred, Eps, Tt);
-  somab := FSqrtOneMinusAlphaBar[Tt];
-  invSqrtAb := 1.0 / FSqrtAlphaBar[Tt];
-  // x0 = (Xt - somab*Eps)*invSqrtAb (rule #13). Eps is a distinct scratch and
-  // X0Out never aliases Xt at any call site, so the copy-first form is safe.
-  X0Out.Copy(Xt);
-  X0Out.MulAdd(-somab, Eps);
-  X0Out.Mul(invSqrtAb);
+  // Both forms are X0Out := RawCoef*RawPred + XtCoef*Xt (rule #13), so X0Out
+  // may alias RawPred. v needs no 1/sqrt(ab), which keeps ab_t = 0 exact.
+  if FPrediction = dpV then
+  begin
+    RawCoef := -FSqrtOneMinusAlphaBar[Tt];
+    XtCoef := FSqrtAlphaBar[Tt];
+  end
+  else
+  begin
+    XtCoef := FInvSqrtAlphaBar[Tt];
+    RawCoef := -FSqrtOneMinusAlphaBar[Tt] * XtCoef;
+  end;
+  if X0Out <> RawPred then X0Out.Copy(RawPred);
+  X0Out.Mul(RawCoef);
+  X0Out.MulAdd(XtCoef, Xt);
 end;
 
 procedure TNNetDiffusionScheduler.AddNoise(X0, Xt: TNNetVolume; Tt: integer;
@@ -800,14 +865,17 @@ begin
   if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
   else FEpsScratch.ReSize(Xt);
   Eps := FEpsScratch;
-  // All updates work from eps; v-prediction is converted up front.
-  ToEps(Xt, RawPred, Eps, Tt);
+  // The other updates work from eps; v-prediction is converted up front.
+  // DDIM, DPM++ and UniPC read RawPred directly (via PredictX0 for the latter).
+  if not (Method in [smDDIM, smDPMSolverPP2M, smUniPC]) then
+    ToEps(Xt, RawPred, Eps, Tt);
   XtSizeM1 := Xt.Size - 1;
   case Method of
       smDDPM:
         begin
           // x_{Tt-1} = 1/sqrt(a_t)*(x_t - beta_t/sqrt(1-ab_t)*eps) + sigma*z.
-          invSqrtAlpha := 1.0 / Sqrt(FAlpha[Tt]);
+          // alpha_T is 0 under the zero-terminal-SNR rescale; floor it as ab.
+          invSqrtAlpha := 1.0 / Sqrt(Max(FAlpha[Tt], cMinAlphaBar));
           coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
           needNoise := Tt > 1;
           if needNoise then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
@@ -843,27 +911,31 @@ begin
             sigma := 0;
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
           somabT := FSqrtOneMinusAlphaBar[Tt];
-          invSqrtAbT := 1.0 / Sqrt(abT);
+          // #5/#13: the update is kA*x_t + cE*RawPred (+ sigma*z). For v,
+          //   x0 = sqrt(ab_t)*x_t - somab_t*v, eps = somab_t*x_t + sqrt(ab_t)*v,
+          // which has no 1/sqrt(ab_t) and so stays exact at ab_t = 0.
+          if FPrediction = dpV then
+          begin
+            kA := sqrtAbPrev * FSqrtAlphaBar[Tt] + dirCoef * somabT;
+            cE := dirCoef * FSqrtAlphaBar[Tt] - sqrtAbPrev * somabT;
+          end
+          else
+          begin
+            kA := sqrtAbPrev * FInvSqrtAlphaBar[Tt];
+            cE := dirCoef - kA * somabT;
+          end;
           if sigma > 0 then
           begin
-            // #5: fold the affine into per-step coeffs. Expanding
-            //   sqrt(ab_prev)*(x_t - somab_t*eps)/sqrt(ab_t) + dirCoef*eps
-            // gives kA*x_t + cE*eps, kA = sqrt(ab_prev)/sqrt(ab_t).
-            kA := sqrtAbPrev * invSqrtAbT;
-            cE := dirCoef - kA * somabT;
             for i := 0 to XtSizeM1 do
             begin
               z := RandG(0, 1);
-              Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + sigma * z;
+              Xt.FData[i] := kA * Xt.FData[i] + cE * RawPred.FData[i] + sigma * z;
             end;
           end
           else
           begin
-            // sigma=0 (z=0): Xt := k*Xt + c*Eps, a uniform affine map (#13).
-            //   k = sqrt(ab_prev)/sqrt(ab_t),
-            //   c = dirCoef - sqrt(ab_prev)/sqrt(ab_t)*somab_t.
-            Xt.Mul(sqrtAbPrev * invSqrtAbT);
-            Xt.MulAdd(dirCoef - sqrtAbPrev * invSqrtAbT * somabT, Eps);
+            Xt.Mul(kA);
+            Xt.MulAdd(cE, RawPred);
           end;
         end;
       smEulerAncestral:
@@ -880,9 +952,8 @@ begin
           //                        = x0 + (sigma_down/s1)*(x_t/sqrt(ab_t) - x0).
           // Finally re-noise to VP scale at TtPrev: multiply by sqrt(ab_prev)
           // and add the ancestral term sqrt(ab_prev)*sigma_up*z.
-          abT := FAlphaBar[Tt];
           somabT := FSqrtOneMinusAlphaBar[Tt];
-          invSqrtAbT := 1.0 / Sqrt(abT);
+          invSqrtAbT := FInvSqrtAlphaBar[Tt];
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
@@ -939,13 +1010,9 @@ begin
           // where D is the data-prediction x0 (2nd-order corrected when history
           // is available): D = (1+1/(2r))*x0_cur - (1/(2r))*x0_prev,
           //   r = h_last / h, h_last = lambda_t - lambda_{Tt of previous step}.
-          abT := FAlphaBar[Tt];
-          somabT := FSqrtOneMinusAlphaBar[Tt];
-          invSqrtAbT := 1.0 / Sqrt(abT);
-          // Convert current eps -> x0 prediction; reuse Eps to hold curX0.
-          // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
-          Eps.Mul(-somabT * invSqrtAbT);
-          Eps.MulAdd(invSqrtAbT, Xt);
+          invSqrtAbT := FInvSqrtAlphaBar[Tt];
+          // Current x0 prediction into Eps (it holds curX0 from here on).
+          PredictX0(Xt, RawPred, Eps, Tt);
           lamT := Lambda(Tt);
           if TtPrev = 0 then
           begin
@@ -1010,11 +1077,8 @@ begin
           //   h_phi_1 = expm1(hh),  B_h = expm1(hh) (bh2).
           // 1. Convert current eps -> current x0 prediction m_t (reuse Eps).
           abT := FAlphaBar[Tt];
-          somabT := FSqrtOneMinusAlphaBar[Tt];
-          invSqrtAbT := 1.0 / Sqrt(abT);
-          // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
-          Eps.Mul(-somabT * invSqrtAbT);
-          Eps.MulAdd(invSqrtAbT, Xt);
+          // Current x0 prediction m_t into Eps.
+          PredictX0(Xt, RawPred, Eps, Tt);
           lamT := Lambda(Tt);
 
           // 2. CORRECTOR: uses the PREVIOUS step's stored output (m0 = the
@@ -1169,7 +1233,7 @@ var
   NumStepsM1: integer;
   Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
-  sigma, sigmaNext, sqrtAbT, sqrtAbPrev: TNeuralFloat;
+  sigma, sigmaNext, sqrtAbPrev: TNeuralFloat;
   kEuler, cCorr1, cCorr2: TNeuralFloat;
   invSqrtAbT, invSigma, invSigmaNext, dSig, halfDSig: TNeuralFloat;
 begin
@@ -1200,9 +1264,8 @@ begin
       TtPrev := Schedule[k + 1];
       sigma := SigmaOf(Tt);
       sigmaNext := SigmaOf(TtPrev);          // 0 when TtPrev = 0
-      sqrtAbT := FSqrtAlphaBar[Tt];
       // Step-invariant reciprocals/deltas hoisted out of the element loops (#5).
-      invSqrtAbT := 1.0 / sqrtAbT;
+      invSqrtAbT := FInvSqrtAlphaBar[Tt];
       // sigma_t is 0 wherever ab_t reaches 1 (Beta1 = 0, or a cosine schedule
       // whose first beta clips to 0). There is no drift at a clean sample, so
       // the reciprocal collapses to 0 instead of overflowing.

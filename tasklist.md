@@ -287,12 +287,17 @@ rather than acted on.
       with `dpV`. Missing pieces, all checked against the shipped
       `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
       "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [ ] `TNNetTimestepSpacing` value for diffusers "trailing" spacing
-            (`round(arange(T, 0, -T/N)) - 1`), next to tsUniform/tsKarras.
-      - [ ] Zero-terminal-SNR beta rescale (Lin et al. 2023, Algorithm 1 on
+      - [X] `TNNetTimestepSpacing` value for diffusers "trailing" spacing
+            (`round(arange(T, 0, -T/N)) - 1`), next to tsUniform/tsKarras:
+            `tsTrailing` (Tt = t + 1 here). `scaled_linear` already exists as
+            `dsScaledLinear`.
+      - [X] Zero-terminal-SNR beta rescale (Lin et al. 2023, Algorithm 1 on
             sqrt(alphas_cumprod), diffusers `rescale_zero_terminal_snr`) as a
             scheduler option; with it the last alpha_bar is 0, so check the DDIM
-            step and the v -> x0 conversion at that endpoint.
+            step and the v -> x0 conversion at that endpoint. Done as the
+            `pRescaleZeroTerminalSNR` constructor option; DDIM and PredictX0
+            with dpV are exact at ab_T = 0, the other samplers floor ab_T at
+            2^-24 in their reciprocals (as diffusers' Euler/DPM/UniPC do).
       - [ ] The pipeline routine in neuralpretrained.pas: resize the long side to
             `default_processing_resolution` (768), pad to a multiple of 8 and
             unpad after (the VAE/UNet builders take a square grid today, so
