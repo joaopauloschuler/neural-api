@@ -1712,11 +1712,11 @@ rather than acted on.
             community LoRA has run yet (user run).
 - [ ] TAESD real-checkpoint check: run examples/LatentTextToImage with a
       downloaded `madebyollin/taesd` (`--tiny-vae DIR --fast-vae`) and compare
-      the image against the full SD VAE decode; add an OpenCL parity test of
-      the composed tiny decoder (the pico tests run on the CPU only). Also open:
-      `BuildTinyVaeDecoderFromSafeTensors` reads only the diffusers
-      `decoder.layers.N` keys, not the original (non-diffusers)
-      `taesd_decoder.safetensors` key layout.
+      the image against the full SD VAE decode. The original madebyollin
+      `taesd_decoder.safetensors` key layout loads too, but only through
+      `BuildTinyVaeDecoderFromSafeTensorsEx` with a hand-built config (that
+      repo ships no config.json); checked on a re-keyed pico fixture, not on
+      the real file.
 - [ ] TAESD previews for examples/QwenImage: examples/QwenImage
       has NO matching tiny decoder: Qwen-Image-2.1's VAE is z_dim 64 at 16x
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's

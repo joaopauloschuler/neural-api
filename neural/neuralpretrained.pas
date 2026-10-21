@@ -11539,8 +11539,8 @@ type
 function ReadTinyVaeDecoderConfigFromJSONFile(
   const FileName: string): TTinyVaeDecoderConfig;
 
-// Builds the AutoencoderTiny DECODER. Input: a (LatentWidth, LatentHeight,
-// LatentChannels) denoiser latent; output: RGB in [-1, 1] (diffusers decode).
+// Builds the AutoencoderTiny DECODER: (LatentWidth, LatentHeight, LatentChannels)
+// latent -> RGB in [-1, 1]; reads diffusers or original madebyollin TAESD keys.
 function BuildTinyVaeDecoder(Reader: TNNetSafeTensorsReader;
   const Config: TTinyVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
@@ -72109,7 +72109,8 @@ var
   StageConv: array of TNNetLayer;
   Blocks: array of array of TTinyVaeBlockLayers;
   Channels, StagePos, MaxStagePos, BlockPos, MaxBlockPos, LayerIdx: integer;
-  Prefix: string;
+  FirstLayerIdx: integer;
+  LayerPrefix, Prefix: string;
 begin
   if (Config.NumStages < 1) or (Config.NumStages > 8) then
     ImportError('Tiny VAE import: NumStages must be 1..8.');
@@ -72158,17 +72159,33 @@ begin
 
     // ---------------- Weights ----------------
     // decoder.layers.N follows nn.Sequential order: conv, ReLU, then per stage
-    // its blocks, an Upsample (all but the last stage) and a conv.
-    LoadVaeConv(Reader, ConvIn, 'decoder.layers.0.weight',
-      'decoder.layers.0.bias', Channels, Config.LatentChannels, 3);
+    // its blocks, an Upsample (all but the last stage) and a conv. The original
+    // madebyollin taesd_decoder.safetensors saves its bare nn.Sequential, which
+    // starts with a weightless Clamp: the same tensors at N + 1, unprefixed.
+    if Reader.HasTensor('decoder.layers.0.weight') then
+    begin
+      LayerPrefix := 'decoder.layers.';
+      FirstLayerIdx := 0;
+    end
+    else if Reader.HasTensor('1.weight') then
+    begin
+      LayerPrefix := '';
+      FirstLayerIdx := 1;
+    end
+    else
+      ImportError('Tiny VAE import: found neither the diffusers ' +
+        '"decoder.layers.0.weight" nor the original TAESD "1.weight" key.');
+    Prefix := LayerPrefix + IntToStr(FirstLayerIdx);
+    LoadVaeConv(Reader, ConvIn, Prefix + '.weight', Prefix + '.bias',
+      Channels, Config.LatentChannels, 3);
     FoldAffineIntoConv(ConvIn, 3.0, 1.0, 0.0);
-    LayerIdx := 2;
+    LayerIdx := FirstLayerIdx + 2;
     for StagePos := 0 to MaxStagePos do
     begin
       MaxBlockPos := Config.StageBlocks[StagePos] - 1;
       for BlockPos := 0 to MaxBlockPos do
       begin
-        Prefix := 'decoder.layers.' + IntToStr(LayerIdx) + '.conv.';
+        Prefix := LayerPrefix + IntToStr(LayerIdx) + '.conv.';
         LoadVaeConv(Reader, Blocks[StagePos][BlockPos].Conv1,
           Prefix + '0.weight', Prefix + '0.bias', Channels, Channels, 3);
         LoadVaeConv(Reader, Blocks[StagePos][BlockPos].Conv2,
@@ -72177,7 +72194,7 @@ begin
           Prefix + '4.weight', Prefix + '4.bias', Channels, Channels, 3);
         Inc(LayerIdx);
       end;
-      Prefix := 'decoder.layers.';
+      Prefix := LayerPrefix;
       if StagePos < MaxStagePos then
       begin
         Inc(LayerIdx); // the Upsample has no weights

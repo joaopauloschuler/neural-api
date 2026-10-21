@@ -58,6 +58,9 @@ type
     // pico AutoencoderTiny decoder and checks "image" to 1e-4.
     procedure CheckTinyVaeDecoderParity(const FixtureName: string;
       ExpectedLatentChannels: integer);
+    // Loads the fixture's "latent" (shaped by Config) and "image" tensors.
+    procedure LoadTinyVaeDecoderIO(const FixtureName: string;
+      const Config: TTinyVaeDecoderConfig; Latent, Image: TNNetVolume);
     // Runs stage A on the dump's input_ids / ref_s and checks every stage-A
     // stage of the dump; Relative divides each max |diff| by max |reference|.
     procedure CheckKokoroStageAParity(Kokoro: TNNetKokoro;
@@ -1081,6 +1084,8 @@ type
     procedure TestTinyVaeDecoderConfigFromJSONFile;
     procedure TestTinyVaeDecoder4ChParity;
     procedure TestTinyVaeDecoder16ChParity;
+    procedure TestTinyVaeDecoderOriginalKeyLayout;
+    procedure TestTinyVaeDecoderOpenCLParity;
     procedure TestVaeEncoderParity;
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
@@ -41554,12 +41559,29 @@ begin
   AssertTrue('shift_factor', Abs(Config.ShiftFactor - 0.0609) < 1e-6);
 end;
 
+procedure TTestNeuralPretrained.LoadTinyVaeDecoderIO(const FixtureName: string;
+  const Config: TTinyVaeDecoderConfig; Latent, Image: TNNetVolume);
+var
+  Reference: TNNetSafeTensorsReader;
+begin
+  Reference := TNNetSafeTensorsReader.Create(
+    FixturePath(FixtureName + '_io.safetensors'));
+  try
+    // Both fixture tensors are stored [H, W, C], the CAI volume order.
+    Reference.LoadTensorFlat('latent', Latent);
+    Latent.ReSize(Config.LatentWidth, Config.LatentHeight,
+      Config.LatentChannels);
+    Reference.LoadTensorFlat('image', Image);
+  finally
+    Reference.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.CheckTinyVaeDecoderParity(
   const FixtureName: string; ExpectedLatentChannels: integer);
 var
   NN: TNNet;
   Config: TTinyVaeDecoderConfig;
-  Reference: TNNetSafeTensorsReader;
   Latent, Image: TNNetVolume;
   ImageSize: integer;
   MaxDiff: TNeuralFloat;
@@ -41567,8 +41589,6 @@ begin
   NN := BuildTinyVaeDecoderFromSafeTensors(
     FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false,
     FixturePath(FixtureName + '_config.json'));
-  Reference := TNNetSafeTensorsReader.Create(
-    FixturePath(FixtureName + '_io.safetensors'));
   Latent := TNNetVolume.Create;
   Image := TNNetVolume.Create;
   try
@@ -41578,11 +41598,7 @@ begin
     AssertEquals('output width', ImageSize, NN.GetLastLayer().Output.SizeX);
     AssertEquals('output height', ImageSize, NN.GetLastLayer().Output.SizeY);
     AssertEquals('output channels', 3, NN.GetLastLayer().Output.Depth);
-    // Both fixture tensors are stored [H, W, C], the CAI volume order.
-    Reference.LoadTensorFlat('latent', Latent);
-    Latent.ReSize(Config.LatentWidth, Config.LatentHeight,
-      Config.LatentChannels);
-    Reference.LoadTensorFlat('image', Image);
+    LoadTinyVaeDecoderIO(FixtureName, Config, Latent, Image);
     AssertEquals('reference image size', NN.GetLastLayer().Output.Size,
       Image.Size);
     NN.Compute(Latent);
@@ -41594,7 +41610,6 @@ begin
   finally
     Image.Free;
     Latent.Free;
-    Reference.Free;
     NN.Free;
   end;
 end;
@@ -41610,6 +41625,159 @@ procedure TTestNeuralPretrained.TestTinyVaeDecoder16ChParity;
 begin
   CheckTinyVaeDecoderParity('tiny_taesd16_decoder', 16);
 end;
+
+// Re-keys the pico taesd4 decoder to the original madebyollin layout
+// (decoder.layers.N.* -> (N + 1).*) in a temp file; both layouts must decode
+// the fixture latent identically. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestTinyVaeDecoderOriginalKeyLayout;
+const
+  FixtureName = 'tiny_taesd4_decoder';
+  DiffusersPrefix = 'decoder.layers.';
+var
+  Config: TTinyVaeDecoderConfig;
+  Reader, Rekeyed: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  DiffusersNet, OriginalNet: TNNet;
+  Tensor, Latent, Image, DiffusersOut: TNNetVolume;
+  Shape: array of Int64;
+  RekeyedPath, Name, Rest: string;
+  TensorPos, MaxTensorPos, DimPos, MaxDimPos, DotPos: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  Config := ReadTinyVaeDecoderConfigFromJSONFile(
+    FixturePath(FixtureName + '_config.json'));
+  RekeyedPath := GetTempDir(false) + 'cai_taesd4_original_keys.safetensors';
+  DiffusersNet := nil;
+  OriginalNet := nil;
+  Tensor := TNNetVolume.Create;
+  Latent := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  DiffusersOut := TNNetVolume.Create;
+  try
+    Reader := TNNetSafeTensorsReader.Create(
+      FixturePath(FixtureName + '.safetensors'));
+    Writer := TNNetSafeTensorsWriter.Create(RekeyedPath);
+    try
+      MaxTensorPos := Reader.Count - 1;
+      for TensorPos := 0 to MaxTensorPos do
+      begin
+        Name := Reader.TensorName(TensorPos);
+        AssertTrue('diffusers key ' + Name,
+          Copy(Name, 1, Length(DiffusersPrefix)) = DiffusersPrefix);
+        Rest := Copy(Name, Length(DiffusersPrefix) + 1, MaxInt);
+        DotPos := Pos('.', Rest);
+        MaxDimPos := Reader.DimCount(Name) - 1;
+        SetLength(Shape, MaxDimPos + 1);
+        for DimPos := 0 to MaxDimPos do
+          Shape[DimPos] := Reader.DimSize(Name, DimPos);
+        Reader.LoadTensorFlat(Name, Tensor);
+        Writer.AddTensorFlat(
+          IntToStr(StrToInt(Copy(Rest, 1, DotPos - 1)) + 1) +
+          Copy(Rest, DotPos, MaxInt), Shape, Tensor);
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+      Reader.Free;
+    end;
+    Rekeyed := TNNetSafeTensorsReader.Create(RekeyedPath);
+    try
+      AssertTrue('original layout has 1.weight', Rekeyed.HasTensor('1.weight'));
+      AssertTrue('original layout has 3.conv.0.weight',
+        Rekeyed.HasTensor('3.conv.0.weight'));
+      AssertFalse('original layout has no diffusers key',
+        Rekeyed.HasTensor('decoder.layers.0.weight'));
+    finally
+      Rekeyed.Free;
+    end;
+    DiffusersNet := BuildTinyVaeDecoderFromSafeTensorsEx(
+      FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false);
+    OriginalNet := BuildTinyVaeDecoderFromSafeTensorsEx(RekeyedPath, Config,
+      {pTrainable=}false);
+    LoadTinyVaeDecoderIO(FixtureName, Config, Latent, Image);
+    DiffusersNet.Compute(Latent);
+    DiffusersOut.Copy(DiffusersNet.GetLastLayer().Output);
+    OriginalNet.Compute(Latent);
+    AssertEquals('original vs diffusers layout: bit-identical', 0.0,
+      MaxAbsVolumeDiff(DiffusersOut, OriginalNet.GetLastLayer().Output), 0.0);
+    Image.Sub(OriginalNet.GetLastLayer().Output);
+    MaxDiff := Image.GetMaxAbs();
+    AssertTrue('original layout vs reference image max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    DeleteFile(RekeyedPath);
+    OriginalNet.Free;
+    DiffusersNet.Free;
+    DiffusersOut.Free;
+    Image.Free;
+    Latent.Free;
+    Tensor.Free;
+  end;
+end;
+
+// The composed pico taesd4 decoder on OpenCL, first resident (ForceOpenCL off),
+// then forced, against its host decode and the diffusers image. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestTinyVaeDecoderOpenCLParity;
+{$IFDEF OpenCL}
+const
+  FixtureName = 'tiny_taesd4_decoder';
+var
+  NN: TNNet;
+  Config: TTinyVaeDecoderConfig;
+  Latent, Image, HostOut: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Forced: boolean;
+  HostDiff, ImageDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildTinyVaeDecoderFromSafeTensors(
+    FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false,
+    FixturePath(FixtureName + '_config.json'));
+  Latent := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  HostOut := TNNetVolume.Create;
+  try
+    LoadTinyVaeDecoderIO(FixtureName, Config, Latent, Image);
+    NN.Compute(Latent);
+    HostOut.Copy(NN.GetLastLayer().Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      for Forced := false to true do
+      begin
+        NN.ForceOpenCL(Forced);
+        NN.Compute(Latent);
+        NN.GetLastLayer().ForceOutputOnRAM();
+        HostDiff := MaxAbsVolumeDiff(HostOut, NN.GetLastLayer().Output);
+        ImageDiff := MaxAbsVolumeDiff(Image, NN.GetLastLayer().Output);
+        WriteLn('  TAESD pico decoder OpenCL (forced=', Forced, '): max|diff| host=',
+          HostDiff:0:9, ' image=', ImageDiff:0:9);
+        AssertTrue('TAESD OpenCL vs host max |diff| = ' + FloatToStr(HostDiff),
+          HostDiff < 1e-4);
+        AssertTrue('TAESD OpenCL vs diffusers image max |diff| = ' +
+          FloatToStr(ImageDiff), ImageDiff < 1e-4);
+      end;
+      AssertAllOnDevice(NN, TNNetConvolutionReLU, 'TAESD pico decoder');
+      AssertAllOnDevice(NN, TNNetConvolutionLinear, 'TAESD pico decoder');
+    finally
+      NN.ForceOpenCL(False);
+    end;
+  finally
+    HostOut.Free;
+    Image.Free;
+    Latent.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // Tiled VAE decode parity (diffusers enable_vae_tiling port). Two checks on the
 // committed pico decoder, built fully-convolutionally at TWO latent grids from
