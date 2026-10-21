@@ -112,6 +112,17 @@ rather than acted on.
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
+- [ ] Probable defect (not fixed, awaits user decision; found during b81a2760):
+      `TNNetDiffusionScheduler` `smDPMSolverPP2M` (neural/neuraldiffusion.pas)
+      uses the first-order update `(alpha_t/alpha_s)*x - sigma_t*(exp(-h)-1)*x0`,
+      but DPM-Solver++ (data prediction, equal to DDIM) is
+      `(sigma_t/sigma_s)*x - alpha_t*(exp(-h)-1)*x0`; its final step also
+      extrapolates with `h := -hLast`. `TestDPMSolverVsOracle` passes because
+      its numpy oracle seems to carry the same formula. Check against diffusers
+      `DPMSolverMultistepScheduler` (alpha-bar schedule, dpmsolver++, order 2)
+      in the ~/x venv before changing it; the flow-matching sampler
+      (`fsDPMSolverPP2M`) is oracle-checked against diffusers and shares only
+      `DPMSolverPP2MHistoryWeight`.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
