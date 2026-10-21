@@ -299,35 +299,6 @@ rather than acted on.
             instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
             + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
             ab_t = 1 (Beta1 = 0). Not needed by Marigold.
-      - [X] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
-            landed `MarigoldDenoise`, split into:
-            - [X] 2a. Grid: pad (`MarigoldPreprocessImage` PadToSquare +
-                  Alignment, `MarigoldUnpadImage`, shared `PadImageClampToEdge`);
-                  replicate right/bottom as diffusers pad_image. Square pad is
-                  exact only for square inputs; the UNet up path also needs the
-                  latent divisible by 2^(blocks-1), so pass Alignment = 64 for SD2.
-            - [X] 2b. Preprocess: `MarigoldPreprocessImage` ([0,1] -> [-1,1],
-                  long side via `ResizeImagePIL` irfBilinear, then the 2a pad).
-            - [X] 2c. Empty-prompt states: `MarigoldEmptyPromptStates(Folder,
-                  EncStates)` -> (2,1,hidden) last_hidden_state of [49406, 49407]
-                  (diffusers tokenizes "" with do_not_pad, so the UNet TextSeqLen
-                  is 2); caller caches it. `ReadClipConfigFromJSONFile` now takes
-                  flat `clip_text_model` configs; new `BuildClipTextTower`.
-            - [X] 2d. `MarigoldDepthFromDecoded`, `MarigoldNormalsFromDecoded`
-                  (+ `MarigoldNormalizeNormals` again after the resize),
-                  `ResizeImageBilinearNoAntialias` (diffusers is_aa=False);
-                  BuildVaeDecoder applies 1/scaling_factor. Order: decode,
-                  depth/normals, unpad, (ensemble), resize.
-            - [X] 2e. `MarigoldPredict(VaeEncoder, UNet, VaeDecoder, UNetConfig,
-                  Sched, Image, EncStates, StartNoises, NumSteps,
-                  ProcessingResolution, Alignment, PredictNormals, Prediction)`;
-                  one ensemble member per StartNoises latent; pico smoke test.
-            - [X] 2f. `MarigoldEnsembleDepth`: min-max normalize, closed-form
-                  least-squares scale+shift to the per-pixel median, lower median,
-                  min-max to [0,1]. DEVIATION: diffusers refines scale/shift with
-                  BFGS (max_iter 2) on pairwise RMS + range regularizer.
-                  `MarigoldEnsembleNormals`: diffusers "closest" (default) or mean.
-                  No uncertainty output.
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
@@ -1037,7 +1008,7 @@ rather than acted on.
         mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
         rejected. Distinct windowing — own importer branch + fixture.
   - [ ] Real laion checkpoint parity + the log-mel frontend wiring: `ClapFeatureExtractor`
-        produces the 1024x64 mel (depends on freq_ratio=4); wire `neuralaudio.pas`
+        produces the 1024x64 mel (freq_ratio=4 is supported, 7bd3e0cd); wire `neuralaudio.pas`
         log-mel -> `ClapBatchNormMelImage` end-to-end and verify against a downloaded
         `clap-htsat-unfused`. (The RoBERTa BPE tokenizer is already importable.)
 - [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
@@ -1662,11 +1633,6 @@ rather than acted on.
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
             example output.
-      - [X] `padding_mask_crop`: crop to the mask's bounding box plus padding,
-            generate at full resolution, paste back (`apply_overlay`); makes a
-            small hole in a large photo cheap. API: `GetMaskCropRegion`,
-            `ResizeImageAndFill`, `ResizeImageAndCrop`, `PasteInpaintCrop`
-            (neuralimageresize.pas); examples/QwenImage `--padding-mask-crop N`.
 - [ ] LaMa large-mask inpainting follow-ups. `BuildLaMaFromSafeTensors`
       (neuralpretrained.pas, `TestLaMaParity` on the pico fixture from
       `tools/make_pico_lama_fixture.py`) and examples/LaMaInpaint are coded; the
@@ -1678,41 +1644,8 @@ rather than acted on.
             column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
             `FInputPrepared` after the forward, in both memory modes; tiling or
             releasing it is a library-wide decision, not made here.
-- [X] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
-      examples/QwenImage, merged into the transformer weights at load. Today
-      `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
-      text models (`pLoRAAdapterDir` of `BuildFromPretrained`); the image side has
-      no adapter path at all, yet community LoRAs (styles, characters, and
-      step-distilled "Lightning"-type adapters that cut 40 steps to 4-8) are how
-      people use diffusion checkpoints. The transformer reads every tensor through
-      one `TNNetSafeTensorsReader` in `TQwenImage21Transformer.Create`, so wrapping
-      that reader is the whole hook; int8/int4 quantization then sees the merged
-      weights, as on the LLM side. What `TNNetLoRAMergeReader` needs (extend it,
-      do not fork a second reader):
-      - Key prefixes besides `base_model.model.`: diffusers saves
-        `transformer.<m>.lora_A.weight`, ComfyUI-style files use
-        `diffusion_model.<m>`; replace the text-decoder prefix probe with a
-        caller-supplied list of strip prefixes.
-      - The kohya layout: `lora_unet_<m with dots as underscores>.lora_down.weight`
-        / `.lora_up.weight` plus a per-module `.alpha` scalar (scale = alpha /
-        rank, no adapter_config.json). Resolve the flattened name against the
-        base reader's tensor names (dots -> underscores index built once).
-      - Per-adapter user scale multiplied into `Scale`; several adapters stack by
-        chaining merge readers (each one is a `TNNetSafeTensorsReader` base).
-      - Fail loudly on an adapter key with no base tensor (wrong model family)
-        and on LoRA-on-conv tensors the reader cannot merge yet.
-      Tests: a pico adapter on `tests/fixtures/tiny_qwenimage21` in both the
-      diffusers and the kohya key layouts, oracle from the ~/x venv
-      (`pipe.load_lora_weights` + `fuse_lora`, latent after one step), the test
-      itself Pascal; plus an unchanged-tensor pass-through check. README section in
-      examples/QwenImage. Before promising a step cut, check that a step-distilled
-      LoRA exists for Qwen-Image-2.1 (the known Lightning adapters target earlier
-      Qwen-Image releases).
-      API: `TNNetLoRAMergeReader.CreateFromFile(Base, File, StripPrefixes,
-      Scale)`, `CreateLoRAMergeChain`, `DiffusersLoRAStripPrefixes`, the
-      `TQwenImage21Transformer.Create` overload with LoRA files/scales,
-      `TQwenImage21Pipeline.AddLoRA`/`ClearLoRAs`; scale rules follow diffusers'
-      Qwen-Image loader (kohya alpha / r, lora_A/lora_B alpha ignored).
+- [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
+      `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`) can take the same
             reader once the real Stable Diffusion pipeline item above lands.
       - [ ] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
