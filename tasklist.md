@@ -1672,6 +1672,56 @@ rather than acted on.
       - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
             generate at full resolution, paste back (`apply_overlay`); makes a
             small hole in a large photo cheap.
+- [ ] LaMa large-mask inpainting (Suvorov et al. 2021, "Resolution-robust Large
+      Mask Inpainting with Fourier Convolutions"): object removal in one forward
+      pass, no prompt and no denoising loop, on photos larger than the 256/512
+      training size. The checkpoint `anyisalin/big-lama` ships
+      `big-lama.safetensors` (verified from its header: 124M F32 params,
+      `generator.model.*` keys; skip the `*_evaluator.*` and `num_batches_tracked`
+      tensors). Architecture read from the header:
+      - Encoder: ReflectionPad(3) + 7x7 conv 4->64 (input = image*(1-mask) | mask,
+        in [0,1]), then three stride-2 3x3 convs 64->128->256->512, each with
+        BN + ReLU. The last one (`model.4`) splits its output into a local 128 and
+        a global 384 channel branch (`convl2l`, `convl2g`).
+      - 18 `FFCResnetBlock`s (`model.5`..`model.22`), each two FFC + BN + ReLU
+        units plus the residual: out_l = convl2l(x_l) + convg2l(x_g),
+        out_g = convl2g(x_l) + convg2g(x_g). The three local convs are 3x3 with
+        reflect padding. `convg2g` is the spectral transform: 1x1 conv 384->192 +
+        BN + ReLU, a Fourier unit (rfft2 with norm="ortho" over (H, W), real and
+        imaginary parts interleaved per channel into 384 maps of width W/2+1,
+        1x1 conv 384->384 + BN + ReLU, irfft2 back to (H, W)), then a 1x1 conv
+        192->384 of (x + fu(x)). big-lama has no LFU branch.
+      - Decoder: concat the two branches, three ConvTranspose2d(k3, s2, p1,
+        output_padding 1) + BN + ReLU 512->256->128->64, ReflectionPad(3) +
+        7x7 conv 64->3, sigmoid. The pipeline composites
+        mask*pred + (1-mask)*image and pads the input to a multiple of 8.
+      Plan:
+      1. One shared FFT routine. The radix-2 complex FFT is copied three times
+         today: `FourierMixFFT` (FourierMix and SpectralConv2D call it),
+         `CirculantFFT` (TNNetCirculantLinear) and the table-driven
+         `FFTRadix2InPlace` (neuralaudio.pas). Merge them into one routine with
+         optional precomputed twiddles, and add a non-power-of-two path
+         (mixed radix 2/3/5, or Bluestein). The LaMa bottleneck is H/8 x W/8,
+         so a 512x768 photo gives 64x96. Padding to a power of two is NOT
+         equivalent: the Fourier unit's global mixing is circular.
+      2. A `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` layer pair, a port of
+         `torch.fft.rfft2` / `irfft2` (norm "ortho" option, interleaved re/im
+         channel layout, forward and backward so FFC layers can be trained). The
+         Fourier unit is then pure composition: rfft2 -> pointwise conv (BN
+         folded) -> ReLU -> irfft2.
+      3. `BuildLaMaFromSafeTensors` in neuralpretrained.pas. Fold every BN into
+         its conv; reuse `TNNetPad` pmReflect and `TNNetDeconvolution` for the
+         transposed convs.
+      4. examples/LaMaInpaint (`--image FILE --mask FILE --out FILE`, cthreads
+         first in uses) with a README.
+      Tests: an rfft2/irfft2 round trip and an exact-vs-naive-DFT check on
+      power-of-two and on 6x10 shapes, a numerical gradient check of the layer
+      pair, and builder parity < 1e-4 against a short PyTorch re-implementation of
+      the FFC generator (the lama repo is not pip-installable) on a pico
+      random-weight fixture generated in the ~/x venv (the tests
+      themselves in Pascal). Then a real 512x512 run by the user. OpenCL is a
+      follow-up: the 18 blocks are 3x3 and 1x1 convs that already have device
+      paths, so only the FFT pair would run on the host.
 - [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
       examples/QwenImage, merged into the transformer weights at load. Today
       `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
