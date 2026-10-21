@@ -39,7 +39,36 @@ the standard way to decode megapixel SD/SDXL latents on a memory-constrained
 box; tile latent 32, overlap 0.25, clamped to the latent so it is a 1-tile
 no-op on the tiny fixture), `--tiny-vae DIR`, `--preview N` and `--fast-vae`
 (see below), `--smoke` (assert finiteness, print `SMOKE OK`/`SMOKE FAIL`, exit
-without a PPM).
+without a PPM), `--apg ETA,MOMENTUM,THRESHOLD` and `--apg-eps` (see below).
+
+## Adaptive Projected Guidance: `--apg ETA,MOMENTUM,THRESHOLD`
+
+High `--cfg` scales oversaturate the image. `--apg` replaces the CFG mix (and its
+0.7 guidance-rescale) with Adaptive Projected Guidance (Sadat et al., ICLR 2025;
+`TNNetAdaptiveProjectedGuidance` in `neuraldiffusion.pas`, a port of diffusers
+`normalized_guidance`). Each step it takes `diff = cond - uncond`, keeps a running
+average `diff + MOMENTUM * previous` (the paper uses a negative momentum such as
+-0.5; 0 turns it off), scales `diff` down to norm `THRESHOLD` when it is longer
+(0 turns the clamp off), splits it into the part parallel to the conditional
+prediction and the orthogonal rest, and returns
+`uncond + W * (orth + ETA * parallel)` with `W = --cfg`. ETA = 0 drops the
+parallel part, which is the part that causes oversaturation. Norms and dot
+products run over the whole latent.
+
+The flag applies APG to the denoised x0 predictions, as the paper does: the
+example converts both model outputs to x0 with `PredictX0`, mixes them, and
+converts the result back with `RawPredFromX0` before the sampler step. Add
+`--apg-eps` to mix the raw eps predictions instead (what a diffusers guider does
+on an eps model). On the pico fixture both spaces run and stay finite; its random
+weights cannot show which one looks better, so x0 stays the default because it
+is the paper's choice. `--apg 1,0,0` (no projection, momentum or clamp) on eps is
+plain CFG. `--apg` does not apply to `--lcm`, which has no cond/uncond pass.
+
+```
+../../bin/x86_64-linux/bin/LatentTextToImage pixart.safetensors vae.safetensors \
+  --steps 20 --cfg 10 --apg 0,-0.5,15
+../../bin/x86_64-linux/bin/LatentTextToImage --smoke --apg 0,-0.5,15 --apg-eps
+```
 
 ## Tiny VAE previews: `--tiny-vae DIR`, `--preview N`, `--fast-vae`
 

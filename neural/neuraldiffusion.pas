@@ -192,6 +192,9 @@ type
     // x0 from eps or v (dpV: sqrt(ab_t)*x_t - sqrt(1-ab_t)*v, exact at ab_t = 0).
     // X0Out may alias RawPred, never Xt.
     procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
+    // Inverse of PredictX0: the raw prediction (eps or v) whose x0 is X0, Tt >= 1.
+    // RawOut may alias X0, never Xt.
+    procedure RawPredFromX0(Xt, X0, RawOut: TNNetVolume; Tt: integer);
     // T = number of diffusion steps. Beta1/BetaT used by linear & scaled-linear;
     // CosineS is the small offset of the cosine schedule (default 0.008).
     // pRescaleZeroTerminalSNR forces ab_T = 0 (needs pT >= 2; pair with dpV + DDIM).
@@ -309,6 +312,38 @@ type
     // timestep with fresh Gaussian noise. Leaves the sampled x0 in X.
     procedure LCMSample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
       NumSteps: integer = 4; Spacing: TNNetTimestepSpacing = tsUniform);
+  end;
+
+  { TNNetAdaptiveProjectedGuidance }
+  // Adaptive Projected Guidance (Sadat et al., ICLR 2025), diffusers
+  // normalized_guidance + MomentumBuffer, with every reduction over the whole
+  // volume. One instance per trajectory: it owns the momentum running average.
+  // Coded by Claude (AI).
+  TNNetAdaptiveProjectedGuidance = class(TObject)
+  private
+    FEta, FMomentum, FNormThreshold: TNeuralFloat;
+    FUseOriginalFormulation: boolean;
+    FRunningDiff: TNNetVolume;
+    FHasRunningDiff: boolean;
+  public
+    // Momentum is the paper's beta (negative, e.g. -0.5; 0 = none); NormThreshold
+    // is r (0 = no clamp); Eta weighs the component parallel to Cond.
+    constructor Create(pEta, pMomentum, pNormThreshold: TNeuralFloat;
+      pUseOriginalFormulation: boolean = false);
+    // Parses the command-line form 'ETA,MOMENTUM,THRESHOLD' (dot decimals);
+    // raises EConvertError on anything else.
+    constructor CreateFromSpec(const Spec: string);
+    destructor Destroy; override;
+    // Forgets the momentum running average; call before each new trajectory.
+    procedure Reset;
+    // Dst := Uncond + W*(orth + Eta*par) (Cond instead of Uncond with the original
+    // formulation). Dst may alias Cond or Uncond. Allocates only on first use.
+    procedure ApplyAPG(Cond, Uncond, Dst: TNNetVolume; W: TNeuralFloat);
+    property Eta: TNeuralFloat read FEta write FEta;
+    property Momentum: TNeuralFloat read FMomentum write FMomentum;
+    property NormThreshold: TNeuralFloat read FNormThreshold write FNormThreshold;
+    property UseOriginalFormulation: boolean read FUseOriginalFormulation
+      write FUseOriginalFormulation;
   end;
 
   // Resolution-dependent sigma shift of a flow-matching schedule, mu > 0:
@@ -925,6 +960,28 @@ begin
       Xt.FData[i] := sab * X0.FData[i] + somab * RandG(0, 1);
 end;
 
+procedure TNNetDiffusionScheduler.RawPredFromX0(Xt, X0, RawOut: TNNetVolume;
+  Tt: integer);
+var
+  X0Coef, XtCoef, InvSomab: TNeuralFloat;
+begin
+  // eps = (x_t - sqrt(ab)*x0)/sqrt(1-ab); v = (sqrt(ab)*x_t - x0)/sqrt(1-ab).
+  InvSomab := 1.0 / FSqrtOneMinusAlphaBar[Tt];
+  if FPrediction = dpV then
+  begin
+    X0Coef := -InvSomab;
+    XtCoef := FSqrtAlphaBar[Tt] * InvSomab;
+  end
+  else
+  begin
+    X0Coef := -FSqrtAlphaBar[Tt] * InvSomab;
+    XtCoef := InvSomab;
+  end;
+  if RawOut <> X0 then RawOut.Copy(X0);
+  RawOut.Mul(X0Coef);
+  RawOut.MulAdd(XtCoef, Xt);
+end;
+
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
 begin
@@ -1492,6 +1549,122 @@ begin
   finally
     Pred.Free;
   end;
+end;
+
+{ TNNetAdaptiveProjectedGuidance }
+
+constructor TNNetAdaptiveProjectedGuidance.Create(pEta, pMomentum,
+  pNormThreshold: TNeuralFloat; pUseOriginalFormulation: boolean);
+begin
+  inherited Create;
+  FEta := pEta;
+  FMomentum := pMomentum;
+  FNormThreshold := pNormThreshold;
+  FUseOriginalFormulation := pUseOriginalFormulation;
+  FRunningDiff := TNNetVolume.Create;
+  FHasRunningDiff := false;
+end;
+
+constructor TNNetAdaptiveProjectedGuidance.CreateFromSpec(const Spec: string);
+var
+  Fields: array[0..2] of TNeuralFloat;
+  DotFormat: TFormatSettings;
+  Rest: string;
+  FieldIdx, CommaPos: integer;
+begin
+  DotFormat := DefaultFormatSettings;
+  DotFormat.DecimalSeparator := '.';
+  Rest := Spec;
+  for FieldIdx := 0 to 2 do
+  begin
+    CommaPos := Pos(',', Rest);
+    if (FieldIdx < 2) and (CommaPos = 0) then
+      raise EConvertError.Create('APG spec needs ETA,MOMENTUM,THRESHOLD: ' + Spec);
+    if FieldIdx = 2 then CommaPos := Length(Rest) + 1;
+    Fields[FieldIdx] := StrToFloat(Trim(Copy(Rest, 1, CommaPos - 1)), DotFormat);
+    Delete(Rest, 1, CommaPos);
+  end;
+  Create(Fields[0], Fields[1], Fields[2]);
+end;
+
+destructor TNNetAdaptiveProjectedGuidance.Destroy;
+begin
+  FRunningDiff.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetAdaptiveProjectedGuidance.Reset;
+begin
+  FHasRunningDiff := false;
+end;
+
+procedure TNNetAdaptiveProjectedGuidance.ApplyAPG(Cond, Uncond,
+  Dst: TNNetVolume; W: TNeuralFloat);
+var
+  DiffNorm, ClampScale, CondSumSqr, ParCoef: TNeuralFloat;
+  CondCoef, DiffCoef: TNeuralFloat;
+begin
+  // diffusers skips guidance (and the momentum update) at the no-op scale.
+  if (FUseOriginalFormulation and (W = 0)) or
+    ((not FUseOriginalFormulation) and (W = 1)) then
+  begin
+    if Dst <> Cond then Dst.Copy(Cond);
+    exit;
+  end;
+  // Eta = 1 makes the projection cancel out; without momentum or clamp it is CFG.
+  if (FEta = 1) and (FMomentum = 0) and (FNormThreshold <= 0) and
+    (not FUseOriginalFormulation) then
+  begin
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Dst, W);
+    exit;
+  end;
+
+  // Running average avg := (Cond - Uncond) + Momentum*avg (starts at zero).
+  if FHasRunningDiff and (FMomentum <> 0) and (FRunningDiff.Size = Cond.Size) then
+  begin
+    FRunningDiff.Mul(FMomentum);
+    FRunningDiff.Add(Cond);
+  end
+  else
+    FRunningDiff.Copy(Cond);
+  FRunningDiff.Sub(Uncond);
+  FHasRunningDiff := true;
+
+  // diff := ClampScale*avg keeps avg itself unclamped, as in diffusers.
+  ClampScale := 1;
+  if FNormThreshold > 0 then
+  begin
+    DiffNorm := FRunningDiff.GetMagnitude();
+    if DiffNorm > FNormThreshold then ClampScale := FNormThreshold / DiffNorm;
+  end;
+
+  // orth + Eta*par = diff + (Eta-1)*par with par = ((diff.Cond)/(Cond.Cond))*Cond,
+  // so Dst = base + CondCoef*Cond + DiffCoef*avg and avg is never rewritten.
+  ParCoef := 0;
+  if FEta <> 1 then
+  begin
+    CondSumSqr := Cond.GetSumSqr();
+    if CondSumSqr > 0 then
+      ParCoef := ClampScale * FRunningDiff.DotProduct(Cond) / CondSumSqr;
+  end;
+  DiffCoef := W * ClampScale;
+  CondCoef := W * (FEta - 1) * ParCoef;
+  if FUseOriginalFormulation then
+  begin
+    if Dst <> Cond then Dst.Copy(Cond);
+    Dst.Mul(CondCoef + 1);
+  end
+  else if Dst = Cond then
+  begin
+    Dst.Mul(CondCoef);
+    Dst.Add(Uncond);
+  end
+  else
+  begin
+    if Dst <> Uncond then Dst.Copy(Uncond);
+    if CondCoef <> 0 then Dst.MulAdd(CondCoef, Cond);
+  end;
+  Dst.MulAdd(DiffCoef, FRunningDiff);
 end;
 
 { TNNetLCMScheduler }

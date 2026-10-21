@@ -73,6 +73,17 @@ noising or sampling loop is hand-rolled here.
   Enough to watch the loss fall and see the fidelity/diversity trend.
 - **`--full`**: many more training steps and more samples per weight for a sharp,
   statistically cleaner trade-off and a nicer PNG grid.
+- **`--apg ETA,MOMENTUM,THRESHOLD`**: every swept `w` uses Adaptive Projected
+  Guidance (Sadat et al., ICLR 2025; `TNNetAdaptiveProjectedGuidance` in
+  `neuraldiffusion.pas`) instead of `ApplyCFG`, e.g. `--apg 0,-0.5,15`. APG keeps
+  a running average of `cond - uncond` with weight MOMENTUM (negative in the
+  paper, 0 = off), clamps its norm to THRESHOLD (0 = off) and scales its component
+  parallel to the conditional prediction by ETA, which reduces the oversaturation
+  of large `w`. It is applied to the x0 predictions, as in the paper (the example
+  converts eps to x0 with `PredictX0` and back with `RawPredFromX0`); add
+  `--apg-eps` to apply it to eps. The `w = 0` and `w = 1` rows are the
+  unconditional and the conditional model either way. The SMOKE denoiser is too
+  undertrained to show a difference; compare with `--full`.
 
 ## Output
 
@@ -96,6 +107,7 @@ ulimit -v 3000000
 fpc -O3 -Mobjfpc -Sh -Fu../../neural -Fu"$LAZUTILS_PATH" ConditionalDiffusion.lpr
 ./ConditionalDiffusion          # SMOKE
 ./ConditionalDiffusion --full   # sharper, cleaner trend
+./ConditionalDiffusion --full --apg 0,-0.5,15   # same sweep with APG
 ```
 
 Pure CPU.

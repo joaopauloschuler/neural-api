@@ -46,6 +46,10 @@ USAGE
 Optional trailing flags:
   --steps N      number of reverse steps (default 4)
   --cfg W        classifier-free guidance scale (default 4.0)
+  --apg ETA,MOMENTUM,THRESHOLD
+                 Adaptive Projected Guidance instead of CFG + guidance-rescale
+                 (paper setting e.g. 0,-0.5,15); mixes the x0 predictions
+  --apg-eps      apply --apg to the raw eps predictions instead of x0
   --dpm          use DPM-Solver++(2M) instead of DDIM
   --unipc        use UniPC (order-2 bh2 predictor-corrector; better at 5-10 steps)
   --lcm          use the Latent Consistency Model few-step sampler
@@ -254,6 +258,8 @@ var
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i: integer;
   Guidance: TNeuralFloat;
+  APG: TNNetAdaptiveProjectedGuidance;
+  ApgOnEps: boolean;
   SmokeMode, UseLCM, LatentOk, ImageOk, UseTiling, UseFastVae: boolean;
   UsingFixtures: boolean;
   PreviewEvery: integer;
@@ -273,6 +279,8 @@ begin
   PreviewEvery := 0;
   TinyVaeDir := '';
   UsingFixtures := true;
+  APG := nil;
+  ApgOnEps := false;
   // Positional checkpoint args (the first two non-flag args).
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
@@ -297,6 +305,13 @@ begin
     Arg := ParamStr(i);
     if Arg = '--steps' then begin Inc(i); NumSteps := StrToIntDef(ParamStr(i), NumSteps); end
     else if Arg = '--cfg' then begin Inc(i); Guidance := StrToFloatDef(ParamStr(i), Guidance); end
+    else if Arg = '--apg' then
+    begin
+      Inc(i);
+      APG.Free;
+      APG := TNNetAdaptiveProjectedGuidance.CreateFromSpec(ParamStr(i));
+    end
+    else if Arg = '--apg-eps' then ApgOnEps := true
     else if Arg = '--dpm' then Method := smDPMSolverPP2M
     else if Arg = '--unipc' then Method := smUniPC
     else if Arg = '--lcm' then UseLCM := true
@@ -394,6 +409,10 @@ begin
         else             WriteLn('Sampler: DDIM, steps ', NumSteps,
           ', CFG ', Guidance:0:2);
       end;
+      if Assigned(APG) then
+        WriteLn('Guidance: APG on ', BoolToStr(ApgOnEps, 'eps', 'x0'), ', eta ',
+          APG.Eta:0:3, ', momentum ', APG.Momentum:0:3, ', norm threshold ',
+          APG.NormThreshold:0:3);
     end;
 
     // Caller-supplied T5 states (Step 3 = a real T5 tower over a tokenized
@@ -430,6 +449,7 @@ begin
     else
     begin
       Scheduler.ResetMultistep;
+      if Assigned(APG) then APG.Reset;
       Preview.Scheduler := Scheduler;
       for StepCnt := 0 to NumSteps - 1 do
       begin
@@ -441,10 +461,24 @@ begin
         // CFG: cond = prompt T5 states; uncond = null/empty caption (zeros).
         PixArtDenoise(PixArtNet, PixCfg, Latent, T, TextStates, EpsCond);
         PixArtDenoise(PixArtNet, PixCfg, Latent, T, NullStates, EpsUncond);
-        // Guidance-rescale (Lin et al. 2023): counteract the over-exposure of
-        // high CFG by pulling the result's std back toward the conditional's.
-        TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided,
-          Guidance, 0.7);
+        if Assigned(APG) then
+        begin
+          // APG works on the denoised x0 (as in the paper) unless --apg-eps;
+          // x0 is affine in eps with the same x_t, so mapping back is exact.
+          if not ApgOnEps then
+          begin
+            Scheduler.PredictX0(Latent, EpsCond, EpsCond, T);
+            Scheduler.PredictX0(Latent, EpsUncond, EpsUncond, T);
+          end;
+          APG.ApplyAPG(EpsCond, EpsUncond, EpsGuided, Guidance);
+          if not ApgOnEps then
+            Scheduler.RawPredFromX0(Latent, EpsGuided, EpsGuided, T);
+        end
+        else
+          // Guidance-rescale (Lin et al. 2023): counteract the over-exposure of
+          // high CFG by pulling the result's std back toward the conditional's.
+          TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided,
+            Guidance, 0.7);
         Preview.MaybeEmit(Latent, EpsGuided, T, StepCnt + 1);
         Scheduler.Step(Latent, EpsGuided, T, TPrev, Method, 0.0);
         WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
@@ -515,6 +549,7 @@ begin
     end;
   finally
     Image.Free;
+    APG.Free;
     EpsGuided.Free;
     EpsUncond.Free;
     EpsCond.Free;

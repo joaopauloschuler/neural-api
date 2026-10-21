@@ -67,6 +67,12 @@ type
     procedure TestCosineInvariants;
     procedure TestAddNoiseClosedForm;
     procedure TestApplyCFG;
+    procedure TestAPGMatchesCFG;
+    procedure TestAPGProjectionAndClamp;
+    procedure TestAPGMomentum;
+    procedure TestAPGAliasing;
+    procedure TestRawPredFromX0RoundTrip;
+    procedure TestAPGCreateFromSpec;
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
@@ -306,6 +312,236 @@ begin
     TestApplyCFGRescale(Cond, Uncond, w);
   finally
     Cond.Free; Uncond.Free; Dst.Free;
+  end;
+end;
+
+// Fills a 2-element volume; the APG tests below are hand-computed on 2 elements.
+procedure SetPair(V: TNNetVolume; A, B: TNeuralFloat);
+begin
+  V.ReSize(2, 1, 1);
+  V.FData[0] := A;
+  V.FData[1] := B;
+end;
+
+procedure TTestNeuralDiffusion.TestAPGMatchesCFG;
+var
+  Cond, Uncond, Expected, Dst: TNNetVolume;
+  APG: TNNetAdaptiveProjectedGuidance;
+  i: integer;
+begin
+  Cond := TNNetVolume.Create(cN, 1, 1);
+  Uncond := TNNetVolume.Create(cN, 1, 1);
+  Expected := TNNetVolume.Create(cN, 1, 1);
+  Dst := TNNetVolume.Create(cN, 1, 1);
+  APG := TNNetAdaptiveProjectedGuidance.Create(1, 0, 0);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Cond.FData[i] := Sin(i * 0.7) + 0.3;
+      Uncond.FData[i] := Cos(i * 1.3) * 0.5;
+    end;
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Expected, 4.5);
+    APG.ApplyAPG(Cond, Uncond, Dst, 4.5);
+    for i := 0 to cN - 1 do
+      AssertEquals('eta=1,m=0,r=0 is CFG @ ' + IntToStr(i),
+        Expected.FData[i], Dst.FData[i], 0);
+    // W = 1 is the diffusers no-op scale: the conditional comes back unchanged.
+    APG.Eta := 0;
+    APG.ApplyAPG(Cond, Uncond, Dst, 1);
+    for i := 0 to cN - 1 do
+      AssertEquals('W=1 returns cond @ ' + IntToStr(i),
+        Cond.FData[i], Dst.FData[i], 0);
+  finally
+    APG.Free; Cond.Free; Uncond.Free; Expected.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestAPGProjectionAndClamp;
+var
+  Cond, Uncond, Dst: TNNetVolume;
+  APG: TNNetAdaptiveProjectedGuidance;
+begin
+  // Cond = (3,4), Uncond = (1,1): diff = (2,3), u = (0.6,0.8), diff.u = 3.6,
+  // par = (2.16,2.88), orth = (-0.16,0.12), ||diff|| = sqrt(13).
+  Cond := TNNetVolume.Create; Uncond := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  APG := TNNetAdaptiveProjectedGuidance.Create(0, 0, 0);
+  try
+    SetPair(Cond, 3, 4); SetPair(Uncond, 1, 1);
+    // eta = 0: Uncond + 2*orth.
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('eta=0 [0]', 0.68, Dst.FData[0], 1e-6);
+    AssertEquals('eta=0 [1]', 1.24, Dst.FData[1], 1e-6);
+    // eta = 0.5: Uncond + 2*(orth + 0.5*par) = (2.84, 4.12).
+    APG.Eta := 0.5;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('eta=0.5 [0]', 2.84, Dst.FData[0], 1e-5);
+    AssertEquals('eta=0.5 [1]', 4.12, Dst.FData[1], 1e-5);
+    // Original formulation adds to Cond: (3,4) + 2*orth with eta = 0.
+    APG.Eta := 0;
+    APG.UseOriginalFormulation := true;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('original [0]', 2.68, Dst.FData[0], 1e-6);
+    AssertEquals('original [1]', 4.24, Dst.FData[1], 1e-6);
+    APG.UseOriginalFormulation := false;
+    // r = 1 clamps diff to diff/sqrt(13); eta = 1 keeps it whole.
+    APG.Eta := 1;
+    APG.NormThreshold := 1;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('clamp eta=1 [0]', 1 + 4 / Sqrt(13), Dst.FData[0], 1e-6);
+    AssertEquals('clamp eta=1 [1]', 1 + 6 / Sqrt(13), Dst.FData[1], 1e-6);
+    // Clamp and projection together: Uncond + 2*orth/sqrt(13).
+    APG.Eta := 0;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('clamp eta=0 [0]', 1 - 0.32 / Sqrt(13), Dst.FData[0], 1e-6);
+    AssertEquals('clamp eta=0 [1]', 1 + 0.24 / Sqrt(13), Dst.FData[1], 1e-6);
+    // A threshold above ||diff|| leaves diff alone: plain CFG (5,7).
+    APG.Eta := 1;
+    APG.NormThreshold := 10;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('no clamp [0]', 5, Dst.FData[0], 1e-6);
+    AssertEquals('no clamp [1]', 7, Dst.FData[1], 1e-6);
+  finally
+    APG.Free; Cond.Free; Uncond.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestAPGMomentum;
+var
+  Cond, Uncond, Dst: TNNetVolume;
+  APG: TNNetAdaptiveProjectedGuidance;
+begin
+  // Step 1: Cond (3,4), Uncond (1,1), avg = (2,3). Step 2: Cond (2,1), Uncond
+  // (1,2), diff = (1,-1), avg = (1,-1) - 0.5*(2,3) = (0,-2.5).
+  Cond := TNNetVolume.Create; Uncond := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  APG := TNNetAdaptiveProjectedGuidance.Create(0, -0.5, 0);
+  try
+    SetPair(Cond, 3, 4); SetPair(Uncond, 1, 1);
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('m step1 [0]', 0.68, Dst.FData[0], 1e-6);
+    AssertEquals('m step1 [1]', 1.24, Dst.FData[1], 1e-6);
+    // Step 2, eta = 0: par = (-2.5/5)*(2,1) = (-1,-0.5), orth = (1,-2),
+    // Dst = (1,2) + 2*(1,-2) = (3,-2).
+    SetPair(Cond, 2, 1); SetPair(Uncond, 1, 2);
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('m step2 [0]', 3, Dst.FData[0], 1e-6);
+    AssertEquals('m step2 [1]', -2, Dst.FData[1], 1e-6);
+    // After Reset the history is gone: avg = (1,-1), eta = 1 -> (3,0).
+    APG.Reset;
+    APG.Eta := 1;
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('reset [0]', 3, Dst.FData[0], 1e-6);
+    AssertEquals('reset [1]', 0, Dst.FData[1], 1e-6);
+    // The clamp must not leak into the running average: with r = 1 step 2
+    // sees avg = (0,-2.5), clamps it to (0,-1), Dst = (1,2) + 2*(0,-1).
+    APG.Reset;
+    APG.NormThreshold := 1;
+    SetPair(Cond, 3, 4); SetPair(Uncond, 1, 1);
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('m+clamp step1 [0]', 1 + 4 / Sqrt(13), Dst.FData[0], 1e-6);
+    SetPair(Cond, 2, 1); SetPair(Uncond, 1, 2);
+    APG.ApplyAPG(Cond, Uncond, Dst, 2);
+    AssertEquals('m+clamp step2 [0]', 1, Dst.FData[0], 1e-6);
+    AssertEquals('m+clamp step2 [1]', 0, Dst.FData[1], 1e-6);
+  finally
+    APG.Free; Cond.Free; Uncond.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestAPGAliasing;
+var
+  Cond, Uncond, Expected, Alias: TNNetVolume;
+  APG: TNNetAdaptiveProjectedGuidance;
+  Formulation, i: integer;
+begin
+  Cond := TNNetVolume.Create(cN, 1, 1);
+  Uncond := TNNetVolume.Create(cN, 1, 1);
+  Expected := TNNetVolume.Create(cN, 1, 1);
+  Alias := TNNetVolume.Create(cN, 1, 1);
+  APG := TNNetAdaptiveProjectedGuidance.Create(0.3, 0, 0.5);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Cond.FData[i] := Sin(i * 0.9) + 0.2;
+      Uncond.FData[i] := Cos(i * 0.4) * 0.3;
+    end;
+    for Formulation := 0 to 1 do
+    begin
+      APG.UseOriginalFormulation := Formulation = 1;
+      APG.ApplyAPG(Cond, Uncond, Expected, 3);
+      Alias.Copy(Cond);
+      APG.ApplyAPG(Alias, Uncond, Alias, 3);
+      for i := 0 to cN - 1 do
+        AssertEquals('Dst = Cond @ ' + IntToStr(i),
+          Expected.FData[i], Alias.FData[i], 1e-5);
+      Alias.Copy(Uncond);
+      APG.ApplyAPG(Cond, Alias, Alias, 3);
+      for i := 0 to cN - 1 do
+        AssertEquals('Dst = Uncond @ ' + IntToStr(i),
+          Expected.FData[i], Alias.FData[i], 1e-5);
+    end;
+  finally
+    APG.Free; Cond.Free; Uncond.Free; Expected.Free; Alias.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestAPGCreateFromSpec;
+var
+  APG: TNNetAdaptiveProjectedGuidance;
+  Raised: boolean;
+begin
+  APG := TNNetAdaptiveProjectedGuidance.CreateFromSpec('0, -0.5,15.25');
+  try
+    AssertEquals('eta', 0, APG.Eta, 0);
+    AssertEquals('momentum', -0.5, APG.Momentum, 0);
+    AssertEquals('threshold', 15.25, APG.NormThreshold, 0);
+    AssertFalse('diffusers default formulation', APG.UseOriginalFormulation);
+  finally
+    APG.Free;
+  end;
+  Raised := false;
+  try
+    TNNetAdaptiveProjectedGuidance.CreateFromSpec('0,-0.5').Free;
+  except
+    on EConvertError do Raised := true;
+  end;
+  AssertTrue('two fields raise', Raised);
+end;
+
+procedure TTestNeuralDiffusion.TestRawPredFromX0RoundTrip;
+const
+  cTt = 400;
+var
+  Sched: TNNetDiffusionScheduler;
+  Xt, Raw, Back: TNNetVolume;
+  Prediction: TNNetPredictionType;
+  i: integer;
+begin
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  Raw := TNNetVolume.Create(cN, 1, 1);
+  Back := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Xt.FData[i] := 0.3 * i - 1.1;
+      Raw.FData[i] := 0.7 * Sin(i * 1.7);
+    end;
+    for Prediction := dpEps to dpV do
+    begin
+      Sched := TNNetDiffusionScheduler.Create(1000, dsLinear, Prediction);
+      try
+        Sched.PredictX0(Xt, Raw, Back, cTt);
+        Sched.RawPredFromX0(Xt, Back, Back, cTt);
+        for i := 0 to cN - 1 do
+          AssertEquals('raw round trip @ ' + IntToStr(i),
+            Raw.FData[i], Back.FData[i], 1e-5);
+      finally
+        Sched.Free;
+      end;
+    end;
+  finally
+    Xt.Free; Raw.Free; Back.Free;
   end;
 end;
 
