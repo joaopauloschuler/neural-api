@@ -54,6 +54,8 @@ type
     procedure CheckWindowAttentionOpenCLParity(Cosine: boolean);
     // TNNetSinkAttention (or TNNetDifferentialAttention) on OpenCL vs the CPU.
     procedure CheckSinkOrDifferentialFlashParity(Differential: boolean);
+    // Their streamed cached decode on OpenCL vs the CPU (see the tests below).
+    procedure CheckSinkOrDifferentialCachedDecodeParity(Differential: boolean);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -557,12 +559,15 @@ type
     procedure GptOssSinkAttentionFlashOpenCLParity;
     // TNNetSinkAttention on cai_sdpa_flash (sink slots as cache prefix rows) vs
     // the CPU: 1 and 3 sinks, causal and not, key splits, a sink update, host
-    // source and fallback, and the cached decode staying on the host.
+    // source and fallback, and a whole-input cached forward on OpenCL.
     procedure SinkAttentionFlashOpenCLParity;
     // TNNetDifferentialAttention on one two-head cai_sdpa_flash launch plus the
     // combine vs the CPU: causal and not, key splits, a lambda update, host
     // source and fallback, and the cached decode staying on the host.
     procedure DifferentialAttentionFlashOpenCLParity;
+    // Streamed decode of TNNetSinkAttention over the resident KV cache vs the
+    // CPU: flash prefill, snapshot handoff, width-1 steps, rollback, restore.
+    procedure SinkAttentionCachedDecodeOpenCLParity;
     // AddMultiHeadSelfAttention (RoPE, 3 heads) with avSink / avDifferential:
     // every head on OpenCL with its resident source bound, output vs the CPU.
     procedure SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
@@ -85912,7 +85917,7 @@ var
     NNCpu, NNGpu: TNNet;
     Input: TNNetVolume;
     CpuAttn, GpuAttn: TNNetScaledDotProductAttention;
-    PassCnt, MaxOutputPos, GpuForwards: integer;
+    PassCnt, MaxOutputPos, GpuForwards, CachedGpuForwards: integer;
     Diff, MaxDiff, MaxAbsY: TNeuralFloat;
     What: string;
 
@@ -86016,10 +86021,14 @@ var
         FloatToStr(MaxDiff), WithinTolerance());
       AssertEquals(What + ': on OpenCL after a weight change', PassCount + 1,
         GpuAttn.ForwardGPUCnt);
-      // The cached decode on the same OpenCL net stays on the host and still
-      // matches the full forward of the same input.
+      // A cached forward of the whole input on the same OpenCL net matches the
+      // full forward of the same input: on OpenCL for the sink layer, on the
+      // host for the differential one.
       if Causal then
       begin
+        if Differential
+          then CachedGpuForwards := 0
+          else CachedGpuForwards := 1;
         GpuForwards := GpuAttn.ForwardGPUCnt;
         GpuAttn.BeginIncrementalDecode(SeqLen);
         NNGpu.Compute(Input);
@@ -86028,15 +86037,15 @@ var
         GpuAttn.EndIncrementalDecode();
         AssertTrue(What + ': cached decode max|diff| ' + FloatToStr(MaxDiff),
           WithinTolerance());
-        AssertEquals(What + ': cached decode on the host', GpuForwards,
-          GpuAttn.ForwardGPUCnt);
+        AssertEquals(What + ': cached decode forwards on OpenCL',
+          GpuForwards + CachedGpuForwards, GpuAttn.ForwardGPUCnt);
         // Back on the full forward, the flash path resumes.
         MaxDiff := 0;
         ComparePass();
         AssertTrue(What + ': max|diff| after the cached decode ' +
           FloatToStr(MaxDiff), WithinTolerance());
         AssertEquals(What + ': on OpenCL after the cached decode',
-          GpuForwards + 1, GpuAttn.ForwardGPUCnt);
+          GpuForwards + CachedGpuForwards + 1, GpuAttn.ForwardGPUCnt);
       end;
     finally
       Input.Free;
@@ -86064,6 +86073,307 @@ begin
   // A host source of 40 rows is uploaded; one of 8 rows keeps the host path.
   RunCase(16, 40, 2, True, 0.8, 0, True, True);
   RunCase(16, 8, 2, True, 0.8, 0, True, False);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.SinkAttentionCachedDecodeOpenCLParity;
+begin
+  CheckSinkOrDifferentialCachedDecodeParity({Differential=}false);
+end;
+
+procedure TTestNeuralNumerical.CheckSinkOrDifferentialCachedDecodeParity(
+  Differential: boolean);
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  PrefillLen = 6;
+  StepCnt = 9;
+  CaptureStep = 2;
+  RollbackStep = 4;
+  WeightChangeStep = 5;
+  RestoreStep = 6;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function NewAttention(Dk, NumSinks: integer;
+    Lambda: TNeuralFloat): TNNetScaledDotProductAttention;
+  begin
+    if Differential
+      then Result := TNNetDifferentialAttention.Create(Dk, True, Lambda)
+      else Result := TNNetSinkAttention.Create(Dk, True, NumSinks);
+  end;
+
+  // Input -> conv (the source) [-> host-only layer] -> attention -> conv.
+  function BuildNet(NN: TNNet; Width, Dk, NumSinks: integer;
+    Lambda: TNeuralFloat; HostSource: boolean;
+    out Source: TNNetLayer): TNNetScaledDotProductAttention;
+  begin
+    NN.AddLayer(TNNetInput.Create(Width, 1, 3 * Dk));
+    Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
+    if HostSource then NN.AddLayer(THostOnlyMulByConstant.Create(1));
+    Result := NewAttention(Dk, NumSinks, Lambda);
+    NN.AddLayer(Result);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(Dk));
+    NN.SetTrainable(False, False);
+  end;
+
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = csSentinel then Inc(Result);
+  end;
+
+  procedure RunCase(Dk, NumSinks: integer; Int8KV: boolean;
+    Lambda: TNeuralFloat; HostSource: boolean);
+  var
+    CpuPrefill, GpuPrefill, CpuStep, GpuStep: TNNet;
+    CpuPA, GpuPA, CpuSA, GpuSA: TNNetScaledDotProductAttention;
+    CpuSource, GpuPrefillSource, GpuSource, Ignored: TNNetLayer;
+    PrefillIn, StepIn, ThrowawayIn, SnapK, SnapV, CheckK, CheckV: TNNetVolume;
+    SnapKQ, SnapVQ, CheckKQ, CheckVQ: TNNetVolumeQuant8;
+    StepPos, SnapLen, SnapSinks, SnapWindow, GpuSteps: integer;
+    UploadCnt, DownloadCnt, SteadyTransfers, FirstStepUploads: int64;
+    MaxDiff, MaxAbsY, Tolerance: TNeuralFloat;
+    TransfersBefore: TOpenCLTransferCounts;
+    What: string;
+
+    procedure CompareAttention(CpuA, GpuA: TNNetScaledDotProductAttention);
+    var
+      OutputPos: integer;
+      Diff: TNeuralFloat;
+    begin
+      GpuA.ForceOutputOnRAM();
+      for OutputPos := 0 to CpuA.Output.Size - 1 do
+      begin
+        Diff := Abs(CpuA.Output.FData[OutputPos] - GpuA.Output.FData[OutputPos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        MaxAbsY := Max(MaxAbsY, Abs(CpuA.Output.FData[OutputPos]));
+      end;
+    end;
+
+    // Src's cache into Dst through the snapshot volumes.
+    procedure CarryCache(Src, Dst: TNNetScaledDotProductAttention);
+    begin
+      if Int8KV then
+      begin
+        Src.CaptureCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks, SnapWindow);
+        Dst.RestoreCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks,
+          SnapWindow);
+      end
+      else
+      begin
+        Src.CaptureCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+        Dst.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+      end;
+    end;
+
+    procedure CaptureInto(A: TNNetScaledDotProductAttention;
+      K, V: TNNetVolume; KQ, VQ: TNNetVolumeQuant8);
+    begin
+      if Int8KV
+        then A.CaptureCacheStateInt8(KQ, VQ, SnapLen, SnapSinks, SnapWindow)
+        else A.CaptureCacheState(K, V, SnapLen, SnapSinks, SnapWindow);
+    end;
+
+    procedure RestoreFrom(A: TNNetScaledDotProductAttention;
+      K, V: TNNetVolume; KQ, VQ: TNNetVolumeQuant8; Len: integer);
+    begin
+      if Int8KV
+        then A.RestoreCacheStateInt8(KQ, VQ, Len, 0, 0)
+        else A.RestoreCacheState(K, V, Len, 0, 0);
+    end;
+
+    procedure StepBoth(Input: TNNetVolume);
+    begin
+      CpuStep.Compute(Input);
+      // Only a download into the source clears the sentinels.
+      GpuSource.Output.Fill(csSentinel);
+      GpuStep.Compute(Input);
+      if not HostSource then
+        AssertEquals(What + ': step source never downloaded',
+          GpuSource.Output.Size, SentinelSurvivors(GpuSource.Output));
+    end;
+
+  var
+    CheckLen: integer;
+  begin
+    What := Format('differential=%s Dk=%d sinks=%d int8=%s lambda=%.2f ' +
+      'host=%s', [BoolToStr(Differential, true), Dk, NumSinks,
+      BoolToStr(Int8KV, true), Lambda, BoolToStr(HostSource, true)]);
+    CpuPrefill := TNNet.Create();
+    GpuPrefill := TNNet.Create();
+    CpuStep := TNNet.Create();
+    GpuStep := TNNet.Create();
+    PrefillIn := TNNetVolume.Create(PrefillLen, 1, 3 * Dk);
+    StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+    ThrowawayIn := TNNetVolume.Create(1, 1, 3 * Dk);
+    SnapK := TNNetVolume.Create();
+    SnapV := TNNetVolume.Create();
+    CheckK := TNNetVolume.Create();
+    CheckV := TNNetVolume.Create();
+    SnapKQ := TNNetVolumeQuant8.Create();
+    SnapVQ := TNNetVolumeQuant8.Create();
+    CheckKQ := TNNetVolumeQuant8.Create();
+    CheckVQ := TNNetVolumeQuant8.Create();
+    try
+      // Every net gets the same layers, so CopyWeights pairs them by index.
+      CpuPA := BuildNet(CpuPrefill, PrefillLen, Dk, NumSinks, Lambda,
+        HostSource, CpuSource);
+      GpuPA := BuildNet(GpuPrefill, PrefillLen, Dk, NumSinks, Lambda,
+        HostSource, GpuPrefillSource);
+      CpuSA := BuildNet(CpuStep, 1, Dk, NumSinks, Lambda, HostSource, Ignored);
+      GpuSA := BuildNet(GpuStep, 1, Dk, NumSinks, Lambda, HostSource,
+        GpuSource);
+      GpuPrefill.CopyWeights(CpuPrefill);
+      ChangeSinkOrDifferentialWeights(CpuPA, GpuPA, Lambda);
+      CpuStep.CopyWeights(CpuPrefill);
+      GpuStep.CopyWeights(CpuPrefill);
+      CpuSA.MulWeights(1.0);
+      GpuSA.MulWeights(1.0);
+      GpuPrefill.EnableOpenCL(PlatformId, DeviceId);
+      GpuStep.EnableOpenCL(PlatformId, DeviceId);
+      // The producers go to OpenCL whatever their size verdict; the attention
+      // layers keep their own verdict, which a resident source satisfies.
+      GpuPrefillSource.ForceOpenCL(True);
+      GpuSource.ForceOpenCL(True);
+      GpuPA.FusedSDPACL.ForcedFlashMinTokens := 2;
+      GpuStep.LayerProfiling := true;
+      CpuPA.BeginIncrementalDecode(PrefillLen + StepCnt, Int8KV);
+      GpuPA.BeginIncrementalDecode(PrefillLen + StepCnt, Int8KV);
+      CpuSA.BeginIncrementalDecode(PrefillLen + StepCnt, Int8KV);
+      GpuSA.BeginIncrementalDecode(PrefillLen + StepCnt, Int8KV);
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      // Prefill window on the flash kernel, then the snapshot handoff.
+      PrefillIn.RandomizeGaussian(1.0);
+      CpuPrefill.Compute(PrefillIn);
+      GpuPrefill.Compute(PrefillIn);
+      CompareAttention(CpuPA, GpuPA);
+      if not HostSource then
+      begin
+        AssertEquals(What + ': prefill on OpenCL', 1, GpuPA.ForwardGPUCnt);
+        AssertTrue(What + ': prefill on the flash kernel',
+          GpuPA.FusedSDPACL.LastPath = sdpaPathFlash);
+        AssertTrue(What + ': prefill cache resident', GpuPA.CacheOnOpenCL);
+      end;
+      CarryCache(CpuPA, CpuSA);
+      CarryCache(GpuPA, GpuSA);
+      if not HostSource then
+        AssertTrue(What + ': a capture leaves the cache resident',
+          GpuPA.CacheOnOpenCL);
+      AssertFalse(What + ': a restore marks the cache host-written',
+        GpuSA.CacheOnOpenCL);
+      GpuSteps := 0;
+      SteadyTransfers := 0;
+      FirstStepUploads := 0;
+      CheckLen := 0;
+      for StepPos := 0 to StepCnt - 1 do
+      begin
+        if StepPos = RestoreStep then
+        begin
+          RestoreFrom(CpuSA, CheckK, CheckV, CheckKQ, CheckVQ, CheckLen);
+          RestoreFrom(GpuSA, CheckK, CheckV, CheckKQ, CheckVQ, CheckLen);
+          AssertFalse(What + ': restore marks the cache host-written',
+            GpuSA.CacheOnOpenCL);
+        end;
+        if StepPos = WeightChangeStep then
+          ChangeSinkOrDifferentialWeights(CpuSA, GpuSA, -0.5 * Lambda);
+        TransfersBefore := GpuSA.ProfiledTransfers;
+        if StepPos = RollbackStep then
+        begin
+          // A rejected token: step, rewind one row, step again.
+          ThrowawayIn.RandomizeGaussian(1.0);
+          StepBoth(ThrowawayIn);
+          CpuSA.TruncateCache(CpuSA.CacheLength - 1);
+          GpuSA.TruncateCache(GpuSA.CacheLength - 1);
+          Inc(GpuSteps);
+        end;
+        StepIn.RandomizeGaussian(1.0);
+        StepBoth(StepIn);
+        Inc(GpuSteps);
+        UploadCnt := GpuSA.ProfiledTransfers.UploadCount -
+          TransfersBefore.UploadCount;
+        DownloadCnt := GpuSA.ProfiledTransfers.DownloadCount -
+          TransfersBefore.DownloadCount;
+        CompareAttention(CpuSA, GpuSA);
+        if StepPos = 0 then FirstStepUploads := UploadCnt;
+        // A restore re-uploads the cache; a sink change re-uploads the sink rows.
+        if (StepPos <> 0) and (StepPos <> RestoreStep) and
+           ((StepPos <> WeightChangeStep) or Differential) then
+          Inc(SteadyTransfers, UploadCnt + DownloadCnt);
+        AssertEquals(What + ': no download inside a step', 0, DownloadCnt);
+        if StepPos = CaptureStep then
+        begin
+          CaptureInto(CpuSA, CheckK, CheckV, CheckKQ, CheckVQ);
+          CaptureInto(GpuSA, CheckK, CheckV, CheckKQ, CheckVQ);
+          CheckLen := SnapLen;
+          if not HostSource then
+            AssertTrue(What + ': a capture leaves the step cache resident',
+              GpuSA.CacheOnOpenCL);
+        end;
+      end;
+      if Int8KV
+        then Tolerance := 1e-3 * Max(1, MaxAbsY)
+        else Tolerance := 1e-4 * Max(1, MaxAbsY);
+      WriteLn('  sink/differential cached decode ', What, ': max|diff|=',
+        MaxDiff:0:9, ' max|y|=', MaxAbsY:0:4, ' gpu=', GpuSA.ForwardGPUCnt,
+        ' bound=', GpuSA.ProfiledResidency.SourceBoundCnt,
+        ' first-step uploads=', FirstStepUploads,
+        ' steady-step transfers=', SteadyTransfers);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < Tolerance);
+      if HostSource then
+      begin
+        AssertEquals(What + ': a short host source keeps the host path', 0,
+          GpuSA.ForwardGPUCnt);
+        AssertFalse(What + ': the host path leaves no resident output',
+          GpuSA.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': every step on OpenCL', GpuSteps,
+        GpuSA.ForwardGPUCnt);
+      AssertTrue(What + ': width-1 steps on the split decode',
+        GpuSA.FusedSDPACL.LastPath = sdpaPathDecodeSplit);
+      AssertEquals(What + ': source bound every step', GpuSteps,
+        GpuSA.ProfiledResidency.SourceBoundCnt);
+      AssertEquals(What + ': source never pulled', 0,
+        GpuSA.ProfiledResidency.SourcePulledToRAMCnt);
+      AssertEquals(What + ': output resident every step', GpuSteps,
+        GpuSA.ProfiledResidency.OutputResidentCnt);
+      AssertEquals(What + ': no transfer on a steady step', 0, SteadyTransfers);
+      AssertTrue(What + ': the first step uploads the carried cache',
+        FirstStepUploads > 0);
+      GpuSA.EndIncrementalDecode();
+      AssertFalse(What + ': EndIncrementalDecode recovers the cache',
+        GpuSA.CacheOnOpenCL);
+    finally
+      CheckVQ.Free; CheckKQ.Free; SnapVQ.Free; SnapKQ.Free;
+      CheckV.Free; CheckK.Free; SnapV.Free; SnapK.Free;
+      ThrowawayIn.Free; StepIn.Free; PrefillIn.Free;
+      GpuStep.Free; CpuStep.Free; GpuPrefill.Free; CpuPrefill.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261022;
+  RunCase(8, 1, False, 0.8, False);
+  RunCase(16, 3, False, 0.3, False);
+  RunCase(16, 2, True, 0.8, False);
+  RunCase(64, 2, True, 0.5, False);
+  RunCase(10, 2, False, 0.8, True);
 end;
 {$ELSE}
 begin

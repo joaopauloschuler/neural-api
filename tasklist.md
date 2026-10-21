@@ -2092,6 +2092,10 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           today), then build gpt-oss through `AddGQAAttentionFromSources`.
           Parity: the pico oracle, the streamed decode, and
           `FusedSDPA*OpenCLParity`-style split / int8 cases with sinks.
+          A single-head alternative now exists: the resident cached step on
+          `TNNetScaledDotProductAttention` (used by `TNNetSinkAttention`) is
+          off for this class only because `CachedStepIsExact` is false and
+          `TNNetFusedSDPACL.ComputeStep` takes no sink buffer yet.
     - [ ] GPU-box: GPT-OSS prefill tok/s with the sink heads on
           `cai_sdpa_flash` against the parent commit.
   - [ ] Follow-ups of the `TNNetSinkAttention` full forward on `cai_sdpa_flash` (732bbaa5): the
@@ -2100,11 +2104,25 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         real K/V sit at slot K, and CacheSlot = K gives mask mode 1 the keys
         [0, K + t + 1). Source bound, result resident, host fallback
         (`SinkAttentionFlashOpenCLParity`, max|diff| < 8e-7 on PoCL). Open:
-    - [ ] The cached decode (`ComputeIncremental`, FP32 and int8 KV) still runs
-          on the host: every decode step pulls the [Q|K|V] pack to RAM. Route:
-          a resident cache with the sink rows as a fixed prefix, as the full
-          forward does, on `TNNetFusedSDPACL.Compute` / `ComputeInt8`.
-    - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit.
+    - [X] The cached decode (`ComputeIncremental`, FP32 and int8 KV) now runs
+          over a resident KV cache: the sink rows are cache rows 0..K-1, the
+          tokens follow at slot K, `TNNetFusedSDPACL.ComputeStep` picks the
+          split decode (width 1) or flash (wide windows). The shared machinery
+          sits on `TNNetScaledDotProductAttention` (`FCacheOnOpenCL`,
+          `EnsureCacheOnOpenCL`, the Force/Copy/Mark cache hooks moved up from
+          `TNNetFusedSDPA`, virtual `CachedStepIsExact` / `CachePrefixRows` /
+          `RunCachedStepOnSource`). The int8 host decode now scores the sink
+          rows from int8 codes too, so the OpenCL step reads the same codes.
+          `SinkAttentionCachedDecodeOpenCLParity`: flash prefill, snapshot
+          handoff, width-1 steps, rollback, restore, a sink change; max|diff|
+          <= 7.2e-7 (FP32 and int8) on PoCL, source bound and never
+          downloaded (sentinel), 0 transfers per steady step.
+    - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit,
+          and decode tok/s of an `avSink` stack with the resident cache.
+    - [ ] The plain `TNNetScaledDotProductAttention` cached decode stays on the
+          host (`CachedStepIsExact` false). Turning it on needs no new code past
+          the base `RunCachedStepOnSource`, only the override and a
+          streamed-decode parity test.
   - [ ] Follow-ups of the `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
         (732bbaa5): one launch with two query heads per KV head
         (`cai_sdpa_diff_pack_q` writes [Q1,0 | 0,Q2], score scale
