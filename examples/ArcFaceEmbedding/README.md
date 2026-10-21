@@ -30,9 +30,9 @@ margin. The **same-class cosine rises** and the **separation grows** with `m`:
 ```
   margin    same     diff   separation   mean_loss
   ------   ------   ------   ----------   ---------
-   0.00      0.9573     -0.3173      1.2747     0.02232
-   0.30      0.9673     -0.3084      1.2758     0.04439
-   0.50      0.9695     -0.3122      1.2817     0.05893
+   0.00      0.9636     -0.3153      1.2789     0.01799
+   0.30      0.9731     -0.3088      1.2819     0.04097
+   0.50      0.9851     -0.3227      1.3077     0.04634
 ```
 
 `same` is the mean cosine similarity of same-class embedding pairs, `diff` is

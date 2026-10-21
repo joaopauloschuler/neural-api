@@ -60,14 +60,6 @@ const
   cLearnRate  = 0.02;
   cMinAUROC   = 0.85;  // self-check threshold
 
-function RandomGauss(): TNeuralFloat;
-var U1, U2: TNeuralFloat;
-begin
-  repeat U1 := Random; until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // NORMAL sample: point on a 2-parameter curved manifold embedded in 8-D plus
 // small jitter. Two latent angles (a,b) drive a fixed nonlinear embedding, so
 // the cloud lives near a 2-D surface that a 2-unit bottleneck can capture.
@@ -76,14 +68,14 @@ var a, b: TNeuralFloat;
 begin
   a := Random * 2 * Pi;
   b := Random * 2 * Pi;
-  X.FData[0] := Sin(a)                + 0.03 * RandomGauss();
-  X.FData[1] := Cos(a)                + 0.03 * RandomGauss();
-  X.FData[2] := Sin(b)                + 0.03 * RandomGauss();
-  X.FData[3] := Cos(b)                + 0.03 * RandomGauss();
-  X.FData[4] := Sin(a + b)            + 0.03 * RandomGauss();
-  X.FData[5] := Cos(a - b)            + 0.03 * RandomGauss();
-  X.FData[6] := 0.5 * Sin(2 * a)      + 0.03 * RandomGauss();
-  X.FData[7] := 0.5 * Cos(2 * b)      + 0.03 * RandomGauss();
+  X.FData[0] := Sin(a)                + 0.03 * RandomStdNormal();
+  X.FData[1] := Cos(a)                + 0.03 * RandomStdNormal();
+  X.FData[2] := Sin(b)                + 0.03 * RandomStdNormal();
+  X.FData[3] := Cos(b)                + 0.03 * RandomStdNormal();
+  X.FData[4] := Sin(a + b)            + 0.03 * RandomStdNormal();
+  X.FData[5] := Cos(a - b)            + 0.03 * RandomStdNormal();
+  X.FData[6] := 0.5 * Sin(2 * a)      + 0.03 * RandomStdNormal();
+  X.FData[7] := 0.5 * Cos(2 * b)      + 0.03 * RandomStdNormal();
 end;
 
 // ANOMALY sample: isotropic Gaussian blob OFF the manifold (shifted centre,
@@ -93,7 +85,7 @@ procedure MakeAnomaly(X: TNNetVolume);
 var d: integer;
 begin
   for d := 0 to cDim - 1 do
-    X.FData[d] := 0.6 + 0.8 * RandomGauss();
+    X.FData[d] := 0.6 + 0.8 * RandomStdNormal();
 end;
 
 // ---- AUROC via the Mann-Whitney U / rank statistic (tie-averaged ranks) ----

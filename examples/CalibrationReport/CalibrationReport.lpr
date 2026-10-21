@@ -65,18 +65,6 @@ begin
   NN.AddLayer(TNNetSoftMax.Create());
 end;
 
-// Box-Muller N(0,1) sample, no external dependency.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Builds an input list (owns its volumes), a parallel integer label array,
 // and a one-hot training pair list (owns its own copies of the inputs).
 procedure BuildSet(PerClass: integer;
@@ -94,8 +82,8 @@ begin
     for I := 1 to PerClass do
     begin
       X := TNNetVolume.Create(2, 1, 1);
-      X.FData[0] := cCenters[C][0] + RandomGauss() * cSigma;
-      X.FData[1] := cCenters[C][1] + RandomGauss() * cSigma;
+      X.FData[0] := cCenters[C][0] + RandomStdNormal() * cSigma;
+      X.FData[1] := cCenters[C][1] + RandomStdNormal() * cSigma;
       Labels[Inputs.Count] := C;
       Inputs.Add(X);
       // independent copy for training (owned by TrainPairs).

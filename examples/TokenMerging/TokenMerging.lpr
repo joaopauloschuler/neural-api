@@ -80,11 +80,6 @@ begin
   RandSeed := oldSeed;
 end;
 
-function RandNormal(): TNeuralFloat;
-begin
-  Result := Sqrt(-2.0 * Ln(Random + 1e-12)) * Cos(2.0 * Pi * Random);
-end;
-
 // (SEQLEN,1,DMODEL) sample of class c: class signal planted into the informative
 // channels at NPLANT positions spread across the sequence, plus Gaussian noise.
 procedure MakeSample(c, seed: integer; Inp: TNNetVolume);
@@ -96,7 +91,7 @@ begin
   Inp.ReSize(SEQLEN, 1, DMODEL);
   for ti := 0 to SEQLEN - 1 do
     for f := 0 to DMODEL - 1 do
-      Inp[ti, 0, f] := RandNormal() * NOISE;
+      Inp[ti, 0, f] := RandomStdNormal() * NOISE;
   for ti := 0 to NPLANT - 1 do
   begin
     pos := (c * 7 + 3 + ti * (SEQLEN div NPLANT)) mod SEQLEN;

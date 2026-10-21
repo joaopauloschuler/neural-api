@@ -97,18 +97,6 @@ type
   TFeat   = array[0..cFeatDim - 1] of TNeuralFloat;
   TMatrix = array of array of TNeuralFloat;
 
-// Why: Box-Muller gives N(0,1) samples without pulling in a dependency.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure BuildNet(out NN: TNNet);
 begin
   NN := TNNet.Create();
@@ -136,7 +124,7 @@ var
 begin
   ClassCenter(ClassId, C);
   for D := 0 to cInputDim - 1 do
-    X.FData[D] := C[D] + RandomGauss() * cBlobSpread;
+    X.FData[D] := C[D] + RandomStdNormal() * cBlobSpread;
   Y.Fill(0);
   Y.FData[ClassId] := 1.0;
 end;
@@ -149,7 +137,7 @@ var
   D: integer;
 begin
   for D := 0 to cInputDim - 1 do
-    X.FData[D] := cOODShift + RandomGauss() * cBlobSpread;
+    X.FData[D] := cOODShift + RandomStdNormal() * cBlobSpread;
 end;
 
 // HARD / near-OOD sample (held-out-class split): a blob sitting at the MIDPOINT
@@ -166,7 +154,7 @@ begin
   ClassCenter(A, Ca);
   ClassCenter(B, Cb);
   for D := 0 to cInputDim - 1 do
-    X.FData[D] := 0.5 * (Ca[D] + Cb[D]) + RandomGauss() * (cBlobSpread * cNearOODSpread);
+    X.FData[D] := 0.5 * (Ca[D] + Cb[D]) + RandomStdNormal() * (cBlobSpread * cNearOODSpread);
 end;
 
 // ---- AUROC via the Mann-Whitney U / rank statistic (tie-averaged ranks) ----

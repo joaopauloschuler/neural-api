@@ -72,17 +72,6 @@ const
 
   cNumEval   = 1000;
 
-function RandNormal: TNeuralFloat;
-// Box-Muller.
-var
-  U1, U2: TNeuralFloat;
-begin
-  U1 := Random;
-  if U1 < 1e-12 then U1 := 1e-12;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure SampleExample(out X, Y: TNeuralFloat; out Cls, Dom: integer);
 const
   cSigma: TNeuralFloat = 0.35;
@@ -103,8 +92,8 @@ begin
     if Cls = 0 then begin Mx := -1; My := +1; end
                   else begin Mx := +1; My := -1; end;
   end;
-  X := Mx + cSigma * RandNormal;
-  Y := My + cSigma * RandNormal;
+  X := Mx + cSigma * RandomStdNormal();
+  Y := My + cSigma * RandomStdNormal();
 end;
 
 procedure BuildModel(out NN: TNNet);

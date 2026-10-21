@@ -32,8 +32,8 @@ Samples and Adversarial Attacks* (NeurIPS 2018).
 | Arm | OOD construction | Covariance | Headline AUROC |
 |-----|------------------|-----------|----------------|
 | **EASY** | far-away Gaussian blob, `+30` per coordinate (region the net never saw) | tied | **1.0000** |
-| **HARD** | near-OOD **boundary blob**: a Gaussian at the **midpoint between two kept in-dist class centres** (classes 0/1), spread `×2.2`, sitting *inside* the convex hull on the decision boundary | tied | **0.9741** |
-| **HARD** | same near-OOD boundary blob | **untied** (per-class) | **0.9721** |
+| **HARD** | near-OOD **boundary blob**: a Gaussian at the **midpoint between two kept in-dist class centres** (classes 0/1), spread `×2.2`, sitting *inside* the convex hull on the decision boundary | tied | **0.9586** |
+| **HARD** | same near-OOD boundary blob | **untied** (per-class) | **0.9675** |
 
 The **EASY** arm is the original split, kept as a baseline. Because the held-in
 and far-OOD score distributions do not overlap at all, its AUROC pins at exactly
@@ -43,7 +43,7 @@ The **HARD** arm is a genuine **near-OOD** split. The class-conditional
 Gaussians are fit on only **K−1** in-distribution classes (the last class is
 held out), and the negatives are boundary blobs whose penultimate features land
 *near* the in-dist manifold rather than far from it. That overlap drops the
-AUROC into a **discriminating 0.8–0.99 band** (`0.9741` here), so the ROC curve
+AUROC into a **discriminating 0.8–0.99 band** (`0.9586` here), so the ROC curve
 actually moves.
 
 ### Tied vs untied (per-class) covariance — the ablation
@@ -55,12 +55,12 @@ On the HARD split we score the same points two ways:
 * **UNTIED** — a separate per-class covariance `Sigma_c`,
   `score(x) = max_c −(f−mu_c)^T Sigma_c^-1 (f−mu_c)`.
 
-The program prints both AUROCs and their delta. Here **tied wins** by a small
-margin (`0.9741` vs `0.9721`, Δ = `−0.0020`): with only `200` samples per class
-the per-class covariances are estimated from less data and are noisier, so
-pooling across classes (the paper's default) is the more robust estimator on
-this tiny target. The delta is small because the clusters are near-isotropic;
-untied pays off only when class covariances genuinely differ in shape.
+The program prints both AUROCs and their delta. In this run **untied wins** by
+a small margin (`0.9675` vs `0.9586`, Δ = `+0.0089`). The delta is small either
+way and its sign varies between random draws: with only `200` samples per class
+the per-class covariances are estimated from less data and are noisier, which
+favours pooling (the paper's default), while the clusters are near-isotropic, so
+untied has little real shape difference to exploit.
 
 ### Inverting the covariance + the ridge
 
@@ -124,45 +124,45 @@ In-distribution classes=5  train/class=200  test/class=200  far-OOD points=1000
 HARD split: Gaussians fit on classes 0..3 (class 4 held out); near-OOD = boundary blobs at the midpoint of classes 0/1
 
 Training the classifier for 60 epochs...
-  epoch    1  mean_nll= 0.40385
-  epoch   20  mean_nll= 0.00256
-  epoch   40  mean_nll= 0.00189
-  epoch   60  mean_nll= 0.00182
+  epoch    1  mean_nll= 0.41839
+  epoch   20  mean_nll= 0.00336
+  epoch   40  mean_nll= 0.00145
+  epoch   60  mean_nll= 0.00060
 
 Mahalanobis OOD detection (Lee et al. 2018)
 Feature layer idx=2  dim=16  ridge=0.0010
 ================================================================
 EASY  far-away OOD (+30/coord), tied covariance:
-  held-in (pos) n=1000  mean score =       -16.0323
-  OOD     (neg) n=1000  mean score =    -10134.5635
+  held-in (pos) n=1000  mean score =       -14.8574
+  OOD     (neg) n=1000  mean score =     -9090.6016
   AUROC = 1.0000
 ----------------------------------------------------------------
 HARD  near-OOD boundary blob (midpoint classes 0/1), TIED covariance:
-  held-in (pos) n= 800  mean score =       -15.5156
-  OOD     (neg) n= 200  mean score =      -100.5866
-  AUROC = 0.9741
+  held-in (pos) n= 800  mean score =       -14.7337
+  OOD     (neg) n= 200  mean score =       -89.0121
+  AUROC = 0.9586
 ----------------------------------------------------------------
 HARD  near-OOD boundary blob (midpoint classes 0/1), UNTIED (per-class) covariance:
-  held-in (pos) n= 800  mean score =       -16.3318
-  OOD     (neg) n= 200  mean score =      -300.2333
-  AUROC = 0.9721
+  held-in (pos) n= 800  mean score =       -15.7448
+  OOD     (neg) n= 200  mean score =      -220.2207
+  AUROC = 0.9675
 ================================================================
 AUROC summary:
   EASY (far-OOD, tied)          = 1.0000
-  HARD (near-OOD, tied)         = 0.9741
-  HARD (near-OOD, untied)       = 0.9721
-  delta (untied - tied), HARD   = -0.0020
+  HARD (near-OOD, tied)         = 0.9586
+  HARD (near-OOD, untied)       = 0.9675
+  delta (untied - tied), HARD   = 0.0089
   -> TIED (pooled) covariance wins on the HARD split
 ================================================================
-PASS: EASY AUROC 1.0000 > 0.80, HARD AUROC 0.9741 in discriminating band (0.80, 1.0)
+PASS: EASY AUROC 1.0000 > 0.80, HARD AUROC 0.9586 in discriminating band (0.80, 1.0)
 ```
 
 On the **EASY** split the held-in and far-OOD score distributions do not overlap
-at all, so the AUROC is a perfect `1.0000` (held-in mean `−16` vs OOD mean
-`−10134`, orders of magnitude apart). On the **HARD** near-OOD split the boundary
-blobs sit close to the manifold (OOD mean only `−100`), the distributions
-overlap, and the AUROC drops into the discriminating band (`0.9741`). Tied edges
-out untied (`0.9741` vs `0.9721`).
+at all, so the AUROC is a perfect `1.0000` (held-in mean `−15` vs OOD mean
+`−9091`, orders of magnitude apart). On the **HARD** near-OOD split the boundary
+blobs sit close to the manifold (OOD mean only `−89`), the distributions
+overlap, and the AUROC drops into the discriminating band (`0.9586`). Untied
+edges out tied (`0.9675` vs `0.9586`).
 
 ## What the built-in check asserts
 

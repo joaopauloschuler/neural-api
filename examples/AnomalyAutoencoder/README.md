@@ -61,23 +61,23 @@ Totals: 5 layers, 320 weights, 42 neurons
 
 training the autoencoder on NORMAL samples (40 epochs)...
   epoch   mean_recon_MSE
-      1       0.285055
-      5       0.174409
-     10       0.158571
-     15       0.145558
-     20       0.137126
-     25       0.131587
-     30       0.130949
-     35       0.132973
-     40       0.131907
+      1       0.275448
+      5       0.166266
+     10       0.155286
+     15       0.139949
+     20       0.136151
+     25       0.128336
+     30       0.128583
+     35       0.138457
+     40       0.125016
 
 reconstruction error (anomaly score):
-  NORMAL  test  n= 600  mean =    0.94782
-  ANOMALY test  n= 600  mean =    6.38120
+  NORMAL  test  n= 600  mean =    1.25996
+  ANOMALY test  n= 600  mean =    6.56770
 
-AUROC (normal vs anomaly by recon error) = 0.9706
+AUROC (normal vs anomaly by recon error) = 0.9688
 
-PASS: AUROC 0.9706 > 0.85 -- reconstruction error separates anomalies from normal points.
+PASS: AUROC 0.9688 > 0.85 -- reconstruction error separates anomalies from normal points.
 ```
 
 ## How to read it

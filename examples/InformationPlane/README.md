@@ -60,22 +60,22 @@ end of the fitting phase, then `I(X;T)` drops for the deeper layers:
 
 ```
  epoch  meanNLL | layer  I(X;T)   I(T;Y)   (bits)
-    10  0.0100 | L1    10.708    1.000
-                | L2     9.003    1.000
-                | L3     5.609    1.000     <- end of fitting
-   200  0.0017 | L1    10.562    1.000
-                | L2     8.093    1.000
-                | L3     3.592    1.000     <- compression: I(X;T) fell 5.61->3.59
+    10  0.0161 | L1    10.646    0.999
+                | L2     8.786    0.999
+                | L3     5.565    0.999     <- end of fitting
+   200  0.0015 | L1    10.469    0.999
+                | L2     7.670    0.999
+                | L3     3.505    0.999     <- compression: I(X;T) fell 5.57->3.51
 ```
 
-The deepest layer `L3` loses ~2 bits of `I(X;T)` while keeping `I(T;Y)=1`; `L2`
-loses ~0.9 bits. On the ASCII plane their paths bend **left** along the top
+The deepest layer `L3` loses ~2 bits of `I(X;T)` while keeping `I(T;Y)~1`; `L2`
+loses ~1.1 bits. On the ASCII plane their paths bend **left** along the top
 edge — the compression bend. The first hidden layer `L1` barely compresses
 (it sits near the `log2(N)` ceiling), which is also the expected pattern
 (compression strengthens with depth).
 
 The ReLU arm (Arm B), by contrast, fits the label just as well (`I(T;Y)=1`) but
-`I(X;T)` stays essentially **flat** after fitting (e.g. `L3` ~5.20 → 5.14 over
+`I(X;T)` stays essentially **flat** after fitting (e.g. `L3` ~5.19 → 5.10 over
 190 epochs) — no clean compression bend.
 
 ## Pitfalls (read before changing the constants)

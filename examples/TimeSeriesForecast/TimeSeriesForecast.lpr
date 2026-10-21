@@ -66,14 +66,6 @@ var
   Norm:   array[0..cSeriesLen - 1] of TNeuralFloat; // standardised series
   Mean, Std: TNeuralFloat;
 
-function RandomGauss(): TNeuralFloat;
-var U1, U2: TNeuralFloat;
-begin
-  repeat U1 := Random; until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure BuildSeries();
 var t: integer; s: TNeuralFloat;
 begin
@@ -82,7 +74,7 @@ begin
     s := cTrendSlope * t
        + cSeasonA * Sin(2 * Pi * t / cPeriodA)
        + cSeasonB * Sin(2 * Pi * t / cPeriodB + cPhaseB)
-       + cNoiseStd * RandomGauss();
+       + cNoiseStd * RandomStdNormal();
     Series[t] := s;
   end;
 end;

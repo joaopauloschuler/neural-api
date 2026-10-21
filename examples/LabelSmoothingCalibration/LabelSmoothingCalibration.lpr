@@ -95,18 +95,6 @@ begin
   Result := NN;
 end;
 
-// Box-Muller N(0,1) sample.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Class center on a ring of cNumClasses overlapping Gaussian clusters.
 procedure ClassCenter(C: integer; out CX, CY: TNeuralFloat);
 var
@@ -139,8 +127,8 @@ begin
     for I := 1 to PerClass do
     begin
       X := TNNetVolume.Create(2, 1, 1);
-      X.FData[0] := CX + RandomGauss() * cSigma;
-      X.FData[1] := CY + RandomGauss() * cSigma;
+      X.FData[0] := CX + RandomStdNormal() * cSigma;
+      X.FData[1] := CY + RandomStdNormal() * cSigma;
       Labels[Inputs.Count] := C;   // clean label for evaluation
       Inputs.Add(X);
 

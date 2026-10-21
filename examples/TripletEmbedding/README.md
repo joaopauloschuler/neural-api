@@ -48,11 +48,11 @@ After training it prints a **per-class mean pairwise cosine-similarity matrix**.
 Embeddings are unit-norm, so cosine similarity is just the dot product:
 
 ```
-          class0  class1  class2  class3
-class0     0.987  -0.614   0.219  -0.342
-class1    -0.614   0.993  -0.420  -0.187
-class2     0.219  -0.420   0.992  -0.594
-class3    -0.342  -0.187  -0.594   0.991
+          class0  class1  class2  class3  
+class0     0.990  -0.433  -0.341  -0.268
+class1    -0.433   0.990  -0.388  -0.096
+class2    -0.341  -0.388   0.982  -0.425
+class3    -0.268  -0.096  -0.425   0.989
 ```
 
 Within-class entries (diagonal) come out near `1.0`; cross-class entries are

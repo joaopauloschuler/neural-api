@@ -123,28 +123,22 @@ rather than acted on.
   - [ ] Follow-up (not in this task): shared paged KV blocks, so conversations
         share the blocks of their common prefix instead of one full KV copy per
         slot (vLLM-style); a large KV-cache rewrite.
-- [ ] One shared standard-normal sampler instead of ~40 private copies.
-      `neural/neuralvolume.pas` already has `RandomStdNormal()` (Marsaglia
-      polar, global `Random`), but only in the implementation section, and
-      `TVolume.RandomGaussianValue` is a second copy of the same body. Copies
-      found 2026-10-20: about 36 examples carry their own Box-Muller helper
-      (`RandomGauss`, `Gauss`, `NextGauss`, `GaussNoise`: TripletEmbedding,
-      UNetSegmentation, CalibrationReport, KalmanFilter, ...),
-      `tests/TestNeuralNumerical.pas` has one, and `neural/neuralnetwork.pas`
-      has three nested `NextGaussian` functions (one on the global `Random`
-      with a cached spare; two on a private LCG so the report never moves the
-      caller's RNG stream). Work: move `RandomStdNormal` to the interface, make
-      `RandomGaussianValue` call it, put the private-stream variant (LCG state
-      + cached spare) into one reusable seeded type in neuralvolume.pas for the
-      two LCG callers, then delete the copies in the examples, tests and
-      neuralnetwork.pas. The polar method draws a different sequence than
-      Box-Muller, so the sample outputs in the touched examples' README.md
-      files must be re-run and refreshed; examples whose `NextGauss` takes a
-      std argument just multiply the shared result.
-      Library part LANDED: `RandomStdNormal` exported, `RandomGaussianValue`
-      calls it, `TStdNormalStream` + `StdNormalStreamInit/Uniform/Next` in
-      neuralvolume.pas serve the two LCG reports; tests use the shared routine.
-      Remaining: the example copies.
+- [X] One shared standard-normal sampler instead of ~40 private copies.
+      DONE 2026-10-21. `RandomStdNormal()` (Marsaglia polar, global `Random`)
+      is in the neuralvolume.pas interface and `TVolume.RandomGaussianValue`
+      calls it. `TStdNormalStream` + `StdNormalStreamInit/Uniform/Next` is the
+      seeded private stream (32-bit LCG + polar, cached spare) used by
+      LayerSensitivityReport and the saliency report; the LLC SGLD chain and
+      the Kalman test use `RandomStdNormal`. 36 examples lost their private
+      Box-Muller helpers (KalmanFilter and HamiltonianPendulum keep a private
+      reproducible stream via `TStdNormalStream`); all 36 build with
+      `lazbuild -B`. Every README sample output was re-run and refreshed (all
+      finished in under 30 s); the new draws flipped the printed verdict in
+      LabelSmoothingCalibration, DiceSegmentation and MahalanobisOOD (tied vs
+      untied), and the prose was rewritten to match.
+      Left alone on purpose: FPC `Math.RandG` calls (neuraldiffusion.pas and a
+      few tests) are an RTL routine, not a private copy; TinyTransformerFFN's
+      `RandNoise` is uniform noise, not a Gaussian sampler.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):

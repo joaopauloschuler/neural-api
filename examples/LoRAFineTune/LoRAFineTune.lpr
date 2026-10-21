@@ -84,18 +84,6 @@ const
   cScaleX = 1.25;  cShiftX = 1.4;
   cScaleY = 0.85;  cShiftY = -1.2;
 
-// Box-Muller N(0,1) sample (no external dependency).
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Build one sample. When Target=true the point is drawn from the SHIFTED/SCALED
 // distribution (same class label) so the base classifier is mismatched. The
 // input is a (1,1,2) per-token stream so the trunk's pointwise projections act
@@ -106,8 +94,8 @@ var
 begin
   X := TNNetVolume.Create(1, 1, 2);
   Y := TNNetVolume.Create(cNumClasses, 1, 1);
-  px := cBaseCenters[ClassId][0] + RandomGauss() * cSigma;
-  py := cBaseCenters[ClassId][1] + RandomGauss() * cSigma;
+  px := cBaseCenters[ClassId][0] + RandomStdNormal() * cSigma;
+  py := cBaseCenters[ClassId][1] + RandomStdNormal() * cSigma;
   if Target then
   begin
     px := px * cScaleX + cShiftX;

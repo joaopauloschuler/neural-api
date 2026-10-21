@@ -46,14 +46,14 @@ Runs in well under a minute on 2 CPU cores; tiny memory footprint.
 ## Headline result (seed 424242, noise std 0.45)
 
 ```
-MSE(noisy   , clean) = 0.21877   (the observation)
-MSE(Kalman  , clean) = 0.04632   reduction 78.8%
-MSE(DiagSSM , clean) = 0.04572   reduction 79.1%
+MSE(noisy   , clean) = 0.19048   (the observation)
+MSE(Kalman  , clean) = 0.05583   reduction 70.7%
+MSE(DiagSSM , clean) = 0.05466   reduction 71.3%
 
 Learned Kalman params (channel 0):
-  a = tanh(a_raw)     = 0.9447
-  Q = softplus(Q_raw) = 0.1641   (process noise)
-  R = softplus(R_raw) = 1.2795   (measurement noise)
+  a   = tanh(a_raw)     = 0.9891
+  Q   = softplus(Q_raw) = 0.2898  (process noise)
+  R   = softplus(R_raw) = 2.5701  (measurement noise)
 ```
 
 Both sequence mixers denoise to essentially the same MSE on this 1-channel

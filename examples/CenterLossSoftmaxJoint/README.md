@@ -37,15 +37,15 @@ visible with no external plotting tools. Representative numbers:
 ```
 ARM A: softmax cross-entropy ONLY (center loss OFF)
   accuracy                       : 1.0000
-  intra-class radius (TIGHTNESS) : 1.9666   (smaller = tighter)
-  inter-class mean separation    : 13.9238
-  intra/inter ratio              : 0.1412   (smaller = cleaner)
+  intra-class radius (TIGHTNESS) : 2.0216  (smaller = tighter)
+  inter-class mean separation    : 13.7424
+  intra/inter ratio              : 0.1471  (smaller = cleaner)
 
 ARM B: softmax + center loss JOINT (center loss ON)
   accuracy                       : 1.0000
-  intra-class radius (TIGHTNESS) : 0.1142   (smaller = tighter)
-  inter-class mean separation    : 3.9970
-  intra/inter ratio              : 0.0286   (smaller = cleaner)
+  intra-class radius (TIGHTNESS) : 0.1658  (smaller = tighter)
+  inter-class mean separation    : 3.8305
+  intra/inter ratio              : 0.0433  (smaller = cleaner)
 ```
 
 Both arms classify perfectly, but the center-loss arm's intra-class radius drops

@@ -108,15 +108,15 @@ Both print `PASS`.
 ```
 Per-concept accuracy (sigmoid bottleneck thresholded at 0.5):
   concept             test-acc
-  c0 "is bright"        0.9900
-  c1 "is top half"      0.9933
-  c2 "is round"(decoy)  0.9933
-  mean concept acc      0.9922
+  c0 "is bright"        0.7158
+  c1 "is top half"      0.9858
+  c2 "is round"(decoy)  0.6850
+  mean concept acc      0.7956
 
 Label accuracy:
-  clean (end-to-end)                 0.9833
-  intervened (inject TRUE concepts)  1.0000
-  -> intervention gain               0.0167
+  clean (end-to-end)                 0.7017
+  intervened (inject TRUE concepts)  0.8717
+  -> intervention gain               0.1700
 
 INVARIANT 1 (no-op overwrite with OWN concepts reproduces logits bit-for-bit): max|dlogit|=0.00E+000  -> PASS
 
@@ -125,8 +125,8 @@ Worked single-concept flip (set concept c1 "is top half" := 1):
   flipped  concepts [1 1 1] -> predicted class 3
   delta = 2  (c1 carries weight +2 in label=c0+2*c1; flipping it moves the class deterministically)
 
-  lambda=1 mean concept acc = 0.9922  (concepts ALIGN)
-  lambda=0 mean concept acc = 0.4983  (concepts DRIFT - leaky CBM)
+  lambda=1 mean concept acc = 0.7956  (concepts ALIGN)
+  lambda=0 mean concept acc = 0.2567  (concepts DRIFT - leaky CBM)
 INVARIANT 2 (lambda=0 bottleneck drifts: alignment drops vs lambda=1): -> PASS
 
 ALL CHECKS PASS

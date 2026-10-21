@@ -115,23 +115,13 @@ var
   // cNumClasses random blob centers in cInDim space (filled once, fixed seed).
   gCenters: array[0..cNumClasses - 1, 0..cInDim - 1] of TNeuralFloat;
 
-// Box-Muller standard normal.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat U1 := Random; until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure InitCenters();
 var
   C, D: integer;
 begin
   for C := 0 to cNumClasses - 1 do
     for D := 0 to cInDim - 1 do
-      gCenters[C][D] := RandomGauss() * 2.4;
+      gCenters[C][D] := RandomStdNormal() * 2.4;
 end;
 
 procedure BuildDataset(out Data: TSampleArray; PerCls: integer);
@@ -144,7 +134,7 @@ begin
     for I := 1 to PerCls do
     begin
       for D := 0 to cInDim - 1 do
-        Data[Idx].F[D] := gCenters[C][D] + RandomGauss() * cSigma;
+        Data[Idx].F[D] := gCenters[C][D] + RandomStdNormal() * cSigma;
       Data[Idx].Cls := C;
       Inc(Idx);
     end;

@@ -85,12 +85,12 @@ Signal length = 1024, levels = 5, filter = Haar, noise sd = 0.30
 AddWaveletPacketTransform(5) packet tree: (1024,1,1) -> (32,1,32)
 
 === Reconstruction SNR (dB, higher is better) ===
-  noisy input                          18.29 dB
-  low-pass baseline (moving avg 9)     16.60 dB
-  wavelet soft-threshold (DWT)         21.20 dB
+  noisy input                          18.21 dB
+  low-pass baseline (moving avg 9)     16.80 dB
+  wavelet soft-threshold (DWT)         21.16 dB
 
-  wavelet gain over noisy    :   2.91 dB
-  wavelet gain over low-pass :   4.60 dB
+  wavelet gain over noisy    :   2.96 dB
+  wavelet gain over low-pass :   4.36 dB
 ```
 
 The wavelet shrinkage reaches **21.2 dB**, beating the moving-average baseline by

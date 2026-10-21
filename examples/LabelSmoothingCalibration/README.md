@@ -111,34 +111,29 @@ RESULTS  (lower ECE / lower Brier = better calibrated)
 ================================================================
     eps     val-acc        ECE       Brier
    -----    -------     -------     -------
-    0.00      22.71%     0.4232      1.0855
-    0.05      19.79%     0.3957      1.0179
-    0.10      20.42%     0.3074      0.9436
-    0.20      19.17%     0.3850      1.0115
+    0.00      19.79%     0.3433      1.0050
+    0.05      20.42%     0.4810      1.1349
+    0.10      20.00%     0.4478      1.0922
+    0.20      16.67%     0.4403      1.0672
 
-Best ECE   : eps=0.10 (ECE=0.3074)
-Best Brier : eps=0.10 (Brier=0.9436)
-Label smoothing IMPROVED ECE over the eps=0 cross-entropy baseline (textbook claim holds here).
-Baseline (eps=0) ECE=0.4232 vs best ECE=0.3074  (delta 0.1158).
-Total runtime for all 4 arms: 83.3s.
+Best ECE   : eps=0.00 (ECE=0.3433)
+Best Brier : eps=0.00 (Brier=1.0050)
+Label smoothing did NOT beat the eps=0 baseline on ECE here (result is mixed/negative -- reported honestly).
+Baseline (eps=0) ECE=0.3433 vs best ECE=0.3433  (delta 0.0000).
+Total runtime for all 4 arms: 13.2s.
 ```
 
 ## Reading the result
 
-On this task the **textbook claim holds**. The `eps = 0` cross-entropy
-baseline is the most over-confident model (ECE = 0.4232, the worst Brier =
-1.0855). Adding smoothing tightens calibration:
+On this run the **textbook claim does not hold**. The `eps = 0` cross-entropy
+baseline is the best-calibrated arm on **both** ECE (0.3433) and Brier
+(1.0050); every smoothed arm is worse (ECE 0.44-0.48), and `eps = 0.20` also
+loses some accuracy (16.7% vs ~20%).
 
-- `eps = 0.10` is best on **both** ECE (0.3074, a 0.116 absolute improvement
-  over the baseline) **and** Brier (0.9436);
-- the accuracy cost is small and expected — the baseline's 22.7% drops to
-  ~20%, well within the noise of a hard, heavily-overlapping problem.
-
-Note the curve is **non-monotone**: calibration improves up to `eps = 0.10`
-and then *degrades* again at `eps = 0.20` (ECE back up to 0.3850). This is
-the classic over-smoothing failure mode — too much smoothing flattens the
-targets so far that the model becomes *under*-confident and the soft target
-no longer matches the true class-overlap structure. The takeaway is not
-"always smooth", but that label smoothing is a **calibration knob with a
-sweet spot**: a modest `eps` reliably improves ECE/Brier over hard-target
-cross-entropy, and the optimal strength is worth a short sweep like this one.
+Validation accuracy stays near chance in every arm, so this is a hard,
+heavily-overlapping problem where the calibration ranking is within run-to-run
+noise: a different random draw of the data can flip the verdict, which is why
+the program prints whichever outcome it measured instead of asserting one.
+The takeaway is not "always smooth", but that label smoothing is a
+**calibration knob** whose benefit has to be measured: a short sweep like this
+one tells you whether any `eps > 0` beats hard-target cross-entropy on your task.

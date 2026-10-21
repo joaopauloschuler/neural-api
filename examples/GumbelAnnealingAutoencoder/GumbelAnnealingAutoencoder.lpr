@@ -81,16 +81,6 @@ var
 
 // ---- synthetic data ---------------------------------------------------------
 
-function Gauss(): TNeuralFloat;
-// Box-Muller standard normal.
-var
-  u1, u2: TNeuralFloat;
-begin
-  u1 := Random(); if u1 < 1e-12 then u1 := 1e-12;
-  u2 := Random();
-  Result := Sqrt(-2.0 * Ln(u1)) * Cos(2.0 * Pi * u2);
-end;
-
 procedure BuildPrototypes();
 var
   c, j: integer;
@@ -115,7 +105,7 @@ begin
     c := Random(K);
     V := TNNetVolume.Create(1, 1, D);
     for j := 0 to D - 1 do
-      V.Raw[j] := Prototypes[c][j] + NoiseStd * Gauss();
+      V.Raw[j] := Prototypes[c][j] + NoiseStd * RandomStdNormal();
     DS.X[i] := V;
     DS.Cluster[i] := c;
   end;

@@ -84,18 +84,6 @@ const
 type
   TVolArray = array of TNNetVolume;
 
-// Box-Muller N(0,1) sample (no extra dependency).
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Builds one synthetic (input, mask) pair: a randomly placed/sized filled disc.
 // mask = 1 inside the disc, 0 outside. Input = clean shape signal + noise.
 procedure MakeSample(Img, Mask: TNNetVolume);
@@ -117,9 +105,9 @@ begin
       if Inside then Mask[X, Y, 0] := 1 else Mask[X, Y, 0] := 0;
       // Input: foreground ~1, background ~0, both corrupted by noise.
       if Inside then
-        Img[X, Y, 0] := 1 + RandomGauss() * cNoise
+        Img[X, Y, 0] := 1 + RandomStdNormal() * cNoise
       else
-        Img[X, Y, 0] := 0 + RandomGauss() * cNoise;
+        Img[X, Y, 0] := 0 + RandomStdNormal() * cNoise;
     end;
 end;
 
