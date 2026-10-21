@@ -1695,6 +1695,38 @@ rather than acted on.
 - [ ] Qwen-Image inpainting (`--init-image FILE --mask FILE`, `/mask`; coded +
       pico parity `TestQwenImage21InpaintParity`): real 1024x1024 inpaint on the
       GPU box (user run), then the README example output.
+- [ ] MultiDiffusion panoramas and large canvases for examples/QwenImage
+      (`--panorama WxH`, port of diffusers `StableDiffusionPanoramaPipeline` /
+      Bar-Tal et al. 2023). Today one `PredictVelocity` call covers the whole
+      latent grid in `TQwenImage21Pipeline` (neuralpretrained.pas, the
+      `for StepPos := StartStep to MaxStepPos` loop), so attention cost and
+      device memory grow with the square of the image-token count and a
+      4096x1024 banner does not fit where 1024x1024 does. MultiDiffusion keeps
+      the transformer at a fixed window (e.g. 128x128 latents = 1024x1024 px):
+      each step runs `PredictVelocity` on overlapping latent windows (stride
+      e.g. 64 latents, optional circular wrap in X for 360-degree panoramas),
+      accumulates each window's velocity into a full-canvas buffer plus a
+      per-cell weight count, divides, then calls the existing
+      `FScheduler.Step` once on the full canvas. Scope:
+      - a reusable window-planner + accumulate/normalize helper; `TiledVaeDecode`
+        already steps tiles by (tile - overlap), so share one planner with it
+        rather than add a second, and let later DiT pipelines (CogVideoX,
+        Wan, MMDiT) drive the helper too;
+      - the prefix (`EncodePrefix`) is encoded once and shared by all windows;
+        check whether the transformer passes rebuild when the window size
+        differs from the canvas grid, and keep them built at the window size;
+      - First-Block Cache: its decision must be per window (one
+        `TDiTFirstBlockCache` state per window index) or disabled under
+        `--panorama`;
+      - decode with the existing tiled VAE path; inpainting/outpainting stay
+        out of v1.
+      Tests: pico transformer, (a) a canvas equal to one window is
+      bit-for-bit the plain path, (b) a 2-window canvas with an all-constant
+      velocity stub normalizes to that constant at the seams, (c) circular
+      wrap blends column 0 with the last column. Real 2048x512 / 4096x1024
+      runs (quality + time per step) on the user's GPU box; README section
+      with the flags and the known trade-off (windows only see their own
+      region, so global composition is weaker than a single full pass).
 - [ ] First-Block Cache follow-ups. `TDiTFirstBlockCache`
       (neural/neuralpretrained.pas, the decision of diffusers
       `hooks/first_block_cache.py`: residual of block 0's image hidden states,
