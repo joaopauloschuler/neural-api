@@ -451,6 +451,9 @@ type
     // TNNetInput -> TNNetSiLU -> TNNetMamba2 with ForceOpenCL off over four
     // (heads, head dim, N, n_groups) shapes: bound source, OpenCL vs CPU scan.
     procedure Mamba2ResidentChainOpenCLParity;
+    // Mamba2 prefill window, host snapshot hand-off, token decode, OpenCL state
+    // slot round trip and reset, all on OpenCL, against the full CPU forward.
+    procedure Mamba2DecodeResidentOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -83611,6 +83614,156 @@ begin
     finally
       CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
     end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.Mamba2DecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 9;
+  PrefixLen = 4;
+  SlotStep = 6;
+  NumHeads = 4;
+  HeadDim = 3;
+  StateSize = 5;
+  NGroups = 2;
+  InDepth = 2 * NumHeads * HeadDim + 2 * NGroups * StateSize + NumHeads;
+  OutDepth = NumHeads * HeadDim;
+var
+  NNFull, NNPre, NNStep: TNNet;
+  FullIn, PreIn, StepIn, FullOut, Snap: TNNetVolume;
+  LFull, LPre, LStep: TNNetMamba2;
+  Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Slot: cl_mem;
+  T, D, N, Steps, SlotSteps, StepForwards: integer;
+  MaxDiff: TNeuralFloat;
+
+  procedure CompareRow(const Got: TNNetVolume; GotT, FullT: integer);
+  var
+    Dim: integer;
+    Diff: TNeuralFloat;
+  begin
+    for Dim := 0 to OutDepth - 1 do
+    begin
+      Diff := Abs(FullOut[FullT, 0, Dim] - Got[GotT, 0, Dim]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+  end;
+
+  procedure StepToken(TokenPos: integer);
+  var
+    Dim: integer;
+  begin
+    for Dim := 0 to InDepth - 1 do StepIn[0, 0, Dim] := FullIn[TokenPos, 0, Dim];
+    NNStep.Compute(StepIn);
+    Inc(StepForwards);
+    LStep.ForceOutputOnRAM();
+    CompareRow(LStep.Output, 0, TokenPos);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261122;
+  NNFull := TNNet.Create();
+  NNPre := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, InDepth);
+  PreIn := TNNetVolume.Create(PrefixLen, 1, InDepth);
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  FullOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  Slot := nil;
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LFull := TNNetMamba2.Create(NumHeads, HeadDim, StateSize, NGroups, 1e-5);
+    NNFull.AddLayer(LFull);
+    NNFull.SetTrainable(False, False);
+    SeedMamba2ForOpenCL(LFull);
+
+    NNPre.AddLayer(TNNetInput.Create(PrefixLen, 1, InDepth, 1));
+    LPre := TNNetMamba2.Create(NumHeads, HeadDim, StateSize, NGroups, 1e-5);
+    NNPre.AddLayer(LPre);
+    NNPre.SetTrainable(False, False);
+
+    NNStep.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LStep := TNNetMamba2.Create(NumHeads, HeadDim, StateSize, NGroups, 1e-5);
+    NNStep.AddLayer(LStep);
+    Act := NNStep.AddLayer(TNNetSiLU.Create());
+    NNStep.SetTrainable(False, False);
+    for N := 0 to LFull.Neurons.Count - 1 do
+    begin
+      LPre.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+      LStep.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+    end;
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        FullIn[T, 0, D] := 3.0 * (Random - 0.5);
+    NNFull.Compute(FullIn);
+    FullOut.Copy(LFull.Output);
+    MaxDiff := 0;
+
+    // Prefill window on OpenCL inside a decode session, then the state comes
+    // home through CaptureState.
+    NNPre.EnableOpenCL(PlatformId, DeviceId);
+    LPre.BeginIncrementalDecode();
+    for T := 0 to PrefixLen - 1 do
+      for D := 0 to InDepth - 1 do
+        PreIn[T, 0, D] := FullIn[T, 0, D];
+    NNPre.Compute(PreIn);
+    AssertEquals('prefill on OpenCL', 1, LPre.ForwardGPUCnt);
+    AssertTrue('the prefill state stays in OpenCL memory', LPre.StateOnOpenCL());
+    LPre.ForceOutputOnRAM();
+    for T := 0 to PrefixLen - 1 do CompareRow(LPre.Output, T, T);
+    LPre.CaptureState(Snap, Steps);
+    AssertEquals('the snapshot carries the prefill length', PrefixLen, Steps);
+    AssertFalse('CaptureState brings the state home', LPre.StateOnOpenCL());
+
+    // The decode twin resumes from the host snapshot, token by token.
+    NNStep.EnableOpenCL(PlatformId, DeviceId);
+    LStep.BeginIncrementalDecode();
+    LStep.RestoreState(Snap, Steps);
+    StepForwards := 0;
+    for T := PrefixLen to SlotStep do StepToken(T);
+    AssertTrue('decode steps keep the state in OpenCL memory',
+      LStep.StateOnOpenCL());
+    // OpenCL-memory checkpoint: capture, run on, restore, re-run the tail.
+    Slot := LStep.NewStateSlotOnOpenCL();
+    AssertTrue('the layer offers an OpenCL state slot', Slot <> nil);
+    LStep.CaptureStateToOpenCL(Slot, SlotSteps);
+    AssertEquals('the slot carries the step count', SlotStep + 1, SlotSteps);
+    for T := SlotStep + 1 to SeqLen - 1 do StepToken(T);
+    LStep.RestoreStateFromOpenCL(Slot, SlotSteps);
+    AssertEquals('restored step count', SlotStep + 1, LStep.DecodeSteps);
+    for T := SlotStep + 1 to SeqLen - 1 do StepToken(T);
+    AssertEquals('decode steps track tokens', SeqLen, LStep.DecodeSteps);
+    // A reset on OpenCL starts the sequence over from h = 0.
+    LStep.ResetState();
+    for T := 0 to 2 do StepToken(T);
+    LStep.EndIncrementalDecode();
+    WriteLn('  Mamba2 OpenCL prefill+decode: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards scan=', LStep.ForwardGPUCnt, '/', StepForwards,
+      ' act=', Act.ForwardGPUCnt);
+    AssertEquals('every decode step must run on OpenCL', StepForwards,
+      LStep.ForwardGPUCnt);
+    AssertTrue('the activation must follow the scan rows', Act.ForwardGPUCnt > 0);
+    AssertTrue('Mamba2 OpenCL prefill+decode vs full CPU forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    if Slot <> nil then clReleaseMemObject(Slot);
+    Snap.Free; FullOut.Free; StepIn.Free; PreIn.Free; FullIn.Free;
+    NNStep.Free; NNPre.Free; NNFull.Free;
   end;
 end;
 {$ELSE}

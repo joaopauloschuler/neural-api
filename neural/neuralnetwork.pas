@@ -13193,8 +13193,10 @@ type
   // Forward is the direct O(SeqLen*d_inner*N) head-wise causal scan (the chunked
   // SSD scan is a stretch goal - this is the v1, mirroring how Mamba-1 landed
   // the recurrent scan before any chunking); backward is exact BPTT.
+  // Incremental decode (inference only) carries the (d_inner, N) state h in
+  // FDecH across forwards, so any window split reproduces the full forward.
   // Coded by Claude (AI).
-  TNNetMamba2 = class(TNNetLayer)
+  TNNetMamba2 = class(TNNetRecurrentDecodeBase)
     private
       FNumHeads: integer;    // FStruct[0]
       FHeadDim: integer;     // FStruct[1] (P)
@@ -13211,6 +13213,7 @@ type
       FGh: TNNetVolume;      // backward state-gradient gh, DInner*N-long scratch
       FGradA, FGradD, FGradDtB, FGradNorm: TNNetVolume; // weight grad accums
       FArBuf: array of TNeuralFloat; // per-head ar = -exp(min(A_log,30)), invariant across t
+      FDecH: TNNetVolume;    // persisted decode state h, DInner*N-long (not serialized)
       {$IFDEF OpenCL}
       // Whole-scan OpenCL forward: one work-item per d_inner channel for the
       // whole sequence, then the gated RMSNorm, both in OpenCL memory.
@@ -13218,7 +13221,14 @@ type
       // True once the parameter tensors change; the OpenCL forward re-uploads
       // them only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
+      // True while the live decode state sits in FMamba2CL's bank rather than
+      // in FDecH. Every host reader of FDecH calls ForceDecodeStateOnRAM.
+      FDecHOnOpenCL: boolean;
       procedure ComputeOpenCL();
+      // Move the decode state between FDecH and the helper's bank; no-ops when
+      // it is already where it is wanted.
+      procedure EnsureDecodeStateOnOpenCL();
+      procedure ForceDecodeStateOnRAM();
       {$ENDIF}
       // Releases FState: the per-timestep h cache is read only by Backpropagate,
       // so an inference-only layer neither fills nor needs it. Compute keys the
@@ -13226,6 +13236,8 @@ type
       procedure FreeBackpropScratch();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure AfterWeightUpdate(); override;
+    protected
+      procedure PrepareDecodeState(); override;
     public
       constructor Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
         pStateSize: integer = 16; pNGroups: integer = 1;
@@ -13235,7 +13247,16 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // --- incremental decode (TNNetRecurrentDecodeBase contract) ---
+      procedure ResetState(); override;
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
+      procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
       {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
@@ -80872,6 +80893,7 @@ begin
   FGradD := TNNetVolume.Create();
   FGradDtB := TNNetVolume.Create();
   FGradNorm := TNNetVolume.Create();
+  FDecH := TNNetVolume.Create();
   AddMissingNeurons(4);
 end;
 
@@ -80880,6 +80902,7 @@ begin
   {$IFDEF OpenCL}
   if Assigned(FMamba2CL) then FMamba2CL.Free;
   {$ENDIF}
+  FDecH.Free;
   FGradNorm.Free;
   FGradDtB.Free;
   FGradD.Free;
@@ -80969,7 +80992,7 @@ end;
 procedure TNNetMamba2.Compute();
 var
   StartTime: double;
-  Alog, Dd, DtB, NormW, Prev: TNNetVolume;
+  Alog, Dd, DtB, NormW, Prev, HState: TNNetVolume;
   SeqLen, t, h, c, g, hpg, bOff, cOff, dtOff, gateOff: integer;
   dInner, P, N, NG, gw, ebase, xbase: integer;
   SeqLenM1, NumHeadsM1, PM1, dInnerM1, tHeads, tDInner: integer;
@@ -80986,11 +81009,13 @@ begin
   begin
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
+    if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end
   else Inc(FForwardCPUCnt);
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  ForceDecodeStateOnRAM();
   // The host is about to write FOutput, so a later ForceOutputOnRAM must not
   // read whatever a previous OpenCL forward left in the helper's buffer.
   FOutputOnOpenCL := false;
@@ -81002,6 +81027,7 @@ begin
   DtB := FNeurons[2].FWeights;
   NormW := FNeurons[3].FWeights;
   SeqLen := FOutput.SizeX;
+  if FDecodeEnabled then Inc(FDecodeSteps, SeqLen);
   P := FHeadDim; N := FStateSize; NG := FNGroups;
   dInner := FDInner;
   gw := FNumHeads div NG;            // heads per group
@@ -81018,7 +81044,13 @@ begin
   // FState is the BPTT-only per-timestep h cache, released on an inference-only
   // layer: rule #20, the test is hoisted out of the token loop.
   KeepState := FState.Size = SeqLen * DInnerN;
-  FH.Fill(0);
+  // A decode session carries FDecH across forwards; otherwise h starts at 0.
+  if FDecodeEnabled then HState := FDecH
+  else
+  begin
+    HState := FH;
+    HState.Fill(0);
+  end;
   // Rule #5/#8: ar_h = -exp(min(A_log_h, 30)) depends only on per-head A_log,
   // invariant across every timestep t. Precompute once per call into the
   // persistent per-head buffer (rule #17: lazy, amortized resize).
@@ -81064,19 +81096,19 @@ begin
         ebase := xbase * N;
         // #13: h := ah*h + dtxv*B over the state axis. Both runs are contiguous
         // over s, so this is one MulMulAdd pass.
-        TNNetVolume.MulMulAdd(@FH.FData[ebase], @XtPtr^[bBase], ah, dtxv, N);
+        TNNetVolume.MulMulAdd(@HState.FData[ebase], @XtPtr^[bBase], ah, dtxv, N);
         // Read-out accY = sum_s C_t[s]*h_new[s]: the C slice of x_t and the
-        // just-updated FH row are both contiguous over the state axis -> AVX dot
-        // product. FH is the live (1,1,dInner*N) state, so it stays in cache;
+        // just-updated HState row are both contiguous over the state axis -> AVX dot
+        // product. HState is the live (1,1,dInner*N) state, so it stays in cache;
         // FState is the BPTT cache.
-        accY := TNNetVolume.DotProduct(@XtPtr^[cBase], @FH.FData[ebase], N);
+        accY := TNNetVolume.DotProduct(@XtPtr^[cBase], @HState.FData[ebase], N);
         FY.FData[tDInner + xbase] := accY + Dd.FData[h] * xv;
       end;
     end;
-    // BPTT cache: FH now holds the whole (d_inner,N) state and FState's timestep
+    // BPTT cache: HState now holds the whole (d_inner,N) state and FState's timestep
     // block has the same layout, so one Move replaces the d_inner*N scalar stores.
     if KeepState then
-      Move(FH.FData[0], FState.FData[tDInner * N], DInnerNFloatSize);
+      Move(HState.FData[0], FState.FData[tDInner * N], DInnerNFloatSize);
     // Gated RMSNorm over the d_inner axis: z = y*silu(gate); out = rms(z)*w.
     msq := 0;
     for c := 0 to dInnerM1 do
@@ -81108,12 +81140,96 @@ begin
   {$ENDIF}
 end;
 
+procedure TNNetMamba2.PrepareDecodeState();
+begin
+  // The decode state is the running h of the scan: fixed (d_inner, N), sized
+  // like FH whatever the context length.
+  FDecH.ReSize(FH);
+  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+end;
+
+procedure TNNetMamba2.ResetState();
+begin
+  FDecH.Fill(0);
+  FDecodeSteps := 0;
+  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+end;
+
+procedure TNNetMamba2.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  {$IFDEF OpenCL} ForceDecodeStateOnRAM(); {$ENDIF}
+  Dst.Copy(FDecH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetMamba2.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecH.Copy(Src);
+  FDecodeSteps := Steps;
+  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+end;
+
+function TNNetMamba2.StateBytes(): int64;
+begin
+  Result := FDecH.GetMemSize();
+end;
+
+function TNNetMamba2.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL} Result := FDecHOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+end;
+
 {$IFDEF OpenCL}
+function TNNetMamba2.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FMamba2CL)
+    then Result := FMamba2CL.NewOpenCLBuffer(FDecH.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetMamba2.CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+begin
+  if not Assigned(FMamba2CL) then
+    raise Exception.Create('TNNetMamba2.CaptureStateToOpenCL: the layer has' +
+      ' no OpenCL path.');
+  // A RAM-resident state is uploaded straight into the slot, so the layer's own
+  // bank is never touched.
+  if FDecHOnOpenCL
+    then FMamba2CL.CopyStateTo(Slot, FDecH.GetMemSize())
+    else FMamba2CL.UploadToOpenCLBuffer(Slot, FDecH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetMamba2.RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+begin
+  if not Assigned(FMamba2CL) then
+    raise Exception.Create('TNNetMamba2.RestoreStateFromOpenCL: the layer has' +
+      ' no OpenCL path.');
+  FMamba2CL.CopyStateFrom(Slot, FDecH);
+  FDecHOnOpenCL := true;
+  FDecodeSteps := Steps;
+end;
+
+procedure TNNetMamba2.EnsureDecodeStateOnOpenCL();
+begin
+  if FDecHOnOpenCL or (not Assigned(FMamba2CL)) then exit;
+  FMamba2CL.UploadState(FDecH);
+  FDecHOnOpenCL := true;
+end;
+
+procedure TNNetMamba2.ForceDecodeStateOnRAM();
+begin
+  if (not FDecHOnOpenCL) or (not Assigned(FMamba2CL)) then exit;
+  FMamba2CL.DownloadState(FDecH);
+  FDecHOnOpenCL := false;
+end;
+
 procedure TNNetMamba2.DisableOpenCL();
 begin
-  // FMamba2CL owns the buffer a kept output lives in, so the host copy has to
-  // be recovered before the helper goes.
+  // FMamba2CL owns the buffers a kept output and a live decode state live in,
+  // so both host copies have to be recovered before the helper goes.
   ForceOutputOnRAM();
+  ForceDecodeStateOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FMamba2CL);
 end;
@@ -81154,8 +81270,9 @@ begin
   else Result := nil;
 end;
 
-// Whole-scan forward in OpenCL memory, starting from h = 0; the result stays in
-// OpenCL memory for the next layer to bind.
+// Whole-scan forward in OpenCL memory. Outside a decode session the scan starts
+// from h = 0; inside one it carries the resident bank, so only kernel arguments
+// cross to the host per token. The result stays in OpenCL memory.
 procedure TNNetMamba2.ComputeOpenCL();
 var
   Prev: TNNetVolume;
@@ -81175,11 +81292,15 @@ begin
     FPrevLayer.ForceOutputOnRAM();
   end;
   Prev := FPrevLayer.FOutput;
+  // A full-sequence forward overwrites the bank from h = 0, so a decode state
+  // still living there has to come home first.
+  if FDecodeEnabled then EnsureDecodeStateOnOpenCL()
+  else ForceDecodeStateOnRAM();
   FMamba2CL.Compute(FNeurons[0].FWeights, FNeurons[1].FWeights,
     FNeurons[2].FWeights, FNeurons[3].FWeights, Prev, FOutput, FH,
     Prev.SizeX, FNumHeads, FHeadDim, FStateSize, FNGroups,
-    {ResetState=}true, FFloatSt[0], FGpuWeightsDirty, SourceBuffer,
-    {pKeepResultOnOpenCL=}true);
+    {ResetState=}not FDecodeEnabled, FFloatSt[0], FGpuWeightsDirty,
+    SourceBuffer, {pKeepResultOnOpenCL=}true);
   FGpuWeightsDirty := false;
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
