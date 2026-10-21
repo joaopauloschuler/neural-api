@@ -2156,8 +2156,11 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         so no static bias table fits. Route: the projections on the existing
         dot-product kernels, a small kernel writing the per-window bias into a
         SeqLen x SeqLen buffer each forward, then the flash bias argument.
-      - `TNNetDotProducts`, the raw contraction behind the CAI self-attention
-        builders.
+      - [ ] `TNNetDotProducts` follow-up: `cai_row_dot_products` is one
+        work-item per output with a serial depth loop and uncoalesced A-row
+        reads. Time a CAI self-attention model on the GPU box; if the
+        contraction shows up at long sequences, tile A and B rows through
+        local memory.
 - [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO -
       coordinate with the open FFT denormal-trap item, since the device path
       would move that math off the host FPU entirely).

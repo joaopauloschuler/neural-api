@@ -4185,6 +4185,33 @@ __kernel void cai_cell_mul
   FDst[i] = FA[i] * FB[j];
 }
 
+// CAI row dot products (TNNetDotProducts forward): FDst[b*FNumAs + a] is row a
+// of FA dotted with row b of FB, both row-major with FVectorSize floats per row.
+// FNoForward != 0 writes 0 where a > b (the causal mask). One work-item per
+// output element; consecutive work-items share the B row. Coded by Claude (AI).
+__kernel void cai_row_dot_products
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FVectorSize,
+  const int FNoForward,
+  __global const float* FA,
+  __global const float* FB,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumAs * FNumBs) return;
+  const int b = g_id / FNumAs;
+  const int a = g_id - b * FNumAs;
+  const int Length = ((FNoForward != 0) && (a > b)) ? 0 : FVectorSize;
+  __global const float* RowA = FA + a * FVectorSize;
+  __global const float* RowB = FB + b * FVectorSize;
+  float acc = 0.0f;
+  for (int i = 0; i < Length; i++) acc = mad(RowA[i], RowB[i], acc);
+  FDst[g_id] = acc;
+}
+
 // CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
 // source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
 // channel run and the arbitrary channel list of TNNetSplitChannelEvery. A

@@ -598,6 +598,9 @@ type
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
+    // AddSingleHeadSelfAttention(NoForward=true): both TNNetDotProducts (masked
+    // Q.K, unmasked ValueT.W) run in OpenCL, binding Q and K. Coded by Claude (AI).
+    procedure TestDotProductsOpenCLParity;
     // Per-channel affine glue, ForceOpenCL off: TNNetInput -> ReLU -> ChannelMul
     // -> ChannelBias -> ReZero -> CellBias -> DeepConcat -> AvgChannel -> FiLM ->
     // AvgPool -> ReLU stays resident (sentinels, transfers, weight refresh).
@@ -70907,6 +70910,121 @@ begin
     AssertTrue('TNNetCellMulByCell OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDotProductsOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csTokens = 6;
+  csDepth = 8;
+var
+  NN: TNNet;
+  Input, OutCPU, ScoresCPU: TNNetVolume;
+  QueryLayer, KeyLayer, Attended, W: TNNetLayer;
+  ScoreLayer, ValueLayer: TNNetDotProducts;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, MaxLayerPos, Pos, MaxPos, SentinelSurvivors, MaskedNonZero: integer;
+  MaxDiff, ScoreDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(csTokens, 1, csDepth);
+  OutCPU := TNNetVolume.Create();
+  ScoresCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(csTokens, 1, csDepth));
+    NN.AddSingleHeadSelfAttention(Attended, W, {NoForward=}true);
+    ScoreLayer := nil;
+    ValueLayer := nil;
+    MaxLayerPos := NN.CountLayers() - 1;
+    for LayerPos := 0 to MaxLayerPos do
+      if NN.Layers[LayerPos] is TNNetDotProducts then
+      begin
+        if ScoreLayer = nil
+          then ScoreLayer := TNNetDotProducts(NN.Layers[LayerPos])
+          else ValueLayer := TNNetDotProducts(NN.Layers[LayerPos]);
+      end;
+    AssertTrue('the builder adds two TNNetDotProducts',
+      Assigned(ScoreLayer) and Assigned(ValueLayer));
+    QueryLayer := NN.Layers[1];
+    KeyLayer := NN.Layers[2];
+    NN.SetTrainable(False, False);
+    Input.RandomizeGaussian();
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    ScoresCPU.Copy(ScoreLayer.Output);
+    AssertEquals('contraction ran on the CPU before EnableOpenCL', 0,
+      ScoreLayer.ForwardGPUCnt);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(True);
+    try
+      NN.Compute(Input);
+      // Parity cannot tell a bind from a download: a second forward must leave
+      // both host copies of the score sources untouched.
+      QueryLayer.Output.Fill(csSentinel);
+      KeyLayer.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      MaxPos := QueryLayer.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        if QueryLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        if KeyLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      end;
+      // The score layer is not the last layer: its host copy needs a download.
+      ScoreLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      ScoreDiff := 0;
+      MaskedNonZero := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      AssertEquals('score size match', ScoresCPU.Size, ScoreLayer.Output.Size);
+      MaxPos := OutCPU.Size - 1;
+      for Pos := 0 to MaxPos do
+        MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[Pos] - NN.GetLastLayer.Output.Raw[Pos]));
+      MaxPos := ScoresCPU.Size - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        ScoreDiff := Max(ScoreDiff, Abs(ScoresCPU.Raw[Pos] - ScoreLayer.Output.Raw[Pos]));
+        // Output index b*NumAs + a with NumAs = csTokens: a > b is masked.
+        if ((Pos mod csTokens) > (Pos div csTokens)) and
+           (ScoreLayer.Output.Raw[Pos] <> 0) then Inc(MaskedNonZero);
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  DotProducts OpenCL parity: out max|diff|=', MaxDiff:0:9,
+      ' scores max|diff|=', ScoreDiff:0:9,
+      ' gpu forwards=', ScoreLayer.ForwardGPUCnt, '/', ValueLayer.ForwardGPUCnt,
+      ' source sentinels=', SentinelSurvivors, '/', 2 * QueryLayer.Output.Size);
+    AssertTrue('masked Q.K must reach OpenCL', ScoreLayer.ForwardGPUCnt > 0);
+    AssertTrue('ValueT.W must reach OpenCL', ValueLayer.ForwardGPUCnt > 0);
+    AssertEquals('Q and K must be read in OpenCL memory, not downloaded',
+      2 * QueryLayer.Output.Size, SentinelSurvivors);
+    AssertEquals('masked scores must be exactly zero', 0, MaskedNonZero);
+    AssertTrue('scores OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(ScoreDiff) + ' must be < 1e-4', ScoreDiff < 1e-4);
+    AssertTrue('attention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    ScoresCPU.Free;
     OutCPU.Free;
     Input.Free;
     NN.Free;
