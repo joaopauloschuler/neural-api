@@ -54,8 +54,9 @@ type
     procedure CheckWindowAttentionOpenCLParity(Cosine: boolean);
     // TNNetSinkAttention (or TNNetDifferentialAttention) on OpenCL vs the CPU.
     procedure CheckSinkOrDifferentialFlashParity(Differential: boolean);
-    // Their streamed cached decode on OpenCL vs the CPU (see the tests below).
-    procedure CheckSinkOrDifferentialCachedDecodeParity(Differential: boolean);
+    // Streamed cached decode of Variant (avSDPA, avSink or avDifferential) on
+    // OpenCL vs the CPU (see the tests below).
+    procedure CheckCachedDecodeOpenCLParity(Variant: TNNetAttentionVariant);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -571,6 +572,9 @@ type
     // The same streamed decode for TNNetDifferentialAttention (two query heads
     // per KV head on the split decode, combine on OpenCL), FP32 and int8 KV.
     procedure DifferentialAttentionCachedDecodeOpenCLParity;
+    // The same streamed decode for plain TNNetScaledDotProductAttention, with a
+    // sliding window and a soft-cap too, FP32 and int8 KV.
+    procedure ScaledDotProductAttentionCachedDecodeOpenCLParity;
     // AddMultiHeadSelfAttention (RoPE, 3 heads) with avSink / avDifferential:
     // every head on OpenCL with its resident source bound, output vs the CPU.
     procedure SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
@@ -86081,16 +86085,21 @@ end;
 
 procedure TTestNeuralNumerical.SinkAttentionCachedDecodeOpenCLParity;
 begin
-  CheckSinkOrDifferentialCachedDecodeParity({Differential=}false);
+  CheckCachedDecodeOpenCLParity(avSink);
 end;
 
 procedure TTestNeuralNumerical.DifferentialAttentionCachedDecodeOpenCLParity;
 begin
-  CheckSinkOrDifferentialCachedDecodeParity({Differential=}true);
+  CheckCachedDecodeOpenCLParity(avDifferential);
 end;
 
-procedure TTestNeuralNumerical.CheckSinkOrDifferentialCachedDecodeParity(
-  Differential: boolean);
+procedure TTestNeuralNumerical.ScaledDotProductAttentionCachedDecodeOpenCLParity;
+begin
+  CheckCachedDecodeOpenCLParity(avSDPA);
+end;
+
+procedure TTestNeuralNumerical.CheckCachedDecodeOpenCLParity(
+  Variant: TNNetAttentionVariant);
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
@@ -86104,23 +86113,29 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
 
-  function NewAttention(Dk, NumSinks: integer;
-    Lambda: TNeuralFloat): TNNetScaledDotProductAttention;
+  // NumSinks is the sliding window for avSDPA.
+  function NewAttention(Dk, NumSinks: integer; Lambda,
+    SoftCap: TNeuralFloat): TNNetScaledDotProductAttention;
   begin
-    if Differential
-      then Result := TNNetDifferentialAttention.Create(Dk, True, Lambda)
-      else Result := TNNetSinkAttention.Create(Dk, True, NumSinks);
+    case Variant of
+      avDifferential:
+        Result := TNNetDifferentialAttention.Create(Dk, True, Lambda);
+      avSink: Result := TNNetSinkAttention.Create(Dk, True, NumSinks);
+    else
+      Result := TNNetScaledDotProductAttention.Create(Dk, True, NumSinks,
+        SoftCap);
+    end;
   end;
 
   // Input -> conv (the source) [-> host-only layer] -> attention -> conv.
   function BuildNet(NN: TNNet; Width, Dk, NumSinks: integer;
-    Lambda: TNeuralFloat; HostSource: boolean;
+    Lambda, SoftCap: TNeuralFloat; HostSource: boolean;
     out Source: TNNetLayer): TNNetScaledDotProductAttention;
   begin
     NN.AddLayer(TNNetInput.Create(Width, 1, 3 * Dk));
     Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
     if HostSource then NN.AddLayer(THostOnlyMulByConstant.Create(1));
-    Result := NewAttention(Dk, NumSinks, Lambda);
+    Result := NewAttention(Dk, NumSinks, Lambda, SoftCap);
     NN.AddLayer(Result);
     NN.AddLayer(TNNetPointwiseConvLinear.Create(Dk));
     NN.SetTrainable(False, False);
@@ -86136,7 +86151,7 @@ var
   end;
 
   procedure RunCase(Dk, NumSinks: integer; Int8KV: boolean;
-    Lambda: TNeuralFloat; HostSource: boolean);
+    Lambda: TNeuralFloat; HostSource: boolean; SoftCap: TNeuralFloat = 0);
   var
     CpuPrefill, GpuPrefill, CpuStep, GpuStep: TNNet;
     CpuPA, GpuPA, CpuSA, GpuSA: TNNetScaledDotProductAttention;
@@ -86209,9 +86224,9 @@ var
   var
     CheckLen: integer;
   begin
-    What := Format('differential=%s Dk=%d sinks=%d int8=%s lambda=%.2f ' +
-      'host=%s', [BoolToStr(Differential, true), Dk, NumSinks,
-      BoolToStr(Int8KV, true), Lambda, BoolToStr(HostSource, true)]);
+    What := Format('variant=%d Dk=%d sinks/window=%d int8=%s lambda=%.2f ' +
+      'softcap=%.1f host=%s', [Ord(Variant), Dk, NumSinks,
+      BoolToStr(Int8KV, true), Lambda, SoftCap, BoolToStr(HostSource, true)]);
     CpuPrefill := TNNet.Create();
     GpuPrefill := TNNet.Create();
     CpuStep := TNNet.Create();
@@ -86229,12 +86244,13 @@ var
     CheckVQ := TNNetVolumeQuant8.Create();
     try
       // Every net gets the same layers, so CopyWeights pairs them by index.
-      CpuPA := BuildNet(CpuPrefill, PrefillLen, Dk, NumSinks, Lambda,
+      CpuPA := BuildNet(CpuPrefill, PrefillLen, Dk, NumSinks, Lambda, SoftCap,
         HostSource, CpuSource);
-      GpuPA := BuildNet(GpuPrefill, PrefillLen, Dk, NumSinks, Lambda,
+      GpuPA := BuildNet(GpuPrefill, PrefillLen, Dk, NumSinks, Lambda, SoftCap,
         HostSource, GpuPrefillSource);
-      CpuSA := BuildNet(CpuStep, 1, Dk, NumSinks, Lambda, HostSource, Ignored);
-      GpuSA := BuildNet(GpuStep, 1, Dk, NumSinks, Lambda, HostSource,
+      CpuSA := BuildNet(CpuStep, 1, Dk, NumSinks, Lambda, SoftCap, HostSource,
+        Ignored);
+      GpuSA := BuildNet(GpuStep, 1, Dk, NumSinks, Lambda, SoftCap, HostSource,
         GpuSource);
       GpuPrefill.CopyWeights(CpuPrefill);
       ChangeSinkOrDifferentialWeights(CpuPA, GpuPA, Lambda);
@@ -86311,7 +86327,7 @@ var
         if StepPos = 0 then FirstStepUploads := UploadCnt;
         // A restore re-uploads the cache; a sink change re-uploads the sink rows.
         if (StepPos <> 0) and (StepPos <> RestoreStep) and
-           ((StepPos <> WeightChangeStep) or Differential) then
+           ((StepPos <> WeightChangeStep) or (Variant <> avSink)) then
           Inc(SteadyTransfers, UploadCnt + DownloadCnt);
         AssertEquals(What + ': no download inside a step', 0, DownloadCnt);
         if StepPos = CaptureStep then
@@ -86327,7 +86343,7 @@ var
       if Int8KV
         then Tolerance := 1e-3 * Max(1, MaxAbsY)
         else Tolerance := 1e-4 * Max(1, MaxAbsY);
-      WriteLn('  sink/differential cached decode ', What, ': max|diff|=',
+      WriteLn('  cached decode ', What, ': max|diff|=',
         MaxDiff:0:9, ' max|y|=', MaxAbsY:0:4, ' gpu=', GpuSA.ForwardGPUCnt,
         ' bound=', GpuSA.ProfiledResidency.SourceBoundCnt,
         ' first-step uploads=', FirstStepUploads,
@@ -86373,6 +86389,19 @@ begin
     Exit;
   end;
   RandSeed := 20261022;
+  if Variant = avSDPA then
+  begin
+    // Full attention, a 4-key sliding window and a soft-cap of 2.
+    RunCase(8, 0, False, 0, False);
+    RunCase(16, 0, True, 0, False);
+    RunCase(64, 0, True, 0, False);
+    RunCase(16, 4, False, 0, False);
+    RunCase(16, 4, True, 0, False);
+    RunCase(16, 0, False, 0, False, 2.0);
+    RunCase(16, 4, True, 0, False, 2.0);
+    RunCase(10, 0, False, 0, True);
+    exit;
+  end;
   RunCase(8, 1, False, 0.8, False);
   RunCase(16, 3, False, 0.3, False);
   RunCase(16, 2, True, 0.8, False);

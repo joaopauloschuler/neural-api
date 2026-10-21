@@ -4744,7 +4744,7 @@ type
       jStart: integer; Factor: TNeuralFloat);
     {$IFDEF OpenCL}
     // True when RunCachedStepOnSource computes what ComputeIncremental does;
-    // the base class says false, so its cached forward stays on the host.
+    // the base class says so for its exact class only, as FlashForwardIsExact.
     function CachedStepIsExact(): boolean; virtual;
     // Fixed rows ahead of the cached tokens in the resident cache (sink slots).
     function CachePrefixRows(): integer; virtual;
@@ -36097,9 +36097,8 @@ var
   Prev, Sinks: TNNetVolume;
   OutPtr, QueryPtr, ScoresPtr: TNeuralFloatArrPtr;
 begin
-  // The KV-cache decode attention is CPU-only (no OpenCL path here), so count
-  // it as a CPU dispatch - otherwise a profiler sees neither counter and the
-  // GPU column reads "-" instead of an honest 0% for the decode workload.
+  // The host KV-cache decode counts as a CPU dispatch, otherwise a profiler
+  // sees neither counter for the decode workload.
   Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -37739,7 +37738,9 @@ end;
 
 function TNNetScaledDotProductAttention.CachedStepIsExact(): boolean;
 begin
-  Result := false;
+  // A subclass inheriting the base host decode may still shape its scores
+  // (ScoreBiasTable, SinkLogits), which RunCachedStepOnSource does not pass.
+  Result := (Self.ClassType = TNNetScaledDotProductAttention);
 end;
 
 function TNNetScaledDotProductAttention.CachePrefixRows(): integer;

@@ -2119,10 +2119,17 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           downloaded (sentinel), 0 transfers per steady step.
     - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit,
           and decode tok/s of an `avSink` stack with the resident cache.
-    - [ ] The plain `TNNetScaledDotProductAttention` cached decode stays on the
-          host (`CachedStepIsExact` false). Turning it on needs no new code past
-          the base `RunCachedStepOnSource`, only the override and a
-          streamed-decode parity test.
+    - [X] The plain `TNNetScaledDotProductAttention` cached decode (FP32 and
+          int8 KV, causal, sliding window, soft-cap) runs over the resident KV
+          cache: the base `CachedStepIsExact` is true for the exact class only,
+          so `TNNetGptOssSinkAttention` (sinks), `TNNetT5RelPosBiasAttention`,
+          `TNNetWindowAttention` / `TNNetSwinV2WindowAttention` (score bias) and
+          the Compute-only variants (ALiBi, cosine, QK-norm, disentangled,
+          conformer) keep the host decode.
+          `ScaledDotProductAttentionCachedDecodeOpenCLParity`: max|diff| <=
+          9.6e-7 (FP32 and int8, window 4, soft-cap 2) on PoCL, source bound and
+          never downloaded (sentinel), 0 transfers per steady step.
+    - [ ] GPU-box: decode tok/s of an `avSDPA` stack with the resident cache.
   - [ ] Follow-ups of the `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
         (732bbaa5): one launch with two query heads per KV head
         (`cai_sdpa_diff_pack_q` writes [Q1,0 | 0,Q2], score scale
