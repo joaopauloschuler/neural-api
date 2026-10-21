@@ -10,7 +10,7 @@ learnable **complex** weights.
 Over a `(SizeX, SizeY, InDepth)` image the layer performs, per channel:
 
 1. a **2-D FFT** — a real radix-2 FFT along X for every row, then along Y for
-   every column (both reuse the proven `FourierMixFFT` radix-2 helper — not a
+   every column (both reuse the proven `FFTRadix2InPlace` radix-2 helper — not a
    second hand-rolled FFT);
 2. a spectral **low-pass truncation** to the lowest `ModesX × ModesY` 2-D
    frequency modes (all higher modes are zeroed, never learned);

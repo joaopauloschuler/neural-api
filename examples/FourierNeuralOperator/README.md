@@ -9,7 +9,7 @@ and the fixed-random `TNNetFourierFeatures`.
 
 Over a `(SeqLen, 1, InDepth)` sequence the layer performs, per channel:
 
-1. a real radix-2 **FFT** along `SeqLen` (reusing the proven `FourierMixFFT`
+1. a real radix-2 **FFT** along `SeqLen` (reusing the proven `FFTRadix2InPlace`
    radix-2 Cooley-Tukey helper — not a second hand-rolled FFT);
 2. a spectral **low-pass truncation** to the lowest `Modes` frequency modes
    (high modes are zeroed, never learned);

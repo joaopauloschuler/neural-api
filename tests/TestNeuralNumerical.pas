@@ -156,6 +156,9 @@ type
     procedure TestFourierMixFFTMatchesDirect;
     procedure TestFourierMixForwardKnownValue;
     procedure TestFourierMixDirectSeparableMatchesNaive;
+    // Shared FFT (neuralvolume.pas) against a naive DFT.
+    procedure TestFFTRadix2MatchesNaiveDFT;
+    procedure TestFFTPlanAnyNMatchesNaiveDFT;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -8487,6 +8490,159 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Naive O(N^2) DFT with the FFT routines' sign and 1/N convention.
+procedure NaiveDFTForTest(const Re, Im: array of Double; N: integer;
+  Inverse: boolean; var OutRe, OutIm: array of Double);
+var
+  FreqCnt, SampleCnt: integer;
+  Ang, SumRe, SumIm, Sgn: Double;
+begin
+  if Inverse then Sgn := 1.0 else Sgn := -1.0;
+  for FreqCnt := 0 to N - 1 do
+  begin
+    SumRe := 0;
+    SumIm := 0;
+    for SampleCnt := 0 to N - 1 do
+    begin
+      Ang := Sgn * 2 * Pi * ((Int64(FreqCnt) * SampleCnt) mod N) / N;
+      SumRe := SumRe + Re[SampleCnt] * Cos(Ang) - Im[SampleCnt] * Sin(Ang);
+      SumIm := SumIm + Re[SampleCnt] * Sin(Ang) + Im[SampleCnt] * Cos(Ang);
+    end;
+    if Inverse then
+    begin
+      SumRe := SumRe / N;
+      SumIm := SumIm / N;
+    end;
+    OutRe[FreqCnt] := SumRe;
+    OutIm[FreqCnt] := SumIm;
+  end;
+end;
+
+// Max abs difference of two complex vectors relative to the reference's max magnitude.
+function FFTRelErrForTest(const ARe, AIm, BRe, BIm: array of Double; N: integer): Double;
+var
+  i: integer;
+  MaxErr, MaxMag: Double;
+begin
+  MaxErr := 0;
+  MaxMag := 1e-300;
+  for i := 0 to N - 1 do
+  begin
+    MaxErr := Max(MaxErr, Abs(ARe[i] - BRe[i]));
+    MaxErr := Max(MaxErr, Abs(AIm[i] - BIm[i]));
+    MaxMag := Max(MaxMag, Abs(BRe[i]));
+    MaxMag := Max(MaxMag, Abs(BIm[i]));
+  end;
+  Result := MaxErr / MaxMag;
+end;
+
+procedure TTestNeuralNumerical.TestFFTRadix2MatchesNaiveDFT;
+const
+  Sizes: array[0..6] of integer = (1, 2, 4, 8, 16, 64, 256);
+var
+  SizeIdx, N, i, TableMode: integer;
+  InvDir: boolean;
+  SrcRe, SrcIm, Re, Im, RefRe, RefIm, CosTab, SinTab: array of Double;
+  Tag: string;
+begin
+  RandSeed := 31337;
+  for SizeIdx := Low(Sizes) to High(Sizes) do
+  begin
+    N := Sizes[SizeIdx];
+    SetLength(SrcRe, N); SetLength(SrcIm, N);
+    SetLength(Re, N); SetLength(Im, N);
+    SetLength(RefRe, N); SetLength(RefIm, N);
+    SetLength(CosTab, N div 2); SetLength(SinTab, N div 2);
+    for i := 0 to N div 2 - 1 do
+    begin
+      CosTab[i] := Cos(2 * Pi * i / N);
+      SinTab[i] := Sin(2 * Pi * i / N);
+    end;
+    for i := 0 to N - 1 do
+    begin
+      SrcRe[i] := Random - 0.5;
+      SrcIm[i] := Random - 0.5;
+    end;
+    for TableMode := 0 to 1 do
+      for InvDir := false to true do
+      begin
+        Tag := 'N=' + IntToStr(N) + ' table=' + IntToStr(TableMode) +
+          ' inverse=' + BoolToStr(InvDir, true);
+        Re := Copy(SrcRe); Im := Copy(SrcIm);
+        if TableMode = 1 then
+          FFTRadix2InPlace(Re, Im, N, InvDir, CosTab, SinTab)
+        else
+          FFTRadix2InPlace(Re, Im, N, InvDir);
+        NaiveDFTForTest(SrcRe, SrcIm, N, InvDir, RefRe, RefIm);
+        AssertTrue('radix-2 vs naive DFT ' + Tag,
+          FFTRelErrForTest(Re, Im, RefRe, RefIm, N) < 1e-12);
+        // Round trip: the opposite direction must restore the input.
+        if TableMode = 1 then
+          FFTRadix2InPlace(Re, Im, N, not InvDir, CosTab, SinTab)
+        else
+          FFTRadix2InPlace(Re, Im, N, not InvDir);
+        if not InvDir then
+          AssertTrue('radix-2 round trip ' + Tag,
+            FFTRelErrForTest(Re, Im, SrcRe, SrcIm, N) < 1e-12);
+      end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFFTPlanAnyNMatchesNaiveDFT;
+const
+  Sizes: array[0..11] of integer = (1, 2, 3, 5, 6, 7, 8, 10, 12, 15, 96, 97);
+var
+  SizeIdx, N, i: integer;
+  InvDir: boolean;
+  Plan: TFFTPlan;
+  SrcRe, SrcIm, Re, Im, RefRe, RefIm: array of Double;
+  Tag: string;
+begin
+  RandSeed := 271828;
+  Plan.N := 0;
+  for SizeIdx := Low(Sizes) to High(Sizes) do
+  begin
+    N := Sizes[SizeIdx];
+    FFTPlanInit(Plan, N);
+    AssertEquals('plan N', N, Plan.N);
+    AssertEquals('plan IsPow2 N=' + IntToStr(N), IsPowerOfTwo(N), Plan.IsPow2);
+    SetLength(SrcRe, N); SetLength(SrcIm, N);
+    SetLength(Re, N); SetLength(Im, N);
+    SetLength(RefRe, N); SetLength(RefIm, N);
+    for i := 0 to N - 1 do
+    begin
+      SrcRe[i] := Random - 0.5;
+      SrcIm[i] := Random - 0.5;
+    end;
+    for InvDir := false to true do
+    begin
+      Tag := 'N=' + IntToStr(N) + ' inverse=' + BoolToStr(InvDir, true);
+      Re := Copy(SrcRe); Im := Copy(SrcIm);
+      FFTPlanExecute(Plan, Re, Im, InvDir);
+      NaiveDFTForTest(SrcRe, SrcIm, N, InvDir, RefRe, RefIm);
+      AssertTrue('plan FFT vs naive DFT ' + Tag,
+        FFTRelErrForTest(Re, Im, RefRe, RefIm, N) < 1e-11);
+      FFTPlanExecute(Plan, Re, Im, not InvDir);
+      AssertTrue('plan round trip ' + Tag,
+        FFTRelErrForTest(Re, Im, SrcRe, SrcIm, N) < 1e-11);
+    end;
+  end;
+  // A real input gives a Hermitian spectrum: X[N-k] = conj(X[k]) at N=10.
+  FFTPlanInit(Plan, 10);
+  SetLength(Re, 10); SetLength(Im, 10);
+  for i := 0 to 9 do
+  begin
+    Re[i] := Sin(i * 0.9) + 0.25 * i;
+    Im[i] := 0;
+  end;
+  FFTPlanExecute(Plan, Re, Im, false);
+  for i := 1 to 9 do
+  begin
+    AssertEquals('Hermitian re k=' + IntToStr(i), Re[i], Re[10 - i], 1e-12);
+    AssertEquals('Hermitian im k=' + IntToStr(i), Im[i], -Im[10 - i], 1e-12);
   end;
 end;
 

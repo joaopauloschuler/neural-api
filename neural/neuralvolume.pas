@@ -1813,6 +1813,36 @@ type
   function NeuralLinearSolve(var A: array of TNeuralFloat;
     var B: array of TNeuralFloat; n, m: integer): boolean;
 
+type
+  { Reusable FFT plan built by FFTPlanInit: radix-2 twiddles for power-of-two N,
+    Bluestein chirp, filter and scratch otherwise. Not thread-safe: one per thread. }
+  TFFTPlan = record
+    N: integer;
+    IsPow2: boolean;
+    ConvLen: integer;
+    CosTab, SinTab: array of Double;
+    ChirpRe, ChirpIm: array of Double;
+    FilterRe, FilterIm: array of Double;
+    WorkRe, WorkIm: array of Double;
+  end;
+
+  // True iff x > 0 and x is a power of two.
+  function IsPowerOfTwo(x: integer): boolean; {$IFDEF Release} inline; {$ENDIF}
+
+  { In-place radix-2 complex FFT of Re/Im[0..N-1], N a power of two. Inverse uses
+    exp(+i) and divides by N. CosTab/SinTab (cos/sin(2*pi*j/N), j < N/2) are optional. }
+  procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+    Inverse: boolean; const CosTab, SinTab: array of Double); overload;
+  procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+    Inverse: boolean); overload;
+
+  // Builds Plan for any N >= 1; allocates only when N changes.
+  procedure FFTPlanInit(var Plan: TFFTPlan; N: integer);
+  { In-place complex FFT of Re/Im[0..Plan.N-1] for any N: radix-2 or Bluestein.
+    Same sign and 1/N convention as FFTRadix2InPlace; no allocation. }
+  procedure FFTPlanExecute(var Plan: TFFTPlan; var Re, Im: array of Double;
+    Inverse: boolean);
+
   { NeuralBoxIoU returns the Intersection-over-Union of two axis-aligned boxes
     given in corner (x1,y1,x2,y2) format (x2>=x1, y2>=y1; pixel or any
     consistent unit). Degenerate boxes are clamped to zero area, and a zero
@@ -5283,6 +5313,263 @@ begin
       TNNetVolume.MulAdd(@A[rowBaseN], @A[colBaseN], -factor, n);
       TNNetVolume.MulAdd(@B[rowBaseM], @B[colBaseM], -factor, m);
     end;
+  end;
+end;
+
+var
+  FFTNoTwiddles: array of Double;
+
+function IsPowerOfTwo(x: integer): boolean;
+begin
+  Result := (x > 0) and ((x and (x - 1)) = 0);
+end;
+
+procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+  Inverse: boolean; const CosTab, SinTab: array of Double);
+var
+  i, j, k, Len, Half, BlockStart, p, q: integer;
+  MaxSamplePos, MaxPairPos, TwIdx, TwStep: integer;
+  Ang, wRe, wIm, wpRe, wpIm, Tmp, InvN, SinSign: Double;
+  uRe, uIm, vRe, vIm, pRe, pIm: Double;
+begin
+  MaxSamplePos := N - 1;
+  j := 0;
+  for i := 1 to MaxSamplePos do
+  begin
+    k := N shr 1;
+    while (j and k) <> 0 do
+    begin
+      j := j and (not k);
+      k := k shr 1;
+    end;
+    j := j or k;
+    if i < j then
+    begin
+      Tmp := Re[i]; Re[i] := Re[j]; Re[j] := Tmp;
+      Tmp := Im[i]; Im[i] := Im[j]; Im[j] := Tmp;
+    end;
+  end;
+  if Inverse then SinSign := 1.0 else SinSign := -1.0;
+  Len := 2;
+  while Len <= N do
+  begin
+    Half := Len shr 1;
+    MaxPairPos := Half - 1;
+    BlockStart := 0;
+    if Length(CosTab) > 0 then
+    begin
+      // Table twiddles: stage Len reads entry k*(N div Len) of the length-N table.
+      TwStep := N div Len;
+      while BlockStart < N do
+      begin
+        TwIdx := 0;
+        p := BlockStart;
+        q := BlockStart + Half;
+        for k := 0 to MaxPairPos do
+        begin
+          wRe := CosTab[TwIdx];
+          wIm := SinTab[TwIdx] * SinSign;
+          uRe := Re[p]; uIm := Im[p];
+          pRe := Re[q]; pIm := Im[q];
+          vRe := wRe * pRe - wIm * pIm;
+          vIm := wRe * pIm + wIm * pRe;
+          Re[p] := uRe + vRe; Im[p] := uIm + vIm;
+          Re[q] := uRe - vRe; Im[q] := uIm - vIm;
+          Inc(p);
+          Inc(q);
+          Inc(TwIdx, TwStep);
+        end;
+        Inc(BlockStart, Len);
+      end;
+    end
+    else
+    begin
+      Ang := SinSign * 2 * Pi / Len;
+      wpRe := Cos(Ang);
+      wpIm := Sin(Ang);
+      while BlockStart < N do
+      begin
+        wRe := 1.0;
+        wIm := 0.0;
+        p := BlockStart;
+        q := BlockStart + Half;
+        for k := 0 to MaxPairPos do
+        begin
+          uRe := Re[p]; uIm := Im[p];
+          pRe := Re[q]; pIm := Im[q];
+          vRe := wRe * pRe - wIm * pIm;
+          vIm := wRe * pIm + wIm * pRe;
+          Re[p] := uRe + vRe; Im[p] := uIm + vIm;
+          Re[q] := uRe - vRe; Im[q] := uIm - vIm;
+          Inc(p);
+          Inc(q);
+          Tmp := wRe * wpRe - wIm * wpIm;
+          wIm := wRe * wpIm + wIm * wpRe;
+          wRe := Tmp;
+        end;
+        Inc(BlockStart, Len);
+      end;
+    end;
+    Len := Len shl 1;
+  end;
+  if Inverse then
+  begin
+    // N is a power of two, so 1/N is exact and the multiply equals the divide.
+    InvN := 1.0 / N;
+    for i := 0 to MaxSamplePos do
+    begin
+      Re[i] := Re[i] * InvN;
+      Im[i] := Im[i] * InvN;
+    end;
+  end;
+end;
+
+procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+  Inverse: boolean);
+begin
+  FFTRadix2InPlace(Re, Im, N, Inverse, FFTNoTwiddles, FFTNoTwiddles);
+end;
+
+procedure FFTPlanInit(var Plan: TFFTPlan; N: integer);
+var
+  TabLen, MaxTabPos, MaxSamplePos, MaxConvPos, SampleCnt: integer;
+  ChirpPhase: Int64;
+  Ang, InvConvLen: Double;
+begin
+  if N < 1 then
+    raise Exception.Create('FFTPlanInit: N must be >= 1, got ' + IntToStr(N));
+  if (Plan.N = N) and (Length(Plan.WorkRe) > 0) then Exit;
+  Plan.N := N;
+  Plan.IsPow2 := IsPowerOfTwo(N);
+  if Plan.IsPow2 then
+    Plan.ConvLen := N
+  else
+  begin
+    Plan.ConvLen := 1;
+    while Plan.ConvLen < 2 * N - 1 do
+      Plan.ConvLen := Plan.ConvLen shl 1;
+  end;
+  TabLen := Plan.ConvLen div 2;
+  SetLength(Plan.CosTab, TabLen);
+  SetLength(Plan.SinTab, TabLen);
+  MaxTabPos := TabLen - 1;
+  for SampleCnt := 0 to MaxTabPos do
+  begin
+    Ang := 2 * Pi * SampleCnt / Plan.ConvLen;
+    Plan.CosTab[SampleCnt] := Cos(Ang);
+    Plan.SinTab[SampleCnt] := Sin(Ang);
+  end;
+  SetLength(Plan.WorkRe, Plan.ConvLen);
+  SetLength(Plan.WorkIm, Plan.ConvLen);
+  if Plan.IsPow2 then
+  begin
+    SetLength(Plan.ChirpRe, 0);
+    SetLength(Plan.ChirpIm, 0);
+    SetLength(Plan.FilterRe, 0);
+    SetLength(Plan.FilterIm, 0);
+    Exit;
+  end;
+  // Bluestein: 2nk = n^2 + k^2 - (k-n)^2, so X = c * ((x*c) circ-conv conj(c)),
+  // c[n] = exp(-i*pi*n^2/N); n^2 is reduced mod 2N to keep the phase exact.
+  SetLength(Plan.ChirpRe, N);
+  SetLength(Plan.ChirpIm, N);
+  MaxSamplePos := N - 1;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    ChirpPhase := (Int64(SampleCnt) * SampleCnt) mod (2 * Int64(N));
+    Ang := Pi * ChirpPhase / N;
+    Plan.ChirpRe[SampleCnt] := Cos(Ang);
+    Plan.ChirpIm[SampleCnt] := -Sin(Ang);
+  end;
+  SetLength(Plan.FilterRe, Plan.ConvLen);
+  SetLength(Plan.FilterIm, Plan.ConvLen);
+  MaxConvPos := Plan.ConvLen - 1;
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    Plan.FilterRe[SampleCnt] := 0.0;
+    Plan.FilterIm[SampleCnt] := 0.0;
+  end;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    Plan.FilterRe[SampleCnt] := Plan.ChirpRe[SampleCnt];
+    Plan.FilterIm[SampleCnt] := -Plan.ChirpIm[SampleCnt];
+  end;
+  for SampleCnt := 1 to MaxSamplePos do
+  begin
+    Plan.FilterRe[Plan.ConvLen - SampleCnt] := Plan.ChirpRe[SampleCnt];
+    Plan.FilterIm[Plan.ConvLen - SampleCnt] := -Plan.ChirpIm[SampleCnt];
+  end;
+  FFTRadix2InPlace(Plan.FilterRe, Plan.FilterIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  // The 1/ConvLen of the convolution's inverse FFT is folded into the filter.
+  InvConvLen := 1.0 / Plan.ConvLen;
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    Plan.FilterRe[SampleCnt] := Plan.FilterRe[SampleCnt] * InvConvLen;
+    Plan.FilterIm[SampleCnt] := Plan.FilterIm[SampleCnt] * InvConvLen;
+  end;
+end;
+
+procedure FFTPlanExecute(var Plan: TFFTPlan; var Re, Im: array of Double;
+  Inverse: boolean);
+var
+  SampleCnt, MaxSamplePos, MaxConvPos, N: integer;
+  xRe, xIm, cRe, cIm, fRe, fIm, InSign, OutScale, OutImScale: Double;
+begin
+  N := Plan.N;
+  if Plan.IsPow2 then
+  begin
+    FFTRadix2InPlace(Re, Im, N, Inverse, Plan.CosTab, Plan.SinTab);
+    Exit;
+  end;
+  // The inverse is conj(DFT(conj(x)))/N, so one forward Bluestein serves both.
+  if Inverse then
+  begin
+    InSign := -1.0;
+    OutScale := 1.0 / Double(N);
+    OutImScale := -OutScale;
+  end
+  else
+  begin
+    InSign := 1.0;
+    OutScale := 1.0;
+    OutImScale := 1.0;
+  end;
+  MaxSamplePos := N - 1;
+  MaxConvPos := Plan.ConvLen - 1;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    xRe := Re[SampleCnt];
+    xIm := Im[SampleCnt] * InSign;
+    cRe := Plan.ChirpRe[SampleCnt];
+    cIm := Plan.ChirpIm[SampleCnt];
+    Plan.WorkRe[SampleCnt] := xRe * cRe - xIm * cIm;
+    Plan.WorkIm[SampleCnt] := xRe * cIm + xIm * cRe;
+  end;
+  FillChar(Plan.WorkRe[N], (Plan.ConvLen - N) * csDoubleSize, 0);
+  FillChar(Plan.WorkIm[N], (Plan.ConvLen - N) * csDoubleSize, 0);
+  FFTRadix2InPlace(Plan.WorkRe, Plan.WorkIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  // Multiply by the filter and conjugate, so a forward FFT acts as the inverse.
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    xRe := Plan.WorkRe[SampleCnt];
+    xIm := Plan.WorkIm[SampleCnt];
+    fRe := Plan.FilterRe[SampleCnt];
+    fIm := Plan.FilterIm[SampleCnt];
+    Plan.WorkRe[SampleCnt] := xRe * fRe - xIm * fIm;
+    Plan.WorkIm[SampleCnt] := -(xRe * fIm + xIm * fRe);
+  end;
+  FFTRadix2InPlace(Plan.WorkRe, Plan.WorkIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    xRe := Plan.WorkRe[SampleCnt];
+    xIm := -Plan.WorkIm[SampleCnt];
+    cRe := Plan.ChirpRe[SampleCnt];
+    cIm := Plan.ChirpIm[SampleCnt];
+    Re[SampleCnt] := (xRe * cRe - xIm * cIm) * OutScale;
+    Im[SampleCnt] := (xRe * cIm + xIm * cRe) * OutImScale;
   end;
 end;
 

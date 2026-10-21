@@ -1329,73 +1329,6 @@ begin
   end;
 end;
 
-// In-place radix-2 FFT (forward: X[k] = sum x[n] exp(-2*pi*i*k*n/N)). N must
-// be a power of two; Re/Im must both hold at least N entries. Shared by the
-// melody chroma front-end and the power-of-two inverse STFT path.
-//
-// CosTab/SinTab are the caller's fundamental twiddle table, CosTab[j] =
-// cos(2*pi*j/N) and SinTab[j] = sin(2*pi*j/N); at least N div 2 entries are
-// read. A stage of length lenF needs exp(-2*pi*i*k2/lenF) for k2 < lenF div 2,
-// which is entry k2*(N div lenF) < N div 2 of that same table. Reading the
-// twiddle instead of advancing it by complex multiplication removes the
-// loop-carried dependency the recurrence imposes on the butterfly loop, and
-// drops the drift the recurrence accumulates across a long stage.
-procedure FFTRadix2InPlace(var Re, Im: array of double; N: integer;
-  const CosTab, SinTab: array of double);
-var
-  i2, j2, lenF, halfF, k2, a2, b2: integer;
-  MaxTapPos, halfFM1, twIdx, twStep: integer;
-  wRe, wIm, tmpF: double;
-  uRe, uIm, vRe, vIm: double;
-begin
-  MaxTapPos := N - 1;
-  j2 := 0;
-  for i2 := 1 to MaxTapPos do
-  begin
-    k2 := N shr 1;
-    while (j2 and k2) <> 0 do
-    begin
-      j2 := j2 and (not k2);
-      k2 := k2 shr 1;
-    end;
-    j2 := j2 or k2;
-    if i2 < j2 then
-    begin
-      tmpF := Re[i2]; Re[i2] := Re[j2]; Re[j2] := tmpF;
-      tmpF := Im[i2]; Im[i2] := Im[j2]; Im[j2] := tmpF;
-    end;
-  end;
-  lenF := 2;
-  while lenF <= N do
-  begin
-    halfF := lenF shr 1;
-    halfFM1 := halfF - 1;
-    twStep := N div lenF;
-    i2 := 0;
-    while i2 < N do
-    begin
-      twIdx := 0;
-      for k2 := 0 to halfFM1 do
-      begin
-        a2 := i2 + k2;
-        b2 := a2 + halfF;
-        // w = exp(-2*pi*i*k2/lenF) = CosTab[twIdx] - i*SinTab[twIdx].
-        wRe := CosTab[twIdx];
-        wIm := SinTab[twIdx];
-        uRe := Re[a2]; uIm := Im[a2];
-        tmpF := Re[b2];
-        vRe := tmpF * wRe + Im[b2] * wIm;
-        vIm := Im[b2] * wRe - tmpF * wIm;
-        Re[a2] := uRe + vRe; Im[a2] := uIm + vIm;
-        Re[b2] := uRe - vRe; Im[b2] := uIm - vIm;
-        Inc(twIdx, twStep);
-      end;
-      i2 := i2 + lenF;
-    end;
-    lenF := lenF shl 1;
-  end;
-end;
-
 procedure ComputeMusicgenMelodyChroma(Samples: TNNetVolume; Chroma: TNNetVolume;
   SampleRate: integer = 32000; NFFT: integer = 16384; Hop: integer = 4096;
   NumChroma: integer = 12);
@@ -1505,7 +1438,7 @@ begin
       else
         for TapCnt := 0 to NFFTM1 do
           Re[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
-      FFTRadix2InPlace(Re, Im, NFFT, FftCos, FftSin);
+      FFTRadix2InPlace(Re, Im, NFFT, false, FftCos, FftSin);
       // one-sided power spectrum, normalized by the window L2 energy
       for BinCnt := 0 to NumBinsM1 do
       begin
@@ -1671,7 +1604,7 @@ begin
       end;
       // The fundamental table built above is exactly the twiddle table the
       // radix-2 stages index (CosTab[j] = cos(2*pi*j/NFFT)); no second table.
-      FFTRadix2InPlace(FftRe, FftIm, NFFT, CosTab, SinTab);
+      FFTRadix2InPlace(FftRe, FftIm, NFFT, false, CosTab, SinTab);
       for TapCnt := 0 to NFFTM1 do
       begin
         Sample := FftRe[TapCnt] * invNFFT;

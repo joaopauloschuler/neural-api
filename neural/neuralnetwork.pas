@@ -14602,7 +14602,7 @@ type
   /// sum of several binds is a single noisy memory and unbind by a key recovers
   /// an approximate copy of its bound value (the HRR query/inverse). Genuinely
   /// new here: nothing else does cyclic n-point convolution as a bilinear bind of
-  /// TWO tensors (TNNetFourierMix / FourierMixFFT do a learned spectral mixing of
+  /// TWO tensors (TNNetFourierMix (direct or FFT) does a learned spectral mixing of
   /// ONE tensor). This layer has NO trainable weights. The Unbind flag round-trips
   /// via FStruct[6]. Forward is a direct O(n^2) cyclic sum (n is small in
   /// practice); the exact bilinear backward packs (da|db) into the same 2n layout.
@@ -16453,7 +16453,7 @@ type
   /// Re(DFT) token mixer) and the fixed-RANDOM TNNetFourierFeatures.
   ///
   /// Over a (SeqLen, 1, InDepth) sequence it performs, per channel:
-  ///   1. a real radix-2 FFT along SeqLen (reusing the proven FourierMixFFT
+  ///   1. a real radix-2 FFT along SeqLen (reusing the proven FFTRadix2InPlace
   ///      radix-2 Cooley-Tukey helper -- NOT a hand-rolled second FFT);
   ///   2. a spectral LOW-PASS truncation to the lowest FModes frequency modes
   ///      (high modes are zeroed, never learned -- this is exactly what makes the
@@ -16525,7 +16525,7 @@ type
   /// the natural 2-D extension of TNNetSpectralConv1D. Over a (SizeX, SizeY,
   /// InDepth) image it performs, per channel:
   ///   1. a 2-D real radix-2 FFT (FFT along X for every row, then along Y for
-  ///      every column -- both reuse the proven FourierMixFFT helper, NOT a
+  ///      every column -- both reuse the proven FFTRadix2InPlace helper, NOT a
   ///      hand-rolled second FFT);
   ///   2. a spectral LOW-PASS truncation to the lowest FModesX x FModesY 2-D
   ///      frequency modes (high modes are zeroed, never learned -- exactly what
@@ -16573,13 +16573,13 @@ type
     // BackpropagateCPU contiguous input-spectrum gradient, FxrPlane's layout.
     FdXrePlane, FdXimPlane: array of TNeuralFloat;
     // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
-    // the [x][y] layout makes Re[ix] the contiguous Y row, so FourierMixFFT
+    // the [x][y] layout makes Re[ix] the contiguous Y row, so FFTRadix2InPlace
     // runs in place on it.
     FFftRowRe, FFftRowIm: array of Double;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
-    // 2-D FFT helpers on a [x][y] grid (in-place); reuse FourierMixFFT per axis.
+    // 2-D FFT helpers on a [x][y] grid (in-place); reuse FFTRadix2InPlace per axis.
     procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
     procedure RebuildWeightPlanes();
     procedure FreeBackpropScratch();
@@ -33685,89 +33685,6 @@ end;
 
 { TNNetFourierMix }
 
-// --- Self-contained radix-2 Cooley-Tukey FFT (power-of-two length only) -----
-// Same algorithm proven in TNNetCirculantLinear's FFT fast path (CirculantFFT,
-// see far below), replicated here because that routine is defined later in the
-// implementation section and Pascal forbids forward use. The inverse path
-// conjugates the exponent and divides by N. Double precision throughout.
-procedure FourierMixFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
-var
-  i, j, len, half, k, NM1, halfM1, a, b: integer;
-  ang, wRe, wIm, wpRe, wpIm, tmp, InvN: Double;
-  uRe, uIm, vRe, vIm: Double;
-begin
-  NM1 := N - 1;
-  // Bit-reversal permutation.
-  j := 0;
-  for i := 1 to NM1 do
-  begin
-    k := N shr 1;
-    while (j and k) <> 0 do
-    begin
-      j := j and (not k);
-      k := k shr 1;
-    end;
-    j := j or k;
-    if i < j then
-    begin
-      tmp := Re[i]; Re[i] := Re[j]; Re[j] := tmp;
-      tmp := Im[i]; Im[i] := Im[j]; Im[j] := tmp;
-    end;
-  end;
-  len := 2;
-  while len <= N do
-  begin
-    half := len shr 1;
-    halfM1 := half - 1;
-    if Inverse then
-      ang := 2 * Pi / len
-    else
-      ang := -2 * Pi / len;
-    wpRe := Cos(ang);
-    wpIm := Sin(ang);
-    i := 0;
-    while i < N do
-    begin
-      wRe := 1.0;
-      wIm := 0.0;
-      for k := 0 to halfM1 do
-      begin
-        a := i + k;
-        b := a + half;
-        uRe := Re[a];
-        uIm := Im[a];
-        vRe := wRe * Re[b] - wIm * Im[b];
-        vIm := wRe * Im[b] + wIm * Re[b];
-        Re[a] := uRe + vRe;
-        Im[a] := uIm + vIm;
-        Re[b] := uRe - vRe;
-        Im[b] := uIm - vIm;
-        tmp := wRe * wpRe - wIm * wpIm;
-        wIm := wRe * wpIm + wIm * wpRe;
-        wRe := tmp;
-      end;
-      i := i + len;
-    end;
-    len := len shl 1;
-  end;
-  if Inverse then
-  begin
-    // N is a power of two, so 1/N is exact and the scale is bit-identical
-    // to the divide it replaces (#21).
-    InvN := 1.0 / N;
-    for i := 0 to NM1 do
-    begin
-      Re[i] := Re[i] * InvN;
-      Im[i] := Im[i] * InvN;
-    end;
-  end;
-end;
-
-function FourierMixIsPow2(x: integer): boolean;
-begin
-  Result := (x > 0) and ((x and (x - 1)) = 0);
-end;
-
 constructor TNNetFourierMix.Create();
 begin
   Create(0);
@@ -33807,7 +33724,7 @@ begin
     FErrorProc('TNNetFourierMix requires SizeY=1 (a (SeqLen,1,d) sequence); got SizeY=' +
       IntToStr(FOutput.SizeY) + '.');
   if GetUseFFT() and
-     not (FourierMixIsPow2(FOutput.SizeX) and FourierMixIsPow2(FOutput.Depth)) then
+     not (IsPowerOfTwo(FOutput.SizeX) and IsPowerOfTwo(FOutput.Depth)) then
     FErrorProc('TNNetFourierMix.UseFFT requires power-of-two SeqLen and Depth; got SeqLen=' +
       IntToStr(FOutput.SizeX) + ', Depth=' + IntToStr(FOutput.Depth) +
       '. Disable UseFFT for the direct O(n^2) path.');
@@ -34008,7 +33925,7 @@ begin
     FillChar(rowIm[0], D * SizeOf(Double), 0);
     for h := 0 to DM1 do
       rowRe[h] := Src.FData[sD + h];
-    FourierMixFFT(rowRe, rowIm, D, false);
+    FFTRadix2InPlace(rowRe, rowIm, D, false);
   end;
   // FFT each column across the sequence axis, keep real part.
   colRe := FFFTColRe;
@@ -34020,7 +33937,7 @@ begin
       colRe[s] := reRows[s][h];
       colIm[s] := imRows[s][h];
     end;
-    FourierMixFFT(colRe, colIm, L, false);
+    FFTRadix2InPlace(colRe, colIm, L, false);
     pos := h;   // #12: carry s*D+h as a running offset instead of a multiply
     for s := 0 to LM1 do
     begin
@@ -89876,101 +89793,6 @@ end;
 
 { TNNetCirculantLinear }
 
-// --- Self-contained radix-2 Cooley-Tukey FFT (power-of-two length only) ----
-// Operates in place on parallel real/imag arrays of length N. Inverse=false is
-// the forward transform sum_n x[n] exp(-2*pi*i*k*n/N); Inverse=true uses +i in
-// the exponent and divides by N, so IFFT(FFT(x)) = x. Kept local to the
-// circulant layer's FFT fast path; not exported. Works in DOUBLE precision
-// internally (independent of TNeuralFloat) so the round-trip stays faithful to
-// the direct path to < 1e-5 even when TNeuralFloat is single.
-procedure CirculantFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
-var
-  i, j, len, half, k, p, q: integer;
-  NM1, halfM1: integer;
-  ang, wRe, wIm, wpRe, wpIm, tmp, InvN: Double;
-  uRe, uIm, vRe, vIm, pRe, pIm: Double;
-begin
-  NM1 := N - 1;
-  // Bit-reversal permutation.
-  j := 0;
-  for i := 1 to NM1 do
-  begin
-    k := N shr 1;
-    while (j and k) <> 0 do
-    begin
-      j := j and (not k);
-      k := k shr 1;
-    end;
-    j := j or k;
-    if i < j then
-    begin
-      tmp := Re[i]; Re[i] := Re[j]; Re[j] := tmp;
-      tmp := Im[i]; Im[i] := Im[j]; Im[j] := tmp;
-    end;
-  end;
-  // Iterative Danielson-Lanczos butterflies.
-  len := 2;
-  while len <= N do
-  begin
-    half := len shr 1;
-    halfM1 := half - 1;
-    // Twiddle factor base exp(-/+ 2*pi*i / len).
-    if Inverse then
-      ang := 2 * Pi / len
-    else
-      ang := -2 * Pi / len;
-    wpRe := Cos(ang);
-    wpIm := Sin(ang);
-    i := 0;
-    while i < N do
-    begin
-      wRe := 1.0;
-      wIm := 0.0;
-      p := i;                     // #12: carries i + k
-      q := i + half;              // #12: carries i + k + half
-      for k := 0 to halfM1 do
-      begin
-        uRe := Re[p];
-        uIm := Im[p];
-        pRe := Re[q];             // #4: each partner is read twice below
-        pIm := Im[q];
-        // v = w * x[i+k+half]
-        vRe := wRe * pRe - wIm * pIm;
-        vIm := wRe * pIm + wIm * pRe;
-        Re[p] := uRe + vRe;
-        Im[p] := uIm + vIm;
-        Re[q] := uRe - vRe;
-        Im[q] := uIm - vIm;
-        Inc(p);
-        Inc(q);
-        // advance w *= wp
-        tmp := wRe * wpRe - wIm * wpIm;
-        wIm := wRe * wpIm + wIm * wpRe;
-        wRe := tmp;
-      end;
-      i := i + len;
-    end;
-    len := len shl 1;
-  end;
-  if Inverse then
-  begin
-    // #21: N is a power of two here (RequireFFTUsable), so 1/N is exact and the
-    // multiply gives the same result as the divide.
-    InvN := 1.0 / N;
-    for i := 0 to NM1 do
-    begin
-      Re[i] := Re[i] * InvN;
-      Im[i] := Im[i] * InvN;
-    end;
-  end;
-end;
-
-// True iff x is a power of two (and > 0).
-function CirculantIsPow2(x: integer): boolean;
-begin
-  Result := (x > 0) and ((x and (x - 1)) = 0);
-end;
-
 constructor TNNetCirculantLinear.Create(pSizeX, pSizeY, pDepth: integer;
   pSuppressBias: integer = 0);
 begin
@@ -90207,7 +90029,7 @@ end;
 // Guards the opt-in FFT path: the radix-2 FFT only supports power-of-two n.
 procedure TNNetCirculantLinear.RequireFFTUsable();
 begin
-  if not CirculantIsPow2(FOutput.Size) then
+  if not IsPowerOfTwo(FOutput.Size) then
     FErrorProc
     (
       'TNNetCirculantLinear.UseFFT requires a power-of-two size; got '+
@@ -90240,7 +90062,7 @@ begin
     FcSpecRe[i] := Kernel.FData[i];
     FcSpecIm[i] := 0;
   end;
-  CirculantFFT(FcSpecRe, FcSpecIm, N, false);
+  FFTRadix2InPlace(FcSpecRe, FcSpecIm, N, false);
   Move(Kernel.FData[0], FcSpecW[0], N * csNeuralFloatSize);
   FcSpecValid := True;
 end;
@@ -90263,7 +90085,7 @@ begin
   begin
     FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
   end;
-  CirculantFFT(FxReBuf, FxImBuf, N, false);
+  FFTRadix2InPlace(FxReBuf, FxImBuf, N, false);
   // Pointwise complex product C .* X.
   for i := 0 to NM1 do
   begin
@@ -90271,7 +90093,7 @@ begin
     yIm := FcSpecRe[i] * FxImBuf[i] + FcSpecIm[i] * FxReBuf[i];
     FcReBuf[i] := yRe; FcImBuf[i] := yIm;
   end;
-  CirculantFFT(FcReBuf, FcImBuf, N, true);
+  FFTRadix2InPlace(FcReBuf, FcImBuf, N, true);
   if FSuppressBias = 0 then
     for i := 0 to NM1 do
       FOutput.FData[i] := FcReBuf[i] + Bias.FData[i]
@@ -90299,7 +90121,7 @@ begin
   begin
     FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
   end;
-  CirculantFFT(FeReBuf, FeImBuf, N, false);
+  FFTRadix2InPlace(FeReBuf, FeImBuf, N, false);
   // conj(C) .* E
   for i := 0 to NM1 do
   begin
@@ -90307,7 +90129,7 @@ begin
     gIm := FcSpecRe[i] * FeImBuf[i] - FcSpecIm[i] * FeReBuf[i];
     FcReBuf[i] := gRe; FcImBuf[i] := gIm;
   end;
-  CirculantFFT(FcReBuf, FcImBuf, N, true);
+  FFTRadix2InPlace(FcReBuf, FcImBuf, N, true);
   for i := 0 to NM1 do
     LocalPrevError.FData[i] := LocalPrevError.FData[i] + FcReBuf[i];
 end;
@@ -90334,8 +90156,8 @@ begin
     FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
     FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
   end;
-  CirculantFFT(FxReBuf, FxImBuf, N, false);
-  CirculantFFT(FeReBuf, FeImBuf, N, false);
+  FFTRadix2InPlace(FxReBuf, FxImBuf, N, false);
+  FFTRadix2InPlace(FeReBuf, FeImBuf, N, false);
   // conj(X) .* E
   for i := 0 to NM1 do
   begin
@@ -90343,7 +90165,7 @@ begin
     gIm := FxReBuf[i] * FeImBuf[i] - FxImBuf[i] * FeReBuf[i];
     FxReBuf[i] := gRe; FxImBuf[i] := gIm;
   end;
-  CirculantFFT(FxReBuf, FxImBuf, N, true);
+  FFTRadix2InPlace(FxReBuf, FxImBuf, N, true);
   for i := 0 to NM1 do
   begin
     KernelDelta.FData[i] := KernelDelta.FData[i] + lr * FxReBuf[i];
@@ -91498,7 +91320,7 @@ end;
 //   x  --FFT-->  Xhat  --complex matmul R[m]-->  Yhat  --(real)IFFT-->  y
 // truncated to the lowest FModes modes. Because every stage is linear over the
 // reals, backward is the EXACT transpose of each stage (derived in full in the
-// class header). The real radix-2 FFT/IFFT is FourierMixFFT (proven < 1e-5 vs
+// class header). The real radix-2 FFT/IFFT is FFTRadix2InPlace (proven < 1e-5 vs
 // the direct DFT in TNNetFourierMix) -- we do NOT hand-roll a second FFT.
 
 constructor TNNetSpectralConv1D.Create(pOutDepth, pModes: integer);
@@ -91580,7 +91402,7 @@ begin
       IntToStr(pPrevLayer.Output.SizeY) + '.');
   FSeqLen := pPrevLayer.Output.SizeX;
   FInDepth := pPrevLayer.Output.Depth;
-  if not FourierMixIsPow2(FSeqLen) then
+  if not IsPowerOfTwo(FSeqLen) then
     FErrorProc('TNNetSpectralConv1D requires a power-of-two SeqLen (radix-2 FFT); got SeqLen=' +
       IntToStr(FSeqLen) + '.');
   if FModes > FSeqLen then
@@ -91715,7 +91537,7 @@ begin
       FXim[ci][n] := 0;
       Inc(pos, FInDepth);
     end;
-    FourierMixFFT(FXre[ci], FXim[ci], FSeqLen, false);
+    FFTRadix2InPlace(FXre[ci], FXim[ci], FSeqLen, false);
   end;
   // Pack the kept-mode input spectra into contiguous (m,ci) Single planes so the
   // InDepth contraction below is a vectorizable DotProduct.
@@ -91753,7 +91575,7 @@ begin
         TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
         TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
     end;
-    FourierMixFFT(FSreBuf, FSimBuf, FSeqLen, true);  // inverse FFT (includes 1/L)
+    FFTRadix2InPlace(FSreBuf, FSimBuf, FSeqLen, true);  // inverse FFT (includes 1/L)
     pos := co;
     for n := 0 to SeqLenM1 do
     begin
@@ -91816,7 +91638,7 @@ begin
       FGimBuf[n] := 0;
       Inc(pos, FOutDepth);
     end;
-    FourierMixFFT(FGreBuf, FGimBuf, FSeqLen, false);
+    FFTRadix2InPlace(FGreBuf, FGimBuf, FSeqLen, false);
     for m := 0 to ModesM1 do
     begin
       gyr := invL * FGreBuf[m];
@@ -91901,7 +91723,7 @@ begin
         FGreBuf[m] := FdXreBuf[ci][m];
         FGimBuf[m] := FdXimBuf[ci][m];
       end;
-      FourierMixFFT(FGreBuf, FGimBuf, FSeqLen, true);  // IFFT (includes 1/L)
+      FFTRadix2InPlace(FGreBuf, FGimBuf, FSeqLen, true);  // IFFT (includes 1/L)
       pos := ci;
       for n := 0 to SeqLenM1 do
       begin
@@ -92611,7 +92433,7 @@ end;
 //   x --FFT2D--> Xhat --complex matmul R[mx,my]--> Yhat --(real)IFFT2D--> y
 // truncated to the lowest FModesX x FModesY 2-D modes. Every stage is linear over
 // the reals, so backward is the EXACT transpose of each stage. The radix-2 FFT is
-// FourierMixFFT applied per axis -- we do NOT hand-roll a second FFT.
+// FFTRadix2InPlace applied per axis -- we do NOT hand-roll a second FFT.
 
 constructor TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY: integer);
 begin
@@ -92684,7 +92506,7 @@ end;
 
 // In-place 2-D FFT on a [x][y] grid: FFT along X (each row of fixed y) then along
 // Y (each column of fixed x). Inverse reverses nothing structurally (the FFT is
-// separable); FourierMixFFT's Inverse flag already applies the 1/N per axis, so a
+// separable); FFTRadix2InPlace's Inverse flag already applies the 1/N per axis, so a
 // full inverse 2-D FFT divides by FSizeX*FSizeY overall.
 procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
 var
@@ -92702,7 +92524,7 @@ begin
       FFftRowRe[ix] := Re[ix][iy];
       FFftRowIm[ix] := Im[ix][iy];
     end;
-    FourierMixFFT(FFftRowRe, FFftRowIm, FSizeX, Inverse);
+    FFTRadix2InPlace(FFftRowRe, FFftRowIm, FSizeX, Inverse);
     for ix := 0 to SizeXM1 do
     begin
       Re[ix][iy] := FFftRowRe[ix];
@@ -92711,7 +92533,7 @@ begin
   end;
   // FFT along Y for each x: Re[ix]/Im[ix] already ARE the contiguous Y rows.
   for ix := 0 to SizeXM1 do
-    FourierMixFFT(Re[ix], Im[ix], FSizeY, Inverse);
+    FFTRadix2InPlace(Re[ix], Im[ix], FSizeY, Inverse);
 end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -92722,10 +92544,10 @@ begin
   FSizeX := pPrevLayer.Output.SizeX;
   FSizeY := pPrevLayer.Output.SizeY;
   FInDepth := pPrevLayer.Output.Depth;
-  if not FourierMixIsPow2(FSizeX) then
+  if not IsPowerOfTwo(FSizeX) then
     FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeX (radix-2 FFT); got SizeX=' +
       IntToStr(FSizeX) + '.');
-  if not FourierMixIsPow2(FSizeY) then
+  if not IsPowerOfTwo(FSizeY) then
     FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeY (radix-2 FFT); got SizeY=' +
       IntToStr(FSizeY) + '.');
   if FModesX > FSizeX then
