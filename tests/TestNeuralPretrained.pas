@@ -1081,6 +1081,12 @@ type
     procedure TestSDUNetPerBlockHeadsParity;
     procedure TestDiffusionInpaintSmoke;
     procedure TestMarigoldDenoiseSmoke;
+    procedure TestMarigoldPreprocessPadsReplicate;
+    procedure TestMarigoldPreprocessResizesLongSide;
+    procedure TestMarigoldUnpadImage;
+    procedure TestMarigoldDepthFromDecoded;
+    procedure TestMarigoldNormalsFromDecoded;
+    procedure TestResizeImageBilinearNoAntialias;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -42453,6 +42459,199 @@ begin
     Expected.Free; UNetInput.Free; Pred.Free;
     Sched.Free; Enc.Free; UNet.Free;
     DeleteFile(Path);
+  end;
+end;
+
+// 3x2 image, no resize: [0,1] -> [-1,1], then replicate pad right/bottom to
+// multiples of 4 (4x4), and with PadToSquare at alignment 1 (3x3).
+procedure TTestNeuralPretrained.TestMarigoldPreprocessPadsReplicate;
+const
+  cImage: array[0..5] of TNeuralFloat = (0, 0.5, 1, 0.25, 0.75, 1);
+  // 2*v-1 rows (-1, 0, 1) and (-0.5, 0.5, 1); column 3 and rows 2-3 replicate.
+  cPadded: array[0..15] of TNeuralFloat = (
+    -1, 0, 1, 1,
+    -0.5, 0.5, 1, 1,
+    -0.5, 0.5, 1, 1,
+    -0.5, 0.5, 1, 1);
+var
+  Image, Padded: TNNetVolume;
+  PadX, PadY, i: integer;
+begin
+  Image := TNNetVolume.Create(3, 2, 1);
+  Padded := TNNetVolume.Create();
+  try
+    for i := 0 to 5 do Image.FData[i] := cImage[i];
+    MarigoldPreprocessImage(Image, Padded, 0, 4, false, PadX, PadY);
+    AssertEquals('PadX', 1, PadX);
+    AssertEquals('PadY', 2, PadY);
+    AssertEquals('SizeX', 4, Padded.SizeX);
+    AssertEquals('SizeY', 4, Padded.SizeY);
+    for i := 0 to 15 do
+      AssertEquals('padded[' + IntToStr(i) + ']', cPadded[i], Padded.FData[i], 1e-6);
+    MarigoldPreprocessImage(Image, Padded, 0, 1, true, PadX, PadY);
+    AssertEquals('square PadX', 0, PadX);
+    AssertEquals('square PadY', 1, PadY);
+    AssertEquals('square SizeX', 3, Padded.SizeX);
+    AssertEquals('square SizeY', 3, Padded.SizeY);
+    for i := 0 to 8 do
+      AssertEquals('square[' + IntToStr(i) + ']', cPadded[(i div 3) * 4 + i mod 3],
+        Padded.FData[i], 1e-6);
+  finally
+    Image.Free;
+    Padded.Free;
+  end;
+end;
+
+// 2x1 image (0, 1) with long side -> 4 gives 4x2 (1*4 div 2). PIL bilinear
+// upsampling 2->4 weights: (1,0), (3/4,1/4), (1/4,3/4), (0,1) on (-1, 1).
+// A 5x3 image at 4 gives 4x2 (floor of 2.4), padded to 8x8 at alignment 8.
+procedure TTestNeuralPretrained.TestMarigoldPreprocessResizesLongSide;
+const
+  cRow: array[0..3] of TNeuralFloat = (-1, -0.5, 0.5, 1);
+var
+  Image, Padded: TNNetVolume;
+  PadX, PadY, X, Y: integer;
+begin
+  Image := TNNetVolume.Create(2, 1, 1);
+  Padded := TNNetVolume.Create();
+  try
+    Image.FData[0] := 0;
+    Image.FData[1] := 1;
+    MarigoldPreprocessImage(Image, Padded, 4, 2, false, PadX, PadY);
+    AssertEquals('PadX', 0, PadX);
+    AssertEquals('PadY', 0, PadY);
+    AssertEquals('SizeX', 4, Padded.SizeX);
+    AssertEquals('SizeY', 2, Padded.SizeY);
+    for Y := 0 to 1 do
+      for X := 0 to 3 do
+        AssertEquals('resized(' + IntToStr(X) + ',' + IntToStr(Y) + ')',
+          cRow[X], Padded[X, Y, 0], 1e-6);
+    Image.ReSize(5, 3, 3);
+    Image.Fill(0.25);
+    MarigoldPreprocessImage(Image, Padded, 4, 8, false, PadX, PadY);
+    AssertEquals('5x3 PadX', 4, PadX);
+    AssertEquals('5x3 PadY', 6, PadY);
+    AssertEquals('5x3 SizeX', 8, Padded.SizeX);
+    AssertEquals('5x3 SizeY', 8, Padded.SizeY);
+    AssertEquals('5x3 Depth', 3, Padded.Depth);
+    AssertEquals('5x3 min', -0.5, Padded.GetMin(), 1e-6);
+    AssertEquals('5x3 max', -0.5, Padded.GetMax(), 1e-6);
+  finally
+    Image.Free;
+    Padded.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMarigoldUnpadImage;
+var
+  Padded, Unpadded: TNNetVolume;
+  X, Y, D: integer;
+begin
+  Padded := TNNetVolume.Create(4, 3, 2);
+  Unpadded := TNNetVolume.Create();
+  try
+    for Y := 0 to 2 do
+      for X := 0 to 3 do
+        for D := 0 to 1 do
+          Padded[X, Y, D] := 100 * Y + 10 * X + D;
+    MarigoldUnpadImage(Padded, Unpadded, 1, 1);
+    AssertEquals('SizeX', 3, Unpadded.SizeX);
+    AssertEquals('SizeY', 2, Unpadded.SizeY);
+    AssertEquals('Depth', 2, Unpadded.Depth);
+    for Y := 0 to 1 do
+      for X := 0 to 2 do
+        for D := 0 to 1 do
+          AssertEquals('unpadded', 100 * Y + 10 * X + D, Unpadded[X, Y, D], 1e-6);
+  finally
+    Padded.Free;
+    Unpadded.Free;
+  end;
+end;
+
+// Channel means 0.4, 3 (clipped to 1) and -2 (clipped to -1) map to 0.7, 1, 0.
+procedure TTestNeuralPretrained.TestMarigoldDepthFromDecoded;
+const
+  cDecoded: array[0..8] of TNeuralFloat = (0.2, 0.4, 0.6, 2, 3, 4, -3, -3, 0);
+  cDepth: array[0..2] of TNeuralFloat = (0.7, 1, 0);
+var
+  Decoded, Depth: TNNetVolume;
+  i: integer;
+begin
+  Decoded := TNNetVolume.Create(3, 1, 3);
+  Depth := TNNetVolume.Create();
+  try
+    for i := 0 to 8 do Decoded.FData[i] := cDecoded[i];
+    MarigoldDepthFromDecoded(Decoded, Depth);
+    AssertEquals('SizeX', 3, Depth.SizeX);
+    AssertEquals('SizeY', 1, Depth.SizeY);
+    AssertEquals('Depth', 1, Depth.Depth);
+    for i := 0 to 2 do
+      AssertEquals('depth[' + IntToStr(i) + ']', cDepth[i], Depth.FData[i], 1e-6);
+  finally
+    Decoded.Free;
+    Depth.Free;
+  end;
+end;
+
+// (3,0,4) clips to (1,0,1) -> (r,0,r), r = 1/sqrt(2); (0.3,0,0.4) -> (0.6,0,0.8);
+// a zero vector stays zero. Without the full z range z -> z/2+1/2 first.
+procedure TTestNeuralPretrained.TestMarigoldNormalsFromDecoded;
+const
+  cDecoded: array[0..8] of TNeuralFloat = (3, 0, 4, 0.3, 0, 0.4, 0, 0, 0);
+  cFull: array[0..8] of TNeuralFloat = (0.70710678, 0, 0.70710678, 0.6, 0, 0.8,
+    0, 0, 0);
+  cHalfDecoded: array[0..5] of TNeuralFloat = (0.5, 0, 0, 0, 0.6, -0.6);
+  // z: 0 -> 0.5, -0.6 -> 0.2; (0.5,0,0.5) and (0,0.6,0.2) normalized.
+  cHalf: array[0..5] of TNeuralFloat = (0.70710678, 0, 0.70710678,
+    0, 0.94868330, 0.31622777);
+var
+  Decoded, Normals: TNNetVolume;
+  i: integer;
+begin
+  Decoded := TNNetVolume.Create(3, 1, 3);
+  Normals := TNNetVolume.Create();
+  try
+    for i := 0 to 8 do Decoded.FData[i] := cDecoded[i];
+    MarigoldNormalsFromDecoded(Decoded, Normals);
+    AssertEquals('Depth', 3, Normals.Depth);
+    for i := 0 to 8 do
+      AssertEquals('full[' + IntToStr(i) + ']', cFull[i], Normals.FData[i], 1e-6);
+    Decoded.ReSize(2, 1, 3);
+    for i := 0 to 5 do Decoded.FData[i] := cHalfDecoded[i];
+    MarigoldNormalsFromDecoded(Decoded, Decoded, false);
+    for i := 0 to 5 do
+      AssertEquals('half[' + IntToStr(i) + ']', cHalf[i], Decoded.FData[i], 1e-6);
+  finally
+    Decoded.Free;
+    Normals.Free;
+  end;
+end;
+
+// align_corners=False source x = (o+0.5)*In/Out-0.5, clamped: 4->2 samples
+// 0.5 and 2.5 (no antialias); 2->4 samples 0, 0.25, 0.75, 1 (clamped).
+procedure TTestNeuralPretrained.TestResizeImageBilinearNoAntialias;
+const
+  cDown: array[0..1] of TNeuralFloat = (0.5, 2.5);
+  cUp: array[0..3] of TNeuralFloat = (0, 0.5, 1.5, 2);
+var
+  Image: TNNetVolume;
+  i: integer;
+begin
+  Image := TNNetVolume.Create(4, 1, 1);
+  try
+    for i := 0 to 3 do Image.FData[i] := i;
+    ResizeImageBilinearNoAntialias(Image, Image, 2, 1);
+    AssertEquals('down SizeX', 2, Image.SizeX);
+    for i := 0 to 1 do
+      AssertEquals('down[' + IntToStr(i) + ']', cDown[i], Image.FData[i], 1e-6);
+    Image.FData[0] := 0;
+    Image.FData[1] := 2;
+    ResizeImageBilinearNoAntialias(Image, Image, 4, 1);
+    AssertEquals('up SizeX', 4, Image.SizeX);
+    for i := 0 to 3 do
+      AssertEquals('up[' + IntToStr(i) + ']', cUp[i], Image.FData[i], 1e-6);
+  finally
+    Image.Free;
   end;
 end;
 

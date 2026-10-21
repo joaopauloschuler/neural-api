@@ -11740,6 +11740,34 @@ procedure MarigoldDenoise(UNet: TNNet; const Config: TSDUNetConfig;
   ImageLatent, EncStates: TNNetVolume; Sched: TNNetDiffusionScheduler;
   NumSteps: integer; Target, UNetInput, Pred: TNNetVolume);
 
+// Image in [0,1] -> [-1,1], long side -> ProcessingResolution (PIL bilinear; <= 0
+// keeps), replicate pad right/bottom by PadX/PadY to Alignment multiples (square if PadToSquare).
+procedure MarigoldPreprocessImage(Image, Dest: TNNetVolume;
+  ProcessingResolution, Alignment: integer; PadToSquare: boolean;
+  out PadX, PadY: integer);
+
+// Dest := Padded without its PadX right columns and PadY bottom rows (diffusers
+// unpad_image). Dest must not be Padded.
+procedure MarigoldUnpadImage(Padded, Dest: TNNetVolume; PadX, PadY: integer);
+
+// Depth (W,H,1) := (clip(channel mean of Decoded, -1, 1) + 1) / 2, Decoded being
+// the raw VAE decoder output (BuildVaeDecoder already applies 1/scaling_factor).
+procedure MarigoldDepthFromDecoded(Decoded, Depth: TNNetVolume);
+
+// Normals := Decoded clipped to [-1,1], channel 2 mapped z -> z/2+1/2 unless
+// UseFullZRange, then MarigoldNormalizeNormals. Normals may be Decoded.
+procedure MarigoldNormalsFromDecoded(Decoded, Normals: TNNetVolume;
+  UseFullZRange: boolean = true);
+
+// Divides each pixel's channel vector by max(L2 norm, 1e-6) (diffusers
+// normalize_normals); diffusers runs it again after the output resize.
+procedure MarigoldNormalizeNormals(Normals: TNNetVolume);
+
+// torch F.interpolate(mode="bilinear", align_corners=False, antialias=False) to
+// (NewSizeX, NewSizeY) via a TNNetBilinearResize net; Dest may be Source.
+procedure ResizeImageBilinearNoAntialias(Source, Dest: TNNetVolume;
+  NewSizeX, NewSizeY: integer);
+
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
 // built with BuildSDUNet(..., pWithControl=true). DownResiduals (the ControlNet
 // down_block_res_samples, in build order: conv_in, then each down resnet, then
@@ -74628,6 +74656,151 @@ begin
     UNetInput.AddLayers(ImageLatent, Target);
     SDUNetDenoise(UNet, Config, UNetInput, EncStates, Schedule[StepPos] - 1, Pred);
     Sched.Step(Target, Pred, Schedule[StepPos], Schedule[StepPos + 1], smDDIM, 0.0);
+  end;
+end;
+
+procedure MarigoldPreprocessImage(Image, Dest: TNNetVolume;
+  ProcessingResolution, Alignment: integer; PadToSquare: boolean;
+  out PadX, PadY: integer);
+var
+  Resized: TNNetVolume;
+  LongSide, NewSizeX, NewSizeY, TargetX, TargetY: integer;
+begin
+  if Alignment < 1 then
+    ImportError('MarigoldPreprocessImage: Alignment ' + IntToStr(Alignment) +
+      ' must be >= 1.');
+  if Image = Dest then
+    ImportError('MarigoldPreprocessImage: Dest must not be Image.');
+  Resized := TNNetVolume.Create();
+  try
+    Resized.ReSize(Image);
+    Resized.Copy(Image);
+    Resized.Mul(2);
+    Resized.Add(-1);
+    if ProcessingResolution > 0 then
+    begin
+      // diffusers resize_to_max_edge: h * max_edge // max(h, w).
+      LongSide := Max(Image.SizeX, Image.SizeY);
+      NewSizeX := Image.SizeX * ProcessingResolution div LongSide;
+      NewSizeY := Image.SizeY * ProcessingResolution div LongSide;
+      if (NewSizeX < 1) or (NewSizeY < 1) then
+        ImportError('MarigoldPreprocessImage: ' + IntToStr(Image.SizeX) + 'x' +
+          IntToStr(Image.SizeY) + ' resizes to an empty image at ' +
+          IntToStr(ProcessingResolution) + '.');
+      ResizeImagePIL(Resized, Resized, NewSizeX, NewSizeY, irfBilinear);
+    end;
+    TargetX := (Resized.SizeX + Alignment - 1) div Alignment * Alignment;
+    TargetY := (Resized.SizeY + Alignment - 1) div Alignment * Alignment;
+    if PadToSquare then
+    begin
+      TargetX := Max(TargetX, TargetY);
+      TargetY := TargetX;
+    end;
+    PadX := TargetX - Resized.SizeX;
+    PadY := TargetY - Resized.SizeY;
+    PadImageClampToEdge(Resized, 0, 0, PadX, PadY, Dest);
+  finally
+    Resized.Free;
+  end;
+end;
+
+procedure MarigoldUnpadImage(Padded, Dest: TNNetVolume; PadX, PadY: integer);
+begin
+  if Padded = Dest then
+    ImportError('MarigoldUnpadImage: Dest must not be Padded.');
+  if (PadX < 0) or (PadY < 0) or (PadX >= Padded.SizeX) or
+    (PadY >= Padded.SizeY) then
+    ImportError('MarigoldUnpadImage: padding ' + IntToStr(PadX) + ',' +
+      IntToStr(PadY) + ' does not fit a ' + IntToStr(Padded.SizeX) + 'x' +
+      IntToStr(Padded.SizeY) + ' image.');
+  Dest.CopyCropping(Padded, 0, 0, Padded.SizeX - PadX, Padded.SizeY - PadY);
+end;
+
+procedure MarigoldDepthFromDecoded(Decoded, Depth: TNNetVolume);
+var
+  ChannelCount, PixelPos, MaxPixelPos, SourcePos, Channel, MaxChannel: integer;
+  ChannelSum: TNeuralFloat;
+begin
+  if Decoded = Depth then
+    ImportError('MarigoldDepthFromDecoded: Depth must not be Decoded.');
+  ChannelCount := Decoded.Depth;
+  MaxChannel := ChannelCount - 1;
+  Depth.ReSize(Decoded.SizeX, Decoded.SizeY, 1);
+  MaxPixelPos := Depth.Size - 1;
+  SourcePos := 0;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    ChannelSum := 0;
+    for Channel := 0 to MaxChannel do
+      ChannelSum := ChannelSum + Decoded.FData[SourcePos + Channel];
+    Depth.FData[PixelPos] := ChannelSum / ChannelCount;
+    Inc(SourcePos, ChannelCount);
+  end;
+  TNNetVolume.ClampAbs(Depth.DataPtr, 1.0, Depth.Size);
+  Depth.Add(1);
+  Depth.Mul(0.5);
+end;
+
+procedure MarigoldNormalsFromDecoded(Decoded, Normals: TNNetVolume;
+  UseFullZRange: boolean);
+var
+  ChannelCount, Pos, MaxPos: integer;
+begin
+  if Decoded.Depth < 3 then
+    ImportError('MarigoldNormalsFromDecoded: needs 3 channels, got ' +
+      IntToStr(Decoded.Depth) + '.');
+  if Normals <> Decoded then
+  begin
+    Normals.ReSize(Decoded);
+    Normals.Copy(Decoded);
+  end;
+  TNNetVolume.ClampAbs(Normals.DataPtr, 1.0, Normals.Size);
+  if not UseFullZRange then
+  begin
+    ChannelCount := Normals.Depth;
+    MaxPos := Normals.Size - 1;
+    Pos := 2;
+    while Pos <= MaxPos do
+    begin
+      Normals.FData[Pos] := Normals.FData[Pos] * 0.5 + 0.5;
+      Inc(Pos, ChannelCount);
+    end;
+  end;
+  MarigoldNormalizeNormals(Normals);
+end;
+
+procedure MarigoldNormalizeNormals(Normals: TNNetVolume);
+const
+  MinNorm = 1e-6;
+var
+  ChannelCount, X, Y, MaxX, MaxY: integer;
+  PixelPtr: TNeuralFloatArrPtr;
+begin
+  ChannelCount := Normals.Depth;
+  MaxX := Normals.SizeX - 1;
+  MaxY := Normals.SizeY - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      PixelPtr := Normals.GetRawPtr(X, Y);
+      TNNetVolume.Mul(PixelPtr, 1 / Max(Sqrt(TNNetVolume.DotProduct(PixelPtr,
+        PixelPtr, ChannelCount)), MinNorm), ChannelCount);
+    end;
+end;
+
+procedure ResizeImageBilinearNoAntialias(Source, Dest: TNNetVolume;
+  NewSizeX, NewSizeY: integer);
+var
+  NN: TNNet;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(Source.SizeX, Source.SizeY, Source.Depth) );
+    NN.AddLayer( TNNetBilinearResize.Create(NewSizeX, NewSizeY, 0) );
+    NN.Compute(Source);
+    NN.GetOutput(Dest);
+  finally
+    NN.Free;
   end;
 end;
 

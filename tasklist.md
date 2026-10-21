@@ -293,21 +293,21 @@ rather than acted on.
             ab_t = 1 (Beta1 = 0). Not needed by Marigold.
       - [ ] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
             landed `MarigoldDenoise`, split into:
-            - [ ] 2a. Grid: the VAE/UNet builders take one square `LatentGrid`.
-                  Either pad to a multiple of 8 and to square, then unpad, or
-                  give the configs separate X/Y grids (saves compute on wide
-                  images). Check which pad mode diffusers Marigold uses
-                  (believed replicate, unverified).
-            - [ ] 2b. Preprocess: resize the long side to
-                  `default_processing_resolution` (768) with the antialiased
-                  resize, map [0,1] -> [-1,1].
+            - [X] 2a. Grid: pad (`MarigoldPreprocessImage` PadToSquare +
+                  Alignment, `MarigoldUnpadImage`, shared `PadImageClampToEdge`);
+                  replicate right/bottom as diffusers pad_image. Square pad is
+                  exact only for square inputs; the UNet up path also needs the
+                  latent divisible by 2^(blocks-1), so pass Alignment = 64 for SD2.
+            - [X] 2b. Preprocess: `MarigoldPreprocessImage` ([0,1] -> [-1,1],
+                  long side via `ResizeImagePIL` irfBilinear, then the 2a pad).
             - [ ] 2c. Empty-prompt states: load the 1024-wide SD2 CLIP text
                   encoder from `text_encoder/`, embed "" once, cache it; check
                   the SD2 config loads.
-            - [ ] 2d. Decode + post-process: VAE decode (check where the
-                  scaling factor is applied), unpad, resize back; depth =
-                  mean of 3 channels clipped and mapped to [0,1]; normals =
-                  unit-normalized 3 channels.
+            - [X] 2d. `MarigoldDepthFromDecoded`, `MarigoldNormalsFromDecoded`
+                  (+ `MarigoldNormalizeNormals` again after the resize),
+                  `ResizeImageBilinearNoAntialias` (diffusers is_aa=False);
+                  BuildVaeDecoder applies 1/scaling_factor. Order: decode,
+                  depth/normals, unpad, (ensemble), resize.
             - [ ] 2e. `MarigoldPredict` chaining 2a-2d, starting noise as a
                   parameter (for the parity fixture), pico smoke test.
             - [ ] 2f. Ensemble over N noise seeds: depth members aligned by

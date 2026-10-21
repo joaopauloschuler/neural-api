@@ -39,6 +39,11 @@ procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
 // GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
 
+// Canvas := Image with Left/Top/Right/Bottom pixels added on each side, each
+// new pixel copying the nearest edge pixel (torch F.pad mode="replicate").
+procedure PadImageClampToEdge(Image: TNNetVolume; Left, Top, Right,
+  Bottom: integer; Canvas: TNNetVolume);
+
 // Outpaint canvas: Image at (Left, Top) on a larger Canvas, the new border
 // clamp-to-edge; Mask (W, H, 1) is 1 there and Overlap pixels in, 0 elsewhere.
 procedure BuildOutpaintCanvas(Image: TNNetVolume; Left, Top, Right, Bottom,
@@ -545,14 +550,18 @@ begin
   if Bottom > 0 then Dec(LastY, Overlap);
 end;
 
-procedure BuildOutpaintCanvas(Image: TNNetVolume; Left, Top, Right, Bottom,
-  Overlap: integer; Canvas, Mask: TNNetVolume);
+procedure PadImageClampToEdge(Image: TNNetVolume; Left, Top, Right,
+  Bottom: integer; Canvas: TNNetVolume);
 var
   CanvasSizeX, CanvasSizeY, Depth, X, Y, MaxX, MaxY, MaxImageX, MaxImageY,
-    SourceY, FirstX, LastX, FirstY, LastY, PixelBytes, RowBytes: integer;
+    SourceY, PixelBytes, RowBytes: integer;
 begin
-  GetOutpaintKeptArea(Image, Left, Top, Right, Bottom, Overlap, FirstX, LastX,
-    FirstY, LastY);
+  if (Left < 0) or (Top < 0) or (Right < 0) or (Bottom < 0) then
+    raise Exception.Create('PadImageClampToEdge: sides ' + IntToStr(Left) +
+      ',' + IntToStr(Top) + ',' + IntToStr(Right) + ',' + IntToStr(Bottom) +
+      ' must not be negative.');
+  if Canvas = Image then
+    raise Exception.Create('PadImageClampToEdge: Canvas must not be Image.');
   CanvasSizeX := Image.SizeX + Left + Right;
   CanvasSizeY := Image.SizeY + Top + Bottom;
   Depth := Image.Depth;
@@ -575,7 +584,17 @@ begin
       Move(Image.FData[Image.GetRawPos(MaxImageX, SourceY)],
         Canvas.FData[Canvas.GetRawPos(X, Y)], PixelBytes);
   end;
-  Mask.ReSize(CanvasSizeX, CanvasSizeY, 1);
+end;
+
+procedure BuildOutpaintCanvas(Image: TNNetVolume; Left, Top, Right, Bottom,
+  Overlap: integer; Canvas, Mask: TNNetVolume);
+var
+  X, Y, FirstX, LastX, FirstY, LastY: integer;
+begin
+  GetOutpaintKeptArea(Image, Left, Top, Right, Bottom, Overlap, FirstX, LastX,
+    FirstY, LastY);
+  PadImageClampToEdge(Image, Left, Top, Right, Bottom, Canvas);
+  Mask.ReSize(Canvas.SizeX, Canvas.SizeY, 1);
   Mask.Fill(1);
   for Y := FirstY to LastY do
     for X := FirstX to LastX do
