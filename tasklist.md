@@ -81,6 +81,16 @@ rather than acted on.
       (cheap, but a hot call), or a separate `CopyWithShape`; audit callers that
       rely on the current behaviour before changing it.
 
+- [ ] Possible trap (not changed, awaits user decision; found during fcfbfa66):
+      FPC's `genrand_MT19937` reseeds when `RandSeed <> OldRandSeed`, then sets
+      `RandSeed := not RandSeed` and stores that as `OldRandSeed`. Code that saves
+      `RandSeed` and restores it afterwards (e.g. `MakeInitialLatents`, about 89
+      sites in neural/) restores a value equal to `OldRandSeed`, so the next draw
+      CONTINUES the old Mersenne Twister state instead of replaying the seed;
+      "same seed" noise can then differ by call order (it broke
+      `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
+      Saved` followed by an explicit reseed, or a private seeded generator for
+      latent noise. Audit the call sites first.
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
