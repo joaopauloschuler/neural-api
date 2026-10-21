@@ -1930,6 +1930,9 @@ rather than acted on.
       examples/QwenImage `--sampler euler|dpm2m|unipc`):
       - [ ] User GPU-box quality check of dpm2m and unipc at 10-12 steps
             against euler at the current default count (18).
+      - [ ] `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` reads only
+            FlowMatchEuler configs; a Wan `UniPCMultistepScheduler` config
+            (use_flow_sigmas, flow_shift, solver_type) should map onto `fsUniPC`.
 - [ ] Adaptive Projected Guidance follow-ups (`TNNetAdaptiveProjectedGuidance` in
       neural/neuraldiffusion.pas, 15c5aca5; `--apg` in examples/LatentTextToImage,
       examples/ConditionalDiffusion and examples/QwenImage). Later consumers: the
@@ -1970,6 +1973,13 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Residency breakers on the decode path (small kernels, largest payoff)
 
+- [ ] Audit after 0ea67b17 (gather-copy layers now share OpenCL outputs by
+      liveness): pipelines that enable output sharing (Restormer and other
+      neuralpretrained.pas pipelines) now also share TNNetPad / Crop /
+      Transpose / SpaceToDepth / upsample outputs. Find any host code that
+      reads one of those intermediate outputs after the forward and mark that
+      layer `OutputPinned`; then a real Restormer / Qwen-Image VAE run on the
+      GPU box against the parent commit (output and time).
 - [ ] Follow-ups of the `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device
       forward (2ebe172b; `cai_topk_gate`) plus the device slot-map build
       (`cai_moe_build_slot_map`): router -> gate|up -> down has no host hop per
