@@ -91,6 +91,13 @@ rather than acted on.
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
       Saved` followed by an explicit reseed, or a private seeded generator for
       latent noise. Audit the call sites first.
+- [ ] Possible defect (not fixed, awaits user decision; found during 329b0a91):
+      `TNNetMamba2`'s gated RMSNorm normalizes over the full d_inner, but HF
+      Nemotron-H normalizes per group (`group_size = intermediate_size //
+      n_groups`), so a real Nemotron-H checkpoint with n_groups > 1 would load
+      and run with the wrong norm. The main README's `TNNetMamba2` row says
+      "grouped gated RMSNorm", which the code does not do. Details and the fix
+      route are under "Real device-side work still running on the host".
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
