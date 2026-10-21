@@ -11552,6 +11552,11 @@ function BuildTinyVaeDecoderFromSafeTensors(const FileName: string;
   out Config: TTinyVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
+// Runs Net (its TNNetInput is the tile) over Source in tiles stepping by tile -
+// 2*Pad - Overlap, dropping Pad on interior sides and feathering Overlap seams.
+function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
+  Overlap, Pad: integer): TNNetVolume;
+
 // Tiled VAE decode (port of diffusers' AutoencoderKL.enable_vae_tiling +
 // tiled_decode). Decodes a LARGE latent volume in OVERLAPPING spatial tiles
 // and feather-blends the seams so peak working-set memory is bounded by the
@@ -12866,41 +12871,65 @@ procedure DecodeVARTokensToImage(VqModel: TNNetVqModel;
 //   conv_hr (3x3, nf -> nf) + LeakyReLU(0.2); conv_last (3x3, nf -> out_ch).
 // state_dict keys: conv_first.{weight,bias}, body.{i}.rdb{1,2,3}.conv{1..5}.*,
 // conv_body.*, conv_up1.*, conv_up2.*, conv_hr.*, conv_last.*.
-// scale=4 uses two upsample stages (conv_up1, conv_up2); scale=2 uses one
-// (conv_up1 only). Real-ESRGAN .pth pickle checkpoints load through the same
-// CreatePretrainedTensorReader path (TNNetTorchBinReader unwraps the
-// 'params_ema'/'params' top-level wrapper dict automatically).
+// UpsampleStages 2 = conv_up1 + conv_up2 (x4), 1 = conv_up1 only. basicsr
+// RealESRGAN_x2plus / x1 keep both stages and PixelUnshuffle the input by 2 / 4
+// first (conv_first takes NumInCh*u*u channels; a TNNetSpaceToDepth stem here):
+// Scale = 2^UpsampleStages / PixelUnshuffle. Keys may carry a wrapper prefix
+// (e.g. 'params_ema.' in a converted .pth); .pth pickles are unwrapped by
+// TNNetTorchBinReader.
 type
   TRRDBNetConfig = record
-    NumInCh: integer;     // input channels (3)
-    NumOutCh: integer;    // output channels (3)
-    NumFeat: integer;     // nf (typically 64)
-    NumBlock: integer;    // number of RRDB blocks in the body
-    NumGrowCh: integer;   // gc growth channels (typically 32)
-    Scale: integer;       // upscaling factor (4)
-    InputSize: integer;   // input image grid H=W for the Input layer
-    ModelType: string;    // 'rrdbnet'
+    NumInCh: integer;        // image channels (3)
+    NumOutCh: integer;       // output channels (3)
+    NumFeat: integer;        // nf (typically 64)
+    NumBlock: integer;       // number of RRDB blocks in the body
+    NumGrowCh: integer;      // gc growth channels (typically 32)
+    Scale: integer;          // output / input image size ratio
+    UpsampleStages: integer; // nearest-2x + conv stages: 1 or 2
+    PixelUnshuffle: integer; // input space-to-depth factor (1 = none)
+    InputWidth: integer;     // TNNetInput width (0 = not set yet)
+    InputHeight: integer;    // TNNetInput height (0 = not set yet)
+    ModelType: string;       // 'rrdbnet'
   end;
 
-// Reads an RRDBNet config. Required: num_feat, num_block. Optional: num_in_ch
-// (3), num_out_ch (3), num_grow_ch (32), scale (4), input_size, model_type.
+// Reads an RRDBNet config. Required: num_feat, num_block. Optional: num_in_ch (3),
+// num_out_ch (3), num_grow_ch (32), scale (4), pixel_unshuffle (1), input_size.
 function ReadRRDBNetConfigFromJSONFile(
   const FileName: string): TRRDBNetConfig;
+
+// Infers the config from the tensor shapes (xinntao keys, any wrapper prefix);
+// InputWidth/InputHeight are left 0 for the caller.
+function InferRRDBNetConfigFromTensors(
+  Reader: TNNetSafeTensorsReader): TRRDBNetConfig;
+
+// ConfigFileName, else config.json next to FileName, else the tensor shapes.
+function LoadRRDBNetConfig(const FileName: string;
+  const ConfigFileName: string = ''): TRRDBNetConfig;
 
 function RRDBNetConfigToString(const Config: TRRDBNetConfig): string;
 
 // Builds the RRDBNet described by Config and loads every weight from Reader
-// (caller owns Reader). The net takes a (InputSize, InputSize, NumInCh) image
-// and outputs a (InputSize*Scale)^2 image with NumOutCh channels (raw).
+// (caller owns Reader): (InputWidth, InputHeight, NumInCh) -> raw x Scale image.
 function BuildRRDBNet(Reader: TNNetSafeTensorsReader;
   const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildRRDBNetFromSafeTensorsEx(const FileName: string;
   const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 
+// Config comes from LoadRRDBNetConfig and must carry an input size.
 function BuildRRDBNetFromSafeTensors(const FileName: string;
   out Config: TRRDBNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
+
+// Config with the net input sized for an ImageWidth x ImageHeight upscale: the
+// whole image when Tile <= 0 or it fits, else Tile + 2*TilePad per axis.
+function RRDBNetTileConfig(const Config: TRRDBNetConfig;
+  ImageWidth, ImageHeight, Tile, TilePad: integer): TRRDBNetConfig;
+
+// Upscales Image (values as the checkpoint expects, [0,1] for Real-ESRGAN) with NN
+// built from RRDBNetTileConfig; tiles when larger. Returns a new volume.
+function RRDBNetUpscale(NN: TNNet; const Config: TRRDBNetConfig;
+  Image: TNNetVolume; TilePad, TileOverlap: integer): TNNetVolume;
 
 // ---------------------------------------------------------------------------
 // NAFNet IMAGE-RESTORATION IMPORT (model_type "nafnet") -- the repo's FIRST
@@ -72244,36 +72273,164 @@ begin
   Result := BuildTinyVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
-// Decode one latent tile (already cropped to the decoder's input size) and
-// return a reference to the decoder's output volume (NOT owned by caller).
-function VaeDecodeTile(Decoder: TNNet; LatentTile: TNNetVolume): TNNetVolume;
+// Tile start positions along one axis: every Stride from 0, plus a last tile
+// clamped to end at Extent (a fixed-size net cannot take a smaller tile).
+procedure ComputeTileStarts(Extent, TileLen, Stride: integer;
+  out Starts: TNeuralIntegerArray);
+var
+  LastStart, StartCount, MaxStartPos, StartPos: integer;
 begin
-  Decoder.Compute(LatentTile);
-  Result := Decoder.GetLastLayer().Output;
+  LastStart := Extent - TileLen;
+  StartCount := 1;
+  if LastStart > 0 then
+    StartCount := (LastStart + Stride - 1) div Stride + 1;
+  SetLength(Starts, StartCount);
+  MaxStartPos := StartCount - 2;
+  for StartPos := 0 to MaxStartPos do
+    Starts[StartPos] := StartPos * Stride;
+  Starts[StartCount - 1] := LastStart;
+end;
+
+function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
+  Overlap, Pad: integer): TNNetVolume;
+var
+  TileW, TileH, OutTileW, OutTileH, Scale, StrideX, StrideY: integer;
+  OutChannels, OutOverlap, OutPad: integer;
+  StartsX, StartsY: TNeuralIntegerArray;
+  nx, nj, tx, ty, d: integer;
+  Tile, TileOut: TNNetVolume;
+  wx, wy, w, oneMinusW: TNeuralFloat;
+  invOv: TNeuralFloat;  // 1/(OutOverlap+1): the feather ramp step
+  MaxStartXPos, MaxStartYPos, MaxTileYPos, MaxOutChannelPos: integer;
+  KeepX0, KeepX1, KeepY0, MaxKeptRowPos: integer;  // kept output span of a tile
+  FeatherCols, MaxFeatherColPos, RunLen, gxBase, gyBase: integer;
+  TileRowFloats, ResultBase, TileOutBase: integer;
+begin
+  TileW := Net.GetFirstLayer().Output.SizeX;
+  TileH := Net.GetFirstLayer().Output.SizeY;
+  OutTileW := Net.GetLastLayer().Output.SizeX;
+  OutTileH := Net.GetLastLayer().Output.SizeY;
+  if (TileW <= 0) or (TileH <= 0) or (OutTileW mod TileW <> 0) or
+     ((OutTileW div TileW) * TileH <> OutTileH) then
+    ImportError('TiledNetCompute: cannot derive one integer input->output ' +
+      'scale from the net (' + IntToStr(TileW) + 'x' + IntToStr(TileH) +
+      ' -> ' + IntToStr(OutTileW) + 'x' + IntToStr(OutTileH) + ').');
+  Scale := OutTileW div TileW;
+  if Source.Depth <> Net.GetFirstLayer().Output.Depth then
+    ImportError('TiledNetCompute: source depth ' + IntToStr(Source.Depth) +
+      ' <> net input depth ' + IntToStr(Net.GetFirstLayer().Output.Depth) + '.');
+  if (Source.SizeX < TileW) or (Source.SizeY < TileH) then
+    ImportError('TiledNetCompute: source smaller than one tile; use plain ' +
+      'Compute.');
+  if (Overlap < 0) or (Pad < 0) then
+    ImportError('TiledNetCompute: overlap and pad must be >= 0.');
+  StrideX := TileW - 2 * Pad - Overlap;
+  StrideY := TileH - 2 * Pad - Overlap;
+  if ((Source.SizeX > TileW) and (StrideX < 1)) or
+     ((Source.SizeY > TileH) and (StrideY < 1)) then
+    ImportError('TiledNetCompute: tile ' + IntToStr(TileW) + 'x' +
+      IntToStr(TileH) + ' leaves no stride after 2*pad (' + IntToStr(Pad) +
+      ') + overlap (' + IntToStr(Overlap) + ').');
+  if StrideX < 1 then StrideX := 1;
+  if StrideY < 1 then StrideY := 1;
+  ComputeTileStarts(Source.SizeX, TileW, StrideX, StartsX);
+  ComputeTileStarts(Source.SizeY, TileH, StrideY, StartsY);
+
+  OutChannels := Net.GetLastLayer().Output.Depth;
+  OutOverlap := Overlap * Scale;
+  OutPad := Pad * Scale;
+  invOv := 1.0 / (OutOverlap + 1);
+  Result := TNNetVolume.Create;
+  Result.ReSize(Source.SizeX * Scale, Source.SizeY * Scale, OutChannels);
+  Result.Fill(0);
+
+  Tile := TNNetVolume.Create;
+  try
+    Tile.ReSize(TileW, TileH, Source.Depth);
+    TileRowFloats := TileW * Source.Depth;
+    MaxStartXPos := High(StartsX);
+    MaxStartYPos := High(StartsY);
+    MaxTileYPos := TileH - 1;
+    MaxOutChannelPos := OutChannels - 1;
+    for nj := 0 to MaxStartYPos do
+    begin
+      // An interior tile side drops OutPad output pixels (basicsr tile_pad):
+      // they saw the tile's zero border instead of the neighbouring image.
+      if nj > 0 then KeepY0 := OutPad else KeepY0 := 0;
+      if nj < MaxStartYPos then MaxKeptRowPos := OutTileH - OutPad - 1
+      else MaxKeptRowPos := OutTileH - 1;
+      gyBase := StartsY[nj] * Scale;
+      for nx := 0 to MaxStartXPos do
+      begin
+        // Each tile row is one contiguous run in both volumes.
+        for ty := 0 to MaxTileYPos do
+          Move(Source.FData[Source.GetRawPos(StartsX[nx], StartsY[nj] + ty, 0)],
+            Tile.FData[Tile.GetRawPos(0, ty, 0)],
+            TileRowFloats * csNeuralFloatSize);
+        Net.Compute(Tile);
+        TileOut := Net.GetLastLayer().Output;
+
+        if nx > 0 then KeepX0 := OutPad else KeepX0 := 0;
+        if nx < MaxStartXPos then KeepX1 := OutTileW - OutPad
+        else KeepX1 := OutTileW;
+        gxBase := StartsX[nx] * Scale;
+        // Feather the left OutOverlap kept columns into the tile to the left
+        // and the top OutOverlap kept rows into the tile above (diffusers
+        // blend_h / blend_v linear ramp); the rest of the kept span overwrites.
+        if nx > 0 then FeatherCols := OutOverlap else FeatherCols := 0;
+        if FeatherCols > KeepX1 - KeepX0 then FeatherCols := KeepX1 - KeepX0;
+        MaxFeatherColPos := FeatherCols - 1;
+        RunLen := (KeepX1 - KeepX0 - FeatherCols) * OutChannels;
+        for ty := KeepY0 to MaxKeptRowPos do
+        begin
+          if (nj > 0) and (ty - KeepY0 < OutOverlap) then
+            wy := (ty - KeepY0 + 1) * invOv
+          else
+            wy := 1.0;
+          ResultBase := Result.GetRawPos(gxBase + KeepX0, gyBase + ty, 0);
+          TileOutBase := TileOut.GetRawPos(KeepX0, ty, 0);
+          // Feather prefix: wx ramps per column. Fused scalar blend: the run is
+          // only OutChannels (=3) floats, below the bulk-call dispatch cost.
+          for tx := 0 to MaxFeatherColPos do
+          begin
+            wx := (tx + 1) * invOv;
+            w := wx * wy;
+            oneMinusW := 1.0 - w;
+            for d := 0 to MaxOutChannelPos do
+              Result.FData[ResultBase + d] :=
+                oneMinusW * Result.FData[ResultBase + d] +
+                w * TileOut.FData[TileOutBase + d];
+            Inc(ResultBase, OutChannels);
+            Inc(TileOutBase, OutChannels);
+          end;
+          // Interior: w = wy across the row and the run is contiguous in both
+          // volumes, so one bulk call per row.
+          if RunLen > 0 then
+          begin
+            if wy = 1.0 then
+              Move(TileOut.FData[TileOutBase], Result.FData[ResultBase],
+                RunLen * csNeuralFloatSize)
+            else
+            begin
+              oneMinusW := 1.0 - wy;
+              TNNetVolume.Mul(Result.GetRawPtr(ResultBase), oneMinusW, RunLen);
+              TNNetVolume.MulAdd(Result.GetRawPtr(ResultBase),
+                TileOut.GetRawPtr(TileOutBase), wy, RunLen);
+            end;
+          end;
+        end;
+      end;
+    end;
+  finally
+    Tile.Free;
+  end;
 end;
 
 function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
   TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat): TNNetVolume;
 var
-  LatTileW, ImgTileW, Scale, Overlap, Stride: integer;
-  OutChannels, OutW, OutH: integer;
-  StartsX, StartsY: array of integer;
-  nx, nj: integer;
-  s, sLast: integer;
-  LatTile, DecOut: TNNetVolume;
-  ImgOverlap: integer;
-  tx, ty, d: integer;
-  gx, gy, gxBase, gyBase: integer;  // global image coords
-  wx, wy, w, oneMinusW: TNeuralFloat;  // feather weights
-  invOv: TNeuralFloat;                 // 1/(ImgOverlap+1), call-invariant (#5);
-                                       // Single: feeds Single blend weights (#25)
-  StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
-  ImgTileWM1, OutChannelsM1: integer;
-  ltBase, latBase, resBase, doBase: integer;
-  FeatherCols, FeatherColsM1, RunLen: integer;
+  LatTileW, ImgTileW, Overlap: integer;
 begin
-  // The decoder's fixed-size TNNetInput defines the tile; the latent->image
-  // scale is read from the first/last layer spatial sizes.
   LatTileW := Decoder.GetFirstLayer().Output.SizeX;
   ImgTileW := Decoder.GetLastLayer().Output.SizeX;
   if LatTileW <> TileLatentMinSize then
@@ -72281,133 +72438,12 @@ begin
       ') must equal TileLatentMinSize (' + IntToStr(TileLatentMinSize) + ').');
   if (LatTileW <= 0) or (ImgTileW mod LatTileW <> 0) then
     ImportError('TiledVaeDecode: cannot derive integer latent->image scale.');
-  Scale := ImgTileW div LatTileW;
-  OutChannels := Decoder.GetLastLayer().Output.Depth;
-
+  if (Latent.SizeX < TileLatentMinSize) or (Latent.SizeY < TileLatentMinSize) then
+    ImportError('TiledVaeDecode: latent smaller than one tile; use plain decode.');
   Overlap := Round(TileLatentMinSize * TileOverlapFactor);
   if Overlap < 0 then Overlap := 0;
   if Overlap > TileLatentMinSize - 1 then Overlap := TileLatentMinSize - 1;
-  Stride := TileLatentMinSize - Overlap;
-  if Stride < 1 then Stride := 1;
-  ImgOverlap := Overlap * Scale;
-  // #5: the feather-ramp denominator is call-invariant; hoist its reciprocal so
-  // the per-row/col ramp is a multiply, not a divide (float; feeds blend weights).
-  invOv := 1.0 / (ImgOverlap + 1);
-
-  if (Latent.SizeX < TileLatentMinSize) or (Latent.SizeY < TileLatentMinSize) then
-    ImportError('TiledVaeDecode: latent smaller than one tile; use plain decode.');
-
-  // Tile START positions in latent space. Edge tiles are CLAMPED so every tile
-  // is exactly TileLatentMinSize (the fixed-size net cannot accept a smaller
-  // tile); the last tile may overlap its predecessor by more than Overlap.
-  SetLength(StartsX, 0);
-  s := 0; sLast := Latent.SizeX - TileLatentMinSize;
-  while s < sLast do
-  begin
-    SetLength(StartsX, Length(StartsX) + 1); StartsX[High(StartsX)] := s;
-    Inc(s, Stride);
-  end;
-  SetLength(StartsX, Length(StartsX) + 1); StartsX[High(StartsX)] := sLast;
-  SetLength(StartsY, 0);
-  s := 0; sLast := Latent.SizeY - TileLatentMinSize;
-  while s < sLast do
-  begin
-    SetLength(StartsY, Length(StartsY) + 1); StartsY[High(StartsY)] := s;
-    Inc(s, Stride);
-  end;
-  SetLength(StartsY, Length(StartsY) + 1); StartsY[High(StartsY)] := sLast;
-
-  OutW := Latent.SizeX * Scale;
-  OutH := Latent.SizeY * Scale;
-  Result := TNNetVolume.Create;
-  Result.ReSize(OutW, OutH, OutChannels);
-  Result.Fill(0);
-
-  LatTile := TNNetVolume.Create;
-  try
-    LatTile.ReSize(TileLatentMinSize, TileLatentMinSize, Latent.Depth);
-    StartsYHi := High(StartsY);
-    StartsXHi := High(StartsX);
-    TileLatentMinSizeM1 := TileLatentMinSize - 1;
-    LatentDepthM1 := Latent.Depth - 1;
-    ImgTileWM1 := ImgTileW - 1;
-    OutChannelsM1 := OutChannels - 1;
-    for nj := 0 to StartsYHi do
-    for nx := 0 to StartsXHi do
-    begin
-      // Crop the latent tile. Each ty row (tx run) is contiguous in both
-      // volumes, so one Move copies the whole row.
-      for ty := 0 to TileLatentMinSizeM1 do
-      begin
-        ltBase := LatTile.GetRawPos(0, ty, 0);
-        latBase := Latent.GetRawPos(StartsX[nx], StartsY[nj] + ty, 0);
-        Move(Latent.FData[latBase], LatTile.FData[ltBase],
-          TileLatentMinSize * Latent.Depth * csNeuralFloatSize);
-      end;
-
-      DecOut := VaeDecodeTile(Decoder, LatTile);
-
-      // Place the decoded tile, feather-blending the top edge into the tile
-      // above (StartsY[nj]>0) and the left edge into the tile to the left
-      // (StartsX[nx]>0). diffusers blend_v / blend_h: a linear ramp across the
-      // overlap rows/cols; the rest is overwrite.
-      // Tile placement offsets are invariant across the ty/tx nest (#5/#12).
-      gyBase := StartsY[nj] * Scale;
-      gxBase := StartsX[nx] * Scale;
-      // #20: 'nx > 0' is invariant across the ENTIRE tx loop, so resolve it once
-      // into a feather-column count instead of re-testing it per pixel.
-      if nx > 0 then FeatherCols := ImgOverlap else FeatherCols := 0;
-      if FeatherCols > ImgTileW then FeatherCols := ImgTileW;
-      FeatherColsM1 := FeatherCols - 1;
-      // Interior columns share one contiguous run in BOTH volumes (#13/App C).
-      RunLen := (ImgTileW - FeatherCols) * OutChannels;
-      for ty := 0 to ImgTileWM1 do
-      begin
-        gy := gyBase + ty;
-        if (nj > 0) and (ty < ImgOverlap) then
-          wy := (ty + 1) * invOv
-        else
-          wy := 1.0;
-        // Seed the row bases at tx=0; both advance by OutChannels per tx (#12).
-        resBase := Result.GetRawPos(gxBase, gy, 0);
-        doBase := DecOut.GetRawPos(0, ty, 0);
-        // Feather prefix: wx ramps per column, so this stays per-pixel. It is
-        // at most ImgOverlap columns wide and only exists when nx > 0.
-        for tx := 0 to FeatherColsM1 do
-        begin
-          wx := (tx + 1) * invOv;
-          w := wx * wy;
-          oneMinusW := 1.0 - w;
-          // Fused scalar blend: the run is only OutChannels (=3) elements, so
-          // per-pixel bulk kernel calls cost more in dispatch than the 3 muls
-          // and 3 FMAs they replace.
-          for d := 0 to OutChannelsM1 do
-            Result.FData[resBase + d] :=
-              oneMinusW * Result.FData[resBase + d] + w * DecOut.FData[doBase + d];
-          Inc(resBase, OutChannels);
-          Inc(doBase, OutChannels);
-        end;
-        // Interior: wx = 1 across every remaining column, so w = wy is constant
-        // and the run is contiguous in both volumes. One bulk call per ROW
-        // replaces ImgTileW-ImgOverlap calls over OutChannels (=3) floats each.
-        if RunLen > 0 then
-        begin
-          if wy = 1.0 then
-            Move(DecOut.FData[doBase], Result.FData[resBase],
-              RunLen * csNeuralFloatSize)
-          else
-          begin
-            oneMinusW := 1.0 - wy;
-            TNNetVolume.Mul(Result.GetRawPtr(resBase), oneMinusW, RunLen);
-            TNNetVolume.MulAdd(Result.GetRawPtr(resBase),
-              DecOut.GetRawPtr(doBase), wy, RunLen);
-          end;
-        end;
-      end;
-    end;
-  finally
-    LatTile.Free;
-  end;
+  Result := TiledNetCompute(Decoder, Latent, Overlap, {Pad=}0);
 end;
 
 // ===========================================================================
@@ -75936,12 +75972,11 @@ begin
     ', latent_grid=' + IntToStr(Config.LatentGrid);
 end;
 
-// Loads the adapter conv_in (3x3) whose torch input channels are in PixelUnshuffle
-// order (oc = ic*r*r + dy*r + dx, dy=row, dx=col offset) but whose CAI input is a
-// TNNetSpaceToDepth output (cai_depth = (dx*r + dy)*C + ic). Remaps the input
-// channel columns so the SpaceToDepth feed matches the torch unshuffle feed.
-procedure LoadT2IAdapterConvIn(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
-  const WName, BName: string; OutCh, CondCh, R, K: integer);
+// Loads a KxK conv fed by torch PixelUnshuffle(R) (column ic*R*R + dy*R + dx) into
+// a layer fed by TNNetSpaceToDepth(R) (depth (dx*R + dy)*CondCh + ic).
+procedure LoadPixelUnshuffleConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; OutCh, CondCh, R, K: integer;
+  const ImporterName: string);
 var
   W, B, WVol: TNNetVolume;
   InCh, o, kk, ic, dy, dx, srcIdx, dstIdx, SrcOBase: integer;
@@ -75950,27 +75985,27 @@ begin
   InCh := CondCh * R * R;
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
-    ImportError('T2I-Adapter import: missing tensor "' + WName + '".');
+    ImportError(ImporterName + ' import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 4) or
      (Reader.DimSize(WName, 0) <> OutCh) or
      (Reader.DimSize(WName, 1) <> InCh) or
      (Reader.DimSize(WName, 2) <> K) or
      (Reader.DimSize(WName, 3) <> K) then
-    ImportError('T2I-Adapter import: "' + WName + '" must have shape [' +
+    ImportError(ImporterName + ' import: "' + WName + '" must have shape [' +
       IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
       IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
   if (Layer.Neurons.Count <> OutCh) or
      (Layer.FArrNeurons[0].Weights.Size <> K * K * InCh) then
-    ImportError('T2I-Adapter import: conv_in target shape mismatch.');
+    ImportError(ImporterName + ' import: "' + WName + '" target shape mismatch.');
   W := TNNetVolume.Create;
   B := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
     if not Reader.HasTensor(BName) then
-      ImportError('T2I-Adapter import: missing bias "' + BName + '".');
+      ImportError(ImporterName + ' import: missing bias "' + BName + '".');
     if (Reader.DimCount(BName) <> 1) or
        (Reader.DimSize(BName, 0) <> OutCh) then
-      ImportError('T2I-Adapter import: "' + BName + '" must have shape [' +
+      ImportError(ImporterName + ' import: "' + BName + '" must have shape [' +
         IntToStr(OutCh) + '], got ' + Reader.ShapeAsString(BName));
     Reader.LoadTensorFlat(BName, B);
     OutChM1 := OutCh - 1;
@@ -76103,8 +76138,9 @@ begin
     // the FeatureRef outputs directly.
 
     // ---------------- Weights ----------------
-    LoadT2IAdapterConvIn(Reader, ConvInRef, 'adapter.conv_in.weight',
-      'adapter.conv_in.bias', d0, Config.CondChannels, Config.DownscaleFactor, 3);
+    LoadPixelUnshuffleConv(Reader, ConvInRef, 'adapter.conv_in.weight',
+      'adapter.conv_in.bias', d0, Config.CondChannels, Config.DownscaleFactor, 3,
+      'T2I-Adapter');
     InCh := d0;
     nM1 := n - 1;
     NumResBlocksM1 := Config.NumResBlocks - 1;
@@ -77236,10 +77272,120 @@ begin
     Result.NumOutCh := Obj.Get('num_out_ch', 3);
     Result.NumGrowCh := Obj.Get('num_grow_ch', 32);
     Result.Scale := Obj.Get('scale', 4);
-    Result.InputSize := Obj.Get('input_size', 0);
+    Result.PixelUnshuffle := Obj.Get('pixel_unshuffle', 1);
+    Result.InputWidth := Obj.Get('input_size', 0);
+    Result.InputHeight := Result.InputWidth;
   finally
     Root.Free;
     JsonText.Free;
+  end;
+  case Result.Scale * Result.PixelUnshuffle of
+    2: Result.UpsampleStages := 1;
+    4: Result.UpsampleStages := 2;
+  else
+    ImportError('RRDBNet import: config "' + FileName + '": scale (' +
+      IntToStr(Result.Scale) + ') * pixel_unshuffle (' +
+      IntToStr(Result.PixelUnshuffle) + ') must be 2 or 4.');
+  end;
+end;
+
+// The prefix P for which P + KeySuffix is a tensor: '' when the bare key exists,
+// else the shortest '...'-prefix of a key ending in '.' + KeySuffix ('' if none).
+function FindTensorKeyPrefix(Reader: TNNetSafeTensorsReader;
+  const KeySuffix: string): string;
+var
+  TensorPos, MaxTensorPos: integer;
+  TensorKey, DottedSuffix: string;
+begin
+  Result := '';
+  if Reader.HasTensor(KeySuffix) then exit;
+  DottedSuffix := '.' + KeySuffix;
+  MaxTensorPos := Reader.Count - 1;
+  for TensorPos := 0 to MaxTensorPos do
+  begin
+    TensorKey := Reader.TensorName(TensorPos);
+    if (Length(TensorKey) > Length(DottedSuffix)) and
+       (Copy(TensorKey, Length(TensorKey) - Length(DottedSuffix) + 1,
+         Length(DottedSuffix)) = DottedSuffix) and
+       ((Result = '') or
+        (Length(TensorKey) - Length(KeySuffix) < Length(Result))) then
+      Result := Copy(TensorKey, 1, Length(TensorKey) - Length(KeySuffix));
+  end;
+end;
+
+function InferRRDBNetConfigFromTensors(
+  Reader: TNNetSafeTensorsReader): TRRDBNetConfig;
+var
+  Prefix: string;
+  ConvFirstInCh, UnshuffleSqr: integer;
+
+  function RequiredDim(const Key: string; Dim: integer): integer;
+  begin
+    if not Reader.HasTensor(Prefix + Key) then
+      ImportError('RRDBNet import: cannot infer the config, tensor "' +
+        Prefix + Key + '" is missing.');
+    if Reader.DimCount(Prefix + Key) <> 4 then
+      ImportError('RRDBNet import: "' + Prefix + Key + '" must be a 4-D conv ' +
+        'weight, got ' + Reader.ShapeAsString(Prefix + Key) + '.');
+    Result := Reader.DimSize(Prefix + Key, Dim);
+  end;
+
+begin
+  Prefix := FindTensorKeyPrefix(Reader, 'conv_first.weight');
+  Result.ModelType := 'rrdbnet';
+  Result.NumFeat := RequiredDim('conv_first.weight', 0);
+  ConvFirstInCh := RequiredDim('conv_first.weight', 1);
+  Result.NumGrowCh := RequiredDim('body.0.rdb1.conv1.weight', 0);
+  Result.NumOutCh := RequiredDim('conv_last.weight', 0);
+  Result.NumBlock := 0;
+  while Reader.HasTensor(Prefix + 'body.' + IntToStr(Result.NumBlock) +
+    '.rdb1.conv1.weight') do
+    Inc(Result.NumBlock);
+  if Reader.HasTensor(Prefix + 'conv_up2.weight') then
+    Result.UpsampleStages := 2
+  else
+    Result.UpsampleStages := 1;
+  // basicsr multiplies num_in_ch by u*u for its pixel-unshuffle input; the image
+  // channel count is taken to be the output channel count.
+  Result.PixelUnshuffle := 1;
+  Result.NumInCh := ConvFirstInCh;
+  if (Result.NumOutCh > 0) and (ConvFirstInCh mod Result.NumOutCh = 0) then
+  begin
+    UnshuffleSqr := ConvFirstInCh div Result.NumOutCh;
+    if (UnshuffleSqr = 4) or (UnshuffleSqr = 16) then
+    begin
+      if UnshuffleSqr = 4 then Result.PixelUnshuffle := 2
+      else Result.PixelUnshuffle := 4;
+      Result.NumInCh := Result.NumOutCh;
+    end;
+  end;
+  if (1 shl Result.UpsampleStages) mod Result.PixelUnshuffle <> 0 then
+    ImportError('RRDBNet import: pixel unshuffle ' +
+      IntToStr(Result.PixelUnshuffle) + ' exceeds the ' +
+      IntToStr(1 shl Result.UpsampleStages) + 'x upsample tail.');
+  Result.Scale := (1 shl Result.UpsampleStages) div Result.PixelUnshuffle;
+  Result.InputWidth := 0;
+  Result.InputHeight := 0;
+end;
+
+function LoadRRDBNetConfig(const FileName: string;
+  const ConfigFileName: string = ''): TRRDBNetConfig;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then
+    Result := ReadRRDBNetConfigFromJSONFile(ConfigFileName)
+  else if FileExists(ExtractFilePath(FileName) + 'config.json') then
+    Result := ReadRRDBNetConfigFromJSONFile(
+      ExtractFilePath(FileName) + 'config.json')
+  else
+  begin
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      Result := InferRRDBNetConfigFromTensors(Reader);
+    finally
+      Reader.Free;
+    end;
   end;
 end;
 
@@ -77251,7 +77397,10 @@ begin
     ', in_ch=' + IntToStr(Config.NumInCh) +
     ', out_ch=' + IntToStr(Config.NumOutCh) +
     ', scale=' + IntToStr(Config.Scale) +
-    ', input_size=' + IntToStr(Config.InputSize);
+    ', upsample_stages=' + IntToStr(Config.UpsampleStages) +
+    ', pixel_unshuffle=' + IntToStr(Config.PixelUnshuffle) +
+    ', input=' + IntToStr(Config.InputWidth) + 'x' +
+    IntToStr(Config.InputHeight);
 end;
 
 type
@@ -77355,41 +77504,54 @@ var
   NN: TNNet;
   ConvFirst, FeatRef, ConvBody, ConvUp1, ConvUp2, ConvHR, ConvLast: TNNetLayer;
   Blocks: array of TRRDBLayers;
-  nf, i, UpStages, s, NumBlockM1, UpStagesM1: integer;
+  nf, i, s, MaxBlockPos, MaxUpsampleStagePos, Unshuffle: integer;
+  Prefix: string;
 begin
   if Config.NumFeat < 1 then
     ImportError('RRDBNet import: num_feat must be >= 1.');
   if Config.NumBlock < 1 then
     ImportError('RRDBNet import: num_block must be >= 1.');
-  if Config.InputSize < 1 then
-    ImportError('RRDBNet import: input_size must be >= 1.');
-  if (Config.Scale <> 4) and (Config.Scale <> 2) then
-    ImportError('RRDBNet import: only scale=2 and scale=4 are supported, got ' +
-      IntToStr(Config.Scale) + '.');
+  if (Config.UpsampleStages < 1) or (Config.UpsampleStages > 2) then
+    ImportError('RRDBNet import: upsample stages must be 1 or 2, got ' +
+      IntToStr(Config.UpsampleStages) + '.');
+  Unshuffle := Config.PixelUnshuffle;
+  if (Unshuffle < 1) or
+     (Config.Scale * Unshuffle <> 1 shl Config.UpsampleStages) then
+    ImportError('RRDBNet import: scale (' + IntToStr(Config.Scale) +
+      ') * pixel_unshuffle (' + IntToStr(Unshuffle) + ') must equal 2^' +
+      IntToStr(Config.UpsampleStages) + '.');
+  if (Config.InputWidth < 1) or (Config.InputHeight < 1) then
+    ImportError('RRDBNet import: input width and height must be >= 1 (set ' +
+      'InputWidth/InputHeight, e.g. with RRDBNetTileConfig).');
+  if (Config.InputWidth mod Unshuffle <> 0) or
+     (Config.InputHeight mod Unshuffle <> 0) then
+    ImportError('RRDBNet import: input ' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight) + ' must be a multiple of pixel_unshuffle ' +
+      IntToStr(Unshuffle) + '.');
   nf := Config.NumFeat;
-  // scale 4 = two 2x nearest-upsample stages (conv_up1, conv_up2);
-  // scale 2 = one 2x stage (conv_up1 only).
-  if Config.Scale = 4 then UpStages := 2 else UpStages := 1;
-  NumBlockM1 := Config.NumBlock - 1;
-  UpStagesM1 := UpStages - 1;
+  Prefix := FindTensorKeyPrefix(Reader, 'conv_first.weight');
+  MaxBlockPos := Config.NumBlock - 1;
+  MaxUpsampleStagePos := Config.UpsampleStages - 1;
   SetLength(Blocks, Config.NumBlock);
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    NN.AddLayer( TNNetInput.Create(Config.InputSize, Config.InputSize,
+    NN.AddLayer( TNNetInput.Create(Config.InputWidth, Config.InputHeight,
       Config.NumInCh) );
+    if Unshuffle > 1 then
+      NN.AddLayer( TNNetSpaceToDepth.Create(Unshuffle) );
     ConvFirst := NN.AddLayer(
       TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
     FeatRef := ConvFirst;  // global residual / upsample feeder
-    for i := 0 to NumBlockM1 do
+    for i := 0 to MaxBlockPos do
       AddRRDB(NN, Config, Blocks[i]);
     ConvBody := NN.AddLayer(
       TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
     // Global residual: feat = conv_first + conv_body(body(conv_first)).
     NN.AddLayer( TNNetSum.Create([ConvBody, FeatRef]) );
-    // Upsample x4: two (nearest-2x + 3x3 conv + LeakyReLU(0.2)) stages.
+    // Upsample: (nearest-2x + 3x3 conv + LeakyReLU(0.2)) per stage.
     ConvUp1 := nil; ConvUp2 := nil;
-    for s := 0 to UpStagesM1 do
+    for s := 0 to MaxUpsampleStagePos do
     begin
       NN.AddLayer( TNNetDeMaxPool.Create(2) );  // nearest 2x upsample
       if s = 0 then
@@ -77412,18 +77574,25 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    LoadVaeConv(Reader, ConvFirst, 'conv_first.weight', 'conv_first.bias',
-      nf, Config.NumInCh, 3);
-    for i := 0 to NumBlockM1 do
-      LoadRRDB(Reader, Blocks[i], 'body.' + IntToStr(i) + '.', Config);
-    LoadVaeConv(Reader, ConvBody, 'conv_body.weight', 'conv_body.bias',
-      nf, nf, 3);
-    LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias', nf, nf, 3);
-    if UpStages >= 2 then
-      LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias', nf, nf, 3);
-    LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias', nf, nf, 3);
-    LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
-      Config.NumOutCh, nf, 3);
+    if Unshuffle > 1 then
+      LoadPixelUnshuffleConv(Reader, ConvFirst, Prefix + 'conv_first.weight',
+        Prefix + 'conv_first.bias', nf, Config.NumInCh, Unshuffle, 3, 'RRDBNet')
+    else
+      LoadVaeConv(Reader, ConvFirst, Prefix + 'conv_first.weight',
+        Prefix + 'conv_first.bias', nf, Config.NumInCh, 3);
+    for i := 0 to MaxBlockPos do
+      LoadRRDB(Reader, Blocks[i], Prefix + 'body.' + IntToStr(i) + '.', Config);
+    LoadVaeConv(Reader, ConvBody, Prefix + 'conv_body.weight',
+      Prefix + 'conv_body.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvUp1, Prefix + 'conv_up1.weight',
+      Prefix + 'conv_up1.bias', nf, nf, 3);
+    if Config.UpsampleStages >= 2 then
+      LoadVaeConv(Reader, ConvUp2, Prefix + 'conv_up2.weight',
+        Prefix + 'conv_up2.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvHR, Prefix + 'conv_hr.weight',
+      Prefix + 'conv_hr.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvLast, Prefix + 'conv_last.weight',
+      Prefix + 'conv_last.bias', Config.NumOutCh, nf, 3);
     Result := NN;
   except
     NN.Free;
@@ -77447,13 +77616,99 @@ end;
 function BuildRRDBNetFromSafeTensors(const FileName: string;
   out Config: TRRDBNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
-var
-  ConfigPath: string;
 begin
-  if ConfigFileName <> '' then ConfigPath := ConfigFileName
-  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
-  Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
+  Config := LoadRRDBNetConfig(FileName, ConfigFileName);
   Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function RoundUpToMultiple(Value, Multiple: integer): integer;
+begin
+  Result := ((Value + Multiple - 1) div Multiple) * Multiple;
+end;
+
+function RRDBNetTileConfig(const Config: TRRDBNetConfig;
+  ImageWidth, ImageHeight, Tile, TilePad: integer): TRRDBNetConfig;
+var
+  Unshuffle, PaddedWidth, PaddedHeight, TileInput: integer;
+begin
+  Result := Config;
+  Unshuffle := Max(Config.PixelUnshuffle, 1);
+  PaddedWidth := RoundUpToMultiple(ImageWidth, Unshuffle);
+  PaddedHeight := RoundUpToMultiple(ImageHeight, Unshuffle);
+  TileInput := RoundUpToMultiple(Max(Tile, 1), Unshuffle) +
+    2 * RoundUpToMultiple(Max(TilePad, 0), Unshuffle);
+  if (Tile <= 0) or (PaddedWidth <= TileInput) then
+    Result.InputWidth := PaddedWidth
+  else
+    Result.InputWidth := TileInput;
+  if (Tile <= 0) or (PaddedHeight <= TileInput) then
+    Result.InputHeight := PaddedHeight
+  else
+    Result.InputHeight := TileInput;
+end;
+
+function RRDBNetUpscale(NN: TNNet; const Config: TRRDBNetConfig;
+  Image: TNNetVolume; TilePad, TileOverlap: integer): TNNetVolume;
+var
+  Unshuffle, TileW, TileH, PaddedW, PaddedH: integer;
+  Padded, Full: TNNetVolume;
+
+  // basicsr RealESRGANer mod_pad: reflect past the right / bottom edge.
+  function ReflectIndex(Pos, Extent: integer): integer;
+  begin
+    Result := Pos;
+    if Result >= Extent then Result := 2 * (Extent - 1) - Result;
+    if Result < 0 then Result := 0;
+  end;
+
+  procedure ReflectPad();
+  var
+    x, y, MaxPaddedXPos, MaxPaddedYPos, RowFloats, Depth: integer;
+  begin
+    Depth := Image.Depth;
+    RowFloats := Image.SizeX * Depth;
+    MaxPaddedXPos := PaddedW - 1;
+    MaxPaddedYPos := PaddedH - 1;
+    for y := 0 to MaxPaddedYPos do
+    begin
+      Move(Image.FData[Image.GetRawPos(0, ReflectIndex(y, Image.SizeY), 0)],
+        Padded.FData[Padded.GetRawPos(0, y, 0)], RowFloats * csNeuralFloatSize);
+      for x := Image.SizeX to MaxPaddedXPos do
+        Move(Image.FData[Image.GetRawPos(ReflectIndex(x, Image.SizeX),
+          ReflectIndex(y, Image.SizeY), 0)],
+          Padded.FData[Padded.GetRawPos(x, y, 0)], Depth * csNeuralFloatSize);
+    end;
+  end;
+
+begin
+  Unshuffle := Max(Config.PixelUnshuffle, 1);
+  TileW := NN.GetFirstLayer().Output.SizeX;
+  TileH := NN.GetFirstLayer().Output.SizeY;
+  PaddedW := Max(RoundUpToMultiple(Image.SizeX, Unshuffle), TileW);
+  PaddedH := Max(RoundUpToMultiple(Image.SizeY, Unshuffle), TileH);
+  Padded := TNNetVolume.Create(PaddedW, PaddedH, Image.Depth);
+  Full := nil;
+  try
+    ReflectPad();
+    if (PaddedW = TileW) and (PaddedH = TileH) then
+    begin
+      NN.Compute(Padded);
+      Full := TNNetVolume.Create;
+      Full.Copy(NN.GetLastLayer().Output);
+    end
+    else
+      // Pad and overlap stay multiples of the unshuffle factor so every tile
+      // start keeps the same space-to-depth phase as the whole image.
+      Full := TiledNetCompute(NN, Padded,
+        RoundUpToMultiple(Max(TileOverlap, 0), Unshuffle),
+        RoundUpToMultiple(Max(TilePad, 0), Unshuffle));
+    Result := TNNetVolume.Create;
+    Result.CopyCropping(Full, 0, 0, Image.SizeX * Config.Scale,
+      Image.SizeY * Config.Scale);
+  finally
+    Full.Free;
+    Padded.Free;
+  end;
 end;
 
 // ===========================================================================

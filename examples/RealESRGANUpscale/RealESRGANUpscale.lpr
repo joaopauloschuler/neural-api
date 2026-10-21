@@ -1,28 +1,20 @@
 program RealESRGANUpscale;
 (*
-RealESRGANUpscale: an END-TO-END smoke of the Real-ESRGAN / ESRGAN RRDBNet
-super-resolution importer (BuildRRDBNetFromSafeTensors, neuralpretrained.pas).
-It is the convolutional, NO-diffusion image upscaler in the repo: load the
-committed tiny RRDBNet checkpoint, read a small PNG, run the net forward and
-write the upscaled PNG.
+RealESRGANUpscale: Real-ESRGAN / ESRGAN RRDBNet super-resolution with the
+importer in neuralpretrained.pas (BuildRRDBNetFromSafeTensorsEx, RRDBNetUpscale).
 
-Pipeline (pure CPU, no dataset download, well under a minute):
-  1. Build the pico RRDBNet from the committed parity fixture
-     tests/fixtures/tiny_rrdbnet{.safetensors,_config.json} (scale x4) and the
-     x2 sibling tiny_rrdbnet_x2.* (scale x2 = one upsample stage).
-  2. Synthesize a tiny 6x6 RGB image (a deterministic colour gradient) and
-     SAVE it as a PNG with neuraldatasets.SaveImageFromVolumeIntoFile - so the
-     example exercises the repo's real PNG writer.
-  3. LOAD that PNG back with LoadImageFromFileIntoVolume, normalise 0..255 ->
-     [-1,1] (the value range the RRDBNet weights expect), Compute, then map the
-     output back to 0..255 and SAVE the upscaled PNG.
-  4. Report the input/output dimensions for both scales.
+Two modes:
+  * no arguments: a smoke of the committed random pico fixtures
+    tests/fixtures/tiny_rrdbnet and tiny_rrdbnet_x2: synthesize a 6x6 PNG, read it back,
+    upscale x4 and x2, write the output PNGs.
+  * --model FILE --input IMG --output IMG: upscale a real image with a real
+    checkpoint (RealESRGAN_x4plus / x2plus .pth or .safetensors). Without a
+    config.json next to FILE the config is inferred from the tensor shapes.
+    --tile N runs the net on N x N tiles (plus --tile-pad context on each side,
+    seams feather-blended over --tile-overlap pixels) so large images fit in RAM.
 
-The committed checkpoint is a random-weight pico net (a faithful smoke of the
-import + forward + image-I/O path, not a photoreal upscaler); swap in a real
-RealESRGAN_x4plus .pth / .safetensors + its config.json to upscale real images
-(the same BuildRRDBNetFromSafeTensors call - .pth params_ema is unwrapped
-automatically by TNNetTorchBinReader).
+Pixel values go in as [0,1] RGB and come out clamped to [0,1], as basicsr's
+RealESRGANer does.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -37,14 +29,177 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
+  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
 
 const
   // Fixtures committed by tools/rrdbnet_tiny_fixture.py.
   FixturesDir = '../../tests/fixtures/';
 
-// Builds a tiny synthetic 6x6 RGB image (0..255) as a deterministic colour
-// gradient so the example needs no input asset on disk.
+type
+  TUpscaleOptions = record
+    ModelFile, ConfigFile, InputFile, OutputFile: string;
+    Tile, TilePad, TileOverlap: integer;
+    UseOpenCL: boolean;
+    OpenCLPlatform, OpenCLDevice: integer;
+  end;
+
+procedure PrintUsage();
+begin
+  WriteLn('Usage: RealESRGANUpscale                       (pico fixture smoke)');
+  WriteLn('       RealESRGANUpscale --model FILE --input IMG --output IMG [options]');
+  WriteLn('  --model FILE         RRDBNet checkpoint (.pth / .safetensors)');
+  WriteLn('  --config FILE        config.json (default: next to --model, else');
+  WriteLn('                       inferred from the tensor shapes)');
+  WriteLn('  --input IMG          image to upscale (PNG / JPEG / BMP)');
+  WriteLn('  --output IMG         upscaled image (PNG)');
+  WriteLn('  --tile N             tile edge in input pixels; 0 = whole image ',
+    '(default 0)');
+  WriteLn('  --tile-pad N         context pixels added on each tile side ',
+    '(default 10)');
+  WriteLn('  --tile-overlap N     pixels feather-blended across seams ',
+    '(default 8)');
+  WriteLn('  --gpu                run the net on OpenCL (needs a build with ',
+    '-dOpenCL)');
+  WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
+  WriteLn('  --gpu-device N       OpenCL device index (default 0)');
+end;
+
+function ParseOptions(out Opt: TUpscaleOptions): boolean;
+var
+  ArgPos: integer;
+  Arg: string;
+
+  function NextArg(): string;
+  begin
+    Inc(ArgPos);
+    if ArgPos > ParamCount then
+      raise Exception.Create(Arg + ' needs a value');
+    Result := ParamStr(ArgPos);
+  end;
+
+begin
+  Opt.ModelFile := '';
+  Opt.ConfigFile := '';
+  Opt.InputFile := '';
+  Opt.OutputFile := '';
+  Opt.Tile := 0;
+  Opt.TilePad := 10;
+  Opt.TileOverlap := 8;
+  Opt.UseOpenCL := false;
+  Opt.OpenCLPlatform := 0;
+  Opt.OpenCLDevice := 0;
+  Result := true;
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
+  begin
+    Arg := ParamStr(ArgPos);
+    if Arg = '--model' then Opt.ModelFile := NextArg()
+    else if Arg = '--config' then Opt.ConfigFile := NextArg()
+    else if Arg = '--input' then Opt.InputFile := NextArg()
+    else if Arg = '--output' then Opt.OutputFile := NextArg()
+    else if Arg = '--tile' then Opt.Tile := StrToInt(NextArg())
+    else if Arg = '--tile-pad' then Opt.TilePad := StrToInt(NextArg())
+    else if Arg = '--tile-overlap' then Opt.TileOverlap := StrToInt(NextArg())
+    else if Arg = '--gpu' then Opt.UseOpenCL := true
+    else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
+    else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
+    else if (Arg = '--help') or (Arg = '-h') then
+    begin
+      PrintUsage();
+      Result := false;
+      exit;
+    end
+    else
+      raise Exception.Create('unknown argument: ' + Arg);
+    Inc(ArgPos);
+  end;
+  if (Opt.ModelFile <> '') and
+     ((Opt.InputFile = '') or (Opt.OutputFile = '')) then
+    raise Exception.Create('--model needs --input and --output');
+end;
+
+// Loads ImageFile as RGB in [0,1], upscales it and writes OutputFile.
+procedure UpscaleFile(const Opt: TUpscaleOptions);
+var
+  Config, TileConfig: TRRDBNetConfig;
+  NN: TNNet;
+  Image, Upscaled: TNNetVolume;
+  ComputeText: string;
+  StartTime: TDateTime;
+  PixelPos: integer;
+  {$IFDEF OpenCL}
+  OpenCLDevices: TEasyOpenCL;
+  OpenCLProblem: string;
+  OpenCLPlatform, OpenCLDevice: integer;
+  {$ENDIF}
+begin
+  Image := TNNetVolume.Create;
+  Upscaled := nil;
+  NN := nil;
+  {$IFDEF OpenCL}
+  OpenCLDevices := nil;
+  {$ENDIF}
+  try
+    if not LoadImageFromFileIntoVolume(Opt.InputFile, Image) then
+      raise Exception.Create('could not load ' + Opt.InputFile);
+    Image.Divi(255.0);
+    Config := LoadRRDBNetConfig(Opt.ModelFile, Opt.ConfigFile);
+    if Image.Depth <> Config.NumInCh then
+      raise Exception.Create(Format('the image has %d channels, the model ' +
+        'takes %d', [Image.Depth, Config.NumInCh]));
+    TileConfig := RRDBNetTileConfig(Config, Image.SizeX, Image.SizeY,
+      Opt.Tile, Opt.TilePad);
+    WriteLn(RRDBNetConfigToString(TileConfig));
+    NN := BuildRRDBNetFromSafeTensorsEx(Opt.ModelFile, TileConfig,
+      {pTrainable=}false);
+    ComputeText := 'CPU';
+    if Opt.UseOpenCL then
+    begin
+      {$IFDEF OpenCL}
+      OpenCLDevices := TEasyOpenCL.Create();
+      OpenCLPlatform := Opt.OpenCLPlatform;
+      OpenCLDevice := Opt.OpenCLDevice;
+      if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
+        OpenCLProblem) then
+      begin
+        NN.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+          OpenCLDevices.Devices[OpenCLDevice]);
+        ComputeText := 'OpenCL on ' +
+          OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
+          OpenCLDevices.DeviceNames[OpenCLDevice];
+      end
+      else
+        ComputeText := 'CPU (' + OpenCLProblem + ')';
+      {$ELSE}
+      ComputeText := 'CPU (built without -dOpenCL)';
+      {$ENDIF}
+    end;
+    WriteLn(Format('Upscaling %dx%d x%d on %s, net input %dx%d',
+      [Image.SizeX, Image.SizeY, Config.Scale, ComputeText,
+       TileConfig.InputWidth, TileConfig.InputHeight]));
+    StartTime := Now();
+    Upscaled := RRDBNetUpscale(NN, TileConfig, Image, Opt.TilePad,
+      Opt.TileOverlap);
+    WriteLn(Format('  %.1f s', [(Now() - StartTime) * 86400.0]));
+    for PixelPos := 0 to Upscaled.Size - 1 do
+      Upscaled.FData[PixelPos] := EnsureRange(Upscaled.FData[PixelPos], 0, 1) * 255;
+    if not SaveImageFromVolumeIntoFile(Upscaled, Opt.OutputFile) then
+      raise Exception.Create('could not save ' + Opt.OutputFile);
+    WriteLn(Format('  %dx%d -> %dx%d  (%s)', [Image.SizeX, Image.SizeY,
+      Upscaled.SizeX, Upscaled.SizeY, Opt.OutputFile]));
+  finally
+    NN.Free;
+    {$IFDEF OpenCL}
+    OpenCLDevices.Free;
+    {$ENDIF}
+    Upscaled.Free;
+    Image.Free;
+  end;
+end;
+
+// Builds a tiny RGB image (0..255) as a deterministic colour gradient so the
+// smoke needs no input asset on disk.
 procedure MakeTinyImage(V: TNNetVolume; Size: integer);
 var
   X, Y: integer;
@@ -59,71 +214,48 @@ begin
     end;
 end;
 
-// Loads PngIn, upscales it through the RRDBNet at Config.Scale and writes
-// PngOut. Normalises 0..255 -> [-1,1] before the net and maps the raw output
-// back to 0..255 (a tanh-free clamp; the pico weights are random so this is a
-// smoke, not a tuned tone curve).
-procedure UpscalePng(NN: TNNet; const Config: TRRDBNetConfig;
-  const PngIn, PngOut: string);
+// Pico smoke: writes a 6x6 PNG and upscales it with the fixture Stem.
+procedure RunFixtureSmoke(const Stem, InPng, OutPng: string);
 var
-  InVol, NormVol, OutVol: TNNetVolume;
-  i: integer;
-begin
-  InVol := TNNetVolume.Create;
-  NormVol := TNNetVolume.Create;
-  OutVol := TNNetVolume.Create;
-  try
-    if not LoadImageFromFileIntoVolume(PngIn, InVol) then
-      raise Exception.Create('could not load ' + PngIn);
-    // 0..255 -> [-1,1].
-    NormVol.Copy(InVol);
-    NormVol.Divi(127.5);
-    NormVol.Add(-1.0);
-    NN.Compute(NormVol);
-    // [-1,1] -> 0..255 (clamped by the PNG writer).
-    OutVol.Copy(NN.GetLastLayer().Output);
-    OutVol.Add(1.0);
-    OutVol.Mul(127.5);
-    for i := 0 to OutVol.Size - 1 do
-      OutVol.FData[i] := EnsureRange(OutVol.FData[i], 0, 255);
-    if not SaveImageFromVolumeIntoFile(OutVol, PngOut) then
-      raise Exception.Create('could not save ' + PngOut);
-    WriteLn(Format('  scale x%d: %dx%d -> %dx%d  (%s)',
-      [Config.Scale, InVol.SizeX, InVol.SizeY,
-       OutVol.SizeX, OutVol.SizeY, PngOut]));
-  finally
-    OutVol.Free;
-    NormVol.Free;
-    InVol.Free;
-  end;
-end;
-
-procedure RunScale(const Stem, InPng, OutPng: string);
-var
-  NN: TNNet;
-  Config: TRRDBNetConfig;
   Img: TNNetVolume;
+  Opt: TUpscaleOptions;
 begin
-  NN := BuildRRDBNetFromSafeTensors(
-    FixturesDir + Stem + '.safetensors', Config,
-    {pTrainable=}false, FixturesDir + Stem + '_config.json');
   Img := TNNetVolume.Create;
   try
-    WriteLn(RRDBNetConfigToString(Config));
-    MakeTinyImage(Img, Config.InputSize);
+    MakeTinyImage(Img, 6);
     if not SaveImageFromVolumeIntoFile(Img, InPng) then
       raise Exception.Create('could not save ' + InPng);
-    UpscalePng(NN, Config, InPng, OutPng);
   finally
     Img.Free;
-    NN.Free;
   end;
+  ParseOptions(Opt);
+  Opt.ModelFile := FixturesDir + Stem + '.safetensors';
+  Opt.ConfigFile := FixturesDir + Stem + '_config.json';
+  Opt.InputFile := InPng;
+  Opt.OutputFile := OutPng;
+  UpscaleFile(Opt);
 end;
 
+var
+  Options: TUpscaleOptions;
 begin
-  WriteLn('Real-ESRGAN / ESRGAN RRDBNet upscale smoke');
-  WriteLn('==========================================');
-  RunScale('tiny_rrdbnet',    'esrgan_in_x4.png', 'esrgan_out_x4.png');
-  RunScale('tiny_rrdbnet_x2', 'esrgan_in_x2.png', 'esrgan_out_x2.png');
-  WriteLn('Done.');
+  try
+    if not ParseOptions(Options) then exit;
+    if Options.ModelFile <> '' then
+      UpscaleFile(Options)
+    else
+    begin
+      WriteLn('Real-ESRGAN / ESRGAN RRDBNet upscale smoke (random pico weights)');
+      WriteLn('================================================================');
+      RunFixtureSmoke('tiny_rrdbnet',    'esrgan_in_x4.png', 'esrgan_out_x4.png');
+      RunFixtureSmoke('tiny_rrdbnet_x2', 'esrgan_in_x2.png', 'esrgan_out_x2.png');
+      WriteLn('Done.');
+    end;
+  except
+    on E: Exception do
+    begin
+      WriteLn('Error: ', E.Message);
+      ExitCode := 1;
+    end;
+  end;
 end.

@@ -368,6 +368,8 @@ type
       NNStreamed, NNRoundTrip: TNNet; MinCmpLayers: integer);
     // Shared RRDBNet parity body: compares NN.Compute(io.input) against the
     // io.json oracle image (< 1e-4). PRIVATE (parameterized; not auto-run).
+    procedure AssertRRDBNetArchitectureEquals(const Msg: string;
+      const Expected, Actual: TRRDBNetConfig);
     procedure RunRRDBNetParity(NN: TNNet; const Config: TRRDBNetConfig;
       const IoFixture: string);
   published
@@ -1134,6 +1136,10 @@ type
     procedure TestRRDBNetParity;
     procedure TestRRDBNetParityPth;
     procedure TestRRDBNetParityScale2;
+    procedure TestRRDBNetInferConfigFromTensors;
+    procedure TestRRDBNetKeyPrefix;
+    procedure TestRRDBNetTiledUpscale;
+    procedure TestRRDBNetPixelUnshuffleX2;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
     procedure TestNAFNetNonSquareInput;
@@ -45161,14 +45167,15 @@ begin
   RefRoot := nil;
   try
     AssertTrue('net built', NN <> nil);
-    AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('input grid', Config.InputWidth, NN.Layers[0].Output.SizeX);
+    AssertEquals('input grid H', Config.InputHeight, NN.Layers[0].Output.SizeY);
     RefJson.LoadFromFile(FixturePath(IoFixture));
     RefRoot := GetJSON(RefJson.Text);
     InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
     ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
     ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
     AssertTrue('input present', InputArr <> nil);
-    AssertEquals('output image grid', Config.InputSize * Config.Scale,
+    AssertEquals('output image grid', Config.InputWidth * Config.Scale,
       NN.GetLastLayer().Output.SizeX);
     AssertEquals('output grid vs oracle', ImgSize,
       NN.GetLastLayer().Output.SizeX);
@@ -45176,16 +45183,16 @@ begin
       NN.GetLastLayer().Output.Depth);
 
     // Load the (C,H,W) input into the CAI (x,y,depth)-indexed volume.
-    ImgInput.ReSize(Config.InputSize, Config.InputSize, Config.NumInCh);
+    ImgInput.ReSize(Config.InputWidth, Config.InputHeight, Config.NumInCh);
     for ChanCnt := 0 to Config.NumInCh - 1 do
     begin
       RowArr := TJSONArray(InputArr.Items[ChanCnt]);
-      for YCnt := 0 to Config.InputSize - 1 do
+      for YCnt := 0 to Config.InputHeight - 1 do
       begin
         ChanArr := TJSONArray(RowArr.Items[YCnt]);
-        for XCnt := 0 to Config.InputSize - 1 do
+        for XCnt := 0 to Config.InputWidth - 1 do
           ImgInput.FData[
-            (YCnt * Config.InputSize + XCnt) * Config.NumInCh + ChanCnt] :=
+            (YCnt * Config.InputWidth + XCnt) * Config.NumInCh + ChanCnt] :=
             ChanArr.Items[XCnt].AsFloat;
       end;
     end;
@@ -45254,6 +45261,289 @@ begin
     {pTrainable=}true, FixturePath('tiny_rrdbnet_x2_config.json')),
     Config, 'tiny_rrdbnet_x2_io.json');
   AssertEquals('scale is 2', 2, Config.Scale);
+end;
+
+// Asserts that two RRDBNet configs agree on every architecture field (the input
+// size is a build-time choice, not part of the checkpoint).
+procedure TTestNeuralPretrained.AssertRRDBNetArchitectureEquals(
+  const Msg: string; const Expected, Actual: TRRDBNetConfig);
+begin
+  AssertEquals(Msg + ' model_type', Expected.ModelType, Actual.ModelType);
+  AssertEquals(Msg + ' num_in_ch', Expected.NumInCh, Actual.NumInCh);
+  AssertEquals(Msg + ' num_out_ch', Expected.NumOutCh, Actual.NumOutCh);
+  AssertEquals(Msg + ' num_feat', Expected.NumFeat, Actual.NumFeat);
+  AssertEquals(Msg + ' num_block', Expected.NumBlock, Actual.NumBlock);
+  AssertEquals(Msg + ' num_grow_ch', Expected.NumGrowCh, Actual.NumGrowCh);
+  AssertEquals(Msg + ' scale', Expected.Scale, Actual.Scale);
+  AssertEquals(Msg + ' upsample stages', Expected.UpsampleStages,
+    Actual.UpsampleStages);
+  AssertEquals(Msg + ' pixel_unshuffle', Expected.PixelUnshuffle,
+    Actual.PixelUnshuffle);
+end;
+
+// The config inferred from the tensor shapes (no config.json next to the
+// fixtures) equals the committed pico JSON configs, for x4, x4 .pth and x2.
+procedure TTestNeuralPretrained.TestRRDBNetInferConfigFromTensors;
+var
+  JsonConfig, Inferred: TRRDBNetConfig;
+begin
+  JsonConfig := ReadRRDBNetConfigFromJSONFile(
+    FixturePath('tiny_rrdbnet_config.json'));
+  Inferred := LoadRRDBNetConfig(FixturePath('tiny_rrdbnet.safetensors'));
+  AssertRRDBNetArchitectureEquals('x4 safetensors', JsonConfig, Inferred);
+  AssertEquals('inferred width unset', 0, Inferred.InputWidth);
+  AssertEquals('inferred height unset', 0, Inferred.InputHeight);
+  Inferred := LoadRRDBNetConfig(FixturePath('tiny_rrdbnet.pth'));
+  AssertRRDBNetArchitectureEquals('x4 pth', JsonConfig, Inferred);
+  JsonConfig := ReadRRDBNetConfigFromJSONFile(
+    FixturePath('tiny_rrdbnet_x2_config.json'));
+  Inferred := LoadRRDBNetConfig(FixturePath('tiny_rrdbnet_x2.safetensors'));
+  AssertRRDBNetArchitectureEquals('x2 safetensors', JsonConfig, Inferred);
+  AssertEquals('x2 fixture has one upsample stage', 1, Inferred.UpsampleStages);
+end;
+
+// A safetensors converted as-is from a Real-ESRGAN .pth keeps the 'params_ema.'
+// key prefix; the import must find it and still match the float64 oracle.
+procedure TTestNeuralPretrained.TestRRDBNetKeyPrefix;
+var
+  Reader: TNNetSafeTensorsReader;
+  Config, Inferred: TRRDBNetConfig;
+  OriginalNames: TStringList;
+  TensorPos, MaxTensorPos: integer;
+  NN: TNNet;
+begin
+  RandSeed := 424242;
+  Config := ReadRRDBNetConfigFromJSONFile(
+    FixturePath('tiny_rrdbnet_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_rrdbnet.safetensors'));
+  OriginalNames := TStringList.Create;
+  try
+    MaxTensorPos := Reader.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+      OriginalNames.Add(Reader.TensorName(TensorPos));
+    for TensorPos := 0 to MaxTensorPos do
+      Reader.RenameTensor(OriginalNames[TensorPos],
+        'params_ema.' + OriginalNames[TensorPos]);
+    AssertFalse('bare key gone', Reader.HasTensor('conv_first.weight'));
+    Inferred := InferRRDBNetConfigFromTensors(Reader);
+    AssertRRDBNetArchitectureEquals('prefixed', Config, Inferred);
+    NN := BuildRRDBNet(Reader, Config, {pTrainable=}true);
+  finally
+    OriginalNames.Free;
+    Reader.Free;
+  end;
+  RunRRDBNetParity(NN, Config, 'tiny_rrdbnet_io.json');
+end;
+
+// Tiled upscale (tile pad + overlap blend) vs whole-image upscale on a
+// non-square image. Pad 20 covers the pico net's ~18.25 input-pixel receptive
+// field, so the kept pixels of each tile see exactly the whole-image context and
+// the blend mixes equal values: tiled must match whole to float rounding.
+procedure TTestNeuralPretrained.TestRRDBNetTiledUpscale;
+const
+  cImageW = 60;
+  cImageH = 50;
+  cTile = 8;
+  cTilePad = 20;
+  cTileOverlap = 2;
+var
+  Config, WholeConfig, TileConfig: TRRDBNetConfig;
+  WholeNet, TileNet: TNNet;
+  Image, Whole, Tiled: TNNetVolume;
+  i, Pass: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Config := ReadRRDBNetConfigFromJSONFile(
+    FixturePath('tiny_rrdbnet_config.json'));
+  WholeConfig := RRDBNetTileConfig(Config, cImageW, cImageH, 0, cTilePad);
+  AssertEquals('whole width', cImageW, WholeConfig.InputWidth);
+  AssertEquals('whole height', cImageH, WholeConfig.InputHeight);
+  WholeNet := BuildRRDBNetFromSafeTensorsEx(
+    FixturePath('tiny_rrdbnet.safetensors'), WholeConfig, {pTrainable=}false);
+  TileNet := nil;
+  Image := TNNetVolume.Create(cImageW, cImageH, 3);
+  Whole := nil;
+  Tiled := nil;
+  try
+    for i := 0 to Image.Size - 1 do
+      Image.FData[i] := 0.5 + 0.45 * Sin(i * 0.137);
+    Whole := RRDBNetUpscale(WholeNet, WholeConfig, Image, cTilePad,
+      cTileOverlap);
+    AssertEquals('whole out W', cImageW * 4, Whole.SizeX);
+    AssertEquals('whole out H', cImageH * 4, Whole.SizeY);
+    for Pass := 0 to 1 do
+    begin
+      TileConfig := RRDBNetTileConfig(Config, cImageW, cImageH, cTile,
+        cTilePad);
+      AssertEquals('tile width', cTile + 2 * cTilePad, TileConfig.InputWidth);
+      AssertEquals('tile height', cTile + 2 * cTilePad, TileConfig.InputHeight);
+      if Pass = 1 then
+      begin
+        // A non-square tile: 2 tiles across, 4 down.
+        TileConfig.InputWidth := 52;
+        TileConfig.InputHeight := 44;
+      end;
+      TileNet := BuildRRDBNetFromSafeTensorsEx(
+        FixturePath('tiny_rrdbnet.safetensors'), TileConfig, {pTrainable=}false);
+      Tiled := RRDBNetUpscale(TileNet, TileConfig, Image, cTilePad,
+        cTileOverlap);
+      AssertEquals('tiled out W', Whole.SizeX, Tiled.SizeX);
+      AssertEquals('tiled out H', Whole.SizeY, Tiled.SizeY);
+      MaxDiff := 0;
+      for i := 0 to Whole.Size - 1 do
+        MaxDiff := Max(MaxDiff, Abs(Tiled.FData[i] - Whole.FData[i]));
+      AssertTrue('pass ' + IntToStr(Pass) + ' tiled vs whole max|diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      FreeAndNil(Tiled);
+      FreeAndNil(TileNet);
+    end;
+  finally
+    Tiled.Free;
+    Whole.Free;
+    Image.Free;
+    TileNet.Free;
+    WholeNet.Free;
+  end;
+end;
+
+// basicsr RealESRGAN_x2plus layout built in Pascal: conv_first takes 3*2*2
+// pixel-unshuffled channels and both conv_up stages exist. Checks the inferred
+// config, the TNNetSpaceToDepth stem, a non-square 6x4 -> 12x8 shape and the
+// conv_first output against a direct torch-order PixelUnshuffle + conv oracle.
+procedure TTestNeuralPretrained.TestRRDBNetPixelUnshuffleX2;
+const
+  cNumFeat = 4;
+  cGrowCh = 2;
+  cImageCh = 3;
+  cUnshuffle = 2;
+  cImageW = 6;
+  cImageH = 4;
+var
+  FileName: string;
+  Writer: TNNetSafeTensorsWriter;
+  ConvFirstW, ConvFirstB, Image: TNNetVolume;
+  Config: TRRDBNetConfig;
+  NN: TNNet;
+  Rdb, Conv, InCh, OutCh, o, c, dy, dx, ky, kx, x, y, LowX, LowY: integer;
+  Ref, MaxDiff: double;
+  AllFinite: boolean;
+  ConvFirstOut: TNNetVolume;
+
+  procedure AddRandomConv(const Name: string; pOutCh, pInCh: integer;
+    Weights, Biases: TNNetVolume);
+  var
+    W, B: TNNetVolume;
+    j: integer;
+  begin
+    if Weights <> nil then W := Weights else W := TNNetVolume.Create;
+    if Biases <> nil then B := Biases else B := TNNetVolume.Create;
+    try
+      W.ReSize(pOutCh * pInCh * 9, 1, 1);
+      for j := 0 to W.Size - 1 do W.FData[j] := (Random - 0.5) * 0.4;
+      B.ReSize(pOutCh, 1, 1);
+      for j := 0 to B.Size - 1 do B.FData[j] := (Random - 0.5) * 0.2;
+      Writer.AddTensorFlat('params_ema.' + Name + '.weight',
+        [pOutCh, pInCh, 3, 3], W);
+      Writer.AddTensorFlat('params_ema.' + Name + '.bias', [pOutCh], B);
+    finally
+      if Weights = nil then W.Free;
+      if Biases = nil then B.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  FileName := GetTempDir(false) + 'cai_rrdbnet_x2plus_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  ConvFirstW := TNNetVolume.Create;
+  ConvFirstB := TNNetVolume.Create;
+  Image := TNNetVolume.Create(cImageW, cImageH, cImageCh);
+  NN := nil;
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    AddRandomConv('conv_first', cNumFeat, cImageCh * cUnshuffle * cUnshuffle,
+      ConvFirstW, ConvFirstB);
+    for Rdb := 1 to 3 do
+      for Conv := 1 to 5 do
+      begin
+        InCh := cNumFeat + (Conv - 1) * cGrowCh;
+        if Conv < 5 then OutCh := cGrowCh else OutCh := cNumFeat;
+        AddRandomConv('body.0.rdb' + IntToStr(Rdb) + '.conv' + IntToStr(Conv),
+          OutCh, InCh, nil, nil);
+      end;
+    AddRandomConv('conv_body', cNumFeat, cNumFeat, nil, nil);
+    AddRandomConv('conv_up1', cNumFeat, cNumFeat, nil, nil);
+    AddRandomConv('conv_up2', cNumFeat, cNumFeat, nil, nil);
+    AddRandomConv('conv_hr', cNumFeat, cNumFeat, nil, nil);
+    AddRandomConv('conv_last', cImageCh, cNumFeat, nil, nil);
+    Writer.SaveToFile;
+    FreeAndNil(Writer);
+
+    Config := LoadRRDBNetConfig(FileName);
+    AssertEquals('num_in_ch', cImageCh, Config.NumInCh);
+    AssertEquals('pixel_unshuffle', cUnshuffle, Config.PixelUnshuffle);
+    AssertEquals('upsample stages', 2, Config.UpsampleStages);
+    AssertEquals('scale', 2, Config.Scale);
+    AssertEquals('num_feat', cNumFeat, Config.NumFeat);
+    AssertEquals('num_grow_ch', cGrowCh, Config.NumGrowCh);
+    AssertEquals('num_block', 1, Config.NumBlock);
+    Config.InputWidth := cImageW;
+    Config.InputHeight := cImageH;
+    NN := BuildRRDBNetFromSafeTensorsEx(FileName, Config, {pTrainable=}false);
+    AssertTrue('space-to-depth stem', NN.Layers[1] is TNNetSpaceToDepth);
+    for x := 0 to Image.Size - 1 do Image.FData[x] := Random;
+    NN.Compute(Image);
+    AssertEquals('out W', cImageW * 2, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('out H', cImageH * 2, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('out depth', cImageCh, NN.GetLastLayer().Output.Depth);
+    AllFinite := true;
+    for x := 0 to NN.GetLastLayer().Output.Size - 1 do
+      if IsNan(NN.GetLastLayer().Output.FData[x]) or
+         IsInfinite(NN.GetLastLayer().Output.FData[x]) then AllFinite := false;
+    AssertTrue('output finite', AllFinite);
+
+    // conv_first oracle: torch PixelUnshuffle channel c*4 + dy*2 + dx holds
+    // image pixel (2*LowX + dx, 2*LowY + dy) of channel c; zero 3x3 padding.
+    ConvFirstOut := NN.Layers[2].Output;
+    AssertEquals('stem grid W', cImageW div cUnshuffle, ConvFirstOut.SizeX);
+    AssertEquals('stem grid H', cImageH div cUnshuffle, ConvFirstOut.SizeY);
+    MaxDiff := 0;
+    for y := 0 to ConvFirstOut.SizeY - 1 do
+      for x := 0 to ConvFirstOut.SizeX - 1 do
+        for o := 0 to cNumFeat - 1 do
+        begin
+          Ref := ConvFirstB.FData[o];
+          for c := 0 to cImageCh - 1 do
+            for dy := 0 to cUnshuffle - 1 do
+              for dx := 0 to cUnshuffle - 1 do
+                for ky := 0 to 2 do
+                  for kx := 0 to 2 do
+                  begin
+                    LowX := x + kx - 1;
+                    LowY := y + ky - 1;
+                    if (LowX < 0) or (LowY < 0) or
+                       (LowX >= ConvFirstOut.SizeX) or
+                       (LowY >= ConvFirstOut.SizeY) then continue;
+                    Ref := Ref + ConvFirstW.FData[
+                      ((o * cImageCh * cUnshuffle * cUnshuffle +
+                        (c * cUnshuffle + dy) * cUnshuffle + dx) * 3 + ky) * 3 +
+                        kx] *
+                      Image[LowX * cUnshuffle + dx, LowY * cUnshuffle + dy, c];
+                  end;
+          MaxDiff := Max(MaxDiff, Abs(Ref - ConvFirstOut[x, y, o]));
+        end;
+    AssertTrue('unshuffle stem max|diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    Writer.Free;
+    NN.Free;
+    Image.Free;
+    ConvFirstB.Free;
+    ConvFirstW.Free;
+    DeleteFile(FileName);
+  end;
 end;
 
 // Verifies ReadNAFNetConfigFromJSONFile on the committed pico config.

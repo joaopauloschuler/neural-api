@@ -1663,32 +1663,22 @@ rather than acted on.
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
       `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
       trained for that latent space (or a cheap latent->RGB linear projection).
-- [ ] Real-image Real-ESRGAN upscaling, and `--upscale` in examples/QwenImage.
-      `BuildRRDBNetFromSafeTensors` and examples/RealESRGANUpscale run only the
-      random pico fixture today. Four things block a real photo: (1) the
-      xinntao `.pth` releases ship no config.json, but `ReadRRDBNetConfigFromJSONFile`
-      requires one; infer `TRRDBNetConfig` from the tensor shapes instead
-      (num_feat from conv_first, num_block from the `body.N` count, num_grow_ch
-      from rdb1.conv1, num_in_ch from the conv_first input width);
-      (2) `RealESRGAN_x2plus` (and the x1 variant) feeds a pixel-unshuffled input
-      (conv_first takes 3*s*s channels) and keeps both conv_up stages: add a
-      `TNNetSpaceToDepth` stem when num_in_ch = 3*s*s, scale from it;
-      (3) the net is built for a square `InputSize`: allow width <> height;
-      (4) whole-image inference at 1024x1024 x4 does not fit in RAM: add a
-      tiled upscale with tile padding and overlap blending (basicsr
-      `RealESRGANer` tile/tile_pad), reusing the tile layout/blend code of
-      `TiledVaeDecode` instead of a second copy. Then: examples/RealESRGANUpscale
-      takes `--model FILE --input IMG --output IMG --tile N --gpu`
-      (the pico smoke stays the default); examples/QwenImage gets
-      `--upscale FILE` (REPL `/upscale FILE|off`) that runs the upscaler on the
-      decoded image after the VAE, so a 512x512 generation becomes 2048x2048 for
-      a fraction of the 1024x1024 denoise cost. Tests: shape-inferred config
-      equals the committed pico config; a pico x2 pixel-unshuffle fixture
-      (`tools/` generator from the ~/x venv using basicsr's RRDBNet definition,
-      ask the user before adding the tool), parity < 1e-4; tiled vs untiled
-      output on a pico net within the overlap-blend tolerance; a non-square input.
-      Real `RealESRGAN_x4plus.pth` run on the user's box. README updates in both
-      examples.
+- [ ] Real-ESRGAN: `--upscale` in examples/QwenImage, plus the checks still open.
+      Done: shape-inferred `TRRDBNetConfig` (`InferRRDBNetConfigFromTensors` /
+      `LoadRRDBNetConfig`, any key prefix such as `params_ema.`), the x2plus/x1
+      `TNNetSpaceToDepth` pixel-unshuffle stem, width <> height, and tiled upscale
+      (`RRDBNetTileConfig` + `RRDBNetUpscale` on `TiledNetCompute`, now shared
+      with `TiledVaeDecode`). examples/RealESRGANUpscale takes `--model --input
+      --output --tile --tile-pad --tile-overlap --gpu`. Left:
+      (1) examples/QwenImage `--upscale FILE` (REPL `/upscale FILE|off`): run
+      `RRDBNetUpscale` on the decoded image after the VAE, so a 512x512 generation
+      becomes 2048x2048 for a fraction of the 1024x1024 denoise cost;
+      (2) DEFERRED, needs the user's approval for a new Python tool: a pico
+      basicsr x2plus fixture (`tools/` generator from the ~/x venv using basicsr's
+      RRDBNet definition), parity < 1e-4 on the whole net. Today only the
+      unshuffle stem has an oracle (Pascal-side, `TestRRDBNetPixelUnshuffleX2`);
+      (3) a real `RealESRGAN_x4plus.pth` (and x2plus) run on the user's box;
+      (4) not supported: the old ESRGAN `model.N.*` key layout.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
       branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
