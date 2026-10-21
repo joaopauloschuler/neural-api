@@ -123,6 +123,24 @@ rather than acted on.
   - [ ] Follow-up (not in this task): shared paged KV blocks, so conversations
         share the blocks of their common prefix instead of one full KV copy per
         slot (vLLM-style); a large KV-cache rewrite.
+- [ ] One shared standard-normal sampler instead of ~40 private copies.
+      `neural/neuralvolume.pas` already has `RandomStdNormal()` (Marsaglia
+      polar, global `Random`), but only in the implementation section, and
+      `TVolume.RandomGaussianValue` is a second copy of the same body. Copies
+      found 2026-10-20: about 36 examples carry their own Box-Muller helper
+      (`RandomGauss`, `Gauss`, `NextGauss`, `GaussNoise`: TripletEmbedding,
+      UNetSegmentation, CalibrationReport, KalmanFilter, ...),
+      `tests/TestNeuralNumerical.pas` has one, and `neural/neuralnetwork.pas`
+      has three nested `NextGaussian` functions (one on the global `Random`
+      with a cached spare; two on a private LCG so the report never moves the
+      caller's RNG stream). Work: move `RandomStdNormal` to the interface, make
+      `RandomGaussianValue` call it, put the private-stream variant (LCG state
+      + cached spare) into one reusable seeded type in neuralvolume.pas for the
+      two LCG callers, then delete the copies in the examples, tests and
+      neuralnetwork.pas. The polar method draws a different sequence than
+      Box-Muller, so the sample outputs in the touched examples' README.md
+      files must be re-run and refreshed; examples whose `NextGauss` takes a
+      std argument just multiply the shared result.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
