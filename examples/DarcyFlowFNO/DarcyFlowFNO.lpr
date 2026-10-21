@@ -47,7 +47,7 @@ program DarcyFlowFNO;
 {$mode objfpc}{$H+}
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
-  Classes, SysUtils, Math, neuralnetwork, neuralvolume;
+  Classes, SysUtils, neuralnetwork, neuralvolume;
 
 const
   TRAIN_GRID = 16;      // grid the surrogate is TRAINED on
@@ -79,7 +79,7 @@ var
   kx, ky, x, y, it, n: integer;
   cr, ci: array[0..KMODES-1, 0..KMODES-1] of TNeuralFloat;
   twoPi, ang, s, mean, h2: TNeuralFloat;
-  oldSeed: integer;
+  oldSeed: cardinal;
   a, u, unew: array of TNeuralFloat;
 begin
   oldSeed := RandSeed;
@@ -226,10 +226,6 @@ var
   FNO, FNOfine: TNNet;
   testCoarse, testFine: TNeuralFloat;
 begin
-  // Mask spurious FPU traps (denormals / inexact) so the FFT-based spectral conv
-  // does not abort on harmless tiny values -- standard in this repo's examples.
-  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
-                    exOverflow, exUnderflow, exPrecision]);
   RandSeed := 424242;
   WriteLn('Darcy-flow FNO surrogate: learning the coefficient a(x,y) -> solution u(x,y)');
   WriteLn('of  -Laplacian u = (a-1)  (periodic Poisson), via AddFourierNeuralOperator2D.');

@@ -115,12 +115,6 @@ rather than acted on.
       logit_scale of the cosine-attention forward. Add a numerical gradient
       check; if it fails, give the layer its own backward (or document it as
       inference-only).
-- [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
-      example-side SetExceptionMask workaround — consider masking/guarding the
-      denormals inside the layer's FFT so callers don't have to. Since
-      5b223b30 the layer runs the shared `TFFTPlan` (neuralvolume.pas), so a
-      guard belongs in `FFTPlanExecute` / `FFTRadix2InPlace` once, not in the
-      layer; first re-check whether examples/DarcyFlowFNO still needs its mask.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
@@ -2167,9 +2161,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO -
-      coordinate with the open FFT denormal-trap item, since the device path
-      would move that math off the host FPU entirely).
+- [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO).
 - [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
