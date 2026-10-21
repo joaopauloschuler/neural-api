@@ -81,6 +81,21 @@ type
     // GrowOutpaintSidesToMultiple and ParseOutpaintSides on valid and invalid
     // input.
     procedure TestOutpaintSidesGrowAndParse;
+    // HFImageProcessorFamily strips Fast/Pil/ImageProcessor/FeatureExtractor;
+    // ViT/DeiT read an int size as a square, CLIP/ConvNext/unknown do not.
+    procedure TestHFProcessorFamilyAndIntSizeSquare;
+    // int size: (size,size) for ViT/DeiT/BEiT types, shortest_edge for CLIP
+    // and for configs with no or an unknown processor type.
+    procedure TestReadConfigIntSizeByProcessorType;
+    // crop_pct: ConvNext below/at 384 and its default, PoolFormer scaling and
+    // its 224 crop default; ignored by other processors.
+    procedure TestReadConfigCropPct;
+    // 13x7 photo through ConvNext (size 7, crop_pct 0.875) and PoolFormer
+    // (size 9, crop_pct 0.9) configs vs transformers' PIL processors.
+    procedure TestCropPctPreprocessMatchesTransformers;
+    // 13x7 photo through ViT int size 5 and DeiT size 6 / crop 4 configs vs
+    // transformers' PIL processors.
+    procedure TestIntSizeSquarePreprocessMatchesTransformers;
   end;
 
 implementation
@@ -866,6 +881,235 @@ begin
     Bottom) <> '');
   AssertTrue('not numbers', ParseOutpaintSides('a,b,c,d', Left, Top, Right,
     Bottom) <> '');
+end;
+
+procedure TTestNeuralImagePreprocess.TestHFProcessorFamilyAndIntSizeSquare;
+begin
+  AssertEquals('fast', 'ViT', HFImageProcessorFamily('ViTImageProcessorFast'));
+  AssertEquals('pil', 'DeiT', HFImageProcessorFamily('DeiTImageProcessorPil'));
+  AssertEquals('legacy', 'ConvNext',
+    HFImageProcessorFamily('ConvNextFeatureExtractor'));
+  AssertEquals('empty', '', HFImageProcessorFamily(''));
+  AssertTrue('ViT square', HFImageProcessorIntSizeIsSquare('ViTImageProcessor'));
+  AssertTrue('ViT legacy square',
+    HFImageProcessorIntSizeIsSquare('ViTFeatureExtractor'));
+  AssertTrue('Beit square',
+    HFImageProcessorIntSizeIsSquare('BeitImageProcessorFast'));
+  AssertFalse('CLIP shortest edge',
+    HFImageProcessorIntSizeIsSquare('CLIPImageProcessor'));
+  AssertFalse('ConvNext shortest edge',
+    HFImageProcessorIntSizeIsSquare('ConvNextImageProcessor'));
+  AssertFalse('SigLIP shortest edge',
+    HFImageProcessorIntSizeIsSquare('SiglipImageProcessor'));
+  AssertFalse('unknown', HFImageProcessorIntSizeIsSquare('FooImageProcessor'));
+  AssertFalse('none', HFImageProcessorIntSizeIsSquare(''));
+end;
+
+procedure TTestNeuralImagePreprocess.TestReadConfigIntSizeByProcessorType;
+var
+  Cfg: TNNetImagePreprocess;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_type.json';
+  try
+    WriteConfig(FN, '{"image_processor_type":"ViTImageProcessor","size":224}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('ViT direct', Cfg.ResizeKeepsAspect);
+    AssertEquals('ViT H', 224, Cfg.ResizeHeight);
+    AssertEquals('ViT W', 224, Cfg.ResizeWidth);
+    AssertEquals('ViT crop H', 224, Cfg.CropHeight);
+    AssertEquals('ViT crop W', 224, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"feature_extractor_type":"ViTFeatureExtractor",' +
+      '"size":32}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('legacy ViT direct', Cfg.ResizeKeepsAspect);
+    AssertEquals('legacy ViT W', 32, Cfg.ResizeWidth);
+
+    WriteConfig(FN, '{"feature_extractor_type":"DeiTFeatureExtractor",' +
+      '"size":256,"crop_size":224,"do_center_crop":true}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('DeiT direct', Cfg.ResizeKeepsAspect);
+    AssertEquals('DeiT H', 256, Cfg.ResizeHeight);
+    AssertEquals('DeiT W', 256, Cfg.ResizeWidth);
+    AssertEquals('DeiT crop H', 224, Cfg.CropHeight);
+    AssertEquals('DeiT crop W', 224, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"image_processor_type":"BeitImageProcessor",' +
+      '"size":224,"crop_size":200,"do_center_crop":false}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertEquals('BEiT uncropped', 224, Cfg.CropHeight);
+
+    WriteConfig(FN, '{"image_processor_type":"CLIPImageProcessor",' +
+      '"size":224,"crop_size":224}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertTrue('CLIP shortest edge', Cfg.ResizeKeepsAspect);
+    AssertEquals('CLIP edge', 224, Cfg.ResizeShorterSide);
+
+    WriteConfig(FN, '{"image_processor_type":"FooImageProcessor",' +
+      '"size":256,"crop_size":224}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertTrue('unknown shortest edge', Cfg.ResizeKeepsAspect);
+    AssertEquals('unknown edge', 256, Cfg.ResizeShorterSide);
+    AssertEquals('unknown crop', 224, Cfg.CropSize);
+  finally
+    DeleteFile(FN);
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestReadConfigCropPct;
+var
+  Cfg: TNNetImagePreprocess;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_croppct.json';
+  try
+    WriteConfig(FN, '{"feature_extractor_type":"ConvNextFeatureExtractor",' +
+      '"size":224,"crop_pct":0.875}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertTrue('ConvNext 224 keeps aspect', Cfg.ResizeKeepsAspect);
+    AssertEquals('ConvNext 224/0.875', 256, Cfg.ResizeShorterSide);
+    AssertEquals('ConvNext crop H', 224, Cfg.CropHeight);
+    AssertEquals('ConvNext crop W', 224, Cfg.CropWidth);
+    AssertEquals('ConvNext crop', 224, Cfg.CropSize);
+
+    WriteConfig(FN, '{"image_processor_type":"ConvNextImageProcessor",' +
+      '"size":{"shortest_edge":224}}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertEquals('ConvNext default crop_pct', 256, Cfg.ResizeShorterSide);
+
+    WriteConfig(FN, '{"image_processor_type":"ConvNextImageProcessor",' +
+      '"size":{"shortest_edge":384},"crop_pct":0.875}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('ConvNext 384 warps', Cfg.ResizeKeepsAspect);
+    AssertEquals('ConvNext 384 H', 384, Cfg.ResizeHeight);
+    AssertEquals('ConvNext 384 W', 384, Cfg.ResizeWidth);
+    AssertEquals('ConvNext 384 crop', 384, Cfg.CropHeight);
+
+    WriteConfig(FN, '{"feature_extractor_type":"PoolFormerFeatureExtractor",' +
+      '"size":224,"crop_pct":0.9}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertTrue('PoolFormer keeps aspect', Cfg.ResizeKeepsAspect);
+    AssertEquals('PoolFormer 224/0.9', 248, Cfg.ResizeShorterSide);
+    AssertEquals('PoolFormer crop', 224, Cfg.CropHeight);
+
+    WriteConfig(FN, '{"image_processor_type":"PoolFormerImageProcessor",' +
+      '"size":{"height":10,"width":20},"crop_pct":0.5,' +
+      '"crop_size":{"height":8,"width":16}}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('PoolFormer (H,W) direct', Cfg.ResizeKeepsAspect);
+    AssertEquals('PoolFormer H/0.5', 20, Cfg.ResizeHeight);
+    AssertEquals('PoolFormer W/0.5', 40, Cfg.ResizeWidth);
+    AssertEquals('PoolFormer crop W', 16, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"image_processor_type":"CLIPImageProcessor",' +
+      '"size":224,"crop_pct":0.5}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertEquals('CLIP ignores crop_pct', 224, Cfg.ResizeShorterSide);
+  finally
+    DeleteFile(FN);
+  end;
+end;
+
+// Dst against transformers' pixel_values: its size and sum, then
+// (X, Y, C, Value) quadruples in Samples.
+procedure AssertTransformersOracle(const Name: string; Dst: TNNetVolume;
+  ExpectedWidth, ExpectedHeight: integer; ExpectedSum: double;
+  const Samples: array of double);
+var
+  SampleIdx: integer;
+begin
+  TAssert.AssertEquals(Name + ' W', ExpectedWidth, Dst.SizeX);
+  TAssert.AssertEquals(Name + ' H', ExpectedHeight, Dst.SizeY);
+  TAssert.AssertEquals(Name + ' D', 3, Dst.Depth);
+  TAssert.AssertEquals(Name + ' sum', ExpectedSum, Dst.GetSum, 1e-3);
+  SampleIdx := 0;
+  while SampleIdx + 3 <= High(Samples) do
+  begin
+    TAssert.AssertEquals(Format('%s (%g,%g,%g)', [Name, Samples[SampleIdx],
+      Samples[SampleIdx + 1], Samples[SampleIdx + 2]]), Samples[SampleIdx + 3],
+      Dst[Round(Samples[SampleIdx]), Round(Samples[SampleIdx + 1]),
+      Round(Samples[SampleIdx + 2])], csOracleTol);
+    Inc(SampleIdx, 4);
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestCropPctPreprocessMatchesTransformers;
+const
+  csNorm = '"resample":3,"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]';
+var
+  Cfg: TNNetImagePreprocess;
+  Src, Dst: TNNetVolume;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_croppct_px.json';
+  Src := TNNetVolume.Create(13, 7, 3);
+  Dst := TNNetVolume.Create;
+  try
+    FillTestPhoto(Src);
+    WriteConfig(FN, '{"image_processor_type":"ConvNextImageProcessor",' +
+      '"size":7,"crop_pct":0.875,' + csNorm + '}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    // ConvNextImageProcessorPil(size=7, crop_pct=0.875, resample=3, ...).
+    AssertTransformersOracle('ConvNext', Dst, 7, 7, 51.462094,
+      [0, 0, 0, -0.617647,  6, 0, 1, -0.831373,  0, 6, 2, -0.267974,
+       3, 3, 0, 0.656863,  1, 2, 1, 0.109804,  6, 6, 2, 1.366013,
+       2, 1, 2, 0.228758,  5, 4, 0, -1.343137]);
+
+    WriteConfig(FN, '{"image_processor_type":"PoolFormerImageProcessor",' +
+      '"size":9,"crop_pct":0.9,"crop_size":9,' + csNorm + '}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    // PoolFormerImageProcessorPil(size=9, crop_pct=0.9, crop_size=9, ...).
+    AssertTransformersOracle('PoolFormer', Dst, 9, 9, 83.783664,
+      [0, 0, 0, -0.637255,  8, 0, 1, -0.752941,  0, 8, 2, 0.437908,
+       4, 4, 0, 0.009804,  1, 2, 1, 1.600000,  8, 8, 2, 0.633987,
+       2, 1, 2, 0.921569,  7, 6, 0, -0.892157]);
+  finally
+    DeleteFile(FN);
+    Dst.Free;
+    Src.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestIntSizeSquarePreprocessMatchesTransformers;
+const
+  csNorm = '"resample":3,"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]';
+var
+  Cfg: TNNetImagePreprocess;
+  Src, Dst: TNNetVolume;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_square_px.json';
+  Src := TNNetVolume.Create(13, 7, 3);
+  Dst := TNNetVolume.Create;
+  try
+    FillTestPhoto(Src);
+    WriteConfig(FN, '{"image_processor_type":"ViTImageProcessor",' +
+      '"size":5,' + csNorm + '}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    // ViTImageProcessorPil(size=5, resample=3, ...).
+    AssertTransformersOracle('ViT', Dst, 5, 5, 22.592812,
+      [0, 0, 0, -1.833333,  4, 0, 1, 0.956863,  0, 4, 2, 0.607843,
+       2, 2, 0, -0.637255,  1, 2, 1, 0.376471,  4, 4, 2, 0.607843,
+       2, 1, 2, 0.673203,  3, 2, 0, -0.813725]);
+
+    WriteConfig(FN, '{"feature_extractor_type":"DeiTFeatureExtractor",' +
+      '"size":6,"crop_size":4,' + csNorm + '}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    // DeiTImageProcessorPil(size=6, crop_size=4, resample=3, ...).
+    AssertTransformersOracle('DeiT', Dst, 4, 4, 14.956864,
+      [0, 0, 0, -0.264706,  3, 0, 1, 0.815686,  0, 3, 2, 0.660131,
+       2, 2, 0, -1.754902,  1, 2, 1, 0.062745,  3, 3, 2, 0.660131,
+       2, 1, 2, 0.660131,  2, 1, 0, -1.264706]);
+  finally
+    DeleteFile(FN);
+    Dst.Free;
+    Src.Free;
+  end;
 end;
 
 initialization

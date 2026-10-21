@@ -906,6 +906,9 @@ type
     // size {"height","width"}: direct resize to (H,W), no crop, equal to
     // ResizeImagePIL; on a square image identical to the shortest_edge path.
     procedure TestClipImagePreprocessHeightWidth;
+    // image_processor_type rules: ViT int size as a square, CLIP as
+    // shortest_edge, ConvNext crop_pct (pixels vs transformers' PIL processor).
+    procedure TestClipImagePreprocessProcessorType;
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
     procedure TestSigLIPVisionFeatures;
@@ -29002,6 +29005,69 @@ begin
     DeleteFile(FileName);
     ShortestEdgeDst.Free;
     Resized.Free;
+    Dst.Free;
+    Src.Free;
+    ConfigFile.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestClipImagePreprocessProcessorType;
+var
+  Config: TClipImageProcessorConfig;
+  Src, Dst: TNNetVolume;
+  ConfigFile: TStringList;
+  FileName: string;
+  X, Y: integer;
+begin
+  FileName := GetTempDir(false) + 'cai_clip_pp_type.json';
+  ConfigFile := TStringList.Create;
+  Src := TNNetVolume.Create(13, 7, 3);
+  Dst := TNNetVolume.Create;
+  try
+    ConfigFile.Text := '{"image_processor_type":"ViTImageProcessor",' +
+      '"size":224}';
+    ConfigFile.SaveToFile(FileName);
+    Config := ReadClipImageProcessorConfig(FileName);
+    AssertFalse('ViT direct', Config.ResizeKeepsAspect);
+    AssertEquals('ViT H', 224, Config.ResizeHeight);
+    AssertEquals('ViT W', 224, Config.ResizeWidth);
+    AssertEquals('ViT crop W', 224, Config.CropWidth);
+
+    ConfigFile.Text := '{"image_processor_type":"CLIPImageProcessor",' +
+      '"size":256,"crop_size":224}';
+    ConfigFile.SaveToFile(FileName);
+    Config := ReadClipImageProcessorConfig(FileName);
+    AssertTrue('CLIP shortest edge', Config.ResizeKeepsAspect);
+    AssertEquals('CLIP edge', 256, Config.ShortestEdge);
+    AssertEquals('CLIP crop', 224, Config.CropHeight);
+
+    ConfigFile.Text := '{"image_processor_type":"ConvNextImageProcessor",' +
+      '"size":7,"crop_pct":0.875,"do_center_crop":false,"resample":3,' +
+      '"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]}';
+    ConfigFile.SaveToFile(FileName);
+    Config := ReadClipImageProcessorConfig(FileName);
+    AssertTrue('ConvNext keeps aspect', Config.ResizeKeepsAspect);
+    AssertEquals('ConvNext 7/0.875', 8, Config.ShortestEdge);
+    AssertEquals('ConvNext crop', 7, Config.CropHeight);
+    AssertTrue('ConvNext always crops', Config.DoCenterCrop);
+    for X := 0 to 12 do
+      for Y := 0 to 6 do
+      begin
+        Src[X, Y, 0] := (X * 35 + Y * 16) mod 256;
+        Src[X, Y, 1] := (X * 37 + Y * 91) mod 256;
+        Src[X, Y, 2] := 255 * ((X + Y) mod 2);
+      end;
+    ClipPreprocessImage(Src, Dst, Config);
+    // ConvNextImageProcessorPil(size=7, crop_pct=0.875, resample=3, ...).
+    AssertEquals('ConvNext out W', 7, Dst.SizeX);
+    AssertEquals('ConvNext out H', 7, Dst.SizeY);
+    AssertEquals('ConvNext sum', 51.462094, Dst.GetSum, 1e-3);
+    AssertEquals('ConvNext (0,0,0)', -0.617647, Dst[0, 0, 0], 1e-5);
+    AssertEquals('ConvNext (3,3,0)', 0.656863, Dst[3, 3, 0], 1e-5);
+    AssertEquals('ConvNext (6,6,2)', 1.366013, Dst[6, 6, 2], 1e-5);
+    AssertEquals('ConvNext (5,4,0)', -1.343137, Dst[5, 4, 0], 1e-5);
+  finally
+    DeleteFile(FileName);
     Dst.Free;
     Src.Free;
     ConfigFile.Free;

@@ -8592,11 +8592,8 @@ type
     Resample: TImageResampleFilter; // resample (PIL code, default BICUBIC)
   end;
 
-// Reads a HF preprocessor_config.json for the CLIP/LLaVA image processor.
-// Defaults follow CLIPImageProcessor: shortest_edge/crop 224, do_* True,
-// rescale_factor 1/255, the OpenAI image_mean/std. size may be an int, an
-// object with "shortest_edge", or "height"/"width"; crop_size may be an int
-// or an object with "height"/"width".
+// Reads a HF preprocessor_config.json (CLIPImageProcessor defaults); size,
+// crop_size and crop_pct per image_processor_type (ResolveHFImageResize).
 function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
 
@@ -85150,6 +85147,9 @@ var
 var
   CropEdge: integer;
   IsSizeHeightWidth, IsCropHeightWidth: boolean;
+  CropPctData: TJSONData;
+  CropPct: double;
+  Resize: THFImageResize;
 begin
   if not FileExists(FileName) then
     ImportError('CLIP image preprocessing: config file not found: ' +
@@ -85180,13 +85180,29 @@ begin
 
     Result.DoResize := Obj.Get('do_resize', true);
     Result.DoCenterCrop := Obj.Get('do_center_crop', true);
-    // ViT/SigLIP processors have no crop: the output is the resized (H,W).
-    if IsSizeHeightWidth and ((Obj.Find('crop_size') = nil) or
-      not Result.DoCenterCrop) then
-    begin
-      Result.CropHeight := Result.ResizeHeight;
-      Result.CropWidth := Result.ResizeWidth;
-    end;
+    Resize.KeepsAspect := Result.ResizeKeepsAspect;
+    Resize.ShortestEdge := Result.ShortestEdge;
+    Resize.ResizeHeight := Result.ResizeHeight;
+    Resize.ResizeWidth := Result.ResizeWidth;
+    Resize.CropHeight := Result.CropHeight;
+    Resize.CropWidth := Result.CropWidth;
+    Resize.DoCenterCrop := Result.DoCenterCrop;
+    CropPctData := Obj.Find('crop_pct');
+    if (CropPctData <> nil) and (CropPctData.JSONType = jtNumber) then
+      CropPct := CropPctData.AsFloat
+    else
+      CropPct := 0;
+    ResolveHFImageResize(Obj.Get('image_processor_type',
+      Obj.Get('feature_extractor_type', '')),
+      (Obj.Find('size') <> nil) and (Obj.Find('size').JSONType = jtNumber),
+      Obj.Find('crop_size') <> nil, CropPct, Resize);
+    Result.ResizeKeepsAspect := Resize.KeepsAspect;
+    Result.ShortestEdge := Resize.ShortestEdge;
+    Result.ResizeHeight := Resize.ResizeHeight;
+    Result.ResizeWidth := Resize.ResizeWidth;
+    Result.CropHeight := Resize.CropHeight;
+    Result.CropWidth := Resize.CropWidth;
+    Result.DoCenterCrop := Resize.DoCenterCrop;
     Result.DoRescale := Obj.Get('do_rescale', true);
     Result.DoNormalize := Obj.Get('do_normalize', true);
     Result.RescaleFactor := Obj.Get('rescale_factor', 1.0 / 255.0);

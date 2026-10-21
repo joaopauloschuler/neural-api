@@ -2333,9 +2333,9 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [ ] An int `size` is ambiguous: ViTImageProcessor reads it as a square
+- [X] An int `size` is ambiguous: ViTImageProcessor reads it as a square
       (H,W) (`default_to_square=True`, e.g. google/vit-base `"size": 224`),
       CLIPImageProcessor as shortest_edge. Both readers still use
       shortest_edge; choosing by `image_processor_type` /
       `feature_extractor_type` needs a processor list.
-- [ ] `crop_pct` (ConvNext and others) is not read by either config reader.
+- [X] `crop_pct` (ConvNext and others) is not read by either config reader.

@@ -63,6 +63,30 @@ function ParseOutpaintSides(const Text: string;
 // as in a HF preprocessor_config.json "resample"; raises on other codes.
 function PILResampleCodeToFilter(Code: integer): TImageResampleFilter;
 
+type
+  // Resize + crop of a HF image processor: shortest-edge (KeepsAspect) or
+  // direct (ResizeHeight,ResizeWidth) resize, then a (CropHeight,CropWidth) crop.
+  THFImageResize = record
+    KeepsAspect: boolean;
+    ShortestEdge: integer;
+    ResizeHeight, ResizeWidth: integer;
+    CropHeight, CropWidth: integer;
+    DoCenterCrop: boolean;
+  end;
+
+// "ViTImageProcessorFast" / "ViTFeatureExtractor" / "ViTImageProcessorPil"
+// -> "ViT": the processor family of an image_processor_type.
+function HFImageProcessorFamily(const ProcessorType: string): string;
+
+// True when transformers reads an int "size" of this processor type as
+// (size,size) (default_to_square); unknown types read it as shortest_edge.
+function HFImageProcessorIntSizeIsSquare(const ProcessorType: string): boolean;
+
+// Applies the processor rules to the raw size/crop_size fields in Resize: int
+// size as a square, crop = resize when uncropped, ConvNext/PoolFormer crop_pct.
+procedure ResolveHFImageResize(const ProcessorType: string;
+  SizeIsInt, HasCropSize: boolean; CropPct: double; var Resize: THFImageResize);
+
 implementation
 
 uses
@@ -80,6 +104,122 @@ begin
   else
     raise Exception.Create('PILResampleCodeToFilter: unknown PIL resample ' +
       'code ' + IntToStr(Code) + '.');
+  end;
+end;
+
+const
+  // transformers 5.x image processor families whose default_to_square is True.
+  csHFSquareIntSizeFamilies: array[0..74] of string = (
+    'Aria', 'Beit', 'Blip', 'CHMv2', 'Cohere2Vision', 'DINOv3ViT', 'DPT',
+    'DeepseekOcr2', 'DeepseekVL', 'DeepseekVLHybrid', 'DeiT', 'DepthPro',
+    'Donut', 'EfficientNet', 'Emu3', 'Flava', 'Fuyu', 'GLPN', 'Gemma3',
+    'Gemma4', 'Gemma4Unified', 'GotOcr2', 'Idefics', 'Idefics3', 'ImageGPT',
+    'Janus', 'Kimi_K25', 'Kosmos2_5', 'LayoutLMv2', 'LayoutLMv3', 'Lfm2Vl',
+    'Llama4', 'MiniCPMV4_6', 'Mllama', 'NeoMME', 'Nougat', 'Ovis2', 'OwlViT',
+    'Owlv2', 'PPChart2Table', 'PPDocLayoutV2', 'PPDocLayoutV3',
+    'PPFormulaNet', 'PPLCNet', 'PPOCRV5ServerDet', 'PPOCRV5ServerRec',
+    'PPOCRV6SmallRec', 'Perceiver', 'PerceptionLM', 'Phi4Multimodal',
+    'Pix2Struct', 'Pixtral', 'PromptDepthAnything', 'Pvt', 'SLANeXt', 'Sam',
+    'Sam2', 'Sam3', 'Sapiens2', 'SegGpt', 'Segformer', 'Siglip2', 'SmolVLM',
+    'Step3p7', 'Swin2SR', 'TimmWrapper', 'Tipsv2', 'Tipsv2Dpt', 'UVDoc',
+    'ViT', 'VideoLlava', 'VitMatte', 'VitPose', 'Vivit', 'ZoeDepth');
+
+function HFImageProcessorFamily(const ProcessorType: string): string;
+
+  procedure StripSuffix(const Suffix: string);
+  var
+    Start: integer;
+  begin
+    Start := Length(Result) - Length(Suffix) + 1;
+    if (Start > 1) and (Copy(Result, Start, Length(Suffix)) = Suffix) then
+      SetLength(Result, Start - 1);
+  end;
+
+begin
+  Result := Trim(ProcessorType);
+  StripSuffix('Fast');
+  StripSuffix('Pil');
+  StripSuffix('ImageProcessor');
+  StripSuffix('FeatureExtractor');
+end;
+
+function HFImageProcessorIntSizeIsSquare(const ProcessorType: string): boolean;
+var
+  Family: string;
+  FamilyIdx: integer;
+begin
+  Result := false;
+  Family := HFImageProcessorFamily(ProcessorType);
+  if Family = '' then Exit;
+  for FamilyIdx := Low(csHFSquareIntSizeFamilies) to
+    High(csHFSquareIntSizeFamilies) do
+    if SameText(Family, csHFSquareIntSizeFamilies[FamilyIdx]) then
+      Exit(true);
+end;
+
+procedure ResolveHFImageResize(const ProcessorType: string;
+  SizeIsInt, HasCropSize: boolean; CropPct: double; var Resize: THFImageResize);
+var
+  Family: string;
+  Edge: integer;
+begin
+  if SizeIsInt and HFImageProcessorIntSizeIsSquare(ProcessorType) then
+  begin
+    Resize.KeepsAspect := false;
+    Resize.ResizeHeight := Resize.ShortestEdge;
+    Resize.ResizeWidth := Resize.ShortestEdge;
+  end;
+  Family := HFImageProcessorFamily(ProcessorType);
+  if SameText(Family, 'ConvNext') then
+  begin
+    // ConvNextImageProcessor.resize: crop_pct (default 224/256) below 384,
+    // a plain (edge,edge) warp from 384 up.
+    if CropPct <= 0 then CropPct := 224 / 256;
+    Edge := Resize.ShortestEdge;
+    Resize.CropHeight := Edge;
+    Resize.CropWidth := Edge;
+    Resize.DoCenterCrop := true;
+    Resize.KeepsAspect := Edge < 384;
+    if Resize.KeepsAspect then
+      Resize.ShortestEdge := Trunc(Edge / CropPct)
+    else
+    begin
+      Resize.ResizeHeight := Edge;
+      Resize.ResizeWidth := Edge;
+    end;
+    Exit;
+  end;
+  if SameText(Family, 'PoolFormer') then
+  begin
+    // PoolFormerImageProcessor.resize: the size scaled by 1/crop_pct, then
+    // the usual crop_size center crop (class defaults 0.9 and 224x224).
+    if CropPct <= 0 then CropPct := 0.9;
+    if not HasCropSize then
+    begin
+      Resize.CropHeight := 224;
+      Resize.CropWidth := 224;
+      HasCropSize := true;
+    end;
+    if (not Resize.KeepsAspect) and
+      (Resize.ResizeHeight = Resize.ResizeWidth) then
+    begin
+      Resize.KeepsAspect := true;
+      Resize.ShortestEdge := Resize.ResizeHeight;
+    end;
+    if Resize.KeepsAspect then
+      Resize.ShortestEdge := Trunc(Resize.ShortestEdge / CropPct)
+    else
+    begin
+      Resize.ResizeHeight := Trunc(Resize.ResizeHeight / CropPct);
+      Resize.ResizeWidth := Trunc(Resize.ResizeWidth / CropPct);
+    end;
+  end;
+  // HF crops only when do_center_crop; ViT/SigLIP have no crop_size at all.
+  if (not Resize.KeepsAspect) and
+    ((not HasCropSize) or (not Resize.DoCenterCrop)) then
+  begin
+    Resize.CropHeight := Resize.ResizeHeight;
+    Resize.CropWidth := Resize.ResizeWidth;
   end;
 end;
 

@@ -260,11 +260,8 @@ procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
 procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
   const Config: TNNetImagePreprocess); overload;
 
-// Reads the standard inference transform straight into a TNNetImagePreprocess
-// from a HuggingFace preprocessor_config.json. Handles size as an int, as
-// {"shortest_edge":N} or as {"height":..,"width":..}, and crop_size as an int
-// or {"height":..,"width":..}. Defaults follow CLIPImageProcessor (shortest
-// edge / crop 224, the OpenAI image_mean/image_std) when a field is absent.
+// Reads a HuggingFace preprocessor_config.json into a TNNetImagePreprocess;
+// size/crop_size/crop_pct per image_processor_type (ResolveHFImageResize).
 function ReadImagePreprocessConfig(
   const FileName: string): TNNetImagePreprocess;
 
@@ -3760,6 +3757,19 @@ begin
   end;
 end;
 
+// Copies a resolved THFImageResize into the TNNetImagePreprocess size fields.
+procedure SetPreprocessResize(var Config: TNNetImagePreprocess;
+  const Resize: THFImageResize);
+begin
+  Config.ResizeShorterSide := Resize.ShortestEdge;
+  Config.ResizeKeepsAspect := Resize.KeepsAspect;
+  Config.ResizeHeight := Resize.ResizeHeight;
+  Config.ResizeWidth := Resize.ResizeWidth;
+  Config.CropSize := Resize.CropHeight;
+  Config.CropHeight := Resize.CropHeight;
+  Config.CropWidth := Resize.CropWidth;
+end;
+
 {$IFDEF FPC}
 function ReadImagePreprocessConfig(
   const FileName: string): TNNetImagePreprocess;
@@ -3767,6 +3777,9 @@ var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
+  CropPctData: TJSONData;
+  CropPct: double;
+  Resize: THFImageResize;
 
   // Reads a size-like field that may be an int (square) or an object with
   // shortest_edge / height / width. Returns the resolved edge length.
@@ -3853,19 +3866,22 @@ begin
         FileName + '" is not a JSON object.');
     Obj := TJSONObject(Root);
 
-    Result.ResizeShorterSide := ReadEdge('size', 224);
-    Result.ResizeKeepsAspect := not ReadHeightWidth('size',
-      Result.ResizeShorterSide, Result.ResizeHeight, Result.ResizeWidth);
-    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
-    ReadHeightWidth('crop_size', Result.CropSize, Result.CropHeight,
-      Result.CropWidth);
-    // HF crops only when do_center_crop; ViT/SigLIP have no crop_size at all.
-    if (not Result.ResizeKeepsAspect) and ((Obj.Find('crop_size') = nil) or
-      not Obj.Get('do_center_crop', true)) then
-    begin
-      Result.CropHeight := Result.ResizeHeight;
-      Result.CropWidth := Result.ResizeWidth;
-    end;
+    Resize.ShortestEdge := ReadEdge('size', 224);
+    Resize.KeepsAspect := not ReadHeightWidth('size', Resize.ShortestEdge,
+      Resize.ResizeHeight, Resize.ResizeWidth);
+    ReadHeightWidth('crop_size', ReadEdge('crop_size', Resize.ShortestEdge),
+      Resize.CropHeight, Resize.CropWidth);
+    Resize.DoCenterCrop := Obj.Get('do_center_crop', true);
+    CropPctData := Obj.Find('crop_pct');
+    if (CropPctData <> nil) and (CropPctData.JSONType = jtNumber) then
+      CropPct := CropPctData.AsFloat
+    else
+      CropPct := 0;
+    ResolveHFImageResize(Obj.Get('image_processor_type',
+      Obj.Get('feature_extractor_type', '')),
+      (Obj.Find('size') <> nil) and (Obj.Find('size').JSONType = jtNumber),
+      Obj.Find('crop_size') <> nil, CropPct, Resize);
+    SetPreprocessResize(Result, Resize);
     Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
@@ -3884,6 +3900,9 @@ var
   JsonText: TStringList;
   Root: TJSONValue;
   Obj: TJSONObject;
+  CropPct: double;
+  ProcessorType: string;
+  Resize: THFImageResize;
 
   // Reads a size-like field that may be an int (square) or an object with
   // shortest_edge / height / width. Returns the resolved edge length.
@@ -3971,19 +3990,24 @@ begin
         FileName + '" is not a JSON object.');
     Obj := Root as TJSONObject;
 
-    Result.ResizeShorterSide := ReadEdge('size', 224);
-    Result.ResizeKeepsAspect := not ReadHeightWidth('size',
-      Result.ResizeShorterSide, Result.ResizeHeight, Result.ResizeWidth);
-    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
-    ReadHeightWidth('crop_size', Result.CropSize, Result.CropHeight,
-      Result.CropWidth);
-    // HF crops only when do_center_crop; ViT/SigLIP have no crop_size at all.
-    if (not Result.ResizeKeepsAspect) and ((Obj.FindValue('crop_size') = nil) or
-      (Obj.FindValue('do_center_crop') is TJSONFalse)) then
-    begin
-      Result.CropHeight := Result.ResizeHeight;
-      Result.CropWidth := Result.ResizeWidth;
-    end;
+    Resize.ShortestEdge := ReadEdge('size', 224);
+    Resize.KeepsAspect := not ReadHeightWidth('size', Resize.ShortestEdge,
+      Resize.ResizeHeight, Resize.ResizeWidth);
+    ReadHeightWidth('crop_size', ReadEdge('crop_size', Resize.ShortestEdge),
+      Resize.CropHeight, Resize.CropWidth);
+    Resize.DoCenterCrop := not (Obj.FindValue('do_center_crop') is TJSONFalse);
+    if Obj.FindValue('crop_pct') is TJSONNumber then
+      CropPct := (Obj.FindValue('crop_pct') as TJSONNumber).AsDouble
+    else
+      CropPct := 0;
+    if not Obj.TryGetValue<string>('image_processor_type', ProcessorType) then
+      if not Obj.TryGetValue<string>('feature_extractor_type',
+        ProcessorType) then
+        ProcessorType := '';
+    ResolveHFImageResize(ProcessorType,
+      Obj.FindValue('size') is TJSONNumber,
+      Obj.FindValue('crop_size') <> nil, CropPct, Resize);
+    SetPreprocessResize(Result, Resize);
     Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
