@@ -1945,62 +1945,19 @@ rather than acted on.
       - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
             approval for a new Python tool.
 - [ ] Perturbed-Attention Guidance (PAG, Ahn et al. 2024, arXiv:2403.17377) and
-      Skip Layer Guidance (SLG) in the Qwen-Image pipeline. The building
-      blocks exist: `TNNetPerturbedGuidance` in neural/neuraldiffusion.pas
-      (the three-way mix of diffusers `PerturbedAttentionGuidance` /
-      `SkipLayerGuidance.forward`, both windows, `guidance_rescale` through
-      `TNNetDiffusionScheduler.RescaleGuidance`, `SetPerturbedLayers` /
-      `PerturbsLayer`, `Mode` = `pgmAttentionScores` (PAG) or `pgmSkipBlock`
-      (SLG)) and the runtime switch `TNNetFusedSDPA.SkipAttentionScores`
-      (each row outputs its own V row; host copy, or one `cai_gather_copy`
-      on the SDPA queue in OpenCL memory). Open:
-      - `TQwenImage21Pipeline`: `--pag-scale W`, `--pag-layers i,j,...`,
-        `--pag-start`/`--pag-stop`, `--slg` (sets `Mode := pgmSkipBlock`),
-        `/pag` in the REPL. Per step: `IsCFGEnabled(Step, N)` /
-        `IsPerturbedEnabled(Step, N)` decide which of the uncond and skip
-        passes run (Step = loop index from 0, N = step count), then
-        `Apply(Step, N, Cond, Uncond, Skip, Dst)`; Uncond/Skip may be nil
-        when their pass is off. Defaults 0.01..0.2 mean steps 2..19 of 100
-        (diffusers' perturbed window is strict on BOTH ends, the CFG window
-        only on the stop) and only step 1 of 10.
-      - PAG wiring: `TQwenImage21Transformer.RunStepBlocks` re-links ONE
-        reusable step block per block index, so set
-        `FStepBlock.Attn.SkipAttentionScores := Guider.PerturbsLayer(BlockCnt)`
-        before each block's `ComputeFromLayerOutput` and clear it after the
-        pass. Query row i's own V row is cache row Prefix + i, which is the
-        row the identity step reads from its input (exact, also with the
-        int8 KV cache); the step still appends its rows, and `LoadStepPrefix`
-        rewinds the cache per block anyway.
-      - SLG wiring needs nothing at layer level: diffusers' default
-        `LayerSkipConfig` (skip_attention and skip_ff) skips the whole block
-        (`TransformerBlockSkipHook` returns the inputs). In `RunStepBlocks`
-        just do not run block b; the next block must then read the output
-        of the last block that DID run, and block 0's skip means reading
-        `FImageInNet.GetLastLayer()` (StepNet's last layer would hold the
-        previous pass's output); `FinishVelocityStep` reads
-        `FStepNet.GetLastLayer()` too, so it needs the same source.
-      - The perturbed pass must not touch the First-Block Cache (pass
-        `Cache = nil` to `PredictVelocity`, or its own cache) nor the cond
-        pass's `TQwenImage21PrefixCache` (it only reads it).
-      - Oracle: diffusers 0.41.0.dev0 cannot run either guider on
-        QwenImage21. `QwenImage21TransformerBlock` and
-        `QwenImage21Attention`'s processor are not in
-        `TransformerBlockRegistry` / `AttentionProcessorRegistry`
-        (hooks/_helpers.py, `get` raises ValueError), and on the cached
-        steps `AttentionScoreSkipFunctionMode` only intercepts
-        `F.scaled_dot_product_attention` with Q length = V length (here
-        image rows vs prefix + image rows), so PAG would be a silent no-op.
-        A pico parity test against diffusers therefore needs a patched
-        registry and a Prefix + i rule written in Python; ask the user
-        before adding any Python tool. The pipeline test that needs no
-        oracle: PAG scale 0 must match the unguided image bit for bit
-        (`Apply` with the perturbed pass off is exactly
-        `ApplyCFG(Cond, Uncond, Dst, W, Rescale)`, or `Dst := Cond`).
-      - README of examples/QwenImage: the flags, the extra cost (one more
-        transformer pass on the steps inside the window, about 20% at the
-        defaults), and a with/without image pair from the user's GPU box.
-      Later consumers: the SD UNet path (examples/LatentTextToImage, diffusers
-      `StableDiffusionPAGPipeline` on mid-block self-attention) and CogVideoX.
+      Skip Layer Guidance (SLG) follow-ups. The Qwen-Image pipeline runs both
+      (`TQwenImage21Pipeline.PerturbedGuidance`, `--pag-scale` / `--slg` in
+      examples/QwenImage). Open:
+      - [ ] A with/without image pair and the measured denoise cost at the
+            defaults (2 of 18 steps run the extra pass) from the user's GPU
+            box, for examples/QwenImage/README.md; the default blocks (PAG 16,
+            SLG 6,7,8) are untuned on the real checkpoint.
+      - [ ] Later consumers: the SD UNet path (examples/LatentTextToImage,
+            diffusers `StableDiffusionPAGPipeline` on mid-block self-attention)
+            and CogVideoX.
+      A diffusers oracle needs a patched block / processor registry and a
+      Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
+      either guider on QwenImage21); ask the user before adding a Python tool.
 
 ## OpenCL forward coverage — layers still on the host
 

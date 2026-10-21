@@ -27,7 +27,8 @@ PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
 /padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
 /upscale FILE|off, /fbc X|off, /panorama WxH|off, /negative-prompt
-TEXT|off, /guidance-scale W, /profile on|off, /stats on|off, /quit.
+TEXT|off, /guidance-scale W, /pag W|off, /profile on|off, /stats on|off,
+/quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -88,6 +89,14 @@ QwenImage21Pipeline true_cfg_scale; Qwen-Image-2.1 is meant to run without).
 --apg ETA,MOMENTUM,THRESHOLD mixes them with Adaptive Projected Guidance on
 the denoised x0 instead; --apg-velocity applies it to the raw velocities.
 
+Perturbed-Attention Guidance (--pag-scale W, or /pag W): on the steps inside
+the --pag-start..--pag-stop window (fractions of the steps run, strict at
+both ends, default 0.01..0.2) one more transformer pass runs on the prompt
+with the --pag-layers blocks' attention scores replaced by the identity, and
+the velocity moves away from it by W (diffusers PerturbedAttentionGuidance).
+--slg skips those blocks instead (Skip Layer Guidance). It adds to CFG, not
+to --apg.
+
 First-Block Cache (--fbc-threshold X or /fbc X): each step runs transformer
 block 0 and compares its residual with the one of the last fully computed
 step; when the relative change is at most X it skips the other blocks and
@@ -117,6 +126,8 @@ USAGE
             [--fbc-threshold X]
             [--negative-prompt TEXT --guidance-scale W
              [--apg ETA,MOMENTUM,THRESHOLD [--apg-velocity]]]
+            [--pag-scale W [--pag-layers I,J,...] [--pag-start F]
+             [--pag-stop F] [--slg]]
             [--panorama WxH [--panorama-stride N] [--panorama-wrap]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -154,6 +165,13 @@ const
   // --upscale-tile when not given: RRDBNet input pixels per tile side.
   csDefaultUpscaleTile = 32;
   csBytesPerMB = 1024.0 * 1024.0;
+  // PAG / SLG when only some of the --pag-* flags are given: diffusers'
+  // guider defaults, and blocks of the 32-block transformer (README.md).
+  csDefaultPagScale = 2.8;
+  csDefaultPagStart = 0.01;
+  csDefaultPagStop = 0.2;
+  csDefaultPagLayers: array[0..0] of integer = (16);
+  csDefaultSlgLayers: array[0..2] of integer = (6, 7, 8);
 
 type
   // Phase and step timings with the process memory. On a terminal each step
@@ -379,6 +397,9 @@ begin
         else if Stats.SkippedStepCount > 0 then
           Detail := Detail + Format(', %d with blocks 1..N-1 skipped (FBC)',
             [Stats.SkippedStepCount]);
+        if Stats.PerturbedPassCount > 0 then
+          Detail := Detail + Format(', %d perturbed passes (PAG/SLG)',
+            [Stats.PerturbedPassCount]);
       end;
       qppDecode:
       begin
@@ -481,6 +502,24 @@ begin
   end
   else WriteLn(StepText);
   FStepStart := StepEnd;
+end;
+
+function IntegerListText(const Values: array of integer): string;
+var
+  ValuePos: integer;
+begin
+  Result := '';
+  for ValuePos := 0 to High(Values) do
+  begin
+    if ValuePos > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Values[ValuePos]);
+  end;
+end;
+
+function DefaultPagLayersText(IsSkipLayer: boolean): string;
+begin
+  if IsSkipLayer then Result := IntegerListText(csDefaultSlgLayers)
+  else Result := IntegerListText(csDefaultPagLayers);
 end;
 
 procedure PrintHelp();
@@ -607,6 +646,22 @@ begin
     'x0 = x - sigma * v');
   WriteLn('  --apg-velocity       apply --apg to the raw velocities instead ',
     'of x0');
+  WriteLn('  --pag-scale W        Perturbed-Attention Guidance: one more ',
+    'transformer pass per step inside');
+  WriteLn('                       the window, with identity attention in ',
+    '--pag-layers; 0 = off (DEFAULT).');
+  WriteLn('                       --pag-layers, --pag-start, --pag-stop or ',
+    '--slg alone use W = ', csDefaultPagScale:0:1, ' (diffusers)');
+  WriteLn('  --pag-layers I,J,... the perturbed transformer blocks (from 0; ',
+    'default ', DefaultPagLayersText(false), ',');
+  WriteLn('                       with --slg ', DefaultPagLayersText(true),
+    '; see README.md)');
+  WriteLn('  --pag-start F        perturbed window start, a fraction of the ',
+    'steps (default ', csDefaultPagStart:0:2, ')');
+  WriteLn('  --pag-stop F         perturbed window stop (default ',
+    csDefaultPagStop:0:2, '); both ends are strict, as diffusers');
+  WriteLn('  --slg                Skip Layer Guidance: skip the --pag-layers ',
+    'blocks in that pass instead');
   WriteLn('  --panorama WxH       MultiDiffusion: a WxH canvas (multiples of ',
     '32) denoised in overlapping');
   WriteLn('                       --width x --height windows whose velocities ',
@@ -715,6 +770,8 @@ begin
     '(stride and wrap from the flags)');
   WriteLn('  /negative-prompt TEXT|off  --negative-prompt for the next prompts');
   WriteLn('  /guidance-scale W    --guidance-scale for the next prompts');
+  WriteLn('  /pag W|off           --pag-scale for the next images (layers, ',
+    'window and --slg from the flags)');
   WriteLn('  /profile on|off      --profile for the next images');
   WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
@@ -802,14 +859,14 @@ begin
   else Result := '';
 end;
 
-// Parses a First-Block Cache threshold >= 0 ('off' = 0, a '.' decimal point);
-// returns '' or what is wrong.
-function ParseFbcThreshold(const Text: string; out Threshold: double): string;
+// Parses a number >= 0 or 'off' (= 0) with a '.' decimal point: the
+// First-Block Cache threshold and the PAG scale; returns '' or what is wrong.
+function ParseNumberOrOff(const Text: string; out Value: double): string;
 begin
   Result := '';
-  if LowerCase(Trim(Text)) = 'off' then Threshold := 0
-  else if not TryStrToFloat(Trim(Text), Threshold, PointFormat()) or
-    not (Threshold >= 0) then
+  if LowerCase(Trim(Text)) = 'off' then Value := 0
+  else if not TryStrToFloat(Trim(Text), Value, PointFormat()) or
+    not (Value >= 0) then
     Result := '"' + Text + '" is not a number >= 0 or off.';
 end;
 
@@ -919,7 +976,8 @@ begin
   else Result := Copy(Prompt, 1, MaxLength - 3) + '...';
 end;
 
-function ParseTokenIds(const List: string): TNeuralIntegerArray;
+// Comma-separated integers (token ids, PAG layers); EConvertError otherwise.
+function ParseIntegerList(const List: string): TNeuralIntegerArray;
 var
   Parts: TStringList;
   PartPos: integer;
@@ -995,6 +1053,9 @@ var
   InputImageEncodeNumber: integer;
   Strength: double;
   HasStrengthArg: boolean;
+  // A --pag-* or --slg flag was given, and --pag-scale among them.
+  HasPagArg, HasPagScaleArg: boolean;
+  PagWindowValue: double;
   FbcThreshold: double;
   // --panorama canvas (0: off), --panorama-stride (0: half a window) and
   // --panorama-wrap; the windows are --width x --height.
@@ -1009,6 +1070,11 @@ var
   HasNegativePrompt, ApgOnVelocity: boolean;
   GuidanceScale: double;
   NegativeEmbeds: TNNetVolume;
+  // --pag-scale (0: off), --pag-start, --pag-stop, --pag-layers (nil: the
+  // default of the mode) and --slg (skip the blocks instead).
+  PagScale, PagStart, PagStop: double;
+  PagLayers: TNeuralIntegerArray;
+  IsSkipLayerGuidance: boolean;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -1085,6 +1151,44 @@ var
     if ApgSpec = '' then Result := Result + 'CFG'
     else Result := Result + 'APG ' + ApgSpec + ' on ' +
       BoolToStr(ApgOnVelocity, 'velocity', 'x0');
+  end;
+
+  // --pag-layers, else the default blocks of the --slg / PAG mode.
+  function PagLayersText(): string;
+  begin
+    if Length(PagLayers) > 0 then Result := IntegerListText(PagLayers)
+    else Result := DefaultPagLayersText(IsSkipLayerGuidance);
+  end;
+
+  function PerturbedGuidanceText(): string;
+  begin
+    if PagScale = 0 then exit('off');
+    Result := BoolToStr(IsSkipLayerGuidance, 'SLG', 'PAG') + ' scale ' +
+      FloatToStr(PagScale, PointFormat()) + ' on blocks ' +
+      PagLayersText() + ', steps in (' +
+      FloatToStr(PagStart, PointFormat()) + ', ' +
+      FloatToStr(PagStop, PointFormat()) + ') of the run';
+    if IsGuided() and (ApgSpec <> '') then
+      Result := Result + ' (refused with --apg while guided)';
+  end;
+
+  // Hands the PAG / SLG settings to the pipeline (nil when off).
+  procedure ApplyPerturbedGuidance();
+  var
+    Guider: TNNetPerturbedGuidance;
+  begin
+    if PagScale = 0 then
+    begin
+      Pipeline.PerturbedGuidance := nil;
+      exit;
+    end;
+    Guider := TNNetPerturbedGuidance.Create(1, PagScale, PagStart, PagStop);
+    if IsSkipLayerGuidance then Guider.Mode := pgmSkipBlock;
+    if Length(PagLayers) > 0 then Guider.SetPerturbedLayers(PagLayers)
+    else if IsSkipLayerGuidance then
+      Guider.SetPerturbedLayers(csDefaultSlgLayers)
+    else Guider.SetPerturbedLayers(csDefaultPagLayers);
+    Pipeline.PerturbedGuidance := Guider;
   end;
 
   // A panorama canvas is set and no init or condition image overrides it.
@@ -1872,7 +1976,7 @@ var
 
   // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image, /mask,
   // /mask-blur, /outpaint, /strength, /upscale, /fbc, /panorama,
-  // /negative-prompt, /guidance-scale, /profile, /stats, /quit;
+  // /negative-prompt, /guidance-scale, /pag, /profile, /stats, /quit;
   // false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
@@ -1880,7 +1984,8 @@ var
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
-    NewStrength, NewMaskBlurRadius, NewFbcThreshold, NewGuidanceScale: double;
+    NewStrength, NewMaskBlurRadius, NewFbcThreshold, NewGuidanceScale,
+      NewPagScale: double;
     NewPaddingMaskCrop: integer;
     NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
@@ -2242,7 +2347,7 @@ var
           '; /fbc X|off changes it]')
       else
       begin
-        Problem := ParseFbcThreshold(Argument, NewFbcThreshold);
+        Problem := ParseNumberOrOff(Argument, NewFbcThreshold);
         if Problem <> '' then WriteLn('[/fbc: ', Problem, ']')
         else
         begin
@@ -2276,6 +2381,24 @@ var
         WriteLn('[guidance ', GuidanceText(), ' from the next prompt]');
       end;
     end
+    else if Command = 'pag' then
+    begin
+      if Argument = '' then
+        WriteLn('[perturbed guidance ', PerturbedGuidanceText(),
+          '; /pag W|off changes it]')
+      else
+      begin
+        Problem := ParseNumberOrOff(Argument, NewPagScale);
+        if Problem <> '' then WriteLn('[/pag: ', Problem, ']')
+        else
+        begin
+          PagScale := NewPagScale;
+          ApplyPerturbedGuidance();
+          WriteLn('[perturbed guidance ', PerturbedGuidanceText(),
+            ' from the next image]');
+        end;
+      end;
+    end
     else if Command = 'profile' then
     begin
       if ParseOnOff(Command, Argument, IsOn) then
@@ -2295,7 +2418,7 @@ var
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
       '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
       '/outpaint, /strength, /upscale, /fbc, /panorama, /negative-prompt, ',
-      '/guidance-scale, /profile, /stats, /quit]');
+      '/guidance-scale, /pag, /profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -2311,7 +2434,7 @@ var
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
       '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, ',
       '/upscale FILE|off, /fbc X|off, /negative-prompt TEXT|off, ',
-      '/guidance-scale W, /profile on|off, /stats on|off, /quit.');
+      '/guidance-scale W, /pag W|off, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -2396,6 +2519,13 @@ begin
   GuidanceScale := 1;
   ApgSpec := '';
   ApgOnVelocity := false;
+  PagScale := 0;
+  PagStart := csDefaultPagStart;
+  PagStop := csDefaultPagStop;
+  PagLayers := nil;
+  IsSkipLayerGuidance := false;
+  HasPagArg := false;
+  HasPagScaleArg := false;
   MaxThreads := 0;
   Upscaler := nil;
   UpscaleFile := '';
@@ -2501,7 +2631,7 @@ begin
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
     else if Arg = '--fbc-threshold' then
     begin
-      ArgProblem := ParseFbcThreshold(NextArg(), FbcThreshold);
+      ArgProblem := ParseNumberOrOff(NextArg(), FbcThreshold);
       if ArgProblem <> '' then
       begin
         WriteLn('--fbc-threshold: ', ArgProblem);
@@ -2566,6 +2696,45 @@ begin
       end;
     end
     else if Arg = '--apg-velocity' then ApgOnVelocity := true
+    else if Arg = '--pag-scale' then
+    begin
+      ArgProblem := ParseNumberOrOff(NextArg(), PagScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--pag-scale: ', ArgProblem);
+        Halt(2);
+      end;
+      HasPagScaleArg := true;
+    end
+    else if Arg = '--pag-layers' then
+    begin
+      try
+        PagLayers := ParseIntegerList(NextArg());
+      except
+        on E: EConvertError do
+        begin
+          WriteLn('--pag-layers: ', E.Message);
+          Halt(2);
+        end;
+      end;
+      HasPagArg := true;
+    end
+    else if (Arg = '--pag-start') or (Arg = '--pag-stop') then
+    begin
+      if not TryStrToFloat(Trim(NextArg()), PagWindowValue, PointFormat()) then
+      begin
+        WriteLn(Arg, ': "', ParamStr(ArgPos), '" is not a number.');
+        Halt(2);
+      end;
+      if Arg = '--pag-start' then PagStart := PagWindowValue
+      else PagStop := PagWindowValue;
+      HasPagArg := true;
+    end
+    else if Arg = '--slg' then
+    begin
+      IsSkipLayerGuidance := true;
+      HasPagArg := true;
+    end
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -2702,6 +2871,22 @@ begin
       WriteLn('[--upscale-tile has no effect without --upscale]')
     else WriteLn('[--upscale-tile applies once /upscale sets an upscaler]');
   end;
+  if HasPagArg and not HasPagScaleArg then PagScale := csDefaultPagScale;
+  try
+    TNNetPerturbedGuidance.Create(1, PagScale, PagStart, PagStop).Free;
+  except
+    on E: EArgumentException do
+    begin
+      WriteLn('--pag-start / --pag-stop: ', E.Message);
+      Halt(2);
+    end;
+  end;
+  if (PagScale <> 0) and IsGuided() and (ApgSpec <> '') then
+  begin
+    WriteLn('--pag-scale: perturbed guidance mixes with CFG, not with --apg; ',
+      'drop one of the two.');
+    Halt(2);
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
@@ -2745,6 +2930,7 @@ begin
       Pipeline.AdaptiveProjectedGuidance :=
         TNNetAdaptiveProjectedGuidance.CreateFromSpec(ApgSpec);
     Pipeline.ApgOnVelocity := ApgOnVelocity;
+    ApplyPerturbedGuidance();
     if FbcThreshold > 0 then WriteLn('[', FbcThresholdText(FbcThreshold), ']');
     SetProfile(UseProfile);
     SetStats(UseStats);
@@ -2841,6 +3027,8 @@ begin
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
     if Assigned(Upscaler) then WriteLn('Upscale    : ', UpscalerText());
     WriteLn('Guidance   : ', GuidanceText());
+    if PagScale <> 0 then
+      WriteLn('Perturbed  : ', PerturbedGuidanceText());
     for LoRAPos := 0 to LoRAFiles.Count - 1 do
       WriteLn('LoRA       : ', LoRAFiles[LoRAPos], ' x ',
         FloatToStr(LoRAScales[LoRAPos], PointFormat()));
@@ -2854,7 +3042,7 @@ begin
     begin
       if TokenList <> '' then
       begin
-        TokenIds := ParseTokenIds(TokenList);
+        TokenIds := ParseIntegerList(TokenList);
         WriteLn('Prompt     : ', Length(TokenIds), ' token ids, drop ',
           DropCount);
       end

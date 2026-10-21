@@ -9485,6 +9485,9 @@ type
     FPrefixImageInNet: TNNet;
     FConditionLatents, FPrefixInput: TNNetVolume;
     FStepGridH, FStepGridW: integer;
+    // The layer the next step block (and FinishVelocityStep) reads: img_in's
+    // output until a block runs, then StepNet's last layer.
+    FStepSourceLayer: TNNetLayer;
     FParallel: boolean;
     FMaxThreads: integer;
     // LayerProfiling: wall time of the last EncodePrefix and of every
@@ -9564,10 +9567,20 @@ type
     procedure BeginVelocityStep(Latents: TNNetVolume; Timestep: TNeuralFloat;
       GridH, GridW: integer);
     // Blocks FirstBlockIdx..MaxBlockIdx on StepNet; block 0 reads img_in's
-    // output, block b > 0 StepNet's last output (block b - 1's).
-    procedure RunStepBlocks(FirstBlockIdx, MaxBlockIdx: integer);
-    // norm_out + proj_out over StepNet's last output into Velocity.
+    // output, block b > 0 the output of the last block that ran.
+    procedure RunStepBlocks(FirstBlockIdx, MaxBlockIdx: integer); overload;
+    // The same with Perturbation's PerturbedLayers perturbed per its Mode:
+    // identity attention scores (PAG) or the block not run at all (SLG).
+    procedure RunStepBlocks(FirstBlockIdx, MaxBlockIdx: integer;
+      Perturbation: TNNetPerturbedGuidance); overload;
+    // norm_out + proj_out over the last block's output (img_in's when no
+    // block ran) into Velocity.
     procedure FinishVelocityStep(Velocity: TNNetVolume);
+    // PredictVelocity's perturbed pass of PAG / SLG: every block, the
+    // First-Block Cache neither read nor updated, the prefix cache read only.
+    procedure PredictPerturbedVelocity(Latents: TNNetVolume;
+      Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume;
+      Perturbation: TNNetPerturbedGuidance);
     // Runs the timestep net: TimestepEmbedding and Modulation (the raw
     // [scale1|gate1|scale2|gate2] row) then hold Timestep's values.
     procedure ComputeModulation(Timestep: TNeuralFloat);
@@ -9926,6 +9939,9 @@ type
     SkippedStepCount: integer;
     // The steps ran both prompts (GuidanceScale > 1 with a negative prompt).
     UsedGuidance: boolean;
+    // Perturbed (PAG / SLG) transformer passes run: one per step inside the
+    // perturbed window, per panorama window.
+    PerturbedPassCount: integer;
     // MultiDiffusion windows each step ran (0: one pass over the image).
     PanoramaWindowCount: integer;
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
@@ -9991,6 +10007,12 @@ type
     FNegativeVelocity: TNNetVolume;
     FNegativeCaches: array of TDiTFirstBlockCache;
     FGuidanceApgs: array of TNNetAdaptiveProjectedGuidance;
+    // PAG / SLG settings (nil: off); while a Denoise runs it, FIsPerturbed,
+    // the perturbed prediction and the guider's step index and step count.
+    FPerturbedGuidance: TNNetPerturbedGuidance;
+    FIsPerturbed: boolean;
+    FPerturbedVelocity: TNNetVolume;
+    FGuidanceStep, FGuidanceStepCount: integer;
     // The phase DoPhase started last (qppDone: none open), when, and the
     // process transfer totals then.
     FOpenPhase: TQwenImage21PipelinePhase;
@@ -10072,7 +10094,8 @@ type
     procedure PredictPanoramaWindow(WindowIdx: integer;
       WindowInput, WindowOutput: TNNetVolume);
     // Velocity from the prompt's prefix cache; while guided, mixed with the
-    // negative prompt's prediction by window GuidanceIdx's APG or plain CFG.
+    // negative prompt's prediction by window GuidanceIdx's APG or plain CFG,
+    // and with the perturbed prediction by PerturbedGuidance.
     procedure PredictGuidedVelocity(Transformer: TQwenImage21Transformer;
       Latents: TNNetVolume; Sigma: TNeuralFloat; GridH, GridW: integer;
       Velocity: TNNetVolume; Cache: TDiTFirstBlockCache;
@@ -10081,6 +10104,7 @@ type
     procedure FreeGuidanceState();
     procedure SetAdaptiveProjectedGuidance(
       Value: TNNetAdaptiveProjectedGuidance);
+    procedure SetPerturbedGuidance(Value: TNNetPerturbedGuidance);
     function GetHasNegativePrompt(): boolean;
     // Plans FPanoramaWindows over a Width x Height image (nil when off).
     procedure PlanPanorama(Width, Height: integer);
@@ -10260,6 +10284,15 @@ type
     // APG mixes the denoised x0 = x - sigma * v of both branches (default
     // false, the paper's space) or, when true, the raw velocities.
     property ApgOnVelocity: boolean read FApgOnVelocity write FApgOnVelocity;
+    // nil (default): off. Otherwise Perturbed-Attention Guidance (Mode
+    // pgmAttentionScores) or Skip Layer Guidance (pgmSkipBlock) with these
+    // settings, one more transformer pass per step inside its perturbed window
+    // (Step and step count of the steps Denoise runs, as diffusers' guider).
+    // Denoise overwrites its GuidanceScale: GuidanceScale while guided by a
+    // negative prompt, else the no-op scale. Not with APG while guided. The
+    // pipeline owns and frees the object.
+    property PerturbedGuidance: TNNetPerturbedGuidance
+      read FPerturbedGuidance write SetPerturbedGuidance;
     // MultiDiffusion: both > 0 run each Denoise step on overlapping windows
     // of this many pixels (multiples of 16, clamped to the image). 0 = off.
     property PanoramaWindowWidth: integer read FPanoramaWindowWidth
@@ -91372,6 +91405,7 @@ begin
   FreeAndNil(FStepNet);
   FreeAndNil(FImageInNet);
   FreeAndNil(FOutputNet);
+  FStepSourceLayer := nil;
   FStepGridH := 0;
   FStepGridW := 0;
   FStepPrefixCapacity := 0;
@@ -91833,29 +91867,48 @@ begin
   FStepNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FOutputNet.Layers[1].Output.Copy(FNormOutScaleLayer.Output);
   FImageInNet.Compute(Latents);
+  FStepSourceLayer := FImageInNet.GetLastLayer();
 end;
 
 procedure TQwenImage21Transformer.RunStepBlocks(FirstBlockIdx,
   MaxBlockIdx: integer);
+begin
+  RunStepBlocks(FirstBlockIdx, MaxBlockIdx, nil);
+end;
+
+procedure TQwenImage21Transformer.RunStepBlocks(FirstBlockIdx,
+  MaxBlockIdx: integer; Perturbation: TNNetPerturbedGuidance);
 var
   BlockCnt: integer;
+  HasPerturbation, IsPerturbed, SkipsBlocks: boolean;
 begin
-  for BlockCnt := FirstBlockIdx to MaxBlockIdx do
-  begin
-    SelectBlockWeights(FStepNet, BlockCnt);
-    LoadStepPrefix(BlockCnt);
-    // The prefix K/V copy is enqueued outside StepNet.Compute: under
-    // profiling it is drained here, in the time outside the nets.
-    {$IFDEF OpenCL}
-    if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
-    {$ENDIF}
-    // img_in feeds block 0 and block b feeds block b + 1 inside OpenCL memory
-    // when the source is there (KeepLastOutputOnOpenCL).
-    if BlockCnt = 0
-      then FStepNet.ComputeFromLayerOutput(FImageInNet.GetLastLayer(), 0,
-        FParallel)
-      else FStepNet.ComputeFromLayerOutput(FStepNet.GetLastLayer(), 0,
-        FParallel);
+  HasPerturbation := Assigned(Perturbation);
+  SkipsBlocks := HasPerturbation and (Perturbation.Mode = pgmSkipBlock);
+  try
+    for BlockCnt := FirstBlockIdx to MaxBlockIdx do
+    begin
+      if HasPerturbation then
+      begin
+        IsPerturbed := Perturbation.PerturbsLayer(BlockCnt);
+        // SLG: the next block or the output net reads the last block run.
+        if IsPerturbed and SkipsBlocks then continue;
+        FStepBlock.Attn.SkipAttentionScores := IsPerturbed;
+      end;
+      SelectBlockWeights(FStepNet, BlockCnt);
+      LoadStepPrefix(BlockCnt);
+      // The prefix K/V copy is enqueued outside StepNet.Compute: under
+      // profiling it is drained here, in the time outside the nets.
+      {$IFDEF OpenCL}
+      if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
+      {$ENDIF}
+      // img_in feeds block 0 and each block the next one run, inside OpenCL
+      // memory when the source is there (KeepLastOutputOnOpenCL).
+      if BlockCnt = 0 then FStepSourceLayer := FImageInNet.GetLastLayer();
+      FStepNet.ComputeFromLayerOutput(FStepSourceLayer, 0, FParallel);
+      FStepSourceLayer := FStepNet.GetLastLayer();
+    end;
+  finally
+    if HasPerturbation then FStepBlock.Attn.SkipAttentionScores := false;
   end;
 end;
 
@@ -91864,7 +91917,7 @@ var
   StepCnt: integer;
 begin
   // The output net's forward downloads only its last layer, the velocity.
-  FOutputNet.ComputeFromLayerOutput(FStepNet.GetLastLayer());
+  FOutputNet.ComputeFromLayerOutput(FStepSourceLayer);
   Velocity.Copy(FOutputNet.GetLastLayer().Output);
   if FLayerProfiling then
   begin
@@ -91912,6 +91965,15 @@ begin
     end;
   end
   else RunStepBlocks(0, MaxBlockPos);
+  FinishVelocityStep(Velocity);
+end;
+
+procedure TQwenImage21Transformer.PredictPerturbedVelocity(
+  Latents: TNNetVolume; Timestep: TNeuralFloat; GridH, GridW: integer;
+  Velocity: TNNetVolume; Perturbation: TNNetPerturbedGuidance);
+begin
+  BeginVelocityStep(Latents, Timestep, GridH, GridW);
+  RunStepBlocks(0, FConfig.NumLayers - 1, Perturbation);
   FinishVelocityStep(Velocity);
 end;
 
@@ -92348,6 +92410,7 @@ begin
   FPanoramaWindows.Free;
   FNegativePromptEmbeds.Free;
   FAdaptiveProjectedGuidance.Free;
+  FPerturbedGuidance.Free;
   inherited Destroy();
 end;
 
@@ -92385,6 +92448,14 @@ begin
   if Value = FAdaptiveProjectedGuidance then exit;
   FAdaptiveProjectedGuidance.Free;
   FAdaptiveProjectedGuidance := Value;
+end;
+
+procedure TQwenImage21Pipeline.SetPerturbedGuidance(
+  Value: TNNetPerturbedGuidance);
+begin
+  if Value = FPerturbedGuidance then exit;
+  FPerturbedGuidance.Free;
+  FPerturbedGuidance := Value;
 end;
 
 function TQwenImage21Pipeline.GetComponentsLoaded(): boolean;
@@ -92802,7 +92873,7 @@ var
   Transformer: TQwenImage21Transformer;
   Velocity, Noise, Known: TNNetVolume;
   GridH, GridW, StepPos, MaxStepPos, RunStepCount, WindowPos, MaxWindowPos,
-    ShiftSeqLen, GuidanceCount: integer;
+    ShiftSeqLen, GuidanceCount, LayerPos, MaxLayerPos: integer;
   IsInpaint: boolean;
 
   procedure EncodeBranchPrefix(Embeds: TNNetVolume;
@@ -92816,6 +92887,27 @@ var
 begin
   CheckImageSize(Width, Height);
   FIsGuided := (FGuidanceScale > 1) and Assigned(FNegativePromptEmbeds);
+  FIsPerturbed := Assigned(FPerturbedGuidance) and
+    (FPerturbedGuidance.PerturbedScale <> 0);
+  // diffusers' PAG and SLG guiders mix their perturbed pass into CFG only.
+  if FIsPerturbed and FIsGuided and Assigned(FAdaptiveProjectedGuidance) then
+    ImportError('TQwenImage21Pipeline.Denoise: perturbed guidance (PAG / ' +
+      'SLG) mixes with CFG, not with APG; drop one of the two.');
+  if FIsPerturbed then
+  begin
+    MaxLayerPos := High(FPerturbedGuidance.PerturbedLayers);
+    if MaxLayerPos < 0 then
+      ImportError('TQwenImage21Pipeline.Denoise: perturbed guidance needs ' +
+        'at least one perturbed layer (SetPerturbedLayers).');
+    for LayerPos := 0 to MaxLayerPos do
+      if (FPerturbedGuidance.PerturbedLayers[LayerPos] < 0) or
+         (FPerturbedGuidance.PerturbedLayers[LayerPos] >=
+          FTransformerConfig.NumLayers) then
+        ImportError('TQwenImage21Pipeline.Denoise: perturbed layer ' +
+          IntToStr(FPerturbedGuidance.PerturbedLayers[LayerPos]) +
+          ' is outside the transformer''s blocks 0..' +
+          IntToStr(FTransformerConfig.NumLayers - 1) + '.');
+  end;
   if FIsGuided and (Length(FNegativeTextLengths) <> Length(TextLengths)) then
     ImportError('TQwenImage21Pipeline.Denoise: the negative prompt has ' +
       IntToStr(Length(FNegativeTextLengths)) + ' text runs and the prompt ' +
@@ -92924,6 +93016,17 @@ begin
             FAdaptiveProjectedGuidance.UseOriginalFormulation);
       end;
     end;
+    FImageStats.PerturbedPassCount := 0;
+    if FIsPerturbed then
+    begin
+      // GuidanceScale > 1 needs a negative prompt; without one CFG is off.
+      if FIsGuided then FPerturbedGuidance.GuidanceScale := FGuidanceScale
+      else if FPerturbedGuidance.UseOriginalFormulation then
+        FPerturbedGuidance.GuidanceScale := 0
+      else FPerturbedGuidance.GuidanceScale := 1;
+      FPerturbedVelocity := TNNetVolume.Create();
+      FGuidanceStepCount := RunStepCount;
+    end;
     DoPhase(qppEncodePrefix);
     if FIsGuided then
     begin
@@ -92936,6 +93039,7 @@ begin
     MaxStepPos := StepCount - 1;
     for StepPos := StartStep to MaxStepPos do
     begin
+      FGuidanceStep := StepPos - StartStep;
       // The pipeline passes timestep / 1000 = sigma.
       if Assigned(FPanoramaWindows) then
       begin
@@ -93015,7 +93119,9 @@ begin
   FNegativeCaches := nil;
   FGuidanceApgs := nil;
   FreeAndNil(FNegativeVelocity);
+  FreeAndNil(FPerturbedVelocity);
   FIsGuided := false;
+  FIsPerturbed := false;
 end;
 
 procedure TQwenImage21Pipeline.PredictGuidedVelocity(
@@ -93024,8 +93130,35 @@ procedure TQwenImage21Pipeline.PredictGuidedVelocity(
   Cache: TDiTFirstBlockCache; GuidanceIdx: integer);
 var
   Apg: TNNetAdaptiveProjectedGuidance;
+  Uncond, Skip: TNNetVolume;
 begin
   Transformer.PredictVelocity(Latents, Sigma, GridH, GridW, Velocity, Cache);
+  if FIsPerturbed then
+  begin
+    Uncond := nil;
+    Skip := nil;
+    if FIsGuided and FPerturbedGuidance.IsCFGEnabled(FGuidanceStep,
+      FGuidanceStepCount) then
+    begin
+      Transformer.ActivePrefixCache := csQwenImage21NegativePrefixCache;
+      Transformer.PredictVelocity(Latents, Sigma, GridH, GridW,
+        FNegativeVelocity, FNegativeCaches[GuidanceIdx]);
+      Transformer.ActivePrefixCache := 0;
+      Uncond := FNegativeVelocity;
+    end;
+    if FPerturbedGuidance.IsPerturbedEnabled(FGuidanceStep,
+      FGuidanceStepCount) then
+    begin
+      // The cond prompt's prefix cache, without a First-Block Cache.
+      Transformer.PredictPerturbedVelocity(Latents, Sigma, GridH, GridW,
+        FPerturbedVelocity, FPerturbedGuidance);
+      Skip := FPerturbedVelocity;
+      Inc(FImageStats.PerturbedPassCount);
+    end;
+    FPerturbedGuidance.Apply(FGuidanceStep, FGuidanceStepCount, Velocity,
+      Uncond, Skip, Velocity);
+    exit;
+  end;
   if not FIsGuided then exit;
   Transformer.ActivePrefixCache := csQwenImage21NegativePrefixCache;
   Transformer.PredictVelocity(Latents, Sigma, GridH, GridW, FNegativeVelocity,

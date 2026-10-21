@@ -1063,6 +1063,16 @@ type
     // Edit layouts (condition image in the prefix) of different text lengths
     // in two prefix caches: each prediction equals that prompt alone.
     procedure TestQwenImage21GuidanceEditPrefixCaches;
+    // PAG / SLG on the pico pipeline against a plain loop of the guider's
+    // step decisions, hand-run perturbed passes and the hand-written mix:
+    // scale 0 bit for bit, PAG alone and with CFG, SLG of block 0, 1 and both.
+    procedure TestQwenImage21PerturbedGuidanceReference;
+    // A skipping First-Block Cache with PAG on: the cond pass's decisions and
+    // latents equal a loop whose cache sees only the cond passes.
+    procedure TestQwenImage21PerturbedGuidanceFirstBlockCache;
+    // PAG with CFG and SLG of block 0 / of every block on int8 OpenCL: the
+    // CPU's latents within 1e-4.
+    procedure TestQwenImage21PerturbedGuidanceOpenCL;
     // TMultiDiffusionWindows: 2 overlapping windows of a constant stub give
     // the constant at the seams; an identity stub gives the canvas back.
     procedure TestMultiDiffusionConstantSeams;
@@ -36157,6 +36167,442 @@ begin
     Pipeline.Free;
   end;
 end;
+
+// The Denoise loop of a PAG / SLG pipeline without its guidance code: Guider
+// decides the steps and the perturbed blocks, the perturbed pass runs block
+// by block, the mix is uncond + W*(cond - uncond) + S*(cond - skip) by hand
+// (skip as the base without CFG). NegEmbeds <> nil adds CFG at GuidanceScale.
+procedure RunQwenImage21PerturbedReference(Pipeline: TQwenImage21Pipeline;
+  Embeds, NegEmbeds: TNNetVolume; GuidanceScale: TNeuralFloat;
+  Guider: TNNetPerturbedGuidance; CondCache: TDiTFirstBlockCache;
+  Side, StepCount: integer; Latents: TNNetVolume;
+  out PerturbedPassCount: integer);
+var
+  Transformer: TQwenImage21Transformer;
+  Cond, Uncond, Skip, Mixed: TNNetVolume;
+  Grid, StepPos, BlockPos, ValuePos: integer;
+  Sigma: TNeuralFloat;
+  HasSkip, IsPerturbed: boolean;
+  MixedValue: TNeuralFloat;
+begin
+  Transformer := Pipeline.LoadedTransformer;
+  Grid := Side div csQwenImage21PixelsPerLatent;
+  PerturbedPassCount := 0;
+  Cond := TNNetVolume.Create;
+  Uncond := TNNetVolume.Create;
+  Skip := TNNetVolume.Create;
+  Mixed := TNNetVolume.Create;
+  try
+    if Assigned(NegEmbeds) then
+    begin
+      Transformer.ActivePrefixCache := 1;
+      Transformer.EncodePrefix(NegEmbeds);
+      Transformer.ActivePrefixCache := 0;
+    end;
+    Transformer.EncodePrefix(Embeds);
+    Pipeline.Scheduler.SetTimesteps(StepCount,
+      Pipeline.Scheduler.ShiftForImageSeqLen(Grid * Grid));
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      Sigma := Pipeline.Scheduler.Sigma[StepPos];
+      Transformer.PredictVelocity(Latents, Sigma, Grid, Grid, Cond, CondCache);
+      if Assigned(NegEmbeds) then
+      begin
+        Transformer.ActivePrefixCache := 1;
+        Transformer.PredictVelocity(Latents, Sigma, Grid, Grid, Uncond, nil);
+        Transformer.ActivePrefixCache := 0;
+      end;
+      HasSkip := Guider.IsPerturbedEnabled(StepPos, StepCount);
+      if HasSkip then
+      begin
+        Inc(PerturbedPassCount);
+        Transformer.BeginVelocityStep(Latents, Sigma, Grid, Grid);
+        for BlockPos := 0 to Transformer.Config.NumLayers - 1 do
+        begin
+          IsPerturbed := Guider.PerturbsLayer(BlockPos);
+          if IsPerturbed and (Guider.Mode = pgmSkipBlock) then continue;
+          Transformer.StepBlock.Attn.SkipAttentionScores := IsPerturbed;
+          Transformer.RunStepBlocks(BlockPos, BlockPos);
+          Transformer.StepBlock.Attn.SkipAttentionScores := false;
+        end;
+        Transformer.FinishVelocityStep(Skip);
+      end;
+      Mixed.ReSize(Cond);
+      for ValuePos := 0 to Cond.Size - 1 do
+      begin
+        MixedValue := Cond.FData[ValuePos];
+        if Assigned(NegEmbeds) then
+          MixedValue := Uncond.FData[ValuePos] + GuidanceScale *
+            (Cond.FData[ValuePos] - Uncond.FData[ValuePos])
+        // Without CFG diffusers' base is the skip prediction, not cond.
+        else if HasSkip then MixedValue := Skip.FData[ValuePos];
+        if HasSkip then
+          MixedValue := MixedValue + Guider.PerturbedScale *
+            (Cond.FData[ValuePos] - Skip.FData[ValuePos]);
+        Mixed.FData[ValuePos] := MixedValue;
+      end;
+      Pipeline.Scheduler.Step(Latents, Mixed, StepPos);
+    end;
+    Transformer.ReleasePasses();
+  finally
+    Mixed.Free;
+    Skip.Free;
+    Uncond.Free;
+    Cond.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21PerturbedGuidanceReference;
+const
+  Side = 64;
+  Grid = Side div csQwenImage21PixelsPerLatent;
+  StepCount = 4;
+  PerturbedScale = 2.5;
+  CFGScale = 3;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Transformer: TQwenImage21Transformer;
+  Guider: TNNetPerturbedGuidance;
+  Embeds, NegEmbeds, Initial, Plain, Latents, Reference, OtherLatents,
+    VelocityA, VelocityB: TNNetVolume;
+  PassCount, ReferencePassCount: integer;
+  Diff: double;
+
+  // A guider over steps 1..StepCount-1 (the window (0, 1) is strict).
+  function NewGuider(Scale: TNeuralFloat; Mode: TNNetPerturbedGuidanceMode;
+    const Layers: array of integer): TNNetPerturbedGuidance;
+  begin
+    Result := TNNetPerturbedGuidance.Create(1, Scale, 0, 1);
+    Result.Mode := Mode;
+    Result.SetPerturbedLayers(Layers);
+  end;
+
+  procedure RunPipeline(Scale: TNeuralFloat; Mode: TNNetPerturbedGuidanceMode;
+    const Layers: array of integer);
+  begin
+    Pipeline.PerturbedGuidance := NewGuider(Scale, Mode, Layers);
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    PassCount := Pipeline.ImageStats.PerturbedPassCount;
+  end;
+
+  // The pipeline against RunQwenImage21PerturbedReference, with or without
+  // the negative prompt's CFG.
+  procedure CheckAgainstReference(const CaseName: string;
+    Mode: TNNetPerturbedGuidanceMode; const Layers: array of integer;
+    WithCFG: boolean);
+  var
+    NegativeEmbeds: TNNetVolume;
+  begin
+    NegativeEmbeds := nil;
+    if WithCFG then
+    begin
+      NegativeEmbeds := NegEmbeds;
+      Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+      Pipeline.GuidanceScale := CFGScale;
+    end
+    else Pipeline.ClearNegativePrompt();
+    RunPipeline(PerturbedScale, Mode, Layers);
+    AssertEquals(CaseName + ': CFG used', WithCFG,
+      Pipeline.ImageStats.UsedGuidance);
+    AssertEquals(CaseName + ': perturbed passes', StepCount - 1, PassCount);
+    Guider := NewGuider(PerturbedScale, Mode, Layers);
+    try
+      Reference.Copy(Initial);
+      RunQwenImage21PerturbedReference(Pipeline, Embeds, NegativeEmbeds,
+        CFGScale, Guider, nil, Side, StepCount, Reference,
+        ReferencePassCount);
+    finally
+      Guider.Free;
+    end;
+    AssertEquals(CaseName + ': reference passes', PassCount,
+      ReferencePassCount);
+    Diff := MaxAbsVolumeDiff(Latents, Reference);
+    WriteLn('  Qwen-Image-2.1 ', CaseName, ' vs the plain loop: max|diff|=',
+      Diff:0:9);
+    AssertTrue(CaseName + ' max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-5', Diff < 1e-5);
+    AssertTrue(CaseName + ' changed the latents',
+      MaxAbsVolumeDiff(Latents, Plain) > 1e-4);
+  end;
+
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  NegEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Reference := TNNetVolume.Create;
+  OtherLatents := TNNetVolume.Create;
+  VelocityA := TNNetVolume.Create;
+  VelocityB := TNNetVolume.Create;
+  try
+    Pipeline.LoadComponents();
+    Transformer := Pipeline.LoadedTransformer;
+    AssertEquals('pico blocks', 2, Transformer.Config.NumLayers);
+    Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount, Embeds);
+    Pipeline.EncodeTokenIds(csGuidanceNegativeIds, csGuidanceDropCount,
+      NegEmbeds);
+    Pipeline.MakeInitialLatents(Side, Side, 13, Initial);
+    AssertNull('off by default', Pipeline.PerturbedGuidance);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Plain);
+    AssertEquals('off: no perturbed pass', 0,
+      Pipeline.ImageStats.PerturbedPassCount);
+
+    // Scale 0: no perturbed pass, bit for bit the unguided image.
+    RunPipeline(0, pgmAttentionScores, [1]);
+    AssertEquals('scale 0: no perturbed pass', 0, PassCount);
+    AssertEquals('scale 0 = unguided', 0, MaxAbsVolumeDiff(Plain, Latents), 0);
+    // The default window (0.01, 0.2) of 4 steps holds no step.
+    Pipeline.PerturbedGuidance := TNNetPerturbedGuidance.Create(1,
+      PerturbedScale);
+    Pipeline.PerturbedGuidance.SetPerturbedLayers([1]);
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    AssertEquals('default window over 4 steps: no pass', 0,
+      Pipeline.ImageStats.PerturbedPassCount);
+    AssertEquals('empty window = unguided', 0,
+      MaxAbsVolumeDiff(Plain, Latents), 0);
+
+    CheckAgainstReference('PAG block 1', pgmAttentionScores, [1], false);
+    CheckAgainstReference('PAG blocks 0,1 + CFG', pgmAttentionScores, [0, 1],
+      true);
+    CheckAgainstReference('SLG block 0', pgmSkipBlock, [0], false);
+    CheckAgainstReference('SLG block 1', pgmSkipBlock, [1], false);
+    CheckAgainstReference('SLG blocks 0,1 + CFG', pgmSkipBlock, [0, 1], true);
+
+    // A skipped block 0 and a skip of every block read img_in's output, not
+    // the step pass's previous output.
+    Guider := NewGuider(PerturbedScale, pgmSkipBlock, [0]);
+    try
+      OtherLatents.Copy(Initial);
+      OtherLatents.Mul(0.5);
+      Transformer.EncodePrefix(Embeds);
+      Transformer.PredictVelocity(Initial, 0.7, Grid, Grid, VelocityA, nil);
+      Transformer.PredictPerturbedVelocity(Initial, 0.7, Grid, Grid,
+        VelocityA, Guider);
+      Transformer.PredictVelocity(OtherLatents, 0.4, Grid, Grid, VelocityB,
+        nil);
+      Transformer.PredictPerturbedVelocity(Initial, 0.7, Grid, Grid,
+        VelocityB, Guider);
+      AssertEquals('SLG block 0 independent of the previous pass', 0,
+        MaxAbsVolumeDiff(VelocityA, VelocityB), 0);
+      Guider.SetPerturbedLayers([0, 1]);
+      Transformer.PredictPerturbedVelocity(Initial, 0.7, Grid, Grid,
+        VelocityA, Guider);
+      Transformer.PredictVelocity(OtherLatents, 0.4, Grid, Grid, VelocityB,
+        nil);
+      Transformer.PredictPerturbedVelocity(Initial, 0.7, Grid, Grid,
+        VelocityB, Guider);
+      AssertEquals('SLG of every block independent of the previous pass', 0,
+        MaxAbsVolumeDiff(VelocityA, VelocityB), 0);
+      Transformer.ReleasePasses();
+    finally
+      Guider.Free;
+    end;
+
+    // A block past the pico's two, and no block, are refused.
+    Pipeline.PerturbedGuidance := NewGuider(PerturbedScale,
+      pgmAttentionScores, [2]);
+    try
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+      Fail('block 2 of 2 must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+    Pipeline.PerturbedGuidance := NewGuider(PerturbedScale,
+      pgmAttentionScores, []);
+    try
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+      Fail('no perturbed block must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+
+    // APG while guided is refused with the perturbed pass on.
+    Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+    Pipeline.GuidanceScale := CFGScale;
+    Pipeline.AdaptiveProjectedGuidance :=
+      TNNetAdaptiveProjectedGuidance.Create(0.0, -0.5, 1.0);
+    Pipeline.PerturbedGuidance := NewGuider(PerturbedScale,
+      pgmAttentionScores, [1]);
+    try
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+      Fail('APG with PAG must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+    Pipeline.PerturbedGuidance.PerturbedScale := 0;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    AssertTrue('APG with PAG scale 0 runs', Pipeline.ImageStats.UsedGuidance);
+  finally
+    VelocityB.Free;
+    VelocityA.Free;
+    OtherLatents.Free;
+    Reference.Free;
+    Latents.Free;
+    Plain.Free;
+    Initial.Free;
+    NegEmbeds.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21PerturbedGuidanceFirstBlockCache;
+const
+  ImageSide = 64;
+  StepCount = 8;
+  SkipThreshold = 1.0;
+  PerturbedScale = 2.5;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Guider: TNNetPerturbedGuidance;
+  CondCache: TDiTFirstBlockCache;
+  Embeds, Initial, Latents, Reference: TNNetVolume;
+  PassCount: integer;
+  Diff: double;
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Reference := TNNetVolume.Create;
+  CondCache := TDiTFirstBlockCache.Create(SkipThreshold);
+  Guider := TNNetPerturbedGuidance.Create(1, PerturbedScale, 0, 1);
+  try
+    Guider.SetPerturbedLayers([1]);
+    Pipeline.LoadComponents();
+    Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount, Embeds);
+    FillFirstBlockCacheLatents(Pipeline, ImageSide, Initial);
+    Pipeline.FirstBlockCacheThreshold := SkipThreshold;
+    Pipeline.PerturbedGuidance := TNNetPerturbedGuidance.Create(1,
+      PerturbedScale, 0, 1);
+    Pipeline.PerturbedGuidance.SetPerturbedLayers([1]);
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Latents);
+    Reference.Copy(Initial);
+    RunQwenImage21PerturbedReference(Pipeline, Embeds, nil, 1, Guider,
+      CondCache, ImageSide, StepCount, Reference, PassCount);
+    WriteLn('  Qwen-Image-2.1 First-Block Cache + PAG: ',
+      CondCache.SkippedStepCount, ' of ', StepCount, ' cond steps skipped');
+    AssertTrue('the cond cache skipped steps', CondCache.SkippedStepCount > 0);
+    AssertEquals('perturbed passes', StepCount - 1,
+      Pipeline.ImageStats.PerturbedPassCount);
+    AssertEquals('reference passes', StepCount - 1, PassCount);
+    AssertEquals('only the cond pass asks the cache', StepCount,
+      CondCache.StepCount);
+    AssertEquals('cond decisions as without the perturbed pass',
+      CondCache.SkippedStepCount, Pipeline.ImageStats.SkippedStepCount);
+    Diff := MaxAbsVolumeDiff(Latents, Reference);
+    AssertTrue('latents max|diff| ' + FloatToStr(Diff) +
+      ' vs the plain loop must be < 1e-5', Diff < 1e-5);
+  finally
+    Guider.Free;
+    CondCache.Free;
+    Reference.Free;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21PerturbedGuidanceOpenCL;
+{$IFDEF OpenCL}
+const
+  Side = 64;
+  StepCount = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Embeds, NegEmbeds, Initial, LatentsCPU, LatentsOpenCL: TNNetVolume;
+  Diff: double;
+
+  procedure RunPipeline(OnOpenCL: boolean; Mode: TNNetPerturbedGuidanceMode;
+    const Layers: array of integer; WithCFG: boolean; Latents: TNNetVolume);
+  var
+    Pipeline: TQwenImage21Pipeline;
+  begin
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    try
+      Pipeline.TransformerFormat := qiwInt8;
+      if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+      Pipeline.LoadComponents();
+      AssertTrue('transformer on OpenCL = ' + BoolToStr(OnOpenCL, true),
+        Pipeline.TransformerOnOpenCL = OnOpenCL);
+      if Embeds.Size <= 1 then
+      begin
+        Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount,
+          Embeds);
+        Pipeline.EncodeTokenIds(csGuidanceNegativeIds, csGuidanceDropCount,
+          NegEmbeds);
+        Pipeline.MakeInitialLatents(Side, Side, 17, Initial);
+      end;
+      if WithCFG then
+      begin
+        Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+        Pipeline.GuidanceScale := 3;
+      end;
+      Pipeline.PerturbedGuidance := TNNetPerturbedGuidance.Create(1, 2.5,
+        0, 1);
+      Pipeline.PerturbedGuidance.Mode := Mode;
+      Pipeline.PerturbedGuidance.SetPerturbedLayers(Layers);
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+      AssertEquals('perturbed passes', StepCount - 1,
+        Pipeline.ImageStats.PerturbedPassCount);
+    finally
+      Pipeline.Free;
+    end;
+  end;
+
+  procedure CheckCase(const CaseName: string; Mode: TNNetPerturbedGuidanceMode;
+    const Layers: array of integer; WithCFG: boolean);
+  begin
+    RunPipeline(false, Mode, Layers, WithCFG, LatentsCPU);
+    RunPipeline(true, Mode, Layers, WithCFG, LatentsOpenCL);
+    Diff := MaxAbsVolumeDiff(LatentsCPU, LatentsOpenCL);
+    WriteLn('  Qwen-Image-2.1 ', CaseName, ' OpenCL vs CPU: max|diff|=',
+      Diff:0:9);
+    AssertTrue(CaseName + ' max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-4', Diff < 1e-4);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Embeds := TNNetVolume.Create;
+  NegEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  LatentsCPU := TNNetVolume.Create;
+  LatentsOpenCL := TNNetVolume.Create;
+  try
+    CheckCase('PAG block 1 + CFG', pgmAttentionScores, [1], true);
+    CheckCase('SLG block 0', pgmSkipBlock, [0], false);
+    CheckCase('SLG blocks 0,1', pgmSkipBlock, [0, 1], false);
+  finally
+    LatentsOpenCL.Free;
+    LatentsCPU.Free;
+    Initial.Free;
+    NegEmbeds.Free;
+    Embeds.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.TestQwenImage21GuidanceEditPrefixCaches;
 const

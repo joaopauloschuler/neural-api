@@ -158,6 +158,7 @@ follow:
 | `/fbc X\|off` | First-Block Cache threshold for the next images, as `--fbc-threshold`; `/fbc` alone shows it, `/fbc off` (or `/fbc 0`) turns it off |
 | `/negative-prompt TEXT\|off` | negative prompt for the next prompts, as `--negative-prompt`; `/negative-prompt` alone shows the guidance setting, `/negative-prompt off` clears it |
 | `/guidance-scale W` | guidance scale for the next prompts, as `--guidance-scale` |
+| `/pag W\|off` | perturbed-guidance scale for the next images, as `--pag-scale`; the blocks, the window and `--slg` come from the flags; `/pag` alone shows the setting |
 | `/panorama WxH\|off` | panorama canvas for the next prompts, as `--panorama` (windows of `/size`, stride and wrap from the flags); `/panorama` alone shows it, `/panorama off` turns it off |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
@@ -619,6 +620,68 @@ bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --guidance-scale 4 \
 
 The quality on the real checkpoint has not been checked yet.
 
+### Perturbed-Attention and Skip Layer Guidance (`--pag-scale W`, `--slg`)
+
+Perturbed-Attention Guidance (PAG, Ahn et al. 2024, arXiv:2403.17377) runs
+one more transformer pass on the prompt, with the attention score matrix of
+the `--pag-layers` blocks replaced by the identity: each image token then
+outputs its own value row (`TNNetFusedSDPA.SkipAttentionScores`). That pass
+predicts a worse velocity `v_skip`, and the step moves away from it. `--slg`
+(Skip Layer Guidance) makes the same pass skip the `--pag-layers` blocks
+entirely instead: the next block reads the output of the last block that ran.
+Both are ports of diffusers' `PerturbedAttentionGuidance` /
+`SkipLayerGuidance` guiders (`TNNetPerturbedGuidance` in
+`neural/neuraldiffusion.pas`). The mix is diffusers' formula:
+
+    with CFG:    v = v_neg + W_cfg * (v_prompt - v_neg) + W * (v_prompt - v_skip)
+    without CFG: v = v_skip + W * (v_prompt - v_skip)
+
+Without a negative prompt diffusers' base is `v_skip`, not `v_prompt`, so the
+second line equals `v_prompt + (W - 1) * (v_prompt - v_skip)`: `--pag-scale 1`
+gives the plain prompt prediction.
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --pag-scale 2.8 \
+  -p "a lighthouse on a cliff at dusk"
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --slg \
+  -p "a lighthouse on a cliff at dusk"
+```
+
+- **Defaults.** `--pag-scale` 2.8, `--pag-start` 0.01 and `--pag-stop` 0.2
+  are diffusers' guider defaults. Any `--pag-*` flag or `--slg` without
+  `--pag-scale` turns the guidance on at 2.8; `--pag-scale 0` (the default)
+  is off. diffusers has no default block list. Here PAG perturbs block 16,
+  the middle of the 32 blocks, as diffusers' PAG examples on DiTs pick a
+  middle block (SD3 `blocks.13` of 24, PixArt-Sigma `blocks.14` of 28, Sana
+  `transformer_blocks.8` of 20). SLG skips blocks 6, 7 and 8: StabilityAI's
+  `[7, 8, 9]` for the 38 blocks of SD3.5 Medium, scaled to 32 blocks. Neither
+  list has been tuned on Qwen-Image-2.1.
+- **Window.** The perturbed pass runs on step `i` of the `n` steps the image
+  runs when `trunc(start * n) < i < trunc(stop * n)`, strict at both ends as
+  in diffusers (an img2img image counts only the steps it runs). At the
+  defaults that is steps 2..19 of 100, step 1 of 10, and steps 1 and 2 of
+  the default 18 (`trunc(0.18) = 0 < i < trunc(3.6) = 3`). For a wider window use e.g. `--pag-start 0 --pag-stop 1` (every step but
+  the first).
+- **Cost.** One more transformer pass on each step inside the window (with
+  `--slg` minus the skipped blocks). At the defaults that is 2 of 18 steps,
+  about 11% more denoise time; with CFG on, three passes on those steps. The
+  extra memory is one velocity buffer. With `--stats`, the `denoise` row
+  counts the perturbed passes.
+- **Caches.** The perturbed pass attends the prompt's prefix K/V cache (it
+  only reads it) and never uses or updates the First-Block Cache, so the
+  prompt pass's `--fbc-threshold` decisions are the ones it would make
+  without PAG. A panorama runs the perturbed pass per window.
+- **APG.** diffusers' PAG and SLG guiders add to CFG only, so `--pag-scale`
+  with `--apg` while CFG is on is refused (the program stops with a message;
+  the pipeline raises).
+- **OpenCL.** On `--gpu` the identity attention is one `cai_gather_copy` on
+  the attention's queue. A block after a skipped one reads its source the
+  way block 0 reads `img_in`, inside OpenCL memory when the source is there.
+  Both are tested against the CPU on PoCL only.
+
+A with/without image pair on the real checkpoint, and the measured cost, are
+pending a run on a GPU box.
+
 ### Panoramas and large canvases (`--panorama WxH`)
 
 `--panorama WxH` (or `/panorama WxH` in the REPL) generates a canvas larger
@@ -729,6 +792,10 @@ and `--fp32`, the last one given wins.
 | `--guidance-scale W` | classifier-free guidance scale: `v_neg + W * (v_prompt - v_neg)`, two transformer passes per step; 1 = off | 1 (off) |
 | `--apg ETA,MOMENTUM,THRESHOLD` | Adaptive Projected Guidance instead of the CFG mix, on the denoised x0 | off |
 | `--apg-velocity` | apply `--apg` to the raw velocities instead of x0 | off |
+| `--pag-scale W` | Perturbed-Attention Guidance: one more transformer pass per step inside the window, identity attention in `--pag-layers`; see [PAG and SLG](#perturbed-attention-and-skip-layer-guidance---pag-scale-w---slg) | 0 (off); 2.8 when another `--pag-*` flag or `--slg` is given |
+| `--pag-layers I,J,...` | the perturbed transformer blocks, from 0 | 16 (`--slg`: 6,7,8) |
+| `--pag-start F`, `--pag-stop F` | the perturbed window as fractions of the steps run, strict at both ends | 0.01, 0.2 |
+| `--slg` | Skip Layer Guidance: the perturbed pass skips the `--pag-layers` blocks | off |
 | `--panorama WxH` | MultiDiffusion: a WxH canvas (rounded down to multiples of 32) denoised in overlapping `--width` x `--height` windows; see [Panoramas](#panoramas-and-large-canvases---panorama-wxh). Not with `--init-image` or `--image` | off |
 | `--panorama-stride N` | window step in pixels, a multiple of 16 no larger than a window side | half a window side |
 | `--panorama-wrap` | wrap the windows past the right edge to the left edge (360-degree panorama) | off |
@@ -962,6 +1029,18 @@ of two separate predictions, with a First-Block Cache and a one-window
 panorama changing nothing; `TestQwenImage21GuidanceEditPrefixCaches` the
 same caches with a condition image; `TestQwenImage21GuidanceOpenCL` a
 guided int8 denoise on OpenCL against the CPU.
+`TestQwenImage21PerturbedGuidanceReference` checks PAG and SLG against a
+plain loop of the guider's step decisions, perturbed passes run block by
+block and the mix written out by hand: scale 0 and an empty window give the
+unguided latents bit for bit; PAG alone and with CFG and SLG of block 0, of
+block 1 and of both match within 1e-5 (the pico has 2 blocks); a skipped
+block 0 does not read the previous pass's output; and the refusals (APG,
+a block out of range, no block). `TestQwenImage21PerturbedGuidanceFirstBlockCache`
+checks that the prompt pass's First-Block Cache decisions and latents equal a
+loop whose cache sees only the prompt passes, and
+`TestQwenImage21PerturbedGuidanceOpenCL` PAG with CFG and SLG on int8 OpenCL
+against the CPU. No diffusers oracle covers them: diffusers 0.41 cannot run
+these guiders on `QwenImage21Transformer2DModel` (see `tasklist.md`).
 `TestQwenImage21PanoramaOneWindowParity` checks that a canvas of one window
 gives the plain denoise bit for bit and plans 3 (4 wrapped) windows on a
 wider canvas; `TestMultiDiffusionConstantSeams` and
