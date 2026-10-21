@@ -5801,6 +5801,26 @@ type
     FOutputKernel: TNeuralKernel;
   end;
 
+  /// OpenCL forward helper for TNNetRoIAlign (cai_roi_align): one work-item per
+  // output cell averages its bilinear samples. Coded by Claude (AI).
+  TNNetRoIAlignCL = class(TNNetKernelCL)
+  private
+    // Persistent buffers (grow-only): the uploaded host source and the result.
+    FBufX, FBufY: cl_mem;
+    FCapX, FCapY: csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Pools the box of X (InW x InH x Depth) into Y; pExternalSrc is bound
+    // instead of uploading X. The result stays in ResultBuffer unless read back.
+    procedure Align(X: TNNetVolume; Y: TNNetVolume; InW, InH, Depth,
+      PooledW, PooledH, RatioX, RatioY: integer;
+      RoiStartX, RoiStartY, BinW, BinH, CountInv: TNeuralFloat;
+      pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+  end;
+
   /// OpenCL forward helper for the depthwise 2-D convolution (TNNetDepthwiseConv).
   // Binds the cai_depthwise_conv2d entry point on the shared dot-product program's
   // device. Uploads the concatenated per-neuron weights + the (already padded)
@@ -17618,14 +17638,29 @@ type
     FSamplingRatio: integer;       // <=0 = adaptive ceil(roi_size/pooled_size)
     FX1, FY1, FX2, FY2: TNeuralFloat;  // box in feature-map coords (pre-scale)
     FSpatialScale: TNeuralFloat;
+    {$IFDEF OpenCL}
+    FRoIAlignCL: TNNetRoIAlignCL;
+    {$ENDIF}
     function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
       ci: integer): TNeuralFloat;
+    // The scaled, half-pixel-shifted box origin, the bin size and the per-axis
+    // sample count shared by the forward, the OpenCL forward and the backward.
+    procedure SamplingGeometry(out RoiStartX, RoiStartY, BinW, BinH: TNeuralFloat;
+      out RatioX, RatioY: integer);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pPooledW, pPooledH: integer;
       pX1, pY1, pX2, pY2: TNeuralFloat;
       pSpatialScale: TNeuralFloat = 1.0;
       pSamplingRatio: integer = 0); reintroduce; overload;
+    {$IFDEF OpenCL}
+    destructor Destroy(); override;
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
     procedure SetBox(pX1, pY1, pX2, pY2: TNeuralFloat);
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -40831,6 +40866,71 @@ begin
     FKernel.ReadBuffer(bufY, Y, CL_TRUE);
   end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
+{ TNNetRoIAlignCL }
+
+constructor TNNetRoIAlignCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_roi_align');
+end;
+
+destructor TNNetRoIAlignCL.Destroy();
+begin
+  if Assigned(FBufX) then clReleaseMemObject(FBufX);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  inherited Destroy();
+end;
+
+function TNNetRoIAlignCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetRoIAlignCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+procedure TNNetRoIAlignCL.Align(X: TNNetVolume; Y: TNNetVolume;
+  InW, InH, Depth, PooledW, PooledH, RatioX, RatioY: integer;
+  RoiStartX, RoiStartY, BinW, BinH, CountInv: TNeuralFloat;
+  pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+var
+  bufX, bufY: cl_mem;
+  k: cl_kernel;
+  fRoiStartX, fRoiStartY, fBinW, fBinH, fCountInv: single;
+begin
+  k := FKernel.Kernel;
+  fRoiStartX := RoiStartX;
+  fRoiStartY := RoiStartY;
+  fBinW := BinW;
+  fBinH := BinH;
+  fCountInv := CountInv;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  clSetKernelArg(k, 0, csLongintSize, @InW);
+  clSetKernelArg(k, 1, csLongintSize, @InH);
+  clSetKernelArg(k, 2, csLongintSize, @Depth);
+  clSetKernelArg(k, 3, csLongintSize, @PooledW);
+  clSetKernelArg(k, 4, csLongintSize, @PooledH);
+  clSetKernelArg(k, 5, csLongintSize, @RatioX);
+  clSetKernelArg(k, 6, csLongintSize, @RatioY);
+  clSetKernelArg(k, 7, csNeuralFloatSize, @fRoiStartX);
+  clSetKernelArg(k, 8, csNeuralFloatSize, @fRoiStartY);
+  clSetKernelArg(k, 9, csNeuralFloatSize, @fBinW);
+  clSetKernelArg(k, 10, csNeuralFloatSize, @fBinH);
+  clSetKernelArg(k, 11, csNeuralFloatSize, @fCountInv);
+  clSetKernelArg(k, 12, csCLMemSize, @bufX);
+  clSetKernelArg(k, 13, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, PooledW * PooledH * Depth);
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
 end;
 
 { TNNetDepthwiseConvCL }
@@ -97476,6 +97576,77 @@ begin
   SetOutputErrorSizeNoDeriv(FOutput);
 end;
 
+procedure TNNetRoIAlign.SamplingGeometry(out RoiStartX, RoiStartY, BinW,
+  BinH: TNeuralFloat; out RatioX, RatioY: integer);
+var
+  RoiW, RoiH: TNeuralFloat;
+begin
+  // aligned=True: scale box, then subtract half-pixel offset (pixel centers).
+  RoiStartX := FX1 * FSpatialScale - 0.5;
+  RoiStartY := FY1 * FSpatialScale - 0.5;
+  RoiW := (FX2 - FX1) * FSpatialScale;
+  RoiH := (FY2 - FY1) * FSpatialScale;
+  // torchvision does NOT clamp roi size to >=1 when aligned=True.
+  BinW := RoiW / FPooledW;
+  BinH := RoiH / FPooledH;
+  if FSamplingRatio > 0 then
+  begin
+    RatioX := FSamplingRatio;
+    RatioY := FSamplingRatio;
+  end
+  else
+  begin
+    RatioX := Ceil(RoiW / FPooledW);
+    RatioY := Ceil(RoiH / FPooledH);
+    if RatioX < 1 then RatioX := 1;
+    if RatioY < 1 then RatioY := 1;
+  end;
+end;
+
+{$IFDEF OpenCL}
+destructor TNNetRoIAlign.Destroy();
+begin
+  if Assigned(FRoIAlignCL) then FreeAndNil(FRoIAlignCL);
+  inherited Destroy();
+end;
+
+// No size verdict: the layer runs in OpenCL when forced, or when an
+// inference-only layer's source is already resident.
+function TNNetRoIAlign.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FRoIAlignCL) and FHasOpenCL and
+    (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+procedure TNNetRoIAlign.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FRoIAlignCL) then
+    FRoIAlignCL := TNNetRoIAlignCL.Create(FNN);
+end;
+
+procedure TNNetRoIAlign.DisableOpenCL();
+begin
+  // FRoIAlignCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FRoIAlignCL);
+end;
+
+function TNNetRoIAlign.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FRoIAlignCL) then Result := FRoIAlignCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetRoIAlign.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FRoIAlignCL) then Result := FRoIAlignCL.OutputKernel()
+  else Result := nil;
+end;
+{$ENDIF}
+
 // Bilinear sample of input channel ci at floating position (px,py); out-of-
 // bounds corners contribute 0 (zero-padding). Identical math to the
 // TNNetDeformableConv sampler.
@@ -97516,37 +97687,52 @@ var
   PrevOut: TNNetVolume;
   Depth, ci, px, py, ix, iy, ratioX, ratioY: integer;
   MaxPooledH, MaxPooledW, MaxDepth, MaxRatioY, MaxRatioX: integer;
-  roiStartX, roiStartY, roiW, roiH, binW, binH: TNeuralFloat;
+  roiStartX, roiStartY, binW, binH: TNeuralFloat;
   sx, sy, acc, countInv: TNeuralFloat;
   StartTime: double;
+  {$IFDEF OpenCL}
+  SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
+  {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  SamplingGeometry(roiStartX, roiStartY, binW, binH, ratioX, ratioY);
+  countInv := 1.0 / (ratioX * ratioY);
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FRoIAlignCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    // Inference keeps the result in OpenCL memory; a forced trainable forward
+    // reads it back for the host backward.
+    KeepOnOpenCL := not FIsTrainable;
+    PrevOut := FPrevLayer.FOutput;
+    FRoIAlignCL.Align(PrevOut, FOutput, PrevOut.SizeX, PrevOut.SizeY,
+      PrevOut.Depth, FPooledW, FPooledH, ratioX, ratioY, roiStartX, roiStartY,
+      binW, binH, countInv, SourceBuffer, KeepOnOpenCL);
+    FOutputOnOpenCL := KeepOnOpenCL;
+    FOutputOnRAM := not KeepOnOpenCL;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Depth := PrevOut.Depth;
-
-  // aligned=True: scale box, then subtract half-pixel offset (pixel centers).
-  roiStartX := FX1 * FSpatialScale - 0.5;
-  roiStartY := FY1 * FSpatialScale - 0.5;
-  roiW := (FX2 - FX1) * FSpatialScale;
-  roiH := (FY2 - FY1) * FSpatialScale;
-  // NOTE: torchvision does NOT clamp roi size to >=1 when aligned=True.
-  binW := roiW / FPooledW;
-  binH := roiH / FPooledH;
-
-  if FSamplingRatio > 0 then
-  begin
-    ratioX := FSamplingRatio;
-    ratioY := FSamplingRatio;
-  end
-  else
-  begin
-    ratioX := Ceil(roiW / FPooledW);
-    ratioY := Ceil(roiH / FPooledH);
-    if ratioX < 1 then ratioX := 1;
-    if ratioY < 1 then ratioY := 1;
-  end;
-  countInv := 1.0 / (ratioX * ratioY);
 
   MaxPooledH := FPooledH - 1;
   MaxPooledW := FPooledW - 1;
@@ -97580,7 +97766,7 @@ var
   Depth, ci, px, py, ix, iy, ratioX, ratioY: integer;
   MaxPooledH, MaxPooledW, MaxDepth, MaxRatioY, MaxRatioX: integer;
   x0, y0, x1, y1, sxSize, sySize: integer;
-  roiStartX, roiStartY, roiW, roiH, binW, binH: TNeuralFloat;
+  roiStartX, roiStartY, binW, binH: TNeuralFloat;
   sx, sy, fx, fy, w00, w01, w10, w11, dy_out, g, countInv: TNeuralFloat;
   HasPrevError: boolean;
   StartTime: double;
@@ -97606,25 +97792,7 @@ begin
     sxSize := PrevOut.SizeX;
     sySize := PrevOut.SizeY;
 
-    roiStartX := FX1 * FSpatialScale - 0.5;
-    roiStartY := FY1 * FSpatialScale - 0.5;
-    roiW := (FX2 - FX1) * FSpatialScale;
-    roiH := (FY2 - FY1) * FSpatialScale;
-    binW := roiW / FPooledW;
-    binH := roiH / FPooledH;
-
-    if FSamplingRatio > 0 then
-    begin
-      ratioX := FSamplingRatio;
-      ratioY := FSamplingRatio;
-    end
-    else
-    begin
-      ratioX := Ceil(roiW / FPooledW);
-      ratioY := Ceil(roiH / FPooledH);
-      if ratioX < 1 then ratioX := 1;
-      if ratioY < 1 then ratioY := 1;
-    end;
+    SamplingGeometry(roiStartX, roiStartY, binW, binH, ratioX, ratioY);
     countInv := 1.0 / (ratioX * ratioY);
 
     MaxPooledH := FPooledH - 1;

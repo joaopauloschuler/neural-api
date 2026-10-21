@@ -2004,10 +2004,10 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       `TNNetSinkAttention` and `TNNetDifferentialAttention` are named in the
       decode-path group above; landing them there covers the vision builders
       that also use them.
-- [ ] The long tail of one-model vision layers: `TNNetRoIAlign` (Mask R-CNN),
-      `TNNetConvGRUCell` (RAFT), `TNNetSpectralConv2D` (FNO - coordinate with
-      the open FFT denormal-trap item, since the device path would move that
-      math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
+- [ ] The long tail of one-model vision layers: `TNNetConvGRUCell` (RAFT),
+      `TNNetSpectralConv2D` (FNO - coordinate with the open FFT denormal-trap
+      item, since the device path would move that math off the host FPU
+      entirely) and `TNNetLocalResponseNormDepth`
       (AlexNet, minor). Rank these by which importer gets used, not by size.
 - [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a

@@ -3036,6 +3036,65 @@ __kernel void cai_meta_acon_table
   FTable[2 * FDepth + c] = cai_fused_act(BetaInput, 2);
 }
 
+// RoIAlign forward (TNNetRoIAlign, torchvision aligned=True). One work-item per
+// output (px,py,d) cell: the mean of FRatioX*FRatioY bilinear samples at the bin
+// sub-centers; out-of-bounds corners add 0. Raw layouts [(y*W + x)*Depth + d].
+// The host passes the box geometry (TNNetRoIAlign.SamplingGeometry).
+// Coded by Claude (AI).
+__kernel void cai_roi_align
+(
+  const int FInW,
+  const int FInH,
+  const int FDepth,
+  const int FPooledW,
+  const int FPooledH,
+  const int FRatioX,
+  const int FRatioY,
+  const float FRoiStartX,
+  const float FRoiStartY,
+  const float FBinW,
+  const float FBinH,
+  const float FCountInv,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPooledW * FPooledH * FDepth) return;
+  const int cell = g_id / FDepth;
+  const int d = g_id - cell * FDepth;
+  const int py = cell / FPooledW;
+  const int px = cell - py * FPooledW;
+  float acc = 0.0f;
+  for (int iy = 0; iy < FRatioY; iy++)
+  {
+    const float sy = FRoiStartY + py * FBinH + (iy + 0.5f) * FBinH / FRatioY;
+    const float y0f = floor(sy);
+    const int y0 = (int)y0f;
+    const int y1 = y0 + 1;
+    const float fy = sy - y0f;
+    const int InY0 = (y0 >= 0) && (y0 < FInH);
+    const int InY1 = (y1 >= 0) && (y1 < FInH);
+    for (int ix = 0; ix < FRatioX; ix++)
+    {
+      const float sx = FRoiStartX + px * FBinW + (ix + 0.5f) * FBinW / FRatioX;
+      const float x0f = floor(sx);
+      const int x0 = (int)x0f;
+      const int x1 = x0 + 1;
+      const float fx = sx - x0f;
+      const int InX0 = (x0 >= 0) && (x0 < FInW);
+      const int InX1 = (x1 >= 0) && (x1 < FInW);
+      float v = 0.0f;
+      if (InX0 && InY0) v += (1.0f - fx) * (1.0f - fy) * FSrc[(y0 * FInW + x0) * FDepth + d];
+      if (InX1 && InY0) v += fx * (1.0f - fy) * FSrc[(y0 * FInW + x1) * FDepth + d];
+      if (InX0 && InY1) v += (1.0f - fx) * fy * FSrc[(y1 * FInW + x0) * FDepth + d];
+      if (InX1 && InY1) v += fx * fy * FSrc[(y1 * FInW + x1) * FDepth + d];
+      acc += v;
+    }
+  }
+  FDst[g_id] = acc * FCountInv;
+}
+
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
 // The input volume is laid out depth-axis contiguous in the TVolume convention:
 // element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride

@@ -951,6 +951,10 @@ type
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
     procedure TestRoIAlignSerializationRoundTrip;
+    // TNNetRoIAlign OpenCL forward vs CPU (several geometries + SetBox), and
+    // its resident chain with ForceOpenCL off.
+    procedure RoIAlignOpenCLParity;
+    procedure RoIAlignResidentChainOpenCL;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -86452,6 +86456,166 @@ end;
 // (0-based -> feature values 5? no: the centers land on grid points), giving
 // the inner-corner averages [3, 4, 6, 7]. Verified identical for sampling_ratio
 // = 2 and the adaptive (sampling_ratio = -1) path.
+// TNNetRoIAlign under ForceOpenCL vs its CPU Compute over fixed and adaptive
+// sampling ratios, a scaled box, a box reaching outside the map, and a SetBox
+// between OpenCL forwards. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RoIAlignOpenCLParity;
+{$IFDEF OpenCL}
+const
+  InW = 9;
+  InH = 7;
+  InDepth = 5;
+  CaseCount = 4;
+  PooledWs: array[0..CaseCount-1] of integer = (2, 3, 7, 4);
+  PooledHs: array[0..CaseCount-1] of integer = (2, 4, 7, 3);
+  Ratios: array[0..CaseCount-1] of integer = (2, 0, 0, 3);
+  Scales: array[0..CaseCount-1] of TNeuralFloat = (1.0, 0.5, 1.0, 1.0);
+  BoxesA: array[0..CaseCount-1, 0..3] of TNeuralFloat = (
+    (0.5, 0.5, 2.5, 2.5), (2.0, 1.0, 15.0, 12.0),
+    (0.0, 0.0, 9.0, 7.0), (-1.5, -2.0, 10.5, 8.25));
+  BoxB: array[0..3] of TNeuralFloat = (1.25, 0.75, 6.5, 5.5);
+var
+  NN: TNNet;
+  Input, OutCPUA, OutCPUB: TNNetVolume;
+  RoI: TNNetRoIAlign;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, i: integer;
+  DiffA, DiffB: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 31337 + CaseIdx;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(InW, InH, InDepth);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      Input.RandomizeGaussian();
+      NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+      RoI := TNNetRoIAlign.Create(PooledWs[CaseIdx], PooledHs[CaseIdx],
+        BoxesA[CaseIdx, 0], BoxesA[CaseIdx, 1], BoxesA[CaseIdx, 2],
+        BoxesA[CaseIdx, 3], Scales[CaseIdx], Ratios[CaseIdx]);
+      NN.AddLayer(RoI);
+      NN.SetTrainable(False, False);
+      NN.Compute(Input);
+      OutCPUA.Copy(RoI.Output);
+      RoI.SetBox(BoxB[0], BoxB[1], BoxB[2], BoxB[3]);
+      NN.Compute(Input);
+      OutCPUB.Copy(RoI.Output);
+      RoI.SetBox(BoxesA[CaseIdx, 0], BoxesA[CaseIdx, 1], BoxesA[CaseIdx, 2],
+        BoxesA[CaseIdx, 3]);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        AssertTrue('ForceOutputOnRAM must report RoIAlign readable',
+          RoI.ForceOutputOnRAM());
+        DiffA := 0;
+        for i := 0 to OutCPUA.Size - 1 do
+          DiffA := Max(DiffA, Abs(OutCPUA.Raw[i] - RoI.Output.Raw[i]));
+        RoI.SetBox(BoxB[0], BoxB[1], BoxB[2], BoxB[3]);
+        NN.Compute(Input);
+        RoI.ForceOutputOnRAM();
+        DiffB := 0;
+        for i := 0 to OutCPUB.Size - 1 do
+          DiffB := Max(DiffB, Abs(OutCPUB.Raw[i] - RoI.Output.Raw[i]));
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  RoIAlign OpenCL parity case ', CaseIdx, ': max|diff| box A=',
+        DiffA:0:9, ' box B=', DiffB:0:9, ' gpu forwards=', RoI.ForwardGPUCnt);
+      AssertEquals('both boxes must run in OpenCL', 2, RoI.ForwardGPUCnt);
+      AssertTrue('RoIAlign box A OpenCL vs CPU max |diff| = ' +
+        FloatToStr(DiffA), DiffA < 1e-5);
+      AssertTrue('RoIAlign box B OpenCL vs CPU max |diff| = ' +
+        FloatToStr(DiffB), DiffB < 1e-5);
+    finally
+      OutCPUB.Free; OutCPUA.Free; Input.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv -> TNNetRoIAlign -> pointwise
+// conv. RoIAlign binds the resident conv output and keeps its own resident
+// (both host copies keep a sentinel); the result matches the CPU. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RoIAlignResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  InW = 8;
+  InH = 6;
+  InDepth = 4;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, RoI, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InW, InH, InDepth);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    RoI := NN.AddLayer(TNNetRoIAlign.Create(3, 3, 1.0, 0.5, 6.5, 5.0, 1.0, 0));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+    NN.SetTrainable(False, False);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    RoI.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    WriteLn('  RoIAlign resident chain: gpu forwards conv=', Conv.ForwardGPUCnt,
+      ' roi=', RoI.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('RoIAlign must follow its resident source', RoI.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident RoIAlign output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('RoIAlign host output not downloaded', csSentinel,
+      RoI.Output.Raw[0], 0);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    WriteLn('  RoIAlign resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('RoIAlign resident chain vs CPU max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.TestRoIAlignForward;
 var
   NN: TNNet;
