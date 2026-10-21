@@ -4551,6 +4551,155 @@ __kernel void cai_gated_delta_net
   }
 }
 
+// SELECTIVE-SCAN PROJECTIONS (TNNetSelectiveSSM). ONE WORK-GROUP PER (ROW,
+// TOKEN): group (r, t) reduces row r of the stacked [FW0 | FW1 | FW2] matrices
+// (FRows0, FRows1, then the rest of dimension 0) against token row t of FX, the
+// lanes striding over the FK-long row so a work-group reads its weight row
+// contiguously. FScratch is one float per lane; the local size must be a power
+// of two. With FSoftplus = 1 the FRows0 rows of FW0 add FBias[r] and return
+// softplus(.) - the per-channel step delta. Out row t starts at t*FOutStride.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_project
+(
+  const int FK,
+  const int FRows0,
+  const int FRows1,
+  const int FInStride,
+  const int FOutStride,
+  const int FSoftplus,
+  __global const float* FW0,
+  __global const float* FW1,
+  __global const float* FW2,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FOut,
+  __local float* FScratch
+)
+{
+  const int r = get_group_id(0);
+  const int t = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __global const float* W;
+  if (r < FRows0) W = FW0 + r * FK;
+  else if (r < FRows0 + FRows1) W = FW1 + (r - FRows0) * FK;
+  else W = FW2 + (r - FRows0 - FRows1) * FK;
+  __global const float* X = FX + t * FInStride;
+  float partial = 0.0f;
+  for (int i = lid; i < FK; i += lsize) partial = mad(W[i], X[i], partial);
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0)
+  {
+    float acc = FScratch[0];
+    if ((FSoftplus != 0) && (r < FRows0))
+    {
+      // Both sides of each select run, so the exp is capped and floored.
+      const float pre = acc + FBias[r];
+      const float ep = cai_exp_floored(fmin(pre, 30.0f));
+      acc = (pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep));
+    }
+    FOut[t * FOutStride + r] = acc;
+  }
+}
+
+// JAMBA INNER RMSNORMS (TNNetSelectiveSSM Jamba / falcon_mamba mode). Row t of
+// FRaw is [ ts (FDtRank) | B (FNS) | C (FNS) ], FStride floats apart; work-item
+// (seg, t) of a (3, SeqLen) launch rewrites segment seg in place as
+// v * rsqrt(mean(v^2) + eps) * gain, gain = FGDt / FGB / FGC.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_inner_norm
+(
+  const int FDtRank,
+  const int FNS,
+  const int FStride,
+  const float FEps,
+  __global const float* FGDt,
+  __global const float* FGB,
+  __global const float* FGC,
+  __global float* FRaw
+)
+{
+  const int seg = get_global_id(0);
+  const int t = get_global_id(1);
+  if (seg > 2) return;
+  int n = FNS;
+  __global const float* gain = FGB;
+  __global float* v = FRaw + t * FStride;
+  if (seg == 0) { n = FDtRank; gain = FGDt; }
+  else if (seg == 1) v += FDtRank;
+  else { v += FDtRank + FNS; gain = FGC; }
+  float ss = 0.0f;
+  for (int i = 0; i < n; i++) ss = mad(v[i], v[i], ss);
+  const float inv = 1.0f / sqrt(ss / (float)n + FEps);
+  for (int i = 0; i < n; i++) v[i] = (v[i] * inv) * gain[i];
+}
+
+// SELECTIVE SCAN (TNNetSelectiveSSM, Mamba-1 / S6). ONE WORK-ITEM PER CHANNEL
+// d: the recurrence is independent across channels and the read-out sums only
+// over the channel's own FNS states, so a work-item carries its channel through
+// the whole sequence with no barrier and no cross-item reduction. Per t, s:
+//   h[d,s] = exp(-delta[t,d]*FExpA[d,s]) * h[d,s] + delta[t,d]*B[t,s']*x[t,d]
+//   y[t,d] = sum_s C[t,s']*h[d,s] + FE[d]*x[t,d]
+// with s' = d + s when FBCPerChannel (the DState = 1 per-channel gains) and
+// s' = s otherwise (B/C shared across channels). delta row t starts at
+// t*FDeltaStride, B and C at t*FBCStride + FBOff / FCOff. FH is the (Depth, NS)
+// state, read and rewritten in place; FResetState = 1 starts it from zero.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_scan
+(
+  const int FSeqLen,
+  const int FDepth,
+  const int FNS,
+  const int FBCPerChannel,
+  const int FDeltaStride,
+  const int FBCStride,
+  const int FBOff,
+  const int FCOff,
+  const int FResetState,
+  __global const float* FExpA,
+  __global const float* FE,
+  __global const float* FDelta,
+  __global const float* FBC,
+  __global const float* FX,
+  __global float* FH,
+  __global float* FY
+)
+{
+  const int d = get_global_id(0);
+  if (d >= FDepth) return;
+  __global float* h = FH + d * FNS;
+  __global const float* ea = FExpA + d * FNS;
+  const int bcChannel = (FBCPerChannel != 0) ? d : 0;
+  const float e = FE[d];
+  int s, t;
+  if (FResetState != 0)
+    for (s = 0; s < FNS; s++) h[s] = 0.0f;
+  for (t = 0; t < FSeqLen; t++)
+  {
+    // sp is capped so sp * ea stays finite (ea <= exp(10)).
+    const float sp = fmin(FDelta[t * FDeltaStride + d], 1e20f);
+    const float xd = FX[t * FDepth + d];
+    const float spxd = sp * xd;
+    __global const float* b = FBC + t * FBCStride + FBOff + bcChannel;
+    __global const float* c = FBC + t * FBCStride + FCOff + bcChannel;
+    float acc = 0.0f;
+    for (s = 0; s < FNS; s++)
+    {
+      const float a = cai_exp_floored(-sp * ea[s]);
+      const float hn = mad(a, h[s], spxd * b[s]);
+      h[s] = hn;
+      acc = mad(c[s], hn, acc);
+    }
+    FY[t * FDepth + d] = mad(e, xd, acc);
+  }
+}
+
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
 // Writes the step's K and V rows - FTokenCnt token rows, one row per KV head
 // each - into the cache slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE

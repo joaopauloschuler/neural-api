@@ -1897,12 +1897,27 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Real device-side work still running on the host
 
-- [ ] `TNNetSelectiveSSM` device forward. The Mamba-1/2, Jamba, Nemotron-H and
-      falcon_mamba trunks are majority-SSM and run entirely on the CPU.
-      `TNNetGatedDeltaNet` already proved the recipe (commit 63047d0f: one
-      work-group per head, the whole scan in OpenCL memory, state carried on the
-      device across decode steps); `TNNetSelectiveSSM` is the same shape. Cover
-      both the prefill scan and the `TNNetRecurrentDecodeBase` one-token path.
+- [X] `TNNetSelectiveSSM` device forward, all three modes (DState = 1, the
+      folded Mamba-1 scan, and the Jamba / falcon_mamba inner-norm scan), for the
+      full-sequence forward, prefill windows and the one-token decode path.
+      `TNNetSelectiveSSMCL` runs `cai_selective_ssm_project` (delta / B / C),
+      `cai_selective_ssm_inner_norm` (Jamba only) and `cai_selective_ssm_scan`
+      (one work-item per channel for the whole sequence) on one queue; the
+      source is bound, the result and the (Depth, N) decode state stay in
+      OpenCL memory, and the state slots of `TNNetStreamingDecoder` checkpoints
+      are OpenCL buffers. Open follow-ups:
+  - [ ] Throughput is unmeasured; time a Mamba / falcon_mamba / Jamba decode
+        on the GPU box. `cai_selective_ssm_project` is one 64-lane work-group
+        per (row, token), so a long prefill re-reads each weight row once per
+        token; if a profile shows it, move the projections onto the tiled
+        GEMM. The folded Mamba-1 `W_d` is a full Depth x Depth matrix; the
+        unfolded low-rank dt path (x_proj_dt then dt_proj, as the Jamba mode
+        already runs) would cut that traffic by Depth / dt_rank.
+  - [ ] `TNNetMamba2` (the Mamba-2 and Nemotron-H mixer) has no device
+        forward. It is a separate `TNNetLayer` (per-head scalar A, n_groups
+        B/C, gated RMSNorm read-out), not a `TNNetSelectiveSSM` mode, and not a
+        `TNNetRecurrentDecodeBase`, so its streamed decode has no carried state
+        to keep in OpenCL memory yet.
 - [ ] `TNNetWKV`, `TNNetTokenShift` and `TNNetDiagonalSSM` device forward — the
       RWKV trunk, same per-head-recurrence recipe as `TNNetSelectiveSSM`. Lower
       priority only because fewer tested checkpoints use it.

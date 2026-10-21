@@ -440,6 +440,14 @@ type
     // owns several state columns and both grid-stride loops run more than one
     // iteration - the shape the two tests above never reach.
     procedure GatedDeltaNetWideHeadOpenCLParity;
+    // TNNetInput -> TNNetSiLU -> TNNetSelectiveSSM with ForceOpenCL off, in all
+    // three scan modes: the resident activation must be bound (sentinel) and
+    // the OpenCL scan must reproduce the CPU one.
+    procedure SelectiveSSMResidentChainOpenCLParity;
+    // A prefill window, a host snapshot hand-off, token-by-token decode, an
+    // OpenCL-memory state slot round trip and a reset, all on OpenCL, against
+    // the full-sequence CPU forward, in all three scan modes.
+    procedure SelectiveSSMDecodeResidentOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -83038,6 +83046,287 @@ begin
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// One TNNetSelectiveSSM per OpenCL test mode: 0 = DState 1 (per-channel B/C),
+// 1 = DState 4 (Mamba-1, shared B/C), 2 = the Jamba / falcon_mamba inner-norm
+// mode (DState 4, dt_rank 3).
+function NewSelectiveSSMForMode(Mode: integer): TNNetSelectiveSSM;
+begin
+  case Mode of
+    0: Result := TNNetSelectiveSSM.Create(1);
+    1: Result := TNNetSelectiveSSM.Create(4);
+  else Result := TNNetSelectiveSSM.CreateJambaInner(4, 3, 1e-3);
+  end;
+end;
+
+function SelectiveSSMModeName(Mode: integer): string;
+begin
+  case Mode of
+    0: Result := 'DState=1';
+    1: Result := 'DState=4';
+  else Result := 'Jamba inner-norm';
+  end;
+end;
+
+// Random weights for every neuron slot; the Jamba gains (slots 7..9) sit
+// around 1 so the inner RMSNorms neither vanish nor explode.
+procedure SeedSelectiveSSMForOpenCL(L: TNNetSelectiveSSM);
+var
+  NeuronPos, ElementPos: integer;
+  W: TNNetVolume;
+begin
+  for NeuronPos := 0 to L.Neurons.Count - 1 do
+  begin
+    W := L.Neurons[NeuronPos].Weights;
+    for ElementPos := 0 to W.Size - 1 do
+      if NeuronPos >= 7
+        then W.Raw[ElementPos] := 0.5 + Random
+        else W.Raw[ElementPos] := 0.8 * (Random - 0.5);
+  end;
+end;
+
+procedure TTestNeuralNumerical.SelectiveSSMResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 7;
+  Depth = 6;
+  csSentinel = -7777;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetSelectiveSSM;
+  ActGpu: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Mode, T, D, N, ElementPos, SentinelSurvivors: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for Mode := 0 to 2 do
+  begin
+    RandSeed := 20261021 + Mode;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, Depth);
+    CpuOut := TNNetVolume.Create();
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+      NNCpu.AddLayer(TNNetSiLU.Create());
+      LCpu := NewSelectiveSSMForMode(Mode);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.SetTrainable(False, False);
+      SeedSelectiveSSMForOpenCL(LCpu);
+
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+      ActGpu := NNGpu.AddLayer(TNNetSiLU.Create());
+      LGpu := NewSelectiveSSMForMode(Mode);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.SetTrainable(False, False);
+      for N := 0 to LCpu.Neurons.Count - 1 do
+        LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to Depth - 1 do
+          Input[T, 0, D] := 3.0 * (Random - 0.5);
+      NNCpu.Compute(Input);
+      CpuOut.Copy(LCpu.Output);
+
+      AssertFalse(SelectiveSSMModeName(Mode) +
+        ': the scan size verdict must leave it on the CPU', LGpu.ShouldOpenCL);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.Compute(Input);
+      // Parity cannot tell a bind from a download: a second forward must leave
+      // the activation's host copy untouched.
+      ActGpu.Output.Fill(csSentinel);
+      NNGpu.Compute(Input);
+      SentinelSurvivors := 0;
+      for ElementPos := 0 to ActGpu.Output.Size - 1 do
+        if ActGpu.Output.Raw[ElementPos] = csSentinel then Inc(SentinelSurvivors);
+      LGpu.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to Depth - 1 do
+        begin
+          Diff := Abs(CpuOut[T, 0, D] - LGpu.Output[T, 0, D]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      WriteLn('  SelectiveSSM ', SelectiveSSMModeName(Mode),
+        ' resident chain: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards scan=', LGpu.ForwardGPUCnt, ' act=', ActGpu.ForwardGPUCnt,
+        ' source sentinels=', SentinelSurvivors, '/', ActGpu.Output.Size);
+      AssertEquals(SelectiveSSMModeName(Mode) +
+        ': a resident source must put the scan on OpenCL', 2, LGpu.ForwardGPUCnt);
+      AssertEquals(SelectiveSSMModeName(Mode) +
+        ': the source must be read in OpenCL memory, not downloaded',
+        ActGpu.Output.Size, SentinelSurvivors);
+      AssertTrue(SelectiveSSMModeName(Mode) + ' OpenCL vs CPU scan: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.SelectiveSSMDecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 9;
+  PrefixLen = 4;
+  Depth = 6;
+  SlotStep = 6;
+var
+  NNFull, NNPre, NNStep: TNNet;
+  FullIn, PreIn, StepIn, FullOut, Snap: TNNetVolume;
+  LFull, LPre, LStep: TNNetSelectiveSSM;
+  Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Slot: cl_mem;
+  Mode, T, D, N, Steps, SlotSteps, StepForwards: integer;
+  MaxDiff: TNeuralFloat;
+
+  procedure CompareRow(const Got: TNNetVolume; GotT, FullT: integer);
+  var
+    Dim: integer;
+    Diff: TNeuralFloat;
+  begin
+    for Dim := 0 to Depth - 1 do
+    begin
+      Diff := Abs(FullOut[FullT, 0, Dim] - Got[GotT, 0, Dim]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+  end;
+
+  procedure StepToken(TokenPos: integer);
+  var
+    Dim: integer;
+  begin
+    for Dim := 0 to Depth - 1 do StepIn[0, 0, Dim] := FullIn[TokenPos, 0, Dim];
+    NNStep.Compute(StepIn);
+    Inc(StepForwards);
+    LStep.ForceOutputOnRAM();
+    CompareRow(LStep.Output, 0, TokenPos);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for Mode := 0 to 2 do
+  begin
+    RandSeed := 20261121 + Mode;
+    NNFull := TNNet.Create();
+    NNPre := TNNet.Create();
+    NNStep := TNNet.Create();
+    FullIn := TNNetVolume.Create(SeqLen, 1, Depth);
+    PreIn := TNNetVolume.Create(PrefixLen, 1, Depth);
+    StepIn := TNNetVolume.Create(1, 1, Depth);
+    FullOut := TNNetVolume.Create();
+    Snap := TNNetVolume.Create();
+    Slot := nil;
+    try
+      NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+      LFull := NewSelectiveSSMForMode(Mode);
+      NNFull.AddLayer(LFull);
+      NNFull.SetTrainable(False, False);
+      SeedSelectiveSSMForOpenCL(LFull);
+
+      NNPre.AddLayer(TNNetInput.Create(PrefixLen, 1, Depth, 1));
+      LPre := NewSelectiveSSMForMode(Mode);
+      NNPre.AddLayer(LPre);
+      NNPre.SetTrainable(False, False);
+
+      NNStep.AddLayer(TNNetInput.Create(1, 1, Depth, 1));
+      LStep := NewSelectiveSSMForMode(Mode);
+      NNStep.AddLayer(LStep);
+      Act := NNStep.AddLayer(TNNetSiLU.Create());
+      NNStep.SetTrainable(False, False);
+      for N := 0 to LFull.Neurons.Count - 1 do
+      begin
+        LPre.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+        LStep.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+      end;
+
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to Depth - 1 do
+          FullIn[T, 0, D] := 3.0 * (Random - 0.5);
+      NNFull.Compute(FullIn);
+      FullOut.Copy(LFull.Output);
+      MaxDiff := 0;
+
+      // Prefill window on OpenCL inside a decode session, then the state comes
+      // home through CaptureState.
+      NNPre.EnableOpenCL(PlatformId, DeviceId);
+      LPre.BeginIncrementalDecode();
+      for T := 0 to PrefixLen - 1 do
+        for D := 0 to Depth - 1 do
+          PreIn[T, 0, D] := FullIn[T, 0, D];
+      NNPre.Compute(PreIn);
+      AssertEquals('prefill on OpenCL', 1, LPre.ForwardGPUCnt);
+      AssertTrue('the prefill state stays in OpenCL memory',
+        LPre.DecodeStateOnOpenCL);
+      LPre.ForceOutputOnRAM();
+      for T := 0 to PrefixLen - 1 do CompareRow(LPre.Output, T, T);
+      LPre.CaptureState(Snap, Steps);
+      AssertEquals('the snapshot carries the prefill length', PrefixLen, Steps);
+      AssertFalse('CaptureState brings the state home', LPre.DecodeStateOnOpenCL);
+
+      // The decode twin resumes from the host snapshot, token by token.
+      NNStep.EnableOpenCL(PlatformId, DeviceId);
+      LStep.BeginIncrementalDecode();
+      LStep.RestoreState(Snap, Steps);
+      StepForwards := 0;
+      for T := PrefixLen to SlotStep do StepToken(T);
+      AssertTrue('decode steps keep the state in OpenCL memory',
+        LStep.DecodeStateOnOpenCL);
+      // OpenCL-memory checkpoint: capture, run on, restore, re-run the tail.
+      Slot := LStep.NewStateSlotOnOpenCL();
+      AssertTrue('the layer offers an OpenCL state slot', Slot <> nil);
+      LStep.CaptureStateToOpenCL(Slot, SlotSteps);
+      AssertEquals('the slot carries the step count', SlotStep + 1, SlotSteps);
+      for T := SlotStep + 1 to SeqLen - 1 do StepToken(T);
+      LStep.RestoreStateFromOpenCL(Slot, SlotSteps);
+      AssertEquals('restored step count', SlotStep + 1, LStep.DecodeSteps);
+      for T := SlotStep + 1 to SeqLen - 1 do StepToken(T);
+      AssertEquals('decode steps track tokens', SeqLen, LStep.DecodeSteps);
+      // A reset on OpenCL starts the sequence over from h = 0.
+      LStep.ResetState();
+      for T := 0 to 2 do StepToken(T);
+      LStep.EndIncrementalDecode();
+      WriteLn('  SelectiveSSM ', SelectiveSSMModeName(Mode),
+        ' OpenCL prefill+decode: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards scan=', LStep.ForwardGPUCnt, '/', StepForwards,
+        ' act=', Act.ForwardGPUCnt);
+      AssertEquals(SelectiveSSMModeName(Mode) +
+        ': every decode step must run on OpenCL', StepForwards,
+        LStep.ForwardGPUCnt);
+      AssertTrue('the activation must follow the scan rows', Act.ForwardGPUCnt > 0);
+      AssertTrue(SelectiveSSMModeName(Mode) +
+        ' OpenCL prefill+decode vs full CPU forward: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      if Slot <> nil then clReleaseMemObject(Slot);
+      Snap.Free; FullOut.Free; StepIn.Free; PreIn.Free; FullIn.Free;
+      NNStep.Free; NNPre.Free; NNFull.Free;
+    end;
   end;
 end;
 {$ELSE}

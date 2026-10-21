@@ -233,7 +233,9 @@ type
       out ADevice: cl_device_id): boolean;
     // CPU-vs-OpenCL streamed decode: two inference twins of the same
     // checkpoint at SeqLen=1, one armed for OpenCL, stepped side by side.
-    procedure RunStreamedDecodeOpenCLParity(const Stem: string);
+    // pOnOpenCL, when set, must run every forward on OpenCL with its state there.
+    procedure RunStreamedDecodeOpenCLParity(const Stem: string;
+      pOnOpenCL: TClass = nil);
     // Every layer of AClass in Net ran at least one forward on the device.
     procedure AssertAllOnDevice(Net: TNNet; AClass: TClass;
       const What: string);
@@ -521,6 +523,9 @@ type
     procedure TestLlamaLinkedWeightsInt4OpenCLParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
+    procedure TestMambaStreamedDecodeOpenCLParity;
+    procedure TestFalconMambaStreamedDecodeOpenCLParity;
+    procedure TestJambaStreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35StateCheckpointResumeParity;
     procedure TestQwen35StateCheckpointResumeInt8KVParity;
@@ -529,6 +534,9 @@ type
     procedure TestQwen35StateCheckpointOpenCLInt8KVParity;
     procedure TestQwen35StateCheckpointOpenCLTwinHandoffParity;
     procedure TestMambaStateCheckpointResumeParity;
+    // The same resume on OpenCL: TNNetSelectiveSSM and the conv offer OpenCL
+    // slots, so the checkpoint never leaves OpenCL memory.
+    procedure TestMambaStateCheckpointOpenCLParity;
     procedure TestQwen35ChatPrefillWindowParity;
     procedure TestQwen35ChatPrefillWindowInt8KVParity;
     procedure TestQwen35ChatPrefillWindowOpenCLParity;
@@ -11739,7 +11747,7 @@ end;
 // The device-layer count is asserted so the test cannot pass by never
 // offloading. Coded by Claude (AI).
 procedure TTestNeuralPretrained.RunStreamedDecodeOpenCLParity(
-  const Stem: string);
+  const Stem: string; pOnOpenCL: TClass = nil);
 const
   StepCnt = 8;
 var
@@ -11789,6 +11797,21 @@ begin
     AssertTrue(Stem + ' reached the device on at least one layer (' +
       IntToStr(GPULayerCnt) + ' of ' + IntToStr(TwinCL.CountLayers()) + ')',
       GPULayerCnt > 0);
+    if Assigned(pOnOpenCL) then
+    begin
+      for LayerCnt := 0 to TwinCL.CountLayers() - 1 do
+        if TwinCL.Layers[LayerCnt].ClassType = pOnOpenCL then
+        begin
+          AssertEquals(Stem + ': ' + pOnOpenCL.ClassName + ' at ' +
+            IntToStr(LayerCnt) + ' ran every decode step on OpenCL', StepCnt,
+            TwinCL.Layers[LayerCnt].ForwardGPUCnt);
+          if TwinCL.Layers[LayerCnt] is TNNetRecurrentDecodeBase then
+            AssertTrue(Stem + ': ' + pOnOpenCL.ClassName + ' at ' +
+              IntToStr(LayerCnt) + ' keeps its decode state in OpenCL memory',
+              TNNetRecurrentDecodeBase(TwinCL.Layers[LayerCnt]).StateOnOpenCL());
+        end;
+      AssertAllOnDevice(TwinCL, pOnOpenCL, Stem);
+    end;
   finally
     SessionCL.Free;
     SessionCPU.Free;
@@ -11818,6 +11841,35 @@ procedure TTestNeuralPretrained.TestQwen2StreamedDecodeOpenCLParity;
 begin
   {$IFDEF OpenCL}
   RunStreamedDecodeOpenCLParity('tiny_qwen2');
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The three importers that build a TNNetSelectiveSSM, decoded on OpenCL: the
+// folded Mamba-1 scan, falcon_mamba's inner-norm scan and Jamba's hybrid stack.
+procedure TTestNeuralPretrained.TestMambaStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_mamba', TNNetSelectiveSSM);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestFalconMambaStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_falcon_mamba', TNNetSelectiveSSM);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestJambaStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_jamba', TNNetSelectiveSSM);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
@@ -12409,6 +12461,91 @@ begin
     NN.Free;
   end;
 end;
+
+procedure TTestNeuralPretrained.TestMambaStateCheckpointOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen   = 10;
+  CheckPos = 4;
+  RunOnTo  = 7;
+var
+  NN: TNNet;
+  Config: TMambaConfig;
+  Session: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+
+  procedure Feed(FromPos, ToPos: integer; Recording: boolean; const What: string);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      if Recording then
+      begin
+        SetLength(RefOut[P], Vocab);
+        for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session.Output().FData[Dim];
+      end
+      else
+        for Dim := 0 to Vocab - 1 do
+          AssertEquals('mamba OpenCL ' + What + ': logit pos ' + IntToStr(P) +
+            ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+            Session.Output().FData[Dim], 0.0);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := BuildMambaFromSafeTensorsEx(FixturePath('tiny_mamba.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_mamba_config.json'));
+  Session := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (3 * T + 1) mod Vocab;
+    Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+    Session.Reset();
+    Feed(0, SeqLen, true, '');
+
+    Chk := Session.NewStateCheckpoint();
+    AssertEquals('mamba OpenCL: every recurrent layer holds an OpenCL slot',
+      Session.SSMCount, Chk.OpenCLSlotCount);
+    Session.Reset();
+    Feed(0, CheckPos, false, 'before the checkpoint');
+    AssertAllOnDevice(NN, TNNetSelectiveSSM, 'mamba OpenCL');
+    AssertRecurrentStateOnOpenCL(NN, 'mamba OpenCL before the capture');
+    Session.CaptureStateInto(Chk);
+    AssertRecurrentStateOnOpenCL(NN, 'mamba OpenCL after the capture');
+    Feed(CheckPos, RunOnTo, false, 'after the checkpoint');
+    Session.RestoreStateFrom(Chk);
+    AssertRecurrentStateOnOpenCL(NN, 'mamba OpenCL after the restore');
+    Feed(CheckPos, SeqLen, false, 'resume');
+  finally
+    Chk.Free;
+    Session.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 function TTestNeuralPretrained.MakeChatModelDir(const Stem: string): string;
 begin
