@@ -6057,13 +6057,6 @@ type
     // True while the bank, not the layer's RAM volume, holds the live decode
     // state (read only through the *StateOnOpenCL / *Slot methods below).
     FStateLive: boolean;
-  public
-    destructor Destroy(); override;
-    // The buffer the last forward wrote Y into, the kernel that wrote it, and
-    // the kernel this helper runs on (for a source that must wait on the queue).
-    function ResultBuffer(): cl_mem;
-    function OutputKernel(): TNeuralKernel;
-    function ForwardKernel(): TNeuralKernel;
     // Sizes the state bank for State and uploads / reads it back (both blocking).
     procedure UploadState(State: TNNetVolume);
     procedure DownloadState(State: TNNetVolume);
@@ -6071,6 +6064,13 @@ type
     // helper's queue. CopyStateFrom sizes the bank for State.
     procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
     procedure CopyStateFrom(Slot: cl_mem; State: TNNetVolume);
+  public
+    destructor Destroy(); override;
+    // The buffer the last forward wrote Y into, the kernel that wrote it, and
+    // the kernel this helper runs on (for a source that must wait on the queue).
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function ForwardKernel(): TNeuralKernel;
     // Moves the live decode state between the layer's State volume and the
     // bank; each is a no-op when the state already sits where it is wanted.
     procedure EnsureStateOnOpenCL(State: TNNetVolume);
@@ -12250,11 +12250,6 @@ type
       // True once the parameter tensors change; the OpenCL forward re-uploads
       // them only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
-      // True while the live incremental-decode state sits in FGatedDeltaNetCL's
-      // bank rather than in FDecS. Every host reader of FDecS calls
-      // ForceDecodeStateOnRAM first; the OpenCL decode forward calls
-      // EnsureDecodeStateOnOpenCL.
-      FDecSOnOpenCL: boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function NonWeightBytes(): int64; override;
@@ -12276,9 +12271,7 @@ type
       procedure ComputeCPURange(FirstKh, LastKh: integer);
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
-      // Move the incremental-decode state between FDecS and the helper's bank.
-      // Both are no-ops when the state is already where it is wanted.
-      procedure EnsureDecodeStateOnOpenCL();
+      // Brings a decode state living in FGatedDeltaNetCL's bank back into FDecS.
       procedure ForceDecodeStateOnRAM();
       // True when the previous layer's output can be read where it lies, as the
       // cai_gated_delta_net input, instead of coming back to RAM to be uploaded.
@@ -13321,9 +13314,6 @@ type
       // True once the parameter tensors change; the OpenCL forward re-uploads
       // them only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
-      // True while the live decode state sits in FSelectiveSSMCL's bank rather
-      // than in FDecH. Every host reader of FDecH calls ForceDecodeStateOnRAM.
-      FDecHOnOpenCL: boolean;
       {$ENDIF}
       // Releases FState: the per-timestep h cache is read only by the backward
       // sweep, so an inference-only layer neither fills nor needs it. The
@@ -13343,9 +13333,7 @@ type
       procedure ComputeIncremental();
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
-      // Move the decode state between FDecH and the helper's bank; no-ops when
-      // it is already where it is wanted.
-      procedure EnsureDecodeStateOnOpenCL();
+      // Brings a decode state living in FSelectiveSSMCL's bank back into FDecH.
       procedure ForceDecodeStateOnRAM();
       {$ENDIF}
       procedure AfterWeightUpdate(); override;
@@ -13384,7 +13372,7 @@ type
       function OpenCLOutputKernel(): TNeuralKernel; override;
       // True while the live decode state sits in the helper's bank rather than
       // in FDecH. Read-only: the layer decides when it moves.
-      property DecodeStateOnOpenCL: boolean read FDecHOnOpenCL;
+      property DecodeStateOnOpenCL: boolean read StateOnOpenCL;
       {$ENDIF}
   end;
 
@@ -13454,13 +13442,8 @@ type
       // True once the parameter tensors change; the OpenCL forward re-uploads
       // them only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
-      // True while the live decode state sits in FMamba2CL's bank rather than
-      // in FDecH. Every host reader of FDecH calls ForceDecodeStateOnRAM.
-      FDecHOnOpenCL: boolean;
       procedure ComputeOpenCL();
-      // Move the decode state between FDecH and the helper's bank; no-ops when
-      // it is already where it is wanted.
-      procedure EnsureDecodeStateOnOpenCL();
+      // Brings a decode state living in FMamba2CL's bank back into FDecH.
       procedure ForceDecodeStateOnRAM();
       {$ENDIF}
       // Releases FState: the per-timestep h cache is read only by Backpropagate,
@@ -78791,14 +78774,14 @@ begin
   // needed (contrast the attention KV cache). Sized by SetPrevLayer; ReSize is
   // a safety net for layers wired manually.
   FDecS.ReSize(1, 1, FNumVHeads * FHeadDimK * FHeadDimV);
-  {$IFDEF OpenCL} FDecSOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FGatedDeltaNetCL) then FGatedDeltaNetCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetGatedDeltaNet.ResetState();
 begin
   FDecS.Fill(0);           // S_{-1} = 0
   FDecodeSteps := 0;
-  {$IFDEF OpenCL} FDecSOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FGatedDeltaNetCL) then FGatedDeltaNetCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetGatedDeltaNet.CaptureState(Dst: TNNetVolume; out Steps: integer);
@@ -78813,7 +78796,7 @@ procedure TNNetGatedDeltaNet.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecS.Copy(Src);
   FDecodeSteps := Steps;
-  {$IFDEF OpenCL} FDecSOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FGatedDeltaNetCL) then FGatedDeltaNetCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 function TNNetGatedDeltaNet.StateBytes(): int64;
@@ -78823,7 +78806,11 @@ end;
 
 function TNNetGatedDeltaNet.StateOnOpenCL(): boolean;
 begin
-  {$IFDEF OpenCL} Result := FDecSOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+  {$IFDEF OpenCL}
+  Result := Assigned(FGatedDeltaNetCL) and FGatedDeltaNetCL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
 end;
 
 {$IFDEF OpenCL}
@@ -78840,11 +78827,7 @@ begin
   if not Assigned(FGatedDeltaNetCL) then
     raise Exception.Create('TNNetGatedDeltaNet.CaptureStateToOpenCL: the' +
       ' layer has no OpenCL path.');
-  // The live state is wherever the flag says; a RAM-resident one is uploaded
-  // straight into the slot so the layer's own bank is never touched.
-  if FDecSOnOpenCL
-    then FGatedDeltaNetCL.CopyStateTo(Slot, FDecS.GetMemSize())
-    else FGatedDeltaNetCL.UploadToOpenCLBuffer(Slot, FDecS);
+  FGatedDeltaNetCL.CaptureStateToSlot(Slot, FDecS);
   Steps := FDecodeSteps;
 end;
 
@@ -78854,8 +78837,7 @@ begin
   if not Assigned(FGatedDeltaNetCL) then
     raise Exception.Create('TNNetGatedDeltaNet.RestoreStateFromOpenCL: the' +
       ' layer has no OpenCL path.');
-  FGatedDeltaNetCL.CopyStateFrom(Slot, FDecS);
-  FDecSOnOpenCL := true;
+  FGatedDeltaNetCL.RestoreStateFromSlot(Slot, FDecS);
   FDecodeSteps := Steps;
 end;
 {$ENDIF}
@@ -78895,7 +78877,6 @@ begin
     FGatedDeltaNetCL := TNNetGatedDeltaNetCL.Create(FNN);
   // Nothing is resident yet, whatever a previous weight update reported.
   FGpuWeightsDirty := true;
-  FDecSOnOpenCL := false;
 end;
 
 function TNNetGatedDeltaNet.WillOpenCL(): boolean;
@@ -78942,18 +78923,9 @@ begin
   Result := PrevOutputOnOpenCL();
 end;
 
-procedure TNNetGatedDeltaNet.EnsureDecodeStateOnOpenCL();
-begin
-  if FDecSOnOpenCL or (not Assigned(FGatedDeltaNetCL)) then exit;
-  FGatedDeltaNetCL.UploadState(FDecS);
-  FDecSOnOpenCL := true;
-end;
-
 procedure TNNetGatedDeltaNet.ForceDecodeStateOnRAM();
 begin
-  if (not FDecSOnOpenCL) or (not Assigned(FGatedDeltaNetCL)) then exit;
-  FGatedDeltaNetCL.DownloadState(FDecS);
-  FDecSOnOpenCL := false;
+  if Assigned(FGatedDeltaNetCL) then FGatedDeltaNetCL.ForceStateOnRAM(FDecS);
 end;
 
 // Whole-scan forward in OpenCL memory. Outside a decode session the scan starts
@@ -78978,8 +78950,8 @@ begin
   Prev := FPrevLayer.FOutput;
   // A full-sequence forward overwrites the bank from S = 0, so a decode state
   // still living there has to come home first.
-  if FDecodeEnabled then EnsureDecodeStateOnOpenCL()
-  else ForceDecodeStateOnRAM();
+  if FDecodeEnabled then FGatedDeltaNetCL.EnsureStateOnOpenCL(FDecS)
+  else FGatedDeltaNetCL.ForceStateOnRAM(FDecS);
   // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
@@ -81866,14 +81838,14 @@ begin
   // (contrast the attention KV cache). FDecH is already sized by SetPrevLayer;
   // ReSize is a safety net for layers wired manually.
   FDecH.ReSize(FH);
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FSelectiveSSMCL) then FSelectiveSSMCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetSelectiveSSM.ResetState();
 begin
   FDecH.Fill(0);            // h_{-1} = 0
   FDecodeSteps := 0;
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FSelectiveSSMCL) then FSelectiveSSMCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetSelectiveSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
@@ -81887,7 +81859,7 @@ procedure TNNetSelectiveSSM.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecH.Copy(Src);
   FDecodeSteps := Steps;
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FSelectiveSSMCL) then FSelectiveSSMCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 function TNNetSelectiveSSM.StateBytes(): int64;
@@ -81897,7 +81869,11 @@ end;
 
 function TNNetSelectiveSSM.StateOnOpenCL(): boolean;
 begin
-  {$IFDEF OpenCL} Result := FDecHOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+  {$IFDEF OpenCL}
+  Result := Assigned(FSelectiveSSMCL) and FSelectiveSSMCL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
 end;
 
 procedure TNNetSelectiveSSM.AfterWeightUpdate();
@@ -81922,11 +81898,7 @@ begin
   if not Assigned(FSelectiveSSMCL) then
     raise Exception.Create('TNNetSelectiveSSM.CaptureStateToOpenCL: the' +
       ' layer has no OpenCL path.');
-  // The live state is wherever the flag says; a RAM-resident one is uploaded
-  // straight into the slot so the layer's own bank is never touched.
-  if FDecHOnOpenCL
-    then FSelectiveSSMCL.CopyStateTo(Slot, FDecH.GetMemSize())
-    else FSelectiveSSMCL.UploadToOpenCLBuffer(Slot, FDecH);
+  FSelectiveSSMCL.CaptureStateToSlot(Slot, FDecH);
   Steps := FDecodeSteps;
 end;
 
@@ -81936,8 +81908,7 @@ begin
   if not Assigned(FSelectiveSSMCL) then
     raise Exception.Create('TNNetSelectiveSSM.RestoreStateFromOpenCL: the' +
       ' layer has no OpenCL path.');
-  FSelectiveSSMCL.CopyStateFrom(Slot, FDecH);
-  FDecHOnOpenCL := true;
+  FSelectiveSSMCL.RestoreStateFromSlot(Slot, FDecH);
   FDecodeSteps := Steps;
 end;
 
@@ -81966,7 +81937,6 @@ begin
     FSelectiveSSMCL := TNNetSelectiveSSMCL.Create(FNN);
   // Nothing is resident yet, whatever a previous weight update reported.
   FGpuWeightsDirty := true;
-  FDecHOnOpenCL := false;
 end;
 
 function TNNetSelectiveSSM.WillOpenCL(): boolean;
@@ -81993,18 +81963,9 @@ begin
   else Result := nil;
 end;
 
-procedure TNNetSelectiveSSM.EnsureDecodeStateOnOpenCL();
-begin
-  if FDecHOnOpenCL or (not Assigned(FSelectiveSSMCL)) then exit;
-  FSelectiveSSMCL.UploadState(FDecH);
-  FDecHOnOpenCL := true;
-end;
-
 procedure TNNetSelectiveSSM.ForceDecodeStateOnRAM();
 begin
-  if (not FDecHOnOpenCL) or (not Assigned(FSelectiveSSMCL)) then exit;
-  FSelectiveSSMCL.DownloadState(FDecH);
-  FDecHOnOpenCL := false;
+  if Assigned(FSelectiveSSMCL) then FSelectiveSSMCL.ForceStateOnRAM(FDecH);
 end;
 
 // Whole-scan forward in OpenCL memory. Outside a decode session the scan starts
@@ -82031,8 +81992,8 @@ begin
   Prev := FPrevLayer.FOutput;
   // A full-sequence forward overwrites the bank from h = 0, so a decode state
   // still living there has to come home first.
-  if FDecodeEnabled then EnsureDecodeStateOnOpenCL()
-  else ForceDecodeStateOnRAM();
+  if FDecodeEnabled then FSelectiveSSMCL.EnsureStateOnOpenCL(FDecH)
+  else FSelectiveSSMCL.ForceStateOnRAM(FDecH);
   if FGpuWeightsDirty then
   begin
     // Slot 4 travels as exp(min(A_raw,10)), the decay base both CPU scans use.
@@ -82688,14 +82649,14 @@ begin
   // The decode state is the running h of the scan: fixed (d_inner, N), sized
   // like FH whatever the context length.
   FDecH.ReSize(FH);
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FMamba2CL) then FMamba2CL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetMamba2.ResetState();
 begin
   FDecH.Fill(0);
   FDecodeSteps := 0;
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FMamba2CL) then FMamba2CL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetMamba2.CaptureState(Dst: TNNetVolume; out Steps: integer);
@@ -82709,7 +82670,7 @@ procedure TNNetMamba2.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecH.Copy(Src);
   FDecodeSteps := Steps;
-  {$IFDEF OpenCL} FDecHOnOpenCL := false; {$ENDIF}
+  {$IFDEF OpenCL} if Assigned(FMamba2CL) then FMamba2CL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 function TNNetMamba2.StateBytes(): int64;
@@ -82719,7 +82680,11 @@ end;
 
 function TNNetMamba2.StateOnOpenCL(): boolean;
 begin
-  {$IFDEF OpenCL} Result := FDecHOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+  {$IFDEF OpenCL}
+  Result := Assigned(FMamba2CL) and FMamba2CL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
 end;
 
 {$IFDEF OpenCL}
@@ -82735,11 +82700,7 @@ begin
   if not Assigned(FMamba2CL) then
     raise Exception.Create('TNNetMamba2.CaptureStateToOpenCL: the layer has' +
       ' no OpenCL path.');
-  // A RAM-resident state is uploaded straight into the slot, so the layer's own
-  // bank is never touched.
-  if FDecHOnOpenCL
-    then FMamba2CL.CopyStateTo(Slot, FDecH.GetMemSize())
-    else FMamba2CL.UploadToOpenCLBuffer(Slot, FDecH);
+  FMamba2CL.CaptureStateToSlot(Slot, FDecH);
   Steps := FDecodeSteps;
 end;
 
@@ -82748,23 +82709,13 @@ begin
   if not Assigned(FMamba2CL) then
     raise Exception.Create('TNNetMamba2.RestoreStateFromOpenCL: the layer has' +
       ' no OpenCL path.');
-  FMamba2CL.CopyStateFrom(Slot, FDecH);
-  FDecHOnOpenCL := true;
+  FMamba2CL.RestoreStateFromSlot(Slot, FDecH);
   FDecodeSteps := Steps;
-end;
-
-procedure TNNetMamba2.EnsureDecodeStateOnOpenCL();
-begin
-  if FDecHOnOpenCL or (not Assigned(FMamba2CL)) then exit;
-  FMamba2CL.UploadState(FDecH);
-  FDecHOnOpenCL := true;
 end;
 
 procedure TNNetMamba2.ForceDecodeStateOnRAM();
 begin
-  if (not FDecHOnOpenCL) or (not Assigned(FMamba2CL)) then exit;
-  FMamba2CL.DownloadState(FDecH);
-  FDecHOnOpenCL := false;
+  if Assigned(FMamba2CL) then FMamba2CL.ForceStateOnRAM(FDecH);
 end;
 
 procedure TNNetMamba2.DisableOpenCL();
@@ -82837,8 +82788,8 @@ begin
   Prev := FPrevLayer.FOutput;
   // A full-sequence forward overwrites the bank from h = 0, so a decode state
   // still living there has to come home first.
-  if FDecodeEnabled then EnsureDecodeStateOnOpenCL()
-  else ForceDecodeStateOnRAM();
+  if FDecodeEnabled then FMamba2CL.EnsureStateOnOpenCL(FDecH)
+  else FMamba2CL.ForceStateOnRAM(FDecH);
   FMamba2CL.Compute(FNeurons[0].FWeights, FNeurons[1].FWeights,
     FNeurons[2].FWeights, FNeurons[3].FWeights, Prev, FOutput, FH,
     Prev.SizeX, FNumHeads, FHeadDim, FStateSize, FNGroups,

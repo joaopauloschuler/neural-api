@@ -2061,11 +2061,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] Throughput is unmeasured: each kernel is one work-item per channel,
         serial over the window, so a long prefill is latency-bound. Time an
         RWKV decode and prefill on the GPU box.
-  - [ ] `TNNetGatedDeltaNet`, `TNNetSelectiveSSM` and `TNNetMamba2` still carry
-        their own copy of the decode-state residency code (`FDecHOnOpenCL`,
-        Ensure/Force, slot capture/restore); move them onto the
-        `TNNetRecurrentScanCL` methods (`EnsureStateOnOpenCL`, `ForceStateOnRAM`,
-        `MarkStateWrittenOnRAM`, `CaptureStateToSlot`, `RestoreStateFromSlot`).
+  - [X] `TNNetGatedDeltaNet`, `TNNetSelectiveSSM` and `TNNetMamba2` now use the
+        `TNNetRecurrentScanCL` decode-state methods (`EnsureStateOnOpenCL`,
+        `ForceStateOnRAM`, `MarkStateWrittenOnRAM`, `CaptureStateToSlot`,
+        `RestoreStateFromSlot`); their own flag and Ensure copies are gone, and
+        the four raw bank primitives are protected on the base.
   - [ ] `TNNetCrossWKV` has no device forward (and no incremental path).
   - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
 - [ ] Attention subclasses that override `Compute` and so lose
