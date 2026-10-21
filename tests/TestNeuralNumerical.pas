@@ -955,6 +955,10 @@ type
     // its resident chain with ForceOpenCL off.
     procedure RoIAlignOpenCLParity;
     procedure RoIAlignResidentChainOpenCL;
+    // TNNetLocalResponseNorm2D / Depth OpenCL forward vs CPU, and both in a
+    // resident chain with ForceOpenCL off.
+    procedure LocalResponseNormOpenCLParity;
+    procedure LocalResponseNormResidentChainOpenCL;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -86606,6 +86610,188 @@ begin
     WriteLn('  RoIAlign resident chain: max|diff|=', MaxDiff:0:9);
     AssertTrue('RoIAlign resident chain vs CPU max |diff| = ' +
       FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetLocalResponseNorm2D / Depth under ForceOpenCL vs the host forward, over
+// odd, even and 1x1 windows, two inputs each; a trainable layer stays on the host.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.LocalResponseNormOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 4;
+  SizeXs: array[0..CaseCount-1] of integer = (7, 1, 4, 3);
+  SizeYs: array[0..CaseCount-1] of integer = (5, 1, 6, 3);
+  Depths: array[0..CaseCount-1] of integer = (6, 9, 13, 2);
+  WindowSizes: array[0..CaseCount-1] of integer = (5, 3, 4, 1);
+  // Large inputs, so the denominator moves well away from 1.
+  csInputScale = 40;
+var
+  NN: TNNet;
+  InputA, InputB, OutCPUA, OutCPUB: TNNetVolume;
+  LRN: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, Variant, i: integer;
+  DiffA, DiffB, MinRatio: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for Variant := 0 to 1 do
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 7100 + CaseIdx;
+    NN := TNNet.Create();
+    InputA := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Depths[CaseIdx]);
+    InputB := TNNetVolume.Create(InputA);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      InputA.RandomizeGaussian();
+      InputA.Mul(csInputScale);
+      InputB.RandomizeGaussian();
+      InputB.Mul(csInputScale);
+      NN.AddLayer(TNNetInput.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Depths[CaseIdx]));
+      if Variant = 0
+        then LRN := NN.AddLayer(TNNetLocalResponseNorm2D.Create(WindowSizes[CaseIdx]))
+        else LRN := NN.AddLayer(TNNetLocalResponseNormDepth.Create(WindowSizes[CaseIdx]));
+      NN.SetTrainable(False, False);
+      NN.Compute(InputA);
+      OutCPUA.Copy(LRN.Output);
+      NN.Compute(InputB);
+      OutCPUB.Copy(LRN.Output);
+      // The normalization must actually shrink some outputs at this input scale.
+      MinRatio := 1;
+      for i := 0 to InputB.Size - 1 do
+        if Abs(InputB.Raw[i]) > 1 then
+          MinRatio := Min(MinRatio, OutCPUB.Raw[i] / InputB.Raw[i]);
+      AssertTrue('LRN must normalize, min ratio = ' + FloatToStr(MinRatio),
+        MinRatio < 0.97);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(InputA);
+        AssertTrue('ForceOutputOnRAM must report LRN readable',
+          LRN.ForceOutputOnRAM());
+        DiffA := 0;
+        for i := 0 to OutCPUA.Size - 1 do
+          DiffA := Max(DiffA, Abs(OutCPUA.Raw[i] - LRN.Output.Raw[i]));
+        NN.Compute(InputB);
+        LRN.ForceOutputOnRAM();
+        DiffB := 0;
+        for i := 0 to OutCPUB.Size - 1 do
+          DiffB := Max(DiffB, Abs(OutCPUB.Raw[i] - LRN.Output.Raw[i]));
+        WriteLn('  LRN OpenCL parity variant ', Variant, ' case ', CaseIdx,
+          ': max|diff| A=', DiffA:0:9, ' B=', DiffB:0:9, ' min ratio=',
+          MinRatio:0:4, ' gpu forwards=', LRN.ForwardGPUCnt);
+        AssertEquals('both forwards must run in OpenCL', 2, LRN.ForwardGPUCnt);
+        // Outputs reach ~|160|: 1e-4 absolute is ~1e-6 relative.
+        AssertTrue('LRN input A OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-4);
+        AssertTrue('LRN input B OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffB), DiffB < 1e-4);
+        // Trainable: the backward needs the host denominator, so no OpenCL forward.
+        NN.SetTrainable(True, False);
+        NN.Compute(InputA);
+        AssertEquals('a trainable LRN must stay on the host', 2, LRN.ForwardGPUCnt);
+        DiffA := 0;
+        for i := 0 to OutCPUA.Size - 1 do
+          DiffA := Max(DiffA, Abs(OutCPUA.Raw[i] - LRN.Output.Raw[i]));
+        AssertTrue('trainable host forward after OpenCL max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-4);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+    finally
+      OutCPUB.Free; OutCPUA.Free; InputB.Free; InputA.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv -> TNNetLocalResponseNorm2D ->
+// TNNetLocalResponseNormDepth -> pointwise conv. Both LRN layers bind the resident
+// source and keep their own output resident (sentinels); the result matches the CPU.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.LocalResponseNormResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  InW = 8;
+  InH = 6;
+  InDepth = 4;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, LRN2D, LRNDepth, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4243;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InW, InH, InDepth);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    Input.Mul(30);
+    NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    LRN2D := NN.AddLayer(TNNetLocalResponseNorm2D.Create(3));
+    LRNDepth := NN.AddLayer(TNNetLocalResponseNormDepth.Create(5));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+    NN.SetTrainable(False, False);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    LRN2D.Output.Fill(csSentinel);
+    LRNDepth.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    WriteLn('  LRN resident chain: gpu forwards conv=', Conv.ForwardGPUCnt,
+      ' lrn2d=', LRN2D.ForwardGPUCnt, ' lrndepth=', LRNDepth.ForwardGPUCnt,
+      ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('LRN2D must follow its resident source', LRN2D.ForwardGPUCnt >= 2);
+    AssertTrue('LRNDepth must follow its resident source',
+      LRNDepth.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident LRN output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('LRN2D host output not downloaded', csSentinel,
+      LRN2D.Output.Raw[0], 0);
+    AssertEquals('LRNDepth host output not downloaded', csSentinel,
+      LRNDepth.Output.Raw[0], 0);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    WriteLn('  LRN resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('LRN resident chain vs CPU max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-3);
   finally
     OutCPU.Free; Input.Free; NN.Free;
   end;

@@ -5821,6 +5821,26 @@ type
     function OutputKernel(): TNeuralKernel;
   end;
 
+  /// OpenCL forward helper for TNNetLocalResponseNorm2D / Depth (cai_local_response_norm).
+  // Coded by Claude (AI).
+  TNNetLocalResponseNormCL = class(TNNetKernelCL)
+  private
+    // Persistent buffers (grow-only): the uploaded host source and the result.
+    FBufX, FBufY: cl_mem;
+    FCapX, FCapY: csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Normalizes X into Y over a box of the given half-widths; pExternalSrc is
+    // bound instead of uploading X. The result stays in ResultBuffer unless read back.
+    procedure Normalize(X: TNNetVolume; Y: TNNetVolume;
+      HalfX, HalfY, HalfD: integer; Scale, Beta: TNeuralFloat;
+      pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   /// OpenCL forward helper for the depthwise 2-D convolution (TNNetDepthwiseConv).
   // Binds the cai_depthwise_conv2d entry point on the shared dot-product program's
   // device. Uploads the concatenated per-neuron weights + the (already padded)
@@ -13340,9 +13360,26 @@ type
       // Squared-input scratch owned by the layer, so the normalization itself
       // allocates nothing per forward pass (rule #17/#27).
       FLRNSqr: TNNetVolume;
+      {$IFDEF OpenCL}
+      FLRNCL: TNNetLocalResponseNormCL;
+      {$ENDIF}
+    protected
+      // True when the OpenCL forward ran over the given window half-widths; False
+      // leaves the source on RAM for the host path. Same alpha/beta as the host.
+      function ComputeLRNOnOpenCL(StartTime: double; HalfX, HalfY,
+        HalfD: integer; Scale: TNeuralFloat): boolean;
     public
       constructor Create(pSize: integer); reintroduce; overload;
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      // Inference only: the backward divides by FLRN, which the OpenCL forward leaves unset.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -40926,6 +40963,72 @@ begin
   clSetKernelArg(k, 12, csCLMemSize, @bufX);
   clSetKernelArg(k, 13, csCLMemSize, @bufY);
   FKernel.RunKernel(k, PooledW * PooledH * Depth);
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+end;
+
+{ TNNetLocalResponseNormCL }
+
+constructor TNNetLocalResponseNormCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_local_response_norm');
+end;
+
+destructor TNNetLocalResponseNormCL.Destroy();
+begin
+  if Assigned(FBufX) then clReleaseMemObject(FBufX);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  inherited Destroy();
+end;
+
+function TNNetLocalResponseNormCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetLocalResponseNormCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetLocalResponseNormCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufY);
+end;
+
+procedure TNNetLocalResponseNormCL.Normalize(X: TNNetVolume; Y: TNNetVolume;
+  HalfX, HalfY, HalfD: integer; Scale, Beta: TNeuralFloat;
+  pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+var
+  bufX, bufY: cl_mem;
+  k: cl_kernel;
+  iSizeX, iSizeY, iDepth: longint;
+  fScale, fBeta: single;
+begin
+  k := FKernel.Kernel;
+  iSizeX := X.SizeX;
+  iSizeY := X.SizeY;
+  iDepth := X.Depth;
+  fScale := Scale;
+  fBeta := Beta;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  clSetKernelArg(k, 0, csLongintSize, @iSizeX);
+  clSetKernelArg(k, 1, csLongintSize, @iSizeY);
+  clSetKernelArg(k, 2, csLongintSize, @iDepth);
+  clSetKernelArg(k, 3, csLongintSize, @HalfX);
+  clSetKernelArg(k, 4, csLongintSize, @HalfY);
+  clSetKernelArg(k, 5, csLongintSize, @HalfD);
+  clSetKernelArg(k, 6, csNeuralFloatSize, @fScale);
+  clSetKernelArg(k, 7, csNeuralFloatSize, @fBeta);
+  clSetKernelArg(k, 8, csCLMemSize, @bufX);
+  clSetKernelArg(k, 9, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, Y.Size);
   if not pKeepResultOnOpenCL then
   begin
     FKernel.Finish();
@@ -104532,15 +104635,21 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+const
+  // AlexNet LRN constants shared by the host and the OpenCL forward.
+  csLRNAlpha = 0.001 / 9.0;
+  csLRNBeta = 0.75;
+
 { TNNetLocalResponseNormDepth }
 procedure TNNetLocalResponseNormDepth.Compute();
 var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeLRNOnOpenCL(StartTime, 0, 0, FStruct[0] shr 1,
+    csLRNAlpha / FStruct[0]) then exit;
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
-  FLRN.CalculateLocalResponseFromDepth(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
+  FLRN.CalculateLocalResponseFromDepth(FOutput, FLRNSqr, FStruct[0], csLRNAlpha, csLRNBeta);
   FOutput.Divi(FLRN);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -104556,9 +104665,94 @@ end;
 
 destructor TNNetLocalResponseNorm2D.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FLRNCL) then FreeAndNil(FLRNCL);
+  {$ENDIF}
   FLRNSqr.Free;
   FLRN.Free;
   inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+// No size verdict: an inference-only layer runs in OpenCL when forced, or when
+// its source is already resident.
+function TNNetLocalResponseNorm2D.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FLRNCL) and FHasOpenCL and (not FIsTrainable) and
+    (FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetLocalResponseNorm2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FNN) and not Assigned(FLRNCL) then
+    FLRNCL := TNNetLocalResponseNormCL.Create(FNN);
+end;
+
+procedure TNNetLocalResponseNorm2D.DisableOpenCL();
+begin
+  // FLRNCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FLRNCL);
+end;
+
+function TNNetLocalResponseNorm2D.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FLRNCL) then Result := FLRNCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetLocalResponseNorm2D.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FLRNCL) then Result := FLRNCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetLocalResponseNorm2D.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FLRNCL) then Result := Result + FLRNCL.BufferBytes();
+end;
+{$ENDIF}
+
+function TNNetLocalResponseNorm2D.ComputeLRNOnOpenCL(StartTime: double;
+  HalfX, HalfY, HalfD: integer; Scale: TNeuralFloat): boolean;
+{$IFDEF OpenCL}
+var
+  SourceBuffer: cl_mem;
+{$ENDIF}
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FLRNCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    FLRNCL.Normalize(FPrevLayer.FOutput, FOutput, HalfX, HalfY, HalfD, Scale,
+      csLRNBeta, SourceBuffer, true);
+    FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit(true);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
 end;
 
 procedure TNNetLocalResponseNorm2D.Compute();
@@ -104566,8 +104760,10 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  inherited Compute();
-  FLRN.CalculateLocalResponseFrom2D(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
+  if ComputeLRNOnOpenCL(StartTime, FStruct[0] shr 1, FStruct[0] shr 1, 0,
+    csLRNAlpha / (FStruct[0] * FStruct[0])) then exit;
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  FLRN.CalculateLocalResponseFrom2D(FOutput, FLRNSqr, FStruct[0], csLRNAlpha, csLRNBeta);
   FOutput.Divi(FLRN);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

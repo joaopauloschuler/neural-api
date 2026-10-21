@@ -3095,6 +3095,53 @@ __kernel void cai_roi_align
   FDst[g_id] = acc * FCountInv;
 }
 
+// Local response normalization forward (TNNetLocalResponseNorm2D / Depth). One
+// work-item per (x,y,d): Dst = Src / (1 + FScale * sum Src^2)^FBeta, the sum over
+// the clamped box of half-widths FHalfX/FHalfY/FHalfD. The base is >= 1, so pow
+// sees no negative or zero argument. Raw layout [(y*W + x)*Depth + d].
+// Coded by Claude (AI).
+__kernel void cai_local_response_norm
+(
+  const int FSizeX,
+  const int FSizeY,
+  const int FDepth,
+  const int FHalfX,
+  const int FHalfY,
+  const int FHalfD,
+  const float FScale,
+  const float FBeta,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FSizeX * FSizeY * FDepth) return;
+  const int cell = g_id / FDepth;
+  const int d = g_id - cell * FDepth;
+  const int y = cell / FSizeX;
+  const int x = cell - y * FSizeX;
+  const int MinX = max(x - FHalfX, 0);
+  const int MaxX = min(x + FHalfX, FSizeX - 1);
+  const int MinY = max(y - FHalfY, 0);
+  const int MaxY = min(y + FHalfY, FSizeY - 1);
+  const int MinD = max(d - FHalfD, 0);
+  const int MaxD = min(d + FHalfD, FDepth - 1);
+  float SumSq = 0.0f;
+  for (int iy = MinY; iy <= MaxY; iy++)
+  {
+    for (int ix = MinX; ix <= MaxX; ix++)
+    {
+      const int Base = (iy * FSizeX + ix) * FDepth;
+      for (int id = MinD; id <= MaxD; id++)
+      {
+        const float v = FSrc[Base + id];
+        SumSq += v * v;
+      }
+    }
+  }
+  FDst[g_id] = FSrc[g_id] / pow(1.0f + FScale * SumSq, FBeta);
+}
+
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
 // The input volume is laid out depth-axis contiguous in the TVolume convention:
 // element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride
