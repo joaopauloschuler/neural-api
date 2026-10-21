@@ -73,6 +73,19 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] Probable defect (not fixed, awaits user decision; found during the
+      Restormer importer): `BuildNAFNet` and `BuildSwinIRFromSafeTensors` load
+      the conv before their `TNNetDepthToSpace` upsample unpermuted, but torch
+      `nn.PixelShuffle` reads channel `c*r*r + sy*r + sx` while DepthToSpace
+      reads `(sx*r + sy)*C + c`. Their parity tests do not see it because
+      tools/nafnet_tiny_fixture.py and tools/swinir_tiny_fixture.py implement
+      the CAI DepthToSpace order on purpose ("NOT nn.PixelShuffle"), so the
+      oracle mirrors the importer. A real NAFNet / SwinIR checkpoint would get
+      scrambled sub-pixels after every up step. Fix route: `PermuteLayerNeurons`
+      on the up convs (as `BuildRestormerFromSafeTensors` does for
+      `TNNetPixelShuffle`), and regenerate both fixtures from the real torch
+      PixelShuffle order.
+
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
       (neural/neuralvolume.pas ~10283) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
@@ -629,20 +642,28 @@ rather than acted on.
         Follow-up: `cai_transposed_attn_dots` reads q|k with a 3C stride per
         position (uncoalesced); time it on the GPU box at 1-4 MP before
         tuning.
-  - [ ] The importer and example (everything below). Everything else is existing layers: `TNNetPointwiseConvLinear`,
-      `TNNetDepthwiseConv` (the 3x3 dconv on qkv and inside GDFN),
-      `TNNetGEGLUErf` for GDFN's gelu(x1)*x2 (check that the half order matches
-      torch.chunk), `TNNetSpaceToDepth`/`TNNetPixelShuffle` (check that the
-      channel order matches torch PixelUnshuffle), `TNNetDeepConcat`, `TNNetSum`.
-      The official weights are .pth only (`torch.save({'params': state_dict})`):
-      open them with `CreatePretrainedTensorReader` (it dispatches to
-      `TNNetTorchBinReader`, the restricted unpickler, which unwraps a top-level
-      `params` / `params_ema` / `state_dict` / `model` dict), so no Python
-      converter is needed; not yet tried on a real Restormer file. Pico parity against the official `Restormer` module
-      (basicsr/models/archs/restormer_arch.py) in the ~/x venv (< 1e-4), then examples/Restormer (`--task
-      derain|deblur|denoise`, tiled inference for large photos; the tiling should
-      reuse the Real-ESRGAN/VAE tile blending helpers, not a copy) with a README.
-      Real-checkpoint runs go to the user's box (the dev VM is capped at 2 GB).
+  - [X] The importer and example LANDED: `TRestormerConfig`,
+        `RestormerTaskConfig` (official option presets),
+        `ReadRestormerConfigFromJSONFile`, `BuildRestormerFromSafeTensors[Ex]`
+        (any reader; `.pth` `{'params': ...}` read directly) and
+        examples/Restormer (`--task derain|deblur|defocus|denoise|
+        denoise-gaussian|denoise-gray`, tiled through the new shared
+        `PaddedTiledNetCompute` / `TiledNetInputSide`, which RRDBNet now uses
+        too, `--gpu`). BiasFree LayerNorm is `TNNetTokenLayerNorm`'s new
+        `pCenterOutput=false` option (CPU forward/backward + `cai_volume_norm`
+        mode 2). Pico parity vs a float64 torch reimplementation of
+        restormer_arch.py: `TestRestormerParity` 8.4e-7 (WithBias, no bias,
+        .safetensors), `TestRestormerDualPixelBiasFreeParity` 1.6e-6 (BiasFree,
+        biases, dual-pixel, .pth, save/load exact); `TestRestormerTiledOpenCL`
+        1.9e-6 on PoCL. Open follow-ups:
+    - [ ] Real-checkpoint run on the user's box (no official file was run;
+          the presets' LayerNorm/bias flags come from the official options
+          yml, and the builder rejects a preset that disagrees with the
+          checkpoint).
+    - [ ] Dual-pixel defocus in the example (importer + parity done; the
+          example reads one image, the checkpoint needs a left/right pair).
+    - [ ] GPU timing at 1-4 MP tiles (and the `cai_transposed_attn_dots`
+          coalescing follow-up above).
 - [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]
       + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
       with accumulated flow residuals + sigmoid fusion-mask blend; pico parity

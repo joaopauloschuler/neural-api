@@ -104,6 +104,8 @@ type
       pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    function RestormerParityMaxDiff(const Stem, WeightsFile: string;
+      pRoundTrip: boolean): double;
     // Loads a {"shape": [T, C, ...], "data": [...]} oracle tensor of Root as a
     // (T,1,C*...) token-major volume.
     procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
@@ -1207,6 +1209,11 @@ type
     procedure TestRIFEParity;
     procedure TestSwinIRConfigFromJSONFile;
     procedure TestSwinIRParity;
+    procedure TestRestormerParity;
+    procedure TestRestormerDualPixelBiasFreeParity;
+    procedure TestRestormerConfig;
+    procedure TestRestormerRejectsMismatchedConfig;
+    procedure TestRestormerTiledOpenCL;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -47581,6 +47588,246 @@ begin
     NN.Free;
   end;
 end;
+
+// Max |diff| of pico Restormer Stem (weights WeightsFile) vs its float64 torch
+// output; with pRoundTrip a save/load copy must reproduce the output exactly.
+function TTestNeuralPretrained.RestormerParityMaxDiff(const Stem,
+  WeightsFile: string; pRoundTrip: boolean): double;
+var
+  NN, Reloaded: TNNet;
+  Config: TRestormerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, ImgArr, ChanArr, RowArr: TJSONArray;
+  ImgInput, NetOutput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, Width, Height: integer;
+begin
+  NN := BuildRestormerFromSafeTensors(FixturePath(WeightsFile), Config,
+    {pTrainable=}false, FixturePath(Stem + '_config.json'));
+  Reloaded := nil;
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  NetOutput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath(Stem + '_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    AssertEquals(Stem + ' input width', Width, NN.Layers[0].Output.SizeX);
+    AssertEquals(Stem + ' input height', Height, NN.Layers[0].Output.SizeY);
+    AssertEquals(Stem + ' output width', Width, NN.GetLastLayer().Output.SizeX);
+    AssertEquals(Stem + ' output height', Height, NN.GetLastLayer().Output.SizeY);
+    AssertEquals(Stem + ' output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+    // (C,H,W) oracle arrays -> CAI (x, y, depth) volumes.
+    ImgInput.ReSize(Width, Height, Config.InpChannels);
+    for ChanCnt := 0 to Config.InpChannels - 1 do
+    begin
+      RowArr := TJSONArray(InputArr.Items[ChanCnt]);
+      for YCnt := 0 to Height - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Width - 1 do
+          ImgInput[XCnt, YCnt, ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    NN.GetOutput(NetOutput);
+    Result := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to Height - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Width - 1 do
+          Result := Max(Result, Abs(NetOutput[XCnt, YCnt, ChanCnt] -
+            ChanArr.Items[XCnt].AsFloat));
+      end;
+    end;
+    if pRoundTrip then
+    begin
+      Reloaded := TNNet.Create();
+      Reloaded.LoadFromString(NN.SaveToString());
+      Reloaded.Compute(ImgInput);
+      AssertEquals(Stem + ' save/load round trip', 0,
+        MaxAbsVolumeDiff(NetOutput, Reloaded.GetLastLayer().Output), 0);
+    end;
+  finally
+    RefRoot.Free;
+    NetOutput.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    Reloaded.Free;
+    NN.Free;
+  end;
+end;
+
+// tiny_restormer.*: random pico Restormer (WithBias, no conv biases, 24x16), the
+// oracle a float64 torch reimplementation of basicsr/.../restormer_arch.py.
+procedure TTestNeuralPretrained.TestRestormerParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := RestormerParityMaxDiff('tiny_restormer',
+    'tiny_restormer.safetensors', {pRoundTrip=}false);
+  WriteLn('  Restormer WithBias max|diff| = ', MaxDiff:0:9);
+  AssertTrue('restored image max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// tiny_restormer_dp.*: same torch reimplementation, dual-pixel + BiasFree + conv
+// biases, 16x24, weights in a {'params': ...} .pth like the official release.
+procedure TTestNeuralPretrained.TestRestormerDualPixelBiasFreeParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := RestormerParityMaxDiff('tiny_restormer_dp',
+    'tiny_restormer_dp.pth', {pRoundTrip=}true);
+  WriteLn('  Restormer dual-pixel BiasFree max|diff| = ', MaxDiff:0:9);
+  AssertTrue('restored image max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// The config reader and the official task presets.
+procedure TTestNeuralPretrained.TestRestormerConfig;
+var
+  Config: TRestormerConfig;
+begin
+  Config := ReadRestormerConfigFromJSONFile(
+    FixturePath('tiny_restormer_dp_config.json'));
+  AssertEquals('model_type', 'restormer', Config.ModelType);
+  AssertEquals('inp_channels', 6, Config.InpChannels);
+  AssertEquals('dim', 4, Config.Dim);
+  AssertEquals('num_blocks[3]', 1, Config.NumBlocks[3]);
+  AssertEquals('heads[2]', 2, Config.Heads[2]);
+  AssertEquals('num_refinement_blocks', 2, Config.NumRefinementBlocks);
+  AssertTrue('bias', Config.Bias);
+  AssertTrue('BiasFree', Config.BiasFreeNorm);
+  AssertTrue('dual_pixel_task', Config.DualPixelTask);
+  AssertEquals('input_width', 16, Config.InputWidth);
+  AssertEquals('input_height', 24, Config.InputHeight);
+  Config := RestormerTaskConfig('deraining');
+  AssertEquals('deraining dim', 48, Config.Dim);
+  AssertEquals('deraining num_blocks[3]', 8, Config.NumBlocks[3]);
+  AssertEquals('deraining heads[3]', 8, Config.Heads[3]);
+  AssertFalse('deraining is WithBias', Config.BiasFreeNorm);
+  AssertTrue('real_denoising is BiasFree',
+    RestormerTaskConfig('real_denoising').BiasFreeNorm);
+  AssertEquals('gray denoising channels', 1,
+    RestormerTaskConfig('gaussian_gray_denoising').InpChannels);
+  AssertEquals('GDFN hidden at dim 48 (torch int(48*2.66))', 127,
+    Trunc(48 * Config.FfnExpansionFactor));
+  AssertEquals('GDFN hidden at dim 384 (torch int(384*2.66))', 1021,
+    Trunc(384 * Config.FfnExpansionFactor));
+end;
+
+// A LayerNorm_type or bias setting that disagrees with the checkpoint must be
+// rejected: otherwise the norm bias / conv bias tensors would go unread.
+procedure TTestNeuralPretrained.TestRestormerRejectsMismatchedConfig;
+
+  function BuildError(pBiasFreeNorm, pBias: boolean): string;
+  var
+    Config: TRestormerConfig;
+    NN: TNNet;
+  begin
+    Result := '';
+    Config := ReadRestormerConfigFromJSONFile(
+      FixturePath('tiny_restormer_config.json'));
+    Config.BiasFreeNorm := pBiasFreeNorm;
+    Config.Bias := pBias;
+    NN := nil;
+    try
+      NN := BuildRestormerFromSafeTensorsEx(
+        FixturePath('tiny_restormer.safetensors'), Config, {pTrainable=}false);
+    except
+      on E: EPretrainedImportError do Result := E.Message;
+    end;
+    NN.Free;
+  end;
+
+var
+  Msg: string;
+begin
+  Msg := BuildError({pBiasFreeNorm=}true, {pBias=}false);
+  AssertTrue('BiasFree on a WithBias checkpoint: ' + Msg,
+    Pos('LayerNorm_type BiasFree', Msg) > 0);
+  Msg := BuildError({pBiasFreeNorm=}false, {pBias=}true);
+  AssertTrue('bias=true on a bias-free checkpoint: ' + Msg,
+    Pos('bias=true', Msg) > 0);
+end;
+
+// The pico dual-pixel net on a 40x30 image through PaddedTiledNetCompute (32x32
+// tiles, host outputs shared by liveness): OpenCL must match the CPU.
+procedure TTestNeuralPretrained.TestRestormerTiledOpenCL;
+{$IFDEF OpenCL}
+const
+  cImageW = 40;
+  cImageH = 30;
+  cTile = 16;
+  cTilePad = 8;
+  cTileOverlap = 8;
+var
+  Config: TRestormerConfig;
+  NNCPU, NNCL: TNNet;
+  Image, RestoredCPU, RestoredCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PixelPos: integer;
+  MaxDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Config := ReadRestormerConfigFromJSONFile(
+    FixturePath('tiny_restormer_dp_config.json'));
+  Config.InputWidth := TiledNetInputSide(cImageW, cTile, cTilePad, 8);
+  Config.InputHeight := TiledNetInputSide(cImageH, cTile, cTilePad, 8);
+  AssertEquals('tile input', 32, Config.InputWidth);
+  NNCPU := nil;
+  NNCL := nil;
+  RestoredCPU := nil;
+  RestoredCL := nil;
+  Image := TNNetVolume.Create(cImageW, cImageH, Config.InpChannels);
+  try
+    for PixelPos := 0 to Image.Size - 1 do
+      Image.FData[PixelPos] := 0.5 + 0.45 * Sin(PixelPos * 0.137);
+    NNCPU := BuildRestormerFromSafeTensorsEx(
+      FixturePath('tiny_restormer_dp.pth'), Config, {pTrainable=}false);
+    NNCPU.ShareHostOutputsByLiveness := true;
+    NNCL := BuildRestormerFromSafeTensorsEx(
+      FixturePath('tiny_restormer_dp.pth'), Config, {pTrainable=}false);
+    NNCL.ShareHostOutputsByLiveness := true;
+    NNCL.EnableOpenCL(PlatformId, DeviceId);
+    RestoredCPU := PaddedTiledNetCompute(NNCPU, Image, 8, cTilePad,
+      cTileOverlap);
+    RestoredCL := PaddedTiledNetCompute(NNCL, Image, 8, cTilePad, cTileOverlap);
+    AssertTrue('net on OpenCL', NNCL.OpenCLEnabled());
+    AssertEquals('restored width', cImageW, RestoredCPU.SizeX);
+    AssertEquals('restored height', cImageH, RestoredCPU.SizeY);
+    AssertEquals('restored channels', Config.OutChannels, RestoredCPU.Depth);
+    MaxDiff := MaxAbsVolumeDiff(RestoredCPU, RestoredCL);
+    WriteLn('  Restormer tiled OpenCL vs CPU max|diff| = ', MaxDiff:0:9);
+    AssertTrue('OpenCL vs CPU max|diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    RestoredCL.Free;
+    RestoredCPU.Free;
+    Image.Free;
+    NNCL.Free;
+    NNCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // Verifies ReadCLIPSegConfigFromJSONFile on the committed pico config.
 procedure TTestNeuralPretrained.TestCLIPSegConfigFromJSONFile;

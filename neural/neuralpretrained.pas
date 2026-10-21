@@ -11623,6 +11623,16 @@ function BuildTinyVaeDecoderFromSafeTensors(const FileName: string;
 function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
   Overlap, Pad: integer): TNNetVolume;
 
+// Net input side for an ImageSide image: the image padded to SizeMultiple when
+// Tile <= 0 or it fits one tile, else Tile + 2*TilePad, each rounded up.
+function TiledNetInputSide(ImageSide, Tile, TilePad,
+  SizeMultiple: integer): integer;
+
+// Reflect-pads Image right/bottom to a multiple of SizeMultiple (at least NN's
+// input), runs NN whole or tiled (TiledNetCompute), crops to Image x scale.
+function PaddedTiledNetCompute(NN: TNNet; Image: TNNetVolume;
+  SizeMultiple, TilePad, TileOverlap: integer): TNNetVolume;
+
 // Tiled VAE decode (port of diffusers' AutoencoderKL.enable_vae_tiling +
 // tiled_decode). Decodes a LARGE latent volume in OVERLAPPING spatial tiles
 // and feather-blends the seams so peak working-set memory is bounded by the
@@ -13342,6 +13352,68 @@ function BuildSwinIRFromSafeTensorsEx(const FileName: string;
 
 function BuildSwinIRFromSafeTensors(const FileName: string;
   out Config: TSwinIRConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
+// Restormer IMAGE-RESTORATION IMPORT (model_type "restormer"; Zamir et al. 2022,
+// arXiv:2111.09881, swz30/Restormer basicsr/models/archs/restormer_arch.py).
+// One architecture restores derained, deblurred (motion / defocus) and denoised
+// (Gaussian / real) images at the input resolution: a 4-level U-Net of
+// TransformerBlocks at full resolution.
+//   TransformerBlock(C): x += project_out(MDTA(dwconv3x3(qkv1x1(LN(x)))))
+//                        x += project_out(gelu(x1) * x2),
+//                             [x1|x2] = dwconv3x3(project_in1x1(LN(x)))  (GDFN)
+//   LN is per pixel over channels: WithBias = TNNetTokenLayerNorm, BiasFree =
+//   TNNetTokenLayerNorm(pCenterOutput=false); MDTA = TNNetTransposedChannelAttention.
+//   Down = conv3x3 C->C/2 + PixelUnshuffle(2); Up = conv3x3 C->2C + PixelShuffle(2);
+//   decoder levels 3 and 2 concat the encoder skip then reduce it with a 1x1
+//   conv, level 1 only concats; refinement blocks; output conv3x3 + input image
+//   (dual-pixel: + skip_conv(patch_embed) before the output conv, no residual).
+// Torch channel orders reach the CAI layers through load-time permutations:
+// the GDFN halves swap (TNNetGEGLUErf gates its SECOND half), the up conv's
+// sub-pixel order follows TNNetPixelShuffle (c*4 + dx*2 + dy), and a
+// TNNetGatherChannels after TNNetSpaceToDepth restores PixelUnshuffle's order.
+// The official release ships .pth only ({'params': state_dict}); open it with
+// CreatePretrainedTensorReader (BuildRestormerFromSafeTensors* already do).
+// ---------------------------------------------------------------------------
+type
+  TRestormerConfig = record
+    InpChannels, OutChannels: integer; // 3/3; 6/3 dual-pixel; 1/1 gray denoising
+    Dim: integer;                      // level-1 width (48)
+    NumBlocks: array[0..3] of integer; // TransformerBlocks per level ([4,6,6,8])
+    NumRefinementBlocks: integer;      // 4
+    Heads: array[0..3] of integer;     // MDTA heads per level ([1,2,4,8])
+    FfnExpansionFactor: double;        // 2.66; GDFN hidden = Trunc(C * factor)
+    Bias: boolean;                     // conv biases (false in every release)
+    BiasFreeNorm: boolean;             // LayerNorm_type 'BiasFree' (denoising)
+    DualPixelTask: boolean;            // dual_pixel_task (6-channel defocus)
+    InputWidth, InputHeight: integer;  // net input, multiples of 8
+    ModelType: string;                 // 'restormer'
+  end;
+
+// The official options yml of Task (deraining, motion_deblurring, real_denoising,
+// ...; '' = torch defaults); the error lists every task. Input size stays 0.
+function RestormerTaskConfig(const Task: string): TRestormerConfig;
+
+// Reads the torch Restormer kwargs (LayerNorm_type, num_blocks, ...) plus
+// input_width / input_height (or input_size); missing fields take torch defaults.
+function ReadRestormerConfigFromJSONFile(
+  const FileName: string): TRestormerConfig;
+
+function RestormerConfigToString(const Config: TRestormerConfig): string;
+
+// Builds Config's Restormer and loads every weight from Reader (caller owns it).
+// (InputWidth, InputHeight, InpChannels) in, the same size x OutChannels out.
+function BuildRestormerFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TRestormerConfig; pTrainable: boolean = true): TNNet; overload;
+
+// FileName is a .pth (the official release) or a .safetensors.
+function BuildRestormerFromSafeTensorsEx(const FileName: string;
+  const Config: TRestormerConfig; pTrainable: boolean = true): TNNet;
+
+// ConfigFileName defaults to config.json next to FileName.
+function BuildRestormerFromSafeTensors(const FileName: string;
+  out Config: TRestormerConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
@@ -66016,7 +66088,7 @@ end;
 // into a TNNetDepthwiseConv (multiplier 1: ONE neuron whose Weights volume is
 // (K, K, C)). For kernel position (kx,ky) channel c the CAI index is
 // (ky*K + kx)*C + c (the volume GetRawPtr layout the depthwise compute reads);
-// HF stores it at [c, 0, ky, kx].
+// HF stores it at [c, 0, ky, kx]. BName '' skips the bias check (bias=False).
 procedure LoadConvNeXtDepthwise(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; Ch, K: integer);
 var
@@ -66046,9 +66118,9 @@ begin
   // The per-channel bias is consumed by the caller's TNNetChannelBias
   // (LoadConvNeXtChannelVector, which repeats both checks); here only its
   // presence and length are validated, so the tensor is never decoded twice.
-  if not Reader.HasTensor(BName) then
+  if (BName <> '') and not Reader.HasTensor(BName) then
     ImportError('ConvNeXt import: missing tensor "' + BName + '".');
-  if Reader.ElementCount(BName) <> Ch then
+  if (BName <> '') and (Reader.ElementCount(BName) <> Ch) then
     ImportError('ConvNeXt import: depthwise "' + BName + '" must have ' +
       IntToStr(Ch) + ' elements.');
   W := TNNetVolume.Create;
@@ -66112,6 +66184,42 @@ begin
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
+  end;
+end;
+
+// Reorders Layer's neurons in place: neuron k takes the weights and bias that
+// neuron SourcePos[k] held (SourcePos is a permutation of the neuron indices).
+procedure PermuteLayerNeurons(Layer: TNNetLayer;
+  const SourcePos: array of integer);
+var
+  Saved: array of TNNetVolume;
+  SavedBias: array of TNeuralFloat;
+  MaxNeuronPos, NeuronPos: integer;
+begin
+  if Length(SourcePos) <> Layer.Neurons.Count then
+    ImportError('Import: internal error - a neuron permutation of ' +
+      IntToStr(Length(SourcePos)) + ' entries for ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons.');
+  MaxNeuronPos := Layer.Neurons.Count - 1;
+  Saved := nil;
+  SavedBias := nil;
+  SetLength(Saved, Layer.Neurons.Count);
+  SetLength(SavedBias, Layer.Neurons.Count);
+  try
+    for NeuronPos := 0 to MaxNeuronPos do
+    begin
+      Saved[NeuronPos] := TNNetVolume.Create;
+      Saved[NeuronPos].Copy(Layer.FArrNeurons[NeuronPos].Weights);
+      SavedBias[NeuronPos] := Layer.FArrNeurons[NeuronPos].BiasWeight;
+    end;
+    for NeuronPos := 0 to MaxNeuronPos do
+    begin
+      Layer.FArrNeurons[NeuronPos].Weights.Copy(Saved[SourcePos[NeuronPos]]);
+      Layer.FArrNeurons[NeuronPos].BiasWeight := SavedBias[SourcePos[NeuronPos]];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    for NeuronPos := 0 to MaxNeuronPos do Saved[NeuronPos].Free;
   end;
 end;
 
@@ -77955,34 +78063,27 @@ begin
   Result := ((Value + Multiple - 1) div Multiple) * Multiple;
 end;
 
-function RRDBNetTileConfig(const Config: TRRDBNetConfig;
-  ImageWidth, ImageHeight, Tile, TilePad: integer): TRRDBNetConfig;
+function TiledNetInputSide(ImageSide, Tile, TilePad,
+  SizeMultiple: integer): integer;
 var
-  Unshuffle, PaddedWidth, PaddedHeight, TileInput: integer;
+  PaddedSide, TileInput: integer;
 begin
-  Result := Config;
-  Unshuffle := Max(Config.PixelUnshuffle, 1);
-  PaddedWidth := RoundUpToMultiple(ImageWidth, Unshuffle);
-  PaddedHeight := RoundUpToMultiple(ImageHeight, Unshuffle);
-  TileInput := RoundUpToMultiple(Max(Tile, 1), Unshuffle) +
-    2 * RoundUpToMultiple(Max(TilePad, 0), Unshuffle);
-  if (Tile <= 0) or (PaddedWidth <= TileInput) then
-    Result.InputWidth := PaddedWidth
-  else
-    Result.InputWidth := TileInput;
-  if (Tile <= 0) or (PaddedHeight <= TileInput) then
-    Result.InputHeight := PaddedHeight
-  else
-    Result.InputHeight := TileInput;
+  SizeMultiple := Max(SizeMultiple, 1);
+  PaddedSide := RoundUpToMultiple(ImageSide, SizeMultiple);
+  TileInput := RoundUpToMultiple(Max(Tile, 1), SizeMultiple) +
+    2 * RoundUpToMultiple(Max(TilePad, 0), SizeMultiple);
+  if (Tile <= 0) or (PaddedSide <= TileInput) then Result := PaddedSide
+  else Result := TileInput;
 end;
 
-function RRDBNetUpscale(NN: TNNet; const Config: TRRDBNetConfig;
-  Image: TNNetVolume; TilePad, TileOverlap: integer): TNNetVolume;
+function PaddedTiledNetCompute(NN: TNNet; Image: TNNetVolume;
+  SizeMultiple, TilePad, TileOverlap: integer): TNNetVolume;
 var
-  Unshuffle, TileW, TileH, PaddedW, PaddedH: integer;
+  Scale, TileW, TileH, PaddedW, PaddedH: integer;
   Padded, Full: TNNetVolume;
 
-  // basicsr RealESRGANer mod_pad: reflect past the right / bottom edge.
+  // basicsr mod_pad / Restormer check_image_size: reflect past the right /
+  // bottom edge.
   function ReflectIndex(Pos, Extent: integer): integer;
   begin
     Result := Pos;
@@ -78010,11 +78111,12 @@ var
   end;
 
 begin
-  Unshuffle := Max(Config.PixelUnshuffle, 1);
+  SizeMultiple := Max(SizeMultiple, 1);
   TileW := NN.GetFirstLayer().Output.SizeX;
   TileH := NN.GetFirstLayer().Output.SizeY;
-  PaddedW := Max(RoundUpToMultiple(Image.SizeX, Unshuffle), TileW);
-  PaddedH := Max(RoundUpToMultiple(Image.SizeY, Unshuffle), TileH);
+  Scale := NN.GetLastLayer().Output.SizeX div TileW;
+  PaddedW := Max(RoundUpToMultiple(Image.SizeX, SizeMultiple), TileW);
+  PaddedH := Max(RoundUpToMultiple(Image.SizeY, SizeMultiple), TileH);
   Padded := TNNetVolume.Create(PaddedW, PaddedH, Image.Depth);
   Full := nil;
   try
@@ -78026,18 +78128,34 @@ begin
       Full.Copy(NN.GetLastLayer().Output);
     end
     else
-      // Pad and overlap stay multiples of the unshuffle factor so every tile
-      // start keeps the same space-to-depth phase as the whole image.
+      // Pad and overlap stay multiples of SizeMultiple so every tile start
+      // keeps the same down-sampling phase as the whole image.
       Full := TiledNetCompute(NN, Padded,
-        RoundUpToMultiple(Max(TileOverlap, 0), Unshuffle),
-        RoundUpToMultiple(Max(TilePad, 0), Unshuffle));
+        RoundUpToMultiple(Max(TileOverlap, 0), SizeMultiple),
+        RoundUpToMultiple(Max(TilePad, 0), SizeMultiple));
     Result := TNNetVolume.Create;
-    Result.CopyCropping(Full, 0, 0, Image.SizeX * Config.Scale,
-      Image.SizeY * Config.Scale);
+    Result.CopyCropping(Full, 0, 0, Image.SizeX * Scale, Image.SizeY * Scale);
   finally
     Full.Free;
     Padded.Free;
   end;
+end;
+
+function RRDBNetTileConfig(const Config: TRRDBNetConfig;
+  ImageWidth, ImageHeight, Tile, TilePad: integer): TRRDBNetConfig;
+begin
+  Result := Config;
+  Result.InputWidth := TiledNetInputSide(ImageWidth, Tile, TilePad,
+    Config.PixelUnshuffle);
+  Result.InputHeight := TiledNetInputSide(ImageHeight, Tile, TilePad,
+    Config.PixelUnshuffle);
+end;
+
+function RRDBNetUpscale(NN: TNNet; const Config: TRRDBNetConfig;
+  Image: TNNetVolume; TilePad, TileOverlap: integer): TNNetVolume;
+begin
+  Result := PaddedTiledNetCompute(NN, Image, Config.PixelUnshuffle, TilePad,
+    TileOverlap);
 end;
 
 constructor TRRDBNetUpscaler.Create(const FileName: string;
@@ -78351,33 +78469,34 @@ end;
 // NAFNet IMAGE-RESTORATION IMPORT (model_type "nafnet")
 // ===========================================================================
 
+// Integer array field FieldName of Obj; Default when it is missing or not an array.
+function ReadJSONIntArray(Obj: TJSONObject; const FieldName: string;
+  const Default: array of integer): TNeuralIntegerArray;
+var
+  Arr: TJSONArray;
+  ItemPos, MaxItemPos: integer;
+begin
+  Result := nil;
+  if (Obj.IndexOfName(FieldName) < 0) or
+     not (Obj.Find(FieldName) is TJSONArray) then
+  begin
+    SetLength(Result, Length(Default));
+    MaxItemPos := Length(Default) - 1;
+    for ItemPos := 0 to MaxItemPos do Result[ItemPos] := Default[ItemPos];
+    Exit;
+  end;
+  Arr := TJSONArray(Obj.Find(FieldName));
+  SetLength(Result, Arr.Count);
+  MaxItemPos := Arr.Count - 1;
+  for ItemPos := 0 to MaxItemPos do Result[ItemPos] := Arr.Items[ItemPos].AsInteger;
+end;
+
 function ReadNAFNetConfigFromJSONFile(
   const FileName: string): TNAFNetConfig;
 var
-  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
-
-  function ReadIntArray(const FieldName: string;
-    const Default: array of integer): TNeuralIntegerArray;
-  var
-    Arr: TJSONArray;
-    i, DefM1: integer;
-  begin
-    if (Obj.IndexOfName(FieldName) < 0) or
-       not (Obj.Find(FieldName) is TJSONArray) then
-    begin
-      SetLength(Result, Length(Default));
-      DefM1 := Length(Default) - 1;
-      for i := 0 to DefM1 do Result[i] := Default[i];
-      Exit;
-    end;
-    Arr := TJSONArray(Obj.Find(FieldName));
-    SetLength(Result, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for i := 0 to LpMax do Result[i] := Arr.Items[i].AsInteger;
-  end;
 
 begin
   if not FileExists(FileName) then
@@ -78403,9 +78522,9 @@ begin
     if Result.Width <= 0 then
       ImportError('NAFNet import: config "' + FileName +
         '" is missing the required positive field "width".');
-    Result.EncBlkNums := ReadIntArray('enc_blk_nums', [1]);
+    Result.EncBlkNums := ReadJSONIntArray(Obj, 'enc_blk_nums', [1]);
     Result.MiddleBlkNum := Obj.Get('middle_blk_num', 1);
-    Result.DecBlkNums := ReadIntArray('dec_blk_nums', [1]);
+    Result.DecBlkNums := ReadJSONIntArray(Obj, 'dec_blk_nums', [1]);
     Result.InputSize := Obj.Get('input_size', 0);
     Result.InputSizeY := 0;
   finally
@@ -79054,30 +79173,9 @@ end;
 function ReadSwinIRConfigFromJSONFile(
   const FileName: string): TSwinIRConfig;
 var
-  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
-
-  function ReadIntArray(const FieldName: string;
-    const Default: array of integer): TNeuralIntegerArray;
-  var
-    Arr: TJSONArray;
-    i, DefM1: integer;
-  begin
-    if (Obj.IndexOfName(FieldName) < 0) or
-       not (Obj.Find(FieldName) is TJSONArray) then
-    begin
-      SetLength(Result, Length(Default));
-      DefM1 := Length(Default) - 1;
-      for i := 0 to DefM1 do Result[i] := Default[i];
-      Exit;
-    end;
-    Arr := TJSONArray(Obj.Find(FieldName));
-    SetLength(Result, Arr.Count);
-    LpMax := Arr.Count - 1;
-    for i := 0 to LpMax do Result[i] := Arr.Items[i].AsInteger;
-  end;
 
 begin
   if not FileExists(FileName) then
@@ -79112,8 +79210,8 @@ begin
     if Result.EmbedDim <= 0 then
       ImportError('SwinIR import: config "' + FileName +
         '" is missing the required positive field "embed_dim".');
-    Result.Depths := ReadIntArray('depths', [6]);
-    Result.NumHeads := ReadIntArray('num_heads', [6]);
+    Result.Depths := ReadJSONIntArray(Obj, 'depths', [6]);
+    Result.NumHeads := ReadJSONIntArray(Obj, 'num_heads', [6]);
     Result.MlpRatio := Obj.Get('mlp_ratio', 2.0);
     Result.NumFeat := Obj.Get('num_feat', 64);
     Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
@@ -79480,6 +79578,542 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinIRConfigFromJSONFile(ConfigPath);
   Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// Restormer IMAGE-RESTORATION IMPORT (model_type "restormer")
+// ===========================================================================
+
+const
+  cRestormerDefaultFfnExpansion: double = 2.66;
+  cRestormerLevels = 4;
+  cRestormerNormEps = 1e-5;
+
+function RestormerTaskConfig(const Task: string): TRestormerConfig;
+begin
+  Result.ModelType := 'restormer';
+  Result.InpChannels := 3;
+  Result.OutChannels := 3;
+  Result.Dim := 48;
+  Result.NumBlocks[0] := 4;
+  Result.NumBlocks[1] := 6;
+  Result.NumBlocks[2] := 6;
+  Result.NumBlocks[3] := 8;
+  Result.NumRefinementBlocks := 4;
+  Result.Heads[0] := 1;
+  Result.Heads[1] := 2;
+  Result.Heads[2] := 4;
+  Result.Heads[3] := 8;
+  Result.FfnExpansionFactor := cRestormerDefaultFfnExpansion;
+  Result.Bias := false;
+  Result.BiasFreeNorm := false;
+  Result.DualPixelTask := false;
+  Result.InputWidth := 0;
+  Result.InputHeight := 0;
+  if (Task = '') or (Task = 'deraining') or (Task = 'motion_deblurring') or
+     (Task = 'single_image_defocus_deblurring') then
+    // WithBias LayerNorm, 3 -> 3 channels: the defaults above.
+  else if Task = 'dual_pixel_defocus_deblurring' then
+  begin
+    Result.InpChannels := 6;
+    Result.DualPixelTask := true;
+  end
+  else if (Task = 'real_denoising') or (Task = 'gaussian_color_denoising') then
+    Result.BiasFreeNorm := true
+  else if Task = 'gaussian_gray_denoising' then
+  begin
+    Result.BiasFreeNorm := true;
+    Result.InpChannels := 1;
+    Result.OutChannels := 1;
+  end
+  else
+    ImportError('Restormer import: unknown task "' + Task + '" (deraining, ' +
+      'motion_deblurring, single_image_defocus_deblurring, ' +
+      'dual_pixel_defocus_deblurring, real_denoising, ' +
+      'gaussian_color_denoising, gaussian_gray_denoising).');
+end;
+
+function ReadRestormerConfigFromJSONFile(
+  const FileName: string): TRestormerConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  NumBlocks, Heads: TNeuralIntegerArray;
+  LevelPos: integer;
+  NormType: string;
+begin
+  if not FileExists(FileName) then
+    ImportError('Restormer import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Restormer import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Restormer import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result := RestormerTaskConfig('');
+    Result.ModelType := Obj.Get('model_type', 'restormer');
+    Result.InpChannels := Obj.Get('inp_channels', Result.InpChannels);
+    Result.OutChannels := Obj.Get('out_channels', Result.OutChannels);
+    Result.Dim := Obj.Get('dim', Result.Dim);
+    NumBlocks := ReadJSONIntArray(Obj, 'num_blocks', Result.NumBlocks);
+    Heads := ReadJSONIntArray(Obj, 'heads', Result.Heads);
+    if (Length(NumBlocks) <> cRestormerLevels) or
+       (Length(Heads) <> cRestormerLevels) then
+      ImportError('Restormer import: num_blocks and heads need ' +
+        IntToStr(cRestormerLevels) + ' entries (one per U-Net level).');
+    for LevelPos := 0 to cRestormerLevels - 1 do
+    begin
+      Result.NumBlocks[LevelPos] := NumBlocks[LevelPos];
+      Result.Heads[LevelPos] := Heads[LevelPos];
+    end;
+    Result.NumRefinementBlocks := Obj.Get('num_refinement_blocks',
+      Result.NumRefinementBlocks);
+    Result.FfnExpansionFactor := Obj.Get('ffn_expansion_factor',
+      Result.FfnExpansionFactor);
+    Result.Bias := Obj.Get('bias', Result.Bias);
+    NormType := Obj.Get('LayerNorm_type', 'WithBias');
+    if NormType = 'BiasFree' then Result.BiasFreeNorm := true
+    else if NormType <> 'WithBias' then
+      ImportError('Restormer import: LayerNorm_type must be WithBias or ' +
+        'BiasFree, got "' + NormType + '".');
+    Result.DualPixelTask := Obj.Get('dual_pixel_task', Result.DualPixelTask);
+    Result.InputWidth := Obj.Get('input_width', Obj.Get('input_size', 0));
+    Result.InputHeight := Obj.Get('input_height', Result.InputWidth);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RestormerConfigToString(const Config: TRestormerConfig): string;
+var
+  LevelPos: integer;
+  BlocksText, HeadsText, NormText: string;
+begin
+  BlocksText := '';
+  HeadsText := '';
+  for LevelPos := 0 to cRestormerLevels - 1 do
+  begin
+    if LevelPos > 0 then
+    begin
+      BlocksText := BlocksText + ',';
+      HeadsText := HeadsText + ',';
+    end;
+    BlocksText := BlocksText + IntToStr(Config.NumBlocks[LevelPos]);
+    HeadsText := HeadsText + IntToStr(Config.Heads[LevelPos]);
+  end;
+  if Config.BiasFreeNorm then NormText := 'BiasFree' else NormText := 'WithBias';
+  Result := Config.ModelType + ' config: inp_channels=' +
+    IntToStr(Config.InpChannels) + ', out_channels=' +
+    IntToStr(Config.OutChannels) + ', dim=' + IntToStr(Config.Dim) +
+    ', num_blocks=[' + BlocksText + '], num_refinement_blocks=' +
+    IntToStr(Config.NumRefinementBlocks) + ', heads=[' + HeadsText +
+    '], ffn_expansion_factor=' + FloatToStr(Config.FfnExpansionFactor) +
+    ', bias=' + BoolToStr(Config.Bias, 'true', 'false') +
+    ', LayerNorm_type=' + NormText + ', dual_pixel_task=' +
+    BoolToStr(Config.DualPixelTask, 'true', 'false') + ', input=' +
+    IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
+end;
+
+type
+  // Layer refs needed to load one Restormer TransformerBlock's weights. The
+  // depthwise bias layers are nil when the config has no conv biases.
+  TRestormerBlockLayers = record
+    Norm1, Qkv, QkvDw, QkvDwBias, Attention, AttnOut: TNNetLayer;
+    Norm2, FfnIn, FfnDw, FfnDwBias, FfnOut: TNNetLayer;
+  end;
+  TRestormerLevelLayers = array of TRestormerBlockLayers;
+
+// GDFN hidden width: torch int(dim * ffn_expansion_factor), in double.
+function RestormerHiddenChannels(C: integer; Factor: double): integer;
+begin
+  Result := Trunc(C * Factor);
+end;
+
+// Appends one TransformerBlock(C) after Source and returns its output.
+function AddRestormerBlock(NN: TNNet; Source: TNNetLayer;
+  C, Heads: integer; const Config: TRestormerConfig; pTrainable: boolean;
+  out Refs: TRestormerBlockLayers): TNNetLayer;
+var
+  SuppressBias, Hidden: integer;
+  AttnSum: TNNetLayer;
+begin
+  if Config.Bias then SuppressBias := 0 else SuppressBias := 1;
+  Hidden := RestormerHiddenChannels(C, Config.FfnExpansionFactor);
+  // --- attention: norm1 -> qkv 1x1 -> 3x3 depthwise -> MDTA -> project_out ---
+  Refs.Norm1 := NN.AddLayerAfter(VaeLayerTrainable(TNNetTokenLayerNorm.Create(
+    cRestormerNormEps, true, not Config.BiasFreeNorm), pTrainable), Source);
+  Refs.Qkv := NN.AddLayer(VaeLayerTrainable(
+    TNNetPointwiseConvLinear.Create(3 * C, SuppressBias), pTrainable));
+  // Multiplier 1, pad 1, stride 1; its per-channel bias rides a ChannelBias.
+  Refs.QkvDw := NN.AddLayer(VaeLayerTrainable(
+    TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), pTrainable));
+  Refs.QkvDwBias := nil;
+  if Config.Bias then
+    Refs.QkvDwBias := NN.AddLayer(VaeLayerTrainable(TNNetChannelBias.Create(),
+      pTrainable));
+  Refs.Attention := NN.AddLayer(VaeLayerTrainable(
+    TNNetTransposedChannelAttention.Create(Heads), pTrainable));
+  Refs.AttnOut := NN.AddLayer(VaeLayerTrainable(
+    TNNetPointwiseConvLinear.Create(C, SuppressBias), pTrainable));
+  AttnSum := NN.AddLayer(VaeLayerTrainable(
+    TNNetSum.Create([Refs.AttnOut, Source]), pTrainable));
+  // --- GDFN: norm2 -> project_in 1x1 -> 3x3 depthwise -> gate -> project_out ---
+  Refs.Norm2 := NN.AddLayer(VaeLayerTrainable(TNNetTokenLayerNorm.Create(
+    cRestormerNormEps, true, not Config.BiasFreeNorm), pTrainable));
+  Refs.FfnIn := NN.AddLayer(VaeLayerTrainable(
+    TNNetPointwiseConvLinear.Create(2 * Hidden, SuppressBias), pTrainable));
+  Refs.FfnDw := NN.AddLayer(VaeLayerTrainable(
+    TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), pTrainable));
+  Refs.FfnDwBias := nil;
+  if Config.Bias then
+    Refs.FfnDwBias := NN.AddLayer(VaeLayerTrainable(TNNetChannelBias.Create(),
+      pTrainable));
+  NN.AddLayer(VaeLayerTrainable(TNNetGEGLUErf.Create(), pTrainable));
+  Refs.FfnOut := NN.AddLayer(VaeLayerTrainable(
+    TNNetPointwiseConvLinear.Create(C, SuppressBias), pTrainable));
+  Result := NN.AddLayer(VaeLayerTrainable(
+    TNNetSum.Create([Refs.FfnOut, AttnSum]), pTrainable));
+end;
+
+// Appends BlockCount TransformerBlocks(C) after Source; returns the last output.
+function AddRestormerLevel(NN: TNNet; Source: TNNetLayer;
+  C, Heads, BlockCount: integer; const Config: TRestormerConfig;
+  pTrainable: boolean; out Blocks: TRestormerLevelLayers): TNNetLayer;
+var
+  BlockPos, MaxBlockPos: integer;
+begin
+  if C mod Heads <> 0 then
+    ImportError('Restormer import: width ' + IntToStr(C) +
+      ' is not divisible by ' + IntToStr(Heads) + ' heads.');
+  Blocks := nil;
+  SetLength(Blocks, BlockCount);
+  Result := Source;
+  MaxBlockPos := BlockCount - 1;
+  for BlockPos := 0 to MaxBlockPos do
+    Result := AddRestormerBlock(NN, Result, C, Heads, Config, pTrainable,
+      Blocks[BlockPos]);
+end;
+
+// Channel list that turns TNNetSpaceToDepth(2)'s (dx*2 + dy)*C + ic order into
+// torch PixelUnshuffle(2)'s ic*4 + dy*2 + dx.
+function RestormerPixelUnshuffleChannels(C: integer): TNeuralIntegerArray;
+var
+  ChannelPos, MaxChannelPos, dx, dy: integer;
+begin
+  Result := nil;
+  SetLength(Result, 4 * C);
+  MaxChannelPos := C - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+    for dy := 0 to 1 do
+      for dx := 0 to 1 do
+        Result[ChannelPos * 4 + dy * 2 + dx] := (dx * 2 + dy) * C + ChannelPos;
+end;
+
+// Source neuron of each up-conv neuron: TNNetPixelShuffle(2) reads channel
+// c*4 + dx*2 + dy where torch PixelShuffle(2) reads c*4 + dy*2 + dx.
+function RestormerPixelShuffleNeurons(OutCh: integer): TNeuralIntegerArray;
+var
+  ChannelPos, MaxChannelPos, dx, dy: integer;
+begin
+  Result := nil;
+  SetLength(Result, 4 * OutCh);
+  MaxChannelPos := OutCh - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+    for dx := 0 to 1 do
+      for dy := 0 to 1 do
+        Result[ChannelPos * 4 + dx * 2 + dy] := ChannelPos * 4 + dy * 2 + dx;
+end;
+
+// Source of each channel when the two halves of Count channels swap places.
+function RestormerHalfSwap(Count: integer): TNeuralIntegerArray;
+var
+  ChannelPos, MaxChannelPos, Half: integer;
+begin
+  Result := nil;
+  SetLength(Result, Count);
+  Half := Count div 2;
+  MaxChannelPos := Count - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+    Result[ChannelPos] := (ChannelPos + Half) mod Count;
+end;
+
+// Reorders the depth axis of Layer's single neuron (a depthwise conv or a
+// channel bias): channel k takes channel SourcePos[k].
+procedure PermuteSingleNeuronDepth(Layer: TNNetLayer;
+  const SourcePos: array of integer);
+var
+  Saved: TNNetVolume;
+begin
+  Saved := TNNetVolume.Create;
+  try
+    Saved.Copy(Layer.FArrNeurons[0].Weights);
+    Layer.FArrNeurons[0].Weights.CopyChannels(Saved, SourcePos);
+    Layer.FlushWeightCache();
+  finally
+    Saved.Free;
+  end;
+end;
+
+procedure LoadRestormerBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TRestormerBlockLayers; const Prefix: string; C: integer;
+  const Config: TRestormerConfig);
+var
+  Hidden: integer;
+  FfnSwap: TNeuralIntegerArray;
+
+  function BiasName(const ConvName: string): string;
+  begin
+    if Config.Bias then Result := Prefix + ConvName + '.bias' else Result := '';
+  end;
+
+begin
+  Hidden := RestormerHiddenChannels(C, Config.FfnExpansionFactor);
+  LoadAffineNormWeights(Reader, Refs.Norm1, Prefix + 'norm1.body.weight',
+    Prefix + 'norm1.body.bias', C, 0, {HasBeta=}true,
+    {BetaFromTensor=}not Config.BiasFreeNorm, {ValidateBeta=}true, 'Restormer');
+  LoadVaeConv(Reader, Refs.Qkv, Prefix + 'attn.qkv.weight',
+    BiasName('attn.qkv'), 3 * C, C, 1);
+  LoadConvNeXtDepthwise(Reader, Refs.QkvDw, Prefix + 'attn.qkv_dwconv.weight',
+    BiasName('attn.qkv_dwconv'), 3 * C, 3);
+  if Config.Bias then
+    LoadConvNeXtChannelVector(Reader, Refs.QkvDwBias,
+      Prefix + 'attn.qkv_dwconv.bias', 0, 3 * C);
+  LoadConvNeXtChannelVector(Reader, Refs.Attention, Prefix + 'attn.temperature',
+    0, TNNetTransposedChannelAttention(Refs.Attention).Heads);
+  LoadVaeConv(Reader, Refs.AttnOut, Prefix + 'attn.project_out.weight',
+    BiasName('attn.project_out'), C, C, 1);
+  LoadAffineNormWeights(Reader, Refs.Norm2, Prefix + 'norm2.body.weight',
+    Prefix + 'norm2.body.bias', C, 0, {HasBeta=}true,
+    {BetaFromTensor=}not Config.BiasFreeNorm, {ValidateBeta=}true, 'Restormer');
+  // torch gates gelu(x1) * x2; TNNetGEGLUErf computes A * gelu(B), so the
+  // project_in rows and the depthwise channels load with their halves swapped.
+  FfnSwap := RestormerHalfSwap(2 * Hidden);
+  LoadVaeConv(Reader, Refs.FfnIn, Prefix + 'ffn.project_in.weight',
+    BiasName('ffn.project_in'), 2 * Hidden, C, 1);
+  PermuteLayerNeurons(Refs.FfnIn, FfnSwap);
+  LoadConvNeXtDepthwise(Reader, Refs.FfnDw, Prefix + 'ffn.dwconv.weight',
+    BiasName('ffn.dwconv'), 2 * Hidden, 3);
+  PermuteSingleNeuronDepth(Refs.FfnDw, FfnSwap);
+  if Config.Bias then
+  begin
+    LoadConvNeXtChannelVector(Reader, Refs.FfnDwBias, Prefix + 'ffn.dwconv.bias',
+      0, 2 * Hidden);
+    PermuteSingleNeuronDepth(Refs.FfnDwBias, FfnSwap);
+  end;
+  LoadVaeConv(Reader, Refs.FfnOut, Prefix + 'ffn.project_out.weight',
+    BiasName('ffn.project_out'), C, Hidden, 1);
+end;
+
+procedure LoadRestormerLevel(Reader: TNNetSafeTensorsReader;
+  const Blocks: TRestormerLevelLayers; const Prefix: string; C: integer;
+  const Config: TRestormerConfig);
+var
+  BlockPos, MaxBlockPos: integer;
+begin
+  MaxBlockPos := High(Blocks);
+  for BlockPos := 0 to MaxBlockPos do
+    LoadRestormerBlock(Reader, Blocks[BlockPos],
+      Prefix + '.' + IntToStr(BlockPos) + '.', C, Config);
+end;
+
+function BuildRestormerFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TRestormerConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  InputLayer, PatchEmbed, SkipConv, OutputConv, Cur: TNNetLayer;
+  EncoderOut, DownConvs, UpConvs, ReduceConvs: array[0..2] of TNNetLayer;
+  EncoderBlocks, DecoderBlocks: array[0..2] of TRestormerLevelLayers;
+  LatentBlocks, RefinementBlocks: TRestormerLevelLayers;
+  LevelPos, C, SuppressBias, LevelWidth: integer;
+  Prefix, LevelName, SkipBias, OutputBias: string;
+begin
+  if Config.Dim < 2 then
+    ImportError('Restormer import: dim must be >= 2.');
+  if Config.FfnExpansionFactor <= 0 then
+    ImportError('Restormer import: ffn_expansion_factor must be > 0.');
+  if (Config.InputWidth < 8) or (Config.InputHeight < 8) or
+     (Config.InputWidth mod 8 <> 0) or (Config.InputHeight mod 8 <> 0) then
+    ImportError('Restormer import: input ' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight) + ' must be a positive multiple of 8 ' +
+      '(three 2x downsamples); pad the image (PaddedTiledNetCompute).');
+  if (not Config.DualPixelTask) and
+     (Config.InpChannels <> Config.OutChannels) then
+    ImportError('Restormer import: the global residual needs inp_channels = ' +
+      'out_channels unless dual_pixel_task.');
+  Prefix := FindTensorKeyPrefix(Reader, 'patch_embed.proj.weight');
+  // A mismatched preset would leave checkpoint tensors unread.
+  if Config.NumBlocks[0] > 0 then
+  begin
+    if Reader.HasTensor(Prefix + 'encoder_level1.0.norm1.body.bias') =
+       Config.BiasFreeNorm then
+      ImportError('Restormer import: the checkpoint''s LayerNorms are ' +
+        BoolToStr(Config.BiasFreeNorm, 'WithBias', 'BiasFree') +
+        ' but the config says LayerNorm_type ' +
+        BoolToStr(Config.BiasFreeNorm, 'BiasFree', 'WithBias') + '.');
+    if Reader.HasTensor(Prefix + 'encoder_level1.0.attn.qkv.bias') <>
+       Config.Bias then
+      ImportError('Restormer import: the checkpoint''s convs are ' +
+        BoolToStr(Config.Bias, 'bias-free', 'biased') + ' but the config ' +
+        'says bias=' + BoolToStr(Config.Bias, 'true', 'false') + '.');
+  end;
+  if Config.Bias then SuppressBias := 0 else SuppressBias := 1;
+  SkipConv := nil;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    InputLayer := NN.AddLayer(TNNetInput.Create(Config.InputWidth,
+      Config.InputHeight, Config.InpChannels));
+    // torch builds OverlapPatchEmbed(inp_channels, dim): never biased.
+    PatchEmbed := NN.AddLayer(VaeLayerTrainable(
+      TNNetConvolutionLinear.Create(Config.Dim, 3, 1, 1, 1),
+      pTrainable));
+    Cur := PatchEmbed;
+    C := Config.Dim;
+    for LevelPos := 0 to 2 do
+    begin
+      EncoderOut[LevelPos] := AddRestormerLevel(NN, Cur, C,
+        Config.Heads[LevelPos], Config.NumBlocks[LevelPos], Config, pTrainable,
+        EncoderBlocks[LevelPos]);
+      // Downsample: conv3x3 C -> C/2 (never biased), PixelUnshuffle(2) -> 2C.
+      DownConvs[LevelPos] := NN.AddLayer(VaeLayerTrainable(
+        TNNetConvolutionLinear.Create(C div 2, 3, 1, 1, 1), pTrainable));
+      NN.AddLayer(VaeLayerTrainable(TNNetSpaceToDepth.Create(2), pTrainable));
+      Cur := NN.AddLayer(VaeLayerTrainable(TNNetGatherChannels.Create(
+        RestormerPixelUnshuffleChannels(C div 2)), pTrainable));
+      C := C * 2;
+    end;
+    Cur := AddRestormerLevel(NN, Cur, C, Config.Heads[3], Config.NumBlocks[3],
+      Config, pTrainable, LatentBlocks);
+    for LevelPos := 2 downto 0 do
+    begin
+      // Upsample: conv3x3 C -> 2C (never biased), PixelShuffle(2) -> C/2.
+      UpConvs[LevelPos] := NN.AddLayer(VaeLayerTrainable(
+        TNNetConvolutionLinear.Create(2 * C, 3, 1, 1, 1), pTrainable));
+      NN.AddLayer(VaeLayerTrainable(TNNetPixelShuffle.Create(2), pTrainable));
+      // torch.cat([up, skip], 1): C/2 + C/2 = C channels.
+      Cur := NN.AddLayer(VaeLayerTrainable(TNNetDeepConcat.Create(
+        [NN.GetLastLayer(), EncoderOut[LevelPos]]), pTrainable));
+      ReduceConvs[LevelPos] := nil;
+      if LevelPos > 0 then
+      begin
+        ReduceConvs[LevelPos] := NN.AddLayer(VaeLayerTrainable(
+          TNNetPointwiseConvLinear.Create(C div 2, SuppressBias), pTrainable));
+        Cur := ReduceConvs[LevelPos];
+        C := C div 2;
+      end;
+      Cur := AddRestormerLevel(NN, Cur, C, Config.Heads[LevelPos],
+        Config.NumBlocks[LevelPos], Config, pTrainable, DecoderBlocks[LevelPos]);
+    end;
+    Cur := AddRestormerLevel(NN, Cur, C, Config.Heads[0],
+      Config.NumRefinementBlocks, Config, pTrainable, RefinementBlocks);
+    if Config.DualPixelTask then
+    begin
+      SkipConv := NN.AddLayerAfter(VaeLayerTrainable(
+        TNNetPointwiseConvLinear.Create(C, SuppressBias), pTrainable), PatchEmbed);
+      NN.AddLayer(VaeLayerTrainable(TNNetSum.Create([Cur, SkipConv]),
+        pTrainable));
+    end;
+    OutputConv := NN.AddLayer(VaeLayerTrainable(TNNetConvolutionLinear.Create(
+      Config.OutChannels, 3, 1, 1, SuppressBias), pTrainable));
+    if not Config.DualPixelTask then
+      NN.AddLayer(VaeLayerTrainable(TNNetSum.Create([OutputConv, InputLayer]),
+        pTrainable));
+
+    // ---------------- Weights ----------------
+    if Config.Bias then
+    begin
+      SkipBias := Prefix + 'skip_conv.bias';
+      OutputBias := Prefix + 'output.bias';
+    end
+    else
+    begin
+      SkipBias := '';
+      OutputBias := '';
+    end;
+    LoadVaeConv(Reader, PatchEmbed, Prefix + 'patch_embed.proj.weight', '',
+      Config.Dim, Config.InpChannels, 3);
+    C := Config.Dim;
+    for LevelPos := 0 to 2 do
+    begin
+      LoadRestormerLevel(Reader, EncoderBlocks[LevelPos],
+        Prefix + 'encoder_level' + IntToStr(LevelPos + 1), C, Config);
+      LoadVaeConv(Reader, DownConvs[LevelPos], Prefix + 'down' +
+        IntToStr(LevelPos + 1) + '_' + IntToStr(LevelPos + 2) + '.body.0.weight',
+        '', C div 2, C, 3);
+      C := C * 2;
+    end;
+    LoadRestormerLevel(Reader, LatentBlocks, Prefix + 'latent', C, Config);
+    for LevelPos := 2 downto 0 do
+    begin
+      LevelName := IntToStr(LevelPos + 1);
+      LoadVaeConv(Reader, UpConvs[LevelPos], Prefix + 'up' +
+        IntToStr(LevelPos + 2) + '_' + LevelName + '.body.0.weight', '', 2 * C,
+        C, 3);
+      PermuteLayerNeurons(UpConvs[LevelPos], RestormerPixelShuffleNeurons(C div 2));
+      if LevelPos > 0 then
+      begin
+        if Config.Bias then
+          LoadVaeConv(Reader, ReduceConvs[LevelPos],
+            Prefix + 'reduce_chan_level' + LevelName + '.weight',
+            Prefix + 'reduce_chan_level' + LevelName + '.bias', C div 2, C, 1)
+        else
+          LoadVaeConv(Reader, ReduceConvs[LevelPos],
+            Prefix + 'reduce_chan_level' + LevelName + '.weight', '', C div 2,
+            C, 1);
+        C := C div 2;
+      end;
+      LoadRestormerLevel(Reader, DecoderBlocks[LevelPos],
+        Prefix + 'decoder_level' + LevelName, C, Config);
+    end;
+    LoadRestormerLevel(Reader, RefinementBlocks, Prefix + 'refinement', C,
+      Config);
+    LevelWidth := C;
+    if Config.DualPixelTask then
+      LoadVaeConv(Reader, SkipConv, Prefix + 'skip_conv.weight', SkipBias,
+        LevelWidth, Config.Dim, 1);
+    LoadVaeConv(Reader, OutputConv, Prefix + 'output.weight', OutputBias,
+      Config.OutChannels, LevelWidth, 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRestormerFromSafeTensorsEx(const FileName: string;
+  const Config: TRestormerConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRestormerFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRestormerFromSafeTensors(const FileName: string;
+  out Config: TRestormerConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRestormerConfigFromJSONFile(ConfigPath);
+  Result := BuildRestormerFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -93408,39 +94042,23 @@ end;
 // place (each neuron carries one output row's weights + bias).
 procedure PermuteFinalLinPatchAxes(Layer: TNNetLayer; P, OutCh: integer);
 var
-  Saved: array of TNNetVolume;
-  SavedBias: array of TNeuralFloat;
-  ph, pw, ic, SrcIdx, DstIdx, N, NM1, PM1, OutChM1: integer;
+  SourcePos: TNeuralIntegerArray;
+  ph, pw, ic, N, PM1, OutChM1: integer;
 begin
   N := P * P * OutCh;
-  NM1 := N - 1;
   PM1 := P - 1;
   OutChM1 := OutCh - 1;
   if Layer.Neurons.Count <> N then
     ImportError('DiT import: internal error - final linear has ' +
       IntToStr(Layer.Neurons.Count) + ' neurons, expected ' + IntToStr(N) + '.');
-  SetLength(Saved, N);
-  SetLength(SavedBias, N);
-  for SrcIdx := 0 to NM1 do
-  begin
-    Saved[SrcIdx] := TNNetVolume.Create;
-    Saved[SrcIdx].Copy(Layer.FArrNeurons[SrcIdx].Weights);
-    SavedBias[SrcIdx] := Layer.FArrNeurons[SrcIdx].BiasWeight;
-  end;
-  try
-    for ph := 0 to PM1 do
-      for pw := 0 to PM1 do
-        for ic := 0 to OutChM1 do
-        begin
-          SrcIdx := (ph * P + pw) * OutCh + ic;  // reference order
-          DstIdx := (pw * P + ph) * OutCh + ic;  // DepthToSpace order
-          Layer.FArrNeurons[DstIdx].Weights.Copy(Saved[SrcIdx]);
-          Layer.FArrNeurons[DstIdx].BiasWeight := SavedBias[SrcIdx];
-        end;
-    Layer.FlushWeightCache();
-  finally
-    for SrcIdx := 0 to NM1 do Saved[SrcIdx].Free;
-  end;
+  SourcePos := nil;
+  SetLength(SourcePos, N);
+  for ph := 0 to PM1 do
+    for pw := 0 to PM1 do
+      for ic := 0 to OutChM1 do
+        // DepthToSpace order <- reference order.
+        SourcePos[(pw * P + ph) * OutCh + ic] := (ph * P + pw) * OutCh + ic;
+  PermuteLayerNeurons(Layer, SourcePos);
 end;
 
 function BuildDiT(Reader: TNNetSafeTensorsReader; const Config: TDiTConfig;

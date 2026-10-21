@@ -5790,12 +5790,13 @@ type
     // The next forwards write their result into a retained reference to
     // Buffer (Bytes long) in place of the private result buffer.
     procedure AdoptResultBuffer(Buffer: cl_mem; Bytes: csize_t);
-    // Normalizes NumSegments contiguous segments of X into Y; Gain/Bias are
-    // SegmentSize long (Bias nil if not UseMean); pExternalSrc is borrowed.
+    // Normalizes NumSegments segments of X into Y; Gain/Bias are SegmentSize long
+    // (Bias nil if not UseMean, pExternalSrc borrowed); pCenterOutput=false: no mean in Y.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
       NumSegments, SegmentSize: integer; UseMean: boolean; Eps: TNeuralFloat;
       pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
-      pKeepResultOnOpenCL: boolean = false);
+      pKeepResultOnOpenCL: boolean = false;
+      pCenterOutput: boolean = true);
   end;
 
   /// OpenCL forward helper for TNNetGroupNorm (and its Groups=Depth limit
@@ -9585,11 +9586,14 @@ type
   // exact per-token LayerNorm Jacobian and accumulates gamma/beta gradients
   // over all tokens. pElementwiseAffine=false (FStruct[0]=1) is
   // nn.LayerNorm(elementwise_affine=False): no neurons, y = x_hat.
+  // pCenterOutput=false (FStruct[1]=1) keeps the variance around the mean but
+  // drops it from the output: x_hat = x / sqrt(var + eps) (Restormer BiasFree).
   // Coded by Claude (AI).
   TNNetTokenLayerNorm = class(TNNetNormWithOpenCL)
     private
       FTokenLNEpsilon: TNeuralFloat;
       FElementwiseAffine: boolean;
+      FCenterOutput: boolean;
       FNormalized: TNNetVolume;   // x_hat, same shape as the input
       FInvStd: TNNetVolume;       // per-token 1/sqrt(var+eps), SizeX x SizeY x 1
       FOnes: TNNetVolume;         // Depth-length ones vector for the mean reduction
@@ -9612,13 +9616,15 @@ type
     public
       constructor Create(); overload; override;
       constructor Create(pEpsilon: TNeuralFloat;
-        pElementwiseAffine: boolean = true); reintroduce; overload;
+        pElementwiseAffine: boolean = true;
+        pCenterOutput: boolean = true); reintroduce; overload;
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       property ElementwiseAffine: boolean read FElementwiseAffine;
+      property CenterOutput: boolean read FCenterOutput;
   end;
 
   /// This layer does per-sample root-mean-square layer normalization. Each
@@ -41175,7 +41181,8 @@ end;
 procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
   Y: TNNetVolume; NumSegments, SegmentSize: integer; UseMean: boolean;
   Eps: TNeuralFloat; pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
-  pKeepResultOnOpenCL: boolean = false);
+  pKeepResultOnOpenCL: boolean = false;
+  pCenterOutput: boolean = true);
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
@@ -41184,7 +41191,9 @@ var
   fEps: single;
 begin
   k := FKernel.Kernel;
-  if UseMean then iUseMean := 1 else iUseMean := 0;
+  if not UseMean then iUseMean := 0
+  else if pCenterOutput then iUseMean := 1
+  else iUseMean := 2;
   fEps := Eps;
   // The kernel's strided loops take any group size.
   LocalSize := ReductionLocalSize(SegmentSize);
@@ -84285,6 +84294,7 @@ begin
   FTokenLNEpsilon := 1e-5;
   FFloatSt[0] := FTokenLNEpsilon;
   FElementwiseAffine := true;
+  FCenterOutput := true;
   FNormalized := TNNetVolume.Create();
   FInvStd := TNNetVolume.Create();
   FOnes := TNNetVolume.Create();
@@ -84294,7 +84304,7 @@ begin
 end;
 
 constructor TNNetTokenLayerNorm.Create(pEpsilon: TNeuralFloat;
-  pElementwiseAffine: boolean);
+  pElementwiseAffine: boolean; pCenterOutput: boolean);
 begin
   Create();
   if pEpsilon > 0 then FTokenLNEpsilon := pEpsilon;
@@ -84303,6 +84313,8 @@ begin
   // 0 is affine, the value InitStruct leaves, so files without the flag load
   // as affine.
   if pElementwiseAffine then FStruct[0] := 0 else FStruct[0] := 1;
+  FCenterOutput := pCenterOutput;
+  if pCenterOutput then FStruct[1] := 0 else FStruct[1] := 1;
 end;
 
 destructor TNNetTokenLayerNorm.Destroy();
@@ -84384,7 +84396,7 @@ var
   StartTime: double;
   Depth, TokenCnt, TokenMax, BaseIdx: integer;
   Mean, Variance, InvStdDev: TNeuralFloat;
-  KeepNorm, IsAffine: boolean;
+  KeepNorm, IsAffine, IsCentered: boolean;
   GammaPtr, BetaPtr, OnesPtr: TNeuralFloatArrPtr;
   XPtr, XHatPtr: TNeuralFloatArrPtr;
 begin
@@ -84416,6 +84428,7 @@ begin
   // primitives (mirrors TNNetTokenRMSNorm.Compute, plus the mean subtraction).
   TokenMax := (FOutput.Size div Depth) - 1;
   IsAffine := FElementwiseAffine;
+  IsCentered := FCenterOutput;
   if IsAffine then
   begin
     GammaPtr := FNeurons[0].FWeights.GetRawPtr();
@@ -84443,8 +84456,11 @@ begin
     // var = mean( centered^2 ) via the vectorized dot product with itself.
     Variance := TNNetVolume.DotProduct(XPtr, XPtr, Depth) / Depth;
     InvStdDev := 1 / Sqrt(Variance + FTokenLNEpsilon);
-    // x_hat = centered * invStd, in place.
+    // x_hat = centered * invStd, in place; without output centering
+    // x_hat = x * invStd = centered * invStd + mean * invStd.
     TNNetVolume.Mul(XPtr, InvStdDev, Depth);
+    if not IsCentered then
+      TNNetVolume.MulAdd(XPtr, OnesPtr, Mean * InvStdDev, Depth);
     if KeepNorm then
     begin
       FInvStd.FData[TokenCnt] := InvStdDev;
@@ -84484,11 +84500,11 @@ begin
     FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
       FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon,
       {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
-      KeepOnOpenCL)
+      KeepOnOpenCL, FCenterOutput)
   else
     FTokenNormCL.Normalize(FOutput, FOnes, FZeros, FOutput, NumTokens, Depth,
       {UseMean=}true, FTokenLNEpsilon, {pWeightsDirty=}false, SourceBuffer,
-      KeepOnOpenCL);
+      KeepOnOpenCL, FCenterOutput);
   FAfterWeightUpdateHasBeenCalled := false;
   FOutputOnOpenCL := KeepOnOpenCL;
   FOutputOnRAM := not KeepOnOpenCL;
@@ -84499,8 +84515,8 @@ procedure TNNetTokenLayerNorm.Backpropagate();
 var
   StartTime: double;
   Depth, TokenCnt, TokenMax, BaseIdx: integer;
-  SumDxHat, SumDxHatXHat, InvStdDev: TNeuralFloat;
-  IsAffine: boolean;
+  SumDxHatXHat, InvStdDev, OnesCoef: TNeuralFloat;
+  IsAffine, IsCentered: boolean;
   GammaPtr, OnesPtr, GammaGradPtr, BetaGradPtr: TNeuralFloatArrPtr;
   OEPtr, NormPtr, DxHatPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
@@ -84515,6 +84531,7 @@ begin
   TokenMax := (FOutput.Size div Depth) - 1;
   OnesPtr := FOnes.GetRawPtr();
   IsAffine := FElementwiseAffine;
+  IsCentered := FCenterOutput;
   if IsAffine then
   begin
     GammaPtr := FNeurons[0].FWeights.GetRawPtr();
@@ -84572,12 +84589,18 @@ begin
         TNNetVolume.Mul(DxHatPtr, GammaPtr, Depth);
       end
       else DxHatPtr := OEPtr;
-      // mean_c( dxhat ) and mean_c( dxhat * x_hat ) via vectorized dot products.
-      SumDxHat := TNNetVolume.DotProduct(DxHatPtr, OnesPtr, Depth) / Depth;
+      // mean_c( dxhat * x_hat ) via a vectorized dot product.
       SumDxHatXHat := TNNetVolume.DotProduct(DxHatPtr, NormPtr, Depth) / Depth;
-      // prevErr += invStd*dxhat - invStd*mean(dxhat) - (invStd*mean(dxhat*xhat))*xhat
+      // Centered: the ones term is -invStd*mean(dxhat). Uncentered (x_hat =
+      // x*invStd): dx = invStd*(dxhat - (x_hat - mean(x_hat))*mean(dxhat*xhat)).
+      if IsCentered then
+        OnesCoef := -InvStdDev *
+          TNNetVolume.DotProduct(DxHatPtr, OnesPtr, Depth) / Depth
+      else
+        OnesCoef := InvStdDev * SumDxHatXHat *
+          TNNetVolume.DotProduct(NormPtr, OnesPtr, Depth) / Depth;
       TNNetVolume.MulAdd(PrevErrPtr, DxHatPtr, InvStdDev, Depth);
-      TNNetVolume.MulAdd(PrevErrPtr, OnesPtr, -(InvStdDev * SumDxHat), Depth);
+      TNNetVolume.MulAdd(PrevErrPtr, OnesPtr, OnesCoef, Depth);
       TNNetVolume.MulAdd(PrevErrPtr, NormPtr, -(InvStdDev * SumDxHatXHat), Depth);
     end;
   end;
@@ -138904,7 +138927,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
-      'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0);
+      'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0, St[1] = 0);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetTokenRMSNorm':          Result := TNNetTokenRMSNorm.Create(Ft[0]);
       'TNNetHeadRMSNorm':           Result := TNNetHeadRMSNorm.Create(St[0], Ft[0]);
@@ -139356,7 +139379,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
-      if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0) else
+      if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0], St[0] = 0, St[1] = 0) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetTokenRMSNorm' then Result := TNNetTokenRMSNorm.Create(Ft[0]) else
       if S[0] = 'TNNetHeadRMSNorm' then Result := TNNetHeadRMSNorm.Create(St[0], Ft[0]) else

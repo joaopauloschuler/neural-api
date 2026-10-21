@@ -2705,7 +2705,9 @@ __kernel void cai_bicubic_scatter
 //     y[i]    = FGain[i] * ((x[i]-mean) * invStd) + FBias[i]
 // FGain/FBias are FSize long and shared by every segment (per channel for the
 // token layers, per element for the whole-volume ones); FBias is not read when
-// FUseMean == 0. Launch one work-group per segment (global size = segments x
+// FUseMean == 0. FUseMean == 2 centers the variance but not the output:
+// y[i] = FGain[i] * (x[i] * invStd) + FBias[i] (Restormer BiasFree).
+// Launch one work-group per segment (global size = segments x
 // local size) with a power-of-two local size, and pass FScratch as
 // get_local_size(0) floats of __local memory. The tree reduction differs from
 // the CPU's 8-wide AVX accumulation order only by float rounding (parity well
@@ -2761,11 +2763,12 @@ __kernel void cai_volume_norm
     barrier(CLK_LOCAL_MEM_FENCE);
   }
   const float invStd = 1.0f / sqrt(FScratch[0] / (float)FSize + FEps);
+  const float outCenter = (FUseMean == 2) ? 0.0f : mean;
 
   // ---- apply gain/bias in parallel ----
   for (int i = lid; i < FSize; i += lsize)
   {
-    const float xhat = (X[i] - mean) * invStd;
+    const float xhat = (X[i] - outCenter) * invStd;
     if (FUseMean != 0)
       Y[i] = mad(FGain[i], xhat, FBias[i]);
     else
