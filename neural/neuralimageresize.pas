@@ -59,6 +59,26 @@ procedure PasteOutpaintOriginal(Image: TNNetVolume; Left, Top, Right,
 procedure GrowOutpaintSidesToMultiple(ImageSizeX, ImageSizeY,
   Multiple: integer; var Left, Top, Right, Bottom: integer);
 
+// diffusers get_crop_region: [X1, X2) x [Y1, Y2) bounds the Mask's nonzero PIL
+// 'L' pixels (0..255) plus Padding, grown to Width:Height, kept in the mask.
+procedure GetMaskCropRegion(Mask: TNNetVolume; Width, Height,
+  Padding: integer; out X1, Y1, X2, Y2: integer);
+
+// diffusers _resize_and_fill: Source fit inside Width x Height at its aspect,
+// centred; the rest repeats its edge pixels (PIL samples them with the filter).
+procedure ResizeImageAndFill(Source, Dest: TNNetVolume; Width,
+  Height: integer; Filter: TImageResampleFilter; RoundToBytes: boolean = false);
+
+// diffusers _resize_and_crop: Source covering Width x Height at its aspect,
+// centred, the excess cropped. Dest may be Source.
+procedure ResizeImageAndCrop(Source, Dest: TNNetVolume; Width,
+  Height: integer; Filter: TImageResampleFilter; RoundToBytes: boolean = false);
+
+// diffusers apply_overlay: Dest := Original, then Generated resized into
+// [X1, X2) x [Y1, Y2) (ResizeImageAndCrop) blended by Mask's PIL 'L' / 255.
+procedure PasteInpaintCrop(Generated, Original, Mask: TNNetVolume;
+  X1, Y1, X2, Y2: integer; Filter: TImageResampleFilter; Dest: TNNetVolume);
+
 // Parses "L,T,R,B" (pixels added on each side, >= 0, not all 0); returns ''
 // or what is wrong.
 function ParseOutpaintSides(const Text: string;
@@ -637,6 +657,203 @@ begin
   else Inc(Right, ExtraX);
   if (Bottom = 0) and (Top > 0) then Inc(Top, ExtraY)
   else Inc(Bottom, ExtraY);
+end;
+
+// PIL 'L' (0..255) of the mask pixel at PixelPos: the channels rounded to
+// bytes, then R*0.299 + G*0.587 + B*0.114 in PIL's fixed point; gray reads as is.
+function MaskPixelLuma(Mask: TNNetVolume; PixelPos: integer): integer;
+const
+  csLumaR = 19595;
+  csLumaG = 38470;
+  csLumaB = 7471;
+  csLumaRound = 32768;
+var
+  SourcePos: integer;
+
+  function ChannelByte(Value: TNeuralFloat): integer;
+  begin
+    if Value <= 0 then exit(0);
+    if Value >= 255 then exit(255);
+    Result := Floor(Value + 0.5);
+  end;
+
+begin
+  SourcePos := PixelPos * Mask.Depth;
+  if Mask.Depth < 3 then exit(ChannelByte(Mask.FData[SourcePos]));
+  Result := (ChannelByte(Mask.FData[SourcePos]) * csLumaR +
+    ChannelByte(Mask.FData[SourcePos + 1]) * csLumaG +
+    ChannelByte(Mask.FData[SourcePos + 2]) * csLumaB + csLumaRound) shr 16;
+end;
+
+procedure GetMaskCropRegion(Mask: TNNetVolume; Width, Height,
+  Padding: integer; out X1, Y1, X2, Y2: integer);
+var
+  X, Y, MaxX, MaxY, PixelPos, Left, Right, Top, Bottom: integer;
+  ProcessingRatio: double;
+
+  // Grows [First, Last) by Trunc(DesiredSize) - its size, half before, then
+  // shifts it back inside [0, Limit) and clips it, as get_crop_region does.
+  procedure GrowAxis(var First, Last: integer; DesiredSize: double;
+    Limit: integer);
+  var
+    Growth: integer;
+  begin
+    Growth := Trunc(DesiredSize - (Last - First));
+    Dec(First, Growth div 2);
+    Inc(Last, Growth - Growth div 2);
+    if Last > Limit then
+    begin
+      Dec(First, Last - Limit);
+      Last := Limit;
+    end;
+    if First < 0 then
+    begin
+      Dec(Last, First);
+      First := 0;
+    end;
+    if Last > Limit then Last := Limit;
+  end;
+
+begin
+  if (Width < 1) or (Height < 1) or (Padding < 0) then
+    raise Exception.Create('GetMaskCropRegion: size ' + IntToStr(Width) +
+      'x' + IntToStr(Height) + ' and padding ' + IntToStr(Padding) +
+      ' must be positive (padding >= 0).');
+  Left := Mask.SizeX;
+  Right := -1;
+  Top := Mask.SizeY;
+  Bottom := -1;
+  MaxX := Mask.SizeX - 1;
+  MaxY := Mask.SizeY - 1;
+  PixelPos := 0;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      if MaskPixelLuma(Mask, PixelPos) > 0 then
+      begin
+        Left := Min(Left, X);
+        Right := Max(Right, X);
+        Top := Min(Top, Y);
+        Bottom := Y;
+      end;
+      Inc(PixelPos);
+    end;
+  if Right < 0 then
+    raise Exception.Create('GetMaskCropRegion: the mask has no nonzero pixel.');
+  X1 := Max(Left - Padding, 0);
+  Y1 := Max(Top - Padding, 0);
+  X2 := Min(Right + 1 + Padding, Mask.SizeX);
+  Y2 := Min(Bottom + 1 + Padding, Mask.SizeY);
+  ProcessingRatio := Width / Height;
+  if (X2 - X1) / (Y2 - Y1) > ProcessingRatio then
+    GrowAxis(Y1, Y2, (X2 - X1) / ProcessingRatio, Mask.SizeY)
+  else
+    GrowAxis(X1, X2, (Y2 - Y1) * ProcessingRatio, Mask.SizeX);
+end;
+
+procedure ResizeImageAndFill(Source, Dest: TNNetVolume; Width,
+  Height: integer; Filter: TImageResampleFilter; RoundToBytes: boolean);
+var
+  Resized: TNNetVolume;
+  FitWidth, FitHeight, Left, Top: integer;
+begin
+  if Width / Height < Source.SizeX / Source.SizeY then
+  begin
+    FitWidth := Width;
+    FitHeight := Max(Source.SizeY * Width div Source.SizeX, 1);
+  end
+  else
+  begin
+    FitWidth := Max(Source.SizeX * Height div Source.SizeY, 1);
+    FitHeight := Height;
+  end;
+  Left := Width div 2 - FitWidth div 2;
+  Top := Height div 2 - FitHeight div 2;
+  Resized := TNNetVolume.Create();
+  try
+    ResizeImagePIL(Source, Resized, FitWidth, FitHeight, Filter, RoundToBytes);
+    PadImageClampToEdge(Resized, Left, Top, Width - FitWidth - Left,
+      Height - FitHeight - Top, Dest);
+  finally
+    Resized.Free;
+  end;
+end;
+
+procedure ResizeImageAndCrop(Source, Dest: TNNetVolume; Width,
+  Height: integer; Filter: TImageResampleFilter; RoundToBytes: boolean);
+var
+  Resized: TNNetVolume;
+  CoverWidth, CoverHeight: integer;
+begin
+  if Width / Height > Source.SizeX / Source.SizeY then
+  begin
+    CoverWidth := Width;
+    CoverHeight := Source.SizeY * Width div Source.SizeX;
+  end
+  else
+  begin
+    CoverWidth := Source.SizeX * Height div Source.SizeY;
+    CoverHeight := Height;
+  end;
+  Resized := TNNetVolume.Create();
+  try
+    ResizeImagePIL(Source, Resized, CoverWidth, CoverHeight, Filter,
+      RoundToBytes);
+    Dest.CopyCropping(Resized, CoverWidth div 2 - Width div 2,
+      CoverHeight div 2 - Height div 2, Width, Height);
+  finally
+    Resized.Free;
+  end;
+end;
+
+procedure PasteInpaintCrop(Generated, Original, Mask: TNNetVolume;
+  X1, Y1, X2, Y2: integer; Filter: TImageResampleFilter; Dest: TNNetVolume);
+var
+  Resized: TNNetVolume;
+  X, Y, MaxX, MaxY, Channel, MaxChannel, DestPos, ResizedPos,
+    MaskPos: integer;
+  Weight: TNeuralFloat;
+begin
+  if (Mask.SizeX <> Original.SizeX) or (Mask.SizeY <> Original.SizeY) then
+    raise Exception.Create('PasteInpaintCrop: the mask is ' +
+      IntToStr(Mask.SizeX) + 'x' + IntToStr(Mask.SizeY) + ', the image ' +
+      IntToStr(Original.SizeX) + 'x' + IntToStr(Original.SizeY) + '.');
+  if (X1 < 0) or (Y1 < 0) or (X2 > Original.SizeX) or
+    (Y2 > Original.SizeY) or (X2 <= X1) or (Y2 <= Y1) then
+    raise Exception.Create('PasteInpaintCrop: crop ' + IntToStr(X1) + ',' +
+      IntToStr(Y1) + ',' + IntToStr(X2) + ',' + IntToStr(Y2) +
+      ' is not inside the image.');
+  Resized := TNNetVolume.Create();
+  try
+    ResizeImageAndCrop(Generated, Resized, X2 - X1, Y2 - Y1, Filter);
+    if Dest <> Original then
+    begin
+      // Copy alone keeps Dest's shape when only the element counts match.
+      Dest.ReSize(Original);
+      Dest.Copy(Original);
+    end;
+    MaxChannel := Min(Dest.Depth, Resized.Depth) - 1;
+    MaxX := X2 - 1;
+    MaxY := Y2 - 1;
+    for Y := Y1 to MaxY do
+    begin
+      MaskPos := Y * Mask.SizeX + X1;
+      for X := X1 to MaxX do
+      begin
+        Weight := MaskPixelLuma(Mask, MaskPos) / 255;
+        Inc(MaskPos);
+        if Weight = 0 then continue;
+        DestPos := Dest.GetRawPos(X, Y);
+        ResizedPos := Resized.GetRawPos(X - X1, Y - Y1);
+        for Channel := 0 to MaxChannel do
+          Dest.FData[DestPos + Channel] := Dest.FData[DestPos + Channel] +
+            Weight * (Resized.FData[ResizedPos + Channel] -
+            Dest.FData[DestPos + Channel]);
+      end;
+    end;
+  finally
+    Resized.Free;
+  end;
 end;
 
 function ParseOutpaintSides(const Text: string;

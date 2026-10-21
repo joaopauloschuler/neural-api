@@ -81,6 +81,17 @@ type
     // GrowOutpaintSidesToMultiple and ParseOutpaintSides on valid and invalid
     // input.
     procedure TestOutpaintSidesGrowAndParse;
+    // GetMaskCropRegion vs hand-traced diffusers get_crop_region: padding,
+    // growth to the aspect, the shift off the bottom, growth past the image.
+    procedure TestMaskCropRegion;
+    // RGB mask read as PIL 'L' (luma 0 not masked); an empty mask is refused.
+    procedure TestMaskCropRegionLumaAndEmptyMask;
+    // ResizeImageAndFill / ResizeImageAndCrop at identity scale: placement,
+    // the edge-repeated fill rows/columns and the centred crop offsets.
+    procedure TestResizeImageAndFillAndCrop;
+    // PasteInpaintCrop: the crop blended by mask / 255, the original elsewhere,
+    // RGBA alpha kept, Dest aliasing Generated; bad crops and masks refused.
+    procedure TestPasteInpaintCrop;
     // HFImageProcessorFamily strips Fast/Pil/ImageProcessor/FeatureExtractor;
     // ViT/DeiT read an int size as a square, CLIP/ConvNext/unknown do not.
     procedure TestHFProcessorFamilyAndIntSizeSquare;
@@ -881,6 +892,210 @@ begin
     Bottom) <> '');
   AssertTrue('not numbers', ParseOutpaintSides('a,b,c,d', Left, Top, Right,
     Bottom) <> '');
+end;
+
+procedure TTestNeuralImagePreprocess.TestMaskCropRegion;
+var
+  Mask: TNNetVolume;
+  X1, Y1, X2, Y2: integer;
+
+  procedure AssertRegion(const Name: string; ExpectedX1, ExpectedY1,
+    ExpectedX2, ExpectedY2: integer);
+  begin
+    AssertEquals(Name + ' x1', ExpectedX1, X1);
+    AssertEquals(Name + ' y1', ExpectedY1, Y1);
+    AssertEquals(Name + ' x2', ExpectedX2, X2);
+    AssertEquals(Name + ' y2', ExpectedY2, Y2);
+  end;
+
+  procedure SetMaskRect(SizeX, SizeY, FirstX, FirstY, LastX, LastY: integer);
+  var
+    X, Y: integer;
+  begin
+    Mask.ReSize(SizeX, SizeY, 1);
+    Mask.Fill(0);
+    for Y := FirstY to LastY do
+      for X := FirstX to LastX do
+        Mask[X, Y, 0] := 255;
+  end;
+
+begin
+  Mask := TNNetVolume.Create;
+  try
+    // Box x 8..9, y 4..5 padded by 1: 4x4, already 1:1.
+    SetMaskRect(20, 10, 8, 4, 9, 5);
+    GetMaskCropRegion(Mask, 32, 32, 1, X1, Y1, X2, Y2);
+    AssertRegion('square', 7, 3, 11, 7);
+    // Box x 17..19, y 0 padded by 2: 5x3 grown to 6 wide at 2:1, x2 = 21
+    // shifted back to 20.
+    SetMaskRect(20, 10, 17, 0, 19, 0);
+    GetMaskCropRegion(Mask, 64, 32, 2, X1, Y1, X2, Y2);
+    AssertRegion('right edge', 14, 0, 20, 3);
+    // Row 9, x 0..5: 6x1 grown to 6 high (7..13), shifted up to 4..10.
+    SetMaskRect(10, 10, 0, 9, 5, 9);
+    GetMaskCropRegion(Mask, 1, 1, 0, X1, Y1, X2, Y2);
+    AssertRegion('bottom edge', 0, 4, 6, 10);
+    // A full 10-wide row in a 10x4 mask cannot grow to 10 high: whole image.
+    SetMaskRect(10, 4, 0, 0, 9, 0);
+    GetMaskCropRegion(Mask, 1, 1, 0, X1, Y1, X2, Y2);
+    AssertRegion('past the image', 0, 0, 10, 4);
+  finally
+    Mask.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestMaskCropRegionLumaAndEmptyMask;
+var
+  Mask: TNNetVolume;
+  X1, Y1, X2, Y2: integer;
+  IsRefused: boolean;
+begin
+  Mask := TNNetVolume.Create(6, 4, 3);
+  try
+    Mask.Fill(0);
+    // PIL 'L' of (0,0,2) is (2*7471 + 32768) shr 16 = 0; of (0,0,5) it is 1.
+    Mask[1, 1, 2] := 2;
+    Mask[4, 2, 2] := 5;
+    GetMaskCropRegion(Mask, 1, 1, 0, X1, Y1, X2, Y2);
+    AssertEquals('x1', 4, X1);
+    AssertEquals('y1', 2, Y1);
+    AssertEquals('x2', 5, X2);
+    AssertEquals('y2', 3, Y2);
+    Mask[4, 2, 2] := 0;
+    IsRefused := false;
+    try
+      GetMaskCropRegion(Mask, 1, 1, 0, X1, Y1, X2, Y2);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('an all-zero mask is refused', IsRefused);
+  finally
+    Mask.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestResizeImageAndFillAndCrop;
+var
+  Source, Dest: TNNetVolume;
+  X, Y, Channel: integer;
+begin
+  Source := TNNetVolume.Create;
+  Dest := TNNetVolume.Create;
+  try
+    // 6x3 into 6x6: fits 6x3 at y = 3 - 1 = 2; rows 0..1 repeat row 0, row 5
+    // repeats row 2.
+    FillOutpaintImage(Source, 6, 3, 2);
+    ResizeImageAndFill(Source, Dest, 6, 6, irfNearest);
+    AssertEquals('fill rows width', 6, Dest.SizeX);
+    AssertEquals('fill rows height', 6, Dest.SizeY);
+    for Y := 0 to 5 do
+      for X := 0 to 5 do
+        for Channel := 0 to 1 do
+          AssertEquals(Format('fill rows (%d,%d,%d)', [X, Y, Channel]),
+            Source[X, Min(Max(Y - 2, 0), 2), Channel], Dest[X, Y, Channel], 0);
+    // 2x4 into 4x4: fits 2x4 at x = 2 - 1 = 1; column 0 and 3 repeat edges.
+    FillOutpaintImage(Source, 2, 4, 1);
+    ResizeImageAndFill(Source, Dest, 4, 4, irfNearest);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        AssertEquals(Format('fill columns (%d,%d)', [X, Y]),
+          Source[Min(Max(X - 1, 0), 1), Y, 0], Dest[X, Y, 0], 0);
+    // 5x3 into 3x3: covers at 5x3, crop x from 5 div 2 - 3 div 2 = 1.
+    FillOutpaintImage(Source, 5, 3, 2);
+    ResizeImageAndCrop(Source, Dest, 3, 3, irfNearest);
+    AssertEquals('crop width', 3, Dest.SizeX);
+    AssertEquals('crop height', 3, Dest.SizeY);
+    for Y := 0 to 2 do
+      for X := 0 to 2 do
+        for Channel := 0 to 1 do
+          AssertEquals(Format('crop wide (%d,%d,%d)', [X, Y, Channel]),
+            Source[X + 1, Y, Channel], Dest[X, Y, Channel], 0);
+    // 3x6 into 3x3: covers at 3x6, crop y from 6 div 2 - 3 div 2 = 2; Dest
+    // is Source.
+    FillOutpaintImage(Source, 3, 6, 1);
+    Dest.ReSize(Source);
+    Dest.Copy(Source);
+    ResizeImageAndCrop(Dest, Dest, 3, 3, irfNearest);
+    for Y := 0 to 2 do
+      for X := 0 to 2 do
+        AssertEquals(Format('crop tall (%d,%d)', [X, Y]),
+          Source[X, Y + 2, 0], Dest[X, Y, 0], 0);
+  finally
+    Dest.Free;
+    Source.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestPasteInpaintCrop;
+var
+  Original, Generated, Mask, Dest: TNNetVolume;
+  X, Y, Channel: integer;
+  Weight, Expected: TNeuralFloat;
+  IsRefused: boolean;
+begin
+  Original := TNNetVolume.Create;
+  Generated := TNNetVolume.Create(2, 2, 3);
+  Mask := TNNetVolume.Create(5, 4, 1);
+  Dest := TNNetVolume.Create;
+  try
+    FillOutpaintImage(Original, 5, 4, 4);
+    Generated.Fill(250);
+    Mask.Fill(0);
+    Mask[2, 1, 0] := 255;
+    Mask[3, 1, 0] := 128;
+    Mask[3, 2, 0] := 51;
+    // Outside the crop: never blended.
+    Mask[0, 0, 0] := 200;
+    PasteInpaintCrop(Generated, Original, Mask, 2, 1, 4, 3, irfNearest,
+      Generated);
+    AssertEquals('width', 5, Generated.SizeX);
+    AssertEquals('height', 4, Generated.SizeY);
+    AssertEquals('depth', 4, Generated.Depth);
+    for Y := 0 to 3 do
+      for X := 0 to 4 do
+        for Channel := 0 to 3 do
+        begin
+          Weight := 0;
+          if (X >= 2) and (Y >= 1) and (Y <= 2) and (Channel < 3) then
+            Weight := Mask[X, Y, 0] / 255;
+          Expected := Original[X, Y, Channel] +
+            Weight * (250 - Original[X, Y, Channel]);
+          AssertEquals(Format('(%d,%d,%d)', [X, Y, Channel]), Expected,
+            Generated[X, Y, Channel], 1e-4);
+        end;
+    // (3,1): 310 + 128/255 * (250 - 310), hand-computed.
+    AssertEquals('half blend', 279.882353, Generated[3, 1, 0], 1e-4);
+    Generated.ReSize(2, 2, 3);
+    Generated.Fill(250);
+    // A Dest of the original's element count (10x4x2 = 5x4x4) takes its shape.
+    Dest.ReSize(10, 4, 2);
+    PasteInpaintCrop(Generated, Original, Mask, 2, 1, 4, 3, irfNearest, Dest);
+    AssertEquals('shaped width', 5, Dest.SizeX);
+    AssertEquals('shaped depth', 4, Dest.Depth);
+    AssertEquals('shaped pixel', 279.882353, Dest[3, 1, 0], 1e-4);
+    IsRefused := false;
+    try
+      PasteInpaintCrop(Generated, Original, Mask, 3, 1, 6, 3, irfNearest,
+        Generated);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('a crop past the image is refused', IsRefused);
+    Mask.ReSize(4, 4, 1);
+    IsRefused := false;
+    try
+      PasteInpaintCrop(Generated, Original, Mask, 2, 1, 4, 3, irfNearest,
+        Generated);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('a mask of another size is refused', IsRefused);
+  finally
+    Dest.Free;
+    Mask.Free;
+    Generated.Free;
+    Original.Free;
+  end;
 end;
 
 procedure TTestNeuralImagePreprocess.TestHFProcessorFamilyAndIntSizeSquare;

@@ -25,8 +25,8 @@ overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
-/outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, /stats on|off,
-/quit.
+/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
+/profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -56,6 +56,10 @@ cell's top-left pixel decides). After every step the kept cells are reset to
 the init image's latents at the next noise level, and to the latents
 themselves after the last step. --strength 1 regenerates the hole from pure
 noise; lower values keep more of the init image inside the hole too.
+--padding-mask-crop N (diffusers padding_mask_crop) generates only the mask's
+bounding box plus N pixels, grown to the output aspect, at the output size,
+then pastes it back into the init image at its own size, blended by the mask
+(apply_overlay); a small hole in a large photo then gets full resolution.
 Outpainting (--init-image FILE --outpaint L,T,R,B, or /outpaint in the REPL):
 extends the init image by L, T, R and B pixels on the left, top, right and
 bottom. BuildOutpaintCanvas (neuralimageresize) places the image on a canvas
@@ -77,7 +81,8 @@ USAGE
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
             [--repeat N] [--image FILE ... |
-             --init-image FILE [--mask FILE [--mask-blur R] |
+             --init-image FILE [--mask FILE [--mask-blur R]
+             [--padding-mask-crop N] |
              --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
@@ -100,7 +105,7 @@ uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
-  SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
+  SysUtils, Classes, Types, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread,
   neuraldiffusion, neuralimageresize;
 
@@ -471,6 +476,14 @@ begin
     'pixels at its own size before');
   WriteLn('                       the 50% threshold (diffusers ',
     'mask_processor.blur; default 0 = off)');
+  WriteLn('  --padding-mask-crop N  with --mask: generate only the mask''s ',
+    'bounding box plus N pixels');
+  WriteLn('                       (grown to the output aspect) at the output ',
+    'size, then paste it back into');
+  WriteLn('                       the init image at its own size, blended by ',
+    'the mask (diffusers');
+  WriteLn('                       padding_mask_crop); the output keeps the ',
+    'init image''s size');
   WriteLn('  --outpaint L,T,R,B   with --init-image: outpaint; add L, T, R, B ',
     'pixels on the left, top,');
   WriteLn('                       right and bottom. The output is the init ',
@@ -583,6 +596,10 @@ begin
   WriteLn('                       clears it');
   WriteLn('  /mask-blur R         mask blur sigma in pixels, as --mask-blur; ',
     'reloads the current mask');
+  WriteLn('  /padding-mask-crop N inpaint only the mask''s box plus N pixels, ',
+    'as --padding-mask-crop;');
+  WriteLn('                       /padding-mask-crop off inpaints the whole ',
+    'image');
   WriteLn('  /outpaint L,T,R,B [OVERLAP]  outpaint the init image, as ',
     '--outpaint (and --outpaint-overlap);');
   WriteLn('                       /outpaint off returns to img2img');
@@ -692,12 +709,12 @@ begin
   else Result := '';
 end;
 
-// Parses an outpaint overlap in 0..csMaxImageSide pixels; returns '' or what
-// is wrong.
-function ParseOutpaintOverlap(const Text: string; out Overlap: integer): string;
+// Parses a pixel count in 0..csMaxImageSide (an outpaint overlap, a mask crop
+// padding); returns '' or what is wrong.
+function ParsePixelCount(const Text: string; out PixelCount: integer): string;
 begin
-  Overlap := StrToIntDef(Trim(Text), -1);
-  if (Overlap < 0) or (Overlap > csMaxImageSide) then
+  PixelCount := StrToIntDef(Trim(Text), -1);
+  if (PixelCount < 0) or (PixelCount > csMaxImageSide) then
     Result := '"' + Text + '" is not an integer in 0..' +
       IntToStr(csMaxImageSide) + '.'
   else Result := '';
@@ -778,6 +795,13 @@ var
   MaskBlurRadius: double;
   MaskImage, MaskLatents: TNNetVolume;
   MaskLatentsWidth, MaskLatentsHeight: integer;
+  // --padding-mask-crop pixels (-1: off). While IsCropInpainting(): the mask
+  // at the init image's size, its crop region and both crops at output size.
+  PaddingMaskCrop: integer;
+  InpaintCrop: TRect;
+  InpaintFullMask, InpaintCropImage, InpaintCropMask: TNNetVolume;
+  // The crop region the image latents were encoded from (empty: no crop).
+  ImageLatentsCrop: TRect;
   // Outpainting: the pixels added per side of the init image and the seam
   // band; the canvas sides grow to multiples of 32 (cropped after decode).
   HasOutpaint: boolean;
@@ -1060,6 +1084,43 @@ var
     else Result := nil;
   end;
 
+  // Inpainting with --padding-mask-crop.
+  function IsCropInpainting(): boolean;
+  begin
+    Result := IsInpainting() and (PaddingMaskCrop >= 0);
+  end;
+
+  // Sets InpaintFullMask, InpaintCrop (diffusers get_crop_region) and the two
+  // crops resized as resize_mode "fill" to the output size; raises if no mask.
+  procedure BuildInpaintCrop(OutputWidth, OutputHeight: integer);
+  var
+    Cropped: TNNetVolume;
+    X1, Y1, X2, Y2: integer;
+  begin
+    if (MaskImage.SizeX = InitImage.SizeX) and
+      (MaskImage.SizeY = InitImage.SizeY) then
+    begin
+      InpaintFullMask.ReSize(MaskImage);
+      InpaintFullMask.Copy(MaskImage);
+    end
+    else ResizeImagePIL(MaskImage, InpaintFullMask, InitImage.SizeX,
+      InitImage.SizeY, irfLanczos);
+    GetMaskCropRegion(InpaintFullMask, OutputWidth, OutputHeight,
+      PaddingMaskCrop, X1, Y1, X2, Y2);
+    InpaintCrop := Rect(X1, Y1, X2, Y2);
+    Cropped := TNNetVolume.Create();
+    try
+      Cropped.CopyCropping(InitImage, X1, Y1, X2 - X1, Y2 - Y1);
+      ResizeImageAndFill(Cropped, InpaintCropImage, OutputWidth, OutputHeight,
+        irfLanczos);
+      Cropped.CopyCropping(InpaintFullMask, X1, Y1, X2 - X1, Y2 - Y1);
+      ResizeImageAndFill(Cropped, InpaintCropMask, OutputWidth, OutputHeight,
+        irfLanczos);
+    finally
+      Cropped.Free;
+    end;
+  end;
+
   // Appends FileName to the condition images when it reads and fits;
   // otherwise returns what is wrong and changes nothing.
   function AddConditionImage(const FileName: string): string;
@@ -1155,6 +1216,19 @@ var
     // Raises when the strength leaves no step.
     TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
     GetOutputSize(OutputWidth, OutputHeight);
+    if IsCropInpainting() then
+    begin
+      BuildInpaintCrop(OutputWidth, OutputHeight);
+      // The crop mask also follows the init image; it is cheap to encode.
+      MaskLatentsWidth := 0;
+    end
+    else InpaintCrop := Rect(0, 0, 0, 0);
+    if not EqualRect(InpaintCrop, ImageLatentsCrop) then
+    begin
+      ImageLatentsWidth := 0;
+      MaskLatentsWidth := 0;
+      ImageLatentsCrop := InpaintCrop;
+    end;
     if IsOutpainting() and ((MaskLatentsWidth <> OutputWidth) or
       (MaskLatentsHeight <> OutputHeight)) then
     begin
@@ -1168,7 +1242,11 @@ var
       (MaskLatentsHeight <> OutputHeight)) then
     begin
       MaskLatentsWidth := 0;
-      Pipeline.EncodeMask(MaskImage, OutputWidth, OutputHeight, MaskLatents);
+      if IsCropInpainting() then
+        Pipeline.EncodeMask(InpaintCropMask, OutputWidth, OutputHeight,
+          MaskLatents)
+      else
+        Pipeline.EncodeMask(MaskImage, OutputWidth, OutputHeight, MaskLatents);
       MaskLatentsWidth := OutputWidth;
       MaskLatentsHeight := OutputHeight;
     end;
@@ -1177,6 +1255,9 @@ var
     ImageLatentsWidth := 0;
     if IsOutpainting() then
       Pipeline.EncodeImage(OutpaintCanvas, OutputWidth, OutputHeight,
+        ImageLatents)
+    else if IsCropInpainting() then
+      Pipeline.EncodeImage(InpaintCropImage, OutputWidth, OutputHeight,
         ImageLatents)
     else
       Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight,
@@ -1239,6 +1320,11 @@ var
     begin
       WriteLn('Mask       : ', MaskFile, ' (', MaskImage.SizeX, 'x',
         MaskImage.SizeY, '), only its white region is regenerated');
+      if IsCropInpainting() then
+        WriteLn('Mask crop  : its box plus ', PaddingMaskCrop, ' pixels, ',
+          'grown to the output aspect, is generated at ', OutputWidth, 'x',
+          OutputHeight, ' and pasted into the ', InitImage.SizeX, 'x',
+          InitImage.SizeY, ' init image');
       if MaskBlurRadius > 0 then
         WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
           PointFormat()), ' pixels');
@@ -1299,7 +1385,11 @@ var
         StepCount, Seed, Image);
     SaveStart := Now();
     Image.Mul(255);
-    if IsOutpainting() then FinishOutpaint();
+    if IsOutpainting() then FinishOutpaint()
+    else if IsCropInpainting() then
+      PasteInpaintCrop(Image, InitImage, InpaintFullMask, InpaintCrop.Left,
+        InpaintCrop.Top, InpaintCrop.Right, InpaintCrop.Bottom, irfLanczos,
+        Image);
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
       raise Exception.Create('could not write ' + ImageFile);
     PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
@@ -1339,6 +1429,7 @@ var
     GetOutputSize(OutputWidth, OutputHeight);
     StepText := IntToStr(StepCount) + ' steps';
     if IsOutpainting() then ModeText := 'outpaint'
+    else if IsCropInpainting() then ModeText := 'inpaint (mask crop)'
     else if IsInpainting() then ModeText := 'inpaint'
     else ModeText := 'img2img';
     if HasInitImage then
@@ -1448,6 +1539,7 @@ var
     NewRepeatCount: integer;
     NewValue: int64;
     NewStrength, NewMaskBlurRadius: double;
+    NewPaddingMaskCrop: integer;
     NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
   begin
@@ -1667,6 +1759,27 @@ var
           ' for the next /mask]');
       end;
     end
+    else if Command = 'padding-mask-crop' then
+    begin
+      if LowerCase(Argument) = 'off' then
+      begin
+        PaddingMaskCrop := -1;
+        WriteLn('[padding mask crop off: the whole image is inpainted]');
+      end
+      else
+      begin
+        Problem := ParsePixelCount(Argument, NewPaddingMaskCrop);
+        if Problem <> '' then WriteLn('[/padding-mask-crop: ', Problem, ']')
+        else
+        begin
+          PaddingMaskCrop := NewPaddingMaskCrop;
+          if IsInpainting() then
+            WriteLn('[padding mask crop ', PaddingMaskCrop, ' pixels]')
+          else WriteLn('[padding mask crop ', PaddingMaskCrop, ' pixels: ',
+            'applies once /init-image and /mask are set]');
+        end;
+      end;
+    end
     else if Command = 'strength' then
     begin
       Problem := ParseStrength(Argument, NewStrength);
@@ -1698,7 +1811,7 @@ var
         NewOverlap := OutpaintOverlap;
         Problem := '';
         if SpacePos > 0 then
-          Problem := ParseOutpaintOverlap(Copy(Argument, SpacePos + 1, MaxInt),
+          Problem := ParsePixelCount(Copy(Argument, SpacePos + 1, MaxInt),
             NewOverlap)
         else SpacePos := Length(Argument) + 1;
         if Problem = '' then
@@ -1758,7 +1871,7 @@ var
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
-      '/outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, ',
+      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, ',
       '/stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
@@ -1816,6 +1929,9 @@ begin
   MaskFile := '';
   MaskBlurRadius := 0;
   MaskLatentsWidth := 0;
+  PaddingMaskCrop := -1;
+  InpaintCrop := Rect(0, 0, 0, 0);
+  ImageLatentsCrop := Rect(0, 0, 0, 0);
   MaskLatentsHeight := 0;
   HasOutpaint := false;
   OutpaintText := '';
@@ -1880,10 +1996,19 @@ begin
         Halt(2);
       end;
     end
+    else if Arg = '--padding-mask-crop' then
+    begin
+      ArgProblem := ParsePixelCount(NextArg(), PaddingMaskCrop);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--padding-mask-crop: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if Arg = '--outpaint' then OutpaintText := NextArg()
     else if Arg = '--outpaint-overlap' then
     begin
-      ArgProblem := ParseOutpaintOverlap(NextArg(), OutpaintOverlap);
+      ArgProblem := ParsePixelCount(NextArg(), OutpaintOverlap);
       if ArgProblem <> '' then
       begin
         WriteLn('--outpaint-overlap: ', ArgProblem);
@@ -1977,6 +2102,12 @@ begin
     WriteLn('--mask needs --init-image (the image it keeps).');
     Halt(2);
   end;
+  if (PaddingMaskCrop >= 0) and (MaskFile = '') and
+    (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--padding-mask-crop needs --mask (the region it crops to).');
+    Halt(2);
+  end;
   if OutpaintText <> '' then
   begin
     ArgProblem := ParseOutpaintSides(OutpaintText, OutpaintLeft, OutpaintTop,
@@ -2012,6 +2143,9 @@ begin
   InitImage := TNNetVolume.Create();
   ImageLatents := TNNetVolume.Create();
   MaskImage := TNNetVolume.Create();
+  InpaintFullMask := TNNetVolume.Create();
+  InpaintCropImage := TNNetVolume.Create();
+  InpaintCropMask := TNNetVolume.Create();
   MaskLatents := TNNetVolume.Create();
   OutpaintCanvas := TNNetVolume.Create();
   OutpaintMask := TNNetVolume.Create();
@@ -2152,6 +2286,9 @@ begin
     OutpaintMask.Free;
     OutpaintCanvas.Free;
     MaskLatents.Free;
+    InpaintCropMask.Free;
+    InpaintCropImage.Free;
+    InpaintFullMask.Free;
     MaskImage.Free;
     ImageLatents.Free;
     InitImage.Free;

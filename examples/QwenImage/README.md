@@ -149,6 +149,7 @@ follow:
 | `/init-image FILE` | init image for the next prompts (img2img, as `--init-image`); `/init-image off` clears it |
 | `/mask FILE` | inpaint mask for the init image (as `--mask`); `/mask off` clears it |
 | `/mask-blur R` | mask blur sigma in pixels (as `--mask-blur`); reloads the current mask with it |
+| `/padding-mask-crop N` | inpaint only the mask's box plus N pixels (as `--padding-mask-crop`); `/padding-mask-crop off` clears it |
 | `/outpaint L,T,R,B [OVERLAP]` | outpaint the init image (as `--outpaint` and `--outpaint-overlap`); sets strength 1 unless `--strength` or `/strength` set it; `/outpaint off` goes back to img2img |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
@@ -341,9 +342,48 @@ same Gaussian with three extended box blurs, so edge values can differ
 slightly. The threshold then rounds the mask's corners and erases specks and
 thin lines narrower than about `R` pixels. Default 0 (no blur).
 
+#### Mask crop (`--padding-mask-crop N`)
+
+Without it, the whole init image is resized to the output size, so a small
+hole in a large photo gets only a few latent cells. `--padding-mask-crop N`
+(or `/padding-mask-crop N`; `/padding-mask-crop off` clears it) does what
+diffusers' `padding_mask_crop` does:
+
+1. The mask is stretched to the init image's size (when it has another
+   size) and its bounding box (pixels whose PIL `L` value is above 0) is
+   grown by `N` pixels on each side, then grown to the output aspect ratio
+   around its centre and shifted back inside the image
+   (`GetMaskCropRegion`, diffusers `get_crop_region`).
+2. That region of the init image and of the mask is resized to the output
+   size (`ResizeImageAndFill`, diffusers `resize_mode="fill"`) and inpainted
+   as above.
+3. The decoded image is resized back to the region's size
+   (`ResizeImageAndCrop`, diffusers `resize_mode="crop"`) and blended into
+   the init image by the mask, `init + mask/255 * (generated - init)`
+   (`PasteInpaintCrop`, diffusers `apply_overlay`). Outside the region the
+   init image is kept exactly.
+
+The output keeps the init image's size, not the output size. The mask used
+for the blend is the one after `--mask-blur`, so a blur gives a soft seam.
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image photo.png \
+  --mask hole.png --padding-mask-crop 32 --strength 1 -p "a red armchair" \
+  --output armchair.png
+```
+
+Differences from diffusers: the resizes run in float, not on 8-bit PIL
+images; where the region's aspect differs from the output's (a rounding
+pixel, or a region clamped by the image border) the fill repeats the edge
+pixels, while PIL samples the edge row with its Lanczos filter; the blend
+skips PIL's premultiplied-alpha rounding. All helpers live in
+neural/neuralimageresize.pas.
+
 Status: the inpaint path matches diffusers on the pico checkpoint
 (`TestQwenImage21InpaintParity`); a real 1024x1024 inpaint on the GPU box
-is still pending (user run).
+is still pending (user run). The mask crop is tested on its helpers (hand
+values checked against diffusers) and a pico smoke run, not against a
+diffusers pipeline output.
 
 ### Outpainting
 
@@ -420,6 +460,7 @@ and `--fp32`, the last one given wins.
 | `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
 | `--mask FILE` | with `--init-image`: inpaint, regenerate only the mask's white region; see [Inpainting](#inpainting) | — |
 | `--mask-blur R` | blur the mask by a Gaussian of sigma R pixels before the 50% threshold (diffusers `mask_processor.blur`) | 0 |
+| `--padding-mask-crop N` | with `--mask`: generate only the mask's bounding box plus N pixels (grown to the output aspect) at the output size and paste it back into the init image, which keeps its size; see [Mask crop](#mask-crop---padding-mask-crop-n) | off |
 | `--outpaint L,T,R,B` | with `--init-image`: add L, T, R, B pixels on the left, top, right and bottom and generate them; see [Outpainting](#outpainting). Not with `--mask` | — |
 | `--outpaint-overlap N` | pixels of the init image along each extended side that are regenerated too | 16 |
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 (1 with `--outpaint`) |
@@ -577,9 +618,6 @@ under [VAE tiles](#vae-tiles).
 - The negative prompt (classifier-free guidance) is not implemented.
 - Editing is tested only against diffusers on the pico checkpoint; it has
   not run on the real checkpoint yet. The same holds for inpainting.
-- Inpainting has no `padding_mask_crop` (crop to the
-  mask's bounding box, generate at full resolution, paste back), so a small
-  hole in a large photo costs a full-size image.
 - The VAE encoder and the vision tower run untiled on the CPU, so their
   memory grows with the output size. They have not been measured at
   1024x1024 on the real checkpoint.

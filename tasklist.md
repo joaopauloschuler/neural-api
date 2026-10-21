@@ -1654,9 +1654,11 @@ rather than acted on.
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
             example output.
-      - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
+      - [X] `padding_mask_crop`: crop to the mask's bounding box plus padding,
             generate at full resolution, paste back (`apply_overlay`); makes a
-            small hole in a large photo cheap.
+            small hole in a large photo cheap. API: `GetMaskCropRegion`,
+            `ResizeImageAndFill`, `ResizeImageAndCrop`, `PasteInpaintCrop`
+            (neuralimageresize.pas); examples/QwenImage `--padding-mask-crop N`.
 - [ ] LaMa large-mask inpainting follow-ups. `BuildLaMaFromSafeTensors`
       (neuralpretrained.pas, `TestLaMaParity` on the pico fixture from
       `tools/make_pico_lama_fixture.py`) and examples/LaMaInpaint are coded; the
