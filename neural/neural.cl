@@ -5565,7 +5565,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // arguments (FColChunk: output columns per work-group, a multiple of 4 up to
 // 256; FKeySplits > 1 writes partials; FBiasLen > 0, which needs FGroupSize 1,
 // adds FScoreBias[FBiasBase + g*FBiasHeadStride + t*FBiasRowStride + key]
-// to each score of head g;
+// to each score of head g, or with FBiasKeyWidth W > 0 the decomposed bias of
+// key = kh*W + kw: entries kh and FBiasRowStride - W + kw of that bias row;
 // FHasSinks adds exp(FSinkLogits[h]) to head h's normalizer, in the merge
 // when FKeySplits > 1).
 #define CAI_FLASH_LEADING_PARAMS \
@@ -5580,7 +5581,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
   __global float* FY, __global float* FPartials, __local float4* FScratch, \
   __global const float* FScoreBias, const int FBiasBase, \
   const int FBiasRowStride, const int FBiasLen, const int FBiasHeadStride, \
-  __global const float* FSinkLogits, const int FHasSinks
+  const int FBiasKeyWidth, __global const float* FSinkLogits, \
+  const int FHasSinks
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
 // only: PoCL miscompiles a lane id divided by a run-time value.
@@ -5753,14 +5755,31 @@ static inline float cai_flash_score(const float Dot, const int Key,
   return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
 }
 
-// Score plus FScoreBias[Index] (clamped into the table) when FBiasLen > 0; a
-// biased score at or below -1e8 is a masked key, as the host forward has it.
+// Score plus the bias of tile key KeyInTile (bias row BiasRow, tile start
+// (KtH, KtW) in key rows/columns), indices clamped into the table, when FBiasLen > 0.
 static inline float cai_flash_add_bias(const float Score,
-  __global const float* FScoreBias, const int Index, const int FBiasLen)
+  __global const float* FScoreBias, const int BiasRow, const int Kt,
+  const int KeyInTile, const int KtH, const int KtW, const float InvKeyWidth,
+  const int FBiasRowStride, const int FBiasLen, const int FBiasKeyWidth)
 {
   if (FBiasLen <= 0) return Score;
-  const float Biased =
-    Score + FScoreBias[clamp(Index, 0, max(FBiasLen - 1, 0))];
+  const int MaxBiasPos = max(FBiasLen - 1, 0);
+  float Bias;
+  if (FBiasKeyWidth > 0)
+  {
+    /* Shifts and a float quotient only: no lane value is divided. */
+    int KeyCol = KtW + KeyInTile;
+    int KeyRow = (int)((float)KeyCol * InvKeyWidth);
+    KeyCol -= KeyRow * FBiasKeyWidth;
+    if (KeyCol >= FBiasKeyWidth) { KeyCol -= FBiasKeyWidth; KeyRow++; }
+    if (KeyCol < 0) { KeyCol += FBiasKeyWidth; KeyRow--; }
+    Bias = FScoreBias[clamp(BiasRow + KtH + KeyRow, 0, MaxBiasPos)]
+      + FScoreBias[clamp(BiasRow + FBiasRowStride - FBiasKeyWidth + KeyCol, 0,
+        MaxBiasPos)];
+  }
+  else Bias = FScoreBias[clamp(BiasRow + Kt + KeyInTile, 0, MaxBiasPos)];
+  /* A biased score at or below -1e8 is a masked key, as on the host. */
+  const float Biased = Score + Bias;
   return (Biased > -1e8f) ? Biased : -1e30f;
 }
 
@@ -5937,6 +5956,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   const int MaxRowPos = FTokenCnt * FGroupSize - 1 - Row0; \
   const int KAligned = (FDk & 3) == 0; \
   const int QAligned = KAligned && ((FXStride & 3) == 0); \
+  const int BiasKeyDivisor = max(FBiasKeyWidth, 1); \
+  const float InvKeyWidth = 1.0f / (float)BiasKeyDivisor; \
   const int Slices = (Dk4 + Ds - 1) / Ds; \
   __global const KVType* KPlane = KSrc + g * FCacheMax * FDk; \
   __global const KVType* VPlane = VSrc + g * FCacheMax * FDk; \
@@ -5946,6 +5967,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
     const int KeysLive = min(CAI_FLASH_KEY_TILE, LoopHi - kt); \
     const int Interior = (kt >= TileMaxLo) \
       && (kt + CAI_FLASH_KEY_TILE <= InteriorHi); \
+    const int KtH = kt / BiasKeyDivisor; \
+    const int KtW = kt - KtH * BiasKeyDivisor; \
     float s[CAI_FLASH_SLOTS][4]; \
     _Pragma("unroll") \
     for (i = 0; i < CAI_FLASH_SLOTS; i++) \
@@ -5990,7 +6013,7 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
         const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
         /* The bias row of token row t = Row0 + row of head g (FGroupSize 1). */ \
         const int BiasRow = FBiasBase + g * FBiasHeadStride \
-          + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride + kt + sx; \
+          + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride; \
         float PartMax = -1e30f; \
         _Pragma("unroll") \
         for (j = 0; j < 4; j++) \
@@ -5998,8 +6021,9 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
           s[i][j] = cai_flash_score(s[i][j], kt + sx + 16 * j, KeyLo, \
             KeyHi, Interior, KScaleAt(sx + 16 * j) * FInvSqrtDk, \
             FScoreSoftCap, FInvScoreSoftCap); \
-          s[i][j] = cai_flash_add_bias(s[i][j], FScoreBias, \
-            BiasRow + 16 * j, FBiasLen); \
+          s[i][j] = cai_flash_add_bias(s[i][j], FScoreBias, BiasRow, kt, \
+            sx + 16 * j, KtH, KtW, InvKeyWidth, FBiasRowStride, FBiasLen, \
+            FBiasKeyWidth); \
           PartMax = fmax(PartMax, s[i][j]); \
         } \
         RowPartF[row * 16 + sx] = PartMax; \
@@ -6174,35 +6198,31 @@ __kernel void cai_sam_window_partition(
     : ((g * WinTok + t) * FDk + d)] = Value;
 }
 
-// FBias[(g*WinTok + t)*WinTok + key]: plane g's decomposed rel-pos bias, Q(t) .
-// FRelPos[qi - ki + FWinH - 1] + Q(t) . FRelPos[FRelHRows + qj - kj + FWinW - 1].
-__kernel void cai_sam_rel_pos_bias(
+// FTables[(g*WinTok + t)*(FWinH + FWinW) + c]: plane g's query t (row qi, column
+// qj) . FRelPos[qi - c + FWinH - 1] for key row c < FWinH, else
+// . FRelPos[FRelHRows + qj - kj + FWinW - 1] for key column kj = c - FWinH.
+__kernel void cai_sam_rel_pos_tables(
   const int FWinH, const int FWinW, const int FPlanes, const int FDk,
   const int FRelHRows, __global const float* FQ,
-  __global const float* FRelPos, __global float* FBias)
+  __global const float* FRelPos, __global float* FTables)
 {
   const int WinTok = FWinH * FWinW;
+  const int TableCols = FWinH + FWinW;
   const int id = get_global_id(0);
-  if (id >= FPlanes * WinTok * WinTok) return;
-  const int Key = id % WinTok;
-  const int PlaneToken = id / WinTok;
+  if (id >= FPlanes * WinTok * TableCols) return;
+  const int c = id % TableCols;
+  const int PlaneToken = id / TableCols;
   const int t = PlaneToken % WinTok;
   const int g = PlaneToken / WinTok;
   const int qi = t / FWinW;
-  const int ki = Key / FWinW;
   const int qj = t - qi * FWinW;
-  const int kj = Key - ki * FWinW;
+  const int RelRow = (c < FWinH) ? (qi - c + FWinH - 1)
+    : (FRelHRows + qj - (c - FWinH) + FWinW - 1);
   __global const float* Query = FQ + t * FPlanes * FDk + g * FDk;
-  __global const float* RelH = FRelPos + (qi - ki + FWinH - 1) * FDk;
-  __global const float* RelW = FRelPos + (FRelHRows + qj - kj + FWinW - 1) * FDk;
-  float DotH = 0.0f;
-  float DotW = 0.0f;
-  for (int d = 0; d < FDk; d++)
-  {
-    DotH = mad(Query[d], RelH[d], DotH);
-    DotW = mad(Query[d], RelW[d], DotW);
-  }
-  FBias[id] = DotH + DotW;
+  __global const float* Rel = FRelPos + RelRow * FDk;
+  float Dot = 0.0f;
+  for (int d = 0; d < FDk; d++) Dot = mad(Query[d], Rel[d], Dot);
+  FTables[id] = Dot;
 }
 
 // FY ((FGridH*FGridW) x C, token-major) = the out projection FProj, row

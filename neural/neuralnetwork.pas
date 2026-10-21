@@ -5124,7 +5124,7 @@ type
       bufSinks: cl_mem; HasSinks: integer;
       bufBias: cl_mem = nil; BiasBase: integer = 0;
       BiasRowStride: integer = 0; BiasLen: integer = 0;
-      BiasHeadStride: integer = 0);
+      BiasHeadStride: integer = 0; BiasKeyWidth: integer = 0);
     // The sink buffer and flag of a launch: pSinkLogits (QHeads logits)
     // uploaded when Changed, or Fallback and 0 when nil.
     procedure SinkLogitsArgs(pSinkLogits: TNNetVolume; pChanged: boolean;
@@ -5284,12 +5284,12 @@ function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
 
 type
   /// OpenCL forward helper for TNNetSAMVisionAttention: the qkv and out
-  // projections on cai_row_dot_products, the window planes, the decomposed
-  // rel-pos bias, and one cai_sdpa_flash launch over every (window, head)
+  // projections on cai_row_dot_products, the window planes, the per-query
+  // rel-pos tables, and one cai_sdpa_flash launch over every (window, head)
   // plane, all on FKernel's queue. Coded by Claude (AI).
   TNNetSAMVisionAttentionCL = class(TNNetFusedSDPACL)
   private
-    FRowDotsKernel, FPartitionKernel, FRelPosBiasKernel,
+    FRowDotsKernel, FPartitionKernel, FRelPosTablesKernel,
       FMergeWindowsKernel: cl_kernel;
     // Weight tables (uploaded on a change), then the grow-only intermediates:
     // the token-major qkv, the flash query rows, the out projection, the output.
@@ -43690,7 +43690,7 @@ procedure TNNetFusedSDPACL.RunFlash(X, Y: TNNetVolume; bufX: cl_mem;
   bufSinks: cl_mem; HasSinks: integer;
   bufBias: cl_mem = nil; BiasBase: integer = 0;
   BiasRowStride: integer = 0; BiasLen: integer = 0;
-  BiasHeadStride: integer = 0);
+  BiasHeadStride: integer = 0; BiasKeyWidth: integer = 0);
 var
   bufPartials, bufY, bufEnds: cl_mem;
   kFlash: cl_kernel;
@@ -43786,9 +43786,10 @@ begin
   clSetKernelArg(kFlash, NextArg + 5, csLongintSize, @BiasRowStride);
   clSetKernelArg(kFlash, NextArg + 6, csLongintSize, @BiasLen);
   clSetKernelArg(kFlash, NextArg + 7, csLongintSize, @BiasHeadStride);
+  clSetKernelArg(kFlash, NextArg + 8, csLongintSize, @BiasKeyWidth);
   // A split launch leaves the sinks to the merge, which adds each one once.
-  clSetKernelArg(kFlash, NextArg + 8, csCLMemSize, @bufSinks);
-  clSetKernelArg(kFlash, NextArg + 9, csLongintSize, @HasSinks);
+  clSetKernelArg(kFlash, NextArg + 9, csCLMemSize, @bufSinks);
+  clSetKernelArg(kFlash, NextArg + 10, csLongintSize, @HasSinks);
   FKernel.RunKernel2D(kFlash, csFusedSDPAFlashLanes,
     KVHeads * RowTiles * KeySplits * ColChunks, csFusedSDPAFlashLanes, 1);
   if KeySplits > 1 then
@@ -44069,7 +44070,7 @@ begin
   // On the flash kernels' TNeuralKernel: one in-order queue orders every pass.
   FRowDotsKernel := FKernel.CreateKernel('cai_row_dot_products');
   FPartitionKernel := FKernel.CreateKernel('cai_sam_window_partition');
-  FRelPosBiasKernel := FKernel.CreateKernel('cai_sam_rel_pos_bias');
+  FRelPosTablesKernel := FKernel.CreateKernel('cai_sam_rel_pos_tables');
   FMergeWindowsKernel := FKernel.CreateKernel('cai_sam_window_merge');
   FPlaneShape := TNNetVolume.Create();
 end;
@@ -44078,7 +44079,7 @@ destructor TNNetSAMVisionAttentionCL.Destroy();
 begin
   if Assigned(FRowDotsKernel) then clReleaseKernel(FRowDotsKernel);
   if Assigned(FPartitionKernel) then clReleaseKernel(FPartitionKernel);
-  if Assigned(FRelPosBiasKernel) then clReleaseKernel(FRelPosBiasKernel);
+  if Assigned(FRelPosTablesKernel) then clReleaseKernel(FRelPosTablesKernel);
   if Assigned(FMergeWindowsKernel) then clReleaseKernel(FMergeWindowsKernel);
   if Assigned(FBufQkvWeight) then clReleaseMemObject(FBufQkvWeight);
   if Assigned(FBufQkvBias) then clReleaseMemObject(FBufQkvBias);
@@ -44125,13 +44126,14 @@ procedure TNNetSAMVisionAttentionCL.Attend(X: TNNetVolume;
 var
   bufX, bufBias: cl_mem;
   k: cl_kernel;
-  GridH, GridW, Channels, WinTokens, Planes, TokenCnt: integer;
+  GridH, GridW, Channels, WinTokens, Planes, TokenCnt, TableCols: integer;
   PlaneBytes: csize_t;
 begin
   GridH := X.SizeY;
   GridW := X.SizeX;
   Channels := Heads * HeadDim;
   WinTokens := WinH * WinW;
+  TableCols := WinH + WinW;
   Planes := Windows * Heads;
   TokenCnt := GridH * GridW;
   PlaneBytes := csize_t(Planes) * WinTokens * HeadDim * csNeuralFloatSize;
@@ -44145,7 +44147,7 @@ begin
   FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, PlaneBytes);
   FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, PlaneBytes);
   bufBias := FKernel.EnsureBuffer(FBufScoreBias, FCapScoreBias,
-    CL_MEM_READ_WRITE, csize_t(Planes) * WinTokens * WinTokens *
+    CL_MEM_READ_WRITE, csize_t(Planes) * WinTokens * TableCols *
     csNeuralFloatSize);
   FKernel.EnsureBuffer(FBufProj, FCapProj, CL_MEM_READ_WRITE,
     csize_t(Windows) * WinTokens * Channels * csNeuralFloatSize);
@@ -44167,7 +44169,7 @@ begin
   clSetKernelArg(k, 11, csCLMemSize, @FBufK);
   clSetKernelArg(k, 12, csCLMemSize, @FBufV);
   FKernel.RunKernel(k, Windows * WinTokens * 3 * Channels);
-  k := FRelPosBiasKernel;
+  k := FRelPosTablesKernel;
   clSetKernelArg(k, 0, csLongintSize, @WinH);
   clSetKernelArg(k, 1, csLongintSize, @WinW);
   clSetKernelArg(k, 2, csLongintSize, @Planes);
@@ -44176,16 +44178,17 @@ begin
   clSetKernelArg(k, 5, csCLMemSize, @FBufPlaneQ);
   clSetKernelArg(k, 6, csCLMemSize, @FBufRelPos);
   clSetKernelArg(k, 7, csCLMemSize, @bufBias);
-  FKernel.RunKernel(k, Planes * WinTokens * WinTokens);
-  // Each plane is one unmasked "cache" of WinTokens keys with its own bias.
+  FKernel.RunKernel(k, Planes * WinTokens * TableCols);
+  // Each plane is one unmasked "cache" of WinTokens keys whose bias the flash
+  // kernel adds from the plane's per-query key-row and key-column tables.
   RunFlash(FPlaneShape, FPlaneShape, FBufPlaneQ, {Int8KV=}false,
     {QHeads=}Planes, {KVHeads=}Planes, {GroupSize=}1, HeadDim,
     {CacheMax=}WinTokens, {CacheSlot=}0, {Window=}0, {Causal=}false, [], 0,
     InvSqrtHeadDim, {ScoreSoftCap=}0, {InvScoreSoftCap=}0, FBufK, FBufV,
     {pKeepResultOnOpenCL=}true, {bufSinks=}FBufPlaneQ, {HasSinks=}0, bufBias,
-    {BiasBase=}0, {BiasRowStride=}WinTokens,
-    {BiasLen=}Planes * WinTokens * WinTokens,
-    {BiasHeadStride=}WinTokens * WinTokens);
+    {BiasBase=}0, {BiasRowStride=}TableCols,
+    {BiasLen=}Planes * WinTokens * TableCols,
+    {BiasHeadStride=}WinTokens * TableCols, {BiasKeyWidth=}WinW);
   // The flash rows are [token][window][channel], so row t*Windows + w is the
   // context of token t of window w.
   RunRowDotProducts(FKernel, FRowDotsKernel, FBufProjWeight, FResultBuf,

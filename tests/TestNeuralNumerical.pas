@@ -89819,18 +89819,18 @@ end;
 
 // TNNetSAMVisionAttention forced into OpenCL vs its CPU Compute: windows that pad
 // the grid, windows that tile it exactly and a global block over a non-square
-// grid, fed by a host-only TNNetIdentity (upload) or the resident TNNetInput
-// (bind); a weight change between OpenCL forwards reaches the kernels.
-// Coded by Claude (AI).
+// grid (the last two past one 64-key flash tile), fed by a host-only
+// TNNetIdentity (upload) or the resident TNNetInput (bind); a weight change
+// between OpenCL forwards reaches the kernels. Coded by Claude (AI).
 procedure TTestNeuralNumerical.SAMVisionAttentionOpenCLParity;
 {$IFDEF OpenCL}
 const
-  CaseCount = 4;
-  SizeXs: array[0..CaseCount-1] of integer = (5, 4, 4, 3);
-  SizeYs: array[0..CaseCount-1] of integer = (7, 4, 3, 5);
-  HeadCounts: array[0..CaseCount-1] of integer = (2, 1, 3, 2);
-  HeadDims: array[0..CaseCount-1] of integer = (4, 8, 2, 3);
-  WindowSizes: array[0..CaseCount-1] of integer = (3, 4, 0, 2);
+  CaseCount = 6;
+  SizeXs: array[0..CaseCount-1] of integer = (5, 4, 4, 3, 13, 11);
+  SizeYs: array[0..CaseCount-1] of integer = (7, 4, 3, 5, 9, 10);
+  HeadCounts: array[0..CaseCount-1] of integer = (2, 1, 3, 2, 2, 1);
+  HeadDims: array[0..CaseCount-1] of integer = (4, 8, 2, 3, 4, 5);
+  WindowSizes: array[0..CaseCount-1] of integer = (3, 4, 0, 2, 0, 9);
 var
   NN: TNNet;
   Input, OutCPUA, OutCPUB: TNNetVolume;
