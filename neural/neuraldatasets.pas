@@ -28,7 +28,7 @@ interface
 
 uses
   {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, System.Generics.Collections, {$ENDIF}
-  neuralvolume, neuralnetwork, pascoremath32
+  neuralvolume, neuralnetwork, neuralimageresize, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
   FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff,
@@ -238,18 +238,15 @@ type
     CropSize: integer;              // crop_size (square)
     Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
     Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+    Resample: TImageResampleFilter; // resample (PIL code, default BICUBIC)
   end;
 
-// Applies the standard inference transform to Src (an (W,H,3) RGB volume with
-// 0..255 byte-valued channels, the layout LoadImageFromFileIntoVolume yields)
-// and writes the (CropSize,CropSize,3) normalized result into Dst:
-//   shorter-side resize to ResizeShorterSide (aspect preserved, bilinear) ->
-//   center-crop to CropSize -> (x/255 - Mean[c])/Std[c] per channel.
-// Mean/Std are RGB triples (e.g. csImageNetMean / csImageNetStd). Src and Dst
-// may NOT be the same volume.
+// Src (W,H,3) RGB 0..255 -> Dst (CropSize,CropSize,3): PIL shorter-side resize
+// (torchvision default bilinear), center crop, (x/255-Mean)/Std; Src <> Dst.
 procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat);
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear);
 
 // Reads the standard inference transform straight into a TNNetImagePreprocess
 // from a HuggingFace preprocessor_config.json. Handles size as an int, as
@@ -263,7 +260,8 @@ function ReadImagePreprocessConfig(
 // volume (LoadImageFromFileIntoVolume + PreprocessImageForVisionModel).
 function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat): boolean;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear): boolean;
 
 // Writes the header of a confusion matrix into a CSV file
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
@@ -3538,14 +3536,13 @@ end;
 
 procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat);
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter);
 var
   Work: TNNetVolume;
-  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  Scale, Fx, Fy: TNeuralFloat;
-  ResizeWM1, ResizeHM1, CropM1, WorkBase, SrcBase, DstBase: integer;
-  ScaleX, ScaleY: TNeuralFloat;
-  SrcXMax, SrcYMax, DstStride, WorkStride: integer;
+  OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  CropM1, WorkBase, DstBase: integer;
+  DstStride, WorkStride: integer;
   WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
   RowOutY: boolean;
   ScaleC, BiasC: array[0..2] of TNeuralFloat;
@@ -3566,52 +3563,7 @@ begin
   Work := TNNetVolume.Create;
   try
     // ---- (1) resize: shorter edge -> ResizeShorterSide, aspect preserved.
-    // PIL/torchvision default is bicubic; this is bilinear (identity when the
-    // source is already at the target size, so a pre-resized Src is exact).
-    if (Src.SizeX <> ResizeShorterSide) or (Src.SizeY <> ResizeShorterSide) then
-    begin
-      if Src.SizeX <= Src.SizeY then
-      begin
-        Scale := ResizeShorterSide / Src.SizeX;
-        ResizeW := ResizeShorterSide;
-        ResizeH := Round(Src.SizeY * Scale);
-      end
-      else
-      begin
-        Scale := ResizeShorterSide / Src.SizeY;
-        ResizeH := ResizeShorterSide;
-        ResizeW := Round(Src.SizeX * Scale);
-      end;
-      if ResizeW < 1 then ResizeW := 1;
-      if ResizeH < 1 then ResizeH := 1;
-      Work.ReSize(ResizeW, ResizeH, 3);
-      ResizeHM1 := ResizeH - 1;
-      ResizeWM1 := ResizeW - 1;
-      ScaleX := Src.SizeX / ResizeW;
-      ScaleY := Src.SizeY / ResizeH;
-      SrcXMax := Src.SizeX - 1;
-      SrcYMax := Src.SizeY - 1;
-      for Y := 0 to ResizeHM1 do
-      begin
-        // bilinear sample location (align_corners = false convention); Y-only
-        Fy := (Y + 0.5) * ScaleY - 0.5;
-        if Fy < 0 then Fy := 0;
-        SrcY := Trunc(Fy);
-        if SrcY > SrcYMax then SrcY := SrcYMax;
-        for X := 0 to ResizeWM1 do
-        begin
-          Fx := (X + 0.5) * ScaleX - 0.5;
-          if Fx < 0 then Fx := 0;
-          SrcX := Trunc(Fx);
-          if SrcX > SrcXMax then SrcX := SrcXMax;
-          WorkBase := Work.GetRawPos(X, Y, 0);
-          SrcBase := Src.GetRawPos(SrcX, SrcY, 0);
-          Move(Src.FData[SrcBase], Work.FData[WorkBase], 3 * csNeuralFloatSize);
-        end;
-      end;
-    end
-    else
-      Work.Copy(Src);
+    ResizeByteImageShortestEdge(Src, Work, ResizeShorterSide, Filter);
 
     // ---- (2) center crop to (CropSize, CropSize).
     OffX := (Work.SizeX - CropSize) div 2;
@@ -3662,7 +3614,8 @@ end;
 
 function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat): boolean;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear): boolean;
 var
   Raw: TNNetVolume;
 begin
@@ -3671,7 +3624,7 @@ begin
     Result := LoadImageFromFileIntoVolume(ImageFileName, Raw);
     if Result then
       PreprocessImageForVisionModel(Raw, V, ResizeShorterSide, CropSize,
-        Mean, Std);
+        Mean, Std, Filter);
   finally
     Raw.Free;
   end;
@@ -3751,6 +3704,7 @@ begin
 
     Result.ResizeShorterSide := ReadEdge('size', 224);
     Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
       csClipMean[0], csClipMean[1], csClipMean[2]);
@@ -3834,6 +3788,7 @@ begin
 
     Result.ResizeShorterSide := ReadEdge('size', 224);
     Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
       csClipMean[0], csClipMean[1], csClipMean[2]);

@@ -9,7 +9,8 @@ torchvision/PIL" check is substituted with a SYNTHETIC, hand-computed oracle:
 tiny known volumes whose geometry (output dims, center-crop offsets) and
 normalization math are computed independently (a short python3 snippet, inlined
 below) and asserted byte-for-byte. The bilinear resize is an identity for the
-identity-resize case, so the normalization oracle is exact there.
+identity-resize case, so the normalization oracle is exact there. Shrinks are
+checked against hand-computed PIL BILINEAR values and against ResizeImagePIL.
 Coded by Claude (AI).
 *)
 
@@ -19,7 +20,7 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, FPImage,
-  neuralnetwork, neuralvolume, neuraldatasets;
+  neuralnetwork, neuralvolume, neuraldatasets, neuralimageresize;
 
 type
   TTestNeuralImagePreprocess = class(TTestCase)
@@ -33,6 +34,12 @@ type
     // 8 wide x 4 tall src, resize shorter (Y) to 2 -> 4x2, crop 2x2: output
     // dims are exactly CropSize x CropSize x 3.
     procedure TestOutputGeometryWithDownResize;
+    // 4x4 -> 2x2 default (bilinear) shrink: PIL's antialiased taps are
+    // (3,3,1)/7 and (1,3,3)/7 per axis, hand-computed.
+    procedure TestBilinearAntialiasShrinkHandComputed;
+    // 10x7 -> 5x4 bicubic shrink (long side Trunc(4*10/7) = 5, not 6) equals
+    // ResizeImagePIL with uint8 rounding, center-cropped and normalized.
+    procedure TestBicubicShrinkMatchesResizeImagePIL;
     // ReadImagePreprocessConfig parses size/crop_size as ints and the
     // image_mean/image_std triples from a HF preprocessor_config.json.
     procedure TestReadConfigIntSizes;
@@ -146,6 +153,84 @@ begin
   end;
 end;
 
+procedure TTestNeuralImagePreprocess.TestBilinearAntialiasShrinkHandComputed;
+const
+  // Per-axis PIL BILINEAR 4 -> 2 of 14*x (x) and 70*y (y).
+  ExpectedX: array[0..1] of TNeuralFloat = (10, 32);
+  ExpectedY: array[0..1] of TNeuralFloat = (50, 160);
+var
+  Src, Dst: TNNetVolume;
+  X, Y, C: integer;
+  Mean, Std: array[0..2] of TNeuralFloat;
+begin
+  Mean[0] := 0; Mean[1] := 0; Mean[2] := 0;
+  Std[0]  := 1; Std[1]  := 1; Std[2]  := 1;
+  Src := TNNetVolume.Create(4, 4, 3);
+  Dst := TNNetVolume.Create;
+  try
+    for X := 0 to 3 do
+      for Y := 0 to 3 do
+        for C := 0 to 2 do
+          Src[X, Y, C] := 14 * X + 70 * Y + C;
+    PreprocessImageForVisionModel(Src, Dst, 2, 2, Mean, Std);
+    AssertEquals('out W', 2, Dst.SizeX);
+    AssertEquals('out H', 2, Dst.SizeY);
+    for Y := 0 to 1 do
+      for X := 0 to 1 do
+        for C := 0 to 2 do
+          AssertEquals(Format('bilinear (%d,%d,%d)', [X, Y, C]),
+            (ExpectedX[X] + ExpectedY[Y] + C) / 255.0, Dst[X, Y, C],
+            csOracleTol);
+  finally
+    Src.Free;
+    Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestBicubicShrinkMatchesResizeImagePIL;
+var
+  Src, Dst, Resized: TNNetVolume;
+  X, Y, C: integer;
+  Mean, Std: array[0..2] of TNeuralFloat;
+  Expected: TNeuralFloat;
+begin
+  Mean[0] := 0.485; Mean[1] := 0.456; Mean[2] := 0.406;
+  Std[0]  := 0.229; Std[1]  := 0.224; Std[2]  := 0.225;
+  Src := TNNetVolume.Create(10, 7, 3);
+  Dst := TNNetVolume.Create;
+  Resized := TNNetVolume.Create;
+  try
+    // Hard 0/255 edges in channel 2 make the bicubic overshoot clamp.
+    for X := 0 to 9 do
+      for Y := 0 to 6 do
+      begin
+        Src[X, Y, 0] := (X * 35 + Y * 16) mod 256;
+        Src[X, Y, 1] := (X * 37 + Y * 91) mod 256;
+        Src[X, Y, 2] := 255 * ((X + Y) mod 2);
+      end;
+    PreprocessImageForVisionModel(Src, Dst, 4, 4, Mean, Std, irfBicubic);
+    ResizeImagePIL(Src, Resized, 5, 4, irfBicubic, {RoundToBytes=}true);
+    AssertEquals('out W', 4, Dst.SizeX);
+    AssertEquals('out H', 4, Dst.SizeY);
+    // 5x4 -> 4x4 center crop: OffX = 0, OffY = 0.
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        for C := 0 to 2 do
+        begin
+          AssertTrue('uint8 rounded',
+            (Resized[X, Y, C] = Round(Resized[X, Y, C])) and
+            (Resized[X, Y, C] >= 0) and (Resized[X, Y, C] <= 255));
+          Expected := (Resized[X, Y, C] / 255.0 - Mean[C]) / Std[C];
+          AssertEquals(Format('bicubic (%d,%d,%d)', [X, Y, C]),
+            Expected, Dst[X, Y, C], csOracleTol);
+        end;
+  finally
+    Src.Free;
+    Dst.Free;
+    Resized.Free;
+  end;
+end;
+
 procedure WriteConfig(const FileName, Body: string);
 var
   L: TStringList;
@@ -166,7 +251,7 @@ var
 begin
   FN := GetTempDir + 'cai_pp_int.json';
   WriteConfig(FN,
-    '{"size":256,"crop_size":224,' +
+    '{"size":256,"crop_size":224,"resample":2,' +
     '"image_mean":[0.485,0.456,0.406],' +
     '"image_std":[0.229,0.224,0.225]}');
   try
@@ -176,6 +261,7 @@ begin
     AssertEquals('mean0', 0.485, Cfg.Mean[0], csOracleTol);
     AssertEquals('mean2', 0.406, Cfg.Mean[2], csOracleTol);
     AssertEquals('std1', 0.224, Cfg.Std[1], csOracleTol);
+    AssertTrue('resample 2 = bilinear', Cfg.Resample = irfBilinear);
   finally
     DeleteFile(FN);
   end;
@@ -216,6 +302,7 @@ begin
     AssertEquals('crop default', 224, Cfg.CropSize);
     AssertEquals('clip mean0', 0.48145466, Cfg.Mean[0], csOracleTol);
     AssertEquals('clip std2', 0.27577711, Cfg.Std[2], csOracleTol);
+    AssertTrue('resample default bicubic', Cfg.Resample = irfBicubic);
   finally
     DeleteFile(FN);
   end;

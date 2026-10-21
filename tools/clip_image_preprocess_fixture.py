@@ -12,6 +12,9 @@ HF CLIPImageProcessor reference for the normalized RGB tensor:
   - crop image: 2x larger than the crop, so center-crop is an EXACT integer
     crop (no interpolation) - exercises the crop offset arithmetic with
     byte-exact reference too (do_resize disabled in this pass).
+  - shrink image: non-square and larger than the working size, through the
+    full processor (PIL bicubic shortest-edge resize, Trunc long side, then
+    center-crop) - the antialiased-downscale oracle.
 
 Coded by Claude (AI).
 
@@ -73,6 +76,10 @@ proc_nocrop = CLIPImageProcessor(
 crop_img = make_image(2 * CROP, 2 * CROP)
 crop_ref = proc_nocrop(images=crop_img, return_tensors='np').pixel_values[0]
 
+# --- shrink image: 20 wide x 13 tall -> 12x8 bicubic -> center-crop 8x8 ---
+shrink_img = make_image(13, 20)
+shrink_ref = proc(images=shrink_img, return_tensors='np').pixel_values[0]
+
 with open('tests/fixtures/tiny_clip_preprocess.json', 'w') as f:
     json.dump({
         'size': SIZE,
@@ -82,6 +89,8 @@ with open('tests/fixtures/tiny_clip_preprocess.json', 'w') as f:
         'parity_ref': parity_ref.tolist(),           # [3][CROP][CROP]
         'crop_image': crop_img.tolist(),             # [2C][2C][3]
         'crop_ref': crop_ref.tolist(),               # [3][CROP][CROP]
+        'shrink_image': shrink_img.tolist(),         # [13][20][3]
+        'shrink_ref': shrink_ref.tolist(),           # [3][CROP][CROP]
     }, f)
 
 print('wrote tiny_clip_preprocessor_config.json + tiny_clip_preprocess.json')

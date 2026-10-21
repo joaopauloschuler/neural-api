@@ -536,7 +536,8 @@ uses
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralchat, neuralmxfp4, neuralnf4,
-  neuralaudio, neuraldiffusion, neuralg2p, neuralplainops, pascoremath32;
+  neuralaudio, neuraldiffusion, neuralg2p, neuralplainops, neuralimageresize,
+  pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -8585,6 +8586,7 @@ type
     RescaleFactor: TNeuralFloat;    // rescale_factor (1/255)
     Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
     Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+    Resample: TImageResampleFilter; // resample (PIL code, default BICUBIC)
   end;
 
 // Reads a HF preprocessor_config.json for the CLIP/LLaVA image processor.
@@ -8595,13 +8597,8 @@ type
 function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
 
-// Preprocesses Src (an (W, H, 3) RGB volume with 0..255 byte values in the
-// channel-last layout the vision net consumes) into Dst, a
-// (CropWidth, CropHeight, 3) normalized RGB volume ready for the CLIP /
-// LLaVA vision tower input. Resize uses bilinear interpolation (HF's
-// default is bicubic; for byte-exact parity feed a Src already at the
-// processor's working size so resize and center-crop are identities - the
-// rescale/normalize path is then byte-exact vs CLIPImageProcessor).
+// Src (W,H,3) RGB 0..255 -> Dst (CropWidth,CropHeight,3) normalized: PIL
+// shortest-edge resize with Config.Resample, center crop, rescale, normalize.
 procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
   const Config: TClipImageProcessorConfig);
 
@@ -14205,9 +14202,6 @@ var
   NeuralImportInt4FromRowsLayerCount: integer = 0;
 
 implementation
-
-uses
-  neuralimageresize;
 
 procedure ImportError(const Msg: string);
 begin
@@ -85086,6 +85080,7 @@ begin
     Result.DoRescale := Obj.Get('do_rescale', true);
     Result.DoNormalize := Obj.Get('do_normalize', true);
     Result.RescaleFactor := Obj.Get('rescale_factor', 1.0 / 255.0);
+    Result.Resample := PILResampleCodeToFilter(Obj.Get('resample', 3));
     ReadTriple('image_mean', Result.Mean,
       0.48145466, 0.4578275, 0.40821073);
     ReadTriple('image_std', Result.Std,
@@ -85100,12 +85095,11 @@ procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
   const Config: TClipImageProcessorConfig);
 var
   Work: TNNetVolume;
-  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  ResizeWM1, ResizeHM1, CropWidthM1, CropHeightM1, SrcXMax, SrcYMax: integer;
-  workBase, srcBase, srcRowBase, dstBase, wkBase, WorkXMax, WorkYMax: integer;
-  Scale, Fx, Fy, rf: TNeuralFloat;
+  OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  CropWidthM1, CropHeightM1: integer;
+  dstBase, wkBase, WorkXMax, WorkYMax: integer;
+  rf: TNeuralFloat;
   a0, a1, a2, b0, b1, b2: TNeuralFloat;
-  rxF, ryF: Double;   // Src->resize coord ratios, invariant across the pixel nest (#5/#8)
 begin
   if (Src = nil) or (Dst = nil) then
     ImportError('ClipPreprocessImage: nil volume.');
@@ -85115,59 +85109,9 @@ begin
 
   Work := TNNetVolume.Create;
   try
-    // ---- resize: shortest edge -> Config.ShortestEdge, aspect preserved.
-    // HF uses bicubic; this is bilinear (identity when already at size).
-    if Config.DoResize and
-       ((Src.SizeX <> Config.ShortestEdge) or
-        (Src.SizeY <> Config.ShortestEdge)) then
-    begin
-      if Src.SizeX <= Src.SizeY then
-      begin
-        Scale := Config.ShortestEdge / Src.SizeX;
-        ResizeW := Config.ShortestEdge;
-        ResizeH := Round(Src.SizeY * Scale);
-      end
-      else
-      begin
-        Scale := Config.ShortestEdge / Src.SizeY;
-        ResizeH := Config.ShortestEdge;
-        ResizeW := Round(Src.SizeX * Scale);
-      end;
-      if ResizeW < 1 then ResizeW := 1;
-      if ResizeH < 1 then ResizeH := 1;
-      Work.ReSize(ResizeW, ResizeH, 3);
-      ResizeWM1 := ResizeW - 1;
-      ResizeHM1 := ResizeH - 1;
-      SrcXMax := Src.SizeX - 1;
-      SrcYMax := Src.SizeY - 1;
-      // #5/#8: the coord ratios are invariant across the whole pixel nest; hoist
-      // them (also removes the per-pixel SizeX/SizeY property getter). Float '/'.
-      rxF := Src.SizeX / ResizeW;
-      ryF := Src.SizeY / ResizeH;
-      workBase := 0;   // = Work.GetRawPos(X, Y, 0); depth 3, walked in order
-      for Y := 0 to ResizeHM1 do
-      begin
-        // The whole y-side depends only on Y; hoist it (#11).
-        Fy := (Y + 0.5) * ryF - 0.5;
-        if Fy < 0 then Fy := 0;
-        SrcY := Trunc(Fy);
-        if SrcY > SrcYMax then SrcY := SrcYMax;
-        srcRowBase := Src.GetRawPos(0, SrcY, 0);   // #11: invariant over X
-        for X := 0 to ResizeWM1 do
-        begin
-          Fx := (X + 0.5) * rxF - 0.5;
-          if Fx < 0 then Fx := 0;
-          SrcX := Trunc(Fx);
-          if SrcX > SrcXMax then SrcX := SrcXMax;
-          srcBase := srcRowBase + SrcX * 3;
-          // three RGB slots, so the copy is cheaper written out (App. B)
-          Work.FData[workBase] := Src.FData[srcBase];
-          Work.FData[workBase + 1] := Src.FData[srcBase + 1];
-          Work.FData[workBase + 2] := Src.FData[srcBase + 2];
-          Inc(workBase, 3);
-        end;
-      end;
-    end
+    if Config.DoResize then
+      ResizeByteImageShortestEdge(Src, Work, Config.ShortestEdge,
+        Config.Resample)
     else
       Work.Copy(Src);
 

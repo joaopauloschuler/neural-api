@@ -2335,12 +2335,20 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [ ] Antialiased downscale in the HF image preprocessing helpers. Both shrink
-      photos with NEAREST (Trunc of the source coordinate) although their comments
-      say bilinear, while the HF targets use PIL BICUBIC/BILINEAR (always
-      antialiased) or torchvision antialias=True:
-      `ClipPreprocessImage` (neural/neuralpretrained.pas; CLIP/LLaVA/ViT/DINOv2/
-      SigLIP paths) and `PreprocessImageForVisionModel` (neural/neuraldatasets.pas;
-      ImageNetEval). Host routines, so port the filter on the host
-      (neuralimageresize.pas BuildAxis is a PIL-style template) and add a
-      PIL-oracle shrink fixture (TestClipImagePreprocess never shrinks).
+- [X] Antialiased downscale in the HF image preprocessing helpers. DONE:
+      neuralimageresize.ResizeImagePIL (all six PIL filters through the one
+      BuildAxis; RoundToBytes = PIL's 8-bit path: 22-bit fixed-point weights,
+      uint8 after each pass; verified 0-diff vs PIL RGB and ~5e-7 vs mode 'F'
+      out of repo) + ResizeByteImageShortestEdge (long side Trunc as HF and
+      torchvision, not Round). `ClipPreprocessImage` uses the config's
+      "resample" (TClipImageProcessorConfig.Resample, default BICUBIC);
+      `PreprocessImageForVisionModel`/`LoadImageForVisionModel` take a Filter
+      (default bilinear = torchvision Resize); TNNetImagePreprocess.Resample is
+      read from the config. Tests: TestClipImagePreprocess gained a 20x13 HF
+      CLIPImageProcessor shrink (4.8e-7), plus a hand-computed bilinear 4x4->2x2
+      and a 10x7 bicubic shrink vs ResizeImagePIL. No old expectation changed
+      (all earlier tests used identity resizes).
+- [ ] HF processors whose `size` is {"height","width"} (ViTImageProcessor,
+      SiglipImageProcessor) resize straight to (H,W) without keeping the aspect
+      ratio; `ClipPreprocessImage` and `ReadImagePreprocessConfig` turn that into
+      a shortest-edge resize, so non-square photos differ from HF there.

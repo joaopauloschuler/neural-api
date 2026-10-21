@@ -28811,11 +28811,11 @@ end;
 
 // Step 2 of the LLaVA import: ReadClipImageProcessorConfig +
 // ClipPreprocessImage must reproduce HF's CLIPImageProcessor normalized RGB
-// tensor. The oracle (tools/clip_image_preprocess_fixture.py) pins two
-// images: a parity image already at the working size (resize/crop are
-// identities -> rescale+normalize is byte-exact) and a 2x image whose
-// center-crop is an exact integer crop (no interpolation). Both compared
-// against HF pixel_values [3][H][W]; our (W,H,3) Dst[x,y,c] = ref[c][y][x].
+// tensor. The oracle (tools/clip_image_preprocess_fixture.py) pins three
+// images: one already at the working size (resize/crop are identities), a 2x
+// image with resize off (exact integer center-crop) and a non-square 20x13
+// shrink through HF's PIL bicubic resize. All compared against HF
+// pixel_values [3][H][W]; our (W,H,3) Dst[x,y,c] = ref[c][y][x].
 procedure TTestNeuralPretrained.TestClipImagePreprocess;
 var
   Config: TClipImageProcessorConfig;
@@ -28887,6 +28887,7 @@ begin
     Abs(Config.Mean[0] - 0.48145466) < 1e-6);
   AssertTrue('std[2] ~ 0.2757',
     Abs(Config.Std[2] - 0.27577711) < 1e-6);
+  AssertTrue('resample defaults to bicubic', Config.Resample = irfBicubic);
 
   Crop := Config.CropWidth;
   Src := TNNetVolume.Create;
@@ -28906,6 +28907,13 @@ begin
     // 2x image, resize off: center-crop is an exact integer crop.
     MaxDiff := MaxDiffAgainst('crop_image', 'crop_ref', {ResizeOff=}true);
     AssertTrue('center-crop preprocess: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // 20x13 -> 12x8 antialiased bicubic shrink, then center-crop.
+    MaxDiff := MaxDiffAgainst('shrink_image', 'shrink_ref',
+      {ResizeOff=}false);
+    WriteLn(Format('  CLIP bicubic shrink vs HF: max|diff|=%.2e', [MaxDiff]));
+    AssertTrue('shrink preprocess: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;
