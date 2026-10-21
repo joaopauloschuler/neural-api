@@ -103,6 +103,7 @@ type
     procedure TestFlowMatchScaleNoiseVsOracle;
     procedure TestFlowDPMSolverFirstOrderMatchesEuler;
     procedure TestFlowDPMSolverTrajectoryVsDiffusers;
+    procedure TestFlowUniPCTrajectoryVsDiffusers;
     procedure TestTrailingSpacingMatchesDiffusers;
     procedure TestZeroTerminalSNRRescale;
     procedure TestZeroTerminalSNRDDIMVEndpoint;
@@ -1741,6 +1742,149 @@ begin
     Sched.ResetMultistep;
     StartSample;
     for StepPos := 1 to 3 do RunStep(StepPos, cStepsC[StepPos], 'C');
+  finally
+    Sched.Free;
+    Sample.Free;
+    Velocity.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowUniPCTrajectoryVsDiffusers;
+const
+  // diffusers 0.41.0.dev0 UniPCMultistepScheduler(use_flow_sigmas=True,
+  // flow_shift=1.0, prediction_type="flow_prediction", solver_order=2,
+  // lower_order_final=True, final_sigmas_type="zero") given the sigma lists
+  // below through set_timesteps(sigmas=...), stepped with FlowSyntheticVelocity
+  // from x[i] = (i - 2.5)*0.4 (its float32 sample math; it moves the first
+  // sigma 1 to float32(1 - 1e-6)).
+  // A: Create(1000, 3.0) static shift (Wan 480p), SetTimesteps(7), bh2.
+  cSigmasA: array[0..7] of double = (1.0, 0.9473684210526314,
+    0.8823529411764705, 0.7999999999999999, 0.6923076923076923,
+    0.5454545454545453, 0.33333333333333337, 0.0);
+  cStepsA: array[0..6, 0..5] of double = (
+    (-0.9473694562911987, -0.5657901763916016, -0.18421083688735962,
+      0.19736847281455994, 0.5789477825164795, 0.9605270624160767),
+    (-0.894055187702179, -0.5308968424797058, -0.1677384376525879,
+      0.19541993737220764, 0.5585783123970032, 0.9217367172241211),
+    (-0.8415402173995972, -0.49613019824028015, -0.15072016417980194,
+      0.19468984007835388, 0.5400998592376709, 0.8855099081993103),
+    (-0.7867394089698792, -0.4593363404273987, -0.13193318247795105,
+      0.19546988606452942, 0.522873044013977, 0.8502761721611023),
+    (-0.7368398904800415, -0.4246120750904083, -0.11238420754671097,
+      0.1998436450958252, 0.5120715498924255, 0.8242993950843811),
+    (-0.7077057957649231, -0.4009164869785309, -0.09412719309329987,
+      0.21266208589076996, 0.5194514393806458, 0.8262407183647156),
+    (-0.6777875423431396, -0.3728841245174408, -0.06798075139522552,
+      0.23692262172698975, 0.5418260097503662, 0.8467293977737427));
+  // B: schedule A with bh1. diffusers returns NaN on the last step (B(h) = -h
+  // is -inf at sigma 0); step 6 is the limit x0 = x - sigma*v of step 5.
+  cStepsB: array[0..6, 0..5] of double = (
+    (-0.9473694562911987, -0.5657901763916016, -0.18421083688735962,
+      0.19736847281455994, 0.5789477825164795, 0.9605270624160767),
+    (-0.9238690137863159, -0.5496666431427002, -0.17546434700489044,
+      0.1987379640340805, 0.5729402303695679, 0.9471425414085388),
+    (-0.8687102794647217, -0.5132340788841248, -0.15775780379772186,
+      0.19771847128868103, 0.5531946420669556, 0.908670961856842),
+    (-0.8121171593666077, -0.4753067195415497, -0.1384962797164917,
+      0.19831416010856628, 0.5351245403289795, 0.8719350099563599),
+    (-0.7614530920982361, -0.4400811791419983, -0.11870924383401871,
+      0.20266267657279968, 0.5240345597267151, 0.8454064726829529),
+    (-0.7407553791999817, -0.4215664863586426, -0.10237767547369003,
+      0.2168111652135849, 0.5359999537467957, 0.85518878698349),
+    (-0.7016566395759583, -0.387798011302948, -0.07393942773342133,
+      0.23991917073726654, 0.5537777543067932, 0.8676363229751587));
+  // C: schedule A, bh2, disable_corrector on every step (UniP only).
+  cStepsC: array[0..6, 0..5] of double = (
+    (-0.9473694562911987, -0.5657901763916016, -0.18421083688735962,
+      0.19736847281455994, 0.5789477825164795, 0.9605270624160767),
+    (-0.8910644054412842, -0.5290139317512512, -0.1669633984565735,
+      0.19508709013462067, 0.5571375489234924, 0.9191880226135254),
+    (-0.8349348902702332, -0.4919765293598175, -0.1490180641412735,
+      0.19394034147262573, 0.536898672580719, 0.879857063293457),
+    (-0.7793577313423157, -0.45470312237739563, -0.13004839420318604,
+      0.1946062445640564, 0.5192608833312988, 0.8439154624938965),
+    (-0.7297177314758301, -0.42015835642814636, -0.1105988472700119,
+      0.1989605724811554, 0.5085200071334839, 0.8180793523788452),
+    (-0.7021526098251343, -0.39747434854507446, -0.09279599785804749,
+      0.21188226342201233, 0.5165605545043945, 0.8212388157844543),
+    (-0.6737768650054932, -0.3703981339931488, -0.06701932847499847,
+      0.23635941743850708, 0.5397381782531738, 0.8431169390678406));
+  // D: Create(1000, 1.0, true, ftsExponential, 0.02), SetTimesteps(6, mu 1.1),
+  // bh2, entered at step 1 (img2img): step 1 is first order, no corrector.
+  cSigmasD: array[0..6] of double = (1.0, 0.9020764511595901,
+    0.7761497985579633, 0.6082039227865721, 0.372995806619427,
+    0.020000000000000018, 0.0);
+  cStepsD: array[1..5, 0..5] of double = (
+    (-0.8864045739173889, -0.5255464315414429, -0.16468825936317444,
+      0.196169912815094, 0.5570281147956848, 0.9178861975669861),
+    (-0.8106069564819336, -0.47391602396965027, -0.13722506165504456,
+      0.19946591556072235, 0.536156952381134, 0.8728477954864502),
+    (-0.7580286264419556, -0.43486616015434265, -0.11170361936092377,
+      0.21145889163017273, 0.5346214771270752, 0.8577839136123657),
+    (-0.9156957864761353, -0.5218769907951355, -0.12805809080600739,
+      0.2657608389854431, 0.6595797538757324, 1.053398609161377),
+    (-0.9161725640296936, -0.5214494466781616, -0.12672628462314606,
+      0.2679969370365143, 0.6627201437950134, 1.0574432611465454));
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+  Sample, Velocity: TNNetVolume;
+  StepPos: integer;
+
+  procedure StartSample;
+  var
+    ElementPos: integer;
+  begin
+    for ElementPos := 0 to 5 do
+      Sample.FData[ElementPos] := (ElementPos - 2.5) * 0.4;
+  end;
+
+  procedure RunStep(StepIdx: integer; const Expected: array of double;
+    const CaseName: string);
+  var
+    ElementPos: integer;
+  begin
+    FlowSyntheticVelocity(Sample, Velocity, Sched.Sigma[StepIdx]);
+    Sched.Step(Sample, Velocity, StepIdx);
+    for ElementPos := 0 to 5 do
+      AssertEquals(CaseName + ' step ' + IntToStr(StepIdx) + ' @ ' +
+        IntToStr(ElementPos), Expected[ElementPos], Sample.FData[ElementPos],
+        2e-5);
+  end;
+
+begin
+  Sched := nil;
+  Sample := TNNetVolume.Create(6, 1, 1);
+  Velocity := TNNetVolume.Create;
+  try
+    Sched := TNNetFlowMatchEulerScheduler.Create(1000, 3.0);
+    Sched.Sampler := fsUniPC;
+    AssertTrue('bh2 is the default', Sched.UniPCSolverType = ustBh2);
+    AssertTrue('corrector on by default', Sched.UniPCCorrector);
+    Sched.SetTimesteps(7);
+    for StepPos := 0 to 7 do
+      AssertEquals('sigma A ' + IntToStr(StepPos), cSigmasA[StepPos],
+        Sched.Sigma[StepPos], 1e-12);
+    StartSample;
+    for StepPos := 0 to 6 do RunStep(StepPos, cStepsA[StepPos], 'A');
+    Sched.UniPCSolverType := ustBh1;
+    Sched.ResetMultistep;
+    StartSample;
+    for StepPos := 0 to 6 do RunStep(StepPos, cStepsB[StepPos], 'B');
+    Sched.UniPCSolverType := ustBh2;
+    Sched.UniPCCorrector := false;
+    Sched.ResetMultistep;
+    StartSample;
+    for StepPos := 0 to 6 do RunStep(StepPos, cStepsC[StepPos], 'C');
+    Sched.Free;
+    Sched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true,
+      ftsExponential, 0.02);
+    Sched.Sampler := fsUniPC;
+    Sched.SetTimesteps(6, 1.1);
+    for StepPos := 0 to 6 do
+      AssertEquals('sigma D ' + IntToStr(StepPos), cSigmasD[StepPos],
+        Sched.Sigma[StepPos], 1e-12);
+    StartSample;
+    for StepPos := 1 to 5 do RunStep(StepPos, cStepsD[StepPos], 'D');
   finally
     Sched.Free;
     Sample.Free;

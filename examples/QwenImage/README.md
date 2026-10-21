@@ -24,8 +24,9 @@ The pipeline follows the diffusers `QwenImage21Pipeline`:
   tokens run once through a prefix pass; each denoising step then runs only
   the image tokens against the cached prompt K/V.
 - **Scheduler** — `TNNetFlowMatchEulerScheduler` (flow-matching Euler with
-  the dynamic exponential shift and `shift_terminal`, or DPM-Solver++(2M)
-  with `--sampler dpm2m`; see [Samplers](#samplers---sampler-eulerdpm2m)).
+  the dynamic exponential shift and `shift_terminal`, DPM-Solver++(2M)
+  with `--sampler dpm2m` or UniPC with `--sampler unipc`; see
+  [Samplers](#samplers---sampler-eulerdpm2munipc)).
 - **VAE decoder** — `TQwenImage21VaeDecoder`, decoding the 64-channel latents
   to RGBA at 16 times the latent width and height, in overlapping tiles.
 
@@ -615,8 +616,8 @@ bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --guidance-scale 4 \
   average, for APG each window keeps its own momentum. With
   `--fbc-threshold`, each pass keeps its own First-Block Cache (diffusers'
   `cache_context("cond")` / `"uncond"`), and the `--stats` row counts
-  skipped passes of both. `--sampler dpm2m` still takes one sampler step
-  per step, on the mixed velocity.
+  skipped passes of both. `--sampler dpm2m` and `--sampler unipc` still
+  take one sampler step per step, on the mixed velocity.
 
 The quality on the real checkpoint has not been checked yet.
 
@@ -775,7 +776,7 @@ and `--fp32`, the last one given wins.
 | --- | --- | --- |
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
 | `--steps N` | sampler steps | 18 |
-| `--sampler NAME` | `euler` or `dpm2m` (DPM-Solver++(2M)); see [Samplers](#samplers---sampler-eulerdpm2m) | `euler` |
+| `--sampler NAME` | `euler`, `dpm2m` (DPM-Solver++(2M)) or `unipc` (UniPC); see [Samplers](#samplers---sampler-eulerdpm2munipc) | `euler` |
 | `--seed N` | seed of the initial noise | 42 |
 | `--image FILE` | edit: a condition image (PNG, JPEG, ...); repeat for up to 10; see [Image editing](#image-editing) | — |
 | `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
@@ -804,9 +805,9 @@ and `--fp32`, the last one given wins.
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
 1024x1024. The step time grows with that count.
 
-### Samplers (`--sampler euler|dpm2m`)
+### Samplers (`--sampler euler|dpm2m|unipc`)
 
-Both samplers run one transformer pass per step on the same sigma schedule
+All three samplers run one transformer pass per step on the same sigma schedule
 (the dynamic shift and `shift_terminal` of `scheduler/scheduler_config.json`).
 
 - `euler` (default): the first-order Euler step of diffusers
@@ -818,9 +819,17 @@ Both samplers run one transformer pass per step on the same sigma schedule
   so it is second order and should reach the quality of Euler in fewer
   steps. An img2img, inpainting or outpainting run starts mid-schedule with a
   first-order step; a panorama steps the blended canvas once per step.
+- `unipc`: UniPC, diffusers `UniPCMultistepScheduler` with
+  `use_flow_sigmas=True`, `prediction_type="flow_prediction"`,
+  `solver_order=2`, `solver_type="bh2"`, `lower_order_final=True` and
+  `final_sigmas_type="zero"` (the Wan default). Like `dpm2m` it is second
+  order from the second step on; it also corrects each step's sample with
+  that step's clean-image prediction (no extra transformer pass). Mid-schedule
+  starts and panoramas behave as with `dpm2m`.
 
-`dpm2m` has not been compared against `euler` on real images yet; try
-`--sampler dpm2m --steps 10` to `12` against the default 18 Euler steps.
+`dpm2m` and `unipc` have not been compared against `euler` on real images
+yet; try `--sampler dpm2m --steps 10` to `12` (or `--sampler unipc`) against
+the default 18 Euler steps.
 
 ### VAE tiles
 

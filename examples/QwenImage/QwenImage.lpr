@@ -537,7 +537,9 @@ begin
   WriteLn('  --width N, --height N  pixels, rounded DOWN to a multiple of 32 ',
     '(default 1024)');
   WriteLn('  --steps N            sampler steps (default 18)');
-  WriteLn('  --sampler NAME       euler or dpm2m (DPM-Solver++(2M), second ',
+  WriteLn('  --sampler NAME       euler, dpm2m (DPM-Solver++(2M), second ',
+    'order) or unipc');
+  WriteLn('                       (UniPC bh2 predictor-corrector, second ',
     'order; default euler)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
   WriteLn('  --image FILE         edit: a condition image; repeat it for up ',
@@ -2662,9 +2664,10 @@ begin
       SamplerName := NextArg();
       if SamplerName = 'euler' then Sampler := fsEuler
       else if SamplerName = 'dpm2m' then Sampler := fsDPMSolverPP2M
+      else if SamplerName = 'unipc' then Sampler := fsUniPC
       else
       begin
-        WriteLn('--sampler: "', SamplerName, '" is not euler or dpm2m.');
+        WriteLn('--sampler: "', SamplerName, '" is not euler, dpm2m or unipc.');
         Halt(2);
       end;
     end

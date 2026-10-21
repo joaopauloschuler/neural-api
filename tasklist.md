@@ -1931,12 +1931,10 @@ rather than acted on.
         (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
         and a reversed velocity sign; the gain is small (the loop is already one
         `MulAdd` per step).
-- [ ] Flow-matching sampler follow-ups (`fsDPMSolverPP2M` + examples/QwenImage
-      `--sampler euler|dpm2m`, b81a2760):
-      - [ ] User GPU-box quality check of dpm2m at 10-12 steps against euler at
-            the current default count (18).
-      - [ ] Optional: `UniPCMultistepScheduler(use_flow_sigmas=True)` (the Wan
-            default) on the same sigma list.
+- [ ] Flow-matching sampler follow-ups (`fsDPMSolverPP2M` / `fsUniPC` +
+      examples/QwenImage `--sampler euler|dpm2m|unipc`):
+      - [ ] User GPU-box quality check of dpm2m and unipc at 10-12 steps
+            against euler at the current default count (18).
 - [ ] Adaptive Projected Guidance follow-ups (`TNNetAdaptiveProjectedGuidance` in
       neural/neuraldiffusion.pas, 15c5aca5; `--apg` in examples/LatentTextToImage,
       examples/ConditionalDiffusion and examples/QwenImage). Later consumers: the

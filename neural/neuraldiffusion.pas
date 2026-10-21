@@ -416,7 +416,15 @@ type
   //   fsEuler         : x_next = x + (sigma_next - sigma)*v.
   //   fsDPMSolverPP2M : diffusers DPMSolverMultistepScheduler(use_flow_sigmas,
   //     flow_prediction, dpmsolver++, solver_order=2, final_sigmas_type="zero").
-  TNNetFlowSampler = (fsEuler, fsDPMSolverPP2M);
+  //   fsUniPC         : diffusers UniPCMultistepScheduler(use_flow_sigmas,
+  //     flow_prediction, predict_x0, solver_order=2, lower_order_final,
+  //     final_sigmas_type="zero"), the Wan scheduler: the order-2 UniP
+  //     predictor plus the UniC corrector that reuses this step's x0 on the
+  //     previous step (no extra model pass).
+  TNNetFlowSampler = (fsEuler, fsDPMSolverPP2M, fsUniPC);
+
+  // UniPC B(h) (diffusers solver_type): ustBh1 B(h) = -h, ustBh2 B(h) = e^-h - 1.
+  TNNetUniPCSolverType = (ustBh1, ustBh2);
 
   { TNNetFlowMatchEulerScheduler }
   // Deterministic sampler for rectified-flow models that predict the velocity
@@ -437,14 +445,27 @@ type
     // NumSteps + 1 entries, descending, the last one 0 (the clean sample).
     FSigmas: array of double;
     FSampler: TNNetFlowSampler;
-    // DPM-Solver++(2M) history: the x0 prediction of step FPrevStepIndex
-    // (-1: none), sized on first use.
+    // Multistep history: the x0 prediction of step FPrevStepIndex (-1: none),
+    // sized on first use. UniPC also keeps the x0 of the step before it
+    // (FPrevX0Older, valid when FHistoryLen = 2), the corrected sample of step
+    // FPrevStepIndex (FPrevSample, diffusers last_sample) and the order its
+    // predictor used (FPrevOrder, the order of the next corrector).
     FPrevX0: TNNetVolume;
     FPrevStepIndex: integer;
+    FPrevX0Older, FPrevSample: TNNetVolume;
+    FHistoryLen, FPrevOrder: integer;
+    FUniPCSolverType: TNNetUniPCSolverType;
+    FUniPCCorrector: boolean;
     procedure SetSampler(Value: TNNetFlowSampler);
     // DPM-Solver++(2M) step; second order when step StepIndex-1 left history.
     procedure StepDPMSolverPP2M(Sample, Velocity: TNNetVolume;
       StepIndex: integer);
+    // UniPC step: corrector + order-2 predictor when step StepIndex-1 left
+    // history, first order otherwise and on the last step.
+    procedure StepUniPC(Sample, Velocity: TNNetVolume; StepIndex: integer);
+    // Sigma[StepIndex] as UniPC reads it: diffusers moves a first sigma of 1
+    // to float32(1 - 1e-6), so lambda = ln((1 - sigma)/sigma) stays finite.
+    function UniPCSigma(StepIndex: integer): double;
     function GetNumSteps: integer;
     function GetSigma(StepIndex: integer): double;
     function GetTimestep(StepIndex: integer): double;
@@ -499,6 +520,12 @@ type
     property TimeShiftType: TNNetFlowTimeShift read FTimeShiftType;
     // Setting it calls ResetMultistep.
     property Sampler: TNNetFlowSampler read FSampler write SetSampler;
+    // fsUniPC options: diffusers solver_type (default ustBh2, the Wan setting)
+    // and the UniC corrector (default true; false is disable_corrector on
+    // every step, the plain UniP predictor).
+    property UniPCSolverType: TNNetUniPCSolverType read FUniPCSolverType
+      write FUniPCSolverType;
+    property UniPCCorrector: boolean read FUniPCCorrector write FUniPCCorrector;
     property ShiftTerminal: double read FShiftTerminal;
     property BaseImageSeqLen: integer read FBaseImageSeqLen;
     property MaxImageSeqLen: integer read FMaxImageSeqLen;
@@ -597,6 +624,58 @@ var
 begin
   if Abs(H) < 1e-12 then StepRatio := 1.0 else StepRatio := HLast / H;
   Result := 0.5 / StepRatio;
+end;
+
+// UniPC B(h) weights (Zhao et al. 2023; diffusers multistep_uni_p_bh_update and
+// multistep_uni_c_bh_update with predict_x0) of one hop from s0 to t:
+//   x_t = (sigma_t/sigma_s0)*x_s0 + WeightM0*m0 + WeightM1*m1 + WeightMT*m_t,
+// m0 the x0 at s0, m1 the x0 one step earlier at s1 (read when Order = 2),
+// m_t the x0 at t (corrector only). HH = lambda_s0 - lambda_t (-h, < 0),
+// Rk = (lambda_s1 - lambda_s0)/h. The order-2 predictor takes rho = 1/2, the
+// order-1 corrector rho = 1/2, the order-2 corrector solves
+// [[1, 1], [Rk, 1]] * rho = b.
+procedure UniPCWeights(HH, Rk, AlphaT: double; Order: integer;
+  IsCorrector: boolean; SolverType: TNNetUniPCSolverType;
+  out WeightM0, WeightM1, WeightMT: double);
+var
+  HPhi1, Bh, DataScale, CorrectionScale, PhiRatio, B1, B2, DetR: double;
+  RhoHistory, RhoCurrent, HistoryD1Scale: double;
+begin
+  HPhi1 := Exp(HH) - 1.0;
+  if SolverType = ustBh1 then Bh := HH else Bh := HPhi1;
+  DataScale := AlphaT * HPhi1;
+  CorrectionScale := AlphaT * Bh;
+  WeightM0 := -DataScale;
+  WeightM1 := 0;
+  WeightMT := 0;
+  if IsCorrector then
+  begin
+    if Order >= 2 then
+    begin
+      PhiRatio := HPhi1 / HH - 1.0;
+      B1 := PhiRatio / Bh;
+      B2 := (PhiRatio / HH - 0.5) * 2.0 / Bh;
+      DetR := 1.0 - Rk;
+      RhoHistory := (B1 - B2) / DetR;
+      RhoCurrent := (-Rk * B1 + B2) / DetR;
+      // corr = RhoHistory*(m1 - m0)/Rk + RhoCurrent*(m_t - m0).
+      HistoryD1Scale := CorrectionScale * RhoHistory / Rk;
+      WeightM0 := -DataScale + HistoryD1Scale + CorrectionScale * RhoCurrent;
+      WeightM1 := -HistoryD1Scale;
+      WeightMT := -CorrectionScale * RhoCurrent;
+    end
+    else
+    begin
+      WeightM0 := -DataScale + 0.5 * CorrectionScale;
+      WeightMT := -0.5 * CorrectionScale;
+    end;
+  end
+  else if Order >= 2 then
+  begin
+    HistoryD1Scale := 0.5 * CorrectionScale / Rk;
+    WeightM0 := -DataScale + HistoryD1Scale;
+    WeightM1 := -HistoryD1Scale;
+  end;
 end;
 
 constructor TNNetDiffusionScheduler.Create(pT: integer;
@@ -1140,18 +1219,15 @@ var
   abT, abPrev, sqrtAbPrev, x0, dirCoef: TNeuralFloat;
   // DPM-Solver++ locals.
   lamT, lamPrev, h, hLast, r0: TNeuralFloat;
-  curX0, dCoef: TNeuralFloat;
   // UniPC locals (order-2 bh2, predict_x0).
-  alphaT, sigmaTuni, sigmaS0, hh, hphi1, Bh, rk, rhoC0, rhoC1: TNeuralFloat;
-  detR, sigRatio: TNeuralFloat;
+  alphaT, sigmaTuni, sigmaS0, rk: TNeuralFloat;
+  WeightM0, WeightM1, WeightMT: double;
   cOrder, pOrder: integer;
   // Loop-invariant hoists (rule #5): per-step coefficients pulled out of the
   // per-element loops below.
   needNoise: boolean;
-  invSqrtAbT, somabT, cA, cB, kX, kD, kM0, kBh, invRk: TNeuralFloat;
-  cD1: TNeuralFloat;           // UniPC D1 coef
+  invSqrtAbT, somabT, cA, cB, kX, kD: TNeuralFloat;
   kA, cE, kZ: TNeuralFloat;    // per-step affine coeffs for the sampler loops (#5)
-  m0Vol, m1Vol: TNNetVolume;   // UniPC history rows bound once (#5)
 begin
   // Persistent lazily-sized eps scratch (rule #17). Step and PredictX0 never
   // run nested, so they safely share FEpsScratch.
@@ -1391,52 +1467,19 @@ begin
             lamPrev := Lambda(FUniHistT[FUniHistLen - 1]); // lambda at s0
             sigmaS0 := FSqrtOneMinusAlphaBar[FUniHistT[FUniHistLen - 1]];
             h := lamT - lamPrev;
-            hh := -h;
-            hphi1 := Exp(hh) - 1.0;
-            Bh := hphi1;                                   // bh2
-            sigRatio := sigmaTuni / sigmaS0;
             cOrder := FUniThisOrder;
-            // Step-invariant products hoisted out of the per-element loops (#5).
-            kM0 := alphaT * hphi1;
-            kBh := alphaT * Bh;
+            // rk of the second history point (FUniHistX0[FUniHistLen-2]).
             if cOrder >= 2 then
-            begin
-              // rk for the second history point (FUniHistX0[FUniHistLen-2] at
-              // FUniHistT[FUniHistLen-2]); D1 = (m1 - m0)/rk.
-              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamPrev) / h;
-              invRk := 1.0 / rk;
-              // Solve the 2x2 system R*rhos = b for the corrector weights.
-              //   R = [[1, 1],[rk, 1]], b = [hphi1/hh - 1, ...]/Bh-scaled terms.
-              //   b1 = (hphi1/hh - 1)/Bh,
-              //   b2 = ((hphi1/hh - 1)/hh - 1/2)*2/Bh.
-              rhoC0 := (hphi1 / hh - 1.0) / Bh;                       // b1
-              rhoC1 := ((hphi1 / hh - 1.0) / hh - 0.5) * 2.0 / Bh;    // b2
-              detR := 1.0 - rk;   // det([[1,1],[rk,1]]) = 1 - rk
-              // rhos = R^{-1} b ; R^{-1} = 1/detR * [[1,-1],[-rk,1]].
-              curX0 := (rhoC0 - rhoC1) / detR;        // rhos_c[0]
-              dCoef := (-rk * rhoC0 + rhoC1) / detR;  // rhos_c[1] (multiplies D1_t)
-              // Uniform affine over Xt (#13). Expanding the scalar body with
-              //   D1 = (m1 - m0)*invRk, m0=hist[-1], m1=hist[-2], mt=Eps:
-              //   Xt = sigRatio*prev + m0*(-kM0 + kBh*(curX0*invRk + dCoef))
-              //                      + m1*(-kBh*curX0*invRk) + mt*(-kBh*dCoef).
-              m0Vol := FUniHistX0[FUniHistLen - 1];
-              m1Vol := FUniHistX0[FUniHistLen - 2];
-              Xt.Copy(FUniPrevSample);
-              Xt.Mul(sigRatio);
-              Xt.MulAdd(-kM0 + kBh * (curX0 * invRk + dCoef), m0Vol);
-              Xt.MulAdd(-kBh * curX0 * invRk, m1Vol);
-              Xt.MulAdd(-kBh * dCoef, Eps);
-            end
+              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamPrev) / h
             else
-            begin
-              // First-order corrector: rhos_c = [0.5]. Uniform affine (#13):
-              //   Xt = sigRatio*prev + m0*(-kM0 + 0.5*kBh) + mt*(-0.5*kBh).
-              m0Vol := FUniHistX0[FUniHistLen - 1];
-              Xt.Copy(FUniPrevSample);
-              Xt.Mul(sigRatio);
-              Xt.MulAdd(-kM0 + 0.5 * kBh, m0Vol);
-              Xt.MulAdd(-0.5 * kBh, Eps);
-            end;
+              rk := 0;
+            UniPCWeights(-h, rk, alphaT, cOrder, true, ustBh2,
+              WeightM0, WeightM1, WeightMT);
+            Xt.Copy(FUniPrevSample);
+            Xt.Mul(sigmaTuni / sigmaS0);
+            Xt.MulAdd(WeightM0, FUniHistX0[FUniHistLen - 1]);
+            if cOrder >= 2 then Xt.MulAdd(WeightM1, FUniHistX0[FUniHistLen - 2]);
+            Xt.MulAdd(WeightMT, Eps);
           end;
 
           // 3. Push m_t (pre-correction x0) + Tt into the 2-deep history.
@@ -1484,37 +1527,23 @@ begin
             sigmaS0 := FSqrtOneMinusAlphaBar[Tt];
             lamPrev := Lambda(TtPrev);
             h := lamPrev - lamT;
-            hh := -h;
-            hphi1 := Exp(hh) - 1.0;
-            Bh := hphi1;                             // bh2
-            sigRatio := sigmaTuni / sigmaS0;
-            // Step-invariant products hoisted out of the per-element loops (#5).
-            kM0 := alphaT * hphi1;
-            kBh := alphaT * Bh;
             if (pOrder >= 2) and (FUniHistLen >= 2) then
             begin
-              // Predictor D1 from the previous history entry (rhos_p = [0.5]).
-              //   rk = (lambda_{prev hist} - lambda_t)/h.
+              // Predictor D1 from the previous history entry (m1 = hist[-2]).
               rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamT) / h;
-              invRk := 1.0 / rk;
-              // Uniform affine over Xt (#13). With m0=Eps, m1=hist[-2],
-              //   D1 = (m1 - m0)*invRk and cD1 = 0.5*kBh*invRk:
-              //   Xt = sigRatio*prev + Eps*(-kM0 + cD1) + m1*(-cD1).
-              cD1 := 0.5 * kBh * invRk;
-              m1Vol := FUniHistX0[FUniHistLen - 2];
-              Xt.Copy(FUniPrevSample);
-              Xt.Mul(sigRatio);
-              Xt.MulAdd(-kM0 + cD1, Eps);
-              Xt.MulAdd(-cD1, m1Vol);
+              pOrder := 2;
             end
             else
             begin
-              // First-order predictor (no correction term).
-              // sigRatio*FUniPrevSample - kM0*Eps as a uniform affine map (#13).
-              Xt.Copy(FUniPrevSample);
-              Xt.Mul(sigRatio);
-              Xt.MulAdd(-kM0, Eps);
+              rk := 0;
+              pOrder := 1;
             end;
+            UniPCWeights(-h, rk, alphaT, pOrder, false, ustBh2,
+              WeightM0, WeightM1, WeightMT);
+            // Xt already holds FUniPrevSample.
+            Xt.Mul(sigmaTuni / sigmaS0);
+            Xt.MulAdd(WeightM0, Eps);
+            if pOrder >= 2 then Xt.MulAdd(WeightM1, FUniHistX0[FUniHistLen - 2]);
           end;
 
           if FUniLowerOrderNums < 2 then Inc(FUniLowerOrderNums);
@@ -2000,12 +2029,20 @@ begin
   SetLength(FSigmas, 0);
   FSampler := fsEuler;
   FPrevX0 := nil;
+  FPrevX0Older := nil;
+  FPrevSample := nil;
   FPrevStepIndex := -1;
+  FHistoryLen := 0;
+  FPrevOrder := 1;
+  FUniPCSolverType := ustBh2;
+  FUniPCCorrector := true;
 end;
 
 destructor TNNetFlowMatchEulerScheduler.Destroy;
 begin
   FPrevX0.Free;
+  FPrevX0Older.Free;
+  FPrevSample.Free;
   inherited Destroy;
 end;
 
@@ -2157,8 +2194,12 @@ begin
   if (StepIndex < 0) or (StepIndex >= GetNumSteps) then
     raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
       ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
-  if FSampler = fsDPMSolverPP2M then StepDPMSolverPP2M(Sample, Velocity, StepIndex)
-  else Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
+  case FSampler of
+    fsDPMSolverPP2M: StepDPMSolverPP2M(Sample, Velocity, StepIndex);
+    fsUniPC: StepUniPC(Sample, Velocity, StepIndex);
+  else
+    Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
+  end;
 end;
 
 procedure TNNetFlowMatchEulerScheduler.ResetMultistep;
@@ -2249,6 +2290,174 @@ begin
       FPrevX0.FData[ElementPos] := CurrentX0;
     end;
   end;
+  FPrevStepIndex := StepIndex;
+end;
+
+function TNNetFlowMatchEulerScheduler.UniPCSigma(StepIndex: integer): double;
+const
+  cSigmaOneNudge: double = 1e-6;
+var
+  NudgedSigma: single;
+begin
+  Result := FSigmas[StepIndex];
+  if Abs(Result - 1) < cSigmaOneNudge then
+  begin
+    NudgedSigma := Result - cSigmaOneNudge;
+    Result := NudgedSigma;
+  end;
+end;
+
+procedure TNNetFlowMatchEulerScheduler.StepUniPC(Sample, Velocity: TNNetVolume;
+  StepIndex: integer);
+var
+  SigmaS, SigmaT, SigmaPrev, AlphaS, AlphaT, LambdaS, LambdaT, LambdaPrev: double;
+  StepH, Rk, WeightM0, WeightM1, WeightMT: double;
+  StepSigma, PredSampleScale, PredCurrentScale, PredPrevScale: TNeuralFloat;
+  CorrSampleScale, CorrPrevScale, CorrOlderScale, CorrCurrentScale: TNeuralFloat;
+  CurrentX0, CorrectedSample: TNeuralFloat;
+  ElementPos, MaxElementPos, PredOrder: integer;
+  HasHistory, UseCorrector: boolean;
+begin
+  // alpha = 1 - sigma, lambda = ln(alpha/sigma), x0 = x - sigma*v. The UniC
+  // corrector rewrites this step's sample from the previous step's corrected
+  // sample with this step's x0 (diffusers multistep_uni_c_bh_update), then the
+  // UniP predictor steps from the corrected sample (multistep_uni_p_bh_update).
+  // Both are affine in the stored x0 values (UniPCWeights).
+  if Velocity.Size <> Sample.Size then
+    raise Exception.Create('Flow-matching UniPC step: ' +
+      IntToStr(Velocity.Size) + ' velocity values for ' +
+      IntToStr(Sample.Size) + ' sample values.');
+  SigmaS := UniPCSigma(StepIndex);
+  SigmaT := FSigmas[StepIndex + 1];
+  StepSigma := SigmaS;
+  if SigmaT <= 0 then
+  begin
+    // Last step to sigma 0 (lower_order_final, first order): x_next is the x0
+    // of the uncorrected sample, the corrector cannot reach it. diffusers
+    // evaluates this limit as NaN for bh1.
+    Sample.MulAdd(-StepSigma, Velocity);
+    FPrevStepIndex := -1;
+    Exit;
+  end;
+  if not Assigned(FPrevX0) then
+  begin
+    FPrevX0 := TNNetVolume.Create(Sample);
+    FPrevStepIndex := -1;
+  end;
+  if not Assigned(FPrevX0Older) then FPrevX0Older := TNNetVolume.Create(Sample);
+  if not Assigned(FPrevSample) then FPrevSample := TNNetVolume.Create(Sample);
+  if (FPrevX0.Size <> Sample.Size) or (FPrevX0Older.Size <> Sample.Size) or
+    (FPrevSample.Size <> Sample.Size) then
+  begin
+    FPrevX0.ReSize(Sample);
+    FPrevX0Older.ReSize(Sample);
+    FPrevSample.ReSize(Sample);
+    FPrevStepIndex := -1;
+  end;
+  HasHistory := (StepIndex > 0) and (FPrevStepIndex = StepIndex - 1);
+  if not HasHistory then FHistoryLen := 0;
+  AlphaS := 1 - SigmaS;
+  AlphaT := 1 - SigmaT;
+  LambdaS := Ln(AlphaS / SigmaS);
+  LambdaT := Ln(AlphaT / SigmaT);
+  UseCorrector := HasHistory and FUniPCCorrector;
+  CorrSampleScale := 0;
+  CorrPrevScale := 0;
+  CorrOlderScale := 0;
+  CorrCurrentScale := 0;
+  LambdaPrev := 0;
+  if HasHistory then
+  begin
+    SigmaPrev := UniPCSigma(StepIndex - 1);
+    LambdaPrev := Ln((1 - SigmaPrev) / SigmaPrev);
+  end;
+  if UseCorrector then
+  begin
+    // UniC from step StepIndex-1 to this sigma at the previous predictor's order.
+    StepH := LambdaS - LambdaPrev;
+    if (FPrevOrder >= 2) and (FHistoryLen >= 2) then
+    begin
+      SigmaPrev := UniPCSigma(StepIndex - 2);
+      Rk := (Ln((1 - SigmaPrev) / SigmaPrev) - LambdaPrev) / StepH;
+      PredOrder := 2;
+    end
+    else
+    begin
+      Rk := 0;
+      PredOrder := 1;
+    end;
+    UniPCWeights(-StepH, Rk, AlphaS, PredOrder, true, FUniPCSolverType,
+      WeightM0, WeightM1, WeightMT);
+    CorrSampleScale := SigmaS / UniPCSigma(StepIndex - 1);
+    CorrPrevScale := WeightM0;
+    CorrOlderScale := WeightM1;
+    CorrCurrentScale := WeightMT;
+  end;
+  // UniP to the next sigma: order 2 with history, first order on a fresh start
+  // (the last step, lower_order_final, left above).
+  StepH := LambdaT - LambdaS;
+  if HasHistory then
+  begin
+    Rk := (LambdaPrev - LambdaS) / StepH;
+    PredOrder := 2;
+  end
+  else
+  begin
+    Rk := 0;
+    PredOrder := 1;
+  end;
+  UniPCWeights(-StepH, Rk, AlphaT, PredOrder, false, FUniPCSolverType,
+    WeightM0, WeightM1, WeightMT);
+  PredSampleScale := SigmaT / SigmaS;
+  PredCurrentScale := WeightM0;
+  PredPrevScale := WeightM1;
+  MaxElementPos := Sample.Size - 1;
+  // One fused pass per case: x0, the corrected sample, the predictor and the
+  // history shift (older := prev, prev := x0, last sample := corrected).
+  if UseCorrector then
+  begin
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      CurrentX0 := Sample.FData[ElementPos] - StepSigma * Velocity.FData[ElementPos];
+      CorrectedSample := CorrSampleScale * FPrevSample.FData[ElementPos] +
+        CorrPrevScale * FPrevX0.FData[ElementPos] +
+        CorrOlderScale * FPrevX0Older.FData[ElementPos] +
+        CorrCurrentScale * CurrentX0;
+      Sample.FData[ElementPos] := PredSampleScale * CorrectedSample +
+        PredCurrentScale * CurrentX0 + PredPrevScale * FPrevX0.FData[ElementPos];
+      FPrevSample.FData[ElementPos] := CorrectedSample;
+      FPrevX0Older.FData[ElementPos] := FPrevX0.FData[ElementPos];
+      FPrevX0.FData[ElementPos] := CurrentX0;
+    end;
+  end
+  else if HasHistory then
+  begin
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      CurrentX0 := Sample.FData[ElementPos] - StepSigma * Velocity.FData[ElementPos];
+      FPrevSample.FData[ElementPos] := Sample.FData[ElementPos];
+      Sample.FData[ElementPos] := PredSampleScale * Sample.FData[ElementPos] +
+        PredCurrentScale * CurrentX0 + PredPrevScale * FPrevX0.FData[ElementPos];
+      FPrevX0Older.FData[ElementPos] := FPrevX0.FData[ElementPos];
+      FPrevX0.FData[ElementPos] := CurrentX0;
+    end;
+  end
+  else
+  begin
+    // Fresh start: the older x0 slot gets this x0 too, so a weight-0 read of it
+    // on the next corrector never touches stale data.
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      CurrentX0 := Sample.FData[ElementPos] - StepSigma * Velocity.FData[ElementPos];
+      FPrevSample.FData[ElementPos] := Sample.FData[ElementPos];
+      Sample.FData[ElementPos] := PredSampleScale * Sample.FData[ElementPos] +
+        PredCurrentScale * CurrentX0;
+      FPrevX0Older.FData[ElementPos] := CurrentX0;
+      FPrevX0.FData[ElementPos] := CurrentX0;
+    end;
+  end;
+  if FHistoryLen < 2 then Inc(FHistoryLen);
+  FPrevOrder := PredOrder;
   FPrevStepIndex := StepIndex;
 end;
 
