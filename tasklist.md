@@ -1997,12 +1997,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         t the keys [0, K + t + 1), i.e. sinks never masked plus causal, and
         mode 0 the non-causal case. Needs a `ComputeFlashPacked` variant
         that keeps a prefix of uploaded rows (CacheMax = K + T). Note
-        FStruct[2] holds K, so the inherited window is always 0. Its
-        `Compute` also ignores `FCacheEnabled` (the GPT-OSS bug, found by
-        reading, not run): a streamed decode attends only the sinks and the
-        current window. Fix that first
-        (seed the cache with the K sink rows, or score the sinks beside
-        `ComputeIncremental`) with a streamed-vs-full parity test.
+        FStruct[2] holds K, so the inherited window is always 0. The CPU
+        KV-cache decode is fixed (c4372a7b): an overridden `ComputeIncremental`
+        scores the sink slots beside the cached keys, FP32 and int8 KV
+        (`TestSinkAttentionCachedDecodeParity`,
+        `TestStreamingDecoderSinkAndDifferentialMatchFullForward`); only the
+        OpenCL device forward remains.
   - [ ] `TNNetDifferentialAttention` (only built by
         `AddMultiHeadSelfAttention`'s differential variant; no importer).
         Two softmax maps over half-width Q1.K1 and Q2.K2 with a shared
@@ -2014,10 +2014,11 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         elementwise kernel Y1 - lambda*Y2 (lambda read from the weight on
         the device, or uploaded when changed). Needs a small packing kernel
         (the `FlashPackedSource` hook, as `cai_sdpa_qk_l2norm_packed` does)
-        and a second result buffer in the helper. Its `Compute` ignores
-        `FCacheEnabled` too (by reading, not run; a window wider than one
-        row also overruns `FAttn`, which `BeginIncrementalDecode` shrinks to
-        one element); same streamed-decode fix and test first.
+        and a second result buffer in the helper. The CPU KV-cache decode is
+        fixed (c4372a7b): an overridden `ComputeIncremental` runs both maps over
+        the cached half-width keys, FP32 and int8 KV
+        (`TestDifferentialAttentionCachedDecodeParity`); only the OpenCL
+        device forward remains.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
       `TNNetCausalLinearAttention` (the non-causal `TNNetLinearAttention` already
       has a two-GEMM `ComputeOpenCL`). COUPLED, not independent: each is a
