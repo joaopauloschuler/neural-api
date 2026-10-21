@@ -903,6 +903,9 @@ type
     procedure TestClipVisionFeatures;
     procedure TestOpenClipVisionTowerParity;
     procedure TestClipImagePreprocess;
+    // size {"height","width"}: direct resize to (H,W), no crop, equal to
+    // ResizeImagePIL; on a square image identical to the shortest_edge path.
+    procedure TestClipImagePreprocessHeightWidth;
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
     procedure TestSigLIPVisionFeatures;
@@ -28921,6 +28924,80 @@ begin
     RefJson.Free;
     Dst.Free;
     Src.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestClipImagePreprocessHeightWidth;
+var
+  Config: TClipImageProcessorConfig;
+  Src, Dst, Resized, ShortestEdgeDst: TNNetVolume;
+  ConfigFile: TStringList;
+  FileName: string;
+  X, Y, C: integer;
+  Expected: TNeuralFloat;
+begin
+  FileName := GetTempDir(false) + 'cai_clip_pp_hw.json';
+  ConfigFile := TStringList.Create;
+  Src := TNNetVolume.Create(13, 9, 3);
+  Dst := TNNetVolume.Create;
+  Resized := TNNetVolume.Create;
+  ShortestEdgeDst := TNNetVolume.Create;
+  try
+    ConfigFile.Text := '{"size":{"height":4,"width":6},"resample":3,' +
+      '"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]}';
+    ConfigFile.SaveToFile(FileName);
+    Config := ReadClipImageProcessorConfig(FileName);
+    AssertFalse('direct mode', Config.ResizeKeepsAspect);
+    AssertEquals('resize H', 4, Config.ResizeHeight);
+    AssertEquals('resize W', 6, Config.ResizeWidth);
+    AssertEquals('crop H', 4, Config.CropHeight);
+    AssertEquals('crop W', 6, Config.CropWidth);
+    for X := 0 to 12 do
+      for Y := 0 to 8 do
+      begin
+        Src[X, Y, 0] := (X * 35 + Y * 16) mod 256;
+        Src[X, Y, 1] := (X * 37 + Y * 91) mod 256;
+        Src[X, Y, 2] := 255 * ((X + Y) mod 2);
+      end;
+    ClipPreprocessImage(Src, Dst, Config);
+    ResizeImagePIL(Src, Resized, 6, 4, irfBicubic, {RoundToBytes=}true);
+    AssertEquals('out W', 6, Dst.SizeX);
+    AssertEquals('out H', 4, Dst.SizeY);
+    for Y := 0 to 3 do
+      for X := 0 to 5 do
+        for C := 0 to 2 do
+        begin
+          Expected := (Resized[X, Y, C] / 255.0 - Config.Mean[C]) /
+            Config.Std[C];
+          AssertEquals(Format('direct (%d,%d,%d)', [X, Y, C]), Expected,
+            Dst[X, Y, C], 1e-5);
+        end;
+
+    // Square image: {"height":4,"width":4} and shortest_edge 4 agree exactly.
+    Src.ReSize(9, 9, 3);
+    for X := 0 to 8 do
+      for Y := 0 to 8 do
+        for C := 0 to 2 do
+          Src[X, Y, C] := (X * 29 + Y * 53 + C * 71) mod 256;
+    ConfigFile.Text := '{"size":{"height":4,"width":4},"resample":3}';
+    ConfigFile.SaveToFile(FileName);
+    ClipPreprocessImage(Src, Dst, ReadClipImageProcessorConfig(FileName));
+    ConfigFile.Text := '{"size":{"shortest_edge":4},"resample":3}';
+    ConfigFile.SaveToFile(FileName);
+    Config := ReadClipImageProcessorConfig(FileName);
+    AssertTrue('shortest_edge keeps aspect', Config.ResizeKeepsAspect);
+    ClipPreprocessImage(Src, ShortestEdgeDst, Config);
+    AssertEquals('square W', 4, Dst.SizeX);
+    AssertEquals('square H', 4, Dst.SizeY);
+    AssertEquals('square bit identical', 0.0,
+      Dst.SumDiff(ShortestEdgeDst), 0.0);
+  finally
+    DeleteFile(FileName);
+    ShortestEdgeDst.Free;
+    Resized.Free;
+    Dst.Free;
+    Src.Free;
+    ConfigFile.Free;
   end;
 end;
 

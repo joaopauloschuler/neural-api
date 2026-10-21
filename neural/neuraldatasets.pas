@@ -236,6 +236,10 @@ type
   TNNetImagePreprocess = record
     ResizeShorterSide: integer;     // size.shortest_edge (resize target)
     CropSize: integer;              // crop_size (square)
+    // False when size is {"height","width"}: resize straight to that size.
+    ResizeKeepsAspect: boolean;
+    ResizeHeight, ResizeWidth: integer; // size.height/width (= shortest edge)
+    CropHeight, CropWidth: integer;     // crop_size.height/width
     Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
     Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
     Resample: TImageResampleFilter; // resample (PIL code, default BICUBIC)
@@ -246,7 +250,12 @@ type
 procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
   const Mean, Std: array of TNeuralFloat;
-  Filter: TImageResampleFilter = irfBilinear);
+  Filter: TImageResampleFilter = irfBilinear); overload;
+
+// Config-driven transform: shorter-side or direct (H,W) resize per
+// Config.ResizeKeepsAspect, center crop to (CropWidth,CropHeight), normalize.
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  const Config: TNNetImagePreprocess); overload;
 
 // Reads the standard inference transform straight into a TNNetImagePreprocess
 // from a HuggingFace preprocessor_config.json. Handles size as an int, as
@@ -3534,18 +3543,63 @@ begin
   end;
 end;
 
-procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
-  ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat;
-  Filter: TImageResampleFilter);
+// Work (resized 0..255 RGB) -> Dst (CropWidth,CropHeight,3): centered crop
+// (zero padded where the window leaves Work), then (x/255 - Mean)/Std.
+procedure CenterCropAndNormalizeImage(Work, Dst: TNNetVolume;
+  CropWidth, CropHeight: integer; const Mean, Std: array of TNeuralFloat);
 var
-  Work: TNNetVolume;
   OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  CropM1, WorkBase, DstBase: integer;
+  MaxCropX, MaxCropY, WorkBase, DstBase: integer;
   DstStride, WorkStride: integer;
   WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
   RowOutY: boolean;
   ScaleC, BiasC: array[0..2] of TNeuralFloat;
+begin
+  OffX := (Work.SizeX - CropWidth) div 2;
+  OffY := (Work.SizeY - CropHeight) div 2;
+  Dst.ReSize(CropWidth, CropHeight, 3);
+  MaxCropX := CropWidth - 1;
+  MaxCropY := CropHeight - 1;
+  DstStride := Dst.GetRawPos(1, 0, 0);
+  WorkStride := Work.GetRawPos(1, 0, 0);
+  WorkSizeXM1 := Work.SizeX - 1;
+  WorkSizeYM1 := Work.SizeY - 1;
+  // (v/255 - Mean[C]) / Std[C] folded into one multiply-add per pixel: the
+  // per-channel scale and bias are invariant over the whole crop (#5).
+  for C := 0 to 2 do
+  begin
+    ScaleC[C] := (1.0 / 255.0) / Std[C];
+    BiasC[C] := -Mean[C] / Std[C];
+  end;
+  for Y := 0 to MaxCropY do
+  begin
+    SrcY := OffY + Y;
+    RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
+    if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
+    else WorkRowBase := 0;
+    DstBase := Dst.GetRawPos(0, Y, 0);
+    for X := 0 to MaxCropX do
+    begin
+      SrcX := OffX + X;
+      // pad with zeros if the crop window exceeds the resized image
+      if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
+      begin
+        for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
+      end
+      else
+      begin
+        WorkBase := WorkRowBase + SrcX * WorkStride;
+        for C := 0 to 2 do
+          Dst.FData[DstBase + C] :=
+            Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
+      end;
+      Inc(DstBase, DstStride);
+    end;
+  end;
+end;
+
+procedure CheckVisionModelPreprocessArgs(Src, Dst: TNNetVolume;
+  const Mean, Std: array of TNeuralFloat);
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3559,54 +3613,41 @@ begin
   if (Length(Mean) < 3) or (Length(Std) < 3) then
     raise Exception.Create(
       'PreprocessImageForVisionModel: Mean/Std need 3 elements.');
+end;
 
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter);
+var
+  Work: TNNetVolume;
+begin
+  CheckVisionModelPreprocessArgs(Src, Dst, Mean, Std);
   Work := TNNetVolume.Create;
   try
-    // ---- (1) resize: shorter edge -> ResizeShorterSide, aspect preserved.
     ResizeByteImageShortestEdge(Src, Work, ResizeShorterSide, Filter);
+    CenterCropAndNormalizeImage(Work, Dst, CropSize, CropSize, Mean, Std);
+  finally
+    Work.Free;
+  end;
+end;
 
-    // ---- (2) center crop to (CropSize, CropSize).
-    OffX := (Work.SizeX - CropSize) div 2;
-    OffY := (Work.SizeY - CropSize) div 2;
-    Dst.ReSize(CropSize, CropSize, 3);
-    CropM1 := CropSize - 1;
-    DstStride := Dst.GetRawPos(1, 0, 0);
-    WorkStride := Work.GetRawPos(1, 0, 0);
-    WorkSizeXM1 := Work.SizeX - 1;
-    WorkSizeYM1 := Work.SizeY - 1;
-    // (v/255 - Mean[C]) / Std[C] folded into one multiply-add per pixel: the
-    // per-channel scale and bias are invariant over the whole crop (#5).
-    for C := 0 to 2 do
-    begin
-      ScaleC[C] := (1.0 / 255.0) / Std[C];
-      BiasC[C] := -Mean[C] / Std[C];
-    end;
-    for Y := 0 to CropM1 do
-    begin
-      SrcY := OffY + Y;
-      RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
-      if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
-      else WorkRowBase := 0;
-      DstBase := Dst.GetRawPos(0, Y, 0);
-      for X := 0 to CropM1 do
-      begin
-        SrcX := OffX + X;
-        // pad with zeros if the crop window exceeds the resized image
-        if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
-        begin
-          for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
-        end
-        else
-        begin
-          // ---- (3) rescale by 1/255 then per-channel normalize.
-          WorkBase := WorkRowBase + SrcX * WorkStride;
-          for C := 0 to 2 do
-            Dst.FData[DstBase + C] :=
-              Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
-        end;
-        Inc(DstBase, DstStride);
-      end;
-    end;
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  const Config: TNNetImagePreprocess);
+var
+  Work: TNNetVolume;
+begin
+  CheckVisionModelPreprocessArgs(Src, Dst, Config.Mean, Config.Std);
+  Work := TNNetVolume.Create;
+  try
+    if Config.ResizeKeepsAspect then
+      ResizeByteImageShortestEdge(Src, Work, Config.ResizeShorterSide,
+        Config.Resample)
+    else
+      ResizeImagePIL(Src, Work, Config.ResizeWidth, Config.ResizeHeight,
+        Config.Resample, {RoundToBytes=}true);
+    CenterCropAndNormalizeImage(Work, Dst, Config.CropWidth,
+      Config.CropHeight, Config.Mean, Config.Std);
   finally
     Work.Free;
   end;
@@ -3662,6 +3703,27 @@ var
       Result := Data.AsInteger;
   end;
 
+  // True when the field is {"height":..,"width":..} without shortest_edge;
+  // otherwise Height = Width = ReadEdge(FieldName, DefaultEdge).
+  function ReadHeightWidth(const FieldName: string; DefaultEdge: integer;
+    out Height, Width: integer): boolean;
+  var
+    O: TJSONObject;
+  begin
+    Height := ReadEdge(FieldName, DefaultEdge);
+    Width := Height;
+    Result := false;
+    if not (Obj.Find(FieldName) is TJSONObject) then Exit;
+    O := TJSONObject(Obj.Find(FieldName));
+    if (O.IndexOfName('shortest_edge') < 0) and
+      (O.IndexOfName('height') >= 0) and (O.IndexOfName('width') >= 0) then
+    begin
+      Height := O.Get('height', DefaultEdge);
+      Width := O.Get('width', DefaultEdge);
+      Result := true;
+    end;
+  end;
+
   procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
     D0, D1, D2: TNeuralFloat);
   var
@@ -3703,7 +3765,18 @@ begin
     Obj := TJSONObject(Root);
 
     Result.ResizeShorterSide := ReadEdge('size', 224);
+    Result.ResizeKeepsAspect := not ReadHeightWidth('size',
+      Result.ResizeShorterSide, Result.ResizeHeight, Result.ResizeWidth);
     Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    ReadHeightWidth('crop_size', Result.CropSize, Result.CropHeight,
+      Result.CropWidth);
+    // HF crops only when do_center_crop; ViT/SigLIP have no crop_size at all.
+    if (not Result.ResizeKeepsAspect) and ((Obj.Find('crop_size') = nil) or
+      not Obj.Get('do_center_crop', true)) then
+    begin
+      Result.CropHeight := Result.ResizeHeight;
+      Result.CropWidth := Result.ResizeWidth;
+    end;
     Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
@@ -3749,6 +3822,29 @@ var
       Result := (Data as TJSONNumber).AsInt;
   end;
 
+  // True when the field is {"height":..,"width":..} without shortest_edge;
+  // otherwise Height = Width = ReadEdge(FieldName, DefaultEdge).
+  function ReadHeightWidth(const FieldName: string; DefaultEdge: integer;
+    out Height, Width: integer): boolean;
+  var
+    O: TJSONObject;
+    Temp, HeightValue, WidthValue: TJSONValue;
+  begin
+    Height := ReadEdge(FieldName, DefaultEdge);
+    Width := Height;
+    Result := false;
+    if not (Obj.FindValue(FieldName) is TJSONObject) then Exit;
+    O := Obj.FindValue(FieldName) as TJSONObject;
+    if (not O.TryGetValue('shortest_edge', Temp)) and
+      O.TryGetValue('height', HeightValue) and
+      O.TryGetValue('width', WidthValue) then
+    begin
+      Height := (HeightValue as TJSONNumber).AsInt;
+      Width := (WidthValue as TJSONNumber).AsInt;
+      Result := true;
+    end;
+  end;
+
   procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
     D0, D1, D2: TNeuralFloat);
   var
@@ -3787,7 +3883,18 @@ begin
     Obj := Root as TJSONObject;
 
     Result.ResizeShorterSide := ReadEdge('size', 224);
+    Result.ResizeKeepsAspect := not ReadHeightWidth('size',
+      Result.ResizeShorterSide, Result.ResizeHeight, Result.ResizeWidth);
     Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    ReadHeightWidth('crop_size', Result.CropSize, Result.CropHeight,
+      Result.CropWidth);
+    // HF crops only when do_center_crop; ViT/SigLIP have no crop_size at all.
+    if (not Result.ResizeKeepsAspect) and ((Obj.FindValue('crop_size') = nil) or
+      (Obj.FindValue('do_center_crop') is TJSONFalse)) then
+    begin
+      Result.CropHeight := Result.ResizeHeight;
+      Result.CropWidth := Result.ResizeWidth;
+    end;
     Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,

@@ -2353,7 +2353,14 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [ ] HF processors whose `size` is {"height","width"} (ViTImageProcessor,
+- [X] HF processors whose `size` is {"height","width"} (ViTImageProcessor,
       SiglipImageProcessor) resize straight to (H,W) without keeping the aspect
       ratio; `ClipPreprocessImage` and `ReadImagePreprocessConfig` turn that into
       a shortest-edge resize, so non-square photos differ from HF there.
+      Both configs now carry `ResizeKeepsAspect` + `ResizeHeight/Width`.
+- [ ] An int `size` is ambiguous: ViTImageProcessor reads it as a square
+      (H,W) (`default_to_square=True`, e.g. google/vit-base `"size": 224`),
+      CLIPImageProcessor as shortest_edge. Both readers still use
+      shortest_edge; choosing by `image_processor_type` /
+      `feature_extractor_type` needs a processor list.
+- [ ] `crop_pct` (ConvNext and others) is not read by either config reader.

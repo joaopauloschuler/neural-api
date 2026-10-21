@@ -47,6 +47,17 @@ type
     procedure TestReadConfigObjectSizes;
     // absent mean/std fall back to the CLIP defaults.
     procedure TestReadConfigDefaults;
+    // size {"height","width"} parses to the direct resize; the crop is (H,W)
+    // unless crop_size is given and do_center_crop is on.
+    procedure TestReadConfigHeightWidthSize;
+    // 13x7 src, direct (H,W) = (4,5) config: Dst is 5x4, uncropped, equal to
+    // ResizeImagePIL(5,4) with uint8 rounding then normalized.
+    procedure TestHeightWidthConfigResizesWithoutCrop;
+    // shortest_edge config through the config overload equals the scalar
+    // call bit for bit.
+    procedure TestShortestEdgeConfigMatchesScalarCall;
+    // square src: height/width (N,N) and shortest_edge N give identical Dst.
+    procedure TestHeightWidthSquareImageMatchesShortestEdge;
     // A (W,H,4) volume saved as PNG is 8-bit RGBA (colour type 6) and reloads
     // with its alpha; a 3-channel volume reloads opaque.
     procedure TestSaveImageRGBAPngRoundTrip;
@@ -310,6 +321,153 @@ begin
     AssertTrue('resample default bicubic', Cfg.Resample = irfBicubic);
   finally
     DeleteFile(FN);
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestReadConfigHeightWidthSize;
+var
+  Cfg: TNNetImagePreprocess;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_hw.json';
+  try
+    WriteConfig(FN, '{"size":{"height":6,"width":10}}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('direct mode', Cfg.ResizeKeepsAspect);
+    AssertEquals('resize H', 6, Cfg.ResizeHeight);
+    AssertEquals('resize W', 10, Cfg.ResizeWidth);
+    AssertEquals('crop H = resize H', 6, Cfg.CropHeight);
+    AssertEquals('crop W = resize W', 10, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"size":{"height":256,"width":256},' +
+      '"crop_size":{"height":224,"width":200},"do_center_crop":true}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertFalse('direct mode with crop', Cfg.ResizeKeepsAspect);
+    AssertEquals('crop H', 224, Cfg.CropHeight);
+    AssertEquals('crop W', 200, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"size":{"height":6,"width":10},' +
+      '"crop_size":{"height":4,"width":4},"do_center_crop":false}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertEquals('no center crop H', 6, Cfg.CropHeight);
+    AssertEquals('no center crop W', 10, Cfg.CropWidth);
+
+    WriteConfig(FN, '{"size":{"shortest_edge":8},"crop_size":5}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    AssertTrue('shortest_edge keeps aspect', Cfg.ResizeKeepsAspect);
+    AssertEquals('shorter', 8, Cfg.ResizeShorterSide);
+    AssertEquals('crop square H', 5, Cfg.CropHeight);
+    AssertEquals('crop square W', 5, Cfg.CropWidth);
+  finally
+    DeleteFile(FN);
+  end;
+end;
+
+procedure FillTestPhoto(Img: TNNetVolume);
+var
+  X, Y: integer;
+begin
+  for X := 0 to Img.SizeX - 1 do
+    for Y := 0 to Img.SizeY - 1 do
+    begin
+      Img[X, Y, 0] := (X * 35 + Y * 16) mod 256;
+      Img[X, Y, 1] := (X * 37 + Y * 91) mod 256;
+      Img[X, Y, 2] := 255 * ((X + Y) mod 2);
+    end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestHeightWidthConfigResizesWithoutCrop;
+var
+  Cfg: TNNetImagePreprocess;
+  Src, Dst, Resized: TNNetVolume;
+  FN: string;
+  X, Y, C: integer;
+  Expected: TNeuralFloat;
+begin
+  FN := GetTempDir + 'cai_pp_hw_resize.json';
+  WriteConfig(FN, '{"size":{"height":4,"width":5},"resample":3,' +
+    '"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]}');
+  Src := TNNetVolume.Create(13, 7, 3);
+  Dst := TNNetVolume.Create;
+  Resized := TNNetVolume.Create;
+  try
+    Cfg := ReadImagePreprocessConfig(FN);
+    FillTestPhoto(Src);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    ResizeImagePIL(Src, Resized, 5, 4, irfBicubic, {RoundToBytes=}true);
+    AssertEquals('out W', 5, Dst.SizeX);
+    AssertEquals('out H', 4, Dst.SizeY);
+    AssertEquals('out D', 3, Dst.Depth);
+    for Y := 0 to 3 do
+      for X := 0 to 4 do
+        for C := 0 to 2 do
+        begin
+          Expected := (Resized[X, Y, C] / 255.0 - Cfg.Mean[C]) / Cfg.Std[C];
+          AssertEquals(Format('direct (%d,%d,%d)', [X, Y, C]),
+            Expected, Dst[X, Y, C], csOracleTol);
+        end;
+  finally
+    DeleteFile(FN);
+    Resized.Free;
+    Dst.Free;
+    Src.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestShortestEdgeConfigMatchesScalarCall;
+var
+  Cfg: TNNetImagePreprocess;
+  Src, Dst, ScalarDst: TNNetVolume;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_se.json';
+  WriteConfig(FN, '{"size":{"shortest_edge":4},"crop_size":3,' +
+    '"resample":2,"image_mean":[0.5,0.4,0.3],"image_std":[0.2,0.25,0.3]}');
+  Src := TNNetVolume.Create(10, 7, 3);
+  Dst := TNNetVolume.Create;
+  ScalarDst := TNNetVolume.Create;
+  try
+    Cfg := ReadImagePreprocessConfig(FN);
+    FillTestPhoto(Src);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    PreprocessImageForVisionModel(Src, ScalarDst, 4, 3, Cfg.Mean, Cfg.Std,
+      irfBilinear);
+    AssertEquals('out W', 3, Dst.SizeX);
+    AssertEquals('out H', 3, Dst.SizeY);
+    AssertEquals('bit identical', 0.0, Dst.SumDiff(ScalarDst), 0.0);
+  finally
+    DeleteFile(FN);
+    ScalarDst.Free;
+    Dst.Free;
+    Src.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestHeightWidthSquareImageMatchesShortestEdge;
+var
+  Cfg: TNNetImagePreprocess;
+  Src, Dst, ShortestEdgeDst: TNNetVolume;
+  FN: string;
+begin
+  FN := GetTempDir + 'cai_pp_sq.json';
+  Src := TNNetVolume.Create(9, 9, 3);
+  Dst := TNNetVolume.Create;
+  ShortestEdgeDst := TNNetVolume.Create;
+  try
+    FillTestPhoto(Src);
+    WriteConfig(FN, '{"size":{"height":4,"width":4},"resample":3}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, Dst, Cfg);
+    WriteConfig(FN, '{"size":{"shortest_edge":4},"resample":3}');
+    Cfg := ReadImagePreprocessConfig(FN);
+    PreprocessImageForVisionModel(Src, ShortestEdgeDst, Cfg);
+    AssertEquals('out W', 4, Dst.SizeX);
+    AssertEquals('bit identical', 0.0, Dst.SumDiff(ShortestEdgeDst), 0.0);
+  finally
+    DeleteFile(FN);
+    ShortestEdgeDst.Free;
+    Dst.Free;
+    Src.Free;
   end;
 end;
 

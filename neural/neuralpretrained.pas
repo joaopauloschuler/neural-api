@@ -8577,6 +8577,9 @@ function SigLIPLogit(ImageEmb, TextEmb: TNNetVolume;
 type
   TClipImageProcessorConfig = record
     ShortestEdge: integer;          // size.shortest_edge (resize target)
+    // False when size is {"height","width"}: resize straight to that size.
+    ResizeKeepsAspect: boolean;
+    ResizeHeight, ResizeWidth: integer; // size.height/width (= shortest edge)
     CropHeight: integer;            // crop_size.height
     CropWidth: integer;             // crop_size.width
     DoResize: boolean;              // do_resize
@@ -8598,7 +8601,7 @@ function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
 
 // Src (W,H,3) RGB 0..255 -> Dst (CropWidth,CropHeight,3) normalized: PIL
-// shortest-edge resize with Config.Resample, center crop, rescale, normalize.
+// shortest-edge or direct (H,W) resize, center crop, rescale, normalize.
 procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
   const Config: TClipImageProcessorConfig);
 
@@ -84994,11 +84997,10 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
 
-  // Reads a size-like field that may be an int (square) or an object with
-  // shortest_edge / height / width. Returns the resolved edge length;
-  // OutH/OutW receive height/width (= edge when square / shortest_edge).
+  // Reads a size-like field: an int (square) or an object with shortest_edge
+  // / height / width. IsHeightWidth: both height and width, no shortest_edge.
   procedure ReadSize(const FieldName: string; DefaultEdge: integer;
-    out OutEdge, OutH, OutW: integer);
+    out OutEdge, OutH, OutW: integer; out IsHeightWidth: boolean);
   var
     Data: TJSONData;
     O: TJSONObject;
@@ -85006,11 +85008,14 @@ var
     OutEdge := DefaultEdge;
     OutH := DefaultEdge;
     OutW := DefaultEdge;
+    IsHeightWidth := false;
     Data := Obj.Find(FieldName);
     if Data = nil then Exit;
     if Data is TJSONObject then
     begin
       O := TJSONObject(Data);
+      IsHeightWidth := (O.IndexOfName('shortest_edge') < 0) and
+        (O.IndexOfName('height') >= 0) and (O.IndexOfName('width') >= 0);
       if O.IndexOfName('shortest_edge') >= 0 then
       begin
         OutEdge := O.Get('shortest_edge', DefaultEdge);
@@ -85051,7 +85056,8 @@ var
   end;
 
 var
-  SizeH, SizeW, CropEdge: integer;
+  CropEdge: integer;
+  IsSizeHeightWidth, IsCropHeightWidth: boolean;
 begin
   if not FileExists(FileName) then
     ImportError('CLIP image preprocessing: config file not found: ' +
@@ -85072,17 +85078,23 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
 
-    // size.shortest_edge (resize target). When size is square the edge is
-    // the side length.
-    ReadSize('size', 224, Result.ShortestEdge, SizeH, SizeW);
-    if Result.ShortestEdge <= 0 then Result.ShortestEdge := SizeH;
+    ReadSize('size', 224, Result.ShortestEdge, Result.ResizeHeight,
+      Result.ResizeWidth, IsSizeHeightWidth);
+    if Result.ShortestEdge <= 0 then Result.ShortestEdge := Result.ResizeHeight;
+    Result.ResizeKeepsAspect := not IsSizeHeightWidth;
 
-    // crop_size.{height,width}.
     ReadSize('crop_size', Result.ShortestEdge, CropEdge,
-      Result.CropHeight, Result.CropWidth);
+      Result.CropHeight, Result.CropWidth, IsCropHeightWidth);
 
     Result.DoResize := Obj.Get('do_resize', true);
     Result.DoCenterCrop := Obj.Get('do_center_crop', true);
+    // ViT/SigLIP processors have no crop: the output is the resized (H,W).
+    if IsSizeHeightWidth and ((Obj.Find('crop_size') = nil) or
+      not Result.DoCenterCrop) then
+    begin
+      Result.CropHeight := Result.ResizeHeight;
+      Result.CropWidth := Result.ResizeWidth;
+    end;
     Result.DoRescale := Obj.Get('do_rescale', true);
     Result.DoNormalize := Obj.Get('do_normalize', true);
     Result.RescaleFactor := Obj.Get('rescale_factor', 1.0 / 255.0);
@@ -85115,11 +85127,14 @@ begin
 
   Work := TNNetVolume.Create;
   try
-    if Config.DoResize then
+    if not Config.DoResize then
+      Work.Copy(Src)
+    else if Config.ResizeKeepsAspect then
       ResizeByteImageShortestEdge(Src, Work, Config.ShortestEdge,
         Config.Resample)
     else
-      Work.Copy(Src);
+      ResizeImagePIL(Src, Work, Config.ResizeWidth, Config.ResizeHeight,
+        Config.Resample, {RoundToBytes=}true);
 
     // ---- center crop to (CropWidth, CropHeight).
     if Config.DoCenterCrop then
