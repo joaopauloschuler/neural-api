@@ -2124,6 +2124,18 @@ type
     // TNNetDeepConcat with a zero-depth host-only source, and with one host-only
     // layer at two positions: exact vs CPU, that layer is uploaded once.
     procedure TestDeepConcatHostSourceEdgeOpenCLParity;
+    // cai_rope/cai_mrope at position 32760 (parity) and at angles near 1e30
+    // (finite, pair norms kept): no PoCL trap on a huge sin/cos argument.
+    procedure TestRoPEOpenCLExtremeInputs;
+    // cai_softmax (both variants) on inputs of +-1e3 and +-1e30: finite, sums
+    // to 1, matches the CPU; no PoCL trap on a far-negative exp argument.
+    procedure TestSoftMaxOpenCLExtremeInputs;
+    // cai_gated_delta_net with the b/a/z gate channels at +-1e3 and +-1e30:
+    // finite and matching the CPU; no PoCL trap in sigmoid, softplus or SiLU.
+    procedure TestGatedDeltaNetOpenCLExtremeGates;
+    // Split-row decode (FP32, int8) and flash over a cache whose scores span
+    // ~2000: matches the CPU, with and without the soft-cap; no PoCL trap.
+    procedure TestFusedSDPAOpenCLExtremeScores;
   end;
 
 implementation
@@ -82375,7 +82387,7 @@ end;
 // twice; the OpenCL layer runs with ForcedSplits key splits (0 = automatic).
 // ExpectedPath sdpaPathFlash falls back to the split decode (causal) or the
 // host when the tiles do not fit; on the host path the output must match the
-// CPU exactly. Inputs are InputAmplitude * U(-0.5, 0.5); KeyRamp > 0 adds
+// CPU exactly. Inputs are InputAmplitude * U(-0.5, 0.5); KeyRamp <> 0 adds
 // KeyRamp * row to prefix K row `row` and 1 to every input. With the int8
 // cache, row r of the prefix and of the step is scaled by 0.5 + 0.375*(r mod 5)
 // and the reference is a double-precision attention over the codes and scales
@@ -82548,7 +82560,7 @@ begin
     begin
       for Pos := 0 to MaxStepInPos do
         StepIn.FData[Pos] := RowAmplitude(Pos div InDepth) * InputAmplitude *
-          (Random - 0.5) + Ord(KeyRamp > 0);
+          (Random - 0.5) + Ord(KeyRamp <> 0);
       LCpu.TruncateCache(0);
       LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
       LGpu.TruncateCache(0);
@@ -82681,6 +82693,377 @@ begin
   KeyRamp := 0.5;
   RunCase(2, 2, 16, 1000, 16, 0, 0, 0, False, sdpaPathFlash);
   AssertTrue('the ramp case ran several key splits', LastFlashSplits > 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Masks every FP exception around NN.Compute(Input), so a host oracle that
+// overflows does not raise; returns true when it raised invalid/zero-divide/overflow.
+function ComputeHostMasked(NN: TNNet; Input: TNNetVolume): boolean;
+var
+  OldMask: TFPUExceptionMask;
+begin
+  Result := false;
+  OldMask := GetExceptionMask;
+  SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+    exDenormalized, exUnderflow, exPrecision]);
+  try
+    {$IFDEF CPUX86_64} SetMXCSR(GetMXCSR and not dword($3F)); {$ENDIF}
+    NN.Compute(Input);
+    // MXCSR status bits: 1 = invalid, 4 = zero divide, 8 = overflow.
+    {$IFDEF CPUX86_64} Result := (GetMXCSR and $0D) <> 0; {$ENDIF}
+  finally
+    ClearExceptions(False);
+    {$IFDEF CPUX86_64} SetMXCSR(GetMXCSR and not dword($3F)); {$ENDIF}
+    SetExceptionMask(OldMask);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEOpenCLExtremeInputs;
+{$IFDEF OpenCL}
+const
+  csTokens = 7;
+  csDepth = 32;
+var
+  NN: TNNet;
+  Input, OutCPU, OutGPU: TNNetVolume;
+  Rope: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, Pos, MaxPos, Token: integer;
+  PosT, PosH, PosW: array of integer;
+  CaseName: string;
+  Diff, MaxDiff, NormIn, NormOut: TNeuralFloat;
+  DeviceAllFinite, IsHugeAngle: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  PosT := nil;
+  PosH := nil;
+  PosW := nil;
+  for CaseCnt := 0 to 3 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csTokens, 1, csDepth);
+    OutCPU := TNNetVolume.Create();
+    OutGPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(csTokens, 1, csDepth, 1));
+      // Base 1e-30 makes the pair frequencies reach ~1e28, so angles are ~1e29.
+      IsHugeAngle := (CaseCnt mod 2) = 1;
+      if CaseCnt < 2 then
+      begin
+        CaseName := 'RoPE';
+        if IsHugeAngle
+          then Rope := TNNetRotaryEmbedding.Create(1e-30)
+          else Rope := TNNetRotaryEmbedding.Create();
+        NN.AddLayer(Rope);
+        TNNetRotaryEmbedding(Rope).PositionOffset := 32760;
+      end
+      else
+      begin
+        CaseName := 'M-RoPE';
+        if IsHugeAngle
+          then Rope := TNNetMRotaryEmbedding.Create(1e-30, 6, 5, 5)
+          else Rope := TNNetMRotaryEmbedding.Create(10000.0, 6, 5, 5);
+        NN.AddLayer(Rope);
+        SetLength(PosT, csTokens);
+        SetLength(PosH, csTokens);
+        SetLength(PosW, csTokens);
+        for Token := 0 to csTokens - 1 do
+        begin
+          PosT[Token] := 32760 + Token;
+          PosH[Token] := 32000 + (Token * 2) mod 5;
+          PosW[Token] := 31000 + (Token * 3 + 1) mod 6;
+        end;
+        TNNetMRotaryEmbedding(Rope).SetPositions(PosT, PosH, PosW);
+      end;
+      if IsHugeAngle then CaseName := CaseName + ' angles ~1e29'
+      else CaseName := CaseName + ' at position 32760';
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do Input.Raw[Pos] := 0.5 * Sin(Pos * 0.37) - 0.2;
+      ComputeHostMasked(NN, Input);
+      OutCPU.Copy(Rope.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertTrue(CaseName + ' must reach OpenCL', Rope.ForwardGPUCnt > 0);
+      Rope.ForceOutputOnRAM();
+      OutGPU.Copy(Rope.Output);
+      // Past |angle| = 1e8 sin/cos are noise on both sides, so the huge-angle
+      // cases check what a rotation keeps instead: each pair's norm.
+      MaxDiff := 0;
+      DeviceAllFinite := true;
+      Pos := 0;
+      while Pos < MaxPos do
+      begin
+        if IsNan(OutGPU.Raw[Pos]) or IsInfinite(OutGPU.Raw[Pos]) or
+          IsNan(OutGPU.Raw[Pos + 1]) or IsInfinite(OutGPU.Raw[Pos + 1]) then
+          DeviceAllFinite := false
+        else if IsHugeAngle then
+        begin
+          NormIn := Sqrt(Sqr(Input.Raw[Pos]) + Sqr(Input.Raw[Pos + 1]));
+          NormOut := Sqrt(Sqr(OutGPU.Raw[Pos]) + Sqr(OutGPU.Raw[Pos + 1]));
+          Diff := Abs(NormIn - NormOut);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end
+        else
+        begin
+          Diff := Max(Abs(OutCPU.Raw[Pos] - OutGPU.Raw[Pos]),
+            Abs(OutCPU.Raw[Pos + 1] - OutGPU.Raw[Pos + 1]));
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+        Inc(Pos, 2);
+      end;
+      WriteLn('  ', CaseName, ' OpenCL extreme input: max|diff|=', MaxDiff:0:9);
+      AssertTrue(CaseName + ': OpenCL output must be finite', DeviceAllFinite);
+      AssertTrue(CaseName + ': max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutGPU.Free;
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSoftMaxOpenCLExtremeInputs;
+{$IFDEF OpenCL}
+const
+  csSizeX = 4;
+  csSizeY = 3;
+  csDepth = 16;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SoftMaxLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, Pos, MaxPos, GroupLen, GroupStart, MaxGroupStart: integer;
+  CaseName: string;
+  InScale, Diff, MaxDiff, GroupSum, MaxSumError: TNeuralFloat;
+  DeviceAllFinite, HostRaised: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 3 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csSizeX, csSizeY, csDepth);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(csSizeX, csSizeY, csDepth, 1));
+      if CaseCnt < 2 then
+      begin
+        CaseName := 'TNNetPointwiseSoftMax';
+        SoftMaxLayer := NN.AddLayer(TNNetPointwiseSoftMax.Create());
+        GroupLen := csDepth;
+      end
+      else
+      begin
+        CaseName := 'TNNetSoftMax';
+        SoftMaxLayer := NN.AddLayer(TNNetSoftMax.Create());
+        GroupLen := Input.Size;
+      end;
+      NN.SetTrainable(False, False);
+      if (CaseCnt mod 2) = 0 then InScale := 1e3 else InScale := 1e30;
+      CaseName := CaseName + ' scale ' + FloatToStr(InScale);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do Input.Raw[Pos] := InScale * Sin(Pos * 0.37);
+      HostRaised := ComputeHostMasked(NN, Input);
+      OutCPU.Copy(SoftMaxLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      AssertTrue(CaseName + ' must reach OpenCL', SoftMaxLayer.ForwardGPUCnt > 0);
+      SoftMaxLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      DeviceAllFinite := true;
+      for Pos := 0 to MaxPos do
+      begin
+        if IsNan(SoftMaxLayer.Output.Raw[Pos]) or
+          IsInfinite(SoftMaxLayer.Output.Raw[Pos]) then DeviceAllFinite := false;
+        Diff := Abs(OutCPU.Raw[Pos] - SoftMaxLayer.Output.Raw[Pos]);
+        if (not HostRaised) and (Diff > MaxDiff) then MaxDiff := Diff;
+      end;
+      MaxSumError := 0;
+      MaxGroupStart := Input.Size - GroupLen;
+      GroupStart := 0;
+      while GroupStart <= MaxGroupStart do
+      begin
+        GroupSum := 0;
+        for Pos := GroupStart to GroupStart + GroupLen - 1 do
+          GroupSum := GroupSum + SoftMaxLayer.Output.Raw[Pos];
+        MaxSumError := Max(MaxSumError, Abs(GroupSum - 1));
+        Inc(GroupStart, GroupLen);
+      end;
+      WriteLn('  ', CaseName, ' OpenCL extreme input: max|diff|=', MaxDiff:0:9,
+        ' max|sum-1|=', MaxSumError:0:9, ' host raised=', HostRaised);
+      AssertTrue(CaseName + ': OpenCL output must be finite', DeviceAllFinite);
+      AssertTrue(CaseName + ': each group sums to 1', MaxSumError < 1e-5);
+      AssertTrue(CaseName + ': OpenCL vs CPU max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGatedDeltaNetOpenCLExtremeGates;
+{$IFDEF OpenCL}
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 7;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+  // z, then b, then a: the gate channels start after q, k and v.
+  csFirstGateD = 2 * Hk * Dk + Hv * Dv;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetGatedDeltaNet;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ScaleCnt, T, D, N: integer;
+  InScale, HostValue, DeviceValue, Diff, MaxDiff: TNeuralFloat;
+  DeviceAllFinite, HostRaised: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for ScaleCnt := 0 to 1 do
+  begin
+    if ScaleCnt = 0 then InScale := 1e3 else InScale := 1e30;
+    RandSeed := 20261021;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+    CpuOut := TNNetVolume.Create();
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+      LCpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.SetTrainable(False, False);
+      SeedGatedDeltaNet(LCpu);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+      LGpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.SetTrainable(False, False);
+      for N := 0 to 2 do LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to InDepth - 1 do
+          if D < csFirstGateD
+            then Input[T, 0, D] := 1.5 * (Random - 0.5)
+            else Input[T, 0, D] := InScale * Sin((T * InDepth + D) * 0.37);
+      HostRaised := ComputeHostMasked(NNCpu, Input);
+      CpuOut.Copy(LCpu.Output);
+
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.Compute(Input);
+      AssertEquals('a resident source puts the scan on OpenCL (scale ' +
+        FloatToStr(InScale) + ')', 1, LGpu.ForwardGPUCnt);
+      LGpu.ForceOutputOnRAM();
+      MaxDiff := 0;
+      DeviceAllFinite := true;
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to OutDepth - 1 do
+        begin
+          DeviceValue := LGpu.Output[T, 0, D];
+          if IsNan(DeviceValue) or IsInfinite(DeviceValue) then
+          begin
+            DeviceAllFinite := false;
+            continue;
+          end;
+          HostValue := CpuOut[T, 0, D];
+          if HostRaised or IsNan(HostValue) or IsInfinite(HostValue) then continue;
+          Diff := Abs(HostValue - DeviceValue) / Max(1, Abs(HostValue));
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      WriteLn('  GatedDeltaNet OpenCL extreme gates: scale ', InScale:0:0,
+        ' max rel diff=', MaxDiff:0:9, ' host raised=', HostRaised);
+      AssertTrue('GatedDeltaNet OpenCL output must be finite (scale ' +
+        FloatToStr(InScale) + ')', DeviceAllFinite);
+      AssertTrue('GatedDeltaNet OpenCL vs CPU at scale ' + FloatToStr(InScale) +
+        ': max relative diff = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestFusedSDPAOpenCLExtremeScores;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  // A 1000-row cache at Dk 16 whose keys move by KeyRamp per row: scores step
+  // by ~4 * KeyRamp per row, so exp(score - max) spans thousands inside a chunk.
+  procedure RunCase(StepTokens: integer; KeyRamp, SoftCap: TNeuralFloat;
+    Int8KV: boolean; ExpectedPath: TFusedSDPAOpenCLPath);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, {QHeads=}2, {KVHeads=}2,
+      {Dk=}16, {PrefixLen=}1000, StepTokens, {Window=}0, SoftCap,
+      {InputAmplitude=}1, KeyRamp, {Causal=}True, {ForcedSplits=}0,
+      {UsableLocalMemBytes=}0, {HostSource=}False,
+      {ResidentPrefix=}not Int8KV, Int8KV, ExpectedPath);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261022;
+  // Falling keys: the largest scores stay near 0, where float spacing allows
+  // the 1e-5 tolerance, and the oldest rows score near -2000.
+  RunCase(1, -0.5, 0, False, sdpaPathDecodeSplit);
+  RunCase(1, -0.5, 0, True, sdpaPathDecodeSplit);
+  // Rising keys, scores up to ~2000 under a soft-cap of 5: tanh arguments near 400.
+  RunCase(1, 0.5, 5.0, False, sdpaPathDecodeSplit);
+  RunCase(1, 0.5, 5.0, True, sdpaPathDecodeSplit);
+  RunCase(16, 0.5, 5.0, False, sdpaPathFlash);
+  RunCase(16, 0.5, 5.0, True, sdpaPathFlash);
 end;
 {$ELSE}
 begin

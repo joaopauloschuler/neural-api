@@ -3144,8 +3144,8 @@ __kernel void cai_rope
   const int k = gid % FHalfDepth;
   const int pos = gid / FHalfDepth;
   const float angle = (float)(pos + FPositionOffset) * FTheta[k];
-  const float s = sin(angle);
-  const float c = cos(angle);
+  const float s = cai_sin(angle);
+  const float c = cai_cos(angle);
   const int base = pos * FDepth + 2 * k;
   const float x0 = FX[base];
   const float x1 = FX[base + 1];
@@ -3182,8 +3182,8 @@ __kernel void cai_mrope
   const int k = gid % FHalfDepth;
   const int pos = gid / FHalfDepth;
   const float angle = FAngle[pos * FHalfTile + k % FHalfTile];
-  const float s = sin(angle);
-  const float c = cos(angle);
+  const float s = cai_sin(angle);
+  const float c = cai_cos(angle);
   const int base = pos * FDepth + 2 * k;
   const float x0 = FX[base];
   const float x1 = FX[base + 1];
@@ -3196,7 +3196,7 @@ __kernel void cai_mrope
 // normalization groups of FGroupLen elements; group g owns FX[g*FGroupLen ..
 // +FGroupLen). One work-item per group does the standard max-subtract -> exp ->
 // sum -> divide:
-//   m = max(x);  e_i = exp(clamp(x_i - m, 4000));  y_i = e_i / sum(e)
+//   m = max(x);  e_i = exp(max(x_i - m, -87));  y_i = e_i / sum(e)
 // FApplyMinScale selects the variant:
 //   0 = TNNetPointwiseSoftMax (FOutput.PointwiseSoftMax, GroupLen = Depth): no
 //       low-end rescaling.
@@ -3241,9 +3241,8 @@ __kernel void cai_softmax
   float total = 0.0f;
   for (int c = 0; c < FGroupLen; c++)
   {
-    float a = (FX[base + c] - shift) * scale;
-    if (a > 4000.0f) a = 4000.0f; else if (a < -4000.0f) a = -4000.0f;
-    const float e = exp(a);
+    // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+    const float e = cai_exp_floored(fmin((FX[base + c] - shift) * scale, 0.0f));
     FY[base + c] = e;
     total += e;
   }
@@ -4086,7 +4085,7 @@ __kernel void cai_gated_delta_net
 
   __global float* S = FS + (h * Dk) * Dv;
   // ea is invariant across t.
-  const float ea = exp(fmin(FALog[h], 30.0f));
+  const float ea = cai_exp_floored(fmin(FALog[h], 30.0f));
   const int qBase = FQOff + kh * Dk;
   const int kBase = FKOff + kh * Dk;
   const int vBase = FVOff + h * Dv;
@@ -4139,16 +4138,13 @@ __kernel void cai_gated_delta_net
     }
 
     // ---- per-head scalar gates: every lane computes them, so no reduction ----
-    const float bv = FX[xRow + FBOff + h];
-    float beta;
-    if (bv > 0.0f) beta = 1.0f / (1.0f + exp(-bv));
-    else { const float sb = exp(bv); beta = sb / (1.0f + sb); }
+    // Both sides of each select run, so every exp is floored and capped. One
+    // exp serves both softplus branches; sp is capped so ea * sp stays finite.
+    const float beta = cai_fused_act(FX[xRow + FBOff + h], 2);
     const float pre = FX[xRow + FAOff + h] + FDtBias[h];
-    float sp;
-    if (pre > 30.0f) sp = pre;
-    else if (pre < -30.0f) sp = exp(pre);
-    else sp = log(1.0f + exp(pre));
-    const float decay = exp(-ea * sp);
+    const float ep = cai_exp_floored(fmin(pre, 30.0f));
+    const float sp = (pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep));
+    const float decay = cai_exp_floored(-ea * fmin(sp, 1e20f));
     // S_{-1} = 0 only at the very first step of a scan that starts from zero.
     const int hasPrev = (t > 0) || (FResetState == 0);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -4187,7 +4183,7 @@ __kernel void cai_gated_delta_net
     for (e = lid; e < Dv; e += lsize)
     {
       const float zv = FX[xRow + zBase + e];
-      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * (zv / (1.0f + exp(-zv)));
+      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * cai_fused_act(zv, 4);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
@@ -4451,7 +4447,7 @@ __kernel void cai_sdpa_decode_split
         {
           float sc = acc[i] * FInvSqrtDk;
           if (FScoreSoftCap > 0.0f)
-            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+            sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
           tile[(qBase + i) * FChunkRows + r] = sc;
         }
     }
@@ -4474,7 +4470,8 @@ __kernel void cai_sdpa_decode_split
   {
     __local float* row = tile + q * FChunkRows;
     const float RowMax = headMax[q];
-    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+    for (r = lid; r < ChunkLive; r += lsize)
+      row[r] = exp(fmax(row[r] - RowMax, -80.0f));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   CAI_SDPA_HEAD_REDUCE(1, headSum)
@@ -4773,7 +4770,7 @@ static inline float cai_flash_score(const float Dot, const int Key,
   const float FInvScoreSoftCap)
 {
   float sc = Dot * ScoreScale;
-  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
   return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
 }
 
@@ -5353,7 +5350,7 @@ __kernel void cai_sdpa_decode_split_int8
         {
           float sc = acc[i] * RowScale;
           if (FScoreSoftCap > 0.0f)
-            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+            sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
           tile[(qBase + i) * FChunkRows + r] = sc;
         }
     }
@@ -5376,7 +5373,8 @@ __kernel void cai_sdpa_decode_split_int8
   {
     __local float* row = tile + q * FChunkRows;
     const float RowMax = headMax[q];
-    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+    for (r = lid; r < ChunkLive; r += lsize)
+      row[r] = exp(fmax(row[r] - RowMax, -80.0f));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   CAI_SDPA_HEAD_REDUCE(1, headSum)

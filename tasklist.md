@@ -2033,20 +2033,23 @@ cannot pay for its own transfer.
       opcodes 15, 40 and 48-55: the scalar ones pass their weight as a kernel
       argument, the per-channel ones read their neurons packed into one table
       (`TNNetChannelTransformBase.PackActivationChannelTables`).
-- [ ] Extend the `cai_activation` trap audit to the other kernels. The
+- [X] Extend the `cai_activation` trap audit to the other kernels. The
       kernels build with `-cl-fast-relaxed-math` and PoCL runs them with FP
       traps unmasked; `TestActivationOpenCLExtremeInputs` showed PoCL's
       `exp` trapping below ~-88 (not underflowing), `erf`/`sin`/`cos`/`log`
       trapping on huge arguments, both sides of data-dependent branches
       running, and `x * tanh` reassociated into an overflowing `x * (1 - e)`.
-      `cai_activation`, `cai_fused_act` and `cai_glu_gate` now go through the
-      `cai_exp_floored`/`cai_erf`/`cai_sin`/`cai_log`/`cai_tanh` helpers at the
-      top of `neural.cl`. Still raw: `cai_gated_delta_net` (two-branch sigmoid
-      and softplus on raw `exp`, `exp(-zv)` in the SiLU gate), `cai_softmax`
-      (`exp` of an argument clamped only to +-4000), the SDPA row softmax
-      `exp(row[r] - RowMax)` without the -80 floor its siblings use, and the
-      RoPE `sin`/`cos` of an unclamped angle. Each needs an extreme-input
-      device test before and after.
+      Done: `cai_gated_delta_net` (sigmoid/SiLU via `cai_fused_act`, one
+      floored exp for both softplus branches, floored decay and `ea`),
+      `cai_softmax` (`cai_exp_floored`), the split-row decode row softmax
+      (FP32 and int8, -80 floor), the soft-cap `tanh` in both split kernels
+      and `cai_flash_score` (`cai_tanh`), and `cai_rope`/`cai_mrope`
+      (`cai_sin`/`cai_cos`, identical below 1e8 rad). Each trapped on PoCL
+      before the fix: `TestRoPEOpenCLExtremeInputs`,
+      `TestSoftMaxOpenCLExtremeInputs`, `TestGatedDeltaNetOpenCLExtremeGates`,
+      `TestFusedSDPAOpenCLExtremeScores`.
+  - [ ] GPU-box decode timing for the -80 floor in the split-row decode (one
+        `fmax` per score) and `cai_tanh` on the soft-cap; not measured here.
 
 ## Layer follow-ups that fix real limitations
 
