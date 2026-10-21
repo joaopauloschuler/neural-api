@@ -18,7 +18,7 @@ uses
   TestNeuralLengthGrouped,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
-  TestNeuralTokenizer, TestNeuralImagePreprocess,
+  TestNeuralTokenizer, TestNeuralImagePreprocess, TestNeuralGIF,
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
   TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
   TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun, TestNeuralReduction,

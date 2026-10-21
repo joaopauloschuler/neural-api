@@ -17,6 +17,7 @@ caller-supplied T5 text states  (a real T5 tower is a follow-up)
      + DecodeCogVideoXVae): a depth-axis CAUSAL temporal conv per spatial cell
      (left-pad time, no future-frame leakage) + SiLU + pointwise conv
   -> per-frame RGB -> a sequence of P6 PPM files (frame_00.ppm, frame_01.ppm, ...)
+     or PNG files, plus an optional looping animated GIF
 ```
 
 Nothing here is a new leaf layer — it is pure plumbing over landed pieces. With
@@ -34,6 +35,9 @@ photorealism. The CogVideoX importer is parity-checked < 1e-4 in
   causal conv via `TNNetCausalConv1D`, 3D RoPE via `TNNetMRotaryEmbedding`) are
   reused landed leaves.
 - **`TNNetDiffusionScheduler`** — the `smDDIM` / `smDPMSolverPP2M` reverse driver.
+- **`TNNetAnimatedGIFWriter`** (`neuralgif`) — the `--gif` output: a fixed
+  6x7x6 RGB-cube (or 256-gray) palette, LZW-coded frames, NETSCAPE2.0 looping;
+  reusable by any example that writes frames.
 
 ## Running
 
@@ -51,6 +55,9 @@ Optional trailing flags:
 | `--steps N` | number of reverse steps (default 4) |
 | `--dpm` | use DPM-Solver++(2M) instead of DDIM |
 | `--smoke` | run, assert finiteness, print `SMOKE OK`/`SMOKE FAIL` and exit (no PPM) |
+| `--gif FILE` | also write all frames as one looping animated GIF (`TNNetAnimatedGIFWriter`, `neuralgif.pas`) |
+| `--fps N` | GIF frame rate (default 8, the CogVideoX rate) |
+| `--png` | write `frame_<ii>.png` instead of `frame_<ii>.ppm` |
 
 (Or compile the `.lpr` with `fpc -Fu../../neural`.)
 
@@ -59,8 +66,9 @@ Optional trailing flags:
 - **Fixture (default):** `tests/fixtures/tiny_cogvideox.*` — fully self-contained,
   no network access.
 - **Text states:** deterministic synthetic values stand in for a real T5 tower.
-- **Output:** writes `frame_<ii>.ppm` (P6) for each decoded frame and prints the
-  config, the per-step latent trajectory norm, and an ASCII preview of each
+- **Output:** writes `frame_<ii>.ppm` (P6, or `.png` with `--png`) for each
+  decoded frame, the `--gif` file when asked, and prints the config, the
+  per-step latent trajectory norm, and an ASCII preview of each
   frame. With `--smoke` it prints `SMOKE OK`/`SMOKE FAIL` and sets the exit code
   (the build step exercises this).
 

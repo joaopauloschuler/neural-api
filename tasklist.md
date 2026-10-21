@@ -1229,8 +1229,8 @@ rather than acted on.
         component in memory at a time, OnPhase/OnStep) and a CLI that loads it;
         examples/TextToVideo takes only a single .safetensors today.
   - [ ] CFG in the TextToVideo loop with a real empty-prompt uncond branch.
-  - [ ] Output: frames are written as separate P6 PPMs only; add an animated
-        GIF / PNG-sequence or a video-container writer.
+  - [ ] Output: PPM/PNG frames and an animated GIF (`--gif`, neuralgif.pas)
+        exist; a video-container (MP4/WebM) writer is still missing.
 - [ ] Wan 2.1 text-to-VIDEO DiT importer (`BuildWanFromSafeTensors[Ex]` +
       `TWanConfig`, model_type "wan", e.g. Wan-AI/Wan2.1-T2V-1.3B) — the current
       most-downloaded open text-to-video model, a flow-matching MMDiT distinct from

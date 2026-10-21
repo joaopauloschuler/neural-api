@@ -17,7 +17,8 @@ a frozen SD UNet):
        spatial cell (left-pad time, no future-frame leakage) + SiLU + pointwise
        conv
     -> per-frame RGB -> a sequence of P6 PPM files (frame_00.ppm, frame_01.ppm,
-       ...), the same writer style as the LatentTextToImage / AnimateDiff demos.
+       ...) or PNG files, and optionally one looping animated GIF
+       (TNNetAnimatedGIFWriter, neuralgif.pas).
 
 Nothing here is a new leaf layer: it is pure plumbing over landed pieces (the
 CogVideoX importer + CogVideoXConditioning, the VAE-decode tail, and the
@@ -39,10 +40,14 @@ Optional trailing flags:
   --steps N      number of reverse steps (default 4)
   --dpm          use DPM-Solver++(2M) instead of DDIM
   --smoke        run, assert finiteness, print SMOKE OK/FAIL and exit (no PPM)
+  --gif FILE     also write all frames as one looping animated GIF
+  --fps N        GIF frame rate (default 8, the CogVideoX rate)
+  --png          write frame_<ii>.png instead of frame_<ii>.ppm
 
 OUTPUT
-  Writes frame_<ii>.ppm for each decoded frame and prints the config, the
-  per-step trajectory norm and an ASCII preview of each frame. With --smoke it
+  Writes frame_<ii>.ppm (or .png) for each decoded frame, the --gif file if
+  asked, and prints the config, the per-step trajectory norm and an ASCII
+  preview of each frame. With --smoke it
   prints "SMOKE OK"/"SMOKE FAIL" and sets the exit code (the build step
   exercises this).
 
@@ -59,7 +64,8 @@ any later version.
 
 uses
   SysUtils, Classes, Math,
-  neuralnetwork, neuralvolume, neuralpretrained, neuraldiffusion;
+  neuralnetwork, neuralvolume, neuralpretrained, neuraldiffusion,
+  neuraldatasets, neuralgif;
 
 const
   cFixtureST  = '../../tests/fixtures/tiny_cogvideox.safetensors';
@@ -101,6 +107,20 @@ begin
   end;
 end;
 
+// Writes ONE frame as PNG: [-1,1] maps to 0..255, a 1-channel frame becomes gray.
+procedure WriteFramePNG(Frame, Work: TNNetVolume; const FileName: string);
+var
+  X, Y, C, MaxChannel: integer;
+begin
+  Work.ReSize(Frame.SizeX, Frame.SizeY, 3);
+  MaxChannel := Min(Frame.Depth, 3) - 1;
+  for Y := 0 to Frame.SizeY - 1 do
+    for X := 0 to Frame.SizeX - 1 do
+      for C := 0 to 2 do
+        Work[X, Y, C] := ToByte(Frame[X, Y, Min(C, MaxChannel)]);
+  SaveImageFromVolumeIntoFile(Work, FileName);
+end;
+
 procedure AsciiPreview(Frame: TNNetVolume);
 const cRamp = ' .:-=+*#%@';
 var X, Y, idx: integer; v: TNeuralFloat;
@@ -134,17 +154,22 @@ var
   Net, VaeNet: TNNet;
   Cfg: TCogVideoXConfig;
   Scheduler: TNNetDiffusionScheduler;
-  Latent, TextStates, Eps, VaeLatent, Decoded, Frame: TNNetVolume;
-  ST, CfgPath: string;
+  Latent, TextStates, Eps, VaeLatent, Decoded, Frame, PngWork: TNNetVolume;
+  GifWriter: TNNetAnimatedGIFWriter;
+  ST, CfgPath, GifFile: string;
+  FramesPerSecond: integer;
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i, LV, ft, hh, ww, c, cell: integer;
-  SmokeMode, LatentOk, DecodedOk: boolean;
+  SmokeMode, LatentOk, DecodedOk, PngFrames: boolean;
   Arg: string;
 begin
   ST := cFixtureST; CfgPath := cFixtureCfg;
   NumSteps := 4;
   Method := smDDIM;
   SmokeMode := false;
+  PngFrames := false;
+  GifFile := '';
+  FramesPerSecond := 8;
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
   begin
@@ -162,6 +187,9 @@ begin
     if Arg = '--steps' then begin Inc(i); NumSteps := StrToIntDef(ParamStr(i), NumSteps); end
     else if Arg = '--dpm' then Method := smDPMSolverPP2M
     else if Arg = '--smoke' then SmokeMode := true
+    else if Arg = '--gif' then begin Inc(i); GifFile := ParamStr(i); end
+    else if Arg = '--fps' then begin Inc(i); FramesPerSecond := StrToIntDef(ParamStr(i), FramesPerSecond); end
+    else if Arg = '--png' then PngFrames := true
     else WriteLn('Ignoring unknown argument: ', Arg);
     Inc(i);
   end;
@@ -177,6 +205,8 @@ begin
   VaeLatent := TNNetVolume.Create;
   Decoded := TNNetVolume.Create;
   Frame := TNNetVolume.Create;
+  PngWork := TNNetVolume.Create;
+  GifWriter := nil;
   try
     WriteLn(CogVideoXConfigToString(Cfg));
     WriteLn('Sampler: ', BoolToStr(Method = smDPMSolverPP2M, 'DPM-Solver++(2M)',
@@ -244,6 +274,9 @@ begin
     else
     begin
       // Unpack each frame (GridH, GridW, Vout) from the (T, HW, Vout) decode.
+      if GifFile <> '' then
+        GifWriter := TNNetAnimatedGIFWriter.Create(GifFile, Cfg.GridWidth,
+          Cfg.GridHeight, Max(1, Round(100 / Max(1, FramesPerSecond))));
       for ft := 0 to Cfg.NumFrames - 1 do
       begin
         Frame.ReSize(Cfg.GridWidth, Cfg.GridHeight, Cfg.VaeOutChannels);
@@ -254,12 +287,20 @@ begin
             for c := 0 to Cfg.VaeOutChannels - 1 do
               Frame[ww, hh, c] := Decoded[ft, cell, c];
           end;
-        WriteFramePPM(Frame, Format('frame_%.2d.ppm', [ft]));
+        if PngFrames then WriteFramePNG(Frame, PngWork, Format('frame_%.2d.png', [ft]))
+        else WriteFramePPM(Frame, Format('frame_%.2d.ppm', [ft]));
+        if GifWriter <> nil then GifWriter.AddFrame(Frame, -1, 1);
         WriteLn; WriteLn('frame ', ft, ':'); AsciiPreview(Frame);
       end;
-      WriteLn('Wrote ', Cfg.NumFrames, ' frame_NN.ppm files.');
+      WriteLn('Wrote ', Cfg.NumFrames, ' frame_NN.', BoolToStr(PngFrames, 'png', 'ppm'),
+        ' files.');
+      if GifWriter <> nil then
+        WriteLn('Wrote ', GifWriter.FrameCount, '-frame animated GIF ', GifFile, ' at ',
+          FramesPerSecond, ' fps.');
     end;
   finally
+    GifWriter.Free;
+    PngWork.Free;
     Frame.Free;
     Decoded.Free;
     VaeLatent.Free;
