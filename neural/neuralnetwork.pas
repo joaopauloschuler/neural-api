@@ -5594,6 +5594,36 @@ type
     procedure GatherFromPrevLayer(Consumer: TNNetLayer);
   end;
 
+  /// OpenCL forward of TNNetRealFFT2D / TNNetInverseRealFFT2D: two direct-DFT
+  // launches through a complex (HalfW, H, 2C) intermediate. rfft2 runs
+  // cai_rfft2_rows_r2c then cai_rfft2_cols_c2c; irfft2 runs cai_rfft2_cols_c2c
+  // (inverse sign) then cai_irfft2_rows_c2r. Any W and H; O(N^2) per line.
+  // Coded by Claude (AI).
+  TNNetRealFFT2DCL = class(TNNetKernelCL)
+  private
+    // On FKernel's queue, so the two launches of a forward stay ordered.
+    FColsKernel, FC2RKernel: cl_kernel;
+    // cos|sin twiddles of W and of H, the per-bin scales, and their uploads.
+    FTwidWHost, FTwidHHost, FBinScaleHost: TNNetVolume;
+    FBufTwidW, FBufTwidH, FBufBinScale, FBufSrc, FBufMid, FBufDst: cl_mem;
+    FCapTwidW, FCapTwidH, FCapBinScale, FCapSrc, FCapMid, FCapDst: csize_t;
+    // W, H, C and HalfW the uploaded tables were built for (0 = none yet).
+    FPlanShape: array[0..3] of integer;
+    procedure FillTwiddles(Twid: TNNetVolume; N: integer);
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Builds and uploads the twiddle and bin-scale tables when Consumer's
+    // transform shape differs from FPlanShape. Consumer is a TNNetRealFFT2DBase.
+    procedure EnsureTables(Consumer: TNNetLayer);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+    // Consumer.Output := the transform of Consumer.PrevLayer's output: binds a
+    // resident source and keeps the result in OpenCL memory unless trainable.
+    procedure TransformFromPrevLayer(Consumer: TNNetLayer; Inverse: boolean);
+  end;
+
   /// OpenCL forward helper for TNNetBicubicUpsample, the 16-corner sibling of
   // TNNetBilinearGatherCL. Per output pixel it blends the 4x4 clamped source
   // neighbourhood by the separable cubic weights (wy[r]*wx[c]). The CALLING
@@ -16620,6 +16650,11 @@ type
     FSpecRe, FSpecIm: array of Double;
     FBinScale: array of Double;
     FGradVol: TNNetVolume;
+    // True on TNNetInverseRealFFT2D: selects the irfft2 device launches.
+    FIsInverse: boolean;
+    {$IFDEF OpenCL}
+    FRealFFT2DCL: TNNetRealFFT2DCL;
+    {$ENDIF}
     // Scale of the unnormalised forward DFT sum for the current norm and H*W.
     function ForwardNormScale(): Double;
     procedure PrepareTransform(pSpatialW, pSpatialH, pChannels: integer);
@@ -16635,6 +16670,16 @@ type
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Forward only on the device: armed and (forced, or inference with a
+    // resident source).
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
     function GetNorm(): integer;
     property SpatialW: integer read FSpatialW;
     property SpatialH: integer read FSpatialH;
@@ -40122,6 +40167,196 @@ begin
     FKernel.ReadBuffer(bufDst, Y, CL_TRUE);
     Consumer.FOutputOnOpenCL := false;
     Consumer.FOutputOnRAM := true;
+  end;
+end;
+
+{ TNNetRealFFT2DCL }
+
+constructor TNNetRealFFT2DCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_rfft2_rows_r2c');
+  FColsKernel := FKernel.CreateKernel('cai_rfft2_cols_c2c');
+  FC2RKernel := FKernel.CreateKernel('cai_irfft2_rows_c2r');
+  FTwidWHost := TNNetVolume.Create();
+  FTwidHHost := TNNetVolume.Create();
+  FBinScaleHost := TNNetVolume.Create();
+end;
+
+destructor TNNetRealFFT2DCL.Destroy();
+begin
+  if Assigned(FColsKernel) then clReleaseKernel(FColsKernel);
+  if Assigned(FC2RKernel) then clReleaseKernel(FC2RKernel);
+  if Assigned(FBufTwidW) then clReleaseMemObject(FBufTwidW);
+  if Assigned(FBufTwidH) then clReleaseMemObject(FBufTwidH);
+  if Assigned(FBufBinScale) then clReleaseMemObject(FBufBinScale);
+  if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
+  if Assigned(FBufMid) then clReleaseMemObject(FBufMid);
+  if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
+  FBinScaleHost.Free;
+  FTwidHHost.Free;
+  FTwidWHost.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRealFFT2DCL.FillTwiddles(Twid: TNNetVolume; N: integer);
+var
+  Pos, MaxPos: integer;
+  Angle: Double;
+begin
+  Twid.ReSize(2 * N, 1, 1);
+  MaxPos := N - 1;
+  for Pos := 0 to MaxPos do
+  begin
+    Angle := 2 * Pi * Pos / N;
+    Twid.FData[2 * Pos] := Cos(Angle);
+    Twid.FData[2 * Pos + 1] := Sin(Angle);
+  end;
+end;
+
+procedure TNNetRealFFT2DCL.EnsureTables(Consumer: TNNetLayer);
+var
+  Layer: TNNetRealFFT2DBase;
+  BinPos, MaxBinPos: integer;
+begin
+  Layer := TNNetRealFFT2DBase(Consumer);
+  if (FPlanShape[0] = Layer.FSpatialW) and (FPlanShape[1] = Layer.FSpatialH) and
+    (FPlanShape[2] = Layer.FChannels) and (FPlanShape[3] = Layer.FHalfW) then exit;
+  FillTwiddles(FTwidWHost, Layer.FSpatialW);
+  FillTwiddles(FTwidHHost, Layer.FSpatialH);
+  FBinScaleHost.ReSize(Layer.FHalfW, 1, 1);
+  MaxBinPos := Layer.FHalfW - 1;
+  for BinPos := 0 to MaxBinPos do
+    FBinScaleHost.FData[BinPos] := Layer.FBinScale[BinPos];
+  FKernel.EnsureWriteBuffer(FBufTwidW, FCapTwidW, FTwidWHost, true, true);
+  FKernel.EnsureWriteBuffer(FBufTwidH, FCapTwidH, FTwidHHost, true, true);
+  FKernel.EnsureWriteBuffer(FBufBinScale, FCapBinScale, FBinScaleHost, true, true);
+  FPlanShape[0] := Layer.FSpatialW;
+  FPlanShape[1] := Layer.FSpatialH;
+  FPlanShape[2] := Layer.FChannels;
+  FPlanShape[3] := Layer.FHalfW;
+end;
+
+function TNNetRealFFT2DCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufDst;
+end;
+
+function TNNetRealFFT2DCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetRealFFT2DCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufTwidW) + OpenCLMemBytes(FBufTwidH) +
+    OpenCLMemBytes(FBufBinScale) + OpenCLMemBytes(FBufSrc) +
+    OpenCLMemBytes(FBufMid) + OpenCLMemBytes(FBufDst);
+end;
+
+procedure TNNetRealFFT2DCL.TransformFromPrevLayer(Consumer: TNNetLayer;
+  Inverse: boolean);
+var
+  Layer: TNNetRealFFT2DBase;
+  Prev: TNNetLayer;
+  Y: TNNetVolume;
+  bufSrc, bufMid, bufDst: cl_mem;
+  k: cl_kernel;
+  NumOut, NumMid, iW, iH, iHalfW, iC, iApplyBinScale: longint;
+  fSign: single;
+  MidBytes: csize_t;
+  KeepResult: boolean;
+begin
+  Layer := TNNetRealFFT2DBase(Consumer);
+  Prev := Layer.FPrevLayer;
+  Y := Layer.FOutput;
+  EnsureTables(Layer);
+  KeepResult := not Layer.FIsTrainable;
+  if KeepResult and Prev.OutputBindableOnOpenCL() then
+  begin
+    bufSrc := Prev.OpenCLOutputBuffer();
+    Prev.OpenCLWaitOutputIfAnotherQueue(FKernel);
+  end
+  else
+  begin
+    Prev.ForceOutputOnRAM();
+    bufSrc := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Prev.FOutput);
+  end;
+  iW := Layer.FSpatialW;
+  iH := Layer.FSpatialH;
+  iHalfW := Layer.FHalfW;
+  iC := Layer.FChannels;
+  NumMid := iHalfW * iH * iC;
+  MidBytes := csize_t(2 * NumMid) * csNeuralFloatSize;
+  bufMid := FKernel.EnsureBuffer(FBufMid, FCapMid, CL_MEM_READ_WRITE, MidBytes);
+  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Y);
+  if Inverse then
+  begin
+    // Columns: unnormalised inverse DFT along H, no bin scale.
+    fSign := 1;
+    iApplyBinScale := 0;
+    k := FColsKernel;
+    clSetKernelArg(k, 0, csLongintSize, @NumMid);
+    clSetKernelArg(k, 1, csLongintSize, @iH);
+    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
+    clSetKernelArg(k, 3, csLongintSize, @iC);
+    clSetKernelArg(k, 4, csNeuralFloatSize, @fSign);
+    clSetKernelArg(k, 5, csLongintSize, @iApplyBinScale);
+    clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
+    clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
+    clSetKernelArg(k, 8, csCLMemSize, @bufSrc);
+    clSetKernelArg(k, 9, csCLMemSize, @bufMid);
+    FKernel.RunKernel(k, NumMid);
+    // Rows: c2r along W with the Hermitian bin counts and the norm.
+    NumOut := Y.Size;
+    k := FC2RKernel;
+    clSetKernelArg(k, 0, csLongintSize, @NumOut);
+    clSetKernelArg(k, 1, csLongintSize, @iW);
+    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
+    clSetKernelArg(k, 3, csLongintSize, @iC);
+    clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
+    clSetKernelArg(k, 5, csCLMemSize, @FBufBinScale);
+    clSetKernelArg(k, 6, csCLMemSize, @bufMid);
+    clSetKernelArg(k, 7, csCLMemSize, @bufDst);
+    FKernel.RunKernel(k, NumOut);
+  end
+  else
+  begin
+    // Rows: real -> half spectrum along W.
+    k := FKernel.Kernel;
+    clSetKernelArg(k, 0, csLongintSize, @NumMid);
+    clSetKernelArg(k, 1, csLongintSize, @iW);
+    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
+    clSetKernelArg(k, 3, csLongintSize, @iC);
+    clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
+    clSetKernelArg(k, 5, csCLMemSize, @bufSrc);
+    clSetKernelArg(k, 6, csCLMemSize, @bufMid);
+    FKernel.RunKernel(k, NumMid);
+    // Columns: forward DFT along H, times the norm.
+    fSign := -1;
+    iApplyBinScale := 1;
+    k := FColsKernel;
+    clSetKernelArg(k, 0, csLongintSize, @NumMid);
+    clSetKernelArg(k, 1, csLongintSize, @iH);
+    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
+    clSetKernelArg(k, 3, csLongintSize, @iC);
+    clSetKernelArg(k, 4, csNeuralFloatSize, @fSign);
+    clSetKernelArg(k, 5, csLongintSize, @iApplyBinScale);
+    clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
+    clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
+    clSetKernelArg(k, 8, csCLMemSize, @bufMid);
+    clSetKernelArg(k, 9, csCLMemSize, @bufDst);
+    FKernel.RunKernel(k, NumMid);
+  end;
+  if KeepResult then
+  begin
+    Layer.FOutputOnOpenCL := true;
+    Layer.FOutputOnRAM := false;
+  end
+  else
+  begin
+    FKernel.ReadBuffer(bufDst, Y, CL_TRUE);
+    Layer.FOutputOnOpenCL := false;
+    Layer.FOutputOnRAM := true;
   end;
 end;
 
@@ -93207,6 +93442,7 @@ end;
 
 destructor TNNetRealFFT2DBase.Destroy();
 begin
+  {$IFDEF OpenCL} FreeAndNil(FRealFFT2DCL); {$ENDIF}
   FGradVol.Free;
   inherited Destroy();
 end;
@@ -93380,10 +93616,70 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if Assigned(FRealFFT2DCL) then
+  begin
+    if WillOpenCL() then
+    begin
+      Inc(FForwardGPUCnt);
+      FRealFFT2DCL.TransformFromPrevLayer(Self, FIsInverse);
+      FForwardTime := FForwardTime + (Now() - StartTime);
+      exit;
+    end;
+    Inc(FForwardCPUCnt);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host writes FOutput next, so a stale device result must not be read.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   ApplyForward(FPrevLayer.FOutput, FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+{$IFDEF OpenCL}
+function TNNetRealFFT2DBase.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FRealFFT2DCL) and FHasOpenCL and Assigned(FPrevLayer) and
+    (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+procedure TNNetRealFFT2DBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FRealFFT2DCL) then FRealFFT2DCL := TNNetRealFFT2DCL.Create(FNN);
+  // Tables uploaded here so the forward only binds and launches.
+  if FSpatialW > 0 then FRealFFT2DCL.EnsureTables(Self);
+end;
+
+procedure TNNetRealFFT2DBase.DisableOpenCL();
+begin
+  // FRealFFT2DCL owns the output buffer and its queue: read it back first.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FRealFFT2DCL);
+  FOutputOnOpenCL := false;
+end;
+
+function TNNetRealFFT2DBase.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FRealFFT2DCL) then Result := FRealFFT2DCL.ResultBuffer()
+  else Result := inherited OpenCLOutputBuffer();
+end;
+
+function TNNetRealFFT2DBase.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FRealFFT2DCL) then Result := FRealFFT2DCL.OutputKernel()
+  else Result := inherited OpenCLOutputKernel();
+end;
+
+function TNNetRealFFT2DBase.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FRealFFT2DCL) then Result := Result + FRealFFT2DCL.BufferBytes();
+end;
+{$ENDIF}
 
 procedure TNNetRealFFT2DBase.Backpropagate();
 var
@@ -93455,6 +93751,7 @@ end;
 constructor TNNetInverseRealFFT2D.Create(pOutputWidth: integer; pNorm: integer);
 begin
   inherited Create();
+  FIsInverse := true;
   FStruct[0] := pNorm;
   FStruct[1] := pOutputWidth;
 end;

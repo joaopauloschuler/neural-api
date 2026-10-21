@@ -1632,9 +1632,15 @@ rather than acted on.
             column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
             `FInputPrepared` after the forward, in both memory modes; tiling or
             releasing it is a library-wide decision, not made here.
-      - [ ] OpenCL: the 3x3 and 1x1 convs already have OpenCL paths; only the
-            `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` pair runs on the host, so a
-            device FFT pair is what keeps the whole generator resident.
+      - [X] OpenCL: the 3x3 and 1x1 convs already have OpenCL paths, and the
+            `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` pair now has a device
+            forward too (`TNNetRealFFT2DCL`: direct DFTs per row and column in
+            `cai_rfft2_rows_r2c`, `cai_rfft2_cols_c2c`, `cai_irfft2_rows_c2r`, any
+            W and H, O(N^2) per line), binding a resident source and keeping its
+            output resident; `TestRealFFT2DOpenCLParity` and
+            `TestInverseRealFFT2DOpenCLParity`. Whole-generator residency and
+            timing are unmeasured on a real GPU; if the FFT shows up in a
+            512x512 profile, a radix-2/mixed-radix kernel is the next step.
 - [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
       examples/QwenImage, merged into the transformer weights at load. Today
       `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder

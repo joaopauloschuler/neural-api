@@ -2447,6 +2447,136 @@ __kernel void cai_gather_copy
   FDst[g_id] = IsZero ? 0.0f : FSrc[SrcPos];
 }
 
+// rfft2 / irfft2 (TNNetRealFFT2D / TNNetInverseRealFFT2D, TNNetRealFFT2DCL) as
+// direct DFTs, one work-item per output element, channel index fastest. Any
+// W and H: O(N) per element, O(N^2) per line. A real volume is (W, H, C) at
+// ((y*W + x)*C + c); a half spectrum is (HalfW, H, 2C) with Re at
+// 2*((y*HalfW + kw)*C + c) and Im right after it. FTwid holds cos|sin of
+// 2*pi*k/N for k < N, interleaved; the angle index (k*n) mod N is stepped
+// exactly, so no float phase accumulates.
+
+// Along W, real -> half spectrum: Dst[y, kw] = sum_x Src[y, x] * exp(-i*2*pi*kw*x/W).
+__kernel void cai_rfft2_rows_r2c
+(
+  const int FNumOut,
+  const int FW,
+  const int FHalfW,
+  const int FC,
+  __global const float* FTwid,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int t = g_id / FC;
+  const int c = g_id - t * FC;
+  const int y = t / FHalfW;
+  const int kw = t - y * FHalfW;
+  int SrcPos = y * FW * FC + c;
+  int Idx = 0;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  for (int x = 0; x < FW; x++)
+  {
+    const float v = FSrc[SrcPos];
+    Re = mad(v, FTwid[2 * Idx], Re);
+    Im = mad(-v, FTwid[2 * Idx + 1], Im);
+    SrcPos += FC;
+    Idx += kw;
+    if (Idx >= FW) Idx -= FW;
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
+}
+
+// Along H, half spectrum -> half spectrum:
+//   Dst[ky, kw] = s[kw] * sum_y Src[y, kw] * exp(i*FSign*2*pi*ky*y/H),
+// FSign = -1 (forward) or +1 (unnormalised inverse); s = FBinScale when
+// FApplyBinScale != 0, else 1.
+__kernel void cai_rfft2_cols_c2c
+(
+  const int FNumOut,
+  const int FH,
+  const int FHalfW,
+  const int FC,
+  const float FSign,
+  const int FApplyBinScale,
+  __global const float* FTwid,
+  __global const float* FBinScale,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int RowLen = FHalfW * FC;
+  const int ky = g_id / RowLen;
+  const int Col = g_id - ky * RowLen;
+  int SrcPos = 2 * Col;
+  const int SrcStride = 2 * RowLen;
+  int Idx = 0;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  for (int y = 0; y < FH; y++)
+  {
+    const float a = FSrc[SrcPos];
+    const float b = FSrc[SrcPos + 1];
+    const float co = FTwid[2 * Idx];
+    const float si = FSign * FTwid[2 * Idx + 1];
+    Re = mad(a, co, mad(-b, si, Re));
+    Im = mad(b, co, mad(a, si, Im));
+    SrcPos += SrcStride;
+    Idx += ky;
+    if (Idx >= FH) Idx -= FH;
+  }
+  if (FApplyBinScale != 0)
+  {
+    const float s = FBinScale[Col / FC];
+    Re *= s;
+    Im *= s;
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
+}
+
+// Along W, half spectrum -> real (c2r): Dst[y, x] = sum_kw FBinScale[kw] *
+// Re(Src[y, kw] * exp(i*2*pi*kw*x/W)). FBinScale carries the Hermitian count
+// (1 for DC and an even W's Nyquist bin, 2 for the others) times the norm.
+__kernel void cai_irfft2_rows_c2r
+(
+  const int FNumOut,
+  const int FW,
+  const int FHalfW,
+  const int FC,
+  __global const float* FTwid,
+  __global const float* FBinScale,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int t = g_id / FC;
+  const int c = g_id - t * FC;
+  const int y = t / FW;
+  const int x = t - y * FW;
+  int SrcPos = 2 * (y * FHalfW * FC + c);
+  const int SrcStride = 2 * FC;
+  int Idx = 0;
+  float Sum = 0.0f;
+  for (int kw = 0; kw < FHalfW; kw++)
+  {
+    const float Term = mad(FSrc[SrcPos], FTwid[2 * Idx],
+      -FSrc[SrcPos + 1] * FTwid[2 * Idx + 1]);
+    Sum = mad(FBinScale[kw], Term, Sum);
+    SrcPos += SrcStride;
+    Idx += x;
+    if (Idx >= FW) Idx -= FW;
+  }
+  FDst[g_id] = Sum;
+}
+
 // CAI Bicubic Gather (separable 4x4 weighted gather forward)
 // Coded by Claude (AI).
 // Device forward for TNNetBicubicUpsample, the 16-corner sibling of

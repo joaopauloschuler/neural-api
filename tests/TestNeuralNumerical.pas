@@ -624,6 +624,13 @@ type
     // TNNetGRN chained resident (cai_grn_table + ChannelAffine) at two depths,
     // then after a gamma/beta update, against a host-only twin net.
     procedure TestGRNOpenCLParity;
+    // Input -> TNNetRealFFT2D -> TNNetInverseRealFFT2D resident on OpenCL at
+    // power-of-two and odd/non-power-of-two sizes, one per norm: both layers
+    // and the round trip against a host-only twin net and the input.
+    procedure TestRealFFT2DOpenCLParity;
+    // TNNetInverseRealFFT2D alone on a non-Hermitian spectrum (Im of DC and of
+    // an even width's Nyquist bin must be dropped), odd and even widths.
+    procedure TestInverseRealFFT2DOpenCLParity;
     procedure TestLearnedPositionalEmbeddingOpenCLParity;
     procedure TestSoftPromptOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
@@ -73200,6 +73207,187 @@ begin
       OpenCLTransferCounting := WasCounting;
       Expected.Free;
       Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Max |Expected - Actual| over max(1, max |Expected|).
+function RelMaxDiffToOutput(Expected, Actual: TNNetVolume): TNeuralFloat;
+begin
+  Result := MaxAbsDiffToOutput(Expected, Actual) / Max(1, Expected.GetMaxAbs());
+end;
+
+// Input (W, H, C) -> TNNetRealFFT2D -> TNNetInverseRealFFT2D(W), inference only.
+function BuildRealFFT2DParityNet(W, H, C, Norm: integer;
+  out FFTLayer, IFFTLayer: TNNetLayer): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(W, H, C));
+  FFTLayer := Result.AddLayer(TNNetRealFFT2D.Create(Norm));
+  IFFTLayer := Result.AddLayer(TNNetInverseRealFFT2D.Create(W, Norm));
+  Result.SetTrainable(False, False);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestRealFFT2DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // W, H, C, norm: power-of-two, odd non-power-of-two, even non-power-of-two
+  // (Nyquist bin) with odd H.
+  csShapes: array[0..2, 0..3] of integer = (
+    (8, 4, 3, csFFTNormBackward), (7, 5, 2, csFFTNormOrtho),
+    (12, 9, 4, csFFTNormForward));
+var
+  NN, NNCPU: TNNet;
+  Input, SpecCPU, OutCPU: TNNetVolume;
+  FFTLayer, IFFTLayer, FFTCPU, IFFTCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  SpecDiff, OutDiff, RoundTripDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    NN := BuildRealFFT2DParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], csShapes[ShapePos, 3], FFTLayer, IFFTLayer);
+    NNCPU := BuildRealFFT2DParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], csShapes[ShapePos, 3], FFTCPU, IFFTCPU);
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    SpecCPU := TNNetVolume.Create();
+    OutCPU := TNNetVolume.Create();
+    try
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 2 * Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7) + 0.5;
+      NNCPU.Compute(Input);
+      SpecCPU.Copy(FFTCPU.Output);
+      OutCPU.Copy(IFFTCPU.Output);
+
+      // ForceOpenCL off: the resident input carries both layers to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      FFTLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to FFTLayer.Output.Size - 1 do
+        if FFTLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      OutDiff := RelMaxDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+      RoundTripDiff := RelMaxDiffToOutput(Input, NN.GetLastLayer.Output);
+      FFTLayer.ForceOutputOnRAM();
+      SpecDiff := RelMaxDiffToOutput(SpecCPU, FFTLayer.Output);
+      WriteLn('  RealFFT2D OpenCL ', csShapes[ShapePos, 0], 'x',
+        csShapes[ShapePos, 1], 'x', csShapes[ShapePos, 2], ' norm=',
+        csShapes[ShapePos, 3], ': rfft2 rel=', SpecDiff:0:9, ' irfft2 rel=',
+        OutDiff:0:9, ' round trip rel=', RoundTripDiff:0:9, ' sentinels=',
+        SentinelSurvivors, '/', FFTLayer.Output.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('TNNetRealFFT2D ran every forward on OpenCL', 2,
+        FFTLayer.ForwardGPUCnt);
+      AssertEquals('TNNetInverseRealFFT2D ran every forward on OpenCL', 2,
+        IFFTLayer.ForwardGPUCnt);
+      AssertEquals('the rfft2 output is bound, not downloaded',
+        FFTLayer.Output.Size, SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('the reference spectrum is not degenerate',
+        SpecCPU.GetMaxAbs() > 0);
+      AssertTrue('rfft2 OpenCL vs CPU: rel diff = ' + FloatToStr(SpecDiff) +
+        ' must be < 1e-4', SpecDiff < 1e-4);
+      AssertTrue('irfft2 OpenCL vs CPU: rel diff = ' + FloatToStr(OutDiff) +
+        ' must be < 1e-4', OutDiff < 1e-4);
+      AssertTrue('OpenCL round trip vs input: rel diff = ' +
+        FloatToStr(RoundTripDiff) + ' must be < 1e-4', RoundTripDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      OutCPU.Free;
+      SpecCPU.Free;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestInverseRealFFT2DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // OutputWidth, H, C: odd width, then even non-power-of-two width (Nyquist).
+  csShapes: array[0..1, 0..2] of integer = ((7, 6, 2), (10, 3, 3));
+var
+  NN, NNCPU: TNNet;
+  Input: TNNetVolume;
+  IFFTLayer, IFFTCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos, OutW: integer;
+  OutDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    OutW := csShapes[ShapePos, 0];
+    NN := TNNet.Create();
+    NNCPU := TNNet.Create();
+    Input := TNNetVolume.Create(OutW div 2 + 1, csShapes[ShapePos, 1],
+      2 * csShapes[ShapePos, 2]);
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      IFFTLayer := NN.AddLayer(TNNetInverseRealFFT2D.Create(OutW));
+      NN.SetTrainable(False, False);
+      NNCPU.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      IFFTCPU := NNCPU.AddLayer(TNNetInverseRealFFT2D.Create(OutW));
+      NNCPU.SetTrainable(False, False);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 3 * Sin(Pos * 0.61) - 0.7 * Cos(Pos * 2.3);
+      NNCPU.Compute(Input);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      IFFTLayer.ForceOutputOnRAM();
+      OutDiff := RelMaxDiffToOutput(IFFTCPU.Output, IFFTLayer.Output);
+      WriteLn('  InverseRealFFT2D OpenCL ', OutW, 'x', csShapes[ShapePos, 1], 'x',
+        csShapes[ShapePos, 2], ': rel=', OutDiff:0:9);
+      AssertEquals('TNNetInverseRealFFT2D ran on OpenCL', 1,
+        IFFTLayer.ForwardGPUCnt);
+      AssertTrue('the reference is not degenerate',
+        IFFTCPU.Output.GetMaxAbs() > 0);
+      AssertTrue('irfft2 OpenCL vs CPU on a non-Hermitian spectrum: rel diff = ' +
+        FloatToStr(OutDiff) + ' must be < 1e-4', OutDiff < 1e-4);
+    finally
+      Input.Free;
+      NNCPU.Free;
       NN.Free;
     end;
   end;
