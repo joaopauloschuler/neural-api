@@ -25,7 +25,8 @@ overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
-/strength S, /profile on|off, /stats on|off, /quit.
+/outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, /stats on|off,
+/quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -55,6 +56,15 @@ cell's top-left pixel decides). After every step the kept cells are reset to
 the init image's latents at the next noise level, and to the latents
 themselves after the last step. --strength 1 regenerates the hole from pure
 noise; lower values keep more of the init image inside the hole too.
+Outpainting (--init-image FILE --outpaint L,T,R,B, or /outpaint in the REPL):
+extends the init image by L, T, R and B pixels on the left, top, right and
+bottom. BuildOutpaintCanvas (neuralimageresize) places the image on a canvas
+grown to multiples of 32, fills the new border by repeating the edge pixels
+and masks that border plus --outpaint-overlap pixels (default 16, one latent
+cell) into the image; the inpaint path then regenerates the mask at strength 1
+unless --strength is given. The output is the canvas itself (--width and
+--height do not apply), cropped to the requested size, and the original pixels
+outside the overlap band are pasted back unchanged (diffusers apply_overlay).
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -67,7 +77,8 @@ USAGE
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
             [--repeat N] [--image FILE ... |
-             --init-image FILE [--mask FILE [--mask-blur R]] [--strength 0.6]]
+             --init-image FILE [--mask FILE [--mask-blur R] |
+             --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -98,6 +109,8 @@ const
   csMaxImageSide = 8192;
   // img2img strength when --strength is not given (diffusers' default).
   csDefaultStrength = 0.6;
+  // Outpaint seam band when --outpaint-overlap is not given: one latent cell.
+  csDefaultOutpaintOverlap = csQwenImage21PixelsPerLatent;
   // Largest --repeat / /repeat count (catches a mistyped count).
   csMaxRepeatCount = 1000;
   csBytesPerMB = 1024.0 * 1024.0;
@@ -458,6 +471,20 @@ begin
     'pixels at its own size before');
   WriteLn('                       the 50% threshold (diffusers ',
     'mask_processor.blur; default 0 = off)');
+  WriteLn('  --outpaint L,T,R,B   with --init-image: outpaint; add L, T, R, B ',
+    'pixels on the left, top,');
+  WriteLn('                       right and bottom. The output is the init ',
+    'image plus that border at its');
+  WriteLn('                       own scale (--width/--height do not apply); ',
+    'the border and the overlap');
+  WriteLn('                       band are generated, the other original ',
+    'pixels are pasted back exactly.');
+  WriteLn('                       Strength 1 unless --strength is given. Not ',
+    'with --mask.');
+  WriteLn('  --outpaint-overlap N pixels of the init image along each ',
+    'extended side that are regenerated');
+  WriteLn('                       too, so the seam blends (default ',
+    csDefaultOutpaintOverlap, ')');
   WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
     csDefaultStrength:0:1, '): runs only the last');
   WriteLn('                       part of the schedule (18 steps at 0.6: the ',
@@ -556,6 +583,9 @@ begin
   WriteLn('                       clears it');
   WriteLn('  /mask-blur R         mask blur sigma in pixels, as --mask-blur; ',
     'reloads the current mask');
+  WriteLn('  /outpaint L,T,R,B [OVERLAP]  outpaint the init image, as ',
+    '--outpaint (and --outpaint-overlap);');
+  WriteLn('                       /outpaint off returns to img2img');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
@@ -662,6 +692,17 @@ begin
   else Result := '';
 end;
 
+// Parses an outpaint overlap in 0..csMaxImageSide pixels; returns '' or what
+// is wrong.
+function ParseOutpaintOverlap(const Text: string; out Overlap: integer): string;
+begin
+  Overlap := StrToIntDef(Trim(Text), -1);
+  if (Overlap < 0) or (Overlap > csMaxImageSide) then
+    Result := '"' + Text + '" is not an integer in 0..' +
+      IntToStr(csMaxImageSide) + '.'
+  else Result := '';
+end;
+
 // Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
 function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
 begin
@@ -714,7 +755,8 @@ begin
 end;
 
 var
-  ModelFolder, Prompt, OutputFile, TokenList, Arg, ArgProblem: string;
+  ModelFolder, Prompt, OutputFile, TokenList, Arg, ArgProblem,
+    OutpaintText: string;
   Width, Height, StepCount, DropCount, ArgPos: integer;
   RepeatCount, ImageNumber, FileNumber: integer;
   Seed: cardinal;
@@ -736,6 +778,15 @@ var
   MaskBlurRadius: double;
   MaskImage, MaskLatents: TNNetVolume;
   MaskLatentsWidth, MaskLatentsHeight: integer;
+  // Outpainting: the pixels added per side of the init image and the seam
+  // band; the canvas sides grow to multiples of 32 (cropped after decode).
+  HasOutpaint: boolean;
+  OutpaintLeft, OutpaintTop, OutpaintRight, OutpaintBottom,
+    OutpaintOverlap: integer;
+  CanvasLeft, CanvasTop, CanvasRight, CanvasBottom: integer;
+  // The canvas (0..255) and its mask (0..255, blurred by MaskBlurRadius),
+  // built from the init image while IsOutpainting().
+  OutpaintCanvas, OutpaintMask: TNNetVolume;
   // Edit: the condition images as read (0..255) and their files; the
   // pipeline holds their encoding at ConditionEncodedArea pixels (0: none).
   // ImageArgFiles: the --image files, read once the output area is known.
@@ -815,7 +866,12 @@ var
   // once encoded), else --width x --height.
   procedure GetOutputSize(out OutputWidth, OutputHeight: integer);
   begin
-    if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
+    if HasInitImage and HasOutpaint then
+    begin
+      OutputWidth := OutpaintCanvas.SizeX;
+      OutputHeight := OutpaintCanvas.SizeY;
+    end
+    else if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
     else if IsEditing() and (ConditionEncodedArea = double(Width) * Height)
       then
     begin
@@ -855,8 +911,93 @@ var
     if Result = '' then Result := OutputSizeProblemFor(Dest);
   end;
 
-  // Loads FileName and makes it the init image when its output size works;
-  // otherwise returns what is wrong and changes nothing.
+  // An init image and outpaint sides are set.
+  function IsOutpainting(): boolean;
+  begin
+    Result := HasInitImage and HasOutpaint;
+  end;
+
+  // '' when Image outpainted by the given sides makes a usable canvas;
+  // otherwise what is wrong.
+  function OutpaintCanvasProblem(Image: TNNetVolume; Left, Top, Right,
+    Bottom: integer): string;
+  begin
+    GrowOutpaintSidesToMultiple(Image.SizeX, Image.SizeY,
+      csQwenImage21ImageSideMultiple, Left, Top, Right, Bottom);
+    Result := ImageSideProblem(Image.SizeX + Left + Right,
+      Image.SizeY + Top + Bottom);
+    if Result <> '' then
+      Result := 'the outpaint canvas would be ' +
+        IntToStr(Image.SizeX + Left + Right) + 'x' +
+        IntToStr(Image.SizeY + Top + Bottom) + ': ' + Result;
+  end;
+
+  // Rebuilds the canvas and its mask from the init image while outpainting;
+  // the encoded latents no longer match them.
+  procedure BuildOutpaint();
+  var
+    Mask: TNNetVolume;
+  begin
+    ImageLatentsWidth := 0;
+    MaskLatentsWidth := 0;
+    if not IsOutpainting() then exit;
+    CanvasLeft := OutpaintLeft;
+    CanvasTop := OutpaintTop;
+    CanvasRight := OutpaintRight;
+    CanvasBottom := OutpaintBottom;
+    GrowOutpaintSidesToMultiple(InitImage.SizeX, InitImage.SizeY,
+      csQwenImage21ImageSideMultiple, CanvasLeft, CanvasTop, CanvasRight,
+      CanvasBottom);
+    Mask := TNNetVolume.Create();
+    try
+      BuildOutpaintCanvas(InitImage, CanvasLeft, CanvasTop, CanvasRight,
+        CanvasBottom, OutpaintOverlap, OutpaintCanvas, Mask);
+      Mask.Mul(255);
+      GaussianBlurImage(Mask, OutpaintMask, MaskBlurRadius);
+    finally
+      Mask.Free;
+    end;
+  end;
+
+  // Makes Left..Bottom with Overlap the outpaint sides when the init image
+  // (if any) gives a usable canvas; otherwise returns what is wrong.
+  function SetOutpaint(Left, Top, Right, Bottom, Overlap: integer): string;
+  begin
+    Result := '';
+    if HasInitImage then
+      Result := OutpaintCanvasProblem(InitImage, Left, Top, Right, Bottom);
+    if Result <> '' then exit;
+    HasOutpaint := true;
+    OutpaintLeft := Left;
+    OutpaintTop := Top;
+    OutpaintRight := Right;
+    OutpaintBottom := Bottom;
+    OutpaintOverlap := Overlap;
+    BuildOutpaint();
+  end;
+
+  // Copies the requested outpaint area out of the decoded canvas Image (0..255)
+  // and pastes the init image's kept pixels back over it.
+  procedure FinishOutpaint();
+  var
+    Cropped: TNNetVolume;
+  begin
+    Cropped := TNNetVolume.Create();
+    try
+      Cropped.CopyCropping(Image, CanvasLeft - OutpaintLeft,
+        CanvasTop - OutpaintTop,
+        InitImage.SizeX + OutpaintLeft + OutpaintRight,
+        InitImage.SizeY + OutpaintTop + OutpaintBottom);
+      PasteOutpaintOriginal(InitImage, OutpaintLeft, OutpaintTop,
+        OutpaintRight, OutpaintBottom, OutpaintOverlap, Cropped);
+      Image.Copy(Cropped);
+    finally
+      Cropped.Free;
+    end;
+  end;
+
+  // Loads FileName and makes it the init image when its output size (or its
+  // outpaint canvas) works; otherwise returns what is wrong and changes nothing.
   function LoadInitImage(const FileName: string): string;
   var
     Loaded: TNNetVolume;
@@ -864,6 +1005,9 @@ var
     Loaded := TNNetVolume.Create();
     try
       Result := ReadImageFile(FileName, Loaded);
+      if (Result = '') and HasOutpaint then
+        Result := OutpaintCanvasProblem(Loaded, OutpaintLeft, OutpaintTop,
+          OutpaintRight, OutpaintBottom);
       if Result <> '' then exit;
       InitImage.Copy(Loaded);
     finally
@@ -873,6 +1017,7 @@ var
     InitImageFile := FileName;
     ImageLatentsWidth := 0;
     ImageLatentsHeight := 0;
+    BuildOutpaint();
   end;
 
   // Loads FileName as the inpaint mask (any size: it is stretched to the
@@ -911,7 +1056,7 @@ var
   // The mask latents for GenerateFromEmbeds: nil unless inpainting.
   function ActiveMaskLatents(): TNNetVolume;
   begin
-    if IsInpainting() then Result := MaskLatents
+    if IsInpainting() or IsOutpainting() then Result := MaskLatents
     else Result := nil;
   end;
 
@@ -1002,12 +1147,24 @@ var
     Problem: string;
   begin
     if not HasInitImage then exit;
-    Problem := OutputSizeProblemFor(InitImage);
-    if Problem <> '' then raise Exception.Create(Problem);
+    if not IsOutpainting() then
+    begin
+      Problem := OutputSizeProblemFor(InitImage);
+      if Problem <> '' then raise Exception.Create(Problem);
+    end;
     // Raises when the strength leaves no step.
     TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
     GetOutputSize(OutputWidth, OutputHeight);
-    if IsInpainting() and ((MaskLatentsWidth <> OutputWidth) or
+    if IsOutpainting() and ((MaskLatentsWidth <> OutputWidth) or
+      (MaskLatentsHeight <> OutputHeight)) then
+    begin
+      MaskLatentsWidth := 0;
+      Pipeline.EncodeMask(OutpaintMask, OutputWidth, OutputHeight,
+        MaskLatents);
+      MaskLatentsWidth := OutputWidth;
+      MaskLatentsHeight := OutputHeight;
+    end
+    else if IsInpainting() and ((MaskLatentsWidth <> OutputWidth) or
       (MaskLatentsHeight <> OutputHeight)) then
     begin
       MaskLatentsWidth := 0;
@@ -1018,7 +1175,12 @@ var
     if (ImageLatentsWidth = OutputWidth) and
       (ImageLatentsHeight = OutputHeight) then exit;
     ImageLatentsWidth := 0;
-    Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight, ImageLatents);
+    if IsOutpainting() then
+      Pipeline.EncodeImage(OutpaintCanvas, OutputWidth, OutputHeight,
+        ImageLatents)
+    else
+      Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight,
+        ImageLatents);
     Reporter.OnPhase(qppDone);
     ImageLatentsWidth := OutputWidth;
     ImageLatentsHeight := OutputHeight;
@@ -1062,6 +1224,17 @@ var
     WriteLn('Init image : ', InitImageFile, ' (', InitImage.SizeX, 'x',
       InitImage.SizeY, '), strength ', StrengthText(Strength), ', the last ',
       StepCount - StartStep, ' of ', StepCount, ' steps');
+    if IsOutpainting() then
+    begin
+      WriteLn('Outpaint   : ', OutpaintLeft, ',', OutpaintTop, ',',
+        OutpaintRight, ',', OutpaintBottom, ' pixels, overlap ',
+        OutpaintOverlap, '; canvas ', OutpaintCanvas.SizeX, 'x',
+        OutpaintCanvas.SizeY, ' cropped to ', InitImage.SizeX + OutpaintLeft +
+        OutpaintRight, 'x', InitImage.SizeY + OutpaintTop + OutpaintBottom);
+      if MaskBlurRadius > 0 then
+        WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
+          PointFormat()), ' pixels');
+    end;
     if IsInpainting() then
     begin
       WriteLn('Mask       : ', MaskFile, ' (', MaskImage.SizeX, 'x',
@@ -1126,6 +1299,7 @@ var
         StepCount, Seed, Image);
     SaveStart := Now();
     Image.Mul(255);
+    if IsOutpainting() then FinishOutpaint();
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
       raise Exception.Create('could not write ' + ImageFile);
     PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
@@ -1155,10 +1329,8 @@ var
   // One image at Seed to the next numbered --output file (Numbered) or to
   // --output; the seed then grows by one, also when the image fails.
   procedure GenerateNextImage(Numbered: boolean);
-  const
-    ModeText: array[boolean] of string = ('img2img', 'inpaint');
   var
-    ImageFile, StepText: string;
+    ImageFile, StepText, ModeText: string;
     OutputWidth, OutputHeight: integer;
   begin
     Inc(ImageNumber);
@@ -1166,9 +1338,12 @@ var
     else ImageFile := OutputFile;
     GetOutputSize(OutputWidth, OutputHeight);
     StepText := IntToStr(StepCount) + ' steps';
+    if IsOutpainting() then ModeText := 'outpaint'
+    else if IsInpainting() then ModeText := 'inpaint'
+    else ModeText := 'img2img';
     if HasInitImage then
       StepText := Format('%s strength %s, the last %d of %d steps',
-        [ModeText[IsInpainting()], StrengthText(Strength), StepCount -
+        [ModeText, StrengthText(Strength), StepCount -
         TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength),
         StepCount])
     else if IsEditing() then
@@ -1264,7 +1439,7 @@ var
   end;
 
   // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image,
-  // /mask, /mask-blur, /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
+  // /mask, /mask-blur, /outpaint, /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
   // out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
@@ -1273,6 +1448,7 @@ var
     NewRepeatCount: integer;
     NewValue: int64;
     NewStrength, NewMaskBlurRadius: double;
+    NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
   begin
     Result := true;
@@ -1296,7 +1472,10 @@ var
       begin
         Width := NewWidth;
         Height := NewHeight;
-        if HasInitImage or IsEditing() then
+        if IsOutpainting() then
+          WriteLn('[size ', Width, 'x', Height, '; outpainting keeps its ',
+            OutpaintCanvas.SizeX, 'x', OutpaintCanvas.SizeY, ' canvas]')
+        else if HasInitImage or IsEditing() then
         begin
           GetOutputSize(NewWidth, NewHeight);
           WriteLn('[size ', Width, 'x', Height, '; the image''s aspect ',
@@ -1443,6 +1622,8 @@ var
         if HasInitImage then WriteLn('[mask off: img2img]')
         else WriteLn('[mask off]');
       end
+      else if HasOutpaint then
+        WriteLn('[/mask: outpainting is on; /outpaint off first]')
       else
       begin
         Problem := LoadMask(Argument);
@@ -1467,7 +1648,13 @@ var
       else
       begin
         MaskBlurRadius := NewMaskBlurRadius;
-        if HasMask then
+        if HasOutpaint then
+        begin
+          BuildOutpaint();
+          WriteLn('[mask blur ', FloatToStr(MaskBlurRadius, PointFormat()),
+            ' for the outpaint mask]');
+        end
+        else if HasMask then
         begin
           Problem := LoadMask(MaskFile);
           if Problem <> '' then
@@ -1487,7 +1674,55 @@ var
       else
       begin
         Strength := NewStrength;
+        HasStrengthArg := true;
         WriteLn('[strength ', StrengthText(Strength), ']');
+      end;
+    end
+    else if Command = 'outpaint' then
+    begin
+      if LowerCase(Argument) = 'off' then
+      begin
+        HasOutpaint := false;
+        BuildOutpaint();
+        if not HasStrengthArg then Strength := csDefaultStrength;
+        if HasInitImage then
+          WriteLn('[outpaint off: img2img, strength ', StrengthText(Strength),
+            ']')
+        else WriteLn('[outpaint off]');
+      end
+      else if HasMask then
+        WriteLn('[/outpaint: a mask is set; /mask off first]')
+      else
+      begin
+        SpacePos := Pos(' ', Argument);
+        NewOverlap := OutpaintOverlap;
+        Problem := '';
+        if SpacePos > 0 then
+          Problem := ParseOutpaintOverlap(Copy(Argument, SpacePos + 1, MaxInt),
+            NewOverlap)
+        else SpacePos := Length(Argument) + 1;
+        if Problem = '' then
+          Problem := ParseOutpaintSides(Copy(Argument, 1, SpacePos - 1),
+            NewLeft, NewTop, NewRight, NewBottom);
+        if Problem = '' then
+          Problem := SetOutpaint(NewLeft, NewTop, NewRight, NewBottom,
+            NewOverlap);
+        if Problem <> '' then
+          WriteLn('[/outpaint: expected /outpaint L,T,R,B [OVERLAP] or ',
+            '/outpaint off; ', Problem, ']')
+        else
+        begin
+          if not HasStrengthArg then Strength := 1;
+          if HasInitImage then
+            WriteLn('[outpaint ', InitImageFile, ' by ', OutpaintLeft, ',',
+              OutpaintTop, ',', OutpaintRight, ',', OutpaintBottom,
+              ' pixels, overlap ', OutpaintOverlap, ': canvas ',
+              OutpaintCanvas.SizeX, 'x', OutpaintCanvas.SizeY, ', strength ',
+              StrengthText(Strength), ']')
+          else WriteLn('[outpaint ', OutpaintLeft, ',', OutpaintTop, ',',
+            OutpaintRight, ',', OutpaintBottom, ': applies once /init-image ',
+            'sets an init image]');
+        end;
       end;
     end
     else if Command = 'profile' then
@@ -1508,7 +1743,7 @@ var
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
       '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
-      '/strength, ',
+      '/outpaint, /strength, ',
       '/profile, /stats, /quit]');
   end;
 
@@ -1522,8 +1757,8 @@ var
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
-      '/init-image FILE|off, /mask FILE|off, /mask-blur R, /strength S, ',
-      '/profile on|off, ',
+      '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
+      '/outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, ',
       '/stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
@@ -1582,6 +1817,9 @@ begin
   MaskBlurRadius := 0;
   MaskLatentsWidth := 0;
   MaskLatentsHeight := 0;
+  HasOutpaint := false;
+  OutpaintText := '';
+  OutpaintOverlap := csDefaultOutpaintOverlap;
   InputImageEncodeNumber := 0;
   ConditionFiles := TStringList.Create;
   ImageArgFiles := TStringList.Create;
@@ -1639,6 +1877,16 @@ begin
       if ArgProblem <> '' then
       begin
         WriteLn('--mask-blur: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--outpaint' then OutpaintText := NextArg()
+    else if Arg = '--outpaint-overlap' then
+    begin
+      ArgProblem := ParseOutpaintOverlap(NextArg(), OutpaintOverlap);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--outpaint-overlap: ', ArgProblem);
         Halt(2);
       end;
     end
@@ -1729,6 +1977,27 @@ begin
     WriteLn('--mask needs --init-image (the image it keeps).');
     Halt(2);
   end;
+  if OutpaintText <> '' then
+  begin
+    ArgProblem := ParseOutpaintSides(OutpaintText, OutpaintLeft, OutpaintTop,
+      OutpaintRight, OutpaintBottom);
+    if ArgProblem <> '' then
+    begin
+      WriteLn('--outpaint: ', ArgProblem);
+      Halt(2);
+    end;
+    if MaskFile <> '' then
+    begin
+      WriteLn('--mask and --outpaint are exclusive.');
+      Halt(2);
+    end;
+    if (InitImageFile = '') and (HasPrompt or (TokenList <> '')) then
+    begin
+      WriteLn('--outpaint needs --init-image (the image it extends).');
+      Halt(2);
+    end;
+    if not HasStrengthArg then Strength := 1;
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
@@ -1744,6 +2013,8 @@ begin
   ImageLatents := TNNetVolume.Create();
   MaskImage := TNNetVolume.Create();
   MaskLatents := TNNetVolume.Create();
+  OutpaintCanvas := TNNetVolume.Create();
+  OutpaintMask := TNNetVolume.Create();
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -1803,6 +2074,15 @@ begin
     {$ENDIF}
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
     Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
+    if OutpaintText <> '' then
+    begin
+      ArgProblem := SetOutpaint(OutpaintLeft, OutpaintTop, OutpaintRight,
+        OutpaintBottom, OutpaintOverlap);
+      if ArgProblem <> '' then
+        raise Exception.Create('--outpaint: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--outpaint applies once /init-image sets an init image]');
+    end;
     if InitImageFile <> '' then
     begin
       ArgProblem := LoadInitImage(InitImageFile);
@@ -1869,6 +2149,8 @@ begin
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}
+    OutpaintMask.Free;
+    OutpaintCanvas.Free;
     MaskLatents.Free;
     MaskImage.Free;
     ImageLatents.Free;

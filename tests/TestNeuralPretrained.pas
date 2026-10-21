@@ -975,6 +975,9 @@ type
     procedure TestQwenImage21Img2ImgKeepLoaded;
     procedure TestQwenImage21InpaintMaskLatents;
     procedure TestQwenImage21InpaintKeepsKnown;
+    // Outpaint on the pico pipeline as examples/QwenImage runs it: canvas
+    // grown to multiples of 32, decode, crop, paste; kept pixels are exact.
+    procedure TestQwenImage21OutpaintKeepsOriginal;
     procedure TestQwenImage21InpaintParity;
     procedure TestQwen3VLVisionConfig;
     procedure TestQwen3VLVisionPreprocessParity;
@@ -35428,6 +35431,111 @@ begin
     Mask.Free;
     MaskLatents.Free;
     ImageLatents.Free;
+    InitImage.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21OutpaintKeepsOriginal;
+const
+  OutpaintLeft = 8;
+  OutpaintTop = 0;
+  OutpaintRight = 0;
+  OutpaintBottom = 8;
+  Overlap = 16;
+var
+  RefJson: TStringList;
+  EmbedsRoot: TJSONData;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, InitImage, Canvas, Mask, ImageLatents, MaskLatents, Image,
+    Cropped: TNNetVolume;
+  CanvasLeft, CanvasTop, CanvasRight, CanvasBottom, X, Y, Channel,
+    KeptCount: integer;
+  DecodeDiff: double;
+begin
+  RefJson := TStringList.Create;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  MaskLatents := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Cropped := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    FillQwenImage21FormulaImage(InitImage, 40, 24, 3);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    CanvasLeft := OutpaintLeft;
+    CanvasTop := OutpaintTop;
+    CanvasRight := OutpaintRight;
+    CanvasBottom := OutpaintBottom;
+    GrowOutpaintSidesToMultiple(InitImage.SizeX, InitImage.SizeY,
+      csQwenImage21ImageSideMultiple, CanvasLeft, CanvasTop, CanvasRight,
+      CanvasBottom);
+    // 48 -> 64 on the only extended horizontal side; 32 is a multiple.
+    AssertEquals('canvas left', 24, CanvasLeft);
+    AssertEquals('canvas right', 0, CanvasRight);
+    AssertEquals('canvas bottom', 8, CanvasBottom);
+    BuildOutpaintCanvas(InitImage, CanvasLeft, CanvasTop, CanvasRight,
+      CanvasBottom, Overlap, Canvas, Mask);
+    Mask.Mul(255);
+    AssertEquals('canvas width', 64, Canvas.SizeX);
+    AssertEquals('canvas height', 32, Canvas.SizeY);
+    Pipeline.EncodeImage(Canvas, Canvas.SizeX, Canvas.SizeY, ImageLatents);
+    Pipeline.EncodeMask(Mask, Canvas.SizeX, Canvas.SizeY, MaskLatents);
+    Pipeline.GenerateFromEmbeds(Embeds, Canvas.SizeX, Canvas.SizeY,
+      {StepCount=}2, {Seed=}0, Image, nil, ImageLatents, {Strength=}1,
+      MaskLatents);
+    AssertTrue('stats: mask', Pipeline.ImageStats.UsedMask);
+    Image.Mul(255);
+    Cropped.CopyCropping(Image, CanvasLeft - OutpaintLeft,
+      CanvasTop - OutpaintTop, 40 + OutpaintLeft + OutpaintRight,
+      24 + OutpaintTop + OutpaintBottom);
+    DecodeDiff := 0;
+    for Y := 0 to 23 do
+      for X := 0 to 39 do
+        for Channel := 0 to 2 do
+          DecodeDiff := Max(DecodeDiff, Abs(Cropped[X + OutpaintLeft,
+            Y + OutpaintTop, Channel] - InitImage[X, Y, Channel]));
+    PasteOutpaintOriginal(InitImage, OutpaintLeft, OutpaintTop, OutpaintRight,
+      OutpaintBottom, Overlap, Cropped);
+    AssertEquals('output width', 48, Cropped.SizeX);
+    AssertEquals('output height', 32, Cropped.SizeY);
+    KeptCount := 0;
+    // Kept: X >= Left + Overlap (left extended), Y < Top + 24 - Overlap
+    // (bottom extended); the top and right sides are not extended.
+    for Y := 0 to Cropped.SizeY - 1 do
+      for X := 0 to Cropped.SizeX - 1 do
+        if (X >= OutpaintLeft + Overlap) and (Y < 24 - Overlap) then
+        begin
+          Inc(KeptCount);
+          for Channel := 0 to 2 do
+            AssertEquals(Format('kept pixel (%d,%d,%d)', [X, Y, Channel]),
+              InitImage[X - OutpaintLeft, Y, Channel], Cropped[X, Y, Channel],
+              0);
+        end;
+    AssertEquals('kept pixels', (40 - Overlap) * (24 - Overlap), KeptCount);
+    WriteLn('  Qwen-Image-2.1 outpaint: decoded vs init max|diff|=',
+      DecodeDiff:0:3, ' before the paste');
+    AssertTrue('the paste is what keeps the original', DecodeDiff > 1);
+  finally
+    Cropped.Free;
+    Image.Free;
+    MaskLatents.Free;
+    ImageLatents.Free;
+    Mask.Free;
+    Canvas.Free;
     InitImage.Free;
     Embeds.Free;
     Pipeline.Free;
