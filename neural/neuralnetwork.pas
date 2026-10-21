@@ -5706,15 +5706,27 @@ type
   // Coded by Claude (AI).
   TNNetRealFFT2DCL = class(TNNetKernelCL)
   private
-    // On FKernel's queue, so the two launches of a forward stay ordered.
+    // W, H, C and HalfW the uploaded tables were built for (0 = none yet).
+    FPlanShape: array[0..3] of integer;
+    procedure FillTwiddles(Twid: TNNetVolume; N: integer);
+  protected
+    // On FKernel's queue, so the launches of a forward stay ordered.
     FColsKernel, FC2RKernel: cl_kernel;
     // cos|sin twiddles of W and of H, the per-bin scales, and their uploads.
     FTwidWHost, FTwidHHost, FBinScaleHost: TNNetVolume;
     FBufTwidW, FBufTwidH, FBufBinScale, FBufSrc, FBufMid, FBufDst: cl_mem;
     FCapTwidW, FCapTwidH, FCapBinScale, FCapSrc, FCapMid, FCapDst: csize_t;
-    // W, H, C and HalfW the uploaded tables were built for (0 = none yet).
-    FPlanShape: array[0..3] of integer;
-    procedure FillTwiddles(Twid: TNNetVolume; N: integer);
+    // Builds the twiddles of W and H and uploads them with FBinScaleHost.
+    procedure UploadTables(W, H: integer);
+    // Prev's resident output when CanBind and bindable, else an upload of it.
+    function BindOrUploadSource(Prev: TNNetLayer; CanBind: boolean): cl_mem;
+    // Keeps Layer's result resident when KeepResult, else reads it back.
+    procedure FinishResult(Layer: TNNetLayer; KeepResult: boolean);
+    // The three DFT launches; BinCount bins of each line are computed.
+    procedure RunRowsR2C(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
+    procedure RunColsC2C(NumOut, H, BinCount, C: longint; Sign: single;
+      ApplyBinScale: longint; Src, Dst: cl_mem);
+    procedure RunRowsC2R(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -5727,6 +5739,30 @@ type
     // Consumer.Output := the transform of Consumer.PrevLayer's output: binds a
     // resident source and keeps the result in OpenCL memory unless trainable.
     procedure TransformFromPrevLayer(Consumer: TNNetLayer; Inverse: boolean);
+  end;
+
+  /// OpenCL forward of TNNetSpectralConv2D on the rfft2 kernels: the kept-mode
+  // spectrum (cai_rfft2_rows_r2c, cai_rfft2_cols_c2c), cai_spectral_mode_mix,
+  // then Re of the inverse 2-D DFT (cai_rfft2_cols_c2c, cai_irfft2_rows_c2r).
+  // Coded by Claude (AI).
+  TNNetSpectralConv2DCL = class(TNNetRealFFT2DCL)
+  private
+    FMixKernel: cl_kernel;
+    // Kept-mode and inverse-column spectra; FBufMid holds the other two stages.
+    FBufSpec, FBufWeights: cl_mem;
+    FCapSpec, FCapWeights: csize_t;
+    // SizeX, SizeY and ModesX the uploaded tables were built for (0 = none yet).
+    FTableShape: array[0..2] of integer;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Uploads the twiddles and the 1/(SizeX*SizeY) bin scales on a shape change.
+    procedure EnsureSpectralTables(Consumer: TNNetLayer);
+    procedure UploadWeights(Weights: TNNetVolume);
+    function BufferBytes(): int64; override;
+    // Consumer.Output := the spectral conv of Consumer.PrevLayer's output; binds
+    // a resident source and keeps the result resident. Consumer is a TNNetSpectralConv2D.
+    procedure ConvolveFromPrevLayer(Consumer: TNNetLayer);
   end;
 
   /// OpenCL forward helper for TNNetBicubicUpsample, the 16-corner sibling of
@@ -17430,6 +17466,9 @@ type
     // the [x][y] layout makes Re[ix] the contiguous Y row, so FFTPlanExecute
     // runs in place on it.
     FFftRowRe, FFftRowIm: array of Double;
+    {$IFDEF OpenCL}
+    FSpectralConvCL: TNNetSpectralConv2DCL;
+    {$ENDIF}
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
@@ -17447,6 +17486,16 @@ type
     procedure AfterWeightUpdate(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Forward only: BackpropagateCPU reads the spectra ComputeCPU leaves, so a
+    // trainable layer always runs on the host.
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
     property ModesX: integer read FModesX;
     property ModesY: integer read FModesY;
     property SizeX: integer read FSizeX;
@@ -41102,6 +41151,15 @@ begin
   end;
 end;
 
+procedure TNNetRealFFT2DCL.UploadTables(W, H: integer);
+begin
+  FillTwiddles(FTwidWHost, W);
+  FillTwiddles(FTwidHHost, H);
+  FKernel.EnsureWriteBuffer(FBufTwidW, FCapTwidW, FTwidWHost, true, true);
+  FKernel.EnsureWriteBuffer(FBufTwidH, FCapTwidH, FTwidHHost, true, true);
+  FKernel.EnsureWriteBuffer(FBufBinScale, FCapBinScale, FBinScaleHost, true, true);
+end;
+
 procedure TNNetRealFFT2DCL.EnsureTables(Consumer: TNNetLayer);
 var
   Layer: TNNetRealFFT2DBase;
@@ -41110,15 +41168,11 @@ begin
   Layer := TNNetRealFFT2DBase(Consumer);
   if (FPlanShape[0] = Layer.FSpatialW) and (FPlanShape[1] = Layer.FSpatialH) and
     (FPlanShape[2] = Layer.FChannels) and (FPlanShape[3] = Layer.FHalfW) then exit;
-  FillTwiddles(FTwidWHost, Layer.FSpatialW);
-  FillTwiddles(FTwidHHost, Layer.FSpatialH);
   FBinScaleHost.ReSize(Layer.FHalfW, 1, 1);
   MaxBinPos := Layer.FHalfW - 1;
   for BinPos := 0 to MaxBinPos do
     FBinScaleHost.FData[BinPos] := Layer.FBinScale[BinPos];
-  FKernel.EnsureWriteBuffer(FBufTwidW, FCapTwidW, FTwidWHost, true, true);
-  FKernel.EnsureWriteBuffer(FBufTwidH, FCapTwidH, FTwidHHost, true, true);
-  FKernel.EnsureWriteBuffer(FBufBinScale, FCapBinScale, FBinScaleHost, true, true);
+  UploadTables(Layer.FSpatialW, Layer.FSpatialH);
   FPlanShape[0] := Layer.FSpatialW;
   FPlanShape[1] := Layer.FSpatialH;
   FPlanShape[2] := Layer.FChannels;
@@ -41142,100 +41196,23 @@ begin
     OpenCLMemBytes(FBufMid) + OpenCLMemBytes(FBufDst);
 end;
 
-procedure TNNetRealFFT2DCL.TransformFromPrevLayer(Consumer: TNNetLayer;
-  Inverse: boolean);
-var
-  Layer: TNNetRealFFT2DBase;
-  Prev: TNNetLayer;
-  Y: TNNetVolume;
-  bufSrc, bufMid, bufDst: cl_mem;
-  k: cl_kernel;
-  NumOut, NumMid, iW, iH, iHalfW, iC, iApplyBinScale: longint;
-  fSign: single;
-  MidBytes: csize_t;
-  KeepResult: boolean;
+function TNNetRealFFT2DCL.BindOrUploadSource(Prev: TNNetLayer;
+  CanBind: boolean): cl_mem;
 begin
-  Layer := TNNetRealFFT2DBase(Consumer);
-  Prev := Layer.FPrevLayer;
-  Y := Layer.FOutput;
-  EnsureTables(Layer);
-  KeepResult := not Layer.FIsTrainable;
-  if KeepResult and Prev.OutputBindableOnOpenCL() then
+  if CanBind and Prev.OutputBindableOnOpenCL() then
   begin
-    bufSrc := Prev.OpenCLOutputBuffer();
+    Result := Prev.OpenCLOutputBuffer();
     Prev.OpenCLWaitOutputIfAnotherQueue(FKernel);
   end
   else
   begin
     Prev.ForceOutputOnRAM();
-    bufSrc := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Prev.FOutput);
+    Result := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Prev.FOutput);
   end;
-  iW := Layer.FSpatialW;
-  iH := Layer.FSpatialH;
-  iHalfW := Layer.FHalfW;
-  iC := Layer.FChannels;
-  NumMid := iHalfW * iH * iC;
-  MidBytes := csize_t(2 * NumMid) * csNeuralFloatSize;
-  bufMid := FKernel.EnsureBuffer(FBufMid, FCapMid, CL_MEM_READ_WRITE, MidBytes);
-  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Y);
-  if Inverse then
-  begin
-    // Columns: unnormalised inverse DFT along H, no bin scale.
-    fSign := 1;
-    iApplyBinScale := 0;
-    k := FColsKernel;
-    clSetKernelArg(k, 0, csLongintSize, @NumMid);
-    clSetKernelArg(k, 1, csLongintSize, @iH);
-    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
-    clSetKernelArg(k, 3, csLongintSize, @iC);
-    clSetKernelArg(k, 4, csNeuralFloatSize, @fSign);
-    clSetKernelArg(k, 5, csLongintSize, @iApplyBinScale);
-    clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
-    clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
-    clSetKernelArg(k, 8, csCLMemSize, @bufSrc);
-    clSetKernelArg(k, 9, csCLMemSize, @bufMid);
-    FKernel.RunKernel(k, NumMid);
-    // Rows: c2r along W with the Hermitian bin counts and the norm.
-    NumOut := Y.Size;
-    k := FC2RKernel;
-    clSetKernelArg(k, 0, csLongintSize, @NumOut);
-    clSetKernelArg(k, 1, csLongintSize, @iW);
-    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
-    clSetKernelArg(k, 3, csLongintSize, @iC);
-    clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
-    clSetKernelArg(k, 5, csCLMemSize, @FBufBinScale);
-    clSetKernelArg(k, 6, csCLMemSize, @bufMid);
-    clSetKernelArg(k, 7, csCLMemSize, @bufDst);
-    FKernel.RunKernel(k, NumOut);
-  end
-  else
-  begin
-    // Rows: real -> half spectrum along W.
-    k := FKernel.Kernel;
-    clSetKernelArg(k, 0, csLongintSize, @NumMid);
-    clSetKernelArg(k, 1, csLongintSize, @iW);
-    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
-    clSetKernelArg(k, 3, csLongintSize, @iC);
-    clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
-    clSetKernelArg(k, 5, csCLMemSize, @bufSrc);
-    clSetKernelArg(k, 6, csCLMemSize, @bufMid);
-    FKernel.RunKernel(k, NumMid);
-    // Columns: forward DFT along H, times the norm.
-    fSign := -1;
-    iApplyBinScale := 1;
-    k := FColsKernel;
-    clSetKernelArg(k, 0, csLongintSize, @NumMid);
-    clSetKernelArg(k, 1, csLongintSize, @iH);
-    clSetKernelArg(k, 2, csLongintSize, @iHalfW);
-    clSetKernelArg(k, 3, csLongintSize, @iC);
-    clSetKernelArg(k, 4, csNeuralFloatSize, @fSign);
-    clSetKernelArg(k, 5, csLongintSize, @iApplyBinScale);
-    clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
-    clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
-    clSetKernelArg(k, 8, csCLMemSize, @bufMid);
-    clSetKernelArg(k, 9, csCLMemSize, @bufDst);
-    FKernel.RunKernel(k, NumMid);
-  end;
+end;
+
+procedure TNNetRealFFT2DCL.FinishResult(Layer: TNNetLayer; KeepResult: boolean);
+begin
   if KeepResult then
   begin
     Layer.FOutputOnOpenCL := true;
@@ -41243,10 +41220,184 @@ begin
   end
   else
   begin
-    FKernel.ReadBuffer(bufDst, Y, CL_TRUE);
+    FKernel.ReadBuffer(FBufDst, Layer.FOutput, CL_TRUE);
     Layer.FOutputOnOpenCL := false;
     Layer.FOutputOnRAM := true;
   end;
+end;
+
+procedure TNNetRealFFT2DCL.RunRowsR2C(NumOut, W, BinCount, C: longint;
+  Src, Dst: cl_mem);
+var
+  k: cl_kernel;
+begin
+  k := FKernel.Kernel;
+  clSetKernelArg(k, 0, csLongintSize, @NumOut);
+  clSetKernelArg(k, 1, csLongintSize, @W);
+  clSetKernelArg(k, 2, csLongintSize, @BinCount);
+  clSetKernelArg(k, 3, csLongintSize, @C);
+  clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
+  clSetKernelArg(k, 5, csCLMemSize, @Src);
+  clSetKernelArg(k, 6, csCLMemSize, @Dst);
+  FKernel.RunKernel(k, NumOut);
+end;
+
+procedure TNNetRealFFT2DCL.RunColsC2C(NumOut, H, BinCount, C: longint;
+  Sign: single; ApplyBinScale: longint; Src, Dst: cl_mem);
+var
+  k: cl_kernel;
+begin
+  k := FColsKernel;
+  clSetKernelArg(k, 0, csLongintSize, @NumOut);
+  clSetKernelArg(k, 1, csLongintSize, @H);
+  clSetKernelArg(k, 2, csLongintSize, @BinCount);
+  clSetKernelArg(k, 3, csLongintSize, @C);
+  clSetKernelArg(k, 4, csNeuralFloatSize, @Sign);
+  clSetKernelArg(k, 5, csLongintSize, @ApplyBinScale);
+  clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
+  clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
+  clSetKernelArg(k, 8, csCLMemSize, @Src);
+  clSetKernelArg(k, 9, csCLMemSize, @Dst);
+  FKernel.RunKernel(k, NumOut);
+end;
+
+procedure TNNetRealFFT2DCL.RunRowsC2R(NumOut, W, BinCount, C: longint;
+  Src, Dst: cl_mem);
+var
+  k: cl_kernel;
+begin
+  k := FC2RKernel;
+  clSetKernelArg(k, 0, csLongintSize, @NumOut);
+  clSetKernelArg(k, 1, csLongintSize, @W);
+  clSetKernelArg(k, 2, csLongintSize, @BinCount);
+  clSetKernelArg(k, 3, csLongintSize, @C);
+  clSetKernelArg(k, 4, csCLMemSize, @FBufTwidW);
+  clSetKernelArg(k, 5, csCLMemSize, @FBufBinScale);
+  clSetKernelArg(k, 6, csCLMemSize, @Src);
+  clSetKernelArg(k, 7, csCLMemSize, @Dst);
+  FKernel.RunKernel(k, NumOut);
+end;
+
+procedure TNNetRealFFT2DCL.TransformFromPrevLayer(Consumer: TNNetLayer;
+  Inverse: boolean);
+var
+  Layer: TNNetRealFFT2DBase;
+  bufSrc, bufMid, bufDst: cl_mem;
+  NumMid: longint;
+  KeepResult: boolean;
+begin
+  Layer := TNNetRealFFT2DBase(Consumer);
+  EnsureTables(Layer);
+  KeepResult := not Layer.FIsTrainable;
+  bufSrc := BindOrUploadSource(Layer.FPrevLayer, KeepResult);
+  NumMid := Layer.FHalfW * Layer.FSpatialH * Layer.FChannels;
+  bufMid := FKernel.EnsureBuffer(FBufMid, FCapMid, CL_MEM_READ_WRITE,
+    csize_t(2 * NumMid) * csNeuralFloatSize);
+  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Layer.FOutput);
+  if Inverse then
+  begin
+    // Columns: unnormalised inverse DFT along H; rows: c2r along W with the
+    // Hermitian bin counts and the norm.
+    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FHalfW, Layer.FChannels, 1, 0,
+      bufSrc, bufMid);
+    RunRowsC2R(Layer.FOutput.Size, Layer.FSpatialW, Layer.FHalfW,
+      Layer.FChannels, bufMid, bufDst);
+  end
+  else
+  begin
+    // Rows: real -> half spectrum along W; columns: forward DFT along H, times
+    // the norm.
+    RunRowsR2C(NumMid, Layer.FSpatialW, Layer.FHalfW, Layer.FChannels,
+      bufSrc, bufMid);
+    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FHalfW, Layer.FChannels, -1, 1,
+      bufMid, bufDst);
+  end;
+  FinishResult(Layer, KeepResult);
+end;
+
+{ TNNetSpectralConv2DCL }
+
+constructor TNNetSpectralConv2DCL.Create(NN: TNNet);
+begin
+  inherited Create(NN);
+  FMixKernel := FKernel.CreateKernel('cai_spectral_mode_mix');
+end;
+
+destructor TNNetSpectralConv2DCL.Destroy();
+begin
+  if Assigned(FMixKernel) then clReleaseKernel(FMixKernel);
+  if Assigned(FBufSpec) then clReleaseMemObject(FBufSpec);
+  if Assigned(FBufWeights) then clReleaseMemObject(FBufWeights);
+  inherited Destroy();
+end;
+
+procedure TNNetSpectralConv2DCL.EnsureSpectralTables(Consumer: TNNetLayer);
+var
+  Layer: TNNetSpectralConv2D;
+begin
+  Layer := TNNetSpectralConv2D(Consumer);
+  if (FTableShape[0] = Layer.FSizeX) and (FTableShape[1] = Layer.FSizeY) and
+    (FTableShape[2] = Layer.FModesX) then exit;
+  FBinScaleHost.ReSize(Layer.FModesX, 1, 1);
+  FBinScaleHost.Fill(1 / (Layer.FSizeX * Layer.FSizeY));
+  UploadTables(Layer.FSizeX, Layer.FSizeY);
+  FTableShape[0] := Layer.FSizeX;
+  FTableShape[1] := Layer.FSizeY;
+  FTableShape[2] := Layer.FModesX;
+end;
+
+procedure TNNetSpectralConv2DCL.UploadWeights(Weights: TNNetVolume);
+begin
+  FKernel.EnsureWriteBuffer(FBufWeights, FCapWeights, Weights, true, true);
+end;
+
+function TNNetSpectralConv2DCL.BufferBytes(): int64;
+begin
+  Result := inherited BufferBytes() + OpenCLMemBytes(FBufSpec) +
+    OpenCLMemBytes(FBufWeights);
+end;
+
+procedure TNNetSpectralConv2DCL.ConvolveFromPrevLayer(Consumer: TNNetLayer);
+var
+  Layer: TNNetSpectralConv2D;
+  bufSrc, bufMid, bufSpec, bufDst: cl_mem;
+  SpecCount, PaddedCount, MaxDepth: longint;
+  SpecBytes: csize_t;
+  k: cl_kernel;
+begin
+  Layer := TNNetSpectralConv2D(Consumer);
+  EnsureSpectralTables(Layer);
+  bufSrc := BindOrUploadSource(Layer.FPrevLayer, true);
+  MaxDepth := Max(Layer.FInDepth, Layer.FOutDepth);
+  SpecBytes := csize_t(2 * Layer.FSizeY * Layer.FModesX * MaxDepth) *
+    csNeuralFloatSize;
+  bufMid := FKernel.EnsureBuffer(FBufMid, FCapMid, CL_MEM_READ_WRITE, SpecBytes);
+  bufSpec := FKernel.EnsureBuffer(FBufSpec, FCapSpec, CL_MEM_READ_WRITE, SpecBytes);
+  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Layer.FOutput);
+  // Forward DFT of the kept ModesY x ModesX corner, (ModesY, ModesX, InDepth).
+  RunRowsR2C(Layer.FSizeY * Layer.FModesX * Layer.FInDepth, Layer.FSizeX,
+    Layer.FModesX, Layer.FInDepth, bufSrc, bufMid);
+  SpecCount := Layer.FModesY * Layer.FModesX * Layer.FInDepth;
+  RunColsC2C(SpecCount, Layer.FSizeY, Layer.FModesX, Layer.FInDepth, -1, 0,
+    bufMid, bufSpec);
+  // Channel mixing into a (SizeY, ModesX, OutDepth) spectrum, zero past ModesY.
+  PaddedCount := Layer.FSizeY * Layer.FModesX * Layer.FOutDepth;
+  k := FMixKernel;
+  clSetKernelArg(k, 0, csLongintSize, @PaddedCount);
+  clSetKernelArg(k, 1, csLongintSize, @Layer.FModesX);
+  clSetKernelArg(k, 2, csLongintSize, @Layer.FModesY);
+  clSetKernelArg(k, 3, csLongintSize, @Layer.FInDepth);
+  clSetKernelArg(k, 4, csLongintSize, @Layer.FOutDepth);
+  clSetKernelArg(k, 5, csCLMemSize, @FBufWeights);
+  clSetKernelArg(k, 6, csCLMemSize, @bufSpec);
+  clSetKernelArg(k, 7, csCLMemSize, @bufMid);
+  FKernel.RunKernel(k, PaddedCount);
+  // Inverse DFT along SizeY, then Re of the inverse along SizeX with 1/(SizeX*SizeY).
+  RunColsC2C(PaddedCount, Layer.FSizeY, Layer.FModesX, Layer.FOutDepth, 1, 0,
+    bufMid, bufSpec);
+  RunRowsC2R(Layer.FOutput.Size, Layer.FSizeX, Layer.FModesX, Layer.FOutDepth,
+    bufSpec, bufDst);
+  FinishResult(Layer, true);
 end;
 
 { TNNetBicubicGatherCL }
@@ -96828,6 +96979,7 @@ end;
 
 destructor TNNetSpectralConv2D.Destroy();
 begin
+  {$IFDEF OpenCL} FreeAndNil(FSpectralConvCL); {$ENDIF}
   SetLength(FXre, 0);
   SetLength(FXim, 0);
   SetLength(FSreBuf, 0);
@@ -96989,10 +97141,80 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if FAfterWeightUpdateHasBeenCalled then
+    begin
+      FSpectralConvCL.UploadWeights(FArrNeurons[0].FWeights);
+      FAfterWeightUpdateHasBeenCalled := false;
+    end;
+    FSpectralConvCL.ConvolveFromPrevLayer(Self);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  if Assigned(FSpectralConvCL) then Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host writes FOutput, so a later ForceOutputOnRAM must not read the
+  // buffer a previous OpenCL forward left resident.
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+{$IFDEF OpenCL}
+function TNNetSpectralConv2D.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FSpectralConvCL) and FHasOpenCL and (not FIsTrainable) and
+    Assigned(FPrevLayer) and (FInDepth > 0) and
+    (FPrevLayer.FOutput.Size = FSizeX * FSizeY * FInDepth) and
+    (FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetSpectralConv2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FSpectralConvCL) then
+    FSpectralConvCL := TNNetSpectralConv2DCL.Create(FNN);
+  // Tables and weights uploaded here so the forward only binds and launches.
+  if FInDepth > 0 then
+  begin
+    FSpectralConvCL.EnsureSpectralTables(Self);
+    FSpectralConvCL.UploadWeights(FArrNeurons[0].FWeights);
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
+end;
+
+procedure TNNetSpectralConv2D.DisableOpenCL();
+begin
+  // FSpectralConvCL owns the output buffer and its queue: read it back first.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FSpectralConvCL);
+  FOutputOnOpenCL := false;
+end;
+
+function TNNetSpectralConv2D.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FSpectralConvCL) then Result := FSpectralConvCL.ResultBuffer()
+  else Result := inherited OpenCLOutputBuffer();
+end;
+
+function TNNetSpectralConv2D.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FSpectralConvCL) then Result := FSpectralConvCL.OutputKernel()
+  else Result := inherited OpenCLOutputKernel();
+end;
+
+function TNNetSpectralConv2D.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FSpectralConvCL) then Result := Result + FSpectralConvCL.BufferBytes();
+end;
+{$ENDIF}
 
 procedure TNNetSpectralConv2D.ComputeCPU();
 var

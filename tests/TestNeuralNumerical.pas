@@ -722,6 +722,7 @@ type
     // TNNetInverseRealFFT2D alone on a non-Hermitian spectrum (Im of DC and of
     // an even width's Nyquist bin must be dropped), odd and even widths.
     procedure TestInverseRealFFT2DOpenCLParity;
+    procedure TestSpectralConv2DOpenCLParity;
     procedure TestLearnedPositionalEmbeddingOpenCLParity;
     procedure TestSoftPromptOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
@@ -74288,6 +74289,124 @@ begin
       AssertTrue('irfft2 OpenCL vs CPU on a non-Hermitian spectrum: rel diff = ' +
         FloatToStr(OutDiff) + ' must be < 1e-4', OutDiff < 1e-4);
     finally
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Input -> SpectralConv2D -> SpectralConv2D: both layers in OpenCL with the first
+// one's output bound (sentinels survive), parity against a host twin, then a
+// weight change between OpenCL forwards.
+procedure TTestNeuralNumerical.TestSpectralConv2DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY: power of two; non-powers
+  // of two with ModesX > SizeX div 2; every Y mode kept.
+  csShapes: array[0..2, 0..5] of integer = (
+    (8, 8, 3, 4, 3, 3), (7, 5, 2, 3, 6, 4), (12, 9, 4, 2, 5, 9));
+var
+  NN, NNCPU: TNNet;
+  Input: TNNetVolume;
+  FirstLayer, LastLayer, FirstCPU, LastCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  FirstDiff, LastDiff, ChangedDiff: TNeuralFloat;
+  ShapeName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    ShapeName := IntToStr(csShapes[ShapePos, 0]) + 'x' +
+      IntToStr(csShapes[ShapePos, 1]) + 'x' + IntToStr(csShapes[ShapePos, 2]) +
+      ' modes ' + IntToStr(csShapes[ShapePos, 4]) + 'x' +
+      IntToStr(csShapes[ShapePos, 5]);
+    NN := TNNet.Create();
+    NNCPU := TNNet.Create();
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      FirstLayer := NN.AddLayer(TNNetSpectralConv2D.Create(csShapes[ShapePos, 3],
+        csShapes[ShapePos, 4], csShapes[ShapePos, 5]));
+      LastLayer := NN.AddLayer(TNNetSpectralConv2D.Create(2, 2, 2));
+      NN.SetTrainable(False, False);
+      NNCPU.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      FirstCPU := NNCPU.AddLayer(TNNetSpectralConv2D.Create(csShapes[ShapePos, 3],
+        csShapes[ShapePos, 4], csShapes[ShapePos, 5]));
+      LastCPU := NNCPU.AddLayer(TNNetSpectralConv2D.Create(2, 2, 2));
+      NNCPU.SetTrainable(False, False);
+      NNCPU.CopyWeights(NN);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 2 * Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7) + 0.5;
+      NNCPU.Compute(Input);
+
+      // ForceOpenCL off: the resident input carries both layers to OpenCL.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      FirstLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      OpenCLTransferCounting := WasCounting;
+      SentinelSurvivors := 0;
+      for Pos := 0 to FirstLayer.Output.Size - 1 do
+        if FirstLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      LastDiff := RelMaxDiffToOutput(LastCPU.Output, NN.GetLastLayer.Output);
+      FirstLayer.ForceOutputOnRAM();
+      FirstDiff := RelMaxDiffToOutput(FirstCPU.Output, FirstLayer.Output);
+
+      // A weight change between OpenCL forwards re-uploads the weights.
+      LastLayer.Neurons[0].Weights.Mul(-0.5);
+      LastLayer.FlushWeightCache();
+      LastCPU.Neurons[0].Weights.Mul(-0.5);
+      LastCPU.FlushWeightCache();
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      ChangedDiff := RelMaxDiffToOutput(LastCPU.Output, NN.GetLastLayer.Output);
+      WriteLn('  SpectralConv2D OpenCL ', ShapeName, ': first rel=',
+        FirstDiff:0:9, ' last rel=', LastDiff:0:9, ' after weight change rel=',
+        ChangedDiff:0:9, ' sentinels=', SentinelSurvivors, '/',
+        FirstLayer.Output.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals(ShapeName + ': first layer ran every forward on OpenCL', 3,
+        FirstLayer.ForwardGPUCnt);
+      AssertEquals(ShapeName + ': last layer ran every forward on OpenCL', 3,
+        LastLayer.ForwardGPUCnt);
+      AssertEquals(ShapeName + ': the first output is bound, not downloaded',
+        FirstLayer.Output.Size, SentinelSurvivors);
+      AssertEquals(ShapeName + ': only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals(ShapeName + ': only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue(ShapeName + ': the reference is not degenerate',
+        (FirstCPU.Output.GetMaxAbs() > 0) and (LastCPU.Output.GetMaxAbs() > 0));
+      AssertTrue(ShapeName + ': first layer OpenCL vs CPU rel diff = ' +
+        FloatToStr(FirstDiff) + ' must be < 1e-4', FirstDiff < 1e-4);
+      AssertTrue(ShapeName + ': last layer OpenCL vs CPU rel diff = ' +
+        FloatToStr(LastDiff) + ' must be < 1e-4', LastDiff < 1e-4);
+      AssertTrue(ShapeName + ': after a weight change rel diff = ' +
+        FloatToStr(ChangedDiff) + ' must be < 1e-4', ChangedDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
       Input.Free;
       NNCPU.Free;
       NN.Free;

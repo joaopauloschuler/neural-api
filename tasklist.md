@@ -2161,7 +2161,11 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO).
+- [ ] `TNNetSpectralConv2D` OpenCL forward follow-up: the inverse
+      `cai_rfft2_cols_c2c` launch sums all SizeY rows of the mixed spectrum,
+      though only the first ModesY are nonzero (the mix kernel writes the rest
+      as zeros). If an FNO shows up on the GPU box, give the column kernel a
+      separate input-row count so it skips the zero rows.
 - [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions

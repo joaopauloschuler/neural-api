@@ -2577,6 +2577,51 @@ __kernel void cai_irfft2_rows_c2r
   FDst[g_id] = Sum;
 }
 
+// TNNetSpectralConv2D per-mode channel mixing between the rfft2 kernels above:
+//   Dst[ky, mx, co] = sum_ci W[mx, ky, ci, co] * Src[ky, mx, ci]   (complex),
+// W at 2*(((mx*FModesY + ky)*FInDepth + ci)*FOutDepth + co), Re then Im. Src is
+// (FModesY, FModesX, FInDepth) complex; Dst rows ky >= FModesY are written as 0.
+__kernel void cai_spectral_mode_mix
+(
+  const int FNumOut,
+  const int FModesX,
+  const int FModesY,
+  const int FInDepth,
+  const int FOutDepth,
+  __global const float* FWeights,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int Mode = g_id / FOutDepth;
+  const int co = g_id - Mode * FOutDepth;
+  const int ky = Mode / FModesX;
+  const int mx = Mode - ky * FModesX;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  if (ky < FModesY)
+  {
+    int SrcPos = 2 * Mode * FInDepth;
+    int WPos = 2 * ((mx * FModesY + ky) * FInDepth * FOutDepth + co);
+    const int WStride = 2 * FOutDepth;
+    for (int ci = 0; ci < FInDepth; ci++)
+    {
+      const float xr = FSrc[SrcPos];
+      const float xi = FSrc[SrcPos + 1];
+      const float wr = FWeights[WPos];
+      const float wi = FWeights[WPos + 1];
+      Re = mad(wr, xr, mad(-wi, xi, Re));
+      Im = mad(wr, xi, mad(wi, xr, Im));
+      SrcPos += 2;
+      WPos += WStride;
+    }
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
+}
+
 // CAI Bicubic Gather (separable 4x4 weighted gather forward)
 // Coded by Claude (AI).
 // Device forward for TNNetBicubicUpsample, the 16-corner sibling of
