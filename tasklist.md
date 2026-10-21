@@ -103,7 +103,10 @@ rather than acted on.
       "same seed" noise can then differ by call order (it broke
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
       Saved` followed by an explicit reseed, or a private seeded generator for
-      latent noise. Audit the call sites first.
+      latent noise. Audit the call sites first. PARTLY DONE (37b3922a):
+      `RestartRandSeed(Seed)` (neuralvolume.pas) forces the reseed and
+      `MakeInitialLatents` uses it; the other save/restore sites in neural/
+      are unchanged and could switch to it.
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
@@ -2170,6 +2173,13 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       though only the first ModesY are nonzero (the mix kernel writes the rest
       as zeros). If an FNO shows up on the GPU box, give the column kernel a
       separate input-row count so it skips the zero rows.
+- [ ] Check (not verified): `TNNetSpectralConv2D` (CPU and OpenCL) keeps only
+      the low corner [0..ModesX-1][0..ModesY-1] of the spectrum and takes the
+      real part of the inverse 2-D FFT. The reference FNO `SpectralConv2d`
+      keeps TWO corners along the full-FFT axis (weights1 for the low modes,
+      weights2 for the negative-frequency modes) and uses irfft2. Decide
+      whether to add the second corner (needed to import a torch FNO
+      checkpoint) or document the layer as a one-corner variant.
 - [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
