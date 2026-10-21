@@ -43,6 +43,9 @@ type
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
+    // Writes the linear-projection pico UNet with conv_in widened to 8 input
+    // channels (Marigold: image latent ++ target latent) to Path.
+    procedure WriteMarigoldPicoUNet(const Path: string);
     // Checks tests/fixtures/torch_head/<pFixtureName>/head.pt against that
     // entry of torch_head/expected.json: every tensor and metadata leaf.
     procedure CheckTorchHeadFixture(const pFixtureName: string);
@@ -1087,6 +1090,10 @@ type
     procedure TestMarigoldDepthFromDecoded;
     procedure TestMarigoldNormalsFromDecoded;
     procedure TestResizeImageBilinearNoAntialias;
+    procedure TestMarigoldEmptyPromptStates;
+    procedure TestMarigoldEnsembleDepth;
+    procedure TestMarigoldEnsembleNormals;
+    procedure TestMarigoldPredictSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -42324,33 +42331,18 @@ begin
   end;
 end;
 
-// Marigold building blocks on pico nets: VAE-encode an image to its latent, widen
-// the linear-projection (SD2-style) pico UNet's conv_in to 8 input channels and
-// run MarigoldDenoise with Marigold's scheduler options. A hand-written loop with
-// a per-element concat and diffusers' timesteps 999/749/499/249 must agree.
-procedure TTestNeuralPretrained.TestMarigoldDenoiseSmoke;
+procedure TTestNeuralPretrained.WriteMarigoldPicoUNet(const Path: string);
 const
-  cSteps = 4;
-  cTimesteps: array[0..cSteps - 1] of integer = (999, 749, 499, 249);
   csConvIn = 'conv_in.weight';
 var
   Reader: TNNetSafeTensorsReader;
   Writer: TNNetSafeTensorsWriter;
   V: TNNetVolume;
-  Path, TName: string;
+  TName: string;
   Dims: array of Int64;
   Info: TSafeTensorInfo;
   t, d, TensorCntM1, DimCntM1: integer;
-  Enc, UNet: TNNet;
-  EncCfg: TVaeDecoderConfig;
-  UCfg: TSDUNetConfig;
-  Sched: TNNetDiffusionScheduler;
-  Img, ImageLatent, EncStates, Target, Expected, UNetInput, Pred: TNNetVolume;
-  ImgGrid, LatGrid, LatDepth, i, x, y, c, k, TtPrev: integer;
-  MaxDiff, PredAbsSum: TNeuralFloat;
 begin
-  RandSeed := 424242;
-  Path := GetTempDir(false) + 'cai_marigold_unet8.safetensors';
   Reader := TNNetSafeTensorsReader.Create(
     FixturePath('tiny_sd_unet_linproj.safetensors'));
   Writer := TNNetSafeTensorsWriter.Create(Path);
@@ -42380,6 +42372,29 @@ begin
     Writer.Free;
     Reader.Free;
   end;
+end;
+
+// Marigold building blocks on pico nets: VAE-encode an image to its latent, widen
+// the linear-projection (SD2-style) pico UNet's conv_in to 8 input channels and
+// run MarigoldDenoise with Marigold's scheduler options. A hand-written loop with
+// a per-element concat and diffusers' timesteps 999/749/499/249 must agree.
+procedure TTestNeuralPretrained.TestMarigoldDenoiseSmoke;
+const
+  cSteps = 4;
+  cTimesteps: array[0..cSteps - 1] of integer = (999, 749, 499, 249);
+var
+  Path: string;
+  Enc, UNet: TNNet;
+  EncCfg: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  Img, ImageLatent, EncStates, Target, Expected, UNetInput, Pred: TNNetVolume;
+  ImgGrid, LatGrid, LatDepth, i, x, y, c, k, TtPrev: integer;
+  MaxDiff, PredAbsSum: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_marigold_unet8.safetensors';
+  WriteMarigoldPicoUNet(Path);
   UCfg := ReadSDUNetConfigFromJSONFile(
     FixturePath('tiny_sd_unet_linproj_config.json'));
   UCfg.InChannels := 8;
@@ -42652,6 +42667,243 @@ begin
       AssertEquals('up[' + IntToStr(i) + ']', cUp[i], Image.FData[i], 1e-6);
   finally
     Image.Free;
+  end;
+end;
+
+// A diffusers text_encoder/ folder (flat clip_text_model config + the tiny CLIP
+// weights): the unprojected [Bos, Eos] states times text_projection must equal
+// the projected rows of the full CLIP text net.
+procedure TTestNeuralPretrained.TestMarigoldEmptyPromptStates;
+const
+  cBos = 0;
+  cEos = 2;
+var
+  Folder: string;
+  Root: TJSONData;
+  JsonText: TStringList;
+  Weights: TMemoryStream;
+  Config: TClipConfig;
+  TextNet, VisionNet: TNNet;
+  States, TokenIds, Projection: TNNetVolume;
+  Reader: TNNetSafeTensorsReader;
+  Row, OutPos, HiddenPos, Hidden, ProjDim: integer;
+  Projected, MaxDiff: TNeuralFloat;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) + 'cai_marigold_text_encoder');
+  ForceDirectories(Folder);
+  JsonText := TStringList.Create;
+  Weights := TMemoryStream.Create;
+  Root := nil;
+  TextNet := nil; VisionNet := nil; Reader := nil;
+  States := TNNetVolume.Create; TokenIds := TNNetVolume.Create(2, 1, 1);
+  Projection := TNNetVolume.Create;
+  try
+    JsonText.LoadFromFile(FixturePath('tiny_clip_config.json'));
+    Root := GetJSON(JsonText.Text);
+    JsonText.Text := TJSONObject(Root).Objects['text_config'].FormatJSON();
+    JsonText.SaveToFile(Folder + 'config.json');
+    Weights.LoadFromFile(FixturePath('tiny_clip.safetensors'));
+    Weights.SaveToFile(Folder + 'model.safetensors');
+
+    Config := ReadClipConfigFromJSONFile(Folder + 'config.json');
+    AssertEquals('model_type', 'clip_text_model', Config.ModelType);
+    AssertEquals('hidden', 16, Config.Text.HiddenSize);
+    AssertEquals('max positions', 12, Config.TextMaxPositions);
+    AssertEquals('no vision tower', 0, Config.Vision.HiddenSize);
+
+    MarigoldEmptyPromptStates(Folder, States, cBos, cEos);
+    Hidden := Config.Text.HiddenSize;
+    AssertEquals('states rows', 2, States.SizeX);
+    AssertEquals('states SizeY', 1, States.SizeY);
+    AssertEquals('states width', Hidden, States.Depth);
+
+    BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'), TextNet,
+      VisionNet, Config, {TextSeqLen=}2, {pTrainable=}false,
+      FixturePath('tiny_clip_config.json'));
+    TokenIds.FData[0] := cBos;
+    TokenIds.FData[1] := cEos;
+    TextNet.Compute(TokenIds);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_clip.safetensors'));
+    Reader.LoadTensorFlat('text_projection.weight', Projection);
+    ProjDim := Config.ProjectionDim;
+    MaxDiff := 0;
+    for Row := 0 to 1 do
+      for OutPos := 0 to ProjDim - 1 do
+      begin
+        Projected := 0;
+        for HiddenPos := 0 to Hidden - 1 do
+          Projected := Projected + Projection.FData[OutPos * Hidden + HiddenPos] *
+            States[Row, 0, HiddenPos];
+        MaxDiff := Max(MaxDiff, Abs(Projected -
+          TextNet.GetLastLayer().Output[Row, 0, OutPos]));
+      end;
+    AssertTrue('projected states = CLIP text rows, max|diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+  finally
+    Root.Free; JsonText.Free; Weights.Free; Reader.Free;
+    TextNet.Free; VisionNet.Free;
+    States.Free; TokenIds.Free; Projection.Free;
+    DeleteFile(Folder + 'config.json');
+    DeleteFile(Folder + 'model.safetensors');
+    RemoveDir(Folder);
+  end;
+end;
+
+// Affine copies of one map ensemble to its min-max normalization. Hand case:
+// normalized members (0,.5,1), (0,1,.6), (.2,0,1); median (0,.5,1); least squares
+// gives (0,266,532), (98,413,287), (190,114,494)/532; median (98,266,494) -> (0,14/33,1).
+procedure TTestNeuralPretrained.TestMarigoldEnsembleDepth;
+const
+  cBase: array[0..3] of TNeuralFloat = (0.1, 0.3, 0.9, 0.5);
+  cBaseNormalized: array[0..3] of TNeuralFloat = (0, 0.25, 1, 0.5);
+  cHand: array[0..2, 0..2] of TNeuralFloat = ((0, 0.5, 1), (2, 4, 3.2), (0.2, 0, 1));
+  cHandExpected: array[0..2] of TNeuralFloat = (0, 14 / 33, 1);
+var
+  Members: array[0..2] of TNNetVolume;
+  Dest: TNNetVolume;
+  MemberPos, i: integer;
+begin
+  for MemberPos := 0 to 2 do Members[MemberPos] := TNNetVolume.Create(4, 1, 1);
+  Dest := TNNetVolume.Create;
+  try
+    for i := 0 to 3 do
+    begin
+      Members[0].FData[i] := cBase[i];
+      Members[1].FData[i] := 3 * cBase[i] - 1;
+      Members[2].FData[i] := 0.5 * cBase[i] + 2;
+    end;
+    MarigoldEnsembleDepth(Members, Dest);
+    AssertEquals('SizeX', 4, Dest.SizeX);
+    for i := 0 to 3 do
+      AssertEquals('affine[' + IntToStr(i) + ']', cBaseNormalized[i],
+        Dest.FData[i], 1e-5);
+    for MemberPos := 0 to 2 do
+    begin
+      Members[MemberPos].ReSize(3, 1, 1);
+      for i := 0 to 2 do Members[MemberPos].FData[i] := cHand[MemberPos, i];
+    end;
+    MarigoldEnsembleDepth(Members, Dest);
+    for i := 0 to 2 do
+      AssertEquals('hand[' + IntToStr(i) + ']', cHandExpected[i], Dest.FData[i], 1e-5);
+  finally
+    for MemberPos := 0 to 2 do Members[MemberPos].Free;
+    Dest.Free;
+  end;
+end;
+
+// Pixel 0: (1,0,0), (0,1,0), (.6,.8,0) -> mean direction (1.6,1.8,0)/sqrt(5.8),
+// closest (.6,.8,0). Pixel 1: (0,0,1) twice and (1,0,0) -> (1,0,2)/sqrt(5), closest (0,0,1).
+procedure TTestNeuralPretrained.TestMarigoldEnsembleNormals;
+const
+  cMembers: array[0..2, 0..5] of TNeuralFloat = (
+    (1, 0, 0, 0, 0, 1), (0, 1, 0, 0, 0, 1), (0.6, 0.8, 0, 1, 0, 0));
+  cClosest: array[0..5] of TNeuralFloat = (0.6, 0.8, 0, 0, 0, 1);
+  cMean: array[0..5] of TNeuralFloat = (0.66436384, 0.74740932, 0,
+    0.44721360, 0, 0.89442719);
+var
+  Members: array[0..2] of TNNetVolume;
+  Dest: TNNetVolume;
+  MemberPos, i: integer;
+begin
+  for MemberPos := 0 to 2 do
+  begin
+    Members[MemberPos] := TNNetVolume.Create(2, 1, 3);
+    for i := 0 to 5 do Members[MemberPos].FData[i] := cMembers[MemberPos, i];
+  end;
+  Dest := TNNetVolume.Create;
+  try
+    MarigoldEnsembleNormals(Members, Dest);
+    AssertEquals('Depth', 3, Dest.Depth);
+    for i := 0 to 5 do
+      AssertEquals('closest[' + IntToStr(i) + ']', cClosest[i], Dest.FData[i], 1e-6);
+    MarigoldEnsembleNormals(Members, Dest, {PickClosest=}false);
+    for i := 0 to 5 do
+      AssertEquals('mean[' + IntToStr(i) + ']', cMean[i], Dest.FData[i], 1e-6);
+  finally
+    for MemberPos := 0 to 2 do Members[MemberPos].Free;
+    Dest.Free;
+  end;
+end;
+
+// Pico VAE + 8-channel UNet: a 16x12 image pads to the 16x16 encoder input and
+// comes back 16x12; depth (2 members, ensembled) in [0,1], normals unit length.
+procedure TTestNeuralPretrained.TestMarigoldPredictSmoke;
+const
+  cSteps = 2;
+  cImageX = 16;
+  cImageY = 12;
+var
+  Path: string;
+  Enc, Dec, UNet: TNNet;
+  EncCfg, DecCfg: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  Image, EncStates, Prediction: TNNetVolume;
+  Noises: array[0..1] of TNNetVolume;
+  X, Y, C, NoisePos: integer;
+  PixelNorm: TNeuralFloat;
+begin
+  RandSeed := 424243;
+  Path := GetTempDir(false) + 'cai_marigold_predict_unet8.safetensors';
+  WriteMarigoldPicoUNet(Path);
+  UCfg := ReadSDUNetConfigFromJSONFile(
+    FixturePath('tiny_sd_unet_linproj_config.json'));
+  UCfg.InChannels := 8;
+  UCfg.TextSeqLen := 2;
+  Enc := nil; Dec := nil; UNet := nil; Sched := nil;
+  Image := TNNetVolume.Create(cImageX, cImageY, 3);
+  EncStates := TNNetVolume.Create(2, 1, UCfg.CrossAttentionDim);
+  Prediction := TNNetVolume.Create;
+  for NoisePos := 0 to 1 do
+    Noises[NoisePos] := TNNetVolume.Create(UCfg.LatentGrid, UCfg.LatentGrid,
+      UCfg.OutChannels);
+  try
+    UNet := BuildSDUNetFromSafeTensorsEx(Path, UCfg);
+    Enc := BuildVaeEncoderFromSafeTensors(
+      FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
+      {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
+    Dec := BuildVaeDecoderFromSafeTensors(
+      FixturePath('tiny_vae_decoder.safetensors'), DecCfg,
+      {pTrainable=}true, FixturePath('tiny_vae_decoder_config.json'));
+    Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+      0.00085, 0.012, 0.008, {pRescaleZeroTerminalSNR=}true,
+      {pFinalAlphaBarIsOne=}false);
+    for Y := 0 to cImageY - 1 do
+      for X := 0 to cImageX - 1 do
+        for C := 0 to 2 do
+          Image[X, Y, C] := 0.5 + 0.5 * Sin(0.4 * X + 0.7 * Y + C);
+    EncStates.RandomizeGaussian(0.5);
+    for NoisePos := 0 to 1 do Noises[NoisePos].RandomizeGaussian(1.0);
+
+    MarigoldPredict(Enc, UNet, Dec, UCfg, Sched, Image, EncStates, Noises,
+      cSteps, {ProcessingResolution=}cImageX, {Alignment=}8,
+      {PredictNormals=}false, Prediction);
+    AssertEquals('depth SizeX', cImageX, Prediction.SizeX);
+    AssertEquals('depth SizeY', cImageY, Prediction.SizeY);
+    AssertEquals('depth channels', 1, Prediction.Depth);
+    AssertTrue('depth min >= 0', Prediction.GetMin() >= -1e-6);
+    AssertTrue('depth max <= 1', Prediction.GetMax() <= 1 + 1e-6);
+    AssertTrue('ensembled depth spans [0,1]',
+      Prediction.GetMax() - Prediction.GetMin() > 0.5);
+
+    MarigoldPredict(Enc, UNet, Dec, UCfg, Sched, Image, EncStates, Noises[0],
+      cSteps, {ProcessingResolution=}cImageX, {Alignment=}8,
+      {PredictNormals=}true, Prediction);
+    AssertEquals('normals SizeX', cImageX, Prediction.SizeX);
+    AssertEquals('normals SizeY', cImageY, Prediction.SizeY);
+    AssertEquals('normals channels', 3, Prediction.Depth);
+    for Y := 0 to cImageY - 1 do
+      for X := 0 to cImageX - 1 do
+      begin
+        PixelNorm := Sqrt(Sqr(Prediction[X, Y, 0]) + Sqr(Prediction[X, Y, 1]) +
+          Sqr(Prediction[X, Y, 2]));
+        AssertEquals('unit normal', 1, PixelNorm, 1e-4);
+      end;
+  finally
+    for NoisePos := 0 to 1 do Noises[NoisePos].Free;
+    Image.Free; EncStates.Free; Prediction.Free;
+    Sched.Free; Enc.Free; Dec.Free; UNet.Free;
+    DeleteFile(Path);
   end;
 end;
 

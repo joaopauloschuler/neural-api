@@ -7891,6 +7891,7 @@ type
 // "quick_gelu", layer_norm_eps = 1e-5, eos_token_id = 2, num_channels = 3,
 // projection_dim = 512, logit_scale_init_value = 2.6592. hidden_act other
 // than quick_gelu / gelu / gelu_new / gelu_pytorch_tanh is rejected.
+// model_type "clip_text_model" (a flat CLIPTextConfig) fills the text fields only.
 function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
 
 function ClipConfigToString(const Config: TClipConfig): string;
@@ -7919,6 +7920,12 @@ procedure BuildClipFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TClipConfig;
   TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
+
+// CLIP TEXT tower alone from Reader ("text_model.*"): (SeqLen,1,1) ids -> per-token
+// features; ProjectionTensorName = '' outputs the post-LN last_hidden_state.
+function BuildClipTextTower(Reader: TNNetSafeTensorsReader;
+  const Config: TClipConfig; TextSeqLen: integer;
+  const ProjectionTensorName: string; pTrainable: boolean): TNNet;
 
 // Builds + loads the CLIP ViT VISION tower alone (the reusable half: a
 // plain pre-LN ViT with a class token). Prefix is the tensor-name prefix
@@ -11767,6 +11774,30 @@ procedure MarigoldNormalizeNormals(Normals: TNNetVolume);
 // (NewSizeX, NewSizeY) via a TNNetBilinearResize net; Dest may be Source.
 procedure ResizeImageBilinearNoAntialias(Source, Dest: TNNetVolume;
   NewSizeX, NewSizeY: integer);
+
+// Marigold's empty-prompt UNet states (2,1,hidden): CLIPTextModel last_hidden_state
+// of [Bos, Eos] (diffusers tokenizes "" unpadded) from a text_encoder/ folder.
+procedure MarigoldEmptyPromptStates(const TextEncoderFolder: string;
+  EncStates: TNNetVolume; BosTokenId: integer = 49406;
+  EosTokenId: integer = 49407);
+
+// Depth ensemble of (W,H,1) members: min-max normalize, least-squares scale+shift
+// to their per-pixel median, lower median again, min-max to [0,1].
+procedure MarigoldEnsembleDepth(const Members: array of TNNetVolume;
+  Dest: TNNetVolume);
+
+// Normals ensemble: per pixel the member closest (max cosine) to the renormalized
+// mean (diffusers "closest"), or that mean itself when PickClosest is false.
+procedure MarigoldEnsembleNormals(const Members: array of TNNetVolume;
+  Dest: TNNetVolume; PickClosest: boolean = true);
+
+// Marigold depth (W,H,1 in [0,1]) or normals (W,H,3 unit) at Image's size; one
+// ensemble member per StartNoises latent. UNet TextSeqLen must be EncStates.SizeX.
+procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
+  const UNetConfig: TSDUNetConfig; Sched: TNNetDiffusionScheduler;
+  Image, EncStates: TNNetVolume; const StartNoises: array of TNNetVolume;
+  NumSteps, ProcessingResolution, Alignment: integer; PredictNormals: boolean;
+  Prediction: TNNetVolume; UseFullZRange: boolean = true);
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
 // built with BuildSDUNet(..., pWithControl=true). DownResiduals (the ControlNet
@@ -61123,75 +61154,87 @@ begin
   end;
 end;
 
+function BuildClipTextTower(Reader: TNNetSafeTensorsReader;
+  const Config: TClipConfig; TextSeqLen: integer;
+  const ProjectionTensorName: string; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  SeqLen, BlockCnt, TextNumLayersM1: integer;
+begin
+  if (Config.Text.NumHeads < 1) or
+     ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+    ImportError('CLIP import: text hidden_size=' +
+      IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
+      'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
+  if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+  else SeqLen := TextSeqLen;
+  if SeqLen > Config.TextMaxPositions then
+    ImportError('CLIP import: requested TextSeqLen=' +
+      IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+      IntToStr(Config.TextMaxPositions) + '.');
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+    // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
+    TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+      Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+    SetLength(Blocks, Config.Text.NumLayers);
+    TextNumLayersM1 := Config.Text.NumLayers - 1;
+    for BlockCnt := 0 to TextNumLayersM1 do
+      AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
+        Blocks[BlockCnt], pTrainable);
+    FinalLN := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
+    // text_projection applied PER TOKEN; HF's text_embeds is the row at
+    // the eot position (ClipTextEosPosition).
+    Proj := nil;
+    if ProjectionTensorName <> '' then
+      Proj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    LoadClipEmbeddingTable(Reader, TokEmb,
+      'text_model.embeddings.token_embedding.weight',
+      Config.TextVocabSize, Config.Text.HiddenSize);
+    LoadClipEmbeddingTable(Reader, PosEmb,
+      'text_model.embeddings.position_embedding.weight',
+      Config.TextMaxPositions, Config.Text.HiddenSize);
+    for BlockCnt := 0 to TextNumLayersM1 do
+      LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+        Config.Text);
+    LoadLayerNormWeights(Reader, FinalLN,
+      'text_model.final_layer_norm.weight',
+      'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+    if Proj <> nil then
+      LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
+        Config.Text.HiddenSize, Config.ProjectionDim); // bias-free
+  except
+    NN.Free;
+    raise;
+  end;
+  Result := NN;
+end;
+
 procedure BuildClipFromSafeTensorsWithConfig(const FileName: string;
   var Config: TClipConfig; out TextNet, VisionNet: TNNet;
   TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
-  NN: TNNet;
-  TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
-  Blocks: TClipBlockLayersArray;
   Tmp: TNNetVolume;
-  SeqLen, BlockCnt, TextNumLayersM1: integer;
 begin
   TextNet := nil;
   VisionNet := nil;
   Reader := CreatePretrainedTensorReader(FileName);
-  NN := nil;
   try
     try
-      if (Config.Text.NumHeads < 1) or
-         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
-        ImportError('CLIP import: text hidden_size=' +
-          IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
-          'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
-      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
-      else SeqLen := TextSeqLen;
-      if SeqLen > Config.TextMaxPositions then
-        ImportError('CLIP import: requested TextSeqLen=' +
-          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
-          IntToStr(Config.TextMaxPositions) + '.');
-
-      // ---------------- TEXT tower architecture ----------------
-      NN := TNNet.Create();
-      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
-      // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
-      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
-      PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
-      if not pTrainable then NN.SetTrainable();
-      SetLength(Blocks, Config.Text.NumLayers);
-      TextNumLayersM1 := Config.Text.NumLayers - 1;
-      for BlockCnt := 0 to TextNumLayersM1 do
-        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
-          Blocks[BlockCnt], pTrainable);
-      FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
-      // text_projection applied PER TOKEN; HF's text_embeds is the row at
-      // the eot position (ClipTextEosPosition).
-      Proj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
-      if not pTrainable then NN.SetTrainable();
-
-      // ---------------- TEXT tower weights ----------------
-      LoadClipEmbeddingTable(Reader, TokEmb,
-        'text_model.embeddings.token_embedding.weight',
-        Config.TextVocabSize, Config.Text.HiddenSize);
-      LoadClipEmbeddingTable(Reader, PosEmb,
-        'text_model.embeddings.position_embedding.weight',
-        Config.TextMaxPositions, Config.Text.HiddenSize);
-      for BlockCnt := 0 to TextNumLayersM1 do
-        LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
-          'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
-          Config.Text);
-      LoadLayerNormWeights(Reader, FinalLN,
-        'text_model.final_layer_norm.weight',
-        'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
-      LoadLlamaLinearWeights(Reader, Proj, 'text_projection.weight',
-        Config.Text.HiddenSize, Config.ProjectionDim); // bias-free
-      TextNet := NN;
-      NN := nil;
+      TextNet := BuildClipTextTower(Reader, Config, TextSeqLen,
+        'text_projection.weight', pTrainable);
 
       // ---------------- VISION tower ----------------
       VisionNet := BuildClipVisionTower(Reader, Config.Vision,
@@ -61211,7 +61254,6 @@ begin
         end;
       end;
     except
-      NN.Free;
       TextNet.Free;
       TextNet := nil;
       VisionNet.Free;
@@ -61297,12 +61339,13 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'clip');
-    if ModelType <> 'clip' then
+    if (ModelType <> 'clip') and (ModelType <> 'clip_text_model') then
       ImportError('CLIP import: config model_type is "' + ModelType +
-        '" - only "clip" is supported here (see BuildFromPretrained ' +
-        'for the full dispatch).');
+        '" - only "clip" and "clip_text_model" are supported here (see ' +
+        'BuildFromPretrained for the full dispatch).');
     Result.ModelType := ModelType;
-    TowerObj := RequiredSubObject('text_config');
+    if ModelType = 'clip_text_model' then TowerObj := Obj
+    else TowerObj := RequiredSubObject('text_config');
     ReadTower(TowerObj, Result.Text);
     Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
     Result.TextMaxPositions :=
@@ -61311,13 +61354,22 @@ begin
     // CLIP config carries; it selects the ARGMAX pooling branch (see
     // ClipTextEosPosition).
     Result.EosTokenId := TowerObj.Get('eos_token_id', 2);
+    Result.ProjectionDim := Obj.Get('projection_dim', 512);
+    Result.LogitScale := Obj.Get('logit_scale_init_value', 2.6592);
+    if ModelType = 'clip_text_model' then
+    begin
+      // Text tower alone (a diffusers text_encoder/): no vision fields.
+      FillChar(Result.Vision, SizeOf(Result.Vision), 0);
+      Result.ImageSize := 0;
+      Result.PatchSize := 0;
+      Result.NumChannels := 0;
+      exit;
+    end;
     TowerObj := RequiredSubObject('vision_config');
     ReadTower(TowerObj, Result.Vision);
     Result.ImageSize := RequiredInt(TowerObj, 'image_size');
     Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
     Result.NumChannels := TowerObj.Get('num_channels', 3);
-    Result.ProjectionDim := Obj.Get('projection_dim', 512);
-    Result.LogitScale := Obj.Get('logit_scale_init_value', 2.6592);
   finally
     Root.Free;
     JsonText.Free;
@@ -74804,6 +74856,208 @@ begin
   end;
 end;
 
+// Per-pixel lower median (torch.median) of Members into Dest; Values: scratch of
+// Length(Members) elements.
+procedure MarigoldMemberMedian(const Members: array of TNNetVolume;
+  Dest: TNNetVolume; var Values: array of TNeuralFloat);
+var
+  PixelPos, MaxPixelPos, MemberPos, MaxMemberPos, SortPos, MedianPos: integer;
+  Value: TNeuralFloat;
+begin
+  MaxMemberPos := High(Members);
+  MedianPos := MaxMemberPos div 2;
+  Dest.ReSize(Members[0]);
+  MaxPixelPos := Dest.Size - 1;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    // Insertion sort: ensembles hold a handful of members.
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      Value := Members[MemberPos].FData[PixelPos];
+      SortPos := MemberPos;
+      while (SortPos > 0) and (Values[SortPos - 1] > Value) do
+      begin
+        Values[SortPos] := Values[SortPos - 1];
+        Dec(SortPos);
+      end;
+      Values[SortPos] := Value;
+    end;
+    Dest.FData[PixelPos] := Values[MedianPos];
+  end;
+end;
+
+// Dest := (Dest - min) / max(max - min, 1e-6) (diffusers ensemble_depth range).
+procedure MarigoldMinMaxNormalize(Dest: TNNetVolume);
+var
+  MinValue: TNeuralFloat;
+begin
+  MinValue := Dest.GetMin();
+  Dest.Add(-MinValue);
+  Dest.Mul(1 / Max(Dest.GetMax(), 1e-6));
+end;
+
+procedure MarigoldEnsembleDepth(const Members: array of TNNetVolume;
+  Dest: TNNetVolume);
+var
+  Aligned: array of TNNetVolume;
+  Values: array of TNeuralFloat;
+  Reference: TNNetVolume;
+  MemberCount, MemberPos, MaxMemberPos: integer;
+  MeanAligned, MeanReference, Covariance, Variance, Scale: TNeuralFloat;
+begin
+  MemberCount := Length(Members);
+  if MemberCount < 1 then
+    ImportError('MarigoldEnsembleDepth: no members.');
+  MaxMemberPos := MemberCount - 1;
+  for MemberPos := 0 to MaxMemberPos do
+    if (Members[MemberPos].Depth <> 1) or
+      not Members[MemberPos].SameSize(Members[0]) then
+      ImportError('MarigoldEnsembleDepth: members must share one (W,H,1) size.');
+  SetLength(Aligned, MemberCount);
+  SetLength(Values, MemberCount);
+  Reference := TNNetVolume.Create();
+  try
+    // diffusers init_param: each member min-max normalized.
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      Aligned[MemberPos] := TNNetVolume.Create(Members[MemberPos]);
+      MarigoldMinMaxNormalize(Aligned[MemberPos]);
+    end;
+    // Closed-form least squares s*a+t ~ median replaces diffusers' BFGS refinement.
+    MarigoldMemberMedian(Aligned, Reference, Values);
+    MeanReference := Reference.GetAvg();
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      MeanAligned := Aligned[MemberPos].GetAvg();
+      Aligned[MemberPos].Add(-MeanAligned);
+      // Centered a: sum((a-ma)*(r-mr)) = sum((a-ma)*r).
+      Covariance := Aligned[MemberPos].DotProduct(Reference);
+      Variance := Aligned[MemberPos].DotProduct(Aligned[MemberPos]);
+      if Variance > 0 then Scale := Covariance / Variance
+      else Scale := 0;
+      Aligned[MemberPos].Mul(Scale);
+      Aligned[MemberPos].Add(MeanReference);
+    end;
+    MarigoldMemberMedian(Aligned, Dest, Values);
+    MarigoldMinMaxNormalize(Dest);
+  finally
+    for MemberPos := 0 to MaxMemberPos do
+      Aligned[MemberPos].Free;
+    Reference.Free;
+  end;
+end;
+
+procedure MarigoldEnsembleNormals(const Members: array of TNNetVolume;
+  Dest: TNNetVolume; PickClosest: boolean);
+var
+  MemberCount, MemberPos, MaxMemberPos, ClosestPos: integer;
+  ChannelCount, PixelOffset, MaxPixelOffset: integer;
+  Similarity, BestSimilarity: TNeuralFloat;
+  MeanPtr: TNeuralFloatArrPtr;
+begin
+  MemberCount := Length(Members);
+  if MemberCount < 1 then
+    ImportError('MarigoldEnsembleNormals: no members.');
+  MaxMemberPos := MemberCount - 1;
+  for MemberPos := 1 to MaxMemberPos do
+    if not Members[MemberPos].SameSize(Members[0]) then
+      ImportError('MarigoldEnsembleNormals: members differ in size.');
+  Dest.ReSize(Members[0]);
+  Dest.Copy(Members[0]);
+  for MemberPos := 1 to MaxMemberPos do
+    Dest.Add(Members[MemberPos]);
+  Dest.Mul(1 / MemberCount);
+  MarigoldNormalizeNormals(Dest);
+  if not PickClosest then exit;
+  ChannelCount := Dest.Depth;
+  MaxPixelOffset := Dest.Size - ChannelCount;
+  PixelOffset := 0;
+  while PixelOffset <= MaxPixelOffset do
+  begin
+    MeanPtr := TNeuralFloatArrPtr(@Dest.FData[PixelOffset]);
+    // argmax keeps the first maximum, as torch does.
+    ClosestPos := 0;
+    BestSimilarity := TNNetVolume.DotProduct(MeanPtr,
+      TNeuralFloatArrPtr(@Members[0].FData[PixelOffset]), ChannelCount);
+    for MemberPos := 1 to MaxMemberPos do
+    begin
+      Similarity := TNNetVolume.DotProduct(MeanPtr,
+        TNeuralFloatArrPtr(@Members[MemberPos].FData[PixelOffset]), ChannelCount);
+      if Similarity > BestSimilarity then
+      begin
+        BestSimilarity := Similarity;
+        ClosestPos := MemberPos;
+      end;
+    end;
+    Move(Members[ClosestPos].FData[PixelOffset], MeanPtr^,
+      ChannelCount * SizeOf(TNeuralFloat));
+    Inc(PixelOffset, ChannelCount);
+  end;
+end;
+
+procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
+  const UNetConfig: TSDUNetConfig; Sched: TNNetDiffusionScheduler;
+  Image, EncStates: TNNetVolume; const StartNoises: array of TNNetVolume;
+  NumSteps, ProcessingResolution, Alignment: integer; PredictNormals: boolean;
+  Prediction: TNNetVolume; UseFullZRange: boolean);
+var
+  Members: array of TNNetVolume;
+  Padded, ImageLatent, Target, UNetInput, Pred, Decoded, Field,
+    Ensembled: TNNetVolume;
+  EncoderInput: TNNetVolume;
+  PadX, PadY, MemberCount, MemberPos, MaxMemberPos: integer;
+begin
+  MemberCount := Length(StartNoises);
+  if MemberCount < 1 then
+    ImportError('MarigoldPredict: no starting noise.');
+  MaxMemberPos := MemberCount - 1;
+  SetLength(Members, MemberCount);
+  for MemberPos := 0 to MaxMemberPos do
+    Members[MemberPos] := TNNetVolume.Create();
+  Padded := TNNetVolume.Create(); ImageLatent := TNNetVolume.Create();
+  Target := TNNetVolume.Create(); UNetInput := TNNetVolume.Create();
+  Pred := TNNetVolume.Create(); Decoded := TNNetVolume.Create();
+  Field := TNNetVolume.Create(); Ensembled := TNNetVolume.Create();
+  try
+    MarigoldPreprocessImage(Image, Padded, ProcessingResolution, Alignment,
+      {PadToSquare=}true, PadX, PadY);
+    EncoderInput := VaeEncoder.Layers[0].Output;
+    if not Padded.SameSize(EncoderInput) then
+      ImportError('MarigoldPredict: padded image ' + IntToStr(Padded.SizeX) + 'x' +
+        IntToStr(Padded.SizeY) + 'x' + IntToStr(Padded.Depth) +
+        ' does not match the VAE encoder input ' + IntToStr(EncoderInput.SizeX) +
+        'x' + IntToStr(EncoderInput.SizeY) + 'x' + IntToStr(EncoderInput.Depth) + '.');
+    VaeEncoder.Compute(Padded);
+    VaeEncoder.GetOutput(ImageLatent);
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      Target.Copy(StartNoises[MemberPos]);
+      MarigoldDenoise(UNet, UNetConfig, ImageLatent, EncStates, Sched, NumSteps,
+        Target, UNetInput, Pred);
+      VaeDecoder.Compute(Target);
+      VaeDecoder.GetOutput(Decoded);
+      if PredictNormals then
+        MarigoldNormalsFromDecoded(Decoded, Field, UseFullZRange)
+      else
+        MarigoldDepthFromDecoded(Decoded, Field);
+      MarigoldUnpadImage(Field, Members[MemberPos], PadX, PadY);
+    end;
+    if MemberCount = 1 then
+      Ensembled.Copy(Members[0])
+    else if PredictNormals then
+      MarigoldEnsembleNormals(Members, Ensembled)
+    else
+      MarigoldEnsembleDepth(Members, Ensembled);
+    ResizeImageBilinearNoAntialias(Ensembled, Prediction, Image.SizeX, Image.SizeY);
+    if PredictNormals then MarigoldNormalizeNormals(Prediction);
+  finally
+    for MemberPos := 0 to MaxMemberPos do
+      Members[MemberPos].Free;
+    Padded.Free; ImageLatent.Free; Target.Free; UNetInput.Free;
+    Pred.Free; Decoded.Free; Field.Free; Ensembled.Free;
+  end;
+end;
+
 function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
 var
   i, Cnt: integer;
@@ -87922,6 +88176,39 @@ function SafeTensorsFolderWeightsFile(const Folder, Stem: string): string;
 begin
   Result := Folder + Stem + '.safetensors.index.json';
   if not FileExists(Result) then Result := Folder + Stem + '.safetensors';
+end;
+
+procedure MarigoldEmptyPromptStates(const TextEncoderFolder: string;
+  EncStates: TNNetVolume; BosTokenId: integer; EosTokenId: integer);
+var
+  Folder: string;
+  Config: TClipConfig;
+  Reader: TNNetSafeTensorsReader;
+  TextNet: TNNet;
+  TokenIds: TNNetVolume;
+begin
+  Folder := IncludeTrailingPathDelimiter(TextEncoderFolder);
+  Config := ReadClipConfigFromJSONFile(Folder + 'config.json');
+  if (BosTokenId < 0) or (BosTokenId >= Config.TextVocabSize) or
+    (EosTokenId < 0) or (EosTokenId >= Config.TextVocabSize) then
+    ImportError('MarigoldEmptyPromptStates: token ids ' + IntToStr(BosTokenId) +
+      ', ' + IntToStr(EosTokenId) + ' outside vocab_size ' +
+      IntToStr(Config.TextVocabSize) + '.');
+  Reader := CreatePretrainedTensorReader(
+    SafeTensorsFolderWeightsFile(Folder, 'model'));
+  TextNet := nil;
+  TokenIds := TNNetVolume.Create(2, 1, 1);
+  try
+    TextNet := BuildClipTextTower(Reader, Config, 2, '', {pTrainable=}false);
+    TokenIds.FData[0] := BosTokenId;
+    TokenIds.FData[1] := EosTokenId;
+    TextNet.Compute(TokenIds);
+    TextNet.GetOutput(EncStates);
+  finally
+    TokenIds.Free;
+    TextNet.Free;
+    Reader.Free;
+  end;
 end;
 
 const

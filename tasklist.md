@@ -291,7 +291,7 @@ rather than acted on.
             instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
             + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
             ab_t = 1 (Beta1 = 0). Not needed by Marigold.
-      - [ ] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
+      - [X] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
             landed `MarigoldDenoise`, split into:
             - [X] 2a. Grid: pad (`MarigoldPreprocessImage` PadToSquare +
                   Alignment, `MarigoldUnpadImage`, shared `PadImageClampToEdge`);
@@ -300,19 +300,26 @@ rather than acted on.
                   latent divisible by 2^(blocks-1), so pass Alignment = 64 for SD2.
             - [X] 2b. Preprocess: `MarigoldPreprocessImage` ([0,1] -> [-1,1],
                   long side via `ResizeImagePIL` irfBilinear, then the 2a pad).
-            - [ ] 2c. Empty-prompt states: load the 1024-wide SD2 CLIP text
-                  encoder from `text_encoder/`, embed "" once, cache it; check
-                  the SD2 config loads.
+            - [X] 2c. Empty-prompt states: `MarigoldEmptyPromptStates(Folder,
+                  EncStates)` -> (2,1,hidden) last_hidden_state of [49406, 49407]
+                  (diffusers tokenizes "" with do_not_pad, so the UNet TextSeqLen
+                  is 2); caller caches it. `ReadClipConfigFromJSONFile` now takes
+                  flat `clip_text_model` configs; new `BuildClipTextTower`.
             - [X] 2d. `MarigoldDepthFromDecoded`, `MarigoldNormalsFromDecoded`
                   (+ `MarigoldNormalizeNormals` again after the resize),
                   `ResizeImageBilinearNoAntialias` (diffusers is_aa=False);
                   BuildVaeDecoder applies 1/scaling_factor. Order: decode,
                   depth/normals, unpad, (ensemble), resize.
-            - [ ] 2e. `MarigoldPredict` chaining 2a-2d, starting noise as a
-                  parameter (for the parity fixture), pico smoke test.
-            - [ ] 2f. Ensemble over N noise seeds: depth members aligned by
-                  least-squares scale+shift then median; normals mean then
-                  renormalize.
+            - [X] 2e. `MarigoldPredict(VaeEncoder, UNet, VaeDecoder, UNetConfig,
+                  Sched, Image, EncStates, StartNoises, NumSteps,
+                  ProcessingResolution, Alignment, PredictNormals, Prediction)`;
+                  one ensemble member per StartNoises latent; pico smoke test.
+            - [X] 2f. `MarigoldEnsembleDepth`: min-max normalize, closed-form
+                  least-squares scale+shift to the per-pixel median, lower median,
+                  min-max to [0,1]. DEVIATION: diffusers refines scale/shift with
+                  BFGS (max_iter 2) on pairwise RMS + range regularizer.
+                  `MarigoldEnsembleNormals`: diffusers "closest" (default) or mean.
+                  No uncertainty output.
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
