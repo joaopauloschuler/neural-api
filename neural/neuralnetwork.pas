@@ -9398,18 +9398,39 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Parent of the four norm layers that run on the TNNetTokenNormCL helper:
+  // owns the helper, arms and releases it and answers the output accessors.
+  // Coded by Claude (AI).
+  TNNetNormWithOpenCL = class(TNNetIdentityWithoutL2)
+    {$IFDEF OpenCL}
+    protected
+      FTokenNormCL: TNNetTokenNormCL;
+      // Returns the previous layer's output buffer when it is bindable at this
+      // size, else nil after staging that output in FOutput for the upload.
+      function BindOrStageSourceOnOpenCL(): cl_mem;
+    public
+      destructor Destroy(); override;
+      // Per-token rule: inference also follows a bindable source of any size.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLBufferBytes(): int64; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
+  end;
+
   /// This layer does a proper per-sample layer normalization. Each input
   // sample (all elements across SizeX*SizeY*Depth) is normalized to zero mean
   // and unit variance, then a learnable per-element scale (gamma) and bias
   // (beta) are applied. Output has the same shape as the input.
   // Coded by Claude (AI).
-  TNNetLayerNorm = class(TNNetIdentityWithoutL2)
+  TNNetLayerNorm = class(TNNetNormWithOpenCL)
     private
       FLayerNormEpsilon: TNeuralFloat;
       FInvStdDev: TNeuralFloat;
       FNormalized: TNNetVolume;
       {$IFDEF OpenCL}
-      FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
       // Releases FNormalized: it is read only by Backpropagate, so an
@@ -9426,9 +9447,6 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
   end;
 
@@ -9453,7 +9471,7 @@ type
   // over all tokens. pElementwiseAffine=false (FStruct[0]=1) is
   // nn.LayerNorm(elementwise_affine=False): no neurons, y = x_hat.
   // Coded by Claude (AI).
-  TNNetTokenLayerNorm = class(TNNetIdentityWithoutL2)
+  TNNetTokenLayerNorm = class(TNNetNormWithOpenCL)
     private
       FTokenLNEpsilon: TNeuralFloat;
       FElementwiseAffine: boolean;
@@ -9466,7 +9484,6 @@ type
       FGammaGradScratch: TNNetVolume; // Depth-length backward gamma-grad accumulator
       FBetaGradScratch: TNNetVolume;  // Depth-length backward beta-grad accumulator
       {$IFDEF OpenCL}
-      FTokenNormCL: TNNetTokenNormCL;
       // Binds a source in OpenCL memory (else uploads it) and leaves the result
       // there for the next layer.
       procedure ComputeOpenCL();
@@ -9486,14 +9503,6 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
-      {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      function OpenCLOutputBuffer(): cl_mem; override;
-      function OpenCLBufferBytes(): int64; override;
-      function OpenCLOutputKernel(): TNeuralKernel; override;
-      {$ENDIF}
       property ElementwiseAffine: boolean read FElementwiseAffine;
   end;
 
@@ -9503,13 +9512,12 @@ type
   // per-element scale (gamma) is applied. Output has the same shape as the
   // input. This is a cheaper, transformer-friendly variant of TNNetLayerNorm.
   // Coded by Claude (AI).
-  TNNetRMSNorm = class(TNNetIdentityWithoutL2)
+  TNNetRMSNorm = class(TNNetNormWithOpenCL)
     private
       FRMSNormEpsilon: TNeuralFloat;
       FInvRMS: TNeuralFloat;
       FNormalized: TNNetVolume;
       {$IFDEF OpenCL}
-      FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
       // Releases FNormalized: it is read only by Backpropagate, so an
@@ -9527,11 +9535,6 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      function OpenCLOutputBuffer(): cl_mem; override;
-      function OpenCLBufferBytes(): int64; override;
-      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -9550,14 +9553,13 @@ type
   // exact per-token RMSNorm Jacobian and accumulates the gain gradient
   // over all tokens.
   // Coded by Claude (AI).
-  TNNetTokenRMSNorm = class(TNNetIdentityWithoutL2)
+  TNNetTokenRMSNorm = class(TNNetNormWithOpenCL)
     private
       FTokenRMSEpsilon: TNeuralFloat;
       FNormalized: TNNetVolume;   // x_hat = x * invRMS, same shape as input
       FInvRMS: TNNetVolume;       // per-segment 1/sqrt(mean(x^2)+eps)
       FGainGradScratch: TNNetVolume; // FNormDim-length backward gain-grad accumulator
       {$IFDEF OpenCL}
-      FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -9602,14 +9604,8 @@ type
       // ComputeRange spans the tokens. Coded by Claude (AI).
       function ChunkWorkCount(): integer; override;
       {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      function OpenCLOutputBuffer(): cl_mem; override;
-      function OpenCLBufferBytes(): int64; override;
       function CanShareOpenCLOutput(): boolean; override;
       procedure AdoptOpenCLOutputBuffer(Buffer: cl_mem; Bytes: csize_t); override;
-      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -83342,6 +83338,75 @@ begin
   Result := inherited GetMaxAbsoluteDelta() * 0.01;
 end;
 
+{ TNNetNormWithOpenCL }
+{$IFDEF OpenCL}
+destructor TNNetNormWithOpenCL.Destroy();
+begin
+  FreeAndNil(FTokenNormCL);
+  inherited Destroy();
+end;
+
+function TNNetNormWithOpenCL.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FTokenNormCL) and FHasOpenCL
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+procedure TNNetNormWithOpenCL.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FTokenNormCL) then
+    FTokenNormCL := TNNetTokenNormCL.Create(FNN);
+end;
+
+procedure TNNetNormWithOpenCL.DisableOpenCL();
+begin
+  // FTokenNormCL owns the buffer a kept output lives in, so the host copy has
+  // to be recovered before the helper goes.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FTokenNormCL);
+end;
+
+function TNNetNormWithOpenCL.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetNormWithOpenCL.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
+end;
+
+function TNNetNormWithOpenCL.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetNormWithOpenCL.BindOrStageSourceOnOpenCL(): cl_mem;
+begin
+  if PrevOutputOnOpenCLSameSize() then
+  begin
+    // Read the source where it lies. The result goes to the helper's own output
+    // buffer, so input and output are distinct handles and never alias.
+    Result := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
+  end
+  else
+  begin
+    // Nothing to bind: bring the source back and stage it in FOutput, which is
+    // what the inherited Compute would have done and what the upload reads.
+    Result := nil;
+    FPrevLayer.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  end;
+end;
+{$ENDIF}
+
 { TNNetLayerNorm }
 constructor TNNetLayerNorm.Create();
 begin
@@ -83353,9 +83418,6 @@ end;
 
 destructor TNNetLayerNorm.Destroy();
 begin
-  {$IFDEF OpenCL}
-  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
-  {$ENDIF}
   FNormalized.Free;
   inherited Destroy();
 end;
@@ -83429,29 +83491,11 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// ComputeOpenCL never binds a source, so a bindable one is no route in.
 function TNNetLayerNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FTokenNormCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
-end;
-
-procedure TNNetLayerNorm.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FTokenNormCL);
-end;
-
-function TNNetLayerNorm.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes();
-  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
-end;
-
-procedure TNNetLayerNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FTokenNormCL) then
-    FTokenNormCL := TNNetTokenNormCL.Create(FNN);
 end;
 
 // Device whole-volume LayerNorm forward: the cai_volume_norm kernel reduces
@@ -83563,9 +83607,6 @@ end;
 
 destructor TNNetTokenLayerNorm.Destroy();
 begin
-  {$IFDEF OpenCL}
-  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
-  {$ENDIF}
   FBetaGradScratch.Free;
   FGammaGradScratch.Free;
   FZeros.Free;
@@ -83721,47 +83762,6 @@ begin
 end;
 
 {$IFDEF OpenCL}
-function TNNetTokenLayerNorm.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL
-                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
-end;
-
-procedure TNNetTokenLayerNorm.DisableOpenCL();
-begin
-  // FTokenNormCL owns the buffer a kept output lives in, so the host copy has
-  // to be recovered before the helper goes.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  FreeAndNil(FTokenNormCL);
-end;
-
-procedure TNNetTokenLayerNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FTokenNormCL) then
-    FTokenNormCL := TNNetTokenNormCL.Create(FNN);
-end;
-
-function TNNetTokenLayerNorm.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
-  else Result := nil;
-end;
-
-function TNNetTokenLayerNorm.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes();
-  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
-end;
-
-function TNNetTokenLayerNorm.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
-  else Result := nil;
-end;
-
 // OpenCL per-token LayerNorm forward (mean and biased-variance reduction over
 // the Depth segment, then gamma .* x_hat + beta), the formula of Compute().
 procedure TNNetTokenLayerNorm.ComputeOpenCL();
@@ -83772,19 +83772,7 @@ var
 begin
   // cai_volume_norm reads the tokens as contiguous Depth segments, the order a
   // source buffer already holds.
-  if PrevOutputOnOpenCLSameSize() then
-  begin
-    // The result goes to the helper's own buffer: input and output never alias.
-    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
-  end
-  else
-  begin
-    // Nothing to bind: stage the source in FOutput, which the upload reads.
-    SourceBuffer := nil;
-    FPrevLayer.ForceOutputOnRAM();
-    FOutput.CopyNoChecks(FPrevLayer.FOutput);
-  end;
+  SourceBuffer := BindOrStageSourceOnOpenCL();
   Depth := FOutput.Depth;
   NumTokens := FOutput.Size div Depth;
   // Inference keeps the result in OpenCL memory (a host reader calls
@@ -83917,9 +83905,6 @@ end;
 
 destructor TNNetRMSNorm.Destroy();
 begin
-  {$IFDEF OpenCL}
-  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
-  {$ENDIF}
   FNormalized.Free;
   inherited Destroy();
 end;
@@ -84017,41 +84002,6 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetRMSNorm.DisableOpenCL();
-begin
-  // FTokenNormCL owns the buffer a resident output lives in, so the host copy
-  // has to be recovered before the helper goes.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  FreeAndNil(FTokenNormCL);
-end;
-
-procedure TNNetRMSNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FTokenNormCL) then
-    FTokenNormCL := TNNetTokenNormCL.Create(FNN);
-  // FShouldOpenCL stays false (pinned in SetPrevLayer); was: FShouldOpenCL := true;
-end;
-
-function TNNetRMSNorm.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
-  else Result := nil;
-end;
-
-function TNNetRMSNorm.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes();
-  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
-end;
-
-function TNNetRMSNorm.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
-  else Result := nil;
-end;
-
 // Device whole-volume RMSNorm forward: the cai_volume_norm kernel (UseMean=
 // false) cooperatively reduces mean(x^2) over the entire sample with one work-
 // group and applies the per-element gamma. Bias passed nil (no beta).
@@ -84060,25 +84010,11 @@ procedure TNNetRMSNorm.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
 begin
-  if PrevOutputOnOpenCLSameSize() then
-  begin
-    // Read the source where it lies. The result goes to the helper's own output
-    // buffer, so input and output are distinct handles and never alias.
-    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
-  end
-  else
-  begin
-    // Nothing to bind: bring the source back and stage it in FOutput, which is
-    // what the inherited Compute would have done and what the upload reads.
-    SourceBuffer := nil;
-    FPrevLayer.ForceOutputOnRAM();
-    FOutput.CopyNoChecks(FPrevLayer.FOutput);
-  end;
+  SourceBuffer := BindOrStageSourceOnOpenCL();
   // The result stays on the device for the next layer to bind. WillOpenCL is
   // inference-only, so no host reader is left behind: anything that wants
-  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
-  // accessors above.
+  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the
+  // TNNetNormWithOpenCL output accessors.
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
     FOutput, {NumSegments=}1, FOutput.Size, {UseMean=}false, FRMSNormEpsilon,
     {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
@@ -84167,9 +84103,6 @@ end;
 
 destructor TNNetTokenRMSNorm.Destroy();
 begin
-  {$IFDEF OpenCL}
-  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
-  {$ENDIF}
   FGainGradScratch.Free;
   FInvRMS.Free;
   FNormalized.Free;
@@ -84324,41 +84257,6 @@ begin
 end;
 
 {$IFDEF OpenCL}
-function TNNetTokenRMSNorm.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL
-                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
-end;
-
-procedure TNNetTokenRMSNorm.DisableOpenCL();
-begin
-  // FTokenNormCL owns the buffer a kept output lives in, so the host copy has
-  // to be recovered before the helper goes.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  FreeAndNil(FTokenNormCL);
-end;
-
-procedure TNNetTokenRMSNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FTokenNormCL) then
-    FTokenNormCL := TNNetTokenNormCL.Create(FNN);
-end;
-
-function TNNetTokenRMSNorm.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
-  else Result := nil;
-end;
-
-function TNNetTokenRMSNorm.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes();
-  if Assigned(FTokenNormCL) then Result := Result + FTokenNormCL.BufferBytes();
-end;
-
 function TNNetTokenRMSNorm.CanShareOpenCLOutput(): boolean;
 begin
   Result := (not FIsTrainable) and Assigned(FTokenNormCL);
@@ -84370,12 +84268,6 @@ begin
   FTokenNormCL.AdoptResultBuffer(Buffer, Bytes);
 end;
 
-function TNNetTokenRMSNorm.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
-  else Result := nil;
-end;
-
 // OpenCL per-token RMSNorm forward (sum-of-squares reduction over the FNormDim
 // segment, no mean subtraction, then gain .* x_hat), bit-faithful to the scalar
 // Compute() above.
@@ -84385,21 +84277,7 @@ var
   SourceBuffer: cl_mem;
   KeepOnOpenCL: boolean;
 begin
-  if PrevOutputOnOpenCLSameSize() then
-  begin
-    // Read the source where it lies. The result goes to the helper's own output
-    // buffer, so input and output are distinct handles and never alias.
-    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
-  end
-  else
-  begin
-    // Nothing to bind: bring the source back and stage it in FOutput, which is
-    // what the inherited Compute would have done and what the upload reads.
-    SourceBuffer := nil;
-    FPrevLayer.ForceOutputOnRAM();
-    FOutput.CopyNoChecks(FPrevLayer.FOutput);
-  end;
+  SourceBuffer := BindOrStageSourceOnOpenCL();
   Depth := FNormDim;
   NumTokens := FOutput.Size div Depth;
   // Inference keeps the result in OpenCL memory (a host reader calls
