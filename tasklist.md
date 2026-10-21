@@ -87,7 +87,7 @@ rather than acted on.
       PixelShuffle order.
 
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
-      (neural/neuralvolume.pas ~10283) calls `ReSize` only when `Size` differs,
+      (neural/neuralvolume.pas) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
       destination's 1024x1024 shape. `PasteInpaintCrop` (ecd33dfb) resizes its
       destination first to avoid it. Options: compare SizeX/SizeY/Depth there
@@ -108,20 +108,15 @@ rather than acted on.
       `MakeInitialLatents` uses it; the other save/restore sites in neural/
       are unchanged and could switch to it.
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
-      (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
+      (neural/neuralnetwork.pas) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
-- [X] `TNNetCosineSimilarityAttention.ComputeOpenCL` (and the inheriting
-      `TNNetQKNormAttention`) never filled FQNorm/FKNorm, so a backward after a
-      device forward read stale rows (input-grad off by 2.6). Fixed: Backpropagate
-      renormalizes on demand; test CosineSimilarityAttentionOpenCLBackward.
-      SwinV2 cosine attention is not affected (its device path needs not FIsTrainable).
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
-      normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
-      landed); only the embedded charsmap is unhandled.
+      normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`);
+      only the embedded charsmap is unhandled.
 
 ## Hardware Support
   - [ ] CUDA/HIP Support
@@ -379,7 +374,7 @@ rather than acted on.
 
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
-      DiT from the landed PixArt/MMDiT/Sana stacks: a cross-attention DiT
+      DiT from the landed PixArt/MMDiT stacks: a cross-attention DiT
       conditioned on BOTH a bilingual CLIP and an mT5 text encoder (two separate
       cross-attn streams concatenated), 2-D rotary position embedding on the
       image tokens, and a "skip-connection" (U-Net-style long skips between the
@@ -524,7 +519,7 @@ rather than acted on.
           2026-10-02). No example loads a real SD checkpoint today: every SD
           example defaults to the tests/fixtures pico nets, and all of them fill
           the UNet text input with random/synthetic states instead of CLIP over a
-          prompt (DiffusionInpainting.lpr:260, FillText in ControlNetCanny and
+          prompt (the EncStates fill in DiffusionInpainting.lpr, FillText in ControlNetCanny and
           T2IAdapterSketch). ControlNetCanny/T2IAdapterSketch run ONE denoise step
           and write no image. Missing pieces:
       - [ ] `TStableDiffusionPipeline` in neuralpretrained.pas with the same
@@ -1923,7 +1918,7 @@ rather than acted on.
   "specials as plain text" flag for chat requests; live (unmerged) LoRA.
 - [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
       (fd99162f):
-  - [ ] `examples/FlowMatching/FlowMatching.lpr` (~296-312): optionally drive the
+  - [ ] `examples/FlowMatching/FlowMatching.lpr` (`SampleOne`): optionally drive the
         loop with `TNNetFlowMatchEulerScheduler`. The example integrates t from 0
         (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
         and a reversed velocity sign; the gain is small (the loop is already one
@@ -1973,27 +1968,13 @@ rather than acted on.
       par := (diff . u) * u, orth := diff - par,
       Dst := uncond + W * (orth + eta * par) (diffusers default; the
       `use_original_formulation` variant adds to cond instead).
-      - [X] A guidance-state class next to the scheduler in neural/neuraldiffusion.pas
-            (`ApplyAPG(Cond, Uncond, Dst)` plus `Reset` per trajectory) that OWNS the
-            momentum volume, sized on first use, so a step allocates nothing.
-            Reuse `TNNetVolume.DotProduct` / `MulAdd` / `Mul`; keep the math in
-            `Single` (guide #25) even though diffusers widens to double.
-            Done: `TNNetAdaptiveProjectedGuidance` (15c5aca5).
-      - [X] Tests: eta = 1, m = 0, r = 0 equals `ApplyCFG` exactly; a hand-computed
-            2-element case for the projection, the norm clamp and two momentum steps;
-            Dst may alias Cond or Uncond like `ApplyCFG`.
+      Done: `TNNetAdaptiveProjectedGuidance` in neural/neuraldiffusion.pas
+      (15c5aca5) with tests, and `--apg` / `--apg-eps` in
+      examples/LatentTextToImage and examples/ConditionalDiffusion. Later
+      consumers: the open CFG items of the CogVideoX TextToVideo loop, the
+      Stable Diffusion pipeline and QwenImage B3.
       - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
             approval for a new Python tool.
-      - [X] Wire it into examples/LatentTextToImage (`--apg ETA,MOMENTUM,THRESHOLD`
-            next to `--cfg`) and examples/ConditionalDiffusion, and
-            document the flag in their README.md files. The paper applies APG to
-            the denoised (x0) prediction rather than to eps; check both on the
-            pico fixture and state which space the flag uses. Done: the flag
-            uses x0 (`PredictX0` / new `RawPredFromX0`), `--apg-eps` switches to
-            eps; both run finite on the pico fixture, which cannot rank them.
-            Later consumers:
-            the open CFG items of the CogVideoX TextToVideo loop, the Stable
-            Diffusion pipeline and QwenImage B3.
 
 ## OpenCL forward coverage — layers still on the host
 
@@ -2111,14 +2092,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] Throughput is unmeasured: each kernel is one work-item per channel,
         serial over the window, so a long prefill is latency-bound. Time an
         RWKV decode and prefill on the GPU box.
-  - [X] `TNNetCrossWKV` device forward: `cai_wkv_scan` takes a receptance
-        buffer and a gate mode (`csWKVGate*`: plain, position-aligned
-        sigmoid(r_t) * wkv_t, full-context sigmoid(r_i) * A/B), run by
-        `TNNetWKVScanCL` (shared with `TNNetWKV`). Both modes run on OpenCL;
-        each source is bound when resident, else uploaded; the result stays
-        resident. PoCL parity `CrossWKV[Asym]OpenCLParity`. Open: GPU timing;
-        the incremental path is tracked under the RWKV/recurrent decode
-        follow-ups.
   - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
 - [ ] Follow-ups of the attention subclasses' device paths:
   - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):
@@ -2222,12 +2195,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         (49 tokens, d_k 32), use work-groups if a large-d_k user appears.
       - [ ] `TNNetSAMVisionAttention` follow-ups (OpenCL forward is
         `TNNetSAMVisionAttentionCL`). Time a SAM encoder on the GPU box first:
-        - [x] `cai_sam_rel_pos_tables` writes the two small per-query tables
-          (WinH + WinW dots per query) and `cai_sdpa_flash` adds them in-kernel
-          (`FBiasKeyWidth` > 0); the full-table kernel is gone.
-        - [x] The bias buffer is Planes x SeqLen x (WinH + WinW) floats, not
-          Planes x SeqLen^2: a SAM-B global block (64x64 grid, 12 heads) needs
-          12 x 4096 x 128 x 4 B = 25 MB instead of 805 MB.
         - Not timed yet: run a SAM encoder on the GPU box and compare the
           decomposed-bias flash launch with the old full-table one.
         - The qkv and out projections run on `cai_row_dot_products` (see the
