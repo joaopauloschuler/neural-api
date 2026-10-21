@@ -287,16 +287,10 @@ rather than acted on.
       with `dpV`. Missing pieces, all checked against the shipped
       `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
       "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [X] Scheduler leftovers from 4c756c1c: `pFinalAlphaBarIsOne` models
-            diffusers `set_alpha_to_one`; Euler-ancestral takes x0 from PredictX0.
       - [ ] DDPM with dpV at the zero-SNR step still goes through eps (x0 = 0
             instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
             + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
             ab_t = 1 (Beta1 = 0). Not needed by Marigold.
-      - [X] Pipeline step 1: `MarigoldDenoise` (neuralpretrained.pas) runs the
-            trailing DDIM loop on ImageLatent ++ Target at diffusers t = Tt-1;
-            covered by `TestMarigoldDenoiseSmoke` (pico VAE encoder + 8-channel
-            pico UNet).
       - [ ] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
             landed `MarigoldDenoise`, split into:
             - [ ] 2a. Grid: the VAE/UNet builders take one square `LatentGrid`.
@@ -1955,12 +1949,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       fix real limitations" are done (intra-chunk dense GEMM + inter-chunk
       running state). Sequence them after those, or fold the device path into
       each chunked rewrite, with an exact-vs-CPU parity test each.
-- [X] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
-      int8 device gather (`cai_embedding_gather_int8`) and leaves its rows
-      resident; its sibling still gathers on the host. Reuse the same entry
-      point, adding the positional table as a second resident source.
-      DONE: `cai_embedding_gather_pos` / `cai_embedding_gather_int8_pos` add the
-      resident positional table; output stays resident.
 
 
 ### Vision and audio layers with no device forward
@@ -2300,9 +2288,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
-- [ ] Add a "FP32 SSE accumulator warning" comment near LayerInputGradientCheck
-      pointing future audits at the DeMaxPool case and the Double-precision
-      workaround.
 - [ ] TNNetPointwiseSoftMax: now that the exact Jacobian lives in
       Backpropagate, opt cross-entropy training paths into the cheap
       (y - target) shortcut explicitly, and add a regression test that
@@ -2368,12 +2353,3 @@ then — only int8 + MXFP4-dequant did.)
       document+measure the approximation error vs whole-image decode on a real
       (trained) checkpoint so users know the quality trade-off. Pure host /
       analysis; no new layer.
-
-## TNNetResize2D follow-ups (from e37d07bb)
-
-- [X] An int `size` is ambiguous: ViTImageProcessor reads it as a square
-      (H,W) (`default_to_square=True`, e.g. google/vit-base `"size": 224`),
-      CLIPImageProcessor as shortest_edge. Both readers still use
-      shortest_edge; choosing by `image_processor_type` /
-      `feature_extractor_type` needs a processor list.
-- [X] `crop_pct` (ConvNext and others) is not read by either config reader.
