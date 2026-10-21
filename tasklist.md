@@ -297,16 +297,28 @@ rather than acted on.
             trailing DDIM loop on ImageLatent ++ Target at diffusers t = Tt-1;
             covered by `TestMarigoldDenoiseSmoke` (pico VAE encoder + 8-channel
             pico UNet).
-      - [ ] Pipeline step 2 — the pipeline routine in neuralpretrained.pas: resize the long side to
-            `default_processing_resolution` (768), pad to a multiple of 8 and
-            unpad after (the VAE/UNet builders take a square grid today, so
-            either pad to square or lift that limit), encode the image to its
-            latent, run `default_denoising_steps` (4) DDIM steps on the target
-            latent with the cached empty-prompt states, decode, average the 3
-            decoded channels and map [-1,1] -> [0,1] (depth) or unit-normalize
-            the 3 channels (normals). Optional ensemble over N noise seeds with
-            the paper's per-member scale+shift least-squares alignment and a
-            median merge (depth); a plain mean then renormalize (normals).
+      - [ ] Pipeline step 2 — `MarigoldPredict` in neuralpretrained.pas around the
+            landed `MarigoldDenoise`, split into:
+            - [ ] 2a. Grid: the VAE/UNet builders take one square `LatentGrid`.
+                  Either pad to a multiple of 8 and to square, then unpad, or
+                  give the configs separate X/Y grids (saves compute on wide
+                  images). Check which pad mode diffusers Marigold uses
+                  (believed replicate, unverified).
+            - [ ] 2b. Preprocess: resize the long side to
+                  `default_processing_resolution` (768) with the antialiased
+                  resize, map [0,1] -> [-1,1].
+            - [ ] 2c. Empty-prompt states: load the 1024-wide SD2 CLIP text
+                  encoder from `text_encoder/`, embed "" once, cache it; check
+                  the SD2 config loads.
+            - [ ] 2d. Decode + post-process: VAE decode (check where the
+                  scaling factor is applied), unpad, resize back; depth =
+                  mean of 3 channels clipped and mapped to [0,1]; normals =
+                  unit-normalized 3 channels.
+            - [ ] 2e. `MarigoldPredict` chaining 2a-2d, starting noise as a
+                  parameter (for the parity fixture), pico smoke test.
+            - [ ] 2f. Ensemble over N noise seeds: depth members aligned by
+                  least-squares scale+shift then median; normals mean then
+                  renormalize.
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
