@@ -1981,6 +1981,46 @@ rather than acted on.
       CogVideoX TextToVideo loop and the Stable Diffusion pipeline.
       - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
             approval for a new Python tool.
+- [ ] Perturbed-Attention Guidance (PAG, Ahn et al. 2024, arXiv:2403.17377) and
+      Skip Layer Guidance (SLG), ported from diffusers
+      `guiders/perturbed_attention_guidance.py` / `skip_layer_guidance.py` +
+      `hooks/layer_skip.py` (0.41.0.dev0 in the ~/x venv). These guiders give
+      guidance WITHOUT a negative prompt: a third, "worse" prediction
+      pred_skip comes from the same transformer with chosen blocks perturbed,
+      and Dst := base + W_cfg * (cond - uncond) + W_pag * (cond - pred_skip),
+      where base is uncond (diffusers default) or cond
+      (`use_original_formulation`). With CFG off, Dst := pred_skip + W_pag *
+      (cond - pred_skip). The perturbation runs only for steps inside
+      [start, stop) (fraction of the schedule; diffusers default 0.01..0.2),
+      so it costs about 20% more transformer passes at the defaults. Today
+      examples/QwenImage gets guidance only from `--negative-prompt` (B3).
+      Scope:
+      - PAG perturbation = `skip_attention_scores`: the attention score
+        matrix becomes the identity, so each query row outputs its own V row.
+        Add this as a mode of `TNNetFusedSDPA` (CPU path: copy V; OpenCL path:
+        a device copy of the V slice, so the output stays resident). In the
+        Qwen-Image step net the queries are the image tokens behind the text
+        prefix cache, so query i takes V row Prefix+i.
+      - SLG perturbation = skip the chosen blocks' attention (or the whole
+        block) for the perturbed pass. Both modes are per-block switches set
+        by the pipeline, so one switch serves both.
+      - A guider in neural/neuraldiffusion.pas beside
+        `TNNetAdaptiveProjectedGuidance`, with the three-way mix, the
+        [start, stop) window, and `guidance_rescale` through the existing
+        `TNNetDiffusionScheduler.ApplyCFG` rescale math (no second copy).
+      - `TQwenImage21Pipeline`: `--pag-scale W`, `--pag-layers i,j,...`,
+        `--pag-start`/`--pag-stop`, `--slg` (SLG mode), `/pag` in the REPL.
+        The perturbed pass must not touch the First-Block Cache or the
+        prefix cache of the cond pass.
+      - Tests: guider math against hand-computed volumes (all four CFG/PAG
+        on/off branches); identity-score SDPA equals V on CPU and OpenCL;
+        pico Qwen-Image parity < 1e-4 vs diffusers with the same
+        `LayerSkipConfig` on the tiny fixture (ask the user before adding a
+        new Python tool); scale 0 must match the unguided image bit for bit.
+      - README of examples/QwenImage: the flags, the extra cost, and a
+        with/without image pair from the user's GPU box.
+      Later consumers: the SD UNet path (examples/LatentTextToImage, diffusers
+      `StableDiffusionPAGPipeline` on mid-block self-attention) and CogVideoX.
 
 ## OpenCL forward coverage — layers still on the host
 
