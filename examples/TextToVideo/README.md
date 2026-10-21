@@ -58,8 +58,46 @@ Optional trailing flags:
 | `--gif FILE` | also write all frames as one looping animated GIF (`TNNetAnimatedGIFWriter`, `neuralgif.pas`) |
 | `--fps N` | GIF frame rate (default 8, the CogVideoX rate) |
 | `--png` | write `frame_<ii>.png` instead of `frame_<ii>.ppm` |
+| `--fbc-threshold X` | First-Block Cache: skip blocks 1..N-1 on steps where block 0 changed little (0 = off, the default; see below) |
 
 (Or compile the `.lpr` with `fpc -Fu../../neural`.)
+
+### First-Block Cache (`--fbc-threshold X`)
+
+`--fbc-threshold X` skips most of the denoiser on steps where little changes.
+It is a port of diffusers' `apply_first_block_cache`
+(`hooks/first_block_cache.py`), shared with examples/QwenImage. Each step runs
+`patch_embed`, the time and text embeddings and transformer block 0, then
+compares block 0's video residual (its video output minus its video input)
+with the residual of the last step that ran every block:
+
+    change = mean |r - r_prev| / mean |r_prev|
+
+When `change` is at most X, the step skips blocks 1 to N-1: it adds the video
+residual those blocks produced on the last full step to block 0's video
+output and runs `norm_out` and `proj_out` on the sum. When `change` is above
+X, the step runs every block and keeps the new residuals. The first step
+always runs every block. Each step line says when it skipped, and the run
+ends with `First-Block Cache skipped k of N steps.`
+
+```
+./TextToVideo cogvideox.safetensors --steps 50 --fbc-threshold 0.1
+```
+
+- **Speed.** A skipped step costs the embeddings, one block and the output
+  head instead of all N blocks. diffusers and ParaAttention report 1.5x to
+  2x at thresholds 0.05 to 0.12 on other DiT models; this port has not been
+  timed on a real CogVideoX checkpoint.
+- **Quality.** A skipped step reuses an older residual, so a higher threshold
+  skips more steps and can lose detail or motion. diffusers' default is 0.05.
+- **Memory.** Three buffers of (video tokens x hidden) floats.
+- **The pico fixture** has one block, so nothing can be skipped there (the
+  example says so). `TestCogVideoXFirstBlockCacheReference` exercises the
+  skips on a three-block copy of it.
+
+`0` (the default) runs every block on every step, exactly as without the
+option. The step is `TCogVideoXSampler.PredictNoise` and the cache
+`TDiTFirstBlockCache`, both in `neural/neuralpretrained.pas`.
 
 ## Inputs / outputs
 

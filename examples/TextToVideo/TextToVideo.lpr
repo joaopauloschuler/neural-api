@@ -43,6 +43,8 @@ Optional trailing flags:
   --gif FILE     also write all frames as one looping animated GIF
   --fps N        GIF frame rate (default 8, the CogVideoX rate)
   --png          write frame_<ii>.png instead of frame_<ii>.ppm
+  --fbc-threshold X  First-Block Cache: skip blocks 1..N-1 on steps whose
+                 block 0 residual changed by at most X (0 = off, the default)
 
 OUTPUT
   Writes frame_<ii>.ppm (or .png) for each decoded frame, the --gif file if
@@ -153,6 +155,10 @@ end;
 var
   Net, VaeNet: TNNet;
   Cfg: TCogVideoXConfig;
+  Sampler: TCogVideoXSampler;
+  FirstBlockCacheThreshold: TNeuralFloat;
+  SkippedBefore: integer;
+  StepSkipped: boolean;
   Scheduler: TNNetDiffusionScheduler;
   Latent, TextStates, Eps, VaeLatent, Decoded, Frame, PngWork: TNNetVolume;
   GifWriter: TNNetAnimatedGIFWriter;
@@ -170,6 +176,7 @@ begin
   PngFrames := false;
   GifFile := '';
   FramesPerSecond := 8;
+  FirstBlockCacheThreshold := 0;
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
   begin
@@ -190,6 +197,11 @@ begin
     else if Arg = '--gif' then begin Inc(i); GifFile := ParamStr(i); end
     else if Arg = '--fps' then begin Inc(i); FramesPerSecond := StrToIntDef(ParamStr(i), FramesPerSecond); end
     else if Arg = '--png' then PngFrames := true
+    else if Arg = '--fbc-threshold' then
+    begin
+      Inc(i);
+      FirstBlockCacheThreshold := StrToFloatDef(ParamStr(i), 0);
+    end
     else WriteLn('Ignoring unknown argument: ', Arg);
     Inc(i);
   end;
@@ -197,6 +209,8 @@ begin
   RandSeed := 424242;
   Net := BuildCogVideoXFromSafeTensors(ST, Cfg, {pTrainable=}false, CfgPath);
   VaeNet := BuildCogVideoXVaeDecoderFromSafeTensorsEx(ST, Cfg, {pTrainable=}false);
+  Sampler := TCogVideoXSampler.Create(Net, Cfg);
+  Sampler.FirstBlockCache.Threshold := FirstBlockCacheThreshold;
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
   LV := Cfg.NumFrames * Cfg.GridHeight * Cfg.GridWidth;
   Latent := TNNetVolume.Create;
@@ -211,6 +225,9 @@ begin
     WriteLn(CogVideoXConfigToString(Cfg));
     WriteLn('Sampler: ', BoolToStr(Method = smDPMSolverPP2M, 'DPM-Solver++(2M)',
       'DDIM'), ', steps ', NumSteps);
+    if Sampler.FirstBlockCache.Enabled then
+      WriteLn('First-Block Cache threshold ', FirstBlockCacheThreshold:0:4,
+        BoolToStr(Cfg.NumLayers < 2, ' (one block: nothing to skip)', ''));
 
     // Deterministic synthetic T5 states stand in for a real T5 tower.
     TextStates.ReSize(Cfg.TextSeqLen, 1, Cfg.TextDim);
@@ -223,21 +240,25 @@ begin
     Eps.ReSize(LV, 1, Cfg.OutChannels);
 
     Scheduler.ResetMultistep;
+    Sampler.FirstBlockCache.Reset();
     for StepCnt := 0 to NumSteps - 1 do
     begin
       T := Scheduler.NumTimesteps - (StepCnt * Scheduler.NumTimesteps) div NumSteps;
       if StepCnt = NumSteps - 1 then TPrev := 0
       else TPrev := Scheduler.NumTimesteps -
         ((StepCnt + 1) * Scheduler.NumTimesteps) div NumSteps;
-      CogVideoXConditioning(Net, Cfg, T, TextStates);
-      Net.Compute(Latent);
-      // eps prediction is (LV,1,out_channels). Keep only the in_channels half
-      // (here out=in, so copy whole) into Eps for the scheduler step.
-      Eps.CopyNoChecks(Net.GetLastLayer().Output);
+      SkippedBefore := Sampler.FirstBlockCache.SkippedStepCount;
+      // eps prediction is (LV,1,out_channels); here out=in.
+      Sampler.PredictNoise(Latent, T, TextStates, Sampler.FirstBlockCache, Eps);
+      StepSkipped := Sampler.FirstBlockCache.SkippedStepCount > SkippedBefore;
       Scheduler.Step(Latent, Eps, T, TPrev, Method, 0.0);
       WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
-        '  |latent|=', Latent.GetMagnitude():0:4);
+        '  |latent|=', Latent.GetMagnitude():0:4,
+        BoolToStr(StepSkipped, '  (blocks 1..N-1 skipped)', ''));
     end;
+    if Sampler.FirstBlockCache.Enabled then
+      WriteLn('First-Block Cache skipped ', Sampler.FirstBlockCache.SkippedStepCount,
+        ' of ', NumSteps, ' steps.');
 
     LatentOk := AllFinite(Latent);
     WriteLn('Sampled video latent frames=', Cfg.NumFrames, ' grid=',
@@ -308,6 +329,7 @@ begin
     TextStates.Free;
     Latent.Free;
     Scheduler.Free;
+    Sampler.Free;
     VaeNet.Free;
     Net.Free;
   end;

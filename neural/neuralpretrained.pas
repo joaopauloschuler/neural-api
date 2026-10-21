@@ -12846,6 +12846,31 @@ function CogVideoXTextInput(Net: TNNet): TNNetLayer;
 procedure CogVideoXConditioning(Net: TNNet; const Config: TCogVideoXConfig;
   t: TNeuralFloat; TextStates: TNNetVolume);
 
+type
+  // Runs a BuildCogVideoX net (not owned) once per denoise step; with an
+  // enabled First-Block Cache it runs block 0, asks the cache, then runs or
+  // skips blocks 1..N-1. Coded by Claude (AI).
+  TCogVideoXSampler = class(TObject)
+  private
+    FNet: TNNet;
+    FConfig: TCogVideoXConfig;
+    // Last layer of block 0 (the prefix nets included) and of the last block.
+    FHeadEndIdx, FTailEndIdx: integer;
+    // patch_embed, and the video stream after block 0 and after the last block.
+    FHeadInput, FHeadOutput, FTailOutput: TNNetLayer;
+    FFirstBlockCache: TDiTFirstBlockCache;
+  public
+    constructor Create(pNet: TNNet; const pConfig: TCogVideoXConfig);
+    destructor Destroy(); override;
+    // Conditions the net on t and TextStates and writes its noise prediction
+    // for Latent into Eps; a nil or disabled Cache runs every block.
+    procedure PredictNoise(Latent: TNNetVolume; t: TNeuralFloat;
+      TextStates: TNNetVolume; Cache: TDiTFirstBlockCache; Eps: TNNetVolume);
+    property Net: TNNet read FNet;
+    // Threshold 0 (the default) is off; reset it before each video.
+    property FirstBlockCache: TDiTFirstBlockCache read FFirstBlockCache;
+  end;
+
 // ---------------------------------------------------------------------------
 // VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
 // by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
@@ -95608,6 +95633,87 @@ begin
   for i := 0 to NetCountM1 do
     if Net.Layers[i] is TNNetMRotaryEmbedding then
       TNNetMRotaryEmbedding(Net.Layers[i]).SetPositions(PosT, PosH, PosW);
+end;
+
+{ TCogVideoXSampler }
+
+// BuildCogVideoX adds each block's two adaLN linears and then norm_out's after
+// the cond SiLU (the layer before the text input), in block order.
+constructor TCogVideoXSampler.Create(pNet: TNNet;
+  const pConfig: TCogVideoXConfig);
+var
+  TextInput, CondLayer: TNNetLayer;
+  LayerPos, MaxLayerPos, AdaCount, Block1StartIdx, FinalStartIdx: integer;
+begin
+  inherited Create();
+  FNet := pNet;
+  FConfig := pConfig;
+  FFirstBlockCache := TDiTFirstBlockCache.Create();
+  TextInput := CogVideoXTextInput(pNet);
+  if (TextInput = nil) or (TextInput.LayerIdx < 2) then
+    ImportError('TCogVideoXSampler: no BuildCogVideoX text input.');
+  CondLayer := pNet.Layers[TextInput.LayerIdx - 1];
+  AdaCount := 0;
+  Block1StartIdx := -1;
+  FinalStartIdx := -1;
+  MaxLayerPos := pNet.GetLastLayerIdx();
+  for LayerPos := TextInput.LayerIdx + 1 to MaxLayerPos do
+    if pNet.Layers[LayerPos].PrevLayer = CondLayer then
+    begin
+      if AdaCount = 2 then Block1StartIdx := LayerPos;
+      FinalStartIdx := LayerPos;
+      Inc(AdaCount);
+    end;
+  if (AdaCount <> 2 * pConfig.NumLayers + 1) or
+    (FinalStartIdx + 1 > MaxLayerPos) then
+    ImportError('TCogVideoXSampler: found ' + IntToStr(AdaCount) +
+      ' adaLN linears, a BuildCogVideoX net of ' +
+      IntToStr(pConfig.NumLayers) + ' blocks has ' +
+      IntToStr(2 * pConfig.NumLayers + 1) + '.');
+  FHeadInput := pNet.Layers[1];
+  // Block 1's video norm1 and norm_out read the video stream they follow.
+  FHeadOutput := pNet.Layers[Block1StartIdx + 1].PrevLayer;
+  FTailOutput := pNet.Layers[FinalStartIdx + 1].PrevLayer;
+  FHeadEndIdx := Block1StartIdx - 1;
+  FTailEndIdx := FinalStartIdx - 1;
+end;
+
+destructor TCogVideoXSampler.Destroy();
+begin
+  FFirstBlockCache.Free;
+  inherited Destroy();
+end;
+
+// On OpenCL the cache compares and adds on the host, as
+// TQwenImage21Transformer.PredictVelocity does.
+procedure TCogVideoXSampler.PredictNoise(Latent: TNNetVolume; t: TNeuralFloat;
+  TextStates: TNNetVolume; Cache: TDiTFirstBlockCache; Eps: TNNetVolume);
+begin
+  CogVideoXConditioning(FNet, FConfig, t, TextStates);
+  if (Cache = nil) or not Cache.Enabled or (FTailEndIdx <= FHeadEndIdx) then
+    FNet.Compute(Latent)
+  else
+  begin
+    FNet.Compute(Latent, 0, false, FHeadEndIdx);
+    FHeadInput.ForceOutputOnRAM();
+    FHeadOutput.ForceOutputOnRAM();
+    if Cache.ShouldRunRemainingBlocks(FHeadInput.Output,
+      FHeadOutput.Output) then
+    begin
+      FNet.ComputeSerial(FHeadEndIdx + 1, FTailEndIdx);
+      FTailOutput.ForceOutputOnRAM();
+      Cache.StoreTailResidual(FTailOutput.Output);
+    end
+    else
+    begin
+      FTailOutput.Output.Copy(FHeadOutput.Output);
+      Cache.ApplyTailResidual(FTailOutput.Output);
+      FTailOutput.MarkOutputWrittenOnRAM();
+    end;
+    FNet.ComputeSerial(FTailEndIdx + 1);
+    FNet.GetLastLayer().ForceOutputOnRAM();
+  end;
+  Eps.Copy(FNet.GetLastLayer().Output);
 end;
 
 // ============================ VideoMAE IMPORT ==============================

@@ -1182,6 +1182,9 @@ type
     procedure TestMMDiTConfigFromJSONFile;
     procedure TestMMDiTJointBlockParity;
     procedure TestCogVideoXParity;
+    // TCogVideoXSampler's First-Block Cache vs plain loops on a 3-block copy
+    // of the pico checkpoint: threshold 0 bit-identical, skips as a reference.
+    procedure TestCogVideoXFirstBlockCacheReference;
     procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
     procedure TestRRDBNetParityPth;
@@ -46051,6 +46054,305 @@ begin
     RefJson.Free;
     NN.Free;
     VaeNN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXFirstBlockCacheReference;
+const
+  BlockCount = 3;
+  StepCount = 8;
+  // The pico's random weights move block 0's residual by 50% to 900% a
+  // step (printed ratios), so the skipping threshold is near 1.
+  SkipThreshold = 1.0;
+  BlockPrefix = 'transformer_blocks.0.';
+var
+  Config, OneBlockConfig: TCogVideoXConfig;
+  Net, OneBlockNet: TNNet;
+  Sampler, OneBlockSampler: TCogVideoXSampler;
+  Scheduler: TNNetDiffusionScheduler;
+  TextStates, Initial, LatentsPlain, LatentsOff, LatentsTiny, LatentsSkip,
+    LatentsReference, Eps, Residual, PrevResidual, TailResidual: TNNetVolume;
+  CheckpointPath, ReferencePattern, SamplerPattern, RatioText: string;
+  ValuePos, MaxValuePos, MaxInputPos, SkipCount: integer;
+  Diff: double;
+
+  // The fixture plus blocks 1..BlockCount-1: block 0's tensors scaled per value.
+  procedure WriteBlockCopies();
+  var
+    Reader: TNNetSafeTensorsReader;
+    Writer: TNNetSafeTensorsWriter;
+    Values: TNNetVolume;
+    Shape: array of Int64;
+    TensorName: string;
+    TensorPos, MaxTensorPos, DimPos, MaxDimPos, BlockPos, MaxBlockPos,
+      CopyValuePos, MaxCopyValuePos: integer;
+  begin
+    Reader := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_cogvideox.safetensors'));
+    Writer := TNNetSafeTensorsWriter.Create(CheckpointPath);
+    Values := TNNetVolume.Create;
+    try
+      MaxTensorPos := Reader.Count - 1;
+      MaxBlockPos := BlockCount - 1;
+      for TensorPos := 0 to MaxTensorPos do
+      begin
+        TensorName := Reader.TensorName(TensorPos);
+        MaxDimPos := Reader.DimCount(TensorName) - 1;
+        SetLength(Shape, MaxDimPos + 1);
+        for DimPos := 0 to MaxDimPos do
+          Shape[DimPos] := Reader.DimSize(TensorName, DimPos);
+        Reader.LoadTensorFlat(TensorName, Values);
+        Writer.AddTensorFlat(TensorName, Shape, Values);
+        if Pos(BlockPrefix, TensorName) <> 1 then continue;
+        for BlockPos := 1 to MaxBlockPos do
+        begin
+          Reader.LoadTensorFlat(TensorName, Values);
+          MaxCopyValuePos := Values.Size - 1;
+          for CopyValuePos := 0 to MaxCopyValuePos do
+            Values.FData[CopyValuePos] := Values.FData[CopyValuePos] *
+              (1 + 0.3 * Sin(CopyValuePos * 0.7 + BlockPos));
+          Writer.AddTensorFlat('transformer_blocks.' + IntToStr(BlockPos) +
+            '.' + Copy(TensorName, Length(BlockPrefix) + 1, MaxInt), Shape,
+            Values);
+        end;
+      end;
+      Writer.SaveToFile;
+    finally
+      Values.Free;
+      Writer.Free;
+      Reader.Free;
+    end;
+  end;
+
+  function StepTimestep(StepPos: integer): integer;
+  begin
+    if StepPos >= StepCount then Result := 0
+    else Result := Scheduler.NumTimesteps -
+      (StepPos * Scheduler.NumTimesteps) div StepCount;
+  end;
+
+  // The example's DDIM loop with every block on every step.
+  procedure RunPlain(DenoiseNet: TNNet; const DenoiseConfig: TCogVideoXConfig;
+    Latents: TNNetVolume);
+  var
+    StepPos: integer;
+  begin
+    Latents.Copy(Initial);
+    Scheduler.ResetMultistep;
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      CogVideoXConditioning(DenoiseNet, DenoiseConfig, StepTimestep(StepPos),
+        TextStates);
+      DenoiseNet.Compute(Latents);
+      Eps.Copy(DenoiseNet.GetLastLayer().Output);
+      Scheduler.Step(Latents, Eps, StepTimestep(StepPos),
+        StepTimestep(StepPos + 1), smDDIM, 0.0);
+    end;
+  end;
+
+  // The same loop through a sampler; Pattern gets R (ran) or S per step.
+  procedure RunSampler(StepSampler: TCogVideoXSampler; Threshold: double;
+    Latents: TNNetVolume; out Pattern: string);
+  var
+    StepPos, SkippedBefore: integer;
+  begin
+    Pattern := '';
+    Latents.Copy(Initial);
+    Scheduler.ResetMultistep;
+    StepSampler.FirstBlockCache.Threshold := Threshold;
+    StepSampler.FirstBlockCache.Reset();
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      SkippedBefore := StepSampler.FirstBlockCache.SkippedStepCount;
+      StepSampler.PredictNoise(Latents, StepTimestep(StepPos), TextStates,
+        StepSampler.FirstBlockCache, Eps);
+      if StepSampler.FirstBlockCache.SkippedStepCount > SkippedBefore
+        then Pattern := Pattern + 'S'
+        else Pattern := Pattern + 'R';
+      Scheduler.Step(Latents, Eps, StepTimestep(StepPos),
+        StepTimestep(StepPos + 1), smDDIM, 0.0);
+    end;
+  end;
+
+  // Full forwards with a plain-loop First-Block Cache: a skipped step
+  // rewrites the last block's video output and reruns norm_out onwards.
+  procedure RunReference(Threshold: double; Latents: TNNetVolume;
+    out Pattern: string);
+  var
+    StepPos, LayerPos, MaxLayerPos, NormCount, ValuePos: integer;
+    HeadInput, HeadOutput, TailOutput, FinalNorm: TNNetLayer;
+    SumDiff, SumPrev, Ratio: double;
+    HasPrev, RunsRemaining: boolean;
+  begin
+    Pattern := '';
+    RatioText := '';
+    HasPrev := false;
+    // Token norms per block: video norm1, text norm1, video norm2, text norm2.
+    HeadOutput := nil;
+    FinalNorm := nil;
+    NormCount := 0;
+    MaxLayerPos := Net.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+      if Net.Layers[LayerPos] is TNNetTokenLayerNorm then
+      begin
+        if NormCount = 4 then HeadOutput := Net.Layers[LayerPos].PrevLayer;
+        FinalNorm := Net.Layers[LayerPos];
+        Inc(NormCount);
+      end;
+    AssertEquals('token norms', 4 * BlockCount + 1, NormCount);
+    HeadInput := Net.Layers[1];
+    TailOutput := FinalNorm.PrevLayer;
+    Latents.Copy(Initial);
+    Scheduler.ResetMultistep;
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      CogVideoXConditioning(Net, Config, StepTimestep(StepPos), TextStates);
+      Net.Compute(Latents);
+      Residual.ReSize(HeadOutput.Output);
+      for ValuePos := 0 to MaxValuePos do
+        Residual.FData[ValuePos] := HeadOutput.Output.FData[ValuePos] -
+          HeadInput.Output.FData[ValuePos];
+      RunsRemaining := true;
+      if (Threshold > 0) and HasPrev then
+      begin
+        SumDiff := 0;
+        SumPrev := 0;
+        for ValuePos := 0 to MaxValuePos do
+        begin
+          SumDiff := SumDiff + Abs(Residual.FData[ValuePos] -
+            PrevResidual.FData[ValuePos]);
+          SumPrev := SumPrev + Abs(PrevResidual.FData[ValuePos]);
+        end;
+        Ratio := SumDiff / SumPrev;
+        RatioText := RatioText + ' ' + FloatToStrF(Ratio, ffFixed, 6, 4);
+        AssertTrue('ratio ' + FloatToStr(Ratio) + ' clear of the threshold',
+          Abs(Ratio - Threshold) > 0.01 * Threshold);
+        RunsRemaining := Ratio > Threshold;
+      end;
+      if RunsRemaining then
+      begin
+        TailResidual.ReSize(HeadOutput.Output);
+        for ValuePos := 0 to MaxValuePos do
+          TailResidual.FData[ValuePos] := TailOutput.Output.FData[ValuePos] -
+            HeadOutput.Output.FData[ValuePos];
+        PrevResidual.Copy(Residual);
+        HasPrev := true;
+        Pattern := Pattern + 'R';
+      end
+      else
+      begin
+        for ValuePos := 0 to MaxValuePos do
+          TailOutput.Output.FData[ValuePos] :=
+            HeadOutput.Output.FData[ValuePos] + TailResidual.FData[ValuePos];
+        Net.ComputeSerial(FinalNorm.LayerIdx);
+        Pattern := Pattern + 'S';
+      end;
+      Eps.Copy(Net.GetLastLayer().Output);
+      Scheduler.Step(Latents, Eps, StepTimestep(StepPos),
+        StepTimestep(StepPos + 1), smDDIM, 0.0);
+    end;
+  end;
+
+begin
+  CheckpointPath := GetTempDir(false) + 'cai_cogvideox_fbc_' +
+    IntToStr(GetProcessID()) + '.safetensors';
+  Config := ReadCogVideoXConfigFromJSONFile(
+    FixturePath('tiny_cogvideox_config.json'));
+  OneBlockConfig := Config;
+  Config.NumLayers := BlockCount;
+  Net := nil;
+  OneBlockNet := nil;
+  Sampler := nil;
+  OneBlockSampler := nil;
+  Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  TextStates := TNNetVolume.Create(Config.TextSeqLen, 1, Config.TextDim);
+  Initial := TNNetVolume.Create(Config.NumFrames * Config.GridHeight *
+    Config.GridWidth, 1, Config.InChannels);
+  LatentsPlain := TNNetVolume.Create;
+  LatentsOff := TNNetVolume.Create;
+  LatentsTiny := TNNetVolume.Create;
+  LatentsSkip := TNNetVolume.Create;
+  LatentsReference := TNNetVolume.Create;
+  Eps := TNNetVolume.Create;
+  Residual := TNNetVolume.Create;
+  PrevResidual := TNNetVolume.Create;
+  TailResidual := TNNetVolume.Create;
+  try
+    WriteBlockCopies();
+    Net := BuildCogVideoXFromSafeTensorsEx(CheckpointPath, Config,
+      {pTrainable=}false);
+    Sampler := TCogVideoXSampler.Create(Net, Config);
+    MaxValuePos := Initial.SizeX * Config.HiddenSize - 1;
+    MaxInputPos := TextStates.Size - 1;
+    for ValuePos := 0 to MaxInputPos do
+      TextStates.FData[ValuePos] := Sin(ValuePos * 0.37) * 0.5;
+    MaxInputPos := Initial.Size - 1;
+    for ValuePos := 0 to MaxInputPos do
+      Initial.FData[ValuePos] := Sin(ValuePos * 0.91 + 0.2) * 0.8;
+    AssertEquals('the default is off', 0, Sampler.FirstBlockCache.Threshold, 0);
+
+    RunPlain(Net, Config, LatentsPlain);
+    RunSampler(Sampler, 0, LatentsOff, SamplerPattern);
+    AssertEquals('off: nothing skipped', 0,
+      Sampler.FirstBlockCache.SkippedStepCount);
+    AssertEquals('off: the plain loop', 0, MaxAbsVolumeDiff(LatentsPlain,
+      LatentsOff), 0);
+    // On but never under the threshold: the split forward changes nothing.
+    RunSampler(Sampler, 1e-30, LatentsTiny, SamplerPattern);
+    AssertEquals('tiny threshold: asked every step', StepCount,
+      Sampler.FirstBlockCache.StepCount);
+    AssertEquals('tiny threshold: nothing skipped', 0,
+      Sampler.FirstBlockCache.SkippedStepCount);
+    AssertEquals('tiny threshold: bit-identical to the plain loop', 0,
+      MaxAbsVolumeDiff(LatentsPlain, LatentsTiny), 0);
+
+    RunReference(SkipThreshold, LatentsReference, ReferencePattern);
+    WriteLn('  CogVideoX First-Block Cache at ', SkipThreshold:0:3,
+      ': pattern ', ReferencePattern, ', ratios', RatioText);
+    SkipCount := Length(ReferencePattern) - Length(StringReplace(
+      ReferencePattern, 'S', '', [rfReplaceAll]));
+    AssertTrue('some steps skipped: ' + ReferencePattern, SkipCount > 0);
+    AssertTrue('a step after the first runs: ' + ReferencePattern,
+      Pos('R', Copy(ReferencePattern, 2, MaxInt)) > 0);
+    RunSampler(Sampler, SkipThreshold, LatentsSkip, SamplerPattern);
+    AssertEquals('sampler skip pattern', ReferencePattern, SamplerPattern);
+    AssertEquals('sampler skipped steps', SkipCount,
+      Sampler.FirstBlockCache.SkippedStepCount);
+    Diff := MaxAbsVolumeDiff(LatentsSkip, LatentsReference);
+    AssertTrue('skipping latents max|diff| ' + FloatToStr(Diff) +
+      ' vs the plain loop must be < 1e-5', Diff < 1e-5);
+    AssertTrue('skipping changed the latents',
+      MaxAbsVolumeDiff(LatentsSkip, LatentsPlain) > 1e-6);
+
+    // One block: nothing to skip, so the cache is never asked.
+    OneBlockNet := BuildCogVideoXFromSafeTensorsEx(
+      FixturePath('tiny_cogvideox.safetensors'), OneBlockConfig,
+      {pTrainable=}false);
+    OneBlockSampler := TCogVideoXSampler.Create(OneBlockNet, OneBlockConfig);
+    RunPlain(OneBlockNet, OneBlockConfig, LatentsPlain);
+    RunSampler(OneBlockSampler, 1e9, LatentsSkip, SamplerPattern);
+    AssertEquals('one block: never asked', 0,
+      OneBlockSampler.FirstBlockCache.StepCount);
+    AssertEquals('one block: the plain loop', 0, MaxAbsVolumeDiff(LatentsPlain,
+      LatentsSkip), 0);
+  finally
+    TailResidual.Free;
+    PrevResidual.Free;
+    Residual.Free;
+    Eps.Free;
+    LatentsReference.Free;
+    LatentsSkip.Free;
+    LatentsTiny.Free;
+    LatentsOff.Free;
+    LatentsPlain.Free;
+    Initial.Free;
+    TextStates.Free;
+    Scheduler.Free;
+    OneBlockSampler.Free;
+    OneBlockNet.Free;
+    Sampler.Free;
+    Net.Free;
+    DeleteFile(CheckpointPath);
   end;
 end;
 
