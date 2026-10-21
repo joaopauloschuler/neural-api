@@ -629,6 +629,9 @@ type
     // TNNetGRN chained resident (cai_grn_table + ChannelAffine) at two depths,
     // then after a gamma/beta update, against a host-only twin net.
     procedure TestGRNOpenCLParity;
+    // TNNetMetaAconC chained resident (cai_meta_acon_table + AconC) at three
+    // shapes, then after a weight update, against a host-only twin net.
+    procedure TestMetaAconCOpenCLParity;
     // Input -> TNNetRealFFT2D -> TNNetInverseRealFFT2D resident on OpenCL at
     // power-of-two and odd/non-power-of-two sizes, one per norm: both layers
     // and the round trip against a host-only twin net and the input.
@@ -72732,6 +72735,13 @@ begin
     SetRandomNeuronWeights(Layer, 1, 0, 1);     // p2
     SetRandomNeuronWeights(Layer, 2, 1, 2);     // beta
   end
+  else if Layer is TNNetMetaAconC then
+  begin
+    SetRandomNeuronWeights(Layer, 0, 1, 1);     // p1
+    SetRandomNeuronWeights(Layer, 1, 0, 1);     // p2
+    SetRandomNeuronWeights(Layer, 2, 0.5, 3);   // gamma
+    SetRandomNeuronWeights(Layer, 3, 0, 2);     // delta
+  end
   else if Layer is TNNetPolynomialActivation then
   begin
     SetRandomNeuronWeights(Layer, 0, 0, 1);     // a
@@ -72762,9 +72772,9 @@ begin
 end;
 
 const
-  csLearnableActivationParityNames: array[0..9] of string = ('PReLU', 'PReLUChannel', 'SwishLearnable',
+  csLearnableActivationParityNames: array[0..10] of string = ('PReLU', 'PReLUChannel', 'SwishLearnable',
     'MishLearnable', 'SoftPlusBetaLearnable', 'SReLU', 'AconC',
-    'PolynomialActivation', 'APL 3 hinges', 'SplineActivation K=5');
+    'PolynomialActivation', 'APL 3 hinges', 'SplineActivation K=5', 'MetaAconC');
 
 function CreateLearnableParityActivation(Variant: integer): TNNetLayer;
 begin
@@ -72779,6 +72789,7 @@ begin
     7: Result := TNNetPolynomialActivation.Create();
     8: Result := TNNetAPL.Create(3);
     9: Result := TNNetSplineActivation.Create(5, 2.0);
+    10: Result := TNNetMetaAconC.Create();
   else Result := nil;
   end;
 end;
@@ -73234,6 +73245,130 @@ begin
       AssertTrue('GRN OpenCL vs CPU: max |diff| = ' + FloatToStr(MaxDiff) +
         ' must be < 1e-4', MaxDiff < 1e-4);
       AssertTrue('GRN OpenCL vs CPU after a weight update: max |diff| = ' +
+        FloatToStr(RefreshDiff) + ' must be < 1e-4', RefreshDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      LastCPU.Free;
+      OutCPU.Free;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Builds Input -> TNNetMetaAconC -> TNNetReLU with random weights (inference only).
+function BuildMetaAconCParityNet(SizeX, SizeY, Depth: integer;
+  out MetaLayer: TNNetLayer): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth));
+  MetaLayer := Result.AddLayer(TNNetMetaAconC.Create());
+  Result.AddLayer(TNNetReLU.Create());
+  Result.SetTrainable(False, False);
+  RandomizeLearnableActivation(MetaLayer);
+end;
+
+// Copies every neuron's weights of Source into Dest (same layer type and shape).
+procedure CopyNeuronWeights(Source, Dest: TNNetLayer);
+var
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  MaxNeuronPos := Source.Neurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+    Dest.Neurons[NeuronPos].Weights.Copy(Source.Neurons[NeuronPos].Weights);
+  Dest.FlushWeightCache();
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestMetaAconCOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // A single position (beta from x itself), a small and a wide volume.
+  csShapes: array[0..2, 0..2] of integer = ((1, 1, 7), (6, 5, 40), (3, 4, 300));
+var
+  NN, NNCPU: TNNet;
+  Input, OutCPU, LastCPU: TNNetVolume;
+  MetaLayer, MetaCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos, SentinelSurvivors: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff, RefreshDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    RandSeed := 20261023 + ShapePos;
+    NN := BuildMetaAconCParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], MetaLayer);
+    NNCPU := BuildMetaAconCParityNet(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2], MetaCPU);
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    OutCPU := TNNetVolume.Create();
+    LastCPU := TNNetVolume.Create();
+    try
+      CopyNeuronWeights(MetaLayer, MetaCPU);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 2 * Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7);
+      NNCPU.Compute(Input);
+      OutCPU.Copy(MetaCPU.Output);
+      LastCPU.Copy(NNCPU.GetLastLayer.Output);
+
+      // ForceOpenCL off: the resident input carries MetaAconC and ReLU to the device.
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      MetaLayer.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to MaxPos do
+        if MetaLayer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(LastCPU, NN.GetLastLayer.Output);
+      MetaLayer.ForceOutputOnRAM();
+      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(OutCPU, MetaLayer.Output));
+
+      // A weight update must reach the device table.
+      RandomizeLearnableActivation(MetaLayer);
+      CopyNeuronWeights(MetaLayer, MetaCPU);
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      MetaLayer.ForceOutputOnRAM();
+      RefreshDiff := MaxAbsDiffToOutput(MetaCPU.Output, MetaLayer.Output);
+      WriteLn('  MetaAconC OpenCL ', csShapes[ShapePos, 0], 'x', csShapes[ShapePos, 1],
+        'x', csShapes[ShapePos, 2], ': max|diff|=', MaxDiff:0:9,
+        ' after update=', RefreshDiff:0:9, ' sentinels=', SentinelSurvivors,
+        '/', Input.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('TNNetMetaAconC ran every forward on OpenCL', 3,
+        MetaLayer.ForwardGPUCnt);
+      AssertEquals('the MetaAconC output is bound, not downloaded', Input.Size,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('MetaAconC OpenCL vs CPU: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('MetaAconC OpenCL vs CPU after a weight update: max |diff| = ' +
         FloatToStr(RefreshDiff) + ' must be < 1e-4', RefreshDiff < 1e-4);
     finally
       OpenCLTransferCounting := WasCounting;

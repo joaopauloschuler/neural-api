@@ -2056,15 +2056,14 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [ ] `TNNetMetaAconC`, the one per-channel learnable activation still with
-      no device forward. Its beta is sigmoid(gamma[c] * mean_c(x) + delta[c]),
-      so it needs a per-sample spatial channel mean before the elementwise
-      ACON map; the map itself is opcode 52 (`TNNetAconC`) with a third table
-      computed on the device. The other ten (PReLU, PReLUChannel, SReLU, APL,
-      AconC, Spline, Swish/Mish/SoftPlusBeta learnable, Polynomial) run on
-      opcodes 15, 40 and 48-55: the scalar ones pass their weight as a kernel
-      argument, the per-channel ones read their neurons packed into one table
-      (`TNNetChannelTransformBase.PackActivationChannelTables`).
+- [X] `TNNetMetaAconC` device forward: `cai_meta_acon_table` builds the
+      p1|p2|beta table from the resident source's channel means (one work-item
+      per channel), then opcode 52 (`TNNetAconC`) maps it. All eleven
+      per-channel learnable activations (PReLU, PReLUChannel, SReLU, APL,
+      AconC, MetaAconC, Spline, Swish/Mish/SoftPlusBeta learnable, Polynomial)
+      now run on opcodes 15, 40 and 48-55: the scalar ones pass their weight as
+      a kernel argument, the per-channel ones read their neurons packed into one
+      table (`TNNetChannelTransformBase.PackActivationChannelTables`).
 - [ ] GPU-box decode timing for the trap-free math of d8e5ec90: the -80 floor in
       the split-row decode (one `fmax` per score) and `cai_tanh` on the soft-cap;
       not measured here.

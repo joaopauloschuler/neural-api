@@ -9554,11 +9554,27 @@ type
       // the pack (refilled on a weight update) when there are several neurons.
       function ActivationChannelParams(): TNNetVolume; override;
       function ActivationChannelTableCount(): integer; override;
+    protected
+      {$IFDEF OpenCL}
+      // A table kernel on FActivationKernel's queue that builds, from the
+      // resident source, the table cai_activation then reads (TNNetGRN, TNNetMetaAconC).
+      FChannelTableKernel: cl_kernel;
+      FChannelTableBuffer: cl_mem;
+      FChannelTableBufBytes: csize_t;
+      // Creates KernelName and a TableBytes device table; call after the
+      // inherited EnableOpenCL, which acquires FActivationKernel.
+      procedure ArmChannelTableOpenCL(const KernelName: string; TableBytes: csize_t);
+      procedure ReleaseChannelTableOpenCL();
+      // True when ArmChannelTableOpenCL armed a table of TableBytes.
+      function ChannelTableArmed(TableBytes: csize_t): boolean;
+      {$ENDIF}
     public
       constructor Create(); override;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
   end;
 
@@ -9859,29 +9875,20 @@ type
       // Channel-mean of Gx, the one forward scalar the backward needs beyond
       // FGxBuf/FNxBuf.
       FMeanG: TNeuralFloat;
-      {$IFDEF OpenCL}
-      // cai_grn_table on FActivationKernel's queue, and the 2*Depth coef|beta
-      // table it writes for cai_activation's ChannelAffine opcode.
-      FGRNTableKernel: cl_kernel;
-      FGRNTableBuffer: cl_mem;
-      FGRNTableBufBytes: csize_t;
-      procedure ReleaseGRNOpenCL();
-      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
       procedure SizeBackpropScratch();
     protected
       {$IFDEF OpenCL}
+      // cai_grn_table writes the 2*Depth coef|beta ChannelAffine table.
       function ActivationChannelBufferOnOpenCL(SourceBuffer,
         WeightBuffer: cl_mem): cl_mem; override;
       {$ENDIF}
     public
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       // Inference only: the device forward leaves the backward's Gx/Nx caches unset.
       function WillOpenCL(): boolean; override;
-      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
@@ -10258,7 +10265,19 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
       procedure SizeBackpropScratch();
+    protected
+      {$IFDEF OpenCL}
+      // cai_meta_acon_table turns the p1|p2|gamma|delta pack into the p1|p2|beta
+      // table of opcode 52, beta from the source's channel means.
+      function ActivationChannelBufferOnOpenCL(SourceBuffer,
+        WeightBuffer: cl_mem): cl_mem; override;
+      {$ENDIF}
     public
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      // Inference only: the device forward leaves the backward's m/beta caches unset.
+      function WillOpenCL(): boolean; override;
+      {$ENDIF}
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       procedure Compute(); override;
@@ -63888,7 +63907,6 @@ end;
 
 destructor TNNetGRN.Destroy();
 begin
-  {$IFDEF OpenCL} ReleaseGRNOpenCL(); {$ENDIF}
   SetLength(FGxBuf, 0);
   SetLength(FNxBuf, 0);
   SetLength(FCoefBuf, 0);
@@ -64115,60 +64133,17 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetGRN.ReleaseGRNOpenCL();
-begin
-  if Assigned(FGRNTableKernel) then
-  begin
-    clReleaseKernel(FGRNTableKernel);
-    FGRNTableKernel := nil;
-  end;
-  if Assigned(FGRNTableBuffer) then
-  begin
-    clReleaseMemObject(FGRNTableBuffer);
-    FGRNTableBuffer := nil;
-    FGRNTableBufBytes := 0;
-  end;
-end;
-
 procedure TNNetGRN.EnableOpenCL(DotProductKernel: TNeuralKernel);
-var
-  TableBytes: csize_t;
 begin
   inherited EnableOpenCL(DotProductKernel);
-  if not Assigned(FActivationKernel) then exit;
-  // Same TNeuralKernel as cai_activation: one in-order queue orders the passes.
-  if not Assigned(FGRNTableKernel) then
-    FGRNTableKernel := FActivationKernel.CreateKernel('cai_grn_table');
-  TableBytes := csize_t(2 * FOutput.Depth) * csNeuralFloatSize;
-  if Assigned(FGRNTableBuffer) and (FGRNTableBufBytes <> TableBytes) then
-  begin
-    clReleaseMemObject(FGRNTableBuffer);
-    FGRNTableBuffer := nil;
-  end;
-  if not Assigned(FGRNTableBuffer) then
-  begin
-    FGRNTableBufBytes := TableBytes;
-    FGRNTableBuffer := FActivationKernel.CreateBuffer(CL_MEM_READ_WRITE,
-      TableBytes);
-  end;
-end;
-
-procedure TNNetGRN.DisableOpenCL();
-begin
-  // The base downloads a resident output before it releases the shared handle.
-  inherited DisableOpenCL();
-  ReleaseGRNOpenCL();
-end;
-
-function TNNetGRN.OpenCLBufferBytes(): int64;
-begin
-  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FGRNTableBuffer);
+  ArmChannelTableOpenCL('cai_grn_table',
+    csize_t(2 * FOutput.Depth) * csNeuralFloatSize);
 end;
 
 function TNNetGRN.WillOpenCL(): boolean;
 begin
-  Result := (not FIsTrainable) and Assigned(FGRNTableKernel) and
-    (FGRNTableBufBytes = csize_t(2 * FOutput.Depth) * csNeuralFloatSize) and
+  Result := (not FIsTrainable) and
+    ChannelTableArmed(csize_t(2 * FOutput.Depth) * csNeuralFloatSize) and
     inherited WillOpenCL();
 end;
 
@@ -64180,7 +64155,7 @@ var
   fEps: single;
   LocalSize: csize_t;
 begin
-  k := FGRNTableKernel;
+  k := FChannelTableKernel;
   iNumPositions := FOutput.SizeX * FOutput.SizeY;
   iDepth := FOutput.Depth;
   fEps := csGRNEpsilon;
@@ -64190,10 +64165,10 @@ begin
   clSetKernelArg(k, 2, csNeuralFloatSize, @fEps);
   clSetKernelArg(k, 3, csCLMemSize, @WeightBuffer);
   clSetKernelArg(k, 4, csCLMemSize, @SourceBuffer);
-  clSetKernelArg(k, 5, csCLMemSize, @FGRNTableBuffer);
+  clSetKernelArg(k, 5, csCLMemSize, @FChannelTableBuffer);
   clSetKernelArg(k, 6, LocalSize * csNeuralFloatSize, nil); // __local scratch
   FActivationKernel.RunKernel2D(k, LocalSize, 1, LocalSize, 1);
-  Result := FGRNTableBuffer;
+  Result := FChannelTableBuffer;
 end;
 {$ENDIF}
 
@@ -65514,6 +65489,7 @@ end;
 constructor TNNetMetaAconC.Create();
 begin
   inherited Create();
+  FActivationOpcode := csActAconC;
   InitDefault();
 end;
 
@@ -65566,7 +65542,11 @@ var
   P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
   W2 := FNeurons[1].FWeights;
@@ -65751,6 +65731,43 @@ begin
   FNeurons[3].FWeights.Fill(0);
   AfterWeightUpdate();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetMetaAconC.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  ArmChannelTableOpenCL('cai_meta_acon_table',
+    csize_t(3 * FOutput.Depth) * csNeuralFloatSize);
+end;
+
+function TNNetMetaAconC.WillOpenCL(): boolean;
+begin
+  Result := (not FIsTrainable) and
+    ChannelTableArmed(csize_t(3 * FOutput.Depth) * csNeuralFloatSize) and
+    inherited WillOpenCL();
+end;
+
+function TNNetMetaAconC.ActivationChannelBufferOnOpenCL(SourceBuffer,
+  WeightBuffer: cl_mem): cl_mem;
+var
+  k: cl_kernel;
+  iNumPositions, iDepth: longint;
+  fInvNumPositions: single;
+begin
+  k := FChannelTableKernel;
+  iNumPositions := FOutput.SizeX * FOutput.SizeY;
+  iDepth := FOutput.Depth;
+  fInvNumPositions := 1 / iNumPositions;
+  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
+  clSetKernelArg(k, 1, csLongintSize, @iDepth);
+  clSetKernelArg(k, 2, csNeuralFloatSize, @fInvNumPositions);
+  clSetKernelArg(k, 3, csCLMemSize, @WeightBuffer);
+  clSetKernelArg(k, 4, csCLMemSize, @SourceBuffer);
+  clSetKernelArg(k, 5, csCLMemSize, @FChannelTableBuffer);
+  FActivationKernel.RunKernel(k, iDepth);
+  Result := FChannelTableBuffer;
+end;
+{$ENDIF}
 
 { TNNetTokenShift }
 constructor TNNetTokenShift.Create();
@@ -81064,6 +81081,7 @@ end;
 
 destructor TNNetChannelTransformBase.Destroy();
 begin
+  {$IFDEF OpenCL} ReleaseChannelTableOpenCL(); {$ENDIF}
   FAconSigmoid.Free;
   FAconBetaGain.Free;
   FAconGain.Free;
@@ -81187,6 +81205,59 @@ begin
     FActivationChannelPack.ReSize(FNeurons.Count * FNeurons[0].FWeights.Size, 1, 1);
     PackActivationChannelTables();
   end;
+end;
+
+procedure TNNetChannelTransformBase.DisableOpenCL();
+begin
+  // The base downloads a resident output before it releases the shared handle.
+  inherited DisableOpenCL();
+  ReleaseChannelTableOpenCL();
+end;
+
+function TNNetChannelTransformBase.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes() + OpenCLMemBytes(FChannelTableBuffer);
+end;
+
+procedure TNNetChannelTransformBase.ArmChannelTableOpenCL(
+  const KernelName: string; TableBytes: csize_t);
+begin
+  if not Assigned(FActivationKernel) then exit;
+  // Same TNeuralKernel as cai_activation: one in-order queue orders the passes.
+  if not Assigned(FChannelTableKernel) then
+    FChannelTableKernel := FActivationKernel.CreateKernel(KernelName);
+  if Assigned(FChannelTableBuffer) and (FChannelTableBufBytes <> TableBytes) then
+  begin
+    clReleaseMemObject(FChannelTableBuffer);
+    FChannelTableBuffer := nil;
+  end;
+  if not Assigned(FChannelTableBuffer) then
+  begin
+    FChannelTableBufBytes := TableBytes;
+    FChannelTableBuffer := FActivationKernel.CreateBuffer(CL_MEM_READ_WRITE,
+      TableBytes);
+  end;
+end;
+
+procedure TNNetChannelTransformBase.ReleaseChannelTableOpenCL();
+begin
+  if Assigned(FChannelTableKernel) then
+  begin
+    clReleaseKernel(FChannelTableKernel);
+    FChannelTableKernel := nil;
+  end;
+  if Assigned(FChannelTableBuffer) then
+  begin
+    clReleaseMemObject(FChannelTableBuffer);
+    FChannelTableBuffer := nil;
+    FChannelTableBufBytes := 0;
+  end;
+end;
+
+function TNNetChannelTransformBase.ChannelTableArmed(TableBytes: csize_t): boolean;
+begin
+  Result := Assigned(FChannelTableKernel) and Assigned(FChannelTableBuffer) and
+    (FChannelTableBufBytes = TableBytes);
 end;
 {$ENDIF}
 

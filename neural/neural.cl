@@ -3009,6 +3009,33 @@ __kernel void cai_grn_table
   }
 }
 
+// Meta-ACON beta table (TNNetMetaAconC forward). FWeights is p1|p2|gamma|delta
+// packed (4*FDepth); FTable gets p1|p2|beta (3*FDepth) for cai_activation's
+// AconC opcode 52, with
+//   beta[c] = sigmoid(gamma[c] * mean_p(x[p,c]) + delta[c])
+// over the FNumPositions positions of one depth-contiguous volume. One
+// work-item per channel. Forward-only.
+__kernel void cai_meta_acon_table
+(
+  const int FNumPositions,
+  const int FDepth,
+  const float FInvNumPositions,
+  __global const float* FWeights,
+  __global const float* FX,
+  __global float* FTable
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FDepth) return;
+  float ChannelSum = 0.0f;
+  for (int p = 0; p < FNumPositions; p++) ChannelSum += FX[p * FDepth + c];
+  const float BetaInput = mad(FWeights[2 * FDepth + c],
+    ChannelSum * FInvNumPositions, FWeights[3 * FDepth + c]);
+  FTable[c] = FWeights[c];
+  FTable[FDepth + c] = FWeights[FDepth + c];
+  FTable[2 * FDepth + c] = cai_fused_act(BetaInput, 2);
+}
+
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
 // The input volume is laid out depth-axis contiguous in the TVolume convention:
 // element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride
