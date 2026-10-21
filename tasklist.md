@@ -1856,11 +1856,13 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [ ] `TNNetDeepConcat` upload follow-ups (from 1b292c2f): a zero-depth
+- [X] `TNNetDeepConcat` upload follow-ups (from 1b292c2f): a zero-depth
       host-only source is not skipped (TNNetConcat skips 0-byte sources; the
       deep concat would create a 0-byte buffer), and a host-only layer listed at
       two source positions is uploaded twice. Guard the first; share one upload
-      per distinct layer for the second.
+      per distinct layer for the second. Done: an empty source binds nil and
+      gets no per-source launch; `FUploadOwnerPos` shares one upload per layer
+      (`TestDeepConcatHostSourceEdgeOpenCLParity`).
 - [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
       (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
       plan too (DeMaxPool's random spacing would need a per-forward plan, so

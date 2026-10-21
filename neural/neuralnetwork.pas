@@ -13832,12 +13832,15 @@ type
     // its byte capacity. Sized in EnableOpenCL, allocated on a source's first upload.
     FUploadBuffers: array of cl_mem;
     FUploadBufBytes: array of csize_t;
+    // Per source position: the first position listing the same layer. Only that
+    // position uploads; the later ones bind its upload buffer.
+    FUploadOwnerPos: TNeuralIntegerArray;
     // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
     function OutputKernelName(): string; override;
     // Releases the upload buffers, then the inherited output buffer and kernel.
     procedure ReleaseOutputOpenCL(); override;
-    // The OpenCL buffer the kernels read source SourcePos from: its own output
-    // when resident, else its upload buffer refreshed from RAM (blocking).
+    // The OpenCL buffer source SourcePos is read from: its own output if resident, else
+    // an upload refreshed from RAM (nil when empty). Call in ascending SourcePos.
     function SourceBufferOnOpenCL(SourcePos: integer): cl_mem;
     // Scatters the source outputs into FOutputBuffer, uploading host-only ones
     // first. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
@@ -104301,7 +104304,7 @@ end;
 
 procedure TNNetDeepConcat.EnableOpenCL(DotProductKernel: TNeuralKernel);
 var
-  MaxSourcePos, SourcePos, SourceCount: integer;
+  MaxSourcePos, SourcePos, OwnerPos, SourceCount: integer;
 begin
   // The source list is fixed at construction, so the arity verdict is too, and it
   // has to precede the inherited acquire: it picks which kernel name to bind.
@@ -104322,6 +104325,13 @@ begin
   // SetLength keeps existing handles and zeroes new slots, so a re-arm leaks nothing.
   SetLength(FUploadBuffers, FPrevLayerList.Count);
   SetLength(FUploadBufBytes, FPrevLayerList.Count);
+  SetLength(FUploadOwnerPos, FPrevLayerList.Count);
+  for SourcePos := 0 to MaxSourcePos do
+  begin
+    OwnerPos := 0;
+    while FPrevLayerList[OwnerPos] <> FPrevLayerList[SourcePos] do Inc(OwnerPos);
+    FUploadOwnerPos[SourcePos] := OwnerPos;
+  end;
 end;
 
 procedure TNNetDeepConcat.ReleaseOutputOpenCL();
@@ -104352,13 +104362,19 @@ end;
 function TNNetDeepConcat.SourceBufferOnOpenCL(SourcePos: integer): cl_mem;
 var
   Source: TNNetLayer;
+  OwnerPos: integer;
 begin
   Source := FPrevLayerList[SourcePos];
+  OwnerPos := FUploadOwnerPos[SourcePos];
   if Source.OutputBindableOnOpenCL() then
   begin
     Source.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
     Result := Source.OpenCLOutputBuffer();
   end
+  // No kernel reads an empty source, and OpenCL rejects a 0-byte buffer.
+  else if FPrevOutput[SourcePos].Size = 0 then Result := nil
+  // The owner position came earlier in this forward and already uploaded it.
+  else if OwnerPos < SourcePos then Result := FUploadBuffers[OwnerPos]
   else
   begin
     // Blocking: a forward whose last layer ends on the host does not drain
@@ -104443,6 +104459,8 @@ begin
       for SourcePos := 0 to MaxSourcePos do
       begin
         iInDepth := FPrevOutput[SourcePos].Depth;
+        // A zero-depth source writes no channel, and a 0-sized launch is an error.
+        if iInDepth = 0 then continue;
         SourceBuffer := SourceBufferOnOpenCL(SourcePos);
         clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
         clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);

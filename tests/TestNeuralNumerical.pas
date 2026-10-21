@@ -30,7 +30,7 @@ type
 
   TTestNeuralNumerical = class(TTestCase)
   private
-    // Last message handed to TEasyOpenCL.ErrorProc by a deliberate bad build.
+    // Last message a test's TEasyOpenCL.ErrorProc hook received.
     FLastCompileError: string;
     procedure CaptureCompileError(const AMessage: string);
     // Window attention (Cosine = SwinV2) on OpenCL vs the CPU: several windows
@@ -2121,6 +2121,9 @@ type
     // TNNetDeepConcat with resident and host-only sources, 4x3 and 1x1, fused and
     // per-source launches: exact vs CPU, only host-only sources are uploaded.
     procedure TestDeepConcatHostSourceOpenCLParity;
+    // TNNetDeepConcat with a zero-depth host-only source, and with one host-only
+    // layer at two positions: exact vs CPU, that layer is uploaded once.
+    procedure TestDeepConcatHostSourceEdgeOpenCLParity;
   end;
 
 implementation
@@ -2133,10 +2136,35 @@ type
     constructor Create(pMul: TNeuralFloat); overload;
   end;
 
+  // A host-only layer whose output has pSizeX x pSizeY positions and depth 0.
+  THostOnlyEmptyDepth = class(TNNetLayer)
+  public
+    constructor Create(pSizeX, pSizeY: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  // Exposes the borrowed FOutputKernel, so a test can hook its ErrorProc.
+  TDeepConcatAccess = class(TNNetDeepConcat);
+
 constructor THostOnlyMulByConstant.Create(pMul: TNeuralFloat);
 begin
   inherited Create(pMul);
   FActivationOpcode := csActNone;
+end;
+
+constructor THostOnlyEmptyDepth.Create(pSizeX, pSizeY: integer);
+begin
+  inherited Create();
+  FOutput.ReSize(pSizeX, pSizeY, 0);
+end;
+
+procedure THostOnlyEmptyDepth.Compute();
+begin
+end;
+
+procedure THostOnlyEmptyDepth.Backpropagate();
+begin
 end;
 
 procedure TTestNeuralNumerical.TestConvolutionNumericalValues;
@@ -73579,6 +73607,121 @@ begin
     finally
       OpenCLTransferCounting := WasCounting;
       ConcatCPU.Free;
+      Expected.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDeepConcatHostSourceEdgeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSizeX = 4;
+  csSizeY = 3;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  InputLayer, ShuffleLayer, ReLULayer, IdentityLayer, EmptyLayer: TNNetLayer;
+  ConcatLayer: TNNetDeepConcat;
+  OutputKernel: TNeuralKernel;
+  OldErrorProc: TGetStrProc;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseCnt, Pos, MaxPos, HostSourceBytes: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  for CaseCnt := 0 to 2 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csSizeX, csSizeY, 6);
+    Expected := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(csSizeX, csSizeY, 6));
+      ShuffleLayer := NN.AddLayerAfter(TNNetChannelShuffle.Create(3), InputLayer);
+      ReLULayer := NN.AddLayerAfter(TNNetReLU.Create(), InputLayer);
+      // TNNetIdentity has no OpenCL path.
+      IdentityLayer := NN.AddLayerAfter(TNNetIdentity.Create(), InputLayer);
+      EmptyLayer := NN.AddLayerAfter(THostOnlyEmptyDepth.Create(csSizeX, csSizeY),
+        InputLayer);
+      HostSourceBytes := IdentityLayer.Output.Size * SizeOf(TNeuralFloat);
+      case CaseCnt of
+        0:
+        begin
+          CaseName := 'fused, zero-depth host-only source';
+          ConcatLayer := TNNetDeepConcat.Create([ShuffleLayer, EmptyLayer, ReLULayer]);
+          HostSourceBytes := 0;
+        end;
+        1:
+        begin
+          CaseName := 'per-source, zero-depth and repeated host-only sources';
+          ConcatLayer := TNNetDeepConcat.Create(
+            [ShuffleLayer, EmptyLayer, IdentityLayer, ReLULayer, IdentityLayer]);
+        end;
+        else
+        begin
+          CaseName := 'fused, repeated host-only source';
+          ConcatLayer := TNNetDeepConcat.Create([IdentityLayer, ReLULayer, IdentityLayer]);
+        end;
+      end;
+      NN.AddLayer(ConcatLayer);
+      NN.AddLayer(TNNetReLU.Create());
+      NN.SetTrainable(False, False);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) - 0.3;
+
+      NN.Compute(Input);
+      Expected.Copy(NN.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      OutputKernel := TDeepConcatAccess(ConcatLayer).FOutputKernel;
+      AssertTrue('TNNetDeepConcat acquired its kernel (' + CaseName + ')',
+        Assigned(OutputKernel));
+      OldErrorProc := OutputKernel.ErrorProc;
+      OutputKernel.ErrorProc := @Self.CaptureCompileError;
+      FLastCompileError := '';
+      try
+        NN.Compute(Input);
+        OpenCLTransferCounting := true;
+        TransfersBefore := OpenCLProcessTransferTotals();
+        NN.Compute(Input);
+        TransfersAfter := OpenCLProcessTransferTotals();
+        OpenCLTransferCounting := WasCounting;
+      finally
+        OutputKernel.ErrorProc := OldErrorProc;
+      end;
+      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
+      WriteLn('  DeepConcat host source edge (', CaseName, '): max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', ConcatLayer.ForwardGPUCnt,
+        ' upload bytes=', TransfersAfter.UploadBytes - TransfersBefore.UploadBytes,
+        ' OpenCL error="', FLastCompileError, '"');
+      AssertEquals('no OpenCL call failed (' + CaseName + ')', '', FLastCompileError);
+      AssertEquals('TNNetDeepConcat ran both forwards on OpenCL (' + CaseName + ')',
+        2, ConcatLayer.ForwardGPUCnt);
+      // The input, then one upload per distinct non-empty host-only layer.
+      AssertEquals('bytes uploaded per forward (' + CaseName + ')',
+        Input.Size * SizeOf(TNeuralFloat) + HostSourceBytes,
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+      AssertTrue('TNNetDeepConcat OpenCL vs CPU (' + CaseName + '): max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
+      AssertTrue('the CPU reference is not degenerate', Expected.GetMaxAbs() > 0);
+    finally
+      OpenCLTransferCounting := WasCounting;
       Expected.Free;
       Input.Free;
       NN.Free;
