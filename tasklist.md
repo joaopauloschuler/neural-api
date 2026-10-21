@@ -616,15 +616,20 @@ rather than acted on.
       transformer blocks at full resolution: LayerNorm over channels (WithBias and
       BiasFree variants), MDTA attention, GDFN feed-forward,
       PixelUnshuffle/PixelShuffle down/up, skip concat + 1x1 reduce, refinement
-      blocks, global residual. Needs ONE new leaf layer: MDTA's TRANSPOSED
-      (channel-wise) attention. Per head it L2-normalizes q and k along the
-      spatial axis, then computes softmax(q k^T * temperature) as a C/h x C/h map
-      and applies it to v. Cost is linear in pixels, which is what makes 1-4 MP
-      restoration feasible. Write it as `TNNetChannelAttention` (or a better
-      name; check existing names first) with a learnable per-head temperature, a
-      numerical-gradient test and an OpenCL forward from the start (bind the
-      resident source, two GEMM-shaped contractions over H*W plus a tiny C x C
-      softmax). Everything else is existing layers: `TNNetPointwiseConvLinear`,
+      blocks, global residual.
+  - [X] The ONE new leaf layer, MDTA's transposed (channel-wise) attention,
+        LANDED as `TNNetTransposedChannelAttention.Create(Heads)` (7ded244f):
+        input W x H x 3C ([q|k|v] along depth, head-major, i.e. torch's
+        qkv.chunk(3, dim=1) + 'b (head c) h w'), output W x H x C; the Heads
+        temperatures are `Neurons[0].Weights.Raw[h]` (torch `temperature`,
+        shape (heads,1,1), copy the heads values in order). CPU forward +
+        backward (input and temperature gradients), OpenCL forward
+        (inference, resident in and out), parity-tested on PoCL. The qkv 1x1 +
+        3x3 depthwise conv and the project_out 1x1 stay existing layers.
+        Follow-up: `cai_transposed_attn_dots` reads q|k with a 3C stride per
+        position (uncoalesced); time it on the GPU box at 1-4 MP before
+        tuning.
+  - [ ] The importer and example (everything below). Everything else is existing layers: `TNNetPointwiseConvLinear`,
       `TNNetDepthwiseConv` (the 3x3 dconv on qkv and inside GDFN),
       `TNNetGEGLUErf` for GDFN's gelu(x1)*x2 (check that the half order matches
       torch.chunk), `TNNetSpaceToDepth`/`TNNetPixelShuffle` (check that the
