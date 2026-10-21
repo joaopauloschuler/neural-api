@@ -1,8 +1,8 @@
 unit neuralimageresize;
 
 (*
-neuralimageresize: image resampling on TNNetVolume with no unit dependency
-beyond neuralvolume (no fcl-image), so importers can use it.
+neuralimageresize: image resampling and filtering on TNNetVolume with no
+unit dependency beyond neuralvolume (no fcl-image), so importers can use it.
 
 Coded by Claude (AI).
 *)
@@ -34,6 +34,10 @@ procedure ResizeImageLanczos(Source, Dest: TNNetVolume; NewSizeX,
 // Trunc(ShortestEdge*Long/Short)) with PIL's uint8 rounding.
 procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
   ShortestEdge: integer; Filter: TImageResampleFilter);
+
+// Separable Gaussian blur of Source (W,H,D) per channel, sigma = Radius (PIL
+// GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
 
 // PIL code (0 NEAREST, 1 LANCZOS, 2 BILINEAR, 3 BICUBIC, 4 BOX, 5 HAMMING),
 // as in a HF preprocessor_config.json "resample"; raises on other codes.
@@ -286,6 +290,79 @@ begin
       Dest.FData[DestPos + ElementPos] := Sum;
     end;
   end;
+end;
+
+
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
+var
+  // Taps[TapPos] weighs the pixel TapPos - TapRadius away; they sum to 1.
+  Taps: array of double;
+  // Source blurred along X only, in the TNNetVolume layout.
+  Rows: array of TNeuralFloat;
+  TapRadius, TapPos, MaxTapPos, SizeX, SizeY, Depth, RowStride: integer;
+  X, Y, Channel, MaxX, MaxY, MaxChannel, NeighbourPos, PixelPos,
+    SourcePixelPos: integer;
+  Distance, TapSum, Sum: double;
+begin
+  if Radius <= 0 then
+  begin
+    if Dest <> Source then Dest.Copy(Source);
+    exit;
+  end;
+  // 3 sigma holds all but 0.3% of the Gaussian's mass.
+  TapRadius := Ceil(3 * Radius);
+  MaxTapPos := 2 * TapRadius;
+  SetLength(Taps, MaxTapPos + 1);
+  TapSum := 0;
+  for TapPos := 0 to MaxTapPos do
+  begin
+    Distance := TapPos - TapRadius;
+    Taps[TapPos] := Exp(-Distance * Distance / (2 * Radius * Radius));
+    TapSum := TapSum + Taps[TapPos];
+  end;
+  for TapPos := 0 to MaxTapPos do
+    Taps[TapPos] := Taps[TapPos] / TapSum;
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  Depth := Source.Depth;
+  RowStride := SizeX * Depth;
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  MaxChannel := Depth - 1;
+  SetLength(Rows, SizeX * SizeY * Depth);
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      PixelPos := Y * RowStride + X * Depth;
+      for Channel := 0 to MaxChannel do
+      begin
+        Sum := 0;
+        for TapPos := 0 to MaxTapPos do
+        begin
+          NeighbourPos := Min(Max(X + TapPos - TapRadius, 0), MaxX);
+          Sum := Sum + Taps[TapPos] *
+            Source.FData[Y * RowStride + NeighbourPos * Depth + Channel];
+        end;
+        Rows[PixelPos + Channel] := Sum;
+      end;
+    end;
+  Dest.ReSize(SizeX, SizeY, Depth);
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      PixelPos := Y * RowStride + X * Depth;
+      for Channel := 0 to MaxChannel do
+      begin
+        Sum := 0;
+        for TapPos := 0 to MaxTapPos do
+        begin
+          NeighbourPos := Min(Max(Y + TapPos - TapRadius, 0), MaxY);
+          SourcePixelPos := NeighbourPos * RowStride + X * Depth;
+          Sum := Sum + Taps[TapPos] * Rows[SourcePixelPos + Channel];
+        end;
+        Dest.FData[PixelPos + Channel] := Sum;
+      end;
+    end;
 end;
 
 

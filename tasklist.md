@@ -1645,7 +1645,8 @@ rather than acted on.
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
             example output.
-      - [ ] `--mask-blur N` (diffusers `mask_processor.blur`).
+      - [X] `--mask-blur N` (diffusers `mask_processor.blur`): `--mask-blur R` /
+            `/mask-blur R` via `GaussianBlurImage` (neuralimageresize.pas).
       - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
             generate at full resolution, paste back (`apply_overlay`); makes a
             small hole in a large photo cheap.

@@ -50,6 +50,11 @@ type
     // A (W,H,4) volume saved as PNG is 8-bit RGBA (colour type 6) and reloads
     // with its alpha; a 3-channel volume reloads opaque.
     procedure TestSaveImageRGBAPngRoundTrip;
+    // GaussianBlurImage of a centred hot pixel keeps its mass of 1, is
+    // symmetric, peaks at 1/S^2 (S = the 1-D tap sum); a flat channel stays flat.
+    procedure TestGaussianBlurImageHotPixel;
+    // Radius 0 copies Source into Dest; in place it changes nothing.
+    procedure TestGaussianBlurImageZeroRadiusIsIdentity;
   end;
 
 implementation
@@ -371,6 +376,85 @@ begin
     Img.Free;
     Reloaded.Free;
     Src.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestGaussianBlurImageHotPixel;
+const
+  csSide = 15;
+  csCenter = 7;
+  csRadius = 1.5;
+  csFlatValue = 5;
+var
+  Image: TNNetVolume;
+  X, Y, OffsetX, OffsetY, Distance: integer;
+  MassSum, TapSum, Value: double;
+begin
+  Image := TNNetVolume.Create(csSide, csSide, 2);
+  try
+    Image.Fill(0);
+    for Y := 0 to csSide - 1 do
+      for X := 0 to csSide - 1 do Image[X, Y, 1] := csFlatValue;
+    Image[csCenter, csCenter, 0] := 1;
+    GaussianBlurImage(Image, Image, csRadius);
+    MassSum := 0;
+    for Y := 0 to csSide - 1 do
+      for X := 0 to csSide - 1 do
+      begin
+        MassSum := MassSum + Image[X, Y, 0];
+        AssertEquals('flat channel at ' + IntToStr(X) + ',' + IntToStr(Y),
+          csFlatValue, Image[X, Y, 1], 1e-5);
+      end;
+    AssertEquals('mass', 1, MassSum, 1e-5);
+    // Taps reach Ceil(3 * 1.5) = 5 pixels, so the centre value is 1/TapSum^2.
+    TapSum := 0;
+    for Distance := -5 to 5 do
+      TapSum := TapSum + Exp(-Distance * Distance / (2 * csRadius * csRadius));
+    AssertEquals('peak', 1 / (TapSum * TapSum),
+      Image[csCenter, csCenter, 0], 1e-6);
+    AssertEquals('no taps beyond 5 pixels', 0, Image[csCenter + 6, csCenter, 0], 0);
+    for OffsetY := -6 to 6 do
+      for OffsetX := -6 to 6 do
+      begin
+        Value := Image[csCenter + OffsetX, csCenter + OffsetY, 0];
+        AssertEquals('mirror X', Value,
+          Image[csCenter - OffsetX, csCenter + OffsetY, 0], 1e-7);
+        AssertEquals('mirror Y', Value,
+          Image[csCenter + OffsetX, csCenter - OffsetY, 0], 1e-7);
+        AssertEquals('transpose', Value,
+          Image[csCenter + OffsetY, csCenter + OffsetX, 0], 1e-7);
+        AssertTrue('peak is the maximum',
+          Value <= Image[csCenter, csCenter, 0]);
+      end;
+  finally
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestGaussianBlurImageZeroRadiusIsIdentity;
+var
+  Source, Dest: TNNetVolume;
+  ElementPos: integer;
+begin
+  Source := TNNetVolume.Create(4, 3, 3);
+  Dest := TNNetVolume.Create;
+  try
+    for ElementPos := 0 to Source.Size - 1 do
+      Source.FData[ElementPos] := (ElementPos * 37) mod 256;
+    GaussianBlurImage(Source, Dest, 0);
+    AssertEquals('width', 4, Dest.SizeX);
+    AssertEquals('height', 3, Dest.SizeY);
+    AssertEquals('depth', 3, Dest.Depth);
+    for ElementPos := 0 to Source.Size - 1 do
+      AssertEquals('copied element ' + IntToStr(ElementPos),
+        Source.FData[ElementPos], Dest.FData[ElementPos], 0);
+    GaussianBlurImage(Dest, Dest, 0);
+    for ElementPos := 0 to Source.Size - 1 do
+      AssertEquals('in-place element ' + IntToStr(ElementPos),
+        Source.FData[ElementPos], Dest.FData[ElementPos], 0);
+  finally
+    Dest.Free;
+    Source.Free;
   end;
 end;
 

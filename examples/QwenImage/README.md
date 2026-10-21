@@ -147,6 +147,7 @@ follow:
 | `/images` | list the condition images; `/images clear` removes them all (back to text-to-image) and frees the vision tower and the VAE encoder |
 | `/init-image FILE` | init image for the next prompts (img2img, as `--init-image`); `/init-image off` clears it |
 | `/mask FILE` | inpaint mask for the init image (as `--mask`); `/mask off` clears it |
+| `/mask-blur R` | mask blur sigma in pixels (as `--mask-blur`); reloads the current mask with it |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/profile on\|off` | `--profile` from the next image |
@@ -310,6 +311,7 @@ This is the blended (no-retrain) mode of the diffusers Qwen-Image v1
 no inpaint pipeline for 2.1.
 
 1. The mask is read as grayscale (PIL's `L` weights, alpha ignored),
+   blurred at its own size when `--mask-blur R` is given (see below),
    stretched to the output size (the init image's), binarized at 50% and
    reduced to the latent grid by nearest sampling: one value per 16x16-pixel
    cell, taken from the cell's top-left pixel. In 2.1 a latent cell is one
@@ -327,6 +329,15 @@ through its attention, a little everywhere) can change slightly even though
 the kept latents are exact. A mask of another aspect ratio than the init
 image is stretched, not cropped. The mask is encoded once per output size;
 `/mask off` (or `/init-image off`) goes back to img2img (or text-to-image).
+
+`--mask-blur R` (or `/mask-blur R`) blurs the mask with a Gaussian of sigma
+`R` mask pixels before the 50% threshold, as diffusers'
+`mask_processor.blur(mask, blur_factor=R)` does before the mask enters the
+pipeline. `GaussianBlurImage` (neural/neuralimageresize.pas) runs a true
+separable Gaussian with clamped edges; PIL's `GaussianBlur` approximates the
+same Gaussian with three extended box blurs, so edge values can differ
+slightly. The threshold then rounds the mask's corners and erases specks and
+thin lines narrower than about `R` pixels. Default 0 (no blur).
 
 Status: the inpaint path matches diffusers on the pico checkpoint
 (`TestQwenImage21InpaintParity`); a real 1024x1024 inpaint on the GPU box
@@ -371,6 +382,7 @@ and `--fp32`, the last one given wins.
 | `--image FILE` | edit: a condition image (PNG, JPEG, ...); repeat for up to 10; see [Image editing](#image-editing) | — |
 | `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
 | `--mask FILE` | with `--init-image`: inpaint, regenerate only the mask's white region; see [Inpainting](#inpainting) | — |
+| `--mask-blur R` | blur the mask by a Gaussian of sigma R pixels before the 50% threshold (diffusers `mask_processor.blur`) | 0 |
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
@@ -526,7 +538,7 @@ under [VAE tiles](#vae-tiles).
 - The negative prompt (classifier-free guidance) is not implemented.
 - Editing is tested only against diffusers on the pico checkpoint; it has
   not run on the real checkpoint yet. The same holds for inpainting.
-- Inpainting has no mask blur and no `padding_mask_crop` (crop to the
+- Inpainting has no `padding_mask_crop` (crop to the
   mask's bounding box, generate at full resolution, paste back), so a small
   hole in a large photo costs a full-size image.
 - The VAE encoder and the vision tower run untiled on the CPU, so their

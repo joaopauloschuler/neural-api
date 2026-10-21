@@ -24,8 +24,8 @@ input ends the session). Images go to numbered files from the --output base
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
-/images [clear], /init-image FILE|off, /mask FILE|off, /strength S,
-/profile on|off, /stats on|off, /quit.
+/images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
+/strength S, /profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -47,7 +47,9 @@ orientation is not applied.
 Inpainting (--init-image FILE --mask FILE, or /mask FILE in the REPL): img2img
 that regenerates only the white region of the mask and keeps the rest of the
 init image (diffusers QwenImageInpaintPipeline's blended mode, no retrained
-model). The mask is read as grayscale (alpha ignored), stretched to the
+model). The mask is read as grayscale (alpha ignored), optionally blurred at
+its own size (--mask-blur R: a Gaussian of sigma R pixels, as diffusers'
+mask_processor.blur), stretched to the
 output size, binarized at 50% and taken per 16x16-pixel latent cell (each
 cell's top-left pixel decides). After every step the kept cells are reset to
 the init image's latents at the next noise level, and to the latents
@@ -65,7 +67,7 @@ USAGE
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
             [--repeat N] [--image FILE ... |
-             --init-image FILE [--mask FILE] [--strength 0.6]]
+             --init-image FILE [--mask FILE [--mask-blur R]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -89,7 +91,7 @@ uses
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
   SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread,
-  neuraldiffusion;
+  neuraldiffusion, neuralimageresize;
 
 const
   // Largest accepted image side in pixels (64x the 1024 default area).
@@ -452,6 +454,10 @@ begin
     'stretched to the output');
   WriteLn('                       size, decided per 16x16 cell), the rest ',
     'keeps the init image');
+  WriteLn('  --mask-blur R        blur the mask by a Gaussian of sigma R ',
+    'pixels at its own size before');
+  WriteLn('                       the 50% threshold (diffusers ',
+    'mask_processor.blur; default 0 = off)');
   WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
     csDefaultStrength:0:1, '): runs only the last');
   WriteLn('                       part of the schedule (18 steps at 0.6: the ',
@@ -548,6 +554,8 @@ begin
   WriteLn('  /mask FILE           inpaint mask for the init image (white = ',
     'regenerate); /mask off');
   WriteLn('                       clears it');
+  WriteLn('  /mask-blur R         mask blur sigma in pixels, as --mask-blur; ',
+    'reloads the current mask');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
@@ -643,6 +651,17 @@ begin
   else Result := '';
 end;
 
+// Parses a mask blur radius >= 0 in pixels (a '.' decimal point); returns ''
+// or what is wrong.
+function ParseMaskBlurRadius(const Text: string; out Radius: double): string;
+begin
+  if not TryStrToFloat(Trim(Text), Radius, PointFormat()) or
+    not ((Radius >= 0) and (Radius <= csMaxImageSide)) then
+    Result := '"' + Text + '" is not a number in [0, ' +
+      IntToStr(csMaxImageSide) + '].'
+  else Result := '';
+end;
+
 // Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
 function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
 begin
@@ -713,6 +732,8 @@ var
   // applies while an init image is set.
   HasMask: boolean;
   MaskFile: string;
+  // Gaussian sigma in mask pixels that LoadMask blurs the mask with (0: none).
+  MaskBlurRadius: double;
   MaskImage, MaskLatents: TNNetVolume;
   MaskLatentsWidth, MaskLatentsHeight: integer;
   // Edit: the condition images as read (0..255) and their files; the
@@ -855,7 +876,7 @@ var
   end;
 
   // Loads FileName as the inpaint mask (any size: it is stretched to the
-  // output size); otherwise returns what is wrong and changes nothing.
+  // output size), blurred by MaskBlurRadius; otherwise returns what is wrong.
   function LoadMask(const FileName: string): string;
   var
     Loaded: TNNetVolume;
@@ -871,7 +892,7 @@ var
           E.Message;
       end;
       if Result <> '' then exit;
-      MaskImage.Copy(Loaded);
+      GaussianBlurImage(Loaded, MaskImage, MaskBlurRadius);
     finally
       Loaded.Free;
     end;
@@ -1042,8 +1063,13 @@ var
       InitImage.SizeY, '), strength ', StrengthText(Strength), ', the last ',
       StepCount - StartStep, ' of ', StepCount, ' steps');
     if IsInpainting() then
+    begin
       WriteLn('Mask       : ', MaskFile, ' (', MaskImage.SizeX, 'x',
         MaskImage.SizeY, '), only its white region is regenerated');
+      if MaskBlurRadius > 0 then
+        WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
+          PointFormat()), ' pixels');
+    end;
   end;
 
   // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
@@ -1238,7 +1264,7 @@ var
   end;
 
   // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image,
-  // /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
+  // /mask, /mask-blur, /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
   // out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
@@ -1246,7 +1272,7 @@ var
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
-    NewStrength: double;
+    NewStrength, NewMaskBlurRadius: double;
     Command, Argument, Problem: string;
   begin
     Result := true;
@@ -1434,6 +1460,26 @@ var
           MaskImage.SizeY, '): applies once /init-image sets an init image]');
       end;
     end
+    else if Command = 'mask-blur' then
+    begin
+      Problem := ParseMaskBlurRadius(Argument, NewMaskBlurRadius);
+      if Problem <> '' then WriteLn('[/mask-blur: ', Problem, ']')
+      else
+      begin
+        MaskBlurRadius := NewMaskBlurRadius;
+        if HasMask then
+        begin
+          Problem := LoadMask(MaskFile);
+          if Problem <> '' then
+            WriteLn('[/mask-blur: ', Problem, ' - the mask keeps its ',
+              'previous blur]')
+          else WriteLn('[mask blur ', FloatToStr(MaskBlurRadius,
+            PointFormat()), ': ', MaskFile, ' reloaded]');
+        end
+        else WriteLn('[mask blur ', FloatToStr(MaskBlurRadius, PointFormat()),
+          ' for the next /mask]');
+      end;
+    end
     else if Command = 'strength' then
     begin
       Problem := ParseStrength(Argument, NewStrength);
@@ -1461,7 +1507,8 @@ var
       end;
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
-      '/tile, /repeat, /image, /images, /init-image, /mask, /strength, ',
+      '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
+      '/strength, ',
       '/profile, /stats, /quit]');
   end;
 
@@ -1475,7 +1522,8 @@ var
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
-      '/init-image FILE|off, /mask FILE|off, /strength S, /profile on|off, ',
+      '/init-image FILE|off, /mask FILE|off, /mask-blur R, /strength S, ',
+      '/profile on|off, ',
       '/stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
@@ -1531,6 +1579,7 @@ begin
   ImageLatentsHeight := 0;
   HasMask := false;
   MaskFile := '';
+  MaskBlurRadius := 0;
   MaskLatentsWidth := 0;
   MaskLatentsHeight := 0;
   InputImageEncodeNumber := 0;
@@ -1584,6 +1633,15 @@ begin
     end
     else if Arg = '--init-image' then InitImageFile := NextArg()
     else if Arg = '--mask' then MaskFile := NextArg()
+    else if Arg = '--mask-blur' then
+    begin
+      ArgProblem := ParseMaskBlurRadius(NextArg(), MaskBlurRadius);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--mask-blur: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if Arg = '--strength' then
     begin
       HasStrengthArg := true;
