@@ -550,6 +550,9 @@ type
     procedure TestNemotronHStreamedDecodeParity;
     procedure TestMamba2StreamedDecodeOpenCLParity;
     procedure TestNemotronHStreamedDecodeOpenCLParity;
+    // tiny_rwkv decoded on OpenCL against the CPU twin: every TNNetTokenShift
+    // runs every step on OpenCL with its previous-token state there.
+    procedure TestRWKVStreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35StateCheckpointResumeParity;
     procedure TestQwen35StateCheckpointResumeInt8KVParity;
@@ -11838,10 +11841,10 @@ begin
           AssertEquals(Stem + ': ' + pOnOpenCL.ClassName + ' at ' +
             IntToStr(LayerCnt) + ' ran every decode step on OpenCL', StepCnt,
             TwinCL.Layers[LayerCnt].ForwardGPUCnt);
-          if TwinCL.Layers[LayerCnt] is TNNetRecurrentDecodeBase then
+          if TNNetStreamingDecoder.IsRecurrentStateLayer(TwinCL.Layers[LayerCnt]) then
             AssertTrue(Stem + ': ' + pOnOpenCL.ClassName + ' at ' +
               IntToStr(LayerCnt) + ' keeps its decode state in OpenCL memory',
-              TNNetRecurrentDecodeBase(TwinCL.Layers[LayerCnt]).StateOnOpenCL());
+              TNNetStreamingDecoder.StateOnOpenCL(TwinCL.Layers[LayerCnt]));
         end;
       AssertAllOnDevice(TwinCL, pOnOpenCL, Stem);
     end;
@@ -12061,6 +12064,15 @@ begin
   {$ENDIF}
 end;
 
+procedure TTestNeuralPretrained.TestRWKVStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_rwkv', TNNetTokenShift);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
 // Turn-boundary state reuse on the REAL qwen3_5 wiring. TChatEngine resumes a
 // hybrid chat from a snapshot taken at the end of the previous turn instead of
 // re-prefilling the whole conversation; TestNeuralDecode covers the mechanism
@@ -12172,12 +12184,12 @@ begin
   for LayerPos := 0 to MaxLayerPos do
   begin
     Layer := Net.Layers[LayerPos];
-    if Layer is TNNetRecurrentDecodeBase then
+    if TNNetStreamingDecoder.IsRecurrentStateLayer(Layer) then
     begin
       Inc(Total);
       AssertTrue(What + ': ' + Layer.ClassName + ' at ' + IntToStr(LayerPos) +
         ' keeps its decode state in OpenCL memory',
-        TNNetRecurrentDecodeBase(Layer).StateOnOpenCL());
+        TNNetStreamingDecoder.StateOnOpenCL(Layer));
     end;
   end;
   AssertTrue(What + ' has recurrent layers', Total > 0);

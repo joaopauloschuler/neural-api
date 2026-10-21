@@ -4917,6 +4917,121 @@ __kernel void cai_mamba2_gated_norm
   for (i = lid; i < FDInner; i += lsize) y[i] = (y[i] * rstd) * FNormW[i];
 }
 
+// PER-CHANNEL SCANS (TNNetTokenShift, TNNetDiagonalSSM, TNNetWKV, driven by
+// TNNetChannelScanCL). ONE WORK-ITEM PER CHANNEL c for the whole sequence: the
+// recurrence never mixes channels. FY row t starts at t*FChannels. FState is the
+// channel's carried decode state, read and rewritten in place; FResetState = 1
+// starts it from the fresh-sequence value instead. Coded by Claude (AI).
+
+// y[t] = mix*x[t] + (1-mix)*x[t-1]; the state is x[t-1] (0 for a fresh sequence).
+__kernel void cai_token_shift_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FMix,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float mix = FMix[c];
+  const float oneMinusMix = 1.0f - mix;
+  float prev = (FResetState != 0) ? 0.0f : FState[c];
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float x = FX[t * FChannels + c];
+    FY[t * FChannels + c] = mix * x + oneMinusMix * prev;
+    prev = x;
+  }
+  FState[c] = prev;
+}
+
+// h = a*h + b*x;  y = c*h + e*x, with a = sigmoid(a_raw) built on the host.
+__kernel void cai_diagonal_ssm_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FA,
+  __global const float* FB,
+  __global const float* FC,
+  __global const float* FE,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float a = FA[c];
+  const float b = FB[c];
+  const float cc = FC[c];
+  const float e = FE[c];
+  float h = (FResetState != 0) ? 0.0f : FState[c];
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float x = FX[t * FChannels + c];
+    h = a * h + b * x;
+    FY[t * FChannels + c] = cc * h + e * x;
+  }
+  FState[c] = h;
+}
+
+// RWKV-4 WKV with the running-max stabiliser (TNNetWKV.Compute). Row t of FX is
+// [ k (FChannels) | v (FChannels) ]; w = softplus(w_raw) is built on the host.
+// FState is [ A | B | Q ], FChannels each; a fresh sequence is A = B = 0,
+// Q = -1e30. One of each exp pair is exp(0) = 1, so no denominator reaches 0.
+__kernel void cai_wkv_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FW,
+  __global const float* FU,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float w = FW[c];
+  const float u = FU[c];
+  const int inDepth = 2 * FChannels;
+  float aa = 0.0f;
+  float bb = 0.0f;
+  float pp = -1e30f;
+  if (FResetState == 0)
+  {
+    aa = FState[c];
+    bb = FState[FChannels + c];
+    pp = FState[2 * FChannels + c];
+  }
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float k = FX[t * inDepth + c];
+    const float v = FX[t * inDepth + FChannels + c];
+    const float ww1 = u + k;
+    const float q1 = fmax(pp, ww1);
+    const float e1 = cai_exp_floored(pp - q1);
+    const float e2 = cai_exp_floored(ww1 - q1);
+    FY[t * FChannels + c] = (e1 * aa + e2 * v) / (e1 * bb + e2);
+    const float ww2 = pp - w;
+    const float q2 = fmax(ww2, k);
+    const float e3 = cai_exp_floored(ww2 - q2);
+    const float e4 = cai_exp_floored(k - q2);
+    aa = e3 * aa + e4 * v;
+    bb = e3 * bb + e4;
+    pp = q2;
+  }
+  FState[c] = aa;
+  FState[FChannels + c] = bb;
+  FState[2 * FChannels + c] = pp;
+}
+
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
 // Writes the step's K and V rows - FTokenCnt token rows, one row per KV head
 // each - into the cache slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE

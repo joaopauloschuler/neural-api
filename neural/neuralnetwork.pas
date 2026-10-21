@@ -6054,6 +6054,9 @@ type
     FCapX, FCapY, FCapState: csize_t;
     // The kernel of the last forward; nil before it, so there is nothing to bind.
     FOutputKernel: TNeuralKernel;
+    // True while the bank, not the layer's RAM volume, holds the live decode
+    // state (read only through the *StateOnOpenCL / *Slot methods below).
+    FStateLive: boolean;
   public
     destructor Destroy(); override;
     // The buffer the last forward wrote Y into, the kernel that wrote it, and
@@ -6068,6 +6071,38 @@ type
     // helper's queue. CopyStateFrom sizes the bank for State.
     procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
     procedure CopyStateFrom(Slot: cl_mem; State: TNNetVolume);
+    // Moves the live decode state between the layer's State volume and the
+    // bank; each is a no-op when the state already sits where it is wanted.
+    procedure EnsureStateOnOpenCL(State: TNNetVolume);
+    procedure ForceStateOnRAM(State: TNNetVolume);
+    // The host wrote State, which therefore holds the live decode state again.
+    procedure MarkStateWrittenOnRAM();
+    // Live state (bank, or State when that is live) into Slot; Slot into the
+    // bank, which becomes live. Slot is StateBytes long, in this context.
+    procedure CaptureStateToSlot(Slot: cl_mem; State: TNNetVolume);
+    procedure RestoreStateFromSlot(Slot: cl_mem; State: TNNetVolume);
+    property StateOnOpenCL: boolean read FStateLive;
+  end;
+
+  /// OpenCL forward helper for the per-channel scans of TNNetTokenShift,
+  // TNNetDiagonalSSM and TNNetWKV: pKernelName runs one work-item per channel for
+  // the whole sequence and advances the state bank in place. Forward-only.
+  // Coded by Claude (AI).
+  TNNetChannelScanCL = class(TNNetRecurrentScanCL)
+  private
+    FBufW: array[0..3] of cl_mem;
+    FCapW: array[0..3] of csize_t;
+    FWeightCount: integer;
+  public
+    destructor Destroy(); override;
+    // Blocking upload of the kernel's per-channel tables (at most four, in its
+    // argument order); they stay resident until the next upload.
+    procedure UploadWeights(const W: array of TNNetVolume);
+    // ResetState starts from the fresh-sequence state, else the bank carries in;
+    // pExternalSrc / pKeepResultOnOpenCL as TNNetGatedDeltaNetCL.Compute.
+    procedure Compute(X, Y, State: TNNetVolume; SeqLen, Channels: integer;
+      ResetState: boolean; pExternalSrc: cl_mem = nil;
+      pKeepResultOnOpenCL: boolean = false);
   end;
 
   /// OpenCL forward helper for the gated delta-rule recurrence
@@ -10696,6 +10731,13 @@ type
       FDecodeEnabled: boolean;
       FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
       FDecPrev: TNNetVolume;    // persisted previous token x_{t-1}, Depth-long
+      {$IFDEF OpenCL}
+      // cai_token_shift_scan in OpenCL memory; its state bank carries FDecPrev
+      // through a decode session. Weights re-upload only when dirty.
+      FScanCL: TNNetChannelScanCL;
+      FGpuWeightsDirty: boolean;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -10704,6 +10746,20 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      procedure AfterWeightUpdate(); override;
+      // The TNNetRecurrentDecodeBase residency contract (see there).
+      function StateBytes(): int64;
+      function StateOnOpenCL(): boolean;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
       // Enable the O(1)-per-step incremental-decode path. The carried state is a
       // single Depth-long buffer holding the PREVIOUS token x_{t-1} (the only
       // history a one-token causal shift needs), so there is no MaxContext budget
@@ -10724,6 +10780,7 @@ type
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
       procedure RestoreState(Src: TNNetVolume; Steps: integer);
       property DecodeEnabled: boolean read FDecodeEnabled;
+      property DecodeSteps: integer read FDecodeSteps;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -42002,6 +42059,101 @@ begin
   FKernel.CopyBuffer(Slot, FBufState, State.GetMemSize());
 end;
 
+procedure TNNetRecurrentScanCL.EnsureStateOnOpenCL(State: TNNetVolume);
+begin
+  if FStateLive then exit;
+  UploadState(State);
+  FStateLive := true;
+end;
+
+procedure TNNetRecurrentScanCL.ForceStateOnRAM(State: TNNetVolume);
+begin
+  if not FStateLive then exit;
+  DownloadState(State);
+  FStateLive := false;
+end;
+
+procedure TNNetRecurrentScanCL.MarkStateWrittenOnRAM();
+begin
+  FStateLive := false;
+end;
+
+procedure TNNetRecurrentScanCL.CaptureStateToSlot(Slot: cl_mem;
+  State: TNNetVolume);
+begin
+  // A RAM-resident state is uploaded straight into the slot, so the bank is
+  // never touched.
+  if FStateLive
+    then CopyStateTo(Slot, State.GetMemSize())
+    else UploadToOpenCLBuffer(Slot, State);
+end;
+
+procedure TNNetRecurrentScanCL.RestoreStateFromSlot(Slot: cl_mem;
+  State: TNNetVolume);
+begin
+  CopyStateFrom(Slot, State);
+  FStateLive := true;
+end;
+
+{ TNNetChannelScanCL }
+
+destructor TNNetChannelScanCL.Destroy();
+var
+  SlotPos: integer;
+begin
+  for SlotPos := Low(FBufW) to High(FBufW) do
+    if Assigned(FBufW[SlotPos]) then clReleaseMemObject(FBufW[SlotPos]);
+  inherited Destroy();
+end;
+
+procedure TNNetChannelScanCL.UploadWeights(const W: array of TNNetVolume);
+var
+  SlotPos, MaxSlotPos: integer;
+begin
+  MaxSlotPos := Min(High(W), High(FBufW));
+  for SlotPos := 0 to MaxSlotPos do
+    FKernel.EnsureWriteBuffer(FBufW[SlotPos], FCapW[SlotPos], W[SlotPos],
+      {DoWrite=}true, {pBlocking=}true);
+  FWeightCount := MaxSlotPos + 1;
+end;
+
+procedure TNNetChannelScanCL.Compute(X, Y, State: TNNetVolume;
+  SeqLen, Channels: integer; ResetState: boolean; pExternalSrc: cl_mem = nil;
+  pKeepResultOnOpenCL: boolean = false);
+var
+  bufX, bufY, bufState: cl_mem;
+  k: cl_kernel;
+  iReset: longint;
+  WeightPos, MaxWeightPos, ArgPos: integer;
+begin
+  if ResetState then iReset := 1 else iReset := 0;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  // Grow-only and never written here, so a bank uploaded by UploadState keeps
+  // its contents across every forward of the session.
+  bufState := FKernel.EnsureOutputBuffer(FBufState, FCapState, State);
+  k := FKernel.Kernel;
+  clSetKernelArg(k, 0, csLongintSize, @SeqLen);
+  clSetKernelArg(k, 1, csLongintSize, @Channels);
+  clSetKernelArg(k, 2, csLongintSize, @iReset);
+  MaxWeightPos := FWeightCount - 1;
+  for WeightPos := 0 to MaxWeightPos do
+    clSetKernelArg(k, 3 + WeightPos, csCLMemSize, @FBufW[WeightPos]);
+  ArgPos := 3 + FWeightCount;
+  clSetKernelArg(k, ArgPos,     csCLMemSize, @bufX);
+  clSetKernelArg(k, ArgPos + 1, csCLMemSize, @bufState);
+  clSetKernelArg(k, ArgPos + 2, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, Channels);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+end;
+
 { TNNetGatedDeltaNetCL }
 
 constructor TNNetGatedDeltaNetCL.Create(NN: TNNet);
@@ -68097,6 +68249,9 @@ end;
 
 destructor TNNetTokenShift.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FScanCL) then FScanCL.Free;
+  {$ENDIF}
   FDecPrev.Free;
   inherited Destroy();
 end;
@@ -68121,7 +68276,23 @@ var
   mix, one_minus_mix, xt, xtm1: TNeuralFloat;
   W: TNNetVolume;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  // The OpenCL forward serves the full-sequence shift and the decode alike. It
+  // runs BEFORE any ForceOutputOnRAM because that download is what it avoids.
+  if WillOpenCL() then
+  begin
+    StartTime := Now();
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecPrev);
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -68234,6 +68405,7 @@ procedure TNNetTokenShift.ResetState();
 begin
   FDecPrev.Fill(0);          // x_{-1} = 0 (the full-scan left zero-padding)
   FDecodeSteps := 0;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetTokenShift.ResetCache();
@@ -68243,6 +68415,7 @@ end;
 
 procedure TNNetTokenShift.CaptureState(Dst: TNNetVolume; out Steps: integer);
 begin
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecPrev); {$ENDIF}
   Dst.ReSize(1, 1, FDecPrev.Size);
   Dst.Copy(FDecPrev);
   Steps := FDecodeSteps;
@@ -68252,7 +68425,130 @@ procedure TNNetTokenShift.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecPrev.Copy(Src);
   FDecodeSteps := Steps;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
+
+function TNNetTokenShift.StateBytes(): int64;
+begin
+  Result := FDecPrev.GetMemSize();
+end;
+
+function TNNetTokenShift.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL}
+  Result := Assigned(FScanCL) and FScanCL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
+end;
+
+procedure TNNetTokenShift.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  {$IFDEF OpenCL}
+  FGpuWeightsDirty := true; // next OpenCL forward re-uploads the mix vector
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetTokenShift.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FScanCL)
+    then Result := FScanCL.NewOpenCLBuffer(FDecPrev.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetTokenShift.CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetTokenShift.CaptureStateToOpenCL: the layer' +
+      ' has no OpenCL path.');
+  FScanCL.CaptureStateToSlot(Slot, FDecPrev);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetTokenShift.RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetTokenShift.RestoreStateFromOpenCL: the layer' +
+      ' has no OpenCL path.');
+  FScanCL.RestoreStateFromSlot(Slot, FDecPrev);
+  FDecodeSteps := Steps;
+end;
+
+function TNNetTokenShift.WillOpenCL(): boolean;
+begin
+  // A source already in OpenCL memory puts the layer there whatever the size
+  // verdict says. The kernel writes no gradient cache: inference-only.
+  Result := Assigned(FScanCL) and FHasOpenCL and (not FIsTrainable)
+            and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetTokenShift.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Not the inherited chain: this layer has no cai_activation opcode and owns
+  // a dedicated scan helper instead.
+  FHasOpenCL := true;
+  if not Assigned(FScanCL) then
+    FScanCL := TNNetChannelScanCL.Create(FNN, 'cai_token_shift_scan');
+  // Nothing is resident yet, whatever a previous weight update reported.
+  FGpuWeightsDirty := true;
+end;
+
+procedure TNNetTokenShift.DisableOpenCL();
+begin
+  // FScanCL owns the buffers a kept output and a live decode state live in.
+  ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecPrev);
+  inherited DisableOpenCL();
+  FreeAndNil(FScanCL);
+end;
+
+function TNNetTokenShift.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTokenShift.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.OutputKernel()
+  else Result := nil;
+end;
+
+// Whole-sequence shift in OpenCL memory. Outside a decode session x_{-1} = 0;
+// inside one the bank carries the previous token, so a step stays resident.
+procedure TNNetTokenShift.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+begin
+  // SeqLen contiguous Depth-long rows, the layout of every producer's buffer.
+  if PrevOutputOnOpenCLSameSize() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FScanCL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  // A full-sequence forward uses the bank as scratch, so a decode state still
+  // living there has to come home first.
+  if FDecodeEnabled then FScanCL.EnsureStateOnOpenCL(FDecPrev)
+  else FScanCL.ForceStateOnRAM(FDecPrev);
+  if FGpuWeightsDirty then
+  begin
+    FScanCL.UploadWeights([FNeurons[0].FWeights]);
+    FGpuWeightsDirty := false;
+  end;
+  FScanCL.Compute(FPrevLayer.FOutput, FOutput, FDecPrev, FOutput.SizeX,
+    FOutput.Depth, {ResetState=}not FDecodeEnabled, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetTokenShift.Backpropagate();
 var

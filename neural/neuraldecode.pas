@@ -1337,6 +1337,10 @@ type
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
+    // Raises unless Chk was sized for this session's recurrent layer roster.
+    procedure CheckStateCheckpointFits(Chk: TNNetDecoderStateCheckpoint;
+      const Caller: string);
+  public
     // Uniform dispatch over the recurrent-state class families (same contract,
     // no common ancestor - see TNNetRecurrentDecodeBase's migration note).
     class function IsRecurrentStateLayer(L: TNNetLayer): boolean;
@@ -1347,10 +1351,18 @@ type
       out Steps: integer);
     class procedure StateRestore(L: TNNetLayer; Src: TNNetVolume;
       Steps: integer);
-    // Raises unless Chk was sized for this session's recurrent layer roster.
-    procedure CheckStateCheckpointFits(Chk: TNNetDecoderStateCheckpoint;
-      const Caller: string);
-  public
+    {$IFDEF OpenCL}
+    // The OpenCL-slot counterparts of StateCapture / StateRestore and the slot
+    // size; StateNewSlotOnOpenCL is nil for a layer without an OpenCL path.
+    class function StateNewSlotOnOpenCL(L: TNNetLayer): cl_mem;
+    class function StateSlotBytes(L: TNNetLayer): int64;
+    class procedure StateCaptureToOpenCL(L: TNNetLayer; Slot: cl_mem;
+      out Steps: integer);
+    class procedure StateRestoreFromOpenCL(L: TNNetLayer; Slot: cl_mem;
+      Steps: integer);
+    {$ENDIF}
+    // True while L keeps its live decode state in OpenCL memory.
+    class function StateOnOpenCL(L: TNNetLayer): boolean;
     // pInt8KV = true arms the int8-quantized KV cache at construction: the
     // attention layers allocate the int8 code/scale storage directly and the
     // full-size FP32 K/V buffers are never allocated (the post-Create
@@ -6135,6 +6147,49 @@ begin
   else TNNetTokenShift(L).RestoreState(Src, Steps);
 end;
 
+class function TNNetStreamingDecoder.StateOnOpenCL(L: TNNetLayer): boolean;
+begin
+  if L is TNNetRecurrentDecodeBase then
+    Result := TNNetRecurrentDecodeBase(L).StateOnOpenCL()
+  else if L is TNNetTokenShift then
+    Result := TNNetTokenShift(L).StateOnOpenCL()
+  else Result := false;
+end;
+
+{$IFDEF OpenCL}
+class function TNNetStreamingDecoder.StateNewSlotOnOpenCL(L: TNNetLayer): cl_mem;
+begin
+  if L is TNNetRecurrentDecodeBase then
+    Result := TNNetRecurrentDecodeBase(L).NewStateSlotOnOpenCL()
+  else if L is TNNetTokenShift then
+    Result := TNNetTokenShift(L).NewStateSlotOnOpenCL()
+  else Result := nil;
+end;
+
+class function TNNetStreamingDecoder.StateSlotBytes(L: TNNetLayer): int64;
+begin
+  if L is TNNetRecurrentDecodeBase then
+    Result := TNNetRecurrentDecodeBase(L).StateBytes()
+  else Result := TNNetTokenShift(L).StateBytes();
+end;
+
+class procedure TNNetStreamingDecoder.StateCaptureToOpenCL(L: TNNetLayer;
+  Slot: cl_mem; out Steps: integer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).CaptureStateToOpenCL(Slot, Steps)
+  else TNNetTokenShift(L).CaptureStateToOpenCL(Slot, Steps);
+end;
+
+class procedure TNNetStreamingDecoder.StateRestoreFromOpenCL(L: TNNetLayer;
+  Slot: cl_mem; Steps: integer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).RestoreStateFromOpenCL(Slot, Steps)
+  else TNNetTokenShift(L).RestoreStateFromOpenCL(Slot, Steps);
+end;
+{$ENDIF}
+
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer;
   pInt8KV: boolean);
 var
@@ -6449,15 +6504,11 @@ begin
     Chk.FSteps[i] := 0;
     Chk.FSlotBytes[i] := 0;
     {$IFDEF OpenCL}
-    Chk.FSlots[i] := nil;
-    if Layer is TNNetRecurrentDecodeBase then
+    Chk.FSlots[i] := StateNewSlotOnOpenCL(Layer);
+    if Assigned(Chk.FSlots[i]) then
     begin
-      Chk.FSlots[i] := TNNetRecurrentDecodeBase(Layer).NewStateSlotOnOpenCL();
-      if Assigned(Chk.FSlots[i]) then
-      begin
-        Chk.FSlotBytes[i] := TNNetRecurrentDecodeBase(Layer).StateBytes();
-        continue;
-      end;
+      Chk.FSlotBytes[i] := StateSlotBytes(Layer);
+      continue;
     end;
     {$ENDIF}
     // Host route: the volume takes the state's shape now, so no later capture
@@ -6520,8 +6571,7 @@ begin
     {$IFDEF OpenCL}
     if Assigned(Chk.FSlots[i]) then
     begin
-      TNNetRecurrentDecodeBase(FSSMs[i]).CaptureStateToOpenCL(Chk.FSlots[i],
-        Chk.FSteps[i]);
+      StateCaptureToOpenCL(FSSMs[i], Chk.FSlots[i], Chk.FSteps[i]);
       continue;
     end;
     {$ENDIF}
@@ -6541,8 +6591,7 @@ begin
     {$IFDEF OpenCL}
     if Assigned(Chk.FSlots[i]) then
     begin
-      TNNetRecurrentDecodeBase(FSSMs[i]).RestoreStateFromOpenCL(Chk.FSlots[i],
-        Chk.FSteps[i]);
+      StateRestoreFromOpenCL(FSSMs[i], Chk.FSlots[i], Chk.FSteps[i]);
       continue;
     end;
     {$ENDIF}
