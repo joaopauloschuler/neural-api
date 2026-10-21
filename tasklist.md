@@ -109,12 +109,16 @@ rather than acted on.
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
-- [ ] Check (not verified): `TNNetSwinV2WindowAttention` inherits the plain
-      `TNNetScaledDotProductAttention` backward, which differentiates
-      softmax(Q.K * scale) without the Q/K L2-normalization and the learnable
-      logit_scale of the cosine-attention forward. Add a numerical gradient
-      check; if it fails, give the layer its own backward (or document it as
-      inference-only).
+- [x] `TNNetSwinV2WindowAttention` inherited the plain SDPA backward (raw
+      Q.K * 1/sqrt(d_k)). CONFIRMED: TestSwinV2WindowAttentionGradientCheck
+      measured max |num-ana| input gradient 1.16e-2 before, 6.0e-4 after. The
+      layer now has its own cosine backward, shared with
+      TNNetCosineSimilarityAttention (BackpropagateCosineScores /
+      NormalizeQKRows on the SDPA base). logit_scale and the CPB bias are
+      load-time constants, so they carry no gradient.
+- [ ] Possible defect (not verified): `TNNetCosineSimilarityAttention.ComputeOpenCL`
+      (SeqLen >= 32, no trainable gate) never fills FQNorm/FKNorm, so a
+      backward after that forward reads stale normalized rows.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD

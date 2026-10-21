@@ -4686,6 +4686,15 @@ type
     // Coded by Claude (AI).
     procedure MaskBand(i, MaxJ: integer; out jLo, jHi: integer);
       {$IFDEF Release} inline; {$ENDIF}
+    // L2-normalizes every source Q and K row (over d_k, +Eps) into QNorm/KNorm
+    // ([SeqLen,1,d_k]) and keeps the reciprocal norms in InvQNorm/InvKNorm.
+    procedure NormalizeQKRows(QNorm, KNorm, InvQNorm, InvKNorm: TNNetVolume;
+      Eps: TNeuralFloat);
+    // Backward of softmax(Scale * Qn.Kn + const) . V into the source error, via
+    // GradQNorm/GradKNorm; returns d(loss)/d(Scale) when NeedScaleGrad, else 0.
+    function BackpropagateCosineScores(QNorm, KNorm, InvQNorm, InvKNorm,
+      GradQNorm, GradKNorm: TNNetVolume; Scale: TNeuralFloat;
+      NeedScaleGrad: boolean): TNeuralFloat;
     // Quantize Src[0..d_k-1] into int8 cache row Slot of Dst, where Slot is
     // the flat (position, head) row index head*MaxContext + position.
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
@@ -8029,13 +8038,20 @@ type
   // time). The additive bias matrix supplied via SetBiasMatrix already carries
   // the continuous-position-bias 16*sigmoid(cpb_mlp(coords)) PLUS the cyclic-
   // shift mask, so Compute() just adds it after the cosine score. NO 1/sqrt(dk)
-  // scaling (the cosine normalization replaces it).
+  // scaling (the cosine normalization replaces it). logit_scale and the bias are
+  // constants (not trained): the backward yields only the Q|K|V gradient.
   // Coded by Claude (AI).
   TNNetSwinV2WindowAttention = class(TNNetWindowAttention)
   private
     FQNorm: TNNetVolume; // L2-normalized query rows, [SeqLen,1,d_k]
     FKNorm: TNNetVolume; // L2-normalized key rows,   [SeqLen,1,d_k]
+    FInvQNorm: TNNetVolume; // 1/||Q[i]|| per query row, [SeqLen,1,1]
+    FInvKNorm: TNNetVolume; // 1/||K[j]|| per key row,   [SeqLen,1,1]
+    FGradQNorm: TNNetVolume; // backprop: d(loss)/d(normalized Q), [SeqLen,1,d_k]
+    FGradKNorm: TNNetVolume; // backprop: d(loss)/d(normalized K), [SeqLen,1,d_k]
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure SizeBackpropScratch();
+    procedure FreeBackpropScratch();
     {$IFDEF OpenCL}
     // The flash forward over cai_sdpa_qk_l2norm_packed's [Qn|Kn|V] rows with
     // logit_scale as the score factor and the bias matrix as the score bias.
@@ -8047,6 +8063,10 @@ type
     constructor Create(d_k: integer; pSeqLen: integer); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
+    // Cosine-score backward: through the logit_scale product and the Q/K L2
+    // normalization; logit_scale and the bias matrix are constants.
+    procedure Backpropagate(); override;
+    function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     {$IFDEF OpenCL}
     // Also sizes the OpenCL [Qn|Kn|V] buffer when the flash forward is armed.
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
@@ -37129,6 +37149,139 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+procedure TNNetScaledDotProductAttention.NormalizeQKRows(QNorm, KNorm,
+  InvQNorm, InvKNorm: TNNetVolume; Eps: TNeuralFloat);
+var
+  Prev: TNNetVolume;
+  RowPos, MaxRowPos, RowBytes: integer;
+  SumSq, InvN: TNeuralFloat;
+  QPtr, KPtr, QnPtr, KnPtr: TNeuralFloatArrPtr;
+begin
+  Prev := FPrevLayer.FOutput;
+  MaxRowPos := Prev.SizeX - 1;
+  RowBytes := FDk * csNeuralFloatSize;
+  // The depth axis is contiguous: sum-of-squares is a self dot product and the
+  // normalize is a Move followed by a scalar Mul.
+  for RowPos := 0 to MaxRowPos do
+  begin
+    QPtr := Prev.GetRawPtr(RowPos, 0);                    // #4
+    SumSq := TNNetVolume.DotProduct(QPtr, QPtr, FDk);
+    InvN := pcr_rsqrtf(SumSq + Eps);
+    InvQNorm.FData[RowPos] := InvN;
+    QnPtr := QNorm.GetRawPtr(RowPos, 0);                  // #4
+    Move(QPtr^, QnPtr^, RowBytes);
+    TNNetVolume.Mul(QnPtr, InvN, FDk);
+    KPtr := Prev.GetRawPtr(RowPos, 0, FDk);               // #4
+    SumSq := TNNetVolume.DotProduct(KPtr, KPtr, FDk);
+    InvN := pcr_rsqrtf(SumSq + Eps);
+    InvKNorm.FData[RowPos] := InvN;
+    KnPtr := KNorm.GetRawPtr(RowPos, 0);                  // #4
+    Move(KPtr^, KnPtr^, RowBytes);
+    TNNetVolume.Mul(KnPtr, InvN, FDk);
+  end;
+end;
+
+function TNNetScaledDotProductAttention.BackpropagateCosineScores(QNorm,
+  KNorm, InvQNorm, InvKNorm, GradQNorm, GradKNorm: TNNetVolume;
+  Scale: TNeuralFloat; NeedScaleGrad: boolean): TNeuralFloat;
+var
+  SeqLen, i, j, SeqLenM1: integer;
+  Prev, PrevErr: TNNetVolume;
+  SumDAttnAttn, A, dS, Dot, InvN, Cos: TNeuralFloat;
+  RawPtr: TNeuralFloatArrPtr;
+  RowStride, posV, NormStride, posN, AttnRow: integer;
+  dOutPtr, qnPtr, gQnPtr, knPtr, gKnPtr: pointer;
+begin
+  Result := 0;
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  // Row strides: Prev/PrevErr share the full QKV depth; the norm rows are FDk.
+  RowStride := Prev.GetRawPos(1, 0);
+  NormStride := KNorm.GetRawPos(1, 0);
+  if Length(FdAttnBuf) <> SeqLen then SetLength(FdAttnBuf, SeqLen);
+  if Length(FdScoreBuf) <> SeqLen then SetLength(FdScoreBuf, SeqLen);
+  GradQNorm.Fill(0);
+  GradKNorm.Fill(0);
+  for i := 0 to SeqLenM1 do
+  begin
+    // ---- dV[j] += Attn[i,j] * dOut[i];  dAttn[j] = dOut[i] . V[j] ----
+    // A zero attention weight (masked key or fully masked row) contributes
+    // nothing to dV and is only consumed multiplied by itself, so it is skipped.
+    AttnRow := FAttn.GetRawPos(0, i);          // #11: FAttn row base (depth 1)
+    dOutPtr := FOutputError.GetRawPtr(i, 0);   // i-only, hoisted (#11)
+    posV := 2 * FDk;                           // j=0 offset (#12)
+    for j := 0 to SeqLenM1 do
+    begin
+      A := FAttn.FData[AttnRow + j];
+      if A <> 0 then
+      begin
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
+        FdAttnBuf[j] := TNNetVolume.DotProduct(
+          dOutPtr, Prev.GetRawPtr(posV), FDk);
+      end
+      else FdAttnBuf[j] := 0;
+      Inc(posV, RowStride);                    // unconditional (#12)
+    end;
+    // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
+    SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
+    for j := 0 to SeqLenM1 do
+      FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
+    // ---- score[i,j] = Scale * qn[i].kn[j] (+ a constant bias) ----
+    // gQn[i] += Scale*dScore[j]*kn[j];  gKn[j] += Scale*dScore[j]*qn[i];
+    // d(loss)/d(Scale) += dScore[j]*cos[i,j], only when asked (#20 unswitch).
+    qnPtr := QNorm.GetRawPtr(i, 0);            // i-only, hoisted (#11)
+    gQnPtr := GradQNorm.GetRawPtr(i, 0);       // i-only, hoisted (#11)
+    posN := 0;                                 // j=0 offset (#12)
+    if NeedScaleGrad then
+    for j := 0 to SeqLenM1 do
+    begin
+      knPtr := KNorm.GetRawPtr(posN);          // #4: shared by 3 uses
+      Cos := TNNetVolume.DotProduct(qnPtr, knPtr, FDk);
+      Result := Result + FdScoreBuf[j] * Cos;
+      dS := FdScoreBuf[j] * Scale;
+      if dS <> 0 then
+      begin
+        TNNetVolume.MulAdd(gQnPtr, knPtr, dS, FDk);
+        TNNetVolume.MulAdd(GradKNorm.GetRawPtr(posN), qnPtr, dS, FDk);
+      end;
+      Inc(posN, NormStride);
+    end
+    else
+    for j := 0 to SeqLenM1 do
+    begin
+      dS := FdScoreBuf[j] * Scale;
+      if dS <> 0 then
+      begin
+        TNNetVolume.MulAdd(gQnPtr, KNorm.GetRawPtr(posN), dS, FDk);
+        TNNetVolume.MulAdd(GradKNorm.GetRawPtr(posN), qnPtr, dS, FDk);
+      end;
+      Inc(posN, NormStride);
+    end;
+  end;
+  // ---- Normalized-row gradients -> raw Q/K gradients ----
+  // For y = x/||x||: dL/dx = InvN*g - (InvN * (y.g))*y, per query row (-> Q at
+  // depth 0) and per key row (-> K at depth FDk).
+  for i := 0 to SeqLenM1 do
+  begin
+    qnPtr := QNorm.GetRawPtr(i, 0);            // #4
+    gQnPtr := GradQNorm.GetRawPtr(i, 0);
+    InvN := InvQNorm.FData[i];
+    Dot := TNNetVolume.DotProduct(qnPtr, gQnPtr, FDk);
+    RawPtr := PrevErr.GetRawPtr(i, 0);
+    TNNetVolume.MulAdd(RawPtr, gQnPtr, InvN, FDk);
+    TNNetVolume.MulAdd(RawPtr, qnPtr, -InvN * Dot, FDk);
+    knPtr := KNorm.GetRawPtr(i, 0);
+    gKnPtr := GradKNorm.GetRawPtr(i, 0);
+    InvN := InvKNorm.FData[i];
+    Dot := TNNetVolume.DotProduct(knPtr, gKnPtr, FDk);
+    RawPtr := PrevErr.GetRawPtr(i, 0, FDk);
+    TNNetVolume.MulAdd(RawPtr, gKnPtr, InvN, FDk);
+    TNNetVolume.MulAdd(RawPtr, knPtr, -InvN * Dot, FDk);
+  end;
+end;
+
 { TNNetFusedSDPA }
 
 constructor TNNetFusedSDPA.Create(pQHeads, pKVHeads, pHeadDim: integer;
@@ -49154,9 +49307,9 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, KnStride, posKn, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, SumSq, InvN, LiveScale, A: TNeuralFloat;
+  Score, MaxScore, SumExp, LiveScale, A: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
+  OutPtr, QnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
@@ -49178,27 +49331,7 @@ begin
   LiveScale := CurrentScale();
   // 1) Precompute the L2-normalized query and key rows (over the d_k feature
   // dimension) plus their reciprocal norms. score uses qn.kn instead of q.k.
-  // The depth axis is contiguous, so sum-of-squares is an AVX self dot product
-  // over FDk floats and the normalize is a Move followed by an AVX scalar Mul.
-  for i := 0 to SeqLenM1 do
-  begin
-    // Query row i (Q at GetRawPtr(i, 0)).
-    QPtr := Prev.GetRawPtr(i, 0);                       // #4
-    SumSq := TNNetVolume.DotProduct(QPtr, QPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + FEps);
-    FInvQNorm.FData[i] := InvN;
-    QnPtr := FQNorm.GetRawPtr(i, 0);                     // #4
-    Move(QPtr^, QnPtr^, FDk * csNeuralFloatSize);
-    TNNetVolume.Mul(QnPtr, InvN, FDk);
-    // Key row i (K at GetRawPtr(i,0,FDk)).
-    KPtr := Prev.GetRawPtr(i, 0, FDk);                   // #4
-    SumSq := TNNetVolume.DotProduct(KPtr, KPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + FEps);
-    FInvKNorm.FData[i] := InvN;
-    KnPtr := FKNorm.GetRawPtr(i, 0);                     // #4
-    Move(KPtr^, KnPtr^, FDk * csNeuralFloatSize);
-    TNNetVolume.Mul(KnPtr, InvN, FDk);
-  end;
+  NormalizeQKRows(FQNorm, FKNorm, FInvQNorm, FInvKNorm, FEps);
   // 2) For each query row i: cosine scores, softmax, weighted sum of V.
   TwoFDk := 2 * FDk;
   RowStride := Prev.GetRawPos(1, 0);
@@ -49380,135 +49513,25 @@ end;
 procedure TNNetCosineSimilarityAttention.Backpropagate();
 var
   StartTime: double;
-  SeqLen, i, j, k: integer;
-  SeqLenM1: integer;
-  Prev, PrevErr: TNNetVolume;
-  // Accumulated gradients w.r.t the NORMALIZED query/key rows, one row per
-  // sequence position; converted to raw-input gradients via the L2-normalize
-  // Jacobian after all (i,j) score contributions are summed.
-  SumDAttnAttn, A, dS, Dot, InvN, LiveScale, GradScale, Cos: TNeuralFloat;
-  RawPtr: TNeuralFloatArrPtr;
-  RowStride, posV, NormStride, posN, AttnRow: integer;
-  dOutPtr, qnPtr, gQnPtr, knPtr, gKnPtr: pointer;
+  SeqLen: integer;
+  GradScale: TNeuralFloat;
   LearnScale: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  LiveScale := CurrentScale();
-  GradScale := 0;
   if (FPrevLayer.Output.Size > 0) and
      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
-    Prev := FPrevLayer.FOutput;
-    PrevErr := FPrevLayer.FOutputError;
-    SeqLen := Prev.SizeX;
-    SeqLenM1 := SeqLen - 1;
-    // Row strides: Prev/PrevErr share the full QKV depth; FKNorm/gKn are FDk.
-    RowStride := Prev.GetRawPos(1, 0);
-    if Length(FdAttnBuf) <> SeqLen then SetLength(FdAttnBuf, SeqLen);
-    if Length(FdScoreBuf) <> SeqLen then SetLength(FdScoreBuf, SeqLen);
+    SeqLen := FPrevLayer.FOutput.SizeX;
     // Persistent lazily-sized accumulators (rule #17): resize once, zero per call.
     if FgQn.Size <> SeqLen * FDk then FgQn.ReSize(SeqLen, 1, FDk);
     if FgKn.Size <> SeqLen * FDk then FgKn.ReSize(SeqLen, 1, FDk);
-    NormStride := FKNorm.GetRawPos(1, 0);
-    // GradScale feeds ONLY the learnable-scale step at the end of this method,
-    // which is itself guarded by exactly this condition. With a fixed scale the
-    // whole SeqLen^2 x FDk cos[i,j] pass below is computed and discarded, so
-    // hoist the guard here (#5) and skip it.
     LearnScale := FLearnableScale and (FNeurons.Count > 0) and
       (FNeurons[0].FWeights.Size = 1);
-      FgQn.Fill(0);
-      FgKn.Fill(0);
-      for i := 0 to SeqLenM1 do
-      begin
-        // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
-        // dV[j,d] += Attn[i,j] * dOut[i,d]
-        // dAttn[j] = sum_d dOut[i,d] * V[j,d]
-        // Depth is contiguous: dV accumulation is an AVX MulAdd and dAttn[j] is
-        // an AVX dot product (dOut[i] . V[j]) over FDk floats.
-        AttnRow := FAttn.GetRawPos(0, i);          // #11: FAttn row base (depth 1)
-        dOutPtr := FOutputError.GetRawPtr(i, 0);   // i-only, hoisted (#11)
-        posV := 2 * FDk;                              // j=0 offset (#12)
-        for j := 0 to SeqLenM1 do
-        begin
-          A := FAttn.FData[AttnRow + j];
-          TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
-          FdAttnBuf[j] := TNNetVolume.DotProduct(
-            dOutPtr, Prev.GetRawPtr(posV), FDk);
-          Inc(posV, RowStride);
-        end;
-        // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
-        SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
-        for j := 0 to SeqLenM1 do
-          FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
-        // Causal-masked positions (j > i) have attn ~ 0, so dScore[j] ~ 0
-        // already; no special handling needed.
-        // ---- Accumulate gradient into the NORMALIZED rows ----
-        // score[i,j] = scale * qn[i] . kn[j]
-        // d/dqn[i,d] += scale * dScore[j] * kn[j,d]   (summed over j)
-        // d/dkn[j,d] += scale * dScore[j] * qn[i,d]   (summed over i)
-        // Depth is contiguous: gQn[i] += dS*kn[j] and gKn[j] += dS*qn[i] are
-        // AVX MulAdd over FDk floats.
-        qnPtr := FQNorm.GetRawPtr(i, 0);   // i-only, hoisted (#11)
-        gQnPtr := FgQn.GetRawPtr(i, 0);      // i-only, hoisted (#11)
-        posN := 0;                             // j=0 offset (#12); FKNorm/gKn shape
-        // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j], so
-        // d(loss)/d(scale) += dScore[j] * cos[i,j] -- needed only when the
-        // scale is learnable, so the pair loop is unswitched on it (#20).
-        if LearnScale then
-        for j := 0 to SeqLenM1 do
-        begin
-          knPtr := FKNorm.GetRawPtr(posN);          // #4: shared by 3 uses
-          Cos := TNNetVolume.DotProduct(qnPtr, knPtr, FDk);
-          GradScale := GradScale + FdScoreBuf[j] * Cos;
-          dS := FdScoreBuf[j] * LiveScale;
-          if dS <> 0 then
-          begin
-            TNNetVolume.MulAdd(gQnPtr, knPtr, dS, FDk);
-            TNNetVolume.MulAdd(FgKn.GetRawPtr(posN), qnPtr, dS, FDk);
-          end;
-          Inc(posN, NormStride);
-        end
-        else
-        for j := 0 to SeqLenM1 do
-        begin
-          dS := FdScoreBuf[j] * LiveScale;
-          if dS <> 0 then
-          begin
-            TNNetVolume.MulAdd(gQnPtr, FKNorm.GetRawPtr(posN), dS, FDk);
-            TNNetVolume.MulAdd(FgKn.GetRawPtr(posN), qnPtr, dS, FDk);
-          end;
-          Inc(posN, NormStride);
-        end;
-      end;
-      // ---- Convert normalized-row gradients to raw Q/K gradients ----
-      // For y = x/||x|| the input gradient for upstream g is
-      //   dL/dx = (1/||x||) * (g - y * (y . g))   (the (I - y y^T)/||x|| form).
-      // Apply per query row (-> Q at depth d) and per key row (-> K at FDk+d).
-      // dL/dx[d] = InvN*g[d] - (InvN*Dot)*y[d], with Dot = y . g (contiguous
-      // over depth). Each is an AVX dot product plus two AVX MulAdd into the
-      // (contiguous) Q/K depth run of PrevErr.
-      for i := 0 to SeqLenM1 do
-      begin
-        // Query row i (-> Q at depth d). Bind the i-only row pointers once (#4).
-        qnPtr := FQNorm.GetRawPtr(i, 0);
-        gQnPtr := FgQn.GetRawPtr(i, 0);
-        InvN := FInvQNorm.FData[i];
-        Dot := TNNetVolume.DotProduct(qnPtr, gQnPtr, FDk);
-        RawPtr := PrevErr.GetRawPtr(i, 0);
-        TNNetVolume.MulAdd(RawPtr, gQnPtr, InvN, FDk);
-        TNNetVolume.MulAdd(RawPtr, qnPtr, -InvN * Dot, FDk);
-        // Key row i (-> K at depth FDk+d).
-        knPtr := FKNorm.GetRawPtr(i, 0);
-        gKnPtr := FgKn.GetRawPtr(i, 0);
-        InvN := FInvKNorm.FData[i];
-        Dot := TNNetVolume.DotProduct(knPtr, gKnPtr, FDk);
-        RawPtr := PrevErr.GetRawPtr(i, 0, FDk);
-        TNNetVolume.MulAdd(RawPtr, gKnPtr, InvN, FDk);
-        TNNetVolume.MulAdd(RawPtr, knPtr, -InvN * Dot, FDk);
-      end;
+    GradScale := BackpropagateCosineScores(FQNorm, FKNorm, FInvQNorm,
+      FInvKNorm, FgQn, FgKn, CurrentScale(), LearnScale);
     // ---- Step the learnable scale like TNNetReZero ----
     // delta += -LearningRate * grad; applied now unless in batch-update mode.
     if LearnScale then
@@ -51333,21 +51356,70 @@ begin
   FFloatSt[1] := 1.0; // default logit_scale (overwritten at load time)
   FQNorm := TNNetVolume.Create();
   FKNorm := TNNetVolume.Create();
+  FInvQNorm := TNNetVolume.Create();
+  FInvKNorm := TNNetVolume.Create();
+  FGradQNorm := TNNetVolume.Create();
+  FGradKNorm := TNNetVolume.Create();
 end;
 
 destructor TNNetSwinV2WindowAttention.Destroy();
 begin
   FQNorm.Free;
   FKNorm.Free;
+  FInvQNorm.Free;
+  FInvKNorm.Free;
+  FGradQNorm.Free;
+  FGradKNorm.Free;
   inherited Destroy();
 end;
 
 procedure TNNetSwinV2WindowAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  // One L2-normalized vector per sequence position, depth = d_k.
+  // One L2-normalized vector and one reciprocal norm per sequence position.
   FQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
   FKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FInvQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+  FInvKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, 1);
+  if FIsTrainable then SizeBackpropScratch();
+end;
+
+procedure TNNetSwinV2WindowAttention.SizeBackpropScratch();
+begin
+  FGradQNorm.ReSize(FPrevLayer.FOutput.SizeX, 1, FDk);
+  FGradKNorm.ReSize(FPrevLayer.FOutput.SizeX, 1, FDk);
+end;
+
+procedure TNNetSwinV2WindowAttention.FreeBackpropScratch();
+begin
+  FGradQNorm.ReSize(1, 1, 1);
+  FGradKNorm.ReSize(1, 1, 1);
+end;
+
+function TNNetSwinV2WindowAttention.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
+end;
+
+procedure TNNetSwinV2WindowAttention.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    BackpropagateCosineScores(FQNorm, FKNorm, FInvQNorm, FInvKNorm,
+      FGradQNorm, FGradKNorm, FFloatSt[1], {NeedScaleGrad=}false);
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 procedure TNNetSwinV2WindowAttention.SetLogitScale(pScale: TNeuralFloat);
@@ -51396,9 +51468,9 @@ var
   SeqN, i, j, d: integer;
   SeqNM1, FDkM1: integer;
   RowStride, TwoFDk, KnStride, posKn, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, SumSq, InvN, Scale: TNeuralFloat;
+  Score, MaxScore, SumExp, Scale: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
+  OutPtr, Bias, BiasRow, QnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL} if ForwardOnOpenCL() then exit; {$ENDIF}
   StartTime := Now();
@@ -51413,21 +51485,7 @@ begin
   Scale := FFloatSt[1];
   Bias := FNeurons[0].FWeights.GetRawPtr(0, 0);
   // 1) L2-normalize each Q and K row over the contiguous d_k depth axis.
-  for i := 0 to SeqNM1 do
-  begin
-    QPtr := Prev.GetRawPtr(i, 0);                       // #4
-    SumSq := TNNetVolume.DotProduct(QPtr, QPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + csSwinV2NormEps);
-    QnPtr := FQNorm.GetRawPtr(i, 0);                     // #4
-    Move(QPtr^, QnPtr^, FDk * csNeuralFloatSize);
-    TNNetVolume.Mul(QnPtr, InvN, FDk);
-    KPtr := Prev.GetRawPtr(i, 0, FDk);                   // #4
-    SumSq := TNNetVolume.DotProduct(KPtr, KPtr, FDk);
-    InvN := pcr_rsqrtf(SumSq + csSwinV2NormEps);
-    KnPtr := FKNorm.GetRawPtr(i, 0);                     // #4
-    Move(KPtr^, KnPtr^, FDk * csNeuralFloatSize);
-    TNNetVolume.Mul(KnPtr, InvN, FDk);
-  end;
+  NormalizeQKRows(FQNorm, FKNorm, FInvQNorm, FInvKNorm, csSwinV2NormEps);
   // 2) cosine score * logit_scale + bias, softmax, weighted sum of V.
   for i := 0 to SeqNM1 do
   begin

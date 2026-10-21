@@ -1784,6 +1784,7 @@ type
     procedure TestCosineSimilarityAttentionSerializationRoundTrip;
     procedure TestCosineSimilarityAttentionLearnableScaleGradientCheck;
     procedure TestCosineSimilarityAttentionLearnableScaleSerializationRoundTrip;
+    procedure TestSwinV2WindowAttentionGradientCheck;
     procedure TestQKNormAttentionGradientCheck;
     procedure TestQKNormAttentionSerializationRoundTrip;
     procedure TestT5RelPosBucketingMatchesReference;
@@ -15695,6 +15696,106 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+// Central-difference input gradient of the cosine window attention (non-unit
+// logit_scale, non-zero bias), also after an inference-only -> trainable flip.
+procedure TTestNeuralNumerical.TestSwinV2WindowAttentionGradientCheck;
+const
+  cSeqLen = 3;
+  cDk = 4;
+  cEpsilon = 0.001;
+var
+  NN, FlippedNN: TNNet;
+  Input, InputPlus, Desired, Bias, AnalyticalGrad: TNNetVolume;
+  LossPlus, LossMinus, NumericalGrad, MaxGradDiff, MaxFlipDiff: TNeuralFloat;
+  ElementPos, MaxElementPos: integer;
+
+  function BuildNet(): TNNet;
+  var
+    Attn: TNNetSwinV2WindowAttention;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(cSeqLen, 1, 3 * cDk, 1));
+    Attn := TNNetSwinV2WindowAttention.Create(cDk, cSeqLen);
+    Result.AddLayer(Attn);
+    Attn.SetLogitScale(2.5);
+    Attn.SetBiasMatrix(Bias);
+    Result.SetLearningRate(1.0, 0.0);
+    Result.SetBatchUpdate(true);
+  end;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  Input := TNNetVolume.Create(cSeqLen, 1, 3 * cDk);
+  InputPlus := TNNetVolume.Create(cSeqLen, 1, 3 * cDk);
+  Desired := TNNetVolume.Create(cSeqLen, 1, cDk);
+  Bias := TNNetVolume.Create(cSeqLen * cSeqLen, 1, 1);
+  AnalyticalGrad := TNNetVolume.Create();
+  NN := nil;
+  FlippedNN := nil;
+  try
+    for ElementPos := 0 to Bias.Size - 1 do
+      Bias.Raw[ElementPos] := 0.4 * Sin(ElementPos * 1.7);
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := Sin(ElementPos * 0.53) * 0.9 + 0.1;
+    for ElementPos := 0 to Desired.Size - 1 do
+      Desired.Raw[ElementPos] := Cos(ElementPos * 0.31);
+    NN := BuildNet();
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    AnalyticalGrad.Copy(NN.Layers[0].OutputError);
+    MaxGradDiff := 0;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + cEpsilon;
+      LossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - cEpsilon;
+      LossMinus := ComputeLoss(InputPlus);
+      NumericalGrad := (LossPlus - LossMinus) / (2 * cEpsilon);
+      MaxGradDiff := Max(MaxGradDiff,
+        Abs(NumericalGrad - AnalyticalGrad.Raw[ElementPos]));
+    end;
+    AssertTrue('SwinV2WindowAttention input gradient max |num-ana| = ' +
+      FloatToStr(MaxGradDiff) + ', grad sum abs = ' +
+      FloatToStr(AnalyticalGrad.GetSumAbs()), MaxGradDiff < 2e-3);
+    FlippedNN := BuildNet();
+    FlippedNN.SetTrainable(false);
+    FlippedNN.SetTrainable(true);
+    FlippedNN.Compute(Input);
+    FlippedNN.Layers[0].OutputError.Fill(0);
+    FlippedNN.Backpropagate(Desired);
+    MaxFlipDiff := 0;
+    for ElementPos := 0 to MaxElementPos do
+      MaxFlipDiff := Max(MaxFlipDiff, Abs(AnalyticalGrad.Raw[ElementPos] -
+        FlippedNN.Layers[0].OutputError.Raw[ElementPos]));
+    AssertTrue('SwinV2WindowAttention gradient after SetTrainable flip differs by ' +
+      FloatToStr(MaxFlipDiff), MaxFlipDiff < 1e-6);
+  finally
+    NN.Free;
+    FlippedNN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+    Bias.Free;
+    AnalyticalGrad.Free;
   end;
 end;
 
