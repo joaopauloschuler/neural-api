@@ -29,7 +29,10 @@ type
   end;
   // Variants of the MoE expert-bank OpenCL parity harness.
   TMoEBankParityOption = (moQuantize, moScaleInput, moBias, moSparseRouter,
-    moHostGateUp, moQuantizeAfterArming);
+    moHostGateUp, moQuantizeAfterArming, moSigmoidRouter, moBiasBalancedRouter,
+    moHostDown);
+  // Variants of the top-k gate OpenCL parity harness.
+  TTopKGateParityVariant = (tgRenormalize, tgRaw, tgBiasBalanced);
   TMoEBankParityOptions = set of TMoEBankParityOption;
 
   TTestNeuralNumerical = class(TTestCase)
@@ -48,6 +51,10 @@ type
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
     // SparseRouter swaps the top-k gate for a ReLU'd linear router, whose exact
     // zeros leave some tokens with FEWER than TopK filled slots.
+    // CPU-vs-OpenCL parity of one top-k gate over a resident source; WithTies
+    // draws the gate weights from four values so ties decide the selection.
+    procedure RunTopKGateOpenCLParity(TokenCnt, ExpertCnt, TopCnt: integer;
+      Variant: TTopKGateParityVariant; WithTies: boolean; const Msg: string);
     procedure RunMoEBankOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
       ExpertWidth, TopCnt: integer; Options: TMoEBankParityOptions;
       const Msg: string; Tolerance: TNeuralFloat);
@@ -777,6 +784,21 @@ type
     procedure MoEExpertBankOpenCLParitySparseRouter;
     procedure MoEExpertBankOpenCLParityHostGateUp;
     procedure MoEExpertBankOpenCLParityQuantizeAfterArming;
+    // The router chain variants: sigmoid + raw top-k (Llama-4), a bias-balanced
+    // gate, and a host down bank that needs the host copy of the slot map.
+    procedure MoEExpertBankOpenCLParitySigmoidRouter;
+    procedure MoEExpertBankOpenCLParityBiasBalancedRouter;
+    procedure MoEExpertBankOpenCLParityHostDown;
+    // OpenCL forward parity (vs CPU) of TNNetTopKGate and
+    // TNNetBiasBalancedTopKGate: exact selection incl. ties, k = 1, 2, >2, k >= E.
+    procedure TopKGateOpenCLParityTop1Ties;
+    procedure TopKGateOpenCLParityTop2Ties;
+    procedure TopKGateOpenCLParityTop3;
+    procedure TopKGateOpenCLParityRawTies;
+    procedure TopKGateOpenCLParityIdentity;
+    procedure BiasBalancedTopKGateOpenCLParityTies;
+    procedure BiasBalancedTopKGateOpenCLParityTop3;
+    procedure BiasBalancedTopKGateOpenCLParityIdentity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -79218,12 +79240,14 @@ const
 var
   NN: TNNet;
   Input, OutCPU, GateUpCPU, OutDev, GateUpDev: TNNetVolume;
-  InputLayer, Source, GateConv, Router, BankGateUp, BankDown: TNNetLayer;
+  InputLayer, Source, GateConv, RouterAct, Router, BankGateUp,
+    BankDown: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   Pos, MaxPos, NeuronPos, SourceSentinels, GateUpSentinels: integer;
+  RouterSentinels, RouterActSentinels: integer;
   GateUpDiff, DownDiff: TNeuralFloat;
-  GateUpOnOpenCL, QuantizeLate: boolean;
+  GateUpOnOpenCL, DownOnOpenCL, QuantizeLate: boolean;
 
   procedure QuantizeBanks();
   begin
@@ -79261,6 +79285,7 @@ begin
     Exit;
   end;
   GateUpOnOpenCL := not (moHostGateUp in Options);
+  DownOnOpenCL := not (moHostDown in Options);
   QuantizeLate := moQuantizeAfterArming in Options;
   RandSeed := 424242;
   NN := TNNet.Create();
@@ -79289,18 +79314,39 @@ begin
     // Not trainable, so it binds the resident source instead of downloading it.
     GateConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt).
       SetTrainable(False, False));
+    // Every router layer is inference-only, so each binds its resident source
+    // and leaves its output in OpenCL memory.
     if moSparseRouter in Options then
     begin
       // Not a TNNetTopKGate, so the bank treats the router as dense (TopK =
       // ExpertCnt) while ReLU's EXACT zeros leave most tokens with fewer than
       // TopK filled slots - the only configuration that exercises the kernels'
       // empty-slot handling.
-      Router := NN.AddLayer(TNNetReLU.Create());
+      Router := NN.AddLayer(TNNetReLU.Create().SetTrainable(False, False));
+      RouterAct := GateConv;
+    end
+    else if moSigmoidRouter in Options then
+    begin
+      // Llama-4: sigmoid, then the raw (unrenormalized) top-k.
+      RouterAct := NN.AddLayer(TNNetSigmoid.Create().SetTrainable(False, False));
+      Router := NN.AddLayer(TNNetTopKGate.Create(TopCnt,
+        {pRenormalize=}false).SetTrainable(False, False));
     end
     else
     begin
-      NN.AddLayer(TNNetPointwiseSoftMax.Create());
-      Router := NN.AddLayer(TNNetTopKGate.Create(TopCnt, {pRenormalize=}true));
+      RouterAct := NN.AddLayer(TNNetPointwiseSoftMax.Create().
+        SetTrainable(False, False));
+      if moBiasBalancedRouter in Options then
+      begin
+        Router := NN.AddLayer(TNNetBiasBalancedTopKGate.Create(TopCnt,
+          {BiasSpeed=}0).SetTrainable(False, False));
+        // A selection bias large enough to change which experts win.
+        for Pos := 0 to ExpertCnt - 1 do
+          Router.Neurons[0].Weights.FData[Pos] := ((Pos mod 3) - 1) * 0.2;
+        Router.FlushWeightCache();
+      end
+      else Router := NN.AddLayer(TNNetTopKGate.Create(TopCnt,
+        {pRenormalize=}true).SetTrainable(False, False));
     end;
     BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(ExpertCnt,
       ExpertWidth, Source, Router, moScaleInput in Options));
@@ -79318,12 +79364,21 @@ begin
       OutCPU.Copy(BankDown.Output);
       GateUpCPU.Copy(BankGateUp.Output);
     end;
+    if moHostDown in Options then
+    begin
+      // Leaves a different routing in the host slot map, so a host down bank
+      // that skipped the rebuild would read it.
+      for Pos := 0 to MaxPos do Input.FData[Pos] := Cos(Pos * 0.91) * 0.8;
+      NN.Compute(Input);
+      for Pos := 0 to MaxPos do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
+    end;
 
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     // Toy sizes fail the size verdict, so an unforced bank with a host source
     // stays on the CPU.
     if not GateUpOnOpenCL then BankGateUp.ForceOpenCL(False);
+    if not DownOnOpenCL then BankDown.DisableOpenCL();
     try
       BankGateUp.ForwardGPUCnt := 0;
       BankDown.ForwardGPUCnt := 0;
@@ -79336,24 +79391,49 @@ begin
       end;
       Source.Output.Fill(csMoESentinel);
       BankGateUp.Output.Fill(csMoESentinel);
+      Router.Output.Fill(csMoESentinel);
+      RouterAct.Output.Fill(csMoESentinel);
       // Resident expert-bank reuse: no re-upload, no download.
       NN.Compute(Input);
       SourceSentinels := CountSentinels(Source.Output);
       GateUpSentinels := CountSentinels(BankGateUp.Output);
-      AssertTrue(Msg + ' - the down bank must take the OpenCL path',
-        BankDown.ForwardGPUCnt > 0);
-      AssertTrue(Msg + ' - the down bank output stays in OpenCL memory',
-        BankDown.OutputBindableOnOpenCL());
+      RouterSentinels := CountSentinels(Router.Output);
+      RouterActSentinels := CountSentinels(RouterAct.Output);
+      if DownOnOpenCL then
+      begin
+        AssertTrue(Msg + ' - the down bank must take the OpenCL path',
+          BankDown.ForwardGPUCnt > 0);
+        AssertTrue(Msg + ' - the down bank output stays in OpenCL memory',
+          BankDown.OutputBindableOnOpenCL());
+      end
+      else
+        AssertEquals(Msg + ' - the down bank stays on the CPU', 0,
+          BankDown.ForwardGPUCnt);
       if GateUpOnOpenCL then
       begin
         AssertTrue(Msg + ' - the gate|up bank must take the OpenCL path',
           BankGateUp.ForwardGPUCnt > 0);
         AssertTrue(Msg + ' - the gate|up output stays in OpenCL memory',
           BankGateUp.OutputBindableOnOpenCL());
+        AssertTrue(Msg + ' - the router must take the OpenCL path',
+          Router.ForwardGPUCnt > 0);
         AssertEquals(Msg + ' - the resident source is not downloaded',
           Source.Output.Size, SourceSentinels);
-        AssertEquals(Msg + ' - the gate|up output is not downloaded',
-          BankGateUp.Output.Size, GateUpSentinels);
+        AssertEquals(Msg + ' - the router input is not downloaded',
+          RouterAct.Output.Size, RouterActSentinels);
+        if DownOnOpenCL then
+        begin
+          // No host hop between the router and the down bank: the slot map
+          // is built in OpenCL memory from the resident router output.
+          AssertEquals(Msg + ' - the router output is not downloaded',
+            Router.Output.Size, RouterSentinels);
+          AssertEquals(Msg + ' - the gate|up output is not downloaded',
+            BankGateUp.Output.Size, GateUpSentinels);
+        end
+        else
+          // The host down bank rebuilds the host slot map from the router.
+          AssertEquals(Msg + ' - the host down bank reads the router', 0,
+            RouterSentinels);
       end
       else
       begin
@@ -79467,6 +79547,196 @@ begin
   // point and re-upload before the next forward.
   RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moBias, moQuantizeAfterArming],
     'int8 after FP32 arming', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParitySigmoidRouter;
+begin
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moSigmoidRouter, moScaleInput],
+    'sigmoid + raw top-k router', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityBiasBalancedRouter;
+begin
+  RunMoEBankOpenCLParity(4, 6, 6, 4, 3, [moBiasBalancedRouter, moBias],
+    'bias-balanced router', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityHostDown;
+begin
+  // The gate|up bank builds the slot map in OpenCL memory only, so the CPU
+  // down bank must rebuild the host copy before it reads it.
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moBias, moHostDown],
+    'host down bank', 1e-4);
+end;
+
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.RunTopKGateOpenCLParity(TokenCnt, ExpertCnt,
+  TopCnt: integer; Variant: TTopKGateParityVariant; WithTies: boolean;
+  const Msg: string);
+{$IFDEF OpenCL}
+const
+  csGateSentinel = 12345.0;
+  csGateTolerance = 1e-6;
+var
+  NN: TNNet;
+  Input, OutCPU, OutDev: TNNetVolume;
+  Source, Gate: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos, NeuronPos, ExpertIdx, SourceSentinels: integer;
+  PatternMismatches: integer;
+  LoadCPU: array of TNeuralFloat;
+  Diff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(TokenCnt, 1, ExpertCnt);
+  OutCPU := TNNetVolume.Create();
+  OutDev := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(TokenCnt, 1, ExpertCnt));
+    // Identity pointwise convolution: a resident source holding the input's
+    // exact values (0 * x and 1 * x are exact), so ties survive.
+    Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt).
+      SetTrainable(False, False));
+    for NeuronPos := 0 to Source.Neurons.Count - 1 do
+    begin
+      Source.Neurons[NeuronPos].Weights.Fill(0);
+      Source.Neurons[NeuronPos].Weights.FData[NeuronPos] := 1;
+      Source.Neurons[NeuronPos].BiasWeight := 0;
+    end;
+    Source.FlushWeightCache();
+    case Variant of
+      tgRenormalize: Gate := NN.AddLayer(TNNetTopKGate.Create(TopCnt, true).
+        SetTrainable(False, False));
+      tgRaw: Gate := NN.AddLayer(TNNetTopKGate.Create(TopCnt, false).
+        SetTrainable(False, False));
+    else
+      begin
+        Gate := NN.AddLayer(TNNetBiasBalancedTopKGate.Create(TopCnt, 0).
+          SetTrainable(False, False));
+        // Quarter steps, like the tied inputs, so biased sums tie too.
+        for ExpertIdx := 0 to ExpertCnt - 1 do
+          Gate.Neurons[0].Weights.FData[ExpertIdx] := ((ExpertIdx mod 3) - 1) * 0.25;
+        Gate.FlushWeightCache();
+      end;
+    end;
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      if WithTies
+        then Input.FData[Pos] := ((Pos * 7 + (Pos div ExpertCnt) * 3) mod 4) * 0.25
+        else Input.FData[Pos] := 0.6 + Sin(Pos * 0.37) * 0.35;
+    NN.Compute(Input);
+    OutCPU.Copy(Gate.Output);
+    SetLength(LoadCPU, ExpertCnt);
+    if Variant = tgBiasBalanced then
+    begin
+      for ExpertIdx := 0 to ExpertCnt - 1 do
+        LoadCPU[ExpertIdx] :=
+          TNNetBiasBalancedTopKGate(Gate).GetExpertLoad(ExpertIdx);
+      TNNetBiasBalancedTopKGate(Gate).ResetExpertLoad();
+    end;
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      Gate.ForwardGPUCnt := 0;
+      NN.Compute(Input);
+      Source.Output.Fill(csGateSentinel);
+      Gate.Output.Fill(csGateSentinel);
+      NN.Compute(Input);
+      SourceSentinels := 0;
+      for Pos := 0 to Source.Output.Size - 1 do
+        if Source.Output.FData[Pos] = csGateSentinel then Inc(SourceSentinels);
+      AssertTrue(Msg + ' - the gate must take the OpenCL path',
+        Gate.ForwardGPUCnt = 2);
+      AssertTrue(Msg + ' - the gate output stays in OpenCL memory',
+        Gate.OutputBindableOnOpenCL());
+      AssertEquals(Msg + ' - the resident source is not downloaded',
+        Source.Output.Size, SourceSentinels);
+      Gate.ForceOutputOnRAM();
+      OutDev.Copy(Gate.Output);
+      if Variant = tgBiasBalanced then
+        // Two device forwards, each counting what the CPU forward counted.
+        for ExpertIdx := 0 to ExpertCnt - 1 do
+          AssertEquals(Msg + ' - expert ' + IntToStr(ExpertIdx) + ' load',
+            2 * LoadCPU[ExpertIdx],
+            TNNetBiasBalancedTopKGate(Gate).GetExpertLoad(ExpertIdx), 0);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertEquals(Msg + ' - output size', OutCPU.Size, OutDev.Size);
+    PatternMismatches := 0;
+    Diff := 0;
+    for Pos := 0 to OutCPU.Size - 1 do
+    begin
+      if (OutCPU.FData[Pos] = 0) <> (OutDev.FData[Pos] = 0) then
+        Inc(PatternMismatches);
+      Diff := Max(Diff, Abs(OutCPU.FData[Pos] - OutDev.FData[Pos]));
+    end;
+    WriteLn('  TopKGate OpenCL parity (', Msg, '): max|diff|=', Diff:0:9,
+      ' selection mismatches=', PatternMismatches);
+    AssertTrue(Msg + ' - CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+    AssertEquals(Msg + ' - the same experts are selected', 0, PatternMismatches);
+    AssertTrue(Msg + ' - max |diff| = ' + FloatToStr(Diff) + ' must be < ' +
+      FloatToStr(csGateTolerance), Diff < csGateTolerance);
+  finally
+    OutDev.Free;
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TopKGateOpenCLParityTop1Ties;
+begin
+  RunTopKGateOpenCLParity(5, 6, 1, tgRenormalize, true, 'k=1 ties');
+end;
+
+procedure TTestNeuralNumerical.TopKGateOpenCLParityTop2Ties;
+begin
+  RunTopKGateOpenCLParity(5, 6, 2, tgRenormalize, true, 'k=2 ties');
+end;
+
+procedure TTestNeuralNumerical.TopKGateOpenCLParityTop3;
+begin
+  RunTopKGateOpenCLParity(4, 8, 3, tgRenormalize, false, 'k=3');
+end;
+
+procedure TTestNeuralNumerical.TopKGateOpenCLParityRawTies;
+begin
+  RunTopKGateOpenCLParity(5, 8, 5, tgRaw, true, 'raw k=5 ties');
+end;
+
+procedure TTestNeuralNumerical.TopKGateOpenCLParityIdentity;
+begin
+  // k >= expert count: the host copies the input without renormalizing.
+  RunTopKGateOpenCLParity(3, 4, 4, tgRenormalize, false, 'identity k=E');
+end;
+
+procedure TTestNeuralNumerical.BiasBalancedTopKGateOpenCLParityTies;
+begin
+  RunTopKGateOpenCLParity(5, 6, 2, tgBiasBalanced, true, 'bias-balanced k=2 ties');
+end;
+
+procedure TTestNeuralNumerical.BiasBalancedTopKGateOpenCLParityTop3;
+begin
+  RunTopKGateOpenCLParity(4, 8, 3, tgBiasBalanced, false, 'bias-balanced k=3');
+end;
+
+procedure TTestNeuralNumerical.BiasBalancedTopKGateOpenCLParityIdentity;
+begin
+  RunTopKGateOpenCLParity(3, 4, 6, tgBiasBalanced, false,
+    'bias-balanced identity k>E');
 end;
 
 // General-convolution BACKWARD device offload parity (vs CPU). Builds a small

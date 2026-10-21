@@ -6024,3 +6024,132 @@ __kernel void cai_moe_expert_gateup_int8
   }
   FOut[pair * FExpertWidth + w] = result;
 } // end of kernel
+
+// Upper bound on the k of cai_topk_gate (its private selection buffers). The
+// host checks it before launching and keeps a larger k on the CPU.
+#define CAI_TOPK_GATE_MAX_K 32
+
+// Hard top-k MoE routing gate (TNNetTopKGate / TNNetBiasBalancedTopKGate), one
+// work-item per cell over its FDepth expert weights.
+//
+// Selection is the insertion scan of the host NeuralMarkTopK, step for step: a
+// value enters a full buffer only when STRICTLY greater than the worst kept
+// one, and is inserted after every kept value it does not beat. On equal values
+// the lower expert index therefore wins, and the kept set is the CPU's.
+// FUseBias ranks by g + b (the selection bias of the bias-balanced gate); the
+// output always carries the unbiased g. FRenormalize divides the survivors by
+// their sum, accumulated in ascending expert order as on the host (a zero sum
+// divides by 1); else the survivors keep g. Non-survivors are written as 0.
+// FTopK >= FDepth is the host's identity copy (no renormalization). FCountLoad
+// adds one per kept expert to FLoadCount, the bias-balanced load accumulator.
+// Coded by Claude (AI).
+__kernel void cai_topk_gate
+(
+  const int FCellCnt,
+  const int FDepth,
+  const int FTopK,
+  const int FRenormalize,
+  const int FUseBias,
+  const int FCountLoad,
+  __global const float* FSource,
+  __global const float* FBias,
+  __global float* FOut,
+  __global int* FLoadCount
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FCellCnt) return;
+  const int base = c * FDepth;
+  if (FTopK >= FDepth)
+  {
+    for (int d = 0; d < FDepth; d++)
+    {
+      FOut[base + d] = FSource[base + d];
+      if (FCountLoad != 0) atomic_inc(&FLoadCount[d]);
+    }
+    return;
+  }
+  float topVal[CAI_TOPK_GATE_MAX_K];
+  int topIdx[CAI_TOPK_GATE_MAX_K];
+  int kept = 0;
+  const int lastK = FTopK - 1;
+  for (int d = 0; d < FDepth; d++)
+  {
+    float val = FSource[base + d];
+    if (FUseBias != 0) val += FBias[d];
+    if ((kept == FTopK) && !(val > topVal[lastK])) continue;
+    if (kept < FTopK) kept++;
+    int ins = kept - 1;
+    while ((ins > 0) && (val > topVal[ins - 1]))
+    {
+      topVal[ins] = topVal[ins - 1];
+      topIdx[ins] = topIdx[ins - 1];
+      ins--;
+    }
+    topVal[ins] = val;
+    topIdx[ins] = d;
+  }
+  // Survivors back into ascending expert order: the order of the host's sum.
+  for (int i = 1; i < kept; i++)
+  {
+    const int idx = topIdx[i];
+    int j = i;
+    while ((j > 0) && (topIdx[j - 1] > idx))
+    {
+      topIdx[j] = topIdx[j - 1];
+      j--;
+    }
+    topIdx[j] = idx;
+  }
+  float survSum = 1.0f;
+  if (FRenormalize != 0)
+  {
+    survSum = 0.0f;
+    for (int i = 0; i < kept; i++) survSum += FSource[base + topIdx[i]];
+    if (survSum == 0.0f) survSum = 1.0f;
+  }
+  for (int d = 0; d < FDepth; d++) FOut[base + d] = 0.0f;
+  for (int i = 0; i < kept; i++)
+  {
+    const int d = topIdx[i];
+    const float g = FSource[base + d];
+    FOut[base + d] = (FRenormalize != 0) ? (g / survSum) : g;
+    if (FCountLoad != 0) atomic_inc(&FLoadCount[d]);
+  }
+} // end of kernel
+
+// Device twin of TNNetMoEExpertBankGateUp.BuildSlotMap over a router output
+// left in OpenCL memory (FTokenCnt rows of FNumExperts gate weights): a token's
+// slots take its non-zero gates in ascending expert order, at most FTopK. A
+// TNNetTopKGate router never exceeds FTopK, so the break only mirrors the host.
+// Slots past FSlotCount[t] keep stale values; every reader stops at the count.
+// One work-item per token. Coded by Claude (AI).
+__kernel void cai_moe_build_slot_map
+(
+  const int FTokenCnt,
+  const int FNumExperts,
+  const int FTopK,
+  __global const float* FGate,
+  __global int*   FSlotExpert,
+  __global float* FSlotGate,
+  __global int*   FSlotCount
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const int gateBase = t * FNumExperts;
+  const int pairBase = t * FTopK;
+  int slot = 0;
+  for (int e = 0; e < FNumExperts; e++)
+  {
+    const float g = FGate[gateBase + e];
+    if (g != 0.0f)
+    {
+      if (slot >= FTopK) break;
+      FSlotExpert[pairBase + slot] = e;
+      FSlotGate[pairBase + slot] = g;
+      slot++;
+    }
+  }
+  FSlotCount[t] = slot;
+} // end of kernel

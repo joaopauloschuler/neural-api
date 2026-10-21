@@ -6205,6 +6205,40 @@ type
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
+  // OpenCL forward helper of TNNetTopKGate and TNNetBiasBalancedTopKGate: binds
+  // cai_topk_gate (one work-item per cell, the host NeuralMarkTopK scan) on the
+  // shared dot-product program's device. The selection bias is resident (ArmBias
+  // re-uploads it only when the layer reports a change) and so is the per-expert
+  // load counter of the bias-balanced gate; the result stays in OpenCL memory
+  // (ResultBuffer) for the next layer unless the caller asks for a read back.
+  // Coded by Claude (AI).
+  TNNetTopKGateCL = class(TNNetKernelCL)
+  private
+    FBufSource, FBufOut, FBufBias, FBufLoad: cl_mem;
+    FCapSource, FCapOut, FCapBias, FCapLoad: csize_t;
+    FUseBias: integer;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Blocking upload of the per-expert selection bias; nil disables it.
+    procedure ArmBias(BiasVol: TNNetVolume);
+    // Sizes the per-expert load counter for Depth experts and zeroes it.
+    // pScratch is the caller's persistent Depth-entry transfer buffer.
+    procedure ClearLoadCount(pScratch: PInteger; Depth: integer);
+    // Adds the device load counts into pLoad (Depth entries); the caller
+    // clears the counter before the next counting launch.
+    procedure FoldLoadCount(pLoad: TNeuralFloatArrPtr; pScratch: PInteger;
+      Depth: integer);
+    // One launch over Source's CellCnt cells of Depth gate weights; binds
+    // pExternalSrc, else uploads Source. CountLoad needs ClearLoadCount first.
+    procedure Compute(Source: TNNetVolume; pExternalSrc: cl_mem;
+      OutVol: TNNetVolume; CellCnt, Depth, TopK: integer;
+      Renormalize, CountLoad, KeepResultOnOpenCL: boolean);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   // OpenCL forward helper shared by both fused MoE expert banks. pGateUp picks
   // the gate|up entry points (cai_moe_expert_gateup*) over the down ones
   // (cai_moe_expert_down*), pInt8 the per-row int8 twin of either; both are
@@ -6231,6 +6265,9 @@ type
     FCapSource, FCapOut: csize_t;
     FGateUp, FInt8: boolean;
     FUseBias: integer;
+    // cai_moe_build_slot_map on the same queue (gate|up role only).
+    FSlotMapKernel: cl_kernel;
+    procedure EnsureSlotMapBuffers(TokenCnt, TopK: integer);
   public
     constructor Create(NN: TNNet; pGateUp, pInt8: boolean);
     destructor Destroy(); override;
@@ -6248,6 +6285,10 @@ type
     // and combine weights, TokenCnt fill counts) into this helper's buffers.
     procedure UploadSlotMap(SlotExpert, SlotCount: PInteger;
       SlotGate: TNeuralFloatArrPtr; TokenCnt, TopK: integer);
+    // Builds the slot map in this helper's buffers from a router output left
+    // in OpenCL memory (TokenCnt x NumExperts); no host transfer.
+    procedure BuildSlotMapOnOpenCL(GateBuffer: cl_mem;
+      TokenCnt, NumExperts, TopK: integer);
     // One launch over SlotMapOwner's slot map; binds pExternalSrc, else uploads
     // Source. Flag is ScaleInputByGate (gate|up) or UnitCombine (down).
     procedure Compute(SlotMapOwner: TNNetMoEExpertBankCL; Source: TNNetVolume;
@@ -15614,6 +15655,27 @@ type
       FKeptBuf: array of boolean;
       FTopIdx: array of integer;      // top-k selection scratch (NeuralMarkTopK)
       FTopVal: array of TNeuralFloat;
+    protected
+      {$IFDEF OpenCL}
+      // cai_topk_gate forward; nil until EnableOpenCL.
+      FTopKGateCL: TNNetTopKGateCL;
+      // Set by AfterWeightUpdate: the resident selection bias must re-upload.
+      FOpenCLBiasDirty: boolean;
+      // True when the source can be read where it lies (inference only: the
+      // backward reads FOutput on the host).
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
+      // Runs the device forward when WillOpenCL; else readies the CPU path
+      // (source downloaded, residency flags reset) and returns false.
+      function ComputeOnOpenCLIfWilling(): boolean;
+      procedure ComputeOpenCL();
+      // Readies the device load counter before a launch; False (the default)
+      // when this gate counts no expert load.
+      function PrepareOpenCLLoadCount(): boolean; virtual;
+      {$ENDIF}
+      // The per-expert bias the selection ranks by (nil: none), and whether
+      // the survivors are renormalized to sum to 1.
+      function SelectionBias(): TNNetVolume; virtual;
+      function RenormalizesSurvivors(): boolean; virtual;
     public
       constructor Create(TopCnt: integer;
         pRenormalize: boolean = true); reintroduce; overload;
@@ -15621,6 +15683,15 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      procedure AfterWeightUpdate(); override;
+      {$IFDEF OpenCL}
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
   end;
 
   /// Expert-Choice routing gate (Zhou et al. 2022, "Mixture-of-Experts with
@@ -15681,11 +15752,29 @@ type
   TNNetBiasBalancedTopKGate = class(TNNetTopKGate)
     private
       FLoadAcc: array of TNeuralFloat;  // per-expert selection counts (transient)
+      {$IFDEF OpenCL}
+      // True when device forwards counted load not yet folded into FLoadAcc.
+      FLoadOnOpenCL: boolean;
+      // Persistent transfer buffer of the device load counter (one per expert).
+      FLoadCountScratch: array of integer;
+      // Adds the device counts into FLoadAcc; the next counting launch clears
+      // the counter (PrepareOpenCLLoadCount).
+      procedure FoldOpenCLExpertLoad();
+      {$ENDIF}
+    protected
+      {$IFDEF OpenCL}
+      function PrepareOpenCLLoadCount(): boolean; override;
+      {$ENDIF}
+      function SelectionBias(): TNNetVolume; override;
+      function RenormalizesSurvivors(): boolean; override;
     public
       constructor Create(TopCnt: integer; BiasSpeed: TNeuralFloat); overload;
       procedure Compute(); override;
       procedure InitDefault(); override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
       // Bias update rule (call once per batch): b_e -= BiasSpeed*sign(load_e -
       // mean_load); consumes and resets the per-expert load accumulator. A
       // no-op when no load has been accumulated or BiasSpeed = 0.
@@ -15791,11 +15880,17 @@ type
       FExpertPairs: array of integer;    // [FTokenCnt*FTopK] pairs by expert
       FOverflowReported: boolean;
       {$IFDEF OpenCL}
-      // True when this pass' slot map was uploaded to FBankCL, so the down bank
+      // True when this pass' slot map is in FBankCL's buffers, so the down bank
       // binds it instead of uploading its own copy.
       FSlotMapOnOpenCL: boolean;
+      // True when this pass' slot map was built in OpenCL memory only: the host
+      // arrays are stale until EnsureHostSlotMap rebuilds them.
+      FHostSlotMapStale: boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Rebuilds the host slot map from the router when this pass built it in
+      // OpenCL memory only. Every host reader of FSlot* calls it first.
+      procedure EnsureHostSlotMap();
       // Scans the router output into the slot map and orders the pairs by
       // expert. Reports (once) a router that selects more than TopK experts
       // for a token - the extra selections are dropped, which keeps the slot
@@ -15827,8 +15922,11 @@ type
       // True when the source can be read where it lies: the kernel reads the
       // flat [token*VectorSize + i] span every producer's buffer carries.
       function ShouldBindPrevOutputOnOpenCL(): boolean;
-      // Single-launch device forward (cai_moe_expert_gateup*): the router is
-      // scanned on the host, the slot-packed SwiGLU hidden stays resident.
+      // True when the router output is in OpenCL memory with the frozen
+      // (TokenCnt, NumExperts) size, so the slot map is built there.
+      function ShouldBuildSlotMapOnOpenCL(): boolean;
+      // Single-launch device forward (cai_moe_expert_gateup*) over a slot map
+      // built in OpenCL memory or on the host; the SwiGLU hidden stays resident.
       procedure ComputeOpenCL();
       {$ENDIF}
     public
@@ -42505,6 +42603,109 @@ begin
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
+{ TNNetTopKGateCL }
+
+constructor TNNetTopKGateCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_topk_gate');
+  FUseBias := 0;
+end;
+
+destructor TNNetTopKGateCL.Destroy();
+begin
+  if Assigned(FBufSource) then clReleaseMemObject(FBufSource);
+  if Assigned(FBufOut)    then clReleaseMemObject(FBufOut);
+  if Assigned(FBufBias)   then clReleaseMemObject(FBufBias);
+  if Assigned(FBufLoad)   then clReleaseMemObject(FBufLoad);
+  inherited Destroy();
+end;
+
+procedure TNNetTopKGateCL.ArmBias(BiasVol: TNNetVolume);
+begin
+  if (BiasVol = nil) or (BiasVol.Size = 0) then
+  begin
+    FUseBias := 0;
+    exit;
+  end;
+  // Blocking: UpdateRoutingBias may rewrite the host bias before this drains.
+  FKernel.EnsureWriteBuffer(FBufBias, FCapBias, BiasVol, {DoWrite=}true,
+    {pBlocking=}true);
+  FUseBias := 1;
+end;
+
+procedure TNNetTopKGateCL.ClearLoadCount(pScratch: PInteger; Depth: integer);
+var
+  LoadBytes: csize_t;
+begin
+  if Depth <= 0 then exit;
+  LoadBytes := csize_t(Depth) * csLongintSize;
+  FKernel.EnsureBuffer(FBufLoad, FCapLoad, CL_MEM_READ_WRITE, LoadBytes);
+  FillChar(pScratch^, LoadBytes, 0);
+  FKernel.WriteBuffer(FBufLoad, LoadBytes, pScratch, CL_TRUE);
+end;
+
+procedure TNNetTopKGateCL.FoldLoadCount(pLoad: TNeuralFloatArrPtr;
+  pScratch: PInteger; Depth: integer);
+var
+  ExpertIdx, MaxExpertPos: integer;
+  LoadBytes: csize_t;
+begin
+  if (FBufLoad = nil) or (Depth <= 0) then exit;
+  LoadBytes := csize_t(Depth) * csLongintSize;
+  // Blocking read on the in-order queue: ordered after every counting launch.
+  FKernel.ReadBuffer(FBufLoad, LoadBytes, pScratch, CL_TRUE);
+  MaxExpertPos := Depth - 1;
+  for ExpertIdx := 0 to MaxExpertPos do
+    pLoad^[ExpertIdx] := pLoad^[ExpertIdx] + pScratch[ExpertIdx];
+end;
+
+procedure TNNetTopKGateCL.Compute(Source: TNNetVolume; pExternalSrc: cl_mem;
+  OutVol: TNNetVolume; CellCnt, Depth, TopK: integer;
+  Renormalize, CountLoad, KeepResultOnOpenCL: boolean);
+var
+  bufSrc, bufO: cl_mem;
+  k: cl_kernel;
+  RenormFlag, CountLoadFlag: integer;
+begin
+  k := FKernel.Kernel;
+  if pExternalSrc <> nil
+    then bufSrc := pExternalSrc
+    // Blocking: the host source may be rewritten before this queue drains.
+    else bufSrc := FKernel.EnsureWriteBuffer(FBufSource, FCapSource, Source,
+      {DoWrite=}true, {pBlocking=}true);
+  bufO := FKernel.EnsureOutputBuffer(FBufOut, FCapOut, OutVol);
+  if Renormalize then RenormFlag := 1 else RenormFlag := 0;
+  if CountLoad then CountLoadFlag := 1 else CountLoadFlag := 0;
+  clSetKernelArg(k, 0, csLongintSize, @CellCnt);
+  clSetKernelArg(k, 1, csLongintSize, @Depth);
+  clSetKernelArg(k, 2, csLongintSize, @TopK);
+  clSetKernelArg(k, 3, csLongintSize, @RenormFlag);
+  clSetKernelArg(k, 4, csLongintSize, @FUseBias);
+  clSetKernelArg(k, 5, csLongintSize, @CountLoadFlag);
+  clSetKernelArg(k, 6, csCLMemSize, @bufSrc);
+  // Unused buffers may be nil: the flags keep the kernel from reading them.
+  clSetKernelArg(k, 7, csCLMemSize, @FBufBias);
+  clSetKernelArg(k, 8, csCLMemSize, @bufO);
+  clSetKernelArg(k, 9, csCLMemSize, @FBufLoad);
+  FKernel.RunKernel(k, CellCnt);
+  if not KeepResultOnOpenCL then FKernel.ReadBuffer(bufO, OutVol, CL_TRUE);
+end;
+
+function TNNetTopKGateCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufOut;
+end;
+
+function TNNetTopKGateCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetTopKGateCL.BufferBytes(): int64;
+begin
+  Result := int64(FCapSource) + FCapOut + FCapBias + FCapLoad;
+end;
+
 { TNNetMoEExpertBankCL }
 
 constructor TNNetMoEExpertBankCL.Create(NN: TNNet; pGateUp, pInt8: boolean);
@@ -42524,10 +42725,14 @@ begin
   FGateUp := pGateUp;
   FInt8 := pInt8;
   FUseBias := 0;
+  // Same TNeuralKernel, so the slot map is built on the queue that reads it.
+  if pGateUp then
+    FSlotMapKernel := FKernel.CreateKernel('cai_moe_build_slot_map');
 end;
 
 destructor TNNetMoEExpertBankCL.Destroy();
 begin
+  if Assigned(FSlotMapKernel) then clReleaseKernel(FSlotMapKernel);
   if Assigned(FBufW)          then clReleaseMemObject(FBufW);
   if Assigned(FBufScales)     then clReleaseMemObject(FBufScales);
   if Assigned(FBufBias)       then clReleaseMemObject(FBufBias);
@@ -42566,8 +42771,7 @@ begin
   FUseBias := 1;
 end;
 
-procedure TNNetMoEExpertBankCL.UploadSlotMap(SlotExpert, SlotCount: PInteger;
-  SlotGate: TNeuralFloatArrPtr; TokenCnt, TopK: integer);
+procedure TNNetMoEExpertBankCL.EnsureSlotMapBuffers(TokenCnt, TopK: integer);
 var
   MapInts, MapFloats, CountInts: csize_t;
 begin
@@ -42580,12 +42784,41 @@ begin
     MapFloats);
   FKernel.EnsureBuffer(FBufSlotCount, FCapSlotCount, CL_MEM_READ_WRITE,
     CountInts);
+end;
+
+procedure TNNetMoEExpertBankCL.UploadSlotMap(SlotExpert, SlotCount: PInteger;
+  SlotGate: TNeuralFloatArrPtr; TokenCnt, TopK: integer);
+var
+  MapInts, MapFloats, CountInts: csize_t;
+begin
+  MapInts := csize_t(TokenCnt) * csize_t(TopK) * csLongintSize;
+  MapFloats := csize_t(TokenCnt) * csize_t(TopK) * csNeuralFloatSize;
+  CountInts := csize_t(TokenCnt) * csLongintSize;
+  EnsureSlotMapBuffers(TokenCnt, TopK);
   // Blocking: the gate|up bank rewrites these host arrays on its next forward,
   // which may come before this queue drains, and a kernel on another queue may
   // read the buffers.
   FKernel.WriteBuffer(FBufSlotExpert, MapInts, SlotExpert, CL_TRUE);
   FKernel.WriteBuffer(FBufSlotGate, MapFloats, SlotGate, CL_TRUE);
   FKernel.WriteBuffer(FBufSlotCount, CountInts, SlotCount, CL_TRUE);
+end;
+
+procedure TNNetMoEExpertBankCL.BuildSlotMapOnOpenCL(GateBuffer: cl_mem;
+  TokenCnt, NumExperts, TopK: integer);
+var
+  k: cl_kernel;
+begin
+  k := FSlotMapKernel;
+  EnsureSlotMapBuffers(TokenCnt, TopK);
+  clSetKernelArg(k, 0, csLongintSize, @TokenCnt);
+  clSetKernelArg(k, 1, csLongintSize, @NumExperts);
+  clSetKernelArg(k, 2, csLongintSize, @TopK);
+  clSetKernelArg(k, 3, csCLMemSize, @GateBuffer);
+  clSetKernelArg(k, 4, csCLMemSize, @FBufSlotExpert);
+  clSetKernelArg(k, 5, csCLMemSize, @FBufSlotGate);
+  clSetKernelArg(k, 6, csCLMemSize, @FBufSlotCount);
+  // In-order queue: the bank launch enqueued next reads the finished map.
+  FKernel.RunKernel(k, TokenCnt);
 end;
 
 procedure TNNetMoEExpertBankCL.Compute(SlotMapOwner: TNNetMoEExpertBankCL;
@@ -111328,8 +111561,136 @@ end;
 destructor TNNetTopKGate.Destroy();
 begin
   SetLength(FKeptBuf, 0);
+  {$IFDEF OpenCL} FreeAndNil(FTopKGateCL); {$ENDIF}
   inherited Destroy();
 end;
+
+function TNNetTopKGate.SelectionBias(): TNNetVolume;
+begin
+  Result := nil;
+end;
+
+function TNNetTopKGate.RenormalizesSurvivors(): boolean;
+begin
+  Result := FStruct[1] <> 1;
+end;
+
+procedure TNNetTopKGate.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  {$IFDEF OpenCL} FOpenCLBiasDirty := true; {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+const
+  // CAI_TOPK_GATE_MAX_K in neural.cl: the size of the kernel's private buffers.
+  csTopKGateOpenCLMaxK = 32;
+
+function TNNetTopKGate.PrepareOpenCLLoadCount(): boolean;
+begin
+  Result := false;
+end;
+
+// cai_topk_gate reads the flat [cell*Depth + d] span every producer's buffer
+// carries, so a resident source binds as is.
+function TNNetTopKGate.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := (not FIsTrainable) and PrevOutputOnOpenCLSameSize();
+end;
+
+// No size verdict: the work is tiny, so only a resident source (or
+// ForceOpenCL) takes the device path.
+function TNNetTopKGate.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FTopKGateCL) and FHasOpenCL and (FOutput.Depth > 0) and
+    ((FStruct[0] >= FOutput.Depth) or (FStruct[0] <= csTopKGateOpenCLMaxK)) and
+    (FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
+end;
+
+function TNNetTopKGate.ComputeOnOpenCLIfWilling(): boolean;
+begin
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    exit(true);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous device forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  Result := false;
+end;
+
+// Same selection, tie order and survivor sum order as the host Compute (see
+// cai_topk_gate). Coded by Claude (AI).
+procedure TNNetTopKGate.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+  KeepResultOnOpenCL, CountLoad: boolean;
+begin
+  if FOpenCLBiasDirty then
+  begin
+    FTopKGateCL.ArmBias(SelectionBias());
+    FOpenCLBiasDirty := false;
+  end;
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTopKGateCL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  CountLoad := PrepareOpenCLLoadCount();
+  // A trainable gate reads FOutput on the host in Backpropagate.
+  KeepResultOnOpenCL := not FIsTrainable;
+  FTopKGateCL.Compute(FPrevLayer.FOutput, SourceBuffer, FOutput,
+    FOutput.Size div FOutput.Depth, FOutput.Depth, FStruct[0],
+    RenormalizesSurvivors(), CountLoad, KeepResultOnOpenCL);
+  FOutputOnOpenCL := KeepResultOnOpenCL;
+  FOutputOnRAM := not KeepResultOnOpenCL;
+end;
+
+procedure TNNetTopKGate.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Not chained: TNNetIdentity's activation buffer is not this layer's output.
+  FHasOpenCL := true;
+  if not Assigned(FTopKGateCL) then FTopKGateCL := TNNetTopKGateCL.Create(FNN);
+  FOpenCLBiasDirty := true;
+end;
+
+procedure TNNetTopKGate.DisableOpenCL();
+begin
+  // FTopKGateCL owns the buffer a resident output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FTopKGateCL);
+end;
+
+function TNNetTopKGate.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTopKGateCL) then Result := FTopKGateCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTopKGate.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTopKGateCL) then Result := FTopKGateCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetTopKGate.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTopKGateCL) then Result := Result + FTopKGateCL.BufferBytes();
+end;
+{$ENDIF}
 
 procedure TNNetTopKGate.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
@@ -111346,7 +111707,13 @@ var
   BestVal, Val, SurvSum: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if ComputeOnOpenCLIfWilling() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -111608,6 +111975,11 @@ begin
   end;
   InitDefault();
   SetLength(FLoadAcc, pPrevLayer.FOutput.Depth);
+  {$IFDEF OpenCL}
+  SetLength(FLoadCountScratch, pPrevLayer.FOutput.Depth);
+  // The device counter was sized for the old expert count.
+  FLoadOnOpenCL := false;
+  {$ENDIF}
   ResetExpertLoad();
 end;
 
@@ -111632,7 +112004,13 @@ var
   BiasPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if ComputeOnOpenCLIfWilling() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -111687,6 +112065,7 @@ var
   Speed, Total, MeanLoad: TNeuralFloat;
   BiasPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FoldOpenCLExpertLoad(); {$ENDIF}
   Speed := FFloatSt[0];
   MaxD := Length(FLoadAcc) - 1;
   if (Speed = 0) or (MaxD < 0) or (FNeurons.Count < 1) then exit;
@@ -111708,8 +112087,50 @@ begin
   ResetExpertLoad();
 end;
 
+function TNNetBiasBalancedTopKGate.SelectionBias(): TNNetVolume;
+begin
+  if FNeurons.Count > 0 then Result := FNeurons[0].FWeights
+  else Result := nil;
+end;
+
+// The combine weights are always the renormalized unbiased g: the host forward
+// ignores the inherited raw flag.
+function TNNetBiasBalancedTopKGate.RenormalizesSurvivors(): boolean;
+begin
+  Result := true;
+end;
+
+{$IFDEF OpenCL}
+function TNNetBiasBalancedTopKGate.PrepareOpenCLLoadCount(): boolean;
+begin
+  if not FLoadOnOpenCL then
+  begin
+    FTopKGateCL.ClearLoadCount(@FLoadCountScratch[0], Length(FLoadCountScratch));
+    FLoadOnOpenCL := true;
+  end;
+  Result := true;
+end;
+
+procedure TNNetBiasBalancedTopKGate.FoldOpenCLExpertLoad();
+begin
+  if not FLoadOnOpenCL then exit;
+  FLoadOnOpenCL := false;
+  if Assigned(FTopKGateCL) and (Length(FLoadAcc) > 0) and
+    (Length(FLoadAcc) = Length(FLoadCountScratch)) then
+    FTopKGateCL.FoldLoadCount(@FLoadAcc[0], @FLoadCountScratch[0],
+      Length(FLoadAcc));
+end;
+
+procedure TNNetBiasBalancedTopKGate.DisableOpenCL();
+begin
+  FoldOpenCLExpertLoad();
+  inherited DisableOpenCL();
+end;
+{$ENDIF}
+
 function TNNetBiasBalancedTopKGate.GetExpertLoad(ExpertIdx: integer): TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FoldOpenCLExpertLoad(); {$ENDIF}
   if (ExpertIdx >= 0) and (ExpertIdx < Length(FLoadAcc))
     then Result := FLoadAcc[ExpertIdx]
     else Result := 0;
@@ -111719,6 +112140,7 @@ procedure TNNetBiasBalancedTopKGate.ResetExpertLoad();
 var
   CntD, MaxIdx: integer;
 begin
+  {$IFDEF OpenCL} FoldOpenCLExpertLoad(); {$ENDIF}
   MaxIdx := Length(FLoadAcc) - 1;
   if MaxIdx >= 0 then
     FillChar(FLoadAcc[0], (MaxIdx + 1) * csNeuralFloatSize, 0);  // #13
@@ -112047,6 +112469,18 @@ begin
   end;
 end;
 
+procedure TNNetMoEExpertBankGateUp.EnsureHostSlotMap();
+begin
+  {$IFDEF OpenCL}
+  if not FHostSlotMapStale then exit;
+  // The same scan over the same router values the device ran, so the host map
+  // matches the one in OpenCL memory.
+  FGateLayer.ForceOutputOnRAM();
+  BuildSlotMap();
+  FHostSlotMapStale := false;
+  {$ENDIF}
+end;
+
 procedure TNNetMoEExpertBankGateUp.PrepareForward();
 var
   TokenIdx, SlotIdx: integer;
@@ -112090,6 +112524,7 @@ begin
   if Assigned(FSourceLayer) then FSourceLayer.ForceOutputOnRAM();
   if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
   FSlotMapOnOpenCL := false;
+  FHostSlotMapStale := false;
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
@@ -112108,6 +112543,7 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
   FSlotMapOnOpenCL := false;
+  FHostSlotMapStale := false;
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
@@ -112277,16 +112713,36 @@ begin
     and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
 end;
 
-// Router read on the host; the slot map is uploaded once and shared with the
-// down bank; the result stays in OpenCL memory. Coded by Claude (AI).
+function TNNetMoEExpertBankGateUp.ShouldBuildSlotMapOnOpenCL(): boolean;
+begin
+  Result := FGateLayer.OutputBindableOnOpenCL() and
+    (FGateLayer.FOutput.Size = FTokenCnt * FNumExperts);
+end;
+
+// A resident router feeds cai_moe_build_slot_map, else the host builds and
+// uploads the map; either way the down bank shares it and the result stays in
+// OpenCL memory. Coded by Claude (AI).
 procedure TNNetMoEExpertBankGateUp.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
   ScaleInputFlag: integer;
 begin
-  FGateLayer.ForceOutputOnRAM();
-  BuildSlotMap();
   ArmOpenCLWeightsIfStale();
+  if ShouldBuildSlotMapOnOpenCL() then
+  begin
+    FGateLayer.OpenCLWaitOutputIfAnotherQueue(FBankCL.OutputKernel());
+    FBankCL.BuildSlotMapOnOpenCL(FGateLayer.OpenCLOutputBuffer(), FTokenCnt,
+      FNumExperts, FTopK);
+    FHostSlotMapStale := true;
+  end
+  else
+  begin
+    FGateLayer.ForceOutputOnRAM();
+    BuildSlotMap();
+    FBankCL.UploadSlotMap(@FSlotExpert[0], @FSlotCount[0],
+      TNeuralFloatArrPtr(@FSlotGate[0]), FTokenCnt, FTopK);
+    FHostSlotMapStale := false;
+  end;
   if ShouldBindPrevOutputOnOpenCL() then
   begin
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
@@ -112297,8 +112753,6 @@ begin
     SourceBuffer := nil;
     FPrevLayer.ForceOutputOnRAM();
   end;
-  FBankCL.UploadSlotMap(@FSlotExpert[0], @FSlotCount[0],
-    TNeuralFloatArrPtr(@FSlotGate[0]), FTokenCnt, FTopK);
   if FScaleInputByGate then ScaleInputFlag := 1 else ScaleInputFlag := 0;
   FBankCL.Compute(FBankCL, FPrevLayer.FOutput, SourceBuffer, FOutput,
     FTokenCnt, FTopK, FExpertWidth, FVectorSize, ScaleInputFlag);
@@ -112389,6 +112843,7 @@ begin
   end;
   Inc(FForwardCPUCnt);
   FPrevLayer.ForceOutputOnRAM();
+  FBank.EnsureHostSlotMap();
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
@@ -112405,6 +112860,7 @@ procedure TNNetMoEExpertBankDown.PrepareChunkedForward();
 begin
   {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if FBank <> nil then FBank.EnsureHostSlotMap();
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
@@ -112625,6 +113081,7 @@ begin
     HiddenBuffer := nil;
     SlotMapOwner := FBankCL;
     FBank.ForceOutputOnRAM();
+    FBank.EnsureHostSlotMap();
     FBankCL.UploadSlotMap(@FBank.FSlotExpert[0], @FBank.FSlotCount[0],
       TNeuralFloatArrPtr(@FBank.FSlotGate[0]), FTokenCnt, FTopK);
   end;
