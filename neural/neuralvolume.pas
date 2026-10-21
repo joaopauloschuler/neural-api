@@ -1814,6 +1814,22 @@ type
     var B: array of TNeuralFloat; n, m: integer): boolean;
 
 type
+  { Seeded private standard-normal stream (32-bit LCG + Marsaglia polar, spare
+    cached) so a caller can draw noise without moving the global Random sequence. }
+  TStdNormalStream = record
+    State: longword;
+    Spare: TNeuralFloat;
+    HaveSpare: boolean;
+  end;
+
+  // Seeds the stream and drops any cached spare.
+  procedure StdNormalStreamInit(var Stream: TStdNormalStream; Seed: longword);
+  // Uniform sample in (0, 1] from the stream's LCG.
+  function StdNormalStreamUniform(var Stream: TStdNormalStream): TNeuralFloat;
+  // Standard normal sample from the stream.
+  function StdNormalStreamNext(var Stream: TStdNormalStream): TNeuralFloat;
+
+type
   { Reusable FFT plan built by FFTPlanInit: radix-2 twiddles for power-of-two N,
     Bluestein chirp, filter and scratch otherwise. Not thread-safe: one per thread. }
   TFFTPlan = record
@@ -1883,6 +1899,9 @@ type
     Tsang (2000) method, supporting any Alpha > 0. }
   function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
   function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+
+  // Standard normal sample (Marsaglia polar) drawn from the global Random RNG.
+  function RandomStdNormal(): TNeuralFloat;
 
   { MixVolumes computes the convex combination
       Output := Lambda*A + (1-Lambda)*B
@@ -5706,9 +5725,8 @@ begin
   else WriteLn(' FAILED.');
 end;
 
-// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
-// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
 // Standard normal sample (Marsaglia polar) using the global Random RNG.
+// The loop runs 4 / pi = 1.273.. times on average.
 function RandomStdNormal(): TNeuralFloat;
 var
   r, x, y: TNeuralFloat;
@@ -5723,6 +5741,45 @@ begin
   Result := x * Sqrt(-2.0 * pcr_logf(r) / r);
 end;
 
+procedure StdNormalStreamInit(var Stream: TStdNormalStream; Seed: longword);
+begin
+  Stream.State := Seed;
+  Stream.Spare := 0;
+  Stream.HaveSpare := False;
+end;
+
+function StdNormalStreamUniform(var Stream: TStdNormalStream): TNeuralFloat;
+begin
+  Stream.State := (Stream.State * 1664525 + 1013904223) and $FFFFFFFF;
+  Result := (Stream.State + 1) / 4294967296.0;
+end;
+
+// Marsaglia polar on the stream's LCG; the second variate of each pair is cached.
+function StdNormalStreamNext(var Stream: TStdNormalStream): TNeuralFloat;
+var
+  r, x, y, Scale: TNeuralFloat;
+begin
+  if Stream.HaveSpare then
+  begin
+    Stream.HaveSpare := False;
+    Result := Stream.Spare;
+    Exit;
+  end;
+  r := 0;
+  while (r >= 1) or (r = 0) do
+  begin
+    x := 2.0 * StdNormalStreamUniform(Stream) - 1.0;
+    y := 2.0 * StdNormalStreamUniform(Stream) - 1.0;
+    r := x * x + y * y;
+  end;
+  Scale := Sqrt(-2.0 * pcr_logf(r) / r);
+  Stream.Spare := y * Scale;
+  Stream.HaveSpare := True;
+  Result := x * Scale;
+end;
+
+// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
+// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
 function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
 var
   d, c, x, v, u: TNeuralFloat;
@@ -9035,23 +9092,10 @@ begin
   end;
 end;
 
-// returns a random gaussivan value. This implementation is inspired on:
-//http://www.cs.princeton.edu/courses/archive/fall12/cos126/assignments/StdGaussian.java.html
+// Standard normal sample from the global Random RNG.
 function TVolume.RandomGaussianValue(): TNeuralFloat;
-var
-  r, x, y: TNeuralFloat;
 begin
-  r := 0;
-  // loop executed 4 / pi = 1.273.. times on average
-  while ( (r > 1) or (r = 0) ) do
-  begin
-    // find a uniform random point (x, y) inside unit circle
-    x := 2.0 * Random() - 1.0;
-    y := 2.0 * Random() - 1.0;
-    r := x*x + y*y;
-  end;
-
-  RandomGaussianValue := x * Sqrt(-2.0 * pcr_logf(r) / r);
+  Result := RandomStdNormal();
 end;
 
 procedure TVolume.Add(Original: TVolume);

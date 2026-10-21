@@ -3988,7 +3988,7 @@ type
   //
   // Inference helper: SampleMixture draws one D-dim sample from the predicted
   // mixture for one spatial cell (pick a component by its pi weights, then
-  // sample that diagonal Gaussian via a Box-Muller normal deviate).
+  // sample that diagonal Gaussian via a Marsaglia-polar normal deviate).
   // Coded by Claude (AI).
   TNNetMixtureDensity = class(TNNetIdentity)
   private
@@ -128196,8 +128196,6 @@ var
   LayerParamCnt: array of integer;
   WStar, Grad: array of TNeuralFloat;
   Beta, nBeta, LStar, LCur, ChainSum, ChainMean, LLCHat, Ratio: TNeuralFloat;
-  HaveSpareGaussian: boolean;
-  SpareGaussian: TNeuralFloat;
   ParamCntCheck: integer;
   NonFinite: boolean;
   Verdict: string;
@@ -128288,31 +128286,6 @@ var
       TNNetVolume.Mul(TNeuralFloatArrPtr(@G[0]), 1.0 / UsedCnt, NetParamCnt);
   end;
 
-  // Standard-normal sample via polar Box-Muller on the global RNG. The polar
-  // pair yields TWO independent variates; the second is cached for the next call.
-  function NextGaussian(): TNeuralFloat;
-  var
-    rr, xx, yy, Scale: TNeuralFloat;
-  begin
-    if HaveSpareGaussian then
-    begin
-      HaveSpareGaussian := false;
-      Result := SpareGaussian;
-      Exit;
-    end;
-    rr := 0;
-    while (rr > 1) or (rr = 0) do
-    begin
-      xx := 2.0 * Random() - 1.0;
-      yy := 2.0 * Random() - 1.0;
-      rr := xx * xx + yy * yy;
-    end;
-    Scale := Sqrt(-2.0 * pcr_logf(rr) / rr);
-    SpareGaussian := yy * Scale;
-    HaveSpareGaussian := true;
-    Result := xx * Scale;
-  end;
-
   // One anchored-Langevin (SGLD) step IN PLACE on the live weights:
   //   w <- w - (eps/2)*( n*beta*g + gamma*(w - w*) ) + N(0, eps)
   procedure LangevinStep();
@@ -128340,13 +128313,13 @@ var
         begin
           Cur := Neu.Weights.FData[KK];
           Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
-          Noise := NoiseSd * NextGaussian();
+          Noise := NoiseSd * RandomStdNormal();
           Neu.Weights.FData[KK] := Cur - HalfEps * Drift + Noise;
           Inc(PP);
         end;
         Cur := Neu.FBiasWeight;
         Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
-        Noise := NoiseSd * NextGaussian();
+        Noise := NoiseSd * RandomStdNormal();
         Neu.FBiasWeight := Cur - HalfEps * Drift + Noise;
         Inc(PP);
       end;
@@ -128490,7 +128463,6 @@ begin
 
       // --- Anchored SGLD chain; average L(w) over the post-burn-in samples. ---
       RandSeed := 987654;
-      HaveSpareGaussian := false;
       BurnIn := Trunc(ChainLen * cBurnFrac);
       if BurnIn >= ChainLen then BurnIn := ChainLen - 1;
       ChainSum := 0;
@@ -129867,10 +129839,8 @@ var
   HasTargets: boolean;
   Snapshot: string;
   SavedRandSeed: longword;
-  LcgState: longword;
-  Eta, G1, G2, U1, U2, R, Theta: TNeuralFloat;
-  HaveSpare: boolean;
-  Spare: TNeuralFloat;
+  NoiseStream: TStdNormalStream;
+  Eta: TNeuralFloat;
   // baseline caches (one volume / loss per used probe sample)
   Baseline: array of TNNetVolume;
   BaseLoss: array of TNeuralFloat;
@@ -129895,44 +129865,15 @@ var
   SnapPos, WeightCount: integer;
   Wv, TgtVol, BaseVol: TNNetVolume;
 
-  // Local LCG -> uniform (0,1], so this report never disturbs the caller's
-  // global RNG sequence (RandSeed is also saved/restored as a safeguard).
-  function LcgNext(): TNeuralFloat;
-  begin
-    LcgState := (LcgState * 1664525 + 1013904223) and $FFFFFFFF;
-    // map to (0, 1] avoiding exact 0 for the log() in Box-Muller.
-    Result := (LcgState + 1) / 4294967296.0;
-  end;
-
-  // Standard normal via Box-Muller (one spare cached between calls).
-  function NextGaussian(): TNeuralFloat;
-  begin
-    if HaveSpare then
-    begin
-      HaveSpare := False;
-      Result := Spare;
-      Exit;
-    end;
-    U1 := LcgNext();
-    U2 := LcgNext();
-    R := Sqrt(-2.0 * pcr_logf(U1));
-    Theta := 2.0 * Pi * U2;
-    pcr_sincosf(Theta, G2, G1);
-    G1 := R * G1;
-    G2 := R * G2;
-    Spare := G2;
-    HaveSpare := True;
-    Result := G1;
-  end;
-
 begin
   Result := '';
   Lines := TStringList.Create();
   Flags := TStringList.Create();
   SetLength(Baseline, 0);
   Snapshot := '';
-  HaveSpare := False;
-  Spare := 0;
+  // Private stream so this report never disturbs the caller's global RNG
+  // sequence (RandSeed is also saved/restored as a safeguard).
+  StdNormalStreamInit(NoiseStream, Seed);
   SavedRandSeed := RandSeed;
   try
     if NN = nil then
@@ -129949,7 +129890,6 @@ begin
     if Trials < 1 then Trials := 1;
     if MaxSamples < 1 then MaxSamples := 1;
 
-    LcgState := Seed;
     HasTargets := (Targets <> nil) and (Targets.Count > 0);
 
     UsedSamples := Samples.Count;
@@ -130079,10 +130019,10 @@ begin
           MaxPerturbWeightPos := Wv.Size - 1;
           for J := 0 to MaxPerturbWeightPos do
           begin
-            Eta := Sigma * NextGaussian();
+            Eta := Sigma * StdNormalStreamNext(NoiseStream);
             Wv.FData[J] := Wv.FData[J] * (1.0 + Eta);
           end;
-          Eta := Sigma * NextGaussian();
+          Eta := Sigma * StdNormalStreamNext(NoiseStream);
           Layer.Neurons[I].FBiasWeight :=
             Layer.Neurons[I].FBiasWeight * (1.0 + Eta);
         end;
@@ -132415,9 +132355,7 @@ var
   PredClass: integer;
   LogitAtX, LogitAtZero: TNeuralFloat;
   Xmin, Xmax, Sigma: TNeuralFloat;
-  LcgState: longword;
-  HaveSpare: boolean;
-  Spare: TNeuralFloat;
+  NoiseStream: TStdNormalStream;
   // attribution maps, flat over Probe.Size
   Vanilla, Smooth, Intg: array of TNeuralFloat;
   // scratch volumes
@@ -132437,34 +132375,6 @@ var
   WorstVal, AbsV: TNeuralFloat;
   RowStr: string;
   BucketIdx: integer;
-
-  // Local LCG -> uniform (0,1], so the report never touches the caller's RNG.
-  function LcgNext(): TNeuralFloat;
-  begin
-    LcgState := (LcgState * 1664525 + 1013904223) and $FFFFFFFF;
-    Result := (LcgState + 1) / 4294967296.0;
-  end;
-
-  function NextGaussian(): TNeuralFloat;
-  var
-    U1, U2, R, Theta, G2: TNeuralFloat;
-  begin
-    if HaveSpare then
-    begin
-      HaveSpare := False;
-      Result := Spare;
-      Exit;
-    end;
-    U1 := LcgNext();
-    U2 := LcgNext();
-    R := Sqrt(-2.0 * pcr_logf(U1));
-    Theta := 2.0 * Pi * U2;
-    pcr_sincosf(Theta, G2, Result);
-    Result := R * Result;
-    G2 := R * G2;
-    Spare := G2;
-    HaveSpare := True;
-  end;
 
   // One forward + one backward pass for input X, injecting the one-hot e_c as
   // the final-layer output error so the gradient that lands on the input layer
@@ -132510,10 +132420,9 @@ begin
   Result := '';
   Lines := TStringList.Create();
   Noisy := nil; Scaled := nil; Grad := nil; Baseline := nil;
-  HaveSpare := False;
-  Spare := 0;
-  LcgState := Seed;
-  if LcgState = 0 then LcgState := 1234567;
+  // Private stream: the report never touches the caller's global RNG.
+  if Seed = 0 then Seed := 1234567;
+  StdNormalStreamInit(NoiseStream, Seed);
   try
     if NN = nil then
     begin
@@ -132592,7 +132501,7 @@ begin
       Noisy.Copy(Probe);
       if Sigma > 0 then
         for I := 0 to NoisySizeM1 do
-          Noisy.Raw[I] := Noisy.Raw[I] + Sigma * NextGaussian();
+          Noisy.Raw[I] := Noisy.Raw[I] + Sigma * StdNormalStreamNext(NoiseStream);
       Grad.Fill(0);
       AccumLogitGrad(Noisy, PredClass, Grad, LogitAtX, 1.0);
       MaxSmoothAccumPos := Probe.Size - 1;

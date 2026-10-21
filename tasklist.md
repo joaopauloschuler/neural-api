@@ -141,6 +141,10 @@ rather than acted on.
       Box-Muller, so the sample outputs in the touched examples' README.md
       files must be re-run and refreshed; examples whose `NextGauss` takes a
       std argument just multiply the shared result.
+      Library part LANDED: `RandomStdNormal` exported, `RandomGaussianValue`
+      calls it, `TStdNormalStream` + `StdNormalStreamInit/Uniform/Next` in
+      neuralvolume.pas serve the two LCG reports; tests use the shared routine.
+      Remaining: the example copies.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):

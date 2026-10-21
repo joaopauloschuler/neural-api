@@ -37157,9 +37157,8 @@ begin
     begin
       cleanVal := Sin(i * 0.18) * 1.5;
       Clean.Raw[i] := cleanVal;
-      // Box-Muller Gaussian noise, std=0.5.
-      Noisy.Raw[i] := cleanVal +
-        Sqrt(-2 * Ln(Random + 1e-12)) * Cos(2 * Pi * Random) * 0.5;
+      // Gaussian noise, std=0.5.
+      Noisy.Raw[i] := cleanVal + RandomStdNormal() * 0.5;
     end;
 
     // Train the filter to denoise: target is the clean signal, input is noisy.

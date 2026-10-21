@@ -86,6 +86,8 @@ type
     procedure TestNeuralGreedyNMS;
     procedure TestLocalResponse2DMatchesReference;
     procedure TestLocalResponseDepthMatchesReference;
+    procedure TestStdNormalStreamDeterministicAndPrivate;
+    procedure TestRandomStdNormalMoments;
   end;
 
   // TNNetVolumeQuant8 holds int8 codes under the TNNetVolume geometry
@@ -143,6 +145,73 @@ type
   end;
 
 implementation
+
+procedure TTestNeuralVolume.TestStdNormalStreamDeterministicAndPrivate;
+const
+  cCount = 20000;
+var
+  A, B: TStdNormalStream;
+  I: integer;
+  V, Sum, SumSq, Mean, Variance: double;
+  SavedSeed: longword;
+begin
+  RandSeed := 31337;
+  SavedSeed := RandSeed;
+  StdNormalStreamInit(A, 42);
+  StdNormalStreamInit(B, 42);
+  Sum := 0;
+  SumSq := 0;
+  for I := 0 to cCount - 1 do
+  begin
+    V := StdNormalStreamNext(A);
+    AssertEquals('same seed gives the same sequence', V, StdNormalStreamNext(B), 0);
+    Sum := Sum + V;
+    SumSq := SumSq + V * V;
+  end;
+  AssertTrue('the stream must not move the global RNG', SavedSeed = RandSeed);
+  Mean := Sum / cCount;
+  Variance := SumSq / cCount - Mean * Mean;
+  AssertEquals('stream mean ~ 0', 0.0, Mean, 0.05);
+  AssertEquals('stream variance ~ 1', 1.0, Variance, 0.05);
+  StdNormalStreamInit(B, 43);
+  StdNormalStreamInit(A, 42);
+  AssertTrue('different seeds differ',
+    StdNormalStreamNext(A) <> StdNormalStreamNext(B));
+end;
+
+procedure TTestNeuralVolume.TestRandomStdNormalMoments;
+const
+  cCount = 20000;
+var
+  I: integer;
+  V, Sum, SumSq, Mean, Variance: double;
+  Vol: TNNetVolume;
+begin
+  RandSeed := 2718;
+  Sum := 0;
+  SumSq := 0;
+  for I := 0 to cCount - 1 do
+  begin
+    V := RandomStdNormal();
+    Sum := Sum + V;
+    SumSq := SumSq + V * V;
+  end;
+  Mean := Sum / cCount;
+  Variance := SumSq / cCount - Mean * Mean;
+  AssertEquals('RandomStdNormal mean ~ 0', 0.0, Mean, 0.05);
+  AssertEquals('RandomStdNormal variance ~ 1', 1.0, Variance, 0.05);
+  // TVolume.RandomGaussianValue is the same draw on the global RNG.
+  Vol := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 99;
+    V := RandomStdNormal();
+    RandSeed := 99;
+    AssertEquals('RandomGaussianValue shares RandomStdNormal', V,
+      Vol.RandomGaussianValue(), 0);
+  finally
+    Vol.Free;
+  end;
+end;
 
 procedure TTestNeuralVolume.TestVolumeCreation;
 var
