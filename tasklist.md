@@ -112,13 +112,6 @@ rather than acted on.
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
       applies; its declaration comment calls this intended, but dL/dW =
       (1/sigma) dL/dw_eff under the same constant-sigma rule.
-- [x] `TNNetSwinV2WindowAttention` inherited the plain SDPA backward (raw
-      Q.K * 1/sqrt(d_k)). CONFIRMED: TestSwinV2WindowAttentionGradientCheck
-      measured max |num-ana| input gradient 1.16e-2 before, 6.0e-4 after. The
-      layer now has its own cosine backward, shared with
-      TNNetCosineSimilarityAttention (BackpropagateCosineScores /
-      NormalizeQKRows on the SDPA base). logit_scale and the CPB bias are
-      load-time constants, so they carry no gradient.
 - [ ] Possible defect (not verified): `TNNetCosineSimilarityAttention.ComputeOpenCL`
       (SeqLen >= 32, no trainable gate) never fills FQNorm/FKNorm, so a
       backward after that forward reads stale normalized rows.
@@ -1662,21 +1655,11 @@ rather than acted on.
 - [ ] Qwen-Image inpainting (`--init-image FILE --mask FILE`, `/mask`; coded +
       pico parity `TestQwenImage21InpaintParity`): real 1024x1024 inpaint on the
       GPU box (user run), then the README example output.
-- [X] MultiDiffusion panoramas and large canvases for examples/QwenImage
-      (`--panorama WxH`, `--panorama-stride N`, `--panorama-wrap`,
-      `/panorama WxH|off`; port of diffusers `StableDiffusionPanoramaPipeline`
-      / Bar-Tal et al. 2023). `TMultiDiffusionWindows` (neuraldiffusion.pas)
-      plans the windows with `ComputeTileStarts` (shared with the tiled VAE
-      decode, now with circular wrap), gathers each window, accumulates the
-      velocities and divides by the per-cell coverage through any
-      `TMultiDiffusionPredictEvent`, so later DiT pipelines can drive it.
-      `TQwenImage21Pipeline.PanoramaWindowWidth/Height`, `PanoramaStride`,
-      `PanoramaCircular`: one `EncodePrefix`, the step pass stays built at the
-      window size, one `TDiTFirstBlockCache` per window (new
-      `PredictVelocity` overload taking the cache), mu from the window token
-      count; inpainting refused. Covered by
+- [ ] MultiDiffusion panoramas follow-up (examples/QwenImage `--panorama WxH`,
+      `--panorama-stride N`, `--panorama-wrap`, `/panorama WxH|off` over
+      `TMultiDiffusionWindows` in neuraldiffusion.pas; coded and covered by
       `TestQwenImage21PanoramaOneWindowParity`, `TestMultiDiffusionConstantSeams`
-      and `TestMultiDiffusionCircularWrap`.
+      and `TestMultiDiffusionCircularWrap`):
       - [ ] Real 2048x512 / 4096x1024 runs on the user's GPU box (quality,
             time per step, with and without `--panorama-wrap`); record them
             in examples/QwenImage/README.md.
