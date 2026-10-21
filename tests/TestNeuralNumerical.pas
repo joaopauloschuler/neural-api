@@ -471,6 +471,9 @@ type
     // The same two checks for TNNetDiagonalSSM (h = a*h + b*x; y = c*h + e*x).
     procedure DiagonalSSMResidentChainOpenCLParity;
     procedure DiagonalSSMDecodeResidentOpenCLParity;
+    // The same two checks for TNNetWKV (2C-wide [k | v] input, C-wide output).
+    procedure WKVResidentChainOpenCLParity;
+    procedure WKVDecodeResidentOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -84085,6 +84088,16 @@ end;
 procedure TTestNeuralNumerical.DiagonalSSMDecodeResidentOpenCLParity;
 begin
   CheckChannelScanDecodeParity(TNNetDiagonalSSM, 6);
+end;
+
+procedure TTestNeuralNumerical.WKVResidentChainOpenCLParity;
+begin
+  CheckChannelScanResidentChainParity(TNNetWKV, 8);
+end;
+
+procedure TTestNeuralNumerical.WKVDecodeResidentOpenCLParity;
+begin
+  CheckChannelScanDecodeParity(TNNetWKV, 8);
 end;
 
 function FusedSDPASplitOverride(Splits, ChunkRows,

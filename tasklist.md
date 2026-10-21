@@ -2053,12 +2053,21 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] The chat engine's checkpoint and prefill-window routes have not been
         run end to end on a real Mamba-2 or Nemotron-H checkpoint since the
         layer became recurrent; only the pico fixtures cover it.
-- [ ] `TNNetWKV` device forward — the RWKV trunk, same per-channel-scan recipe
-      as `TNNetTokenShift` and `TNNetDiagonalSSM` (landed: `cai_token_shift_scan`
-      / `cai_diagonal_ssm_scan` on the shared `TNNetChannelScanCL` helper, decode
-      state and checkpoint slots in OpenCL memory; tiny_rwkv streamed decode
-      covered on PoCL). Lower priority only because fewer tested checkpoints
-      use it.
+- [ ] Follow-ups of the `TNNetTokenShift` / `TNNetDiagonalSSM` / `TNNetWKV` device
+      forward (`cai_token_shift_scan`, `cai_diagonal_ssm_scan`, `cai_wkv_scan` on
+      the shared `TNNetChannelScanCL`; decode state and checkpoint slots stay in
+      OpenCL memory; the tiny_rwkv full forward, streamed decode and checkpoint
+      resume are covered on PoCL). Open follow-ups:
+  - [ ] Throughput is unmeasured: each kernel is one work-item per channel,
+        serial over the window, so a long prefill is latency-bound. Time an
+        RWKV decode and prefill on the GPU box.
+  - [ ] `TNNetGatedDeltaNet`, `TNNetSelectiveSSM` and `TNNetMamba2` still carry
+        their own copy of the decode-state residency code (`FDecHOnOpenCL`,
+        Ensure/Force, slot capture/restore); move them onto the
+        `TNNetRecurrentScanCL` methods (`EnsureStateOnOpenCL`, `ForceStateOnRAM`,
+        `MarkStateWrittenOnRAM`, `CaptureStateToSlot`, `RestoreStateFromSlot`).
+  - [ ] `TNNetCrossWKV` has no device forward (and no incremental path).
+  - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
 - [ ] Attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
   - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):

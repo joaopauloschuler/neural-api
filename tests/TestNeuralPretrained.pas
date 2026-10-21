@@ -553,6 +553,11 @@ type
     // tiny_rwkv decoded on OpenCL against the CPU twin: every TNNetTokenShift
     // runs every step on OpenCL with its previous-token state there.
     procedure TestRWKVStreamedDecodeOpenCLParity;
+    // The same decode requiring every TNNetWKV on OpenCL with its (A,B,Q) state
+    // there; one 8-token forward on OpenCL; and a checkpoint through OpenCL slots.
+    procedure TestRWKVWKVStreamedDecodeOpenCLParity;
+    procedure TestRWKVFullForwardOpenCLParity;
+    procedure TestRWKVStateCheckpointOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35StateCheckpointResumeParity;
     procedure TestQwen35StateCheckpointResumeInt8KVParity;
@@ -12068,6 +12073,33 @@ procedure TTestNeuralPretrained.TestRWKVStreamedDecodeOpenCLParity;
 begin
   {$IFDEF OpenCL}
   RunStreamedDecodeOpenCLParity('tiny_rwkv', TNNetTokenShift);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestRWKVWKVStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_rwkv', TNNetWKV);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestRWKVFullForwardOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunFullForwardOpenCLParity('tiny_rwkv', 8, TNNetWKV);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestRWKVStateCheckpointOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStateCheckpointOpenCLParity('tiny_rwkv', TNNetWKV);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}

@@ -12428,12 +12428,19 @@ type
       FGradW, FGradU: TNNetVolume; // C-long grad accumulators
       // --- incremental-decode state (inference only, not serialized; the
       // mode flag / step counter live in TNNetRecurrentDecodeBase) ---
-      FDecAA: TNNetVolume;      // persisted stabilised numerator A, C-long
-      FDecBB: TNNetVolume;      // persisted stabilised denominator B, C-long
-      FDecPP: TNNetVolume;      // persisted log-space running max Q, C-long
+      // Persisted [A | B | Q], C each: stabilised numerator, denominator and
+      // log-space running max (the layout cai_wkv_scan reads and writes).
+      FDecState: TNNetVolume;
       // Set whenever something that CAN be known to change w_raw happens
       // (construction, AfterWeightUpdate, the start of a decode session).
       FWDirty: boolean;
+      {$IFDEF OpenCL}
+      // cai_wkv_scan in OpenCL memory; its state bank carries FDecState through
+      // a decode session. Tables re-upload only when dirty.
+      FScanCL: TNNetChannelScanCL;
+      FGpuWeightsDirty: boolean;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure ComputeIncremental();
       // Rebuild policy for the FW = softplus(w_raw) table, called from both
       // forwards. Outside a decode session it is rebuilt UNCONDITIONALLY: it
@@ -12465,6 +12472,17 @@ type
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
       function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
   end;
 
   /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
@@ -70951,20 +70969,12 @@ begin
   FB := TNNetVolume.Create();
   FGradW := TNNetVolume.Create();
   FGradU := TNNetVolume.Create();
-  FDecAA := TNNetVolume.Create();
-  FDecBB := TNNetVolume.Create();
-  FDecPP := TNNetVolume.Create();
+  FDecState := TNNetVolume.Create();
   FDecodeEnabled := false;
   FDecodeSteps := 0;
   FWDirty := true;
   // [0]=w_raw [1]=u
   AddMissingNeurons(2);
-end;
-
-procedure TNNetWKV.AfterWeightUpdate();
-begin
-  inherited AfterWeightUpdate();
-  FWDirty := true;          // next forward rebuilds softplus(w_raw)
 end;
 
 procedure TNNetWKV.PrepareWTable();
@@ -70989,9 +70999,10 @@ end;
 
 destructor TNNetWKV.Destroy();
 begin
-  FDecPP.Free;
-  FDecBB.Free;
-  FDecAA.Free;
+  {$IFDEF OpenCL}
+  if Assigned(FScanCL) then FScanCL.Free;
+  {$ENDIF}
+  FDecState.Free;
   FGradU.Free;
   FGradW.Free;
   FB.Free;
@@ -71030,9 +71041,7 @@ begin
   FB.ReSize(FOutput.SizeX, 1, FChannels);
   FGradW.ReSize(1, 1, FChannels);
   FGradU.ReSize(1, 1, FChannels);
-  FDecAA.ReSize(1, 1, FChannels);
-  FDecBB.ReSize(1, 1, FChannels);
-  FDecPP.ReSize(1, 1, FChannels);
+  FDecState.ReSize(1, 1, 3 * FChannels);
   InitDefault();
 end;
 
@@ -71047,7 +71056,23 @@ var
   ww2, qmax2, e3, e4, eq: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  // The OpenCL forward serves the full-sequence scan and the decode alike. It
+  // runs BEFORE any ForceOutputOnRAM because that download is what it avoids.
+  if WillOpenCL() then
+  begin
+    StartTime := Now();
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecState);
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -71119,7 +71144,7 @@ end;
 // Inference-only stateful forward. The per-token recurrence is ALGEBRAICALLY
 // IDENTICAL to one step of Compute()'s full-sequence scan (same RWKV-v4
 // running-max stabiliser), but the running stabilised state (A,B,Q) resumes
-// from the PERSISTED FDecAA/FDecBB/FDecPP (carried across calls) instead of
+// from the PERSISTED FDecState triple (carried across calls) instead of
 // starting at (0,0,-inf), the true-accumulator BPTT cache FA/FB is NOT written,
 // and the loop is O(1) in past context (it only sweeps the SeqLen supplied this
 // call - one token for a decode step, many for a prompt prefill). Driving the
@@ -71153,9 +71178,9 @@ begin
     wv := FW.FData[d];
     uv := Wu.FData[d];
     // Resume the stabilised state from the persisted triple (NOT zero).
-    aprev := FDecAA.FData[d];
-    bprev := FDecBB.FData[d];
-    qprev := FDecPP.FData[d];
+    aprev := FDecState.FData[d];
+    bprev := FDecState.FData[C + d];
+    qprev := FDecState.FData[2 * C + d];
     basePrev := Prev.GetRawPos(0, 0, d);       // depth 2C; steps by pvStride
     baseC := FOutput.GetRawPos(0, 0, d);       // depth C; steps by ocStride
     for t := 0 to MaxT do
@@ -71186,9 +71211,9 @@ begin
       Inc(baseC, ocStride);
     end;
     // Persist the advanced stabilised state for the next call.
-    FDecAA.FData[d] := aprev;
-    FDecBB.FData[d] := bprev;
-    FDecPP.FData[d] := qprev;
+    FDecState.FData[d] := aprev;
+    FDecState.FData[C + d] := bprev;
+    FDecState.FData[2 * C + d] := qprev;
   end;
   Inc(FDecodeSteps, SeqLen);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -71199,10 +71224,9 @@ begin
   // The persisted state is one C-long (A,B,Q) triple; no MaxContext budget is
   // needed (contrast the attention KV cache). The buffers are already sized by
   // SetPrevLayer; ReSize is a safety net for layers wired manually.
-  FDecAA.ReSize(1, 1, FChannels);
-  FDecBB.ReSize(1, 1, FChannels);
-  FDecPP.ReSize(1, 1, FChannels);
+  FDecState.ReSize(1, 1, 3 * FChannels);
   FWDirty := true;          // force one rebuild at the start of the session
+  {$IFDEF OpenCL} FGpuWeightsDirty := true; {$ENDIF}
 end;
 
 procedure TNNetWKV.ResetState();
@@ -71210,44 +71234,153 @@ var
   d: integer;
   MaxC: integer;
 begin
-  FDecAA.Fill(0);            // A_{-1} = 0
-  FDecBB.Fill(0);            // B_{-1} = 0
+  FDecState.Fill(0);         // A_{-1} = B_{-1} = 0
   MaxC := FChannels - 1;
   for d := 0 to MaxC do
-    FDecPP.FData[d] := -1e30;  // Q_{-1} = -inf (log-space running max)
+    FDecState.FData[2 * FChannels + d] := -1e30; // Q_{-1} = -inf (log-space running max)
   FDecodeSteps := 0;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetWKV.CaptureState(Dst: TNNetVolume; out Steps: integer);
-var
-  RowBytes: integer;
 begin
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecState); {$ENDIF}
   Dst.ReSize(1, 1, 3 * FChannels);
-  // #13: the three per-channel state vectors are each a contiguous FChannels
-  // run, packed AA | BB | PP into Dst.
-  RowBytes := FChannels * csNeuralFloatSize;
-  Move(FDecAA.FData[0], Dst.FData[0],             RowBytes);
-  Move(FDecBB.FData[0], Dst.FData[FChannels],     RowBytes);
-  Move(FDecPP.FData[0], Dst.FData[2 * FChannels], RowBytes);
+  Dst.Copy(FDecState);
   Steps := FDecodeSteps;
 end;
 
 procedure TNNetWKV.RestoreState(Src: TNNetVolume; Steps: integer);
-var
-  RowBytes: integer;
 begin
-  // #13: mirror of CaptureState -- three contiguous FChannels runs.
-  RowBytes := FChannels * csNeuralFloatSize;
-  Move(Src.FData[0],             FDecAA.FData[0], RowBytes);
-  Move(Src.FData[FChannels],     FDecBB.FData[0], RowBytes);
-  Move(Src.FData[2 * FChannels], FDecPP.FData[0], RowBytes);
+  FDecState.Copy(Src);
   FDecodeSteps := Steps;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 function TNNetWKV.StateBytes(): int64;
 begin
-  Result := 3 * FChannels * csNeuralFloatSize;
+  Result := FDecState.GetMemSize();
 end;
+
+function TNNetWKV.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL}
+  Result := Assigned(FScanCL) and FScanCL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
+end;
+
+procedure TNNetWKV.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  FWDirty := true;          // next forward rebuilds softplus(w_raw)
+  {$IFDEF OpenCL}
+  FGpuWeightsDirty := true; // next OpenCL forward re-uploads the tables
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetWKV.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FScanCL)
+    then Result := FScanCL.NewOpenCLBuffer(FDecState.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetWKV.CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetWKV.CaptureStateToOpenCL: the layer has no' +
+      ' OpenCL path.');
+  FScanCL.CaptureStateToSlot(Slot, FDecState);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetWKV.RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetWKV.RestoreStateFromOpenCL: the layer has no' +
+      ' OpenCL path.');
+  FScanCL.RestoreStateFromSlot(Slot, FDecState);
+  FDecodeSteps := Steps;
+end;
+
+function TNNetWKV.WillOpenCL(): boolean;
+begin
+  // A source already in OpenCL memory puts the layer there whatever the size
+  // verdict says. The kernel writes no BPTT accumulator cache: inference-only.
+  Result := Assigned(FScanCL) and FHasOpenCL and (not FIsTrainable)
+            and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetWKV.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Bare TNNetLayer arming plus the dedicated scan helper: the recurrence is a
+  // per-channel scan, not a contraction.
+  FHasOpenCL := true;
+  if not Assigned(FScanCL) then
+    FScanCL := TNNetChannelScanCL.Create(FNN, 'cai_wkv_scan');
+  // Nothing is resident yet, whatever a previous weight update reported.
+  FGpuWeightsDirty := true;
+end;
+
+procedure TNNetWKV.DisableOpenCL();
+begin
+  // FScanCL owns the buffers a kept output and a live decode state live in.
+  ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecState);
+  inherited DisableOpenCL();
+  FreeAndNil(FScanCL);
+end;
+
+function TNNetWKV.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetWKV.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.OutputKernel()
+  else Result := nil;
+end;
+
+// Whole-sequence WKV scan in OpenCL memory. Outside a decode session (A,B,Q)
+// starts fresh; inside one the bank carries FDecState, so a step stays resident.
+procedure TNNetWKV.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+begin
+  // SeqLen contiguous 2C-long [k | v] rows bind straight in (no size match:
+  // the output is C wide).
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FScanCL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  // A full-sequence forward uses the bank as scratch, so a decode state still
+  // living there has to come home first.
+  if FDecodeEnabled then FScanCL.EnsureStateOnOpenCL(FDecState)
+  else FScanCL.ForceStateOnRAM(FDecState);
+  if FGpuWeightsDirty then
+  begin
+    PrepareWTable();
+    FScanCL.UploadWeights([FW, FNeurons[1].FWeights]);
+    FGpuWeightsDirty := false;
+  end;
+  FScanCL.Compute(FPrevLayer.FOutput, FOutput, FDecState, FOutput.SizeX,
+    FChannels, {ResetState=}not FDecodeEnabled, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetWKV.Backpropagate();
 var
