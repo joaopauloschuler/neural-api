@@ -1643,14 +1643,20 @@ rather than acted on.
          (mixed radix 2/3/5, or Bluestein). The LaMa bottleneck is H/8 x W/8,
          so a 512x768 photo gives 64x96. Padding to a power of two is NOT
          equivalent: the Fourier unit's global mixing is circular.
-      2. A `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` layer pair, a port of
+      2. [DONE e61c1fbf] A `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` layer pair, a port of
          `torch.fft.rfft2` / `irfft2` (norm "ortho" option, interleaved re/im
          channel layout, forward and backward so FFC layers can be trained). The
          Fourier unit is then pure composition: rfft2 -> pointwise conv (BN
          folded) -> ReLU -> irfft2.
       3. `BuildLaMaFromSafeTensors` in neuralpretrained.pas. Fold every BN into
          its conv; reuse `TNNetPad` pmReflect and `TNNetDeconvolution` for the
-         transposed convs.
+         transposed convs. Fourier unit wiring: `TNNetRealFFT2D.Create(csFFTNormOrtho)`
+         maps (W, H, C) to (W div 2 + 1, H, 2C) with depth 2c = Re and 2c+1 = Im of
+         channel c, which is exactly lama's order (`stack((re, im), dim=-1)`, permute
+         to (B, C, 2, H, W/2+1), `view(B, 2C, ...)`), so the 384->384 1x1 conv weights load without a channel permutation;
+         close with `TNNetInverseRealFFT2D.Create(W, csFFTNormOrtho)`, passing the
+         spatial W of the FU input (needed for odd W; the default 2*(SizeX-1) is
+         only right for even W).
       4. examples/LaMaInpaint (`--image FILE --mask FILE --out FILE`, cthreads
          first in uses) with a README.
       Tests: an rfft2/irfft2 round trip and an exact-vs-naive-DFT check on
