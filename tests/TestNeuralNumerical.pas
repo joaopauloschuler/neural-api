@@ -1055,6 +1055,10 @@ type
     // resident chain with ForceOpenCL off.
     procedure TransposedChannelAttentionOpenCLParity;
     procedure TransposedChannelAttentionResidentChainOpenCL;
+    // TNNetSAMVisionAttention OpenCL forward vs CPU (padded windows, exact
+    // windows, a global block; host and resident sources), and a resident chain.
+    procedure SAMVisionAttentionOpenCLParity;
+    procedure SAMVisionAttentionResidentChainOpenCL;
     // TNNetLocalResponseNorm2D / Depth OpenCL forward vs CPU, and both in a
     // resident chain with ForceOpenCL off.
     procedure LocalResponseNormOpenCLParity;
@@ -89429,6 +89433,227 @@ begin
     NN.GetLastLayer.ForceOutputOnRAM();
     MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
     WriteLn('  TransposedChannelAttention resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('resident chain vs CPU max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Random qkv/proj weights, biases and rel-pos tables of a TNNetSAMVisionAttention
+// through its importer setters, so AfterWeightUpdate marks the OpenCL copy stale.
+procedure SetRandomSAMAttentionWeights(Attn: TNNetSAMVisionAttention;
+  WinH, WinW: integer);
+var
+  Channels: integer;
+  Values: TNNetVolume;
+
+  procedure FillValues(Size: integer; Spread: TNeuralFloat);
+  var
+    Pos: integer;
+  begin
+    Values.ReSize(Size, 1, 1);
+    for Pos := 0 to Size - 1 do Values.Raw[Pos] := Spread * (Random - 0.5);
+  end;
+
+var
+  RelH: TNNetVolume;
+begin
+  Channels := Attn.Heads * Attn.HeadDim;
+  Values := TNNetVolume.Create();
+  RelH := TNNetVolume.Create();
+  try
+    FillValues(3 * Channels * Channels, 1.2);
+    Attn.SetQkvWeight(Values);
+    FillValues(3 * Channels, 0.8);
+    Attn.SetQkvBias(Values);
+    FillValues(Channels * Channels, 1.0);
+    Attn.SetProjWeight(Values);
+    FillValues(Channels, 0.6);
+    Attn.SetProjBias(Values);
+    FillValues((2 * WinH - 1) * Attn.HeadDim, 1.5);
+    RelH.Copy(Values);
+    FillValues((2 * WinW - 1) * Attn.HeadDim, 1.5);
+    Attn.SetRelPos(RelH, Values);
+  finally
+    RelH.Free;
+    Values.Free;
+  end;
+end;
+
+// TNNetSAMVisionAttention forced into OpenCL vs its CPU Compute: windows that pad
+// the grid, windows that tile it exactly and a global block over a non-square
+// grid, fed by a host-only TNNetIdentity (upload) or the resident TNNetInput
+// (bind); a weight change between OpenCL forwards reaches the kernels.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.SAMVisionAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 4;
+  SizeXs: array[0..CaseCount-1] of integer = (5, 4, 4, 3);
+  SizeYs: array[0..CaseCount-1] of integer = (7, 4, 3, 5);
+  HeadCounts: array[0..CaseCount-1] of integer = (2, 1, 3, 2);
+  HeadDims: array[0..CaseCount-1] of integer = (4, 8, 2, 3);
+  WindowSizes: array[0..CaseCount-1] of integer = (3, 4, 0, 2);
+var
+  NN: TNNet;
+  Input, OutCPUA, OutCPUB: TNNetVolume;
+  Attn: TNNetSAMVisionAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, HostSource, WinH, WinW, Channels: integer;
+  DiffA, DiffB: TNeuralFloat;
+  SourceBindable: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for HostSource := 0 to 1 do
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    Channels := HeadCounts[CaseIdx] * HeadDims[CaseIdx];
+    if WindowSizes[CaseIdx] > 0 then
+    begin
+      WinH := WindowSizes[CaseIdx];
+      WinW := WindowSizes[CaseIdx];
+    end
+    else
+    begin
+      WinH := SizeYs[CaseIdx];
+      WinW := SizeXs[CaseIdx];
+    end;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Channels);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      Input.RandomizeGaussian();
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      if HostSource = 1 then NN.AddLayer(TNNetIdentity.Create());
+      Attn := TNNetSAMVisionAttention(NN.AddLayer(TNNetSAMVisionAttention.Create(
+        HeadCounts[CaseIdx], WindowSizes[CaseIdx], HeadDims[CaseIdx], Channels)));
+      NN.SetTrainable(False, False);
+      RandSeed := 7100 + CaseIdx;
+      SetRandomSAMAttentionWeights(Attn, WinH, WinW);
+      NN.Compute(Input);
+      OutCPUA.Copy(Attn.Output);
+      SetRandomSAMAttentionWeights(Attn, WinH, WinW);
+      NN.Compute(Input);
+      OutCPUB.Copy(Attn.Output);
+      RandSeed := 7100 + CaseIdx;
+      SetRandomSAMAttentionWeights(Attn, WinH, WinW);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Attn.ForceOpenCL(True);
+      try
+        NN.Compute(Input);
+        SourceBindable := Attn.PrevLayer.OutputBindableOnOpenCL();
+        Attn.ForceOutputOnRAM();
+        DiffA := MaxAbsDiffToOutput(OutCPUA, Attn.Output);
+        SetRandomSAMAttentionWeights(Attn, WinH, WinW);
+        NN.Compute(Input);
+        Attn.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffToOutput(OutCPUB, Attn.Output);
+      finally
+        Attn.ForceOpenCL(False);
+      end;
+      WriteLn('  SAMVisionAttention OpenCL ', Input.SizeX, 'x', Input.SizeY,
+        'x', Input.Depth, ' heads=', HeadCounts[CaseIdx], ' window=',
+        WindowSizes[CaseIdx], ' host source=', HostSource, ' bound=',
+        SourceBindable, ': max|diff| A=', DiffA:0:9, ' B=', DiffB:0:9);
+      AssertEquals('both forwards ran in OpenCL', 2, Attn.ForwardGPUCnt);
+      AssertEquals('source residency follows the case', HostSource = 0,
+        SourceBindable);
+      AssertTrue('OpenCL vs CPU max |diff| = ' + FloatToStr(DiffA), DiffA < 1e-4);
+      AssertTrue('OpenCL vs CPU after a weight change: max |diff| = ' +
+        FloatToStr(DiffB), DiffB < 1e-4);
+    finally
+      OutCPUB.Free; OutCPUA.Free; Input.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv (C) -> TNNetSAMVisionAttention
+// (padded windows) -> pointwise conv. The attention binds the resident conv output
+// and keeps its own resident (host copies keep a sentinel); one upload and one
+// download per forward. Coded by Claude (AI).
+procedure TTestNeuralNumerical.SAMVisionAttentionResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Proj: TNNetLayer;
+  Attn: TNNetSAMVisionAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4747;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 7, 5);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(9, 7, 5));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    Attn := TNNetSAMVisionAttention(NN.AddLayer(
+      TNNetSAMVisionAttention.Create(2, 4, 4, 8)));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    SetRandomSAMAttentionWeights(Attn, 4, 4);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    Attn.Output.Fill(csSentinel);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    WriteLn('  SAMVisionAttention resident chain: gpu forwards conv=',
+      Conv.ForwardGPUCnt, ' attn=', Attn.ForwardGPUCnt, ' proj=',
+      Proj.ForwardGPUCnt, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('the attention must follow its resident source',
+      Attn.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident attention output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('attention host output not downloaded', csSentinel,
+      Attn.Output.Raw[Attn.Output.Size - 1], 0);
+    AssertEquals('only the input is uploaded', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+    WriteLn('  SAMVisionAttention resident chain: max|diff|=', MaxDiff:0:9);
     AssertTrue('resident chain vs CPU max |diff| = ' + FloatToStr(MaxDiff),
       MaxDiff < 1e-4);
   finally

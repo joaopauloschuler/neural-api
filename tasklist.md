@@ -2150,12 +2150,18 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item
         per (token, Q/K/V part) with a serial d_k loop; fine for Swin windows
         (49 tokens, d_k 32), use work-groups if a large-d_k user appears.
-      - `TNNetSAMVisionAttention` (SAM): not an SDPA subclass; it fuses the qkv
-        projection, the padded window partition, the out projection and a
-        QUERY-DEPENDENT decomposed rel-pos bias (Q . rel_pos_h + Q . rel_pos_w),
-        so no static bias table fits. Route: the projections on the existing
-        dot-product kernels, a small kernel writing the per-window bias into a
-        SeqLen x SeqLen buffer each forward, then the flash bias argument.
+      - [ ] `TNNetSAMVisionAttention` follow-ups (OpenCL forward is
+        `TNNetSAMVisionAttentionCL`). Time a SAM encoder on the GPU box first:
+        - `cai_sam_rel_pos_bias` is one work-item per (plane, query, key) with
+          two serial HeadDim dots, so Q . rel_pos_h is recomputed for every kj
+          and Q . rel_pos_w for every ki. If it shows up, write the two small
+          per-query tables (WinH + WinW dots) and add them in the flash kernel
+          instead of expanding the full table.
+        - The bias table is Planes x SeqLen x SeqLen floats. On a SAM-B global
+          block (64x64 grid, 12 heads) that is 12 x 4096^2 x 4 B = 805 MB in
+          OpenCL memory; the same in-kernel table add removes it.
+        - The qkv and out projections run on `cai_row_dot_products` (see the
+          `TNNetDotProducts` follow-up below).
       - [ ] `TNNetDotProducts` follow-up: `cai_row_dot_products` is one
         work-item per output with a serial depth loop and uncoalesced A-row
         reads. Time a CAI self-attention model on the GPU box; if the

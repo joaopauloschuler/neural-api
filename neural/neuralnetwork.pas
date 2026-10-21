@@ -5114,7 +5114,8 @@ type
       bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean;
       bufSinks: cl_mem; HasSinks: integer;
       bufBias: cl_mem = nil; BiasBase: integer = 0;
-      BiasRowStride: integer = 0; BiasLen: integer = 0);
+      BiasRowStride: integer = 0; BiasLen: integer = 0;
+      BiasHeadStride: integer = 0);
     // The sink buffer and flag of a launch: pSinkLogits (QHeads logits)
     // uploaded when Changed, or Fallback and 0 when nil.
     procedure SinkLogitsArgs(pSinkLogits: TNNetVolume; pChanged: boolean;
@@ -5271,6 +5272,42 @@ type
 // partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
 function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
   Dk: integer): boolean;
+
+type
+  /// OpenCL forward helper for TNNetSAMVisionAttention: the qkv and out
+  // projections on cai_row_dot_products, the window planes, the decomposed
+  // rel-pos bias, and one cai_sdpa_flash launch over every (window, head)
+  // plane, all on FKernel's queue. Coded by Claude (AI).
+  TNNetSAMVisionAttentionCL = class(TNNetFusedSDPACL)
+  private
+    FRowDotsKernel, FPartitionKernel, FRelPosBiasKernel,
+      FMergeWindowsKernel: cl_kernel;
+    // Weight tables (uploaded on a change), then the grow-only intermediates:
+    // the token-major qkv, the flash query rows, the out projection, the output.
+    FBufQkvWeight, FBufQkvBias, FBufProjWeight, FBufProjBias, FBufRelPos: cl_mem;
+    FCapQkvWeight, FCapQkvBias, FCapProjWeight, FCapProjBias, FCapRelPos: csize_t;
+    FBufQKV, FBufPlaneQ, FBufProj, FBufOut: cl_mem;
+    FCapQKV, FCapPlaneQ, FCapProj, FCapOut: csize_t;
+    // The flash query rows' and result's shape: (WinTokens, 1, Planes*HeadDim).
+    FPlaneShape: TNNetVolume;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Sizes the plane shape and the output buffer for Y (grow-only).
+    procedure Reserve(Y: TNNetVolume; WinTokens, Planes, HeadDim: integer);
+    function PlaneShapeFits(WinTokens, Planes, HeadDim: integer): boolean;
+    // Uploads the five weight tables when Changed (a fresh buffer always uploads).
+    procedure UploadWeights(QkvWeight, QkvBias, ProjWeight, ProjBias,
+      RelPos: TNNetVolume; Changed: boolean);
+    // X (W x H x C, or pExternalSrc) into OutputBuffer, left in OpenCL memory;
+    // the caller has called Reserve and UploadWeights.
+    procedure Attend(X: TNNetVolume; pExternalSrc: cl_mem;
+      Heads, HeadDim, WinH, WinW, WindowsX, Windows, RelHRows: integer;
+      InvSqrtHeadDim: TNeuralFloat);
+    function OutputBuffer(): cl_mem;
+    function OutputBytes(): csize_t;
+    function BufferBytes(): int64; override;
+  end;
 {$ENDIF}
 
 type
@@ -8027,8 +8064,17 @@ type
     FQ, FK, FV, FCtx: TNNetVolume; // per-window q/k/v/context [winTokens x 1 x C]
     // scratch: the width rel-pos bias of one query row, indexed by kj
     FBiasW: TNNetVolume;
+    {$IFDEF OpenCL}
+    FSAMAttentionCL: TNNetSAMVisionAttentionCL;
+    // Binds (or uploads) the source and leaves the output in OpenCL memory.
+    // The caller checks WillOpenCL first.
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure AllocBuffers();
+    // One window's WinH x WinW token grid and the window counts over the
+    // zero-padded grid; a global block (WindowSize 0) is one window.
+    procedure WindowLayout(out WinH, WinW, WindowsY, WindowsX: integer);
   public
     constructor Create(pHeads, pWindowSize, pHeadDim, pChannels: integer); reintroduce; overload;
     constructor Create(); overload; override;
@@ -8043,6 +8089,15 @@ type
     procedure SetProjWeight(const W: TNNetVolume);
     procedure SetProjBias(const B: TNNetVolume);
     procedure SetRelPos(const RelH, RelW: TNNetVolume);
+    {$IFDEF OpenCL}
+    // Inference only: Backpropagate passes no gradient through this forward.
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
     property Heads: integer read FHeads;
     property WindowSize: integer read FWindowSize;
     property HeadDim: integer read FHeadDim;
@@ -41851,25 +41906,33 @@ begin
     else Result := FKernel.EnsureBuffer(FBufA, FCapA, CL_MEM_READ_WRITE, NeededBytes);
 end;
 
-procedure TNNetDotProductsCL.Contract(BufA, BufB: cl_mem;
-  NumAs, NumBs, VectorSize: integer; NoForward: boolean);
+// cai_row_dot_products entry point k on Kernel's queue: BufDst[b*NumAs + a] :=
+// BufA row a . BufB row b, zero where a > b when NoForward.
+procedure RunRowDotProducts(Kernel: TNeuralKernel; k: cl_kernel;
+  BufA, BufB, BufDst: cl_mem; NumAs, NumBs, VectorSize: integer;
+  NoForward: boolean);
 var
-  k: cl_kernel;
   iNumAs, iNumBs, iVectorSize, iNoForward: longint;
 begin
   iNumAs := NumAs;
   iNumBs := NumBs;
   iVectorSize := VectorSize;
   iNoForward := BoolToByte[NoForward];
-  k := FKernel.Kernel;
   clSetKernelArg(k, 0, csLongintSize, @iNumAs);
   clSetKernelArg(k, 1, csLongintSize, @iNumBs);
   clSetKernelArg(k, 2, csLongintSize, @iVectorSize);
   clSetKernelArg(k, 3, csLongintSize, @iNoForward);
   clSetKernelArg(k, 4, csCLMemSize, @BufA);
   clSetKernelArg(k, 5, csCLMemSize, @BufB);
-  clSetKernelArg(k, 6, csCLMemSize, @FBufY);
-  FKernel.RunKernel(k, NumAs * NumBs);
+  clSetKernelArg(k, 6, csCLMemSize, @BufDst);
+  Kernel.RunKernel(k, NumAs * NumBs);
+end;
+
+procedure TNNetDotProductsCL.Contract(BufA, BufB: cl_mem;
+  NumAs, NumBs, VectorSize: integer; NoForward: boolean);
+begin
+  RunRowDotProducts(FKernel, FKernel.Kernel, BufA, BufB, FBufY, NumAs, NumBs,
+    VectorSize, NoForward);
 end;
 
 function TNNetDotProductsCL.ResultBytes(): csize_t;
@@ -43321,7 +43384,8 @@ procedure TNNetFusedSDPACL.RunFlash(X, Y: TNNetVolume; bufX: cl_mem;
   bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean;
   bufSinks: cl_mem; HasSinks: integer;
   bufBias: cl_mem = nil; BiasBase: integer = 0;
-  BiasRowStride: integer = 0; BiasLen: integer = 0);
+  BiasRowStride: integer = 0; BiasLen: integer = 0;
+  BiasHeadStride: integer = 0);
 var
   bufPartials, bufY, bufEnds: cl_mem;
   kFlash: cl_kernel;
@@ -43416,9 +43480,10 @@ begin
   clSetKernelArg(kFlash, NextArg + 4, csLongintSize, @BiasBase);
   clSetKernelArg(kFlash, NextArg + 5, csLongintSize, @BiasRowStride);
   clSetKernelArg(kFlash, NextArg + 6, csLongintSize, @BiasLen);
+  clSetKernelArg(kFlash, NextArg + 7, csLongintSize, @BiasHeadStride);
   // A split launch leaves the sinks to the merge, which adds each one once.
-  clSetKernelArg(kFlash, NextArg + 7, csCLMemSize, @bufSinks);
-  clSetKernelArg(kFlash, NextArg + 8, csLongintSize, @HasSinks);
+  clSetKernelArg(kFlash, NextArg + 8, csCLMemSize, @bufSinks);
+  clSetKernelArg(kFlash, NextArg + 9, csLongintSize, @HasSinks);
   FKernel.RunKernel2D(kFlash, csFusedSDPAFlashLanes,
     KVHeads * RowTiles * KeySplits * ColChunks, csFusedSDPAFlashLanes, 1);
   if KeySplits > 1 then
@@ -43689,6 +43754,171 @@ begin
     Inc(CodePlaneBase, CodePlaneBytes);
     Inc(ScalePlaneBase, ScalePlaneBytes);
   end;
+end;
+
+{ TNNetSAMVisionAttentionCL }
+
+constructor TNNetSAMVisionAttentionCL.Create(NN: TNNet);
+begin
+  inherited Create(NN);
+  // On the flash kernels' TNeuralKernel: one in-order queue orders every pass.
+  FRowDotsKernel := FKernel.CreateKernel('cai_row_dot_products');
+  FPartitionKernel := FKernel.CreateKernel('cai_sam_window_partition');
+  FRelPosBiasKernel := FKernel.CreateKernel('cai_sam_rel_pos_bias');
+  FMergeWindowsKernel := FKernel.CreateKernel('cai_sam_window_merge');
+  FPlaneShape := TNNetVolume.Create();
+end;
+
+destructor TNNetSAMVisionAttentionCL.Destroy();
+begin
+  if Assigned(FRowDotsKernel) then clReleaseKernel(FRowDotsKernel);
+  if Assigned(FPartitionKernel) then clReleaseKernel(FPartitionKernel);
+  if Assigned(FRelPosBiasKernel) then clReleaseKernel(FRelPosBiasKernel);
+  if Assigned(FMergeWindowsKernel) then clReleaseKernel(FMergeWindowsKernel);
+  if Assigned(FBufQkvWeight) then clReleaseMemObject(FBufQkvWeight);
+  if Assigned(FBufQkvBias) then clReleaseMemObject(FBufQkvBias);
+  if Assigned(FBufProjWeight) then clReleaseMemObject(FBufProjWeight);
+  if Assigned(FBufProjBias) then clReleaseMemObject(FBufProjBias);
+  if Assigned(FBufRelPos) then clReleaseMemObject(FBufRelPos);
+  if Assigned(FBufQKV) then clReleaseMemObject(FBufQKV);
+  if Assigned(FBufPlaneQ) then clReleaseMemObject(FBufPlaneQ);
+  if Assigned(FBufProj) then clReleaseMemObject(FBufProj);
+  if Assigned(FBufOut) then clReleaseMemObject(FBufOut);
+  FPlaneShape.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSAMVisionAttentionCL.Reserve(Y: TNNetVolume;
+  WinTokens, Planes, HeadDim: integer);
+begin
+  FPlaneShape.ReSize(WinTokens, 1, Planes * HeadDim);
+  FKernel.EnsureOutputBuffer(FBufOut, FCapOut, Y);
+end;
+
+function TNNetSAMVisionAttentionCL.PlaneShapeFits(
+  WinTokens, Planes, HeadDim: integer): boolean;
+begin
+  Result := (FPlaneShape.SizeX = WinTokens) and
+    (FPlaneShape.Depth = Planes * HeadDim);
+end;
+
+procedure TNNetSAMVisionAttentionCL.UploadWeights(QkvWeight, QkvBias,
+  ProjWeight, ProjBias, RelPos: TNNetVolume; Changed: boolean);
+begin
+  FKernel.EnsureWriteBuffer(FBufQkvWeight, FCapQkvWeight, QkvWeight, Changed,
+    {pBlocking=}true);
+  FKernel.EnsureWriteBuffer(FBufQkvBias, FCapQkvBias, QkvBias, Changed, true);
+  FKernel.EnsureWriteBuffer(FBufProjWeight, FCapProjWeight, ProjWeight,
+    Changed, true);
+  FKernel.EnsureWriteBuffer(FBufProjBias, FCapProjBias, ProjBias, Changed, true);
+  FKernel.EnsureWriteBuffer(FBufRelPos, FCapRelPos, RelPos, Changed, true);
+end;
+
+procedure TNNetSAMVisionAttentionCL.Attend(X: TNNetVolume;
+  pExternalSrc: cl_mem; Heads, HeadDim, WinH, WinW, WindowsX, Windows,
+  RelHRows: integer; InvSqrtHeadDim: TNeuralFloat);
+var
+  bufX, bufBias: cl_mem;
+  k: cl_kernel;
+  GridH, GridW, Channels, WinTokens, Planes, TokenCnt: integer;
+  PlaneBytes: csize_t;
+begin
+  GridH := X.SizeY;
+  GridW := X.SizeX;
+  Channels := Heads * HeadDim;
+  WinTokens := WinH * WinW;
+  Planes := Windows * Heads;
+  TokenCnt := GridH * GridW;
+  PlaneBytes := csize_t(Planes) * WinTokens * HeadDim * csNeuralFloatSize;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X, true,
+      {pBlocking=}true);
+  FKernel.EnsureBuffer(FBufQKV, FCapQKV, CL_MEM_READ_WRITE,
+    csize_t(TokenCnt) * 3 * Channels * csNeuralFloatSize);
+  FKernel.EnsureBuffer(FBufPlaneQ, FCapPlaneQ, CL_MEM_READ_WRITE, PlaneBytes);
+  FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, PlaneBytes);
+  FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, PlaneBytes);
+  bufBias := FKernel.EnsureBuffer(FBufScoreBias, FCapScoreBias,
+    CL_MEM_READ_WRITE, csize_t(Planes) * WinTokens * WinTokens *
+    csNeuralFloatSize);
+  FKernel.EnsureBuffer(FBufProj, FCapProj, CL_MEM_READ_WRITE,
+    csize_t(Windows) * WinTokens * Channels * csNeuralFloatSize);
+  // qkv[token*3C + o] := QkvWeight row o . input row token.
+  RunRowDotProducts(FKernel, FRowDotsKernel, FBufQkvWeight, bufX, FBufQKV,
+    3 * Channels, TokenCnt, Channels, {NoForward=}false);
+  k := FPartitionKernel;
+  clSetKernelArg(k,  0, csLongintSize, @GridH);
+  clSetKernelArg(k,  1, csLongintSize, @GridW);
+  clSetKernelArg(k,  2, csLongintSize, @WinH);
+  clSetKernelArg(k,  3, csLongintSize, @WinW);
+  clSetKernelArg(k,  4, csLongintSize, @WindowsX);
+  clSetKernelArg(k,  5, csLongintSize, @Windows);
+  clSetKernelArg(k,  6, csLongintSize, @Heads);
+  clSetKernelArg(k,  7, csLongintSize, @HeadDim);
+  clSetKernelArg(k,  8, csCLMemSize, @FBufQKV);
+  clSetKernelArg(k,  9, csCLMemSize, @FBufQkvBias);
+  clSetKernelArg(k, 10, csCLMemSize, @FBufPlaneQ);
+  clSetKernelArg(k, 11, csCLMemSize, @FBufK);
+  clSetKernelArg(k, 12, csCLMemSize, @FBufV);
+  FKernel.RunKernel(k, Windows * WinTokens * 3 * Channels);
+  k := FRelPosBiasKernel;
+  clSetKernelArg(k, 0, csLongintSize, @WinH);
+  clSetKernelArg(k, 1, csLongintSize, @WinW);
+  clSetKernelArg(k, 2, csLongintSize, @Planes);
+  clSetKernelArg(k, 3, csLongintSize, @HeadDim);
+  clSetKernelArg(k, 4, csLongintSize, @RelHRows);
+  clSetKernelArg(k, 5, csCLMemSize, @FBufPlaneQ);
+  clSetKernelArg(k, 6, csCLMemSize, @FBufRelPos);
+  clSetKernelArg(k, 7, csCLMemSize, @bufBias);
+  FKernel.RunKernel(k, Planes * WinTokens * WinTokens);
+  // Each plane is one unmasked "cache" of WinTokens keys with its own bias.
+  RunFlash(FPlaneShape, FPlaneShape, FBufPlaneQ, {Int8KV=}false,
+    {QHeads=}Planes, {KVHeads=}Planes, {GroupSize=}1, HeadDim,
+    {CacheMax=}WinTokens, {CacheSlot=}0, {Window=}0, {Causal=}false, [], 0,
+    InvSqrtHeadDim, {ScoreSoftCap=}0, {InvScoreSoftCap=}0, FBufK, FBufV,
+    {pKeepResultOnOpenCL=}true, {bufSinks=}FBufPlaneQ, {HasSinks=}0, bufBias,
+    {BiasBase=}0, {BiasRowStride=}WinTokens,
+    {BiasLen=}Planes * WinTokens * WinTokens,
+    {BiasHeadStride=}WinTokens * WinTokens);
+  // The flash rows are [token][window][channel], so row t*Windows + w is the
+  // context of token t of window w.
+  RunRowDotProducts(FKernel, FRowDotsKernel, FBufProjWeight, FResultBuf,
+    FBufProj, Channels, Windows * WinTokens, Channels, {NoForward=}false);
+  k := FMergeWindowsKernel;
+  clSetKernelArg(k, 0, csLongintSize, @GridH);
+  clSetKernelArg(k, 1, csLongintSize, @GridW);
+  clSetKernelArg(k, 2, csLongintSize, @WinH);
+  clSetKernelArg(k, 3, csLongintSize, @WinW);
+  clSetKernelArg(k, 4, csLongintSize, @WindowsX);
+  clSetKernelArg(k, 5, csLongintSize, @Windows);
+  clSetKernelArg(k, 6, csLongintSize, @Channels);
+  clSetKernelArg(k, 7, csCLMemSize, @FBufProj);
+  clSetKernelArg(k, 8, csCLMemSize, @FBufProjBias);
+  clSetKernelArg(k, 9, csCLMemSize, @FBufOut);
+  FKernel.RunKernel(k, TokenCnt * Channels);
+end;
+
+function TNNetSAMVisionAttentionCL.OutputBuffer(): cl_mem;
+begin
+  Result := FBufOut;
+end;
+
+function TNNetSAMVisionAttentionCL.OutputBytes(): csize_t;
+begin
+  Result := FCapOut;
+end;
+
+function TNNetSAMVisionAttentionCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufK) +
+    OpenCLMemBytes(FBufV) + OpenCLMemBytes(FBufPartials) +
+    OpenCLMemBytes(FBufY) + OpenCLMemBytes(FBufScoreBias) +
+    OpenCLMemBytes(FBufQkvWeight) + OpenCLMemBytes(FBufQkvBias) +
+    OpenCLMemBytes(FBufProjWeight) + OpenCLMemBytes(FBufProjBias) +
+    OpenCLMemBytes(FBufRelPos) + OpenCLMemBytes(FBufQKV) +
+    OpenCLMemBytes(FBufPlaneQ) + OpenCLMemBytes(FBufProj) +
+    OpenCLMemBytes(FBufOut);
 end;
 
 { TNNetSoftMaxCL }
@@ -51142,6 +51372,9 @@ end;
 
 destructor TNNetSAMVisionAttention.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FSAMAttentionCL) then FreeAndNil(FSAMAttentionCL);
+  {$ENDIF}
   FAttn.Free;
   FQ.Free;
   FK.Free;
@@ -51287,7 +51520,20 @@ var
   inRange: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host writes FOutput, so a later ForceOutputOnRAM must not read the
+  // buffer a previous OpenCL forward left resident.
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   Prev := FPrevLayer.FOutput;
   // CAI volume convention: GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth+d, so the X
   // axis is the FAST (inner) axis. HF SAM lays out the patch grid (gridH,
@@ -51481,6 +51727,128 @@ begin
    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+procedure TNNetSAMVisionAttention.WindowLayout(out WinH, WinW, WindowsY,
+  WindowsX: integer);
+begin
+  if FWindowSize > 0 then
+  begin
+    WinH := FWindowSize;
+    WinW := FWindowSize;
+    WindowsY := (FOutput.SizeY + FWindowSize - 1) div FWindowSize;
+    WindowsX := (FOutput.SizeX + FWindowSize - 1) div FWindowSize;
+  end
+  else
+  begin
+    WinH := FOutput.SizeY;
+    WinW := FOutput.SizeX;
+    WindowsY := 1;
+    WindowsX := 1;
+  end;
+end;
+
+{$IFDEF OpenCL}
+// No size verdict: an inference-only layer runs in OpenCL when forced, or when
+// its source is already resident.
+function TNNetSAMVisionAttention.WillOpenCL(): boolean;
+var
+  WinH, WinW, WindowsY, WindowsX, WinTokens, Planes: integer;
+begin
+  Result := false;
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FSAMAttentionCL)) or
+    (not Assigned(FPrevLayer)) then exit;
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  WinTokens := WinH * WinW;
+  Planes := WindowsY * WindowsX * FHeads;
+  // The kernels index the source, the rel-pos rows and the bias table as
+  // shaped here; SetPrevLayer and SetRelPos only report a mismatch.
+  if (FPrevLayer.FOutput.Size <> FOutput.Size) or
+    (FPrevLayer.FOutput.Depth <> FChannels) or (FNeurons.Count < 5) or
+    (FStruct[4] <> 2 * WinH - 1) or
+    (FNeurons[4].FWeights.Size <> (2 * WinH + 2 * WinW - 2) * FHeadDim) or
+    (int64(Planes) * WinTokens * WinTokens >= High(longint)) or
+    (int64(FOutput.SizeX) * FOutput.SizeY * 3 * FChannels >= High(longint)) or
+    (not FSAMAttentionCL.PlaneShapeFits(WinTokens, Planes, FHeadDim)) or
+    (csize_t(FOutput.Size) * csNeuralFloatSize > FSAMAttentionCL.OutputBytes()) or
+    (not FSAMAttentionCL.FlashTilesFit(FHeadDim, {Int8KV=}false)) or
+    (not FusedSDPAFlashIndicesFit(Planes, Planes, WinTokens, WinTokens,
+      FHeadDim)) then exit;
+  Result := FForceOpenCL or PrevOutputOnOpenCL();
+end;
+
+procedure TNNetSAMVisionAttention.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+  WinH, WinW, WindowsY, WindowsX: integer;
+begin
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FSAMAttentionCL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  FSAMAttentionCL.UploadWeights(FNeurons[0].FWeights, FNeurons[1].FWeights,
+    FNeurons[2].FWeights, FNeurons[3].FWeights, FNeurons[4].FWeights,
+    FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  FSAMAttentionCL.Attend(FPrevLayer.FOutput, SourceBuffer, FHeads, FHeadDim,
+    WinH, WinW, WindowsX, WindowsY * WindowsX, {RelHRows=}FStruct[4],
+    FInvSqrtHd);
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetSAMVisionAttention.EnableOpenCL(DotProductKernel: TNeuralKernel);
+var
+  WinH, WinW, WindowsY, WindowsX: integer;
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FSAMAttentionCL) then
+    FSAMAttentionCL := TNNetSAMVisionAttentionCL.Create(FNN)
+  else if FSAMAttentionCL.OutputBytes() < csize_t(FOutput.Size) * csNeuralFloatSize then
+    // Growing replaces the output buffer, and the output it held goes with it.
+    FOutputOnOpenCL := false;
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  FSAMAttentionCL.Reserve(FOutput, WinH * WinW,
+    WindowsY * WindowsX * FHeads, FHeadDim);
+end;
+
+procedure TNNetSAMVisionAttention.DisableOpenCL();
+begin
+  // FSAMAttentionCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FSAMAttentionCL);
+end;
+
+function TNNetSAMVisionAttention.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FSAMAttentionCL) then Result := FSAMAttentionCL.OutputBuffer()
+  else Result := nil;
+end;
+
+function TNNetSAMVisionAttention.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FSAMAttentionCL) then Result := FSAMAttentionCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetSAMVisionAttention.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FSAMAttentionCL) then
+    Result := Result + FSAMAttentionCL.BufferBytes();
+end;
+{$ENDIF}
 
 procedure TNNetSAMVisionAttention.Backpropagate();
 begin

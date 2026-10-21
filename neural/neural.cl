@@ -5519,7 +5519,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
 // arguments (FColChunk: output columns per work-group, a multiple of 4 up to
 // 256; FKeySplits > 1 writes partials; FBiasLen > 0, which needs FGroupSize 1,
-// adds FScoreBias[FBiasBase + t*FBiasRowStride + key] to each score;
+// adds FScoreBias[FBiasBase + g*FBiasHeadStride + t*FBiasRowStride + key]
+// to each score of head g;
 // FHasSinks adds exp(FSinkLogits[h]) to head h's normalizer, in the merge
 // when FKeySplits > 1).
 #define CAI_FLASH_LEADING_PARAMS \
@@ -5533,7 +5534,7 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 #define CAI_FLASH_TRAILING_PARAMS \
   __global float* FY, __global float* FPartials, __local float4* FScratch, \
   __global const float* FScoreBias, const int FBiasBase, \
-  const int FBiasRowStride, const int FBiasLen, \
+  const int FBiasRowStride, const int FBiasLen, const int FBiasHeadStride, \
   __global const float* FSinkLogits, const int FHasSinks
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
@@ -5942,8 +5943,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
         const int row = sy + RowLanes * i; \
         const int KeyLo = RowTable[2 * Br + row]; \
         const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
-        /* The bias row of token row t = Row0 + row (FGroupSize 1). */ \
-        const int BiasRow = FBiasBase \
+        /* The bias row of token row t = Row0 + row of head g (FGroupSize 1). */ \
+        const int BiasRow = FBiasBase + g * FBiasHeadStride \
           + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride + kt + sx; \
         float PartMax = -1e30f; \
         _Pragma("unroll") \
@@ -6086,6 +6087,99 @@ void cai_sdpa_flash_int8(CAI_FLASH_LEADING_PARAMS,
   CAI_FLASH_TRAILING_PARAMS)
 CAI_FLASH_BODY(char, FKCodes, FVCodes, cai_flash_stage_codes,
   CAI_FLASH_STAGE_INT8_SCALES, CAI_FLASH_K_SCALE, CAI_FLASH_V_SCALE)
+
+// SAM WINDOW ATTENTION (TNNetSAMVisionAttention). Windows are FWinH x FWinW
+// tokens (a global block is one window over the grid), FWindowsX per row of
+// windows, and plane g = w*FHeads + h is head h of window w. Flash query row t
+// of plane g sits at FQ[t*FPlanes*FDk + g*FDk]; key/value row t at
+// FK/FV[(g*FWinTok + t)*FDk].
+
+// The token-major qkv projection FQKV ((FGridH*FGridW) x 3C) plus FQKVBias
+// into the window planes; a padded token's input row is zero (bias only).
+__kernel void cai_sam_window_partition(
+  const int FGridH, const int FGridW, const int FWinH, const int FWinW,
+  const int FWindowsX, const int FWindows, const int FHeads, const int FDk,
+  __global const float* FQKV, __global const float* FQKVBias,
+  __global float* FQ, __global float* FK, __global float* FV)
+{
+  const int Channels = FHeads * FDk;
+  const int QKVDepth = 3 * Channels;
+  const int WinTok = FWinH * FWinW;
+  const int Planes = FWindows * FHeads;
+  const int id = get_global_id(0);
+  if (id >= FWindows * WinTok * QKVDepth) return;
+  const int o = id % QKVDepth;
+  const int WindowToken = id / QKVDepth;
+  const int t = WindowToken % WinTok;
+  const int w = WindowToken / WinTok;
+  const int wy = w / FWindowsX;
+  const int ty = t / FWinW;
+  const int gy = wy * FWinH + ty;
+  const int gx = (w - wy * FWindowsX) * FWinW + (t - ty * FWinW);
+  const int InGrid = (gy < FGridH) && (gx < FGridW);
+  const float Projected = FQKV[InGrid ? ((gy * FGridW + gx) * QKVDepth + o) : 0];
+  const float Value = FQKVBias[o] + (InGrid ? Projected : 0.0f);
+  const int Part = o / Channels;
+  const int c = o - Part * Channels;
+  const int h = c / FDk;
+  const int d = c - h * FDk;
+  const int g = w * FHeads + h;
+  __global float* Dst = (Part == 0) ? FQ : ((Part == 1) ? FK : FV);
+  Dst[(Part == 0) ? (t * Planes * FDk + g * FDk + d)
+    : ((g * WinTok + t) * FDk + d)] = Value;
+}
+
+// FBias[(g*WinTok + t)*WinTok + key]: plane g's decomposed rel-pos bias, Q(t) .
+// FRelPos[qi - ki + FWinH - 1] + Q(t) . FRelPos[FRelHRows + qj - kj + FWinW - 1].
+__kernel void cai_sam_rel_pos_bias(
+  const int FWinH, const int FWinW, const int FPlanes, const int FDk,
+  const int FRelHRows, __global const float* FQ,
+  __global const float* FRelPos, __global float* FBias)
+{
+  const int WinTok = FWinH * FWinW;
+  const int id = get_global_id(0);
+  if (id >= FPlanes * WinTok * WinTok) return;
+  const int Key = id % WinTok;
+  const int PlaneToken = id / WinTok;
+  const int t = PlaneToken % WinTok;
+  const int g = PlaneToken / WinTok;
+  const int qi = t / FWinW;
+  const int ki = Key / FWinW;
+  const int qj = t - qi * FWinW;
+  const int kj = Key - ki * FWinW;
+  __global const float* Query = FQ + t * FPlanes * FDk + g * FDk;
+  __global const float* RelH = FRelPos + (qi - ki + FWinH - 1) * FDk;
+  __global const float* RelW = FRelPos + (FRelHRows + qj - kj + FWinW - 1) * FDk;
+  float DotH = 0.0f;
+  float DotW = 0.0f;
+  for (int d = 0; d < FDk; d++)
+  {
+    DotH = mad(Query[d], RelH[d], DotH);
+    DotW = mad(Query[d], RelW[d], DotW);
+  }
+  FBias[id] = DotH + DotW;
+}
+
+// FY ((FGridH*FGridW) x C, token-major) = the out projection FProj, row
+// t*FWindows + w per window token, plus FProjBias; padded tokens are dropped.
+__kernel void cai_sam_window_merge(
+  const int FGridH, const int FGridW, const int FWinH, const int FWinW,
+  const int FWindowsX, const int FWindows, const int FChannels,
+  __global const float* FProj, __global const float* FProjBias,
+  __global float* FY)
+{
+  const int id = get_global_id(0);
+  if (id >= FGridH * FGridW * FChannels) return;
+  const int o = id % FChannels;
+  const int Token = id / FChannels;
+  const int gy = Token / FGridW;
+  const int gx = Token - gy * FGridW;
+  const int wy = gy / FWinH;
+  const int wx = gx / FWinW;
+  const int t = (gy - wy * FWinH) * FWinW + (gx - wx * FWinW);
+  const int w = wy * FWindowsX + wx;
+  FY[id] = FProj[(t * FWindows + w) * FChannels + o] + FProjBias[o];
+}
 
 // INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
 // and V slices into the resident int8 cache at slots FCacheSlot ..
