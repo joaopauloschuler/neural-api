@@ -287,11 +287,12 @@ rather than acted on.
       with `dpV`. Missing pieces, all checked against the shipped
       `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
       "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [ ] Scheduler leftovers from 4c756c1c: diffusers `set_alpha_to_one=False`
-            (the final DDIM step lands on alpha_bar[0], not 1) is not modelled;
-            Euler-type samplers with dpV return x0 = 0 instead of -v at the exact
-            zero-SNR step (they convert through eps). Marigold uses DDIM, so
-            only the first matters for parity.
+      - [X] Scheduler leftovers from 4c756c1c: `pFinalAlphaBarIsOne` models
+            diffusers `set_alpha_to_one`; Euler-ancestral takes x0 from PredictX0.
+      - [ ] DDPM with dpV at the zero-SNR step still goes through eps (x0 = 0
+            instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
+            + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
+            ab_t = 1 (Beta1 = 0). Not needed by Marigold.
       - [ ] Pipeline step 1: the building blocks with tiny random nets (no
             weights needed): an image -> latent encode via `BuildVaeEncoder`, the
             8-channel UNet concat (image latent ++ noisy target latent), and the

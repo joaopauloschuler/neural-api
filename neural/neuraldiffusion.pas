@@ -135,6 +135,8 @@ type
     // as do FSigma and FLambda, so no sampler divides by zero.
     FInvSqrtAlphaBar: array of TNeuralFloat;
     FRescaleZeroTerminalSNR: boolean;
+    // ab_prev of DDIM's final step: 1, or ab_1 (diffusers alphas_cumprod[0]).
+    FFinalAlphaBar: TNeuralFloat;
     // DPM-Solver++ multistep state (previous step's converted x0 prediction).
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
@@ -193,10 +195,12 @@ type
     // T = number of diffusion steps. Beta1/BetaT used by linear & scaled-linear;
     // CosineS is the small offset of the cosine schedule (default 0.008).
     // pRescaleZeroTerminalSNR forces ab_T = 0 (needs pT >= 2; pair with dpV + DDIM).
+    // pFinalAlphaBarIsOne = diffusers set_alpha_to_one; false ends DDIM on ab_1.
     constructor Create(pT: integer; pSchedule: TNNetBetaSchedule = dsLinear;
       pPrediction: TNNetPredictionType = dpEps;
       Beta1: TNeuralFloat = 1.0e-4; BetaT: TNeuralFloat = 0.02;
-      CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false);
+      CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false;
+      pFinalAlphaBarIsOne: boolean = true);
     destructor Destroy; override;
 
     // Schedule tables (1-based timesteps; index 0 = clean anchor).
@@ -206,6 +210,7 @@ type
     property NumTimesteps: integer read FT;
     property PredictionType: TNNetPredictionType read FPrediction;
     property RescaleZeroTerminalSNR: boolean read FRescaleZeroTerminalSNR;
+    property FinalAlphaBar: TNeuralFloat read FFinalAlphaBar;
 
     // FORWARD process. Xt := sqrt(ab_t)*X0 + sqrt(1-ab_t)*Noise. If NoiseOut is
     // given it receives the sampled noise (the eps training target). When
@@ -399,7 +404,8 @@ const
 
 constructor TNNetDiffusionScheduler.Create(pT: integer;
   pSchedule: TNNetBetaSchedule; pPrediction: TNNetPredictionType;
-  Beta1, BetaT, CosineS: TNeuralFloat; pRescaleZeroTerminalSNR: boolean);
+  Beta1, BetaT, CosineS: TNeuralFloat; pRescaleZeroTerminalSNR: boolean;
+  pFinalAlphaBarIsOne: boolean);
 begin
   inherited Create;
   if pT < 1 then raise Exception.Create('Diffusion T must be >= 1.');
@@ -418,6 +424,8 @@ begin
   SetLength(FSigma, FT + 1);
   SetLength(FInvSqrtAlphaBar, FT + 1);
   BuildTables(Beta1, BetaT, CosineS);
+  if pFinalAlphaBarIsOne then FFinalAlphaBar := 1.0
+  else FFinalAlphaBar := FAlphaBar[1];
   FPrevX0 := nil;
   FUniPrevSample := nil;
   FUniHistX0[0] := nil;
@@ -866,8 +874,8 @@ begin
   else FEpsScratch.ReSize(Xt);
   Eps := FEpsScratch;
   // The other updates work from eps; v-prediction is converted up front.
-  // DDIM, DPM++ and UniPC read RawPred directly (via PredictX0 for the latter).
-  if not (Method in [smDDIM, smDPMSolverPP2M, smUniPC]) then
+  // DDIM, DPM++, UniPC and Euler read RawPred directly or through PredictX0.
+  if not (Method in [smDDIM, smDPMSolverPP2M, smUniPC, smEulerAncestral]) then
     ToEps(Xt, RawPred, Eps, Tt);
   XtSizeM1 := Xt.Size - 1;
   case Method of
@@ -902,9 +910,10 @@ begin
           // x_{TtPrev} = sqrt(ab_prev)*x0 + sqrt(1-ab_prev - sigma^2)*eps + sigma*z
           // sigma = eta*sqrt((1-ab_prev)/(1-ab_t))*sqrt(1-ab_t/ab_prev).
           abT := FAlphaBar[Tt];
-          abPrev := FAlphaBar[TtPrev];
+          if TtPrev = 0 then abPrev := FFinalAlphaBar
+          else abPrev := FAlphaBar[TtPrev];
           sqrtAbPrev := Sqrt(abPrev);
-          if (Eta > 0) and (TtPrev > 0) then
+          if (Eta > 0) and (abPrev < 1.0) then
             sigma := Eta * Sqrt((1.0 - abPrev) / (1.0 - abT)) *
                      Sqrt(1.0 - abT / abPrev)
           else
@@ -940,63 +949,49 @@ begin
         end;
       smEulerAncestral:
         begin
-          // Euler-ancestral ("Euler a", Karras et al. 2022). Work in the VE
-          // sigma parameterisation: sigma = sqrt((1-ab)/ab). The denoised
-          // estimate is x0 = (x_t - somab_t*eps)/sqrt(ab_t). The ancestral split
-          // of the remaining noise sigma_next = Sigma(TtPrev):
+          // Euler-ancestral ("Euler a", Karras et al. 2022) in the VE sigma
+          // parameterisation sigma = sqrt((1-ab)/ab). With x0 from PredictX0
+          // (exact for v at ab_t = 0) and s1 = Sigma(Tt), s2 = Sigma(TtPrev):
           //   sigma_up   = eta * sqrt( (s2^2*(s1^2 - s2^2)) / s1^2 )   (injected)
           //   sigma_down = sqrt( max(0, s2^2 - sigma_up^2) )          (Euler drift)
-          // with s1 = Sigma(Tt), s2 = Sigma(TtPrev). The Euler drift along the
-          // probability-flow ODE from sigma=s1 to sigma=sigma_down is, in terms
-          // of the denoised x0:  x = x0 + sigma_down*((x_t/sqrt(ab_t) - x0)/s1)
-          //                        = x0 + (sigma_down/s1)*(x_t/sqrt(ab_t) - x0).
-          // Finally re-noise to VP scale at TtPrev: multiply by sqrt(ab_prev)
-          // and add the ancestral term sqrt(ab_prev)*sigma_up*z.
-          somabT := FSqrtOneMinusAlphaBar[Tt];
-          invSqrtAbT := FInvSqrtAlphaBar[Tt];
+          //   x = sqrt(ab_prev)*(x0 + (sigma_down/s1)*(x_t/sqrt(ab_t) - x0)
+          //       + sigma_up*z).
+          PredictX0(Xt, RawPred, Eps, Tt);
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
-            // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
-            Xt.Mul(invSqrtAbT);
-            Xt.MulAdd(-somabT * invSqrtAbT, Eps);
+            Xt.Copy(Eps);
             Exit;
           end;
-          abPrev := FAlphaBar[TtPrev];
-          sqrtAbPrev := Sqrt(abPrev);
+          invSqrtAbT := FInvSqrtAlphaBar[Tt];
+          sqrtAbPrev := FSqrtAlphaBar[TtPrev];
+          // Reuse DPM locals as scratch for the sigma split.
+          lamT := SigmaOf(Tt);                       // s1
+          lamPrev := SigmaOf(TtPrev);                // s2
+          if (Eta > 0) and (lamT > 0) then
+            sigma := Eta * Sqrt((lamPrev * lamPrev *
+              Max(0.0, lamT * lamT - lamPrev * lamPrev)) / (lamT * lamT))
+          else
+            sigma := 0;                            // sigma_up
+          h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
+          if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
+          // #5: the update folds to kA*x_t + cE*x0 + kZ*z per step.
+          kA := sqrtAbPrev * r0 * invSqrtAbT;
+          cE := sqrtAbPrev * (1 - r0);
+          if sigma > 0 then
           begin
-            // Reuse DPM locals as scratch for the sigma split.
-            lamT := SigmaOf(Tt);                       // s1
-            lamPrev := SigmaOf(TtPrev);                // s2
-            if (Eta > 0) and (lamT > 0) then
-              sigma := Eta * Sqrt((lamPrev * lamPrev *
-                Max(0.0, lamT * lamT - lamPrev * lamPrev)) / (lamT * lamT))
-            else
-              sigma := 0;                            // sigma_up
-            h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
-            if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
-            if sigma > 0 then
+            kZ := sqrtAbPrev * sigma;
+            for i := 0 to XtSizeM1 do
             begin
-              // #5: curX0 = invSqrtAbT*x_t - (1-r0)*somab_t*invSqrtAbT*eps, so
-              // the whole update folds to kA*x_t + cE*eps + kZ*z per step.
-              kA := sqrtAbPrev * invSqrtAbT;
-              cE := -sqrtAbPrev * (1 - r0) * somabT * invSqrtAbT;
-              kZ := sqrtAbPrev * sigma;
-              for i := 0 to XtSizeM1 do
-              begin
-                z := RandG(0, 1);
-                Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + kZ * z;
-              end;
-            end
-            else
-            begin
-              // sigma=0 (z=0): the whole update collapses to a uniform affine
-              // Xt := k*Xt + c*Eps (#13), with
-              //   k = sqrt(ab_prev)/sqrt(ab_t),
-              //   c = -sqrt(ab_prev)*(1-r0)*somab_t/sqrt(ab_t).
-              Xt.Mul(sqrtAbPrev * invSqrtAbT);
-              Xt.MulAdd(-(sqrtAbPrev * (1 - r0) * somabT * invSqrtAbT), Eps);
+              z := RandG(0, 1);
+              Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + kZ * z;
             end;
+          end
+          else
+          begin
+            // sigma=0 (z=0): a uniform affine map (#13).
+            Xt.Mul(kA);
+            Xt.MulAdd(cE, Eps);
           end;
         end;
       smDPMSolverPP2M:

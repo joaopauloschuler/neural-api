@@ -23,7 +23,9 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
    near the DDIM baseline.
  - tsTrailing reproduces diffusers' "trailing" timesteps; the zero-terminal-SNR
    rescale gives ab_T = 0 with ab_1 unchanged, and every sampler stays finite
-   there (DDIM with v-prediction exactly: x0 = -v, eps = x_t at ab_T = 0).
+   there (DDIM and Euler with v-prediction exactly: x0 = -v at ab_T = 0).
+ - pFinalAlphaBarIsOne = false (diffusers set_alpha_to_one=False) reproduces a
+   4-step Marigold-config DDIM trajectory computed with diffusers' DDIMScheduler.
  - TNNetFlowMatchEulerScheduler matches the Qwen-Image-2.1 diffusers oracle
    (tests/fixtures/qwenimage21_scheduler_oracle.json, from
    tools/make_pico_qwenimage21_fixture.py): mu, sigmas, timesteps, two steps.
@@ -92,6 +94,8 @@ type
     procedure TestZeroTerminalSNRRescale;
     procedure TestZeroTerminalSNRDDIMVEndpoint;
     procedure TestZeroTerminalSNRTrailingSamplersFinite;
+    procedure TestDDIMFinalAlphaBarVsDiffusers;
+    procedure TestZeroTerminalSNREulerVEndpoint;
   end;
 
 implementation
@@ -1327,6 +1331,85 @@ begin
     finally
       Sched.Free; X.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestDDIMFinalAlphaBarVsDiffusers;
+const
+  // diffusers DDIMScheduler(scaled_linear 0.00085..0.012, v_prediction,
+  // trailing, rescale_betas_zero_snr, eta 0), 4 steps, v = sin(0.01*(t+1))*x,
+  // x = (i - 4)*0.3; set_alpha_to_one False then True.
+  cNotOne: array[0..cN - 1] of double = (-0.530490551, -0.397867913,
+    -0.265245276, -0.132622638, 0, 0.132622638, 0.265245276, 0.397867913);
+  cOne: array[0..cN - 1] of double = (-0.496718779, -0.372539085,
+    -0.24835939, -0.124179695, 0, 0.124179695, 0.24835939, 0.372539085);
+var
+  SchedNotOne, SchedOne: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  SchedNotOne := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true, false);
+  SchedOne := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    AssertEquals('final ab = ab_1', SchedNotOne.AlphaBar[1],
+      SchedNotOne.FinalAlphaBar, 0.0);
+    AssertEquals('default final ab = 1', 1.0, SchedOne.FinalAlphaBar, 0.0);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    SchedNotOne.Sample(X, @ToyModel, 4, smDDIM, 0.0, tsTrailing);
+    for i := 0 to cN - 1 do
+      AssertEquals('not-one @ ' + IntToStr(i), cNotOne[i], X.FData[i], 1e-5);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    SchedOne.Sample(X, @ToyModel, 4, smDDIM, 0.0, tsTrailing);
+    for i := 0 to cN - 1 do
+      AssertEquals('one @ ' + IntToStr(i), cOne[i], X.FData[i], 1e-5);
+  finally
+    SchedNotOne.Free; SchedOne.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestZeroTerminalSNREulerVEndpoint;
+const
+  cTZ = 1000;
+  cTPrev = 750;
+var
+  Sched: TNNetDiffusionScheduler;
+  Xt, V, Got: TNNetVolume;
+  i: integer;
+  s1, s2, sqrtAbPrev, kA, kX0: double;
+begin
+  // Deterministic Euler from ab_T = 0 with v: x0 = -v exactly, and
+  // x = sqrt(ab_prev)*((s2/s1)*x_t/sqrt(ab_T) + (1 - s2/s1)*x0), where the
+  // floored 1/sqrt(ab_T) = sqrt(1 + s1^2).
+  Sched := TNNetDiffusionScheduler.Create(cTZ, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true);
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  V := TNNetVolume.Create(cN, 1, 1);
+  Got := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Xt.FData[i] := 0.25 * i - 0.9;
+      V.FData[i] := 0.4 * Cos(i);
+    end;
+    Got.Copy(Xt);
+    Sched.Step(Got, V, cTZ, 0, smEulerAncestral, 0.0);
+    for i := 0 to cN - 1 do
+      AssertEquals('final x0 = -v @ ' + IntToStr(i), -V.FData[i], Got.FData[i], 1e-7);
+    s1 := Sched.SigmaAt[cTZ];
+    s2 := Sched.SigmaAt[cTPrev];
+    sqrtAbPrev := Sqrt(Sched.AlphaBar[cTPrev]);
+    kA := sqrtAbPrev * (s2 / s1) * Sqrt(1.0 + s1 * s1);
+    kX0 := sqrtAbPrev * (1.0 - s2 / s1);
+    Got.Copy(Xt);
+    Sched.Step(Got, V, cTZ, cTPrev, smEulerAncestral, 0.0);
+    for i := 0 to cN - 1 do
+      AssertEquals('Euler endpoint @ ' + IntToStr(i),
+        kA * Xt.FData[i] - kX0 * V.FData[i], Got.FData[i], 1e-5);
+  finally
+    Sched.Free; Xt.Free; V.Free; Got.Free;
   end;
 end;
 
