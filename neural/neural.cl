@@ -5115,10 +5115,12 @@ __kernel void cai_diagonal_ssm_scan
   FState[c] = h;
 }
 
-// RWKV-4 WKV with the running-max stabiliser (TNNetWKV.Compute). Row t of FX is
-// [ k (FChannels) | v (FChannels) ]; w = softplus(w_raw) is built on the host.
+// RWKV-4 WKV with the running-max stabiliser (TNNetWKV / TNNetCrossWKV). Row t
+// of FX is [ k | v ], FChannels each; w = softplus(w_raw) is built on the host.
 // FState is [ A | B | Q ], FChannels each; a fresh sequence is A = B = 0,
 // Q = -1e30. One of each exp pair is exp(0) = 1, so no denominator reaches 0.
+// FGateMode: 0 = FY is wkv_t (FR unread); 1 = FY is sigmoid(r_t) * wkv_t;
+// 2 = after the scan, query row i of FY (FQueryLen rows) is sigmoid(r_i) * A/B.
 __kernel void cai_wkv_scan
 (
   const int FSeqLen,
@@ -5128,7 +5130,10 @@ __kernel void cai_wkv_scan
   __global const float* FU,
   __global const float* FX,
   __global float* FState,
-  __global float* FY
+  __global float* FY,
+  __global const float* FR,
+  const int FGateMode,
+  const int FQueryLen
 )
 {
   const int c = get_global_id(0);
@@ -5149,11 +5154,14 @@ __kernel void cai_wkv_scan
   {
     const float k = FX[t * inDepth + c];
     const float v = FX[t * inDepth + FChannels + c];
+    const int outPos = t * FChannels + c;
     const float ww1 = u + k;
     const float q1 = fmax(pp, ww1);
     const float e1 = cai_exp_floored(pp - q1);
     const float e2 = cai_exp_floored(ww1 - q1);
-    FY[t * FChannels + c] = (e1 * aa + e2 * v) / (e1 * bb + e2);
+    const float wkv = (e1 * aa + e2 * v) / (e1 * bb + e2);
+    if (FGateMode == 0) FY[outPos] = wkv;
+    else if (FGateMode == 1) FY[outPos] = cai_fused_act(FR[outPos], 2) * wkv;
     const float ww2 = pp - w;
     const float q2 = fmax(ww2, k);
     const float e3 = cai_exp_floored(ww2 - q2);
@@ -5165,6 +5173,16 @@ __kernel void cai_wkv_scan
   FState[c] = aa;
   FState[FChannels + c] = bb;
   FState[2 * FChannels + c] = pp;
+  if (FGateMode == 2)
+  {
+    // bb > 0 once a key row went in: the scan's last e4 or e3 * bb is positive.
+    const float summary = aa / bb;
+    for (int i = 0; i < FQueryLen; i++)
+    {
+      const int outPos = i * FChannels + c;
+      FY[outPos] = cai_fused_act(FR[outPos], 2) * summary;
+    }
+  }
 }
 
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).

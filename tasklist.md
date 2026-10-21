@@ -2072,8 +2072,14 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] Throughput is unmeasured: each kernel is one work-item per channel,
         serial over the window, so a long prefill is latency-bound. Time an
         RWKV decode and prefill on the GPU box.
-  - [ ] `TNNetCrossWKV` has no device forward (its incremental path is tracked
-        under the RWKV/recurrent decode follow-ups).
+  - [X] `TNNetCrossWKV` device forward: `cai_wkv_scan` takes a receptance
+        buffer and a gate mode (`csWKVGate*`: plain, position-aligned
+        sigmoid(r_t) * wkv_t, full-context sigmoid(r_i) * A/B), run by
+        `TNNetWKVScanCL` (shared with `TNNetWKV`). Both modes run on OpenCL;
+        each source is bound when resident, else uploaded; the result stays
+        resident. PoCL parity `CrossWKV[Asym]OpenCLParity`. Open: GPU timing;
+        the incremental path is tracked under the RWKV/recurrent decode
+        follow-ups.
   - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
 - [ ] Follow-ups of the attention subclasses' device paths:
   - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):

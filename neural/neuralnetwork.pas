@@ -157,6 +157,12 @@ const
   // Most output axes a cai_gather_copy plan describes (TNNetGatherCopyCL).
   csGatherCopyMaxAxes = 6;
 
+  // cai_wkv_scan read-outs: plain wkv_t (TNNetWKV), sigmoid(r_t) * wkv_t, and
+  // sigmoid(r_i) * the full-context A/B (TNNetCrossWKV symmetric / asymmetric).
+  csWKVGateNone = 0;
+  csWKVGatePositionAligned = 1;
+  csWKVGateSummary = 2;
+
   // Channel count from which the bilinear-sampler backward passes
   // (TNNetFlowWarp, TNNetBackwardWarp, TNNetAffineGridSample, TNNetGridSample)
   // switch from the scalar depth loop to whole-column MulAdd/DotProduct over the
@@ -6200,6 +6206,11 @@ type
     FBufW: array[0..3] of cl_mem;
     FCapW: array[0..3] of csize_t;
     FWeightCount: integer;
+  protected
+    // Sets the arguments a kernel takes after FY, from ArgPos on; SourceBuffer
+    // is the bound X. The shared scans take none.
+    procedure BindTrailingArguments(k: cl_kernel; ArgPos: integer;
+      SourceBuffer: cl_mem); virtual;
   public
     destructor Destroy(); override;
     // Blocking upload of the kernel's per-channel tables (at most four, in its
@@ -6210,6 +6221,30 @@ type
     procedure Compute(X, Y, State: TNNetVolume; SeqLen, Channels: integer;
       ResetState: boolean; pExternalSrc: cl_mem = nil;
       pKeepResultOnOpenCL: boolean = false);
+  end;
+
+  /// cai_wkv_scan on TNNetChannelScanCL, plus its receptance-gated modes for
+  // TNNetCrossWKV (the csWKVGate* constants). Forward-only. Coded by Claude (AI).
+  TNNetWKVScanCL = class(TNNetChannelScanCL)
+  private
+    FBufR: cl_mem;
+    FCapR: csize_t;
+    FGateBuffer: cl_mem;
+    FGateMode, FQueryLen: integer;
+  protected
+    procedure BindTrailingArguments(k: cl_kernel; ArgPos: integer;
+      SourceBuffer: cl_mem); override;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Upload buffers sized for a host-side [k | v] source X or receptance R
+    // (no write), for TNNetLayer.BindOrUploadOpenCLOperand.
+    function SourceUploadBuffer(X: TNNetVolume): cl_mem;
+    function GateUploadBuffer(R: TNNetVolume): cl_mem;
+    // Fresh-state scan of KeyValueLen [k | v] rows in SourceBuffer, gated by the
+    // receptance rows in GateBuffer; Y (QueryLen rows) stays in ResultBuffer.
+    procedure ComputeGated(X, Y, State: TNNetVolume; KeyValueLen, QueryLen,
+      Channels, GateMode: integer; SourceBuffer, GateBuffer: cl_mem);
   end;
 
   /// OpenCL forward helper for the gated delta-rule recurrence
@@ -12588,7 +12623,7 @@ type
       {$IFDEF OpenCL}
       // cai_wkv_scan in OpenCL memory; its state bank carries FDecState through
       // a decode session. Tables re-upload only when dirty.
-      FScanCL: TNNetChannelScanCL;
+      FScanCL: TNNetWKVScanCL;
       FGpuWeightsDirty: boolean;
       procedure ComputeOpenCL();
       {$ENDIF}
@@ -12710,7 +12745,17 @@ type
       FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
       FGradW, FGradU: TNNetVolume; // C-long grad accumulators
       FAsymmetric: boolean;     // full-context cross (rectangular QxKV) when true
+      {$IFDEF OpenCL}
+      // cai_wkv_scan in a receptance-gated mode; FScanState only sizes its
+      // state bank. Tables re-upload only when dirty.
+      FScanCL: TNNetWKVScanCL;
+      FScanState: TNNetVolume;
+      FGpuWeightsDirty: boolean;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // FW := softplus(Neurons[0]), the per-channel positive decay.
+      procedure PrepareWTable();
       procedure ComputeSym();   // equal-seqlen, position-aligned v1 read-out
       procedure ComputeAsym();  // summarise kv once, query with QSeqLen<>KVSeqLen
       procedure BackpropagateSym();
@@ -12725,6 +12770,16 @@ type
       procedure Backpropagate(); override;
       procedure AppendInputLayers(pList: TList); override;
       procedure InitDefault(); override;
+      procedure AfterWeightUpdate(); override;
+      {$IFDEF OpenCL}
+      // Inference only (the backward reads the host caches); either source may
+      // be bound in OpenCL memory or uploaded from RAM.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
       property KeyValueSource: TNNetLayer read FKVLayer;
       property Asymmetric: boolean read FAsymmetric;
   end;
@@ -42719,12 +42774,72 @@ begin
   clSetKernelArg(k, ArgPos,     csCLMemSize, @bufX);
   clSetKernelArg(k, ArgPos + 1, csCLMemSize, @bufState);
   clSetKernelArg(k, ArgPos + 2, csCLMemSize, @bufY);
+  BindTrailingArguments(k, ArgPos + 3, bufX);
   FKernel.RunKernel(k, Channels);
   FOutputKernel := FKernel;
   if not pKeepResultOnOpenCL then
   begin
     FKernel.Finish();
     FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+end;
+
+procedure TNNetChannelScanCL.BindTrailingArguments(k: cl_kernel;
+  ArgPos: integer; SourceBuffer: cl_mem);
+begin
+end;
+
+{ TNNetWKVScanCL }
+
+constructor TNNetWKVScanCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_wkv_scan');
+  FGateMode := csWKVGateNone;
+end;
+
+destructor TNNetWKVScanCL.Destroy();
+begin
+  if Assigned(FBufR) then clReleaseMemObject(FBufR);
+  inherited Destroy();
+end;
+
+procedure TNNetWKVScanCL.BindTrailingArguments(k: cl_kernel; ArgPos: integer;
+  SourceBuffer: cl_mem);
+var
+  GateBuffer: cl_mem;
+begin
+  // Without a gate the kernel never reads FR, but the argument must be a buffer.
+  if FGateMode = csWKVGateNone
+    then GateBuffer := SourceBuffer
+    else GateBuffer := FGateBuffer;
+  clSetKernelArg(k, ArgPos,     csCLMemSize, @GateBuffer);
+  clSetKernelArg(k, ArgPos + 1, csLongintSize, @FGateMode);
+  clSetKernelArg(k, ArgPos + 2, csLongintSize, @FQueryLen);
+end;
+
+function TNNetWKVScanCL.SourceUploadBuffer(X: TNNetVolume): cl_mem;
+begin
+  Result := FKernel.EnsureOutputBuffer(FBufX, FCapX, X);
+end;
+
+function TNNetWKVScanCL.GateUploadBuffer(R: TNNetVolume): cl_mem;
+begin
+  Result := FKernel.EnsureOutputBuffer(FBufR, FCapR, R);
+end;
+
+procedure TNNetWKVScanCL.ComputeGated(X, Y, State: TNNetVolume; KeyValueLen,
+  QueryLen, Channels, GateMode: integer; SourceBuffer, GateBuffer: cl_mem);
+begin
+  FGateMode := GateMode;
+  FQueryLen := QueryLen;
+  FGateBuffer := GateBuffer;
+  try
+    Compute(X, Y, State, KeyValueLen, Channels, {ResetState=}true, SourceBuffer,
+      {pKeepResultOnOpenCL=}true);
+  finally
+    FGateMode := csWKVGateNone;
+    FQueryLen := 0;
+    FGateBuffer := nil;
   end;
 end;
 
@@ -72194,7 +72309,7 @@ begin
   // per-channel scan, not a contraction.
   FHasOpenCL := true;
   if not Assigned(FScanCL) then
-    FScanCL := TNNetChannelScanCL.Create(FNN, 'cai_wkv_scan');
+    FScanCL := TNNetWKVScanCL.Create(FNN);
   // Nothing is resident yet, whatever a previous weight update reported.
   FGpuWeightsDirty := true;
 end;
@@ -73335,6 +73450,10 @@ begin
   FB := TNNetVolume.Create();
   FGradW := TNNetVolume.Create();
   FGradU := TNNetVolume.Create();
+  {$IFDEF OpenCL}
+  FScanState := TNNetVolume.Create();
+  FGpuWeightsDirty := true;
+  {$ENDIF}
   // [0]=w_raw [1]=u
   AddMissingNeurons(2);
   if Assigned(FKVLayer) then
@@ -73348,6 +73467,10 @@ end;
 
 destructor TNNetCrossWKV.Destroy();
 begin
+  {$IFDEF OpenCL}
+  FScanCL.Free;
+  FScanState.Free;
+  {$ENDIF}
   FGradU.Free;
   FGradW.Free;
   FB.Free;
@@ -73421,43 +73544,149 @@ begin
   FB.ReSize(FKVLayer.FOutput.SizeX, 1, FChannels);
   FGradW.ReSize(1, 1, FChannels);
   FGradU.ReSize(1, 1, FChannels);
+  {$IFDEF OpenCL}
+  FScanState.ReSize(1, 1, 3 * FChannels);
+  {$ENDIF}
   InitDefault();
 end;
 
+procedure TNNetCrossWKV.PrepareWTable();
+var
+  MaxC, d: integer;
+  raw: TNeuralFloat;
+  Ww: TNNetVolume;
+begin
+  Ww := FNeurons[0].FWeights;
+  MaxC := FChannels - 1;
+  for d := 0 to MaxC do
+  begin
+    raw := Ww.FData[d];
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + NeuralExp(raw));
+  end;
+end;
+
+procedure TNNetCrossWKV.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  {$IFDEF OpenCL}
+  FGpuWeightsDirty := true;
+  {$ENDIF}
+end;
+
 procedure TNNetCrossWKV.Compute();
+{$IFDEF OpenCL}
+var
+  StartTime: double;
+{$ENDIF}
 begin
   {$IFDEF OpenCL}
+  // Runs BEFORE any ForceOutputOnRAM because those downloads are what it avoids.
+  if WillOpenCL() then
+  begin
+    StartTime := Now();
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FKVLayer) then FKVLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
   {$ENDIF}
   if FAsymmetric then ComputeAsym() else ComputeSym();
 end;
 
+{$IFDEF OpenCL}
+function TNNetCrossWKV.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FScanCL) and FHasOpenCL and (not FIsTrainable) and
+    Assigned(FKVLayer) and (FShouldOpenCL or FForceOpenCL or
+    PrevOutputOnOpenCL() or FKVLayer.OutputBindableOnOpenCL());
+end;
+
+procedure TNNetCrossWKV.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Bare TNNetLayer arming plus the scan helper: the recurrence is a
+  // per-channel scan, not a contraction.
+  FHasOpenCL := true;
+  if not Assigned(FScanCL) then FScanCL := TNNetWKVScanCL.Create(FNN);
+  FGpuWeightsDirty := true;
+end;
+
+procedure TNNetCrossWKV.DisableOpenCL();
+begin
+  // FScanCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FScanCL);
+end;
+
+function TNNetCrossWKV.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetCrossWKV.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.OutputKernel()
+  else Result := nil;
+end;
+
+// Both read-outs in one cai_wkv_scan launch: position-aligned (symmetric) or
+// the full-context summary read by every query row (asymmetric).
+procedure TNNetCrossWKV.ComputeOpenCL();
+var
+  ConsumerKernel: TNeuralKernel;
+  SourceUpload, GateUpload, SourceBuffer, GateBuffer: cl_mem;
+  GateMode: integer;
+begin
+  ConsumerKernel := FScanCL.ForwardKernel();
+  SourceUpload := nil;
+  GateUpload := nil;
+  if not FKVLayer.OutputBindableOnOpenCL() then
+    SourceUpload := FScanCL.SourceUploadBuffer(FKVLayer.FOutput);
+  if not FPrevLayer.OutputBindableOnOpenCL() then
+    GateUpload := FScanCL.GateUploadBuffer(FPrevLayer.FOutput);
+  SourceBuffer := BindOrUploadOpenCLOperand(FKVLayer, ConsumerKernel, SourceUpload);
+  GateBuffer := BindOrUploadOpenCLOperand(FPrevLayer, ConsumerKernel, GateUpload);
+  if FGpuWeightsDirty then
+  begin
+    PrepareWTable();
+    FScanCL.UploadWeights([FW, FNeurons[1].FWeights]);
+    FGpuWeightsDirty := false;
+  end;
+  if FAsymmetric
+    then GateMode := csWKVGateSummary
+    else GateMode := csWKVGatePositionAligned;
+  FScanCL.ComputeGated(FKVLayer.FOutput, FOutput, FScanState,
+    FKVLayer.FOutput.SizeX, FOutput.SizeX, FChannels, GateMode, SourceBuffer,
+    GateBuffer);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
+
 procedure TNNetCrossWKV.ComputeSym();
 var
   StartTime: double;
-  Ww, Wu, Rcp, KVv: TNNetVolume;
+  Wu, Rcp, KVv: TNNetVolume;
   SeqLen, C, t, d: integer;
   MaxC, MaxT, baseKV, baseC, kvStride, ocStride: integer;
-  raw, wv, uv, kt, vt, rt, aprev, bprev: TNeuralFloat;
+  wv, uv, kt, vt, rt, aprev, bprev: TNeuralFloat;
   qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
   ww2, qmax2, e3, e4, anew, bnew, wkv, eq: TNeuralFloat;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C)
   KVv := FKVLayer.FOutput;          // key|value source B (depth 2C)
-  Ww := FNeurons[0].FWeights;
   Wu := FNeurons[1].FWeights;
   SeqLen := FOutput.SizeX;
   C := FChannels;
   MaxC := C - 1;
   MaxT := SeqLen - 1;
-  // Per-channel positive decay w = softplus(w_raw).
-  for d := 0 to MaxC do
-  begin
-    raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + NeuralExp(raw));
-  end;
+  PrepareWTable();
   // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0),
   // k|v read from source B, then receptance-gated by sigmoid(r) from source A.
   kvStride := KVv.GetRawPos(1, 0);           // = 2C: KVv (t,d)->(t+1,d) step
@@ -73522,17 +73751,16 @@ procedure TNNetCrossWKV.ComputeAsym();
 // not a causal-prefix copy.
 var
   StartTime: double;
-  Ww, Rcp, KVv: TNNetVolume;
+  Rcp, KVv: TNNetVolume;
   QLen, KVLen, C, t, i, d: integer;
   MaxC, MaxKV, MaxQ, baseKV, baseC, baseLast, baseQ, kvStride, ocStride: integer;
-  raw, wv, kt, vt, aprev, bprev: TNeuralFloat;
+  wv, kt, vt, aprev, bprev: TNeuralFloat;
   qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, eq: TNeuralFloat;
   summaryPtr, outRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C), len QLen
   KVv := FKVLayer.FOutput;          // key|value source B (depth 2C), len KVLen
-  Ww := FNeurons[0].FWeights;
   QLen := FOutput.SizeX;
   KVLen := KVv.SizeX;
   C := FChannels;
@@ -73541,11 +73769,7 @@ begin
   MaxQ := QLen - 1;
   // u (FNeurons[1]) is unused in the asymmetric read-out: there is no per-query
   // current-token bonus, so only the decay weight w drives the summary.
-  for d := 0 to MaxC do
-  begin
-    raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + NeuralExp(raw));
-  end;
+  PrepareWTable();
   kvStride := KVv.GetRawPos(1, 0);           // = 2C: KVv row step
   ocStride := FA.GetRawPos(1, 0);            // = C: FA/FB (and Rcp/FOutput) step
   for d := 0 to MaxC do

@@ -49,6 +49,10 @@ type
       InDepth: integer);
     procedure CheckChannelScanDecodeParity(AClass: TNNetLayerClass;
       InDepth: integer);
+    // TNNetCrossWKV on OpenCL vs the CPU, one layer per source placement (both
+    // resident, either one host-side, both host-side under ForceOpenCL).
+    procedure CheckCrossWKVOpenCLParity(Asymmetric: boolean;
+      QueryLen, KeyValueLen: integer);
     // Window attention (Cosine = SwinV2) on OpenCL vs the CPU: several windows
     // and heads, shift masks, resident outputs, a bias and logit_scale update.
     procedure CheckWindowAttentionOpenCLParity(Cosine: boolean);
@@ -480,6 +484,10 @@ type
     // The same two checks for TNNetWKV (2C-wide [k | v] input, C-wide output).
     procedure WKVResidentChainOpenCLParity;
     procedure WKVDecodeResidentOpenCLParity;
+    // TNNetCrossWKV, position-aligned (equal lengths) and full-context summary
+    // (QueryLen <> KeyValueLen) read-outs.
+    procedure CrossWKVOpenCLParity;
+    procedure CrossWKVAsymOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -84713,6 +84721,146 @@ end;
 procedure TTestNeuralNumerical.WKVDecodeResidentOpenCLParity;
 begin
   CheckChannelScanDecodeParity(TNNetWKV, 8);
+end;
+
+procedure TTestNeuralNumerical.CheckCrossWKVOpenCLParity(Asymmetric: boolean;
+  QueryLen, KeyValueLen: integer);
+{$IFDEF OpenCL}
+const
+  Channels = 5;
+  PlacementCnt = 4;
+  csSentinel = -7777;
+  PlacementNames: array[0..PlacementCnt - 1] of string =
+    ('both resident', 'key|value on host', 'receptance on host', 'both on host');
+var
+  NNCpu, NNGpu: TNNet;
+  QueryData, KeyValueData: TNNetVolume;
+  CpuCross, GpuCross: array[0..PlacementCnt - 1] of TNNetLayer;
+  GpuQueryIn, GpuKeyValueIn, GpuQueryAct, GpuKeyValueAct: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PlacementPos, NeuronPos, ElementPos, SentinelSurvivors, SentinelCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+
+  // Receptance and key|value inputs, each feeding a resident and a host-side
+  // SiLU, and one TNNetCrossWKV per placement.
+  procedure BuildNet(NN: TNNet; var Cross: array of TNNetLayer; out QueryIn,
+    KeyValueIn, QueryAct, KeyValueAct, QueryHost, KeyValueHost: TNNetLayer);
+  begin
+    QueryIn := NN.AddLayer(TNNetInput.Create(QueryLen, 1, Channels, 1));
+    QueryAct := NN.AddLayerAfter(TNNetSiLU.Create(), QueryIn);
+    QueryHost := NN.AddLayerAfter(TNNetSiLU.Create(), QueryIn);
+    KeyValueIn := NN.AddLayerAfter(
+      TNNetInput.Create(KeyValueLen, 1, 2 * Channels, 1), 0);
+    KeyValueAct := NN.AddLayerAfter(TNNetSiLU.Create(), KeyValueIn);
+    KeyValueHost := NN.AddLayerAfter(TNNetSiLU.Create(), KeyValueIn);
+    Cross[0] := NN.AddLayerAfter(
+      TNNetCrossWKV.Create(KeyValueAct, Asymmetric), QueryAct);
+    Cross[1] := NN.AddLayerAfter(
+      TNNetCrossWKV.Create(KeyValueHost, Asymmetric), QueryAct);
+    Cross[2] := NN.AddLayerAfter(
+      TNNetCrossWKV.Create(KeyValueAct, Asymmetric), QueryHost);
+    Cross[3] := NN.AddLayerAfter(
+      TNNetCrossWKV.Create(KeyValueHost, Asymmetric), QueryHost);
+    NN.SetTrainable(False, False);
+  end;
+
+  procedure RunForward(NN: TNNet; KeyValueIn: TNNetLayer);
+  begin
+    KeyValueIn.Output.Copy(KeyValueData);
+    NN.Compute(QueryData);
+  end;
+
+var
+  CpuQueryIn, CpuKeyValueIn, CpuQueryAct, CpuKeyValueAct: TNNetLayer;
+  CpuQueryHost, CpuKeyValueHost, GpuQueryHost, GpuKeyValueHost: TNNetLayer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  QueryData := TNNetVolume.Create(QueryLen, 1, Channels);
+  KeyValueData := TNNetVolume.Create(KeyValueLen, 1, 2 * Channels);
+  try
+    BuildNet(NNCpu, CpuCross, CpuQueryIn, CpuKeyValueIn, CpuQueryAct,
+      CpuKeyValueAct, CpuQueryHost, CpuKeyValueHost);
+    BuildNet(NNGpu, GpuCross, GpuQueryIn, GpuKeyValueIn, GpuQueryAct,
+      GpuKeyValueAct, GpuQueryHost, GpuKeyValueHost);
+    for PlacementPos := 0 to PlacementCnt - 1 do
+    begin
+      SeedChannelScanForOpenCL(CpuCross[PlacementPos]);
+      for NeuronPos := 0 to CpuCross[PlacementPos].Neurons.Count - 1 do
+        GpuCross[PlacementPos].Neurons[NeuronPos].Weights.Copy(
+          CpuCross[PlacementPos].Neurons[NeuronPos].Weights);
+    end;
+    for ElementPos := 0 to QueryData.Size - 1 do
+      QueryData.Raw[ElementPos] := 3.0 * (Random - 0.5);
+    for ElementPos := 0 to KeyValueData.Size - 1 do
+      KeyValueData.Raw[ElementPos] := 3.0 * (Random - 0.5);
+    RunForward(NNCpu, CpuKeyValueIn);
+
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    // Host-side sources: these two SiLUs run on the CPU.
+    GpuQueryHost.DisableOpenCL();
+    GpuKeyValueHost.DisableOpenCL();
+    GpuCross[3].ForceOpenCL(True);
+    RunForward(NNGpu, GpuKeyValueIn);
+    // Parity cannot tell a bind from a download: a second forward must leave
+    // the resident sources' host copies untouched.
+    GpuQueryAct.Output.Fill(csSentinel);
+    GpuKeyValueAct.Output.Fill(csSentinel);
+    RunForward(NNGpu, GpuKeyValueIn);
+    SentinelSurvivors := 0;
+    for ElementPos := 0 to GpuQueryAct.Output.Size - 1 do
+      if GpuQueryAct.Output.Raw[ElementPos] = csSentinel then Inc(SentinelSurvivors);
+    for ElementPos := 0 to GpuKeyValueAct.Output.Size - 1 do
+      if GpuKeyValueAct.Output.Raw[ElementPos] = csSentinel then Inc(SentinelSurvivors);
+    SentinelCnt := GpuQueryAct.Output.Size + GpuKeyValueAct.Output.Size;
+    for PlacementPos := 0 to PlacementCnt - 1 do
+    begin
+      GpuCross[PlacementPos].ForceOutputOnRAM();
+      MaxDiff := 0;
+      for ElementPos := 0 to CpuCross[PlacementPos].Output.Size - 1 do
+      begin
+        Diff := Abs(CpuCross[PlacementPos].Output.Raw[ElementPos] -
+          GpuCross[PlacementPos].Output.Raw[ElementPos]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  TNNetCrossWKV asym=', Asymmetric, ' ', PlacementNames[PlacementPos],
+        ': max|diff|=', MaxDiff:0:9, ' gpu forwards=',
+        GpuCross[PlacementPos].ForwardGPUCnt);
+      AssertEquals(PlacementNames[PlacementPos] +
+        ': both forwards must run on OpenCL', 2,
+        GpuCross[PlacementPos].ForwardGPUCnt);
+      AssertTrue(PlacementNames[PlacementPos] + ' OpenCL vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    end;
+    AssertEquals('resident sources must be read in OpenCL memory, not downloaded',
+      SentinelCnt, SentinelSurvivors);
+    AssertEquals('the host-side sources must stay in RAM', 0,
+      GpuQueryHost.ForwardGPUCnt + GpuKeyValueHost.ForwardGPUCnt);
+  finally
+    KeyValueData.Free; QueryData.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.CrossWKVOpenCLParity;
+begin
+  CheckCrossWKVOpenCLParity({Asymmetric=}false, 7, 7);
+end;
+
+procedure TTestNeuralNumerical.CrossWKVAsymOpenCLParity;
+begin
+  CheckCrossWKVOpenCLParity({Asymmetric=}true, 4, 9);
 end;
 
 function FusedSDPASplitOverride(Splits, ChunkRows,
