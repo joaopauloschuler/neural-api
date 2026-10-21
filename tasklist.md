@@ -1951,10 +1951,21 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [ ] CogVideoX VAE decoder runs its `TNNetCausalConv1D` pair once per spatial
+- [X] CogVideoX VAE decoder runs its `TNNetCausalConv1D` pair once per spatial
       cell on a tiny (T,1,Clat) net, so the size verdict keeps it on the CPU
       and the new device forward rarely fires. Batch all H*W cells into one
       forward (cells along Y, SizeY = H*W) so one launch covers the frame.
+      DONE: `TNNetCausalConv1D` now takes SizeY>1 as independent rows (host
+      forward/backward row loop; OpenCL position count = SizeX*SizeY on the
+      unchanged cai_conv_implicit). `BuildCogVideoXVaeDecoderFromSafeTensorsEx`
+      builds the net once at (T, Min(H*W, MaxCellsPerForward), Clat), default
+      cap `csCogVideoXVaeMaxCellsPerForward` = 4096 cells; `DecodeCogVideoXVae`
+      feeds the latent straight in when the block covers the frame, else one
+      Move per row block (zero-filled short last block). Tests:
+      TestCausalConv1DRowsIndependent (CPU forward vs per-row nets + input and
+      weight gradients), TestCausalConv1DOpenCLParity +2 SizeY>1 cases,
+      TestCogVideoXParity checks whole-frame vs per-cell vs 3-cell blocks.
+      Not measured on a GPU box (no timing claim).
 - [ ] GPU-box check: `cai_sdpa_flash` gained a uniform score-bias branch
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased

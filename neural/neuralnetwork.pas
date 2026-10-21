@@ -10313,9 +10313,9 @@ type
   /// TNNetCausalConv1D: a learnable 1D convolution along the SizeX (time) axis
   // with LEFT-ONLY zero padding of (FeatureSize-1), so the sequence length is
   // preserved (output SizeX == input SizeX) and output position t depends ONLY
-  // on input positions <= t (no future leakage). The input is a (SeqLen, 1,
-  // InputDepth) sequence laid out along SizeX exactly like TNNetTokenShift /
-  // the attention layers (SizeY must be 1). For each output channel f, position
+  // on input positions <= t (no future leakage). The input is a (SeqLen, Rows,
+  // InputDepth) volume: each SizeY row is an independent sequence along SizeX
+  // (Rows=1 is the usual case). For each row, output channel f, position
   // t and kernel tap k (0..K-1, where K = FeatureSize):
   //   y[t,0,f] = bias[f]
   //            + sum_{k=0..K-1} sum_{c} W[f][k,0,c] * x[t-Dilation*(K-1-k),0,c]
@@ -66029,7 +66029,7 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetCausalConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
-  EnableNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX);
+  EnableNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
 end;
 
 procedure TNNetCausalConv1D.DisableOpenCL();
@@ -66072,17 +66072,15 @@ end;
 
 procedure TNNetCausalConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  SeqLen, InputDepth: integer;
+  SeqLen, RowCount, InputDepth: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
-  if pPrevLayer.FOutput.SizeY <> 1 then
-    FErrorProc('TNNetCausalConv1D requires SizeY=1, got SizeY=' +
-      IntToStr(pPrevLayer.FOutput.SizeY));
   SeqLen := pPrevLayer.FOutput.SizeX;
+  RowCount := pPrevLayer.FOutput.SizeY;
   InputDepth := pPrevLayer.FOutput.Depth;
-  // Causal/SAME along time: output length == input length.
-  FOutput.ReSize(SeqLen, 1, FNeurons.Count);
-  SetOutputErrorSize(SeqLen, 1, FNeurons.Count);
+  // Causal/SAME along time: output length == input length, rows independent.
+  FOutput.ReSize(SeqLen, RowCount, FNeurons.Count);
+  SetOutputErrorSize(SeqLen, RowCount, FNeurons.Count);
   // Each output channel reads a (Ksize, 1, InputDepth) window.
   SetNumWeightsForAllNeurons(FFeatureSize, 1, InputDepth);
   InitDefault();
@@ -66091,7 +66089,7 @@ begin
   FShouldOpenCL := (Int64(FOutput.Size) * FFeatureSize * InputDepth >= cNeuralOpenCLMinWork);
   // The device GEMM is shaped by this layer's sizes: a re-wire re-arms it.
   if FHasOpenCL and Assigned(FDotCL) then
-    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX);
+    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
   {$ENDIF}
 end;
 
@@ -66100,8 +66098,9 @@ var
   MaxNeuronPos: integer;
   StartTime: double;
   Prev: TNNetVolume;
-  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
+  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT, srcPos: integer;
   MaxT, MaxK, OutDepth, outPos, wOfs, DilSpan: integer;
+  RowPos, MaxRowPos, TapStride, TimeTapBase, FirstTapOfs: integer;
   W: TNNetVolume;
   sum, biasInit: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -66129,7 +66128,10 @@ begin
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
   MaxNeuronPos := FNeurons.Count - 1;
+  MaxRowPos := Prev.SizeY - 1;
+  TapStride := Dil * InputDepth;
   DilSpan := Dil * MaxK;             // #5: the left-padding span, once per call
+  FirstTapOfs := -DilSpan * InputDepth;
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
@@ -66138,25 +66140,33 @@ begin
     biasInit := 0;
     if FSuppressBias = 0 then biasInit := localNeuron.FBiasWeight;
     outPos := f;                     // #6: carried FOutput offset (stride OutDepth).
-    for t := 0 to MaxT do
+    // #6: offset of tap 0 for (row, t); rows are contiguous, so it carries across rows.
+    TimeTapBase := FirstTapOfs;
+    for RowPos := 0 to MaxRowPos do
     begin
-      sum := biasInit;
-      // Left-only padding: tap k reads input position t-Dil*(Ksize-1-k).
-      // Positions < 0 are the (zero) left padding -> skipped. The depth axis is
-      // contiguous, so each tap is an AVX dot product over InputDepth floats.
-      // #6: srcT steps by +Dil per tap; the weight row by +InputDepth.
-      srcT := t - DilSpan;
-      wOfs := 0;
-      for k := 0 to MaxK do
+      for t := 0 to MaxT do
       begin
-        if srcT >= 0 then // padded positions (< 0) are skipped, never reads srcT > t
-          sum := sum + TNNetVolume.DotProduct(
-            W.GetRawPtr(wOfs), Prev.GetRawPtr(srcT, 0), InputDepth);
-        Inc(srcT, Dil);
-        Inc(wOfs, InputDepth);
+        sum := biasInit;
+        // Left-only padding: tap k reads input position t-Dil*(Ksize-1-k) of
+        // this row. Positions < 0 are the (zero) left padding -> skipped. The
+        // depth axis is contiguous, so each tap is an AVX dot product.
+        // #6: srcT steps by +Dil per tap, srcPos by +TapStride, the weights by +InputDepth.
+        srcT := t - DilSpan;
+        srcPos := TimeTapBase;
+        Inc(TimeTapBase, InputDepth);
+        wOfs := 0;
+        for k := 0 to MaxK do
+        begin
+          if srcT >= 0 then // padded positions (< 0) are skipped, never reads srcT > t
+            sum := sum + TNNetVolume.DotProduct(
+              W.GetRawPtr(wOfs), Prev.GetRawPtr(srcPos), InputDepth);
+          Inc(srcT, Dil);
+          Inc(srcPos, TapStride);
+          Inc(wOfs, InputDepth);
+        end;
+        FOutput.FData[outPos] := sum;
+        Inc(outPos, OutDepth);
       end;
-      FOutput.FData[outPos] := sum;
-      Inc(outPos, OutDepth);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -66167,8 +66177,9 @@ var
   MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
-  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
+  SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT, srcPos: integer;
   MaxT, MaxK, OutDepth, outPos, wOfs, DilSpan: integer;
+  RowPos, MaxRowPos, TapStride, TimeTapBase, FirstTapOfs: integer;
   W, GW: TNNetVolume;
   gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -66201,38 +66212,49 @@ begin
   MaxNeuronPos := FNeurons.Count - 1;
   negLR := -FLearningRate;           // #5
   AddBias := FSuppressBias = 0;      // #20: a layer flag, not a per-t condition
+  MaxRowPos := Prev.SizeY - 1;
+  TapStride := Dil * InputDepth;
   DilSpan := Dil * MaxK;             // #5: the left-padding span, once per call
+  FirstTapOfs := -DilSpan * InputDepth;
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
     GW := localNeuron.FDelta;
     outPos := f;                     // #6: carried FOutputError offset.
-    for t := 0 to MaxT do
+    // #6: offset of tap 0 for (row, t); rows are contiguous, so it carries across rows.
+    TimeTapBase := FirstTapOfs;
+    for RowPos := 0 to MaxRowPos do
     begin
-      gy := FOutputError.FData[outPos];
-      Inc(outPos, OutDepth);
-      if gy = 0 then continue;
-      negLRgy := negLR * gy;         // #4: the bias delta uses the same product
-      if AddBias then
-        localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
-      // Depth axis is contiguous: accumulate each tap with AVX MulAdd
-      //   (PtrA[i] += PtrB[i] * Value) over InputDepth floats.
-      // #6: srcT steps by +Dil per tap; the weight rows by +InputDepth.
-      srcT := t - DilSpan;
-      wOfs := 0;
-      for k := 0 to MaxK do
+      for t := 0 to MaxT do
       begin
-        if srcT >= 0 then
+        gy := FOutputError.FData[outPos];
+        Inc(outPos, OutDepth);
+        srcPos := TimeTapBase;
+        Inc(TimeTapBase, InputDepth);
+        if gy = 0 then continue;
+        negLRgy := negLR * gy;       // #4: the bias delta uses the same product
+        if AddBias then
+          localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
+        // Depth axis is contiguous: accumulate each tap with AVX MulAdd
+        //   (PtrA[i] += PtrB[i] * Value) over InputDepth floats.
+        // #6: srcT steps by +Dil per tap, srcPos by +TapStride, the weights by +InputDepth.
+        srcT := t - DilSpan;
+        wOfs := 0;
+        for k := 0 to MaxK do
         begin
-          TNNetVolume.MulAdd(GW.GetRawPtr(wOfs), Prev.GetRawPtr(srcT, 0),
-            negLRgy, InputDepth);
-          if hasInputGrad then
-            TNNetVolume.MulAdd(PrevErr.GetRawPtr(srcT, 0), W.GetRawPtr(wOfs),
-              gy, InputDepth);
+          if srcT >= 0 then
+          begin
+            TNNetVolume.MulAdd(GW.GetRawPtr(wOfs), Prev.GetRawPtr(srcPos),
+              negLRgy, InputDepth);
+            if hasInputGrad then
+              TNNetVolume.MulAdd(PrevErr.GetRawPtr(srcPos), W.GetRawPtr(wOfs),
+                gy, InputDepth);
+          end;
+          Inc(srcT, Dil);
+          Inc(srcPos, TapStride);
+          Inc(wOfs, InputDepth);
         end;
-        Inc(srcT, Dil);
-        Inc(wOfs, InputDepth);
       end;
     end;
     if (not FBatchUpdate) then localNeuron.UpdateWeights(FInertia);

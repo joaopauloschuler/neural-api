@@ -1382,6 +1382,9 @@ type
     procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
     procedure TestCausalConv1DSerializationRoundTrip;
+    // SizeY>1: rows are independent sequences (forward vs a SizeY=1 net per
+    // row, plus input and weight finite-difference gradients).
+    procedure TestCausalConv1DRowsIndependent;
     procedure TestCausalConv1DDilatedForward;
     procedure TestCausalConv1DDilatedWeightGradientCheck;
     procedure TestCausalConv1DDilatedSerializationRoundTrip;
@@ -48414,6 +48417,115 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestCausalConv1DRowsIndependent;
+const
+  csSeqLen = 5; csRows = 3; csInDepth = 3; csNumFeat = 4; csK = 3; csDil = 2;
+  csEpsilon = 0.001;
+var
+  NN, NNRow: TNNet;
+  LConv: TNNetLayer;
+  Input, RowInput, InputPlus, Desired: TNNetVolume;
+  RowPos, t, f, i, n, RowFloats: integer;
+  lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNRow := TNNet.Create();
+  Input := TNNetVolume.Create(csSeqLen, csRows, csInDepth);
+  RowInput := TNNetVolume.Create(csSeqLen, 1, csInDepth);
+  InputPlus := TNNetVolume.Create(csSeqLen, csRows, csInDepth);
+  Desired := TNNetVolume.Create(csSeqLen, csRows, csNumFeat);
+  try
+    NN.AddLayer(TNNetInput.Create(csSeqLen, csRows, csInDepth, 1));
+    LConv := NN.AddLayer(TNNetCausalConv1D.Create(csNumFeat, csK, 0, csDil));
+    NNRow.AddLayer(TNNetInput.Create(csSeqLen, 1, csInDepth, 1));
+    NNRow.AddLayer(TNNetCausalConv1D.Create(csNumFeat, csK, 0, csDil));
+    for f := 0 to csNumFeat - 1 do
+      LConv.Neurons[f].BiasWeight := 0.1 * f - 0.2;
+    NNRow.CopyWeights(NN);
+    AssertEquals('CausalConv1D keeps SizeY', csRows, LConv.Output.SizeY);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 1.2 + 0.1 * Cos(i * 1.7);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.6;
+    // (A) forward: each row equals the single-row net on that row alone.
+    NN.Compute(Input);
+    RowFloats := csSeqLen * csInDepth;
+    for RowPos := 0 to csRows - 1 do
+    begin
+      Move(Input.FData[RowPos * RowFloats], RowInput.FData[0],
+        RowFloats * csNeuralFloatSize);
+      NNRow.Compute(RowInput);
+      for t := 0 to csSeqLen - 1 do
+        for f := 0 to csNumFeat - 1 do
+          AssertEquals('CausalConv1D row ' + IntToStr(RowPos) + ' t=' +
+            IntToStr(t) + ' f=' + IntToStr(f),
+            NNRow.GetLastLayer.Output[t, 0, f], LConv.Output[t, RowPos, f], 1e-5);
+    end;
+    // (B) input gradient vs finite differences across all rows.
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + csEpsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - csEpsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * csEpsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('CausalConv1D rows input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // (C) weight gradient: accumulated over every row.
+    for n := 0 to csNumFeat - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + csEpsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * csEpsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + csEpsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * csEpsilon);
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+        AssertTrue('CausalConv1D rows weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    NNRow.Free;
+    Input.Free;
+    RowInput.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestCausalConv1DDilatedForward;
 var
   NN: TNNet;
@@ -74193,12 +74305,12 @@ end;
 // Input (SeqLen,1,InC) -> CausalConv1D(OutC,K,SuppressBias,Dil) ->
 // CausalConv1D(5,2) -> ReLU, with non-trivial weights and biases.
 function BuildCausalConv1DParityNet(SeqLen, InC, OutC, K, SuppressBias,
-  Dil: integer; out FirstConv, SecondConv: TNNetLayer): TNNet;
+  Dil, Rows: integer; out FirstConv, SecondConv: TNNetLayer): TNNet;
 var
   NeuronPos: integer;
 begin
   Result := TNNet.Create();
-  Result.AddLayer(TNNetInput.Create(SeqLen, 1, InC));
+  Result.AddLayer(TNNetInput.Create(SeqLen, Rows, InC));
   FirstConv := Result.AddLayer(TNNetCausalConv1D.Create(OutC, K, SuppressBias, Dil));
   SecondConv := Result.AddLayer(TNNetCausalConv1D.Create(5, 2));
   Result.AddLayer(TNNetReLU.Create());
@@ -74221,11 +74333,12 @@ procedure TTestNeuralNumerical.TestCausalConv1DOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
-  // SeqLen, InC, OutC, K, SuppressBias, Dilation. The third shape takes the
-  // tiled kernel (>= 64 rows); in the fourth the left pad exceeds SeqLen.
-  csCases: array[0..4, 0..5] of integer = ((17, 8, 12, 3, 0, 1),
-    (20, 5, 7, 4, 1, 3), (24, 16, 70, 3, 0, 2), (6, 3, 4, 3, 0, 4),
-    (9, 6, 10, 1, 0, 1));
+  // SeqLen, InC, OutC, K, SuppressBias, Dilation, Rows (SizeY). The third
+  // shape takes the tiled kernel (>= 64 rows); in the fourth the left pad
+  // exceeds SeqLen; the last two run independent rows along SizeY.
+  csCases: array[0..6, 0..6] of integer = ((17, 8, 12, 3, 0, 1, 1),
+    (20, 5, 7, 4, 1, 3, 1), (24, 16, 70, 3, 0, 2, 1), (6, 3, 4, 3, 0, 4, 1),
+    (9, 6, 10, 1, 0, 1, 1), (7, 4, 6, 3, 0, 2, 5), (5, 8, 70, 3, 0, 1, 9));
 var
   NN, NNCPU: TNNet;
   Input, Out1CPU, Out2CPU, LastCPU: TNNetVolume;
@@ -74248,11 +74361,12 @@ begin
     RandSeed := 20261020 + CasePos;
     NN := BuildCausalConv1DParityNet(csCases[CasePos, 0], csCases[CasePos, 1],
       csCases[CasePos, 2], csCases[CasePos, 3], csCases[CasePos, 4],
-      csCases[CasePos, 5], Conv1, Conv2);
+      csCases[CasePos, 5], csCases[CasePos, 6], Conv1, Conv2);
     NNCPU := BuildCausalConv1DParityNet(csCases[CasePos, 0], csCases[CasePos, 1],
       csCases[CasePos, 2], csCases[CasePos, 3], csCases[CasePos, 4],
-      csCases[CasePos, 5], Conv1CPU, Conv2CPU);
-    Input := TNNetVolume.Create(csCases[CasePos, 0], 1, csCases[CasePos, 1]);
+      csCases[CasePos, 5], csCases[CasePos, 6], Conv1CPU, Conv2CPU);
+    Input := TNNetVolume.Create(csCases[CasePos, 0], csCases[CasePos, 6],
+      csCases[CasePos, 1]);
     Out1CPU := TNNetVolume.Create();
     Out2CPU := TNNetVolume.Create();
     LastCPU := TNNetVolume.Create();

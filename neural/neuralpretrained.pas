@@ -12610,17 +12610,18 @@ function BuildCogVideoXFromSafeTensors(const FileName: string;
   out Config: TCogVideoXConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
-// Builds the 3D-causal-conv VAE DECODE tail described by Config (a separate
-// TNNet): input (T,H*W,VaeLatentChannels) channel-major -> output
-// (T,H*W,VaeOutChannels). Coded by Claude (AI).
-function BuildCogVideoXVaeDecoderFromSafeTensorsEx(const FileName: string;
-  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+const
+  // Spatial cells per VAE-decode forward: bounds the decode net's activations.
+  csCogVideoXVaeMaxCellsPerForward = 4096;
 
-// Runs the 3D-causal-conv VAE decode tail over every spatial cell of a
-// (NumFrames, GridHeight*GridWidth, VaeLatentChannels) channel-major latent,
-// writing the decoded (NumFrames, GridHeight*GridWidth, VaeOutChannels) video.
-// VaeNet is the single-cell net from BuildCogVideoXVaeDecoderFromSafeTensorsEx.
-// Coded by Claude (AI).
+// Builds the 3D-causal-conv VAE DECODE tail (a separate TNNet) over a block of
+// Min(H*W, MaxCellsPerForward) cells: (T,Cells,VaeLatentChannels) -> (T,Cells,VaeOutChannels).
+function BuildCogVideoXVaeDecoderFromSafeTensorsEx(const FileName: string;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true;
+  MaxCellsPerForward: integer = csCogVideoXVaeMaxCellsPerForward): TNNet;
+
+// Decodes a (NumFrames, GridHeight*GridWidth, VaeLatentChannels) latent into
+// (NumFrames, GridHeight*GridWidth, VaeOutChannels), one VaeNet forward per cell block.
 procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXConfig;
   Latent: TNNetVolume; DecodedOut: TNNetVolume);
 
@@ -93560,12 +93561,13 @@ begin
 end;
 
 function BuildCogVideoXVaeDecoderFromSafeTensorsEx(const FileName: string;
-  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true;
+  MaxCellsPerForward: integer = csCogVideoXVaeMaxCellsPerForward): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   InLayer, TConv, ActLayer, OutConv: TNNetLayer;
-  T, HW, Clat, Vout, KT, co: integer;
+  T, HW, BlockCells, Clat, Vout, KT, co: integer;
   ClatM1, VoutM1: integer;
   WV, BV: TNNetVolume;
 begin
@@ -93579,16 +93581,14 @@ begin
     KT := Config.VaeTemporalKernel;
     ClatM1 := Clat - 1;
     VoutM1 := Vout - 1;
+    BlockCells := Max(1, Min(HW, MaxCellsPerForward));
     NN := TNNet.Create();
     // The 3D-causal VAE decode tail. Each SPATIAL cell is an independent
-    // temporal sequence: time rides the X axis, the C channels ride the Depth
-    // axis (the VideoMAE space<->time view). TNNetCausalConv1D requires SizeY=1,
-    // so this net decodes ONE cell (T,1,Clat) -> (T,1,Vout); the caller
-    // (DecodeCogVideoXVae) runs it once per cell over the H*W grid, reusing the
-    // same shared causal-conv weights -- exactly the diffusers
-    // CogVideoXCausalConv3d depth-axis causal temporal convolution (left pad
-    // KT-1, no future-frame leakage) followed by SiLU + a pointwise 1x1 conv.
-    InLayer := NN.AddLayer( TNNetInput.Create(T, 1, Clat) );
+    // temporal sequence: time rides the X axis, cells ride the Y axis (one
+    // TNNetCausalConv1D row each) and the C channels ride the Depth axis --
+    // the diffusers CogVideoXCausalConv3d depth-axis causal temporal conv (left
+    // pad KT-1, no future-frame leakage), then SiLU + a pointwise 1x1 conv.
+    InLayer := NN.AddLayer( TNNetInput.Create(T, BlockCells, Clat) );
     TConv := NN.AddLayer(
       TNNetCausalConv1D.Create(Clat, KT, {SuppressBias=}0).SetTrainable(pTrainable) );
     ActLayer := NN.AddLayer( TNNetSiLU.Create() );
@@ -93645,35 +93645,47 @@ end;
 procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXConfig;
   Latent: TNNetVolume; DecodedOut: TNNetVolume);
 var
-  T, HW, Clat, Vout, cell: integer;
-  HWM1: integer;
-  latBase, doBase: integer;
-  CellIn, LastOut: TNNetVolume;
+  T, HW, Clat, Vout, BlockCells, FirstCell, CellCount: integer;
+  CellInFloats, CellOutFloats: integer;
+  BlockIn, LastOut: TNNetVolume;
 begin
   T := Config.NumFrames;
   HW := Config.GridHeight * Config.GridWidth;
   Clat := Config.VaeLatentChannels;
   Vout := Config.VaeOutChannels;
-  HWM1 := HW - 1;
+  BlockCells := VaeNet.Layers[0].Output.SizeY;
   // Latent is (T, HW, Clat) channel-major; DecodedOut becomes (T, HW, Vout).
   DecodedOut.ReSize(T, HW, Vout);
-  CellIn := TNNetVolume.Create(T, 1, Clat);
+  if BlockCells = HW then
+  begin
+    // The whole frame fits one block: Latent already is the net input.
+    VaeNet.Compute(Latent);
+    DecodedOut.Copy(VaeNet.GetLastLayer().Output);
+    exit;
+  end;
+  // Cells are rows of (T, Clat) floats, so a run of cells is one contiguous
+  // Move in both volumes (App. C). A short last block zero-fills its tail rows.
+  CellInFloats := T * Clat;
+  CellOutFloats := T * Vout;
+  BlockIn := TNNetVolume.Create(T, BlockCells, Clat);
   try
-    for cell := 0 to HWM1 do
+    FirstCell := 0;
+    while FirstCell < HW do
     begin
-      // Gather this cell's temporal column (T frames, Clat channels). A cell's
-      // T frames are one contiguous run in both volumes - Latent is (T, HW, C)
-      // so its raw offset is (cell*T + ti)*C - hence a single Move (App. C).
-      latBase := Latent.GetRawPos(0, cell, 0);
-      Move(Latent.FData[latBase], CellIn.FData[0], T * Clat * csNeuralFloatSize);
-      VaeNet.Compute(CellIn);
+      CellCount := Min(BlockCells, HW - FirstCell);
+      Move(Latent.FData[FirstCell * CellInFloats], BlockIn.FData[0],
+        CellCount * CellInFloats * csNeuralFloatSize);
+      if CellCount < BlockCells then
+        FillChar(BlockIn.FData[CellCount * CellInFloats],
+          (BlockCells - CellCount) * CellInFloats * csNeuralFloatSize, 0);
+      VaeNet.Compute(BlockIn);
       LastOut := VaeNet.GetLastLayer().Output;
-      doBase := DecodedOut.GetRawPos(0, cell, 0);
-      Move(LastOut.FData[0], DecodedOut.FData[doBase],
-        T * Vout * csNeuralFloatSize);
+      Move(LastOut.FData[0], DecodedOut.FData[FirstCell * CellOutFloats],
+        CellCount * CellOutFloats * csNeuralFloatSize);
+      Inc(FirstCell, BlockCells);
     end;
   finally
-    CellIn.Free;
+    BlockIn.Free;
   end;
 end;
 

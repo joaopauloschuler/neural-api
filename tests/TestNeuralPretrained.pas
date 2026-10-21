@@ -43832,16 +43832,16 @@ end;
 
 procedure TTestNeuralPretrained.TestCogVideoXParity;
 var
-  NN, VaeNN: TNNet;
+  NN, VaeNN, VaeCellNN, VaeBlockNN: TNNet;
   Config: TCogVideoXConfig;
-  Latent, TextStates, Decoded, VaeLatent: TNNetVolume;
+  Latent, TextStates, Decoded, VaeLatent, DecodedPath: TNNetVolume;
   RefRoot: TJSONData;
   RefJson: TStringList;
   DenArr, VaeArr: TJSONArray;
   CaseObj: TJSONObject;
   LatArr, TextArr, EpsArr, VLatArr, DecArr: TJSONArray;
   LV, T, GH, GW, CaseCnt, idx, i, ft, hh, ww, c: integer;
-  tval, RefVal, GotVal, Diff, MaxDiff: double;
+  tval, RefVal, GotVal, Diff, MaxDiff, PathDiff: double;
 begin
   RandSeed := 424242;
   Config := ReadCogVideoXConfigFromJSONFile(
@@ -43852,6 +43852,16 @@ begin
     FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
   VaeNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
     FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
+  // One cell per forward (the per-cell semantics) and a 3-cell block that
+  // leaves a short last block on the 2x2 grid.
+  VaeCellNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true,
+    {MaxCellsPerForward=}1);
+  VaeBlockNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true,
+    {MaxCellsPerForward=}3);
+  DecodedPath := TNNetVolume.Create;
+  PathDiff := 0;
   RefJson := TStringList.Create;
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
@@ -43914,6 +43924,12 @@ begin
               Inc(idx);
             end;
       DecodeCogVideoXVae(VaeNN, Config, VaeLatent, Decoded);
+      AssertEquals('whole-frame VAE net takes every cell in one forward',
+        GH * GW, VaeNN.Layers[0].Output.SizeY);
+      DecodeCogVideoXVae(VaeCellNN, Config, VaeLatent, DecodedPath);
+      PathDiff := Max(PathDiff, Decoded.SumDiff(DecodedPath));
+      DecodeCogVideoXVae(VaeBlockNN, Config, VaeLatent, DecodedPath);
+      PathDiff := Max(PathDiff, Decoded.SumDiff(DecodedPath));
       idx := 0;
       for ft := 0 to T - 1 do
         for hh := 0 to GH - 1 do
@@ -43929,7 +43945,12 @@ begin
     end;
     AssertTrue('CogVideoX denoiser+VAE: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+    AssertTrue('CogVideoX VAE whole-frame vs per-cell/block paths: sum |diff| = ' +
+      FloatToStr(PathDiff) + ' must be < 1e-5', PathDiff < 1e-5);
   finally
+    VaeCellNN.Free;
+    VaeBlockNN.Free;
+    DecodedPath.Free;
     RefRoot.Free;
     Latent.Free;
     TextStates.Free;
