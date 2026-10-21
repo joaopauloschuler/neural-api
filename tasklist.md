@@ -627,9 +627,8 @@ rather than acted on.
         the presets' LayerNorm/bias flags come from the official options
         yml, and the builder rejects a preset that disagrees with the
         checkpoint).
-  - [X] Dual-pixel defocus in the example: `--left/--right` (+ `--task
-        dual-pixel`), `RestormerPackDualPixel`, tiled/OpenCL path shared;
-        `TestRestormerDualPixelPackedParity`, `TestRestormerPackDualPixelRejects`.
+  - [ ] Dual-pixel defocus follow-ups (examples/Restormer `--left/--right` +
+        `RestormerPackDualPixel`, cee1d880):
     - [ ] 16-bit PNG precision: `LoadImageIntoVolume` keeps the high 8 bits
           (`shr 8`) and the example writes 8-bit output; the official script
           reads /65535 and writes 16-bit PNG.
@@ -647,8 +646,8 @@ rather than acted on.
           each successive block; v1 refines from the SAME [frame0|frame1] input at full
           resolution. Wire the scale schedule + warped-frame re-feeding and verify
           against an exported hzwer/Practical-RIFE checkpoint.
-  - [X] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
-        schedule (RIFE's timestep encoding + recursion).
+  - [ ] Timestep-plane follow-up (arbitrary t and the recursive Nx schedule,
+        7322d80d):
     - [ ] Verify the timestep-plane path on a real Practical-RIFE v4 checkpoint
           (needs the multi-scale item above; v4 also feeds t to every refining
           block alongside the warped frames, which v1 does not re-feed).
@@ -1476,10 +1475,9 @@ rather than acted on.
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
 
-- [~] Stable Diffusion img2img + inpainting pipelines (VAE encoder
-      BuildVaeEncoderFromSafeTensors, examples/ImageToImage SDEdit loop and blended
-      SDUNetDenoiseInpaint / examples/DiffusionInpainting are in place).
-      STILL OPEN: (1) the non-deterministic VAE reparameterize head
+- [ ] Stable Diffusion img2img + inpainting follow-ups (on top of
+      BuildVaeEncoderFromSafeTensors, examples/ImageToImage and
+      SDUNetDenoiseInpaint / examples/DiffusionInpainting): (1) the non-deterministic VAE reparameterize head
       (mean+exp(0.5*logvar)*noise); (2) the 9-channel inpaint-specialized UNet
       (conv_in widened to 4 latent + 1 mask + 4 masked-latent) importer support;
       (3) a fixed-seed img2img latent trajectory matching diffusers
@@ -1520,8 +1518,8 @@ rather than acted on.
       regnet_y SE gate, NO new leaf layers; pico parity
       `TestRegNet{Config,XImageClassification,YImageClassification}Parity` < 1e-4
       vs a REAL float64 HF RegNetForImageClassification):
-  - [ ] real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040 needs
-        the HF image-processor preprocessing path).
+  - [ ] real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040)
+        through `ReadImagePreprocessConfig` + `PreprocessImageForVisionModel`.
   - [ ] timm naming variant.
   - [ ] downsample-in-first-stage=true real configs (code handles it, untested
         on a real ckpt).
@@ -1580,9 +1578,8 @@ rather than acted on.
         `TNNetFlowMatchEulerScheduler.SetSigmas` (shift_terminal stretch
         divides 0/0; diffusers yields NaN). One-shot too.
   Phase B — speed:
-  - [ ] B1 follow-ups. B1 itself (OpenCL for the transformer step pass, int4 and
-        int8 on the shared tiled OpenCL kernels; text encoder on the CPU) landed as
-        tasks B1a-B1g (88aad8ca..52e1d2c7), including `examples/QwenImage --gpu`.
+  - [ ] B1 follow-ups (B1 = OpenCL transformer step pass, int4 and int8 on the
+        shared tiled OpenCL kernels, 88aad8ca..52e1d2c7, `examples/QwenImage --gpu`).
         First GPU run (user, 2026-09-30, NVIDIA L4, tip dd2c2971, before B1d):
         256x256 --int4, 40 steps: 2.2 s/step (CPU int4 16.4 s/step), denoise
         91.7 s; load transformer 240.3 s (CPU int4 load 148 s); load text
@@ -1648,11 +1645,8 @@ rather than acted on.
           also overflows on the host (`TVolume.ReSize` integer size;
           `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
           resident, so the VAE has ~10-14 GB on a 24 GB L4.
-          - [X] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
-                OpenCL (-17% of decode FLOPs); CPU path unchanged. Done: the
-                implicit GEMM folds a single-reader TNNetDeMaxPool (which then
-                skips its forward); 1024x1024 untiled 17.0 -> 14.2 TFLOP
-                (estimate). GPU timing on the L4 still open.
+          - [ ] B2f5 follow-ups (the nearest-2x + 3x3 OpenCL fold, c42915c0):
+                - [ ] GPU timing of the fold on the L4.
                 - [ ] B2f5 follow-up: the "single reader" test is
                       `GetDepartingBranchesCnt() = 1`; a layer that reads the
                       TNNetDeMaxPool output without registering as a branch would
@@ -1666,11 +1660,8 @@ rather than acted on.
           Side note: `FInputBufferBs` (READ_ONLY) is written by cai_im2col and
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
-  - [X] B3. Optional guidance (negative prompt) with its own prefix cache.
-        `TQwenImage21Pipeline.GuidanceScale` / `SetNegativePromptEmbeds` /
-        `AdaptiveProjectedGuidance` (+ `ApgOnVelocity`), one prefix cache per
-        prompt (`TQwenImage21Transformer.ActivePrefixCache`); examples/QwenImage
-        `--negative-prompt`, `--guidance-scale`, `--apg`, `--apg-velocity`.
+  - [ ] B3 follow-up (negative-prompt guidance, 90e08744: examples/QwenImage
+        `--negative-prompt`, `--guidance-scale`, `--apg`, `--apg-velocity`):
     - [ ] Real-checkpoint quality check on the GPU box: same seed, scale 1
           vs 4 with a negative prompt, CFG vs `--apg 0,-0.5,15` (x0 and
           `--apg-velocity`); record the step time (two passes) and the images
@@ -1762,16 +1753,8 @@ rather than acted on.
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
       `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
       trained for that latent space (or a cheap latent->RGB linear projection).
-- [ ] Real-ESRGAN: the checks still open.
-      Done: shape-inferred `TRRDBNetConfig` (`InferRRDBNetConfigFromTensors` /
-      `LoadRRDBNetConfig`, any key prefix such as `params_ema.`), the x2plus/x1
-      `TNNetSpaceToDepth` pixel-unshuffle stem, width <> height, and tiled upscale
-      (`RRDBNetTileConfig` + `RRDBNetUpscale` on `TiledNetCompute`, now shared
-      with `TiledVaeDecode`). examples/RealESRGANUpscale takes `--model --input
-      --output --tile --tile-pad --tile-overlap --gpu`. examples/QwenImage
-      `--upscale FILE` / `--upscale-tile N` / REPL `/upscale FILE|off` run the
-      shared `TRRDBNetUpscaler` (both examples call it) after the VAE decode.
-      Left:
+- [ ] Real-ESRGAN (`TRRDBNetUpscaler`, examples/RealESRGANUpscale, QwenImage
+      `--upscale`) open checks:
       (1) memory: on the CPU path a tile holds ~2.7 MB per net-input pixel
       (x4plus layout, measured), almost all of it each convolution's own
       FInputCopy + FInputPrepared (im2col), which liveness output sharing does
@@ -1948,37 +1931,17 @@ rather than acted on.
         (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
         and a reversed velocity sign; the gain is small (the loop is already one
         `MulAdd` per step).
-- [ ] Second-order multistep sampler for the flow-matching pipelines (Qwen-Image,
-      later SD3/FLUX/Wan). Done: `TNNetFlowMatchEulerScheduler.Sampler :=
-      fsDPMSolverPP2M` (diffusers `DPMSolverMultistepScheduler(use_flow_sigmas=True,
-      prediction_type="flow_prediction", solver_order=2,
-      final_sigmas_type="zero")` on the scheduler's own sigma list), tests
-      against a diffusers trajectory oracle, and examples/QwenImage
-      `--sampler euler|dpm2m` (default euler).
+- [ ] Flow-matching sampler follow-ups (`fsDPMSolverPP2M` + examples/QwenImage
+      `--sampler euler|dpm2m`, b81a2760):
       - [ ] User GPU-box quality check of dpm2m at 10-12 steps against euler at
             the current default count (18).
       - [ ] Optional: `UniPCMultistepScheduler(use_flow_sigmas=True)` (the Wan
             default) on the same sigma list.
-- [ ] Adaptive Projected Guidance (APG, Sadat et al., ICLR 2025, "Eliminating
-      Oversaturation and Artifacts of High Guidance Scales in Diffusion Models"),
-      ported from diffusers `guiders/adaptive_projected_guidance.py`
-      (`normalized_guidance` + `MomentumBuffer`, 0.41.0.dev0 in the ~/x venv).
-      Today the diffusion loops have only `TNNetDiffusionScheduler.ApplyCFG`
-      (plain mix and the Lin et al. guidance-rescale overload); high guidance
-      scales oversaturate the image, and APG fixes that at the same cost (two
-      dot products and a few `MulAdd` passes over the latent per step).
-      Math per step, all reductions over the whole volume:
-      diff := cond - uncond; with momentum m: avg := diff + m * avg, diff := avg
-      (the paper uses a NEGATIVE m, e.g. -0.5); with norm threshold r > 0:
-      diff := diff * min(1, r / ||diff||); then u := cond / ||cond||,
-      par := (diff . u) * u, orth := diff - par,
-      Dst := uncond + W * (orth + eta * par) (diffusers default; the
-      `use_original_formulation` variant adds to cond instead).
-      Done: `TNNetAdaptiveProjectedGuidance` in neural/neuraldiffusion.pas
-      (15c5aca5) with tests, and `--apg` / `--apg-eps` in
-      examples/LatentTextToImage and examples/ConditionalDiffusion; QwenImage
-      B3 uses it (`--apg`). Later consumers: the open CFG items of the
-      CogVideoX TextToVideo loop and the Stable Diffusion pipeline.
+- [ ] Adaptive Projected Guidance follow-ups (`TNNetAdaptiveProjectedGuidance` in
+      neural/neuraldiffusion.pas, 15c5aca5; `--apg` in examples/LatentTextToImage,
+      examples/ConditionalDiffusion and examples/QwenImage). Later consumers: the
+      open CFG items of the CogVideoX TextToVideo loop and the Stable Diffusion
+      pipeline.
       - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
             approval for a new Python tool.
 - [ ] Perturbed-Attention Guidance (PAG, Ahn et al. 2024, arXiv:2403.17377) and
@@ -2026,8 +1989,8 @@ rather than acted on.
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
 `TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
-training on OpenCL"). 53 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
-`ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
+training on OpenCL"). About 66 of the 513 `TNNet*` classes in `neuralnetwork.pas` (2026-10-21)
+declare a `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
 "does this layer evict a resident chain to RAM", not by FLOPs.
@@ -2207,8 +2170,8 @@ for itself even when it sits between two host layers.
 
 Derived by walking the class graph: a layer counts as covered if it declares
 `ComputeOpenCL`, sets an `FActivationOpcode`, dispatches to OpenCL inside its
-own `Compute`, or inherits one of those without overriding `Compute`. 310 of
-the 487 classes fail that test; the ones below are the subset the vision and
+own `Compute`, or inherits one of those without overriding `Compute`. Most
+classes fail that test; the ones below are the subset the vision and
 audio builders actually instantiate. Note the third case: a class that
 overrides `Compute` with no device branch silently loses its parent's kernel
 (`TNNetMaxPoolPortable` lost `TNNetMaxPool`'s that way; fixed in commit abd639f0).
@@ -2338,21 +2301,16 @@ cannot pay for its own transfer.
       estimate. Options: free/share it when the net is not trainable, or tile the
       im2col along Y. Library-wide; propose and wait for approval before coding.
 
-- [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
-      (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
-      importer). The single-cell `TNNetLSTMCell`/`TNNetGRUCell` (torch fused
-      `weight_ih`/`weight_hh` gate layout, full forward + exact BPTT) have landed.
-      The `AddBidirectionalLSTM`/`AddBidirectionalGRU` builders exist too.
-  - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up, GRU half and
-        the multi-layer fixture: the LSTM half exists (`CellsReadInputWidth`
-        builds projection-free `TNNetLSTMCell.Create(Hidden)` cells that
-        `LoadTorchLSTMInto` loads), but `AddBidirectionalRecurrentStack` still
-        inserts a learned `TNNetPointwiseConvLinear` projection on every
-        incoming Depth≠Hidden feed for GRU cells, which torch nn.GRU does not
-        have, so `LoadTorchGRUInto` rejects those stacks. Give `TNNetGRUCell`
-        the same any-input-width form, then add a 2-layer bidirectional
-        pico-oracle parity fixture for LSTM and GRU (the generator already
-        supports the shape — `tools/torch_rnn_tiny_fixture.py`).
+- [ ] Faithful stacked-bidirectional torch import (`LoadTorchGRUInto`), GRU half
+      and the multi-layer fixture: the LSTM half exists (`CellsReadInputWidth`
+      builds projection-free `TNNetLSTMCell.Create(Hidden)` cells that
+      `LoadTorchLSTMInto` loads), but `AddBidirectionalRecurrentStack` still
+      inserts a learned `TNNetPointwiseConvLinear` projection on every
+      incoming Depth≠Hidden feed for GRU cells, which torch nn.GRU does not
+      have, so `LoadTorchGRUInto` rejects those stacks. Give `TNNetGRUCell`
+      the same any-input-width form, then add a 2-layer bidirectional
+      pico-oracle parity fixture for LSTM and GRU (the generator already
+      supports the shape — `tools/torch_rnn_tiny_fixture.py`).
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
@@ -2497,8 +2455,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] TNNetMaxPoolWithPosition correctness check — the auxiliary "position
       channels" should round-trip through TNNetDeMaxPool to exactly
       reconstruct the upsample pattern.
-- [ ] TNNetAddPositionalEmbedding scale-factor backward check on
-      rectangular (X≠Y) shapes (square inputs can hide off-by-one bugs).
 - [ ] Gradient-flow regression test — train a 12-layer ReLU MLP one epoch
       with and without a single TNNetLayerNorm/RMSNorm at the midpoint;
       assert per-layer gradient norms with the norm layer are uniformly
@@ -2560,27 +2516,16 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 
 ## Vision / generative & accelerator batch 2026-06-27b
 
-- [ ] NF4 (bitsandbytes 4-bit) dequantizing import path. PARTIALLY LANDED
-      (commit 90b6c931): the `neural/neuralnf4.pas` dequant unit ships — the exact
-      16-level NF4 codebook (`NF4Code`) + `DequantizeNF4(Codes, Absmax, N, Dest,
-      BlockSize=64)` with HIGH-nibble-first packing and per-block FP32 absmax
-      (`dequant[i] = NF4_CODE[nibble] * absmax[i div BlockSize]`); single-quant
-      only. Cross-checked to <1e-5 against a pure-numpy reference
-      (`tools/make_pico_nf4_fixture.py` → `tests/fixtures/pico_nf4.json`;
-      `bitsandbytes` is NOT importable under `venv x` — CPU torch, no CUDA bnb
-      build) via `TestNF4DequantFixtureParity` + `TestNF4DequantHandBlock`.
-      OPEN FOLLOW-UPS:
-  - [ ] Double-quantized absmax: handle `*.nested_absmax` / `*.nested_quant_map`
-        / `*.quant_state.*` (the secondary int8 quant + nested absmax + offset).
-        DEFERRED. `LoadNF4QuantizedTensorFlat` now RAISES a clear
-        `EPretrainedImportError` on these nested/double-quant markers (and on a
-        non-FP32 absmax sibling) rather than feeding quantized absmax into
-        DequantizeNF4 — no silent garbage path. `TestNF4ImporterRejectsDoubleQuant`
-        covers the rejection (fixture `pico_nf4_doublequant.safetensors`). To
-        finish: expand the int8-quantized absmax (nested absmax + offset +
-        quant_map) to FP32 upstream, then drop the guard. A real `bnb-4bit`
-        Llama/Qwen slicer fixture is RAM/network-gated; today's parity is the
-        random pico numpy oracle only.
+- [ ] NF4 double-quantized absmax (`neural/neuralnf4.pas` dequant, 90b6c931):
+      handle `*.nested_absmax` / `*.nested_quant_map` / `*.quant_state.*` (the
+      secondary int8 quant + nested absmax + offset). `LoadNF4QuantizedTensorFlat`
+      RAISES a clear `EPretrainedImportError` on these nested/double-quant markers
+      (and on a non-FP32 absmax sibling); `TestNF4ImporterRejectsDoubleQuant`
+      covers the rejection (fixture `pico_nf4_doublequant.safetensors`). To
+      finish: expand the int8-quantized absmax (nested absmax + offset +
+      quant_map) to FP32 upstream, then drop the guard. A real `bnb-4bit`
+      Llama/Qwen slicer fixture is RAM/network-gated; today's parity is the
+      random pico numpy oracle only.
 
 ## Tiled VAE decode follow-ups (from 2e28a44b)
 
