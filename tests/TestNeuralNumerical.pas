@@ -894,6 +894,8 @@ type
     // conformer relative-position (Q.P bias in the CPU gap). Each reuses the two
     // dense device matmuls and injects its variant term between them.
     procedure CosineSimilarityAttentionOpenCLParity;
+    // A device forward followed by a backward must give the CPU gradients.
+    procedure CosineSimilarityAttentionOpenCLBackward;
     procedure DisentangledAttentionOpenCLParity;
     procedure ConformerRelPosAttentionOpenCLParity;
     // OpenCL input-projection GEMM forward offload parity (vs CPU/AVX) for the
@@ -81275,6 +81277,114 @@ begin
     OutCPU.Free;
     XData.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The device forward of TNNetCosineSimilarityAttention (and its QK-Norm
+// subclass) must leave the backward the same normalized rows as the CPU
+// forward: the OpenCL net first runs a CPU forward on OTHER data so any row
+// the device forward fails to refresh is stale, then device forward +
+// backward, compared against a CPU-only net on the same weights and target.
+procedure TTestNeuralNumerical.CosineSimilarityAttentionOpenCLBackward;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40;
+var
+  NN, NNCPU: TNNet;
+  XData, XOther, Desired: TNNetVolume;
+  Attn, AttnCPU: TNNetCosineSimilarityAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, i: integer;
+  Diff, MaxDiff, ScaleGradDiff: TNeuralFloat;
+
+  function NewAttn(): TNNetCosineSimilarityAttention;
+  begin
+    if CasePos = 0
+      then Result := TNNetCosineSimilarityAttention.Create(Dk, true, 8.0)
+      else Result := TNNetQKNormAttention.Create(Dk, false);
+  end;
+
+  procedure BuildNet(var ANet: TNNet; out AAttn: TNNetCosineSimilarityAttention);
+  begin
+    ANet := TNNet.Create();
+    ANet.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    AAttn := NewAttn();
+    ANet.AddLayer(AAttn);
+    ANet.SetLearningRate(1.0, 0.0);
+    ANet.SetBatchUpdate(true);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := nil;
+    NNCPU := nil;
+    XData := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    XOther := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+    try
+      BuildNet(NN, Attn);
+      BuildNet(NNCPU, AttnCPU);
+      for i := 0 to XData.Size - 1 do
+      begin
+        XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+        XOther.Raw[i] := 0.7 * Cos(i * 0.17 + 1.0) - 0.1 * Sin(i * 0.05);
+      end;
+      for i := 0 to Desired.Size - 1 do
+        Desired.Raw[i] := 0.4 * Sin(i * 0.21 + 0.5);
+
+      NNCPU.Compute(XData);
+      NNCPU.Layers[0].OutputError.Fill(0);
+      NNCPU.ClearDeltas();
+      NNCPU.Backpropagate(Desired);
+
+      NN.Compute(XOther);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      AssertTrue('cosine device path armed', Attn.ShouldOpenCL);
+      NN.Compute(XData);
+      AssertEquals('the forward ran on OpenCL', 1, Attn.ForwardGPUCnt);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.ClearDeltas();
+      NN.Backpropagate(Desired);
+
+      MaxDiff := 0;
+      for i := 0 to XData.Size - 1 do
+      begin
+        Diff := Abs(NNCPU.Layers[0].OutputError.Raw[i] -
+          NN.Layers[0].OutputError.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      ScaleGradDiff := 0;
+      if Attn.LearnableScale then
+        ScaleGradDiff := Abs(AttnCPU.Neurons[0].Delta.Raw[0] -
+          Attn.Neurons[0].Delta.Raw[0]);
+      WriteLn('  CosineSimilarityAttention OpenCL backward case ', CasePos,
+        ': max|input-grad diff|=', MaxDiff:0:9, ' |scale-grad diff|=',
+        ScaleGradDiff:0:9);
+      AssertTrue('cosine OpenCL forward + backward input-grad vs CPU: max ' +
+        '|diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('cosine OpenCL forward + backward scale-grad vs CPU: |diff| = ' +
+        FloatToStr(ScaleGradDiff) + ' must be < 1e-3', ScaleGradDiff < 1e-3);
+    finally
+      Desired.Free;
+      XOther.Free;
+      XData.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
   end;
 end;
 {$ELSE}

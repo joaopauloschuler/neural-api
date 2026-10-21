@@ -7611,6 +7611,7 @@ type
     FInvKNorm: TNNetVolume; // 1/||K[j]|| per key row, [SizeX,1,1]
     // Persistent, lazily-sized backprop gradient accumulators (rule #17).
     FgQn, FgKn: TNNetVolume; // grads w.r.t normalized query/key rows, [SeqLen,1,d_k]
+    FQKNormStale: boolean; // the device forward left FQNorm/FKNorm unfilled
     function CurrentScale(): TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     {$IFDEF OpenCL}
@@ -49332,6 +49333,7 @@ begin
   // 1) Precompute the L2-normalized query and key rows (over the d_k feature
   // dimension) plus their reciprocal norms. score uses qn.kn instead of q.k.
   NormalizeQKRows(FQNorm, FKNorm, FInvQNorm, FInvKNorm, FEps);
+  FQKNormStale := false;
   // 2) For each query row i: cosine scores, softmax, weighted sum of V.
   TwoFDk := 2 * FDk;
   RowStride := Prev.GetRawPos(1, 0);
@@ -49505,6 +49507,8 @@ begin
   FDotCL.ReallocateBuffersIfRequired(FVRowBuf, FAttn, SeqLen);
   FDotCL.Compute(FVRowBuf, FAttn, {ActFN}0, {NewVAs}true, {NewVBs}true);
   FDotCL.FinishAndLoadResult(FOutput, 0);
+  // Only a backward reads FQNorm/FKNorm: it rebuilds them on demand.
+  FQKNormStale := true;
 
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -49528,6 +49532,11 @@ begin
     // Persistent lazily-sized accumulators (rule #17): resize once, zero per call.
     if FgQn.Size <> SeqLen * FDk then FgQn.ReSize(SeqLen, 1, FDk);
     if FgKn.Size <> SeqLen * FDk then FgKn.ReSize(SeqLen, 1, FDk);
+    if FQKNormStale then
+    begin
+      NormalizeQKRows(FQNorm, FKNorm, FInvQNorm, FInvKNorm, FEps);
+      FQKNormStale := false;
+    end;
     LearnScale := FLearnableScale and (FNeurons.Count > 0) and
       (FNeurons[0].FWeights.Size = 1);
     GradScale := BackpropagateCosineScores(FQNorm, FKNorm, FInvQNorm,
