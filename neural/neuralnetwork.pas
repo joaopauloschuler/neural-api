@@ -6009,27 +6009,43 @@ type
     function BufferBytes(): int64; override;
   end;
 
-  /// OpenCL forward helper for TNNetDotProducts: cai_row_dot_products contracts
-  // two row-major sources into one resident result. Coded by Claude (AI).
-  TNNetDotProductsCL = class(TNNetKernelCL)
-  private
+  /// Base of the OpenCL forward helpers that read two sources (A and B) into one
+  // resident result buffer. Coded by Claude (AI).
+  TNNetTwoSourceCL = class(TNNetKernelCL)
+  protected
     // Persistent buffers: the result (sized by ReserveResult) and the grow-only
     // uploads of a host-only A or B source.
     FBufA, FBufB, FBufY: cl_mem;
     FCapA, FCapB, FCapY: csize_t;
   public
-    constructor Create(NN: TNNet);
     destructor Destroy(); override;
     procedure ReserveResult(Y: TNNetVolume);
     // Upload buffer for a host-only A (pIsB=false) or B source of Source's size.
     function UploadBuffer(Source: TNNetVolume; pIsB: boolean): cl_mem;
-    // ResultBuffer[b*NumAs + a] := A row a . B row b; zero where a > b when NoForward.
-    procedure Contract(BufA, BufB: cl_mem; NumAs, NumBs, VectorSize: integer;
-      NoForward: boolean);
     function ResultBytes(): csize_t;
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
     function BufferBytes(): int64; override;
+  end;
+
+  /// OpenCL forward helper for TNNetDotProducts: cai_row_dot_products contracts
+  // two row-major sources into one resident result. Coded by Claude (AI).
+  TNNetDotProductsCL = class(TNNetTwoSourceCL)
+  public
+    constructor Create(NN: TNNet);
+    // ResultBuffer[b*NumAs + a] := A row a . B row b; zero where a > b when NoForward.
+    procedure Contract(BufA, BufB: cl_mem; NumAs, NumBs, VectorSize: integer;
+      NoForward: boolean);
+  end;
+
+  /// OpenCL forward helper for TNNetAttentiveStatsPooling: cai_attentive_stats_pooling,
+  // one work-group per channel. Source A is the features, B the logits. Coded by Claude (AI).
+  TNNetAttentiveStatsPoolingCL = class(TNNetTwoSourceCL)
+  public
+    constructor Create(NN: TNNet);
+    // ResultBuffer := [mu (Channels) | sigma (Channels)] over SeqLen frames.
+    procedure Pool(BufFeatures, BufLogits: cl_mem; SeqLen, Channels: integer;
+      Eps: TNeuralFloat);
   end;
 
   /// OpenCL forward helper for TNNetConvGRUCell: the two elementwise steps around
@@ -7433,6 +7449,12 @@ type
       FMu: TNNetVolume;        // cached weighted mean per channel, (1,1,C)
       FSigma: TNNetVolume;     // cached weighted std per channel, (1,1,C)
       FdABuf: array of TNeuralFloat; // persistent, lazily-sized backprop scratch (rule #17)
+      {$IFDEF OpenCL}
+      FPoolingCL: TNNetAttentiveStatsPoolingCL;
+      // Binds (or uploads) both sources and leaves [mu | sigma] in OpenCL memory.
+      // The caller checks WillOpenCL first.
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(LogitSource: TNNetLayer; pEps: TNeuralFloat = 1e-12); reintroduce; overload;
@@ -7441,6 +7463,16 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure AppendInputLayers(pList: TList); override;
+      {$IFDEF OpenCL}
+      // Inference only: Backpropagate and AttentionWeights read the host caches,
+      // which the OpenCL forward does not write.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
       property AttentionWeights: TNNetVolume read FA;
       property Channels: integer read FChannels;
   end;
@@ -40774,6 +40806,9 @@ end;
 
 destructor TNNetAttentiveStatsPooling.Destroy();
 begin
+  {$IFDEF OpenCL}
+  FPoolingCL.Free;
+  {$ENDIF}
   FA.Free;
   FMu.Free;
   FSigma.Free;
@@ -40820,8 +40855,18 @@ var
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
+  // Runs BEFORE any ForceOutputOnRAM because those downloads are what it avoids.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FLogitLayer) then FLogitLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
   {$ENDIF}
   H := FPrevLayer.FOutput;
   E := FLogitLayer.FOutput;
@@ -42253,14 +42298,9 @@ begin
   FKernel.RunKernel(k, Y.Size);
 end;
 
-{ TNNetDotProductsCL }
+{ TNNetTwoSourceCL }
 
-constructor TNNetDotProductsCL.Create(NN: TNNet);
-begin
-  inherited Create(NN, 'cai_row_dot_products');
-end;
-
-destructor TNNetDotProductsCL.Destroy();
+destructor TNNetTwoSourceCL.Destroy();
 begin
   if Assigned(FBufA) then clReleaseMemObject(FBufA);
   if Assigned(FBufB) then clReleaseMemObject(FBufB);
@@ -42268,12 +42308,12 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetDotProductsCL.ReserveResult(Y: TNNetVolume);
+procedure TNNetTwoSourceCL.ReserveResult(Y: TNNetVolume);
 begin
   FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
 end;
 
-function TNNetDotProductsCL.UploadBuffer(Source: TNNetVolume; pIsB: boolean): cl_mem;
+function TNNetTwoSourceCL.UploadBuffer(Source: TNNetVolume; pIsB: boolean): cl_mem;
 var
   NeededBytes: csize_t;
 begin
@@ -42281,6 +42321,34 @@ begin
   if pIsB
     then Result := FKernel.EnsureBuffer(FBufB, FCapB, CL_MEM_READ_WRITE, NeededBytes)
     else Result := FKernel.EnsureBuffer(FBufA, FCapA, CL_MEM_READ_WRITE, NeededBytes);
+end;
+
+function TNNetTwoSourceCL.ResultBytes(): csize_t;
+begin
+  Result := FCapY;
+end;
+
+function TNNetTwoSourceCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetTwoSourceCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetTwoSourceCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufA) + OpenCLMemBytes(FBufB) +
+    OpenCLMemBytes(FBufY);
+end;
+
+{ TNNetDotProductsCL }
+
+constructor TNNetDotProductsCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_row_dot_products');
 end;
 
 // cai_row_dot_products entry point k on Kernel's queue: BufDst[b*NumAs + a] :=
@@ -42312,25 +42380,35 @@ begin
     VectorSize, NoForward);
 end;
 
-function TNNetDotProductsCL.ResultBytes(): csize_t;
+{ TNNetAttentiveStatsPoolingCL }
+
+constructor TNNetAttentiveStatsPoolingCL.Create(NN: TNNet);
 begin
-  Result := FCapY;
+  inherited Create(NN, 'cai_attentive_stats_pooling');
 end;
 
-function TNNetDotProductsCL.ResultBuffer(): cl_mem;
+procedure TNNetAttentiveStatsPoolingCL.Pool(BufFeatures, BufLogits: cl_mem;
+  SeqLen, Channels: integer; Eps: TNeuralFloat);
+var
+  k: cl_kernel;
+  iSeqLen, iChannels: longint;
+  fEps: single;
+  LocalSize: csize_t;
 begin
-  Result := FBufY;
-end;
-
-function TNNetDotProductsCL.OutputKernel(): TNeuralKernel;
-begin
-  Result := FKernel;
-end;
-
-function TNNetDotProductsCL.BufferBytes(): int64;
-begin
-  Result := OpenCLMemBytes(FBufA) + OpenCLMemBytes(FBufB) +
-    OpenCLMemBytes(FBufY);
+  k := FKernel.Kernel;
+  iSeqLen := SeqLen;
+  iChannels := Channels;
+  fEps := Eps;
+  LocalSize := ReductionLocalSize(SeqLen);
+  clSetKernelArg(k, 0, csLongintSize, @iSeqLen);
+  clSetKernelArg(k, 1, csLongintSize, @iChannels);
+  clSetKernelArg(k, 2, csNeuralFloatSize, @fEps);
+  clSetKernelArg(k, 3, csCLMemSize, @BufFeatures);
+  clSetKernelArg(k, 4, csCLMemSize, @BufLogits);
+  clSetKernelArg(k, 5, csCLMemSize, @FBufY);
+  // __local scratch: max/exp sum, weighted sum, weighted sum of squares.
+  clSetKernelArg(k, 6, 3 * LocalSize * csNeuralFloatSize, nil);
+  FKernel.RunKernel2D(k, LocalSize * csize_t(Channels), 1, LocalSize, 1);
 end;
 
 { TNNetConvGRUCellCL }
@@ -148310,6 +148388,91 @@ begin
   inherited AppendInputLayers(pList);
   if Assigned(FLogitLayer) then pList.Add(FLogitLayer);
 end;
+
+{$IFDEF OpenCL}
+// No size verdict: an inference-only layer runs in OpenCL when forced, or when
+// either source is already resident (the other one is uploaded).
+function TNNetAttentiveStatsPooling.WillOpenCL(): boolean;
+var
+  Features, Logits: TNNetVolume;
+begin
+  Result := false;
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FPoolingCL)) then exit;
+  if (not Assigned(FPrevLayer)) or (not Assigned(FLogitLayer)) then exit;
+  // A source may have been resized since SetPrevLayer, so the shapes the kernel
+  // indexes are checked here.
+  Features := FPrevLayer.FOutput;
+  Logits := FLogitLayer.FOutput;
+  if (FChannels < 1) or (Features.Size <> Logits.Size) or
+     (Features.Depth <> FChannels) or (Features.SizeY <> 1) or
+     (FOutput.Size <> 2 * FChannels) or
+     (csize_t(FOutput.Size) * csNeuralFloatSize > FPoolingCL.ResultBytes()) then exit;
+  Result := FForceOpenCL or FPrevLayer.OutputBindableOnOpenCL() or
+    FLogitLayer.OutputBindableOnOpenCL();
+end;
+
+procedure TNNetAttentiveStatsPooling.ComputeOpenCL();
+var
+  OutputKernel: TNeuralKernel;
+  UploadFeatures, UploadLogits, BufferFeatures, BufferLogits: cl_mem;
+begin
+  OutputKernel := FPoolingCL.OutputKernel();
+  UploadFeatures := nil;
+  UploadLogits := nil;
+  if not FPrevLayer.OutputBindableOnOpenCL() then
+    UploadFeatures := FPoolingCL.UploadBuffer(FPrevLayer.FOutput, {pIsB=}false);
+  if not FLogitLayer.OutputBindableOnOpenCL() then
+    UploadLogits := FPoolingCL.UploadBuffer(FLogitLayer.FOutput, {pIsB=}true);
+  BufferFeatures := BindOrUploadOpenCLOperand(FPrevLayer, OutputKernel, UploadFeatures);
+  BufferLogits := BindOrUploadOpenCLOperand(FLogitLayer, OutputKernel, UploadLogits);
+  FPoolingCL.Pool(BufferFeatures, BufferLogits, FPrevLayer.FOutput.SizeX,
+    FChannels, FEps);
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetAttentiveStatsPooling.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FPoolingCL) then
+    FPoolingCL := TNNetAttentiveStatsPoolingCL.Create(FNN)
+  else if FPoolingCL.ResultBytes() < csize_t(FOutput.Size) * csNeuralFloatSize then
+    // Growing replaces the result buffer, and the output it held goes with it.
+    FOutputOnOpenCL := false;
+  FPoolingCL.ReserveResult(FOutput);
+end;
+
+procedure TNNetAttentiveStatsPooling.DisableOpenCL();
+begin
+  // FPoolingCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FPoolingCL);
+end;
+
+function TNNetAttentiveStatsPooling.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FPoolingCL) then Result := FPoolingCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetAttentiveStatsPooling.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FPoolingCL) then Result := FPoolingCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetAttentiveStatsPooling.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FPoolingCL) then
+    Result := Result + FPoolingCL.BufferBytes();
+end;
+{$ENDIF}
 
 procedure TNNetCrossWKV.AppendInputLayers(pList: TList);
 begin

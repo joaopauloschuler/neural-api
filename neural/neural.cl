@@ -3147,6 +3147,85 @@ __kernel void cai_meta_acon_table
   FTable[2 * FDepth + c] = cai_fused_act(BetaInput, 2);
 }
 
+// Attentive statistics pooling (TNNetAttentiveStatsPooling forward, ECAPA-TDNN).
+// FH (features) and FE (attention logits) are (FSeqLen, 1, FChannels) volumes,
+// element [t, c] at t*FChannels + c. Per channel c, with a = softmax_t(FE[., c]):
+//   FY[c]             = mu    = sum_t a[t] * h[t]
+//   FY[FChannels + c] = sigma = sqrt(max(sum_t a[t] * h[t]^2 - mu^2, 0) + FEps)
+// One work-group per channel (a power-of-two local size, FScratch = 3 *
+// get_local_size(0) floats of __local memory): lanes stride over time, then a
+// tree reduction combines the max, the exp sum and the two weighted sums.
+// Forward-only. Coded by Claude (AI).
+__kernel void cai_attentive_stats_pooling
+(
+  const int FSeqLen,
+  const int FChannels,
+  const float FEps,
+  __global const float* FH,
+  __global const float* FE,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int c = get_group_id(0);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __local float* SumH = FScratch + lsize;
+  __local float* SumHH = SumH + lsize;
+  int s;
+  float maxe = -1e30f;
+  for (int t = lid; t < FSeqLen; t += lsize) maxe = fmax(maxe, FE[t * FChannels + c]);
+  FScratch[lid] = maxe;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  maxe = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float sumExp = 0.0f;
+  float sumH = 0.0f;
+  float sumHH = 0.0f;
+  for (int t = lid; t < FSeqLen; t += lsize)
+  {
+    const int idx = t * FChannels + c;
+    // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+    const float e = cai_exp_floored(fmin(FE[idx] - maxe, 0.0f));
+    const float h = FH[idx];
+    const float eh = e * h;
+    sumExp += e;
+    sumH += eh;
+    sumHH = mad(eh, h, sumHH);
+  }
+  FScratch[lid] = sumExp;
+  SumH[lid] = sumH;
+  SumHH[lid] = sumHH;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s)
+    {
+      FScratch[lid] += FScratch[lid + s];
+      SumH[lid] += SumH[lid + s];
+      SumHH[lid] += SumHH[lid + s];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0)
+  {
+    // No fused multiply-add: m2 - mu^2 rounds both terms like the host, so a
+    // single frame gives a variance of exactly 0.
+    #pragma OPENCL FP_CONTRACT OFF
+    // The max element contributes exp(0) = 1, so the fallback mirrors a host guard only.
+    const float inv = 1.0f / ((FScratch[0] > 0.0f) ? FScratch[0] : 1.0f);
+    const float mu = SumH[0] * inv;
+    const float variance = fmax(SumHH[0] * inv - mu * mu, 0.0f);
+    FY[c] = mu;
+    FY[FChannels + c] = sqrt(variance + FEps);
+  }
+}
+
 // RoIAlign forward (TNNetRoIAlign, torchvision aligned=True). One work-item per
 // output (px,py,d) cell: the mean of FRatioX*FRatioY bilinear samples at the bin
 // sub-centers; out-of-bounds corners add 0. Raw layouts [(y*W + x)*Depth + d].

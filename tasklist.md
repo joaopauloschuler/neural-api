@@ -2215,10 +2215,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
       across groups if it shows up on the GPU box.
-- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
-      new kernel (per-channel softmax over time, then the two weighted moments)
-      reading two sources, the features and `FLogitLayer`. It runs once per
-      utterance and reduces T x C to 2C, so its host hop is one T x C download per source.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

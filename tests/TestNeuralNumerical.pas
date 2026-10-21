@@ -612,6 +612,9 @@ type
     // AddSingleHeadSelfAttention(NoForward=true): both TNNetDotProducts (masked
     // Q.K, unmasked ValueT.W) run in OpenCL, binding Q and K. Coded by Claude (AI).
     procedure TestDotProductsOpenCLParity;
+    // TNNetAttentiveStatsPooling on OpenCL vs the CPU for (T, C) = (1, 3), (7, 5)
+    // and (300, 6), one layer per source placement, plus a resident-output consumer.
+    procedure TestAttentiveStatsPoolingOpenCLParity;
     // Per-channel affine glue, ForceOpenCL off: TNNetInput -> ReLU -> ChannelMul
     // -> ChannelBias -> ReZero -> CellBias -> DeepConcat -> AvgChannel -> FiLM ->
     // AvgPool -> ReLU stays resident (sentinels, transfers, weight refresh).
@@ -71295,6 +71298,187 @@ begin
     OutCPU.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestAttentiveStatsPoolingOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  CaseCnt = 3;
+  PlacementCnt = 4;
+  SeqLens: array[0..CaseCnt - 1] of integer = (1, 7, 300);
+  ChannelCounts: array[0..CaseCnt - 1] of integer = (3, 5, 6);
+  PlacementNames: array[0..PlacementCnt - 1] of string =
+    ('both resident', 'logits on host', 'features on host', 'both on host');
+type
+  TCaseLayers = record
+    FeatureIn, LogitIn, FeatureAct, LogitAct, FeatureHost, LogitHost: TNNetLayer;
+    Pools: array[0..PlacementCnt - 1] of TNNetLayer;
+    Consumer: TNNetLayer;
+  end;
+var
+  NNCpu, NNGpu: TNNet;
+  CpuCases, GpuCases: array[0..CaseCnt - 1] of TCaseLayers;
+  FeatureData, LogitData: array[0..CaseCnt - 1] of TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, PlacementPos, ElementPos, SourceSentinels, SourceSentinelCnt,
+    PoolSentinels, PoolSentinelCnt, HostGpuForwards: integer;
+  Diff, MaxDiff, ConsumerDiff: TNeuralFloat;
+
+  // Per case: features and logits inputs, each feeding a resident and a
+  // host-side SiLU, one pooling layer per placement and a SiLU after the first.
+  procedure BuildNet(NN: TNNet; var Cases: array of TCaseLayers);
+  var
+    BuildPos: integer;
+  begin
+    for BuildPos := 0 to CaseCnt - 1 do
+      with Cases[BuildPos] do
+      begin
+        if BuildPos = 0
+          then FeatureIn := NN.AddLayer(TNNetInput.Create(SeqLens[BuildPos], 1,
+            ChannelCounts[BuildPos], 1))
+          else FeatureIn := NN.AddLayerAfter(TNNetInput.Create(SeqLens[BuildPos],
+            1, ChannelCounts[BuildPos], 1), 0);
+        LogitIn := NN.AddLayerAfter(TNNetInput.Create(SeqLens[BuildPos], 1,
+          ChannelCounts[BuildPos], 1), 0);
+        FeatureAct := NN.AddLayerAfter(TNNetSiLU.Create(), FeatureIn);
+        FeatureHost := NN.AddLayerAfter(TNNetSiLU.Create(), FeatureIn);
+        LogitAct := NN.AddLayerAfter(TNNetSiLU.Create(), LogitIn);
+        LogitHost := NN.AddLayerAfter(TNNetSiLU.Create(), LogitIn);
+        Pools[0] := NN.AddLayerAfter(
+          TNNetAttentiveStatsPooling.Create(LogitAct), FeatureAct);
+        Consumer := NN.AddLayerAfter(TNNetSiLU.Create(), Pools[0]);
+        Pools[1] := NN.AddLayerAfter(
+          TNNetAttentiveStatsPooling.Create(LogitHost), FeatureAct);
+        Pools[2] := NN.AddLayerAfter(
+          TNNetAttentiveStatsPooling.Create(LogitAct), FeatureHost);
+        Pools[3] := NN.AddLayerAfter(
+          TNNetAttentiveStatsPooling.Create(LogitHost), FeatureHost);
+      end;
+    NN.SetTrainable(False, False);
+  end;
+
+  procedure RunForward(NN: TNNet; var Cases: array of TCaseLayers);
+  var
+    RunPos: integer;
+  begin
+    for RunPos := 1 to CaseCnt - 1 do
+      Cases[RunPos].FeatureIn.Output.Copy(FeatureData[RunPos]);
+    for RunPos := 0 to CaseCnt - 1 do
+      Cases[RunPos].LogitIn.Output.Copy(LogitData[RunPos]);
+    NN.Compute(FeatureData[0]);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  for CasePos := 0 to CaseCnt - 1 do
+  begin
+    FeatureData[CasePos] := TNNetVolume.Create(SeqLens[CasePos], 1, ChannelCounts[CasePos]);
+    LogitData[CasePos] := TNNetVolume.Create(SeqLens[CasePos], 1, ChannelCounts[CasePos]);
+    // Wide logits make the softmax over time far from uniform.
+    for ElementPos := 0 to FeatureData[CasePos].Size - 1 do
+    begin
+      FeatureData[CasePos].Raw[ElementPos] := 3.0 * (Random - 0.5);
+      LogitData[CasePos].Raw[ElementPos] := 12.0 * (Random - 0.5);
+    end;
+  end;
+  try
+    BuildNet(NNCpu, CpuCases);
+    BuildNet(NNGpu, GpuCases);
+    RunForward(NNCpu, CpuCases);
+
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    for CasePos := 0 to CaseCnt - 1 do
+    begin
+      // Host-side sources: these SiLUs run on the CPU.
+      GpuCases[CasePos].FeatureHost.DisableOpenCL();
+      GpuCases[CasePos].LogitHost.DisableOpenCL();
+      GpuCases[CasePos].Pools[3].ForceOpenCL(True);
+    end;
+    RunForward(NNGpu, GpuCases);
+    // Parity cannot tell a bind from a download: a second forward must leave
+    // the host copies of the resident sources and of the consumed pool untouched.
+    for CasePos := 0 to CaseCnt - 1 do
+      with GpuCases[CasePos] do
+      begin
+        FeatureAct.Output.Fill(csSentinel);
+        LogitAct.Output.Fill(csSentinel);
+        Pools[0].Output.Fill(csSentinel);
+      end;
+    RunForward(NNGpu, GpuCases);
+    for CasePos := 0 to CaseCnt - 1 do
+      with GpuCases[CasePos] do
+      begin
+        SourceSentinels := 0;
+        SourceSentinelCnt := FeatureAct.Output.Size + LogitAct.Output.Size;
+        for ElementPos := 0 to FeatureAct.Output.Size - 1 do
+        begin
+          if FeatureAct.Output.Raw[ElementPos] = csSentinel then Inc(SourceSentinels);
+          if LogitAct.Output.Raw[ElementPos] = csSentinel then Inc(SourceSentinels);
+        end;
+        PoolSentinels := 0;
+        PoolSentinelCnt := Pools[0].Output.Size;
+        for ElementPos := 0 to Pools[0].Output.Size - 1 do
+          if Pools[0].Output.Raw[ElementPos] = csSentinel then Inc(PoolSentinels);
+        AssertTrue('case ' + IntToStr(CasePos) +
+          ': the pooled output must stay in OpenCL memory',
+          Pools[0].OutputBindableOnOpenCL());
+        for PlacementPos := 0 to PlacementCnt - 1 do
+        begin
+          Pools[PlacementPos].ForceOutputOnRAM();
+          MaxDiff := 0;
+          for ElementPos := 0 to CpuCases[CasePos].Pools[PlacementPos].Output.Size - 1 do
+          begin
+            Diff := Abs(CpuCases[CasePos].Pools[PlacementPos].Output.Raw[ElementPos] -
+              Pools[PlacementPos].Output.Raw[ElementPos]);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+          WriteLn('  TNNetAttentiveStatsPooling T=', SeqLens[CasePos], ' C=',
+            ChannelCounts[CasePos], ' ', PlacementNames[PlacementPos],
+            ': max|diff|=', MaxDiff:0:9, ' gpu forwards=',
+            Pools[PlacementPos].ForwardGPUCnt);
+          AssertEquals(PlacementNames[PlacementPos] +
+            ': both forwards must run on OpenCL', 2,
+            Pools[PlacementPos].ForwardGPUCnt);
+          AssertTrue(PlacementNames[PlacementPos] + ' OpenCL vs CPU: max |diff| = ' +
+            FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+        end;
+        Consumer.ForceOutputOnRAM();
+        ConsumerDiff := 0;
+        for ElementPos := 0 to Consumer.Output.Size - 1 do
+          ConsumerDiff := Max(ConsumerDiff, Abs(Consumer.Output.Raw[ElementPos] -
+            CpuCases[CasePos].Consumer.Output.Raw[ElementPos]));
+        AssertTrue('consumer OpenCL vs CPU: max |diff| = ' +
+          FloatToStr(ConsumerDiff) + ' must be < 1e-4', ConsumerDiff < 1e-4);
+        AssertEquals('resident sources must be read in OpenCL memory, not downloaded',
+          SourceSentinelCnt, SourceSentinels);
+        AssertEquals('the consumer must bind the pooled output, not download it',
+          PoolSentinelCnt, PoolSentinels);
+        HostGpuForwards := FeatureHost.ForwardGPUCnt + LogitHost.ForwardGPUCnt;
+        AssertEquals('the host-side sources must stay in RAM', 0, HostGpuForwards);
+      end;
+  finally
+    for CasePos := 0 to CaseCnt - 1 do
+    begin
+      LogitData[CasePos].Free;
+      FeatureData[CasePos].Free;
+    end;
+    NNGpu.Free;
+    NNCpu.Free;
   end;
 end;
 {$ELSE}
