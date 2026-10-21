@@ -780,6 +780,10 @@ type
       // PrevOutputOnOpenCL for a consumer that reads the source as one flat
       // span of its own output size (guards a reshape since SetPrevLayer).
       function PrevOutputOnOpenCLSameSize(): boolean;
+      // pSource's bindable output buffer, ordered before pConsumerKernel; else
+      // pSource.Output written (blocking) into pUploadBuffer, which is returned.
+      function BindOrUploadOpenCLOperand(pSource: TNNetLayer;
+        pConsumerKernel: TNeuralKernel; pUploadBuffer: cl_mem): cl_mem;
       // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
       // test hook proving a window forward took the tiled int8/int4 kernel.
       function OpenCLTiledGemmLaunchCount(): integer;
@@ -13423,28 +13427,44 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Parent of the two-source multiplies that run on cai_cell_mul: owns the
+  // kernel handle and the OpenCL buffers, and launches the product.
+  // Coded by Claude (AI).
+  TNNetMulBySourceBase = class(TNNetChannelTransformBase)
+    {$IFDEF OpenCL}
+    protected
+      // Net-wide cai_cell_mul handle, borrowed from FNN in EnableOpenCL; the net
+      // owns and frees it. Its queue is also the queue the sources produced on.
+      FMulKernel: TNeuralKernel;
+      // Persistent buffer in OpenCL memory holding this layer's output. Allocated
+      // ONCE in EnableOpenCL and reused by every forward, so no forward allocates.
+      FMulBuffer: cl_mem;
+      FMulBufSize: integer; // element capacity of FMulBuffer
+      // Copy of a host-only second operand, written every OpenCL forward;
+      // allocated by a subclass EnableOpenCL that needs it, grow-only.
+      FMulUploadBuffer: cl_mem;
+      FMulUploadCapBytes: csize_t;
+      // Releases the buffers, then the borrowed FMulKernel handle. Called from
+      // DisableOpenCL AND Destroy: a layer is destroyed without a DisableOpenCL.
+      procedure ReleaseMulOpenCL();
+      // FMulBuffer := BufferA * BufferB, B broadcast with period BSize; the
+      // product stays in OpenCL memory.
+      procedure RunCellMulOpenCL(BufferA, BufferB: cl_mem; BSize: longint);
+    public
+      destructor Destroy(); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
+  end;
+
   // This is an experimental class. Do not use it.
-  TNNetChannelMulByLayer = class(TNNetChannelTransformBase)
+  TNNetChannelMulByLayer = class(TNNetMulBySourceBase)
     private
       FLayerWithChannelsIdx, FLayerMulIdx: integer;
       FLayerWithChannels, FLayerMul: TNNetLayer;
       {$IFDEF OpenCL}
-      // Net-wide cai_cell_mul handle, borrowed from FNN in EnableOpenCL; the net
-      // owns and frees it. Its queue is also the queue the sources produced on.
-      FMulKernel: TNeuralKernel;
-      // Persistent device buffer holding this layer's output. Allocated ONCE in
-      // EnableOpenCL and reused by every forward, so no forward pass allocates.
-      FMulBuffer: cl_mem;
-      FMulBufSize: integer; // element capacity of FMulBuffer
-      // Copy of a host-only FLayerMul (Depth floats), written every OpenCL
-      // forward; allocated in EnableOpenCL, grow-only.
-      FMulUploadBuffer: cl_mem;
-      FMulUploadCapBytes: csize_t;
-      // Releases this layer's OpenCL resources: its two buffers in OpenCL
-      // memory, then the borrowed FMulKernel handle. Called from DisableOpenCL
-      // AND from Destroy - a layer is destroyed without a DisableOpenCL first,
-      // so neither may be the only caller. Coded by Claude (AI).
-      procedure ReleaseMulOpenCL();
       // Multiplies the resident per-token source by the per-channel operand
       // (bound or uploaded) into FMulBuffer. The caller checks WillOpenCL().
       procedure ComputeOpenCL();
@@ -13454,12 +13474,8 @@ type
       constructor Create(LayerWithChannels, LayerMul: TNNetLayer); reintroduce; overload;
       constructor Create(LayerWithChannelsIdx, LayerMulIdx: integer); reintroduce; overload;
       {$IFDEF OpenCL}
-      destructor Destroy(); override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
-      function OpenCLOutputBuffer(): cl_mem; override;
-      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -13468,23 +13484,11 @@ type
 
   /// This layer multiplies each cell from one branch to each cell from another
   // branch.
-  TNNetCellMulByCell = class(TNNetChannelTransformBase)
+  TNNetCellMulByCell = class(TNNetMulBySourceBase)
     private
       FLayerAIdx, FLayerBIdx: integer;
       FLayerA, FLayerB: TNNetLayer;
       {$IFDEF OpenCL}
-      // Net-wide cai_cell_mul handle, borrowed from FNN in EnableOpenCL; the net
-      // owns and frees it. Its queue is also the queue the sources produced on.
-      FMulKernel: TNeuralKernel;
-      // Persistent device buffer holding this layer's output. Allocated ONCE in
-      // EnableOpenCL and reused by every forward, so no forward pass allocates.
-      FMulBuffer: cl_mem;
-      FMulBufSize: integer; // element capacity of FMulBuffer
-      // Releases this layer's OpenCL resources: the device buffer, then the
-      // borrowed FMulKernel handle. Called from DisableOpenCL AND from Destroy -
-      // a layer is destroyed without a DisableOpenCL first, so neither may be
-      // the only caller. Coded by Claude (AI).
-      procedure ReleaseMulOpenCL();
       // Multiplies the two already-resident source outputs into FMulBuffer and
       // leaves the product there. The caller checks WillOpenCL().
       procedure ComputeOpenCL();
@@ -13494,12 +13498,7 @@ type
       constructor Create(LayerA, LayerB: TNNetLayer); reintroduce; overload;
       constructor Create(LayerAIdx, LayerBIdx: integer); reintroduce; overload;
       {$IFDEF OpenCL}
-      destructor Destroy(); override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
-      function OpenCLOutputBuffer(): cl_mem; override;
-      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -58826,13 +58825,14 @@ begin
 end;
 
 {$IFDEF OpenCL}
-destructor TNNetCellMulByCell.Destroy();
+{ TNNetMulBySourceBase }
+destructor TNNetMulBySourceBase.Destroy();
 begin
   ReleaseMulOpenCL();
   inherited Destroy();
 end;
 
-procedure TNNetCellMulByCell.EnableOpenCL(DotProductKernel: TNeuralKernel);
+procedure TNNetMulBySourceBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   // Acquire once: a second call would leak a private handle.
@@ -58853,7 +58853,7 @@ begin
   end;
 end;
 
-procedure TNNetCellMulByCell.ReleaseMulOpenCL();
+procedure TNNetMulBySourceBase.ReleaseMulOpenCL();
 begin
   if Assigned(FMulBuffer) then
   begin
@@ -58861,13 +58861,19 @@ begin
     FMulBuffer := nil;
     FMulBufSize := 0;
   end;
+  if Assigned(FMulUploadBuffer) then
+  begin
+    clReleaseMemObject(FMulUploadBuffer);
+    FMulUploadBuffer := nil;
+    FMulUploadCapBytes := 0;
+  end;
   // With the buffer gone nothing of this layer's output is in OpenCL
   // memory: leaving the flag set would hand a consumer a released buffer.
   FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_cell_mul', FMulKernel);
 end;
 
-procedure TNNetCellMulByCell.DisableOpenCL();
+procedure TNNetMulBySourceBase.DisableOpenCL();
 begin
   // FMulBuffer is read through FMulKernel's queue, so the output has to come
   // back to RAM while that handle is still alive.
@@ -58876,6 +58882,37 @@ begin
   ReleaseMulOpenCL();
 end;
 
+function TNNetMulBySourceBase.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FMulBuffer;
+end;
+
+function TNNetMulBySourceBase.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FMulKernel;
+end;
+
+procedure TNNetMulBySourceBase.RunCellMulOpenCL(BufferA, BufferB: cl_mem;
+  BSize: longint);
+var
+  Kern: cl_kernel;
+  iSize: longint;
+begin
+  Kern := FMulKernel.Kernel;
+  iSize := FOutput.Size;
+  clSetKernelArg(Kern, 0, csLongintSize, @iSize);
+  clSetKernelArg(Kern, 1, csLongintSize, @BSize);
+  clSetKernelArg(Kern, 2, csCLMemSize, @BufferA);
+  clSetKernelArg(Kern, 3, csCLMemSize, @BufferB);
+  clSetKernelArg(Kern, 4, csCLMemSize, @FMulBuffer);
+  FMulKernel.RunKernel(Kern, iSize);
+  // No read back here: the product stays in OpenCL memory until a host reader
+  // calls ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+{ TNNetCellMulByCell }
 function TNNetCellMulByCell.WillOpenCL(): boolean;
 begin
   Result := false;
@@ -58893,41 +58930,15 @@ begin
     FLayerB.OutputBindableOnOpenCL();
 end;
 
-function TNNetCellMulByCell.OpenCLOutputBuffer(): cl_mem;
-begin
-  Result := FMulBuffer;
-end;
-
-function TNNetCellMulByCell.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  Result := FMulKernel;
-end;
-
 procedure TNNetCellMulByCell.ComputeOpenCL();
 var
-  Kern: cl_kernel;
-  iSize, iBSize: longint;
   BufferA, BufferB: cl_mem;
 begin
-  FLayerA.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
-  FLayerB.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
-  // Read per forward, never cached: a source can replace its result buffer.
-  BufferA := FLayerA.OpenCLOutputBuffer();
-  BufferB := FLayerB.OpenCLOutputBuffer();
-  Kern := FMulKernel.Kernel;
-  iSize := FOutput.Size;
+  // WillOpenCL admits only two bindable sources, so neither upload runs.
+  BufferA := BindOrUploadOpenCLOperand(FLayerA, FMulKernel, nil);
+  BufferB := BindOrUploadOpenCLOperand(FLayerB, FMulKernel, nil);
   // Same length as A: cai_cell_mul then indexes B directly, with no broadcast.
-  iBSize := iSize;
-  clSetKernelArg(Kern, 0, csLongintSize, @iSize);
-  clSetKernelArg(Kern, 1, csLongintSize, @iBSize);
-  clSetKernelArg(Kern, 2, csCLMemSize, @BufferA);
-  clSetKernelArg(Kern, 3, csCLMemSize, @BufferB);
-  clSetKernelArg(Kern, 4, csCLMemSize, @FMulBuffer);
-  FMulKernel.RunKernel(Kern, iSize);
-  // No read back here: the product stays on the device until a host reader
-  // calls ForceOutputOnRAM.
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
+  RunCellMulOpenCL(BufferA, BufferB, FOutput.Size);
 end;
 {$ENDIF}
 
@@ -82470,62 +82481,11 @@ begin
 end;
 
 {$IFDEF OpenCL}
-destructor TNNetChannelMulByLayer.Destroy();
-begin
-  ReleaseMulOpenCL();
-  inherited Destroy();
-end;
-
 procedure TNNetChannelMulByLayer.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
-  // Acquire once: a second call would leak a private handle.
-  if Assigned(FNN) and (not Assigned(FMulKernel)) then
-    FMulKernel := FNN.GetKernel('cai_cell_mul');
-  if Assigned(FMulBuffer) and (FMulBufSize <> FOutput.Size) then
-  begin
-    clReleaseMemObject(FMulBuffer);
-    FMulBuffer := nil;
-    // The output this buffer held is gone with it; only the host copy is left.
-    FOutputOnOpenCL := false;
-  end;
-  if not Assigned(FMulBuffer) then
-  begin
-    FMulBufSize := FOutput.Size;
-    FMulBuffer := DotProductKernel.CreateBuffer(
-      CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
-  end;
   DotProductKernel.EnsureBuffer(FMulUploadBuffer, FMulUploadCapBytes,
     CL_MEM_READ_ONLY, FOutput.Depth * csNeuralFloatSize);
-end;
-
-procedure TNNetChannelMulByLayer.ReleaseMulOpenCL();
-begin
-  if Assigned(FMulBuffer) then
-  begin
-    clReleaseMemObject(FMulBuffer);
-    FMulBuffer := nil;
-    FMulBufSize := 0;
-  end;
-  if Assigned(FMulUploadBuffer) then
-  begin
-    clReleaseMemObject(FMulUploadBuffer);
-    FMulUploadBuffer := nil;
-    FMulUploadCapBytes := 0;
-  end;
-  // With the buffer gone nothing of this layer's output is in OpenCL
-  // memory: leaving the flag set would hand a consumer a released buffer.
-  FOutputOnOpenCL := false;
-  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_cell_mul', FMulKernel);
-end;
-
-procedure TNNetChannelMulByLayer.DisableOpenCL();
-begin
-  // FMulBuffer is read through FMulKernel's queue, so the output has to come
-  // back to RAM while that handle is still alive.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  ReleaseMulOpenCL();
 end;
 
 function TNNetChannelMulByLayer.WillOpenCL(): boolean;
@@ -82547,52 +82507,17 @@ begin
     (FMulUploadCapBytes >= csize_t(FOutput.Depth) * csNeuralFloatSize)));
 end;
 
-function TNNetChannelMulByLayer.OpenCLOutputBuffer(): cl_mem;
-begin
-  Result := FMulBuffer;
-end;
-
-function TNNetChannelMulByLayer.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  Result := FMulKernel;
-end;
-
 procedure TNNetChannelMulByLayer.ComputeOpenCL();
 var
-  Kern: cl_kernel;
-  iSize, iBSize: longint;
   BufferWithChannels, BufferMul: cl_mem;
 begin
-  FLayerWithChannels.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
-  // Read per forward, never cached: a source can replace its result buffer.
-  BufferWithChannels := FLayerWithChannels.OpenCLOutputBuffer();
-  if FLayerMul.OutputBindableOnOpenCL() then
-  begin
-    FLayerMul.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
-    BufferMul := FLayerMul.OpenCLOutputBuffer();
-  end
-  else
-  begin
-    // Blocking: a forward whose last layer ends on the host does not drain
-    // this queue, and the next forward rewrites FLayerMul.Output on the host.
-    FLayerMul.ForceOutputOnRAM();
-    FMulKernel.WriteBuffer(FMulUploadBuffer, FLayerMul.Output, CL_TRUE);
-    BufferMul := FMulUploadBuffer;
-  end;
-  Kern := FMulKernel.Kernel;
-  iSize := FOutput.Size;
+  // WillOpenCL admits only a bindable FLayerWithChannels, so it never uploads.
+  BufferWithChannels := BindOrUploadOpenCLOperand(FLayerWithChannels,
+    FMulKernel, nil);
+  BufferMul := BindOrUploadOpenCLOperand(FLayerMul, FMulKernel,
+    FMulUploadBuffer);
   // One operand per channel: cai_cell_mul broadcasts it over the positions.
-  iBSize := FOutput.Depth;
-  clSetKernelArg(Kern, 0, csLongintSize, @iSize);
-  clSetKernelArg(Kern, 1, csLongintSize, @iBSize);
-  clSetKernelArg(Kern, 2, csCLMemSize, @BufferWithChannels);
-  clSetKernelArg(Kern, 3, csCLMemSize, @BufferMul);
-  clSetKernelArg(Kern, 4, csCLMemSize, @FMulBuffer);
-  FMulKernel.RunKernel(Kern, iSize);
-  // No read back here: the product stays on the device until a host reader
-  // calls ForceOutputOnRAM.
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
+  RunCellMulOpenCL(BufferWithChannels, BufferMul, FOutput.Depth);
 end;
 {$ENDIF}
 
@@ -87363,22 +87288,10 @@ var
 begin
   FeatureLayer := FPrevLayerList[0];
   CondLayer := FPrevLayerList[1];
-  FeatureLayer.OpenCLWaitOutputIfAnotherQueue(FAffineKernel);
-  // Read per forward, never cached: a source can replace its result buffer.
-  FeatureBuffer := FeatureLayer.OpenCLOutputBuffer();
-  if CondLayer.OutputBindableOnOpenCL() then
-  begin
-    CondLayer.OpenCLWaitOutputIfAnotherQueue(FAffineKernel);
-    CondBuffer := CondLayer.OpenCLOutputBuffer();
-  end
-  else
-  begin
-    // Blocking: the next forward may rewrite CondLayer.Output on the host
-    // before this queue drains.
-    CondLayer.ForceOutputOnRAM();
-    FAffineKernel.WriteBuffer(FCondUploadBuffer, CondLayer.Output, CL_TRUE);
-    CondBuffer := FCondUploadBuffer;
-  end;
+  // WillOpenCL admits only a bindable feature map, so it never uploads.
+  FeatureBuffer := BindOrUploadOpenCLOperand(FeatureLayer, FAffineKernel, nil);
+  CondBuffer := BindOrUploadOpenCLOperand(CondLayer, FAffineKernel,
+    FCondUploadBuffer);
   Kern := FAffineKernel.Kernel;
   iSize := FOutput.Size;
   iOpcode := csActChannelAffine;
@@ -144970,6 +144883,25 @@ end;
 function TNNetLayer.PrevOutputOnOpenCLSameSize(): boolean;
 begin
   Result := PrevOutputOnOpenCL() and (FPrevLayer.FOutput.Size = FOutput.Size);
+end;
+
+function TNNetLayer.BindOrUploadOpenCLOperand(pSource: TNNetLayer;
+  pConsumerKernel: TNeuralKernel; pUploadBuffer: cl_mem): cl_mem;
+begin
+  if pSource.OutputBindableOnOpenCL() then
+  begin
+    pSource.OpenCLWaitOutputIfAnotherQueue(pConsumerKernel);
+    // Read per forward, never cached: a source can replace its result buffer.
+    Result := pSource.OpenCLOutputBuffer();
+  end
+  else
+  begin
+    // Blocking: a forward whose last layer ends on the host does not drain
+    // this queue, and the next forward rewrites pSource.Output on the host.
+    pSource.ForceOutputOnRAM();
+    pConsumerKernel.WriteBuffer(pUploadBuffer, pSource.Output, CL_TRUE);
+    Result := pUploadBuffer;
+  end;
 end;
 
 function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;
