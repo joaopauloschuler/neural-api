@@ -12883,6 +12883,49 @@ function BuildNAFNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// LaMa LARGE-MASK INPAINTING IMPORT (Suvorov et al. 2021, big-lama's
+// FFCResNetGenerator; checkpoint anyisalin/big-lama, keys generator.model.*).
+// model.1 = 7x7 FFC on ReflectionPad(3); model.2.. = stride-2 3x3 FFCs, the
+// last one splitting into local/global branches; then FFC resnet blocks (local
+// 3x3 convs + a spectral transform with a Fourier unit on the global branch);
+// local|global concat; ConvTranspose2d(k3,s2,p1,op1)+BN+ReLU per downsample;
+// ReflectionPad(3) + 7x7 conv + sigmoid. Every FFC conv pads by reflection;
+// every BatchNorm is folded into the conv in front of it.
+// ---------------------------------------------------------------------------
+type
+  // Generator shape, read from the checkpoint's tensor shapes and key names.
+  TLaMaConfig = record
+    TensorPrefix: string;      // 'generator.' in big-lama.safetensors, else ''
+    InChannels: integer;       // 4: image*(1-mask) | mask
+    BaseChannels: integer;     // ngf (64)
+    DownsampleCount: integer;  // stride-2 FFC convs (3)
+    LocalChannels: integer;    // bottleneck local branch (128)
+    GlobalChannels: integer;   // bottleneck global branch (384)
+    BlockCount: integer;       // FFC resnet blocks (18)
+    OutChannels: integer;      // 3
+    InputWidth, InputHeight: integer; // multiples of 2^DownsampleCount
+  end;
+
+// Reads the generator shape from Reader's tensors for a pInputWidth x
+// pInputHeight input; both must be multiples of 2^DownsampleCount.
+function ReadLaMaConfigFromReader(Reader: TNNetSafeTensorsReader;
+  pInputWidth, pInputHeight: integer): TLaMaConfig;
+
+function LaMaConfigToString(const Config: TLaMaConfig): string;
+
+// Builds the generator and loads its weights from Reader (caller owns Reader).
+// Input (W, H, InChannels) in [0,1]; output (W, H, OutChannels), sigmoid.
+function BuildLaMa(Reader: TNNetSafeTensorsReader;
+  const Config: TLaMaConfig; pTrainable: boolean = true): TNNet;
+
+function BuildLaMaFromSafeTensorsEx(const FileName: string;
+  const Config: TLaMaConfig; pTrainable: boolean = true): TNNet;
+
+function BuildLaMaFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TLaMaConfig;
+  pTrainable: boolean = true): TNNet;
+
+// ---------------------------------------------------------------------------
 // RIFE VIDEO FRAME-INTERPOLATION IMPORT (model_type "rife") -- the repo's FIRST
 // VIDEO-generative importer: it SYNTHESISES an intermediate frame between two
 // input frames (the landed RAFT path estimates optical FLOW but does not
@@ -64991,45 +65034,73 @@ begin
   end;
 end;
 
-// Loads a torchvision ConvTranspose2d (weight [I,O,kh,kw] + bias [O]) into a
-// TNNetDeconvolution. The CAI deconv per-neuron weight keeps the SAME
-// (FeatureSizeX, FeatureSizeY, InputDepth) layout as a convolution -- i.e.
-// FData[(ky*K + kx)*I + c] for output neuron o -- whereas PyTorch stores it
-// CHANNEL-FIRST as [in=c, out=o, ky, kx]. We transpose the (c,o) axes on load.
-procedure LoadMaskRCNNDeconv(Reader: TNNetSafeTensorsReader;
+// Loads a torch ConvTranspose2d (weight [I,O,K,K] + bias [O]) into a TNNetDeconvolution
+// (weights (kx,ky,c) per out channel), folding BatchNorm BnPrefix into it when <> ''.
+procedure LoadConvTranspose2DFoldBN(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string;
-  InCh, OutCh, K: integer);
+  InCh, OutCh, K: integer; const BnPrefix: string = '';
+  BnEps: TNeuralFloat = 1e-5);
 var
-  W, B, WVol: TNNetVolume;
+  W, B, WVol, Gamma, Beta, Mean, Var_: TNNetVolume;
   o, c, ky, kx, kBase, srcIdx, OutKK, OutM1, InM1, KM1: integer;
+  Scale, Shift, Denom: TNeuralFloat;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
-    ImportError('Mask R-CNN import: missing tensor "' + WName + '".');
+    ImportError('ConvTranspose2d import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 4) or
      (Reader.DimSize(WName, 0) <> InCh) or
      (Reader.DimSize(WName, 1) <> OutCh) or
      (Reader.DimSize(WName, 2) <> K) or
      (Reader.DimSize(WName, 3) <> K) then
-    ImportError('Mask R-CNN import: ConvTranspose "' + WName +
+    ImportError('ConvTranspose2d import: "' + WName +
       '" must have shape [' + IntToStr(InCh) + ', ' + IntToStr(OutCh) + ', ' +
       IntToStr(K) + ', ' + IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
   if Layer.Neurons.Count <> OutCh then
-    ImportError('Mask R-CNN import: deconv target has ' +
+    ImportError('ConvTranspose2d import: deconv target has ' +
       IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(OutCh) + '.');
   W := TNNetVolume.Create;
   B := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create;
+  Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
     Reader.LoadTensorFlat(BName, B);
     if B.Size <> OutCh then
-      ImportError('Mask R-CNN import: "' + BName + '" must have ' +
+      ImportError('ConvTranspose2d import: "' + BName + '" must have ' +
         IntToStr(OutCh) + ' elements.');
+    if BnPrefix <> '' then
+    begin
+      if not Reader.HasTensor(BnPrefix + '.weight') then
+        ImportError('ConvTranspose2d import: missing BatchNorm tensor "' +
+          BnPrefix + '.weight".');
+      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+      if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
+         (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
+        ImportError('ConvTranspose2d import: BatchNorm "' + BnPrefix +
+          '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+    end;
     OutM1 := OutCh - 1;  InM1 := InCh - 1;  KM1 := K - 1;
     OutKK := OutCh * K * K;
     for o := 0 to OutM1 do
     begin
+      if BnPrefix <> '' then
+      begin
+        Denom := Sqrt(Var_.FData[o] + BnEps);
+        Scale := Gamma.FData[o] / Denom;
+        Shift := Beta.FData[o] - Gamma.FData[o] * Mean.FData[o] / Denom;
+      end
+      else
+      begin
+        Scale := 1.0;
+        Shift := 0.0;
+      end;
       WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KM1 do
         for kx := 0 to KM1 do
@@ -65039,15 +65110,15 @@ begin
           srcIdx := (o * K + ky) * K + kx;
           for c := 0 to InM1 do
           begin
-            WVol.FData[kBase + c] := W.FData[srcIdx];
+            WVol.FData[kBase + c] := W.FData[srcIdx] * Scale;
             Inc(srcIdx, OutKK);
           end;
         end;
-      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o] * Scale + Shift;
     end;
     Layer.FlushWeightCache();
   finally
-    W.Free; B.Free;
+    W.Free; B.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
   end;
 end;
 
@@ -65167,7 +65238,7 @@ begin
   // ConvTranspose2d kernel 2 stride 2 -> ReLU (mask_predictor.conv5_mask).
   MaskDeconv := NN.AddLayer(
     TNNetDeconvolutionReLU.Create(C, 2, 2, 0, 0).SetTrainable(pTrainable));
-  LoadMaskRCNNDeconv(Reader, MaskDeconv,
+  LoadConvTranspose2DFoldBN(Reader, MaskDeconv,
     'roi_heads.mask_predictor.conv5_mask.weight',
     'roi_heads.mask_predictor.conv5_mask.bias',
     C, C, 2);
@@ -77230,6 +77301,335 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadNAFNetConfigFromJSONFile(ConfigPath);
   Result := BuildNAFNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// LaMa LARGE-MASK INPAINTING IMPORT
+// ===========================================================================
+
+// Loads bias-free torch Conv2d weights WNames ([O, I_n, K, K]) stacked along the input
+// axis into Layer, times BatchNorm BnPrefix's scale; its shift is the bias only if pAddBnShift.
+procedure LoadStackedConvFoldBN(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WNames: array of string; const BnPrefix: string;
+  pAddBnShift: boolean; BnEps: TNeuralFloat = 1e-5);
+var
+  W, Gamma, Beta, Mean, Var_, Scale, Shift, WVol: TNNetVolume;
+  OutCh, InTotal, InCh, InBase, K, KK, NamePos, MaxNamePos: integer;
+  o, c, ky, kx, kBase, srcIdx, OutChM1, InChM1, KM1: integer;
+  Denom: TNeuralFloat;
+begin
+  EnsureWritableImportWeights(Layer);
+  OutCh := Layer.Neurons.Count;
+  MaxNamePos := High(WNames);
+  for NamePos := 0 to MaxNamePos do
+    if not Reader.HasTensor(WNames[NamePos]) then
+      ImportError('LaMa import: missing tensor "' + WNames[NamePos] + '".');
+  K := Reader.DimSize(WNames[0], 2);
+  KK := K * K;
+  InTotal := Layer.FArrNeurons[0].Weights.Size div KK;
+  InBase := 0;
+  for NamePos := 0 to MaxNamePos do
+  begin
+    if (Reader.DimCount(WNames[NamePos]) <> 4) or
+       (Reader.DimSize(WNames[NamePos], 0) <> OutCh) or
+       (Reader.DimSize(WNames[NamePos], 2) <> K) or
+       (Reader.DimSize(WNames[NamePos], 3) <> K) then
+      ImportError('LaMa import: "' + WNames[NamePos] + '" must have shape [' +
+        IntToStr(OutCh) + ', in, ' + IntToStr(K) + ', ' + IntToStr(K) +
+        '] (nn.Conv2d [out,in,kh,kw]), got ' +
+        Reader.ShapeAsString(WNames[NamePos]));
+    Inc(InBase, Reader.DimSize(WNames[NamePos], 1));
+  end;
+  if (InBase <> InTotal) or (Layer.FArrNeurons[0].Weights.Size <> KK * InTotal) then
+    ImportError('LaMa import: internal error - conv "' + WNames[0] +
+      '" target has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
+      ' weights per neuron, the tensors give ' + IntToStr(KK * InBase) + '.');
+  W := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create;
+  Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
+  Scale := TNNetVolume.Create(OutCh, 1, 1);
+  Shift := TNNetVolume.Create(OutCh, 1, 1);
+  try
+    Scale.Fill(1.0);
+    Shift.Fill(0.0);
+    OutChM1 := OutCh - 1;
+    if BnPrefix <> '' then
+    begin
+      if not Reader.HasTensor(BnPrefix + '.weight') then
+        ImportError('LaMa import: missing BatchNorm tensor "' +
+          BnPrefix + '.weight".');
+      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+      if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
+         (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
+        ImportError('LaMa import: BatchNorm "' + BnPrefix +
+          '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+      for o := 0 to OutChM1 do
+      begin
+        Denom := Sqrt(Var_.FData[o] + BnEps);
+        Scale.FData[o] := Gamma.FData[o] / Denom;
+        Shift.FData[o] := Beta.FData[o] - Gamma.FData[o] * Mean.FData[o] / Denom;
+      end;
+    end;
+    KM1 := K - 1;
+    InBase := 0;
+    for NamePos := 0 to MaxNamePos do
+    begin
+      Reader.LoadTensorFlat(WNames[NamePos], W);
+      InCh := Reader.DimSize(WNames[NamePos], 1);
+      InChM1 := InCh - 1;
+      for o := 0 to OutChM1 do
+      begin
+        WVol := Layer.FArrNeurons[o].Weights;
+        for ky := 0 to KM1 do
+          for kx := 0 to KM1 do
+          begin
+            kBase := (ky * K + kx) * InTotal + InBase;
+            // #12: the source walks c with a fixed K*K stride.
+            srcIdx := (o * InCh * K + ky) * K + kx;
+            for c := 0 to InChM1 do
+            begin
+              WVol.FData[kBase + c] := W.FData[srcIdx] * Scale.FData[o];
+              Inc(srcIdx, KK);
+            end;
+          end;
+      end;
+      Inc(InBase, InCh);
+    end;
+    for o := 0 to OutChM1 do
+      if pAddBnShift
+        then Layer.FArrNeurons[o].BiasWeight := Shift.FData[o]
+        else Layer.FArrNeurons[o].BiasWeight := 0;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+    Scale.Free; Shift.Free;
+  end;
+end;
+
+function LaMaTensorName(const Prefix: string; LayerIdx: integer;
+  const Suffix: string): string;
+begin
+  Result := Prefix + 'model.' + IntToStr(LayerIdx) + '.' + Suffix;
+end;
+
+function ReadLaMaConfigFromReader(Reader: TNNetSafeTensorsReader;
+  pInputWidth, pInputHeight: integer): TLaMaConfig;
+var
+  P: string;
+  LayerIdx, DownCnt, MaxDownPos: integer;
+begin
+  if Reader.HasTensor('generator.model.1.ffc.convl2l.weight') then P := 'generator.'
+  else if Reader.HasTensor('model.1.ffc.convl2l.weight') then P := ''
+  else
+    ImportError('LaMa import: no "generator.model.1.ffc.convl2l.weight" ' +
+      'tensor - not a big-lama FFCResNetGenerator checkpoint.');
+  Result.TensorPrefix := P;
+  Result.InChannels := Reader.DimSize(LaMaTensorName(P, 1, 'ffc.convl2l.weight'), 1);
+  Result.BaseChannels := Reader.DimSize(LaMaTensorName(P, 1, 'ffc.convl2l.weight'), 0);
+  LayerIdx := 2;
+  while Reader.HasTensor(LaMaTensorName(P, LayerIdx, 'ffc.convl2l.weight')) do
+    Inc(LayerIdx);
+  Result.DownsampleCount := LayerIdx - 2;
+  if Result.DownsampleCount < 1 then
+    ImportError('LaMa import: no downsampling FFC ("' +
+      LaMaTensorName(P, 2, 'ffc.convl2l.weight') + '").');
+  MaxDownPos := Result.DownsampleCount - 1;
+  for DownCnt := 0 to MaxDownPos do
+    if Reader.HasTensor(LaMaTensorName(P, 2 + DownCnt, 'ffc.convl2g.weight')) <>
+       (DownCnt = MaxDownPos) then
+      ImportError('LaMa import: only the last downsampling FFC (model.' +
+        IntToStr(1 + Result.DownsampleCount) + ') may have a global branch.');
+  LayerIdx := 1 + Result.DownsampleCount;
+  Result.LocalChannels := Reader.DimSize(LaMaTensorName(P, LayerIdx, 'ffc.convl2l.weight'), 0);
+  Result.GlobalChannels := Reader.DimSize(LaMaTensorName(P, LayerIdx, 'ffc.convl2g.weight'), 0);
+  if Odd(Result.GlobalChannels) then
+    ImportError('LaMa import: the global branch needs an even channel count, got ' +
+      IntToStr(Result.GlobalChannels) + '.');
+  LayerIdx := 2 + Result.DownsampleCount;
+  while Reader.HasTensor(LaMaTensorName(P, LayerIdx, 'conv1.ffc.convl2l.weight')) do
+    Inc(LayerIdx);
+  Result.BlockCount := LayerIdx - 2 - Result.DownsampleCount;
+  // Layout: blocks, concat, 3 modules per upsampling, ReflectionPad, conv.
+  LayerIdx := 4 + 4 * Result.DownsampleCount + Result.BlockCount;
+  if not Reader.HasTensor(LaMaTensorName(P, LayerIdx, 'weight')) then
+    ImportError('LaMa import: missing the output conv "' +
+      LaMaTensorName(P, LayerIdx, 'weight') + '".');
+  Result.OutChannels := Reader.DimSize(LaMaTensorName(P, LayerIdx, 'weight'), 0);
+  Result.InputWidth := pInputWidth;
+  Result.InputHeight := pInputHeight;
+end;
+
+function LaMaConfigToString(const Config: TLaMaConfig): string;
+begin
+  Result := 'lama: prefix="' + Config.TensorPrefix + '"' +
+    ', in_channels=' + IntToStr(Config.InChannels) +
+    ', ngf=' + IntToStr(Config.BaseChannels) +
+    ', n_downsampling=' + IntToStr(Config.DownsampleCount) +
+    ', local=' + IntToStr(Config.LocalChannels) +
+    ', global=' + IntToStr(Config.GlobalChannels) +
+    ', n_blocks=' + IntToStr(Config.BlockCount) +
+    ', out_channels=' + IntToStr(Config.OutChannels) +
+    ', input=' + IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
+end;
+
+function BuildLaMa(Reader: TNNetSafeTensorsReader;
+  const Config: TLaMaConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  P: string;
+  Cur, Pad, L, G, IdL, IdG: TNNetLayer;
+  Factor, BottleneckW, LayerIdx, DownCnt, BlockCnt: integer;
+  MaxDownPos, MaxBlockPos, InCh, OutCh: integer;
+
+  // One FFC_BN_ACT of a resnet block (prefix UnitPrefix) on the pair (pL, pG).
+  procedure AddFFCUnit(const UnitPrefix: string; var pL, pG: TNNetLayer);
+  var
+    PadL, PadG, LocalConv, L2G, S1, FU, IFFT, G2G: TNNetLayer;
+  begin
+    PadL := NN.AddLayerAfter(TNNetPad.Create(1, pmReflect), pL);
+    PadG := NN.AddLayerAfter(TNNetPad.Create(1, pmReflect), pG);
+    // convl2l(x_l) + convg2l(x_g) is one conv over the concatenated inputs.
+    NN.AddLayer(TNNetDeepConcat.Create([PadL, PadG]));
+    LocalConv := NN.AddLayer(TNNetConvolutionReLU.Create(
+      Config.LocalChannels, 3, 0, 1).SetTrainable(pTrainable));
+    LoadStackedConvFoldBN(Reader, LocalConv, [UnitPrefix + 'ffc.convl2l.weight',
+      UnitPrefix + 'ffc.convg2l.weight'], UnitPrefix + 'bn_l', true);
+    L2G := NN.AddLayerAfter(TNNetConvolutionLinear.Create(
+      Config.GlobalChannels, 3, 0, 1).SetTrainable(pTrainable), PadL);
+    LoadStackedConvFoldBN(Reader, L2G, [UnitPrefix + 'ffc.convl2g.weight'],
+      UnitPrefix + 'bn_g', true);
+    // Spectral transform: conv1 -> Fourier unit -> conv2(x + fu(x)).
+    S1 := NN.AddLayerAfter(TNNetPointwiseConvReLU.Create(
+      Config.GlobalChannels div 2).SetTrainable(pTrainable), pG);
+    LoadStackedConvFoldBN(Reader, S1, [UnitPrefix + 'ffc.convg2g.conv1.0.weight'],
+      UnitPrefix + 'ffc.convg2g.conv1.1', true);
+    NN.AddLayer(TNNetRealFFT2D.Create(csFFTNormOrtho));
+    FU := NN.AddLayer(TNNetPointwiseConvReLU.Create(
+      Config.GlobalChannels).SetTrainable(pTrainable));
+    LoadStackedConvFoldBN(Reader, FU, [UnitPrefix + 'ffc.convg2g.fu.conv_layer.weight'],
+      UnitPrefix + 'ffc.convg2g.fu.bn', true);
+    IFFT := NN.AddLayer(TNNetInverseRealFFT2D.Create(BottleneckW, csFFTNormOrtho));
+    NN.AddLayer(TNNetSum.Create([S1, IFFT]));
+    // bn_g's shift already sits in L2G's bias.
+    G2G := NN.AddLayer(TNNetPointwiseConvLinear.Create(
+      Config.GlobalChannels, {pSuppressBias=}1).SetTrainable(pTrainable));
+    LoadStackedConvFoldBN(Reader, G2G, [UnitPrefix + 'ffc.convg2g.conv2.weight'],
+      UnitPrefix + 'bn_g', false);
+    NN.AddLayer(TNNetSum.Create([L2G, G2G]));
+    pG := NN.AddLayer(TNNetReLU.Create());
+    pL := LocalConv;
+  end;
+
+begin
+  P := Config.TensorPrefix;
+  Factor := 1 shl Config.DownsampleCount;
+  if (Config.InputWidth < 2 * Factor) or (Config.InputHeight < 2 * Factor) or
+     (Config.InputWidth mod Factor <> 0) or (Config.InputHeight mod Factor <> 0) then
+    ImportError('LaMa import: the input ' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight) + ' must be a multiple of ' + IntToStr(Factor) +
+      ' and at least ' + IntToStr(2 * Factor) + ' on each axis (pad it).');
+  BottleneckW := Config.InputWidth div Factor;
+  MaxDownPos := Config.DownsampleCount - 1;
+  MaxBlockPos := Config.BlockCount - 1;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Config.InputWidth, Config.InputHeight,
+      Config.InChannels));
+    NN.AddLayer(TNNetPad.Create(3, pmReflect));
+    Cur := NN.AddLayer(TNNetConvolutionReLU.Create(Config.BaseChannels, 7, 0, 1).
+      SetTrainable(pTrainable));
+    LoadResNetConvFoldBN(Reader, Cur, LaMaTensorName(P, 1, 'ffc.convl2l.weight'),
+      LaMaTensorName(P, 1, 'bn_l'), Config.BaseChannels, Config.InChannels, 7, 1e-5);
+    InCh := Config.BaseChannels;
+    G := nil;
+    for DownCnt := 0 to MaxDownPos do
+    begin
+      LayerIdx := 2 + DownCnt;
+      OutCh := Reader.DimSize(LaMaTensorName(P, LayerIdx, 'ffc.convl2l.weight'), 0);
+      Pad := NN.AddLayer(TNNetPad.Create(1, pmReflect));
+      Cur := NN.AddLayer(TNNetConvolutionReLU.Create(OutCh, 3, 0, 2).
+        SetTrainable(pTrainable));
+      LoadResNetConvFoldBN(Reader, Cur, LaMaTensorName(P, LayerIdx, 'ffc.convl2l.weight'),
+        LaMaTensorName(P, LayerIdx, 'bn_l'), OutCh, InCh, 3, 1e-5);
+      if DownCnt = MaxDownPos then
+      begin
+        G := NN.AddLayerAfter(TNNetConvolutionReLU.Create(Config.GlobalChannels,
+          3, 0, 2).SetTrainable(pTrainable), Pad);
+        LoadResNetConvFoldBN(Reader, G, LaMaTensorName(P, LayerIdx, 'ffc.convl2g.weight'),
+          LaMaTensorName(P, LayerIdx, 'bn_g'), Config.GlobalChannels, InCh, 3, 1e-5);
+      end;
+      InCh := OutCh;
+    end;
+    L := Cur;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      LayerIdx := 2 + Config.DownsampleCount + BlockCnt;
+      IdL := L;
+      IdG := G;
+      AddFFCUnit(LaMaTensorName(P, LayerIdx, 'conv1.'), L, G);
+      AddFFCUnit(LaMaTensorName(P, LayerIdx, 'conv2.'), L, G);
+      L := NN.AddLayer(TNNetSum.Create([IdL, L]));
+      G := NN.AddLayer(TNNetSum.Create([IdG, G]));
+    end;
+    NN.AddLayer(TNNetDeepConcat.Create([L, G]));
+    InCh := Config.LocalChannels + Config.GlobalChannels;
+    LayerIdx := 3 + Config.DownsampleCount + Config.BlockCount;
+    for DownCnt := 0 to MaxDownPos do
+    begin
+      OutCh := Reader.DimSize(LaMaTensorName(P, LayerIdx, 'weight'), 1);
+      Cur := NN.AddLayer(TNNetDeconvolutionReLU.Create(OutCh, 3, {pStride=}2,
+        {pPadding=}1, {pOutputPadding=}1).SetTrainable(pTrainable));
+      LoadConvTranspose2DFoldBN(Reader, Cur, LaMaTensorName(P, LayerIdx, 'weight'),
+        LaMaTensorName(P, LayerIdx, 'bias'), InCh, OutCh, 3,
+        P + 'model.' + IntToStr(LayerIdx + 1));
+      InCh := OutCh;
+      Inc(LayerIdx, 3);
+    end;
+    NN.AddLayer(TNNetPad.Create(3, pmReflect));
+    Cur := NN.AddLayer(TNNetConvolutionLinear.Create(Config.OutChannels, 7, 0, 1).
+      SetTrainable(pTrainable));
+    LoadVaeConv(Reader, Cur, LaMaTensorName(P, LayerIdx + 1, 'weight'),
+      LaMaTensorName(P, LayerIdx + 1, 'bias'), Config.OutChannels, InCh, 7);
+    NN.AddLayer(TNNetSigmoid.Create());
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildLaMaFromSafeTensorsEx(const FileName: string;
+  const Config: TLaMaConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildLaMa(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildLaMaFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TLaMaConfig;
+  pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Config := ReadLaMaConfigFromReader(Reader, pInputWidth, pInputHeight);
+    Result := BuildLaMa(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
 end;
 
 // ===========================================================================

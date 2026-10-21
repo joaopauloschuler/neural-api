@@ -1103,6 +1103,8 @@ type
     procedure TestRRDBNetParityScale2;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
+    procedure TestLaMaParity;
+    procedure TestLaMaRejectsUnpaddedInput;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestSwinIRConfigFromJSONFile;
@@ -44310,6 +44312,84 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// Parity test for BuildLaMaFromSafeTensors against the pico big-lama-layout
+// fixture (tools/make_pico_lama_fixture.py: ngf 8, 3 downsamplings, local 16 +
+// global 48 bottleneck, 2 FFC resnet blocks, 24x16 input -> 3x2 bottleneck, so
+// the Fourier unit runs on an odd width). Covers key/shape discovery, every
+// BatchNorm fold, reflect padding, the rfft2 -> conv -> irfft2 unit and the
+// ConvTranspose2d(k3,s2,p1,op1) decoder; asserts < 1e-4 on the sigmoid output.
+procedure TTestNeuralPretrained.TestLaMaParity;
+var
+  NN: TNNet;
+  Config: TLaMaConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, OutputArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  ElemCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  NN := BuildLaMaFromSafeTensors(FixturePath('tiny_lama.safetensors'),
+    {pInputWidth=}24, {pInputHeight=}16, Config, {pTrainable=}false);
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create(24, 16, 4);
+  RefRoot := nil;
+  try
+    AssertEquals('prefix', 'generator.', Config.TensorPrefix);
+    AssertEquals('in channels', 4, Config.InChannels);
+    AssertEquals('ngf', 8, Config.BaseChannels);
+    AssertEquals('downsamplings', 3, Config.DownsampleCount);
+    AssertEquals('local channels', 16, Config.LocalChannels);
+    AssertEquals('global channels', 48, Config.GlobalChannels);
+    AssertEquals('blocks', 2, Config.BlockCount);
+    AssertEquals('out channels', 3, Config.OutChannels);
+    RefJson.LoadFromFile(FixturePath('tiny_lama_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    OutputArr := TJSONArray(TJSONObject(RefRoot).Find('output'));
+    AssertEquals('input size', ImgInput.Size, InputArr.Count);
+    for ElemCnt := 0 to ImgInput.Size - 1 do
+      ImgInput.FData[ElemCnt] := InputArr.Items[ElemCnt].AsFloat;
+    NN.Compute(ImgInput);
+    AssertEquals('output width', 24, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output height', 16, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('output size', NN.GetLastLayer().Output.Size, OutputArr.Count);
+    MaxDiff := 0;
+    for ElemCnt := 0 to OutputArr.Count - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ElemCnt] -
+        OutputArr.Items[ElemCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('LaMa output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// BuildLaMa rejects an input that is not a multiple of 2^DownsampleCount.
+procedure TTestNeuralPretrained.TestLaMaRejectsUnpaddedInput;
+var
+  NN: TNNet;
+  Config: TLaMaConfig;
+  Msg: string;
+begin
+  Msg := '';
+  NN := nil;
+  try
+    NN := BuildLaMaFromSafeTensors(FixturePath('tiny_lama.safetensors'),
+      {pInputWidth=}20, {pInputHeight=}16, Config, {pTrainable=}false);
+  except
+    on E: EPretrainedImportError do Msg := E.Message;
+  end;
+  NN.Free;
+  AssertTrue('error names the multiple: ' + Msg, Pos('multiple of 8', Msg) > 0);
 end;
 
 // Verifies ReadRIFEConfigFromJSONFile on the committed pico config.

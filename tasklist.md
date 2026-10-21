@@ -1648,7 +1648,7 @@ rather than acted on.
          channel layout, forward and backward so FFC layers can be trained). The
          Fourier unit is then pure composition: rfft2 -> pointwise conv (BN
          folded) -> ReLU -> irfft2.
-      3. `BuildLaMaFromSafeTensors` in neuralpretrained.pas. Fold every BN into
+      3. [DONE] `BuildLaMaFromSafeTensors` in neuralpretrained.pas. Fold every BN into
          its conv; reuse `TNNetPad` pmReflect and `TNNetDeconvolution` for the
          transposed convs. Fourier unit wiring: `TNNetRealFFT2D.Create(csFFTNormOrtho)`
          maps (W, H, C) to (W div 2 + 1, H, 2C) with depth 2c = Re and 2c+1 = Im of
