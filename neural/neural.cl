@@ -5895,3 +5895,132 @@ __kernel void cai_moe_expert_down_int8
 
   FOut[t * FHiddenSize + h] = acc;
 } // end of kernel
+
+// Gate|up half of a fused MoE block in a single launch: for every (token,
+// slot) pair the router filled, the SwiGLU'd hidden of that slot's expert
+//
+//   Out[t,j,w] = up * (g * sigmoid(g)),   up = s * (W[e*2I + w]     . x[t]) + b
+//                                          g = s * (W[e*2I + I + w] . x[t]) + b
+//
+// with e = SlotExpert[t,j] and s = SlotGate[t,j] when FScaleInput (Llama-4
+// routing scales the expert INPUT; the projection is linear in x) else 1.
+// Rows 0..I-1 of an expert are UP, rows I..2I-1 are GATE, the half-swap order
+// of TNNetMoEExpertBankGateUp. Slots a token did not fill are written as 0.
+// The slot map is built on the host and shared with cai_moe_expert_down, so the
+// result can stay in OpenCL memory for the down bank.
+// One work-item per output element; global size = (FExpertWidth,
+// FTokenCnt*FTopK). The sigmoid is trap-free: exp(-g) may reach +inf, which
+// makes g/(1+inf) a signed zero.
+// Coded by Claude (AI).
+__kernel void cai_moe_expert_gateup
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FExpertWidth,
+  const int FVectorSize,
+  const int FScaleInput,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FSource,
+  __global const float* FWeights,
+  __global const float* FBias,
+  __global float* FOut
+)
+{
+  const int w = get_global_id(0);
+  const int pair = get_global_id(1);
+  if ((w >= FExpertWidth) || (pair >= FTokenCnt * FTopK)) return;
+
+  const int t = pair / FTopK;
+  const int j = pair - t * FTopK;
+  float result = 0.0f;
+  if (j < FSlotCount[t])
+  {
+    const int e = FSlotExpert[pair];
+    const float s = (FScaleInput != 0) ? FSlotGate[pair] : 1.0f;
+    const int upRow = e * 2 * FExpertWidth + w;
+    const int gateRow = upRow + FExpertWidth;
+    // 64-bit offsets: a whole bank can exceed 2^31 weights.
+    const long upBase = (long)upRow * FVectorSize;
+    const long gateBase = (long)gateRow * FVectorSize;
+    const int srcBase = t * FVectorSize;
+    float up = 0.0f;
+    float g = 0.0f;
+    for (int i = 0; i < FVectorSize; i++)
+    {
+      const float x = FSource[srcBase + i];
+      up = mad(FWeights[upBase + i], x, up);
+      g = mad(FWeights[gateBase + i], x, g);
+    }
+    up *= s;
+    g *= s;
+    if (FUseBias != 0)
+    {
+      up += FBias[upRow];
+      g += FBias[gateRow];
+    }
+    result = up * (g * (1.0f / (1.0f + exp(-g))));
+  }
+  FOut[pair * FExpertWidth + w] = result;
+} // end of kernel
+
+// Int8-weight twin of cai_moe_expert_gateup over the layer's per-row symmetric
+// int8 codes in the same row-major order. The per-row scale (times the input
+// gate s) is applied ONCE to the raw code sum and BEFORE the FP32 bias,
+// mirroring TNNetMoEExpertBankGateUp.ComputeExpertsQuantizedInt8.
+// Coded by Claude (AI).
+__kernel void cai_moe_expert_gateup_int8
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FExpertWidth,
+  const int FVectorSize,
+  const int FScaleInput,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FSource,
+  __global const char*  FCodes,
+  __global const float* FBias,
+  __global float* FOut,
+  __global const float* FScales
+)
+{
+  const int w = get_global_id(0);
+  const int pair = get_global_id(1);
+  if ((w >= FExpertWidth) || (pair >= FTokenCnt * FTopK)) return;
+
+  const int t = pair / FTopK;
+  const int j = pair - t * FTopK;
+  float result = 0.0f;
+  if (j < FSlotCount[t])
+  {
+    const int e = FSlotExpert[pair];
+    const float s = (FScaleInput != 0) ? FSlotGate[pair] : 1.0f;
+    const int upRow = e * 2 * FExpertWidth + w;
+    const int gateRow = upRow + FExpertWidth;
+    const long upBase = (long)upRow * FVectorSize;
+    const long gateBase = (long)gateRow * FVectorSize;
+    const int srcBase = t * FVectorSize;
+    float up = 0.0f;
+    float g = 0.0f;
+    for (int i = 0; i < FVectorSize; i++)
+    {
+      const float x = FSource[srcBase + i];
+      up = mad(convert_float(FCodes[upBase + i]), x, up);
+      g = mad(convert_float(FCodes[gateBase + i]), x, g);
+    }
+    up *= FScales[upRow] * s;
+    g *= FScales[gateRow] * s;
+    if (FUseBias != 0)
+    {
+      up += FBias[upRow];
+      g += FBias[gateRow];
+    }
+    result = up * (g * (1.0f / (1.0f + exp(-g))));
+  }
+  FOut[pair * FExpertWidth + w] = result;
+} // end of kernel

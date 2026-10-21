@@ -1857,22 +1857,21 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Residency breakers on the decode path (small kernels, largest payoff)
 
-- [ ] `TNNetMoEExpertBankGateUp` single-launch device forward. The clearest
-      single gap: `TNNetMoEExpertBankDown` got one (commit d105047c) but its
-      sibling did not, so every MoE block downloads the expert activations
-      between the two banks. Mirror the down-bank kernel (one launch over the
-      selected experts, resident int8 or FP32 weight slab) so gate/up -> down
-      stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
-      OLMoE and GPT-OSS.
 - [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
       (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
       plan too (DeMaxPool's random spacing would need a per-forward plan, so
       it stays out). The gather-copy layers do not take part in OpenCL output
       sharing by liveness (`CanShareOpenCLOutput` is False).
 - [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
-      per token, but the router sits between two resident MoE banks, so running
-      it on the host costs two transfers per token. Only worth landing together
-      with the gate/up bank item above.
+      per token, but it is now the only host hop of a MoE block: both banks run
+      in OpenCL and chain resident (`cai_moe_expert_gateup*` ->
+      `cai_moe_expert_down*`), yet `TNNetMoEExpertBankGateUp.ComputeOpenCL`
+      still downloads the router output, builds the slot map on the host
+      (`BuildSlotMap`) and uploads it with three blocking writes per block. A
+      device router needs a device slot-map build too (the down bank already
+      binds the gate|up helper's slot-map buffers, so only the producer side
+      changes). Throughput of the two bank kernels is unmeasured: they are one
+      work-item per output element, no tiling; time them on the GPU box.
 - [ ] `--gpu-fp16`: narrow each resident FP32 source to half ONCE per forward,
       not once per consumer. `TDotProductSharedKernel.PrepareInt8BOperand` calls
       `CastBOperandToFP16` (`cai_f32_to_half`) into the layer's own

@@ -6098,7 +6098,7 @@ type
   // Binds cai_embedding_gather (FP32 vocab table) or cai_embedding_gather_int8
   // (per-row int8 codes + scales) on the shared dot-product program's device -
   // the entry point is chosen at construction from the layer's quantization
-  // state, as TNNetMoEExpertDownCL does. It uploads the vocab table plus a
+  // state, as TNNetMoEExpertBankCL does. It uploads the vocab table plus a
   // host-resolved per-token source-row list and runs one work-item per (output
   // token, depth) producing a single scalar, leaving the gathered output
   // resident. The EncodeZero / zero-padding decision (row = -1 leaves that token
@@ -6205,22 +6205,21 @@ type
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
-  // OpenCL forward helper for the fused MoE down projection
-  // (TNNetMoEExpertBankDown). Binds cai_moe_expert_down (FP32 weights) or
-  // cai_moe_expert_down_int8 (per-row int8 codes + scales) on the shared
-  // dot-product program's device - the entry point is chosen at construction
-  // from the layer's quantization state.
+  // OpenCL forward helper shared by both fused MoE expert banks. pGateUp picks
+  // the gate|up entry points (cai_moe_expert_gateup*) over the down ones
+  // (cai_moe_expert_down*), pInt8 the per-row int8 twin of either; both are
+  // fixed at construction from the layer's role and quantization state.
   // The expert bank is RESIDENT and IMMUTABLE: the whole weight block (plus the
   // per-row scales and the packed biases) is uploaded ONCE by the Arm* methods
   // and never re-uploaded, exactly as the int8 TNNetFullConnect device path
   // does - both banks are inference-only, so their weights cannot change. Only
-  // the slot map (routing, rebuilt every forward by the gate|up bank), the slot
-  // hidden state and the result travel per forward.
-  // Weights ride in the layer's NATIVE row-major order (row = expert*HiddenSize
-  // + hiddenRow, ExpertWidth values each), so the int8 quantization table
-  // uploads verbatim - no transpose, no interleave, no host staging copy.
+  // the slot map (routing, rebuilt every forward by the gate|up bank) and the
+  // source travel per forward, and a source left in OpenCL memory is bound.
+  // Weights ride in the layer's NATIVE row-major order (one row per neuron), so
+  // the int8 quantization table uploads verbatim - no transpose, no interleave.
+  // The result stays in OpenCL memory (ResultBuffer) for the next layer.
   // Coded by Claude (AI).
-  TNNetMoEExpertDownCL = class(TNNetKernelCL)
+  TNNetMoEExpertBankCL = class(TNNetKernelCL)
   private
     // Resident, uploaded once by the Arm* methods below.
     FBufW, FBufScales, FBufBias: cl_mem;
@@ -6228,12 +6227,12 @@ type
     // Per-forward (grow-only, reused).
     FBufSlotExpert, FBufSlotGate, FBufSlotCount: cl_mem;
     FCapSlotExpert, FCapSlotGate, FCapSlotCount: csize_t;
-    FBufHidden, FBufOut: cl_mem;
-    FCapHidden, FCapOut: csize_t;
-    FInt8: boolean;
+    FBufSource, FBufOut: cl_mem;
+    FCapSource, FCapOut: csize_t;
+    FGateUp, FInt8: boolean;
     FUseBias: integer;
   public
-    constructor Create(NN: TNNet; pInt8: boolean);
+    constructor Create(NN: TNNet; pGateUp, pInt8: boolean);
     destructor Destroy(); override;
     // Uploads the int8 code block (NumRows*VS bytes, row-major) and the NumRows
     // per-row scales. Blocking: the caller's storage may go away on return.
@@ -6245,12 +6244,18 @@ type
     // Packed per-row biases (NumRows values). nil (or an all-zero volume the
     // caller filtered out) pins UseBias = 0 and the device never reads them.
     procedure ArmBias(BiasVol: TNNetVolume);
-    // One launch per forward. SlotExpert/SlotCount are the gate|up bank's
-    // integer slot map, SlotGate its combine weights; Hidden is that bank's
-    // output (slot-packed) and Out receives the (TokenCnt, HiddenSize) mixture.
-    procedure Compute(SlotExpert, SlotCount: PInteger;
-      SlotGate: TNeuralFloatArrPtr; Hidden, Out: TNNetVolume;
-      TokenCnt, TopK, HiddenSize, ExpertWidth, UnitCombine: integer);
+    // Blocking upload of the gate|up bank's slot map (TokenCnt*TopK experts
+    // and combine weights, TokenCnt fill counts) into this helper's buffers.
+    procedure UploadSlotMap(SlotExpert, SlotCount: PInteger;
+      SlotGate: TNeuralFloatArrPtr; TokenCnt, TopK: integer);
+    // One launch over SlotMapOwner's slot map; binds pExternalSrc, else uploads
+    // Source. Flag is ScaleInputByGate (gate|up) or UnitCombine (down).
+    procedure Compute(SlotMapOwner: TNNetMoEExpertBankCL; Source: TNNetVolume;
+      pExternalSrc: cl_mem; OutVol: TNNetVolume;
+      TokenCnt, TopK, OutWidth, InWidth, Flag: integer);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
   end;
   {$ENDIF}
 
@@ -15691,6 +15696,56 @@ type
       procedure ResetExpertLoad();
   end;
 
+  /// Shared base of the two fused MoE expert banks: the OpenCL arming of the
+  /// resident weight block and the residency of the bank's output. Do not use it
+  /// directly. Coded by Claude (AI).
+  TNNetMoEExpertBankBase = class(TNNetLayerConcatedWeights)
+    {$IFDEF OpenCL}
+    protected
+      // Single-launch device forward helper; its entry point depends on the
+      // bank's role and on the quantization mode it was armed for.
+      FBankCL: TNNetMoEExpertBankCL;
+      // True once the resident expert bank has been uploaded. WillOpenCL checks
+      // it, so an unarmed layer (device unavailable, or a bank whose upload
+      // failed) silently stays on the fused CPU forward.
+      FOpenCLArmed: boolean;
+      // Set by AfterWeightUpdate so an FP32 bank that changed after arming
+      // re-uploads before the next device forward. int8 banks are immutable.
+      FOpenCLWeightsDirty: boolean;
+      // Quantization mode the resident bank (and the bound kernel entry point)
+      // was armed for. A bank quantized or dequantized AFTER arming flips
+      // FQuantInt8 without any weight-update notification, so the two are
+      // compared before every device forward and the helper is rebuilt on a
+      // mismatch - the FP32 kernel would otherwise read int8 codes as floats.
+      FOpenCLArmedInt8: boolean;
+      // Packed per-row biases staged for the device; nil when every row bias is
+      // zero - the kernel then skips the bias add.
+      FDevBias: TNNetVolume;
+      // True for the gate|up bank: picks the helper's entry points.
+      function IsGateUpBank(): boolean; virtual; abstract;
+      // False while the bank lacks what its device forward reads.
+      function OpenCLBankReady(): boolean; virtual;
+      // Builds FDevBias, or leaves it nil when the bank is bias-free.
+      procedure BuildOpenCLBias();
+      // Uploads the FP32 bank through a transient packed volume (the bank keeps
+      // per-neuron rows and never concatenates).
+      procedure ArmOpenCLWeightsFP32();
+      procedure ArmOpenCLWeights();
+      // Re-arms when the weights changed or the quantization mode flipped.
+      procedure ArmOpenCLWeightsIfStale();
+      // The verdict both banks share; each adds its own geometry check.
+      function BankWillOpenCL(): boolean;
+    public
+      destructor Destroy(); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      procedure AfterWeightUpdate(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
+  end;
+
   /// FUSED MIXTURE-OF-EXPERTS EXPERT BANK - the gate|up half.
   /// One layer holds ALL NumExperts fused gate|up projections of a sparse MoE
   /// block as a single flat [NumExperts*2*ExpertWidth, HiddenSize] neuron
@@ -15713,7 +15768,7 @@ type
   /// INFERENCE-ONLY: Backpropagate raises. MoE TRAINING goes through
   /// AddTopKMixtureOfExperts / AddDeepSeekMoE, which build per-expert layers.
   // Coded by Claude (AI).
-  TNNetMoEExpertBankGateUp = class(TNNetLayerConcatedWeights)
+  TNNetMoEExpertBankGateUp = class(TNNetMoEExpertBankBase)
     private
       FSourceIdx, FGateIdx: integer;
       FSourceLayer, FGateLayer: TNNetLayer;
@@ -15735,6 +15790,11 @@ type
       FExpertCursor: array of integer;   // [FNumExperts] scatter cursors
       FExpertPairs: array of integer;    // [FTokenCnt*FTopK] pairs by expert
       FOverflowReported: boolean;
+      {$IFDEF OpenCL}
+      // True when this pass' slot map was uploaded to FBankCL, so the down bank
+      // binds it instead of uploading its own copy.
+      FSlotMapOnOpenCL: boolean;
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // Scans the router output into the slot map and orders the pairs by
       // expert. Reports (once) a router that selects more than TopK experts
@@ -15761,9 +15821,22 @@ type
       // pass-stable, built by PrepareChunkedForward before any chunk runs.
       procedure ComputeRange(StartRange, FinRange: integer); override;
       procedure PrepareChunkedForward(); override;
+      {$IFDEF OpenCL}
+      function IsGateUpBank(): boolean; override;
+      function OpenCLBankReady(): boolean; override;
+      // True when the source can be read where it lies: the kernel reads the
+      // flat [token*VectorSize + i] span every producer's buffer carries.
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
+      // Single-launch device forward (cai_moe_expert_gateup*): the router is
+      // scanned on the host, the slot-packed SwiGLU hidden stays resident.
+      procedure ComputeOpenCL();
+      {$ENDIF}
     public
       function ChunkEligible(): boolean; override;
       function ChunkWorkCount(): integer; override;
+      {$IFDEF OpenCL}
+      function WillOpenCL(): boolean; override;
+      {$ENDIF}
       constructor Create(pNumExperts, pExpertWidth, pSourceLayerIdx,
         pGateLayerIdx: integer; pScaleInputByGate: boolean = false);
         reintroduce; overload;
@@ -15792,34 +15865,13 @@ type
   /// OUTPUT (S,1,HiddenSize) - the MoE block output, ready to be summed with a
   /// shared expert or added back to the residual stream.
   /// INFERENCE-ONLY: Backpropagate raises. Coded by Claude (AI).
-  TNNetMoEExpertBankDown = class(TNNetLayerConcatedWeights)
+  TNNetMoEExpertBankDown = class(TNNetMoEExpertBankBase)
     private
       FBank: TNNetMoEExpertBankGateUp;
       FNumExperts, FHiddenSize, FExpertWidth, FTopK, FTokenCnt: integer;
       // Mirrors the gate|up bank's ScaleInputByGate: when the gate already
       // scaled the expert input, the mixture combines the slots with weight 1.
       FUnitCombine: boolean;
-      {$IFDEF OpenCL}
-      // Single-launch device forward (cai_moe_expert_down*): the whole mixture
-      // of this MoE block in one kernel, reading the gate|up bank's slot map.
-      FMoEDownCL: TNNetMoEExpertDownCL;
-      // True once the resident expert bank has been uploaded. WillOpenCL gates
-      // on it, so an unarmed layer (device unavailable, or a bank whose upload
-      // failed) silently stays on the fused CPU forward.
-      FOpenCLArmed: boolean;
-      // Set by AfterWeightUpdate so an FP32 bank that changed after arming
-      // re-uploads before the next device forward. int8 banks are immutable.
-      FOpenCLWeightsDirty: boolean;
-      // Quantization mode the resident bank (and the bound kernel entry point)
-      // was armed for. A bank quantized or dequantized AFTER arming flips
-      // FQuantInt8 without any weight-update notification, so the two are
-      // compared before every device forward and the helper is rebuilt on a
-      // mismatch - the FP32 kernel would otherwise read int8 codes as floats.
-      FOpenCLArmedInt8: boolean;
-      // Packed per-row biases ([NumExperts*HiddenSize]) staged for the device.
-      // nil when every row bias is zero - the kernel then skips the bias add.
-      FDevBias: TNNetVolume;
-      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // The gate-weighted mixture over the work-item slice [StartRange..
       // FinRange] of the (token x hidden-row-block) index space, NBlocks blocks
@@ -15845,14 +15897,11 @@ type
       procedure ComputeRange(StartRange, FinRange: integer); override;
       procedure PrepareChunkedForward(); override;
       {$IFDEF OpenCL}
+      function IsGateUpBank(): boolean; override;
+      function OpenCLBankReady(): boolean; override;
+      // Single-launch device forward (cai_moe_expert_down*): the whole mixture
+      // in one kernel, binding the gate|up bank's resident output and slot map.
       procedure ComputeOpenCL();
-      // Builds FDevBias, or leaves it nil when the bank is bias-free.
-      procedure BuildOpenCLBias();
-      // Uploads the FP32 bank through a transient packed volume (the bank keeps
-      // per-neuron rows and never concatenates). Only the int8 path is used in
-      // production; this exists for unquantized banks and parity tests.
-      procedure ArmOpenCLWeightsFP32();
-      procedure ArmOpenCLWeights();
       {$ENDIF}
     public
       function ChunkEligible(): boolean; override;
@@ -15861,11 +15910,7 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
-      destructor Destroy(); override;
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      procedure AfterWeightUpdate(); override;
       {$ENDIF}
       property NumExperts: integer read FNumExperts;
       property HiddenSize: integer read FHiddenSize;
@@ -42460,18 +42505,28 @@ begin
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
-{ TNNetMoEExpertDownCL }
+{ TNNetMoEExpertBankCL }
 
-constructor TNNetMoEExpertDownCL.Create(NN: TNNet; pInt8: boolean);
+constructor TNNetMoEExpertBankCL.Create(NN: TNNet; pGateUp, pInt8: boolean);
 begin
-  if pInt8
-    then inherited Create(NN, 'cai_moe_expert_down_int8')
-    else inherited Create(NN, 'cai_moe_expert_down');
+  if pGateUp then
+  begin
+    if pInt8
+      then inherited Create(NN, 'cai_moe_expert_gateup_int8')
+      else inherited Create(NN, 'cai_moe_expert_gateup');
+  end
+  else
+  begin
+    if pInt8
+      then inherited Create(NN, 'cai_moe_expert_down_int8')
+      else inherited Create(NN, 'cai_moe_expert_down');
+  end;
+  FGateUp := pGateUp;
   FInt8 := pInt8;
   FUseBias := 0;
 end;
 
-destructor TNNetMoEExpertDownCL.Destroy();
+destructor TNNetMoEExpertBankCL.Destroy();
 begin
   if Assigned(FBufW)          then clReleaseMemObject(FBufW);
   if Assigned(FBufScales)     then clReleaseMemObject(FBufScales);
@@ -42479,12 +42534,12 @@ begin
   if Assigned(FBufSlotExpert) then clReleaseMemObject(FBufSlotExpert);
   if Assigned(FBufSlotGate)   then clReleaseMemObject(FBufSlotGate);
   if Assigned(FBufSlotCount)  then clReleaseMemObject(FBufSlotCount);
-  if Assigned(FBufHidden)     then clReleaseMemObject(FBufHidden);
+  if Assigned(FBufSource)     then clReleaseMemObject(FBufSource);
   if Assigned(FBufOut)        then clReleaseMemObject(FBufOut);
   inherited Destroy();
 end;
 
-procedure TNNetMoEExpertDownCL.ArmWeightsInt8(pCodes: TNeuralInt8ArrPtr;
+procedure TNNetMoEExpertBankCL.ArmWeightsInt8(pCodes: TNeuralInt8ArrPtr;
   pScales: TNeuralFloatArrPtr; NumRows, VS: integer);
 begin
   // One-time: the codes/scales are immutable - the bank is inference-only.
@@ -42492,14 +42547,14 @@ begin
     NumRows, VS);
 end;
 
-procedure TNNetMoEExpertDownCL.ArmWeightsFP32(PackedW: TNNetVolume);
+procedure TNNetMoEExpertBankCL.ArmWeightsFP32(PackedW: TNNetVolume);
 begin
   if (PackedW = nil) or (PackedW.Size = 0) then exit;
   FKernel.EnsureWriteBuffer(FBufW, FCapW, PackedW, {DoWrite}true);
   FKernel.Finish(); // the caller frees the staging volume right after
 end;
 
-procedure TNNetMoEExpertDownCL.ArmBias(BiasVol: TNNetVolume);
+procedure TNNetMoEExpertBankCL.ArmBias(BiasVol: TNNetVolume);
 begin
   if (BiasVol = nil) or (BiasVol.Size = 0) then
   begin
@@ -42511,52 +42566,81 @@ begin
   FUseBias := 1;
 end;
 
-procedure TNNetMoEExpertDownCL.Compute(SlotExpert, SlotCount: PInteger;
-  SlotGate: TNeuralFloatArrPtr; Hidden, Out: TNNetVolume;
-  TokenCnt, TopK, HiddenSize, ExpertWidth, UnitCombine: integer);
+procedure TNNetMoEExpertBankCL.UploadSlotMap(SlotExpert, SlotCount: PInteger;
+  SlotGate: TNeuralFloatArrPtr; TokenCnt, TopK: integer);
 var
-  bufSE, bufSG, bufSC, bufH, bufO: cl_mem;
-  k: cl_kernel;
   MapInts, MapFloats, CountInts: csize_t;
 begin
-  k := FKernel.Kernel;
   MapInts := csize_t(TokenCnt) * csize_t(TopK) * csLongintSize;
   MapFloats := csize_t(TokenCnt) * csize_t(TopK) * csNeuralFloatSize;
   CountInts := csize_t(TokenCnt) * csLongintSize;
-  // The slot map is rebuilt by the gate|up bank at every forward, so all three
-  // arrays upload every call. They are tiny (TokenCnt*TopK entries).
-  bufSE := FKernel.EnsureBuffer(FBufSlotExpert, FCapSlotExpert,
-    CL_MEM_READ_WRITE, MapInts);
-  bufSG := FKernel.EnsureBuffer(FBufSlotGate, FCapSlotGate,
-    CL_MEM_READ_WRITE, MapFloats);
-  bufSC := FKernel.EnsureBuffer(FBufSlotCount, FCapSlotCount,
-    CL_MEM_READ_WRITE, CountInts);
-  FKernel.WriteBuffer(bufSE, MapInts, SlotExpert, CL_FALSE);
-  FKernel.WriteBuffer(bufSG, MapFloats, SlotGate, CL_FALSE);
-  FKernel.WriteBuffer(bufSC, CountInts, SlotCount, CL_FALSE);
-  bufH := FKernel.EnsureWriteBuffer(FBufHidden, FCapHidden, Hidden);
-  bufO := FKernel.EnsureOutputBuffer(FBufOut, FCapOut, Out);
+  FKernel.EnsureBuffer(FBufSlotExpert, FCapSlotExpert, CL_MEM_READ_WRITE,
+    MapInts);
+  FKernel.EnsureBuffer(FBufSlotGate, FCapSlotGate, CL_MEM_READ_WRITE,
+    MapFloats);
+  FKernel.EnsureBuffer(FBufSlotCount, FCapSlotCount, CL_MEM_READ_WRITE,
+    CountInts);
+  // Blocking: the gate|up bank rewrites these host arrays on its next forward,
+  // which may come before this queue drains, and a kernel on another queue may
+  // read the buffers.
+  FKernel.WriteBuffer(FBufSlotExpert, MapInts, SlotExpert, CL_TRUE);
+  FKernel.WriteBuffer(FBufSlotGate, MapFloats, SlotGate, CL_TRUE);
+  FKernel.WriteBuffer(FBufSlotCount, CountInts, SlotCount, CL_TRUE);
+end;
+
+procedure TNNetMoEExpertBankCL.Compute(SlotMapOwner: TNNetMoEExpertBankCL;
+  Source: TNNetVolume; pExternalSrc: cl_mem; OutVol: TNNetVolume;
+  TokenCnt, TopK, OutWidth, InWidth, Flag: integer);
+var
+  bufSrc, bufO: cl_mem;
+  k: cl_kernel;
+begin
+  k := FKernel.Kernel;
+  if pExternalSrc <> nil
+    then bufSrc := pExternalSrc
+    // Blocking: the host source may be rewritten before this queue drains.
+    else bufSrc := FKernel.EnsureWriteBuffer(FBufSource, FCapSource, Source,
+      {DoWrite=}true, {pBlocking=}true);
+  bufO := FKernel.EnsureOutputBuffer(FBufOut, FCapOut, OutVol);
   clSetKernelArg(k,  0, csLongintSize, @TokenCnt);
   clSetKernelArg(k,  1, csLongintSize, @TopK);
-  clSetKernelArg(k,  2, csLongintSize, @HiddenSize);
-  clSetKernelArg(k,  3, csLongintSize, @ExpertWidth);
-  clSetKernelArg(k,  4, csLongintSize, @UnitCombine);
+  clSetKernelArg(k,  2, csLongintSize, @OutWidth);
+  clSetKernelArg(k,  3, csLongintSize, @InWidth);
+  clSetKernelArg(k,  4, csLongintSize, @Flag);
   clSetKernelArg(k,  5, csLongintSize, @FUseBias);
-  clSetKernelArg(k,  6, csCLMemSize, @bufSE);
-  clSetKernelArg(k,  7, csCLMemSize, @bufSG);
-  clSetKernelArg(k,  8, csCLMemSize, @bufSC);
-  clSetKernelArg(k,  9, csCLMemSize, @bufH);
+  clSetKernelArg(k,  6, csCLMemSize, @SlotMapOwner.FBufSlotExpert);
+  clSetKernelArg(k,  7, csCLMemSize, @SlotMapOwner.FBufSlotGate);
+  clSetKernelArg(k,  8, csCLMemSize, @SlotMapOwner.FBufSlotCount);
+  clSetKernelArg(k,  9, csCLMemSize, @bufSrc);
   clSetKernelArg(k, 10, csCLMemSize, @FBufW);
   // A bias-less bank passes the (possibly nil) buffer with FUseBias = 0: the
   // kernel never reads it, but every argument must still be set before enqueue.
   clSetKernelArg(k, 11, csCLMemSize, @FBufBias);
   clSetKernelArg(k, 12, csCLMemSize, @bufO);
   if FInt8 then clSetKernelArg(k, 13, csCLMemSize, @FBufScales);
-  // One work-item per output element.
-  FKernel.RunKernel2D(k, HiddenSize, TokenCnt);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufO, Out, CL_TRUE);
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
+  // One work-item per output element: (expert row, token slot) for gate|up,
+  // (hidden row, token) for down.
+  if FGateUp
+    then FKernel.RunKernel2D(k, OutWidth, TokenCnt * TopK)
+    else FKernel.RunKernel2D(k, OutWidth, TokenCnt);
+  // No read back: the result waits in FBufOut until the next layer binds it or
+  // a host reader calls ForceOutputOnRAM.
+end;
+
+function TNNetMoEExpertBankCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufOut;
+end;
+
+function TNNetMoEExpertBankCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetMoEExpertBankCL.BufferBytes(): int64;
+begin
+  Result := int64(FCapW) + FCapScales + FCapBias + FCapSlotExpert +
+    FCapSlotGate + FCapSlotCount + FCapSource + FCapOut;
 end;
 
 { TNNetRoPECL }
@@ -111640,6 +111724,184 @@ begin
     FillChar(FLoadAcc[0], (MaxIdx + 1) * csNeuralFloatSize, 0);  // #13
 end;
 
+{$IFDEF OpenCL}
+{ TNNetMoEExpertBankBase }
+function TNNetMoEExpertBankBase.OpenCLBankReady(): boolean;
+begin
+  Result := true;
+end;
+
+// Packs the per-row biases the device kernels add. A bank whose every row bias
+// is zero (the usual case for MoE checkpoints) leaves FDevBias nil, which pins
+// the kernel's FUseBias to 0. Coded by Claude (AI).
+procedure TNNetMoEExpertBankBase.BuildOpenCLBias();
+var
+  RowIdx, MaxRowPos: integer;
+  HasBias: boolean;
+begin
+  MaxRowPos := FNeurons.Count - 1;
+  HasBias := false;
+  for RowIdx := 0 to MaxRowPos do
+  begin
+    if FArrNeurons[RowIdx].FBiasWeight <> 0 then
+    begin
+      HasBias := true;
+      break;
+    end;
+  end;
+  if not HasBias then
+  begin
+    FreeAndNil(FDevBias);
+    exit;
+  end;
+  if not Assigned(FDevBias) then FDevBias := TNNetVolume.Create();
+  FDevBias.ReSize(FNeurons.Count, 1, 1);
+  for RowIdx := 0 to MaxRowPos do
+    FDevBias.FData[RowIdx] := FArrNeurons[RowIdx].FBiasWeight;
+end;
+
+// FP32 arming. The bank keeps per-neuron weight rows and deliberately never
+// concatenates them (FShouldConcatWeights stays false), so the packed block the
+// device needs is built here, uploaded and released again - it is a transient,
+// not a second permanent copy of the bank. Coded by Claude (AI).
+procedure TNNetMoEExpertBankBase.ArmOpenCLWeightsFP32();
+var
+  PackedW: TNNetVolume;
+  RowIdx, MaxRowPos: integer;
+begin
+  MaxRowPos := FNeurons.Count - 1;
+  if MaxRowPos < 0 then exit;
+  PackedW := TNNetVolume.Create();
+  try
+    PackedW.ReSize(FNeurons.Count, 1, FVectorSize);
+    for RowIdx := 0 to MaxRowPos do
+      Move(FArrNeurons[RowIdx].FWeights.FData[0],
+        PackedW.FData[RowIdx * FVectorSize], FVectorSizeBytes);
+    FBankCL.ArmWeightsFP32(PackedW);
+  finally
+    PackedW.Free;
+  end;
+end;
+
+procedure TNNetMoEExpertBankBase.ArmOpenCLWeights();
+begin
+  if not Assigned(FBankCL) then exit;
+  if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+  // The entry point is chosen at construction from the quantization state, so a
+  // bank that changed state after arming needs a fresh helper, not just a fresh
+  // upload. A resident output lives in the old helper's buffer.
+  if FOpenCLArmed and (FOpenCLArmedInt8 <> FQuantInt8) then
+  begin
+    ForceOutputOnRAM();
+    FOutputOnOpenCL := false;
+    FreeAndNil(FBankCL);
+    FBankCL := TNNetMoEExpertBankCL.Create(FNN, IsGateUpBank(), FQuantInt8);
+  end;
+  // The kernels stride the bank by FVectorSize, so an int8 table whose row
+  // width says otherwise must not be uploaded: stay unarmed (CPU forward).
+  if FQuantInt8 and (FQuantVectorSize <> FVectorSize) then
+  begin
+    FOpenCLArmed := false;
+    FErrorProc(ClassName + ' - layer ' + IntToStr(FLayerIdx) +
+      ' int8 row width ' + IntToStr(FQuantVectorSize) +
+      ' does not match the weight row width ' + IntToStr(FVectorSize) +
+      '. The device forward stays disabled.');
+    exit;
+  end;
+  BuildOpenCLBias();
+  if FQuantInt8 then
+  begin
+    // The quantization table is already row-major in the layout the kernel
+    // reads, so it uploads verbatim - no transpose, no staging copy.
+    FBankCL.ArmWeightsInt8(FQuantTable.DataPtr, FQuantTable.ScalePtr,
+      FNeurons.Count, FQuantVectorSize);
+  end
+  else ArmOpenCLWeightsFP32();
+  FBankCL.ArmBias(FDevBias);
+  FOpenCLArmedInt8 := FQuantInt8;
+  FOpenCLWeightsDirty := false;
+  FOpenCLArmed := true;
+end;
+
+procedure TNNetMoEExpertBankBase.ArmOpenCLWeightsIfStale();
+begin
+  if FOpenCLWeightsDirty or (FOpenCLArmedInt8 <> FQuantInt8) then
+    ArmOpenCLWeights();
+end;
+
+function TNNetMoEExpertBankBase.BankWillOpenCL(): boolean;
+begin
+  Result := FHasOpenCL and FOpenCLArmed and Assigned(FBankCL) and
+    OpenCLBankReady();
+end;
+
+procedure TNNetMoEExpertBankBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Bare arming ONLY. Chaining to TNNetLayerConcatedWeights.EnableOpenCL would
+  // set FShouldConcatWeights and resize FConcatedWeights/FConcatedWInter to the
+  // full expert bank - two FP32 copies of a block this layer never concatenates
+  // (see TNNetDepthwiseConv.EnableOpenCL for the same reasoning).
+  FHasOpenCL := true;
+  if not OpenCLBankReady() then exit;
+  if not Assigned(FBankCL) then
+    FBankCL := TNNetMoEExpertBankCL.Create(FNN, IsGateUpBank(), FQuantInt8);
+  // Armed unconditionally, NOT on FShouldOpenCL: TNNet.ForceOpenCL runs after
+  // EnableOpenCL, so a verdict-checked arm would leave a forced layer (the
+  // parity tests) with no resident weights.
+  // ORDERING: the expert bank uploads once, here. EnableOpenCL must therefore
+  // run AFTER the checkpoint is loaded - arming a construction-time-quantized
+  // bank before its weights arrive would upload a block of zeros. The
+  // AfterWeightUpdate hook below re-arms if the weights change later.
+  ArmOpenCLWeights();
+end;
+
+procedure TNNetMoEExpertBankBase.DisableOpenCL();
+begin
+  // FBankCL owns the buffer a resident output lives in, so the host copy has to
+  // be recovered before the helper goes.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FBankCL);
+  FreeAndNil(FDevBias);
+  FOpenCLArmed := false;
+end;
+
+procedure TNNetMoEExpertBankBase.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  // The resident bank is now stale. int8 banks are immutable in practice (the
+  // layer is inference-only), but an FP32 bank can still be rewritten by a
+  // loader after arming, and re-uploading is far cheaper than being wrong.
+  FOpenCLWeightsDirty := true;
+end;
+
+function TNNetMoEExpertBankBase.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FBankCL) then Result := FBankCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetMoEExpertBankBase.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FBankCL) then Result := FBankCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetMoEExpertBankBase.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FBankCL) then Result := Result + FBankCL.BufferBytes();
+end;
+
+destructor TNNetMoEExpertBankBase.Destroy();
+begin
+  FreeAndNil(FBankCL);
+  FreeAndNil(FDevBias);
+  inherited Destroy();
+end;
+{$ENDIF}
+
 { TNNetMoEExpertBankGateUp }
 constructor TNNetMoEExpertBankGateUp.Create(pNumExperts, pExpertWidth,
   pSourceLayerIdx, pGateLayerIdx: integer; pScaleInputByGate: boolean);
@@ -111708,6 +111970,12 @@ begin
   SetLength(FSlotCount, FTokenCnt);
   SetLength(FExpertStart, FNumExperts + 1);
   SetLength(FExpertCursor, FNumExperts);
+  {$IFDEF OpenCL}
+  // Frozen device size verdict, same work proxy as ChunkEligible: every output
+  // slot costs two dot products of FVectorSize.
+  FShouldOpenCL := (Int64(FOutput.Size) * 2 * FVectorSize >=
+    cNeuralOpenCLMinWork);
+  {$ENDIF}
   InitDefault();
   BuildArrNeurons();
   AfterWeightUpdate();
@@ -111808,11 +112076,22 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
   // Both input edges are read on the host here: FGateLayer inside
   // PrepareForward (BuildSlotMap) and FSourceLayer in the expert nest below.
-  {$IFDEF OpenCL}
   if Assigned(FSourceLayer) then FSourceLayer.ForceOutputOnRAM();
   if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
+  FSlotMapOnOpenCL := false;
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   PrepareForward();
   // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
@@ -111828,6 +112107,9 @@ begin
   {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
+  FSlotMapOnOpenCL := false;
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   // The chunk path never calls Compute, so the routing decision every chunk
   // reads is built here: once, single-threaded, before any chunk is published.
@@ -111966,6 +112248,66 @@ begin
   end;
 end;
 
+{$IFDEF OpenCL}
+function TNNetMoEExpertBankGateUp.IsGateUpBank(): boolean;
+begin
+  Result := true;
+end;
+
+function TNNetMoEExpertBankGateUp.OpenCLBankReady(): boolean;
+begin
+  Result := Assigned(FSourceLayer) and Assigned(FGateLayer);
+end;
+
+// The kernel reads TokenCnt*VectorSize floats from the source, which is exactly
+// the source size frozen at SetPrevLayer.
+function TNNetMoEExpertBankGateUp.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := PrevOutputOnOpenCL() and
+    (FPrevLayer.FOutput.Size = FTokenCnt * FVectorSize);
+end;
+
+// A resident source takes the device path even under the size verdict: the
+// host path would have to download it.
+function TNNetMoEExpertBankGateUp.WillOpenCL(): boolean;
+begin
+  Result := BankWillOpenCL()
+    // The slot map is indexed with FTokenCnt, frozen at SetPrevLayer.
+    and (FTokenCnt = FSourceLayer.FOutput.SizeX * FSourceLayer.FOutput.SizeY)
+    and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
+end;
+
+// Router read on the host; the slot map is uploaded once and shared with the
+// down bank; the result stays in OpenCL memory. Coded by Claude (AI).
+procedure TNNetMoEExpertBankGateUp.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+  ScaleInputFlag: integer;
+begin
+  FGateLayer.ForceOutputOnRAM();
+  BuildSlotMap();
+  ArmOpenCLWeightsIfStale();
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FBankCL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  FBankCL.UploadSlotMap(@FSlotExpert[0], @FSlotCount[0],
+    TNeuralFloatArrPtr(@FSlotGate[0]), FTokenCnt, FTopK);
+  if FScaleInputByGate then ScaleInputFlag := 1 else ScaleInputFlag := 0;
+  FBankCL.Compute(FBankCL, FPrevLayer.FOutput, SourceBuffer, FOutput,
+    FTokenCnt, FTopK, FExpertWidth, FVectorSize, ScaleInputFlag);
+  FSlotMapOnOpenCL := true;
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
+
 procedure TNNetMoEExpertBankGateUp.Backpropagate();
 begin
   raise Exception.Create('TNNetMoEExpertBankGateUp.Backpropagate: layer ' +
@@ -112046,11 +112388,13 @@ begin
     exit;
   end;
   Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
   // so the FP32 nest would read shrunk storage.
   // One work item per token: the serial pass has no reason to split rows.
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FQuantInt8
     then ComputeMixtureQuantizedInt8(0, FTokenCnt - 1, 1)
     else ComputeMixture(0, FTokenCnt - 1, 1);
@@ -112059,7 +112403,11 @@ end;
 
 procedure TNNetMoEExpertBankDown.PrepareChunkedForward();
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   // The chunk path never calls Compute; only the neuron array needs building,
   // since every chunk reads the gate|up bank's already-finished slot map.
   if FBank = nil then exit;
@@ -112235,166 +112583,56 @@ begin
 end;
 
 {$IFDEF OpenCL}
-// Packs the per-row biases the device kernel adds inside its slot loop. A bank
-// whose every row bias is zero (the usual case for MoE checkpoints) leaves
-// FDevBias nil, which pins the kernel's FUseBias to 0. Coded by Claude (AI).
-procedure TNNetMoEExpertBankDown.BuildOpenCLBias();
-var
-  RowIdx, MaxRowPos: integer;
-  HasBias: boolean;
+function TNNetMoEExpertBankDown.IsGateUpBank(): boolean;
 begin
-  MaxRowPos := FNeurons.Count - 1;
-  if High(FArrNeurons) < MaxRowPos then BuildArrNeurons();
-  HasBias := false;
-  for RowIdx := 0 to MaxRowPos do
-  begin
-    if FArrNeurons[RowIdx].FBiasWeight <> 0 then
-    begin
-      HasBias := true;
-      break;
-    end;
-  end;
-  if not HasBias then
-  begin
-    FreeAndNil(FDevBias);
-    exit;
-  end;
-  if not Assigned(FDevBias) then FDevBias := TNNetVolume.Create();
-  FDevBias.ReSize(FNeurons.Count, 1, 1);
-  for RowIdx := 0 to MaxRowPos do
-    FDevBias.FData[RowIdx] := FArrNeurons[RowIdx].FBiasWeight;
+  Result := false;
 end;
 
-// FP32 arming. The bank keeps per-neuron weight rows and deliberately never
-// concatenates them (FShouldConcatWeights stays false), so the packed block the
-// device needs is built here, uploaded and released again - it is a transient,
-// not a second permanent copy of the bank. Coded by Claude (AI).
-procedure TNNetMoEExpertBankDown.ArmOpenCLWeightsFP32();
-var
-  PackedW: TNNetVolume;
-  RowIdx, MaxRowPos: integer;
+function TNNetMoEExpertBankDown.OpenCLBankReady(): boolean;
 begin
-  MaxRowPos := FNeurons.Count - 1;
-  if MaxRowPos < 0 then exit;
-  PackedW := TNNetVolume.Create();
-  try
-    PackedW.ReSize(FNeurons.Count, 1, FVectorSize);
-    for RowIdx := 0 to MaxRowPos do
-      Move(FArrNeurons[RowIdx].FWeights.FData[0],
-        PackedW.FData[RowIdx * FVectorSize], FVectorSizeBytes);
-    FMoEDownCL.ArmWeightsFP32(PackedW);
-  finally
-    PackedW.Free;
-  end;
+  Result := FBank <> nil;
 end;
 
-procedure TNNetMoEExpertBankDown.ArmOpenCLWeights();
-begin
-  if not Assigned(FMoEDownCL) then exit;
-  // The entry point is chosen at construction from the quantization state, so a
-  // bank that changed state after arming needs a fresh helper, not just a fresh
-  // upload.
-  if FOpenCLArmed and (FOpenCLArmedInt8 <> FQuantInt8) then
-  begin
-    FreeAndNil(FMoEDownCL);
-    FMoEDownCL := TNNetMoEExpertDownCL.Create(FNN, FQuantInt8);
-  end;
-  // The kernel strides the bank by FExpertWidth, so an int8 table whose row
-  // width says otherwise must not be uploaded: stay unarmed (CPU forward).
-  if FQuantInt8 and (FQuantVectorSize <> FExpertWidth) then
-  begin
-    FOpenCLArmed := false;
-    FErrorProc('TNNetMoEExpertBankDown - layer ' + IntToStr(FLayerIdx) +
-      ' int8 row width ' + IntToStr(FQuantVectorSize) +
-      ' does not match the expert width ' + IntToStr(FExpertWidth) +
-      '. The device forward stays disabled.');
-    exit;
-  end;
-  BuildOpenCLBias();
-  if FQuantInt8 then
-  begin
-    // The quantization table is already row-major in the layout the kernel
-    // reads, so it uploads verbatim - no transpose, no staging copy.
-    FMoEDownCL.ArmWeightsInt8(FQuantTable.DataPtr, FQuantTable.ScalePtr,
-      FNeurons.Count, FQuantVectorSize);
-  end
-  else ArmOpenCLWeightsFP32();
-  FMoEDownCL.ArmBias(FDevBias);
-  FOpenCLArmedInt8 := FQuantInt8;
-  FOpenCLWeightsDirty := false;
-  FOpenCLArmed := true;
-end;
-
-procedure TNNetMoEExpertBankDown.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  // Bare arming ONLY. Chaining to TNNetLayerConcatedWeights.EnableOpenCL would
-  // set FShouldConcatWeights and resize FConcatedWeights/FConcatedWInter to the
-  // full expert bank - two FP32 copies of a block this layer never concatenates
-  // (see TNNetDepthwiseConv.EnableOpenCL for the same reasoning).
-  FHasOpenCL := true;
-  if FBank = nil then exit;
-  if not Assigned(FMoEDownCL) then
-    FMoEDownCL := TNNetMoEExpertDownCL.Create(FNN, FQuantInt8);
-  // Armed unconditionally, NOT gated on FShouldOpenCL: TNNet.ForceOpenCL runs
-  // after EnableOpenCL, so a verdict-gated arm would leave a forced layer
-  // (the parity tests) with no resident weights.
-  // ORDERING: the expert bank uploads once, here. EnableOpenCL must therefore
-  // run AFTER the checkpoint is loaded - arming a construction-time-quantized
-  // bank before its weights arrive would upload a block of zeros. The
-  // AfterWeightUpdate hook below re-arms if the weights change later.
-  ArmOpenCLWeights();
-end;
-
-procedure TNNetMoEExpertBankDown.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FMoEDownCL);
-  FreeAndNil(FDevBias);
-  FOpenCLArmed := false;
-end;
-
+// A resident gate|up output takes the device path even under the size verdict:
+// the host path would have to download it.
 function TNNetMoEExpertBankDown.WillOpenCL(): boolean;
 begin
-  Result := FHasOpenCL and FOpenCLArmed and (FBank <> nil)
-    and Assigned(FMoEDownCL)
+  Result := BankWillOpenCL()
     // The slot map is indexed with FTokenCnt, frozen at SetPrevLayer: a layer
     // whose output geometry drifted from it would misroute rows, so it falls
     // back to the (identically indexed, but self-consistent) CPU forward.
     and (FTokenCnt = FOutput.SizeX * FOutput.SizeY)
-    and (FShouldOpenCL or FForceOpenCL);
+    and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
 end;
 
-procedure TNNetMoEExpertBankDown.AfterWeightUpdate();
-begin
-  inherited AfterWeightUpdate();
-  // The resident bank is now stale. int8 banks are immutable in practice (the
-  // layer is inference-only), but an FP32 bank can still be rewritten by a
-  // loader after arming, and re-uploading is far cheaper than being wrong.
-  FOpenCLWeightsDirty := true;
-end;
-
-// Single-launch device forward. Everything the kernel needs beyond the resident
-// bank is small: the gate|up bank's slot map (routing, rebuilt every forward),
-// its slot-packed hidden state, and this layer's output. Coded by Claude (AI).
+// Binds the gate|up bank's resident hidden state and slot map when it ran in
+// OpenCL this pass, else uploads both. Coded by Claude (AI).
 procedure TNNetMoEExpertBankDown.ComputeOpenCL();
 var
   UnitCombineFlag: integer;
+  HiddenBuffer: cl_mem;
+  SlotMapOwner: TNNetMoEExpertBankCL;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  if FOpenCLWeightsDirty or (FOpenCLArmedInt8 <> FQuantInt8) then
-    ArmOpenCLWeights();
+  ArmOpenCLWeightsIfStale();
+  if FBank.FSlotMapOnOpenCL and PrevOutputOnOpenCL() then
+  begin
+    HiddenBuffer := FBank.OpenCLOutputBuffer();
+    SlotMapOwner := FBank.FBankCL;
+    FBank.OpenCLWaitOutputIfAnotherQueue(FBankCL.OutputKernel());
+  end
+  else
+  begin
+    HiddenBuffer := nil;
+    SlotMapOwner := FBankCL;
+    FBank.ForceOutputOnRAM();
+    FBankCL.UploadSlotMap(@FBank.FSlotExpert[0], @FBank.FSlotCount[0],
+      TNeuralFloatArrPtr(@FBank.FSlotGate[0]), FTokenCnt, FTopK);
+  end;
   if FUnitCombine then UnitCombineFlag := 1 else UnitCombineFlag := 0;
-  FMoEDownCL.Compute(@FBank.FSlotExpert[0], @FBank.FSlotCount[0],
-    TNeuralFloatArrPtr(@FBank.FSlotGate[0]),
-    FPrevLayer.FOutput, FOutput,
+  FBankCL.Compute(SlotMapOwner, FBank.FOutput, HiddenBuffer, FOutput,
     FTokenCnt, FTopK, FHiddenSize, FExpertWidth, UnitCombineFlag);
-end;
-
-destructor TNNetMoEExpertBankDown.Destroy();
-begin
-  FreeAndNil(FMoEDownCL);
-  FreeAndNil(FDevBias);
-  inherited Destroy();
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 

@@ -27,6 +27,10 @@ type
   TFusedSDPASplitLaunch = record
     Splits, ChunkRows, StaticLocalBytes, LocalMemBytes, ScratchBytes: integer;
   end;
+  // Variants of the MoE expert-bank OpenCL parity harness.
+  TMoEBankParityOption = (moQuantize, moScaleInput, moBias, moSparseRouter,
+    moHostGateUp, moQuantizeAfterArming);
+  TMoEBankParityOptions = set of TMoEBankParityOption;
 
   TTestNeuralNumerical = class(TTestCase)
   private
@@ -44,9 +48,9 @@ type
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
     // SparseRouter swaps the top-k gate for a ReLU'd linear router, whose exact
     // zeros leave some tokens with FEWER than TopK filled slots.
-    procedure RunMoEBankDownOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
-      ExpertWidth, TopCnt: integer; Quantize, ScaleInputByGate, WithBias,
-      SparseRouter: boolean; const Msg: string; Tolerance: TNeuralFloat);
+    procedure RunMoEBankOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
+      ExpertWidth, TopCnt: integer; Options: TMoEBankParityOptions;
+      const Msg: string; Tolerance: TNeuralFloat);
     // Runs one split-row decode parity case, prints its max|diff| and launch
     // geometry, and checks the OpenCL forward count and the tolerance.
     function CheckFusedSDPASplitCase(const What: string; QHeads, KVHeads, Dk,
@@ -761,17 +765,18 @@ type
     // TQuantRowsTransposeFan (the PrepareInt8DotCL / PrepareInt4DotCL repack)
     // equals the volume methods, inline and split into worker ranges.
     procedure TestCopyQuantRowsTransposedMatchesVolumeMethods;
-    // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
-    // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
-    // mixture of one MoE block in one kernel, reading the gate|up bank's slot
-    // map. The gate|up bank has no device path, so its output doubles as a
-    // routing-stability check across the CPU and device runs. Coded by Claude (AI).
-    procedure MoEExpertBankDownOpenCLParity;
-    procedure MoEExpertBankDownOpenCLParityInt8;
-    procedure MoEExpertBankDownOpenCLParityDecode;
-    procedure MoEExpertBankDownOpenCLParityScaleInput;
-    procedure MoEExpertBankDownOpenCLParityDenseGate;
-    procedure MoEExpertBankDownOpenCLParitySparseRouter;
+    // OpenCL single-launch forward parity (vs the fused CPU forward) for the
+    // MoE gate|up and down banks, chained in OpenCL memory: residency and
+    // binding are checked with sentinels. Coded by Claude (AI).
+    procedure MoEExpertBankOpenCLParity;
+    procedure MoEExpertBankOpenCLParityInt8;
+    procedure MoEExpertBankOpenCLParityDecode;
+    procedure MoEExpertBankOpenCLParityScaleInput;
+    procedure MoEExpertBankOpenCLParityScaleInputInt8;
+    procedure MoEExpertBankOpenCLParityDenseGate;
+    procedure MoEExpertBankOpenCLParitySparseRouter;
+    procedure MoEExpertBankOpenCLParityHostGateUp;
+    procedure MoEExpertBankOpenCLParityQuantizeAfterArming;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -79202,45 +79207,94 @@ begin
 end;
 {$ENDIF}
 
-// CPU-vs-device forward parity for the fused MoE down bank. The whole net is
-// computed once on the CPU (fused CPU mixture), then again with the device path
-// forced on, and the two down-bank outputs are compared. Two guards keep the
-// comparison honest: the gate|up bank has NO device path, so its output must be
-// bit-identical across the two runs (proving the routing did not drift), and
-// the down bank's ForwardGPUCnt must be non-zero (proving the device path was
-// actually taken instead of silently falling back). Coded by Claude (AI).
-procedure TTestNeuralNumerical.RunMoEBankDownOpenCLParity(TokenCnt, HiddenSize,
-  ExpertCnt, ExpertWidth, TopCnt: integer; Quantize, ScaleInputByGate, WithBias,
-  SparseRouter: boolean; const Msg: string; Tolerance: TNeuralFloat);
+// CPU-vs-OpenCL parity of both fused MoE banks; host sentinels in the source and
+// the gate|up output prove both are bound, not downloaded. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RunMoEBankOpenCLParity(TokenCnt, HiddenSize,
+  ExpertCnt, ExpertWidth, TopCnt: integer; Options: TMoEBankParityOptions;
+  const Msg: string; Tolerance: TNeuralFloat);
 {$IFDEF OpenCL}
+const
+  csMoESentinel = 12345.0;
 var
   NN: TNNet;
-  Input, OutCPU, GateUpCPU: TNNetVolume;
-  InputLayer, GateConv, Router, BankGateUp, BankDown: TNNetLayer;
+  Input, OutCPU, GateUpCPU, OutDev, GateUpDev: TNNetVolume;
+  InputLayer, Source, GateConv, Router, BankGateUp, BankDown: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  Pos, MaxPos: integer;
-  Diff, MaxDiff: TNeuralFloat;
+  Pos, MaxPos, NeuronPos, SourceSentinels, GateUpSentinels: integer;
+  GateUpDiff, DownDiff: TNeuralFloat;
+  GateUpOnOpenCL, QuantizeLate: boolean;
+
+  procedure QuantizeBanks();
+  begin
+    TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
+    TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
+    AssertTrue(Msg + ' - gate|up bank is int8',
+      TNNetLayerConcatedWeights(BankGateUp).WeightsQuantizedInt8);
+    AssertTrue(Msg + ' - down bank is int8',
+      TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
+  end;
+
+  function CountSentinels(V: TNNetVolume): integer;
+  var
+    ElementPos: integer;
+  begin
+    Result := 0;
+    for ElementPos := 0 to V.Size - 1 do
+      if V.FData[ElementPos] = csMoESentinel then Inc(Result);
+  end;
+
+  function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+  var
+    ElementPos: integer;
+  begin
+    AssertEquals(Msg + ' - output size match', A.Size, B.Size);
+    Result := 0;
+    for ElementPos := 0 to A.Size - 1 do
+      Result := Max(Result, Abs(A.FData[ElementPos] - B.FData[ElementPos]));
+  end;
+
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
+  GateUpOnOpenCL := not (moHostGateUp in Options);
+  QuantizeLate := moQuantizeAfterArming in Options;
   RandSeed := 424242;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(TokenCnt, 1, HiddenSize);
   OutCPU := TNNetVolume.Create();
   GateUpCPU := TNNetVolume.Create();
+  OutDev := TNNetVolume.Create();
+  GateUpDev := TNNetVolume.Create();
   try
     InputLayer := NN.AddLayer(TNNetInput.Create(TokenCnt, 1, HiddenSize));
-    GateConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt));
-    if SparseRouter then
+    if GateUpOnOpenCL then
+    begin
+      // An identity pointwise convolution that leaves its output in OpenCL
+      // memory, so the gate|up bank has a resident source to bind.
+      Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(HiddenSize).
+        SetTrainable(False, False));
+      for NeuronPos := 0 to Source.Neurons.Count - 1 do
+      begin
+        Source.Neurons[NeuronPos].Weights.Fill(0);
+        Source.Neurons[NeuronPos].Weights.FData[NeuronPos] := 1;
+        Source.Neurons[NeuronPos].BiasWeight := 0;
+      end;
+      Source.FlushWeightCache();
+    end
+    else Source := NN.AddLayer(TNNetIdentity.Create());
+    // Not trainable, so it binds the resident source instead of downloading it.
+    GateConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt).
+      SetTrainable(False, False));
+    if moSparseRouter in Options then
     begin
       // Not a TNNetTopKGate, so the bank treats the router as dense (TopK =
       // ExpertCnt) while ReLU's EXACT zeros leave most tokens with fewer than
-      // TopK filled slots - the only configuration that exercises the kernel's
-      // partial slot loop.
+      // TopK filled slots - the only configuration that exercises the kernels'
+      // empty-slot handling.
       Router := NN.AddLayer(TNNetReLU.Create());
     end
     else
@@ -79248,73 +79302,95 @@ begin
       NN.AddLayer(TNNetPointwiseSoftMax.Create());
       Router := NN.AddLayer(TNNetTopKGate.Create(TopCnt, {pRenormalize=}true));
     end;
-    BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(
-      ExpertCnt, ExpertWidth, InputLayer, Router, ScaleInputByGate));
+    BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(ExpertCnt,
+      ExpertWidth, Source, Router, moScaleInput in Options));
     BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
     FillMoEDownLayer(GateConv, 4, true);
-    FillMoEDownLayer(BankGateUp, 1, WithBias);
-    FillMoEDownLayer(BankDown, 2, WithBias);
-    if Quantize then
-    begin
-      TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
-      TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
-      AssertTrue(Msg + ' - down bank is int8',
-        TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
-    end;
+    FillMoEDownLayer(BankGateUp, 1, moBias in Options);
+    FillMoEDownLayer(BankDown, 2, moBias in Options);
+    if moQuantize in Options then QuantizeBanks();
     MaxPos := Input.Size - 1;
     for Pos := 0 to MaxPos do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
 
-    NN.Compute(Input);
-    OutCPU.Copy(BankDown.Output);
-    GateUpCPU.Copy(BankGateUp.Output);
-    AssertTrue(Msg + ' - CPU output is non-trivial',
-      OutCPU.GetMaxAbs() > 1e-3);
+    if not QuantizeLate then
+    begin
+      NN.Compute(Input);
+      OutCPU.Copy(BankDown.Output);
+      GateUpCPU.Copy(BankGateUp.Output);
+    end;
 
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
+    // Toy sizes fail the size verdict, so an unforced bank with a host source
+    // stays on the CPU.
+    if not GateUpOnOpenCL then BankGateUp.ForceOpenCL(False);
     try
+      BankGateUp.ForwardGPUCnt := 0;
       BankDown.ForwardGPUCnt := 0;
       NN.Compute(Input);
-      // Second device forward with UNCHANGED weights: exercises the resident
-      // expert-bank reuse (no re-upload).
+      if QuantizeLate then
+      begin
+        // The re-arm after the flip recovers the resident outputs to RAM once.
+        QuantizeBanks();
+        NN.Compute(Input);
+      end;
+      Source.Output.Fill(csMoESentinel);
+      BankGateUp.Output.Fill(csMoESentinel);
+      // Resident expert-bank reuse: no re-upload, no download.
       NN.Compute(Input);
-      AssertTrue(Msg + ' - the down bank must take the device path',
+      SourceSentinels := CountSentinels(Source.Output);
+      GateUpSentinels := CountSentinels(BankGateUp.Output);
+      AssertTrue(Msg + ' - the down bank must take the OpenCL path',
         BankDown.ForwardGPUCnt > 0);
-      AssertEquals(Msg + ' - output size match', OutCPU.Size,
-        BankDown.Output.Size);
-      // The gate|up bank stays on the CPU, so a LARGE change here would mean a
-      // different set of experts was selected and the comparison below would be
-      // meaningless. The router itself does run on the device in the second
-      // pass, so its float noise reaches this output whenever the bank folds
-      // the gate weight into the expert input (ScaleInputByGate) - hence a
-      // tolerance rather than exact equality. A flipped expert moves this by
-      // orders of magnitude more.
-      MaxDiff := 0;
-      MaxPos := GateUpCPU.Size - 1;
-      for Pos := 0 to MaxPos do
+      AssertTrue(Msg + ' - the down bank output stays in OpenCL memory',
+        BankDown.OutputBindableOnOpenCL());
+      if GateUpOnOpenCL then
       begin
-        Diff := Abs(GateUpCPU.FData[Pos] - BankGateUp.Output.FData[Pos]);
-        if Diff > MaxDiff then MaxDiff := Diff;
-      end;
-      AssertTrue(Msg + ' - the same experts must be selected across the two ' +
-        'runs (gate|up max |diff| = ' + FloatToStr(MaxDiff) + ')',
-        MaxDiff < 1e-5);
-      MaxDiff := 0;
-      MaxPos := OutCPU.Size - 1;
-      for Pos := 0 to MaxPos do
+        AssertTrue(Msg + ' - the gate|up bank must take the OpenCL path',
+          BankGateUp.ForwardGPUCnt > 0);
+        AssertTrue(Msg + ' - the gate|up output stays in OpenCL memory',
+          BankGateUp.OutputBindableOnOpenCL());
+        AssertEquals(Msg + ' - the resident source is not downloaded',
+          Source.Output.Size, SourceSentinels);
+        AssertEquals(Msg + ' - the gate|up output is not downloaded',
+          BankGateUp.Output.Size, GateUpSentinels);
+      end
+      else
       begin
-        Diff := Abs(OutCPU.FData[Pos] - BankDown.Output.FData[Pos]);
-        if Diff > MaxDiff then MaxDiff := Diff;
+        AssertEquals(Msg + ' - the gate|up bank stays on the CPU', 0,
+          BankGateUp.ForwardGPUCnt);
+        AssertEquals(Msg + ' - the CPU gate|up bank writes its host output', 0,
+          GateUpSentinels);
       end;
+      BankGateUp.ForceOutputOnRAM();
+      BankDown.ForceOutputOnRAM();
+      GateUpDev.Copy(BankGateUp.Output);
+      OutDev.Copy(BankDown.Output);
     finally
       NN.ForceOpenCL(False);
     end;
-    WriteLn('  MoE down bank OpenCL parity (', Msg, '): max|diff|=',
-      MaxDiff:0:9);
+    if QuantizeLate then
+    begin
+      // The int8 CPU reference.
+      NN.DisableOpenCL();
+      NN.Compute(Input);
+      OutCPU.Copy(BankDown.Output);
+      GateUpCPU.Copy(BankGateUp.Output);
+    end;
+    AssertTrue(Msg + ' - CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+    GateUpDiff := MaxAbsDiff(GateUpCPU, GateUpDev);
+    DownDiff := MaxAbsDiff(OutCPU, OutDev);
+    WriteLn('  MoE bank OpenCL parity (', Msg, '): gate|up max|diff|=',
+      GateUpDiff:0:9, ' down max|diff|=', DownDiff:0:9);
+    AssertTrue(Msg + ' - MoE gate|up bank OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(GateUpDiff) + ' must be < ' + FloatToStr(Tolerance),
+      GateUpDiff < Tolerance);
     AssertTrue(Msg + ' - MoE down bank OpenCL vs CPU parity: max |diff| = ' +
-      FloatToStr(MaxDiff) + ' must be < ' + FloatToStr(Tolerance),
-      MaxDiff < Tolerance);
+      FloatToStr(DownDiff) + ' must be < ' + FloatToStr(Tolerance),
+      DownDiff < Tolerance);
   finally
+    GateUpDev.Free;
+    OutDev.Free;
     GateUpCPU.Free;
     OutCPU.Free;
     Input.Free;
@@ -79327,52 +79403,70 @@ begin
 end;
 {$ENDIF}
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParity;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParity;
 begin
   // 3 tokens, 5 experts, 2 kept, biases on: the data-dependent router makes
   // different tokens select different experts.
-  RunMoEBankDownOpenCLParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
-    {ExpertWidth=}4, {TopCnt=}2, {Quantize=}false, {ScaleInputByGate=}false,
-    {WithBias=}true, {SparseRouter=}false, 'k<E multi-token', 1e-4);
+  RunMoEBankOpenCLParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
+    {ExpertWidth=}4, {TopCnt=}2, [moBias], 'k<E multi-token', 1e-4);
 end;
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityInt8;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityInt8;
 begin
-  // Resident int8 codes + per-row scales, compared against the fused int8 CPU
-  // mixture (both dequantize the same codes, so the gate is tight).
-  RunMoEBankDownOpenCLParity(3, 6, 5, 4, 2, {Quantize=}true, false,
-    {WithBias=}true, false, 'int8 k<E', 1e-4);
+  // Resident int8 codes + per-row scales in both banks, compared against the
+  // fused int8 CPU forward (both dequantize the same codes).
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moQuantize, moBias], 'int8 k<E', 1e-4);
 end;
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityDecode;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityDecode;
 begin
-  // One token: the decode shape, where the NDRange collapses to a single
-  // column. Bias-free, which pins the kernel's UseBias = 0 path.
-  RunMoEBankDownOpenCLParity(1, 8, 4, 5, 2, false, false, {WithBias=}false,
-    false, 'decode single token', 1e-4);
+  // One token: the decode shape. Bias-free, which pins the kernels'
+  // UseBias = 0 path.
+  RunMoEBankOpenCLParity(1, 8, 4, 5, 2, [], 'decode single token', 1e-4);
 end;
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityScaleInput;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityScaleInput;
 begin
-  // Llama-4 routing: the gate already scaled the expert INPUT, so the mixture
-  // must combine the slots with weight 1 (UnitCombine).
-  RunMoEBankDownOpenCLParity(3, 6, 5, 4, 2, false, {ScaleInputByGate=}true,
-    {WithBias=}false, false, 'scale-input', 1e-4);
+  // Llama-4 routing: the gate|up bank scales the expert INPUT by the gate, so
+  // the down bank combines the slots with weight 1 (UnitCombine).
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moScaleInput], 'scale-input', 1e-4);
 end;
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityDenseGate;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityScaleInputInt8;
+begin
+  // The int8 gate|up kernel applies row scale * input gate to the raw code sum.
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moQuantize, moScaleInput, moBias],
+    'int8 scale-input', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityDenseGate;
 begin
   // TopCnt = ExpertCnt: every expert fires for every token.
-  RunMoEBankDownOpenCLParity(2, 5, 3, 3, 3, false, false, true, false,
-    'dense gate', 1e-4);
+  RunMoEBankOpenCLParity(2, 5, 3, 3, 3, [moBias], 'dense gate', 1e-4);
 end;
 
-procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParitySparseRouter;
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParitySparseRouter;
 begin
-  // ReLU'd linear router: tokens fill FEWER slots than TopK, and a token whose
-  // gate is all-zero must produce exactly zero.
-  RunMoEBankDownOpenCLParity(4, 6, 5, 4, 5, false, false, true,
-    {SparseRouter=}true, 'sparse router / partial slots', 1e-4);
+  // ReLU'd linear router: tokens fill FEWER slots than TopK, so the gate|up
+  // kernel must zero the empty slots and an all-zero gate must give zero.
+  RunMoEBankOpenCLParity(4, 6, 5, 4, 5, [moBias, moSparseRouter],
+    'sparse router / partial slots', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityHostGateUp;
+begin
+  // Gate|up bank on the CPU: the down bank uploads the hidden state and its
+  // own copy of the slot map.
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 3, [moBias, moHostGateUp],
+    'host gate|up', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankOpenCLParityQuantizeAfterArming;
+begin
+  // Banks armed as FP32 and then quantized: both must rebuild their entry
+  // point and re-upload before the next forward.
+  RunMoEBankOpenCLParity(3, 6, 5, 4, 2, [moBias, moQuantizeAfterArming],
+    'int8 after FP32 arming', 1e-4);
 end;
 
 // General-convolution BACKWARD device offload parity (vs CPU). Builds a small
