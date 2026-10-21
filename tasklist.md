@@ -293,11 +293,10 @@ rather than acted on.
             instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
             + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
             ab_t = 1 (Beta1 = 0). Not needed by Marigold.
-      - [ ] Pipeline step 1: the building blocks with tiny random nets (no
-            weights needed): an image -> latent encode via `BuildVaeEncoder`, the
-            8-channel UNet concat (image latent ++ noisy target latent), and the
-            4-step DDIM v-prediction loop with tsTrailing +
-            pRescaleZeroTerminalSNR, as a smoke test that the shapes line up.
+      - [X] Pipeline step 1: `MarigoldDenoise` (neuralpretrained.pas) runs the
+            trailing DDIM loop on ImageLatent ++ Target at diffusers t = Tt-1;
+            covered by `TestMarigoldDenoiseSmoke` (pico VAE encoder + 8-channel
+            pico UNet).
       - [ ] Pipeline step 2 — the pipeline routine in neuralpretrained.pas: resize the long side to
             `default_processing_resolution` (768), pad to a multiple of 8 and
             unpad after (the VAE/UNet builders take a square grid today, so

@@ -88,6 +88,7 @@ type
     procedure TestLocalResponseDepthMatchesReference;
     procedure TestStdNormalStreamDeterministicAndPrivate;
     procedure TestRandomStdNormalMoments;
+    procedure TestAddLayersDepthConcatNonSquare;
   end;
 
   // TNNetVolumeQuant8 holds int8 codes under the TNNetVolume geometry
@@ -240,6 +241,40 @@ begin
       AssertEquals('All values should be 5.0', 5.0, V.Raw[I], 0.0001);
   finally
     V.Free;
+  end;
+end;
+
+// AddLayers(A, B) is a depth concat: A's channels first, then B's, on a
+// non-square grid.
+procedure TTestNeuralVolume.TestAddLayersDepthConcatNonSquare;
+var
+  A, B, Dst: TNNetVolume;
+  X, Y, D: integer;
+begin
+  A := TNNetVolume.Create(3, 2, 2);
+  B := TNNetVolume.Create(3, 2, 3);
+  Dst := TNNetVolume.Create;
+  try
+    for X := 0 to 2 do
+      for Y := 0 to 1 do
+      begin
+        for D := 0 to 1 do A[X, Y, D] := 100 * X + 10 * Y + D;
+        for D := 0 to 2 do B[X, Y, D] := -(100 * X + 10 * Y + D);
+      end;
+    Dst.AddLayers(A, B);
+    AssertEquals('SizeX', 3, Dst.SizeX);
+    AssertEquals('SizeY', 2, Dst.SizeY);
+    AssertEquals('Depth', 5, Dst.Depth);
+    for X := 0 to 2 do
+      for Y := 0 to 1 do
+      begin
+        for D := 0 to 1 do
+          AssertEquals('A part', A[X, Y, D], Dst[X, Y, D], 0.0);
+        for D := 0 to 2 do
+          AssertEquals('B part', B[X, Y, D], Dst[X, Y, D + 2], 0.0);
+      end;
+  finally
+    A.Free; B.Free; Dst.Free;
   end;
 end;
 

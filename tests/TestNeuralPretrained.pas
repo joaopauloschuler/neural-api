@@ -1077,6 +1077,7 @@ type
     procedure TestSDUNetSDXLParity;
     procedure TestSDUNetPerBlockHeadsParity;
     procedure TestDiffusionInpaintSmoke;
+    procedure TestMarigoldDenoiseSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -42248,6 +42249,144 @@ begin
     ImgIn.Free; Z0.Free; Mask.Free; EncStates.Free;
     Latents.Free; Scratch.Free; KnownNoised.Free;
     Sched.Free; Enc.Free; UNet.Free;
+  end;
+end;
+
+// Marigold building blocks on pico nets: VAE-encode an image to its latent, widen
+// the linear-projection (SD2-style) pico UNet's conv_in to 8 input channels and
+// run MarigoldDenoise with Marigold's scheduler options. A hand-written loop with
+// a per-element concat and diffusers' timesteps 999/749/499/249 must agree.
+procedure TTestNeuralPretrained.TestMarigoldDenoiseSmoke;
+const
+  cSteps = 4;
+  cTimesteps: array[0..cSteps - 1] of integer = (999, 749, 499, 249);
+  csConvIn = 'conv_in.weight';
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  Path, TName: string;
+  Dims: array of Int64;
+  Info: TSafeTensorInfo;
+  t, d, TensorCntM1, DimCntM1: integer;
+  Enc, UNet: TNNet;
+  EncCfg: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  Img, ImageLatent, EncStates, Target, Expected, UNetInput, Pred: TNNetVolume;
+  ImgGrid, LatGrid, LatDepth, i, x, y, c, k, TtPrev: integer;
+  MaxDiff, PredAbsSum: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_marigold_unet8.safetensors';
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_sd_unet_linproj.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(Path);
+  V := TNNetVolume.Create;
+  try
+    TensorCntM1 := Reader.Count - 1;
+    for t := 0 to TensorCntM1 do
+    begin
+      TName := Reader.TensorName(t);
+      Info := Reader.GetInfo(TName);
+      DimCntM1 := Length(Info.Shape) - 1;
+      SetLength(Dims, DimCntM1 + 1);
+      for d := 0 to DimCntM1 do Dims[d] := Info.Shape[d];
+      Reader.LoadTensorFlat(TName, V);
+      if TName = csConvIn then
+      begin
+        // [out, 4, 3, 3] -> [out, 8, 3, 3]: image latent ++ target latent.
+        Dims[1] := 2 * Dims[1];
+        V.ReSize(Dims[0] * Dims[1] * Dims[2] * Dims[3], 1, 1);
+        V.RandomizeGaussian(0.1);
+      end;
+      Writer.AddTensorFlat(TName, Dims, V);
+    end;
+    Writer.SaveToFile();
+  finally
+    V.Free;
+    Writer.Free;
+    Reader.Free;
+  end;
+  UCfg := ReadSDUNetConfigFromJSONFile(
+    FixturePath('tiny_sd_unet_linproj_config.json'));
+  UCfg.InChannels := 8;
+  Enc := nil; UNet := nil; Sched := nil;
+  Img := TNNetVolume.Create; ImageLatent := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create; Target := TNNetVolume.Create;
+  Expected := TNNetVolume.Create; UNetInput := TNNetVolume.Create;
+  Pred := TNNetVolume.Create;
+  try
+    UNet := BuildSDUNetFromSafeTensorsEx(Path, UCfg);
+    Enc := BuildVaeEncoderFromSafeTensors(
+      FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
+      {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
+    Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+      0.00085, 0.012, 0.008, {pRescaleZeroTerminalSNR=}true,
+      {pFinalAlphaBarIsOne=}false);
+    LatGrid := EncCfg.LatentGrid;
+    LatDepth := EncCfg.LatentChannels;
+    AssertEquals('VAE latent grid = UNet grid', UCfg.LatentGrid, LatGrid);
+    AssertEquals('UNet out = latent channels', LatDepth, UCfg.OutChannels);
+    ImgGrid := LatGrid shl (EncCfg.NumBlockOut - 1);
+    Img.ReSize(ImgGrid, ImgGrid, EncCfg.OutChannels);
+    for y := 0 to ImgGrid - 1 do
+      for x := 0 to ImgGrid - 1 do
+        for c := 0 to EncCfg.OutChannels - 1 do
+          Img[x, y, c] := Sin(0.3 * x + 0.5 * y + c);
+    Enc.Compute(Img);
+    ImageLatent.Copy(Enc.GetLastLayer().Output);
+    AssertEquals('latent X', LatGrid, ImageLatent.SizeX);
+    AssertEquals('latent Y', LatGrid, ImageLatent.SizeY);
+    AssertEquals('latent D', LatDepth, ImageLatent.Depth);
+    EncStates.ReSize(UCfg.TextSeqLen, 1, UCfg.CrossAttentionDim);
+    EncStates.RandomizeGaussian(0.5);
+    Target.ReSize(LatGrid, LatGrid, LatDepth);
+    Target.RandomizeGaussian(1.0);
+    Expected.Copy(Target);
+
+    MarigoldDenoise(UNet, UCfg, ImageLatent, EncStates, Sched, cSteps,
+      Target, UNetInput, Pred);
+    AssertEquals('UNet input depth', 8, UNetInput.Depth);
+    AssertEquals('target X', LatGrid, Target.SizeX);
+    AssertEquals('target D', LatDepth, Target.Depth);
+    for x := 0 to LatGrid - 1 do
+      for y := 0 to LatGrid - 1 do
+        for c := 0 to LatDepth - 1 do
+          AssertEquals('image latent first', ImageLatent[x, y, c],
+            UNetInput[x, y, c], 0.0);
+
+    // Reference loop (Expected still holds the starting noise).
+    PredAbsSum := 0;
+    for k := 0 to cSteps - 1 do
+    begin
+      UNetInput.ReSize(LatGrid, LatGrid, 2 * LatDepth);
+      for x := 0 to LatGrid - 1 do
+        for y := 0 to LatGrid - 1 do
+          for c := 0 to LatDepth - 1 do
+          begin
+            UNetInput[x, y, c] := ImageLatent[x, y, c];
+            UNetInput[x, y, LatDepth + c] := Expected[x, y, c];
+          end;
+      SDUNetDenoise(UNet, UCfg, UNetInput, EncStates, cTimesteps[k], Pred);
+      if k < cSteps - 1 then TtPrev := cTimesteps[k + 1] + 1 else TtPrev := 0;
+      if k = 0 then PredAbsSum := Pred.GetSumAbs();
+      Sched.Step(Expected, Pred, cTimesteps[k] + 1, TtPrev, smDDIM, 0.0);
+    end;
+    AssertTrue('UNet prediction non-zero', PredAbsSum > 1e-6);
+    MaxDiff := 0;
+    for i := 0 to Target.Size - 1 do
+    begin
+      AssertFalse('finite', IsNan(Target.FData[i]) or IsInfinite(Target.FData[i]));
+      MaxDiff := Max(MaxDiff, Abs(Target.FData[i] - Expected.FData[i]));
+    end;
+    AssertTrue('MarigoldDenoise = reference loop, max|diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+  finally
+    Img.Free; ImageLatent.Free; EncStates.Free; Target.Free;
+    Expected.Free; UNetInput.Free; Pred.Free;
+    Sched.Free; Enc.Free; UNet.Free;
+    DeleteFile(Path);
   end;
 end;
 

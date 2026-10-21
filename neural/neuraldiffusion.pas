@@ -176,10 +176,6 @@ type
     // Map a (continuous) target sigma back to the nearest schedule timestep in
     // 1..T whose Sigma() is closest. Used by the Karras spacing.
     function SigmaToTimestep(TargetSigma: TNeuralFloat): integer;
-    // Build a list of NumSteps+1 timesteps (descending, last entry 0 = clean
-    // image) using the requested spacing. Caller-owned dynamic array.
-    function BuildTimestepSchedule(NumSteps: integer;
-      Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
     // Heun 2nd-order trajectory (smHeun). Separated from Sample() because it is
     // the only method that calls Denoise TWICE per step (a genuine intra-step
     // second derivative), so it cannot share the single-eval Step() dispatch.
@@ -189,6 +185,10 @@ type
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
   public
+    // Build a list of NumSteps+1 timesteps (descending, last entry 0 = clean
+    // image) using the requested spacing. Caller-owned dynamic array.
+    function BuildTimestepSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
     // x0 from eps or v (dpV: sqrt(ab_t)*x_t - sqrt(1-ab_t)*v, exact at ab_t = 0).
     // X0Out may alias RawPred, never Xt.
     procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);

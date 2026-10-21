@@ -11737,6 +11737,12 @@ procedure SDUNetDenoiseInpaint(Net: TNNet; const Config: TSDUNetConfig;
   const Schedule: array of integer; Sampler: TNNetSamplerMethod;
   Eta: TNeuralFloat; Latents, Scratch, KnownNoised: TNNetVolume);
 
+// Marigold: NumSteps trailing DDIM (eta 0) steps on Target in place; the UNet sees
+// ImageLatent ++ Target (depth) at t = Tt-1. UNetInput, Pred: caller scratch.
+procedure MarigoldDenoise(UNet: TNNet; const Config: TSDUNetConfig;
+  ImageLatent, EncStates: TNNetVolume; Sched: TNNetDiffusionScheduler;
+  NumSteps: integer; Target, UNetInput, Pred: TNNetVolume);
+
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
 // built with BuildSDUNet(..., pWithControl=true). DownResiduals (the ControlNet
 // down_block_res_samples, in build order: conv_in, then each down resnet, then
@@ -74602,6 +74608,30 @@ begin
   // Final composite at t=0: the kept region is EXACTLY the clean source latent so
   // the unmasked output is pixel-faithful (latent-exact) by construction.
   InpaintBlend(Latents, Z0, MaskLatent);
+end;
+
+procedure MarigoldDenoise(UNet: TNNet; const Config: TSDUNetConfig;
+  ImageLatent, EncStates: TNNetVolume; Sched: TNNetDiffusionScheduler;
+  NumSteps: integer; Target, UNetInput, Pred: TNNetVolume);
+var
+  Schedule: TNeuralIntegerArray;
+  StepPos, MaxStepPos: integer;
+begin
+  if ImageLatent.Depth + Target.Depth <> Config.InChannels then
+    ImportError('MarigoldDenoise: image latent depth ' +
+      IntToStr(ImageLatent.Depth) + ' + target depth ' + IntToStr(Target.Depth) +
+      ' <> UNet in_channels ' + IntToStr(Config.InChannels) + '.');
+  if (ImageLatent.SizeX <> Target.SizeX) or (ImageLatent.SizeY <> Target.SizeY) then
+    ImportError('MarigoldDenoise: image latent and target grids differ.');
+  Schedule := Sched.BuildTimestepSchedule(NumSteps, tsTrailing);
+  Sched.ResetMultistep;
+  MaxStepPos := Length(Schedule) - 2;
+  for StepPos := 0 to MaxStepPos do
+  begin
+    UNetInput.AddLayers(ImageLatent, Target);
+    SDUNetDenoise(UNet, Config, UNetInput, EncStates, Schedule[StepPos] - 1, Pred);
+    Sched.Step(Target, Pred, Schedule[StepPos], Schedule[StepPos + 1], smDDIM, 0.0);
+  end;
 end;
 
 function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;

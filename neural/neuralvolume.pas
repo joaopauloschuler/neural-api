@@ -9416,7 +9416,7 @@ var
   RowBytesA, RowBytesB, ADepth: integer;
 begin
   MaxX := Max(A.FSizeX, B.FSizeX);
-  MaxY := Max(A.FSizeX, B.FSizeX);
+  MaxY := Max(A.FSizeY, B.FSizeY);
   MaxD := A.FDepth + B.FDepth;
   Resize(MaxX,MaxY,MaxD);
 
