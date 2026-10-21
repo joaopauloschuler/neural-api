@@ -39,6 +39,26 @@ procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
 // GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
 
+// Outpaint canvas: Image at (Left, Top) on a larger Canvas, the new border
+// clamp-to-edge; Mask (W, H, 1) is 1 there and Overlap pixels in, 0 elsewhere.
+procedure BuildOutpaintCanvas(Image: TNNetVolume; Left, Top, Right, Bottom,
+  Overlap: integer; Canvas, Mask: TNNetVolume);
+
+// Copies Image over Dest (its BuildOutpaintCanvas size) where that Mask is 0,
+// the channels both have, so the kept pixels are exact.
+procedure PasteOutpaintOriginal(Image: TNNetVolume; Left, Top, Right,
+  Bottom, Overlap: integer; Dest: TNNetVolume);
+
+// Grows Right (Left when only Left is extended) and Bottom (or Top) so the
+// outpaint canvas sides are multiples of Multiple.
+procedure GrowOutpaintSidesToMultiple(ImageSizeX, ImageSizeY,
+  Multiple: integer; var Left, Top, Right, Bottom: integer);
+
+// Parses "L,T,R,B" (pixels added on each side, >= 0, not all 0); returns ''
+// or what is wrong.
+function ParseOutpaintSides(const Text: string;
+  out Left, Top, Right, Bottom: integer): string;
+
 // PIL code (0 NEAREST, 1 LANCZOS, 2 BILINEAR, 3 BICUBIC, 4 BOX, 5 HAMMING),
 // as in a HF preprocessor_config.json "resample"; raises on other codes.
 function PILResampleCodeToFilter(Code: integer): TImageResampleFilter;
@@ -363,6 +383,129 @@ begin
         Dest.FData[PixelPos + Channel] := Sum;
       end;
     end;
+end;
+
+// The canvas rectangle the outpaint mask keeps: the image without an Overlap
+// band on each extended side; empty (Last < First) when the bands meet.
+procedure GetOutpaintKeptArea(Image: TNNetVolume; Left, Top, Right, Bottom,
+  Overlap: integer; out FirstX, LastX, FirstY, LastY: integer);
+begin
+  if (Left < 0) or (Top < 0) or (Right < 0) or (Bottom < 0) or
+    (Overlap < 0) then
+    raise Exception.Create('outpaint: sides ' + IntToStr(Left) + ',' +
+      IntToStr(Top) + ',' + IntToStr(Right) + ',' + IntToStr(Bottom) +
+      ' and overlap ' + IntToStr(Overlap) + ' must not be negative.');
+  FirstX := Left;
+  LastX := Left + Image.SizeX - 1;
+  FirstY := Top;
+  LastY := Top + Image.SizeY - 1;
+  if Left > 0 then Inc(FirstX, Overlap);
+  if Right > 0 then Dec(LastX, Overlap);
+  if Top > 0 then Inc(FirstY, Overlap);
+  if Bottom > 0 then Dec(LastY, Overlap);
+end;
+
+procedure BuildOutpaintCanvas(Image: TNNetVolume; Left, Top, Right, Bottom,
+  Overlap: integer; Canvas, Mask: TNNetVolume);
+var
+  CanvasSizeX, CanvasSizeY, Depth, X, Y, MaxX, MaxY, MaxImageX, MaxImageY,
+    SourceY, FirstX, LastX, FirstY, LastY, PixelBytes, RowBytes: integer;
+begin
+  GetOutpaintKeptArea(Image, Left, Top, Right, Bottom, Overlap, FirstX, LastX,
+    FirstY, LastY);
+  CanvasSizeX := Image.SizeX + Left + Right;
+  CanvasSizeY := Image.SizeY + Top + Bottom;
+  Depth := Image.Depth;
+  Canvas.ReSize(CanvasSizeX, CanvasSizeY, Depth);
+  PixelBytes := Depth * SizeOf(TNeuralFloat);
+  RowBytes := Image.SizeX * PixelBytes;
+  MaxX := CanvasSizeX - 1;
+  MaxY := CanvasSizeY - 1;
+  MaxImageX := Image.SizeX - 1;
+  MaxImageY := Image.SizeY - 1;
+  for Y := 0 to MaxY do
+  begin
+    SourceY := Min(Max(Y - Top, 0), MaxImageY);
+    for X := 0 to Left - 1 do
+      Move(Image.FData[Image.GetRawPos(0, SourceY)],
+        Canvas.FData[Canvas.GetRawPos(X, Y)], PixelBytes);
+    Move(Image.FData[Image.GetRawPos(0, SourceY)],
+      Canvas.FData[Canvas.GetRawPos(Left, Y)], RowBytes);
+    for X := Left + Image.SizeX to MaxX do
+      Move(Image.FData[Image.GetRawPos(MaxImageX, SourceY)],
+        Canvas.FData[Canvas.GetRawPos(X, Y)], PixelBytes);
+  end;
+  Mask.ReSize(CanvasSizeX, CanvasSizeY, 1);
+  Mask.Fill(1);
+  for Y := FirstY to LastY do
+    for X := FirstX to LastX do
+      Mask.FData[Mask.GetRawPos(X, Y)] := 0;
+end;
+
+procedure PasteOutpaintOriginal(Image: TNNetVolume; Left, Top, Right,
+  Bottom, Overlap: integer; Dest: TNNetVolume);
+var
+  X, Y, FirstX, LastX, FirstY, LastY, Channel, MaxChannel, SourcePos,
+    DestPos: integer;
+begin
+  GetOutpaintKeptArea(Image, Left, Top, Right, Bottom, Overlap, FirstX, LastX,
+    FirstY, LastY);
+  if (Dest.SizeX <> Image.SizeX + Left + Right) or
+    (Dest.SizeY <> Image.SizeY + Top + Bottom) then
+    raise Exception.Create('PasteOutpaintOriginal: the result is ' +
+      IntToStr(Dest.SizeX) + 'x' + IntToStr(Dest.SizeY) + ', the canvas ' +
+      IntToStr(Image.SizeX + Left + Right) + 'x' +
+      IntToStr(Image.SizeY + Top + Bottom) + '.');
+  MaxChannel := Min(Image.Depth, Dest.Depth) - 1;
+  for Y := FirstY to LastY do
+    for X := FirstX to LastX do
+    begin
+      SourcePos := Image.GetRawPos(X - Left, Y - Top);
+      DestPos := Dest.GetRawPos(X, Y);
+      for Channel := 0 to MaxChannel do
+        Dest.FData[DestPos + Channel] := Image.FData[SourcePos + Channel];
+    end;
+end;
+
+procedure GrowOutpaintSidesToMultiple(ImageSizeX, ImageSizeY,
+  Multiple: integer; var Left, Top, Right, Bottom: integer);
+var
+  ExtraX, ExtraY: integer;
+begin
+  ExtraX := (Multiple - (ImageSizeX + Left + Right) mod Multiple) mod Multiple;
+  ExtraY := (Multiple - (ImageSizeY + Top + Bottom) mod Multiple) mod Multiple;
+  if (Right = 0) and (Left > 0) then Inc(Left, ExtraX)
+  else Inc(Right, ExtraX);
+  if (Bottom = 0) and (Top > 0) then Inc(Top, ExtraY)
+  else Inc(Bottom, ExtraY);
+end;
+
+function ParseOutpaintSides(const Text: string;
+  out Left, Top, Right, Bottom: integer): string;
+var
+  Sides: array[0..3] of integer;
+  Rest: string;
+  SidePos, CommaPos: integer;
+begin
+  Result := '"' + Text + '" is not L,T,R,B: four pixel counts >= 0, not ' +
+    'all 0.';
+  Left := 0; Top := 0; Right := 0; Bottom := 0;
+  Rest := Text;
+  for SidePos := 0 to 3 do
+  begin
+    CommaPos := Pos(',', Rest);
+    if (SidePos < 3) = (CommaPos = 0) then exit;
+    if CommaPos = 0 then CommaPos := Length(Rest) + 1;
+    Sides[SidePos] := StrToIntDef(Trim(Copy(Rest, 1, CommaPos - 1)), -1);
+    if Sides[SidePos] < 0 then exit;
+    Rest := Copy(Rest, CommaPos + 1, MaxInt);
+  end;
+  if Sides[0] + Sides[1] + Sides[2] + Sides[3] = 0 then exit;
+  Left := Sides[0];
+  Top := Sides[1];
+  Right := Sides[2];
+  Bottom := Sides[3];
+  Result := '';
 end;
 
 

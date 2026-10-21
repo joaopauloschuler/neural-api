@@ -19,7 +19,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, FPImage,
+  Classes, SysUtils, Math, fpcunit, testregistry, FPImage,
   neuralnetwork, neuralvolume, neuraldatasets, neuralimageresize;
 
 type
@@ -69,6 +69,18 @@ type
     // A binary P6 written like the examples write it (larger than the FPC
     // reader buffer, with a comment), a P5 and a saved .ppm reload exactly.
     procedure TestLoadBinaryPPMAndPGM;
+    // BuildOutpaintCanvas with asymmetric sides 2,1,0,3 and overlap 1: the
+    // image at (2,1), clamp-to-edge border, mask band only on extended sides.
+    procedure TestOutpaintCanvasPlacementEdgeFillAndMask;
+    // Zero sides: the canvas is the image and the mask is all 0, whatever the
+    // overlap; an overlap wider than the image masks all of it.
+    procedure TestOutpaintCanvasZeroSidesAndWideOverlap;
+    // PasteOutpaintOriginal writes the image's channels where the mask is 0
+    // and nothing else; a result of another size is refused.
+    procedure TestPasteOutpaintOriginal;
+    // GrowOutpaintSidesToMultiple and ParseOutpaintSides on valid and invalid
+    // input.
+    procedure TestOutpaintSidesGrowAndParse;
   end;
 
 implementation
@@ -690,6 +702,170 @@ begin
     Loaded.Free;
     Src.Free;
   end;
+end;
+
+// Image (SizeX, SizeY, Depth) with value X*100 + Y*10 + Channel.
+procedure FillOutpaintImage(Image: TNNetVolume; SizeX, SizeY, Depth: integer);
+var
+  X, Y, Channel: integer;
+begin
+  Image.ReSize(SizeX, SizeY, Depth);
+  for Y := 0 to SizeY - 1 do
+    for X := 0 to SizeX - 1 do
+      for Channel := 0 to Depth - 1 do
+        Image[X, Y, Channel] := X * 100 + Y * 10 + Channel;
+end;
+
+procedure TTestNeuralImagePreprocess.TestOutpaintCanvasPlacementEdgeFillAndMask;
+var
+  Image, Canvas, Mask: TNNetVolume;
+  X, Y, Channel: integer;
+  IsKept: boolean;
+begin
+  Image := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  try
+    FillOutpaintImage(Image, 4, 5, 3);
+    BuildOutpaintCanvas(Image, {Left=}2, {Top=}1, {Right=}0, {Bottom=}3,
+      {Overlap=}1, Canvas, Mask);
+    AssertEquals('canvas width', 6, Canvas.SizeX);
+    AssertEquals('canvas height', 9, Canvas.SizeY);
+    AssertEquals('canvas depth', 3, Canvas.Depth);
+    AssertEquals('mask width', 6, Mask.SizeX);
+    AssertEquals('mask height', 9, Mask.SizeY);
+    AssertEquals('mask depth', 1, Mask.Depth);
+    for Y := 0 to 8 do
+      for X := 0 to 5 do
+      begin
+        for Channel := 0 to 2 do
+          AssertEquals(Format('canvas (%d,%d,%d)', [X, Y, Channel]),
+            Image[Min(Max(X - 2, 0), 3), Min(Max(Y - 1, 0), 4), Channel],
+            Canvas[X, Y, Channel], 0);
+        // Left and top bands start one pixel in; the right side is not
+        // extended, so the image keeps its last column.
+        IsKept := (X >= 3) and (X <= 5) and (Y >= 2) and (Y <= 4);
+        if IsKept then
+          AssertEquals(Format('mask kept (%d,%d)', [X, Y]), 0, Mask[X, Y, 0], 0)
+        else
+          AssertEquals(Format('mask hole (%d,%d)', [X, Y]), 1, Mask[X, Y, 0], 0);
+      end;
+  finally
+    Mask.Free;
+    Canvas.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestOutpaintCanvasZeroSidesAndWideOverlap;
+var
+  Image, Canvas, Mask: TNNetVolume;
+  ElementPos: integer;
+begin
+  Image := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  try
+    FillOutpaintImage(Image, 5, 3, 4);
+    BuildOutpaintCanvas(Image, 0, 0, 0, 0, {Overlap=}2, Canvas, Mask);
+    AssertEquals('canvas width', 5, Canvas.SizeX);
+    AssertEquals('canvas height', 3, Canvas.SizeY);
+    AssertEquals('canvas depth', 4, Canvas.Depth);
+    for ElementPos := 0 to Image.Size - 1 do
+      AssertEquals('canvas element ' + IntToStr(ElementPos),
+        Image.FData[ElementPos], Canvas.FData[ElementPos], 0);
+    for ElementPos := 0 to Mask.Size - 1 do
+      AssertEquals('mask element ' + IntToStr(ElementPos), 0,
+        Mask.FData[ElementPos], 0);
+    BuildOutpaintCanvas(Image, 1, 1, 1, 1, {Overlap=}2, Canvas, Mask);
+    AssertEquals('wide-overlap mask size', 7 * 5, Mask.Size);
+    for ElementPos := 0 to Mask.Size - 1 do
+      AssertEquals('wide-overlap mask element ' + IntToStr(ElementPos), 1,
+        Mask.FData[ElementPos], 0);
+  finally
+    Mask.Free;
+    Canvas.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestPasteOutpaintOriginal;
+var
+  Image, Canvas, Mask, Dest: TNNetVolume;
+  X, Y, Channel: integer;
+  IsRefused: boolean;
+begin
+  Image := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  Dest := TNNetVolume.Create;
+  try
+    FillOutpaintImage(Image, 6, 4, 3);
+    BuildOutpaintCanvas(Image, 3, 0, 2, 1, {Overlap=}2, Canvas, Mask);
+    Dest.ReSize(Canvas.SizeX, Canvas.SizeY, 4);
+    Dest.Fill(-1);
+    PasteOutpaintOriginal(Image, 3, 0, 2, 1, 2, Dest);
+    for Y := 0 to Dest.SizeY - 1 do
+      for X := 0 to Dest.SizeX - 1 do
+        for Channel := 0 to 3 do
+          if (Mask[X, Y, 0] = 0) and (Channel < 3) then
+            AssertEquals(Format('pasted (%d,%d,%d)', [X, Y, Channel]),
+              Image[X - 3, Y, Channel], Dest[X, Y, Channel], 0)
+          else
+            AssertEquals(Format('untouched (%d,%d,%d)', [X, Y, Channel]), -1,
+              Dest[X, Y, Channel], 0);
+    Dest.ReSize(Canvas.SizeX + 1, Canvas.SizeY, 3);
+    IsRefused := false;
+    try
+      PasteOutpaintOriginal(Image, 3, 0, 2, 1, 2, Dest);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('a result of another size is refused', IsRefused);
+  finally
+    Dest.Free;
+    Mask.Free;
+    Canvas.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestOutpaintSidesGrowAndParse;
+var
+  Left, Top, Right, Bottom: integer;
+begin
+  // 40 + 8 = 48 -> 64: only Left is extended, so Left takes the 16; 24 -> 32
+  // with no vertical extension: Bottom takes the 8.
+  Left := 8; Top := 0; Right := 0; Bottom := 0;
+  GrowOutpaintSidesToMultiple(40, 24, 32, Left, Top, Right, Bottom);
+  AssertEquals('left grows', 24, Left);
+  AssertEquals('right stays', 0, Right);
+  AssertEquals('top stays', 0, Top);
+  AssertEquals('bottom grows', 8, Bottom);
+  Left := 4; Top := 3; Right := 5; Bottom := 0;
+  GrowOutpaintSidesToMultiple(23, 29, 32, Left, Top, Right, Bottom);
+  // 23 + 9 = 32 and 29 + 3 = 32 are multiples already: nothing grows.
+  AssertEquals('left already a multiple', 4, Left);
+  AssertEquals('right already a multiple', 5, Right);
+  AssertEquals('top already a multiple', 3, Top);
+  AssertEquals('bottom already a multiple', 0, Bottom);
+
+  AssertEquals('valid', '', ParseOutpaintSides(' 1, 2,3 ,4', Left, Top, Right,
+    Bottom));
+  AssertEquals('left', 1, Left);
+  AssertEquals('top', 2, Top);
+  AssertEquals('right', 3, Right);
+  AssertEquals('bottom', 4, Bottom);
+  AssertTrue('three values', ParseOutpaintSides('1,2,3', Left, Top, Right,
+    Bottom) <> '');
+  AssertTrue('five values', ParseOutpaintSides('1,2,3,4,5', Left, Top, Right,
+    Bottom) <> '');
+  AssertTrue('all zero', ParseOutpaintSides('0,0,0,0', Left, Top, Right,
+    Bottom) <> '');
+  AssertTrue('negative', ParseOutpaintSides('-1,0,4,0', Left, Top, Right,
+    Bottom) <> '');
+  AssertTrue('not numbers', ParseOutpaintSides('a,b,c,d', Left, Top, Right,
+    Bottom) <> '');
 end;
 
 initialization

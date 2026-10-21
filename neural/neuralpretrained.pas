@@ -12926,6 +12926,15 @@ function BuildLaMaFromSafeTensors(const FileName: string;
   pInputWidth, pInputHeight: integer; out Config: TLaMaConfig;
   pTrainable: boolean = true): TNNet;
 
+// The (PaddedW, PaddedH, 4) LaMa input image*(1-mask) | mask from Image (W, H,
+// 3) in [0,1] and Mask (W, H, 1) of 0/1, padded bottom/right as numpy 'symmetric'.
+procedure LaMaBuildInput(Image, Mask, NetInput: TNNetVolume;
+  PaddedW, PaddedH: integer);
+
+// Output (W, H, 3) in 0..255 := Mask*Prediction + (1-Mask)*Image over Image's
+// area (Prediction may be padded larger), as lama's predict.py composites.
+procedure LaMaComposite(Image, Mask, Prediction, Output: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // RIFE VIDEO FRAME-INTERPOLATION IMPORT (model_type "rife") -- the repo's FIRST
 // VIDEO-generative importer: it SYNTHESISES an intermediate frame between two
@@ -77633,6 +77642,59 @@ begin
   finally
     Reader.Free;
   end;
+end;
+
+// Mirror index of numpy.pad(mode='symmetric') for a pad on the high side only.
+function LaMaSymmetricIndex(Pos, Size: integer): integer;
+begin
+  Result := Pos;
+  while Result >= Size do
+  begin
+    Result := 2 * Size - 1 - Result;
+    if Result < 0 then Result := -Result - 1;
+  end;
+end;
+
+procedure LaMaBuildInput(Image, Mask, NetInput: TNNetVolume;
+  PaddedW, PaddedH: integer);
+var
+  X, Y, SourceX, SourceY, Channel, MaxX, MaxY: integer;
+  Hole: TNeuralFloat;
+begin
+  NetInput.ReSize(PaddedW, PaddedH, 4);
+  MaxX := PaddedW - 1;
+  MaxY := PaddedH - 1;
+  for Y := 0 to MaxY do
+  begin
+    SourceY := LaMaSymmetricIndex(Y, Image.SizeY);
+    for X := 0 to MaxX do
+    begin
+      SourceX := LaMaSymmetricIndex(X, Image.SizeX);
+      Hole := Mask[SourceX, SourceY, 0];
+      for Channel := 0 to 2 do
+        NetInput[X, Y, Channel] := Image[SourceX, SourceY, Channel] *
+          (1 - Hole);
+      NetInput[X, Y, 3] := Hole;
+    end;
+  end;
+end;
+
+procedure LaMaComposite(Image, Mask, Prediction, Output: TNNetVolume);
+var
+  X, Y, Channel, MaxX, MaxY: integer;
+  Hole: TNeuralFloat;
+begin
+  Output.ReSize(Image.SizeX, Image.SizeY, 3);
+  MaxX := Image.SizeX - 1;
+  MaxY := Image.SizeY - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      Hole := Mask[X, Y, 0];
+      for Channel := 0 to 2 do
+        Output[X, Y, Channel] := 255 *
+          (Hole * Prediction[X, Y, Channel] + (1 - Hole) * Image[X, Y, Channel]);
+    end;
 end;
 
 // ===========================================================================

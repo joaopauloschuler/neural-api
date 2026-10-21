@@ -1109,6 +1109,9 @@ type
     procedure TestNAFNetNonSquareInput;
     procedure TestLaMaParity;
     procedure TestLaMaRejectsUnpaddedInput;
+    // Outpaint run on the pico LaMa through the example's routines: the
+    // original pixels survive exactly outside the overlap band.
+    procedure TestLaMaOutpaintKeepsOriginal;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestSwinIRConfigFromJSONFile;
@@ -44533,6 +44536,73 @@ begin
   end;
   NN.Free;
   AssertTrue('error names the multiple: ' + Msg, Pos('multiple of 8', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;
+const
+  OutpaintLeft = 4;
+  OutpaintTop = 2;
+  OutpaintRight = 6;
+  OutpaintBottom = 2;
+  Overlap = 2;
+var
+  NN: TNNet;
+  Config: TLaMaConfig;
+  Original, Canvas, Mask, NetInput, Output: TNNetVolume;
+  X, Y, Channel, KeptCount: integer;
+  HoleDiff: double;
+begin
+  Original := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  NN := nil;
+  try
+    Original.ReSize(12, 10, 3);
+    for Y := 0 to 9 do
+      for X := 0 to 11 do
+        for Channel := 0 to 2 do
+          Original[X, Y, Channel] := ((X * 7 + Y * 13 + Channel * 29) mod 32) / 31;
+    BuildOutpaintCanvas(Original, OutpaintLeft, OutpaintTop, OutpaintRight,
+      OutpaintBottom, Overlap, Canvas, Mask);
+    AssertEquals('canvas width', 22, Canvas.SizeX);
+    AssertEquals('canvas height', 14, Canvas.SizeY);
+    NN := BuildLaMaFromSafeTensors(FixturePath('tiny_lama.safetensors'),
+      {pInputWidth=}24, {pInputHeight=}16, Config, {pTrainable=}false);
+    LaMaBuildInput(Canvas, Mask, NetInput, 24, 16);
+    NN.Compute(NetInput);
+    LaMaComposite(Canvas, Mask, NN.GetLastLayer().Output, Output);
+    AssertEquals('output width', 22, Output.SizeX);
+    AssertEquals('output height', 14, Output.SizeY);
+    KeptCount := 0;
+    HoleDiff := 0;
+    for Y := 0 to Output.SizeY - 1 do
+      for X := 0 to Output.SizeX - 1 do
+        if Mask[X, Y, 0] = 0 then
+        begin
+          Inc(KeptCount);
+          for Channel := 0 to 2 do
+            AssertEquals(Format('kept pixel (%d,%d,%d)', [X, Y, Channel]),
+              255 * Original[X - OutpaintLeft, Y - OutpaintTop, Channel],
+              Output[X, Y, Channel], 1e-4);
+        end
+        else
+          for Channel := 0 to 2 do
+            HoleDiff := Max(HoleDiff, Abs(Output[X, Y, Channel] -
+              255 * Canvas[X, Y, Channel]));
+    AssertEquals('kept pixels', (12 - 2 * Overlap) * (10 - 2 * Overlap),
+      KeptCount);
+    AssertTrue('the border is generated, not the edge fill: max|diff| = ' +
+      FloatToStr(HoleDiff), HoleDiff > 1e-3);
+  finally
+    NN.Free;
+    Output.Free;
+    NetInput.Free;
+    Mask.Free;
+    Canvas.Free;
+    Original.Free;
+  end;
 end;
 
 // Verifies ReadRIFEConfigFromJSONFile on the committed pico config.

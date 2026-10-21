@@ -41,6 +41,24 @@ The program follows lama's prediction pipeline:
 4. It composites `mask*prediction + (1-mask)*image`, crops the padding away and
    saves the result.
 
+## Outpainting
+
+`--outpaint L,T,R,B` replaces `--mask` and extends the image beyond its borders
+by L, T, R and B pixels on the left, top, right and bottom:
+
+```
+../../bin/x86_64-linux/bin/LaMaInpaint --model big-lama.safetensors \
+  --image photo.png --outpaint 0,0,128,0 --out wider.png
+```
+
+`BuildOutpaintCanvas` (`neural/neuralimageresize.pas`) places the image on the
+larger canvas and fills the new border by repeating the edge pixels. Its mask
+covers that border plus `--outpaint-overlap N` pixels (default 8) into the image
+on each extended side, so the generator also redraws the seam. The composite
+then keeps every other original pixel exactly. LaMa fits small extensions
+(aspect-ratio fixes); for large ones use `examples/QwenImage --outpaint`.
+`TestLaMaOutpaintKeepsOriginal` runs it on the pico checkpoint.
+
 `BuildLaMa` builds the net for one fixed input size. The program builds it for
 the padded image size, so each run builds a new net.
 
