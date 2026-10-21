@@ -90,6 +90,10 @@ rather than acted on.
       5b223b30 the layer runs the shared `TFFTPlan` (neuralvolume.pas), so a
       guard belongs in `FFTPlanExecute` / `FFTRadix2InPlace` once, not in the
       layer; first re-check whether examples/DarcyFlowFNO still needs its mask.
+- [ ] Binary PPM (P6) input fails in `LoadImageFromFileIntoVolume`
+      (neuraldatasets.pas), including the P6 files the examples write
+      themselves (found by 2c50b73b; examples/ImageRestoration tells users to
+      pass PNG). Fix the reader or route .ppm through the repo's own P6 code.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
@@ -298,7 +302,17 @@ rather than acted on.
             `pRescaleZeroTerminalSNR` constructor option; DDIM and PredictX0
             with dpV are exact at ab_T = 0, the other samplers floor ab_T at
             2^-24 in their reciprocals (as diffusers' Euler/DPM/UniPC do).
-      - [ ] The pipeline routine in neuralpretrained.pas: resize the long side to
+      - [ ] Scheduler leftovers from 4c756c1c: diffusers `set_alpha_to_one=False`
+            (the final DDIM step lands on alpha_bar[0], not 1) is not modelled;
+            Euler-type samplers with dpV return x0 = 0 instead of -v at the exact
+            zero-SNR step (they convert through eps). Marigold uses DDIM, so
+            only the first matters for parity.
+      - [ ] Pipeline step 1: the building blocks with tiny random nets (no
+            weights needed): an image -> latent encode via `BuildVaeEncoder`, the
+            8-channel UNet concat (image latent ++ noisy target latent), and the
+            4-step DDIM v-prediction loop with tsTrailing +
+            pRescaleZeroTerminalSNR, as a smoke test that the shapes line up.
+      - [ ] Pipeline step 2 — the pipeline routine in neuralpretrained.pas: resize the long side to
             `default_processing_resolution` (768), pad to a multiple of 8 and
             unpad after (the VAE/UNet builders take a square grid today, so
             either pad to square or lift that limit), encode the image to its
