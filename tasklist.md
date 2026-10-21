@@ -1558,12 +1558,14 @@ rather than acted on.
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (these writes
           are the only mid-block waits).
-    - [ ] B1d1 follow-up: Shared "bind or upload the operand" helper for
-          TNNetChannelMulByLayer and TNNetCellMulByCell.
+    - [X] B1d1 follow-up: Shared "bind or upload the operand" helper for
+          TNNetChannelMulByLayer and TNNetCellMulByCell. Done 4e3057e6:
+          TNNetLayer.BindOrUploadOpenCLOperand (FiLM too) + TNNetMulBySourceBase.
     - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
           OpenCL parity test.
-    - [ ] B1d2 follow-up: Shared parent class for the four norm layers' identical
+    - [X] B1d2 follow-up: Shared parent class for the four norm layers' identical
           FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
+          Done 3c3a3ae6: TNNetNormWithOpenCL.
     - [ ] B1d2 follow-up: Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
           never fills FNormalized/FInvStd (FInvRMS): backprop reads
           stale values (pre-existing).
