@@ -104,13 +104,6 @@ rather than acted on.
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
       Saved` followed by an explicit reseed, or a private seeded generator for
       latent noise. Audit the call sites first.
-- [ ] Possible defect (not fixed, awaits user decision; found during 329b0a91):
-      `TNNetMamba2`'s gated RMSNorm normalizes over the full d_inner, but HF
-      Nemotron-H normalizes per group (`group_size = intermediate_size //
-      n_groups`), so a real Nemotron-H checkpoint with n_groups > 1 would load
-      and run with the wrong norm. The main README's `TNNetMamba2` row says
-      "grouped gated RMSNorm", which the code does not do. Details and the fix
-      route are under "Real device-side work still running on the host".
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
@@ -265,8 +258,9 @@ rather than acted on.
   - [ ] Nemotron-H-MoE grouped-routing follow-up: the importer REJECTS
         n_group>1 and moe_latent_size with a clear message. Wire the
         group-limited / latent-MoE routing path if a real Nemotron-H-MoE
-        checkpoint needs it (DeepSeek-V2-style grouped topk gate is landed —
-        reuse it).
+        checkpoint needs it (no grouped top-k gate exists yet; the DeepSeek
+        importer also rejects group_limited_greedy, so both would share one
+        implementation).
 - [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
       additionally shares a small set of transformer blocks across depth with a
       per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
@@ -623,47 +617,18 @@ rather than acted on.
         not obtainable offline); the importer accepts a real checkpoint path.
   - [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
         nearest+conv "real-world" SR upsampler variants not yet wired.
-- [ ] Restormer image-restoration importer (`BuildRestormerFromSafeTensors[Ex]` +
-      `TRestormerConfig`, swz30/Restormer: deraining, motion/defocus deblurring,
-      Gaussian and real denoising from one architecture). A 4-level U-Net of
-      transformer blocks at full resolution: LayerNorm over channels (WithBias and
-      BiasFree variants), MDTA attention, GDFN feed-forward,
-      PixelUnshuffle/PixelShuffle down/up, skip concat + 1x1 reduce, refinement
-      blocks, global residual.
-  - [X] The ONE new leaf layer, MDTA's transposed (channel-wise) attention,
-        LANDED as `TNNetTransposedChannelAttention.Create(Heads)` (7ded244f):
-        input W x H x 3C ([q|k|v] along depth, head-major, i.e. torch's
-        qkv.chunk(3, dim=1) + 'b (head c) h w'), output W x H x C; the Heads
-        temperatures are `Neurons[0].Weights.Raw[h]` (torch `temperature`,
-        shape (heads,1,1), copy the heads values in order). CPU forward +
-        backward (input and temperature gradients), OpenCL forward
-        (inference, resident in and out), parity-tested on PoCL. The qkv 1x1 +
-        3x3 depthwise conv and the project_out 1x1 stay existing layers.
-        Follow-up: `cai_transposed_attn_dots` reads q|k with a 3C stride per
-        position (uncoalesced); time it on the GPU box at 1-4 MP before
-        tuning.
-  - [X] The importer and example LANDED: `TRestormerConfig`,
-        `RestormerTaskConfig` (official option presets),
-        `ReadRestormerConfigFromJSONFile`, `BuildRestormerFromSafeTensors[Ex]`
-        (any reader; `.pth` `{'params': ...}` read directly) and
-        examples/Restormer (`--task derain|deblur|defocus|denoise|
-        denoise-gaussian|denoise-gray`, tiled through the new shared
-        `PaddedTiledNetCompute` / `TiledNetInputSide`, which RRDBNet now uses
-        too, `--gpu`). BiasFree LayerNorm is `TNNetTokenLayerNorm`'s new
-        `pCenterOutput=false` option (CPU forward/backward + `cai_volume_norm`
-        mode 2). Pico parity vs a float64 torch reimplementation of
-        restormer_arch.py: `TestRestormerParity` 8.4e-7 (WithBias, no bias,
-        .safetensors), `TestRestormerDualPixelBiasFreeParity` 1.6e-6 (BiasFree,
-        biases, dual-pixel, .pth, save/load exact); `TestRestormerTiledOpenCL`
-        1.9e-6 on PoCL. Open follow-ups:
-    - [ ] Real-checkpoint run on the user's box (no official file was run;
-          the presets' LayerNorm/bias flags come from the official options
-          yml, and the builder rejects a preset that disagrees with the
-          checkpoint).
-    - [ ] Dual-pixel defocus in the example (importer + parity done; the
-          example reads one image, the checkpoint needs a left/right pair).
-    - [ ] GPU timing at 1-4 MP tiles (and the `cai_transposed_attn_dots`
-          coalescing follow-up above).
+- [ ] Restormer image-restoration follow-ups (`TNNetTransposedChannelAttention`,
+      7ded244f; `BuildRestormerFromSafeTensors[Ex]` + `TRestormerConfig` +
+      examples/Restormer, c7363ab4; pico parity `TestRestormerParity`,
+      `TestRestormerDualPixelBiasFreeParity`, `TestRestormerTiledOpenCL` on PoCL):
+  - [ ] Real-checkpoint run on the user's box (no official file was run;
+        the presets' LayerNorm/bias flags come from the official options
+        yml, and the builder rejects a preset that disagrees with the
+        checkpoint).
+  - [ ] Dual-pixel defocus in the example (importer + parity done; the
+        example reads one image, the checkpoint needs a left/right pair).
+  - [ ] GPU timing at 1-4 MP tiles, then coalescing `cai_transposed_attn_dots`,
+        which reads q|k with a 3C stride per position (uncoalesced).
 - [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]
       + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
       with accumulated flow residuals + sigmoid fusion-mask blend; pico parity
@@ -1178,7 +1143,8 @@ rather than acted on.
         Step 3 swaps in a real T5 encoder + real PixArt/VAE checkpoint.)
   - [ ] Follow-up — the pico PixArt + matched pico VAE are RANDOM (smoke only);
         once a real checkpoint is wired (Step 3) re-verify the chain produces a
-        sensible image, and consider a Karras-spaced / Euler-ancestral variant.
+        sensible image, and expose the existing `smEulerAncestral` sampler /
+        `tsKarras` spacing (neuraldiffusion.pas) as example flags.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
 - [ ] Mask R-CNN instance-segmentation importer follow-ups (`BuildMaskRCNNFromSafeTensors[Ex]`
@@ -1792,7 +1758,7 @@ rather than acted on.
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
       `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
       trained for that latent space (or a cheap latent->RGB linear projection).
-- [ ] Real-ESRGAN: the checks still open (the examples/QwenImage `--upscale` is done).
+- [ ] Real-ESRGAN: the checks still open.
       Done: shape-inferred `TRRDBNetConfig` (`InferRRDBNetConfigFromTensors` /
       `LoadRRDBNetConfig`, any key prefix such as `params_ema.`), the x2plus/x1
       `TNNetSpaceToDepth` pixel-unshuffle stem, width <> height, and tiled upscale
@@ -1981,8 +1947,9 @@ rather than acted on.
 
 ## OpenCL forward coverage — layers still on the host
 
-Forward pass only; a device backward is a separate project (nothing in the tree
-has one today). 53 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
+Forward pass only; device backward is limited to `TNNetFullConnect`,
+`TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
+training on OpenCL"). 53 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
 `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
@@ -2081,7 +2048,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         normalize wrong. Needs a decision: a norm-group count on `TNNetMamba2`
         (CPU forward, backward, `cai_mamba2_gated_norm` with one work-group per
         (token, group)), set by the Nemotron-H importer, plus an n_groups > 1
-        Nemotron-H fixture.
+        Nemotron-H fixture. Also fix the main README's `TNNetMamba2` row,
+        which claims a "grouped gated RMSNorm" the code does not do.
   - [ ] The chat engine's checkpoint and prefill-window routes have not been
         run end to end on a real Mamba-2 or Nemotron-H checkpoint since the
         layer became recurrent; only the pico fixtures cover it.
@@ -2093,15 +2061,10 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] Throughput is unmeasured: each kernel is one work-item per channel,
         serial over the window, so a long prefill is latency-bound. Time an
         RWKV decode and prefill on the GPU box.
-  - [X] `TNNetGatedDeltaNet`, `TNNetSelectiveSSM` and `TNNetMamba2` now use the
-        `TNNetRecurrentScanCL` decode-state methods (`EnsureStateOnOpenCL`,
-        `ForceStateOnRAM`, `MarkStateWrittenOnRAM`, `CaptureStateToSlot`,
-        `RestoreStateFromSlot`); their own flag and Ensure copies are gone, and
-        the four raw bank primitives are protected on the base.
-  - [ ] `TNNetCrossWKV` has no device forward (and no incremental path).
+  - [ ] `TNNetCrossWKV` has no device forward (its incremental path is tracked
+        under the RWKV/recurrent decode follow-ups).
   - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
-- [ ] Attention subclasses that override `Compute` and so lose
-      `TNNetScaledDotProductAttention`'s device path:
+- [ ] Follow-ups of the attention subclasses' device paths:
   - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):
         the full forward runs on `cai_sdpa_flash`
         with the source bound and the result resident. The flash epilogue and
@@ -2113,8 +2076,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         `ComputeIncremental` with the sink (virtual `SinkLogits`), FP32 and
         int8, on the host. Open follow-ups:
     - [ ] Resident-KV decode for GPT-OSS: the importer builds one sink layer
-          per query head, and the single-head SDPA has no OpenCL cached path
-          for any class, so every decode step pulls each head's [Q|K|V] pack
+          per query head, and this class keeps the host cached decode
+          (`CachedStepIsExact` is false), so every decode step pulls each head's [Q|K|V] pack
           to RAM. Route: give `TNNetFusedSDPA` a per-query-head sink
           option (one neuron of QHeads weights, FStruct flag, the CPU prefill
           / cached-token / chunked-row paths and the backward), pass
@@ -2136,31 +2099,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         real K/V sit at slot K, and CacheSlot = K gives mask mode 1 the keys
         [0, K + t + 1). Source bound, result resident, host fallback
         (`SinkAttentionFlashOpenCLParity`, max|diff| < 8e-7 on PoCL). Open:
-    - [X] The cached decode (`ComputeIncremental`, FP32 and int8 KV) now runs
-          over a resident KV cache: the sink rows are cache rows 0..K-1, the
-          tokens follow at slot K, `TNNetFusedSDPACL.ComputeStep` picks the
-          split decode (width 1) or flash (wide windows). The shared machinery
-          sits on `TNNetScaledDotProductAttention` (`FCacheOnOpenCL`,
-          `EnsureCacheOnOpenCL`, the Force/Copy/Mark cache hooks moved up from
-          `TNNetFusedSDPA`, virtual `CachedStepIsExact` / `CachePrefixRows` /
-          `RunCachedStepOnSource`). The int8 host decode now scores the sink
-          rows from int8 codes too, so the OpenCL step reads the same codes.
-          `SinkAttentionCachedDecodeOpenCLParity`: flash prefill, snapshot
-          handoff, width-1 steps, rollback, restore, a sink change; max|diff|
-          <= 7.2e-7 (FP32 and int8) on PoCL, source bound and never
-          downloaded (sentinel), 0 transfers per steady step.
     - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit,
           and decode tok/s of an `avSink` stack with the resident cache.
-    - [X] The plain `TNNetScaledDotProductAttention` cached decode (FP32 and
-          int8 KV, causal, sliding window, soft-cap) runs over the resident KV
-          cache: the base `CachedStepIsExact` is true for the exact class only,
-          so `TNNetGptOssSinkAttention` (sinks), `TNNetT5RelPosBiasAttention`,
-          `TNNetWindowAttention` / `TNNetSwinV2WindowAttention` (score bias) and
-          the Compute-only variants (ALiBi, cosine, QK-norm, disentangled,
-          conformer) keep the host decode.
-          `ScaledDotProductAttentionCachedDecodeOpenCLParity`: max|diff| <=
-          9.6e-7 (FP32 and int8, window 4, soft-cap 2) on PoCL, source bound and
-          never downloaded (sentinel), 0 transfers per steady step.
     - [ ] GPU-box: decode tok/s of an `avSDPA` stack with the resident cache.
   - [ ] Follow-ups of the `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
         (732bbaa5): one launch with two query heads per KV head
@@ -2169,14 +2109,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         into a second result buffer. Source bound, result resident, host
         fallback (`DifferentialAttentionFlashOpenCLParity`, max|diff| < 1.5e-6
         on PoCL). Open:
-    - [X] The cached decode (`ComputeIncremental`, FP32 and int8 KV) now runs
-          over the resident KV cache (the `TNNetSinkAttention` machinery):
-          `TNNetFusedSDPACL.ComputeDifferential` packs [Q1,0 | 0,Q2], appends
-          K/V from the bound source, runs the split decode (width 1) or flash
-          with two query heads per KV head, then the combine; lambda stays a
-          kernel argument. `DifferentialAttentionCachedDecodeOpenCLParity`:
-          max|diff| <= 8.9e-7 (FP32 and int8) on PoCL, source bound and never
-          downloaded (sentinel), 0 transfers per steady step.
     - [ ] GPU-box: prefill tok/s of an `avDifferential` stack against the
           parent commit, and decode tok/s with the resident cache.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
@@ -2240,9 +2172,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         SeqLen x SeqLen buffer each forward, then the flash bias argument.
       - `TNNetDotProducts`, the raw contraction behind the CAI self-attention
         builders.
-      `TNNetSinkAttention` and `TNNetDifferentialAttention` got their full
-      forward in the decode-path group above (732bbaa5), which covers the
-      vision builders that use them too.
 - [ ] The long tail of one-model vision layers: `TNNetSpectralConv2D` (FNO -
       coordinate with the open FFT denormal-trap item, since the device path
       would move that math off the host FPU entirely).
@@ -2314,8 +2243,8 @@ cannot pay for its own transfer.
       `UpdateWeights`, not once per sample. Same route for `TNNetFullConnect`
       (whose `BackpropagateOpenCL` is live but uploads per call). Out of scope
       until (1)-(4) pay: `TNNetDepthwiseConv` / `TNNetDeconvolution` backward
-      (both CPU-only today) and the "a device backward is a separate project"
-      line under "OpenCL forward coverage", which is stale once this lands.
+      (both CPU-only today); when this lands, add `TNNetConvolution` to the
+      device-backward list at the top of "OpenCL forward coverage".
 
 - [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
       (the even/odd split trick) to halve the row cost. Low priority: the FFTs
@@ -2547,9 +2476,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `[grad] [serialize]` block, written by a small script.
 
 ## Vision / generative & accelerator batch 2026-06-27b
-
-(Verified absent in source before listing. An NF4 dequant path did not exist
-then — only int8 + MXFP4-dequant did.)
 
 - [ ] NF4 (bitsandbytes 4-bit) dequantizing import path. PARTIALLY LANDED
       (commit 90b6c931): the `neural/neuralnf4.pas` dequant unit ships — the exact
