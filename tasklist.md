@@ -971,8 +971,6 @@ rather than acted on.
   - 2.6 `AdainResBlk1d` follow-ups:
         - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
           grouped deconvolution downloads its source and re-uploads its output.
-        - [ ] A Y factor other than the X factor on SizeY > 1 runs
-          `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
   - 2.9 Forward complex STFT follow-ups:
         - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
@@ -1972,11 +1970,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Residency breakers on the decode path (small kernels, largest payoff)
 
-- [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
-      (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
-      plan too (DeMaxPool's random spacing would need a per-forward plan, so
-      it stays out). The gather-copy layers do not take part in OpenCL output
-      sharing by liveness (`CanShareOpenCLOutput` is False).
 - [ ] Follow-ups of the `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device
       forward (2ebe172b; `cai_topk_gate`) plus the device slot-map build
       (`cai_moe_build_slot_map`): router -> gate|up -> down has no host hop per

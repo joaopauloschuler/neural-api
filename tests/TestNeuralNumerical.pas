@@ -637,6 +637,10 @@ type
     // The cai_gather_copy plan is uploaded by EnableOpenCL, not by the first
     // forward, and a later source shape change rebuilds it.
     procedure TestGatherCopyPlanBuiltAtArmOpenCL;
+    // ShareOpenCLOutputsByLiveness on a chain of cai_gather_copy layers
+    // (upsample, space/depth, pixel shuffle, flip, pad, crop): they reuse each
+    // other's buffers and the output equals the unshared and the CPU nets.
+    procedure TestGatherCopyShareOutputsByLiveness;
     // ForceOpenCL off: TNNetInput -> Pad -> ChannelShuffle -> ExpandDims ->
     // Squeeze -> ExpandDims -> Squeeze -> Reshape -> Gather -> ReLU stays
     // resident; the ExpandDims/Squeeze/Reshape outputs are views.
@@ -666,8 +670,9 @@ type
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
-    // Reshape (alias), DeMaxPool, DeAvgPool, Upsample, PixelShuffle and
-    // GatherChannels follow a resident source; host-path cases stay on the CPU.
+    // Reshape (alias), DeMaxPool (also a Y factor other than the X factor),
+    // DeAvgPool, Upsample, PixelShuffle and GatherChannels follow a resident
+    // source; host-path cases stay on the CPU.
     procedure TestRelayoutResidentOpenCLParity;
     // Device-side depth-axis scatter (cai_deep_concat) forward parity for
     // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
@@ -73164,7 +73169,7 @@ procedure TTestNeuralNumerical.TestRelayoutResidentOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = 999;
-  CaseCount = 15;
+  CaseCount = 17;
 var
   NN: TNNet;
   Input, OutCPU, LayerCPU: TNNetVolume;
@@ -73184,8 +73189,9 @@ begin
   end;
   for CaseCnt := 0 to CaseCount - 1 do
   begin
-    // Cases 12-14 have a resident source; random spacing (12) and a
-    // size-changing reshape (14) must stay on the host, DeAvgPool (13) not.
+    // Cases 12-16 have a resident source; random spacing (12) and a
+    // size-changing reshape (14) must stay on the host, DeAvgPool (13) and
+    // the DeMaxPool Y factors other than the X factor (15, 16) not.
     HostSource := Odd(CaseCnt) and (CaseCnt < 12);
     ExpectOpenCL := (not HostSource) and (CaseCnt <> 12) and (CaseCnt <> 14);
     if CaseCnt div 2 = 4 then SourceDepth := 18 else SourceDepth := 8;
@@ -73207,6 +73213,10 @@ begin
         LayerUnderTest := TNNetDeAvgPool.Create(2)
       else if CaseCnt = 14 then
         LayerUnderTest := TNNetReshape.Create(10, 1, SourceDepth)
+      else if CaseCnt = 15 then
+        LayerUnderTest := TNNetDeMaxPool.Create(2, 0, {pPoolSizeY=}3)
+      else if CaseCnt = 16 then
+        LayerUnderTest := TNNetDeMaxPool.Create(3, 0, {pPoolSizeY=}1)
       else
       case CaseCnt div 2 of
         0: LayerUnderTest := TNNetReshape.Create(20, 1, SourceDepth);
@@ -79156,6 +79166,125 @@ begin
     OutCPU.Free;
     Input.Free;
     Net.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGatherCopyShareOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  cFirstGatherIdx = 2;
+  cLastGatherIdx = 9;
+var
+  NetCPU, NetOff, NetOn: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, OtherPos, PassPos, ReusedCount: integer;
+  MaxAbs, Diff: TNeuralFloat;
+
+  function BuildNet(): TNNet;
+  var
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(6, 5, 8));
+    Result.AddLayer(TNNetConvolutionLinear.Create(16, 3, 1, 1, 0));
+    Result.AddLayer(TNNetDeMaxPool.Create(2));            // 12 x 10 x 16
+    Result.AddLayer(TNNetSpaceToDepth.Create(2));         // 6 x 5 x 64
+    Result.AddLayer(TNNetPixelShuffle.Create(2));         // 12 x 10 x 16
+    Result.AddLayer(TNNetFlipX.Create());
+    Result.AddLayer(TNNetUpsample.Create());              // 24 x 20 x 4
+    Result.AddLayer(TNNetPadXY.Create(1, 2));             // 26 x 24 x 4
+    Result.AddLayer(TNNetCrop.Create(1, 1, 24, 20));      // 24 x 20 x 4
+    Result.AddLayer(TNNetDeMaxPool.Create(2, 0, 1));      // 48 x 20 x 4
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(3));
+    Result.SetTrainable(false, {pLowMemory=}false);
+    for LayerCnt := 0 to Result.GetLastLayerIdx() do
+    begin
+      for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+      end;
+      Result.Layers[LayerCnt].FlushWeightCache();
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetCPU := BuildNet();
+  NetOff := BuildNet();
+  NetOn := BuildNet();
+  Input := TNNetVolume.Create(6, 5, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    for LayerPos := 0 to Input.Size - 1 do
+      Input.Raw[LayerPos] := 0.7 * Sin(LayerPos * 0.037) + 0.05;
+    NetCPU.Compute(Input);
+    NetCPU.GetOutput(OutCPU);
+    MaxAbs := OutCPU.GetMaxAbs();
+    NetOff.ShareOpenCLOutputsByLiveness := false;
+    NetOff.EnableOpenCL(PlatformId, DeviceId);
+    NetOff.ForceOpenCL(true);
+    NetOn.ShareOpenCLOutputsByLiveness := true;
+    NetOn.EnableOpenCL(PlatformId, DeviceId);
+    NetOn.ForceOpenCL(true);
+    AssertEquals('unshared net: no shared layers', 0,
+      NetOff.OpenCLSharedOutputLayerCount());
+    for LayerPos := cFirstGatherIdx to cLastGatherIdx do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' ' +
+        NetOn.Layers[LayerPos].ClassName + ' can share its OpenCL output',
+        NetOn.Layers[LayerPos].CanShareOpenCLOutput());
+    // Gather layers two apart may write into one buffer.
+    ReusedCount := 0;
+    for LayerPos := cFirstGatherIdx to cLastGatherIdx do
+      for OtherPos := LayerPos + 1 to cLastGatherIdx do
+        if Assigned(NetOn.Layers[LayerPos].OpenCLOutputBuffer()) and
+          (NetOn.Layers[LayerPos].OpenCLOutputBuffer() =
+           NetOn.Layers[OtherPos].OpenCLOutputBuffer()) then
+          Inc(ReusedCount);
+    AssertTrue('gather-copy layers reuse each other''s buffers', ReusedCount > 0);
+    AssertTrue('the shared buffers are smaller than the outputs they hold',
+      NetOn.OpenCLSharedOutputBytes() < NetOn.OpenCLSharedOutputPrivateBytes());
+    for PassPos := 0 to 2 do
+    begin
+      NetOff.Compute(Input);
+      NetOn.Compute(Input);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+        NetOff.GetLastLayer().Output);
+      AssertEquals('shared vs private, pass ' + IntToStr(PassPos), 0, Diff, 0);
+      Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, OutCPU);
+      AssertTrue('shared vs CPU, pass ' + IntToStr(PassPos) + ': ' +
+        FloatToStr(Diff), Diff < 1e-4 * (MaxAbs + 1));
+    end;
+    for LayerPos := cFirstGatherIdx to cLastGatherIdx do
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' ' +
+        NetOn.Layers[LayerPos].ClassName + ' ran on OpenCL', 3,
+        NetOn.Layers[LayerPos].ForwardGPUCnt);
+    WriteLn('  GatherCopy ShareOutputsByLiveness: ',
+      NetOn.OpenCLSharedOutputLayerCount(), ' layers share ',
+      NetOn.OpenCLSharedOutputBytes(), ' B (private: ',
+      NetOn.OpenCLSharedOutputPrivateBytes(), ' B), ', ReusedCount,
+      ' gather pairs reuse a buffer');
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NetOn.Free;
+    NetOff.Free;
     NetCPU.Free;
   end;
 end;

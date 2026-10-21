@@ -2442,45 +2442,11 @@ __kernel void cai_bilinear_gather
   FDst[g_id] = acc;
 }
 
-// CAI upsample gather: the forward of the nearest-neighbour upsample and the
-// depth-to-space layers (TNNetDeMaxPool, TNNetUpsample, TNNetPixelShuffle).
-// Output pixel (OX, OY) copies from source pixel (OX / FFactor, OY / FFactor),
-// the channel picked by the output channel c and the pixel's offset (i, j)
-// inside its FFactor x FFactor block:
-//   src channel = c*FChannelStride + i*FXStride + j*FYStride
-// (nearest upsample: 1, 0, 0; PixelShuffle(r): r*r, r, 1;
-// TNNetUpsample: 4, 1, 2).
-// Raw layouts [(y*SizeX + x)*Depth + d]. One work-item per OUTPUT element.
-__kernel void cai_upsample_gather
-(
-  const int FNumOut,
-  const int FOutSizeX,
-  const int FOutDepth,
-  const int FInSizeX,
-  const int FInDepth,
-  const int FFactor,
-  const int FChannelStride,
-  const int FXStride,
-  const int FYStride,
-  __global const float* FSrc,
-  __global float* FDst
-)
-{
-  const int g_id = get_global_id(0);
-  if (g_id >= FNumOut) return;
-  const int pos = g_id / FOutDepth;
-  const int c = g_id - pos * FOutDepth;
-  const int OY = pos / FOutSizeX;
-  const int OX = pos - OY * FOutSizeX;
-  const int x = OX / FFactor;
-  const int y = OY / FFactor;
-  FDst[g_id] = FSrc[(y * FInSizeX + x) * FInDepth + c * FChannelStride +
-    (OX - x * FFactor) * FXStride + (OY - y * FFactor) * FYStride];
-}
-
 // CAI gather copy: the forward of the layers whose output elements each copy
-// one source element or read zero (crop, padding, transposes, space/depth and
-// MobileViT reshuffles, token and channel gathers; TNNetGatherCopyCL).
+// one source element or read zero (crop, padding, transposes, space/depth,
+// nearest upsample, pixel shuffle and MobileViT reshuffles, token and channel
+// gathers; TNNetGatherCopyCL). The tables are per axis (sum of the extents,
+// not one entry per element), so they stay cached and add no memory traffic.
 // FPlan = [AxisCount, Extent[AxisCount], TableStart[AxisCount], tables]. The
 // output index splits into one coordinate per axis, outermost first, and each
 // coordinate's table entry is a source offset; the offsets add up, and a
