@@ -46,6 +46,8 @@ type
     // Window attention (Cosine = SwinV2) on OpenCL vs the CPU: several windows
     // and heads, shift masks, resident outputs, a bias and logit_scale update.
     procedure CheckWindowAttentionOpenCLParity(Cosine: boolean);
+    // TNNetSinkAttention (or TNNetDifferentialAttention) on OpenCL vs the CPU.
+    procedure CheckSinkOrDifferentialFlashParity(Differential: boolean);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -535,6 +537,17 @@ type
     // CPU: windows, head dim 10, key splits (the sink joins in the merge), a
     // dominant sink, a sink change between passes, and the host fallback.
     procedure GptOssSinkAttentionFlashOpenCLParity;
+    // TNNetSinkAttention on cai_sdpa_flash (sink slots as cache prefix rows) vs
+    // the CPU: 1 and 3 sinks, causal and not, key splits, a sink update, host
+    // source and fallback, and the cached decode staying on the host.
+    procedure SinkAttentionFlashOpenCLParity;
+    // TNNetDifferentialAttention on one two-head cai_sdpa_flash launch plus the
+    // combine vs the CPU: causal and not, key splits, a lambda update, host
+    // source and fallback, and the cached decode staying on the host.
+    procedure DifferentialAttentionFlashOpenCLParity;
+    // AddMultiHeadSelfAttention (RoPE, 3 heads) with avSink / avDifferential:
+    // every head on OpenCL with its resident source bound, output vs the CPU.
+    procedure SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -2252,6 +2265,10 @@ type
 
   // Exposes the borrowed FOutputKernel, so a test can hook its ErrorProc.
   TDeepConcatAccess = class(TNNetDeepConcat);
+
+  // A TNNetSinkAttention subclass the flash forward does not know: it must keep
+  // the host Compute (FlashForwardIsExact tests the exact class).
+  TSinkAttentionHostSubclass = class(TNNetSinkAttention);
 
 constructor THostOnlyMulByConstant.Create(pMul: TNeuralFloat);
 begin
@@ -80417,7 +80434,7 @@ end;
 // device forward must match the CPU Compute() within FP32 GEMM-reorder noise.
 // SeqLen >= 32 so the device path fires; causal+sliding-window are exercised so
 // the masking branch is covered. The test also pins the SAFETY guard: a sibling
-// variant (TNNetSinkAttention) that ships NO correct offload must have
+// variant (a TNNetSinkAttention subclass) that ships NO correct offload must have
 // ShouldOpenCL = false after EnableOpenCL, i.e. it falls back to its CPU
 // Compute() rather than the wrong inherited plain-SDPA device path. (Cosine /
 // disentangled / conformer now DO ship correct offloads, so they are armed and
@@ -80434,7 +80451,7 @@ var
   XData, OutCPU: TNNetVolume;
   InputLayer: TNNetLayer;
   Attn: TNNetALiBiAttention;
-  NoOffload: TNNetSinkAttention;
+  NoOffload: TSinkAttentionHostSubclass;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   i: integer;
@@ -80489,10 +80506,10 @@ begin
   NN := TNNet.Create();
   try
     InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
-    NoOffload := TNNetSinkAttention.Create(Dk, {CausalMask}true, 2);
+    NoOffload := TSinkAttentionHostSubclass.Create(Dk, {CausalMask}true, 2);
     NN.AddLayerAfter(NoOffload, InputLayer);
     NN.EnableOpenCL(PlatformId, DeviceId);
-    AssertTrue('sink attention must fall back to CPU (ShouldOpenCL=false)',
+    AssertTrue('a sink attention subclass must fall back to CPU (ShouldOpenCL=false)',
       not NoOffload.ShouldOpenCL);
   finally
     NN.Free;
@@ -85522,6 +85539,330 @@ begin
   // A host source of 40 rows is uploaded; one of 8 rows keeps the host path.
   RunCase(16, 40, 0, True, 0.7, 0, True, True);
   RunCase(16, 8, 0, True, 0.7, 0, True, False);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Fresh trainable weights on Src (random sink slots, or lambda = Lambda for
+// TNNetDifferentialAttention), copied to Dst; both rerun AfterWeightUpdate.
+procedure ChangeSinkOrDifferentialWeights(Src, Dst: TNNetLayer;
+  Lambda: TNeuralFloat);
+var
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  MaxNeuronPos := Src.Neurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+  begin
+    if Src is TNNetDifferentialAttention
+      then Src.Neurons[NeuronPos].Weights.Fill(Lambda)
+      else Src.Neurons[NeuronPos].Weights.RandomizeGaussian(1.0);
+    Dst.Neurons[NeuronPos].Weights.Copy(Src.Neurons[NeuronPos].Weights);
+  end;
+  Src.MulWeights(1.0);
+  Dst.MulWeights(1.0);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.SinkAttentionFlashOpenCLParity;
+begin
+  CheckSinkOrDifferentialFlashParity({Differential=}false);
+end;
+
+procedure TTestNeuralNumerical.DifferentialAttentionFlashOpenCLParity;
+begin
+  CheckSinkOrDifferentialFlashParity({Differential=}true);
+end;
+
+procedure TTestNeuralNumerical.CheckSinkOrDifferentialFlashParity(
+  Differential: boolean);
+{$IFDEF OpenCL}
+const
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function NewAttention(Dk, NumSinks: integer;
+    Causal: boolean): TNNetScaledDotProductAttention;
+  begin
+    if Differential
+      then Result := TNNetDifferentialAttention.Create(Dk, Causal, 0.8)
+      else Result := TNNetSinkAttention.Create(Dk, Causal, NumSinks);
+  end;
+
+  procedure RunCase(Dk, SeqLen, NumSinks: integer; Causal: boolean;
+    Lambda: TNeuralFloat; ForcedSplits: integer;
+    HostSource, ExpectFlash: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input: TNNetVolume;
+    CpuAttn, GpuAttn: TNNetScaledDotProductAttention;
+    PassCnt, MaxOutputPos, GpuForwards: integer;
+    Diff, MaxDiff, MaxAbsY: TNeuralFloat;
+    What: string;
+
+    procedure CompareOutputs();
+    var
+      OutputPos: integer;
+    begin
+      GpuAttn.ForceOutputOnRAM();
+      for OutputPos := 0 to MaxOutputPos do
+      begin
+        Diff := Abs(CpuAttn.Output.FData[OutputPos] -
+          GpuAttn.Output.FData[OutputPos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        MaxAbsY := Max(MaxAbsY, Abs(CpuAttn.Output.FData[OutputPos]));
+      end;
+    end;
+
+    procedure ComparePass();
+    begin
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      CompareOutputs();
+    end;
+
+    function WithinTolerance(): boolean;
+    begin
+      Result := MaxDiff < 1e-4 * Max(1, MaxAbsY);
+    end;
+
+  begin
+    What := Format('differential=%s Dk=%d T=%d sinks=%d causal=%s ' +
+      'lambda=%.2f splits=%d host=%s', [BoolToStr(Differential, true), Dk,
+      SeqLen, NumSinks, BoolToStr(Causal, true), Lambda, ForcedSplits,
+      BoolToStr(HostSource, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
+      if HostSource then NNCpu.AddLayer(THostOnlyMulByConstant.Create(1));
+      CpuAttn := NewAttention(Dk, NumSinks, Causal);
+      NNCpu.AddLayer(CpuAttn);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
+      if HostSource then NNGpu.AddLayer(THostOnlyMulByConstant.Create(1));
+      GpuAttn := NewAttention(Dk, NumSinks, Causal);
+      NNGpu.AddLayer(GpuAttn);
+      NNGpu.CopyWeights(NNCpu);
+      ChangeSinkOrDifferentialWeights(CpuAttn, GpuAttn, Lambda);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      if ForcedSplits > 0 then
+        GpuAttn.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
+      NNGpu.LayerProfiling := true;
+      MaxOutputPos := GpuAttn.Output.Size - 1;
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      for PassCnt := 1 to PassCount do ComparePass();
+      WriteLn('  sink/differential flash ', What, ': max|diff|=', MaxDiff:0:9,
+        ' max|y|=', MaxAbsY:0:4, ' gpu=', GpuAttn.ForwardGPUCnt, ' bound=',
+        GpuAttn.ProfiledResidency.SourceBoundCnt);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        WithinTolerance());
+      AssertEquals(What + ': WillOpenCL', ExpectFlash, GpuAttn.WillOpenCL());
+      if not ExpectFlash then
+      begin
+        AssertEquals(What + ': host path', 0, GpuAttn.ForwardGPUCnt);
+        AssertFalse(What + ': the host path leaves no resident output',
+          GpuAttn.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': attention on OpenCL', PassCount,
+        GpuAttn.ForwardGPUCnt);
+      if ForcedSplits > 0 then
+        AssertEquals(What + ': key splits', ForcedSplits,
+          GpuAttn.FusedSDPACL.LastFlashSplits);
+      AssertEquals(What + ': output resident', PassCount,
+        GpuAttn.ProfiledResidency.OutputResidentCnt);
+      if HostSource then
+        AssertEquals(What + ': source uploaded', PassCount,
+          GpuAttn.ProfiledResidency.ActivationUploadedCnt)
+      else
+      begin
+        AssertEquals(What + ': source bound', PassCount,
+          GpuAttn.ProfiledResidency.SourceBoundCnt);
+        AssertEquals(What + ': source never pulled', 0,
+          GpuAttn.ProfiledResidency.SourcePulledToRAMCnt);
+      end;
+      // New sink slots / lambda must reach the next OpenCL forward.
+      ChangeSinkOrDifferentialWeights(CpuAttn, GpuAttn, -0.5 * Lambda);
+      MaxDiff := 0;
+      ComparePass();
+      AssertTrue(What + ': max|diff| after a weight change ' +
+        FloatToStr(MaxDiff), WithinTolerance());
+      AssertEquals(What + ': on OpenCL after a weight change', PassCount + 1,
+        GpuAttn.ForwardGPUCnt);
+      // The cached decode on the same OpenCL net stays on the host and still
+      // matches the full forward of the same input.
+      if Causal then
+      begin
+        GpuForwards := GpuAttn.ForwardGPUCnt;
+        GpuAttn.BeginIncrementalDecode(SeqLen);
+        NNGpu.Compute(Input);
+        MaxDiff := 0;
+        CompareOutputs();
+        GpuAttn.EndIncrementalDecode();
+        AssertTrue(What + ': cached decode max|diff| ' + FloatToStr(MaxDiff),
+          WithinTolerance());
+        AssertEquals(What + ': cached decode on the host', GpuForwards,
+          GpuAttn.ForwardGPUCnt);
+        // Back on the full forward, the flash path resumes.
+        MaxDiff := 0;
+        ComparePass();
+        AssertTrue(What + ': max|diff| after the cached decode ' +
+          FloatToStr(MaxDiff), WithinTolerance());
+        AssertEquals(What + ': on OpenCL after the cached decode',
+          GpuForwards + 1, GpuAttn.ForwardGPUCnt);
+      end;
+    finally
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  // One and three sinks (one only for the sink layer), causal and not.
+  RunCase(16, 40, 1, True, 0.8, 0, False, True);
+  RunCase(16, 40, 3, True, 0.6, 0, False, True);
+  RunCase(16, 36, 1, False, 0.8, 0, False, True);
+  RunCase(10, 36, 3, False, 1.2, 0, False, True);
+  RunCase(64, 48, 2, True, 0.3, 0, False, True);
+  // Key splits through the merge.
+  RunCase(16, 200, 2, True, 0.8, 3, False, True);
+  RunCase(16, 200, 1, False, 0.8, 4, False, True);
+  // A host source of 40 rows is uploaded; one of 8 rows keeps the host path.
+  RunCase(16, 40, 2, True, 0.8, 0, True, True);
+  RunCase(16, 8, 2, True, 0.8, 0, True, False);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 40;
+  DModel = 24;
+  Heads = 3;
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Variant: TNNetAttentionVariant; Causal: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input: TNNetVolume;
+    LayerPos, MaxLayerPos, PassCnt, HeadCnt: integer;
+    MaxDiff, MaxAbsY: TNeuralFloat;
+    Layer: TNNetLayer;
+    What: string;
+  begin
+    What := Format('variant=%d causal=%s', [Ord(Variant),
+      BoolToStr(Causal, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, DModel);
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      NNCpu.AddMultiHeadSelfAttention(Heads, Causal, {UseRoPE=}true, Variant,
+        {NumSinks=}2);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, DModel));
+      NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * DModel));
+      NNGpu.AddMultiHeadSelfAttention(Heads, Causal, {UseRoPE=}true, Variant,
+        {NumSinks=}2);
+      NNGpu.CopyWeights(NNCpu);
+      MaxLayerPos := NNCpu.CountLayers() - 1;
+      HeadCnt := 0;
+      for LayerPos := 0 to MaxLayerPos do
+        if (NNCpu.Layers[LayerPos] is TNNetSinkAttention) or
+           (NNCpu.Layers[LayerPos] is TNNetDifferentialAttention) then
+        begin
+          ChangeSinkOrDifferentialWeights(NNCpu.Layers[LayerPos],
+            NNGpu.Layers[LayerPos], 0.5 + 0.1 * HeadCnt);
+          Inc(HeadCnt);
+        end;
+      AssertEquals(What + ': attention heads', Heads, HeadCnt);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.LayerProfiling := true;
+      Input.RandomizeGaussian(1.0);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      for PassCnt := 1 to PassCount do
+      begin
+        Input.RandomizeGaussian(1.0);
+        NNCpu.Compute(Input);
+        NNGpu.Compute(Input);
+        NNGpu.GetLastLayer().ForceOutputOnRAM();
+        MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(NNCpu.GetLastLayer.Output,
+          NNGpu.GetLastLayer.Output));
+        MaxAbsY := Max(MaxAbsY, NNCpu.GetLastLayer.Output.GetMaxAbs());
+      end;
+      WriteLn('  sink/differential multi-head ', What, ': max|diff|=',
+        MaxDiff:0:9, ' max|y|=', MaxAbsY:0:4);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-4 * Max(1, MaxAbsY));
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        Layer := NNGpu.Layers[LayerPos];
+        if (Layer is TNNetSinkAttention) or
+           (Layer is TNNetDifferentialAttention) then
+        begin
+          AssertEquals(What + ': head on OpenCL', PassCount,
+            Layer.ForwardGPUCnt);
+          AssertEquals(What + ': head source bound', PassCount,
+            Layer.ProfiledResidency.SourceBoundCnt);
+          AssertEquals(What + ': head source never pulled', 0,
+            Layer.ProfiledResidency.SourcePulledToRAMCnt);
+          AssertEquals(What + ': head output resident', PassCount,
+            Layer.ProfiledResidency.OutputResidentCnt);
+        end;
+      end;
+    finally
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261022;
+  RunCase(avSink, True);
+  RunCase(avSink, False);
+  RunCase(avDifferential, True);
+  RunCase(avDifferential, False);
 end;
 {$ELSE}
 begin

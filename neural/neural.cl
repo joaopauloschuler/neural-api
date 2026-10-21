@@ -4891,6 +4891,49 @@ __kernel void cai_sdpa_qk_l2norm_packed
     FY[base + d] = FX[base + d] * invN;
 }
 
+// Query pre-pass for TNNetDifferentialAttention: row t of FY is the two query
+// heads [Q1, 0 | 0, Q2] (2*FDk floats) built from the [Q | K | V] row of FX,
+// so one flash launch with two heads per KV head scores Q1.K1 and Q2.K2.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_diff_pack_q
+(
+  const int FTokenCnt,
+  const int FDk,
+  const int FXStride,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  const int TwoDk = 2 * FDk;
+  if (p >= FTokenCnt * TwoDk) return;
+  const int t = p / TwoDk;
+  const int c = p - t * TwoDk;
+  const int HalfDk = FDk >> 1;
+  // Column c of head 0 keeps Q[c] below HalfDk; head 1 keeps Q[c - FDk] from HalfDk on.
+  const int d = (c < FDk) ? c : (c - FDk);
+  const int Keep = (c < FDk) ? (d < HalfDk) : (d >= HalfDk);
+  FY[p] = Keep ? FX[t * FXStride + d] : 0.0f;
+}
+
+// Differential attention epilogue: FY[t, d] = FPair[t, d] - FLambda *
+// FPair[t, FDk + d] over the two-head flash result. Coded by Claude (AI).
+__kernel void cai_sdpa_diff_combine
+(
+  const int FTokenCnt,
+  const int FDk,
+  const float FLambda,
+  __global const float* FPair,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  if (p >= FTokenCnt * FDk) return;
+  const int t = p / FDk;
+  const int PairPos = p + t * FDk;
+  FY[p] = FPair[PairPos] - FLambda * FPair[PairPos + FDk];
+}
+
 // Query heads a lane scores against one K row at a time in the split-row
 // decode kernels: a fixed slab so the accumulators stay in registers. A head
 // group wider than this re-reads the K row once per slab. The slab loops clamp

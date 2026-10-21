@@ -4650,6 +4650,9 @@ type
     function FlashPackedSource(SourceBuffer: cl_mem): cl_mem; virtual;
     // The factor of every flash score (Q . K); the base class uses 1/sqrt(d_k).
     function FlashScoreScale(): TNeuralFloat; virtual;
+    // ComputeFlashOpenCL's launches over the packed source (nil = upload the
+    // source), leaving the output in FFusedSDPACL.ResultBuffer.
+    procedure RunFlashOnSource(SourceBuffer: cl_mem); virtual;
     // Runs ComputeFlashOpenCL when WillOpenCL and returns true; otherwise marks
     // the output host-written, downloads the source and returns false.
     function ForwardOnOpenCL(): boolean;
@@ -5014,6 +5017,17 @@ type
     FQKNormKernel: cl_kernel;
     FBufQKNorm: cl_mem;
     FCapQKNorm: csize_t;
+    // ComputeFlashDifferential's entry points, its [Q1,0|0,Q2] query rows and
+    // its combined result (grow-only).
+    FDiffPackKernel, FDiffCombineKernel: cl_kernel;
+    FBufDiffQ, FBufDiffY: cl_mem;
+    FCapDiffQ, FCapDiffY: csize_t;
+    // The buffer the last forward left its result in (FBufY or FBufDiffY).
+    FResultBuf: cl_mem;
+    // True while FBufK/FBufV rows 0..FPrefixRowCnt-1 hold ComputeFlashPacked's
+    // last uploaded prefix; any other cache writer clears it.
+    FPrefixRowsValid: boolean;
+    FPrefixRowCnt: integer;
     FRowKeyEndsVersion, FRowKeyEndCnt: integer;
     // The last flash launch's tiles and key splits, test-only split count and
     // flash row threshold (0 = automatic), and the path of the last forward.
@@ -5180,16 +5194,21 @@ type
       const RowKeyEnds: array of integer; RowKeyEndsVersion: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-    // One head over X = (TokenCnt, 1, [Q|K|V]): copies K and V into the FP32
-    // cache buffers (CacheMax = TokenCnt), then runs cai_sdpa_flash. Score
-    // (t, j) gains pScoreBias[Base + t*RowStride + j], uploaded when Changed.
-    // pSinkLogits[0] joins every softmax denominator, uploaded when Changed.
+    // One head of X = (TokenCnt, 1, [Q|K|V]) on cai_sdpa_flash: keys are the
+    // pPrefix rows then X's; bias, sinks and prefix upload when Changed.
     procedure ComputeFlashPacked(X, Y: TNNetVolume; Dk, Window: integer;
       Causal: boolean; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
       pScoreBias: TNNetVolume = nil; pScoreBiasBase: integer = 0;
       pScoreBiasRowStride: integer = 0; pScoreBiasChanged: boolean = true;
-      pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true);
+      pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true;
+      pPrefixKeys: TNNetVolume = nil; pPrefixValues: TNNetVolume = nil;
+      pPrefixChanged: boolean = true);
+    // Differential attention of X = (TokenCnt, 1, [Q|K|V]) (or pExternalSrc)
+    // into ResultBuffer: A1.V - Lambda*A2.V; Pair (TokenCnt,1,2*Dk) is a shape.
+    procedure ComputeFlashDifferential(X, Y, Pair: TNNetVolume; Dk: integer;
+      Causal: boolean; InvSqrtHalfDk, Lambda: TNeuralFloat;
+      pExternalSrc: cl_mem = nil);
     // Sizes NormalizeQKPacked's result for TokenCnt rows of [Q|K|V] (grow-only).
     procedure EnsureQKNormBuffer(TokenCnt, Dk: integer);
     // X = (TokenCnt, 1, [Q|K|V]) (or pExternalSrc) with the Q and K slices
@@ -7984,13 +8003,26 @@ type
     // per-call sink key/value gradient accumulators (FNumSinks,1,FDk).
     FSinkKeyPtr, FSinkValPtr: array of TNeuralFloatArrPtr;
     FSinkKeyGrad, FSinkValGrad: TNNetVolume;
+    {$IFDEF OpenCL}
+    // The sink keys and values packed as (FNumSinks, 1, d_k) rows: the flash
+    // forward's cache prefix, repacked every flash forward.
+    FSinkKeyRows, FSinkValueRows: TNNetVolume;
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     // Points FSinkKeyPtr/FSinkValPtr at the current sink key/value weight rows.
     procedure BindSinkSlotPtrs();
   protected
     // The cached decode: the sink slots are scored beside the cached keys.
     procedure ComputeIncremental(); override;
+    {$IFDEF OpenCL}
+    function FlashForwardIsExact(): boolean; override;
+    // The sink slots are cache rows 0..FNumSinks-1 ahead of the real keys.
+    procedure RunFlashOnSource(SourceBuffer: cl_mem); override;
+    {$ENDIF}
   public
+    {$IFDEF OpenCL}
+    function WillOpenCL(): boolean; override;
+    {$ENDIF}
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       NumSinks: integer = 1); overload;
     destructor Destroy(); override;
@@ -8080,12 +8112,24 @@ type
     FdScore1Buf, FdScore2Buf: array of TNeuralFloat;
     // The cached decode's map-2 score row (FCacheScores holds map 1).
     FCacheScores2: array of TNeuralFloat;
+    {$IFDEF OpenCL}
+    // (SeqLen, 1, 2*d_k): the shape of the flash forward's two-map rows.
+    FFlashPairShape: TNNetVolume;
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure FreeBackpropScratch();
   protected
     // The cached decode: both maps over the cached half-width keys.
     procedure ComputeIncremental(); override;
+    {$IFDEF OpenCL}
+    function FlashForwardIsExact(): boolean; override;
+    // Both maps in one two-head flash launch, then out = Y1 - lambda*Y2.
+    procedure RunFlashOnSource(SourceBuffer: cl_mem); override;
+    {$ENDIF}
   public
+    {$IFDEF OpenCL}
+    function WillOpenCL(): boolean; override;
+    {$ENDIF}
     procedure BeginIncrementalDecode(pMaxContext: integer;
       pInt8KV: boolean = false); override;
     constructor Create(d_k: integer; pCausalMask: boolean = false;
@@ -36119,15 +36163,29 @@ begin
     and FusedSDPAFlashIndicesFit(1, 1, SeqLen, SeqLen, FDk);
 end;
 
+procedure TNNetScaledDotProductAttention.RunFlashOnSource(SourceBuffer: cl_mem);
+var
+  ScoreBias, Sinks: TNNetVolume;
+  BiasBase, BiasRowStride: integer;
+begin
+  ScoreBias := ScoreBiasTable(BiasBase, BiasRowStride);
+  Sinks := SinkLogits();
+  // One flag covers both tables: a weight update may have changed either.
+  FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk, FWindow,
+    FCausal, FlashScoreScale(), FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
+    {pKeepResultOnOpenCL=}true, ScoreBias, BiasBase, BiasRowStride,
+    {pScoreBiasChanged=}FAfterWeightUpdateHasBeenCalled, Sinks,
+    {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
+  if Assigned(ScoreBias) or Assigned(Sinks) then
+    FAfterWeightUpdateHasBeenCalled := false;
+end;
+
 procedure TNNetScaledDotProductAttention.ComputeFlashOpenCL();
 var
   SourceBuffer: cl_mem;
   StartTime: double;
-  ScoreBias, Sinks: TNNetVolume;
-  BiasBase, BiasRowStride: integer;
 begin
   StartTime := Now();
-  ScoreBias := ScoreBiasTable(BiasBase, BiasRowStride);
   if PrevOutputOnOpenCL() then
   begin
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
@@ -36138,16 +36196,7 @@ begin
     SourceBuffer := nil;
     FPrevLayer.ForceOutputOnRAM();
   end;
-  SourceBuffer := FlashPackedSource(SourceBuffer);
-  Sinks := SinkLogits();
-  // One flag covers both tables: a weight update may have changed either.
-  FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk, FWindow,
-    FCausal, FlashScoreScale(), FScoreSoftCap, FInvScoreSoftCap, SourceBuffer,
-    {pKeepResultOnOpenCL=}true, ScoreBias, BiasBase, BiasRowStride,
-    {pScoreBiasChanged=}FAfterWeightUpdateHasBeenCalled, Sinks,
-    {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
-  if Assigned(ScoreBias) or Assigned(Sinks) then
-    FAfterWeightUpdateHasBeenCalled := false;
+  RunFlashOnSource(FlashPackedSource(SourceBuffer));
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -42115,6 +42164,8 @@ begin
   FSplitInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_split_int8');
   FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
   FQKNormKernel := FKernel.CreateKernel('cai_sdpa_qk_l2norm_packed');
+  FDiffPackKernel := FKernel.CreateKernel('cai_sdpa_diff_pack_q');
+  FDiffCombineKernel := FKernel.CreateKernel('cai_sdpa_diff_combine');
   FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
   FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
   FFlashKernels[false] := FKernel.CreateKernel('cai_sdpa_flash');
@@ -42146,6 +42197,8 @@ begin
   if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
   if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
   if Assigned(FQKNormKernel)     then clReleaseKernel(FQKNormKernel);
+  if Assigned(FDiffPackKernel)   then clReleaseKernel(FDiffPackKernel);
+  if Assigned(FDiffCombineKernel) then clReleaseKernel(FDiffCombineKernel);
   for Int8KV := false to true do
     if Assigned(FFlashKernels[Int8KV]) then
       clReleaseKernel(FFlashKernels[Int8KV]);
@@ -42153,6 +42206,8 @@ begin
   if Assigned(FBufScoreBias) then clReleaseMemObject(FBufScoreBias);
   if Assigned(FBufSinkLogits) then clReleaseMemObject(FBufSinkLogits);
   if Assigned(FBufQKNorm) then clReleaseMemObject(FBufQKNorm);
+  if Assigned(FBufDiffQ) then clReleaseMemObject(FBufDiffQ);
+  if Assigned(FBufDiffY) then clReleaseMemObject(FBufDiffY);
   if Assigned(FBufX)        then clReleaseMemObject(FBufX);
   if Assigned(FBufK)        then clReleaseMemObject(FBufK);
   if Assigned(FBufV)        then clReleaseMemObject(FBufV);
@@ -42167,7 +42222,7 @@ end;
 
 function TNNetFusedSDPACL.ResultBuffer(): cl_mem;
 begin
-  Result := FBufY;
+  Result := FResultBuf;
 end;
 
 function TNNetFusedSDPACL.OutputKernel(): TNeuralKernel;
@@ -42320,6 +42375,7 @@ procedure TNNetFusedSDPACL.FinishForward(bufY: cl_mem; Y: TNNetVolume;
   pKeepResultOnOpenCL: boolean);
 begin
   FOutputKernel := FKernel;
+  FResultBuf := bufY;
   if not pKeepResultOnOpenCL then
   begin
     FKernel.Finish();
@@ -42447,6 +42503,7 @@ end;
 procedure TNNetFusedSDPACL.EnsureCacheBuffers(K, V: TNNetVolume;
   out bufK, bufV: cl_mem);
 begin
+  FPrefixRowsValid := false;
   bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
   bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
 end;
@@ -42792,17 +42849,41 @@ procedure TNNetFusedSDPACL.ComputeFlashPacked(X, Y: TNNetVolume;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
   pScoreBias: TNNetVolume = nil; pScoreBiasBase: integer = 0;
   pScoreBiasRowStride: integer = 0; pScoreBiasChanged: boolean = true;
-  pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true);
+  pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true;
+  pPrefixKeys: TNNetVolume = nil; pPrefixValues: TNNetVolume = nil;
+  pPrefixChanged: boolean = true);
 var
   bufX, bufBias, bufSinks: cl_mem;
-  TokenCnt, BiasLen, HasSinks: integer;
-  CacheBytes: csize_t;
+  TokenCnt, BiasLen, HasSinks, PrefixRows, CacheMax: integer;
+  CacheBytes, PrefixBytes, PrevCapK, PrevCapV: csize_t;
 begin
   TokenCnt := X.SizeX;
-  CacheBytes := csize_t(TokenCnt) * Dk * csNeuralFloatSize;
+  PrefixRows := 0;
+  if Assigned(pPrefixKeys) then PrefixRows := pPrefixKeys.SizeX;
+  CacheMax := PrefixRows + TokenCnt;
+  CacheBytes := csize_t(CacheMax) * Dk * csNeuralFloatSize;
   bufX := StepSourceBuffer(X, pExternalSrc);
+  PrevCapK := FCapK;
+  PrevCapV := FCapV;
   FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, CacheBytes);
   FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, CacheBytes);
+  if PrefixRows > 0 then
+  begin
+    // A grown buffer is a fresh handle with no prefix in it.
+    if pPrefixChanged or (not FPrefixRowsValid) or
+       (FPrefixRowCnt <> PrefixRows) or (FCapK <> PrevCapK) or
+       (FCapV <> PrevCapV) then
+    begin
+      PrefixBytes := csize_t(PrefixRows) * Dk * csNeuralFloatSize;
+      FKernel.WriteBufferAt(FBufK, 0, PrefixBytes, pPrefixKeys.GetRawPtr(0),
+        CL_TRUE);
+      FKernel.WriteBufferAt(FBufV, 0, PrefixBytes, pPrefixValues.GetRawPtr(0),
+        CL_TRUE);
+      FPrefixRowCnt := PrefixRows;
+      FPrefixRowsValid := true;
+    end;
+  end
+  else FPrefixRowsValid := false;
   bufBias := nil;
   BiasLen := 0;
   if Assigned(pScoreBias) then
@@ -42814,13 +42895,56 @@ begin
   end;
   SinkLogitsArgs(pSinkLogits, pSinkLogitsChanged, {QHeads=}1, bufX, bufSinks,
     HasSinks);
-  RunAppend(bufX, FBufK, FBufV, {KVHeads=}1, TokenCnt, Dk,
-    {CacheMax=}TokenCnt, {CacheSlot=}0, {QW=}Dk, {KVOffset=}Dk, X.Depth);
+  RunAppend(bufX, FBufK, FBufV, {KVHeads=}1, TokenCnt, Dk, CacheMax,
+    {CacheSlot=}PrefixRows, {QW=}Dk, {KVOffset=}Dk, X.Depth);
   RunFlash(X, Y, bufX, {Int8KV=}false, {QHeads=}1, {KVHeads=}1,
-    {GroupSize=}1, Dk, {CacheMax=}TokenCnt, {CacheSlot=}0, Window, Causal,
+    {GroupSize=}1, Dk, CacheMax, {CacheSlot=}PrefixRows, Window, Causal,
     [], 0, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, FBufK, FBufV,
     pKeepResultOnOpenCL, bufSinks, HasSinks, bufBias, pScoreBiasBase,
     pScoreBiasRowStride, BiasLen);
+end;
+
+procedure TNNetFusedSDPACL.ComputeFlashDifferential(X, Y, Pair: TNNetVolume;
+  Dk: integer; Causal: boolean; InvSqrtHalfDk, Lambda: TNeuralFloat;
+  pExternalSrc: cl_mem = nil);
+var
+  bufX, bufQ, bufPair, bufOut: cl_mem;
+  TokenCnt, XStride: integer;
+  CacheBytes: csize_t;
+  fLambda: single;
+begin
+  TokenCnt := X.SizeX;
+  XStride := X.Depth;
+  fLambda := Lambda;
+  CacheBytes := csize_t(TokenCnt) * Dk * csNeuralFloatSize;
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  FKernel.EnsureBuffer(FBufK, FCapK, CL_MEM_READ_WRITE, CacheBytes);
+  FKernel.EnsureBuffer(FBufV, FCapV, CL_MEM_READ_WRITE, CacheBytes);
+  FPrefixRowsValid := false;
+  bufQ := FKernel.EnsureOutputBuffer(FBufDiffQ, FCapDiffQ, Pair);
+  clSetKernelArg(FDiffPackKernel, 0, csLongintSize, @TokenCnt);
+  clSetKernelArg(FDiffPackKernel, 1, csLongintSize, @Dk);
+  clSetKernelArg(FDiffPackKernel, 2, csLongintSize, @XStride);
+  clSetKernelArg(FDiffPackKernel, 3, csCLMemSize, @bufX);
+  clSetKernelArg(FDiffPackKernel, 4, csCLMemSize, @bufQ);
+  FKernel.RunKernel(FDiffPackKernel, TokenCnt * 2 * Dk);
+  RunAppend(bufX, FBufK, FBufV, {KVHeads=}1, TokenCnt, Dk,
+    {CacheMax=}TokenCnt, {CacheSlot=}0, {QW=}Dk, {KVOffset=}Dk, XStride);
+  // Query heads [Q1,0] and [0,Q2] share the one KV head: both maps, one launch.
+  RunFlash(Pair, Pair, bufQ, {Int8KV=}false, {QHeads=}2, {KVHeads=}1,
+    {GroupSize=}2, Dk, {CacheMax=}TokenCnt, {CacheSlot=}0, {Window=}0,
+    Causal, [], 0, InvSqrtHalfDk, {ScoreSoftCap=}0, {InvScoreSoftCap=}0,
+    FBufK, FBufV, {pKeepResultOnOpenCL=}true, {bufSinks=}bufX,
+    {HasSinks=}0);
+  bufPair := FResultBuf;
+  bufOut := FKernel.EnsureOutputBuffer(FBufDiffY, FCapDiffY, Y);
+  clSetKernelArg(FDiffCombineKernel, 0, csLongintSize, @TokenCnt);
+  clSetKernelArg(FDiffCombineKernel, 1, csLongintSize, @Dk);
+  clSetKernelArg(FDiffCombineKernel, 2, csNeuralFloatSize, @fLambda);
+  clSetKernelArg(FDiffCombineKernel, 3, csCLMemSize, @bufPair);
+  clSetKernelArg(FDiffCombineKernel, 4, csCLMemSize, @bufOut);
+  FKernel.RunKernel(FDiffCombineKernel, TokenCnt * Dk);
+  FResultBuf := bufOut;
 end;
 
 procedure TNNetFusedSDPACL.SinkLogitsArgs(pSinkLogits: TNNetVolume;
@@ -50449,6 +50573,10 @@ begin
   FSinkAttn := TNNetVolume.Create();
   FSinkKeyGrad := TNNetVolume.Create();
   FSinkValGrad := TNNetVolume.Create();
+  {$IFDEF OpenCL}
+  FSinkKeyRows := TNNetVolume.Create(FNumSinks, 1, FDk);
+  FSinkValueRows := TNNetVolume.Create(FNumSinks, 1, FDk);
+  {$ENDIF}
 end;
 
 destructor TNNetSinkAttention.Destroy();
@@ -50456,8 +50584,49 @@ begin
   FSinkAttn.Free;
   FSinkKeyGrad.Free;
   FSinkValGrad.Free;
+  {$IFDEF OpenCL}
+  FSinkKeyRows.Free;
+  FSinkValueRows.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+function TNNetSinkAttention.FlashForwardIsExact(): boolean;
+begin
+  // Compute applies no soft-cap and no window.
+  Result := (Self.ClassType = TNNetSinkAttention) and (FScoreSoftCap = 0) and
+    (FWindow = 0);
+end;
+
+function TNNetSinkAttention.WillOpenCL(): boolean;
+begin
+  Result := inherited WillOpenCL() and FusedSDPAFlashIndicesFit(1, 1,
+    FPrevLayer.FOutput.SizeX, FNumSinks + FPrevLayer.FOutput.SizeX, FDk);
+end;
+
+procedure TNNetSinkAttention.RunFlashOnSource(SourceBuffer: cl_mem);
+var
+  s, MaxSinkPos, RowBytes: integer;
+begin
+  // 2*K rows: repacked every forward, uploaded only when the weights changed
+  // or the cache buffer lost them.
+  BindSinkSlotPtrs();
+  MaxSinkPos := FNumSinks - 1;
+  RowBytes := FDk * csNeuralFloatSize;
+  for s := 0 to MaxSinkPos do
+  begin
+    Move(FSinkKeyPtr[s]^, FSinkKeyRows.GetRawPtr(s, 0)^, RowBytes);
+    Move(FSinkValPtr[s]^, FSinkValueRows.GetRawPtr(s, 0)^, RowBytes);
+  end;
+  FFusedSDPACL.ComputeFlashPacked(FPrevLayer.FOutput, FOutput, FDk,
+    {Window=}0, FCausal, FInvSqrtDk, {ScoreSoftCap=}0, {InvScoreSoftCap=}0,
+    SourceBuffer, {pKeepResultOnOpenCL=}true, {pScoreBias=}nil, 0, 0, false,
+    {pSinkLogits=}nil, false, FSinkKeyRows, FSinkValueRows,
+    {pPrefixChanged=}FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
+end;
+{$ENDIF}
 
 procedure TNNetSinkAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
@@ -50495,12 +50664,15 @@ var
   Prev: TNNetVolume;
   OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if ForwardOnOpenCL() then exit;
+  {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncremental();
     exit;
   end;
+  Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -51025,6 +51197,9 @@ begin
   FLambdaInit := pLambdaInit;
   FFloatSt[0] := FLambdaInit;
   FAttn2 := TNNetVolume.Create();
+  {$IFDEF OpenCL}
+  FFlashPairShape := TNNetVolume.Create();
+  {$ENDIF}
   InitDefault();
 end;
 
@@ -51039,9 +51214,36 @@ end;
 destructor TNNetDifferentialAttention.Destroy();
 begin
   FAttn2.Free;
+  {$IFDEF OpenCL}
+  FFlashPairShape.Free;
+  {$ENDIF}
   FreeBackpropScratch();
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+function TNNetDifferentialAttention.FlashForwardIsExact(): boolean;
+begin
+  // Compute applies no soft-cap and no window.
+  Result := (Self.ClassType = TNNetDifferentialAttention) and
+    (FScoreSoftCap = 0) and (FWindow = 0);
+end;
+
+function TNNetDifferentialAttention.WillOpenCL(): boolean;
+begin
+  Result := inherited WillOpenCL() and
+    (FFlashPairShape.SizeX = FPrevLayer.FOutput.SizeX) and
+    FusedSDPAFlashIndicesFit(2, 1, FPrevLayer.FOutput.SizeX,
+      FPrevLayer.FOutput.SizeX, FDk);
+end;
+
+procedure TNNetDifferentialAttention.RunFlashOnSource(SourceBuffer: cl_mem);
+begin
+  FFusedSDPACL.ComputeFlashDifferential(FPrevLayer.FOutput, FOutput,
+    FFlashPairShape, FDk, FCausal, FInvSqrtHalfDk,
+    FNeurons[0].FWeights.Raw[0], SourceBuffer);
+end;
+{$ENDIF}
 
 function TNNetDifferentialAttention.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
@@ -51059,6 +51261,9 @@ begin
   InitDefault();
   // Second attention map, same layout as the parent FAttn: X=key, Y=query.
   FAttn2.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+  {$IFDEF OpenCL}
+  FFlashPairShape.ReSize(pPrevLayer.FOutput.SizeX, 1, 2 * FDk);
+  {$ENDIF}
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -51148,12 +51353,15 @@ var
   Prev: TNNetVolume;
   OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if ForwardOnOpenCL() then exit;
+  {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncremental();
     exit;
   end;
+  Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
