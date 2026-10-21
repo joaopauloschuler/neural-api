@@ -1295,6 +1295,35 @@ rather than acted on.
         (it takes ONE VisualTokens block + one ImageGridH/W today).
   - [ ] Real-checkpoint parity (Qwen/Qwen2-VL-2B-Instruct) + an examples/Qwen2VLDescribe
         that captions a tiny CPU image (ulimit-bounded).
+- [ ] Image input for ChatTerminal / ChatServer on the multimodal Qwen3.5 / Qwen3.6 /
+      Qwen3.8 checkpoints (`Qwen3_5ForConditionalGeneration`, model_type `qwen3_5` /
+      `qwen3_5_moe`). Today `BuildQwen35FromSafeTensorsEx` SKIPS `model.visual.*`, and
+      ChatServer rejects any `image_url` content part, so the user's tested chat models
+      are text-only although their checkpoints ship a vision tower. transformers'
+      `Qwen3_5VisionModel` is `Qwen3VLVisionModel` without DeepStack (no
+      `deepstack_visual_indexes`), so the landed `TQwen3VLVisionTower` (Qwen-Image-2.1
+      text encoder) should load it with an empty DeepStack array. Pieces:
+  - [ ] Vision tower: build `TQwen3VLVisionTower.CreateFromReader` from the checkpoint's
+        `vision_config` + `preprocessor_config.json`; a test that a qwen3_5 pico
+        fixture (no DeepStack) encodes an image and matches HF `Qwen3_5VisionModel`
+        `pooler_output` (oracle via the ~/x venv; ask before adding a new Python tool).
+  - [ ] Text side: interleaved M-RoPE (`mrope_section`, `mrope_interleaved`) on the
+        gated full-attention layers. `CreateRoPELayerForConfig` raises "M-RoPE has no
+        partial rotary" today, and qwen3_5 combines both (partial_rotary_factor 0.25),
+        so `TNNetInterleavedMRotaryEmbedding` needs the rotary-tile path. Text-only
+        prompts must stay exact (all three axes equal), so the text path keeps working.
+  - [ ] TChatEngine: splice the merged image tokens at the `<|image_pad|>` slots of
+        the chat template (reuse `LlavaAssembleEmbeddings` / the Qwen2-VL position
+        builder), and continue decode positions from max(position)+1 (HF rope_deltas),
+        not from the token count. The prompt-prefix cache and `--cache-checkpoints`
+        must key on the image bytes too, so a different image never resumes the cache.
+  - [ ] Front ends: ChatTerminal `/image FILE` (attach to the next user message);
+        ChatServer accepts OpenAI `image_url` parts as `data:` base64 URLs and local
+        files (no network fetch). The tower runs on OpenCL under `--gpu` through
+        the existing armed-net path.
+  - [ ] Parity: HF `Qwen3_5ForConditionalGeneration` greedy tokens for one image +
+        question on Qwen/Qwen3.5-0.8B (CPU, under the 2 GB cap), HF logit oracle first;
+        README row stays "planned (coded)" until the user runs a real checkpoint.
 - [ ] CLIPSeg text-prompted zero-shot segmentation importer follow-ups
       (BuildCLIPSegFromSafeTensors[WithConfig] + TCLIPSegConfig + RunCLIPSeg LANDED —
       frozen CLIP dual encoder + a FiLM-conditioned transposed-conv decoder emitting a
