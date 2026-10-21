@@ -1901,8 +1901,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       plan too (DeMaxPool's random spacing would need a per-forward plan, so
       it stays out). The gather-copy layers do not take part in OpenCL output
       sharing by liveness (`CanShareOpenCLOutput` is False).
-- [X] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward
-      (`cai_topk_gate`) plus the device slot-map build
+- [ ] Follow-ups of the `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device
+      forward (2ebe172b; `cai_topk_gate`) plus the device slot-map build
       (`cai_moe_build_slot_map`): router -> gate|up -> down has no host hop per
       token when the router output is resident. Open follow-ups:
   - [ ] Throughput of `cai_topk_gate` (one work-item per token, so a decode
@@ -1936,7 +1936,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Real device-side work still running on the host
 
-- [X] `TNNetSelectiveSSM` device forward, all three modes (DState = 1, the
+- [ ] Follow-ups of the `TNNetSelectiveSSM` device forward (0e9ed104), all
+      three modes (DState = 1, the
       folded Mamba-1 scan, and the Jamba / falcon_mamba inner-norm scan), for the
       full-sequence forward, prefill windows and the one-token decode path.
       `TNNetSelectiveSSMCL` runs `cai_selective_ssm_project` (delta / B / C),
@@ -1962,7 +1963,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       priority only because fewer tested checkpoints use it.
 - [ ] Attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
-  - [X] `TNNetGptOssSinkAttention`: the full forward runs on `cai_sdpa_flash`
+  - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):
+        the full forward runs on `cai_sdpa_flash`
         with the source bound and the result resident. The flash epilogue and
         `cai_sdpa_decode_merge` take an optional per-query-head sink buffer
         (`FHasSinks` = 0 for every other caller); a split launch adds the sink
