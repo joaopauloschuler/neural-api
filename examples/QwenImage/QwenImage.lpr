@@ -26,7 +26,8 @@ grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
 /padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
-/upscale FILE|off, /fbc X|off, /profile on|off, /stats on|off, /quit.
+/upscale FILE|off, /fbc X|off, /panorama WxH|off, /profile on|off,
+/stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -85,6 +86,14 @@ block 0 and compares its residual with the one of the last fully computed
 step; when the relative change is at most X it skips the other blocks and
 reuses their cached residual (diffusers apply_first_block_cache). 0 = off.
 
+Panoramas and large canvases (--panorama WxH or /panorama WxH): MultiDiffusion
+(Bar-Tal et al. 2023, diffusers StableDiffusionPanoramaPipeline). Each step
+runs the transformer on overlapping --width x --height windows of the WxH
+canvas (every --panorama-stride pixels, default half a window) and averages
+the windows' velocities per latent cell, so memory stays at one window.
+--panorama-wrap wraps the windows in X for a 360-degree panorama. Each window
+sees only its own region, so the global composition is weaker than one pass.
+
 The initial noise comes from the FPC RNG (--seed), so an image is repeatable
 here but not equal to a diffusers image with the same seed.
 
@@ -99,6 +108,7 @@ USAGE
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
             [--fbc-threshold X]
+            [--panorama WxH [--panorama-stride N] [--panorama-wrap]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile] [--stats]
@@ -351,7 +361,13 @@ begin
         if Stats.StepCount > 0 then
           Detail := Format('%d steps x %.1f ms', [Stats.StepCount,
             Stats.PhaseMs[Phase] / Stats.StepCount]);
-        if Stats.SkippedStepCount > 0 then
+        if Stats.PanoramaWindowCount > 0 then
+          Detail := Detail + Format(', %d panorama windows',
+            [Stats.PanoramaWindowCount]);
+        if (Stats.SkippedStepCount > 0) and (Stats.PanoramaWindowCount > 0)
+          then Detail := Detail + Format(', %d window passes with blocks ' +
+            '1..N-1 skipped (FBC)', [Stats.SkippedStepCount])
+        else if Stats.SkippedStepCount > 0 then
           Detail := Detail + Format(', %d with blocks 1..N-1 skipped (FBC)',
             [Stats.SkippedStepCount]);
       end;
@@ -568,6 +584,17 @@ begin
     'those blocks. 0 = off (DEFAULT);');
   WriteLn('                       0.05..0.2 trade detail for speed (see ',
     'README.md)');
+  WriteLn('  --panorama WxH       MultiDiffusion: a WxH canvas (multiples of ',
+    '32) denoised in overlapping');
+  WriteLn('                       --width x --height windows whose velocities ',
+    'are averaged per latent cell;');
+  WriteLn('                       memory stays at one window. Not with ',
+    '--init-image or --image (see README.md)');
+  WriteLn('  --panorama-stride N  window step in pixels, a multiple of 16 no ',
+    'larger than a window side');
+  WriteLn('                       (default: half the window side)');
+  WriteLn('  --panorama-wrap      wrap the windows past the right edge to the ',
+    'left edge (360-degree panorama)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
     'the parallel layer scheduler with intra-layer threading)');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
@@ -661,6 +688,8 @@ begin
     'memory if both do not fit.');
   WriteLn('  /fbc X|off           First-Block Cache threshold for the next ',
     'images, as --fbc-threshold');
+  WriteLn('  /panorama WxH|off    --panorama canvas for the next prompts ',
+    '(stride and wrap from the flags)');
   WriteLn('  /profile on|off      --profile for the next images');
   WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
@@ -808,6 +837,20 @@ begin
   else Result := '';
 end;
 
+// Parses a --panorama-stride: a positive multiple of 16 pixels; returns ''
+// or what is wrong.
+function ParsePanoramaStride(const Text: string; out Stride: integer): string;
+begin
+  Stride := StrToIntDef(Trim(Text), -1);
+  if (Stride < csQwenImage21PixelsPerLatent) or (Stride > csMaxImageSide) or
+     (Stride mod csQwenImage21PixelsPerLatent <> 0) then
+    Result := '"' + Text + '" is not a multiple of ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + ' in ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + '..' + IntToStr(csMaxImageSide) +
+      '.'
+  else Result := '';
+end;
+
 // Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
 function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
 begin
@@ -918,6 +961,10 @@ var
   Strength: double;
   HasStrengthArg: boolean;
   FbcThreshold: double;
+  // --panorama canvas (0: off), --panorama-stride (0: half a window) and
+  // --panorama-wrap; the windows are --width x --height.
+  PanoramaWidth, PanoramaHeight, PanoramaStride: integer;
+  PanoramaWrap: boolean;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -972,6 +1019,12 @@ var
     Result := Length(ConditionImages) > 0;
   end;
 
+  // A panorama canvas is set and no init or condition image overrides it.
+  function IsPanorama(): boolean;
+  begin
+    Result := (PanoramaWidth > 0) and not HasInitImage and not IsEditing();
+  end;
+
   // The image size: --width x --height, or with SourceImage <> nil its aspect
   // ratio at that area (diffusers' calculate_dimensions).
   procedure GetOutputSizeFor(SourceImage: TNNetVolume; out OutputWidth,
@@ -1006,6 +1059,11 @@ var
     else if IsEditing() then
       GetOutputSizeFor(ConditionImages[High(ConditionImages)], OutputWidth,
         OutputHeight)
+    else if IsPanorama() then
+    begin
+      OutputWidth := PanoramaWidth;
+      OutputHeight := PanoramaHeight;
+    end
     else GetOutputSizeFor(nil, OutputWidth, OutputHeight);
   end;
 
@@ -1413,6 +1471,30 @@ var
       Upscaler.Config.Scale, Upscaler.Tile]);
   end;
 
+  function PanoramaStrideText(): string;
+  begin
+    if PanoramaStride > 0 then Result := IntToStr(PanoramaStride) + ' pixels'
+    else Result := 'half a window';
+  end;
+
+  // Arms the pipeline's MultiDiffusion windows while IsPanorama(), else
+  // turns them off.
+  procedure ApplyPanorama();
+  begin
+    if IsPanorama() then
+    begin
+      Pipeline.PanoramaWindowWidth := Width;
+      Pipeline.PanoramaWindowHeight := Height;
+    end
+    else
+    begin
+      Pipeline.PanoramaWindowWidth := 0;
+      Pipeline.PanoramaWindowHeight := 0;
+    end;
+    Pipeline.PanoramaStride := PanoramaStride;
+    Pipeline.PanoramaCircular := PanoramaWrap;
+  end;
+
   procedure PrintImageSettings();
   var
     OutputWidth, OutputHeight, StartStep: integer;
@@ -1421,6 +1503,11 @@ var
     WriteLn('Image      : ', OutputWidth, 'x', OutputHeight, ' (',
       (OutputWidth div 16) * (OutputHeight div 16), ' image tokens), ',
       StepCount, ' steps, seed ', Seed);
+    if IsPanorama() then
+      WriteLn('Panorama   : ', Width, 'x', Height, ' windows every ',
+        PanoramaStrideText(), BoolToStr(PanoramaWrap, ', wrapping in X', ''))
+    else if PanoramaWidth > 0 then
+      WriteLn('Panorama   : off while an init or condition image is set');
     if IsEditing() then
     begin
       WriteLn('Edit       : ', Length(ConditionImages), ' condition ',
@@ -1504,6 +1591,7 @@ var
       IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     ImageStart := GetTickCount64;
     GetOutputSize(OutputWidth, OutputHeight);
+    ApplyPanorama();
     if HasInitImage then
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
         StepCount, Seed, Image, nil, ImageLatents, Strength,
@@ -2016,6 +2104,37 @@ var
         else WriteLn('[/upscale: ', Problem, ' - upscaling stays off]');
       end;
     end
+    else if Command = 'panorama' then
+    begin
+      if Argument = '' then
+      begin
+        if PanoramaWidth > 0 then
+          WriteLn('[panorama ', PanoramaWidth, 'x', PanoramaHeight,
+            '; /panorama WxH|off changes it]')
+        else WriteLn('[panorama off; /panorama WxH sets a canvas]');
+      end
+      else if LowerCase(Argument) = 'off' then
+      begin
+        PanoramaWidth := 0;
+        PanoramaHeight := 0;
+        WriteLn('[panorama off]');
+      end
+      else
+      begin
+        Problem := ParseImageSize(Argument, NewWidth, NewHeight);
+        if Problem <> '' then WriteLn('[/panorama: ', Problem, ']')
+        else
+        begin
+          PanoramaWidth := NewWidth;
+          PanoramaHeight := NewHeight;
+          WriteLn('[panorama ', PanoramaWidth, 'x', PanoramaHeight, ' in ',
+            Width, 'x', Height, ' windows]');
+          if not IsPanorama() then
+            WriteLn('[/panorama: off while an init or condition image is ',
+              'set]');
+        end;
+      end;
+    end
     else if Command = 'fbc' then
     begin
       if Argument = '' then
@@ -2142,6 +2261,10 @@ begin
   Strength := csDefaultStrength;
   HasStrengthArg := false;
   FbcThreshold := 0;
+  PanoramaWidth := 0;
+  PanoramaHeight := 0;
+  PanoramaStride := 0;
+  PanoramaWrap := false;
   MaxThreads := 0;
   Upscaler := nil;
   UpscaleFile := '';
@@ -2254,6 +2377,25 @@ begin
         Halt(2);
       end;
     end
+    else if Arg = '--panorama' then
+    begin
+      ArgProblem := ParseImageSize(NextArg(), PanoramaWidth, PanoramaHeight);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--panorama: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--panorama-stride' then
+    begin
+      ArgProblem := ParsePanoramaStride(NextArg(), PanoramaStride);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--panorama-stride: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--panorama-wrap' then PanoramaWrap := true
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -2361,6 +2503,28 @@ begin
       Halt(2);
     end;
     if not HasStrengthArg then Strength := 1;
+  end;
+  if (PanoramaWidth > 0) and ((InitImageFile <> '') or
+    (ImageArgFiles.Count > 0)) then
+  begin
+    WriteLn('--panorama runs text-to-image only: not with --init-image or ',
+      '--image.');
+    Halt(2);
+  end;
+  if (PanoramaWidth > 0) and (PanoramaStride > 0) and
+    ((PanoramaStride > Width) or (PanoramaStride > Height)) then
+  begin
+    WriteLn('--panorama-stride: ', PanoramaStride, ' is larger than the ',
+      Width, 'x', Height, ' window.');
+    Halt(2);
+  end;
+  if (PanoramaWidth = 0) and (PanoramaWrap or (PanoramaStride > 0)) then
+  begin
+    if HasPrompt or (TokenList <> '') then
+      WriteLn('[--panorama-stride and --panorama-wrap have no effect ',
+        'without --panorama]')
+    else WriteLn('[--panorama-stride and --panorama-wrap apply once ',
+      '/panorama sets a canvas]');
   end;
   if (UpscaleTile <> csDefaultUpscaleTile) and (UpscaleFile = '') then
   begin

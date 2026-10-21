@@ -155,6 +155,7 @@ follow:
 | `/upscale FILE` | upscale the next images with this Real-ESRGAN checkpoint, as `--upscale`; `/upscale` alone shows the current one, `/upscale off` stops upscaling |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/fbc X\|off` | First-Block Cache threshold for the next images, as `--fbc-threshold`; `/fbc` alone shows it, `/fbc off` (or `/fbc 0`) turns it off |
+| `/panorama WxH\|off` | panorama canvas for the next prompts, as `--panorama` (windows of `/size`, stride and wrap from the flags); `/panorama` alone shows it, `/panorama off` turns it off |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
 | `/quit` | end the session |
@@ -564,6 +565,63 @@ without the option. The pipeline property is
 `TDiTFirstBlockCache` in `neural/neuralpretrained.pas`, written so other
 DiT pipelines can reuse it.
 
+### Panoramas and large canvases (`--panorama WxH`)
+
+`--panorama WxH` (or `/panorama WxH` in the REPL) generates a canvas larger
+than the transformer pass with MultiDiffusion (Bar-Tal et al. 2023, the
+method of diffusers' `StableDiffusionPanoramaPipeline`). The transformer
+always runs on a window of `--width` x `--height` pixels (default
+1024x1024). Each step:
+
+1. cuts overlapping windows out of the canvas latents, every
+   `--panorama-stride` pixels (default half a window side);
+2. runs the transformer on each window, all with the one prompt prefix that
+   `EncodePrefix` encoded at the start of the image;
+3. averages the windows' velocities per latent cell (a cell covered by k
+   windows gets the mean of the k velocities);
+4. runs one Euler step on the whole canvas.
+
+`--panorama-wrap` wraps the windows past the right edge around to the left
+edge, so the left and right edges blend into each other: use it for
+360-degree panoramas. The VAE decodes the canvas with its usual tiles.
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --panorama 4096x1024 \
+  --panorama-wrap -p "a mountain lake at sunrise, wide panorama"
+```
+
+The trade-off:
+
+- **Memory.** The transformer's activations and attention grow with the
+  window, not the canvas: a 4096x1024 banner needs the memory of a
+  1024x1024 image plus the canvas latents (small).
+- **Time.** Each step runs the transformer once per window. 4096x1024 with
+  1024x1024 windows every 512 pixels is 7 windows, so a step takes about 7
+  times a 1024x1024 step. A larger stride runs fewer windows and blends
+  less; a stride equal to the window side has no overlap and shows seams.
+- **Composition.** Each window sees only its own region and the prompt,
+  so the global composition is weaker than one pass over the whole image:
+  objects can repeat along a wide canvas, and nothing ties distant regions
+  together. Prompts that describe a scene that repeats well (landscapes,
+  skylines) work best.
+- **Schedule.** The sigma shift (`mu`) is computed from a window's token
+  count, the size the transformer sees, not the canvas's.
+- **First-Block Cache.** With `--fbc-threshold`, each window keeps its own
+  cache and decides on its own; the memory is three (window tokens x hidden)
+  buffers per window. The `--stats` row counts skipped window passes.
+
+`--panorama` runs text-to-image only: not with `--init-image` (img2img,
+inpainting, outpainting) or `--image` (editing). A canvas no larger than one
+window runs exactly one pass, the same as without the option. The quality
+and the time per step on the real checkpoint (2048x512, 4096x1024) have not
+been measured yet. The pipeline properties are
+`TQwenImage21Pipeline.PanoramaWindowWidth`, `PanoramaWindowHeight`,
+`PanoramaStride` and `PanoramaCircular`; the window planner and the
+averaging are `TMultiDiffusionWindows` in `neural/neuraldiffusion.pas`,
+which takes any velocity callback, so other DiT pipelines can reuse it. It
+plans its windows with `ComputeTileStarts`, the planner of the tiled VAE
+decode.
+
 ## Options
 
 `QwenImage --help` prints this list.
@@ -612,6 +670,9 @@ and `--fp32`, the last one given wins.
 | `--upscale FILE` | upscale each image with this Real-ESRGAN / ESRGAN RRDBNet checkpoint before the save; see [Upscaling](#upscaling---upscale-file) | off |
 | `--upscale-tile N` | upscaler tile in input pixels, 0 = the whole image; each tile adds 10 context pixels per side | 32 |
 | `--fbc-threshold X` | First-Block Cache: skip transformer blocks 1..N-1 on steps whose block-0 residual changed by at most X; see [First-Block Cache](#first-block-cache---fbc-threshold-x) | 0 (off) |
+| `--panorama WxH` | MultiDiffusion: a WxH canvas (rounded down to multiples of 32) denoised in overlapping `--width` x `--height` windows; see [Panoramas](#panoramas-and-large-canvases---panorama-wxh). Not with `--init-image` or `--image` | off |
+| `--panorama-stride N` | window step in pixels, a multiple of 16 no larger than a window side | half a window side |
+| `--panorama-wrap` | wrap the windows past the right edge to the left edge (360-degree panorama) | off |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
@@ -817,3 +878,9 @@ checks it on OpenCL against the CPU. `TestDiTFirstBlockCacheDecision` and
 plain-loop reference: threshold 0 gives the same latents bit for bit, and a
 threshold that skips some steps gives the reference's skip pattern and
 latents, on the CPU and on OpenCL. No diffusers oracle covers it yet.
+`TestQwenImage21PanoramaOneWindowParity` checks that a canvas of one window
+gives the plain denoise bit for bit and plans 3 (4 wrapped) windows on a
+wider canvas; `TestMultiDiffusionConstantSeams` and
+`TestMultiDiffusionCircularWrap` check the window averaging on stubs: a
+constant velocity stays constant at the seams, an identity stub returns the
+canvas, and a wrapped canvas blends column 0 with the last window.

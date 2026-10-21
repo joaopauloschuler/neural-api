@@ -396,6 +396,74 @@ type
 // have the same size.
 procedure InpaintBlend(Latents, Known, Mask: TNNetVolume);
 
+// Tile starts along one axis every Stride from 0. Plain: the last tile is
+// clamped to end at Extent. Circular: ceil(Extent/Stride) tiles, wrapping.
+procedure ComputeTileStarts(Extent, TileLen, Stride: integer;
+  out Starts: TNeuralIntegerArray; Circular: boolean = false);
+
+type
+  // Fills WindowOutput from WindowInput for window WindowIdx (same token
+  // layout; WindowOutput may change depth and must keep the token count).
+  TMultiDiffusionPredictEvent = procedure(WindowIdx: integer;
+    WindowInput, WindowOutput: TNNetVolume) of object;
+
+  // MultiDiffusion (Bar-Tal et al. 2023, diffusers
+  // StableDiffusionPanoramaPipeline): a denoiser of a fixed window size runs
+  // on overlapping windows of a larger row-major token canvas; each canvas
+  // cell gets the mean of the windows covering it. Canvases are row-major
+  // (CanvasWidth*CanvasHeight,1,Depth) or (CanvasWidth,CanvasHeight,Depth);
+  // windows take the same form. Optional wrap in X for 360-degree
+  // panoramas. Coded by Claude (AI).
+  TMultiDiffusionWindows = class(TObject)
+  private
+    FCanvasWidth, FCanvasHeight, FWindowWidth, FWindowHeight: integer;
+    FCircularX: boolean;
+    FStartsX, FStartsY: TNeuralIntegerArray;
+    // 1 / (windows covering the cell), one per canvas cell.
+    FInvCoverage: TNeuralFloatDynArr;
+    FWindowInput, FWindowOutput, FAccumulator: TNNetVolume;
+    function GetWindowCount(): integer;
+    function GetWindowX(WindowIdx: integer): integer;
+    function GetWindowY(WindowIdx: integer): integer;
+    function GetCoverage(CellX, CellY: integer): integer;
+    procedure CheckCanvas(Canvas: TNNetVolume; const Caller: string);
+    procedure ShapeWindow(Canvas, Window: TNNetVolume; Depth: integer);
+    // IsGather: Window := Canvas's window cells; else Canvas cells += Window.
+    procedure TransferWindow(Canvas, Window: TNNetVolume; WindowIdx: integer;
+      IsGather: boolean);
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // Windows of WindowWidth x WindowHeight cells (each side clamped to the
+    // canvas) every StrideX / StrideY cells; 1 <= Stride <= window side.
+    procedure Plan(CanvasWidth, CanvasHeight, WindowWidth, WindowHeight,
+      StrideX, StrideY: integer; CircularX: boolean = false);
+    // Window := window WindowIdx of Canvas (resized to the window).
+    procedure GatherWindow(Canvas: TNNetVolume; WindowIdx: integer;
+      Window: TNNetVolume);
+    // Zeroes the canvas accumulator, Depth values per cell.
+    procedure ClearAccumulator(Depth: integer);
+    // Adds Window into the accumulator cells of window WindowIdx.
+    procedure AccumulateWindow(WindowIdx: integer; Window: TNNetVolume);
+    // CanvasOutput := accumulator / coverage, shaped like Canvas.
+    procedure NormalizeInto(Canvas, CanvasOutput: TNNetVolume);
+    // Every window: gather from Canvas, Predict, accumulate; then
+    // NormalizeInto(Canvas, CanvasOutput); one window equals Predict(Canvas).
+    procedure PredictCanvas(Canvas, CanvasOutput: TNNetVolume;
+      Predict: TMultiDiffusionPredictEvent);
+    property CanvasWidth: integer read FCanvasWidth;
+    property CanvasHeight: integer read FCanvasHeight;
+    property WindowWidth: integer read FWindowWidth;
+    property WindowHeight: integer read FWindowHeight;
+    property CircularX: boolean read FCircularX;
+    property WindowCount: integer read GetWindowCount;
+    // Top-left cell of window WindowIdx (row-major over the starts grid).
+    property WindowX[WindowIdx: integer]: integer read GetWindowX;
+    property WindowY[WindowIdx: integer]: integer read GetWindowY;
+    // Windows covering cell (CellX, CellY).
+    property Coverage[CellX, CellY: integer]: integer read GetCoverage;
+  end;
+
 implementation
 
 uses
@@ -1728,6 +1796,247 @@ begin
   StartSigma := FSigmas[StepIndex];
   Noise.Mul(StartSigma);
   Noise.MulAdd(1 - StartSigma, Sample);
+end;
+
+procedure ComputeTileStarts(Extent, TileLen, Stride: integer;
+  out Starts: TNeuralIntegerArray; Circular: boolean);
+var
+  LastStart, StartCount, MaxStartPos, StartPos: integer;
+begin
+  LastStart := Extent - TileLen;
+  StartCount := 1;
+  if LastStart > 0 then
+  begin
+    if Circular
+      then StartCount := (Extent + Stride - 1) div Stride
+      else StartCount := (LastStart + Stride - 1) div Stride + 1;
+  end;
+  Starts := nil;
+  SetLength(Starts, StartCount);
+  MaxStartPos := StartCount - 1;
+  for StartPos := 0 to MaxStartPos do
+    Starts[StartPos] := StartPos * Stride;
+  if (LastStart >= 0) and not Circular then
+    Starts[StartCount - 1] := LastStart;
+end;
+
+{ TMultiDiffusionWindows }
+
+constructor TMultiDiffusionWindows.Create();
+begin
+  inherited Create();
+  FWindowInput := TNNetVolume.Create();
+  FWindowOutput := TNNetVolume.Create();
+  FAccumulator := TNNetVolume.Create();
+end;
+
+destructor TMultiDiffusionWindows.Destroy();
+begin
+  FWindowInput.Free;
+  FWindowOutput.Free;
+  FAccumulator.Free;
+  inherited Destroy();
+end;
+
+procedure TMultiDiffusionWindows.Plan(CanvasWidth, CanvasHeight, WindowWidth,
+  WindowHeight, StrideX, StrideY: integer; CircularX: boolean);
+var
+  CellCoverage: TNeuralIntegerArray;
+  WindowIdx, MaxWindowPos, RowPos, MaxRowPos, ColPos, MaxColPos, CellPos,
+    MaxCellPos, RowBase: integer;
+begin
+  if (CanvasWidth < 1) or (CanvasHeight < 1) or (WindowWidth < 1) or
+     (WindowHeight < 1) then
+    raise Exception.Create('TMultiDiffusionWindows.Plan: canvas ' +
+      IntToStr(CanvasWidth) + 'x' + IntToStr(CanvasHeight) + ' or window ' +
+      IntToStr(WindowWidth) + 'x' + IntToStr(WindowHeight) + ' is empty.');
+  if WindowWidth > CanvasWidth then WindowWidth := CanvasWidth;
+  if WindowHeight > CanvasHeight then WindowHeight := CanvasHeight;
+  if (StrideX < 1) or (StrideX > WindowWidth) or (StrideY < 1) or
+     (StrideY > WindowHeight) then
+    raise Exception.Create('TMultiDiffusionWindows.Plan: stride ' +
+      IntToStr(StrideX) + 'x' + IntToStr(StrideY) + ' must be in 1..the ' +
+      'window side (' + IntToStr(WindowWidth) + 'x' +
+      IntToStr(WindowHeight) + ') so every cell is covered.');
+  FCanvasWidth := CanvasWidth;
+  FCanvasHeight := CanvasHeight;
+  FWindowWidth := WindowWidth;
+  FWindowHeight := WindowHeight;
+  FCircularX := CircularX;
+  ComputeTileStarts(CanvasWidth, WindowWidth, StrideX, FStartsX, CircularX);
+  ComputeTileStarts(CanvasHeight, WindowHeight, StrideY, FStartsY);
+  CellCoverage := nil;
+  SetLength(CellCoverage, CanvasWidth * CanvasHeight);
+  MaxRowPos := WindowHeight - 1;
+  MaxColPos := WindowWidth - 1;
+  MaxWindowPos := GetWindowCount() - 1;
+  for WindowIdx := 0 to MaxWindowPos do
+    for RowPos := 0 to MaxRowPos do
+    begin
+      RowBase := (GetWindowY(WindowIdx) + RowPos) * CanvasWidth;
+      for ColPos := 0 to MaxColPos do
+        Inc(CellCoverage[RowBase +
+          (GetWindowX(WindowIdx) + ColPos) mod CanvasWidth]);
+    end;
+  FInvCoverage := nil;
+  SetLength(FInvCoverage, CanvasWidth * CanvasHeight);
+  MaxCellPos := CanvasWidth * CanvasHeight - 1;
+  for CellPos := 0 to MaxCellPos do
+    FInvCoverage[CellPos] := 1 / CellCoverage[CellPos];
+end;
+
+function TMultiDiffusionWindows.GetWindowCount(): integer;
+begin
+  Result := Length(FStartsX) * Length(FStartsY);
+end;
+
+function TMultiDiffusionWindows.GetWindowX(WindowIdx: integer): integer;
+begin
+  Result := FStartsX[WindowIdx mod Length(FStartsX)];
+end;
+
+function TMultiDiffusionWindows.GetWindowY(WindowIdx: integer): integer;
+begin
+  Result := FStartsY[WindowIdx div Length(FStartsX)];
+end;
+
+function TMultiDiffusionWindows.GetCoverage(CellX, CellY: integer): integer;
+begin
+  Result := Round(1 / FInvCoverage[CellY * FCanvasWidth + CellX]);
+end;
+
+procedure TMultiDiffusionWindows.CheckCanvas(Canvas: TNNetVolume;
+  const Caller: string);
+var
+  CellCount: integer;
+begin
+  CellCount := FCanvasWidth * FCanvasHeight;
+  if (CellCount = 0) or not (((Canvas.SizeX = FCanvasWidth) and
+     (Canvas.SizeY = FCanvasHeight)) or ((Canvas.SizeX = CellCount) and
+     (Canvas.SizeY = 1))) then
+    raise Exception.Create('TMultiDiffusionWindows.' + Caller + ': a ' +
+      IntToStr(Canvas.SizeX) + 'x' + IntToStr(Canvas.SizeY) + ' volume is ' +
+      'not the planned ' + IntToStr(FCanvasWidth) + 'x' +
+      IntToStr(FCanvasHeight) + ' canvas (call Plan first).');
+end;
+
+procedure TMultiDiffusionWindows.ShapeWindow(Canvas, Window: TNNetVolume;
+  Depth: integer);
+begin
+  if (Canvas.SizeX = FCanvasWidth) and (Canvas.SizeY = FCanvasHeight)
+    then Window.ReSize(FWindowWidth, FWindowHeight, Depth)
+    else Window.ReSize(FWindowWidth * FWindowHeight, 1, Depth);
+end;
+
+procedure TMultiDiffusionWindows.TransferWindow(Canvas, Window: TNNetVolume;
+  WindowIdx: integer; IsGather: boolean);
+var
+  Depth, StartX, StartY, FirstRunFloats, WrapRunFloats, WindowRowFloats,
+    CanvasRowFloats, CanvasRowBase, CanvasWrapBase, WindowRowBase, RowPos,
+    MaxRowPos, FirstRunCells: integer;
+begin
+  Depth := Window.Depth;
+  StartX := GetWindowX(WindowIdx);
+  StartY := GetWindowY(WindowIdx);
+  // A wrapped window row is two runs: StartX..the right edge, then from 0.
+  FirstRunCells := FCanvasWidth - StartX;
+  if FirstRunCells > FWindowWidth then FirstRunCells := FWindowWidth;
+  FirstRunFloats := FirstRunCells * Depth;
+  WindowRowFloats := FWindowWidth * Depth;
+  WrapRunFloats := WindowRowFloats - FirstRunFloats;
+  CanvasRowFloats := FCanvasWidth * Depth;
+  CanvasWrapBase := StartY * CanvasRowFloats;
+  CanvasRowBase := CanvasWrapBase + StartX * Depth;
+  WindowRowBase := 0;
+  MaxRowPos := FWindowHeight - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    if IsGather then
+    begin
+      Move(Canvas.FData[CanvasRowBase], Window.FData[WindowRowBase],
+        FirstRunFloats * csNeuralFloatSize);
+      if WrapRunFloats > 0 then
+        Move(Canvas.FData[CanvasWrapBase],
+          Window.FData[WindowRowBase + FirstRunFloats],
+          WrapRunFloats * csNeuralFloatSize);
+    end
+    else
+    begin
+      TNNetVolume.Add(Canvas.GetRawPtr(CanvasRowBase),
+        Window.GetRawPtr(WindowRowBase), FirstRunFloats);
+      if WrapRunFloats > 0 then
+        TNNetVolume.Add(Canvas.GetRawPtr(CanvasWrapBase),
+          Window.GetRawPtr(WindowRowBase + FirstRunFloats), WrapRunFloats);
+    end;
+    Inc(CanvasRowBase, CanvasRowFloats);
+    Inc(CanvasWrapBase, CanvasRowFloats);
+    Inc(WindowRowBase, WindowRowFloats);
+  end;
+end;
+
+procedure TMultiDiffusionWindows.GatherWindow(Canvas: TNNetVolume;
+  WindowIdx: integer; Window: TNNetVolume);
+begin
+  CheckCanvas(Canvas, 'GatherWindow');
+  ShapeWindow(Canvas, Window, Canvas.Depth);
+  TransferWindow(Canvas, Window, WindowIdx, true);
+end;
+
+procedure TMultiDiffusionWindows.ClearAccumulator(Depth: integer);
+begin
+  FAccumulator.ReSize(FCanvasWidth * FCanvasHeight, 1, Depth);
+  FAccumulator.Fill(0);
+end;
+
+procedure TMultiDiffusionWindows.AccumulateWindow(WindowIdx: integer;
+  Window: TNNetVolume);
+begin
+  if (Window.Depth <> FAccumulator.Depth) or
+     (Window.Size <> FWindowWidth * FWindowHeight * Window.Depth) then
+    raise Exception.Create('TMultiDiffusionWindows.AccumulateWindow: ' +
+      IntToStr(Window.Size) + ' values do not form a ' +
+      IntToStr(FWindowWidth) + 'x' + IntToStr(FWindowHeight) + 'x' +
+      IntToStr(FAccumulator.Depth) + ' window (ClearAccumulator first).');
+  TransferWindow(FAccumulator, Window, WindowIdx, false);
+end;
+
+procedure TMultiDiffusionWindows.NormalizeInto(Canvas,
+  CanvasOutput: TNNetVolume);
+var
+  Depth, CellPos, MaxCellPos: integer;
+  CellInvCoverage: TNeuralFloat;
+begin
+  CheckCanvas(Canvas, 'NormalizeInto');
+  Depth := FAccumulator.Depth;
+  if (Canvas.SizeX = FCanvasWidth) and (Canvas.SizeY = FCanvasHeight)
+    then CanvasOutput.ReSize(FCanvasWidth, FCanvasHeight, Depth)
+    else CanvasOutput.ReSize(FCanvasWidth * FCanvasHeight, 1, Depth);
+  Move(FAccumulator.FData[0], CanvasOutput.FData[0],
+    FAccumulator.Size * csNeuralFloatSize);
+  MaxCellPos := FCanvasWidth * FCanvasHeight - 1;
+  for CellPos := 0 to MaxCellPos do
+  begin
+    CellInvCoverage := FInvCoverage[CellPos];
+    if CellInvCoverage <> 1 then
+      TNNetVolume.Mul(CanvasOutput.GetRawPtr(CellPos * Depth),
+        CellInvCoverage, Depth);
+  end;
+end;
+
+procedure TMultiDiffusionWindows.PredictCanvas(Canvas,
+  CanvasOutput: TNNetVolume; Predict: TMultiDiffusionPredictEvent);
+var
+  WindowIdx, MaxWindowPos: integer;
+begin
+  MaxWindowPos := GetWindowCount() - 1;
+  for WindowIdx := 0 to MaxWindowPos do
+  begin
+    GatherWindow(Canvas, WindowIdx, FWindowInput);
+    Predict(WindowIdx, FWindowInput, FWindowOutput);
+    if WindowIdx = 0 then ClearAccumulator(FWindowOutput.Depth);
+    AccumulateWindow(WindowIdx, FWindowOutput);
+  end;
+  NormalizeInto(Canvas, CanvasOutput);
 end;
 
 end.

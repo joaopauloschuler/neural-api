@@ -141,6 +141,14 @@ type
       out TextLengths: TNeuralIntegerArray);
     procedure RecordQwenImage21Step(StepIndex, StepCount: integer;
       Timestep: double; Latents: TNNetVolume);
+    // TMultiDiffusionPredictEvent stubs: 0.3 in 3 channels, the input
+    // itself, and WindowIdx + 1 in every value.
+    procedure MultiDiffusionConstantStub(WindowIdx: integer;
+      WindowInput, WindowOutput: TNNetVolume);
+    procedure MultiDiffusionIdentityStub(WindowIdx: integer;
+      WindowInput, WindowOutput: TNNetVolume);
+    procedure MultiDiffusionWindowIndexStub(WindowIdx: integer;
+      WindowInput, WindowOutput: TNNetVolume);
     // Loads a {"shape": [C, H, W], ...} oracle image of Root as a (W,H,C) volume.
     procedure LoadOracleImageTensor(Root: TJSONData; const Key: string;
       Dest: TNNetVolume);
@@ -1041,6 +1049,15 @@ type
     // The same skipping threshold with the int8 step pass on OpenCL and on
     // the CPU: same skip count, latents within 1e-4.
     procedure TestQwenImage21FirstBlockCacheOpenCL;
+    // MultiDiffusion on the pico pipeline: a canvas of one window is bit for
+    // bit the plain Denoise; wider canvases plan 3 (4 circular) windows.
+    procedure TestQwenImage21PanoramaOneWindowParity;
+    // TMultiDiffusionWindows: 2 overlapping windows of a constant stub give
+    // the constant at the seams; an identity stub gives the canvas back.
+    procedure TestMultiDiffusionConstantSeams;
+    // Circular wrap: the last window covers the last column and column 0,
+    // so column 0 blends with it; the gather wraps the same way.
+    procedure TestMultiDiffusionCircularWrap;
     procedure TestQwenImage21LanczosResizeVsPIL;
     procedure TestQwenImage21PrepareVaeImage;
     procedure TestQwenImage21SizeForAspect;
@@ -35719,6 +35736,207 @@ end;
 begin
 end;
 {$ENDIF}
+
+procedure TTestNeuralPretrained.MultiDiffusionConstantStub(WindowIdx: integer;
+  WindowInput, WindowOutput: TNNetVolume);
+begin
+  WindowOutput.ReSize(WindowInput.SizeX, WindowInput.SizeY, 3);
+  WindowOutput.Fill(0.3);
+end;
+
+procedure TTestNeuralPretrained.MultiDiffusionIdentityStub(WindowIdx: integer;
+  WindowInput, WindowOutput: TNNetVolume);
+begin
+  WindowOutput.Copy(WindowInput);
+end;
+
+procedure TTestNeuralPretrained.MultiDiffusionWindowIndexStub(
+  WindowIdx: integer; WindowInput, WindowOutput: TNNetVolume);
+begin
+  WindowOutput.ReSize(WindowInput);
+  WindowOutput.Fill(WindowIdx + 1);
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21PanoramaOneWindowParity;
+const
+  Side = 64;
+  StepCount = 3;
+var
+  RefJson: TStringList;
+  EmbedsRoot: TJSONData;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, Initial, LatentsPlain, LatentsWindow, WideInitial,
+    WideLatents: TNNetVolume;
+  ValuePos: integer;
+begin
+  RefJson := TStringList.Create;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  LatentsPlain := TNNetVolume.Create;
+  LatentsWindow := TNNetVolume.Create;
+  WideInitial := TNNetVolume.Create;
+  WideLatents := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.MakeInitialLatents(Side, Side, 5, Initial);
+    LatentsPlain.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, LatentsPlain);
+    AssertEquals('plain: no windows', 0,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    // A window equal to the canvas, then one clamped down to it.
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    LatentsWindow.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, LatentsWindow);
+    AssertEquals('one window', 1, Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals('one window = plain', 0,
+      MaxAbsVolumeDiff(LatentsPlain, LatentsWindow), 0);
+    Pipeline.PanoramaWindowWidth := 1024;
+    Pipeline.PanoramaWindowHeight := 1024;
+    LatentsWindow.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, LatentsWindow);
+    AssertEquals('clamped window = plain', 0,
+      MaxAbsVolumeDiff(LatentsPlain, LatentsWindow), 0);
+    // 128x64: 8x4 latent cells, 4x4 windows every 2 cells.
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    Pipeline.MakeInitialLatents(2 * Side, Side, 6, WideInitial);
+    WideLatents.Copy(WideInitial);
+    Pipeline.Denoise(Embeds, 2 * Side, Side, StepCount, WideLatents);
+    AssertEquals('wide: 3 windows', 3,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals('wide: tokens', WideInitial.Size, WideLatents.Size);
+    Pipeline.PanoramaCircular := true;
+    Pipeline.FirstBlockCacheThreshold := 1.0;
+    WideLatents.Copy(WideInitial);
+    Pipeline.Denoise(Embeds, 2 * Side, Side, StepCount, WideLatents);
+    AssertEquals('circular: 4 windows', 4,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    AssertTrue('per-window caches skip at most every window step after ' +
+      'the first', Pipeline.ImageStats.SkippedStepCount <= 4 * (StepCount - 1));
+    for ValuePos := 0 to WideLatents.Size - 1 do
+      AssertFalse('finite latents', IsNan(WideLatents.FData[ValuePos]) or
+        IsInfinite(WideLatents.FData[ValuePos]));
+    Pipeline.PanoramaStride := 3 * Side;
+    try
+      Pipeline.Denoise(Embeds, 2 * Side, Side, StepCount, WideLatents);
+      Fail('a stride larger than the window must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+  finally
+    WideLatents.Free;
+    WideInitial.Free;
+    LatentsWindow.Free;
+    LatentsPlain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMultiDiffusionConstantSeams;
+var
+  Windows: TMultiDiffusionWindows;
+  Canvas, Output: TNNetVolume;
+  ValuePos: integer;
+begin
+  Windows := TMultiDiffusionWindows.Create();
+  Canvas := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  try
+    // 6x4 cells, 4x4 windows every 2: windows at x = 0 and 2, seam x = 2, 3.
+    Windows.Plan(6, 4, 4, 4, 2, 2);
+    AssertEquals('windows', 2, Windows.WindowCount);
+    AssertEquals('window 1 x', 2, Windows.WindowX[1]);
+    AssertEquals('seam coverage', 2, Windows.Coverage[3, 1]);
+    AssertEquals('edge coverage', 1, Windows.Coverage[5, 1]);
+    Canvas.ReSize(6 * 4, 1, 2);
+    Canvas.Randomize();
+    Windows.PredictCanvas(Canvas, Output, @MultiDiffusionConstantStub);
+    AssertEquals('token form', 6 * 4, Output.SizeX);
+    AssertEquals('stub depth', 3, Output.Depth);
+    for ValuePos := 0 to Output.Size - 1 do
+      AssertEquals('constant at cell ' + IntToStr(ValuePos div 3), 0.3,
+        Output.FData[ValuePos], 1e-7);
+    // Uneven 7x5 canvas (clamped last windows, coverage up to 4): the
+    // identity stub must hand back the canvas, in the (W,H,D) form.
+    Windows.Plan(7, 5, 4, 3, 2, 2);
+    AssertEquals('uneven windows', 3 * 2, Windows.WindowCount);
+    AssertEquals('clamped last x', 3, Windows.WindowX[2]);
+    Canvas.ReSize(7, 5, 2);
+    Canvas.Randomize();
+    Windows.PredictCanvas(Canvas, Output, @MultiDiffusionIdentityStub);
+    AssertEquals('image form x', 7, Output.SizeX);
+    AssertEquals('image form y', 5, Output.SizeY);
+    AssertEquals('identity', 0, MaxAbsVolumeDiff(Canvas, Output), 1e-6);
+  finally
+    Output.Free;
+    Canvas.Free;
+    Windows.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMultiDiffusionCircularWrap;
+var
+  Windows: TMultiDiffusionWindows;
+  Canvas, Window, Output: TNNetVolume;
+  Starts: TNeuralIntegerArray;
+  X, Y: integer;
+begin
+  ComputeTileStarts(10, 4, 3, Starts);
+  AssertEquals('plain starts', 3, Length(Starts));
+  AssertEquals('plain last start clamped', 6, Starts[2]);
+  ComputeTileStarts(6, 4, 2, Starts, true);
+  AssertEquals('circular starts', 3, Length(Starts));
+  AssertEquals('circular last start', 4, Starts[2]);
+  Windows := TMultiDiffusionWindows.Create();
+  Canvas := TNNetVolume.Create;
+  Window := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  try
+    // Each canvas value is its column.
+    Canvas.ReSize(6, 2, 1);
+    for Y := 0 to 1 do
+      for X := 0 to 5 do
+        Canvas[X, Y, 0] := X;
+    Windows.Plan(6, 2, 4, 2, 2, 2);
+    Windows.PredictCanvas(Canvas, Output, @MultiDiffusionWindowIndexStub);
+    AssertEquals('plain: column 0 sees window 0 only', 1, Output[0, 0, 0],
+      1e-7);
+    Windows.Plan(6, 2, 4, 2, 2, 2, true);
+    AssertEquals('circular windows', 3, Windows.WindowCount);
+    AssertEquals('column 0 coverage', 2, Windows.Coverage[0, 1]);
+    AssertEquals('last column coverage', 2, Windows.Coverage[5, 1]);
+    Windows.GatherWindow(Canvas, 2, Window);
+    for Y := 0 to 1 do
+      for X := 0 to 3 do
+        AssertEquals('wrapped gather', (4 + X) mod 6, Window[X, Y, 0], 0);
+    Windows.PredictCanvas(Canvas, Output, @MultiDiffusionWindowIndexStub);
+    for Y := 0 to 1 do
+    begin
+      // Windows 0 (x 0..3) and 2 (x 4,5,0,1) give (1 + 3) / 2.
+      AssertEquals('column 0 blends with the last window', 2,
+        Output[0, Y, 0], 1e-7);
+      AssertEquals('column 1', 2, Output[1, Y, 0], 1e-7);
+      AssertEquals('column 3', 1.5, Output[3, Y, 0], 1e-7);
+      AssertEquals('last column', 2.5, Output[5, Y, 0], 1e-7);
+    end;
+  finally
+    Output.Free;
+    Window.Free;
+    Canvas.Free;
+    Windows.Free;
+  end;
+end;
 
 procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
 var

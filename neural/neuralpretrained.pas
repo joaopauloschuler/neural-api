@@ -9525,7 +9525,12 @@ type
     // Velocity of the GridH x GridW image tokens at Timestep in [0, 1] (the
     // pipeline's t / 1000), attending the prefix of the last EncodePrefix.
     procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
-      GridH, GridW: integer; Velocity: TNNetVolume);
+      GridH, GridW: integer; Velocity: TNNetVolume); overload;
+    // The same with Cache deciding instead of FirstBlockCache (MultiDiffusion
+    // keeps one per window); nil runs every block.
+    procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
+      GridH, GridW: integer; Velocity: TNNetVolume;
+      Cache: TDiTFirstBlockCache); overload;
     // PredictVelocity's three parts, for a caller that drives the blocks:
     // PrepareStepPass, modulation rows, img_in over Latents.
     procedure BeginVelocityStep(Latents: TNNetVolume; Timestep: TNeuralFloat;
@@ -9883,8 +9888,11 @@ type
     TransfersCounted: boolean;
     // StepCount: the steps run (an init image skips the first ones).
     StepCount, VaeTileCount, VaeNetCount: integer;
-    // Steps whose blocks 1..N-1 the First-Block Cache skipped (0 when off).
+    // Steps whose blocks 1..N-1 the First-Block Cache skipped (0 when off);
+    // under MultiDiffusion, window passes.
     SkippedStepCount: integer;
+    // MultiDiffusion windows each step ran (0: one pass over the image).
+    PanoramaWindowCount: integer;
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
     // The image started from EncodeImage's latents (img2img), and kept
     // them outside EncodeMask's hole (inpainting).
@@ -9926,6 +9934,14 @@ type
     FTransformerProfileReport, FVaeProfileReport: string;
     FImageStats: TQwenImage21ImageStats;
     FFirstBlockCacheThreshold: TNeuralFloat;
+    FPanoramaWindowWidth, FPanoramaWindowHeight, FPanoramaStride: integer;
+    FPanoramaCircular: boolean;
+    // The running Denoise's MultiDiffusion state for PredictPanoramaWindow:
+    // the transformer, the step's sigma and one First-Block Cache per window.
+    FPanoramaTransformer: TQwenImage21Transformer;
+    FPanoramaWindows: TMultiDiffusionWindows;
+    FPanoramaSigma: TNeuralFloat;
+    FPanoramaCaches: array of TDiTFirstBlockCache;
     // The phase DoPhase started last (qppDone: none open), when, and the
     // process transfer totals then.
     FOpenPhase: TQwenImage21PipelinePhase;
@@ -10003,6 +10019,11 @@ type
       ImageLatents, MaskLatents: TNNetVolume);
     // Raises when ComponentsLoaded: Setting would not reach loaded weights.
     procedure RefuseWhileLoaded(const Setting: string);
+    // TMultiDiffusionPredictEvent of Denoise's panorama windows.
+    procedure PredictPanoramaWindow(WindowIdx: integer;
+      WindowInput, WindowOutput: TNNetVolume);
+    // Plans FPanoramaWindows over a Width x Height image (nil when off).
+    procedure PlanPanorama(Width, Height: integer);
     procedure SetTransformerFormat(Value: TQwenImage21WeightFormat);
     procedure SetInt8Input(Value: boolean);
     procedure SetTextEncoderInt8(Value: boolean);
@@ -10162,6 +10183,18 @@ type
     // suggests 0.05 to 0.2): higher skips more steps' blocks 1..N-1.
     property FirstBlockCacheThreshold: TNeuralFloat
       read FFirstBlockCacheThreshold write FFirstBlockCacheThreshold;
+    // MultiDiffusion: both > 0 run each Denoise step on overlapping windows
+    // of this many pixels (multiples of 16, clamped to the image). 0 = off.
+    property PanoramaWindowWidth: integer read FPanoramaWindowWidth
+      write FPanoramaWindowWidth;
+    property PanoramaWindowHeight: integer read FPanoramaWindowHeight
+      write FPanoramaWindowHeight;
+    // Window step in pixels, a multiple of 16; 0 = half the window side.
+    property PanoramaStride: integer read FPanoramaStride
+      write FPanoramaStride;
+    // Windows past the right edge wrap to the left edge (360-degree panorama).
+    property PanoramaCircular: boolean read FPanoramaCircular
+      write FPanoramaCircular;
     property TransformerProfileReport: string read FTransformerProfileReport;
     property VaeProfileReport: string read FVaeProfileReport;
     // EncodeTokenIds fills the qppLoadTextEncoder and qppEncodePrompt phases,
@@ -72567,24 +72600,6 @@ begin
   Result := BuildTinyVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
-// Tile start positions along one axis: every Stride from 0, plus a last tile
-// clamped to end at Extent (a fixed-size net cannot take a smaller tile).
-procedure ComputeTileStarts(Extent, TileLen, Stride: integer;
-  out Starts: TNeuralIntegerArray);
-var
-  LastStart, StartCount, MaxStartPos, StartPos: integer;
-begin
-  LastStart := Extent - TileLen;
-  StartCount := 1;
-  if LastStart > 0 then
-    StartCount := (LastStart + Stride - 1) div Stride + 1;
-  SetLength(Starts, StartCount);
-  MaxStartPos := StartCount - 2;
-  for StartPos := 0 to MaxStartPos do
-    Starts[StartPos] := StartPos * Stride;
-  Starts[StartCount - 1] := LastStart;
-end;
-
 function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
   Overlap, Pad: integer): TNNetVolume;
 var
@@ -91422,33 +91437,40 @@ begin
   end;
 end;
 
+procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
+  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
+begin
+  PredictVelocity(Latents, Timestep, GridH, GridW, Velocity, FFirstBlockCache);
+end;
+
 // First-Block Cache on the host: PredictVelocity downloads block 0's input and
 // output (and the last block's); the output net uploads a skipped step's sum.
 procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
-  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
+  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume;
+  Cache: TDiTFirstBlockCache);
 var
   MaxBlockPos: integer;
   HeadInput, HeadOutput: TNNetLayer;
 begin
   BeginVelocityStep(Latents, Timestep, GridH, GridW);
   MaxBlockPos := FConfig.NumLayers - 1;
-  if FFirstBlockCache.Enabled and (MaxBlockPos > 0) then
+  if Assigned(Cache) and Cache.Enabled and (MaxBlockPos > 0) then
   begin
     RunStepBlocks(0, 0);
     HeadInput := FImageInNet.GetLastLayer();
     HeadOutput := FStepNet.GetLastLayer();
     HeadInput.ForceOutputOnRAM();
     HeadOutput.ForceOutputOnRAM();
-    if FFirstBlockCache.ShouldRunRemainingBlocks(HeadInput.Output,
+    if Cache.ShouldRunRemainingBlocks(HeadInput.Output,
       HeadOutput.Output) then
     begin
       RunStepBlocks(1, MaxBlockPos);
       FStepNet.GetLastLayer().ForceOutputOnRAM();
-      FFirstBlockCache.StoreTailResidual(FStepNet.GetLastLayer().Output);
+      Cache.StoreTailResidual(FStepNet.GetLastLayer().Output);
     end
     else
     begin
-      FFirstBlockCache.ApplyTailResidual(HeadOutput.Output);
+      Cache.ApplyTailResidual(HeadOutput.Output);
       HeadOutput.MarkOutputWrittenOnRAM();
     end;
   end
@@ -91880,6 +91902,7 @@ begin
   UnloadComponents();
   ClearConditionImages();
   FScheduler.Free;
+  FPanoramaWindows.Free;
   inherited Destroy();
 end;
 
@@ -92293,7 +92316,8 @@ procedure TQwenImage21Pipeline.DenoiseAt(PromptEmbeds: TNNetVolume;
 var
   Transformer: TQwenImage21Transformer;
   Velocity, Noise, Known: TNNetVolume;
-  GridH, GridW, StepPos, MaxStepPos, RunStepCount: integer;
+  GridH, GridW, StepPos, MaxStepPos, RunStepCount, WindowPos, MaxWindowPos,
+    ShiftSeqLen: integer;
   IsInpaint: boolean;
 begin
   CheckImageSize(Width, Height);
@@ -92312,11 +92336,6 @@ begin
       IntToStr(MaskLatents.Size) + ' mask values for ' +
       IntToStr(Latents.Size) + ' latent values (encode the mask at ' +
       IntToStr(Width) + 'x' + IntToStr(Height) + ').');
-  GridH := Height div csQwenImage21PixelsPerLatent;
-  GridW := Width div csQwenImage21PixelsPerLatent;
-  // mu from the image token count, as the diffusers pipeline computes it.
-  FScheduler.SetTimesteps(StepCount,
-    FScheduler.ShiftForImageSeqLen(GridH * GridW));
   if Assigned(ImageLatents) then
   begin
     if ImageLatents.Size <> Latents.Size then
@@ -92325,6 +92344,21 @@ begin
         IntToStr(Latents.Size) + ' noise values (encode the image at ' +
         IntToStr(Width) + 'x' + IntToStr(Height) + ').');
   end;
+  if IsInpaint and (FPanoramaWindowWidth > 0) and
+     (FPanoramaWindowHeight > 0) then
+    ImportError('TQwenImage21Pipeline.Denoise: inpainting does not run ' +
+      'with panorama windows.');
+  GridH := Height div csQwenImage21PixelsPerLatent;
+  GridW := Width div csQwenImage21PixelsPerLatent;
+  // mu from the token count the transformer sees, as the diffusers pipeline
+  // computes it (a panorama window's).
+  ShiftSeqLen := GridH * GridW;
+  PlanPanorama(Width, Height);
+  if Assigned(FPanoramaWindows) then
+    ShiftSeqLen := FPanoramaWindows.WindowWidth *
+      FPanoramaWindows.WindowHeight;
+  FScheduler.SetTimesteps(StepCount,
+    FScheduler.ShiftForImageSeqLen(ShiftSeqLen));
   RunStepCount := StepCount - StartStep;
   FTransformerProfileReport := '';
   Noise := nil;
@@ -92353,6 +92387,19 @@ begin
     Transformer.LayerProfiling := FLayerProfiling;
     Transformer.FirstBlockCache.Threshold := FFirstBlockCacheThreshold;
     Transformer.FirstBlockCache.Reset();
+    if Assigned(FPanoramaWindows) then
+    begin
+      FPanoramaTransformer := Transformer;
+      // Neighbouring windows see different latents: one decision each.
+      if FFirstBlockCacheThreshold > 0 then
+      begin
+        SetLength(FPanoramaCaches, FPanoramaWindows.WindowCount);
+        MaxWindowPos := FPanoramaWindows.WindowCount - 1;
+        for WindowPos := 0 to MaxWindowPos do
+          FPanoramaCaches[WindowPos] :=
+            TDiTFirstBlockCache.Create(FFirstBlockCacheThreshold);
+      end;
+    end;
     DoPhase(qppEncodePrefix);
     if Length(TextLengths) = 0 then Transformer.EncodePrefix(PromptEmbeds)
     else Transformer.EncodePrefix(PromptEmbeds, TextLengths,
@@ -92362,8 +92409,14 @@ begin
     for StepPos := StartStep to MaxStepPos do
     begin
       // The pipeline passes timestep / 1000 = sigma.
-      Transformer.PredictVelocity(Latents, FScheduler.Sigma[StepPos], GridH,
-        GridW, Velocity);
+      if Assigned(FPanoramaWindows) then
+      begin
+        FPanoramaSigma := FScheduler.Sigma[StepPos];
+        FPanoramaWindows.PredictCanvas(Latents, Velocity,
+          @PredictPanoramaWindow);
+      end
+      else Transformer.PredictVelocity(Latents, FScheduler.Sigma[StepPos],
+        GridH, GridW, Velocity);
       FScheduler.Step(Latents, Velocity, StepPos);
       if IsInpaint then
       begin
@@ -92383,6 +92436,16 @@ begin
     FImageStats.StepCount := RunStepCount;
     FImageStats.SkippedStepCount :=
       Transformer.FirstBlockCache.SkippedStepCount;
+    FImageStats.PanoramaWindowCount := 0;
+    if Assigned(FPanoramaWindows) then
+    begin
+      FImageStats.PanoramaWindowCount := FPanoramaWindows.WindowCount;
+      MaxWindowPos := Length(FPanoramaCaches) - 1;
+      FImageStats.SkippedStepCount := 0;
+      for WindowPos := 0 to MaxWindowPos do
+        Inc(FImageStats.SkippedStepCount,
+          FPanoramaCaches[WindowPos].SkippedStepCount);
+    end;
     FImageStats.TransformerOnOpenCL := FTransformerOnOpenCL;
     FImageStats.TransformerOpenCLBytes := Transformer.OpenCLBufferBytes();
     if FLayerProfiling then
@@ -92393,8 +92456,71 @@ begin
     Velocity.Free;
     Known.Free;
     Noise.Free;
+    MaxWindowPos := Length(FPanoramaCaches) - 1;
+    for WindowPos := 0 to MaxWindowPos do
+      FPanoramaCaches[WindowPos].Free;
+    FPanoramaCaches := nil;
+    FreeAndNil(FPanoramaWindows);
+    FPanoramaTransformer := nil;
     EndPhase();
   end;
+end;
+
+procedure TQwenImage21Pipeline.PlanPanorama(Width, Height: integer);
+var
+  WindowWidth, WindowHeight, StrideX, StrideY: integer;
+begin
+  FreeAndNil(FPanoramaWindows);
+  if (FPanoramaWindowWidth <= 0) or (FPanoramaWindowHeight <= 0) then exit;
+  if (FPanoramaWindowWidth mod csQwenImage21ImageSideMultiple <> 0) or
+     (FPanoramaWindowHeight mod csQwenImage21ImageSideMultiple <> 0) or
+     (FPanoramaStride < 0) or
+     (FPanoramaStride mod csQwenImage21PixelsPerLatent <> 0) or
+     (FPanoramaStride > FPanoramaWindowWidth) or
+     (FPanoramaStride > FPanoramaWindowHeight) then
+    ImportError('TQwenImage21Pipeline: panorama window ' +
+      IntToStr(FPanoramaWindowWidth) + 'x' + IntToStr(FPanoramaWindowHeight) +
+      ' needs sides that are multiples of ' +
+      IntToStr(csQwenImage21ImageSideMultiple) + ' and stride ' +
+      IntToStr(FPanoramaStride) + ' a multiple of ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + ' no larger than a side.');
+  WindowWidth := FPanoramaWindowWidth;
+  if WindowWidth > Width then WindowWidth := Width;
+  WindowHeight := FPanoramaWindowHeight;
+  if WindowHeight > Height then WindowHeight := Height;
+  WindowWidth := WindowWidth div csQwenImage21PixelsPerLatent;
+  WindowHeight := WindowHeight div csQwenImage21PixelsPerLatent;
+  if FPanoramaStride > 0 then
+  begin
+    StrideX := FPanoramaStride div csQwenImage21PixelsPerLatent;
+    StrideY := StrideX;
+  end
+  else
+  begin
+    StrideX := WindowWidth div 2;
+    StrideY := WindowHeight div 2;
+  end;
+  // A side clamped to the image has one window, whatever its stride.
+  if StrideX > WindowWidth then StrideX := WindowWidth;
+  if StrideY > WindowHeight then StrideY := WindowHeight;
+  if StrideX < 1 then StrideX := 1;
+  if StrideY < 1 then StrideY := 1;
+  FPanoramaWindows := TMultiDiffusionWindows.Create();
+  FPanoramaWindows.Plan(Width div csQwenImage21PixelsPerLatent,
+    Height div csQwenImage21PixelsPerLatent, WindowWidth, WindowHeight,
+    StrideX, StrideY, FPanoramaCircular);
+end;
+
+procedure TQwenImage21Pipeline.PredictPanoramaWindow(WindowIdx: integer;
+  WindowInput, WindowOutput: TNNetVolume);
+var
+  Cache: TDiTFirstBlockCache;
+begin
+  Cache := nil;
+  if Length(FPanoramaCaches) > 0 then Cache := FPanoramaCaches[WindowIdx];
+  FPanoramaTransformer.PredictVelocity(WindowInput, FPanoramaSigma,
+    FPanoramaWindows.WindowHeight, FPanoramaWindows.WindowWidth,
+    WindowOutput, Cache);
 end;
 
 function TQwenImage21Pipeline.AcquireVaeEncoder(): TQwenImage21VaeEncoder;
