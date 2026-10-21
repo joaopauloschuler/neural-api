@@ -610,6 +610,34 @@ rather than acted on.
         not obtainable offline); the importer accepts a real checkpoint path.
   - [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
         nearest+conv "real-world" SR upsampler variants not yet wired.
+- [ ] Restormer image-restoration importer (`BuildRestormerFromSafeTensors[Ex]` +
+      `TRestormerConfig`, swz30/Restormer: deraining, motion/defocus deblurring,
+      Gaussian and real denoising from one architecture). A 4-level U-Net of
+      transformer blocks at full resolution: LayerNorm over channels (WithBias and
+      BiasFree variants), MDTA attention, GDFN feed-forward,
+      PixelUnshuffle/PixelShuffle down/up, skip concat + 1x1 reduce, refinement
+      blocks, global residual. Needs ONE new leaf layer: MDTA's TRANSPOSED
+      (channel-wise) attention. Per head it L2-normalizes q and k along the
+      spatial axis, then computes softmax(q k^T * temperature) as a C/h x C/h map
+      and applies it to v. Cost is linear in pixels, which is what makes 1-4 MP
+      restoration feasible. Write it as `TNNetChannelAttention` (or a better
+      name; check existing names first) with a learnable per-head temperature, a
+      numerical-gradient test and an OpenCL forward from the start (bind the
+      resident source, two GEMM-shaped contractions over H*W plus a tiny C x C
+      softmax). Everything else is existing layers: `TNNetPointwiseConvLinear`,
+      `TNNetDepthwiseConv` (the 3x3 dconv on qkv and inside GDFN),
+      `TNNetGEGLUErf` for GDFN's gelu(x1)*x2 (check that the half order matches
+      torch.chunk), `TNNetSpaceToDepth`/`TNNetPixelShuffle` (check that the
+      channel order matches torch PixelUnshuffle), `TNNetDeepConcat`, `TNNetSum`.
+      The official weights are .pth only (`torch.save({'params': state_dict})`):
+      open them with `CreatePretrainedTensorReader` (it already dispatches to
+      `TNNetTorchBinReader`, the restricted unpickler) and
+      check that it handles the outer `params` dict, so no Python converter is
+      needed. Pico parity against the official `Restormer` module
+      (basicsr/models/archs/restormer_arch.py) in the ~/x venv (< 1e-4), then examples/Restormer (`--task
+      derain|deblur|denoise`, tiled inference for large photos; the tiling should
+      reuse the Real-ESRGAN/VAE tile blending helpers, not a copy) with a README.
+      Real-checkpoint runs go to the user's box (the dev VM is capped at 2 GB).
 - [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]
       + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
       with accumulated flow residuals + sigmoid fusion-mask blend; pico parity
