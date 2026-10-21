@@ -1677,6 +1677,33 @@ rather than acted on.
             column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
             `FInputPrepared` after the forward, in both memory modes; tiling or
             releasing it is a library-wide decision, not made here.
+- [ ] Outpainting (extend an image beyond its borders) on top of the two coded
+      inpainters: `--outpaint L,T,R,B` (pixels to add on each side) in
+      examples/QwenImage (with `--init-image`, plus `/outpaint` in the REPL) and
+      in examples/LaMaInpaint. Nothing in neural/ or examples/ does this today;
+      users now have to build the larger canvas and its mask by hand in an
+      image editor.
+      - One shared routine in neural/neuralimageresize.pas, next to
+        `GaussianBlurImage`, e.g. `BuildOutpaintCanvas(Image, Left, Top, Right,
+        Bottom, Overlap, Canvas, Mask)`: Canvas = the image placed at
+        (Left, Top) on the larger size, new border filled by edge replication
+        (reuse `TNNetVolume.CopyPadding` where the sides are equal, otherwise a
+        clamp-to-edge copy) so the VAE does not see a black frame; Mask = 1 on
+        the new border plus `Overlap` pixels into the original (default 8-16) so
+        the seam is regenerated, 0 elsewhere. Both inpainters then run
+        unchanged; `--mask-blur` already softens the seam on the QwenImage path.
+      - QwenImage: round the canvas up to a multiple of the VAE factor (16) and
+        to the size the scheduler accepts, generate at `--strength 1` by default
+        for the border, and paste the untouched original pixels back over the
+        result outside the overlap band (diffusers `apply_overlay` behaviour), so
+        the kept region is exact rather than VAE round-tripped.
+      - LaMaInpaint: same canvas + mask; LaMa already composites
+        `mask*prediction + (1-mask)*image`, so only the CLI and canvas are new.
+        Good for small extensions (aspect-ratio fixes); QwenImage for large ones.
+      - Tests: the canvas/mask builder (placement, edge fill, overlap band,
+        asymmetric sides, zero sides = identity) and one pico-checkpoint
+        outpaint run per inpainter asserting the original pixels survive
+        outside the overlap. Document both flags in each example README.
 - [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
       examples/QwenImage, merged into the transformer weights at load. Today
       `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
