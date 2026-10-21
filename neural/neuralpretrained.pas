@@ -10054,12 +10054,12 @@ type
     // the global RandSeed is restored). Torch's noise is not reproducible.
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
-    // Euler steps StartStep..StepCount-1 on Latents in place (noise in, clean
-    // out); ImageLatents <> nil first noises them to Sigma[StartStep] (img2img).
-    // MaskLatents <> nil (EncodeMask, needs ImageLatents) inpaints: after each
-    // step the kept region (mask 0) is reset to ImageLatents noised with the
-    // same noise to the next sigma, and to ImageLatents itself after the last
-    // (diffusers QwenImageInpaintPipeline's blend).
+    // Scheduler steps StartStep..StepCount-1 on Latents in place (noise in,
+    // clean out); ImageLatents <> nil first noises them to Sigma[StartStep]
+    // (img2img). MaskLatents <> nil (EncodeMask, needs ImageLatents) inpaints:
+    // after each step the kept region (mask 0) is reset to ImageLatents noised
+    // with the same noise to the next sigma, and to ImageLatents itself after
+    // the last (diffusers QwenImageInpaintPipeline's blend).
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume; StartStep: integer = 0;
       ImageLatents: TNNetVolume = nil; MaskLatents: TNNetVolume = nil);

@@ -29,6 +29,8 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
  - TNNetFlowMatchEulerScheduler matches the Qwen-Image-2.1 diffusers oracle
    (tests/fixtures/qwenimage21_scheduler_oracle.json, from
    tools/make_pico_qwenimage21_fixture.py): mu, sigmas, timesteps, two steps.
+ - Its fsDPMSolverPP2M sampler equals Euler when every step is first order and
+   matches diffusers DPMSolverMultistepScheduler(use_flow_sigmas) trajectories.
 Coded by Claude (AI).
 *)
 
@@ -96,6 +98,8 @@ type
     procedure TestFlowMatchFromDiffusersConfig;
     procedure TestFlowMatchImg2ImgStartStepVsOracle;
     procedure TestFlowMatchScaleNoiseVsOracle;
+    procedure TestFlowDPMSolverFirstOrderMatchesEuler;
+    procedure TestFlowDPMSolverTrajectoryVsDiffusers;
     procedure TestTrailingSpacingMatchesDiffusers;
     procedure TestZeroTerminalSNRRescale;
     procedure TestZeroTerminalSNRDDIMVEndpoint;
@@ -1430,6 +1434,158 @@ begin
     Noise.Free;
     Sample.Free;
     Root.Free;
+  end;
+end;
+
+// The synthetic velocity of the DPM-Solver++ flow tests:
+// v[i] = x[i]*(0.5 + sigma) - 0.25*(i - 2).
+procedure FlowSyntheticVelocity(Sample, Velocity: TNNetVolume; Sigma: double);
+var
+  ElementPos, MaxElementPos: integer;
+begin
+  Velocity.ReSize(Sample);
+  MaxElementPos := Sample.Size - 1;
+  for ElementPos := 0 to MaxElementPos do
+    Velocity.FData[ElementPos] := Sample.FData[ElementPos] * (0.5 + Sigma) -
+      0.25 * (ElementPos - 2);
+end;
+
+procedure TTestNeuralDiffusion.TestFlowDPMSolverFirstOrderMatchesEuler;
+var
+  EulerSched, DPMSched: TNNetFlowMatchEulerScheduler;
+  EulerSample, DPMSample, Velocity: TNNetVolume;
+  StepPos, ElementPos: integer;
+begin
+  // With no history (ResetMultistep before each step) DPM-Solver++ is
+  // algebraically Euler; single-precision rounding differs by a few ulps.
+  EulerSched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true,
+    ftsExponential, 0.02);
+  DPMSched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true,
+    ftsExponential, 0.02);
+  EulerSample := TNNetVolume.Create(6, 1, 1);
+  DPMSample := TNNetVolume.Create(6, 1, 1);
+  Velocity := TNNetVolume.Create;
+  try
+    DPMSched.Sampler := fsDPMSolverPP2M;
+    EulerSched.SetTimesteps(5, 0.9);
+    DPMSched.SetTimesteps(5, 0.9);
+    for ElementPos := 0 to 5 do
+      EulerSample.FData[ElementPos] := (ElementPos - 2.5) * 0.4;
+    DPMSample.Copy(EulerSample);
+    for StepPos := 0 to 4 do
+    begin
+      FlowSyntheticVelocity(EulerSample, Velocity, EulerSched.Sigma[StepPos]);
+      EulerSched.Step(EulerSample, Velocity, StepPos);
+      FlowSyntheticVelocity(DPMSample, Velocity, DPMSched.Sigma[StepPos]);
+      DPMSched.ResetMultistep;
+      DPMSched.Step(DPMSample, Velocity, StepPos);
+      for ElementPos := 0 to 5 do
+        AssertEquals('first order = Euler, step ' + IntToStr(StepPos) +
+          ' @ ' + IntToStr(ElementPos), EulerSample.FData[ElementPos],
+          DPMSample.FData[ElementPos], 2e-6);
+    end;
+  finally
+    EulerSched.Free;
+    DPMSched.Free;
+    EulerSample.Free;
+    DPMSample.Free;
+    Velocity.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowDPMSolverTrajectoryVsDiffusers;
+const
+  // diffusers 0.41.0.dev0 DPMSolverMultistepScheduler(use_flow_sigmas=True,
+  // prediction_type="flow_prediction", solver_order=2, lower_order_final=True,
+  // final_sigmas_type="zero") stepped on the sigma lists below with
+  // FlowSyntheticVelocity from x[i] = (i - 2.5)*0.4 (its float32 sample math).
+  // A: SetSigmas([0.95, 0.6, 0.3], mu 0.7); one genuine second-order step.
+  cSigmasA: array[0..3] of double = (0.9745296268011178, 0.7512827010955053,
+    0.463241971419116, 0.0);
+  cStepsA: array[0..2, 0..5] of double = (
+    (-0.7824392295667284, -0.4583012093361499, -0.13416315930324893,
+      0.18997489072965204, 0.514112940762553, 0.8382509609931316),
+    (-0.6796619052657934, -0.38724843550802984, -0.0948349574459361,
+      0.19757851316557706, 0.48999200612883204, 0.7824054162819507),
+    (-0.6080081589563989, -0.33026321244354107, -0.05251826133186225,
+      0.22522668565379014, 0.5029716450175218, 0.7807165585221684));
+  // B: SetTimesteps(4, mu 1.1), shift_terminal 0.02; sigma 1 first (alpha 0).
+  cSigmasB: array[0..4] of double = (1.0, 0.8041087361931913,
+    0.5101699356554767, 0.019999999999999907, 0.0);
+  cStepsB: array[0..3, 0..5] of double = (
+    (-0.804108738899231, -0.47267070399105604, -0.14123262437939757,
+      0.19020544033109973, 0.5216435199427583, 0.8530815548509332),
+    (-0.6428406036386997, -0.36496741175716274, -0.08709418341764345,
+      0.19077903773626875, 0.46865225117462683, 0.7465254728584861),
+    (-0.8502000205115119, -0.48088724952555567, -0.11157443469503514,
+      0.2577383705284962, 0.6270511684727749, 0.9963639713685698),
+    (-0.8513579402981921, -0.4808860221304899, -0.11041406057420679,
+      0.2600578914749998, 0.630529836320658, 1.0010017860663367));
+  // C: schedule B entered at step 1 (img2img), so step 1 is first order.
+  cStepsC: array[1..3, 0..5] of double = (
+    (-0.7636412204236053, -0.44348782202959985, -0.1233343640309496,
+      0.19681906416537825, 0.5169725221640284, 0.8371259205580339),
+    (-1.0049550234468114, -0.581478010454454, -0.15800093038279034,
+      0.26547611545072813, 0.688953197385037, 1.1124302066521041),
+    (-1.0045034912029647, -0.5804306391457277, -0.15635772070680934,
+      0.26771516385004057, 0.6917880841322326, 1.1158609325029223));
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+  Sample, Velocity: TNNetVolume;
+  StepPos: integer;
+
+  procedure StartSample;
+  var
+    ElementPos: integer;
+  begin
+    for ElementPos := 0 to 5 do
+      Sample.FData[ElementPos] := (ElementPos - 2.5) * 0.4;
+  end;
+
+  procedure RunStep(StepIdx: integer; const Expected: array of double;
+    const CaseName: string);
+  var
+    ElementPos: integer;
+  begin
+    FlowSyntheticVelocity(Sample, Velocity, Sched.Sigma[StepIdx]);
+    Sched.Step(Sample, Velocity, StepIdx);
+    for ElementPos := 0 to 5 do
+      AssertEquals(CaseName + ' step ' + IntToStr(StepIdx) + ' @ ' +
+        IntToStr(ElementPos), Expected[ElementPos], Sample.FData[ElementPos],
+        2e-5);
+  end;
+
+begin
+  Sched := nil;
+  Sample := TNNetVolume.Create(6, 1, 1);
+  Velocity := TNNetVolume.Create;
+  try
+    Sched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true);
+    Sched.Sampler := fsDPMSolverPP2M;
+    Sched.SetSigmas([0.95, 0.6, 0.3], 0.7);
+    for StepPos := 0 to 3 do
+      AssertEquals('sigma A ' + IntToStr(StepPos), cSigmasA[StepPos],
+        Sched.Sigma[StepPos], 1e-12);
+    StartSample;
+    for StepPos := 0 to 2 do RunStep(StepPos, cStepsA[StepPos], 'A');
+    Sched.Free;
+    Sched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true,
+      ftsExponential, 0.02);
+    Sched.Sampler := fsDPMSolverPP2M;
+    Sched.SetTimesteps(4, 1.1);
+    for StepPos := 0 to 4 do
+      AssertEquals('sigma B ' + IntToStr(StepPos), cSigmasB[StepPos],
+        Sched.Sigma[StepPos], 1e-12);
+    StartSample;
+    for StepPos := 0 to 3 do RunStep(StepPos, cStepsB[StepPos], 'B');
+    // A new trajectory: history from the end of B must not leak into C.
+    Sched.ResetMultistep;
+    StartSample;
+    for StepPos := 1 to 3 do RunStep(StepPos, cStepsC[StepPos], 'C');
+  finally
+    Sched.Free;
+    Sample.Free;
+    Velocity.Free;
   end;
 end;
 

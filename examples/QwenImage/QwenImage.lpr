@@ -9,7 +9,7 @@ and the VAE decode run on OpenCL by default; everything else runs on the CPU:
 
   prompt -> processor/tokenizer.json -> Qwen3-VL text encoder
     -> transformer prefix pass (text K/V, once)
-    -> N flow-matching Euler steps over the image tokens
+    -> N flow-matching steps (Euler or DPM-Solver++(2M)) over the image tokens
     -> VAE decode, tiled -> RGBA PNG.
 
 One-shot (-p "prompt" or --token-ids): one image, then exit. Each component
@@ -488,7 +488,9 @@ begin
     'qwenimage_0002.png, ...');
   WriteLn('  --width N, --height N  pixels, rounded DOWN to a multiple of 32 ',
     '(default 1024)');
-  WriteLn('  --steps N            Euler steps (default 18)');
+  WriteLn('  --steps N            sampler steps (default 18)');
+  WriteLn('  --sampler NAME       euler or dpm2m (DPM-Solver++(2M), second ',
+    'order; default euler)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
   WriteLn('  --image FILE         edit: a condition image; repeat it for up ',
     'to ', csQwenImage21MaxConditionImages, ' images (image 1, 2, ...');
@@ -652,7 +654,7 @@ begin
   WriteLn('and reads one prompt per line from stdin (a piped file is a batch). ',
     'REPL commands:');
   WriteLn('  /size WxH            image size for the next prompts');
-  WriteLn('  /steps N             Euler steps for the next prompts');
+  WriteLn('  /steps N             sampler steps for the next prompts');
   WriteLn('  /seed N              seed of the next image (otherwise the seed ',
     'grows by one per image)');
   WriteLn('  /repeat N PROMPT     N images of PROMPT (encoded once), ',
@@ -965,6 +967,9 @@ var
   // --panorama-wrap; the windows are --width x --height.
   PanoramaWidth, PanoramaHeight, PanoramaStride: integer;
   PanoramaWrap: boolean;
+  // --sampler: the flow-matching update rule of every Denoise.
+  Sampler: TNNetFlowSampler;
+  SamplerName: string;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -2265,6 +2270,7 @@ begin
   PanoramaHeight := 0;
   PanoramaStride := 0;
   PanoramaWrap := false;
+  Sampler := fsEuler;
   MaxThreads := 0;
   Upscaler := nil;
   UpscaleFile := '';
@@ -2396,6 +2402,17 @@ begin
       end;
     end
     else if Arg = '--panorama-wrap' then PanoramaWrap := true
+    else if Arg = '--sampler' then
+    begin
+      SamplerName := NextArg();
+      if SamplerName = 'euler' then Sampler := fsEuler
+      else if SamplerName = 'dpm2m' then Sampler := fsDPMSolverPP2M
+      else
+      begin
+        WriteLn('--sampler: "', SamplerName, '" is not euler or dpm2m.');
+        Halt(2);
+      end;
+    end
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -2568,6 +2585,7 @@ begin
     Pipeline.Parallel := not UseSerial;
     Pipeline.MaxThreads := MaxThreads;
     Pipeline.FirstBlockCacheThreshold := FbcThreshold;
+    Pipeline.Scheduler.Sampler := Sampler;
     if FbcThreshold > 0 then WriteLn('[', FbcThresholdText(FbcThreshold), ']');
     SetProfile(UseProfile);
     SetStats(UseStats);

@@ -1924,35 +1924,16 @@ rather than acted on.
         and a reversed velocity sign; the gain is small (the loop is already one
         `MulAdd` per step).
 - [ ] Second-order multistep sampler for the flow-matching pipelines (Qwen-Image,
-      later SD3/FLUX/Wan), so a 1024x1024 image needs fewer 7B MMDiT passes.
-      Today `TNNetFlowMatchEulerScheduler` is first-order Euler only; the
-      DPM-Solver++(2M) / UniPC / Heun paths of `TNNetDiffusionScheduler` are
-      alpha-bar (DDPM-schedule) based and cannot drive a velocity model.
-      Port diffusers `DPMSolverMultistepScheduler(use_flow_sigmas=True,
-      prediction_type="flow_prediction")` (and, if cheap on top,
-      `UniPCMultistepScheduler(use_flow_sigmas=True)`, the Wan default; both in
-      the ~/x venv, diffusers 0.41.0.dev0) onto the SAME sigma list
-      `SetTimesteps`/`SetSigmas` already build (shift, dynamic mu, terminal
-      stretch): alpha_t = 1 - sigma, sigma_t = sigma, x0 = x - sigma * v,
-      lambda = ln(alpha_t / sigma_t); first-order on the first step and on the
-      last step (sigma = 0, lambda = +inf, diffusers `lower_order_final` /
-      `final_sigmas_type="zero"`).
-      - [ ] One previous-x0 volume owned by the scheduler, sized on first use
-            (no per-step allocation, guide #17), a `ResetMultistep` per
-            trajectory, and the update composed from `TNNetVolume` bulk ops
-            (`MulAdd`/`Mul`); share the 2M coefficient math with
-            `TNNetDiffusionScheduler` instead of a second copy (guide #5).
-      - [ ] Img2img/inpainting/outpainting/panorama start mid-trajectory
-            (`Img2ImgStartStep`): the first executed step must be first-order;
-            MultiDiffusion panoramas blend velocities per window, so the solver
-            must step the blended latent once per step, not once per window.
-      - [ ] Tests: Euler equality when forced first-order; a diffusers-oracle
-            sigma/coefficient list and a 3-step latent trajectory on a fixed
-            synthetic velocity function (Pascal-side oracle values pasted from
-            the venv, no new Python tool in the repo).
-      - [ ] examples/QwenImage `--sampler euler|dpm2m[|unipc]` (default stays
-            euler) + README.md; then a user GPU-box quality check of dpm2m at
-            10-12 steps against euler at the current default count.
+      later SD3/FLUX/Wan). Done: `TNNetFlowMatchEulerScheduler.Sampler :=
+      fsDPMSolverPP2M` (diffusers `DPMSolverMultistepScheduler(use_flow_sigmas=True,
+      prediction_type="flow_prediction", solver_order=2,
+      final_sigmas_type="zero")` on the scheduler's own sigma list), tests
+      against a diffusers trajectory oracle, and examples/QwenImage
+      `--sampler euler|dpm2m` (default euler).
+      - [ ] User GPU-box quality check of dpm2m at 10-12 steps against euler at
+            the current default count (18).
+      - [ ] Optional: `UniPCMultistepScheduler(use_flow_sigmas=True)` (the Wan
+            default) on the same sigma list.
 - [ ] Adaptive Projected Guidance (APG, Sadat et al., ICLR 2025, "Eliminating
       Oversaturation and Artifacts of High Guidance Scales in Diffusion Models"),
       ported from diffusers `guiders/adaptive_projected_guidance.py`

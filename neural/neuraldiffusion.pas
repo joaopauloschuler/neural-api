@@ -29,7 +29,8 @@ WHAT IT PROVIDES
   * A classifier-free-guidance (CFG) MIXER: given eps_cond and eps_uncond and a
     guidance weight w, returns eps_uncond + w*(eps_cond - eps_uncond).
   * TNNetFlowMatchEulerScheduler: a separate flow-matching (rectified-flow)
-    Euler sampler with static or resolution-dependent sigma shifting.
+    sampler (Euler or DPM-Solver++(2M)) with static or resolution-dependent
+    sigma shifting.
 
 MODEL-AGNOSTIC. The denoiser is supplied by the CALLER as a Pascal
 procedure-of-object (TNNetDenoiseCallback): given a noisy volume x_t and an
@@ -351,10 +352,16 @@ type
   //   ftsLinear      : sigma' = mu   / (mu   + (1/sigma - 1))
   TNNetFlowTimeShift = (ftsExponential, ftsLinear);
 
+  // Update rule of TNNetFlowMatchEulerScheduler.Step:
+  //   fsEuler         : x_next = x + (sigma_next - sigma)*v.
+  //   fsDPMSolverPP2M : diffusers DPMSolverMultistepScheduler(use_flow_sigmas,
+  //     flow_prediction, dpmsolver++, solver_order=2, final_sigmas_type="zero").
+  TNNetFlowSampler = (fsEuler, fsDPMSolverPP2M);
+
   { TNNetFlowMatchEulerScheduler }
-  // Deterministic Euler sampler for rectified-flow models that predict the
-  // velocity v = noise - x0 (diffusers FlowMatchEulerDiscreteScheduler): sigma
-  // runs from ~1 (noise) to 0 (clean), x_next = x + (sigma_next - sigma)*v. The
+  // Deterministic sampler for rectified-flow models that predict the velocity
+  // v = noise - x0 (diffusers FlowMatchEulerDiscreteScheduler): sigma runs from
+  // ~1 (noise) to 0 (clean), one Step per sigma interval, Euler by default. The
   // schedule is the sigma list itself, in double (N+1 values, not a hot path).
   // Coded by Claude (AI).
   TNNetFlowMatchEulerScheduler = class(TObject)
@@ -369,6 +376,15 @@ type
     FBaseShift, FMaxShift: double;
     // NumSteps + 1 entries, descending, the last one 0 (the clean sample).
     FSigmas: array of double;
+    FSampler: TNNetFlowSampler;
+    // DPM-Solver++(2M) history: the x0 prediction of step FPrevStepIndex
+    // (-1: none), sized on first use.
+    FPrevX0: TNNetVolume;
+    FPrevStepIndex: integer;
+    procedure SetSampler(Value: TNNetFlowSampler);
+    // DPM-Solver++(2M) step; second order when step StepIndex-1 left history.
+    procedure StepDPMSolverPP2M(Sample, Velocity: TNNetVolume;
+      StepIndex: integer);
     function GetNumSteps: integer;
     function GetSigma(StepIndex: integer): double;
     function GetTimestep(StepIndex: integer): double;
@@ -379,6 +395,7 @@ type
       pShift: double = 1.0; pUseDynamicShifting: boolean = false;
       pTimeShiftType: TNNetFlowTimeShift = ftsExponential;
       pShiftTerminal: double = 0.0);
+    destructor Destroy; override;
     // Reads a diffusers FlowMatchEulerDiscreteScheduler scheduler_config.json;
     // raises on a setting this class does not implement (Karras sigmas, ...).
     constructor CreateFromDiffusersConfig(const FileName: string);
@@ -393,14 +410,16 @@ type
     // Applies the dynamic time shift of type TimeShiftType to one sigma in (0, 1].
     function TimeShift(Mu, Sigma: double): double;
     // diffusers set_timesteps(sigmas=...): shift (static or dynamic with Mu),
-    // stretch to ShiftTerminal, append the final sigma 0.
+    // stretch to ShiftTerminal, append the final sigma 0. Calls ResetMultistep.
     procedure SetSigmas(const Sigmas: array of double; Mu: double = 0.0);
     // SetSigmas with linspace(1, 1/NumSteps, NumSteps), the input sigmas the
     // FLUX and Qwen-Image pipelines pass.
     procedure SetTimesteps(NumSteps: integer; Mu: double = 0.0);
-    // One Euler step in place: Sample += (Sigma[StepIndex+1] - Sigma[StepIndex])
-    // * Velocity, where Velocity is the model output at Timestep[StepIndex].
+    // One Sampler step in place from Sigma[StepIndex] to Sigma[StepIndex+1];
+    // Velocity is the model output at Timestep[StepIndex].
     procedure Step(Sample, Velocity: TNNetVolume; StepIndex: integer);
+    // Forgets the multistep history, so the next Step is first order.
+    procedure ResetMultistep;
     // diffusers img2img get_timesteps: the first step that runs at Strength,
     // int(N - min(N * Strength, N)); raises when no step runs.
     class function Img2ImgStartStep(NumSteps: integer;
@@ -418,6 +437,8 @@ type
     property Shift: double read FShift;
     property UseDynamicShifting: boolean read FUseDynamicShifting;
     property TimeShiftType: TNNetFlowTimeShift read FTimeShiftType;
+    // Setting it calls ResetMultistep.
+    property Sampler: TNNetFlowSampler read FSampler write SetSampler;
     property ShiftTerminal: double read FShiftTerminal;
     property BaseImageSeqLen: integer read FBaseImageSeqLen;
     property MaxImageSeqLen: integer read FMaxImageSeqLen;
@@ -507,6 +528,16 @@ uses
 const
   // Stand-in for an alpha_bar of exactly 0 in reciprocals (diffusers uses 2**-24).
   cMinAlphaBar = 5.9604644775390625e-8;
+
+// DPM-Solver++(2M) midpoint weight w of the previous x0 for step size H after a
+// step of HLast: D = (1 + w)*x0 - w*x0_prev, w = 0.5/r, r = HLast/H.
+function DPMSolverPP2MHistoryWeight(HLast, H: double): double;
+var
+  StepRatio: double;
+begin
+  if Abs(H) < 1e-12 then StepRatio := 1.0 else StepRatio := HLast / H;
+  Result := 0.5 / StepRatio;
+end;
 
 constructor TNNetDiffusionScheduler.Create(pT: integer;
   pSchedule: TNNetBetaSchedule; pPrediction: TNNetPredictionType;
@@ -1218,9 +1249,8 @@ begin
             begin
               hLast := lamT - FPrevLambda;          // < 0
               h := -hLast;                          // approximate remaining step
-              if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-              cA := 1.0 + 0.5 / r0;
-              cB := 0.5 / r0;
+              cB := DPMSolverPP2MHistoryWeight(hLast, h);
+              cA := 1.0 + cB;
               // cA*Eps - cB*FPrevX0 as a uniform affine map (#13).
               Xt.Copy(Eps);
               Xt.Mul(cA);
@@ -1249,9 +1279,8 @@ begin
           else
           begin
             hLast := lamT - FPrevLambda;            // < 0
-            if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-            cA := 1.0 + 0.5 / r0;
-            cB := 0.5 / r0;
+            cB := DPMSolverPP2MHistoryWeight(hLast, h);
+            cA := 1.0 + cB;
             // Xt := kX*Xt - kD*(cA*Eps - cB*FPrevX0) as a uniform affine map (#13).
             Xt.Mul(kX);
             Xt.MulAdd(-kD * cA, Eps);
@@ -1768,6 +1797,15 @@ begin
   FBaseShift := 0.5;
   FMaxShift := 1.15;
   SetLength(FSigmas, 0);
+  FSampler := fsEuler;
+  FPrevX0 := nil;
+  FPrevStepIndex := -1;
+end;
+
+destructor TNNetFlowMatchEulerScheduler.Destroy;
+begin
+  FPrevX0.Free;
+  inherited Destroy;
 end;
 
 constructor TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(
@@ -1873,6 +1911,7 @@ begin
       FSigmas[SigmaPos] := 1 - (1 - FSigmas[SigmaPos]) / StretchScale;
   end;
   FSigmas[MaxSigmaPos + 1] := 0;
+  ResetMultistep;
 end;
 
 procedure TNNetFlowMatchEulerScheduler.SetTimesteps(NumSteps: integer;
@@ -1917,7 +1956,99 @@ begin
   if (StepIndex < 0) or (StepIndex >= GetNumSteps) then
     raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
       ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
-  Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
+  if FSampler = fsDPMSolverPP2M then StepDPMSolverPP2M(Sample, Velocity, StepIndex)
+  else Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
+end;
+
+procedure TNNetFlowMatchEulerScheduler.ResetMultistep;
+begin
+  FPrevStepIndex := -1;
+end;
+
+procedure TNNetFlowMatchEulerScheduler.SetSampler(Value: TNNetFlowSampler);
+begin
+  FSampler := Value;
+  ResetMultistep;
+end;
+
+procedure TNNetFlowMatchEulerScheduler.StepDPMSolverPP2M(Sample,
+  Velocity: TNNetVolume; StepIndex: integer);
+var
+  SigmaS, SigmaT, SigmaPrev, AlphaS, AlphaT, AlphaPrev: double;
+  LambdaS, HistoryWeight: double;
+  SampleScale, DataScale, CurrentX0Scale, PrevX0Scale, StepSigma: TNeuralFloat;
+  CurrentX0: TNeuralFloat;
+  ElementPos, MaxElementPos: integer;
+  HasHistory: boolean;
+begin
+  // alpha = 1 - sigma, lambda = ln(alpha/sigma), x0 = x - sigma*v, and
+  // x_next = (sigma_t/sigma_s)*x - alpha_t*(exp(-h) - 1)*D (Lu et al. 2022).
+  if Velocity.Size <> Sample.Size then
+    raise Exception.Create('Flow-matching DPM-Solver++ step: ' +
+      IntToStr(Velocity.Size) + ' velocity values for ' +
+      IntToStr(Sample.Size) + ' sample values.');
+  SigmaS := FSigmas[StepIndex];
+  SigmaT := FSigmas[StepIndex + 1];
+  StepSigma := SigmaS;
+  if SigmaT <= 0 then
+  begin
+    // Final step to sigma 0 (lambda = +inf): first order, x_next = x0.
+    Sample.MulAdd(-StepSigma, Velocity);
+    FPrevStepIndex := -1;
+    Exit;
+  end;
+  AlphaS := 1 - SigmaS;
+  AlphaT := 1 - SigmaT;
+  // -alpha_t*(exp(-h) - 1) with exp(-h) = sigma_t*alpha_s/(alpha_t*sigma_s),
+  // finite at sigma_s = 1 (lambda_s = -inf).
+  SampleScale := SigmaT / SigmaS;
+  DataScale := AlphaT - SigmaT * AlphaS / SigmaS;
+  if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Sample)
+  else if FPrevX0.Size <> Sample.Size then
+  begin
+    FPrevX0.ReSize(Sample);
+    FPrevStepIndex := -1;
+  end;
+  HistoryWeight := 0;
+  if (StepIndex > 0) and (FPrevStepIndex = StepIndex - 1) and (AlphaS > 0) then
+  begin
+    SigmaPrev := FSigmas[StepIndex - 1];
+    AlphaPrev := 1 - SigmaPrev;
+    // AlphaPrev = 0 is lambda_prev = -inf: r = inf, so the weight is 0.
+    if AlphaPrev > 0 then
+    begin
+      LambdaS := Ln(AlphaS / SigmaS);
+      HistoryWeight := DPMSolverPP2MHistoryWeight(
+        LambdaS - Ln(AlphaPrev / SigmaPrev), Ln(AlphaT / SigmaT) - LambdaS);
+    end;
+  end;
+  HasHistory := HistoryWeight <> 0;
+  MaxElementPos := Sample.Size - 1;
+  // One fused pass that also stores x0 for the next step: composing it from
+  // bulk ops needs a second x0 volume and four passes.
+  if HasHistory then
+  begin
+    CurrentX0Scale := DataScale * (1 + HistoryWeight);
+    PrevX0Scale := -DataScale * HistoryWeight;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      CurrentX0 := Sample.FData[ElementPos] - StepSigma * Velocity.FData[ElementPos];
+      Sample.FData[ElementPos] := SampleScale * Sample.FData[ElementPos] +
+        CurrentX0Scale * CurrentX0 + PrevX0Scale * FPrevX0.FData[ElementPos];
+      FPrevX0.FData[ElementPos] := CurrentX0;
+    end;
+  end
+  else
+  begin
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      CurrentX0 := Sample.FData[ElementPos] - StepSigma * Velocity.FData[ElementPos];
+      Sample.FData[ElementPos] := SampleScale * Sample.FData[ElementPos] +
+        DataScale * CurrentX0;
+      FPrevX0.FData[ElementPos] := CurrentX0;
+    end;
+  end;
+  FPrevStepIndex := StepIndex;
 end;
 
 class function TNNetFlowMatchEulerScheduler.Img2ImgStartStep(NumSteps: integer;

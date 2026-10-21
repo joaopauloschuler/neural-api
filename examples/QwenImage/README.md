@@ -11,7 +11,7 @@ prompt
   -> processor/tokenizer.json (Qwen chat template, system prompt dropped)
   -> Qwen3-VL text encoder (text part: 36-layer Qwen3 decoder)
   -> MMDiT transformer prefix pass (the prompt's K/V, computed once)
-  -> N flow-matching Euler steps over the image tokens
+  -> N flow-matching steps (Euler or DPM-Solver++(2M)) over the image tokens
   -> VAE decoder, tiled
   -> RGBA PNG
 ```
@@ -24,7 +24,8 @@ The pipeline follows the diffusers `QwenImage21Pipeline`:
   tokens run once through a prefix pass; each denoising step then runs only
   the image tokens against the cached prompt K/V.
 - **Scheduler** — `TNNetFlowMatchEulerScheduler` (flow-matching Euler with
-  the dynamic exponential shift and `shift_terminal`).
+  the dynamic exponential shift and `shift_terminal`, or DPM-Solver++(2M)
+  with `--sampler dpm2m`; see [Samplers](#samplers---sampler-eulerdpm2m)).
 - **VAE decoder** — `TQwenImage21VaeDecoder`, decoding the 64-channel latents
   to RGBA at 16 times the latent width and height, in overlapping tiles.
 
@@ -141,7 +142,7 @@ follow:
 | Command | Effect |
 | --- | --- |
 | `/size WxH` | image size, e.g. `/size 1024x768` (each side rounded down to a multiple of 32, 32..8192) |
-| `/steps N` | Euler steps |
+| `/steps N` | sampler steps |
 | `/seed N` | seed of the next image; without it the seed grows by one per image |
 | `/tile SIZE[,STRIDE]` | VAE tile, as `--vae-tile` |
 | `/image FILE` | add a condition image (edit, as `--image`) for the next prompts, up to 10 |
@@ -579,7 +580,7 @@ always runs on a window of `--width` x `--height` pixels (default
    `EncodePrefix` encoded at the start of the image;
 3. averages the windows' velocities per latent cell (a cell covered by k
    windows gets the mean of the k velocities);
-4. runs one Euler step on the whole canvas.
+4. runs one sampler step on the whole canvas.
 
 `--panorama-wrap` wraps the windows past the right edge around to the left
 edge, so the left and right edges blend into each other: use it for
@@ -657,7 +658,8 @@ and `--fp32`, the last one given wins.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--width N`, `--height N` | pixels, rounded down to a multiple of 32 (32..8192) | 1024 |
-| `--steps N` | Euler steps | 18 |
+| `--steps N` | sampler steps | 18 |
+| `--sampler NAME` | `euler` or `dpm2m` (DPM-Solver++(2M)); see [Samplers](#samplers---sampler-eulerdpm2m) | `euler` |
 | `--seed N` | seed of the initial noise | 42 |
 | `--image FILE` | edit: a condition image (PNG, JPEG, ...); repeat for up to 10; see [Image editing](#image-editing) | — |
 | `--init-image FILE` | img2img from this init image; see [img2img](#img2img-sdedit) | — |
@@ -677,6 +679,24 @@ and `--fp32`, the last one given wins.
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
 1024x1024. The step time grows with that count.
+
+### Samplers (`--sampler euler|dpm2m`)
+
+Both samplers run one transformer pass per step on the same sigma schedule
+(the dynamic shift and `shift_terminal` of `scheduler/scheduler_config.json`).
+
+- `euler` (default): the first-order Euler step of diffusers
+  `FlowMatchEulerDiscreteScheduler`, the scheduler the checkpoint ships.
+- `dpm2m`: DPM-Solver++(2M), diffusers `DPMSolverMultistepScheduler` with
+  `use_flow_sigmas=True`, `prediction_type="flow_prediction"`,
+  `solver_order=2` and `final_sigmas_type="zero"`. Each step except the
+  first and the last also uses the previous step's clean-image prediction,
+  so it is second order and should reach the quality of Euler in fewer
+  steps. An img2img, inpainting or outpainting run starts mid-schedule with a
+  first-order step; a panorama steps the blended canvas once per step.
+
+`dpm2m` has not been compared against `euler` on real images yet; try
+`--sampler dpm2m --steps 10` to `12` against the default 18 Euler steps.
 
 ### VAE tiles
 
