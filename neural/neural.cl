@@ -3178,6 +3178,57 @@ __kernel void cai_embedding_gather_int8
     FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row];
 }
 
+// cai_embedding_gather plus the positional table FPos (TNNetTokenAndPositional-
+// Embedding), shaped like FY: a zero-padding token (row < 0) gets neither table.
+// Coded by Claude (AI).
+__kernel void cai_embedding_gather_pos
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const float* FW,
+  __global float* FY,
+  __global const float* FPos
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = FW[row * FEmbeddingSize + e] + FPos[gid];
+}
+
+// Int8 twin of cai_embedding_gather_pos; FScales then FPos close the argument
+// list. Coded by Claude (AI).
+__kernel void cai_embedding_gather_int8_pos
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const char* FCodes,
+  __global float* FY,
+  __global const float* FScales,
+  __global const float* FPos
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row]
+      + FPos[gid];
+}
+
 /* Device-side im2col, shared by cai_im2col and cai_im2col_h. One work-item per
    element of the convolution's FInputPrepared column matrix: a copy of one
    FInput element, or 0 for a tap in the zero padding, in the layout of the CPU

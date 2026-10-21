@@ -938,6 +938,10 @@ type
     // Same, with the vocab table quantized: cai_embedding_gather_int8 must
     // reproduce the host dequantizing gather from the same codes and scales.
     procedure EmbeddingInt8OpenCLParity;
+    // TNNetTokenAndPositionalEmbedding OpenCL gather + positional add, FP32
+    // and int8, vs CPU; and its resident chain with ForceOpenCL off.
+    procedure TokenAndPositionalEmbeddingOpenCLParity;
+    procedure TokenAndPositionalEmbeddingResidentChainOpenCL;
     // OpenCL contiguous-group softmax forward offload parity (vs CPU) for the
     // softmax head layers TNNetPointwiseSoftMax (per-token, GroupLen=Depth) and
     // TNNetSoftMax (whole-volume, GroupLen=Size).
@@ -86143,6 +86147,168 @@ begin
     AssertTrue('the int8 gather must run on the device',
       Embed.ForwardGPUCnt > 0);
     AssertTrue('Embedding int8 OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetTokenAndPositionalEmbedding under ForceOpenCL, FP32 then int8: the
+// cai_embedding_gather*_pos entry points add the positional table on OpenCL,
+// and a zero-padding token (EncodeZero=0) gets neither table. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TokenAndPositionalEmbeddingOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 7;
+  VocabSize = 13;
+  EmbSize = 10;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 0, 7, 1, 0, 12, 5);
+  i, Pass: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for Pass := 0 to 1 do
+  begin
+    RandSeed := 424242 + Pass;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 1);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+      Embed := NN.AddLayer(TNNetTokenAndPositionalEmbedding.Create(VocabSize,
+        EmbSize, {EncodeZero=}0, 0.5, {ScalePositional=}0.3));
+      NN.SetTrainable(False, False);
+      if Pass = 1 then
+      begin
+        NN.QuantizeWeightsInt8();
+        AssertTrue('the embedding must be int8 quantized',
+          TNNetEmbedding(Embed).WeightsQuantizedInt8);
+      end;
+      for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        AssertTrue('ForceOutputOnRAM must report the embedding readable',
+          Embed.ForceOutputOnRAM());
+        AssertEquals('output size match', OutCPU.Size, Embed.Output.Size);
+        MaxDiff := 0;
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - Embed.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  TokenAndPositionalEmbedding OpenCL parity (int8=', Pass,
+        '): max|diff|=', MaxDiff:0:9, ' gpu forwards=', Embed.ForwardGPUCnt);
+      AssertTrue('the positional gather must run on OpenCL',
+        Embed.ForwardGPUCnt > 0);
+      AssertTrue('the positional table must be resident',
+        Assigned(TNNetTokenAndPositionalEmbedding(Embed).OpenCLPositionalBuffer()));
+      AssertTrue('TokenAndPositionalEmbedding OpenCL vs CPU parity: max |diff| = '
+        + FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+    finally
+      OutCPU.Free; Input.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: a resident TNNetInput puts the positional embedding on
+// OpenCL, its output stays resident (the host copy keeps a sentinel) and the
+// projection binds it; a second forward reuses the resident positional table.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TokenAndPositionalEmbeddingResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  SeqLen = 3;
+  VocabSize = 11;
+  EmbSize = 100;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  PositionalBuffer: cl_mem;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    Embed := NN.AddLayer(TNNetTokenAndPositionalEmbedding.Create(VocabSize,
+      EmbSize, {EncodeZero=}1, 0.5, {ScalePositional=}0.3));
+    // Same sizes as EmbeddingResidentChainUnforcedOpenCLParity: the
+    // projection's size verdict is False, so only a resident source moves it.
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    PositionalBuffer :=
+      TNNetTokenAndPositionalEmbedding(Embed).OpenCLPositionalBuffer();
+    AssertTrue('the positional table must be resident', Assigned(PositionalBuffer));
+    Embed.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    AssertEquals('embedding host output not downloaded', csSentinel,
+      Embed.Output.Raw[0], 0);
+    AssertTrue('the positional table must stay the same resident buffer',
+      PositionalBuffer =
+      TNNetTokenAndPositionalEmbedding(Embed).OpenCLPositionalBuffer());
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  TokenAndPositionalEmbedding resident chain: max|diff|=',
+      MaxDiff:0:9, ' gpu forwards embed=', Embed.ForwardGPUCnt,
+      ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('a resident input alone must put the embedding on OpenCL',
+      Embed.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident embedding output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertTrue('resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;

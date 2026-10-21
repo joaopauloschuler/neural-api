@@ -1943,10 +1943,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       fix real limitations" are done (intra-chunk dense GEMM + inter-chunk
       running state). Sequence them after those, or fold the device path into
       each chunked rewrite, with an exact-vs-CPU parity test each.
-- [ ] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
+- [X] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
       int8 device gather (`cai_embedding_gather_int8`) and leaves its rows
       resident; its sibling still gathers on the host. Reuse the same entry
       point, adding the positional table as a second resident source.
+      DONE: `cai_embedding_gather_pos` / `cai_embedding_gather_int8_pos` add the
+      resident positional table; output stays resident.
 
 
 ### Vision and audio layers with no device forward

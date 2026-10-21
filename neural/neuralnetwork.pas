@@ -6053,21 +6053,28 @@ type
     // Entry point selector, fixed at Create: true binds cai_embedding_gather_int8
     // and Gather reads QuantTable; false binds cai_embedding_gather and it reads W.
     FInt8: boolean;
+    // True binds the _pos entry point: Gather then adds the resident positional
+    // table FBufPos (output-shaped), re-uploaded after InvalidatePositionalCache.
+    FPositional, FPositionalCached: boolean;
+    FBufPos: cl_mem;
+    FCapPos: csize_t;
     // Persistent per-forward device buffers (grow-only): the token-row index
     // array and the gathered result. (FBufW above is the resident table.)
     FBufRows, FBufY: cl_mem;
     FCapRows, FCapY: csize_t;
   public
-    constructor Create(NN: TNNet; pInt8: boolean);
+    constructor Create(NN: TNNet; pInt8: boolean; pPositional: boolean = false);
     destructor Destroy(); override;
     // The vocab table arrives as W (FP32 helper) or QuantTable (int8 helper) -
     // the other one is ignored; both are (VocabSize rows x EmbeddingSize,
     // depth-contiguous). TokenRows[c] is the vocab row to copy into output token
     // c, or -1 to leave that output token zero. Y only SIZES the device result
-    // buffer: the gathered NumTokens x EmbeddingSize rows are left in FBufY, unread.
+    // buffer: the gathered rows are left in FBufY, unread. Positional (Y-shaped)
+    // is added to every gathered row; required iff the helper is positional.
     procedure Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
       const TokenRows: array of integer; Y: TNNetVolume;
-      NumTokens, EmbeddingSize, VocabSize: integer);
+      NumTokens, EmbeddingSize, VocabSize: integer;
+      Positional: TNNetVolume = nil);
     // Uploads the table now when it is not resident yet (Gather does it
     // lazily), blocking, so a borrower on another queue reads a complete table.
     procedure EnsureTableResident(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
@@ -6079,8 +6086,11 @@ type
     // Which entry point this helper bound: the owning layer rebuilds it when its
     // own quantization state no longer matches.
     property Int8: boolean read FInt8;
+    property HasPositionalTable: boolean read FPositional;
     // The resident vocab table (nil until uploaded or borrowed): test hook.
     property TableBuffer: cl_mem read FBufW;
+    // The resident positional table (nil until the first positional Gather).
+    property PositionalBuffer: cl_mem read FBufPos;
     // FBufY and the queue that owns its contents - what a layer running Gather
     // answers OpenCLOutputBuffer/OpenCLOutputKernel with.
     function OutputBuffer(): cl_mem;
@@ -6088,6 +6098,8 @@ type
     // Drop the resident weight buffer so the next Gather re-uploads the table.
     // Called whenever the layer's weights change (training step / importer load).
     procedure InvalidateWeightCache();
+    // The next positional Gather re-uploads the positional table.
+    procedure InvalidatePositionalCache();
   end;
 
   /// OpenCL forward helper for the softmax head layers (TNNetPointwiseSoftMax,
@@ -8821,6 +8833,14 @@ type
     function NonWeightBytes(): int64; override;
   protected
     procedure DetachFromWeightOwner(); override;
+    {$IFDEF OpenCL}
+    // The output-shaped table the OpenCL gather adds to every gathered row;
+    // nil (no positional add) here.
+    function PositionalTableForOpenCL(): TNNetVolume; virtual;
+    // Runs the OpenCL gather when WillOpenCL agrees and returns True; else marks
+    // the output host-written for the caller's CPU forward and returns False.
+    function TryComputeOpenCL(StartTime: double): boolean;
+    {$ENDIF}
   public
     // Neurons plus, when Owner is int8, its vocab table by reference; the
     // gather then reads the owner's codes, and a later EnableOpenCL retains
@@ -8909,7 +8929,15 @@ type
     FPositionalEmbeddingN: integer;
     FScalePositional: TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  protected
+    {$IFDEF OpenCL}
+    function PositionalTableForOpenCL(): TNNetVolume; override;
+    {$ENDIF}
   public
+    {$IFDEF OpenCL}
+    // Test hook: the resident positional table (nil until the first gather).
+    function OpenCLPositionalBuffer(): cl_mem;
+    {$ENDIF}
     constructor Create(pVocabSize, pEmbeddingSize: integer;
       EncodeZero: integer = 0;
       ScaleEmbedding: TNeuralFloat = 0.02;
@@ -42336,13 +42364,20 @@ end;
 
 { TNNetEmbeddingCL }
 
-constructor TNNetEmbeddingCL.Create(NN: TNNet; pInt8: boolean);
+constructor TNNetEmbeddingCL.Create(NN: TNNet; pInt8: boolean;
+  pPositional: boolean = false);
+var
+  EntryPoint: string;
 begin
   if pInt8
-    then inherited Create(NN, 'cai_embedding_gather_int8')
-    else inherited Create(NN, 'cai_embedding_gather');
+    then EntryPoint := 'cai_embedding_gather_int8'
+    else EntryPoint := 'cai_embedding_gather';
+  if pPositional then EntryPoint := EntryPoint + '_pos';
+  inherited Create(NN, EntryPoint);
   FInt8 := pInt8;
+  FPositional := pPositional;
   FWeightCached := false;
+  FPositionalCached := false;
 end;
 
 destructor TNNetEmbeddingCL.Destroy();
@@ -42351,7 +42386,13 @@ begin
   if Assigned(FBufScales) then clReleaseMemObject(FBufScales);
   if Assigned(FBufRows)   then clReleaseMemObject(FBufRows);
   if Assigned(FBufY)      then clReleaseMemObject(FBufY);
+  if Assigned(FBufPos)    then clReleaseMemObject(FBufPos);
   inherited Destroy();
+end;
+
+procedure TNNetEmbeddingCL.InvalidatePositionalCache();
+begin
+  FPositionalCached := false;
 end;
 
 procedure TNNetEmbeddingCL.InvalidateWeightCache();
@@ -42363,7 +42404,8 @@ end;
 
 procedure TNNetEmbeddingCL.Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
   const TokenRows: array of integer; Y: TNNetVolume;
-  NumTokens, EmbeddingSize, VocabSize: integer);
+  NumTokens, EmbeddingSize, VocabSize: integer;
+  Positional: TNNetVolume = nil);
 var
   bufRows, bufY: cl_mem;
   k: cl_kernel;
@@ -42385,8 +42427,17 @@ begin
   clSetKernelArg(k, 2, csCLMemSize, @bufRows);
   clSetKernelArg(k, 3, csCLMemSize, @FBufW);
   clSetKernelArg(k, 4, csCLMemSize, @bufY);
-  // The int8 entry point takes the per-row scales after the shared prefix.
+  // The int8 entry point takes the per-row scales after the shared prefix, and
+  // the _pos entry points the positional table last.
   if FInt8 then clSetKernelArg(k, 5, csCLMemSize, @FBufScales);
+  if FPositional then
+  begin
+    // Constant for a given wiring (rebuilt only in SetPrevLayer): uploaded once.
+    FKernel.EnsureWriteBuffer(FBufPos, FCapPos, Positional,
+      {DoWrite}not FPositionalCached, {pBlocking}true);
+    FPositionalCached := true;
+    clSetKernelArg(k, 5 + Ord(FInt8), csCLMemSize, @FBufPos);
+  end;
   // One work-item per (output token, depth) pair. No Finish and no read back:
   // the result waits in FBufY until the layer's reader calls ForceOutputOnRAM or
   // a consumer orders itself with OpenCLWaitOutputIfAnotherQueue. Buffers are
@@ -116206,8 +116257,31 @@ begin
     FreeAndNil(FEmbeddingCL);
   end;
   if not Assigned(FEmbeddingCL) then
-    FEmbeddingCL := TNNetEmbeddingCL.Create(FNN, FQuantInt8);
+    FEmbeddingCL := TNNetEmbeddingCL.Create(FNN, FQuantInt8,
+      Assigned(PositionalTableForOpenCL()));
   BorrowOwnerOpenCLTable();
+end;
+
+function TNNetEmbedding.PositionalTableForOpenCL(): TNNetVolume;
+begin
+  Result := nil;
+end;
+
+function TNNetEmbedding.TryComputeOpenCL(StartTime: double): boolean;
+begin
+  Result := WillOpenCL();
+  if Result then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
 end;
 
 procedure TNNetEmbedding.BorrowOwnerOpenCLTable();
@@ -116245,11 +116319,13 @@ end;
 // there and the download that pin measured is never paid.
 // The helper must be bound to the entry point this layer's quantization state
 // needs (ArmEmbeddingCL keeps them in step; a mismatch would gather from the
-// wrong table). And exactly TNNetEmbedding: the positional subclass keeps the
-// scalar path.
+// wrong table). And only the classes whose Compute dispatches here: a further
+// subclass keeps its own scalar path.
 function TNNetEmbedding.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FEmbeddingCL) and FHasOpenCL and (Self.ClassType = TNNetEmbedding)
+  Result := Assigned(FEmbeddingCL) and FHasOpenCL
+            and ((Self.ClassType = TNNetEmbedding) or
+                 (Self.ClassType = TNNetTokenAndPositionalEmbedding))
             and (FEmbeddingCL.Int8 = FQuantInt8)
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and PrevOutputOnOpenCL()));
@@ -116310,7 +116386,8 @@ begin
       FTokenRows[CntToken] := -1; // zero-padding: leave this output token zero
   end;
   FEmbeddingCL.Gather(FNeurons[0].Weights, FQuantTable, FTokenRows, FOutput,
-    FPrevLayer.Output.Size, FEmbeddingSize, FVocabSize);
+    FPrevLayer.Output.Size, FEmbeddingSize, FVocabSize,
+    PositionalTableForOpenCL());
   // The gathered rows wait on the device: the first block's projections bind
   // them, and a host reader pays one download through ForceOutputOnRAM.
   FOutputOnOpenCL := true;
@@ -116517,24 +116594,9 @@ var
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  {$IFDEF OpenCL}
-  // Device token-gather forward: it leaves the gathered rows in OpenCL memory
-  // for the first block's projections, and moves them back only when the layer
-  // is trainable. Restricted to exactly TNNetEmbedding: the positional subclass
-  // keeps the scalar path.
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end;
-  Inc(FForwardCPUCnt);
-  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
-  // read the buffer a previous device forward left resident.
-  FOutputOnOpenCL := false;
-  FOutputOnRAM := true;
-  {$ENDIF}
+  // The OpenCL token gather leaves the gathered rows in OpenCL memory for the
+  // first block's projections, and moves them back only when trainable.
+  {$IFDEF OpenCL} if TryComputeOpenCL(StartTime) then exit; {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
   // FOutput is (PrevOut.Size, 1, FEmbeddingSize), so the token loops below write
@@ -116833,7 +116895,23 @@ begin
   FPositionalEmbedding.ReSize(FOutput);
   FPositionalEmbedding.PositionalEncoding(FEmbeddingSize);
   if FScalePositional<>1 then FPositionalEmbedding.Mul(FScalePositional);
+  {$IFDEF OpenCL}
+  if Assigned(FEmbeddingCL) then FEmbeddingCL.InvalidatePositionalCache();
+  {$ENDIF}
 end;
+
+{$IFDEF OpenCL}
+function TNNetTokenAndPositionalEmbedding.PositionalTableForOpenCL(): TNNetVolume;
+begin
+  Result := FPositionalEmbedding;
+end;
+
+function TNNetTokenAndPositionalEmbedding.OpenCLPositionalBuffer(): cl_mem;
+begin
+  if Assigned(FEmbeddingCL) then Result := FEmbeddingCL.PositionalBuffer
+  else Result := nil;
+end;
+{$ENDIF}
 
 constructor TNNetTokenAndPositionalEmbedding.Create(pVocabSize,
   pEmbeddingSize: integer;
@@ -116870,6 +116948,7 @@ var
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL} if TryComputeOpenCL(StartTime) then exit; {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
   // FOutput is (PrevOut.Size, 1, FEmbeddingSize) and FPositionalEmbedding shares
