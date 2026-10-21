@@ -290,6 +290,44 @@ rather than acted on.
       mask ranking as a follow-up. Pico-fixture parity < 1e-4 on the proto-mask
       logits vs a float64 reference.
 
+- [ ] Marigold diffusion depth / surface normals (diffusers `MarigoldDepthPipeline`
+      / `MarigoldNormalsPipeline`; checkpoints `prs-eth/marigold-depth-v1-1` and
+      `prs-eth/marigold-normals-v1-1`, Ke et al. 2024, arXiv:2312.02145). Marigold
+      is an SD2 UNet fine-tuned to denoise a depth (or normals) latent while
+      conditioned on the image latent, so most of it is already in the tree:
+      `BuildSDUNetFromSafeTensors` reads `in_channels` (8 here: image latent ++
+      noisy target latent) and `use_linear_projection`, `BuildVaeEncoder` /
+      `BuildVaeDecoderFromSafeTensors` cover the AutoencoderKL, the CLIP importer
+      covers `text_encoder/` (`CLIPTextModel`, used once to embed the empty
+      prompt; check its 1024-wide SD2 config loads), and neuraldiffusion has DDIM
+      with `dpV`. Missing pieces, all checked against the shipped
+      `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
+      "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
+      - [ ] `TNNetTimestepSpacing` value for diffusers "trailing" spacing
+            (`round(arange(T, 0, -T/N)) - 1`), next to tsUniform/tsKarras.
+      - [ ] Zero-terminal-SNR beta rescale (Lin et al. 2023, Algorithm 1 on
+            sqrt(alphas_cumprod), diffusers `rescale_zero_terminal_snr`) as a
+            scheduler option; with it the last alpha_bar is 0, so check the DDIM
+            step and the v -> x0 conversion at that endpoint.
+      - [ ] The pipeline routine in neuralpretrained.pas: resize the long side to
+            `default_processing_resolution` (768), pad to a multiple of 8 and
+            unpad after (the VAE/UNet builders take a square grid today, so
+            either pad to square or lift that limit), encode the image to its
+            latent, run `default_denoising_steps` (4) DDIM steps on the target
+            latent with the cached empty-prompt states, decode, average the 3
+            decoded channels and map [-1,1] -> [0,1] (depth) or unit-normalize
+            the 3 channels (normals). Optional ensemble over N noise seeds with
+            the paper's per-member scale+shift least-squares alignment and a
+            median merge (depth); a plain mean then renormalize (normals).
+      - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
+            like the existing tools/sd_unet_*_fixture.py; ask the user before
+            adding a new Python tool), < 1e-4 on the final depth map with fixed
+            noise.
+      - [ ] `examples/MarigoldDepth` (README, depth written as a grayscale PNG,
+            `--normals` switch). The real UNet is ~865M params (3.4 GB FP32),
+            above the 2 GB cap on the dev box, so real-checkpoint runs (int8 /
+            OpenCL) belong on the user's GPU box.
+
 - [ ] LLaVA-NeXT (llava-v1.6, model_type `llava_next`) dynamic-resolution VLM
       importer follow-up to the landed `BuildLlavaFromSafeTensors`. The v1.6
       difference is the "anyres" image processing: the input is split into a grid
