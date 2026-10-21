@@ -1929,20 +1929,25 @@ rather than acted on.
       par := (diff . u) * u, orth := diff - par,
       Dst := uncond + W * (orth + eta * par) (diffusers default; the
       `use_original_formulation` variant adds to cond instead).
-      - [ ] A guidance-state class next to the scheduler in neural/neuraldiffusion.pas
+      - [X] A guidance-state class next to the scheduler in neural/neuraldiffusion.pas
             (`ApplyAPG(Cond, Uncond, Dst)` plus `Reset` per trajectory) that OWNS the
             momentum volume, sized on first use, so a step allocates nothing.
             Reuse `TNNetVolume.DotProduct` / `MulAdd` / `Mul`; keep the math in
             `Single` (guide #25) even though diffusers widens to double.
-      - [ ] Tests: eta = 1, m = 0, r = 0 equals `ApplyCFG` exactly; a hand-computed
+            Done: `TNNetAdaptiveProjectedGuidance` (15c5aca5).
+      - [X] Tests: eta = 1, m = 0, r = 0 equals `ApplyCFG` exactly; a hand-computed
             2-element case for the projection, the norm clamp and two momentum steps;
-            Dst may alias Cond or Uncond like `ApplyCFG`. A diffusers oracle
-            needs the user's approval for a new Python tool.
-      - [ ] Wire it into examples/LatentTextToImage (`--apg ETA,MOMENTUM,THRESHOLD`
+            Dst may alias Cond or Uncond like `ApplyCFG`.
+      - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
+            approval for a new Python tool.
+      - [X] Wire it into examples/LatentTextToImage (`--apg ETA,MOMENTUM,THRESHOLD`
             next to `--cfg`) and examples/ConditionalDiffusion, and
             document the flag in their README.md files. The paper applies APG to
             the denoised (x0) prediction rather than to eps; check both on the
-            pico fixture and state which space the flag uses. Later consumers:
+            pico fixture and state which space the flag uses. Done: the flag
+            uses x0 (`PredictX0` / new `RawPredFromX0`), `--apg-eps` switches to
+            eps; both run finite on the pico fixture, which cannot rank them.
+            Later consumers:
             the open CFG items of the CogVideoX TextToVideo loop, the Stable
             Diffusion pipeline and QwenImage B3.
 
