@@ -158,26 +158,11 @@ rather than acted on.
   - [ ] MiniCPM4 / MiniCPM-MoE importers (separate model families; MiniCPM4
         adds its own long-context/sparse-attention pieces, MiniCPM-MoE adds the
         Mixtral-style MoE FFN — neither is the dense-1.2B/2B path landed here).
-- [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
-      model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
-      A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
-      genuinely new piece is the checkpoint LAYOUT, resolved by an
-      InternLM2->HF translating reader (`TNNetInternLM2Reader`, a
-      `TNNetSafeTensorsReader` subclass) that rides the existing core Llama
-      builder with NO new layer/config flags. It (a) unpacks the fused
-      `attention.wqkv` (reshaped `[num_kv_heads, q_per_kv+2, head_dim, hidden]`,
-      per-group q slices then single K then single V) into standard separate
-      W_q/W_k/W_v with the group-interleaved row reorder (all Q heads
-      group-major, then all K, then all V — HF rotate_half order, so the core
-      builder's own rotate_half→interleaved q/k de-permute for RoPE applies
-      unchanged), and (b) renames the InternLM2 tensors (tok_embeddings /
-      wo / feed_forward.w1=gate|w2=down|w3=up / attention_norm / ffn_norm /
-      output) to the HF Llama names the core builder reads. Tokenizer is a
-      SentencePiece `.model` (already supported); `bias=true` rejected.
-      Verified by a HAND-BUILT pico fixture (tools/internlm2_tiny_fixture.py —
-      InternLM2 is NOT in transformers, needs trust_remote_code offline, so the
-      reference is a self-contained numpy float64 forward) asserting next-token
-      logits < 1e-4: tests `TestInternLM2ConfigParity` / `TestInternLM2LogitParity`.
+- [ ] InternLM2 / InternLM2.5 importer follow-ups (`BuildInternLM2FromSafeTensors[Ex]`,
+      model_type "internlm2", `TNNetInternLM2Reader` wqkv unpack + rename onto the
+      core Llama builder; pico parity `TestInternLM2ConfigParity` /
+      `TestInternLM2LogitParity` < 1e-4 vs a numpy float64 forward from
+      tools/internlm2_tiny_fixture.py):
   - [ ] real-checkpoint slicer not exercised: the translating reader's wqkv
         unpack rematerializes each q/k/v slice in RAM per tensor (fine at pico
         and 1.8B/7B widths); a streaming/int8 path for the 20B checkpoint and a
@@ -282,29 +267,15 @@ rather than acted on.
       mask ranking as a follow-up. Pico-fixture parity < 1e-4 on the proto-mask
       logits vs a float64 reference.
 
-- [ ] Marigold diffusion depth / surface normals (diffusers `MarigoldDepthPipeline`
-      / `MarigoldNormalsPipeline`; checkpoints `prs-eth/marigold-depth-v1-1` and
-      `prs-eth/marigold-normals-v1-1`, Ke et al. 2024, arXiv:2312.02145). Marigold
-      is an SD2 UNet fine-tuned to denoise a depth (or normals) latent while
-      conditioned on the image latent, so most of it is already in the tree:
-      `BuildSDUNetFromSafeTensors` reads `in_channels` (8 here: image latent ++
-      noisy target latent) and `use_linear_projection`, `BuildVaeEncoder` /
-      `BuildVaeDecoderFromSafeTensors` cover the AutoencoderKL, the CLIP importer
-      covers `text_encoder/` (`CLIPTextModel`, used once to embed the empty
-      prompt; check its 1024-wide SD2 config loads), and neuraldiffusion has DDIM
-      with `dpV`. Missing pieces, all checked against the shipped
-      `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
-      "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [X] DDPM with dpV at the zero-SNR step now uses the posterior-mean form
-            (x0 = -v at ab_T = 0), with a pass-through guard where ab_t = 1
-            (Beta1 = 0).
+- [ ] Marigold diffusion depth / surface normals follow-ups (`TMarigoldPipeline`
+      in neuralpretrained.pas + `examples/MarigoldDepth`, dc2979d4; checkpoints
+      `prs-eth/marigold-depth-v1-1` / `prs-eth/marigold-normals-v1-1`, Ke et al.
+      2024, arXiv:2312.02145). The SD2 `CLIPTextModel` 1024-wide config is not
+      yet checked against a real `text_encoder/`. Open:
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
             noise.
-      - [X] `examples/MarigoldDepth` over `TMarigoldPipeline` (depth as a
-            16-bit grayscale PNG, normals as RGB; task from model_index.json
-            instead of a `--normals` switch).
       - [ ] Real-checkpoint runs of examples/MarigoldDepth (FP32, `--int8`,
             `--gpu`) on the user's GPU box: the UNet is ~865M params (3.4 GB
             FP32), above the 2 GB cap on the dev box. SD UNet / VAE under
@@ -441,9 +412,9 @@ rather than acted on.
   - [ ] use_gated_mlp (SwiGLU giant) variant rejected (only plain
         up_proj/down_proj+gelu wired).
   - [ ] non-square / non-native image_size (dynamic RoPE grid) not yet plumbed —
-        TNNetVisionRoPE2D is fixed to the build-time grid. Still unblocks
-        DINOv3-backed dense-prediction once the "register-token DINOv2 backbones
-        rejected by BuildDPT" follow-up lands.
+        TNNetVisionRoPE2D is fixed to the build-time grid. DINOv3-backed
+        dense prediction also needs the BuildDPT register-token item under
+        Depth Anything V2 below.
 
 - [ ] Kandinsky 2.2 unCLIP text-to-image importer
       (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,
@@ -546,9 +517,9 @@ rather than acted on.
             SD 2.x 768). Latent (H/8,W/8,4) scaled by 1/0.18215 (SDXL 0.13025).
       - [ ] CFG inside the SD loop: a cond + an empty-prompt uncond UNet pass per
             step (twice the per-step cost).
-      - [ ] CLIP text encoder for SD: BuildClipFromSafeTensors loads a full CLIP
-            (text + vision); check / add a text-only path for the
-            CLIPTextModel-only text_encoder/ folder (unverified). SD 1.x feeds the
+      - [ ] CLIP text encoder for SD: the text-only `CLIPTextModel` folder load
+            exists (`BuildClipTextTower`, used by `MarigoldEmptyPromptStates`,
+            tested by `TestMarigoldEmptyPromptStates`). SD 1.x feeds the
             last hidden state (77 tokens, padded); SD 2.x the penultimate layer;
             SDXL two encoders (CLIP-L + OpenCLIP-bigG) concatenated + the pooled
             vector into SDUNetDenoiseSDXL.
@@ -1615,26 +1586,9 @@ rather than acted on.
         prefill. Estimates at 1024^2: prefix ~4.1k tokens / ~4.3 GB FP32 K/V for one
         reference image, ~41k tokens / ~43 GB for ten; text-encoder scores ~13.6 GB
         unwindowed at ten. Decide scope with an L4 measurement.
-- [~] Qwen-Image inpainting: `--init-image FILE --mask FILE` in examples/QwenImage
-      (and `/mask FILE|off` in the REPL) regenerates only the white region of a
-      mask image and keeps the rest of the init image. Port of diffusers
-      `QwenImageInpaintPipeline` (`pipelines/qwenimage/pipeline_qwenimage_inpaint.py`
-      in the ~/x venv), the no-retrain blended mode; the img2img path it extends
-      is already in `TQwenImage21Pipeline` (`EncodeImage`, `Img2ImgStartStep`,
-      `ScaleNoise` in `DenoiseAt`).
-      Status (2026-10-20): CODED and parity-tested on the pico checkpoint.
-      `QwenImage21MaskToLatents` / `TQwenImage21Pipeline.EncodeMask`, a
-      `MaskLatents` argument on `Denoise` / `GenerateFromEmbeds`, the shared
-      `InpaintBlend` (neuraldiffusion.pas, also used by `SDUNetDenoiseInpaint`),
-      `--mask` / `/mask` and the README section. Tests
-      `TestQwenImage21InpaintMaskLatents`, `...InpaintKeepsKnown`,
-      `...InpaintParity` (oracle `tiny_qwenimage21_inpaint_io.json` from
-      `tools/make_pico_qwenimage21_img2img_fixture.py --inpaint-only`).
-      Note: 2.1 latents are unpatched (VAE factor 16,
-      diffusers 2.1 `_pack_latents` is a plain flatten), so there is no 2x2
-      packing; each token's channels all take that token's mask value.
-      - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
-            example output.
+- [ ] Qwen-Image inpainting (`--init-image FILE --mask FILE`, `/mask`; coded +
+      pico parity `TestQwenImage21InpaintParity`): real 1024x1024 inpaint on the
+      GPU box (user run), then the README example output.
 - [ ] First-Block Cache step skipping for the DiT denoise loop (port of diffusers
       `hooks/first_block_cache.py`, `apply_first_block_cache(pipe.transformer,
       FirstBlockCacheConfig(threshold=...))`, present in the ~/x venv, diffusers
@@ -1675,9 +1629,8 @@ rather than acted on.
             from "coded, real checkpoint untested". Memory estimate from the pico
             net scaled to big-lama: about 8.6 GB at 512x512, of which 3.3 GB is the
             im2col column matrix of the 7x7 64->3 output conv and 3.4 GB the
-            column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
-            `FInputPrepared` after the forward, in both memory modes; tiling or
-            releasing it is a library-wide decision, not made here.
+            column matrices of the 36 FFC-unit 3x3 convs; releasing
+            `FInputPrepared` is the user-decision item under "Layer follow-ups".
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`) can take the same
@@ -1710,8 +1663,8 @@ rather than acted on.
       (1) memory: on the CPU path a tile holds ~2.7 MB per net-input pixel
       (x4plus layout, measured), almost all of it each convolution's own
       FInputCopy + FInputPrepared (im2col), which liveness output sharing does
-      not cover; one im2col scratch shared by a net's inference convolutions
-      would allow 256-pixel tiles. Needs the user's decision (engine change);
+      not cover; releasing or sharing `FInputPrepared` (the user-decision
+      item under "Layer follow-ups") would allow 256-pixel tiles;
       (2) DEFERRED, needs the user's approval for a new Python tool: a pico
       basicsr x2plus fixture (`tools/` generator from the ~/x venv using basicsr's
       RRDBNet definition), parity < 1e-4 on the whole net. Today only the
