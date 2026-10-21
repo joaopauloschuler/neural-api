@@ -1745,6 +1745,10 @@ type
     // The KV-cache forward (one and three rows per step, FP32 and int8, full
     // and sliding window) against the full forward. Coded by Claude (AI).
     procedure TestGptOssSinkAttentionCachedDecodeParity;
+    // The KV-cache forward of TNNetSinkAttention / TNNetDifferentialAttention
+    // against the full forward (widths 1 and 3, FP32 and int8). Coded by Claude (AI).
+    procedure TestSinkAttentionCachedDecodeParity;
+    procedure TestDifferentialAttentionCachedDecodeParity;
     procedure TestDifferentialAttentionLambdaZeroDegeneracy;
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
@@ -16145,6 +16149,163 @@ begin
     RunCase(10, 4, 3, -1.0, Int8KV);
     // A sink far above every score takes most of the softmax mass.
     RunCase(16, 0, 3, 6.0, Int8KV);
+  end;
+end;
+
+// Max |diff| between FullAttn's causal forward of Input and StepAttn's cached
+// decode of the same rows, StepWidth rows per NNStep.Compute.
+function MaxCachedDecodeDiff(NNFull, NNStep: TNNet;
+  FullAttn, StepAttn: TNNetScaledDotProductAttention; Input: TNNetVolume;
+  StepWidth: integer; Int8KV: boolean): TNeuralFloat;
+var
+  StepIn: TNNetVolume;
+  SeqLen, InDepth, Dk, Row, StepRow, MaxStepRowPos, d, MaxDPos: integer;
+  Diff: TNeuralFloat;
+begin
+  SeqLen := Input.SizeX;
+  InDepth := Input.Depth;
+  Dk := InDepth div 3;
+  StepIn := TNNetVolume.Create(StepWidth, 1, InDepth);
+  try
+    NNFull.Compute(Input);
+    StepAttn.BeginIncrementalDecode(SeqLen, Int8KV);
+    Result := 0;
+    MaxStepRowPos := StepWidth - 1;
+    MaxDPos := Dk - 1;
+    Row := 0;
+    while Row < SeqLen do
+    begin
+      for StepRow := 0 to MaxStepRowPos do
+        Move(Input.FData[(Row + StepRow) * InDepth],
+          StepIn.FData[StepRow * InDepth], InDepth * SizeOf(TNeuralFloat));
+      NNStep.Compute(StepIn);
+      for StepRow := 0 to MaxStepRowPos do
+        for d := 0 to MaxDPos do
+        begin
+          Diff := Abs(FullAttn.Output.FData[(Row + StepRow) * Dk + d] -
+            StepAttn.Output.FData[StepRow * Dk + d]);
+          if IsNan(Diff) or (Diff > Result) then Result := Diff;
+        end;
+      Inc(Row, StepWidth);
+    end;
+    StepAttn.EndIncrementalDecode();
+  finally
+    StepIn.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSinkAttentionCachedDecodeParity;
+const
+  SeqLen = 12;
+  cInt8Tolerance = 3e-2;
+
+  procedure RunCase(Dk, NumSinks, StepWidth: integer; Int8KV: boolean);
+  var
+    NNFull, NNStep: TNNet;
+    FullAttn, StepAttn: TNNetSinkAttention;
+    Input: TNNetVolume;
+    SlotPos, MaxSlotPos: integer;
+    MaxDiff: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('Sink Dk=%d sinks=%d width=%d int8=%s',
+      [Dk, NumSinks, StepWidth, BoolToStr(Int8KV, true)]);
+    NNFull := TNNet.Create();
+    NNStep := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      FullAttn := TNNetSinkAttention.Create(Dk, true, NumSinks);
+      NNFull.AddLayer(FullAttn);
+      NNStep.AddLayer(TNNetInput.Create(StepWidth, 1, 3 * Dk));
+      StepAttn := TNNetSinkAttention.Create(Dk, true, NumSinks);
+      NNStep.AddLayer(StepAttn);
+      // Non-zero sink keys AND values, shared by both layers.
+      MaxSlotPos := 2 * NumSinks - 1;
+      for SlotPos := 0 to MaxSlotPos do
+      begin
+        FullAttn.Neurons[SlotPos].Weights.RandomizeGaussian(1.0);
+        StepAttn.Neurons[SlotPos].Weights.Copy(FullAttn.Neurons[SlotPos].Weights);
+      end;
+      Input.RandomizeGaussian(1.0);
+      MaxDiff := MaxCachedDecodeDiff(NNFull, NNStep, FullAttn, StepAttn, Input,
+        StepWidth, Int8KV);
+      if Int8KV then
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < cInt8Tolerance)
+      else
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+    finally
+      Input.Free;
+      NNStep.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  Int8KV: boolean;
+begin
+  RandSeed := 20261021;
+  for Int8KV := false to true do
+  begin
+    RunCase(8, 1, 1, Int8KV);
+    RunCase(8, 3, 1, Int8KV);
+    RunCase(10, 2, 3, Int8KV);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDifferentialAttentionCachedDecodeParity;
+const
+  SeqLen = 12;
+  cInt8Tolerance = 3e-2;
+
+  procedure RunCase(Dk, StepWidth: integer; Lambda: TNeuralFloat;
+    Int8KV: boolean);
+  var
+    NNFull, NNStep: TNNet;
+    FullAttn, StepAttn: TNNetDifferentialAttention;
+    Input: TNNetVolume;
+    MaxDiff: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('Differential Dk=%d width=%d lambda=%.2f int8=%s',
+      [Dk, StepWidth, Lambda, BoolToStr(Int8KV, true)]);
+    NNFull := TNNet.Create();
+    NNStep := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      FullAttn := TNNetDifferentialAttention.Create(Dk, true, Lambda);
+      NNFull.AddLayer(FullAttn);
+      NNStep.AddLayer(TNNetInput.Create(StepWidth, 1, 3 * Dk));
+      StepAttn := TNNetDifferentialAttention.Create(Dk, true, Lambda);
+      NNStep.AddLayer(StepAttn);
+      Input.RandomizeGaussian(1.0);
+      MaxDiff := MaxCachedDecodeDiff(NNFull, NNStep, FullAttn, StepAttn, Input,
+        StepWidth, Int8KV);
+      if Int8KV then
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < cInt8Tolerance)
+      else
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+    finally
+      Input.Free;
+      NNStep.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  Int8KV: boolean;
+begin
+  RandSeed := 20261021;
+  for Int8KV := false to true do
+  begin
+    RunCase(8, 1, 0.8, Int8KV);
+    RunCase(10, 1, 0.3, Int8KV);
+    RunCase(8, 3, 0.8, Int8KV);
   end;
 end;
 

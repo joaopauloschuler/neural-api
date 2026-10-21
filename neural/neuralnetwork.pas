@@ -4683,7 +4683,6 @@ type
     // from Src (SrcPlaneRows rows per plane) to Dst (DstPlaneRows per plane).
     class procedure CopyPlaneRows(Src, Dst: Pointer; Planes, Rows, RowBytes,
       SrcPlaneRows, DstPlaneRows: integer);
-    procedure ComputeIncremental();
     // FlashAttention-1 tiled online-softmax forward (opt-in, forward-only).
     // Returns true if it handled the forward; false to fall back to the naive
     // path (any feature outside the standard-softmax v1 scope). Coded by Claude (AI).
@@ -4703,6 +4702,23 @@ type
     // One logit per query head that joins every softmax denominator with no
     // value row (gpt-oss attention sinks); nil (the base class) = none.
     function SinkLogits(): TNNetVolume; virtual;
+    // The KV-cache forward of a whole input (Compute runs it when the cache is on).
+    procedure ComputeIncremental(); virtual;
+    // Raises and returns true when SeqLen more tokens overflow the cache.
+    function CacheOverflows(SeqLen: integer): boolean;
+    // Appends the K and V of the packed [Q|K|V] row Src to the cache, first
+    // evicting the oldest window key when the eviction cap is full.
+    procedure AppendCacheToken(Src: TNeuralFloatArrPtr);
+    // First cached position the newest query attends (sliding window).
+    function CacheKeyStart(): integer;
+    // Scores^[j] := Scale * Query . K_j[KeyOffset..KeyOffset+Dim-1], soft-capped,
+    // for cached j >= jStart; returns the max of MaxSeed and every score.
+    function ScoreCachedKeys(QueryPtr: TNeuralFloatArrPtr;
+      KeyOffset, Dim, jStart: integer; Scale, MaxSeed: TNeuralFloat;
+      Scores: TNeuralFloatArrPtr): TNeuralFloat;
+    // OutPtr[0..d_k-1] += Factor * sum_j Weights^[j] * V_j over cached j >= jStart.
+    procedure AddCachedValues(OutPtr, Weights: TNeuralFloatArrPtr;
+      jStart: integer; Factor: TNeuralFloat);
   public
     // pWindow = 0 (default) keeps the original full-attention behavior.
     // pWindow = W >= 1 applies a Mistral / Gemma-2-style SLIDING-WINDOW mask:
@@ -7947,12 +7963,17 @@ type
     // Backpropagate(). Layout: X = augmented key index (0..K-1 = sinks,
     // K..K+SeqLen-1 = real keys), Y = query index i, [X,Y,0]; rows sum to 1.
     FSinkAttn: TNNetVolume;
-    // Persistent, lazily-sized scratch (rule #17). Sink key/value weight-row
-    // pointer tables (size FNumSinks) shared by Compute/Backpropagate, and the
+    // Persistent scratch (rule #17). Sink key/value weight-row pointer tables
+    // (size FNumSinks, sized at Create) shared by every forward/backward, and the
     // per-call sink key/value gradient accumulators (FNumSinks,1,FDk).
     FSinkKeyPtr, FSinkValPtr: array of TNeuralFloatArrPtr;
     FSinkKeyGrad, FSinkValGrad: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Points FSinkKeyPtr/FSinkValPtr at the current sink key/value weight rows.
+    procedure BindSinkSlotPtrs();
+  protected
+    // The cached decode: the sink slots are scored beside the cached keys.
+    procedure ComputeIncremental(); override;
   public
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       NumSinks: integer = 1); overload;
@@ -8038,13 +8059,19 @@ type
     // FAttn (parent) holds map 1. Layout matches FAttn: X=key j, Y=query i.
     FAttn2: TNNetVolume;
     // Per-instance Backpropagate scratch for the two attention maps, each sized
-    // SeqLen. The overridden Compute has no incremental-decode path so SeqLen is
-    // fixed after SetPrevLayer; pinned there alongside FAttn2.
+    // SeqLen at SetPrevLayer alongside FAttn2 (the cached decode never trains).
     FdAttn1Buf, FdAttn2Buf: array of TNeuralFloat;
     FdScore1Buf, FdScore2Buf: array of TNeuralFloat;
+    // The cached decode's map-2 score row (FCacheScores holds map 1).
+    FCacheScores2: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure FreeBackpropScratch();
+  protected
+    // The cached decode: both maps over the cached half-width keys.
+    procedure ComputeIncremental(); override;
   public
+    procedure BeginIncrementalDecode(pMaxContext: integer;
+      pInt8KV: boolean = false); override;
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       pLambdaInit: TNeuralFloat = 0.8); overload;
     destructor Destroy(); override;
@@ -35622,19 +35649,171 @@ end;
 // [0..t]. Works for a one-token decode step (the headline O(1)-per-step use)
 // and equally for a multi-token prompt prefill (every token sees only its
 // own prefix, i.e. exact causal behavior).
+function TNNetScaledDotProductAttention.CacheOverflows(SeqLen: integer): boolean;
+begin
+  // Eviction OFF: the cache must hold the whole prefix, so overflowing the
+  // preallocation is a hard error. Eviction ON: the middle is dropped per token
+  // (AppendCacheToken evicts BEFORE appending), so nothing can overflow.
+  Result := (FEvictSinks = 0) and (FCacheLen + SeqLen > FCacheMax);
+  if Result then
+    FErrorProc('TNNetScaledDotProductAttention KV cache overflow: ' +
+      IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
+      IntToStr(FCacheMax) + '. Call ResetCache or raise MaxContext.');
+end;
+
+procedure TNNetScaledDotProductAttention.AppendCacheToken(Src: TNeuralFloatArrPtr);
+var
+  j, jP1, jDk, jP1Dk, CacheLenM2, RowBytesFP, RowBytesI8: integer;
+begin
+  RowBytesFP := FDk * csNeuralFloatSize;
+  // StreamingLLM eviction (opt-in). If the cache is already at its cap (sinks +
+  // window), drop the OLDEST window key: shift slots [FEvictSinks+1 ..
+  // FCacheLen-1] left by one over slot FEvictSinks. The sink slots are never
+  // touched, and the append below brings the live length back to the cap.
+  // Retained keys keep their original post-RoPE rotation (see EnableEviction).
+  if (FEvictSinks > 0) and (FCacheLen >= FEvictSinks + FEvictWindow) then
+  begin
+    CacheLenM2 := FCacheLen - 2;
+    // Slot j begins at flat offset j * FDk in every store (FP32 rows and int8
+    // codes), so one carried offset serves K and V in both formats (#12/#20).
+    jDk := FEvictSinks * FDk;
+    if FKVQuantInt8 then
+    begin
+      // Not DeleteRows: that drops whole Y rows (KV heads), whereas an eviction
+      // drops one POSITION and must stop at the live length.
+      RowBytesI8 := FDk * csShortIntSize;
+      for j := FEvictSinks to CacheLenM2 do
+      begin
+        jP1 := j + 1;
+        jP1Dk := jDk + FDk;
+        Move(FKCacheQ.FData[jP1Dk], FKCacheQ.FData[jDk], RowBytesI8);
+        Move(FVCacheQ.FData[jP1Dk], FVCacheQ.FData[jDk], RowBytesI8);
+        FKCacheQ.ScalePtr^[j] := FKCacheQ.ScalePtr^[jP1];
+        FVCacheQ.ScalePtr^[j] := FVCacheQ.ScalePtr^[jP1];
+        jDk := jP1Dk;
+      end;
+    end
+    else
+      for j := FEvictSinks to CacheLenM2 do
+      begin
+        jP1Dk := jDk + FDk;
+        Move(FKCache.FData[jP1Dk], FKCache.FData[jDk], RowBytesFP);
+        Move(FVCache.FData[jP1Dk], FVCache.FData[jDk], RowBytesFP);
+        jDk := jP1Dk;
+      end;
+    Dec(FCacheLen);
+  end;
+  // The token's global position is the running cache length. int8 KV stores
+  // codes + a per-row scale (no FP32 row retained); FP32 is one Move per slice.
+  if FKVQuantInt8 then
+  begin
+    QuantizeCacheRow(TNeuralFloatArrPtr(@Src^[FDk]), FKCacheQ, FCacheLen);
+    QuantizeCacheRow(TNeuralFloatArrPtr(@Src^[2 * FDk]), FVCacheQ, FCacheLen);
+  end
+  else
+  begin
+    Move(Src^[FDk], FKCache.GetRawPtr(FCacheLen, 0)^, RowBytesFP);
+    Move(Src^[2 * FDk], FVCache.GetRawPtr(FCacheLen, 0)^, RowBytesFP);
+  end;
+  Inc(FCacheLen);
+end;
+
+function TNNetScaledDotProductAttention.CacheKeyStart(): integer;
+begin
+  // Full attention starts at 0; a sliding window attends only the FWindow most
+  // recent cached positions (the band the non-cached forward keeps).
+  if (FWindow > 0) and (FCacheLen > FWindow) then
+    Result := FCacheLen - FWindow
+  else
+    Result := 0;
+end;
+
+function TNNetScaledDotProductAttention.ScoreCachedKeys(
+  QueryPtr: TNeuralFloatArrPtr; KeyOffset, Dim, jStart: integer;
+  Scale, MaxSeed: TNeuralFloat; Scores: TNeuralFloatArrPtr): TNeuralFloat;
+var
+  j, jDk, CacheLenM1: integer;
+  Score: TNeuralFloat;
+  HasSoftCap: boolean;
+  KCodesPtr: TNeuralInt8ArrPtr;
+  KScalePtr: TNeuralFloatArrPtr;
+begin
+  // Format and soft-cap are layer state: the key loops split on the format and
+  // test a boolean for the cap (#20).
+  HasSoftCap := FScoreSoftCap > 0;
+  CacheLenM1 := FCacheLen - 1;
+  Result := MaxSeed;
+  jDk := jStart * FDk + KeyOffset;
+  if FKVQuantInt8 then
+  begin
+    // Dot the query against the cached key CODES directly and apply the row's
+    // quantization scale once - no dequantize-to-scratch pass.
+    KCodesPtr := FKCacheQ.DataPtr;
+    KScalePtr := FKCacheQ.ScalePtr;
+    for j := jStart to CacheLenM1 do
+    begin
+      Score := TNNetVolume.DotProductInt8(TNeuralInt8ArrPtr(@KCodesPtr^[jDk]),
+        QueryPtr, Dim) * (KScalePtr^[j] * Scale);
+      if HasSoftCap then
+        Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+      Scores^[j] := Score;
+      if Score > Result then Result := Score;
+      Inc(jDk, FDk);
+    end;
+  end
+  else
+    for j := jStart to CacheLenM1 do
+    begin
+      Score := TNNetVolume.DotProduct(QueryPtr, FKCache.GetRawPtr(jDk), Dim) *
+        Scale;
+      if HasSoftCap then
+        Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+      Scores^[j] := Score;
+      if Score > Result then Result := Score;
+      Inc(jDk, FDk);
+    end;
+end;
+
+procedure TNNetScaledDotProductAttention.AddCachedValues(OutPtr,
+  Weights: TNeuralFloatArrPtr; jStart: integer; Factor: TNeuralFloat);
+var
+  j, jDk, CacheLenM1: integer;
+  VCodesPtr: TNeuralInt8ArrPtr;
+  VScalePtr: TNeuralFloatArrPtr;
+begin
+  CacheLenM1 := FCacheLen - 1;
+  jDk := jStart * FDk;
+  if FKVQuantInt8 then
+  begin
+    // The weight, Factor and the row's quantization scale fold into one scalar
+    // of a fused int8 axpy straight from the cached value CODES.
+    VCodesPtr := FVCacheQ.DataPtr;
+    VScalePtr := FVCacheQ.ScalePtr;
+    for j := jStart to CacheLenM1 do
+    begin
+      TNNetVolume.MulAddInt8Scalar(OutPtr, TNeuralInt8ArrPtr(@VCodesPtr^[jDk]),
+        Weights^[j] * Factor * VScalePtr^[j], FDk);
+      Inc(jDk, FDk);
+    end;
+  end
+  else
+    for j := jStart to CacheLenM1 do
+    begin
+      TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(jDk), Weights^[j] * Factor,
+        FDk);
+      Inc(jDk, FDk);
+    end;
+end;
+
 procedure TNNetScaledDotProductAttention.ComputeIncremental();
 var
   StartTime: double;
-  SeqLen, p, j, jStart: integer;
-  SeqLenM1, CacheLenM1, CacheLenM2, jP1, jDk, jP1Dk: integer;
-  RowBytesFP, RowBytesI8, TwoFDk: integer;
+  p, jStart, MaxTokenPos, RowBytesFP: integer;
   posPrev, posOut, PrevRowStride, OutRowStride: integer;
-  QuantInt8, HasSoftCap, HasSink: boolean;
-  Score, MaxScore, SumExp, InvSumExp, SinkLogit, MaxScoreSeed: TNeuralFloat;
+  HasSink: boolean;
+  MaxScore, SumExp, SinkLogit, MaxScoreSeed: TNeuralFloat;
   Prev, Sinks: TNNetVolume;
-  OutPtr, QueryPtr: TNeuralFloatArrPtr;
-  KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
-  KScalePtr, VScalePtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr, ScoresPtr: TNeuralFloatArrPtr;
 begin
   // The KV-cache decode attention is CPU-only (no OpenCL path here), so count
   // it as a CPU dispatch - otherwise a profiler sees neither counter and the
@@ -35642,10 +35821,7 @@ begin
   Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
-  // Storage format and soft-cap are layer state, invariant for the whole call:
-  // the key loops split on the format and test a boolean for the cap (#20).
-  QuantInt8 := FKVQuantInt8;
-  HasSoftCap := FScoreSoftCap > 0;
+  if CacheOverflows(Prev.SizeX) then exit;
   // A sink logit seeds the running max and joins the normalizer once per token.
   Sinks := SinkLogits();
   HasSink := Assigned(Sinks);
@@ -35656,184 +35832,29 @@ begin
     SinkLogit := Sinks.FData[0];
     MaxScoreSeed := SinkLogit;
   end;
-  // Cache bases hoisted out of every loop below (#11). They stay valid for the
-  // whole call: the containers are preallocated at MaxContext and no ReSize
-  // happens between here and the last read.
-  KCodesPtr := FKCacheQ.DataPtr;
-  VCodesPtr := FVCacheQ.DataPtr;
-  KScalePtr := FKCacheQ.ScalePtr;
-  VScalePtr := FVCacheQ.ScalePtr;
-  SeqLen := Prev.SizeX;
-  SeqLenM1 := SeqLen - 1;
-  // Byte size of one cached K/V row, loop-invariant for the whole call: FDk is
-  // fixed per layer. Precompute once instead of recomputing FDk * <elem size>
-  // at every Move below.
+  ScoresPtr := TNeuralFloatArrPtr(@FCacheScores[0]);
+  MaxTokenPos := Prev.SizeX - 1;
   RowBytesFP := FDk * csNeuralFloatSize;
-  RowBytesI8 := FDk * csShortIntSize;
-  TwoFDk := 2 * FDk;
-  // Per-token row bases carried by addition (#12): p advances by 1, so the flat
-  // offset of Prev row p advances by one row stride, and FOutput row p likewise.
+  // Per-token row bases carried by addition (#12).
   PrevRowStride := Prev.GetRawPos(1, 0);
   OutRowStride := FOutput.GetRawPos(1, 0);
   posPrev := 0;
   posOut := 0;
-  // Eviction OFF: the cache must hold the whole prefix, so overflowing the
-  // preallocation is a hard error (unchanged unbounded behavior). Eviction ON:
-  // the cap is FEvictSinks + FEvictWindow and the middle is dropped per token,
-  // so the cache never exceeds the cap and there is nothing to overflow (the
-  // append below uses one transient extra slot, always < MaxContext since the
-  // cap itself is <= MaxContext - 1 is NOT required because we evict BEFORE
-  // appending the next token).
-  if (FEvictSinks = 0) and (FCacheLen + SeqLen > FCacheMax) then
+  for p := 0 to MaxTokenPos do
   begin
-    FErrorProc('TNNetScaledDotProductAttention KV cache overflow: ' +
-      IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
-      IntToStr(FCacheMax) + '. Call ResetCache or raise MaxContext.');
-    exit;
-  end;
-  for p := 0 to SeqLenM1 do
-  begin
-    // StreamingLLM eviction (opt-in). Before appending token p, if the cache is
-    // already at its cap (sinks + window), drop the OLDEST window key to make
-    // room: shift slots [FEvictSinks+1 .. FCacheLen-1] left by one over slot
-    // FEvictSinks. The first FEvictSinks (sink) slots are never touched. After
-    // this the live length is cap-1, the append below brings it back to cap, so
-    // CacheLength is pinned at sinks + window forever. Retained keys keep their
-    // original post-RoPE rotation (see EnableEviction's RoPE note).
-    if (FEvictSinks > 0) and (FCacheLen >= FEvictSinks + FEvictWindow) then
-    begin
-      CacheLenM2 := FCacheLen - 2;
-      // Every per-slot store keeps FDk contiguous elements, so slot j begins at
-      // flat offset j * FDk in ALL of them: FKCache/FVCache.FData (float rows,
-      // since their shape MaxContext x 1 x FDk gives GetRawPos(j, 0) = j * FDk)
-      // and FKCacheQ/FVCacheQ.FData (int8 rows). Carry that offset (and the
-      // next slot's) by addition and reuse it for K and V in both formats -
-      // no per-row GetRawPtr / multiply. The one multiply below is the only one.
-      // The storage format is layer state, so it is hoisted out of the shift
-      // and each half runs branch-free with its own carried offset (#20).
-      jDk := FEvictSinks * FDk;
-      if QuantInt8 then
-        // int8 storage: shift the codes + per-row scales instead of FP32.
-        // Not DeleteRows: that drops whole Y rows (KV heads), whereas an
-        // eviction drops one POSITION and must stop at the live length
-        // rather than running to MaxContext.
-        for j := FEvictSinks to CacheLenM2 do
-        begin
-          jP1 := j + 1;        // next (source) slot, shifted left over slot j
-          jP1Dk := jDk + FDk;  // (j + 1) * FDk, by addition
-          Move(FKCacheQ.FData[jP1Dk], FKCacheQ.FData[jDk], RowBytesI8);
-          Move(FVCacheQ.FData[jP1Dk], FVCacheQ.FData[jDk], RowBytesI8);
-          FKCacheQ.ScalePtr^[j] := FKCacheQ.ScalePtr^[jP1];
-          FVCacheQ.ScalePtr^[j] := FVCacheQ.ScalePtr^[jP1];
-          jDk := jP1Dk;        // advance: next iteration's j * FDk
-        end
-      else
-        for j := FEvictSinks to CacheLenM2 do
-        begin
-          jP1Dk := jDk + FDk;
-          Move(FKCache.FData[jP1Dk], FKCache.FData[jDk], RowBytesFP);
-          Move(FVCache.FData[jP1Dk], FVCache.FData[jDk], RowBytesFP);
-          jDk := jP1Dk;
-        end;
-      Dec(FCacheLen);
-    end;
-    // Append this token's K and V to the cache; its global position is the
-    // running cache length. With int8 KV on, quantize the slice to int8 codes +
-    // a per-row scale (no FP32 row retained); otherwise copy the FP32 slice
-    // (depth is contiguous, so each slice is one Move).
-    if QuantInt8 then
-    begin
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + FDk), FKCacheQ, FCacheLen);
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + TwoFDk), FVCacheQ, FCacheLen);
-    end
-    else
-    begin
-      Move(Prev.GetRawPtr(posPrev + FDk)^, FKCache.GetRawPtr(FCacheLen, 0)^,
-        RowBytesFP);
-      Move(Prev.GetRawPtr(posPrev + TwoFDk)^, FVCache.GetRawPtr(FCacheLen, 0)^,
-        RowBytesFP);
-    end;
-    Inc(FCacheLen);
-    // Scaled scores of this query against every cached key [jStart..FCacheLen-1].
-    // Full attention starts at 0; a sliding window (FWindow > 0) attends only
-    // over the FWindow most recent cached positions (the same band the
-    // non-cached forward keeps; older keys are simply skipped).
-    if (FWindow > 0) and (FCacheLen > FWindow) then
-      jStart := FCacheLen - FWindow
-    else
-      jStart := 0;
-    CacheLenM1 := FCacheLen - 1;
-    MaxScore := MaxScoreSeed;
     QueryPtr := Prev.GetRawPtr(posPrev);
-    jDk := jStart * FDk;
-    // With int8 KV on, dot the query against the cached key CODES directly
-    // (fused int8 x fp32 kernel) and apply the row's quantization scale once
-    // - no dequantize-to-scratch pass. Mathematically identical to
-    // dequant-then-dot (the scale factors out of the sum); not bit-identical
-    // (scale applied once vs per term, and the AVX int8 reduction order
-    // differs), well inside the documented int8-KV drift tolerance.
-    // Coded by Claude (AI).
-    if QuantInt8 then
-      for j := jStart to CacheLenM1 do
-      begin
-        Score := TNNetVolume.DotProductInt8(
-          TNeuralInt8ArrPtr(@KCodesPtr^[jDk]),
-          QueryPtr, FDk) * (KScalePtr^[j] * FInvSqrtDk);
-        // Same attention-logit soft-cap as the full forward (opt-in).
-        if HasSoftCap then
-          Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
-        FCacheScores[j] := Score;
-        if Score > MaxScore then MaxScore := Score;
-        Inc(jDk, FDk);
-      end
-    else
-      for j := jStart to CacheLenM1 do
-      begin
-        Score := TNNetVolume.DotProduct(
-          QueryPtr, FKCache.GetRawPtr(jDk), FDk) * FInvSqrtDk;
-        if HasSoftCap then
-          Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
-        FCacheScores[j] := Score;
-        if Score > MaxScore then MaxScore := Score;
-        Inc(jDk, FDk);
-      end;
-    // Numerically stable softmax over the cached prefix (no mask needed:
-    // future positions are simply not in the cache yet). The live prefix is a
-    // contiguous FCacheScores run, so the shift, the exp and the normalizer are
-    // one fused vectorized pass (#19).
-    SumExp := TNNetVolume.ExpShiftSum(
-      TNeuralFloatArrPtr(@FCacheScores[jStart]),
-      TNeuralFloatArrPtr(@FCacheScores[jStart]), MaxScore,
-      CacheLenM1 - jStart + 1);
+    AppendCacheToken(QueryPtr);
+    jStart := CacheKeyStart();
+    MaxScore := ScoreCachedKeys(QueryPtr, 0, FDk, jStart, FInvSqrtDk,
+      MaxScoreSeed, ScoresPtr);
+    // No mask needed: future positions are not in the cache yet. The live
+    // prefix is contiguous, so shift, exp and normalizer are one pass (#19).
+    SumExp := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@ScoresPtr^[jStart]),
+      TNeuralFloatArrPtr(@ScoresPtr^[jStart]), MaxScore, FCacheLen - jStart);
     if HasSink then SumExp := SumExp + NeuralExp(SinkLogit - MaxScore);
-    // out[p] = sum_j attn[j] * V[j] (AVX MulAdd over contiguous depth).
     OutPtr := FOutput.GetRawPtr(posOut);
     FillChar(OutPtr^, RowBytesFP, 0);
-    if SumExp > 0 then
-    begin
-      InvSumExp := 1 / SumExp;
-      jDk := jStart * FDk;
-      if QuantInt8 then
-        // int8 KV: accumulate straight from the cached value CODES; the
-        // attention weight, softmax normalizer and the row's quantization
-        // scale all fold into the one scalar (fused int8 axpy, no
-        // dequantize-to-scratch pass). Coded by Claude (AI).
-        for j := jStart to CacheLenM1 do
-        begin
-          TNNetVolume.MulAddInt8Scalar(OutPtr,
-            TNeuralInt8ArrPtr(@VCodesPtr^[jDk]),
-            FCacheScores[j] * InvSumExp * VScalePtr^[j], FDk);
-          Inc(jDk, FDk);
-        end
-      else
-        for j := jStart to CacheLenM1 do
-        begin
-          TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(jDk),
-            FCacheScores[j] * InvSumExp, FDk);
-          Inc(jDk, FDk);
-        end;
-    end;
-    // Advance the carried per-token row bases for the next p (#12).
+    if SumExp > 0 then AddCachedValues(OutPtr, ScoresPtr, jStart, 1 / SumExp);
     Inc(posPrev, PrevRowStride);
     Inc(posOut, OutRowStride);
   end;
@@ -50323,6 +50344,8 @@ begin
   FNumSinks := NumSinks;
   // Persist K so CreateLayer / LoadFromString can reconstruct the layer.
   FStruct[2] := FNumSinks;
+  SetLength(FSinkKeyPtr, FNumSinks);
+  SetLength(FSinkValPtr, FNumSinks);
   FSinkAttn := TNNetVolume.Create();
   FSinkKeyGrad := TNNetVolume.Create();
   FSinkValGrad := TNNetVolume.Create();
@@ -50372,8 +50395,13 @@ var
   Prev: TNNetVolume;
   OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
-  StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if FCacheEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
+  StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   AugLen := FNumSinks + SeqLen;
@@ -50384,17 +50412,8 @@ begin
   TwoFDk := 2 * FDk;
   RowBytes := FDk * csNeuralFloatSize;       // #5: once per call
   RowStride := Prev.GetRawPos(1, 0);
-  // Sink key/value weight-row pointers depend only on the sink slot s (key in
-  // FArrNeurons[s], value in FArrNeurons[FNumSinks+s]) and are invariant across
-  // the query loop i, so bind them once via the array mirror. Persistent
-  // lazily-sized tables (rule #17).
-  if Length(FSinkKeyPtr) <> FNumSinks then SetLength(FSinkKeyPtr, FNumSinks);
-  if Length(FSinkValPtr) <> FNumSinks then SetLength(FSinkValPtr, FNumSinks);
-  for s := 0 to FNumSinksM1 do
-  begin
-    FSinkKeyPtr[s] := FArrNeurons[s].FWeights.GetRawPtr(0, 0);
-    FSinkValPtr[s] := FArrNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0);
-  end;
+  // Sink weight rows are invariant across the query loop i: bind them once.
+  BindSinkSlotPtrs();
   // For each query row i: scores over [sinks ++ real keys], softmax, then a
   // weighted sum over [sink values ++ real V].
   for i := 0 to SeqLenM1 do
@@ -50466,6 +50485,79 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetSinkAttention.BindSinkSlotPtrs();
+var
+  s, MaxSinkPos: integer;
+begin
+  // Key of slot s in FArrNeurons[s], value in FArrNeurons[FNumSinks + s].
+  MaxSinkPos := FNumSinks - 1;
+  for s := 0 to MaxSinkPos do
+  begin
+    FSinkKeyPtr[s] := FArrNeurons[s].FWeights.GetRawPtr(0, 0);
+    FSinkValPtr[s] := FArrNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0);
+  end;
+end;
+
+procedure TNNetSinkAttention.ComputeIncremental();
+var
+  StartTime: double;
+  p, s, jStart, MaxTokenPos, MaxSinkPos, RowBytesFP: integer;
+  posPrev, posOut, PrevRowStride, OutRowStride: integer;
+  Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, QueryPtr, ScoresPtr, SinkScoresPtr: TNeuralFloatArrPtr;
+begin
+  Inc(FForwardCPUCnt);
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  if CacheOverflows(Prev.SizeX) then exit;
+  BindSinkSlotPtrs();
+  // FSinkAttn (sized by SetPrevLayer, unused while the cache is on) holds at
+  // least FNumSinks elements: its first row is the sink-score scratch.
+  SinkScoresPtr := FSinkAttn.GetRawPtr(0);
+  ScoresPtr := TNeuralFloatArrPtr(@FCacheScores[0]);
+  MaxTokenPos := Prev.SizeX - 1;
+  MaxSinkPos := FNumSinks - 1;
+  RowBytesFP := FDk * csNeuralFloatSize;
+  PrevRowStride := Prev.GetRawPos(1, 0);
+  OutRowStride := FOutput.GetRawPos(1, 0);
+  posPrev := 0;
+  posOut := 0;
+  for p := 0 to MaxTokenPos do
+  begin
+    QueryPtr := Prev.GetRawPtr(posPrev);
+    AppendCacheToken(QueryPtr);
+    jStart := CacheKeyStart();
+    MaxScore := ScoreCachedKeys(QueryPtr, 0, FDk, jStart, FInvSqrtDk, -1e30,
+      ScoresPtr);
+    // The sink slots are never masked and never evicted.
+    for s := 0 to MaxSinkPos do
+    begin
+      Score := TNNetVolume.DotProduct(QueryPtr, FSinkKeyPtr[s], FDk) *
+        FInvSqrtDk;
+      SinkScoresPtr^[s] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := TNNetVolume.ExpShiftSum(SinkScoresPtr, SinkScoresPtr, MaxScore,
+      FNumSinks) + TNNetVolume.ExpShiftSum(
+      TNeuralFloatArrPtr(@ScoresPtr^[jStart]),
+      TNeuralFloatArrPtr(@ScoresPtr^[jStart]), MaxScore, FCacheLen - jStart);
+    OutPtr := FOutput.GetRawPtr(posOut);
+    FillChar(OutPtr^, RowBytesFP, 0);
+    if SumExp > 0 then
+    begin
+      InvSumExp := 1 / SumExp;
+      for s := 0 to MaxSinkPos do
+        TNNetVolume.MulAdd(OutPtr, FSinkValPtr[s], SinkScoresPtr^[s] * InvSumExp,
+          FDk);
+      AddCachedValues(OutPtr, ScoresPtr, jStart, InvSumExp);
+    end;
+    Inc(posPrev, PrevRowStride);
+    Inc(posOut, OutRowStride);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 procedure TNNetSinkAttention.Backpropagate();
 var
   StartTime: double;
@@ -50508,16 +50600,8 @@ begin
   if FSinkValGrad.Size <> FNumSinks * FDk then FSinkValGrad.ReSize(FNumSinks, 1, FDk);
     FSinkKeyGrad.Fill(0);
     FSinkValGrad.Fill(0);
-    // Sink key/value weight-row pointers depend only on the sink slot s and are
-    // invariant across the query loop i, so bind them once via the array mirror
-    // (persistent lazily-sized tables, rule #17).
-    if Length(FSinkKeyPtr) <> FNumSinks then SetLength(FSinkKeyPtr, FNumSinks);
-    if Length(FSinkValPtr) <> FNumSinks then SetLength(FSinkValPtr, FNumSinks);
-    for s := 0 to FNumSinksM1 do
-    begin
-      FSinkKeyPtr[s] := FArrNeurons[s].FWeights.GetRawPtr(0, 0);
-      FSinkValPtr[s] := FArrNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0);
-    end;
+    // Sink weight rows are invariant across the query loop i: bind them once.
+    BindSinkSlotPtrs();
     for i := 0 to SeqLenM1 do
     begin
       // ---- Gradients w.r.t the values (sink + real) and the weights w ----
@@ -50893,6 +50977,67 @@ begin
   AfterWeightUpdate();
 end;
 
+procedure TNNetDifferentialAttention.BeginIncrementalDecode(
+  pMaxContext: integer; pInt8KV: boolean);
+begin
+  inherited BeginIncrementalDecode(pMaxContext, pInt8KV);
+  SetLength(FCacheScores2, FCacheMax);
+end;
+
+procedure TNNetDifferentialAttention.ComputeIncremental();
+var
+  StartTime: double;
+  p, jStart, KeyCount, MaxTokenPos, RowBytesFP: integer;
+  posPrev, posOut, PrevRowStride, OutRowStride: integer;
+  Max1, Max2, Sum1, Sum2, LambdaVal: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, QueryPtr, Scores1Ptr, Scores2Ptr: TNeuralFloatArrPtr;
+begin
+  Inc(FForwardCPUCnt);
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  if CacheOverflows(Prev.SizeX) then exit;
+  LambdaVal := FNeurons[0].FWeights.Raw[0];
+  Scores1Ptr := TNeuralFloatArrPtr(@FCacheScores[0]);
+  Scores2Ptr := TNeuralFloatArrPtr(@FCacheScores2[0]);
+  MaxTokenPos := Prev.SizeX - 1;
+  RowBytesFP := FDk * csNeuralFloatSize;
+  PrevRowStride := Prev.GetRawPos(1, 0);
+  OutRowStride := FOutput.GetRawPos(1, 0);
+  posPrev := 0;
+  posOut := 0;
+  for p := 0 to MaxTokenPos do
+  begin
+    QueryPtr := Prev.GetRawPtr(posPrev);
+    AppendCacheToken(QueryPtr);
+    jStart := CacheKeyStart();
+    KeyCount := FCacheLen - jStart;
+    // Map 1: Q1 . K1 (first half of the cached key row); map 2: Q2 . K2.
+    Max1 := ScoreCachedKeys(QueryPtr, 0, FHalfDk, jStart, FInvSqrtHalfDk,
+      -1e30, Scores1Ptr);
+    Max2 := ScoreCachedKeys(TNeuralFloatArrPtr(@QueryPtr^[FHalfDk]), FHalfDk,
+      FHalfDk, jStart, FInvSqrtHalfDk, -1e30, Scores2Ptr);
+    Sum1 := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Scores1Ptr^[jStart]),
+      TNeuralFloatArrPtr(@Scores1Ptr^[jStart]), Max1, KeyCount);
+    Sum2 := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Scores2Ptr^[jStart]),
+      TNeuralFloatArrPtr(@Scores2Ptr^[jStart]), Max2, KeyCount);
+    OutPtr := FOutput.GetRawPtr(posOut);
+    FillChar(OutPtr^, RowBytesFP, 0);
+    if (Sum1 > 0) and (Sum2 > 0) then
+    begin
+      // e1/Sum1 - lambda*e2/Sum2 = (e1 - lambda*(Sum1/Sum2)*e2) / Sum1: one
+      // bulk pass over the scores, then one pass over the cached values.
+      TNNetVolume.MulAdd(TNeuralFloatArrPtr(@Scores1Ptr^[jStart]),
+        TNeuralFloatArrPtr(@Scores2Ptr^[jStart]), -LambdaVal * Sum1 / Sum2,
+        KeyCount);
+      AddCachedValues(OutPtr, Scores1Ptr, jStart, 1 / Sum1);
+    end;
+    Inc(posPrev, PrevRowStride);
+    Inc(posOut, OutRowStride);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 procedure TNNetDifferentialAttention.Compute();
 var
   AttnIdx, Row, RowStride, posK, posV: integer;
@@ -50903,8 +51048,13 @@ var
   Prev: TNNetVolume;
   OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
-  StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if FCacheEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
+  StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
