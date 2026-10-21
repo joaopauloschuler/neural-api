@@ -630,10 +630,10 @@ rather than acted on.
       torch.chunk), `TNNetSpaceToDepth`/`TNNetPixelShuffle` (check that the
       channel order matches torch PixelUnshuffle), `TNNetDeepConcat`, `TNNetSum`.
       The official weights are .pth only (`torch.save({'params': state_dict})`):
-      open them with `CreatePretrainedTensorReader` (it already dispatches to
-      `TNNetTorchBinReader`, the restricted unpickler) and
-      check that it handles the outer `params` dict, so no Python converter is
-      needed. Pico parity against the official `Restormer` module
+      open them with `CreatePretrainedTensorReader` (it dispatches to
+      `TNNetTorchBinReader`, the restricted unpickler, which unwraps a top-level
+      `params` / `params_ema` / `state_dict` / `model` dict), so no Python
+      converter is needed; not yet tried on a real Restormer file. Pico parity against the official `Restormer` module
       (basicsr/models/archs/restormer_arch.py) in the ~/x venv (< 1e-4), then examples/Restormer (`--task
       derain|deblur|denoise`, tiled inference for large photos; the tiling should
       reuse the Real-ESRGAN/VAE tile blending helpers, not a copy) with a README.
@@ -933,7 +933,9 @@ rather than acted on.
           128/256/512 channel convs take the interleaved path. Measure on 2D convs
           too before changing the heuristic.
         - [ ] OpenCL weight borrowing (`BuildWeightOwner` + `EnableOpenCLInContextOf`)
-          is not tested for `TNNetConv1DLinear` (the CPU borrowing build is).
+          has no direct unit test for `TNNetConv1DLinear` (the CPU borrowing build
+          has one); only the stage-A integration test `TestKokoroStageAOpenCLParity`
+          covers it, and that test asserts only that some layer ran on OpenCL.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
@@ -1593,14 +1595,8 @@ rather than acted on.
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (these writes
           are the only mid-block waits).
-    - [X] B1d1 follow-up: Shared "bind or upload the operand" helper for
-          TNNetChannelMulByLayer and TNNetCellMulByCell. Done 4e3057e6:
-          TNNetLayer.BindOrUploadOpenCLOperand (FiLM too) + TNNetMulBySourceBase.
     - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
           OpenCL parity test.
-    - [X] B1d2 follow-up: Shared parent class for the four norm layers' identical
-          FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
-          Done 3c3a3ae6: TNNetNormWithOpenCL.
     - [ ] B1d2 follow-up: Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
           never fills FNormalized/FInvStd (FInvRMS): backprop reads
           stale values (pre-existing).
@@ -1642,10 +1638,11 @@ rather than acted on.
           41.0; after B2f3 ~1.3 / ~1.9 / ~4.7. Host today 9.9 + 2.0 GB at 256.
           Corrections to earlier notes: the 1 GB FP32 upload is inside the net
           (first forward) and small; blending is milliseconds; the ~22 s outside
-          the nets is most likely host-side arming per tile shape
-          (`TNNetLayerConcatedWeights.EnableOpenCL` calls `AfterWeightUpdate`
-          twice: 1 GB concat + scalar transpose + output-sized bias fill per
-          call) plus ~10 GB of zero-filled host volumes per build. Untiled 1024
+          the nets was attributed to host-side arming per tile shape
+          (`AfterWeightUpdate`: 1 GB concat + scalar transpose + output-sized
+          bias fill; a78b169f removed the second call and shares one weight
+          copy across the tile-shape nets, so re-measure) plus ~10 GB of
+          zero-filled host volumes per build. Untiled 1024
           also overflows on the host (`TVolume.ReSize` integer size;
           `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
           resident, so the VAE has ~10-14 GB on a 24 GB L4.
@@ -1704,12 +1701,6 @@ rather than acted on.
             there has prefix rows and does not match the cached steps' shape;
             the oracle must slice the target rows (our step pass carries only
             them).
-      - [X] Reuse in the CogVideoX TextToVideo loop (43f99b62):
-            `TCogVideoXSampler.PredictNoise` splits the single CogVideoX TNNet
-            into layer ranges (prefix + block 0 / blocks 1..N-1 / output head),
-            examples/TextToVideo `--fbc-threshold X`,
-            `TestCogVideoXFirstBlockCacheReference` on a three-block copy of
-            the pico checkpoint.
       - [ ] Reuse in later DiT pipelines (SD3/FLUX MMDiT, Wan): the same
             split of their block loop (run block 0, ask, run or skip the
             rest); a single-TNNet denoiser can follow TCogVideoXSampler's
@@ -2058,16 +2049,14 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           option (one neuron of QHeads weights, FStruct flag, the CPU prefill
           / cached-token / chunked-row paths and the backward), pass
           `SinkLogits` to `TNNetFusedSDPACL.Compute` / `ComputeInt8` /
-          `ComputeFlash` / `ComputeFlashInt8` (the kernels already take it;
-          only `ComputeFlashPacked` passes it today), then build gpt-oss
-          through `AddGQAAttentionFromSources`. Parity: the pico oracle, the
-          streamed decode, and `FusedSDPA*OpenCLParity`-style split / int8
-          cases with sinks.
-    - [ ] `cai_sdpa_flash_int8` carries the sink epilogue but no caller
-          passes sinks to it yet; cover it with the item above.
+          `ComputeFlash` / `ComputeFlashInt8` (the kernels already take it,
+          `cai_sdpa_flash_int8` included; only `ComputeFlashPacked` passes it
+          today), then build gpt-oss through `AddGQAAttentionFromSources`.
+          Parity: the pico oracle, the streamed decode, and
+          `FusedSDPA*OpenCLParity`-style split / int8 cases with sinks.
     - [ ] GPU-box: GPT-OSS prefill tok/s with the sink heads on
           `cai_sdpa_flash` against the parent commit.
-  - [x] `TNNetSinkAttention` full forward on `cai_sdpa_flash` (732bbaa5): the
+  - [ ] Follow-ups of the `TNNetSinkAttention` full forward on `cai_sdpa_flash` (732bbaa5): the
         K sink slots are cache rows 0..K-1 (a prefix `ComputeFlashPacked`
         uploads only when the weights change or the cache buffer regrows), the
         real K/V sit at slot K, and CacheSlot = K gives mask mode 1 the keys
@@ -2078,7 +2067,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           a resident cache with the sink rows as a fixed prefix, as the full
           forward does, on `TNNetFusedSDPACL.Compute` / `ComputeInt8`.
     - [ ] GPU-box: prefill tok/s of an `avSink` stack against the parent commit.
-  - [x] `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
+  - [ ] Follow-ups of the `TNNetDifferentialAttention` full forward on `cai_sdpa_flash`
         (732bbaa5): one launch with two query heads per KV head
         (`cai_sdpa_diff_pack_q` writes [Q1,0 | 0,Q2], score scale
         1/sqrt(d_k/2)), then `cai_sdpa_diff_combine` writes Y1 - lambda*Y2
@@ -2411,18 +2400,19 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       repeats. Capture as `AssertKinkDerivative(layer, x_kink, expected_dydx)`
       and use it first for the missing TNNetHardShrink / TNNetSoftShrink
       kink-region tests at hand-picked inputs (no central differences).
-- [ ] FP-exception robustness for TNNetSoftSign / TNNetESwish at truly extreme
-      inputs (surfaced 2026-05-31 while writing the saturation tests above):
-      both raise a HARDWARE FP exception rather than returning a finite value
-      at far-extreme magnitudes — TNNetSoftSign's closed-form derivative
-      `1/(1+|x|)^2` overflows float32 around |x|~1e30 (EInvalidOp), and
-      TNNetESwish's `Exp(-beta*x)` overflows the RTL `Exp` around beta*x~-570
-      (EOverflow). The landed tests stay inside the safe-but-saturating band
-      (SoftSign ±1e6, ESwish beta*x up to ±625) and document the limit. Decide
-      a policy: either clamp the offending intermediate (saturate the derivative
-      to 0 / the sigmoid to its asymptote) so the layers stay finite at any
-      input like HardTanh/SoftCapping do, or document the input-range contract.
-      Then extend the tests to the far-extreme range under the chosen policy.
+- [ ] FP-exception robustness for TNNetESwish at truly extreme inputs
+      (surfaced 2026-05-31 while writing the saturation tests above): its
+      `Exp(-beta*x)` overflows the RTL `Exp` around beta*x~-570 (EOverflow)
+      instead of returning a finite value. The landed test stays inside the
+      safe-but-saturating band (beta*x up to ±625) and documents the limit.
+      Decide a policy: either clamp the offending intermediate (saturate the
+      sigmoid to its asymptote) so the layer stays finite at any input like
+      HardTanh/SoftCapping do, or document the input-range contract. Then
+      extend the test to the far-extreme range under the chosen policy.
+      TNNetSoftSign no longer squares 1+|x| (1641985d computes the derivative
+      as InvDenom * InvDenom), so it should now be finite at |x|~1e30, but
+      `TestSoftSignExtremeInputSaturation` still stops at ±1e6 and its comment
+      still describes the old overflow: extend it to the far-extreme range.
       The device forward (opcodes 22, 70) is already finite at any finite input
       (`TestActivationOpenCLExtremeInputs`); this item is the host path only.
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
