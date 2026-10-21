@@ -1663,21 +1663,27 @@ rather than acted on.
       spatial with RGBA out, while taesd* / taef1 are 4/16-ch at 8x and taehv's
       `taew2_1` is Wan-2.1 (16-ch, 8x); a QwenImage preview needs a tiny decoder
       trained for that latent space (or a cheap latent->RGB linear projection).
-- [ ] Real-ESRGAN: `--upscale` in examples/QwenImage, plus the checks still open.
+- [ ] Real-ESRGAN: the checks still open (the examples/QwenImage `--upscale` is done).
       Done: shape-inferred `TRRDBNetConfig` (`InferRRDBNetConfigFromTensors` /
       `LoadRRDBNetConfig`, any key prefix such as `params_ema.`), the x2plus/x1
       `TNNetSpaceToDepth` pixel-unshuffle stem, width <> height, and tiled upscale
       (`RRDBNetTileConfig` + `RRDBNetUpscale` on `TiledNetCompute`, now shared
       with `TiledVaeDecode`). examples/RealESRGANUpscale takes `--model --input
-      --output --tile --tile-pad --tile-overlap --gpu`. Left:
-      (1) examples/QwenImage `--upscale FILE` (REPL `/upscale FILE|off`): run
-      `RRDBNetUpscale` on the decoded image after the VAE, so a 512x512 generation
-      becomes 2048x2048 for a fraction of the 1024x1024 denoise cost;
+      --output --tile --tile-pad --tile-overlap --gpu`. examples/QwenImage
+      `--upscale FILE` / `--upscale-tile N` / REPL `/upscale FILE|off` run the
+      shared `TRRDBNetUpscaler` (both examples call it) after the VAE decode.
+      Left:
+      (1) memory: on the CPU path a tile holds ~2.7 MB per net-input pixel
+      (x4plus layout, measured), almost all of it each convolution's own
+      FInputCopy + FInputPrepared (im2col), which liveness output sharing does
+      not cover; one im2col scratch shared by a net's inference convolutions
+      would allow 256-pixel tiles. Needs the user's decision (engine change);
       (2) DEFERRED, needs the user's approval for a new Python tool: a pico
       basicsr x2plus fixture (`tools/` generator from the ~/x venv using basicsr's
       RRDBNet definition), parity < 1e-4 on the whole net. Today only the
       unshuffle stem has an oracle (Pascal-side, `TestRRDBNetPixelUnshuffleX2`);
-      (3) a real `RealESRGAN_x4plus.pth` (and x2plus) run on the user's box;
+      (3) a real `RealESRGAN_x4plus.pth` (and x2plus) run on the user's box,
+      through both examples (QwenImage: `--width 512 --height 512 --upscale`);
       (4) not supported: the old ESRGAN `model.N.*` key layout.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
       calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,

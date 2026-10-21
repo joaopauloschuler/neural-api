@@ -1,9 +1,10 @@
 # RealESRGANUpscale: Real-ESRGAN / ESRGAN RRDBNet super-resolution
 
 Upscales an image with the **Real-ESRGAN / ESRGAN RRDBNet** importer in
-`neural/neuralpretrained.pas` (`LoadRRDBNetConfig`, `RRDBNetTileConfig`,
-`BuildRRDBNetFromSafeTensorsEx`, `RRDBNetUpscale`). RRDBNet is convolution only,
-with no diffusion loop.
+`neural/neuralpretrained.pas` through `TRRDBNetUpscaler` (`LoadRRDBNetConfig`,
+`RRDBNetTileConfig`, `BuildRRDBNetFromSafeTensorsEx`, `RRDBNetUpscale`), the same
+class `examples/QwenImage --upscale` uses. RRDBNet is convolution only, with no
+diffusion loop.
 
 ## Running
 
@@ -51,7 +52,12 @@ unshuffle factor, or to the whole image when the image fits. `RRDBNetUpscale`
 then calls `TiledNetCompute`, which `TiledVaeDecode` also uses. For each tile,
 `TiledNetCompute` drops `tile_pad` output pixels on every interior side and
 feather-blends the next `tile_overlap` pixels into the neighbouring tile.
-Peak memory follows the tile size, not the image size. The real x4plus net
+Peak memory follows the tile size, not the image size: on the CPU path,
+about 0.3 GB plus 2.7 MB per net-input pixel for the x4plus layout (measured
+with random weights; `--tile 32` with the default pad is a 52x52 input, about
+7.6 GB). `TRRDBNetUpscaler` turns on `TNNet.ShareHostOutputsByLiveness`, but
+most of that memory is each convolution's own input copy and im2col buffer,
+which it does not share. The real x4plus net
 looks far beyond 10 pixels, so tiled output is close to the whole-image
 output but not equal to it, as in basicsr.
 
@@ -63,7 +69,9 @@ With no arguments, the example builds the committed random-weight pico nets
 and `esrgan_out_x2.png`. This checks the import and the image I/O. It is not a
 photoreal upscale.
 
-Tests: `TestRRDBNetParity{,Pth,Scale2}` (float64 oracle, `< 1e-4`),
+Tests: `TestRRDBNetUpscalerMatchesRRDBNetUpscale` (the class against a
+direct `RRDBNetUpscale`, RGB and RGBA), `TestRRDBNetUpscalerOpenCL`,
+`TestRRDBNetParity{,Pth,Scale2}` (float64 oracle, `< 1e-4`),
 `TestRRDBNetInferConfigFromTensors`, `TestRRDBNetKeyPrefix`,
 `TestRRDBNetTiledUpscale` (tiled vs whole on a non-square image, with square
 and non-square tiles) and `TestRRDBNetPixelUnshuffleX2` (an x2plus layout

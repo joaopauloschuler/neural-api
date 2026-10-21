@@ -1,7 +1,7 @@
 program RealESRGANUpscale;
 (*
 RealESRGANUpscale: Real-ESRGAN / ESRGAN RRDBNet super-resolution with the
-importer in neuralpretrained.pas (BuildRRDBNetFromSafeTensorsEx, RRDBNetUpscale).
+importer in neuralpretrained.pas (TRRDBNetUpscaler over RRDBNetUpscale).
 
 Two modes:
   * no arguments: a smoke of the committed random pico fixtures
@@ -28,7 +28,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
-  Classes, SysUtils, Math,
+  Classes, SysUtils,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
 
@@ -119,15 +119,15 @@ begin
     raise Exception.Create('--model needs --input and --output');
 end;
 
-// Loads ImageFile as RGB in [0,1], upscales it and writes OutputFile.
+// Loads InputFile, upscales it in [0,1] with TRRDBNetUpscaler and writes
+// OutputFile.
 procedure UpscaleFile(const Opt: TUpscaleOptions);
 var
-  Config, TileConfig: TRRDBNetConfig;
-  NN: TNNet;
+  Upscaler: TRRDBNetUpscaler;
+  TileConfig: TRRDBNetConfig;
   Image, Upscaled: TNNetVolume;
   ComputeText: string;
   StartTime: TDateTime;
-  PixelPos: integer;
   {$IFDEF OpenCL}
   OpenCLDevices: TEasyOpenCL;
   OpenCLProblem: string;
@@ -135,8 +135,8 @@ var
   {$ENDIF}
 begin
   Image := TNNetVolume.Create;
-  Upscaled := nil;
-  NN := nil;
+  Upscaled := TNNetVolume.Create;
+  Upscaler := nil;
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -144,15 +144,12 @@ begin
     if not LoadImageFromFileIntoVolume(Opt.InputFile, Image) then
       raise Exception.Create('could not load ' + Opt.InputFile);
     Image.Divi(255.0);
-    Config := LoadRRDBNetConfig(Opt.ModelFile, Opt.ConfigFile);
-    if Image.Depth <> Config.NumInCh then
-      raise Exception.Create(Format('the image has %d channels, the model ' +
-        'takes %d', [Image.Depth, Config.NumInCh]));
-    TileConfig := RRDBNetTileConfig(Config, Image.SizeX, Image.SizeY,
-      Opt.Tile, Opt.TilePad);
+    Upscaler := TRRDBNetUpscaler.Create(Opt.ModelFile, Opt.ConfigFile);
+    Upscaler.Tile := Opt.Tile;
+    Upscaler.TilePad := Opt.TilePad;
+    Upscaler.TileOverlap := Opt.TileOverlap;
+    TileConfig := Upscaler.TileConfigFor(Image.SizeX, Image.SizeY);
     WriteLn(RRDBNetConfigToString(TileConfig));
-    NN := BuildRRDBNetFromSafeTensorsEx(Opt.ModelFile, TileConfig,
-      {pTrainable=}false);
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
     begin
@@ -163,7 +160,7 @@ begin
       if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
         OpenCLProblem) then
       begin
-        NN.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+        Upscaler.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
           OpenCLDevices.Devices[OpenCLDevice]);
         ComputeText := 'OpenCL on ' +
           OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
@@ -176,20 +173,20 @@ begin
       {$ENDIF}
     end;
     WriteLn(Format('Upscaling %dx%d x%d on %s, net input %dx%d',
-      [Image.SizeX, Image.SizeY, Config.Scale, ComputeText,
+      [Image.SizeX, Image.SizeY, Upscaler.Config.Scale, ComputeText,
        TileConfig.InputWidth, TileConfig.InputHeight]));
     StartTime := Now();
-    Upscaled := RRDBNetUpscale(NN, TileConfig, Image, Opt.TilePad,
-      Opt.TileOverlap);
+    Upscaler.Upscale(Image, Upscaled);
+    if Opt.UseOpenCL and not Upscaler.OnOpenCL then
+      WriteLn('  OpenCL did not arm: the net ran on the CPU');
     WriteLn(Format('  %.1f s', [(Now() - StartTime) * 86400.0]));
-    for PixelPos := 0 to Upscaled.Size - 1 do
-      Upscaled.FData[PixelPos] := EnsureRange(Upscaled.FData[PixelPos], 0, 1) * 255;
+    Upscaled.Mul(255);
     if not SaveImageFromVolumeIntoFile(Upscaled, Opt.OutputFile) then
       raise Exception.Create('could not save ' + Opt.OutputFile);
     WriteLn(Format('  %dx%d -> %dx%d  (%s)', [Image.SizeX, Image.SizeY,
       Upscaled.SizeX, Upscaled.SizeY, Opt.OutputFile]));
   finally
-    NN.Free;
+    Upscaler.Free;
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}

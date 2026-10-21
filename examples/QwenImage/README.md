@@ -152,6 +152,7 @@ follow:
 | `/padding-mask-crop N` | inpaint only the mask's box plus N pixels (as `--padding-mask-crop`); `/padding-mask-crop off` clears it |
 | `/outpaint L,T,R,B [OVERLAP]` | outpaint the init image (as `--outpaint` and `--outpaint-overlap`); sets strength 1 unless `--strength` or `/strength` set it; `/outpaint off` goes back to img2img |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
+| `/upscale FILE` | upscale the next images with this Real-ESRGAN checkpoint, as `--upscale`; `/upscale` alone shows the current one, `/upscale off` stops upscaling |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
@@ -465,6 +466,51 @@ The adapters are checked only against an oracle computed in the tests
 (`TestLoRAMergeImage*`, `TestQwenImage21TransformerLoRA`); no real
 community LoRA has run through this program yet.
 
+### Upscaling (`--upscale FILE`)
+
+`--upscale FILE` upscales every image with a Real-ESRGAN / ESRGAN RRDBNet
+checkpoint after the VAE decode and before the PNG save. With
+`RealESRGAN_x4plus.pth`, a 512x512 generation is written as 2048x2048, and the
+transformer only runs on the 1024 image tokens of 512x512:
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --int4 \
+  --width 512 --height 512 --upscale RealESRGAN_x4plus.pth -p "a fox in a forest"
+```
+
+The upscaler is `TRRDBNetUpscaler` in `neural/neuralpretrained.pas`, the same
+code that `examples/RealESRGANUpscale` runs. It takes the `.pth` as
+published (the `params_ema` wrapper is unwrapped) or a `.safetensors`. It
+reads `config.json` next to the file when there is one, and otherwise reads
+the config from the tensor shapes, so x2plus works too. The image goes in as
+RGB in [0,1] and comes out clamped to [0,1], as basicsr's `RealESRGANer`
+does. The alpha channel of the VAE output is resized bilinearly, not run
+through the net. Upscaling runs after the inpaint-crop paste and the outpaint
+crop, so it upscales the finished image.
+
+Memory: the upscaler net is built for each image after the VAE decode, so in
+one-shot runs it is the only component in memory, and it is freed before the
+PNG save. In the REPL and with `--repeat`, the text encoder, the transformer
+and the VAE decoder stay loaded beside it while it runs. The program does not
+keep it between images: reading the weights again (67 MB for x4plus) costs
+far less than the upscale itself, while a kept net would also keep its tile
+buffers.
+
+The net runs tile by tile: `--upscale-tile N` pixels (default 32), plus 10
+pixels of context on each side, with 8-pixel feathered seams. On the CPU
+path a tile holds about 0.3 GB plus 2.7 MB per pixel of (N + 20)^2,
+measured on this machine with the x4plus layout. That is about 3.8 GB at 16,
+7.6 GB at 32 and 19 GB at 64. Most of it is each convolution's own
+input copy and im2col buffer, which `TNNet.ShareHostOutputsByLiveness` does
+not share. A larger tile has less context overhead: (N + 20)^2 / N^2 is 2.6x
+at 32 and 1.7x at 64. `--upscale-tile 0` runs the whole image as one tile.
+When `--gpu` armed the pipeline, the upscaler runs on the same OpenCL device.
+The time and memory of the real x4plus checkpoint have not been measured on
+a GPU yet.
+
+With `--stats`, the stage table gets an `upscale` row with the device, the
+output size and the net input size.
+
 ## Options
 
 `QwenImage --help` prints this list.
@@ -510,6 +556,8 @@ and `--fp32`, the last one given wins.
 | `--outpaint L,T,R,B` | with `--init-image`: add L, T, R, B pixels on the left, top, right and bottom and generate them; see [Outpainting](#outpainting). Not with `--mask` | — |
 | `--outpaint-overlap N` | pixels of the init image along each extended side that are regenerated too | 16 |
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 (1 with `--outpaint`) |
+| `--upscale FILE` | upscale each image with this Real-ESRGAN / ESRGAN RRDBNet checkpoint before the save; see [Upscaling](#upscaling---upscale-file) | off |
+| `--upscale-tile N` | upscaler tile in input pixels, 0 = the whole image; each tile adds 10 context pixels per side | 32 |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
@@ -664,6 +712,9 @@ under [VAE tiles](#vae-tiles).
 - The negative prompt (classifier-free guidance) is not implemented.
 - Editing is tested only against diffusers on the pico checkpoint; it has
   not run on the real checkpoint yet. The same holds for inpainting.
+- `--upscale` has run only with the repository's random pico RRDBNet
+  (`tests/fixtures/tiny_rrdbnet*`); a real `RealESRGAN_x4plus.pth` run is
+  still pending.
 - The VAE encoder and the vision tower run untiled on the CPU, so their
   memory grows with the output size. They have not been measured at
   1024x1024 on the real checkpoint.
@@ -704,3 +755,7 @@ zero-scale adapter leaves the velocity unchanged. The edit tests
 (`TestQwenImage21Edit*`) read the oracle of
 `tools/make_pico_qwenimage21_edit_pipeline_fixture.py`: the diffusers
 pipeline with one and two condition images.
+`TestRRDBNetUpscalerMatchesRRDBNetUpscale` checks the `--upscale` code
+(`TRRDBNetUpscaler`) against a direct `RRDBNetUpscale` on a tiled pico image,
+for RGB and for RGBA with a bilinear alpha. `TestRRDBNetUpscalerOpenCL`
+checks it on OpenCL against the CPU.

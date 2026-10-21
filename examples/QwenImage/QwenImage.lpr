@@ -26,7 +26,7 @@ grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
 /padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
-/profile on|off, /stats on|off, /quit.
+/upscale FILE|off, /profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -73,6 +73,13 @@ GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
 
+Upscaling (--upscale FILE or /upscale FILE): a Real-ESRGAN / ESRGAN RRDBNet
+checkpoint (RealESRGAN_x4plus .pth or .safetensors) upscales the finished image
+before the PNG save through TRRDBNetUpscaler, so 512x512 becomes 2048x2048 at x4.
+The upscaler net is built after the VAE decode, for each image, and freed after
+it; it runs tile by tile (--upscale-tile, default 32 pixels plus 10 of context
+per side) on the --gpu device. Alpha is resized bilinearly.
+
 The initial noise comes from the FPC RNG (--seed), so an image is repeatable
 here but not equal to a diffusers image with the same seed.
 
@@ -85,7 +92,7 @@ USAGE
              [--padding-mask-crop N] |
              --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
-            [--lora FILE[:SCALE] ...]
+            [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile] [--stats]
@@ -119,6 +126,8 @@ const
   csDefaultOutpaintOverlap = csQwenImage21PixelsPerLatent;
   // Largest --repeat / /repeat count (catches a mistyped count).
   csMaxRepeatCount = 1000;
+  // --upscale-tile when not given: RRDBNet input pixels per tile side.
+  csDefaultUpscaleTile = 32;
   csBytesPerMB = 1024.0 * 1024.0;
 
 type
@@ -231,9 +240,11 @@ begin
 end;
 
 // The per-image stage table of --stats and --profile: one row per phase that
-// ran, PNG save, their sum; then OpenCL transfers and bytes held, peak RSS.
+// ran, upscale (UpscaleRanOn '' = none), PNG save, their sum; then OpenCL
+// transfers and bytes held, peak RSS.
 procedure PrintStageTable(const Stats: TQwenImage21ImageStats;
   ImageNumber, EncodeImageNumber, InputImageEncodeNumber: integer;
+  UpscaleMs: double; const UpscaleRanOn, UpscaleDetail: string;
   PngSaveMs: double; IsProfiled, IsPeakPerImage: boolean);
 var
   Phase: TQwenImage21PipelinePhase;
@@ -291,7 +302,7 @@ begin
   UsedImages := Stats.UsedInitImage or (Stats.ConditionImageCount > 0);
   HasImageEncode := UsedImages and (ImageNumber = InputImageEncodeNumber);
   IsOnOpenCL := Stats.TransformerOnOpenCL or Stats.VaeOnOpenCL;
-  TotalMs := PngSaveMs;
+  TotalMs := PngSaveMs + UpscaleMs;
   for Phase := Low(TQwenImage21PipelinePhase) to qppDecode do
     if IsCountedHere(Phase) then
       TotalMs := TotalMs + Stats.PhaseMs[Phase];
@@ -346,6 +357,8 @@ begin
     end;
     AddTimedRow(PhaseName(Phase), RanOn, Stats.PhaseMs[Phase], Detail);
   end;
+  if UpscaleRanOn <> '' then
+    AddTimedRow('upscale', UpscaleRanOn, UpscaleMs, UpscaleDetail);
   AddTimedRow('PNG save', 'CPU', PngSaveMs, '');
   AddRow('sum of stages', '', Format('%.1f', [TotalMs]), '100.0', '');
   if IsOnOpenCL then
@@ -528,6 +541,16 @@ begin
   WriteLn('                       adapters.');
   WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
     'of 16 (default 256,192)');
+  WriteLn('  --upscale FILE       upscale each image with this Real-ESRGAN / ',
+    'ESRGAN RRDBNet checkpoint');
+  WriteLn('                       (.pth or .safetensors; config.json next to ',
+    'it, else read from the tensors)');
+  WriteLn('                       before the save: x4plus turns 512x512 into ',
+    '2048x2048. Runs on the --gpu device.');
+  WriteLn('  --upscale-tile N     upscaler tile in input pixels, 0 = the whole ',
+    'image (default ', csDefaultUpscaleTile, ');');
+  WriteLn('                       a tile holds about 2.7 MB per pixel of ',
+    '(N + 20)^2 on the CPU');
   WriteLn('  --serial             single-threaded forward passes (default: ',
     'the parallel layer scheduler with intra-layer threading)');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
@@ -611,6 +634,8 @@ begin
   WriteLn('                       /outpaint off returns to img2img');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
+  WriteLn('  /upscale FILE        upscale the next images, as --upscale; ',
+    '/upscale off stops it');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
     'with --repeat N > 1) the');
   WriteLn('                       transformer stays in OpenCL memory ',
@@ -866,6 +891,12 @@ var
   RequestedPlatform, RequestedDevice: integer;
   {$ENDIF}
   VaeTileSize, VaeTileStride, MaxThreads: integer;
+  // --upscale / /upscale: nil when off; built from UpscaleTile.
+  Upscaler: TRRDBNetUpscaler;
+  UpscaleFile: string;
+  UpscaleTile: integer;
+  // The pipeline got an OpenCL device; the upscaler is armed on it too.
+  IsOpenCLSelected: boolean;
   Pipeline: TQwenImage21Pipeline;
   Reporter: TQwenImageReporter;
   PromptEmbeds, Image: TNNetVolume;
@@ -1315,6 +1346,34 @@ var
   end;
 
   // The Image and Init image lines of the run header.
+  // Replaces the upscaler with FileName's (config read now, weights per
+  // image); returns '' or what is wrong, keeping the previous upscaler then.
+  function SetUpscaler(const FileName: string): string;
+  var
+    NewUpscaler: TRRDBNetUpscaler;
+  begin
+    Result := '';
+    try
+      NewUpscaler := TRRDBNetUpscaler.Create(FileName);
+    except
+      on E: Exception do exit(E.Message);
+    end;
+    NewUpscaler.Tile := UpscaleTile;
+    {$IFDEF OpenCL}
+    if IsOpenCLSelected then
+      NewUpscaler.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+        OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
+    {$ENDIF}
+    Upscaler.Free;
+    Upscaler := NewUpscaler;
+  end;
+
+  function UpscalerText(): string;
+  begin
+    Result := Format('%s (x%d, tile %d)', [Upscaler.FileName,
+      Upscaler.Config.Scale, Upscaler.Tile]);
+  end;
+
   procedure PrintImageSettings();
   var
     OutputWidth, OutputHeight, StartStep: integer;
@@ -1395,9 +1454,11 @@ var
   procedure GenerateImage(const ImageFile: string);
   var
     ImageStart: QWord;
-    SaveStart: TDateTime;
-    PngSaveMs: double;
-    OutputWidth, OutputHeight: integer;
+    SaveStart, UpscaleStart: TDateTime;
+    PngSaveMs, UpscaleMs: double;
+    OutputWidth, OutputHeight, GeneratedWidth, GeneratedHeight: integer;
+    UpscaleRanOn, UpscaleDetail: string;
+    TileConfig: TRRDBNetConfig;
   begin
     // The image that encoded the prompt had its mark reset before the encode.
     if ImageNumber <> EncodeImageNumber then
@@ -1421,15 +1482,38 @@ var
       PasteInpaintCrop(Image, InitImage, InpaintFullMask, InpaintCrop.Left,
         InpaintCrop.Top, InpaintCrop.Right, InpaintCrop.Bottom, irfLanczos,
         Image);
+    UpscaleMs := 0;
+    UpscaleRanOn := '';
+    UpscaleDetail := '';
+    if Assigned(Upscaler) then
+    begin
+      UpscaleStart := Now();
+      GeneratedWidth := Image.SizeX;
+      GeneratedHeight := Image.SizeY;
+      TileConfig := Upscaler.TileConfigFor(GeneratedWidth, GeneratedHeight);
+      Image.Divi(255);
+      Upscaler.Upscale(Image, Image);
+      Image.Mul(255);
+      UpscaleMs := (Now() - UpscaleStart) * MSecsPerDay;
+      if Upscaler.OnOpenCL then UpscaleRanOn := 'OpenCL'
+      else UpscaleRanOn := 'CPU';
+      UpscaleDetail := Format('x%d to %dx%d, net input %dx%d',
+        [Upscaler.Config.Scale, Image.SizeX, Image.SizeY,
+         TileConfig.InputWidth, TileConfig.InputHeight]);
+      WriteLn('Upscaled ', GeneratedWidth, 'x', GeneratedHeight, ' to ',
+        Image.SizeX, 'x', Image.SizeY, ' on ', UpscaleRanOn, ' in ',
+        (UpscaleMs / 1000):0:1, ' s');
+    end;
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
       raise Exception.Create('could not write ' + ImageFile);
-    PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
+    PngSaveMs := (Now() - SaveStart) * MSecsPerDay - UpscaleMs;
     WriteLn('Wrote ', ImageFile, ' (', Image.SizeX, 'x', Image.SizeY, 'x',
       Image.Depth, ') in ', ((GetTickCount64 - ImageStart) / 1000):0:1,
       ' s; ', MemoryReport());
     if UseStats or UseProfile then
       PrintStageTable(Pipeline.ImageStats, ImageNumber, EncodeImageNumber,
-        InputImageEncodeNumber, PngSaveMs, UseProfile, IsPeakPerImage);
+        InputImageEncodeNumber, UpscaleMs, UpscaleRanOn, UpscaleDetail,
+        PngSaveMs, UseProfile, IsPeakPerImage);
     if UseProfile then
     begin
       WriteLn;
@@ -1560,9 +1644,9 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image,
-  // /mask, /mask-blur, /outpaint, /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
-  // out of memory.
+  // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image, /mask,
+  // /mask-blur, /outpaint, /strength, /upscale, /profile, /stats and /quit;
+  // false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
     IsOn: boolean;
@@ -1869,6 +1953,30 @@ var
         end;
       end;
     end
+    else if Command = 'upscale' then
+    begin
+      if Argument = '' then
+      begin
+        if Assigned(Upscaler) then
+          WriteLn('[upscale ', UpscalerText(), '; /upscale off stops it]')
+        else WriteLn('[/upscale: expected /upscale FILE or /upscale off]');
+      end
+      else if LowerCase(Argument) = 'off' then
+      begin
+        FreeAndNil(Upscaler);
+        WriteLn('[upscale off]');
+      end
+      else
+      begin
+        Problem := SetUpscaler(Argument);
+        if Problem = '' then
+          WriteLn('[upscale ', UpscalerText(), ' from the next image]')
+        else if Assigned(Upscaler) then
+          WriteLn('[/upscale: ', Problem, ' - ', UpscalerText(),
+            ' stays active]')
+        else WriteLn('[/upscale: ', Problem, ' - upscaling stays off]');
+      end;
+    end
     else if Command = 'profile' then
     begin
       if ParseOnOff(Command, Argument, IsOn) then
@@ -1887,7 +1995,7 @@ var
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
       '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
-      '/outpaint, /strength, ',
+      '/outpaint, /strength, /upscale, ',
       '/profile, /stats, /quit]');
   end;
 
@@ -1902,8 +2010,8 @@ var
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
-      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, /profile on|off, ',
-      '/stats on|off, /quit.');
+      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, ',
+      '/upscale FILE|off, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -1978,6 +2086,10 @@ begin
   Strength := csDefaultStrength;
   HasStrengthArg := false;
   MaxThreads := 0;
+  Upscaler := nil;
+  UpscaleFile := '';
+  UpscaleTile := csDefaultUpscaleTile;
+  IsOpenCLSelected := false;
   VaeTileSize := 256;
   VaeTileStride := 192;
   UseOpenCL := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -2094,6 +2206,16 @@ begin
         Halt(2);
       end;
     end
+    else if Arg = '--upscale' then UpscaleFile := NextArg()
+    else if Arg = '--upscale-tile' then
+    begin
+      ArgProblem := ParsePixelCount(NextArg(), UpscaleTile);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--upscale-tile: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if (Arg = '--help') or (Arg = '-h') then
     begin
       PrintHelp();
@@ -2174,6 +2296,12 @@ begin
     end;
     if not HasStrengthArg then Strength := 1;
   end;
+  if (UpscaleTile <> csDefaultUpscaleTile) and (UpscaleFile = '') then
+  begin
+    if HasPrompt or (TokenList <> '') then
+      WriteLn('[--upscale-tile has no effect without --upscale]')
+    else WriteLn('[--upscale-tile applies once /upscale sets an upscaler]');
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
@@ -2231,6 +2359,7 @@ begin
             OpenCLDevice, ']');
         Pipeline.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
           OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
+        IsOpenCLSelected := true;
         ComputeText := 'OpenCL requested on ' +
           OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
           OpenCLDevices.DeviceNames[OpenCLDevice];
@@ -2284,6 +2413,12 @@ begin
       if ArgProblem <> '' then
         raise Exception.Create('--image: ' + ArgProblem);
     end;
+    if UpscaleFile <> '' then
+    begin
+      ArgProblem := SetUpscaler(UpscaleFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--upscale: ' + ArgProblem);
+    end;
     // Refuses a checkpoint that cannot edit before anything loads.
     if IsEditing() then Pipeline.CheckEditSupport();
     WriteLn('Model      : ', ModelFolder);
@@ -2295,6 +2430,7 @@ begin
     end;
     WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
+    if Assigned(Upscaler) then WriteLn('Upscale    : ', UpscalerText());
     for LoRAPos := 0 to LoRAFiles.Count - 1 do
       WriteLn('LoRA       : ', LoRAFiles[LoRAPos], ' x ',
         FloatToStr(LoRAScales[LoRAPos], PointFormat()));
@@ -2327,6 +2463,7 @@ begin
   finally
     Reporter.EndStepLine();
     ClearConditionImages();
+    Upscaler.Free;
     ImageArgFiles.Free;
     LoRAFiles.Free;
     ConditionFiles.Free;

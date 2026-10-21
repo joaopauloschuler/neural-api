@@ -1140,6 +1140,8 @@ type
     procedure TestRRDBNetKeyPrefix;
     procedure TestRRDBNetTiledUpscale;
     procedure TestRRDBNetPixelUnshuffleX2;
+    procedure TestRRDBNetUpscalerMatchesRRDBNetUpscale;
+    procedure TestRRDBNetUpscalerOpenCL;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
     procedure TestNAFNetNonSquareInput;
@@ -45407,6 +45409,171 @@ begin
     WholeNet.Free;
   end;
 end;
+
+// TRRDBNetUpscaler on a tiled RGB image equals RRDBNetUpscale clamped to [0,1];
+// RGBA keeps that colour and resizes alpha bilinearly; Upscaled may be Image.
+procedure TTestNeuralPretrained.TestRRDBNetUpscalerMatchesRRDBNetUpscale;
+const
+  cImageW = 20;
+  cImageH = 14;
+  cTile = 8;
+  cTilePad = 4;
+  cTileOverlap = 2;
+var
+  Upscaler: TRRDBNetUpscaler;
+  TileConfig: TRRDBNetConfig;
+  NN: TNNet;
+  Rgb, Rgba, Alpha, Reference, AlphaReference, Upscaled: TNNetVolume;
+  PixelPos, Channel, MaxPixelPos: integer;
+  MaxDiff: TNeuralFloat;
+  HasRaised: boolean;
+begin
+  RandSeed := 424242;
+  Upscaler := TRRDBNetUpscaler.Create(FixturePath('tiny_rrdbnet.safetensors'),
+    FixturePath('tiny_rrdbnet_config.json'));
+  NN := nil;
+  Rgb := TNNetVolume.Create(cImageW, cImageH, 3);
+  Rgba := TNNetVolume.Create(cImageW, cImageH, 4);
+  Alpha := TNNetVolume.Create(cImageW, cImageH, 1);
+  Reference := nil;
+  AlphaReference := TNNetVolume.Create;
+  Upscaled := TNNetVolume.Create;
+  try
+    Upscaler.Tile := cTile;
+    Upscaler.TilePad := cTilePad;
+    Upscaler.TileOverlap := cTileOverlap;
+    MaxPixelPos := cImageW * cImageH - 1;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      for Channel := 0 to 2 do
+      begin
+        Rgb.FData[PixelPos * 3 + Channel] :=
+          0.5 + 0.6 * Sin((PixelPos * 3 + Channel) * 0.137);
+        Rgba.FData[PixelPos * 4 + Channel] := Rgb.FData[PixelPos * 3 + Channel];
+      end;
+      Alpha.FData[PixelPos] := 0.5 + 0.5 * Cos(PixelPos * 0.31);
+      Rgba.FData[PixelPos * 4 + 3] := Alpha.FData[PixelPos];
+    end;
+    TileConfig := Upscaler.TileConfigFor(cImageW, cImageH);
+    AssertEquals('tiled net input', cTile + 2 * cTilePad,
+      TileConfig.InputWidth);
+    NN := BuildRRDBNetFromSafeTensorsEx(FixturePath('tiny_rrdbnet.safetensors'),
+      TileConfig, {pTrainable=}false);
+    Reference := RRDBNetUpscale(NN, TileConfig, Rgb, cTilePad, cTileOverlap);
+    for PixelPos := 0 to Reference.Size - 1 do
+      Reference.FData[PixelPos] := EnsureRange(Reference.FData[PixelPos], 0, 1);
+    AssertTrue('the fixture output reaches past [0,1] so the clamp is tested',
+      (Reference.GetMin() = 0) or (Reference.GetMax() = 1));
+
+    Upscaler.Upscale(Rgb, Upscaled);
+    AssertEquals('RGB W', cImageW * 4, Upscaled.SizeX);
+    AssertEquals('RGB H', cImageH * 4, Upscaled.SizeY);
+    AssertEquals('RGB depth', 3, Upscaled.Depth);
+    MaxDiff := 0;
+    for PixelPos := 0 to Reference.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Upscaled.FData[PixelPos] -
+        Reference.FData[PixelPos]));
+    AssertTrue('RGB max|diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-6);
+
+    ResizeImagePIL(Alpha, AlphaReference, cImageW * 4, cImageH * 4,
+      irfBilinear);
+    // In place: Upscaled is the image itself.
+    Upscaler.Upscale(Rgba, Rgba);
+    AssertEquals('RGBA W', cImageW * 4, Rgba.SizeX);
+    AssertEquals('RGBA H', cImageH * 4, Rgba.SizeY);
+    AssertEquals('RGBA depth', 4, Rgba.Depth);
+    MaxDiff := 0;
+    MaxPixelPos := Rgba.SizeX * Rgba.SizeY - 1;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      for Channel := 0 to 2 do
+        MaxDiff := Max(MaxDiff, Abs(Rgba.FData[PixelPos * 4 + Channel] -
+          Reference.FData[PixelPos * 3 + Channel]));
+      MaxDiff := Max(MaxDiff, Abs(Rgba.FData[PixelPos * 4 + 3] -
+        AlphaReference.FData[PixelPos]));
+    end;
+    AssertTrue('RGBA max|diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-6);
+
+    HasRaised := false;
+    Alpha.ReSize(cImageW, cImageH, 2);
+    try
+      Upscaler.Upscale(Alpha, Upscaled);
+    except
+      on E: Exception do HasRaised := true;
+    end;
+    AssertTrue('a 2-channel image is refused', HasRaised);
+  finally
+    Upscaled.Free;
+    AlphaReference.Free;
+    Reference.Free;
+    Alpha.Free;
+    Rgba.Free;
+    Rgb.Free;
+    NN.Free;
+    Upscaler.Free;
+  end;
+end;
+
+// TRRDBNetUpscaler armed with EnableOpenCL runs there (OnOpenCL) and matches
+// the CPU upscale of the same tiled image.
+procedure TTestNeuralPretrained.TestRRDBNetUpscalerOpenCL;
+{$IFDEF OpenCL}
+const
+  cImageW = 20;
+  cImageH = 14;
+var
+  UpscalerCPU, UpscalerCL: TRRDBNetUpscaler;
+  Image, UpscaledCPU, UpscaledCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PixelPos: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  UpscalerCPU := TRRDBNetUpscaler.Create(
+    FixturePath('tiny_rrdbnet.safetensors'),
+    FixturePath('tiny_rrdbnet_config.json'));
+  UpscalerCL := TRRDBNetUpscaler.Create(
+    FixturePath('tiny_rrdbnet.safetensors'),
+    FixturePath('tiny_rrdbnet_config.json'));
+  Image := TNNetVolume.Create(cImageW, cImageH, 3);
+  UpscaledCPU := TNNetVolume.Create;
+  UpscaledCL := TNNetVolume.Create;
+  try
+    for PixelPos := 0 to Image.Size - 1 do
+      Image.FData[PixelPos] := 0.5 + 0.45 * Sin(PixelPos * 0.137);
+    UpscalerCPU.Tile := 8;
+    UpscalerCL.Tile := 8;
+    UpscalerCL.EnableOpenCL(PlatformId, DeviceId);
+    UpscalerCPU.Upscale(Image, UpscaledCPU);
+    UpscalerCL.Upscale(Image, UpscaledCL);
+    AssertFalse('CPU upscaler not on OpenCL', UpscalerCPU.OnOpenCL);
+    AssertTrue('armed upscaler on OpenCL', UpscalerCL.OnOpenCL);
+    AssertEquals('size', UpscaledCPU.Size, UpscaledCL.Size);
+    MaxDiff := 0;
+    for PixelPos := 0 to UpscaledCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(UpscaledCL.FData[PixelPos] -
+        UpscaledCPU.FData[PixelPos]));
+    AssertTrue('OpenCL vs CPU max|diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    UpscaledCL.Free;
+    UpscaledCPU.Free;
+    Image.Free;
+    UpscalerCL.Free;
+    UpscalerCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // basicsr RealESRGAN_x2plus layout built in Pascal: conv_first takes 3*2*2
 // pixel-unshuffled channels and both conv_up stages exist. Checks the inferred

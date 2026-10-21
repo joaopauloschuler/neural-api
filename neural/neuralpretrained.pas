@@ -12931,6 +12931,43 @@ function RRDBNetTileConfig(const Config: TRRDBNetConfig;
 function RRDBNetUpscale(NN: TNNet; const Config: TRRDBNetConfig;
   Image: TNNetVolume; TilePad, TileOverlap: integer): TNNetVolume;
 
+type
+  // An RRDBNet checkpoint as an upscaler of [0,1] images. Each Upscale builds the
+  // net (dead outputs share storage) for that image and frees it. Coded by Claude (AI).
+  TRRDBNetUpscaler = class(TObject)
+  private
+    FFileName: string;
+    FConfig: TRRDBNetConfig;
+    FTile, FTilePad, FTileOverlap: integer;
+    FOnOpenCL: boolean;
+    {$IFDEF OpenCL}
+    FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
+    FOpenCLPlatform: cl_platform_id;
+    FOpenCLDevice: cl_device_id;
+    {$ENDIF}
+  public
+    // Reads the config with LoadRRDBNetConfig; the weights load in each Upscale.
+    constructor Create(const FileName: string; const ConfigFileName: string = '');
+    // The net input Upscale builds for an ImageWidth x ImageHeight image.
+    function TileConfigFor(ImageWidth, ImageHeight: integer): TRRDBNetConfig;
+    // Image (W,H,NumInCh[+1 alpha, resized bilinearly]) in [0,1] -> Upscaled x
+    // Scale, clamped to [0,1]. Upscaled may be Image.
+    procedure Upscale(Image, Upscaled: TNNetVolume);
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true);
+    {$ENDIF}
+    property FileName: string read FFileName;
+    property Config: TRRDBNetConfig read FConfig;
+    // Tile edge in input pixels (0, the default: the whole image in one net),
+    // context pixels per tile side (10) and feathered seam pixels (8), as basicsr.
+    property Tile: integer read FTile write FTile;
+    property TilePad: integer read FTilePad write FTilePad;
+    property TileOverlap: integer read FTileOverlap write FTileOverlap;
+    // The last Upscale ran on OpenCL (EnableOpenCL was called and it armed).
+    property OnOpenCL: boolean read FOnOpenCL;
+  end;
+
 // ---------------------------------------------------------------------------
 // NAFNet IMAGE-RESTORATION IMPORT (model_type "nafnet") -- the repo's FIRST
 // non-diffusion image-to-image RESTORATION importer that is NOT super-resolution
@@ -77708,6 +77745,122 @@ begin
   finally
     Full.Free;
     Padded.Free;
+  end;
+end;
+
+constructor TRRDBNetUpscaler.Create(const FileName: string;
+  const ConfigFileName: string);
+begin
+  inherited Create();
+  FFileName := FileName;
+  FConfig := LoadRRDBNetConfig(FileName, ConfigFileName);
+  FTile := 0;
+  FTilePad := 10;
+  FTileOverlap := 8;
+  FOnOpenCL := false;
+end;
+
+function TRRDBNetUpscaler.TileConfigFor(ImageWidth,
+  ImageHeight: integer): TRRDBNetConfig;
+begin
+  Result := RRDBNetTileConfig(FConfig, ImageWidth, ImageHeight, FTile,
+    FTilePad);
+end;
+
+{$IFDEF OpenCL}
+procedure TRRDBNetUpscaler.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean);
+begin
+  FOpenCLRequested := true;
+  FOpenCLPlatform := pPlatform;
+  FOpenCLDevice := pDevice;
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+end;
+{$ENDIF}
+
+procedure TRRDBNetUpscaler.Upscale(Image, Upscaled: TNNetVolume);
+var
+  TileConfig: TRRDBNetConfig;
+  NN: TNNet;
+  Color, Alpha, AlphaUpscaled, NetOutput: TNNetVolume;
+  HasAlpha: boolean;
+  PixelPos, MaxPixelPos, ColorDepth, ImageDepth: integer;
+begin
+  ColorDepth := FConfig.NumInCh;
+  ImageDepth := Image.Depth;
+  HasAlpha := ImageDepth = ColorDepth + 1;
+  if (ImageDepth <> ColorDepth) and not HasAlpha then
+    ImportError(Format('RRDBNet upscale: the image has %d channels, the ' +
+      'model takes %d (or %d with alpha).', [ImageDepth, ColorDepth,
+      ColorDepth + 1]));
+  if HasAlpha and (FConfig.NumOutCh <> ColorDepth) then
+    ImportError('RRDBNet upscale: alpha needs num_out_ch = num_in_ch.');
+  TileConfig := TileConfigFor(Image.SizeX, Image.SizeY);
+  FOnOpenCL := false;
+  NN := nil;
+  Color := nil;
+  Alpha := nil;
+  AlphaUpscaled := nil;
+  NetOutput := nil;
+  try
+    MaxPixelPos := Image.SizeX * Image.SizeY - 1;
+    if HasAlpha then
+    begin
+      Color := TNNetVolume.Create(Image.SizeX, Image.SizeY, ColorDepth);
+      Alpha := TNNetVolume.Create(Image.SizeX, Image.SizeY, 1);
+      for PixelPos := 0 to MaxPixelPos do
+      begin
+        Move(Image.FData[PixelPos * ImageDepth],
+          Color.FData[PixelPos * ColorDepth], ColorDepth * csNeuralFloatSize);
+        Alpha.FData[PixelPos] := Image.FData[PixelPos * ImageDepth + ColorDepth];
+      end;
+    end;
+    NN := BuildRRDBNetFromSafeTensorsEx(FFileName, TileConfig,
+      {pTrainable=}false);
+    NN.ShareHostOutputsByLiveness := true;
+    {$IFDEF OpenCL}
+    if FOpenCLRequested then
+    begin
+      NN.ShareOpenCLOutputsByLiveness := FOpenCLHasSharedKernel;
+      NN.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice, FOpenCLHasSharedKernel);
+      FOnOpenCL := NN.OpenCLEnabled();
+    end;
+    {$ENDIF}
+    if HasAlpha then
+      NetOutput := RRDBNetUpscale(NN, TileConfig, Color, FTilePad, FTileOverlap)
+    else
+      NetOutput := RRDBNetUpscale(NN, TileConfig, Image, FTilePad,
+        FTileOverlap);
+    FreeAndNil(NN);
+    TNNetVolume.ReluL(Addr(NetOutput.FData[0]), Addr(NetOutput.FData[0]), 0, 1,
+      0, NetOutput.Size);
+    if HasAlpha then
+    begin
+      AlphaUpscaled := TNNetVolume.Create;
+      ResizeImagePIL(Alpha, AlphaUpscaled, NetOutput.SizeX, NetOutput.SizeY,
+        irfBilinear);
+      Upscaled.ReSize(NetOutput.SizeX, NetOutput.SizeY, ImageDepth);
+      MaxPixelPos := NetOutput.SizeX * NetOutput.SizeY - 1;
+      for PixelPos := 0 to MaxPixelPos do
+      begin
+        Move(NetOutput.FData[PixelPos * ColorDepth],
+          Upscaled.FData[PixelPos * ImageDepth], ColorDepth * csNeuralFloatSize);
+        Upscaled.FData[PixelPos * ImageDepth + ColorDepth] :=
+          AlphaUpscaled.FData[PixelPos];
+      end;
+    end
+    else
+    begin
+      // Copy keeps the destination's shape when only the sizes match.
+      Upscaled.ReSize(NetOutput);
+      Upscaled.Copy(NetOutput);
+    end;
+  finally
+    NetOutput.Free;
+    AlphaUpscaled.Free;
+    Alpha.Free;
+    Color.Free;
+    NN.Free;
   end;
 end;
 
