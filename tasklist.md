@@ -73,6 +73,14 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
+      (neural/neuralvolume.pas ~10283) calls `ReSize` only when `Size` differs,
+      so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
+      destination's 1024x1024 shape. `PasteInpaintCrop` (ecd33dfb) resizes its
+      destination first to avoid it. Options: compare SizeX/SizeY/Depth there
+      (cheap, but a hot call), or a separate `CopyWithShape`; audit callers that
+      rely on the current behaviour before changing it.
+
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
       (neural/neuralnetwork.pas ~13905) keeps the inherited FC weight delta
       (gradient w.r.t. w_eff) without the 1/sigma factor its conv sibling now
