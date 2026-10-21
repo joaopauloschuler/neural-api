@@ -156,6 +156,8 @@ follow:
 | `/upscale FILE` | upscale the next images with this Real-ESRGAN checkpoint, as `--upscale`; `/upscale` alone shows the current one, `/upscale off` stops upscaling |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
 | `/fbc X\|off` | First-Block Cache threshold for the next images, as `--fbc-threshold`; `/fbc` alone shows it, `/fbc off` (or `/fbc 0`) turns it off |
+| `/negative-prompt TEXT\|off` | negative prompt for the next prompts, as `--negative-prompt`; `/negative-prompt` alone shows the guidance setting, `/negative-prompt off` clears it |
+| `/guidance-scale W` | guidance scale for the next prompts, as `--guidance-scale` |
 | `/panorama WxH\|off` | panorama canvas for the next prompts, as `--panorama` (windows of `/size`, stride and wrap from the flags); `/panorama` alone shows it, `/panorama off` turns it off |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
@@ -195,8 +197,9 @@ In the REPL, `/image FILE` appends a condition image, `/images` lists them
 and `/images clear` removes them all. The images apply to every prompt that
 follows. An edit and an init image (`--init-image`, img2img) are exclusive.
 
-This is the diffusers `QwenImage21Pipeline` with `image=[...]` (no
-classifier-free guidance):
+This is the diffusers `QwenImage21Pipeline` with `image=[...]` (guidance
+only with `--negative-prompt`, see
+[Guidance](#guidance---negative-prompt-text---guidance-scale-w)):
 
 1. Each image is resized to its own aspect ratio at the area of `--width` x
    `--height` (default 1024x1024), sides multiples of 32 (diffusers'
@@ -566,6 +569,56 @@ without the option. The pipeline property is
 `TDiTFirstBlockCache` in `neural/neuralpretrained.pas`, written so other
 DiT pipelines can reuse it.
 
+### Guidance (`--negative-prompt TEXT --guidance-scale W`)
+
+Qwen-Image-2.1 is meant to run without classifier-free guidance, so it is
+off by default. `--negative-prompt TEXT` with `--guidance-scale W` greater
+than 1 turns it on, as diffusers' `QwenImage21Pipeline` does with
+`negative_prompt` and `true_cfg_scale` (an empty negative prompt also
+counts). Each step then runs the transformer twice on the same latents,
+once with the prompt and once with the negative prompt, and mixes the two
+velocities:
+
+    v = v_neg + W * (v_prompt - v_neg)
+
+This is the 2.1 pipeline's formula. The v1 `QwenImagePipeline` also
+rescales the mix to the norm of `v_prompt` per token; the 2.1 pipeline does
+not, and neither does this one.
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --guidance-scale 4 \
+  --negative-prompt "blurry, low quality, text" \
+  -p "a lighthouse on a cliff at dusk"
+```
+
+- **Prefix caches.** The text encoder encodes the negative prompt too (with
+  the same condition images when editing). The transformer keeps one prefix
+  K/V cache per prompt (`TQwenImage21Transformer.ActivePrefixCache`), so
+  the two passes do not overwrite each other; the block weights are shared.
+- **Cost.** Two transformer passes per step: the denoise takes about twice
+  as long. Memory grows by the negative prompt's prefix K/V and one
+  velocity buffer; the step activations are reused by both passes.
+- **APG.** `--apg ETA,MOMENTUM,THRESHOLD` replaces the CFG mix with
+  Adaptive Projected Guidance (`TNNetAdaptiveProjectedGuidance`, as in
+  `examples/LatentTextToImage`; paper setting e.g. `0,-0.5,15`). It mixes
+  the denoised predictions `x0 = x - sigma * v` of both passes, the
+  paper's space, and converts the result back to a velocity;
+  `--apg-velocity` mixes the raw velocities instead (what a diffusers guider
+  does). `THRESHOLD` is a norm over the whole latent, so its scale differs
+  from the Stable Diffusion values in the paper.
+- **Other modes.** img2img, inpainting and outpainting guide each step
+  before the sampler step and the mask blend, as diffusers' inpaint
+  pipeline does. A panorama guides each window's prediction before the
+  windows are averaged (diffusers' `StableDiffusionPanoramaPipeline` guides
+  each view the same way); for the plain CFG mix this equals guiding the
+  average, for APG each window keeps its own momentum. With
+  `--fbc-threshold`, each pass keeps its own First-Block Cache (diffusers'
+  `cache_context("cond")` / `"uncond"`), and the `--stats` row counts
+  skipped passes of both. `--sampler dpm2m` still takes one sampler step
+  per step, on the mixed velocity.
+
+The quality on the real checkpoint has not been checked yet.
+
 ### Panoramas and large canvases (`--panorama WxH`)
 
 `--panorama WxH` (or `/panorama WxH` in the REPL) generates a canvas larger
@@ -672,6 +725,10 @@ and `--fp32`, the last one given wins.
 | `--upscale FILE` | upscale each image with this Real-ESRGAN / ESRGAN RRDBNet checkpoint before the save; see [Upscaling](#upscaling---upscale-file) | off |
 | `--upscale-tile N` | upscaler tile in input pixels, 0 = the whole image; each tile adds 10 context pixels per side | 32 |
 | `--fbc-threshold X` | First-Block Cache: skip transformer blocks 1..N-1 on steps whose block-0 residual changed by at most X; see [First-Block Cache](#first-block-cache---fbc-threshold-x) | 0 (off) |
+| `--negative-prompt TEXT` | what the image should not show; used when `--guidance-scale` > 1; see [Guidance](#guidance---negative-prompt-text---guidance-scale-w) | none |
+| `--guidance-scale W` | classifier-free guidance scale: `v_neg + W * (v_prompt - v_neg)`, two transformer passes per step; 1 = off | 1 (off) |
+| `--apg ETA,MOMENTUM,THRESHOLD` | Adaptive Projected Guidance instead of the CFG mix, on the denoised x0 | off |
+| `--apg-velocity` | apply `--apg` to the raw velocities instead of x0 | off |
 | `--panorama WxH` | MultiDiffusion: a WxH canvas (rounded down to multiples of 32) denoised in overlapping `--width` x `--height` windows; see [Panoramas](#panoramas-and-large-canvases---panorama-wxh). Not with `--init-image` or `--image` | off |
 | `--panorama-stride N` | window step in pixels, a multiple of 16 no larger than a window side | half a window side |
 | `--panorama-wrap` | wrap the windows past the right edge to the left edge (360-degree panorama) | off |
@@ -844,7 +901,6 @@ under [VAE tiles](#vae-tiles).
 - An OpenCL error, such as a failed allocation, is printed but not detected.
   The pipeline cannot tell that a layer failed, so a REPL image can be wrong
   yet reported as written. Watch the log for OpenCL error lines.
-- The negative prompt (classifier-free guidance) is not implemented.
 - Editing is tested only against diffusers on the pico checkpoint; it has
   not run on the real checkpoint yet. The same holds for inpainting.
 - `--upscale` has run only with the repository's random pico RRDBNet
@@ -898,6 +954,14 @@ checks it on OpenCL against the CPU. `TestDiTFirstBlockCacheDecision` and
 plain-loop reference: threshold 0 gives the same latents bit for bit, and a
 threshold that skips some steps gives the reference's skip pattern and
 latents, on the CPU and on OpenCL. No diffusers oracle covers it yet.
+`TestQwenImage21GuidanceOffBitIdentical` checks that guidance off (scale 1,
+or no negative prompt) gives the plain loop's latents bit for bit;
+`TestQwenImage21GuidanceMix` that two prefix caches keep their prompts
+apart and that a guided step equals CFG (and APG on x0 and on the velocity)
+of two separate predictions, with a First-Block Cache and a one-window
+panorama changing nothing; `TestQwenImage21GuidanceEditPrefixCaches` the
+same caches with a condition image; `TestQwenImage21GuidanceOpenCL` a
+guided int8 denoise on OpenCL against the CPU.
 `TestQwenImage21PanoramaOneWindowParity` checks that a canvas of one window
 gives the plain denoise bit for bit and plans 3 (4 wrapped) windows on a
 wider canvas; `TestMultiDiffusionConstantSeams` and

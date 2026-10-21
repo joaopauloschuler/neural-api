@@ -1647,9 +1647,15 @@ rather than acted on.
           Side note: `FInputBufferBs` (READ_ONLY) is written by cai_im2col and
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
-  - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
-        `TNNetAdaptiveProjectedGuidance` (neuraldiffusion.pas, 15c5aca5) is
-        ready to use in place of plain CFG here.
+  - [X] B3. Optional guidance (negative prompt) with its own prefix cache.
+        `TQwenImage21Pipeline.GuidanceScale` / `SetNegativePromptEmbeds` /
+        `AdaptiveProjectedGuidance` (+ `ApgOnVelocity`), one prefix cache per
+        prompt (`TQwenImage21Transformer.ActivePrefixCache`); examples/QwenImage
+        `--negative-prompt`, `--guidance-scale`, `--apg`, `--apg-velocity`.
+    - [ ] Real-checkpoint quality check on the GPU box: same seed, scale 1
+          vs 4 with a negative prompt, CFG vs `--apg 0,-0.5,15` (x0 and
+          `--apg-velocity`); record the step time (two passes) and the images
+          in examples/QwenImage/README.md.
   Phase C — editing and reference images (plan from source reading of
   diffusers 0.41.0.dev0 `pipeline_qwenimage21.py` / `transformer_qwenimage21.py`
   / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`;
@@ -1951,9 +1957,9 @@ rather than acted on.
       `use_original_formulation` variant adds to cond instead).
       Done: `TNNetAdaptiveProjectedGuidance` in neural/neuraldiffusion.pas
       (15c5aca5) with tests, and `--apg` / `--apg-eps` in
-      examples/LatentTextToImage and examples/ConditionalDiffusion. Later
-      consumers: the open CFG items of the CogVideoX TextToVideo loop, the
-      Stable Diffusion pipeline and QwenImage B3.
+      examples/LatentTextToImage and examples/ConditionalDiffusion; QwenImage
+      B3 uses it (`--apg`). Later consumers: the open CFG items of the
+      CogVideoX TextToVideo loop and the Stable Diffusion pipeline.
       - [ ] A diffusers `normalized_guidance` oracle test; needs the user's
             approval for a new Python tool.
 

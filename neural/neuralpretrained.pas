@@ -9421,6 +9421,29 @@ type
   // Storage of the blocks' Linear weights; norms and the head nets stay FP32.
   TQwenImage21WeightFormat = (qiwFP32, qiwInt8, qiwInt4);
 
+  // One prompt's state for TQwenImage21Transformer: every block's post-RoPE
+  // prefix K/V, the prefix layout and the step tokens' RoPE positions.
+  TQwenImage21PrefixCache = class(TObject)
+  private
+    FKeys, FValues: array of TNNetVolume;
+    FTokenCount: integer;
+    FTextLengths, FGridHeights, FGridWidths: TNeuralIntegerArray;
+    // The step tokens' positions for a FStepGridH x FStepGridW target (0: none).
+    FStepPosF, FStepPosH, FStepPosW: TNeuralIntegerArray;
+    FStepGridH, FStepGridW: integer;
+    {$IFDEF OpenCL}
+    // Block i's K rows then V rows in OpenCL memory (nil before the upload).
+    FKVOnOpenCL: array of TNNetKVRowsOnOpenCL;
+    procedure ReleaseKVOnOpenCL();
+    {$ENDIF}
+  public
+    constructor Create(BlockCount: integer);
+    destructor Destroy(); override;
+    // Forgets the prefix and shrinks the K/V volumes (RAM and OpenCL).
+    procedure Release();
+    property TokenCount: integer read FTokenCount;
+  end;
+
   // Qwen-Image-2.1 transformer (diffusers QwenImage21Transformer2DModel) run
   // with ONE reusable prefix block and ONE reusable step block. BlockStore[i]
   // is a 1-token net that owns block i's weights; SelectBlockWeights re-links a
@@ -9445,12 +9468,18 @@ type
     FTimestepEmbeddingLayer, FModulationLayer, FNormOutScaleLayer: TNNetLayer;
     FTextInNet, FImageInNet, FOutputNet, FPrefixNet, FStepNet: TNNet;
     FPrefixBlock, FStepBlock: TQwenImage21BlockLayers;
-    // Block i's post-RoPE prefix keys and values, each (L,1,hidden).
-    FPrefixKeys, FPrefixValues: array of TNNetVolume;
-    FPrefixLength: integer;
-    // Layout of the last EncodePrefix (BuildQwenImage21RopePositions order).
-    FPrefixTextLengths, FPrefixGridHeights, FPrefixGridWidths:
+    // Every prefix cache ActivePrefixCache has selected, and the active one.
+    FPrefixCaches: array of TQwenImage21PrefixCache;
+    FPrefix: TQwenImage21PrefixCache;
+    FActivePrefixCache: integer;
+    // Layout FPrefixNet was built for (BuildQwenImage21RopePositions order).
+    FPrefixNetTokenCount: integer;
+    FPrefixNetTextLengths, FPrefixNetGridHeights, FPrefixNetGridWidths:
       TNeuralIntegerArray;
+    // Prefix rows StepNet's attention cache holds room for, and the cache
+    // whose step positions its RoPE layers hold (nil: none).
+    FStepPrefixCapacity: integer;
+    FStepRopeCache: TQwenImage21PrefixCache;
     // img_in over the condition images' latents, concatenated in
     // FConditionLatents; FPrefixInput interleaves its rows with txt_in's.
     FPrefixImageInNet: TNNet;
@@ -9471,11 +9500,8 @@ type
     // PrepareStepPass arms each rebuilt step pass (EnableStepPassOpenCL).
     FOpenCLEnabled: boolean;
     FOpenCLHasSharedKernel: boolean;
-    // Block i's prefix K rows then V rows in OpenCL memory, uploaded by the
-    // first step after EncodePrefix (nil before), and the uploads so far.
-    FPrefixKVOnOpenCL: array of TNNetKVRowsOnOpenCL;
+    // Prefix K/V uploads to OpenCL memory (LoadStepPrefix) so far.
     FPrefixKVUploadCount: integer;
-    procedure ReleasePrefixKVOnOpenCL();
     // Arms the image-in net, StepNet and the output net in BlockStore[0]'s
     // context, so one step chains them inside OpenCL memory.
     procedure EnableStepPassOpenCL();
@@ -9494,6 +9520,8 @@ type
     function GetBlockStoreLayers(BlockIdx: integer): TQwenImage21BlockLayers;
     function GetPrefixKeys(BlockIdx: integer): TNNetVolume;
     function GetPrefixValues(BlockIdx: integer): TNNetVolume;
+    function GetPrefixLength(): integer;
+    procedure SetActivePrefixCache(Value: integer);
     function GetTimestepEmbedding(): TNNetVolume;
     function GetModulation(): TNNetVolume;
     procedure SetLayerProfiling(Value: boolean);
@@ -9513,8 +9541,8 @@ type
       const LoRAFiles: array of string;
       const LoRAScales: array of TNeuralFloat); overload;
     destructor Destroy(); override;
-    // Runs txt_in and every block over the prompt with the t = 0 modulation
-    // and keeps each block's post-RoPE K and V (PrefixKeys, PrefixValues).
+    // Runs txt_in and every block over the prompt with the t = 0 modulation;
+    // the active prefix cache keeps each block's post-RoPE K and V.
     procedure EncodePrefix(TextHidden: TNNetVolume); overload;
     // With condition images: TextHidden = text rows only (TextLengths runs);
     // ImageLatents[k] = normalized (GridHeights[k]*GridWidths[k],1,in_channels).
@@ -9523,7 +9551,7 @@ type
       const ImageLatents: array of TNNetVolume;
       const GridHeights, GridWidths: array of integer); overload;
     // Velocity of the GridH x GridW image tokens at Timestep in [0, 1] (the
-    // pipeline's t / 1000), attending the prefix of the last EncodePrefix.
+    // pipeline's t / 1000), attending the active prefix cache.
     procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
       GridH, GridW: integer; Velocity: TNNetVolume); overload;
     // The same with Cache deciding instead of FirstBlockCache (MultiDiffusion
@@ -9543,7 +9571,8 @@ type
     // Runs the timestep net: TimestepEmbedding and Modulation (the raw
     // [scale1|gate1|scale2|gate2] row) then hold Timestep's values.
     procedure ComputeModulation(Timestep: TNeuralFloat);
-    // (Re)builds StepNet for a GridH x GridW image; needs EncodePrefix first.
+    // (Re)builds StepNet for a GridH x GridW image and loads the active
+    // cache's step positions; needs EncodePrefix first.
     procedure PrepareStepPass(GridH, GridW: integer);
     // Frees the prefix and step passes with their activations and the prefix
     // K/V (RAM and OpenCL); the block weights stay. Next: EncodePrefix.
@@ -9576,9 +9605,13 @@ type
     property PrefixKeys[BlockIdx: integer]: TNNetVolume read GetPrefixKeys;
     property PrefixValues[BlockIdx: integer]: TNNetVolume
       read GetPrefixValues;
-    // Text plus condition-image token count of the last EncodePrefix; 0
-    // before the first.
-    property PrefixLength: integer read FPrefixLength;
+    // Text plus condition-image token count of the active cache's last
+    // EncodePrefix; 0 before the first.
+    property PrefixLength: integer read GetPrefixLength;
+    // The prefix cache EncodePrefix fills and the step pass attends (default
+    // 0); each index keeps its own prompt. ReleasePasses frees all, selects 0.
+    property ActivePrefixCache: integer read FActivePrefixCache
+      write SetActivePrefixCache;
     property TimestepEmbedding: TNNetVolume read GetTimestepEmbedding;
     property Modulation: TNNetVolume read GetModulation;
     // Prefix and step blocks run the parallel layer scheduler with intra-layer
@@ -9889,8 +9922,10 @@ type
     // StepCount: the steps run (an init image skips the first ones).
     StepCount, VaeTileCount, VaeNetCount: integer;
     // Steps whose blocks 1..N-1 the First-Block Cache skipped (0 when off);
-    // under MultiDiffusion, window passes.
+    // counted per pass: per window (MultiDiffusion) and per guidance branch.
     SkippedStepCount: integer;
+    // The steps ran both prompts (GuidanceScale > 1 with a negative prompt).
+    UsedGuidance: boolean;
     // MultiDiffusion windows each step ran (0: one pass over the image).
     PanoramaWindowCount: integer;
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
@@ -9905,9 +9940,9 @@ type
   end;
 
   // Qwen-Image-2.1 text-to-image and editing with condition images (diffusers
-  // QwenImage21Pipeline, no guidance) over a model_index.json folder, and
-  // SDEdit img2img from an init image (the Qwen-Image v1 img2img schedule; 2.1
-  // ships no img2img pipeline). Each component (vision tower, text encoder,
+  // QwenImage21Pipeline, optional negative-prompt guidance) over a
+  // model_index.json folder, and SDEdit img2img from an init image (the
+  // Qwen-Image v1 img2img schedule; 2.1 ships no img2img pipeline). Each component (vision tower, text encoder,
   // VAE encoder, transformer, VAE decoder) is loaded when its stage starts and
   // freed when it ends, so peak memory is the largest component, not the sum.
   // After LoadComponents they stay loaded (the vision tower and the VAE
@@ -9942,6 +9977,20 @@ type
     FPanoramaWindows: TMultiDiffusionWindows;
     FPanoramaSigma: TNeuralFloat;
     FPanoramaCaches: array of TDiTFirstBlockCache;
+    // Guidance: the negative prompt's embeds and text runs (nil: none), the
+    // scale, and the APG settings (nil: plain CFG).
+    FNegativePromptEmbeds: TNNetVolume;
+    FNegativeTextLengths: TNeuralIntegerArray;
+    FGuidanceScale: TNeuralFloat;
+    FAdaptiveProjectedGuidance: TNNetAdaptiveProjectedGuidance;
+    FApgOnVelocity: boolean;
+    // The running Denoise's guidance: on or off, the negative prediction, and
+    // per window (one entry without MultiDiffusion) its First-Block Cache
+    // (nil: off) and its APG (nil: plain CFG).
+    FIsGuided: boolean;
+    FNegativeVelocity: TNNetVolume;
+    FNegativeCaches: array of TDiTFirstBlockCache;
+    FGuidanceApgs: array of TNNetAdaptiveProjectedGuidance;
     // The phase DoPhase started last (qppDone: none open), when, and the
     // process transfer totals then.
     FOpenPhase: TQwenImage21PipelinePhase;
@@ -10022,6 +10071,17 @@ type
     // TMultiDiffusionPredictEvent of Denoise's panorama windows.
     procedure PredictPanoramaWindow(WindowIdx: integer;
       WindowInput, WindowOutput: TNNetVolume);
+    // Velocity from the prompt's prefix cache; while guided, mixed with the
+    // negative prompt's prediction by window GuidanceIdx's APG or plain CFG.
+    procedure PredictGuidedVelocity(Transformer: TQwenImage21Transformer;
+      Latents: TNNetVolume; Sigma: TNeuralFloat; GridH, GridW: integer;
+      Velocity: TNNetVolume; Cache: TDiTFirstBlockCache;
+      GuidanceIdx: integer);
+    // Frees the running Denoise's guidance state.
+    procedure FreeGuidanceState();
+    procedure SetAdaptiveProjectedGuidance(
+      Value: TNNetAdaptiveProjectedGuidance);
+    function GetHasNegativePrompt(): boolean;
     // Plans FPanoramaWindows over a Width x Height image (nil when off).
     procedure PlanPanorama(Width, Height: integer);
     procedure SetTransformerFormat(Value: TQwenImage21WeightFormat);
@@ -10183,6 +10243,23 @@ type
     // suggests 0.05 to 0.2): higher skips more steps' blocks 1..N-1.
     property FirstBlockCacheThreshold: TNeuralFloat
       read FFirstBlockCacheThreshold write FFirstBlockCacheThreshold;
+    // Classifier-free guidance (diffusers QwenImage21Pipeline true_cfg_scale):
+    // on when GuidanceScale > 1 and a negative prompt is set; default 1 (off).
+    property GuidanceScale: TNeuralFloat read FGuidanceScale
+      write FGuidanceScale;
+    // The negative prompt's embeds (EncodeTokenIds; while editing
+    // EncodeEditTokenIds with the same images and its TextLengths); copied.
+    procedure SetNegativePromptEmbeds(Embeds: TNNetVolume;
+      const TextLengths: array of integer);
+    procedure ClearNegativePrompt();
+    property HasNegativePrompt: boolean read GetHasNegativePrompt;
+    // nil (default): plain CFG. Otherwise APG with these settings (one copy per
+    // panorama window) replaces it; the pipeline owns and frees the object.
+    property AdaptiveProjectedGuidance: TNNetAdaptiveProjectedGuidance
+      read FAdaptiveProjectedGuidance write SetAdaptiveProjectedGuidance;
+    // APG mixes the denoised x0 = x - sigma * v of both branches (default
+    // false, the paper's space) or, when true, the raw velocities.
+    property ApgOnVelocity: boolean read FApgOnVelocity write FApgOnVelocity;
     // MultiDiffusion: both > 0 run each Denoise step on overlapping windows
     // of this many pixels (multiples of 16, clamped to the image). 0 = off.
     property PanoramaWindowWidth: integer read FPanoramaWindowWidth
@@ -89186,6 +89263,15 @@ begin
     Inc(Result, GridHeights[RunCnt] * GridWidths[RunCnt]);
 end;
 
+// Dest := Source (Dest keeps its storage when the length is unchanged).
+procedure CopyToIntegerArray(const Source: array of integer;
+  var Dest: TNeuralIntegerArray);
+begin
+  SetLength(Dest, Length(Source));
+  if Length(Source) > 0 then
+    Move(Source[0], Dest[0], Length(Source) * csIntegerSize);
+end;
+
 procedure QwenImage21StepLayout(const PrefixTextLengths, PrefixGridHeights,
   PrefixGridWidths: array of integer; TargetH, TargetW: integer;
   out TextLengths, GridHeights, GridWidths: TNeuralIntegerArray);
@@ -89631,6 +89717,76 @@ const
   // diffusers QwenImage21TimestepProjEmbeddings: fixed, not in config.json.
   csQwenImage21TimestepDim = 256;
   csQwenImage21TimeFactor = 1000;
+
+{ TQwenImage21PrefixCache }
+
+constructor TQwenImage21PrefixCache.Create(BlockCount: integer);
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  inherited Create();
+  SetLength(FKeys, BlockCount);
+  SetLength(FValues, BlockCount);
+  {$IFDEF OpenCL} SetLength(FKVOnOpenCL, BlockCount); {$ENDIF}
+  MaxBlockPos := BlockCount - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FKeys[BlockCnt] := TNNetVolume.Create();
+    FValues[BlockCnt] := TNNetVolume.Create();
+    {$IFDEF OpenCL} FKVOnOpenCL[BlockCnt].Buffer := nil; {$ENDIF}
+  end;
+end;
+
+destructor TQwenImage21PrefixCache.Destroy();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  {$IFDEF OpenCL} ReleaseKVOnOpenCL(); {$ENDIF}
+  MaxBlockPos := Length(FKeys) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FKeys[BlockCnt].Free;
+    FValues[BlockCnt].Free;
+  end;
+  inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+procedure TQwenImage21PrefixCache.ReleaseKVOnOpenCL();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  MaxBlockPos := Length(FKVOnOpenCL) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    if Assigned(FKVOnOpenCL[BlockCnt].Buffer) then
+    begin
+      clReleaseMemObject(FKVOnOpenCL[BlockCnt].Buffer);
+      FKVOnOpenCL[BlockCnt].Buffer := nil;
+    end;
+end;
+{$ENDIF}
+
+procedure TQwenImage21PrefixCache.Release();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  {$IFDEF OpenCL} ReleaseKVOnOpenCL(); {$ENDIF}
+  FTokenCount := 0;
+  SetLength(FTextLengths, 0);
+  SetLength(FGridHeights, 0);
+  SetLength(FGridWidths, 0);
+  SetLength(FStepPosF, 0);
+  SetLength(FStepPosH, 0);
+  SetLength(FStepPosW, 0);
+  FStepGridH := 0;
+  FStepGridW := 0;
+  MaxBlockPos := Length(FKeys) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FKeys[BlockCnt].ReSize(1, 1, 1);
+    FValues[BlockCnt].ReSize(1, 1, 1);
+  end;
+end;
 
 { TDiTFirstBlockCache }
 
@@ -90892,14 +91048,9 @@ begin
     MaxBlockPos := FConfig.NumLayers - 1;
     SetLength(FBlockStore, FConfig.NumLayers);
     SetLength(FBlockStoreLayers, FConfig.NumLayers);
-    SetLength(FPrefixKeys, FConfig.NumLayers);
-    SetLength(FPrefixValues, FConfig.NumLayers);
-    {$IFDEF OpenCL} SetLength(FPrefixKVOnOpenCL, FConfig.NumLayers); {$ENDIF}
+    SetActivePrefixCache(0);
     for BlockCnt := 0 to MaxBlockPos do
     begin
-      FPrefixKeys[BlockCnt] := TNNetVolume.Create();
-      FPrefixValues[BlockCnt] := TNNetVolume.Create();
-      {$IFDEF OpenCL} FPrefixKVOnOpenCL[BlockCnt].Buffer := nil; {$ENDIF}
       BlockNet := TNNet.Create();
       FBlockStore[BlockCnt] := BlockNet;
       // Armed before the build: the loader streams rows straight into int8.
@@ -90937,7 +91088,9 @@ var
 begin
   FreeStepPass();
   FFirstBlockCache.Free;
-  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
+  MaxBlockPos := Length(FPrefixCaches) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    FPrefixCaches[BlockCnt].Free;
   FPrefixNet.Free;
   FTextInNet.Free;
   FPrefixImageInNet.Free;
@@ -90945,11 +91098,7 @@ begin
   FPrefixInput.Free;
   MaxBlockPos := Length(FBlockStore) - 1;
   for BlockCnt := 0 to MaxBlockPos do
-  begin
     FBlockStore[BlockCnt].Free;
-    FPrefixKeys[BlockCnt].Free;
-    FPrefixValues[BlockCnt].Free;
-  end;
   FOutputOwner.Free;
   FImageInOwner.Free;
   FTextInOwner.Free;
@@ -90965,30 +91114,53 @@ begin
   FreeAndNil(FOutputNet);
   FStepGridH := 0;
   FStepGridW := 0;
+  FStepPrefixCapacity := 0;
+  FStepRopeCache := nil;
 end;
 
 procedure TQwenImage21Transformer.ReleasePasses();
 var
-  BlockCnt, MaxBlockPos: integer;
+  CacheCnt, MaxCachePos: integer;
 begin
   FreeStepPass();
   FFirstBlockCache.ReleaseBuffers();
-  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FreeAndNil(FPrefixNet);
   FreeAndNil(FTextInNet);
   FreeAndNil(FPrefixImageInNet);
   FreeAndNil(FConditionLatents);
   FreeAndNil(FPrefixInput);
-  FPrefixLength := 0;
-  SetLength(FPrefixTextLengths, 0);
-  SetLength(FPrefixGridHeights, 0);
-  SetLength(FPrefixGridWidths, 0);
-  MaxBlockPos := Length(FPrefixKeys) - 1;
-  for BlockCnt := 0 to MaxBlockPos do
+  FPrefixNetTokenCount := 0;
+  SetLength(FPrefixNetTextLengths, 0);
+  SetLength(FPrefixNetGridHeights, 0);
+  SetLength(FPrefixNetGridWidths, 0);
+  MaxCachePos := Length(FPrefixCaches) - 1;
+  for CacheCnt := 0 to MaxCachePos do
+    FPrefixCaches[CacheCnt].Release();
+  SetActivePrefixCache(0);
+end;
+
+procedure TQwenImage21Transformer.SetActivePrefixCache(Value: integer);
+var
+  CacheCnt, OldCount: integer;
+begin
+  if Value < 0 then
+    raise Exception.Create('TQwenImage21Transformer.ActivePrefixCache: ' +
+      IntToStr(Value) + ' is negative.');
+  OldCount := Length(FPrefixCaches);
+  if Value >= OldCount then
   begin
-    FPrefixKeys[BlockCnt].ReSize(1, 1, 1);
-    FPrefixValues[BlockCnt].ReSize(1, 1, 1);
+    SetLength(FPrefixCaches, Value + 1);
+    for CacheCnt := OldCount to Value do
+      FPrefixCaches[CacheCnt] :=
+        TQwenImage21PrefixCache.Create(FConfig.NumLayers);
   end;
+  FActivePrefixCache := Value;
+  FPrefix := FPrefixCaches[Value];
+end;
+
+function TQwenImage21Transformer.GetPrefixLength(): integer;
+begin
+  Result := FPrefix.FTokenCount;
 end;
 
 // A layer with weights in OpenCL memory links only when they can follow by
@@ -91043,19 +91215,6 @@ begin
   FStepNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
   FOutputNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
 end;
-
-procedure TQwenImage21Transformer.ReleasePrefixKVOnOpenCL();
-var
-  BlockCnt, MaxBlockPos: integer;
-begin
-  MaxBlockPos := Length(FPrefixKVOnOpenCL) - 1;
-  for BlockCnt := 0 to MaxBlockPos do
-    if Assigned(FPrefixKVOnOpenCL[BlockCnt].Buffer) then
-    begin
-      clReleaseMemObject(FPrefixKVOnOpenCL[BlockCnt].Buffer);
-      FPrefixKVOnOpenCL[BlockCnt].Buffer := nil;
-    end;
-end;
 {$ENDIF}
 
 // An OpenCL-side append, not a second key source: the kernel reads one
@@ -91069,22 +91228,23 @@ begin
   {$IFDEF OpenCL}
   if Attn.WillOpenCL() then
   begin
-    if not Assigned(FPrefixKVOnOpenCL[BlockIdx].Buffer) then
+    if not Assigned(FPrefix.FKVOnOpenCL[BlockIdx].Buffer) then
     begin
-      FPrefixKVOnOpenCL[BlockIdx] := Attn.NewCacheRowsOnOpenCL(
-        FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
+      FPrefix.FKVOnOpenCL[BlockIdx] := Attn.NewCacheRowsOnOpenCL(
+        FPrefix.FKeys[BlockIdx], FPrefix.FValues[BlockIdx]);
       Inc(FPrefixKVUploadCount);
     end;
-    Attn.AppendCacheRowsFromOpenCL(FPrefixKVOnOpenCL[BlockIdx]);
+    Attn.AppendCacheRowsFromOpenCL(FPrefix.FKVOnOpenCL[BlockIdx]);
   end
   else
   {$ENDIF}
-    Attn.AppendCacheRowsFrom(FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
-  if Attn.CacheLength <> FPrefixLength then
+    Attn.AppendCacheRowsFrom(FPrefix.FKeys[BlockIdx],
+      FPrefix.FValues[BlockIdx]);
+  if Attn.CacheLength <> FPrefix.FTokenCount then
     raise Exception.Create('TQwenImage21Transformer.PredictVelocity: ' +
       'block ' + IntToStr(BlockIdx) + ' cached ' +
       IntToStr(Attn.CacheLength) + ' prefix rows, expected ' +
-      IntToStr(FPrefixLength) + '.');
+      IntToStr(FPrefix.FTokenCount) + '.');
 end;
 
 procedure TQwenImage21Transformer.ComputeModulation(Timestep: TNeuralFloat);
@@ -91122,15 +91282,17 @@ var
   var
     RunPos, GridPos: integer;
   begin
-    Result := (FPrefixLength > 0) and Assigned(FPrefixNet) and
-      (Length(FPrefixTextLengths) = MaxRunPos + 1) and
-      (Length(FPrefixGridHeights) = ImageCount);
+    Result := (FPrefixNetTokenCount > 0) and Assigned(FPrefixNet) and
+      (Length(FPrefixNetTextLengths) = MaxRunPos + 1) and
+      (Length(FPrefixNetGridHeights) = ImageCount);
     if not Result then exit;
     for RunPos := 0 to MaxRunPos do
-      if FPrefixTextLengths[RunPos] <> TextLengths[RunPos] then exit(false);
+      if FPrefixNetTextLengths[RunPos] <> TextLengths[RunPos] then
+        exit(false);
     for GridPos := 0 to MaxImagePos do
-      if (FPrefixGridHeights[GridPos] <> GridHeights[GridPos]) or
-         (FPrefixGridWidths[GridPos] <> GridWidths[GridPos]) then exit(false);
+      if (FPrefixNetGridHeights[GridPos] <> GridHeights[GridPos]) or
+         (FPrefixNetGridWidths[GridPos] <> GridWidths[GridPos]) then
+        exit(false);
   end;
 
   // Copies RowCount (1,1,hidden) rows from Source row SourceRow on.
@@ -91209,17 +91371,22 @@ begin
   end;
   HasImages := ImageCount > 0;
   TokenCount := TextCount + ConditionCount;
-  // The rows below replace every block's prefix K/V.
-  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
+  // The rows below replace the active cache's prefix: PrepareStepPass
+  // reloads its step positions and resizes StepNet's room for it.
+  {$IFDEF OpenCL} FPrefix.ReleaseKVOnOpenCL(); {$ENDIF}
+  FPrefix.FTokenCount := 0;
+  FPrefix.FStepGridH := 0;
+  FPrefix.FStepGridW := 0;
+  if FStepRopeCache = FPrefix then FStepRopeCache := nil;
+  CopyToIntegerArray(TextLengths, FPrefix.FTextLengths);
+  CopyToIntegerArray(GridHeights, FPrefix.FGridHeights);
+  CopyToIntegerArray(GridWidths, FPrefix.FGridWidths);
   if not SameLayout() then
   begin
-    // The step pass caches prefix + image rows and places the target after
-    // the prefix layout, so it is rebuilt too.
-    FreeStepPass();
     FreeAndNil(FPrefixNet);
     FreeAndNil(FTextInNet);
     FreeAndNil(FPrefixImageInNet);
-    FPrefixLength := 0;
+    FPrefixNetTokenCount := 0;
     FTextInNet := TNNet.Create();
     FTextInNet.BuildWeightOwner := FTextInOwner;
     AddQwenImage21TextProjection(FTextInNet,
@@ -91260,17 +91427,10 @@ begin
     BuildQwenImage21RopePositions(TextLengths, GridHeights, GridWidths,
       PosF, PosH, PosW);
     QwenImage21SetRopePositions(FPrefixNet, PosF, PosH, PosW);
-    SetLength(FPrefixTextLengths, MaxRunPos + 1);
-    for RunCnt := 0 to MaxRunPos do
-      FPrefixTextLengths[RunCnt] := TextLengths[RunCnt];
-    SetLength(FPrefixGridHeights, ImageCount);
-    SetLength(FPrefixGridWidths, ImageCount);
-    for ImagePos := 0 to MaxImagePos do
-    begin
-      FPrefixGridHeights[ImagePos] := GridHeights[ImagePos];
-      FPrefixGridWidths[ImagePos] := GridWidths[ImagePos];
-    end;
-    FPrefixLength := TokenCount;
+    CopyToIntegerArray(TextLengths, FPrefixNetTextLengths);
+    CopyToIntegerArray(GridHeights, FPrefixNetGridHeights);
+    CopyToIntegerArray(GridWidths, FPrefixNetGridWidths);
+    FPrefixNetTokenCount := TokenCount;
     SetLayerProfiling(FLayerProfiling);
   end;
   if FLayerProfiling then
@@ -91313,10 +91473,11 @@ begin
       else FPrefixNet.Compute(BlockInput, 0, FParallel, LastBlockEndIdx);
     FPrefixBlock.KRope.ForceOutputOnRAM();
     FPrefixBlock.VProj.ForceOutputOnRAM();
-    FPrefixKeys[BlockCnt].Copy(FPrefixBlock.KRope.Output);
-    FPrefixValues[BlockCnt].Copy(FPrefixBlock.VProj.Output);
+    FPrefix.FKeys[BlockCnt].Copy(FPrefixBlock.KRope.Output);
+    FPrefix.FValues[BlockCnt].Copy(FPrefixBlock.VProj.Output);
     BlockInput := FPrefixNet.GetLastLayer().Output;
   end;
+  FPrefix.FTokenCount := TokenCount;
   FProfilePrefixMs := (Now() - PrefixStart) * MSecsPerDay;
 end;
 
@@ -91324,52 +91485,68 @@ procedure TQwenImage21Transformer.PrepareStepPass(GridH, GridW: integer);
 var
   PosF, PosH, PosW: TNeuralIntegerArray;
   TextLengths, GridHeights, GridWidths: TNeuralIntegerArray;
-  TokenCount: integer;
+  TokenCount, PrefixCapacity, CacheCnt, MaxCachePos: integer;
 begin
-  if FPrefixLength = 0 then
+  if FPrefix.FTokenCount = 0 then
     raise Exception.Create('TQwenImage21Transformer: call EncodePrefix ' +
       'before the step pass.');
   if (GridH < 1) or (GridW < 1) then
     raise Exception.Create('TQwenImage21Transformer.PrepareStepPass: grid ' +
       IntToStr(GridH) + 'x' + IntToStr(GridW) + ' is empty.');
-  if Assigned(FStepNet) and (GridH = FStepGridH) and (GridW = FStepGridW) then
-    exit;
-  FreeStepPass();
   TokenCount := GridH * GridW;
-  FImageInNet := TNNet.Create();
-  FImageInNet.BuildWeightOwner := FImageInOwner;
-  BuildImageInNet(FImageInNet, TokenCount);
-  FImageInNet.BuildWeightOwner := nil;
-  // Block 0 copies img_in's output inside OpenCL memory when it is there.
-  FImageInNet.KeepLastOutputOnOpenCL := true;
-  FStepNet := TNNet.Create();
-  FStepNet.BuildWeightOwner := FBlockStore[0];
-  BuildBlockNet(FStepNet, TokenCount, qibStep, FPrefixLength, FStepBlock);
-  FStepNet.BuildWeightOwner := nil;
-  FStepNet.KeepLastOutputOnOpenCL := true;
-  if FInt8Input then FStepNet.EnableInt8Input();
-  PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
-  FOutputNet := TNNet.Create();
-  FOutputNet.BuildWeightOwner := FOutputOwner;
-  BuildOutputNet(FOutputNet, TokenCount);
-  FOutputNet.BuildWeightOwner := nil;
-  {$IFDEF OpenCL}
-  if FOpenCLEnabled then EnableStepPassOpenCL();
-  {$ENDIF}
-  // The step pass carries only the target tokens: the tail of the joint
-  // layout, so its frame position follows every prefix text run and image.
-  QwenImage21StepLayout(FPrefixTextLengths, FPrefixGridHeights,
-    FPrefixGridWidths, GridH, GridW, TextLengths, GridHeights, GridWidths);
-  BuildQwenImage21RopePositions(TextLengths, GridHeights, GridWidths,
-    PosF, PosH, PosW);
-  QwenImage21SetRopePositions(FStepNet,
-    Copy(PosF, FPrefixLength, TokenCount),
-    Copy(PosH, FPrefixLength, TokenCount),
-    Copy(PosW, FPrefixLength, TokenCount));
-  FStepGridH := GridH;
-  FStepGridW := GridW;
-  SetLayerProfiling(FLayerProfiling);
-  SetLength(FProfileStepMs, 0);
+  // Room for the longest encoded prefix, so switching caches keeps StepNet.
+  PrefixCapacity := 0;
+  MaxCachePos := Length(FPrefixCaches) - 1;
+  for CacheCnt := 0 to MaxCachePos do
+    PrefixCapacity := Max(PrefixCapacity, FPrefixCaches[CacheCnt].FTokenCount);
+  if not (Assigned(FStepNet) and (GridH = FStepGridH) and
+    (GridW = FStepGridW) and (PrefixCapacity = FStepPrefixCapacity)) then
+  begin
+    FreeStepPass();
+    FImageInNet := TNNet.Create();
+    FImageInNet.BuildWeightOwner := FImageInOwner;
+    BuildImageInNet(FImageInNet, TokenCount);
+    FImageInNet.BuildWeightOwner := nil;
+    // Block 0 copies img_in's output inside OpenCL memory when it is there.
+    FImageInNet.KeepLastOutputOnOpenCL := true;
+    FStepNet := TNNet.Create();
+    FStepNet.BuildWeightOwner := FBlockStore[0];
+    BuildBlockNet(FStepNet, TokenCount, qibStep, PrefixCapacity, FStepBlock);
+    FStepNet.BuildWeightOwner := nil;
+    FStepNet.KeepLastOutputOnOpenCL := true;
+    if FInt8Input then FStepNet.EnableInt8Input();
+    PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
+    FOutputNet := TNNet.Create();
+    FOutputNet.BuildWeightOwner := FOutputOwner;
+    BuildOutputNet(FOutputNet, TokenCount);
+    FOutputNet.BuildWeightOwner := nil;
+    {$IFDEF OpenCL}
+    if FOpenCLEnabled then EnableStepPassOpenCL();
+    {$ENDIF}
+    FStepGridH := GridH;
+    FStepGridW := GridW;
+    FStepPrefixCapacity := PrefixCapacity;
+    SetLayerProfiling(FLayerProfiling);
+    SetLength(FProfileStepMs, 0);
+  end;
+  if FStepRopeCache = FPrefix then exit;
+  if (FPrefix.FStepGridH <> GridH) or (FPrefix.FStepGridW <> GridW) then
+  begin
+    // The step pass carries only the target tokens: the tail of the joint
+    // layout, so its frame position follows every prefix text run and image.
+    QwenImage21StepLayout(FPrefix.FTextLengths, FPrefix.FGridHeights,
+      FPrefix.FGridWidths, GridH, GridW, TextLengths, GridHeights, GridWidths);
+    BuildQwenImage21RopePositions(TextLengths, GridHeights, GridWidths,
+      PosF, PosH, PosW);
+    FPrefix.FStepPosF := Copy(PosF, FPrefix.FTokenCount, TokenCount);
+    FPrefix.FStepPosH := Copy(PosH, FPrefix.FTokenCount, TokenCount);
+    FPrefix.FStepPosW := Copy(PosW, FPrefix.FTokenCount, TokenCount);
+    FPrefix.FStepGridH := GridH;
+    FPrefix.FStepGridW := GridW;
+  end;
+  QwenImage21SetRopePositions(FStepNet, FPrefix.FStepPosF, FPrefix.FStepPosH,
+    FPrefix.FStepPosW);
+  FStepRopeCache := FPrefix;
 end;
 
 procedure TQwenImage21Transformer.BeginVelocityStep(Latents: TNNetVolume;
@@ -91491,13 +91668,13 @@ end;
 
 function TQwenImage21Transformer.GetPrefixKeys(BlockIdx: integer): TNNetVolume;
 begin
-  Result := FPrefixKeys[BlockIdx];
+  Result := FPrefix.FKeys[BlockIdx];
 end;
 
 function TQwenImage21Transformer.GetPrefixValues(
   BlockIdx: integer): TNNetVolume;
 begin
-  Result := FPrefixValues[BlockIdx];
+  Result := FPrefix.FValues[BlockIdx];
 end;
 
 function TQwenImage21Transformer.GetTimestepEmbedding(): TNNetVolume;
@@ -91514,7 +91691,7 @@ function TQwenImage21Transformer.OpenCLBufferBytes(): int64;
 {$IFDEF OpenCL}
 var
   Nets: array[0..5] of TNNet;
-  NetPos, BlockCnt, MaxBlockPos: integer;
+  NetPos, BlockCnt, MaxBlockPos, CachePos, MaxCachePos: integer;
 {$ENDIF}
 begin
   Result := 0;
@@ -91532,9 +91709,14 @@ begin
   MaxBlockPos := Length(FBlockStore) - 1;
   for BlockCnt := 0 to MaxBlockPos do
     Inc(Result, FBlockStore[BlockCnt].OpenCLBufferBytes());
-  MaxBlockPos := Length(FPrefixKVOnOpenCL) - 1;
-  for BlockCnt := 0 to MaxBlockPos do
-    Inc(Result, OpenCLMemBytes(FPrefixKVOnOpenCL[BlockCnt].Buffer));
+  MaxCachePos := Length(FPrefixCaches) - 1;
+  for CachePos := 0 to MaxCachePos do
+  begin
+    MaxBlockPos := Length(FPrefixCaches[CachePos].FKVOnOpenCL) - 1;
+    for BlockCnt := 0 to MaxBlockPos do
+      Inc(Result, OpenCLMemBytes(
+        FPrefixCaches[CachePos].FKVOnOpenCL[BlockCnt].Buffer));
+  end;
   {$ENDIF}
 end;
 
@@ -91643,7 +91825,7 @@ begin
     if Assigned(FPrefixNet) then
     begin
       Lines.Add(Format('[profile] transformer prefix pass: %d text tokens, ' +
-        'wall %.1f ms (txt_in net %.1f ms)', [FPrefixLength, FProfilePrefixMs,
+        'wall %.1f ms (txt_in net %.1f ms)', [FPrefixNetTokenCount, FProfilePrefixMs,
         FTextInNet.NNetForwardTime * MSecsPerDay]));
       Lines.Add('[profile] PrefixNet by block role, summed over blocks:');
       Lines.Add(TNNet.LayerGroupTimingReport(FPrefixNet,
@@ -91895,6 +92077,7 @@ begin
   FParallel := true;
   FMaxThreads := 0;
   FOpenPhase := qppDone;
+  FGuidanceScale := 1;
 end;
 
 destructor TQwenImage21Pipeline.Destroy();
@@ -91903,7 +92086,45 @@ begin
   ClearConditionImages();
   FScheduler.Free;
   FPanoramaWindows.Free;
+  FNegativePromptEmbeds.Free;
+  FAdaptiveProjectedGuidance.Free;
   inherited Destroy();
+end;
+
+procedure TQwenImage21Pipeline.SetNegativePromptEmbeds(Embeds: TNNetVolume;
+  const TextLengths: array of integer);
+begin
+  if not Assigned(Embeds) then
+  begin
+    ClearNegativePrompt();
+    exit;
+  end;
+  if not Assigned(FNegativePromptEmbeds) then
+    FNegativePromptEmbeds := TNNetVolume.Create();
+  FNegativePromptEmbeds.Copy(Embeds);
+  // One text run is the text-to-image layout, which DenoiseAt passes as [].
+  if Length(TextLengths) > 1 then
+    CopyToIntegerArray(TextLengths, FNegativeTextLengths)
+  else SetLength(FNegativeTextLengths, 0);
+end;
+
+procedure TQwenImage21Pipeline.ClearNegativePrompt();
+begin
+  FreeAndNil(FNegativePromptEmbeds);
+  SetLength(FNegativeTextLengths, 0);
+end;
+
+function TQwenImage21Pipeline.GetHasNegativePrompt(): boolean;
+begin
+  Result := Assigned(FNegativePromptEmbeds);
+end;
+
+procedure TQwenImage21Pipeline.SetAdaptiveProjectedGuidance(
+  Value: TNNetAdaptiveProjectedGuidance);
+begin
+  if Value = FAdaptiveProjectedGuidance then exit;
+  FAdaptiveProjectedGuidance.Free;
+  FAdaptiveProjectedGuidance := Value;
 end;
 
 function TQwenImage21Pipeline.GetComponentsLoaded(): boolean;
@@ -92286,6 +92507,10 @@ begin
   EncodeEditTokenIds(TokenIds, DropCount, PromptEmbeds, TextLengths);
 end;
 
+const
+  // TQwenImage21Transformer.ActivePrefixCache of the negative prompt.
+  csQwenImage21NegativePrefixCache = 1;
+
 procedure TQwenImage21Pipeline.MakeInitialLatents(Width, Height: integer;
   Seed: cardinal; Latents: TNNetVolume);
 var
@@ -92317,10 +92542,25 @@ var
   Transformer: TQwenImage21Transformer;
   Velocity, Noise, Known: TNNetVolume;
   GridH, GridW, StepPos, MaxStepPos, RunStepCount, WindowPos, MaxWindowPos,
-    ShiftSeqLen: integer;
+    ShiftSeqLen, GuidanceCount: integer;
   IsInpaint: boolean;
+
+  procedure EncodeBranchPrefix(Embeds: TNNetVolume;
+    const BranchTextLengths: array of integer);
+  begin
+    if Length(BranchTextLengths) = 0 then Transformer.EncodePrefix(Embeds)
+    else Transformer.EncodePrefix(Embeds, BranchTextLengths,
+      FConditionLatents, FConditionGridHeights, FConditionGridWidths);
+  end;
+
 begin
   CheckImageSize(Width, Height);
+  FIsGuided := (FGuidanceScale > 1) and Assigned(FNegativePromptEmbeds);
+  if FIsGuided and (Length(FNegativeTextLengths) <> Length(TextLengths)) then
+    ImportError('TQwenImage21Pipeline.Denoise: the negative prompt has ' +
+      IntToStr(Length(FNegativeTextLengths)) + ' text runs and the prompt ' +
+      IntToStr(Length(TextLengths)) + ' (encode both with the same ' +
+      'condition images, or both without).');
   if (StartStep < 0) or (StartStep >= StepCount) then
     ImportError('TQwenImage21Pipeline.Denoise: start step ' +
       IntToStr(StartStep) + ' is outside 0..' + IntToStr(StepCount - 1) + '.');
@@ -92400,10 +92640,38 @@ begin
             TDiTFirstBlockCache.Create(FFirstBlockCacheThreshold);
       end;
     end;
+    if FIsGuided then
+    begin
+      // The negative branch needs its own First-Block Cache decisions and
+      // APG momentum, per window as diffusers' MultiDiffusion guides views.
+      GuidanceCount := 1;
+      if Assigned(FPanoramaWindows) then
+        GuidanceCount := FPanoramaWindows.WindowCount;
+      FNegativeVelocity := TNNetVolume.Create();
+      SetLength(FNegativeCaches, GuidanceCount);
+      SetLength(FGuidanceApgs, GuidanceCount);
+      MaxWindowPos := GuidanceCount - 1;
+      for WindowPos := 0 to MaxWindowPos do
+      begin
+        if FFirstBlockCacheThreshold > 0 then
+          FNegativeCaches[WindowPos] :=
+            TDiTFirstBlockCache.Create(FFirstBlockCacheThreshold);
+        if Assigned(FAdaptiveProjectedGuidance) then
+          FGuidanceApgs[WindowPos] := TNNetAdaptiveProjectedGuidance.Create(
+            FAdaptiveProjectedGuidance.Eta,
+            FAdaptiveProjectedGuidance.Momentum,
+            FAdaptiveProjectedGuidance.NormThreshold,
+            FAdaptiveProjectedGuidance.UseOriginalFormulation);
+      end;
+    end;
     DoPhase(qppEncodePrefix);
-    if Length(TextLengths) = 0 then Transformer.EncodePrefix(PromptEmbeds)
-    else Transformer.EncodePrefix(PromptEmbeds, TextLengths,
-      FConditionLatents, FConditionGridHeights, FConditionGridWidths);
+    if FIsGuided then
+    begin
+      Transformer.ActivePrefixCache := csQwenImage21NegativePrefixCache;
+      EncodeBranchPrefix(FNegativePromptEmbeds, FNegativeTextLengths);
+      Transformer.ActivePrefixCache := 0;
+    end;
+    EncodeBranchPrefix(PromptEmbeds, TextLengths);
     DoPhase(qppDenoise);
     MaxStepPos := StepCount - 1;
     for StepPos := StartStep to MaxStepPos do
@@ -92415,8 +92683,9 @@ begin
         FPanoramaWindows.PredictCanvas(Latents, Velocity,
           @PredictPanoramaWindow);
       end
-      else Transformer.PredictVelocity(Latents, FScheduler.Sigma[StepPos],
-        GridH, GridW, Velocity);
+      else PredictGuidedVelocity(Transformer, Latents,
+        FScheduler.Sigma[StepPos], GridH, GridW, Velocity,
+        Transformer.FirstBlockCache, 0);
       FScheduler.Step(Latents, Velocity, StepPos);
       if IsInpaint then
       begin
@@ -92446,6 +92715,12 @@ begin
         Inc(FImageStats.SkippedStepCount,
           FPanoramaCaches[WindowPos].SkippedStepCount);
     end;
+    MaxWindowPos := Length(FNegativeCaches) - 1;
+    for WindowPos := 0 to MaxWindowPos do
+      if Assigned(FNegativeCaches[WindowPos]) then
+        Inc(FImageStats.SkippedStepCount,
+          FNegativeCaches[WindowPos].SkippedStepCount);
+    FImageStats.UsedGuidance := FIsGuided;
     FImageStats.TransformerOnOpenCL := FTransformerOnOpenCL;
     FImageStats.TransformerOpenCLBytes := Transformer.OpenCLBufferBytes();
     if FLayerProfiling then
@@ -92462,7 +92737,55 @@ begin
     FPanoramaCaches := nil;
     FreeAndNil(FPanoramaWindows);
     FPanoramaTransformer := nil;
+    FreeGuidanceState();
     EndPhase();
+  end;
+end;
+
+procedure TQwenImage21Pipeline.FreeGuidanceState();
+var
+  GuidancePos, MaxGuidancePos: integer;
+begin
+  MaxGuidancePos := Length(FNegativeCaches) - 1;
+  for GuidancePos := 0 to MaxGuidancePos do
+    FNegativeCaches[GuidancePos].Free;
+  MaxGuidancePos := Length(FGuidanceApgs) - 1;
+  for GuidancePos := 0 to MaxGuidancePos do
+    FGuidanceApgs[GuidancePos].Free;
+  FNegativeCaches := nil;
+  FGuidanceApgs := nil;
+  FreeAndNil(FNegativeVelocity);
+  FIsGuided := false;
+end;
+
+procedure TQwenImage21Pipeline.PredictGuidedVelocity(
+  Transformer: TQwenImage21Transformer; Latents: TNNetVolume;
+  Sigma: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume;
+  Cache: TDiTFirstBlockCache; GuidanceIdx: integer);
+var
+  Apg: TNNetAdaptiveProjectedGuidance;
+begin
+  Transformer.PredictVelocity(Latents, Sigma, GridH, GridW, Velocity, Cache);
+  if not FIsGuided then exit;
+  Transformer.ActivePrefixCache := csQwenImage21NegativePrefixCache;
+  Transformer.PredictVelocity(Latents, Sigma, GridH, GridW, FNegativeVelocity,
+    FNegativeCaches[GuidanceIdx]);
+  Transformer.ActivePrefixCache := 0;
+  Apg := FGuidanceApgs[GuidanceIdx];
+  // diffusers QwenImage21Pipeline: uncond + scale * (cond - uncond), no
+  // norm rescale (the v1 QwenImagePipeline's).
+  if not Assigned(Apg) then
+    TNNetDiffusionScheduler.ApplyCFG(Velocity, FNegativeVelocity, Velocity,
+      FGuidanceScale)
+  else if FApgOnVelocity or (Sigma <= 0) then
+    Apg.ApplyAPG(Velocity, FNegativeVelocity, Velocity, FGuidanceScale)
+  else
+  begin
+    // x0 = x - sigma * v of both branches, APG, then v = (x - x0) / sigma.
+    Velocity.MulMulAdd(-Sigma, 1, Latents);
+    FNegativeVelocity.MulMulAdd(-Sigma, 1, Latents);
+    Apg.ApplyAPG(Velocity, FNegativeVelocity, Velocity, FGuidanceScale);
+    Velocity.MulMulAdd(-1 / Sigma, 1 / Sigma, Latents);
   end;
 end;
 
@@ -92518,9 +92841,9 @@ var
 begin
   Cache := nil;
   if Length(FPanoramaCaches) > 0 then Cache := FPanoramaCaches[WindowIdx];
-  FPanoramaTransformer.PredictVelocity(WindowInput, FPanoramaSigma,
+  PredictGuidedVelocity(FPanoramaTransformer, WindowInput, FPanoramaSigma,
     FPanoramaWindows.WindowHeight, FPanoramaWindows.WindowWidth,
-    WindowOutput, Cache);
+    WindowOutput, Cache, WindowIdx);
 end;
 
 function TQwenImage21Pipeline.AcquireVaeEncoder(): TQwenImage21VaeEncoder;

@@ -26,8 +26,8 @@ grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
 /padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
-/upscale FILE|off, /fbc X|off, /panorama WxH|off, /profile on|off,
-/stats on|off, /quit.
+/upscale FILE|off, /fbc X|off, /panorama WxH|off, /negative-prompt
+TEXT|off, /guidance-scale W, /profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -81,6 +81,13 @@ The upscaler net is built after the VAE decode, for each image, and freed after
 it; it runs tile by tile (--upscale-tile, default 32 pixels plus 10 of context
 per side) on the --gpu device. Alpha is resized bilinearly.
 
+Guidance (--negative-prompt TEXT --guidance-scale W > 1): each step runs the
+transformer twice, on the prompt's and on the negative prompt's prefix
+cache, and mixes the velocities as uncond + W * (cond - uncond) (diffusers
+QwenImage21Pipeline true_cfg_scale; Qwen-Image-2.1 is meant to run without).
+--apg ETA,MOMENTUM,THRESHOLD mixes them with Adaptive Projected Guidance on
+the denoised x0 instead; --apg-velocity applies it to the raw velocities.
+
 First-Block Cache (--fbc-threshold X or /fbc X): each step runs transformer
 block 0 and compares its residual with the one of the last fully computed
 step; when the relative change is at most X it skips the other blocks and
@@ -108,6 +115,8 @@ USAGE
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
             [--fbc-threshold X]
+            [--negative-prompt TEXT --guidance-scale W
+             [--apg ETA,MOMENTUM,THRESHOLD [--apg-velocity]]]
             [--panorama WxH [--panorama-stride N] [--panorama-wrap]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
@@ -586,6 +595,18 @@ begin
     'those blocks. 0 = off (DEFAULT);');
   WriteLn('                       0.05..0.2 trade detail for speed (see ',
     'README.md)');
+  WriteLn('  --negative-prompt TEXT  what the image should not show; used ',
+    'when --guidance-scale > 1');
+  WriteLn('  --guidance-scale W   classifier-free guidance: uncond + W * ',
+    '(cond - uncond), two transformer');
+  WriteLn('                       passes per step. 1 = off (DEFAULT; ',
+    'Qwen-Image-2.1 is meant to run without)');
+  WriteLn('  --apg ETA,MOMENTUM,THRESHOLD  Adaptive Projected Guidance ',
+    'instead of the CFG mix (paper');
+  WriteLn('                       setting e.g. 0,-0.5,15), on the denoised ',
+    'x0 = x - sigma * v');
+  WriteLn('  --apg-velocity       apply --apg to the raw velocities instead ',
+    'of x0');
   WriteLn('  --panorama WxH       MultiDiffusion: a WxH canvas (multiples of ',
     '32) denoised in overlapping');
   WriteLn('                       --width x --height windows whose velocities ',
@@ -692,6 +713,8 @@ begin
     'images, as --fbc-threshold');
   WriteLn('  /panorama WxH|off    --panorama canvas for the next prompts ',
     '(stride and wrap from the flags)');
+  WriteLn('  /negative-prompt TEXT|off  --negative-prompt for the next prompts');
+  WriteLn('  /guidance-scale W    --guidance-scale for the next prompts');
   WriteLn('  /profile on|off      --profile for the next images');
   WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
@@ -788,6 +811,16 @@ begin
   else if not TryStrToFloat(Trim(Text), Threshold, PointFormat()) or
     not (Threshold >= 0) then
     Result := '"' + Text + '" is not a number >= 0 or off.';
+end;
+
+// Parses a guidance scale >= 0 (a '.' decimal point); returns '' or what is
+// wrong.
+function ParseGuidanceScale(const Text: string; out Scale: double): string;
+begin
+  Result := '';
+  if not TryStrToFloat(Trim(Text), Scale, PointFormat()) or
+    not (Scale >= 0) then
+    Result := '"' + Text + '" is not a number >= 0.';
 end;
 
 function FbcThresholdText(Threshold: double): string;
@@ -970,6 +1003,12 @@ var
   // --sampler: the flow-matching update rule of every Denoise.
   Sampler: TNNetFlowSampler;
   SamplerName: string;
+  // --negative-prompt (HasNegativePrompt: given, even empty), --guidance-scale,
+  // --apg (ApgSpec '': plain CFG) and --apg-velocity.
+  NegativePrompt, ApgSpec: string;
+  HasNegativePrompt, ApgOnVelocity: boolean;
+  GuidanceScale: double;
+  NegativeEmbeds: TNNetVolume;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -1022,6 +1061,30 @@ var
   function IsEditing(): boolean;
   begin
     Result := Length(ConditionImages) > 0;
+  end;
+
+  // Both prompts run each step (diffusers: a scale > 1 and a negative prompt).
+  function IsGuided(): boolean;
+  begin
+    Result := (GuidanceScale > 1) and HasNegativePrompt;
+  end;
+
+  function GuidanceText(): string;
+  begin
+    if not IsGuided() then
+    begin
+      Result := 'off';
+      if HasNegativePrompt then
+        Result := Result + ' (the negative prompt needs --guidance-scale > 1)'
+      else if GuidanceScale > 1 then
+        Result := Result + ' (--guidance-scale needs --negative-prompt)';
+      exit;
+    end;
+    Result := 'scale ' + FloatToStr(GuidanceScale, PointFormat()) +
+      ', negative prompt "' + ShortPrompt(NegativePrompt, 40) + '", ';
+    if ApgSpec = '' then Result := Result + 'CFG'
+    else Result := Result + 'APG ' + ApgSpec + ' on ' +
+      BoolToStr(ApgOnVelocity, 'velocity', 'x0');
   end;
 
   // A panorama canvas is set and no init or condition image overrides it.
@@ -1432,6 +1495,35 @@ var
     InputImageEncodeNumber := ImageNumber + 1;
   end;
 
+  // The negative prompt's embeds (same template and condition images as the
+  // prompt) while guidance is on; cleared otherwise.
+  procedure EncodeNegativePrompt();
+  var
+    NegativeIds, NegativeTextLengths: TNeuralIntegerArray;
+    NegativeDropCount: integer;
+  begin
+    if not IsGuided() then
+    begin
+      Pipeline.ClearNegativePrompt();
+      exit;
+    end;
+    NegativeTextLengths := nil;
+    if IsEditing() then
+    begin
+      NegativeIds := Pipeline.TokenizeEditPrompt(NegativePrompt,
+        Length(ConditionImages), NegativeDropCount);
+      Pipeline.EncodeEditTokenIds(NegativeIds, NegativeDropCount,
+        NegativeEmbeds, NegativeTextLengths);
+    end
+    else
+    begin
+      NegativeIds := Pipeline.TokenizePrompt(NegativePrompt,
+        NegativeDropCount);
+      Pipeline.EncodeTokenIds(NegativeIds, NegativeDropCount, NegativeEmbeds);
+    end;
+    Pipeline.SetNegativePromptEmbeds(NegativeEmbeds, NegativeTextLengths);
+  end;
+
   // Encodes the input images when needed (condition images or the init
   // image), then TokenIds into PromptEmbeds; ends the encode phase line.
   procedure EncodePrompt();
@@ -1439,6 +1531,8 @@ var
     IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     PrepareConditionImages();
     PrepareInitLatents();
+    // First, so the stage table's encode times are the prompt's.
+    EncodeNegativePrompt();
     if IsEditing() then
       Pipeline.EncodeEditTokenIds(TokenIds, DropCount, PromptEmbeds,
         TextLengths)
@@ -1777,7 +1871,8 @@ var
   end;
 
   // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image, /mask,
-  // /mask-blur, /outpaint, /strength, /upscale, /fbc, /profile, /stats, /quit;
+  // /mask-blur, /outpaint, /strength, /upscale, /fbc, /panorama,
+  // /negative-prompt, /guidance-scale, /profile, /stats, /quit;
   // false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
@@ -1785,7 +1880,7 @@ var
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
-    NewStrength, NewMaskBlurRadius, NewFbcThreshold: double;
+    NewStrength, NewMaskBlurRadius, NewFbcThreshold, NewGuidanceScale: double;
     NewPaddingMaskCrop: integer;
     NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
@@ -2157,6 +2252,30 @@ var
         end;
       end;
     end
+    else if Command = 'negative-prompt' then
+    begin
+      if Argument = '' then
+        WriteLn('[guidance ', GuidanceText(), '; /negative-prompt TEXT|off ',
+          'changes it]')
+      else
+      begin
+        HasNegativePrompt := LowerCase(Argument) <> 'off';
+        if HasNegativePrompt then NegativePrompt := Argument
+        else NegativePrompt := '';
+        WriteLn('[guidance ', GuidanceText(), ' from the next prompt]');
+      end;
+    end
+    else if Command = 'guidance-scale' then
+    begin
+      Problem := ParseGuidanceScale(Argument, NewGuidanceScale);
+      if Problem <> '' then WriteLn('[/guidance-scale: ', Problem, ']')
+      else
+      begin
+        GuidanceScale := NewGuidanceScale;
+        Pipeline.GuidanceScale := GuidanceScale;
+        WriteLn('[guidance ', GuidanceText(), ' from the next prompt]');
+      end;
+    end
     else if Command = 'profile' then
     begin
       if ParseOnOff(Command, Argument, IsOn) then
@@ -2175,8 +2294,8 @@ var
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
       '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
-      '/outpaint, /strength, /upscale, /fbc, ',
-      '/profile, /stats, /quit]');
+      '/outpaint, /strength, /upscale, /fbc, /panorama, /negative-prompt, ',
+      '/guidance-scale, /profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -2191,7 +2310,8 @@ var
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
       '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, ',
-      '/upscale FILE|off, /fbc X|off, /profile on|off, /stats on|off, /quit.');
+      '/upscale FILE|off, /fbc X|off, /negative-prompt TEXT|off, ',
+      '/guidance-scale W, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -2271,6 +2391,11 @@ begin
   PanoramaStride := 0;
   PanoramaWrap := false;
   Sampler := fsEuler;
+  NegativePrompt := '';
+  HasNegativePrompt := false;
+  GuidanceScale := 1;
+  ApgSpec := '';
+  ApgOnVelocity := false;
   MaxThreads := 0;
   Upscaler := nil;
   UpscaleFile := '';
@@ -2413,6 +2538,34 @@ begin
         Halt(2);
       end;
     end
+    else if Arg = '--negative-prompt' then
+    begin
+      NegativePrompt := NextArg();
+      HasNegativePrompt := true;
+    end
+    else if Arg = '--guidance-scale' then
+    begin
+      ArgProblem := ParseGuidanceScale(NextArg(), GuidanceScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--guidance-scale: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--apg' then
+    begin
+      ApgSpec := NextArg();
+      try
+        TNNetAdaptiveProjectedGuidance.CreateFromSpec(ApgSpec).Free;
+      except
+        on E: EConvertError do
+        begin
+          WriteLn('--apg: ', E.Message);
+          Halt(2);
+        end;
+      end;
+    end
+    else if Arg = '--apg-velocity' then ApgOnVelocity := true
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -2559,6 +2712,7 @@ begin
   StartTime := GetTickCount64;
   Reporter := TQwenImageReporter.Create();
   PromptEmbeds := TNNetVolume.Create();
+  NegativeEmbeds := TNNetVolume.Create();
   Image := TNNetVolume.Create();
   InitImage := TNNetVolume.Create();
   ImageLatents := TNNetVolume.Create();
@@ -2586,6 +2740,11 @@ begin
     Pipeline.MaxThreads := MaxThreads;
     Pipeline.FirstBlockCacheThreshold := FbcThreshold;
     Pipeline.Scheduler.Sampler := Sampler;
+    Pipeline.GuidanceScale := GuidanceScale;
+    if ApgSpec <> '' then
+      Pipeline.AdaptiveProjectedGuidance :=
+        TNNetAdaptiveProjectedGuidance.CreateFromSpec(ApgSpec);
+    Pipeline.ApgOnVelocity := ApgOnVelocity;
     if FbcThreshold > 0 then WriteLn('[', FbcThresholdText(FbcThreshold), ']');
     SetProfile(UseProfile);
     SetStats(UseStats);
@@ -2681,6 +2840,7 @@ begin
     WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
     if Assigned(Upscaler) then WriteLn('Upscale    : ', UpscalerText());
+    WriteLn('Guidance   : ', GuidanceText());
     for LoRAPos := 0 to LoRAFiles.Count - 1 do
       WriteLn('LoRA       : ', LoRAFiles[LoRAPos], ' x ',
         FloatToStr(LoRAScales[LoRAPos], PointFormat()));
@@ -2731,6 +2891,7 @@ begin
     ImageLatents.Free;
     InitImage.Free;
     Image.Free;
+    NegativeEmbeds.Free;
     PromptEmbeds.Free;
     Reporter.Free;
   end;

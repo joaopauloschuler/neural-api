@@ -1052,6 +1052,17 @@ type
     // MultiDiffusion on the pico pipeline: a canvas of one window is bit for
     // bit the plain Denoise; wider canvases plan 3 (4 circular) windows.
     procedure TestQwenImage21PanoramaOneWindowParity;
+    // Guidance off (scale 1, or no negative prompt) is bit for bit the plain
+    // transformer loop.
+    procedure TestQwenImage21GuidanceOffBitIdentical;
+    // Two prefix caches keep their prompts apart; a guided step is CFG (and
+    // APG) of the two separate predictions; FBC and one window change nothing.
+    procedure TestQwenImage21GuidanceMix;
+    // A guided int8 denoise on OpenCL matches the CPU within 1e-4.
+    procedure TestQwenImage21GuidanceOpenCL;
+    // Edit layouts (condition image in the prefix) of different text lengths
+    // in two prefix caches: each prediction equals that prompt alone.
+    procedure TestQwenImage21GuidanceEditPrefixCaches;
     // TMultiDiffusionWindows: 2 overlapping windows of a constant stub give
     // the constant at the seams; an identity stub gives the canvas back.
     procedure TestMultiDiffusionConstantSeams;
@@ -35857,6 +35868,468 @@ begin
     RefJson.Free;
   end;
 end;
+
+const
+  // Pico prompt and (longer) negative prompt template ids, drop count 5.
+  csGuidancePromptIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196,
+    233, 270, 7, 44, 81, 118, 155, 192);
+  csGuidanceNegativeIds: array[0..15] of integer = (13, 50, 87, 124, 161,
+    198, 235, 3, 9, 46, 83, 120, 157, 194, 231, 268);
+  csGuidanceDropCount = 5;
+
+procedure TTestNeuralPretrained.TestQwenImage21GuidanceOffBitIdentical;
+const
+  Side = 64;
+  Grid = Side div csQwenImage21PixelsPerLatent;
+  StepCount = 3;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Transformer: TQwenImage21Transformer;
+  Embeds, NegEmbeds, Initial, Reference, Latents, Velocity: TNNetVolume;
+  StepPos: integer;
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  NegEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Reference := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    Pipeline.LoadComponents();
+    Transformer := Pipeline.LoadedTransformer;
+    Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount, Embeds);
+    Pipeline.EncodeTokenIds(csGuidanceNegativeIds, csGuidanceDropCount,
+      NegEmbeds);
+    Pipeline.MakeInitialLatents(Side, Side, 7, Initial);
+    AssertEquals('default scale', 1, Pipeline.GuidanceScale, 0);
+    AssertFalse('no negative prompt by default', Pipeline.HasNegativePrompt);
+    // The plain loop Denoise ran before guidance existed.
+    Reference.Copy(Initial);
+    Transformer.EncodePrefix(Embeds);
+    Pipeline.Scheduler.SetTimesteps(StepCount,
+      Pipeline.Scheduler.ShiftForImageSeqLen(Grid * Grid));
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      Transformer.PredictVelocity(Reference, Pipeline.Scheduler.Sigma[StepPos],
+        Grid, Grid, Velocity);
+      Pipeline.Scheduler.Step(Reference, Velocity, StepPos);
+    end;
+    Transformer.ReleasePasses();
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    AssertFalse('default: unguided', Pipeline.ImageStats.UsedGuidance);
+    AssertEquals('default = plain loop', 0,
+      MaxAbsVolumeDiff(Reference, Latents), 0);
+    Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+    AssertTrue('negative prompt set', Pipeline.HasNegativePrompt);
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    AssertFalse('scale 1: unguided', Pipeline.ImageStats.UsedGuidance);
+    AssertEquals('scale 1 with a negative prompt = plain loop', 0,
+      MaxAbsVolumeDiff(Reference, Latents), 0);
+    Pipeline.ClearNegativePrompt();
+    Pipeline.GuidanceScale := 4;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+    AssertFalse('no negative prompt: unguided',
+      Pipeline.ImageStats.UsedGuidance);
+    AssertEquals('scale 4 without a negative prompt = plain loop', 0,
+      MaxAbsVolumeDiff(Reference, Latents), 0);
+  finally
+    Velocity.Free;
+    Latents.Free;
+    Reference.Free;
+    Initial.Free;
+    NegEmbeds.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21GuidanceMix;
+const
+  Side = 64;
+  Grid = Side div csQwenImage21PixelsPerLatent;
+  StepCount = 3;
+  Scale = 3.5;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Transformer: TQwenImage21Transformer;
+  Apg: TNNetAdaptiveProjectedGuidance;
+  Embeds, NegEmbeds, Initial, CondAlone, NegAlone, CondShared, NegShared,
+    CondAfterNeg, Mixed, Expected, Guided, GuidedFbc, CondX0,
+    NegX0: TNNetVolume;
+  Sigma0: TNeuralFloat;
+  ValuePos, StepPos: integer;
+  OnVelocity: boolean;
+  Diff: double;
+
+  // Velocity of Initial at Sigma0 from the active prefix cache.
+  procedure Predict(Velocity: TNNetVolume);
+  begin
+    Transformer.PredictVelocity(Initial, Sigma0, Grid, Grid, Velocity);
+  end;
+
+  // Initial after one scheduler step with Velocity (Denoise's timesteps).
+  procedure StepFromInitial(Velocity: TNNetVolume);
+  begin
+    Expected.Copy(Initial);
+    Pipeline.Scheduler.Step(Expected, Velocity, 0);
+  end;
+
+  // Pipeline.Denoise from Initial, recording each step's latents.
+  procedure RunPipeline(Latents: TNNetVolume);
+  var
+    RecordPos: integer;
+  begin
+    for RecordPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[RecordPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+  end;
+
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  NegEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  CondAlone := TNNetVolume.Create;
+  NegAlone := TNNetVolume.Create;
+  CondShared := TNNetVolume.Create;
+  NegShared := TNNetVolume.Create;
+  CondAfterNeg := TNNetVolume.Create;
+  Mixed := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Guided := TNNetVolume.Create;
+  GuidedFbc := TNNetVolume.Create;
+  CondX0 := TNNetVolume.Create;
+  NegX0 := TNNetVolume.Create;
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    Pipeline.LoadComponents();
+    Transformer := Pipeline.LoadedTransformer;
+    Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount, Embeds);
+    Pipeline.EncodeTokenIds(csGuidanceNegativeIds, csGuidanceDropCount,
+      NegEmbeds);
+    AssertTrue('the negative prompt is longer', NegEmbeds.SizeX > Embeds.SizeX);
+    Pipeline.MakeInitialLatents(Side, Side, 9, Initial);
+    Pipeline.Scheduler.SetTimesteps(StepCount,
+      Pipeline.Scheduler.ShiftForImageSeqLen(Grid * Grid));
+    Sigma0 := Pipeline.Scheduler.Sigma[0];
+    // Each prompt alone, one prefix cache.
+    Transformer.EncodePrefix(Embeds);
+    Predict(CondAlone);
+    Transformer.ReleasePasses();
+    Transformer.EncodePrefix(NegEmbeds);
+    Predict(NegAlone);
+    Transformer.ReleasePasses();
+    // Both prompts in two caches: neither overwrites the other.
+    Transformer.ActivePrefixCache := 1;
+    Transformer.EncodePrefix(NegEmbeds);
+    Transformer.ActivePrefixCache := 0;
+    Transformer.EncodePrefix(Embeds);
+    AssertEquals('cache 0 length', Embeds.SizeX, Transformer.PrefixLength);
+    Predict(CondShared);
+    Transformer.ActivePrefixCache := 1;
+    AssertEquals('cache 1 length', NegEmbeds.SizeX, Transformer.PrefixLength);
+    Predict(NegShared);
+    Transformer.ActivePrefixCache := 0;
+    Predict(CondAfterNeg);
+    Transformer.ReleasePasses();
+    AssertEquals('ReleasePasses selects cache 0', 0,
+      Transformer.ActivePrefixCache);
+    Diff := MaxAbsVolumeDiff(CondAlone, CondShared);
+    AssertTrue('cond with two caches max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-6', Diff < 1e-6);
+    Diff := MaxAbsVolumeDiff(NegAlone, NegShared);
+    AssertTrue('negative with two caches max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-6', Diff < 1e-6);
+    AssertEquals('the negative pass leaves the cond prediction unchanged', 0,
+      MaxAbsVolumeDiff(CondShared, CondAfterNeg), 0);
+    AssertTrue('the prompts predict differently',
+      MaxAbsVolumeDiff(CondAlone, NegAlone) > 1e-4);
+
+    // A guided Denoise's first step: uncond + scale * (cond - uncond).
+    Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+    Pipeline.GuidanceScale := Scale;
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    RunPipeline(Guided);
+    AssertTrue('guided', Pipeline.ImageStats.UsedGuidance);
+    AssertEquals('steps recorded', StepCount,
+      Length(FQwenImage21StepLatents));
+    Mixed.Copy(CondAlone);
+    for ValuePos := 0 to Mixed.Size - 1 do
+      Mixed.FData[ValuePos] := NegAlone.FData[ValuePos] + Scale *
+        (CondAlone.FData[ValuePos] - NegAlone.FData[ValuePos]);
+    StepFromInitial(Mixed);
+    Diff := MaxAbsVolumeDiff(Expected, FQwenImage21StepLatents[0]);
+    WriteLn('  Qwen-Image-2.1 CFG step vs two separate predictions: ',
+      'max|diff|=', Diff:0:9);
+    AssertTrue('CFG step max|diff| ' + FloatToStr(Diff) + ' must be < 1e-5',
+      Diff < 1e-5);
+
+    // A First-Block Cache that never skips and a one-window panorama keep
+    // each branch's prediction.
+    Pipeline.FirstBlockCacheThreshold := 1e-30;
+    RunPipeline(GuidedFbc);
+    AssertEquals('FBC on, nothing skipped', 0,
+      Pipeline.ImageStats.SkippedStepCount);
+    AssertEquals('FBC on = off', 0, MaxAbsVolumeDiff(Guided, GuidedFbc), 0);
+    Pipeline.FirstBlockCacheThreshold := 0;
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    RunPipeline(GuidedFbc);
+    AssertEquals('one window', 1, Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals('one guided window = guided plain', 0,
+      MaxAbsVolumeDiff(Guided, GuidedFbc), 0);
+    Pipeline.PanoramaWindowWidth := 0;
+    Pipeline.PanoramaWindowHeight := 0;
+
+    // APG in place of CFG, on x0 = x - sigma * v (default) and on the raw
+    // velocities: the same step from a fresh APG of those settings.
+    Pipeline.AdaptiveProjectedGuidance :=
+      TNNetAdaptiveProjectedGuidance.Create(0.0, -0.5, 1.0);
+    AssertFalse('APG on x0 by default', Pipeline.ApgOnVelocity);
+    for OnVelocity := false to true do
+    begin
+      Pipeline.ApgOnVelocity := OnVelocity;
+      RunPipeline(GuidedFbc);
+      CondX0.Copy(CondAlone);
+      NegX0.Copy(NegAlone);
+      if not OnVelocity then
+        for ValuePos := 0 to Initial.Size - 1 do
+        begin
+          CondX0.FData[ValuePos] := Initial.FData[ValuePos] -
+            Sigma0 * CondAlone.FData[ValuePos];
+          NegX0.FData[ValuePos] := Initial.FData[ValuePos] -
+            Sigma0 * NegAlone.FData[ValuePos];
+        end;
+      Apg := TNNetAdaptiveProjectedGuidance.Create(0.0, -0.5, 1.0);
+      try
+        Apg.ApplyAPG(CondX0, NegX0, Mixed, Scale);
+      finally
+        Apg.Free;
+      end;
+      if not OnVelocity then
+        for ValuePos := 0 to Initial.Size - 1 do
+          Mixed.FData[ValuePos] := (Initial.FData[ValuePos] -
+            Mixed.FData[ValuePos]) / Sigma0;
+      StepFromInitial(Mixed);
+      Diff := MaxAbsVolumeDiff(Expected, FQwenImage21StepLatents[0]);
+      WriteLn('  Qwen-Image-2.1 APG step (on ', BoolToStr(OnVelocity,
+        'velocity', 'x0'), '): max|diff|=', Diff:0:9);
+      AssertTrue('APG step max|diff| ' + FloatToStr(Diff) +
+        ' must be < 2e-5', Diff < 2e-5);
+      AssertTrue('APG differs from CFG',
+        MaxAbsVolumeDiff(Guided, GuidedFbc) > 1e-5);
+      if OnVelocity then
+        AssertTrue('APG on velocity differs from APG on x0',
+          MaxAbsVolumeDiff(CondShared, FQwenImage21StepLatents[0]) > 1e-5)
+      else CondShared.Copy(FQwenImage21StepLatents[0]);
+    end;
+  finally
+    Pipeline.OnStep := nil;
+    for StepPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[StepPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    NegX0.Free;
+    CondX0.Free;
+    GuidedFbc.Free;
+    Guided.Free;
+    Expected.Free;
+    Mixed.Free;
+    CondAfterNeg.Free;
+    NegShared.Free;
+    CondShared.Free;
+    NegAlone.Free;
+    CondAlone.Free;
+    Initial.Free;
+    NegEmbeds.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21GuidanceEditPrefixCaches;
+const
+  ImageGrid = 2;
+  TargetGrid = 3;
+  Timestep = 0.7;
+var
+  Transformer: TQwenImage21Transformer;
+  CondText, NegText, ImageLatents, Latents, CondAlone, NegAlone, CondShared,
+    NegShared, CondAfterNeg: TNNetVolume;
+  Diff: double;
+
+  procedure FillWave(Volume: TNNetVolume; Phase: double);
+  var
+    ValuePos: integer;
+  begin
+    for ValuePos := 0 to Volume.Size - 1 do
+      Volume.FData[ValuePos] := Sin(0.37 * ValuePos + Phase);
+  end;
+
+  // Text runs [3, 2] (cond) or [5, 4] (negative) around one condition image.
+  procedure Encode(IsNegative: boolean);
+  begin
+    if IsNegative then
+      Transformer.EncodePrefix(NegText, [5, 4], [ImageLatents],
+        [ImageGrid], [ImageGrid])
+    else Transformer.EncodePrefix(CondText, [3, 2], [ImageLatents],
+      [ImageGrid], [ImageGrid]);
+  end;
+
+  procedure Predict(Velocity: TNNetVolume);
+  begin
+    Transformer.PredictVelocity(Latents, Timestep, TargetGrid, TargetGrid,
+      Velocity);
+  end;
+
+begin
+  Transformer := nil;
+  CondText := TNNetVolume.Create;
+  NegText := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  CondAlone := TNNetVolume.Create;
+  NegAlone := TNNetVolume.Create;
+  CondShared := TNNetVolume.Create;
+  NegShared := TNNetVolume.Create;
+  CondAfterNeg := TNNetVolume.Create;
+  try
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    CondText.ReSize(5, 1, Transformer.Config.ContextInDim);
+    NegText.ReSize(9, 1, Transformer.Config.ContextInDim);
+    ImageLatents.ReSize(ImageGrid * ImageGrid, 1,
+      Transformer.Config.InChannels);
+    Latents.ReSize(TargetGrid * TargetGrid, 1, Transformer.Config.InChannels);
+    FillWave(CondText, 0.1);
+    FillWave(NegText, 1.3);
+    FillWave(ImageLatents, 2.1);
+    FillWave(Latents, 0.6);
+    Encode(false);
+    Predict(CondAlone);
+    Transformer.ReleasePasses();
+    Encode(true);
+    Predict(NegAlone);
+    Transformer.ReleasePasses();
+    Transformer.ActivePrefixCache := 1;
+    Encode(true);
+    Transformer.ActivePrefixCache := 0;
+    Encode(false);
+    Predict(CondShared);
+    Transformer.ActivePrefixCache := 1;
+    AssertEquals('negative prefix length', 9 + ImageGrid * ImageGrid,
+      Transformer.PrefixLength);
+    Predict(NegShared);
+    Transformer.ActivePrefixCache := 0;
+    Predict(CondAfterNeg);
+    Transformer.ReleasePasses();
+    Diff := MaxAbsVolumeDiff(CondAlone, CondShared);
+    AssertTrue('cond max|diff| ' + FloatToStr(Diff) + ' must be < 1e-6',
+      Diff < 1e-6);
+    Diff := MaxAbsVolumeDiff(NegAlone, NegShared);
+    AssertTrue('negative max|diff| ' + FloatToStr(Diff) + ' must be < 1e-6',
+      Diff < 1e-6);
+    AssertEquals('the negative pass leaves the cond prediction unchanged', 0,
+      MaxAbsVolumeDiff(CondShared, CondAfterNeg), 0);
+    AssertTrue('the layouts predict differently',
+      MaxAbsVolumeDiff(CondAlone, NegAlone) > 1e-4);
+  finally
+    CondAfterNeg.Free;
+    NegShared.Free;
+    CondShared.Free;
+    NegAlone.Free;
+    CondAlone.Free;
+    Latents.Free;
+    ImageLatents.Free;
+    NegText.Free;
+    CondText.Free;
+    Transformer.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21GuidanceOpenCL;
+{$IFDEF OpenCL}
+const
+  Side = 64;
+  StepCount = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Embeds, NegEmbeds, Initial, LatentsCPU, LatentsOpenCL: TNNetVolume;
+  Diff: double;
+
+  procedure RunPipeline(OnOpenCL: boolean; Latents: TNNetVolume);
+  var
+    Pipeline: TQwenImage21Pipeline;
+  begin
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    try
+      Pipeline.TransformerFormat := qiwInt8;
+      if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+      Pipeline.LoadComponents();
+      AssertTrue('transformer on OpenCL = ' + BoolToStr(OnOpenCL, true),
+        Pipeline.TransformerOnOpenCL = OnOpenCL);
+      if Embeds.Size <= 1 then
+      begin
+        Pipeline.EncodeTokenIds(csGuidancePromptIds, csGuidanceDropCount,
+          Embeds);
+        Pipeline.EncodeTokenIds(csGuidanceNegativeIds, csGuidanceDropCount,
+          NegEmbeds);
+        Pipeline.MakeInitialLatents(Side, Side, 11, Initial);
+      end;
+      Pipeline.SetNegativePromptEmbeds(NegEmbeds, []);
+      Pipeline.GuidanceScale := 3;
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+      AssertTrue('guided', Pipeline.ImageStats.UsedGuidance);
+      // Each prompt's cache uploads every block's prefix K/V once.
+      AssertEquals('prefix K/V uploads',
+        2 * Pipeline.TransformerConfig.NumLayers * Ord(OnOpenCL),
+        Pipeline.LoadedTransformer.PrefixKVUploadCount);
+    finally
+      Pipeline.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Embeds := TNNetVolume.Create;
+  NegEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  LatentsCPU := TNNetVolume.Create;
+  LatentsOpenCL := TNNetVolume.Create;
+  try
+    RunPipeline(false, LatentsCPU);
+    RunPipeline(true, LatentsOpenCL);
+    Diff := MaxAbsVolumeDiff(LatentsCPU, LatentsOpenCL);
+    WriteLn('  Qwen-Image-2.1 guided denoise OpenCL vs CPU: max|diff|=',
+      Diff:0:9);
+    AssertTrue('max|diff| ' + FloatToStr(Diff) + ' must be < 1e-4',
+      Diff < 1e-4);
+  finally
+    LatentsOpenCL.Free;
+    LatentsCPU.Free;
+    Initial.Free;
+    NegEmbeds.Free;
+    Embeds.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.TestMultiDiffusionConstantSeams;
 var
