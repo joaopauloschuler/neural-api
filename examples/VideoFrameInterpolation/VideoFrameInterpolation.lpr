@@ -1,9 +1,9 @@
 program VideoFrameInterpolation;
 (*
-VideoFrameInterpolation: synthesises ONE intermediate frame (t=0.5) between two
-input frames on the CPU end-to-end with the repo's RIFE frame-interpolation
-importer (BuildRIFEFromSafeTensors, neuralpretrained.pas) -- a
-VIDEO-generative import. The landed RAFT path estimates optical FLOW
+VideoFrameInterpolation: synthesises intermediate frames between two input
+frames on the CPU end-to-end with the repo's RIFE frame-interpolation importer
+(BuildRIFEFromSafeTensors, neuralpretrained.pas) -- a VIDEO-generative import.
+The landed RAFT path estimates optical FLOW
 but does NOT synthesise frames; examples/FrameInterpolation is a from-scratch toy
 (TNNetFlowWarp), not an importer. RIFE (Huang et al. 2022, "Real-Time
 Intermediate Flow Estimation for Video Frame Interpolation", arXiv:2011.06294;
@@ -17,6 +17,12 @@ equivalent of grid_sample(padding_mode='border', align_corners=True)). Everythin
 else (3x3 conv, per-channel PReLU, sigmoid, channel-broadcast multiply, residual
 sum) reuses landed layers.
 
+TIMESTEPS: a checkpoint whose first IFBlock reads 2*in_channel+1 planes takes
+Practical-RIFE v4's timestep plane, so it renders any t directly. A checkpoint
+without one only predicts t=0.5; RIFEInterpolateFrames then recurses (middle
+frame, then the middles of each half), so --factor must be a power of two and
+--t must be dyadic (k/2^n). The net is built once for every frame.
+
 NO NETWORK ACCESS / SELF-CONTAINED: the official Practical-RIFE checkpoints are
 not obtainable offline, so -- exactly like the repo's NAFNet / SwinIR pico
 fixtures -- this falls back to the committed CONFIG-FAITHFUL random pico RIFE
@@ -29,13 +35,16 @@ interpolation forward pass, and writes the result. Pass a real .safetensors
 (+ config.json sibling) to interpolate with your own trained checkpoint.
 
 USAGE
-  ./VideoFrameInterpolation                 use the committed pico fixture
-  ./VideoFrameInterpolation model.safetensors [config.json]
-                                            use a real checkpoint
+  ./VideoFrameInterpolation [model.safetensors [config.json]] [options]
+  With no checkpoint the committed pico fixture is used.
+  --factor N     write N-1 frames at t = k/N between the inputs (default 2)
+  --t VALUE      write ONE frame at time VALUE in (0,1) instead of --factor
+  --gif FILE     also write all frames (inputs included) as a looping GIF
 
 OUTPUT
-  Writes rife_frame0.ppm, rife_frame1.ppm and rife_middle.ppm (P6 color images)
-  and prints the config plus a small ASCII preview of frame0 / middle / frame1.
+  Writes rife_frame_00.ppm (frame0), the intermediate frames in time order, and
+  frame1 last (P6 color images), and prints the config plus a small ASCII
+  preview of every frame for grids up to 32x32.
 
 Coded by Claude (AI).
 
@@ -49,15 +58,15 @@ any later version.
 {$mode objfpc}{$H+}
 
 uses
+  {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes, Math,
-  neuralnetwork, neuralvolume, neuralpretrained;
+  neuralnetwork, neuralvolume, neuralpretrained, neuralgif;
 
 const
   cFixtureST  = '../../tests/fixtures/tiny_rife.safetensors';
   cFixtureCfg = '../../tests/fixtures/tiny_rife_config.json';
-  cFrame0File = 'rife_frame0.ppm';
-  cFrame1File = 'rife_frame1.ppm';
-  cMiddleFile = 'rife_middle.ppm';
+  cFramePrefix = 'rife_frame_';
+  cMaxPreviewSize = 32;
 
 function ToByte(V: TNeuralFloat): byte;
 begin
@@ -131,18 +140,62 @@ begin
     end;
 end;
 
+procedure Usage(const Problem: string);
+begin
+  WriteLn('Error: ', Problem);
+  WriteLn('Usage: VideoFrameInterpolation [model.safetensors [config.json]] ' +
+    '[--factor N] [--t VALUE] [--gif FILE]');
+  Halt(1);
+end;
+
 var
   NN: TNNet;
   Config: TRIFEConfig;
-  TwoFrames, Frame0, Frame1: TNNetVolume;
-  S, InPlanes, X, Y, C: integer;
-  STPath, CfgPath: string;
+  Frame0, Frame1: TNNetVolume;
+  Frames, Sequence: TNNetVolumeList;
+  GifWriter: TNNetAnimatedGIFWriter;
+  S, ArgPos, FramePos, MaxFramePos, Factor: integer;
+  FrameT: TNeuralFloat;
+  HasFrameT: boolean;
+  STPath, CfgPath, GifFile, FrameFile, Arg: string;
 begin
-  if ParamCount >= 1 then
+  STPath := '';
+  CfgPath := '';
+  GifFile := '';
+  Factor := 2;
+  FrameT := 0.5;
+  HasFrameT := false;
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
   begin
-    STPath := ParamStr(1);
-    if ParamCount >= 2 then CfgPath := ParamStr(2)
-    else CfgPath := ExtractFilePath(STPath) + 'config.json';
+    Arg := ParamStr(ArgPos);
+    if (Arg = '--factor') or (Arg = '--t') or (Arg = '--gif') then
+    begin
+      if ArgPos = ParamCount then Usage(Arg + ' needs a value.');
+      Inc(ArgPos);
+      if Arg = '--factor' then
+      begin
+        if not TryStrToInt(ParamStr(ArgPos), Factor) or (Factor < 2) then
+          Usage('--factor must be an integer >= 2.');
+      end
+      else if Arg = '--t' then
+      begin
+        if not TryStrToFloat(ParamStr(ArgPos), FrameT) or (FrameT <= 0) or
+          (FrameT >= 1) then
+          Usage('--t must be a number in (0, 1).');
+        HasFrameT := true;
+      end
+      else GifFile := ParamStr(ArgPos);
+    end
+    else if Copy(Arg, 1, 2) = '--' then Usage('unknown option ' + Arg)
+    else if STPath = '' then STPath := Arg
+    else if CfgPath = '' then CfgPath := Arg
+    else Usage('unexpected argument ' + Arg);
+    Inc(ArgPos);
+  end;
+  if STPath <> '' then
+  begin
+    if CfgPath = '' then CfgPath := ExtractFilePath(STPath) + 'config.json';
     WriteLn('Loading RIFE from checkpoint: ', STPath);
   end
   else
@@ -154,48 +207,71 @@ begin
   end;
 
   NN := BuildRIFEFromSafeTensors(STPath, Config, {pTrainable=}false, CfgPath);
+  Frame0 := nil;
+  Frame1 := nil;
+  Frames := TNNetVolumeList.Create;
+  Sequence := TNNetVolumeList.Create({FreeObjects=}false);
   try
     WriteLn(RIFEConfigToString(Config));
     S := Config.InputSize;
-    InPlanes := 2 * Config.InChannel;
-    TwoFrames := TNNetVolume.Create(S, S, InPlanes);
     Frame0 := TNNetVolume.Create(S, S, Config.InChannel);
     Frame1 := TNNetVolume.Create(S, S, Config.InChannel);
+    // frame0: blob near the left; frame1: same blob shifted right + down.
+    FillBlob(Frame0, 0, S * 0.30, S * 0.40, S * 0.55);
+    FillBlob(Frame1, 0, S * 0.70, S * 0.60, S * 0.55);
+
     try
-      // frame0: blob near the left; frame1: same blob shifted right + down.
-      // The true middle frame would have the blob halfway between.
-      FillBlob(TwoFrames, 0,                S * 0.30, S * 0.40, S * 0.55);
-      FillBlob(TwoFrames, Config.InChannel, S * 0.70, S * 0.60, S * 0.55);
-      // Mirror into the single-frame volumes for visualisation/preview.
-      for Y := 0 to S - 1 do
-        for X := 0 to S - 1 do
-          for C := 0 to Config.InChannel - 1 do
-          begin
-            Frame0[X, Y, C] := TwoFrames[X, Y, C];
-            Frame1[X, Y, C] := TwoFrames[X, Y, Config.InChannel + C];
-          end;
+      if HasFrameT then
+      begin
+        Frames.AddVolumes(1, S, S, Config.InChannel);
+        RIFEInterpolateAt(NN, Config, Frame0, Frame1, FrameT, Frames[0]);
+        WriteLn('Interpolated one frame at t=', FrameT:0:4, '.');
+      end
+      else
+      begin
+        RIFEInterpolateFrames(NN, Config, Frame0, Frame1, Factor, Frames);
+        WriteLn('Interpolated ', Frames.Count, ' frame(s) for a ', Factor,
+          'x factor (', BoolToStr(Config.TimestepInput,
+          'one call per t', 'midpoint recursion'), ').');
+      end;
+    except
+      // A model without a timestep plane rejects non-dyadic t / factors.
+      on E: Exception do Usage(E.Message);
+    end;
 
-      NN.Compute(TwoFrames);
-      WriteLn('Interpolated middle frame: ', NN.GetLastLayer().Output.SizeX,
-        'x', NN.GetLastLayer().Output.SizeY, 'x',
-        NN.GetLastLayer().Output.Depth, ' (one frame between the two inputs).');
-
-      WriteColorPPM(Frame0, cFrame0File);
-      WriteColorPPM(Frame1, cFrame1File);
-      WriteColorPPM(NN.GetLastLayer().Output, cMiddleFile);
-      WriteLn('Wrote ', cFrame0File, ', ', cMiddleFile, ' and ',
-        cFrame1File, '.');
-
-      WriteLn; WriteLn('frame0:'); AsciiPreview(TwoFrames, 0);
-      WriteLn; WriteLn('middle (interpolated):');
-      AsciiPreview(NN.GetLastLayer().Output, 0);
-      WriteLn; WriteLn('frame1:'); AsciiPreview(TwoFrames, Config.InChannel);
-    finally
-      TwoFrames.Free;
-      Frame0.Free;
-      Frame1.Free;
+    Sequence.Add(Frame0);
+    for FramePos := 0 to Frames.Count - 1 do Sequence.Add(Frames[FramePos]);
+    Sequence.Add(Frame1);
+    MaxFramePos := Sequence.Count - 1;
+    for FramePos := 0 to MaxFramePos do
+    begin
+      FrameFile := cFramePrefix + Format('%.2d', [FramePos]) + '.ppm';
+      WriteColorPPM(Sequence[FramePos], FrameFile);
+      WriteLn('Wrote ', FrameFile);
+      if S <= cMaxPreviewSize then
+      begin
+        AsciiPreview(Sequence[FramePos], 0);
+        WriteLn;
+      end;
+    end;
+    if GifFile <> '' then
+    begin
+      GifWriter := TNNetAnimatedGIFWriter.Create(GifFile, S, S);
+      try
+        for FramePos := 0 to MaxFramePos do
+          GifWriter.AddFrame(Sequence[FramePos], -1, 1);
+        GifWriter.Finish;
+        WriteLn('Wrote ', GifWriter.FrameCount, '-frame animated GIF ',
+          GifFile);
+      finally
+        GifWriter.Free;
+      end;
     end;
   finally
+    Sequence.Free;
+    Frames.Free;
+    Frame1.Free;
+    Frame0.Free;
     NN.Free;
   end;
 end.

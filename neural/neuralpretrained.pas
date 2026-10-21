@@ -13366,18 +13366,20 @@ procedure LaMaComposite(Image, Mask, Prediction, Output: TNNetVolume);
 //   conv0(3x3, in_planes->c, pad1) -> PReLU(c)
 //   conv1(3x3, c->c, pad1)         -> PReLU(c)
 //   lastconv(3x3, c->5, pad1)       # 4 flow channels + 1 fusion-mask channel
-// IFNet (v1, t=0.5): the input is the channel-concat [frame0(3) | frame1(3)]
-//   (6 channels, SAME HxW). Each IFBlock predicts a flow RESIDUAL (accumulated)
-//   and a mask logit (the LAST block's wins, like RIFE). The accumulated 4-ch
+// IFNet (v1): the input is the channel-concat [frame0(3) | frame1(3)] (6
+//   channels, SAME HxW), plus a constant plane filled with t when the checkpoint
+//   takes a timestep (Practical-RIFE v4: 7 input planes). Each IFBlock
+//   predicts a flow RESIDUAL (accumulated) and a mask logit (the LAST block's
+//   wins, like RIFE). The accumulated 4-ch
 //   flow splits into flow_t0=(dx,dy) for frame0 and flow_t1=(dx,dy) for frame1.
 //   warped0 = backward_warp(frame0, flow_t0); warped1 = backward_warp(frame1,
 //   flow_t1); m = sigmoid(mask); merged = warped0*m + warped1*(1-m). The output
-//   is the (in_channel, input_size, input_size) interpolated MIDDLE frame.
-// SCOPE (v1): one intermediate frame at t=0.5, inference-only, a small IFNet of
-// num_blocks IFBlocks at FULL resolution. Deferred (tasklist follow-ups): real
-// Practical-RIFE checkpoint parity (multi-scale stride-2 IFBlocks with warped-
-// frame re-feeding, privileged-distillation teacher), arbitrary-t and the
-// recursive 2x->4x multi-frame schedule.
+//   is the (in_channel, input_size, input_size) interpolated frame at t (0.5
+//   for a model without a timestep plane; RIFEInterpolateFrames recurses).
+// SCOPE (v1): inference-only, a small IFNet of num_blocks IFBlocks at FULL
+// resolution. Deferred (tasklist follow-ups): real Practical-RIFE checkpoint
+// parity (multi-scale stride-2 IFBlocks with warped-frame re-feeding,
+// privileged-distillation teacher).
 // ---------------------------------------------------------------------------
 type
   TRIFEConfig = record
@@ -13385,28 +13387,49 @@ type
     HiddenChannels: integer;        // IFBlock hidden width c
     NumBlocks: integer;             // IFBlocks in the coarse-to-fine stack
     InputSize: integer;             // input grid H=W for the Input layer
+    TimestepInput: boolean;         // input ends with a constant t plane (v4)
     ModelType: string;              // 'rife'
   end;
 
 // Reads a RIFE config. Required: hidden_channels. Optional: in_channel (3),
-// num_blocks (2), input_size, model_type.
+// num_blocks (2), input_size, timestep_input (false), model_type.
 function ReadRIFEConfigFromJSONFile(const FileName: string): TRIFEConfig;
 
 function RIFEConfigToString(const Config: TRIFEConfig): string;
 
-// Builds the RIFE IFNet described by Config and loads every weight from Reader
-// (caller owns Reader). The net takes a (InputSize, InputSize, 2*InChannel)
-// image whose depth axis is [frame0 | frame1] and outputs the
-// (InputSize, InputSize, InChannel) interpolated middle frame (raw).
+// Builds the RIFE IFNet and loads its weights (caller owns Reader). Input is
+// RIFEPackFrames' volume; output the (S, S, InChannel) interpolated frame.
 function BuildRIFE(Reader: TNNetSafeTensorsReader;
   const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
+
+// Sets Config.TimestepInput from block0.conv0's input-plane count (2*InChannel
+// or 2*InChannel+1); raises on any other count.
+procedure DetectRIFETimestepInput(Reader: TNNetSafeTensorsReader;
+  var Config: TRIFEConfig);
 
 function BuildRIFEFromSafeTensorsEx(const FileName: string;
   const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
 
+// Reads the config (default: config.json beside FileName) and detects
+// Config.TimestepInput from the checkpoint before building.
 function BuildRIFEFromSafeTensors(const FileName: string;
   out Config: TRIFEConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
+
+// Packs the net input: depth = [Frame0 | Frame1] plus a plane filled with T when
+// Config.TimestepInput. Frames are (S, S, InChannel).
+procedure RIFEPackFrames(const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; T: TNeuralFloat; PackedInput: TNNetVolume);
+
+// Writes the frame at time T in (0,1) into Output. Without a timestep plane T
+// must be dyadic (k/2^n, n <= 16): the net bisects toward it from t=0.5.
+procedure RIFEInterpolateAt(NN: TNNet; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; T: TNeuralFloat; Output: TNNetVolume);
+
+// Fills Frames with the frames at t = k/Factor (k = 1..Factor-1) in order: one
+// call per t with a timestep plane, else midpoint recursion (power-of-2 Factor).
+procedure RIFEInterpolateFrames(NN: TNNet; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; Factor: integer; Frames: TNNetVolumeList);
 
 // ---------------------------------------------------------------------------
 // SwinIR IMAGE-RESTORATION IMPORT (model_type "swinir") -- the repo's FIRST
@@ -78401,6 +78424,7 @@ begin
         '" is missing the required positive field "hidden_channels".');
     Result.NumBlocks := Obj.Get('num_blocks', 2);
     Result.InputSize := Obj.Get('input_size', 0);
+    Result.TimestepInput := Obj.Get('timestep_input', false);
   finally
     Root.Free;
     JsonText.Free;
@@ -78412,7 +78436,31 @@ begin
   Result := Config.ModelType + ' config: in_channel=' +
     IntToStr(Config.InChannel) + ', hidden_channels=' +
     IntToStr(Config.HiddenChannels) + ', num_blocks=' +
-    IntToStr(Config.NumBlocks) + ', input_size=' + IntToStr(Config.InputSize);
+    IntToStr(Config.NumBlocks) + ', input_size=' + IntToStr(Config.InputSize) +
+    ', timestep_input=' + BoolToStr(Config.TimestepInput, 'true', 'false');
+end;
+
+procedure DetectRIFETimestepInput(Reader: TNNetSafeTensorsReader;
+  var Config: TRIFEConfig);
+const
+  cConv0Name = 'block0.conv0.weight';
+var
+  InPlanes: Int64;
+begin
+  if not Reader.HasTensor(cConv0Name) then
+    ImportError('RIFE import: checkpoint has no ' + cConv0Name + '.');
+  if Reader.DimCount(cConv0Name) <> 4 then
+    ImportError('RIFE import: ' + cConv0Name + ' must be 4-D, got ' +
+      Reader.ShapeAsString(cConv0Name) + '.');
+  InPlanes := Reader.DimSize(cConv0Name, 1);
+  if InPlanes = 2 * Config.InChannel then
+    Config.TimestepInput := false
+  else if InPlanes = 2 * Config.InChannel + 1 then
+    Config.TimestepInput := true
+  else
+    ImportError('RIFE import: ' + cConv0Name + ' reads ' + IntToStr(InPlanes) +
+      ' planes; expected 2*in_channel (' + IntToStr(2 * Config.InChannel) +
+      ') or 2*in_channel+1 with a timestep plane.');
 end;
 
 type
@@ -78468,13 +78516,13 @@ begin
     ImportError('RIFE import: in_channel must be >= 1.');
   if Config.InputSize < 1 then
     ImportError('RIFE import: input_size must be >= 1.');
-  InPlanes := 2 * Config.InChannel;
+  InPlanes := 2 * Config.InChannel + Ord(Config.TimestepInput);
   NumBlocksM1 := Config.NumBlocks - 1;
   SetLength(Refs, Config.NumBlocks);
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    // Input depth = 2*InChannel: [frame0 | frame1] concatenated on depth axis.
+    // Input depth: [frame0 | frame1 (| t plane)] concatenated on depth axis.
     InputLayer := NN.AddLayer(TNNetInput.Create(
       Config.InputSize, Config.InputSize, InPlanes));
     Frame0 := NN.AddLayerAfter(
@@ -78482,7 +78530,7 @@ begin
     Frame1 := NN.AddLayerAfter(
       TNNetSplitChannels.Create(Config.InChannel, Config.InChannel), InputLayer);
 
-    // Coarse-to-fine IFBlocks: each reads the [frame0|frame1] input and emits a
+    // Coarse-to-fine IFBlocks: each reads the whole packed input and emits a
     // 5-channel (4 flow + 1 mask) map. Flow residuals accumulate; the last
     // block's mask logit is the fusion mask.
     FlowAcc := nil;
@@ -78550,11 +78598,165 @@ function BuildRIFEFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
 begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRIFEConfigFromJSONFile(ConfigPath);
-  Result := BuildRIFEFromSafeTensorsEx(FileName, Config, pTrainable);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    DetectRIFETimestepInput(Reader, Config);
+    Result := BuildRIFE(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure RIFEPackFrames(const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; T: TNeuralFloat; PackedInput: TNNetVolume);
+var
+  InChannel, PackedDepth, TimestepOffset: integer;
+  PixelPos, MaxPixelPos, FramePos, PackedPos, FrameBytes: integer;
+begin
+  InChannel := Config.InChannel;
+  if (Frame0.Depth <> InChannel) or (Frame1.Size <> Frame0.Size) or
+    (Frame1.SizeX <> Frame0.SizeX) then
+    raise Exception.Create('RIFEPackFrames: frames must both be (S, S, ' +
+      IntToStr(InChannel) + ').');
+  PackedDepth := 2 * InChannel + Ord(Config.TimestepInput);
+  PackedInput.ReSize(Frame0.SizeX, Frame0.SizeY, PackedDepth);
+  FrameBytes := InChannel * csNeuralFloatSize;
+  TimestepOffset := 2 * InChannel;
+  MaxPixelPos := Frame0.SizeX * Frame0.SizeY - 1;
+  FramePos := 0;
+  PackedPos := 0;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    Move(Frame0.FData[FramePos], PackedInput.FData[PackedPos], FrameBytes);
+    Move(Frame1.FData[FramePos], PackedInput.FData[PackedPos + InChannel],
+      FrameBytes);
+    if Config.TimestepInput then
+      PackedInput.FData[PackedPos + TimestepOffset] := T;
+    Inc(FramePos, InChannel);
+    Inc(PackedPos, PackedDepth);
+  end;
+end;
+
+// One forward pass: packs (Frame0, Frame1, T) into PackedInput and copies the
+// interpolated frame into Output.
+procedure RIFEComputeFrame(NN: TNNet; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; T: TNeuralFloat;
+  PackedInput, Output: TNNetVolume);
+begin
+  RIFEPackFrames(Config, Frame0, Frame1, T, PackedInput);
+  NN.Compute(PackedInput);
+  Output.Copy(NN.GetLastLayer().Output);
+end;
+
+procedure RIFEInterpolateAt(NN: TNNet; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; T: TNeuralFloat; Output: TNNetVolume);
+const
+  cMaxBisectSteps = 16;
+var
+  PackedInput, LoFrame, HiFrame: TNNetVolume;
+  LoT, HiT, MidT: double;
+  StepPos: integer;
+begin
+  if (T <= 0) or (T >= 1) then
+    raise Exception.Create('RIFEInterpolateAt: T must be in (0, 1), got ' +
+      FloatToStr(T) + '.');
+  if (not Config.TimestepInput) and
+    (Frac(double(T) * (1 shl cMaxBisectSteps)) <> 0) then
+    raise Exception.Create('RIFEInterpolateAt: a model without a timestep ' +
+      'plane only reaches dyadic T = k/2^n (n <= 16), got ' +
+      FloatToStr(T) + '.');
+  PackedInput := TNNetVolume.Create;
+  LoFrame := TNNetVolume.Create;
+  HiFrame := TNNetVolume.Create;
+  try
+    if Config.TimestepInput then
+    begin
+      RIFEComputeFrame(NN, Config, Frame0, Frame1, T, PackedInput, Output);
+      Exit;
+    end;
+    LoFrame.Copy(Frame0);
+    HiFrame.Copy(Frame1);
+    LoT := 0;
+    HiT := 1;
+    for StepPos := 1 to cMaxBisectSteps do
+    begin
+      MidT := (LoT + HiT) * 0.5;
+      RIFEComputeFrame(NN, Config, LoFrame, HiFrame, 0.5, PackedInput, Output);
+      if MidT = T then Exit;
+      if T < MidT then
+      begin
+        HiFrame.Copy(Output);
+        HiT := MidT;
+      end
+      else
+      begin
+        LoFrame.Copy(Output);
+        LoT := MidT;
+      end;
+    end;
+  finally
+    HiFrame.Free;
+    LoFrame.Free;
+    PackedInput.Free;
+  end;
+end;
+
+procedure RIFEInterpolateFrames(NN: TNNet; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume; Factor: integer; Frames: TNNetVolumeList);
+var
+  PackedInput: TNNetVolume;
+  Anchors: array of TNNetVolume;
+  FramePos, MaxFramePos: integer;
+
+  // Fills Anchors strictly between LoPos and HiPos by midpoint recursion.
+  procedure FillMidpoints(LoPos, HiPos: integer);
+  var
+    MidPos: integer;
+  begin
+    if HiPos - LoPos < 2 then Exit;
+    MidPos := (LoPos + HiPos) div 2;
+    RIFEComputeFrame(NN, Config, Anchors[LoPos], Anchors[HiPos], 0.5,
+      PackedInput, Anchors[MidPos]);
+    FillMidpoints(LoPos, MidPos);
+    FillMidpoints(MidPos, HiPos);
+  end;
+
+begin
+  if Factor < 2 then
+    raise Exception.Create('RIFEInterpolateFrames: Factor must be >= 2, got ' +
+      IntToStr(Factor) + '.');
+  if (not Config.TimestepInput) and ((Factor and (Factor - 1)) <> 0) then
+    raise Exception.Create('RIFEInterpolateFrames: a model without a ' +
+      'timestep plane needs a power-of-two Factor, got ' +
+      IntToStr(Factor) + '.');
+  MaxFramePos := Factor - 1;
+  Frames.Clear;
+  Frames.AddVolumes(MaxFramePos, Frame0.SizeX, Frame0.SizeY, Config.InChannel);
+  PackedInput := TNNetVolume.Create;
+  try
+    if Config.TimestepInput then
+    begin
+      for FramePos := 1 to MaxFramePos do
+        RIFEComputeFrame(NN, Config, Frame0, Frame1, FramePos / Factor,
+          PackedInput, Frames[FramePos - 1]);
+    end
+    else
+    begin
+      SetLength(Anchors, Factor + 1);
+      Anchors[0] := Frame0;
+      Anchors[Factor] := Frame1;
+      for FramePos := 1 to MaxFramePos do
+        Anchors[FramePos] := Frames[FramePos - 1];
+      FillMidpoints(0, Factor);
+    end;
+  finally
+    PackedInput.Free;
+  end;
 end;
 
 // ===========================================================================

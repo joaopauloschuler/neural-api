@@ -12,7 +12,7 @@ forward path EXACTLY (same idiom as tools/nafnet_tiny_fixture.py). Weights use a
 RIFE-style state_dict key scheme so the importer is exercised on a realistic key
 layout.
 
-This pico is scoped to ONE intermediate frame at t=0.5 (inference-only), a small
+The main pico is a t=0.5 model (inference-only), a small
 IFNet of 2 IFBlocks at full resolution with tiny channel counts. The genuinely
 new primitive being pinned is the differentiable BACKWARD-WARP
 (TNNetBackwardWarp): out(x,y) = image(x+dx(x,y), y+dy(x,y)), bilinear, flow in
@@ -38,9 +38,16 @@ IFNet (this pico): the input is the channel-concat [frame0(3) | frame1(3)] (6ch)
 
 Coded by Claude (AI).
 
+A second pico (tiny_rife_t.*) mirrors Practical-RIFE v4's TIMESTEP input: a
+constant plane filled with t is concatenated after the two frames, so every
+IFBlock reads 2*in_channel+1 = 7 planes [frame0 | frame1 | t]; its oracle runs at
+t=0.25. It reuses tiny_rife_config.json: the importer detects the timestep
+plane from the block0.conv0 input-plane count.
+
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/rife_tiny_fixture.py
-writes tests/fixtures/tiny_rife{.safetensors,_config.json,_io.json}.
+writes tests/fixtures/tiny_rife{.safetensors,_config.json,_io.json} and
+tests/fixtures/tiny_rife_t{.safetensors,_io.json}.
 Needs numpy + safetensors only.
 """
 import json
@@ -77,10 +84,10 @@ def add_ifblock(sd, prefix, in_planes, c):
     sd[prefix + 'prelu1.weight'] = randn(c, std=0.2) + 0.25
 
 
-def build_state_dict():
+def build_state_dict(in_planes=IN_PLANES):
     sd = {}
     for i in range(NUM_BLOCKS):
-        add_ifblock(sd, f'block{i}.', IN_PLANES, C)
+        add_ifblock(sd, f'block{i}.', in_planes, C)
     return sd
 
 
@@ -148,7 +155,7 @@ def ifblock(inp, sd, prefix):
 
 
 def forward(inp, sd):
-    # inp: (6,H,W) = [frame0(3) | frame1(3)]
+    # inp: (6,H,W) = [frame0(3) | frame1(3)], or (7,H,W) with a trailing t plane
     frame0 = inp[0:3]
     frame1 = inp[3:6]
     flow = np.zeros((4,) + inp.shape[1:], dtype=np.float64)
@@ -217,6 +224,32 @@ def main():
 
     # The mask must actually mix the two warped frames (not a degenerate 0/1).
     print('all fixture self-checks passed')
+
+    write_timestep_fixture(x)
+
+
+def write_timestep_fixture(frames):
+    # Practical-RIFE v4: timestep = (x[:, :1] * 0 + 1) * t appended after the
+    # two frames; every block reads [frame0 | frame1 | t].
+    t = 0.25
+    sd_f32 = {k: v.astype(np.float32)
+              for k, v in build_state_dict(IN_PLANES + 1).items()}
+    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
+    xt = np.concatenate([frames, np.full((1,) + frames.shape[1:], t)], 0)
+    img = forward(xt, sd)
+    other = forward(np.concatenate(
+        [frames, np.full((1,) + frames.shape[1:], 0.75)], 0), sd)
+    assert np.abs(img - other).max() > 1e-4, 'timestep plane had no effect'
+    # Shares tiny_rife_config.json: the timestep plane is detected, not configured.
+    save_file(sd_f32, 'tests/fixtures/tiny_rife_t.safetensors')
+    with open('tests/fixtures/tiny_rife_t_io.json', 'w') as f:
+        json.dump({
+            'input': frames.tolist(),  # (6,H,W) = [frame0 | frame1]
+            't': t,
+            'image': img.tolist(),     # (3,H,W) interpolated frame at t
+            'image_size': img.shape[1],
+        }, f)
+    print(f'wrote tiny_rife_t.* (timestep model, t={t})')
 
 
 if __name__ == '__main__':

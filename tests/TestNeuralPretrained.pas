@@ -1243,6 +1243,8 @@ type
     procedure TestLaMaOutpaintKeepsOriginal;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
+    procedure TestRIFETimestepParity;
+    procedure TestRIFEFrameSchedule;
     procedure TestSwinIRConfigFromJSONFile;
     procedure TestSwinIRParity;
     procedure TestRestormerParity;
@@ -48236,6 +48238,192 @@ begin
   finally
     RefRoot.Free;
     ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Loads the (6,S,S) [frame0 | frame1] 'input' of a RIFE io fixture into two
+// (S,S,3) frames.
+procedure LoadRIFEFixtureFrames(RootObj: TJSONObject; const Config: TRIFEConfig;
+  Frame0, Frame1: TNNetVolume);
+var
+  PairVol: TNNetVolume;
+begin
+  PairVol := TNNetVolume.Create;
+  try
+    LoadVqImageVolume(RootObj, 'input', Config.InputSize,
+      2 * Config.InChannel, PairVol);
+    Frame0.CopyChannels(PairVol, [0, 1, 2]);
+    Frame1.CopyChannels(PairVol, [3, 4, 5]);
+  finally
+    PairVol.Free;
+  end;
+end;
+
+// Practical-RIFE v4 timestep plane: tiny_rife_t.* has 7-plane IFBlocks
+// [frame0 | frame1 | t]; the oracle frame is at t=0.25
+// (tools/rife_tiny_fixture.py).
+procedure TTestNeuralPretrained.TestRIFETimestepParity;
+var
+  NN: TNNet;
+  Config: TRIFEConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Frame0, Frame1, Output, Expected, Third: TNNetVolume;
+  Frames: TNNetVolumeList;
+  OracleT: TNeuralFloat;
+begin
+  NN := BuildRIFEFromSafeTensors(FixturePath('tiny_rife_t.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_rife_config.json'));
+  RefJson := TStringList.Create;
+  Frame0 := TNNetVolume.Create;
+  Frame1 := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Third := TNNetVolume.Create;
+  Frames := TNNetVolumeList.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('timestep plane detected from block0.conv0',
+      Config.TimestepInput);
+    AssertEquals('input depth (frame0|frame1|t)', 2 * Config.InChannel + 1,
+      NN.Layers[0].Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_rife_t_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    OracleT := TJSONObject(RefRoot).Get('t', 0.0);
+    AssertEquals('oracle t', 0.25, OracleT, 0);
+    LoadRIFEFixtureFrames(TJSONObject(RefRoot), Config, Frame0, Frame1);
+    LoadVqImageVolume(TJSONObject(RefRoot), 'image', Config.InputSize,
+      Config.InChannel, Expected);
+    RIFEInterpolateAt(NN, Config, Frame0, Frame1, OracleT, Output);
+    Output.Sub(Expected);
+    AssertTrue('frame at t=0.25: max |diff| = ' +
+      FloatToStr(Output.GetMaxAbs()) +
+      ' must be < 1e-4', Output.GetMaxAbs() < 1e-4);
+    // Any factor: 4x puts t=0.25 first; 3x runs t=1/3 directly.
+    RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 4, Frames);
+    AssertEquals('4x frame count', 3, Frames.Count);
+    Frames[0].Sub(Expected);
+    AssertTrue('4x frame 1 is t=0.25', Frames[0].GetMaxAbs() < 1e-4);
+    RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 3, Frames);
+    AssertEquals('3x frame count', 2, Frames.Count);
+    RIFEInterpolateAt(NN, Config, Frame0, Frame1, 1 / 3, Third);
+    Third.Sub(Frames[0]);
+    AssertEquals('3x frame 1 is t=1/3', 0, Third.GetMaxAbs(), 0);
+  finally
+    RefRoot.Free;
+    Frames.Free;
+    Third.Free;
+    Expected.Free;
+    Output.Free;
+    Frame1.Free;
+    Frame0.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Midpoint recursion for a model without a timestep plane: 2x equals the
+// direct t=0.5 call, 4x is [mid(F0,M), M, mid(M,F1)], and RIFEInterpolateAt
+// bisects to the same dyadic frames.
+procedure TTestNeuralPretrained.TestRIFEFrameSchedule;
+var
+  NN: TNNet;
+  Config: TRIFEConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Frame0, Frame1, PackedInput: TNNetVolume;
+  Middle, Quarter, ThreeQuarter, Probe: TNNetVolume;
+  Frames: TNNetVolumeList;
+  Raised: boolean;
+
+  procedure ComputeMiddle(A, B, Dest: TNNetVolume);
+  begin
+    RIFEPackFrames(Config, A, B, 0.5, PackedInput);
+    NN.Compute(PackedInput);
+    Dest.Copy(NN.GetLastLayer().Output);
+  end;
+
+  function MaxDiff(A, B: TNNetVolume): TNeuralFloat;
+  begin
+    Probe.Copy(A);
+    Probe.Sub(B);
+    Result := Probe.GetMaxAbs();
+  end;
+
+begin
+  NN := BuildRIFEFromSafeTensors(FixturePath('tiny_rife.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_rife_config.json'));
+  RefJson := TStringList.Create;
+  Frame0 := TNNetVolume.Create;
+  Frame1 := TNNetVolume.Create;
+  PackedInput := TNNetVolume.Create;
+  Middle := TNNetVolume.Create;
+  Quarter := TNNetVolume.Create;
+  ThreeQuarter := TNNetVolume.Create;
+  Probe := TNNetVolume.Create;
+  Frames := TNNetVolumeList.Create;
+  RefRoot := nil;
+  try
+    AssertFalse('no timestep plane', Config.TimestepInput);
+    RefJson.LoadFromFile(FixturePath('tiny_rife_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadRIFEFixtureFrames(TJSONObject(RefRoot), Config, Frame0, Frame1);
+    ComputeMiddle(Frame0, Frame1, Middle);
+    LoadVqImageVolume(TJSONObject(RefRoot), 'image', Config.InputSize,
+      Config.InChannel, Probe);
+    Probe.Sub(Middle);
+    AssertTrue('packed middle vs oracle', Probe.GetMaxAbs() < 1e-4);
+    ComputeMiddle(Frame0, Middle, Quarter);
+    ComputeMiddle(Middle, Frame1, ThreeQuarter);
+
+    RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 2, Frames);
+    AssertEquals('2x frame count', 1, Frames.Count);
+    AssertEquals('2x = direct t=0.5', 0, MaxDiff(Frames[0], Middle), 0);
+
+    RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 4, Frames);
+    AssertEquals('4x frame count', 3, Frames.Count);
+    AssertEquals('4x frame 1 (t=0.25)', 0, MaxDiff(Frames[0], Quarter), 0);
+    AssertEquals('4x frame 2 (t=0.5)', 0, MaxDiff(Frames[1], Middle), 0);
+    AssertEquals('4x frame 3 (t=0.75)', 0, MaxDiff(Frames[2], ThreeQuarter), 0);
+    AssertTrue('t=0.25 differs from t=0.5', MaxDiff(Quarter, Middle) > 1e-6);
+
+    RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 8, Frames);
+    AssertEquals('8x frame count', 7, Frames.Count);
+    AssertEquals('8x frame 2 (t=0.25)', 0, MaxDiff(Frames[1], Quarter), 0);
+    AssertEquals('8x frame 6 (t=0.75)', 0, MaxDiff(Frames[5], ThreeQuarter), 0);
+
+    RIFEInterpolateAt(NN, Config, Frame0, Frame1, 0.75, Probe);
+    AssertEquals('bisect t=0.75', 0, MaxDiff(Probe, ThreeQuarter), 0);
+    RIFEInterpolateAt(NN, Config, Frame0, Frame1, 0.125, Probe);
+    AssertEquals('bisect t=0.125 = 8x frame 1', 0,
+      MaxDiff(Probe, Frames[0]), 0);
+
+    Raised := false;
+    try
+      RIFEInterpolateFrames(NN, Config, Frame0, Frame1, 3, Frames);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('non-power-of-two factor rejected', Raised);
+    Raised := false;
+    try
+      RIFEInterpolateAt(NN, Config, Frame0, Frame1, 0.3, Probe);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('non-dyadic t rejected', Raised);
+  finally
+    RefRoot.Free;
+    Frames.Free;
+    Probe.Free;
+    ThreeQuarter.Free;
+    Quarter.Free;
+    Middle.Free;
+    PackedInput.Free;
+    Frame1.Free;
+    Frame0.Free;
     RefJson.Free;
     NN.Free;
   end;

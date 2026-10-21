@@ -624,15 +624,18 @@ rather than acted on.
       + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
       with accumulated flow residuals + sigmoid fusion-mask blend; pico parity
       TestRIFEParity < 1e-4 vs a float64 numpy oracle;
-      examples/VideoFrameInterpolation one middle frame t=0.5, inference-only, on CPU):
+      examples/VideoFrameInterpolation --factor N / --t VALUE, inference-only, on CPU):
   - [ ] Real Practical-RIFE checkpoint parity (offline-download deferred): the real
           IFNet is MULTI-SCALE (stride-2 IFBlocks downsample then bilinearly upsample
           the predicted flow) and RE-FEEDS the warped frames + previous flow/mask into
           each successive block; v1 refines from the SAME [frame0|frame1] input at full
           resolution. Wire the scale schedule + warped-frame re-feeding and verify
           against an exported hzwer/Practical-RIFE checkpoint.
-  - [ ] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
+  - [X] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
         schedule (RIFE's timestep encoding + recursion).
+    - [ ] Verify the timestep-plane path on a real Practical-RIFE v4 checkpoint
+          (needs the multi-scale item above; v4 also feeds t to every refining
+          block alongside the warped frames, which v1 does not re-feed).
   - [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
         middle frame); inference-only path is landed.
 - [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
