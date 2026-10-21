@@ -28,7 +28,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
-  Classes, SysUtils, fpjson, jsonparser,
+  Classes, SysUtils,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuralsafetensors,
   neuralpretrained;
@@ -214,52 +214,6 @@ begin
   end;
 end;
 
-// A diffusers-layout Marigold folder over the pico UNet (conv_in widened to
-// 8 channels) and pico VAE; no text_encoder/ (the smoke sets the states).
-procedure WritePicoFolder(const Folder, PipelineClass: string);
-var
-  Lines: TStringList;
-  Root: TJSONData;
-  PredictionType: string;
-begin
-  ForceDirectories(Folder + 'scheduler');
-  ForceDirectories(Folder + 'unet');
-  ForceDirectories(Folder + 'vae');
-  Lines := TStringList.Create;
-  Root := nil;
-  try
-    if PipelineClass = 'MarigoldNormalsPipeline' then PredictionType := 'normals'
-    else PredictionType := 'depth';
-    Lines.Text := '{"_class_name": "' + PipelineClass + '", ' +
-      '"prediction_type": "' + PredictionType + '", "default_denoising_steps": 2, ' +
-      '"default_processing_resolution": 16, "use_full_z_range": true}';
-    Lines.SaveToFile(Folder + 'model_index.json');
-    // prs-eth/marigold-depth-v1-1 scheduler settings.
-    Lines.Text := '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
-      '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
-      '"clip_sample": false, "num_train_timesteps": 1000, ' +
-      '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
-      '"set_alpha_to_one": false, "timestep_spacing": "trailing"}';
-    Lines.SaveToFile(Folder + 'scheduler' + DirectorySeparator +
-      'scheduler_config.json');
-    Lines.LoadFromFile(FixturesDir + 'tiny_sd_unet_linproj_config.json');
-    Root := GetJSON(Lines.Text);
-    TJSONObject(Root).Integers['in_channels'] := 8;
-    Lines.Text := Root.FormatJSON();
-    Lines.SaveToFile(Folder + 'unet' + DirectorySeparator + 'config.json');
-    MarigoldWidenUNetConvIn(FixturesDir + 'tiny_sd_unet_linproj.safetensors',
-      Folder + 'unet' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
-    Lines.LoadFromFile(FixturesDir + 'tiny_vae_encoder_config.json');
-    Lines.SaveToFile(Folder + 'vae' + DirectorySeparator + 'config.json');
-    MergeSafeTensorsFiles([FixturesDir + 'tiny_vae_encoder.safetensors',
-      FixturesDir + 'tiny_vae_decoder.safetensors'],
-      Folder + 'vae' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
-  finally
-    Root.Free;
-    Lines.Free;
-  end;
-end;
-
 // Builds a 24x16 RGB gradient (0..255) so the smoke needs no input asset.
 procedure MakeTinyImage(V: TNNetVolume);
 var
@@ -302,12 +256,12 @@ begin
       'cai_marigold_pico_example');
     if TaskPos = 0 then
     begin
-      WritePicoFolder(Folder, 'MarigoldDepthPipeline');
+      WriteMarigoldPicoFolder(FixturesDir, Folder, 'MarigoldDepthPipeline');
       Opt.OutputFile := 'marigold_depth.png';
     end
     else
     begin
-      WritePicoFolder(Folder, 'MarigoldNormalsPipeline');
+      WriteMarigoldPicoFolder(FixturesDir, Folder, 'MarigoldNormalsPipeline');
       Opt.OutputFile := 'marigold_normals.png';
     end;
     Pipeline := TMarigoldPipeline.Create(Folder);

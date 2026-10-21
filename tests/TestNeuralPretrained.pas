@@ -46,9 +46,6 @@ type
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
-    // A diffusers-layout Marigold folder over the pico UNet and VAE fixtures
-    // (no text_encoder/: its width differs from the UNet's cross_attention_dim).
-    procedure WriteMarigoldPicoFolder(const Folder, PipelineClass: string);
     // Checks tests/fixtures/torch_head/<pFixtureName>/head.pt against that
     // entry of torch_head/expected.json: every tensor and metadata leaf.
     procedure CheckTorchHeadFixture(const pFixtureName: string);
@@ -42527,50 +42524,6 @@ begin
   MarigoldWidenUNetConvIn(FixturePath('tiny_sd_unet_linproj.safetensors'), Path);
 end;
 
-procedure TTestNeuralPretrained.WriteMarigoldPicoFolder(const Folder,
-  PipelineClass: string);
-var
-  Lines: TStringList;
-  Root: TJSONData;
-  PredictionType: string;
-begin
-  ForceDirectories(Folder + 'scheduler');
-  ForceDirectories(Folder + 'unet');
-  ForceDirectories(Folder + 'vae');
-  Lines := TStringList.Create;
-  Root := nil;
-  try
-    if PipelineClass = 'MarigoldNormalsPipeline' then PredictionType := 'normals'
-    else PredictionType := 'depth';
-    Lines.Text := '{"_class_name": "' + PipelineClass + '", ' +
-      '"prediction_type": "' + PredictionType + '", "default_denoising_steps": 2, ' +
-      '"default_processing_resolution": 16, "use_full_z_range": true}';
-    Lines.SaveToFile(Folder + 'model_index.json');
-    Lines.Text := '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
-      '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
-      '"clip_sample": false, "num_train_timesteps": 1000, ' +
-      '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
-      '"set_alpha_to_one": false, "timestep_spacing": "trailing"}';
-    Lines.SaveToFile(Folder + 'scheduler' + DirectorySeparator +
-      'scheduler_config.json');
-    Lines.LoadFromFile(FixturePath('tiny_sd_unet_linproj_config.json'));
-    Root := GetJSON(Lines.Text);
-    TJSONObject(Root).Integers['in_channels'] := 8;
-    Lines.Text := Root.FormatJSON();
-    Lines.SaveToFile(Folder + 'unet' + DirectorySeparator + 'config.json');
-    WriteMarigoldPicoUNet(Folder + 'unet' + DirectorySeparator +
-      'diffusion_pytorch_model.safetensors');
-    Lines.LoadFromFile(FixturePath('tiny_vae_encoder_config.json'));
-    Lines.SaveToFile(Folder + 'vae' + DirectorySeparator + 'config.json');
-    MergeSafeTensorsFiles([FixturePath('tiny_vae_encoder.safetensors'),
-      FixturePath('tiny_vae_decoder.safetensors')],
-      Folder + 'vae' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
-  finally
-    Root.Free;
-    Lines.Free;
-  end;
-end;
-
 // Marigold building blocks on pico nets: VAE-encode an image to its latent, widen
 // the linear-projection (SD2-style) pico UNet's conv_in to 8 input channels and
 // run MarigoldDenoise with Marigold's scheduler options. A hand-written loop with
@@ -43208,7 +43161,7 @@ const
   cSeed = 31337;
   cMembers = 2;
 var
-  Folder: string;
+  Folder, PipelineClass: string;
   Pipeline: TMarigoldPipeline;
   Enc, Dec, UNet: TNNet;
   VaeConfig: TVaeDecoderConfig;
@@ -43232,10 +43185,11 @@ begin
           Image[X, Y, C] := 0.5 + 0.5 * Sin(0.4 * X + 0.7 * Y + C);
     for PredictNormals := false to true do
     begin
-      if PredictNormals then
-        WriteMarigoldPicoFolder(Folder, 'MarigoldNormalsPipeline')
-      else
-        WriteMarigoldPicoFolder(Folder, 'MarigoldDepthPipeline');
+      if PredictNormals then PipelineClass := 'MarigoldNormalsPipeline'
+      else PipelineClass := 'MarigoldDepthPipeline';
+      WriteMarigoldPicoFolder(
+        ExtractFilePath(FixturePath('tiny_sd_unet_linproj.safetensors')), Folder,
+        PipelineClass);
       Pipeline := TMarigoldPipeline.Create(Folder);
       AssertEquals('normals from _class_name', PredictNormals,
         Pipeline.PredictNormals);

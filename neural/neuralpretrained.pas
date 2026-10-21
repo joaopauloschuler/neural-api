@@ -11823,6 +11823,10 @@ procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
 // conv_in.weight [O,C,k,k] duplicated to [O,2C,k,k] and halved.
 procedure MarigoldWidenUNetConvIn(const SourceFile, DestFile: string);
 
+// Writes a diffusers-layout Marigold folder (PipelineClass = MarigoldDepthPipeline
+// or MarigoldNormalsPipeline) from the random pico fixtures in FixturesDir; no text_encoder/.
+procedure WriteMarigoldPicoFolder(const FixturesDir, Folder, PipelineClass: string);
+
 type
   // Marigold depth / surface normals (diffusers MarigoldDepthPipeline and
   // MarigoldNormalsPipeline) over a model_index.json folder. Predict builds the
@@ -75475,6 +75479,52 @@ begin
     Weights.Free;
     Writer.Free;
     Reader.Free;
+  end;
+end;
+
+procedure WriteMarigoldPicoFolder(const FixturesDir, Folder, PipelineClass: string);
+var
+  Lines: TStringList;
+  Root: TJSONData;
+  PredictionType, Fixtures: string;
+begin
+  Fixtures := IncludeTrailingPathDelimiter(FixturesDir);
+  ForceDirectories(Folder + 'scheduler');
+  ForceDirectories(Folder + 'unet');
+  ForceDirectories(Folder + 'vae');
+  Lines := TStringList.Create;
+  Root := nil;
+  try
+    if PipelineClass = 'MarigoldNormalsPipeline' then PredictionType := 'normals'
+    else PredictionType := 'depth';
+    Lines.Text := '{"_class_name": "' + PipelineClass + '", ' +
+      '"prediction_type": "' + PredictionType + '", "default_denoising_steps": 2, ' +
+      '"default_processing_resolution": 16, "use_full_z_range": true}';
+    Lines.SaveToFile(Folder + 'model_index.json');
+    // prs-eth/marigold-depth-v1-1 scheduler settings.
+    Lines.Text := '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
+      '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+      '"clip_sample": false, "num_train_timesteps": 1000, ' +
+      '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
+      '"set_alpha_to_one": false, "timestep_spacing": "trailing"}';
+    Lines.SaveToFile(Folder + 'scheduler' + DirectorySeparator +
+      'scheduler_config.json');
+    // Marigold's UNet reads the image latent ++ the target latent: 8 channels.
+    Lines.LoadFromFile(Fixtures + 'tiny_sd_unet_linproj_config.json');
+    Root := GetJSON(Lines.Text);
+    TJSONObject(Root).Integers['in_channels'] := 8;
+    Lines.Text := Root.FormatJSON();
+    Lines.SaveToFile(Folder + 'unet' + DirectorySeparator + 'config.json');
+    MarigoldWidenUNetConvIn(Fixtures + 'tiny_sd_unet_linproj.safetensors',
+      Folder + 'unet' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
+    Lines.LoadFromFile(Fixtures + 'tiny_vae_encoder_config.json');
+    Lines.SaveToFile(Folder + 'vae' + DirectorySeparator + 'config.json');
+    MergeSafeTensorsFiles([Fixtures + 'tiny_vae_encoder.safetensors',
+      Fixtures + 'tiny_vae_decoder.safetensors'],
+      Folder + 'vae' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
+  finally
+    Root.Free;
+    Lines.Free;
   end;
 end;
 
