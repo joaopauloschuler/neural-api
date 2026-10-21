@@ -1013,6 +1013,15 @@ type
     // its resident chain with ForceOpenCL off.
     procedure RoIAlignOpenCLParity;
     procedure RoIAlignResidentChainOpenCL;
+    // TNNetTransposedChannelAttention: a hand-computed forward, the numerical
+    // input and temperature gradients, and a save/load round trip.
+    procedure TestTransposedChannelAttentionForward;
+    procedure TestTransposedChannelAttentionGradientCheck;
+    procedure TestTransposedChannelAttentionSerializationRoundTrip;
+    // Its OpenCL forward vs CPU (forced, host and resident sources), and a
+    // resident chain with ForceOpenCL off.
+    procedure TransposedChannelAttentionOpenCLParity;
+    procedure TransposedChannelAttentionResidentChainOpenCL;
     // TNNetLocalResponseNorm2D / Depth OpenCL forward vs CPU, and both in a
     // resident chain with ForceOpenCL off.
     procedure LocalResponseNormOpenCLParity;
@@ -88277,6 +88286,386 @@ begin
     AssertTrue('RoIAlign resident chain vs CPU max |diff| = ' +
       FloatToStr(MaxDiff), MaxDiff < 1e-4);
   finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// --- TNNetTransposedChannelAttention ----------------------------------------
+
+// Fills a W x H x 3C [q|k|v] input with smooth, position-varying values.
+procedure FillTransposedAttnInput(Input: TNNetVolume; Phase: TNeuralFloat);
+var
+  Pos, MaxPos: integer;
+begin
+  MaxPos := Input.Size - 1;
+  for Pos := 0 to MaxPos do
+    Input.Raw[Pos] := Sin(Pos * 0.53 + Phase) * 0.9 + 0.3 * Cos(Pos * 1.7);
+end;
+
+// One head, C = 2, two positions, temperature 2, against the closed form:
+// qn0 = (0.6,0.8), qn1 = (1,0), kn0 = (0,1), kn1 = (0.8,0.6), so S = [[0.8,0.96],[0,0.8]].
+// Then Heads = C (one channel per head), where every softmax is 1 and Y = v.
+procedure TTestNeuralNumerical.TestTransposedChannelAttentionForward;
+const
+  // Per position: q0, q1, k0, k1, v0, v1.
+  csInput: array[0..1, 0..5] of TNeuralFloat = (
+    (3, 1, 0, 4, 1, -1),
+    (4, 0, 2, 3, 2, 3));
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetTransposedChannelAttention;
+  A00, A01, A10, A11, Expected: TNeuralFloat;
+  PositionPos, DepthPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 6));
+    Attn := TNNetTransposedChannelAttention.Create(1);
+    NN.AddLayer(Attn);
+    AssertEquals('one temperature per head', 1, Attn.Neurons[0].Weights.Size);
+    AssertEquals('temperature init', 1, Attn.Neurons[0].Weights.Raw[0], 0);
+    AssertEquals('output depth is C', 2, Attn.Output.Depth);
+    Attn.Neurons[0].Weights.Raw[0] := 2;
+    for PositionPos := 0 to 1 do
+      for DepthPos := 0 to 5 do
+        Input[PositionPos, 0, DepthPos] := csInput[PositionPos, DepthPos];
+    NN.Compute(Input);
+    // Row 0 logits (1.6, 1.92); row 1 logits (0, 1.6).
+    A01 := 1 / (1 + Exp(-0.32));
+    A00 := 1 - A01;
+    A11 := 1 / (1 + Exp(-1.6));
+    A10 := 1 - A11;
+    for PositionPos := 0 to 1 do
+    begin
+      Expected := A00 * csInput[PositionPos, 4] + A01 * csInput[PositionPos, 5];
+      AssertEquals('Y channel 0 at position ' + IntToStr(PositionPos), Expected,
+        Attn.Output[PositionPos, 0, 0], 1e-5);
+      Expected := A10 * csInput[PositionPos, 4] + A11 * csInput[PositionPos, 5];
+      AssertEquals('Y channel 1 at position ' + IntToStr(PositionPos), Expected,
+        Attn.Output[PositionPos, 0, 1], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 9);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 9));
+    NN.AddLayer(TNNetTransposedChannelAttention.Create(3));
+    FillTransposedAttnInput(Input, 0.2);
+    NN.Compute(Input);
+    for PositionPos := 0 to 5 do
+      for DepthPos := 0 to 2 do
+        AssertEquals('one channel per head gives Y = v', Input.Raw[PositionPos * 9 + 6 + DepthPos],
+          NN.GetLastLayer.Output.Raw[PositionPos * 3 + DepthPos], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Two heads of three channels on a 3x2 map: central differences of
+// 0.5*|Y - Desired|^2 against the analytical temperature and input gradients.
+procedure TTestNeuralNumerical.TestTransposedChannelAttentionGradientCheck;
+const
+  csHeads = 2;
+  csChannels = 6;
+  csEpsilon = 1e-3;
+  csTemperatures: array[0..csHeads - 1] of TNeuralFloat = (0.7, 1.6);
+var
+  NN: TNNet;
+  Input, Desired, AnalyticalInputGrad: TNNetVolume;
+  Attn: TNNetTransposedChannelAttention;
+  HeadPos, Pos, MaxPos: integer;
+  Saved, LossPlus, LossMinus, Numerical, Analytical: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    OutPos, MaxOutPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    MaxOutPos := NN.GetLastLayer.Output.Size - 1;
+    for OutPos := 0 to MaxOutPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutPos] - Desired.Raw[OutPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 2, 3 * csChannels);
+  Desired := TNNetVolume.Create(3, 2, csChannels);
+  AnalyticalInputGrad := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 3 * csChannels, 1));
+    Attn := TNNetTransposedChannelAttention.Create(csHeads);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for HeadPos := 0 to csHeads - 1 do
+      Attn.Neurons[0].Weights.Raw[HeadPos] := csTemperatures[HeadPos];
+    FillTransposedAttnInput(Input, 0.1);
+    MaxPos := Desired.Size - 1;
+    for Pos := 0 to MaxPos do
+      Desired.Raw[Pos] := Cos(Pos * 0.31) * 0.5;
+
+    // Analytical gradients: BatchUpdate keeps Delta = -lr * grad, lr = 1.
+    ComputeLoss();
+    Attn.Neurons[0].ClearDelta;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    AnalyticalInputGrad.Copy(NN.Layers[0].OutputError);
+
+    for HeadPos := 0 to csHeads - 1 do
+    begin
+      Analytical := -Attn.Neurons[0].Delta.Raw[HeadPos];
+      Saved := Attn.Neurons[0].Weights.Raw[HeadPos];
+      Attn.Neurons[0].Weights.Raw[HeadPos] := Saved + csEpsilon;
+      LossPlus := ComputeLoss();
+      Attn.Neurons[0].Weights.Raw[HeadPos] := Saved - csEpsilon;
+      LossMinus := ComputeLoss();
+      Attn.Neurons[0].Weights.Raw[HeadPos] := Saved;
+      Numerical := (LossPlus - LossMinus) / (2 * csEpsilon);
+      AssertTrue('temperature gradient of head ' + IntToStr(HeadPos) +
+        ' num=' + FloatToStr(Numerical) + ' ana=' + FloatToStr(Analytical),
+        Abs(Numerical - Analytical) < 2e-3);
+    end;
+
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+    begin
+      Saved := Input.Raw[Pos];
+      Input.Raw[Pos] := Saved + csEpsilon;
+      LossPlus := ComputeLoss();
+      Input.Raw[Pos] := Saved - csEpsilon;
+      LossMinus := ComputeLoss();
+      Input.Raw[Pos] := Saved;
+      Numerical := (LossPlus - LossMinus) / (2 * csEpsilon);
+      Analytical := AnalyticalInputGrad.Raw[Pos];
+      AssertTrue('input gradient at ' + IntToStr(Pos) + ' num=' +
+        FloatToStr(Numerical) + ' ana=' + FloatToStr(Analytical),
+        Abs(Numerical - Analytical) < 2e-3);
+    end;
+  finally
+    AnalyticalInputGrad.Free;
+    Desired.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// SaveToString/LoadFromString rebuilds the layer through CreateLayer with its
+// head count and trained temperatures, and reproduces the forward.
+procedure TTestNeuralNumerical.TestTransposedChannelAttentionSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetTransposedChannelAttention;
+  Pos, MaxPos: integer;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 24);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 24));
+    Attn := TNNetTransposedChannelAttention.Create(2);
+    NN.AddLayer(Attn);
+    Attn.Neurons[0].Weights.Raw[0] := 0.5;
+    Attn.Neurons[0].Weights.Raw[1] := 2.5;
+    FillTransposedAttnInput(Input, 0.4);
+    NN.Compute(Input);
+    NN2.LoadFromString(NN.SaveToString());
+    AssertTrue('reloaded layer class', NN2.Layers[1] is TNNetTransposedChannelAttention);
+    Attn2 := NN2.Layers[1] as TNNetTransposedChannelAttention;
+    AssertEquals('reloaded head count', 2, Attn2.Heads);
+    AssertEquals('reloaded temperature 0', 0.5, Attn2.Neurons[0].Weights.Raw[0], 1e-6);
+    AssertEquals('reloaded temperature 1', 2.5, Attn2.Neurons[0].Weights.Raw[1], 1e-6);
+    NN2.Compute(Input);
+    MaxPos := NN.GetLastLayer.Output.Size - 1;
+    AssertEquals('reloaded output size', NN.GetLastLayer.Output.Size,
+      NN2.GetLastLayer.Output.Size);
+    for Pos := 0 to MaxPos do
+      AssertEquals('reloaded output at ' + IntToStr(Pos),
+        NN.GetLastLayer.Output.Raw[Pos], NN2.GetLastLayer.Output.Raw[Pos], 1e-6);
+  finally
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// TNNetTransposedChannelAttention forced into OpenCL vs its CPU Compute, fed by a
+// host-only TNNetIdentity (upload) or the resident TNNetInput (bind), over several
+// head layouts and a map wider than one work-group; a temperature change between
+// OpenCL forwards reaches the kernel. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TransposedChannelAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 4;
+  SizeXs: array[0..CaseCount-1] of integer = (5, 7, 20, 3);
+  SizeYs: array[0..CaseCount-1] of integer = (4, 3, 15, 1);
+  ChannelCounts: array[0..CaseCount-1] of integer = (8, 12, 6, 3);
+  HeadCounts: array[0..CaseCount-1] of integer = (2, 3, 1, 3);
+var
+  NN: TNNet;
+  Input, OutCPUA, OutCPUB, TemperatureA: TNNetVolume;
+  Attn: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, HostSource, HeadPos: integer;
+  DiffA, DiffB: TNeuralFloat;
+  SourceBindable: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for HostSource := 0 to 1 do
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 6100 + CaseIdx;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx],
+      3 * ChannelCounts[CaseIdx]);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    TemperatureA := TNNetVolume.Create();
+    try
+      FillTransposedAttnInput(Input, CaseIdx);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      if HostSource = 1 then NN.AddLayer(TNNetIdentity.Create());
+      Attn := NN.AddLayer(TNNetTransposedChannelAttention.Create(HeadCounts[CaseIdx]));
+      NN.SetTrainable(False, False);
+      SetRandomNeuronWeights(Attn, 0, 1.5, 2);
+      TemperatureA.Copy(Attn.Neurons[0].Weights);
+      NN.Compute(Input);
+      OutCPUA.Copy(Attn.Output);
+      for HeadPos := 0 to HeadCounts[CaseIdx] - 1 do
+        Attn.Neurons[0].Weights.Raw[HeadPos] := 3 - HeadPos * 0.7;
+      NN.Compute(Input);
+      OutCPUB.Copy(Attn.Output);
+      Attn.Neurons[0].Weights.Copy(TemperatureA);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Attn.ForceOpenCL(True);
+      try
+        NN.Compute(Input);
+        SourceBindable := Attn.PrevLayer.OutputBindableOnOpenCL();
+        Attn.ForceOutputOnRAM();
+        DiffA := MaxAbsDiffToOutput(OutCPUA, Attn.Output);
+        for HeadPos := 0 to HeadCounts[CaseIdx] - 1 do
+          Attn.Neurons[0].Weights.Raw[HeadPos] := 3 - HeadPos * 0.7;
+        NN.Compute(Input);
+        Attn.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffToOutput(OutCPUB, Attn.Output);
+      finally
+        Attn.ForceOpenCL(False);
+      end;
+      WriteLn('  TransposedChannelAttention OpenCL ', Input.SizeX, 'x',
+        Input.SizeY, 'x', Input.Depth, ' heads=', HeadCounts[CaseIdx],
+        ' host source=', HostSource, ' bound=', SourceBindable,
+        ': max|diff| A=', DiffA:0:9, ' B=', DiffB:0:9);
+      AssertEquals('both forwards ran in OpenCL', 2, Attn.ForwardGPUCnt);
+      AssertEquals('source residency follows the case', HostSource = 0,
+        SourceBindable);
+      AssertTrue('OpenCL vs CPU max |diff| = ' + FloatToStr(DiffA), DiffA < 1e-5);
+      AssertTrue('OpenCL vs CPU after a temperature change: max |diff| = ' +
+        FloatToStr(DiffB), DiffB < 1e-5);
+    finally
+      TemperatureA.Free; OutCPUB.Free; OutCPUA.Free; Input.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv (3C) -> TNNetTransposedChannelAttention
+// -> pointwise conv. The attention binds the resident conv output and keeps its own
+// resident (host copies keep a sentinel); one upload and one download per forward.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TransposedChannelAttentionResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Attn, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4343;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 7, 5);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(9, 7, 5));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * 8));
+    Attn := NN.AddLayer(TNNetTransposedChannelAttention.Create(2));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    Attn.Neurons[0].Weights.Raw[0] := 1.7;
+    Attn.Neurons[0].Weights.Raw[1] := 0.6;
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    Attn.Output.Fill(csSentinel);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    WriteLn('  TransposedChannelAttention resident chain: gpu forwards conv=',
+      Conv.ForwardGPUCnt, ' attn=', Attn.ForwardGPUCnt, ' proj=',
+      Proj.ForwardGPUCnt, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('the attention must follow its resident source',
+      Attn.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident attention output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('attention host output not downloaded', csSentinel,
+      Attn.Output.Raw[Attn.Output.Size - 1], 0);
+    AssertEquals('only the input is uploaded', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+    WriteLn('  TransposedChannelAttention resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('resident chain vs CPU max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    OpenCLTransferCounting := WasCounting;
     OutCPU.Free; Input.Free; NN.Free;
   end;
 end;

@@ -3095,6 +3095,115 @@ __kernel void cai_roi_align
   FDst[g_id] = acc * FCountInv;
 }
 
+// Transposed channel attention (TNNetTransposedChannelAttention, Restormer MDTA).
+// X is FNumPositions x 3*FC, [q|k|v] head-major. One work-group per dot product
+// over the positions: group g < FC*FCh is q[r].k[FC + h*FCh + j] with
+// g = r*FCh + j, h = r / FCh; group FC*FCh + s is the sum of squares of q|k
+// channel s (s < 2*FC). FScratch holds get_local_size(0) floats (a power of two).
+// Coded by Claude (AI).
+__kernel void cai_transposed_attn_dots
+(
+  const int FNumPositions,
+  const int FC,
+  const int FCh,
+  __global const float* FX,
+  __global float* FDots,
+  __local float* FScratch
+)
+{
+  const int g = get_group_id(0);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int GramCount = FC * FCh;
+  const int IsGram = g < GramCount;
+  const int Row = g / FCh;
+  const int Col = g - Row * FCh;
+  const int Head = Row / FCh;
+  const int SquareChannel = g - GramCount;
+  const int ChannelA = IsGram ? Row : SquareChannel;
+  const int ChannelB = IsGram ? (FC + Head * FCh + Col) : SquareChannel;
+  const int Stride = 3 * FC;
+  int s;
+  float acc = 0.0f;
+  for (int p = lid; p < FNumPositions; p += lsize)
+    acc = mad(FX[p * Stride + ChannelA], FX[p * Stride + ChannelB], acc);
+  FScratch[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) FDots[g] = FScratch[0];
+}
+
+// One work-item per q row r (head h = r / FCh): FAttn[r*FCh + j] =
+// softmax_j(t[h] * G[r,j] / (max(|q_r|, eps) * max(|k_j|, eps))), G and the
+// squared norms read from cai_transposed_attn_dots. The sums of squares are
+// >= 0 and the exp arguments <= 0, so no branch can trap. Coded by Claude (AI).
+__kernel void cai_transposed_attn_softmax
+(
+  const int FC,
+  const int FCh,
+  const float FEps,
+  __global const float* FTemperature,
+  __global const float* FDots,
+  __global float* FAttn
+)
+{
+  const int Row = get_global_id(0);
+  if (Row >= FC) return;
+  const int Head = Row / FCh;
+  const int SquareBase = FC * FCh;
+  const int KeySquareBase = SquareBase + FC + Head * FCh;
+  const int RowBase = Row * FCh;
+  const float RowScale = FTemperature[Head] / fmax(sqrt(FDots[SquareBase + Row]), FEps);
+  float MaxLogit = -FLT_MAX;
+  float SumExp = 0.0f;
+  int j;
+  for (j = 0; j < FCh; j++)
+  {
+    const float Logit = FDots[RowBase + j] * RowScale /
+      fmax(sqrt(FDots[KeySquareBase + j]), FEps);
+    FAttn[RowBase + j] = Logit;
+    MaxLogit = fmax(MaxLogit, Logit);
+  }
+  for (j = 0; j < FCh; j++)
+  {
+    const float E = exp(FAttn[RowBase + j] - MaxLogit);
+    FAttn[RowBase + j] = E;
+    SumExp += E;
+  }
+  const float InvSum = 1.0f / SumExp;
+  for (j = 0; j < FCh; j++) FAttn[RowBase + j] *= InvSum;
+}
+
+// One work-item per output (p, c), h = c / FCh:
+// FY[p*FC + c] = sum_j FAttn[c*FCh + j] * v[p, h*FCh + j], v at depth 2*FC of X.
+// Coded by Claude (AI).
+__kernel void cai_transposed_attn_apply
+(
+  const int FNumPositions,
+  const int FC,
+  const int FCh,
+  __global const float* FAttn,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumPositions * FC) return;
+  const int p = g_id / FC;
+  const int c = g_id - p * FC;
+  const int Head = c / FCh;
+  const int ValueBase = p * 3 * FC + 2 * FC + Head * FCh;
+  const int RowBase = c * FCh;
+  float acc = 0.0f;
+  for (int j = 0; j < FCh; j++)
+    acc = mad(FAttn[RowBase + j], FX[ValueBase + j], acc);
+  FY[g_id] = acc;
+}
+
 // Local response normalization forward (TNNetLocalResponseNorm2D / Depth). One
 // work-item per (x,y,d): Dst = Src / (1 + FScale * sum Src^2)^FBeta, the sum over
 // the clamped box of half-widths FHalfX/FHalfY/FHalfD. The base is >= 1, so pow

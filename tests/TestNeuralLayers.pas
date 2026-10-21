@@ -2821,6 +2821,12 @@ begin
          Result.AddLayer(T(TNNetMLSTMCell.Create()));
          Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
        end;
+    18: begin
+         Result.AddLayer(TNNetInput.Create(3, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(12)));
+         Result.AddLayer(T(TNNetTransposedChannelAttention.Create(2)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
   end;
   if not pTrainable then Result.SetTrainable(false, pLowMemory);
   // Retention has no softmax to bound its scores; 0.05 overflows it in 3 steps.
@@ -3047,7 +3053,8 @@ begin
     'Retention (learned gamma)', 'CrossAttention', 'T5RelPosBiasAttention',
     'DifferentialAttention', 'LinformerAttention', 'GatedResidual',
     'CapsuleRouting', 'HardConcrete', 'GRN', 'APL', 'SplineActivation',
-    'Invertible1x1Conv', 'MLSTMCell'], @BuildScratchRoundTripNetA, 0);
+    'Invertible1x1Conv', 'MLSTMCell', 'TransposedChannelAttention'],
+    @BuildScratchRoundTripNetA, 0);
 end;
 
 procedure TTestNeuralLayers.TestSetTrainableRoundTripScratchLayersB;

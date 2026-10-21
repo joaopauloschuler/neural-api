@@ -5894,6 +5894,30 @@ type
     function BufferBytes(): int64; override;
   end;
 
+  /// OpenCL forward helper for TNNetTransposedChannelAttention: cai_transposed_attn_dots,
+  // _softmax and _apply, all on FKernel's queue. Coded by Claude (AI).
+  TNNetTransposedChannelAttentionCL = class(TNNetKernelCL)
+  private
+    FDotsKernel, FSoftmaxKernel: cl_kernel;
+    // Persistent buffers (grow-only): the uploaded host source, the dot
+    // products, the attention map, the temperatures and the result.
+    FBufX, FBufDots, FBufAttn, FBufTemperature, FBufY: cl_mem;
+    FCapX, FCapDots, FCapAttn, FCapTemperature, FCapY: csize_t;
+    // The temperatures FBufTemperature holds, so an unchanged weight is not re-uploaded.
+    FUploadedTemperature: TNNetVolume;
+    FTemperatureUploaded: boolean;
+  public
+    constructor Create(NN: TNNet; pHeads: integer);
+    destructor Destroy(); override;
+    // Attends X (positions x 3*Channels) into Y (positions x Channels); pExternalSrc
+    // is bound instead of uploading X. The result stays in ResultBuffer.
+    procedure Attend(X, Y, Temperature: TNNetVolume;
+      Channels, HeadChannels: integer; Eps: TNeuralFloat; pExternalSrc: cl_mem);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   /// OpenCL forward helper for TNNetConvGRUCell: the two elementwise steps around
   // its gate convolutions (cai_conv_gru_reset_input, cai_conv_gru_blend). Coded by Claude (AI).
   TNNetConvGRUCellCL = class(TNNetKernelCL)
@@ -8324,6 +8348,49 @@ type
     procedure Backpropagate(); override;
     property Dk: integer read FDk;
     property NumFeatures: integer read FM;
+  end;
+
+  /// Transposed (channel-wise) multi-head attention: the core of Restormer's MDTA
+  // (Zamir et al. 2022, https://arxiv.org/abs/2111.09881), the same math as
+  // XCiT's cross-covariance attention. Input: W x H x 3C, [q|k|v] along depth,
+  // each head-major (head h owns channels h*Ch..h*Ch+Ch-1, Ch = C/Heads).
+  // Per head, q and k channels are L2-normalized over the W*H positions
+  // (x / max(||x||, 1e-12), torch F.normalize), A = softmax_j(t[h] * qn_i.kn_j)
+  // is a Ch x Ch map and Y[p, h*Ch+i] = sum_j A[i,j] * v[p, h*Ch+j].
+  // Output: W x H x C. Cost is linear in W*H; no W*H x W*H map is formed.
+  // Storage: FNeurons[0].Weights = the Heads temperatures t[h] (init 1; torch's
+  // temperature of shape (heads,1,1)). Heads is FStruct[0].
+  // Coded by Claude (AI).
+  TNNetTransposedChannelAttention = class(TNNetLayer)
+  private
+    FHeads, FChannels, FHeadChannels: integer;
+    // Forward caches the backward reads, sized (Ch, Heads, Ch) so row h*Ch+i is
+    // contiguous over j: the cosine scores S and the softmax A = softmax(t*S).
+    FScores, FAttn: TNNetVolume;
+    // Per q|k channel (2C): 1/max(||x||, eps), and 1/||x||^2 (0 at or below eps).
+    FInvNorm, FInvNormSqr: TNNetVolume;
+    // Backward scratch: dA, turned into dG in place; the per-channel norm term.
+    FGradAttn, FNormTerm: TNNetVolume;
+    {$IFDEF OpenCL}
+    FTransposedAttnCL: TNNetTransposedChannelAttentionCL;
+    {$ENDIF}
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pHeads: integer); reintroduce; overload;
+    destructor Destroy(); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Inference only: the OpenCL forward leaves the backward's caches unset.
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
+    property Heads: integer read FHeads;
   end;
 
   /// Causal (autoregressive) linear attention. Same feature map phi(x)=elu(x)+1
@@ -41464,6 +41531,113 @@ begin
   end;
 end;
 
+{ TNNetTransposedChannelAttentionCL }
+
+constructor TNNetTransposedChannelAttentionCL.Create(NN: TNNet; pHeads: integer);
+begin
+  inherited Create(NN, 'cai_transposed_attn_apply');
+  // Same TNeuralKernel as the apply pass: one in-order queue orders the three.
+  FDotsKernel := FKernel.CreateKernel('cai_transposed_attn_dots');
+  FSoftmaxKernel := FKernel.CreateKernel('cai_transposed_attn_softmax');
+  FUploadedTemperature := TNNetVolume.Create(pHeads, 1, 1);
+end;
+
+destructor TNNetTransposedChannelAttentionCL.Destroy();
+begin
+  if Assigned(FDotsKernel) then clReleaseKernel(FDotsKernel);
+  if Assigned(FSoftmaxKernel) then clReleaseKernel(FSoftmaxKernel);
+  if Assigned(FBufX) then clReleaseMemObject(FBufX);
+  if Assigned(FBufDots) then clReleaseMemObject(FBufDots);
+  if Assigned(FBufAttn) then clReleaseMemObject(FBufAttn);
+  if Assigned(FBufTemperature) then clReleaseMemObject(FBufTemperature);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  FUploadedTemperature.Free;
+  inherited Destroy();
+end;
+
+function TNNetTransposedChannelAttentionCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetTransposedChannelAttentionCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetTransposedChannelAttentionCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufDots) +
+    OpenCLMemBytes(FBufAttn) + OpenCLMemBytes(FBufTemperature) +
+    OpenCLMemBytes(FBufY);
+end;
+
+procedure TNNetTransposedChannelAttentionCL.Attend(X, Y,
+  Temperature: TNNetVolume; Channels, HeadChannels: integer;
+  Eps: TNeuralFloat; pExternalSrc: cl_mem);
+var
+  bufX, bufY, bufDots, bufAttn, bufTemperature: cl_mem;
+  k: cl_kernel;
+  iNumPositions, iChannels, iHeadChannels: longint;
+  fEps: single;
+  GramCount, DotCount: integer;
+  LocalSize: csize_t;
+  TemperatureChanged: boolean;
+begin
+  iNumPositions := X.SizeX * X.SizeY;
+  iChannels := Channels;
+  iHeadChannels := HeadChannels;
+  fEps := Eps;
+  GramCount := Channels * HeadChannels;
+  DotCount := GramCount + 2 * Channels;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  bufDots := FKernel.EnsureBuffer(FBufDots, FCapDots, CL_MEM_READ_WRITE,
+    csize_t(DotCount) * csNeuralFloatSize);
+  bufAttn := FKernel.EnsureBuffer(FBufAttn, FCapAttn, CL_MEM_READ_WRITE,
+    csize_t(GramCount) * csNeuralFloatSize);
+  TemperatureChanged := (not FTemperatureUploaded) or
+    (CompareByte(FUploadedTemperature.FData[0], Temperature.FData[0],
+      Temperature.Size * csNeuralFloatSize) <> 0);
+  bufTemperature := FKernel.EnsureWriteBuffer(FBufTemperature,
+    FCapTemperature, Temperature, TemperatureChanged, {pBlocking=}true);
+  if TemperatureChanged then
+  begin
+    FUploadedTemperature.Copy(Temperature);
+    FTemperatureUploaded := true;
+  end;
+
+  k := FDotsKernel;
+  LocalSize := TNNetKernelCL.ReductionLocalSize(iNumPositions);
+  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
+  clSetKernelArg(k, 1, csLongintSize, @iChannels);
+  clSetKernelArg(k, 2, csLongintSize, @iHeadChannels);
+  clSetKernelArg(k, 3, csCLMemSize, @bufX);
+  clSetKernelArg(k, 4, csCLMemSize, @bufDots);
+  clSetKernelArg(k, 5, LocalSize * csNeuralFloatSize, nil); // __local scratch
+  FKernel.RunKernel2D(k, csize_t(DotCount) * LocalSize, 1, LocalSize, 1);
+
+  k := FSoftmaxKernel;
+  clSetKernelArg(k, 0, csLongintSize, @iChannels);
+  clSetKernelArg(k, 1, csLongintSize, @iHeadChannels);
+  clSetKernelArg(k, 2, csNeuralFloatSize, @fEps);
+  clSetKernelArg(k, 3, csCLMemSize, @bufTemperature);
+  clSetKernelArg(k, 4, csCLMemSize, @bufDots);
+  clSetKernelArg(k, 5, csCLMemSize, @bufAttn);
+  FKernel.RunKernel(k, Channels);
+
+  k := FKernel.Kernel;
+  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
+  clSetKernelArg(k, 1, csLongintSize, @iChannels);
+  clSetKernelArg(k, 2, csLongintSize, @iHeadChannels);
+  clSetKernelArg(k, 3, csCLMemSize, @bufAttn);
+  clSetKernelArg(k, 4, csCLMemSize, @bufX);
+  clSetKernelArg(k, 5, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, Y.Size);
+end;
+
 { TNNetConvGRUCellCL }
 
 constructor TNNetConvGRUCellCL.Create(NN: TNNet);
@@ -46431,6 +46605,399 @@ begin
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
+
+const
+  // torch.nn.functional.normalize's default eps (TNNetTransposedChannelAttention).
+  csTransposedAttnEps = 1e-12;
+
+{ TNNetTransposedChannelAttention }
+
+constructor TNNetTransposedChannelAttention.Create(pHeads: integer);
+begin
+  inherited Create();
+  FHeads := pHeads;
+  if FHeads < 1 then
+    FErrorProc('TNNetTransposedChannelAttention requires Heads >= 1. Heads=' +
+      IntToStr(FHeads));
+  FStruct[0] := FHeads;
+  FScores := TNNetVolume.Create();
+  FAttn := TNNetVolume.Create();
+  FInvNorm := TNNetVolume.Create();
+  FInvNormSqr := TNNetVolume.Create();
+  FGradAttn := TNNetVolume.Create();
+  FNormTerm := TNNetVolume.Create();
+end;
+
+destructor TNNetTransposedChannelAttention.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FTransposedAttnCL) then FreeAndNil(FTransposedAttnCL);
+  {$ENDIF}
+  FScores.Free;
+  FAttn.Free;
+  FInvNorm.Free;
+  FInvNormSqr.Free;
+  FGradAttn.Free;
+  FNormTerm.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTransposedChannelAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  QKVDepth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  QKVDepth := pPrevLayer.FOutput.Depth;
+  if (QKVDepth = 0) or (QKVDepth mod (3 * FHeads) <> 0) then
+    FErrorProc('TNNetTransposedChannelAttention requires input depth = 3*C ' +
+      'with C divisible by Heads. Depth=' + IntToStr(QKVDepth) + ', Heads=' +
+      IntToStr(FHeads));
+  FChannels := QKVDepth div 3;
+  FHeadChannels := FChannels div FHeads;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FChannels);
+  SetOutputErrorSize(FOutput);
+  FScores.ReSize(FHeadChannels, FHeads, FHeadChannels);
+  FAttn.ReSize(FHeadChannels, FHeads, FHeadChannels);
+  FGradAttn.ReSize(FHeadChannels, FHeads, FHeadChannels);
+  FInvNorm.ReSize(2 * FChannels, 1, 1);
+  FInvNormSqr.ReSize(2 * FChannels, 1, 1);
+  FNormTerm.ReSize(2 * FChannels, 1, 1);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(FHeads, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetTransposedChannelAttention.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  if FNeurons[0].FWeights.Size = FHeads then
+  begin
+    FNeurons[0].FWeights.Fill(1);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetTransposedChannelAttention.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  Temperature: TNeuralFloatArrPtr;
+  PositionPos, MaxPositionPos, HeadPos, MaxHeadPos: integer;
+  RowPos, HeadRowPos, MaxHeadRowPos, ChannelPos, MaxChannelPos: integer;
+  QKVDepth, QKDepth, PrevBase, RowBase, KeyBase, ValueBase, OutPos: integer;
+  RowBytes: integer;
+  Norm, HeadTemperature, RowMax, RowSum: TNeuralFloat;
+  RowPtr: TNeuralFloatArrPtr;
+  {$IFDEF OpenCL}
+  SourceBuffer: cl_mem;
+  {$ENDIF}
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTransposedAttnCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    FTransposedAttnCL.Attend(FPrevLayer.FOutput, FOutput, FNeurons[0].FWeights,
+      FChannels, FHeadChannels, csTransposedAttnEps, SourceBuffer);
+    FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host writes FOutput, so a later ForceOutputOnRAM must not read the
+  // buffer a previous OpenCL forward left resident.
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
+  Prev := FPrevLayer.FOutput;
+  Temperature := TNeuralFloatArrPtr(@FNeurons[0].FWeights.FData[0]);
+  QKVDepth := 3 * FChannels;
+  QKDepth := 2 * FChannels;
+  MaxPositionPos := Prev.SizeX * Prev.SizeY - 1;
+  MaxHeadPos := FHeads - 1;
+  MaxHeadRowPos := FHeadChannels - 1;
+  MaxChannelPos := QKDepth - 1;
+  RowBytes := FHeadChannels * csNeuralFloatSize;
+  // Sums of squares of every q|k channel and the per-head Gram G[i,j] = q_i.k_j.
+  FInvNorm.Fill(0);
+  FScores.Fill(0);
+  PrevBase := 0;
+  for PositionPos := 0 to MaxPositionPos do
+  begin
+    TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FInvNorm.FData[0]),
+      TNeuralFloatArrPtr(@Prev.FData[PrevBase]),
+      TNeuralFloatArrPtr(@Prev.FData[PrevBase]), QKDepth);
+    RowPos := PrevBase;
+    RowBase := 0;
+    KeyBase := PrevBase + FChannels;
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      for HeadRowPos := 0 to MaxHeadRowPos do
+      begin
+        TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FScores.FData[RowBase]),
+          TNeuralFloatArrPtr(@Prev.FData[KeyBase]), Prev.FData[RowPos],
+          FHeadChannels);
+        Inc(RowPos);
+        Inc(RowBase, FHeadChannels);
+      end;
+      Inc(KeyBase, FHeadChannels);
+    end;
+    Inc(PrevBase, QKVDepth);
+  end;
+  for ChannelPos := 0 to MaxChannelPos do
+  begin
+    Norm := Sqrt(FInvNorm.FData[ChannelPos]);
+    if Norm > csTransposedAttnEps then
+    begin
+      FInvNorm.FData[ChannelPos] := 1 / Norm;
+      FInvNormSqr.FData[ChannelPos] := FInvNorm.FData[ChannelPos] *
+        FInvNorm.FData[ChannelPos];
+    end
+    else
+    begin
+      // x / eps has no gradient path through the norm.
+      FInvNorm.FData[ChannelPos] := 1 / csTransposedAttnEps;
+      FInvNormSqr.FData[ChannelPos] := 0;
+    end;
+  end;
+  // S[i,j] = G[i,j] / (|q_i| |k_j|), then A = softmax_j(t[h] * S) row by row.
+  RowPos := 0;
+  RowBase := 0;
+  KeyBase := FChannels;
+  for HeadPos := 0 to MaxHeadPos do
+  begin
+    HeadTemperature := Temperature^[HeadPos];
+    for HeadRowPos := 0 to MaxHeadRowPos do
+    begin
+      RowPtr := TNeuralFloatArrPtr(@FScores.FData[RowBase]);
+      TNNetVolume.Mul(RowPtr, FInvNorm.FData[RowPos], FHeadChannels);
+      TNNetVolume.Mul(RowPtr, TNeuralFloatArrPtr(@FInvNorm.FData[KeyBase]),
+        FHeadChannels);
+      Move(RowPtr^, FAttn.FData[RowBase], RowBytes);
+      RowPtr := TNeuralFloatArrPtr(@FAttn.FData[RowBase]);
+      TNNetVolume.Mul(RowPtr, HeadTemperature, FHeadChannels);
+      RowMax := TNNetVolume.MaxValue(RowPtr, FHeadChannels);
+      RowSum := TNNetVolume.ExpShiftSum(RowPtr, RowPtr, RowMax, FHeadChannels);
+      TNNetVolume.Mul(RowPtr, 1 / RowSum, FHeadChannels);
+      Inc(RowPos);
+      Inc(RowBase, FHeadChannels);
+    end;
+    Inc(KeyBase, FHeadChannels);
+  end;
+  // Y[p, h*Ch+i] = A[h*Ch+i, :] . v[p, h*Ch..h*Ch+Ch-1].
+  PrevBase := 0;
+  OutPos := 0;
+  for PositionPos := 0 to MaxPositionPos do
+  begin
+    ValueBase := PrevBase + QKDepth;
+    RowBase := 0;
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      for HeadRowPos := 0 to MaxHeadRowPos do
+      begin
+        FOutput.FData[OutPos] := TNNetVolume.DotProduct(
+          TNeuralFloatArrPtr(@FAttn.FData[RowBase]),
+          TNeuralFloatArrPtr(@Prev.FData[ValueBase]), FHeadChannels);
+        Inc(OutPos);
+        Inc(RowBase, FHeadChannels);
+      end;
+      Inc(ValueBase, FHeadChannels);
+    end;
+    Inc(PrevBase, QKVDepth);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTransposedChannelAttention.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  TemperatureNeuron: TNNetNeuron;
+  PositionPos, MaxPositionPos, HeadPos, MaxHeadPos: integer;
+  RowPos, HeadRowPos, MaxHeadRowPos: integer;
+  QKVDepth, QKDepth, PrevBase, RowBase, KeyBase, ValueBase, ErrPos: integer;
+  HeadTemperature, AttnGradDot, ScoreGradDot, TemperatureGrad: TNeuralFloat;
+  GradRow, AttnRow, ScoreRow: TNeuralFloatArrPtr;
+  HasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  HasInputGrad := (Prev.Size > 0) and (PrevErr.Size = Prev.Size);
+  TemperatureNeuron := FNeurons[0];
+  QKVDepth := 3 * FChannels;
+  QKDepth := 2 * FChannels;
+  MaxPositionPos := Prev.SizeX * Prev.SizeY - 1;
+  MaxHeadPos := FHeads - 1;
+  MaxHeadRowPos := FHeadChannels - 1;
+  // dA[i,j] = sum_p dY[p,i] * v[p,j].
+  FGradAttn.Fill(0);
+  PrevBase := 0;
+  ErrPos := 0;
+  for PositionPos := 0 to MaxPositionPos do
+  begin
+    ValueBase := PrevBase + QKDepth;
+    RowBase := 0;
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      for HeadRowPos := 0 to MaxHeadRowPos do
+      begin
+        TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FGradAttn.FData[RowBase]),
+          TNeuralFloatArrPtr(@Prev.FData[ValueBase]), FOutputError.FData[ErrPos],
+          FHeadChannels);
+        Inc(ErrPos);
+        Inc(RowBase, FHeadChannels);
+      end;
+      Inc(ValueBase, FHeadChannels);
+    end;
+    Inc(PrevBase, QKVDepth);
+  end;
+  // Per row: dL = A .* (dA - A.dA) (softmax), dt[h] += dL.S, dS = t*dL, then
+  // dG = dS / (|q_i| |k_j|). FNormTerm collects sum_j dS.S (q) and sum_i dS.S (k).
+  FNormTerm.Fill(0);
+  RowPos := 0;
+  RowBase := 0;
+  KeyBase := FChannels;
+  for HeadPos := 0 to MaxHeadPos do
+  begin
+    HeadTemperature := TemperatureNeuron.FWeights.FData[HeadPos];
+    TemperatureGrad := 0;
+    for HeadRowPos := 0 to MaxHeadRowPos do
+    begin
+      GradRow := TNeuralFloatArrPtr(@FGradAttn.FData[RowBase]);
+      AttnRow := TNeuralFloatArrPtr(@FAttn.FData[RowBase]);
+      ScoreRow := TNeuralFloatArrPtr(@FScores.FData[RowBase]);
+      AttnGradDot := TNNetVolume.DotProduct(AttnRow, GradRow, FHeadChannels);
+      TNNetVolume.Mul(GradRow, AttnRow, FHeadChannels);
+      TNNetVolume.MulAdd(GradRow, AttnRow, -AttnGradDot, FHeadChannels);
+      ScoreGradDot := TNNetVolume.DotProduct(GradRow, ScoreRow, FHeadChannels);
+      TemperatureGrad := TemperatureGrad + ScoreGradDot;
+      TNNetVolume.Mul(GradRow, HeadTemperature, FHeadChannels);
+      FNormTerm.FData[RowPos] := -HeadTemperature * ScoreGradDot *
+        FInvNormSqr.FData[RowPos];
+      TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FNormTerm.FData[KeyBase]), GradRow,
+        ScoreRow, FHeadChannels);
+      TNNetVolume.Mul(GradRow, FInvNorm.FData[RowPos], FHeadChannels);
+      TNNetVolume.Mul(GradRow, TNeuralFloatArrPtr(@FInvNorm.FData[KeyBase]),
+        FHeadChannels);
+      Inc(RowPos);
+      Inc(RowBase, FHeadChannels);
+    end;
+    TemperatureNeuron.FDelta.FData[HeadPos] :=
+      TemperatureNeuron.FDelta.FData[HeadPos] + (-FLearningRate) * TemperatureGrad;
+    Inc(KeyBase, FHeadChannels);
+  end;
+  // d(1/|k_j|)/dk[p,j] = -k[p,j] / |k_j|^3: the k terms become -sum_i dS.S / |k_j|^2.
+  TNNetVolume.Mul(TNeuralFloatArrPtr(@FNormTerm.FData[FChannels]),
+    TNeuralFloatArrPtr(@FInvNormSqr.FData[FChannels]), FChannels);
+  TNNetVolume.Mul(TNeuralFloatArrPtr(@FNormTerm.FData[FChannels]), -1,
+    FChannels);
+  if HasInputGrad then
+  begin
+    // dq[p,i] += dG[i,:].k_p, dk[p,:] += dG[i,:] * q[p,i], dv[p,:] += A[i,:] * dY[p,i],
+    // then dq|dk[p,:] += FNormTerm .* q|k[p,:].
+    PrevBase := 0;
+    ErrPos := 0;
+    for PositionPos := 0 to MaxPositionPos do
+    begin
+      RowPos := PrevBase;
+      KeyBase := PrevBase + FChannels;
+      ValueBase := PrevBase + QKDepth;
+      RowBase := 0;
+      for HeadPos := 0 to MaxHeadPos do
+      begin
+        for HeadRowPos := 0 to MaxHeadRowPos do
+        begin
+          GradRow := TNeuralFloatArrPtr(@FGradAttn.FData[RowBase]);
+          PrevErr.FData[RowPos] := PrevErr.FData[RowPos] +
+            TNNetVolume.DotProduct(GradRow,
+              TNeuralFloatArrPtr(@Prev.FData[KeyBase]), FHeadChannels);
+          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@PrevErr.FData[KeyBase]),
+            GradRow, Prev.FData[RowPos], FHeadChannels);
+          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@PrevErr.FData[ValueBase]),
+            TNeuralFloatArrPtr(@FAttn.FData[RowBase]), FOutputError.FData[ErrPos],
+            FHeadChannels);
+          Inc(RowPos);
+          Inc(ErrPos);
+          Inc(RowBase, FHeadChannels);
+        end;
+        Inc(KeyBase, FHeadChannels);
+        Inc(ValueBase, FHeadChannels);
+      end;
+      TNNetVolume.MulAdd(TNeuralFloatArrPtr(@PrevErr.FData[PrevBase]),
+        TNeuralFloatArrPtr(@FNormTerm.FData[0]),
+        TNeuralFloatArrPtr(@Prev.FData[PrevBase]), QKDepth);
+      Inc(PrevBase, QKVDepth);
+    end;
+  end;
+  if not FBatchUpdate then
+  begin
+    TemperatureNeuron.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{$IFDEF OpenCL}
+// No size verdict: an inference-only layer runs in OpenCL when forced, or when
+// its source is already resident.
+function TNNetTransposedChannelAttention.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FTransposedAttnCL) and FHasOpenCL and (not FIsTrainable) and
+    (FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetTransposedChannelAttention.EnableOpenCL(
+  DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FNN) and not Assigned(FTransposedAttnCL) then
+    FTransposedAttnCL := TNNetTransposedChannelAttentionCL.Create(FNN, FHeads);
+end;
+
+procedure TNNetTransposedChannelAttention.DisableOpenCL();
+begin
+  // FTransposedAttnCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FTransposedAttnCL);
+end;
+
+function TNNetTransposedChannelAttention.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTransposedAttnCL) then Result := FTransposedAttnCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTransposedChannelAttention.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTransposedAttnCL) then Result := FTransposedAttnCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetTransposedChannelAttention.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTransposedAttnCL) then
+    Result := Result + FTransposedAttnCL.BufferBytes();
+end;
+{$ENDIF}
 
 { TNNetPerformerAttention }
 
@@ -138124,6 +138691,7 @@ begin
       'TNNetSoftPrompt' :           Result := TNNetSoftPrompt.Create(St[0], St[1]);
       'TNNetProductKeyMemory' :     Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
+      'TNNetTransposedChannelAttention' : Result := TNNetTransposedChannelAttention.Create(St[0]);
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
@@ -138573,6 +139141,7 @@ begin
       if S[0] = 'TNNetSoftPrompt' then Result := TNNetSoftPrompt.Create(St[0], St[1]) else
       if S[0] = 'TNNetProductKeyMemory' then Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
+      if S[0] = 'TNNetTransposedChannelAttention' then Result := TNNetTransposedChannelAttention.Create(St[0]) else
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
