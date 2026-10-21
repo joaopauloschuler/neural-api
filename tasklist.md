@@ -1635,6 +1635,38 @@ rather than acted on.
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
             example output.
+- [ ] First-Block Cache step skipping for the DiT denoise loop (port of diffusers
+      `hooks/first_block_cache.py`, `apply_first_block_cache(pipe.transformer,
+      FirstBlockCacheConfig(threshold=...))`, present in the ~/x venv, diffusers
+      0.41). Today `TQwenImage21Transformer.PredictVelocity` runs every block on
+      every step (the `for BlockCnt := 0 to MaxBlockPos` loop over the shared
+      `FStepNet`), so a 50-step image costs 50 full transformer passes. FBC runs
+      block 0, compares its residual (output - input of block 0) with the previous
+      step's: when mean|r - r_prev| / mean|r_prev| < threshold, it skips blocks
+      1..N-1 and adds the cached tail residual (last-block output - block-0
+      output) from the last fully computed step; otherwise it runs the rest and
+      refreshes both caches. The text stream is already prefix-cached
+      (`EncodePrefix`), so only the image hidden states need caching. Typical
+      published speed-up is 1.5-2x per image at threshold 0.05-0.12 with little
+      visible change.
+      - Put the decision and the two residual buffers in one small reusable
+        class (e.g. `TDiTFirstBlockCache`: `Reset`, `ShouldRunRemainingBlocks`,
+        `StoreTailResidual`, `ApplyTailResidual`, built on `TNNetVolume` bulk
+        methods, buffers sized once per image, not per step), so the CogVideoX
+        TextToVideo loop and later DiT pipelines (SD3/FLUX MMDiT, Wan) call the
+        same class instead of copying it.
+      - Pipeline: `TQwenImage21Pipeline.FirstBlockCacheThreshold` (0 = off, the
+        default), `Reset` at the start of `DenoiseAt`, skipped-step count in
+        `FImageStats`. examples/QwenImage `--fbc-threshold X` and REPL
+        `/fbc X|off`; README section with the speed/quality trade-off.
+      - OpenCL: when the step pass is resident, the residual difference and the
+        tail add must stay on the device (one reduction + one axpy) or the
+        download of the hidden states eats the saving.
+      - Tests: a pico-fixture oracle from diffusers (QwenImage transformer with
+        `apply_first_block_cache`, fixed latents, a threshold that skips some
+        steps) matching the skip pattern and the final latents < 1e-4; plus
+        threshold 0 = bit-identical to today's loop. Speed measured on the user's
+        GPU box.
 - [ ] LaMa large-mask inpainting follow-ups. `BuildLaMaFromSafeTensors`
       (neuralpretrained.pas, `TestLaMaParity` on the pico fixture from
       `tools/make_pico_lama_fixture.py`) and examples/LaMaInpaint are coded; the
