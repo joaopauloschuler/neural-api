@@ -312,6 +312,10 @@ procedure SaveNNetToSafeTensorsEx(NN: TNNet; const pFileName: string;
 // layer. Refreshes each touched layer's derived weight caches and clears
 // inertia/deltas, so the net is immediately ready for inference/training.
 procedure LoadNNetFromSafeTensors(NN: TNNet; const pFileName: string);
+// DestFile := every tensor of SourceFiles in file order, written as F32; a
+// tensor name present in two sources raises ESafeTensorsError.
+procedure MergeSafeTensorsFiles(const SourceFiles: array of string;
+  const DestFile: string);
 
 var
   // Size in bytes of the staging chunk every checkpoint reader here (and in
@@ -332,6 +336,42 @@ const
   csTensorSlotEmpty = -1;
   csTensorSlotDeleted = -2;
   csMinTensorSlots = 64;
+
+procedure MergeSafeTensorsFiles(const SourceFiles: array of string;
+  const DestFile: string);
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Tensor: TNNetVolume;
+  Info: TSafeTensorInfo;
+  TensorName: string;
+  SourcePos, TensorPos, MaxTensorPos: integer;
+begin
+  Writer := TNNetSafeTensorsWriter.Create(DestFile);
+  Tensor := TNNetVolume.Create();
+  try
+    for SourcePos := 0 to High(SourceFiles) do
+    begin
+      Reader := TNNetSafeTensorsReader.Create(SourceFiles[SourcePos]);
+      try
+        MaxTensorPos := Reader.Count - 1;
+        for TensorPos := 0 to MaxTensorPos do
+        begin
+          TensorName := Reader.TensorName(TensorPos);
+          Info := Reader.GetInfo(TensorName);
+          Reader.LoadTensorFlat(TensorName, Tensor);
+          Writer.AddTensorFlat(TensorName, Info.Shape, Tensor);
+        end;
+      finally
+        Reader.Free;
+      end;
+    end;
+    Writer.SaveToFile();
+  finally
+    Tensor.Free;
+    Writer.Free;
+  end;
+end;
 
 function DecodeF16(Bits: Word): Single;
 var

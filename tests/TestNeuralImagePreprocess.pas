@@ -61,6 +61,7 @@ type
     // A (W,H,4) volume saved as PNG is 8-bit RGBA (colour type 6) and reloads
     // with its alpha; a 3-channel volume reloads opaque.
     procedure TestSaveImageRGBAPngRoundTrip;
+    procedure TestSaveGray16PngRoundTrip;
     // GaussianBlurImage of a centred hot pixel keeps its mass of 1, is
     // symmetric, peaks at 1/S^2 (S = the 1-D tap sum); a flat channel stays flat.
     procedure TestGaussianBlurImageHotPixel;
@@ -508,6 +509,43 @@ begin
     DeleteFile(FN);
     ShortestEdgeDst.Free;
     Dst.Free;
+    Src.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestSaveGray16PngRoundTrip;
+const
+  cValues: array[0..5] of TNeuralFloat = (0, 1, 0.5, 0.123456, 1.5, -0.2);
+  cExpected: array[0..5] of word = (0, 65535, 32768, 8091, 65535, 0);
+var
+  Src: TNNetVolume;
+  Img: TFPMemoryImage;
+  FN: string;
+  PngHeader: TFileStream;
+  HeaderBytes: array[0..25] of byte;
+  X: integer;
+begin
+  FN := GetTempDir + 'cai_gray16_roundtrip.png';
+  Src := TNNetVolume.Create(6, 1, 1);
+  Img := TFPMemoryImage.Create(1, 1);
+  try
+    for X := 0 to 5 do Src[X, 0, 0] := cValues[X];
+    AssertTrue('saved', SaveGray16PNGFromVolume(Src, FN));
+    PngHeader := TFileStream.Create(FN, fmOpenRead);
+    try
+      PngHeader.ReadBuffer(HeaderBytes, SizeOf(HeaderBytes));
+    finally
+      PngHeader.Free;
+    end;
+    AssertEquals('IHDR bit depth', 16, HeaderBytes[24]);
+    AssertEquals('IHDR colour type 0 = gray', 0, HeaderBytes[25]);
+    AssertTrue('reloaded', Img.LoadFromFile(FN));
+    AssertEquals('width', 6, Img.Width);
+    for X := 0 to 5 do
+      AssertEquals('gray ' + IntToStr(X), cExpected[X], Img.Colors[X, 0].red);
+  finally
+    DeleteFile(FN);
+    Img.Free;
     Src.Free;
   end;
 end;

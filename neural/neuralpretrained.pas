@@ -11819,6 +11819,60 @@ procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
   NumSteps, ProcessingResolution, Alignment: integer; PredictNormals: boolean;
   Prediction: TNNetVolume; UseFullZRange: boolean = true);
 
+// Ke et al. 2024 Sec. 3.2 input init: DestFile := SourceFile (an SD UNet) with
+// conv_in.weight [O,C,k,k] duplicated to [O,2C,k,k] and halved.
+procedure MarigoldWidenUNetConvIn(const SourceFile, DestFile: string);
+
+type
+  // Marigold depth / surface normals (diffusers MarigoldDepthPipeline and
+  // MarigoldNormalsPipeline) over a model_index.json folder. Predict builds the
+  // VAE encoder, UNet and VAE decoder one at a time, each freed after its stage,
+  // so peak memory is the largest component. Coded by Claude (AI).
+  TMarigoldPipeline = class(TObject)
+  private
+    FModelFolder: string;
+    FScheduler: TNNetDiffusionScheduler;
+    FUNetConfig: TSDUNetConfig;
+    FVaeEncoderConfig, FVaeDecoderConfig: TVaeDecoderConfig;
+    FPredictionType: string;
+    FPredictNormals, FUseFullZRange, FQuantizeInt8: boolean;
+    FDefaultSteps, FDefaultProcessingResolution: integer;
+    // text_encoder/'s empty-prompt states, from the first Predict unless set.
+    FEmptyPromptStates: TNNetVolume;
+    FHasEmptyPromptStates: boolean;
+    {$IFDEF OpenCL}
+    FUseOpenCL: boolean;
+    FOpenCLPlatform: cl_platform_id;
+    FOpenCLDevice: cl_device_id;
+    {$ENDIF}
+    function ComponentFolder(const Component: string): string;
+    // Quantizes (the UNet, when QuantizeInt8) and arms OpenCL on a new net.
+    procedure PrepareComponent(Net: TNNet; IsUNet: boolean);
+  public
+    // Reads model_index.json and the scheduler/, unet/ and vae/ configs only.
+    constructor Create(const ModelFolder: string);
+    destructor Destroy(); override;
+    // Replaces text_encoder/'s empty-prompt states (n,1,cross_attention_dim).
+    procedure SetEmptyPromptStates(States: TNNetVolume);
+    {$IFDEF OpenCL}
+    // Components built by later Predict calls run on this OpenCL device.
+    procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+    {$ENDIF}
+    // MarigoldPredict on Image (W,H,3) in [0,1]; NumSteps < 1 / ProcessingResolution
+    // < 0 take the checkpoint defaults (0 = native); EnsembleSize noises from Seed.
+    procedure Predict(Image: TNNetVolume; NumSteps, EnsembleSize,
+      ProcessingResolution: integer; Seed: cardinal; Prediction: TNNetVolume);
+    property PredictNormals: boolean read FPredictNormals;
+    // model_index.json prediction_type: depth, disparity or normals.
+    property PredictionType: string read FPredictionType;
+    property DefaultSteps: integer read FDefaultSteps;
+    property DefaultProcessingResolution: integer
+      read FDefaultProcessingResolution;
+    // int8 UNet weights (TNNet.QuantizeWeightsInt8) for later Predict calls.
+    property QuantizeInt8: boolean read FQuantizeInt8 write FQuantizeInt8;
+    property UNetConfig: TSDUNetConfig read FUNetConfig;
+  end;
+
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
 // built with BuildSDUNet(..., pWithControl=true). DownResiduals (the ControlNet
 // down_block_res_samples, in build order: conv_in, then each down resnet, then
@@ -75264,6 +75318,56 @@ begin
   end;
 end;
 
+// ImageLatent := VaeEncoder(Padded); raises unless Padded fits its input.
+procedure MarigoldEncodePadded(VaeEncoder: TNNet;
+  Padded, ImageLatent: TNNetVolume);
+var
+  EncoderInput: TNNetVolume;
+begin
+  EncoderInput := VaeEncoder.Layers[0].Output;
+  if not Padded.SameSize(EncoderInput) then
+    ImportError('Marigold: padded image ' + IntToStr(Padded.SizeX) + 'x' +
+      IntToStr(Padded.SizeY) + 'x' + IntToStr(Padded.Depth) +
+      ' does not match the VAE encoder input ' + IntToStr(EncoderInput.SizeX) +
+      'x' + IntToStr(EncoderInput.SizeY) + 'x' + IntToStr(EncoderInput.Depth) + '.');
+  VaeEncoder.Compute(Padded);
+  VaeEncoder.GetOutput(ImageLatent);
+end;
+
+// Member := the unpadded depth or normals field of VaeDecoder(Target).
+// Decoded and Field are caller scratch.
+procedure MarigoldDecodeMember(VaeDecoder: TNNet; Target: TNNetVolume;
+  PredictNormals, UseFullZRange: boolean; PadX, PadY: integer;
+  Decoded, Field, Member: TNNetVolume);
+begin
+  VaeDecoder.Compute(Target);
+  VaeDecoder.GetOutput(Decoded);
+  if PredictNormals then
+    MarigoldNormalsFromDecoded(Decoded, Field, UseFullZRange)
+  else
+    MarigoldDepthFromDecoded(Decoded, Field);
+  MarigoldUnpadImage(Field, Member, PadX, PadY);
+end;
+
+// Prediction := Members ensembled and resized to SizeX x SizeY (normals
+// renormalized). Ensembled is caller scratch.
+procedure MarigoldFinishPrediction(const Members: array of TNNetVolume;
+  PredictNormals: boolean; SizeX, SizeY: integer;
+  Ensembled, Prediction: TNNetVolume);
+begin
+  if Length(Members) = 1 then
+  begin
+    Ensembled.ReSize(Members[0]);
+    Ensembled.Copy(Members[0]);
+  end
+  else if PredictNormals then
+    MarigoldEnsembleNormals(Members, Ensembled)
+  else
+    MarigoldEnsembleDepth(Members, Ensembled);
+  ResizeImageBilinearNoAntialias(Ensembled, Prediction, SizeX, SizeY);
+  if PredictNormals then MarigoldNormalizeNormals(Prediction);
+end;
+
 procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
   const UNetConfig: TSDUNetConfig; Sched: TNNetDiffusionScheduler;
   Image, EncStates: TNNetVolume; const StartNoises: array of TNNetVolume;
@@ -75271,9 +75375,7 @@ procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
   Prediction: TNNetVolume; UseFullZRange: boolean);
 var
   Members: array of TNNetVolume;
-  Padded, ImageLatent, Target, UNetInput, Pred, Decoded, Field,
-    Ensembled: TNNetVolume;
-  EncoderInput: TNNetVolume;
+  Padded, ImageLatent, Target, UNetInput, Pred, Decoded, Field: TNNetVolume;
   PadX, PadY, MemberCount, MemberPos, MaxMemberPos: integer;
 begin
   MemberCount := Length(StartNoises);
@@ -75286,44 +75388,93 @@ begin
   Padded := TNNetVolume.Create(); ImageLatent := TNNetVolume.Create();
   Target := TNNetVolume.Create(); UNetInput := TNNetVolume.Create();
   Pred := TNNetVolume.Create(); Decoded := TNNetVolume.Create();
-  Field := TNNetVolume.Create(); Ensembled := TNNetVolume.Create();
+  Field := TNNetVolume.Create();
   try
     MarigoldPreprocessImage(Image, Padded, ProcessingResolution, Alignment,
       {PadToSquare=}true, PadX, PadY);
-    EncoderInput := VaeEncoder.Layers[0].Output;
-    if not Padded.SameSize(EncoderInput) then
-      ImportError('MarigoldPredict: padded image ' + IntToStr(Padded.SizeX) + 'x' +
-        IntToStr(Padded.SizeY) + 'x' + IntToStr(Padded.Depth) +
-        ' does not match the VAE encoder input ' + IntToStr(EncoderInput.SizeX) +
-        'x' + IntToStr(EncoderInput.SizeY) + 'x' + IntToStr(EncoderInput.Depth) + '.');
-    VaeEncoder.Compute(Padded);
-    VaeEncoder.GetOutput(ImageLatent);
+    MarigoldEncodePadded(VaeEncoder, Padded, ImageLatent);
     for MemberPos := 0 to MaxMemberPos do
     begin
       Target.Copy(StartNoises[MemberPos]);
       MarigoldDenoise(UNet, UNetConfig, ImageLatent, EncStates, Sched, NumSteps,
         Target, UNetInput, Pred);
-      VaeDecoder.Compute(Target);
-      VaeDecoder.GetOutput(Decoded);
-      if PredictNormals then
-        MarigoldNormalsFromDecoded(Decoded, Field, UseFullZRange)
-      else
-        MarigoldDepthFromDecoded(Decoded, Field);
-      MarigoldUnpadImage(Field, Members[MemberPos], PadX, PadY);
+      MarigoldDecodeMember(VaeDecoder, Target, PredictNormals, UseFullZRange,
+        PadX, PadY, Decoded, Field, Members[MemberPos]);
     end;
-    if MemberCount = 1 then
-      Ensembled.Copy(Members[0])
-    else if PredictNormals then
-      MarigoldEnsembleNormals(Members, Ensembled)
-    else
-      MarigoldEnsembleDepth(Members, Ensembled);
-    ResizeImageBilinearNoAntialias(Ensembled, Prediction, Image.SizeX, Image.SizeY);
-    if PredictNormals then MarigoldNormalizeNormals(Prediction);
+    MarigoldFinishPrediction(Members, PredictNormals, Image.SizeX, Image.SizeY,
+      Field, Prediction);
   finally
     for MemberPos := 0 to MaxMemberPos do
       Members[MemberPos].Free;
     Padded.Free; ImageLatent.Free; Target.Free; UNetInput.Free;
-    Pred.Free; Decoded.Free; Field.Free; Ensembled.Free;
+    Pred.Free; Decoded.Free; Field.Free;
+  end;
+end;
+
+procedure MarigoldWidenUNetConvIn(const SourceFile, DestFile: string);
+const
+  csConvInWeight = 'conv_in.weight';
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Weights, Widened: TNNetVolume;
+  Info: TSafeTensorInfo;
+  Dims: array of Int64;
+  TensorName: string;
+  TensorPos, MaxTensorPos, DimPos, MaxDimPos: integer;
+  OutPos, MaxOutPos, InBlockSize: integer;
+  WidenedConvIn: boolean;
+begin
+  Reader := CreatePretrainedTensorReader(SourceFile);
+  Writer := TNNetSafeTensorsWriter.Create(DestFile);
+  Weights := TNNetVolume.Create();
+  Widened := TNNetVolume.Create();
+  WidenedConvIn := false;
+  try
+    MaxTensorPos := Reader.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      Info := Reader.GetInfo(TensorName);
+      MaxDimPos := Length(Info.Shape) - 1;
+      SetLength(Dims, MaxDimPos + 1);
+      for DimPos := 0 to MaxDimPos do Dims[DimPos] := Info.Shape[DimPos];
+      Reader.LoadTensorFlat(TensorName, Weights);
+      if TensorName = csConvInWeight then
+      begin
+        if Length(Dims) <> 4 then
+          ImportError('MarigoldWidenUNetConvIn: ' + csConvInWeight +
+            ' is not a 4-D convolution weight.');
+        // Per output channel, the [C,k,k] block is written twice, halved.
+        InBlockSize := Dims[1] * Dims[2] * Dims[3];
+        Weights.Mul(0.5);
+        Widened.ReSize(2 * Weights.Size, 1, 1);
+        MaxOutPos := Dims[0] - 1;
+        for OutPos := 0 to MaxOutPos do
+        begin
+          Move(Weights.FData[OutPos * InBlockSize],
+            Widened.FData[2 * OutPos * InBlockSize],
+            InBlockSize * SizeOf(TNeuralFloat));
+          Move(Weights.FData[OutPos * InBlockSize],
+            Widened.FData[(2 * OutPos + 1) * InBlockSize],
+            InBlockSize * SizeOf(TNeuralFloat));
+        end;
+        Dims[1] := 2 * Dims[1];
+        Writer.AddTensorFlat(TensorName, Dims, Widened);
+        WidenedConvIn := true;
+      end
+      else
+        Writer.AddTensorFlat(TensorName, Dims, Weights);
+    end;
+    if not WidenedConvIn then
+      ImportError('MarigoldWidenUNetConvIn: ' + SourceFile + ' has no ' +
+        csConvInWeight + '.');
+    Writer.SaveToFile();
+  finally
+    Widened.Free;
+    Weights.Free;
+    Writer.Free;
+    Reader.Free;
   end;
 end;
 
@@ -88812,6 +88963,208 @@ begin
     TokenIds.Free;
     TextNet.Free;
     Reader.Free;
+  end;
+end;
+
+constructor TMarigoldPipeline.Create(const ModelFolder: string);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  PipelineClass, IndexFile: string;
+begin
+  inherited Create;
+  FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
+  FEmptyPromptStates := TNNetVolume.Create();
+  IndexFile := FModelFolder + 'model_index.json';
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(IndexFile);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Marigold: ' + IndexFile + ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    PipelineClass := Obj.Get('_class_name', '');
+    if PipelineClass = 'MarigoldNormalsPipeline' then FPredictNormals := true
+    else if PipelineClass = 'MarigoldDepthPipeline' then FPredictNormals := false
+    else
+      ImportError('Marigold: ' + IndexFile + ' _class_name "' + PipelineClass +
+        '" is not MarigoldDepthPipeline or MarigoldNormalsPipeline.');
+    // null entries read as their defaults (Find by type skips jtNull).
+    FPredictionType := Obj.Get('prediction_type', '');
+    FUseFullZRange := Obj.Get('use_full_z_range', true);
+    FDefaultSteps := Obj.Get('default_denoising_steps', 0);
+    FDefaultProcessingResolution := Obj.Get('default_processing_resolution', 0);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+    ComponentFolder('scheduler') + 'scheduler_config.json');
+  FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
+    'config.json');
+  FVaeEncoderConfig := ReadVaeEncoderConfigFromJSONFile(ComponentFolder('vae') +
+    'config.json');
+  FVaeDecoderConfig := ReadVaeDecoderConfigFromJSONFile(ComponentFolder('vae') +
+    'config.json');
+  if FUNetConfig.InChannels <> 2 * FVaeEncoderConfig.LatentChannels then
+    ImportError('Marigold: unet in_channels ' + IntToStr(FUNetConfig.InChannels) +
+      ' is not twice the VAE latent_channels ' +
+      IntToStr(FVaeEncoderConfig.LatentChannels) + '.');
+end;
+
+destructor TMarigoldPipeline.Destroy();
+begin
+  FEmptyPromptStates.Free;
+  FScheduler.Free;
+  inherited Destroy;
+end;
+
+function TMarigoldPipeline.ComponentFolder(const Component: string): string;
+begin
+  Result := FModelFolder + Component + DirectorySeparator;
+end;
+
+procedure TMarigoldPipeline.PrepareComponent(Net: TNNet; IsUNet: boolean);
+begin
+  if IsUNet and FQuantizeInt8 then Net.QuantizeWeightsInt8();
+  {$IFDEF OpenCL}
+  if FUseOpenCL then Net.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice);
+  {$ENDIF}
+end;
+
+procedure TMarigoldPipeline.SetEmptyPromptStates(States: TNNetVolume);
+begin
+  FEmptyPromptStates.ReSize(States);
+  FEmptyPromptStates.Copy(States);
+  FHasEmptyPromptStates := true;
+end;
+
+{$IFDEF OpenCL}
+procedure TMarigoldPipeline.EnableOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+begin
+  FUseOpenCL := true;
+  FOpenCLPlatform := platform_id;
+  FOpenCLDevice := device_id;
+end;
+{$ENDIF}
+
+procedure TMarigoldPipeline.Predict(Image: TNNetVolume; NumSteps, EnsembleSize,
+  ProcessingResolution: integer; Seed: cardinal; Prediction: TNNetVolume);
+var
+  Members, Targets: array of TNNetVolume;
+  Padded, ImageLatent, UNetInput, Pred, Decoded, Field: TNNetVolume;
+  EncoderConfig, DecoderConfig: TVaeDecoderConfig;
+  StepConfig: TSDUNetConfig;
+  Net: TNNet;
+  VaeWeightsFile: string;
+  StepCount, Resolution, Alignment, UNetAlignment, LatentGrid: integer;
+  PadX, PadY, MemberPos, MaxMemberPos: integer;
+  SavedSeed: cardinal;
+begin
+  if EnsembleSize < 1 then
+    ImportError('Marigold: ensemble size ' + IntToStr(EnsembleSize) + ' < 1.');
+  StepCount := NumSteps;
+  if StepCount < 1 then StepCount := FDefaultSteps;
+  if StepCount < 1 then
+    ImportError('Marigold: model_index.json has no default_denoising_steps; ' +
+      'pass NumSteps.');
+  Resolution := ProcessingResolution;
+  if Resolution < 0 then Resolution := FDefaultProcessingResolution;
+  Alignment := 1 shl (FVaeEncoderConfig.NumBlockOut - 1);
+  UNetAlignment := 1 shl (FUNetConfig.NumBlockOut - 1);
+  MaxMemberPos := EnsembleSize - 1;
+  SetLength(Members, EnsembleSize);
+  SetLength(Targets, EnsembleSize);
+  for MemberPos := 0 to MaxMemberPos do
+  begin
+    Members[MemberPos] := TNNetVolume.Create();
+    Targets[MemberPos] := TNNetVolume.Create();
+  end;
+  Padded := TNNetVolume.Create(); ImageLatent := TNNetVolume.Create();
+  UNetInput := TNNetVolume.Create(); Pred := TNNetVolume.Create();
+  Decoded := TNNetVolume.Create(); Field := TNNetVolume.Create();
+  try
+    MarigoldPreprocessImage(Image, Padded, Resolution, Alignment,
+      {PadToSquare=}true, PadX, PadY);
+    LatentGrid := Padded.SizeX div Alignment;
+    if LatentGrid mod UNetAlignment <> 0 then
+      ImportError('Marigold: latent grid ' + IntToStr(LatentGrid) +
+        ' is not a multiple of ' + IntToStr(UNetAlignment) +
+        '; pick a processing resolution that is a multiple of ' +
+        IntToStr(Alignment * UNetAlignment) + '.');
+    VaeWeightsFile := SafeTensorsFolderWeightsFile(ComponentFolder('vae'),
+      'diffusion_pytorch_model');
+
+    EncoderConfig := FVaeEncoderConfig;
+    EncoderConfig.LatentGrid := LatentGrid;
+    Net := BuildVaeEncoderFromSafeTensorsEx(VaeWeightsFile, EncoderConfig,
+      {pTrainable=}false);
+    try
+      PrepareComponent(Net, {IsUNet=}false);
+      MarigoldEncodePadded(Net, Padded, ImageLatent);
+    finally
+      Net.Free;
+    end;
+
+    if not FHasEmptyPromptStates then
+    begin
+      MarigoldEmptyPromptStates(ComponentFolder('text_encoder'),
+        FEmptyPromptStates);
+      FHasEmptyPromptStates := true;
+    end;
+    if FEmptyPromptStates.Depth <> FUNetConfig.CrossAttentionDim then
+      ImportError('Marigold: prompt states width ' +
+        IntToStr(FEmptyPromptStates.Depth) + ' <> unet cross_attention_dim ' +
+        IntToStr(FUNetConfig.CrossAttentionDim) + '.');
+    SavedSeed := RandSeed;
+    RandSeed := Seed;
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      Targets[MemberPos].ReSize(LatentGrid, LatentGrid, FUNetConfig.OutChannels);
+      Targets[MemberPos].RandomizeGaussian(1.0);
+    end;
+    RandSeed := SavedSeed;
+
+    StepConfig := FUNetConfig;
+    StepConfig.LatentGrid := LatentGrid;
+    StepConfig.TextSeqLen := FEmptyPromptStates.SizeX;
+    Net := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+      ComponentFolder('unet'), 'diffusion_pytorch_model'), StepConfig,
+      {pTrainable=}false);
+    try
+      PrepareComponent(Net, {IsUNet=}true);
+      for MemberPos := 0 to MaxMemberPos do
+        MarigoldDenoise(Net, StepConfig, ImageLatent, FEmptyPromptStates,
+          FScheduler, StepCount, Targets[MemberPos], UNetInput, Pred);
+    finally
+      Net.Free;
+    end;
+
+    DecoderConfig := FVaeDecoderConfig;
+    DecoderConfig.LatentGrid := LatentGrid;
+    Net := BuildVaeDecoderFromSafeTensorsEx(VaeWeightsFile, DecoderConfig,
+      {pTrainable=}false);
+    try
+      PrepareComponent(Net, {IsUNet=}false);
+      for MemberPos := 0 to MaxMemberPos do
+        MarigoldDecodeMember(Net, Targets[MemberPos], FPredictNormals,
+          FUseFullZRange, PadX, PadY, Decoded, Field, Members[MemberPos]);
+    finally
+      Net.Free;
+    end;
+    MarigoldFinishPrediction(Members, FPredictNormals, Image.SizeX, Image.SizeY,
+      Field, Prediction);
+  finally
+    for MemberPos := 0 to MaxMemberPos do
+    begin
+      Members[MemberPos].Free;
+      Targets[MemberPos].Free;
+    end;
+    Padded.Free; ImageLatent.Free; UNetInput.Free; Pred.Free;
+    Decoded.Free; Field.Free;
   end;
 end;
 

@@ -201,6 +201,9 @@ type
       Beta1: TNeuralFloat = 1.0e-4; BetaT: TNeuralFloat = 0.02;
       CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false;
       pFinalAlphaBarIsOne: boolean = true);
+    // Reads a diffusers DDIMScheduler / DDPMScheduler scheduler_config.json;
+    // raises on what this class does not implement (clip_sample, non-trailing).
+    constructor CreateFromDiffusersConfig(const FileName: string);
     destructor Destroy; override;
 
     // Schedule tables (1-based timesteps; index 0 = clean anchor).
@@ -436,6 +439,61 @@ begin
   FUniThisOrder := 1;
   FUniLowerOrderNums := 0;
   FUniHistLen := 0;
+end;
+
+constructor TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+  const FileName: string);
+var
+  JsonText: TStringList;
+  Root, TrainedBetas: TJSONData;
+  Obj: TJSONObject;
+  ScheduleName, PredictionName, SpacingName: string;
+  Schedule: TNNetBetaSchedule;
+  Prediction: TNNetPredictionType;
+
+  procedure Refuse(const Setting: string);
+  begin
+    raise Exception.Create('Diffusion scheduler config ' + FileName + ': ' +
+      Setting + ' is not implemented.');
+  end;
+
+begin
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      raise Exception.Create('Diffusion scheduler config ' + FileName +
+        ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    // diffusers defaults: clip_sample true, thresholding false.
+    if Obj.Get('clip_sample', true) then Refuse('"clip_sample" = true');
+    if Obj.Get('thresholding', false) then Refuse('"thresholding" = true');
+    TrainedBetas := Obj.Find('trained_betas');
+    if (TrainedBetas <> nil) and not (TrainedBetas.JSONType = jtNull) then
+      Refuse('"trained_betas"');
+    ScheduleName := Obj.Get('beta_schedule', 'linear');
+    if ScheduleName = 'linear' then Schedule := dsLinear
+    else if ScheduleName = 'scaled_linear' then Schedule := dsScaledLinear
+    else if ScheduleName = 'squaredcos_cap_v2' then Schedule := dsCosine
+    else Refuse('beta_schedule "' + ScheduleName + '"');
+    PredictionName := Obj.Get('prediction_type', 'epsilon');
+    if PredictionName = 'epsilon' then Prediction := dpEps
+    else if PredictionName = 'v_prediction' then Prediction := dpV
+    else Refuse('prediction_type "' + PredictionName + '"');
+    // Only "trailing" matches diffusers exactly; tsUniform is not "leading".
+    SpacingName := Obj.Get('timestep_spacing', 'leading');
+    if SpacingName <> 'trailing' then
+      Refuse('timestep_spacing "' + SpacingName + '"');
+    Create(Obj.Get('num_train_timesteps', 1000), Schedule, Prediction,
+      Obj.Get('beta_start', 0.0001), Obj.Get('beta_end', 0.02), 0.008,
+      Obj.Get('rescale_betas_zero_snr', false),
+      Obj.Get('set_alpha_to_one', true));
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
 end;
 
 destructor TNNetDiffusionScheduler.Destroy;

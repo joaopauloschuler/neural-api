@@ -98,6 +98,7 @@ type
     procedure TestZeroTerminalSNREulerVEndpoint;
     procedure TestZeroTerminalSNRDDPMVEndpoint;
     procedure TestDDPMFirstStepPosteriorMean;
+    procedure TestSchedulerFromDiffusersConfig;
   end;
 
 implementation
@@ -1395,6 +1396,75 @@ begin
     end;
   finally
     Xt.Free; Raw.Free; Got.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestSchedulerFromDiffusersConfig;
+const
+  // prs-eth/marigold-depth-v1-1 scheduler/scheduler_config.json.
+  csMarigoldConfig = '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+    '"clip_sample": false, "num_train_timesteps": 1000, ' +
+    '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
+    '"set_alpha_to_one": false, "steps_offset": 1, "thresholding": false, ' +
+    '"timestep_spacing": "trailing"}';
+var
+  FileName: string;
+  Lines: TStringList;
+  FromConfig, Reference: TNNetDiffusionScheduler;
+  Tt: integer;
+
+  function Refused(const Json: string): boolean;
+  var
+    Probe: TNNetDiffusionScheduler;
+  begin
+    Lines.Text := Json;
+    Lines.SaveToFile(FileName);
+    Result := false;
+    Probe := nil;
+    try
+      try
+        Probe := TNNetDiffusionScheduler.CreateFromDiffusersConfig(FileName);
+      except
+        Result := true;
+      end;
+    finally
+      Probe.Free;
+    end;
+  end;
+
+begin
+  FileName := GetTempDir(false) + 'cai_ddim_scheduler_config.json';
+  Lines := TStringList.Create;
+  FromConfig := nil;
+  Reference := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true, false);
+  try
+    Lines.Text := csMarigoldConfig;
+    Lines.SaveToFile(FileName);
+    FromConfig := TNNetDiffusionScheduler.CreateFromDiffusersConfig(FileName);
+    AssertEquals('T', 1000, FromConfig.NumTimesteps);
+    AssertTrue('v prediction', FromConfig.PredictionType = dpV);
+    AssertTrue('zero SNR', FromConfig.RescaleZeroTerminalSNR);
+    AssertEquals('final alpha bar = ab_1', Reference.AlphaBar[1],
+      FromConfig.FinalAlphaBar, 0);
+    for Tt := 0 to 1000 do
+      AssertEquals('alpha bar @ ' + IntToStr(Tt), Reference.AlphaBar[Tt],
+        FromConfig.AlphaBar[Tt], 0);
+    AssertTrue('clip_sample defaults to true',
+      Refused('{"timestep_spacing": "trailing"}'));
+    AssertTrue('leading spacing', Refused('{"clip_sample": false}'));
+    AssertTrue('sample prediction', Refused('{"clip_sample": false, ' +
+      '"timestep_spacing": "trailing", "prediction_type": "sample"}'));
+    AssertTrue('trained betas', Refused('{"clip_sample": false, ' +
+      '"timestep_spacing": "trailing", "trained_betas": [0.1, 0.2]}'));
+    AssertFalse('null trained betas load', Refused('{"clip_sample": false, ' +
+      '"timestep_spacing": "trailing", "trained_betas": null}'));
+  finally
+    FromConfig.Free;
+    Reference.Free;
+    Lines.Free;
+    DeleteFile(FileName);
   end;
 end;
 

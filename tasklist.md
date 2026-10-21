@@ -302,10 +302,13 @@ rather than acted on.
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
             noise.
-      - [ ] `examples/MarigoldDepth` (README, depth written as a grayscale PNG,
-            `--normals` switch). The real UNet is ~865M params (3.4 GB FP32),
-            above the 2 GB cap on the dev box, so real-checkpoint runs (int8 /
-            OpenCL) belong on the user's GPU box.
+      - [X] `examples/MarigoldDepth` over `TMarigoldPipeline` (depth as a
+            16-bit grayscale PNG, normals as RGB; task from model_index.json
+            instead of a `--normals` switch).
+      - [ ] Real-checkpoint runs of examples/MarigoldDepth (FP32, `--int8`,
+            `--gpu`) on the user's GPU box: the UNet is ~865M params (3.4 GB
+            FP32), above the 2 GB cap on the dev box. SD UNet / VAE under
+            OpenCL had no prior coverage; only the pico smoke ran on PoCL.
 
 - [ ] LLaVA-NeXT (llava-v1.6, model_type `llava_next`) dynamic-resolution VLM
       importer follow-up to the landed `BuildLlavaFromSafeTensors`. The v1.6

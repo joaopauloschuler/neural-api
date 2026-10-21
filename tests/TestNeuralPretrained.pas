@@ -46,6 +46,9 @@ type
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
+    // A diffusers-layout Marigold folder over the pico UNet and VAE fixtures
+    // (no text_encoder/: its width differs from the UNet's cross_attention_dim).
+    procedure WriteMarigoldPicoFolder(const Folder, PipelineClass: string);
     // Checks tests/fixtures/torch_head/<pFixtureName>/head.pt against that
     // entry of torch_head/expected.json: every tensor and metadata leaf.
     procedure CheckTorchHeadFixture(const pFixtureName: string);
@@ -1106,6 +1109,9 @@ type
     procedure TestMarigoldEnsembleDepth;
     procedure TestMarigoldEnsembleNormals;
     procedure TestMarigoldPredictSmoke;
+    procedure TestMergeSafeTensorsFiles;
+    procedure TestMarigoldWidenUNetConvIn;
+    procedure TestMarigoldPipelineMatchesPredict;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -42517,45 +42523,51 @@ begin
 end;
 
 procedure TTestNeuralPretrained.WriteMarigoldPicoUNet(const Path: string);
-const
-  csConvIn = 'conv_in.weight';
-var
-  Reader: TNNetSafeTensorsReader;
-  Writer: TNNetSafeTensorsWriter;
-  V: TNNetVolume;
-  TName: string;
-  Dims: array of Int64;
-  Info: TSafeTensorInfo;
-  t, d, TensorCntM1, DimCntM1: integer;
 begin
-  Reader := TNNetSafeTensorsReader.Create(
-    FixturePath('tiny_sd_unet_linproj.safetensors'));
-  Writer := TNNetSafeTensorsWriter.Create(Path);
-  V := TNNetVolume.Create;
+  MarigoldWidenUNetConvIn(FixturePath('tiny_sd_unet_linproj.safetensors'), Path);
+end;
+
+procedure TTestNeuralPretrained.WriteMarigoldPicoFolder(const Folder,
+  PipelineClass: string);
+var
+  Lines: TStringList;
+  Root: TJSONData;
+  PredictionType: string;
+begin
+  ForceDirectories(Folder + 'scheduler');
+  ForceDirectories(Folder + 'unet');
+  ForceDirectories(Folder + 'vae');
+  Lines := TStringList.Create;
+  Root := nil;
   try
-    TensorCntM1 := Reader.Count - 1;
-    for t := 0 to TensorCntM1 do
-    begin
-      TName := Reader.TensorName(t);
-      Info := Reader.GetInfo(TName);
-      DimCntM1 := Length(Info.Shape) - 1;
-      SetLength(Dims, DimCntM1 + 1);
-      for d := 0 to DimCntM1 do Dims[d] := Info.Shape[d];
-      Reader.LoadTensorFlat(TName, V);
-      if TName = csConvIn then
-      begin
-        // [out, 4, 3, 3] -> [out, 8, 3, 3]: image latent ++ target latent.
-        Dims[1] := 2 * Dims[1];
-        V.ReSize(Dims[0] * Dims[1] * Dims[2] * Dims[3], 1, 1);
-        V.RandomizeGaussian(0.1);
-      end;
-      Writer.AddTensorFlat(TName, Dims, V);
-    end;
-    Writer.SaveToFile();
+    if PipelineClass = 'MarigoldNormalsPipeline' then PredictionType := 'normals'
+    else PredictionType := 'depth';
+    Lines.Text := '{"_class_name": "' + PipelineClass + '", ' +
+      '"prediction_type": "' + PredictionType + '", "default_denoising_steps": 2, ' +
+      '"default_processing_resolution": 16, "use_full_z_range": true}';
+    Lines.SaveToFile(Folder + 'model_index.json');
+    Lines.Text := '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
+      '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+      '"clip_sample": false, "num_train_timesteps": 1000, ' +
+      '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
+      '"set_alpha_to_one": false, "timestep_spacing": "trailing"}';
+    Lines.SaveToFile(Folder + 'scheduler' + DirectorySeparator +
+      'scheduler_config.json');
+    Lines.LoadFromFile(FixturePath('tiny_sd_unet_linproj_config.json'));
+    Root := GetJSON(Lines.Text);
+    TJSONObject(Root).Integers['in_channels'] := 8;
+    Lines.Text := Root.FormatJSON();
+    Lines.SaveToFile(Folder + 'unet' + DirectorySeparator + 'config.json');
+    WriteMarigoldPicoUNet(Folder + 'unet' + DirectorySeparator +
+      'diffusion_pytorch_model.safetensors');
+    Lines.LoadFromFile(FixturePath('tiny_vae_encoder_config.json'));
+    Lines.SaveToFile(Folder + 'vae' + DirectorySeparator + 'config.json');
+    MergeSafeTensorsFiles([FixturePath('tiny_vae_encoder.safetensors'),
+      FixturePath('tiny_vae_decoder.safetensors')],
+      Folder + 'vae' + DirectorySeparator + 'diffusion_pytorch_model.safetensors');
   finally
-    V.Free;
-    Writer.Free;
-    Reader.Free;
+    Root.Free;
+    Lines.Free;
   end;
 end;
 
@@ -43089,6 +43101,199 @@ begin
     Image.Free; EncStates.Free; Prediction.Free;
     Sched.Free; Enc.Free; Dec.Free; UNet.Free;
     DeleteFile(Path);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMergeSafeTensorsFiles;
+var
+  Path: string;
+  Merged, Encoder, Decoder: TNNetSafeTensorsReader;
+  Expected, Got: TNNetVolume;
+
+  procedure CheckSource(Source: TNNetSafeTensorsReader);
+  var
+    Name: string;
+    TensorPos, MaxTensorPos: integer;
+  begin
+    MaxTensorPos := Source.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      Name := Source.TensorName(TensorPos);
+      AssertTrue('merged has ' + Name, Merged.HasTensor(Name));
+      Source.LoadTensorFlat(Name, Expected);
+      Merged.LoadTensorFlat(Name, Got);
+      AssertEquals(Name + ' size', Expected.Size, Got.Size);
+      AssertEquals(Name + ' values', 0, Expected.SumDiff(Got), 0);
+    end;
+  end;
+
+begin
+  Path := GetTempDir(false) + 'cai_merged_vae.safetensors';
+  Encoder := nil; Decoder := nil; Merged := nil;
+  Expected := TNNetVolume.Create; Got := TNNetVolume.Create;
+  try
+    MergeSafeTensorsFiles([FixturePath('tiny_vae_encoder.safetensors'),
+      FixturePath('tiny_vae_decoder.safetensors')], Path);
+    Encoder := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_vae_encoder.safetensors'));
+    Decoder := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_vae_decoder.safetensors'));
+    Merged := TNNetSafeTensorsReader.Create(Path);
+    AssertEquals('tensor count', Encoder.Count + Decoder.Count, Merged.Count);
+    CheckSource(Encoder);
+    CheckSource(Decoder);
+    try
+      MergeSafeTensorsFiles([FixturePath('tiny_vae_encoder.safetensors'),
+        FixturePath('tiny_vae_encoder.safetensors')], Path + '.dup');
+      Fail('a name in two sources must raise');
+    except
+      on E: ESafeTensorsError do ;
+    end;
+  finally
+    Expected.Free; Got.Free;
+    Merged.Free; Encoder.Free; Decoder.Free;
+    DeleteFile(Path);
+    DeleteFile(Path + '.dup');
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMarigoldWidenUNetConvIn;
+var
+  Path: string;
+  Source, Widened: TNNetSafeTensorsReader;
+  Original, Got: TNNetVolume;
+  Info: TSafeTensorInfo;
+  OutPos, InPos, KernelPos, InBlockSize, InChannels: integer;
+  Halved: TNeuralFloat;
+begin
+  Path := GetTempDir(false) + 'cai_marigold_widened_unet.safetensors';
+  Source := nil; Widened := nil;
+  Original := TNNetVolume.Create; Got := TNNetVolume.Create;
+  try
+    WriteMarigoldPicoUNet(Path);
+    Source := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_sd_unet_linproj.safetensors'));
+    Widened := TNNetSafeTensorsReader.Create(Path);
+    AssertEquals('tensor count', Source.Count, Widened.Count);
+    Info := Widened.GetInfo('conv_in.weight');
+    InChannels := Source.GetInfo('conv_in.weight').Shape[1];
+    AssertEquals('in channels doubled', 2 * InChannels, Info.Shape[1]);
+    Source.LoadTensorFlat('conv_in.weight', Original);
+    Widened.LoadTensorFlat('conv_in.weight', Got);
+    InBlockSize := InChannels * Info.Shape[2] * Info.Shape[3];
+    for OutPos := 0 to Info.Shape[0] - 1 do
+      for InPos := 0 to InBlockSize - 1 do
+      begin
+        Halved := 0.5 * Original.FData[OutPos * InBlockSize + InPos];
+        for KernelPos := 0 to 1 do
+          AssertEquals('conv_in ' + IntToStr(OutPos) + ',' + IntToStr(InPos),
+            Halved, Got.FData[(2 * OutPos + KernelPos) * InBlockSize + InPos], 0);
+      end;
+    Source.LoadTensorFlat('conv_out.weight', Original);
+    Widened.LoadTensorFlat('conv_out.weight', Got);
+    AssertEquals('conv_out untouched', 0, Original.SumDiff(Got), 0);
+  finally
+    Original.Free; Got.Free;
+    Source.Free; Widened.Free;
+    DeleteFile(Path);
+  end;
+end;
+
+// TMarigoldPipeline (one component at a time, configs from the folder) must
+// reproduce MarigoldPredict on the same nets, noises and scheduler.
+procedure TTestNeuralPretrained.TestMarigoldPipelineMatchesPredict;
+const
+  cImageX = 16;
+  cImageY = 12;
+  cSeed = 31337;
+  cMembers = 2;
+var
+  Folder: string;
+  Pipeline: TMarigoldPipeline;
+  Enc, Dec, UNet: TNNet;
+  VaeConfig: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  Image, EncStates, Expected, Got: TNNetVolume;
+  Noises: array[0..cMembers - 1] of TNNetVolume;
+  X, Y, C, NoisePos: integer;
+  PredictNormals: boolean;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) + 'cai_marigold_pico');
+  Enc := nil; Dec := nil; UNet := nil; Sched := nil; Pipeline := nil;
+  Image := TNNetVolume.Create(cImageX, cImageY, 3);
+  EncStates := TNNetVolume.Create;
+  Expected := TNNetVolume.Create; Got := TNNetVolume.Create;
+  for NoisePos := 0 to cMembers - 1 do Noises[NoisePos] := TNNetVolume.Create;
+  try
+    for Y := 0 to cImageY - 1 do
+      for X := 0 to cImageX - 1 do
+        for C := 0 to 2 do
+          Image[X, Y, C] := 0.5 + 0.5 * Sin(0.4 * X + 0.7 * Y + C);
+    for PredictNormals := false to true do
+    begin
+      if PredictNormals then
+        WriteMarigoldPicoFolder(Folder, 'MarigoldNormalsPipeline')
+      else
+        WriteMarigoldPicoFolder(Folder, 'MarigoldDepthPipeline');
+      Pipeline := TMarigoldPipeline.Create(Folder);
+      AssertEquals('normals from _class_name', PredictNormals,
+        Pipeline.PredictNormals);
+      AssertEquals('default steps', 2, Pipeline.DefaultSteps);
+      AssertEquals('default resolution', 16, Pipeline.DefaultProcessingResolution);
+      UCfg := Pipeline.UNetConfig;
+      EncStates.ReSize(2, 1, UCfg.CrossAttentionDim);
+      EncStates.RandomizeGaussian(0.5);
+      Pipeline.SetEmptyPromptStates(EncStates);
+      Pipeline.Predict(Image, {NumSteps=}0, cMembers, {ProcessingResolution=}-1,
+        cSeed, Got);
+      FreeAndNil(Pipeline);
+
+      UCfg.TextSeqLen := 2;
+      UNet := BuildSDUNetFromSafeTensorsEx(Folder + 'unet' + DirectorySeparator +
+        'diffusion_pytorch_model.safetensors', UCfg, {pTrainable=}false);
+      VaeConfig := ReadVaeEncoderConfigFromJSONFile(Folder + 'vae' +
+        DirectorySeparator + 'config.json');
+      Enc := BuildVaeEncoderFromSafeTensorsEx(Folder + 'vae' +
+        DirectorySeparator + 'diffusion_pytorch_model.safetensors', VaeConfig,
+        {pTrainable=}false);
+      VaeConfig := ReadVaeDecoderConfigFromJSONFile(Folder + 'vae' +
+        DirectorySeparator + 'config.json');
+      VaeConfig.LatentGrid := UCfg.LatentGrid;
+      Dec := BuildVaeDecoderFromSafeTensorsEx(Folder + 'vae' +
+        DirectorySeparator + 'diffusion_pytorch_model.safetensors', VaeConfig,
+        {pTrainable=}false);
+      Sched := TNNetDiffusionScheduler.CreateFromDiffusersConfig(Folder +
+        'scheduler' + DirectorySeparator + 'scheduler_config.json');
+      RandSeed := cSeed;
+      for NoisePos := 0 to cMembers - 1 do
+      begin
+        Noises[NoisePos].ReSize(UCfg.LatentGrid, UCfg.LatentGrid, UCfg.OutChannels);
+        Noises[NoisePos].RandomizeGaussian(1.0);
+      end;
+      MarigoldPredict(Enc, UNet, Dec, UCfg, Sched, Image, EncStates, Noises,
+        {NumSteps=}2, {ProcessingResolution=}16, {Alignment=}2, PredictNormals,
+        Expected);
+      FreeAndNil(Sched); FreeAndNil(Enc); FreeAndNil(Dec); FreeAndNil(UNet);
+      AssertTrue('same size', Expected.SameSize(Got));
+      AssertEquals('pipeline = MarigoldPredict', 0, Expected.SumDiff(Got), 1e-5);
+    end;
+  finally
+    for NoisePos := 0 to cMembers - 1 do Noises[NoisePos].Free;
+    Image.Free; EncStates.Free; Expected.Free; Got.Free;
+    Pipeline.Free; Sched.Free; Enc.Free; Dec.Free; UNet.Free;
+    DeleteFile(Folder + 'model_index.json');
+    DeleteFile(Folder + 'scheduler' + DirectorySeparator + 'scheduler_config.json');
+    DeleteFile(Folder + 'unet' + DirectorySeparator + 'config.json');
+    DeleteFile(Folder + 'unet' + DirectorySeparator +
+      'diffusion_pytorch_model.safetensors');
+    DeleteFile(Folder + 'vae' + DirectorySeparator + 'config.json');
+    DeleteFile(Folder + 'vae' + DirectorySeparator +
+      'diffusion_pytorch_model.safetensors');
+    RemoveDir(Folder + 'scheduler');
+    RemoveDir(Folder + 'unet');
+    RemoveDir(Folder + 'vae');
+    RemoveDir(Folder);
   end;
 end;
 

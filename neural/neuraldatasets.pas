@@ -197,6 +197,9 @@ type
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
   // A depth-4 volume saved as .png keeps its alpha channel (0..255 each).
   function SaveImageFromVolumeIntoFile(V:TNNetVolume; ImageFileName:string):boolean;
+  // Channel 0 of V, clamped to [0,1], as a 16-bit grayscale PNG (value*65535,
+  // as diffusers export_depth_to_16bit_png). False when the save fails.
+  function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
   // V becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha (opaque files get
   // alpha 255); 0..255 each. False when the file does not load.
   function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
@@ -2995,6 +2998,44 @@ begin
     end
     else
       Result := M.SaveToFile(ImageFileName);
+  finally
+    PngWriter.Free;
+    M.Free;
+  end;
+end;
+
+function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
+var
+  M: TFPMemoryImage;
+  PngWriter: TFPWriterPNG;
+  LocalColor: TFPColor;
+  X, Y, MaxX, MaxY: integer;
+  GrayValue: word;
+begin
+  M := TFPMemoryImage.Create(V.SizeX, V.SizeY);
+  PngWriter := TFPWriterPNG.Create;
+  try
+    MaxX := V.SizeX - 1;
+    MaxY := V.SizeY - 1;
+    LocalColor.alpha := alphaOpaque;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+      begin
+        GrayValue := Round(Max(0.0, Min(1.0, V.FData[V.GetRawPos(X, Y)])) * 65535);
+        LocalColor.red := GrayValue;
+        LocalColor.green := GrayValue;
+        LocalColor.blue := GrayValue;
+        M.Colors[X, Y] := LocalColor;
+      end;
+    PngWriter.GrayScale := true;
+    PngWriter.WordSized := true;
+    PngWriter.UseAlpha := false;
+    try
+      M.SaveToFile(FileName, PngWriter);
+      Result := true;
+    except
+      Result := false;
+    end;
   finally
     PngWriter.Free;
     M.Free;
