@@ -46,6 +46,7 @@ type
     procedure TestCachedForwardNonCausal; // external prefix + unmasked step
     procedure TestSharedCacheStorage;     // stacked layers, one K/V storage
     procedure TestCachedRowKeyEnds;       // per-row key ends vs a dense mask
+    procedure TestSkipAttentionScores;    // identity scores: each row's own V
   end;
 
 implementation
@@ -894,6 +895,148 @@ begin
     PrefixK.Free;
     Input.Free;
     Prefix.Free;
+  end;
+end;
+
+// Output row p, head h must be input row p's V slice of KV group h div
+// (Hq div Hkv), exactly.
+procedure AssertIdentityScores(const Msg: string; Input, Output: TNNetVolume;
+  Hq, Hkv, HeadDim: integer);
+var
+  p, h, d, QW, KW: integer;
+begin
+  QW := Hq * HeadDim;
+  KW := Hkv * HeadDim;
+  TAssert.AssertEquals(Msg + ': output size', Input.SizeX * QW, Output.Size);
+  for p := 0 to Input.SizeX - 1 do
+    for h := 0 to Hq - 1 do
+      for d := 0 to HeadDim - 1 do
+        TAssert.AssertEquals(Msg + ' row ' + IntToStr(p) + ' head ' +
+          IntToStr(h) + ' col ' + IntToStr(d),
+          Input.FData[p * Input.Depth + QW + KW +
+            (h div (Hq div Hkv)) * HeadDim + d],
+          Output.FData[p * QW + h * HeadDim + d], 0);
+end;
+
+procedure TTestNeuralFusedSDPA.TestSkipAttentionScores;
+const
+  PrefixLen = 5;
+  StepLen = 4;
+  HeadDim = 4;
+var
+  NN, Ref, Reloaded: TNNet;
+  Layer, RefLayer: TNNetFusedSDPA;
+  Input, StepInput, NextInput, PrefixK, PrefixV: TNNetVolume;
+  Hq, Hkv, QW, KW, PackedWidth, i, CaseIdx: integer;
+  Parallel, Int8KV, Raised: boolean;
+begin
+  Input := TNNetVolume.Create(PrefixLen + StepLen, 1, 1);
+  StepInput := TNNetVolume.Create();
+  NextInput := TNNetVolume.Create();
+  PrefixK := TNNetVolume.Create();
+  PrefixV := TNNetVolume.Create();
+  try
+    for CaseIdx := 0 to 1 do
+    begin
+      // MHA, then GQA groups of 3.
+      if CaseIdx = 0 then begin Hq := 2; Hkv := 2; end
+      else begin Hq := 6; Hkv := 2; end;
+      QW := Hq * HeadDim;
+      KW := Hkv * HeadDim;
+      PackedWidth := QW + 2 * KW;
+      Input.ReSize(PrefixLen + StepLen, 1, PackedWidth);
+      StepInput.ReSize(StepLen, 1, PackedWidth);
+      NextInput.ReSize(StepLen, 1, PackedWidth);
+      PrefixK.ReSize(PrefixLen, 1, KW);
+      PrefixV.ReSize(PrefixLen, 1, KW);
+      FillPacked(Input, 17 + CaseIdx);
+      FillPacked(NextInput, 230 + CaseIdx);
+      CopyPackedRows(Input, PrefixK, 0, PrefixLen, QW);
+      CopyPackedRows(Input, PrefixV, 0, PrefixLen, QW + KW);
+      CopyPackedRows(Input, StepInput, PrefixLen, StepLen, 0);
+      // No cache, causal: the diagonal is always attendable, so query i still
+      // takes V row i.
+      for Parallel := false to true do
+      begin
+        NN := BuildFusedNet(PrefixLen + StepLen, Hq, Hkv, HeadDim, 0, true);
+        try
+          TNNetFusedSDPA(NN.GetLastLayer()).SkipAttentionScores := true;
+          NN.Compute(Input, 0, Parallel);
+          AssertIdentityScores('prefill Hq=' + IntToStr(Hq) + ' parallel=' +
+            BoolToStr(Parallel, true), Input, NN.GetLastLayer().Output, Hq,
+            Hkv, HeadDim);
+        finally
+          NN.Free;
+        end;
+      end;
+      // Cached step behind an external prefix (the Qwen-Image step net): query
+      // i takes cache row PrefixLen + i, which is its own V. A normal step
+      // afterwards must see the same cache as after a normal first step.
+      for Int8KV := false to true do
+        for Parallel := false to true do
+        begin
+          NN := TNNet.Create();
+          Ref := TNNet.Create();
+          try
+            NN.AddLayer(TNNetInput.Create(StepLen, 1, PackedWidth));
+            Layer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, false, 0, 0, true);
+            Layer.BeginIncrementalDecode(PrefixLen + 2 * StepLen, Int8KV);
+            NN.AddLayer(Layer);
+            Ref.AddLayer(TNNetInput.Create(StepLen, 1, PackedWidth));
+            RefLayer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, false, 0, 0,
+              true);
+            RefLayer.BeginIncrementalDecode(PrefixLen + 2 * StepLen, Int8KV);
+            Ref.AddLayer(RefLayer);
+            Layer.AppendCacheRowsFrom(PrefixK, PrefixV);
+            RefLayer.AppendCacheRowsFrom(PrefixK, PrefixV);
+            Layer.SkipAttentionScores := true;
+            NN.Compute(StepInput, 0, Parallel);
+            Ref.Compute(StepInput, 0, Parallel);
+            AssertIdentityScores('cached Hq=' + IntToStr(Hq) + ' int8kv=' +
+              BoolToStr(Int8KV, true) + ' parallel=' +
+              BoolToStr(Parallel, true), StepInput, Layer.Output, Hq, Hkv,
+              HeadDim);
+            AssertEquals('identity step appends its rows',
+              PrefixLen + StepLen, Layer.CacheLength);
+            Layer.SkipAttentionScores := false;
+            NN.Compute(NextInput, 0, Parallel);
+            Ref.Compute(NextInput, 0, Parallel);
+            for i := 0 to Layer.Output.Size - 1 do
+              AssertEquals('next step after identity, int8kv=' +
+                BoolToStr(Int8KV, true) + ' at ' + IntToStr(i),
+                RefLayer.Output.FData[i], Layer.Output.FData[i], 0);
+          finally
+            NN.Free;
+            Ref.Free;
+          end;
+        end;
+    end;
+    // A runtime switch: not saved, and the backward refuses it.
+    NN := BuildFusedNet(StepLen, 2, 1, HeadDim, 0, false);
+    Reloaded := TNNet.Create();
+    try
+      Layer := TNNetFusedSDPA(NN.GetLastLayer());
+      Layer.SkipAttentionScores := true;
+      Reloaded.LoadFromString(NN.SaveToString());
+      AssertFalse('SkipAttentionScores is not saved',
+        TNNetFusedSDPA(Reloaded.GetLastLayer()).SkipAttentionScores);
+      Raised := false;
+      try
+        Layer.Backpropagate();
+      except
+        on E: Exception do Raised := true;
+      end;
+      AssertTrue('Backpropagate raises with SkipAttentionScores', Raised);
+    finally
+      NN.Free;
+      Reloaded.Free;
+    end;
+  finally
+    Input.Free;
+    StepInput.Free;
+    NextInput.Free;
+    PrefixK.Free;
+    PrefixV.Free;
   end;
 end;
 

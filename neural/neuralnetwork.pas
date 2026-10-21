@@ -200,8 +200,10 @@ type
   TNNetFusedSDPACL = class;
   TNNetGatherCopyCL = class;
   // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
-  // (cai_sdpa_decode_split + merge) or a flash variant (+ merge when split).
-  TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash);
+  // (cai_sdpa_decode_split + merge), a flash variant (+ merge when split), or
+  // the identity-score V copy (cai_gather_copy, TNNetFusedSDPA.SkipAttentionScores).
+  TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash,
+    sdpaPathIdentityScores);
   {$ENDIF}
 
   // 2-D dynamic double matrix used by TNNetSpectralConv2D's separable 2-D FFT
@@ -5071,6 +5073,14 @@ type
     FCapDiffQ, FCapDiffY: csize_t;
     // The buffer the last forward left its result in (FBufY or FBufDiffY).
     FResultBuf: cl_mem;
+    // cai_gather_copy on FKernel's queue, its plan of ComputeStepIdentityScores
+    // (grow-only) and the (TokenCnt, XStride, QHeads, GroupSize, Dk, VOffset)
+    // the uploaded plan was built for.
+    FGatherCopyKernel: cl_kernel;
+    FIdentityTable, FIdentityPlanHost: TNeuralIntegerArray;
+    FBufIdentityPlan: cl_mem;
+    FCapIdentityPlan: csize_t;
+    FIdentityPlanKey: array[0..5] of integer;
     // True while FBufK/FBufV rows 0..FPrefixRowCnt-1 hold ComputeFlashPacked's
     // last uploaded prefix; any other cache writer clears it.
     FPrefixRowsValid: boolean;
@@ -5109,6 +5119,9 @@ type
     // Size the four int8 cache buffers for the whole MaxContext allocation.
     // Grow-only, so a decode session sizes them once.
     procedure EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
+    // Builds and uploads ComputeStepIdentityScores' plan unless the key matches.
+    procedure EnsureIdentityPlan(TokenCnt, XStride, QHeads, GroupSize, Dk,
+      VOffset: integer);
     // Scratch floats one pass-1 work-group of the named cache format may ask
     // for: the device figure (or the forced one) less the kernel's own local
     // memory and csFusedSDPALocalMemReserveBytes.
@@ -5235,6 +5248,11 @@ type
       CacheSlot, QW, KW, Window: integer; Causal: boolean;
       const RowKeyEnds: array of integer; RowKeyEndsVersion: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // ComputeStep's append, then the identity score matrix: Y's row t, head h
+    // is X's row t V slice of KV group h div GroupSize (one cai_gather_copy).
+    procedure ComputeStepIdentityScores(X, Y: TNNetVolume; Int8KV: boolean;
+      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot, QW, KW: integer;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
     // One head of X = (TokenCnt, 1, [Q|K|V]) on cai_sdpa_flash: keys are the
     // pPrefix rows then X's; bias, sinks and prefix upload when Changed.
@@ -5370,7 +5388,8 @@ type
   /// backward IS implemented (per-head mirror of the single-head backward).
   /// Serialization: FStruct[5] = QHeads, FStruct[6] = KVHeads on top of the
   /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap;
-  /// FStruct[7] = CachedForwardNonCausal.
+  /// FStruct[7] = CachedForwardNonCausal. SkipAttentionScores is a runtime
+  /// switch, not saved.
   // Coded by Claude (AI).
   TNNetFusedSDPA = class(TNNetScaledDotProductAttention)
   private
@@ -5387,6 +5406,11 @@ type
     // Bumped by SetRowKeyEnds (never 0), so the OpenCL helper re-uploads
     // the ends only when they change.
     FRowKeyEndsVersion: integer;
+    // See SkipAttentionScores.
+    FSkipAttentionScores: boolean;
+    // Identity scores for heads h1..h2: every token row's head h output is
+    // its own V slice of KV group h div FGroupSize.
+    procedure ComputeIdentityScoreHeads(h1, h2: integer);
     // Append input token p's K/V rows (all KV heads) to cache slot FCacheLen.
     procedure AppendRow(p: integer);
     // Append one token's K and V rows to cache slot FCacheLen. KRow/VRow each
@@ -5477,6 +5501,10 @@ type
     // (mask mode none) over an FP32 cache. Eviction must be off.
     property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
       write SetCachedForwardNonCausal;
+    // Inference-only (Perturbed-Attention Guidance): the score matrix is the
+    // identity, so each row outputs its own V row; the cache still appends.
+    property SkipAttentionScores: boolean read FSkipAttentionScores
+      write FSkipAttentionScores;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -37572,6 +37600,32 @@ begin
   end;
 end;
 
+// With the cache on, row p's own V is also cache row FCacheBaseLen + p (it was
+// just appended), so reading the input reads exactly that row, before any
+// int8 rounding. Coded by Claude (AI).
+procedure TNNetFusedSDPA.ComputeIdentityScoreHeads(h1, h2: integer);
+var
+  p, h, MaxTokenPos, RowStride, RowBytes, SrcPos, DstPos, VOfs: integer;
+  Prev: TNNetVolume;
+begin
+  Prev := FPrevLayer.FOutput;
+  MaxTokenPos := Prev.SizeX - 1;
+  RowStride := Prev.GetRawPos(1, 0);
+  RowBytes := FDk * csNeuralFloatSize;
+  VOfs := FQW + FKW;
+  for h := h1 to h2 do
+  begin
+    SrcPos := VOfs + (h div FGroupSize) * FDk;
+    DstPos := h * FDk;
+    for p := 0 to MaxTokenPos do
+    begin
+      Move(Prev.FData[SrcPos], FOutput.FData[DstPos], RowBytes);
+      Inc(SrcPos, RowStride);
+      Inc(DstPos, FQW);
+    end;
+  end;
+end;
+
 procedure TNNetFusedSDPA.AppendRow(p: integer);
 var
   pBase: integer;
@@ -37885,13 +37939,17 @@ begin
     begin
       if FCacheLen >= FEvictSinks + FEvictWindow then EvictOldestWindowRow();
       AppendRow(p);
-      ComputeCachedToken(p, 0, QHeadsM1, FCacheLen);
+      if not FSkipAttentionScores then
+        ComputeCachedToken(p, 0, QHeadsM1, FCacheLen);
     end;
+    if FSkipAttentionScores then ComputeIdentityScoreHeads(0, QHeadsM1);
   end
   else
   begin
     AppendCacheRows();
-    ComputeCachedRows(0, QHeadsM1);
+    if FSkipAttentionScores
+      then ComputeIdentityScoreHeads(0, QHeadsM1)
+      else ComputeCachedRows(0, QHeadsM1);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -37955,7 +38013,9 @@ begin
   FLastForwardTiled := false;
   Inc(FForwardCPUCnt);
   StartTime := Now();
-  ComputePrefillHeads(0, FQHeads - 1);
+  if FSkipAttentionScores
+    then ComputeIdentityScoreHeads(0, FQHeads - 1)
+    else ComputePrefillHeads(0, FQHeads - 1);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -37996,7 +38056,8 @@ end;
 procedure TNNetFusedSDPA.ComputeRange(StartRange, FinRange: integer);
 begin
   if FChunkPrecomputed then exit; // prep already produced FOutput
-  if FCacheEnabled then ComputeCachedRows(StartRange, FinRange)
+  if FSkipAttentionScores then ComputeIdentityScoreHeads(StartRange, FinRange)
+  else if FCacheEnabled then ComputeCachedRows(StartRange, FinRange)
   else ComputePrefillHeads(StartRange, FinRange);
 end;
 
@@ -38054,7 +38115,7 @@ begin
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
     and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax);
-  if not Result then exit;
+  if (not Result) or FSkipAttentionScores then exit;
   Result := OpenCLPathFor(FPrevLayer.FOutput.SizeX) <> sdpaPathNone;
 end;
 
@@ -38244,12 +38305,18 @@ begin
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
   // accessors above.
-  FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, FKVQuantInt8,
-    OpenCLPathFor(TokenCnt), FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-    {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
-    {Causal=}not FCachedForwardNonCausal, FRowKeyEnds, FRowKeyEndsVersion,
-    FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
-    SourceBuffer, {pKeepResultOnOpenCL=}true);
+  if FSkipAttentionScores then
+    FFusedSDPACL.ComputeStepIdentityScores(FPrevLayer.FOutput, FOutput,
+      FKVQuantInt8, FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
+      {CacheSlot=}FCacheLen, FQW, FKW, SourceBuffer,
+      {pKeepResultOnOpenCL=}true)
+  else
+    FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, FKVQuantInt8,
+      OpenCLPathFor(TokenCnt), FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
+      {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      {Causal=}not FCachedForwardNonCausal, FRowKeyEnds, FRowKeyEndsVersion,
+      FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
+      SourceBuffer, {pKeepResultOnOpenCL=}true);
   Inc(FCacheLen, TokenCnt);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
@@ -38357,6 +38424,9 @@ var
   HasSoftCap: boolean;
   SumDAttnAttn, A, dS, TanhVal: TNeuralFloat;
 begin
+  if FSkipAttentionScores then
+    raise Exception.Create('TNNetFusedSDPA.Backpropagate: SkipAttentionScores ' +
+      'is inference-only (the forward leaves no attention map).');
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
@@ -41199,6 +41269,28 @@ begin
   end;
 end;
 
+// Packs a cai_gather_copy plan into PlanHost (grown when short): AxisCount,
+// the extents, the table starts, then Table[0..TableLen-1]; returns its length.
+function PackGatherCopyPlan(AxisCount: integer;
+  const Extents, TableStarts: array of integer;
+  const Table: TNeuralIntegerArray; TableLen: integer;
+  var PlanHost: TNeuralIntegerArray): integer;
+var
+  AxisPos, MaxAxisPos, HeaderLen: integer;
+begin
+  HeaderLen := 1 + 2 * AxisCount;
+  Result := HeaderLen + TableLen;
+  if Length(PlanHost) < Result then SetLength(PlanHost, Result);
+  PlanHost[0] := AxisCount;
+  MaxAxisPos := AxisCount - 1;
+  for AxisPos := 0 to MaxAxisPos do
+  begin
+    PlanHost[1 + AxisPos] := Extents[AxisPos];
+    PlanHost[1 + AxisCount + AxisPos] := HeaderLen + TableStarts[AxisPos];
+  end;
+  Move(Table[0], PlanHost[HeaderLen], TableLen * csLongintSize);
+end;
+
 { TNNetGatherCopyCL }
 
 constructor TNNetGatherCopyCL.Create(NN: TNNet);
@@ -41282,7 +41374,7 @@ end;
 procedure TNNetGatherCopyCL.EnsurePlan(Consumer: TNNetLayer);
 var
   Src, Y: TNNetVolume;
-  AxisPos, MaxAxisPos, HeaderLen, PlanLen, OutCount: integer;
+  AxisPos, MaxAxisPos, PlanLen, OutCount: integer;
 begin
   Src := Consumer.FPrevLayer.FOutput;
   Y := Consumer.FOutput;
@@ -41298,16 +41390,8 @@ begin
   if (FAxisCount = 0) or (OutCount <> Y.Size) then
     raise Exception.Create(Consumer.ClassName + ': the cai_gather_copy plan ' +
       'covers ' + IntToStr(OutCount) + ' of ' + IntToStr(Y.Size) + ' outputs.');
-  HeaderLen := 1 + 2 * FAxisCount;
-  PlanLen := HeaderLen + FTableLen;
-  if Length(FPlanHost) < PlanLen then SetLength(FPlanHost, PlanLen);
-  FPlanHost[0] := FAxisCount;
-  for AxisPos := 0 to MaxAxisPos do
-  begin
-    FPlanHost[1 + AxisPos] := FAxisExtent[AxisPos];
-    FPlanHost[1 + FAxisCount + AxisPos] := HeaderLen + FAxisTableStart[AxisPos];
-  end;
-  Move(FTable[0], FPlanHost[HeaderLen], FTableLen * csLongintSize);
+  PlanLen := PackGatherCopyPlan(FAxisCount, FAxisExtent, FAxisTableStart,
+    FTable, FTableLen, FPlanHost);
   FKernel.EnsureBuffer(FPlanBuf, FCapPlan, CL_MEM_READ_ONLY,
     PlanLen * csLongintSize);
   FKernel.WriteBuffer(FPlanBuf, PlanLen * csLongintSize, @FPlanHost[0], CL_TRUE);
@@ -43268,6 +43352,7 @@ begin
   FQKNormKernel := FKernel.CreateKernel('cai_sdpa_qk_l2norm_packed');
   FDiffPackKernel := FKernel.CreateKernel('cai_sdpa_diff_pack_q');
   FDiffCombineKernel := FKernel.CreateKernel('cai_sdpa_diff_combine');
+  FGatherCopyKernel := FKernel.CreateKernel('cai_gather_copy');
   FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
   FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
   FFlashKernels[false] := FKernel.CreateKernel('cai_sdpa_flash');
@@ -43301,6 +43386,8 @@ begin
   if Assigned(FQKNormKernel)     then clReleaseKernel(FQKNormKernel);
   if Assigned(FDiffPackKernel)   then clReleaseKernel(FDiffPackKernel);
   if Assigned(FDiffCombineKernel) then clReleaseKernel(FDiffCombineKernel);
+  if Assigned(FGatherCopyKernel) then clReleaseKernel(FGatherCopyKernel);
+  if Assigned(FBufIdentityPlan) then clReleaseMemObject(FBufIdentityPlan);
   for Int8KV := false to true do
     if Assigned(FFlashKernels[Int8KV]) then
       clReleaseKernel(FFlashKernels[Int8KV]);
@@ -43647,6 +43734,71 @@ begin
     RunSplitDecode(X, Y, bufX, Int8KV, QHeads, KVHeads, GroupSize, Dk,
       CacheMax, CacheSlot, Window, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap,
       bufK, bufV, pKeepResultOnOpenCL);
+end;
+
+procedure TNNetFusedSDPACL.EnsureIdentityPlan(TokenCnt, XStride, QHeads,
+  GroupSize, Dk, VOffset: integer);
+var
+  TokenPos, HeadPos, ColPos, PlanLen: integer;
+  Extents, TableStarts: array[0..2] of integer;
+begin
+  if (FIdentityPlanKey[0] = TokenCnt) and (FIdentityPlanKey[1] = XStride) and
+    (FIdentityPlanKey[2] = QHeads) and (FIdentityPlanKey[3] = GroupSize) and
+    (FIdentityPlanKey[4] = Dk) and (FIdentityPlanKey[5] = VOffset) then exit;
+  // Output axes (token, query head, column): source offset t*XStride +
+  // VOffset + (h div GroupSize)*Dk + d.
+  Extents[0] := TokenCnt;
+  Extents[1] := QHeads;
+  Extents[2] := Dk;
+  TableStarts[0] := 0;
+  TableStarts[1] := TokenCnt;
+  TableStarts[2] := TokenCnt + QHeads;
+  if Length(FIdentityTable) < TokenCnt + QHeads + Dk then
+    SetLength(FIdentityTable, TokenCnt + QHeads + Dk);
+  for TokenPos := 0 to TokenCnt - 1 do
+    FIdentityTable[TokenPos] := TokenPos * XStride;
+  for HeadPos := 0 to QHeads - 1 do
+    FIdentityTable[TableStarts[1] + HeadPos] :=
+      VOffset + (HeadPos div GroupSize) * Dk;
+  for ColPos := 0 to Dk - 1 do
+    FIdentityTable[TableStarts[2] + ColPos] := ColPos;
+  PlanLen := PackGatherCopyPlan(3, Extents, TableStarts, FIdentityTable,
+    TokenCnt + QHeads + Dk, FIdentityPlanHost);
+  FKernel.EnsureBuffer(FBufIdentityPlan, FCapIdentityPlan, CL_MEM_READ_ONLY,
+    PlanLen * csLongintSize);
+  FKernel.WriteBuffer(FBufIdentityPlan, PlanLen * csLongintSize,
+    @FIdentityPlanHost[0], CL_TRUE);
+  FIdentityPlanKey[0] := TokenCnt;
+  FIdentityPlanKey[1] := XStride;
+  FIdentityPlanKey[2] := QHeads;
+  FIdentityPlanKey[3] := GroupSize;
+  FIdentityPlanKey[4] := Dk;
+  FIdentityPlanKey[5] := VOffset;
+end;
+
+procedure TNNetFusedSDPACL.ComputeStepIdentityScores(X, Y: TNNetVolume;
+  Int8KV: boolean; QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot, QW,
+  KW: integer; pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+var
+  bufX, bufK, bufV, bufY: cl_mem;
+  NumOut: longint;
+begin
+  if not Assigned(FGatherCopyKernel) then
+    raise Exception.Create('TNNetFusedSDPACL.ComputeStepIdentityScores: ' +
+      'cai_gather_copy is missing from the OpenCL program.');
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  AppendStep(bufX, Int8KV, KVHeads, X.SizeX, Dk, CacheMax, CacheSlot, QW, KW,
+    X.Depth, bufK, bufV);
+  EnsureIdentityPlan(X.SizeX, X.Depth, QHeads, GroupSize, Dk, QW + KW);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  NumOut := X.SizeX * QHeads * Dk;
+  clSetKernelArg(FGatherCopyKernel, 0, csLongintSize, @NumOut);
+  clSetKernelArg(FGatherCopyKernel, 1, csCLMemSize, @FBufIdentityPlan);
+  clSetKernelArg(FGatherCopyKernel, 2, csCLMemSize, @bufX);
+  clSetKernelArg(FGatherCopyKernel, 3, csCLMemSize, @bufY);
+  FKernel.RunKernel(FGatherCopyKernel, NumOut);
+  FLastPath := sdpaPathIdentityScores;
+  FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
 procedure TNNetFusedSDPACL.AppendStep(bufX: cl_mem; Int8KV: boolean;

@@ -553,6 +553,9 @@ type
     // CachedForwardNonCausal flash vs the CPU: head dims 5 to 260, GQA,
     // windows, soft-cap, ragged tiles, the int8 cache, and host-path cases.
     procedure FusedSDPANonCausalOpenCLParity;
+    // SkipAttentionScores in OpenCL memory: each row's own V (exact), the
+    // append still runs, and the next normal step matches the CPU.
+    procedure FusedSDPAIdentityScoresOpenCLParity;
     // Causal flash steps (prefill windows over a cache, sliding windows, GQA,
     // key splits incl. empty ones) against the CPU; one-row steps keep the
     // split-row decode.
@@ -86383,6 +86386,146 @@ begin
   RunFusedSDPAFlashCase(PlatformId, DeviceId, 2, 2, 64, 200, 40, 0,
     0, InputAmplitude, KeyRamp, {Causal=}False, {ForcedSplits=}4, 0, False,
     True, False, sdpaPathFlash);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The identity output is a copy, so it must equal the V slices exactly; the
+// normal step after it shares 1e-5 of max(1, max|y|) with the flash tests.
+procedure TTestNeuralNumerical.FusedSDPAIdentityScoresOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens: integer;
+    Causal, HostSource, ResidentPrefix, Int8KV: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    LCpu, LGpu: TNNetFusedSDPA;
+    StepIn, PrefixK, PrefixV: TNNetVolume;
+    KVRows: TNNetKVRowsOnOpenCL;
+    InDepth, QW, KW, Pos, T, H, D: integer;
+    Diff, MaxDiff, MaxAbsCpu: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('identity %s Hq=%d Hkv=%d Dk=%d L=%d T=%d host=%s ' +
+      'resident=%s int8kv=%s', [BoolToStr(Causal, 'causal', 'non-causal'),
+      QHeads, KVHeads, Dk, PrefixLen, StepTokens, BoolToStr(HostSource, true),
+      BoolToStr(ResidentPrefix, true), BoolToStr(Int8KV, true)]);
+    QW := QHeads * Dk;
+    KW := KVHeads * Dk;
+    InDepth := QW + 2 * KW;
+    KVRows.Buffer := nil;
+    KVRows.RowCount := 0;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
+    PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+    PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+    try
+      NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, 0, 0,
+        {pCachedForwardNonCausal=}not Causal);
+      LCpu.BeginIncrementalDecode(PrefixLen + 2 * StepTokens, Int8KV);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+      if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
+      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, 0, 0,
+        {pCachedForwardNonCausal=}not Causal);
+      LGpu.BeginIncrementalDecode(PrefixLen + 2 * StepTokens, Int8KV);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      for Pos := 0 to PrefixK.Size - 1 do
+      begin
+        PrefixK.FData[Pos] := 3 * (Random - 0.5);
+        PrefixV.FData[Pos] := 3 * (Random - 0.5);
+      end;
+      LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      if ResidentPrefix then
+      begin
+        KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
+        LGpu.AppendCacheRowsFromOpenCL(KVRows);
+      end
+      else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+      for Pos := 0 to StepIn.Size - 1 do StepIn.FData[Pos] := 3 * (Random - 0.5);
+      LCpu.SkipAttentionScores := true;
+      LGpu.SkipAttentionScores := true;
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      TAssert.AssertEquals(What + ': the identity step ran on OpenCL', 1,
+        LGpu.ForwardGPUCnt);
+      TAssert.AssertEquals(What + ': the OpenCL path',
+        Ord(sdpaPathIdentityScores), Ord(LGpu.FusedSDPACL.LastPath));
+      TAssert.AssertTrue(What + ': the output stays in OpenCL memory',
+        LGpu.OutputBindableOnOpenCL());
+      TAssert.AssertEquals(What + ': the input source was ' +
+        BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
+        LGpu.PrevOutputOnOpenCL());
+      TAssert.AssertEquals(What + ': the identity step appends',
+        PrefixLen + StepTokens, LGpu.CacheLength);
+      LGpu.ForceOutputOnRAM();
+      for T := 0 to StepTokens - 1 do
+        for H := 0 to QHeads - 1 do
+          for D := 0 to Dk - 1 do
+            TAssert.AssertEquals(What + Format(': row %d head %d col %d',
+              [T, H, D]), StepIn.FData[T * InDepth + QW + KW +
+              (H div (QHeads div KVHeads)) * Dk + D],
+              LGpu.Output.FData[T * QW + H * Dk + D], 0);
+      // The next step attends the rows the identity step appended.
+      for Pos := 0 to StepIn.Size - 1 do StepIn.FData[Pos] := 3 * (Random - 0.5);
+      LCpu.SkipAttentionScores := false;
+      LGpu.SkipAttentionScores := false;
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      LGpu.ForceOutputOnRAM();
+      MaxDiff := 0;
+      MaxAbsCpu := 0;
+      for Pos := 0 to LCpu.Output.Size - 1 do
+      begin
+        Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
+          MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
+      end;
+      WriteLn('  FusedSDPA OpenCL ', What, ': next step max|diff|=',
+        MaxDiff:0:9, ' path=', Ord(LGpu.FusedSDPACL.LastPath));
+      // The int8 append may round a code the other way than the host does.
+      if not Int8KV then
+        TAssert.AssertTrue(What + ': next step max|diff| ' +
+          FloatToStr(MaxDiff), MaxDiff < 1e-5 * Max(1, MaxAbsCpu));
+    finally
+      if KVRows.Buffer <> nil then clReleaseMemObject(KVRows.Buffer);
+      NNCpu.Free;
+      NNGpu.Free;
+      StepIn.Free;
+      PrefixK.Free;
+      PrefixV.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  // The Qwen-Image step: image rows behind a resident text prefix, MHA.
+  RunCase(2, 2, 128, 7, 5, False, False, True, False);
+  // GQA groups of 3, Dk off the float4 width, an uploaded source and prefix.
+  RunCase(6, 2, 5, 4, 9, False, True, False, False);
+  // Causal: one decode token without a prefix (MQA), then 6 rows over a
+  // resident prefix.
+  RunCase(4, 1, 16, 0, 1, True, False, False, False);
+  RunCase(2, 1, 16, 3, 6, True, False, True, False);
+  // The int8 cache: the copy reads the FP32 input, not the codes.
+  RunCase(2, 2, 16, 4, 9, False, False, False, True);
 end;
 {$ELSE}
 begin

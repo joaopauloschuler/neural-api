@@ -239,6 +239,10 @@ type
     // exactly. std is the population std over the whole volume.
     class procedure ApplyCFG(EpsCond, EpsUncond, Dst: TNNetVolume;
       W, GuidanceRescale: TNeuralFloat); overload;
+    // The rescale step alone on a guided Dst, StdCond = std of the conditional
+    // prediction: Dst *= GuidanceRescale*StdCond/std(Dst) + 1 - GuidanceRescale.
+    class procedure RescaleGuidance(Dst: TNNetVolume;
+      StdCond, GuidanceRescale: TNeuralFloat);
 
     // Reset the DPM-Solver++ multistep history. Call before each new trajectory.
     procedure ResetMultistep;
@@ -345,6 +349,62 @@ type
     property NormThreshold: TNeuralFloat read FNormThreshold write FNormThreshold;
     property UseOriginalFormulation: boolean read FUseOriginalFormulation
       write FUseOriginalFormulation;
+  end;
+
+  // What the third (perturbed) pass of TNNetPerturbedGuidance changes in its
+  // PerturbedLayers: the attention score matrix becomes the identity (PAG,
+  // TNNetFusedSDPA.SkipAttentionScores), or the whole block is skipped (SLG).
+  TNNetPerturbedGuidanceMode = (pgmAttentionScores, pgmSkipBlock);
+
+  { TNNetPerturbedGuidance }
+  // Perturbed-Attention Guidance (Ahn et al. 2024) and Skip Layer Guidance:
+  // diffusers PerturbedAttentionGuidance / SkipLayerGuidance.forward. Skip is
+  // the conditional prediction with PerturbedLayers perturbed (see Mode); with
+  // both guidances on, Dst := Uncond + W*(Cond - Uncond) + PerturbedScale*(Cond
+  // - Skip), Cond in place of the leading Uncond with UseOriginalFormulation.
+  // Step counts from 0 to NumSteps - 1, as the pipeline loop index does.
+  // Coded by Claude (AI).
+  TNNetPerturbedGuidance = class(TObject)
+  private
+    FGuidanceScale, FPerturbedScale, FGuidanceRescale: TNeuralFloat;
+    FPerturbedStart, FPerturbedStop, FGuidanceStart, FGuidanceStop: double;
+    FUseOriginalFormulation: boolean;
+    FMode: TNNetPerturbedGuidanceMode;
+    FPerturbedLayers: TNeuralIntegerArray;
+    procedure SetPerturbedWindow(pStart, pStop: double);
+  public
+    // Fractions of the schedule as in diffusers: 0 <= pPerturbedStart < 1 and
+    // pPerturbedStart <= pPerturbedStop <= 1, else EArgumentException.
+    constructor Create(pGuidanceScale, pPerturbedScale: TNeuralFloat;
+      pPerturbedStart: double = 0.01; pPerturbedStop: double = 0.2;
+      pGuidanceRescale: TNeuralFloat = 0;
+      pUseOriginalFormulation: boolean = false);
+    // CFG runs when Trunc(GuidanceStart*N) <= Step < Trunc(GuidanceStop*N) and
+    // GuidanceScale is not the no-op scale (1, or 0 with the original formula).
+    function IsCFGEnabled(Step, NumSteps: integer): boolean;
+    // The perturbed pass runs when Trunc(PerturbedStart*N) < Step <
+    // Trunc(PerturbedStop*N) (both strict, as diffusers) and PerturbedScale <> 0.
+    function IsPerturbedEnabled(Step, NumSteps: integer): boolean;
+    procedure SetPerturbedLayers(const pLayers: array of integer);
+    function PerturbsLayer(LayerIdx: integer): boolean;
+    // The guided prediction of step Step into Dst (may alias Cond, Uncond or
+    // Skip). Uncond / Skip may be nil when their guidance is off at this step.
+    procedure Apply(Step, NumSteps: integer; Cond, Uncond, Skip,
+      Dst: TNNetVolume);
+    property GuidanceScale: TNeuralFloat read FGuidanceScale write FGuidanceScale;
+    property PerturbedScale: TNeuralFloat read FPerturbedScale
+      write FPerturbedScale;
+    property GuidanceRescale: TNeuralFloat read FGuidanceRescale
+      write FGuidanceRescale;
+    property PerturbedStart: double read FPerturbedStart;
+    property PerturbedStop: double read FPerturbedStop;
+    // The CFG window, diffusers' guider start / stop (default 0 .. 1).
+    property GuidanceStart: double read FGuidanceStart write FGuidanceStart;
+    property GuidanceStop: double read FGuidanceStop write FGuidanceStop;
+    property UseOriginalFormulation: boolean read FUseOriginalFormulation
+      write FUseOriginalFormulation;
+    property Mode: TNNetPerturbedGuidanceMode read FMode write FMode;
+    property PerturbedLayers: TNeuralIntegerArray read FPerturbedLayers;
   end;
 
   // Resolution-dependent sigma shift of a flow-matching schedule, mu > 0:
@@ -1035,20 +1095,31 @@ end;
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W, GuidanceRescale: TNeuralFloat);
 var
-  stdCond, stdCfg, factor: TNeuralFloat;
+  stdCond: TNeuralFloat;
 begin
-  // Plain CFG mix first (also fills Dst when GuidanceRescale = 0).
-  ApplyCFG(EpsCond, EpsUncond, Dst, W);
-  if GuidanceRescale = 0 then exit;
-
-  // Rescale the over-saturated CFG result toward the conditional's std, then
-  // blend back by GuidanceRescale (diffusers rescale_noise_cfg, Lin et al. 2023).
+  if GuidanceRescale = 0 then
+  begin
+    ApplyCFG(EpsCond, EpsUncond, Dst, W);
+    exit;
+  end;
+  // Before the mix: Dst may alias EpsCond.
   stdCond := EpsCond.GetStdDeviation();
-  stdCfg  := Dst.GetStdDeviation();
-  if stdCfg = 0 then exit;
-  factor := stdCond / stdCfg;
+  ApplyCFG(EpsCond, EpsUncond, Dst, W);
+  RescaleGuidance(Dst, stdCond, GuidanceRescale);
+end;
+
+class procedure TNNetDiffusionScheduler.RescaleGuidance(Dst: TNNetVolume;
+  StdCond, GuidanceRescale: TNeuralFloat);
+var
+  stdGuided: TNeuralFloat;
+begin
+  // Rescale the over-saturated guided result toward the conditional's std, then
+  // blend back by GuidanceRescale (diffusers rescale_noise_cfg, Lin et al. 2023).
+  if GuidanceRescale = 0 then exit;
+  stdGuided := Dst.GetStdDeviation();
+  if stdGuided = 0 then exit;
   // Whole expression is Dst[i]*K with invariant K (rule #5/#13) -> one bulk scale.
-  Dst.Mul(GuidanceRescale * factor + (1 - GuidanceRescale));
+  Dst.Mul(GuidanceRescale * (StdCond / stdGuided) + (1 - GuidanceRescale));
 end;
 
 procedure TNNetDiffusionScheduler.ResetMultistep;
@@ -1694,6 +1765,136 @@ begin
     if CondCoef <> 0 then Dst.MulAdd(CondCoef, Cond);
   end;
   Dst.MulAdd(DiffCoef, FRunningDiff);
+end;
+
+{ TNNetPerturbedGuidance }
+
+constructor TNNetPerturbedGuidance.Create(pGuidanceScale,
+  pPerturbedScale: TNeuralFloat; pPerturbedStart, pPerturbedStop: double;
+  pGuidanceRescale: TNeuralFloat; pUseOriginalFormulation: boolean);
+begin
+  inherited Create;
+  FGuidanceScale := pGuidanceScale;
+  FPerturbedScale := pPerturbedScale;
+  FGuidanceRescale := pGuidanceRescale;
+  FUseOriginalFormulation := pUseOriginalFormulation;
+  FGuidanceStart := 0;
+  FGuidanceStop := 1;
+  FMode := pgmAttentionScores;
+  SetPerturbedWindow(pPerturbedStart, pPerturbedStop);
+end;
+
+procedure TNNetPerturbedGuidance.SetPerturbedWindow(pStart, pStop: double);
+begin
+  if not ((pStart >= 0) and (pStart < 1)) then
+    raise EArgumentException.Create('TNNetPerturbedGuidance: start ' +
+      FloatToStr(pStart) + ' is outside [0, 1).');
+  if not ((pStart <= pStop) and (pStop <= 1)) then
+    raise EArgumentException.Create('TNNetPerturbedGuidance: stop ' +
+      FloatToStr(pStop) + ' is outside [start, 1].');
+  FPerturbedStart := pStart;
+  FPerturbedStop := pStop;
+end;
+
+function TNNetPerturbedGuidance.IsCFGEnabled(Step, NumSteps: integer): boolean;
+begin
+  if FUseOriginalFormulation
+    then Result := FGuidanceScale <> 0
+    else Result := FGuidanceScale <> 1;
+  if Result and (NumSteps > 0) then
+    Result := (Trunc(FGuidanceStart * NumSteps) <= Step) and
+      (Step < Trunc(FGuidanceStop * NumSteps));
+end;
+
+function TNNetPerturbedGuidance.IsPerturbedEnabled(Step,
+  NumSteps: integer): boolean;
+begin
+  Result := FPerturbedScale <> 0;
+  if Result and (NumSteps > 0) then
+    Result := (Trunc(FPerturbedStart * NumSteps) < Step) and
+      (Step < Trunc(FPerturbedStop * NumSteps));
+end;
+
+procedure TNNetPerturbedGuidance.SetPerturbedLayers(
+  const pLayers: array of integer);
+var
+  LayerPos, MaxLayerPos: integer;
+begin
+  MaxLayerPos := High(pLayers);
+  SetLength(FPerturbedLayers, MaxLayerPos + 1);
+  for LayerPos := 0 to MaxLayerPos do
+    FPerturbedLayers[LayerPos] := pLayers[LayerPos];
+end;
+
+function TNNetPerturbedGuidance.PerturbsLayer(LayerIdx: integer): boolean;
+var
+  LayerPos, MaxLayerPos: integer;
+begin
+  Result := true;
+  MaxLayerPos := High(FPerturbedLayers);
+  for LayerPos := 0 to MaxLayerPos do
+    if FPerturbedLayers[LayerPos] = LayerIdx then exit;
+  Result := false;
+end;
+
+procedure TNNetPerturbedGuidance.Apply(Step, NumSteps: integer; Cond, Uncond,
+  Skip, Dst: TNNetVolume);
+var
+  CFGOn, PerturbedOn: boolean;
+  CondCoef, UncondCoef, SkipCoef, BaseCoef, StdCond: TNeuralFloat;
+begin
+  CFGOn := IsCFGEnabled(Step, NumSteps);
+  PerturbedOn := IsPerturbedEnabled(Step, NumSteps);
+  if CFGOn and (Uncond = nil) then
+    raise EArgumentException.Create('TNNetPerturbedGuidance.Apply: step ' +
+      IntToStr(Step) + ' runs CFG and needs Uncond.');
+  if PerturbedOn and (Skip = nil) then
+    raise EArgumentException.Create('TNNetPerturbedGuidance.Apply: step ' +
+      IntToStr(Step) + ' runs the perturbed pass and needs Skip.');
+  // Original formulation: base Cond, i.e. ApplyCFG's base plus one more W.
+  if FUseOriginalFormulation then BaseCoef := 1 else BaseCoef := 0;
+  if not PerturbedOn then
+  begin
+    if CFGOn then
+      TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Dst,
+        FGuidanceScale + BaseCoef, FGuidanceRescale)
+    // diffusers rescales Cond by std(Cond)/std(Cond) = 1 here: a no-op.
+    else if Dst <> Cond then Dst.Copy(Cond);
+    exit;
+  end;
+  if not CFGOn then
+  begin
+    // Skip + W*(Cond - Skip): the CFG mix with Skip as the negative.
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Skip, Dst,
+      FPerturbedScale + BaseCoef, FGuidanceRescale);
+    exit;
+  end;
+  // Both on: Dst := cC*Cond + cU*Uncond + cS*Skip, the Dst-aliased term first.
+  CondCoef := BaseCoef + FGuidanceScale + FPerturbedScale;
+  UncondCoef := (1 - BaseCoef) - FGuidanceScale;
+  SkipCoef := -FPerturbedScale;
+  StdCond := 0;
+  if FGuidanceRescale <> 0 then StdCond := Cond.GetStdDeviation();
+  if Dst = Uncond then
+  begin
+    Dst.Mul(UncondCoef);
+    Dst.MulAdd(CondCoef, Cond);
+    Dst.MulAdd(SkipCoef, Skip);
+  end
+  else if Dst = Skip then
+  begin
+    Dst.Mul(SkipCoef);
+    Dst.MulAdd(CondCoef, Cond);
+    Dst.MulAdd(UncondCoef, Uncond);
+  end
+  else
+  begin
+    if Dst <> Cond then Dst.Copy(Cond);
+    Dst.Mul(CondCoef);
+    Dst.MulAdd(UncondCoef, Uncond);
+    Dst.MulAdd(SkipCoef, Skip);
+  end;
+  TNNetDiffusionScheduler.RescaleGuidance(Dst, StdCond, FGuidanceRescale);
 end;
 
 { TNNetLCMScheduler }

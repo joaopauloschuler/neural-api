@@ -75,6 +75,9 @@ type
     procedure TestAPGAliasing;
     procedure TestRawPredFromX0RoundTrip;
     procedure TestAPGCreateFromSpec;
+    procedure TestPerturbedGuidanceBranches;
+    procedure TestPerturbedGuidanceWindows;
+    procedure TestPerturbedGuidanceRescaleAndAliasing;
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
@@ -487,6 +490,162 @@ begin
     end;
   finally
     APG.Free; Cond.Free; Uncond.Free; Expected.Free; Alias.Free;
+  end;
+end;
+
+// Fills V with the three values A, B, C.
+procedure SetVolume3(V: TNNetVolume; A, B, C: TNeuralFloat);
+begin
+  V.ReSize(3, 1, 1);
+  V.FData[0] := A;
+  V.FData[1] := B;
+  V.FData[2] := C;
+end;
+
+procedure AssertVolume3(const Msg: string; V: TNNetVolume;
+  A, B, C, Tolerance: TNeuralFloat);
+begin
+  TAssert.AssertEquals(Msg + ' [0]', A, V.FData[0], Tolerance);
+  TAssert.AssertEquals(Msg + ' [1]', B, V.FData[1], Tolerance);
+  TAssert.AssertEquals(Msg + ' [2]', C, V.FData[2], Tolerance);
+end;
+
+// Cond = (1,2,3), Uncond = (0,1,-1), Skip = (2,0,1), W = 3, PerturbedScale = 2:
+// Cond-Uncond = (1,1,4), Cond-Skip = (-1,2,2).
+procedure TTestNeuralDiffusion.TestPerturbedGuidanceBranches;
+var
+  Cond, Uncond, Skip, Dst, Expected: TNNetVolume;
+  Guider: TNNetPerturbedGuidance;
+  i: integer;
+begin
+  Cond := TNNetVolume.Create; Uncond := TNNetVolume.Create;
+  Skip := TNNetVolume.Create; Dst := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Guider := TNNetPerturbedGuidance.Create(3, 2);
+  try
+    SetVolume3(Cond, 1, 2, 3);
+    SetVolume3(Uncond, 0, 1, -1);
+    SetVolume3(Skip, 2, 0, 1);
+    // NumSteps 0: no window, both guidances on.
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Dst);
+    AssertVolume3('CFG+PAG: Uncond + 3(C-U) + 2(C-S)', Dst, 1, 8, 15, 1e-6);
+    Guider.UseOriginalFormulation := true;
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Dst);
+    AssertVolume3('CFG+PAG original: Cond + 3(C-U) + 2(C-S)', Dst, 2, 9, 19,
+      1e-6);
+    // CFG off: GuidanceScale is the no-op scale (0 original, 1 otherwise).
+    Guider.GuidanceScale := 0;
+    Guider.Apply(0, 0, Cond, nil, Skip, Dst);
+    AssertVolume3('PAG only original: Cond + 2(C-S)', Dst, -1, 6, 7, 1e-6);
+    Guider.UseOriginalFormulation := false;
+    Guider.GuidanceScale := 1;
+    Guider.Apply(0, 0, Cond, nil, Skip, Dst);
+    AssertVolume3('PAG only: Skip + 2(C-S)', Dst, 0, 4, 5, 1e-6);
+    // PAG off at scale 0: CFG alone, bit-equal to ApplyCFG (the unguided-by-PAG
+    // pipeline), and Cond itself when CFG is off too.
+    Guider.GuidanceScale := 3;
+    Guider.PerturbedScale := 0;
+    Guider.Apply(0, 0, Cond, Uncond, nil, Dst);
+    AssertVolume3('CFG only: Uncond + 3(C-U)', Dst, 3, 4, 11, 1e-6);
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Expected, 3);
+    for i := 0 to 2 do
+      AssertEquals('PerturbedScale 0 is ApplyCFG bit for bit @ ' + IntToStr(i),
+        Expected.FData[i], Dst.FData[i], 0);
+    Guider.UseOriginalFormulation := true;
+    Guider.Apply(0, 0, Cond, Uncond, nil, Dst);
+    AssertVolume3('CFG only original: Cond + 3(C-U)', Dst, 4, 5, 15, 1e-6);
+    Guider.UseOriginalFormulation := false;
+    Guider.GuidanceScale := 1;
+    Guider.Apply(0, 0, Cond, nil, nil, Dst);
+    AssertVolume3('neither: Cond', Dst, 1, 2, 3, 0);
+    // A guidance that is on needs its prediction.
+    Guider.PerturbedScale := 2;
+    try
+      Guider.Apply(0, 0, Cond, nil, nil, Dst);
+      Fail('PAG on without Skip must raise');
+    except
+      on E: EArgumentException do ;
+    end;
+    try
+      TNNetPerturbedGuidance.Create(3, 2, 0.5, 0.2).Free;
+      Fail('stop below start must raise');
+    except
+      on E: EArgumentException do ;
+    end;
+    Guider.SetPerturbedLayers([1, 4]);
+    AssertTrue('layer 4 perturbed', Guider.PerturbsLayer(4));
+    AssertFalse('layer 2 not perturbed', Guider.PerturbsLayer(2));
+  finally
+    Guider.Free; Cond.Free; Uncond.Free; Skip.Free; Dst.Free; Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestPerturbedGuidanceWindows;
+var
+  Guider: TNNetPerturbedGuidance;
+begin
+  // Defaults 0.01 .. 0.2 over 100 steps: Trunc(1) < Step < Trunc(20).
+  Guider := TNNetPerturbedGuidance.Create(3, 2);
+  try
+    AssertFalse('step 1 is the strict start', Guider.IsPerturbedEnabled(1, 100));
+    AssertTrue('step 2 inside', Guider.IsPerturbedEnabled(2, 100));
+    AssertTrue('step 19 inside', Guider.IsPerturbedEnabled(19, 100));
+    AssertFalse('step 20 is the stop', Guider.IsPerturbedEnabled(20, 100));
+    // 10 steps: Trunc(0.1) = 0 < Step < Trunc(2.0) = 2, only step 1.
+    AssertFalse('10 steps: step 0', Guider.IsPerturbedEnabled(0, 10));
+    AssertTrue('10 steps: step 1', Guider.IsPerturbedEnabled(1, 10));
+    AssertFalse('10 steps: step 2', Guider.IsPerturbedEnabled(2, 10));
+    // The CFG window includes its start: Trunc(0.5*10) <= Step < Trunc(1*10).
+    Guider.GuidanceStart := 0.5;
+    AssertFalse('CFG step 4', Guider.IsCFGEnabled(4, 10));
+    AssertTrue('CFG step 5 is the inclusive start', Guider.IsCFGEnabled(5, 10));
+    AssertTrue('CFG step 9', Guider.IsCFGEnabled(9, 10));
+    AssertFalse('CFG step 10', Guider.IsCFGEnabled(10, 10));
+    Guider.GuidanceScale := 1;
+    AssertFalse('CFG at the no-op scale', Guider.IsCFGEnabled(5, 10));
+    Guider.PerturbedScale := 0;
+    AssertFalse('PAG at scale 0', Guider.IsPerturbedEnabled(2, 100));
+  finally
+    Guider.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestPerturbedGuidanceRescaleAndAliasing;
+var
+  Cond, Uncond, Skip, Dst, Expected: TNNetVolume;
+  Guider: TNNetPerturbedGuidance;
+  i: integer;
+begin
+  Cond := TNNetVolume.Create; Uncond := TNNetVolume.Create;
+  Skip := TNNetVolume.Create; Dst := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Guider := TNNetPerturbedGuidance.Create(3, 2, 0.01, 0.2, 0.5);
+  try
+    // The mix is (1,8,15): std sqrt(98/3); std(Cond) = sqrt(2/3), so the
+    // factor is 0.5*(1/7) + 0.5 = 4/7.
+    SetVolume3(Uncond, 0, 1, -1);
+    SetVolume3(Skip, 2, 0, 1);
+    SetVolume3(Cond, 1, 2, 3);
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Dst);
+    AssertVolume3('rescale 0.5', Dst, 4 / 7, 32 / 7, 60 / 7, 1e-5);
+    // Dst aliasing each input gives the same result.
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Cond);
+    AssertVolume3('Dst = Cond', Cond, 4 / 7, 32 / 7, 60 / 7, 1e-5);
+    SetVolume3(Cond, 1, 2, 3);
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Uncond);
+    AssertVolume3('Dst = Uncond', Uncond, 4 / 7, 32 / 7, 60 / 7, 1e-5);
+    SetVolume3(Uncond, 0, 1, -1);
+    Guider.Apply(0, 0, Cond, Uncond, Skip, Skip);
+    AssertVolume3('Dst = Skip', Skip, 4 / 7, 32 / 7, 60 / 7, 1e-5);
+    // ApplyCFG with rescale takes std(EpsCond) before Dst overwrites it.
+    SetVolume3(Cond, 1, 2, 3);
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Expected, 3, 0.5);
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Cond, 3, 0.5);
+    for i := 0 to 2 do
+      AssertEquals('ApplyCFG rescale with Dst = EpsCond @ ' + IntToStr(i),
+        Expected.FData[i], Cond.FData[i], 1e-6);
+  finally
+    Guider.Free; Cond.Free; Uncond.Free; Skip.Free; Dst.Free; Expected.Free;
   end;
 end;
 
