@@ -291,17 +291,6 @@ rather than acted on.
       with `dpV`. Missing pieces, all checked against the shipped
       `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
       "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [X] `TNNetTimestepSpacing` value for diffusers "trailing" spacing
-            (`round(arange(T, 0, -T/N)) - 1`), next to tsUniform/tsKarras:
-            `tsTrailing` (Tt = t + 1 here). `scaled_linear` already exists as
-            `dsScaledLinear`.
-      - [X] Zero-terminal-SNR beta rescale (Lin et al. 2023, Algorithm 1 on
-            sqrt(alphas_cumprod), diffusers `rescale_zero_terminal_snr`) as a
-            scheduler option; with it the last alpha_bar is 0, so check the DDIM
-            step and the v -> x0 conversion at that endpoint. Done as the
-            `pRescaleZeroTerminalSNR` constructor option; DDIM and PredictX0
-            with dpV are exact at ab_T = 0, the other samplers floor ab_T at
-            2^-24 in their reciprocals (as diffusers' Euler/DPM/UniPC do).
       - [ ] Scheduler leftovers from 4c756c1c: diffusers `set_alpha_to_one=False`
             (the final DDIM step lands on alpha_bar[0], not 1) is not modelled;
             Euler-type samplers with dpV return x0 = 0 instead of -v at the exact
@@ -628,11 +617,6 @@ rather than acted on.
   - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
         weights are large / not redistributable; importer uses the canonical
         NAFNet state_dict key scheme so a real checkpoint should drop in).
-  - [X] PNG input/output in examples/ImageRestoration (the example uses
-        deterministic synthetic images + PPM; the PNG reader/writer already
-        exists via `LoadImageFromFileIntoVolume` in neuraldatasets.pas).
-        Landed: `--input FILE` / `--output FILE`, [0, 1] RGB pixels, any image
-        size via the new `TNAFNetConfig.InputSizeY` (pad to 2^levels, crop back).
   - [ ] NAFBlock dropout + the wider official width/block configs are wired by
         config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer follow-ups
@@ -1661,8 +1645,6 @@ rather than acted on.
       packing; each token's channels all take that token's mask value.
       - [ ] Real 1024x1024 inpaint on the GPU box (user run), then the README
             example output.
-      - [X] `--mask-blur N` (diffusers `mask_processor.blur`): `--mask-blur R` /
-            `/mask-blur R` via `GaussianBlurImage` (neuralimageresize.pas).
       - [ ] `padding_mask_crop`: crop to the mask's bounding box plus padding,
             generate at full resolution, paste back (`apply_overlay`); makes a
             small hole in a large photo cheap.
@@ -2060,12 +2042,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
       across groups if it shows up on the GPU box.
-- [X] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
-      segmentation frontend and the ECAPA-TDNN trunk. Both run
-      `cai_conv_implicit`: TDNN shares `TNNetConv1DBase` with
-      `TNNetCausalConv1D` (left padding `Dilation*(K div 2)` instead of
-      `Dilation*(K-1)`); SincConv1D convolves its materialized `FBank`, re-laid
-      out k-major and uploaded only when the bank was rebuilt. Not timed on a GPU.
 - [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
       new kernel (per-channel softmax over time, then the two weighted moments)
       reading two sources, the features and `FLogitLayer`. It runs once per
@@ -2101,14 +2077,6 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [X] `TNNetMetaAconC` device forward: `cai_meta_acon_table` builds the
-      p1|p2|beta table from the resident source's channel means (one work-item
-      per channel), then opcode 52 (`TNNetAconC`) maps it. All eleven
-      per-channel learnable activations (PReLU, PReLUChannel, SReLU, APL,
-      AconC, MetaAconC, Spline, Swish/Mish/SoftPlusBeta learnable, Polynomial)
-      now run on opcodes 15, 40 and 48-55: the scalar ones pass their weight as
-      a kernel argument, the per-channel ones read their neurons packed into one
-      table (`TNNetChannelTransformBase.PackActivationChannelTables`).
 - [ ] GPU-box decode timing for the trap-free math of d8e5ec90: the -80 floor in
       the split-row decode (one `fmax` per score) and `cai_tanh` on the soft-cap;
       not measured here.
@@ -2394,11 +2362,6 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [X] HF processors whose `size` is {"height","width"} (ViTImageProcessor,
-      SiglipImageProcessor) resize straight to (H,W) without keeping the aspect
-      ratio; `ClipPreprocessImage` and `ReadImagePreprocessConfig` turn that into
-      a shortest-edge resize, so non-square photos differ from HF there.
-      Both configs now carry `ResizeKeepsAspect` + `ResizeHeight/Width`.
 - [ ] An int `size` is ambiguous: ViTImageProcessor reads it as a square
       (H,W) (`default_to_square=True`, e.g. google/vit-base `"size": 224`),
       CLIPImageProcessor as shortest_edge. Both readers still use
