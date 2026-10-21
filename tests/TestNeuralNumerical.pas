@@ -517,6 +517,10 @@ type
     // TNNetScaledDotProductAttention on cai_sdpa_flash vs the CPU, with the
     // residency of the attention, the concat and the out-projection.
     procedure ScaledDotProductAttentionFlashOpenCLParity;
+    // TNNetGptOssSinkAttention on cai_sdpa_flash with its sink logit vs the
+    // CPU: windows, head dim 10, key splits (the sink joins in the merge), a
+    // dominant sink, a sink change between passes, and the host fallback.
+    procedure GptOssSinkAttentionFlashOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -1730,6 +1734,9 @@ type
     procedure TestGptOssSinkAttentionForward;
     procedure TestGptOssSinkAttentionGradientCheck;
     procedure TestGptOssSinkAttentionSerializationRoundTrip;
+    // The KV-cache forward (one and three rows per step, FP32 and int8, full
+    // and sliding window) against the full forward. Coded by Claude (AI).
+    procedure TestGptOssSinkAttentionCachedDecodeParity;
     procedure TestDifferentialAttentionLambdaZeroDegeneracy;
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
@@ -16049,6 +16056,87 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionCachedDecodeParity;
+const
+  SeqLen = 12;
+  // Per-row int8 K/V scales on O(1) Gaussian rows.
+  cInt8Tolerance = 3e-2;
+
+  procedure RunCase(Dk, Window, StepWidth: integer; Sink: TNeuralFloat;
+    Int8KV: boolean);
+  var
+    NNFull, NNStep: TNNet;
+    FullAttn, StepAttn: TNNetGptOssSinkAttention;
+    Input, StepIn: TNNetVolume;
+    Row, StepRow, MaxStepRowPos, d, MaxDPos: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('Dk=%d W=%d width=%d sink=%.2f int8=%s',
+      [Dk, Window, StepWidth, Sink, BoolToStr(Int8KV, true)]);
+    NNFull := TNNet.Create();
+    NNStep := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    StepIn := TNNetVolume.Create(StepWidth, 1, 3 * Dk);
+    try
+      NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      FullAttn := TNNetGptOssSinkAttention.Create(Dk, true, Window);
+      NNFull.AddLayer(FullAttn);
+      NNStep.AddLayer(TNNetInput.Create(StepWidth, 1, 3 * Dk));
+      StepAttn := TNNetGptOssSinkAttention.Create(Dk, true, Window);
+      NNStep.AddLayer(StepAttn);
+      FullAttn.SetSinkLogit(Sink);
+      StepAttn.SetSinkLogit(Sink);
+      Input.RandomizeGaussian(1.0);
+      NNFull.Compute(Input);
+      StepAttn.BeginIncrementalDecode(SeqLen, Int8KV);
+      MaxDiff := 0;
+      MaxStepRowPos := StepWidth - 1;
+      MaxDPos := Dk - 1;
+      Row := 0;
+      while Row < SeqLen do
+      begin
+        for StepRow := 0 to MaxStepRowPos do
+          Move(Input.FData[(Row + StepRow) * 3 * Dk],
+            StepIn.FData[StepRow * 3 * Dk], 3 * Dk * SizeOf(TNeuralFloat));
+        NNStep.Compute(StepIn);
+        for StepRow := 0 to MaxStepRowPos do
+          for d := 0 to MaxDPos do
+          begin
+            Diff := Abs(FullAttn.Output.FData[(Row + StepRow) * Dk + d] -
+              StepAttn.Output.FData[StepRow * Dk + d]);
+            if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+          end;
+        Inc(Row, StepWidth);
+      end;
+      if Int8KV then
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < cInt8Tolerance)
+      else
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+    finally
+      StepIn.Free;
+      Input.Free;
+      NNStep.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  Int8KV: boolean;
+begin
+  RandSeed := 20261021;
+  for Int8KV := false to true do
+  begin
+    RunCase(8, 0, 1, 0.5, Int8KV);
+    RunCase(8, 4, 1, 0.5, Int8KV);
+    RunCase(10, 4, 3, -1.0, Int8KV);
+    // A sink far above every score takes most of the softmax mass.
+    RunCase(16, 0, 3, 6.0, Int8KV);
   end;
 end;
 
@@ -84565,6 +84653,149 @@ begin
   RunCase(2, 64, 8, 0, False, False, True, False);
   // A non-causal window has no flash mask: the host paths run.
   RunCase(2, 64, 40, 8, False, False, False, False);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GptOssSinkAttentionFlashOpenCLParity;
+{$IFDEF OpenCL}
+const
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Dk, SeqLen, Window: integer; Causal: boolean;
+    Sink: TNeuralFloat; ForcedSplits: integer; HostSource, ExpectFlash: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input: TNNetVolume;
+    CpuAttn, GpuAttn: TNNetGptOssSinkAttention;
+    PassCnt, MaxOutputPos: integer;
+    Diff, MaxDiff, MaxAbsY: TNeuralFloat;
+    What: string;
+
+    procedure ComparePass();
+    var
+      OutputPos: integer;
+    begin
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      GpuAttn.ForceOutputOnRAM();
+      for OutputPos := 0 to MaxOutputPos do
+      begin
+        Diff := Abs(CpuAttn.Output.FData[OutputPos] -
+          GpuAttn.Output.FData[OutputPos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        MaxAbsY := Max(MaxAbsY, Abs(CpuAttn.Output.FData[OutputPos]));
+      end;
+    end;
+
+  begin
+    What := Format('Dk=%d T=%d W=%d causal=%s sink=%.2f splits=%d host=%s',
+      [Dk, SeqLen, Window, BoolToStr(Causal, true), Sink, ForcedSplits,
+      BoolToStr(HostSource, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNCpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
+      if HostSource then NNCpu.AddLayer(THostOnlyMulByConstant.Create(1));
+      CpuAttn := TNNetGptOssSinkAttention.Create(Dk, Causal, Window);
+      NNCpu.AddLayer(CpuAttn);
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNGpu.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dk));
+      if HostSource then NNGpu.AddLayer(THostOnlyMulByConstant.Create(1));
+      GpuAttn := TNNetGptOssSinkAttention.Create(Dk, Causal, Window);
+      NNGpu.AddLayer(GpuAttn);
+      CpuAttn.SetSinkLogit(Sink);
+      NNGpu.CopyWeights(NNCpu);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      if ForcedSplits > 0 then
+        GpuAttn.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
+      NNGpu.LayerProfiling := true;
+      MaxOutputPos := GpuAttn.Output.Size - 1;
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      for PassCnt := 1 to PassCount do ComparePass();
+      WriteLn('  gpt-oss sink flash ', What, ': max|diff|=', MaxDiff:0:9,
+        ' max|y|=', MaxAbsY:0:4, ' gpu=', GpuAttn.ForwardGPUCnt, ' bound=',
+        GpuAttn.ProfiledResidency.SourceBoundCnt);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * MaxAbsY + 1e-7);
+      AssertEquals(What + ': WillOpenCL', ExpectFlash, GpuAttn.WillOpenCL());
+      if not ExpectFlash then
+      begin
+        AssertEquals(What + ': host path', 0, GpuAttn.ForwardGPUCnt);
+        AssertFalse(What + ': the host path leaves no resident output',
+          GpuAttn.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': attention on OpenCL', PassCount,
+        GpuAttn.ForwardGPUCnt);
+      if ForcedSplits > 0 then
+        AssertEquals(What + ': key splits', ForcedSplits,
+          GpuAttn.FusedSDPACL.LastFlashSplits);
+      AssertEquals(What + ': output resident', PassCount,
+        GpuAttn.ProfiledResidency.OutputResidentCnt);
+      if HostSource then
+        AssertEquals(What + ': source uploaded', PassCount,
+          GpuAttn.ProfiledResidency.ActivationUploadedCnt)
+      else
+      begin
+        AssertEquals(What + ': source bound', PassCount,
+          GpuAttn.ProfiledResidency.SourceBoundCnt);
+        AssertEquals(What + ': source never pulled', 0,
+          GpuAttn.ProfiledResidency.SourcePulledToRAMCnt);
+      end;
+      // A changed sink must reach the resident copy on the next forward.
+      CpuAttn.SetSinkLogit(Sink - 2.5);
+      GpuAttn.SetSinkLogit(Sink - 2.5);
+      MaxDiff := 0;
+      ComparePass();
+      AssertTrue(What + ': max|diff| after a sink change ' +
+        FloatToStr(MaxDiff), MaxDiff < 2e-5 * MaxAbsY + 1e-7);
+      AssertEquals(What + ': on OpenCL after a sink change', PassCount + 1,
+        GpuAttn.ForwardGPUCnt);
+    finally
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261021;
+  // Full and sliding causal windows, gpt-oss's head dim 10, a non-causal head.
+  RunCase(16, 40, 0, True, 0.7, 0, False, True);
+  RunCase(64, 48, 8, True, -0.4, 0, False, True);
+  RunCase(10, 40, 4, True, 1.3, 0, False, True);
+  RunCase(16, 36, 0, False, 0.2, 0, False, True);
+  // Key splits: the merge adds the sink once per row.
+  RunCase(16, 200, 0, True, 0.7, 3, False, True);
+  RunCase(10, 200, 64, True, 1.3, 4, False, True);
+  // A sink far above every score (the rescale to max(m, s)), unsplit and split.
+  RunCase(16, 40, 0, True, 12.0, 0, False, True);
+  RunCase(16, 200, 0, True, 12.0, 3, False, True);
+  // A host source of 40 rows is uploaded; one of 8 rows keeps the host path.
+  RunCase(16, 40, 0, True, 0.7, 0, True, True);
+  RunCase(16, 8, 0, True, 0.7, 0, True, False);
 end;
 {$ELSE}
 begin

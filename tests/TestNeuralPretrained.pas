@@ -573,6 +573,13 @@ type
     procedure TestGptOssMXFP4LogitParity;
     procedure TestGptOssExpertSlabTranspose;
     procedure TestGptOssSlabElementCountGuard;
+    // The gpt-oss pico streamed token by token through TNNetStreamingDecoder
+    // (FP32 KV cache) against the full forward.
+    procedure TestGptOssStreamedDecodeParity;
+    // The gpt-oss pico full forward and streamed decode with OpenCL enabled,
+    // against the HF oracle and the CPU twin.
+    procedure TestGptOssLogitParityOpenCL;
+    procedure TestGptOssStreamedDecodeOpenCLParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -16036,6 +16043,123 @@ begin
   end;
   AssertTrue('an over-2^31 expert slab must raise EPretrainedImportError',
     Rejected);
+end;
+
+// TNNetStreamingDecoder switches every TNNetGptOssSinkAttention onto the KV
+// cache, so the sink must also join the cached softmax; the sliding layer
+// (window 4) is exercised past its window by the 16 steps. The int8 cache is
+// checked per layer in TestNeuralNumerical: here a top-2 routing flip on the
+// pico turns its rounding into logit jumps. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGptOssStreamedDecodeParity;
+const
+  SeqLen = 16;
+var
+  Full, Twin: TNNet;
+  Config: TGptOssConfig;
+  Session: TNNetStreamingDecoder;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, V, Vocab: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildGptOssFromSafeTensorsEx(FixturePath('tiny_gpt_oss.safetensors'),
+    Config, {SeqLen=}SeqLen, {pTrainable=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  Twin := BuildGptOssFromSafeTensorsEx(FixturePath('tiny_gpt_oss.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  Session := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  FullOut := TNNetVolume.Create();
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do
+      FullIn.FData[T] := (5 * T + 2) mod Vocab;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('sink heads collected', Config.NumHeads * Config.NumLayers,
+      Session.SDPACount);
+    Session.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := FullIn.FData[T];
+      Session.StepForward(StepIn, T);
+      StepOut := Session.Output();
+      for V := 0 to Vocab - 1 do
+        AssertEquals('streamed logit pos ' + IntToStr(T) + ' tok ' +
+          IntToStr(V), FullOut.FData[T * Vocab + V], StepOut.FData[V], 2e-4);
+    end;
+  finally
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// The full forward with OpenCL enabled and forced, so the per-head [Q|K|V]
+// packs are resident: every sink head must run cai_sdpa_flash on its bound
+// source and the logits must still match the HF oracle. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGptOssLogitParityOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Config: TGptOssConfig;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerCnt, SinkCnt: integer;
+  Sink: TNNetLayer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := BuildGptOssFromSafeTensorsEx(FixturePath('tiny_gpt_oss.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  try
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(true);
+    NN.LayerProfiling := true;
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+    SinkCnt := 0;
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Sink := NN.Layers[LayerCnt];
+      if Sink.ClassType <> TNNetGptOssSinkAttention then continue;
+      Inc(SinkCnt);
+      AssertTrue('sink head ' + IntToStr(LayerCnt) + ' on OpenCL',
+        Sink.ForwardGPUCnt > 0);
+      AssertEquals('sink head ' + IntToStr(LayerCnt) + ' bound its source',
+        Sink.ForwardGPUCnt, Sink.ProfiledResidency.SourceBoundCnt);
+      AssertEquals('sink head ' + IntToStr(LayerCnt) + ' pulled nothing', 0,
+        Sink.ProfiledResidency.SourcePulledToRAMCnt);
+    end;
+    AssertEquals('sink heads', Config.NumHeads * Config.NumLayers, SinkCnt);
+  finally
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestGptOssStreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_gpt_oss');
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 // Verifies the RWKV-4 import target - the suite's FIRST NON-TRANSFORMER

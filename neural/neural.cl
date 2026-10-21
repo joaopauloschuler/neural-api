@@ -4878,7 +4878,9 @@ __kernel void cai_sdpa_decode_split
 // pass 1 wrote for (h, t) - layout as cai_sdpa_decode_split states - by
 // log-sum-exp: M = max of the chunk maxima, w_c = exp(m_c - M) or 0 for a
 // chunk with l_c = 0, L = sum of l_c*w_c, and Y[t][h*FDk + d] =
-// sum of w_c*acc_c[d] / L, zero when L = 0 as the host path does.
+// sum of w_c*acc_c[d] / L, zero when L = 0 as the host path does. FHasSinks
+// adds head h's sink logit s = FSinkLogits[h] once: M also covers s and L
+// gains exp(s - M), with no value row (gpt-oss attention sinks).
 // Launch 2-D with global (LocalSize, FQHeads*FTokenCnt) and local
 // (LocalSize, 1); LocalSize a power of two. FScratch is LocalSize + FSplits
 // floats of __local memory: the reduction scratch, then the chunk weights.
@@ -4892,6 +4894,8 @@ __kernel void cai_sdpa_decode_merge
   const int FYStride,
   __global const float* FPartials,
   __global float* FY,
+  __global const float* FSinkLogits,
+  const int FHasSinks,
   __local float* FScratch
 )
 {
@@ -4916,7 +4920,8 @@ __kernel void cai_sdpa_decode_merge
     if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  const float MaxScore = FScratch[0];
+  const float SinkLogit = FHasSinks ? FSinkLogits[h] : -1e30f;
+  const float MaxScore = fmax(FScratch[0], SinkLogit);
   barrier(CLK_LOCAL_MEM_FENCE);
 
   float partial = 0.0f;
@@ -4937,7 +4942,8 @@ __kernel void cai_sdpa_decode_merge
     if (lid < s) FScratch[lid] += FScratch[lid + s];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  const float SumExp = FScratch[0];
+  const float SumExp = FScratch[0]
+    + (FHasSinks ? exp(fmax(SinkLogit - MaxScore, -80.0f)) : 0.0f);
   const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
 
   const int yBase = t * FYStride + h * FDk;
@@ -4962,7 +4968,9 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
 // arguments (FColChunk: output columns per work-group, a multiple of 4 up to
 // 256; FKeySplits > 1 writes partials; FBiasLen > 0, which needs FGroupSize 1,
-// adds FScoreBias[FBiasBase + t*FBiasRowStride + key] to each score).
+// adds FScoreBias[FBiasBase + t*FBiasRowStride + key] to each score;
+// FHasSinks adds exp(FSinkLogits[h]) to head h's normalizer, in the merge
+// when FKeySplits > 1).
 #define CAI_FLASH_LEADING_PARAMS \
   const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
   const int FDk, const int FCacheMax, const int FKeyBase, \
@@ -4974,7 +4982,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 #define CAI_FLASH_TRAILING_PARAMS \
   __global float* FY, __global float* FPartials, __local float4* FScratch, \
   __global const float* FScoreBias, const int FBiasBase, \
-  const int FBiasRowStride, const int FBiasLen
+  const int FBiasRowStride, const int FBiasLen, \
+  __global const float* FSinkLogits, const int FHasSinks
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
 // only: PoCL miscompiles a lane id divided by a run-time value.
@@ -4992,13 +5001,10 @@ static inline int2 cai_flash_key_range(const int t, const int FTokenCnt,
   return (int2)((FWindow > 0) ? max(0, KeyHi - FWindow) : 0, KeyHi);
 }
 
-// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, out
-// offset (Y, or split Split's partial acc[0]), lo and hi tables; dead: -1, -1, 0, 0.
-static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
-  const int r, const int Row0, const int g, const int Split,
-  const int FKeySplits, const int FGroupSize, const int FTokenCnt,
-  const int FDk, const int FXStride, const int FYStride, const int FKeyBase,
-  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+// Token row t and group head q of packed row Row0 + r = t*FGroupSize + q;
+// Row0 is uniform, so no lane-derived value is divided.
+static inline int2 cai_flash_row_token_head(const int Row0, const int r,
+  const int FGroupSize)
 {
   int t = Row0 / FGroupSize;
   int q = Row0 - t * FGroupSize + r;
@@ -5007,6 +5013,20 @@ static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
     q -= FGroupSize;
     t++;
   }
+  return (int2)(t, q);
+}
+
+// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, out
+// offset (Y, or split Split's partial acc[0]), lo and hi tables; dead: -1, -1, 0, 0.
+static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
+  const int r, const int Row0, const int g, const int Split,
+  const int FKeySplits, const int FGroupSize, const int FTokenCnt,
+  const int FDk, const int FXStride, const int FYStride, const int FKeyBase,
+  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+{
+  const int2 TokenHead = cai_flash_row_token_head(Row0, r, FGroupSize);
+  const int t = TokenHead.x;
+  const int q = TokenHead.y;
   int XOffset = -1, YOffset = -1;
   int2 KeyRange = (int2)(0, 0);
   if (t < FTokenCnt)
@@ -5151,6 +5171,19 @@ static inline float cai_flash_add_bias(const float Score,
 static inline float cai_flash_prob(const float Score, const float RowMax)
 {
   return (Score > -1e29f) ? exp(clamp(Score - RowMax, -80.0f, 0.0f)) : 0.0f;
+}
+
+// 1 / the normalizer of a row with sum l = RowTotal at max m = RowMaxScore:
+// with a sink logit s, (l + exp(s - m)) rescaled to max(m, s); 0 for l = 0
+// without one.
+static inline float cai_flash_inv_row_total(const float RowTotal,
+  const float RowMaxScore, const int FHasSinks, const float SinkLogit)
+{
+  if (!FHasSinks) return (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
+  const float MaxScore = fmax(RowMaxScore, SinkLogit);
+  const float Rescale = exp(fmax(RowMaxScore - MaxScore, -80.0f));
+  return Rescale /
+    (RowTotal * Rescale + exp(fmax(SinkLogit - MaxScore, -80.0f)));
 }
 
 // The largest of a row's 16 partials and Running.
@@ -5470,8 +5503,11 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   { \
     const int row = oy + OutRowLanes * i; \
     const float RowTotal = cai_flash_sum16(RowPart + row * 4); \
+    const float SinkLogit = FHasSinks ? FSinkLogits[g * FGroupSize \
+      + cai_flash_row_token_head(Row0, row, FGroupSize).y] : 0.0f; \
     const float InvRowTotal = (FKeySplits > 1) ? 1.0f \
-      : ((RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f); \
+      : cai_flash_inv_row_total(RowTotal, RowMax[row], FHasSinks, \
+        SinkLogit); \
     RegionA[row * VStride4 + min(ox, MaxCol4Pos + 1)] = o[i][0] * InvRowTotal; \
     RegionA[row * VStride4 + min(ox + OutColLanes, MaxCol4Pos + 1)] = \
       o[i][1] * InvRowTotal; \

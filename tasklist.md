@@ -1908,10 +1908,60 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       priority only because fewer tested checkpoints use it.
 - [ ] Attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
-      `TNNetGptOssSinkAttention` (GPT-OSS is a live importer, and the sink is
-      `TNNetFusedSDPA` plus one per-head scalar, so it should reuse the fused
-      decode kernels), `TNNetSinkAttention` and `TNNetDifferentialAttention`.
-      Take the GPT-OSS sink first.
+  - [X] `TNNetGptOssSinkAttention`: the full forward runs on `cai_sdpa_flash`
+        with the source bound and the result resident. The flash epilogue and
+        `cai_sdpa_decode_merge` take an optional per-query-head sink buffer
+        (`FHasSinks` = 0 for every other caller); a split launch adds the sink
+        in the merge only, so it counts once. The cached forward
+        (`TNNetStreamingDecoder`, i.e. ChatTerminal) ignored the KV cache
+        (max logit error 12.0 on the pico); it now runs the base
+        `ComputeIncremental` with the sink (virtual `SinkLogits`), FP32 and
+        int8, on the host. Open follow-ups:
+    - [ ] Resident-KV decode for GPT-OSS: the importer builds one sink layer
+          per query head, and the single-head SDPA has no OpenCL cached path
+          for any class, so every decode step pulls each head's [Q|K|V] pack
+          to RAM. Route: give `TNNetFusedSDPA` a per-query-head sink
+          option (one neuron of QHeads weights, FStruct flag, the CPU prefill
+          / cached-token / chunked-row paths and the backward), pass
+          `SinkLogits` to `TNNetFusedSDPACL.Compute` / `ComputeInt8` /
+          `ComputeFlash` / `ComputeFlashInt8` (the kernels already take it;
+          only `ComputeFlashPacked` passes it today), then build gpt-oss
+          through `AddGQAAttentionFromSources`. Parity: the pico oracle, the
+          streamed decode, and `FusedSDPA*OpenCLParity`-style split / int8
+          cases with sinks.
+    - [ ] `cai_sdpa_flash_int8` carries the sink epilogue but no caller
+          passes sinks to it yet; cover it with the item above.
+    - [ ] GPU-box: GPT-OSS prefill tok/s with the sink heads on
+          `cai_sdpa_flash` against the parent commit.
+  - [ ] `TNNetSinkAttention` (StreamingLLM learnable key/value slots, only
+        built by `AddMultiHeadSelfAttention`'s sink variant; no importer).
+        Fits `cai_sdpa_flash` with NO kernel change: put the K sink slots in
+        cache rows 0..K-1 (uploaded from the 2K neurons when the weights
+        change) and append the real K/V at slot K; mask mode 1 then gives row
+        t the keys [0, K + t + 1), i.e. sinks never masked plus causal, and
+        mode 0 the non-causal case. Needs a `ComputeFlashPacked` variant
+        that keeps a prefix of uploaded rows (CacheMax = K + T). Note
+        FStruct[2] holds K, so the inherited window is always 0. Its
+        `Compute` also ignores `FCacheEnabled` (the GPT-OSS bug, found by
+        reading, not run): a streamed decode attends only the sinks and the
+        current window. Fix that first
+        (seed the cache with the K sink rows, or score the sinks beside
+        `ComputeIncremental`) with a streamed-vs-full parity test.
+  - [ ] `TNNetDifferentialAttention` (only built by
+        `AddMultiHeadSelfAttention`'s differential variant; no importer).
+        Two softmax maps over half-width Q1.K1 and Q2.K2 with a shared
+        full-width V, out = A1.V - lambda * A2.V. The flash kernel uses one
+        Dk for Q.K and V, so zero-pad Q instead of splitting: packs
+        [Q1,0|K|V] and [0,Q2|K|V] give Q1.K1 and Q2.K2 against the
+        unchanged K and V; run `cai_sdpa_flash` twice with score scale
+        1/sqrt(d_k/2) (`FlashScoreScale`) into two buffers, then one
+        elementwise kernel Y1 - lambda*Y2 (lambda read from the weight on
+        the device, or uploaded when changed). Needs a small packing kernel
+        (the `FlashPackedSource` hook, as `cai_sdpa_qk_l2norm_packed` does)
+        and a second result buffer in the helper. Its `Compute` ignores
+        `FCacheEnabled` too (by reading, not run; a window wider than one
+        row also overruns `FAttn`, which `BeginIncrementalDecode` shrinks to
+        one element); same streamed-decode fix and test first.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
       `TNNetCausalLinearAttention` (the non-causal `TNNetLinearAttention` already
       has a two-GEMM `ComputeOpenCL`). COUPLED, not independent: each is a
