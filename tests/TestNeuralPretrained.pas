@@ -118,6 +118,11 @@ type
       TJSONData;
     // The pico diffusers transformer folder (FixturePath takes files only).
     function QwenImage21TransformerFolder(): string;
+    // Its diffusion_pytorch_model.safetensors.index.json.
+    function QwenImage21TransformerWeightsFile(): string;
+    // The image LoRA adapter files of the TestLoRAMergeImage* tests.
+    function WriteImageLoRAFixtures(): string;
+    procedure DeleteImageLoRAFixtures(const Dir: string);
     // TQwenImage21Pipeline over the pico folder vs a pipeline oracle, from
     // its prompt_embeds or (FromTokenIds) from the A2 token ids.
     procedure CheckQwenImage21PipelineOracle(const FixtureName: string;
@@ -1193,6 +1198,10 @@ type
     procedure TestLoRAMergeQwen3LogitParity;
     procedure TestLoRAMergeQwen35Int8;
     procedure TestLoRAMergeRejectsUnsupportedAdapters;
+    procedure TestLoRAMergeImageAdapterLayouts;
+    procedure TestLoRAMergeImageAdapterStack;
+    procedure TestLoRAMergeImageAdapterRejects;
+    procedure TestQwenImage21TransformerLoRA;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
     procedure TestGenerationDefaultsFromJSONFile;
@@ -47347,6 +47356,400 @@ begin
     end;
   end;
   AssertTrue('an adapter for another architecture must be refused', Raised);
+end;
+
+// Queues a [Rows, Cols] tensor of uniform values in [-0.5, 0.5) (RandSeed).
+procedure AddRandomLoRAFactor(Writer: TNNetSafeTensorsWriter;
+  const Name: string; Rows, Cols: integer);
+var
+  Factor: TNNetVolume;
+  ElemCnt, MaxElemPos: integer;
+begin
+  Factor := TNNetVolume.Create(Rows * Cols, 1, 1);
+  try
+    MaxElemPos := Factor.Size - 1;
+    for ElemCnt := 0 to MaxElemPos do
+      Factor.FData[ElemCnt] := Random - 0.5;
+    Writer.AddTensorFlat(Name, [Rows, Cols], Factor);
+  finally
+    Factor.Free;
+  end;
+end;
+
+// Queues a 0-dim F32 scalar (a kohya ".alpha").
+procedure AddLoRAAlpha(Writer: TNNetSafeTensorsWriter; const Name: string;
+  Alpha: TNeuralFloat);
+var
+  Scalar: TNNetVolume;
+begin
+  Scalar := TNNetVolume.Create(1, 1, 1);
+  try
+    Scalar.FData[0] := Alpha;
+    Writer.AddTensorFlat(Name, [], Scalar);
+  finally
+    Scalar.Free;
+  end;
+end;
+
+// Expected += Scale * (B @ A), with A [r, in] and B [out, r] read from
+// AdapterFile and Expected the flat [out, in] base tensor; in double.
+procedure AddExpectedLoRADelta(Expected: TNNetVolume;
+  const AdapterFile, AName, BName: string; Scale: double);
+var
+  Adapter: TNNetSafeTensorsReader;
+  A, B: TNNetVolume;
+  Rank, InDim, OutDim, OutCnt, InCnt, RankCnt: integer;
+  Sum: double;
+begin
+  Adapter := TNNetSafeTensorsReader.Create(AdapterFile);
+  A := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Adapter.LoadTensorFlat(AName, A);
+    Adapter.LoadTensorFlat(BName, B);
+    Rank := integer(Adapter.DimSize(AName, 0));
+    InDim := integer(Adapter.DimSize(AName, 1));
+    OutDim := integer(Adapter.DimSize(BName, 0));
+    for OutCnt := 0 to OutDim - 1 do
+      for InCnt := 0 to InDim - 1 do
+      begin
+        Sum := 0;
+        for RankCnt := 0 to Rank - 1 do
+          Sum := Sum + double(B.FData[OutCnt * Rank + RankCnt]) *
+            A.FData[RankCnt * InDim + InCnt];
+        Expected.FData[OutCnt * InDim + InCnt] :=
+          Expected.FData[OutCnt * InDim + InCnt] + Scale * Sum;
+      end;
+  finally
+    B.Free;
+    A.Free;
+    Adapter.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.QwenImage21TransformerWeightsFile(): string;
+begin
+  Result := IncludeTrailingPathDelimiter(QwenImage21TransformerFolder()) +
+    'diffusion_pytorch_model.safetensors.index.json';
+end;
+
+// Writes the two image adapters of the TestLoRAMergeImage* tests into a new
+// temp dir: <dir>diffusers.safetensors (transformer. and diffusion_model.
+// lora_A/lora_B keys, one ignored alpha) and <dir>kohya.safetensors (lora_unet_
+// lora_down/lora_up keys, one with an alpha). Returns the dir.
+function TTestNeuralPretrained.WriteImageLoRAFixtures(): string;
+var
+  Writer: TNNetSafeTensorsWriter;
+begin
+  Result := GetTempDir(false) + 'cai_image_lora_' +
+    IntToStr(Random(1000000)) + DirectorySeparator;
+  AssertTrue('temp adapter dir', ForceDirectories(Result));
+  RandSeed := 20261021;
+  Writer := TNNetSafeTensorsWriter.Create(Result + 'diffusers.safetensors');
+  try
+    AddRandomLoRAFactor(Writer,
+      'transformer.transformer_blocks.0.attn.to_q.lora_A.weight', 2, 32);
+    AddRandomLoRAFactor(Writer,
+      'transformer.transformer_blocks.0.attn.to_q.lora_B.weight', 32, 2);
+    AddRandomLoRAFactor(Writer, 'transformer.img_in.lora_A.weight', 3, 16);
+    AddRandomLoRAFactor(Writer, 'transformer.img_in.lora_B.weight', 32, 3);
+    // Ignored, as diffusers' Qwen-Image loader ignores it.
+    AddLoRAAlpha(Writer, 'transformer.img_in.alpha', 1);
+    AddRandomLoRAFactor(Writer, 'diffusion_model.proj_out.lora_A.weight', 2, 32);
+    AddRandomLoRAFactor(Writer, 'diffusion_model.proj_out.lora_B.weight', 16, 2);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+  Writer := TNNetSafeTensorsWriter.Create(Result + 'kohya.safetensors');
+  try
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_transformer_blocks_1_img_mlp_proj.lora_down.weight', 4, 32);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_transformer_blocks_1_img_mlp_proj.lora_up.weight', 96, 4);
+    AddLoRAAlpha(Writer, 'lora_unet_transformer_blocks_1_img_mlp_proj.alpha', 2);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_txt_in_in_layer.lora_down.weight', 2, 64);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_txt_in_in_layer.lora_up.weight', 32, 2);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight', 2, 32);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight', 32, 2);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.DeleteImageLoRAFixtures(const Dir: string);
+begin
+  DeleteFile(Dir + 'diffusers.safetensors');
+  DeleteFile(Dir + 'kohya.safetensors');
+  DeleteFile(Dir + 'bad.safetensors');
+  RemoveDir(Dir);
+end;
+
+// Image-generator adapters on tests/fixtures/tiny_qwenimage21: the diffusers
+// and the kohya key layouts merge to W + scale * (B @ A) (oracle computed
+// here), untouched tensors pass through bit for bit. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeImageAdapterLayouts;
+const
+  DiffusersScale = 0.75;
+var
+  Dir: string;
+  Base, Merged: TNNetSafeTensorsReader;
+  Expected, Actual, Rows: TNNetVolume;
+
+  procedure CheckMerged(Reader: TNNetSafeTensorsReader;
+    const BaseName, AdapterFile, AName, BName: string; Scale: double);
+  begin
+    Base.LoadTensorFlat(BaseName, Expected);
+    AddExpectedLoRADelta(Expected, AdapterFile, AName, BName, Scale);
+    Reader.LoadTensorFlat(BaseName, Actual);
+    AssertEquals(BaseName + ' merged dtype', 'F32', Reader.GetDType(BaseName));
+    AssertEquals(BaseName + ' size', Expected.Size, Actual.Size);
+    AssertEquals(BaseName + ' vs W + scale * B @ A', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+  end;
+
+  procedure CheckPassThrough(Reader: TNNetSafeTensorsReader;
+    const BaseName: string);
+  begin
+    Base.LoadTensorFlat(BaseName, Expected);
+    Reader.LoadTensorFlat(BaseName, Actual);
+    AssertEquals(BaseName + ' dtype kept', Base.GetDType(BaseName),
+      Reader.GetDType(BaseName));
+    AssertEquals(BaseName + ' passes through', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 0);
+  end;
+
+begin
+  Dir := WriteImageLoRAFixtures();
+  Base := TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile());
+  Merged := nil;
+  Expected := TNNetVolume.Create;
+  Actual := TNNetVolume.Create;
+  Rows := TNNetVolume.Create;
+  try
+    Merged := TNNetLoRAMergeReader.CreateFromFile(
+      TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile()),
+      Dir + 'diffusers.safetensors', DiffusersLoRAStripPrefixes,
+      DiffusersScale);
+    AssertEquals('diffusers adapted tensors', 3,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    // lora_A/lora_B: scale 1.0 (an alpha is ignored), times the user scale.
+    CheckMerged(Merged, 'transformer_blocks.0.attn.to_q.weight',
+      Dir + 'diffusers.safetensors',
+      'transformer.transformer_blocks.0.attn.to_q.lora_A.weight',
+      'transformer.transformer_blocks.0.attn.to_q.lora_B.weight',
+      DiffusersScale);
+    CheckMerged(Merged, 'img_in.weight', Dir + 'diffusers.safetensors',
+      'transformer.img_in.lora_A.weight', 'transformer.img_in.lora_B.weight',
+      DiffusersScale);
+    CheckMerged(Merged, 'proj_out.weight', Dir + 'diffusers.safetensors',
+      'diffusion_model.proj_out.lora_A.weight',
+      'diffusion_model.proj_out.lora_B.weight', DiffusersScale);
+    CheckPassThrough(Merged, 'transformer_blocks.0.attn.to_k.weight');
+    CheckPassThrough(Merged, 'txt_in.text_norm.weight');
+    FreeAndNil(Merged);
+    Merged := TNNetLoRAMergeReader.CreateFromFile(
+      TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile()),
+      Dir + 'kohya.safetensors', DiffusersLoRAStripPrefixes);
+    AssertEquals('kohya adapted tensors', 3,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    // alpha 2 over rank 4.
+    CheckMerged(Merged, 'transformer_blocks.1.img_mlp.proj.weight',
+      Dir + 'kohya.safetensors',
+      'lora_unet_transformer_blocks_1_img_mlp_proj.lora_down.weight',
+      'lora_unet_transformer_blocks_1_img_mlp_proj.lora_up.weight', 0.5);
+    CheckMerged(Merged, 'txt_in.in_layer.weight', Dir + 'kohya.safetensors',
+      'lora_unet_txt_in_in_layer.lora_down.weight',
+      'lora_unet_txt_in_in_layer.lora_up.weight', 1.0);
+    CheckPassThrough(Merged, 'transformer_blocks.1.img_mlp.out.weight');
+    // A row range off a row boundary reads the slice of the merged tensor.
+    Merged.LoadTensorFlat('transformer_blocks.1.img_mlp.proj.weight', Actual);
+    Merged.LoadTensorRowsFlat('transformer_blocks.1.img_mlp.proj.weight',
+      {FirstRow=}5, {RowCount=}7, {RowSize=}16, Rows);
+    AssertEquals('row view size', 7 * 16, Rows.Size);
+    AssertEquals('row view first', Actual.FData[5 * 16], Rows.FData[0], 0);
+    AssertEquals('row view last', Actual.FData[5 * 16 + 7 * 16 - 1],
+      Rows.FData[7 * 16 - 1], 0);
+  finally
+    Rows.Free;
+    Actual.Free;
+    Expected.Free;
+    Merged.Free;
+    Base.Free;
+    DeleteImageLoRAFixtures(Dir);
+  end;
+end;
+
+// Two chained adapters (CreateLoRAMergeChain) that both target to_q of block
+// 0 add both deltas, each with its own scale. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeImageAdapterStack;
+const
+  WName = 'transformer_blocks.0.attn.to_q.weight';
+var
+  Dir: string;
+  Base, Chain: TNNetSafeTensorsReader;
+  Expected, Actual: TNNetVolume;
+begin
+  Dir := WriteImageLoRAFixtures();
+  Base := TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile());
+  Chain := nil;
+  Expected := TNNetVolume.Create;
+  Actual := TNNetVolume.Create;
+  try
+    Chain := CreateLoRAMergeChain(
+      TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile()),
+      [Dir + 'diffusers.safetensors', Dir + 'kohya.safetensors'], [0.5, -1.5],
+      DiffusersLoRAStripPrefixes);
+    Base.LoadTensorFlat(WName, Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'diffusers.safetensors',
+      'transformer.transformer_blocks.0.attn.to_q.lora_A.weight',
+      'transformer.transformer_blocks.0.attn.to_q.lora_B.weight', 0.5);
+    AddExpectedLoRADelta(Expected, Dir + 'kohya.safetensors',
+      'lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight',
+      'lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight', -1.5);
+    Chain.LoadTensorFlat(WName, Actual);
+    AssertEquals('stacked to_q', 0, MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+    // Each adapter's other targets still come through the chain.
+    Base.LoadTensorFlat('img_in.weight', Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'diffusers.safetensors',
+      'transformer.img_in.lora_A.weight', 'transformer.img_in.lora_B.weight',
+      0.5);
+    Chain.LoadTensorFlat('img_in.weight', Actual);
+    AssertEquals('img_in through the chain', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+    Base.LoadTensorFlat('transformer_blocks.0.attn.to_v.weight', Expected);
+    Chain.LoadTensorFlat('transformer_blocks.0.attn.to_v.weight', Actual);
+    AssertEquals('to_v passes through the chain', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 0);
+  finally
+    Actual.Free;
+    Expected.Free;
+    Chain.Free;
+    Base.Free;
+    DeleteImageLoRAFixtures(Dir);
+  end;
+end;
+
+// An adapter key with no base tensor and a conv (4-D) LoRA both raise
+// EPretrainedImportError naming the problem. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeImageAdapterRejects;
+var
+  Dir: string;
+  Writer: TNNetSafeTensorsWriter;
+  Factor: TNNetVolume;
+  Raised: boolean;
+
+  procedure ExpectRefusal(const Expected: string);
+  begin
+    Raised := false;
+    try
+      CreateLoRAMergeChain(
+        TNNetSafeTensorsReader.Create(QwenImage21TransformerWeightsFile()),
+        [Dir + 'bad.safetensors'], [1.0], DiffusersLoRAStripPrefixes).Free;
+    except
+      on E: EPretrainedImportError do
+      begin
+        Raised := true;
+        AssertTrue('message names "' + Expected + '": ' + E.Message,
+          Pos(Expected, E.Message) > 0);
+      end;
+    end;
+    AssertTrue('adapter must be refused (' + Expected + ')', Raised);
+    DeleteFile(Dir + 'bad.safetensors');
+  end;
+
+begin
+  Dir := WriteImageLoRAFixtures();
+  Factor := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(Dir + 'bad.safetensors');
+    try
+      AddRandomLoRAFactor(Writer,
+        'transformer.single_transformer_blocks.0.proj_mlp.lora_A.weight', 2, 32);
+      AddRandomLoRAFactor(Writer,
+        'transformer.single_transformer_blocks.0.proj_mlp.lora_B.weight', 32, 2);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    ExpectRefusal('matches no base tensor');
+    Writer := TNNetSafeTensorsWriter.Create(Dir + 'bad.safetensors');
+    try
+      Factor.ReSize(2 * 16, 1, 1);
+      Factor.Fill(0.1);
+      Writer.AddTensorFlat('lora_unet_img_in.lora_down.weight', [2, 16, 1, 1],
+        Factor);
+      Factor.ReSize(32 * 2, 1, 1);
+      Writer.AddTensorFlat('lora_unet_img_in.lora_up.weight', [32, 2, 1, 1],
+        Factor);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    ExpectRefusal('convolution LoRA');
+  finally
+    Factor.Free;
+    DeleteImageLoRAFixtures(Dir);
+  end;
+end;
+
+// The transformer built with an adapter at scale 0 predicts the velocity of
+// the one built without it; at scale 1 the velocity moves. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwenImage21TransformerLoRA;
+var
+  Dir: string;
+  RefRoot: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Latents, PlainVelocity, Velocity: TNNetVolume;
+  GridH, GridW: integer;
+
+  procedure PredictWith(const AdapterFiles: array of string;
+    const Scales: array of TNeuralFloat; Output: TNNetVolume);
+  begin
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder(), qiwFP32, false, AdapterFiles, Scales);
+    try
+      Transformer.EncodePrefix(Embeds);
+      Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Output);
+    finally
+      FreeAndNil(Transformer);
+    end;
+  end;
+
+begin
+  Dir := WriteImageLoRAFixtures();
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  PlainVelocity := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    PredictWith([], [], PlainVelocity);
+    PredictWith([Dir + 'diffusers.safetensors', Dir + 'kohya.safetensors'],
+      [0.0, 0.0], Velocity);
+    AssertEquals('zero-scale adapters', 0,
+      MaxAbsVolumeDiff(PlainVelocity, Velocity), 0);
+    PredictWith([Dir + 'diffusers.safetensors', Dir + 'kohya.safetensors'],
+      [1.0, 1.0], Velocity);
+    AssertTrue('adapters at scale 1 move the velocity',
+      MaxAbsVolumeDiff(PlainVelocity, Velocity) > 1e-3);
+  finally
+    Velocity.Free;
+    PlainVelocity.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+    DeleteImageLoRAFixtures(Dir);
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestMXFP4DequantHandBlock;

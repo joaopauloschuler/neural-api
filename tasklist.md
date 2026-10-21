@@ -1670,7 +1670,7 @@ rather than acted on.
             column matrices of the 36 FFC-unit 3x3 convs. Every convolution keeps
             `FInputPrepared` after the forward, in both memory modes; tiling or
             releasing it is a library-wide decision, not made here.
-- [ ] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
+- [X] Image-generator LoRA adapters: `--lora FILE[:SCALE]` (repeatable) in
       examples/QwenImage, merged into the transformer weights at load. Today
       `TNNetLoRAMergeReader` merges only HF PEFT adapters into the Llama-builder
       text models (`pLoRAAdapterDir` of `BuildFromPretrained`); the image side has
@@ -1699,8 +1699,17 @@ rather than acted on.
       itself Pascal; plus an unchanged-tensor pass-through check. README section in
       examples/QwenImage. Before promising a step cut, check that a step-distilled
       LoRA exists for Qwen-Image-2.1 (the known Lightning adapters target earlier
-      Qwen-Image releases). The SD UNet path (`BuildSDUNetFromSafeTensors`) can
-      take the same reader once the real Stable Diffusion pipeline item above lands.
+      Qwen-Image releases).
+      API: `TNNetLoRAMergeReader.CreateFromFile(Base, File, StripPrefixes,
+      Scale)`, `CreateLoRAMergeChain`, `DiffusersLoRAStripPrefixes`, the
+      `TQwenImage21Transformer.Create` overload with LoRA files/scales,
+      `TQwenImage21Pipeline.AddLoRA`/`ClearLoRAs`; scale rules follow diffusers'
+      Qwen-Image loader (kohya alpha / r, lora_A/lora_B alpha ignored).
+      - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`) can take the same
+            reader once the real Stable Diffusion pipeline item above lands.
+      - [ ] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
+            `load_lora_weights` + `fuse_lora` latent oracle, and no real
+            community LoRA has run yet (user run).
 - [ ] TAESD real-checkpoint check: run examples/LatentTextToImage with a
       downloaded `madebyollin/taesd` (`--tiny-vae DIR --fast-vae`) and compare
       the image against the full SD VAE decode; add an OpenCL parity test of

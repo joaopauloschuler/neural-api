@@ -9458,7 +9458,13 @@ type
     // from a diffusers transformer folder. pInt8Input needs int8/int4 weights.
     constructor Create(const TransformerFolder: string;
       pWeightFormat: TQwenImage21WeightFormat = qiwFP32;
-      pInt8Input: boolean = false);
+      pInt8Input: boolean = false); overload;
+    // The same with LoRA adapter files merged into the weights as they load
+    // (CreateLoRAMergeChain, DiffusersLoRAStripPrefixes), LoRAScales[i] each.
+    constructor Create(const TransformerFolder: string;
+      pWeightFormat: TQwenImage21WeightFormat; pInt8Input: boolean;
+      const LoRAFiles: array of string;
+      const LoRAScales: array of TNeuralFloat); overload;
     destructor Destroy(); override;
     // Runs txt_in and every block over the prompt with the t = 0 modulation
     // and keeps each block's post-RoPE K and V (PrefixKeys, PrefixValues).
@@ -9846,6 +9852,9 @@ type
     FTransformerConfig: TQwenImage21TransformerConfig;
     FTransformerFormat: TQwenImage21WeightFormat;
     FInt8Input, FTextEncoderInt8: boolean;
+    // AddLoRA's adapter files and scales, merged by CreateTransformer.
+    FLoRAFiles: TStringArray;
+    FLoRAScales: TNeuralFloatDynArr;
     FVaeTileSize, FVaeTileStride: integer;
     FParallel: boolean;
     FMaxThreads: integer;
@@ -9935,6 +9944,7 @@ type
     procedure SetTransformerFormat(Value: TQwenImage21WeightFormat);
     procedure SetInt8Input(Value: boolean);
     procedure SetTextEncoderInt8(Value: boolean);
+    function GetLoRACount(): integer;
   public
     // Reads model_index.json, scheduler/scheduler_config.json and
     // transformer/config.json; no weights are loaded here.
@@ -10067,6 +10077,11 @@ type
     property Int8Input: boolean read FInt8Input write SetInt8Input;
     property TextEncoderInt8: boolean read FTextEncoderInt8
       write SetTextEncoderInt8;
+    // A LoRA .safetensors merged into the transformer weights at its next load
+    // (Scale times the adapter's alpha / r). Both refuse while ComponentsLoaded.
+    procedure AddLoRA(const FileName: string; Scale: TNeuralFloat = 1.0);
+    procedure ClearLoRAs();
+    property LoRACount: integer read GetLoRACount;
     // VAE tile in pixels (multiples of 16); default 256/192 (diffusers'
     // enable_tiling) hides tile seams; ~10.7 GB of layer buffers live.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
@@ -14063,6 +14078,8 @@ type
   // of the checkpoint's embed_tokens.weight: "model.language_model.",
   // "model." or ""). The other tensors pass through untouched. An entry's
   // Shard field holds its index into FSourceNames (renames keep the link).
+  // CreateFromFile takes a lone adapter file (diffusers, ComfyUI or kohya
+  // keys); readers chain, so adapters stack (CreateLoRAMergeChain).
   TNNetLoRAMergeReader = class(TNNetSafeTensorsReader)
   private
     FBase: TNNetSafeTensorsReader;     // owned
@@ -14079,11 +14096,22 @@ type
     procedure AddDeltaToFlatRange(ModuleIdx: integer; Dest: TNNetVolume;
       FirstElement: Int64);
     function GetAdaptedTensorCount: integer;
+    // Opens AdapterFile and pairs its factors with base tensors; HasConfig
+    // false: no r check, kohya pairs scale by "<m>.alpha" / r (1.0 without).
+    procedure ReadAdapterModules(const AdapterFile, ConfigFile: string;
+      const Config: TPEFTAdapterConfig;
+      HasConfig: boolean; const StripPrefixes: array of string;
+      UserScale: TNeuralFloat);
   public
     // Takes ownership of pBase (also freed when Create raises). pAdapterDir
     // holds adapter_config.json and adapter_model.safetensors (or .bin).
     constructor Create(pBase: TNNetSafeTensorsReader;
-      const pAdapterDir: string);
+      const pAdapterDir: string; pUserScale: TNeuralFloat = 1.0);
+    // One adapter file with lora_A/lora_B or kohya lora_down/lora_up keys; the
+    // first matching pStripPrefixes entry is cut from each module name.
+    constructor CreateFromFile(pBase: TNNetSafeTensorsReader;
+      const pAdapterFile: string; const pStripPrefixes: array of string;
+      pUserScale: TNeuralFloat = 1.0);
     destructor Destroy; override;
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
@@ -14096,6 +14124,17 @@ type
       Dest: TNNetVolumeQuant4); override;
     property AdaptedTensorCount: integer read GetAdaptedTensorCount;
   end;
+
+const
+  // Key prefixes of image-generator LoRA files: diffusers, ComfyUI, kohya.
+  DiffusersLoRAStripPrefixes: array[0..2] of string =
+    ('transformer.', 'diffusion_model.', 'lora_unet_');
+
+// Wraps Base in one CreateFromFile reader per adapter file (Scales[i] each);
+// takes ownership of Base, also when it raises.
+function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
+  const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
+  const StripPrefixes: array of string): TNNetSafeTensorsReader;
 
 // Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
 // layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
@@ -17373,40 +17412,15 @@ end;
 { TNNetLoRAMergeReader }
 
 constructor TNNetLoRAMergeReader.Create(pBase: TNNetSafeTensorsReader;
-  const pAdapterDir: string);
+  const pAdapterDir: string; pUserScale: TNeuralFloat);
 const
   PEFTKeyPrefix = 'base_model.model.';
-  LoRAAMarker = '.lora_A.';
 var
   Config: TPEFTAdapterConfig;
-  ConfigFile, AdapterFile, AdapterKey, ModulePath, WeightSuffix: string;
-  BName, BaseName, TextPrefix, DType: string;
-  PairedNames: TStringList;
-  Module: TPEFTLoRAMergeModule;
-  Alpha: TNeuralFloat;
-  SourceCnt, MaxSourcePos, AdapterCnt, MaxAdapterPos, MarkerPos: integer;
-  SourceIdx, PatternIdx, ExpectedRank, ModuleIdx: integer;
-
-  // "weight" or "<adapter name>.weight" (PEFT drops the name "default").
-  function IsLoRAWeightSuffix(const Suffix: string): boolean;
-  var
-    NamePart: string;
-  begin
-    if Suffix = 'weight' then exit(true);
-    NamePart := Copy(Suffix, 1, Length(Suffix) - Length('.weight'));
-    Result := (Length(Suffix) > Length('.weight')) and
-      (Copy(Suffix, Length(NamePart) + 1, MaxInt) = '.weight') and
-      (Pos('.', NamePart) = 0);
-  end;
-
+  ConfigFile, AdapterFile: string;
 begin
   inherited CreateBare;
   FBase := pBase; // first: Destroy frees it when anything below raises
-  FCachedModule := -1;
-  FA := TNNetVolume.Create;
-  FB := TNNetVolume.Create;
-  FDeltaRow := TNNetVolume.Create;
-  FFileName := FBase.FileName;
   ConfigFile := IncludeTrailingPathDelimiter(pAdapterDir) +
     'adapter_config.json';
   Config := ReadPEFTAdapterConfig(ConfigFile);
@@ -17420,6 +17434,98 @@ begin
   if not FileExists(AdapterFile) then
     ImportError('LoRA merge: neither adapter_model.safetensors nor ' +
       'adapter_model.bin found in ' + pAdapterDir + '.');
+  ReadAdapterModules(AdapterFile, ConfigFile, Config, {HasConfig=}true,
+    [PEFTKeyPrefix], pUserScale);
+end;
+
+constructor TNNetLoRAMergeReader.CreateFromFile(pBase: TNNetSafeTensorsReader;
+  const pAdapterFile: string; const pStripPrefixes: array of string;
+  pUserScale: TNeuralFloat);
+var
+  Config: TPEFTAdapterConfig;
+begin
+  inherited CreateBare;
+  FBase := pBase; // first: Destroy frees it when anything below raises
+  if not FileExists(pAdapterFile) then
+    ImportError('LoRA merge: adapter file ' + pAdapterFile + ' not found.');
+  Config := Default(TPEFTAdapterConfig);
+  ReadAdapterModules(pAdapterFile, '', Config, {HasConfig=}false,
+    pStripPrefixes, pUserScale);
+end;
+
+procedure TNNetLoRAMergeReader.ReadAdapterModules(const AdapterFile,
+  ConfigFile: string; const Config: TPEFTAdapterConfig; HasConfig: boolean;
+  const StripPrefixes: array of string; UserScale: TNeuralFloat);
+const
+  MaxMarkerPos = 1;
+  // PEFT/diffusers names, then kohya names, of the down (A) and up (B) factor.
+  AMarkers: array[0..MaxMarkerPos] of string = ('.lora_A.', '.lora_down.');
+  BMarkers: array[0..MaxMarkerPos] of string = ('.lora_B.', '.lora_up.');
+  WeightSuffix = '.weight';
+var
+  AdapterKey, AdapterModulePath, ModulePath, FactorSuffix: string;
+  BName, AlphaName, BaseName, TextPrefix, DType: string;
+  PairedNames, FlatSources: TStringList;
+  Module: TPEFTLoRAMergeModule;
+  Alpha: TNeuralFloat;
+  SourceCnt, MaxSourcePos, AdapterCnt, MaxAdapterPos, MarkerPos: integer;
+  MarkerCnt, PrefixCnt, SourceIdx, PatternIdx, ExpectedRank: integer;
+  ModuleIdx: integer;
+
+  // "weight" or "<adapter name>.weight" (PEFT drops the name "default").
+  function IsLoRAWeightSuffix(const Suffix: string): boolean;
+  var
+    NamePart: string;
+  begin
+    if Suffix = 'weight' then exit(true);
+    NamePart := Copy(Suffix, 1, Length(Suffix) - Length(WeightSuffix));
+    Result := (Length(Suffix) > Length(WeightSuffix)) and
+      (Copy(Suffix, Length(NamePart) + 1, MaxInt) = WeightSuffix) and
+      (Pos('.', NamePart) = 0);
+  end;
+
+  // Source index of the base "<m>.weight" whose <m> with dots as underscores
+  // is FlatModule (kohya names), -1 when none; the index is built once.
+  function FlatSourceOf(const FlatModule: string): integer;
+  var
+    SourceName, FlatName: string;
+    EntryIdx, FlatCnt: integer;
+  begin
+    if FlatSources = nil then
+    begin
+      FlatSources := TStringList.Create;
+      FlatSources.CaseSensitive := true;
+      FlatSources.Sorted := true;
+      for FlatCnt := 0 to MaxSourcePos do
+      begin
+        SourceName := FSourceNames[FlatCnt];
+        if (Length(SourceName) <= Length(WeightSuffix)) or
+          (Copy(SourceName, Length(SourceName) - Length(WeightSuffix) + 1,
+          MaxInt) <> WeightSuffix) then continue;
+        FlatName := StringReplace(Copy(SourceName, 1,
+          Length(SourceName) - Length(WeightSuffix)), '.', '_', [rfReplaceAll]);
+        EntryIdx := FlatSources.IndexOf(FlatName);
+        if EntryIdx < 0 then
+          FlatSources.AddObject(FlatName, TObject(PtrInt(FlatCnt)))
+        else
+          FlatSources.Objects[EntryIdx] := TObject(PtrInt(-1));
+      end;
+    end;
+    EntryIdx := FlatSources.IndexOf(FlatModule);
+    if EntryIdx < 0 then exit(-1);
+    Result := integer(PtrInt(FlatSources.Objects[EntryIdx]));
+    if Result < 0 then
+      ImportError('LoRA merge: adapter module "' + FlatModule + '" matches ' +
+        'several base tensors once dots read as underscores in ' +
+        FFileName + '.');
+  end;
+
+begin
+  FCachedModule := -1;
+  FA := TNNetVolume.Create;
+  FB := TNNetVolume.Create;
+  FDeltaRow := TNNetVolume.Create;
+  FFileName := FBase.FileName;
   FAdapter := CreatePretrainedTensorReader(AdapterFile);
   MaxSourcePos := FBase.Count - 1;
   SetLength(FTensors, FBase.Count);
@@ -17440,6 +17546,7 @@ begin
     TextPrefix := 'model.'
   else
     TextPrefix := '';
+  FlatSources := nil;
   PairedNames := TStringList.Create;
   try
     PairedNames.Sorted := true;
@@ -17447,30 +17554,57 @@ begin
     for AdapterCnt := 0 to MaxAdapterPos do
     begin
       AdapterKey := FAdapter.TensorName(AdapterCnt);
-      MarkerPos := Pos(LoRAAMarker, AdapterKey);
-      if MarkerPos = 0 then continue; // paired below from its lora_A
-      WeightSuffix := Copy(AdapterKey, MarkerPos + Length(LoRAAMarker), MaxInt);
-      if not IsLoRAWeightSuffix(WeightSuffix) then continue;
-      ModulePath := Copy(AdapterKey, 1, MarkerPos - 1);
-      BName := ModulePath + '.lora_B.' + WeightSuffix;
+      MarkerCnt := 0;
+      MarkerPos := 0;
+      while (MarkerPos = 0) and (MarkerCnt <= MaxMarkerPos) do
+      begin
+        MarkerPos := Pos(AMarkers[MarkerCnt], AdapterKey);
+        if MarkerPos = 0 then Inc(MarkerCnt);
+      end;
+      if MarkerPos = 0 then continue; // paired below from its down factor
+      FactorSuffix := Copy(AdapterKey, MarkerPos + Length(AMarkers[MarkerCnt]),
+        MaxInt);
+      if not IsLoRAWeightSuffix(FactorSuffix) then continue;
+      AdapterModulePath := Copy(AdapterKey, 1, MarkerPos - 1);
+      BName := AdapterModulePath + BMarkers[MarkerCnt] + FactorSuffix;
       if not FAdapter.HasTensor(BName) then
         ImportError('LoRA merge: adapter tensor "' + AdapterKey +
           '" has no matching "' + BName + '" in ' + AdapterFile + '.');
       PairedNames.Add(AdapterKey);
       PairedNames.Add(BName);
-      if Copy(ModulePath, 1, Length(PEFTKeyPrefix)) = PEFTKeyPrefix then
-        Delete(ModulePath, 1, Length(PEFTKeyPrefix));
-      if FBase.HasTensor(ModulePath + '.weight') then
-        BaseName := ModulePath + '.weight'
+      if (FAdapter.DimCount(AdapterKey) > 2) or
+        (FAdapter.DimCount(BName) > 2) then
+        ImportError('LoRA merge: "' + AdapterKey + '" ' +
+          FAdapter.ShapeAsString(AdapterKey) + ' and "' + BName + '" ' +
+          FAdapter.ShapeAsString(BName) + ' are convolution LoRA factors; ' +
+          'only Linear (2-D) factors merge (' + AdapterFile + ').');
+      ModulePath := AdapterModulePath;
+      for PrefixCnt := Low(StripPrefixes) to High(StripPrefixes) do
+        if (StripPrefixes[PrefixCnt] <> '') and
+          (Copy(ModulePath, 1, Length(StripPrefixes[PrefixCnt])) =
+          StripPrefixes[PrefixCnt]) then
+        begin
+          Delete(ModulePath, 1, Length(StripPrefixes[PrefixCnt]));
+          break;
+        end;
+      if FBase.HasTensor(ModulePath + WeightSuffix) then
+        BaseName := ModulePath + WeightSuffix
       else if (TextPrefix <> '') and
-        FBase.HasTensor(TextPrefix + ModulePath + '.weight') then
-        BaseName := TextPrefix + ModulePath + '.weight'
+        FBase.HasTensor(TextPrefix + ModulePath + WeightSuffix) then
+        BaseName := TextPrefix + ModulePath + WeightSuffix
       else
-        ImportError('LoRA merge: adapter module "' + ModulePath +
-          '" matches no base tensor (tried "' + ModulePath + '.weight" and "' +
-          TextPrefix + ModulePath + '.weight") in ' + FFileName + '.');
-      if (Pos('visual.', BaseName) = 1) or (Pos('model.visual.', BaseName) = 1)
-        or (Pos('mtp.', BaseName) = 1) or (Pos('model.mtp.', BaseName) = 1) then
+      begin
+        SourceIdx := FlatSourceOf(ModulePath);
+        if SourceIdx < 0 then
+          ImportError('LoRA merge: adapter module "' + ModulePath +
+            '" matches no base tensor (tried "' + ModulePath + '.weight", "' +
+            TextPrefix + ModulePath + '.weight" and dots as underscores) in ' +
+            FFileName + '.');
+        BaseName := FSourceNames[SourceIdx];
+      end;
+      if HasConfig and ((Pos('visual.', BaseName) = 1) or
+        (Pos('model.visual.', BaseName) = 1) or (Pos('mtp.', BaseName) = 1) or
+        (Pos('model.mtp.', BaseName) = 1)) then
         ImportError('LoRA merge: adapter module "' + ModulePath +
           '" targets "' + BaseName + '", which the text importer skips.');
       if Config.TargetModulesIsList and
@@ -17498,17 +17632,41 @@ begin
           '" ' + FBase.ShapeAsString(BaseName) +
           ' (expected [r, in] and [out, r]).');
       Module.Rank := integer(FAdapter.DimSize(AdapterKey, 0));
-      PatternIdx := PEFTPatternIndex(Config.RankPatternKeys, ModulePath);
-      if PatternIdx >= 0 then ExpectedRank := Config.RankPatternValues[PatternIdx]
-      else ExpectedRank := Config.Rank;
-      if Module.Rank <> ExpectedRank then
-        ImportError('LoRA merge: "' + AdapterKey + '" has rank ' +
-          IntToStr(Module.Rank) + ' but ' + ConfigFile + ' gives r = ' +
-          IntToStr(ExpectedRank) + ' for module "' + ModulePath + '".');
-      PatternIdx := PEFTPatternIndex(Config.AlphaPatternKeys, ModulePath);
-      if PatternIdx >= 0 then Alpha := Config.AlphaPatternValues[PatternIdx]
-      else Alpha := Config.Alpha;
-      Module.Scale := Alpha / Module.Rank;
+      if HasConfig then
+      begin
+        PatternIdx := PEFTPatternIndex(Config.RankPatternKeys, ModulePath);
+        if PatternIdx >= 0 then
+          ExpectedRank := Config.RankPatternValues[PatternIdx]
+        else ExpectedRank := Config.Rank;
+        if Module.Rank <> ExpectedRank then
+          ImportError('LoRA merge: "' + AdapterKey + '" has rank ' +
+            IntToStr(Module.Rank) + ' but ' + ConfigFile + ' gives r = ' +
+            IntToStr(ExpectedRank) + ' for module "' + ModulePath + '".');
+        PatternIdx := PEFTPatternIndex(Config.AlphaPatternKeys, ModulePath);
+        if PatternIdx >= 0 then Alpha := Config.AlphaPatternValues[PatternIdx]
+        else Alpha := Config.Alpha;
+      end
+      else
+      begin
+        // As diffusers: kohya pairs scale by alpha / r (1.0 without alpha);
+        // Qwen-Image's loader drops an alpha beside lora_A/lora_B.
+        Alpha := Module.Rank;
+        AlphaName := AdapterModulePath + '.alpha';
+        if FAdapter.HasTensor(AlphaName) then
+        begin
+          PairedNames.Add(AlphaName);
+          if FAdapter.ElementCount(AlphaName) <> 1 then
+            ImportError('LoRA merge: "' + AlphaName + '" ' +
+              FAdapter.ShapeAsString(AlphaName) + ' is not a scalar (' +
+              AdapterFile + ').');
+          if MarkerCnt = 1 then
+          begin
+            FAdapter.LoadTensorFlat(AlphaName, FA);
+            Alpha := FA.FData[0];
+          end;
+        end;
+      end;
+      Module.Scale := UserScale * Alpha / Module.Rank;
       SourceIdx := FindTensor(BaseName);
       if FModuleOfSource[SourceIdx] >= 0 then
         ImportError('LoRA merge: two adapter modules target "' + BaseName +
@@ -17528,6 +17686,7 @@ begin
           'supported (' + AdapterFile + ').');
   finally
     PairedNames.Free;
+    FlatSources.Free;
   end;
   if Length(FModules) = 0 then
     ImportError('LoRA merge: ' + AdapterFile + ' holds no LoRA weights.');
@@ -17656,6 +17815,26 @@ begin
       'delta and has no packed Q4_0 form: %s', [pName, FFileName]);
   FBase.LoadTensorPackedRowsQ4_0(FSourceNames[SourceIdx], FirstRow, RowCount,
     RowSize, Dest);
+end;
+
+function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
+  const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
+  const StripPrefixes: array of string): TNNetSafeTensorsReader;
+var
+  FileCnt, MaxFilePos: integer;
+begin
+  if Length(Scales) <> Length(AdapterFiles) then
+  begin
+    Base.Free;
+    ImportError('CreateLoRAMergeChain: ' + IntToStr(Length(AdapterFiles)) +
+      ' adapter files but ' + IntToStr(Length(Scales)) + ' scales.');
+  end;
+  Result := Base;
+  MaxFilePos := High(AdapterFiles);
+  // A raising CreateFromFile frees the chain built so far (its pBase).
+  for FileCnt := 0 to MaxFilePos do
+    Result := TNNetLoRAMergeReader.CreateFromFile(Result,
+      AdapterFiles[FileCnt], StripPrefixes, Scales[FileCnt]);
 end;
 
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
@@ -88991,6 +89170,13 @@ end;
 
 constructor TQwenImage21Transformer.Create(const TransformerFolder: string;
   pWeightFormat: TQwenImage21WeightFormat; pInt8Input: boolean);
+begin
+  Create(TransformerFolder, pWeightFormat, pInt8Input, [], []);
+end;
+
+constructor TQwenImage21Transformer.Create(const TransformerFolder: string;
+  pWeightFormat: TQwenImage21WeightFormat; pInt8Input: boolean;
+  const LoRAFiles: array of string; const LoRAScales: array of TNeuralFloat);
 var
   Folder, WeightsFile: string;
   Reader: TNNetSafeTensorsReader;
@@ -89012,7 +89198,8 @@ begin
   WeightsFile := SafeTensorsFolderWeightsFile(Folder,
     'diffusion_pytorch_model');
   FTimestepInput := TNNetVolume.Create(1, 1, 1);
-  Reader := TNNetSafeTensorsReader.Create(WeightsFile);
+  Reader := CreateLoRAMergeChain(TNNetSafeTensorsReader.Create(WeightsFile),
+    LoRAFiles, LoRAScales, DiffusersLoRAStripPrefixes);
   try
     BuildTimestepNet(Reader);
     FTextInOwner := TNNet.Create();
@@ -90059,6 +90246,31 @@ begin
   FTextEncoderInt8 := Value;
 end;
 
+procedure TQwenImage21Pipeline.AddLoRA(const FileName: string;
+  Scale: TNeuralFloat);
+var
+  LoRAIdx: integer;
+begin
+  RefuseWhileLoaded('AddLoRA');
+  LoRAIdx := Length(FLoRAFiles);
+  SetLength(FLoRAFiles, LoRAIdx + 1);
+  SetLength(FLoRAScales, LoRAIdx + 1);
+  FLoRAFiles[LoRAIdx] := FileName;
+  FLoRAScales[LoRAIdx] := Scale;
+end;
+
+procedure TQwenImage21Pipeline.ClearLoRAs();
+begin
+  RefuseWhileLoaded('ClearLoRAs');
+  SetLength(FLoRAFiles, 0);
+  SetLength(FLoRAScales, 0);
+end;
+
+function TQwenImage21Pipeline.GetLoRACount(): integer;
+begin
+  Result := Length(FLoRAFiles);
+end;
+
 function TQwenImage21Pipeline.GetTextEncoderConfig(): TQwen3VLConfig;
 begin
   if not FTextEncoderConfigRead then
@@ -90101,7 +90313,7 @@ end;
 function TQwenImage21Pipeline.CreateTransformer(): TQwenImage21Transformer;
 begin
   Result := TQwenImage21Transformer.Create(ComponentFolder('transformer'),
-    FTransformerFormat, FInt8Input);
+    FTransformerFormat, FInt8Input, FLoRAFiles, FLoRAScales);
   try
     EnableTransformerOpenCL(Result);
   except

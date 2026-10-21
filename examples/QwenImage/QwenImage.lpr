@@ -85,6 +85,7 @@ USAGE
              [--padding-mask-crop N] |
              --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
+            [--lora FILE[:SCALE] ...]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile] [--stats]
@@ -520,6 +521,11 @@ begin
     'input/output/timestep nets and the VAE stay FP32.');
   WriteLn('  --int8-input         int8 activations into the transformer''s ',
     'int8/int4 projections (not with --fp32)');
+  WriteLn('  --lora FILE[:SCALE]  merge a LoRA .safetensors (diffusers, ComfyUI ',
+    'or kohya keys) into the');
+  WriteLn('                       transformer weights at load, times SCALE ',
+    '(default 1). Repeat it to stack');
+  WriteLn('                       adapters.');
   WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
     'of 16 (default 256,192)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
@@ -698,6 +704,25 @@ begin
   else Result := '';
 end;
 
+// Parses a --lora FILE[:SCALE] value (a '.' decimal point; no number after the
+// last ':' leaves it in the file name); returns '' or what is wrong.
+function ParseLoRAArg(const Text: string; out FileName: string;
+  out Scale: double): string;
+var
+  ColonPos: integer;
+begin
+  FileName := Text;
+  Scale := 1.0;
+  ColonPos := LastDelimiter(':', Text);
+  if (ColonPos > 0) and TryStrToFloat(Copy(Text, ColonPos + 1, MaxInt), Scale,
+    PointFormat()) then
+    FileName := Copy(Text, 1, ColonPos - 1)
+  else Scale := 1.0;
+  if not FileExists(FileName) then
+    Result := 'file "' + FileName + '" not found.'
+  else Result := '';
+end;
+
 // Parses a mask blur radius >= 0 in pixels (a '.' decimal point); returns ''
 // or what is wrong.
 function ParseMaskBlurRadius(const Text: string; out Radius: double): string;
@@ -815,6 +840,12 @@ var
   // pipeline holds their encoding at ConditionEncodedArea pixels (0: none).
   // ImageArgFiles: the --image files, read once the output area is known.
   ConditionFiles, ImageArgFiles: TStringList;
+  // The --lora files and their scales, in the order given.
+  LoRAFiles: TStringList;
+  LoRAScales: array of double;
+  LoRAFile: string;
+  LoRAScale: double;
+  LoRAPos: integer;
   ConditionImages: array of TNNetVolume;
   ConditionEncodedArea: double;
   // The N+1 text runs of the encoded edit prompt.
@@ -1939,6 +1970,8 @@ begin
   InputImageEncodeNumber := 0;
   ConditionFiles := TStringList.Create;
   ImageArgFiles := TStringList.Create;
+  LoRAFiles := TStringList.Create;
+  LoRAScales := nil;
   ConditionImages := nil;
   ConditionEncodedArea := 0;
   Pipeline := nil;
@@ -2029,6 +2062,18 @@ begin
     else if Arg = '--int4' then WeightFormat := qiwInt4
     else if Arg = '--fp32' then WeightFormat := qiwFP32
     else if Arg = '--int8-input' then UseInt8Input := true
+    else if Arg = '--lora' then
+    begin
+      ArgProblem := ParseLoRAArg(NextArg(), LoRAFile, LoRAScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--lora: ', ArgProblem);
+        Halt(2);
+      end;
+      LoRAFiles.Add(LoRAFile);
+      SetLength(LoRAScales, Length(LoRAScales) + 1);
+      LoRAScales[High(LoRAScales)] := LoRAScale;
+    end
     else if Arg = '--serial' then UseSerial := true
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
     else if Arg = '--token-ids' then TokenList := NextArg()
@@ -2158,6 +2203,8 @@ begin
     Pipeline.TransformerFormat := WeightFormat;
     Pipeline.TextEncoderInt8 := WeightFormat <> qiwFP32;
     Pipeline.Int8Input := UseInt8Input;
+    for LoRAPos := 0 to LoRAFiles.Count - 1 do
+      Pipeline.AddLoRA(LoRAFiles[LoRAPos], LoRAScales[LoRAPos]);
     Pipeline.VaeTileSize := VaeTileSize;
     Pipeline.VaeTileStride := VaeTileStride;
     Pipeline.Parallel := not UseSerial;
@@ -2248,6 +2295,9 @@ begin
     end;
     WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
+    for LoRAPos := 0 to LoRAFiles.Count - 1 do
+      WriteLn('LoRA       : ', LoRAFiles[LoRAPos], ' x ',
+        FloatToStr(LoRAScales[LoRAPos], PointFormat()));
     if UseSerial then WriteLn('Threads    : serial (single-threaded)')
     else if MaxThreads > 0 then
       WriteLn('Threads    : parallel, at most ', MaxThreads, ' workers')
@@ -2278,6 +2328,7 @@ begin
     Reporter.EndStepLine();
     ClearConditionImages();
     ImageArgFiles.Free;
+    LoRAFiles.Free;
     ConditionFiles.Free;
     Pipeline.Free;
     {$IFDEF OpenCL}
