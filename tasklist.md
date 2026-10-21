@@ -1639,6 +1639,13 @@ rather than acted on.
                 implicit GEMM folds a single-reader TNNetDeMaxPool (which then
                 skips its forward); 1024x1024 untiled 17.0 -> 14.2 TFLOP
                 (estimate). GPU timing on the L4 still open.
+                - [ ] B2f5 follow-up: the "single reader" test is
+                      `GetDepartingBranchesCnt() = 1`; a layer that reads the
+                      TNNetDeMaxPool output without registering as a branch would
+                      see an empty output. Audit readers that bypass AddLayer.
+                - [ ] B2f5 follow-up: Swish/HardSwish/Rectangular conv subclasses
+                      and the int8/int4 convs do not fold (the Qwen-Image VAE
+                      needs none; SD VAE / UNet upsamplers might).
           - [ ] B2f6. Untiled path: memory estimator vs the device limits,
                 `--vae-tile 0`; L4 runs 256/192 -> 512/384 -> untiled in the REPL;
                 then the default decision with the user.
@@ -1646,6 +1653,8 @@ rather than acted on.
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
+        `TNNetAdaptiveProjectedGuidance` (neuraldiffusion.pas, 15c5aca5) is
+        ready to use in place of plain CFG here.
   Phase C — editing and reference images (plan from source reading of
   diffusers 0.41.0.dev0 `pipeline_qwenimage21.py` / `transformer_qwenimage21.py`
   / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`;
