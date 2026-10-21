@@ -635,6 +635,21 @@ type
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure MoveOutputToRAM(); virtual;
+      // Sizes WeightsInter to (TapCount,1,RowCount) and arms FDotCL as an
+      // implicit conv over PositionCount output positions.
+      procedure ArmImplicitConv(WeightsInter: TNNetVolume;
+        RowCount, TapCount, PositionCount: integer);
+      // Creates FDotCL and WeightsInter when missing and marks the layer OpenCL-enabled.
+      procedure CreateImplicitConvCL(var WeightsInter: TNNetVolume);
+      // Inference only, armed with RowCount x TapCount weights, and big enough
+      // or fed by a resident source (as for TNNetConvolution).
+      function WillImplicitConv(WeightsInter: TNNetVolume;
+        RowCount, TapCount: integer): boolean;
+      // Runs cai_conv_implicit over FPrevLayer (bound when resident) into this
+      // layer's resident output; Bias nil means no bias.
+      procedure ComputeImplicitConvOnOpenCL(WeightsInter, Bias: TNNetVolume;
+        NewWeights: boolean; RowSpan, Stride, PaddingX, PaddingY, DilationX: integer;
+        OutFrames: integer = 1; FrameStep: integer = 0; WindowDepth: integer = 0);
       // Sizes WeightsInter (taps x neurons) and Bias to the neurons and arms
       // FDotCL as an implicit conv over PositionCount output positions.
       procedure ArmNeuronImplicitConv(WeightsInter, Bias: TNNetVolume;
@@ -646,8 +661,7 @@ type
       // when missing, then ArmNeuronImplicitConv.
       procedure EnableNeuronImplicitConv(var WeightsInter, Bias: TNNetVolume;
         PositionCount: integer);
-      // WillOpenCL of such a layer: inference only, armed, and big enough or
-      // fed by a resident source (as for TNNetConvolution).
+      // WillImplicitConv with one row per neuron.
       function WillNeuronImplicitConv(WeightsInter: TNNetVolume): boolean;
       {$ENDIF}
 
@@ -10329,6 +10343,35 @@ type
       property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
+  /// This is a base class. Do not use it directly.
+  // TNNetConv1DBase: a full channel-mixing K-tap conv along SizeX with one
+  // neuron (K,1,InputDepth) per output channel; descendants place the window.
+  TNNetConv1DBase = class(TNNetLayer)
+    protected
+      FFeatureSize: integer; // kernel size K
+      FDilation: integer;    // tap spacing in time (>=1)
+      {$IFDEF OpenCL}
+      FWeightsCL, FBiasCL: TNNetVolume; // implicit-conv A operand and bias
+      procedure ComputeOpenCL();
+      // End of a descendant's SetPrevLayer: size verdict, then re-arm FDotCL.
+      procedure ArmConv1DOpenCL();
+      {$ENDIF}
+      // Zero-padded positions read before output position 0 by the first tap.
+      function LeftPadding(): integer; virtual; abstract;
+    public
+      constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0;
+        pDilation: integer = 1); reintroduce; overload;
+      destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      // Inference forward is cai_conv_implicit: a K x 1 kernel at LeftPadding,
+      // with the bias fused.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetCausalConv1D: a learnable 1D convolution along the SizeX (time) axis
   // with LEFT-ONLY zero padding of (FeatureSize-1), so the sequence length is
   // preserved (output SizeX == input SizeX) and output position t depends ONLY
@@ -10351,29 +10394,14 @@ type
   // FStruct[4] (matching the convolution layers' slot) and Dilation in FStruct[5]
   // for round-tripping.
   // Coded by Claude (AI).
-  TNNetCausalConv1D = class(TNNetLayer)
-    private
-      FFeatureSize: integer; // kernel size K
-      FDilation: integer;    // WaveNet-style dilation (>=1); 1 == dense causal conv
-      {$IFDEF OpenCL}
-      FWeightsCL, FBiasCL: TNNetVolume; // implicit-conv A operand and bias
-      procedure ComputeOpenCL();
-      {$ENDIF}
+  TNNetCausalConv1D = class(TNNetConv1DBase)
+    protected
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Dilation*(K-1): the window trails t, so there is no right padding.
+      function LeftPadding(): integer; override;
     public
-      constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0;
-        pDilation: integer = 1); reintroduce; overload;
-      destructor Destroy(); override;
-      {$IFDEF OpenCL}
-      // Inference forward is cai_conv_implicit: a K x 1 kernel, left padding
-      // Dilation*(K-1) and no right padding, with the bias fused.
-      function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
-      {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      procedure InitDefault(); override;
   end;
 
   /// TNNetTDNNConv1D: a learnable, NON-CAUSAL (centred "SAME") 1-D convolution
@@ -10396,17 +10424,14 @@ type
   // for round-tripping. Backward is the standard conv backward (input + per-tap
   // weight + bias grad) restricted to the in-range centred window.
   // Coded by Claude (AI).
-  TNNetTDNNConv1D = class(TNNetLayer)
-    private
-      FFeatureSize: integer; // kernel size K
-      FDilation: integer;    // dilation (>=1); 1 == dense centred conv
+  TNNetTDNNConv1D = class(TNNetConv1DBase)
+    protected
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Dilation*(K div 2): the window is centred on t.
+      function LeftPadding(): integer; override;
     public
-      constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0;
-        pDilation: integer = 1); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
-      procedure InitDefault(); override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -11079,12 +11104,24 @@ type
       // a direct Neurons[0].Weights write from outside the layer.
       FBankSrc: TNNetVolume;
       FBankValid: boolean;    // false until FBank/FBankSrc have been built once
+      {$IFDEF OpenCL}
+      FBankCL: TNNetVolume;   // FBank k-major: the implicit-conv A operand
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure MaterializeBank();
-      procedure MaterializeBankIfStale();
+      // True when it rebuilt FBank.
+      function MaterializeBankIfStale(): boolean;
     public
       constructor Create(pNumFilters, pKernelSize: integer; pStride: integer = 1;
         pSampleRate: TNeuralFloat = 16000); reintroduce; overload;
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      // Inference forward is cai_conv_implicit over the materialized bank;
+      // FBankCL is re-uploaded only when the bank was rebuilt or re-armed.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -46073,24 +46110,13 @@ var
   TapsPerOut: integer;
 begin
   TapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
-  if (TapsPerOut = 0) or (FOutput.Size = 0) then exit;
-  FModWeightsInter.ReSize(TapsPerOut, 1, FOutChannels);
-  // PrepareForCompute releases the result buffer a resident output lives in.
-  FOutputOnOpenCL := false;
-  FDotCL.PrepareForCompute(FModWeightsInter, FOutput.SizeX * FOutput.SizeY,
-    TapsPerOut);
-  FDotCL.PrepareImplicitConv();
+  ArmImplicitConv(FModWeightsInter, FOutChannels, TapsPerOut,
+    FOutput.SizeX * FOutput.SizeY);
 end;
 
 procedure TNNetModulatedConv2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
-  FHasOpenCL := true;
-  if not Assigned(FDotCL) then
-  begin
-    FDotCL := NewDotProductCL(GetDotProductKernel());
-    FDotCL.HideMessages();
-  end;
-  if not Assigned(FModWeightsInter) then FModWeightsInter := TNNetVolume.Create();
+  CreateImplicitConvCL(FModWeightsInter);
   ArmOpenCLForward();
 end;
 
@@ -46106,27 +46132,14 @@ end;
 // every forward because the style changes per sample.
 procedure TNNetModulatedConv2D.ComputeOpenCL();
 var
-  GatherSrcBuffer: cl_mem;
   BiasVol: TNNetVolume;
 begin
-  GatherSrcBuffer := nil;
-  if PrevOutputOnOpenCL() then
-  begin
-    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
-  end
-  else
-    FPrevLayer.ForceOutputOnRAM();
   FModWeightsInter.InterleaveWithXFrom(FModWeights, FModWeights.SizeX);
   if FSuppressBias = 0 then BiasVol := FNeurons[FOutChannels].FWeights
   else BiasVol := nil;
-  FDotCL.ComputeImplicitConv(FModWeightsInter, FPrevLayer.FOutput,
-    {OutSizeX}FOutput.SizeX, {RowSpan}FInChannels * FFeatureSize, {Stride}1,
-    {PaddingX}FFeatureSize shr 1, {PaddingY}FFeatureSize shr 1, {DilationX}1,
-    csActNone, {NewVAs}true, BiasVol, {NewVBias}true,
-    {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
+  ComputeImplicitConvOnOpenCL(FModWeightsInter, BiasVol, {NewWeights}true,
+    {RowSpan}FInChannels * FFeatureSize, {Stride}1, {PaddingX}FFeatureSize shr 1,
+    {PaddingY}FFeatureSize shr 1, {DilationX}1);
 end;
 {$ENDIF}
 
@@ -66020,8 +66033,8 @@ begin
   AfterWeightUpdate();
 end;
 
-{ TNNetCausalConv1D }
-constructor TNNetCausalConv1D.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0; pDilation: integer = 1);
+{ TNNetConv1DBase }
+constructor TNNetConv1DBase.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0; pDilation: integer = 1);
 begin
   inherited Create();
   FFeatureSize := Max(pFeatureSize, 1);
@@ -66034,7 +66047,7 @@ begin
   FStruct[5] := FDilation;
 end;
 
-destructor TNNetCausalConv1D.Destroy();
+destructor TNNetConv1DBase.Destroy();
 begin
   {$IFDEF OpenCL}
   FWeightsCL.Free;
@@ -66043,49 +66056,57 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetConv1DBase.InitDefault();
+begin
+  // He init, like the convolution layers.
+  InitHeUniform(1);
+end;
+
 {$IFDEF OpenCL}
-procedure TNNetCausalConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
+procedure TNNetConv1DBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   EnableNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
 end;
 
-procedure TNNetCausalConv1D.DisableOpenCL();
+procedure TNNetConv1DBase.DisableOpenCL();
 begin
   // A kept output lives in FDotCL's result buffer, which the inherited call frees.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
 end;
 
-function TNNetCausalConv1D.WillOpenCL(): boolean;
+function TNNetConv1DBase.WillOpenCL(): boolean;
 begin
   Result := WillNeuronImplicitConv(FWeightsCL);
 end;
 
-procedure TNNetCausalConv1D.ComputeOpenCL();
+procedure TNNetConv1DBase.ArmConv1DOpenCL();
+begin
+  FShouldOpenCL := (Int64(FOutput.Size) * FFeatureSize * FPrevLayer.FOutput.Depth >=
+    cNeuralOpenCLMinWork);
+  // The device GEMM is shaped by this layer's sizes: a re-wire re-arms it.
+  if FHasOpenCL and Assigned(FDotCL) then
+    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
+end;
+
+procedure TNNetConv1DBase.ComputeOpenCL();
 var
-  GatherSrcBuffer: cl_mem;
   BiasVol: TNNetVolume;
   WUpdated: boolean;
 begin
-  GatherSrcBuffer := nil;
-  if PrevOutputOnOpenCL() then
-  begin
-    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
-  end
-  else
-    FPrevLayer.ForceOutputOnRAM();
   WUpdated := RefreshNeuronImplicitConv(FWeightsCL, FBiasCL);
   if FSuppressBias = 0 then BiasVol := FBiasCL else BiasVol := nil;
-  FDotCL.ComputeImplicitConv(FWeightsCL, FPrevLayer.FOutput,
-    {OutSizeX}FOutput.SizeX, {RowSpan}FPrevLayer.FOutput.Depth * FFeatureSize,
-    {Stride}1, {PaddingX}FDilation * (FFeatureSize - 1), {PaddingY}0,
-    {DilationX}FDilation, csActNone, {NewVAs}WUpdated, BiasVol,
-    {NewVBias}WUpdated, {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
+  ComputeImplicitConvOnOpenCL(FWeightsCL, BiasVol, WUpdated,
+    {RowSpan}FPrevLayer.FOutput.Depth * FFeatureSize, {Stride}1,
+    {PaddingX}LeftPadding(), {PaddingY}0, {DilationX}FDilation);
 end;
 {$ENDIF}
+
+{ TNNetCausalConv1D }
+function TNNetCausalConv1D.LeftPadding(): integer;
+begin
+  Result := FDilation * (FFeatureSize - 1);
+end;
 
 procedure TNNetCausalConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
@@ -66102,12 +66123,7 @@ begin
   SetNumWeightsForAllNeurons(FFeatureSize, 1, InputDepth);
   InitDefault();
   AfterWeightUpdate();
-  {$IFDEF OpenCL}
-  FShouldOpenCL := (Int64(FOutput.Size) * FFeatureSize * InputDepth >= cNeuralOpenCLMinWork);
-  // The device GEMM is shaped by this layer's sizes: a re-wire re-arms it.
-  if FHasOpenCL and Assigned(FDotCL) then
-    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
-  {$ENDIF}
+  {$IFDEF OpenCL} ArmConv1DOpenCL(); {$ENDIF}
 end;
 
 procedure TNNetCausalConv1D.Compute();
@@ -66281,24 +66297,10 @@ begin
   if hasInputGrad then FPrevLayer.Backpropagate();
 end;
 
-procedure TNNetCausalConv1D.InitDefault();
-begin
-  // He init, like the convolution layers.
-  InitHeUniform(1);
-end;
-
 { TNNetTDNNConv1D }
-constructor TNNetTDNNConv1D.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0; pDilation: integer = 1);
+function TNNetTDNNConv1D.LeftPadding(): integer;
 begin
-  inherited Create();
-  FFeatureSize := Max(pFeatureSize, 1);
-  FDilation := Max(pDilation, 1);
-  FSuppressBias := pSuppressBias;
-  AddNeurons(pNumFeatures);
-  FStruct[0] := pNumFeatures;
-  FStruct[1] := FFeatureSize;
-  FStruct[4] := FSuppressBias;
-  FStruct[5] := FDilation;
+  Result := FDilation * (FFeatureSize shr 1);
 end;
 
 procedure TNNetTDNNConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -66317,6 +66319,7 @@ begin
   SetNumWeightsForAllNeurons(FFeatureSize, 1, InputDepth);
   InitDefault();
   AfterWeightUpdate();
+  {$IFDEF OpenCL} ArmConv1DOpenCL(); {$ENDIF}
 end;
 
 procedure TNNetTDNNConv1D.Compute();
@@ -66331,7 +66334,19 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
@@ -66447,11 +66462,6 @@ begin
   if (not FBatchUpdate) then AfterWeightUpdate();
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if hasInputGrad then FPrevLayer.Backpropagate();
-end;
-
-procedure TNNetTDNNConv1D.InitDefault();
-begin
-  InitHeUniform(1);
 end;
 
 { TNNetDepthwiseConv1D }
@@ -67282,30 +67292,17 @@ end;
 // is the frame-packed output volume as it is.
 procedure TNNetConvolution3D.ComputeOpenCL();
 var
-  GatherSrcBuffer: cl_mem;
   BiasVol: TNNetVolume;
   WUpdated: boolean;
   WindowDepth: integer;
 begin
-  GatherSrcBuffer := nil;
-  if PrevOutputOnOpenCL() then
-  begin
-    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
-  end
-  else
-    FPrevLayer.ForceOutputOnRAM();
   WUpdated := RefreshNeuronImplicitConv(FWeightsCL, FBiasCL);
   if FSuppressBias = 0 then BiasVol := FBiasCL else BiasVol := nil;
   WindowDepth := FFeatureSizeT * FChannels;
-  FDotCL.ComputeImplicitConv(FWeightsCL, FPrevLayer.FOutput,
-    {OutSizeX}FOutput.SizeX, {RowSpan}WindowDepth * FFeatureSizeXY, FStride,
-    {PaddingX}FPadding, {PaddingY}FPadding, {DilationX}1, csActNone,
-    {NewVAs}WUpdated, BiasVol, {NewVBias}WUpdated,
-    {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer, {OutFrames}FOutputT,
+  ComputeImplicitConvOnOpenCL(FWeightsCL, BiasVol, WUpdated,
+    {RowSpan}WindowDepth * FFeatureSizeXY, FStride, {PaddingX}FPadding,
+    {PaddingY}FPadding, {DilationX}1, {OutFrames}FOutputT,
     {FrameStep}FStrideT * FChannels, WindowDepth);
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
 end;
 {$ENDIF}
 
@@ -72929,6 +72926,7 @@ end;
 
 destructor TNNetSincConv1D.Destroy();
 begin
+  {$IFDEF OpenCL} FBankCL.Free; {$ENDIF}
   FBankSrc.Free;
   FGBank.Free;
   FGradS.Free;
@@ -72975,7 +72973,47 @@ begin
     FWindow.FData[n] := 0.54 - 0.46 * pcr_cosf(2 * Pi * n / (FKernelSize - 1));
   if half < 0 then half := 0; // half is re-derived where needed
   InitDefault();
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (Int64(FOutput.Size) * FKernelSize >= cNeuralOpenCLMinWork);
+  if FHasOpenCL and Assigned(FDotCL) then
+    ArmImplicitConv(FBankCL, FNumFilters, FKernelSize, FOutput.SizeX);
+  {$ENDIF}
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetSincConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  CreateImplicitConvCL(FBankCL);
+  ArmImplicitConv(FBankCL, FNumFilters, FKernelSize, FOutput.SizeX);
+end;
+
+procedure TNNetSincConv1D.DisableOpenCL();
+begin
+  // A kept output lives in FDotCL's result buffer, which the inherited call frees.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+end;
+
+function TNNetSincConv1D.WillOpenCL(): boolean;
+begin
+  Result := WillImplicitConv(FBankCL, FNumFilters, FKernelSize);
+end;
+
+// A (T,1,1) source is a depth-1 image: a KernelSize x 1 window with no padding.
+procedure TNNetSincConv1D.ComputeOpenCL();
+var
+  BankChanged: boolean;
+begin
+  BankChanged := MaterializeBankIfStale() or FAfterWeightUpdateHasBeenCalled;
+  if BankChanged then
+  begin
+    FBankCL.InterleaveWithDepthFrom(FBank, FNumFilters);
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
+  ComputeImplicitConvOnOpenCL(FBankCL, nil, BankChanged,
+    {RowSpan}FKernelSize, FStride, {PaddingX}0, {PaddingY}0, {DilationX}1);
+end;
+{$ENDIF}
 
 // SincFn(x) = sin(x)/x with the removable singularity sinc(0)=1.
 function SincConvSinc(x: TNeuralFloat): TNeuralFloat;
@@ -73024,7 +73062,7 @@ end;
 // Rebuilds the filter bank only when the (low,band) scalars it was built from
 // changed. The check is 2*NumFilters float compares; the rebuild it skips is
 // 2*NumFilters*KernelSize sin/divide evaluations.
-procedure TNNetSincConv1D.MaterializeBankIfStale();
+function TNNetSincConv1D.MaterializeBankIfStale(): boolean;
 var
   W: TNNetVolume;
   i, WSize, WSizeM1: integer;
@@ -73033,6 +73071,7 @@ begin
   W := FNeurons[0].FWeights;
   WSize := W.Size;
   stale := (not FBankValid) or (FBankSrc.Size <> WSize);
+  Result := false;
   if not stale then
   begin
     WSizeM1 := WSize - 1;
@@ -73050,6 +73089,7 @@ begin
   MaterializeBank();
   Move(W.FData[0], FBankSrc.FData[0], WSize * csNeuralFloatSize);
   FBankValid := true;
+  Result := true;
 end;
 
 procedure TNNetSincConv1D.Compute();
@@ -73062,7 +73102,19 @@ var
   XPtr, BankPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   MaterializeBankIfStale();
   Prev := FPrevLayer.FOutput;
   XPtr := Prev.GetRawPtr(0, 0);
@@ -142598,16 +142650,11 @@ begin
   end;
 end;
 
-procedure TNNetLayer.ArmNeuronImplicitConv(WeightsInter, Bias: TNNetVolume;
-  PositionCount: integer);
-var
-  TapCount: integer;
+procedure TNNetLayer.ArmImplicitConv(WeightsInter: TNNetVolume;
+  RowCount, TapCount, PositionCount: integer);
 begin
-  if (FNeurons.Count = 0) or (PositionCount = 0) then exit;
-  TapCount := FNeurons[0].Weights.Size;
-  if TapCount = 0 then exit;
-  WeightsInter.ReSize(TapCount, 1, FNeurons.Count);
-  Bias.ReSize(FNeurons.Count, 1, 1);
+  if (RowCount = 0) or (TapCount = 0) or (PositionCount = 0) then exit;
+  WeightsInter.ReSize(TapCount, 1, RowCount);
   // PrepareForCompute releases the result buffer a resident output lives in.
   FOutputOnOpenCL := false;
   FDotCL.PrepareForCompute(WeightsInter, PositionCount, TapCount);
@@ -142615,8 +142662,7 @@ begin
   FAfterWeightUpdateHasBeenCalled := true;
 end;
 
-procedure TNNetLayer.EnableNeuronImplicitConv(var WeightsInter,
-  Bias: TNNetVolume; PositionCount: integer);
+procedure TNNetLayer.CreateImplicitConvCL(var WeightsInter: TNNetVolume);
 begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
@@ -142625,16 +142671,62 @@ begin
     FDotCL.HideMessages();
   end;
   if not Assigned(WeightsInter) then WeightsInter := TNNetVolume.Create();
+end;
+
+function TNNetLayer.WillImplicitConv(WeightsInter: TNNetVolume;
+  RowCount, TapCount: integer): boolean;
+begin
+  Result := Assigned(FDotCL) and FHasOpenCL and (not FIsTrainable) and
+    FDotCL.ImplicitConvReady and (RowCount > 0) and
+    (WeightsInter.Size = TapCount * RowCount) and
+    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetLayer.ComputeImplicitConvOnOpenCL(WeightsInter,
+  Bias: TNNetVolume; NewWeights: boolean; RowSpan, Stride, PaddingX, PaddingY,
+  DilationX: integer; OutFrames: integer; FrameStep: integer;
+  WindowDepth: integer);
+var
+  GatherSrcBuffer: cl_mem;
+begin
+  GatherSrcBuffer := nil;
+  if PrevOutputOnOpenCL() then
+  begin
+    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+    FPrevLayer.ForceOutputOnRAM();
+  FDotCL.ComputeImplicitConv(WeightsInter, FPrevLayer.FOutput, FOutput.SizeX,
+    RowSpan, Stride, PaddingX, PaddingY, DilationX, csActNone,
+    {NewVAs}NewWeights, Bias, {NewVBias}NewWeights,
+    {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer, OutFrames, FrameStep,
+    WindowDepth);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetLayer.ArmNeuronImplicitConv(WeightsInter, Bias: TNNetVolume;
+  PositionCount: integer);
+begin
+  if FNeurons.Count = 0 then exit;
+  Bias.ReSize(FNeurons.Count, 1, 1);
+  ArmImplicitConv(WeightsInter, FNeurons.Count, FNeurons[0].Weights.Size,
+    PositionCount);
+end;
+
+procedure TNNetLayer.EnableNeuronImplicitConv(var WeightsInter,
+  Bias: TNNetVolume; PositionCount: integer);
+begin
+  CreateImplicitConvCL(WeightsInter);
   if not Assigned(Bias) then Bias := TNNetVolume.Create();
   ArmNeuronImplicitConv(WeightsInter, Bias, PositionCount);
 end;
 
 function TNNetLayer.WillNeuronImplicitConv(WeightsInter: TNNetVolume): boolean;
 begin
-  Result := Assigned(FDotCL) and FHasOpenCL and (not FIsTrainable) and
-    FDotCL.ImplicitConvReady and (FNeurons.Count > 0) and
-    (WeightsInter.Size = FNeurons[0].Weights.Size * FNeurons.Count) and
-    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+  Result := (FNeurons.Count > 0) and
+    WillImplicitConv(WeightsInter, FNeurons.Count, FNeurons[0].Weights.Size);
 end;
 
 function TNNetLayer.RefreshNeuronImplicitConv(WeightsInter,

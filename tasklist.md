@@ -2016,11 +2016,12 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
       across groups if it shows up on the GPU box.
-- [ ] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
-      segmentation frontend and the ECAPA-TDNN trunk. Both are convolutions
-      whose kernel is generated (sinc band-pass) or dilated, so the existing
-      conv offload applies once the kernel slab is materialized; the closest
-      thing to a free win on the audio side.
+- [X] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
+      segmentation frontend and the ECAPA-TDNN trunk. Both run
+      `cai_conv_implicit`: TDNN shares `TNNetConv1DBase` with
+      `TNNetCausalConv1D` (left padding `Dilation*(K div 2)` instead of
+      `Dilation*(K-1)`); SincConv1D convolves its materialized `FBank`, re-laid
+      out k-major and uploaded only when the bank was rebuilt. Not timed on a GPU.
 - [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN). Not a gather copy: it needs a
       new kernel (per-channel softmax over time, then the two weighted moments)
       reading two sources, the features and `FLogitLayer`. It runs once per
