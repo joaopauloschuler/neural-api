@@ -2066,6 +2066,32 @@ cannot pay for its own transfer.
 
 ## Layer follow-ups that fix real limitations
 
+- [ ] Convolution training on OpenCL that pays for itself. Today a CNN trains
+      on the CPU even under OpenCL (examples/SimpleImageClassifierGPU,
+      VisualGAN, UNetSegmentation, VQGAN): `TNNetConvolution.BackpropagateOpenCL`
+      exists (two device GEMMs: weight grad and input grad) but its call in
+      `TNNetConvolution.Backpropagate` was commented out as "too slow" in
+      37022401, and `BackpropagatePointwiseOpenCL` has no caller. The cost is
+      the transfers, not the GEMMs: every backward computes OED on the host,
+      re-lays out OED, the im2col patches and W^T on the host, uploads all
+      three, downloads both results, and scatters the input gradient (col2im)
+      on the host. Also, `ShouldBindPrevOutputOnOpenCL` refuses a trainable
+      layer, so the training forward downloads every activation too.
+      Plan, each step with a PoCL exact-vs-CPU gradient test (tolerance from
+      docs/layer-authoring.md §3): (1) measure first, on the GPU box: per-layer
+      backward time of SimpleImageClassifierGPU with the commented block
+      re-enabled vs `BackpropagateFastTiledCPU`, split into upload/GEMM/download;
+      (2) keep the forward im2col and `FOutputRaw` resident for the backward,
+      compute OED on the device (activation-derivative opcode times the error)
+      and bind it as the GEMM A operand; (3) a `cai_col2im` scatter kernel so
+      the input gradient stays resident and the previous layer's backward binds
+      it; (4) accumulate the weight delta on the device and download it once per
+      `UpdateWeights`, not once per sample. Same route for `TNNetFullConnect`
+      (whose `BackpropagateOpenCL` is live but uploads per call). Out of scope
+      until (1)-(4) pay: `TNNetDepthwiseConv` / `TNNetDeconvolution` backward
+      (both CPU-only today) and the "a device backward is a separate project"
+      line under "OpenCL forward coverage", which is stale once this lands.
+
 - [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
       (the even/odd split trick) to halve the row cost. Low priority: the FFTs
       are small next to LaMa's convolutions; do it only if a profile shows them.
