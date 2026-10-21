@@ -154,6 +154,7 @@ follow:
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/upscale FILE` | upscale the next images with this Real-ESRGAN checkpoint, as `--upscale`; `/upscale` alone shows the current one, `/upscale off` stops upscaling |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
+| `/fbc X\|off` | First-Block Cache threshold for the next images, as `--fbc-threshold`; `/fbc` alone shows it, `/fbc off` (or `/fbc 0`) turns it off |
 | `/profile on\|off` | `--profile` from the next image |
 | `/stats on\|off` | `--stats` from the next image |
 | `/quit` | end the session |
@@ -511,6 +512,58 @@ a GPU yet.
 With `--stats`, the stage table gets an `upscale` row with the device, the
 output size and the net input size.
 
+### First-Block Cache (`--fbc-threshold X`)
+
+`--fbc-threshold X` (or `/fbc X` in the REPL) skips most of the transformer
+on steps where little changes. It is a port of diffusers'
+`apply_first_block_cache` (`hooks/first_block_cache.py`). Each step runs
+`img_in` and transformer block 0, then compares block 0's residual (its
+output minus its input) with the residual of the last step that ran every
+block:
+
+    change = mean |r - r_prev| / mean |r_prev|
+
+When `change` is at most X, the step skips blocks 1 to N-1. It adds the
+residual those blocks produced on the last full step (last block output
+minus block 0 output) to block 0's output, and runs `norm_out` and
+`proj_out` on the sum. When `change` is above X, the step runs every block
+and refreshes both residuals. The first step of every image always runs
+every block. A skipped step does not refresh `r_prev`, so the comparison
+stays against the last full step and the skips cannot drift without bound.
+
+```
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --fbc-threshold 0.1 \
+  -p "a lighthouse on a cliff at dusk"
+```
+
+The trade-off:
+
+- **Speed.** A skipped step costs `img_in`, one block and `norm_out` +
+  `proj_out` instead of all N blocks, so the denoise time falls about in
+  proportion to the skipped steps. With `--stats`, the `denoise` row shows
+  how many steps skipped (`k with blocks 1..N-1 skipped (FBC)`). diffusers
+  and ParaAttention report 1.5x to 2x per image at thresholds 0.05 to 0.12
+  on other DiT models. Speed-ups for Qwen-Image-2.1 have not been measured
+  yet; the pico checkpoint in the tests is too small to time.
+- **Quality.** A skipped step reuses an older residual, so a higher
+  threshold skips more steps and can lose fine detail or shift colours and
+  composition. diffusers' default is 0.05. The quality at each threshold has
+  not been checked on Qwen-Image-2.1 yet: compare the same seed with and
+  without the option.
+- **Memory.** Three host buffers of (image tokens x hidden) floats each,
+  with 4096 image tokens at 1024x1024.
+- **OpenCL.** The comparison and the residual add run on the CPU: every
+  step downloads `img_in`'s and block 0's outputs, a full step also
+  downloads the last block's output, and a skipped step uploads the sum.
+  That is three transfers of (image tokens x hidden) floats per step, small
+  next to a step's time; a device-side version is open in `tasklist.md`.
+
+`0` (the default) turns it off: every step runs every block, exactly as
+without the option. The pipeline property is
+`TQwenImage21Pipeline.FirstBlockCacheThreshold`; the cache itself is
+`TDiTFirstBlockCache` in `neural/neuralpretrained.pas`, written so other
+DiT pipelines can reuse it.
+
 ## Options
 
 `QwenImage --help` prints this list.
@@ -558,6 +611,7 @@ and `--fp32`, the last one given wins.
 | `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 (1 with `--outpaint`) |
 | `--upscale FILE` | upscale each image with this Real-ESRGAN / ESRGAN RRDBNet checkpoint before the save; see [Upscaling](#upscaling---upscale-file) | off |
 | `--upscale-tile N` | upscaler tile in input pixels, 0 = the whole image; each tile adds 10 context pixels per side | 32 |
+| `--fbc-threshold X` | First-Block Cache: skip transformer blocks 1..N-1 on steps whose block-0 residual changed by at most X; see [First-Block Cache](#first-block-cache---fbc-threshold-x) | 0 (off) |
 | `--repeat N` | with `-p` or `--token-ids`: N images (1..1000) with seeds `--seed`, `--seed`+1, ...; the text encoder runs once. N > 1 keeps every component loaded, as the REPL does, and numbers the files like the REPL (`qwenimage_0001.png`, ...). An error ends the run | 1 |
 
 An image of W x H pixels has (W/16) x (H/16) image tokens: 4096 at
@@ -758,4 +812,8 @@ pipeline with one and two condition images.
 `TestRRDBNetUpscalerMatchesRRDBNetUpscale` checks the `--upscale` code
 (`TRRDBNetUpscaler`) against a direct `RRDBNetUpscale` on a tiled pico image,
 for RGB and for RGBA with a bilinear alpha. `TestRRDBNetUpscalerOpenCL`
-checks it on OpenCL against the CPU.
+checks it on OpenCL against the CPU. `TestDiTFirstBlockCacheDecision` and
+`TestQwenImage21FirstBlockCache*` check the First-Block Cache against a
+plain-loop reference: threshold 0 gives the same latents bit for bit, and a
+threshold that skips some steps gives the reference's skip pattern and
+latents, on the CPU and on OpenCL. No diffusers oracle covers it yet.

@@ -984,6 +984,15 @@ type
     procedure TestQwenImage21PipelineKeepLoaded;
     procedure TestQwenImage21PipelineUnloadComponents;
     procedure TestQwenImage21PipelineImageStats;
+    // TDiTFirstBlockCache on synthetic volumes against plain loops: decision,
+    // the reference residual a skip keeps, the tail add, misuse refusals.
+    procedure TestDiTFirstBlockCacheDecision;
+    // First-Block Cache on the pico pipeline against a plain-loop reference:
+    // threshold 0 bit-identical, a skipping threshold's pattern and latents.
+    procedure TestQwenImage21FirstBlockCacheReference;
+    // The same skipping threshold with the int8 step pass on OpenCL and on
+    // the CPU: same skip count, latents within 1e-4.
+    procedure TestQwenImage21FirstBlockCacheOpenCL;
     procedure TestQwenImage21LanczosResizeVsPIL;
     procedure TestQwenImage21PrepareVaeImage;
     procedure TestQwenImage21SizeForAspect;
@@ -34762,6 +34771,446 @@ begin
     Pipeline.Free;
   end;
 end;
+
+procedure TTestNeuralPretrained.TestDiTFirstBlockCacheDecision;
+const
+  // Odd and above csMinAvxSize: the AVX body and its scalar tail both run.
+  ValueCount = 37;
+  Threshold = 0.1;
+var
+  Cache: TDiTFirstBlockCache;
+  HeadInput, HeadOutput, TailOutput, FirstResidual, FirstTail,
+    Expected: TNNetVolume;
+  ValuePos: integer;
+  SumDiff, SumPrev: double;
+  Refused: boolean;
+
+  // Head output = input + base residual * (1 + Scale * sin(i)).
+  procedure SetHead(Scale: double);
+  var
+    I: integer;
+  begin
+    for I := 0 to ValueCount - 1 do
+    begin
+      HeadInput.FData[I] := 0.25 * Cos(I);
+      HeadOutput.FData[I] := HeadInput.FData[I] +
+        (0.5 + 0.01 * I) * (1 + Scale * Sin(I));
+    end;
+  end;
+
+  // Plain-loop mean|r - FirstResidual| / mean|FirstResidual|.
+  function ReferenceRatio(): double;
+  var
+    I: integer;
+  begin
+    SumDiff := 0;
+    SumPrev := 0;
+    for I := 0 to ValueCount - 1 do
+    begin
+      SumDiff := SumDiff + Abs(HeadOutput.FData[I] - HeadInput.FData[I] -
+        FirstResidual.FData[I]);
+      SumPrev := SumPrev + Abs(FirstResidual.FData[I]);
+    end;
+    Result := SumDiff / SumPrev;
+  end;
+
+begin
+  Cache := TDiTFirstBlockCache.Create();
+  HeadInput := TNNetVolume.Create(ValueCount, 1, 1);
+  HeadOutput := TNNetVolume.Create(ValueCount, 1, 1);
+  TailOutput := TNNetVolume.Create(ValueCount, 1, 1);
+  FirstResidual := TNNetVolume.Create(ValueCount, 1, 1);
+  FirstTail := TNNetVolume.Create(ValueCount, 1, 1);
+  Expected := TNNetVolume.Create(ValueCount, 1, 1);
+  try
+    AssertFalse('threshold 0 is off', Cache.Enabled);
+    Cache.Threshold := Threshold;
+    AssertTrue('threshold > 0 is on', Cache.Enabled);
+    Refused := false;
+    try
+      Cache.ApplyTailResidual(HeadOutput);
+    except
+      on Exception do Refused := true;
+    end;
+    AssertTrue('no tail residual before a computed step', Refused);
+
+    // Step 1: always runs the remaining blocks.
+    SetHead(0);
+    for ValuePos := 0 to ValueCount - 1 do
+    begin
+      FirstResidual.FData[ValuePos] := HeadOutput.FData[ValuePos] -
+        HeadInput.FData[ValuePos];
+      TailOutput.FData[ValuePos] := 2 * HeadOutput.FData[ValuePos] - 1;
+      FirstTail.FData[ValuePos] := TailOutput.FData[ValuePos] -
+        HeadOutput.FData[ValuePos];
+    end;
+    AssertTrue('first step runs', Cache.ShouldRunRemainingBlocks(HeadInput,
+      HeadOutput));
+    AssertEquals('first step has no ratio', -1, Cache.LastRelativeDiff, 0);
+    Refused := false;
+    try
+      Cache.ApplyTailResidual(HeadOutput);
+    except
+      on Exception do Refused := true;
+    end;
+    AssertTrue('apply refused while the tail is pending', Refused);
+    Cache.StoreTailResidual(TailOutput);
+    Refused := false;
+    try
+      Cache.StoreTailResidual(TailOutput);
+    except
+      on Exception do Refused := true;
+    end;
+    AssertTrue('a second store is refused', Refused);
+
+    // Step 2: a 5% change skips; the output gets step 1's tail residual.
+    SetHead(0.05);
+    AssertFalse('small change skips', Cache.ShouldRunRemainingBlocks(
+      HeadInput, HeadOutput));
+    AssertEquals('step 2 ratio', ReferenceRatio(), Cache.LastRelativeDiff,
+      1e-5);
+    for ValuePos := 0 to ValueCount - 1 do
+      Expected.FData[ValuePos] := HeadOutput.FData[ValuePos] +
+        FirstTail.FData[ValuePos];
+    Cache.ApplyTailResidual(HeadOutput);
+    AssertEquals('tail added', 0, MaxAbsVolumeDiff(HeadOutput, Expected),
+      1e-6);
+
+    // Step 3: compared with step 1's residual, not step 2's (a skip keeps
+    // the reference): 0.09 vs step 1 skips although it is 0.04 off step 2.
+    SetHead(0.09);
+    AssertFalse('still under the threshold against step 1',
+      Cache.ShouldRunRemainingBlocks(HeadInput, HeadOutput));
+    AssertEquals('step 3 ratio against step 1', ReferenceRatio(),
+      Cache.LastRelativeDiff, 1e-5);
+    // Step 4: 0.3 off step 1 runs and becomes the new reference.
+    SetHead(0.3);
+    AssertTrue('large change runs', Cache.ShouldRunRemainingBlocks(
+      HeadInput, HeadOutput));
+    AssertEquals('step 4 ratio', ReferenceRatio(), Cache.LastRelativeDiff,
+      1e-5);
+    AssertTrue('step 4 ratio above the threshold',
+      Cache.LastRelativeDiff > Threshold);
+    Cache.StoreTailResidual(TailOutput);
+    AssertEquals('steps', 4, Cache.StepCount);
+    AssertEquals('skipped', 2, Cache.SkippedStepCount);
+    SetHead(0.3);
+    AssertFalse('same residual as the reference skips',
+      Cache.ShouldRunRemainingBlocks(HeadInput, HeadOutput));
+    AssertEquals('identical residual: ratio 0', 0, Cache.LastRelativeDiff,
+      1e-7);
+
+    Cache.Reset();
+    AssertEquals('reset steps', 0, Cache.StepCount);
+    AssertEquals('reset skips', 0, Cache.SkippedStepCount);
+    AssertTrue('first step after Reset runs',
+      Cache.ShouldRunRemainingBlocks(HeadInput, HeadOutput));
+  finally
+    Expected.Free;
+    FirstTail.Free;
+    FirstResidual.Free;
+    TailOutput.Free;
+    HeadOutput.Free;
+    HeadInput.Free;
+    Cache.Free;
+  end;
+end;
+
+// Fixed initial latents from a formula: the RNG save/restore of
+// MakeInitialLatents would change the RandSeed state later tests start from.
+procedure FillFirstBlockCacheLatents(Pipeline: TQwenImage21Pipeline;
+  ImageSide: integer; Latents: TNNetVolume);
+var
+  ValuePos: integer;
+begin
+  Latents.ReSize(Sqr(ImageSide div csQwenImage21PixelsPerLatent), 1,
+    Pipeline.TransformerConfig.InChannels);
+  for ValuePos := 0 to Latents.Size - 1 do
+    Latents.FData[ValuePos] := 1.2 * Sin(0.7 * ValuePos + 0.3) +
+      0.4 * Cos(1.9 * ValuePos);
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21FirstBlockCacheReference;
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  ImageSide = 64;
+  GridH = ImageSide div csQwenImage21PixelsPerLatent;
+  GridW = GridH;
+  StepCount = 8;
+  // The pico's random weights change block 0's residual by ~100% a step
+  // (printed ratios), so its skipping threshold is near 1, not 0.05..0.2.
+  SkipThreshold = 1.0;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Initial, LatentsOff, LatentsTiny, LatentsSkip, LatentsReference,
+    LatentsPredict, Velocity, Residual, PrevResidual, HeadCopy,
+    TailResidual: TNNetVolume;
+  ReferencePattern, PredictPattern, RatioText: string;
+  SkipCount: integer;
+  Diff: double;
+
+  // The denoise loop with a plain-loop First-Block Cache (0 = off) over the
+  // transformer's step parts; Pattern gets R (ran) or S (skipped) per step.
+  procedure RunReference(Threshold: double; Latents: TNNetVolume;
+    out Pattern: string);
+  var
+    StepPos, ValuePos, MaxValuePos, MaxBlockPos: integer;
+    HeadInput, HeadOutput, TailOutput: TNNetLayer;
+    SumDiff, SumPrev, Ratio: double;
+    HasPrev, RunsRemaining: boolean;
+  begin
+    Pattern := '';
+    RatioText := '';
+    HasPrev := false;
+    MaxBlockPos := Transformer.Config.NumLayers - 1;
+    Transformer.EncodePrefix(Embeds);
+    Pipeline.Scheduler.SetTimesteps(StepCount,
+      Pipeline.Scheduler.ShiftForImageSeqLen(GridH * GridW));
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      Transformer.BeginVelocityStep(Latents, Pipeline.Scheduler.Sigma[StepPos],
+        GridH, GridW);
+      Transformer.RunStepBlocks(0, 0);
+      HeadInput := Transformer.ImageInNet.GetLastLayer();
+      HeadOutput := Transformer.StepNet.GetLastLayer();
+      HeadInput.ForceOutputOnRAM();
+      HeadOutput.ForceOutputOnRAM();
+      MaxValuePos := HeadOutput.Output.Size - 1;
+      Residual.ReSize(HeadOutput.Output);
+      for ValuePos := 0 to MaxValuePos do
+        Residual.FData[ValuePos] := HeadOutput.Output.FData[ValuePos] -
+          HeadInput.Output.FData[ValuePos];
+      RunsRemaining := true;
+      if (Threshold > 0) and HasPrev then
+      begin
+        SumDiff := 0;
+        SumPrev := 0;
+        for ValuePos := 0 to MaxValuePos do
+        begin
+          SumDiff := SumDiff + Abs(Residual.FData[ValuePos] -
+            PrevResidual.FData[ValuePos]);
+          SumPrev := SumPrev + Abs(PrevResidual.FData[ValuePos]);
+        end;
+        Ratio := SumDiff / SumPrev;
+        RatioText := RatioText + ' ' + FloatToStrF(Ratio, ffFixed, 6, 4);
+        // A ratio near the threshold could flip between kernels.
+        AssertTrue('ratio ' + FloatToStr(Ratio) + ' clear of the threshold',
+          Abs(Ratio - Threshold) > 0.01 * Threshold);
+        RunsRemaining := Ratio > Threshold;
+      end;
+      if RunsRemaining then
+      begin
+        HeadCopy.Copy(HeadOutput.Output);
+        Transformer.RunStepBlocks(1, MaxBlockPos);
+        TailOutput := Transformer.StepNet.GetLastLayer();
+        TailOutput.ForceOutputOnRAM();
+        TailResidual.ReSize(HeadCopy);
+        for ValuePos := 0 to MaxValuePos do
+          TailResidual.FData[ValuePos] := TailOutput.Output.FData[ValuePos] -
+            HeadCopy.FData[ValuePos];
+        PrevResidual.Copy(Residual);
+        HasPrev := true;
+        Pattern := Pattern + 'R';
+      end
+      else
+      begin
+        for ValuePos := 0 to MaxValuePos do
+          HeadOutput.Output.FData[ValuePos] :=
+            HeadOutput.Output.FData[ValuePos] + TailResidual.FData[ValuePos];
+        HeadOutput.MarkOutputWrittenOnRAM();
+        Pattern := Pattern + 'S';
+      end;
+      Transformer.FinishVelocityStep(Velocity);
+      Pipeline.Scheduler.Step(Latents, Velocity, StepPos);
+    end;
+    Transformer.ReleasePasses();
+  end;
+
+  // The same loop through PredictVelocity with the transformer's cache.
+  procedure RunPredictVelocity(Threshold: double; Latents: TNNetVolume;
+    out Pattern: string);
+  var
+    StepPos, SkippedBefore: integer;
+  begin
+    Pattern := '';
+    Transformer.FirstBlockCache.Threshold := Threshold;
+    Transformer.FirstBlockCache.Reset();
+    Transformer.EncodePrefix(Embeds);
+    Pipeline.Scheduler.SetTimesteps(StepCount,
+      Pipeline.Scheduler.ShiftForImageSeqLen(GridH * GridW));
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      SkippedBefore := Transformer.FirstBlockCache.SkippedStepCount;
+      Transformer.PredictVelocity(Latents, Pipeline.Scheduler.Sigma[StepPos],
+        GridH, GridW, Velocity);
+      if Transformer.FirstBlockCache.SkippedStepCount > SkippedBefore
+        then Pattern := Pattern + 'S'
+        else Pattern := Pattern + 'R';
+      Pipeline.Scheduler.Step(Latents, Velocity, StepPos);
+    end;
+    Transformer.ReleasePasses();
+    Transformer.FirstBlockCache.Threshold := 0;
+  end;
+
+  procedure RunPipeline(Threshold: double; Latents: TNNetVolume);
+  begin
+    Pipeline.FirstBlockCacheThreshold := Threshold;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Latents);
+  end;
+
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  LatentsOff := TNNetVolume.Create;
+  LatentsTiny := TNNetVolume.Create;
+  LatentsSkip := TNNetVolume.Create;
+  LatentsReference := TNNetVolume.Create;
+  LatentsPredict := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  Residual := TNNetVolume.Create;
+  PrevResidual := TNNetVolume.Create;
+  HeadCopy := TNNetVolume.Create;
+  TailResidual := TNNetVolume.Create;
+  try
+    Pipeline.LoadComponents();
+    Transformer := Pipeline.LoadedTransformer;
+    Pipeline.EncodeTokenIds(TokenIds, 5, Embeds);
+    FillFirstBlockCacheLatents(Pipeline, ImageSide, Initial);
+    AssertEquals('the default is off', 0, Pipeline.FirstBlockCacheThreshold,
+      0);
+
+    RunPipeline(0, LatentsOff);
+    AssertEquals('off: nothing skipped', 0,
+      Pipeline.ImageStats.SkippedStepCount);
+    LatentsReference.Copy(Initial);
+    RunReference(0, LatentsReference, ReferencePattern);
+    AssertEquals('off: the plain loop', 0, MaxAbsVolumeDiff(LatentsOff,
+      LatentsReference), 0);
+    // On but never under the threshold: the host round trips change nothing.
+    RunPipeline(1e-30, LatentsTiny);
+    AssertEquals('tiny threshold: nothing skipped', 0,
+      Pipeline.ImageStats.SkippedStepCount);
+    AssertEquals('tiny threshold: bit-identical to off', 0,
+      MaxAbsVolumeDiff(LatentsOff, LatentsTiny), 0);
+
+    LatentsReference.Copy(Initial);
+    RunReference(SkipThreshold, LatentsReference, ReferencePattern);
+    WriteLn('  Qwen-Image-2.1 First-Block Cache at ', SkipThreshold:0:3,
+      ': pattern ', ReferencePattern, ', ratios', RatioText);
+    SkipCount := Length(ReferencePattern) - Length(StringReplace(
+      ReferencePattern, 'S', '', [rfReplaceAll]));
+    AssertTrue('some steps skipped: ' + ReferencePattern, SkipCount > 0);
+    AssertTrue('a step after the first runs: ' + ReferencePattern,
+      Pos('R', Copy(ReferencePattern, 2, MaxInt)) > 0);
+    LatentsPredict.Copy(Initial);
+    RunPredictVelocity(SkipThreshold, LatentsPredict, PredictPattern);
+    AssertEquals('PredictVelocity skip pattern', ReferencePattern,
+      PredictPattern);
+    RunPipeline(SkipThreshold, LatentsSkip);
+    AssertEquals('pipeline skipped steps', SkipCount,
+      Pipeline.ImageStats.SkippedStepCount);
+    Diff := MaxAbsVolumeDiff(LatentsSkip, LatentsReference);
+    AssertTrue('skipping latents max|diff| ' + FloatToStr(Diff) +
+      ' vs the plain loop must be < 1e-5', Diff < 1e-5);
+    AssertEquals('PredictVelocity latents', 0, MaxAbsVolumeDiff(LatentsSkip,
+      LatentsPredict), 0);
+    AssertTrue('skipping changed the latents',
+      MaxAbsVolumeDiff(LatentsSkip, LatentsOff) > 1e-4);
+  finally
+    TailResidual.Free;
+    HeadCopy.Free;
+    PrevResidual.Free;
+    Residual.Free;
+    Velocity.Free;
+    LatentsPredict.Free;
+    LatentsReference.Free;
+    LatentsSkip.Free;
+    LatentsTiny.Free;
+    LatentsOff.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwenImage21FirstBlockCacheOpenCL;
+{$IFDEF OpenCL}
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  ImageSide = 64;
+  StepCount = 8;
+  SkipThreshold = 1.0;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Embeds, Initial, LatentsCPU, LatentsOpenCL: TNNetVolume;
+  SkippedCPU, SkippedOpenCL: integer;
+  Diff: double;
+
+  procedure RunPipeline(OnOpenCL: boolean; Latents: TNNetVolume;
+    out SkippedStepCount: integer);
+  var
+    Pipeline: TQwenImage21Pipeline;
+  begin
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    try
+      Pipeline.TransformerFormat := qiwInt8;
+      if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+      Pipeline.LoadComponents();
+      AssertTrue('transformer on OpenCL = ' + BoolToStr(OnOpenCL, true),
+        Pipeline.TransformerOnOpenCL = OnOpenCL);
+      if Embeds.Size <= 1 then
+      begin
+        Pipeline.EncodeTokenIds(TokenIds, 5, Embeds);
+        FillFirstBlockCacheLatents(Pipeline, ImageSide, Initial);
+      end;
+      Pipeline.FirstBlockCacheThreshold := SkipThreshold;
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Latents);
+      SkippedStepCount := Pipeline.ImageStats.SkippedStepCount;
+    finally
+      Pipeline.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  LatentsCPU := TNNetVolume.Create;
+  LatentsOpenCL := TNNetVolume.Create;
+  try
+    RunPipeline(false, LatentsCPU, SkippedCPU);
+    RunPipeline(true, LatentsOpenCL, SkippedOpenCL);
+    AssertTrue('the CPU run skipped steps', SkippedCPU > 0);
+    AssertEquals('same skipped steps on OpenCL', SkippedCPU, SkippedOpenCL);
+    Diff := MaxAbsVolumeDiff(LatentsCPU, LatentsOpenCL);
+    WriteLn('  Qwen-Image-2.1 First-Block Cache OpenCL vs CPU: ', SkippedCPU,
+      ' of ', StepCount, ' steps skipped, max|diff|=', Diff:0:9);
+    AssertTrue('max|diff| ' + FloatToStr(Diff) + ' must be < 1e-4',
+      Diff < 1e-4);
+  finally
+    LatentsOpenCL.Free;
+    LatentsCPU.Free;
+    Initial.Free;
+    Embeds.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
 var

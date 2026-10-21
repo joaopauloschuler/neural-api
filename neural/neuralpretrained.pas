@@ -9374,6 +9374,50 @@ procedure QwenImage21SetRopePositions(NN: TNNet;
   const PosF, PosH, PosW: array of integer);
 
 type
+  // First-Block Cache for a DiT denoise loop (diffusers hooks/
+  // first_block_cache.py). Per step the caller runs block 0, asks
+  // ShouldRunRemainingBlocks, then either runs the other blocks and calls
+  // StoreTailResidual with the last block's output, or skips them and calls
+  // ApplyTailResidual on block 0's output. Only the residuals of the last
+  // fully computed step are kept, as diffusers does. Coded by Claude (AI).
+  TDiTFirstBlockCache = class(TObject)
+  private
+    FThreshold: TNeuralFloat;
+    // Block 0's residual of this step, and of the last fully computed step.
+    FResidual, FHeadResidual: TNNetVolume;
+    FHeadResidualSumAbs: TNeuralFloat;
+    // Block 0's output minus the last block's output of the last fully
+    // computed step (block 0's output alone until StoreTailResidual).
+    FHeadMinusTail: TNNetVolume;
+    FHasHeadResidual, FHasTailResidual, FIsTailPending: boolean;
+    FStepCount, FSkippedStepCount: integer;
+    FLastRelativeDiff: TNeuralFloat;
+    function GetEnabled(): boolean;
+  public
+    constructor Create(pThreshold: TNeuralFloat = 0);
+    destructor Destroy(); override;
+    // Forgets both residuals and the counts; the buffers keep their size.
+    procedure Reset();
+    // Shrinks the three buffers to one element (the next step resizes them).
+    procedure ReleaseBuffers();
+    // r = HeadOutput - HeadInput. True on the first step after Reset or when
+    // mean|r - r_prev| / mean|r_prev| > Threshold; true keeps r as r_prev.
+    function ShouldRunRemainingBlocks(HeadInput,
+      HeadOutput: TNNetVolume): boolean;
+    // After ShouldRunRemainingBlocks = true: keeps TailOutput - HeadOutput.
+    procedure StoreTailResidual(TailOutput: TNNetVolume);
+    // After ShouldRunRemainingBlocks = false: HeadOutput += the kept residual.
+    procedure ApplyTailResidual(HeadOutput: TNNetVolume);
+    // 0 = off: the caller runs every block and never asks.
+    property Threshold: TNeuralFloat read FThreshold write FThreshold;
+    property Enabled: boolean read GetEnabled;
+    // ShouldRunRemainingBlocks calls since Reset, and how many said false.
+    property StepCount: integer read FStepCount;
+    property SkippedStepCount: integer read FSkippedStepCount;
+    // The ratio the last ShouldRunRemainingBlocks compared (-1: first step).
+    property LastRelativeDiff: TNeuralFloat read FLastRelativeDiff;
+  end;
+
   // Storage of the blocks' Linear weights; norms and the head nets stay FP32.
   TQwenImage21WeightFormat = (qiwFP32, qiwInt8, qiwInt4);
 
@@ -9419,6 +9463,9 @@ type
     FLayerProfiling: boolean;
     FProfilePrefixMs: double;
     FProfileStepMs: array of double;
+    FStepStart: TDateTime;
+    // Threshold 0 (the default) runs every block on every step.
+    FFirstBlockCache: TDiTFirstBlockCache;
     {$IFDEF OpenCL}
     // Set by EnableOpenCL: every block store holds its codes in OpenCL memory;
     // PrepareStepPass arms each rebuilt step pass (EnableStepPassOpenCL).
@@ -9479,6 +9526,15 @@ type
     // pipeline's t / 1000), attending the prefix of the last EncodePrefix.
     procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
       GridH, GridW: integer; Velocity: TNNetVolume);
+    // PredictVelocity's three parts, for a caller that drives the blocks:
+    // PrepareStepPass, modulation rows, img_in over Latents.
+    procedure BeginVelocityStep(Latents: TNNetVolume; Timestep: TNeuralFloat;
+      GridH, GridW: integer);
+    // Blocks FirstBlockIdx..MaxBlockIdx on StepNet; block 0 reads img_in's
+    // output, block b > 0 StepNet's last output (block b - 1's).
+    procedure RunStepBlocks(FirstBlockIdx, MaxBlockIdx: integer);
+    // norm_out + proj_out over StepNet's last output into Velocity.
+    procedure FinishVelocityStep(Velocity: TNNetVolume);
     // Runs the timestep net: TimestepEmbedding and Modulation (the raw
     // [scale1|gate1|scale2|gate2] row) then hold Timestep's values.
     procedure ComputeModulation(Timestep: TNeuralFloat);
@@ -9529,6 +9585,9 @@ type
     // ProfileReport then covers the last EncodePrefix and the steps after it.
     property LayerProfiling: boolean read FLayerProfiling
       write SetLayerProfiling;
+    // PredictVelocity skips blocks 1..N-1 when its Threshold > 0 (needs two
+    // or more blocks); the caller resets it before each image.
+    property FirstBlockCache: TDiTFirstBlockCache read FFirstBlockCache;
     function ProfileReport(): string;
     // TNNet.OpenCLBufferBytes of every block store and pass now, plus the
     // prefix K/V in OpenCL memory; 0 without OpenCL.
@@ -9824,6 +9883,8 @@ type
     TransfersCounted: boolean;
     // StepCount: the steps run (an init image skips the first ones).
     StepCount, VaeTileCount, VaeNetCount: integer;
+    // Steps whose blocks 1..N-1 the First-Block Cache skipped (0 when off).
+    SkippedStepCount: integer;
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
     // The image started from EncodeImage's latents (img2img), and kept
     // them outside EncodeMask's hole (inpainting).
@@ -9864,6 +9925,7 @@ type
     FLayerProfiling: boolean;
     FTransformerProfileReport, FVaeProfileReport: string;
     FImageStats: TQwenImage21ImageStats;
+    FFirstBlockCacheThreshold: TNeuralFloat;
     // The phase DoPhase started last (qppDone: none open), when, and the
     // process transfer totals then.
     FOpenPhase: TQwenImage21PipelinePhase;
@@ -10096,6 +10158,10 @@ type
     // (DecodeLatents); each leaves its ProfileReport in the property below.
     property LayerProfiling: boolean read FLayerProfiling
       write FLayerProfiling;
+    // First-Block Cache threshold of Denoise (0 = off, the default; diffusers
+    // suggests 0.05 to 0.2): higher skips more steps' blocks 1..N-1.
+    property FirstBlockCacheThreshold: TNeuralFloat
+      read FFirstBlockCacheThreshold write FFirstBlockCacheThreshold;
     property TransformerProfileReport: string read FTransformerProfileReport;
     property VaeProfileReport: string read FVaeProfileReport;
     // EncodeTokenIds fills the qppLoadTextEncoder and qppEncodePrompt phases,
@@ -88892,6 +88958,113 @@ const
   csQwenImage21TimestepDim = 256;
   csQwenImage21TimeFactor = 1000;
 
+{ TDiTFirstBlockCache }
+
+constructor TDiTFirstBlockCache.Create(pThreshold: TNeuralFloat);
+begin
+  inherited Create();
+  FThreshold := pThreshold;
+  FResidual := TNNetVolume.Create();
+  FHeadResidual := TNNetVolume.Create();
+  FHeadMinusTail := TNNetVolume.Create();
+  Reset();
+end;
+
+destructor TDiTFirstBlockCache.Destroy();
+begin
+  FHeadMinusTail.Free;
+  FHeadResidual.Free;
+  FResidual.Free;
+  inherited Destroy();
+end;
+
+function TDiTFirstBlockCache.GetEnabled(): boolean;
+begin
+  Result := FThreshold > 0;
+end;
+
+procedure TDiTFirstBlockCache.Reset();
+begin
+  FHasHeadResidual := false;
+  FHasTailResidual := false;
+  FIsTailPending := false;
+  FHeadResidualSumAbs := 0;
+  FStepCount := 0;
+  FSkippedStepCount := 0;
+  FLastRelativeDiff := -1;
+end;
+
+procedure TDiTFirstBlockCache.ReleaseBuffers();
+begin
+  Reset();
+  FResidual.ReSize(1, 1, 1);
+  FHeadResidual.ReSize(1, 1, 1);
+  FHeadMinusTail.ReSize(1, 1, 1);
+end;
+
+// mean|r - r_prev| / mean|r_prev| is computed as the ratio of the two sums;
+// a zero r_prev runs the blocks (diffusers would compare NaN or +Inf).
+function TDiTFirstBlockCache.ShouldRunRemainingBlocks(HeadInput,
+  HeadOutput: TNNetVolume): boolean;
+var
+  Swap: TNNetVolume;
+begin
+  if HeadInput.Size <> HeadOutput.Size then
+    raise Exception.Create('TDiTFirstBlockCache: block 0 input has ' +
+      IntToStr(HeadInput.Size) + ' values, its output ' +
+      IntToStr(HeadOutput.Size) + '.');
+  FResidual.Copy(HeadOutput);
+  FResidual.Sub(HeadInput);
+  Inc(FStepCount);
+  FLastRelativeDiff := -1;
+  Result := true;
+  if FHasHeadResidual and FHasTailResidual and
+    (FHeadResidual.Size = FResidual.Size) and (FHeadResidualSumAbs > 0) then
+  begin
+    FLastRelativeDiff := FResidual.SumDiff(FHeadResidual) /
+      FHeadResidualSumAbs;
+    Result := FLastRelativeDiff > FThreshold;
+  end;
+  if Result then
+  begin
+    Swap := FHeadResidual;
+    FHeadResidual := FResidual;
+    FResidual := Swap;
+    FHeadResidualSumAbs := FHeadResidual.GetSumAbs();
+    FHasHeadResidual := true;
+    FHeadMinusTail.Copy(HeadOutput);
+    FHasTailResidual := false;
+    FIsTailPending := true;
+  end
+  else Inc(FSkippedStepCount);
+end;
+
+procedure TDiTFirstBlockCache.StoreTailResidual(TailOutput: TNNetVolume);
+begin
+  if not FIsTailPending then
+    raise Exception.Create('TDiTFirstBlockCache.StoreTailResidual: ' +
+      'ShouldRunRemainingBlocks did not ask for the remaining blocks.');
+  if TailOutput.Size <> FHeadMinusTail.Size then
+    raise Exception.Create('TDiTFirstBlockCache.StoreTailResidual: the ' +
+      'last block output has ' + IntToStr(TailOutput.Size) +
+      ' values, block 0''s ' + IntToStr(FHeadMinusTail.Size) + '.');
+  FHeadMinusTail.Sub(TailOutput);
+  FIsTailPending := false;
+  FHasTailResidual := true;
+end;
+
+procedure TDiTFirstBlockCache.ApplyTailResidual(HeadOutput: TNNetVolume);
+begin
+  if FIsTailPending or not FHasTailResidual then
+    raise Exception.Create('TDiTFirstBlockCache.ApplyTailResidual: no tail ' +
+      'residual from a fully computed step.');
+  if HeadOutput.Size <> FHeadMinusTail.Size then
+    raise Exception.Create('TDiTFirstBlockCache.ApplyTailResidual: block 0 ' +
+      'output has ' + IntToStr(HeadOutput.Size) + ' values, the residual ' +
+      IntToStr(FHeadMinusTail.Size) + '.');
+  HeadOutput.Sub(FHeadMinusTail);
+end;
+
 { TQwenImage21Transformer }
 
 // Layers: input X (TokenCount,1,hidden), input modulation (1,1,4*hidden), the
@@ -90026,6 +90199,7 @@ begin
   WeightsFile := SafeTensorsFolderWeightsFile(Folder,
     'diffusion_pytorch_model');
   FTimestepInput := TNNetVolume.Create(1, 1, 1);
+  FFirstBlockCache := TDiTFirstBlockCache.Create();
   Reader := CreateLoRAMergeChain(TNNetSafeTensorsReader.Create(WeightsFile),
     LoRAFiles, LoRAScales, DiffusersLoRAStripPrefixes);
   try
@@ -90088,6 +90262,7 @@ var
   BlockCnt, MaxBlockPos: integer;
 begin
   FreeStepPass();
+  FFirstBlockCache.Free;
   {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FPrefixNet.Free;
   FTextInNet.Free;
@@ -90123,6 +90298,7 @@ var
   BlockCnt, MaxBlockPos: integer;
 begin
   FreeStepPass();
+  FFirstBlockCache.ReleaseBuffers();
   {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FreeAndNil(FPrefixNet);
   FreeAndNil(FTextInNet);
@@ -90522,11 +90698,8 @@ begin
   SetLength(FProfileStepMs, 0);
 end;
 
-procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
-  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
-var
-  BlockCnt, MaxBlockPos, StepCnt: integer;
-  StepStart: TDateTime;
+procedure TQwenImage21Transformer.BeginVelocityStep(Latents: TNNetVolume;
+  Timestep: TNeuralFloat; GridH, GridW: integer);
 begin
   PrepareStepPass(GridH, GridW);
   if (Latents.SizeX <> GridH * GridW) or (Latents.SizeY <> 1) or
@@ -90544,13 +90717,19 @@ begin
     FStepNet.ResetSchedulerStats();
     FOutputNet.ClearTime();
   end;
-  StepStart := Now();
+  FStepStart := Now();
   ComputeModulation(Timestep);
   FStepNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FOutputNet.Layers[1].Output.Copy(FNormOutScaleLayer.Output);
   FImageInNet.Compute(Latents);
-  MaxBlockPos := FConfig.NumLayers - 1;
-  for BlockCnt := 0 to MaxBlockPos do
+end;
+
+procedure TQwenImage21Transformer.RunStepBlocks(FirstBlockIdx,
+  MaxBlockIdx: integer);
+var
+  BlockCnt: integer;
+begin
+  for BlockCnt := FirstBlockIdx to MaxBlockIdx do
   begin
     SelectBlockWeights(FStepNet, BlockCnt);
     LoadStepPrefix(BlockCnt);
@@ -90567,6 +90746,12 @@ begin
       else FStepNet.ComputeFromLayerOutput(FStepNet.GetLastLayer(), 0,
         FParallel);
   end;
+end;
+
+procedure TQwenImage21Transformer.FinishVelocityStep(Velocity: TNNetVolume);
+var
+  StepCnt: integer;
+begin
   // The output net's forward downloads only its last layer, the velocity.
   FOutputNet.ComputeFromLayerOutput(FStepNet.GetLastLayer());
   Velocity.Copy(FOutputNet.GetLastLayer().Output);
@@ -90574,8 +90759,42 @@ begin
   begin
     StepCnt := Length(FProfileStepMs);
     SetLength(FProfileStepMs, StepCnt + 1);
-    FProfileStepMs[StepCnt] := (Now() - StepStart) * MSecsPerDay;
+    FProfileStepMs[StepCnt] := (Now() - FStepStart) * MSecsPerDay;
   end;
+end;
+
+// First-Block Cache on the host: PredictVelocity downloads block 0's input and
+// output (and the last block's); the output net uploads a skipped step's sum.
+procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
+  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
+var
+  MaxBlockPos: integer;
+  HeadInput, HeadOutput: TNNetLayer;
+begin
+  BeginVelocityStep(Latents, Timestep, GridH, GridW);
+  MaxBlockPos := FConfig.NumLayers - 1;
+  if FFirstBlockCache.Enabled and (MaxBlockPos > 0) then
+  begin
+    RunStepBlocks(0, 0);
+    HeadInput := FImageInNet.GetLastLayer();
+    HeadOutput := FStepNet.GetLastLayer();
+    HeadInput.ForceOutputOnRAM();
+    HeadOutput.ForceOutputOnRAM();
+    if FFirstBlockCache.ShouldRunRemainingBlocks(HeadInput.Output,
+      HeadOutput.Output) then
+    begin
+      RunStepBlocks(1, MaxBlockPos);
+      FStepNet.GetLastLayer().ForceOutputOnRAM();
+      FFirstBlockCache.StoreTailResidual(FStepNet.GetLastLayer().Output);
+    end
+    else
+    begin
+      FFirstBlockCache.ApplyTailResidual(HeadOutput.Output);
+      HeadOutput.MarkOutputWrittenOnRAM();
+    end;
+  end
+  else RunStepBlocks(0, MaxBlockPos);
+  FinishVelocityStep(Velocity);
 end;
 
 function TQwenImage21Transformer.GetBlockStore(BlockIdx: integer): TNNet;
@@ -91473,6 +91692,8 @@ begin
     Transformer.Parallel := FParallel;
     Transformer.MaxThreads := FMaxThreads;
     Transformer.LayerProfiling := FLayerProfiling;
+    Transformer.FirstBlockCache.Threshold := FFirstBlockCacheThreshold;
+    Transformer.FirstBlockCache.Reset();
     DoPhase(qppEncodePrefix);
     if Length(TextLengths) = 0 then Transformer.EncodePrefix(PromptEmbeds)
     else Transformer.EncodePrefix(PromptEmbeds, TextLengths,
@@ -91501,6 +91722,8 @@ begin
           FScheduler.Timestep[StepPos], Latents);
     end;
     FImageStats.StepCount := RunStepCount;
+    FImageStats.SkippedStepCount :=
+      Transformer.FirstBlockCache.SkippedStepCount;
     FImageStats.TransformerOnOpenCL := FTransformerOnOpenCL;
     FImageStats.TransformerOpenCLBytes := Transformer.OpenCLBufferBytes();
     if FLayerProfiling then

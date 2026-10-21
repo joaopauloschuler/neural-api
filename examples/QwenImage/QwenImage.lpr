@@ -26,7 +26,7 @@ grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
 /padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
-/upscale FILE|off, /profile on|off, /stats on|off, /quit.
+/upscale FILE|off, /fbc X|off, /profile on|off, /stats on|off, /quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -80,6 +80,11 @@ The upscaler net is built after the VAE decode, for each image, and freed after
 it; it runs tile by tile (--upscale-tile, default 32 pixels plus 10 of context
 per side) on the --gpu device. Alpha is resized bilinearly.
 
+First-Block Cache (--fbc-threshold X or /fbc X): each step runs transformer
+block 0 and compares its residual with the one of the last fully computed
+step; when the relative change is at most X it skips the other blocks and
+reuses their cached residual (diffusers apply_first_block_cache). 0 = off.
+
 The initial noise comes from the FPC RNG (--seed), so an image is repeatable
 here but not equal to a diffusers image with the same seed.
 
@@ -93,6 +98,7 @@ USAGE
              --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
+            [--fbc-threshold X]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile] [--stats]
@@ -345,6 +351,9 @@ begin
         if Stats.StepCount > 0 then
           Detail := Format('%d steps x %.1f ms', [Stats.StepCount,
             Stats.PhaseMs[Phase] / Stats.StepCount]);
+        if Stats.SkippedStepCount > 0 then
+          Detail := Detail + Format(', %d with blocks 1..N-1 skipped (FBC)',
+            [Stats.SkippedStepCount]);
       end;
       qppDecode:
       begin
@@ -551,6 +560,14 @@ begin
     'image (default ', csDefaultUpscaleTile, ');');
   WriteLn('                       a tile holds about 2.7 MB per pixel of ',
     '(N + 20)^2 on the CPU');
+  WriteLn('  --fbc-threshold X    First-Block Cache: skip transformer blocks ',
+    '1..N-1 on a step whose block-0');
+  WriteLn('                       residual changed by at most X (relative ',
+    'mean |diff|) since the last full');
+  WriteLn('                       step, reusing that step''s residual of ',
+    'those blocks. 0 = off (DEFAULT);');
+  WriteLn('                       0.05..0.2 trade detail for speed (see ',
+    'README.md)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
     'the parallel layer scheduler with intra-layer threading)');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
@@ -642,6 +659,8 @@ begin
     'during the VAE decode; /tile 128');
   WriteLn('                       (or --vae-tile 128) lowers the VAE''s ',
     'memory if both do not fit.');
+  WriteLn('  /fbc X|off           First-Block Cache threshold for the next ',
+    'images, as --fbc-threshold');
   WriteLn('  /profile on|off      --profile for the next images');
   WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
@@ -727,6 +746,25 @@ begin
     not ((Strength > 0) and (Strength <= 1)) then
     Result := '"' + Text + '" is not a number in (0, 1].'
   else Result := '';
+end;
+
+// Parses a First-Block Cache threshold >= 0 ('off' = 0, a '.' decimal point);
+// returns '' or what is wrong.
+function ParseFbcThreshold(const Text: string; out Threshold: double): string;
+begin
+  Result := '';
+  if LowerCase(Trim(Text)) = 'off' then Threshold := 0
+  else if not TryStrToFloat(Trim(Text), Threshold, PointFormat()) or
+    not (Threshold >= 0) then
+    Result := '"' + Text + '" is not a number >= 0 or off.';
+end;
+
+function FbcThresholdText(Threshold: double): string;
+begin
+  if Threshold > 0 then
+    Result := 'First-Block Cache threshold ' +
+      FloatToStr(Threshold, PointFormat())
+  else Result := 'First-Block Cache off';
 end;
 
 // Parses a --lora FILE[:SCALE] value (a '.' decimal point; no number after the
@@ -879,6 +917,7 @@ var
   InputImageEncodeNumber: integer;
   Strength: double;
   HasStrengthArg: boolean;
+  FbcThreshold: double;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -1645,7 +1684,7 @@ var
   end;
 
   // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image, /mask,
-  // /mask-blur, /outpaint, /strength, /upscale, /profile, /stats and /quit;
+  // /mask-blur, /outpaint, /strength, /upscale, /fbc, /profile, /stats, /quit;
   // false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
@@ -1653,7 +1692,7 @@ var
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
-    NewStrength, NewMaskBlurRadius: double;
+    NewStrength, NewMaskBlurRadius, NewFbcThreshold: double;
     NewPaddingMaskCrop: integer;
     NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
@@ -1977,6 +2016,23 @@ var
         else WriteLn('[/upscale: ', Problem, ' - upscaling stays off]');
       end;
     end
+    else if Command = 'fbc' then
+    begin
+      if Argument = '' then
+        WriteLn('[', FbcThresholdText(Pipeline.FirstBlockCacheThreshold),
+          '; /fbc X|off changes it]')
+      else
+      begin
+        Problem := ParseFbcThreshold(Argument, NewFbcThreshold);
+        if Problem <> '' then WriteLn('[/fbc: ', Problem, ']')
+        else
+        begin
+          Pipeline.FirstBlockCacheThreshold := NewFbcThreshold;
+          WriteLn('[', FbcThresholdText(NewFbcThreshold),
+            ' from the next image]');
+        end;
+      end;
+    end
     else if Command = 'profile' then
     begin
       if ParseOnOff(Command, Argument, IsOn) then
@@ -1995,7 +2051,7 @@ var
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
       '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
-      '/outpaint, /strength, /upscale, ',
+      '/outpaint, /strength, /upscale, /fbc, ',
       '/profile, /stats, /quit]');
   end;
 
@@ -2011,7 +2067,7 @@ var
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
       '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, ',
-      '/upscale FILE|off, /profile on|off, /stats on|off, /quit.');
+      '/upscale FILE|off, /fbc X|off, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -2085,6 +2141,7 @@ begin
   Pipeline := nil;
   Strength := csDefaultStrength;
   HasStrengthArg := false;
+  FbcThreshold := 0;
   MaxThreads := 0;
   Upscaler := nil;
   UpscaleFile := '';
@@ -2188,6 +2245,15 @@ begin
     end
     else if Arg = '--serial' then UseSerial := true
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
+    else if Arg = '--fbc-threshold' then
+    begin
+      ArgProblem := ParseFbcThreshold(NextArg(), FbcThreshold);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--fbc-threshold: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -2337,6 +2403,8 @@ begin
     Pipeline.VaeTileStride := VaeTileStride;
     Pipeline.Parallel := not UseSerial;
     Pipeline.MaxThreads := MaxThreads;
+    Pipeline.FirstBlockCacheThreshold := FbcThreshold;
+    if FbcThreshold > 0 then WriteLn('[', FbcThresholdText(FbcThreshold), ']');
     SetProfile(UseProfile);
     SetStats(UseStats);
     Pipeline.OnPhase := @Reporter.OnPhase;
