@@ -35,9 +35,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 //         at the canonical NumFrames = 3000),
 //       * center-REFLECT-pad by n_fft/2 = 200 samples on both sides,
 //       * 400-point STFT (PERIODIC hann window, hop 160) - computed here as a
-//         direct real DFT against precomputed cos/sin tables because 400 is
-//         not a power of two (the radix-2 FFTs in neuralnetwork.pas do not
-//         apply); all-zero frames (the 30 s padding tail) are skipped,
+//         two-factor (20 x 20) real DFT against precomputed cos/sin tables
+//         (RealFramePowerSpectrum); all-zero frames (the 30 s padding tail)
+//         are skipped,
 //       * power spectrum (201 bins) through the SLANEY-scale, slaney-NORMED
 //         80-filter triangular mel bank (mel_filter_bank(num_frequency_bins=
 //         201, num_mel_filters=80, min=0, max=8000, norm="slaney",
@@ -1339,12 +1339,12 @@ var
   WinNorm: double;                // sqrt(sum(window^2))
   Filt: TNNetVolume;
   Re, Im: array of double;        // FFT scratch (NFFT)
-  FftCos, FftSin: array of double; // radix-2 twiddles, cos/sin(2*pi*j/NFFT)
+  FftPlan: TFFTPlan;              // length-NFFT plan (any NFFT)
   Power: array of double;         // one frame's power spectrum (NumBins)
   RawChroma: array of double;     // (NumFrames x NumChroma)
   FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
-  rowBase, fBase, HalfNFFT, HalfNFFTM1: integer;
-  Acc, MaxVal, V, WinNormInv, angStep, ang: double;
+  rowBase, fBase: integer;
+  Acc, MaxVal, V, WinNormInv: double;
 
   // reflect pad indexing (np pad mode 'reflect' = torch center pad): mirror
   // WITHOUT repeating the edge sample. Single bounce suffices (PadLeft < len).
@@ -1360,8 +1360,6 @@ var
 begin
   if NFFT < 2 then
     raise Exception.Create('ComputeMusicgenMelodyChroma: NFFT must be >= 2.');
-  if (NFFT and (NFFT - 1)) <> 0 then
-    raise Exception.Create('ComputeMusicgenMelodyChroma: NFFT must be a power of two.');
   NumSamplesIn := Samples.Size;
   // The feature extractor pads a too-short waveform to NFFT with zeros first
   // (centered). Mirror that by treating Samples as already >= NFFT here: in
@@ -1398,19 +1396,8 @@ begin
   SetLength(Im, NFFT);
   SetLength(Power, NumBins);
   SetLength(RawChroma, NumFrames * NumChroma);
-  // Radix-2 twiddle table, built once for the whole call (preprocessing, not a
-  // Compute path): the FFT reads entries 0..NFFT div 2 - 1 of it.
-  HalfNFFT := NFFT shr 1;
-  HalfNFFTM1 := HalfNFFT - 1;
-  SetLength(FftCos, HalfNFFT);
-  SetLength(FftSin, HalfNFFT);
-  angStep := 2.0 * Pi / NFFT;
-  for TapCnt := 0 to HalfNFFTM1 do
-  begin
-    ang := angStep * TapCnt;
-    FftCos[TapCnt] := Cos(ang);
-    FftSin[TapCnt] := Sin(ang);
-  end;
+  // Built once for the whole call (preprocessing, not a Compute path).
+  FFTPlanInit(FftPlan, NFFT);
   try
     BuildChromaFilterBank(Filt, SampleRate, NFFT, NumChroma);
 
@@ -1438,7 +1425,7 @@ begin
       else
         for TapCnt := 0 to NFFTM1 do
           Re[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
-      FFTRadix2InPlace(Re, Im, NFFT, false, FftCos, FftSin);
+      FFTPlanExecute(FftPlan, Re, Im, false);
       // one-sided power spectrum, normalized by the window L2 energy
       for BinCnt := 0 to NumBinsM1 do
       begin
@@ -1480,7 +1467,6 @@ begin
     Filt.Free;
     SetLength(Re, 0); SetLength(Im, 0); SetLength(Power, 0);
     SetLength(RawChroma, 0); SetLength(Window, 0);
-    SetLength(FftCos, 0); SetLength(FftSin, 0);
   end;
 end;
 
@@ -1502,11 +1488,15 @@ var
   Acc0, Acc1, Acc2, Acc3, SelfConj, Sample, WinTap: double;
   ReVal0, ReVal1, ReVal2, ReVal3: double;
   ImVal0, ImVal1, ImVal2, ImVal3: double;
-  FftRe, FftIm: array of double;  // full-spectrum radix-2 scratch (pow2 NFFT)
-  IsPow2: boolean;                // NFFT is a power of two -> radix-2 path
+  FftRe, FftIm: array of double;  // full-spectrum FFT scratch (UseFFT)
+  FftPlan: TFFTPlan;              // length-NFFT plan (UseFFT)
+  UseFFT: boolean;                // per-frame FFT instead of the direct inverse DFT
   MirrorCnt, MirrorSrc: integer;
 const
   csEnvEps = 1e-12;               // divide-by-zero guard for the COLA envelope
+  // Below this a non-power-of-two NFFT runs the direct inverse DFT: Bluestein's
+  // three padded FFTs cost more than NFFT*NumBins there (measured crossover ~64-100).
+  csISTFTMinBluesteinNFFT = 64;
 begin
   if NFFT < 2 then
     raise Exception.Create('ISTFTOverlapAdd: NFFT must be >= 2.');
@@ -1535,7 +1525,20 @@ begin
     Win2[TapCnt] := Window[TapCnt] * Window[TapCnt];
   end;
 
-  // ---- inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
+  // With UseFFT the per-frame O(NFFT*NumBins) inverse DFT becomes one
+  // O(NFFT*log NFFT) forward FFT. The one-sided spectrum is mirrored back to full
+  // length with the conjugate the storage convention implies (stored Im =
+  // +sum x*sin, so x[t] = Re(FFT(Y))/NFFT for Y[k] = Re[k] + i*Im[k],
+  // Y[NFFT-k] = Re[k] - i*Im[k]).
+  UseFFT := ((NFFT and NFFTM1) = 0) or (NFFT >= csISTFTMinBluesteinNFFT);
+  if UseFFT then
+  begin
+    SetLength(FftRe, NFFT);
+    SetLength(FftIm, NFFT);
+    FFTPlanInit(FftPlan, NFFT);
+  end;
+
+  // ---- direct inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
   // x[t] = (1/NFFT) * ( Re[0]
   //        + 2*sum_{k=1..NumBins-1}( Re[k]*cos + Im[k]*sin )  [k=NFFT/2 halved]
   //        ). The Im sign matches the forward SinTab (stored Im = +sum x*sin),
@@ -1544,14 +1547,17 @@ begin
   // table of NFFT entries replaces the (NumBins x NFFT) product table: 8.4 MB
   // walked with an NFFT-element stride becomes an NFFT-element table that stays
   // in cache, and the setup cost drops from NumBins*NFFT to NFFT Cos/Sin calls.
-  SetLength(CosTab, NFFT);
-  SetLength(SinTab, NFFT);
-  angStep := 2.0 * Pi / NFFT;
-  for TapCnt := 0 to NFFTM1 do
+  if not UseFFT then
   begin
-    ang := angStep * TapCnt;
-    CosTab[TapCnt] := Cos(ang);
-    SinTab[TapCnt] := Sin(ang);
+    SetLength(CosTab, NFFT);
+    SetLength(SinTab, NFFT);
+    angStep := 2.0 * Pi / NFFT;
+    for TapCnt := 0 to NFFTM1 do
+    begin
+      ang := angStep * TapCnt;
+      CosTab[TapCnt] := Cos(ang);
+      SinTab[TapCnt] := Sin(ang);
+    end;
   end;
 
   // Every bin carries weight 2 except bin 0 and, when NFFT is even, the top
@@ -1560,18 +1566,6 @@ begin
   // doubles it, and subtracts the single-count bins back out once per sample.
   TopIsHalf := (NFFT and 1) = 0;
   NumBins4 := NumBins and (not 3);
-
-  // For a power-of-two NFFT the whole per-frame O(NFFT*NumBins) inverse DFT
-  // collapses to one O(NFFT*log2 NFFT) radix-2 pass. The one-sided spectrum is
-  // mirrored back to full length with the conjugate the storage convention
-  // implies (stored Im = +sum x*sin, so x[t] = Re(FFT(Y))/NFFT for
-  // Y[k] = Re[k] + i*Im[k], Y[NFFT-k] = Re[k] - i*Im[k]).
-  IsPow2 := (NFFT and NFFTM1) = 0;
-  if IsPow2 then
-  begin
-    SetLength(FftRe, NFFT);
-    SetLength(FftIm, NFFT);
-  end;
 
   OutLen := NFFT + (NumFrames - 1) * HopLength;
   OutLenM1 := OutLen - 1;
@@ -1588,23 +1582,23 @@ begin
   begin
     FrameStart := FrameCnt * HopLength;
     frameBase := FrameCnt * NumBins;      // Re/Im row base (invariant over nest)
-    if IsPow2 then
+    if UseFFT then
     begin
       for BinCnt := 0 to NumBinsM1 do
       begin
         FftRe[BinCnt] := Re.FData[frameBase + BinCnt];
         FftIm[BinCnt] := Im.FData[frameBase + BinCnt];
       end;
-      MirrorSrc := NumBinsM1 - 1;
+      // Y[MirrorCnt] = conj(Y[NFFT - MirrorCnt]); the first mirrored bin is
+      // NumBins, so the source starts at NFFT - NumBins (odd or even NFFT).
+      MirrorSrc := NFFT - NumBins;
       for MirrorCnt := NumBins to NFFTM1 do
       begin
         FftRe[MirrorCnt] := Re.FData[frameBase + MirrorSrc];
         FftIm[MirrorCnt] := -Im.FData[frameBase + MirrorSrc];
         Dec(MirrorSrc);
       end;
-      // The fundamental table built above is exactly the twiddle table the
-      // radix-2 stages index (CosTab[j] = cos(2*pi*j/NFFT)); no second table.
-      FFTRadix2InPlace(FftRe, FftIm, NFFT, false, CosTab, SinTab);
+      FFTPlanExecute(FftPlan, FftRe, FftIm, false);
       for TapCnt := 0 to NFFTM1 do
       begin
         Sample := FftRe[TapCnt] * invNFFT;

@@ -50,8 +50,8 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math, neuralnetwork, neuralvolume;
 
 const
-  TRAIN_GRID = 16;      // power-of-two grid the surrogate is TRAINED on
-  EVAL_GRID  = 32;      // finer power-of-two grid used ONLY at test time
+  TRAIN_GRID = 16;      // grid the surrogate is TRAINED on
+  EVAL_GRID  = 32;      // finer grid used ONLY at test time
   MODESX     = 6;       // kept Fourier modes along X (low-pass band)
   MODESY     = 6;       // kept Fourier modes along Y
   WIDTH      = 8;       // FNO channel width (lifting dimension)

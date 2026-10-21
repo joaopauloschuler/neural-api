@@ -2049,13 +2049,26 @@ cannot pay for its own transfer.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] Move the remaining FFT callers onto the shared `TFFTPlan` (Bluestein, any N;
-      neuralvolume.pas, 5a2f88e5) so they stop requiring power-of-two sizes:
-      `TNNetFourierMix` and `TNNetCirculantLinear` still reject non-power-of-two
-      lengths, and the audio inverse STFT in neuralaudio.pas still runs a direct
-      O(N^2) DFT for other sizes. Each plan is a field built in SetPrevLayer (a
-      plan is not thread-safe: one per worker on a chunked path). Tests: the
-      layer's existing gradient checks at a non-power-of-two length.
+- [X] Move the remaining FFT callers onto the shared `TFFTPlan` (Bluestein, any N;
+      neuralvolume.pas, 5a2f88e5) so they stop requiring power-of-two sizes.
+      DONE: `TNNetFourierMix` (UseFFT), `TNNetCirculantLinear` (UseFFT),
+      `TNNetSpectralConv1D` and `TNNetSpectralConv2D` run on plan fields built in
+      SetPrevLayer and no longer reject non-power-of-two lengths (none of them
+      has a chunked path, so one plan per axis). neuralaudio.pas:
+      `ISTFTOverlapAddReIm` uses the plan for a power-of-two NFFT or NFFT >= 64
+      and keeps the direct inverse DFT below that (measured: direct 0.33 us vs
+      Bluestein 2.0 us per frame at NFFT 20, Kokoro's size; Bluestein wins from
+      ~100); its mirrored spectrum was wrong for odd NFFT on the FFT path (only
+      reachable with Bluestein) and is fixed. `ComputeMusicgenMelodyChroma` uses
+      the plan and accepts any NFFT. No `FFTRadix2InPlace` caller remains
+      outside neuralvolume.pas. Left: `RealFramePowerSpectrum` (Whisper's
+      400-point two-factor 20x20 DFT, ~N*(N1+N2) and oracle-pinned, not slower
+      than three 1024-point FFTs) and `TNNetForwardSTFT` (direct DFT for short
+      NFFT; see the 2.9 follow-up). TNNetImplicitLongConv / Hyena have no FFT
+      yet (separate item below). Tests: non-pow2 gradient checks for all four
+      layers, SpectralConv1D/2D forward vs a naive DFT, FourierMix FFT vs the
+      naive cos sum, CirculantLinear FFT vs direct at n = 12 and 7, ISTFT at
+      NFFT 20/100/101/400 vs the product-table reference, chroma at NFFT 1000.
 - [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
       (the even/odd split trick) to halve the row cost. Low priority: the FFTs
       are small next to LaMa's convolutions; do it only if a profile shows them.

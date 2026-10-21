@@ -37,9 +37,9 @@ type
     // Forward STFT -> ISTFTOverlapAdd round-trips the interior near-exactly
     // under a perfect-reconstruction Hann window with 75% overlap.
     procedure TestISTFTRoundTrip;
-    // ISTFTOverlapAddReIm reduces its twiddle index modulo NFFT against a
-    // single fundamental table; assert it still matches the straightforward
-    // (NumBins x NFFT) product-table reference, for even and odd NFFT.
+    // ISTFTOverlapAddReIm (radix-2, Bluestein or direct inverse DFT by NFFT)
+    // matches the straightforward (NumBins x NFFT) product-table reference,
+    // for even and odd, power-of-two and non-power-of-two NFFT.
     procedure TestISTFTReImMatchesProductTable;
     // Resampling 16 kHz -> 16 kHz is a bit-identical passthrough.
     procedure TestResampleIdentity;
@@ -67,7 +67,7 @@ type
     // A silent waveform produces one uniform log-mel value everywhere.
     procedure TestWhisperLogMelSilence;
     // ComputeMusicgenMelodyChroma emits a one-hot row per frame and a steady
-    // pure tone picks the same chroma in every interior frame.
+    // pure tone picks the same chroma in every interior frame (pow2 and non-pow2 NFFT).
     procedure TestMelodyChromaOneHotPureTone;
     // BuildChromaFilterBank rows are the column-L2-normalized Gaussians rolled
     // by 3*(NumChroma div 12): assert the roll and the (weighted) column norms.
@@ -320,13 +320,20 @@ var
   MaxDiff, MaxAbs, d: double;
 begin
   // NFFT = 16 and 64 (powers of two: the radix-2 inverse path, top bin
-  // self-conjugate) and NFFT = 9 (odd: not self-conjugate, no radix-2
-  // decomposition, and BinCnt*TapCnt wraps at a non-power-of-two modulus).
-  for NFFTIdx := 0 to 2 do
+  // self-conjugate); NFFT = 9 and 20 (small non-powers of two: the direct
+  // inverse DFT, BinCnt*TapCnt wrapping at a non-power-of-two modulus); NFFT =
+  // 100, 101 and 400 (the Bluestein plan, even and odd mirrored spectra).
+  for NFFTIdx := 0 to 6 do
   begin
-    if NFFTIdx = 0 then begin NFFT := 16; Hop := 4; end
-    else if NFFTIdx = 1 then begin NFFT := 9; Hop := 3; end
-    else begin NFFT := 64; Hop := 16; end;
+    case NFFTIdx of
+      0: begin NFFT := 16; Hop := 4; end;
+      1: begin NFFT := 9; Hop := 3; end;
+      2: begin NFFT := 64; Hop := 16; end;
+      3: begin NFFT := 20; Hop := 5; end;
+      4: begin NFFT := 100; Hop := 25; end;
+      5: begin NFFT := 101; Hop := 25; end;
+    else begin NFFT := 400; Hop := 100; end;
+    end;
     NumBins := NFFT div 2 + 1;
     Re := TNNetVolume.Create(csFrames, 1, NumBins);
     Im := TNNetVolume.Create(csFrames, 1, NumBins);
@@ -355,7 +362,7 @@ begin
       // Relative to the reference's own scale: both sides are double-precision
       // DSP landing in float32 storage, so the bound must track the signal.
       AssertTrue('NFFT ' + IntToStr(NFFT) +
-        ': radix-2/fundamental-table ISTFT vs product-table reference ' +
+        ': ISTFT vs product-table reference ' +
         'max |diff| = ' + FloatToStr(MaxDiff) + ' vs max |want| = ' +
         FloatToStr(MaxAbs), MaxDiff < 1e-5 * (1.0 + MaxAbs));
     finally
@@ -866,65 +873,69 @@ end;
 procedure TTestNeuralAudio.TestMelodyChromaOneHotPureTone;
 const
   cSr = 32000;
-  cNFFT = 1024;
   cHop = 256;
   cNumChroma = 12;
-  cToneBin = 14;                      // 437.5 Hz: exactly on an FFT bin
+  cToneBin = 14;                      // the tone sits exactly on FFT bin 14
 var
   Samples, Chroma, Filt: TNNetVolume;
-  N, i, f, c, NumOnes, Hot, Expected: integer;
+  N, i, f, c, NumOnes, Hot, Expected, NFFTIdx, NFFT: integer;
   V, MaxVal, Freq: double;
 begin
   N := 16 * cHop;
-  Samples := TNNetVolume.Create(N, 1, 1);
-  Chroma := TNNetVolume.Create(1, 1, 1);
-  Filt := TNNetVolume.Create;
-  try
-    Freq := cSr * (cToneBin / cNFFT);
-    for i := 0 to N - 1 do
-      Samples.FData[i] := Sin(2.0 * Pi * Freq * i / cSr);
-    ComputeMusicgenMelodyChroma(Samples, Chroma, cSr, cNFFT, cHop, cNumChroma);
-    AssertEquals('chroma frame count', 1 + N div cHop, Chroma.SizeX);
-    AssertEquals('chroma depth', cNumChroma, Chroma.Depth);
-    // The dominant chroma of a pure tone is the bank's own argmax at that bin.
-    BuildChromaFilterBank(Filt, cSr, cNFFT, cNumChroma);
-    MaxVal := -1e30;
-    Expected := 0;
-    for c := 0 to cNumChroma - 1 do
-    begin
-      V := Filt[c, 0, cToneBin];
-      if V > MaxVal then
-      begin
-        MaxVal := V;
-        Expected := c;
-      end;
-    end;
-    for f := 0 to Chroma.SizeX - 1 do
-    begin
-      NumOnes := 0;
-      Hot := -1;
+  // NFFT 1024 runs the radix-2 plan, NFFT 1000 the Bluestein plan.
+  for NFFTIdx := 0 to 1 do
+  begin
+    if NFFTIdx = 0 then NFFT := 1024 else NFFT := 1000;
+    Samples := TNNetVolume.Create(N, 1, 1);
+    Chroma := TNNetVolume.Create(1, 1, 1);
+    Filt := TNNetVolume.Create;
+    try
+      Freq := cSr * (cToneBin / NFFT);
+      for i := 0 to N - 1 do
+        Samples.FData[i] := Sin(2.0 * Pi * Freq * i / cSr);
+      ComputeMusicgenMelodyChroma(Samples, Chroma, cSr, NFFT, cHop, cNumChroma);
+      AssertEquals('chroma frame count', 1 + N div cHop, Chroma.SizeX);
+      AssertEquals('chroma depth', cNumChroma, Chroma.Depth);
+      // The dominant chroma of a pure tone is the bank's own argmax at that bin.
+      BuildChromaFilterBank(Filt, cSr, NFFT, cNumChroma);
+      MaxVal := -1e30;
+      Expected := 0;
       for c := 0 to cNumChroma - 1 do
       begin
-        V := Chroma[f, 0, c];
-        if V <> 0.0 then
+        V := Filt[c, 0, cToneBin];
+        if V > MaxVal then
         begin
-          Inc(NumOnes);
-          Hot := c;
-          AssertEquals('chroma frame ' + IntToStr(f) + ' one-hot value',
-            1.0, V, 1e-9);
+          MaxVal := V;
+          Expected := c;
         end;
       end;
-      AssertEquals('chroma frame ' + IntToStr(f) + ' has exactly one hot bin',
-        1, NumOnes);
-      // Frames 2..(NumFrames-3) are fully inside the tone (no reflect pad).
-      if (f >= 2) and (f <= Chroma.SizeX - 3) then
-        AssertEquals('interior chroma frame ' + IntToStr(f) + ' picks the tone',
-          Expected, Hot);
+      for f := 0 to Chroma.SizeX - 1 do
+      begin
+        NumOnes := 0;
+        Hot := -1;
+        for c := 0 to cNumChroma - 1 do
+        begin
+          V := Chroma[f, 0, c];
+          if V <> 0.0 then
+          begin
+            Inc(NumOnes);
+            Hot := c;
+            AssertEquals('NFFT ' + IntToStr(NFFT) + ' chroma frame ' +
+              IntToStr(f) + ' one-hot value', 1.0, V, 1e-9);
+          end;
+        end;
+        AssertEquals('NFFT ' + IntToStr(NFFT) + ' chroma frame ' + IntToStr(f) +
+          ' has exactly one hot bin', 1, NumOnes);
+        // Frames 2..(NumFrames-3) are fully inside the tone (no reflect pad).
+        if (f >= 2) and (f <= Chroma.SizeX - 3) then
+          AssertEquals('NFFT ' + IntToStr(NFFT) + ' interior chroma frame ' +
+            IntToStr(f) + ' picks the tone', Expected, Hot);
+      end;
+    finally
+      Samples.Free;
+      Chroma.Free;
+      Filt.Free;
     end;
-  finally
-    Samples.Free;
-    Chroma.Free;
-    Filt.Free;
   end;
 end;
 

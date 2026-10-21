@@ -4315,9 +4315,9 @@ type
   // 2D-DFT operator applied to dL/dy:
   //   dL/dx[s,h] = sum_{a,b} cos(2*pi*(a*s/L + b*h/D)) * dL/dy[a,b]
   // The default O(n^2) direct path works for arbitrary SeqLen and d. An
-  // opt-in radix-2 FFT fast path (UseFFT, default FALSE) is available when
-  // both SeqLen and d are powers of two; it is checked against the direct
-  // path to < 1e-5. UseFFT round-trips via FStruct[0].
+  // opt-in FFT fast path (UseFFT, default FALSE; TFFTPlan, so any SeqLen and
+  // d) is checked against the direct path to < 1e-5. UseFFT round-trips via
+  // FStruct[0].
   // Coded by Claude (AI).
   TNNetFourierMix = class(TNNetIdentity)
   protected
@@ -4330,6 +4330,7 @@ type
     FCosA, FSinA: array of Double;      // one sequence-axis row (length L)
     FCrT, FCiT: array of Double;        // hidden-axis partial sums, [b*L + s]
     FFFTCacheL, FFFTCacheD: integer;
+    FPlanL, FPlanD: TFFTPlan;            // sequence-axis and hidden-axis plans
 
     {$IFDEF FPC}
     FFFTRe, FFFTIm: array of array of Double; // [s][h] after hidden-axis FFT
@@ -14468,13 +14469,13 @@ type
   // gradient into FArrNeurons[1].Delta, so the ordinary inertia / Adam weight
   // update machinery applies unchanged.
   // OPT-IN O(n log n) FFT FAST PATH (default OFF): set UseFFT := true to compute
-  // the forward AND backward in the frequency domain via a self-contained
-  // radix-2 Cooley-Tukey FFT. Circular convolution y = c (*) x becomes the
-  // pointwise complex product Y = FFT(c).*FFT(x), y = IFFT(Y); the input/kernel
-  // gradients are circular CORRELATIONS, computed with the conjugate spectrum.
-  // The radix-2 FFT requires n to be a power of two; UseFFT errors clearly if
-  // not. The direct O(n^2) time-domain path remains the DEFAULT and is the
-  // numerical source of truth (the FFT path matches it to < 1e-5).
+  // the forward AND backward in the frequency domain via the shared TFFTPlan
+  // (radix-2 for a power-of-two n, Bluestein otherwise). Circular convolution
+  // y = c (*) x becomes the pointwise complex product Y = FFT(c).*FFT(x),
+  // y = IFFT(Y); the input/kernel gradients are circular CORRELATIONS, computed
+  // with the conjugate spectrum. The direct O(n^2) time-domain path remains the
+  // DEFAULT and is the numerical source of truth (the FFT path matches it to
+  // < 1e-5).
   // Coded by Claude (AI).
   TNNetCirculantLinear = class(TNNetFullConnectLinear)
   private
@@ -14490,6 +14491,7 @@ type
     FcSpecRe, FcSpecIm: array of Double;
     FcSpecW: array of TNeuralFloat;
     FcSpecValid: boolean;
+    FFFTPlan: TFFTPlan;   // length-N plan, built in SetPrevLayer
     // Reversed copy of the input (FxRevBuf[0] = x[0], FxRevBuf[p] = x[n-p]),
     // sized N in SetPrevLayer. It makes the direct forward's kernel index
     // ascend, so each output is two contiguous dot products.
@@ -14499,7 +14501,6 @@ type
     procedure ComputeFFT();
     procedure ComputePreviousLayerErrorFFT();
     procedure BackpropagateKernelBiasFFT();
-    procedure RequireFFTUsable();
   public
     destructor Destroy(); override;
     procedure Compute(); override;
@@ -16491,8 +16492,8 @@ type
   /// Re(DFT) token mixer) and the fixed-RANDOM TNNetFourierFeatures.
   ///
   /// Over a (SeqLen, 1, InDepth) sequence it performs, per channel:
-  ///   1. a real radix-2 FFT along SeqLen (reusing the proven FFTRadix2InPlace
-  ///      radix-2 Cooley-Tukey helper -- NOT a hand-rolled second FFT);
+  ///   1. a real FFT along SeqLen (the shared TFFTPlan: radix-2 for a power of
+  ///      two, Bluestein for any other SeqLen -- NOT a hand-rolled second FFT);
   ///   2. a spectral LOW-PASS truncation to the lowest FModes frequency modes
   ///      (high modes are zeroed, never learned -- this is exactly what makes the
   ///      operator resolution-invariant: the SAME learned weights apply on any
@@ -16517,8 +16518,9 @@ type
   private
     FOutDepth: integer;     // requested output Depth
     FModes: integer;        // number of kept low-frequency modes
-    FSeqLen: integer;       // SeqLen (= prev SizeX), power of two
+    FSeqLen: integer;       // SeqLen (= prev SizeX), any length >= 1
     FInDepth: integer;      // input Depth
+    FFFTPlan: TFFTPlan;     // length-FSeqLen plan, built in SetPrevLayer
     // Scratch buffers (per Compute/Backpropagate), kept to avoid re-alloc.
     FXre, FXim: array of array of Double;  // [ci][k] forward spectrum of input
     FSreBuf, FSimBuf: array of Double;      // ComputeCPU per-output spectrum (FSeqLen)
@@ -16562,8 +16564,8 @@ type
   /// TWO-DIMENSIONAL Fourier Neural Operator (FNO) SPECTRAL CONVOLUTION layer:
   /// the natural 2-D extension of TNNetSpectralConv1D. Over a (SizeX, SizeY,
   /// InDepth) image it performs, per channel:
-  ///   1. a 2-D real radix-2 FFT (FFT along X for every row, then along Y for
-  ///      every column -- both reuse the proven FFTRadix2InPlace helper, NOT a
+  ///   1. a 2-D real FFT (FFT along X for every row, then along Y for every
+  ///      column -- both use the shared TFFTPlan, so any SizeX/SizeY, NOT a
   ///      hand-rolled second FFT);
   ///   2. a spectral LOW-PASS truncation to the lowest FModesX x FModesY 2-D
   ///      frequency modes (high modes are zeroed, never learned -- exactly what
@@ -16592,8 +16594,9 @@ type
     FOutDepth: integer;     // requested output Depth
     FModesX: integer;       // number of kept low-frequency modes along X
     FModesY: integer;       // number of kept low-frequency modes along Y
-    FSizeX: integer;        // input SizeX, power of two
-    FSizeY: integer;        // input SizeY, power of two
+    FSizeX: integer;        // input SizeX, any size >= 1
+    FSizeY: integer;        // input SizeY, any size >= 1
+    FPlanX, FPlanY: TFFTPlan; // per-axis FFT plans, built in SetPrevLayer
     FInDepth: integer;      // input Depth
     // Scratch: forward 2-D spectrum of the input, [ci][x][y].
     FXre, FXim: array of TSpectralConv2DMatrix;
@@ -16611,13 +16614,13 @@ type
     // BackpropagateCPU contiguous input-spectrum gradient, FxrPlane's layout.
     FdXrePlane, FdXimPlane: array of TNeuralFloat;
     // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
-    // the [x][y] layout makes Re[ix] the contiguous Y row, so FFTRadix2InPlace
+    // the [x][y] layout makes Re[ix] the contiguous Y row, so FFTPlanExecute
     // runs in place on it.
     FFftRowRe, FFftRowIm: array of Double;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
-    // 2-D FFT helpers on a [x][y] grid (in-place); reuse FFTRadix2InPlace per axis.
+    // 2-D FFT helpers on a [x][y] grid (in-place); one TFFTPlan per axis.
     procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
     procedure RebuildWeightPlanes();
     procedure FreeBackpropScratch();
@@ -33839,6 +33842,8 @@ end;
 procedure TNNetFourierMix.SetUseFFT(AValue: boolean);
 begin
   if AValue then FStruct[0] := 1 else FStruct[0] := 0;
+  if AValue and Assigned(FPrevLayer) then
+    EnsureFFTBuffers(FOutput.SizeX, FOutput.Depth);
 end;
 
 procedure TNNetFourierMix.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -33847,11 +33852,7 @@ begin
   if FOutput.SizeY <> 1 then
     FErrorProc('TNNetFourierMix requires SizeY=1 (a (SeqLen,1,d) sequence); got SizeY=' +
       IntToStr(FOutput.SizeY) + '.');
-  if GetUseFFT() and
-     not (IsPowerOfTwo(FOutput.SizeX) and IsPowerOfTwo(FOutput.Depth)) then
-    FErrorProc('TNNetFourierMix.UseFFT requires power-of-two SeqLen and Depth; got SeqLen=' +
-      IntToStr(FOutput.SizeX) + ', Depth=' + IntToStr(FOutput.Depth) +
-      '. Disable UseFFT for the direct O(n^2) path.');
+  if GetUseFFT() then EnsureFFTBuffers(FOutput.SizeX, FOutput.Depth);
 end;
 
 // Lazily (re)builds the direct-path twiddle tables and separable intermediates
@@ -34005,10 +34006,12 @@ end;
 
 // FFT fast path: a separable 2D FFT. We FFT along the hidden axis (length D),
 // then along the sequence axis (length L), and keep the real part. The result
-// equals Re(DFT_seq(DFT_hidden(x))) exactly. Both axes must be powers of two.
+// equals Re(DFT_seq(DFT_hidden(x))) exactly, for any L and D.
 procedure TNNetFourierMix.EnsureFFTBuffers(L, D: integer);
 begin
   if (L = FFFTCacheL) and (D = FFFTCacheD) then exit;
+  FFTPlanInit(FPlanL, L);
+  FFTPlanInit(FPlanD, D);
   SetLength(FFFTRe, L, D);
   SetLength(FFFTIm, L, D);
   SetLength(FFFTColRe, L);
@@ -34049,7 +34052,7 @@ begin
     FillChar(rowIm[0], D * SizeOf(Double), 0);
     for h := 0 to DM1 do
       rowRe[h] := Src.FData[sD + h];
-    FFTRadix2InPlace(rowRe, rowIm, D, false);
+    FFTPlanExecute(FPlanD, rowRe, rowIm, false);
   end;
   // FFT each column across the sequence axis, keep real part.
   colRe := FFFTColRe;
@@ -34061,7 +34064,7 @@ begin
       colRe[s] := reRows[s][h];
       colIm[s] := imRows[s][h];
     end;
-    FFTRadix2InPlace(colRe, colIm, L, false);
+    FFTPlanExecute(FPlanL, colRe, colIm, false);
     pos := h;   // #12: carry s*D+h as a running offset instead of a multiply
     for s := 0 to LM1 do
     begin
@@ -90360,6 +90363,7 @@ begin
   SetLength(FcSpecRe, N); SetLength(FcSpecIm, N);
   SetLength(FcSpecW, N);
   FcSpecValid := False;
+  FFTPlanInit(FFFTPlan, N);
   InitDefault();
   // The kernel c is the only learned operator; keep the bias neuron at 0 so the
   // layer starts as a (near-)identity-magnitude circular convolution.
@@ -90391,13 +90395,7 @@ var
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  if FUseFFT then
-  begin
-    RequireFFTUsable();
-    ComputeFFT();
-  end
-  else
-    ComputeCPU();
+  if FUseFFT then ComputeFFT() else ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -90541,17 +90539,6 @@ begin
   end;
 end;
 
-// Guards the opt-in FFT path: the radix-2 FFT only supports power-of-two n.
-procedure TNNetCirculantLinear.RequireFFTUsable();
-begin
-  if not IsPowerOfTwo(FOutput.Size) then
-    FErrorProc
-    (
-      'TNNetCirculantLinear.UseFFT requires a power-of-two size; got '+
-      IntToStr(FOutput.Size)+'. Disable UseFFT to use the direct O(n^2) path.'
-    );
-end;
-
 // FFT(c) is reused by every FFT path until the kernel weights actually change,
 // so it is transformed once per weight state instead of once per pass (#27). The
 // snapshot compare is O(n) against an O(n log n) transform.
@@ -90577,7 +90564,7 @@ begin
     FcSpecRe[i] := Kernel.FData[i];
     FcSpecIm[i] := 0;
   end;
-  FFTRadix2InPlace(FcSpecRe, FcSpecIm, N, false);
+  FFTPlanExecute(FFFTPlan, FcSpecRe, FcSpecIm, false);
   Move(Kernel.FData[0], FcSpecW[0], N * csNeuralFloatSize);
   FcSpecValid := True;
 end;
@@ -90600,7 +90587,7 @@ begin
   begin
     FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
   end;
-  FFTRadix2InPlace(FxReBuf, FxImBuf, N, false);
+  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, false);
   // Pointwise complex product C .* X.
   for i := 0 to NM1 do
   begin
@@ -90608,7 +90595,7 @@ begin
     yIm := FcSpecRe[i] * FxImBuf[i] + FcSpecIm[i] * FxReBuf[i];
     FcReBuf[i] := yRe; FcImBuf[i] := yIm;
   end;
-  FFTRadix2InPlace(FcReBuf, FcImBuf, N, true);
+  FFTPlanExecute(FFFTPlan, FcReBuf, FcImBuf, true);
   if FSuppressBias = 0 then
     for i := 0 to NM1 do
       FOutput.FData[i] := FcReBuf[i] + Bias.FData[i]
@@ -90636,7 +90623,7 @@ begin
   begin
     FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
   end;
-  FFTRadix2InPlace(FeReBuf, FeImBuf, N, false);
+  FFTPlanExecute(FFFTPlan, FeReBuf, FeImBuf, false);
   // conj(C) .* E
   for i := 0 to NM1 do
   begin
@@ -90644,7 +90631,7 @@ begin
     gIm := FcSpecRe[i] * FeImBuf[i] - FcSpecIm[i] * FeReBuf[i];
     FcReBuf[i] := gRe; FcImBuf[i] := gIm;
   end;
-  FFTRadix2InPlace(FcReBuf, FcImBuf, N, true);
+  FFTPlanExecute(FFFTPlan, FcReBuf, FcImBuf, true);
   for i := 0 to NM1 do
     LocalPrevError.FData[i] := LocalPrevError.FData[i] + FcReBuf[i];
 end;
@@ -90671,8 +90658,8 @@ begin
     FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
     FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
   end;
-  FFTRadix2InPlace(FxReBuf, FxImBuf, N, false);
-  FFTRadix2InPlace(FeReBuf, FeImBuf, N, false);
+  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, false);
+  FFTPlanExecute(FFFTPlan, FeReBuf, FeImBuf, false);
   // conj(X) .* E
   for i := 0 to NM1 do
   begin
@@ -90680,7 +90667,7 @@ begin
     gIm := FxReBuf[i] * FeImBuf[i] - FxImBuf[i] * FeReBuf[i];
     FxReBuf[i] := gRe; FxImBuf[i] := gIm;
   end;
-  FFTRadix2InPlace(FxReBuf, FxImBuf, N, true);
+  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, true);
   for i := 0 to NM1 do
   begin
     KernelDelta.FData[i] := KernelDelta.FData[i] + lr * FxReBuf[i];
@@ -91835,8 +91822,8 @@ end;
 //   x  --FFT-->  Xhat  --complex matmul R[m]-->  Yhat  --(real)IFFT-->  y
 // truncated to the lowest FModes modes. Because every stage is linear over the
 // reals, backward is the EXACT transpose of each stage (derived in full in the
-// class header). The real radix-2 FFT/IFFT is FFTRadix2InPlace (proven < 1e-5 vs
-// the direct DFT in TNNetFourierMix) -- we do NOT hand-roll a second FFT.
+// class header). The FFT/IFFT is the shared TFFTPlan (any SeqLen) -- we do NOT
+// hand-roll a second FFT.
 
 constructor TNNetSpectralConv1D.Create(pOutDepth, pModes: integer);
 begin
@@ -91917,9 +91904,6 @@ begin
       IntToStr(pPrevLayer.Output.SizeY) + '.');
   FSeqLen := pPrevLayer.Output.SizeX;
   FInDepth := pPrevLayer.Output.Depth;
-  if not IsPowerOfTwo(FSeqLen) then
-    FErrorProc('TNNetSpectralConv1D requires a power-of-two SeqLen (radix-2 FFT); got SeqLen=' +
-      IntToStr(FSeqLen) + '.');
   if FModes > FSeqLen then
     FErrorProc('TNNetSpectralConv1D: Modes (' + IntToStr(FModes) +
       ') must be <= SeqLen (' + IntToStr(FSeqLen) + ').');
@@ -91938,6 +91922,7 @@ begin
   FNeurons[0].FBiasWeight := 0;
   BuildArrNeurons();
 
+  FFTPlanInit(FFFTPlan, FSeqLen);
   SetLength(FXre, FInDepth, FSeqLen);
   SetLength(FXim, FInDepth, FSeqLen);
   // FSreBuf/FSimBuf are forward Compute scratch; the rest is backprop-only.
@@ -92052,7 +92037,7 @@ begin
       FXim[ci][n] := 0;
       Inc(pos, FInDepth);
     end;
-    FFTRadix2InPlace(FXre[ci], FXim[ci], FSeqLen, false);
+    FFTPlanExecute(FFFTPlan, FXre[ci], FXim[ci], false);
   end;
   // Pack the kept-mode input spectra into contiguous (m,ci) Single planes so the
   // InDepth contraction below is a vectorizable DotProduct.
@@ -92090,7 +92075,7 @@ begin
         TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
         TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
     end;
-    FFTRadix2InPlace(FSreBuf, FSimBuf, FSeqLen, true);  // inverse FFT (includes 1/L)
+    FFTPlanExecute(FFFTPlan, FSreBuf, FSimBuf, true);  // inverse FFT (includes 1/L)
     pos := co;
     for n := 0 to SeqLenM1 do
     begin
@@ -92153,7 +92138,7 @@ begin
       FGimBuf[n] := 0;
       Inc(pos, FOutDepth);
     end;
-    FFTRadix2InPlace(FGreBuf, FGimBuf, FSeqLen, false);
+    FFTPlanExecute(FFFTPlan, FGreBuf, FGimBuf, false);
     for m := 0 to ModesM1 do
     begin
       gyr := invL * FGreBuf[m];
@@ -92238,7 +92223,7 @@ begin
         FGreBuf[m] := FdXreBuf[ci][m];
         FGimBuf[m] := FdXimBuf[ci][m];
       end;
-      FFTRadix2InPlace(FGreBuf, FGimBuf, FSeqLen, true);  // IFFT (includes 1/L)
+      FFTPlanExecute(FFFTPlan, FGreBuf, FGimBuf, true);  // IFFT (includes 1/L)
       pos := ci;
       for n := 0 to SeqLenM1 do
       begin
@@ -92947,8 +92932,8 @@ end;
 // The forward map is the linear 2-D pipeline
 //   x --FFT2D--> Xhat --complex matmul R[mx,my]--> Yhat --(real)IFFT2D--> y
 // truncated to the lowest FModesX x FModesY 2-D modes. Every stage is linear over
-// the reals, so backward is the EXACT transpose of each stage. The radix-2 FFT is
-// FFTRadix2InPlace applied per axis -- we do NOT hand-roll a second FFT.
+// the reals, so backward is the EXACT transpose of each stage. The FFT is the
+// shared TFFTPlan applied per axis -- we do NOT hand-roll a second FFT.
 
 constructor TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY: integer);
 begin
@@ -93021,7 +93006,7 @@ end;
 
 // In-place 2-D FFT on a [x][y] grid: FFT along X (each row of fixed y) then along
 // Y (each column of fixed x). Inverse reverses nothing structurally (the FFT is
-// separable); FFTRadix2InPlace's Inverse flag already applies the 1/N per axis, so a
+// separable); FFTPlanExecute's Inverse flag already applies the 1/N per axis, so a
 // full inverse 2-D FFT divides by FSizeX*FSizeY overall.
 procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
 var
@@ -93039,7 +93024,7 @@ begin
       FFftRowRe[ix] := Re[ix][iy];
       FFftRowIm[ix] := Im[ix][iy];
     end;
-    FFTRadix2InPlace(FFftRowRe, FFftRowIm, FSizeX, Inverse);
+    FFTPlanExecute(FPlanX, FFftRowRe, FFftRowIm, Inverse);
     for ix := 0 to SizeXM1 do
     begin
       Re[ix][iy] := FFftRowRe[ix];
@@ -93048,7 +93033,7 @@ begin
   end;
   // FFT along Y for each x: Re[ix]/Im[ix] already ARE the contiguous Y rows.
   for ix := 0 to SizeXM1 do
-    FFTRadix2InPlace(Re[ix], Im[ix], FSizeY, Inverse);
+    FFTPlanExecute(FPlanY, Re[ix], Im[ix], Inverse);
 end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -93059,12 +93044,6 @@ begin
   FSizeX := pPrevLayer.Output.SizeX;
   FSizeY := pPrevLayer.Output.SizeY;
   FInDepth := pPrevLayer.Output.Depth;
-  if not IsPowerOfTwo(FSizeX) then
-    FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeX (radix-2 FFT); got SizeX=' +
-      IntToStr(FSizeX) + '.');
-  if not IsPowerOfTwo(FSizeY) then
-    FErrorProc('TNNetSpectralConv2D requires a power-of-two SizeY (radix-2 FFT); got SizeY=' +
-      IntToStr(FSizeY) + '.');
   if FModesX > FSizeX then
     FErrorProc('TNNetSpectralConv2D: ModesX (' + IntToStr(FModesX) +
       ') must be <= SizeX (' + IntToStr(FSizeX) + ').');
@@ -93098,6 +93077,8 @@ begin
   SetLength(FximPlane, FModesX * FModesY * FInDepth);
   SetLength(FFftRowRe, FSizeX);
   SetLength(FFftRowIm, FSizeX);
+  FFTPlanInit(FPlanX, FSizeX);
+  FFTPlanInit(FPlanY, FSizeY);
   if FIsTrainable then SizeBackpropScratch();
 
   InitDefault();

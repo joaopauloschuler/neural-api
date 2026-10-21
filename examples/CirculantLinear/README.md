@@ -69,12 +69,13 @@ By default the forward and backward passes use the direct **O(n²)** circular su
 (clear and easy to verify against finite differences). Setting
 
 ```pascal
-CL := TNNetCirculantLinear.Create(n);  // n MUST be a power of two for FFT
+CL := TNNetCirculantLinear.Create(n);  // any n
 CL.UseFFT := true;                     // opt-in O(n log n) path
 ```
 
 switches **both the forward and the backward** to a frequency-domain
-implementation backed by a self-contained **radix-2 Cooley-Tukey FFT**:
+implementation backed by the shared **`TFFTPlan`** (radix-2 for a power-of-two
+`n`, Bluestein for any other `n`):
 
 - forward: `y = IFFT( FFT(c) .* FFT(x) ) + bias`,
 - input gradient: `dx = IFFT( conj(FFT(c)) .* FFT(e) )` (a circular correlation),
@@ -84,9 +85,7 @@ This is O(n log n) instead of O(n²). The direct path stays the **default** and 
 the numerical source of truth; a test (`TestCirculantLinearFFTEquivalence` in
 `tests/TestNeuralNumerical.pas`) asserts the FFT path reproduces the direct
 forward output, input gradient and kernel/bias deltas to **< 1e-5** on a random
-kernel/input/error. The radix-2 transform requires `n` to be a power of two;
-`UseFFT` errors clearly otherwise (disable it to use the direct path for any
-`n`). The FFT works in double precision internally so the round-trip stays
+kernel/input/error, at power-of-two and non-power-of-two `n`. The FFT works in double precision internally so the round-trip stays
 faithful even when `TNeuralFloat` is single precision. A direct-vs-FFT
 wall-clock chart as `n` grows is not included here.
 

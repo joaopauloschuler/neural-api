@@ -70,16 +70,15 @@ works for **arbitrary** `SeqLen` and `d` and is the numerical source of truth.
 Setting
 
 ```pascal
-FM := TNNetFourierMix.Create;  // SeqLen and d MUST be powers of two for FFT
-FM.UseFFT := true;             // opt-in separable radix-2 FFT path
+FM := TNNetFourierMix.Create;  // any SeqLen and d
+FM.UseFFT := true;             // opt-in separable FFT path
 ```
 
 switches the mixing to a separable 2D FFT (FFT along the hidden axis, then along
-the sequence axis, keep the real part), backed by a self-contained radix-2
-Cooley-Tukey FFT in double precision. A test
+the sequence axis, keep the real part), backed by the shared `TFFTPlan`
+(radix-2 for a power of two, Bluestein for any other length) in double precision. A test
 (`TestFourierMixFFTMatchesDirect` in `tests/TestNeuralNumerical.pas`) asserts the
-FFT output reproduces the direct output to **< 1e-5**; `UseFFT` errors clearly if
-either axis is not a power of two (disable it to use the direct path for any
-shape). `UseFFT` round-trips through `SaveToString` / `LoadFromString`.
+FFT output reproduces the direct output to **< 1e-5**, at power-of-two and
+non-power-of-two shapes. `UseFFT` round-trips through `SaveToString` / `LoadFromString`.
 
 Coded by Claude (AI).

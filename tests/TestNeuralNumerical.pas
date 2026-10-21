@@ -247,6 +247,7 @@ type
     // TNNetCirculantLinear structured-matrix dense layer
     procedure TestCirculantLinearKnownConvolution;
     procedure TestCirculantLinearGradientCheck;
+    procedure TestCirculantLinearGradientCheckNonPow2FFT;
     procedure TestCirculantLinearSerializationRoundTrip;
     procedure TestCirculantLinearFFTEquivalence;
     // TNNetHouseholderLinear exactly-orthogonal dense layer
@@ -285,6 +286,7 @@ type
     procedure TestOctonionLinearSerializationRoundTrip;
     // TNNetSpectralConv1D Fourier Neural Operator spectral conv layer
     procedure TestSpectralConv1DGradientCheck;
+    procedure TestSpectralConv1DGradientCheckNonPow2;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
     // TNNetDWT1D lifting-scheme single-level 1-D discrete wavelet transform
@@ -294,6 +296,9 @@ type
     procedure TestDWT1DReconstructionOracle;
     // TNNetSpectralConv2D 2-D Fourier Neural Operator spectral conv layer
     procedure TestSpectralConv2DGradientCheck;
+    procedure TestSpectralConv2DGradientCheckNonPow2;
+    // Non-power-of-two (and one radix-2) SpectralConv1D/2D forward vs a naive DFT.
+    procedure TestSpectralConvNonPow2MatchesNaiveDFT;
     procedure TestSpectralConv2DShapeAndTruncation;
     procedure TestSpectralConv2DSerializationRoundTrip;
     procedure TestSpectralConvInferenceOnlyWeightPlanes;
@@ -8498,10 +8503,13 @@ end;
 
 procedure TTestNeuralNumerical.TestFourierMixGradientCheckNonPow2;
 begin
-  // NON-power-of-two shape (3,1,5) proving the direct O(n^2) path and its adjoint
-  // are exact for arbitrary SeqLen/Depth.
+  // NON-power-of-two shapes proving the direct O(n^2) path, the Bluestein FFT
+  // path and their adjoints are exact for arbitrary SeqLen/Depth.
   RandSeed := 424242;
   FourierMixGradCheck(Self, 3, 5, 0, 'FourierMix(3,1,5) direct');
+  FourierMixGradCheck(Self, 3, 5, 1, 'FourierMix(3,1,5) FFT');
+  FourierMixGradCheck(Self, 5, 3, 1, 'FourierMix(5,1,3) FFT');
+  FourierMixGradCheck(Self, 6, 2, 1, 'FourierMix(6,1,2) FFT');
 end;
 
 procedure TTestNeuralNumerical.TestFourierMixLoadFromString;
@@ -8708,7 +8716,8 @@ var
   Input: TNNetVolume;
   i: integer;
 begin
-  // The opt-in radix-2 FFT fast path must reproduce the direct O(n^2) path to
+  // The opt-in FFT fast path (radix-2 plan here; TestFourierMixDirectSeparableMatchesNaive
+  // covers Bluestein) must reproduce the direct O(n^2) path to
   // < 1e-5 on a power-of-two (8,1,4) shape.
   RandSeed := 424242;
   NNDirect := TNNet.Create();
@@ -8780,15 +8789,16 @@ var
   Input: TNNetVolume;
   Shapes: array[0..6, 0..1] of integer =
     ((3, 5), (6, 10), (7, 7), (12, 9), (1, 6), (5, 1), (9, 4));
-  ShapeIdx, L, D, a, b, s, h, LM1, DM1, SizeM1: integer;
+  ShapeIdx, L, D, a, b, s, h, LM1, DM1, SizeM1, UseFFT: integer;
   Acc, TwoPi: Double;
 begin
   // The direct path is SEPARABLE (cos(A+B) expansion) and reads fundamental
   // twiddle tables with a carried, conditionally-wrapped index. Pin it against
   // a verbatim naive sum_{s,h} x[s,h]*Cos(2*pi*(a*s/L + b*h/D)) reference over
-  // NON-power-of-two shapes (which TestFourierMixFFTMatchesDirect cannot cover)
-  // plus the degenerate L=1 and D=1 axes, so a wrong table wrap is caught.
+  // NON-power-of-two shapes plus the degenerate L=1 and D=1 axes, so a wrong
+  // table wrap is caught. The FFT path (Bluestein here) is held to the same sum.
   TwoPi := 2 * Pi;
+  for UseFFT := 0 to 1 do
   for ShapeIdx := 0 to 6 do
   begin
     L := Shapes[ShapeIdx][0];
@@ -8799,7 +8809,7 @@ begin
     Input := TNNetVolume.Create(L, 1, D);
     try
       NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
-      NN.AddLayer(TNNetFourierMix.Create(0)); // direct path
+      NN.AddLayer(TNNetFourierMix.Create(UseFFT));
       SizeM1 := Input.Size - 1;
       for s := 0 to SizeM1 do
         Input.Raw[s] := Sin(s * 1.1 + 0.4) * 1.7 + Cos(s * 0.23) * 0.4;
@@ -8812,7 +8822,7 @@ begin
             for h := 0 to DM1 do
               Acc := Acc + Input.Raw[s * D + h] *
                 Cos(TwoPi * (a * s) / L + TwoPi * (b * h) / D);
-          AssertEquals('FourierMix direct ' + IntToStr(L) + 'x' + IntToStr(D) +
+          AssertEquals('FourierMix UseFFT=' + IntToStr(UseFFT) + ' ' + IntToStr(L) + 'x' + IntToStr(D) +
             ' at (' + IntToStr(a) + ',' + IntToStr(b) + ')',
             Acc, NN.GetLastLayer.Output.Raw[a * D + b], 1e-3);
         end;
@@ -60527,13 +60537,14 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestCirculantLinearGradientCheck;
+procedure CirculantLinearGradCheck(ATestCase: TTestCase; N: integer;
+  UseFFT: boolean);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
   CL: TNNetCirculantLinear;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
-  i, N: integer;
+  i: integer;
 
   function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
   var
@@ -60554,7 +60565,6 @@ begin
   // kernel c (and the per-output bias). Reseed the shared RNG per the
   // numerical-test ordering rule.
   RandSeed := 424242;
-  N := 5;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(1, 1, N);
   InputPlus := TNNetVolume.Create(1, 1, N);
@@ -60564,6 +60574,7 @@ begin
     NN.AddLayer(TNNetInput.Create(1, 1, N, 1));
     CL := TNNetCirculantLinear.Create(N);
     NN.AddLayer(CL);
+    CL.UseFFT := UseFFT;
     // LearningRate 1 + batch update: deltas accumulate -gradient, weights stay
     // fixed, so finite differences remain valid.
     NN.SetLearningRate(1.0, 0.0);
@@ -60592,7 +60603,7 @@ begin
       NN.Backpropagate(Desired);
       analyticalGrad := NN.Layers[0].OutputError.Raw[i];
 
-      AssertTrue('CirculantLinear input gradient check at ' + IntToStr(i) +
+      ATestCase.AssertTrue('CirculantLinear(' + IntToStr(N) + ') input gradient check at ' + IntToStr(i) +
         ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
         FloatToStr(analyticalGrad) + ')',
         Abs(numericalGrad - analyticalGrad) < 0.01);
@@ -60615,7 +60626,7 @@ begin
       // Delta := Delta - LearningRate*gradient with LR=1 => grad = -Delta.
       analyticalGrad := -CL.Neurons[0].Delta.Raw[i];
 
-      AssertTrue('CirculantLinear kernel gradient check at ' + IntToStr(i) +
+      ATestCase.AssertTrue('CirculantLinear(' + IntToStr(N) + ') kernel gradient check at ' + IntToStr(i) +
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -60636,7 +60647,7 @@ begin
       NN.Backpropagate(Desired);
       analyticalGrad := -CL.Neurons[1].Delta.Raw[i];
 
-      AssertTrue('CirculantLinear bias gradient check at ' + IntToStr(i) +
+      ATestCase.AssertTrue('CirculantLinear(' + IntToStr(N) + ') bias gradient check at ' + IntToStr(i) +
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -60646,6 +60657,18 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearGradientCheck;
+begin
+  CirculantLinearGradCheck(Self, 5, false);
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearGradientCheckNonPow2FFT;
+begin
+  // Non-power-of-two n on the FFT path runs the Bluestein plan.
+  CirculantLinearGradCheck(Self, 7, true);
+  CirculantLinearGradCheck(Self, 6, true);
 end;
 
 procedure TTestNeuralNumerical.TestCirculantLinearSerializationRoundTrip;
@@ -62507,13 +62530,13 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestSpectralConv1DGradientCheck;
+procedure SpectralConv1DGradCheck(ATestCase: TTestCase; SeqLen: integer);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
   SC: TNNetSpectralConv1D;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
-  i, SeqLen, InDepth, OutDepth, Modes, InSize, OutSize, WCount: integer;
+  i, InDepth, OutDepth, Modes, InSize, OutSize, WCount: integer;
 
   function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
   var
@@ -62537,7 +62560,7 @@ begin
   // a real bug. (TestNeuralNumerical shares one RNG; reseed to avoid tripping
   // unrelated ordering-sensitive checks.)
   RandSeed := 424242;
-  SeqLen := 8; InDepth := 2; OutDepth := 2; Modes := 3;
+  InDepth := 2; OutDepth := 2; Modes := 3;
   InSize := SeqLen * InDepth;
   OutSize := SeqLen * OutDepth;
   NN := TNNet.Create();
@@ -62577,7 +62600,7 @@ begin
       analyticalGrad := NN.Layers[0].OutputError.Raw[i];
       maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
 
-      AssertTrue('SpectralConv1D input gradient check at ' + IntToStr(i) +
+      ATestCase.AssertTrue('SpectralConv1D input gradient check at ' + IntToStr(i) +
         ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
         FloatToStr(analyticalGrad) + ')',
         Abs(numericalGrad - analyticalGrad) < 0.01);
@@ -62599,7 +62622,7 @@ begin
       analyticalGrad := -SC.Neurons[0].Delta.Raw[i];
       maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
 
-      AssertTrue('SpectralConv1D weight gradient check c=' + IntToStr(i) +
+      ATestCase.AssertTrue('SpectralConv1D weight gradient check c=' + IntToStr(i) +
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -62610,6 +62633,18 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DGradientCheck;
+begin
+  SpectralConv1DGradCheck(Self, 8);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DGradientCheckNonPow2;
+begin
+  // SeqLen 7 and 12 run the Bluestein plan.
+  SpectralConv1DGradCheck(Self, 7);
+  SpectralConv1DGradCheck(Self, 12);
 end;
 
 procedure TTestNeuralNumerical.TestSpectralConv1DModesTruncation;
@@ -64674,13 +64709,13 @@ begin
   WriteLn('  DWT1D reconstruction-oracle max-abs-error: ', maxErr:0:10);
 end;
 
-procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheck;
+procedure SpectralConv2DGradCheck(ATestCase: TTestCase; SizeX, SizeY: integer);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
   SC: TNNetSpectralConv2D;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
-  i, SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY, InSize, OutSize, WCount: integer;
+  i, InDepth, OutDepth, ModesX, ModesY, InSize, OutSize, WCount: integer;
 
   function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
   var
@@ -64702,7 +64737,7 @@ begin
   // keep finite-difference truncation small -- tolerance is NOT loosened to mask
   // a bug. (Shared RNG; reseed to avoid tripping ordering-sensitive checks.)
   RandSeed := 424242;
-  SizeX := 4; SizeY := 4; InDepth := 2; OutDepth := 2; ModesX := 2; ModesY := 3;
+  InDepth := 2; OutDepth := 2; ModesX := 2; ModesY := 3;
   InSize := SizeX * SizeY * InDepth;
   OutSize := SizeX * SizeY * OutDepth;
   NN := TNNet.Create();
@@ -64742,7 +64777,7 @@ begin
       analyticalGrad := NN.Layers[0].OutputError.Raw[i];
       maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
 
-      AssertTrue('SpectralConv2D input gradient check at ' + IntToStr(i) +
+      ATestCase.AssertTrue('SpectralConv2D input gradient check at ' + IntToStr(i) +
         ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
         FloatToStr(analyticalGrad) + ')',
         Abs(numericalGrad - analyticalGrad) < 0.01);
@@ -64764,7 +64799,7 @@ begin
       analyticalGrad := -SC.Neurons[0].Delta.Raw[i];
       maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
 
-      AssertTrue('SpectralConv2D weight gradient check c=' + IntToStr(i) +
+      ATestCase.AssertTrue('SpectralConv2D weight gradient check c=' + IntToStr(i) +
         ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
         Abs(numericalGrad - analyticalGrad) < 0.01);
     end;
@@ -64775,6 +64810,122 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheck;
+begin
+  SpectralConv2DGradCheck(Self, 4, 4);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheckNonPow2;
+begin
+  // SizeX 6 / SizeY 5 run the Bluestein plan on both axes; 4 x 3 mixes radix-2
+  // on X with Bluestein on Y.
+  SpectralConv2DGradCheck(Self, 6, 5);
+  SpectralConv2DGradCheck(Self, 4, 3);
+end;
+
+// Naive forward of TNNetSpectralConv1D/2D: per-(kx,ky) direct DFT of the input,
+// the complex matmul on the kept low corner, then a direct inverse DFT (real part).
+// The 1D layer is the SizeY = 1, ModesY = 1 case of the same weight layout.
+procedure NaiveSpectralConvForward(Input, W, Output: TNNetVolume;
+  OutDepth, ModesX, ModesY: integer);
+var
+  SizeX, SizeY, InDepth, x, y, ci, co, mx, my, b: integer;
+  Ang, Xr, Xi, Yr, Yi, Acc, Wr, Wi: Double;
+  SpecRe, SpecIm: array of Double;   // [(mx*ModesY+my)*InDepth+ci]
+begin
+  SizeX := Input.SizeX; SizeY := Input.SizeY; InDepth := Input.Depth;
+  SetLength(SpecRe, ModesX * ModesY * InDepth);
+  SetLength(SpecIm, ModesX * ModesY * InDepth);
+  for mx := 0 to ModesX - 1 do
+    for my := 0 to ModesY - 1 do
+      for ci := 0 to InDepth - 1 do
+      begin
+        Xr := 0; Xi := 0;
+        for x := 0 to SizeX - 1 do
+          for y := 0 to SizeY - 1 do
+          begin
+            Ang := 2 * Pi * (mx * x / SizeX + my * y / SizeY);
+            Xr := Xr + Input[x, y, ci] * Cos(Ang);
+            Xi := Xi - Input[x, y, ci] * Sin(Ang);
+          end;
+        SpecRe[(mx * ModesY + my) * InDepth + ci] := Xr;
+        SpecIm[(mx * ModesY + my) * InDepth + ci] := Xi;
+      end;
+  Output.ReSize(SizeX, SizeY, OutDepth);
+  for co := 0 to OutDepth - 1 do
+    for x := 0 to SizeX - 1 do
+      for y := 0 to SizeY - 1 do
+      begin
+        Acc := 0;
+        for mx := 0 to ModesX - 1 do
+          for my := 0 to ModesY - 1 do
+          begin
+            Yr := 0; Yi := 0;
+            for ci := 0 to InDepth - 1 do
+            begin
+              b := (((mx * ModesY + my) * InDepth + ci) * OutDepth + co) * 2;
+              Wr := W.FData[b]; Wi := W.FData[b + 1];
+              Xr := SpecRe[(mx * ModesY + my) * InDepth + ci];
+              Xi := SpecIm[(mx * ModesY + my) * InDepth + ci];
+              Yr := Yr + Wr * Xr - Wi * Xi;
+              Yi := Yi + Wr * Xi + Wi * Xr;
+            end;
+            Ang := 2 * Pi * (mx * x / SizeX + my * y / SizeY);
+            Acc := Acc + Yr * Cos(Ang) - Yi * Sin(Ang);
+          end;
+        Output[x, y, co] := Acc / (SizeX * SizeY);
+      end;
+end;
+
+// Builds Input -> layer, fills deterministic input/weights, and asserts the
+// layer forward equals NaiveSpectralConvForward.
+procedure SpectralConvNaiveParityCheck(ATestCase: TTestCase; SC: TNNetLayer;
+  SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY: integer; const AName: string);
+var
+  NN: TNNet;
+  Input, Want: TNNetVolume;
+  W: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, InDepth);
+  Want := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth));
+    NN.AddLayer(SC);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37 + 0.2) * 0.8 + Cos(i * 1.21) * 0.3;
+    W := SC.Neurons[0].Weights;
+    for i := 0 to W.Size - 1 do
+      W.Raw[i] := 0.3 * Sin(i * 0.91 + 0.1);
+    // A trainable layer rebuilds its weight planes on every forward.
+    NN.Compute(Input);
+    NaiveSpectralConvForward(Input, W, Want, OutDepth, ModesX, ModesY);
+    ATestCase.AssertEquals(AName + ' output size', Want.Size, SC.Output.Size);
+    for i := 0 to Want.Size - 1 do
+      ATestCase.AssertEquals(AName + ' at ' + IntToStr(i),
+        Want.Raw[i], SC.Output.Raw[i], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+    Want.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConvNonPow2MatchesNaiveDFT;
+begin
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(3, 4),
+    12, 1, 2, 3, 4, 1, 'SpectralConv1D L=12');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(2, 7),
+    7, 1, 3, 2, 7, 1, 'SpectralConv1D L=7 all modes');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(2, 3),
+    16, 1, 2, 2, 3, 1, 'SpectralConv1D L=16 (radix-2)');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 3, 2),
+    6, 5, 2, 2, 3, 2, 'SpectralConv2D 6x5');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(3, 2, 3),
+    8, 7, 2, 3, 2, 3, 'SpectralConv2D 8x7');
 end;
 
 procedure TTestNeuralNumerical.TestSpectralConv2DShapeAndTruncation;
@@ -88272,20 +88423,19 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestCirculantLinearFFTEquivalence;
+procedure CirculantLinearFFTEquivalenceCheck(ATestCase: TTestCase; N: integer);
 var
   NNDirect, NNFFT: TNNet;
   Input, Desired: TNNetVolume;
   CLDirect, CLFFT: TNNetCirculantLinear;
-  N, i: integer;
+  i: integer;
 begin
-  // The opt-in radix-2 FFT path (UseFFT := true) must reproduce the DEFAULT
+  // The opt-in FFT path (UseFFT := true) must reproduce the DEFAULT
   // direct O(n^2) path for BOTH the forward output and the backward gradients
   // (input error + kernel delta + bias delta) to < 1e-5 on a random
-  // kernel/input/error. n is a power of two (FFT requirement). Reseed the
+  // kernel/input/error at any n. Reseed the
   // shared RNG per the numerical-test ordering rule.
   RandSeed := 424242;
-  N := 16;
   Input := TNNetVolume.Create(1, 1, N);
   Desired := TNNetVolume.Create(1, 1, N);
 
@@ -88322,7 +88472,7 @@ begin
     NNDirect.Compute(Input);
     NNFFT.Compute(Input);
     for i := 0 to N - 1 do
-      AssertTrue('CirculantLinear FFT forward matches direct at ' + IntToStr(i) +
+      ATestCase.AssertTrue('CirculantLinear FFT forward matches direct at ' + IntToStr(i) +
         ' direct=' + FloatToStr(NNDirect.GetLastLayer.Output.Raw[i]) +
         ' fft=' + FloatToStr(NNFFT.GetLastLayer.Output.Raw[i]),
         Abs(NNDirect.GetLastLayer.Output.Raw[i] -
@@ -88339,13 +88489,13 @@ begin
 
     for i := 0 to N - 1 do
     begin
-      AssertTrue('CirculantLinear FFT input-grad matches direct at ' + IntToStr(i),
+      ATestCase.AssertTrue('CirculantLinear FFT input-grad matches direct at ' + IntToStr(i),
         Abs(NNDirect.Layers[0].OutputError.Raw[i] -
             NNFFT.Layers[0].OutputError.Raw[i]) < 1e-5);
-      AssertTrue('CirculantLinear FFT kernel-delta matches direct at ' + IntToStr(i),
+      ATestCase.AssertTrue('CirculantLinear FFT kernel-delta matches direct at ' + IntToStr(i),
         Abs(CLDirect.Neurons[0].Delta.Raw[i] -
             CLFFT.Neurons[0].Delta.Raw[i]) < 1e-5);
-      AssertTrue('CirculantLinear FFT bias-delta matches direct at ' + IntToStr(i),
+      ATestCase.AssertTrue('CirculantLinear FFT bias-delta matches direct at ' + IntToStr(i),
         Abs(CLDirect.Neurons[1].Delta.Raw[i] -
             CLFFT.Neurons[1].Delta.Raw[i]) < 1e-5);
     end;
@@ -88355,6 +88505,13 @@ begin
     Input.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestCirculantLinearFFTEquivalence;
+begin
+  CirculantLinearFFTEquivalenceCheck(Self, 16);  // radix-2 plan
+  CirculantLinearFFTEquivalenceCheck(Self, 12);  // Bluestein plan
+  CirculantLinearFFTEquivalenceCheck(Self, 7);
 end;
 
 procedure TTestNeuralNumerical.TestKANLayerGradientCheck;

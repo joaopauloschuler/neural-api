@@ -81,10 +81,6 @@ modest epochs — finishes in about **3 minutes** on 2 cores and uses little
 memory. The data-generation Jacobi solve (especially the `32×32` evaluation set)
 dominates the runtime. No binaries are committed.
 
-> **Grid must be a power of two.** `TNNetSpectralConv2D` uses a separable radix-2
-> FFT, so both spatial dimensions must be powers of two (here `16` and `32`). A
-> non-power-of-two grid trips the FFT assertion.
-
 ## Representative output
 
 ```
