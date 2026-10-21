@@ -86,7 +86,10 @@ rather than acted on.
       inference-only).
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
-      denormals inside the layer's FFT so callers don't have to.
+      denormals inside the layer's FFT so callers don't have to. Since
+      5b223b30 the layer runs the shared `TFFTPlan` (neuralvolume.pas), so a
+      guard belongs in `FFTPlanExecute` / `FFTRadix2InPlace` once, not in the
+      layer; first re-check whether examples/DarcyFlowFNO still needs its mask.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
@@ -1966,6 +1969,13 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       weight gradients), TestCausalConv1DOpenCLParity +2 SizeY>1 cases,
       TestCogVideoXParity checks whole-frame vs per-cell vs 3-cell blocks.
       Not measured on a GPU box (no timing claim).
+- [ ] GPU-box checks for two a20 device paths, unmeasured on the dev box:
+      (a) `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` (d7c177dd, direct O(N^2)
+      DFT per line) inside examples/LaMaInpaint at 512x512: FFT share of the
+      generator forward, and whether the whole generator stays resident;
+      (b) CogVideoX VAE decode after cc4432cc (one `TNNetCausalConv1D` forward
+      per frame, `csCogVideoXVaeMaxCellsPerForward` = 4096): decode time per
+      frame against the parent commit.
 - [ ] GPU-box check: `cai_sdpa_flash` gained a uniform score-bias branch
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased
