@@ -2053,6 +2053,22 @@ cannot pay for its own transfer.
 
 ## Layer follow-ups that fix real limitations
 
+- [ ] Move the remaining FFT callers onto the shared `TFFTPlan` (Bluestein, any N;
+      neuralvolume.pas, 5a2f88e5) so they stop requiring power-of-two sizes:
+      `TNNetFourierMix` and `TNNetCirculantLinear` still reject non-power-of-two
+      lengths, and the audio inverse STFT in neuralaudio.pas still runs a direct
+      O(N^2) DFT for other sizes. Each plan is a field built in SetPrevLayer (a
+      plan is not thread-safe: one per worker on a chunked path). Tests: the
+      layer's existing gradient checks at a non-power-of-two length.
+- [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
+      (the even/odd split trick) to halve the row cost. Low priority: the FFTs
+      are small next to LaMa's convolutions; do it only if a profile shows them.
+- [ ] Decision for the user: inference-time release of the convolution im2col
+      matrix (`FInputPrepared`). Every convolution keeps it after the forward in
+      both memory modes; for big-lama at 512x512 that is ~6.7 GB of the ~8.6 GB
+      estimate. Options: free/share it when the net is not trainable, or tile the
+      im2col along Y. Library-wide; propose and wait for approval before coding.
+
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
       importer). The single-cell `TNNetLSTMCell`/`TNNetGRUCell` (torch fused
