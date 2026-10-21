@@ -297,6 +297,12 @@ type
     procedure TestSpectralConv2DShapeAndTruncation;
     procedure TestSpectralConv2DSerializationRoundTrip;
     procedure TestSpectralConvInferenceOnlyWeightPlanes;
+    // TNNetRealFFT2D / TNNetInverseRealFFT2D (torch.fft.rfft2 / irfft2 port)
+    procedure TestRealFFT2DMatchesNaiveDFT;
+    procedure TestInverseRealFFT2DMatchesNaiveDFT;
+    procedure TestRealFFT2DRoundTrip;
+    procedure TestRealFFT2DGradientCheck;
+    procedure TestRealFFT2DSerializationRoundTrip;
     // AddFourierNeuralOperator1D/2D block builders (spectral + pointwise residual)
     procedure TestFourierNeuralOperator1DShape;
     procedure TestFourierNeuralOperator2DShape;
@@ -64878,6 +64884,321 @@ begin
     NN.Free;
     NNRef.Free;
     Input2.Free;
+  end;
+end;
+
+// Naive torch.fft.rfft2 (Wh, Height, 2C) of the real (Width, Height, C) volume X for the given norm.
+procedure NaiveRealFFT2D(X, Y: TNNetVolume; Norm: integer);
+var
+  Width, Height, C, Wh, kh, kw, h, w, ch: integer;
+  SumRe, SumIm, Theta, Scale: Double;
+begin
+  Width := X.SizeX; Height := X.SizeY; C := X.Depth; Wh := Width div 2 + 1;
+  case Norm of
+    csFFTNormOrtho: Scale := 1.0 / Sqrt(Width * Height);
+    csFFTNormForward: Scale := 1.0 / (Width * Height);
+  else
+    Scale := 1.0;
+  end;
+  Y.ReSize(Wh, Height, 2 * C);
+  for ch := 0 to C - 1 do
+    for kh := 0 to Height - 1 do
+      for kw := 0 to Wh - 1 do
+      begin
+        SumRe := 0; SumIm := 0;
+        for h := 0 to Height - 1 do
+          for w := 0 to Width - 1 do
+          begin
+            Theta := 2 * Pi * ((kh * h) / Height + (kw * w) / Width);
+            SumRe := SumRe + X[w, h, ch] * Cos(Theta);
+            SumIm := SumIm - X[w, h, ch] * Sin(Theta);
+          end;
+        Y[kw, kh, 2 * ch] := SumRe * Scale;
+        Y[kw, kh, 2 * ch + 1] := SumIm * Scale;
+      end;
+end;
+
+// Naive torch.fft.irfft2(s=(Height, Width)): c2c inverse over Height, then c2r over Width (drops Im of DC/Nyquist).
+procedure NaiveInverseRealFFT2D(Y, X: TNNetVolume; Width, Norm: integer);
+var
+  Height, C, Wh, kh, kw, h, w, ch: integer;
+  Sum, Theta, Scale, BinWeight: Double;
+begin
+  Height := Y.SizeY; C := Y.Depth div 2; Wh := Width div 2 + 1;
+  case Norm of
+    csFFTNormOrtho: Scale := 1.0 / Sqrt(Width * Height);
+    csFFTNormForward: Scale := 1.0;
+  else
+    Scale := 1.0 / (Width * Height);
+  end;
+  X.ReSize(Width, Height, C);
+  for ch := 0 to C - 1 do
+    for h := 0 to Height - 1 do
+      for w := 0 to Width - 1 do
+      begin
+        Sum := 0;
+        for kw := 0 to Wh - 1 do
+        begin
+          if (kw = 0) or ((Width mod 2 = 0) and (kw = Width div 2)) then BinWeight := 1 else BinWeight := 2;
+          for kh := 0 to Height - 1 do
+          begin
+            Theta := 2 * Pi * ((kh * h) / Height + (kw * w) / Width);
+            Sum := Sum + BinWeight *
+              (Y[kw, kh, 2 * ch] * Cos(Theta) - Y[kw, kh, 2 * ch + 1] * Sin(Theta));
+          end;
+        end;
+        X[w, h, ch] := Sum * Scale;
+      end;
+end;
+
+function MaxScaledDiff(A, B: TNNetVolume): Double;
+var
+  i: integer;
+begin
+  Result := 0;
+  for i := 0 to A.Size - 1 do
+    Result := Max(Result, Abs(A.Raw[i] - B.Raw[i]) / Max(1.0, Abs(B.Raw[i])));
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DMatchesNaiveDFT;
+const
+  cShapes: array[0..3, 0..2] of integer = ((8, 8, 2), (10, 6, 2), (7, 5, 3), (1, 3, 1));
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  ShapeCnt, Norm, i: integer;
+  Diff: Double;
+begin
+  Input := TNNetVolume.Create();
+  Expected := TNNetVolume.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+      for Norm := csFFTNormBackward to csFFTNormForward do
+      begin
+        Input.ReSize(cShapes[ShapeCnt, 0], cShapes[ShapeCnt, 1], cShapes[ShapeCnt, 2]);
+        for i := 0 to Input.Size - 1 do
+          Input.Raw[i] := Sin(i * 0.37 + Norm) * 0.8 + 0.1;
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+          NN.AddLayer(TNNetRealFFT2D.Create(Norm));
+          NN.Compute(Input);
+          NaiveRealFFT2D(Input, Expected, Norm);
+          AssertEquals('rfft2 SizeX', Expected.SizeX, NN.GetLastLayer.Output.SizeX);
+          AssertEquals('rfft2 SizeY', Expected.SizeY, NN.GetLastLayer.Output.SizeY);
+          AssertEquals('rfft2 Depth', Expected.Depth, NN.GetLastLayer.Output.Depth);
+          Diff := MaxScaledDiff(NN.GetLastLayer.Output, Expected);
+          AssertTrue('rfft2 vs naive DFT W=' + IntToStr(Input.SizeX) + ' H=' +
+            IntToStr(Input.SizeY) + ' norm=' + IntToStr(Norm) + ' diff=' +
+            FloatToStr(Diff), Diff < 1e-5);
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    Input.Free;
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInverseRealFFT2DMatchesNaiveDFT;
+const
+  // (OutputWidth, H, C); the input half spectrum carries nonzero Im at DC and Nyquist.
+  cShapes: array[0..3, 0..2] of integer = ((8, 8, 2), (10, 6, 1), (7, 5, 2), (1, 2, 1));
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  ShapeCnt, Norm, i, W: integer;
+  Diff: Double;
+begin
+  Input := TNNetVolume.Create();
+  Expected := TNNetVolume.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+      for Norm := csFFTNormBackward to csFFTNormForward do
+      begin
+        W := cShapes[ShapeCnt, 0];
+        Input.ReSize(W div 2 + 1, cShapes[ShapeCnt, 1], 2 * cShapes[ShapeCnt, 2]);
+        for i := 0 to Input.Size - 1 do
+          Input.Raw[i] := Cos(i * 0.53 + Norm) * 0.7 - 0.05;
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+          NN.AddLayer(TNNetInverseRealFFT2D.Create(W, Norm));
+          NN.Compute(Input);
+          NaiveInverseRealFFT2D(Input, Expected, W, Norm);
+          AssertEquals('irfft2 SizeX', W, NN.GetLastLayer.Output.SizeX);
+          AssertEquals('irfft2 Depth', Expected.Depth, NN.GetLastLayer.Output.Depth);
+          Diff := MaxScaledDiff(NN.GetLastLayer.Output, Expected);
+          AssertTrue('irfft2 vs naive W=' + IntToStr(W) + ' norm=' + IntToStr(Norm) +
+            ' diff=' + FloatToStr(Diff), Diff < 1e-5);
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    Input.Free;
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DRoundTrip;
+const
+  cShapes: array[0..3, 0..2] of integer = ((8, 8, 2), (10, 6, 2), (7, 5, 3), (96, 64, 1));
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ShapeCnt, Norm, i: integer;
+  Diff: Double;
+begin
+  Input := TNNetVolume.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+      for Norm := csFFTNormBackward to csFFTNormForward do
+      begin
+        Input.ReSize(cShapes[ShapeCnt, 0], cShapes[ShapeCnt, 1], cShapes[ShapeCnt, 2]);
+        for i := 0 to Input.Size - 1 do
+          Input.Raw[i] := Sin(i * 0.91) * 1.2 - 0.3;
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+          NN.AddLayer(TNNetRealFFT2D.Create(Norm));
+          NN.AddLayer(TNNetInverseRealFFT2D.Create(Input.SizeX, Norm));
+          NN.Compute(Input);
+          Diff := MaxScaledDiff(NN.GetLastLayer.Output, Input);
+          AssertTrue('irfft2(rfft2(x)) = x W=' + IntToStr(Input.SizeX) + ' norm=' +
+            IntToStr(Norm) + ' diff=' + FloatToStr(Diff), Diff < 1e-5);
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    Input.Free;
+  end;
+end;
+
+// Max |numeric - analytic| / max(1, |analytic|) input gradient of 0.5*|out - target|^2.
+function RealFFT2DGradientError(ALayer: TNNetLayer; SizeX, SizeY, Depth: integer): Double;
+var
+  NN: TNNet;
+  Input, Probe, Target, AnalyticGrad: TNNetVolume;
+  i: integer;
+  Epsilon, LossPlus, LossMinus, Numeric, Analytic: Double;
+
+  function Loss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    Diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[k] - Target.Raw[k];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  Result := 0;
+  Epsilon := 1e-3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  Probe := TNNetVolume.Create(SizeX, SizeY, Depth);
+  Target := TNNetVolume.Create();
+  AnalyticGrad := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(ALayer);
+    Target.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Target.Size - 1 do
+      Target.Raw[i] := Cos(i * 0.61) * 0.5;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.73) * 0.4 + 0.05;
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Target);
+    AnalyticGrad.Copy(NN.Layers[0].OutputError);
+    for i := 0 to Input.Size - 1 do
+    begin
+      Analytic := AnalyticGrad.Raw[i];
+      Probe.Copy(Input);
+      Probe.Raw[i] := Input.Raw[i] + Epsilon;
+      LossPlus := Loss(Probe);
+      Probe.Raw[i] := Input.Raw[i] - Epsilon;
+      LossMinus := Loss(Probe);
+      Numeric := (LossPlus - LossMinus) / (2 * Epsilon);
+      Result := Max(Result, Abs(Numeric - Analytic) / Max(1.0, Abs(Analytic)));
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Probe.Free;
+    Target.Free;
+    AnalyticGrad.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DGradientCheck;
+const
+  cWidths: array[0..2] of integer = (6, 5, 4);
+var
+  WidthCnt, Norm, W: integer;
+  Err, MaxErr: Double;
+begin
+  MaxErr := 0;
+  for WidthCnt := 0 to High(cWidths) do
+    for Norm := csFFTNormBackward to csFFTNormForward do
+    begin
+      W := cWidths[WidthCnt];
+      Err := RealFFT2DGradientError(TNNetRealFFT2D.Create(Norm), W, 3, 2);
+      AssertTrue('rfft2 input gradient W=' + IntToStr(W) + ' norm=' + IntToStr(Norm) +
+        ' err=' + FloatToStr(Err), Err < 1e-2);
+      MaxErr := Max(MaxErr, Err);
+      Err := RealFFT2DGradientError(TNNetInverseRealFFT2D.Create(W, Norm),
+        W div 2 + 1, 3, 4);
+      AssertTrue('irfft2 input gradient W=' + IntToStr(W) + ' norm=' + IntToStr(Norm) +
+        ' err=' + FloatToStr(Err), Err < 1e-2);
+      MaxErr := Max(MaxErr, Err);
+    end;
+  WriteLn('  RealFFT2D pair gradient check max scaled error: ', MaxErr:0:8);
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(7, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 5, 2));
+    NN.AddLayer(TNNetRealFFT2D.Create(csFFTNormOrtho));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+    NN.AddLayer(TNNetInverseRealFFT2D.Create(7, csFFTNormOrtho));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+    NN2.Compute(Input);
+    Saved2 := NN2.SaveToString();
+    AssertEquals('rfft2/irfft2 SaveToString round trip', Saved, Saved2);
+    AssertEquals('rfft2 norm round trips', csFFTNormOrtho,
+      (NN2.Layers[1] as TNNetRealFFT2D).GetNorm());
+    AssertEquals('irfft2 width round trips', 7,
+      (NN2.Layers[3] as TNNetInverseRealFFT2D).SpatialW);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('rfft2/irfft2 Compute after round trip pos ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 

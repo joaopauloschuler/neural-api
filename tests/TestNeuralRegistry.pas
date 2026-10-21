@@ -547,6 +547,10 @@ begin
     // Interleaved M-RoPE (Qwen3-VL text; depth 16 = 2 heads x head_dim 8).
     381: begin AddSeqInput(ANet); Exit(L('TNNetInterleavedMRotaryEmbedding', TNNetInterleavedMRotaryEmbedding.Create(
             10000.0, 2, 1, 1, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, True, 8))); end;
+
+    // rfft2 / irfft2 pair (input SizeX 5 = 8 div 2 + 1 half-spectrum bins).
+    382: begin AddImgInput(ANet); Exit(L('TNNetRealFFT2D', TNNetRealFFT2D.Create(csFFTNormOrtho))); end;
+    383: begin ANet.AddLayer(TNNetInput.Create(5, 8, 8, 1)); Exit(L('TNNetInverseRealFFT2D', TNNetInverseRealFFT2D.Create(8, csFFTNormOrtho))); end;
     else
       Result := False;
   end;

@@ -182,6 +182,11 @@ const
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
   csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
 
+  // TNNetRealFFT2D / TNNetInverseRealFFT2D norm selectors (FStruct[0]), as torch.fft.
+  csFFTNormBackward = 0;  // forward unscaled, inverse scaled by 1/(H*W)
+  csFFTNormOrtho    = 1;  // both scaled by 1/sqrt(H*W)
+  csFFTNormForward  = 2;  // forward scaled by 1/(H*W), inverse unscaled
+
 type
   TNNetLayer = class;
   TNNet = class;
@@ -16598,6 +16603,64 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property InDepth: integer read FInDepth;
+  end;
+
+  // Shared plans, scratch and transforms of the rfft2/irfft2 pair over (H=SizeY,
+  // W=SizeX) per channel; the half spectrum is (W div 2 + 1, H, 2C), Re/Im interleaved.
+  // Coded by Claude (AI).
+  TNNetRealFFT2DBase = class(TNNetLayer)
+  protected
+    FSpatialW, FSpatialH, FChannels, FHalfW: integer;
+    FPlanW, FPlanH: TFFTPlan;
+    FRowRe, FRowIm: array of Double;
+    FColRe, FColIm: array of Double;
+    FSpecRe, FSpecIm: array of Double;
+    FBinScale: array of Double;
+    FGradVol: TNNetVolume;
+    // Scale of the unnormalised forward DFT sum for the current norm and H*W.
+    function ForwardNormScale(): Double;
+    procedure PrepareTransform(pSpatialW, pSpatialH, pChannels: integer);
+    // Dst (FHalfW, H, 2C) := unnormalised rfft2 of real Src (W, H, C), bin kw scaled by FBinScale[kw].
+    procedure RealToHalfSpectrum(Src, Dst: TNNetVolume);
+    { Dst (W, H, C) := Scale * H * W * Re(ifft2(S)), S = Src's half spectrum extended
+      to W bins by Hermitian symmetry (irfft2) or by zeros (the rfft2 adjoint). }
+    procedure HalfSpectrumToReal(Src, Dst: TNNetVolume; Scale: Double; Hermitian: boolean);
+    procedure ApplyForward(Src, Dst: TNNetVolume); virtual; abstract;
+    procedure ApplyAdjoint(Src, Dst: TNNetVolume); virtual; abstract;
+  public
+    constructor Create(); override;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    function GetNorm(): integer;
+    property SpatialW: integer read FSpatialW;
+    property SpatialH: integer read FSpatialH;
+  end;
+
+  /// Port of torch.fft.rfft2 over (H=SizeY, W=SizeX) per channel: input (W, H, C) ->
+  /// output (W div 2 + 1, H, 2C), channel 2c = Re and 2c+1 = Im of input channel c.
+  // Coded by Claude (AI).
+  TNNetRealFFT2D = class(TNNetRealFFT2DBase)
+  protected
+    procedure ApplyForward(Src, Dst: TNNetVolume); override;
+    procedure ApplyAdjoint(Src, Dst: TNNetVolume); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pNorm: integer); reintroduce; overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  end;
+
+  /// Port of torch.fft.irfft2(s=(H, OutputWidth)): input (OutputWidth div 2 + 1, H, 2C)
+  /// in TNNetRealFFT2D's layout -> real (OutputWidth, H, C). OutputWidth <= 0 means 2*(SizeX-1).
+  // Coded by Claude (AI).
+  TNNetInverseRealFFT2D = class(TNNetRealFFT2DBase)
+  protected
+    procedure ApplyForward(Src, Dst: TNNetVolume); override;
+    procedure ApplyAdjoint(Src, Dst: TNNetVolume); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pOutputWidth: integer; pNorm: integer = csFFTNormBackward); reintroduce; overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   end;
 
   /// SINGLE-LEVEL 1-D DISCRETE WAVELET TRANSFORM layer implemented with the
@@ -92917,6 +92980,304 @@ begin
   end;
 end;
 
+{ TNNetRealFFT2DBase }
+
+constructor TNNetRealFFT2DBase.Create();
+begin
+  inherited Create();
+  FGradVol := TNNetVolume.Create();
+end;
+
+destructor TNNetRealFFT2DBase.Destroy();
+begin
+  FGradVol.Free;
+  inherited Destroy();
+end;
+
+function TNNetRealFFT2DBase.GetNorm(): integer;
+begin
+  Result := FStruct[0];
+end;
+
+function TNNetRealFFT2DBase.ForwardNormScale(): Double;
+begin
+  case FStruct[0] of
+    csFFTNormOrtho: Result := 1.0 / Sqrt(Double(FSpatialW) * FSpatialH);
+    csFFTNormForward: Result := 1.0 / (Double(FSpatialW) * FSpatialH);
+  else
+    Result := 1.0;
+  end;
+end;
+
+procedure TNNetRealFFT2DBase.PrepareTransform(pSpatialW, pSpatialH, pChannels: integer);
+begin
+  if (FStruct[0] < csFFTNormBackward) or (FStruct[0] > csFFTNormForward) then
+    FErrorProc(ClassName + ': unknown norm ' + IntToStr(FStruct[0]) + '.');
+  if (pSpatialW < 1) or (pSpatialH < 1) or (pChannels < 1) then
+    FErrorProc(ClassName + ': empty transform W=' + IntToStr(pSpatialW) +
+      ' H=' + IntToStr(pSpatialH) + ' C=' + IntToStr(pChannels) + '.');
+  FSpatialW := pSpatialW;
+  FSpatialH := pSpatialH;
+  FChannels := pChannels;
+  FHalfW := pSpatialW div 2 + 1;
+  FFTPlanInit(FPlanW, FSpatialW);
+  FFTPlanInit(FPlanH, FSpatialH);
+  SetLength(FRowRe, FSpatialW);
+  SetLength(FRowIm, FSpatialW);
+  SetLength(FColRe, FSpatialH);
+  SetLength(FColIm, FSpatialH);
+  SetLength(FSpecRe, FSpatialH * FHalfW);
+  SetLength(FSpecIm, FSpatialH * FHalfW);
+  SetLength(FBinScale, FHalfW);
+end;
+
+procedure TNNetRealFFT2DBase.RealToHalfSpectrum(Src, Dst: TNNetVolume);
+var
+  ChannelCnt, SpatialX, SpatialY, BinCnt: integer;
+  MaxChannelPos, MaxSpatialX, MaxSpatialY, MaxBinPos: integer;
+  SrcPos, SpecPos, DstPos, SrcRowStride, DstDepth, DstRowStride: integer;
+  RowBytes, BinBytes: integer;
+  BinScale: Double;
+begin
+  MaxChannelPos := FChannels - 1;
+  MaxSpatialX := FSpatialW - 1;
+  MaxSpatialY := FSpatialH - 1;
+  MaxBinPos := FHalfW - 1;
+  SrcRowStride := FSpatialW * FChannels;
+  DstDepth := 2 * FChannels;
+  DstRowStride := FHalfW * DstDepth;
+  RowBytes := FSpatialW * csDoubleSize;
+  BinBytes := FHalfW * csDoubleSize;
+  for ChannelCnt := 0 to MaxChannelPos do
+  begin
+    SrcPos := ChannelCnt;
+    SpecPos := 0;
+    for SpatialY := 0 to MaxSpatialY do
+    begin
+      for SpatialX := 0 to MaxSpatialX do
+      begin
+        FRowRe[SpatialX] := Src.FData[SrcPos];
+        Inc(SrcPos, FChannels);
+      end;
+      FillChar(FRowIm[0], RowBytes, 0);
+      FFTPlanExecute(FPlanW, FRowRe, FRowIm, false);
+      Move(FRowRe[0], FSpecRe[SpecPos], BinBytes);
+      Move(FRowIm[0], FSpecIm[SpecPos], BinBytes);
+      Inc(SpecPos, FHalfW);
+    end;
+    for BinCnt := 0 to MaxBinPos do
+    begin
+      SpecPos := BinCnt;
+      for SpatialY := 0 to MaxSpatialY do
+      begin
+        FColRe[SpatialY] := FSpecRe[SpecPos];
+        FColIm[SpatialY] := FSpecIm[SpecPos];
+        Inc(SpecPos, FHalfW);
+      end;
+      FFTPlanExecute(FPlanH, FColRe, FColIm, false);
+      BinScale := FBinScale[BinCnt];
+      DstPos := BinCnt * DstDepth + 2 * ChannelCnt;
+      for SpatialY := 0 to MaxSpatialY do
+      begin
+        Dst.FData[DstPos] := FColRe[SpatialY] * BinScale;
+        Dst.FData[DstPos + 1] := FColIm[SpatialY] * BinScale;
+        Inc(DstPos, DstRowStride);
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetRealFFT2DBase.HalfSpectrumToReal(Src, Dst: TNNetVolume;
+  Scale: Double; Hermitian: boolean);
+var
+  ChannelCnt, SpatialX, SpatialY, BinCnt: integer;
+  MaxChannelPos, MaxSpatialX, MaxSpatialY, MaxBinPos, MaxMirrorPos: integer;
+  SrcPos, SpecPos, DstPos, SrcDepth, SrcRowStride: integer;
+  BinBytes, TailBytes: integer;
+  OutScale: Double;
+begin
+  MaxChannelPos := FChannels - 1;
+  MaxSpatialX := FSpatialW - 1;
+  MaxSpatialY := FSpatialH - 1;
+  MaxBinPos := FHalfW - 1;
+  MaxMirrorPos := (FSpatialW - 1) div 2;
+  SrcDepth := 2 * FChannels;
+  SrcRowStride := FHalfW * SrcDepth;
+  BinBytes := FHalfW * csDoubleSize;
+  TailBytes := (FSpatialW - FHalfW) * csDoubleSize;
+  // FFTPlanExecute's inverse divides by H and by W; the caller's Scale excludes it.
+  OutScale := Scale * FSpatialW * FSpatialH;
+  for ChannelCnt := 0 to MaxChannelPos do
+  begin
+    for BinCnt := 0 to MaxBinPos do
+    begin
+      SrcPos := BinCnt * SrcDepth + 2 * ChannelCnt;
+      for SpatialY := 0 to MaxSpatialY do
+      begin
+        FColRe[SpatialY] := Src.FData[SrcPos];
+        FColIm[SpatialY] := Src.FData[SrcPos + 1];
+        Inc(SrcPos, SrcRowStride);
+      end;
+      FFTPlanExecute(FPlanH, FColRe, FColIm, true);
+      SpecPos := BinCnt;
+      for SpatialY := 0 to MaxSpatialY do
+      begin
+        FSpecRe[SpecPos] := FColRe[SpatialY];
+        FSpecIm[SpecPos] := FColIm[SpatialY];
+        Inc(SpecPos, FHalfW);
+      end;
+    end;
+    SpecPos := 0;
+    DstPos := ChannelCnt;
+    for SpatialY := 0 to MaxSpatialY do
+    begin
+      Move(FSpecRe[SpecPos], FRowRe[0], BinBytes);
+      Move(FSpecIm[SpecPos], FRowIm[0], BinBytes);
+      Inc(SpecPos, FHalfW);
+      if Hermitian then
+      begin
+        // Bins W-k mirror k as conj; Re() below drops Im of DC and Nyquist, as c2r does.
+        for BinCnt := 1 to MaxMirrorPos do
+        begin
+          FRowRe[FSpatialW - BinCnt] := FRowRe[BinCnt];
+          FRowIm[FSpatialW - BinCnt] := -FRowIm[BinCnt];
+        end;
+      end
+      else if TailBytes > 0 then
+      begin
+        FillChar(FRowRe[FHalfW], TailBytes, 0);
+        FillChar(FRowIm[FHalfW], TailBytes, 0);
+      end;
+      FFTPlanExecute(FPlanW, FRowRe, FRowIm, true);
+      for SpatialX := 0 to MaxSpatialX do
+      begin
+        Dst.FData[DstPos] := FRowRe[SpatialX] * OutScale;
+        Inc(DstPos, FChannels);
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetRealFFT2DBase.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  ApplyForward(FPrevLayer.FOutput, FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRealFFT2DBase.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    FGradVol.ReSize(FPrevLayer.FOutput);
+    ApplyAdjoint(FOutputError, FGradVol);
+    FPrevLayer.FOutputError.Add(FGradVol);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetRealFFT2D }
+
+constructor TNNetRealFFT2D.Create();
+begin
+  Create(csFFTNormBackward);
+end;
+
+constructor TNNetRealFFT2D.Create(pNorm: integer);
+begin
+  inherited Create();
+  FStruct[0] := pNorm;
+end;
+
+procedure TNNetRealFFT2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  BinScale: Double;
+  MaxBinPos, BinCnt: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  PrepareTransform(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY,
+    pPrevLayer.Output.Depth);
+  BinScale := ForwardNormScale();
+  MaxBinPos := FHalfW - 1;
+  for BinCnt := 0 to MaxBinPos do
+    FBinScale[BinCnt] := BinScale;
+  FOutput.ReSize(FHalfW, FSpatialH, 2 * FChannels);
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetRealFFT2D.ApplyForward(Src, Dst: TNNetVolume);
+begin
+  RealToHalfSpectrum(Src, Dst);
+end;
+
+// dL/dx = s * Re(sum over the kept bins of G * exp(+i*theta)): zero-padded, not Hermitian.
+procedure TNNetRealFFT2D.ApplyAdjoint(Src, Dst: TNNetVolume);
+begin
+  HalfSpectrumToReal(Src, Dst, ForwardNormScale(), false);
+end;
+
+{ TNNetInverseRealFFT2D }
+
+constructor TNNetInverseRealFFT2D.Create();
+begin
+  Create(0, csFFTNormBackward);
+end;
+
+constructor TNNetInverseRealFFT2D.Create(pOutputWidth: integer; pNorm: integer);
+begin
+  inherited Create();
+  FStruct[0] := pNorm;
+  FStruct[1] := pOutputWidth;
+end;
+
+procedure TNNetInverseRealFFT2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutputWidth, MaxBinPos, BinCnt: integer;
+  InverseScale: Double;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  OutputWidth := FStruct[1];
+  if OutputWidth <= 0 then OutputWidth := 2 * (pPrevLayer.Output.SizeX - 1);
+  if (OutputWidth < 1) or (OutputWidth div 2 + 1 <> pPrevLayer.Output.SizeX) then
+    FErrorProc('TNNetInverseRealFFT2D: input SizeX ' + IntToStr(pPrevLayer.Output.SizeX) +
+      ' must be OutputWidth div 2 + 1 (OutputWidth=' + IntToStr(OutputWidth) + ').');
+  if Odd(pPrevLayer.Output.Depth) then
+    FErrorProc('TNNetInverseRealFFT2D: input Depth must be even (Re/Im pairs); got ' +
+      IntToStr(pPrevLayer.Output.Depth) + '.');
+  PrepareTransform(OutputWidth, pPrevLayer.Output.SizeY, pPrevLayer.Output.Depth div 2);
+  // irfft2's scale is 1/(N*s) for the forward scale s; c2r counts bins 1..ceil(W/2)-1 twice.
+  InverseScale := 1.0 / (ForwardNormScale() * FSpatialW * FSpatialH);
+  MaxBinPos := FHalfW - 1;
+  for BinCnt := 0 to MaxBinPos do
+    FBinScale[BinCnt] := 2 * InverseScale;
+  FBinScale[0] := InverseScale;
+  if not Odd(FSpatialW) then FBinScale[MaxBinPos] := InverseScale;
+  FOutput.ReSize(FSpatialW, FSpatialH, FChannels);
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetInverseRealFFT2D.ApplyForward(Src, Dst: TNNetVolume);
+begin
+  HalfSpectrumToReal(Src, Dst, 1.0 / (ForwardNormScale() * FSpatialW * FSpatialH), true);
+end;
+
+procedure TNNetInverseRealFFT2D.ApplyAdjoint(Src, Dst: TNNetVolume);
+begin
+  RealToHalfSpectrum(Src, Dst);
+end;
+
 { TNNetTropicalLinear }
 
 // Tropical (max-plus / min-plus) dense layer. The forward map per output i is
@@ -134782,6 +135143,8 @@ begin
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
       'TNNetDWT1D' :                Result := TNNetDWT1D.Create(St[0], St[1] <> 0);
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
+      'TNNetRealFFT2D' :            Result := TNNetRealFFT2D.Create(St[0]);
+      'TNNetInverseRealFFT2D' :     Result := TNNetInverseRealFFT2D.Create(St[1], St[0]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
@@ -135231,6 +135594,8 @@ begin
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
       if S[0] = 'TNNetDWT1D' then Result := TNNetDWT1D.Create(St[0], St[1] <> 0) else
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetRealFFT2D' then Result := TNNetRealFFT2D.Create(St[0]) else
+      if S[0] = 'TNNetInverseRealFFT2D' then Result := TNNetInverseRealFFT2D.Create(St[1], St[0]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
