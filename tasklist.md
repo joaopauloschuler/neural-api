@@ -1634,8 +1634,11 @@ rather than acted on.
           also overflows on the host (`TVolume.ReSize` integer size;
           `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
           resident, so the VAE has ~10-14 GB on a 24 GB L4.
-          - [ ] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
-                OpenCL (-17% of decode FLOPs); CPU path unchanged.
+          - [X] B2f5. Nearest-2x + 3x3 conv fold as four 2x2 phase convs on
+                OpenCL (-17% of decode FLOPs); CPU path unchanged. Done: the
+                implicit GEMM folds a single-reader TNNetDeMaxPool (which then
+                skips its forward); 1024x1024 untiled 17.0 -> 14.2 TFLOP
+                (estimate). GPU timing on the L4 still open.
           - [ ] B2f6. Untiled path: memory estimator vs the device limits,
                 `--vae-tile 0`; L4 runs 256/192 -> 512/384 -> untiled in the REPL;
                 then the default decision with the user.

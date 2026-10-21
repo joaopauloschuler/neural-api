@@ -882,13 +882,26 @@ static inline void cai_tiled_mad4(float* acc, __local const float* Bs,
   }
 }
 
+// Result column of GEMM column b: b itself, or under UpsampleFold (see
+// cai_conv_gather) the 2x output pixel of low-res pixel b in phase Phase.
+static inline int cai_conv_result_column(const int UpsampleFold,
+  const int OutSizeX, const int b, const int Phase)
+{
+  if (UpsampleFold == 0) return b;
+  const int LowResSizeX = max(OutSizeX, 1);
+  const int oy = b / LowResSizeX;
+  const int ox = b - oy * LowResSizeX;
+  return (2 * oy + (Phase >> 1)) * 2 * LowResSizeX + 2 * ox + (Phase & 1);
+}
+
 // Per-row scale, fused bias, fused activation and store of one row's
 // CAI_TILED_COLS results; a row past FNumAs-1 or a column past FNumBs-1 is
-// skipped.
+// skipped. Columns map through cai_conv_result_column.
 static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
   const int ActFN, const int UseBias, __global float* R,
   __global const float* Bias, const float RowScale,
-  const int row, const int b0, const float* acc)
+  const int row, const int b0, const float* acc, const int UpsampleFold,
+  const int OutSizeX, const int Phase)
 {
   if (row >= FNumAs) return;
   #pragma unroll
@@ -897,7 +910,8 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
     const int gb = b0 + b;
     if (gb < FNumBs)
     {
-      const int pos = gb * FNumAs + row;
+      const int pos = cai_conv_result_column(UpsampleFold, OutSizeX, gb,
+        Phase) * FNumAs + row;
       float v = acc[b] * RowScale;
       if (UseBias != 0) v += Bias[row];
       R[pos] = cai_fused_act(v, ActFN);
@@ -914,6 +928,10 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
 // output frame into the column, b = pixel * OutFrames + frame: the tap window
 // is the InDepth floats at frame * FrameStep of a PixelStride-float pixel.
 // A 2-D conv has OutFrames 1, FrameStep 0 and PixelStride = InDepth.
+// UpsampleFold 1 is a 3x3 pad-1 conv over a nearest-2x upsample of the source:
+// axis 2 is the output phase py*2+px, whose 2x2 A slab (FNumAs*FSize floats
+// each, cai_conv_upsample_fold_weights) reads source rows y-1+py.. and
+// columns x-1+px..; column b = low-res pixel stores to pixel (2y+py, 2x+px).
 typedef struct
 {
   int OutSizeX;  // FOutput.SizeX
@@ -926,6 +944,7 @@ typedef struct
   int PixelStride; // source floats per pixel
   int OutFrames;   // output frames per output pixel
   int FrameStep;   // source depth offset between consecutive output frames
+  int UpsampleFold; // 0 or 1, see above
 } cai_conv_gather;
 
 // cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
@@ -997,6 +1016,12 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   __global float* FResultBuffer, const int UseBias,
   __global const float* FRowBias, __local float* Bs)
 {
+  // 0 on a 2-D launch; the output phase under G.UpsampleFold.
+  const int Phase = get_group_id(2);
+  cai_conv_gather PG = G;
+  PG.PaddingY -= Phase >> 1;
+  PG.PaddingX -= Phase & 1;
+  Af += Phase * FNumAs * FSize;
   const int lid = get_local_id(0);
   const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
   const int b0 = get_group_id(1) * CAI_TILED_COLS;
@@ -1013,7 +1038,7 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   int FirstX[CAI_TILED_B_COLS_PER_LANE];
   int FirstD[CAI_TILED_B_COLS_PER_LANE];
   if (BIsConv)
-    cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX, FirstD);
+    cai_conv_gather_columns(PG, FNumBs, b0, lid, FirstY, FirstX, FirstD);
 
   const int RowStep4 = 4 * FNumAs;
   for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
@@ -1021,7 +1046,7 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     // The previous step's reads must finish before the tile is overwritten.
     barrier(CLK_LOCAL_MEM_FENCE);
     if (BIsConv)
-      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX,
+      cai_tiled_stage_b_conv(PG, FSize, k0, Bf, Bs, lid, FirstY, FirstX,
         FirstD);
     else
       cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, 0, 0, Bs, lid,
@@ -1065,9 +1090,10 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   }
 
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FRowBias, 1.0f, a0 + lid, b0, acc0);
+    FRowBias, 1.0f, a0 + lid, b0, acc0, G.UpsampleFold, G.OutSizeX, Phase);
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FRowBias, 1.0f, a0 + lid + CAI_TILED_LANES, b0, acc1);
+    FRowBias, 1.0f, a0 + lid + CAI_TILED_LANES, b0, acc1, G.UpsampleFold,
+    G.OutSizeX, Phase);
 }
 
 // Tiled twin of cai_dot_product: FP32 weights in its [a + k*FNumAs] layout,
@@ -1088,7 +1114,7 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
-  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1371,18 +1397,20 @@ __kernel void cai_conv_implicit_tiled
   const int DilationX,
   const int PixelStride,
   const int OutFrames,
-  const int FrameStep
+  const int FrameStep,
+  const int UpsampleFold
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-    Stride, PaddingX, PaddingY, DilationX, PixelStride, OutFrames, FrameStep};
+    Stride, PaddingX, PaddingY, DilationX, PixelStride, OutFrames, FrameStep,
+    UpsampleFold};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
 }
 
 // Untiled twin of cai_conv_implicit_tiled (same arguments), one work-item per
-// (row, position) as cai_dot_product; sums in k order. Coded by Claude (AI).
+// (row, position, phase) as cai_dot_product; sums in k order. Coded by Claude (AI).
 __kernel void cai_conv_implicit
 (
   const int FNumAs,
@@ -1405,11 +1433,13 @@ __kernel void cai_conv_implicit
   const int DilationX,
   const int PixelStride,
   const int OutFrames,
-  const int FrameStep
+  const int FrameStep,
+  const int UpsampleFold
 )
 {
   const int a_id = get_global_id(0);
   const int b_id = get_global_id(1);
+  const int Phase = get_global_id(2);
   if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
   const int FeatureSizeX = RowSpan / InDepth;
   const int FeatureSizeY = FSize / RowSpan;
@@ -1417,11 +1447,11 @@ __kernel void cai_conv_implicit
   const int FrameOffset = (b_id - pixel * OutFrames) * FrameStep;
   const int oy = pixel / OutSizeX;
   const int ox = pixel - oy * OutSizeX;
-  const int FirstY = oy * Stride - PaddingY;
-  const int FirstX = ox * Stride - PaddingX;
+  const int FirstY = oy * Stride - PaddingY + (Phase >> 1);
+  const int FirstX = ox * Stride - PaddingX + (Phase & 1);
   const int TapStep = InDepth * FNumAs;
-  // A element (a_id, k) sits at a_id + k * FNumAs.
-  int APos = a_id;
+  // A element (a_id, k) of the phase slab sits at a_id + k * FNumAs.
+  int APos = a_id + Phase * FNumAs * FSize;
   float acc = 0.0f;
   for (int ky = 0; ky < FeatureSizeY; ky++)
   {
@@ -1443,9 +1473,42 @@ __kernel void cai_conv_implicit
       APos += TapStep;
     }
   }
-  const int ResultPos = b_id * FNumAs + a_id;
+  const int ResultPos = cai_conv_result_column(UpsampleFold, OutSizeX, b_id,
+    Phase) * FNumAs + a_id;
   if (UseBias != 0) acc += FRowBias[a_id];
   FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
+}
+
+// Phase weights of a 3x3 conv over a nearest-2x upsample (UpsampleFold): tap
+// (r, c) of phase (py, px) sums the 3x3 taps ky in [r*(1+py), py+r*(2-py)]
+// (same for kx), i.e. the taps that land on one source pixel. Src is the
+// [a + k*NumAs] 3x3 layout, Dst four such 2x2 slabs. Launch (NumAs, InDepth, 16).
+__kernel void cai_conv_upsample_fold_weights
+(
+  const int NumAs,
+  const int InDepth,
+  __global const float* Src,
+  __global float* Dst
+)
+{
+  const int a = get_global_id(0);
+  const int d = get_global_id(1);
+  const int PhaseTap = get_global_id(2);
+  if ((a >= NumAs) || (d >= InDepth)) return;
+  const int Phase = PhaseTap >> 2;
+  const int py = Phase >> 1;
+  const int px = Phase & 1;
+  const int r = (PhaseTap >> 1) & 1;
+  const int c = PhaseTap & 1;
+  const int FirstKy = r * (1 + py);
+  const int LastKy = py + r * (2 - py);
+  const int FirstKx = c * (1 + px);
+  const int LastKx = px + c * (2 - px);
+  float Sum = 0.0f;
+  for (int ky = FirstKy; ky <= LastKy; ky++)
+    for (int kx = FirstKx; kx <= LastKx; kx++)
+      Sum += Src[a + ((ky * 3 + kx) * InDepth + d) * NumAs];
+  Dst[a + (Phase * 4 * InDepth + (r * 2 + c) * InDepth + d) * NumAs] = Sum;
 }
 
 // int4 body: the int8 lane map, one Q4_0 block per K-step (blocks [StepFirst,

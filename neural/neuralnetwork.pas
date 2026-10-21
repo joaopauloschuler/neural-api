@@ -797,6 +797,8 @@ type
       function OpenCLLastTiledGemmSplits(): integer;
       // Implicit-GEMM convolution launches of this layer's FDotCL (0 without one).
       function OpenCLImplicitConvLaunchCount(): integer;
+      // Of those, the nearest-2x upsample folds (TNNetConvolution.WillFoldUpsampleOnOpenCL).
+      function OpenCLUpsampleFoldLaunchCount(): integer;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -16723,6 +16725,9 @@ type
       // owner with changed weights leaves this layer on the old buffers.
       function BorrowOwnerOpenCLWeights(pNumBs: integer): boolean;
       {$ENDIF}
+      // True when the OpenCL forward may fold a nearest-2x FPrevLayer into
+      // four 2x2 phase convs over its source. False here.
+      function UpsampleFoldEligible(): boolean; virtual;
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
       destructor Destroy(); override;
@@ -16891,6 +16896,9 @@ type
       // Inference FP32 forwards without Winograd, which writes the A buffer.
       function OpenCLWeightsShareable(): boolean; override;
     public
+      // True when the implicit-GEMM forward reads FPrevLayer's source instead
+      // of FPrevLayer (a TNNetDeMaxPool that then skips its own forward).
+      function WillFoldUpsampleOnOpenCL(): boolean;
       procedure DisableOpenCL(); override;
       function OpenCLBufferBytes(): int64; override;
       function CanShareOpenCLOutput(): boolean; override;
@@ -16964,12 +16972,17 @@ type
       {$ENDIF}
     // </TEMP>
 
+    protected
+      // A 3x3 pad-1 stride-1 plain convolution after a nearest-2x TNNetDeMaxPool.
+      function UpsampleFoldEligible(): boolean; override;
     public
       destructor Destroy(); override;
       procedure Compute(); override;
       // True for the plain convolution classes only: the descendants with a
       // forward of their own are not checked for writing the whole output.
       function CanShareHostOutput(): boolean; override;
+      // Adds FPrevLayer's source when the upsample fold may read it.
+      procedure AppendInputLayers(pList: TList); override;
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): CPU
       // forward only (not WillOpenCL), and the positions*neurons*vector MAC work
       // is at or above the net's min-work threshold. Winograd keeps its serial
@@ -19492,14 +19505,18 @@ type
       FGatherChannelStride, FGatherXStride, FGatherYStride: integer;
       {$IFDEF OpenCL}
       FUpsampleCL: TNNetUpsampleGatherCL;
+      // The only consumer, armed to fold this upsample (TNNetConvolutionBase.EnableOpenCL).
+      FFoldingConsumer: TNNetConvolution;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer) : integer; override;
     protected
-      // True when the OpenCL gather ran. False means the caller's CPU path
-      // follows, with the source in RAM and both residency flags reset.
+      // True when the OpenCL gather ran or FFoldingConsumer folds this layer
+      // (no output anywhere then). False: the CPU path follows, source in RAM.
       function ComputeUpsampleOnOpenCL(StartTime: double): boolean;
     public
+      // Plain nearest 2x upsample on both axes (not depth-to-space).
+      function IsNearestUpsample2x(): boolean;
       // pPoolSizeY = 0 repeats rows pPoolSize times, as columns.
       constructor Create(pPoolSize: integer; pSpacing: integer = 0;
         pPoolSizeY: integer = 0); overload;
@@ -88633,6 +88650,11 @@ begin
   end;
 end;
 
+function TNNetConvolutionBase.UpsampleFoldEligible(): boolean;
+begin
+  Result := false;
+end;
+
 {$IFDEF OpenCL}
 // The name matters: under FP16 the handle is cai_im2col_h, and returning it
 // under the literal 'cai_im2col' makes TNNet.FreeKernelIfNotShared miss the
@@ -88683,6 +88705,10 @@ begin
       FDotCL.PrepareForCompute(FConcatedWInter, FOutputSizeX * FOutputSizeY,
         FVectorSize);
     FDotCL.PrepareImplicitConv();
+    // With another reader the upsample still runs; the fold only saves FLOPs.
+    if UpsampleFoldEligible() and FDotCL.PrepareUpsampleFold() and
+      (FPrevLayer.GetDepartingBranchesCnt() = 1) then
+      TNNetDeMaxPool(FPrevLayer).FFoldingConsumer := TNNetConvolution(Self);
   end;
   // Borrow the cai_im2col handle so ComputeOpenCL can build the column matrix
   // (FInputPrepared) on the device. Only meaningful for a real (spatial)
@@ -112213,10 +112239,24 @@ begin
 end;
 {$ENDIF}
 
+function TNNetDeMaxPool.IsNearestUpsample2x(): boolean;
+begin
+  Result := (FPoolSize = 2) and (FPoolSizeY = 2) and (FSpacing = 0) and
+    (FGatherChannelStride = 1) and (FGatherXStride = 0) and
+    (FGatherYStride = 0);
+end;
+
 function TNNetDeMaxPool.ComputeUpsampleOnOpenCL(StartTime: double): boolean;
 begin
   Result := false;
   {$IFDEF OpenCL}
+  if Assigned(FFoldingConsumer) and FFoldingConsumer.WillFoldUpsampleOnOpenCL() then
+  begin
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := false;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit(true);
+  end;
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -117177,7 +117217,27 @@ begin
   ApplyActivationFunctionToOutputRange(FirstElem, LastElem);
 end;
 
+// nearest-2x then 3x3 pad 1 = per output phase (py, px) a 2x2 conv over the
+// source at rows y-1+py.. and columns x-1+px.. (zero padding maps to zero padding).
+function TNNetConvolution.UpsampleFoldEligible(): boolean;
+begin
+  Result := ((ClassType = TNNetConvolution) or
+    (ClassType = TNNetConvolutionLinear) or
+    (ClassType = TNNetConvolutionReLU)) and (not FPointwise) and
+    (FFeatureSizeX = 3) and (FFeatureSizeY = 3) and (FStride = 1) and
+    (FPadding = 1) and (FPaddingY = 1) and (FDilationX = 1) and
+    (FPrevLayer is TNNetDeMaxPool) and
+    TNNetDeMaxPool(FPrevLayer).IsNearestUpsample2x() and
+    Assigned(FPrevLayer.PrevLayer);
+end;
+
 {$IFDEF OpenCL}
+function TNNetConvolution.WillFoldUpsampleOnOpenCL(): boolean;
+begin
+  Result := Assigned(FDotCL) and FDotCL.UpsampleFoldReady() and
+    ShouldOpenCLImplicitConv() and UpsampleFoldEligible();
+end;
+
 function TNNetConvolution.ShouldOpenCLIm2Col(): boolean;
 begin
   // cai_im2col indexes the column matrix with int.
@@ -117249,10 +117309,22 @@ var
   ActivationFunctionInOpenCL, WUpdated, OpenCLIm2Col: boolean;
   BiasVol: TNNetVolume;
   PrevOutputBuffer, GatherSrcBuffer: cl_mem;
+  UpsampleFold: boolean;
+  GatherSource: TNNetLayer;
 begin
   PrevOutputBuffer := nil;
   GatherSrcBuffer := nil;
-  if ShouldBindPrevOutputOnOpenCL() then
+  UpsampleFold := WillFoldUpsampleOnOpenCL();
+  if UpsampleFold then GatherSource := FPrevLayer.PrevLayer
+  else GatherSource := FPrevLayer;
+  if UpsampleFold then
+  begin
+    if GatherSource.OutputBindableOnOpenCL() then
+      GatherSrcBuffer := GatherSource.OpenCLOutputBuffer()
+    else
+      GatherSource.ForceOutputOnRAM();
+  end
+  else if ShouldBindPrevOutputOnOpenCL() then
     PrevOutputBuffer := FPrevLayer.OpenCLOutputBuffer()
   else if ShouldBindPrevOutputAsGatherSrc() then
     GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer()
@@ -117295,12 +117367,16 @@ begin
   // A borrowed buffer was produced on the source layer's queue, so block on that
   // queue first (a no-op when it is this layer's queue too).
   if (PrevOutputBuffer <> nil) or (GatherSrcBuffer <> nil) then
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+    GatherSource.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
 
   // Implicit GEMM: the GEMM gathers B from the unpadded source itself (the
   // bound buffer, or the host Output uploaded as is), so neither the column
   // matrix nor its B buffer exists. Coded by Claude (AI).
-  if ShouldOpenCLImplicitConv() then
+  if UpsampleFold then
+    FDotCL.ComputeUpsampleFoldConv(InputAVolume, GatherSource.Output, ActOpcode,
+      {NewVAs}WUpdated, BiasVol, {NewVBias}WUpdated, {NewSrc}true,
+      GatherSrcBuffer)
+  else if ShouldOpenCLImplicitConv() then
   begin
     FDotCL.ComputeImplicitConv(InputAVolume, FPrevLayer.Output,
       {OutSizeX}FOutput.SizeX, {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX,
@@ -118469,8 +118545,9 @@ begin
     {$IFDEF OpenCL}
     GatherSrcOnOpenCL := ShouldBindPrevOutputAsGatherSrc();
     ImplicitConvOnOpenCL := ShouldOpenCLImplicitConv();
-    if not (ShouldBindPrevOutputOnOpenCL() or GatherSrcOnOpenCL)
-      then FPrevLayer.ForceOutputOnRAM();
+    // The fold reads FPrevLayer's source, which ComputeOpenCL binds or downloads.
+    if not (ShouldBindPrevOutputOnOpenCL() or GatherSrcOnOpenCL or
+      WillFoldUpsampleOnOpenCL()) then FPrevLayer.ForceOutputOnRAM();
     {$ENDIF}
     PrepareForwardPrologue(GatherSrcOnOpenCL or ImplicitConvOnOpenCL);
 
@@ -147210,6 +147287,11 @@ begin
   if Assigned(FDotCL) then Result := FDotCL.ImplicitConvLaunchCount else Result := 0;
 end;
 
+function TNNetLayer.OpenCLUpsampleFoldLaunchCount(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.UpsampleFoldLaunchCount else Result := 0;
+end;
+
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
 begin
   if FIsTrainable then
@@ -147910,6 +147992,14 @@ end;
 procedure TNNetLayer.AppendInputLayers(pList: TList);
 begin
   if Assigned(FPrevLayer) and (FPrevLayer <> Self) then pList.Add(FPrevLayer);
+end;
+
+procedure TNNetConvolution.AppendInputLayers(pList: TList);
+begin
+  inherited AppendInputLayers(pList);
+  {$IFDEF OpenCL}
+  if UpsampleFoldEligible() then pList.Add(FPrevLayer.PrevLayer);
+  {$ENDIF}
 end;
 
 procedure TNNetConcatBase.AppendInputLayers(pList: TList);

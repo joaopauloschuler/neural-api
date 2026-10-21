@@ -33932,8 +33932,8 @@ var
   DeviceId: cl_device_id;
   LayerPos, ConvCount, ConvOnOpenCLCount: integer;
   BoundSpatialConvCount, HostSourceSpatialConvCount: integer;
-  ImplicitConvCount, AttnCount: integer;
-  Layer: TNNetLayer;
+  ImplicitConvCount, AttnCount, FoldedConvCount: integer;
+  Layer, GatherSource: TNNetLayer;
   MaxDiff: double;
   Transfers, NoTransfers: TOpenCLTransferCounts;
   OpenCLBytes, ExplicitOpenCLBytes: int64;
@@ -33999,13 +33999,25 @@ begin
     BoundSpatialConvCount := 0;
     HostSourceSpatialConvCount := 0;
     ImplicitConvCount := 0;
+    FoldedConvCount := 0;
     for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
     begin
       Layer := Decoder.Net.Layers[LayerPos];
       if not ((Layer is TNNetConvolution) and
         (TNNetConvolution(Layer).FeatureSizeX > 1)) then continue;
       if Layer.OpenCLImplicitConvLaunchCount() > 0 then Inc(ImplicitConvCount);
-      if not Layer.PrevLayer.OutputBindableOnOpenCL() then
+      // An upsampler conv folds the nearest-2x and reads its source.
+      GatherSource := Layer.PrevLayer;
+      if Layer.OpenCLUpsampleFoldLaunchCount() > 0 then
+      begin
+        Inc(FoldedConvCount);
+        AssertTrue('layer ' + IntToStr(LayerPos) + ' folds a TNNetDeMaxPool',
+          GatherSource is TNNetDeMaxPool);
+        AssertFalse('the folded upsample has no output',
+          GatherSource.OutputBindableOnOpenCL());
+        GatherSource := GatherSource.PrevLayer;
+      end;
+      if not GatherSource.OutputBindableOnOpenCL() then
       begin
         Inc(HostSourceSpatialConvCount);
         continue;
@@ -34018,7 +34030,10 @@ begin
     end;
     WriteLn('  Qwen-Image-2.1 VAE 3x3 convs: ', BoundSpatialConvCount,
       ' bind a resident source, ', HostSourceSpatialConvCount,
-      ' read a host source, ', ImplicitConvCount, ' ran the implicit GEMM');
+      ' read a host source, ', ImplicitConvCount, ' ran the implicit GEMM, ',
+      FoldedConvCount, ' folded the upsample');
+    AssertEquals('upsampler convs that folded the nearest-2x',
+      Length(Decoder.Config.TemporalUpsample), FoldedConvCount);
     AssertEquals('3x3 convs on the implicit GEMM',
       BoundSpatialConvCount + HostSourceSpatialConvCount, ImplicitConvCount);
     FillChar(Transfers, SizeOf(Transfers), 0);

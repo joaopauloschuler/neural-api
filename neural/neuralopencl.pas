@@ -527,6 +527,13 @@ type
       FImplicitConvKernel, FImplicitConvTiledKernel: cl_kernel;
       FImplicitConvReady: boolean;
       FImplicitConvLaunchCount: integer;
+      /// NEAREST-2X UPSAMPLE FOLD (PrepareUpsampleFold): the four 2x2 phase
+      /// slabs cai_conv_upsample_fold_weights derives from FInputBufferAs; stale
+      /// until derived after the A operand last changed.
+      FUpsampleFoldBuffer: cl_mem;
+      FUpsampleFoldWeightsKernel: cl_kernel;
+      FUpsampleFoldStale: boolean;
+      FUpsampleFoldLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
       /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
@@ -595,6 +602,16 @@ type
       /// pRowsPerTile x pColsPerTile work-group and pSplits K-splits, on the shared queue.
       procedure RunTiledGemm(pKernel: cl_kernel;
         pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+      /// RunTiledGemm's grid over FNumAs rows and pNumBs columns, with
+      /// pAxis2Groups work-groups along axis 2 (a 2-D launch when 1).
+      procedure RunTiledGrid(pKernel: cl_kernel; pLanes, pRowsPerTile,
+        pColsPerTile, pNumBs, pAxis2Groups: longint);
+      /// Binds the 22 arguments of cai_conv_implicit(_tiled) and launches the
+      /// tiled kernel when the shape allows; err accumulates failures.
+      procedure LaunchImplicitConv(AsBuffer, SrcBuffer: cl_mem; NumBs,
+        GemmSize, UseBias, OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
+        Stride, PaddingX, PaddingY, DilationX, PixelStride, OutFrames,
+        FrameStep, UpsampleFold: longint; var err: integer);
       /// The large grid's split count (1 = none): TiledGemmSplitK fitted to
       /// FSize, or AutoTiledGemmSplitCount unless the queue is private.
       function SelectTiledSplitCount(): integer;
@@ -665,6 +682,14 @@ type
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil;
         OutFrames: longint = 1; FrameStep: longint = 0; WindowDepth: longint = 0);
+      /// Allocates the phase slabs after PrepareImplicitConv on a 3x3 layout
+      /// (FSize = 9 x depth); False when the device refused them.
+      function PrepareUpsampleFold(): boolean;
+      /// ComputeImplicitConv of a 3x3 pad-1 stride-1 conv over a nearest-2x
+      /// upsample of SrcVol, as four 2x2 phase GEMMs over SrcVol itself.
+      procedure ComputeUpsampleFoldConv(VAs, SrcVol: TNNetVolume; pActFN: longint;
+        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean; pExternalSrc: cl_mem);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -754,6 +779,10 @@ type
       /// Implicit-GEMM convolution launches (tiled ones count in
       /// TiledGemmLaunchCount too).
       property ImplicitConvLaunchCount: integer read FImplicitConvLaunchCount;
+      /// True after a successful PrepareUpsampleFold.
+      function UpsampleFoldReady(): boolean;
+      /// ComputeUpsampleFoldConv launches (also counted as implicit convs).
+      property UpsampleFoldLaunchCount: integer read FUpsampleFoldLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -1022,7 +1051,7 @@ begin
   Result := OpenCLMemBytes(FInputBufferBs) +
     OpenCLMemBytes(FResultBuffer) +
     OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
-    OpenCLMemBytes(FInputBufferBsFP16);
+    OpenCLMemBytes(FInputBufferBsFP16) + OpenCLMemBytes(FUpsampleFoldBuffer);
   if not FWeightsBorrowed then
     Result := Result + OpenCLMemBytes(FInputBufferAs);
   if not FBiasBorrowed then
@@ -1058,9 +1087,14 @@ begin
   ReleaseTiledKernels();
   if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
   if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
+  if Assigned(FUpsampleFoldWeightsKernel)  then clReleaseKernel(FUpsampleFoldWeightsKernel);
+  if Assigned(FUpsampleFoldBuffer) then clReleaseMemObject(FUpsampleFoldBuffer);
   FImplicitConvKernel := nil;
   FImplicitConvTiledKernel := nil;
   FImplicitConvReady := false;
+  FUpsampleFoldWeightsKernel := nil;
+  FUpsampleFoldBuffer := nil;
+  FUpsampleFoldStale := false;
   FMainKernel := nil;
   FSinglePassKernel := nil;
   FTiledRejected := false;
@@ -1354,7 +1388,10 @@ begin
           'kernel arguments: ' + IntToStr(err));
 
       if NewVAs and not FWeightsBorrowed then
+      begin
         err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+        FUpsampleFoldStale := true;
+      end;
       if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -1642,6 +1679,7 @@ begin
   err := CL_SUCCESS;
   PrepareBiasOperand(VBias, {NewVBias=}true, err);
   err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs, CL_TRUE);
+  FUpsampleFoldStale := true;
   Result := err = CL_SUCCESS;
 end;
 
@@ -2221,19 +2259,25 @@ end;
 
 procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel;
   pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+begin
+  RunTiledGrid(pKernel, pLanes, pRowsPerTile, pColsPerTile, FNumBs, pSplits);
+  FLastTiledLanes := pLanes;
+  FLastTiledSplits := pSplits;
+end;
+
+procedure TDotProductSharedKernel.RunTiledGrid(pKernel: cl_kernel; pLanes,
+  pRowsPerTile, pColsPerTile, pNumBs, pAxis2Groups: longint);
 var
   RowTiles, ColTiles: longint;
 begin
   RowTiles := (FNumAs + pRowsPerTile - 1) div pRowsPerTile;
-  ColTiles := (FNumBs + pColsPerTile - 1) div pColsPerTile;
-  if pSplits > 1
+  ColTiles := (pNumBs + pColsPerTile - 1) div pColsPerTile;
+  if pAxis2Groups > 1
     then FDotProductKernel.RunKernel3D(pKernel, RowTiles * pLanes, ColTiles,
-      pSplits, pLanes, 1, 1)
+      pAxis2Groups, pLanes, 1, 1)
     else FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles,
       pLanes, 1);
   Inc(FTiledLaunchCount);
-  FLastTiledLanes := pLanes;
-  FLastTiledSplits := pSplits;
 end;
 
 function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
@@ -2263,9 +2307,7 @@ procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
 var
   err: integer;
   UseBias, InSizeX, InSizeY, InDepth, PixelStride: longint;
-  K: cl_kernel;
   SrcBuffer: cl_mem;
-  UseTiled: boolean;
 begin
   if not FImplicitConvReady then
   begin
@@ -2289,15 +2331,41 @@ begin
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
   SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
   if NewVAs and not FWeightsBorrowed then
+  begin
     err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FUpsampleFoldStale := true;
+  end;
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'uploading: ' + IntToStr(err));
+    exit;
+  end;
+  LaunchImplicitConv(FInputBufferAs, SrcBuffer, FNumBs, FSize, UseBias,
+    OutSizeX, RowSpan, InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY,
+    DilationX, PixelStride, OutFrames, FrameStep, {UpsampleFold=}0, err);
+  if err <> CL_SUCCESS then
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'setting arguments: ' + IntToStr(err));
+end;
+
+procedure TDotProductSharedKernel.LaunchImplicitConv(AsBuffer,
+  SrcBuffer: cl_mem; NumBs, GemmSize, UseBias, OutSizeX, RowSpan, InSizeX,
+  InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX, PixelStride,
+  OutFrames, FrameStep, UpsampleFold: longint; var err: integer);
+var
+  K: cl_kernel;
+  UseTiled: boolean;
+  PhaseCount: longint;
+begin
   UseTiled := Assigned(FImplicitConvTiledKernel) and
     (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm();
   if UseTiled then K := FImplicitConvTiledKernel else K := FImplicitConvKernel;
   err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @NumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @GemmSize);
   err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
-  err := err or clSetKernelArg(K, 4, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @AsBuffer);
   err := err or clSetKernelArg(K, 5, csCLMemSize, @SrcBuffer);
   err := err or clSetKernelArg(K, 6, csCLMemSize, @FResultBuffer);
   err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
@@ -2314,17 +2382,103 @@ begin
   err := err or clSetKernelArg(K, 18, csLongintSize, @PixelStride);
   err := err or clSetKernelArg(K, 19, csLongintSize, @OutFrames);
   err := err or clSetKernelArg(K, 20, csLongintSize, @FrameStep);
-  if err <> CL_SUCCESS then
+  err := err or clSetKernelArg(K, 21, csLongintSize, @UpsampleFold);
+  if err <> CL_SUCCESS then exit;
+  if UpsampleFold <> 0 then PhaseCount := 4 else PhaseCount := 1;
+  if UseTiled
+    then RunTiledGrid(K, csTiledGemmLanes,
+      csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols, NumBs,
+      PhaseCount)
+    else if PhaseCount > 1
+      then FDotProductKernel.RunKernel3D(K, FNumAs, NumBs, PhaseCount)
+      else FDotProductKernel.RunKernel2D(K, FNumAs, NumBs);
+  Inc(FImplicitConvLaunchCount);
+end;
+
+function TDotProductSharedKernel.UpsampleFoldReady(): boolean;
+begin
+  Result := FImplicitConvReady and Assigned(FUpsampleFoldBuffer) and
+    Assigned(FUpsampleFoldWeightsKernel);
+end;
+
+function TDotProductSharedKernel.PrepareUpsampleFold(): boolean;
+begin
+  Result := UpsampleFoldReady();
+  if Result or (not FImplicitConvReady) or (FSize mod 9 <> 0) then exit;
+  FUpsampleFoldWeightsKernel :=
+    FDotProductKernel.CreateKernel('cai_conv_upsample_fold_weights');
+  if not Assigned(FUpsampleFoldWeightsKernel) then exit;
+  FUpsampleFoldBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * (FSize div 9) * 16 * csNeuralFloatSize);
+  if not Assigned(FUpsampleFoldBuffer) then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
-      'setting arguments or uploading: ' + IntToStr(err));
+    clReleaseKernel(FUpsampleFoldWeightsKernel);
+    FUpsampleFoldWeightsKernel := nil;
     exit;
   end;
-  if UseTiled
-    then RunTiledGemm(K, csTiledGemmLanes,
-      csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols)
-    else FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
-  Inc(FImplicitConvLaunchCount);
+  FUpsampleFoldStale := true;
+  Result := true;
+end;
+
+procedure TDotProductSharedKernel.ComputeUpsampleFoldConv(VAs,
+  SrcVol: TNNetVolume; pActFN: longint; NewVAs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InDepth: longint;
+  SrcBuffer: cl_mem;
+begin
+  InDepth := SrcVol.Depth;
+  if (not UpsampleFoldReady()) or (VAs.Size <> FSize * FNumAs) or
+    (FSize <> 9 * InDepth) or (FNumBs <> 4 * SrcVol.SizeX * SrcVol.SizeY) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeUpsampleFoldConv - ' +
+      'unarmed or shape mismatch: FSize ' + IntToStr(FSize) + ', NumBs ' +
+      IntToStr(FNumBs) + ', source ' + IntToStr(SrcVol.SizeX) + 'x' +
+      IntToStr(SrcVol.SizeY) + 'x' + IntToStr(InDepth));
+    exit;
+  end;
+  FActFun := pActFN;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs then
+  begin
+    if not FWeightsBorrowed then
+      err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FUpsampleFoldStale := true;
+  end;
+  if FUpsampleFoldStale and (err = CL_SUCCESS) then
+  begin
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 0, csLongintSize,
+      @FNumAs);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 1, csLongintSize,
+      @InDepth);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 2, csCLMemSize,
+      @FInputBufferAs);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 3, csCLMemSize,
+      @FUpsampleFoldBuffer);
+    if err = CL_SUCCESS then
+    begin
+      FDotProductKernel.RunKernel3D(FUpsampleFoldWeightsKernel, FNumAs,
+        InDepth, 16);
+      FUpsampleFoldStale := false;
+    end;
+  end;
+  if err = CL_SUCCESS then
+    LaunchImplicitConv(FUpsampleFoldBuffer, SrcBuffer, FNumBs div 4,
+      4 * InDepth, UseBias, {OutSizeX}SrcVol.SizeX, {RowSpan}2 * InDepth,
+      SrcVol.SizeX, SrcVol.SizeY, InDepth, {Stride}1, {PaddingX}1,
+      {PaddingY}1, {DilationX}1, {PixelStride}InDepth, {OutFrames}1,
+      {FrameStep}0, {UpsampleFold}1, err);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeUpsampleFoldConv - ' +
+      'failed uploading, deriving the phase weights or launching: ' +
+      IntToStr(err));
+    exit;
+  end;
+  Inc(FUpsampleFoldLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;

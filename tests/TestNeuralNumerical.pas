@@ -406,6 +406,9 @@ type
     procedure TestBackwardWarpOpenCLParity;
     procedure TestAffineGridSampleOpenCLParity;
     procedure TestBilinearUpsampleOpenCLParity;
+    // Nearest-2x + 3x3 conv folded into four 2x2 phase convs on OpenCL vs the
+    // CPU: sizes, tiled/untiled, ReLU, resident/host source, 1 or 2 readers.
+    procedure TestUpsampleFoldConvOpenCLParity;
     procedure TestPixelShuffleOpenCLParity;
     procedure TestBicubicUpsampleOpenCLParity;
     procedure TestPixelShuffleBackwardOpenCLParity;
@@ -69852,6 +69855,154 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestUpsampleFoldConvOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csFoldSentinel = 12345.0;
+  // W, H, input depth, output depth (70 >= the tiled-GEMM row minimum).
+  csFoldCases: array[0..3, 0..3] of integer =
+    ((5, 4, 3, 6), (6, 7, 8, 70), (1, 1, 2, 3), (3, 5, 4, 4));
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Source, Upsample, Conv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, W, H, DIn, DOut, ElementPos, NeuronPos, VariantPos: integer;
+  FoldBefore, TiledBefore: integer;
+  HostSource, UseReLU, TwoReaders, ImplicitConvWasEnabled: boolean;
+  MaxDiff: TNeuralFloat;
+  CaseName: string;
+
+  function MaxDiffToCPU(): TNeuralFloat;
+  var
+    DiffPos: integer;
+  begin
+    Result := 0;
+    AssertEquals(CaseName + ': output size', OutCPU.Size,
+      NN.GetLastLayer.Output.Size);
+    for DiffPos := 0 to OutCPU.Size - 1 do
+      Result := Max(Result, Abs(OutCPU.Raw[DiffPos] -
+        NN.GetLastLayer.Output.Raw[DiffPos]));
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  Input := TNNetVolume.Create();
+  OutCPU := TNNetVolume.Create();
+  try
+    for CasePos := 0 to High(csFoldCases) do
+      for VariantPos := 0 to 3 do
+      begin
+        W := csFoldCases[CasePos, 0];
+        H := csFoldCases[CasePos, 1];
+        DIn := csFoldCases[CasePos, 2];
+        DOut := csFoldCases[CasePos, 3];
+        HostSource := (VariantPos and 1) <> 0;
+        UseReLU := VariantPos = 2;
+        // The second reader (a sum) needs the upsample's depth.
+        TwoReaders := (VariantPos = 3) and (DIn = DOut);
+        CaseName := Format('%dx%dx%d->%d host=%s relu=%s two readers=%s',
+          [W, H, DIn, DOut, BoolToStr(HostSource, true),
+          BoolToStr(UseReLU, true), BoolToStr(TwoReaders, true)]);
+        RandSeed := 9100 + CasePos * 10 + VariantPos;
+        Input.ReSize(W, H, DIn);
+        for ElementPos := 0 to Input.Size - 1 do
+          Input.Raw[ElementPos] := Random() * 2 - 1;
+        NN := TNNet.Create();
+        try
+          NN.AddLayer(TNNetInput.Create(W, H, DIn, 1));
+          if HostSource then
+            Source := NN.AddLayer(TNNetIdentity.Create())
+          else
+          begin
+            // Identity pointwise conv: its output stays in OpenCL memory.
+            Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(DIn).
+              SetTrainable(False, False));
+            for NeuronPos := 0 to Source.Neurons.Count - 1 do
+            begin
+              Source.Neurons[NeuronPos].Weights.Fill(0);
+              Source.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+              Source.Neurons[NeuronPos].BiasWeight := 0;
+            end;
+            Source.FlushWeightCache();
+          end;
+          Upsample := NN.AddLayer(TNNetDeMaxPool.Create(2).SetTrainable(False));
+          if UseReLU
+            then Conv := TNNetConvolutionReLU.Create(DOut, 3, 1, 1)
+            else Conv := TNNetConvolutionLinear.Create(DOut, 3, 1, 1);
+          Conv.SetTrainable(False, False);
+          NN.AddLayer(Conv);
+          for NeuronPos := 0 to Conv.Neurons.Count - 1 do
+          begin
+            for ElementPos := 0 to Conv.Neurons[NeuronPos].Weights.Size - 1 do
+              Conv.Neurons[NeuronPos].Weights.Raw[ElementPos] := Random() - 0.5;
+            Conv.Neurons[NeuronPos].BiasWeight := Random() - 0.5;
+          end;
+          Conv.FlushWeightCache();
+          if TwoReaders then
+            NN.AddLayer(TNNetSum.Create([Conv, Upsample]).SetTrainable(False));
+          NN.Compute(Input);
+          OutCPU.Copy(NN.GetLastLayer.Output);
+
+          NN.ForceOpenCL(True);
+          NN.EnableOpenCL(PlatformId, DeviceId);
+          try
+            SetOpenCLImplicitConv(true);
+            FoldBefore := Conv.OpenCLUpsampleFoldLaunchCount();
+            TiledBefore := Conv.OpenCLTiledGemmLaunchCount();
+            NN.Compute(Input);
+            MaxDiff := MaxDiffToCPU();
+            AssertTrue(CaseName + ': fold max |diff| = ' + FloatToStr(MaxDiff),
+              MaxDiff < 1e-4);
+            AssertEquals(CaseName + ': fold launches', FoldBefore + 1,
+              Conv.OpenCLUpsampleFoldLaunchCount());
+            AssertEquals(CaseName + ': tiled kernel',
+              Ord(DOut >= 64), Conv.OpenCLTiledGemmLaunchCount() - TiledBefore);
+            AssertEquals(CaseName + ': the upsample output exists only with ' +
+              'a second reader', TwoReaders, Upsample.OutputBindableOnOpenCL() or
+              Upsample.ForceOutputOnRAM());
+            if not HostSource then
+            begin
+              // The bound source is read in OpenCL memory, never from RAM.
+              Source.Output.Fill(csFoldSentinel);
+              NN.Compute(Input);
+              MaxDiff := MaxDiffToCPU();
+              AssertTrue(CaseName + ': resident source max |diff| = ' +
+                FloatToStr(MaxDiff), MaxDiff < 1e-4);
+            end;
+            SetOpenCLImplicitConv(false);
+            FoldBefore := Conv.OpenCLUpsampleFoldLaunchCount();
+            NN.Compute(Input);
+            MaxDiff := MaxDiffToCPU();
+            AssertTrue(CaseName + ': explicit max |diff| = ' +
+              FloatToStr(MaxDiff), MaxDiff < 1e-4);
+            AssertEquals(CaseName + ': no fold without the implicit GEMM',
+              FoldBefore, Conv.OpenCLUpsampleFoldLaunchCount());
+          finally
+            NN.ForceOpenCL(False);
+            SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+          end;
+        finally
+          NN.Free;
+        end;
+      end;
+  finally
+    OutCPU.Free;
+    Input.Free;
   end;
 end;
 {$ELSE}
