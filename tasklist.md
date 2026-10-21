@@ -928,30 +928,22 @@ rather than acted on.
           fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
           unless forced, because the LSTM output is on RAM.
   Phase 2 — components, in graph order:
-  - [x] 2.1 ALBERT: extend `BuildBertFromSafeTensors` with the embedding projection
-        and one shared layer (do not clone it); then `bert_encoder` 768->512.
+  - 2.1 ALBERT follow-up:
         - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
-  - [x] 2.6 `AdainResBlk1d`: two weight-norm convs + shortcut (nearest x2 upsample,
-        1x1 conv without bias), times rsqrt(2). The x2 block uses a DEPTHWISE
-        ConvTranspose1d (k3, s2, groups=C, output_padding 1): add groups to
-        `THiFiGANConv` (or the `TNNet` equivalent).
+  - 2.6 `AdainResBlk1d` follow-ups:
         - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
           grouped deconvolution downloads its source and re-uploads its output.
         - [ ] A Y factor other than the X factor on SizeY > 1 runs
           `TNNetDeMaxPool` on the CPU (`cai_upsample_gather` has one factor).
-  - [x] 2.9 Public forward complex STFT (n_fft 20, hop 5, Hann, centre reflect pad)
-        in neuralaudio.pas; only power-spectrum and private FFT routines exist.
+  - 2.9 Forward complex STFT follow-ups:
         - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
         - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
-  - [x] 2.11 Generator: noise convs (k12 s6 p3; k1), `noise_res`, ConvTranspose1d
-        ups, reflection pad (1,0) on the last stage, MRF average of 3 resblocks,
-        `conv_post` 128->22, exp (magnitude) / sin (phase), iSTFT via
-        `ISTFTOverlapAdd` with the centre trim and the phase-sign flip.
+  - 2.11 Generator follow-up:
         - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
           their scratch per call (once per utterance).
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
@@ -1804,7 +1796,8 @@ rather than acted on.
   Stage 2 — Kev and Open-Jev:
   - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
         Open-Jev-2B against their Python servers; commands written by the agents.
-        Commands (ChatServer.md *Trained decision checkpoints*); PASS = max abs
+        Commands below (ChatServer.md *Trained decision checkpoints* has only the
+        DecisionClient sanity run); PASS = max abs
         difference <= 5e-3 (exit 0); `--fp32` is required:
         ```
         git clone https://huggingface.co/Qwen/Qwen3.5-0.8B-Base q08b
@@ -1874,13 +1867,6 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       selected experts, resident int8 or FP32 weight slab) so gate/up -> down
       stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
       OLMoE and GPT-OSS.
-- [X] `TNNetDeepConcat` upload follow-ups (from 1b292c2f): a zero-depth
-      host-only source is not skipped (TNNetConcat skips 0-byte sources; the
-      deep concat would create a 0-byte buffer), and a host-only layer listed at
-      two source positions is uploaded twice. Guard the first; share one upload
-      per distinct layer for the second. Done: an empty source binds nil and
-      gets no per-source launch; `FUploadOwnerPos` shares one upload per layer
-      (`TestDeepConcatHostSourceEdgeOpenCLParity`).
 - [ ] Follow-ups of the `cai_gather_copy` glue: `cai_upsample_gather`
       (DeMaxPool, Upsample, PixelShuffle) is expressible as a `cai_gather_copy`
       plan too (DeMaxPool's random spacing would need a per-forward plan, so
@@ -2051,23 +2037,9 @@ cannot pay for its own transfer.
       opcodes 15, 40 and 48-55: the scalar ones pass their weight as a kernel
       argument, the per-channel ones read their neurons packed into one table
       (`TNNetChannelTransformBase.PackActivationChannelTables`).
-- [X] Extend the `cai_activation` trap audit to the other kernels. The
-      kernels build with `-cl-fast-relaxed-math` and PoCL runs them with FP
-      traps unmasked; `TestActivationOpenCLExtremeInputs` showed PoCL's
-      `exp` trapping below ~-88 (not underflowing), `erf`/`sin`/`cos`/`log`
-      trapping on huge arguments, both sides of data-dependent branches
-      running, and `x * tanh` reassociated into an overflowing `x * (1 - e)`.
-      Done: `cai_gated_delta_net` (sigmoid/SiLU via `cai_fused_act`, one
-      floored exp for both softplus branches, floored decay and `ea`),
-      `cai_softmax` (`cai_exp_floored`), the split-row decode row softmax
-      (FP32 and int8, -80 floor), the soft-cap `tanh` in both split kernels
-      and `cai_flash_score` (`cai_tanh`), and `cai_rope`/`cai_mrope`
-      (`cai_sin`/`cai_cos`, identical below 1e8 rad). Each trapped on PoCL
-      before the fix: `TestRoPEOpenCLExtremeInputs`,
-      `TestSoftMaxOpenCLExtremeInputs`, `TestGatedDeltaNetOpenCLExtremeGates`,
-      `TestFusedSDPAOpenCLExtremeScores`.
-  - [ ] GPU-box decode timing for the -80 floor in the split-row decode (one
-        `fmax` per score) and `cai_tanh` on the soft-cap; not measured here.
+- [ ] GPU-box decode timing for the trap-free math of d8e5ec90: the -80 floor in
+      the split-row decode (one `fmax` per score) and `cai_tanh` on the soft-cap;
+      not measured here.
 
 ## Layer follow-ups that fix real limitations
 
@@ -2357,10 +2329,6 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [X] `TNNetResize2D` `antialias=True` as the opt-in 5th flag (FStruct[4]):
-      variable-tap per-axis tables + separable two-pass forward/transpose on
-      TNNetResizeBase; torch oracle tools/make_resize2d_antialias_fixture.py.
-      Host only: no OpenCL kernel for variable tap counts (layer is CPU-pinned).
 - [ ] Antialiased downscale in the HF image preprocessing helpers. Both shrink
       photos with NEAREST (Trunc of the source coordinate) although their comments
       say bilinear, while the HF targets use PIL BICUBIC/BILINEAR (always
