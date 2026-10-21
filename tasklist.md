@@ -1204,6 +1204,13 @@ rather than acted on.
         component in memory at a time, OnPhase/OnStep) and a CLI that loads it;
         examples/TextToVideo takes only a single .safetensors today.
   - [ ] CFG in the TextToVideo loop with a real empty-prompt uncond branch.
+        Blocked on the T5 tower + tokenizer (the TCogVideoXPipeline item
+        above): the example's text states are synthetic, so an "empty-prompt"
+        branch would be invented too and `--cfg` would mean nothing. When it
+        lands: eps = uncond + scale * (cond - uncond), two
+        `TCogVideoXSampler.PredictNoise` calls per step, each branch with its
+        own `TDiTFirstBlockCache` (PredictNoise takes the cache as a
+        parameter).
   - [ ] Output: PPM/PNG frames and an animated GIF (`--gif`, neuralgif.pas)
         exist; a video-container (MP4/WebM) writer is still missing.
 - [ ] Wan 2.1 text-to-VIDEO DiT importer (`BuildWanFromSafeTensors[Ex]` +
@@ -1660,9 +1667,16 @@ rather than acted on.
             there has prefix rows and does not match the cached steps' shape;
             the oracle must slice the target rows (our step pass carries only
             them).
-      - [ ] Reuse in the CogVideoX TextToVideo loop and later DiT pipelines
-            (SD3/FLUX MMDiT, Wan): they need the same split of their block
-            loop (run block 0, ask, run or skip the rest).
+      - [X] Reuse in the CogVideoX TextToVideo loop (43f99b62):
+            `TCogVideoXSampler.PredictNoise` splits the single CogVideoX TNNet
+            into layer ranges (prefix + block 0 / blocks 1..N-1 / output head),
+            examples/TextToVideo `--fbc-threshold X`,
+            `TestCogVideoXFirstBlockCacheReference` on a three-block copy of
+            the pico checkpoint.
+      - [ ] Reuse in later DiT pipelines (SD3/FLUX MMDiT, Wan): the same
+            split of their block loop (run block 0, ask, run or skip the
+            rest); a single-TNNet denoiser can follow TCogVideoXSampler's
+            layer-range split.
 - [ ] LaMa large-mask inpainting follow-ups. `BuildLaMaFromSafeTensors`
       (neuralpretrained.pas, `TestLaMaParity` on the pico fixture from
       `tools/make_pico_lama_fixture.py`) and examples/LaMaInpaint are coded; the
