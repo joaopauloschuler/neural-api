@@ -1931,6 +1931,37 @@ rather than acted on.
         (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
         and a reversed velocity sign; the gain is small (the loop is already one
         `MulAdd` per step).
+- [ ] Adaptive Projected Guidance (APG, Sadat et al., ICLR 2025, "Eliminating
+      Oversaturation and Artifacts of High Guidance Scales in Diffusion Models"),
+      ported from diffusers `guiders/adaptive_projected_guidance.py`
+      (`normalized_guidance` + `MomentumBuffer`, 0.41.0.dev0 in the ~/x venv).
+      Today the diffusion loops have only `TNNetDiffusionScheduler.ApplyCFG`
+      (plain mix and the Lin et al. guidance-rescale overload); high guidance
+      scales oversaturate the image, and APG fixes that at the same cost (two
+      dot products and a few `MulAdd` passes over the latent per step).
+      Math per step, all reductions over the whole volume:
+      diff := cond - uncond; with momentum m: avg := diff + m * avg, diff := avg
+      (the paper uses a NEGATIVE m, e.g. -0.5); with norm threshold r > 0:
+      diff := diff * min(1, r / ||diff||); then u := cond / ||cond||,
+      par := (diff . u) * u, orth := diff - par,
+      Dst := uncond + W * (orth + eta * par) (diffusers default; the
+      `use_original_formulation` variant adds to cond instead).
+      - [ ] A guidance-state class next to the scheduler in neural/neuraldiffusion.pas
+            (`ApplyAPG(Cond, Uncond, Dst)` plus `Reset` per trajectory) that OWNS the
+            momentum volume, sized on first use, so a step allocates nothing.
+            Reuse `TNNetVolume.DotProduct` / `MulAdd` / `Mul`; keep the math in
+            `Single` (guide #25) even though diffusers widens to double.
+      - [ ] Tests: eta = 1, m = 0, r = 0 equals `ApplyCFG` exactly; a hand-computed
+            2-element case for the projection, the norm clamp and two momentum steps;
+            Dst may alias Cond or Uncond like `ApplyCFG`. A diffusers oracle
+            needs the user's approval for a new Python tool.
+      - [ ] Wire it into examples/LatentTextToImage (`--apg ETA,MOMENTUM,THRESHOLD`
+            next to `--cfg`) and examples/ConditionalDiffusion, and
+            document the flag in their README.md files. The paper applies APG to
+            the denoised (x0) prediction rather than to eps; check both on the
+            pico fixture and state which space the flag uses. Later consumers:
+            the open CFG items of the CogVideoX TextToVideo loop, the Stable
+            Diffusion pipeline and QwenImage B3.
 
 ## OpenCL forward coverage — layers still on the host
 
