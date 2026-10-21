@@ -616,8 +616,13 @@ rather than acted on.
         the presets' LayerNorm/bias flags come from the official options
         yml, and the builder rejects a preset that disagrees with the
         checkpoint).
-  - [ ] Dual-pixel defocus in the example (importer + parity done; the
-        example reads one image, the checkpoint needs a left/right pair).
+  - [X] Dual-pixel defocus in the example: `--left/--right` (+ `--task
+        dual-pixel`), `RestormerPackDualPixel`, tiled/OpenCL path shared;
+        `TestRestormerDualPixelPackedParity`, `TestRestormerPackDualPixelRejects`.
+    - [ ] 16-bit PNG precision: `LoadImageIntoVolume` keeps the high 8 bits
+          (`shr 8`) and the example writes 8-bit output; the official script
+          reads /65535 and writes 16-bit PNG.
+    - [ ] Not run on a real DPDD pair (needs `dual_pixel_defocus_deblurring.pth`).
   - [ ] GPU timing at 1-4 MP tiles, then coalescing `cai_transposed_attn_dots`,
         which reads q|k with a 3C stride per position (uncoalesced).
 - [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]

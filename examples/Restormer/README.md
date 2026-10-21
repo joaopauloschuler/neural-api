@@ -20,6 +20,11 @@ patch_embed 3x3 -> [encoder level L blocks -> Downsample]x3 -> latent blocks
       -> decoder level L blocks]x3 -> refinement blocks -> output 3x3 + input
 ```
 
+The dual-pixel defocus net takes the left and right dual-pixel views
+concatenated on channels (6 channels in, 3 out). It adds a 1x1 `skip_conv` of
+the patch embedding before the output conv and has no global residual against
+the input.
+
 TransformerBlock(C):
 
 ```
@@ -44,14 +49,16 @@ x = x + project_out(gelu(x1) * x2),  [x1|x2] = dwconv3x3(project_in1x1(LayerNorm
 ./Restormer                                          # pico fixture smoke run
 ./Restormer --task derain --input rainy.png --output clean.png
 ./Restormer --task deblur --model motion_deblurring.pth --input blurry.jpg --output sharp.png --gpu
+./Restormer --left 1P0A1000_L.png --right 1P0A1000_R.png --output sharp.png
 ```
 
 | option | meaning | default |
 | --- | --- | --- |
-| `--task TASK` | `derain`, `deblur` (motion), `defocus` (single image), `denoise` (real camera noise), `denoise-gaussian`, `denoise-gray` | smoke run |
+| `--task TASK` | `derain`, `deblur` (motion), `defocus` (single image), `dual-pixel` (defocus from a left/right pair), `denoise` (real camera noise), `denoise-gaussian`, `denoise-gray` | smoke run; `dual-pixel` with `--left` |
 | `--model FILE` | checkpoint, `.pth` (the release format) or `.safetensors` | the release file name below, in the current folder |
 | `--config FILE` | a JSON with the torch constructor kwargs, overriding the task preset | the preset |
 | `--input IMG` / `--output IMG` | PNG / JPEG / BMP / PPM in; the output format comes from the extension | required with `--task` |
+| `--left IMG` / `--right IMG` | the two dual-pixel views of one shot, same size; they replace `--input` and imply `--task dual-pixel` | |
 | `--tile N` | tile edge in pixels; `0` runs the whole image in one net | 256 |
 | `--tile-pad N` | context pixels on each tile side, dropped from interior sides | 16 |
 | `--tile-overlap N` | pixels feather-blended across tile seams | 32 |
@@ -62,6 +69,7 @@ x = x + project_out(gelu(x1) * x2),  [x1|x2] = dwconv3x3(project_in1x1(LayerNorm
 | `derain` | Deraining | `deraining.pth` | WithBias |
 | `deblur` | Motion_Deblurring | `motion_deblurring.pth` | WithBias |
 | `defocus` | Defocus_Deblurring (single image) | `single_image_defocus_deblurring.pth` | WithBias |
+| `dual-pixel` | Defocus_Deblurring (dual pixel), 6 channels in | `dual_pixel_defocus_deblurring.pth` | WithBias |
 | `denoise` | Real_Denoising | `real_denoising.pth` | BiasFree |
 | `denoise-gaussian` | Gaussian color denoising (blind) | `gaussian_color_denoising_blind.pth` | BiasFree |
 | `denoise-gray` | Gaussian gray denoising (blind), 1 channel | `gaussian_gray_denoising_blind.pth` | BiasFree |
@@ -88,18 +96,39 @@ full-resolution activation is 510 channels (the level-1 GDFN), so a 256x256
 tile holds about 134 MB per such tensor. `ShareHostOutputsByLiveness` lets
 activations that are no longer needed share storage.
 
+## Dual-pixel defocus deblurring
+
+`--left` and `--right` take the two dual-pixel views (for DPDD, the
+`*_L.png` / `*_R.png` files of one shot). `RestormerPackDualPixel`
+(`neuralpretrained.pas`) packs them into one 6-channel volume, left channels
+first, as the official `torch.cat([left, right], 1)` does. The packed volume
+then goes through the same padding and tiling as a single image. The example
+refuses:
+
+* `--input` for a dual-pixel checkpoint or config (`inp_channels=6`);
+* `--left`/`--right` for a single-image checkpoint or config;
+* views of different sizes (`RestormerPackDualPixel` raises).
+
+The builder also refuses a checkpoint whose `patch_embed` input channels or
+`skip_conv` presence disagree with the config, so a dual-pixel `.pth` run with
+`--task defocus` stops with a message naming `inp_channels`.
+
+16-bit PNGs (the DPDD release format) load, but `LoadImageFromFileIntoVolume`
+keeps only the high 8 bits of each channel, and the output is written as an
+8-bit image. The official test script reads the views at 16 bits (`/65535`) and
+writes a 16-bit PNG, so results differ from it by up to that quantization.
+
 With no arguments, the example runs a smoke test on the committed random pico
-fixture (`tests/fixtures/tiny_restormer.*`). A synthetic 37x29 image is
-reflect-padded and run in 16x16 tiles, and the result is written to
-`restormer_smoke.ppm`. The weights are random, so the output is not a
-restoration.
+fixtures (`tests/fixtures/tiny_restormer.*` and `tiny_restormer_dp.*`). A
+synthetic 37x29 image (and, for the dual-pixel net, a left/right pair) is
+reflect-padded and run in 16x16 tiles, and the results are written to
+`restormer_smoke.ppm` and `restormer_dp_smoke.ppm`. The weights are random, so
+the output is not a restoration.
 
 ## Not covered
 
-* Dual-pixel defocus deblurring (`dual_pixel_defocus_deblurring.pth`, a
-  6-channel left/right pair): the importer builds it (`TRestormerConfig.DualPixelTask`,
-  parity-tested), but this example reads one image only.
 * No real checkpoint has been run, and no GPU timing exists yet.
+* 16-bit input precision and 16-bit output (see above).
 
 ## Tests
 
@@ -108,5 +137,12 @@ restoration.
 * `TestRestormerDualPixelBiasFreeParity`: BiasFree LayerNorm, conv biases,
   dual-pixel skip conv, 16x24, a `{'params': ...}` `.pth`; max |diff| 1.6e-6,
   and a save/load copy of the net reproduces the output exactly.
+* `TestRestormerDualPixelPackedParity`: the same oracle input split into
+  left/right views, packed by `RestormerPackDualPixel` and run through
+  `PaddedTiledNetCompute`; max |diff| 1.6e-6.
+* `TestRestormerPackDualPixelRejects`: a 3-channel config, a 1-channel view and
+  views of different sizes are refused.
+* `TestRestormerRejectsMismatchedConfig`: also a dual-pixel config on a
+  3-channel checkpoint.
 * `TestRestormerTiledOpenCL`: the dual-pixel pico net on a 40x30 image through
   `PaddedTiledNetCompute`, OpenCL against CPU, max |diff| 1.9e-6 on PoCL.

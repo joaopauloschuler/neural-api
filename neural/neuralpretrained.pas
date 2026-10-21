@@ -13549,6 +13549,11 @@ function BuildRestormerFromSafeTensors(const FileName: string;
   out Config: TRestormerConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
+// Packs a dual-pixel pair into the net input: depth = [Left | Right] (torch.cat
+// on channels). Raises on a non-dual-pixel Config or views of a wrong depth/size.
+procedure RestormerPackDualPixel(const Config: TRestormerConfig;
+  Left, Right, PackedInput: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // CLIPSeg TEXT-PROMPTED ZERO-SHOT SEGMENTATION IMPORT (model_type "clipseg")
 // -- the repo's FIRST "free-text prompt -> dense single-channel mask"
@@ -78612,34 +78617,49 @@ begin
   end;
 end;
 
+// Resizes PackedInput to First's size x (First.Depth + Second.Depth +
+// TrailingDepth) and writes [First | Second] per pixel; callers check shapes.
+procedure ConcatVolumesOnDepth(First, Second, PackedInput: TNNetVolume;
+  TrailingDepth: integer);
+var
+  FirstDepth, SecondDepth, PackedDepth: integer;
+  PixelPos, MaxPixelPos, FirstPos, SecondPos, PackedPos: integer;
+  FirstBytes, SecondBytes: integer;
+begin
+  FirstDepth := First.Depth;
+  SecondDepth := Second.Depth;
+  PackedDepth := FirstDepth + SecondDepth + TrailingDepth;
+  PackedInput.ReSize(First.SizeX, First.SizeY, PackedDepth);
+  FirstBytes := FirstDepth * csNeuralFloatSize;
+  SecondBytes := SecondDepth * csNeuralFloatSize;
+  MaxPixelPos := First.SizeX * First.SizeY - 1;
+  FirstPos := 0;
+  SecondPos := 0;
+  PackedPos := 0;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    Move(First.FData[FirstPos], PackedInput.FData[PackedPos], FirstBytes);
+    Move(Second.FData[SecondPos], PackedInput.FData[PackedPos + FirstDepth],
+      SecondBytes);
+    Inc(FirstPos, FirstDepth);
+    Inc(SecondPos, SecondDepth);
+    Inc(PackedPos, PackedDepth);
+  end;
+end;
+
 procedure RIFEPackFrames(const Config: TRIFEConfig;
   Frame0, Frame1: TNNetVolume; T: TNeuralFloat; PackedInput: TNNetVolume);
 var
-  InChannel, PackedDepth, TimestepOffset: integer;
-  PixelPos, MaxPixelPos, FramePos, PackedPos, FrameBytes: integer;
+  InChannel: integer;
 begin
   InChannel := Config.InChannel;
   if (Frame0.Depth <> InChannel) or (Frame1.Size <> Frame0.Size) or
     (Frame1.SizeX <> Frame0.SizeX) then
     raise Exception.Create('RIFEPackFrames: frames must both be (S, S, ' +
       IntToStr(InChannel) + ').');
-  PackedDepth := 2 * InChannel + Ord(Config.TimestepInput);
-  PackedInput.ReSize(Frame0.SizeX, Frame0.SizeY, PackedDepth);
-  FrameBytes := InChannel * csNeuralFloatSize;
-  TimestepOffset := 2 * InChannel;
-  MaxPixelPos := Frame0.SizeX * Frame0.SizeY - 1;
-  FramePos := 0;
-  PackedPos := 0;
-  for PixelPos := 0 to MaxPixelPos do
-  begin
-    Move(Frame0.FData[FramePos], PackedInput.FData[PackedPos], FrameBytes);
-    Move(Frame1.FData[FramePos], PackedInput.FData[PackedPos + InChannel],
-      FrameBytes);
-    if Config.TimestepInput then
-      PackedInput.FData[PackedPos + TimestepOffset] := T;
-    Inc(FramePos, InChannel);
-    Inc(PackedPos, PackedDepth);
-  end;
+  ConcatVolumesOnDepth(Frame0, Frame1, PackedInput, Ord(Config.TimestepInput));
+  if Config.TimestepInput then
+    PackedInput.FillAtDepth(2 * InChannel, T);
 end;
 
 // One forward pass: packs (Frame0, Frame1, T) into PackedInput and copies the
@@ -80261,6 +80281,20 @@ begin
         BoolToStr(Config.Bias, 'bias-free', 'biased') + ' but the config ' +
         'says bias=' + BoolToStr(Config.Bias, 'true', 'false') + '.');
   end;
+  if Reader.HasTensor(Prefix + 'patch_embed.proj.weight') and
+     (Reader.DimCount(Prefix + 'patch_embed.proj.weight') = 4) and
+     (Reader.DimSize(Prefix + 'patch_embed.proj.weight', 1) <>
+      Config.InpChannels) then
+    ImportError('Restormer import: the checkpoint takes ' +
+      IntToStr(Reader.DimSize(Prefix + 'patch_embed.proj.weight', 1)) +
+      ' input channels but the config says inp_channels=' +
+      IntToStr(Config.InpChannels) + ' (6 = a dual-pixel left/right pair, ' +
+      '3 = one RGB image, 1 = one gray image).');
+  if Reader.HasTensor(Prefix + 'skip_conv.weight') <> Config.DualPixelTask then
+    ImportError('Restormer import: the checkpoint ' +
+      BoolToStr(Config.DualPixelTask, 'has no', 'has a') + ' skip_conv but ' +
+      'the config says dual_pixel_task=' +
+      BoolToStr(Config.DualPixelTask, 'true', 'false') + '.');
   if Config.Bias then SuppressBias := 0 else SuppressBias := 1;
   SkipConv := nil;
   NN := TNNet.Create();
@@ -80408,6 +80442,30 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRestormerConfigFromJSONFile(ConfigPath);
   Result := BuildRestormerFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure RestormerPackDualPixel(const Config: TRestormerConfig;
+  Left, Right, PackedInput: TNNetVolume);
+var
+  ViewDepth: integer;
+begin
+  if not Config.DualPixelTask then
+    ImportError('RestormerPackDualPixel: the config is not dual-pixel ' +
+      '(inp_channels=' + IntToStr(Config.InpChannels) + '); it restores ' +
+      'one image, not a left/right pair.');
+  ViewDepth := Config.InpChannels div 2;
+  if (2 * ViewDepth <> Config.InpChannels) or (Left.Depth <> ViewDepth) or
+     (Right.Depth <> ViewDepth) then
+    ImportError('RestormerPackDualPixel: inp_channels=' +
+      IntToStr(Config.InpChannels) + ' needs two ' + IntToStr(ViewDepth) +
+      '-channel views, got ' + IntToStr(Left.Depth) + ' (left) and ' +
+      IntToStr(Right.Depth) + ' (right).');
+  if (Left.SizeX <> Right.SizeX) or (Left.SizeY <> Right.SizeY) then
+    ImportError('RestormerPackDualPixel: the left view is ' +
+      IntToStr(Left.SizeX) + 'x' + IntToStr(Left.SizeY) + ' but the right ' +
+      'view is ' + IntToStr(Right.SizeX) + 'x' + IntToStr(Right.SizeY) +
+      '; both views must have the same size.');
+  ConcatVolumesOnDepth(Left, Right, PackedInput, {TrailingDepth=}0);
 end;
 
 // ===========================================================================

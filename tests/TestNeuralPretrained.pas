@@ -105,7 +105,7 @@ type
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
-      pRoundTrip: boolean): double;
+      pRoundTrip: boolean; pPackedPath: boolean = false): double;
     // Loads a {"shape": [T, C, ...], "data": [...]} oracle tensor of Root as a
     // (T,1,C*...) token-major volume.
     procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
@@ -1249,6 +1249,8 @@ type
     procedure TestSwinIRParity;
     procedure TestRestormerParity;
     procedure TestRestormerDualPixelBiasFreeParity;
+    procedure TestRestormerDualPixelPackedParity;
+    procedure TestRestormerPackDualPixelRejects;
     procedure TestRestormerConfig;
     procedure TestRestormerRejectsMismatchedConfig;
     procedure TestRestormerTiledOpenCL;
@@ -48539,8 +48541,10 @@ end;
 
 // Max |diff| of pico Restormer Stem (weights WeightsFile) vs its float64 torch
 // output; with pRoundTrip a save/load copy must reproduce the output exactly.
+// pPackedPath splits the oracle input into a left/right pair and runs
+// RestormerPackDualPixel + PaddedTiledNetCompute instead of NN.Compute.
 function TTestNeuralPretrained.RestormerParityMaxDiff(const Stem,
-  WeightsFile: string; pRoundTrip: boolean): double;
+  WeightsFile: string; pRoundTrip: boolean; pPackedPath: boolean): double;
 var
   NN, Reloaded: TNNet;
   Config: TRestormerConfig;
@@ -48549,6 +48553,41 @@ var
   InputArr, ImgArr, ChanArr, RowArr: TJSONArray;
   ImgInput, NetOutput: TNNetVolume;
   ChanCnt, YCnt, XCnt, Width, Height: integer;
+
+  // ImgInput -> left/right views -> RestormerPackDualPixel -> tiled forward.
+  procedure ComputeThroughPackedPath();
+  var
+    Left, Right, PackedInput, Restored: TNNetVolume;
+    ViewDepth, X, Y, Channel: integer;
+  begin
+    ViewDepth := Config.InpChannels div 2;
+    Left := TNNetVolume.Create(Width, Height, ViewDepth);
+    Right := TNNetVolume.Create(Width, Height, ViewDepth);
+    PackedInput := TNNetVolume.Create;
+    Restored := nil;
+    try
+      for Y := 0 to Height - 1 do
+        for X := 0 to Width - 1 do
+          for Channel := 0 to ViewDepth - 1 do
+          begin
+            Left[X, Y, Channel] := ImgInput[X, Y, Channel];
+            Right[X, Y, Channel] := ImgInput[X, Y, Channel + ViewDepth];
+          end;
+      RestormerPackDualPixel(Config, Left, Right, PackedInput);
+      AssertEquals(Stem + ' packed depth', Config.InpChannels,
+        PackedInput.Depth);
+      AssertEquals(Stem + ' packed = torch.cat([left, right], 1)', 0,
+        MaxAbsVolumeDiff(PackedInput, ImgInput), 0);
+      Restored := PaddedTiledNetCompute(NN, PackedInput, 8, 8, 8);
+      NetOutput.Copy(Restored);
+    finally
+      Restored.Free;
+      PackedInput.Free;
+      Right.Free;
+      Left.Free;
+    end;
+  end;
+
 begin
   NN := BuildRestormerFromSafeTensors(FixturePath(WeightsFile), Config,
     {pTrainable=}false, FixturePath(Stem + '_config.json'));
@@ -48582,8 +48621,14 @@ begin
           ImgInput[XCnt, YCnt, ChanCnt] := ChanArr.Items[XCnt].AsFloat;
       end;
     end;
-    NN.Compute(ImgInput);
-    NN.GetOutput(NetOutput);
+    if pPackedPath then ComputeThroughPackedPath()
+    else
+    begin
+      NN.Compute(ImgInput);
+      NN.GetOutput(NetOutput);
+    end;
+    AssertEquals(Stem + ' restored width', Width, NetOutput.SizeX);
+    AssertEquals(Stem + ' restored height', Height, NetOutput.SizeY);
     Result := 0;
     for ChanCnt := 0 to Config.OutChannels - 1 do
     begin
@@ -48640,6 +48685,62 @@ begin
     ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 
+// The dual-pixel oracle input split into left/right views, packed by
+// RestormerPackDualPixel and run through PaddedTiledNetCompute (the example's path).
+procedure TTestNeuralPretrained.TestRestormerDualPixelPackedParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := RestormerParityMaxDiff('tiny_restormer_dp',
+    'tiny_restormer_dp.pth', {pRoundTrip=}false, {pPackedPath=}true);
+  WriteLn('  Restormer dual-pixel packed path max|diff| = ', MaxDiff:0:9);
+  AssertTrue('restored image max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// RestormerPackDualPixel refuses a 3-channel config, views of the wrong depth
+// and views of different sizes.
+procedure TTestNeuralPretrained.TestRestormerPackDualPixelRejects;
+var
+  DualConfig: TRestormerConfig;
+  Left, Right, PackedInput: TNNetVolume;
+
+  function PackError(const Config: TRestormerConfig): string;
+  begin
+    Result := '';
+    try
+      RestormerPackDualPixel(Config, Left, Right, PackedInput);
+    except
+      on E: EPretrainedImportError do Result := E.Message;
+    end;
+  end;
+
+var
+  Msg: string;
+begin
+  DualConfig := RestormerTaskConfig('dual_pixel_defocus_deblurring');
+  Left := TNNetVolume.Create(8, 8, 3);
+  Right := TNNetVolume.Create(8, 8, 3);
+  PackedInput := TNNetVolume.Create;
+  try
+    AssertEquals('a valid pair packs', '', PackError(DualConfig));
+    AssertEquals('packed depth', 6, PackedInput.Depth);
+    Msg := PackError(RestormerTaskConfig('deraining'));
+    AssertTrue('3-channel config: ' + Msg, Pos('not dual-pixel', Msg) > 0);
+    Right.ReSize(8, 8, 1);
+    Msg := PackError(DualConfig);
+    AssertTrue('1-channel right view: ' + Msg,
+      Pos('two 3-channel views', Msg) > 0);
+    Right.ReSize(8, 16, 3);
+    Msg := PackError(DualConfig);
+    AssertTrue('8x16 right view: ' + Msg, Pos('same size', Msg) > 0);
+  finally
+    PackedInput.Free;
+    Right.Free;
+    Left.Free;
+  end;
+end;
+
 // The config reader and the official task presets.
 procedure TTestNeuralPretrained.TestRestormerConfig;
 var
@@ -48677,7 +48778,8 @@ end;
 // rejected: otherwise the norm bias / conv bias tensors would go unread.
 procedure TTestNeuralPretrained.TestRestormerRejectsMismatchedConfig;
 
-  function BuildError(pBiasFreeNorm, pBias: boolean): string;
+  function BuildError(pBiasFreeNorm, pBias: boolean;
+    pInpChannels: integer = 3; pDualPixel: boolean = false): string;
   var
     Config: TRestormerConfig;
     NN: TNNet;
@@ -48687,6 +48789,8 @@ procedure TTestNeuralPretrained.TestRestormerRejectsMismatchedConfig;
       FixturePath('tiny_restormer_config.json'));
     Config.BiasFreeNorm := pBiasFreeNorm;
     Config.Bias := pBias;
+    Config.InpChannels := pInpChannels;
+    Config.DualPixelTask := pDualPixel;
     NN := nil;
     try
       NN := BuildRestormerFromSafeTensorsEx(
@@ -48706,6 +48810,12 @@ begin
   Msg := BuildError({pBiasFreeNorm=}false, {pBias=}true);
   AssertTrue('bias=true on a bias-free checkpoint: ' + Msg,
     Pos('bias=true', Msg) > 0);
+  Msg := BuildError(false, false, {pInpChannels=}6, {pDualPixel=}true);
+  AssertTrue('dual-pixel config on a 3-channel checkpoint: ' + Msg,
+    Pos('takes 3 input channels', Msg) > 0);
+  Msg := BuildError(false, false, {pInpChannels=}3, {pDualPixel=}true);
+  AssertTrue('dual_pixel_task on a checkpoint without skip_conv: ' + Msg,
+    Pos('has no skip_conv', Msg) > 0);
 end;
 
 // The pico dual-pixel net on a 40x30 image through PaddedTiledNetCompute (32x32
