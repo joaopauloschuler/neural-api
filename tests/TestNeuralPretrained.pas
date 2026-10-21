@@ -236,6 +236,10 @@ type
     // pOnOpenCL, when set, must run every forward on OpenCL with its state there.
     procedure RunStreamedDecodeOpenCLParity(const Stem: string;
       pOnOpenCL: TClass = nil);
+    // CPU-vs-OpenCL full-sequence forward of one checkpoint at SeqLen;
+    // every AClass layer must reach OpenCL.
+    procedure RunFullForwardOpenCLParity(const Stem: string; SeqLen: integer;
+      AClass: TClass);
     // Every layer of AClass in Net ran at least one forward on the device.
     procedure AssertAllOnDevice(Net: TNNet; AClass: TClass;
       const What: string);
@@ -526,6 +530,10 @@ type
     procedure TestMambaStreamedDecodeOpenCLParity;
     procedure TestFalconMambaStreamedDecodeOpenCLParity;
     procedure TestJambaStreamedDecodeOpenCLParity;
+    // tiny_mamba2 and tiny_nemotronh full-sequence forward on OpenCL against
+    // the CPU twin; every TNNetMamba2 must run on OpenCL.
+    procedure TestMamba2FullForwardOpenCLParity;
+    procedure TestNemotronHFullForwardOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35StateCheckpointResumeParity;
     procedure TestQwen35StateCheckpointResumeInt8KVParity;
@@ -11870,6 +11878,83 @@ procedure TTestNeuralPretrained.TestJambaStreamedDecodeOpenCLParity;
 begin
   {$IFDEF OpenCL}
   RunStreamedDecodeOpenCLParity('tiny_jamba', TNNetSelectiveSSM);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+// Two inference builds of one checkpoint at SeqLen, one armed for OpenCL as
+// ChatTerminal arms it (no ForceOpenCL); the logits of one full forward must
+// match within 1e-4 relative. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunFullForwardOpenCLParity(const Stem: string;
+  SeqLen: integer; AClass: TClass);
+var
+  NetCPU, NetCL: TNNet;
+  Ids, OutCPU, OutCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, ElementPos, MaxElementPos, Vocab: integer;
+  Diff, MaxRelDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NetCPU := nil; NetCL := nil;
+  Ids := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  OutCL := TNNetVolume.Create();
+  try
+    NetCPU := BuildFromPretrained(FixturePath(Stem + '.safetensors'), SeqLen,
+      {pTrainable=}false, FixturePath(Stem + '_config.json'));
+    NetCL := BuildFromPretrained(FixturePath(Stem + '.safetensors'), SeqLen,
+      {pTrainable=}false, FixturePath(Stem + '_config.json'));
+    NetCL.EnableOpenCL(PlatformId, DeviceId);
+    Vocab := NetCPU.GetLastLayer.Output.Depth;
+    for T := 0 to SeqLen - 1 do Ids.FData[T] := (5 * T + 2) mod Vocab;
+    NetCPU.Compute(Ids);
+    NetCPU.GetOutput(OutCPU);
+    NetCL.Compute(Ids);
+    NetCL.GetOutput(OutCL);
+    MaxRelDiff := 0;
+    MaxElementPos := OutCPU.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      Diff := Abs(OutCPU.FData[ElementPos] - OutCL.FData[ElementPos]) /
+        Max(1.0, Abs(OutCPU.FData[ElementPos]));
+      if Diff > MaxRelDiff then MaxRelDiff := Diff;
+    end;
+    WriteLn('  ', Stem, ' full forward OpenCL vs CPU: max rel diff=',
+      MaxRelDiff:0:9);
+    AssertAllOnDevice(NetCL, AClass, Stem);
+    AssertTrue(Stem + ' OpenCL full forward: max rel diff ' +
+      FloatToStr(MaxRelDiff) + ' must be < 1e-4', MaxRelDiff < 1e-4);
+  finally
+    OutCL.Free;
+    OutCPU.Free;
+    Ids.Free;
+    NetCL.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestMamba2FullForwardOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunFullForwardOpenCLParity('tiny_mamba2', 8, TNNetMamba2);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestNemotronHFullForwardOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunFullForwardOpenCLParity('tiny_nemotronh', 8, TNNetMamba2);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}

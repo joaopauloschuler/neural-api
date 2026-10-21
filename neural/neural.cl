@@ -4700,6 +4700,111 @@ __kernel void cai_selective_ssm_scan
   }
 }
 
+// MAMBA-2 SSD SCAN (TNNetMamba2). ONE WORK-ITEM PER d_inner CHANNEL ch for the
+// whole sequence: head h = ch / FHeadDim, group g = h / FHeadsPerGroup. Row t of
+// FX is [ x (FDInner) | B | C | dt (heads) | gate ], FInDepth floats apart. Per t:
+//   dt = softplus(dt_in[h] + dt_bias[h]);  a = exp(-dt * exp(min(A_log[h],30)))
+//   h[ch,s] = a * h[ch,s] + dt * B[g,s] * x[ch];  y = sum_s C[g,s]*h[ch,s] + D[h]*x[ch]
+// FH is the (FDInner, FNS) state, read and rewritten in place; FResetState = 1
+// starts it from zero. y lands in FY (FDInner per token) for the gated norm.
+// Coded by Claude (AI).
+__kernel void cai_mamba2_scan
+(
+  const int FSeqLen,
+  const int FDInner,
+  const int FHeadDim,
+  const int FNS,
+  const int FHeadsPerGroup,
+  const int FInDepth,
+  const int FBOff,
+  const int FCOff,
+  const int FDtOff,
+  const int FResetState,
+  __global const float* FALog,
+  __global const float* FD,
+  __global const float* FDtBias,
+  __global const float* FX,
+  __global float* FH,
+  __global float* FY
+)
+{
+  const int ch = get_global_id(0);
+  if (ch >= FDInner) return;
+  const int h = ch / FHeadDim;
+  const int gOff = (h / FHeadsPerGroup) * FNS;
+  __global float* st = FH + ch * FNS;
+  // A = -exp(A_log) is at most exp(30) in magnitude and dt is capped at 1e20,
+  // so dt * A stays finite; PoCL evaluates both sides of every select.
+  const float ar = -cai_exp_floored(fmin(FALog[h], 30.0f));
+  const float dtBias = FDtBias[h];
+  const float dd = FD[h];
+  int s, t;
+  if (FResetState != 0)
+    for (s = 0; s < FNS; s++) st[s] = 0.0f;
+  for (t = 0; t < FSeqLen; t++)
+  {
+    __global const float* row = FX + t * FInDepth;
+    const float pre = row[FDtOff + h] + dtBias;
+    const float ep = cai_exp_floored(fmin(pre, 30.0f));
+    const float dt = fmin((pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep)), 1e20f);
+    const float a = cai_exp_floored(dt * ar);
+    const float xv = row[ch];
+    const float dtxv = dt * xv;
+    __global const float* b = row + FBOff + gOff;
+    __global const float* c = row + FCOff + gOff;
+    float acc = 0.0f;
+    for (s = 0; s < FNS; s++)
+    {
+      const float hn = mad(a, st[s], dtxv * b[s]);
+      st[s] = hn;
+      acc = mad(c[s], hn, acc);
+    }
+    FY[t * FDInner + ch] = mad(dd, xv, acc);
+  }
+}
+
+// MAMBA-2 GATED RMSNORM READ-OUT (TNNetMamba2), in place over FY. ONE
+// WORK-GROUP PER TOKEN t (group id 1), lanes striding over the FDInner channels:
+//   z = y * silu(gate);  y = (z * rsqrt(mean(z^2) + eps)) * FNormW
+// A lane rewrites the same channels in both passes, so in place is safe.
+// FScratch is one float per lane; the local size must be a power of two.
+// Coded by Claude (AI).
+__kernel void cai_mamba2_gated_norm
+(
+  const int FDInner,
+  const int FInDepth,
+  const int FGateOff,
+  const float FEps,
+  __global const float* FNormW,
+  __global const float* FX,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int t = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __global const float* gate = FX + t * FInDepth + FGateOff;
+  __global float* y = FY + t * FDInner;
+  float partial = 0.0f;
+  int i;
+  for (i = lid; i < FDInner; i += lsize)
+  {
+    const float z = y[i] * cai_fused_act(gate[i], 4);
+    y[i] = z;
+    partial = mad(z, z, partial);
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float rstd = 1.0f / sqrt(FScratch[0] / (float)FDInner + FEps);
+  for (i = lid; i < FDInner; i += lsize) y[i] = (y[i] * rstd) * FNormW[i];
+}
+
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
 // Writes the step's K and V rows - FTokenCnt token rows, one row per KV head
 // each - into the cache slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE

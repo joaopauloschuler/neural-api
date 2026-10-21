@@ -5995,6 +5995,33 @@ type
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
+  /// Shared parent of the OpenCL helpers whose scan reads and rewrites a
+  // resident state bank in place (GatedDeltaNet, SelectiveSSM, Mamba-2).
+  // Coded by Claude (AI).
+  TNNetRecurrentScanCL = class(TNNetKernelCL)
+  protected
+    // Persistent buffers (grow-only), reused every forward. FBufState is the
+    // state bank: uploaded when a decode session starts, never per token.
+    FBufX, FBufY, FBufState: cl_mem;
+    FCapX, FCapY, FCapState: csize_t;
+    // The kernel of the last forward; nil before it, so there is nothing to bind.
+    FOutputKernel: TNeuralKernel;
+  public
+    destructor Destroy(); override;
+    // The buffer the last forward wrote Y into, the kernel that wrote it, and
+    // the kernel this helper runs on (for a source that must wait on the queue).
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function ForwardKernel(): TNeuralKernel;
+    // Sizes the state bank for State and uploads / reads it back (both blocking).
+    procedure UploadState(State: TNNetVolume);
+    procedure DownloadState(State: TNNetVolume);
+    // Copies between the state bank and Slot, both in OpenCL memory, on this
+    // helper's queue. CopyStateFrom sizes the bank for State.
+    procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+    procedure CopyStateFrom(Slot: cl_mem; State: TNNetVolume);
+  end;
+
   /// OpenCL forward helper for the gated delta-rule recurrence
   // (TNNetGatedDeltaNet). Binds the cai_gated_delta_net entry point on the
   // shared dot-product program's device and runs ONE work-group per value head,
@@ -6003,37 +6030,14 @@ type
   // lets an incremental decode session step without a host round trip.
   // Forward-only (backward stays on CPU).
   // Coded by Claude (AI).
-  TNNetGatedDeltaNetCL = class(TNNetKernelCL)
+  TNNetGatedDeltaNetCL = class(TNNetRecurrentScanCL)
   private
-    // Persistent device buffers (grow-only), reused every forward. FBufS is the
-    // matrix state bank: the kernel reads and rewrites it in place, so it is
-    // never uploaded per token - only when a decode session starts.
-    FBufALog, FBufDtBias, FBufNormW, FBufX, FBufY, FBufS: cl_mem;
-    FCapALog, FCapDtBias, FCapNormW, FCapX, FCapY, FCapS: csize_t;
-    // The kernel of the last forward, so a layer that leaves its result in
-    // FBufY can name the queue that produced it. Nil before the first forward,
-    // which is what tells a consumer there is nothing to bind yet.
-    FOutputKernel: TNeuralKernel;
+    // Resident parameter buffers (grow-only), re-uploaded only when NewW.
+    FBufALog, FBufDtBias, FBufNormW: cl_mem;
+    FCapALog, FCapDtBias, FCapNormW: csize_t;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // The buffer the last call wrote Y into, and the kernel that wrote it. Read
-    // per forward: EnsureOutputBuffer replaces the handle when Y grows.
-    function ResultBuffer(): cl_mem;
-    function OutputKernel(): TNeuralKernel;
-    // The kernel this helper runs on, for a source layer that has to wait on
-    // the right queue before its buffer is read.
-    function ForwardKernel(): TNeuralKernel;
-    // Sizes the state bank for S and uploads S into it. Call once per decode
-    // session, not once per token.
-    procedure UploadState(S: TNNetVolume);
-    // Reads the state bank back into S (blocking). Nothing to read before the
-    // first UploadState, which the caller tracks.
-    procedure DownloadState(S: TNNetVolume);
-    // Copies between the state bank and Slot, both in OpenCL memory, on this
-    // helper's queue. CopyStateFrom sizes the bank for S.
-    procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
-    procedure CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
     // ALog / DtBias / NormW are Neurons[0..2]'s weights; X is the packed
     // [q|k|v|z|b|a] input and Y receives the gated read-out. S sizes the
     // resident state bank. The six channel offsets come from the layer so the
@@ -6058,7 +6062,7 @@ type
   // for the whole sequence). The (Depth, N) state is resident and advanced in
   // place, so a decode session steps without a host round trip. Forward-only.
   // Coded by Claude (AI).
-  TNNetSelectiveSSMCL = class(TNNetKernelCL)
+  TNNetSelectiveSSMCL = class(TNNetRecurrentScanCL)
   private
     FNormKernel, FScanKernel: cl_kernel;
     // One resident buffer per TNNetSelectiveSSM neuron slot (0..9), uploaded
@@ -6066,35 +6070,43 @@ type
     FBufW: array[0..9] of cl_mem;
     FCapW: array[0..9] of csize_t;
     // FBufProj holds [delta | B | C] per token (delta only in Jamba mode, where
-    // FBufRaw holds [ts | B | C]); FBufH is the state bank.
-    FBufX, FBufProj, FBufRaw, FBufY, FBufH: cl_mem;
-    FCapX, FCapProj, FCapRaw, FCapY, FCapH: csize_t;
-    // The kernel of the last forward; nil before it, so there is nothing to bind.
-    FOutputKernel: TNeuralKernel;
+    // FBufRaw holds [ts | B | C]).
+    FBufProj, FBufRaw: cl_mem;
+    FCapProj, FCapRaw: csize_t;
     procedure RunProject(K, Rows0, Rows1, TotalRows, SeqLen, InStride,
       OutStride, Softplus: integer; W0, W1, W2, Bias, X, OutBuf: cl_mem);
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // The buffer the last call wrote Y into, the kernel that wrote it, and the
-    // kernel this helper runs on (for a source that must wait on the queue).
-    function ResultBuffer(): cl_mem;
-    function OutputKernel(): TNeuralKernel;
-    function ForwardKernel(): TNeuralKernel;
     // W[i] is neuron slot i's weights, except W[4], which is exp(min(A_raw,10)).
     // Blocking. Six volumes in the folded modes, ten in Jamba mode.
     procedure UploadWeights(const W: array of TNNetVolume);
-    // Sizes the state bank for H and uploads / reads it back (both blocking).
-    procedure UploadState(H: TNNetVolume);
-    procedure DownloadState(H: TNNetVolume);
-    // Copies between the state bank and Slot, both in OpenCL memory, on this
-    // helper's queue. CopyStateFrom sizes the bank for H.
-    procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
-    procedure CopyStateFrom(Slot: cl_mem; H: TNNetVolume);
     // ResetState starts from h = 0 (else the resident bank carries in); a non-nil
     // pExternalSrc is read in place of uploading X. Same contract as GatedDeltaNet.
     procedure Compute(X, Y, H: TNNetVolume; SeqLen, Depth, NS, DtRank: integer;
       JambaInner, ResetState: boolean; Eps: TNeuralFloat;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+  end;
+
+  /// OpenCL forward helper for TNNetMamba2: cai_mamba2_scan (one work-item per
+  // d_inner channel for the whole sequence, the (DInner, N) state advanced in
+  // place) then cai_mamba2_gated_norm (one work-group per token), on one queue.
+  // Forward-only. Coded by Claude (AI).
+  TNNetMamba2CL = class(TNNetRecurrentScanCL)
+  private
+    FNormKernel: cl_kernel;
+    // Resident parameters (A_log, D, dt_bias, norm_weight), re-uploaded only
+    // when NewW.
+    FBufALog, FBufD, FBufDtBias, FBufNormW: cl_mem;
+    FCapALog, FCapD, FCapDtBias, FCapNormW: csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // X is the packed [x | B | C | dt | gate] input, Y receives the gated-normed
+    // read-out and State sizes the bank; ResetState and pExternalSrc as GatedDeltaNet.
+    procedure Compute(ALog, D, DtBias, NormW, X, Y, State: TNNetVolume;
+      SeqLen, NumHeads, HeadDim, StateSize, NGroups: integer;
+      ResetState: boolean; Eps: TNeuralFloat; NewW: boolean = true;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
@@ -13199,11 +13211,21 @@ type
       FGh: TNNetVolume;      // backward state-gradient gh, DInner*N-long scratch
       FGradA, FGradD, FGradDtB, FGradNorm: TNNetVolume; // weight grad accums
       FArBuf: array of TNeuralFloat; // per-head ar = -exp(min(A_log,30)), invariant across t
+      {$IFDEF OpenCL}
+      // Whole-scan OpenCL forward: one work-item per d_inner channel for the
+      // whole sequence, then the gated RMSNorm, both in OpenCL memory.
+      FMamba2CL: TNNetMamba2CL;
+      // True once the parameter tensors change; the OpenCL forward re-uploads
+      // them only then, keeping the resident copy across forwards.
+      FGpuWeightsDirty: boolean;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       // Releases FState: the per-timestep h cache is read only by Backpropagate,
       // so an inference-only layer neither fills nor needs it. Compute keys the
       // store on FState's size.
       procedure FreeBackpropScratch();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure AfterWeightUpdate(); override;
     public
       constructor Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
         pStateSize: integer = 16; pNGroups: integer = 1;
@@ -13213,6 +13235,15 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      // The inherited pair names FDotCL's buffer, which this layer never writes:
+      // its results come out of cai_mamba2_gated_norm.
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
   end;
 
   /// TNNetImplicitLongConv: the Hyena Hierarchy (Poli et al. 2023,
@@ -41672,6 +41703,57 @@ begin
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
+{ TNNetRecurrentScanCL }
+
+destructor TNNetRecurrentScanCL.Destroy();
+begin
+  if Assigned(FBufX)     then clReleaseMemObject(FBufX);
+  if Assigned(FBufY)     then clReleaseMemObject(FBufY);
+  if Assigned(FBufState) then clReleaseMemObject(FBufState);
+  inherited Destroy();
+end;
+
+function TNNetRecurrentScanCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetRecurrentScanCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
+function TNNetRecurrentScanCL.ForwardKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+procedure TNNetRecurrentScanCL.UploadState(State: TNNetVolume);
+begin
+  FKernel.EnsureOutputBuffer(FBufState, FCapState, State);
+  FKernel.WriteBuffer(FBufState, State, CL_TRUE);
+end;
+
+procedure TNNetRecurrentScanCL.DownloadState(State: TNNetVolume);
+begin
+  if not Assigned(FBufState) then exit;
+  FKernel.Finish();
+  FKernel.ReadBuffer(FBufState, State, CL_TRUE);
+end;
+
+procedure TNNetRecurrentScanCL.CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+begin
+  FKernel.CopyBuffer(FBufState, Slot, Bytes);
+  // The slot may be read next by another net's queue, so the copy completes here.
+  FKernel.Finish();
+end;
+
+procedure TNNetRecurrentScanCL.CopyStateFrom(Slot: cl_mem; State: TNNetVolume);
+begin
+  FKernel.EnsureOutputBuffer(FBufState, FCapState, State);
+  FKernel.CopyBuffer(Slot, FBufState, State.GetMemSize());
+end;
+
 { TNNetGatedDeltaNetCL }
 
 constructor TNNetGatedDeltaNetCL.Create(NN: TNNet);
@@ -41684,51 +41766,7 @@ begin
   if Assigned(FBufALog)   then clReleaseMemObject(FBufALog);
   if Assigned(FBufDtBias) then clReleaseMemObject(FBufDtBias);
   if Assigned(FBufNormW)  then clReleaseMemObject(FBufNormW);
-  if Assigned(FBufX)      then clReleaseMemObject(FBufX);
-  if Assigned(FBufY)      then clReleaseMemObject(FBufY);
-  if Assigned(FBufS)      then clReleaseMemObject(FBufS);
   inherited Destroy();
-end;
-
-function TNNetGatedDeltaNetCL.ResultBuffer(): cl_mem;
-begin
-  Result := FBufY;
-end;
-
-function TNNetGatedDeltaNetCL.OutputKernel(): TNeuralKernel;
-begin
-  Result := FOutputKernel;
-end;
-
-function TNNetGatedDeltaNetCL.ForwardKernel(): TNeuralKernel;
-begin
-  Result := FKernel;
-end;
-
-procedure TNNetGatedDeltaNetCL.UploadState(S: TNNetVolume);
-begin
-  FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
-  FKernel.WriteBuffer(FBufS, S, CL_TRUE);
-end;
-
-procedure TNNetGatedDeltaNetCL.DownloadState(S: TNNetVolume);
-begin
-  if not Assigned(FBufS) then exit;
-  FKernel.Finish();
-  FKernel.ReadBuffer(FBufS, S, CL_TRUE);
-end;
-
-procedure TNNetGatedDeltaNetCL.CopyStateTo(Slot: cl_mem; Bytes: csize_t);
-begin
-  FKernel.CopyBuffer(FBufS, Slot, Bytes);
-  // The slot may be read next by another net's queue, so the copy completes here.
-  FKernel.Finish();
-end;
-
-procedure TNNetGatedDeltaNetCL.CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
-begin
-  FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
-  FKernel.CopyBuffer(Slot, FBufS, S.GetMemSize());
 end;
 
 procedure TNNetGatedDeltaNetCL.Compute(ALog, DtBias, NormW, X, Y, S: TNNetVolume;
@@ -41762,7 +41800,7 @@ begin
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   // Grow-only and never written here, so a bank uploaded by UploadState keeps
   // its contents across every forward of the session.
-  bufS := FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
+  bufS := FKernel.EnsureOutputBuffer(FBufState, FCapState, S);
   clSetKernelArg(k,  0, csLongintSize, @SeqLen);
   clSetKernelArg(k,  1, csLongintSize, @NumVHeads);
   clSetKernelArg(k,  2, csLongintSize, @HeadDimK);
@@ -41815,29 +41853,11 @@ var
 begin
   for SlotPos := Low(FBufW) to High(FBufW) do
     if Assigned(FBufW[SlotPos]) then clReleaseMemObject(FBufW[SlotPos]);
-  if Assigned(FBufX)    then clReleaseMemObject(FBufX);
   if Assigned(FBufProj) then clReleaseMemObject(FBufProj);
   if Assigned(FBufRaw)  then clReleaseMemObject(FBufRaw);
-  if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  if Assigned(FBufH)    then clReleaseMemObject(FBufH);
   if Assigned(FNormKernel) then clReleaseKernel(FNormKernel);
   if Assigned(FScanKernel) then clReleaseKernel(FScanKernel);
   inherited Destroy();
-end;
-
-function TNNetSelectiveSSMCL.ResultBuffer(): cl_mem;
-begin
-  Result := FBufY;
-end;
-
-function TNNetSelectiveSSMCL.OutputKernel(): TNeuralKernel;
-begin
-  Result := FOutputKernel;
-end;
-
-function TNNetSelectiveSSMCL.ForwardKernel(): TNeuralKernel;
-begin
-  Result := FKernel;
 end;
 
 procedure TNNetSelectiveSSMCL.UploadWeights(const W: array of TNNetVolume);
@@ -41848,32 +41868,6 @@ begin
   for SlotPos := 0 to MaxSlotPos do
     FKernel.EnsureWriteBuffer(FBufW[SlotPos], FCapW[SlotPos], W[SlotPos],
       {DoWrite=}true, {pBlocking=}true);
-end;
-
-procedure TNNetSelectiveSSMCL.UploadState(H: TNNetVolume);
-begin
-  FKernel.EnsureOutputBuffer(FBufH, FCapH, H);
-  FKernel.WriteBuffer(FBufH, H, CL_TRUE);
-end;
-
-procedure TNNetSelectiveSSMCL.DownloadState(H: TNNetVolume);
-begin
-  if not Assigned(FBufH) then exit;
-  FKernel.Finish();
-  FKernel.ReadBuffer(FBufH, H, CL_TRUE);
-end;
-
-procedure TNNetSelectiveSSMCL.CopyStateTo(Slot: cl_mem; Bytes: csize_t);
-begin
-  FKernel.CopyBuffer(FBufH, Slot, Bytes);
-  // The slot may be read next by another net's queue, so the copy completes here.
-  FKernel.Finish();
-end;
-
-procedure TNNetSelectiveSSMCL.CopyStateFrom(Slot: cl_mem; H: TNNetVolume);
-begin
-  FKernel.EnsureOutputBuffer(FBufH, FCapH, H);
-  FKernel.CopyBuffer(Slot, FBufH, H.GetMemSize());
 end;
 
 procedure TNNetSelectiveSSMCL.RunProject(K, Rows0, Rows1, TotalRows, SeqLen,
@@ -41918,7 +41912,7 @@ begin
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   // Grow-only and never written here, so a bank uploaded by UploadState keeps
   // its contents across every forward of the session.
-  bufH := FKernel.EnsureOutputBuffer(FBufH, FCapH, H);
+  bufH := FKernel.EnsureOutputBuffer(FBufState, FCapState, H);
   if JambaInner then
   begin
     // [ts | B | C] = [x_proj_dt; W_B; W_C] . x, normalized in place, then
@@ -41988,6 +41982,96 @@ begin
   clSetKernelArg(k, 14, csCLMemSize, @bufH);
   clSetKernelArg(k, 15, csCLMemSize, @bufY);
   FKernel.RunKernel(k, Depth);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+end;
+
+{ TNNetMamba2CL }
+
+constructor TNNetMamba2CL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_mamba2_scan');
+  // Same TNeuralKernel, so the norm runs on the scan's in-order queue.
+  FNormKernel := FKernel.CreateKernel('cai_mamba2_gated_norm');
+end;
+
+destructor TNNetMamba2CL.Destroy();
+begin
+  if Assigned(FBufALog)   then clReleaseMemObject(FBufALog);
+  if Assigned(FBufD)      then clReleaseMemObject(FBufD);
+  if Assigned(FBufDtBias) then clReleaseMemObject(FBufDtBias);
+  if Assigned(FBufNormW)  then clReleaseMemObject(FBufNormW);
+  if Assigned(FNormKernel) then clReleaseKernel(FNormKernel);
+  inherited Destroy();
+end;
+
+procedure TNNetMamba2CL.Compute(ALog, D, DtBias, NormW, X, Y,
+  State: TNNetVolume; SeqLen, NumHeads, HeadDim, StateSize, NGroups: integer;
+  ResetState: boolean; Eps: TNeuralFloat; NewW: boolean = true;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+var
+  bufALog, bufD, bufDtBias, bufNormW, bufX, bufY, bufState: cl_mem;
+  k: cl_kernel;
+  DInner, HeadsPerGroup, InDepth, BOff, COff, DtOff, GateOff: integer;
+  iReset: longint;
+  fEps: single;
+  NormLocalSize: csize_t;
+begin
+  DInner := NumHeads * HeadDim;
+  HeadsPerGroup := NumHeads div NGroups;
+  // Input row layout [ x (DInner) | B (NG*N) | C (NG*N) | dt (NumHeads) | gate (DInner) ].
+  BOff := DInner;
+  COff := DInner + NGroups * StateSize;
+  DtOff := COff + NGroups * StateSize;
+  GateOff := DtOff + NumHeads;
+  InDepth := GateOff + DInner;
+  if ResetState then iReset := 1 else iReset := 0;
+  fEps := Eps;
+  bufALog   := FKernel.EnsureWriteBuffer(FBufALog, FCapALog, ALog, NewW);
+  bufD      := FKernel.EnsureWriteBuffer(FBufD, FCapD, D, NewW);
+  bufDtBias := FKernel.EnsureWriteBuffer(FBufDtBias, FCapDtBias, DtBias, NewW);
+  bufNormW  := FKernel.EnsureWriteBuffer(FBufNormW, FCapNormW, NormW, NewW);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  // Grow-only and never written here, so a bank uploaded by UploadState keeps
+  // its contents across every forward of the session.
+  bufState := FKernel.EnsureOutputBuffer(FBufState, FCapState, State);
+  k := FKernel.Kernel;
+  clSetKernelArg(k,  0, csLongintSize, @SeqLen);
+  clSetKernelArg(k,  1, csLongintSize, @DInner);
+  clSetKernelArg(k,  2, csLongintSize, @HeadDim);
+  clSetKernelArg(k,  3, csLongintSize, @StateSize);
+  clSetKernelArg(k,  4, csLongintSize, @HeadsPerGroup);
+  clSetKernelArg(k,  5, csLongintSize, @InDepth);
+  clSetKernelArg(k,  6, csLongintSize, @BOff);
+  clSetKernelArg(k,  7, csLongintSize, @COff);
+  clSetKernelArg(k,  8, csLongintSize, @DtOff);
+  clSetKernelArg(k,  9, csLongintSize, @iReset);
+  clSetKernelArg(k, 10, csCLMemSize, @bufALog);
+  clSetKernelArg(k, 11, csCLMemSize, @bufD);
+  clSetKernelArg(k, 12, csCLMemSize, @bufDtBias);
+  clSetKernelArg(k, 13, csCLMemSize, @bufX);
+  clSetKernelArg(k, 14, csCLMemSize, @bufState);
+  clSetKernelArg(k, 15, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, DInner);
+  k := FNormKernel;
+  NormLocalSize := ReductionLocalSize(DInner);
+  clSetKernelArg(k, 0, csLongintSize, @DInner);
+  clSetKernelArg(k, 1, csLongintSize, @InDepth);
+  clSetKernelArg(k, 2, csLongintSize, @GateOff);
+  clSetKernelArg(k, 3, csNeuralFloatSize, @fEps);
+  clSetKernelArg(k, 4, csCLMemSize, @bufNormW);
+  clSetKernelArg(k, 5, csCLMemSize, @bufX);
+  clSetKernelArg(k, 6, csCLMemSize, @bufY);
+  clSetKernelArg(k, 7, NormLocalSize * csNeuralFloatSize, nil);
+  // One work-group of NormLocalSize lanes per token.
+  FKernel.RunKernel2D(k, NormLocalSize, SeqLen, NormLocalSize, 1);
   FOutputKernel := FKernel;
   if not pKeepResultOnOpenCL then
   begin
@@ -80793,6 +80877,9 @@ end;
 
 destructor TNNetMamba2.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FMamba2CL) then FMamba2CL.Free;
+  {$ENDIF}
   FGradNorm.Free;
   FGradDtB.Free;
   FGradD.Free;
@@ -80892,7 +80979,23 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  // The OpenCL forward runs BEFORE any ForceOutputOnRAM because that download
+  // is what it exists to avoid; the CPU scan below is the fallback.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end
+  else Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous OpenCL forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Alog := FNeurons[0].FWeights;
   Dd := FNeurons[1].FWeights;
@@ -80996,6 +81099,92 @@ begin
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+procedure TNNetMamba2.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  {$IFDEF OpenCL}
+  FGpuWeightsDirty := true; // next OpenCL forward re-uploads the parameters
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetMamba2.DisableOpenCL();
+begin
+  // FMamba2CL owns the buffer a kept output lives in, so the host copy has to
+  // be recovered before the helper goes.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FMamba2CL);
+end;
+
+procedure TNNetMamba2.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Bare TNNetLayer arming (FHasOpenCL + the shared dot-product kernel) plus the
+  // dedicated scan helper: the recurrence is a per-channel scan, not a contraction.
+  FHasOpenCL := true;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := NewDotProductCL(GetDotProductKernel());
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FMamba2CL) then
+    FMamba2CL := TNNetMamba2CL.Create(FNN);
+  // Nothing is resident yet, whatever a previous weight update reported.
+  FGpuWeightsDirty := true;
+end;
+
+function TNNetMamba2.WillOpenCL(): boolean;
+begin
+  // A source already in OpenCL memory puts the layer there whatever the size
+  // verdict says. The kernels write none of the BPTT caches: inference-only.
+  Result := Assigned(FMamba2CL) and FHasOpenCL and (not FIsTrainable)
+            and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+function TNNetMamba2.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FMamba2CL) then Result := FMamba2CL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetMamba2.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FMamba2CL) then Result := FMamba2CL.OutputKernel()
+  else Result := nil;
+end;
+
+// Whole-scan forward in OpenCL memory, starting from h = 0; the result stays in
+// OpenCL memory for the next layer to bind.
+procedure TNNetMamba2.ComputeOpenCL();
+var
+  Prev: TNNetVolume;
+  SourceBuffer: cl_mem;
+begin
+  // The input is SeqLen contiguous InDepth-long rows, the layout every
+  // producer's buffer already carries, so a resident source binds straight in
+  // (no size match: the output is d_inner wide, the input is not).
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FMamba2CL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  Prev := FPrevLayer.FOutput;
+  FMamba2CL.Compute(FNeurons[0].FWeights, FNeurons[1].FWeights,
+    FNeurons[2].FWeights, FNeurons[3].FWeights, Prev, FOutput, FH,
+    Prev.SizeX, FNumHeads, FHeadDim, FStateSize, FNGroups,
+    {ResetState=}true, FFloatSt[0], FGpuWeightsDirty, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FGpuWeightsDirty := false;
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetMamba2.Backpropagate();
 var

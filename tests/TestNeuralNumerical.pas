@@ -448,6 +448,9 @@ type
     // OpenCL-memory state slot round trip and a reset, all on OpenCL, against
     // the full-sequence CPU forward, in all three scan modes.
     procedure SelectiveSSMDecodeResidentOpenCLParity;
+    // TNNetInput -> TNNetSiLU -> TNNetMamba2 with ForceOpenCL off over four
+    // (heads, head dim, N, n_groups) shapes: bound source, OpenCL vs CPU scan.
+    procedure Mamba2ResidentChainOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -83487,6 +83490,126 @@ begin
       if Slot <> nil then clReleaseMemObject(Slot);
       Snap.Free; FullOut.Free; StepIn.Free; PreIn.Free; FullIn.Free;
       NNStep.Free; NNPre.Free; NNFull.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Seeds a TNNetMamba2 so the OpenCL parity covers every branch of the dt
+// softplus: head 0 above the 30 cap, head 1 below -30, the rest in between.
+procedure SeedMamba2ForOpenCL(L: TNNetMamba2);
+var
+  ElementPos, MaxElementPos: integer;
+  W: TNNetVolume;
+begin
+  W := L.Neurons[0].Weights; // A_log
+  MaxElementPos := W.Size - 1;
+  for ElementPos := 0 to MaxElementPos do W.Raw[ElementPos] := 1.6 * (Random - 0.5);
+  W := L.Neurons[1].Weights; // D
+  for ElementPos := 0 to MaxElementPos do W.Raw[ElementPos] := Random - 0.5;
+  W := L.Neurons[2].Weights; // dt_bias
+  for ElementPos := 0 to MaxElementPos do W.Raw[ElementPos] := 2.0 * (Random - 0.5);
+  W.Raw[0] := 35;
+  if W.Size > 1 then W.Raw[1] := -35;
+  W := L.Neurons[3].Weights; // norm_weight
+  MaxElementPos := W.Size - 1;
+  for ElementPos := 0 to MaxElementPos do W.Raw[ElementPos] := 0.5 + Random;
+end;
+
+procedure TTestNeuralNumerical.Mamba2ResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 7;
+  csSentinel = -7777;
+  // (NumHeads, HeadDim, StateSize, NGroups); the last has d_inner 320, wider
+  // than the norm's 256-lane work-group.
+  csShapes: array[0..3, 0..3] of integer =
+    ((2, 2, 3, 1), (4, 3, 5, 2), (4, 2, 4, 4), (8, 40, 16, 2));
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetMamba2;
+  ActGpu: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, InDepth, T, D, N, ElementPos, SentinelSurvivors: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  ShapeName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for ShapePos := Low(csShapes) to High(csShapes) do
+  begin
+    RandSeed := 20261021 + ShapePos;
+    InDepth := 2 * csShapes[ShapePos, 0] * csShapes[ShapePos, 1] +
+      2 * csShapes[ShapePos, 3] * csShapes[ShapePos, 2] + csShapes[ShapePos, 0];
+    ShapeName := 'Mamba2 H=' + IntToStr(csShapes[ShapePos, 0]) +
+      ' P=' + IntToStr(csShapes[ShapePos, 1]) +
+      ' N=' + IntToStr(csShapes[ShapePos, 2]) +
+      ' G=' + IntToStr(csShapes[ShapePos, 3]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+    CpuOut := TNNetVolume.Create();
+    try
+      NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+      NNCpu.AddLayer(TNNetSiLU.Create());
+      LCpu := TNNetMamba2.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+        csShapes[ShapePos, 2], csShapes[ShapePos, 3], 1e-5);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.SetTrainable(False, False);
+      SeedMamba2ForOpenCL(LCpu);
+
+      NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+      ActGpu := NNGpu.AddLayer(TNNetSiLU.Create());
+      LGpu := TNNetMamba2.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+        csShapes[ShapePos, 2], csShapes[ShapePos, 3], 1e-5);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.SetTrainable(False, False);
+      for N := 0 to LCpu.Neurons.Count - 1 do
+        LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to InDepth - 1 do
+          Input[T, 0, D] := 3.0 * (Random - 0.5);
+      NNCpu.Compute(Input);
+      CpuOut.Copy(LCpu.Output);
+
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      NNGpu.Compute(Input);
+      // Parity cannot tell a bind from a download: a second forward must leave
+      // the activation's host copy untouched.
+      ActGpu.Output.Fill(csSentinel);
+      NNGpu.Compute(Input);
+      SentinelSurvivors := 0;
+      for ElementPos := 0 to ActGpu.Output.Size - 1 do
+        if ActGpu.Output.Raw[ElementPos] = csSentinel then Inc(SentinelSurvivors);
+      LGpu.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for ElementPos := 0 to CpuOut.Size - 1 do
+      begin
+        Diff := Abs(CpuOut.Raw[ElementPos] - LGpu.Output.Raw[ElementPos]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', ShapeName, ' resident chain: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards scan=', LGpu.ForwardGPUCnt, ' act=', ActGpu.ForwardGPUCnt,
+        ' source sentinels=', SentinelSurvivors, '/', ActGpu.Output.Size);
+      AssertEquals(ShapeName + ': a resident source must put the scan on OpenCL',
+        2, LGpu.ForwardGPUCnt);
+      AssertEquals(ShapeName +
+        ': the source must be read in OpenCL memory, not downloaded',
+        ActGpu.Output.Size, SentinelSurvivors);
+      AssertTrue(ShapeName + ' OpenCL vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
     end;
   end;
 end;
