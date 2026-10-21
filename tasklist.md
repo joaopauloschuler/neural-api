@@ -2318,7 +2318,16 @@ then — only int8 + MXFP4-dequant did.)
 
 ## TNNetResize2D follow-ups (from e37d07bb)
 
-- [ ] `TNNetResize2D` `antialias=True` box-prefilter for downscale was SCOPED OUT
-      of v1 (it changes the kernel support to scale-dependent, breaking the fixed
-      2-tap / 4-tap separable gather; torch's antialias widens the kernel and
-      renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
+- [X] `TNNetResize2D` `antialias=True` as the opt-in 5th flag (FStruct[4]):
+      variable-tap per-axis tables + separable two-pass forward/transpose on
+      TNNetResizeBase; torch oracle tools/make_resize2d_antialias_fixture.py.
+      Host only: no OpenCL kernel for variable tap counts (layer is CPU-pinned).
+- [ ] Antialiased downscale in the HF image preprocessing helpers. Both shrink
+      photos with NEAREST (Trunc of the source coordinate) although their comments
+      say bilinear, while the HF targets use PIL BICUBIC/BILINEAR (always
+      antialiased) or torchvision antialias=True:
+      `ClipPreprocessImage` (neural/neuralpretrained.pas; CLIP/LLaVA/ViT/DINOv2/
+      SigLIP paths) and `PreprocessImageForVisionModel` (neural/neuraldatasets.pas;
+      ImageNetEval). Host routines, so port the filter on the host
+      (neuralimageresize.pas BuildAxis is a PIL-style template) and add a
+      PIL-oracle shrink fixture (TestClipImagePreprocess never shrinks).

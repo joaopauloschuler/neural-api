@@ -18653,6 +18653,8 @@ type
       // Cached per-shape sampling geometry of each axis (rule #27): built once
       // per shape by the descendant, then read as a table by the kernels below.
       FXMap, FYMap: TNNetAxisMap;
+      // (OutX, InY, Depth) intermediate of the variable-tap separable passes.
+      FHorizontalPass: TNNetVolume;
       {$IFDEF OpenCL}
       // Forward device offload: the gather helper matching this layer's blend
       // (4 or 16 corners) plus the host staging buffers handed to it.
@@ -18663,6 +18665,10 @@ type
       procedure BilinearBackward(PrevError: TNNetVolume);
       procedure BicubicForward(Src: TNNetVolume);
       procedure BicubicBackward(PrevError: TNNetVolume);
+      // Any-TapCnt separable resample (X pass into FHorizontalPass, then Y over
+      // whole rows) and its transpose; FHorizontalPass must match the shapes.
+      procedure SeparableForward(Src: TNNetVolume);
+      procedure SeparableBackward(PrevError: TNNetVolume);
       {$IFDEF OpenCL}
       procedure CreateGatherBuffers();
       procedure GatherOpenCL(Src: TNNetVolume);
@@ -18796,8 +18802,14 @@ type
   //   align_corners=False : src = (o+0.5)*InSize/OutSize - 0.5
   // (nearest uses src = o*InSize/OutSize, PyTorch's nearest convention, and never
   // clamps the fractional part.) Applied independently per channel; no trainable
-  // parameters. FStruct: [0]=OutX, [1]=OutY, [2]=mode, [3]=align_corners; these
-  // round-trip through Save/LoadFromString. Forward reuses the Depth-contiguous
+  // parameters. FStruct: [0]=OutX, [1]=OutY, [2]=mode, [3]=align_corners,
+  // [4]=antialias; these round-trip through Save/LoadFromString (a string saved
+  // before [4] existed loads with antialias off). antialias=1 ports torch's
+  // interpolate(antialias=True) for bilinear/bicubic (ignored for nearest): the
+  // filter (triangle, or Keys A=-0.5 for bicubic) widens by InSize/OutSize on a
+  // downscaled axis and is renormalised per output, on EVERY axis, so a bicubic
+  // upscale also differs from antialias=0, as in torch. Runs on the host only.
+  // Forward reuses the Depth-contiguous
   // Move/MulAdd column idiom of the up-samplers; backward is the exact transpose
   // (scatter each output error back into its source taps by the same weights), so
   // the input-gradient path is numerically exact for every mode. Needed wherever a
@@ -18810,9 +18822,10 @@ type
       // Fills FXMap/FYMap with the geometry of the configured mode.
       procedure EnsureAxisMaps(Src: TNNetVolume);
     public
-      // pMode: 0=nearest, 1=bilinear, 2=bicubic.
+      // pMode: 0=nearest, 1=bilinear, 2=bicubic; pAntialias<>0 = torch antialias=True.
       constructor Create(pOutW: integer = 2; pOutH: integer = 2;
-        pMode: integer = 1; pAlignCorners: integer = 0); reintroduce; overload;
+        pMode: integer = 1; pAlignCorners: integer = 0;
+        pAntialias: integer = 0); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
@@ -59701,6 +59714,7 @@ end;
 { TNNetResizeBase }
 destructor TNNetResizeBase.Destroy();
 begin
+  if Assigned(FHorizontalPass) then FreeAndNil(FHorizontalPass);
   {$IFDEF OpenCL}
   if Assigned(FGatherCL)  then FreeAndNil(FGatherCL);
   if Assigned(FCornerBuf) then FreeAndNil(FCornerBuf);
@@ -59967,6 +59981,99 @@ begin
   end;
 end;
 
+// Tap t of output o weights source FXMap.Idx[o*TapCnt + t]; zero-weight padding
+// taps (variable-support maps) are skipped after the first one.
+procedure TNNetResizeBase.SeparableForward(Src: TNNetVolume);
+var
+  D, ox, oy, y, t, XBase, YBase, RowLen: integer;
+  MaxOutXPos, MaxOutYPos, MaxSrcYPos, MaxTapXPos, MaxTapYPos: integer;
+  TapWeight: TNeuralFloat;
+  DstPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  MaxSrcYPos := Src.SizeY - 1;
+  MaxTapXPos := FXMap.TapCnt - 1;
+  MaxTapYPos := FYMap.TapCnt - 1;
+  for y := 0 to MaxSrcYPos do
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * FXMap.TapCnt;
+      DstPtr := FHorizontalPass.GetRawPtr(ox, y);
+      Move(Src.GetRawPtr(FXMap.Idx[XBase], y)^, DstPtr^, D * csNeuralFloatSize);
+      TNNetVolume.Mul(DstPtr, FXMap.W[XBase], D);
+      for t := 1 to MaxTapXPos do
+      begin
+        TapWeight := FXMap.W[XBase + t];
+        if TapWeight <> 0 then
+          TNNetVolume.MulAdd(DstPtr, Src.GetRawPtr(FXMap.Idx[XBase + t], y),
+            TapWeight, D);
+      end;
+    end;
+  // Output rows and FHorizontalPass rows are both OutX*Depth contiguous runs.
+  RowLen := FOutput.SizeX * D;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * FYMap.TapCnt;
+    DstPtr := FOutput.GetRawPtr(0, oy);
+    Move(FHorizontalPass.GetRawPtr(0, FYMap.Idx[YBase])^, DstPtr^,
+      RowLen * csNeuralFloatSize);
+    TNNetVolume.Mul(DstPtr, FYMap.W[YBase], RowLen);
+    for t := 1 to MaxTapYPos do
+    begin
+      TapWeight := FYMap.W[YBase + t];
+      if TapWeight <> 0 then
+        TNNetVolume.MulAdd(DstPtr,
+          FHorizontalPass.GetRawPtr(0, FYMap.Idx[YBase + t]), TapWeight, RowLen);
+    end;
+  end;
+end;
+
+// Exact adjoint of SeparableForward: Y transpose into FHorizontalPass, then X
+// transpose accumulated into PrevError.
+procedure TNNetResizeBase.SeparableBackward(PrevError: TNNetVolume);
+var
+  D, ox, oy, y, t, XBase, YBase, RowLen: integer;
+  MaxOutXPos, MaxOutYPos, MaxSrcYPos, MaxTapXPos, MaxTapYPos: integer;
+  TapWeight: TNeuralFloat;
+  GradPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  MaxSrcYPos := PrevError.SizeY - 1;
+  MaxTapXPos := FXMap.TapCnt - 1;
+  MaxTapYPos := FYMap.TapCnt - 1;
+  RowLen := FOutput.SizeX * D;
+  FHorizontalPass.Fill(0);
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * FYMap.TapCnt;
+    GradPtr := FOutputError.GetRawPtr(0, oy);
+    for t := 0 to MaxTapYPos do
+    begin
+      TapWeight := FYMap.W[YBase + t];
+      if TapWeight <> 0 then
+        TNNetVolume.MulAdd(FHorizontalPass.GetRawPtr(0, FYMap.Idx[YBase + t]),
+          GradPtr, TapWeight, RowLen);
+    end;
+  end;
+  for y := 0 to MaxSrcYPos do
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * FXMap.TapCnt;
+      GradPtr := FHorizontalPass.GetRawPtr(ox, y);
+      for t := 0 to MaxTapXPos do
+      begin
+        TapWeight := FXMap.W[XBase + t];
+        if TapWeight <> 0 then
+          TNNetVolume.MulAdd(PrevError.GetRawPtr(FXMap.Idx[XBase + t], y),
+            GradPtr, TapWeight, D);
+      end;
+    end;
+end;
+
 const
   // TNNetAxisMap.Kind: which builder filled the cached axis geometry.
   csAxisMapBilinearFactor = 1;
@@ -59974,6 +60081,8 @@ const
   csAxisMapBilinearSize   = 3;
   csAxisMapBicubicSize    = 4;
   csAxisMapNearestSize    = 5;
+  csAxisMapBilinearAntialias = 6;
+  csAxisMapBicubicAntialias  = 7;
 
 // Bilinear sampling shared geometry: for output index o on an axis of input
 // size InSize, returns the two source corner indices i0,i1 and the weight w1 of
@@ -60237,6 +60346,97 @@ begin
   end;
   M.TapCnt := 4;
   M.Kind := csAxisMapBicubicSize;
+  M.OutSize := OutSize;
+  M.InSize := InSize;
+  M.AlignCorners := AlignCorners;
+end;
+
+// torch's antialias filters (aten upsample_*_aa, PIL): the triangle for
+// bilinear, Keys cubic with A=-0.5 (not the -0.75 of plain bicubic) for bicubic.
+function AntialiasFilter(x: TNeuralFloat; IsBicubic: boolean): TNeuralFloat; inline;
+const
+  A = -0.5;
+begin
+  x := Abs(x);
+  if IsBicubic then
+  begin
+    if x < 1 then Result := ((A + 2) * x - (A + 3)) * x * x + 1
+    else if x < 2 then Result := (((x - 5) * x + 8) * x - 4) * A
+    else Result := 0;
+  end
+  else if x < 1 then Result := 1 - x
+  else Result := 0;
+end;
+
+// Fills one axis with torch's antialias geometry: support widens by Scale on a
+// downscale, weights renormalised to sum 1; TapCnt = widest support, zero-padded.
+procedure EnsureAntialiasSizeMap(var M: TNNetAxisMap;
+  OutSize, InSize, AlignCorners: integer; IsBicubic: boolean);
+var
+  o, t, Base, Kind, FirstPos, TapCount, MaxTapCount, MaxOutPos, MaxTapPos: integer;
+  Scale, Support, InvScale, Center, WeightSum: TNeuralFloat;
+
+  procedure TapRange(OutPos: integer; out First, Count: integer);
+  begin
+    Center := Scale * (OutPos + 0.5);
+    First := Trunc(Center - Support + 0.5);
+    if First < 0 then First := 0;
+    Count := Trunc(Center + Support + 0.5);
+    if Count > InSize then Count := InSize;
+    Count := Count - First;
+    if Count < 1 then Count := 1;
+  end;
+
+begin
+  if IsBicubic then Kind := csAxisMapBicubicAntialias
+  else Kind := csAxisMapBilinearAntialias;
+  if (M.Kind = Kind) and (M.OutSize = OutSize) and
+     (M.InSize = InSize) and (M.AlignCorners = AlignCorners) then exit;
+  if AlignCorners <> 0 then
+  begin
+    if OutSize > 1 then Scale := (InSize - 1) / (OutSize - 1)
+    else Scale := 0;
+  end
+  else Scale := InSize / OutSize;
+  if IsBicubic then Support := 2 else Support := 1;
+  InvScale := 1;
+  if Scale >= 1 then
+  begin
+    Support := Support * Scale;
+    InvScale := 1 / Scale;
+  end;
+  MaxOutPos := OutSize - 1;
+  MaxTapCount := 1;
+  for o := 0 to MaxOutPos do
+  begin
+    TapRange(o, FirstPos, TapCount);
+    if TapCount > MaxTapCount then MaxTapCount := TapCount;
+  end;
+  SetLength(M.Idx, OutSize * MaxTapCount);
+  SetLength(M.W, OutSize * MaxTapCount);
+  MaxTapPos := MaxTapCount - 1;
+  for o := 0 to MaxOutPos do
+  begin
+    TapRange(o, FirstPos, TapCount);
+    Base := o * MaxTapCount;
+    WeightSum := 0;
+    for t := 0 to MaxTapPos do
+    begin
+      M.Idx[Base + t] := FirstPos;
+      M.W[Base + t] := 0;
+      if t < TapCount then
+      begin
+        M.Idx[Base + t] := FirstPos + t;
+        M.W[Base + t] := AntialiasFilter((FirstPos + t - Center + 0.5) * InvScale,
+          IsBicubic);
+        WeightSum := WeightSum + M.W[Base + t];
+      end;
+    end;
+    if WeightSum <> 0 then
+      for t := 0 to MaxTapPos do M.W[Base + t] := M.W[Base + t] / WeightSum;
+  end;
+  M.TapCnt := MaxTapCount;
+  M.Kind := Kind;
   M.OutSize := OutSize;
   M.InSize := InSize;
   M.AlignCorners := AlignCorners;
@@ -60628,7 +60828,8 @@ begin
 end;
 
 { TNNetResize2D }
-constructor TNNetResize2D.Create(pOutW, pOutH, pMode, pAlignCorners: integer);
+constructor TNNetResize2D.Create(pOutW, pOutH, pMode, pAlignCorners,
+  pAntialias: integer);
 begin
   inherited Create();
   if pOutW < 1 then pOutW := 1;
@@ -60638,6 +60839,7 @@ begin
   FStruct[1] := pOutH;
   FStruct[2] := pMode;
   if pAlignCorners <> 0 then FStruct[3] := 1 else FStruct[3] := 0;
+  if (pAntialias <> 0) and (pMode <> 0) then FStruct[4] := 1 else FStruct[4] := 0;
 end;
 
 procedure TNNetResize2D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -60645,6 +60847,9 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
   SetOutputErrorSize(FOutput);
+  if (FStruct[4] <> 0) and not Assigned(FHorizontalPass) then
+    FHorizontalPass := TNNetVolume.Create();
+  EnsureAxisMaps(pPrevLayer.Output);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.37x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
   {$ENDIF}
@@ -60658,7 +60863,13 @@ var
 begin
   Mode := FStruct[2];
   AC := FStruct[3];
-  if Mode = 0 then
+  if FStruct[4] <> 0 then
+  begin
+    EnsureAntialiasSizeMap(FXMap, FOutput.SizeX, Src.SizeX, AC, Mode = 2);
+    EnsureAntialiasSizeMap(FYMap, FOutput.SizeY, Src.SizeY, AC, Mode = 2);
+    FHorizontalPass.ReSize(FOutput.SizeX, Src.SizeY, FOutput.Depth);
+  end
+  else if Mode = 0 then
   begin
     EnsureNearestSizeMap(FXMap, FOutput.SizeX, Src.SizeX);
     EnsureNearestSizeMap(FYMap, FOutput.SizeY, Src.SizeY);
@@ -60698,7 +60909,8 @@ begin
   end
   else Inc(FForwardCPUCnt);
   {$ENDIF}
-  case FStruct[2] of
+  if FStruct[4] <> 0 then SeparableForward(PrevOutput)
+  else case FStruct[2] of
     0:
     begin
       // Nearest: copy the single picked Depth-long source column.
@@ -60725,8 +60937,9 @@ begin
   FHasOpenCL := true;
   // One gather helper for the configured blend: 4 corners for bilinear (the same
   // kernel as TNNetBilinearResize), 16 for bicubic (the same kernel as
-  // TNNetBicubicUpsample). Nearest gets none - it has nothing to blend.
-  if not Assigned(FGatherCL) then
+  // TNNetBicubicUpsample). Nearest gets none - it has nothing to blend - and
+  // neither does antialias, whose per-axis tap count is not fixed.
+  if not Assigned(FGatherCL) and (FStruct[4] = 0) then
   begin
     if FStruct[2] = 1 then FGatherCL := TNNetBilinearGatherCL.Create(FNN)
     else if FStruct[2] = 2 then FGatherCL := TNNetBicubicGatherCL.Create(FNN);
@@ -60747,7 +60960,8 @@ begin
   TestBackPropCallCurrCnt();
   PrevError := FPrevLayer.OutputError;
   EnsureAxisMaps(FPrevLayer.Output);
-  case FStruct[2] of
+  if FStruct[4] <> 0 then SeparableBackward(PrevError)
+  else case FStruct[2] of
     0:
     begin
       // Transpose of nearest: accumulate the whole error column into the picked src.
@@ -135288,7 +135502,7 @@ begin
       'TNNetBilinearUpsample' :     Result := TNNetBilinearUpsample.Create(St[0]);
       'TNNetBicubicUpsample' :      Result := TNNetBicubicUpsample.Create(St[0], St[1]);
       'TNNetBilinearResize' :       Result := TNNetBilinearResize.Create(St[0], St[1], St[2]);
-      'TNNetResize2D' :             Result := TNNetResize2D.Create(St[0], St[1], St[2], St[3]);
+      'TNNetResize2D' :             Result := TNNetResize2D.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
@@ -135739,7 +135953,7 @@ begin
       if S[0] = 'TNNetBilinearUpsample' then Result := TNNetBilinearUpsample.Create(St[0]) else
       if S[0] = 'TNNetBicubicUpsample' then Result := TNNetBicubicUpsample.Create(St[0], St[1]) else
       if S[0] = 'TNNetBilinearResize' then Result := TNNetBilinearResize.Create(St[0], St[1], St[2]) else
-      if S[0] = 'TNNetResize2D' then Result := TNNetResize2D.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetResize2D' then Result := TNNetResize2D.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else

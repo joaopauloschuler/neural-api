@@ -386,6 +386,9 @@ type
     procedure TestResize2DBilinearInputGradientCheck;
     procedure TestResize2DBicubicInputGradientCheck;
     procedure TestResize2DSerializationRoundTrip;
+    procedure TestResize2DAntialiasTorchParity;
+    procedure TestResize2DAntialiasInputGradientCheck;
+    procedure TestResize2DAntialiasSerializationRoundTrip;
     procedure TestDeconvolutionOpenCLParity;
     // A conv that first runs the fused-activation device forward (output left
     // in OpenCL memory) and is then switched to the Winograd path, which writes
@@ -64230,7 +64233,7 @@ end;
 // sampling (non-integer ratio) and both align_corners conventions.
 procedure Resize2DInputGradHelper(ATest: TTestNeuralNumerical;
   AMode, AAlignCorners, InX, InY, OutX, OutY, Depth: integer;
-  const AName: string; ATol: TNeuralFloat);
+  const AName: string; ATol: TNeuralFloat; AAntialias: integer = 0);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
@@ -64261,7 +64264,8 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(InX, InY, Depth, 1)); // 1 = collect input error
-    NN.AddLayer(TNNetResize2D.Create(OutX, OutY, AMode, AAlignCorners));
+    NN.AddLayer(TNNetResize2D.Create(OutX, OutY, AMode, AAlignCorners,
+      AAntialias));
     OutSize := NN.GetLastLayer.Output.Size;
     Desired := TNNetVolume.Create(OutSize, 1, 1);
     NN.SetLearningRate(1.0, 0.0);
@@ -64351,6 +64355,72 @@ begin
   finally
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestResize2DAntialiasInputGradientCheck;
+begin
+  // Downscale (widened support), mixed down-X/up-Y, and align_corners=True.
+  Resize2DInputGradHelper(Self, 1, 0, 7, 6, 3, 4, 2, 'Resize2D-AA-Bilinear', 1e-2, 1);
+  Resize2DInputGradHelper(Self, 2, 0, 9, 5, 4, 7, 2, 'Resize2D-AA-Bicubic-mixed', 1e-2, 1);
+  Resize2DInputGradHelper(Self, 2, 1, 8, 7, 3, 3, 3, 'Resize2D-AA-Bicubic-ac1', 1e-2, 1);
+end;
+
+procedure TTestNeuralNumerical.TestResize2DAntialiasSerializationRoundTrip;
+var
+  NN, NN2, NNPlain: TNNet;
+  Input: TNNetVolume;
+  S, OldFormat: string;
+  i: integer;
+  MaxDiff, MaxAADiff: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  NNPlain := TNNet.Create();
+  Input := TNNetVolume.Create(13, 9, 3);
+  try
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.37) - 0.2;
+    NN.AddLayer(TNNetInput.Create(13, 9, 3));
+    NN.AddLayer(TNNetResize2D.Create(5, 4, 2, 0, 1));
+    NNPlain.AddLayer(TNNetInput.Create(13, 9, 3));
+    NNPlain.AddLayer(TNNetResize2D.Create(5, 4, 2, 0, 0));
+    S := NN.SaveStructureToString();
+    AssertTrue('antialias saved in FStruct[4]', Pos('TNNetResize2D:5;4;2;0;1;', S) > 0);
+    NN2.LoadStructureFromString(S);
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    NNPlain.Compute(Input);
+    MaxDiff := 0;
+    MaxAADiff := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      MaxDiff := Max(MaxDiff, Abs(NN.GetLastLayer.Output.Raw[i] -
+        NN2.GetLastLayer.Output.Raw[i]));
+      MaxAADiff := Max(MaxAADiff, Abs(NN.GetLastLayer.Output.Raw[i] -
+        NNPlain.GetLastLayer.Output.Raw[i]));
+    end;
+    AssertTrue('reloaded antialias layer matches', MaxDiff = 0);
+    AssertTrue('antialias differs from plain bicubic', MaxAADiff > 1e-3);
+    // A string written before FStruct[4] existed (4 flags) loads with antialias off.
+    OldFormat := StringReplace(S, 'TNNetResize2D:5;4;2;0;1;0;0;0',
+      'TNNetResize2D:5;4;2;0', []);
+    AssertTrue('old-format string built', OldFormat <> S);
+    NN2.Free;
+    NN2 := TNNet.Create();
+    NN2.LoadStructureFromString(OldFormat);
+    AssertTrue('old format re-saves with antialias 0',
+      Pos('TNNetResize2D:5;4;2;0;0;', NN2.SaveStructureToString()) > 0);
+    NN2.Compute(Input);
+    MaxDiff := 0;
+    for i := 0 to NNPlain.GetLastLayer.Output.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(NNPlain.GetLastLayer.Output.Raw[i] -
+        NN2.GetLastLayer.Output.Raw[i]));
+    AssertTrue('old format computes as plain bicubic', MaxDiff = 0);
+  finally
+    Input.Free;
+    NNPlain.Free;
+    NN2.Free;
+    NN.Free;
   end;
 end;
 
@@ -66840,6 +66910,72 @@ begin
   end;
 end;
 
+// tests/fixtures/resize2d_antialias_oracle.json (tools/make_resize2d_antialias_
+// fixture.py): torch interpolate(antialias=True), input [C][H][W], output [C][OH][OW].
+procedure TTestNeuralNumerical.TestResize2DAntialiasTorchParity;
+var
+  Oracle, OracleCase: TJSONObject;
+  Cases, Planes: TJSONArray;
+  NN: TNNet;
+  Input: TNNetVolume;
+  CasePos, x, y, c, InW, InH, OutW, OutH, Channels: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  Oracle := LoadJSONFixture('resize2d_antialias_oracle.json');
+  if Oracle = nil then
+  begin
+    Ignore('resize2d_antialias_oracle.json absent; run tools/make_resize2d_antialias_fixture.py');
+    exit;
+  end;
+  Input := TNNetVolume.Create();
+  try
+    Cases := Oracle.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      OracleCase := Cases.Objects[CasePos];
+      CaseName := OracleCase.Strings['name'];
+      InW := OracleCase.Integers['in_w'];
+      InH := OracleCase.Integers['in_h'];
+      OutW := OracleCase.Integers['out_w'];
+      OutH := OracleCase.Integers['out_h'];
+      Channels := OracleCase.Integers['channels'];
+      Input.ReSize(InW, InH, Channels);
+      Planes := OracleCase.Arrays['input'];
+      for c := 0 to Channels - 1 do
+        for y := 0 to InH - 1 do
+          for x := 0 to InW - 1 do
+            Input[x, y, c] := Planes.Arrays[c].Arrays[y].Floats[x];
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(InW, InH, Channels));
+        NN.AddLayer(TNNetResize2D.Create(OutW, OutH,
+          OracleCase.Integers['mode'], OracleCase.Integers['align_corners'], 1));
+        NN.Compute(Input);
+        AssertEquals(CaseName + ': OutX', OutW, NN.GetLastLayer.Output.SizeX);
+        AssertEquals(CaseName + ': OutY', OutH, NN.GetLastLayer.Output.SizeY);
+        Planes := OracleCase.Arrays['output'];
+        MaxDiff := 0;
+        for c := 0 to Channels - 1 do
+          for y := 0 to OutH - 1 do
+            for x := 0 to OutW - 1 do
+            begin
+              Diff := Abs(NN.GetLastLayer.Output[x, y, c] -
+                Planes.Arrays[c].Arrays[y].Floats[x]);
+              if Diff > MaxDiff then MaxDiff := Diff;
+            end;
+        AssertTrue(CaseName + ': max |diff| vs torch = ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+    Oracle.Free;
+  end;
+end;
+
 function CreateConv1DFromOracle(OracleCase: TJSONObject): TNNetConv1DLinear;
 var
   SuppressBias: integer;
@@ -69218,13 +69354,13 @@ end;
 procedure TTestNeuralNumerical.TestResize2DOpenCLParity;
 {$IFDEF OpenCL}
 type
-  TCase = record W, H, D, OutW, OutH, Mode: integer; Name: string; end;
+  TCase = record W, H, D, OutW, OutH, Mode, Antialias: integer; Name: string; end;
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  Cases: array[0..4] of TCase;
+  Cases: array[0..6] of TCase;
   ci, i: integer;
   Diff, MaxDiff: TNeuralFloat;
 begin
@@ -69240,6 +69376,12 @@ begin
   Cases[2].W := 10; Cases[2].H :=  6; Cases[2].D := 4; Cases[2].OutW :=  5; Cases[2].OutH := 14; Cases[2].Mode := 1; Cases[2].Name := 'bilinear-rect';
   Cases[3].W :=  8; Cases[3].H :=  8; Cases[3].D := 5; Cases[3].OutW := 13; Cases[3].OutH := 11; Cases[3].Mode := 2; Cases[3].Name := 'bicubic-upscale';
   Cases[4].W := 11; Cases[4].H :=  9; Cases[4].D := 3; Cases[4].OutW :=  6; Cases[4].OutH := 15; Cases[4].Mode := 2; Cases[4].Name := 'bicubic-rect';
+  // Antialias has no device kernel: ForceOpenCL must fall back to the host path.
+  Cases[5].W := 12; Cases[5].H := 12; Cases[5].D := 3; Cases[5].OutW :=  5; Cases[5].OutH :=  7; Cases[5].Mode := 1; Cases[5].Name := 'bilinear-antialias';
+  Cases[6].W := 11; Cases[6].H :=  9; Cases[6].D := 3; Cases[6].OutW :=  4; Cases[6].OutH := 15; Cases[6].Mode := 2; Cases[6].Name := 'bicubic-antialias';
+  for ci := 0 to 4 do Cases[ci].Antialias := 0;
+  Cases[5].Antialias := 1;
+  Cases[6].Antialias := 1;
   for ci := 0 to High(Cases) do
   begin
     RandSeed := 424242;
@@ -69248,7 +69390,7 @@ begin
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(Cases[ci].W, Cases[ci].H, Cases[ci].D, 1));
-      NN.AddLayer(TNNetResize2D.Create(Cases[ci].OutW, Cases[ci].OutH, Cases[ci].Mode, 0));
+      NN.AddLayer(TNNetResize2D.Create(Cases[ci].OutW, Cases[ci].OutH, Cases[ci].Mode, 0, Cases[ci].Antialias));
       for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.39) * 0.85 - 0.1;
 
       NN.Compute(Input);
