@@ -1953,11 +1953,38 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         GEMM. The folded Mamba-1 `W_d` is a full Depth x Depth matrix; the
         unfolded low-rank dt path (x_proj_dt then dt_proj, as the Jamba mode
         already runs) would cut that traffic by Depth / dt_rank.
-  - [ ] `TNNetMamba2` (the Mamba-2 and Nemotron-H mixer) has no device
-        forward. It is a separate `TNNetLayer` (per-head scalar A, n_groups
-        B/C, gated RMSNorm read-out), not a `TNNetSelectiveSSM` mode, and not a
-        `TNNetRecurrentDecodeBase`, so its streamed decode has no carried state
-        to keep in OpenCL memory yet.
+- [ ] Follow-ups of the `TNNetMamba2` device forward (fc5c2c40) and its
+      streamed-decode state (329b0a91), the Mamba-2 and Nemotron-H mixer.
+      `TNNetMamba2CL` runs `cai_mamba2_scan` (one work-item per d_inner
+      channel for the whole sequence, the (d_inner, N) state advanced in
+      place) and `cai_mamba2_gated_norm` (one work-group per token) on one
+      queue; the source is bound, the result stays in OpenCL memory. The layer
+      now descends from `TNNetRecurrentDecodeBase`: before 329b0a91
+      `TNNetStreamingDecoder` never collected it, so every width-1 step
+      restarted the scan from h = 0 and a streamed Mamba-2 / Nemotron-H decode
+      (ChatTerminal) diverged from the full forward from the second token. The
+      decode state now stays in OpenCL memory and checkpoint slots are OpenCL
+      buffers. `TNNetRecurrentScanCL` is the new shared parent of the
+      GatedDeltaNet, SelectiveSSM and Mamba-2 helpers (state bank plumbing).
+      Open follow-ups:
+  - [ ] Throughput is unmeasured; time a Mamba-2 and a Nemotron-H decode and
+        prefill on the GPU box. One work-item per channel runs the whole
+        sequence serially, so a long prefill is latency-bound; if a profile
+        shows it, the chunked SSD scan is the next step (it is also the CPU
+        stretch goal).
+  - [ ] The gated RMSNorm normalizes over the full d_inner (CPU and OpenCL
+        alike). That matches HF `modeling_mamba2.py` (`MambaRMSNormGated` over
+        intermediate_size), but HF `modeling_nemotron_h.py` builds
+        `Zamba2RMSNormGated(group_size = intermediate_size // n_groups)`. The
+        tiny_nemotronh fixture uses n_groups = 1, so no test sees the
+        difference; a real Nemotron-H checkpoint with n_groups > 1 would
+        normalize wrong. Needs a decision: a norm-group count on `TNNetMamba2`
+        (CPU forward, backward, `cai_mamba2_gated_norm` with one work-group per
+        (token, group)), set by the Nemotron-H importer, plus an n_groups > 1
+        Nemotron-H fixture.
+  - [ ] The chat engine's checkpoint and prefill-window routes have not been
+        run end to end on a real Mamba-2 or Nemotron-H checkpoint since the
+        layer became recurrent; only the pico fixtures cover it.
 - [ ] `TNNetWKV`, `TNNetTokenShift` and `TNNetDiagonalSSM` device forward — the
       RWKV trunk, same per-head-recurrence recipe as `TNNetSelectiveSSM`. Lower
       priority only because fewer tested checkpoints use it.
