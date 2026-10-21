@@ -3142,6 +3142,54 @@ __kernel void cai_local_response_norm
   FDst[g_id] = FSrc[g_id] / pow(1.0f + FScale * SumSq, FBeta);
 }
 
+// TNNetConvGRUCell reset step: FDst = [r*h ; x] per pixel, where h|x is the cell
+// input FSrc (FHiddenC + FInputC channels) and r is the second half of the fused
+// z|r gate map FGates (2*FHiddenC channels per pixel). One work-item per output float.
+// Coded by Claude (AI).
+__kernel void cai_conv_gru_reset_input
+(
+  const int FPixelCount,
+  const int FHiddenC,
+  const int FInputC,
+  __global const float* FGates,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  const int InDepth = FHiddenC + FInputC;
+  if (g_id >= FPixelCount * InDepth) return;
+  const int pixel = g_id / InDepth;
+  const int c = g_id - pixel * InDepth;
+  float v = FSrc[g_id];
+  if (c < FHiddenC) v = FGates[pixel * 2 * FHiddenC + FHiddenC + c] * v;
+  FDst[g_id] = v;
+}
+
+// TNNetConvGRUCell blend: FDst = (1 - z) * h + z * q, with z the first half of the
+// fused z|r gate map FGates, h the first FHiddenC channels of FSrc and q the
+// candidate map FCandidate (already tanh'd). One work-item per output float.
+// Coded by Claude (AI).
+__kernel void cai_conv_gru_blend
+(
+  const int FPixelCount,
+  const int FHiddenC,
+  const int FInputC,
+  __global const float* FGates,
+  __global const float* FSrc,
+  __global const float* FCandidate,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPixelCount * FHiddenC) return;
+  const int pixel = g_id / FHiddenC;
+  const int c = g_id - pixel * FHiddenC;
+  const float z = FGates[pixel * 2 * FHiddenC + c];
+  const float h = FSrc[pixel * (FHiddenC + FInputC) + c];
+  FDst[g_id] = (1.0f - z) * h + z * FCandidate[g_id];
+}
+
 // Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
 // The input volume is laid out depth-axis contiguous in the TVolume convention:
 // element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride

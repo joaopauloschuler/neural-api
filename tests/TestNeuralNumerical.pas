@@ -959,6 +959,10 @@ type
     // resident chain with ForceOpenCL off.
     procedure LocalResponseNormOpenCLParity;
     procedure LocalResponseNormResidentChainOpenCL;
+    // TNNetConvGRUCell OpenCL forward vs CPU, and in a resident chain with
+    // ForceOpenCL off.
+    procedure ConvGRUCellOpenCLParity;
+    procedure ConvGRUCellResidentChainOpenCL;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -86794,6 +86798,223 @@ begin
       FloatToStr(MaxDiff), MaxDiff < 1e-3);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+// Gives every TNNetConvGRUCell gate kernel and bias Gaussian values of the given
+// spread, large enough that the gates leave the near-0.5 regime of InitDefault.
+procedure RandomizeConvGRUCellWeights(Cell: TNNetLayer; Spread: TNeuralFloat);
+var
+  NeuronPos: integer;
+begin
+  for NeuronPos := 0 to 5 do
+  begin
+    Cell.Neurons[NeuronPos].Weights.RandomizeGaussian();
+    Cell.Neurons[NeuronPos].Weights.Mul(Spread);
+  end;
+  Cell.FlushWeightCache();
+end;
+{$ENDIF}
+
+// TNNetConvGRUCell under ForceOpenCL vs a CPU twin, over 1x1/3x3/5x5 kernels, two
+// inputs, a weight update; a trainable cell stays on the host. Coded by Claude (AI).
+procedure TTestNeuralNumerical.ConvGRUCellOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 4;
+  SizeXs: array[0..CaseCount-1] of integer = (7, 1, 6, 3);
+  SizeYs: array[0..CaseCount-1] of integer = (5, 1, 4, 2);
+  HiddenCs: array[0..CaseCount-1] of integer = (4, 2, 8, 3);
+  InputCs: array[0..CaseCount-1] of integer = (3, 5, 6, 2);
+  FeatureSizes: array[0..CaseCount-1] of integer = (3, 1, 5, 3);
+var
+  NN, NNCPU: TNNet;
+  InputA, InputB, OutCPUA, OutCPUB: TNNetVolume;
+  Cell, CellCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, Depth: integer;
+  DiffA, DiffB, DiffUpdate, DiffHost: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 7300 + CaseIdx;
+    Depth := HiddenCs[CaseIdx] + InputCs[CaseIdx];
+    NN := TNNet.Create();
+    NNCPU := TNNet.Create();
+    InputA := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Depth);
+    InputB := TNNetVolume.Create(InputA);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      InputA.RandomizeGaussian();
+      InputB.RandomizeGaussian();
+      InputB.Mul(2);
+      NN.AddLayer(TNNetInput.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Depth));
+      Cell := NN.AddLayer(TNNetConvGRUCell.Create(HiddenCs[CaseIdx],
+        InputCs[CaseIdx], FeatureSizes[CaseIdx]));
+      NNCPU.AddLayer(TNNetInput.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Depth));
+      CellCPU := NNCPU.AddLayer(TNNetConvGRUCell.Create(HiddenCs[CaseIdx],
+        InputCs[CaseIdx], FeatureSizes[CaseIdx]));
+      NN.SetTrainable(False, False);
+      NNCPU.SetTrainable(False, False);
+      RandomizeConvGRUCellWeights(Cell, 0.4);
+      NNCPU.CopyWeights(NN);
+      NNCPU.Compute(InputA);
+      OutCPUA.Copy(CellCPU.Output);
+      NNCPU.Compute(InputB);
+      OutCPUB.Copy(CellCPU.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(InputA);
+        AssertTrue('ForceOutputOnRAM must report the cell readable',
+          Cell.ForceOutputOnRAM());
+        DiffA := MaxAbsDiffToOutput(OutCPUA, Cell.Output);
+        NN.Compute(InputB);
+        Cell.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffToOutput(OutCPUB, Cell.Output);
+        // A weight update must reach both device GEMM operands and the biases.
+        RandomizeConvGRUCellWeights(Cell, 0.3);
+        NNCPU.CopyWeights(NN);
+        NNCPU.Compute(InputA);
+        NN.Compute(InputA);
+        Cell.ForceOutputOnRAM();
+        DiffUpdate := MaxAbsDiffToOutput(CellCPU.Output, Cell.Output);
+        WriteLn('  ConvGRUCell OpenCL parity case ', CaseIdx, ': max|diff| A=',
+          DiffA:0:9, ' B=', DiffB:0:9, ' after update=', DiffUpdate:0:9,
+          ' max|out|=', OutCPUB.GetMaxAbs():0:4, ' gpu forwards=',
+          Cell.ForwardGPUCnt);
+        AssertEquals('every forward must run in OpenCL', 3, Cell.ForwardGPUCnt);
+        AssertTrue('the CPU reference is not degenerate', OutCPUA.GetMaxAbs() > 0.1);
+        AssertTrue('ConvGRUCell input A OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-4);
+        AssertTrue('ConvGRUCell input B OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffB), DiffB < 1e-4);
+        AssertTrue('ConvGRUCell after a weight update max |diff| = ' +
+          FloatToStr(DiffUpdate), DiffUpdate < 1e-4);
+        // Trainable: the device path is inference only.
+        NN.SetTrainable(True, False);
+        NN.Compute(InputA);
+        AssertEquals('a trainable cell must stay on the host', 3, Cell.ForwardGPUCnt);
+        DiffHost := MaxAbsDiffToOutput(CellCPU.Output, Cell.Output);
+        AssertTrue('trainable host forward after OpenCL max |diff| = ' +
+          FloatToStr(DiffHost), DiffHost < 1e-4);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+    finally
+      OutCPUB.Free; OutCPUA.Free; InputB.Free; InputA.Free;
+      NNCPU.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off, shared and private kernel queues: TNNetInput -> pointwise conv ->
+// TNNetConvGRUCell -> pointwise conv. The cell binds the resident source, keeps its output
+// resident (sentinels, one upload and one download per forward). Coded by Claude (AI).
+procedure TTestNeuralNumerical.ConvGRUCellResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  InW = 9;
+  InH = 7;
+  InDepth = 4;
+  HiddenC = 6;
+  InputC = 5;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU, CellCPU: TNNetVolume;
+  Conv, Cell, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, SentinelSurvivors, KernelMode: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff, CellDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  // Mode 1 gives each entry point its own queue, so the cell's hand-overs
+  // between the GEMM queue and its two elementwise kernels are exercised.
+  for KernelMode := 0 to 1 do
+  begin
+    RandSeed := 4343;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(InW, InH, InDepth);
+    OutCPU := TNNetVolume.Create();
+    CellCPU := TNNetVolume.Create();
+    try
+      Input.RandomizeGaussian();
+      NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+      Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(HiddenC + InputC));
+      Cell := NN.AddLayer(TNNetConvGRUCell.Create(HiddenC, InputC, 3));
+      Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+      NN.SetTrainable(False, False);
+      RandomizeConvGRUCellWeights(Cell, 0.4);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      CellCPU.Copy(Cell.Output);
+      NN.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel=}KernelMode = 0);
+      NN.Compute(Input);
+      Conv.Output.Fill(csSentinel);
+      Cell.Output.Fill(csSentinel);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to Cell.Output.Size - 1 do
+        if Cell.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+      Cell.ForceOutputOnRAM();
+      CellDiff := MaxAbsDiffToOutput(CellCPU, Cell.Output);
+      WriteLn('  ConvGRUCell resident chain mode ', KernelMode, ': gpu forwards conv=', Conv.ForwardGPUCnt,
+        ' cell=', Cell.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt,
+        ' sentinels=', SentinelSurvivors, '/', Cell.Output.Size, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount,
+        ' max|diff| last=', MaxDiff:0:9, ' cell=', CellDiff:0:9);
+      AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+      AssertTrue('the cell must follow its resident source', Cell.ForwardGPUCnt >= 2);
+      AssertTrue('the projection must follow the resident cell output',
+        Proj.ForwardGPUCnt >= 2);
+      AssertEquals('conv host output not downloaded', csSentinel,
+        Conv.Output.Raw[0], 0);
+      AssertEquals('cell host output not downloaded', Cell.Output.Size,
+        SentinelSurvivors);
+      AssertEquals('only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals('only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue('ConvGRUCell resident chain vs CPU max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-4);
+      AssertTrue('ConvGRUCell resident cell vs CPU max |diff| = ' +
+        FloatToStr(CellDiff), CellDiff < 1e-4);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      CellCPU.Free; OutCPU.Free; Input.Free; NN.Free;
+  end;
   end;
 end;
 {$ELSE}

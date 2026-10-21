@@ -5841,6 +5841,31 @@ type
     function BufferBytes(): int64; override;
   end;
 
+  /// OpenCL forward helper for TNNetConvGRUCell: the two elementwise steps around
+  // its gate convolutions (cai_conv_gru_reset_input, cai_conv_gru_blend). Coded by Claude (AI).
+  TNNetConvGRUCellCL = class(TNNetKernelCL)
+  private
+    // Persistent buffers (grow-only): the uploaded host source, [r*h ; x] and the result.
+    FBufSrc, FBufResetInput, FBufY: cl_mem;
+    FCapSrc, FCapResetInput, FCapY: csize_t;
+    FResetKernel: TNeuralKernel;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Blocking upload of the host cell input, so every queue may read the returned buffer.
+    function UploadSource(Src: TNNetVolume): cl_mem;
+    // Writes [r*h ; x] (shaped as ResetInput) from the z|r gates and the cell input.
+    function BuildResetInput(Gates, Src: cl_mem; ResetInput: TNNetVolume;
+      HiddenC, InputC: integer): cl_mem;
+    // Writes Y = (1 - z) * h + z * q into ResultBuffer.
+    procedure Blend(Gates, Src, Candidate: cl_mem; Y: TNNetVolume;
+      HiddenC, InputC: integer);
+    function ResultBuffer(): cl_mem;
+    function ResetKernel(): TNeuralKernel;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   /// OpenCL forward helper for the depthwise 2-D convolution (TNNetDepthwiseConv).
   // Binds the cai_depthwise_conv2d entry point on the shared dot-product program's
   // device. Uploads the concatenated per-neuron weights + the (already padded)
@@ -6601,12 +6626,34 @@ type
     FHiddenC, FInC, FFeature, FPad, FW, FH: integer;
     FZg, FRg, FQ, FRH: TNNetVolume; // gate scratch maps
     FZcat: TNNetVolume;            // [r*h ; x] scratch for the candidate conv
+    {$IFDEF OpenCL}
+    // FDotCL runs the fused z|r gate conv; FCandidateDotCL the q conv.
+    FCandidateDotCL: TDotProductSharedKernel;
+    FGRUCL: TNNetConvGRUCellCL;
+    // cai_conv_implicit A operands (k-major) and the fused z|r bias.
+    FGatesWeightsCL, FGatesBiasCL, FCandidateWeightsCL: TNNetVolume;
+    // Sizes the operands and arms both implicit convs for this layer's shape.
+    procedure ArmOpenCLForward();
+    // Re-lays the gate kernels out for cai_conv_implicit; True when it did.
+    function RefreshGateWeightsCL(): boolean;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure GateConv(NeuronBase: integer; Src: TNNetVolume; Dst: TNNetVolume);
   public
     constructor Create(pHiddenChannels, pInputChannels: integer;
       pFeatureSize: integer = 3); reintroduce; overload;
     destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    // Inference forward: two cai_conv_implicit convs (z|r with sigmoid, q with
+    // tanh) and two elementwise kernels; the result stays resident.
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -41036,6 +41083,89 @@ begin
   end;
 end;
 
+{ TNNetConvGRUCellCL }
+
+constructor TNNetConvGRUCellCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_conv_gru_blend');
+  FResetKernel := NN.GetKernel('cai_conv_gru_reset_input');
+end;
+
+destructor TNNetConvGRUCellCL.Destroy();
+begin
+  if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
+  if Assigned(FBufResetInput) then clReleaseMemObject(FBufResetInput);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  FNN.FreeKernelIfNotShared('cai_conv_gru_reset_input', FResetKernel);
+  inherited Destroy();
+end;
+
+function TNNetConvGRUCellCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetConvGRUCellCL.ResetKernel(): TNeuralKernel;
+begin
+  Result := FResetKernel;
+end;
+
+function TNNetConvGRUCellCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetConvGRUCellCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufSrc) + OpenCLMemBytes(FBufResetInput) +
+    OpenCLMemBytes(FBufY);
+end;
+
+function TNNetConvGRUCellCL.UploadSource(Src: TNNetVolume): cl_mem;
+begin
+  Result := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Src, {DoWrite}true,
+    {pBlocking}true);
+end;
+
+function TNNetConvGRUCellCL.BuildResetInput(Gates, Src: cl_mem;
+  ResetInput: TNNetVolume; HiddenC, InputC: integer): cl_mem;
+var
+  k: cl_kernel;
+  PixelCount: longint;
+begin
+  k := FResetKernel.Kernel;
+  PixelCount := ResetInput.SizeX * ResetInput.SizeY;
+  Result := FResetKernel.EnsureOutputBuffer(FBufResetInput, FCapResetInput,
+    ResetInput);
+  clSetKernelArg(k, 0, csLongintSize, @PixelCount);
+  clSetKernelArg(k, 1, csLongintSize, @HiddenC);
+  clSetKernelArg(k, 2, csLongintSize, @InputC);
+  clSetKernelArg(k, 3, csCLMemSize, @Gates);
+  clSetKernelArg(k, 4, csCLMemSize, @Src);
+  clSetKernelArg(k, 5, csCLMemSize, @Result);
+  FResetKernel.RunKernel(k, ResetInput.Size);
+end;
+
+procedure TNNetConvGRUCellCL.Blend(Gates, Src, Candidate: cl_mem;
+  Y: TNNetVolume; HiddenC, InputC: integer);
+var
+  k: cl_kernel;
+  PixelCount: longint;
+  bufY: cl_mem;
+begin
+  k := FKernel.Kernel;
+  PixelCount := Y.SizeX * Y.SizeY;
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  clSetKernelArg(k, 0, csLongintSize, @PixelCount);
+  clSetKernelArg(k, 1, csLongintSize, @HiddenC);
+  clSetKernelArg(k, 2, csLongintSize, @InputC);
+  clSetKernelArg(k, 3, csCLMemSize, @Gates);
+  clSetKernelArg(k, 4, csCLMemSize, @Src);
+  clSetKernelArg(k, 5, csCLMemSize, @Candidate);
+  clSetKernelArg(k, 6, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, Y.Size);
+end;
+
 { TNNetDepthwiseConvCL }
 
 constructor TNNetDepthwiseConvCL.Create(NN: TNNet);
@@ -44545,6 +44675,11 @@ end;
 
 destructor TNNetConvGRUCell.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FGRUCL) then FreeAndNil(FGRUCL);
+  FreeDotProductCL(FCandidateDotCL);
+  FGatesWeightsCL.Free; FGatesBiasCL.Free; FCandidateWeightsCL.Free;
+  {$ENDIF}
   FZg.Free; FRg.Free; FQ.Free; FRH.Free; FZcat.Free;
   inherited Destroy();
 end;
@@ -44583,7 +44718,167 @@ begin
   FOutput.ReSize(FW, FH, FHiddenC);
   SetOutputErrorSize(FOutput);
   InitDefault();
+  {$IFDEF OpenCL}
+  // Three gate convs over the same taps.
+  FShouldOpenCL := (3 * Int64(FOutput.Size) * FFeature * FFeature * ZC >=
+    cNeuralOpenCLMinWork);
+  // The device GEMMs are shaped by this layer's sizes: a re-wire re-arms them.
+  if FHasOpenCL and Assigned(FDotCL) then ArmOpenCLForward();
+  {$ENDIF}
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetConvGRUCell.ArmOpenCLForward();
+var
+  TapCount, PixelCount: integer;
+begin
+  TapCount := FFeature * FFeature * (FHiddenC + FInC);
+  PixelCount := FW * FH;
+  if PixelCount = 0 then exit;
+  FGatesBiasCL.ReSize(2 * FHiddenC, 1, 1);
+  ArmImplicitConv(FGatesWeightsCL, 2 * FHiddenC, TapCount, PixelCount);
+  FCandidateWeightsCL.ReSize(TapCount, 1, FHiddenC);
+  FCandidateDotCL.PrepareForCompute(FCandidateWeightsCL, PixelCount, TapCount);
+  FCandidateDotCL.PrepareImplicitConv();
+end;
+
+procedure TNNetConvGRUCell.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  CreateImplicitConvCL(FGatesWeightsCL);
+  if not Assigned(FGatesBiasCL) then FGatesBiasCL := TNNetVolume.Create();
+  if not Assigned(FCandidateWeightsCL) then
+    FCandidateWeightsCL := TNNetVolume.Create();
+  if not Assigned(FCandidateDotCL) then
+  begin
+    FCandidateDotCL := NewDotProductCL(GetDotProductKernel());
+    FCandidateDotCL.HideMessages();
+  end;
+  if Assigned(FNN) and not Assigned(FGRUCL) then
+    FGRUCL := TNNetConvGRUCellCL.Create(FNN);
+  ArmOpenCLForward();
+end;
+
+procedure TNNetConvGRUCell.DisableOpenCL();
+begin
+  // FGRUCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FreeAndNil(FGRUCL);
+  FreeDotProductCL(FCandidateDotCL);
+  inherited DisableOpenCL();
+end;
+
+function TNNetConvGRUCell.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FGRUCL) and Assigned(FCandidateDotCL) and
+    FCandidateDotCL.ImplicitConvReady and
+    WillImplicitConv(FGatesWeightsCL, 2 * FHiddenC,
+      FFeature * FFeature * (FHiddenC + FInC));
+end;
+
+function TNNetConvGRUCell.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FGRUCL) then Result := FGRUCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetConvGRUCell.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FGRUCL) then Result := FGRUCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetConvGRUCell.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FCandidateDotCL) then Result := Result + FCandidateDotCL.BufferBytes();
+  if Assigned(FGRUCL) then Result := Result + FGRUCL.BufferBytes();
+end;
+
+function TNNetConvGRUCell.RefreshGateWeightsCL(): boolean;
+var
+  TapCount, GateRowCount, HiddenPos, MaxHiddenPos, TapPos, MaxTapPos: integer;
+  SrcPos, DstPos: integer;
+  Wz, Wr: TNNetVolume;
+begin
+  Result := FAfterWeightUpdateHasBeenCalled;
+  if not Result then exit;
+  TapCount := FFeature * FFeature * (FHiddenC + FInC);
+  GateRowCount := 2 * FHiddenC;
+  MaxHiddenPos := FHiddenC - 1;
+  MaxTapPos := TapCount - 1;
+  Wz := FNeurons[0].FWeights;
+  Wr := FNeurons[1].FWeights;
+  // A element (row, tap) sits at row + tap * GateRowCount; rows are z then r.
+  for HiddenPos := 0 to MaxHiddenPos do
+  begin
+    SrcPos := HiddenPos * TapCount;
+    DstPos := HiddenPos;
+    for TapPos := 0 to MaxTapPos do
+    begin
+      FGatesWeightsCL.FData[DstPos] := Wz.FData[SrcPos];
+      FGatesWeightsCL.FData[DstPos + FHiddenC] := Wr.FData[SrcPos];
+      Inc(SrcPos);
+      Inc(DstPos, GateRowCount);
+    end;
+  end;
+  FCandidateWeightsCL.InterleaveWithDepthFrom(FNeurons[2].FWeights, FHiddenC);
+  Move(FNeurons[3].FWeights.FData[0], FGatesBiasCL.FData[0],
+    FHiddenC * csNeuralFloatSize);
+  Move(FNeurons[4].FWeights.FData[0], FGatesBiasCL.FData[FHiddenC],
+    FHiddenC * csNeuralFloatSize);
+  FAfterWeightUpdateHasBeenCalled := false;
+end;
+
+// The two GEMMs share the dot-product queue; the helper's two kernels may each
+// own another, so every hand-over between queues finishes the producer first.
+procedure TNNetConvGRUCell.ComputeOpenCL();
+var
+  SrcBuffer, ResetInputBuffer: cl_mem;
+  GemmKernel: TNeuralKernel;
+  WeightsUpdated: boolean;
+  RowSpan: integer;
+
+  procedure WaitIfAnotherQueue(Producer, Consumer: TNeuralKernel);
+  begin
+    if Producer.Commands <> Consumer.Commands then Producer.Finish();
+  end;
+
+begin
+  GemmKernel := FDotCL.DotProductKernel;
+  if PrevOutputOnOpenCL() then
+  begin
+    SrcBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(GemmKernel);
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FGRUCL.ResetKernel());
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FGRUCL.OutputKernel());
+  end
+  else
+  begin
+    FPrevLayer.ForceOutputOnRAM();
+    SrcBuffer := FGRUCL.UploadSource(FPrevLayer.FOutput);
+  end;
+  WeightsUpdated := RefreshGateWeightsCL();
+  RowSpan := (FHiddenC + FInC) * FFeature;
+  // The previous forward's blend still reads the gate map this GEMM rewrites.
+  WaitIfAnotherQueue(FGRUCL.OutputKernel(), GemmKernel);
+  FDotCL.ComputeImplicitConv(FGatesWeightsCL, FPrevLayer.FOutput, FW, RowSpan,
+    {Stride}1, FPad, FPad, {DilationX}1, csActSigmoid, WeightsUpdated,
+    FGatesBiasCL, WeightsUpdated, {NewSrc}false, SrcBuffer);
+  WaitIfAnotherQueue(GemmKernel, FGRUCL.ResetKernel());
+  ResetInputBuffer := FGRUCL.BuildResetInput(FDotCL.ResultBuffer, SrcBuffer,
+    FRH, FHiddenC, FInC);
+  WaitIfAnotherQueue(FGRUCL.ResetKernel(), GemmKernel);
+  FCandidateDotCL.ComputeImplicitConv(FCandidateWeightsCL, FRH, FW, RowSpan,
+    {Stride}1, FPad, FPad, {DilationX}1, csActTanh, WeightsUpdated,
+    FNeurons[5].FWeights, WeightsUpdated, {NewSrc}false, ResetInputBuffer);
+  WaitIfAnotherQueue(GemmKernel, FGRUCL.OutputKernel());
+  FGRUCL.Blend(FDotCL.ResultBuffer, SrcBuffer, FCandidateDotCL.ResultBuffer,
+    FOutput, FHiddenC, FInC);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetConvGRUCell.GateConv(NeuronBase: integer; Src: TNNetVolume;
   Dst: TNNetVolume);
@@ -44637,7 +44932,21 @@ var
   zv, qv, hv: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Prev := FPrevLayer.FOutput;
   FHM1 := FH - 1; FWM1 := FW - 1; HiddenCM1 := FHiddenC - 1; InCM1 := FInC - 1;
   // z = sigmoid(Wz*[h;x]+bz); r = sigmoid(Wr*[h;x]+br) over the raw input.
