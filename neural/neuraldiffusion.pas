@@ -851,7 +851,7 @@ var
   i: integer;
   XtSizeM1: integer;
   Eps: TNNetVolume;
-  invSqrtAlpha, coef, sigma, z: TNeuralFloat;
+  invSqrtAlpha, sigma, z: TNeuralFloat;
   abT, abPrev, sqrtAbPrev, x0, dirCoef: TNeuralFloat;
   // DPM-Solver++ locals.
   lamT, lamPrev, h, hLast, r0: TNeuralFloat;
@@ -874,34 +874,53 @@ begin
   else FEpsScratch.ReSize(Xt);
   Eps := FEpsScratch;
   // The other updates work from eps; v-prediction is converted up front.
-  // DDIM, DPM++, UniPC and Euler read RawPred directly or through PredictX0.
-  if not (Method in [smDDIM, smDPMSolverPP2M, smUniPC, smEulerAncestral]) then
+  // DDPM, DDIM, DPM++, UniPC and Euler read RawPred directly or through PredictX0.
+  if not (Method in [smDDPM, smDDIM, smDPMSolverPP2M, smUniPC, smEulerAncestral]) then
     ToEps(Xt, RawPred, Eps, Tt);
   XtSizeM1 := Xt.Size - 1;
   case Method of
       smDDPM:
         begin
-          // x_{Tt-1} = 1/sqrt(a_t)*(x_t - beta_t/sqrt(1-ab_t)*eps) + sigma*z.
-          // alpha_T is 0 under the zero-terminal-SNR rescale; floor it as ab.
-          invSqrtAlpha := 1.0 / Sqrt(Max(FAlpha[Tt], cMinAlphaBar));
-          coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
+          // Posterior mean (Ho 2020 eq. 7) c0*x0 + c1*x_t, x0 from eps or v,
+          // folded into kA*x_t + cE*RawPred (#5/#13) + sigma*z.
+          somabT := FSqrtOneMinusAlphaBar[Tt];
           needNoise := Tt > 1;
           if needNoise then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
+          if somabT = 0 then
+          begin
+            // ab_t = 1 (Beta1 = 0): beta_t = 0 and x_t is already clean.
+            kA := 1;
+            cE := 0;
+          end
+          else if FPrediction = dpV then
+          begin
+            // c0 = sqrt(ab_prev)*beta_t/(1-ab_t), c1 = sqrt(a_t)*(1-ab_prev)/(1-ab_t)
+            // with x0 = sqrt(ab_t)*x_t - somab_t*v: exact at ab_t = 0 (x0 = -v).
+            cA := FSqrtAlphaBar[Tt - 1] * FBeta[Tt] / (somabT * somabT);
+            cB := Sqrt(FAlpha[Tt]) * Sqr(FSqrtOneMinusAlphaBar[Tt - 1]) /
+              (somabT * somabT);
+            kA := cA * FSqrtAlphaBar[Tt] + cB;
+            cE := -cA * somabT;
+          end
+          else
+          begin
+            // eps: 1/sqrt(a_t)*(x_t - beta_t/sqrt(1-ab_t)*eps); alpha_T floored as ab.
+            invSqrtAlpha := 1.0 / Sqrt(Max(FAlpha[Tt], cMinAlphaBar));
+            kA := invSqrtAlpha;
+            cE := -invSqrtAlpha * FBeta[Tt] / somabT;
+          end;
           if needNoise then
           begin
-            cE := invSqrtAlpha * coef;   // #5: invariant across the element loop
             for i := 0 to XtSizeM1 do
             begin
               z := RandG(0, 1);
-              Xt.FData[i] := invSqrtAlpha * Xt.FData[i] -
-                cE * Eps.FData[i] + sigma * z;
+              Xt.FData[i] := kA * Xt.FData[i] + cE * RawPred.FData[i] + sigma * z;
             end;
           end
           else
           begin
-            // No noise: uniform affine Xt := invSqrtAlpha*(Xt - coef*Eps) (#13).
-            Xt.Mul(invSqrtAlpha);
-            Xt.MulAdd(-invSqrtAlpha * coef, Eps);
+            Xt.Mul(kA);
+            Xt.MulAdd(cE, RawPred);
           end;
         end;
       smDDIM:

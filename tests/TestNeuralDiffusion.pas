@@ -96,6 +96,8 @@ type
     procedure TestZeroTerminalSNRTrailingSamplersFinite;
     procedure TestDDIMFinalAlphaBarVsDiffusers;
     procedure TestZeroTerminalSNREulerVEndpoint;
+    procedure TestZeroTerminalSNRDDPMVEndpoint;
+    procedure TestDDPMFirstStepPosteriorMean;
   end;
 
 implementation
@@ -1298,6 +1300,101 @@ begin
         -sqrtAbPrev * V.FData[i] + somabPrev * Xt.FData[i], Got.FData[i], 1e-6);
   finally
     Sched.Free; Xt.Free; V.Free; Got.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestZeroTerminalSNRDDPMVEndpoint;
+const
+  cTZ = 1000;
+  cSeed = 4242;
+var
+  Sched: TNNetDiffusionScheduler;
+  Xt, V, Got: TNNetVolume;
+  Z: array[0..cN - 1] of double;
+  i: integer;
+  sqrtAbPrev, sigma: double;
+begin
+  // At ab_T = 0, x0 = -v and alpha_T = 0, so the DDPM posterior mean is
+  // sqrt(ab_{T-1})*(-v); the step adds sqrt(beta_T)*z with the seeded z.
+  Sched := TNNetDiffusionScheduler.Create(cTZ, dsScaledLinear, dpV,
+    0.00085, 0.012, 0.008, true);
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  V := TNNetVolume.Create(cN, 1, 1);
+  Got := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Xt.FData[i] := 0.25 * i - 0.9;
+      V.FData[i] := 0.4 * Cos(i);
+    end;
+    RandSeed := cSeed;
+    for i := 0 to cN - 1 do Z[i] := RandG(0, 1);
+    sqrtAbPrev := Sqrt(Sched.AlphaBar[cTZ - 1]);
+    sigma := Sqrt(Sched.Beta[cTZ]);
+    Got.Copy(Xt);
+    RandSeed := cSeed;
+    Sched.Step(Got, V, cTZ, cTZ - 1, smDDPM, 0.0);
+    // sqrt(ab_{T-1}) is ~1e-3, so check the x0 the step used, noise removed.
+    for i := 0 to cN - 1 do
+      AssertEquals('DDPM endpoint x0 = -v @ ' + IntToStr(i), -V.FData[i],
+        (Got.FData[i] - sigma * Z[i]) / sqrtAbPrev, 1e-2);
+  finally
+    Sched.Free; Xt.Free; V.Free; Got.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestDDPMFirstStepPosteriorMean;
+var
+  Sched: TNNetDiffusionScheduler;
+  Xt, Raw, Got: TNNetVolume;
+  Prediction: TNNetPredictionType;
+  i: integer;
+  ab, Expected: double;
+begin
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  Raw := TNNetVolume.Create(cN, 1, 1);
+  Got := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      Xt.FData[i] := 0.3 * i - 1.1;
+      Raw.FData[i] := 0.5 * Sin(i + 1);
+    end;
+    for Prediction := Low(TNNetPredictionType) to High(TNNetPredictionType) do
+    begin
+      // ab_0 = 1 makes the posterior mean of the last step equal x0 (diffusers
+      // DDPMScheduler at t = 0), with no noise added.
+      Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, Prediction,
+        cBeta1, cBetaT);
+      try
+        ab := Sched.AlphaBar[1];
+        Got.Copy(Xt);
+        Sched.Step(Got, Raw, 1, 0, smDDPM, 0.0);
+        for i := 0 to cN - 1 do
+        begin
+          if Prediction = dpV then
+            Expected := Sqrt(ab) * Xt.FData[i] - Sqrt(1.0 - ab) * Raw.FData[i]
+          else
+            Expected := (Xt.FData[i] - Sqrt(1.0 - ab) * Raw.FData[i]) / Sqrt(ab);
+          AssertEquals('t=1 x0 @ ' + IntToStr(i), Expected, Got.FData[i], 1e-5);
+        end;
+      finally
+        Sched.Free;
+      end;
+      // Beta1 = 0 gives ab_1 = 1: x_1 is already clean and must pass through.
+      Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, Prediction,
+        0.0, cBetaT);
+      try
+        Got.Copy(Xt);
+        Sched.Step(Got, Raw, 1, 0, smDDPM, 0.0);
+        for i := 0 to cN - 1 do
+          AssertEquals('Beta1=0 @ ' + IntToStr(i), Xt.FData[i], Got.FData[i], 1e-6);
+      finally
+        Sched.Free;
+      end;
+    end;
+  finally
+    Xt.Free; Raw.Free; Got.Free;
   end;
 end;
 

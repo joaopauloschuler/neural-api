@@ -295,10 +295,9 @@ rather than acted on.
       with `dpV`. Missing pieces, all checked against the shipped
       `scheduler_config.json` (DDIM, `v_prediction`, `timestep_spacing:
       "trailing"`, `rescale_betas_zero_snr: true`, `scaled_linear` 0.00085..0.012):
-      - [ ] DDPM with dpV at the zero-SNR step still goes through eps (x0 = 0
-            instead of -v); the posterior-mean form sqrt(ab_prev)*beta/(1-ab)*x0
-            + sqrt(a)*(1-ab_prev)/(1-ab)*x_t fixes it but needs a guard where
-            ab_t = 1 (Beta1 = 0). Not needed by Marigold.
+      - [X] DDPM with dpV at the zero-SNR step now uses the posterior-mean form
+            (x0 = -v at ab_T = 0), with a pass-through guard where ab_t = 1
+            (Beta1 = 0).
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
