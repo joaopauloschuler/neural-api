@@ -66,6 +66,9 @@ type
     procedure TestGaussianBlurImageHotPixel;
     // Radius 0 copies Source into Dest; in place it changes nothing.
     procedure TestGaussianBlurImageZeroRadiusIsIdentity;
+    // A binary P6 written like the examples write it (larger than the FPC
+    // reader buffer, with a comment), a P5 and a saved .ppm reload exactly.
+    procedure TestLoadBinaryPPMAndPGM;
   end;
 
 implementation
@@ -613,6 +616,79 @@ begin
   finally
     Dest.Free;
     Source.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestLoadBinaryPPMAndPGM;
+const
+  ImgW = 40;
+  ImgH = 30;
+var
+  FN: string;
+  F: TFileStream;
+  Header: AnsiString;
+  Raster: array of byte;
+  Src, Loaded: TNNetVolume;
+  X, Y, C: integer;
+begin
+  FN := GetTempDir + 'cai_p6_roundtrip.ppm';
+  Src := TNNetVolume.Create(ImgW, ImgH, 3);
+  Loaded := TNNetVolume.Create;
+  try
+    SetLength(Raster, ImgW * ImgH * 3);
+    for Y := 0 to ImgH - 1 do
+      for X := 0 to ImgW - 1 do
+        for C := 0 to 2 do
+        begin
+          Src[X, Y, C] := (X * 7 + Y * 13 + C * 101) mod 256;
+          Raster[(Y * ImgW + X) * 3 + C] := Round(Src[X, Y, C]);
+        end;
+    Header := 'P6'#10'# made by a test'#10 + IntToStr(ImgW) + ' ' + IntToStr(ImgH) +
+      #10'255'#10;
+    F := TFileStream.Create(FN, fmCreate);
+    try
+      F.WriteBuffer(Header[1], Length(Header));
+      F.WriteBuffer(Raster[0], Length(Raster));
+    finally
+      F.Free;
+    end;
+    AssertTrue('P6 loads', LoadImageFromFileIntoVolume(FN, Loaded));
+    AssertEquals('P6 width', ImgW, Loaded.SizeX);
+    AssertEquals('P6 height', ImgH, Loaded.SizeY);
+    AssertEquals('P6 depth', 3, Loaded.Depth);
+    for Y := 0 to ImgH - 1 do
+      for X := 0 to ImgW - 1 do
+        for C := 0 to 2 do
+          AssertEquals('P6 pixel ' + IntToStr(X) + ',' + IntToStr(Y) + ' c' +
+            IntToStr(C), Src[X, Y, C], Loaded[X, Y, C], 0);
+    // The repo's own .ppm saver round-trips through the same loader.
+    AssertTrue('saved ppm', SaveImageFromVolumeIntoFile(Src, FN));
+    AssertTrue('saved ppm loads', LoadImageFromFileIntoVolume(FN, Loaded));
+    AssertEquals('saved ppm pixel', Src[ImgW - 1, ImgH - 1, 2],
+      Loaded[ImgW - 1, ImgH - 1, 2], 0);
+    AssertEquals('saved ppm pixel 2', Src[3, 5, 1], Loaded[3, 5, 1], 0);
+    DeleteFile(FN);
+    // Binary grayscale: every channel carries the gray byte.
+    FN := GetTempDir + 'cai_p5_roundtrip.pgm';
+    Header := 'P5 3 2 255'#10;
+    F := TFileStream.Create(FN, fmCreate);
+    try
+      F.WriteBuffer(Header[1], Length(Header));
+      F.WriteBuffer(Raster[0], 6);
+    finally
+      F.Free;
+    end;
+    AssertTrue('P5 loads', LoadImageFromFileIntoVolume(FN, Loaded));
+    AssertEquals('P5 width', 3, Loaded.SizeX);
+    AssertEquals('P5 height', 2, Loaded.SizeY);
+    for X := 0 to 5 do
+      for C := 0 to 2 do
+        AssertEquals('P5 pixel ' + IntToStr(X) + ' c' + IntToStr(C),
+          Raster[X], Loaded[X mod 3, X div 3, C], 0);
+  finally
+    DeleteFile(FN);
+    Loaded.Free;
+    Src.Free;
   end;
 end;
 

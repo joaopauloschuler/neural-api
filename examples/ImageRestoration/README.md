@@ -52,7 +52,7 @@ out = y + gamma .* x2
 | option | meaning | default |
 | --- | --- | --- |
 | `model.safetensors [config.json]` | checkpoint and its config (positional; config defaults to the `config.json` beside the checkpoint) | the pico fixture |
-| `--input FILE` | restore this image instead of the synthetic one (PNG, JPEG, BMP, TIFF, ... via `LoadImageFromFileIntoVolume`, `neuraldatasets.pas`); no synthetic noise is added | — |
+| `--input FILE` | restore this image instead of the synthetic one (PNG, JPEG, BMP, TIFF, PPM, ... via `LoadImageFromFileIntoVolume`, `neuraldatasets.pas`); no synthetic noise is added | — |
 | `--output FILE` | where the restored image goes; the format comes from the extension (`SaveImageFromVolumeIntoFile`: PNG, BMP, JPEG, PPM, ...) | `nafnet_restored.ppm` |
 
 Pixels enter the net as RGB in [0, 1] (`/255`), the official NAFNet
@@ -63,8 +63,8 @@ With `--input`, the example builds the net at the image's own size instead of
 the right and bottom as the official `check_image_size` does, and the output
 is cropped back. Non-square images are fine (`TNAFNetConfig.InputSizeY`).
 Memory and time grow with the image area. The ASCII preview is printed only
-for images of at most 64x64 pixels. fcl-image's PNM reader fails on P6 files
-(including the ones this example writes), so use PNG for `--input`.
+for images of at most 64x64 pixels. Binary PPM/PGM inputs work too, including
+the `.ppm` files this example writes.
 
 No network access is required: the official NAFNet checkpoints are large and not
 obtainable offline, so — exactly like the repo's RRDBNet / VAE-decoder pico

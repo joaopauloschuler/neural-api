@@ -90,10 +90,6 @@ rather than acted on.
       5b223b30 the layer runs the shared `TFFTPlan` (neuralvolume.pas), so a
       guard belongs in `FFTPlanExecute` / `FFTRadix2InPlace` once, not in the
       layer; first re-check whether examples/DarcyFlowFNO still needs its mask.
-- [ ] Binary PPM (P6) input fails in `LoadImageFromFileIntoVolume`
-      (neuraldatasets.pas), including the P6 files the examples write
-      themselves (found by 2c50b73b; examples/ImageRestoration tells users to
-      pass PNG). Fix the reader or route .ppm through the repo's own P6 code.
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD

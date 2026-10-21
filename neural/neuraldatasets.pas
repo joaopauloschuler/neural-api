@@ -187,6 +187,9 @@ type
     TrainingProp, ValidationProp, TestProp: single);
 
   {$IFDEF FPC}
+  // M.LoadFromFile, except netpbm (.ppm/.pgm/.pbm/.pnm) goes through a reader
+  // that works around the FPC 3.2 raw-PNM bug (pixel bytes lost to a buffer).
+  function LoadFPImageFromFile(M: TFPMemoryImage; ImageFileName: string): boolean;
   // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each.
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
     pWithAlpha: boolean = false);
@@ -2855,6 +2858,92 @@ begin
 end;
 
 {$IFDEF FPC}
+type
+  // FPC 3.2 TFPReaderPNM reads the header through a 1 KB buffer and then reads
+  // raw rasters straight from the stream; this rewinds to the raster start.
+  TNNetReaderPNM = class(TFPReaderPNM)
+  protected
+    procedure InternalRead(Stream: TStream; Img: TFPCustomImage); override;
+  end;
+
+procedure TNNetReaderPNM.InternalRead(Stream: TStream; Img: TFPCustomImage);
+var
+  StartPos, RasterPos: Int64;
+  Magic: array[0..1] of AnsiChar;
+  FieldValues: array[0..2] of integer;
+  FieldCount, NeededFields, Row: integer;
+  C: AnsiChar;
+begin
+  StartPos := Stream.Position;
+  Stream.ReadBuffer(Magic, 2);
+  if (Magic[0] <> 'P') or not (Magic[1] in ['4'..'6']) then
+  begin
+    Stream.Position := StartPos;
+    inherited InternalRead(Stream, Img);
+    exit;
+  end;
+  if Magic[1] = '4' then NeededFields := 2 else NeededFields := 3;
+  FieldCount := 0;
+  while FieldCount < NeededFields do
+  begin
+    Stream.ReadBuffer(C, 1);
+    if C = '#' then
+    begin
+      repeat Stream.ReadBuffer(C, 1) until (C = #10) or (C = #13);
+    end
+    else if C in ['0'..'9'] then
+    begin
+      // The single whitespace that ends the last field is consumed here.
+      FieldValues[FieldCount] := 0;
+      repeat
+        FieldValues[FieldCount] := FieldValues[FieldCount] * 10 + (Ord(C) - Ord('0'));
+        Stream.ReadBuffer(C, 1);
+      until not (C in ['0'..'9']);
+      Inc(FieldCount);
+    end
+    else if not (C in [#9, #10, #13, #32]) then
+      raise FPImageException.Create('Invalid PNM header data');
+  end;
+  RasterPos := Stream.Position;
+  Stream.Position := StartPos;
+  ReadHeader(Stream);
+  Stream.Position := RasterPos;
+  Img.SetSize(FieldValues[0], FieldValues[1]);
+  if Magic[1] = '4'
+  then FScanLineSize := (FieldValues[0] + 7) shr 3
+  else FScanLineSize := (FBitPP div 8) * FieldValues[0];
+  GetMem(FScanLine, FScanLineSize);
+  try
+    for Row := 0 to FieldValues[1] - 1 do
+    begin
+      ReadScanLine(Row, Stream);
+      WriteScanLine(Row, Img);
+    end;
+  finally
+    FreeMem(FScanLine);
+  end;
+end;
+
+function LoadFPImageFromFile(M: TFPMemoryImage; ImageFileName: string): boolean;
+var
+  Reader: TNNetReaderPNM;
+  Ext: string;
+begin
+  Ext := LowerCase(ExtractFileExt(ImageFileName));
+  if (Ext = '.ppm') or (Ext = '.pgm') or (Ext = '.pbm') or (Ext = '.pnm') then
+  begin
+    Reader := TNNetReaderPNM.Create;
+    try
+      M.LoadFromFile(ImageFileName, Reader);
+      Result := true;
+    finally
+      Reader.Free;
+    end;
+  end
+  else
+    Result := M.LoadFromFile(ImageFileName);
+end;
+
 function TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
   ImageFileName: string; V: TNNetVolume): boolean;
 var
@@ -2862,7 +2951,7 @@ var
 begin
   M := TFPMemoryImage.Create(1, 1);
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-  Result := M.LoadFromFile( ImageFileName );
+  Result := LoadFPImageFromFile(M, ImageFileName);
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
   if Result then LoadImageIntoVolume(M, V);
   M.Free;
@@ -2880,7 +2969,7 @@ var
 begin
   M := TFPMemoryImage.Create(1, 1);
   try
-    Result := M.LoadFromFile(ImageFileName);
+    Result := LoadFPImageFromFile(M, ImageFileName);
     if Result then LoadImageIntoVolume(M, V, pWithAlpha);
   finally
     M.Free;
@@ -3070,7 +3159,7 @@ begin
             try
             {$IFDEF FPC}
               {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-              M.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
+              LoadFPImageFromFile(M, Self.GetFileName(ClassId, ImageId));
               {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
               LoadImageIntoVolume(M, SourceVolume);
             {$ELSE}
