@@ -11240,6 +11240,13 @@ type
       // Set whenever something that CAN be known to change a_raw happens
       // (construction, AfterWeightUpdate, the start of a decode session).
       FADirty: boolean;
+      {$IFDEF OpenCL}
+      // cai_diagonal_ssm_scan in OpenCL memory; its state bank carries FDecodeH
+      // through a decode session. Tables re-upload only when dirty.
+      FScanCL: TNNetChannelScanCL;
+      FGpuWeightsDirty: boolean;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure ComputeIncremental();
       // Rebuild policy for the FA = sigmoid(a_raw) table, called from both
       // forwards. Outside a decode session the table is rebuilt
@@ -11278,6 +11285,19 @@ type
       // sessions. Coded by Claude (AI).
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
       procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      // The TNNetRecurrentDecodeBase residency contract (see there).
+      function StateBytes(): int64;
+      function StateOnOpenCL(): boolean;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -70149,6 +70169,9 @@ procedure TNNetDiagonalSSM.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
   FADirty := true;          // next forward rebuilds sigmoid(a_raw)
+  {$IFDEF OpenCL}
+  FGpuWeightsDirty := true; // next OpenCL forward re-uploads the tables
+  {$ENDIF}
 end;
 
 procedure TNNetDiagonalSSM.PrepareATable();
@@ -70169,6 +70192,9 @@ end;
 
 destructor TNNetDiagonalSSM.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FScanCL) then FScanCL.Free;
+  {$ENDIF}
   FDecodeH.Free;
   FGradE.Free;
   FGradC.Free;
@@ -70214,7 +70240,23 @@ var
   MaxD, MaxT, RowBytes: integer;
   HPtr, TmpPtr, XtPtr, OutPtr, StatePtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  // The OpenCL forward serves the full-sequence scan and the decode alike. It
+  // runs BEFORE any ForceOutputOnRAM because that download is what it avoids.
+  if WillOpenCL() then
+  begin
+    StartTime := Now();
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecodeH);
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -70332,9 +70374,9 @@ begin
   // needed (contrast the attention KV cache). FDecodeH is already sized by
   // SetPrevLayer; the ReSize is a no-op safety net for layers wired manually.
   FDecodeH.ReSize(1, 1, FOutput.Depth);
-  FDecodeH.Fill(0);
-  FDecodeSteps := 0;
+  ResetState();
   FADirty := true;          // force one rebuild at the start of the session
+  {$IFDEF OpenCL} FGpuWeightsDirty := true; {$ENDIF}
   FDecodeEnabled := true;
 end;
 
@@ -70348,10 +70390,12 @@ procedure TNNetDiagonalSSM.ResetState();
 begin
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetDiagonalSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
 begin
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecodeH); {$ENDIF}
   Dst.Copy(FDecodeH);
   Steps := FDecodeSteps;
 end;
@@ -70360,7 +70404,124 @@ procedure TNNetDiagonalSSM.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecodeH.Copy(Src);
   FDecodeSteps := Steps;
+  {$IFDEF OpenCL} if Assigned(FScanCL) then FScanCL.MarkStateWrittenOnRAM(); {$ENDIF}
 end;
+
+function TNNetDiagonalSSM.StateBytes(): int64;
+begin
+  Result := FDecodeH.GetMemSize();
+end;
+
+function TNNetDiagonalSSM.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL}
+  Result := Assigned(FScanCL) and FScanCL.StateOnOpenCL;
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetDiagonalSSM.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FScanCL)
+    then Result := FScanCL.NewOpenCLBuffer(FDecodeH.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetDiagonalSSM.CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetDiagonalSSM.CaptureStateToOpenCL: the layer' +
+      ' has no OpenCL path.');
+  FScanCL.CaptureStateToSlot(Slot, FDecodeH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetDiagonalSSM.RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer);
+begin
+  if not Assigned(FScanCL) then
+    raise Exception.Create('TNNetDiagonalSSM.RestoreStateFromOpenCL: the layer' +
+      ' has no OpenCL path.');
+  FScanCL.RestoreStateFromSlot(Slot, FDecodeH);
+  FDecodeSteps := Steps;
+end;
+
+function TNNetDiagonalSSM.WillOpenCL(): boolean;
+begin
+  // A source already in OpenCL memory puts the layer there whatever the size
+  // verdict says. The kernel writes no BPTT state cache: inference-only.
+  Result := Assigned(FScanCL) and FHasOpenCL and (not FIsTrainable)
+            and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetDiagonalSSM.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Not the inherited chain: this layer has no cai_activation opcode and owns
+  // a dedicated scan helper instead.
+  FHasOpenCL := true;
+  if not Assigned(FScanCL) then
+    FScanCL := TNNetChannelScanCL.Create(FNN, 'cai_diagonal_ssm_scan');
+  // Nothing is resident yet, whatever a previous weight update reported.
+  FGpuWeightsDirty := true;
+end;
+
+procedure TNNetDiagonalSSM.DisableOpenCL();
+begin
+  // FScanCL owns the buffers a kept output and a live decode state live in.
+  ForceOutputOnRAM();
+  if Assigned(FScanCL) then FScanCL.ForceStateOnRAM(FDecodeH);
+  inherited DisableOpenCL();
+  FreeAndNil(FScanCL);
+end;
+
+function TNNetDiagonalSSM.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetDiagonalSSM.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FScanCL) then Result := FScanCL.OutputKernel()
+  else Result := nil;
+end;
+
+// Whole-sequence recurrence in OpenCL memory. Outside a decode session h starts
+// at 0; inside one the bank carries FDecodeH, so a step stays resident.
+procedure TNNetDiagonalSSM.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+begin
+  // SeqLen contiguous Depth-long rows, the layout of every producer's buffer.
+  if PrevOutputOnOpenCLSameSize() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FScanCL.ForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  // A full-sequence forward uses the bank as scratch, so a decode state still
+  // living there has to come home first.
+  if FDecodeEnabled then FScanCL.EnsureStateOnOpenCL(FDecodeH)
+  else FScanCL.ForceStateOnRAM(FDecodeH);
+  if FGpuWeightsDirty then
+  begin
+    PrepareATable();
+    FScanCL.UploadWeights([FA, FNeurons[1].FWeights, FNeurons[2].FWeights,
+      FNeurons[3].FWeights]);
+    FGpuWeightsDirty := false;
+  end;
+  FScanCL.Compute(FPrevLayer.FOutput, FOutput, FDecodeH, FOutput.SizeX,
+    FOutput.Depth, {ResetState=}not FDecodeEnabled, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetDiagonalSSM.Backpropagate();
 var

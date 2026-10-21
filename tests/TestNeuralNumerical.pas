@@ -468,6 +468,9 @@ type
     // TokenShift prefill window, host snapshot hand-off, token decode, OpenCL
     // state slot round trip and reset, all on OpenCL, against the full CPU forward.
     procedure TokenShiftDecodeResidentOpenCLParity;
+    // The same two checks for TNNetDiagonalSSM (h = a*h + b*x; y = c*h + e*x).
+    procedure DiagonalSSMResidentChainOpenCLParity;
+    procedure DiagonalSSMDecodeResidentOpenCLParity;
     // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
     // memory between tokens, appended in place, so every step must match the
     // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
@@ -84072,6 +84075,16 @@ end;
 procedure TTestNeuralNumerical.TokenShiftDecodeResidentOpenCLParity;
 begin
   CheckChannelScanDecodeParity(TNNetTokenShift, 6);
+end;
+
+procedure TTestNeuralNumerical.DiagonalSSMResidentChainOpenCLParity;
+begin
+  CheckChannelScanResidentChainParity(TNNetDiagonalSSM, 6);
+end;
+
+procedure TTestNeuralNumerical.DiagonalSSMDecodeResidentOpenCLParity;
+begin
+  CheckChannelScanDecodeParity(TNNetDiagonalSSM, 6);
 end;
 
 function FusedSDPASplitOverride(Splits, ChunkRows,

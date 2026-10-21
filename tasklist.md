@@ -2053,11 +2053,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
   - [ ] The chat engine's checkpoint and prefill-window routes have not been
         run end to end on a real Mamba-2 or Nemotron-H checkpoint since the
         layer became recurrent; only the pico fixtures cover it.
-- [ ] `TNNetWKV` and `TNNetDiagonalSSM` device forward — the RWKV trunk, same
-      per-channel-scan recipe as `TNNetTokenShift` (landed: `cai_token_shift_scan`
-      on the shared `TNNetChannelScanCL` helper, decode state and checkpoint
-      slots in OpenCL memory; tiny_rwkv streamed decode covered on PoCL).
-      Lower priority only because fewer tested checkpoints use it.
+- [ ] `TNNetWKV` device forward — the RWKV trunk, same per-channel-scan recipe
+      as `TNNetTokenShift` and `TNNetDiagonalSSM` (landed: `cai_token_shift_scan`
+      / `cai_diagonal_ssm_scan` on the shared `TNNetChannelScanCL` helper, decode
+      state and checkpoint slots in OpenCL memory; tiny_rwkv streamed decode
+      covered on PoCL). Lower priority only because fewer tested checkpoints
+      use it.
 - [ ] Attention subclasses that override `Compute` and so lose
       `TNNetScaledDotProductAttention`'s device path:
   - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):

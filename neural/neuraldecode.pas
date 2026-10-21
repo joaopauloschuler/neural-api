@@ -6151,6 +6151,8 @@ class function TNNetStreamingDecoder.StateOnOpenCL(L: TNNetLayer): boolean;
 begin
   if L is TNNetRecurrentDecodeBase then
     Result := TNNetRecurrentDecodeBase(L).StateOnOpenCL()
+  else if L is TNNetDiagonalSSM then
+    Result := TNNetDiagonalSSM(L).StateOnOpenCL()
   else if L is TNNetTokenShift then
     Result := TNNetTokenShift(L).StateOnOpenCL()
   else Result := false;
@@ -6161,6 +6163,8 @@ class function TNNetStreamingDecoder.StateNewSlotOnOpenCL(L: TNNetLayer): cl_mem
 begin
   if L is TNNetRecurrentDecodeBase then
     Result := TNNetRecurrentDecodeBase(L).NewStateSlotOnOpenCL()
+  else if L is TNNetDiagonalSSM then
+    Result := TNNetDiagonalSSM(L).NewStateSlotOnOpenCL()
   else if L is TNNetTokenShift then
     Result := TNNetTokenShift(L).NewStateSlotOnOpenCL()
   else Result := nil;
@@ -6170,6 +6174,8 @@ class function TNNetStreamingDecoder.StateSlotBytes(L: TNNetLayer): int64;
 begin
   if L is TNNetRecurrentDecodeBase then
     Result := TNNetRecurrentDecodeBase(L).StateBytes()
+  else if L is TNNetDiagonalSSM then
+    Result := TNNetDiagonalSSM(L).StateBytes()
   else Result := TNNetTokenShift(L).StateBytes();
 end;
 
@@ -6178,6 +6184,8 @@ class procedure TNNetStreamingDecoder.StateCaptureToOpenCL(L: TNNetLayer;
 begin
   if L is TNNetRecurrentDecodeBase then
     TNNetRecurrentDecodeBase(L).CaptureStateToOpenCL(Slot, Steps)
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).CaptureStateToOpenCL(Slot, Steps)
   else TNNetTokenShift(L).CaptureStateToOpenCL(Slot, Steps);
 end;
 
@@ -6186,6 +6194,8 @@ class procedure TNNetStreamingDecoder.StateRestoreFromOpenCL(L: TNNetLayer;
 begin
   if L is TNNetRecurrentDecodeBase then
     TNNetRecurrentDecodeBase(L).RestoreStateFromOpenCL(Slot, Steps)
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).RestoreStateFromOpenCL(Slot, Steps)
   else TNNetTokenShift(L).RestoreStateFromOpenCL(Slot, Steps);
 end;
 {$ENDIF}
