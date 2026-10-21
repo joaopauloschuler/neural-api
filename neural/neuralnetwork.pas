@@ -8202,6 +8202,10 @@ type
     function FlashForwardIsExact(): boolean; override;
     // Both maps in one two-head flash launch, then out = Y1 - lambda*Y2.
     procedure RunFlashOnSource(SourceBuffer: cl_mem); override;
+    // The cached step runs the same two query heads over the resident cache.
+    function CachedStepIsExact(): boolean; override;
+    function CachedStepQueryHeads(): integer; override;
+    procedure RunCachedStepOnSource(SourceBuffer: cl_mem); override;
     {$ENDIF}
   public
     {$IFDEF OpenCL}
@@ -52146,6 +52150,26 @@ begin
     FFlashPairShape, {Int8KV=}false, sdpaPathFlash, FDk,
     {CacheMax=}FPrevLayer.FOutput.SizeX, {CacheSlot=}0, FCausal,
     FInvSqrtHalfDk, FNeurons[0].FWeights.Raw[0], SourceBuffer);
+end;
+
+function TNNetDifferentialAttention.CachedStepIsExact(): boolean;
+begin
+  Result := FlashForwardIsExact();
+end;
+
+function TNNetDifferentialAttention.CachedStepQueryHeads(): integer;
+begin
+  Result := 2;
+end;
+
+procedure TNNetDifferentialAttention.RunCachedStepOnSource(
+  SourceBuffer: cl_mem);
+begin
+  // Causal by construction, as ComputeIncremental: row t attends up to its slot.
+  FFusedSDPACL.ComputeDifferential(FPrevLayer.FOutput, FOutput,
+    FFlashPairShape, FKVQuantInt8, CachedStepPath(FPrevLayer.FOutput.SizeX),
+    FDk, FCacheMax, {CacheSlot=}FCacheLen, {Causal=}true, FInvSqrtHalfDk,
+    FNeurons[0].FWeights.Raw[0], SourceBuffer);
 end;
 {$ENDIF}
 

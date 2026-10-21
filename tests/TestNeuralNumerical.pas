@@ -563,11 +563,14 @@ type
     procedure SinkAttentionFlashOpenCLParity;
     // TNNetDifferentialAttention on one two-head cai_sdpa_flash launch plus the
     // combine vs the CPU: causal and not, key splits, a lambda update, host
-    // source and fallback, and the cached decode staying on the host.
+    // source and fallback, and a whole-input cached forward on OpenCL.
     procedure DifferentialAttentionFlashOpenCLParity;
     // Streamed decode of TNNetSinkAttention over the resident KV cache vs the
     // CPU: flash prefill, snapshot handoff, width-1 steps, rollback, restore.
     procedure SinkAttentionCachedDecodeOpenCLParity;
+    // The same streamed decode for TNNetDifferentialAttention (two query heads
+    // per KV head on the split decode, combine on OpenCL), FP32 and int8 KV.
+    procedure DifferentialAttentionCachedDecodeOpenCLParity;
     // AddMultiHeadSelfAttention (RoPE, 3 heads) with avSink / avDifferential:
     // every head on OpenCL with its resident source bound, output vs the CPU.
     procedure SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
@@ -85917,7 +85920,7 @@ var
     NNCpu, NNGpu: TNNet;
     Input: TNNetVolume;
     CpuAttn, GpuAttn: TNNetScaledDotProductAttention;
-    PassCnt, MaxOutputPos, GpuForwards, CachedGpuForwards: integer;
+    PassCnt, MaxOutputPos, GpuForwards: integer;
     Diff, MaxDiff, MaxAbsY: TNeuralFloat;
     What: string;
 
@@ -86021,14 +86024,10 @@ var
         FloatToStr(MaxDiff), WithinTolerance());
       AssertEquals(What + ': on OpenCL after a weight change', PassCount + 1,
         GpuAttn.ForwardGPUCnt);
-      // A cached forward of the whole input on the same OpenCL net matches the
-      // full forward of the same input: on OpenCL for the sink layer, on the
-      // host for the differential one.
+      // A cached forward of the whole input on the same OpenCL net runs on
+      // OpenCL too and matches the full forward of the same input.
       if Causal then
       begin
-        if Differential
-          then CachedGpuForwards := 0
-          else CachedGpuForwards := 1;
         GpuForwards := GpuAttn.ForwardGPUCnt;
         GpuAttn.BeginIncrementalDecode(SeqLen);
         NNGpu.Compute(Input);
@@ -86037,15 +86036,15 @@ var
         GpuAttn.EndIncrementalDecode();
         AssertTrue(What + ': cached decode max|diff| ' + FloatToStr(MaxDiff),
           WithinTolerance());
-        AssertEquals(What + ': cached decode forwards on OpenCL',
-          GpuForwards + CachedGpuForwards, GpuAttn.ForwardGPUCnt);
+        AssertEquals(What + ': cached decode on OpenCL', GpuForwards + 1,
+          GpuAttn.ForwardGPUCnt);
         // Back on the full forward, the flash path resumes.
         MaxDiff := 0;
         ComparePass();
         AssertTrue(What + ': max|diff| after the cached decode ' +
           FloatToStr(MaxDiff), WithinTolerance());
         AssertEquals(What + ': on OpenCL after the cached decode',
-          GpuForwards + CachedGpuForwards + 1, GpuAttn.ForwardGPUCnt);
+          GpuForwards + 2, GpuAttn.ForwardGPUCnt);
       end;
     finally
       Input.Free;
@@ -86083,6 +86082,11 @@ end;
 procedure TTestNeuralNumerical.SinkAttentionCachedDecodeOpenCLParity;
 begin
   CheckSinkOrDifferentialCachedDecodeParity({Differential=}false);
+end;
+
+procedure TTestNeuralNumerical.DifferentialAttentionCachedDecodeOpenCLParity;
+begin
+  CheckSinkOrDifferentialCachedDecodeParity({Differential=}true);
 end;
 
 procedure TTestNeuralNumerical.CheckSinkOrDifferentialCachedDecodeParity(

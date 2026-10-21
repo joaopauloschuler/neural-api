@@ -2130,10 +2130,16 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         into a second result buffer. Source bound, result resident, host
         fallback (`DifferentialAttentionFlashOpenCLParity`, max|diff| < 1.5e-6
         on PoCL). Open:
-    - [ ] The cached decode (`ComputeIncremental`, FP32 and int8 KV) still runs
-          on the host, pulling the [Q|K|V] pack to RAM every step.
+    - [X] The cached decode (`ComputeIncremental`, FP32 and int8 KV) now runs
+          over the resident KV cache (the `TNNetSinkAttention` machinery):
+          `TNNetFusedSDPACL.ComputeDifferential` packs [Q1,0 | 0,Q2], appends
+          K/V from the bound source, runs the split decode (width 1) or flash
+          with two query heads per KV head, then the combine; lambda stays a
+          kernel argument. `DifferentialAttentionCachedDecodeOpenCLParity`:
+          max|diff| <= 8.9e-7 (FP32 and int8) on PoCL, source bound and never
+          downloaded (sentinel), 0 transfers per steady step.
     - [ ] GPU-box: prefill tok/s of an `avDifferential` stack against the
-          parent commit.
+          parent commit, and decode tok/s with the resident cache.
 - [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and
       `TNNetCausalLinearAttention` (the non-causal `TNNetLinearAttention` already
       has a two-GEMM `ComputeOpenCL`). COUPLED, not independent: each is a
