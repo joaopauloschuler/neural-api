@@ -526,49 +526,71 @@ rather than acted on.
   - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
         UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
     - [ ] Real Stable Diffusion text-to-image from a diffusers folder (audit
-          2026-10-02). No example loads a real SD checkpoint today: every SD
-          example defaults to the tests/fixtures pico nets, and all of them fill
-          the UNet text input with random/synthetic states instead of CLIP over a
-          prompt (the EncStates fill in DiffusionInpainting.lpr, FillText in ControlNetCanny and
-          T2IAdapterSketch). ControlNetCanny/T2IAdapterSketch run ONE denoise step
-          and write no image. Missing pieces:
-      - [ ] `TStableDiffusionPipeline` in neuralpretrained.pas with the same
-            public shape as `TQwenImage21Pipeline` (Create(ModelFolder) over
+          2026-10-02). SD 1.x pipeline + CLI LANDED 2026-10-21 (8abce32d,
+          d7d07607, d55b7bfc, b764df66; pico parity vs a diffusers float64 run
+          on tests/fixtures/tiny_sd15 from tools/make_pico_sd_pipeline_fixture.py).
+          Done and open pieces:
+      - [X] `TStableDiffusionPipeline` (neuralpretrained.pas): Create over
             model_index.json + text_encoder/ tokenizer/ unet/ vae/ scheduler/,
-            TokenizePrompt, EncodePrompt, Denoise, DecodeLatents,
-            GenerateFromEmbeds, OnPhase/OnStep, load-use-free one component at a
-            time). Scheduler from scheduler/scheduler_config.json onto
-            TNNetDiffusionScheduler (dsScaledLinear; dpEps for SD 1.x, dpV for
-            SD 2.x 768). Latent (H/8,W/8,4) scaled by 1/0.18215 (SDXL 0.13025).
-      - [ ] CFG inside the SD loop: a cond + an empty-prompt uncond UNet pass per
-            step (twice the per-step cost).
-      - [ ] CLIP text encoder for SD: the text-only `CLIPTextModel` folder load
-            exists (`BuildClipTextTower`, used by `MarigoldEmptyPromptStates`,
-            tested by `TestMarigoldEmptyPromptStates`). SD 1.x feeds the
-            last hidden state (77 tokens, padded); SD 2.x the penultimate layer;
-            SDXL two encoders (CLIP-L + OpenCLIP-bigG) concatenated + the pooled
-            vector into SDUNetDenoiseSDXL.
-      - [ ] CLIP tokenizer from vocab.json + merges.txt: the SD 1.5 tokenizer/
-            folder is believed to ship no tokenizer.json, which is what
-            neuralhftokenizer.pas reads (unverified; else convert once).
-      - [ ] F16 weights: the safetensors reader decodes F16, but the SD UNet / VAE
-            loaders are unverified on the F16 (and *.fp16.safetensors variant)
-            files most SD repos ship.
-      - [ ] Resolution: the UNet TNNetInput is sized from Config.LatentGrid at
-            build, so each image size needs a rebuild (or a resizable input).
-      - [ ] Memory/speed: FP32 SD 1.5 UNet ~3.4 GB (over the 3 GB cap on the dev
-            box, so the first real run is on the user's box); int8/int4 UNet
-            weights (the int8 conv path exists, untried on this UNet), UNet
-            OpenCL arming, per-prompt caching of the text cross-attention K/V.
-      - [ ] CLI: either teach examples/QwenImage to pick the pipeline from
-            model_index.json `_class_name` (QwenImage21Pipeline vs
-            StableDiffusionPipeline) so the argument parsing / reporter / OpenCL
-            selection are shared, or a separate examples/StableDiffusion over the
-            same pipeline class. Then wire DiffusionInpainting / ControlNetCanny /
-            T2IAdapterSketch to the real CLIP text states and a full sampling loop.
-      - [ ] Per-component parity against diffusers on real weights (the ~/x venv
-            oracle recipe from the Qwen-Image project), SD 1.5 first, then SD 2.x,
-            then SDXL.
+            TokenizePrompt, EncodeTokenIds/EncodePrompt, MakeInitialLatents,
+            Denoise, DecodeLatents, GenerateFromEmbeds, Generate, OnPhase/OnStep;
+            each component built per stage and freed. Tests:
+            TestStableDiffusionPipeline{Tokens,Embeds,GuidedNoise,Parity,
+            RefusesBadSize} (embeds 1.0e-6, guided noise 8.2e-6, step latents
+            2.0e-5, image 1.1e-6).
+      - [X] CFG: cond + empty/negative-prompt uncond UNet pass per step through
+            TNNetDiffusionScheduler.ApplyCFG; Generate encodes both prompts in
+            one text-encoder load.
+      - [X] Scheduler config: timestep_spacing "leading" + steps_offset
+            (tsLeading, the SD 1.x/2.x default) and PNDM configs (no
+            clip_sample default) load into TNNetDiffusionScheduler.
+      - [X] SD 1.x CLIP text encoder: BuildClipTextTower last hidden state, 77
+            tokens padded with tokenizer_config's pad token.
+      - [X] CLIP tokenizer from vocab.json + merges.txt
+            (TNeuralHFTokenizer.LoadCLIPVocabAndMerges, TestCLIPVocabAndMergesParity).
+      - [X] Fixed ReadSDUNetConfigFromJSONText: attention_head_dim is the head
+            COUNT in diffusers (num_attention_heads or attention_head_dim); it
+            was read as a head dim, so real SD 1.5 built 40 heads instead of 8.
+            Pico configs now state the head counts their numpy oracles used.
+      - [X] CLI: examples/StableDiffusion (separate example; the QwenImage CLI
+            is typed to TQwenImage21Pipeline's phases and stats).
+      - [ ] Real-checkpoint run of SD 1.5 (runwayml/stable-diffusion-v1-5 F32
+            safetensors) on the user's GPU box with examples/StableDiffusion
+            --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
+            per-component parity against diffusers on the real weights (the ~/x
+            venv oracle recipe).
+      - [ ] Samplers per scheduler `_class_name`: the pipeline always runs DDIM
+            (eta 0); SD 1.5 ships PNDMScheduler (PLMS), others Euler / DPM++.
+            Map DPMSolverMultistep -> smDPMSolverPP2M and add PNDM/Euler with
+            pico parity.
+      - [ ] SD 2.x: v_prediction (dpV exists), use_linear_projection and the
+            head list [5,10,20,20] exist in the UNet importer, pad token "!"
+            is read from tokenizer_config. The SD 2.x text_encoder config is
+            believed to keep 23 of 24 layers (so its last hidden state is the
+            penultimate one; verify). Needs a pico SD 2.x fixture parity, then a
+            real 2.1 run.
+      - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
+            pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
+            the pipeline refuses addition_embed_type "text_time" today.
+      - [ ] F16 weights: the SD UNet / VAE / CLIP loaders are unverified on F16
+            and *.fp16.safetensors variant files (pick the variant by name).
+      - [ ] transformers >= 5 CLIPTextModel exports drop the `text_model.` key
+            prefix; BuildClipTextTower requires it (the pico fixture re-adds it).
+      - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
+            CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
+      - [ ] Resolution: images must be square; the UNet / VAE TNNetInput is
+            sized from one LatentGrid at build, so each size needs a rebuild
+            (or a resizable input) and non-square needs LatentGridX/Y.
+      - [ ] Memory/speed: int8/int4 UNet weights (QuantizeWeightsInt8 as in
+            TMarigoldPipeline), keep components loaded across prompts
+            (LoadComponents like TQwenImage21Pipeline), per-phase time/transfer
+            stats, per-prompt caching of the text cross-attention K/V.
+      - [ ] Wire DiffusionInpainting / ControlNetCanny / T2IAdapterSketch to the
+            real CLIP text states (TStableDiffusionPipeline.EncodePrompt) and a
+            full sampling loop; they still fill the UNet text input with
+            synthetic states, and ControlNet/T2I run one step and write no image.
+      - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
+            Marigold checkpoints (all read the same UNet config parser).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
