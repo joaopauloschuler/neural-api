@@ -1100,6 +1100,8 @@ type
     // windows, a global block; host and resident sources), and a resident chain.
     procedure SAMVisionAttentionOpenCLParity;
     procedure SAMVisionAttentionResidentChainOpenCL;
+    procedure BatchedWindowAttentionOpenCLParity;
+    procedure BatchedWindowAttentionResidentChainOpenCL;
     // TNNetLocalResponseNorm2D / Depth OpenCL forward vs CPU, and both in a
     // resident chain with ForceOpenCL off.
     procedure LocalResponseNormOpenCLParity;
@@ -1714,6 +1716,7 @@ type
     procedure TestGatherTokensZeroPadding;
     procedure TestBatchedWindowAttentionMatchesWindowAttention;
     procedure TestBatchedWindowAttentionGradientCheck;
+    procedure TestBatchedWindowAttentionChunkParity;
     procedure TestGEGLUForward;
     procedure TestGEGLUGradientCheck;
     procedure TestGEGLUErfGradientCheck;
@@ -11765,6 +11768,82 @@ begin
     AnalyticalGrad.Free;
     Desired.Free;
     InputPlus.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Random qkv-free setup of a TNNetBatchedWindowAttention: per-head bias in
+// [-0.5, 0.5] and region ids where window w uses pattern w mod 3 (0 = one
+// region, 1 = two regions split at the window middle, 2 = three regions).
+procedure SetBatchedWindowAttentionCase(Attn: TNNetBatchedWindowAttention;
+  Windows: integer);
+var
+  Bias: TNNetVolume;
+  RegionIds: TNeuralIntegerArray;
+  Head, ElementPos, WinPos, TokenPos, Tokens: integer;
+begin
+  Tokens := Attn.WindowTokens;
+  Bias := TNNetVolume.Create(Tokens * Tokens, 1, 1);
+  try
+    for Head := 0 to Attn.Heads - 1 do
+    begin
+      for ElementPos := 0 to Bias.Size - 1 do Bias.Raw[ElementPos] := Random - 0.5;
+      Attn.SetHeadBias(Head, Bias);
+    end;
+  finally
+    Bias.Free;
+  end;
+  RegionIds := nil;
+  SetLength(RegionIds, Windows * Tokens);
+  for WinPos := 0 to Windows - 1 do
+    for TokenPos := 0 to Tokens - 1 do
+      case WinPos mod 3 of
+        0: RegionIds[WinPos * Tokens + TokenPos] := 5;
+        1: RegionIds[WinPos * Tokens + TokenPos] := 5 + Ord(2 * TokenPos >= Tokens);
+        else RegionIds[WinPos * Tokens + TokenPos] := 7 + TokenPos mod 3;
+      end;
+  Attn.SetRegionIds(RegionIds);
+end;
+
+// The plane-chunked host forward (intra-layer threading) equals the serial one.
+procedure TTestNeuralNumerical.TestBatchedWindowAttentionChunkParity;
+const
+  cWindows = 5;
+  cTokens = 7;
+  cHeads = 3;
+  cHeadDim = 4;
+var
+  NN: TNNet;
+  Attn: TNNetBatchedWindowAttention;
+  Input, ParOut: TNNetVolume;
+  ElementPos: integer;
+begin
+  RandSeed := 5151;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cWindows * cTokens, 1, 3 * cHeads * cHeadDim);
+  ParOut := TNNetVolume.Create();
+  try
+    for ElementPos := 0 to Input.Size - 1 do Input.Raw[ElementPos] := Random * 2 - 1;
+    NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+    Attn := TNNetBatchedWindowAttention.Create(cHeads, cTokens);
+    NN.AddLayer(Attn);
+    SetBatchedWindowAttentionCase(Attn, cWindows);
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    NN.SetTrainable(False, False);
+    AssertTrue('chunk-eligible', Attn.ChunkEligible());
+    AssertEquals('one chunk unit per (window, head)', cWindows * cHeads,
+      Attn.ChunkWorkCount());
+    NN.Compute(Input, 0, True);
+    ParOut.Copy(Attn.Output);
+    NN.Compute(Input, 0, False);
+    AssertTrue('output non-trivial', Attn.Output.GetSumAbs() > 0);
+    for ElementPos := 0 to ParOut.Size - 1 do
+      AssertTrue('chunked = serial at ' + IntToStr(ElementPos),
+        ParOut.Raw[ElementPos] = Attn.Output.Raw[ElementPos]);
+  finally
+    ParOut.Free;
     Input.Free;
     NN.Free;
   end;
@@ -91706,6 +91785,194 @@ begin
     NN.GetLastLayer.ForceOutputOnRAM();
     MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
     WriteLn('  SAMVisionAttention resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('resident chain vs CPU max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    OpenCLTransferCounting := WasCounting;
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetBatchedWindowAttention under ForceOpenCL vs the host forward: bound
+// and uploaded sources, unaligned and aligned head dims, windows with no mask,
+// two mask patterns (one shared by two windows), a bias change that rebuilds
+// the tables, then a DisableOpenCL + EnableOpenCL re-arm. Coded by Claude (AI).
+procedure TTestNeuralNumerical.BatchedWindowAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 3;
+  WindowCounts: array[0..CaseCount-1] of integer = (5, 3, 2);
+  TokenCounts: array[0..CaseCount-1] of integer = (9, 16, 49);
+  HeadCounts: array[0..CaseCount-1] of integer = (3, 2, 3);
+  HeadDims: array[0..CaseCount-1] of integer = (5, 8, 32);
+var
+  NN: TNNet;
+  Input, OutCPUA, OutCPUB: TNNetVolume;
+  Attn: TNNetBatchedWindowAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CaseIdx, HostSource, ElementPos, GPUCntBeforeReArm: integer;
+  DiffA, DiffB, DiffC: TNeuralFloat;
+  SourceBindable: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for HostSource := 0 to 1 do
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(WindowCounts[CaseIdx] * TokenCounts[CaseIdx], 1,
+      3 * HeadCounts[CaseIdx] * HeadDims[CaseIdx]);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      RandSeed := 8200 + CaseIdx;
+      for ElementPos := 0 to Input.Size - 1 do
+        Input.Raw[ElementPos] := Random * 2 - 1;
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+      if HostSource = 1 then NN.AddLayer(TNNetIdentity.Create());
+      Attn := TNNetBatchedWindowAttention.Create(HeadCounts[CaseIdx],
+        TokenCounts[CaseIdx]);
+      NN.AddLayer(Attn);
+      NN.SetTrainable(False, False);
+      RandSeed := 8300 + CaseIdx;
+      SetBatchedWindowAttentionCase(Attn, WindowCounts[CaseIdx]);
+      NN.Compute(Input);
+      OutCPUA.Copy(Attn.Output);
+      SetBatchedWindowAttentionCase(Attn, WindowCounts[CaseIdx]);
+      NN.Compute(Input);
+      OutCPUB.Copy(Attn.Output);
+      RandSeed := 8300 + CaseIdx;
+      SetBatchedWindowAttentionCase(Attn, WindowCounts[CaseIdx]);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Attn.ForceOpenCL(True);
+      try
+        NN.Compute(Input);
+        SourceBindable := Attn.PrevLayer.OutputBindableOnOpenCL();
+        Attn.ForceOutputOnRAM();
+        DiffA := MaxAbsDiffToOutput(OutCPUA, Attn.Output);
+        SetBatchedWindowAttentionCase(Attn, WindowCounts[CaseIdx]);
+        NN.Compute(Input);
+        Attn.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffToOutput(OutCPUB, Attn.Output);
+        GPUCntBeforeReArm := Attn.ForwardGPUCnt;
+        // DisableOpenCL frees the helper; EnableOpenCL must rebuild its tables.
+        NN.DisableOpenCL();
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        Attn.ForceOpenCL(True);
+        NN.Compute(Input);
+        Attn.ForceOutputOnRAM();
+        DiffC := MaxAbsDiffToOutput(OutCPUB, Attn.Output);
+      finally
+        Attn.ForceOpenCL(False);
+      end;
+      WriteLn('  BatchedWindowAttention OpenCL windows=', WindowCounts[CaseIdx],
+        ' tokens=', TokenCounts[CaseIdx], ' heads=', HeadCounts[CaseIdx],
+        ' head_dim=', HeadDims[CaseIdx], ' host source=', HostSource,
+        ' bound=', SourceBindable, ': max|diff| A=', DiffA:0:9, ' B=', DiffB:0:9,
+        ' re-enabled=', DiffC:0:9);
+      AssertEquals('both forwards ran in OpenCL', 2, GPUCntBeforeReArm);
+      AssertEquals('the re-enabled forward ran in OpenCL', GPUCntBeforeReArm + 1,
+        Attn.ForwardGPUCnt);
+      AssertTrue('OpenCL vs CPU after DisableOpenCL + EnableOpenCL: max |diff| = ' +
+        FloatToStr(DiffC), DiffC < 1e-4);
+      AssertEquals('source residency follows the case', HostSource = 0,
+        SourceBindable);
+      AssertTrue('OpenCL vs CPU max |diff| = ' + FloatToStr(DiffA), DiffA < 1e-4);
+      AssertTrue('OpenCL vs CPU after a bias change: max |diff| = ' +
+        FloatToStr(DiffB), DiffB < 1e-4);
+    finally
+      OutCPUB.Free; OutCPUA.Free; Input.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv (qkv) -> TNNetBatchedWindowAttention
+// -> pointwise conv. The attention binds the resident qkv and keeps its output
+// resident (host copies keep a sentinel); one upload and one download per forward.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.BatchedWindowAttentionResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  cWindows = 4;
+  cTokens = 9;
+  cHeads = 2;
+  cHeadDim = 4;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Qkv, Proj: TNNetLayer;
+  Attn: TNNetBatchedWindowAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4848;
+  WasCounting := OpenCLTransferCounting;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cWindows * cTokens, 1, 6);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(cWindows * cTokens, 1, 6));
+    Qkv := NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * cHeads * cHeadDim));
+    Attn := TNNetBatchedWindowAttention.Create(cHeads, cTokens);
+    NN.AddLayer(Attn);
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+    NN.SetTrainable(False, False);
+    SetBatchedWindowAttentionCase(Attn, cWindows);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Qkv.Output.Fill(csSentinel);
+    Attn.Output.Fill(csSentinel);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    NN.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    WriteLn('  BatchedWindowAttention resident chain: gpu forwards qkv=',
+      Qkv.ForwardGPUCnt, ' attn=', Attn.ForwardGPUCnt, ' proj=',
+      Proj.ForwardGPUCnt, ' uploads=',
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    AssertTrue('the qkv conv must run in OpenCL', Qkv.ForwardGPUCnt >= 2);
+    AssertTrue('the attention must follow its resident source',
+      Attn.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident attention output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('qkv host output not downloaded', csSentinel,
+      Qkv.Output.Raw[0], 0);
+    AssertEquals('attention host output not downloaded', csSentinel,
+      Attn.Output.Raw[Attn.Output.Size - 1], 0);
+    AssertEquals('only the input is uploaded', 1,
+      TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+    AssertEquals('only the last layer is downloaded', 1,
+      TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, NN.GetLastLayer.Output);
+    WriteLn('  BatchedWindowAttention resident chain: max|diff|=', MaxDiff:0:9);
     AssertTrue('resident chain vs CPU max |diff| = ' + FloatToStr(MaxDiff),
       MaxDiff < 1e-4);
   finally

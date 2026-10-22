@@ -55970,7 +55970,7 @@ var
   NetInput: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  LayerPos, FirstBadLayer: integer;
+  LayerPos, FirstBadLayer, WindowAttnCnt, WindowAttnOnCLCnt: integer;
   LayerDiff, MaxDiff, OutputDiff: double;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -56008,8 +56008,20 @@ begin
       end;
       if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
     end;
+    WindowAttnCnt := 0;
+    WindowAttnOnCLCnt := 0;
+    for LayerPos := 1 to NN.CountLayers() - 1 do
+      if NN.Layers[LayerPos] is TNNetBatchedWindowAttention then
+      begin
+        Inc(WindowAttnCnt);
+        if NN.Layers[LayerPos].ForwardGPUCnt = 2 then Inc(WindowAttnOnCLCnt);
+      end;
     WriteLn('  BiRefNet OpenCL mask max|diff| = ', OutputDiff:0:9,
-      ' any layer = ', MaxDiff:0:9);
+      ' any layer = ', MaxDiff:0:9, ' window attention in OpenCL: ',
+      WindowAttnOnCLCnt, '/', WindowAttnCnt);
+    AssertTrue('the Swin blocks have window attention', WindowAttnCnt > 0);
+    AssertEquals('every window attention follows its resident qkv',
+      WindowAttnCnt, WindowAttnOnCLCnt);
     AssertTrue('mask OpenCL vs CPU max |diff| = ' + FloatToStr(OutputDiff) +
       ' must be < 1e-4', OutputDiff < 1e-4);
     AssertEquals('every layer OpenCL vs CPU within 1e-4', -1, FirstBadLayer);

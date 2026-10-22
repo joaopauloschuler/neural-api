@@ -5935,8 +5935,9 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // adds FScoreBias[FBiasBase + g*FBiasHeadStride + t*FBiasRowStride + key]
 // to each score of head g, or with FBiasKeyWidth W > 0 the decomposed bias of
 // key = kh*W + kw: entries kh and FBiasRowStride - W + kw of that bias row;
-// FHasSinks adds exp(FSinkLogits[h]) to head h's normalizer, in the merge
-// when FKeySplits > 1).
+// FHasBiasPlaneBase replaces g*FBiasHeadStride by FBiasPlaneBase[g], so
+// planes can share tables; FHasSinks adds exp(FSinkLogits[h]) to head h's
+// normalizer, in the merge when FKeySplits > 1).
 #define CAI_FLASH_LEADING_PARAMS \
   const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
   const int FDk, const int FCacheMax, const int FKeyBase, \
@@ -5950,7 +5951,8 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
   __global const float* FScoreBias, const int FBiasBase, \
   const int FBiasRowStride, const int FBiasLen, const int FBiasHeadStride, \
   const int FBiasKeyWidth, __global const float* FSinkLogits, \
-  const int FHasSinks
+  const int FHasSinks, __global const int* FBiasPlaneBase, \
+  const int FHasBiasPlaneBase
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
 // only: PoCL miscompiles a lane id divided by a run-time value.
@@ -6325,6 +6327,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   const int KAligned = (FDk & 3) == 0; \
   const int QAligned = KAligned && ((FXStride & 3) == 0); \
   const int BiasKeyDivisor = max(FBiasKeyWidth, 1); \
+  const int BiasPlaneOfs = FHasBiasPlaneBase ? FBiasPlaneBase[g] \
+    : g * FBiasHeadStride; \
   const float InvKeyWidth = 1.0f / (float)BiasKeyDivisor; \
   const int Slices = (Dk4 + Ds - 1) / Ds; \
   __global const KVType* KPlane = KSrc + g * FCacheMax * FDk; \
@@ -6380,7 +6384,7 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
         const int KeyLo = RowTable[2 * Br + row]; \
         const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
         /* The bias row of token row t = Row0 + row of head g (FGroupSize 1). */ \
-        const int BiasRow = FBiasBase + g * FBiasHeadStride \
+        const int BiasRow = FBiasBase + BiasPlaneOfs \
           + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride; \
         float PartMax = -1e30f; \
         _Pragma("unroll") \
