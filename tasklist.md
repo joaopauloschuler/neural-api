@@ -663,6 +663,40 @@ rather than acted on.
             copy of the text; HF lowercases Unicode (non-ASCII tokens differ).
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
+      - [ ] IP-Adapter image prompts in TStableDiffusionPipeline (port of
+            diffusers `load_ip_adapter` + `set_ip_adapter_scale` +
+            IPAdapterAttnProcessor, h94/IP-Adapter ip-adapter_sd15). Today
+            BuildIPAdapter builds only image_proj + ONE isolated decoupled
+            cross-attention block (TestIPAdapterParity); nothing taps it into the
+            UNet. Pieces, all reusing existing code:
+            (1) BuildSDUNet(pWithIPAdapter): AddSDTransformer2D gives every attn2
+                a second K/V pair (to_k_ip / to_v_ip over a NumImageTokens
+                TNNetInput, the same TNNetCrossAttention construction
+                BuildIPAdapter uses) whose output is added to the text
+                attention, times Scale, before to_out.0. The weights are
+                `ip_adapter.<idx>.to_{k,v}_ip.weight` with odd idx 1..31 for
+                SD 1.5; idx follows diffusers' attn_processors order
+                (module-registration order: down_blocks, up_blocks, then
+                mid_block; verify on the fixture). The IP K/V get quantized
+                along with the rest of the UNet when UNetInt8 is set.
+            (2) The image tokens: ClipPreprocessImage + BuildClipVisionTower
+                (models/image_encoder, CLIPVisionModelWithProjection ViT-H/14,
+                unnormalized `image_embeds`) -> the image_proj part of
+                BuildIPAdapter -> (NumImageTokens,1,CrossAttentionDim), computed
+                once per Generate. The unguided half of CFG uses image_proj of a
+                ZERO embedding (diffusers' negative_image_embeds), which is not
+                a zero token block.
+            (3) TStableDiffusionIPAdapter = class(TStableDiffusionConditioner)
+                with a UNetWithIPAdapter hook (like UNetWithControl /
+                UNetWithAdapter) that feeds the image-token input every UNet
+                pass, plus a Scale property.
+            Tests: extend tools/make_pico_sd_conditioning_fixtures.py with a
+            pico IP-Adapter + pico CLIP vision tower; 3 DDIM steps + the image
+            vs diffusers float64 < 1e-4, and Scale = 0 matching the plain
+            pipeline. CLI: `--ip-adapter FILE --ip-image PNG --ip-scale S` in
+            examples/StableDiffusion + its README. Out of scope: IP-Adapter-Plus
+            (Resampler image_proj over the penultimate hidden states), FaceID,
+            SDXL, combining it with ControlNet / T2I-Adapter.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
