@@ -58,6 +58,9 @@ type
     // pico AutoencoderTiny decoder and checks "image" to 1e-4.
     procedure CheckTinyVaeDecoderParity(const FixtureName: string;
       ExpectedLatentChannels: integer);
+    // SuperPoint from the LightGlue checkpoint, then TLightGlueMatcher, against
+    // tests/fixtures/<FixtureName>_io.json (make_pico_lightglue_fixture.py).
+    procedure CheckLightGlueParity(const FixtureName: string);
     // Loads the fixture's "latent" (shaped by Config) and "image" tensors.
     procedure LoadTinyVaeDecoderIO(const FixtureName: string;
       const Config: TTinyVaeDecoderConfig; Latent, Image: TNNetVolume);
@@ -1256,6 +1259,12 @@ type
     procedure TestSuperPointParity;
     procedure TestSuperPointPreprocess;
     procedure TestSuperPointRejectsUnalignedInput;
+    procedure TestLightGlueConfigFromJSONFile;
+    // descriptor_dim 16 over 8-channel SuperPoint descriptors (input_projection).
+    procedure TestLightGlueParity;
+    // Identity input projection and 2 query heads over 1 key/value head.
+    procedure TestLightGlueGQAParity;
+    procedure TestLightGlueNoKeypoints;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -48690,6 +48699,202 @@ begin
   end;
   NN.Free;
   AssertTrue('error names the multiple: ' + Msg, Pos('multiple of 8', Msg) > 0);
+end;
+
+// ReadLightGlueConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestLightGlueConfigFromJSONFile;
+var
+  Config: TLightGlueConfig;
+begin
+  Config := ReadLightGlueConfigFromJSONFile(
+    FixturePath('tiny_lightglue_gqa_config.json'), 64, 48);
+  AssertEquals('descriptor dim', 8, Config.DescriptorDim);
+  AssertEquals('layers', 2, Config.NumHiddenLayers);
+  AssertEquals('heads', 2, Config.NumAttentionHeads);
+  AssertEquals('key/value heads', 1, Config.NumKeyValueHeads);
+  AssertEquals('filter threshold', 0.05, Config.FilterThreshold, 1e-6);
+  AssertEquals('depth confidence', 0.95, Config.DepthConfidence, 1e-6);
+  AssertEquals('width confidence', 0.99, Config.WidthConfidence, 1e-6);
+  AssertTrue('attention bias', Config.AttentionBias);
+  AssertEquals('detector descriptor dim', 8,
+    Config.KeypointDetector.DescriptorDecoderDim);
+  AssertEquals('detector nms radius', 2, Config.KeypointDetector.NmsRadius);
+  AssertEquals('detector input width', 64, Config.KeypointDetector.InputWidth);
+end;
+
+procedure TTestNeuralPretrained.CheckLightGlueParity(const FixtureName: string);
+var
+  Config: TLightGlueConfig;
+  Detector: TNNet;
+  Matcher: TLightGlueMatcher;
+  Keypoints: array[0..1] of TSuperPointKeypoints;
+  Images: array[0..1] of TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Cases, Arr: TJSONArray;
+  CaseObj: TJSONObject;
+  Width, Height, CasePos, MaxCasePos, Side, ElemPos, MaxElemPos: integer;
+  PointPos, MaxPointPos, DescriptorBase: integer;
+  MaxDiff, ScoreDiff: double;
+  Context: string;
+begin
+  Matcher := nil;
+  Detector := nil;
+  Keypoints[0] := TSuperPointKeypoints.Create();
+  Keypoints[1] := TSuperPointKeypoints.Create();
+  Images[0] := TNNetVolume.Create();
+  Images[1] := TNNetVolume.Create();
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath(FixtureName + '_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    Matcher := BuildLightGlueFromSafeTensors(
+      FixturePath(FixtureName + '.safetensors'), Config, {pThreaded=}true,
+      FixturePath(FixtureName + '_config.json'));
+    Config.KeypointDetector.InputWidth := Width;
+    Config.KeypointDetector.InputHeight := Height;
+    Detector := BuildLightGlueKeypointDetectorFromSafeTensors(
+      FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    MaxCasePos := Cases.Count - 1;
+    for CasePos := 0 to MaxCasePos do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      for Side := 0 to 1 do
+      begin
+        Images[Side].ReSize(Width, Height, 1);
+        Arr := TJSONArray(CaseObj.Find('image' + IntToStr(Side)));
+        MaxElemPos := Images[Side].Size - 1;
+        for ElemPos := 0 to MaxElemPos do
+          Images[Side].FData[ElemPos] := Arr.Items[ElemPos].AsFloat;
+        Keypoints[Side].Detect(Detector, Images[Side], Config.KeypointDetector);
+        Context := FixtureName + ' case ' + IntToStr(CasePos) + ' side ' +
+          IntToStr(Side);
+        Arr := TJSONArray(CaseObj.Find('keypoints' + IntToStr(Side)));
+        AssertEquals(Context + ' keypoint count', Arr.Count div 2,
+          Keypoints[Side].Count);
+        MaxPointPos := Keypoints[Side].Count - 1;
+        for PointPos := 0 to MaxPointPos do
+        begin
+          AssertEquals(Context + ' x ' + IntToStr(PointPos),
+            Arr.Items[2 * PointPos].AsInteger, Keypoints[Side].X[PointPos]);
+          AssertEquals(Context + ' y ' + IntToStr(PointPos),
+            Arr.Items[2 * PointPos + 1].AsInteger, Keypoints[Side].Y[PointPos]);
+        end;
+      end;
+      Matcher.Match(Keypoints[0], Keypoints[1], Width, Height);
+      for Side := 0 to 1 do
+      begin
+        Context := FixtureName + ' case ' + IntToStr(CasePos) + ' side ' +
+          IntToStr(Side);
+        Arr := TJSONArray(CaseObj.Find('descriptors' + IntToStr(Side)));
+        if Side = 0 then DescriptorBase := 0
+        else DescriptorBase := Matcher.Count0 * Config.DescriptorDim;
+        AssertEquals(Context + ' descriptor count', Arr.Count,
+          Keypoints[Side].Count * Config.DescriptorDim);
+        MaxDiff := 0;
+        MaxElemPos := Arr.Count - 1;
+        for ElemPos := 0 to MaxElemPos do
+          MaxDiff := Max(MaxDiff, Abs(Arr.Items[ElemPos].AsFloat -
+            Matcher.Descriptors.FData[DescriptorBase + ElemPos]));
+        AssertTrue(Context + ' descriptors max |diff| = ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-4);
+        Arr := TJSONArray(CaseObj.Find('matches' + IntToStr(Side)));
+        MaxPointPos := Keypoints[Side].Count - 1;
+        ScoreDiff := 0;
+        for PointPos := 0 to MaxPointPos do
+        begin
+          if Side = 0 then
+          begin
+            AssertEquals(Context + ' match ' + IntToStr(PointPos),
+              Arr.Items[PointPos].AsInteger, Matcher.Matches0[PointPos]);
+            ScoreDiff := Max(ScoreDiff, Abs(Matcher.MatchScores0[PointPos] -
+              TJSONArray(CaseObj.Find('scores0')).Items[PointPos].AsFloat));
+          end
+          else
+          begin
+            AssertEquals(Context + ' match ' + IntToStr(PointPos),
+              Arr.Items[PointPos].AsInteger, Matcher.Matches1[PointPos]);
+            ScoreDiff := Max(ScoreDiff, Abs(Matcher.MatchScores1[PointPos] -
+              TJSONArray(CaseObj.Find('scores1')).Items[PointPos].AsFloat));
+          end;
+        end;
+        AssertTrue(Context + ' scores max |diff| = ' + FloatToStr(ScoreDiff),
+          ScoreDiff < 1e-4);
+      end;
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    Images[1].Free;
+    Images[0].Free;
+    Keypoints[1].Free;
+    Keypoints[0].Free;
+    Detector.Free;
+    Matcher.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestLightGlueParity;
+begin
+  CheckLightGlueParity('tiny_lightglue');
+end;
+
+procedure TTestNeuralPretrained.TestLightGlueGQAParity;
+begin
+  CheckLightGlueParity('tiny_lightglue_gqa');
+end;
+
+// An image without keypoints matches nothing on either side.
+procedure TTestNeuralPretrained.TestLightGlueNoKeypoints;
+var
+  Config: TLightGlueConfig;
+  Detector: TNNet;
+  Matcher: TLightGlueMatcher;
+  Found, Empty: TSuperPointKeypoints;
+  Image: TNNetVolume;
+  PointPos, MaxPointPos: integer;
+begin
+  Matcher := BuildLightGlueFromSafeTensors(
+    FixturePath('tiny_lightglue.safetensors'), Config, {pThreaded=}false,
+    FixturePath('tiny_lightglue_config.json'));
+  Config.KeypointDetector.InputWidth := 64;
+  Config.KeypointDetector.InputHeight := 48;
+  Detector := BuildLightGlueKeypointDetectorFromSafeTensors(
+    FixturePath('tiny_lightglue.safetensors'), Config, {pTrainable=}false);
+  Found := TSuperPointKeypoints.Create();
+  Empty := TSuperPointKeypoints.Create();
+  Image := TNNetVolume.Create(64, 48, 1);
+  try
+    MaxPointPos := Image.Size - 1;
+    for PointPos := 0 to MaxPointPos do
+      Image.FData[PointPos] := Frac(Abs(Sin(PointPos * 12.9898)) * 43758.5453);
+    Found.Detect(Detector, Image, Config.KeypointDetector);
+    AssertTrue('some keypoints', Found.Count > 0);
+    Config.KeypointDetector.KeypointThreshold := 2;
+    Empty.Detect(Detector, Image, Config.KeypointDetector);
+    AssertEquals('no keypoints above 2', 0, Empty.Count);
+    Matcher.Match(Found, Empty, 64, 48);
+    AssertEquals('count 0', Found.Count, Matcher.Count0);
+    AssertEquals('count 1', 0, Matcher.Count1);
+    MaxPointPos := Found.Count - 1;
+    for PointPos := 0 to MaxPointPos do
+    begin
+      AssertEquals('unmatched ' + IntToStr(PointPos), -1,
+        Matcher.Matches0[PointPos]);
+      AssertEquals('zero score ' + IntToStr(PointPos), 0,
+        Matcher.MatchScores0[PointPos], 0);
+    end;
+  finally
+    Image.Free;
+    Empty.Free;
+    Found.Free;
+    Detector.Free;
+    Matcher.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;

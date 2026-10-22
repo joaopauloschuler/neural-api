@@ -154,7 +154,6 @@ type
     procedure LSTMProjectionJob(Index, ThreadNum: integer);
     procedure LSTMRecurrenceJob(Index, ThreadNum: integer);
     procedure RunLSTMDirection(Direction: integer);
-    class procedure GrowScratch(V: TNNetVolume; FloatCount: integer);
     class procedure CheckSequence(V: TNNetVolume; Channels: integer;
       const OpName: string);
   public
@@ -162,6 +161,8 @@ type
     // it); pThreaded = false runs every op on the calling thread.
     constructor Create(pThreaded: boolean = true; pTilePositions: integer = 36);
     destructor Destroy(); override;
+    // Grows V to at least FloatCount floats and never shrinks it.
+    class procedure GrowScratch(V: TNNetVolume; FloatCount: integer);
     // torch Conv1d (zero padding, dilation); PaddingRight only sets the length.
     procedure Conv1D(Input, Output: TNNetVolume; Weights: TNNetPlainConvWeights;
       Stride, Dilation, PaddingLeft, PaddingRight: integer); overload;

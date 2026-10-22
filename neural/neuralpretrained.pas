@@ -14096,6 +14096,11 @@ type
 function ReadSuperPointConfigFromJSONFile(const FileName: string;
   pInputWidth: integer = 640; pInputHeight: integer = 480): TSuperPointConfig;
 
+// The same fields from a parsed config object (nil = every default); Source
+// names the origin in error messages.
+function ReadSuperPointConfigFromJSONObject(Obj: TJSONObject;
+  pInputWidth, pInputHeight: integer; const Source: string): TSuperPointConfig;
+
 function SuperPointConfigToString(const Config: TSuperPointConfig): string;
 
 // Pixel side of one score-head cell: 2^(encoder blocks - 1), 8 for SuperPoint.
@@ -14162,6 +14167,121 @@ type
     property Scores[Index: integer]: TNeuralFloat read GetScore;
     property Descriptors: TNNetVolume read FDescriptors;
   end;
+
+// ---------------------------------------------------------------------------
+// LightGlue keypoint matching (Lindenberger et al. 2023; transformers
+// model_type "lightglue", ETH-CVG/lightglue_superpoint) over two
+// TSuperPointKeypoints sets. Per layer: self-attention with a rotary whose
+// angles are a learned linear map of the normalized keypoint coordinates,
+// then cross-attention to the other image (shared weights both ways), each
+// followed by MLP(concat[x, attention]) + residual. The match head is a
+// similarity + matchability double log-softmax with a mutual nearest-neighbour
+// check above filter_threshold. Host-side on TNNetPlainOps (the keypoint
+// counts change per pair); every layer runs: no early exit, no point pruning.
+// ---------------------------------------------------------------------------
+type
+  TLightGlueConfig = record
+    DescriptorDim: integer;          // 256
+    NumHiddenLayers: integer;        // 9
+    NumAttentionHeads: integer;      // 4
+    NumKeyValueHeads: integer;       // = NumAttentionHeads when absent
+    DepthConfidence: TNeuralFloat;   // 0.95, early exit (not run)
+    WidthConfidence: TNeuralFloat;   // 0.99, point pruning (not run)
+    FilterThreshold: TNeuralFloat;   // 0.1
+    AttentionBias: boolean;          // true
+    HiddenAct: string;               // 'gelu' (erf)
+    KeypointDetector: TSuperPointConfig;
+    ModelType: string;               // 'lightglue'
+  end;
+
+// Reads a transformers LightGlue config.json, keypoint_detector_config
+// included (its SuperPoint input is pInputWidth x pInputHeight).
+function ReadLightGlueConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer = 640; pInputHeight: integer = 480): TLightGlueConfig;
+
+function LightGlueConfigToString(const Config: TLightGlueConfig): string;
+
+type
+  // Weights of one attention + MLP block (self or cross); QKV holds the q
+  // rows (pre-scaled by 1/sqrt(head_dim)), then the k rows, then the v rows.
+  TLightGlueBlockWeights = record
+    QKV, Output, FC1, FC2: TNNetPlainConvWeights;
+    NormGain, NormBias: TNNetVolume;
+  end;
+
+  TLightGlueMatcher = class(TObject)
+  private
+    FConfig: TLightGlueConfig;
+    FOps: TNNetPlainOps;
+    FInputProjection: TNNetPlainConvWeights; // nil = identity
+    FPositionProjector: TNNetVolume;         // [HeadDim/2][2]
+    FBlocks: array of TLightGlueBlockWeights; // 2 per layer: self, cross
+    FFinalProjection, FMatchability: TNNetPlainConvWeights;
+    FHeadDim, FKeyValueDim, FQKVWidth: integer;
+    // Scratch reused across calls; token rows are image A's then image B's.
+    FInput, FHidden, FQKV, FAttention, FProjected, FConcat: TNNetVolume;
+    FMLPHidden, FMLPOut, FGeluScratch, FAngles, FCos, FSin: TNNetVolume;
+    FKeyRows, FValueRowsT, FPackedKeys, FPackedValues, FScores: TNNetVolume;
+    FMatchDescriptors, FMatchLogits, FPackedMatch: TNNetVolume;
+    FSimilarity, FSimilarityT, FExpScratch: TNNetVolume;
+    FRowLogSumExp, FColumnLogSumExp, FLogSigmoid: TNeuralFloatDynArr;
+    FColumnBest: TNeuralFloatDynArr;
+    FCount0, FCount1: integer;
+    FMatches0, FMatches1, FColumnArgMax: TNeuralIntegerArray;
+    FMatchScores0, FMatchScores1: TNeuralFloatDynArr;
+    procedure FreeWeights();
+    // Rotates the q and k slices of FQKV rows by the per-token FCos / FSin.
+    procedure ApplyRotary(TokenCount: integer);
+    // Multi-head attention of FQKV query rows [QueryStart, +QueryCount) over
+    // key/value rows [KeyStart, +KeyCount) into the same FAttention rows.
+    procedure Attend(QueryStart, QueryCount, KeyStart, KeyCount: integer);
+    // In place on FMLPHidden: per-token LayerNorm (eps 1e-5), then erf GELU.
+    procedure LayerNormGelu(const Block: TLightGlueBlockWeights);
+    procedure RunBlock(const Block: TLightGlueBlockWeights; IsCross: boolean);
+    procedure AssignMatches();
+    function GetMatch0(Index: integer): integer;
+    function GetMatch1(Index: integer): integer;
+    function GetMatchScore0(Index: integer): TNeuralFloat;
+    function GetMatchScore1(Index: integer): TNeuralFloat;
+  public
+    // pThreaded = false runs the per-token linears on the calling thread.
+    constructor Create(const pConfig: TLightGlueConfig; pThreaded: boolean = true);
+    destructor Destroy(); override;
+    // Loads every matcher tensor except token_confidence (early exit only).
+    procedure LoadWeights(Reader: TNNetSafeTensorsReader);
+    // Matches the keypoints of two ImageWidth x ImageHeight images (the
+    // SuperPoint net input size): Matches0[i] is the B index of A's i or -1.
+    procedure Match(KeypointsA, KeypointsB: TSuperPointKeypoints;
+      ImageWidth, ImageHeight: integer);
+    property Config: TLightGlueConfig read FConfig;
+    // Score a mutual match must exceed; read by the next Match.
+    property FilterThreshold: TNeuralFloat read FConfig.FilterThreshold
+      write FConfig.FilterThreshold;
+    property Count0: integer read FCount0;
+    property Count1: integer read FCount1;
+    property Matches0[Index: integer]: integer read GetMatch0;
+    property Matches1[Index: integer]: integer read GetMatch1;
+    property MatchScores0[Index: integer]: TNeuralFloat read GetMatchScore0;
+    property MatchScores1[Index: integer]: TNeuralFloat read GetMatchScore1;
+    // (Count0 + Count1, 1, DescriptorDim) after the last layer, A rows first.
+    property Descriptors: TNNetVolume read FHidden;
+  end;
+
+function BuildLightGlue(Reader: TNNetSafeTensorsReader;
+  const Config: TLightGlueConfig; pThreaded: boolean = true): TLightGlueMatcher;
+
+function BuildLightGlueFromSafeTensorsEx(const FileName: string;
+  const Config: TLightGlueConfig; pThreaded: boolean = true): TLightGlueMatcher;
+
+// Reads config.json beside FileName ('' = "config.json" next to it).
+function BuildLightGlueFromSafeTensors(const FileName: string;
+  out Config: TLightGlueConfig; pThreaded: boolean = true;
+  const ConfigFileName: string = ''): TLightGlueMatcher;
+
+// The SuperPoint net stored inside a LightGlue checkpoint (keypoint_detector.*),
+// built for Config.KeypointDetector.
+function BuildLightGlueKeypointDetectorFromSafeTensors(const FileName: string;
+  const Config: TLightGlueConfig; pTrainable: boolean = true): TNNet;
 
 type
   // ViTPose human-pose KEYPOINT-estimation config (model_type "vitpose"; the
@@ -14896,6 +15016,38 @@ procedure LoadImportJSONText(JsonText: TStrings; const FileName: string);
 begin
   RaiseIfGitLfsPointer(FileName, EPretrainedImportError);
   JsonText.LoadFromFile(FileName);
+end;
+
+// Reads and parses FileName as a JSON object (errors name ImporterName); the
+// caller frees the result.
+function LoadImportJSONObject(const FileName, ImporterName: string): TJSONObject;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
+  if not FileExists(FileName) then
+    ImportError(ImporterName + ' import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(ImporterName + ' import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+    begin
+      FreeAndNil(Root);
+      ImportError(ImporterName + ' import: config "' + FileName +
+        '" is not a JSON object.');
+    end;
+  finally
+    JsonText.Free;
+  end;
+  Result := TJSONObject(Root);
 end;
 
 function CreatePretrainedTensorReader(
@@ -72149,33 +72301,8 @@ end;
 
 // Reads and parses a VAE config file; the caller frees the returned object.
 function LoadVaeConfigJSONObject(const FileName: string): TJSONObject;
-var
-  JsonText: TStringList;
-  Root: TJSONData;
 begin
-  if not FileExists(FileName) then
-    ImportError('VAE import: config file not found: ' + FileName);
-  JsonText := TStringList.Create;
-  Root := nil;
-  try
-    LoadImportJSONText(JsonText, FileName);
-    try
-      Root := GetJSON(JsonText.Text);
-    except
-      on E: Exception do
-        ImportError('VAE import: config "' + FileName +
-          '" is not valid JSON (' + E.Message + ').');
-    end;
-    if not (Root is TJSONObject) then
-    begin
-      FreeAndNil(Root);
-      ImportError('VAE import: config "' + FileName +
-        '" is not a JSON object.');
-    end;
-  finally
-    JsonText.Free;
-  end;
-  Result := TJSONObject(Root);
+  Result := LoadImportJSONObject(FileName, 'VAE');
 end;
 
 function ReadVaeDecoderConfigFromJSONFile(
@@ -87576,34 +87703,22 @@ begin
 end;
 
 // ------------------------------- SuperPoint --------------------------------
-function ReadSuperPointConfigFromJSONFile(const FileName: string;
-  pInputWidth: integer; pInputHeight: integer): TSuperPointConfig;
+function ReadSuperPointConfigFromJSONObject(Obj: TJSONObject;
+  pInputWidth, pInputHeight: integer; const Source: string): TSuperPointConfig;
 var
-  JsonText: TStringList;
-  Root: TJSONData;
-  Obj: TJSONObject;
+  EmptyObj: TJSONObject;
 begin
-  if not FileExists(FileName) then
-    ImportError('SuperPoint import: config file not found: ' + FileName);
-  JsonText := TStringList.Create;
-  Root := nil;
+  EmptyObj := nil;
+  if Obj = nil then
+  begin
+    EmptyObj := TJSONObject.Create;
+    Obj := EmptyObj;
+  end;
   try
-    LoadImportJSONText(JsonText, FileName);
-    try
-      Root := GetJSON(JsonText.Text);
-    except
-      on E: Exception do
-        ImportError('SuperPoint import: config "' + FileName +
-          '" is not valid JSON (' + E.Message + ').');
-    end;
-    if not (Root is TJSONObject) then
-      ImportError('SuperPoint import: config "' + FileName +
-        '" is not a JSON object.');
-    Obj := TJSONObject(Root);
     Result.ModelType := Obj.Get('model_type', 'superpoint');
     if LowerCase(Result.ModelType) <> 'superpoint' then
-      ImportError('SuperPoint import: model_type is "' + Result.ModelType +
-        '", expected "superpoint".');
+      ImportError('SuperPoint import: model_type in ' + Source + ' is "' +
+        Result.ModelType + '", expected "superpoint".');
     Result.EncoderHiddenSizes := ReadJSONIntArray(Obj, 'encoder_hidden_sizes',
       [64, 64, 128, 128]);
     Result.DecoderHiddenSize := Obj.Get('decoder_hidden_size', 256);
@@ -87616,8 +87731,21 @@ begin
     Result.InputWidth := pInputWidth;
     Result.InputHeight := pInputHeight;
   finally
-    Root.Free;
-    JsonText.Free;
+    EmptyObj.Free;
+  end;
+end;
+
+function ReadSuperPointConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer; pInputHeight: integer): TSuperPointConfig;
+var
+  Obj: TJSONObject;
+begin
+  Obj := LoadImportJSONObject(FileName, 'SuperPoint');
+  try
+    Result := ReadSuperPointConfigFromJSONObject(Obj, pInputWidth, pInputHeight,
+      '"' + FileName + '"');
+  finally
+    Obj.Free;
   end;
 end;
 
@@ -88065,6 +88193,743 @@ begin
   ScoreLayer.ForceOutputOnRAM();
   DescriptorLayer.ForceOutputOnRAM();
   Extract(ScoreLayer.Output, DescriptorLayer.Output, Config);
+end;
+
+// ------------------------------- LightGlue ---------------------------------
+function ReadLightGlueConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer; pInputHeight: integer): TLightGlueConfig;
+var
+  Obj, DetectorObj: TJSONObject;
+  Field: TJSONData;
+begin
+  Obj := LoadImportJSONObject(FileName, 'LightGlue');
+  try
+    Result.ModelType := Obj.Get('model_type', 'lightglue');
+    if LowerCase(Result.ModelType) <> 'lightglue' then
+      ImportError('LightGlue import: model_type is "' + Result.ModelType +
+        '", expected "lightglue".');
+    Result.DescriptorDim := Obj.Get('descriptor_dim', 256);
+    Result.NumHiddenLayers := Obj.Get('num_hidden_layers', 9);
+    Result.NumAttentionHeads := Obj.Get('num_attention_heads', 4);
+    Field := Obj.Find('num_key_value_heads');
+    if (Field = nil) or (Field.JSONType = jtNull) then
+      Result.NumKeyValueHeads := Result.NumAttentionHeads
+    else
+      Result.NumKeyValueHeads := Field.AsInteger;
+    Result.DepthConfidence := Obj.Get('depth_confidence', 0.95);
+    Result.WidthConfidence := Obj.Get('width_confidence', 0.99);
+    Result.FilterThreshold := Obj.Get('filter_threshold', 0.1);
+    Result.AttentionBias := Obj.Get('attention_bias', true);
+    Result.HiddenAct := Obj.Get('hidden_act', 'gelu');
+    Field := Obj.Find('keypoint_detector_config');
+    if Field is TJSONObject then DetectorObj := TJSONObject(Field)
+    else DetectorObj := nil;
+    Result.KeypointDetector := ReadSuperPointConfigFromJSONObject(DetectorObj,
+      pInputWidth, pInputHeight, 'keypoint_detector_config of "' +
+      FileName + '"');
+  finally
+    Obj.Free;
+  end;
+end;
+
+function LightGlueConfigToString(const Config: TLightGlueConfig): string;
+begin
+  Result := Config.ModelType + ' config: descriptor_dim=' +
+    IntToStr(Config.DescriptorDim) +
+    ', num_hidden_layers=' + IntToStr(Config.NumHiddenLayers) +
+    ', num_attention_heads=' + IntToStr(Config.NumAttentionHeads) +
+    ', num_key_value_heads=' + IntToStr(Config.NumKeyValueHeads) +
+    ', filter_threshold=' + FloatToStr(Config.FilterThreshold) +
+    ', depth_confidence=' + FloatToStr(Config.DepthConfidence) +
+    ', width_confidence=' + FloatToStr(Config.WidthConfidence) +
+    ' (early exit and pruning not run); keypoint detector: ' +
+    SuperPointConfigToString(Config.KeypointDetector);
+end;
+
+// Loads Name into Dest after checking it holds ExpectedCount elements.
+procedure LoadLightGlueTensor(Reader: TNNetSafeTensorsReader;
+  const Name: string; Dest: TNNetVolume; ExpectedCount: integer);
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError('LightGlue import: tensor "' + Name + '" not found.');
+  if Reader.ElementCount(Name) <> ExpectedCount then
+    ImportError('LightGlue import: "' + Name + '" is ' +
+      Reader.ShapeAsString(Name) + ', expected ' + IntToStr(ExpectedCount) +
+      ' elements.');
+  Reader.LoadTensorFlat(Name, Dest);
+end;
+
+// Copies nn.Linear Prefix (weight [OutDim][InDim], bias when HasBias) times
+// Scale into rows [RowOffset, RowOffset + OutDim) of Weight and Bias.
+procedure LoadLightGlueLinearRows(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; InDim, OutDim, RowOffset: integer; HasBias: boolean;
+  Scale: TNeuralFloat; Weight, Bias, Scratch: TNNetVolume);
+begin
+  LoadLightGlueTensor(Reader, Prefix + '.weight', Scratch, OutDim * InDim);
+  if Scale <> 1 then Scratch.Mul(Scale);
+  Move(Scratch.FData[0], Weight.FData[RowOffset * InDim],
+    OutDim * InDim * csNeuralFloatSize);
+  if HasBias then
+  begin
+    LoadLightGlueTensor(Reader, Prefix + '.bias', Scratch, OutDim);
+    if Scale <> 1 then Scratch.Mul(Scale);
+    Move(Scratch.FData[0], Bias.FData[RowOffset], OutDim * csNeuralFloatSize);
+  end;
+end;
+
+// nn.Linear Prefix (times Scale) into Weights.
+procedure LoadLightGlueLinear(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Weights: TNNetPlainConvWeights;
+  InDim, OutDim: integer; HasBias: boolean; Scale: TNeuralFloat = 1);
+var
+  Weight, Bias, Scratch: TNNetVolume;
+begin
+  Weight := TNNetVolume.Create(OutDim * InDim, 1, 1);
+  Bias := TNNetVolume.Create(OutDim, 1, 1);
+  Scratch := TNNetVolume.Create();
+  try
+    LoadLightGlueLinearRows(Reader, Prefix, InDim, OutDim, 0, HasBias, Scale,
+      Weight, Bias, Scratch);
+    if HasBias then Weights.LoadTorchConv1D(Weight, Bias, OutDim, InDim, 1)
+    else Weights.LoadTorchConv1D(Weight, nil, OutDim, InDim, 1);
+  finally
+    Scratch.Free;
+    Bias.Free;
+    Weight.Free;
+  end;
+end;
+
+{ TLightGlueMatcher }
+
+constructor TLightGlueMatcher.Create(const pConfig: TLightGlueConfig;
+  pThreaded: boolean);
+var
+  BlockPos, MaxBlockPos: integer;
+begin
+  inherited Create();
+  FConfig := pConfig;
+  if (FConfig.NumHiddenLayers < 1) or (FConfig.NumAttentionHeads < 1) or
+     (FConfig.NumKeyValueHeads < 1) or
+     (FConfig.DescriptorDim mod FConfig.NumAttentionHeads <> 0) or
+     (FConfig.NumAttentionHeads mod FConfig.NumKeyValueHeads <> 0) then
+    ImportError('LightGlue import: needs layers >= 1 and descriptor_dim / ' +
+      'num_attention_heads / num_key_value_heads that divide evenly (' +
+      LightGlueConfigToString(FConfig) + ').');
+  FHeadDim := FConfig.DescriptorDim div FConfig.NumAttentionHeads;
+  if Odd(FHeadDim) then
+    ImportError('LightGlue import: the head dim ' + IntToStr(FHeadDim) +
+      ' must be even for the rotary pairs.');
+  if (LowerCase(FConfig.HiddenAct) <> 'gelu') and
+     (LowerCase(FConfig.HiddenAct) <> 'gelu_python') then
+    ImportError('LightGlue import: hidden_act "' + FConfig.HiddenAct +
+      '" is not supported (only the erf "gelu").');
+  FKeyValueDim := FConfig.NumKeyValueHeads * FHeadDim;
+  FQKVWidth := FConfig.DescriptorDim + 2 * FKeyValueDim;
+  FOps := TNNetPlainOps.Create(pThreaded);
+  if FConfig.KeypointDetector.DescriptorDecoderDim <> FConfig.DescriptorDim then
+    FInputProjection := TNNetPlainConvWeights.Create();
+  FPositionProjector := TNNetVolume.Create();
+  SetLength(FBlocks, 2 * FConfig.NumHiddenLayers);
+  MaxBlockPos := High(FBlocks);
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    FBlocks[BlockPos].QKV := TNNetPlainConvWeights.Create();
+    FBlocks[BlockPos].Output := TNNetPlainConvWeights.Create();
+    FBlocks[BlockPos].FC1 := TNNetPlainConvWeights.Create();
+    FBlocks[BlockPos].FC2 := TNNetPlainConvWeights.Create();
+    FBlocks[BlockPos].NormGain := TNNetVolume.Create();
+    FBlocks[BlockPos].NormBias := TNNetVolume.Create();
+  end;
+  FFinalProjection := TNNetPlainConvWeights.Create();
+  FMatchability := TNNetPlainConvWeights.Create();
+  FInput := TNNetVolume.Create();
+  FHidden := TNNetVolume.Create();
+  FQKV := TNNetVolume.Create();
+  FAttention := TNNetVolume.Create();
+  FProjected := TNNetVolume.Create();
+  FConcat := TNNetVolume.Create();
+  FMLPHidden := TNNetVolume.Create();
+  FMLPOut := TNNetVolume.Create();
+  FGeluScratch := TNNetVolume.Create();
+  FAngles := TNNetVolume.Create();
+  FCos := TNNetVolume.Create();
+  FSin := TNNetVolume.Create();
+  FKeyRows := TNNetVolume.Create();
+  FValueRowsT := TNNetVolume.Create();
+  FPackedKeys := TNNetVolume.Create();
+  FPackedValues := TNNetVolume.Create();
+  FScores := TNNetVolume.Create();
+  FMatchDescriptors := TNNetVolume.Create();
+  FMatchLogits := TNNetVolume.Create();
+  FPackedMatch := TNNetVolume.Create();
+  FSimilarity := TNNetVolume.Create();
+  FSimilarityT := TNNetVolume.Create();
+  FExpScratch := TNNetVolume.Create();
+end;
+
+procedure TLightGlueMatcher.FreeWeights();
+var
+  BlockPos, MaxBlockPos: integer;
+begin
+  MaxBlockPos := High(FBlocks);
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    FBlocks[BlockPos].QKV.Free;
+    FBlocks[BlockPos].Output.Free;
+    FBlocks[BlockPos].FC1.Free;
+    FBlocks[BlockPos].FC2.Free;
+    FBlocks[BlockPos].NormGain.Free;
+    FBlocks[BlockPos].NormBias.Free;
+  end;
+  SetLength(FBlocks, 0);
+  FInputProjection.Free;
+  FPositionProjector.Free;
+  FFinalProjection.Free;
+  FMatchability.Free;
+end;
+
+destructor TLightGlueMatcher.Destroy();
+begin
+  FreeWeights();
+  FOps.Free;
+  FInput.Free;
+  FHidden.Free;
+  FQKV.Free;
+  FAttention.Free;
+  FProjected.Free;
+  FConcat.Free;
+  FMLPHidden.Free;
+  FMLPOut.Free;
+  FGeluScratch.Free;
+  FAngles.Free;
+  FCos.Free;
+  FSin.Free;
+  FKeyRows.Free;
+  FValueRowsT.Free;
+  FPackedKeys.Free;
+  FPackedValues.Free;
+  FScores.Free;
+  FMatchDescriptors.Free;
+  FMatchLogits.Free;
+  FPackedMatch.Free;
+  FSimilarity.Free;
+  FSimilarityT.Free;
+  FExpScratch.Free;
+  inherited Destroy();
+end;
+
+procedure TLightGlueMatcher.LoadWeights(Reader: TNNetSafeTensorsReader);
+var
+  LayerPos, MaxLayerPos, Dim, DoubleDim: integer;
+  QKVWeight, QKVBias, Scratch: TNNetVolume;
+  Block: TLightGlueBlockWeights;
+
+  procedure LoadBlock(const AttentionPrefix, MLPPrefix: string);
+  var
+    HasBias: boolean;
+  begin
+    HasBias := FConfig.AttentionBias;
+    // 1/sqrt(head_dim) folds into the q rows: the rotary is linear in q.
+    LoadLightGlueLinearRows(Reader, AttentionPrefix + 'q_proj', Dim, Dim, 0,
+      HasBias, 1 / Sqrt(FHeadDim), QKVWeight, QKVBias, Scratch);
+    LoadLightGlueLinearRows(Reader, AttentionPrefix + 'k_proj', Dim,
+      FKeyValueDim, Dim, HasBias, 1, QKVWeight, QKVBias, Scratch);
+    LoadLightGlueLinearRows(Reader, AttentionPrefix + 'v_proj', Dim,
+      FKeyValueDim, Dim + FKeyValueDim, HasBias, 1, QKVWeight, QKVBias, Scratch);
+    if HasBias then
+      Block.QKV.LoadTorchConv1D(QKVWeight, QKVBias, FQKVWidth, Dim, 1)
+    else
+      Block.QKV.LoadTorchConv1D(QKVWeight, nil, FQKVWidth, Dim, 1);
+    LoadLightGlueLinear(Reader, AttentionPrefix + 'o_proj', Block.Output,
+      Dim, Dim, HasBias);
+    LoadLightGlueLinear(Reader, MLPPrefix + 'fc1', Block.FC1, DoubleDim,
+      DoubleDim, true);
+    LoadLightGlueTensor(Reader, MLPPrefix + 'layer_norm.weight',
+      Block.NormGain, DoubleDim);
+    LoadLightGlueTensor(Reader, MLPPrefix + 'layer_norm.bias',
+      Block.NormBias, DoubleDim);
+    LoadLightGlueLinear(Reader, MLPPrefix + 'fc2', Block.FC2, DoubleDim,
+      Dim, true);
+  end;
+
+var
+  LayerPrefix: string;
+begin
+  Dim := FConfig.DescriptorDim;
+  DoubleDim := 2 * Dim;
+  if Assigned(FInputProjection) then
+    LoadLightGlueLinear(Reader, 'input_projection', FInputProjection,
+      FConfig.KeypointDetector.DescriptorDecoderDim, Dim, true);
+  LoadLightGlueTensor(Reader, 'positional_encoder.projector.weight',
+    FPositionProjector, FHeadDim);
+  QKVWeight := TNNetVolume.Create(FQKVWidth * Dim, 1, 1);
+  QKVBias := TNNetVolume.Create(FQKVWidth, 1, 1);
+  Scratch := TNNetVolume.Create();
+  try
+    MaxLayerPos := FConfig.NumHiddenLayers - 1;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      LayerPrefix := 'transformer_layers.' + IntToStr(LayerPos) + '.';
+      Block := FBlocks[2 * LayerPos];
+      LoadBlock(LayerPrefix + 'self_attention.', LayerPrefix + 'self_mlp.');
+      Block := FBlocks[2 * LayerPos + 1];
+      LoadBlock(LayerPrefix + 'cross_attention.', LayerPrefix + 'cross_mlp.');
+    end;
+  finally
+    Scratch.Free;
+    QKVBias.Free;
+    QKVWeight.Free;
+  end;
+  LayerPrefix := 'match_assignment_layers.' +
+    IntToStr(FConfig.NumHiddenLayers - 1) + '.';
+  // transformers divides the projected descriptors by descriptor_dim^(1/4).
+  LoadLightGlueLinear(Reader, LayerPrefix + 'final_projection',
+    FFinalProjection, Dim, Dim, true, 1 / Sqrt(Sqrt(Dim)));
+  LoadLightGlueLinear(Reader, LayerPrefix + 'matchability', FMatchability,
+    Dim, 1, true);
+end;
+
+function TLightGlueMatcher.GetMatch0(Index: integer): integer;
+begin
+  Result := FMatches0[Index];
+end;
+
+function TLightGlueMatcher.GetMatch1(Index: integer): integer;
+begin
+  Result := FMatches1[Index];
+end;
+
+function TLightGlueMatcher.GetMatchScore0(Index: integer): TNeuralFloat;
+begin
+  Result := FMatchScores0[Index];
+end;
+
+function TLightGlueMatcher.GetMatchScore1(Index: integer): TNeuralFloat;
+begin
+  Result := FMatchScores1[Index];
+end;
+
+procedure TLightGlueMatcher.ApplyRotary(TokenCount: integer);
+var
+  HalfHeadDim, TokenPos, MaxTokenPos, HeadPos, MaxHeadPos: integer;
+  PairPos, MaxPairPos, EvenPos, RowBase, AngleBase: integer;
+  EvenValue, OddValue, CosValue, SinValue: TNeuralFloat;
+begin
+  HalfHeadDim := FHeadDim div 2;
+  MaxTokenPos := TokenCount - 1;
+  // The q heads and then the k heads sit back to back from the row start.
+  MaxHeadPos := FConfig.NumAttentionHeads + FConfig.NumKeyValueHeads - 1;
+  MaxPairPos := HalfHeadDim - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    RowBase := TokenPos * FQKVWidth;
+    AngleBase := TokenPos * HalfHeadDim;
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      EvenPos := RowBase + HeadPos * FHeadDim;
+      for PairPos := 0 to MaxPairPos do
+      begin
+        EvenValue := FQKV.FData[EvenPos];
+        OddValue := FQKV.FData[EvenPos + 1];
+        CosValue := FCos.FData[AngleBase + PairPos];
+        SinValue := FSin.FData[AngleBase + PairPos];
+        FQKV.FData[EvenPos] := EvenValue * CosValue - OddValue * SinValue;
+        FQKV.FData[EvenPos + 1] := OddValue * CosValue + EvenValue * SinValue;
+        Inc(EvenPos, 2);
+      end;
+    end;
+  end;
+end;
+
+procedure TLightGlueMatcher.Attend(QueryStart, QueryCount, KeyStart,
+  KeyCount: integer);
+var
+  GroupSize, KeyValueHeadPos, MaxKeyValueHeadPos, HeadPos, MaxHeadPos: integer;
+  KeyPos, MaxKeyPos, ElementPos, MaxElementPos, QueryPos, MaxQueryPos: integer;
+  KeyOffset, ValueOffset, RowBase, TransposedPos, ScorePos, Dim: integer;
+  RowMax, RowSum: TNeuralFloat;
+  ScoreRowPtr: TNeuralFloatArrPtr;
+begin
+  Dim := FConfig.DescriptorDim;
+  GroupSize := FConfig.NumAttentionHeads div FConfig.NumKeyValueHeads;
+  MaxKeyValueHeadPos := FConfig.NumKeyValueHeads - 1;
+  MaxKeyPos := KeyCount - 1;
+  MaxElementPos := FHeadDim - 1;
+  MaxQueryPos := QueryCount - 1;
+  for KeyValueHeadPos := 0 to MaxKeyValueHeadPos do
+  begin
+    // Contiguous k rows and transposed v rows of this head, then packed.
+    KeyOffset := Dim + KeyValueHeadPos * FHeadDim;
+    ValueOffset := KeyOffset + FKeyValueDim;
+    for KeyPos := 0 to MaxKeyPos do
+    begin
+      RowBase := (KeyStart + KeyPos) * FQKVWidth;
+      Move(FQKV.FData[RowBase + KeyOffset], FKeyRows.FData[KeyPos * FHeadDim],
+        FHeadDim * csNeuralFloatSize);
+      TransposedPos := KeyPos;
+      for ElementPos := 0 to MaxElementPos do
+      begin
+        FValueRowsT.FData[TransposedPos] :=
+          FQKV.FData[RowBase + ValueOffset + ElementPos];
+        Inc(TransposedPos, KeyCount);
+      end;
+    end;
+    TNNetVolume.PackDotProductRows(FPackedKeys.DataPtr, FKeyRows.DataPtr,
+      KeyCount, FHeadDim);
+    TNNetVolume.PackDotProductRows(FPackedValues.DataPtr, FValueRowsT.DataPtr,
+      FHeadDim, KeyCount);
+    MaxHeadPos := (KeyValueHeadPos + 1) * GroupSize - 1;
+    for HeadPos := KeyValueHeadPos * GroupSize to MaxHeadPos do
+    begin
+      // The q rows carry the 1/sqrt(head_dim) scale from LoadWeights.
+      TNNetVolume.DotProductsPacked(FScores.DataPtr, KeyCount,
+        FPackedKeys.DataPtr, KeyCount,
+        FQKV.GetRawPtr(QueryStart * FQKVWidth + HeadPos * FHeadDim), FQKVWidth,
+        QueryCount, FHeadDim, nil);
+      ScorePos := 0;
+      for QueryPos := 0 to MaxQueryPos do
+      begin
+        ScoreRowPtr := FScores.GetRawPtr(ScorePos);
+        RowMax := TNNetVolume.MaxValue(ScoreRowPtr, KeyCount);
+        RowSum := TNNetVolume.ExpShiftSum(ScoreRowPtr, ScoreRowPtr, RowMax,
+          KeyCount);
+        TNNetVolume.Mul(ScoreRowPtr, 1 / RowSum, KeyCount);
+        Inc(ScorePos, KeyCount);
+      end;
+      TNNetVolume.DotProductsPacked(
+        FAttention.GetRawPtr(QueryStart * Dim + HeadPos * FHeadDim), Dim,
+        FPackedValues.DataPtr, FHeadDim, FScores.DataPtr, KeyCount,
+        QueryCount, KeyCount, nil);
+    end;
+  end;
+end;
+
+procedure TLightGlueMatcher.LayerNormGelu(const Block: TLightGlueBlockWeights);
+const
+  csLayerNormEps = 1e-5;
+  csInvSqrt2 = 0.70710678118654752;
+var
+  Width, TokenPos, MaxTokenPos, ElementPos, MaxElementPos, RowBase: integer;
+  Mean, InvStd: TNeuralFloat;
+  RowPtr, GainPtr, BiasPtr: TNeuralFloatArrPtr;
+begin
+  Width := FMLPHidden.Depth;
+  MaxTokenPos := FMLPHidden.SizeX - 1;
+  MaxElementPos := Width - 1;
+  GainPtr := Block.NormGain.DataPtr;
+  BiasPtr := Block.NormBias.DataPtr;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    RowBase := TokenPos * Width;
+    RowPtr := FMLPHidden.GetRawPtr(RowBase);
+    Mean := TNNetVolume.Sum(RowPtr, Width) / Width;
+    InvStd := 1 / Sqrt(TNNetVolume.SumSqrCentered(RowPtr, Mean, Width) / Width +
+      csLayerNormEps);
+    for ElementPos := 0 to MaxElementPos do
+      RowPtr^[ElementPos] := (RowPtr^[ElementPos] - Mean) * InvStd *
+        GainPtr^[ElementPos] + BiasPtr^[ElementPos];
+  end;
+  // Exact GELU: x * (1 + erf(x / sqrt(2))) / 2.
+  MaxElementPos := FMLPHidden.Size - 1;
+  FGeluScratch.Copy(FMLPHidden);
+  TNNetVolume.Mul(FGeluScratch.DataPtr, csInvSqrt2, FMLPHidden.Size);
+  TNNetVolume.Erf(FGeluScratch.DataPtr, FGeluScratch.DataPtr, FMLPHidden.Size);
+  for ElementPos := 0 to MaxElementPos do
+    FMLPHidden.FData[ElementPos] := FMLPHidden.FData[ElementPos] * 0.5 *
+      (1 + FGeluScratch.FData[ElementPos]);
+end;
+
+procedure TLightGlueMatcher.RunBlock(const Block: TLightGlueBlockWeights;
+  IsCross: boolean);
+var
+  TokenCount: integer;
+begin
+  TokenCount := FHidden.SizeX;
+  FOps.PointwiseConv(FHidden, FQKV, Block.QKV);
+  FAttention.ReSize(TokenCount, 1, FConfig.DescriptorDim);
+  if IsCross then
+  begin
+    // Both directions read the same self-attended rows.
+    Attend(0, FCount0, FCount0, FCount1);
+    Attend(FCount0, FCount1, 0, FCount0);
+  end
+  else
+  begin
+    ApplyRotary(TokenCount);
+    Attend(0, FCount0, 0, FCount0);
+    Attend(FCount0, FCount1, FCount0, FCount1);
+  end;
+  FOps.PointwiseConv(FAttention, FProjected, Block.Output);
+  FOps.ConcatChannels([FHidden, FProjected], FConcat);
+  FOps.PointwiseConv(FConcat, FMLPHidden, Block.FC1);
+  LayerNormGelu(Block);
+  FOps.PointwiseConv(FMLPHidden, FMLPOut, Block.FC2);
+  FHidden.Add(FMLPOut);
+end;
+
+procedure TLightGlueMatcher.AssignMatches();
+var
+  Dim, RowCount, ColumnCount, TokenPos, MaxTokenPos, RowPos, MaxRowPos: integer;
+  ColumnPos, MaxColumnPos, BestPos, PartnerPos, SimilarityPos: integer;
+  Logit, RowMax, RowShift, Value, BestValue, Score, Threshold: TNeuralFloat;
+  RowPtr: TNeuralFloatArrPtr;
+  IsMutual: boolean;
+begin
+  Dim := FConfig.DescriptorDim;
+  RowCount := FCount0;
+  ColumnCount := FCount1;
+  FOps.PointwiseConv(FHidden, FMatchDescriptors, FFinalProjection);
+  FOps.PointwiseConv(FHidden, FMatchLogits, FMatchability);
+  MaxTokenPos := RowCount + ColumnCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    // log(sigmoid(z)) = min(z, 0) - ln(1 + exp(-|z|)), stable for any z.
+    Logit := FMatchLogits.FData[TokenPos];
+    FLogSigmoid[TokenPos] := Min(Logit, 0) - Ln(1 + NeuralExp(-Abs(Logit)));
+  end;
+  // Similarity (RowCount x ColumnCount) and its transpose, each row-contiguous.
+  TNNetVolume.PackDotProductRows(FPackedMatch.DataPtr,
+    FMatchDescriptors.GetRawPtr(RowCount * Dim), ColumnCount, Dim);
+  TNNetVolume.DotProductsPacked(FSimilarity.DataPtr, ColumnCount,
+    FPackedMatch.DataPtr, ColumnCount, FMatchDescriptors.DataPtr, Dim, RowCount, Dim,
+    nil);
+  TNNetVolume.PackDotProductRows(FPackedMatch.DataPtr,
+    FMatchDescriptors.DataPtr, RowCount, Dim);
+  TNNetVolume.DotProductsPacked(FSimilarityT.DataPtr, RowCount,
+    FPackedMatch.DataPtr, RowCount, FMatchDescriptors.GetRawPtr(RowCount * Dim),
+    Dim, ColumnCount, Dim, nil);
+  MaxRowPos := RowCount - 1;
+  MaxColumnPos := ColumnCount - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    RowPtr := FSimilarity.GetRawPtr(RowPos * ColumnCount);
+    RowMax := TNNetVolume.MaxValue(RowPtr, ColumnCount);
+    FRowLogSumExp[RowPos] := RowMax + Ln(TNNetVolume.ExpShiftSum(
+      FExpScratch.DataPtr, RowPtr, RowMax, ColumnCount));
+  end;
+  for ColumnPos := 0 to MaxColumnPos do
+  begin
+    RowPtr := FSimilarityT.GetRawPtr(ColumnPos * RowCount);
+    RowMax := TNNetVolume.MaxValue(RowPtr, RowCount);
+    // Column term of every score: log sigmoid(z1) - column log-sum-exp.
+    FColumnLogSumExp[ColumnPos] := FLogSigmoid[RowCount + ColumnPos] - (RowMax +
+      Ln(TNNetVolume.ExpShiftSum(FExpScratch.DataPtr, RowPtr, RowMax, RowCount)));
+    FColumnBest[ColumnPos] := -MaxSingle;
+    FColumnArgMax[ColumnPos] := -1;
+  end;
+  // score[i,j] = log_softmax_row + log_softmax_column + log sigmoid(z0) +
+  // log sigmoid(z1); first maximum per row and per column, as torch.max.
+  SimilarityPos := 0;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    RowShift := FLogSigmoid[RowPos] - FRowLogSumExp[RowPos];
+    BestValue := -MaxSingle;
+    BestPos := -1;
+    for ColumnPos := 0 to MaxColumnPos do
+    begin
+      Value := 2 * FSimilarity.FData[SimilarityPos] + RowShift +
+        FColumnLogSumExp[ColumnPos];
+      if Value > BestValue then
+      begin
+        BestValue := Value;
+        BestPos := ColumnPos;
+      end;
+      if Value > FColumnBest[ColumnPos] then
+      begin
+        FColumnBest[ColumnPos] := Value;
+        FColumnArgMax[ColumnPos] := RowPos;
+      end;
+      Inc(SimilarityPos);
+    end;
+    FMatches0[RowPos] := BestPos;
+    FMatchScores0[RowPos] := BestValue;
+  end;
+  // Mutual check, then filter_threshold on exp(score) of the shared pair.
+  Threshold := FConfig.FilterThreshold;
+  for ColumnPos := 0 to MaxColumnPos do
+  begin
+    PartnerPos := FColumnArgMax[ColumnPos];
+    FMatches1[ColumnPos] := -1;
+    FMatchScores1[ColumnPos] := 0;
+    if FMatches0[PartnerPos] = ColumnPos then
+    begin
+      Score := NeuralExp(FMatchScores0[PartnerPos]);
+      FMatchScores1[ColumnPos] := Score;
+      if Score > Threshold then FMatches1[ColumnPos] := PartnerPos;
+    end;
+  end;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    IsMutual := FColumnArgMax[FMatches0[RowPos]] = RowPos;
+    Score := 0;
+    if IsMutual then Score := NeuralExp(FMatchScores0[RowPos]);
+    FMatchScores0[RowPos] := Score;
+    if not (IsMutual and (Score > Threshold)) then FMatches0[RowPos] := -1;
+  end;
+end;
+
+procedure TLightGlueMatcher.Match(KeypointsA, KeypointsB: TSuperPointKeypoints;
+  ImageWidth, ImageHeight: integer);
+var
+  TokenCount, MaxCount, DetectorDim, Dim, HalfHeadDim, TokenPos: integer;
+  MaxTokenPos, PairPos, MaxPairPos, AngleBase, LayerPos, MaxLayerPos: integer;
+  PixelX, PixelY: integer;
+  ShiftX, ShiftY, InvScale, NormX, NormY: TNeuralFloat;
+begin
+  FCount0 := KeypointsA.Count;
+  FCount1 := KeypointsB.Count;
+  TokenCount := FCount0 + FCount1;
+  if Length(FMatches0) < FCount0 then
+  begin
+    SetLength(FMatches0, FCount0);
+    SetLength(FMatchScores0, FCount0);
+    SetLength(FRowLogSumExp, FCount0);
+  end;
+  if Length(FMatches1) < FCount1 then
+  begin
+    SetLength(FMatches1, FCount1);
+    SetLength(FMatchScores1, FCount1);
+    SetLength(FColumnLogSumExp, FCount1);
+    SetLength(FColumnBest, FCount1);
+    SetLength(FColumnArgMax, FCount1);
+  end;
+  if Length(FLogSigmoid) < TokenCount then SetLength(FLogSigmoid, TokenCount);
+  Dim := FConfig.DescriptorDim;
+  if (FCount0 = 0) or (FCount1 = 0) then
+  begin
+    // transformers returns no match when either image has no keypoint.
+    if FCount0 > 0 then FillChar(FMatchScores0[0], FCount0 * csNeuralFloatSize, 0);
+    if FCount1 > 0 then FillChar(FMatchScores1[0], FCount1 * csNeuralFloatSize, 0);
+    MaxTokenPos := FCount0 - 1;
+    for TokenPos := 0 to MaxTokenPos do FMatches0[TokenPos] := -1;
+    MaxTokenPos := FCount1 - 1;
+    for TokenPos := 0 to MaxTokenPos do FMatches1[TokenPos] := -1;
+    FHidden.ReSize(TokenCount, 1, Dim);
+    exit;
+  end;
+  DetectorDim := FConfig.KeypointDetector.DescriptorDecoderDim;
+  if (KeypointsA.Descriptors.Depth <> DetectorDim) or
+     (KeypointsB.Descriptors.Depth <> DetectorDim) then
+    raise Exception.Create('TLightGlueMatcher.Match: descriptors must have ' +
+      IntToStr(DetectorDim) + ' channels.');
+  // Scratch sized once per call, never shrunk between the two images.
+  MaxCount := Max(FCount0, FCount1);
+  HalfHeadDim := FHeadDim div 2;
+  TNNetPlainOps.GrowScratch(FKeyRows, MaxCount * FHeadDim);
+  TNNetPlainOps.GrowScratch(FValueRowsT, MaxCount * FHeadDim);
+  TNNetPlainOps.GrowScratch(FPackedKeys,
+    TNNetVolume.PackedDotProductFloats(MaxCount, FHeadDim));
+  TNNetPlainOps.GrowScratch(FPackedValues,
+    TNNetVolume.PackedDotProductFloats(FHeadDim, MaxCount));
+  TNNetPlainOps.GrowScratch(FScores, MaxCount * MaxCount);
+  TNNetPlainOps.GrowScratch(FPackedMatch,
+    TNNetVolume.PackedDotProductFloats(MaxCount, Dim));
+  TNNetPlainOps.GrowScratch(FSimilarity, FCount0 * FCount1);
+  TNNetPlainOps.GrowScratch(FSimilarityT, FCount0 * FCount1);
+  TNNetPlainOps.GrowScratch(FExpScratch, MaxCount);
+  FInput.ReSize(TokenCount, 1, DetectorDim);
+  Move(KeypointsA.Descriptors.FData[0], FInput.FData[0],
+    FCount0 * DetectorDim * csNeuralFloatSize);
+  Move(KeypointsB.Descriptors.FData[0], FInput.FData[FCount0 * DetectorDim],
+    FCount1 * DetectorDim * csNeuralFloatSize);
+  if Assigned(FInputProjection) then
+    FOps.PointwiseConv(FInput, FHidden, FInputProjection)
+  else
+  begin
+    FHidden.ReSize(TokenCount, 1, Dim);
+    FHidden.Copy(FInput);
+  end;
+  // Rotary angles: projector . ((x, y) - size/2) / (max(W, H)/2).
+  FAngles.ReSize(TokenCount, 1, HalfHeadDim);
+  FCos.ReSize(TokenCount, 1, HalfHeadDim);
+  FSin.ReSize(TokenCount, 1, HalfHeadDim);
+  ShiftX := ImageWidth * 0.5;
+  ShiftY := ImageHeight * 0.5;
+  InvScale := 2 / Max(ImageWidth, ImageHeight);
+  MaxTokenPos := TokenCount - 1;
+  MaxPairPos := HalfHeadDim - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    if TokenPos < FCount0 then
+    begin
+      PixelX := KeypointsA.X[TokenPos];
+      PixelY := KeypointsA.Y[TokenPos];
+    end
+    else
+    begin
+      PixelX := KeypointsB.X[TokenPos - FCount0];
+      PixelY := KeypointsB.Y[TokenPos - FCount0];
+    end;
+    NormX := (PixelX - ShiftX) * InvScale;
+    NormY := (PixelY - ShiftY) * InvScale;
+    AngleBase := TokenPos * HalfHeadDim;
+    for PairPos := 0 to MaxPairPos do
+      FAngles.FData[AngleBase + PairPos] :=
+        FPositionProjector.FData[2 * PairPos] * NormX +
+        FPositionProjector.FData[2 * PairPos + 1] * NormY;
+  end;
+  TNNetVolume.SinCos(FSin.DataPtr, FCos.DataPtr, FAngles.DataPtr,
+    TokenCount * HalfHeadDim);
+  MaxLayerPos := FConfig.NumHiddenLayers - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    RunBlock(FBlocks[2 * LayerPos], false);
+    RunBlock(FBlocks[2 * LayerPos + 1], true);
+  end;
+  AssignMatches();
+end;
+
+function BuildLightGlue(Reader: TNNetSafeTensorsReader;
+  const Config: TLightGlueConfig; pThreaded: boolean): TLightGlueMatcher;
+begin
+  Result := TLightGlueMatcher.Create(Config, pThreaded);
+  try
+    Result.LoadWeights(Reader);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function BuildLightGlueFromSafeTensorsEx(const FileName: string;
+  const Config: TLightGlueConfig; pThreaded: boolean): TLightGlueMatcher;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildLightGlue(Reader, Config, pThreaded);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildLightGlueFromSafeTensors(const FileName: string;
+  out Config: TLightGlueConfig; pThreaded: boolean;
+  const ConfigFileName: string): TLightGlueMatcher;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadLightGlueConfigFromJSONFile(ConfigPath);
+  Result := BuildLightGlueFromSafeTensorsEx(FileName, Config, pThreaded);
+end;
+
+function BuildLightGlueKeypointDetectorFromSafeTensors(const FileName: string;
+  const Config: TLightGlueConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    if Reader.RenameTensorPrefix('keypoint_detector.', '') = 0 then
+      ImportError('LightGlue import: "' + FileName +
+        '" holds no keypoint_detector.* tensors.');
+    Result := BuildSuperPoint(Reader, Config.KeypointDetector, pTrainable);
+  finally
+    Reader.Free;
+  end;
 end;
 
 function ReadClipImageProcessorConfig(
