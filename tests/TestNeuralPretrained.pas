@@ -1383,6 +1383,9 @@ type
     procedure TestStableDiffusionDeepCacheReference;
     // img2img at interval 3: step 0 bit-identical to interval 1, cached passes.
     procedure TestStableDiffusionDeepCacheImg2Img;
+    // A ControlNet under DeepCache: shallow passes run only the residuals the
+    // shallow branch reads, bit-identical to running the whole ControlNet.
+    procedure TestStableDiffusionControlNetDeepCache;
     // SDUNetDenoise's DeepCache split on a forced-OpenCL UNet vs the CPU.
     procedure TestStableDiffusionDeepCacheOpenCL;
     // SDUNetSelfAttentionNames / SDUNetPAGLayerIndices on tiny_sd15: diffusers'
@@ -1412,6 +1415,9 @@ type
     procedure TestStableDiffusionSAGNonSquareMask;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
+    // ControlNetResiduals with fewer down residuals: equal to the full run's,
+    // and the layers past the last needed skip (mid tap too) are not computed.
+    procedure TestControlNetResidualsTruncated;
     procedure TestControlNetCombinedParity;
     procedure TestT2IAdapterParity;
     procedure TestT2IAdapterFeatureCountMismatch;
@@ -49296,6 +49302,88 @@ begin
   end;
 end;
 
+type
+  // The ControlNet that computes every residual on every pass.
+  TSDFullResidualControlNet = class(TStableDiffusionControlNet)
+  protected
+    function PassDownResidualCount(
+      Inputs: TStableDiffusionPassInputs): integer; override;
+  end;
+
+function TSDFullResidualControlNet.PassDownResidualCount(
+  Inputs: TStableDiffusionPassInputs): integer;
+begin
+  Result := Config.NumDownResiduals;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetDeepCache;
+const
+  StepCount = 7;
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet, FullControlNet: TStableDiffusionControlNet;
+  ControlImage, Embeds, Initial, Expected, Got: TNNetVolume;
+  ImageSide, BranchPos: integer;
+  Branches: array[0..1] of integer;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_controlnet_io.json');
+  Pipeline := CreateSD15Pipeline();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  FullControlNet := TSDFullResidualControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  ControlImage := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['control_image'],
+      false, ControlImage);
+    ControlImage.Mul(255);
+    ControlNet.SetControlImage(ControlImage);
+    FullControlNet.SetControlImage(ControlImage);
+    ControlNet.ConditioningScale := 0.5;
+    FullControlNet.ConditioningScale := 0.5;
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    ImageSide := TJSONObject(FSD15Oracle).Get('image_size', 0);
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    Pipeline.DeepCacheInterval := 3;
+    Branches[0] := 0;
+    Branches[1] := Pipeline.UNetConfig.LayersPerBlock;
+    for BranchPos := 0 to High(Branches) do
+    begin
+      Pipeline.DeepCacheBranch := Branches[BranchPos];
+      Pipeline.Conditioner := FullControlNet;
+      Expected.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Expected);
+      AssertEquals('full: no shallow ControlNet run', 0,
+        Pipeline.ImageStats.ControlNetShallowRunCount);
+      Pipeline.Conditioner := ControlNet;
+      Got.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+      // Steps 1, 2, 4 and 5 of 7 skip in both CFG passes.
+      AssertEquals('cached passes', 8, Pipeline.ImageStats.UNetCachedPassCount);
+      AssertEquals('one shallow ControlNet run per cached pass', 8,
+        Pipeline.ImageStats.ControlNetShallowRunCount);
+      AssertEquals('branch ' + IntToStr(Branches[BranchPos]) +
+        ': latents equal the full ControlNet''s', 0,
+        MaxAbsVolumeDiff(Got, Expected), 0);
+    end;
+  finally
+    Got.Free;
+    Expected.Free;
+    Initial.Free;
+    Embeds.Free;
+    ControlImage.Free;
+    Pipeline.Free;
+    FullControlNet.Free;
+    ControlNet.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestStableDiffusionDeepCacheImg2Img;
 const
   StepCount = 8;
@@ -50207,6 +50295,84 @@ end;
 // (added to conv_in), the encoder down/mid blocks (REUSE of the SD UNet block
 // builders), and the per-resolution zero-conv taps, end to end < 1e-4 vs the
 // oracle on the residual tensors that get injected into the frozen base UNet.
+procedure TTestNeuralPretrained.TestControlNetResidualsTruncated;
+const
+  Sentinel = 7;
+var
+  NN: TNNet;
+  Config: TControlNetConfig;
+  Latent, EncStates, Cond, MidResidual: TNNetVolume;
+  FullResiduals, GotResiduals: array of TNNetVolume;
+  ResidualPos, MaxResidualPos, ResidualCount, TapBase, LastSourceIdx,
+    LayerPos, MaxLayerPos: integer;
+  LayerOutput: TNNetVolume;
+begin
+  RandSeed := 424243;
+  NN := BuildControlNetFromSafeTensors(
+    FixturePath('tiny_controlnet.safetensors'), Config,
+    {pTrainable=}false, FixturePath('tiny_controlnet_config.json'));
+  Latent := TNNetVolume.Create(Config.Base.LatentGrid, Config.Base.LatentGrid,
+    Config.Base.InChannels);
+  EncStates := TNNetVolume.Create(Config.Base.TextSeqLen, 1,
+    Config.Base.CrossAttentionDim);
+  Cond := TNNetVolume.Create(Config.CondGrid, Config.CondGrid,
+    Config.CondChannels);
+  MidResidual := TNNetVolume.Create;
+  MaxResidualPos := Config.NumDownResiduals - 1;
+  SetLength(FullResiduals, Config.NumDownResiduals);
+  SetLength(GotResiduals, Config.NumDownResiduals);
+  for ResidualPos := 0 to MaxResidualPos do
+  begin
+    FullResiduals[ResidualPos] := TNNetVolume.Create;
+    GotResiduals[ResidualPos] := TNNetVolume.Create;
+  end;
+  try
+    AssertTrue('several down residuals', Config.NumDownResiduals >= 3);
+    Latent.RandomizeGaussian();
+    EncStates.RandomizeGaussian();
+    Cond.Randomize();
+    ControlNetResiduals(NN, Config, Latent, EncStates, Cond, 0.4,
+      FullResiduals, MidResidual);
+    TapBase := NN.CountLayers() - (Config.NumDownResiduals + 1);
+    MaxLayerPos := NN.GetLastLayerIdx();
+    for ResidualCount := 1 to Config.NumDownResiduals - 1 do
+    begin
+      for LayerPos := 0 to MaxLayerPos do
+        NN.Layers[LayerPos].Output.Fill(Sentinel);
+      MidResidual.Fill(Sentinel);
+      ControlNetResiduals(NN, Config, Latent, EncStates, Cond, 0.4,
+        GotResiduals, MidResidual, ResidualCount);
+      for ResidualPos := 0 to ResidualCount - 1 do
+        AssertEquals('count ' + IntToStr(ResidualCount) + ': residual ' +
+          IntToStr(ResidualPos), 0, MaxAbsVolumeDiff(GotResiduals[ResidualPos],
+          FullResiduals[ResidualPos]), 0);
+      AssertEquals('mid residual untouched', Sentinel, MidResidual.FData[0], 0);
+      LastSourceIdx := NN.Layers[TapBase + ResidualCount - 1].PrevLayer.LayerIdx;
+      for LayerPos := LastSourceIdx + 1 to MaxLayerPos do
+      begin
+        if (LayerPos >= TapBase) and (LayerPos < TapBase + ResidualCount) then
+          continue;
+        LayerOutput := NN.Layers[LayerPos].Output;
+        if LayerOutput.Size > 0 then
+          AssertEquals('count ' + IntToStr(ResidualCount) + ': layer ' +
+            IntToStr(LayerPos) + ' not computed', Sentinel,
+            LayerOutput.FData[LayerOutput.Size - 1], 0);
+      end;
+    end;
+  finally
+    for ResidualPos := 0 to MaxResidualPos do
+    begin
+      GotResiduals[ResidualPos].Free;
+      FullResiduals[ResidualPos].Free;
+    end;
+    MidResidual.Free;
+    Cond.Free;
+    EncStates.Free;
+    Latent.Free;
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestControlNetParity;
 var
   NN: TNNet;

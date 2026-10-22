@@ -9431,6 +9431,9 @@ type
     // The Interval decision for a caller that keeps the tail output, not a
     // residual: true asks for StoreTailOutput, false for RestoreTailOutput.
     function ShouldRunRemainingBlocks(): boolean; overload;
+    // What the next parameterless ShouldRunRemainingBlocks returns, without
+    // counting a step; true when Interval <= 1 (no decision: run everything).
+    function WillRunRemainingBlocks(): boolean;
     procedure StoreTailOutput(TailOutput: TNNetVolume);
     // Dest := the kept tail output (Dest must already have its size).
     procedure RestoreTailOutput(Dest: TNNetVolume);
@@ -12260,6 +12263,8 @@ type
     UNetPassCount: integer;
     // The passes of UNetPassCount that ran only the DeepCache shallow branch.
     UNetCachedPassCount: integer;
+    // ControlNet runs of those passes: only the residuals the shallow branch reads.
+    ControlNetShallowRunCount: integer;
   end;
 
   TStableDiffusionPipeline = class;
@@ -12850,6 +12855,13 @@ procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
   Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
   DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
 
+// Only DownResiduals[0..DownResidualCount-1]: runs the layers their taps read
+// and those taps; MidResidual is untouched below Config.NumDownResiduals.
+procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
+  Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume;
+  DownResidualCount: integer); overload;
+
 // ---------------------------------------------------------------------------
 // T2I-ADAPTER FEATURE-INJECTION IMPORT (diffusers T2IAdapter "full_adapter",
 // e.g. TencentARC/t2iadapter_canny_sd15v2 / t2iadapter_sketch_sd14v1). The
@@ -12957,6 +12969,10 @@ type
     // of the run's first ControlNet (set by BeginDenoise and the multi one).
     FRunGuessMode: boolean;
   protected
+    // The down residuals the pass seeing Inputs reads; a DeepCache shallow pass
+    // reads conv_in's and those of down block 0's first DeepCacheBranch resnets.
+    function PassDownResidualCount(
+      Inputs: TStableDiffusionPassInputs): integer; virtual;
     procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs); override;
@@ -78782,15 +78798,28 @@ end;
 procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
   Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
   DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
-var
-  TextIn, CondIn: TNNetLayer;
-  TapBase, i: integer;
-  NumDownResidualsM1: integer;
 begin
-  if Length(DownResiduals) < Config.NumDownResiduals then
+  ControlNetResiduals(Net, Config, Latent, EncStates, Cond, t, DownResiduals,
+    MidResidual, Config.NumDownResiduals);
+end;
+
+procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
+  Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume;
+  DownResidualCount: integer);
+var
+  TextIn, CondIn, Tap: TNNetLayer;
+  TapBase, ResidualPos, MaxResidualPos: integer;
+begin
+  if (DownResidualCount < 1) or
+    (DownResidualCount > Config.NumDownResiduals) then
+    ImportError('ControlNetResiduals: ' + IntToStr(DownResidualCount) +
+      ' down residuals asked, the net has 1..' +
+      IntToStr(Config.NumDownResiduals) + '.');
+  if Length(DownResiduals) < DownResidualCount then
     ImportError('ControlNetResiduals: DownResiduals has ' +
       IntToStr(Length(DownResiduals)) + ' slots, need ' +
-      IntToStr(Config.NumDownResiduals) + '.');
+      IntToStr(DownResidualCount) + '.');
   ControlNetTimestepInput(Net).Output.FData[0] := t;
   TextIn := ControlNetTextStatesInput(Net);
   if EncStates.Size <> TextIn.Output.Size then
@@ -78804,14 +78833,26 @@ begin
       IntToStr(Cond.Size) + ' <> net cond input size ' +
       IntToStr(CondIn.Output.Size) + '.');
   CondIn.Output.Copy(Cond);
-  Net.Compute(Latent);
   // The residual taps are the LAST NumDownResiduals+1 layers of the net, built
   // CONSECUTIVELY as [down taps..., mid tap] (no sink layer follows them).
   TapBase := Net.CountLayers() - (Config.NumDownResiduals + 1);
-  NumDownResidualsM1 := Config.NumDownResiduals - 1;
-  for i := 0 to NumDownResidualsM1 do
-    DownResiduals[i].Copy(Net.Layers[TapBase + i].Output);
-  MidResidual.Copy(Net.Layers[TapBase + Config.NumDownResiduals].Output);
+  MaxResidualPos := DownResidualCount - 1;
+  if DownResidualCount = Config.NumDownResiduals then Net.Compute(Latent)
+  else
+  begin
+    // Each tap reads its skip; the skips come in build order.
+    Net.Compute(Latent, 0, false,
+      Net.Layers[TapBase + MaxResidualPos].PrevLayer.LayerIdx);
+    Net.ComputeFromFilledInput(TapBase, false, TapBase + MaxResidualPos);
+  end;
+  for ResidualPos := 0 to MaxResidualPos do
+  begin
+    Tap := Net.Layers[TapBase + ResidualPos];
+    Tap.ForceOutputOnRAM();
+    DownResiduals[ResidualPos].Copy(Tap.Output);
+  end;
+  if DownResidualCount = Config.NumDownResiduals then
+    MidResidual.Copy(Net.Layers[TapBase + Config.NumDownResiduals].Output);
 end;
 
 // ===========================================================================
@@ -94814,6 +94855,14 @@ begin
   else Inc(FSkippedStepCount);
 end;
 
+function TDiTFirstBlockCache.WillRunRemainingBlocks(): boolean;
+begin
+  if FInterval <= 1 then exit(true);
+  // ShouldRunRemainingBlocks drops a kept residual before IsIntervalRunStep.
+  Result := not (FIsOutputKept and FHasTailResidual) or
+    (FStepCount mod FInterval = 0);
+end;
+
 procedure TDiTFirstBlockCache.StoreTailOutput(TailOutput: TNNetVolume);
 begin
   CheckKeptKind(true, 'StoreTailOutput');
@@ -96747,6 +96796,7 @@ begin
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
   FImageStats.UNetCachedPassCount := 0;
+  FImageStats.ControlNetShallowRunCount := 0;
   WithControl := StepConditioner.UNetWithControl();
   WithAdapter := StepConditioner.UNetWithAdapter();
   IPAdapterFile := StepConditioner.UNetIPAdapterFile();
@@ -97421,11 +97471,22 @@ begin
   FRunGuessMode := FGuessMode or FConfig.GlobalPoolConditions;
 end;
 
+function TStableDiffusionControlNet.PassDownResidualCount(
+  Inputs: TStableDiffusionPassInputs): integer;
+var
+  PassCache: TDiTFirstBlockCache;
+begin
+  Result := FConfig.NumDownResiduals;
+  PassCache := FPipeline.DeepCacheFor(Inputs);
+  if Assigned(PassCache) and not PassCache.WillRunRemainingBlocks() then
+    Result := Min(FPipeline.FDeepCacheBranch + 1, Result);
+end;
+
 procedure TStableDiffusionControlNet.FillUNetInputs(
   const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
   Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
 var
-  ResidualPos, MaxResidualPos: integer;
+  ResidualPos, MaxResidualPos, ResidualCount, MaxComputedPos: integer;
   StepStart, StepEnd: double;
   ResidualScale: TNeuralFloat;
   LogspaceScales: boolean;
@@ -97447,11 +97508,13 @@ begin
   StepEnd := (FPipeline.FStepPos + 1) / FPipeline.FStepCount;
   if (StepStart < FGuidanceStart) or (StepEnd > FGuidanceEnd) then exit;
   if FRunGuessMode and not (sdpiPrompt in Inputs) then exit;
+  ResidualCount := PassDownResidualCount(Inputs);
   ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, FControlImage,
-    Timestep, FDownResiduals, FMidResidual);
+    Timestep, FDownResiduals, FMidResidual, ResidualCount);
   LogspaceScales := FRunGuessMode and not FConfig.GlobalPoolConditions;
   MaxResidualPos := High(FDownResiduals);
-  for ResidualPos := 0 to MaxResidualPos do
+  MaxComputedPos := ResidualCount - 1;
+  for ResidualPos := 0 to MaxComputedPos do
   begin
     ResidualScale := FConditioningScale;
     // torch.logspace(-1, 0, residual count + 1); the mid residual takes 1.
@@ -97464,6 +97527,11 @@ begin
     SDUNetWriteInput(UNetInputs.ControlDown[ResidualPos],
       FDownResiduals[ResidualPos], {Accumulate=}true,
       'TStableDiffusionControlNet: down residual');
+  end;
+  if ResidualCount < FConfig.NumDownResiduals then
+  begin
+    Inc(FPipeline.FImageStats.ControlNetShallowRunCount);
+    exit;
   end;
   if FConditioningScale <> 1 then FMidResidual.Mul(FConditioningScale);
   if FConfig.GlobalPoolConditions then PoolResidual(FMidResidual);

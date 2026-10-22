@@ -742,8 +742,9 @@ rather than acted on.
         - [ ] GPU box: SD 1.5, 50 steps DDIM, `--deepcache 2/3/5` (branch 0 and
               the default) vs off: time per image and image pairs in
               examples/StableDiffusion/README.md.
-        - [ ] A ControlNet still runs on shallow-only steps although only its
-              shallow-skip residuals are used; skip its deep part there.
+        - [X] A ControlNet still runs on shallow-only steps although only its
+              shallow-skip residuals are used; skip its deep part there
+              (T2I-Adapter features run once per image: nothing to skip).
       - [ ] Self-Attention Guidance for the SD UNet: the with/without image
             pair on SD 1.5 from the GPU box in examples/StableDiffusion/README.md
             (`--sag-scale 0.75`). The pipeline side is done
