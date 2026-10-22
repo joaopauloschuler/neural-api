@@ -19,6 +19,22 @@ The pipeline builds the text encoder, the UNet and the VAE decoder one at a
 time and frees each one after its stage. Peak memory is therefore the UNet, not
 the sum of all components.
 
+With `--repeat N` (N > 1) the example calls `LoadComponents` instead: the
+three nets are built once and stay in memory for all N images, and the prompt
+is encoded once. A kept UNet or VAE decoder is rebuilt only when the latent
+grid changes (a new image size), and a kept text encoder only when the token
+count changes. In the library, `TStableDiffusionPipeline.LoadComponents` /
+`UnloadComponents` do the same for any sequence of calls; the images are
+bit-identical to the build-per-stage path
+(`TestStableDiffusionPipelineKeepLoaded`).
+
+`--int8` stores the UNet and text encoder weights in int8
+(`TNNet.QuantizeWeightsInt8`, the `TMarigoldPipeline` path; properties
+`UNetInt8` and `TextEncoderInt8`). The VAE decoder stays FP32. On the pico
+folder the int8 image is within 0.0092 of the FP32 one (pixels in [0, 1]) and
+the prompt embeds within 0.045 (`TestStableDiffusionPipelineInt8`); the
+quality on a real checkpoint is not measured yet.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -53,6 +69,12 @@ StableDiffusion [--model DIR] [options]
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
                     euler, euler-a or dpm++2m
   --output PNG      output file (default stable_diffusion.png)
+  --repeat N        N images, seeds --seed, --seed+1, ...; the prompt is encoded
+                    once. N > 1 keeps the components loaded and numbers the files
+                    (stable_diffusion_0001.png, ...; default 1)
+  --int8            UNet and text encoder weights in int8 (default FP32)
+  --stats           after each image, a stage table (wall ms; with --gpu also
+                    the host<->OpenCL MB of each stage)
   --gpu             run the nets on OpenCL (build with -dOpenCL)
   --gpu-platform N  OpenCL platform index (default 0)
   --gpu-device N    OpenCL device index (default 0)
@@ -66,6 +88,26 @@ StableDiffusion --model ~/models/stable-diffusion-v1-5 \
 With no `--model` the example runs the committed random pico folder
 `tests/fixtures/tiny_sd15` (16x16, random weights): it checks wiring and I/O
 only.
+
+## Stage table (`--stats`)
+
+After each image, `--stats` prints the wall time of every stage that ran, from
+`TStableDiffusionPipeline.ImageStats`. A load row appears only when that net
+was built for this image; with `--repeat` the prompt rows appear only for
+image 1, which encoded the prompt. The denoise row gives the UNet passes (two
+per step with guidance). With `--gpu` the table also gives the host<->OpenCL
+megabytes moved in each stage. Pico folder, `--repeat 2 --stats --steps 2
+--gpu` on PoCL (CPU OpenCL), image 2:
+
+```
+Stages of image 2 (wall time):
+  Stage                      ms      %
+  encode prompt               -      -  encoded once, before image 1
+  denoise                  19.0   79.2  4 UNet passes x 4.8 ms  up 0.63 MB, down 0.63 MB
+  VAE decode                2.0    8.3  up 0.00 MB, down 0.00 MB
+  PNG save                  3.0   12.5
+  sum of stages            24.0  100.0
+```
 
 ## Limits
 
@@ -84,6 +126,9 @@ only.
   files are untested.
 * The noise (the initial latents and the Euler a step noise) comes from the
   Free Pascal RNG, so a seed does not reproduce a diffusers image.
+* Every UNet pass recomputes the cross-attention K/V of the text states,
+  which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
+  pass, so the K/V are not cached.
 
 ## Build
 

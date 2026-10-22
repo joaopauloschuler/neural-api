@@ -561,7 +561,7 @@ rather than acted on.
             encoder + pipeline + examples/StableDiffusion --width/--height.
             Pico parity vs diffusers float64 at 32x16: UNet output, 3 DDIM
             steps and the image < 1e-4 (TestStableDiffusionPipelineNonSquare).
-            Each size still rebuilds the UNet/VAE (see Memory/speed below).
+            With LoadComponents a size change rebuilds only the UNet/VAE.
       - [ ] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for
             SD 1.5); diffusers allows multiples of 8 by passing upsample_size
             to the up blocks (nearest-resize to the skip size). Needs an
@@ -569,10 +569,28 @@ rather than acted on.
       - [ ] ControlNet / T2I-Adapter are still square: TControlNetConfig.CondGrid
             and TT2IAdapterConfig take one side; BuildControlNet ignores
             Base.LatentGridY.
-      - [ ] Memory/speed: int8/int4 UNet weights (QuantizeWeightsInt8 as in
-            TMarigoldPipeline), keep components loaded across prompts
-            (LoadComponents like TQwenImage21Pipeline), per-phase time/transfer
-            stats, per-prompt caching of the text cross-attention K/V.
+      - [X] Memory/speed (024aba22, a7e6db67, 6aa826fa): LoadComponents /
+            UnloadComponents keep the text encoder, UNet and VAE across calls
+            (rebuilt only on a new token count / latent grid; bit-identical,
+            TestStableDiffusionPipelineKeepLoaded); UNetInt8 / TextEncoderInt8
+            (pico image 0.0092, embeds 0.045 vs FP32,
+            TestStableDiffusionPipelineInt8); ImageStats per-phase ms + OpenCL
+            bytes via the shared NeuralPhaseMarkNow / NeuralChargePhase;
+            examples/StableDiffusion --repeat N, --int8, --stats.
+      - [ ] int8 quality on a real SD 1.5 checkpoint (UNet + CLIP int8 vs FP32
+            image, user's GPU box), and int4 UNet weights (QuantizeWeightsInt4,
+            the QwenImage --int4 path) once int8 is validated.
+      - [ ] A size change still re-reads the UNet/VAE safetensors. Rebuild the
+            graph with BuildSDUNet and copy the weights from the kept net
+            instead (careful with int8: copy before quantizing, or quantize the
+            new net again).
+      - [ ] Per-prompt caching of the cross-attention text K/V (low payoff,
+            ~0.4% of a 512x512 SD 1.5 pass: 2*77*768*sum(C)=1.5 GMAC over the
+            16 attn2 blocks vs ~400 GMAC). Needs a TNNet mechanism to skip the
+            layers that depend only on the text input (AddSDTransformer2D's
+            TSDAttnLayers.Blocks[].Cross_K / Cross_V) while it is unchanged, and two
+            caches, because CFG alternates the cond and uncond text every step
+            (or run CFG as one batch-2 pass).
       - [ ] Wire DiffusionInpainting / ControlNetCanny / T2IAdapterSketch to the
             real CLIP text states (TStableDiffusionPipeline.EncodePrompt) and a
             full sampling loop; they still fill the UNet text input with
