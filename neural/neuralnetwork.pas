@@ -17937,6 +17937,47 @@ type
       {$ENDIF}
   end;
 
+  /// Per-channel mean over a (2r+1)x(2r+1) window, same output size: zero padding and
+  /// a fixed 1/(2r+1)^2 divisor (RVM fast_guided_filter.py BoxFilter). Coded by Claude (AI).
+  TNNetBoxFilter = class(TNNetIdentity)
+    private
+      FRadius: integer;
+      // Horizontal window sums of the source, already scaled by 1/(2r+1)^2.
+      FRowPass: TNNetVolume;
+      // SizeX*Depth zeros, read in place of an out-of-range tap.
+      FZeroRow: TNNetVolume;
+      {$IFDEF OpenCL}
+      FPool2DCL: TNNetPool2DCL;
+      {$ENDIF}
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Dest columns StartX..FinX := box filter of Source; Dest may be Source only
+      // over the full width. The map is symmetric, so the backward reuses it.
+      procedure FilterColumns(Source, Dest: TNNetVolume; StartX, FinX: integer);
+      // True when the OpenCL forward ran; False leaves the source on RAM.
+      function ComputeOnOpenCL(StartTime: double): boolean;
+    protected
+      // Threaded slice: a block of output COLUMNS, both passes.
+      procedure ComputeRange(StartRange, FinRange: integer); override;
+      procedure PrepareChunkedForward(); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pRadius: integer); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      function ChunkEligible(): boolean; override;
+      // ComputeRange's index space: output columns (SizeX).
+      function ChunkWorkCount(): integer; override;
+      {$IFDEF OpenCL}
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
+      property Radius: integer read FRadius;
+  end;
+
   /// SINGLE-LEVEL 1-D DISCRETE WAVELET TRANSFORM layer implemented with the
   /// SECOND-GENERATION LIFTING SCHEME (Sweldens). Over a (SeqLen,1,Depth)
   /// sequence it transforms EACH channel independently along the SeqLen axis:
@@ -99680,6 +99721,270 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetBoxFilter }
+
+constructor TNNetBoxFilter.Create();
+begin
+  Create(1);
+end;
+
+constructor TNNetBoxFilter.Create(pRadius: integer);
+begin
+  inherited Create();
+  if pRadius < 0 then
+    FErrorProc('TNNetBoxFilter requires Radius >= 0. Got ' + IntToStr(pRadius));
+  FRadius := Max(pRadius, 0);
+  FStruct[0] := FRadius;
+  FRowPass := TNNetVolume.Create();
+  FZeroRow := TNNetVolume.Create();
+end;
+
+destructor TNNetBoxFilter.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FPool2DCL) then FreeAndNil(FPool2DCL);
+  {$ENDIF}
+  FZeroRow.Free;
+  FRowPass.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetBoxFilter.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FRowPass.ReSize(FOutput);
+  FZeroRow.ReSize(FOutput.SizeX * FOutput.Depth, 1, 1);
+  FZeroRow.Fill(0);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (Int64(FOutput.Size) >= cNeuralOpenCLMinWork);
+  {$ENDIF}
+end;
+
+// Separable running sums: an X step adds the depth run entering the window and
+// subtracts the one leaving it; Y does the same over row segments.
+procedure TNNetBoxFilter.FilterColumns(Source, Dest: TNNetVolume;
+  StartX, FinX: integer);
+var
+  Depth, RowStride, MaxX, MaxY, X, Y, FirstX, TapX, TapY: integer;
+  FirstTapX, MaxTapX, MaxTapY, EnterPos, LeavePos: integer;
+  RowOffset, CellOffset, EnterOffset, LeaveOffset, TapOffset: integer;
+  ColumnOffset, SegmentLength: integer;
+  Scale: TNeuralFloat;
+  SourcePtr, RowPassPtr, DestPtr, ZeroPtr, EnterPtr, LeavePtr: TNeuralFloatArrPtr;
+begin
+  Depth := Source.Depth;
+  RowStride := Source.SizeX * Depth;
+  MaxX := Source.SizeX - 1;
+  MaxY := Source.SizeY - 1;
+  Scale := 1 / Sqr(2 * FRadius + 1);
+  SourcePtr := Source.DataPtr;
+  RowPassPtr := FRowPass.DataPtr;
+  DestPtr := Dest.DataPtr;
+  ZeroPtr := FZeroRow.DataPtr;
+  FirstX := StartX + 1;
+  FirstTapX := Max(0, StartX - FRadius);
+  MaxTapX := Min(MaxX, StartX + FRadius);
+  // Every row of the X pass is done before the Y pass reads it, so Dest may be
+  // Source over the full width.
+  RowOffset := 0;
+  for Y := 0 to MaxY do
+  begin
+    CellOffset := RowOffset + StartX * Depth;
+    FillChar(RowPassPtr^[CellOffset], Depth * csNeuralFloatSize, 0);
+    TapOffset := RowOffset + FirstTapX * Depth;
+    for TapX := FirstTapX to MaxTapX do
+    begin
+      TNNetVolume.MulAdd(@RowPassPtr^[CellOffset], @SourcePtr^[TapOffset],
+        Scale, Depth);
+      Inc(TapOffset, Depth);
+    end;
+    EnterPos := FirstX + FRadius;
+    LeavePos := FirstX - FRadius - 1;
+    EnterOffset := RowOffset + EnterPos * Depth;
+    LeaveOffset := RowOffset + LeavePos * Depth;
+    for X := FirstX to FinX do
+    begin
+      if EnterPos <= MaxX then EnterPtr := @SourcePtr^[EnterOffset]
+      else EnterPtr := ZeroPtr;
+      if LeavePos >= 0 then LeavePtr := @SourcePtr^[LeaveOffset]
+      else LeavePtr := ZeroPtr;
+      TNNetVolume.AddScaledDifference(@RowPassPtr^[CellOffset + Depth],
+        @RowPassPtr^[CellOffset], EnterPtr, LeavePtr, Scale, Depth);
+      Inc(CellOffset, Depth);
+      Inc(EnterPos);
+      Inc(LeavePos);
+      Inc(EnterOffset, Depth);
+      Inc(LeaveOffset, Depth);
+    end;
+    Inc(RowOffset, RowStride);
+  end;
+  ColumnOffset := StartX * Depth;
+  SegmentLength := (FinX - StartX + 1) * Depth;
+  Move(RowPassPtr^[ColumnOffset], DestPtr^[ColumnOffset],
+    SegmentLength * csNeuralFloatSize);
+  MaxTapY := Min(MaxY, FRadius);
+  RowOffset := ColumnOffset + RowStride;
+  for TapY := 1 to MaxTapY do
+  begin
+    TNNetVolume.Add(@DestPtr^[ColumnOffset], @RowPassPtr^[RowOffset],
+      SegmentLength);
+    Inc(RowOffset, RowStride);
+  end;
+  EnterPos := 1 + FRadius;
+  LeavePos := -FRadius;
+  EnterOffset := ColumnOffset + EnterPos * RowStride;
+  LeaveOffset := ColumnOffset + LeavePos * RowStride;
+  RowOffset := ColumnOffset + RowStride;
+  for Y := 1 to MaxY do
+  begin
+    if EnterPos <= MaxY then EnterPtr := @RowPassPtr^[EnterOffset]
+    else EnterPtr := ZeroPtr;
+    if LeavePos >= 0 then LeavePtr := @RowPassPtr^[LeaveOffset]
+    else LeavePtr := ZeroPtr;
+    TNNetVolume.AddScaledDifference(@DestPtr^[RowOffset],
+      @DestPtr^[RowOffset - RowStride], EnterPtr, LeavePtr, 1, SegmentLength);
+    Inc(RowOffset, RowStride);
+    Inc(EnterPos);
+    Inc(LeavePos);
+    Inc(EnterOffset, RowStride);
+    Inc(LeaveOffset, RowStride);
+  end;
+end;
+
+{$IFDEF OpenCL}
+function TNNetBoxFilter.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FPool2DCL) and FHasOpenCL and
+    (FShouldOpenCL or FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+procedure TNNetBoxFilter.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FNN) and not Assigned(FPool2DCL) then
+    FPool2DCL := TNNetPool2DCL.Create(FNN);
+end;
+
+procedure TNNetBoxFilter.DisableOpenCL();
+begin
+  // FPool2DCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FPool2DCL);
+end;
+
+function TNNetBoxFilter.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetBoxFilter.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FPool2DCL) then Result := FPool2DCL.OutputKernel()
+  else Result := nil;
+end;
+{$ENDIF}
+
+// cai_pool2d at stride 1, padding r and the full (2r+1)^2 divisor is this map.
+function TNNetBoxFilter.ComputeOnOpenCL(StartTime: double): boolean;
+{$IFDEF OpenCL}
+var
+  SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
+  WindowSize: integer;
+{$ENDIF}
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FPool2DCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    // A trainable forward reads the result back for the host backward.
+    KeepOnOpenCL := not FIsTrainable;
+    WindowSize := 2 * FRadius + 1;
+    FPool2DCL.Pool(FPrevLayer.FOutput, FOutput,
+      FOutput.SizeX, FOutput.SizeY, FOutput.Depth,
+      FOutput.SizeX, FOutput.SizeY, WindowSize, {Stride=}1, {Reduce=}1,
+      Sqr(WindowSize), SourceBuffer, KeepOnOpenCL, FRadius);
+    FOutputOnOpenCL := KeepOnOpenCL;
+    FOutputOnRAM := not KeepOnOpenCL;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit(true);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
+
+procedure TNNetBoxFilter.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if ComputeOnOpenCL(StartTime) then exit;
+  FilterColumns(FPrevLayer.FOutput, FOutput, 0, FOutput.SizeX - 1);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBoxFilter.ComputeRange(StartRange, FinRange: integer);
+begin
+  FilterColumns(FPrevLayer.FOutput, FOutput, StartRange, FinRange);
+end;
+
+procedure TNNetBoxFilter.PrepareChunkedForward();
+begin
+  inherited PrepareChunkedForward();
+  {$IFDEF OpenCL}
+  // The chunks write FOutput on the host (see ComputeOnOpenCL).
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
+
+function TNNetBoxFilter.ChunkEligible(): boolean;
+begin
+  // Two running-sum passes cost a few flops per element, so a small map is
+  // shorter than the chunk join.
+  Result := (FNN <> nil) and FNN.FIntraLayerThreading and (not WillOpenCL()) and
+    (FOutput.Size >= 16384);
+end;
+
+function TNNetBoxFilter.ChunkWorkCount(): integer;
+begin
+  Result := FOutput.SizeX;
+end;
+
+procedure TNNetBoxFilter.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Zero padding with a fixed divisor makes the map symmetric (its own adjoint).
+  if FOutputError.Size = FRowPass.Size then
+    FilterColumns(FOutputError, FOutputError, 0, FOutputError.SizeX - 1);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 { TNNetTropicalLinear }
 
 // Tropical (max-plus / min-plus) dense layer. The forward map per output i is
@@ -142082,6 +142387,7 @@ begin
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
       'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
       'TNNetFreeUFourierFilter':    Result := TNNetFreeUFourierFilter.Create(Ft[0]);
+      'TNNetBoxFilter':             Result := TNNetBoxFilter.Create(St[0]);
       'TNNetAddConstant'  :         Result := TNNetAddConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetGradientReversal' :     Result := TNNetGradientReversal.Create(Ft[0]);
@@ -142540,6 +142846,7 @@ begin
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
       if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
       if S[0] = 'TNNetFreeUFourierFilter' then Result := TNNetFreeUFourierFilter.Create(Ft[0]) else
+      if S[0] = 'TNNetBoxFilter' then Result := TNNetBoxFilter.Create(St[0]) else
       if S[0] = 'TNNetAddConstant' then Result := TNNetAddConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetGradientReversal' then Result := TNNetGradientReversal.Create(Ft[0]) else

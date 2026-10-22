@@ -342,6 +342,12 @@ type
     // and 1-wide sides; structure round trip.
     procedure TestFreeUFourierFilterGradientCheck;
     procedure TestFreeUFourierFilterSerializationRoundTrip;
+    // TNNetBoxFilter (RVM BoxFilter): torch values at r=1/2 plus brute-force
+    // windows, input gradient, round trip, ComputeRange column chunks.
+    procedure TestBoxFilterTorchParity;
+    procedure TestBoxFilterGradientCheck;
+    procedure TestBoxFilterSerializationRoundTrip;
+    procedure TestBoxFilterColumnChunks;
     // AddFourierNeuralOperator1D/2D block builders (spectral + pointwise residual)
     procedure TestFourierNeuralOperator1DShape;
     procedure TestFourierNeuralOperator2DShape;
@@ -1110,6 +1116,9 @@ type
     // with ForceOpenCL off.
     procedure FreeUFourierFilterOpenCLParity;
     procedure FreeUFourierFilterResidentChainOpenCL;
+    // TNNetBoxFilter OpenCL forward vs CPU, and in a resident chain.
+    procedure BoxFilterOpenCLParity;
+    procedure BoxFilterResidentChainOpenCL;
     // TNNetConvGRUCell OpenCL forward vs CPU, and in a resident chain with
     // ForceOpenCL off.
     procedure ConvGRUCellOpenCLParity;
@@ -2370,6 +2379,9 @@ type
   // A TNNetSinkAttention subclass the flash forward does not know: it must keep
   // the host Compute (FlashForwardIsExact tests the exact class).
   TSinkAttentionHostSubclass = class(TNNetSinkAttention);
+
+  // Reaches the protected ComputeRange, the chunk path's entry point.
+  TBoxFilterAccess = class(TNNetBoxFilter);
 
 constructor THostOnlyMulByConstant.Create(pMul: TNeuralFloat);
 begin
@@ -92238,6 +92250,357 @@ begin
     WriteLn('  FreeU filter resident chain: max|diff|=', MaxDiff:0:9);
     AssertTrue('FreeU filter resident chain vs CPU max |diff| = ' +
       FloatToStr(MaxDiff), MaxDiff < 1e-3);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Input of the TNNetBoxFilter tests, also what the torch oracle was fed:
+// x[0,d,y,x] = 0.1x + 0.07y^2 - 0.2d + 0.3((xy + d) mod 3).
+procedure FillBoxFilterInput(V: TNNetVolume);
+var
+  X, Y, D: integer;
+begin
+  for Y := 0 to V.SizeY - 1 do
+    for X := 0 to V.SizeX - 1 do
+      for D := 0 to V.Depth - 1 do
+        V[X, Y, D] := 0.1 * X + 0.07 * Y * Y - 0.2 * D + 0.3 * ((X * Y + D) mod 3);
+end;
+
+// Zero-padded window sum divided by the full (2r+1)^2, one cell at a time.
+function BoxFilterReference(V: TNNetVolume; X, Y, D, Radius: integer): TNeuralFloat;
+var
+  TapX, TapY: integer;
+begin
+  Result := 0;
+  for TapY := Y - Radius to Y + Radius do
+    for TapX := X - Radius to X + Radius do
+      if (TapX >= 0) and (TapX < V.SizeX) and (TapY >= 0) and (TapY < V.SizeY) then
+        Result := Result + V[TapX, TapY, D];
+  Result := Result / Sqr(2 * Radius + 1);
+end;
+
+function BoxFilterReferenceDiff(Input, Output: TNNetVolume; Radius: integer): TNeuralFloat;
+var
+  X, Y, D: integer;
+begin
+  Result := 0;
+  for Y := 0 to Input.SizeY - 1 do
+    for X := 0 to Input.SizeX - 1 do
+      for D := 0 to Input.Depth - 1 do
+        Result := Max(Result, Abs(Output[X, Y, D] -
+          BoxFilterReference(Input, X, Y, D, Radius)));
+end;
+
+// Values from RobustVideoMatting model/fast_guided_filter.py BoxFilter(r) (two
+// depthwise convs, zero padding, 1/(2r+1) per axis) in torch, 7x5x3 input above.
+procedure TTestNeuralNumerical.TestBoxFilterTorchParity;
+const
+  PointCount = 9;
+  PointX: array[0..PointCount - 1] of integer = (0, 6, 0, 6, 3, 1, 5, 3, 0);
+  PointY: array[0..PointCount - 1] of integer = (0, 0, 4, 4, 2, 1, 3, 0, 2);
+  PointD: array[0..PointCount - 1] of integer = (0, 1, 2, 0, 1, 2, 0, 2, 1);
+  TorchR1: array[0..PointCount - 1] of TNeuralFloat = (0.0711111, 0.2711111,
+    0.4333334, 0.7000000, 0.7266667, 0.2166667, 1.3766667, 0.2566667, 0.3177778);
+  TorchR2: array[0..PointCount - 1] of TNeuralFloat = (0.1500000, 0.2580000,
+    0.2796000, 0.4956000, 0.8200000, 0.3088000, 0.7320000, 0.2260000, 0.3720000);
+  // SizeX, SizeY, Depth, Radius; the last two windows are wider than the map.
+  CaseCount = 5;
+  CaseSizes: array[0..CaseCount * 4 - 1] of integer = (
+    7, 5, 3, 0,
+    9, 4, 11, 1,
+    6, 8, 17, 2,
+    3, 2, 4, 3,
+    1, 6, 9, 2);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Filter: TNNetLayer;
+  Radius, PointPos, CasePos: integer;
+  Expected, MaxDiff: TNeuralFloat;
+begin
+  Input := TNNetVolume.Create(7, 5, 3);
+  try
+    FillBoxFilterInput(Input);
+    for Radius := 1 to 2 do
+    begin
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(7, 5, 3));
+        Filter := NN.AddLayer(TNNetBoxFilter.Create(Radius));
+        NN.Compute(Input);
+        AssertEquals('box filter keeps SizeX', 7, Filter.Output.SizeX);
+        AssertEquals('box filter keeps SizeY', 5, Filter.Output.SizeY);
+        AssertEquals('box filter keeps Depth', 3, Filter.Output.Depth);
+        for PointPos := 0 to PointCount - 1 do
+        begin
+          if Radius = 1 then Expected := TorchR1[PointPos]
+          else Expected := TorchR2[PointPos];
+          AssertEquals('box filter r=' + IntToStr(Radius) + ' vs torch at point ' +
+            IntToStr(PointPos), Expected,
+            Filter.Output[PointX[PointPos], PointY[PointPos], PointD[PointPos]], 1e-5);
+        end;
+        MaxDiff := BoxFilterReferenceDiff(Input, Filter.Output, Radius);
+        AssertTrue('box filter r=' + IntToStr(Radius) + ' vs brute force max|diff| = ' +
+          FloatToStr(MaxDiff), MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+  for CasePos := 0 to CaseCount - 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(CaseSizes[CasePos * 4], CaseSizes[CasePos * 4 + 1],
+      CaseSizes[CasePos * 4 + 2]);
+    try
+      FillBoxFilterInput(Input);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      Filter := NN.AddLayer(TNNetBoxFilter.Create(CaseSizes[CasePos * 4 + 3]));
+      NN.Compute(Input);
+      MaxDiff := BoxFilterReferenceDiff(Input, Filter.Output,
+        CaseSizes[CasePos * 4 + 3]);
+      AssertTrue('box filter case ' + IntToStr(CasePos) + ' vs brute force max|diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBoxFilterGradientCheck;
+const
+  CaseCount = 4;
+  SizeXs: array[0..CaseCount - 1] of integer = (6, 5, 1, 9);
+  SizeYs: array[0..CaseCount - 1] of integer = (4, 3, 5, 2);
+  Radii: array[0..CaseCount - 1] of integer = (1, 2, 1, 3);
+var
+  CasePos: integer;
+  Err: Double;
+begin
+  // Self-adjoint map: the backward filters the error with the same window.
+  for CasePos := 0 to CaseCount - 1 do
+  begin
+    Err := RealFFT2DGradientError(TNNetBoxFilter.Create(Radii[CasePos]),
+      SizeXs[CasePos], SizeYs[CasePos], 3);
+    AssertTrue('box filter input gradient ' + IntToStr(SizeXs[CasePos]) + 'x' +
+      IntToStr(SizeYs[CasePos]) + ' r=' + IntToStr(Radii[CasePos]) + ' err=' +
+      FloatToStr(Err), Err < 1e-3);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBoxFilterSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+begin
+  SerializationRoundTrip(Self, TNNetBoxFilter.Create(2),
+    'BoxFilter', 6, 5, 3, 1e-6);
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 5, 3));
+    NN.AddLayer(TNNetBoxFilter.Create(3));
+    NN2.LoadFromString(NN.SaveToString());
+    AssertEquals('box filter radius round trips', 3,
+      (NN2.GetLastLayer() as TNNetBoxFilter).Radius);
+  finally
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// ComputeRange over disjoint column blocks (the chunk path) matches Compute.
+procedure TTestNeuralNumerical.TestBoxFilterColumnChunks;
+const
+  csSentinel = -7777;
+  BlockCount = 4;
+  BlockStarts: array[0..BlockCount - 1] of integer = (0, 1, 4, 8);
+  BlockEnds: array[0..BlockCount - 1] of integer = (0, 3, 7, 10);
+var
+  NN: TNNet;
+  Input, SerialOutput: TNNetVolume;
+  Filter: TNNetLayer;
+  Radius, BlockPos: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  Input := TNNetVolume.Create(11, 6, 5);
+  SerialOutput := TNNetVolume.Create();
+  try
+    FillBoxFilterInput(Input);
+    for Radius := 1 to 3 do
+    begin
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(11, 6, 5));
+        Filter := NN.AddLayer(TNNetBoxFilter.Create(Radius));
+        NN.Compute(Input);
+        SerialOutput.Copy(Filter.Output);
+        AssertEquals('one chunk per column', 11, Filter.ChunkWorkCount());
+        Filter.Output.Fill(csSentinel);
+        for BlockPos := BlockCount - 1 downto 0 do
+          TBoxFilterAccess(Filter).ComputeRange(BlockStarts[BlockPos],
+            BlockEnds[BlockPos]);
+        MaxDiff := MaxAbsDiffOfVolumes(SerialOutput, Filter.Output);
+        AssertTrue('box filter r=' + IntToStr(Radius) +
+          ' column chunks vs Compute max|diff| = ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    SerialOutput.Free;
+    Input.Free;
+  end;
+end;
+
+// TNNetBoxFilter under ForceOpenCL (cai_pool2d) vs the host forward, non-square
+// maps incl. 1-wide sides and windows wider than the map. Coded by Claude (AI).
+procedure TTestNeuralNumerical.BoxFilterOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 5;
+  SizeXs: array[0..CaseCount - 1] of integer = (7, 8, 1, 6, 9);
+  SizeYs: array[0..CaseCount - 1] of integer = (5, 3, 4, 1, 6);
+  Depths: array[0..CaseCount - 1] of integer = (3, 6, 3, 5, 4);
+  Radii: array[0..CaseCount - 1] of integer = (1, 2, 1, 2, 3);
+var
+  NN: TNNet;
+  InputA, InputB, OutCPUA, OutCPUB: TNNetVolume;
+  Filter: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos: integer;
+  DiffA, DiffB: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 7400 + CasePos;
+    NN := TNNet.Create();
+    InputA := TNNetVolume.Create(SizeXs[CasePos], SizeYs[CasePos], Depths[CasePos]);
+    InputB := TNNetVolume.Create(InputA);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      FillBoxFilterInput(InputA);
+      InputB.RandomizeGaussian();
+      NN.AddLayer(TNNetInput.Create(SizeXs[CasePos], SizeYs[CasePos],
+        Depths[CasePos]));
+      Filter := NN.AddLayer(TNNetBoxFilter.Create(Radii[CasePos]));
+      NN.SetTrainable(False, False);
+      NN.Compute(InputA);
+      OutCPUA.Copy(Filter.Output);
+      NN.Compute(InputB);
+      OutCPUB.Copy(Filter.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(InputA);
+        AssertTrue('ForceOutputOnRAM must report the filter readable',
+          Filter.ForceOutputOnRAM());
+        DiffA := MaxAbsDiffOfVolumes(OutCPUA, Filter.Output);
+        NN.Compute(InputB);
+        Filter.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffOfVolumes(OutCPUB, Filter.Output);
+        WriteLn('  box filter OpenCL parity case ', CasePos, ': max|diff| A=',
+          DiffA:0:9, ' B=', DiffB:0:9, ' gpu forwards=', Filter.ForwardGPUCnt);
+        AssertEquals('both forwards must run in OpenCL', 2, Filter.ForwardGPUCnt);
+        AssertTrue('box filter input A OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-5);
+        AssertTrue('box filter input B OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffB), DiffB < 1e-5);
+        // A trainable forward still runs in OpenCL but reads its result back.
+        NN.SetTrainable(True, False);
+        NN.Compute(InputA);
+        AssertEquals('a trainable forced forward runs in OpenCL', 3,
+          Filter.ForwardGPUCnt);
+        DiffA := MaxAbsDiffOfVolumes(OutCPUA, Filter.Output);
+        AssertTrue('trainable OpenCL forward read back max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-5);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+    finally
+      OutCPUB.Free; OutCPUA.Free; InputB.Free; InputA.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv -> TNNetBoxFilter -> pointwise
+// conv. The filter binds the resident source and keeps its own output resident
+// (sentinels); the result matches the CPU. Coded by Claude (AI).
+procedure TTestNeuralNumerical.BoxFilterResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  InW = 9;
+  InH = 6;
+  InDepth = 4;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Filter, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4344;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InW, InH, InDepth);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    Filter := NN.AddLayer(TNNetBoxFilter.Create(1));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+    NN.SetTrainable(False, False);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    Filter.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    WriteLn('  box filter resident chain: gpu forwards conv=', Conv.ForwardGPUCnt,
+      ' filter=', Filter.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('the filter must follow its resident source',
+      Filter.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident filter output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('filter host output not downloaded', csSentinel,
+      Filter.Output.Raw[0], 0);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := MaxAbsDiffOfVolumes(OutCPU, NN.GetLastLayer.Output);
+    WriteLn('  box filter resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('box filter resident chain vs CPU max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
   end;

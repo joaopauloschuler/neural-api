@@ -636,6 +636,9 @@ type
       // the value and add 32 elements per iteration; every other build runs the
       // scalar loop. Bit-exact either way: a float add is a float add.
       class procedure AddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); static;
+      // Dst[i] := A[i] + Scale * (B[i] - C[i]): one step of a sliding-window running
+      // sum (TNNetBoxFilter). Dst may alias A. AVX2/64-bit: 32 lanes per iteration.
+      class procedure AddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr; Scale: TNeuralFloat; pSize: integer); static;
       class procedure Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // ExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
       // returns the sum of everything it wrote - the numerator and the
@@ -12028,6 +12031,30 @@ end;
 {$ENDIF}
 {$UNDEF HASAVXADDSCALAR}
 
+{$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXADDSCALEDDIFFERENCE}{$ENDIF}{$ENDIF}
+{$IFDEF HASAVXADDSCALEDDIFFERENCE}
+// Defined later in this file inside the AVX64 asm block.
+procedure AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
+  Scale: TNeuralFloat; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AddScaledDifference(PtrDst, PtrA, PtrB,
+  PtrC: TNeuralFloatArrPtr; Scale: TNeuralFloat; pSize: integer);
+{$IFDEF HASAVXADDSCALEDDIFFERENCE}
+begin
+  if pSize <= 0 then exit;
+  AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC, Scale, pSize);
+end;
+{$ELSE}
+var
+  I, MaxElementPos: integer;
+begin
+  MaxElementPos := pSize - 1;
+  for I := 0 to MaxElementPos do
+    PtrDst^[I] := PtrA^[I] + Scale * (PtrB^[I] - PtrC^[I]);
+end;
+{$ENDIF}
+{$UNDEF HASAVXADDSCALEDDIFFERENCE}
+
 class procedure TNNetVolume.Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
@@ -19654,6 +19681,98 @@ begin
   end;
   for I := localNumElements to NumElementsM1 do
     PtrA^[I] := PtrA^[I] + Value;
+end;
+{$ENDIF}
+{$ENDIF}
+
+{ AVXAddScaledDifference: dst := a + Scale * (b - c), one vsubps + one FMA per
+  8 lanes; 32 elements per iteration through four independent chains, then 8 at
+  a time, then a scalar tail. The parameters go through locals (the
+  AVXDotProductsPacked6x16 idiom) so no load reads an argument register the
+  block already overwrote; Scale is broadcast through a pointer (PIC-safe). }
+{$IFDEF AVX2}
+{$IFDEF AVX64}
+procedure AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
+  Scale: TNeuralFloat; NumElements: integer);
+var
+  localNumElements, I, NumElementsM1: integer;
+  LocalDst, LocalA, LocalB, LocalC, ScalePtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  NumElementsM1 := NumElements - 1;
+  if localNumElements > 0 then
+  begin
+    LocalDst := PtrDst;
+    LocalA := PtrA;
+    LocalB := PtrB;
+    LocalC := PtrC;
+    ScalePtr := Addr(Scale);
+  asm
+  mov rax, LocalA
+  mov r8, LocalB
+  mov r9, LocalC
+  mov rdx, LocalDst
+  mov r10, ScalePtr
+  mov ecx, localNumElements
+  vbroadcastss ymm7, [r10]
+
+  push rcx
+  shr ecx, 5                       // large iterations = elements / 32
+  jz @SkipLargeASDLoop
+@LargeASDLoop:
+  vmovups   ymm0, [r8]
+  vmovups   ymm1, [r8+32]
+  vmovups   ymm2, [r8+64]
+  vmovups   ymm3, [r8+96]
+
+  vsubps    ymm0, ymm0, [r9]
+  vsubps    ymm1, ymm1, [r9+32]
+  vsubps    ymm2, ymm2, [r9+64]
+  vsubps    ymm3, ymm3, [r9+96]
+
+  vfmadd213ps ymm0, ymm7, [rax]    // ymm0 := Scale * (b - c) + a
+  vfmadd213ps ymm1, ymm7, [rax+32]
+  vfmadd213ps ymm2, ymm7, [rax+64]
+  vfmadd213ps ymm3, ymm7, [rax+96]
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm2
+  vmovups   [rdx+96], ymm3
+
+  add rax, 128
+  add r8, 128
+  add r9, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeASDLoop
+
+@SkipLargeASDLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndASD
+  shr ecx, 3                       // small iterations = (elements mod 32) / 8
+@SmallASDLoop:
+  vmovups   ymm0, [r8]
+  vsubps    ymm0, ymm0, [r9]
+  vfmadd213ps ymm0, ymm7, [rax]
+  vmovups   [rdx], ymm0
+  add rax, 32
+  add r8, 32
+  add r9, 32
+  add rdx, 32
+  dec ecx
+  jnz @SmallASDLoop
+
+@EndASD:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'R9', 'R10', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm7'
+  ];
+  end;
+  for I := localNumElements to NumElementsM1 do
+    PtrDst^[I] := PtrA^[I] + Scale * (PtrB^[I] - PtrC^[I]);
 end;
 {$ENDIF}
 {$ENDIF}

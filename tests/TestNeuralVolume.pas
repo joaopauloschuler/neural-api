@@ -27,6 +27,7 @@ type
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeAddScaledDifferenceParity;
     procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
     procedure TestVolumeReluGradParity;
@@ -621,6 +622,48 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeAddScaledDifferenceParity;
+// Dst := A + Scale * (B - C). The AVX2 lanes fuse the multiply-add, so the
+// tolerance is a rounding step; Dst aliasing A is the running-sum use.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 31, 32, 33, 39, 64, 65, 97, 1000);
+  cScale = 0.04;
+var
+  A, B, C, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(A, N);
+    SetLength(B, N);
+    SetLength(C, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      A[K] := (Random - 0.5) * 8;
+      B[K] := (Random - 0.5) * 8;
+      C[K] := (Random - 0.5) * 8;
+      Ref[K] := A[K] + cScale * (B[K] - C[K]);
+      Dst[K] := 12345;
+    end;
+    TNNetVolume.AddScaledDifference(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@A[0]), TNeuralFloatArrPtr(@B[0]),
+      TNeuralFloatArrPtr(@C[0]), cScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('AddScaledDifference[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 1e-6);
+    TNNetVolume.AddScaledDifference(TNeuralFloatArrPtr(@A[0]),
+      TNeuralFloatArrPtr(@A[0]), TNeuralFloatArrPtr(@B[0]),
+      TNeuralFloatArrPtr(@C[0]), cScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('AddScaledDifference in place[' + IntToStr(K) + '] (N=' +
+        IntToStr(N) + ')', Ref[K], A[K], 1e-6);
+  end;
 end;
 
 procedure TTestNeuralVolume.TestVolumeSumSqrCenteredParity;
