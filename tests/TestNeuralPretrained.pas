@@ -119,6 +119,9 @@ type
     // tiny_sd2_depth_io.json (depth2img with a supplied depth map): the latent
     // depth, the steps and the image < 1e-4; OnOpenCL enables OpenCL first.
     procedure CheckSD2Depth2ImgParity(OnOpenCL: boolean);
+    // tiny_sd_x4_upscaler_io.json: both cases, the first again kept, and the
+    // refusals; OnOpenCL enables OpenCL first.
+    procedure CheckSDUpscalerParity(OnOpenCL: boolean);
     // tiny_sd2_depth without a depth map: the pico DPT-Hybrid estimator of
     // tiny_sd2_depth_estimator vs tiny_sd2_depth_estimator_io.json.
     procedure CheckSD2Depth2ImgEstimatorParity(OnOpenCL: boolean;
@@ -1357,6 +1360,7 @@ type
     procedure TestStableDiffusion2Depth2ImgEstimatorOpenCL;
     procedure TestStableDiffusion2Depth2ImgEstimatorKept;
     procedure TestStableDiffusionUpscalerParity;
+    procedure TestStableDiffusionUpscalerOpenCL;
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
@@ -47634,6 +47638,18 @@ end;
 // 12x8 image at noise level 20 and Euler on a 13x10 one (bicubic to 12x8) at
 // 150, then the first case again with the components kept.
 procedure TTestNeuralPretrained.TestStableDiffusionUpscalerParity;
+begin
+  CheckSDUpscalerParity(false);
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionUpscalerOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckSDUpscalerParity(true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.CheckSDUpscalerParity(OnOpenCL: boolean);
 var
   Pipeline, PlainPipeline: TStableDiffusionPipeline;
   Upscaler: TStableDiffusionUpscaler;
@@ -47642,7 +47658,18 @@ var
   LowResImage, ImageNoise, Latents, Embeds: TNNetVolume;
   CasePos, ImageWidth, ImageHeight: integer;
   IsRefused: boolean;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
 begin
+  {$IFDEF OpenCL}
+  if OnOpenCL and not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  {$ENDIF}
   FSD15Oracle := LoadSD15Fixture('tiny_sd_x4_upscaler_io.json');
   Pipeline := CreateSDPipeline('tiny_sd_x4_upscaler');
   PlainPipeline := nil;
@@ -47652,6 +47679,9 @@ begin
   Latents := TNNetVolume.Create;
   Embeds := TNNetVolume.Create;
   try
+    {$IFDEF OpenCL}
+    if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
     AssertEquals('7-channel unet', 7, Pipeline.UNetConfig.InChannels);
     AssertEquals('3-level vae', 4, Pipeline.VaeScaleFactor);
     AssertEquals('default noise level', 20, Upscaler.NoiseLevel);

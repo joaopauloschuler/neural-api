@@ -320,7 +320,9 @@ VAE, the `tiny_sd2` text encoder): DDIM on a 12x8 image at noise level 20,
 Euler on a 13x10 image (resized to 12x8) at noise level 150, and the first
 case again with the components kept; the latents after each step match to
 1e-5 and the 48x32 image to 4e-6 (`TestStableDiffusionUpscalerParity`; the
-UNet alone in `TestSDUNetClassEmbedOnlyCrossParity`). No real checkpoint has
+UNet alone in `TestSDUNetClassEmbedOnlyCrossParity`). With OpenCL enabled the
+same cases match within 1e-4 (`TestStableDiffusionUpscalerOpenCL`; the
+class-label embedding runs on the CPU). No real checkpoint has
 been run yet. The UNet runs at the low-res size: a 128x128 input is a
 128x128 latent grid (SD 1.5 at 512x512 runs 64x64), so plan on a GPU.
 

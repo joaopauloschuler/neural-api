@@ -621,9 +621,9 @@ rather than acted on.
                 the image with diffusers.
           - [ ] The real UNet ships as fp16 weights in many mirrors; the F16
                 loader item below applies.
-          - [ ] OpenCL parity for the upscaler (no TestStableDiffusionUpscaler
-                OpenCL variant yet; the class-label TNNetEmbedding runs on the
-                CPU by design).
+          - [x] OpenCL parity for the upscaler
+                (TestStableDiffusionUpscalerOpenCL, < 1e-4 on PoCL; the
+                class-label TNNetEmbedding runs on the CPU by design).
           - [ ] diffusers' upscale pipeline takes a batch of images and
                 num_images_per_prompt; the conditioner takes one image.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
