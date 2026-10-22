@@ -1918,12 +1918,29 @@ rather than acted on.
             `FInputPrepared` is the user-decision item under "Layer follow-ups".
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
-      - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`,
+      - [X] The SD UNet path (`BuildSDUNetFromSafeTensors`,
             `TStableDiffusionPipeline`) can take the same reader;
             examples/StableDiffusion has no `--lora` yet.
-      - [ ] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
+            DONE: `TStableDiffusionPipeline.AddLoRA/ClearLoRAs`, a
+            `BuildSDUNetFromSafeTensorsEx` overload with LoRA files, the text
+            encoder merged too, `--lora FILE[:SCALE]` + README; the reader
+            gained SD key layouts (older diffusers lora.down /
+            lora_linear_layer / attn-processor, kohya lora_te_), conv LoRA
+            (1x1 and 3x3 LoCon), skip prefixes per component and the
+            `lora_adapter_metadata` alpha.
+      - [X] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
             `load_lora_weights` + `fuse_lora` latent oracle, and no real
             community LoRA has run yet (user run).
+            DONE for SD: `TestStableDiffusionPipelineLoRA` against diffusers
+            float64 (`--lora-only` in make_pico_sd_conditioning_fixtures.py),
+            plus `TestLoRAMergeSDUNetLayouts` / `TestLoRAMergeSDTextEncoder`.
+      - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
+            runwayml/stable-diffusion-v1-5 (user run).
+      - [ ] Qwen-Image has no diffusers `fuse_lora` latent oracle; its reader
+            now also takes `lora_adapter_metadata` (`transformer.r` /
+            `transformer.lora_alpha`), checked on SD files only.
+      - [ ] LyCORIS LoHa / LoKr / Tucker (`lora_mid`) and DoRA files are
+            refused; SDXL LoRAs need the SDXL pipeline first.
 - [ ] TAESD real-checkpoint check: run examples/LatentTextToImage with a
       downloaded `madebyollin/taesd` (`--tiny-vae DIR --fast-vae`) and compare
       the image against the full SD VAE decode. The original madebyollin

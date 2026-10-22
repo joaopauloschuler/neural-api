@@ -156,6 +156,9 @@ type
     // The image LoRA adapter files of the TestLoRAMergeImage* tests.
     function WriteImageLoRAFixtures(): string;
     procedure DeleteImageLoRAFixtures(const Dir: string);
+    // The Stable Diffusion LoRA adapter files of the TestLoRAMergeSD* tests.
+    function WriteSDLoRAFixtures(): string;
+    procedure DeleteSDLoRAFixtures(const Dir: string);
     // TQwenImage21Pipeline over the pico folder vs a pipeline oracle, from
     // its prompt_embeds or (FromTokenIds) from the A2 token ids.
     procedure CheckQwenImage21PipelineOracle(const FixtureName: string;
@@ -1392,6 +1395,9 @@ type
     procedure TestLoRAMergeImageAdapterStack;
     procedure TestLoRAMergeImageAdapterRejects;
     procedure TestQwenImage21TransformerLoRA;
+    procedure TestLoRAMergeSDUNetLayouts;
+    procedure TestLoRAMergeSDTextEncoder;
+    procedure TestStableDiffusionPipelineLoRA;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
     procedure TestGenerationDefaultsFromJSONFile;
@@ -53196,22 +53202,32 @@ begin
   AssertTrue('an adapter for another architecture must be refused', Raised);
 end;
 
-// Queues a [Rows, Cols] tensor of uniform values in [-0.5, 0.5) (RandSeed).
+// Queues a tensor of Shape with uniform values in [-0.5, 0.5) (RandSeed).
 procedure AddRandomLoRAFactor(Writer: TNNetSafeTensorsWriter;
-  const Name: string; Rows, Cols: integer);
+  const Name: string; const Shape: array of Int64); overload;
 var
   Factor: TNNetVolume;
-  ElemCnt, MaxElemPos: integer;
+  ElemCnt, MaxElemPos, DimCnt: integer;
+  ElemCount: Int64;
 begin
-  Factor := TNNetVolume.Create(Rows * Cols, 1, 1);
+  ElemCount := 1;
+  for DimCnt := Low(Shape) to High(Shape) do
+    ElemCount := ElemCount * Shape[DimCnt];
+  Factor := TNNetVolume.Create(integer(ElemCount), 1, 1);
   try
     MaxElemPos := Factor.Size - 1;
     for ElemCnt := 0 to MaxElemPos do
       Factor.FData[ElemCnt] := Random - 0.5;
-    Writer.AddTensorFlat(Name, [Rows, Cols], Factor);
+    Writer.AddTensorFlat(Name, Shape, Factor);
   finally
     Factor.Free;
   end;
+end;
+
+procedure AddRandomLoRAFactor(Writer: TNNetSafeTensorsWriter;
+  const Name: string; Rows, Cols: integer); overload;
+begin
+  AddRandomLoRAFactor(Writer, Name, [Int64(Rows), Int64(Cols)]);
 end;
 
 // Queues a 0-dim F32 scalar (a kohya ".alpha").
@@ -53229,8 +53245,8 @@ begin
   end;
 end;
 
-// Expected += Scale * (B @ A), with A [r, in] and B [out, r] read from
-// AdapterFile and Expected the flat [out, in] base tensor; in double.
+// Expected += Scale * (B @ A), with A [r, in(, kh, kw)] and B [out, r(, 1, 1)]
+// read from AdapterFile and Expected the flat base tensor; in double.
 procedure AddExpectedLoRADelta(Expected: TNNetVolume;
   const AdapterFile, AName, BName: string; Scale: double);
 var
@@ -53246,7 +53262,7 @@ begin
     Adapter.LoadTensorFlat(AName, A);
     Adapter.LoadTensorFlat(BName, B);
     Rank := integer(Adapter.DimSize(AName, 0));
-    InDim := integer(Adapter.DimSize(AName, 1));
+    InDim := integer(Adapter.ElementCount(AName) div Rank);
     OutDim := integer(Adapter.DimSize(BName, 0));
     for OutCnt := 0 to OutDim - 1 do
       for InCnt := 0 to InDim - 1 do
@@ -53473,8 +53489,8 @@ begin
   end;
 end;
 
-// An adapter key with no base tensor and a conv (4-D) LoRA both raise
-// EPretrainedImportError naming the problem. Coded by Claude (AI).
+// An adapter key with no base tensor and a conv (4-D) LoRA on a Linear both
+// raise EPretrainedImportError naming the problem. Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestLoRAMergeImageAdapterRejects;
 var
   Dir: string;
@@ -53529,7 +53545,7 @@ begin
     finally
       Writer.Free;
     end;
-    ExpectRefusal('convolution LoRA');
+    ExpectRefusal('do not fit');
   finally
     Factor.Free;
     DeleteImageLoRAFixtures(Dir);
@@ -53587,6 +53603,288 @@ begin
     Embeds.Free;
     RefRoot.Free;
     DeleteImageLoRAFixtures(Dir);
+  end;
+end;
+
+// Writes the Stable Diffusion adapters of TestLoRAMergeSDUNet* into a new temp
+// dir: <dir>diffusers.safetensors (PEFT lora_A/lora_B, older lora.down and
+// attn-processor keys, a 3x3 conv pair, two text encoder pairs) and
+// <dir>kohya.safetensors (lora_unet_ / lora_te_ pairs with alphas, a 1x1
+// conv pair). Returns the dir.
+function TTestNeuralPretrained.WriteSDLoRAFixtures(): string;
+var
+  Writer: TNNetSafeTensorsWriter;
+begin
+  Result := GetTempDir(false) + 'cai_sd_lora_' +
+    IntToStr(Random(1000000)) + DirectorySeparator;
+  AssertTrue('temp adapter dir', ForceDirectories(Result));
+  RandSeed := 20261022;
+  Writer := TNNetSafeTensorsWriter.Create(Result + 'diffusers.safetensors');
+  try
+    AddRandomLoRAFactor(Writer, 'unet.down_blocks.0.attentions.0.' +
+      'transformer_blocks.0.attn1.to_q.lora_A.weight', [2, 8]);
+    AddRandomLoRAFactor(Writer, 'unet.down_blocks.0.attentions.0.' +
+      'transformer_blocks.0.attn1.to_q.lora_B.weight', [8, 2]);
+    AddRandomLoRAFactor(Writer, 'unet.mid_block.attentions.0.' +
+      'transformer_blocks.0.attn2.to_k.lora.down.weight', [3, 32]);
+    AddRandomLoRAFactor(Writer, 'unet.mid_block.attentions.0.' +
+      'transformer_blocks.0.attn2.to_k.lora.up.weight', [16, 3]);
+    AddRandomLoRAFactor(Writer, 'unet.up_blocks.1.attentions.1.' +
+      'transformer_blocks.0.attn1.processor.to_out_lora.down.weight', [2, 8]);
+    AddRandomLoRAFactor(Writer, 'unet.up_blocks.1.attentions.1.' +
+      'transformer_blocks.0.attn1.processor.to_out_lora.up.weight', [8, 2]);
+    AddRandomLoRAFactor(Writer,
+      'unet.down_blocks.0.resnets.0.conv1.lora_A.weight', [2, 8, 3, 3]);
+    AddRandomLoRAFactor(Writer,
+      'unet.down_blocks.0.resnets.0.conv1.lora_B.weight', [8, 2, 1, 1]);
+    AddRandomLoRAFactor(Writer, 'text_encoder.text_model.encoder.layers.0.' +
+      'self_attn.q_proj.lora_A.weight', [2, 32]);
+    AddRandomLoRAFactor(Writer, 'text_encoder.text_model.encoder.layers.0.' +
+      'self_attn.q_proj.lora_B.weight', [32, 2]);
+    AddRandomLoRAFactor(Writer, 'text_encoder.text_model.encoder.layers.1.' +
+      'self_attn.to_out_lora.down.weight', [2, 32]);
+    AddRandomLoRAFactor(Writer, 'text_encoder.text_model.encoder.layers.1.' +
+      'self_attn.to_out_lora.up.weight', [32, 2]);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+  Writer := TNNetSafeTensorsWriter.Create(Result + 'kohya.safetensors');
+  try
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight',
+      [2, 8, 1, 1]);
+    AddRandomLoRAFactor(Writer,
+      'lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight',
+      [8, 2, 1, 1]);
+    AddLoRAAlpha(Writer, 'lora_unet_down_blocks_0_attentions_0_proj_in.alpha',
+      1);
+    AddRandomLoRAFactor(Writer, 'lora_unet_mid_block_attentions_0_' +
+      'transformer_blocks_0_attn1_to_v.lora_down.weight', [2, 16]);
+    AddRandomLoRAFactor(Writer, 'lora_unet_mid_block_attentions_0_' +
+      'transformer_blocks_0_attn1_to_v.lora_up.weight', [16, 2]);
+    AddLoRAAlpha(Writer, 'lora_unet_mid_block_attentions_0_' +
+      'transformer_blocks_0_attn1_to_v.alpha', 4);
+    AddRandomLoRAFactor(Writer, 'lora_te_text_model_encoder_layers_1_mlp_fc1.' +
+      'lora_down.weight', [2, 32]);
+    AddRandomLoRAFactor(Writer, 'lora_te_text_model_encoder_layers_1_mlp_fc1.' +
+      'lora_up.weight', [64, 2]);
+    AddLoRAAlpha(Writer, 'lora_te_text_model_encoder_layers_1_mlp_fc1.alpha',
+      1);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.DeleteSDLoRAFixtures(const Dir: string);
+begin
+  DeleteFile(Dir + 'diffusers.safetensors');
+  DeleteFile(Dir + 'kohya.safetensors');
+  DeleteFile(Dir + 'metadata.safetensors');
+  RemoveDir(Dir);
+end;
+
+// SD LoRA key layouts on the pico tiny_sd15 UNet: PEFT, older diffusers
+// (lora.down, attn-processor), kohya, linear and 1x1 / 3x3 conv pairs merge to
+// W + scale * (B @ A); text encoder keys are skipped. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeSDUNetLayouts;
+const
+  UserScale = 0.5;
+var
+  Dir, UNetFile: string;
+  Base, Merged: TNNetSafeTensorsReader;
+  Expected, Actual: TNNetVolume;
+
+  procedure CheckMerged(const BaseName, AdapterFile, AName, BName: string;
+    Scale: double);
+  begin
+    Base.LoadTensorFlat(BaseName, Expected);
+    AddExpectedLoRADelta(Expected, AdapterFile, AName, BName, Scale);
+    Merged.LoadTensorFlat(BaseName, Actual);
+    AssertEquals(BaseName + ' size', Expected.Size, Actual.Size);
+    AssertEquals(BaseName + ' vs W + scale * B @ A', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+  end;
+
+begin
+  Dir := WriteSDLoRAFixtures();
+  UNetFile := FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors');
+  Base := TNNetSafeTensorsReader.Create(UNetFile);
+  Merged := nil;
+  Expected := TNNetVolume.Create;
+  Actual := TNNetVolume.Create;
+  try
+    Merged := CreateLoRAMergeChain(TNNetSafeTensorsReader.Create(UNetFile),
+      [Dir + 'diffusers.safetensors'], [UserScale], SDUNetLoRAStripPrefixes,
+      SDUNetLoRASkipPrefixes, false);
+    AssertEquals('diffusers adapted unet tensors', 4,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    CheckMerged('down_blocks.0.attentions.0.transformer_blocks.0.attn1.' +
+      'to_q.weight', Dir + 'diffusers.safetensors', 'unet.down_blocks.0.' +
+      'attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight',
+      'unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.' +
+      'lora_B.weight', UserScale);
+    CheckMerged('mid_block.attentions.0.transformer_blocks.0.attn2.to_k.' +
+      'weight', Dir + 'diffusers.safetensors', 'unet.mid_block.attentions.0.' +
+      'transformer_blocks.0.attn2.to_k.lora.down.weight',
+      'unet.mid_block.attentions.0.transformer_blocks.0.attn2.to_k.lora.up.' +
+      'weight', UserScale);
+    CheckMerged('up_blocks.1.attentions.1.transformer_blocks.0.attn1.' +
+      'to_out.0.weight', Dir + 'diffusers.safetensors', 'unet.up_blocks.1.' +
+      'attentions.1.transformer_blocks.0.attn1.processor.to_out_lora.down.' +
+      'weight', 'unet.up_blocks.1.attentions.1.transformer_blocks.0.attn1.' +
+      'processor.to_out_lora.up.weight', UserScale);
+    CheckMerged('down_blocks.0.resnets.0.conv1.weight',
+      Dir + 'diffusers.safetensors',
+      'unet.down_blocks.0.resnets.0.conv1.lora_A.weight',
+      'unet.down_blocks.0.resnets.0.conv1.lora_B.weight', UserScale);
+    FreeAndNil(Merged);
+    Merged := CreateLoRAMergeChain(TNNetSafeTensorsReader.Create(UNetFile),
+      [Dir + 'kohya.safetensors'], [1.0], SDUNetLoRAStripPrefixes,
+      SDUNetLoRASkipPrefixes, false);
+    AssertEquals('kohya adapted unet tensors', 2,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    // alpha 1 over rank 2, then alpha 4 over rank 2.
+    CheckMerged('down_blocks.0.attentions.0.proj_in.weight',
+      Dir + 'kohya.safetensors',
+      'lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight',
+      'lora_unet_down_blocks_0_attentions_0_proj_in.lora_up.weight', 0.5);
+    CheckMerged('mid_block.attentions.0.transformer_blocks.0.attn1.to_v.weight',
+      Dir + 'kohya.safetensors', 'lora_unet_mid_block_attentions_0_' +
+      'transformer_blocks_0_attn1_to_v.lora_down.weight',
+      'lora_unet_mid_block_attentions_0_transformer_blocks_0_attn1_to_v.' +
+      'lora_up.weight', 2.0);
+  finally
+    Actual.Free;
+    Expected.Free;
+    Merged.Free;
+    Base.Free;
+    DeleteSDLoRAFixtures(Dir);
+  end;
+end;
+
+// The text encoder side: PEFT and kohya keys with and without "text_model."
+// merge into tiny_sd15's CLIP, unet keys are skipped, and a
+// lora_adapter_metadata lora_alpha sets the scale. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLoRAMergeSDTextEncoder;
+const
+  QName = 'text_model.encoder.layers.0.self_attn.q_proj.weight';
+  VName = 'text_model.encoder.layers.1.self_attn.v_proj.weight';
+var
+  Dir, TextFile: string;
+  Base, Merged: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Expected, Actual: TNNetVolume;
+
+  function MergeOne(const AdapterFile: string): TNNetSafeTensorsReader;
+  begin
+    Result := CreateLoRAMergeChain(TNNetSafeTensorsReader.Create(TextFile),
+      [AdapterFile], [1.0], SDTextEncoderLoRAStripPrefixes, [], true);
+  end;
+
+begin
+  Dir := WriteSDLoRAFixtures();
+  TextFile := FixturePath('tiny_sd15/text_encoder/model.safetensors');
+  Base := TNNetSafeTensorsReader.Create(TextFile);
+  Merged := nil;
+  Expected := TNNetVolume.Create;
+  Actual := TNNetVolume.Create;
+  try
+    Merged := MergeOne(Dir + 'diffusers.safetensors');
+    AssertEquals('diffusers adapted text tensors', 2,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    Base.LoadTensorFlat(QName, Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'diffusers.safetensors',
+      'text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_A.weight',
+      'text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_B.weight',
+      1.0);
+    Merged.LoadTensorFlat(QName, Actual);
+    AssertEquals('q_proj merged', 0, MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+    // An attn-processor to_out_lora on CLIP self_attn is out_proj.
+    Base.LoadTensorFlat('text_model.encoder.layers.1.self_attn.out_proj.weight',
+      Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'diffusers.safetensors',
+      'text_encoder.text_model.encoder.layers.1.self_attn.to_out_lora.down.' +
+      'weight', 'text_encoder.text_model.encoder.layers.1.self_attn.' +
+      'to_out_lora.up.weight', 1.0);
+    Merged.LoadTensorFlat('text_model.encoder.layers.1.self_attn.out_proj.' +
+      'weight', Actual);
+    AssertEquals('out_proj merged', 0, MaxAbsVolumeDiff(Expected, Actual),
+      1e-5);
+    FreeAndNil(Merged);
+    Merged := MergeOne(Dir + 'kohya.safetensors');
+    AssertEquals('kohya adapted text tensors', 1,
+      TNNetLoRAMergeReader(Merged).AdaptedTensorCount);
+    Base.LoadTensorFlat('text_model.encoder.layers.1.mlp.fc1.weight', Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'kohya.safetensors',
+      'lora_te_text_model_encoder_layers_1_mlp_fc1.lora_down.weight',
+      'lora_te_text_model_encoder_layers_1_mlp_fc1.lora_up.weight', 0.5);
+    Merged.LoadTensorFlat('text_model.encoder.layers.1.mlp.fc1.weight', Actual);
+    AssertEquals('fc1 merged', 0, MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+    FreeAndNil(Merged);
+    // transformers >= 5 module names (no "text_model."), alpha from metadata.
+    Writer := TNNetSafeTensorsWriter.Create(Dir + 'metadata.safetensors');
+    try
+      AddRandomLoRAFactor(Writer, 'text_encoder.encoder.layers.1.self_attn.' +
+        'v_proj.lora_A.weight', [4, 32]);
+      AddRandomLoRAFactor(Writer, 'text_encoder.encoder.layers.1.self_attn.' +
+        'v_proj.lora_B.weight', [32, 4]);
+      Writer.SetMetadata('lora_adapter_metadata', '{"text_encoder.r": 4, ' +
+        '"text_encoder.lora_alpha": 6.0, "text_encoder.target_modules": ' +
+        '["v_proj"], "text_encoder.use_dora": false, "unet.r": 8}');
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    Merged := MergeOne(Dir + 'metadata.safetensors');
+    Base.LoadTensorFlat(VName, Expected);
+    AddExpectedLoRADelta(Expected, Dir + 'metadata.safetensors',
+      'text_encoder.encoder.layers.1.self_attn.v_proj.lora_A.weight',
+      'text_encoder.encoder.layers.1.self_attn.v_proj.lora_B.weight', 1.5);
+    Merged.LoadTensorFlat(VName, Actual);
+    AssertEquals('v_proj merged at alpha / r', 0,
+      MaxAbsVolumeDiff(Expected, Actual), 1e-5);
+  finally
+    Actual.Free;
+    Expected.Free;
+    Merged.Free;
+    Base.Free;
+    DeleteSDLoRAFixtures(Dir);
+  end;
+end;
+
+// TStableDiffusionPipeline.AddLoRA against diffusers load_lora_weights +
+// fuse_lora float64 (tiny_sd15_lora_io.json): a PEFT file with metadata
+// alpha, a kohya file with alphas (unet and text encoder, linear and conv
+// modules) and both stacked; latents after each step and the image < 1e-4.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineLoRA;
+var
+  Cases, Files, Scales: TJSONArray;
+  Expected: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  CasePos, FilePos: integer;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_lora_io.json');
+  Pipeline := nil;
+  try
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Expected := Cases.Objects[CasePos];
+      Files := Expected.Arrays['files'];
+      Scales := Expected.Arrays['scales'];
+      Pipeline := CreateSD15Pipeline();
+      for FilePos := 0 to Files.Count - 1 do
+        Pipeline.AddLoRA(FixturePath('tiny_sd15_lora/' +
+          Files.Strings[FilePos]), Scales.Floats[FilePos]);
+      AssertEquals('LoRA count', Files.Count, Pipeline.LoRACount);
+      CheckSD15ConditionedParity(Pipeline, Expected);
+      FreeAndNil(Pipeline);
+    end;
+  finally
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
   end;
 end;
 

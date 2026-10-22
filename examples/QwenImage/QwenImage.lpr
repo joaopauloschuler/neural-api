@@ -895,15 +895,10 @@ end;
 function ParseLoRAArg(const Text: string; out FileName: string;
   out Scale: double): string;
 var
-  ColonPos: integer;
+  SpecScale: TNeuralFloat;
 begin
-  FileName := Text;
-  Scale := 1.0;
-  ColonPos := LastDelimiter(':', Text);
-  if (ColonPos > 0) and TryStrToFloat(Copy(Text, ColonPos + 1, MaxInt), Scale,
-    PointFormat()) then
-    FileName := Copy(Text, 1, ColonPos - 1)
-  else Scale := 1.0;
+  SplitLoRASpec(Text, FileName, SpecScale);
+  Scale := SpecScale;
   if not FileExists(FileName) then
     Result := 'file "' + FileName + '" not found.'
   else Result := '';

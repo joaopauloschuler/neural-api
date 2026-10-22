@@ -59,6 +59,38 @@ lowercase TOKEN (`file.pt:easynegative`) to get all of them. Tested against
 diffusers float64 on the pico folder (`TestStableDiffusionTextualInversion*`);
 no real embedding has been run yet.
 
+`--lora FILE[:SCALE]` (repeatable) merges a LoRA `.safetensors` into the
+weights as they load, as diffusers `load_lora_weights` + `fuse_lora` do
+(`TStableDiffusionPipeline.AddLoRA`, `TNNetLoRAMergeReader`). Every adapted
+weight reads as W + SCALE * (alpha / r) * B @ A; nothing is added to the net,
+so the UNet and text encoder run at plain speed. Several `--lora` files add
+their deltas. The reader takes these key layouts:
+
+* diffusers / PEFT: `unet.<module>.lora_A.weight` / `lora_B`, and
+  `text_encoder.<module>...`. alpha / r comes from the file's
+  `lora_adapter_metadata` header when it has one, else it is 1.
+* older diffusers files: `<module>.lora.down.weight` / `lora.up`,
+  `<module>.lora_linear_layer.down.weight`, and attention-processor keys
+  (`attn1.processor.to_q_lora.down.weight`); alpha / r is 1, as in diffusers.
+* kohya / AUTOMATIC1111: `lora_unet_<module with _>.lora_down.weight` /
+  `lora_up` / `alpha`, and `lora_te_` (or `lora_te1_`) for the text encoder;
+  the scale is alpha / r (1 without an alpha).
+
+Linear and convolution modules both merge: a 1x1 `proj_in` / `proj_out` and a
+3x3 resnet conv (kohya LoCon: down [r, in, 3, 3], up [out, r, 1, 1]). Text
+encoder module names with and without `text_model.` both match. A LoRA whose
+module matches no tensor, DoRA, LyCORIS LoHa / LoKr, LoRA biases and SDXL
+`lora_te2_` keys are refused or skipped: a module that matches nothing raises,
+a tensor that is not part of a down/up pair raises, and text encoder 2 keys
+are left out. `--lora ~/loras/style.safetensors:0.7` sets SCALE 0.7.
+
+The merge is tested against diffusers float64 `load_lora_weights` +
+`fuse_lora` on the pico folder (`TestStableDiffusionPipelineLoRA`: a PEFT file
+with metadata alpha, a kohya file with alphas, both stacked; linear and conv
+modules of the UNet and the text encoder), and per key layout against
+W + scale * B @ A (`TestLoRAMergeSDUNetLayouts`, `TestLoRAMergeSDTextEncoder`).
+No community LoRA has been run on a real checkpoint yet.
+
 `--ip-adapter FILE --ip-image PNG [--ip-scale S]` adds an image prompt, as
 diffusers `load_ip_adapter` + `set_ip_adapter_scale` do with
 `h94/IP-Adapter` `models/ip-adapter_sd15.safetensors` (or `.bin`)
@@ -171,6 +203,9 @@ StableDiffusion [--model DIR] [options]
   --embedding F[:T] textual inversion embedding (diffusers learned_embeds
                     .safetensors/.bin or A1111 .pt) under token T (default: the
                     file's); use the token in the prompts; repeatable
+  --lora FILE[:SCALE] merge a LoRA .safetensors (diffusers/PEFT or kohya/A1111
+                    keys; UNet and text encoder) at SCALE (default 1.0);
+                    repeatable
   --ip-adapter FILE IP-Adapter ip-adapter_sd15 (.safetensors/.bin) with its
                     image_encoder/ folder beside it; needs --ip-image
   --ip-image PNG    the image prompt of --ip-adapter

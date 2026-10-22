@@ -77,6 +77,19 @@ not matter; values rounded to 10 digits):
       and Euler a at 1 / 1 (one pass). The noise and Euler a's per-step noise
       are injected.
 
+  tests/fixtures/tiny_sd15_lora/{peft.safetensors,kohya.safetensors}
+      two random LoRAs on tiny_sd15's unet AND text encoder, linear and conv
+      (1x1 proj_in, 3x3 resnet conv1) modules: peft.safetensors as
+      save_lora_weights writes it (unet./text_encoder. lora_A/lora_B keys,
+      lora_adapter_metadata header with lora_alpha != r), kohya.safetensors
+      in the kohya/A1111 layout (lora_unet_/lora_te_ lora_down/lora_up keys
+      with an alpha per module)
+  tests/fixtures/tiny_sd15_lora_io.json
+      StableDiffusionPipeline + load_lora_weights + fuse_lora on tiny_sd15,
+      STEPS guided DDIM steps from injected latents, per case (each file at
+      its own scale, and both stacked through set_adapters): files, scales,
+      timesteps, latents_after, image
+
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
 Coded by Claude (AI).
@@ -88,11 +101,13 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py --ip-adapter-only
   python tools/make_pico_sd_conditioning_fixtures.py --img2img-only
   python tools/make_pico_sd_conditioning_fixtures.py --ip2p-only
+  python tools/make_pico_sd_conditioning_fixtures.py --lora-only
 (--nonsquare-only keeps the committed folders and writes only the two
 non-square files; --inpaint-strength-only writes only the strength file;
 --ip-adapter-only writes only the IP-Adapter folder and its file;
 --img2img-only writes only the img2img file; --ip2p-only writes only the
-InstructPix2Pix folder and its file.)
+InstructPix2Pix folder and its file; --lora-only writes only the LoRA folder
+and its file.)
 """
 import json
 import os
@@ -133,6 +148,8 @@ IP_ADAPTER_DIR = os.path.join(FIXTURES, "tiny_sd15_ip_adapter")
 IP_ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_ip_adapter_io.json")
 IP2P_DIR = os.path.join(FIXTURES, "tiny_sd15_ip2p")
 IP2P_IO = os.path.join(FIXTURES, "tiny_sd15_ip2p_io.json")
+LORA_DIR = os.path.join(FIXTURES, "tiny_sd15_lora")
+LORA_IO = os.path.join(FIXTURES, "tiny_sd15_lora_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
@@ -154,6 +171,15 @@ IP_IMAGE_HEIGHT = 13
 IP_TOKENS = 4            # diffusers ImageProjection of an ip-adapter_sd15
 IMAGE_GUIDANCE = 1.5
 PROMPT = "a photo of an astronaut riding a horse on mars"
+LORA_RANK = 2
+LORA_ALPHA = 3.0         # peft.safetensors metadata: scale alpha / r = 1.5
+KOHYA_ALPHA = 1.0        # kohya.safetensors per-module alpha: scale 0.5
+LORA_UNET_MODULES = ["to_q", "to_k", "to_v", "to_out.0", "proj_in", "ff.net.2",
+                     "conv1", "time_emb_proj"]
+LORA_TEXT_MODULES = ["q_proj", "v_proj", "out_proj", "fc1"]
+LORA_CASES = (("peft", ["peft.safetensors"], [0.8]),
+              ("kohya", ["kohya.safetensors"], [0.7]),
+              ("stack", ["peft.safetensors", "kohya.safetensors"], [0.8, -0.6]))
 
 
 def perturb(module, std=0.05):
@@ -604,8 +630,95 @@ def make_ip2p():
         json.dump(payload, f)
 
 
+def random_lora_layers(model, modules, seed):
+    """Adds a LoRA adapter (r LORA_RANK, alpha LORA_ALPHA) on modules with
+    random A and B; returns its config and peft state dict (float32)."""
+    from peft import LoraConfig
+    from peft.utils import get_peft_model_state_dict
+    config = LoraConfig(r=LORA_RANK, lora_alpha=LORA_ALPHA, target_modules=modules,
+                        init_lora_weights=False)
+    model.add_adapter(config)
+    generator = torch.Generator().manual_seed(seed)
+    layers = get_peft_model_state_dict(model)
+    for key in sorted(layers):
+        value = torch.randn(layers[key].shape, generator=generator,
+                            dtype=torch.float64) * 0.2
+        layers[key] = value.to(torch.float32).contiguous()
+    return config, layers
+
+
+def adapter_metadata(config):
+    """The LoraConfig dict save_lora_weights stores, minus the local path."""
+    metadata = config.to_dict()
+    metadata["base_model_name_or_path"] = None
+    return metadata
+
+
+def kohya_layers(layers, kohya_prefix, alpha):
+    """peft keys "<m>.lora_A.weight" -> "<kohya_prefix><m with _>.lora_down
+    .weight" (lora_up, alpha alongside)."""
+    out = {}
+    for key, value in layers.items():
+        module, factor = key.rsplit(".lora_", 1)
+        flat = kohya_prefix + module.replace(".", "_")
+        out[flat + (".lora_down.weight" if factor.startswith("A") else
+                    ".lora_up.weight")] = value
+        out[flat + ".alpha"] = torch.tensor(alpha, dtype=torch.float32)
+    return out
+
+
+def make_lora():
+    os.makedirs(LORA_DIR, exist_ok=True)
+    pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float32,
+                                                   safety_checker=None)
+    unet_config, unet_layers = random_lora_layers(pipe.unet, LORA_UNET_MODULES,
+                                                  SEED + 50)
+    text_config, text_layers = random_lora_layers(pipe.text_encoder,
+                                                  LORA_TEXT_MODULES, SEED + 51)
+    for name in ("peft.safetensors", "kohya.safetensors"):
+        if os.path.exists(os.path.join(LORA_DIR, name)):
+            os.remove(os.path.join(LORA_DIR, name))
+    StableDiffusionPipeline.save_lora_weights(
+        LORA_DIR, unet_lora_layers=unet_layers, text_encoder_lora_layers=text_layers,
+        weight_name="peft.safetensors",
+        unet_lora_adapter_metadata=adapter_metadata(unet_config),
+        text_encoder_lora_adapter_metadata=adapter_metadata(text_config))
+    pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float32,
+                                                   safety_checker=None)
+    _, unet_layers = random_lora_layers(pipe.unet, LORA_UNET_MODULES, SEED + 52)
+    _, text_layers = random_lora_layers(pipe.text_encoder, LORA_TEXT_MODULES,
+                                        SEED + 53)
+    kohya = kohya_layers(unet_layers, "lora_unet_", KOHYA_ALPHA)
+    kohya.update(kohya_layers(text_layers, "lora_te_", KOHYA_ALPHA))
+    save_file(kohya, os.path.join(LORA_DIR, "kohya.safetensors"))
+    latents = initial_latents()
+    cases = []
+    for name, files, scales in LORA_CASES:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            PICO_DIR, torch_dtype=torch.float64, safety_checker=None)
+        adapter_names = []
+        for file_name in files:
+            adapter_names.append(file_name.split(".")[0])
+            pipe.load_lora_weights(LORA_DIR, weight_name=file_name,
+                                   adapter_name=adapter_names[-1])
+        pipe.set_adapters(adapter_names, scales)
+        pipe.fuse_lora(adapter_names=adapter_names)
+        pipe.unload_lora_weights()
+        out = run(pipe, {}, latents)
+        out.update(name=name, files=files, scales=scales)
+        cases.append(out)
+        print(name, out["timesteps"])
+    payload = {"image_size": IMAGE_SIZE, "steps": STEPS, "guidance_scale": GUIDANCE,
+               "prompt": PROMPT, "latents": chw(latents[0]), "cases": cases}
+    with open(LORA_IO, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
+    if "--lora-only" in sys.argv:
+        make_lora()
+        sys.exit(0)
     if "--ip2p-only" in sys.argv:
         make_ip2p()
         sys.exit(0)
@@ -629,3 +742,4 @@ if __name__ == "__main__":
     if "--nonsquare-only" not in sys.argv:
         make_ip_adapter()
         make_ip2p()
+        make_lora()

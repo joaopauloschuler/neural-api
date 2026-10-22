@@ -11952,7 +11952,14 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
-  const IPAdapterFile: string = ''): TNNet;
+  const IPAdapterFile: string = ''): TNNet; overload;
+// The same with LoRA files merged into the UNet weights as they load
+// (SDUNetLoRAStripPrefixes; text encoder keys skipped), LoRAScales[i] each.
+function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+  const Config: TSDUNetConfig; const LoRAFiles: array of string;
+  const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  const IPAdapterFile: string = ''): TNNet; overload;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
   out Config: TSDUNetConfig; pTrainable: boolean = true;
@@ -12237,6 +12244,9 @@ type
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
     FUNetIPAdapterFile: string;
+    // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
+    FLoRAFiles: TStringArray;
+    FLoRAScales: TNeuralFloatDynArr;
     FVaeGridX, FVaeGridY, FVaeEncoderGridX, FVaeEncoderGridY: integer;
     // Bumped whenever kept nets become stale (OpenCL, int8, unload).
     FComponentEpoch: integer;
@@ -12288,6 +12298,9 @@ type
     function GetVaeScaleFactor(): integer;
     function GetDefaultImageSize(): integer;
     function GetHasNegativePromptEmbeds(): boolean;
+    function GetLoRACount(): integer;
+    // Frees the kept UNet and text encoder and the encoded negative embeds.
+    procedure LoRAsChanged();
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12313,6 +12326,10 @@ type
       const Token: string = ''): string;
     // diffusers maybe_convert_prompt: "Token" -> "Token Token_1 ..." per concept.
     function ExpandInversionTokens(const Prompt: string): string;
+    // A LoRA .safetensors (diffusers, kohya/A1111) merged into the UNet and the
+    // text encoder as they load; drops kept nets and encoded negative embeds.
+    procedure AddLoRA(const FileName: string; Scale: TNeuralFloat = 1.0);
+    procedure ClearLoRAs();
     // [bos] + ids (truncated) + [eos], padded with the pad token to MaxTokenCount.
     function TokenizePrompt(const Prompt: string): TNeuralIntegerArray;
     // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
@@ -12383,6 +12400,7 @@ type
     property Conditioner: TStableDiffusionConditioner read FConditioner
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
+    property LoRACount: integer read GetLoRACount;
   end;
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
@@ -15297,7 +15315,8 @@ type
 
   // A tensor reader over a base checkpoint with a HF PEFT LoRA adapter merged
   // in, in HF tensor space: every base tensor the adapter targets reads as
-  // W + (lora_alpha / r) * B @ A in FP32, per whole-tensor or row-range load,
+  // W + (lora_alpha / r) * B @ A in FP32, per whole-tensor or row-range load
+  // (a conv [out, in, kh, kw] reads as [out, in*kh*kw], B as [out, r, 1, 1]),
   // so the importers' row permutations and int8/int4 quantization see the
   // merged weights. Adapter key "base_model.model.<m>.lora_A.weight" targets
   // the base tensor "<m>.weight", else "<text prefix><m>.weight" (the prefix
@@ -15305,7 +15324,9 @@ type
   // "model." or ""). The other tensors pass through untouched. An entry's
   // Shard field holds its index into FSourceNames (renames keep the link).
   // CreateFromFile takes a lone adapter file (diffusers, ComfyUI or kohya
-  // keys); readers chain, so adapters stack (CreateLoRAMergeChain).
+  // keys, older diffusers lora.down / attn-processor names, and the
+  // lora_adapter_metadata header for r / lora_alpha); readers chain, so
+  // adapters stack (CreateLoRAMergeChain).
   TNNetLoRAMergeReader = class(TNNetSafeTensorsReader)
   private
     FBase: TNNetSafeTensorsReader;     // owned
@@ -15325,9 +15346,9 @@ type
     // Opens AdapterFile and pairs its factors with base tensors; HasConfig
     // false: no r check, kohya pairs scale by "<m>.alpha" / r (1.0 without).
     procedure ReadAdapterModules(const AdapterFile, ConfigFile: string;
-      const Config: TPEFTAdapterConfig;
-      HasConfig: boolean; const StripPrefixes: array of string;
-      UserScale: TNeuralFloat);
+      Config: TPEFTAdapterConfig;
+      HasConfig: boolean; const StripPrefixes, SkipPrefixes: array of string;
+      SkipUnprefixed: boolean; UserScale: TNeuralFloat);
   public
     // Takes ownership of pBase (also freed when Create raises). pAdapterDir
     // holds adapter_config.json and adapter_model.safetensors (or .bin).
@@ -15337,7 +15358,13 @@ type
     // first matching pStripPrefixes entry is cut from each module name.
     constructor CreateFromFile(pBase: TNNetSafeTensorsReader;
       const pAdapterFile: string; const pStripPrefixes: array of string;
-      pUserScale: TNeuralFloat = 1.0);
+      pUserScale: TNeuralFloat = 1.0); overload;
+    // Keys starting with a pSkipPrefixes entry (pSkipUnprefixed: also keys with
+    // no pStripPrefixes entry) belong to another component and are left out.
+    constructor CreateFromFile(pBase: TNNetSafeTensorsReader;
+      const pAdapterFile: string;
+      const pStripPrefixes, pSkipPrefixes: array of string;
+      pSkipUnprefixed: boolean; pUserScale: TNeuralFloat = 1.0); overload;
     destructor Destroy; override;
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
@@ -15355,12 +15382,27 @@ const
   // Key prefixes of image-generator LoRA files: diffusers, ComfyUI, kohya.
   DiffusersLoRAStripPrefixes: array[0..2] of string =
     ('transformer.', 'diffusion_model.', 'lora_unet_');
+  // Stable Diffusion 1.x/2.x LoRA files: the UNet keys and what they skip,
+  // then the text encoder keys (CreateFromFile with pSkipUnprefixed).
+  SDUNetLoRAStripPrefixes: array[0..1] of string = ('unet.', 'lora_unet_');
+  SDUNetLoRASkipPrefixes: array[0..1] of string = ('text_encoder', 'lora_te');
+  SDTextEncoderLoRAStripPrefixes: array[0..2] of string =
+    ('text_encoder.', 'lora_te_', 'lora_te1_');
 
 // Wraps Base in one CreateFromFile reader per adapter file (Scales[i] each);
 // takes ownership of Base, also when it raises.
 function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
   const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
-  const StripPrefixes: array of string): TNNetSafeTensorsReader;
+  const StripPrefixes: array of string): TNNetSafeTensorsReader; overload;
+function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
+  const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
+  const StripPrefixes, SkipPrefixes: array of string;
+  SkipUnprefixed: boolean): TNNetSafeTensorsReader; overload;
+
+// Splits a "FILE[:SCALE]" LoRA argument ('.' decimal point); without a number
+// after the last ':' the whole Spec is FileName and Scale is 1.
+procedure SplitLoRASpec(const Spec: string; out FileName: string;
+  out Scale: TNeuralFloat);
 
 // Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
 // layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
@@ -18430,7 +18472,9 @@ begin
   Layer.FlushWeightCache();
 end;
 
-function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+// ReadPEFTAdapterConfig on a parsed config object; SourceName names it in errors.
+function ReadPEFTAdapterConfigJSON(Obj: TJSONObject;
+  const SourceName: string): TPEFTAdapterConfig;
 const
   // Options that add weights or change the merged math (W + alpha/r * B A).
   UnsupportedOptions: array[0..13] of string = ('use_dora', 'use_rslora',
@@ -18439,9 +18483,6 @@ const
     'target_parameters', 'alora_invocation_tokens', 'arrow_config',
     'kasa_config', 'monteclora_config');
 var
-  JsonText: TStringList;
-  Root: TJSONData;
-  Obj: TJSONObject;
   Field: TJSONData;
   OptionCnt, ItemCnt, MaxItemPos: integer;
   InitText: string;
@@ -18501,6 +18542,70 @@ begin
   Result := Default(TPEFTAdapterConfig);
   Result.Alpha := 1.0;
   Result.Rank := 1;
+  if Obj.Get('peft_type', 'LORA') <> 'LORA' then
+    ImportError('PEFT import: config "' + SourceName + '" has peft_type "' +
+      Obj.Get('peft_type', '') + '" - only LORA is supported.');
+  for OptionCnt := Low(UnsupportedOptions) to High(UnsupportedOptions) do
+    if IsOptionSet(Obj.Find(UnsupportedOptions[OptionCnt])) then
+      ImportError('PEFT import: config "' + SourceName + '" sets "' +
+        UnsupportedOptions[OptionCnt] + '" = ' +
+        Obj.Find(UnsupportedOptions[OptionCnt]).AsJSON +
+        ' - not supported (the weights would not be base + ' +
+        '(lora_alpha/r) * B @ A).');
+  if Obj.Get('bias', 'none') <> 'none' then
+    ImportError('PEFT import: config "' + SourceName + '" has bias "' +
+      Obj.Get('bias', '') + '" - only "none" is supported.');
+  // PiSSA / OLoRA / CorDA / LoftQ / LoRA-GA rewrite the base weights at
+  // initialization, so their adapters do not apply to the original base.
+  Field := Obj.Find('init_lora_weights');
+  if (Field <> nil) and (Field.JSONType = jtString) then
+  begin
+    InitText := Field.AsString;
+    if (InitText <> 'gaussian') and (InitText <> 'eva') and
+       (InitText <> 'orthogonal') then
+      ImportError('PEFT import: config "' + SourceName +
+        '" has init_lora_weights "' + InitText + '" - only true, false, ' +
+        '"gaussian", "eva" and "orthogonal" leave the base weights intact.');
+  end;
+  Field := Obj.Find('r');
+  if (Field <> nil) and not Field.IsNull then
+  begin
+    Result.Rank := Field.AsInteger;
+    Result.RankFound := True;
+    if Result.Rank < 1 then
+      ImportError('PEFT import: config "r" must be a positive integer, got '
+        + Field.AsJSON + '.');
+  end;
+  // lora_alpha defaults to r (PEFT scale 1.0) when absent.
+  Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
+  Field := Obj.Find('target_modules');
+  if (Field <> nil) and (Field is TJSONArray) then
+  begin
+    Result.TargetModulesIsList := true;
+    SetLength(Result.TargetModules, Field.Count);
+    MaxItemPos := Field.Count - 1;
+    for ItemCnt := 0 to MaxItemPos do
+      Result.TargetModules[ItemCnt] := Field.Items[ItemCnt].AsString;
+  end;
+  ReadPattern('rank_pattern', Result.RankPatternKeys, PatternValues);
+  SetLength(Result.RankPatternValues, Length(PatternValues));
+  MaxPatternPos := High(PatternValues);
+  for PatternCnt := 0 to MaxPatternPos do
+  begin
+    Result.RankPatternValues[PatternCnt] := Round(PatternValues[PatternCnt]);
+    if Result.RankPatternValues[PatternCnt] < 1 then
+      ImportError('PEFT import: config "rank_pattern" value for "' +
+        Result.RankPatternKeys[PatternCnt] + '" must be >= 1.');
+  end;
+  ReadPattern('alpha_pattern', Result.AlphaPatternKeys,
+    Result.AlphaPatternValues);
+end;
+
+function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
   if not FileExists(FileName) then
     ImportError('PEFT import: adapter_config.json not found: ' + FileName);
   JsonText := TStringList.Create;
@@ -18517,64 +18622,7 @@ begin
     if not (Root is TJSONObject) then
       ImportError('PEFT import: config "' + FileName +
         '" is not a JSON object.');
-    Obj := TJSONObject(Root);
-    if Obj.Get('peft_type', 'LORA') <> 'LORA' then
-      ImportError('PEFT import: config "' + FileName + '" has peft_type "' +
-        Obj.Get('peft_type', '') + '" - only LORA is supported.');
-    for OptionCnt := Low(UnsupportedOptions) to High(UnsupportedOptions) do
-      if IsOptionSet(Obj.Find(UnsupportedOptions[OptionCnt])) then
-        ImportError('PEFT import: config "' + FileName + '" sets "' +
-          UnsupportedOptions[OptionCnt] + '" = ' +
-          Obj.Find(UnsupportedOptions[OptionCnt]).AsJSON +
-          ' - not supported (the weights would not be base + ' +
-          '(lora_alpha/r) * B @ A).');
-    if Obj.Get('bias', 'none') <> 'none' then
-      ImportError('PEFT import: config "' + FileName + '" has bias "' +
-        Obj.Get('bias', '') + '" - only "none" is supported.');
-    // PiSSA / OLoRA / CorDA / LoftQ / LoRA-GA rewrite the base weights at
-    // initialization, so their adapters do not apply to the original base.
-    Field := Obj.Find('init_lora_weights');
-    if (Field <> nil) and (Field.JSONType = jtString) then
-    begin
-      InitText := Field.AsString;
-      if (InitText <> 'gaussian') and (InitText <> 'eva') and
-         (InitText <> 'orthogonal') then
-        ImportError('PEFT import: config "' + FileName +
-          '" has init_lora_weights "' + InitText + '" - only true, false, ' +
-          '"gaussian", "eva" and "orthogonal" leave the base weights intact.');
-    end;
-    Field := Obj.Find('r');
-    if (Field <> nil) and not Field.IsNull then
-    begin
-      Result.Rank := Field.AsInteger;
-      Result.RankFound := True;
-      if Result.Rank < 1 then
-        ImportError('PEFT import: config "r" must be a positive integer, got '
-          + Field.AsJSON + '.');
-    end;
-    // lora_alpha defaults to r (PEFT scale 1.0) when absent.
-    Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
-    Field := Obj.Find('target_modules');
-    if (Field <> nil) and (Field is TJSONArray) then
-    begin
-      Result.TargetModulesIsList := true;
-      SetLength(Result.TargetModules, Field.Count);
-      MaxItemPos := Field.Count - 1;
-      for ItemCnt := 0 to MaxItemPos do
-        Result.TargetModules[ItemCnt] := Field.Items[ItemCnt].AsString;
-    end;
-    ReadPattern('rank_pattern', Result.RankPatternKeys, PatternValues);
-    SetLength(Result.RankPatternValues, Length(PatternValues));
-    MaxPatternPos := High(PatternValues);
-    for PatternCnt := 0 to MaxPatternPos do
-    begin
-      Result.RankPatternValues[PatternCnt] := Round(PatternValues[PatternCnt]);
-      if Result.RankPatternValues[PatternCnt] < 1 then
-        ImportError('PEFT import: config "rank_pattern" value for "' +
-          Result.RankPatternKeys[PatternCnt] + '" must be >= 1.');
-    end;
-    ReadPattern('alpha_pattern', Result.AlphaPatternKeys,
-      Result.AlphaPatternValues);
+    Result := ReadPEFTAdapterConfigJSON(TJSONObject(Root), FileName);
   finally
     Root.Free;
     JsonText.Free;
@@ -18693,42 +18741,55 @@ begin
     ImportError('LoRA merge: neither adapter_model.safetensors nor ' +
       'adapter_model.bin found in ' + pAdapterDir + '.');
   ReadAdapterModules(AdapterFile, ConfigFile, Config, {HasConfig=}true,
-    [PEFTKeyPrefix], pUserScale);
+    [PEFTKeyPrefix], [], false, pUserScale);
 end;
 
 constructor TNNetLoRAMergeReader.CreateFromFile(pBase: TNNetSafeTensorsReader;
   const pAdapterFile: string; const pStripPrefixes: array of string;
   pUserScale: TNeuralFloat);
-var
-  Config: TPEFTAdapterConfig;
+begin
+  CreateFromFile(pBase, pAdapterFile, pStripPrefixes, [], false, pUserScale);
+end;
+
+constructor TNNetLoRAMergeReader.CreateFromFile(pBase: TNNetSafeTensorsReader;
+  const pAdapterFile: string;
+  const pStripPrefixes, pSkipPrefixes: array of string;
+  pSkipUnprefixed: boolean; pUserScale: TNeuralFloat);
 begin
   inherited CreateBare;
   FBase := pBase; // first: Destroy frees it when anything below raises
   if not FileExists(pAdapterFile) then
     ImportError('LoRA merge: adapter file ' + pAdapterFile + ' not found.');
-  Config := Default(TPEFTAdapterConfig);
-  ReadAdapterModules(pAdapterFile, '', Config, {HasConfig=}false,
-    pStripPrefixes, pUserScale);
+  ReadAdapterModules(pAdapterFile, '', Default(TPEFTAdapterConfig),
+    {HasConfig=}false, pStripPrefixes, pSkipPrefixes, pSkipUnprefixed,
+    pUserScale);
 end;
 
 procedure TNNetLoRAMergeReader.ReadAdapterModules(const AdapterFile,
-  ConfigFile: string; const Config: TPEFTAdapterConfig; HasConfig: boolean;
-  const StripPrefixes: array of string; UserScale: TNeuralFloat);
+  ConfigFile: string; Config: TPEFTAdapterConfig; HasConfig: boolean;
+  const StripPrefixes, SkipPrefixes: array of string; SkipUnprefixed: boolean;
+  UserScale: TNeuralFloat);
 const
-  MaxMarkerPos = 1;
-  // PEFT/diffusers names, then kohya names, of the down (A) and up (B) factor.
-  AMarkers: array[0..MaxMarkerPos] of string = ('.lora_A.', '.lora_down.');
-  BMarkers: array[0..MaxMarkerPos] of string = ('.lora_B.', '.lora_up.');
+  MaxMarkerPos = 4;
+  // The down (A) and up (B) factor names: PEFT/diffusers, kohya, then the
+  // older diffusers LoRACompatibleLinear, lora_linear_layer and attn-processor ones.
+  AMarkers: array[0..MaxMarkerPos] of string = ('.lora_A.', '.lora_down.',
+    '.lora.down.', '.lora_linear_layer.down.', '_lora.down.');
+  BMarkers: array[0..MaxMarkerPos] of string = ('.lora_B.', '.lora_up.',
+    '.lora.up.', '.lora_linear_layer.up.', '_lora.up.');
+  KohyaMarker = 1;
+  AttnProcessorMarker = 4;
   WeightSuffix = '.weight';
+  MetadataKey = 'lora_adapter_metadata';
 var
   AdapterKey, AdapterModulePath, ModulePath, FactorSuffix: string;
-  BName, AlphaName, BaseName, TextPrefix, DType: string;
+  BName, AlphaName, BaseName, TextPrefix, DType, ConfigName: string;
   PairedNames, FlatSources: TStringList;
   Module: TPEFTLoRAMergeModule;
   Alpha: TNeuralFloat;
   SourceCnt, MaxSourcePos, AdapterCnt, MaxAdapterPos, MarkerPos: integer;
   MarkerCnt, PrefixCnt, SourceIdx, PatternIdx, ExpectedRank: integer;
-  ModuleIdx: integer;
+  ModuleIdx, SkippedCount, BaseDimCount: integer;
 
   // "weight" or "<adapter name>.weight" (PEFT drops the name "default").
   function IsLoRAWeightSuffix(const Suffix: string): boolean;
@@ -18740,6 +18801,73 @@ var
     Result := (Length(Suffix) > Length(WeightSuffix)) and
       (Copy(Suffix, Length(NamePart) + 1, MaxInt) = WeightSuffix) and
       (Pos('.', NamePart) = 0);
+  end;
+
+  function HasPrefix(const Key, Prefix: string): boolean;
+  begin
+    Result := (Prefix <> '') and (Copy(Key, 1, Length(Prefix)) = Prefix);
+  end;
+
+  // True for a key of another component (SkipPrefixes, SkipUnprefixed).
+  function IsSkippedKey(const Key: string): boolean;
+  var
+    SkipCnt: integer;
+  begin
+    for SkipCnt := Low(SkipPrefixes) to High(SkipPrefixes) do
+      if HasPrefix(Key, SkipPrefixes[SkipCnt]) then exit(true);
+    if not SkipUnprefixed then exit(false);
+    for SkipCnt := Low(StripPrefixes) to High(StripPrefixes) do
+      if HasPrefix(Key, StripPrefixes[SkipCnt]) then exit(false);
+    Result := true;
+  end;
+
+  // diffusers' lora_adapter_metadata header (its LoraConfig, keys under the
+  // component prefix) as Config; ignored without an "r".
+  procedure ReadAdapterMetadata();
+  var
+    MetaText, Prefix: string;
+    Root: TJSONData;
+    Fields: TJSONObject;
+    FieldCnt, MaxFieldPos, ComponentCnt: integer;
+  begin
+    MetaText := FAdapter.MetadataValue(MetadataKey);
+    if MetaText = '' then exit;
+    Fields := nil;
+    Root := nil;
+    try
+      Root := GetJSON(MetaText);
+    except
+      on E: Exception do
+        ImportError('LoRA merge: ' + MetadataKey + ' of ' + AdapterFile +
+          ' is not valid JSON (' + E.Message + ').');
+    end;
+    try
+      if not (Root is TJSONObject) then exit;
+      Prefix := '';
+      for ComponentCnt := Low(StripPrefixes) to High(StripPrefixes) do
+        if (Copy(StripPrefixes[ComponentCnt],
+          Length(StripPrefixes[ComponentCnt]), 1) = '.') and
+          (TJSONObject(Root).Find(StripPrefixes[ComponentCnt] + 'r') <> nil) then
+        begin
+          Prefix := StripPrefixes[ComponentCnt];
+          break;
+        end;
+      if (Prefix = '') and (TJSONObject(Root).Find('r') = nil) then exit;
+      Fields := TJSONObject.Create;
+      MaxFieldPos := TJSONObject(Root).Count - 1;
+      for FieldCnt := 0 to MaxFieldPos do
+        if (Prefix = '') or HasPrefix(TJSONObject(Root).Names[FieldCnt],
+          Prefix) then
+          Fields.Add(Copy(TJSONObject(Root).Names[FieldCnt],
+            Length(Prefix) + 1, MaxInt),
+            TJSONObject(Root).Items[FieldCnt].Clone);
+      ConfigName := AdapterFile + ' ' + MetadataKey;
+      Config := ReadPEFTAdapterConfigJSON(Fields, ConfigName);
+      HasConfig := true;
+    finally
+      Fields.Free;
+      Root.Free;
+    end;
   end;
 
   // Source index of the base "<m>.weight" whose <m> with dots as underscores
@@ -18778,6 +18906,49 @@ var
         FFileName + '.');
   end;
 
+  // An attn-processor module path "<attn>.processor.to_q" as the base layer:
+  // "<attn>.to_q" (to_out: "to_out.0"); CLIP self_attn: q_proj ... out_proj.
+  function AttnProcessorModulePath(const Path: string): string;
+  const
+    MaxProjPos = 3;
+    ProcessorNames: array[0..MaxProjPos] of string =
+      ('.to_q', '.to_k', '.to_v', '.to_out');
+    ClipNames: array[0..MaxProjPos] of string =
+      ('.q_proj', '.k_proj', '.v_proj', '.out_proj');
+  var
+    ProjCnt, StemLength: integer;
+  begin
+    Result := StringReplace(Path, '.processor.', '.', [rfReplaceAll]);
+    for ProjCnt := 0 to MaxProjPos do
+    begin
+      StemLength := Length(Result) - Length(ProcessorNames[ProjCnt]);
+      if (StemLength > 0) and (Copy(Result, StemLength + 1, MaxInt) =
+        ProcessorNames[ProjCnt]) then
+      begin
+        if Pos('.self_attn.', Result) > 0 then
+          exit(Copy(Result, 1, StemLength) + ClipNames[ProjCnt]);
+        if ProjCnt = MaxProjPos then Result := Result + '.0';
+        exit;
+      end;
+    end;
+  end;
+
+  // A [r, in(, kh, kw)] and B [out, r(, 1, 1)] against the base shape.
+  function FactorsFitBase(): boolean;
+  var
+    DimCnt: integer;
+  begin
+    Result := (FAdapter.DimCount(AdapterKey) = BaseDimCount) and
+      (FAdapter.DimCount(BName) = BaseDimCount) and
+      (FAdapter.DimSize(BName, 0) = Module.OutDim) and
+      (FAdapter.DimSize(BName, 1) = FAdapter.DimSize(AdapterKey, 0)) and
+      (FAdapter.ElementCount(BName) = Module.OutDim *
+      FAdapter.DimSize(AdapterKey, 0));
+    for DimCnt := 1 to BaseDimCount - 1 do
+      Result := Result and (FAdapter.DimSize(AdapterKey, DimCnt) =
+        FBase.DimSize(BaseName, DimCnt));
+  end;
+
 begin
   FCachedModule := -1;
   FA := TNNetVolume.Create;
@@ -18785,6 +18956,8 @@ begin
   FDeltaRow := TNNetVolume.Create;
   FFileName := FBase.FileName;
   FAdapter := CreatePretrainedTensorReader(AdapterFile);
+  ConfigName := ConfigFile;
+  if not HasConfig then ReadAdapterMetadata();
   MaxSourcePos := FBase.Count - 1;
   SetLength(FTensors, FBase.Count);
   SetLength(FSourceNames, FBase.Count);
@@ -18797,14 +18970,18 @@ begin
     FModuleOfSource[SourceCnt] := -1;
   end;
   InvalidateTensorIndex;
-  // The text decoder's prefix, as the Llama importer detects it.
+  // The text model's prefix, as the Llama and CLIP importers detect it
+  // (transformers >= 5 CLIP LoRAs name modules without "text_model.").
   if FBase.HasTensor('model.language_model.embed_tokens.weight') then
     TextPrefix := 'model.language_model.'
   else if FBase.HasTensor('model.embed_tokens.weight') then
     TextPrefix := 'model.'
+  else if FBase.HasTensor('text_model.embeddings.token_embedding.weight') then
+    TextPrefix := 'text_model.'
   else
     TextPrefix := '';
   FlatSources := nil;
+  SkippedCount := 0;
   PairedNames := TStringList.Create;
   try
     PairedNames.Sorted := true;
@@ -18812,6 +18989,12 @@ begin
     for AdapterCnt := 0 to MaxAdapterPos do
     begin
       AdapterKey := FAdapter.TensorName(AdapterCnt);
+      if IsSkippedKey(AdapterKey) then
+      begin
+        PairedNames.Add(AdapterKey);
+        Inc(SkippedCount);
+        continue;
+      end;
       MarkerCnt := 0;
       MarkerPos := 0;
       while (MarkerPos = 0) and (MarkerCnt <= MaxMarkerPos) do
@@ -18830,21 +19013,18 @@ begin
           '" has no matching "' + BName + '" in ' + AdapterFile + '.');
       PairedNames.Add(AdapterKey);
       PairedNames.Add(BName);
-      if (FAdapter.DimCount(AdapterKey) > 2) or
-        (FAdapter.DimCount(BName) > 2) then
-        ImportError('LoRA merge: "' + AdapterKey + '" ' +
-          FAdapter.ShapeAsString(AdapterKey) + ' and "' + BName + '" ' +
-          FAdapter.ShapeAsString(BName) + ' are convolution LoRA factors; ' +
-          'only Linear (2-D) factors merge (' + AdapterFile + ').');
       ModulePath := AdapterModulePath;
       for PrefixCnt := Low(StripPrefixes) to High(StripPrefixes) do
-        if (StripPrefixes[PrefixCnt] <> '') and
-          (Copy(ModulePath, 1, Length(StripPrefixes[PrefixCnt])) =
-          StripPrefixes[PrefixCnt]) then
+        if HasPrefix(ModulePath, StripPrefixes[PrefixCnt]) then
         begin
           Delete(ModulePath, 1, Length(StripPrefixes[PrefixCnt]));
           break;
         end;
+      if MarkerCnt = AttnProcessorMarker then
+        ModulePath := AttnProcessorModulePath(ModulePath)
+      else if MarkerCnt > KohyaMarker then
+        ModulePath := StringReplace(ModulePath, '.processor.', '.',
+          [rfReplaceAll]);
       if FBase.HasTensor(ModulePath + WeightSuffix) then
         BaseName := ModulePath + WeightSuffix
       else if (TextPrefix <> '') and
@@ -18853,6 +19033,9 @@ begin
       else
       begin
         SourceIdx := FlatSourceOf(ModulePath);
+        if (SourceIdx < 0) and (TextPrefix <> '') then
+          SourceIdx := FlatSourceOf(StringReplace(TextPrefix, '.', '_',
+            [rfReplaceAll]) + ModulePath);
         if SourceIdx < 0 then
           ImportError('LoRA merge: adapter module "' + ModulePath +
             '" matches no base tensor (tried "' + ModulePath + '.weight", "' +
@@ -18868,27 +19051,24 @@ begin
       if Config.TargetModulesIsList and
         (PEFTPatternIndex(Config.TargetModules, ModulePath) < 0) then
         ImportError('LoRA merge: adapter module "' + ModulePath +
-          '" is not in the target_modules of ' + ConfigFile + '.');
+          '" is not in the target_modules of ' + ConfigName + '.');
       DType := FBase.GetDType(BaseName);
+      BaseDimCount := FBase.DimCount(BaseName);
       if ((DType <> 'F32') and (DType <> 'F16') and (DType <> 'BF16')) or
-        (FBase.DimCount(BaseName) <> 2) then
+        ((BaseDimCount <> 2) and (BaseDimCount <> 4)) then
         ImportError('LoRA merge: base tensor "' + BaseName + '" (dtype ' +
           DType + ', shape ' + FBase.ShapeAsString(BaseName) +
-          ') is not a dense F32/F16/BF16 matrix.');
+          ') is not a dense F32/F16/BF16 matrix or convolution kernel.');
       Module.AName := AdapterKey;
       Module.BName := BName;
       Module.OutDim := integer(FBase.DimSize(BaseName, 0));
-      Module.InDim := integer(FBase.DimSize(BaseName, 1));
-      if (FAdapter.DimCount(AdapterKey) <> 2) or
-        (FAdapter.DimCount(BName) <> 2) or
-        (FAdapter.DimSize(AdapterKey, 1) <> Module.InDim) or
-        (FAdapter.DimSize(BName, 0) <> Module.OutDim) or
-        (FAdapter.DimSize(BName, 1) <> FAdapter.DimSize(AdapterKey, 0)) then
+      Module.InDim := integer(FBase.ElementCount(BaseName) div Module.OutDim);
+      if not FactorsFitBase() then
         ImportError('LoRA merge: "' + AdapterKey + '" ' +
           FAdapter.ShapeAsString(AdapterKey) + ' and "' + BName + '" ' +
           FAdapter.ShapeAsString(BName) + ' do not fit base "' + BaseName +
-          '" ' + FBase.ShapeAsString(BaseName) +
-          ' (expected [r, in] and [out, r]).');
+          '" ' + FBase.ShapeAsString(BaseName) + ' (expected [r, in] and ' +
+          '[out, r], or [r, in, kh, kw] and [out, r, 1, 1] on a convolution).');
       Module.Rank := integer(FAdapter.DimSize(AdapterKey, 0));
       if HasConfig then
       begin
@@ -18898,7 +19078,7 @@ begin
         else ExpectedRank := Config.Rank;
         if Module.Rank <> ExpectedRank then
           ImportError('LoRA merge: "' + AdapterKey + '" has rank ' +
-            IntToStr(Module.Rank) + ' but ' + ConfigFile + ' gives r = ' +
+            IntToStr(Module.Rank) + ' but ' + ConfigName + ' gives r = ' +
             IntToStr(ExpectedRank) + ' for module "' + ModulePath + '".');
         PatternIdx := PEFTPatternIndex(Config.AlphaPatternKeys, ModulePath);
         if PatternIdx >= 0 then Alpha := Config.AlphaPatternValues[PatternIdx]
@@ -18907,7 +19087,7 @@ begin
       else
       begin
         // As diffusers: kohya pairs scale by alpha / r (1.0 without alpha);
-        // Qwen-Image's loader drops an alpha beside lora_A/lora_B.
+        // its other formats drop an alpha beside the factors.
         Alpha := Module.Rank;
         AlphaName := AdapterModulePath + '.alpha';
         if FAdapter.HasTensor(AlphaName) then
@@ -18917,7 +19097,7 @@ begin
             ImportError('LoRA merge: "' + AlphaName + '" ' +
               FAdapter.ShapeAsString(AlphaName) + ' is not a scalar (' +
               AdapterFile + ').');
-          if MarkerCnt = 1 then
+          if MarkerCnt = KohyaMarker then
           begin
             FAdapter.LoadTensorFlat(AlphaName, FA);
             Alpha := FA.FData[0];
@@ -18946,7 +19126,7 @@ begin
     PairedNames.Free;
     FlatSources.Free;
   end;
-  if Length(FModules) = 0 then
+  if (Length(FModules) = 0) and (SkippedCount = 0) then
     ImportError('LoRA merge: ' + AdapterFile + ' holds no LoRA weights.');
 end;
 
@@ -19078,6 +19258,15 @@ end;
 function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
   const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
   const StripPrefixes: array of string): TNNetSafeTensorsReader;
+begin
+  Result := CreateLoRAMergeChain(Base, AdapterFiles, Scales, StripPrefixes,
+    [], false);
+end;
+
+function CreateLoRAMergeChain(Base: TNNetSafeTensorsReader;
+  const AdapterFiles: array of string; const Scales: array of TNeuralFloat;
+  const StripPrefixes, SkipPrefixes: array of string;
+  SkipUnprefixed: boolean): TNNetSafeTensorsReader;
 var
   FileCnt, MaxFilePos: integer;
 begin
@@ -19092,7 +19281,28 @@ begin
   // A raising CreateFromFile frees the chain built so far (its pBase).
   for FileCnt := 0 to MaxFilePos do
     Result := TNNetLoRAMergeReader.CreateFromFile(Result,
-      AdapterFiles[FileCnt], StripPrefixes, Scales[FileCnt]);
+      AdapterFiles[FileCnt], StripPrefixes, SkipPrefixes, SkipUnprefixed,
+      Scales[FileCnt]);
+end;
+
+procedure SplitLoRASpec(const Spec: string; out FileName: string;
+  out Scale: TNeuralFloat);
+var
+  ColonPos: integer;
+  PointSettings: TFormatSettings;
+  ScaleValue: double;
+begin
+  FileName := Spec;
+  Scale := 1.0;
+  PointSettings := DefaultFormatSettings;
+  PointSettings.DecimalSeparator := '.';
+  ColonPos := LastDelimiter(':', Spec);
+  if (ColonPos > 0) and TryStrToFloat(Copy(Spec, ColonPos + 1, MaxInt),
+    ScaleValue, PointSettings) then
+  begin
+    FileName := Copy(Spec, 1, ColonPos - 1);
+    Scale := ScaleValue;
+  end;
 end;
 
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
@@ -76085,11 +76295,24 @@ function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
   const IPAdapterFile: string = ''): TNNet;
+begin
+  Result := BuildSDUNetFromSafeTensorsEx(FileName, Config, [], [], pTrainable,
+    pWithControl, pWithAdapter, IPAdapterFile);
+end;
+
+function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+  const Config: TSDUNetConfig; const LoRAFiles: array of string;
+  const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  const IPAdapterFile: string = ''): TNNet;
 var
   Reader, IPAdapterReader: TNNetSafeTensorsReader;
 begin
   IPAdapterReader := nil;
-  Reader := CreatePretrainedTensorReader(FileName);
+  // The chain owns (and on a raise frees) the plain reader.
+  Reader := CreateLoRAMergeChain(CreatePretrainedTensorReader(FileName),
+    LoRAFiles, LoRAScales, SDUNetLoRAStripPrefixes, SDUNetLoRASkipPrefixes,
+    {SkipUnprefixed=}false);
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
@@ -93105,6 +93328,14 @@ begin
   ExtraTokenRows := nil;
   Reader := CreatePretrainedTensorReader(SafeTensorsFolderWeightsFile(
     ComponentFolder('text_encoder'), 'model'));
+  if Length(FLoRAFiles) > 0 then
+  begin
+    // LoRA keys name text_model.*; an unprefixed export gets the prefix.
+    if not Reader.HasTensor('text_model.embeddings.token_embedding.weight') then
+      Reader.RenameTensorPrefix('', 'text_model.');
+    Reader := CreateLoRAMergeChain(Reader, FLoRAFiles, FLoRAScales,
+      SDTextEncoderLoRAStripPrefixes, [], {SkipUnprefixed=}true);
+  end;
   try
     if FInversionVectors.Count > 0 then
     begin
@@ -93142,8 +93373,8 @@ begin
   FreeAndNil(FUNet);
   Result := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
     ComponentFolder('unet'), 'diffusion_pytorch_model'),
-    UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false,
-    WithControl, WithAdapter, IPAdapterFile);
+    UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
+    {pTrainable=}false, WithControl, WithAdapter, IPAdapterFile);
   try
     PrepareComponent(Result, FUNetInt8);
   except
@@ -93304,6 +93535,43 @@ end;
 function TStableDiffusionPipeline.GetHasNegativePromptEmbeds(): boolean;
 begin
   Result := FHasNegativePromptEmbeds;
+end;
+
+function TStableDiffusionPipeline.GetLoRACount(): integer;
+begin
+  Result := Length(FLoRAFiles);
+end;
+
+procedure TStableDiffusionPipeline.LoRAsChanged();
+begin
+  FreeAndNil(FTextEncoder);
+  FreeAndNil(FUNet);
+  Inc(FComponentEpoch);
+  FHasNegativePromptEmbeds := false;
+end;
+
+procedure TStableDiffusionPipeline.AddLoRA(const FileName: string;
+  Scale: TNeuralFloat);
+var
+  LoRAIdx: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('TStableDiffusionPipeline: LoRA file ' + FileName +
+      ' not found.');
+  LoRAIdx := Length(FLoRAFiles);
+  SetLength(FLoRAFiles, LoRAIdx + 1);
+  SetLength(FLoRAScales, LoRAIdx + 1);
+  FLoRAFiles[LoRAIdx] := FileName;
+  FLoRAScales[LoRAIdx] := Scale;
+  LoRAsChanged();
+end;
+
+procedure TStableDiffusionPipeline.ClearLoRAs();
+begin
+  if Length(FLoRAFiles) = 0 then exit;
+  SetLength(FLoRAFiles, 0);
+  SetLength(FLoRAScales, 0);
+  LoRAsChanged();
 end;
 
 procedure TStableDiffusionPipeline.LatentGridFor(Width, Height: integer;

@@ -7,7 +7,7 @@ unit neuralsafetensors;
 //   bytes 0..7  : little-endian uint64 N = byte length of the JSON header
 //   bytes 8..8+N-1 : UTF-8 JSON object mapping tensor name ->
 //        {"dtype": "F32", "shape": [d0, d1, ...], "data_offsets": [b, e]}
-//     (an optional "__metadata__" string->string object is ignored)
+//     (an optional "__metadata__" string->string object: MetadataValue)
 //   bytes 8+N.. : raw tensor data; each tensor's bytes live at
 //        [8+N+b, 8+N+e) and hold prod(shape) elements in ROW-MAJOR order
 //        (C order: the LAST dimension is contiguous).
@@ -66,6 +66,8 @@ type
     FDataStarts: array of Int64; // per shard: absolute offset of data section
     FDataSizes: array of Int64;  // per shard: byte length of data section
     FTensors: array of TSafeTensorInfo;
+    // "__metadata__" string pairs of the headers (first shard's value wins).
+    FMetaKeys, FMetaValues: TStringList;
     // In-flight state of one parallel F16/BF16 decode (DecodeHalfBuffer):
     // the shared neuralthread pool splits FParDecodeCount elements among
     // its workers via DecodeHalfJob. Valid only inside a DecodeHalfBuffer
@@ -132,6 +134,8 @@ type
     // Returns the shard index.
     function OpenShard(const pShardFileName: string): integer;
     procedure ParseHeader(const HeaderJson: string; ShardIdx: integer);
+    // Adds the string pairs of a "__metadata__" object to FMetaKeys/Values.
+    procedure ReadMetadata(MetaObj: TJSONObject);
     // Parses a model.safetensors.index.json and opens every referenced shard.
     procedure OpenFromIndex(const pIndexFileName: string);
   public
@@ -209,6 +213,8 @@ type
     // handing the reader to the stock Llama builder. Returns the count
     // dropped. Coded by Claude (AI).
     function RemoveTensorsWithPrefix(const pPrefix: string): integer;
+    // The header "__metadata__" value of pKey; '' when absent.
+    function MetadataValue(const pKey: string): string;
     property FileName: string read FFileName;
   end;
 
@@ -537,7 +543,19 @@ begin
   Hi := High(FStreams);
   for i := 0 to Hi do
     FStreams[i].Free;
+  FMetaValues.Free;
+  FMetaKeys.Free;
   inherited Destroy;
+end;
+
+function TNNetSafeTensorsReader.MetadataValue(const pKey: string): string;
+var
+  KeyIdx: integer;
+begin
+  Result := '';
+  if FMetaKeys = nil then exit;
+  KeyIdx := FMetaKeys.IndexOf(pKey);
+  if KeyIdx >= 0 then Result := FMetaValues[KeyIdx];
 end;
 
 function TNNetSafeTensorsReader.OpenShard(
@@ -660,6 +678,25 @@ begin
   end;
 end;
 
+procedure TNNetSafeTensorsReader.ReadMetadata(MetaObj: TJSONObject);
+var
+  PairCnt, MaxPairPos: integer;
+begin
+  if FMetaKeys = nil then
+  begin
+    FMetaKeys := TStringList.Create;
+    FMetaValues := TStringList.Create;
+  end;
+  MaxPairPos := MetaObj.Count - 1;
+  for PairCnt := 0 to MaxPairPos do
+    if (MetaObj.Items[PairCnt].JSONType = jtString) and
+      (FMetaKeys.IndexOf(MetaObj.Names[PairCnt]) < 0) then
+    begin
+      FMetaKeys.Add(MetaObj.Names[PairCnt]);
+      FMetaValues.Add(MetaObj.Items[PairCnt].AsString);
+    end;
+end;
+
 procedure TNNetSafeTensorsReader.ParseHeader(const HeaderJson: string;
   ShardIdx: integer);
 var
@@ -694,7 +731,12 @@ begin
     for i := 0 to ObjMax do
     begin
       EntryName := Obj.Names[i];
-      if EntryName = '__metadata__' then continue;
+      if EntryName = '__metadata__' then
+      begin
+        if Obj.Items[i] is TJSONObject then
+          ReadMetadata(TJSONObject(Obj.Items[i]));
+        continue;
+      end;
       if not (Obj.Items[i] is TJSONObject) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: entry "%s" is not an object: %s',

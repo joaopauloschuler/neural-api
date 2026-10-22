@@ -19,6 +19,8 @@ prompt encode and keeps the three components loaded. --int8 stores the UNet
 and text encoder weights in int8. --stats prints a per-image stage table
 (wall ms; host<->OpenCL MB with --gpu). --embedding FILE[:TOKEN] (repeatable)
 loads a textual inversion concept, as diffusers load_textual_inversion.
+--lora FILE[:SCALE] (repeatable) merges a LoRA into the UNet and text encoder
+weights as they load, as diffusers load_lora_weights + fuse_lora.
 --ip-adapter FILE --ip-image PNG [--ip-scale S] adds an image prompt through an
 h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
 diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
@@ -67,6 +69,9 @@ type
     ImageGuidanceScale: double;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
+    // --lora files and their scales, in load order.
+    LoRAFiles: array of string;
+    LoRAScales: array of TNeuralFloat;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
@@ -193,6 +198,10 @@ begin
     '(default: the');
   WriteLn('                    file''s); use the token in the prompts; ',
     'repeatable');
+  WriteLn('  --lora FILE[:SCALE] merge a LoRA .safetensors (diffusers/PEFT or ',
+    'kohya/A1111');
+  WriteLn('                    keys; UNet and text encoder) at SCALE ',
+    '(default 1.0); repeatable');
   WriteLn('  --ip-adapter FILE IP-Adapter ip-adapter_sd15 (.safetensors/.bin) ',
     'with its');
   WriteLn('                    image_encoder/ folder beside it; needs ',
@@ -311,6 +320,16 @@ begin
       SetLength(Opt.Embeddings, Length(Opt.Embeddings) + 1);
       Opt.Embeddings[High(Opt.Embeddings)] := NextArg();
     end
+    else if Arg = '--lora' then
+    begin
+      SetLength(Opt.LoRAFiles, Length(Opt.LoRAFiles) + 1);
+      SetLength(Opt.LoRAScales, Length(Opt.LoRAScales) + 1);
+      SplitLoRASpec(NextArg(), Opt.LoRAFiles[High(Opt.LoRAFiles)],
+        Opt.LoRAScales[High(Opt.LoRAScales)]);
+      if not FileExists(Opt.LoRAFiles[High(Opt.LoRAFiles)]) then
+        raise Exception.Create('--lora: file "' +
+          Opt.LoRAFiles[High(Opt.LoRAFiles)] + '" not found');
+    end
     else if Arg = '--ip-adapter' then Opt.IPAdapterFile := NextArg()
     else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
     else if Arg = '--ip-scale' then
@@ -390,7 +409,7 @@ var
   Image, PromptEmbeds: TNNetVolume;
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
-  ImageWidth, ImageHeight, ImagePos, EmbeddingPos: integer;
+  ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
   PngSaveMs: double;
@@ -476,6 +495,12 @@ begin
       EmbeddingToken := Pipeline.LoadTextualInversion(EmbeddingFile,
         EmbeddingToken);
       WriteLn('Embedding: ', EmbeddingToken, ' from ', EmbeddingFile);
+    end;
+    for LoRAPos := 0 to High(Opt.LoRAFiles) do
+    begin
+      Pipeline.AddLoRA(Opt.LoRAFiles[LoRAPos], Opt.LoRAScales[LoRAPos]);
+      WriteLn(Format('LoRA:     %s x %.2f', [Opt.LoRAFiles[LoRAPos],
+        Opt.LoRAScales[LoRAPos]]));
     end;
     if Assigned(Img2Img) then
       WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
