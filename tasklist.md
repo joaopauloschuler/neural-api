@@ -591,6 +591,24 @@ rather than acted on.
             synthetic states, and ControlNet/T2I run one step and write no image.
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
+      - [ ] Textual inversion embeddings (port of diffusers
+            `TextualInversionLoaderMixin.load_textual_inversion`): a
+            `TStableDiffusionPipeline.LoadTextualInversion(FileName, Token)` that
+            reads a diffusers `learned_embeds.safetensors` / `.bin` (one
+            `{token: [N, hidden]}` tensor) or an A1111 `.pt` (`string_to_param['*']`,
+            via TNNetTorchBinReader), registers Token (and Token_1..Token_{N-1}
+            for multi-vector concepts) as added tokens in the CLIP tokenizer
+            (TNeuralHFTokenizer already handles added tokens on encode; it needs
+            a public add call), and appends the rows to
+            `text_model.embeddings.token_embedding` when BuildClipTextTower
+            builds the text encoder (vocab grows by N, the extra rows held by
+            the pipeline until the encoder is built). Rejects a hidden size that
+            does not match the text encoder (SD 1.x 768 vs SD 2.x 1024). Tests:
+            a pico CLIP fixture + a 2-vector concept from a tools/ generator,
+            embeds of a prompt containing the token vs diffusers float64
+            (< 1e-5), and the tokenizer output with the multi-vector expansion.
+            Then a `--embedding file[:token]` option (repeatable) in
+            examples/StableDiffusion and its README.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
