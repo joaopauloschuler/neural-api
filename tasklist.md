@@ -1985,6 +1985,25 @@ rather than acted on.
       `LightGlueForKeypointMatching` in the ~/x venv (keypoints, scores,
       descriptors, match indices). Real checkpoints are small (~5 MB + ~50 MB),
       so a real-pair run fits the dev box.
+      - [X] SuperPoint: `BuildSuperPoint[FromSafeTensors[Ex]]`,
+            `ReadSuperPointConfigFromJSONFile`, `GetSuperPointHeads`,
+            `SuperPointPreprocessImage` (the PIL-backend processor) and
+            `TSuperPointKeypoints` (NMS, threshold, border, top-k, descriptor
+            sampling) in neural/neuralpretrained.pas; pico fixture
+            tools/make_pico_superpoint_fixture.py, 4 tests (dense score and
+            descriptor maps, keypoints, scores, descriptors over 3 post-process
+            settings, preprocessing). Border removal keeps transformers' rule:
+            it compares against the full-resolution size times 8, so only the
+            near border is removed (the original SuperPoint removes both).
+      - [ ] LightGlue (`BuildLightGlueFromSafeTensors[Ex]`), feeding on
+            `TSuperPointKeypoints` (pixel X/Y, Descriptors (Count, 1, D)).
+      - [ ] examples/KeypointMatching + README.md.
+      - [ ] SuperPoint follow-ups: a real-checkpoint run of
+            magic-leap-community/superpoint (check its preprocessor_config
+            do_grayscale and the tensor names); the torchvision-backend
+            processor (uint8 grayscale before an antialiased resize) is not
+            matched, only the PIL backend; `TSuperPointKeypoints` has no
+            post_process_keypoint_detection rescale to the original image size.
 
 ## OpenCL forward coverage — layers still on the host
 

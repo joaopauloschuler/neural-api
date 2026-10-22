@@ -14069,6 +14069,100 @@ function BuildDepthAnythingV2FromSafeTensors(const FileName: string;
   out Config: TDPTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
+// ---------------------------------------------------------------------------
+// SuperPoint keypoint detection + description (DeTone et al. 2018; transformers
+// model_type "superpoint", magic-leap-community/superpoint). VGG-style encoder
+// (two 3x3 conv+ReLU per block, 2x2 max-pool between blocks); score head =
+// 3x3 conv+ReLU, 1x1 conv to Cell*Cell+1 classes, softmax, dustbin dropped,
+// DepthToSpace(Cell) to full resolution; descriptor head = 3x3 conv+ReLU, 1x1
+// conv, per-pixel L2 normalize. TSuperPointKeypoints runs the host post-process.
+// ---------------------------------------------------------------------------
+type
+  TSuperPointConfig = record
+    EncoderHiddenSizes: TNeuralIntegerArray; // [64,64,128,128]
+    DecoderHiddenSize: integer;              // 256
+    KeypointDecoderDim: integer;             // 65 = Cell*Cell + dustbin
+    DescriptorDecoderDim: integer;           // 256
+    KeypointThreshold: TNeuralFloat;         // 0.005
+    MaxKeypoints: integer;                   // -1 keeps every keypoint
+    NmsRadius: integer;                      // 4
+    BorderRemovalDistance: integer;          // 4
+    InputWidth, InputHeight: integer;        // multiples of the cell (640x480)
+    ModelType: string;                       // 'superpoint'
+  end;
+
+// Reads a transformers SuperPoint config.json; the net input is pInputWidth x
+// pInputHeight (SuperPointImageProcessor's default 640 x 480).
+function ReadSuperPointConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer = 640; pInputHeight: integer = 480): TSuperPointConfig;
+
+function SuperPointConfigToString(const Config: TSuperPointConfig): string;
+
+// Pixel side of one score-head cell: 2^(encoder blocks - 1), 8 for SuperPoint.
+function SuperPointCellSize(const Config: TSuperPointConfig): integer;
+
+// Builds the net and loads its weights from Reader (caller owns Reader). Input
+// (W, H, 1) gray in [0,1]; the last layer is the (W, H, 1) pre-NMS score map.
+function BuildSuperPoint(Reader: TNNetSafeTensorsReader;
+  const Config: TSuperPointConfig; pTrainable: boolean = true): TNNet;
+
+function BuildSuperPointFromSafeTensorsEx(const FileName: string;
+  const Config: TSuperPointConfig; pTrainable: boolean = true): TNNet;
+
+// Reads config.json beside FileName ('' = "config.json" next to it), builds
+// the net for a pInputWidth x pInputHeight input and returns the Config.
+function BuildSuperPointFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TSuperPointConfig;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TNNet;
+
+// The score-map layer (the last one) and the normalized (W/Cell, H/Cell, D)
+// descriptor-map layer of a BuildSuperPoint net.
+procedure GetSuperPointHeads(NN: TNNet;
+  out ScoreLayer, DescriptorLayer: TNNetLayer);
+
+// SuperPointImageProcessorPil: Source (W0, H0, 1 or 3) of 0..255 to Dest
+// (Width, Height, 1): PIL bilinear byte resize, /255, NTSC gray (else channel 0).
+procedure SuperPointPreprocessImage(Source, Dest: TNNetVolume;
+  Width, Height: integer; DoGrayscale: boolean = true);
+
+type
+  // Keypoints of one image: pixel (X, Y) in the net input, Scores, and
+  // Descriptors (Count, 1, DescriptorDim), each row L2-normalized.
+  TSuperPointKeypoints = class(TObject)
+  private
+    FCount: integer;
+    FX, FY: TNeuralIntegerArray;
+    FScores: TNeuralFloatDynArr;
+    FDescriptors: TNNetVolume;
+    // Scratch reused across calls: the NMS score/mask maps and candidates.
+    FMaxMask, FSuppressMask, FSuppressedScores: TNNetVolume;
+    FPooled, FRowPooled: TNNetVolume;
+    FCandidateX, FCandidateY, FCandidateOrder: TNeuralIntegerArray;
+    FCandidateScores: TNeuralFloatDynArr;
+    // Dest := max over the (2*Radius+1)^2 window of Source (W, H, 1), clipped.
+    procedure MaxPool(Source, Dest: TNNetVolume; Radius: integer);
+    // FMaxMask := 1 where transformers simple_nms keeps ScoreMap, else 0.
+    procedure SimpleNMS(ScoreMap: TNNetVolume; Radius: integer);
+    function GetX(Index: integer): integer;
+    function GetY(Index: integer): integer;
+    function GetScore(Index: integer): TNeuralFloat;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // transformers' post-process: NMS, threshold, border removal, top
+    // MaxKeypoints, descriptors bilinear-sampled at the keypoints.
+    procedure Extract(ScoreMap, DescriptorMap: TNNetVolume;
+      const Config: TSuperPointConfig);
+    // Runs NN (a BuildSuperPoint net) on Image (W, H, 1), then Extract.
+    procedure Detect(NN: TNNet; Image: TNNetVolume;
+      const Config: TSuperPointConfig);
+    property Count: integer read FCount;
+    property X[Index: integer]: integer read GetX;
+    property Y[Index: integer]: integer read GetY;
+    property Scores[Index: integer]: TNeuralFloat read GetScore;
+    property Descriptors: TNNetVolume read FDescriptors;
+  end;
+
 type
   // ViTPose human-pose KEYPOINT-estimation config (model_type "vitpose"; the
   // nested backbone_config is model_type "vitpose_backbone"). The repo's FIRST
@@ -87479,6 +87573,498 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDPTConfigFromJSONFile(ConfigPath);
   Result := BuildDepthAnythingV2FromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ------------------------------- SuperPoint --------------------------------
+function ReadSuperPointConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer; pInputHeight: integer): TSuperPointConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('SuperPoint import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SuperPoint import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SuperPoint import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'superpoint');
+    if LowerCase(Result.ModelType) <> 'superpoint' then
+      ImportError('SuperPoint import: model_type is "' + Result.ModelType +
+        '", expected "superpoint".');
+    Result.EncoderHiddenSizes := ReadJSONIntArray(Obj, 'encoder_hidden_sizes',
+      [64, 64, 128, 128]);
+    Result.DecoderHiddenSize := Obj.Get('decoder_hidden_size', 256);
+    Result.KeypointDecoderDim := Obj.Get('keypoint_decoder_dim', 65);
+    Result.DescriptorDecoderDim := Obj.Get('descriptor_decoder_dim', 256);
+    Result.KeypointThreshold := Obj.Get('keypoint_threshold', 0.005);
+    Result.MaxKeypoints := Obj.Get('max_keypoints', -1);
+    Result.NmsRadius := Obj.Get('nms_radius', 4);
+    Result.BorderRemovalDistance := Obj.Get('border_removal_distance', 4);
+    Result.InputWidth := pInputWidth;
+    Result.InputHeight := pInputHeight;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SuperPointConfigToString(const Config: TSuperPointConfig): string;
+var
+  BlockPos, MaxBlockPos: integer;
+begin
+  Result := Config.ModelType + ' config: encoder_hidden_sizes=[';
+  MaxBlockPos := High(Config.EncoderHiddenSizes);
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    if BlockPos > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.EncoderHiddenSizes[BlockPos]);
+  end;
+  Result := Result + '], decoder_hidden_size=' +
+    IntToStr(Config.DecoderHiddenSize) +
+    ', keypoint_decoder_dim=' + IntToStr(Config.KeypointDecoderDim) +
+    ', descriptor_decoder_dim=' + IntToStr(Config.DescriptorDecoderDim) +
+    ', keypoint_threshold=' + FloatToStr(Config.KeypointThreshold) +
+    ', max_keypoints=' + IntToStr(Config.MaxKeypoints) +
+    ', nms_radius=' + IntToStr(Config.NmsRadius) +
+    ', border_removal_distance=' + IntToStr(Config.BorderRemovalDistance) +
+    ', input=' + IntToStr(Config.InputWidth) + 'x' +
+    IntToStr(Config.InputHeight);
+end;
+
+function SuperPointCellSize(const Config: TSuperPointConfig): integer;
+begin
+  Result := 1 shl (Length(Config.EncoderHiddenSizes) - 1);
+end;
+
+function BuildSuperPoint(Reader: TNNetSafeTensorsReader;
+  const Config: TSuperPointConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  ConvA, ConvB: array of TNNetLayer;
+  Encoder, DescriptorA, DescriptorB, ScoreA, ScoreB: TNNetLayer;
+  BlockCount, MaxBlockPos, BlockPos, Cell, CellArea, InCh: integer;
+  SubX, SubY, MaxSubPos, ChannelA, ChannelB: integer;
+  BlockPrefix: string;
+  NeuronA, NeuronB: TNNetNeuron;
+  SwapWeights: TNNetVolume;
+  SwapBias: TNeuralFloat;
+begin
+  BlockCount := Length(Config.EncoderHiddenSizes);
+  if BlockCount < 2 then
+    ImportError('SuperPoint import: encoder_hidden_sizes needs >= 2 blocks.');
+  Cell := SuperPointCellSize(Config);
+  CellArea := Cell * Cell;
+  if Config.KeypointDecoderDim <> CellArea + 1 then
+    ImportError('SuperPoint import: keypoint_decoder_dim must be ' +
+      IntToStr(CellArea + 1) + ' (cell ' + IntToStr(Cell) + ' + dustbin), got ' +
+      IntToStr(Config.KeypointDecoderDim) + '.');
+  if (Config.InputWidth < Cell) or (Config.InputHeight < Cell) or
+     (Config.InputWidth mod Cell <> 0) or (Config.InputHeight mod Cell <> 0) then
+    ImportError('SuperPoint import: input ' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight) + ' must be a positive multiple of ' +
+      IntToStr(Cell) + ' on both sides.');
+  MaxBlockPos := BlockCount - 1;
+  SetLength(ConvA, BlockCount);
+  SetLength(ConvB, BlockCount);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.InputWidth, Config.InputHeight, 1));
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      ConvA[BlockPos] := NN.AddLayer(TNNetConvolutionReLU.Create(
+        Config.EncoderHiddenSizes[BlockPos], 3, 1, 1, 0).SetTrainable(pTrainable));
+      ConvB[BlockPos] := NN.AddLayer(TNNetConvolutionReLU.Create(
+        Config.EncoderHiddenSizes[BlockPos], 3, 1, 1, 0).SetTrainable(pTrainable));
+      if BlockPos < MaxBlockPos then NN.AddLayer(TNNetMaxPool.Create(2));
+    end;
+    Encoder := NN.GetLastLayer();
+    DescriptorA := NN.AddLayer(TNNetConvolutionReLU.Create(
+      Config.DecoderHiddenSize, 3, 1, 1, 0).SetTrainable(pTrainable));
+    DescriptorB := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.DescriptorDecoderDim, 1, 0, 1, 0).SetTrainable(pTrainable));
+    // eps 1e-24 under the root = torch normalize's max(norm, 1e-12).
+    NN.AddLayer(TNNetL2Normalize.Create(0, 1e-24));
+    ScoreA := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
+      Config.DecoderHiddenSize, 3, 1, 1, 0).SetTrainable(pTrainable), Encoder);
+    ScoreB := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.KeypointDecoderDim, 1, 0, 1, 0).SetTrainable(pTrainable));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    NN.AddLayer(TNNetSplitChannels.Create(0, CellArea));
+    NN.AddLayer(TNNetDepthToSpace.Create(Cell));
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    InCh := 1;
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      BlockPrefix := 'encoder.conv_blocks.' + IntToStr(BlockPos) + '.';
+      LoadVaeConv(Reader, ConvA[BlockPos], BlockPrefix + 'conv_a.weight',
+        BlockPrefix + 'conv_a.bias', Config.EncoderHiddenSizes[BlockPos], InCh, 3);
+      InCh := Config.EncoderHiddenSizes[BlockPos];
+      LoadVaeConv(Reader, ConvB[BlockPos], BlockPrefix + 'conv_b.weight',
+        BlockPrefix + 'conv_b.bias', InCh, InCh, 3);
+    end;
+    LoadVaeConv(Reader, DescriptorA, 'descriptor_decoder.conv_descriptor_a.weight',
+      'descriptor_decoder.conv_descriptor_a.bias', Config.DecoderHiddenSize, InCh, 3);
+    LoadVaeConv(Reader, DescriptorB, 'descriptor_decoder.conv_descriptor_b.weight',
+      'descriptor_decoder.conv_descriptor_b.bias', Config.DescriptorDecoderDim,
+      Config.DecoderHiddenSize, 1);
+    LoadVaeConv(Reader, ScoreA, 'keypoint_decoder.conv_score_a.weight',
+      'keypoint_decoder.conv_score_a.bias', Config.DecoderHiddenSize, InCh, 3);
+    LoadVaeConv(Reader, ScoreB, 'keypoint_decoder.conv_score_b.weight',
+      'keypoint_decoder.conv_score_b.bias', Config.KeypointDecoderDim,
+      Config.DecoderHiddenSize, 1);
+    // transformers reads class SubY*Cell+SubX as pixel (SubX, SubY);
+    // TNNetDepthToSpace reads class SubX*Cell+SubY, so swap the transposed pairs.
+    MaxSubPos := Cell - 1;
+    SwapWeights := TNNetVolume.Create();
+    try
+      for SubX := 0 to MaxSubPos do
+        for SubY := SubX + 1 to MaxSubPos do
+        begin
+          ChannelA := SubX * Cell + SubY;
+          ChannelB := SubY * Cell + SubX;
+          NeuronA := ScoreB.FArrNeurons[ChannelA];
+          NeuronB := ScoreB.FArrNeurons[ChannelB];
+          SwapWeights.Copy(NeuronA.Weights);
+          NeuronA.Weights.Copy(NeuronB.Weights);
+          NeuronB.Weights.Copy(SwapWeights);
+          SwapBias := NeuronA.BiasWeight;
+          NeuronA.BiasWeight := NeuronB.BiasWeight;
+          NeuronB.BiasWeight := SwapBias;
+        end;
+    finally
+      SwapWeights.Free;
+    end;
+    ScoreB.FlushWeightCache();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSuperPointFromSafeTensorsEx(const FileName: string;
+  const Config: TSuperPointConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSuperPoint(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSuperPointFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TSuperPointConfig;
+  pTrainable: boolean; const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSuperPointConfigFromJSONFile(ConfigPath, pInputWidth,
+    pInputHeight);
+  Result := BuildSuperPointFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure GetSuperPointHeads(NN: TNNet;
+  out ScoreLayer, DescriptorLayer: TNNetLayer);
+var
+  LayerPos: integer;
+begin
+  ScoreLayer := NN.GetLastLayer();
+  DescriptorLayer := nil;
+  for LayerPos := NN.CountLayers() - 1 downto 0 do
+    if NN.Layers[LayerPos] is TNNetL2Normalize then
+    begin
+      DescriptorLayer := NN.Layers[LayerPos];
+      break;
+    end;
+  if (DescriptorLayer = nil) or not (ScoreLayer is TNNetDepthToSpace) then
+    raise Exception.Create('GetSuperPointHeads: NN is not a BuildSuperPoint net.');
+end;
+
+procedure SuperPointPreprocessImage(Source, Dest: TNNetVolume;
+  Width, Height: integer; DoGrayscale: boolean);
+const
+  csGrayR = 0.2989;
+  csGrayG = 0.5870;
+  csGrayB = 0.1140;
+  csRescale = 1 / 255;
+var
+  Resized: TNNetVolume;
+  PixelPos, MaxPixelPos, SourcePos, Depth: integer;
+  NeedsGray: boolean;
+begin
+  Resized := TNNetVolume.Create();
+  try
+    ResizeImagePIL(Source, Resized, Width, Height, irfBilinear, true);
+    Dest.ReSize(Width, Height, 1);
+    Depth := Resized.Depth;
+    MaxPixelPos := Width * Height - 1;
+    // transformers leaves an image whose three channels already match as is.
+    NeedsGray := false;
+    if DoGrayscale and (Depth >= 3) then
+      for PixelPos := 0 to MaxPixelPos do
+      begin
+        SourcePos := PixelPos * Depth;
+        if (Resized.FData[SourcePos] <> Resized.FData[SourcePos + 1]) or
+           (Resized.FData[SourcePos + 1] <> Resized.FData[SourcePos + 2]) then
+        begin
+          NeedsGray := true;
+          break;
+        end;
+      end;
+    SourcePos := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      if NeedsGray then
+        Dest.FData[PixelPos] :=
+          (Resized.FData[SourcePos] * csRescale) * csGrayR +
+          (Resized.FData[SourcePos + 1] * csRescale) * csGrayG +
+          (Resized.FData[SourcePos + 2] * csRescale) * csGrayB
+      else
+        Dest.FData[PixelPos] := Resized.FData[SourcePos] * csRescale;
+      Inc(SourcePos, Depth);
+    end;
+  finally
+    Resized.Free;
+  end;
+end;
+
+{ TSuperPointKeypoints }
+
+constructor TSuperPointKeypoints.Create();
+begin
+  inherited Create();
+  FDescriptors := TNNetVolume.Create();
+  FMaxMask := TNNetVolume.Create();
+  FSuppressMask := TNNetVolume.Create();
+  FSuppressedScores := TNNetVolume.Create();
+  FPooled := TNNetVolume.Create();
+  FRowPooled := TNNetVolume.Create();
+end;
+
+destructor TSuperPointKeypoints.Destroy();
+begin
+  FDescriptors.Free;
+  FMaxMask.Free;
+  FSuppressMask.Free;
+  FSuppressedScores.Free;
+  FPooled.Free;
+  FRowPooled.Free;
+  inherited Destroy();
+end;
+
+function TSuperPointKeypoints.GetX(Index: integer): integer;
+begin
+  Result := FX[Index];
+end;
+
+function TSuperPointKeypoints.GetY(Index: integer): integer;
+begin
+  Result := FY[Index];
+end;
+
+function TSuperPointKeypoints.GetScore(Index: integer): TNeuralFloat;
+begin
+  Result := FScores[Index];
+end;
+
+procedure TSuperPointKeypoints.MaxPool(Source, Dest: TNNetVolume;
+  Radius: integer);
+var
+  SizeX, SizeY, MaxPixelX, MaxPixelY, PixelX, PixelY, WindowPos, FirstPos, MaxWindowPos: integer;
+  RowBase: integer;
+  Value: TNeuralFloat;
+begin
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  MaxPixelX := SizeX - 1;
+  MaxPixelY := SizeY - 1;
+  FRowPooled.ReSize(SizeX, SizeY, 1);
+  Dest.ReSize(SizeX, SizeY, 1);
+  // A square max is separable: the row maxima, then their column maxima.
+  for PixelY := 0 to MaxPixelY do
+  begin
+    RowBase := PixelY * SizeX;
+    for PixelX := 0 to MaxPixelX do
+    begin
+      FirstPos := RowBase + Max(PixelX - Radius, 0);
+      MaxWindowPos := RowBase + Min(PixelX + Radius, MaxPixelX);
+      Value := Source.FData[FirstPos];
+      for WindowPos := FirstPos + 1 to MaxWindowPos do
+        if Source.FData[WindowPos] > Value then Value := Source.FData[WindowPos];
+      FRowPooled.FData[RowBase + PixelX] := Value;
+    end;
+  end;
+  for PixelY := 0 to MaxPixelY do
+  begin
+    RowBase := PixelY * SizeX;
+    for PixelX := 0 to MaxPixelX do
+    begin
+      FirstPos := Max(PixelY - Radius, 0) * SizeX + PixelX;
+      MaxWindowPos := Min(PixelY + Radius, MaxPixelY) * SizeX + PixelX;
+      Value := FRowPooled.FData[FirstPos];
+      WindowPos := FirstPos + SizeX;
+      while WindowPos <= MaxWindowPos do
+      begin
+        if FRowPooled.FData[WindowPos] > Value then
+          Value := FRowPooled.FData[WindowPos];
+        Inc(WindowPos, SizeX);
+      end;
+      Dest.FData[RowBase + PixelX] := Value;
+    end;
+  end;
+end;
+
+procedure TSuperPointKeypoints.SimpleNMS(ScoreMap: TNNetVolume; Radius: integer);
+var
+  PixelPos, MaxPixelPos, Pass: integer;
+begin
+  if Radius < 0 then
+    raise Exception.Create('SuperPoint: nms_radius must be >= 0.');
+  MaxPixelPos := ScoreMap.Size - 1;
+  FMaxMask.ReSize(ScoreMap.SizeX, ScoreMap.SizeY, 1);
+  FSuppressedScores.ReSize(ScoreMap.SizeX, ScoreMap.SizeY, 1);
+  MaxPool(ScoreMap, FPooled, Radius);
+  for PixelPos := 0 to MaxPixelPos do
+    if ScoreMap.FData[PixelPos] = FPooled.FData[PixelPos] then
+      FMaxMask.FData[PixelPos] := 1
+    else
+      FMaxMask.FData[PixelPos] := 0;
+  for Pass := 1 to 2 do
+  begin
+    MaxPool(FMaxMask, FSuppressMask, Radius);
+    for PixelPos := 0 to MaxPixelPos do
+      if FSuppressMask.FData[PixelPos] > 0 then
+        FSuppressedScores.FData[PixelPos] := 0
+      else
+        FSuppressedScores.FData[PixelPos] := ScoreMap.FData[PixelPos];
+    MaxPool(FSuppressedScores, FPooled, Radius);
+    for PixelPos := 0 to MaxPixelPos do
+      if (FSuppressMask.FData[PixelPos] <= 0) and
+         (FSuppressedScores.FData[PixelPos] = FPooled.FData[PixelPos]) then
+        FMaxMask.FData[PixelPos] := 1;
+  end;
+end;
+
+procedure TSuperPointKeypoints.Extract(ScoreMap, DescriptorMap: TNNetVolume;
+  const Config: TSuperPointConfig);
+var
+  Cell, SizeX, SizeY, MaxPixelX, MaxPixelY, PixelX, PixelY, PixelPos, Border: integer;
+  LimitX, LimitY, CandidateCount, MaxCandidatePos, CandidatePos: integer;
+  KeptPos, MaxKeptPos, CellsX, CellsY, Depth: integer;
+  Score, Threshold, HalfCellOffset, ScaleX, ScaleY, Norm: TNeuralFloat;
+  RowPtr: TNeuralFloatArrPtr;
+begin
+  Cell := SuperPointCellSize(Config);
+  SizeX := ScoreMap.SizeX;
+  SizeY := ScoreMap.SizeY;
+  SimpleNMS(ScoreMap, Config.NmsRadius);
+  if Length(FCandidateX) < ScoreMap.Size then
+  begin
+    SetLength(FCandidateX, ScoreMap.Size);
+    SetLength(FCandidateY, ScoreMap.Size);
+    SetLength(FCandidateOrder, ScoreMap.Size);
+    SetLength(FCandidateScores, ScoreMap.Size);
+  end;
+  Threshold := Config.KeypointThreshold;
+  Border := Config.BorderRemovalDistance;
+  // transformers passes the full-resolution size times the cell as the limit,
+  // so only the near border is effectively removed; kept for parity.
+  LimitX := SizeX * Cell - Border;
+  LimitY := SizeY * Cell - Border;
+  MaxPixelX := SizeX - 1;
+  MaxPixelY := SizeY - 1;
+  CandidateCount := 0;
+  PixelPos := 0;
+  for PixelY := 0 to MaxPixelY do
+    for PixelX := 0 to MaxPixelX do
+    begin
+      if FMaxMask.FData[PixelPos] > 0 then Score := ScoreMap.FData[PixelPos]
+      else Score := 0;
+      if (Score > Threshold) and (PixelY >= Border) and (PixelY < LimitY) and
+         (PixelX >= Border) and (PixelX < LimitX) then
+      begin
+        FCandidateX[CandidateCount] := PixelX;
+        FCandidateY[CandidateCount] := PixelY;
+        FCandidateScores[CandidateCount] := Score;
+        FCandidateOrder[CandidateCount] := CandidateCount;
+        Inc(CandidateCount);
+      end;
+      Inc(PixelPos);
+    end;
+  MaxCandidatePos := CandidateCount - 1;
+  if (Config.MaxKeypoints >= 0) and (Config.MaxKeypoints < CandidateCount) then
+  begin
+    // torch.topk returns the kept keypoints in descending score order.
+    if MaxCandidatePos > 0 then
+      QuickSortOrderByScoreDesc(FCandidateOrder, FCandidateScores, 0,
+        MaxCandidatePos);
+    FCount := Config.MaxKeypoints;
+  end
+  else
+    FCount := CandidateCount;
+  if Length(FX) < FCount then
+  begin
+    SetLength(FX, FCount);
+    SetLength(FY, FCount);
+    SetLength(FScores, FCount);
+  end;
+  Depth := DescriptorMap.Depth;
+  CellsX := DescriptorMap.SizeX;
+  CellsY := DescriptorMap.SizeY;
+  FDescriptors.ReSize(FCount, 1, Depth);
+  // transformers: (p - Cell/2 + 0.5) / (Cells*Cell - Cell/2 - 0.5) in [0,1],
+  // then grid_sample align_corners=True scales it by Cells - 1.
+  HalfCellOffset := Cell * 0.5 - 0.5;
+  ScaleX := (CellsX - 1) / (CellsX * Cell - HalfCellOffset - 1);
+  ScaleY := (CellsY - 1) / (CellsY * Cell - HalfCellOffset - 1);
+  MaxKeptPos := FCount - 1;
+  for KeptPos := 0 to MaxKeptPos do
+  begin
+    CandidatePos := FCandidateOrder[KeptPos];
+    FX[KeptPos] := FCandidateX[CandidatePos];
+    FY[KeptPos] := FCandidateY[CandidatePos];
+    FScores[KeptPos] := FCandidateScores[CandidatePos];
+    RowPtr := FDescriptors.GetRawPtr(KeptPos, 0);
+    NeuralBilinearGatherColumn(DescriptorMap, RowPtr,
+      (FX[KeptPos] - HalfCellOffset) * ScaleX,
+      (FY[KeptPos] - HalfCellOffset) * ScaleY, CellsX, CellsY, Depth, false);
+    Norm := Sqrt(TNNetVolume.DotProduct(RowPtr, RowPtr, Depth));
+    if Norm < 1e-12 then Norm := 1e-12;
+    TNNetVolume.Mul(RowPtr, 1 / Norm, Depth);
+  end;
+end;
+
+procedure TSuperPointKeypoints.Detect(NN: TNNet; Image: TNNetVolume;
+  const Config: TSuperPointConfig);
+var
+  ScoreLayer, DescriptorLayer: TNNetLayer;
+begin
+  NN.Compute(Image);
+  GetSuperPointHeads(NN, ScoreLayer, DescriptorLayer);
+  ScoreLayer.ForceOutputOnRAM();
+  DescriptorLayer.ForceOutputOnRAM();
+  Extract(ScoreLayer.Output, DescriptorLayer.Output, Config);
 end;
 
 function ReadClipImageProcessorConfig(

@@ -1877,6 +1877,11 @@ type
   function NeuralBoxGIoU(AX1, AY1, AX2, AY2,
     BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
 
+  // Quicksorts Order[iLo..iHi] in place so Scores[Order[..]] is descending;
+  // no heap allocation, ties in unspecified order.
+  procedure QuickSortOrderByScoreDesc(var Order: array of integer;
+    const Scores: array of TNeuralFloat; iLo, iHi: Integer);
+
   { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
     (x1,y1,x2,y2) format; Scores[i] is box i's confidence; Classes[i] is its

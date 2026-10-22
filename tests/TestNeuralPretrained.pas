@@ -1251,6 +1251,11 @@ type
     // Outpaint run on the pico LaMa through the example's routines: the
     // original pixels survive exactly outside the overlap band.
     procedure TestLaMaOutpaintKeepsOriginal;
+    procedure TestSuperPointConfigFromJSONFile;
+    // Dense maps, then keypoints / scores / descriptors per post-process setting.
+    procedure TestSuperPointParity;
+    procedure TestSuperPointPreprocess;
+    procedure TestSuperPointRejectsUnalignedInput;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -48513,6 +48518,173 @@ begin
   try
     NN := BuildLaMaFromSafeTensors(FixturePath('tiny_lama.safetensors'),
       {pInputWidth=}20, {pInputHeight=}16, Config, {pTrainable=}false);
+  except
+    on E: EPretrainedImportError do Msg := E.Message;
+  end;
+  NN.Free;
+  AssertTrue('error names the multiple: ' + Msg, Pos('multiple of 8', Msg) > 0);
+end;
+
+// ReadSuperPointConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestSuperPointConfigFromJSONFile;
+var
+  Config: TSuperPointConfig;
+begin
+  Config := ReadSuperPointConfigFromJSONFile(
+    FixturePath('tiny_superpoint_config.json'), 40, 32);
+  AssertEquals('encoder blocks', 4, Length(Config.EncoderHiddenSizes));
+  AssertEquals('encoder block 2', 6, Config.EncoderHiddenSizes[2]);
+  AssertEquals('decoder hidden', 8, Config.DecoderHiddenSize);
+  AssertEquals('keypoint dim', 65, Config.KeypointDecoderDim);
+  AssertEquals('descriptor dim', 8, Config.DescriptorDecoderDim);
+  AssertEquals('threshold', 0.005, Config.KeypointThreshold, 1e-9);
+  AssertEquals('max keypoints', -1, Config.MaxKeypoints);
+  AssertEquals('nms radius', 4, Config.NmsRadius);
+  AssertEquals('border', 4, Config.BorderRemovalDistance);
+  AssertEquals('cell', 8, SuperPointCellSize(Config));
+  AssertEquals('input width', 40, Config.InputWidth);
+end;
+
+// Parity of BuildSuperPointFromSafeTensors + TSuperPointKeypoints against the
+// transformers SuperPointForKeypointDetection oracle (make_pico_superpoint_fixture.py).
+procedure TTestNeuralPretrained.TestSuperPointParity;
+var
+  NN: TNNet;
+  Config: TSuperPointConfig;
+  Keypoints: TSuperPointKeypoints;
+  ScoreLayer, DescriptorLayer: TNNetLayer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Cases: TJSONArray;
+  CaseObj: TJSONObject;
+  Image: TNNetVolume;
+  CasePos, ElemPos, MaxElemPos, KeypointPos, MaxKeypointPos: integer;
+
+  function MaxAbsDiff(const Name: string; Actual: TNNetVolume): double;
+  var
+    Arr: TJSONArray;
+    Pos_, MaxPos: integer;
+  begin
+    Arr := TJSONArray(CaseObj.Find(Name));
+    AssertEquals(Name + ' size', Arr.Count, Actual.Size);
+    Result := 0;
+    MaxPos := Arr.Count - 1;
+    for Pos_ := 0 to MaxPos do
+      Result := Max(Result, Abs(Actual.FData[Pos_] - Arr.Items[Pos_].AsFloat));
+  end;
+
+begin
+  NN := BuildSuperPointFromSafeTensors(FixturePath('tiny_superpoint.safetensors'),
+    40, 32, Config, {pTrainable=}false,
+    FixturePath('tiny_superpoint_config.json'));
+  Keypoints := TSuperPointKeypoints.Create();
+  RefJson := TStringList.Create;
+  Image := TNNetVolume.Create(40, 32, 1);
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_superpoint_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CasePos]);
+      MaxElemPos := Image.Size - 1;
+      for ElemPos := 0 to MaxElemPos do
+        Image.FData[ElemPos] :=
+          TJSONArray(CaseObj.Find('input')).Items[ElemPos].AsFloat;
+      Config.NmsRadius := CaseObj.Get('nms_radius', 0);
+      Config.KeypointThreshold := CaseObj.Get('keypoint_threshold', 0.0);
+      Config.BorderRemovalDistance := CaseObj.Get('border_removal_distance', 0);
+      Config.MaxKeypoints := CaseObj.Get('max_keypoints', 0);
+      Keypoints.Detect(NN, Image, Config);
+      GetSuperPointHeads(NN, ScoreLayer, DescriptorLayer);
+      AssertTrue('case ' + IntToStr(CasePos) + ' score map',
+        MaxAbsDiff('score_map', ScoreLayer.Output) < 1e-5);
+      AssertTrue('case ' + IntToStr(CasePos) + ' descriptor map',
+        MaxAbsDiff('descriptor_map', DescriptorLayer.Output) < 1e-5);
+      AssertEquals('case ' + IntToStr(CasePos) + ' keypoint count',
+        TJSONArray(CaseObj.Find('scores')).Count, Keypoints.Count);
+      MaxKeypointPos := Keypoints.Count - 1;
+      for KeypointPos := 0 to MaxKeypointPos do
+      begin
+        AssertEquals('case ' + IntToStr(CasePos) + ' x ' + IntToStr(KeypointPos),
+          TJSONArray(CaseObj.Find('keypoints')).Items[KeypointPos * 2].AsInteger,
+          Keypoints.X[KeypointPos]);
+        AssertEquals('case ' + IntToStr(CasePos) + ' y ' + IntToStr(KeypointPos),
+          TJSONArray(CaseObj.Find('keypoints')).Items[KeypointPos * 2 + 1].AsInteger,
+          Keypoints.Y[KeypointPos]);
+        AssertEquals('case ' + IntToStr(CasePos) + ' score ' + IntToStr(KeypointPos),
+          TJSONArray(CaseObj.Find('scores')).Items[KeypointPos].AsFloat,
+          Keypoints.Scores[KeypointPos], 1e-5);
+      end;
+      AssertTrue('case ' + IntToStr(CasePos) + ' descriptors',
+        MaxAbsDiff('descriptors', Keypoints.Descriptors) < 1e-4);
+    end;
+  finally
+    RefRoot.Free;
+    Image.Free;
+    RefJson.Free;
+    Keypoints.Free;
+    NN.Free;
+  end;
+end;
+
+// SuperPointPreprocessImage against SuperPointImageProcessorPil (do_grayscale).
+procedure TTestNeuralPretrained.TestSuperPointPreprocess;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  SourceArr, OutputArr: TJSONArray;
+  PreObj: TJSONObject;
+  Source, Dest: TNNetVolume;
+  ElemPos, MaxElemPos: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Source := TNNetVolume.Create;
+  Dest := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_superpoint_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PreObj := TJSONObject(TJSONObject(RefRoot).Find('preprocess'));
+    Source.ReSize(PreObj.Get('source_width', 0), PreObj.Get('source_height', 0), 3);
+    SourceArr := TJSONArray(PreObj.Find('source'));
+    AssertEquals('source size', Source.Size, SourceArr.Count);
+    MaxElemPos := Source.Size - 1;
+    for ElemPos := 0 to MaxElemPos do
+      Source.FData[ElemPos] := SourceArr.Items[ElemPos].AsFloat;
+    SuperPointPreprocessImage(Source, Dest, 40, 32);
+    OutputArr := TJSONArray(PreObj.Find('output'));
+    AssertEquals('output size', OutputArr.Count, Dest.Size);
+    AssertEquals('output depth', 1, Dest.Depth);
+    MaxDiff := 0;
+    MaxElemPos := Dest.Size - 1;
+    for ElemPos := 0 to MaxElemPos do
+      MaxDiff := Max(MaxDiff, Abs(Dest.FData[ElemPos] -
+        OutputArr.Items[ElemPos].AsFloat));
+    AssertTrue('preprocess max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+  finally
+    RefRoot.Free;
+    Dest.Free;
+    Source.Free;
+    RefJson.Free;
+  end;
+end;
+
+// BuildSuperPoint rejects an input that is not a multiple of the 8-pixel cell.
+procedure TTestNeuralPretrained.TestSuperPointRejectsUnalignedInput;
+var
+  NN: TNNet;
+  Config: TSuperPointConfig;
+  Msg: string;
+begin
+  Msg := '';
+  NN := nil;
+  try
+    NN := BuildSuperPointFromSafeTensors(
+      FixturePath('tiny_superpoint.safetensors'), 36, 32, Config,
+      {pTrainable=}false, FixturePath('tiny_superpoint_config.json'));
   except
     on E: EPretrainedImportError do Msg := E.Message;
   end;

@@ -25123,6 +25123,12 @@ type
     RowCount: integer; PairDst: TNeuralByteArrPtr;
     ScaleDst: TNeuralFloatArrPtr);
 
+  // OutPtr[0..D-1] := bilinear blend of Src's depth columns at source-pixel
+  // (sx, sy); BorderPad clamps corners, else out-of-range corners add 0.
+  procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
+    OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
+    W, H, D: integer; BorderPad: boolean);
+
   {$IFNDEF FPC}
   procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
   {$ENDIF}
