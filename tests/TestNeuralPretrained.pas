@@ -35,6 +35,10 @@ type
     Cached: TNeuralIntegerArray;
   end;
 
+  // What the kept pipeline of CheckSD15KeptSizeChange adds to the plain one.
+  TSD15SizeChangeCase = (sccPlain, sccInt8, sccLoRA, sccControlNet,
+    sccT2IAdapter);
+
   TTestNeuralPretrained = class(TTestCase)
   private
     FNotices: string; // CaptureNotice accumulator
@@ -55,6 +59,10 @@ type
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
+    // A kept pipeline generates at A, B (an odd latent grid), A; each image must
+    // match a fresh pipeline's and the size changes read no weights file.
+    procedure CheckSD15KeptSizeChange(SizeChangeCase: TSD15SizeChangeCase;
+      OnOpenCL: boolean);
     // The pipeline of fixture folder Folder (tiny_sd15, tiny_sd2).
     function CreateSDPipeline(const Folder: string): TStableDiffusionPipeline;
     // Pipeline parity checks of fixture folder Folder against its
@@ -1268,6 +1276,10 @@ type
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineOddSize;
     procedure TestStableDiffusionPipelineKeepLoaded;
+    procedure TestStableDiffusionPipelineSizeChangeBorrows;
+    procedure TestStableDiffusionConditionerSizeChangeBorrows;
+    procedure TestStableDiffusionPipelineSizeChangeOpenCL;
+    procedure TestSDUNetBorrowedWeightsOpenCL;
     procedure TestStableDiffusionPipelineInt8;
     procedure TestStableDiffusionControlNetParity;
     procedure TestStableDiffusionControlNetNonSquare;
@@ -47285,6 +47297,236 @@ begin
     Reference.Free;
   end;
 end;
+
+procedure TTestNeuralPretrained.CheckSD15KeptSizeChange(
+  SizeChangeCase: TSD15SizeChangeCase; OnOpenCL: boolean);
+const
+  cSizeCount = 3;
+  // 14x18 is a 7x9 latent grid: the UNet adds odd-size crops there. The
+  // T2I-Adapter needs sides that are multiples of 4.
+  cWidths: array[0..cSizeCount - 1] of integer = (16, 14, 16);
+  cHeights: array[0..cSizeCount - 1] of integer = (16, 18, 16);
+  cAdapterWidths: array[0..cSizeCount - 1] of integer = (16, 24, 16);
+  cAdapterHeights: array[0..cSizeCount - 1] of integer = (16, 8, 16);
+var
+  Kept, Fresh: TStableDiffusionPipeline;
+  KeptConditioner, FreshConditioner: TStableDiffusionConditioner;
+  ConditionImage, Expected, Image: TNNetVolume;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+  CaseName: string;
+  SizePos, ElementPos, Width, Height, LoadCountAfterFirstImage: integer;
+  Diff: double;
+
+  function CreateConditioner(): TStableDiffusionConditioner;
+  var
+    ControlNet: TStableDiffusionControlNet;
+    Adapter: TStableDiffusionT2IAdapter;
+  begin
+    Result := nil;
+    if SizeChangeCase = sccControlNet then
+    begin
+      ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+        FixturePath('tiny_sd15_controlnet/config.json')));
+      ControlNet.SetControlImage(ConditionImage);
+      ControlNet.ConditioningScale := 0.5;
+      Result := ControlNet;
+    end
+    else if SizeChangeCase = sccT2IAdapter then
+    begin
+      Adapter := TStableDiffusionT2IAdapter.Create(ExtractFileDir(
+        FixturePath('tiny_sd15_t2i_adapter/config.json')));
+      Adapter.SetHintImage(ConditionImage);
+      Adapter.ConditioningScale := 0.8;
+      Result := Adapter;
+    end;
+  end;
+
+  function CreatePipeline(Conditioner: TStableDiffusionConditioner):
+    TStableDiffusionPipeline;
+  begin
+    Result := CreateSD15Pipeline();
+    {$IFDEF OpenCL}
+    if OnOpenCL then Result.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
+    Result.UNetInt8 := SizeChangeCase in [sccInt8, sccControlNet];
+    if SizeChangeCase = sccLoRA then
+      Result.AddLoRA(FixturePath('tiny_sd15_lora/peft.safetensors'), 0.8);
+    Result.Conditioner := Conditioner;
+  end;
+
+begin
+  WriteStr(CaseName, SizeChangeCase);
+  if OnOpenCL then CaseName := CaseName + ' OpenCL';
+  {$IFDEF OpenCL}
+  if OnOpenCL and not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  {$ENDIF}
+  ConditionImage := TNNetVolume.Create(32, 32, 3);
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  KeptConditioner := nil;
+  Kept := nil;
+  try
+    for ElementPos := 0 to ConditionImage.Size - 1 do
+      ConditionImage.FData[ElementPos] := (ElementPos * 37) mod 256;
+    KeptConditioner := CreateConditioner();
+    Kept := CreatePipeline(KeptConditioner);
+    LoadCountAfterFirstImage := 0;
+    for SizePos := 0 to cSizeCount - 1 do
+    begin
+      if SizeChangeCase = sccT2IAdapter then
+      begin
+        Width := cAdapterWidths[SizePos];
+        Height := cAdapterHeights[SizePos];
+      end
+      else
+      begin
+        Width := cWidths[SizePos];
+        Height := cHeights[SizePos];
+      end;
+      FreshConditioner := CreateConditioner();
+      Fresh := CreatePipeline(FreshConditioner);
+      try
+        Fresh.Generate('a red cube', Width, Height, 2, 7, Expected);
+      finally
+        Fresh.Free;
+        FreshConditioner.Free;
+      end;
+      if SizePos = 0 then Kept.LoadComponents(Width, Height);
+      Kept.Generate('a red cube', Width, Height, 2, 7, Image);
+      if SizePos = 0 then
+        LoadCountAfterFirstImage := Kept.WeightFileLoadCount
+      else
+        AssertEquals(CaseName + ': size ' + IntToStr(SizePos) +
+          ' reads no weights file', LoadCountAfterFirstImage,
+          Kept.WeightFileLoadCount);
+      Diff := MaxAbsVolumeDiff(Image, Expected);
+      AssertTrue(CaseName + ': ' + IntToStr(Width) + 'x' + IntToStr(Height) +
+        ' kept vs fresh max|diff| ' + FloatToStr(Diff) + ' must be < 1e-5',
+        Diff < 1e-5);
+    end;
+    AssertTrue(CaseName + ': the first image read the weights',
+      LoadCountAfterFirstImage > 0);
+  finally
+    Kept.Free;
+    KeptConditioner.Free;
+    Image.Free;
+    Expected.Free;
+    ConditionImage.Free;
+  end;
+end;
+
+// The kept UNet and VAE borrow the weights read once: FP32, int8 and a
+// LoRA-merged UNet at sizes A, B, A match fresh pipelines.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineSizeChangeBorrows;
+begin
+  CheckSD15KeptSizeChange(sccPlain, false);
+  CheckSD15KeptSizeChange(sccInt8, false);
+  CheckSD15KeptSizeChange(sccLoRA, false);
+end;
+
+// A kept int8 ControlNet and a kept T2I-Adapter rebuilt per size borrow too.
+procedure TTestNeuralPretrained.TestStableDiffusionConditionerSizeChangeBorrows;
+begin
+  CheckSD15KeptSizeChange(sccControlNet, false);
+  CheckSD15KeptSizeChange(sccT2IAdapter, false);
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineSizeChangeOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckSD15KeptSizeChange(sccPlain, true);
+  CheckSD15KeptSizeChange(sccInt8, true);
+  {$ENDIF}
+end;
+
+// A UNet built at a 7x9 latent grid borrowing the weights of a 1x1-grid owner
+// (FP32, then int8), forced onto OpenCL, matches the one read from disk.
+procedure TTestNeuralPretrained.TestSDUNetBorrowedWeightsOpenCL;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Config, OwnerConfig: TSDUNetConfig;
+  Owner, Borrower, Loaded: TNNet;
+  Latent, Text, ExpectedNoise, Noise: TNNetVolume;
+  WeightsFile: string;
+  IsInt8: boolean;
+  LayerPos, GPUForwardCount: integer;
+  Diff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WeightsFile := FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors');
+  Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd15/unet/config.json'));
+  Config.LatentGrid := 7;
+  Config.LatentGridY := 9;
+  Config.TextSeqLen := 5;
+  OwnerConfig := Config;
+  OwnerConfig.LatentGrid := 1;
+  OwnerConfig.LatentGridY := 1;
+  OwnerConfig.TextSeqLen := 1;
+  Latent := TNNetVolume.Create(7, 9, Config.InChannels);
+  Text := TNNetVolume.Create(5, 1, Config.CrossAttentionDim);
+  ExpectedNoise := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Owner := nil;
+  Borrower := nil;
+  Loaded := nil;
+  try
+    RandSeed := 31;
+    Latent.RandomizeGaussian(1.0);
+    Text.RandomizeGaussian(1.0);
+    for IsInt8 := false to true do
+    begin
+      Loaded := BuildSDUNetFromSafeTensorsEx(WeightsFile, Config, false);
+      if IsInt8 then Loaded.QuantizeWeightsInt8();
+      SDUNetDenoise(Loaded, Config, Latent, Text, 500, ExpectedNoise);
+      FreeAndNil(Loaded);
+      Owner := BuildSDUNetFromSafeTensorsEx(WeightsFile, OwnerConfig, false);
+      if IsInt8 then Owner.QuantizeWeightsInt8();
+      Borrower := BuildSDUNet(nil, Config, false, false, false, nil, Owner);
+      AssertEquals('the borrower sizes no weights', 0,
+        Borrower.WeightElementsSized());
+      Borrower.ForceOpenCL(true);
+      Borrower.EnableOpenCL(PlatformId, DeviceId);
+      SDUNetDenoise(Borrower, Config, Latent, Text, 500, Noise);
+      GPUForwardCount := 0;
+      for LayerPos := 0 to Borrower.GetLastLayerIdx() do
+        Inc(GPUForwardCount, Borrower.Layers[LayerPos].ForwardGPUCnt);
+      AssertTrue('int8 ' + BoolToStr(IsInt8, true) + ': layers ran on OpenCL',
+        GPUForwardCount > 0);
+      Diff := MaxAbsVolumeDiff(Noise, ExpectedNoise);
+      WriteLn('  SD UNet borrowed on OpenCL vs loaded on CPU, int8 ',
+        BoolToStr(IsInt8, true), ': max|diff|=', Diff:0:9);
+      AssertTrue('int8 ' + BoolToStr(IsInt8, true) + ': max|diff| ' +
+        FloatToStr(Diff) + ' must be < 1e-4', Diff < 1e-4);
+      FreeAndNil(Borrower);
+      FreeAndNil(Owner);
+    end;
+  finally
+    Loaded.Free;
+    Borrower.Free;
+    Owner.Free;
+    Noise.Free;
+    ExpectedNoise.Free;
+    Text.Free;
+    Latent.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 // int8 UNet + text encoder vs FP32 (pico): embeds (|max| ~4) move > 0 and
 // < 0.1, the [0, 1] image > 0 and < 0.03 (measured 0.045 and 0.0092).

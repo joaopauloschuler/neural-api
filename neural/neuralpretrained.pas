@@ -11734,8 +11734,11 @@ function LatentGridYOf(const Config: TVaeDecoderConfig): integer; overload;
 // from Reader (caller owns Reader). The net takes a (LatentGrid, LatentGridYOf,
 // LatentChannels) latent volume and outputs that grid times 2^(num_block-1)
 // as an RGB image with OutChannels channels (raw, pre-clamp).
+// pWeightOwner (a net of this builder and config at any grid, weights final):
+// every weight layer borrows its weights and Reader may be nil.
 function BuildVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildVaeDecoderFromSafeTensorsEx(const FileName: string;
   const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
@@ -11950,10 +11953,15 @@ function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
 // The three combine; the extra inputs follow the latent/timestep/text (and
 // SDXL add_embeds) ones in the order IP-Adapter, adapter, control
 // (SDUNetConditioningInputs finds them).
+//
+// pWeightOwner (a UNet of this config and IP-Adapter, any grid, weights final):
+// every weight layer borrows its weights; Reader may be nil, IPAdapterReader
+// gives only shapes.
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
-  IPAdapterReader: TNNetSafeTensorsReader = nil): TNNet;
+  IPAdapterReader: TNNetSafeTensorsReader = nil;
+  pWeightOwner: TNNet = nil): TNNet;
 
 // IPAdapterFile '' builds no IP-Adapter attention.
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
@@ -12176,6 +12184,10 @@ type
     FPipeline: TStableDiffusionPipeline;
     // FPipeline.ComponentEpoch when the nets below were built.
     FNetEpoch: integer;
+    // While the pipeline keeps its components: the weights of a size-bound
+    // net, read once; each size borrows them. Int8 as the UNet was then.
+    FWeightOwner: TNNet;
+    FWeightOwnerInt8: boolean;
     // The predictions of the extra passes of PredictGuidedNoise.
     FGuidancePreds: array[0..1] of TNNetVolume;
     // Opens sdphLoadUNet unless it is the open phase: the conditioner's
@@ -12282,6 +12294,11 @@ type
     FKeepComponents: boolean;
     FUNetInt8, FTextEncoderInt8: boolean;
     FTextEncoder, FUNet, FVaeDecoder, FVaeEncoder: TNNet;
+    // While kept: the weights of the size-bound nets above, read once at a
+    // 1x1 latent grid; each size builds a net borrowing them (BuildWeightOwner).
+    FUNetOwner, FVaeDecoderOwner, FVaeEncoderOwner: TNNet;
+    FUNetOwnerIPAdapterFile: string;
+    FWeightFileLoadCount: integer;
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
     FUNetIPAdapterFile: string;
@@ -12334,6 +12351,15 @@ type
       WithControl, WithAdapter: boolean; const IPAdapterFile: string): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
     function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
+    // The UNet / VAE nets read from their weights file (WeightFileLoadCount);
+    // pWeightOwner set: the net borrows its weights and nothing is read.
+    function BuildUNet(GridX, GridY, TextSeqLen: integer; WithControl,
+      WithAdapter: boolean; const IPAdapterFile: string;
+      pWeightOwner: TNNet = nil): TNNet;
+    function BuildVaeDecoderNet(GridX, GridY: integer;
+      pWeightOwner: TNNet = nil): TNNet;
+    function BuildVaeEncoderNet(GridX, GridY: integer;
+      pWeightOwner: TNNet = nil): TNNet;
     // The Conditioner, or the plain one when none is set.
     function ActiveConditioner(): TStableDiffusionConditioner;
     // Zeroes the control / adapter inputs, then FPassConditioners fill them.
@@ -12462,6 +12488,9 @@ type
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
     property LoRACount: integer read GetLoRACount;
+    // Component nets built by reading a weights file (text encoder, UNet, VAE,
+    // ControlNet, T2I-Adapter); a kept net rebuilt for a new size reads none.
+    property WeightFileLoadCount: integer read FWeightFileLoadCount;
   end;
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
@@ -12544,8 +12573,11 @@ function ControlNetConfigToString(const Config: TControlNetConfig): string;
 // Builds the ControlNetModel described by Config and loads every weight from
 // Reader (caller owns Reader). Four TNNetInputs (latent, timestep, text states,
 // control image). See ControlNetResiduals for the driver.
+// pWeightOwner (a net of this builder and config at any grid, weights final):
+// every weight layer borrows its weights and Reader may be nil.
 function BuildControlNet(Reader: TNNetSafeTensorsReader;
-  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TControlNetConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildControlNetFromSafeTensorsEx(const FileName: string;
   const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
@@ -12622,8 +12654,11 @@ function T2IAdapterConfigToString(const Config: TT2IAdapterConfig): string;
 // Builds the T2IAdapter (full_adapter) described by Config and loads every
 // weight from Reader (caller owns Reader). ONE TNNetInput (the hint image). See
 // T2IAdapterFeatures for the driver.
+// pWeightOwner (a net of this builder and config at any grid, weights final):
+// every weight layer borrows its weights and Reader may be nil.
 function BuildT2IAdapter(Reader: TNNetSafeTensorsReader;
-  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildT2IAdapterFromSafeTensorsEx(const FileName: string;
   const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
@@ -13046,8 +13081,11 @@ function ReadVaeEncoderConfigFromJSONFile(
 // Builds the AutoencoderKL ENCODER. Input is an (ImgGrid, ImgGrid, in_channels)
 // image; output is the deterministic (LatentGrid, LatentGrid, LatentChannels)
 // latent = mean * scaling_factor. ImgGrid = LatentGrid * 2^(NumBlockOut-1).
+// pWeightOwner (a net of this builder and config at any grid, weights final):
+// every weight layer borrows its weights and Reader may be nil.
 function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildVaeEncoderFromSafeTensorsEx(const FileName: string;
   const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
@@ -73355,6 +73393,27 @@ begin
   Result := Layer;
 end;
 
+// A GroupNorm with its epsilon set, so a graph built without loading any
+// weights (a borrowing build) normalizes as the loaded one.
+function CreateGroupNorm(Groups: integer; Epsilon: TNeuralFloat): TNNetGroupNorm;
+begin
+  Result := TNNetGroupNorm.Create(Groups);
+  Result.GroupNormEpsilon := Epsilon;
+end;
+
+// Ends NN's borrowing build (NN.BuildWeightOwner set before its first layer);
+// raises when an owner layer with weights found no counterpart.
+procedure EndBorrowingBuild(NN: TNNet; const ImportName: string);
+var
+  UnlinkedCount: integer;
+begin
+  UnlinkedCount := NN.UnlinkedBuildWeightOwnerLayerCount();
+  NN.BuildWeightOwner := nil;
+  if UnlinkedCount > 0 then
+    ImportError(ImportName + ': ' + IntToStr(UnlinkedCount) + ' weight ' +
+      'layers of the weight owner have no counterpart (graph mismatch).');
+end;
+
 // One pre-norm ResnetBlock2D on the last layer: Norm1 -> SiLU -> conv1(3x3) ->
 // Norm2 -> SiLU -> conv2(3x3) + shortcut (identity, or 1x1 when InCh<>OutCh).
 procedure AddVaeResnetBlockWithNorms(NN: TNNet; InCh, OutCh: integer;
@@ -73408,8 +73467,8 @@ procedure AddVaeResnetBlock(NN: TNNet; const Config: TVaeDecoderConfig;
   InCh, OutCh: integer; out Refs: TVaeResnetLayers);
 begin
   AddVaeResnetBlockWithNorms(NN, InCh, OutCh,
-    TNNetGroupNorm.Create(Config.NormNumGroups),
-    TNNetGroupNorm.Create(Config.NormNumGroups), Refs);
+    CreateGroupNorm(Config.NormNumGroups, Config.NormEps),
+    CreateGroupNorm(Config.NormNumGroups, Config.NormEps), Refs);
 end;
 
 procedure LoadVaeResnetBlock(Reader: TNNetSafeTensorsReader;
@@ -73464,7 +73523,7 @@ procedure AddVaeAttention(NN: TNNet; const Config: TVaeDecoderConfig;
   Channels: integer; out Refs: TVaeAttnLayers);
 begin
   AddVaeAttentionWithNorm(NN, Channels,
-    TNNetGroupNorm.Create(Config.NormNumGroups), Refs);
+    CreateGroupNorm(Config.NormNumGroups, Config.NormEps), Refs);
 end;
 
 procedure LoadVaeAttention(Reader: TNNetSafeTensorsReader;
@@ -73487,7 +73546,8 @@ begin
 end;
 
 function BuildVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   NN: TNNet;
   PostQuant, ConvIn, NormOut, ConvOut: TNNetLayer;
@@ -73512,6 +73572,7 @@ begin
   SetLength(UpConv, Config.NumBlockOut);
   NN := TNNet.Create();
   try
+    NN.BuildWeightOwner := pWeightOwner;
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(Config.LatentGrid, LatentGridYOf(Config),
       Config.LatentChannels) );
@@ -73552,11 +73613,17 @@ begin
         UpConv[r] := nil;
     end;
     // OUT: conv_norm_out (GroupNorm) -> SiLU -> conv_out (3x3 -> RGB).
-    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NormOut := NN.AddLayer( CreateGroupNorm(Config.NormNumGroups, Config.NormEps) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
       TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
+
+    if pWeightOwner <> nil then
+    begin
+      EndBorrowingBuild(NN, 'VAE decoder import');
+      exit(NN);
+    end;
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, PostQuant, 'post_quant_conv.weight',
@@ -75688,7 +75755,7 @@ begin
   Refs.GN1 := nil; Refs.Conv1 := nil; Refs.TimeProj := nil; Refs.GN2 := nil;
   Refs.Conv2 := nil; Refs.Shortcut := nil;
   Groups := Config.NormNumGroups;
-  Refs.GN1 := NN.AddLayerAfter( TNNetGroupNorm.Create(Groups), Input );
+  Refs.GN1 := NN.AddLayerAfter( CreateGroupNorm(Groups, SDUNET_RES_EPS), Input );
   NN.AddLayer( TNNetSiLU.Create() );
   Refs.Conv1 := NN.AddLayer(
     TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
@@ -75703,7 +75770,7 @@ begin
   ModVec := Refs.TimeProj;
   Injected := NN.AddLayer( TNNetFiLM.Create([Conv1Out, ModVec]) );
   // continue the main path from the injected hidden state.
-  NN.AddLayerAfter( TNNetGroupNorm.Create(Groups), Injected );
+  NN.AddLayerAfter( CreateGroupNorm(Groups, SDUNET_RES_EPS), Injected );
   Refs.GN2 := NN.GetLastLayer();
   NN.AddLayer( TNNetSiLU.Create() );
   Refs.Conv2 := NN.AddLayer(
@@ -75786,7 +75853,8 @@ begin
   HeadsM1 := Heads - 1;
   HeadDimM1 := HeadDim - 1;
   Inner := 4 * Channels;
-  Refs.GN := NN.AddLayerAfter( TNNetGroupNorm.Create(Config.NormNumGroups), Input );
+  Refs.GN := NN.AddLayerAfter( CreateGroupNorm(Config.NormNumGroups,
+    SDUNET_TR_EPS), Input );
   Refs.ProjIn := NN.AddLayer(
     TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
   // flatten the spatial grid row-major to (H*W,1,C) tokens.
@@ -75988,7 +76056,8 @@ end;
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
-  IPAdapterReader: TNNetSafeTensorsReader = nil): TNNet;
+  IPAdapterReader: TNNetSafeTensorsReader = nil;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   NN: TNNet;
   IPKeyInput, IPValueInput: TNNetLayer;
@@ -76062,6 +76131,7 @@ begin
       Config.CrossAttentionDim);
   NN := TNNet.Create();
   try
+    NN.BuildWeightOwner := pWeightOwner;
     SetLength(DownRes, n);
     SetLength(DownAttn, n);
     SetLength(DownSamp, n);
@@ -76306,11 +76376,16 @@ begin
     end;
 
     // ---- OUT ----
-    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NormOut := NN.AddLayer( CreateGroupNorm(Config.NormNumGroups, SDUNET_RES_EPS) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
       TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
+    if pWeightOwner <> nil then
+    begin
+      EndBorrowingBuild(NN, 'SD UNet import');
+      exit(NN);
+    end;
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvIn, 'conv_in.weight', 'conv_in.bias', d0,
@@ -77512,7 +77587,8 @@ begin
 end;
 
 function BuildControlNet(Reader: TNNetSafeTensorsReader;
-  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TControlNetConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   NN: TNNet;
   Cfg: TSDUNetConfig;
@@ -77548,6 +77624,7 @@ begin
     ImportError('ControlNet import: num_heads must be >= 1.');
   NN := TNNet.Create();
   try
+    NN.BuildWeightOwner := pWeightOwner;
     SetLength(DownRes, n);
     SetLength(DownAttn, n);
     SetLength(DownSamp, n);
@@ -77667,6 +77744,12 @@ begin
     // Output read directly by ControlNetResiduals. The taps are built
     // CONSECUTIVELY (all down taps, then the mid tap) and are therefore the
     // last NumDownResiduals+1 layers of the net.
+
+    if pWeightOwner <> nil then
+    begin
+      EndBorrowingBuild(NN, 'ControlNet import');
+      exit(NN);
+    end;
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvIn, 'conv_in.weight', 'conv_in.bias', d0,
@@ -78056,7 +78139,8 @@ begin
 end;
 
 function BuildT2IAdapter(Reader: TNNetSafeTensorsReader;
-  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   NN: TNNet;
   CondInput, HLayer, ConvIn: TNNetLayer;
@@ -78091,6 +78175,7 @@ begin
       ' is not the hint image / downscale_factor.');
   NN := TNNet.Create();
   try
+    NN.BuildWeightOwner := pWeightOwner;
     SetLength(InConvRef, n);
     SetLength(Block1Ref, n);
     SetLength(Block2Ref, n);
@@ -78146,6 +78231,12 @@ begin
 
     // No sink layer: TNNet.Compute runs every layer; T2IAdapterFeatures reads
     // the FeatureRef outputs directly.
+
+    if pWeightOwner <> nil then
+    begin
+      EndBorrowingBuild(NN, 'T2I-Adapter import');
+      exit(NN);
+    end;
 
     // ---------------- Weights ----------------
     LoadPixelUnshuffleConv(Reader, ConvInRef, 'adapter.conv_in.weight',
@@ -78621,7 +78712,8 @@ begin
 end;
 
 function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   NN: TNNet;
   ConvIn, NormOut, ConvOut, QuantConv: TNNetLayer;
@@ -78648,6 +78740,7 @@ begin
   SetLength(DownConv, Config.NumBlockOut);
   NN := TNNet.Create();
   try
+    NN.BuildWeightOwner := pWeightOwner;
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGridY, Config.OutChannels) );
     ConvIn := NN.AddLayer(
@@ -78679,7 +78772,7 @@ begin
     AddVaeResnetBlock(NN, Config, TopC, TopC, MidRes2);
     // OUT: conv_norm_out (GroupNorm) -> SiLU -> conv_out (3x3 -> 2*lat) ->
     // quant_conv (1x1).
-    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NormOut := NN.AddLayer( CreateGroupNorm(Config.NormNumGroups, Config.NormEps) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
       TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0).SetTrainable(pTrainable) );
@@ -78690,6 +78783,12 @@ begin
     NN.AddLayer( TNNetSplitChannels.Create(0, Config.LatentChannels) );
     NN.AddLayer( TNNetMulByConstant.Create(Config.ScalingFactor) );
     if not pTrainable then NN.SetTrainable();
+
+    if pWeightOwner <> nil then
+    begin
+      EndBorrowingBuild(NN, 'VAE encoder import');
+      exit(NN);
+    end;
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvIn, 'encoder.conv_in.weight',
@@ -93494,6 +93593,7 @@ begin
   if Value <> FUNetInt8 then
   begin
     FreeAndNil(FUNet);
+    FreeAndNil(FUNetOwner);
     Inc(FComponentEpoch);
   end;
   FUNetInt8 := Value;
@@ -93512,6 +93612,9 @@ begin
   FreeAndNil(FUNet);
   FreeAndNil(FVaeDecoder);
   FreeAndNil(FVaeEncoder);
+  FreeAndNil(FUNetOwner);
+  FreeAndNil(FVaeDecoderOwner);
+  FreeAndNil(FVaeEncoderOwner);
 end;
 
 // Phases sdphLoadTextEncoder, sdphLoadUNet, sdphLoadVae, then sdphDone.
@@ -93570,6 +93673,7 @@ begin
   ExtraTokenRows := nil;
   Reader := CreatePretrainedTensorReader(SafeTensorsFolderWeightsFile(
     ComponentFolder('text_encoder'), 'model'));
+  Inc(FWeightFileLoadCount);
   if Length(FLoRAFiles) > 0 then
   begin
     // LoRA keys name text_model.*; an unprefixed export gets the prefix.
@@ -93603,6 +93707,32 @@ begin
   end;
 end;
 
+function TStableDiffusionPipeline.BuildUNet(GridX, GridY, TextSeqLen: integer;
+  WithControl, WithAdapter: boolean; const IPAdapterFile: string;
+  pWeightOwner: TNNet): TNNet;
+var
+  IPAdapterReader: TNNetSafeTensorsReader;
+begin
+  if pWeightOwner = nil then
+  begin
+    Inc(FWeightFileLoadCount);
+    exit(BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+      ComponentFolder('unet'), 'diffusion_pytorch_model'),
+      UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
+      {pTrainable=}false, WithControl, WithAdapter, IPAdapterFile));
+  end;
+  IPAdapterReader := nil;
+  try
+    if IPAdapterFile <> '' then
+      IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
+    Result := BuildSDUNet(nil, UNetStepConfig(GridX, GridY, TextSeqLen),
+      {pTrainable=}false, WithControl, WithAdapter, IPAdapterReader,
+      pWeightOwner);
+  finally
+    IPAdapterReader.Free;
+  end;
+end;
+
 function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
   TextSeqLen: integer; WithControl, WithAdapter: boolean;
   const IPAdapterFile: string): TNNet;
@@ -93613,12 +93743,25 @@ begin
     (FUNetIPAdapterFile = IPAdapterFile) then exit(FUNet);
   DoPhase(sdphLoadUNet);
   FreeAndNil(FUNet);
-  Result := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-    ComponentFolder('unet'), 'diffusion_pytorch_model'),
-    UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
-    {pTrainable=}false, WithControl, WithAdapter, IPAdapterFile);
+  if FKeepComponents then
+  begin
+    if FUNetOwnerIPAdapterFile <> IPAdapterFile then FreeAndNil(FUNetOwner);
+    if FUNetOwner = nil then
+    begin
+      // The control / adapter inputs are weightless: one owner serves all.
+      FUNetOwner := BuildUNet(1, 1, 1, false, false, IPAdapterFile);
+      FUNetOwnerIPAdapterFile := IPAdapterFile;
+      if FUNetInt8 then FUNetOwner.QuantizeWeightsInt8();
+    end;
+    Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
+      IPAdapterFile, FUNetOwner);
+  end
+  else
+    Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
+      IPAdapterFile);
   try
-    PrepareComponent(Result, FUNetInt8);
+    // A borrowing net links the owner's int8 tables.
+    PrepareComponent(Result, FUNetInt8 and not FKeepComponents);
   except
     Result.Free;
     raise;
@@ -93642,21 +93785,51 @@ begin
   if Result = nil then Result := FPlainConditioner;
 end;
 
-function TStableDiffusionPipeline.AcquireVaeDecoder(GridX,
-  GridY: integer): TNNet;
+function TStableDiffusionPipeline.BuildVaeDecoderNet(GridX, GridY: integer;
+  pWeightOwner: TNNet): TNNet;
 var
   DecoderConfig: TVaeDecoderConfig;
+begin
+  DecoderConfig := FVaeConfig;
+  DecoderConfig.LatentGrid := GridX;
+  DecoderConfig.LatentGridY := GridY;
+  if pWeightOwner <> nil then
+    exit(BuildVaeDecoder(nil, DecoderConfig, {pTrainable=}false, pWeightOwner));
+  Inc(FWeightFileLoadCount);
+  Result := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
+    {pTrainable=}false);
+end;
+
+function TStableDiffusionPipeline.BuildVaeEncoderNet(GridX, GridY: integer;
+  pWeightOwner: TNNet): TNNet;
+var
+  EncoderConfig: TVaeDecoderConfig;
+begin
+  EncoderConfig := ReadVaeEncoderConfigFromJSONFile(ComponentFolder('vae') +
+    'config.json');
+  EncoderConfig.LatentGrid := GridX;
+  EncoderConfig.LatentGridY := GridY;
+  if pWeightOwner <> nil then
+    exit(BuildVaeEncoder(nil, EncoderConfig, {pTrainable=}false, pWeightOwner));
+  Inc(FWeightFileLoadCount);
+  Result := BuildVaeEncoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('vae'), 'diffusion_pytorch_model'), EncoderConfig,
+    {pTrainable=}false);
+end;
+
+function TStableDiffusionPipeline.AcquireVaeDecoder(GridX,
+  GridY: integer): TNNet;
 begin
   if Assigned(FVaeDecoder) and (FVaeGridX = GridX) and (FVaeGridY = GridY) then
     exit(FVaeDecoder);
   DoPhase(sdphLoadVae);
   FreeAndNil(FVaeDecoder);
-  DecoderConfig := FVaeConfig;
-  DecoderConfig.LatentGrid := GridX;
-  DecoderConfig.LatentGridY := GridY;
-  Result := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-    ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
-    {pTrainable=}false);
+  if FKeepComponents and (FVaeDecoderOwner = nil) then
+    FVaeDecoderOwner := BuildVaeDecoderNet(1, 1);
+  if FKeepComponents
+    then Result := BuildVaeDecoderNet(GridX, GridY, FVaeDecoderOwner)
+    else Result := BuildVaeDecoderNet(GridX, GridY);
   try
     PrepareComponent(Result, {QuantizeInt8=}false);
   except
@@ -93673,19 +93846,15 @@ end;
 
 function TStableDiffusionPipeline.AcquireVaeEncoder(GridX,
   GridY: integer): TNNet;
-var
-  EncoderConfig: TVaeDecoderConfig;
 begin
   if Assigned(FVaeEncoder) and (FVaeEncoderGridX = GridX) and
     (FVaeEncoderGridY = GridY) then exit(FVaeEncoder);
   FreeAndNil(FVaeEncoder);
-  EncoderConfig := ReadVaeEncoderConfigFromJSONFile(ComponentFolder('vae') +
-    'config.json');
-  EncoderConfig.LatentGrid := GridX;
-  EncoderConfig.LatentGridY := GridY;
-  Result := BuildVaeEncoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-    ComponentFolder('vae'), 'diffusion_pytorch_model'), EncoderConfig,
-    {pTrainable=}false);
+  if FKeepComponents and (FVaeEncoderOwner = nil) then
+    FVaeEncoderOwner := BuildVaeEncoderNet(1, 1);
+  if FKeepComponents
+    then Result := BuildVaeEncoderNet(GridX, GridY, FVaeEncoderOwner)
+    else Result := BuildVaeEncoderNet(GridX, GridY);
   try
     PrepareComponent(Result, {QuantizeInt8=}false);
   except
@@ -93805,6 +93974,7 @@ procedure TStableDiffusionPipeline.LoRAsChanged();
 begin
   FreeAndNil(FTextEncoder);
   FreeAndNil(FUNet);
+  FreeAndNil(FUNetOwner);
   Inc(FComponentEpoch);
   FHasNegativePromptEmbeds := false;
 end;
@@ -94336,6 +94506,7 @@ end;
 
 destructor TStableDiffusionConditioner.Destroy();
 begin
+  FWeightOwner.Free;
   FGuidancePreds[1].Free;
   FGuidancePreds[0].Free;
   inherited Destroy();
@@ -94601,18 +94772,42 @@ begin
   begin
     StartLoadPhase();
     FreeAndNil(FNet);
+    if Pipeline.ComponentsLoaded and
+      ((FWeightOwner = nil) or (FWeightOwnerInt8 <> Pipeline.UNetInt8)) then
+    begin
+      FreeAndNil(FWeightOwner);
+      FNetConfig := FConfig;
+      FNetConfig.Base.LatentGrid := 1;
+      FNetConfig.Base.LatentGridY := 1;
+      FNetConfig.Base.TextSeqLen := 1;
+      FNetConfig.CondGrid := CondFactor;
+      FNetConfig.CondGridY := CondFactor;
+      FWeightOwner := BuildControlNetFromSafeTensorsEx(FWeightsFile,
+        FNetConfig, {pTrainable=}false);
+      Inc(Pipeline.FWeightFileLoadCount);
+      FWeightOwnerInt8 := Pipeline.UNetInt8;
+      if FWeightOwnerInt8 then FWeightOwner.QuantizeWeightsInt8();
+    end;
     FNetConfig := FConfig;
     FNetConfig.Base.LatentGrid := GridX;
     FNetConfig.Base.LatentGridY := GridY;
     FNetConfig.Base.TextSeqLen := TextSeqLen;
     FNetConfig.CondGrid := GridX * CondFactor;
     FNetConfig.CondGridY := GridY * CondFactor;
-    FNet := BuildControlNetFromSafeTensorsEx(FWeightsFile, FNetConfig,
-      {pTrainable=}false);
+    if Pipeline.ComponentsLoaded then
+      FNet := BuildControlNet(nil, FNetConfig, {pTrainable=}false, FWeightOwner)
+    else
+    begin
+      FNet := BuildControlNetFromSafeTensorsEx(FWeightsFile, FNetConfig,
+        {pTrainable=}false);
+      Inc(Pipeline.FWeightFileLoadCount);
+    end;
     FNetGridX := GridX;
     FNetGridY := GridY;
     FNetEpoch := Pipeline.ComponentEpoch;
-    Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8);
+    // A borrowing net links the owner's int8 tables.
+    Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8 and
+      not Pipeline.ComponentsLoaded);
   end;
   ConvertAndResizeImagePIL(FSourceImage, FControlImage, FNetConfig.CondGrid,
     CondGridYOf(FNetConfig), FConfig.CondChannels, {ClipToByteRange=}false,
@@ -94661,7 +94856,9 @@ end;
 
 procedure TStableDiffusionControlNet.EndDenoise();
 begin
-  if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
+  if FPipeline.ComponentsLoaded then exit;
+  FreeAndNil(FNet);
+  FreeAndNil(FWeightOwner);
 end;
 
 constructor TStableDiffusionT2IAdapter.Create(const AdapterFolder: string);
@@ -94705,7 +94902,7 @@ procedure TStableDiffusionT2IAdapter.BeginDenoise(
   Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
   TextSeqLen: integer);
 var
-  GridX, GridY, SideMultiple, FeaturePos, MaxFeaturePos: integer;
+  GridX, GridY, SideMultiple, OwnerGrid, FeaturePos, MaxFeaturePos: integer;
 begin
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
   GridX := Latents.SizeX;
@@ -94733,13 +94930,32 @@ begin
   begin
     StartLoadPhase();
     FreeAndNil(FNet);
+    if Pipeline.ComponentsLoaded and (FWeightOwner = nil) then
+    begin
+      // The smallest grid the adapter accepts.
+      OwnerGrid := Max(1, SideMultiple div FConfig.DownscaleFactor);
+      FNetConfig := FConfig;
+      FNetConfig.LatentGrid := OwnerGrid;
+      FNetConfig.LatentGridY := OwnerGrid;
+      FNetConfig.CondGrid := OwnerGrid * FConfig.DownscaleFactor;
+      FNetConfig.CondGridY := OwnerGrid * FConfig.DownscaleFactor;
+      FWeightOwner := BuildT2IAdapterFromSafeTensorsEx(FWeightsFile,
+        FNetConfig, {pTrainable=}false);
+      Inc(Pipeline.FWeightFileLoadCount);
+    end;
     FNetConfig := FConfig;
     FNetConfig.LatentGrid := GridX;
     FNetConfig.LatentGridY := GridY;
     FNetConfig.CondGrid := GridX * FConfig.DownscaleFactor;
     FNetConfig.CondGridY := GridY * FConfig.DownscaleFactor;
-    FNet := BuildT2IAdapterFromSafeTensorsEx(FWeightsFile, FNetConfig,
-      {pTrainable=}false);
+    if Pipeline.ComponentsLoaded then
+      FNet := BuildT2IAdapter(nil, FNetConfig, {pTrainable=}false, FWeightOwner)
+    else
+    begin
+      FNet := BuildT2IAdapterFromSafeTensorsEx(FWeightsFile, FNetConfig,
+        {pTrainable=}false);
+      Inc(Pipeline.FWeightFileLoadCount);
+    end;
     FNetGridX := GridX;
     FNetGridY := GridY;
     FNetEpoch := Pipeline.ComponentEpoch;
@@ -94778,7 +94994,9 @@ end;
 
 procedure TStableDiffusionT2IAdapter.EndDenoise();
 begin
-  if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
+  if FPipeline.ComponentsLoaded then exit;
+  FreeAndNil(FNet);
+  FreeAndNil(FWeightOwner);
 end;
 
 constructor TStableDiffusionIPAdapter.Create(const WeightsFile: string;

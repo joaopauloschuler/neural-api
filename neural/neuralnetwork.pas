@@ -740,8 +740,8 @@ type
       // True, and the link marked pending, when the owning net builds
       // borrowing (TNNet.BuildWeightOwner): the caller sizes no weight rows.
       function DeferWeightSizingToBuildLink(): boolean;
-      // TNNet calls it once the layer index is final: links this layer to the
-      // owner net's layer at the same index (same class), raising on a graph
+      // TNNet calls it once the layer is attached: a weight-bearing layer links
+      // to the owner's next weight-bearing layer (same class), raising on a graph
       // mismatch or a refused link. Coded by Claude (AI).
       procedure LinkBuildWeightOwner();
     public
@@ -20295,11 +20295,14 @@ type
       FBuildQuantInt8: boolean;
       // BORROWING BUILD. While set, every layer attached to this net sizes no
       // weight rows (TNNetLayer.DeferWeightSizingToBuildLink) and, once its
-      // index is final, links to FBuildWeightOwner's layer at the same index
-      // (TNNetLayer.LinkBuildWeightOwner, which raises on a graph mismatch).
-      // The builder sets it before the first AddLayer and clears it after the
-      // graph; the owner's weight state must be final. Coded by Claude (AI).
+      // index is final, links to the next weight-bearing layer of
+      // FBuildWeightOwner (TNNetLayer.LinkBuildWeightOwner, which raises on a
+      // graph mismatch), so weightless layers (a crop at an odd size) may
+      // differ. The builder sets it before the first AddLayer and clears it
+      // after the graph; the owner's weight state must be final. Coded by Claude (AI).
       FBuildWeightOwner: TNNet;
+      // The owner layer index the next weight-bearing layer pairs with.
+      FBuildWeightOwnerLayerPos: integer;
       {$IFDEF OpenCL}
       // FP16 ACTIVATION MODE. When true, an int8 convolution runs its device
       // forward with the half B operand (cai_dot_product_int8_h and friends)
@@ -20372,6 +20375,11 @@ type
       procedure CountHostSharedOutputs(out LayerCount: integer;
         out SharedBytes, PrivateBytes: int64);
       procedure SetLayerProfiling(Value: boolean);
+      // Starts the borrowing build pairing at the owner's first layer.
+      procedure SetBuildWeightOwner(Value: TNNet);
+      // The next weight-bearing owner layer (the cursor moves past it); nil
+      // when none is left.
+      function TakeBuildWeightOwnerLayer(): TNNetLayer;
     protected
       // Plans host output sharing; a suffix forward is refused while outputs
       // are shared, as it would read outputs the last pass overwrote.
@@ -22199,7 +22207,10 @@ type
       // The net whose weights every layer attached from now on borrows (see
       // FBuildWeightOwner); nil = the layers size their own rows.
       property BuildWeightOwner: TNNet
-        read FBuildWeightOwner write FBuildWeightOwner;
+        read FBuildWeightOwner write SetBuildWeightOwner;
+      // Weight-bearing owner layers no attached layer has paired with yet:
+      // 0 after a borrowing build whose graph matches. Coded by Claude (AI).
+      function UnlinkedBuildWeightOwnerLayerCount(): integer;
       // Sum of every layer's WeightElementsSized: 0 for a net built borrowing.
       function WeightElementsSized(): int64;
       // Q4_0-quantizes every layer that SupportsInt4Weights and returns how
@@ -89347,10 +89358,8 @@ begin
     FQuantVectorSize, VBs);
 end;
 
-// A borrower that cannot borrow (owner not OpenCL-armed yet, or armed in
-// another context - EnableOpenCLInContextOf is the route that shares one)
-// reports it and uploads its own copy: correct, but the duplication the link
-// exists to remove. Coded by Claude (AI).
+// A borrower uploads its own copy unless the owner is armed in its context
+// (EnableOpenCLInContextOf); an armed owner it cannot borrow from is reported.
 function TNNetLayerConcatedWeights.BorrowOwnerOpenCLCodes(
   VBs: TNNetVolume): boolean;
 var
@@ -89359,13 +89368,14 @@ begin
   Result := false;
   if not (FLinkedWeightTables and Assigned(FWeightOwner)) then exit;
   OwnerCW := TNNetLayerConcatedWeights(FWeightOwner);
-  if Assigned(OwnerCW.FDotCL) then
-    Result := FDotCL.PrepareForComputeBorrowingCodes(OwnerCW.FDotCL, VBs,
-      FFP16Active);
+  // A host-only owner (never armed) has no OpenCL codes to lend.
+  if not Assigned(OwnerCW.FDotCL) then exit;
+  Result := FDotCL.PrepareForComputeBorrowingCodes(OwnerCW.FDotCL, VBs,
+    FFP16Active);
   if not Result then
     FErrorProc(ClassName + '.PrepareInt8DotCL: layer ' + IntToStr(FLayerIdx) +
-      ' could not borrow its owner''s resident codes (owner not armed, or ' +
-      'another OpenCL context) - uploading a second copy.');
+      ' could not borrow its owner''s resident codes (another OpenCL ' +
+      'context, or another shape or format) - uploading a second copy.');
 end;
 
 function TNNetLayerConcatedWeights.OpenCLCodesBuffer(): cl_mem;
@@ -145788,6 +145798,40 @@ begin
     end;
 end;
 
+procedure TNNet.SetBuildWeightOwner(Value: TNNet);
+begin
+  FBuildWeightOwner := Value;
+  FBuildWeightOwnerLayerPos := 0;
+end;
+
+// A layer lends when it holds rows or links them (a shared ALBERT block).
+function TNNet.TakeBuildWeightOwnerLayer(): TNNetLayer;
+var
+  OwnerLayer: TNNetLayer;
+  OwnerLayerCount: integer;
+begin
+  Result := nil;
+  OwnerLayerCount := FBuildWeightOwner.CountLayers();
+  while FBuildWeightOwnerLayerPos < OwnerLayerCount do
+  begin
+    OwnerLayer := FBuildWeightOwner.FLayers[FBuildWeightOwnerLayerPos];
+    Inc(FBuildWeightOwnerLayerPos);
+    if (OwnerLayer.CountWeights() > 0) or Assigned(OwnerLayer.FWeightOwner) then
+      exit(OwnerLayer);
+  end;
+end;
+
+function TNNet.UnlinkedBuildWeightOwnerLayerCount(): integer;
+var
+  SavedLayerPos: integer;
+begin
+  Result := 0;
+  if not Assigned(FBuildWeightOwner) then exit;
+  SavedLayerPos := FBuildWeightOwnerLayerPos;
+  while TakeBuildWeightOwnerLayer() <> nil do Inc(Result);
+  FBuildWeightOwnerLayerPos := SavedLayerPos;
+end;
+
 function TNNet.LinkWeightsFrom(Owner: TNNet): integer;
 var
   LayerCnt: integer;
@@ -147387,19 +147431,21 @@ end;
 // place where the mismatch is cheap to stop. Coded by Claude (AI).
 procedure TNNetLayer.LinkBuildWeightOwner();
 var
-  OwnerNet: TNNet;
   OwnerLayer: TNNetLayer;
 begin
-  OwnerNet := FNN.FBuildWeightOwner;
-  if FLayerIdx >= OwnerNet.CountLayers() then
+  // A weightless layer pairs with nothing.
+  if not FBuildLinkPending and (CountWeights() = 0) and
+    not Assigned(FWeightOwner) then exit;
+  OwnerLayer := FNN.TakeBuildWeightOwnerLayer();
+  if OwnerLayer = nil then
     raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
-      IntToStr(FLayerIdx) + ' has no counterpart - the owner net has only ' +
-      IntToStr(OwnerNet.CountLayers()) + ' layers (graph mismatch).');
-  OwnerLayer := OwnerNet.FLayers[FLayerIdx];
+      IntToStr(FLayerIdx) + ' has no counterpart - the owner net has no ' +
+      'weight-bearing layer left (graph mismatch).');
   if OwnerLayer.ClassType <> Self.ClassType then
     raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
-      IntToStr(FLayerIdx) + ' is a ' + ClassName + ' but the owner''s is a ' +
-      OwnerLayer.ClassName + ' (graph mismatch).');
+      IntToStr(FLayerIdx) + ' is a ' + ClassName + ' but the owner''s layer ' +
+      IntToStr(OwnerLayer.LayerIdx) + ' is a ' + OwnerLayer.ClassName +
+      ' (graph mismatch).');
   // An owner layer that borrows inside its own net (a shared ALBERT block)
   // lends the rows it borrows.
   if Assigned(OwnerLayer.FWeightOwner) then OwnerLayer := OwnerLayer.FWeightOwner;
@@ -147407,14 +147453,6 @@ begin
   begin
     // Linked already (a TNNetEmbedding links in its constructor).
     FBuildLinkPending := false;
-    exit;
-  end;
-  if OwnerLayer.CountWeights() = 0 then
-  begin
-    if FBuildLinkPending then
-      raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
-        IntToStr(FLayerIdx) + ' skipped sizing its rows but the owner''s ' +
-        'layer has no weights to lend.');
     exit;
   end;
   // Cleared before the link: LinkWeightsFrom rebuilds the derived caches

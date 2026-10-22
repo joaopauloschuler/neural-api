@@ -610,10 +610,25 @@ rather than acted on.
             image, user's GPU box; `UNetInt8` / `TextEncoderInt8`, `--int8`),
             then int4 UNet weights (QuantizeWeightsInt4, the QwenImage --int4
             path) after the int8 check.
-      - [ ] A size change still re-reads the UNet/VAE safetensors. Rebuild the
-            graph with BuildSDUNet and copy the weights from the kept net
-            instead (careful with int8: copy before quantizing, or quantize the
-            new net again).
+      - [X] A kept pipeline's size change reads no safetensors: the UNet, VAE
+            decoder/encoder, ControlNet and T2I-Adapter weights are read once
+            into a 1x1-grid weight owner (int8-quantized there), and each size
+            builds a net borrowing them (BuildWeightOwner; borrowing builds pair
+            weight-bearing layers in order, so the odd-size TNNetCrop is fine).
+            WeightFileLoadCount; TestStableDiffusion*SizeChange*,
+            TestSDUNetBorrowedWeightsOpenCL.
+        - [ ] --gpu: the owners stay on the host, so each size change uploads
+              the UNet weights (int8 codes or FP32) into the new net's own
+              OpenCL context again. Arming the owners in one shared context
+              (CreateOpenCLContextNet + ArmWeightOwnerInOpenCLContext, as the
+              Qwen-Image VAE does) would make a size change upload nothing;
+              measure on the GPU box first.
+        - [ ] A different IP-Adapter file still re-reads the UNet (the owner
+              holds the IP-Adapter attention weights).
+        - [ ] TNNetGroupNorm.GroupNormEpsilon is not in the saved structure, so
+              Clone / SaveToString of an SD UNet or VAE resets the 1e-6 norms to
+              1e-5. The builders now set it at construction; the save format
+              does not carry it.
       - [ ] Per-prompt caching of the cross-attention text K/V (low payoff,
             ~0.4% of a 512x512 SD 1.5 pass: 2*77*768*sum(C)=1.5 GMAC over the
             16 attn2 blocks vs ~400 GMAC). Needs a TNNet mechanism to skip the

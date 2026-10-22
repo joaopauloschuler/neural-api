@@ -25,7 +25,9 @@ With `--repeat N` (N > 1) the example calls `LoadComponents` instead: the
 three nets are built once and stay in memory for all N images, and the prompt
 is encoded once. A kept UNet or VAE decoder is rebuilt only when the latent
 grid changes (a new image size), and a kept text encoder only when the token
-count changes. In the library, `TStableDiffusionPipeline.LoadComponents` /
+count changes. A rebuild for a new size reads no weights file: the new net
+borrows the weights that the first build read (`TestStableDiffusionPipelineSizeChangeBorrows`,
+`WeightFileLoadCount`). In the library, `TStableDiffusionPipeline.LoadComponents` /
 `UnloadComponents` do the same for any sequence of calls; the images are
 bit-identical to the build-per-stage path
 (`TestStableDiffusionPipelineKeepLoaded`).
