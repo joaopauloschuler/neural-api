@@ -516,7 +516,7 @@ begin
   FThreadNum := 1;
   FShouldStart := false;
   FProcFinished := false;
-  PidAndIndexStr := IntToStr(GetProcessId())+'-'+IntToStr(pIndex);
+  PidAndIndexStr := IntToStr(GetProcessId())+'-'+IntToStr(pIndex)+'-'+IntToHex(PtrUInt(Self), 8);
   NStartName := 'NStart-'+PidAndIndexStr;
   NFinishName := 'NFinish-'+PidAndIndexStr;
   {$IFDEF FPC}
