@@ -120,3 +120,4 @@ examples/InstanceSegmentation/*.ppu
 __pycache__/
 *.pyc
 examples/ColorizePhoto/*.png
+examples/FaceRestoration/*.png
