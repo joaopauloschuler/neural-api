@@ -706,9 +706,11 @@ rather than acted on.
             (tools/make_pico_sd_prompt_weighting_fixture.py; the community
             pipeline is not in the ~/x venv). Open:
         - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
-        - [ ] A1111 extras not done: `BREAK`, moving a chunk split back to a
-              nearby comma, per-chunk mean restore (lpw restores the whole
-              prompt's mean, which is what is coded).
+        - [x] A1111 `BREAK` (TestSDPromptBreakParser,
+              TestStableDiffusionPromptBreakTokens).
+        - [ ] A1111 extras not done: moving a chunk split back to a nearby
+              comma, per-chunk mean restore (lpw restores the whole prompt's
+              mean, which is what is coded).
       - [ ] IP-Adapter image prompts in TStableDiffusionPipeline follow-ups
             (TStableDiffusionIPAdapter, h94/IP-Adapter ip-adapter_sd15,
             StableDiffusion --ip-adapter/--ip-image/--ip-scale):

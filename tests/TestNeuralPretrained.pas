@@ -1364,7 +1364,11 @@ type
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
     procedure TestSDPromptWeightParser;
+    // ParseSDPromptWeights splits A1111 BREAK out as chunk-break spans.
+    procedure TestSDPromptBreakParser;
     procedure TestStableDiffusionLongPromptTokens;
+    // A1111 BREAK chunk layout of TokenizePromptChunks / EncodePrompts.
+    procedure TestStableDiffusionPromptBreakTokens;
     procedure TestStableDiffusionLongPromptEmbeds;
     procedure TestStableDiffusionClipSkipParity;
     // TDiTFirstBlockCache.Interval: the run/skip pattern, the kept tail output,
@@ -48645,6 +48649,46 @@ begin
   CheckSpans(':1.3) alone', [':1.3) alone'], [1.0]);
 end;
 
+// A1111 \s*\bBREAK\b\s*: case-sensitive whole word, whitespace around it
+// dropped, inside brackets too; spans either side of a break never merge.
+procedure TTestNeuralPretrained.TestSDPromptBreakParser;
+const
+  cBreak = '<BREAK>';
+
+  procedure CheckSpans(const Prompt: string; const Texts: array of string;
+    const Weights: array of double);
+  var
+    Spans: TSDPromptSpanArray;
+    SpanPos: integer;
+  begin
+    Spans := ParseSDPromptWeights(Prompt);
+    AssertEquals('"' + Prompt + '" span count', Length(Texts), Length(Spans));
+    for SpanPos := 0 to High(Texts) do
+    begin
+      AssertEquals('"' + Prompt + '" break ' + IntToStr(SpanPos),
+        Texts[SpanPos] = cBreak, Spans[SpanPos].IsChunkBreak);
+      if Texts[SpanPos] = cBreak then continue;
+      AssertEquals('"' + Prompt + '" text ' + IntToStr(SpanPos),
+        Texts[SpanPos], Spans[SpanPos].Text);
+      AssertEquals('"' + Prompt + '" weight ' + IntToStr(SpanPos),
+        Weights[SpanPos], Spans[SpanPos].Weight, 1e-15);
+    end;
+  end;
+
+begin
+  CheckSpans('a BREAK b', ['a', cBreak, 'b'], [1, 1, 1]);
+  CheckSpans('BREAK', [cBreak], [1]);
+  CheckSpans('BREAK a', [cBreak, 'a'], [1, 1]);
+  CheckSpans('a BREAK', ['a', cBreak], [1, 1]);
+  CheckSpans('a BREAK BREAK b', ['a', cBreak, cBreak, 'b'], [1, 1, 1, 1]);
+  CheckSpans('a,BREAK,b', ['a,', cBreak, ',b'], [1, 1, 1]);
+  CheckSpans('a break b', ['a break b'], [1]);
+  CheckSpans('aBREAK b BREAKx BREAK_ Break', ['aBREAK b BREAKx BREAK_ Break'],
+    [1]);
+  CheckSpans('(a) BREAK (b)', ['a', cBreak, 'b'], [1.1, 1, 1.1]);
+  CheckSpans('(a BREAK b:1.5) c', ['a', cBreak, 'b', ' c'], [1.5, 1, 1.5, 1]);
+end;
+
 // TokenizePromptChunks vs lpw_stable_diffusion (tiny_sd15_lpw_io.json): the
 // chunked ids and per-id weights of prompt and negative prompt at one chunk count.
 procedure TTestNeuralPretrained.TestStableDiffusionLongPromptTokens;
@@ -48707,6 +48751,106 @@ begin
     end;
   finally
     Root.Free;
+  end;
+end;
+
+// BREAK closes the current chunk into [bos] ids [eos] pads: an empty chunk at
+// the start or between two BREAKs, none after a full chunk or at the end; cut
+// at MaxPromptChunkCount with a notice; literal text without PromptWeighting.
+procedure TTestNeuralPretrained.TestStableDiffusionPromptBreakTokens;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Got, Expected: TNNetVolume;
+  FullChunkText: string;
+  WordCnt, ValuePos: integer;
+  MaxDiff: double;
+
+  procedure CheckChunks(const Name, Prompt: string;
+    const ChunkTexts: array of string; MinChunkCount: integer = 1);
+  var
+    Ids, ChunkIds: TNeuralIntegerArray;
+    Weights: TNeuralFloatDynArr;
+    ChunkPos, IdPos, TokenCount: integer;
+  begin
+    Ids := Pipeline.TokenizePromptChunks(Prompt, Weights, MinChunkCount);
+    TokenCount := Length(Pipeline.TokenizePrompt(''));
+    AssertEquals(Name + ' id count', Length(ChunkTexts) * TokenCount,
+      Length(Ids));
+    AssertEquals(Name + ' weight count', Length(Ids), Length(Weights));
+    for ChunkPos := 0 to High(ChunkTexts) do
+    begin
+      ChunkIds := Pipeline.TokenizePrompt(ChunkTexts[ChunkPos]);
+      for IdPos := 0 to TokenCount - 1 do
+        AssertEquals(Name + ' chunk ' + IntToStr(ChunkPos) + ' id ' +
+          IntToStr(IdPos), ChunkIds[IdPos], Ids[ChunkPos * TokenCount + IdPos]);
+    end;
+  end;
+
+  procedure CheckWeights(const Name, Prompt: string;
+    const Positions: array of integer; Weight: double);
+  var
+    Ids: TNeuralIntegerArray;
+    Weights: TNeuralFloatDynArr;
+    IdPos, WeightedPos: integer;
+    Expect: double;
+  begin
+    Ids := Pipeline.TokenizePromptChunks(Prompt, Weights);
+    for IdPos := 0 to High(Weights) do
+    begin
+      Expect := 1;
+      for WeightedPos := 0 to High(Positions) do
+        if Positions[WeightedPos] = IdPos then Expect := Weight;
+      AssertEquals(Name + ' weight ' + IntToStr(IdPos), Expect,
+        Weights[IdPos], 1e-6);
+    end;
+  end;
+
+begin
+  FullChunkText := 'cat';
+  for WordCnt := 2 to 75 do FullChunkText := FullChunkText + ' cat';
+  Got := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Pipeline := CreateSD15Pipeline();
+  try
+    AssertEquals('one id per cat', 77, Length(Pipeline.TokenizePrompt('cat')));
+    AssertEquals('75 cats fill a chunk', Pipeline.TokenizePrompt('')[1],
+      Pipeline.TokenizePrompt(FullChunkText)[76]);
+    CheckChunks('two chunks', 'a cat BREAK red photo', ['a cat', 'red photo']);
+    CheckChunks('at start', 'BREAK a cat', ['', 'a cat']);
+    CheckChunks('at end', 'a cat BREAK', ['a cat']);
+    CheckChunks('alone', 'BREAK', ['']);
+    CheckChunks('two in a row', 'a cat BREAK BREAK red', ['a cat', '', 'red']);
+    CheckChunks('after a full chunk', FullChunkText + ' BREAK red',
+      [FullChunkText, 'red']);
+    CheckChunks('full chunk then end', FullChunkText + ' BREAK', [FullChunkText]);
+    CheckChunks('overflow then break', FullChunkText + ' a BREAK red',
+      [FullChunkText, 'a', 'red']);
+    CheckChunks('lowercase is text', 'a cat break red', ['a cat break red']);
+    CheckChunks('min chunk count pads', 'a BREAK b', ['a', 'b', ''], 3);
+    CheckChunks('cut at 3 chunks', 'a BREAK b BREAK c BREAK red', ['a', 'b', 'c']);
+    CheckWeights('weighted chunk', '(a cat:1.5) BREAK (red:1.5)', [1, 2, 78], 1.5);
+    CheckWeights('bracketed chunk', '(a cat) BREAK (red)', [1, 2, 78], 1.1);
+    Pipeline.EncodePrompts(['a BREAK b BREAK c BREAK red'], [Got]);
+    AssertEquals('cut to 3 chunks', 3 * 77, Got.SizeX);
+    AssertTrue('cut notice: ' + Pipeline.PromptNotice,
+      Pos('the last 1 chunks (1 tokens) were cut', Pipeline.PromptNotice) > 0);
+    // lpw encodes every chunk alone, so chunk 1 is "red photo" encoded alone.
+    Pipeline.EncodePrompt('a cat BREAK red photo', Got);
+    Pipeline.EncodePrompt('red photo', Expected);
+    AssertEquals('two chunks encoded', 2 * Expected.SizeX, Got.SizeX);
+    MaxDiff := 0;
+    for ValuePos := 0 to Expected.Size - 1 do
+      MaxDiff := Max(MaxDiff,
+        Abs(Got.FData[Expected.Size + ValuePos] - Expected.FData[ValuePos]));
+    AssertTrue('chunk 1 = "red photo", max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-6);
+    Pipeline.PromptWeighting := false;
+    CheckChunks('literal when not weighting', 'a cat BREAK red',
+      ['a cat break red']);
+  finally
+    Pipeline.Free;
+    Expected.Free;
+    Got.Free;
   end;
 end;
 

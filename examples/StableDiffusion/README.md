@@ -77,7 +77,8 @@ limit) caps the chunk count; a longer prompt is cut and the program prints a
 `Notice:` line saying how many tokens were dropped (`PromptNotice`).
 
 Prompts take the AUTOMATIC1111 weighting syntax (property `PromptWeighting`,
-on by default; `--no-prompt-weighting` reads the brackets as plain text):
+on by default; `--no-prompt-weighting` reads the brackets and `BREAK` as plain
+text):
 
 | Syntax | Weight |
 | --- | --- |
@@ -85,11 +86,26 @@ on by default; `--no-prompt-weighting` reads the brackets as plain text):
 | `(word)`, `((word))` | 1.1, 1.21 |
 | `[word]` | 1 / 1.1 |
 | `\(`, `\)`, `\[`, `\]`, `\\` | the literal character |
+| `BREAK` | ends the current chunk (see below) |
 
 Each token's text-encoder output row is multiplied by its weight, then the
 whole prompt's states are rescaled to their unweighted mean, as lpw's
 `get_weighted_text_embeddings` does. A textual inversion token works inside a
 weighted span: `(<cat-toy>:1.3)` weights all of its vectors.
+
+`BREAK` (uppercase, a whole word) works as in AUTOMATIC1111: it closes the
+current chunk, which is padded as `<|startoftext|>` ids `<|endoftext|>` pads,
+and the text after it starts the next chunk. A `BREAK` at the start of the
+prompt or straight after another `BREAK` gives an empty chunk; a `BREAK` right
+after a full chunk of 75 tokens, or at the end of the prompt, adds nothing.
+The chunks still count toward `--max-prompt-chunks`, and the `Notice:` line
+reports chunks cut that way. Lowercase `break` is a word. Unlike A1111, a
+`BREAK` inside brackets still breaks (A1111 turns it into the word with a
+negative weight).
+
+```
+StableDiffusion --prompt "a castle on a hill, sunset BREAK red flags, stone walls"
+```
 
 ```
 StableDiffusion --model ~/models/stable-diffusion-v1-5 \
@@ -101,7 +117,9 @@ Tested against a reimplementation of lpw's `get_weighted_text_embeddings` in
 float64 on the pico folder (`tools/make_pico_sd_prompt_weighting_fixture.py`;
 the community pipeline is not packaged with diffusers): token ids and weights
 match exactly, and 2-chunk weighted prompts are within 1.7e-6
-(`TestStableDiffusionLongPrompt*`, `TestSDPromptWeightParser`).
+(`TestStableDiffusionLongPrompt*`, `TestSDPromptWeightParser`). `BREAK` has no
+lpw counterpart; `TestSDPromptBreakParser` and
+`TestStableDiffusionPromptBreakTokens` check the A1111 chunk layout above.
 
 `--clip-skip N` (property `ClipSkip`, diffusers `clip_skip`) takes the text
 encoder's hidden state N layers before the last, through its final layer norm:
@@ -578,8 +596,9 @@ StableDiffusion [--model DIR] [options]
   --negative TEXT   negative prompt (default empty)
                     Both take A1111 weights: (word:1.3), (word) = x1.1, [word] = /1.1,
                     \( \) \[ \] for literal brackets; prompts longer than 75 tokens
-                    are encoded in chunks of 75 (lpw_stable_diffusion)
-  --no-prompt-weighting  read brackets in the prompts as plain text
+                    are encoded in chunks of 75 (lpw_stable_diffusion);
+                    a standalone BREAK starts a new chunk (A1111)
+  --no-prompt-weighting  read brackets and BREAK in the prompts as plain text
   --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens (default 3;
                     0: no limit); longer prompts are cut with a notice
   --clip-skip N     skip the last N text encoder layers (diffusers clip_skip;

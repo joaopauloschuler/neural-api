@@ -12343,10 +12343,12 @@ type
     procedure EndDenoise(); virtual;
   end;
 
-  // A run of prompt text and its A1111 attention weight.
+  // A run of prompt text and its A1111 attention weight, or (IsChunkBreak) an
+  // A1111 BREAK that closes the current 75-token chunk (Text '', Weight 1).
   TSDPromptSpan = record
     Text: string;
     Weight: double;
+    IsChunkBreak: boolean;
   end;
   TSDPromptSpanArray = array of TSDPromptSpan;
 
@@ -12496,16 +12498,20 @@ type
       const Embeds: array of TNNetVolume);
     // Prompt's ids without bos/eos after ExpandInversionTokens, one weight per
     // id (ParseSDPromptWeights spans when PromptWeighting, else all 1).
+    // Chunk i holds TextIds[ChunkStarts[i] .. ChunkStarts[i + 1] - 1]: runs of
+    // MaxTokenCount - 2 ids, and every A1111 BREAK closes the current chunk.
     procedure PromptTextIds(const Prompt: string;
-      out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr);
-    // Chunks of MaxTokenCount - 2 ids that TextCount ids need, at least
-    // MinChunkCount, at most Max(MaxChunkCount, MinChunkCount) (< 1: no cap).
-    function PromptChunkCount(TextCount, MinChunkCount,
+      out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr;
+      out ChunkStarts: TNeuralIntegerArray);
+    // NeededChunkCount, at least MinChunkCount, at most
+    // Max(MaxChunkCount, MinChunkCount) (< 1: no cap).
+    function PromptChunkCount(NeededChunkCount, MinChunkCount,
       MaxChunkCount: integer): integer;
-    // ChunkCount chunks of [bos] + ids + [eos] + pads, flat; ChunkWeights is 1
-    // off the text (TextWeights nil: all 1). Ids past the last chunk are cut.
+    // ChunkCount chunks of [bos] + ids + [eos] + pads, flat, split at ChunkStarts
+    // (nil: every MaxTokenCount - 2 ids); weights 1 off the text or TextWeights nil.
     procedure LayoutPromptChunks(const TextIds: TNeuralIntegerArray;
-      const TextWeights: TNeuralFloatDynArr; ChunkCount: integer;
+      const TextWeights: TNeuralFloatDynArr;
+      const ChunkStarts: TNeuralIntegerArray; ChunkCount: integer;
       out ChunkIds: TNeuralIntegerArray; out ChunkWeights: TNeuralFloatDynArr);
     // Every prompt at one shared chunk count: each chunk encoded, the chunks
     // concatenated along X, then weighted (ApplyPromptWeights); cuts go to PromptNotice.
@@ -12695,7 +12701,7 @@ type
   end;
 
 // A1111 / lpw_stable_diffusion parse_prompt_attention: "(a:1.3)", "(a)" x 1.1,
-// "[a]" / 1.1, "\(" escapes; equal-weight neighbours merged; never empty.
+// "[a]" / 1.1, "\(" escapes, A1111 BREAK; equal-weight neighbours merged; never empty.
 function ParseSDPromptWeights(const Prompt: string): TSDPromptSpanArray;
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
@@ -96009,6 +96015,8 @@ function ParseSDPromptWeights(const Prompt: string): TSDPromptSpanArray;
 const
   cRoundBracketWeight: double = 1.1;
   cTextStop = ['\', '(', ')', '[', ']', ':'];
+  cWhiteSpace = [' ', #9, #10, #11, #12, #13];
+  cWordChars = ['0'..'9', 'A'..'Z', 'a'..'z', '_', #128..#255];
 var
   RoundStarts, SquareStarts: TNeuralIntegerArray;
   RoundCount, SquareCount, SpanCount, CharPos, PromptLen, RunEnd: integer;
@@ -96020,7 +96028,43 @@ var
     if SpanCount = Length(Result) then SetLength(Result, 2 * SpanCount + 4);
     Result[SpanCount].Text := Text;
     Result[SpanCount].Weight := 1.0;
+    Result[SpanCount].IsChunkBreak := false;
     Inc(SpanCount);
+  end;
+
+  // Python's \bBREAK\b at WordPos (UTF-8 bytes >= 128 count as word chars).
+  function IsChunkBreakAt(WordPos: integer): boolean;
+  begin
+    Result := (Copy(Prompt, WordPos, 5) = 'BREAK') and
+      ((WordPos = 1) or not (Prompt[WordPos - 1] in cWordChars)) and
+      ((WordPos + 5 > PromptLen) or not (Prompt[WordPos + 5] in cWordChars));
+  end;
+
+  // Prompt[First..Last] split at A1111's \s*\bBREAK\b\s* into text and breaks.
+  procedure AddTextRun(First, Last: integer);
+  var
+    PieceStart, PieceEnd, WordPos: integer;
+  begin
+    PieceStart := First;
+    WordPos := First;
+    while WordPos + 4 <= Last do
+      if IsChunkBreakAt(WordPos) then
+      begin
+        PieceEnd := WordPos - 1;
+        while (PieceEnd >= PieceStart) and (Prompt[PieceEnd] in cWhiteSpace) do
+          Dec(PieceEnd);
+        if PieceEnd >= PieceStart then
+          AddSpan(Copy(Prompt, PieceStart, PieceEnd - PieceStart + 1));
+        AddSpan('');
+        Result[SpanCount - 1].IsChunkBreak := true;
+        WordPos := WordPos + 5;
+        while (WordPos <= Last) and (Prompt[WordPos] in cWhiteSpace) do
+          Inc(WordPos);
+        PieceStart := WordPos;
+      end
+      else Inc(WordPos);
+    if Last >= PieceStart then
+      AddSpan(Copy(Prompt, PieceStart, Last - PieceStart + 1));
   end;
 
   procedure MultiplyFrom(FirstSpanPos: integer; Multiplier: double);
@@ -96029,8 +96073,9 @@ var
   begin
     MaxMultiplySpanPos := SpanCount - 1;
     for MultiplySpanPos := FirstSpanPos to MaxMultiplySpanPos do
-      Result[MultiplySpanPos].Weight := Result[MultiplySpanPos].Weight *
-        Multiplier;
+      if not Result[MultiplySpanPos].IsChunkBreak then
+        Result[MultiplySpanPos].Weight := Result[MultiplySpanPos].Weight *
+          Multiplier;
   end;
 
   procedure Push(var Starts: TNeuralIntegerArray; var Count: integer);
@@ -96115,7 +96160,7 @@ begin
         RunEnd := CharPos;
         while (RunEnd < PromptLen) and not (Prompt[RunEnd + 1] in cTextStop) do
           Inc(RunEnd);
-        AddSpan(Copy(Prompt, CharPos, RunEnd - CharPos + 1));
+        AddTextRun(CharPos, RunEnd);
         CharPos := RunEnd;
       end;
     end;
@@ -96128,11 +96173,12 @@ begin
   for SpanPos := 0 to MaxSpanPos do
     MultiplyFrom(SquareStarts[SpanPos], SquareBracketWeight);
   if SpanCount = 0 then AddSpan('');
-  // Merge neighbours of equal weight in place.
+  // Merge text neighbours of equal weight in place.
   RunEnd := 0;
   MaxSpanPos := SpanCount - 1;
   for SpanPos := 1 to MaxSpanPos do
-    if Result[SpanPos].Weight = Result[RunEnd].Weight then
+    if (Result[SpanPos].Weight = Result[RunEnd].Weight) and
+      not (Result[SpanPos].IsChunkBreak or Result[RunEnd].IsChunkBreak) then
       Result[RunEnd].Text := Result[RunEnd].Text + Result[SpanPos].Text
     else
     begin
@@ -96148,16 +96194,38 @@ var
   Weights: TNeuralFloatDynArr;
 begin
   EnsureTokenizer();
-  LayoutPromptChunks(FTokenizer.Encode(ExpandInversionTokens(Prompt)), nil, 1,
-    Result, Weights);
+  LayoutPromptChunks(FTokenizer.Encode(ExpandInversionTokens(Prompt)), nil, nil,
+    1, Result, Weights);
 end;
 
 procedure TStableDiffusionPipeline.PromptTextIds(const Prompt: string;
-  out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr);
+  out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr;
+  out ChunkStarts: TNeuralIntegerArray);
 var
   Spans: TSDPromptSpanArray;
   SpanIds: TNeuralIntegerArray;
   SpanPos, MaxSpanPos, IdPos, MaxIdPos, TextCount: integer;
+  SegmentStart, StartCount: integer;
+
+  // Chunks of MaxTokenCount - 2 ids over TextIds[SegmentStart..TextCount - 1];
+  // a segment a BREAK closes takes one chunk even when empty.
+  procedure AddSegmentChunks(IsClosedByBreak: boolean);
+  var
+    ChunkTextCount, SegmentChunkCount, ChunkPos, MaxChunkPos: integer;
+  begin
+    ChunkTextCount := FMaxTokenCount - 2;
+    SegmentChunkCount := (TextCount - SegmentStart + ChunkTextCount - 1) div
+      ChunkTextCount;
+    if IsClosedByBreak then SegmentChunkCount := Max(SegmentChunkCount, 1);
+    SetLength(ChunkStarts, StartCount + SegmentChunkCount);
+    MaxChunkPos := SegmentChunkCount - 1;
+    for ChunkPos := 0 to MaxChunkPos do
+      ChunkStarts[StartCount + ChunkPos] := SegmentStart +
+        ChunkPos * ChunkTextCount;
+    Inc(StartCount, SegmentChunkCount);
+    SegmentStart := TextCount;
+  end;
+
 begin
   EnsureTokenizer();
   if FPromptWeighting then Spans := ParseSDPromptWeights(ExpandInversionTokens(Prompt))
@@ -96169,10 +96237,18 @@ begin
   end;
   TextIds := nil;
   Weights := nil;
+  ChunkStarts := nil;
   TextCount := 0;
+  SegmentStart := 0;
+  StartCount := 0;
   MaxSpanPos := High(Spans);
   for SpanPos := 0 to MaxSpanPos do
   begin
+    if Spans[SpanPos].IsChunkBreak then
+    begin
+      AddSegmentChunks(true);
+      continue;
+    end;
     SpanIds := FTokenizer.Encode(Spans[SpanPos].Text);
     SetLength(TextIds, TextCount + Length(SpanIds));
     SetLength(Weights, TextCount + Length(SpanIds));
@@ -96184,27 +96260,26 @@ begin
     end;
     Inc(TextCount, Length(SpanIds));
   end;
+  AddSegmentChunks(StartCount = 0);
+  SetLength(ChunkStarts, StartCount + 1);
+  ChunkStarts[StartCount] := TextCount;
 end;
 
-function TStableDiffusionPipeline.PromptChunkCount(TextCount, MinChunkCount,
-  MaxChunkCount: integer): integer;
-var
-  ChunkTextCount: integer;
+function TStableDiffusionPipeline.PromptChunkCount(NeededChunkCount,
+  MinChunkCount, MaxChunkCount: integer): integer;
 begin
-  ChunkTextCount := FMaxTokenCount - 2;
-  Result := Max(Max(MinChunkCount, 1),
-    (TextCount + ChunkTextCount - 1) div ChunkTextCount);
+  Result := Max(Max(MinChunkCount, 1), NeededChunkCount);
   if MaxChunkCount > 0 then
     Result := Min(Result, Max(MaxChunkCount, MinChunkCount));
 end;
 
 procedure TStableDiffusionPipeline.LayoutPromptChunks(
   const TextIds: TNeuralIntegerArray; const TextWeights: TNeuralFloatDynArr;
-  ChunkCount: integer; out ChunkIds: TNeuralIntegerArray;
-  out ChunkWeights: TNeuralFloatDynArr);
+  const ChunkStarts: TNeuralIntegerArray; ChunkCount: integer;
+  out ChunkIds: TNeuralIntegerArray; out ChunkWeights: TNeuralFloatDynArr);
 var
   PadId, ChunkTextCount, ChunkPos, MaxChunkPos, ChunkStart, TextStart: integer;
-  TextCount, TokenPos, MaxTokenPos: integer;
+  TextCount, TokenPos, MaxTokenPos, StartedChunkCount: integer;
 begin
   EnsureTokenizer();
   PadId := FTokenizer.TokenToId(FPadToken);
@@ -96216,12 +96291,26 @@ begin
   SetLength(ChunkWeights, ChunkCount * FMaxTokenCount);
   MaxTokenPos := High(ChunkWeights);
   for TokenPos := 0 to MaxTokenPos do ChunkWeights[TokenPos] := 1.0;
+  StartedChunkCount := Length(ChunkStarts) - 1;
   MaxChunkPos := ChunkCount - 1;
   for ChunkPos := 0 to MaxChunkPos do
   begin
     ChunkStart := ChunkPos * FMaxTokenCount;
-    TextStart := ChunkPos * ChunkTextCount;
-    TextCount := Max(0, Min(ChunkTextCount, Length(TextIds) - TextStart));
+    if ChunkStarts = nil then
+    begin
+      TextStart := ChunkPos * ChunkTextCount;
+      TextCount := Max(0, Min(ChunkTextCount, Length(TextIds) - TextStart));
+    end
+    else if ChunkPos < StartedChunkCount then
+    begin
+      TextStart := ChunkStarts[ChunkPos];
+      TextCount := ChunkStarts[ChunkPos + 1] - TextStart;
+    end
+    else
+    begin
+      TextStart := 0;
+      TextCount := 0;
+    end;
     ChunkIds[ChunkStart] := FTokenizer.BosId;
     for TokenPos := 1 to TextCount do
       ChunkIds[ChunkStart + TokenPos] := TextIds[TextStart + TokenPos - 1];
@@ -96239,12 +96328,13 @@ end;
 function TStableDiffusionPipeline.TokenizePromptChunks(const Prompt: string;
   out Weights: TNeuralFloatDynArr; MinChunkCount: integer): TNeuralIntegerArray;
 var
-  TextIds: TNeuralIntegerArray;
+  TextIds, ChunkStarts: TNeuralIntegerArray;
   TextWeights: TNeuralFloatDynArr;
 begin
-  PromptTextIds(Prompt, TextIds, TextWeights);
-  LayoutPromptChunks(TextIds, TextWeights, PromptChunkCount(Length(TextIds),
-    MinChunkCount, FMaxPromptChunkCount), Result, Weights);
+  PromptTextIds(Prompt, TextIds, TextWeights, ChunkStarts);
+  LayoutPromptChunks(TextIds, TextWeights, ChunkStarts,
+    PromptChunkCount(High(ChunkStarts), MinChunkCount, FMaxPromptChunkCount),
+    Result, Weights);
 end;
 
 procedure TStableDiffusionPipeline.ApplyPromptWeights(Embeds: TNNetVolume;
@@ -96285,42 +96375,46 @@ procedure TStableDiffusionPipeline.EncodePromptList(
   const Prompts: array of string; const Embeds: array of TNNetVolume;
   MinChunkCount, MaxChunkCount: integer);
 var
-  TextIdLists, TokenLists: array of TNeuralIntegerArray;
+  TextIdLists, ChunkStartLists, TokenLists: array of TNeuralIntegerArray;
   TextWeightLists, ChunkWeightLists: array of TNeuralFloatDynArr;
   ChunkIds: TNeuralIntegerArray;
   ChunkEmbeds: array of TNNetVolume;
   ChunkCount, PromptPos, MaxPromptPos, ChunkPos, MaxChunkPos: integer;
-  ListPos, MaxListPos, TokenSize: integer;
+  ListPos, MaxListPos, TokenSize, NeededChunkCount, TextCount: integer;
 begin
   MaxPromptPos := High(Prompts);
   SetLength(TextIdLists, MaxPromptPos + 1);
+  SetLength(ChunkStartLists, MaxPromptPos + 1);
   SetLength(TextWeightLists, MaxPromptPos + 1);
   SetLength(ChunkWeightLists, MaxPromptPos + 1);
   ChunkCount := Max(MinChunkCount, 1);
   for PromptPos := 0 to MaxPromptPos do
   begin
     PromptTextIds(Prompts[PromptPos], TextIdLists[PromptPos],
-      TextWeightLists[PromptPos]);
+      TextWeightLists[PromptPos], ChunkStartLists[PromptPos]);
     ChunkCount := Max(ChunkCount, PromptChunkCount(
-      Length(TextIdLists[PromptPos]), MinChunkCount, MaxChunkCount));
+      High(ChunkStartLists[PromptPos]), MinChunkCount, MaxChunkCount));
   end;
   SetLength(TokenLists, (MaxPromptPos + 1) * ChunkCount);
   MaxChunkPos := ChunkCount - 1;
   for PromptPos := 0 to MaxPromptPos do
   begin
-    if Length(TextIdLists[PromptPos]) > ChunkCount * (FMaxTokenCount - 2) then
+    NeededChunkCount := High(ChunkStartLists[PromptPos]);
+    if NeededChunkCount > ChunkCount then
     begin
+      TextCount := Length(TextIdLists[PromptPos]);
       if FPromptNotice <> '' then FPromptNotice := FPromptNotice + ' ';
       FPromptNotice := FPromptNotice + 'Prompt "' +
-        Copy(Prompts[PromptPos], 1, 40) + '..." has ' +
-        IntToStr(Length(TextIdLists[PromptPos])) + ' tokens; the last ' +
-        IntToStr(Length(TextIdLists[PromptPos]) -
-        ChunkCount * (FMaxTokenCount - 2)) + ' were cut (' +
-        IntToStr(ChunkCount) + ' chunks of ' + IntToStr(FMaxTokenCount - 2) +
-        ').';
+        Copy(Prompts[PromptPos], 1, 40) + '..." has ' + IntToStr(TextCount) +
+        ' tokens in ' + IntToStr(NeededChunkCount) + ' chunks; the last ' +
+        IntToStr(NeededChunkCount - ChunkCount) + ' chunks (' +
+        IntToStr(TextCount - ChunkStartLists[PromptPos][ChunkCount]) +
+        ' tokens) were cut (' + IntToStr(ChunkCount) + ' chunks of ' +
+        IntToStr(FMaxTokenCount - 2) + ').';
     end;
     LayoutPromptChunks(TextIdLists[PromptPos], TextWeightLists[PromptPos],
-      ChunkCount, ChunkIds, ChunkWeightLists[PromptPos]);
+      ChunkStartLists[PromptPos], ChunkCount, ChunkIds,
+      ChunkWeightLists[PromptPos]);
     for ChunkPos := 0 to MaxChunkPos do
       TokenLists[PromptPos * ChunkCount + ChunkPos] :=
         Copy(ChunkIds, ChunkPos * FMaxTokenCount, FMaxTokenCount);
@@ -96668,7 +96762,7 @@ procedure TStableDiffusionPipeline.Generate(const Prompt: string; Width,
   Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume);
 var
   PromptEmbeds: TNNetVolume;
-  NegativeIds: TNeuralIntegerArray;
+  NegativeIds, NegativeChunkStarts: TNeuralIntegerArray;
   NegativeWeights: TNeuralFloatDynArr;
   MinChunkCount: integer;
 begin
@@ -96689,8 +96783,9 @@ begin
       MinChunkCount := 1;
       if (CFGGuidanceScale > 1) and FNegativeEmbedsFromPrompt then
       begin
-        PromptTextIds(FNegativePrompt, NegativeIds, NegativeWeights);
-        MinChunkCount := PromptChunkCount(Length(NegativeIds), 1,
+        PromptTextIds(FNegativePrompt, NegativeIds, NegativeWeights,
+          NegativeChunkStarts);
+        MinChunkCount := PromptChunkCount(High(NegativeChunkStarts), 1,
           FMaxPromptChunkCount);
       end;
       EncodePromptList([Prompt], [PromptEmbeds], MinChunkCount,

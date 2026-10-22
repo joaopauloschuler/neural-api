@@ -230,8 +230,10 @@ begin
     'x1.1, [word] = /1.1,');
   WriteLn('                    \( \) \[ \] for literal brackets; prompts ',
     'longer than 75 tokens');
-  WriteLn('                    are encoded in chunks of 75 (lpw_stable_diffusion)');
-  WriteLn('  --no-prompt-weighting  read brackets in the prompts as plain text');
+  WriteLn('                    are encoded in chunks of 75 (lpw_stable_diffusion);');
+  WriteLn('                    a standalone BREAK starts a new chunk (A1111)');
+  WriteLn('  --no-prompt-weighting  read brackets and BREAK in the prompts as ',
+    'plain text');
   WriteLn('  --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens ',
     '(default 3;');
   WriteLn('                    0: no limit); longer prompts are cut with a notice');
