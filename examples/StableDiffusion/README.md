@@ -589,6 +589,64 @@ DeepCache (`TestStableDiffusionPAGDeepCache`); OpenCL against the CPU < 1e-4
 (`TestStableDiffusionPAGOpenCL`). A real checkpoint has not been run with PAG
 yet.
 
+## Self-Attention Guidance (`--sag-scale`)
+
+Self-Attention Guidance (SAG; Hong et al. 2023, arXiv:2210.00939) blurs the
+regions the UNet attends to and steers each step away from what the UNet
+predicts for the blurred latents. Per step, after the CFG passes:
+
+1. The mask comes from the self-attention (`attn1`) of the mid block in the
+   unconditional pass (the conditional pass without CFG). The attention each
+   key receives, averaged over the heads and summed over the queries, is
+   compared with 1; the keys above 1 form the mask on the mid-block grid. The
+   mask is nearest-upsampled to the latent size.
+2. x0 and eps are predicted from that pass's noise (epsilon or
+   `v_prediction`, as the scheduler config says) at the step's
+   `alphas_cumprod`. x0 is Gaussian-blurred (kernel 9, sigma 1, reflect
+   padding) inside the mask and re-noised to the step's timestep with the
+   same eps.
+3. One more UNet pass runs on the degraded latents, with the negative prompt
+   (the prompt without CFG). The step's noise gets
+   `sag * (source - degraded)`, where source is the unconditional
+   prediction (the conditional one without CFG).
+
+This is diffusers' `StableDiffusionSAGPipeline`; its default `sag_scale` is
+0.75.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 25 \
+  --sag-scale 0.75 --prompt "a watercolor painting of a lighthouse" --gpu
+```
+
+diffusers indexes `alphas_cumprod` with integer timesteps only. Here the
+fractional timesteps of the sigma schedules (Euler / Euler a with linspace
+spacing, Karras sigmas) read `alpha_bar = 1 / (1 + sigma^2)` of the
+interpolated sigma. The pipeline keeps the latents in the model-input scale,
+so SAG's x0 and re-noise formulas hold for every sampler. SAG combines with
+PAG (the SAG term is added after the PAG mix), img2img, inpainting,
+depth2img, ControlNet, T2I-Adapter, IP-Adapter, LoRA, FreeU and DeepCache.
+Under DeepCache the degraded pass keeps its own deep features, and the steps
+that skip the mid block reuse the last mask. SAG does not combine with
+`--edit-image`.
+
+`TStableDiffusionPipeline.SAGScale` (0 = off) is the API;
+`SelfAttentionMask` holds the last mask (mid-block grid, 0/1). The pieces are
+reusable: `SDSelfAttentionGuidanceMask`, `SDSelfAttentionDegrade`,
+`TNNetDiffusionScheduler.AlphaBarRootsAt` / `SplitPrediction`, and the
+torchvision-style `GaussianBlurImage(Source, Dest, Sigma, KernelSize)` in
+`neuralimageresize.pas`. During the denoise loop the mid `attn1` heads set
+`KeepAttentionWeights`, so on OpenCL those heads skip the fused flash kernel.
+Tests on the pico folder: `--sag-scale 0` (and < 0) bit-identical to no SAG
+(`TestStableDiffusionSAGScaleZero`); DeepCache (`TestStableDiffusionSAGDeepCache`);
+diffusers float64 `StableDiffusionSAGPipeline` with DDIM, with and without
+CFG, the last mask bit for bit and sampled final latents within 5e-5 (about
+2e-6 measured; `TestStableDiffusionSAGParity`); a 32x16 image, whose mask is
+the 8x4 mid-block grid (`TestStableDiffusionSAGNonSquareMask`); the blur taps
+against torchvision's kernel (`TestGaussianBlurImageTorchvisionKernel`). The
+reference numbers come from an ad hoc diffusers run and are hardcoded in the
+tests, because the committed fixture generator has no SAG mode. A real
+checkpoint has not been run with SAG yet.
+
 ## Usage
 
 ```
@@ -669,6 +727,8 @@ StableDiffusion [--model DIR] [options]
                     mid_block.attentions.0.transformer_blocks.0.attn1; default mid)
   --pag-adaptive-scale A lowers the PAG scale by A per timestep below 1000
                     (diffusers pag_adaptive_scale, default 0)
+  --sag-scale S     Self-Attention Guidance scale (default 0 = off; diffusers
+                    uses 0.75): one more UNet pass per step
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

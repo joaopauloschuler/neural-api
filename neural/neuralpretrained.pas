@@ -12096,6 +12096,14 @@ function SDUNetPAGLayerIndices(const Config: TSDUNetConfig;
 // SelfAttentionIndices; raises unless Net is a BuildSDUNet net of Config.
 function SDUNetSelfAttentionHeads(Net: TNNet; const Config: TSDUNetConfig;
   const SelfAttentionIndices: array of integer): TNNetLayerRefArr;
+// diffusers SAG mask on Mask's (mid-block) grid: 1 where the head-mean map of
+// Heads (KeepAttentionWeights set), summed over the queries, is > 1, else 0.
+procedure SDSelfAttentionGuidanceMask(const Heads: TNNetLayerRefArr;
+  Mask: TNNetVolume);
+// diffusers sag_masking after the mask: X0 := its blur (9 taps, sigma 1, reflect)
+// where the nearest-upsampled Mask is 1, then SqrtAb*X0 + SqrtOneMinusAb*Eps.
+procedure SDSelfAttentionDegrade(X0, Eps, Mask, Blurred: TNNetVolume;
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 
 // SDXL single-step denoise for a UNet built with addition_embed_type=="text_time"
 // (Config.UseAddEmbedding=true). PooledText is the (AdditionEmbedTextDim) pooled
@@ -12248,7 +12256,7 @@ type
       array[TStableDiffusionPipelinePhase] of int64;
     TransfersCounted: boolean;
     // UNet passes of the last Denoise: one per model eval, plus one each for
-    // CFG and PAG.
+    // CFG, PAG and SAG.
     UNetPassCount: integer;
     // The passes of UNetPassCount that ran only the DeepCache shallow branch.
     UNetCachedPassCount: integer;
@@ -12259,9 +12267,11 @@ type
   TStableDiffusionConditionerArray = array of TStableDiffusionConditioner;
 
   // The inputs one UNet pass of a guided step sees: the prompt (else the
-  // negative prompt; the IP-Adapter image goes with it), InstructPix2Pix's image
-  // and PerturbedGuidance's identity self-attention (the perturbed pass of PAG).
-  TStableDiffusionPassInput = (sdpiPrompt, sdpiImage, sdpiPerturbed);
+  // negative prompt; the IP-Adapter image goes with it), InstructPix2Pix's image,
+  // PerturbedGuidance's identity self-attention (the perturbed pass of PAG) and
+  // SAG's blurred latents (the degraded pass).
+  TStableDiffusionPassInput = (sdpiPrompt, sdpiImage, sdpiPerturbed,
+    sdpiDegraded);
   TStableDiffusionPassInputs = set of TStableDiffusionPassInput;
 
   // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
@@ -12277,7 +12287,9 @@ type
     FWeightOwner: TNNet;
     FWeightOwnerInt8: boolean;
     // The predictions of the extra passes of PredictGuidedNoise.
-    FGuidancePreds: array[0..1] of TNNetVolume;
+    FGuidancePreds: array[0..2] of TNNetVolume;
+    // SAG's x0 (then degraded latents), eps and blurred x0.
+    FSAGLatents, FSAGEps, FSAGBlurred: TNNetVolume;
     // Opens sdphLoadUNet unless it is the open phase: the conditioner's
     // own nets load (and run once) there.
     procedure StartLoadPhase();
@@ -12289,6 +12301,16 @@ type
     procedure PredictPass(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume);
+    // PredictPass, then the pipeline's SAG mask from it when its deep branch ran.
+    procedure PredictMaskSourcePass(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume);
+    // FGuidancePreds[2] := Source - the UNet (a pass seeing Inputs) on the SAG
+    // degraded latents; Source is the prediction the mask came from.
+    procedure PredictSelfAttentionGuidance(UNet: TNNet;
+      const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+      Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+      Source: TNNetVolume);
     // SDUNetDenoise under the pipeline's DeepCache of the pass PredictPass runs
     // (a full forward outside one, or with DeepCacheInterval 1).
     procedure DenoiseUNet(UNet: TNNet; const Config: TSDUNetConfig;
@@ -12421,7 +12443,7 @@ type
     // DeepCache: one step cache per pass kind (DeepCacheFor), the DeepCache
     // layout of the kept FUNet, the split Denoise runs, the running pass's cache.
     FDeepCacheInterval, FDeepCacheBranch: integer;
-    FDeepCaches: array[0..4] of TDiTFirstBlockCache;
+    FDeepCaches: array[0..5] of TDiTFirstBlockCache;
     FUNetDeepCacheLayout: TSDUNetDeepCacheLayout;
     FDeepCacheSplit: TSDUNetDeepCacheSplit;
     FPassDeepCache: TDiTFirstBlockCache;
@@ -12430,6 +12452,12 @@ type
     FPerturbedGuidance: TNNetPerturbedGuidance;
     FIsPerturbed: boolean;
     FPerturbedHeads: TNNetLayerRefArr;
+    // SAG scale; during Denoise, whether it runs, the mid attn1 heads it reads
+    // and its mask on the mid-block grid (kept for the DeepCache shallow steps).
+    FSAGScale: TNeuralFloat;
+    FIsSelfAttentionGuided: boolean;
+    FSelfAttentionHeads: TNNetLayerRefArr;
+    FSelfAttentionMask: TNNetVolume;
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
     FLoRAScales: TNeuralFloatDynArr;
@@ -12541,6 +12569,10 @@ type
     // Denoise's FIsPerturbed and FPerturbedHeads for Net; raises on settings
     // the UNet cannot run.
     procedure PreparePerturbedGuidance(Net: TNNet);
+    // Denoise's SAG state for Net at the latent grid; KeepAttentionWeights on the
+    // mid attn1 heads while Value, off again for false.
+    procedure PrepareSelfAttentionGuidance(Net: TNNet; GridX, GridY: integer;
+      Value: boolean);
     // The step cache of the passes that see Inputs; nil when DeepCache is off.
     function DeepCacheFor(Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
   public
@@ -12698,6 +12730,11 @@ type
     // "mid"); every step runs it, so the window and formulation are not read.
     property PerturbedGuidance: TNNetPerturbedGuidance read FPerturbedGuidance
       write SetPerturbedGuidance;
+    // SAG as diffusers StableDiffusionSAGPipeline sag_scale (0 = off, its
+    // default 0.75): one more UNet pass per step on mid-attention-blurred x0.
+    property SAGScale: TNeuralFloat read FSAGScale write FSAGScale;
+    // The SAG mask of the last pass that ran the mid block (mid-block grid, 0/1).
+    property SelfAttentionMask: TNNetVolume read FSelfAttentionMask;
   end;
 
 // A1111 / lpw_stable_diffusion parse_prompt_attention: "(a:1.3)", "(a)" x 1.1,
@@ -77549,6 +77586,83 @@ begin
   end;
 end;
 
+procedure SDSelfAttentionGuidanceMask(const Heads: TNNetLayerRefArr;
+  Mask: TNNetVolume);
+var
+  ColumnSums: array of double;
+  Map: TNNetVolume;
+  HeadPos, MaxHeadPos, QueryPos, KeyPos, MaxTokenPos, MapPos,
+    MapDepth: integer;
+begin
+  if Length(Heads) = 0 then
+    ImportError('SDSelfAttentionGuidanceMask: no attention heads.');
+  MaxTokenPos := Mask.SizeX * Mask.SizeY - 1;
+  SetLength(ColumnSums, MaxTokenPos + 1);
+  for KeyPos := 0 to MaxTokenPos do ColumnSums[KeyPos] := 0;
+  MaxHeadPos := High(Heads);
+  for HeadPos := 0 to MaxHeadPos do
+  begin
+    Map := TNNetScaledDotProductAttention(Heads[HeadPos]).AttentionWeights;
+    if (Map.SizeX <> MaxTokenPos + 1) or (Map.SizeY <> MaxTokenPos + 1) then
+      ImportError('SDSelfAttentionGuidanceMask: an attention map of ' +
+        IntToStr(Map.SizeX) + 'x' + IntToStr(Map.SizeY) + ' does not fit a ' +
+        IntToStr(Mask.SizeX) + 'x' + IntToStr(Mask.SizeY) + ' grid (set ' +
+        'KeepAttentionWeights before the pass).');
+    MapDepth := Map.Depth;
+    // Map is X = key, Y = query: a key's column sums its query rows.
+    for QueryPos := 0 to MaxTokenPos do
+    begin
+      MapPos := Map.GetRawPos(0, QueryPos);
+      for KeyPos := 0 to MaxTokenPos do
+      begin
+        ColumnSums[KeyPos] := ColumnSums[KeyPos] + Map.FData[MapPos];
+        Inc(MapPos, MapDepth);
+      end;
+    end;
+  end;
+  // Tokens are the grid row-major (y * SizeX + x), as Mask's FData.
+  for KeyPos := 0 to MaxTokenPos do
+    if ColumnSums[KeyPos] / (MaxHeadPos + 1) > 1 then Mask.FData[KeyPos] := 1
+    else Mask.FData[KeyPos] := 0;
+end;
+
+procedure SDSelfAttentionDegrade(X0, Eps, Mask, Blurred: TNNetVolume;
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+var
+  X, Y, MaxX, MaxY, MaskX, MaskY, MaxMaskX, MaxMaskY, Depth, PixelPos,
+    ChannelPos, MaxChannelPos: integer;
+  // F.interpolate "nearest" in single as PyTorch: floor(dst * (in / out)).
+  ScaleX, ScaleY, DestPos: single;
+begin
+  GaussianBlurImage(X0, Blurred, 1.0, 9);
+  MaxX := X0.SizeX - 1;
+  MaxY := X0.SizeY - 1;
+  MaxMaskX := Mask.SizeX - 1;
+  MaxMaskY := Mask.SizeY - 1;
+  Depth := X0.Depth;
+  MaxChannelPos := Depth - 1;
+  ScaleX := Mask.SizeX / X0.SizeX;
+  ScaleY := Mask.SizeY / X0.SizeY;
+  for Y := 0 to MaxY do
+  begin
+    DestPos := Y;
+    DestPos := DestPos * ScaleY;
+    MaskY := Min(Trunc(DestPos), MaxMaskY);
+    for X := 0 to MaxX do
+    begin
+      DestPos := X;
+      DestPos := DestPos * ScaleX;
+      MaskX := Min(Trunc(DestPos), MaxMaskX);
+      if Mask.FData[MaskY * Mask.SizeX + MaskX] = 0 then continue;
+      PixelPos := X0.GetRawPos(X, Y);
+      for ChannelPos := 0 to MaxChannelPos do
+        X0.FData[PixelPos + ChannelPos] := Blurred.FData[PixelPos + ChannelPos];
+    end;
+  end;
+  X0.Mul(SqrtAb);
+  X0.MulAdd(SqrtOneMinusAb, Eps);
+end;
+
 procedure SDUNetDenoiseSDXL(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates, PooledText: TNNetVolume; t: TNeuralFloat;
   const TimeIds: array of TNeuralFloat; Noise: TNNetVolume);
@@ -95111,6 +95225,7 @@ begin
   for CachePos := 0 to High(FDeepCaches) do
     FDeepCaches[CachePos] := TDiTFirstBlockCache.Create();
   FDeepCacheInterval := 1;
+  FSelfAttentionMask := TNNetVolume.Create();
   FNegativePromptEmbeds := TNNetVolume.Create();
   FInversionVectors := TNNetVolumeList.Create();
   FGuidanceScale := 7.5;
@@ -95213,6 +95328,7 @@ begin
   UnloadComponents();
   for CachePos := 0 to High(FDeepCaches) do FDeepCaches[CachePos].Free;
   FPerturbedGuidance.Free;
+  FSelfAttentionMask.Free;
   FPlainConditioner.Free;
   {$IFDEF OpenCL}
   FOpenCLDevices.Free;
@@ -95710,14 +95826,16 @@ begin
   FDeepCacheBranch := Value;
 end;
 
-// The pass kinds of a step (CFG, InstructPix2Pix, PAG) each keep their own
-// deep branch output: Inputs as a 2-bit index, the perturbed pass slot 4.
+// The pass kinds of a step (CFG, InstructPix2Pix, PAG, SAG) each keep their
+// own deep branch output: Inputs as a 2-bit index, the perturbed pass slot 4,
+// the degraded pass slot 5.
 function TStableDiffusionPipeline.DeepCacheFor(
   Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
 begin
   Result := nil;
   if FDeepCacheInterval <= 1 then exit;
   if sdpiPerturbed in Inputs then Result := FDeepCaches[4]
+  else if sdpiDegraded in Inputs then Result := FDeepCaches[5]
   else Result := FDeepCaches[Ord(sdpiPrompt in Inputs) +
     2 * Ord(sdpiImage in Inputs)];
 end;
@@ -95746,6 +95864,48 @@ begin
     SelfAttentionIndices := SDUNetPAGLayerIndices(FUNetConfig, ['mid']);
   FPerturbedHeads := SDUNetSelfAttentionHeads(Net, FUNetConfig,
     SelfAttentionIndices);
+end;
+
+procedure TStableDiffusionPipeline.PrepareSelfAttentionGuidance(Net: TNNet;
+  GridX, GridY: integer; Value: boolean);
+const
+  csMidSelfAttention = 'mid_block.attentions.0.transformer_blocks.0.attn1';
+var
+  Names: TStringArray;
+  NamePos, MaxNamePos, MidAttentionIdx, HeadPos, MaxHeadPos, BlockPos,
+    MaxBlockPos, MidX, MidY: integer;
+begin
+  MaxHeadPos := High(FSelfAttentionHeads);
+  for HeadPos := 0 to MaxHeadPos do
+    TNNetScaledDotProductAttention(FSelfAttentionHeads[HeadPos]).
+      KeepAttentionWeights := false;
+  FSelfAttentionHeads := nil;
+  FIsSelfAttentionGuided := Value;
+  if not Value then exit;
+  Names := SDUNetSelfAttentionNames(FUNetConfig);
+  MidAttentionIdx := -1;
+  MaxNamePos := High(Names);
+  for NamePos := 0 to MaxNamePos do
+    if Names[NamePos] = csMidSelfAttention then MidAttentionIdx := NamePos;
+  if MidAttentionIdx < 0 then
+    ImportError('TStableDiffusionPipeline: SAG reads ' + csMidSelfAttention +
+      ', which this unet does not have.');
+  FSelfAttentionHeads := SDUNetSelfAttentionHeads(Net, FUNetConfig,
+    [MidAttentionIdx]);
+  MaxHeadPos := High(FSelfAttentionHeads);
+  for HeadPos := 0 to MaxHeadPos do
+    TNNetScaledDotProductAttention(FSelfAttentionHeads[HeadPos]).
+      KeepAttentionWeights := true;
+  // Every down block but the last halves the grid (3x3 stride 2, padding 1).
+  MidX := GridX;
+  MidY := GridY;
+  MaxBlockPos := FUNetConfig.NumBlockOut - 2;
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    MidX := (MidX + 1) div 2;
+    MidY := (MidY + 1) div 2;
+  end;
+  FSelfAttentionMask.ReSize(MidX, MidY, 1);
 end;
 
 procedure TStableDiffusionPipeline.EnableFreeU(S1, S2, B1, B2: TNeuralFloat);
@@ -96608,6 +96768,7 @@ begin
       end;
     end;
     PreparePerturbedGuidance(Net);
+    PrepareSelfAttentionGuidance(Net, GridX, GridY, FSAGScale > 0);
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
     FUNetInputs := SDUNetConditioningInputs(Net, StepConfig,
       IPAdapterFile <> '', WithAdapter, WithControl);
@@ -96684,6 +96845,7 @@ begin
     FPassConditioners := nil;
     FPerturbedHeads := nil;
     FIsPerturbed := false;
+    PrepareSelfAttentionGuidance(Net, GridX, GridY, false);
     FUNetInputs := Default(TSDUNetConditioningInputs);
     StepNoise.Free;
     Pred.Free;
@@ -96802,11 +96964,19 @@ begin
   inherited Create();
   FGuidancePreds[0] := TNNetVolume.Create();
   FGuidancePreds[1] := TNNetVolume.Create();
+  FGuidancePreds[2] := TNNetVolume.Create();
+  FSAGLatents := TNNetVolume.Create();
+  FSAGEps := TNNetVolume.Create();
+  FSAGBlurred := TNNetVolume.Create();
 end;
 
 destructor TStableDiffusionConditioner.Destroy();
 begin
   FWeightOwner.Free;
+  FSAGBlurred.Free;
+  FSAGEps.Free;
+  FSAGLatents.Free;
+  FGuidancePreds[2].Free;
   FGuidancePreds[1].Free;
   FGuidancePreds[0].Free;
   inherited Destroy();
@@ -96844,6 +97014,45 @@ begin
     if IsPerturbedPass then SetPerturbedHeads(false);
   end;
   Inc(FPipeline.FImageStats.UNetPassCount);
+end;
+
+procedure TStableDiffusionConditioner.PredictMaskSourcePass(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+var
+  PassCache: TDiTFirstBlockCache;
+  SkippedStepCount: integer;
+begin
+  PassCache := FPipeline.DeepCacheFor(Inputs);
+  SkippedStepCount := 0;
+  if Assigned(PassCache) then SkippedStepCount := PassCache.SkippedStepCount;
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, Inputs, Pred);
+  // A DeepCache shallow pass skips the mid block: the last mask stays.
+  if (not Assigned(PassCache)) or
+    (PassCache.SkippedStepCount = SkippedStepCount) then
+    SDSelfAttentionGuidanceMask(FPipeline.FSelfAttentionHeads,
+      FPipeline.FSelfAttentionMask);
+end;
+
+procedure TStableDiffusionConditioner.PredictSelfAttentionGuidance(
+  UNet: TNNet; const Config: TSDUNetConfig; Latents,
+  PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+  Inputs: TStableDiffusionPassInputs; Source: TNNetVolume);
+var
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat;
+  Delta: TNNetVolume;
+begin
+  FPipeline.FScheduler.AlphaBarRootsAt(Timestep, SqrtAb, SqrtOneMinusAb);
+  FPipeline.FScheduler.SplitPrediction(Latents, Source, FSAGLatents, FSAGEps,
+    SqrtAb, SqrtOneMinusAb);
+  SDSelfAttentionDegrade(FSAGLatents, FSAGEps, FPipeline.FSelfAttentionMask,
+    FSAGBlurred, SqrtAb, SqrtOneMinusAb);
+  Delta := FGuidancePreds[2];
+  PredictPass(UNet, Config, FSAGLatents, PromptEmbeds, Timestep, Inputs,
+    Delta);
+  Delta.Mul(-1);
+  Delta.Add(Source);
 end;
 
 procedure TStableDiffusionConditioner.DenoiseUNet(UNet: TNNet;
@@ -96890,18 +97099,34 @@ procedure TStableDiffusionConditioner.PredictGuidedNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
   Timestep: TNeuralFloat; Pred: TNNetVolume);
 var
-  IsCFG: boolean;
+  IsCFG, IsSelfAttentionGuided: boolean;
   UncondPred: TNNetVolume;
 begin
-  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
-    [sdpiPrompt, sdpiImage], Pred);
   IsCFG := IsGuided(FPipeline.CFGGuidanceScale);
+  IsSelfAttentionGuided := FPipeline.FIsSelfAttentionGuided;
+  // SAG reads the attention map of the uncond pass (the cond one without CFG).
+  if IsSelfAttentionGuided and not IsCFG then
+    PredictMaskSourcePass(UNet, Config, Latents, PromptEmbeds, Timestep,
+      [sdpiPrompt, sdpiImage], Pred)
+  else PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
+    [sdpiPrompt, sdpiImage], Pred);
   UncondPred := nil;
   if IsCFG then
   begin
     UncondPred := FGuidancePreds[0];
-    PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [],
+    if IsSelfAttentionGuided then
+      PredictMaskSourcePass(UNet, Config, Latents, PromptEmbeds, Timestep, [],
+        UncondPred)
+    else PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [],
       UncondPred);
+  end;
+  if IsSelfAttentionGuided then
+  begin
+    if IsCFG then
+      PredictSelfAttentionGuidance(UNet, Config, Latents, PromptEmbeds,
+        Timestep, [sdpiDegraded], UncondPred)
+    else PredictSelfAttentionGuidance(UNet, Config, Latents, PromptEmbeds,
+      Timestep, [sdpiPrompt, sdpiImage, sdpiDegraded], Pred);
   end;
   if FPipeline.FIsPerturbed then
   begin
@@ -96913,6 +97138,8 @@ begin
   else if IsCFG then
     TNNetDiffusionScheduler.ApplyCFG(Pred, UncondPred, Pred,
       FPipeline.CFGGuidanceScale);
+  if IsSelfAttentionGuided then
+    Pred.MulAdd(FPipeline.FSAGScale, FGuidancePreds[2]);
 end;
 
 procedure TStableDiffusionConditioner.StartLoadPhase();
@@ -98037,6 +98264,9 @@ begin
   if FPipeline.FIsPerturbed then
     ImportError('TStableDiffusionInstructPix2Pix: PerturbedGuidance (PAG) ' +
       'does not mix with the image guidance; set it to nil.');
+  if FPipeline.FIsSelfAttentionGuided then
+    ImportError('TStableDiffusionInstructPix2Pix: SAG does not mix with the ' +
+      'image guidance; set SAGScale to 0.');
   PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
     [sdpiPrompt, sdpiImage], Pred);
   GuidanceScale := FPipeline.CFGGuidanceScale;

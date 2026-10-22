@@ -43,7 +43,11 @@ procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
 
 // Separable Gaussian blur of Source (W,H,D) per channel, sigma = Radius (PIL
 // GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
-procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat); overload;
+// torchvision gaussian_blur: KernelSize (odd) taps of std Sigma per axis,
+// reflect padding (no edge repeat). Dest may be Source.
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
+  KernelSize: integer); overload;
 
 // cv2.Canny(Source, Low, High, apertureSize=3, L2gradient) of a 0..255 image
 // (no blur; strongest channel per pixel): Dest (W,H,DestDepth) holds 0 or 255.
@@ -615,31 +619,50 @@ begin
 end;
 
 
-procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
+// Separable blur of Source by the normalized Gaussian of Sigma over taps
+// -TapRadius..TapRadius; past the edge it clamps or reflects.
+procedure BlurImageSeparable(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
+  TapRadius: integer; IsReflect: boolean);
 var
   // Taps[TapPos] weighs the pixel TapPos - TapRadius away; they sum to 1.
   Taps: array of double;
+  // NeighboursX/Y[Pos * TapCount + TapPos]: the pixel tap TapPos of Pos reads.
+  NeighboursX, NeighboursY: array of integer;
   // Source blurred along X only, in the TNNetVolume layout.
   Rows: array of TNeuralFloat;
-  TapRadius, TapPos, MaxTapPos, SizeX, SizeY, Depth, RowStride: integer;
-  X, Y, Channel, MaxX, MaxY, MaxChannel, NeighbourPos, PixelPos,
-    SourcePixelPos: integer;
+  TapPos, MaxTapPos, TapCount, SizeX, SizeY, Depth, RowStride: integer;
+  X, Y, Channel, MaxX, MaxY, MaxChannel, PixelPos, NeighbourBase: integer;
   Distance, TapSum, Sum: double;
-begin
-  if Radius <= 0 then
+
+  procedure BuildNeighbours(MaxPos: integer; var Neighbours: array of integer);
+  var
+    Pos, NeighbourTapPos, Offset, Period: integer;
   begin
-    if Dest <> Source then Dest.Copy(Source);
-    exit;
+    Period := 2 * MaxPos;
+    for Pos := 0 to MaxPos do
+      for NeighbourTapPos := 0 to MaxTapPos do
+      begin
+        Offset := Pos + NeighbourTapPos - TapRadius;
+        if not IsReflect then Offset := Min(Max(Offset, 0), MaxPos)
+        else if Period = 0 then Offset := 0
+        else
+        begin
+          Offset := Abs(Offset) mod Period;
+          if Offset > MaxPos then Offset := Period - Offset;
+        end;
+        Neighbours[Pos * TapCount + NeighbourTapPos] := Offset;
+      end;
   end;
-  // 3 sigma holds all but 0.3% of the Gaussian's mass.
-  TapRadius := Ceil(3 * Radius);
+
+begin
   MaxTapPos := 2 * TapRadius;
-  SetLength(Taps, MaxTapPos + 1);
+  TapCount := MaxTapPos + 1;
+  SetLength(Taps, TapCount);
   TapSum := 0;
   for TapPos := 0 to MaxTapPos do
   begin
     Distance := TapPos - TapRadius;
-    Taps[TapPos] := Exp(-Distance * Distance / (2 * Radius * Radius));
+    Taps[TapPos] := Exp(-Distance * Distance / (2 * Sigma * Sigma));
     TapSum := TapSum + Taps[TapPos];
   end;
   for TapPos := 0 to MaxTapPos do
@@ -651,25 +674,29 @@ begin
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
   MaxChannel := Depth - 1;
+  SetLength(NeighboursX, SizeX * TapCount);
+  SetLength(NeighboursY, SizeY * TapCount);
+  BuildNeighbours(MaxX, NeighboursX);
+  BuildNeighbours(MaxY, NeighboursY);
   SetLength(Rows, SizeX * SizeY * Depth);
   for Y := 0 to MaxY do
     for X := 0 to MaxX do
     begin
       PixelPos := Y * RowStride + X * Depth;
+      NeighbourBase := X * TapCount;
       for Channel := 0 to MaxChannel do
       begin
         Sum := 0;
         for TapPos := 0 to MaxTapPos do
-        begin
-          NeighbourPos := Min(Max(X + TapPos - TapRadius, 0), MaxX);
-          Sum := Sum + Taps[TapPos] *
-            Source.FData[Y * RowStride + NeighbourPos * Depth + Channel];
-        end;
+          Sum := Sum + Taps[TapPos] * Source.FData[Y * RowStride +
+            NeighboursX[NeighbourBase + TapPos] * Depth + Channel];
         Rows[PixelPos + Channel] := Sum;
       end;
     end;
   Dest.ReSize(SizeX, SizeY, Depth);
   for Y := 0 to MaxY do
+  begin
+    NeighbourBase := Y * TapCount;
     for X := 0 to MaxX do
     begin
       PixelPos := Y * RowStride + X * Depth;
@@ -677,14 +704,32 @@ begin
       begin
         Sum := 0;
         for TapPos := 0 to MaxTapPos do
-        begin
-          NeighbourPos := Min(Max(Y + TapPos - TapRadius, 0), MaxY);
-          SourcePixelPos := NeighbourPos * RowStride + X * Depth;
-          Sum := Sum + Taps[TapPos] * Rows[SourcePixelPos + Channel];
-        end;
+          Sum := Sum + Taps[TapPos] * Rows[NeighboursY[NeighbourBase + TapPos] *
+            RowStride + X * Depth + Channel];
         Dest.FData[PixelPos + Channel] := Sum;
       end;
     end;
+  end;
+end;
+
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
+begin
+  if Radius <= 0 then
+  begin
+    if Dest <> Source then Dest.Copy(Source);
+    exit;
+  end;
+  // 3 sigma holds all but 0.3% of the Gaussian's mass.
+  BlurImageSeparable(Source, Dest, Radius, Ceil(3 * Radius), false);
+end;
+
+procedure GaussianBlurImage(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
+  KernelSize: integer);
+begin
+  if (KernelSize < 1) or not Odd(KernelSize) or (Sigma <= 0) then
+    raise EArgumentException.Create('GaussianBlurImage: KernelSize must be ' +
+      'odd and >= 1 and Sigma > 0.');
+  BlurImageSeparable(Source, Dest, Sigma, KernelSize div 2, true);
 end;
 
 procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,

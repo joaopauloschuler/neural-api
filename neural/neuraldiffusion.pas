@@ -235,6 +235,9 @@ type
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
+    // ToEps at the roots of any alpha bar.
+    procedure ToEpsAt(Xt, RawPred, EpsOut: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat);
     // CreateFromDiffusersConfig hands the parsed config here after Create, so a
     // descendant reads its own keys.
     procedure ReadDiffusersConfig(Config: TJSONObject); virtual;
@@ -325,6 +328,14 @@ type
     // Xt may alias X0.
     procedure AddNoise(X0, Xt: TNNetVolume; Tt: integer;
       NoiseOut: TNNetVolume = nil; PreSampledNoise: TNNetVolume = nil);
+    // sqrt(ab) and sqrt(1-ab) at the 0-based ModelTimestep (alphas_cumprod[t]);
+    // a fractional one reads ab = 1/(1+sigma^2) of the interpolated sigma.
+    procedure AlphaBarRootsAt(ModelTimestep: double;
+      out SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+    // diffusers SAG pred_x0 / pred_epsilon of RawPred (eps or v) at Xt for those
+    // roots; X0Out and EpsOut alias neither Xt nor RawPred.
+    procedure SplitPrediction(Xt, RawPred, X0Out, EpsOut: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 
     // Classifier-free guidance mix into Dst:
     //   Dst := EpsUncond + W*(EpsCond - EpsUncond).
@@ -1235,8 +1246,12 @@ begin
 end;
 
 procedure TNNetDiffusionScheduler.ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
-var
-  sab, somab: TNeuralFloat;
+begin
+  ToEpsAt(Xt, RawPred, EpsOut, FSqrtAlphaBar[Tt], FSqrtOneMinusAlphaBar[Tt]);
+end;
+
+procedure TNNetDiffusionScheduler.ToEpsAt(Xt, RawPred, EpsOut: TNNetVolume;
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 begin
   if FPrediction = dpEps then
   begin
@@ -1244,13 +1259,42 @@ begin
     Exit;
   end;
   // v-prediction: eps = sqrt(ab)*v + sqrt(1-ab)*x_t.
-  // Bulk form (rule #13). EpsOut never aliases RawPred or Xt at the (internal)
-  // call sites, so capturing RawPred into EpsOut first is safe.
-  sab := FSqrtAlphaBar[Tt];
-  somab := FSqrtOneMinusAlphaBar[Tt];
+  // Bulk form (rule #13). EpsOut never aliases RawPred or Xt at the call
+  // sites, so capturing RawPred into EpsOut first is safe.
   EpsOut.Copy(RawPred);
-  EpsOut.Mul(sab);
-  EpsOut.MulAdd(somab, Xt);
+  EpsOut.Mul(SqrtAb);
+  EpsOut.MulAdd(SqrtOneMinusAb, Xt);
+end;
+
+procedure TNNetDiffusionScheduler.AlphaBarRootsAt(ModelTimestep: double;
+  out SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+var
+  Tt: integer;
+  Sigma: double;
+begin
+  Tt := Round(ModelTimestep) + 1;
+  if (ModelTimestep = Tt - 1) and (Tt >= 1) and (Tt <= FT) then
+  begin
+    SqrtAb := FSqrtAlphaBar[Tt];
+    SqrtOneMinusAb := FSqrtOneMinusAlphaBar[Tt];
+    exit;
+  end;
+  // ab = 1/(1+sigma^2): sqrt(ab) = 1/sqrt(1+sigma^2), sqrt(1-ab) = sigma*sqrt(ab).
+  Sigma := InterpolatedSigma(ModelTimestep);
+  SqrtAb := 1 / Sqrt(1 + Sigma * Sigma);
+  SqrtOneMinusAb := Sigma * SqrtAb;
+end;
+
+procedure TNNetDiffusionScheduler.SplitPrediction(Xt, RawPred, X0Out,
+  EpsOut: TNNetVolume; SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+var
+  InvSqrtAb: TNeuralFloat;
+begin
+  // ab = 0 (zero terminal SNR) reads as cMinAlphaBar, as FInvSqrtAlphaBar.
+  if SqrtAb > 0 then InvSqrtAb := 1 / SqrtAb
+  else InvSqrtAb := 1 / Sqrt(cMinAlphaBar);
+  PredictX0At(Xt, RawPred, X0Out, SqrtAb, SqrtOneMinusAb, InvSqrtAb);
+  ToEpsAt(Xt, RawPred, EpsOut, SqrtAb, SqrtOneMinusAb);
 end;
 
 procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;

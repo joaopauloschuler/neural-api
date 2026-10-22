@@ -744,28 +744,13 @@ rather than acted on.
               examples/StableDiffusion/README.md.
         - [ ] A ControlNet still runs on shallow-only steps although only its
               shallow-skip residuals are used; skip its deep part there.
-      - [ ] Self-Attention Guidance for the SD UNet (Hong et al. 2023, diffusers
-            `StableDiffusionSAGPipeline`, `sag_scale` default 0.75):
-            `TStableDiffusionPipeline.SAGScale`, examples/StableDiffusion
-            `--sag-scale S`. Per step, after the CFG pass: read the mid-block
-            self-attention probabilities of that pass (`KeepAttentionWeights`
-            on the mid `attn1` SDPA), mask = head-mean of the map summed over
-            the query axis > 1.0, reshaped to the mid-block grid and
-            nearest-upsampled to the latent size; predict x0 from the
-            unconditional noise (epsilon / v_prediction as the scheduler
-            config says), Gaussian-blur it (torchvision kernel 9, sigma 1.0,
-            reflect padding - `GaussianBlurImage` in neuralimageresize.pas
-            takes a PIL radius, so check its taps match or add a kernel-size
-            overload there) only inside the mask, re-noise it to t with that
-            same noise, run one extra unconditional UNet pass on the degraded
-            latents and add `SAGScale * (eps_uncond - eps_degraded)`. Unlike
-            PAG it changes no layer flag; it reuses the PAG pass-kind
-            plumbing in PredictGuidedNoise and one more DeepCache slot. Tests:
-            `SAGScale = 0` is bit-identical to off; a pico parity vs diffusers
-            on tests/fixtures/tiny_sd15 (the existing SD pico oracle recipe;
-            ask before writing a new Python generator); mask shape on a
-            non-square latent. Then a with/without image pair on SD 1.5 from
-            the GPU box in examples/StableDiffusion/README.md.
+      - [ ] Self-Attention Guidance for the SD UNet: the with/without image
+            pair on SD 1.5 from the GPU box in examples/StableDiffusion/README.md
+            (`--sag-scale 0.75`). The pipeline side is done
+            (`TStableDiffusionPipeline.SAGScale`, `--sag-scale`,
+            TestStableDiffusionSAG*: pico parity vs diffusers with reference
+            numbers hardcoded from an ad hoc run; tools/make_pico_sd_pipeline_fixture.py
+            has no SAG mode).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):

@@ -52,6 +52,9 @@ branch and reuse the deep branch output of the last whole run.
 Perturbed-Attention Guidance (Ahn et al. 2024), as diffusers
 StableDiffusionPAGPipeline: one more UNet pass per step with the self-attention
 of the chosen layers (default mid) replaced by identity attention.
+--sag-scale S turns on Self-Attention Guidance (Hong et al. 2023), as diffusers
+StableDiffusionSAGPipeline: one more UNet pass per step on latents blurred where
+the mid-block self-attention concentrates.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -127,6 +130,8 @@ type
     // patterns (diffusers pag_applied_layers).
     PAGScale, PAGAdaptiveScale: double;
     PAGLayers: TStringArray;
+    // --sag-scale (<= 0: off).
+    SAGScale: double;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -345,6 +350,9 @@ begin
   WriteLn('  --pag-adaptive-scale A lowers the PAG scale by A per timestep ',
     'below 1000');
   WriteLn('                    (diffusers pag_adaptive_scale, default 0)');
+  WriteLn('  --sag-scale S     Self-Attention Guidance scale (default 0 = off; ',
+    'diffusers');
+  WriteLn('                    uses 0.75): one more UNet pass per step');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -448,6 +456,7 @@ begin
   Opt.PAGScale := 0;
   Opt.PAGAdaptiveScale := 0;
   Opt.PAGLayers := nil;
+  Opt.SAGScale := 0;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -515,6 +524,8 @@ begin
       Opt.PAGAdaptiveScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--pag-layers' then
       Opt.PAGLayers := NextArg().Split([','])
+    else if Arg = '--sag-scale' then
+      Opt.SAGScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
@@ -547,6 +558,8 @@ begin
       '--pag-scale > 0');
   if (Opt.PAGScale > 0) and (Opt.EditImageFile <> '') then
     raise Exception.Create('--pag-scale cannot be combined with --edit-image');
+  if (Opt.SAGScale > 0) and (Opt.EditImageFile <> '') then
+    raise Exception.Create('--sag-scale cannot be combined with --edit-image');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
@@ -760,6 +773,7 @@ begin
         ['mid']);
       PerturbedGuidance.SetPerturbedLayers(PAGLayerIndices);
     end;
+    Pipeline.SAGScale := Opt.SAGScale;
     {$IFDEF OpenCL}
     if Opt.UseStats then OpenCLTransferCounting := true;
     {$ENDIF}
@@ -801,6 +815,9 @@ begin
       for PAGLayerPos := 0 to High(PAGLayerIndices) do
         WriteLn('          ', SelfAttentionNames[PAGLayerIndices[PAGLayerPos]]);
     end;
+    if Opt.SAGScale > 0 then
+      WriteLn(Format('SAG:      scale %.2f, mid-block self-attention mask',
+        [Opt.SAGScale]));
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,

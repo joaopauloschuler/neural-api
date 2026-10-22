@@ -68,6 +68,9 @@ type
     procedure TestGaussianBlurImageHotPixel;
     // Radius 0 copies Source into Dest; in place it changes nothing.
     procedure TestGaussianBlurImageZeroRadiusIsIdentity;
+    // The (Sigma, KernelSize) overload: a delta yields torchvision's 9 taps of
+    // sigma 1; a 6x5x2 image matches diffusers gaussian_blur_2d (reflect).
+    procedure TestGaussianBlurImageTorchvisionKernel;
     // A binary P6 written like the examples write it (larger than the FPC
     // reader buffer, with a comment), a P5 and a saved .ppm reload exactly.
     procedure TestLoadBinaryPPMAndPGM;
@@ -758,6 +761,60 @@ begin
   finally
     Dest.Free;
     Source.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestGaussianBlurImageTorchvisionKernel;
+const
+  // torch.exp(-0.5 * torch.linspace(-4, 4, 9) ** 2), normalized (float32).
+  csTorchTaps: array[0..8] of double = (0.0001338306174147874,
+    0.004431861452758312, 0.05399112403392792, 0.2419714331626892,
+    0.3989434540271759, 0.2419714331626892, 0.05399112403392792,
+    0.004431861452758312, 0.0001338306174147874);
+  // diffusers gaussian_blur_2d(x, 9, 1.0) of x[c, y, x] = (c*30 + y*6 + x)^1.5
+  // / 10 on a 2x5x6 (C, H, W) image, float64, in CHW order.
+  csDiffusersBlur: array[0..59] of double = (1.447148256, 1.576111393,
+    1.87754503, 2.242229786, 2.593834433, 2.758309889, 2.428190341,
+    2.585578317, 2.947038492, 3.373757746, 3.777771359, 3.965219622,
+    4.912830307, 5.123746565, 5.599476091, 6.146241864, 6.652994145,
+    6.88574718, 7.864269332, 8.118602838, 8.688342659, 9.336000571,
+    9.930558196, 10.202334236, 9.337348855, 9.609310279, 10.217478592,
+    10.906803509, 11.537923906, 11.8260133, 20.898076909, 21.254616434,
+    22.048343934, 22.941020797, 23.752320344, 24.121206355, 23.112787812,
+    23.480883852, 24.300031977, 25.220694719, 26.05690036, 26.436981325,
+    28.12371562, 28.516372423, 29.389563998, 30.369758291, 31.258974096,
+    31.662889748, 33.370474497, 33.786589395, 34.711422688, 35.748550891,
+    36.688505537, 37.115244857, 35.83300808, 36.259519912, 37.207248174,
+    38.269630676, 39.232103049, 39.668974228);
+var
+  Image: TNNetVolume;
+  X, Y, Channel: integer;
+begin
+  Image := TNNetVolume.Create(17, 1, 1);
+  try
+    Image.Fill(0);
+    Image[8, 0, 0] := 1;
+    // One row reflects onto itself, so the Y pass keeps the X taps.
+    GaussianBlurImage(Image, Image, 1.0, 9);
+    for X := 0 to 16 do
+      if (X < 4) or (X > 12) then
+        AssertEquals('no tap at ' + IntToStr(X), 0, Image[X, 0, 0], 0)
+      else AssertEquals('tap ' + IntToStr(X - 4), csTorchTaps[X - 4],
+        Image[X, 0, 0], 1e-7);
+    Image.ReSize(6, 5, 2);
+    for Channel := 0 to 1 do
+      for Y := 0 to 4 do
+        for X := 0 to 5 do
+          Image[X, Y, Channel] := Power(Channel * 30 + Y * 6 + X, 1.5) / 10;
+    GaussianBlurImage(Image, Image, 1.0, 9);
+    for Channel := 0 to 1 do
+      for Y := 0 to 4 do
+        for X := 0 to 5 do
+          AssertEquals('blur at ' + IntToStr(X) + ',' + IntToStr(Y) + ',' +
+            IntToStr(Channel), csDiffusersBlur[Channel * 30 + Y * 6 + X],
+            Image[X, Y, Channel], 2e-5);
+  finally
+    Image.Free;
   end;
 end;
 

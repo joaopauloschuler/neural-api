@@ -1400,6 +1400,16 @@ type
     procedure TestStableDiffusionPAGDeepCache;
     // The identity heads of a forced-OpenCL UNet vs the CPU.
     procedure TestStableDiffusionPAGOpenCL;
+    // SAGScale 0 (or < 0) bit-identical to never set; > 0 adds one pass per step.
+    procedure TestStableDiffusionSAGScaleZero;
+    // SAG under DeepCache: the degraded pass keeps its own cache slot.
+    procedure TestStableDiffusionSAGDeepCache;
+    // diffusers float64 StableDiffusionSAGPipeline on tiny_sd15 (DDIM, 3 steps,
+    // sag_scale 0.75), CFG and no CFG: the last mask and sampled final latents.
+    procedure TestStableDiffusionSAGParity;
+    // A 32x16 image (16x8 latents): the mask is the 8x4 mid-block grid and
+    // matches diffusers bit for bit, as do sampled final latents.
+    procedure TestStableDiffusionSAGNonSquareMask;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -49826,6 +49836,243 @@ end;
 begin
 end;
 {$ENDIF}
+
+procedure TTestNeuralPretrained.TestStableDiffusionSAGScaleZero;
+const
+  StepCount = 3;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Plain, Got: TNNetVolume;
+  ImageSide, ScalePos: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    ImageSide := Pipeline.DefaultImageSize;
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Plain);
+    for ScalePos := 0 to 1 do
+    begin
+      Pipeline.SAGScale := -ScalePos;
+      Got.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+      AssertEquals('scale ' + IntToStr(-ScalePos) + ' passes', 2 * StepCount,
+        Pipeline.ImageStats.UNetPassCount);
+      AssertEquals('scale ' + IntToStr(-ScalePos) + ' bit-identical', 0,
+        MaxAbsVolumeDiff(Got, Plain), 0);
+    end;
+    Pipeline.SAGScale := 0.75;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('SAG passes', 3 * StepCount, Pipeline.ImageStats.UNetPassCount);
+    AssertTrue('SAG moves the latents', MaxAbsVolumeDiff(Got, Plain) > 1e-4);
+    Pipeline.SAGScale := 0;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('off again: bit-identical', 0, MaxAbsVolumeDiff(Got, Plain), 0);
+  finally
+    Got.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionSAGDeepCache;
+const
+  StepCount = 7;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Plain, PlainFirst, Got: TNNetVolume;
+  ImageSide: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  PlainFirst := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.SAGScale := 0.75;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    ImageSide := Pipeline.DefaultImageSize;
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Plain);
+    PlainFirst.Copy(FSDFirstStepLatents);
+    Pipeline.DeepCacheInterval := 3;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('passes', 3 * StepCount, Pipeline.ImageStats.UNetPassCount);
+    // Steps 1, 2, 4 and 5 of 7 skip in each of the three pass kinds.
+    AssertEquals('cached passes', 12, Pipeline.ImageStats.UNetCachedPassCount);
+    AssertEquals('step 0 runs the whole unet', 0,
+      MaxAbsVolumeDiff(FSDFirstStepLatents, PlainFirst), 0);
+    AssertTrue('later steps reuse deep outputs',
+      MaxAbsVolumeDiff(Got, Plain) > 0);
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    Got.Free;
+    PlainFirst.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+type
+  // (x, y, channel, value) of a latent; the values below came from diffusers
+  // StableDiffusionSAGPipeline on tiny_sd15 in float64 (ad hoc run).
+  TSDLatentSample = record
+    X, Y, Channel: integer;
+    Value: double;
+  end;
+
+const
+  csSAGCFGSamples: array[0..15] of TSDLatentSample = (
+    (X: 5; Y: 0; Channel: 0; Value: 5.440723079),
+    (X: 2; Y: 5; Channel: 0; Value: -4.283335661),
+    (X: 7; Y: 1; Channel: 1; Value: -2.368173338),
+    (X: 4; Y: 6; Channel: 1; Value: 2.228470674),
+    (X: 1; Y: 3; Channel: 2; Value: 4.189508314),
+    (X: 6; Y: 7; Channel: 2; Value: -1.555863202),
+    (X: 3; Y: 4; Channel: 3; Value: 3.101768643),
+    (X: 0; Y: 1; Channel: 0; Value: -0.561121592),
+    (X: 5; Y: 5; Channel: 0; Value: -3.189619915),
+    (X: 2; Y: 2; Channel: 1; Value: -6.006655652),
+    (X: 7; Y: 6; Channel: 1; Value: 4.246673011),
+    (X: 4; Y: 3; Channel: 2; Value: 4.717935156),
+    (X: 1; Y: 0; Channel: 3; Value: 4.084509758),
+    (X: 6; Y: 4; Channel: 3; Value: -0.005830365),
+    (X: 3; Y: 1; Channel: 0; Value: 3.866600165),
+    (X: 0; Y: 6; Channel: 0; Value: 2.184287693));
+  csSAGNoCFGSamples: array[0..15] of TSDLatentSample = (
+    (X: 5; Y: 0; Channel: 0; Value: 4.014260661),
+    (X: 2; Y: 5; Channel: 0; Value: -3.918647065),
+    (X: 7; Y: 1; Channel: 1; Value: -1.798251536),
+    (X: 4; Y: 6; Channel: 1; Value: 2.522315624),
+    (X: 1; Y: 3; Channel: 2; Value: 2.149763954),
+    (X: 6; Y: 7; Channel: 2; Value: -1.783057475),
+    (X: 3; Y: 4; Channel: 3; Value: 2.407790763),
+    (X: 0; Y: 1; Channel: 0; Value: -1.065741190),
+    (X: 5; Y: 5; Channel: 0; Value: -3.754216406),
+    (X: 2; Y: 2; Channel: 1; Value: -3.970131008),
+    (X: 7; Y: 6; Channel: 1; Value: 5.280990061),
+    (X: 4; Y: 3; Channel: 2; Value: 3.546239828),
+    (X: 1; Y: 0; Channel: 3; Value: 2.352514556),
+    (X: 6; Y: 4; Channel: 3; Value: -0.355410935),
+    (X: 3; Y: 1; Channel: 0; Value: 3.758309364),
+    (X: 0; Y: 6; Channel: 0; Value: 2.731954945));
+  csSAGNonSquareSamples: array[0..15] of TSDLatentSample = (
+    (X: 5; Y: 0; Channel: 0; Value: 3.269543755),
+    (X: 10; Y: 2; Channel: 0; Value: -5.598129601),
+    (X: 15; Y: 4; Channel: 0; Value: 0.129848224),
+    (X: 4; Y: 7; Channel: 0; Value: -0.763098573),
+    (X: 9; Y: 1; Channel: 1; Value: -1.020347191),
+    (X: 14; Y: 3; Channel: 1; Value: -2.665669285),
+    (X: 3; Y: 6; Channel: 1; Value: 1.794034210),
+    (X: 8; Y: 0; Channel: 2; Value: 10.418881246),
+    (X: 13; Y: 2; Channel: 2; Value: 6.839162176),
+    (X: 2; Y: 5; Channel: 2; Value: -0.412866914),
+    (X: 7; Y: 7; Channel: 2; Value: 5.378732310),
+    (X: 12; Y: 1; Channel: 3; Value: 7.945874029),
+    (X: 1; Y: 4; Channel: 3; Value: 2.122859676),
+    (X: 6; Y: 6; Channel: 3; Value: 1.177215539),
+    (X: 11; Y: 0; Channel: 0; Value: 3.923425710),
+    (X: 0; Y: 3; Channel: 0; Value: 1.369393545));
+
+// Runs SAG over Fixture's latents and prompt (DDIM, 3 steps) and checks the
+// last mask ('0'/'1' per mid-grid token, row-major) and the sampled latents.
+procedure CheckSDSelfAttentionGuidance(Test: TTestNeuralPretrained;
+  Pipeline: TStableDiffusionPipeline; Fixture: TJSONObject;
+  GuidanceScale, SAGScale: TNeuralFloat; MidX, MidY: integer;
+  const ExpectedMask: string; const Samples: array of TSDLatentSample;
+  const CaseName: string);
+var
+  Embeds, Latents: TNNetVolume;
+  ImageWidth, ImageHeight, TokenPos, SamplePos: integer;
+  ExpectedBit: TNeuralFloat;
+begin
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    ImageWidth := Fixture.Get('width', 0);
+    ImageHeight := Fixture.Get('height', 0);
+    Pipeline.GuidanceScale := GuidanceScale;
+    Pipeline.SAGScale := SAGScale;
+    Pipeline.EncodePrompt(Fixture.Get('prompt', ''), Embeds);
+    Test.LoadNestedOracleVolume(Fixture.Arrays['latents'], true, Latents);
+    Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 3, Latents);
+    if GuidanceScale > 1 then
+      TAssert.AssertEquals(CaseName + ' passes', 9,
+        Pipeline.ImageStats.UNetPassCount)
+    else TAssert.AssertEquals(CaseName + ' passes', 6,
+      Pipeline.ImageStats.UNetPassCount);
+    TAssert.AssertEquals(CaseName + ' mask width', MidX,
+      Pipeline.SelfAttentionMask.SizeX);
+    TAssert.AssertEquals(CaseName + ' mask height', MidY,
+      Pipeline.SelfAttentionMask.SizeY);
+    TAssert.AssertEquals(CaseName + ' mask depth', 1,
+      Pipeline.SelfAttentionMask.Depth);
+    for TokenPos := 0 to MidX * MidY - 1 do
+    begin
+      ExpectedBit := Ord(ExpectedMask[TokenPos + 1] = '1');
+      TAssert.AssertEquals(CaseName + ' mask token ' + IntToStr(TokenPos),
+        ExpectedBit, Pipeline.SelfAttentionMask.FData[TokenPos], 0);
+    end;
+    for SamplePos := 0 to High(Samples) do
+      TAssert.AssertEquals(CaseName + ' latent ' + IntToStr(SamplePos),
+        Samples[SamplePos].Value, Latents[Samples[SamplePos].X,
+        Samples[SamplePos].Y, Samples[SamplePos].Channel], 5e-5);
+  finally
+    Latents.Free;
+    Embeds.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionSAGParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_pag_io.json');
+  Pipeline := CreateSD15Pipeline();
+  try
+    CheckSDSelfAttentionGuidance(Self, Pipeline, TJSONObject(FSD15Oracle), 7.5,
+      0.75, 4, 4, '1100111101111000', csSAGCFGSamples, 'cfg');
+    CheckSDSelfAttentionGuidance(Self, Pipeline, TJSONObject(FSD15Oracle), 1.0,
+      0.75, 4, 4, '1000100101111000', csSAGNoCFGSamples, 'no cfg');
+  finally
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionSAGNonSquareMask;
+var
+  Pipeline: TStableDiffusionPipeline;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_nonsquare_io.json');
+  Pipeline := CreateSD15Pipeline();
+  try
+    CheckSDSelfAttentionGuidance(Self, Pipeline, TJSONObject(FSD15Oracle), 7.5,
+      1.0, 8, 4, '10010001011001010101010100001100', csSAGNonSquareSamples,
+      'non-square');
+  finally
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
 
 procedure TTestNeuralPretrained.TestMarigoldPipelineMatchesPredict;
 const

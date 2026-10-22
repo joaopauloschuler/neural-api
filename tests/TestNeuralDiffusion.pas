@@ -71,6 +71,9 @@ type
     procedure TestScaledLinearInvariants;
     procedure TestCosineInvariants;
     procedure TestAddNoiseClosedForm;
+    // AlphaBarRootsAt (integer: the tables; fractional: 1/(1+sigma^2)) and
+    // SplitPrediction recovering x0 and eps from eps and v predictions.
+    procedure TestSplitPredictionAt;
     procedure TestApplyCFG;
     procedure TestAPGMatchesCFG;
     procedure TestAPGProjectionAndClamp;
@@ -339,6 +342,55 @@ begin
     end;
   finally
     Sched.Free; X0.Free; Xt.Free; Noise.Free; Eps.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestSplitPredictionAt;
+var
+  Sched: TNNetDiffusionScheduler;
+  X0, Eps, Xt, RawPred, X0Out, EpsOut: TNNetVolume;
+  Prediction: TNNetPredictionType;
+  i: integer;
+  sab, somab, NearSab, NearSomab: TNeuralFloat;
+begin
+  X0 := TNNetVolume.Create(cN, 1, 1);
+  Eps := TNNetVolume.Create(cN, 1, 1);
+  Xt := TNNetVolume.Create(cN, 1, 1);
+  RawPred := TNNetVolume.Create(cN, 1, 1);
+  X0Out := TNNetVolume.Create;
+  EpsOut := TNNetVolume.Create;
+  try
+    for i := 0 to cN - 1 do begin X0.FData[i] := 0.5 * i - 1; Eps.FData[i] := 0.3 - 0.1 * i; end;
+    for Prediction := dpEps to dpV do
+    begin
+      Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, Prediction, cBeta1, cBetaT);
+      try
+        Sched.AlphaBarRootsAt(99, sab, somab);
+        AssertEquals('integer sqrt(ab)', Sqrt(Sched.AlphaBar[100]), sab, 1e-6);
+        AssertEquals('integer sqrt(1-ab)', Sqrt(1 - Sched.AlphaBar[100]), somab, 1e-6);
+        Sched.AlphaBarRootsAt(99 + 1e-6, NearSab, NearSomab);
+        AssertEquals('fractional sqrt(ab)', sab, NearSab, 1e-5);
+        AssertEquals('fractional sqrt(1-ab)', somab, NearSomab, 1e-5);
+        AssertEquals('fractional roots on the unit circle', 1,
+          Sqr(NearSab) + Sqr(NearSomab), 1e-6);
+        for i := 0 to cN - 1 do
+        begin
+          Xt.FData[i] := sab * X0.FData[i] + somab * Eps.FData[i];
+          if Prediction = dpEps then RawPred.FData[i] := Eps.FData[i]
+          else RawPred.FData[i] := sab * Eps.FData[i] - somab * X0.FData[i];
+        end;
+        Sched.SplitPrediction(Xt, RawPred, X0Out, EpsOut, sab, somab);
+        for i := 0 to cN - 1 do
+        begin
+          AssertEquals('x0 @ ' + IntToStr(i), X0.FData[i], X0Out.FData[i], 1e-4);
+          AssertEquals('eps @ ' + IntToStr(i), Eps.FData[i], EpsOut.FData[i], 1e-4);
+        end;
+      finally
+        Sched.Free;
+      end;
+    end;
+  finally
+    X0.Free; Eps.Free; Xt.Free; RawPred.Free; X0Out.Free; EpsOut.Free;
   end;
 end;
 
