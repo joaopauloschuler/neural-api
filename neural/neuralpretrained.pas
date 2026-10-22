@@ -12127,6 +12127,17 @@ type
   TStableDiffusionStepEvent = procedure(StepIndex, StepCount: integer;
     Timestep: double; Latents: TNNetVolume) of object;
 
+  // Wall ms and host<->OpenCL bytes of each phase of the last encode and the
+  // last image (sdphDone unused); bytes count while OpenCLTransferCounting is on.
+  TStableDiffusionImageStats = record
+    PhaseMs: array[TStableDiffusionPipelinePhase] of double;
+    PhaseUploadBytes, PhaseDownloadBytes:
+      array[TStableDiffusionPipelinePhase] of int64;
+    TransfersCounted: boolean;
+    // UNet passes of the last Denoise: one per model eval, two when guided.
+    UNetPassCount: integer;
+  end;
+
   // Stable Diffusion 1.x text-to-image (diffusers StableDiffusionPipeline) over
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
@@ -12158,6 +12169,10 @@ type
     FHasNegativePromptEmbeds: boolean;
     FOnPhase: TStableDiffusionPhaseEvent;
     FOnStep: TStableDiffusionStepEvent;
+    FImageStats: TStableDiffusionImageStats;
+    // The phase DoPhase started last (sdphDone: none open) and its start.
+    FOpenPhase: TStableDiffusionPipelinePhase;
+    FOpenPhaseMark: TNeuralPhaseMark;
     // Set by LoadComponents: the nets below outlive their stage, each rebuilt
     // only when its token count or latent grid changes; nil until built.
     FKeepComponents: boolean;
@@ -12171,7 +12186,12 @@ type
     FOpenCLDevice: cl_device_id;
     {$ENDIF}
     function ComponentFolder(const Component: string): string;
+    // Charges the open phase to ImageStats, then starts Phase (EndPhase: none)
+    // and fires OnPhase.
     procedure DoPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure EndPhase();
+    // Zeroes the time and bytes of Phases in ImageStats.
+    procedure ClearPhaseStats(Phases: array of TStableDiffusionPipelinePhase);
     // Quantizes Net (QuantizeInt8) and arms OpenCL when EnableOpenCL asked.
     procedure PrepareComponent(Net: TNNet; QuantizeInt8: boolean);
     procedure SetUNetInt8(Value: boolean);
@@ -12258,6 +12278,7 @@ type
     // unet sample_size * VaeScaleFactor (512 for SD 1.5).
     property DefaultImageSize: integer read GetDefaultImageSize;
     property ComponentsLoaded: boolean read FKeepComponents;
+    property ImageStats: TStableDiffusionImageStats read FImageStats;
     // int8 weights (TNNet.QuantizeWeightsInt8) for the UNet / the text
     // encoder built from now on; a kept net of a changed one is rebuilt.
     property UNetInt8: boolean read FUNetInt8 write SetUNetInt8;
@@ -92209,6 +92230,7 @@ begin
   FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
   FNegativePromptEmbeds := TNNetVolume.Create();
   FGuidanceScale := 7.5;
+  FOpenPhase := sdphDone;
   IndexFile := FModelFolder + 'model_index.json';
   TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
   JsonText := TStringList.Create;
@@ -92293,10 +92315,37 @@ begin
   Result := FModelFolder + Component + DirectorySeparator;
 end;
 
+procedure TStableDiffusionPipeline.EndPhase();
+begin
+  if FOpenPhase <> sdphDone then
+    NeuralChargePhase(FOpenPhaseMark, FImageStats.PhaseMs[FOpenPhase],
+      FImageStats.PhaseUploadBytes[FOpenPhase],
+      FImageStats.PhaseDownloadBytes[FOpenPhase]);
+  FOpenPhase := sdphDone;
+end;
+
 procedure TStableDiffusionPipeline.DoPhase(
   Phase: TStableDiffusionPipelinePhase);
 begin
+  EndPhase();
+  FOpenPhase := Phase;
+  FOpenPhaseMark := NeuralPhaseMarkNow();
   if Assigned(FOnPhase) then FOnPhase(Phase);
+end;
+
+procedure TStableDiffusionPipeline.ClearPhaseStats(
+  Phases: array of TStableDiffusionPipelinePhase);
+var
+  Phase: TStableDiffusionPipelinePhase;
+begin
+  for Phase in Phases do
+  begin
+    FImageStats.PhaseMs[Phase] := 0;
+    FImageStats.PhaseUploadBytes[Phase] := 0;
+    FImageStats.PhaseDownloadBytes[Phase] := 0;
+  end;
+  FImageStats.TransfersCounted :=
+    {$IFDEF OpenCL}OpenCLTransferCounting{$ELSE}false{$ENDIF};
 end;
 
 procedure TStableDiffusionPipeline.PrepareComponent(Net: TNNet;
@@ -92567,6 +92616,7 @@ begin
       TextNet.GetOutput(Embeds[ListPos]);
     end;
   finally
+    EndPhase();
     TokenIds.Free;
     ReleaseComponent(TextNet);
   end;
@@ -92581,12 +92631,14 @@ begin
   SetLength(TokenList, Length(TokenIds));
   MaxTokenPos := High(TokenIds);
   for TokenPos := 0 to MaxTokenPos do TokenList[TokenPos] := TokenIds[TokenPos];
+  ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
   EncodeTokenIdLists([TokenList], [PromptEmbeds]);
 end;
 
 procedure TStableDiffusionPipeline.EncodePrompt(const Prompt: string;
   PromptEmbeds: TNNetVolume);
 begin
+  ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
   EncodeTokenIdLists([TokenizePrompt(Prompt)], [PromptEmbeds]);
 end;
 
@@ -92634,6 +92686,8 @@ begin
       IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
       IntToStr(PromptEmbeds.SizeX) + '.');
   StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
+  ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
+  FImageStats.UNetPassCount := 0;
   Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX);
   Pred := TNNetVolume.Create();
   PredUncond := TNNetVolume.Create();
@@ -92653,10 +92707,12 @@ begin
       // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
       Tt := Schedule[StepPos];
       SDUNetDenoise(Net, StepConfig, Latents, PromptEmbeds, Tt - 1, Pred);
+      Inc(FImageStats.UNetPassCount);
       if IsGuided then
       begin
         SDUNetDenoise(Net, StepConfig, Latents, FNegativePromptEmbeds, Tt - 1,
           PredUncond);
+        Inc(FImageStats.UNetPassCount);
         TNNetDiffusionScheduler.ApplyCFG(Pred, PredUncond, Pred,
           FGuidanceScale);
       end;
@@ -92664,6 +92720,7 @@ begin
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Tt - 1, Latents);
     end;
   finally
+    EndPhase();
     PredUncond.Free;
     Pred.Free;
     ReleaseComponent(Net);
@@ -92677,6 +92734,7 @@ var
   GridX, GridY: integer;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
+  ClearPhaseStats([sdphLoadVae, sdphDecode]);
   Net := AcquireVaeDecoder(GridX, GridY);
   try
     DoPhase(sdphDecode);
@@ -92688,6 +92746,7 @@ begin
     Image.Mul(0.5);
     Image.Add(0.5);
   finally
+    EndPhase();
     ReleaseComponent(Net);
   end;
 end;
@@ -92721,6 +92780,7 @@ var
 begin
   PromptEmbeds := TNNetVolume.Create();
   try
+    ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
     if (FGuidanceScale > 1) and not FHasNegativePromptEmbeds then
     begin
       EncodeTokenIdLists([TokenizePrompt(Prompt),

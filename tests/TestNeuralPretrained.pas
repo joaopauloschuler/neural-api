@@ -45772,7 +45772,7 @@ begin
 end;
 
 // LoadComponents keeps the three nets: two prompts at two sizes match the
-// build-per-stage path exactly, and only a new latent grid rebuilds UNet/VAE.
+// build-per-stage path exactly; only a new latent grid rebuilds UNet/VAE.
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineKeepLoaded;
 const
   cPrompts: array[0..1] of string = ('a red cube', 'a blue ball');
@@ -45781,6 +45781,7 @@ var
   Reference, Kept: TStableDiffusionPipeline;
   Expected: array[0..1] of TNNetVolume;
   Image: TNNetVolume;
+  Stats: TStableDiffusionImageStats;
   ImagePos: integer;
   MaxDiff: double;
 begin
@@ -45793,6 +45794,10 @@ begin
     for ImagePos := 0 to 1 do
       Reference.Generate(cPrompts[ImagePos], cWidths[ImagePos], 16, 3,
         ImagePos + 5, Expected[ImagePos]);
+    Stats := Reference.ImageStats;
+    AssertEquals('guided passes', 6, Stats.UNetPassCount);
+    AssertTrue('UNet load timed', Stats.PhaseMs[sdphLoadUNet] +
+      Stats.PhaseMs[sdphDenoise] > 0);
     AssertFalse('not loaded', Kept.ComponentsLoaded);
     Kept.LoadComponents(16, 16);
     AssertTrue('loaded', Kept.ComponentsLoaded);
@@ -45805,6 +45810,14 @@ begin
       MaxDiff := MaxAbsVolumeDiff(Image, Expected[ImagePos]);
       AssertTrue('image ' + IntToStr(ImagePos) + ' max |diff| = ' +
         FloatToStr(MaxDiff), MaxDiff = 0);
+      if ImagePos = 0 then
+      begin
+        Stats := Kept.ImageStats;
+        AssertEquals('kept: no text encoder load', 0,
+          Stats.PhaseMs[sdphLoadTextEncoder]);
+        AssertEquals('kept: no UNet load', 0, Stats.PhaseMs[sdphLoadUNet]);
+        AssertEquals('kept: no VAE load', 0, Stats.PhaseMs[sdphLoadVae]);
+      end;
     end;
     AssertEquals('text encoder kept', 0, FSD15PhaseCounts[sdphLoadTextEncoder]);
     AssertEquals('prompts encoded', 2, FSD15PhaseCounts[sdphEncodePrompt]);

@@ -16,7 +16,8 @@ DPM-Solver++ 2M; other classes run DDIM). --sampler overrides it.
 Each component is loaded when its stage starts and freed when it ends, so
 only one is in memory at a time. --repeat N > 1 makes N images from one
 prompt encode and keeps the three components loaded. --int8 stores the UNet
-and text encoder weights in int8.
+and text encoder weights in int8. --stats prints a per-image stage table
+(wall ms; host<->OpenCL MB with --gpu).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -52,32 +53,88 @@ type
     Steps, ImageWidth, ImageHeight, RepeatCount: integer;
     GuidanceScale: double;
     Seed: cardinal;
-    UseOpenCL, UseInt8: boolean;
+    UseOpenCL, UseInt8, UseStats: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
 
   // Prints the pipeline's stages and steps as they run.
   TStableDiffusionReporter = class(TObject)
-  private
-    FPhaseStart: TDateTime;
   public
     procedure OnPhase(Phase: TStableDiffusionPipelinePhase);
     procedure OnStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
   end;
 
-procedure TStableDiffusionReporter.OnPhase(
-  Phase: TStableDiffusionPipelinePhase);
 const
   PhaseNames: array[TStableDiffusionPipelinePhase] of string = (
     'loading the text encoder', 'encoding the prompt', 'loading the UNet',
     'denoising', 'loading the VAE decoder', 'decoding', 'done');
+  PhaseRowNames: array[TStableDiffusionPipelinePhase] of string = (
+    'load text encoder', 'encode prompt', 'load UNet', 'denoise', 'load VAE',
+    'VAE decode', 'done');
+  BytesPerMB = 1024 * 1024;
+
+procedure TStableDiffusionReporter.OnPhase(
+  Phase: TStableDiffusionPipelinePhase);
 begin
-  if FPhaseStart <> 0 then
-    WriteLn(Format('    (%.1f s)', [(Now() - FPhaseStart) * 86400.0]));
-  FPhaseStart := Now();
   WriteLn('  ', PhaseNames[Phase]);
-  if Phase = sdphDone then FPhaseStart := 0;
+end;
+
+// The --stats table of image ImageNumber: one row per phase that ran (the
+// prompt rows only when HasEncode), then the PNG save and the sum.
+procedure PrintStageTable(const Stats: TStableDiffusionImageStats;
+  ImageNumber: integer; HasEncode: boolean; PngSaveMs: double);
+var
+  Phase: TStableDiffusionPipelinePhase;
+  TotalMs: double;
+  Detail: string;
+
+  procedure AddRow(const Stage, Ms, Pct, RowDetail: string);
+  begin
+    WriteLn(TrimRight(Format('  %-18s %10s %6s  %s', [Stage, Ms, Pct,
+      RowDetail])));
+  end;
+
+  procedure AddTimedRow(const Stage: string; Ms: double;
+    const RowDetail: string);
+  var
+    Share: double;
+  begin
+    if TotalMs > 0 then Share := 100.0 * Ms / TotalMs else Share := 0;
+    AddRow(Stage, Format('%.1f', [Ms]), Format('%.1f', [Share]), RowDetail);
+  end;
+
+begin
+  TotalMs := PngSaveMs;
+  for Phase := Low(TStableDiffusionPipelinePhase) to sdphDecode do
+    if HasEncode or not (Phase in [sdphLoadTextEncoder, sdphEncodePrompt]) then
+      TotalMs := TotalMs + Stats.PhaseMs[Phase];
+  WriteLn('Stages of image ', ImageNumber, ' (wall time):');
+  AddRow('Stage', 'ms', '%', '');
+  for Phase := Low(TStableDiffusionPipelinePhase) to sdphDecode do
+  begin
+    if not HasEncode and (Phase in [sdphLoadTextEncoder, sdphEncodePrompt]) then
+    begin
+      if Phase = sdphEncodePrompt then
+        AddRow(PhaseRowNames[Phase], '-', '-', 'encoded once, before image 1');
+      continue;
+    end;
+    // A load the kept components skipped is left out.
+    if (Stats.PhaseMs[Phase] = 0) and (Phase in [sdphLoadTextEncoder,
+      sdphLoadUNet, sdphLoadVae]) then continue;
+    Detail := '';
+    if (Phase = sdphDenoise) and (Stats.UNetPassCount > 0) then
+      Detail := Format('%d UNet passes x %.1f ms', [Stats.UNetPassCount,
+        Stats.PhaseMs[Phase] / Stats.UNetPassCount]);
+    if Stats.TransfersCounted and ((Stats.PhaseUploadBytes[Phase] > 0) or
+      (Stats.PhaseDownloadBytes[Phase] > 0)) then
+      Detail := Trim(Detail + Format('  up %.2f MB, down %.2f MB',
+        [Stats.PhaseUploadBytes[Phase] / BytesPerMB,
+         Stats.PhaseDownloadBytes[Phase] / BytesPerMB]));
+    AddTimedRow(PhaseRowNames[Phase], Stats.PhaseMs[Phase], Detail);
+  end;
+  AddTimedRow('PNG save', PngSaveMs, '');
+  AddRow('sum of stages', Format('%.1f', [TotalMs]), '100.0', '');
 end;
 
 procedure TStableDiffusionReporter.OnStep(StepIndex, StepCount: integer;
@@ -112,6 +169,9 @@ begin
   WriteLn('                    (stable_diffusion_0001.png, ...; default 1)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
+  WriteLn('  --stats           after each image, a stage table (wall ms; ',
+    'with --gpu also');
+  WriteLn('                    the host<->OpenCL MB of each stage)');
   WriteLn('  --gpu             run the nets on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N  OpenCL platform index (default 0)');
@@ -165,6 +225,7 @@ begin
   Opt.RepeatCount := 1;
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
+  Opt.UseStats := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
   Result := true;
@@ -190,6 +251,7 @@ begin
     else if Arg = '--sampler' then Opt.SamplerName := LowerCase(NextArg())
     else if Arg = '--repeat' then Opt.RepeatCount := StrToInt(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
+    else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -226,7 +288,8 @@ var
   ComputeText, ImageFile: string;
   ImageWidth, ImageHeight, ImagePos: integer;
   Seed: cardinal;
-  StartTime: TDateTime;
+  StartTime, SaveStart: TDateTime;
+  PngSaveMs: double;
   {$IFDEF OpenCL}
   OpenCLDevices: TEasyOpenCL;
   OpenCLProblem: string;
@@ -271,6 +334,9 @@ begin
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.UNetInt8 := Opt.UseInt8;
     Pipeline.TextEncoderInt8 := Opt.UseInt8;
+    {$IFDEF OpenCL}
+    if Opt.UseStats then OpenCLTransferCounting := true;
+    {$ENDIF}
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     WriteLn('Model:    ', Opt.ModelFolder);
@@ -312,11 +378,16 @@ begin
       else
         Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
           Seed, Image);
-      WriteLn(Format('Total:    %.1f s', [(Now() - StartTime) * 86400.0]));
+      SaveStart := Now();
       Image.Mul(255.0);
       if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
         raise Exception.Create('could not save ' + ImageFile);
+      PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
+      WriteLn(Format('Total:    %.1f s', [(Now() - StartTime) * 86400.0]));
       WriteLn('Wrote ', ImageFile);
+      if Opt.UseStats then
+        PrintStageTable(Pipeline.ImageStats, ImagePos + 1,
+          (Opt.RepeatCount = 1) or (ImagePos = 0), PngSaveMs);
       // The seed wraps from High(cardinal) to 0.
       {$PUSH}{$Q-}{$R-}
       Inc(Seed);
