@@ -1958,7 +1958,7 @@ rather than acted on.
       Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
       either guider on QwenImage21); ask the user before adding a Python tool.
 
-- [ ] SuperPoint + LightGlue keypoint detection and image matching importer
+- [X] SuperPoint + LightGlue keypoint detection and image matching importer
       (`BuildSuperPointFromSafeTensors[Ex]` + `BuildLightGlueFromSafeTensors[Ex]`,
       transformers model_types "superpoint" / "lightglue", checkpoints
       `magic-leap-community/superpoint` and `ETH-CVG/lightglue_superpoint`), plus
@@ -1995,9 +1995,32 @@ rather than acted on.
             settings, preprocessing). Border removal keeps transformers' rule:
             it compares against the full-resolution size times 8, so only the
             near border is removed (the original SuperPoint removes both).
-      - [ ] LightGlue (`BuildLightGlueFromSafeTensors[Ex]`), feeding on
-            `TSuperPointKeypoints` (pixel X/Y, Descriptors (Count, 1, D)).
-      - [ ] examples/KeypointMatching + README.md.
+      - [X] LightGlue: `BuildLightGlue[FromSafeTensors[Ex]]`,
+            `ReadLightGlueConfigFromJSONFile` (keypoint_detector_config read
+            through `ReadSuperPointConfigFromJSONObject`),
+            `BuildLightGlueKeypointDetectorFromSafeTensors` (the SuperPoint
+            inside the LightGlue checkpoint) and `TLightGlueMatcher.Match` over
+            two `TSuperPointKeypoints`. Host-side on `TNNetPlainOps` (fused
+            q|k|v per-token linears, ConcatChannels) and
+            `TNNetVolume.DotProductsPacked` (per-head attention, similarity),
+            because the keypoint counts change per pair and a `TNNet` cannot
+            resize; the coordinate rotary is computed on the host (projector,
+            `SinCos`). GQA supported. Pico fixtures
+            tools/make_pico_lightglue_fixture.py (descriptor_dim 16 with
+            input_projection; dim 8 identity + GQA), 4 tests: keypoints and
+            match indices exact, final descriptors and scores < 1e-4 vs the
+            transformers float64 forward with early exit and pruning disabled.
+      - [X] examples/KeypointMatching + README.md (pico smoke with no
+            arguments; `--model`, `--superpoint`, `--width/--height`,
+            `--max-keypoints`, `--keypoint-threshold`, `--filter-threshold`).
+      - [ ] LightGlue follow-ups: adaptive depth (early exit on
+            `depth_confidence` with the token_confidence heads, not loaded
+            now) and point pruning (`width_confidence`); a real-checkpoint run
+            of ETH-CVG/lightglue_superpoint on a real image pair, with a
+            transformers comparison (with and without early exit/pruning) and
+            the measured time; threading the attention (one head per pool
+            thread) and an OpenCL path; a TNNet coordinate-rotary layer if a
+            TNNet path is ever wanted.
       - [ ] SuperPoint follow-ups: a real-checkpoint run of
             magic-leap-community/superpoint (check its preprocessor_config
             do_grayscale and the tensor names); the torchvision-backend
