@@ -530,6 +530,37 @@ rather than acted on.
             use_karras_sigmas (diffusers keeps continuous sigmas, tsKarras
             snaps to integer timesteps), PNDM PRK warm-up, Euler linspace
             fractional timesteps, DDPMScheduler (smDDPM ignores the stride).
+      - [ ] Latent Consistency Models in TStableDiffusionPipeline: 2-8 step
+            SD 1.5 images, about 6-10x fewer UNet passes than 25-50 step
+            sampling. Two checkpoint routes, both reusing TNNetLCMScheduler
+            (its c_skip/c_out already match diffusers' timestep_scaling 10):
+            (1) LCM-LoRA (latent-consistency/lcm-lora-sdv1-5) through the
+                existing --lora merge plus `--sampler lcm` (or a
+                scheduler_config with _class_name "LCMScheduler"), guidance
+                1-2 on the usual two-half CFG;
+            (2) LCM-distilled UNets (SimianLuo/LCM_Dreamshaper_v7): the UNet
+                config has time_cond_proj_dim (256), i.e. a guidance-scale
+                embedding (w - 1)*1000 sinusoid fed through
+                time_embedding.cond_proj (no bias) and added to the sample
+                before linear_1, with ONE UNet pass per step (no CFG). Today
+                BuildSDUNet ignores the key and its weight, so such a
+                checkpoint would load and silently produce wrong images:
+                refuse it until wired.
+            Scheduler gaps to close against diffusers LCMScheduler:
+            DiffusersSchedulerSampler does not map "LCMScheduler"; diffusers
+            picks the steps from the original_inference_steps (50) origin grid
+            k*i - 1 (4 steps -> 999, 759, 499, 259), which no
+            TNNetTimestepSpacing gives today (add it to TNNetLCMScheduler, not
+            a new class); the re-noise hop uses the next step's alpha and the
+            last step returns the denoised estimate; img2img strength scales
+            the origin grid (int(50*strength) points), so the
+            TStableDiffusionImg2Img / inpainter start-step hook must follow it.
+            Tests: pico fixture via tools/make_pico_sd_pipeline_fixture.py with
+            an LCMScheduler config and a time_cond_proj_dim UNet, 4 steps +
+            the decoded image vs diffusers float64 < 1e-4, plus an img2img
+            strength 0.5 case. CLI: examples/StableDiffusion
+            `--sampler lcm` + README section, then a real LCM-LoRA run on
+            the user's GPU box.
       - [ ] SD 2.x: v_prediction (dpV exists), use_linear_projection and the
             head list [5,10,20,20] exist in the UNet importer, pad token "!"
             is read from tokenizer_config. The SD 2.x text_encoder config is
