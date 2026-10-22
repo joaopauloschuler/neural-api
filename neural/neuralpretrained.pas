@@ -12900,18 +12900,25 @@ type
       write FImageGuidanceScale;
   end;
 
-  // diffusers StableDiffusionDepth2ImgPipeline (stabilityai/stable-diffusion-2-depth)
-  // with a supplied depth_map: img2img whose 5-channel UNet sees latents | depth.
+  // diffusers StableDiffusionDepth2ImgPipeline (stabilityai/stable-diffusion-2-depth):
+  // img2img whose 5-channel UNet sees latents | depth. Without SetDepthMap the
+  // depth_estimator/ (DPT) + feature_extractor/ estimate it from the image.
   TStableDiffusionDepth2Img = class(TStableDiffusionImg2Img)
   private
     FDepthMap, FDepthLatents: TNNetVolume;
+    FHasSuppliedDepthMap: boolean;
+    FDepthEstimatorFolder: string;
+    // FDepthMap := the DPT predicted_depth of FSourceImage (diffusers
+    // prepare_depth_map with depth_map=None).
+    procedure EstimateDepthMap();
   protected
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
   public
     constructor Create();
     destructor Destroy(); override;
     // Depth (W, H, 1) as DPT predicted_depth (larger = nearer), or a gray / RGB
-    // depth image (W, H, 3|4) in 0..255 taken as its PIL luma; any size and scale.
+    // depth image (W, H, 3|4) in 0..255 taken as its PIL luma; any size and
+    // scale. nil goes back to estimating the depth from the image.
     procedure SetDepthMap(Depth: TNNetVolume);
     function AcceptsUNetInChannels(InChannels,
       LatentChannels: integer): boolean; override;
@@ -12920,6 +12927,12 @@ type
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     // The normalized depth (GridX, GridY, 1) in [-1, 1] of the last BeginDenoise.
     property DepthLatents: TNNetVolume read FDepthLatents;
+    // The supplied depth map, or the one the last BeginDenoise estimated.
+    property DepthMap: TNNetVolume read FDepthMap;
+    // The folder holding depth_estimator/ and feature_extractor/; '' = the
+    // pipeline's model folder.
+    property DepthEstimatorFolder: string read FDepthEstimatorFolder
+      write FDepthEstimatorFolder;
   end;
 
 // ---------------------------------------------------------------------------
@@ -96512,7 +96525,9 @@ end;
 
 procedure TStableDiffusionDepth2Img.SetDepthMap(Depth: TNNetVolume);
 begin
-  if Depth.Depth = 1 then
+  FHasSuppliedDepthMap := Assigned(Depth);
+  if not FHasSuppliedDepthMap then FDepthMap.ReSize(0, 0, 0)
+  else if Depth.Depth = 1 then
   begin
     FDepthMap.ReSize(Depth);
     FDepthMap.Copy(Depth);
@@ -96527,12 +96542,102 @@ begin
   Result := InChannels = LatentChannels + 1;
 end;
 
+procedure TStableDiffusionDepth2Img.EstimateDepthMap();
+var
+  EstimatorFolder, PreprocessFile, ImporterName: string;
+  JsonText: TStringList;
+  Root: TJSONData;
+  Preprocess: TClipImageProcessorConfig;
+  Config: TDPTConfig;
+  Estimator: TNNet;
+  RGBImage, Pixels: TNNetVolume;
+  MultipleOf: integer;
+begin
+  ImporterName := ClassName + ' depth estimator';
+  if FDepthEstimatorFolder <> '' then
+  begin
+    EstimatorFolder := IncludeTrailingPathDelimiter(FDepthEstimatorFolder) +
+      'depth_estimator' + DirectorySeparator;
+    PreprocessFile := IncludeTrailingPathDelimiter(FDepthEstimatorFolder) +
+      'feature_extractor' + DirectorySeparator;
+  end
+  else
+  begin
+    EstimatorFolder := FPipeline.ComponentFolder('depth_estimator');
+    PreprocessFile := FPipeline.ComponentFolder('feature_extractor');
+  end;
+  PreprocessFile := PreprocessFile + 'preprocessor_config.json';
+  if not FileExists(EstimatorFolder + 'config.json') then
+    ImportError(ImporterName + ': no depth map was set and "' +
+      EstimatorFolder + 'config.json" does not exist.');
+  if not FileExists(PreprocessFile) then
+    ImportError(ImporterName + ': "' + PreprocessFile + '" does not exist.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, PreprocessFile);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError(ImporterName + ': "' + PreprocessFile +
+        '" is not a JSON object.');
+    MultipleOf := TJSONObject(Root).Get('ensure_multiple_of', 1);
+    // DPTImageProcessor's aspect-keeping resize would need an interpolated
+    // position table; BuildDPT only runs the native image_size.
+    if ReadJSONBoolOrDefault(TJSONObject(Root), 'keep_aspect_ratio', false) then
+      ImportError(ImporterName + ': keep_aspect_ratio is not supported.');
+    Preprocess := ReadClipImageProcessorConfigFromJSONText(JsonText.Text,
+      PreprocessFile);
+    // DPTImageProcessor defaults to IMAGENET_STANDARD (0.5), not CLIP's mean/std.
+    if TJSONObject(Root).Find('image_mean') = nil then
+    begin
+      Preprocess.Mean[0] := 0.5;
+      Preprocess.Mean[1] := 0.5;
+      Preprocess.Mean[2] := 0.5;
+    end;
+    if TJSONObject(Root).Find('image_std') = nil then
+    begin
+      Preprocess.Std[0] := 0.5;
+      Preprocess.Std[1] := 0.5;
+      Preprocess.Std[2] := 0.5;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  Config := ReadDPTConfigFromJSONFile(EstimatorFolder + 'config.json');
+  if (Preprocess.CropWidth <> Config.Backbone.ImageSize) or
+    (Preprocess.CropHeight <> Config.Backbone.ImageSize) or
+    (MultipleOf < 1) or (Config.Backbone.ImageSize mod MultipleOf <> 0) then
+    ImportError(ImporterName + ': the processor size ' +
+      IntToStr(Preprocess.CropWidth) + 'x' + IntToStr(Preprocess.CropHeight) +
+      ' (multiple of ' + IntToStr(MultipleOf) + ') is not the estimator ' +
+      'image_size ' + IntToStr(Config.Backbone.ImageSize) + '.');
+  RGBImage := TNNetVolume.Create;
+  Pixels := TNNetVolume.Create;
+  Estimator := nil;
+  try
+    Estimator := BuildDPTFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+      EstimatorFolder, 'model'), Config, {pTrainable=}false);
+    FPipeline.PrepareComponent(Estimator, {QuantizeInt8=}false);
+    if FSourceImage.Depth = 3 then RGBImage.Copy(FSourceImage)
+    else ConvertAndResizeImagePIL(FSourceImage, RGBImage, FSourceImage.SizeX,
+      FSourceImage.SizeY, 3, {ClipToByteRange=}true, 0, 255);
+    ClipPreprocessImage(RGBImage, Pixels, Preprocess);
+    Estimator.Compute(Pixels);
+    Estimator.GetLastLayer().ForceOutputOnRAM();
+    FDepthMap.ReSize(Estimator.GetLastLayer().Output);
+    FDepthMap.Copy(Estimator.GetLastLayer().Output);
+  finally
+    Estimator.Free;
+    Pixels.Free;
+    RGBImage.Free;
+  end;
+end;
+
 procedure TStableDiffusionDepth2Img.EncodeImage(VaeImage,
   Latents: TNNetVolume);
 begin
-  if FDepthMap.Size = 0 then
-    ImportError('TStableDiffusionDepth2Img: call SetDepthMap first (the ' +
-      'checkpoint''s DPT-Hybrid depth_estimator is not supported).');
+  if not FHasSuppliedDepthMap then EstimateDepthMap();
   inherited EncodeImage(VaeImage, Latents);
   DiffusersDepthToLatentGrid(FDepthMap, Latents.SizeX, Latents.SizeY,
     FDepthLatents);

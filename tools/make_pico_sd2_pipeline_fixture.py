@@ -45,11 +45,24 @@ globals repointed), diffusers float64, latents passed explicitly:
                                        noise, the image latent sample noise and
                                        Euler a's step noise are injected.
 
+--depth-estimator-only writes only the oracle of depth-to-image WITHOUT a
+depth map (depth_map=None), on tiny_sd2_depth with the pico DPT-Hybrid of
+tests/fixtures/tiny_sd2_depth_estimator (tools/make_pico_dpt_hybrid_fixture.py)
+as depth_estimator / feature_extractor:
+
+  tests/fixtures/tiny_sd2_depth_estimator_io.json  one DDIM case from a PIL
+                                       init image; the processor's
+                                       pixel_values (H, W, 3), the estimator's
+                                       predicted_depth ("depth_map"), its
+                                       latent-grid depth, timesteps,
+                                       latents_after, image
+
 Coded by Claude (AI).
 
 Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd2_pipeline_fixture.py
   python tools/make_pico_sd2_pipeline_fixture.py --depth-only
+  python tools/make_pico_sd2_pipeline_fixture.py --depth-estimator-only
 """
 import json
 import os
@@ -57,12 +70,14 @@ import shutil
 import sys
 
 import torch
+from PIL import Image
 from safetensors.torch import load_file, save_file
 from diffusers import (AutoencoderKL, DDIMScheduler, EulerAncestralDiscreteScheduler,
                        StableDiffusionDepth2ImgPipeline, StableDiffusionPipeline,
                        UNet2DConditionModel)
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_depth2img as depth2img_module
-from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
+from transformers import (CLIPTextConfig, CLIPTextModel, CLIPTokenizer,
+                          DPTForDepthEstimation, DPTImageProcessor)
 
 import make_pico_sd_pipeline_fixture as pipeline_fixture
 import make_pico_sd_conditioning_fixtures as conditioning_fixture
@@ -74,6 +89,8 @@ SD2_SAMPLE_SIZE = 12     # latent grid; the default image is 12 * 2 = 24
 TEXT_HIDDEN = 32
 DEPTH_DIR = os.path.join(FIXTURES, "tiny_sd2_depth")
 DEPTH_IO = os.path.join(FIXTURES, "tiny_sd2_depth_io.json")
+ESTIMATOR_DIR = os.path.join(FIXTURES, "tiny_sd2_depth_estimator")
+ESTIMATOR_IO = os.path.join(FIXTURES, "tiny_sd2_depth_estimator_io.json")
 DEPTH_WIDTH = 16         # latent grid 8 x 6
 DEPTH_HEIGHT = 12
 DEPTH_STEPS = 5
@@ -212,14 +229,11 @@ def make_depth_folder():
         json.dump(index, f, indent=2)
 
 
-def make_depth():
-    """StableDiffusionDepth2ImgPipeline with a supplied depth_map (float64)."""
-    torch.set_grad_enabled(False)
-    make_depth_folder()
-    image = conditioning_fixture.byte_image(
-        torch.Generator().manual_seed(SD2_SEED + 51), 3, DEPTH_WIDTH, DEPTH_HEIGHT)
-    noise = conditioning_fixture.initial_latents(DEPTH_WIDTH, DEPTH_HEIGHT)
-    generator = torch.Generator().manual_seed(SD2_SEED + 52)
+def inject_depth2img_noise(noise, generator):
+    """Draws the image-latent sample noise and DEPTH_STEPS Euler a step noises
+    from generator and injects them, with the initial noise, into diffusers.
+    Returns (image_noise, step_noise, pending): run() pops step noise from
+    pending."""
     image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
     step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
                   for _ in range(DEPTH_STEPS)]
@@ -230,6 +244,19 @@ def make_depth():
     pending_step_noise = []
     conditioning_fixture.euler_a_module.randn_tensor = (
         lambda *args, **kwargs: pending_step_noise.pop(0).clone())
+    return image_noise, step_noise, pending_step_noise
+
+
+def make_depth():
+    """StableDiffusionDepth2ImgPipeline with a supplied depth_map (float64)."""
+    torch.set_grad_enabled(False)
+    make_depth_folder()
+    image = conditioning_fixture.byte_image(
+        torch.Generator().manual_seed(SD2_SEED + 51), 3, DEPTH_WIDTH, DEPTH_HEIGHT)
+    noise = conditioning_fixture.initial_latents(DEPTH_WIDTH, DEPTH_HEIGHT)
+    generator = torch.Generator().manual_seed(SD2_SEED + 52)
+    image_noise, step_noise, pending_step_noise = inject_depth2img_noise(
+        noise, generator)
     cases = []
     for case_pos, (name, euler_a) in enumerate((("ddim", False), ("euler_a", True))):
         width, height = DEPTH_MAP_SIZES[case_pos]
@@ -272,7 +299,60 @@ def make_depth():
         json.dump(payload, f)
 
 
+def make_depth_estimator():
+    """StableDiffusionDepth2ImgPipeline with depth_map=None (float64): the
+    pico DPT-Hybrid estimates the depth of a PIL init image."""
+    torch.set_grad_enabled(False)
+    levels = conditioning_fixture.byte_image(
+        torch.Generator().manual_seed(SD2_SEED + 53), 3, DEPTH_WIDTH, DEPTH_HEIGHT)
+    pil_image = Image.fromarray(
+        (levels[0].permute(1, 2, 0) * 255).round().to(torch.uint8).numpy())
+    noise = conditioning_fixture.initial_latents(DEPTH_WIDTH, DEPTH_HEIGHT)
+    generator = torch.Generator().manual_seed(SD2_SEED + 54)
+    image_noise, step_noise, pending_step_noise = inject_depth2img_noise(
+        noise, generator)
+    depth_estimator = DPTForDepthEstimation.from_pretrained(
+        os.path.join(ESTIMATOR_DIR, "depth_estimator"), torch_dtype=torch.float64)
+    feature_extractor = DPTImageProcessor.from_pretrained(
+        os.path.join(ESTIMATOR_DIR, "feature_extractor"))
+    pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
+        DEPTH_DIR, torch_dtype=torch.float64, depth_estimator=depth_estimator,
+        feature_extractor=feature_extractor)
+    pixel_values = feature_extractor(images=pil_image, return_tensors="pt").pixel_values
+    predicted_depth = depth_estimator(pixel_values.to(torch.float64)).predicted_depth
+    depth_latents = pipe.prepare_depth_map(pil_image, None, 1, False, torch.float64,
+                                           torch.device("cpu"))
+    pending_step_noise[:] = step_noise
+    out = conditioning_fixture.run(
+        pipe, {"image": pil_image, "strength": DEPTH_STRENGTH}, None, False,
+        steps=DEPTH_STEPS, sized=False)
+    out["timesteps"] = out["timesteps"][-len(out["latents_after"]):]
+    out["name"] = "ddim_estimated_depth"
+    out["scheduler"] = type(pipe.scheduler).__name__
+    out["pixel_values"] = conditioning_fixture.hwc(pixel_values.to(torch.float64))
+    out["depth_map"] = conditioning_fixture.rounded(
+        predicted_depth[0].unsqueeze(-1).tolist())
+    out["depth_latents"] = conditioning_fixture.rounded(
+        depth_latents[0].permute(1, 2, 0).tolist())
+    print(out["name"], out["timesteps"], "depth range",
+          float(predicted_depth.min()), float(predicted_depth.max()))
+    payload = {"width": DEPTH_WIDTH, "height": DEPTH_HEIGHT,
+               "steps": DEPTH_STEPS, "strength": DEPTH_STRENGTH,
+               "guidance_scale": conditioning_fixture.GUIDANCE,
+               "prompt": conditioning_fixture.PROMPT,
+               "init_image": conditioning_fixture.hwc(levels),
+               "latents": conditioning_fixture.chw(noise[0]),
+               "image_sample_noise": conditioning_fixture.chw(image_noise[0]),
+               "step_noise": [conditioning_fixture.chw(item[0]) for item in step_noise],
+               "cases": [out]}
+    with open(ESTIMATOR_IO, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--depth-estimator-only" in sys.argv:
+        make_depth_estimator()
+        sys.exit(0)
     if "--depth-only" in sys.argv:
         make_depth()
         sys.exit(0)

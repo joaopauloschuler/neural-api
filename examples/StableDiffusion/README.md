@@ -143,22 +143,26 @@ PNDM, DPM-Solver++ 2M, Euler and Euler a (replayed step noise), and with DDIM
 at strength 1 (`TestStableDiffusionImg2ImgParity`). No real checkpoint has
 been run yet.
 
-`--depth-image PNG` with `--init-image` runs depth-to-image, as diffusers
-`StableDiffusionDepth2ImgPipeline` called with `depth_map`
-(`TStableDiffusionDepth2Img`). It needs a depth folder such as
-`stabilityai/stable-diffusion-2-depth`, whose UNet takes 5 channels: the
-latents and the depth. The run is image-to-image (same `--strength`) with
-the depth map added to every UNet pass. The depth map is read as its luma
-(brighter = nearer, as the relative inverse depth of DPT / MiDaS), resized
-to the latent grid with torch bicubic interpolation and normalized to
-[-1, 1] by its minimum and maximum; any size works. The checkpoint's own
-`depth_estimator/` (DPT-Hybrid, a ResNet + ViT backbone) is not supported, so
-the depth map must come from another estimator, for example the grayscale
-PGM of `examples/DepthAnythingV2` saved as PNG (`examples/MarigoldDepth`
-writes 0 = near: invert it first).
-A depth UNet without `--depth-image` stops with an error:
+`--init-image PNG` on a depth folder such as
+`stabilityai/stable-diffusion-2-depth` (whose UNet takes 5 channels: the
+latents and the depth) runs depth-to-image, as diffusers
+`StableDiffusionDepth2ImgPipeline` (`TStableDiffusionDepth2Img`). The run is
+image-to-image (same `--strength`) with the depth map added to every UNet
+pass. By default the folder's own `depth_estimator/` (DPT-Hybrid: a BiT
+ResNet + ViT, `BuildDPT`) estimates the depth from the init image, after the
+`feature_extractor/` `DPTImageProcessor` resize (bilinear to 384x384, mean and
+std 0.5), as diffusers does with `depth_map=None`. `--depth-image PNG`
+supplies the depth map instead: it is read as its luma (brighter = nearer, as
+the relative inverse depth of DPT / MiDaS), for example the grayscale PGM of
+`examples/DepthAnythingV2` saved as PNG (`examples/MarigoldDepth` writes 0 =
+near: invert it first). Either map is resized to the latent grid with torch
+bicubic interpolation and normalized to [-1, 1] by its minimum and maximum;
+any size works. A depth UNet without `--init-image` stops with an error.
 
 ```
+StableDiffusion --model ~/models/stable-diffusion-2-depth \
+  --init-image photo.png --strength 0.7 \
+  --prompt "a marble statue in a museum"
 StableDiffusion --model ~/models/stable-diffusion-2-depth \
   --init-image photo.png --depth-image photo_depth.png --strength 0.7 \
   --prompt "a marble statue in a museum"
@@ -168,7 +172,12 @@ Tested against diffusers float64 on a pico 5-channel SD 2.x folder
 (`tests/fixtures/tiny_sd2_depth`) at strength 0.6 with DDIM and Euler a
 (replayed step noise), with a depth map smaller and one larger than the
 latent grid (`TestStableDiffusion2Depth2ImgParity`, and on OpenCL
-`TestStableDiffusion2Depth2ImgOpenCL`). No real checkpoint has been run yet.
+`TestStableDiffusion2Depth2ImgOpenCL`), and with the depth estimated by a
+pico DPT-Hybrid (`tests/fixtures/tiny_sd2_depth_estimator`,
+`TestStableDiffusion2Depth2ImgEstimatorParity` / `...EstimatorOpenCL`). No
+real checkpoint has been run yet. The estimator only runs at its native
+`image_size` (`keep_aspect_ratio` processors are refused) and is rebuilt for
+every run.
 
 `--edit-image PNG [--image-guidance S]` edits the image as the prompt
 instructs ("make it winter"), as diffusers
@@ -387,7 +396,8 @@ StableDiffusion [--model DIR] [options]
                     first int(50 * S) LCM timesteps)
   --depth-image PNG depth-to-image: the depth map of --init-image (luma,
                     brighter = nearer; any size) for a 5-channel depth UNet
-                    folder, e.g. stabilityai/stable-diffusion-2-depth
+                    folder, e.g. stabilityai/stable-diffusion-2-depth; without
+                    it the folder's depth_estimator/ estimates the depth
   --edit-image PNG  InstructPix2Pix: edit this image as the prompt says (needs an
                     8-channel UNet folder, e.g. timbrooks/instruct-pix2pix); the
                     output takes its size (rounded down to the VAE factor)

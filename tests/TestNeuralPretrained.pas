@@ -106,6 +106,9 @@ type
     // tiny_sd2_depth_io.json (depth2img with a supplied depth map): the latent
     // depth, the steps and the image < 1e-4; OnOpenCL enables OpenCL first.
     procedure CheckSD2Depth2ImgParity(OnOpenCL: boolean);
+    // tiny_sd2_depth without a depth map: the pico DPT-Hybrid estimator of
+    // tiny_sd2_depth_estimator vs tiny_sd2_depth_estimator_io.json.
+    procedure CheckSD2Depth2ImgEstimatorParity(OnOpenCL: boolean);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1330,6 +1333,8 @@ type
     procedure TestStableDiffusion2Img2ImgParity;
     procedure TestStableDiffusion2Depth2ImgParity;
     procedure TestStableDiffusion2Depth2ImgOpenCL;
+    procedure TestStableDiffusion2Depth2ImgEstimatorParity;
+    procedure TestStableDiffusion2Depth2ImgEstimatorOpenCL;
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
@@ -47289,6 +47294,91 @@ begin
     ImageNoise.Free;
     SourceImage.Free;
     PlainPipeline.Free;
+    Pipeline.Free;
+    Depth2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionDepth2ImgPipeline float64 with depth_map=None: the pico
+// DPT-Hybrid depth_estimator + DPTImageProcessor estimate the depth (DDIM).
+procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgEstimatorParity;
+begin
+  CheckSD2Depth2ImgEstimatorParity(false);
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgEstimatorOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckSD2Depth2ImgEstimatorParity(true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.CheckSD2Depth2ImgEstimatorParity(
+  OnOpenCL: boolean);
+var
+  Pipeline: TStableDiffusionPipeline;
+  Depth2Img: TStableDiffusionDepth2Img;
+  Entry: TJSONObject;
+  SourceImage, ImageNoise, Expected: TNNetVolume;
+  MaxDiff: double;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if OnOpenCL and not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  {$ENDIF}
+  FSD15Oracle := LoadSD15Fixture('tiny_sd2_depth_estimator_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd2_depth');
+  Depth2Img := TStableDiffusionDepth2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    {$IFDEF OpenCL}
+    if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Depth2Img.SetImage(SourceImage);
+    Depth2Img.SetSampleNoise(ImageNoise);
+    Depth2Img.Strength := TJSONObject(FSD15Oracle).Get('strength', 0.0);
+    Depth2Img.DepthEstimatorFolder := ExtractFileDir(ExtractFileDir(FixturePath(
+      'tiny_sd2_depth_estimator' + DirectorySeparator + 'depth_estimator' +
+      DirectorySeparator + 'config.json')));
+    // A supplied map, cleared again: the estimator runs.
+    Depth2Img.SetDepthMap(ImageNoise);
+    Depth2Img.SetDepthMap(nil);
+    AssertEquals('cleared depth map', 0, Depth2Img.DepthMap.Size);
+    Pipeline.Conditioner := Depth2Img;
+    Pipeline.Sampler := smDDIM;
+    Entry := TJSONObject(FSD15Oracle).Arrays['cases'].Objects[0];
+    AssertEquals('scheduler', 'DDIMScheduler', Entry.Get('scheduler', ''));
+    CheckSD15ConditionedParity(Pipeline, Entry);
+    LoadNestedOracleVolume(Entry.Arrays['depth_map'], false, Expected);
+    AssertEquals('estimated depth width', Expected.SizeX,
+      Depth2Img.DepthMap.SizeX);
+    MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthMap, Expected);
+    WriteLn('  depth2img estimated depth max|diff| = ', MaxDiff:0:9);
+    AssertTrue('estimated depth max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    LoadNestedOracleVolume(Entry.Arrays['depth_latents'], false, Expected);
+    MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthLatents, Expected);
+    AssertTrue('estimated depth latents max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    Expected.Free;
+    ImageNoise.Free;
+    SourceImage.Free;
     Pipeline.Free;
     Depth2Img.Free;
     FreeAndNil(FSD15Oracle);

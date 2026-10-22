@@ -31,11 +31,11 @@ h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
 diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
 [--strength S] turns it into image-to-image (diffusers
 StableDiffusionImg2ImgPipeline): the output takes the image's size.
---depth-image PNG with --init-image runs depth-to-image on a 5-channel depth
-UNet folder such as stabilityai/stable-diffusion-2-depth (diffusers
-StableDiffusionDepth2ImgPipeline with depth_map): the depth map is read as
-its luma, brighter = nearer; the checkpoint's DPT-Hybrid depth_estimator is
-not supported, so the depth map must be supplied.
+--init-image on a 5-channel depth UNet folder such as
+stabilityai/stable-diffusion-2-depth runs depth-to-image (diffusers
+StableDiffusionDepth2ImgPipeline): the folder's depth_estimator/ (DPT-Hybrid)
+estimates the depth map, or --depth-image PNG supplies it (read as its luma,
+brighter = nearer).
 --edit-image PNG [--image-guidance S] edits the image as the prompt instructs
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
@@ -249,7 +249,9 @@ begin
     '(luma, brighter =');
   WriteLn('                    nearer; any size) for a 5-channel depth UNet ',
     'folder, e.g.');
-  WriteLn('                    stabilityai/stable-diffusion-2-depth');
+  WriteLn('                    stabilityai/stable-diffusion-2-depth; without ',
+    'it the folder''s');
+  WriteLn('                    depth_estimator/ estimates the depth');
   WriteLn('  --edit-image PNG  InstructPix2Pix: edit this image as the prompt ',
     'says (needs an');
   WriteLn('                    8-channel UNet folder, e.g. ',
@@ -482,6 +484,7 @@ var
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
   StepCount, Img2ImgStepCount: integer;
+  IsDepthUNet: boolean;
   GuidanceScale: double;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
@@ -514,17 +517,22 @@ begin
     end;
     ImageWidth := Pipeline.DefaultImageSize;
     ImageHeight := Pipeline.DefaultImageSize;
-    // A depth UNet takes latents | depth.
-    if (Pipeline.UNetConfig.InChannels = Pipeline.UNetConfig.OutChannels + 1)
-      and (Opt.DepthImageFile = '') then
+    // A depth UNet takes latents | depth; without --depth-image the folder's
+    // depth_estimator/ computes the depth from the init image.
+    IsDepthUNet := Pipeline.UNetConfig.InChannels =
+      Pipeline.UNetConfig.OutChannels + 1;
+    if IsDepthUNet and (Opt.InitImageFile = '') then
       raise Exception.Create('this is a depth-to-image UNet: give ' +
-        '--init-image and --depth-image');
-    if Opt.DepthImageFile <> '' then
+        '--init-image (and optionally --depth-image)');
+    if IsDepthUNet or (Opt.DepthImageFile <> '') then
     begin
       Depth2Img := TStableDiffusionDepth2Img.Create();
-      if not LoadImageFromFileIntoVolume(Opt.DepthImageFile, Image) then
-        raise Exception.Create('could not load ' + Opt.DepthImageFile);
-      Depth2Img.SetDepthMap(Image);
+      if Opt.DepthImageFile <> '' then
+      begin
+        if not LoadImageFromFileIntoVolume(Opt.DepthImageFile, Image) then
+          raise Exception.Create('could not load ' + Opt.DepthImageFile);
+        Depth2Img.SetDepthMap(Image);
+      end;
       Img2Img := Depth2Img;
     end
     else if Opt.InitImageFile <> '' then
@@ -628,8 +636,10 @@ begin
       WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
         [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
          Img2ImgStepCount, StepCount]));
-      if Assigned(Depth2Img) then
-        WriteLn('Depth image: ', Opt.DepthImageFile, ' (depth-to-image)');
+      if Assigned(Depth2Img) and (Opt.DepthImageFile <> '') then
+        WriteLn('Depth image: ', Opt.DepthImageFile, ' (depth-to-image)')
+      else if Assigned(Depth2Img) then
+        WriteLn('Depth: estimated by depth_estimator/ (depth-to-image)');
     end;
     if Assigned(InstructPix2Pix) then
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',

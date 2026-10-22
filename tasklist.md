@@ -602,7 +602,8 @@ rather than acted on.
               DDIM and Euler a at strength 0.6, depth maps smaller and larger
               than the latent grid.
           - [ ] Real stabilityai/stable-diffusion-2-depth run on the user's GPU
-                box (512x512) with a depth map from another estimator.
+                box (512x512) with a depth map from another estimator
+                (--depth-image).
           - [X] DPT-Hybrid importer (Intel/dpt-hybrid-midas, the checkpoint's
                 depth_estimator/): BuildDPT reads model_type "dpt" with
                 is_hybrid (BiT bottleneck backbone, weight standardization folded
@@ -623,8 +624,22 @@ rather than acted on.
             - [ ] FPC 3.x -O2 miscompiled `B <> (Flag and (I < 2))` in a for
                   loop in BuildDPT (garbage index register; rewritten with a
                   local boolean). Report upstream with a reduced case.
-          - [ ] Depth2Img runs the depth_estimator/ + feature_extractor/ of
-                the pipeline folder when no depth map is set.
+          - [X] Depth2Img runs the depth_estimator/ + feature_extractor/ of
+                the pipeline folder (or DepthEstimatorFolder) when no depth map
+                is set (diffusers depth_map=None; DPTImageProcessor through
+                ClipPreprocessImage, PIL bilinear uint8 resize);
+                examples/StableDiffusion needs only --init-image on a depth
+                folder. Pico parity (make_pico_sd2_pipeline_fixture.py
+                --depth-estimator-only): TestStableDiffusion2Depth2ImgEstimatorParity
+                / ...EstimatorOpenCL.
+            - [ ] Real stabilityai/stable-diffusion-2-depth run with its own
+                  depth_estimator on the user's GPU box (512x512); compare the
+                  estimated depth with diffusers.
+            - [ ] The estimator is rebuilt (and its 490 MB read) on every
+                  BeginDenoise; keep it with the pipeline's kept components.
+            - [ ] transformers with torchvision uses the torchvision uint8
+                  resize for DPTImageProcessor; the oracle here is the PIL
+                  backend (torchvision is not installed in ~/x).
           - [ ] --depth-image loads 8 bits per channel; a 16-bit depth PNG
                 loses precision (SetDepthMap itself takes any float map).
         - [ ] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
