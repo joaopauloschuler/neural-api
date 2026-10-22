@@ -355,21 +355,41 @@ rather than acted on.
       follow-up (a few latent frames → pixel frames). Pico-fixture parity < 1e-4
       vs a float64 transformers/diffusers oracle on one denoise step.
 
-- [ ] BiRefNet / RMBG-2.0 background-removal (dichotomous high-resolution image
-      segmentation) importer (`BuildBiRefNetFromSafeTensors[Ex]`,
-      ZhengPeng7/BiRefNet and briaai/RMBG-2.0, which ships the same BiRefNet
-      architecture). Distinct from the landed semantic/instance/panoptic
-      segmentation paths (SegFormer / Mask2Former / Mask-R-CNN): BiRefNet predicts
-      a SINGLE high-resolution foreground alpha matte via a bilateral-reference
-      decoder — a Swin-L backbone (reuse `BuildSwinFromSafeTensors`) feeding a
-      localization module + a reconstruction decoder whose blocks each take a
-      gradient/inward-reference and an outward-reference feature, upsampled to a
-      full-resolution sigmoid mask. The reusable new pieces are the
-      bilateral-reference decoder block and the multi-scale supervision head;
-      reuse the landed bilinear upsample (`TNNetBilinearUpsample`) and Swin tower.
-      Pico-fixture parity < 1e-4 vs a float64 transformers oracle, plus an
-      `examples/BackgroundRemoval` cutting a subject out of a tiny CPU image
-      (sigmoid mask -> RGBA composite).
+- [ ] BiRefNet / RMBG-2.0 follow-up (`BuildBiRefNetFromSafeTensors[Ex]` +
+      examples/BackgroundRemoval landed; pico parity and OpenCL parity only):
+      run ZhengPeng7/BiRefNet and briaai/RMBG-2.0 at 1024x1024 on the user's GPU
+      box (`--gpu`, also CPU) and compare the mask with the official
+      `transformers` remote-code output before README calls it supported.
+
+- [ ] Robust Video Matting importer (`BuildRVMFromSafeTensors[Ex]`, Lin et al.
+      WACV 2022, arXiv:2108.11515, PeterL1n/RobustVideoMatting
+      `rvm_mobilenetv3.pth` / `rvm_resnet50.pth` through `TNNetTorchBinReader`;
+      the weights are GPL-3.0, so load them at run time and never ship them)
+      + examples/VideoMatting. Turns a webcam-style frame sequence into a
+      temporally consistent alpha matte and foreground: the recurrent state
+      carries across frames, so there is no per-frame flicker, and it runs at
+      real-time sizes where BiRefNet (one image, Swin-L) cannot. Architecture:
+      MobileNetV3-Large encoder (reuse `BuildMobileNetV3`, exposing the 1/2,
+      1/4, 1/8, 1/16 features, last stage dilated) or ResNet-50 (reuse the
+      ResNet importer), an LR-ASPP head (1x1 conv + global-pool sigmoid gate:
+      `TNNetAvgChannel` + `TNNetCellMulByCell`), a recurrent decoder whose
+      blocks run a ConvGRU on HALF the channels (reuse `TNNetConvGRUCell`: the
+      gate equations match, only the [x ; h] concat order differs, so permute
+      the input-channel slices at load), bilinear 2x upsampling
+      (`TNNetBilinearUpsample`), and a projection to fgr residual (3) + alpha (1).
+      High resolution goes through the Deep Guided Filter refiner
+      (`downsample_ratio`): box filters of the low-res image/prediction, a
+      small 1x1 conv stack for A and b, bilinear A/b upsample, then
+      `A * hr_image + b`. A box-filter layer does not exist yet; add it to
+      neuralnetwork.pas (separable running-sum mean, AVX row pass, OpenCL
+      forward) rather than coding it inside neuralpretrained.pas. Per-frame API
+      `RVMStep(Net, Frame, State)` keeps the four hidden maps between calls
+      (same holder pattern as the other recurrent decode paths). The example
+      reads a numbered PNG/JPG frame folder and writes RGBA frames, a green-
+      screen composite and an optional `--gif` (neuralgif.pas). Pico parity vs
+      the official `model/model.py` in the ~/x venv over 3 frames (so the
+      recurrent state is exercised), an OpenCL forward test, then a real
+      checkpoint run on the GPU box before README calls it supported.
 
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
@@ -831,36 +851,14 @@ rather than acted on.
           block alongside the warped frames, which v1 does not re-feed).
   - [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
         middle frame); inference-only path is landed.
-- [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
-      TencentARC/GFPGAN) — leverages the LANDED StyleGAN2 generator
-      (BuildStyleGAN2GeneratorFromSafeTensors) as a fixed facial prior: a U-Net
-      degradation-removal encoder maps a low-quality face to the StyleGAN2 latent/
-      noise inputs, and per-resolution encoder features are spatially modulated into
-      the generator via CS-SFT (channel-split spatial feature transform) layers. The
-      only genuinely new code is the small U-Net encoder + the CS-SFT scale/shift
-      injection (an affine FiLM-like modulation — reuse the landed TNNetFiLM); the
-      synthesis backbone is reuse. Distinct from NAFNet/SwinIR (generic restoration
-      with no generative face prior). Pico parity vs a float64 oracle on the SFT
-      injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
-- [ ] DDColor photo-colorization importer (`BuildDDColorFromSafeTensors[Ex]`,
-      Kang et al. ICCV 2023, arXiv:2212.11613, Apache-2.0 checkpoints
-      `piddnad/ddcolor_paper_tiny` / `ddcolor_modelscope` / `ddcolor_artistic`;
-      `.pth` through `TNNetTorchBinReader`) + examples/ColorizePhoto. Turns a real
-      grayscale photo of any size into color; examples/Colorization only trains a
-      small CIFAR-10 U-Net from scratch. Architecture: ConvNeXt-T/L encoder (reuse
-      `BuildConvNeXt`, exposing its stage 1/4..1/32 features), a pixel decoder of
-      PixelShuffle up-blocks (`TNNetPixelShuffle`), a multi-scale color decoder of
-      learnable color queries (cross-attention to the 1/16, 1/8, 1/4 features, then
-      self-attention + FFN, the Mask2Former order: reuse the landed Mask2Former
-      decoder layers), the query x pixel-feature product (reuse
-      `Mask2FormerMaskEinsum`) and a 1x1 fusion conv to a*b*. Pre/post: resize to
-      512 (or 256), L of `RgbToLab` with a*b* = 0 back to RGB as input, bilinear
-      a*b* back to the source size recombined with the source L via `LabToRgb`.
-      Every block must be an existing neuralnetwork.pas layer; a missing one is
-      added there, not in neuralpretrained.pas. Pico parity vs the official
-      `basicsr/archs/ddcolor_arch.py` in the ~/x venv (tiny random config,
-      tests/fixtures), an OpenCL forward test, then a real-checkpoint run on the
-      GPU box before README calls it supported.
+- [ ] GFPGAN follow-up (`BuildGFPGANFromSafeTensors[Ex]` + examples/FaceRestoration
+      landed; pico parity and OpenCL parity only): run GFPGANv1.3.pth and
+      GFPGANv1.4.pth on real aligned 512x512 faces (CPU and `--gpu`) against the
+      official `gfpgan` inference output before README calls it supported.
+- [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
+      landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
+      and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against
+      the official `basicsr` inference output before README calls it supported.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
@@ -1141,9 +1139,6 @@ rather than acted on.
         - [ ] Trainable deconvolutions and activations without a fused opcode
           (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
           CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
-        - [ ] `TNNetSnake` training forward (both alpha modes) still runs the
-          scalar `pcr_sincosf` loop; blocked `TNNetVolume.SinCos` could write
-          sin into `FOutput` and cos into `FOutputErrorDeriv` with no scratch.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
           activation chain are unmeasured on a GPU (PoCL parity only).
   - [ ] 0.5 Stage-net holder for Kokoro (stage A: `TNNetKokoro.PrepareStageA`;
