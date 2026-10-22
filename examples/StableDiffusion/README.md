@@ -1,7 +1,7 @@
 # StableDiffusion
 
-Text-to-image, image-to-image and InstructPix2Pix image editing with a
-diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
+Text-to-image, image-to-image, depth-to-image and InstructPix2Pix image
+editing with a diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
 
 One `Generate` call:
 
@@ -142,6 +142,33 @@ Tested against diffusers float64 on the pico folder at strength 0.6 with DDIM,
 PNDM, DPM-Solver++ 2M, Euler and Euler a (replayed step noise), and with DDIM
 at strength 1 (`TestStableDiffusionImg2ImgParity`). No real checkpoint has
 been run yet.
+
+`--depth-image PNG` with `--init-image` runs depth-to-image, as diffusers
+`StableDiffusionDepth2ImgPipeline` called with `depth_map`
+(`TStableDiffusionDepth2Img`). It needs a depth folder such as
+`stabilityai/stable-diffusion-2-depth`, whose UNet takes 5 channels: the
+latents and the depth. The run is image-to-image (same `--strength`) with
+the depth map added to every UNet pass. The depth map is read as its luma
+(brighter = nearer, as the relative inverse depth of DPT / MiDaS), resized
+to the latent grid with torch bicubic interpolation and normalized to
+[-1, 1] by its minimum and maximum; any size works. The checkpoint's own
+`depth_estimator/` (DPT-Hybrid, a ResNet + ViT backbone) is not supported, so
+the depth map must come from another estimator, for example the grayscale
+PGM of `examples/DepthAnythingV2` saved as PNG (`examples/MarigoldDepth`
+writes 0 = near: invert it first).
+A depth UNet without `--depth-image` stops with an error:
+
+```
+StableDiffusion --model ~/models/stable-diffusion-2-depth \
+  --init-image photo.png --depth-image photo_depth.png --strength 0.7 \
+  --prompt "a marble statue in a museum"
+```
+
+Tested against diffusers float64 on a pico 5-channel SD 2.x folder
+(`tests/fixtures/tiny_sd2_depth`) at strength 0.6 with DDIM and Euler a
+(replayed step noise), with a depth map smaller and one larger than the
+latent grid (`TestStableDiffusion2Depth2ImgParity`, and on OpenCL
+`TestStableDiffusion2Depth2ImgOpenCL`). No real checkpoint has been run yet.
 
 `--edit-image PNG [--image-guidance S]` edits the image as the prompt
 instructs ("make it winter"), as diffusers
@@ -358,6 +385,9 @@ StableDiffusion [--model DIR] [options]
   --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);
                     runs the last int(steps * S) steps (lcm: all steps over the
                     first int(50 * S) LCM timesteps)
+  --depth-image PNG depth-to-image: the depth map of --init-image (luma,
+                    brighter = nearer; any size) for a 5-channel depth UNet
+                    folder, e.g. stabilityai/stable-diffusion-2-depth
   --edit-image PNG  InstructPix2Pix: edit this image as the prompt says (needs an
                     8-channel UNet folder, e.g. timbrooks/instruct-pix2pix); the
                     output takes its size (rounded down to the VAE factor)

@@ -31,6 +31,11 @@ h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
 diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
 [--strength S] turns it into image-to-image (diffusers
 StableDiffusionImg2ImgPipeline): the output takes the image's size.
+--depth-image PNG with --init-image runs depth-to-image on a 5-channel depth
+UNet folder such as stabilityai/stable-diffusion-2-depth (diffusers
+StableDiffusionDepth2ImgPipeline with depth_map): the depth map is read as
+its luma, brighter = nearer; the checkpoint's DPT-Hybrid depth_estimator is
+not supported, so the depth map must be supplied.
 --edit-image PNG [--image-guidance S] edits the image as the prompt instructs
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
@@ -73,8 +78,8 @@ type
     // --ip-adapter weights file and --ip-image; '' for none.
     IPAdapterFile, IPImageFile: string;
     IPScale: double;
-    // --init-image ('' for text-to-image) and its --strength.
-    InitImageFile: string;
+    // --init-image ('' for text-to-image), its --strength and --depth-image.
+    InitImageFile, DepthImageFile: string;
     Strength: double;
     // --edit-image ('' for none) and its --image-guidance (< 0: default).
     EditImageFile: string;
@@ -240,6 +245,11 @@ begin
   WriteLn('                    runs the last int(steps * S) steps (lcm: all ',
     'steps over');
   WriteLn('                    the first int(50 * S) LCM timesteps)');
+  WriteLn('  --depth-image PNG depth-to-image: the depth map of --init-image ',
+    '(luma, brighter =');
+  WriteLn('                    nearer; any size) for a 5-channel depth UNet ',
+    'folder, e.g.');
+  WriteLn('                    stabilityai/stable-diffusion-2-depth');
   WriteLn('  --edit-image PNG  InstructPix2Pix: edit this image as the prompt ',
     'says (needs an');
   WriteLn('                    8-channel UNet folder, e.g. ',
@@ -328,6 +338,7 @@ begin
   Opt.IPImageFile := '';
   Opt.IPScale := 1.0;
   Opt.InitImageFile := '';
+  Opt.DepthImageFile := '';
   Opt.Strength := -1;
   Opt.EditImageFile := '';
   Opt.ImageGuidanceScale := -1;
@@ -387,6 +398,7 @@ begin
     else if Arg = '--ip-scale' then
       Opt.IPScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
+    else if Arg = '--depth-image' then Opt.DepthImageFile := NextArg()
     else if Arg = '--strength' then
       Opt.Strength := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--edit-image' then Opt.EditImageFile := NextArg()
@@ -419,6 +431,8 @@ begin
     raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
     raise Exception.Create('--strength needs --init-image');
+  if (Opt.DepthImageFile <> '') and (Opt.InitImageFile = '') then
+    raise Exception.Create('--depth-image needs --init-image');
   if (Opt.ImageGuidanceScale >= 0) and (Opt.EditImageFile = '') then
     raise Exception.Create('--image-guidance needs --edit-image');
   if (Opt.EditImageFile <> '') and (Opt.InitImageFile <> '') then
@@ -460,6 +474,7 @@ var
   IPAdapter: TStableDiffusionIPAdapter;
   Multi: TStableDiffusionMultiConditioner;
   Img2Img: TStableDiffusionImg2Img;
+  Depth2Img: TStableDiffusionDepth2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   ImageConditioner: TStableDiffusionImageConditioner;
   Image, PromptEmbeds: TNNetVolume;
@@ -480,6 +495,7 @@ begin
   IPAdapter := nil;
   Multi := nil;
   Img2Img := nil;
+  Depth2Img := nil;
   InstructPix2Pix := nil;
   ImageConditioner := nil;
   Image := TNNetVolume.Create;
@@ -498,9 +514,23 @@ begin
     end;
     ImageWidth := Pipeline.DefaultImageSize;
     ImageHeight := Pipeline.DefaultImageSize;
-    if Opt.InitImageFile <> '' then
+    // A depth UNet takes latents | depth.
+    if (Pipeline.UNetConfig.InChannels = Pipeline.UNetConfig.OutChannels + 1)
+      and (Opt.DepthImageFile = '') then
+      raise Exception.Create('this is a depth-to-image UNet: give ' +
+        '--init-image and --depth-image');
+    if Opt.DepthImageFile <> '' then
     begin
+      Depth2Img := TStableDiffusionDepth2Img.Create();
+      if not LoadImageFromFileIntoVolume(Opt.DepthImageFile, Image) then
+        raise Exception.Create('could not load ' + Opt.DepthImageFile);
+      Depth2Img.SetDepthMap(Image);
+      Img2Img := Depth2Img;
+    end
+    else if Opt.InitImageFile <> '' then
       Img2Img := TStableDiffusionImg2Img.Create();
+    if Assigned(Img2Img) then
+    begin
       if Opt.Strength >= 0 then Img2Img.Strength := Opt.Strength;
       ImageConditioner := Img2Img;
       SourceImageFile := Opt.InitImageFile;
@@ -598,6 +628,8 @@ begin
       WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
         [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
          Img2ImgStepCount, StepCount]));
+      if Assigned(Depth2Img) then
+        WriteLn('Depth image: ', Opt.DepthImageFile, ' (depth-to-image)');
     end;
     if Assigned(InstructPix2Pix) then
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',

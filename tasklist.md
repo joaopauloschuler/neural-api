@@ -592,8 +592,38 @@ rather than acted on.
               inpainting checkpoint shows up.
         - [ ] SD 2.x upcast_attention is ignored (all FP32); it matters only
               with the F16 item below.
-        - [ ] SD 2.x depth-to-image (StableDiffusionDepth2ImgPipeline, 5-channel
-              UNet) and the x4 upscaler are not covered.
+        - [X] SD 2.x depth-to-image with a supplied depth map:
+              TStableDiffusionDepth2Img (an img2img whose 5-channel UNet sees
+              latents | depth; DiffusersDepthToLatentGrid = prepare_depth_map's
+              torch bicubic resize + per-image min/max to [-1, 1]),
+              examples/StableDiffusion --init-image + --depth-image. Pico parity
+              tests/fixtures/tiny_sd2_depth (make_pico_sd2_pipeline_fixture.py
+              --depth-only), TestStableDiffusion2Depth2ImgParity / ...OpenCL:
+              DDIM and Euler a at strength 0.6, depth maps smaller and larger
+              than the latent grid.
+          - [ ] Real stabilityai/stable-diffusion-2-depth run on the user's GPU
+                box (512x512) with a depth map from another estimator.
+          - [ ] The checkpoint's depth_estimator/ (DPTForDepthEstimation,
+                dpt-hybrid-midas) is not supported: BuildDPT only takes a DINOv2
+                backbone_config (the Depth Anything layout). The hybrid needs
+                (transformers modeling_dpt.py): a BiT backbone_config (model_type
+                "bit", bottleneck layers, depths [3, 4, 9], weight-standardized
+                convs + GroupNorm, global_padding "same", dynamic-pad stem);
+                DPTViTHybridEmbeddings (BiT feature map -> 1x1 projection to the
+                ViT width, cls token, resized position embeddings) feeding a ViT
+                encoder; readout_type "project" (cls concat + Linear + GELU);
+                neck_ignore_stages [0, 1] (the first two neck inputs are BiT
+                stage feature maps, not reassembled tokens); the DPT neck
+                (reassemble resize, fusion pre-activation residual units) and
+                DPTDepthEstimationHead (conv, 2x bilinear align_corners upsample,
+                conv, ReLU, 1x1 conv, ReLU); and DPTImageProcessor from
+                feature_extractor/preprocessor_config.json. Then Depth2Img runs
+                it when no depth map is set. The plain-ViT DPT (Intel/dpt-large,
+                is_hybrid false) is not supported either.
+          - [ ] --depth-image loads 8 bits per channel; a 16-bit depth PNG
+                loses precision (SetDepthMap itself takes any float map).
+        - [ ] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
+              stabilityai/stable-diffusion-x4-upscaler) is not covered.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
             pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
             the pipeline refuses addition_embed_type "text_time" today.

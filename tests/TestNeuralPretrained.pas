@@ -103,6 +103,9 @@ type
     // runs the UNet forced onto OpenCL and the pipeline with OpenCL enabled.
     procedure CheckSD15SizedParity(const FileName: string;
       OnOpenCL: boolean = false);
+    // tiny_sd2_depth_io.json (depth2img with a supplied depth map): the latent
+    // depth, the steps and the image < 1e-4; OnOpenCL enables OpenCL first.
+    procedure CheckSD2Depth2ImgParity(OnOpenCL: boolean);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1318,6 +1321,8 @@ type
     procedure TestStableDiffusion2Parity;
     procedure TestStableDiffusion2Samplers;
     procedure TestStableDiffusion2Img2ImgParity;
+    procedure TestStableDiffusion2Depth2ImgParity;
+    procedure TestStableDiffusion2Depth2ImgOpenCL;
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
@@ -47062,6 +47067,153 @@ begin
     SourceImage.Free;
     Pipeline.Free;
     Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionDepth2ImgPipeline float64 on tiny_sd2_depth (5-channel UNet):
+// DDIM and Euler a at strength 0.6, depth maps upscaled and downscaled.
+procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgParity;
+begin
+  CheckSD2Depth2ImgParity(false);
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckSD2Depth2ImgParity(true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.CheckSD2Depth2ImgParity(OnOpenCL: boolean);
+var
+  Pipeline, PlainPipeline: TStableDiffusionPipeline;
+  Depth2Img: TStableDiffusionDepth2Img;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, ImageNoise, DepthMap, DepthImage, Expected, Latents,
+    Embeds: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight, PixelPos, Channel: integer;
+  MaxDiff: double;
+  IsRefused: boolean;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if OnOpenCL and not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  {$ENDIF}
+  FSD15Oracle := LoadSD15Fixture('tiny_sd2_depth_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd2_depth');
+  PlainPipeline := nil;
+  Depth2Img := TStableDiffusionDepth2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  DepthMap := TNNetVolume.Create;
+  DepthImage := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    {$IFDEF OpenCL}
+    if OnOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
+    AssertEquals('5-channel unet', 5, Pipeline.UNetConfig.InChannels);
+    AssertEquals('default strength', 0.8, Depth2Img.Strength, 1e-12);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Depth2Img.SetImage(SourceImage);
+    Depth2Img.SetSampleNoise(ImageNoise);
+    Depth2Img.Strength := TJSONObject(FSD15Oracle).Get('strength', 0.0);
+    Depth2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    AssertEquals('output width', TJSONObject(FSD15Oracle).Get('width', 0),
+      ImageWidth);
+    // The depth map is required.
+    Pipeline.GuidanceScale := 1;
+    Pipeline.EncodePrompt('a', Embeds);
+    Pipeline.Conditioner := Depth2Img;
+    Pipeline.MakeInitialLatents(ImageWidth, ImageHeight, 1, Latents);
+    IsRefused := false;
+    try
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('no depth map refused', IsRefused);
+    Pipeline.OnAncestralNoise := @SD15StepNoise;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 2, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      if Entry.Get('scheduler', '') = 'DDIMScheduler' then
+        Pipeline.Sampler := smDDIM
+      else Pipeline.Sampler := smEulerAncestral;
+      LoadNestedOracleVolume(Entry.Arrays['depth_map'], false, DepthMap);
+      Depth2Img.SetDepthMap(DepthMap);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      LoadNestedOracleVolume(Entry.Arrays['depth_latents'], false, Expected);
+      MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthLatents, Expected);
+      AssertTrue(Entry.Get('name', '') + ' depth latents max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    end;
+    // A gray RGB depth image (bytes) is read as its luma: the same depth.
+    DepthImage.ReSize(DepthMap.SizeX, DepthMap.SizeY, 3);
+    for PixelPos := 0 to DepthMap.Size - 1 do
+    begin
+      DepthMap.FData[PixelPos] := Round(DepthMap.FData[PixelPos] * 30);
+      for Channel := 0 to 2 do
+        DepthImage.FData[PixelPos * 3 + Channel] := DepthMap.FData[PixelPos];
+    end;
+    DiffusersDepthToLatentGrid(DepthMap, Latents.SizeX, Latents.SizeY,
+      Expected);
+    Depth2Img.SetDepthMap(DepthImage);
+    Depth2Img.Strength := 1;
+    Pipeline.GuidanceScale := 1;
+    Pipeline.OnStep := nil;
+    Pipeline.MakeInitialLatents(ImageWidth, ImageHeight, 1, Latents);
+    Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 1, Latents);
+    MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthLatents, Expected);
+    AssertTrue('RGB depth image max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-6);
+    DepthMap.Fill(3);
+    IsRefused := false;
+    try
+      DiffusersDepthToLatentGrid(DepthMap, 8, 6, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('flat depth refused', IsRefused);
+    // The 4-channel tiny_sd2 unet cannot take the depth channel.
+    PlainPipeline := CreateSDPipeline('tiny_sd2');
+    PlainPipeline.Conditioner := Depth2Img;
+    PlainPipeline.MakeInitialLatents(ImageWidth, ImageHeight, 1, Latents);
+    IsRefused := false;
+    try
+      PlainPipeline.Denoise(Embeds, ImageWidth, ImageHeight, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('4-channel unet refused for depth2img', IsRefused);
+  finally
+    Embeds.Free;
+    Latents.Free;
+    Expected.Free;
+    DepthImage.Free;
+    DepthMap.Free;
+    ImageNoise.Free;
+    SourceImage.Free;
+    PlainPipeline.Free;
+    Pipeline.Free;
+    Depth2Img.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;

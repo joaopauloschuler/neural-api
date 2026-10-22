@@ -28,19 +28,40 @@ globals repointed), diffusers float64, latents passed explicitly:
                                              Euler, Euler a
 (layouts as their tiny_sd15 counterparts; see the two tiny_sd15 generators).
 
+--depth-only writes only the depth-to-image folder and its oracle:
+
+  tests/fixtures/tiny_sd2_depth/       a copy of tiny_sd2 whose unet takes 5
+                                       channels (latents | depth); model_index
+                                       names StableDiffusionDepth2ImgPipeline,
+                                       no depth_estimator / feature_extractor
+  tests/fixtures/tiny_sd2_depth_io.json  StableDiffusionDepth2ImgPipeline with
+                                       a supplied depth_map: a DEPTH_WIDTH x
+                                       DEPTH_HEIGHT image, DEPTH_STEPS steps of
+                                       DDIM and Euler a at strength
+                                       DEPTH_STRENGTH; per case the depth map
+                                       (H, W, 1), its prepare_depth_map result
+                                       at the latent grid ("depth_latents"),
+                                       timesteps, latents_after, image. The
+                                       noise, the image latent sample noise and
+                                       Euler a's step noise are injected.
+
 Coded by Claude (AI).
 
 Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd2_pipeline_fixture.py
+  python tools/make_pico_sd2_pipeline_fixture.py --depth-only
 """
 import json
 import os
 import shutil
+import sys
 
 import torch
 from safetensors.torch import load_file, save_file
-from diffusers import (AutoencoderKL, DDIMScheduler, StableDiffusionPipeline,
+from diffusers import (AutoencoderKL, DDIMScheduler, EulerAncestralDiscreteScheduler,
+                       StableDiffusionDepth2ImgPipeline, StableDiffusionPipeline,
                        UNet2DConditionModel)
+import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_depth2img as depth2img_module
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 import make_pico_sd_pipeline_fixture as pipeline_fixture
@@ -51,6 +72,14 @@ SD2_DIR = os.path.join(FIXTURES, "tiny_sd2")
 SD2_SEED = 20261022
 SD2_SAMPLE_SIZE = 12     # latent grid; the default image is 12 * 2 = 24
 TEXT_HIDDEN = 32
+DEPTH_DIR = os.path.join(FIXTURES, "tiny_sd2_depth")
+DEPTH_IO = os.path.join(FIXTURES, "tiny_sd2_depth_io.json")
+DEPTH_WIDTH = 16         # latent grid 8 x 6
+DEPTH_HEIGHT = 12
+DEPTH_STEPS = 5
+DEPTH_STRENGTH = 0.6
+# (width, height) of each case's depth map: upscaled, then downscaled to 8 x 6.
+DEPTH_MAP_SIZES = ((5, 4), (13, 9))
 
 
 def write_sd2_tokenizer_config(folder):
@@ -157,7 +186,96 @@ def check_folder():
     assert ids[-1] == 0, ids
 
 
+def make_depth_folder():
+    torch.manual_seed(SD2_SEED + 50)
+    if os.path.isdir(DEPTH_DIR):
+        shutil.rmtree(DEPTH_DIR)
+    shutil.copytree(SD2_DIR, DEPTH_DIR)
+    base = UNet2DConditionModel.from_pretrained(os.path.join(SD2_DIR, "unet"))
+    config = dict(base.config)
+    config["in_channels"] = 5
+    unet = UNet2DConditionModel.from_config(config)
+    pipeline_fixture.perturb(unet)
+    unet_dir = os.path.join(DEPTH_DIR, "unet")
+    shutil.rmtree(unet_dir)
+    unet.save_pretrained(unet_dir, safe_serialization=True)
+    index_file = os.path.join(DEPTH_DIR, "model_index.json")
+    with open(index_file) as f:
+        index = json.load(f)
+    index["_class_name"] = "StableDiffusionDepth2ImgPipeline"
+    index.pop("safety_checker", None)
+    index.pop("requires_safety_checker", None)
+    index.pop("image_encoder", None)
+    index["depth_estimator"] = [None, None]
+    index["feature_extractor"] = [None, None]
+    with open(index_file, "w") as f:
+        json.dump(index, f, indent=2)
+
+
+def make_depth():
+    """StableDiffusionDepth2ImgPipeline with a supplied depth_map (float64)."""
+    torch.set_grad_enabled(False)
+    make_depth_folder()
+    image = conditioning_fixture.byte_image(
+        torch.Generator().manual_seed(SD2_SEED + 51), 3, DEPTH_WIDTH, DEPTH_HEIGHT)
+    noise = conditioning_fixture.initial_latents(DEPTH_WIDTH, DEPTH_HEIGHT)
+    generator = torch.Generator().manual_seed(SD2_SEED + 52)
+    image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+    step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(DEPTH_STEPS)]
+    depth2img_module.retrieve_latents = (
+        lambda output, generator=None, sample_mode="sample":
+        output.latent_dist.mean + output.latent_dist.std * image_noise)
+    depth2img_module.randn_tensor = lambda *args, **kwargs: noise.clone()
+    pending_step_noise = []
+    conditioning_fixture.euler_a_module.randn_tensor = (
+        lambda *args, **kwargs: pending_step_noise.pop(0).clone())
+    cases = []
+    for case_pos, (name, euler_a) in enumerate((("ddim", False), ("euler_a", True))):
+        width, height = DEPTH_MAP_SIZES[case_pos]
+        # Positive, DPT-like relative depth.
+        depth_map = torch.rand((1, height, width), generator=generator,
+                               dtype=torch.float64) * 7 + 0.5
+        pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
+            DEPTH_DIR, torch_dtype=torch.float64, depth_estimator=None,
+            feature_extractor=None)
+        if euler_a:
+            pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                pipe.scheduler.config)
+        assert pipe.unet.config.in_channels == 5
+        depth_latents = pipe.prepare_depth_map(image, depth_map, 1, False,
+                                               torch.float64, "cpu")
+        pending_step_noise[:] = step_noise
+        out = conditioning_fixture.run(
+            pipe, {"image": image, "strength": DEPTH_STRENGTH,
+                   "depth_map": depth_map.clone()},
+            None, euler_a, steps=DEPTH_STEPS, sized=False)
+        out["timesteps"] = out["timesteps"][-len(out["latents_after"]):]
+        out["name"] = name
+        out["scheduler"] = type(pipe.scheduler).__name__
+        out["depth_map"] = conditioning_fixture.rounded(
+            depth_map[0].unsqueeze(-1).tolist())
+        out["depth_latents"] = conditioning_fixture.rounded(
+            depth_latents[0].permute(1, 2, 0).tolist())
+        cases.append(out)
+        print(name, out["timesteps"], len(out["latents_after"]), "steps run")
+    payload = {"width": DEPTH_WIDTH, "height": DEPTH_HEIGHT,
+               "steps": DEPTH_STEPS, "strength": DEPTH_STRENGTH,
+               "guidance_scale": conditioning_fixture.GUIDANCE,
+               "prompt": conditioning_fixture.PROMPT,
+               "init_image": conditioning_fixture.hwc(image),
+               "latents": conditioning_fixture.chw(noise[0]),
+               "image_sample_noise": conditioning_fixture.chw(image_noise[0]),
+               "step_noise": [conditioning_fixture.chw(item[0]) for item in step_noise],
+               "cases": cases}
+    with open(DEPTH_IO, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--depth-only" in sys.argv:
+        make_depth()
+        sys.exit(0)
     build_sd2_folder()
     check_folder()
     point_generators_at_sd2()

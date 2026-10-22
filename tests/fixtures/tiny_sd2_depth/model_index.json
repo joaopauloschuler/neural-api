@@ -1,0 +1,32 @@
+{
+  "_class_name": "StableDiffusionDepth2ImgPipeline",
+  "_diffusers_version": "0.41.0.dev0",
+  "feature_extractor": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "DDIMScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "CLIPTextModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "CLIPTokenizer"
+  ],
+  "unet": [
+    "diffusers",
+    "UNet2DConditionModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKL"
+  ],
+  "depth_estimator": [
+    null,
+    null
+  ]
+}

@@ -12189,8 +12189,8 @@ type
   TStableDiffusionPassInputs = set of TStableDiffusionPassInput;
 
   // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
-  // T2I-Adapter, IP-Adapter, img2img, inpainting, InstructPix2Pix); this base
-  // runs the plain UNet with CFG. Coded by Claude (AI).
+  // T2I-Adapter, IP-Adapter, img2img, inpainting, InstructPix2Pix,
+  // depth2img); this base runs the plain UNet with CFG. Coded by Claude (AI).
   TStableDiffusionConditioner = class(TObject)
   protected
     FPipeline: TStableDiffusionPipeline;
@@ -12435,7 +12435,7 @@ type
     // Replaces the unconditional embeds (NegativePrompt's, encoded on demand).
     procedure SetNegativePromptEmbeds(Embeds: TNNetVolume);
     procedure ClearNegativePrompt();
-    // Standard-normal (GridX, GridY, in_channels) latents from Seed (FPC RNG;
+    // Standard-normal (GridX, GridY, latent_channels) latents from Seed (FPC RNG;
     // the global RandSeed is restored). Torch's noise is not reproducible.
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
@@ -12702,6 +12702,10 @@ procedure DiffusersBinarizeMask(Mask: TNNetVolume; Width, Height: integer;
 // Channels): each cell's top-left pixel (torch nearest interpolate), per channel.
 procedure DiffusersMaskToLatentGrid(BinaryMask: TNNetVolume;
   PixelsPerLatent, Channels: integer; MaskLatents: TNNetVolume);
+// diffusers depth2img prepare_depth_map: Depth (W, H, 1) -> DepthLatents (GridX,
+// GridY, 1), torch bicubic resize then 2 * (d - min) / (max - min) - 1.
+procedure DiffusersDepthToLatentGrid(Depth: TNNetVolume; GridX, GridY: integer;
+  DepthLatents: TNNetVolume);
 
 type
   // diffusers StableDiffusionControlNetPipeline: a ControlNetModel folder
@@ -12777,13 +12781,19 @@ type
   end;
 
   // A conditioner over one source image, which BeginDenoise VAE-encodes at
-  // the output size (img2img, inpainting, InstructPix2Pix).
+  // the output size (img2img, inpainting, InstructPix2Pix, depth2img).
   TStableDiffusionImageConditioner = class(TStableDiffusionConditioner)
   protected
     FSourceImage: TNNetVolume;
     FImageLatents: TNNetVolume;
+    // latents | ExtraChannels, the input of a UNet wider than the latents.
+    FUNetInput: TNNetVolume;
     // From BeginDenoise: VaeImage is the image at the latent size in [-1, 1].
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); virtual; abstract;
+    // Pred := the UNet output for Latents with ExtraChannels concatenated in depth.
+    procedure PredictWithExtraChannels(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, ExtraChannels, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume);
   public
     constructor Create();
     destructor Destroy(); override;
@@ -12834,7 +12844,7 @@ type
     FSourceMask: TNNetVolume;
     // 9 channels: mask | masked-image latents. The re-noised image latents
     // and the latent mask per channel.
-    FMaskAndImageLatents, FUNetInput: TNNetVolume;
+    FMaskAndImageLatents: TNNetVolume;
     FKnownLatents, FMaskLatents: TNNetVolume;
     // The unit Gaussian noise of the masked-image latent sample.
     FMaskedImageSampleNoise: TNNetVolume;
@@ -12865,9 +12875,8 @@ type
   // an 8-channel UNet sees latents | the VAE latent mean of the image (unscaled).
   TStableDiffusionInstructPix2Pix = class(TStableDiffusionImageConditioner)
   private
-    // latents | image latents; zeros stand in for the image in the passes
-    // without sdpiImage.
-    FUNetInput, FZeroImageLatents: TNNetVolume;
+    // Zeros stand in for the image latents in the passes without sdpiImage.
+    FZeroImageLatents: TNNetVolume;
     FImageGuidanceScale: TNeuralFloat;
   protected
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
@@ -12889,6 +12898,28 @@ type
     // diffusers image_guidance_scale (1.5): the pull toward the input image.
     property ImageGuidanceScale: TNeuralFloat read FImageGuidanceScale
       write FImageGuidanceScale;
+  end;
+
+  // diffusers StableDiffusionDepth2ImgPipeline (stabilityai/stable-diffusion-2-depth)
+  // with a supplied depth_map: img2img whose 5-channel UNet sees latents | depth.
+  TStableDiffusionDepth2Img = class(TStableDiffusionImg2Img)
+  private
+    FDepthMap, FDepthLatents: TNNetVolume;
+  protected
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // Depth (W, H, 1) as DPT predicted_depth (larger = nearer), or a gray / RGB
+    // depth image (W, H, 3|4) in 0..255 taken as its PIL luma; any size and scale.
+    procedure SetDepthMap(Depth: TNNetVolume);
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    // The normalized depth (GridX, GridY, 1) in [-1, 1] of the last BeginDenoise.
+    property DepthLatents: TNNetVolume read FDepthLatents;
   end;
 
 // ---------------------------------------------------------------------------
@@ -93449,6 +93480,7 @@ begin
     (ClassName = 'StableDiffusionInpaintPipeline') or
     (ClassName = 'StableDiffusionImg2ImgPipeline') or
     (ClassName = 'StableDiffusionInstructPix2PixPipeline') or
+    (ClassName = 'StableDiffusionDepth2ImgPipeline') or
     (ClassName = 'LatentConsistencyModelPipeline') or
     (ClassName = 'LatentConsistencyModelImg2ImgPipeline');
 end;
@@ -93546,10 +93578,11 @@ begin
     ImportError('TStableDiffusionPipeline: the unet uses SDXL ' +
       'addition_embed_type "text_time"; SDXL is not supported yet.');
   // An inpainting UNet takes latents | mask | masked-image latents, an
-  // InstructPix2Pix one latents | image latents.
+  // InstructPix2Pix one latents | image latents, a depth2img one latents | depth.
   if ((FUNetConfig.InChannels <> FVaeConfig.LatentChannels) and
     (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels + 1) and
-    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels)) or
+    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels) and
+    (FUNetConfig.InChannels <> FVaeConfig.LatentChannels + 1)) or
     (FUNetConfig.OutChannels <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline: unet in/out_channels ' +
       IntToStr(FUNetConfig.InChannels) + '/' +
@@ -94399,7 +94432,8 @@ begin
       StepConditioner.ClassName + ' cannot feed a unet of ' +
       IntToStr(FUNetConfig.InChannels) + ' input channels (an inpainting ' +
       'unet needs a TStableDiffusionInpainter, an InstructPix2Pix one a ' +
-      'TStableDiffusionInstructPix2Pix).');
+      'TStableDiffusionInstructPix2Pix, a depth2img one a ' +
+      'TStableDiffusionDepth2Img).');
   if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
     (Latents.Depth <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
@@ -94769,6 +94803,37 @@ begin
       for Channel := 0 to MaxChannel do
         MaskLatents.FData[CellPos + Channel] := CellValue;
     end;
+end;
+
+procedure DiffusersDepthToLatentGrid(Depth: TNNetVolume; GridX, GridY: integer;
+  DepthLatents: TNNetVolume);
+var
+  ResizeNet: TNNet;
+  DepthMin, DepthRange: TNeuralFloat;
+begin
+  if (Depth.Depth <> 1) or (Depth.Size = 0) or (GridX < 1) or (GridY < 1) then
+    ImportError('DiffusersDepthToLatentGrid: a ' + IntToStr(Depth.SizeX) + 'x' +
+      IntToStr(Depth.SizeY) + 'x' + IntToStr(Depth.Depth) + ' depth map does ' +
+      'not fit a ' + IntToStr(GridX) + 'x' + IntToStr(GridY) + ' latent grid.');
+  ResizeNet := TNNet.Create();
+  try
+    ResizeNet.AddLayer(TNNetInput.Create(Depth.SizeX, Depth.SizeY, 1));
+    ResizeNet.AddLayer(TNNetResize2D.Create(GridX, GridY, {bicubic}2,
+      {AlignCorners=}0));
+    ResizeNet.Compute(Depth);
+    DepthLatents.ReSize(GridX, GridY, 1);
+    DepthLatents.Copy(ResizeNet.GetLastLayer.Output);
+  finally
+    ResizeNet.Free;
+  end;
+  DepthMin := DepthLatents.GetMin();
+  DepthRange := DepthLatents.GetMax() - DepthMin;
+  if not (DepthRange > 0) then
+    ImportError('DiffusersDepthToLatentGrid: the depth map is flat at the ' +
+      IntToStr(GridX) + 'x' + IntToStr(GridY) + ' latent grid.');
+  DepthLatents.Add(-DepthMin);
+  DepthLatents.Mul(2 / DepthRange);
+  DepthLatents.Add(-1);
 end;
 
 constructor TStableDiffusionControlNet.Create(const ControlNetFolder: string);
@@ -95422,13 +95487,23 @@ begin
   inherited Create();
   FSourceImage := TNNetVolume.Create();
   FImageLatents := TNNetVolume.Create();
+  FUNetInput := TNNetVolume.Create();
 end;
 
 destructor TStableDiffusionImageConditioner.Destroy();
 begin
+  FUNetInput.Free;
   FImageLatents.Free;
   FSourceImage.Free;
   inherited Destroy();
+end;
+
+procedure TStableDiffusionImageConditioner.PredictWithExtraChannels(
+  UNet: TNNet; const Config: TSDUNetConfig; Latents, ExtraChannels,
+  Embeds: TNNetVolume; Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  FUNetInput.AddLayers(Latents, ExtraChannels);
+  SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
 end;
 
 procedure TStableDiffusionImageConditioner.SetImage(Image: TNNetVolume);
@@ -95550,7 +95625,6 @@ begin
   inherited Create();
   FSourceMask := TNNetVolume.Create();
   FMaskAndImageLatents := TNNetVolume.Create();
-  FUNetInput := TNNetVolume.Create();
   FKnownLatents := TNNetVolume.Create();
   FMaskLatents := TNNetVolume.Create();
   FMaskedImageSampleNoise := TNNetVolume.Create();
@@ -95562,7 +95636,6 @@ begin
   FMaskedImageSampleNoise.Free;
   FMaskLatents.Free;
   FKnownLatents.Free;
-  FUNetInput.Free;
   FMaskAndImageLatents.Free;
   FSourceMask.Free;
   inherited Destroy();
@@ -95641,10 +95714,8 @@ procedure TStableDiffusionInpainter.PredictNoise(UNet: TNNet;
   Pred: TNNetVolume);
 begin
   if FIsConcatUNet then
-  begin
-    FUNetInput.AddLayers(Latents, FMaskAndImageLatents);
-    SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
-  end
+    PredictWithExtraChannels(UNet, Config, Latents, FMaskAndImageLatents,
+      Embeds, Timestep, Pred)
   else SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
 end;
 
@@ -95666,7 +95737,6 @@ end;
 constructor TStableDiffusionInstructPix2Pix.Create();
 begin
   inherited Create();
-  FUNetInput := TNNetVolume.Create();
   FZeroImageLatents := TNNetVolume.Create();
   FImageGuidanceScale := 1.5;
 end;
@@ -95674,7 +95744,6 @@ end;
 destructor TStableDiffusionInstructPix2Pix.Destroy();
 begin
   FZeroImageLatents.Free;
-  FUNetInput.Free;
   inherited Destroy();
 end;
 
@@ -95727,9 +95796,63 @@ procedure TStableDiffusionInstructPix2Pix.PredictNoise(UNet: TNNet;
   Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
   Pred: TNNetVolume);
 begin
-  if sdpiImage in Inputs then FUNetInput.AddLayers(Latents, FImageLatents)
-  else FUNetInput.AddLayers(Latents, FZeroImageLatents);
-  SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
+  if sdpiImage in Inputs then
+    PredictWithExtraChannels(UNet, Config, Latents, FImageLatents, Embeds,
+      Timestep, Pred)
+  else PredictWithExtraChannels(UNet, Config, Latents, FZeroImageLatents,
+    Embeds, Timestep, Pred);
+end;
+
+constructor TStableDiffusionDepth2Img.Create();
+begin
+  inherited Create();
+  FDepthMap := TNNetVolume.Create();
+  FDepthLatents := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionDepth2Img.Destroy();
+begin
+  FDepthLatents.Free;
+  FDepthMap.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionDepth2Img.SetDepthMap(Depth: TNNetVolume);
+begin
+  if Depth.Depth = 1 then
+  begin
+    FDepthMap.ReSize(Depth);
+    FDepthMap.Copy(Depth);
+  end
+  else ConvertAndResizeImagePIL(Depth, FDepthMap, Depth.SizeX, Depth.SizeY, 1,
+    {ClipToByteRange=}false, 0, 255);
+end;
+
+function TStableDiffusionDepth2Img.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  Result := InChannels = LatentChannels + 1;
+end;
+
+procedure TStableDiffusionDepth2Img.EncodeImage(VaeImage,
+  Latents: TNNetVolume);
+begin
+  if FDepthMap.Size = 0 then
+    ImportError('TStableDiffusionDepth2Img: call SetDepthMap first (the ' +
+      'checkpoint''s DPT-Hybrid depth_estimator is not supported).');
+  inherited EncodeImage(VaeImage, Latents);
+  DiffusersDepthToLatentGrid(FDepthMap, Latents.SizeX, Latents.SizeY,
+    FDepthLatents);
+end;
+
+procedure TStableDiffusionDepth2Img.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  // diffusers feeds the same depth to the prompt and the unconditional pass.
+  PredictWithExtraChannels(UNet, Config, Latents, FDepthLatents, Embeds,
+    Timestep, Pred);
 end;
 
 const
