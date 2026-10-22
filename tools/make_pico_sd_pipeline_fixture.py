@@ -9,7 +9,8 @@ transformers class (nothing downloaded), saved with the real folder layout:
     model_index.json                     StableDiffusionPipeline
     scheduler/scheduler_config.json      DDIMScheduler, SD 1.5 betas, leading
                                          spacing, steps_offset 1
-    text_encoder/{config.json,model.safetensors}       CLIPTextModel, F32
+    text_encoder/{config.json,model.safetensors}       CLIPTextModel, F32, keys
+                                         under text_model. as in SD 1.5
     tokenizer/{vocab.json,merges.txt,tokenizer_config.json,
                special_tokens_map.json}  a CLIP BPE trained here on a small
                                          corpus (no tokenizer.json, as SD 1.5)
@@ -38,6 +39,7 @@ import shutil
 from collections import Counter
 
 import torch
+from safetensors.torch import load_file, save_file
 from diffusers import (AutoencoderKL, DDIMScheduler, StableDiffusionPipeline,
                        UNet2DConditionModel)
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
@@ -208,6 +210,13 @@ def build_folder():
         if name not in ("vocab.json", "merges.txt"):
             os.remove(os.path.join(tokenizer_dir, name))
     write_tokenizer(tokenizer_dir, vocab, merges)
+    # transformers 5 saves CLIPTextModel keys without the text_model. prefix
+    # that the SD 1.5 checkpoint (and our loader) use.
+    te_file = os.path.join(PICO_DIR, "text_encoder", "model.safetensors")
+    tensors = load_file(te_file)
+    tensors = {(k if k.startswith("text_model.") else "text_model." + k): v
+               for k, v in tensors.items()}
+    save_file(tensors, te_file, metadata={"format": "pt"})
 
 
 def make_oracle():
@@ -216,6 +225,10 @@ def make_oracle():
     pipe.set_progress_bar_config(disable=True)
     tokenizer = pipe.tokenizer
     assert tokenizer.model_max_length == 77
+    saved = load_file(os.path.join(PICO_DIR, "text_encoder", "model.safetensors"))
+    for key, value in pipe.text_encoder.state_dict().items():
+        stored = saved.get(key, saved.get("text_model." + key))
+        assert stored is not None and torch.equal(stored.double(), value), key
     tokens = []
     for prompt in TOKEN_PROMPTS:
         padded = tokenizer(prompt, padding="max_length", max_length=77,

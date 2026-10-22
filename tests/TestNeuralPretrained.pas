@@ -42,7 +42,20 @@ type
     FQwenImage21Phases: array of TQwenImage21PipelinePhase;
     FQwenImage21StepLatents: array of TNNetVolume;
     FQwenImage21StepTimesteps: array of double;
+    // TStableDiffusionPipeline OnStep check against the oracle's latents_after.
+    FSD15Oracle: TJSONData;
+    FSD15StepMaxDiff: double;
+    FSD15StepCount: integer;
     function FixturePath(const FileName: string): string;
+    // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
+    function LoadSD15PipelineOracle(): TJSONData;
+    function CreateSD15Pipeline(): TStableDiffusionPipeline;
+    // Nested JSON [S][D] -> (S,1,D); [C][H][W] (ChannelsFirst) or [H][W][C]
+    // -> (W,H,C).
+    procedure LoadNestedOracleVolume(Data: TJSONData; ChannelsFirst: boolean;
+      Dest: TNNetVolume);
+    procedure SD15CheckStep(StepIndex, StepCount: integer; Timestep: double;
+      Latents: TNNetVolume);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1207,6 +1220,11 @@ type
     procedure TestMergeSafeTensorsFiles;
     procedure TestMarigoldWidenUNetConvIn;
     procedure TestMarigoldPipelineMatchesPredict;
+    procedure TestStableDiffusionPipelineTokens;
+    procedure TestStableDiffusionPipelineEmbeds;
+    procedure TestStableDiffusionPipelineGuidedNoise;
+    procedure TestStableDiffusionPipelineParity;
+    procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -44463,9 +44481,9 @@ begin
 end;
 
 // Per-block attention-head parity: the diffusers config "attention_head_dim" is
-// a LIST (one per-head DIM per resolution block; SDXL-style) so the head COUNT
-// varies per block. The pico fixture (tools/sd_unet_perblock_heads_tiny_fixture)
-// has block_out_channels=[8,16] with attention_head_dim=[2,8] -> heads=[4,2], and
+// a LIST (one head COUNT per resolution block; SDXL-style). The pico fixture
+// (tools/sd_unet_perblock_heads_tiny_fixture) has block_out_channels=[8,16]
+// with attention_head_dim=[4,2] -> heads=[4,2] (head dims 2 and 8), and
 // attends BOTH down blocks AND both up blocks so the differing per-block head
 // count is exercised on the down/mid/up paths. Verifies the list parses into
 // HeadsPerBlock (differing values), the net builds, and SDUNetDenoise's predicted
@@ -45294,6 +45312,305 @@ end;
 
 // TMarigoldPipeline (one component at a time, configs from the folder) must
 // reproduce MarigoldPredict on the same nets, noises and scheduler.
+function TTestNeuralPretrained.LoadSD15PipelineOracle(): TJSONData;
+var
+  RawText: TStringStream;
+  Parser: TJSONParser;
+begin
+  RawText := TStringStream.Create('');
+  try
+    RawText.LoadFromFile(FixturePath('tiny_sd15_pipeline_io.json'));
+    Parser := TJSONParser.Create(RawText.DataString, []);
+    try
+      Result := Parser.Parse;
+    finally
+      Parser.Free;
+    end;
+  finally
+    RawText.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.CreateSD15Pipeline(): TStableDiffusionPipeline;
+begin
+  Result := TStableDiffusionPipeline.Create(ExtractFileDir(
+    FixturePath('tiny_sd15/model_index.json')));
+end;
+
+procedure TTestNeuralPretrained.LoadNestedOracleVolume(Data: TJSONData;
+  ChannelsFirst: boolean; Dest: TNNetVolume);
+var
+  Outer, Middle, Inner: TJSONArray;
+  OuterPos, MiddlePos, InnerPos, OuterCount, MiddleCount, InnerCount: integer;
+begin
+  Outer := TJSONArray(Data);
+  OuterCount := Outer.Count;
+  MiddleCount := TJSONArray(Outer.Items[0]).Count;
+  if not (TJSONArray(Outer.Items[0]).Items[0] is TJSONArray) then
+  begin
+    Dest.ReSize(OuterCount, 1, MiddleCount);
+    for OuterPos := 0 to OuterCount - 1 do
+    begin
+      Middle := TJSONArray(Outer.Items[OuterPos]);
+      for MiddlePos := 0 to MiddleCount - 1 do
+        Dest.FData[OuterPos * MiddleCount + MiddlePos] :=
+          Middle.Items[MiddlePos].AsFloat;
+    end;
+    exit;
+  end;
+  InnerCount := TJSONArray(TJSONArray(Outer.Items[0]).Items[0]).Count;
+  if ChannelsFirst then Dest.ReSize(InnerCount, MiddleCount, OuterCount)
+  else Dest.ReSize(MiddleCount, OuterCount, InnerCount);
+  for OuterPos := 0 to OuterCount - 1 do
+  begin
+    Middle := TJSONArray(Outer.Items[OuterPos]);
+    for MiddlePos := 0 to MiddleCount - 1 do
+    begin
+      Inner := TJSONArray(Middle.Items[MiddlePos]);
+      for InnerPos := 0 to InnerCount - 1 do
+        if ChannelsFirst then
+          // [C][H][W]: pixel (W = InnerPos, H = MiddlePos), channel OuterPos.
+          Dest.FData[(MiddlePos * InnerCount + InnerPos) * OuterCount +
+            OuterPos] := Inner.Items[InnerPos].AsFloat
+        else
+          // [H][W][C]: pixel (W = MiddlePos, H = OuterPos), channel InnerPos.
+          Dest.FData[(OuterPos * MiddleCount + MiddlePos) * InnerCount +
+            InnerPos] := Inner.Items[InnerPos].AsFloat;
+    end;
+  end;
+end;
+
+procedure TTestNeuralPretrained.SD15CheckStep(StepIndex, StepCount: integer;
+  Timestep: double; Latents: TNNetVolume);
+var
+  Expected: TNNetVolume;
+begin
+  Expected := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents_after'].
+      Items[StepIndex], true, Expected);
+    FSD15StepMaxDiff := Max(FSD15StepMaxDiff,
+      MaxAbsVolumeDiff(Latents, Expected));
+    AssertEquals('step timestep', TJSONObject(FSD15Oracle).
+      Arrays['timesteps'].Integers[StepIndex], Round(Timestep));
+    Inc(FSD15StepCount);
+  finally
+    Expected.Free;
+  end;
+end;
+
+// TokenizePrompt: [bos] + ids + [eos], padded to 77 with <|endoftext|> and
+// truncated, as diffusers' tokenizer(padding="max_length", truncation=True).
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineTokens;
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TNeuralIntegerArray;
+  CaseCnt, IdCnt: integer;
+begin
+  Root := LoadSD15PipelineOracle();
+  Pipeline := CreateSD15Pipeline();
+  try
+    AssertEquals('max tokens', 77, Pipeline.MaxTokenCount);
+    Cases := TJSONObject(Root).Arrays['tokens'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      ExpectedIds := Cases.Objects[CaseCnt].Arrays['input_ids'];
+      Ids := Pipeline.TokenizePrompt(Cases.Objects[CaseCnt].Get('prompt', ''));
+      AssertEquals('case ' + IntToStr(CaseCnt) + ' count', ExpectedIds.Count,
+        Length(Ids));
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals('case ' + IntToStr(CaseCnt) + ' id ' + IntToStr(IdCnt),
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+    end;
+  finally
+    Pipeline.Free;
+    Root.Free;
+  end;
+end;
+
+// EncodePrompt: the CLIP last hidden state of the prompt and of "" against
+// diffusers encode_prompt (float64).
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineEmbeds;
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Got, Expected: TNNetVolume;
+  MaxDiff: double;
+begin
+  Root := LoadSD15PipelineOracle();
+  Pipeline := CreateSD15Pipeline();
+  Got := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Pipeline.EncodePrompt(TJSONObject(Root).Get('prompt', ''), Got);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['prompt_embeds'], false,
+      Expected);
+    AssertEquals('embeds tokens', 77, Got.SizeX);
+    MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+    AssertTrue('prompt embeds max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    Pipeline.EncodePrompt('', Got);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['negative_prompt_embeds'],
+      false, Expected);
+    MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+    AssertTrue('empty prompt embeds max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    Expected.Free;
+    Got.Free;
+    Pipeline.Free;
+    Root.Free;
+  end;
+end;
+
+// Step 0 of the oracle run: the scheduler's leading timesteps and the CFG mix
+// of the conditional and unconditional UNet passes (guidance 7.5).
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineGuidedNoise;
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Schedule: TNeuralIntegerArray;
+  Timesteps: TJSONArray;
+  Latents, Cond, Uncond, NoiseCond, NoiseUncond, Expected: TNNetVolume;
+  StepPos: integer;
+  MaxDiff: double;
+begin
+  Root := LoadSD15PipelineOracle();
+  Pipeline := CreateSD15Pipeline();
+  Latents := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  Uncond := TNNetVolume.Create;
+  NoiseCond := TNNetVolume.Create;
+  NoiseUncond := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Net := nil;
+  try
+    Timesteps := TJSONObject(Root).Arrays['timesteps'];
+    Schedule := Pipeline.Scheduler.BuildTimestepSchedule(Timesteps.Count,
+      Pipeline.Scheduler.ConfigSpacing);
+    for StepPos := 0 to Timesteps.Count - 1 do
+      AssertEquals('timestep ' + IntToStr(StepPos),
+        Timesteps.Integers[StepPos], Schedule[StepPos] - 1);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['latents'], true, Latents);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['prompt_embeds'], false,
+      Cond);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['negative_prompt_embeds'],
+      false, Uncond);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Latents.SizeX;
+    Config.TextSeqLen := Cond.SizeX;
+    Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+    SDUNetDenoise(Net, Config, Latents, Cond, Timesteps.Integers[0], NoiseCond);
+    SDUNetDenoise(Net, Config, Latents, Uncond, Timesteps.Integers[0],
+      NoiseUncond);
+    TNNetDiffusionScheduler.ApplyCFG(NoiseCond, NoiseUncond, NoiseCond,
+      TJSONObject(Root).Get('guidance_scale', 0.0));
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['noise_pred_0'], true,
+      Expected);
+    MaxDiff := MaxAbsVolumeDiff(NoiseCond, Expected);
+    AssertTrue('guided noise max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    Net.Free;
+    Expected.Free;
+    NoiseUncond.Free;
+    NoiseCond.Free;
+    Uncond.Free;
+    Cond.Free;
+    Latents.Free;
+    Pipeline.Free;
+    Root.Free;
+  end;
+end;
+
+// End to end from the prompt text and the oracle's initial latents: 3 guided
+// DDIM steps (latents after each) and the decoded 16x16 image.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Image, Expected: TNNetVolume;
+  ImageSize: integer;
+  MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15PipelineOracle();
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    ImageSize := TJSONObject(FSD15Oracle).Get('image_size', 0);
+    AssertEquals('default image size', ImageSize, Pipeline.DefaultImageSize);
+    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
+      0.0);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    FSD15StepMaxDiff := 0;
+    FSD15StepCount := 0;
+    Pipeline.OnStep := @SD15CheckStep;
+    AssertFalse('no negative embeds yet', Pipeline.HasNegativePromptEmbeds);
+    Pipeline.GenerateFromEmbeds(Embeds, ImageSize, ImageSize,
+      TJSONObject(FSD15Oracle).Get('steps', 0), 0, Image, Initial);
+    AssertTrue('empty prompt encoded', Pipeline.HasNegativePromptEmbeds);
+    AssertEquals('steps run', TJSONObject(FSD15Oracle).Get('steps', 0),
+      FSD15StepCount);
+    AssertTrue('step latents max |diff| = ' + FloatToStr(FSD15StepMaxDiff),
+      FSD15StepMaxDiff < 1e-4);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['image'], false,
+      Expected);
+    AssertEquals('image width', ImageSize, Image.SizeX);
+    AssertEquals('image depth', 3, Image.Depth);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('image max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    Expected.Free;
+    Image.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// Non-square sizes and sides that are not a multiple of the VAE factor times
+// the UNet down factor are refused before any weight loads.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineRefusesBadSize;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Latents: TNNetVolume;
+
+  function Refused(Width, Height: integer): boolean;
+  begin
+    Result := false;
+    try
+      Pipeline.MakeInitialLatents(Width, Height, 1, Latents);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  Latents := TNNetVolume.Create;
+  try
+    AssertEquals('vae factor', 2, Pipeline.VaeScaleFactor);
+    AssertTrue('non-square', Refused(16, 32));
+    AssertTrue('not a multiple of 4', Refused(6, 6));
+    AssertFalse('16 is fine', Refused(16, 16));
+    AssertEquals('latent grid', 8, Latents.SizeX);
+    AssertEquals('latent depth', 4, Latents.Depth);
+  finally
+    Latents.Free;
+    Pipeline.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestMarigoldPipelineMatchesPredict;
 const
   cImageX = 16;

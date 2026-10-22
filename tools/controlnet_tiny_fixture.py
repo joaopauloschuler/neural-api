@@ -452,7 +452,7 @@ def main():
         'down_block_types': DOWN_TYPES,
         'layers_per_block': LAYERS_PER_BLOCK,
         'cross_attention_dim': CROSS_DIM,
-        'attention_head_dim': BLOCK_OUT[0] // HEADS,
+        'attention_head_dim': HEADS,  # diffusers: the head COUNT
         'norm_num_groups': NORM_GROUPS,
         'flip_sin_to_cos': True,
         'freq_shift': 0,

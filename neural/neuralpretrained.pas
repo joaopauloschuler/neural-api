@@ -11834,8 +11834,8 @@ function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
 //   * ResnetBlock2D GroupNorm / conv_norm_out eps = 1e-5; the Transformer2DModel
 //     pre-norm GroupNorm eps = 1e-6 (DISTINCT - diffusers uses both).
 //   * attention to_q/to_k/to_v are bias-FREE; to_out.0 is biased; 1/sqrt(head)
-//     scale; heads = channels div attention_head_dim's per-head size (SD1.5
-//     interprets the config field so num_heads is fixed per block).
+//     scale; heads = the config's attention_head_dim (diffusers reads it as
+//     the head COUNT), head dim = block channels / heads.
 //   * GEGLU feed-forward uses EXACT erf GELU (TNNetGEGLUErf); inner = 4*dim.
 //   * Downsample2D = symmetric pad=1 stride-2 3x3 conv (NOT the VAE encoder's
 //     asymmetric pad); Upsample2D = nearest-2x (TNNetDeMaxPool) + 3x3 conv.
@@ -11853,11 +11853,9 @@ type
     NumHeads: integer;                        // attention heads (block-0 value;
                                               // kept for back-compat + ToString)
     HeadsPerBlock: array[0..7] of integer;    // attention heads PER resolution
-                                              // block. SD1.5 = constant (all
-                                              // NumHeads); SDXL etc. supply a
-                                              // per-block attention_head_dim list
-                                              // so heads vary: heads[b] =
-                                              // BlockOutChannels[b] / dim[b].
+                                              // block: diffusers attention_head_dim
+                                              // (a head COUNT; SD1.5 8 everywhere,
+                                              // SD2.x [5,10,20,20]).
     NormNumGroups: integer;                   // GroupNorm groups (32)
     LatentGrid: integer;                      // latent H=W for the Input
     TextSeqLen: integer;                      // encoder_hidden_states length
@@ -12094,6 +12092,118 @@ type
     // int8 UNet weights (TNNet.QuantizeWeightsInt8) for later Predict calls.
     property QuantizeInt8: boolean read FQuantizeInt8 write FQuantizeInt8;
     property UNetConfig: TSDUNetConfig read FUNetConfig;
+  end;
+
+type
+  // The stages of TStableDiffusionPipeline; OnPhase fires as each one starts.
+  TStableDiffusionPipelinePhase = (sdphLoadTextEncoder, sdphEncodePrompt,
+    sdphLoadUNet, sdphDenoise, sdphLoadVae, sdphDecode, sdphDone);
+  TStableDiffusionPhaseEvent = procedure(Phase: TStableDiffusionPipelinePhase)
+    of object;
+  // Fired after denoising step StepIndex (0-based) of StepCount; Latents holds
+  // the sample after that step, Timestep the diffusers timestep it started at.
+  TStableDiffusionStepEvent = procedure(StepIndex, StepCount: integer;
+    Timestep: double; Latents: TNNetVolume) of object;
+
+  // Stable Diffusion 1.x text-to-image (diffusers StableDiffusionPipeline) over
+  // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
+  // classifier-free guidance with an empty (or negative) prompt. Each component
+  // is built when its stage starts and freed when it ends. The scheduler config
+  // sets betas, spacing and prediction type; Sampler picks the update (DDIM).
+  // Latents are (Grid, Grid, latent_channels); images are square. Coded by Claude (AI).
+  TStableDiffusionPipeline = class(TObject)
+  private
+    FModelFolder: string;
+    FScheduler: TNNetDiffusionScheduler;
+    FSchedulerClassName: string;
+    FSampler: TNNetSamplerMethod;
+    FUNetConfig: TSDUNetConfig;
+    FVaeConfig: TVaeDecoderConfig;
+    FTextConfig: TClipConfig;
+    // tokenizer_config.json: model_max_length (capped at the text positions)
+    // and the pad token text; FTokenizer is loaded by the first TokenizePrompt.
+    FMaxTokenCount: integer;
+    FPadToken: string;
+    FTokenizer: TNeuralHFTokenizer;
+    FGuidanceScale: TNeuralFloat;
+    FNegativePrompt: string;
+    // The unconditional embeds of guided steps: set, or encoded on first use.
+    FNegativePromptEmbeds: TNNetVolume;
+    FHasNegativePromptEmbeds: boolean;
+    FOnPhase: TStableDiffusionPhaseEvent;
+    FOnStep: TStableDiffusionStepEvent;
+    {$IFDEF OpenCL}
+    FUseOpenCL: boolean;
+    FOpenCLPlatform: cl_platform_id;
+    FOpenCLDevice: cl_device_id;
+    {$ENDIF}
+    function ComponentFolder(const Component: string): string;
+    procedure DoPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure PrepareComponent(Net: TNNet);
+    // Latent grid of a Width x Height image; raises unless it is square and a
+    // multiple of what the VAE and the UNet down blocks need.
+    function LatentGridFor(Width, Height: integer): integer;
+    // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
+    procedure EncodeTokenIdLists(const TokenLists: array of TNeuralIntegerArray;
+      const Embeds: array of TNNetVolume);
+    procedure SetNegativePrompt(const Value: string);
+    function GetVaeScaleFactor(): integer;
+    function GetDefaultImageSize(): integer;
+    function GetHasNegativePromptEmbeds(): boolean;
+  public
+    // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
+    // unet/ and vae/ configs; no weights are loaded here.
+    constructor Create(const ModelFolder: string);
+    destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    // Components built by later calls run on this OpenCL device.
+    procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+    {$ENDIF}
+    // [bos] + ids (truncated) + [eos], padded with the pad token to MaxTokenCount.
+    function TokenizePrompt(const Prompt: string): TNeuralIntegerArray;
+    // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
+    procedure EncodeTokenIds(const TokenIds: array of integer;
+      PromptEmbeds: TNNetVolume);
+    procedure EncodePrompt(const Prompt: string; PromptEmbeds: TNNetVolume);
+    // Replaces the unconditional embeds (NegativePrompt's, encoded on demand).
+    procedure SetNegativePromptEmbeds(Embeds: TNNetVolume);
+    procedure ClearNegativePrompt();
+    // Standard-normal (Grid, Grid, in_channels) latents from Seed (FPC RNG; the
+    // global RandSeed is restored). Torch's noise is not reproducible.
+    procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
+      Latents: TNNetVolume);
+    // StepCount scheduler steps on Latents in place (noise in, clean out); with
+    // GuidanceScale > 1 each step also runs the unconditional embeds (CFG).
+    procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Latents: TNNetVolume);
+    // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
+    procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
+      Image: TNNetVolume);
+    // Denoise + DecodeLatents; InitialLatents (noise) = nil draws it from Seed.
+    procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+      InitialLatents: TNNetVolume = nil);
+    // Encodes Prompt (and the negative prompt, in the same text encoder load).
+    procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
+      Seed: cardinal; Image: TNNetVolume);
+    // CFG weight (diffusers guidance_scale, 7.5); <= 1 runs no unconditional pass.
+    property GuidanceScale: TNeuralFloat read FGuidanceScale
+      write FGuidanceScale;
+    property NegativePrompt: string read FNegativePrompt
+      write SetNegativePrompt;
+    property HasNegativePromptEmbeds: boolean read GetHasNegativePromptEmbeds;
+    property Sampler: TNNetSamplerMethod read FSampler write FSampler;
+    property Scheduler: TNNetDiffusionScheduler read FScheduler;
+    // scheduler_config.json _class_name (only its betas/spacing are used).
+    property SchedulerClassName: string read FSchedulerClassName;
+    property UNetConfig: TSDUNetConfig read FUNetConfig;
+    property TextConfig: TClipConfig read FTextConfig;
+    property MaxTokenCount: integer read FMaxTokenCount;
+    property VaeScaleFactor: integer read GetVaeScaleFactor;
+    // unet sample_size * VaeScaleFactor (512 for SD 1.5).
+    property DefaultImageSize: integer read GetDefaultImageSize;
+    property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
+    property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
   end;
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
@@ -74564,64 +74674,37 @@ begin
     Result.NormNumGroups := Obj.Get('norm_num_groups', 32);
     Result.TimeEmbedDim := 4 * Result.BlockOutChannels[0];
     Result.TextSeqLen := Obj.Get('text_seq_len', Obj.Get('max_position_embeddings', 77));
-    // attention_head_dim: HF/diffusers semantics -- this is the per-head channel
-    // DIM, and a block's num_heads = (that block's channel width) / its head dim.
-    // It is EITHER a scalar (one head dim for every resolution; SD1.5 uses 8,
-    // which over block_out_channels [320,640,1280,1280] yields a CONSTANT 8 heads
-    // everywhere -- the historical "8 heads" SD case) OR a LIST (one head dim per
-    // block; SDXL-style, e.g. [5,10,20] over [320,640,1280] -> 64 channels/head
-    // and 5/10/20 heads). We parse both into the per-block HeadsPerBlock array.
-    //   heads[block] = BlockOutChannels[block] div dim[block].
-    // NOTE: newer diffusers configs sometimes also carry a confusingly-named
-    // "num_attention_heads" field (the ACTUAL head COUNT, not a dim). This
-    // importer keys on attention_head_dim ONLY (consistent with the original
-    // C/dim derivation and every committed SD fixture); num_attention_heads is
-    // intentionally NOT read here. If a checkpoint relies on it the import will
-    // surface a head-count mismatch rather than silently misbehave.
-    ArrData := Obj.Find('attention_head_dim');
+    // diffusers num_attention_heads = num_attention_heads or attention_head_dim:
+    // despite its name, attention_head_dim holds the head COUNT (scalar, or one
+    // per block); each block splits its channels into that many heads.
+    ArrData := Obj.Find('num_attention_heads');
+    if (ArrData = nil) or (ArrData.JSONType = jtNull) then
+      ArrData := Obj.Find('attention_head_dim');
     if (ArrData <> nil) and (ArrData is TJSONArray) then
     begin
-      // per-block head-dim list (SDXL etc.): one entry per resolution block.
       Arr := TJSONArray(ArrData);
       if Arr.Count <> Result.NumBlockOut then
-        ImportError('SD UNet import: "attention_head_dim" list must have ' +
+        ImportError('SD UNet import: the head-count list must have ' +
           IntToStr(Result.NumBlockOut) + ' entries (one per block), got ' +
           IntToStr(Arr.Count) + '.');
-      for i := 0 to LpMax do
-      begin
-        AttnHeadDim := Arr.Integers[i];
-        if AttnHeadDim < 1 then
-          ImportError('SD UNet import: attention_head_dim[' + IntToStr(i) +
-            '] must be >= 1.');
-        if (Result.BlockOutChannels[i] mod AttnHeadDim) <> 0 then
-          ImportError('SD UNet import: block_out_channels[' + IntToStr(i) + ']=' +
-            IntToStr(Result.BlockOutChannels[i]) + ' not divisible by ' +
-            'attention_head_dim[' + IntToStr(i) + ']=' + IntToStr(AttnHeadDim) + '.');
-        Result.HeadsPerBlock[i] := Result.BlockOutChannels[i] div AttnHeadDim;
-        if Result.HeadsPerBlock[i] < 1 then Result.HeadsPerBlock[i] := 1;
-      end;
+      for i := 0 to LpMax do Result.HeadsPerBlock[i] := Arr.Integers[i];
     end
     else
     begin
-      // scalar head dim: SD1.5/2.x interpret this as a CONSTANT head count across
-      // every block (the historical "8 heads everywhere" case). This is NOT the
-      // HF C[i]/dim-per-block rule -- a scalar attention_head_dim in these configs
-      // is the BLOCK-0 head dim only, and SD reuses that head COUNT verbatim for
-      // all resolutions (head DIM then grows with channel width). We preserve that
-      // exactly: heads = BlockOut[0] div dim for every block (BIT-IDENTICAL to the
-      // pre-per-block importer). Only the LIST form (above) yields varying heads.
-      AttnHeadDim := Obj.Get('attention_head_dim', 8);
-      if AttnHeadDim < 1 then
-        ImportError('SD UNet import: attention_head_dim must be >= 1.');
-      if (Result.BlockOutChannels[0] mod AttnHeadDim) <> 0 then
-        ImportError('SD UNet import: block_out_channels[0]=' +
-          IntToStr(Result.BlockOutChannels[0]) + ' not divisible by ' +
-          'attention_head_dim=' + IntToStr(AttnHeadDim) + '.');
-      for i := 0 to LpMax do
-      begin
-        Result.HeadsPerBlock[i] := Result.BlockOutChannels[0] div AttnHeadDim;
-        if Result.HeadsPerBlock[i] < 1 then Result.HeadsPerBlock[i] := 1;
-      end;
+      if (ArrData <> nil) and (ArrData is TJSONNumber) then
+        AttnHeadDim := ArrData.AsInteger
+      else AttnHeadDim := 8;
+      for i := 0 to LpMax do Result.HeadsPerBlock[i] := AttnHeadDim;
+    end;
+    for i := 0 to LpMax do
+    begin
+      if Result.HeadsPerBlock[i] < 1 then
+        ImportError('SD UNet import: block ' + IntToStr(i) + ' head count ' +
+          IntToStr(Result.HeadsPerBlock[i]) + ' must be >= 1.');
+      if (Result.BlockOutChannels[i] mod Result.HeadsPerBlock[i]) <> 0 then
+        ImportError('SD UNet import: block_out_channels[' + IntToStr(i) + ']=' +
+          IntToStr(Result.BlockOutChannels[i]) + ' not divisible by its ' +
+          IntToStr(Result.HeadsPerBlock[i]) + ' attention heads.');
     end;
     // NumHeads kept as the block-0 value for back-compat (ToString, the >=1
     // build-time guard). Per-block builders now read HeadsPerBlock directly.
@@ -92022,6 +92105,412 @@ begin
     end;
     Padded.Free; ImageLatent.Free; UNetInput.Free; Pred.Free;
     Decoded.Free; Field.Free;
+  end;
+end;
+
+constructor TStableDiffusionPipeline.Create(const ModelFolder: string);
+var
+  JsonText: TStringList;
+  Root, Node: TJSONData;
+  Obj: TJSONObject;
+  IndexFile, TokenizerConfigFile: string;
+begin
+  inherited Create;
+  FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
+  FNegativePromptEmbeds := TNNetVolume.Create();
+  FGuidanceScale := 7.5;
+  FSampler := smDDIM;
+  IndexFile := FModelFolder + 'model_index.json';
+  TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(IndexFile);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('TStableDiffusionPipeline: ' + IndexFile +
+        ' is not a JSON object.');
+    if TJSONObject(Root).Get('_class_name', '') <> 'StableDiffusionPipeline' then
+      ImportError('TStableDiffusionPipeline: ' + IndexFile + ' names "' +
+        TJSONObject(Root).Get('_class_name', '') +
+        '", not StableDiffusionPipeline.');
+    FreeAndNil(Root);
+    JsonText.LoadFromFile(ComponentFolder('scheduler') +
+      'scheduler_config.json');
+    Root := GetJSON(JsonText.Text);
+    if Root is TJSONObject then
+      FSchedulerClassName := TJSONObject(Root).Get('_class_name', '');
+    FreeAndNil(Root);
+    FTextConfig := ReadClipConfigFromJSONFile(ComponentFolder('text_encoder') +
+      'config.json');
+    FMaxTokenCount := FTextConfig.TextMaxPositions;
+    FPadToken := '<|endoftext|>';
+    if FileExists(TokenizerConfigFile) then
+    begin
+      JsonText.LoadFromFile(TokenizerConfigFile);
+      Root := GetJSON(JsonText.Text);
+      if Root is TJSONObject then
+      begin
+        Obj := TJSONObject(Root);
+        // Some exports store model_max_length as a huge sentinel float.
+        Node := Obj.Find('model_max_length');
+        if (Node is TJSONNumber) and (Node.AsFloat >= 2) and
+          (Node.AsFloat < FMaxTokenCount) then
+          FMaxTokenCount := Round(Node.AsFloat);
+        Node := Obj.Find('pad_token');
+        if Node is TJSONString then FPadToken := Node.AsString
+        else if Node is TJSONObject then
+          FPadToken := TJSONObject(Node).Get('content', FPadToken);
+      end;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+    ComponentFolder('scheduler') + 'scheduler_config.json');
+  FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
+    'config.json');
+  FVaeConfig := ReadVaeDecoderConfigFromJSONFile(ComponentFolder('vae') +
+    'config.json');
+  if FUNetConfig.UseAddEmbedding then
+    ImportError('TStableDiffusionPipeline: the unet uses SDXL ' +
+      'addition_embed_type "text_time"; SDXL is not supported yet.');
+  if (FUNetConfig.InChannels <> FVaeConfig.LatentChannels) or
+    (FUNetConfig.OutChannels <> FVaeConfig.LatentChannels) then
+    ImportError('TStableDiffusionPipeline: unet in/out_channels ' +
+      IntToStr(FUNetConfig.InChannels) + '/' +
+      IntToStr(FUNetConfig.OutChannels) + ' <> vae latent_channels ' +
+      IntToStr(FVaeConfig.LatentChannels) + '.');
+  if FTextConfig.Text.HiddenSize <> FUNetConfig.CrossAttentionDim then
+    ImportError('TStableDiffusionPipeline: text encoder hidden_size ' +
+      IntToStr(FTextConfig.Text.HiddenSize) + ' <> unet cross_attention_dim ' +
+      IntToStr(FUNetConfig.CrossAttentionDim) + '.');
+end;
+
+destructor TStableDiffusionPipeline.Destroy();
+begin
+  FTokenizer.Free;
+  FNegativePromptEmbeds.Free;
+  FScheduler.Free;
+  inherited Destroy;
+end;
+
+function TStableDiffusionPipeline.ComponentFolder(
+  const Component: string): string;
+begin
+  Result := FModelFolder + Component + DirectorySeparator;
+end;
+
+procedure TStableDiffusionPipeline.DoPhase(
+  Phase: TStableDiffusionPipelinePhase);
+begin
+  if Assigned(FOnPhase) then FOnPhase(Phase);
+end;
+
+procedure TStableDiffusionPipeline.PrepareComponent(Net: TNNet);
+begin
+  {$IFDEF OpenCL}
+  if FUseOpenCL then Net.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice);
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+procedure TStableDiffusionPipeline.EnableOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+begin
+  FUseOpenCL := true;
+  FOpenCLPlatform := platform_id;
+  FOpenCLDevice := device_id;
+end;
+{$ENDIF}
+
+function TStableDiffusionPipeline.GetVaeScaleFactor(): integer;
+begin
+  Result := 1 shl (FVaeConfig.NumBlockOut - 1);
+end;
+
+function TStableDiffusionPipeline.GetDefaultImageSize(): integer;
+begin
+  Result := FUNetConfig.LatentGrid * GetVaeScaleFactor();
+end;
+
+function TStableDiffusionPipeline.GetHasNegativePromptEmbeds(): boolean;
+begin
+  Result := FHasNegativePromptEmbeds;
+end;
+
+function TStableDiffusionPipeline.LatentGridFor(Width,
+  Height: integer): integer;
+var
+  SideMultiple: integer;
+begin
+  SideMultiple := GetVaeScaleFactor() * (1 shl (FUNetConfig.NumBlockOut - 1));
+  if Width <> Height then
+    ImportError('TStableDiffusionPipeline: ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ' is not square; the UNet and VAE builders take ' +
+      'one latent grid side.');
+  if (Width < SideMultiple) or (Width mod SideMultiple <> 0) then
+    ImportError('TStableDiffusionPipeline: image side ' + IntToStr(Width) +
+      ' is not a positive multiple of ' + IntToStr(SideMultiple) + '.');
+  Result := Width div GetVaeScaleFactor();
+end;
+
+procedure TStableDiffusionPipeline.SetNegativePrompt(const Value: string);
+begin
+  if Value = FNegativePrompt then exit;
+  FNegativePrompt := Value;
+  FHasNegativePromptEmbeds := false;
+end;
+
+procedure TStableDiffusionPipeline.SetNegativePromptEmbeds(
+  Embeds: TNNetVolume);
+begin
+  FNegativePromptEmbeds.ReSize(Embeds);
+  FNegativePromptEmbeds.Copy(Embeds);
+  FHasNegativePromptEmbeds := true;
+end;
+
+procedure TStableDiffusionPipeline.ClearNegativePrompt();
+begin
+  FNegativePrompt := '';
+  FHasNegativePromptEmbeds := false;
+end;
+
+function TStableDiffusionPipeline.TokenizePrompt(
+  const Prompt: string): TNeuralIntegerArray;
+var
+  Folder: string;
+  TextIds: TNeuralIntegerArray;
+  TextCount, PadId, TokenPos, MaxTokenPos: integer;
+begin
+  if not Assigned(FTokenizer) then
+  begin
+    Folder := ComponentFolder('tokenizer');
+    FTokenizer := TNeuralHFTokenizer.Create();
+    FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
+      Folder + 'merges.txt');
+  end;
+  PadId := FTokenizer.TokenToId(FPadToken);
+  if PadId < 0 then
+    ImportError('TStableDiffusionPipeline: pad token "' + FPadToken +
+      '" is not in tokenizer/vocab.json.');
+  TextIds := FTokenizer.Encode(Prompt);
+  TextCount := Min(Length(TextIds), FMaxTokenCount - 2);
+  SetLength(Result, FMaxTokenCount);
+  Result[0] := FTokenizer.BosId;
+  for TokenPos := 1 to TextCount do Result[TokenPos] := TextIds[TokenPos - 1];
+  Result[TextCount + 1] := FTokenizer.EosId;
+  MaxTokenPos := FMaxTokenCount - 1;
+  for TokenPos := TextCount + 2 to MaxTokenPos do Result[TokenPos] := PadId;
+end;
+
+procedure TStableDiffusionPipeline.EncodeTokenIdLists(
+  const TokenLists: array of TNeuralIntegerArray;
+  const Embeds: array of TNNetVolume);
+var
+  Folder: string;
+  Reader: TNNetSafeTensorsReader;
+  TextNet: TNNet;
+  TokenIds: TNNetVolume;
+  SeqLen, ListPos, MaxListPos, TokenPos, MaxTokenPos: integer;
+begin
+  SeqLen := Length(TokenLists[0]);
+  MaxListPos := High(TokenLists);
+  for ListPos := 0 to MaxListPos do
+    if Length(TokenLists[ListPos]) <> SeqLen then
+      ImportError('TStableDiffusionPipeline: token lists differ in length.');
+  DoPhase(sdphLoadTextEncoder);
+  Folder := ComponentFolder('text_encoder');
+  Reader := CreatePretrainedTensorReader(
+    SafeTensorsFolderWeightsFile(Folder, 'model'));
+  TextNet := nil;
+  TokenIds := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    TextNet := BuildClipTextTower(Reader, FTextConfig, SeqLen, '',
+      {pTrainable=}false);
+    FreeAndNil(Reader);
+    PrepareComponent(TextNet);
+    DoPhase(sdphEncodePrompt);
+    MaxTokenPos := SeqLen - 1;
+    for ListPos := 0 to MaxListPos do
+    begin
+      for TokenPos := 0 to MaxTokenPos do
+        TokenIds.FData[TokenPos] := TokenLists[ListPos][TokenPos];
+      TextNet.Compute(TokenIds);
+      TextNet.GetOutput(Embeds[ListPos]);
+    end;
+  finally
+    TokenIds.Free;
+    TextNet.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.EncodeTokenIds(
+  const TokenIds: array of integer; PromptEmbeds: TNNetVolume);
+var
+  TokenList: TNeuralIntegerArray;
+  TokenPos, MaxTokenPos: integer;
+begin
+  SetLength(TokenList, Length(TokenIds));
+  MaxTokenPos := High(TokenIds);
+  for TokenPos := 0 to MaxTokenPos do TokenList[TokenPos] := TokenIds[TokenPos];
+  EncodeTokenIdLists([TokenList], [PromptEmbeds]);
+end;
+
+procedure TStableDiffusionPipeline.EncodePrompt(const Prompt: string;
+  PromptEmbeds: TNNetVolume);
+begin
+  EncodeTokenIdLists([TokenizePrompt(Prompt)], [PromptEmbeds]);
+end;
+
+procedure TStableDiffusionPipeline.MakeInitialLatents(Width, Height: integer;
+  Seed: cardinal; Latents: TNNetVolume);
+var
+  Grid: integer;
+  SavedSeed: cardinal;
+begin
+  Grid := LatentGridFor(Width, Height);
+  Latents.ReSize(Grid, Grid, FUNetConfig.InChannels);
+  SavedSeed := RandSeed;
+  RandSeed := Seed;
+  Latents.RandomizeGaussian(1.0);
+  RandSeed := SavedSeed;
+end;
+
+procedure TStableDiffusionPipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
+  Height, StepCount: integer; Latents: TNNetVolume);
+var
+  StepConfig: TSDUNetConfig;
+  Net: TNNet;
+  Schedule: TNeuralIntegerArray;
+  Pred, PredUncond: TNNetVolume;
+  IsGuided: boolean;
+  Grid, StepPos, MaxStepPos, Tt: integer;
+begin
+  Grid := LatentGridFor(Width, Height);
+  if (Latents.SizeX <> Grid) or (Latents.SizeY <> Grid) or
+    (Latents.Depth <> FUNetConfig.InChannels) then
+    ImportError('TStableDiffusionPipeline.Denoise: latents ' +
+      IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
+      IntToStr(Latents.Depth) + ' do not match a ' + IntToStr(Width) +
+      'x' + IntToStr(Height) + ' image.');
+  IsGuided := FGuidanceScale > 1;
+  if IsGuided and not FHasNegativePromptEmbeds then
+  begin
+    EncodeTokenIdLists([TokenizePrompt(FNegativePrompt)],
+      [FNegativePromptEmbeds]);
+    FHasNegativePromptEmbeds := true;
+  end;
+  if IsGuided and (FNegativePromptEmbeds.SizeX <> PromptEmbeds.SizeX) then
+    ImportError('TStableDiffusionPipeline.Denoise: the negative embeds hold ' +
+      IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
+      IntToStr(PromptEmbeds.SizeX) + '.');
+  StepConfig := FUNetConfig;
+  StepConfig.LatentGrid := Grid;
+  StepConfig.TextSeqLen := PromptEmbeds.SizeX;
+  DoPhase(sdphLoadUNet);
+  Net := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('unet'), 'diffusion_pytorch_model'), StepConfig,
+    {pTrainable=}false);
+  Pred := TNNetVolume.Create();
+  PredUncond := TNNetVolume.Create();
+  try
+    PrepareComponent(Net);
+    DoPhase(sdphDenoise);
+    Schedule := FScheduler.BuildTimestepSchedule(StepCount,
+      FScheduler.ConfigSpacing);
+    FScheduler.ResetMultistep;
+    MaxStepPos := Length(Schedule) - 2;
+    for StepPos := 0 to MaxStepPos do
+    begin
+      // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
+      Tt := Schedule[StepPos];
+      SDUNetDenoise(Net, StepConfig, Latents, PromptEmbeds, Tt - 1, Pred);
+      if IsGuided then
+      begin
+        SDUNetDenoise(Net, StepConfig, Latents, FNegativePromptEmbeds, Tt - 1,
+          PredUncond);
+        TNNetDiffusionScheduler.ApplyCFG(Pred, PredUncond, Pred,
+          FGuidanceScale);
+      end;
+      FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, 0.0);
+      if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Tt - 1, Latents);
+    end;
+  finally
+    PredUncond.Free;
+    Pred.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.DecodeLatents(Latents: TNNetVolume; Width,
+  Height: integer; Image: TNNetVolume);
+var
+  DecoderConfig: TVaeDecoderConfig;
+  Net: TNNet;
+begin
+  DecoderConfig := FVaeConfig;
+  DecoderConfig.LatentGrid := LatentGridFor(Width, Height);
+  DoPhase(sdphLoadVae);
+  Net := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
+    {pTrainable=}false);
+  try
+    PrepareComponent(Net);
+    DoPhase(sdphDecode);
+    // The decoder applies 1/scaling_factor; diffusers postprocess is
+    // (x / 2 + 0.5) clamped to [0, 1].
+    Net.Compute(Latents);
+    Net.GetOutput(Image);
+    TNNetVolume.ClampAbs(Image.DataPtr, 1.0, Image.Size);
+    Image.Mul(0.5);
+    Image.Add(0.5);
+  finally
+    Net.Free;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.GenerateFromEmbeds(
+  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  Seed: cardinal; Image: TNNetVolume; InitialLatents: TNNetVolume);
+var
+  Latents: TNNetVolume;
+begin
+  Latents := TNNetVolume.Create();
+  try
+    if Assigned(InitialLatents) then
+    begin
+      Latents.ReSize(InitialLatents);
+      Latents.Copy(InitialLatents);
+    end
+    else MakeInitialLatents(Width, Height, Seed, Latents);
+    Denoise(PromptEmbeds, Width, Height, StepCount, Latents);
+    DecodeLatents(Latents, Width, Height, Image);
+    DoPhase(sdphDone);
+  finally
+    Latents.Free;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.Generate(const Prompt: string; Width,
+  Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume);
+var
+  PromptEmbeds: TNNetVolume;
+begin
+  PromptEmbeds := TNNetVolume.Create();
+  try
+    if (FGuidanceScale > 1) and not FHasNegativePromptEmbeds then
+    begin
+      EncodeTokenIdLists([TokenizePrompt(Prompt),
+        TokenizePrompt(FNegativePrompt)], [PromptEmbeds, FNegativePromptEmbeds]);
+      FHasNegativePromptEmbeds := true;
+    end
+    else EncodePrompt(Prompt, PromptEmbeds);
+    GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed, Image);
+  finally
+    PromptEmbeds.Free;
   end;
 end;
 
