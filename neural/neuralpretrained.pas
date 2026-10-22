@@ -14797,8 +14797,8 @@ function StyleGAN2ConfigToString(const Config: TStyleGAN2Config): string;
 
 // Builds the StyleGAN2 generator described by Config and loads every weight from
 // Reader (caller owns Reader). The only fed input is layer 0 = latent z
-// (LatentDim,1,1); the learned constant and the noise maps are pre-filled
-// TNNetInput layers. Each modulated conv adds noise_strength * noise, where the
+// (LatentDim,1,1); the learned constant and the stored noise maps are
+// TNNetCellBias weights. Each modulated conv adds noise_strength * noise, where the
 // noise is one of (per NoiseMode):
 //   snmConst  - the stored "noise" tensor: a (size,size) map ([1,1,H,W], the
 //               real-checkpoint layout) broadcast over depth, or a full-depth
@@ -14821,6 +14821,86 @@ function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
   out Config: TStyleGAN2Config; pTrainable: boolean = true;
   const ConfigFileName: string = '';
   NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+
+// ---------------------------------------------------------------------------
+// GFPGAN BLIND FACE RESTORATION IMPORT (Wang et al., CVPR 2021, arXiv:2101.04061;
+// TencentARC/GFPGAN gfpgan/archs/gfpganv1_clean_arch.py "GFPGANv1Clean", the
+// v1.3 / v1.4 checkpoints). Input: an ALIGNED, CROPPED face (OutSize, OutSize, 3)
+// in [-1,1]; output: the restored face at the same size in [-1,1] (unclamped).
+//   - U-Net degradation-removal encoder: 1x1 conv, ResBlocks (3x3 conv ->
+//     bilinear 0.5x (= 2x2 average) -> 3x3 conv, plus a 1x1 skip) down to 4x4,
+//     3x3 final conv; final_linear maps the 4x4 features to the style latents.
+//   - U-Net decoder: ResBlocks with bilinear 2x upsampling add the encoder skips;
+//     each level emits a CS-SFT scale and shift (two 3x3 conv -> LeakyReLU ->
+//     3x3 conv branches).
+//   - StyleGAN2-clean decoder: learned 4x4 constant, TNNetModulatedConv2D (gain
+//     sqrt(2), bilinear upsample before the conv) + noise (the StyleGAN2 noise
+//     branch) + bias + LeakyReLU, toRGB 1x1 modulated convs summed into an
+//     upsampled RGB skip. After each level's first conv the SFT applies
+//     x*scale+shift to the second half of the channels (sft_half) or to all.
+// The style MLP is not built: v1.3/v1.4 feed the latents directly
+// (input_is_latent=True). Face detection and alignment are not part of the net.
+// Coded by Claude (AI).
+type
+  TGFPGANConfig = record
+    OutSize: integer;             // face resolution, a power of two >= 8 (512)
+    NumStyleFeat: integer;        // style latent width (512)
+    ChannelMultiplier: double;    // StyleGAN2 channel multiplier (2)
+    Narrow: double;               // channel narrow ratio (1)
+    NumMlp: integer;              // style MLP depth (8, present but unused)
+    InputIsLatent: boolean;       // final_linear output is already w (true)
+    DifferentW: boolean;          // one latent per decoder layer (true)
+    SftHalf: boolean;             // SFT on the second half of the channels (true)
+  end;
+
+// The GFPGANv1Clean arguments of the v1.3 / v1.4 releases (GFPGANer).
+function DefaultGFPGANConfig(): TGFPGANConfig;
+
+// Reads a GFPGAN config.json (out_size, num_style_feat, channel_multiplier,
+// narrow, num_mlp, input_is_latent, different_w, sft_half); missing = default.
+function ReadGFPGANConfigFromJSONFile(const FileName: string): TGFPGANConfig;
+
+// Overwrites the shape-determined fields of Config (out_size, num_style_feat,
+// narrow, channel_multiplier, num_mlp, different_w, sft_half) from Reader.
+procedure InferGFPGANConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TGFPGANConfig);
+
+function GFPGANConfigToString(const Config: TGFPGANConfig): string;
+
+// Channel count at Resolution of the StyleGAN2 decoder, or of the U-Net when
+// IsUNet (the arch's channels table, U-Net at half narrow).
+function GFPGANChannels(const Config: TGFPGANConfig; Resolution: integer;
+  IsUNet: boolean): integer;
+
+// Builds GFPGANv1Clean and loads every weight from Reader (caller owns Reader).
+// NoiseMode as in BuildStyleGAN2Generator: GFPGANer itself uses random noise.
+function BuildGFPGAN(Reader: TNNetSafeTensorsReader;
+  const Config: TGFPGANConfig; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+
+// Same from a .pth ({'params_ema': ...} unwrapped) / .bin / .safetensors file.
+function BuildGFPGANFromSafeTensorsEx(const FileName: string;
+  const Config: TGFPGANConfig; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+
+// Config from ConfigFileName (default: config.json beside FileName, else the
+// v1.4 defaults), shape fields from the checkpoint.
+function BuildGFPGANFromSafeTensors(const FileName: string;
+  out Config: TGFPGANConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = '';
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+
+// Face (W, H, 3) RGB 0..255 -> NetInput (OutSize, OutSize, 3) in [-1,1]
+// (bilinear resize, as cv2.resize does for an already aligned face).
+procedure GFPGANPrepareInput(Face: TNNetVolume; const Config: TGFPGANConfig;
+  NetInput: TNNetVolume);
+
+// Net output in [-1,1] -> Restored RGB 0..255 (clamped, as tensor2img does).
+procedure GFPGANComposeOutput(NetOutput, Restored: TNNetVolume);
+
+// GFPGANPrepareInput -> NN.Compute -> GFPGANComposeOutput (OutSize x OutSize).
+procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
+  Face, Restored: TNNetVolume);
 
 // ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
@@ -84012,8 +84092,8 @@ begin
   end;
 end;
 
-// Loads a Conv2d [out,in,K,K] kernel + optional [out] bias into a
-// TNNetModulatedConv2D (kernel -> per-output neuron, bias -> FNeurons[OutCh]).
+// Loads a Conv2d [out,in,K,K] (or the clean arch's [1,out,in,K,K]) kernel +
+// optional [out] bias into a TNNetModulatedConv2D (bias -> FNeurons[OutCh]).
 procedure LoadStyleGAN2ModConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetModulatedConv2D; const WName, BName: string;
   OutCh, InCh, K: integer);
@@ -84021,16 +84101,18 @@ var
   W, B: TNNetVolume;
   o, c, ky, kx, OutChM1, InChM1, KM1: integer;
   DstW, BiasW: TNNetVolume;
-  KSq, InChKSq, oBase, kyBase, DstBase, SrcIdx: integer;
+  KSq, InChKSq, oBase, kyBase, DstBase, SrcIdx, DimShift: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('StyleGAN2 import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 4) or
-     (Reader.DimSize(WName, 0) <> OutCh) or
-     (Reader.DimSize(WName, 1) <> InCh) or
-     (Reader.DimSize(WName, 2) <> K) or
-     (Reader.DimSize(WName, 3) <> K) then
+  DimShift := Reader.DimCount(WName) - 4;
+  if (DimShift < 0) or (DimShift > 1) or
+     ((DimShift = 1) and (Reader.DimSize(WName, 0) <> 1)) or
+     (Reader.DimSize(WName, DimShift) <> OutCh) or
+     (Reader.DimSize(WName, DimShift + 1) <> InCh) or
+     (Reader.DimSize(WName, DimShift + 2) <> K) or
+     (Reader.DimSize(WName, DimShift + 3) <> K) then
     ImportError('StyleGAN2 import: "' + WName + '" must have shape [' +
       IntToStr(OutCh) + ',' + IntToStr(InCh) + ',' + IntToStr(K) + ',' +
       IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
@@ -84090,6 +84172,133 @@ begin
   end;
 end;
 
+// Copies a flat torch [C,H,W] tensor Src into Dest (W,H,C) of the same size.
+procedure LoadTorchCHWIntoVolume(Src, Dest: TNNetVolume);
+var
+  Planar: TNNetVolume;
+begin
+  if Dest.Depth = 1 then
+    Move(Src.FData[0], Dest.FData[0], Dest.Size * csNeuralFloatSize)
+  else
+  begin
+    Planar := TNNetVolume.Create();
+    try
+      Planar.InterleaveWithDepthFrom(Src, Dest.Depth);
+      Move(Planar.FData[0], Dest.FData[0], Dest.Size * csNeuralFloatSize);
+    finally
+      Planar.Free;
+    end;
+  end;
+end;
+
+// Depth of the noise map stored as MapName: 1 (a [size,size] map broadcast over
+// the Channels) or Channels (a full-depth [Channels,size,size] map).
+function StyleGAN2NoiseMapDepth(Reader: TNNetSafeTensorsReader;
+  const MapName: string; Size, Channels: integer): integer;
+var
+  NoiseElements: Int64;
+begin
+  if not Reader.HasTensor(MapName) then
+    ImportError('StyleGAN2 import: missing "' + MapName + '".');
+  NoiseElements := Reader.ElementCount(MapName);
+  if NoiseElements = Int64(Channels) * Size * Size then Result := Channels
+  else if NoiseElements = Int64(Size) * Size then Result := 1
+  else
+  begin
+    Result := 1;
+    ImportError('StyleGAN2 import: "' + MapName + '" must hold ' +
+      IntToStr(Size * Size) + ' (broadcast) or ' +
+      IntToStr(Channels * Size * Size) + ' (full-depth) elements, got ' +
+      Reader.ShapeAsString(MapName));
+  end;
+end;
+
+// A learned (SizeX, SizeY, Depth) constant: a zero TNNetInput plus a
+// TNNetCellBias holding the values, so SaveToString keeps them.
+function AddLearnedConstant(NN: TNNet; SizeX, SizeY, Depth: integer): TNNetLayer;
+begin
+  Result := NN.AddLayerAfter(TNNetCellBias.Create(),
+    NN.AddLayerAfter(TNNetInput.Create(SizeX, SizeY, Depth, 1), 0));
+end;
+
+// Loads the torch [C,H,W] (or [1,C,H,W]) tensor TensorName into an
+// AddLearnedConstant layer.
+procedure LoadLearnedConstant(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const TensorName: string);
+var
+  Values: TNNetVolume;
+begin
+  if not Reader.HasTensor(TensorName) then
+    ImportError('Import: missing tensor "' + TensorName + '".');
+  EnsureWritableImportWeights(Layer);
+  Values := TNNetVolume.Create();
+  try
+    Reader.LoadTensorFlat(TensorName, Values);
+    if Values.Size <> Layer.Output.Size then
+      ImportError('Import: "' + TensorName + '" holds ' +
+        IntToStr(Values.Size) + ' elements, expected ' +
+        IntToStr(Layer.Output.Size) + '.');
+    LoadTorchCHWIntoVolume(Values, Layer.Neurons[0].Weights);
+  finally
+    Values.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Appends noise map (snmConst: AddLearnedConstant; snmRandom: N(0,1) per forward)
+// -> TNNetReZero strength -> [replicate over depth] -> Sum into Feat.
+function AddStyleGAN2NoiseInjection(NN: TNNet; Feat: TNNetLayer;
+  Size, Channels, NoiseDepth: integer; NoiseMode: TStyleGAN2NoiseMode;
+  out NoiseMap, NoiseScale: TNNetLayer): TNNetLayer;
+var
+  NoiseBranch: TNNetLayer;
+begin
+  NoiseMap := nil;
+  NoiseScale := nil;
+  Result := Feat;
+  if NoiseMode = snmNone then exit;
+  if NoiseMode = snmConst then
+  begin
+    NoiseMap := AddLearnedConstant(NN, Size, Size, NoiseDepth);
+    NoiseBranch := NoiseMap;
+  end
+  else
+  begin
+    NoiseMap := NN.AddLayerAfter(TNNetInput.Create(Size, Size, NoiseDepth, 1), 0);
+    NoiseBranch := NN.AddLayerAfter(TNNetGaussianNoise.Create(1.0), NoiseMap);
+  end;
+  NoiseScale := NN.AddLayerAfter(TNNetReZero.Create(), NoiseBranch);
+  NoiseBranch := NoiseScale;
+  if NoiseDepth < Channels then
+    NoiseBranch := NN.AddLayerAfter(
+      TNNetDeepConcat.Replicate(Channels, NoiseBranch), NoiseBranch);
+  Result := NN.AddLayerAfter(TNNetSum.Create([Feat, NoiseBranch]), Feat);
+end;
+
+// Loads the scalar strength StrengthName into NoiseScale and, under snmConst,
+// the map MapName (HW, or CHW -> HWC) into NoiseMap. No-op under snmNone.
+procedure LoadStyleGAN2NoiseInjection(Reader: TNNetSafeTensorsReader;
+  NoiseMap, NoiseScale: TNNetLayer; const StrengthName, MapName: string;
+  NoiseMode: TStyleGAN2NoiseMode);
+var
+  NoiseW: TNNetVolume;
+begin
+  if NoiseMode = snmNone then exit;
+  if not Reader.HasTensor(StrengthName) then
+    ImportError('StyleGAN2 import: missing "' + StrengthName + '".');
+  NoiseW := TNNetVolume.Create();
+  try
+    Reader.LoadTensorFlat(StrengthName, NoiseW);
+    EnsureWritableImportWeights(NoiseScale);
+    NoiseScale.FArrNeurons[0].Weights.FData[0] := NoiseW.FData[0];
+    NoiseScale.FlushWeightCache();
+  finally
+    NoiseW.Free;
+  end;
+  // snmRandom: the zero TNNetInput is the TNNetGaussianNoise base.
+  if NoiseMode = snmConst then LoadLearnedConstant(Reader, NoiseMap, MapName);
+end;
+
 function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
   const Config: TStyleGAN2Config; pTrainable: boolean = true;
   NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
@@ -84107,61 +84316,23 @@ var
   ToRGBAffine: array of TNNetLayer;
   ToRGBConv: array of TNNetModulatedConv2D;
   Convs: array of array of TConvRefs;  // [block][convIdx]
-  ConstW, NoiseW: TNNetVolume;
-  b, c, l, nConv, size, ch, lat, gridSize, noiseIdx: integer;
-  MappingLayersM1, NumBlocksM1, chM1, gridSizeM1, nConvM1, SizeSqM1: integer;
-  ConvsBM1, SizeSq, DstIdx, SrcIdx: integer;
-  TgtVol: TNNetVolume;
+  b, c, l, nConv, size, ch, lat: integer;
+  MappingLayersM1, NumBlocksM1, nConvM1, ConvsBM1: integer;
   pfx: string;
-
-  // Depth of the noise map a conv pass injects: 1 (broadcast over the ch
-  // channels) unless snmConst finds a full-depth [ch,size,size] tensor.
-  function NoiseMapDepth(const Prefix: string): integer;
-  var
-    NoiseElements: Int64;
-  begin
-    Result := 1;
-    if NoiseMode <> snmConst then exit;
-    if not Reader.HasTensor(Prefix + 'noise') then
-      ImportError('StyleGAN2 import: missing "' + Prefix + 'noise".');
-    NoiseElements := Reader.ElementCount(Prefix + 'noise');
-    if NoiseElements = Int64(ch) * size * size then Result := ch
-    else if NoiseElements <> Int64(size) * size then
-      ImportError('StyleGAN2 import: "' + Prefix + 'noise" must hold ' +
-        IntToStr(size * size) + ' (broadcast) or ' + IntToStr(ch * size * size) +
-        ' (full-depth) elements, got ' + Reader.ShapeAsString(Prefix + 'noise'));
-  end;
 
   function AddConvPass(const Prefix: string): TConvRefs;
   var
-    NoiseBranch: TNNetLayer;
     NoiseDepth: integer;
   begin
     Result.Affine := NN.AddLayerAfter(
       TNNetFullConnectLinear.Create(ch).SetTrainable(pTrainable), WLatent);
     Result.ModConv := TNNetModulatedConv2D.Create(ch, 3, 0, 1, Result.Affine);
     NN.AddLayerAfter(Result.ModConv, Feat);
-    Feat := Result.ModConv;
-    Result.Noise := nil;
-    Result.NoiseScale := nil;
-    if NoiseMode <> snmNone then
-    begin
-      // noise map -> [fresh N(0,1)] -> learned scalar strength (TNNetReZero) ->
-      // [replicate over depth] -> Sum into the conv output.
-      NoiseDepth := NoiseMapDepth(Prefix);
-      Result.Noise := NN.AddLayerAfter(
-        TNNetInput.Create(size, size, NoiseDepth, 1), 0);
-      NoiseBranch := Result.Noise;
-      if NoiseMode = snmRandom then
-        NoiseBranch := NN.AddLayerAfter(TNNetGaussianNoise.Create(1.0),
-          NoiseBranch);
-      Result.NoiseScale := NN.AddLayerAfter(TNNetReZero.Create(), NoiseBranch);
-      NoiseBranch := Result.NoiseScale;
-      if NoiseDepth < ch then
-        NoiseBranch := NN.AddLayerAfter(
-          TNNetDeepConcat.Replicate(ch, NoiseBranch), NoiseBranch);
-      Feat := NN.AddLayerAfter(TNNetSum.Create([Feat, NoiseBranch]), Feat);
-    end;
+    NoiseDepth := 1;
+    if NoiseMode = snmConst then
+      NoiseDepth := StyleGAN2NoiseMapDepth(Reader, Prefix + 'noise', size, ch);
+    Feat := AddStyleGAN2NoiseInjection(NN, Result.ModConv, size, ch,
+      NoiseDepth, NoiseMode, Result.Noise, Result.NoiseScale);
     Feat := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2), Feat);
   end;
 
@@ -84178,19 +84349,15 @@ begin
   ch := Config.Channels;
   MappingLayersM1 := Config.MappingLayers - 1;
   NumBlocksM1 := Config.NumBlocks - 1;
-  chM1 := ch - 1;
   NN := TNNet.Create();
   SetLength(MapFC, Config.MappingLayers);
   SetLength(ToRGBAffine, Config.NumBlocks);
   SetLength(ToRGBConv, Config.NumBlocks);
   SetLength(Convs, Config.NumBlocks);
-  ConstW := TNNetVolume.Create();
-  NoiseW := TNNetVolume.Create();
   try
-    // -------- Inputs: [0]=z latent, [1]=learned constant --------
+    // -------- Inputs: [0]=z latent, then the learned constant --------
     NN.AddLayer( TNNetInput.Create(lat, 1, 1, 1) );          // layer 0 = z
-    ConstInput := NN.AddLayerAfter(
-      TNNetInput.Create(Config.StartSize, Config.StartSize, ch, 1), 0); // const
+    ConstInput := AddLearnedConstant(NN, Config.StartSize, Config.StartSize, ch);
     // -------- Mapping network: z -> w --------
     WLatent := NN.Layers[0];
     for l := 0 to MappingLayersM1 do
@@ -84233,35 +84400,10 @@ begin
       LoadStyleGAN2Linear(Reader, MapFC[l],
         'mapping.' + IntToStr(l) + '.weight', 'mapping.' + IntToStr(l) + '.bias',
         lat, lat);
-    // Learned constant (stored CHW [ch,start,start]) -> ConstInput.Output.
-    if not Reader.HasTensor('const') then
-      ImportError('StyleGAN2 import: missing tensor "const".');
-    Reader.LoadTensorFlat('const', ConstW);
-    if ConstW.Size <> ch * Config.StartSize * Config.StartSize then
-      ImportError('StyleGAN2 import: "const" size mismatch.');
-    gridSize := Config.StartSize * Config.StartSize;
-    gridSizeM1 := gridSize - 1;
-    // CHW -> HWC: one contiguous source run per channel, landing on a
-    // destination stepped by ch.
-    TgtVol := ConstInput.Output;
-    SrcIdx := 0;                             // c * gridSize
-    for c := 0 to chM1 do
-    begin
-      DstIdx := c;
-      for l := 0 to gridSizeM1 do
-      begin
-        TgtVol.FData[DstIdx] := ConstW.FData[SrcIdx + l];
-        Inc(DstIdx, ch);
-      end;
-      Inc(SrcIdx, gridSize);
-    end;
+    LoadLearnedConstant(Reader, ConstInput, 'const');
 
-    noiseIdx := 0;
     for b := 0 to NumBlocksM1 do
     begin
-      size := Config.StartSize shl b;
-      SizeSq := size * size;
-      SizeSqM1 := SizeSq - 1;
       ConvsBM1 := Length(Convs[b]) - 1;
       for c := 0 to ConvsBM1 do
       begin
@@ -84270,40 +84412,9 @@ begin
           pfx + 'affine.bias', ch, lat);
         LoadStyleGAN2ModConv(Reader, Convs[b][c].ModConv, pfx + 'weight',
           pfx + 'bias', ch, ch, 3);
-        if NoiseMode = snmNone then continue;
-        // noise_strength scalar -> ReZero alpha (FNeurons[0].Weights[0]).
-        if not Reader.HasTensor(pfx + 'noise_strength') then
-          ImportError('StyleGAN2 import: missing "' + pfx + 'noise_strength".');
-        Reader.LoadTensorFlat(pfx + 'noise_strength', NoiseW);
-        EnsureWritableImportWeights(Convs[b][c].NoiseScale);
-        Convs[b][c].NoiseScale.FArrNeurons[0].Weights.FData[0] := NoiseW.FData[0];
-        Convs[b][c].NoiseScale.FlushWeightCache();
-        TgtVol := Convs[b][c].Noise.Output;
-        // snmRandom: the zero map is the TNNetGaussianNoise base.
-        if NoiseMode = snmRandom then
-        begin
-          TgtVol.Fill(0);
-          continue;
-        end;
-        // Fixed per-pixel noise map (NoiseMapDepth checked its size).
-        Reader.LoadTensorFlat(pfx + 'noise', NoiseW);
-        if TgtVol.Depth = 1 then
-          Move(NoiseW.FData[0], TgtVol.FData[0], SizeSq * csNeuralFloatSize)
-        else
-        begin
-          // CHW -> HWC, same carried-index shape as the learned constant above.
-          SrcIdx := 0;                         // l * SizeSq
-          for l := 0 to chM1 do
-          begin
-            DstIdx := l;
-            for noiseIdx := 0 to SizeSqM1 do
-            begin
-              TgtVol.FData[DstIdx] := NoiseW.FData[SrcIdx + noiseIdx];
-              Inc(DstIdx, ch);
-            end;
-            Inc(SrcIdx, SizeSq);
-          end;
-        end;
+        LoadStyleGAN2NoiseInjection(Reader, Convs[b][c].Noise,
+          Convs[b][c].NoiseScale, pfx + 'noise_strength', pfx + 'noise',
+          NoiseMode);
       end;
       pfx := 'block.' + IntToStr(b) + '.torgb.';
       LoadStyleGAN2Linear(Reader, ToRGBAffine[b], pfx + 'affine.weight',
@@ -84316,8 +84427,6 @@ begin
     NN.Free;
     raise;
   end;
-  ConstW.Free;
-  NoiseW.Free;
 end;
 
 function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
@@ -84346,6 +84455,510 @@ begin
   Config := ReadStyleGAN2ConfigFromJSONFile(ConfigPath);
   Result := BuildStyleGAN2GeneratorFromSafeTensorsEx(FileName, Config,
     pTrainable, NoiseMode);
+end;
+
+// ===========================================================================
+// GFPGAN BLIND FACE RESTORATION IMPORT (GFPGANv1Clean)
+// ===========================================================================
+
+const
+  csGFPGANImporter = 'GFPGAN import';
+  csGFPGANDecoder = 'stylegan_decoder.';
+
+function DefaultGFPGANConfig(): TGFPGANConfig;
+begin
+  Result.OutSize := 512;
+  Result.NumStyleFeat := 512;
+  Result.ChannelMultiplier := 2;
+  Result.Narrow := 1;
+  Result.NumMlp := 8;
+  Result.InputIsLatent := true;
+  Result.DifferentW := true;
+  Result.SftHalf := true;
+end;
+
+function ReadGFPGANConfigFromJSONFile(const FileName: string): TGFPGANConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError(csGFPGANImporter + ': config file not found: ' + FileName);
+  Result := DefaultGFPGANConfig();
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csGFPGANImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csGFPGANImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.OutSize := Obj.Get('out_size', Result.OutSize);
+    Result.NumStyleFeat := Obj.Get('num_style_feat', Result.NumStyleFeat);
+    Result.ChannelMultiplier := Obj.Get('channel_multiplier',
+      Result.ChannelMultiplier);
+    Result.Narrow := Obj.Get('narrow', Result.Narrow);
+    Result.NumMlp := Obj.Get('num_mlp', Result.NumMlp);
+    Result.InputIsLatent := Obj.Get('input_is_latent', Result.InputIsLatent);
+    Result.DifferentW := Obj.Get('different_w', Result.DifferentW);
+    Result.SftHalf := Obj.Get('sft_half', Result.SftHalf);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GFPGANChannels(const Config: TGFPGANConfig; Resolution: integer;
+  IsUNet: boolean): integer;
+var
+  Width, Ratio: double;
+begin
+  Ratio := Config.Narrow;
+  if IsUNet then Ratio := Ratio * 0.5;
+  case Resolution of
+    4, 8, 16, 32: Width := 512;
+    64: Width := 256 * Config.ChannelMultiplier;
+    128: Width := 128 * Config.ChannelMultiplier;
+    256: Width := 64 * Config.ChannelMultiplier;
+    512: Width := 32 * Config.ChannelMultiplier;
+    1024: Width := 16 * Config.ChannelMultiplier;
+  else
+    begin
+      Width := 0;
+      ImportError(csGFPGANImporter + ': unsupported resolution ' +
+        IntToStr(Resolution) + ' (4..1024, powers of two).');
+    end;
+  end;
+  // Python int() truncation; the epsilon absorbs a narrow read back as ch/512.
+  Result := Trunc(Width * Ratio + 1e-6);
+end;
+
+// log2 of a power-of-two OutSize >= 8 (the arch's log_size).
+function GFPGANLogSize(const Config: TGFPGANConfig): integer;
+begin
+  if (Config.OutSize < 8) or (Config.OutSize > 1024) or
+     ((Config.OutSize and (Config.OutSize - 1)) <> 0) then
+    ImportError(csGFPGANImporter + ': out_size must be a power of two in ' +
+      '8..1024, got ' + IntToStr(Config.OutSize) + '.');
+  Result := 0;
+  while (1 shl Result) < Config.OutSize do Inc(Result);
+end;
+
+procedure InferGFPGANConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TGFPGANConfig);
+var
+  LevelCnt, LatentCnt, MlpPos: integer;
+  Decoder4, Decoder64, UNetTop, LinearOut: integer;
+begin
+  if not Reader.HasTensor('conv_body_first.weight') then
+    ImportError(csGFPGANImporter + ': "conv_body_first.weight" not found in ' +
+      Reader.FileName + ' - not a GFPGANv1Clean checkpoint?');
+  LevelCnt := 0;
+  while Reader.HasTensor('conv_body_down.' + IntToStr(LevelCnt) +
+    '.conv1.weight') do Inc(LevelCnt);
+  if LevelCnt < 1 then
+    ImportError(csGFPGANImporter + ': no conv_body_down blocks found.');
+  Config.OutSize := 4 shl LevelCnt;
+  Config.NumStyleFeat := Reader.DimSize(csGFPGANDecoder +
+    'style_conv1.modulated_conv.modulation.weight', 1);
+  Decoder4 := Reader.DimSize(csGFPGANDecoder + 'constant_input.weight', 1);
+  Config.Narrow := Decoder4 / 512;
+  // style_convs.6 is the first conv at 64x64 (levels start at 8x8, 2 per level).
+  if LevelCnt >= 4 then
+  begin
+    Decoder64 := Reader.DimSize(csGFPGANDecoder +
+      'style_convs.6.modulated_conv.weight', 1);
+    Config.ChannelMultiplier := Decoder64 / (256 * Config.Narrow);
+  end;
+  LatentCnt := 2 * (LevelCnt + 2) - 2;
+  LinearOut := Reader.DimSize('final_linear.weight', 0);
+  if LinearOut = LatentCnt * Config.NumStyleFeat then Config.DifferentW := true
+  else if LinearOut = Config.NumStyleFeat then Config.DifferentW := false
+  else
+    ImportError(csGFPGANImporter + ': final_linear.weight has ' +
+      IntToStr(LinearOut) + ' outputs, expected ' +
+      IntToStr(Config.NumStyleFeat) + ' or ' +
+      IntToStr(LatentCnt * Config.NumStyleFeat) + '.');
+  UNetTop := Reader.DimSize('condition_scale.0.0.weight', 0);
+  Config.SftHalf := Reader.DimSize('condition_scale.0.2.weight', 0) = UNetTop;
+  MlpPos := 0;
+  while Reader.HasTensor(csGFPGANDecoder + 'style_mlp.' +
+    IntToStr(2 * MlpPos + 1) + '.weight') do Inc(MlpPos);
+  Config.NumMlp := MlpPos;
+end;
+
+function GFPGANConfigToString(const Config: TGFPGANConfig): string;
+begin
+  Result := 'gfpgan config: out_size=' + IntToStr(Config.OutSize) +
+    ', num_style_feat=' + IntToStr(Config.NumStyleFeat) +
+    ', channel_multiplier=' + FloatToStr(Config.ChannelMultiplier) +
+    ', narrow=' + FloatToStr(Config.Narrow) +
+    ', num_mlp=' + IntToStr(Config.NumMlp) +
+    ', input_is_latent=' + BoolToStr(Config.InputIsLatent, true) +
+    ', different_w=' + BoolToStr(Config.DifferentW, true) +
+    ', sft_half=' + BoolToStr(Config.SftHalf, true);
+end;
+
+// Loads torch Prefix.weight ([OutCh,InCh,K,K], or a Linear [OutCh,InCh*K*K] over
+// a CHW-flattened KxK input) and Prefix.bias (when HasBias) into a CAI conv/FC.
+procedure LoadGFPGANConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix: string; OutCh, InCh, K: integer; HasBias: boolean);
+var
+  W, Bias: TNNetVolume;
+  WName: string;
+  IsConvShape, IsLinearShape: boolean;
+begin
+  WName := Prefix + '.weight';
+  if not Reader.HasTensor(WName) then
+    ImportError(csGFPGANImporter + ': missing tensor "' + WName + '".');
+  IsConvShape := (Reader.DimCount(WName) = 4) and
+    (Reader.DimSize(WName, 0) = OutCh) and (Reader.DimSize(WName, 1) = InCh) and
+    (Reader.DimSize(WName, 2) = K) and (Reader.DimSize(WName, 3) = K);
+  IsLinearShape := (Reader.DimCount(WName) = 2) and
+    (Reader.DimSize(WName, 0) = OutCh) and
+    (Reader.DimSize(WName, 1) = InCh * K * K);
+  if not (IsConvShape or IsLinearShape) then
+    ImportError(csGFPGANImporter + ': "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  Bias := nil;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if HasBias then
+    begin
+      Bias := TNNetVolume.Create;
+      if not Reader.HasTensor(Prefix + '.bias') then
+        ImportError(csGFPGANImporter + ': missing tensor "' + Prefix +
+          '.bias".');
+      Reader.LoadTensorFlat(Prefix + '.bias', Bias);
+      if Bias.Size <> OutCh then
+        ImportError(csGFPGANImporter + ': "' + Prefix + '.bias" must have ' +
+          IntToStr(OutCh) + ' elements.');
+    end;
+    WriteTorchConvWeights(Layer, W, Bias, nil, nil, OutCh, InCh, K);
+  finally
+    Bias.Free;
+    W.Free;
+  end;
+end;
+
+function BuildGFPGAN(Reader: TNNetSafeTensorsReader;
+  const Config: TGFPGANConfig; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+var
+  NN: TNNet;
+  Feat, StyleCode, Skip, SameHalf, SftHalfLayer: TNNetLayer;
+  DownOutputs, Scales, Shifts: array of TNNetLayer;
+  LevelCnt, MaxLevelPos, LevelPos, Resolution, InCh, OutCh, SftCh: integer;
+  LatentCnt, LatentPos, HalfCh: integer;
+
+  function AddConv(Src: TNNetLayer; const Prefix: string;
+    pOutCh, pInCh, K: integer; HasBias: boolean): TNNetLayer;
+  var
+    SuppressBias: integer;
+  begin
+    if HasBias then SuppressBias := 0 else SuppressBias := 1;
+    if K = 1 then
+      Result := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(pOutCh, SuppressBias), Src)
+    else
+      Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(pOutCh, K,
+        K shr 1, 1, SuppressBias), Src);
+    LoadGFPGANConv(Reader, Result, Prefix, pOutCh, pInCh, K, HasBias);
+  end;
+
+  function AddConvLeaky(Src: TNNetLayer; const Prefix: string;
+    pOutCh, pInCh, K: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2),
+      AddConv(Src, Prefix, pOutCh, pInCh, K, true));
+  end;
+
+  // ResBlock: bilinear 0.5x of a power-of-two map is exactly a 2x2 average; the
+  // 1x1 skip runs before the 2x upsample, which commutes with it.
+  function AddResBlock(Src: TNNetLayer; const Prefix: string;
+    pInCh, pOutCh: integer; IsDown: boolean): TNNetLayer;
+  var
+    Main, SkipBranch: TNNetLayer;
+  begin
+    Main := AddConvLeaky(Src, Prefix + 'conv1', pInCh, pInCh, 3);
+    if IsDown then
+      Main := NN.AddLayerAfter(TNNetAvgPool.Create(2), Main)
+    else
+      Main := NN.AddLayerAfter(TNNetBilinearUpsample.Create(2), Main);
+    Main := AddConvLeaky(Main, Prefix + 'conv2', pOutCh, pInCh, 3);
+    if IsDown then
+    begin
+      SkipBranch := NN.AddLayerAfter(TNNetAvgPool.Create(2), Src);
+      SkipBranch := AddConv(SkipBranch, Prefix + 'skip', pOutCh, pInCh, 1, false);
+    end
+    else
+    begin
+      SkipBranch := AddConv(Src, Prefix + 'skip', pOutCh, pInCh, 1, false);
+      SkipBranch := NN.AddLayerAfter(TNNetBilinearUpsample.Create(2), SkipBranch);
+    end;
+    Result := NN.AddLayerAfter(TNNetSum.Create([Main, SkipBranch]), Main);
+  end;
+
+  // The style latent of decoder layer pLatentPos (latent[:, pLatentPos]).
+  function LatentLayer(pLatentPos: integer): TNNetLayer;
+  begin
+    if Config.DifferentW then
+      Result := NN.AddLayerAfter(TNNetSplitChannels.Create(
+        pLatentPos * Config.NumStyleFeat, Config.NumStyleFeat), StyleCode)
+    else
+      Result := StyleCode;
+  end;
+
+  function AddModulatedConv(Src: TNNetLayer; const Prefix: string;
+    pOutCh, pInCh, K, pLatentPos: integer; pDemodulate: integer;
+    pGain: TNeuralFloat): TNNetModulatedConv2D;
+  var
+    Affine: TNNetLayer;
+  begin
+    Affine := NN.AddLayerAfter(TNNetFullConnectLinear.Create(pInCh).
+      SetTrainable(pTrainable), LatentLayer(pLatentPos));
+    LoadStyleGAN2Linear(Reader, Affine, Prefix + 'modulated_conv.modulation.weight',
+      Prefix + 'modulated_conv.modulation.bias', pInCh, Config.NumStyleFeat);
+    Result := TNNetModulatedConv2D.Create(pOutCh, K, 0, pDemodulate, Affine,
+      pGain);
+    NN.AddLayerAfter(Result, Src);
+    LoadStyleGAN2ModConv(Reader, Result, Prefix + 'modulated_conv.weight',
+      Prefix + 'bias', pOutCh, pInCh, K);
+  end;
+
+  // StyleConv: [bilinear 2x] -> modulated conv * sqrt(2) + bias -> noise ->
+  // LeakyReLU(0.2).
+  function AddStyleConv(Src: TNNetLayer; const Prefix: string;
+    pInCh, pOutCh, pLatentPos, pResolution, pNoisePos: integer;
+    Upsample: boolean): TNNetLayer;
+  var
+    NoiseInput, NoiseScale: TNNetLayer;
+  begin
+    if Upsample then
+      Src := NN.AddLayerAfter(TNNetBilinearUpsample.Create(2), Src);
+    Result := AddModulatedConv(Src, Prefix, pOutCh, pInCh, 3, pLatentPos, 1,
+      Sqrt(2.0));
+    Result := AddStyleGAN2NoiseInjection(NN, Result, pResolution, pOutCh, 1,
+      NoiseMode, NoiseInput, NoiseScale);
+    LoadStyleGAN2NoiseInjection(Reader, NoiseInput, NoiseScale,
+      Prefix + 'weight', csGFPGANDecoder + 'noises.noise' + IntToStr(pNoisePos),
+      NoiseMode);
+    Result := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2), Result);
+  end;
+
+  // ToRGB: 1x1 modulated conv (no demodulation) + bias + bilinear-2x PrevSkip.
+  function AddToRGB(Src: TNNetLayer; const Prefix: string;
+    pInCh, pLatentPos: integer; PrevSkip: TNNetLayer): TNNetLayer;
+  var
+    Upsampled: TNNetLayer;
+  begin
+    Result := AddModulatedConv(Src, Prefix, 3, pInCh, 1, pLatentPos, 0, 1.0);
+    if PrevSkip <> nil then
+    begin
+      Upsampled := NN.AddLayerAfter(TNNetBilinearUpsample.Create(2), PrevSkip);
+      Result := NN.AddLayerAfter(TNNetSum.Create([Result, Upsampled]), Result);
+    end;
+  end;
+
+begin
+  LevelCnt := GFPGANLogSize(Config) - 2;
+  if not Config.InputIsLatent then
+    ImportError(csGFPGANImporter + ': input_is_latent=False (the style MLP ' +
+      'path) is not supported; GFPGAN v1.3/v1.4 use input_is_latent=True.');
+  if Config.NumStyleFeat < 1 then
+    ImportError(csGFPGANImporter + ': num_style_feat must be >= 1.');
+  MaxLevelPos := LevelCnt - 1;
+  LatentCnt := 2 * (LevelCnt + 2) - 2;
+  NN := TNNet.Create();
+  SetLength(DownOutputs, LevelCnt);
+  SetLength(Scales, LevelCnt);
+  SetLength(Shifts, LevelCnt);
+  try
+    // -------- U-Net encoder --------
+    Feat := NN.AddLayer(TNNetInput.Create(Config.OutSize, Config.OutSize, 3));
+    InCh := GFPGANChannels(Config, Config.OutSize, true);
+    Feat := AddConvLeaky(Feat, 'conv_body_first', InCh, 3, 1);
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      OutCh := GFPGANChannels(Config, Config.OutSize shr (LevelPos + 1), true);
+      Feat := AddResBlock(Feat, 'conv_body_down.' + IntToStr(LevelPos) + '.',
+        InCh, OutCh, true);
+      DownOutputs[LevelPos] := Feat;
+      InCh := OutCh;
+    end;
+    OutCh := GFPGANChannels(Config, 4, true);
+    Feat := AddConvLeaky(Feat, 'final_conv', OutCh, InCh, 3);
+    InCh := OutCh;
+    // final_linear over the CHW-flattened 4x4 map = a 4x4 valid convolution.
+    if Config.DifferentW then
+      StyleCode := NN.AddLayerAfter(TNNetFullConnectLinear.Create(1, 1,
+        LatentCnt * Config.NumStyleFeat, 0).SetTrainable(pTrainable), Feat)
+    else
+      StyleCode := NN.AddLayerAfter(TNNetFullConnectLinear.Create(1, 1,
+        Config.NumStyleFeat, 0).SetTrainable(pTrainable), Feat);
+    LoadGFPGANConv(Reader, StyleCode, 'final_linear', StyleCode.Output.Size,
+      InCh, 4, true);
+    // -------- U-Net decoder + CS-SFT conditions --------
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      Feat := NN.AddLayerAfter(TNNetSum.Create([Feat,
+        DownOutputs[MaxLevelPos - LevelPos]]), Feat);
+      OutCh := GFPGANChannels(Config, 8 shl LevelPos, true);
+      Feat := AddResBlock(Feat, 'conv_body_up.' + IntToStr(LevelPos) + '.',
+        InCh, OutCh, false);
+      if Config.SftHalf then SftCh := OutCh else SftCh := 2 * OutCh;
+      Scales[LevelPos] := AddConv(AddConvLeaky(Feat, 'condition_scale.' +
+        IntToStr(LevelPos) + '.0', OutCh, OutCh, 3), 'condition_scale.' +
+        IntToStr(LevelPos) + '.2', SftCh, OutCh, 3, true);
+      Shifts[LevelPos] := AddConv(AddConvLeaky(Feat, 'condition_shift.' +
+        IntToStr(LevelPos) + '.0', OutCh, OutCh, 3), 'condition_shift.' +
+        IntToStr(LevelPos) + '.2', SftCh, OutCh, 3, true);
+      InCh := OutCh;
+    end;
+    // -------- StyleGAN2-clean decoder with CS-SFT --------
+    InCh := GFPGANChannels(Config, 4, false);
+    Feat := AddLearnedConstant(NN, 4, 4, InCh);
+    LoadLearnedConstant(Reader, Feat, csGFPGANDecoder + 'constant_input.weight');
+    Feat := AddStyleConv(Feat, csGFPGANDecoder + 'style_conv1.', InCh, InCh,
+      0, 4, 0, false);
+    Skip := AddToRGB(Feat, csGFPGANDecoder + 'to_rgb1.', InCh, 1, nil);
+    LatentPos := 1;
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      Resolution := 8 shl LevelPos;
+      OutCh := GFPGANChannels(Config, Resolution, false);
+      Feat := AddStyleConv(Feat, csGFPGANDecoder + 'style_convs.' +
+        IntToStr(2 * LevelPos) + '.', InCh, OutCh, LatentPos, Resolution,
+        2 * LevelPos + 1, true);
+      if Config.SftHalf then
+      begin
+        HalfCh := OutCh div 2;
+        if (OutCh mod 2 <> 0) or
+           (Scales[LevelPos].Output.Depth <> OutCh - HalfCh) then
+          ImportError(csGFPGANImporter + ': sft_half needs ' +
+            IntToStr(OutCh - HalfCh) + '-channel conditions at ' +
+            IntToStr(Resolution) + 'x' + IntToStr(Resolution) + ', got ' +
+            IntToStr(Scales[LevelPos].Output.Depth) + '.');
+        SameHalf := NN.AddLayerAfter(TNNetSplitChannels.Create(0, HalfCh), Feat);
+        SftHalfLayer := NN.AddLayerAfter(TNNetSplitChannels.Create(HalfCh,
+          OutCh - HalfCh), Feat);
+      end
+      else
+      begin
+        if Scales[LevelPos].Output.Depth <> OutCh then
+          ImportError(csGFPGANImporter + ': SFT needs ' + IntToStr(OutCh) +
+            '-channel conditions at ' + IntToStr(Resolution) + 'x' +
+            IntToStr(Resolution) + ', got ' +
+            IntToStr(Scales[LevelPos].Output.Depth) + '.');
+        SameHalf := nil;
+        SftHalfLayer := Feat;
+      end;
+      SftHalfLayer := NN.AddLayerAfter(TNNetCellMulByCell.Create(SftHalfLayer,
+        Scales[LevelPos]), SftHalfLayer);
+      Feat := NN.AddLayerAfter(TNNetSum.Create([SftHalfLayer, Shifts[LevelPos]]),
+        SftHalfLayer);
+      if SameHalf <> nil then
+        Feat := NN.AddLayerAfter(TNNetDeepConcat.Create([SameHalf, Feat]), Feat);
+      Feat := AddStyleConv(Feat, csGFPGANDecoder + 'style_convs.' +
+        IntToStr(2 * LevelPos + 1) + '.', OutCh, OutCh, LatentPos + 1,
+        Resolution, 2 * LevelPos + 2, false);
+      Skip := AddToRGB(Feat, csGFPGANDecoder + 'to_rgbs.' + IntToStr(LevelPos) +
+        '.', OutCh, LatentPos + 2, Skip);
+      InCh := OutCh;
+      Inc(LatentPos, 2);
+    end;
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildGFPGANFromSafeTensorsEx(const FileName: string;
+  const Config: TGFPGANConfig; pTrainable: boolean = true;
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildGFPGAN(Reader, Config, pTrainable, NoiseMode);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildGFPGANFromSafeTensors(const FileName: string;
+  out Config: TGFPGANConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = '';
+  NoiseMode: TStyleGAN2NoiseMode = snmConst): TNNet;
+var
+  ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  if (ConfigFileName <> '') or FileExists(ConfigPath) then
+    Config := ReadGFPGANConfigFromJSONFile(ConfigPath)
+  else
+    Config := DefaultGFPGANConfig();
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    InferGFPGANConfigFromTensors(Reader, Config);
+    Result := BuildGFPGAN(Reader, Config, pTrainable, NoiseMode);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure GFPGANPrepareInput(Face: TNNetVolume; const Config: TGFPGANConfig;
+  NetInput: TNNetVolume);
+begin
+  if Face.Depth <> 3 then
+    ImportError(csGFPGANImporter + ': GFPGANPrepareInput needs an RGB image, ' +
+      'got depth ' + IntToStr(Face.Depth) + '.');
+  if (Face.SizeX = Config.OutSize) and (Face.SizeY = Config.OutSize) then
+    NetInput.Copy(Face)
+  else
+    ResizeImageBilinearNoAntialias(Face, NetInput, Config.OutSize,
+      Config.OutSize);
+  NetInput.Mul(1 / 127.5);
+  NetInput.Sub(1.0);
+end;
+
+procedure GFPGANComposeOutput(NetOutput, Restored: TNNetVolume);
+begin
+  if Restored <> NetOutput then Restored.Copy(NetOutput);
+  TNNetVolume.ClampAbs(Restored.DataPtr, 1.0, Restored.Size);
+  Restored.Add(1.0);
+  Restored.Mul(127.5);
+end;
+
+procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
+  Face, Restored: TNNetVolume);
+var
+  NetInput: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  try
+    GFPGANPrepareInput(Face, Config, NetInput);
+    NN.Compute(NetInput);
+    NN.GetOutput(Restored);
+    GFPGANComposeOutput(Restored, Restored);
+  finally
+    NetInput.Free;
+  end;
 end;
 
 // ===========================================================================

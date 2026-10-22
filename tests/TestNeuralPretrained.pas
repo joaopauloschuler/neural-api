@@ -194,6 +194,8 @@ type
     // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
     function DDColorParityMaxDiff(const WeightsFile: string;
       pRoundTrip: boolean; out Config: TDDColorConfig): double;
+    function GFPGANParityMaxDiff(const WeightsFile, IOFile, ConfigFile: string;
+      pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
       pRoundTrip: boolean; pPackedPath: boolean = false): double;
     // Largest |depth - oracle| of BuildDPTFromSafeTensors over every case of
@@ -1507,6 +1509,12 @@ type
     procedure TestStyleGAN2BroadcastNoiseMatchesTiled;
     procedure TestStyleGAN2RandomNoiseSeeded;
     procedure TestStyleGAN2NoNoiseEqualsZeroStrength;
+    procedure TestGFPGANParity;
+    procedure TestGFPGANSharedLatentParityInfersConfig;
+    procedure TestGFPGANNoiseModes;
+    procedure TestGFPGANPrepareAndCompose;
+    // The tiny fixture with EnableOpenCL against the host net, every layer.
+    procedure TestGFPGANOpenCLParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestDINOv3ConfigFromJSONFile;
@@ -55540,6 +55548,252 @@ begin
     DeleteFile(ZeroStrengthPath);
   end;
 end;
+
+// Max |diff| of the pico GFPGAN WeightsFile ({'params_ema': ...} .pth) vs the
+// official gfpganv1_clean_arch.py output (float64 torch, randomize_noise=False).
+function TTestNeuralPretrained.GFPGANParityMaxDiff(const WeightsFile,
+  IOFile, ConfigFile: string; pRoundTrip: boolean;
+  out Config: TGFPGANConfig): double;
+var
+  NN, Reloaded: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput, Expected, NetOutput: TNNetVolume;
+begin
+  if ConfigFile <> '' then
+    NN := BuildGFPGANFromSafeTensors(FixturePath(WeightsFile), Config,
+      {pTrainable=}false, FixturePath(ConfigFile))
+  else
+  begin
+    Config := DefaultGFPGANConfig();
+    IO := CreatePretrainedTensorReader(FixturePath(WeightsFile));
+    try
+      InferGFPGANConfigFromTensors(IO, Config);
+      NN := BuildGFPGAN(IO, Config, {pTrainable=}false);
+    finally
+      IO.Free;
+    end;
+  end;
+  Reloaded := nil;
+  IO := TNNetSafeTensorsReader.Create(FixturePath(IOFile));
+  NetInput := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NetOutput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    LoadDDColorTorchImage(IO, 'output', Expected);
+    AssertEquals('input size', Config.OutSize, NetInput.SizeX);
+    NN.Compute(NetInput);
+    NN.GetOutput(NetOutput);
+    AssertEquals('output width', Expected.SizeX, NetOutput.SizeX);
+    AssertEquals('output height', Expected.SizeY, NetOutput.SizeY);
+    AssertEquals('output channels', 3, NetOutput.Depth);
+    AssertTrue('the reference is not degenerate', Expected.GetMaxAbs() > 0.1);
+    Result := MaxAbsVolumeDiff(NetOutput, Expected);
+    if pRoundTrip then
+    begin
+      Reloaded := TNNet.Create();
+      Reloaded.LoadFromString(NN.SaveToString());
+      Reloaded.SetTrainable();
+      Reloaded.Compute(NetInput);
+      AssertEquals('save/load round trip reproduces the face', 0,
+        MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output, NetOutput), 1e-5);
+    end;
+  finally
+    Reloaded.Free;
+    NetOutput.Free;
+    Expected.Free;
+    NetInput.Free;
+    IO.Free;
+    NN.Free;
+  end;
+end;
+
+// tiny_gfpgan.*: the v1.3/v1.4 flags (different_w, sft_half, input_is_latent) at
+// out_size 64, channel_multiplier 1, narrow 1/32 (decoder 16..8, U-Net 8..4).
+procedure TTestNeuralPretrained.TestGFPGANParity;
+var
+  Config: TGFPGANConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := GFPGANParityMaxDiff('tiny_gfpgan.pth', 'tiny_gfpgan_io.safetensors',
+    'tiny_gfpgan_config.json', {pRoundTrip=}true, Config);
+  WriteLn('  GFPGAN (v1.4 flags) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+    MaxDiff < 1e-4);
+  AssertEquals('different_w', true, Config.DifferentW);
+  AssertEquals('sft_half', true, Config.SftHalf);
+  AssertEquals('decoder channels at 64', 8, GFPGANChannels(Config, 64, false));
+  AssertEquals('U-Net channels at 64', 4, GFPGANChannels(Config, 64, true));
+end;
+
+// tiny_gfpgan_shared_w.*: one shared latent, SFT on all channels, out_size 32;
+// no config.json, so every field comes from the tensor shapes.
+procedure TTestNeuralPretrained.TestGFPGANSharedLatentParityInfersConfig;
+var
+  Config: TGFPGANConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := GFPGANParityMaxDiff('tiny_gfpgan_shared_w.pth',
+    'tiny_gfpgan_shared_w_io.safetensors', '', {pRoundTrip=}false, Config);
+  WriteLn('  GFPGAN (shared w, full SFT) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+    MaxDiff < 1e-4);
+  AssertEquals('out_size', 32, Config.OutSize);
+  AssertEquals('num_style_feat', 8, Config.NumStyleFeat);
+  AssertEquals('narrow', 1 / 32, Config.Narrow, 1e-12);
+  AssertEquals('num_mlp', 2, Config.NumMlp);
+  AssertEquals('different_w', false, Config.DifferentW);
+  AssertEquals('sft_half', false, Config.SftHalf);
+end;
+
+// The noise branch is live (snmNone changes the face) and snmRandom is seeded.
+procedure TTestNeuralPretrained.TestGFPGANNoiseModes;
+var
+  Config: TGFPGANConfig;
+  NNConst, NNNone, NNRandom: TNNet;
+  NetInput, ConstOut, RandomOut: TNNetVolume;
+begin
+  Config := ReadGFPGANConfigFromJSONFile(FixturePath('tiny_gfpgan_config.json'));
+  NNConst := BuildGFPGANFromSafeTensorsEx(FixturePath('tiny_gfpgan.pth'),
+    Config, false, snmConst);
+  NNNone := BuildGFPGANFromSafeTensorsEx(FixturePath('tiny_gfpgan.pth'),
+    Config, false, snmNone);
+  NNRandom := BuildGFPGANFromSafeTensorsEx(FixturePath('tiny_gfpgan.pth'),
+    Config, false, snmRandom);
+  NetInput := TNNetVolume.Create(Config.OutSize, Config.OutSize, 3);
+  ConstOut := TNNetVolume.Create;
+  RandomOut := TNNetVolume.Create;
+  try
+    NetInput.FillForDebug();
+    NNConst.Compute(NetInput);
+    ConstOut.Copy(NNConst.GetLastLayer().Output);
+    NNNone.Compute(NetInput);
+    AssertTrue('snmNone differs from the stored noise',
+      MaxAbsVolumeDiff(NNNone.GetLastLayer().Output, ConstOut) > 1e-3);
+    RandSeed := 77;
+    NNRandom.Compute(NetInput);
+    RandomOut.Copy(NNRandom.GetLastLayer().Output);
+    RandSeed := 77;
+    NNRandom.Compute(NetInput);
+    AssertEquals('snmRandom is reproducible under one seed', 0,
+      MaxAbsVolumeDiff(NNRandom.GetLastLayer().Output, RandomOut), 1e-6);
+    AssertTrue('snmRandom differs from the stored noise',
+      MaxAbsVolumeDiff(RandomOut, ConstOut) > 1e-3);
+  finally
+    RandomOut.Free;
+    ConstOut.Free;
+    NetInput.Free;
+    NNRandom.Free;
+    NNNone.Free;
+    NNConst.Free;
+  end;
+end;
+
+// GFPGANPrepareInput maps 0..255 to [-1,1] (resizing to out_size);
+// GFPGANComposeOutput clamps to [-1,1] and maps back to 0..255.
+procedure TTestNeuralPretrained.TestGFPGANPrepareAndCompose;
+var
+  Config: TGFPGANConfig;
+  Face, NetInput, Restored: TNNetVolume;
+begin
+  Config := DefaultGFPGANConfig();
+  Config.OutSize := 8;
+  Face := TNNetVolume.Create(8, 8, 3);
+  NetInput := TNNetVolume.Create;
+  Restored := TNNetVolume.Create;
+  try
+    Face.Fill(255);
+    Face[0, 0, 0] := 0;
+    GFPGANPrepareInput(Face, Config, NetInput);
+    AssertEquals('0 -> -1', -1, NetInput[0, 0, 0], 1e-6);
+    AssertEquals('255 -> 1', 1, NetInput[1, 0, 0], 1e-6);
+    Face.ReSize(16, 12, 3);
+    Face.Fill(127.5);
+    GFPGANPrepareInput(Face, Config, NetInput);
+    AssertEquals('resized width', 8, NetInput.SizeX);
+    AssertEquals('resized height', 8, NetInput.SizeY);
+    AssertEquals('mid gray -> 0', 0, NetInput[3, 5, 2], 1e-5);
+    NetInput.Fill(0);
+    NetInput[0, 0, 0] := -3;
+    NetInput[1, 0, 0] := 2;
+    GFPGANComposeOutput(NetInput, Restored);
+    AssertEquals('clamped low', 0, Restored[0, 0, 0], 1e-5);
+    AssertEquals('clamped high', 255, Restored[1, 0, 0], 1e-5);
+    AssertEquals('zero -> 127.5', 127.5, Restored[2, 0, 1], 1e-5);
+  finally
+    Restored.Free;
+    NetInput.Free;
+    Face.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGFPGANOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TGFPGANConfig;
+  NN, NNCPU: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, FirstBadLayer, OpenCLLayerCnt: integer;
+  LayerDiff, MaxDiff, OutputDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildGFPGANFromSafeTensors(FixturePath('tiny_gfpgan.pth'), Config,
+    {pTrainable=}false, FixturePath('tiny_gfpgan_config.json'));
+  NNCPU := BuildGFPGANFromSafeTensors(FixturePath('tiny_gfpgan.pth'), Config,
+    {pTrainable=}false, FixturePath('tiny_gfpgan_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_gfpgan_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    NNCPU.Compute(NetInput);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 1 to NN.CountLayers() - 1 do
+    begin
+      if NN.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output);
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  GFPGAN OpenCL first layer past 1e-4: ', LayerPos, ' ',
+          NN.Layers[LayerPos].ClassName, ' max|diff|=', LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  GFPGAN OpenCL face max|diff| = ', OutputDiff:0:9,
+      ' any layer = ', MaxDiff:0:9, ' layers on OpenCL: ', OpenCLLayerCnt, '/',
+      NN.CountLayers() - 1);
+    AssertTrue('some layers ran on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue('face OpenCL vs CPU max |diff| = ' + FloatToStr(OutputDiff) +
+      ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertEquals('every layer OpenCL vs CPU within 1e-4', -1, FirstBadLayer);
+  finally
+    NetInput.Free;
+    IO.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // Verifies ReadDINOv2ConfigFromJSONFile on the committed DINOv2 pico config.
 procedure TTestNeuralPretrained.TestDINOv2ConfigFromJSONFile;

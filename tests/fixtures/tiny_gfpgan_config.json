@@ -1,0 +1,11 @@
+{
+  "model_type": "gfpgan",
+  "out_size": 64,
+  "num_style_feat": 8,
+  "channel_multiplier": 1,
+  "narrow": 0.03125,
+  "num_mlp": 2,
+  "input_is_latent": true,
+  "different_w": true,
+  "sft_half": true
+}

@@ -717,10 +717,11 @@ type
       /// for InDepth input channels; False when the device refused them.
       function PrepareModulatedConv(InDepth: longint): boolean;
       /// ComputeImplicitConv (stride 1, SAME padding) of VAs modulated on OpenCL by
-      /// StyleBuffer (InDepth floats) and, when Demodulate, demodulated per row.
+      /// StyleBuffer (InDepth floats) and, when Demodulate, demodulated per row;
+      /// every row is scaled by OutputGain before the bias.
       procedure ComputeModulatedConv(VAs, SrcVol: TNNetVolume; StyleBuffer: cl_mem;
         FeatureSize, pActFN: longint; Demodulate: boolean; DemodEps: TNeuralFloat;
-        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        OutputGain: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean; pExternalSrc: cl_mem);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
@@ -2657,7 +2658,7 @@ end;
 
 procedure TDotProductSharedKernel.ComputeModulatedConv(VAs, SrcVol: TNNetVolume;
   StyleBuffer: cl_mem; FeatureSize, pActFN: longint; Demodulate: boolean;
-  DemodEps: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume;
+  DemodEps: TNeuralFloat; OutputGain: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume;
   NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
 var
   err: integer;
@@ -2707,9 +2708,10 @@ begin
   err := err or clSetKernelArg(FModRowScalesKernel, 1, csLongintSize, @InDepth);
   err := err or clSetKernelArg(FModRowScalesKernel, 2, csLongintSize, @DemodulateFlag);
   err := err or clSetKernelArg(FModRowScalesKernel, 3, csNeuralFloatSize, @DemodEps);
-  err := err or clSetKernelArg(FModRowScalesKernel, 4, csCLMemSize, @FModSquareSumsBuffer);
-  err := err or clSetKernelArg(FModRowScalesKernel, 5, csCLMemSize, @StyleBuffer);
-  err := err or clSetKernelArg(FModRowScalesKernel, 6, csCLMemSize, @FModRowScalesBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 4, csNeuralFloatSize, @OutputGain);
+  err := err or clSetKernelArg(FModRowScalesKernel, 5, csCLMemSize, @FModSquareSumsBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 6, csCLMemSize, @StyleBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 7, csCLMemSize, @FModRowScalesBuffer);
   err := err or clSetKernelArg(FModulateWeightsKernel, 0, csLongintSize, @FNumAs);
   err := err or clSetKernelArg(FModulateWeightsKernel, 1, csLongintSize, @FSize);
   err := err or clSetKernelArg(FModulateWeightsKernel, 2, csLongintSize, @InDepth);

@@ -23439,7 +23439,7 @@ begin
   try
     XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
     SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
-    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput);
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput, Sqrt(2.0));
     NN.AddLayerAfter(Conv, XInput);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
@@ -23530,7 +23530,7 @@ begin
   try
     XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
     SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
-    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput, Sqrt(2.0)), XInput);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
 
@@ -23612,7 +23612,7 @@ begin
   try
     XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
     SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
-    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 0, SInput); // demod=0
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 0, SInput, 0.7); // demod=0
     NN.AddLayerAfter(Conv, XInput);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
@@ -23667,7 +23667,7 @@ begin
   try
     XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
     SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
-    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput, 1.5), XInput);
 
     for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
     for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
@@ -23688,6 +23688,8 @@ begin
       AssertEquals('ModulatedConv2D SaveToString round-trip equality', Saved, Saved2);
       AssertTrue('ModulatedConv2D round-trip last layer is TNNetModulatedConv2D',
         NN2.GetLastLayer is TNNetModulatedConv2D);
+      AssertEquals('ModulatedConv2D round-trip OutputGain', 1.5,
+        TNNetModulatedConv2D(NN2.GetLastLayer).OutputGain, 1e-7);
       NN2.Layers[0].Output.Copy(XData);
       NN2.Layers[1].Output.Copy(SData);
       NN2.Compute(NN2.Layers[0].Output);
@@ -75607,6 +75609,7 @@ var
   DeviceId: cl_device_id;
   CaseCnt, OutC, KSz, SuppressBias, Demod, SizeX, SizeY: integer;
   Pos, MaxPos, SentinelSurvivors, SlabBytes, BaseUploadBytes: integer;
+  OutputGain: TNeuralFloat;
   SquareSumsBefore: integer;
   WasCounting, HostStyle, StyleIsInput: boolean;
   TransfersBefore, TransfersAfter, TransfersUpdate: TOpenCLTransferCounts;
@@ -75648,11 +75651,13 @@ begin
   for CaseCnt := 0 to 3 do
   begin
     SizeX := 9; SizeY := 7; HostStyle := false; StyleIsInput := false;
+    OutputGain := 1.0;
     case CaseCnt of
       0:
       begin
-        CaseName := '3x3 demod + bias, resident style';
+        CaseName := '3x3 demod + bias, gain sqrt(2), resident style';
         OutC := 16; KSz := 3; SuppressBias := 0; Demod := 1;
+        OutputGain := Sqrt(2.0);
       end;
       1:
       begin
@@ -75667,8 +75672,9 @@ begin
       end;
       else
       begin
-        CaseName := '3x3 no demod + bias, 40 rows, host style';
+        CaseName := '3x3 no demod + bias, gain 0.7, 40 rows, host style';
         OutC := 40; KSz := 3; SuppressBias := 0; Demod := 0; HostStyle := true;
+        OutputGain := 0.7;
       end;
     end;
     NN := TNNet.Create();
@@ -75689,7 +75695,7 @@ begin
       else
         StyleSrc := NN.AddLayerAfter(TNNetMulByConstant.Create(1.0), SInput);
       ModConv := TNNetModulatedConv2D.Create(OutC, KSz, SuppressBias, Demod,
-        StyleSrc);
+        StyleSrc, OutputGain);
       NN.AddLayerAfter(ModConv, XInput);
       NN.AddLayer(TNNetReLU.Create());
       NN.SetTrainable(False, False);

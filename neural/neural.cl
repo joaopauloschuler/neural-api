@@ -1605,14 +1605,15 @@ __kernel void cai_conv_weight_square_sums
   SquareSums[d * NumAs + a] = Sum;
 }
 
-// RowScales[a] = 1 / sqrt(sum_d SquareSums(a, d) * Style[d]^2 + Eps), the
-// demodulation factor, or 1 when Demodulate is 0. Launch (NumAs).
+// RowScales[a] = Gain / sqrt(sum_d SquareSums(a, d) * Style[d]^2 + Eps), the
+// demodulation factor, or Gain when Demodulate is 0. Launch (NumAs).
 __kernel void cai_conv_modulation_row_scales
 (
   const int NumAs,
   const int InDepth,
   const int Demodulate,
   const float Eps,
+  const float Gain,
   __global const float* SquareSums,
   __global const float* Style,
   __global float* RowScales
@@ -1627,7 +1628,7 @@ __kernel void cai_conv_modulation_row_scales
     Sum = mad(SquareSums[d * NumAs + a], s * s, Sum);
   }
   // Sum + Eps > 0, so the division never traps even when Demodulate is 0.
-  RowScales[a] = (Demodulate != 0) ? 1.0f / sqrt(Sum + Eps) : 1.0f;
+  RowScales[a] = (Demodulate != 0) ? Gain / sqrt(Sum + Eps) : Gain;
 }
 
 // Dst(a, k) = A(a, k) * Style[k mod InDepth] * RowScales[a], both in the

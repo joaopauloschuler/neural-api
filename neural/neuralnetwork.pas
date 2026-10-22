@@ -7248,8 +7248,9 @@ type
   // end-to-end). The demod backward uses the chain rule through
   // d[o]=(g[o]+eps)^(-1/2), g[o]=sum w'^2: d d[o]/d w'[o,t] = -d[o]^3 * w'[o,t].
   // FStruct[0]=OutChannels, FStruct[1]=FeatureSize, FStruct[2]=SuppressBias,
-  // FStruct[3]=Demodulate persist; the StyleSource index is injected into the
-  // source slot (like TNNetConcat) so it round-trips through SaveToString.
+  // FStruct[3]=Demodulate and FFloatSt[0]=OutputGain persist; the StyleSource
+  // index is injected into the source slot (like TNNetConcat) so it round-trips.
+  // OutputGain scales the conv result before the bias (StyleGAN2-clean sqrt(2)).
   // SCOPE NOTE (v1): inference-oriented synthesis primitive -- no fused
   // up/downsampling (use a separate TNNetUpsample), no grouped/minibatch-std.
   // OpenCL (inference): the base kernel stays resident; OpenCL derives w'' from
@@ -7261,6 +7262,7 @@ type
     FFeatureSize: integer;
     FInChannels: integer;
     FDemodulate: boolean;
+    FOutputGain: TNeuralFloat;
     FStyleLayer: TNNetLayer;     // explicit per-input-channel style source
     FModWeights: TNNetVolume;    // cached modulated+demodulated kernel (forward)
     FDemodScale: TNNetVolume;    // cached per-output-channel demod factor d[o]
@@ -7275,7 +7277,8 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pNumFeatures, pFeatureSize, pSuppressBias,
-      pDemodulate: integer; StyleSource: TNNetLayer); reintroduce; overload;
+      pDemodulate: integer; StyleSource: TNNetLayer;
+      pOutputGain: TNeuralFloat = 1.0); reintroduce; overload;
     destructor Destroy(); override;
     function SaveStructureToString(): string; override;
     procedure InitDefault(); override;
@@ -7293,6 +7296,7 @@ type
     property FeatureSize: integer read FFeatureSize;
     property InChannels: integer read FInChannels;
     property Demodulate: boolean read FDemodulate;
+    property OutputGain: TNeuralFloat read FOutputGain;
     property StyleSource: TNNetLayer read FStyleLayer;
   end;
 
@@ -49338,13 +49342,16 @@ const
   csModulatedConvDemodEps = 1e-8;
 
 constructor TNNetModulatedConv2D.Create(pNumFeatures, pFeatureSize,
-  pSuppressBias, pDemodulate: integer; StyleSource: TNNetLayer);
+  pSuppressBias, pDemodulate: integer; StyleSource: TNNetLayer;
+  pOutputGain: TNeuralFloat);
 begin
   inherited Create();
   FOutChannels := pNumFeatures;
   FFeatureSize := pFeatureSize;
   FSuppressBias := pSuppressBias;
   FDemodulate := (pDemodulate <> 0);
+  FOutputGain := pOutputGain;
+  FFloatSt[0] := FOutputGain;
   if FOutChannels < 1 then
     FErrorProc('TNNetModulatedConv2D requires NumFeatures >= 1. Got ' +
       IntToStr(FOutChannels));
@@ -49521,9 +49528,10 @@ begin
         end;
         Inc(Base, FInChannels);               // #6
       end;
-    if FDemodulate then FDemodScale.FData[o] := 1.0 / pcr_sqrtf(g + csModulatedConvDemodEps)
-    else FDemodScale.FData[o] := 1.0;
     if FDemodulate then
+      FDemodScale.FData[o] := FOutputGain / pcr_sqrtf(g + csModulatedConvDemodEps)
+    else FDemodScale.FData[o] := FOutputGain;
+    if FDemodScale.FData[o] <> 1.0 then
       TNNetVolume.Mul(FModWeights.GetRawPtr(oBase), FDemodScale.FData[o],
         tapsPerOut);
   end;
@@ -49633,7 +49641,7 @@ begin
   else
     FPrevLayer.ForceOutputOnRAM();
   FDotCL.ComputeModulatedConv(FWeightsInter, FPrevLayer.FOutput, StyleBuffer,
-    FFeatureSize, csActNone, FDemodulate, csModulatedConvDemodEps,
+    FFeatureSize, csActNone, FDemodulate, csModulatedConvDemodEps, FOutputGain,
     {NewVAs}WeightsChanged, BiasVol, {NewVBias}WeightsChanged,
     {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
   FOutputOnOpenCL := true;
@@ -49649,7 +49657,7 @@ var
   StartTime: double;
   X, Style, XErr, StyleErr: TNNetVolume;
   o, ox, oy, ky, kx, i, Base, pad, prevX, prevY, tapsPerOut, xBase, oBase: integer;
-  Dy, Xv, lr, dwm, dot, wbase, sv: TNeuralFloat;
+  Dy, Xv, lr, dwm, dot, wbase, sv, DemodO, DemodCubeTerm: TNeuralFloat;
   PropMain, PropStyle, PropW: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -49719,16 +49727,23 @@ begin
     //   => dL/dw'[o,t] = d*FGModW[o,t] - d^3 * w'[o,t] * dot,  dot=sum FGModW*w'
     // (demod=false: d=1, dot term drops, dL/dw'=FGModW.)
     // Then dL/dw[o,t] = s_i * dL/dw'[o,t]; dL/ds_i += w[o,t] * dL/dw'[o,t].
+    // FDemodScale holds G*d (G = OutputGain), so the cube term is (G*d)^3/G^2.
     if PropW or PropStyle then
       for o := 0 to OutChM1 do
       begin
         oBase := o * tapsPerOut;
+        DemodO := FDemodScale.FData[o];
         dot := 0;
         if FDemodulate then
+        begin
+          // FModWeights holds w''=G*d*w'; recover w' via /FDemodScale.
           for i := 0 to TapsM1 do
             dot := dot + FGModW.FData[oBase + i] *
-              (FModWeights.FData[oBase + i] / FDemodScale.FData[o]);
-        // note: FModWeights holds w''=d*w'; recover w'=w''/d via /FDemodScale.
+              (FModWeights.FData[oBase + i] / DemodO);
+          DemodCubeTerm := DemodO * DemodO * DemodO /
+            (FOutputGain * FOutputGain) * dot;
+        end
+        else DemodCubeTerm := 0;
         for ky := 0 to FeatSzM1 do
           for kx := 0 to FeatSzM1 do
           begin
@@ -49738,12 +49753,8 @@ begin
               sv := Style.FData[i];
               wbase := FArrNeurons[o].FWeights.FData[Base + i];
               // dL/dw'[o,t]
-              if FDemodulate then
-                dwm := FDemodScale.FData[o] * FGModW.FData[oBase + Base + i]
-                  - FDemodScale.FData[o] * FDemodScale.FData[o] * FDemodScale.FData[o]
-                    * (sv * wbase) * dot
-              else
-                dwm := FGModW.FData[oBase + Base + i];
+              dwm := DemodO * FGModW.FData[oBase + Base + i] -
+                DemodCubeTerm * (sv * wbase);
               // dL/d(base weight) = s_i * dwm  -> Delta (LR-scaled, negated)
               if PropW then
                 FArrNeurons[o].FDelta.FData[Base + i] :=
@@ -141149,7 +141160,9 @@ begin
       'TNNetConvGRUCell' :          Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
-      'TNNetModulatedConv2D' :      Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]);
+      // A string saved before OutputGain existed carries Ft[0] = 0: gain 1.
+      'TNNetModulatedConv2D' :      if Ft[0] = 0 then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0])
+                                    else Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0], Ft[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
@@ -141600,7 +141613,11 @@ begin
       if S[0] = 'TNNetConvGRUCell' then Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
-      if S[0] = 'TNNetModulatedConv2D' then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]) else
+      if S[0] = 'TNNetModulatedConv2D' then
+      begin
+        if Ft[0] = 0 then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0])
+        else Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0], Ft[0]);
+      end else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
