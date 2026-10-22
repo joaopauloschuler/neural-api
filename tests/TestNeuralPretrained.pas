@@ -1107,6 +1107,7 @@ type
     procedure TestMultiDiffusionCircularWrap;
     procedure TestQwenImage21LanczosResizeVsPIL;
     procedure TestQwenImage21PrepareVaeImage;
+    procedure TestConvertAndResizeImagePILPinned;
     procedure TestQwenImage21SizeForAspect;
     procedure TestQwenImage21Img2ImgParity;
     procedure TestQwenImage21Img2ImgKeepLoaded;
@@ -37045,6 +37046,129 @@ begin
   end;
 end;
 
+// Pins ConvertAndResizeImagePIL in the diffusers ([0, 1]) and QwenImage (RGBA,
+// clipped) modes on 3x2 RGB, gray and partial-alpha RGBA images, bit-exact.
+procedure TTestNeuralPretrained.TestConvertAndResizeImagePILPinned;
+const
+  csPinD1: array[0..35] of TNeuralFloat = (
+    -0.110845394, 0.0370602347, 0.315651864, 0.440602243, 0.568295896,
+    0.765116751, 0.527603447, 0.724424303, 0.852117956, 0.0536317863,
+    0.332223415, 0.480129033, 0.407957554, 0.541748285, 0.149212092,
+    0.446695507, 0.661888123, 0.59867698, 0.533696711, 0.470485538, 0.685678184,
+    0.572434723, 0.1798985, 0.313689292, 0.926760435, 1.04643631, -0.0172276683,
+    0.45278877, 0.755480409, 0.432237238, 0.539789975, 0.216546834, 0.519238412,
+    1.09123755, 0.0275735948, 0.147249505);
+  csPinD2: array[0..5] of TNeuralFloat = (
+    0.355828196, 0.522740841, 0.539062917, 0.439409047, 0.722297609,
+    0.356077224);
+  csPinD3: array[0..26] of TNeuralFloat = (
+    -0.0109040979, -0.0109040979, -0.0109040979, 0.134193957, 0.134193957,
+    0.134193957, 0.279291987, 0.279291987, 0.279291987, 0.260784328,
+    0.260784328, 0.260784328, 0.405882388, 0.405882388, 0.405882388,
+    0.550980449, 0.550980449, 0.550980449, 0.532472789, 0.532472789,
+    0.532472789, 0.67757082, 0.67757082, 0.67757082, 0.82266885, 0.82266885,
+    0.82266885);
+  csPinD4: array[0..5] of TNeuralFloat = (
+    0.160784319, 0.596078455, 0.329411775, 0.46274513, 0.784313798, 0.329411775);
+  csPinQ1: array[0..47] of TNeuralFloat = (
+    0, 37.9620094, 103.837914, 255, 0, 0, 59.7628021, 72.1959686, 0.0300889555,
+    0, 0, 0, 42.9990807, 88.4728775, 126.542183, 120.51564, 88.7191696,
+    125.330307, 51.3922691, 222.443207, 89.6132889, 129.697586, 111.701576,
+    173.856064, 93.1723404, 112.097595, 185.589737, 88.1653442, 96.1371689,
+    65.0917282, 93.505127, 60.4434624, 255, 255, 0, 156.480988, 135.013443,
+    179.718109, 135.393555, 255, 85.111351, 103.541885, 178.032837, 192.94101,
+    255, 0, 0, 0.371281773);
+  csPinQ2: array[0..35] of TNeuralFloat = (
+    1.44052303, 38.4405212, 75.4405212, 255, 112.440521, 149.440521,
+    218.222687, 255, 255, 4.44052315, 41.4405212, 255, 49.5, 86.5, 123.5,
+    255, 160.5, 197.5, 106.5, 255, 143.5, 52.5, 89.5, 255, 97.5594788,
+    134.559479, 171.559479, 255, 208.559479, 245.559479, 0, 255, 31.777319,
+    100.559479, 137.559479, 255);
+  csPinQ3: array[0..23] of TNeuralFloat = (
+    11, 48, 85, 255, 159, 196, 233, 0, 51, 88, 125, 96, 199, 236, 17,
+    180, 91, 128, 165, 255, 239, 20, 57, 30);
+  csPinQ4: array[0..47] of TNeuralFloat = (
+    -1, -0.702258706, -0.185584962, 1, -1, -1, -0.531272113, -0.433757067,
+    -0.999764025, -1, -1, -1, -0.662752271, -0.306095064, -0.0075122118,
+    -0.0547792316, -0.304163337, -0.0170171261, -0.596923351, 0.744652748,
+    -0.297150612, 0.0172359943, -0.123909175, 0.363577008, -0.269236505,
+    -0.120803118, 0.455605865, -0.308507085, -0.245982945, -0.489476621,
+    -0.266626418, -0.525933623, 1, 1, -1, 0.227301955, 0.0589290857,
+    0.409553886, 0.0619102716, 1, -0.332459927, -0.187906742, 0.396336079,
+    0.513262868, 1, -1, -1, -0.997088015);
+var
+  Source, Dest: TNNetVolume;
+  PixelPos: integer;
+
+  procedure FillSource(SizeX, SizeY, Depth: integer);
+  const
+    Alphas: array[0..5] of integer = (255, 0, 96, 180, 255, 30);
+  var
+    PixelPos, Channel: integer;
+  begin
+    Source.ReSize(SizeX, SizeY, Depth);
+    for PixelPos := 0 to SizeX * SizeY - 1 do
+      for Channel := 0 to Depth - 1 do
+        if (Depth = 4) and (Channel = 3) then
+          Source.FData[PixelPos * Depth + Channel] := Alphas[PixelPos mod 6]
+        else
+          Source.FData[PixelPos * Depth + Channel] :=
+            ((PixelPos * Depth + Channel) * 37 + 11) mod 256;
+  end;
+
+  procedure CheckPinned(const CaseName: string; SizeX, SizeY, Depth: integer;
+    const Expected: array of TNeuralFloat);
+  var
+    ValuePos: integer;
+  begin
+    AssertEquals(CaseName + ' width', SizeX, Dest.SizeX);
+    AssertEquals(CaseName + ' height', SizeY, Dest.SizeY);
+    AssertEquals(CaseName + ' depth', Depth, Dest.Depth);
+    for ValuePos := 0 to High(Expected) do
+      AssertEquals(CaseName + ' value ' + IntToStr(ValuePos),
+        Expected[ValuePos], Dest.FData[ValuePos], 0);
+  end;
+
+begin
+  Source := TNNetVolume.Create();
+  Dest := TNNetVolume.Create();
+  try
+    FillSource(3, 2, 4);
+    ConvertAndResizeImagePIL(Source, Dest, 4, 3, 3, false, 0, 1);
+    CheckPinned('RGBA to RGB', 4, 3, 3, csPinD1);
+    ConvertAndResizeImagePIL(Source, Dest, 2, 3, 1, false, 0, 1);
+    CheckPinned('RGBA to L', 2, 3, 1, csPinD2);
+    FillSource(3, 2, 1);
+    ConvertAndResizeImagePIL(Source, Dest, 3, 3, 3, false, 0, 1);
+    CheckPinned('L to RGB', 3, 3, 3, csPinD3);
+    FillSource(3, 2, 3);
+    ConvertAndResizeImagePIL(Source, Dest, 3, 2, 1, false, 0, 1);
+    CheckPinned('RGB to L, same size', 3, 2, 1, csPinD4);
+    FillSource(3, 2, 4);
+    ConvertAndResizeImagePIL(Source, Dest, 4, 3, 4, true, 0, 255);
+    CheckPinned('premultiplied RGBA', 4, 3, 4, csPinQ1);
+    ConvertAndResizeImagePIL(Source, Dest, 3, 2, 4, true, 0, 255);
+    CheckPinned('RGBA, same size', 3, 2, 4, csPinQ3);
+    ConvertAndResizeImagePIL(Source, Dest, 4, 3, 4, true, -1, 1);
+    CheckPinned('RGBA to [-1, 1]', 4, 3, 4, csPinQ4);
+    FillSource(3, 2, 3);
+    ConvertAndResizeImagePIL(Source, Dest, 3, 3, 4, true, 0, 255);
+    CheckPinned('RGB to RGBA', 3, 3, 4, csPinQ2);
+    FillSource(3, 2, 1);
+    ConvertAndResizeImagePIL(Source, Dest, 3, 2, 4, true, 0, 255);
+    AssertEquals('L to RGBA depth', 4, Dest.Depth);
+    for PixelPos := 0 to 5 do
+    begin
+      AssertEquals('L to RGBA blue', Source.FData[PixelPos],
+        Dest.FData[PixelPos * 4 + 2], 0);
+      AssertEquals('L to RGBA alpha', 255, Dest.FData[PixelPos * 4 + 3], 0);
+    end;
+  finally
+    Dest.Free;
+    Source.Free;
+  end;
+end;
+
 // PrepareVaeImage vs PIL's 8-bit RGBA resize (3 of 255; low/zero alpha: alpha
 // and premultiplied RGB, 8 of 255), then the RGB and opaque paths.
 procedure TTestNeuralPretrained.TestQwenImage21PrepareVaeImage;
@@ -37086,7 +37210,7 @@ begin
       LoadOracleTokenTensorObject(CaseObj.Find('output_hwc'), 'output_hwc',
         Expected);
       Expected.ReSize(OutW, OutH, 4);
-      QwenImage21PrepareVaeImage(Source, OutW, OutH, VaeImage);
+      ConvertAndResizeImagePIL(Source, VaeImage, OutW, OutH, 4, true, -1, 1);
       AssertEquals('RGBA out', 4, VaeImage.Depth);
       AssertEquals('width', OutW, VaeImage.SizeX);
       AssertTrue('inside [-1, 1]', (VaeImage.GetMin() >= -1) and
@@ -37135,7 +37259,7 @@ begin
     Source.ReSize(5, 3, 3);
     for ValuePos := 0 to Source.Size - 1 do
       Source.FData[ValuePos] := (ValuePos * 37) mod 256;
-    QwenImage21PrepareVaeImage(Source, 5, 3, VaeImage);
+    ConvertAndResizeImagePIL(Source, VaeImage, 5, 3, 4, true, -1, 1);
     AssertEquals('RGB gets an alpha channel', 4, VaeImage.Depth);
     for PixelPos := 0 to 14 do
     begin
@@ -37145,10 +37269,10 @@ begin
     end;
     Reference.Copy(VaeImage);
     VaeImage.Copy(Source);
-    QwenImage21PrepareVaeImage(VaeImage, 5, 3, VaeImage);
+    ConvertAndResizeImagePIL(VaeImage, VaeImage, 5, 3, 4, true, -1, 1);
     AssertEquals('in place', 0, MaxAbsVolumeDiff(VaeImage, Reference), 0);
     // Resized: RGB and the same image as opaque RGBA (no copy) agree, alpha +1.
-    QwenImage21PrepareVaeImage(Source, 9, 7, Reference);
+    ConvertAndResizeImagePIL(Source, Reference, 9, 7, 4, true, -1, 1);
     OpaqueRgba.ReSize(5, 3, 4);
     for PixelPos := 0 to 14 do
     begin
@@ -37157,7 +37281,7 @@ begin
           Source.FData[PixelPos * 3 + Channel];
       OpaqueRgba.FData[PixelPos * 4 + 3] := 255;
     end;
-    QwenImage21PrepareVaeImage(OpaqueRgba, 9, 7, VaeImage);
+    ConvertAndResizeImagePIL(OpaqueRgba, VaeImage, 9, 7, 4, true, -1, 1);
     AssertEquals('opaque RGBA = RGB', 0, MaxAbsVolumeDiff(VaeImage,
       Reference), 1e-6);
     for PixelPos := 0 to 9 * 7 - 1 do

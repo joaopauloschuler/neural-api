@@ -30,6 +30,12 @@ procedure ResizeImagePIL(Source, Dest: TNNetVolume; NewSizeX,
 procedure ResizeImageLanczos(Source, Dest: TNNetVolume; NewSizeX,
   NewSizeY: integer);
 
+// PIL convert to L/RGB/RGBA (Channels 1/3/4) + resize, RGBA premultiplied, in
+// float; 0..255 maps to [OutputMin, OutputMax]. Dest may be Source.
+procedure ConvertAndResizeImagePIL(Source, Dest: TNNetVolume; Width, Height,
+  Channels: integer; ClipToByteRange: boolean; OutputMin,
+  OutputMax: TNeuralFloat; Filter: TImageResampleFilter = irfLanczos);
+
 // HF/torchvision shortest-edge resize of a 0..255 image (long side
 // Trunc(ShortestEdge*Long/Short)) with PIL's uint8 rounding.
 procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
@@ -279,6 +285,131 @@ procedure ResizeImageLanczos(Source, Dest: TNNetVolume; NewSizeX,
   NewSizeY: integer);
 begin
   ResizeImagePIL(Source, Dest, NewSizeX, NewSizeY, irfLanczos);
+end;
+
+procedure ConvertAndResizeImagePIL(Source, Dest: TNNetVolume; Width, Height,
+  Channels: integer; ClipToByteRange: boolean; OutputMin,
+  OutputMax: TNeuralFloat; Filter: TImageResampleFilter);
+const
+  MaxChannelValue: TNeuralFloat = 255;
+  // PIL 'L' = (R*19595 + G*38470 + B*7471 + 0x8000) >> 16.
+  csLumaR = 19595;
+  csLumaG = 38470;
+  csLumaB = 7471;
+  csLumaRound = 32768;
+var
+  Converted: TNNetVolume;
+  PixelPos, MaxPixelPos, SourcePos, DestPos, Channel, MaxColorChannel,
+    MaxChannel, SourceDepth: integer;
+  Alpha, AlphaScale, Value, Scale: TNeuralFloat;
+  IsResized, IsPremultiplied, OwnsConverted: boolean;
+begin
+  SourceDepth := Source.Depth;
+  if (SourceDepth <> 1) and (SourceDepth <> 3) and (SourceDepth <> 4) then
+    raise Exception.Create('ConvertAndResizeImagePIL: the image has ' +
+      IntToStr(SourceDepth) + ' channels, expected gray, RGB or RGBA.');
+  if (Channels <> 1) and (Channels <> 3) and (Channels <> 4) then
+    raise Exception.Create('ConvertAndResizeImagePIL: ' + IntToStr(Channels) +
+      ' output channels; 1, 3 or 4 are supported.');
+  if (Width < 1) or (Height < 1) then
+    raise Exception.Create('ConvertAndResizeImagePIL: target size ' +
+      IntToStr(Width) + 'x' + IntToStr(Height) + ' is empty.');
+  IsResized := (Source.SizeX <> Width) or (Source.SizeY <> Height);
+  MaxPixelPos := Source.SizeX * Source.SizeY - 1;
+  // PIL resizes RGBA as premultiplied "RGBa"; an opaque image skips it.
+  IsPremultiplied := false;
+  if IsResized and (Channels = 4) and (SourceDepth = 4) then
+    for PixelPos := 0 to MaxPixelPos do
+      if Source.FData[PixelPos * 4 + 3] < MaxChannelValue then
+      begin
+        IsPremultiplied := true;
+        break;
+      end;
+  Converted := Source;
+  OwnsConverted := false;
+  try
+    if (SourceDepth <> Channels) or IsPremultiplied then
+    begin
+      if IsResized or (Source = Dest) then
+      begin
+        Converted := TNNetVolume.Create();
+        OwnsConverted := true;
+      end
+      else Converted := Dest;
+      Converted.ReSize(Source.SizeX, Source.SizeY, Channels);
+      MaxColorChannel := Min(Channels, 3) - 1;
+      for PixelPos := 0 to MaxPixelPos do
+      begin
+        SourcePos := PixelPos * SourceDepth;
+        DestPos := PixelPos * Channels;
+        if SourceDepth = 4 then Alpha := Source.FData[SourcePos + 3]
+        else Alpha := MaxChannelValue;
+        if SourceDepth = 1 then
+          for Channel := 0 to MaxColorChannel do
+            Converted.FData[DestPos + Channel] := Source.FData[SourcePos]
+        else if Channels = 1 then
+          Converted.FData[DestPos] := Trunc((Source.FData[SourcePos] * csLumaR +
+            Source.FData[SourcePos + 1] * csLumaG +
+            Source.FData[SourcePos + 2] * csLumaB + csLumaRound) / 65536)
+        else if IsPremultiplied then
+        begin
+          AlphaScale := Alpha / MaxChannelValue;
+          for Channel := 0 to MaxColorChannel do
+            Converted.FData[DestPos + Channel] :=
+              Source.FData[SourcePos + Channel] * AlphaScale;
+        end
+        else
+          for Channel := 0 to MaxColorChannel do
+            Converted.FData[DestPos + Channel] :=
+              Source.FData[SourcePos + Channel];
+        if Channels = 4 then Converted.FData[DestPos + 3] := Alpha;
+      end;
+    end;
+    if IsResized then
+    begin
+      ResizeImagePIL(Converted, Dest, Width, Height, Filter);
+      if ClipToByteRange or IsPremultiplied then
+      begin
+        MaxPixelPos := Width * Height - 1;
+        MaxChannel := Channels - 1;
+        for PixelPos := 0 to MaxPixelPos do
+        begin
+          DestPos := PixelPos * Channels;
+          if ClipToByteRange then
+            for Channel := 0 to MaxChannel do
+            begin
+              Value := Dest.FData[DestPos + Channel];
+              if Value < 0 then Dest.FData[DestPos + Channel] := 0
+              else if Value > MaxChannelValue then
+                Dest.FData[DestPos + Channel] := MaxChannelValue;
+            end;
+          if IsPremultiplied then
+          begin
+            Alpha := Dest.FData[DestPos + 3];
+            // PIL's rgba2rgbA leaves a pixel with alpha 0 premultiplied.
+            if (Alpha > 0) and (Alpha < MaxChannelValue) then
+              for Channel := 0 to 2 do
+              begin
+                Value := Dest.FData[DestPos + Channel] * MaxChannelValue /
+                  Alpha;
+                if Value > MaxChannelValue then Value := MaxChannelValue;
+                Dest.FData[DestPos + Channel] := Value;
+              end;
+          end;
+        end;
+      end;
+    end
+    else if Converted <> Dest then
+    begin
+      Dest.ReSize(Converted);
+      Dest.Copy(Converted);
+    end;
+  finally
+    if OwnsConverted then Converted.Free;
+  end;
+  Scale := (OutputMax - OutputMin) / MaxChannelValue;
+  if Scale <> 1 then Dest.Mul(Scale);
+  if OutputMin <> 0 then Dest.Add(OutputMin);
 end;
 
 procedure ResizeImagePIL(Source, Dest: TNNetVolume; NewSizeX,

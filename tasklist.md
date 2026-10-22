@@ -603,9 +603,11 @@ rather than acted on.
               fresh AddNoise draws, not diffusers' after-step blend with the
               initial noise) and TestDiffusionInpaintSmoke, superseded by
               TStableDiffusionInpainter. DONE: both removed; no other caller.
-        - [ ] Two diffusers image-processor ports: DiffusersPrepareImage and
+        - [X] Two diffusers image-processor ports: DiffusersPrepareImage and
               QwenImage21ResizeToRgba/QwenImage21PrepareVaeImage (premultiplied
               RGBA). Fold the Qwen pair onto one routine.
+              DONE: all three replaced by ConvertAndResizeImagePIL (neuralimageresize);
+              bit-exact (TestConvertAndResizeImagePILPinned).
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
       - [ ] Textual inversion on a real checkpoint: SD 1.5 with a

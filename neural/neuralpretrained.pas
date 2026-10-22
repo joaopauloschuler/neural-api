@@ -9895,13 +9895,6 @@ const
   // Most condition images one edit takes (the example's limit too).
   csQwenImage21MaxConditionImages = 10;
 
-// Source (W, H, 3|4) in 0..255 to (Width, Height, 4) RGBA in 0..255; RGB gets
-// alpha 255. PIL's LANCZOS on premultiplied RGBA, in float (no 8 bits).
-procedure QwenImage21ResizeToRgba(Source: TNNetVolume; Width,
-  Height: integer; Rgba: TNNetVolume);
-// QwenImage21ResizeToRgba, then scaled to the VAE input range [-1, 1].
-procedure QwenImage21PrepareVaeImage(Source: TNNetVolume; Width,
-  Height: integer; VaeImage: TNNetVolume);
 // Inpaint mask (W, H, 1|3|4) in 0..255 (white = regenerate, black = keep)
 // -> MaskLatents (tokens, 1, Channels) of 0/1, the layout of the latents of a
 // Width x Height image, as diffusers' mask processor and prepare_mask_latents
@@ -12540,10 +12533,6 @@ function T2IAdapterCondInput(Net: TNNet): TNNetLayer;
 procedure T2IAdapterFeatures(Net: TNNet; const Config: TT2IAdapterConfig;
   Cond: TNNetVolume; Features: array of TNNetVolume);
 
-// Source (W, H, 1|3|4) in 0..255 -> Dest (Width, Height, Channels) in [0, 1]
-// as diffusers' image processors: PIL 'L' for 1 channel, alpha dropped, Lanczos.
-procedure DiffusersPrepareImage(Source: TNNetVolume; Width, Height,
-  Channels: integer; Dest: TNNetVolume);
 // Inpaint mask (W, H, 1|3|4) in 0..255 (white = regenerate) -> BinaryMask
 // (Width, Height, 1) of 0/1 as diffusers' mask processor (gray, resize, >= 0.5).
 procedure DiffusersBinarizeMask(Mask: TNNetVolume; Width, Height: integer;
@@ -93712,60 +93701,6 @@ procedure TStableDiffusionConditioner.EndDenoise();
 begin
 end;
 
-procedure DiffusersPrepareImage(Source: TNNetVolume; Width, Height,
-  Channels: integer; Dest: TNNetVolume);
-const
-  MaxChannelValue: TNeuralFloat = 255;
-  // PIL 'L' = (R*19595 + G*38470 + B*7471 + 0x8000) >> 16.
-  csLumaR = 19595;
-  csLumaG = 38470;
-  csLumaB = 7471;
-  csLumaRound = 32768;
-var
-  Converted: TNNetVolume;
-  PixelPos, MaxPixelPos, SourcePos, DestPos, Channel, MaxChannel: integer;
-begin
-  if (Source.Depth <> 1) and (Source.Depth <> 3) and (Source.Depth <> 4) then
-    ImportError('DiffusersPrepareImage: the image has ' +
-      IntToStr(Source.Depth) + ' channels, expected gray, RGB or RGBA.');
-  if (Channels <> 1) and (Channels <> 3) then
-    ImportError('DiffusersPrepareImage: ' + IntToStr(Channels) +
-      ' output channels; 1 or 3 are supported.');
-  if Source = Dest then
-    ImportError('DiffusersPrepareImage: Dest must not be Source.');
-  Converted := TNNetVolume.Create(Source.SizeX, Source.SizeY, Channels);
-  try
-    MaxPixelPos := Source.SizeX * Source.SizeY - 1;
-    MaxChannel := Channels - 1;
-    for PixelPos := 0 to MaxPixelPos do
-    begin
-      SourcePos := PixelPos * Source.Depth;
-      DestPos := PixelPos * Channels;
-      if Source.Depth = 1 then
-        for Channel := 0 to MaxChannel do
-          Converted.FData[DestPos + Channel] := Source.FData[SourcePos]
-      else if Channels = 1 then
-        Converted.FData[DestPos] := Trunc((Source.FData[SourcePos] * csLumaR +
-          Source.FData[SourcePos + 1] * csLumaG +
-          Source.FData[SourcePos + 2] * csLumaB + csLumaRound) / 65536)
-      else
-        for Channel := 0 to MaxChannel do
-          Converted.FData[DestPos + Channel] :=
-            Source.FData[SourcePos + Channel];
-    end;
-    if (Source.SizeX <> Width) or (Source.SizeY <> Height) then
-      ResizeImageLanczos(Converted, Dest, Width, Height)
-    else
-    begin
-      Dest.ReSize(Converted);
-      Dest.Copy(Converted);
-    end;
-    Dest.Mul(1 / MaxChannelValue);
-  finally
-    Converted.Free;
-  end;
-end;
-
 procedure DiffusersBinarizeMask(Mask: TNNetVolume; Width, Height: integer;
   BinaryMask: TNNetVolume);
 const
@@ -93775,9 +93710,13 @@ var
   Gray: TNNetVolume;
   PixelPos, MaxPixelPos: integer;
 begin
+  if (Mask.Depth <> 1) and (Mask.Depth <> 3) and (Mask.Depth <> 4) then
+    ImportError('DiffusersBinarizeMask: the mask has ' +
+      IntToStr(Mask.Depth) + ' channels, expected gray, RGB or RGBA.');
   Gray := TNNetVolume.Create();
   try
-    DiffusersPrepareImage(Mask, Width, Height, 1, Gray);
+    ConvertAndResizeImagePIL(Mask, Gray, Width, Height, 1,
+      {ClipToByteRange=}false, 0, 1);
     BinaryMask.ReSize(Width, Height, 1);
     MaxPixelPos := Gray.Size - 1;
     // Gray is in [0, 1]; compare in 0..255 so integer levels stay exact.
@@ -93897,8 +93836,9 @@ begin
     FNetEpoch := Pipeline.ComponentEpoch;
     Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8);
   end;
-  DiffusersPrepareImage(FSourceImage, FNetConfig.CondGrid,
-    CondGridYOf(FNetConfig), FConfig.CondChannels, FControlImage);
+  ConvertAndResizeImagePIL(FSourceImage, FControlImage, FNetConfig.CondGrid,
+    CondGridYOf(FNetConfig), FConfig.CondChannels, {ClipToByteRange=}false,
+    0, 1);
   if Length(FDownResiduals) <> FConfig.NumDownResiduals then
   begin
     SetLength(FDownResiduals, FConfig.NumDownResiduals);
@@ -94020,8 +93960,9 @@ begin
     for FeaturePos := 0 to MaxFeaturePos do
       FFeatures[FeaturePos] := TNNetVolume.Create();
   end;
-  DiffusersPrepareImage(FSourceImage, FNetConfig.CondGrid,
-    CondGridYOf(FNetConfig), FConfig.CondChannels, FHintImage);
+  ConvertAndResizeImagePIL(FSourceImage, FHintImage, FNetConfig.CondGrid,
+    CondGridYOf(FNetConfig), FConfig.CondChannels, {ClipToByteRange=}false,
+    0, 1);
   T2IAdapterFeatures(FNet, FNetConfig, FHintImage, FFeatures);
   MaxFeaturePos := High(FFeatures);
   if FConditioningScale <> 1 then
@@ -94310,7 +94251,8 @@ begin
   KeepMask := TNNetVolume.Create();
   try
     StartLoadPhase();
-    DiffusersPrepareImage(FSourceImage, Width, Height, 3, VaeImage);
+    ConvertAndResizeImagePIL(FSourceImage, VaeImage, Width, Height, 3,
+      {ClipToByteRange=}false, 0, 1);
     VaeImage.Mul(2);
     VaeImage.Add(-1);
     DiffusersBinarizeMask(FSourceMask, Width, Height, BinaryMask);
@@ -96025,108 +95967,6 @@ begin
   end;
 end;
 
-procedure QwenImage21ResizeToRgba(Source: TNNetVolume; Width,
-  Height: integer; Rgba: TNNetVolume);
-const
-  MaxChannelValue: TNeuralFloat = 255;
-var
-  RgbaCopy, Resampled: TNNetVolume;
-  PixelPos, MaxPixelPos, SourcePos, RgbaPos, Channel: integer;
-  Alpha, Value: TNeuralFloat;
-  IsOpaque, IsResized, IsPremultiplied, OwnsRgbaCopy: boolean;
-begin
-  if (Source.Depth <> 3) and (Source.Depth <> 4) then
-    ImportError('QwenImage21ResizeToRgba: the image has ' +
-      IntToStr(Source.Depth) + ' channels, expected RGB or RGBA.');
-  if (Width < 1) or (Height < 1) then
-    ImportError('QwenImage21ResizeToRgba: target size ' + IntToStr(Width) +
-      'x' + IntToStr(Height) + ' is empty.');
-  IsResized := (Source.SizeX <> Width) or (Source.SizeY <> Height);
-  MaxPixelPos := Source.SizeX * Source.SizeY - 1;
-  IsOpaque := true;
-  if Source.Depth = 4 then
-    for PixelPos := 0 to MaxPixelPos do
-      if Source.FData[PixelPos * 4 + 3] < MaxChannelValue then
-      begin
-        IsOpaque := false;
-        break;
-      end;
-  // PIL resizes RGBA as premultiplied "RGBa" and clips to 0..255.
-  IsPremultiplied := IsResized and not IsOpaque;
-  RgbaCopy := nil;
-  OwnsRgbaCopy := false;
-  try
-    // An RGBA copy only to add the alpha channel or to premultiply.
-    if (Source.Depth = 3) or IsPremultiplied then
-    begin
-      if IsResized or (Source = Rgba) then
-      begin
-        RgbaCopy := TNNetVolume.Create();
-        OwnsRgbaCopy := true;
-      end
-      else RgbaCopy := Rgba;
-      RgbaCopy.ReSize(Source.SizeX, Source.SizeY, 4);
-      for PixelPos := 0 to MaxPixelPos do
-      begin
-        SourcePos := PixelPos * Source.Depth;
-        RgbaPos := PixelPos * 4;
-        if Source.Depth = 4 then Alpha := Source.FData[SourcePos + 3]
-        else Alpha := MaxChannelValue;
-        for Channel := 0 to 2 do
-          RgbaCopy.FData[RgbaPos + Channel] :=
-            Source.FData[SourcePos + Channel];
-        if IsPremultiplied then
-          for Channel := 0 to 2 do
-            RgbaCopy.FData[RgbaPos + Channel] :=
-              RgbaCopy.FData[RgbaPos + Channel] * (Alpha / MaxChannelValue);
-        RgbaCopy.FData[RgbaPos + 3] := Alpha;
-      end;
-      Resampled := RgbaCopy;
-    end
-    else Resampled := Source;
-    if IsResized then
-    begin
-      ResizeImageLanczos(Resampled, Rgba, Width, Height);
-      MaxPixelPos := Width * Height - 1;
-      for PixelPos := 0 to MaxPixelPos do
-      begin
-        RgbaPos := PixelPos * 4;
-        for Channel := 0 to 3 do
-        begin
-          Value := Rgba.FData[RgbaPos + Channel];
-          if Value < 0 then Rgba.FData[RgbaPos + Channel] := 0
-          else if Value > MaxChannelValue then
-            Rgba.FData[RgbaPos + Channel] := MaxChannelValue;
-        end;
-        Alpha := Rgba.FData[RgbaPos + 3];
-        // PIL's rgba2rgbA leaves a pixel with alpha 0 premultiplied.
-        if IsPremultiplied and (Alpha > 0) and (Alpha < MaxChannelValue) then
-          for Channel := 0 to 2 do
-          begin
-            Value := Rgba.FData[RgbaPos + Channel] * MaxChannelValue /
-              Alpha;
-            if Value > MaxChannelValue then Value := MaxChannelValue;
-            Rgba.FData[RgbaPos + Channel] := Value;
-          end;
-      end;
-    end
-    else if Resampled <> Rgba then Rgba.Copy(Resampled);
-  finally
-    if OwnsRgbaCopy then RgbaCopy.Free;
-  end;
-end;
-
-procedure QwenImage21PrepareVaeImage(Source: TNNetVolume; Width,
-  Height: integer; VaeImage: TNNetVolume);
-const
-  MaxChannelValue: TNeuralFloat = 255;
-begin
-  QwenImage21ResizeToRgba(Source, Width, Height, VaeImage);
-  // pixel / 255 * 2 - 1, as the VaeImageProcessor normalises.
-  VaeImage.Mul(2 / MaxChannelValue);
-  VaeImage.Add(-1);
-end;
-
 procedure QwenImage21MaskToLatents(Mask: TNNetVolume; Width, Height,
   Channels: integer; MaskLatents: TNNetVolume);
 var
@@ -97100,7 +96940,8 @@ begin
     Encoder := AcquireVaeEncoder();
     try
       DoPhase(qppEncodeImage);
-      QwenImage21PrepareVaeImage(Image, Width, Height, VaeImage);
+      ConvertAndResizeImagePIL(Image, VaeImage, Width, Height, 4,
+        {ClipToByteRange=}true, -1, 1);
       Encoder.Encode(VaeImage, ImageLatents);
       QwenImage21LatentToTokens(ImageLatents);
     finally
@@ -97227,8 +97068,9 @@ begin
       for ImagePos := 0 to MaxImagePos do
       begin
         Resized[ImagePos] := TNNetVolume.Create();
-        QwenImage21ResizeToRgba(Images[ImagePos], Widths[ImagePos],
-          Heights[ImagePos], Resized[ImagePos]);
+        ConvertAndResizeImagePIL(Images[ImagePos], Resized[ImagePos],
+          Widths[ImagePos], Heights[ImagePos], 4, {ClipToByteRange=}true, 0,
+          255);
       end;
       SetLength(FConditionEmbeds, ImageCount);
       SetLength(FConditionLatents, ImageCount);
@@ -97274,8 +97116,9 @@ begin
         DoPhase(qppEncodeImage);
         for ImagePos := 0 to MaxImagePos do
         begin
-          QwenImage21PrepareVaeImage(Resized[ImagePos],
-            Resized[ImagePos].SizeX, Resized[ImagePos].SizeY, VaeImage);
+          ConvertAndResizeImagePIL(Resized[ImagePos], VaeImage,
+            Resized[ImagePos].SizeX, Resized[ImagePos].SizeY, 4,
+            {ClipToByteRange=}true, -1, 1);
           Encoder.Encode(VaeImage, FConditionLatents[ImagePos]);
           QwenImage21LatentToTokens(FConditionLatents[ImagePos]);
         end;
