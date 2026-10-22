@@ -1206,6 +1206,10 @@ type
     procedure TestDPTHybridConfigFromJSONFile;
     procedure TestDPTHybridDepthEstimationParity;
     procedure TestDPTViTDepthEstimationParity;
+    procedure TestDPTViTResizedParity;
+    procedure TestDPTHybridResizedParity;
+    procedure TestDepthAnythingV2ResizedParity;
+    procedure TestDPTResizeOutputSize;
     procedure TestDepthAnythingV2Parity;
     procedure TestVideoMAEConfigFromJSONFile;
     procedure TestVideoMAEClassificationParity;
@@ -40873,16 +40877,15 @@ var
   Output: TNNetVolume;
   CaseCnt, x, yy, c, FlatIdx, GW, GH, W, H, NumCh: integer;
 begin
-  NN := BuildDPTFromSafeTensors(WeightsFile, Config, {pTrainable=}true,
-    ConfigFile);
+  // A case's in_w / in_h (default image_size) is the size the net is built for.
+  Config := ReadDPTConfigFromJSONFile(ConfigFile);
+  NN := nil;
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
   Result := 0;
-  W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;
   NumCh := Config.Backbone.NumChannels;
   try
-    AssertTrue('net built', NN <> nil);
     RefJson.LoadFromFile(IoFile);
     RefRoot := GetJSON(RefJson.Text);
     CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
@@ -40890,6 +40893,15 @@ begin
     for CaseCnt := 0 to CasesArr.Count - 1 do
     begin
       CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      W := CaseObj.Get('in_w', Config.Backbone.ImageSize);
+      H := CaseObj.Get('in_h', Config.Backbone.ImageSize);
+      if (NN = nil) or (W <> Config.InputWidth) or (H <> Config.InputHeight) then
+      begin
+        FreeAndNil(NN);
+        Config.InputWidth := W;
+        Config.InputHeight := H;
+        NN := BuildDPTFromSafeTensorsEx(WeightsFile, Config, {pTrainable=}true);
+      end;
       InArr := TJSONArray(CaseObj.Find('input'));
       OutArr := TJSONArray(CaseObj.Find('output'));
       GW := CaseObj.Get('out_grid_w', 0);
@@ -40921,6 +40933,81 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// tiny_dpt_vit at 16x16 and 48x16 (native 32x32): the position grid resized
+// bilinearly as DPTViTEmbeddings._resize_pos_embed does; oracle = transformers.
+procedure TTestNeuralPretrained.TestDPTViTResizedParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := DPTDepthParityMaxDiff(
+    FixturePath('tiny_dpt_vit' + DirectorySeparator + 'model.safetensors'),
+    FixturePath('tiny_dpt_vit' + DirectorySeparator + 'config.json'),
+    FixturePath('tiny_dpt_vit_resized_io.json'));
+  WriteLn('  ViT DPT resized depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('ViT DPT resized depth: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// The pico DPT-Hybrid estimator at 96x32 (native 64x64).
+procedure TTestNeuralPretrained.TestDPTHybridResizedParity;
+var
+  Folder: string;
+  MaxDiff: double;
+begin
+  Folder := 'tiny_sd2_depth_estimator' + DirectorySeparator +
+    'depth_estimator' + DirectorySeparator;
+  MaxDiff := DPTDepthParityMaxDiff(FixturePath(Folder + 'model.safetensors'),
+    FixturePath(Folder + 'config.json'),
+    FixturePath('tiny_dpt_hybrid_resized_io.json'));
+  WriteLn('  DPT-Hybrid resized depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('DPT-Hybrid resized depth: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// tiny_depth_anything_v2 at 16x10 (native 12x12, an odd 8x5 grid): bicubic
+// position resize (Dinov2Embeddings.interpolate_pos_encoding).
+procedure TTestNeuralPretrained.TestDepthAnythingV2ResizedParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := DPTDepthParityMaxDiff(
+    FixturePath('tiny_depth_anything_v2.safetensors'),
+    FixturePath('tiny_depth_anything_v2_config.json'),
+    FixturePath('tiny_depth_anything_v2_resized_io.json'));
+  WriteLn('  Depth Anything V2 resized depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('Depth Anything V2 resized depth: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// DPTResizeOutputSize vs transformers get_resize_output_image_size.
+procedure TTestNeuralPretrained.TestDPTResizeOutputSize;
+var
+  Config: TDPTImageProcessorConfig;
+
+  procedure Check(ImageW, ImageH, SizeW, SizeH: integer; KeepAspect: boolean;
+    MultipleOf, ExpectedW, ExpectedH: integer);
+  var
+    OutW, OutH: integer;
+  begin
+    Config.Clip.DoResize := true;
+    Config.Clip.ResizeWidth := SizeW;
+    Config.Clip.ResizeHeight := SizeH;
+    Config.KeepAspectRatio := KeepAspect;
+    Config.EnsureMultipleOf := MultipleOf;
+    DPTResizeOutputSize(Config, ImageW, ImageH, OutW, OutH);
+    AssertEquals(Format('%dx%d width', [ImageW, ImageH]), ExpectedW, OutW);
+    AssertEquals(Format('%dx%d height', [ImageW, ImageH]), ExpectedH, OutH);
+  end;
+
+begin
+  Check(640, 480, 518, 518, true, 14, 686, 518);
+  Check(480, 640, 518, 518, true, 14, 518, 686);
+  Check(640, 480, 384, 384, false, 1, 384, 384);
+  Check(1000, 750, 384, 384, true, 32, 512, 384);
+  Check(500, 375, 384, 384, true, 32, 512, 384);
+  Check(100, 1000, 64, 32, true, 16, 64, 640);
 end;
 
 // The DPT-Hybrid config of the pico depth2img estimator: ViT fields at the top

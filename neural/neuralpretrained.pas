@@ -14926,6 +14926,9 @@ type
     ReadoutType: string;              // readout_type: 'ignore', 'add', 'project'
     NeckIgnoreStages: array[0..3] of boolean; // neck_ignore_stages (hybrid)
     AddProjection: boolean;           // add_projection (3x3 conv before the head)
+    // The built net's input size (multiples of PatchSize; 0 = image_size); the
+    // position table is resized to that patch grid as transformers does.
+    InputWidth, InputHeight: integer;
   end;
 
 // Reads a HF Depth-Anything / DPT config.json (model_type "depth_anything" or
@@ -14940,14 +14943,8 @@ function ReadDPTConfigFromJSONFile(const FileName: string): TDPTConfig;
 
 function DPTConfigToString(const Config: TDPTConfig): string;
 
-// Builds the DPT / Depth-Anything depth-estimation net described by Config and
-// loads every weight from Reader (the caller owns Reader). The net takes an
-// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs a
-// (ImageSize, ImageSize, 1) per-pixel depth map (full input resolution), exactly
-// HF's predicted_depth. The DINOv2 encoder is reused (inline blocks tapped at
-// each hooked stage, shared final LayerNorm); the genuinely new code is the
-// convolutional reassemble/fusion neck + 3-conv depth head. pTrainable=False frees
-// training volumes during build.
+// Builds + loads (caller owns Reader) the DPT / Depth-Anything net: normalized
+// (InputWidth, InputHeight, NumChannels) RGB -> HF's predicted_depth map.
 function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
   const Config: TDPTConfig; pTrainable: boolean = true): TNNet; overload;
 
@@ -14961,6 +14958,28 @@ function BuildDPTFromSafeTensorsEx(const FileName: string;
 function BuildDPTFromSafeTensors(const FileName: string;
   out Config: TDPTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
+
+type
+  // A DPTImageProcessor preprocessor_config.json: Clip holds size, resample,
+  // rescale and mean/std (IMAGENET_STANDARD 0.5 when absent).
+  TDPTImageProcessorConfig = record
+    Clip: TClipImageProcessorConfig;
+    KeepAspectRatio: boolean;   // keep_aspect_ratio
+    EnsureMultipleOf: integer;  // ensure_multiple_of
+  end;
+
+function ReadDPTImageProcessorConfig(
+  const FileName: string): TDPTImageProcessorConfig;
+
+// transformers DPT get_resize_output_image_size: the size an ImageWidth x
+// ImageHeight image is resized to (keep_aspect_ratio, ensure_multiple_of).
+procedure DPTResizeOutputSize(const Config: TDPTImageProcessorConfig;
+  ImageWidth, ImageHeight: integer; out OutWidth, OutHeight: integer);
+
+// Src (W,H,3) RGB 0..255 -> Dst normalized at DPTResizeOutputSize; build the
+// DPT net with InputWidth/InputHeight = Dst.SizeX/SizeY.
+procedure DPTPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TDPTImageProcessorConfig);
 
 // ---------------------------------------------------------------------------
 // Depth Anything V2 monocular RELATIVE-depth importer (model_type
@@ -86439,6 +86458,8 @@ begin
     Result.HeadInIndex := Obj.Get('head_in_index', -1);
     Result.DepthEstimationType := Obj.Get('depth_estimation_type', 'relative');
     Result.MaxDepth := Obj.Get('max_depth', double(1));
+    Result.InputWidth := Result.Backbone.ImageSize;
+    Result.InputHeight := Result.Backbone.ImageSize;
   finally
     if Root <> nil then Root.Free;
     JsonText.Free;
@@ -86464,7 +86485,8 @@ begin
     ', type=' + Config.DepthEstimationType +
     ', max_depth=' + FloatToStr(Config.MaxDepth) +
     ', readout=' + Config.ReadoutType +
-    ', hybrid=' + BoolToStr(Config.IsHybrid, true);
+    ', hybrid=' + BoolToStr(Config.IsHybrid, true) +
+    ', input=' + IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
 end;
 
 // Loads a bias-FREE nn.Conv2d (weight [OutCh,InCh,K,K]) into a CAI conv layer
@@ -86666,6 +86688,19 @@ begin
   Result := Config.Backbone.ModelType = 'dinov2';
 end;
 
+// The built net's input size (InputWidth x InputHeight, 0 = image_size) and its
+// patch grid.
+procedure DPTInputGeometry(const Config: TDPTConfig;
+  out InputX, InputY, GridX, GridY: integer);
+begin
+  InputX := Config.InputWidth;
+  InputY := Config.InputHeight;
+  if InputX < 1 then InputX := Config.Backbone.ImageSize;
+  if InputY < 1 then InputY := Config.Backbone.ImageSize;
+  GridX := InputX div Config.Backbone.PatchSize;
+  GridY := InputY div Config.Backbone.PatchSize;
+end;
+
 // Loads a biased patch conv: Name.weight [Hidden, Channels, Patch, Patch] and
 // Name.bias.
 procedure LoadDPTBiasedPatchConv(Reader: TNNetSafeTensorsReader;
@@ -86690,20 +86725,65 @@ begin
   end;
 end;
 
-// Loads Pfx position_embeddings into PosEmb and folds Pfx cls_token into row 0
-// (the cls slot the builders leave at zero).
-procedure LoadDPTPositionTable(Reader: TNNetSafeTensorsReader;
-  PosEmb: TNNetLayer; const Pfx: string; TokenCount, Hidden: integer);
+// torch F.interpolate(Source, size=(OutY, OutX), mode, align_corners) per
+// channel into Dest; Mode as TNNetResize2D (0 nearest, 1 bilinear, 2 bicubic).
+procedure InterpolateVolume2D(Source, Dest: TNNetVolume;
+  OutX, OutY, Mode, AlignCorners: integer);
 var
-  Table: TNNetVolume;
+  ResizeNet: TNNet;
+begin
+  ResizeNet := TNNet.Create();
+  try
+    ResizeNet.AddLayer(TNNetInput.Create(Source.SizeX, Source.SizeY,
+      Source.Depth));
+    ResizeNet.AddLayer(TNNetResize2D.Create(OutX, OutY, Mode, AlignCorners));
+    ResizeNet.Compute(Source);
+    Dest.ReSize(OutX, OutY, Source.Depth);
+    Dest.Copy(ResizeNet.GetLastLayer.Output);
+  finally
+    ResizeNet.Free;
+  end;
+end;
+
+// Loads Pfx position_embeddings (a NativeGrid^2 grid after the cls row) into
+// PosEmb, its grid resized to GridX x GridY (align_corners=False, TNNetResize2D
+// ResizeMode), and folds Pfx cls_token into row 0 (left at zero by the builders).
+procedure LoadDPTPositionTable(Reader: TNNetSafeTensorsReader;
+  PosEmb: TNNetLayer; const Pfx: string;
+  NativeGrid, GridX, GridY, Hidden, ResizeMode: integer);
+var
+  Table, NativeGridTable, ResizedGridTable, Weights: TNNetVolume;
 begin
   Table := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(Pfx + 'position_embeddings', Table);
-    if Table.Size <> TokenCount * Hidden then
-      ImportError('DPT import: position_embeddings size mismatch (native ' +
-        'resolution only).');
-    PosEmb.FArrNeurons[0].Weights.Copy(Table);
+    if Table.Size <> (NativeGrid * NativeGrid + 1) * Hidden then
+      ImportError('DPT import: position_embeddings must hold ' +
+        IntToStr(NativeGrid * NativeGrid + 1) + ' rows of ' + IntToStr(Hidden) +
+        ' (image_size / patch_size squared, plus cls).');
+    Weights := PosEmb.FArrNeurons[0].Weights;
+    if (GridX = NativeGrid) and (GridY = NativeGrid) then
+      Weights.Copy(Table)
+    else
+    begin
+      NativeGridTable := TNNetVolume.Create(NativeGrid, NativeGrid, Hidden);
+      ResizedGridTable := TNNetVolume.Create;
+      try
+        Move(Table.FData[Hidden], NativeGridTable.FData[0],
+          NativeGridTable.Size * csNeuralFloatSize);
+        InterpolateVolume2D(NativeGridTable, ResizedGridTable, GridX, GridY,
+          ResizeMode, {AlignCorners=}0);
+        if Weights.Size <> ResizedGridTable.Size + Hidden then
+          ImportError('DPT import: the position layer does not hold a ' +
+            IntToStr(GridX) + 'x' + IntToStr(GridY) + ' grid.');
+        Move(Table.FData[0], Weights.FData[0], Hidden * csNeuralFloatSize);
+        Move(ResizedGridTable.FData[0], Weights.FData[Hidden],
+          ResizedGridTable.Size * csNeuralFloatSize);
+      finally
+        ResizedGridTable.Free;
+        NativeGridTable.Free;
+      end;
+    end;
     Reader.LoadTensorFlat(Pfx + 'cls_token', Table);
     if Table.Size <> Hidden then
       ImportError('DPT import: cls_token must have ' + IntToStr(Hidden) +
@@ -86945,12 +87025,13 @@ procedure AddDPTDINOv2Backbone(NN: TNNet; const Config: TDPTConfig;
 var
   Bk: TDINOv2Config;
   BlockOut: array of TNNetLayer;
-  Grid, NumPatches, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
+  InputX, InputY, GridX, GridY, NumPatches, Hidden, BlockPos, MaxBlockPos,
+    StagePos: integer;
 begin
   Bk := Config.Backbone;
   Hidden := Bk.HiddenSize;
-  Grid := Bk.ImageSize div Bk.PatchSize;
-  NumPatches := Grid * Grid;
+  DPTInputGeometry(Config, InputX, InputY, GridX, GridY);
+  NumPatches := GridX * GridY;
   Layers.PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
     Hidden, Bk.PatchSize, 0, Bk.PatchSize, 0).SetTrainable(pTrainable));
   NN.AddLayer(TNNetReshape.Create(NumPatches, 1, Hidden));
@@ -86976,7 +87057,8 @@ begin
       TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetTrainable(pTrainable),
       BlockOut[Config.OutIndices[StagePos] - 1]);
     NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
-    StageMaps[StagePos] := NN.AddLayer(TNNetReshape.Create(Grid, Grid, Hidden));
+    StageMaps[StagePos] := NN.AddLayer(TNNetReshape.Create(GridX, GridY,
+      Hidden));
   end;
 end;
 
@@ -86985,18 +87067,19 @@ procedure LoadDPTDINOv2BackboneWeights(Reader: TNNetSafeTensorsReader;
 var
   Bk: TDINOv2Config;
   Pfx: string;
-  Grid, BlockPos, MaxBlockPos, StagePos: integer;
+  InputX, InputY, GridX, GridY, BlockPos, MaxBlockPos, StagePos: integer;
 begin
   Bk := Config.Backbone;
-  Grid := Bk.ImageSize div Bk.PatchSize;
+  DPTInputGeometry(Config, InputX, InputY, GridX, GridY);
   if Reader.HasTensor('backbone.embeddings.cls_token') then Pfx := 'backbone.'
   else if Reader.HasTensor('dinov2.embeddings.cls_token') then Pfx := 'dinov2.'
   else Pfx := '';
   LoadDPTBiasedPatchConv(Reader, Layers.PatchConv,
     Pfx + 'embeddings.patch_embeddings.projection', Bk.NumChannels,
     Bk.PatchSize, Bk.HiddenSize);
+  // Dinov2Embeddings.interpolate_pos_encoding: bicubic.
   LoadDPTPositionTable(Reader, Layers.PosEmb, Pfx + 'embeddings.',
-    Grid * Grid + 1, Bk.HiddenSize);
+    Bk.ImageSize div Bk.PatchSize, GridX, GridY, Bk.HiddenSize, {bicubic}2);
   MaxBlockPos := Bk.NumLayers - 1;
   for BlockPos := 0 to MaxBlockPos do
     LoadDINOv2EncoderBlockWeights(Reader, Layers.Blocks[BlockPos],
@@ -87026,24 +87109,25 @@ var
   Bk: TDINOv2Config;
   BitStageOut: array[0..2] of TNNetLayer;
   BlockOut: array of TNNetLayer;
-  Grid, NumPatches, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
+  InputX, InputY, GridX, GridY, NumPatches, Hidden, BlockPos, MaxBlockPos,
+    StagePos: integer;
   Hook, Tokens, ClsMap: TNNetLayer;
 begin
   Bk := Config.Backbone;
   Hidden := Bk.HiddenSize;
-  Grid := Bk.ImageSize div Bk.PatchSize;
-  NumPatches := Grid * Grid;
+  DPTInputGeometry(Config, InputX, InputY, GridX, GridY);
+  NumPatches := GridX * GridY;
   Layers.PatchConv := nil;
   Layers.Projection := nil;
   if Config.IsHybrid then
   begin
     AddDPTBiTBackbone(NN, Config.Bit, pTrainable, Layers, BitStageOut);
-    if (BitStageOut[2].Output.SizeX <> Grid) or
-      (BitStageOut[2].Output.SizeY <> Grid) then
+    if (BitStageOut[2].Output.SizeX <> GridX) or
+      (BitStageOut[2].Output.SizeY <> GridY) then
       ImportError('DPT import: the BiT stage-3 map is ' +
         IntToStr(BitStageOut[2].Output.SizeX) + 'x' +
         IntToStr(BitStageOut[2].Output.SizeY) + '; the position table needs ' +
-        IntToStr(Grid) + 'x' + IntToStr(Grid) + ' (image_size / patch_size).');
+        IntToStr(GridX) + 'x' + IntToStr(GridY) + ' (input / patch_size).');
     Layers.Projection := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
   end
@@ -87076,12 +87160,12 @@ begin
     // The hooked block output, without the final LayerNorm.
     Hook := BlockOut[Config.OutIndices[StagePos] - 1];
     NN.AddLayerAfter(TNNetCrop.Create(1, 0, NumPatches, 1), Hook);
-    Tokens := NN.AddLayer(TNNetReshape.Create(Grid, Grid, Hidden));
+    Tokens := NN.AddLayer(TNNetReshape.Create(GridX, GridY, Hidden));
     if Config.ReadoutType <> 'ignore' then
     begin
       // The cls row, repeated over the grid.
       NN.AddLayerAfter(TNNetCrop.Create(0, 0, 1, 1), Hook);
-      ClsMap := NN.AddLayer(TNNetBilinearResize.Create(Grid, Grid, 0));
+      ClsMap := NN.AddLayer(TNNetBilinearResize.Create(GridX, GridY, 0));
       if Config.ReadoutType = 'add' then
         NN.AddLayer(TNNetSum.Create([Tokens, ClsMap]))
       else
@@ -87103,11 +87187,12 @@ procedure LoadDPTViTBackboneWeights(Reader: TNNetSafeTensorsReader;
 var
   Bk: TDINOv2Config;
   Pfx, ReadoutName: string;
-  Grid, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
+  InputX, InputY, GridX, GridY, Hidden, BlockPos, MaxBlockPos,
+    StagePos: integer;
 begin
   Bk := Config.Backbone;
   Hidden := Bk.HiddenSize;
-  Grid := Bk.ImageSize div Bk.PatchSize;
+  DPTInputGeometry(Config, InputX, InputY, GridX, GridY);
   if Reader.HasTensor('dpt.embeddings.cls_token') then Pfx := 'dpt.'
   else Pfx := '';
   if Config.IsHybrid then
@@ -87122,8 +87207,9 @@ begin
     LoadDPTBiasedPatchConv(Reader, Layers.PatchConv,
       Pfx + 'embeddings.patch_embeddings.projection', Bk.NumChannels,
       Bk.PatchSize, Hidden);
+  // DPTViT(Hybrid)Embeddings._resize_pos_embed: bilinear.
   LoadDPTPositionTable(Reader, Layers.PosEmb, Pfx + 'embeddings.',
-    Grid * Grid + 1, Hidden);
+    Bk.ImageSize div Bk.PatchSize, GridX, GridY, Hidden, {bilinear}1);
   MaxBlockPos := Bk.NumLayers - 1;
   for BlockPos := 0 to MaxBlockPos do
     LoadViTEncoderBlockWeights(Reader, Layers.Blocks[BlockPos],
@@ -87146,7 +87232,7 @@ procedure AddDPTNeckAndHead(NN: TNNet; const Config: TDPTConfig;
 var
   Reassembled: array[0..3] of TNNetLayer;
   Cur, Residual: TNNetLayer;
-  StagePos, FusionPos, K, Fus, TargetX, TargetY: integer;
+  StagePos, FusionPos, K, Fus, TargetX, TargetY, InputX, InputY: integer;
   Fac: double;
   IsDepthAnything: boolean;
 begin
@@ -87248,9 +87334,9 @@ begin
   // Bilinear (align corners) to the input size (Depth Anything) or 2x (DPT).
   if IsDepthAnything then
   begin
-    TargetX := (Config.Backbone.ImageSize div Config.Backbone.PatchSize) *
-      Config.Backbone.PatchSize;
-    TargetY := TargetX;
+    DPTInputGeometry(Config, InputX, InputY, TargetX, TargetY);
+    TargetX := TargetX * Config.Backbone.PatchSize;
+    TargetY := TargetY * Config.Backbone.PatchSize;
   end
   else
   begin
@@ -87358,7 +87444,7 @@ var
   DINOv2Layers: TDPTDINOv2Layers;
   ViTLayers: TDPTViTLayers;
   Neck: TDPTNeckLayers;
-  StagePos: integer;
+  StagePos, InputX, InputY, GridX, GridY: integer;
   IsDepthAnything, IsIgnoreExpected: boolean;
 begin
   Bk := Config.Backbone;
@@ -87371,6 +87457,11 @@ begin
     ImportError('DPT import: hidden_size not divisible by num_attention_heads.');
   if (Bk.PatchSize < 1) or ((Bk.ImageSize mod Bk.PatchSize) <> 0) then
     ImportError('DPT import: image_size not a multiple of patch_size.');
+  DPTInputGeometry(Config, InputX, InputY, GridX, GridY);
+  if (InputX mod Bk.PatchSize <> 0) or (InputY mod Bk.PatchSize <> 0) then
+    ImportError('DPT import: the input ' + IntToStr(InputX) + 'x' +
+      IntToStr(InputY) + ' is not a multiple of patch_size ' +
+      IntToStr(Bk.PatchSize) + '.');
   if (LowerCase(Config.DepthEstimationType) <> 'relative') and
      (LowerCase(Config.DepthEstimationType) <> 'metric') then
     ImportError('DPT import: depth_estimation_type "' +
@@ -87400,7 +87491,7 @@ begin
   end;
   NN := TNNet.Create();
   try
-    NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
+    NN.AddLayer(TNNetInput.Create(InputX, InputY, Bk.NumChannels));
     if IsDepthAnything then
       AddDPTDINOv2Backbone(NN, Config, pTrainable, DINOv2Layers, StageMaps)
     else
@@ -87422,6 +87513,96 @@ function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
   const Config: TDPTConfig; pTrainable: boolean): TNNet;
 begin
   Result := BuildDPT(Reader, Config, pTrainable);
+end;
+
+function ReadDPTImageProcessorConfig(
+  const FileName: string): TDPTImageProcessorConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ChannelPos: integer;
+begin
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('DPT image preprocessing: "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.Clip := ReadClipImageProcessorConfigFromJSONText(JsonText.Text,
+      FileName);
+    // DPT always resizes to size {height, width} (an int is a square).
+    Result.Clip.ResizeKeepsAspect := false;
+    Result.Clip.DoCenterCrop := false;
+    for ChannelPos := 0 to 2 do
+    begin
+      if Obj.Find('image_mean') = nil then Result.Clip.Mean[ChannelPos] := 0.5;
+      if Obj.Find('image_std') = nil then Result.Clip.Std[ChannelPos] := 0.5;
+    end;
+    Result.KeepAspectRatio := ReadJSONBoolOrDefault(Obj, 'keep_aspect_ratio',
+      false);
+    Result.EnsureMultipleOf := 1;
+    if (Obj.Find('ensure_multiple_of') <> nil) and
+      (Obj.Find('ensure_multiple_of').JSONType = jtNumber) then
+      Result.EnsureMultipleOf := Obj.Get('ensure_multiple_of', 1);
+    if Result.EnsureMultipleOf < 1 then
+      ImportError('DPT image preprocessing: ensure_multiple_of must be >= 1.');
+    if ReadJSONBoolOrDefault(Obj, 'do_pad', false) or
+      ReadJSONBoolOrDefault(Obj, 'do_center_crop', false) then
+      ImportError('DPT image preprocessing: do_pad / do_center_crop are not ' +
+        'supported.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure DPTResizeOutputSize(const Config: TDPTImageProcessorConfig;
+  ImageWidth, ImageHeight: integer; out OutWidth, OutHeight: integer);
+var
+  ScaleX, ScaleY: double;
+begin
+  if not Config.Clip.DoResize then
+  begin
+    OutWidth := ImageWidth;
+    OutHeight := ImageHeight;
+    Exit;
+  end;
+  ScaleX := Config.Clip.ResizeWidth / ImageWidth;
+  ScaleY := Config.Clip.ResizeHeight / ImageHeight;
+  // keep_aspect_ratio: scale as little as possible.
+  if Config.KeepAspectRatio then
+  begin
+    if Abs(1 - ScaleX) < Abs(1 - ScaleY) then ScaleY := ScaleX
+    else ScaleX := ScaleY;
+  end;
+  // Python round() is round-half-even, as is Round.
+  OutWidth := Round(ScaleX * ImageWidth / Config.EnsureMultipleOf) *
+    Config.EnsureMultipleOf;
+  OutHeight := Round(ScaleY * ImageHeight / Config.EnsureMultipleOf) *
+    Config.EnsureMultipleOf;
+  if (OutWidth < 1) or (OutHeight < 1) then
+    ImportError('DPT image preprocessing: a ' + IntToStr(ImageWidth) + 'x' +
+      IntToStr(ImageHeight) + ' image resizes to ' + IntToStr(OutWidth) + 'x' +
+      IntToStr(OutHeight) + '.');
+end;
+
+procedure DPTPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TDPTImageProcessorConfig);
+var
+  SizedConfig: TClipImageProcessorConfig;
+  OutWidth, OutHeight: integer;
+begin
+  DPTResizeOutputSize(Config, Src.SizeX, Src.SizeY, OutWidth, OutHeight);
+  SizedConfig := Config.Clip;
+  SizedConfig.ResizeWidth := OutWidth;
+  SizedConfig.ResizeHeight := OutHeight;
+  SizedConfig.CropWidth := OutWidth;
+  SizedConfig.CropHeight := OutHeight;
+  ClipPreprocessImage(Src, Dst, SizedConfig);
 end;
 
 // ===========================================================================
@@ -96125,24 +96306,14 @@ end;
 procedure DiffusersDepthToLatentGrid(Depth: TNNetVolume; GridX, GridY: integer;
   DepthLatents: TNNetVolume);
 var
-  ResizeNet: TNNet;
   DepthMin, DepthRange: TNeuralFloat;
 begin
   if (Depth.Depth <> 1) or (Depth.Size = 0) or (GridX < 1) or (GridY < 1) then
     ImportError('DiffusersDepthToLatentGrid: a ' + IntToStr(Depth.SizeX) + 'x' +
       IntToStr(Depth.SizeY) + 'x' + IntToStr(Depth.Depth) + ' depth map does ' +
       'not fit a ' + IntToStr(GridX) + 'x' + IntToStr(GridY) + ' latent grid.');
-  ResizeNet := TNNet.Create();
-  try
-    ResizeNet.AddLayer(TNNetInput.Create(Depth.SizeX, Depth.SizeY, 1));
-    ResizeNet.AddLayer(TNNetResize2D.Create(GridX, GridY, {bicubic}2,
-      {AlignCorners=}0));
-    ResizeNet.Compute(Depth);
-    DepthLatents.ReSize(GridX, GridY, 1);
-    DepthLatents.Copy(ResizeNet.GetLastLayer.Output);
-  finally
-    ResizeNet.Free;
-  end;
+  InterpolateVolume2D(Depth, DepthLatents, GridX, GridY, {bicubic}2,
+    {AlignCorners=}0);
   DepthMin := DepthLatents.GetMin();
   DepthRange := DepthLatents.GetMax() - DepthMin;
   if not (DepthRange > 0) then
@@ -97166,12 +97337,9 @@ end;
 procedure TStableDiffusionDepth2Img.EstimateDepthMap();
 var
   EstimatorFolder, PreprocessFile, ImporterName: string;
-  JsonText: TStringList;
-  Root: TJSONData;
-  Preprocess: TClipImageProcessorConfig;
+  Preprocess: TDPTImageProcessorConfig;
   Config: TDPTConfig;
   RGBImage, Pixels: TNNetVolume;
-  MultipleOf: integer;
 begin
   ImporterName := ClassName + ' depth estimator';
   if FDepthEstimatorFolder <> '' then
@@ -97192,64 +97360,32 @@ begin
       EstimatorFolder + 'config.json" does not exist.');
   if not FileExists(PreprocessFile) then
     ImportError(ImporterName + ': "' + PreprocessFile + '" does not exist.');
-  JsonText := TStringList.Create;
-  Root := nil;
-  try
-    LoadImportJSONText(JsonText, PreprocessFile);
-    Root := GetJSON(JsonText.Text);
-    if not (Root is TJSONObject) then
-      ImportError(ImporterName + ': "' + PreprocessFile +
-        '" is not a JSON object.');
-    MultipleOf := TJSONObject(Root).Get('ensure_multiple_of', 1);
-    // DPTImageProcessor's aspect-keeping resize would need an interpolated
-    // position table; BuildDPT only runs the native image_size.
-    if ReadJSONBoolOrDefault(TJSONObject(Root), 'keep_aspect_ratio', false) then
-      ImportError(ImporterName + ': keep_aspect_ratio is not supported.');
-    Preprocess := ReadClipImageProcessorConfigFromJSONText(JsonText.Text,
-      PreprocessFile);
-    // DPTImageProcessor defaults to IMAGENET_STANDARD (0.5), not CLIP's mean/std.
-    if TJSONObject(Root).Find('image_mean') = nil then
-    begin
-      Preprocess.Mean[0] := 0.5;
-      Preprocess.Mean[1] := 0.5;
-      Preprocess.Mean[2] := 0.5;
-    end;
-    if TJSONObject(Root).Find('image_std') = nil then
-    begin
-      Preprocess.Std[0] := 0.5;
-      Preprocess.Std[1] := 0.5;
-      Preprocess.Std[2] := 0.5;
-    end;
-  finally
-    Root.Free;
-    JsonText.Free;
-  end;
-  Config := ReadDPTConfigFromJSONFile(EstimatorFolder + 'config.json');
-  if (Preprocess.CropWidth <> Config.Backbone.ImageSize) or
-    (Preprocess.CropHeight <> Config.Backbone.ImageSize) or
-    (MultipleOf < 1) or (Config.Backbone.ImageSize mod MultipleOf <> 0) then
-    ImportError(ImporterName + ': the processor size ' +
-      IntToStr(Preprocess.CropWidth) + 'x' + IntToStr(Preprocess.CropHeight) +
-      ' (multiple of ' + IntToStr(MultipleOf) + ') is not the estimator ' +
-      'image_size ' + IntToStr(Config.Backbone.ImageSize) + '.');
-  if not Assigned(FEstimator) or (FNetEpoch <> FPipeline.ComponentEpoch) or
-    (FEstimatorFolder <> EstimatorFolder) then
-  begin
-    FreeAndNil(FEstimator);
-    FEstimator := BuildDPTFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-      EstimatorFolder, 'model'), Config, {pTrainable=}false);
-    Inc(FPipeline.FWeightFileLoadCount);
-    FEstimatorFolder := EstimatorFolder;
-    FNetEpoch := FPipeline.ComponentEpoch;
-    FPipeline.PrepareComponent(FEstimator, {QuantizeInt8=}false);
-  end;
+  Preprocess := ReadDPTImageProcessorConfig(PreprocessFile);
   RGBImage := TNNetVolume.Create;
   Pixels := TNNetVolume.Create;
   try
     if FSourceImage.Depth = 3 then RGBImage.Copy(FSourceImage)
     else ConvertAndResizeImagePIL(FSourceImage, RGBImage, FSourceImage.SizeX,
       FSourceImage.SizeY, 3, {ClipToByteRange=}true, 0, 255);
-    ClipPreprocessImage(RGBImage, Pixels, Preprocess);
+    DPTPreprocessImage(RGBImage, Pixels, Preprocess);
+    // The estimator is built for the processed size, which keep_aspect_ratio
+    // makes depend on the image.
+    if not Assigned(FEstimator) or (FNetEpoch <> FPipeline.ComponentEpoch) or
+      (FEstimatorFolder <> EstimatorFolder) or
+      (FEstimator.Layers[0].Output.SizeX <> Pixels.SizeX) or
+      (FEstimator.Layers[0].Output.SizeY <> Pixels.SizeY) then
+    begin
+      FreeAndNil(FEstimator);
+      Config := ReadDPTConfigFromJSONFile(EstimatorFolder + 'config.json');
+      Config.InputWidth := Pixels.SizeX;
+      Config.InputHeight := Pixels.SizeY;
+      FEstimator := BuildDPTFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+        EstimatorFolder, 'model'), Config, {pTrainable=}false);
+      Inc(FPipeline.FWeightFileLoadCount);
+      FEstimatorFolder := EstimatorFolder;
+      FNetEpoch := FPipeline.ComponentEpoch;
+      FPipeline.PrepareComponent(FEstimator, {QuantizeInt8=}false);
+    end;
     FEstimator.Compute(Pixels);
     FEstimator.GetLastLayer().ForceOutputOnRAM();
     FDepthMap.ReSize(FEstimator.GetLastLayer().Output);

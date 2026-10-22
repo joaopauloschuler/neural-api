@@ -22,10 +22,18 @@ Depth Anything demos visualize depth — alongside a small ASCII preview.
 
 ```
 cd examples/DepthAnythingV2
-lazbuild DepthAnythingV2.lpi --build-mode=Release
+lazbuild DepthAnythingV2.lpi
 ../../bin/x86_64-linux/bin/DepthAnythingV2                   # pico smoke
 ../../bin/x86_64-linux/bin/DepthAnythingV2 model.safetensors # real checkpoint
+../../bin/x86_64-linux/bin/DepthAnythingV2 --size 16x10      # pico at 16x10
 ```
+
+`--size WxH` builds the net for a WxH input (both multiples of `patch_size`)
+instead of the config's square `image_size`; the DINOv2 position table is
+resized bicubically to the new patch grid, as transformers'
+`interpolate_pos_encoding` does. Real Depth Anything checkpoints are run that way:
+their `DPTImageProcessor` keeps the aspect ratio (`keep_aspect_ratio`,
+`ensure_multiple_of` 14), which `DPTPreprocessImage` reproduces.
 
 ## Input
 
@@ -41,4 +49,5 @@ the same synthetic input.
 `depth_pico.pgm` / `depth_pico.ppm` (or `depth_real.*` for a real checkpoint),
 plus the printed depth range and an ASCII preview. Pure CPU, well under a second
 on the fixture. Importer parity is asserted to max |diff| < 1e-4 vs the HF
-`DepthAnythingForDepthEstimation` float64 forward in `TestDepthAnythingV2Parity`.
+`DepthAnythingForDepthEstimation` float64 forward in `TestDepthAnythingV2Parity`
+(native size) and `TestDepthAnythingV2ResizedParity` (16x10).

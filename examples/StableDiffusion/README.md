@@ -224,8 +224,10 @@ latent grid (`TestStableDiffusion2Depth2ImgParity`, and on OpenCL
 `TestStableDiffusion2Depth2ImgOpenCL`), and with the depth estimated by a
 pico DPT-Hybrid (`tests/fixtures/tiny_sd2_depth_estimator`,
 `TestStableDiffusion2Depth2ImgEstimatorParity` / `...EstimatorOpenCL`). No
-real checkpoint has been run yet. The estimator only runs at its native
-`image_size` (`keep_aspect_ratio` processors are refused). With `--repeat N`
+real checkpoint has been run yet. The estimator runs at the size its
+`feature_extractor` resizes the image to (`keep_aspect_ratio` and
+`ensure_multiple_of` included), with the position table interpolated when that
+is not `image_size`; the stock processor resizes to `image_size`. With `--repeat N`
 (`LoadComponents`) it is built once and kept with the other components; it
 still estimates the depth for every image
 (`TestStableDiffusion2Depth2ImgEstimatorKept`).

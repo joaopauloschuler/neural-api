@@ -24,6 +24,7 @@
 /// Usage:
 ///   DepthAnythingV2                      # pico smoke run -> depth_pico.{pgm,ppm}
 ///   DepthAnythingV2 model.safetensors    # real checkpoint, synthetic input
+///   DepthAnythingV2 --size 16x10         # any WxH multiple of patch_size
 ///
 /// Coded by Joao Paulo Schwarz Schuler with Claude (AI).
 /// https://github.com/joaopauloschuler/neural-api
@@ -140,8 +141,8 @@ var
   NN: TNNet;
   Config: TDPTConfig;
   Img, Output: TNNetVolume;
-  ModelPath, ConfigPath, OutBase: string;
-  W, H, GW, GH, i, x, y: integer;
+  ModelPath, ConfigPath, OutBase, SizeArg: string;
+  W, H, GW, GH, i, x, y, ParamPos, SeparatorPos: integer;
   v, dMin, dMax, dRange: TNeuralFloat;
   Gray: array of byte;
   Norm: array of TNeuralFloat;
@@ -149,9 +150,21 @@ begin
   WriteLn('Depth Anything V2 monocular relative-depth -> normalized depth image');
   WriteLn('-------------------------------------------------------------------');
 
-  if ParamCount >= 1 then
+  ModelPath := '';
+  SizeArg := '';
+  ParamPos := 1;
+  while ParamPos <= ParamCount do
   begin
-    ModelPath := ParamStr(1);
+    if (ParamStr(ParamPos) = '--size') and (ParamPos < ParamCount) then
+    begin
+      Inc(ParamPos);
+      SizeArg := ParamStr(ParamPos);
+    end
+    else ModelPath := ParamStr(ParamPos);
+    Inc(ParamPos);
+  end;
+  if ModelPath <> '' then
+  begin
     ConfigPath := ExtractFilePath(ModelPath) + 'config.json';
     OutBase := 'depth_real';
     WriteLn('Real checkpoint: ', ModelPath);
@@ -164,14 +177,29 @@ begin
     WriteLn('Pico smoke run: ', ModelPath);
   end;
 
+  Config := ReadDPTConfigFromJSONFile(ConfigPath);
+  // --size WxH: the position table is interpolated to that patch grid.
+  if SizeArg <> '' then
+  begin
+    SeparatorPos := Pos('x', LowerCase(SizeArg));
+    Config.InputWidth := StrToIntDef(Copy(SizeArg, 1, SeparatorPos - 1), 0);
+    Config.InputHeight := StrToIntDef(Copy(SizeArg, SeparatorPos + 1,
+      Length(SizeArg)), 0);
+    if (SeparatorPos < 2) or (Config.InputWidth < 1) or
+      (Config.InputHeight < 1) then
+    begin
+      WriteLn('--size expects WxH, e.g. 16x10; got "', SizeArg, '".');
+      Halt(1);
+    end;
+  end;
   // pTrainable=false frees per-neuron training buffers during the build.
-  NN := BuildDepthAnythingV2FromSafeTensors(ModelPath, Config,
-    {pTrainable=}false, ConfigPath);
+  NN := BuildDepthAnythingV2FromSafeTensorsEx(ModelPath, Config,
+    {pTrainable=}false);
   Img := TNNetVolume.Create;
   try
     WriteLn('Model: ', DPTConfigToString(Config));
-    W := Config.Backbone.ImageSize;
-    H := Config.Backbone.ImageSize;
+    W := Config.InputWidth;
+    H := Config.InputHeight;
     MakeSyntheticImage(Img, W, H);
 
     NN.Compute(Img);

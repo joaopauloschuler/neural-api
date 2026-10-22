@@ -502,6 +502,11 @@ rather than acted on.
   - [ ] metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
         "metric") untested on a real ckpt.
   - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
+  - [x] non-native / non-square input: DONE, TDPTConfig.InputWidth/InputHeight
+        (bicubic position resize, TestDepthAnythingV2ResizedParity) and
+        examples/DepthAnythingV2 --size WxH.
+  - [ ] real keep_aspect_ratio run (518, ensure_multiple_of 14) with
+        DPTPreprocessImage on a photo; the example has no image input yet.
 
 - [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
       LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
@@ -575,9 +580,28 @@ rather than acted on.
                 TestDPTHybridDepthEstimationParity, TestDPTViTDepthEstimationParity):
             - [ ] Real Intel/dpt-hybrid-midas and Intel/dpt-large runs on the
                   user's GPU box (384x384; compare against transformers).
-            - [ ] Only the native image_size: the position table is not
-                  interpolated, so DPTImageProcessor keep_aspect_ratio /
-                  other sizes are refused.
+            - [x] Only the native image_size: DONE, TDPTConfig.InputWidth/
+                  InputHeight (any multiple of patch_size) resize the position
+                  grid as transformers does (bilinear for DPTViT(Hybrid)
+                  Embeddings, bicubic for Dinov2Embeddings, align_corners
+                  False); ReadDPTImageProcessorConfig / DPTResizeOutputSize /
+                  DPTPreprocessImage port keep_aspect_ratio + ensure_multiple_of
+                  and depth2img builds its estimator at the processed size.
+                  TestDPTViTResizedParity (16x16, 48x16), TestDPTHybridResized
+                  Parity (96x32), TestDepthAnythingV2ResizedParity (16x10),
+                  all < 1e-4 vs tools/make_pico_dpt_resized_cases.py.
+              - [ ] Stock transformers refuses a non-native DPT-Hybrid input
+                    and reshapes a non-square ViT DPT neck input to
+                    sqrt(tokens); the oracle lifts both (image_size override,
+                    patch grid handed to the neck). Our non-square DPT output
+                    follows the DINOv2-backbone DPT path, not stock behaviour.
+              - [ ] A DPT (not Depth Anything) neck level of odd size (an odd
+                    patch grid with a 0.5 reassemble factor) is refused;
+                    DPTFeatureFusionLayer bilinearly resizes the residual
+                    instead.
+              - [ ] DPTPreprocessImage has a size test only
+                    (TestDPTResizeOutputSize); no pixel parity vs
+                    DPTImageProcessor with keep_aspect_ratio.
             - [ ] readout "add" is built but has no fixture; BiT
                   preactivation layers, dilated stages (output_stride reached)
                   and batch-norm fusion units are refused.
