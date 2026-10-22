@@ -7891,7 +7891,8 @@ type
 // "quick_gelu", layer_norm_eps = 1e-5, eos_token_id = 2, num_channels = 3,
 // projection_dim = 512, logit_scale_init_value = 2.6592. hidden_act other
 // than quick_gelu / gelu / gelu_new / gelu_pytorch_tanh is rejected.
-// model_type "clip_text_model" (a flat CLIPTextConfig) fills the text fields only.
+// model_type "clip_text_model" / "clip_vision_model" (a flat CLIPTextConfig /
+// CLIPVisionConfig) fills the text / vision fields only.
 function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
 
 function ClipConfigToString(const Config: TClipConfig): string;
@@ -8604,6 +8605,9 @@ type
 // crop_size and crop_pct per image_processor_type (ResolveHFImageResize).
 function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
+// Same parser fed from a JSON string; SourceName only names it in errors.
+function ReadClipImageProcessorConfigFromJSONText(const JsonSource,
+  SourceName: string): TClipImageProcessorConfig;
 
 // Src (W,H,3) RGB 0..255 -> Dst (CropWidth,CropHeight,3) normalized: PIL
 // shortest-edge or direct (H,W) resize, center crop, rescale, normalize.
@@ -11942,13 +11946,20 @@ function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
 // latent/timestep/text/control inputs and start zero-filled, so a plain
 // SDUNetDenoise on an adapter-enabled net is bit-identical to the base UNet.
 // SDUNetDenoiseWithAdapter fills them.
+//
+// A non-nil IPAdapterReader (an ip-adapter_sd15 file) gives every attn2 the
+// IP-Adapter to_k_ip / to_v_ip attention over two more TNNetInputs (#3, #4)
+// that SDUNetDenoiseWithIPAdapter fills; it refuses pWithControl/pWithAdapter.
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  IPAdapterReader: TNNetSafeTensorsReader = nil): TNNet;
 
+// IPAdapterFile '' builds no IP-Adapter attention.
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  const IPAdapterFile: string = ''): TNNet;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
   out Config: TSDUNetConfig; pTrainable: boolean = true;
@@ -12118,7 +12129,7 @@ type
   TStableDiffusionPipeline = class;
 
   // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
-  // T2I-Adapter, inpainting); this base runs the plain UNet. Coded by Claude (AI).
+  // T2I-Adapter, IP-Adapter, inpainting); this base runs the plain UNet. Coded by Claude (AI).
   TStableDiffusionConditioner = class(TObject)
   protected
     FPipeline: TStableDiffusionPipeline;
@@ -12134,6 +12145,8 @@ type
     // Builds the UNet with the ControlNet skip / T2I-Adapter inputs.
     function UNetWithControl(): boolean; virtual;
     function UNetWithAdapter(): boolean; virtual;
+    // The IP-Adapter weights file the UNet's attn2 layers take ('' for none).
+    function UNetIPAdapterFile(): string; virtual;
     // True when this conditioner can feed a UNet with InChannels inputs.
     function AcceptsUNetInChannels(InChannels,
       LatentChannels: integer): boolean; virtual;
@@ -12203,6 +12216,7 @@ type
     FTextEncoder, FUNet, FVaeDecoder, FVaeEncoder: TNNet;
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
+    FUNetIPAdapterFile: string;
     FVaeGridX, FVaeGridY, FVaeEncoderGridX, FVaeEncoderGridY: integer;
     // Bumped whenever kept nets become stale (OpenCL, int8, unload).
     FComponentEpoch: integer;
@@ -12240,7 +12254,7 @@ type
     // after starting its load phase; ReleaseComponent ends its use.
     function AcquireTextEncoder(SeqLen: integer): TNNet;
     function AcquireUNet(GridX, GridY, TextSeqLen: integer;
-      WithControl, WithAdapter: boolean): TNNet;
+      WithControl, WithAdapter: boolean; const IPAdapterFile: string): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
     function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
     // The Conditioner, or the plain one when none is set.
@@ -12341,8 +12355,8 @@ type
       write SetTextEncoderInt8;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
-    // ControlNet / T2I-Adapter / inpainting for later Denoise calls; nil runs
-    // the plain UNet. Not owned.
+    // ControlNet / T2I-Adapter / IP-Adapter / inpainting for later Denoise
+    // calls; nil runs the plain UNet. Not owned.
     property Conditioner: TStableDiffusionConditioner read FConditioner
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
@@ -12664,12 +12678,10 @@ type
 //       to_k_ip / to_v_ip slices) added to the text stream and scaled by the
 //       fixed conditioning_scale.
 //
-// v1 scope: BuildIPAdapter builds the image_proj module + ONE isolated
-// decoupled cross-attention block (the SAME multi-head construction the SD UNet
-// cross-attn uses, with the extra image K/V tapped in) so the new math is
-// verified end-to-end on the pico oracle (TestIPAdapterParity, max|diff|<1e-4).
-// FULL per-block tapping into BuildSDUNet is a follow-up (the new code is fully
-// exercised by the isolated block). Follow-ups: IP-Adapter-Plus, FaceID, SDXL.
+// BuildIPAdapter builds the image_proj module + ONE isolated decoupled
+// cross-attention block (TestIPAdapterParity). In a full UNet,
+// BuildSDUNet(IPAdapterReader) taps every attn2 and TStableDiffusionIPAdapter
+// runs it in TStableDiffusionPipeline. Follow-ups: IP-Adapter-Plus, FaceID, SDXL.
 type
   TIPAdapterConfig = record
     ClipEmbeddingsDim: integer;   // pooled CLIP image-embedding dim
@@ -12719,6 +12731,61 @@ function IPAdapterImageEmbedInput(Net: TNNet): TNNetLayer;
 // ImageEmbed is (1,1,ClipEmbeddingsDim).
 procedure IPAdapterCrossAttention(Net: TNNet; const Config: TIPAdapterConfig;
   Hidden, Text, ImageEmbed, Output: TNNetVolume);
+
+// ClipEmbeddingsDim / NumImageTokens of an ip-adapter_sd15 file from the
+// image_proj.proj.weight shape; raises unless it maps to CrossAttentionDim.
+function ReadIPAdapterImageProjConfig(Reader: TNNetSafeTensorsReader;
+  CrossAttentionDim: integer): TIPAdapterConfig;
+
+// image_proj alone: (ClipEmbeddingsDim,1,1) image_embeds -> (NumImageTokens,1,
+// CrossAttentionDim) image tokens (diffusers ImageProjection).
+function BuildIPAdapterImageProj(Reader: TNNetSafeTensorsReader;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+
+// SDUNetDenoise of a UNet built with an IP-Adapter: KeyTokens feed to_k_ip and
+// ValueTokens (KeyTokens times the IP-Adapter scale) feed to_v_ip.
+procedure SDUNetDenoiseWithIPAdapter(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  KeyTokens, ValueTokens, Noise: TNNetVolume);
+
+type
+  // diffusers load_ip_adapter (h94/IP-Adapter ip-adapter_sd15): a CLIP image
+  // prompt whose image_proj tokens join every attn2 through to_k_ip / to_v_ip.
+  TStableDiffusionIPAdapter = class(TStableDiffusionConditioner)
+  private
+    FWeightsFile, FImageEncoderFolder: string;
+    FImageEncoderConfig: TClipConfig;
+    FImageProjConfig: TIPAdapterConfig;
+    FImageEncoder, FImageProj: TNNet;
+    FSourceImage, FPixels, FImageEmbeds, FZeroEmbeds: TNNetVolume;
+    // to_k_ip tokens and the Scale-weighted to_v_ip ones, of the image and
+    // of the zero embedding (the unguided CFG half).
+    FImageTokens, FImageValueTokens: TNNetVolume;
+    FUncondTokens, FUncondValueTokens: TNNetVolume;
+    FScale: TNeuralFloat;
+    // Image tokens and their Scale copy of Embeds through image_proj.
+    procedure ProjectImageEmbeds(Embeds, Tokens, ValueTokens: TNNetVolume);
+  public
+    // WeightsFile: ip-adapter_sd15 (.safetensors / .bin); ImageEncoderFolder
+    // '' is image_encoder/ beside it (CLIPVisionModelWithProjection).
+    constructor Create(const WeightsFile: string;
+      const ImageEncoderFolder: string = '');
+    destructor Destroy(); override;
+    // The image prompt (W, H, 3) in 0..255, CLIP-preprocessed per image.
+    procedure SetImage(Image: TNNetVolume);
+    function UNetIPAdapterFile(): string; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure EndDenoise(); override;
+    // diffusers set_ip_adapter_scale (1.0); 0 leaves the text attention alone.
+    property Scale: TNeuralFloat read FScale write FScale;
+    // The image_embeds (ClipEmbeddingsDim, 1, 1) of the last BeginDenoise.
+    property ImageEmbeds: TNNetVolume read FImageEmbeds;
+    property ImageEncoderConfig: TClipConfig read FImageEncoderConfig;
+  end;
 
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL ENCODER), the
@@ -62635,11 +62702,27 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'clip');
-    if (ModelType <> 'clip') and (ModelType <> 'clip_text_model') then
+    if (ModelType <> 'clip') and (ModelType <> 'clip_text_model') and
+      (ModelType <> 'clip_vision_model') then
       ImportError('CLIP import: config model_type is "' + ModelType +
-        '" - only "clip" and "clip_text_model" are supported here (see ' +
-        'BuildFromPretrained for the full dispatch).');
+        '" - only "clip", "clip_text_model" and "clip_vision_model" are ' +
+        'supported here (see BuildFromPretrained for the full dispatch).');
     Result.ModelType := ModelType;
+    if ModelType = 'clip_vision_model' then
+    begin
+      // Vision tower alone (CLIPVisionModelWithProjection): no text fields.
+      FillChar(Result.Text, SizeOf(Result.Text), 0);
+      Result.TextVocabSize := 0;
+      Result.TextMaxPositions := 0;
+      Result.EosTokenId := 0;
+      Result.ProjectionDim := Obj.Get('projection_dim', 512);
+      Result.LogitScale := 0;
+      ReadTower(Obj, Result.Vision);
+      Result.ImageSize := RequiredInt(Obj, 'image_size');
+      Result.PatchSize := RequiredInt(Obj, 'patch_size');
+      Result.NumChannels := Obj.Get('num_channels', 3);
+      exit;
+    end;
     if ModelType = 'clip_text_model' then TowerObj := Obj
     else TowerObj := RequiredSubObject('text_config');
     ReadTower(TowerObj, Result.Text);
@@ -75147,6 +75230,8 @@ type
     LN1, LN2, LN3: TNNetLayer;
     Self_QKV, Self_Out: TNNetLayer;
     Cross_Q, Cross_K, Cross_V, Cross_Out: TNNetLayer;
+    // IP-Adapter to_k_ip / to_v_ip; nil without image tokens.
+    Cross_KIP, Cross_VIP: TNNetLayer;
     FfProj, FfOut: TNNetLayer;
   end;
   // One Transformer2DModel: GN + proj_in/out + a STACK of BasicTransformerBlocks
@@ -75240,6 +75325,8 @@ end;
 // per-head exactly like the VAE mid-attention but with token LayerNorm;
 // cross-attn uses per-head TNNetCrossAttention over the projected text states
 // (the landed two-source recipe).
+// IPKeyTokens / IPValueTokens (IP-Adapter image tokens; the value ones carry
+// the scale) add per-head attention over to_k_ip / to_v_ip to the text one.
 //
 // proj_in/proj_out are built as 1x1 TNNetConvolutionLinear regardless of
 // Config.UseLinearProjection: an nn.Linear over the channel axis and a 1x1 conv
@@ -75248,11 +75335,13 @@ end;
 // Coded by Claude (AI).
 procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
   TextStates, Input: TNNetLayer; Channels, Depth, Heads: integer;
-  pTrainable: boolean; out Refs: TSDAttnLayers);
+  pTrainable: boolean; out Refs: TSDAttnLayers;
+  IPKeyTokens: TNNetLayer = nil; IPValueTokens: TNNetLayer = nil);
 var
-  ResidualIn, Tokens, X1, X2, X3, CrossOut: TNNetLayer;
+  ResidualIn, Tokens, X1, X2, X3, CrossOut, CrossHeads: TNNetLayer;
   KSlice, VSlice, QSlice, KVPack, KProjFull, VProjFull, QProjFull: TNNetLayer;
-  HeadOutputs: array of TNNetLayer;
+  KIPSlice, VIPSlice: TNNetLayer;
+  HeadOutputs, IPHeadOutputs: array of TNNetLayer;
   QChannels: array of integer;
   H, W, HeadDim, hh, dd, Inner, HeadsM1, HeadDimM1, blk: integer;
   DepthM1: integer;
@@ -75272,6 +75361,7 @@ begin
   NN.AddLayer( TNNetReshape.Create(H * W, 1, Channels) );
   Tokens := NN.GetLastLayer();
   SetLength(HeadOutputs, Heads);
+  SetLength(IPHeadOutputs, Heads);
   SetLength(QChannels, HeadDim);
   if Depth < 1 then Depth := 1;
   SetLength(Refs.Blocks, Depth);
@@ -75300,6 +75390,15 @@ begin
     VProjFull := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
     Refs.Blocks[blk].Cross_V := VProjFull;
+    Refs.Blocks[blk].Cross_KIP := nil;
+    Refs.Blocks[blk].Cross_VIP := nil;
+    if IPKeyTokens <> nil then
+    begin
+      Refs.Blocks[blk].Cross_KIP := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), IPKeyTokens);
+      Refs.Blocks[blk].Cross_VIP := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), IPValueTokens);
+    end;
     for hh := 0 to HeadsM1 do
     begin
       for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
@@ -75309,8 +75408,23 @@ begin
       KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
       HeadOutputs[hh] := NN.AddLayerAfter(
         TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
+      if IPKeyTokens <> nil then
+      begin
+        KIPSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels),
+          Refs.Blocks[blk].Cross_KIP);
+        VIPSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels),
+          Refs.Blocks[blk].Cross_VIP);
+        KVPack := NN.AddLayer(TNNetDeepConcat.Create([KIPSlice, VIPSlice]));
+        IPHeadOutputs[hh] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
+      end;
     end;
-    NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+    CrossHeads := NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+    if IPKeyTokens <> nil then
+    begin
+      NN.AddLayer( TNNetDeepConcat.Create(IPHeadOutputs) );
+      NN.AddLayer( TNNetSum.Create([CrossHeads, NN.GetLastLayer()]) );
+    end;
     Refs.Blocks[blk].Cross_Out := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
     CrossOut := NN.GetLastLayer();
@@ -75335,6 +75449,7 @@ begin
     TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualIn]) );
   SetLength(HeadOutputs, 0);
+  SetLength(IPHeadOutputs, 0);
   SetLength(QChannels, 0);
 end;
 
@@ -75443,9 +75558,13 @@ end;
 
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  IPAdapterReader: TNNetSafeTensorsReader = nil): TNNet;
 var
   NN: TNNet;
+  IPKeyInput, IPValueInput: TNNetLayer;
+  IPConfig: TIPAdapterConfig;
+  IPKeyId: integer;
   AdapterInputs: array of TNNetLayer;
   AdapterTop: integer;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
@@ -75475,6 +75594,27 @@ var
   UpSamp: array of TNNetLayer;
   PoppedCh: integer;
   NumResnetM1, TimeEmbedDimM1: integer;
+
+  // to_k_ip / to_v_ip of every attn2 of Refs, numbered as load_ip_adapter.
+  procedure LoadIPAdapterAttn(const Refs: TSDAttnLayers; Channels: integer);
+  var
+    BlockPos, MaxBlockPos: integer;
+    KeyPrefix: string;
+  begin
+    MaxBlockPos := High(Refs.Blocks);
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      KeyPrefix := 'ip_adapter.' + IntToStr(IPKeyId) + '.';
+      LoadLlamaLinearWeights(IPAdapterReader, Refs.Blocks[BlockPos].Cross_KIP,
+        KeyPrefix + 'to_k_ip.weight', Config.CrossAttentionDim, Channels,
+        0, -1, 0, '');
+      LoadLlamaLinearWeights(IPAdapterReader, Refs.Blocks[BlockPos].Cross_VIP,
+        KeyPrefix + 'to_v_ip.weight', Config.CrossAttentionDim, Channels,
+        0, -1, 0, '');
+      Inc(IPKeyId, 2);
+    end;
+  end;
+
 begin
   n := Config.NumBlockOut;
   nM1 := n - 1;
@@ -75486,6 +75626,16 @@ begin
   if (Config.LatentGrid < 1) or (LatentGridYOf(Config) < 1) then
     ImportError('SD UNet import: latent grid ' + IntToStr(Config.LatentGrid) +
       'x' + IntToStr(LatentGridYOf(Config)) + ' must be positive.');
+  IPKeyInput := nil;
+  IPValueInput := nil;
+  if IPAdapterReader <> nil then
+  begin
+    if pWithControl or pWithAdapter then
+      ImportError('SD UNet import: an IP-Adapter does not combine with the ' +
+        'ControlNet / T2I-Adapter inputs.');
+    IPConfig := ReadIPAdapterImageProjConfig(IPAdapterReader,
+      Config.CrossAttentionDim);
+  end;
   NN := TNNet.Create();
   try
     SetLength(DownRes, n);
@@ -75550,6 +75700,15 @@ begin
       TimeCond := NN.AddLayerAfter( [TNNetSum.Create([TFc2, AddFc2])], AddFc2 );
     end;
 
+    // IP-Adapter image tokens for to_k_ip, then the scaled ones for to_v_ip.
+    if IPAdapterReader <> nil then
+    begin
+      IPKeyInput := NN.AddLayer( TNNetInput.Create(IPConfig.NumImageTokens, 1,
+        Config.CrossAttentionDim) );
+      IPValueInput := NN.AddLayer( TNNetInput.Create(IPConfig.NumImageTokens, 1,
+        Config.CrossAttentionDim) );
+    end;
+
     if not pTrainable then NN.SetTrainable();
 
     // conv_in skip (deferred until after the latent/timestep/text inputs so the
@@ -75577,7 +75736,7 @@ begin
         begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
             Config.TransformerLayersPerBlock[i], Config.HeadsPerBlock[i],
-            pTrainable, DownAttn[i][j]);
+            pTrainable, DownAttn[i][j], IPKeyInput, IPValueInput);
           HLayer := NN.GetLastLayer();
         end;
         // T2I-Adapter: the feature joins the block's last skip and what flows
@@ -75623,7 +75782,7 @@ begin
     HLayer := NN.GetLastLayer();
     AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh,
       Config.TransformerLayersPerBlock[nM1], Config.HeadsPerBlock[nM1],
-      pTrainable, MidAttn);
+      pTrainable, MidAttn, IPKeyInput, IPValueInput);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes2);
@@ -75661,7 +75820,7 @@ begin
         begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
             Config.TransformerLayersPerBlock[RevIdx], Config.HeadsPerBlock[RevIdx],
-            pTrainable, UpAttn[i][j]);
+            pTrainable, UpAttn[i][j], IPKeyInput, IPValueInput);
           HLayer := NN.GetLastLayer();
         end;
       end;
@@ -75787,6 +75946,25 @@ begin
     LoadVaeGroupNorm(Reader, NormOut, 'conv_norm_out', d0, SDUNET_RES_EPS);
     LoadVaeConv(Reader, ConvOut, 'conv_out.weight', 'conv_out.bias',
       Config.OutChannels, d0, 3);
+
+    // diffusers attn_processors order: down blocks, up blocks, then mid.
+    if IPAdapterReader <> nil then
+    begin
+      IPKeyId := 1;
+      for i := 0 to nM1 do
+        if Config.DownHasAttn[i] then
+          for j := 0 to NumResnetM1 do
+            LoadIPAdapterAttn(DownAttn[i][j], Config.BlockOutChannels[i]);
+      for i := 0 to nM1 do
+        if Config.UpHasAttn[i] then
+          for j := 0 to NumResnet do
+            LoadIPAdapterAttn(UpAttn[i][j], Config.BlockOutChannels[nM1 - i]);
+      LoadIPAdapterAttn(MidAttn, MidCh);
+      if IPAdapterReader.HasTensor('ip_adapter.' + IntToStr(IPKeyId) +
+        '.to_k_ip.weight') then
+        ImportError('SD UNet import: the IP-Adapter has more cross-attention ' +
+          'layers than the unet (' + IntToStr(IPKeyId div 2) + ').');
+    end;
     Result := NN;
   except
     NN.Free;
@@ -75796,14 +75974,20 @@ end;
 
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  const IPAdapterFile: string = ''): TNNet;
 var
-  Reader: TNNetSafeTensorsReader;
+  Reader, IPAdapterReader: TNNetSafeTensorsReader;
 begin
+  IPAdapterReader := nil;
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl, pWithAdapter);
+    if IPAdapterFile <> '' then
+      IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
+    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl, pWithAdapter,
+      IPAdapterReader);
   finally
+    IPAdapterReader.Free;
     Reader.Free;
   end;
 end;
@@ -77600,6 +77784,85 @@ begin
      Config.AttnIndex]);
 end;
 
+// image_proj (diffusers ImageProjModel) after ImgEmbIn: Linear (clip ->
+// N*cross, WITH bias) -> reshape to N tokens of dim cross -> LayerNorm.
+procedure AddIPAdapterImageProj(NN: TNNet; ImgEmbIn: TNNetLayer;
+  const Config: TIPAdapterConfig; pTrainable: boolean;
+  out ImgProj, ImgTokens: TNNetLayer);
+begin
+  ImgProj := NN.AddLayerAfter(
+    TNNetFullConnectLinear.Create(Config.NumImageTokens *
+      Config.CrossAttentionDim).SetTrainable(pTrainable), ImgEmbIn);
+  NN.AddLayer(TNNetReshape.Create(Config.NumImageTokens, 1,
+    Config.CrossAttentionDim));
+  ImgTokens := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+end;
+
+procedure LoadIPAdapterImageProj(Reader: TNNetSafeTensorsReader;
+  ImgProj, ImgTokens: TNNetLayer; const Config: TIPAdapterConfig);
+begin
+  LoadLlamaLinearWeights(Reader, ImgProj, 'image_proj.proj.weight',
+    Config.ClipEmbeddingsDim, Config.NumImageTokens * Config.CrossAttentionDim,
+    0, -1, 0, 'image_proj.proj.bias');
+  LoadLayerNormWeights(Reader, ImgTokens,
+    'image_proj.norm.weight', 'image_proj.norm.bias', Config.CrossAttentionDim);
+end;
+
+function ReadIPAdapterImageProjConfig(Reader: TNNetSafeTensorsReader;
+  CrossAttentionDim: integer): TIPAdapterConfig;
+const
+  csProjName = 'image_proj.proj.weight';
+var
+  ProjRows: Int64;
+begin
+  if not Reader.HasTensor(csProjName) then
+    ImportError('IP-Adapter import: ' + csProjName + ' not found (only the ' +
+      'plain ip-adapter_sd15 ImageProjModel is supported, not Plus / FaceID).');
+  if Reader.DimCount(csProjName) <> 2 then
+    ImportError('IP-Adapter import: ' + csProjName + ' has shape ' +
+      Reader.ShapeAsString(csProjName) + ', expected [tokens*cross, clip].');
+  ProjRows := Reader.DimSize(csProjName, 0);
+  if (CrossAttentionDim < 1) or (ProjRows mod CrossAttentionDim <> 0) then
+    ImportError('IP-Adapter import: ' + csProjName + ' has ' +
+      IntToStr(ProjRows) + ' rows, not a multiple of the unet ' +
+      'cross_attention_dim ' + IntToStr(CrossAttentionDim) + '.');
+  FillChar(Result, SizeOf(Result), 0);
+  Result.ModelType := 'IPAdapterModel';
+  Result.ClipEmbeddingsDim := Reader.DimSize(csProjName, 1);
+  Result.CrossAttentionDim := CrossAttentionDim;
+  Result.NumImageTokens := ProjRows div CrossAttentionDim;
+  Result.ConditioningScale := 1;
+end;
+
+function BuildIPAdapterImageProj(Reader: TNNetSafeTensorsReader;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  ImgEmbIn, ImgProj, ImgTokens: TNNetLayer;
+begin
+  NN := TNNet.Create;
+  try
+    ImgEmbIn := NN.AddLayer(TNNetInput.Create(Config.ClipEmbeddingsDim, 1, 1));
+    AddIPAdapterImageProj(NN, ImgEmbIn, Config, pTrainable, ImgProj, ImgTokens);
+    if not pTrainable then NN.SetTrainable();
+    LoadIPAdapterImageProj(Reader, ImgProj, ImgTokens, Config);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure SDUNetDenoiseWithIPAdapter(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  KeyTokens, ValueTokens, Noise: TNNetVolume);
+begin
+  SDUNetCopyIntoInputs(Net, SDUNetSkipInputBase(Config), 2,
+    [KeyTokens, ValueTokens], 'SDUNetDenoiseWithIPAdapter: image tokens');
+  SDUNetDenoise(Net, Config, Latent, EncStates, t, Noise);
+end;
+
 function BuildIPAdapter(Reader: TNNetSafeTensorsReader;
   const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
 var
@@ -77638,14 +77901,7 @@ begin
     TextIn := NN.AddLayer(TNNetInput.Create(Config.TextSeqLen, 1, Cross));
     ImgEmbIn := NN.AddLayer(TNNetInput.Create(Config.ClipEmbeddingsDim, 1, 1));
 
-    // ---- image_proj (diffusers ImageProjModel): Linear (clip -> N*cross, WITH
-    //      bias) -> reshape to N tokens of dim cross -> LayerNorm. ----
-    ImgProj := NN.AddLayerAfter(
-      TNNetFullConnectLinear.Create(Config.NumImageTokens * Cross).
-        SetTrainable(pTrainable), ImgEmbIn);
-    NN.AddLayer(TNNetReshape.Create(Config.NumImageTokens, 1, Cross));
-    ImgTokens := NN.AddLayer(
-      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+    AddIPAdapterImageProj(NN, ImgEmbIn, Config, pTrainable, ImgProj, ImgTokens);
 
     // ---- decoupled cross-attention (the SAME multi-head construction the SD
     //      UNet cross-attn uses, with the EXTRA image K/V tapped in). ----
@@ -77695,12 +77951,7 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---- weight loading ----
-    // image_proj.proj: Linear (clip -> N*cross) WITH bias.
-    LoadLlamaLinearWeights(Reader, ImgProj, 'image_proj.proj.weight',
-      Config.ClipEmbeddingsDim, Config.NumImageTokens * Cross, 0, -1, 0,
-      'image_proj.proj.bias');
-    LoadLayerNormWeights(Reader, ImgTokens,
-      'image_proj.norm.weight', 'image_proj.norm.bias', Cross);
+    LoadIPAdapterImageProj(Reader, ImgProj, ImgTokens, Config);
     // base UNet attn2 (shared Q + text K/V + out), all bias-free except to_out.0.
     LoadLlamaLinearWeights(Reader, QProj, AttnPrefix + 'to_q.weight', d, d, 0, -1, 0, '');
     LoadLlamaLinearWeights(Reader, KTxt, AttnPrefix + 'to_k.weight', Cross, d, 0, -1, 0, '');
@@ -89385,6 +89636,23 @@ function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
 var
   JsonText: TStringList;
+begin
+  if not FileExists(FileName) then
+    ImportError('CLIP image preprocessing: config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    Result := ReadClipImageProcessorConfigFromJSONText(JsonText.Text,
+      FileName);
+  finally
+    JsonText.Free;
+  end;
+end;
+
+function ReadClipImageProcessorConfigFromJSONText(const JsonSource,
+  SourceName: string): TClipImageProcessorConfig;
+var
   Root: TJSONData;
   Obj: TJSONObject;
 
@@ -89453,22 +89721,17 @@ var
   CropPct: double;
   Resize: THFImageResize;
 begin
-  if not FileExists(FileName) then
-    ImportError('CLIP image preprocessing: config file not found: ' +
-      FileName);
-  JsonText := TStringList.Create;
   Root := nil;
   try
-    LoadImportJSONText(JsonText, FileName);
     try
-      Root := GetJSON(JsonText.Text);
+      Root := GetJSON(JsonSource);
     except
       on E: Exception do
-        ImportError('CLIP image preprocessing: config "' + FileName +
+        ImportError('CLIP image preprocessing: config "' + SourceName +
           '" is not valid JSON (' + E.Message + ').');
     end;
     if not (Root is TJSONObject) then
-      ImportError('CLIP image preprocessing: config "' + FileName +
+      ImportError('CLIP image preprocessing: config "' + SourceName +
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
 
@@ -89515,7 +89778,6 @@ begin
       0.26862954, 0.26130258, 0.27577711);
   finally
     Root.Free;
-    JsonText.Free;
   end;
 end;
 
@@ -92688,7 +92950,8 @@ begin
     AcquireTextEncoder(FMaxTokenCount);
     AcquireUNet(GridX, GridY, FMaxTokenCount,
       ActiveConditioner().UNetWithControl(),
-      ActiveConditioner().UNetWithAdapter());
+      ActiveConditioner().UNetWithAdapter(),
+      ActiveConditioner().UNetIPAdapterFile());
     AcquireVaeDecoder(GridX, GridY);
   except
     UnloadComponents();
@@ -92756,17 +93019,19 @@ begin
 end;
 
 function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
-  TextSeqLen: integer; WithControl, WithAdapter: boolean): TNNet;
+  TextSeqLen: integer; WithControl, WithAdapter: boolean;
+  const IPAdapterFile: string): TNNet;
 begin
   if Assigned(FUNet) and (FUNetGridX = GridX) and (FUNetGridY = GridY) and
     (FUNetTextSeqLen = TextSeqLen) and (FUNetWithControl = WithControl) and
-    (FUNetWithAdapter = WithAdapter) then exit(FUNet);
+    (FUNetWithAdapter = WithAdapter) and
+    (FUNetIPAdapterFile = IPAdapterFile) then exit(FUNet);
   DoPhase(sdphLoadUNet);
   FreeAndNil(FUNet);
   Result := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
     ComponentFolder('unet'), 'diffusion_pytorch_model'),
     UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false,
-    WithControl, WithAdapter);
+    WithControl, WithAdapter, IPAdapterFile);
   try
     PrepareComponent(Result, FUNetInt8);
   except
@@ -92781,6 +93046,7 @@ begin
     FUNetTextSeqLen := TextSeqLen;
     FUNetWithControl := WithControl;
     FUNetWithAdapter := WithAdapter;
+    FUNetIPAdapterFile := IPAdapterFile;
   end;
 end;
 
@@ -93254,7 +93520,8 @@ begin
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
   Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX,
-    StepConditioner.UNetWithControl(), StepConditioner.UNetWithAdapter());
+    StepConditioner.UNetWithControl(), StepConditioner.UNetWithAdapter(),
+    StepConditioner.UNetIPAdapterFile());
   Pred := TNNetVolume.Create();
   PredUncond := TNNetVolume.Create();
   try
@@ -93398,6 +93665,11 @@ end;
 function TStableDiffusionConditioner.UNetWithAdapter(): boolean;
 begin
   Result := false;
+end;
+
+function TStableDiffusionConditioner.UNetIPAdapterFile(): string;
+begin
+  Result := '';
 end;
 
 function TStableDiffusionConditioner.AcceptsUNetInChannels(InChannels,
@@ -93770,6 +94042,172 @@ end;
 procedure TStableDiffusionT2IAdapter.EndDenoise();
 begin
   if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
+end;
+
+constructor TStableDiffusionIPAdapter.Create(const WeightsFile: string;
+  const ImageEncoderFolder: string);
+begin
+  inherited Create();
+  FWeightsFile := WeightsFile;
+  if ImageEncoderFolder = '' then
+    FImageEncoderFolder := ExtractFilePath(ExpandFileName(WeightsFile)) +
+      'image_encoder' + DirectorySeparator
+  else
+    FImageEncoderFolder := IncludeTrailingPathDelimiter(ImageEncoderFolder);
+  if not FileExists(FWeightsFile) then
+    ImportError('TStableDiffusionIPAdapter: ' + FWeightsFile + ' not found.');
+  FImageEncoderConfig := ReadClipConfigFromJSONFile(FImageEncoderFolder +
+    'config.json');
+  FSourceImage := TNNetVolume.Create();
+  FPixels := TNNetVolume.Create();
+  FImageEmbeds := TNNetVolume.Create();
+  FZeroEmbeds := TNNetVolume.Create();
+  FImageTokens := TNNetVolume.Create();
+  FImageValueTokens := TNNetVolume.Create();
+  FUncondTokens := TNNetVolume.Create();
+  FUncondValueTokens := TNNetVolume.Create();
+  FScale := 1;
+end;
+
+destructor TStableDiffusionIPAdapter.Destroy();
+begin
+  FImageProj.Free;
+  FImageEncoder.Free;
+  FUncondValueTokens.Free;
+  FUncondTokens.Free;
+  FImageValueTokens.Free;
+  FImageTokens.Free;
+  FZeroEmbeds.Free;
+  FImageEmbeds.Free;
+  FPixels.Free;
+  FSourceImage.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionIPAdapter.SetImage(Image: TNNetVolume);
+begin
+  if Image.Depth <> 3 then
+    ImportError('TStableDiffusionIPAdapter: the image prompt must be RGB, ' +
+      'got ' + IntToStr(Image.Depth) + ' channels.');
+  FSourceImage.ReSize(Image);
+  FSourceImage.Copy(Image);
+end;
+
+function TStableDiffusionIPAdapter.UNetIPAdapterFile(): string;
+begin
+  Result := FWeightsFile;
+end;
+
+procedure TStableDiffusionIPAdapter.ProjectImageEmbeds(Embeds, Tokens,
+  ValueTokens: TNNetVolume);
+begin
+  FImageProj.Compute(Embeds);
+  FImageProj.GetOutput(Tokens);
+  ValueTokens.ReSize(Tokens);
+  ValueTokens.Copy(Tokens);
+  ValueTokens.Mul(FScale);
+end;
+
+procedure TStableDiffusionIPAdapter.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  Reader: TNNetSafeTensorsReader;
+  PreprocessFile: string;
+  Preprocess: TClipImageProcessorConfig;
+  ImageSize, EmbedDim: integer;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  if FSourceImage.Size = 0 then
+    ImportError('TStableDiffusionIPAdapter: call SetImage first.');
+  if not Assigned(FImageEncoder) or (FNetEpoch <> Pipeline.ComponentEpoch) then
+  begin
+    StartLoadPhase();
+    FreeAndNil(FImageEncoder);
+    FreeAndNil(FImageProj);
+    Reader := CreatePretrainedTensorReader(FWeightsFile);
+    try
+      FImageProjConfig := ReadIPAdapterImageProjConfig(Reader,
+        Pipeline.UNetConfig.CrossAttentionDim);
+      if FImageProjConfig.ClipEmbeddingsDim <>
+        FImageEncoderConfig.ProjectionDim then
+        ImportError('TStableDiffusionIPAdapter: image_proj takes ' +
+          IntToStr(FImageProjConfig.ClipEmbeddingsDim) + ' features, the ' +
+          'image encoder projects to ' +
+          IntToStr(FImageEncoderConfig.ProjectionDim) + '.');
+      FImageProj := BuildIPAdapterImageProj(Reader, FImageProjConfig,
+        {pTrainable=}false);
+    finally
+      Reader.Free;
+    end;
+    Reader := CreatePretrainedTensorReader(SafeTensorsFolderWeightsFile(
+      FImageEncoderFolder, 'model'));
+    try
+      FImageEncoder := BuildClipVisionTower(Reader, FImageEncoderConfig.Vision,
+        FImageEncoderConfig.ImageSize, FImageEncoderConfig.PatchSize,
+        FImageEncoderConfig.NumChannels, FImageEncoderConfig.ProjectionDim,
+        'vision_model.', 'visual_projection.weight', {pTrainable=}false);
+    finally
+      Reader.Free;
+    end;
+    FNetEpoch := Pipeline.ComponentEpoch;
+    Pipeline.PrepareComponent(FImageEncoder, {QuantizeInt8=}false);
+    Pipeline.PrepareComponent(FImageProj, {QuantizeInt8=}false);
+  end;
+  // diffusers uses the pipeline's feature_extractor, else CLIPImageProcessor
+  // at the encoder image size.
+  PreprocessFile := Pipeline.ComponentFolder('feature_extractor') +
+    'preprocessor_config.json';
+  if FileExists(PreprocessFile) then
+    Preprocess := ReadClipImageProcessorConfig(PreprocessFile)
+  else
+  begin
+    ImageSize := FImageEncoderConfig.ImageSize;
+    Preprocess := ReadClipImageProcessorConfigFromJSONText(Format(
+      '{"size": {"shortest_edge": %d}, "crop_size": {"height": %d, ' +
+      '"width": %d}}', [ImageSize, ImageSize, ImageSize]),
+      'CLIPImageProcessor defaults');
+  end;
+  ClipPreprocessImage(FSourceImage, FPixels, Preprocess);
+  // image_embeds: the projected class-token row of the tower output.
+  FImageEncoder.Compute(FPixels);
+  EmbedDim := FImageEncoderConfig.ProjectionDim;
+  FImageEmbeds.ReSize(EmbedDim, 1, 1);
+  FImageEncoder.GetLastLayer().ForceOutputOnRAM();
+  Move(FImageEncoder.GetLastLayer().Output.FData[0], FImageEmbeds.FData[0],
+    EmbedDim * csNeuralFloatSize);
+  FZeroEmbeds.ReSize(EmbedDim, 1, 1);
+  FZeroEmbeds.Fill(0);
+  ProjectImageEmbeds(FImageEmbeds, FImageTokens, FImageValueTokens);
+  ProjectImageEmbeds(FZeroEmbeds, FUncondTokens, FUncondValueTokens);
+  // The tokens hold for every step.
+  if not Pipeline.ComponentsLoaded then
+  begin
+    FreeAndNil(FImageEncoder);
+    FreeAndNil(FImageProj);
+  end;
+end;
+
+procedure TStableDiffusionIPAdapter.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  // Denoise runs the unguided CFG half on FNegativePromptEmbeds.
+  if Embeds = FPipeline.FNegativePromptEmbeds then
+    SDUNetDenoiseWithIPAdapter(UNet, Config, Latents, Embeds, Timestep,
+      FUncondTokens, FUncondValueTokens, Pred)
+  else
+    SDUNetDenoiseWithIPAdapter(UNet, Config, Latents, Embeds, Timestep,
+      FImageTokens, FImageValueTokens, Pred);
+end;
+
+procedure TStableDiffusionIPAdapter.EndDenoise();
+begin
+  if not FPipeline.ComponentsLoaded then
+  begin
+    FreeAndNil(FImageEncoder);
+    FreeAndNil(FImageProj);
+  end;
 end;
 
 constructor TStableDiffusionInpainter.Create();

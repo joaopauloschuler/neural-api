@@ -1243,6 +1243,9 @@ type
     procedure TestStableDiffusionControlNetNonSquare;
     procedure TestStableDiffusionT2IAdapterParity;
     procedure TestStableDiffusionT2IAdapterNonSquare;
+    procedure TestStableDiffusionIPAdapterParity;
+    procedure TestStableDiffusionIPAdapterScaleZero;
+    procedure TestSDUNetIPAdapterRefusesControl;
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionTextualInversionTokens;
@@ -45896,6 +45899,121 @@ begin
     Pipeline.Free;
     Adapter.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionPipeline + load_ip_adapter float64 (tiny_sd15_ip_adapter_io.json,
+// a random ip-adapter_sd15 + CLIP vision tower): 3 guided DDIM steps, scale 0.7.
+procedure TTestNeuralPretrained.TestStableDiffusionIPAdapterParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  IPAdapter: TStableDiffusionIPAdapter;
+  PromptImage, ExpectedEmbeds: TNNetVolume;
+  EmbedArray: TJSONArray;
+  EmbedPos: integer;
+  MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_ip_adapter_io.json');
+  Pipeline := CreateSD15Pipeline();
+  IPAdapter := TStableDiffusionIPAdapter.Create(
+    FixturePath('tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+  PromptImage := TNNetVolume.Create;
+  ExpectedEmbeds := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['ip_image'],
+      false, PromptImage);
+    AssertEquals('prompt image width', 20, PromptImage.SizeX);
+    AssertEquals('prompt image height', 13, PromptImage.SizeY);
+    IPAdapter.SetImage(PromptImage);
+    IPAdapter.Scale := TJSONObject(FSD15Oracle).Get('ip_scale', 0.0);
+    Pipeline.Conditioner := IPAdapter;
+    CheckSD15ConditionedParity(Pipeline, TJSONObject(FSD15Oracle));
+    EmbedArray := TJSONObject(FSD15Oracle).Arrays['image_embeds'];
+    ExpectedEmbeds.ReSize(EmbedArray.Count, 1, 1);
+    for EmbedPos := 0 to EmbedArray.Count - 1 do
+      ExpectedEmbeds.FData[EmbedPos] := EmbedArray.Floats[EmbedPos];
+    MaxDiff := MaxAbsVolumeDiff(IPAdapter.ImageEmbeds, ExpectedEmbeds);
+    AssertTrue('image_embeds max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    ExpectedEmbeds.Free;
+    PromptImage.Free;
+    Pipeline.Free;
+    IPAdapter.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// IP-Adapter scale 0 reproduces the plain pipeline (the image attention adds
+// exact zeros); scale 1 changes the image.
+procedure TTestNeuralPretrained.TestStableDiffusionIPAdapterScaleZero;
+const
+  csImageSize = 16;
+  csSteps = 2;
+var
+  Pipeline: TStableDiffusionPipeline;
+  IPAdapter: TStableDiffusionIPAdapter;
+  PromptImage, Plain, Adapted: TNNetVolume;
+  PixelPos: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  IPAdapter := TStableDiffusionIPAdapter.Create(
+    FixturePath('tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+  PromptImage := TNNetVolume.Create(12, 9, 3);
+  Plain := TNNetVolume.Create;
+  Adapted := TNNetVolume.Create;
+  try
+    for PixelPos := 0 to PromptImage.Size - 1 do
+      PromptImage.FData[PixelPos] := (PixelPos * 37) mod 256;
+    IPAdapter.SetImage(PromptImage);
+    Pipeline.GuidanceScale := 5;
+    Pipeline.Generate('a red cube', csImageSize, csImageSize, csSteps, 7, Plain);
+    Pipeline.Conditioner := IPAdapter;
+    IPAdapter.Scale := 0;
+    Pipeline.Generate('a red cube', csImageSize, csImageSize, csSteps, 7,
+      Adapted);
+    AssertTrue('scale 0 max |diff| = ' + FloatToStr(MaxAbsVolumeDiff(Plain,
+      Adapted)), MaxAbsVolumeDiff(Plain, Adapted) < 1e-6);
+    IPAdapter.Scale := 1;
+    Pipeline.Generate('a red cube', csImageSize, csImageSize, csSteps, 7,
+      Adapted);
+    AssertTrue('scale 1 changes the image', MaxAbsVolumeDiff(Plain,
+      Adapted) > 1e-4);
+  finally
+    Adapted.Free;
+    Plain.Free;
+    PromptImage.Free;
+    Pipeline.Free;
+    IPAdapter.Free;
+  end;
+end;
+
+// BuildSDUNet refuses an IP-Adapter together with the ControlNet inputs.
+procedure TTestNeuralPretrained.TestSDUNetIPAdapterRefusesControl;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Refused: boolean;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Net := nil;
+  try
+    Config := Pipeline.UNetConfig;
+    Refused := false;
+    try
+      Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+        'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false,
+        {pWithControl=}true, {pWithAdapter=}false, FixturePath(
+        'tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+    except
+      on E: EPretrainedImportError do
+        Refused := Pos('IP-Adapter', E.Message) > 0;
+    end;
+    AssertTrue('IP-Adapter with ControlNet refused', Refused);
+  finally
+    Net.Free;
+    Pipeline.Free;
   end;
 end;
 

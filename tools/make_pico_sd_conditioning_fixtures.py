@@ -49,6 +49,15 @@ not matter; values rounded to 10 digits):
       is skipped (it wants multiples of 8, the real VAE factor)
   tests/fixtures/tiny_sd15_t2i_adapter_nonsquare_io.json
       the T2I-Adapter run at ADAPTER_WIDTH x ADAPTER_HEIGHT
+  tests/fixtures/tiny_sd15_ip_adapter/{ip-adapter_sd15.safetensors,
+      image_encoder/{config.json,model.safetensors}}
+      an h94/IP-Adapter ip-adapter_sd15 layout: a random ImageProjModel
+      (image_proj.proj / image_proj.norm, 4 tokens) and to_k_ip / to_v_ip per
+      cross-attention (ip_adapter.1, .3, ... in unet.attn_processors order),
+      plus a pico CLIPVisionModelWithProjection
+  tests/fixtures/tiny_sd15_ip_adapter_io.json
+      StableDiffusionPipeline + load_ip_adapter: ip_image (H,W,3) in 0..255,
+      ip_scale, the image_embeds, latents, timesteps, latents_after, image
 
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
@@ -58,16 +67,21 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py
   python tools/make_pico_sd_conditioning_fixtures.py --nonsquare-only
   python tools/make_pico_sd_conditioning_fixtures.py --inpaint-strength-only
+  python tools/make_pico_sd_conditioning_fixtures.py --ip-adapter-only
 (--nonsquare-only keeps the committed folders and writes only the two
-non-square files; --inpaint-strength-only writes only the strength file.)
+non-square files; --inpaint-strength-only writes only the strength file;
+--ip-adapter-only writes only the IP-Adapter folder and its file.)
 """
 import json
 import os
 import shutil
 import sys
 
+import numpy
 import torch
+from PIL import Image
 from safetensors.torch import load_file, save_file
+from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
 from diffusers import (ControlNetModel, EulerDiscreteScheduler,
                        StableDiffusionAdapterPipeline,
                        StableDiffusionControlNetPipeline,
@@ -87,6 +101,8 @@ INPAINT_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_io.json")
 INPAINT_STRENGTH_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_strength_io.json")
 CONTROLNET_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_nonsquare_io.json")
 ADAPTER_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_nonsquare_io.json")
+IP_ADAPTER_DIR = os.path.join(FIXTURES, "tiny_sd15_ip_adapter")
+IP_ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_ip_adapter_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
@@ -100,6 +116,10 @@ CONTROLNET_SCALE = 0.5
 ADAPTER_SCALE = 0.8
 STRENGTH = 0.6
 STRENGTH_STEPS = 5
+IP_SCALE = 0.7
+IP_IMAGE_WIDTH = 20      # resized (shortest edge) and center-cropped to 8x8
+IP_IMAGE_HEIGHT = 13
+IP_TOKENS = 4            # diffusers ImageProjection of an ip-adapter_sd15
 PROMPT = "a photo of an astronaut riding a horse on mars"
 
 
@@ -368,8 +388,69 @@ def make_adapter_nonsquare():
     print("adapter non-square", len(out["image"][0]), "x", len(out["image"]))
 
 
+def make_ip_adapter():
+    torch.manual_seed(SEED + 30)
+    parts = base_components()
+    unet = parts["unet"]
+    vision_config = CLIPVisionConfig(hidden_size=16, intermediate_size=24,
+                                     num_hidden_layers=2, num_attention_heads=2,
+                                     image_size=8, patch_size=4, projection_dim=12,
+                                     hidden_act="quick_gelu")
+    encoder = CLIPVisionModelWithProjection(vision_config)
+    perturb(encoder)
+    cross = unet.config.cross_attention_dim
+    state = {
+        "image_proj.proj.weight": torch.randn(IP_TOKENS * cross, 12) * 0.3,
+        "image_proj.proj.bias": torch.randn(IP_TOKENS * cross) * 0.3,
+        "image_proj.norm.weight": 1 + torch.randn(cross) * 0.1,
+        "image_proj.norm.bias": torch.randn(cross) * 0.1}
+    # load_ip_adapter numbers the cross-attention processors 1, 3, 5, ...
+    key_id = 1
+    for name, proc in unet.attn_processors.items():
+        if name.endswith("attn1.processor"):
+            continue
+        hidden = unet.get_submodule(name[:-len(".processor")]).to_q.out_features
+        print("ip_adapter.%d" % key_id, name, hidden)
+        state["ip_adapter.%d.to_k_ip.weight" % key_id] = torch.randn(hidden, cross) * 0.3
+        state["ip_adapter.%d.to_v_ip.weight" % key_id] = torch.randn(hidden, cross) * 0.3
+        key_id += 2
+    if os.path.isdir(IP_ADAPTER_DIR):
+        shutil.rmtree(IP_ADAPTER_DIR)
+    os.makedirs(IP_ADAPTER_DIR)
+    save_file({k: v.to(torch.float32).contiguous() for k, v in state.items()},
+              os.path.join(IP_ADAPTER_DIR, "ip-adapter_sd15.safetensors"))
+    encoder.to(torch.float32).save_pretrained(
+        os.path.join(IP_ADAPTER_DIR, "image_encoder"), safe_serialization=True)
+    pipe = StableDiffusionPipeline(**parts)
+    pipe.register_modules(image_encoder=None)
+    pipe.load_ip_adapter(IP_ADAPTER_DIR, subfolder="",
+                         weight_name="ip-adapter_sd15.safetensors")
+    pipe.set_ip_adapter_scale(IP_SCALE)
+    pipe.to(torch.float64)
+    generator = torch.Generator().manual_seed(SEED + 31)
+    levels = torch.randint(0, 256, (IP_IMAGE_HEIGHT, IP_IMAGE_WIDTH, 3),
+                           generator=generator)
+    ip_image = Image.fromarray(levels.numpy().astype(numpy.uint8), "RGB")
+    pixels = pipe.feature_extractor(ip_image, return_tensors="pt").pixel_values
+    image_embeds = pipe.image_encoder(pixels.to(torch.float64)).image_embeds
+    latents = initial_latents()
+    out = run(pipe, {"ip_adapter_image": ip_image}, latents)
+    payload = {"image_size": IMAGE_SIZE, "steps": STEPS, "guidance_scale": GUIDANCE,
+               "prompt": PROMPT, "ip_scale": IP_SCALE,
+               "ip_image": levels.tolist(),
+               "image_embeds": rounded(image_embeds[0].tolist()),
+               "latents": chw(latents[0])}
+    payload.update(out)
+    with open(IP_ADAPTER_IO, "w") as f:
+        json.dump(payload, f)
+    print("ip-adapter timesteps", out["timesteps"])
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
+    if "--ip-adapter-only" in sys.argv:
+        make_ip_adapter()
+        sys.exit(0)
     if "--inpaint-strength-only" in sys.argv:
         make_inpaint_strength()
         sys.exit(0)
@@ -380,3 +461,5 @@ if __name__ == "__main__":
         make_inpaint_strength()
     make_controlnet_nonsquare()
     make_adapter_nonsquare()
+    if "--nonsquare-only" not in sys.argv:
+        make_ip_adapter()
