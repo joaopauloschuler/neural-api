@@ -745,8 +745,8 @@ type
     // TNNetGRN chained resident (cai_grn_table + ChannelAffine) at two depths,
     // then after a gamma/beta update, against a host-only twin net.
     procedure TestGRNOpenCLParity;
-    // TNNetMetaAconC chained resident (cai_meta_acon_table + AconC) at three
-    // shapes, then after a weight update, against a host-only twin net.
+    // TNNetMetaAconC chained resident (cai_meta_acon_table + AconC) at one- and
+    // many-slice shapes, then after a weight update, against a host-only twin net.
     procedure TestMetaAconCOpenCLParity;
     // Input -> TNNetRealFFT2D -> TNNetInverseRealFFT2D resident on OpenCL at
     // power-of-two and odd/non-power-of-two sizes, one per norm: both layers
@@ -74354,8 +74354,10 @@ procedure TTestNeuralNumerical.TestMetaAconCOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
-  // A single position (beta from x itself), a small and a wide volume.
-  csShapes: array[0..2, 0..2] of integer = ((1, 1, 7), (6, 5, 40), (3, 4, 300));
+  // A single position (beta from x itself), a small and a wide volume (one
+  // partial-sum slice each), then 14 (ragged) and 63 slices.
+  csShapes: array[0..4, 0..2] of integer = ((1, 1, 7), (6, 5, 40), (3, 4, 300),
+    (23, 19, 48), (50, 45, 8));
 var
   NN, NNCPU: TNNet;
   Input, OutCPU, LastCPU: TNNetVolume;

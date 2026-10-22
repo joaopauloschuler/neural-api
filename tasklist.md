@@ -2397,9 +2397,14 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
       across groups if it shows up on the GPU box.
-      - Done: `cai_channel_square_sums_partial` writes up to 64 position-slice
+      - Done: `cai_channel_sums_partial` writes up to 64 position-slice
         partial sums per channel (buffer sized at EnableOpenCL), then
         `cai_grn_table` finishes in one group. GPU timing pending.
+- [X] `TNNetMetaAconC` device forward: `cai_meta_acon_table` looped every
+      position per channel in one work-item. It now sums the partials of
+      `cai_channel_sums_partial` (sum-of-x mode; GRN uses the square mode),
+      armed through the shared `TNNetChannelTransformBase` helpers. PoCL
+      parity at 1 to 63 slices; GPU timing pending.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

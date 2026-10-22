@@ -3169,15 +3169,17 @@ __kernel void cai_group_norm
   }
 }
 
-// Per-slice channel sums of squares of one depth-contiguous volume: work-item
-// (c, slice) writes FPartial[slice * FDepth + c] = sum of x[p,c]^2 over the
-// positions [slice * FPositionsPerSlice, +FPositionsPerSlice) clipped to
-// FNumPositions. Launch (FDepth, slice count); adjacent c read adjacent floats.
-__kernel void cai_channel_square_sums_partial
+// Per-slice channel sums of one depth-contiguous volume: work-item (c, slice)
+// writes FPartial[slice * FDepth + c] = sum of x[p,c] (FSquare = 0) or of
+// x[p,c]^2 (FSquare = 1) over the positions [slice * FPositionsPerSlice,
+// +FPositionsPerSlice) clipped to FNumPositions. Launch (FDepth, slice count);
+// adjacent c read adjacent floats.
+__kernel void cai_channel_sums_partial
 (
   const int FNumPositions,
   const int FDepth,
   const int FPositionsPerSlice,
+  const int FSquare,
   __global const float* FX,
   __global float* FPartial
 )
@@ -3191,13 +3193,13 @@ __kernel void cai_channel_square_sums_partial
   for (int p = firstPos; p < lastPos; p++)
   {
     const float v = FX[p * FDepth + c];
-    ss = mad(v, v, ss);
+    ss = mad(v, FSquare ? v : 1.0f, ss);
   }
   FPartial[slice * FDepth + c] = ss;
 }
 
 // Global Response Normalization table (TNNetGRN forward, ConvNeXt-V2). From the
-// FNumSlices x FDepth partial sums of squares of cai_channel_square_sums_partial
+// FNumSlices x FDepth partial sums of squares of cai_channel_sums_partial
 // it writes the cai_activation ChannelAffine table (opcode 46), 2*FDepth long:
 //   Gx[c]          = sqrt(sum_p x[p,c]^2 + FEps)
 //   FTable[c]      = 1 + gamma[c] * Gx[c] / mean_c(Gx)
@@ -3251,22 +3253,23 @@ __kernel void cai_grn_table
 // packed (4*FDepth); FTable gets p1|p2|beta (3*FDepth) for cai_activation's
 // AconC opcode 52, with
 //   beta[c] = sigmoid(gamma[c] * mean_p(x[p,c]) + delta[c])
-// over the FNumPositions positions of one depth-contiguous volume. One
-// work-item per channel. Forward-only.
+// with the channel sums from the FNumSlices x FDepth partials of
+// cai_channel_sums_partial. One work-item per channel. Forward-only.
 __kernel void cai_meta_acon_table
 (
-  const int FNumPositions,
+  const int FNumSlices,
   const int FDepth,
   const float FInvNumPositions,
   __global const float* FWeights,
-  __global const float* FX,
+  __global const float* FPartial,
   __global float* FTable
 )
 {
   const int c = get_global_id(0);
   if (c >= FDepth) return;
   float ChannelSum = 0.0f;
-  for (int p = 0; p < FNumPositions; p++) ChannelSum += FX[p * FDepth + c];
+  for (int slice = 0; slice < FNumSlices; slice++)
+    ChannelSum += FPartial[slice * FDepth + c];
   const float BetaInput = mad(FWeights[2 * FDepth + c],
     ChannelSum * FInvNumPositions, FWeights[3 * FDepth + c]);
   FTable[c] = FWeights[c];

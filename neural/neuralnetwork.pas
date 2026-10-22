@@ -10278,16 +10278,23 @@ type
       FChannelTableKernel: cl_kernel;
       FChannelTableBuffer: cl_mem;
       FChannelTableBufBytes: csize_t;
-      // An optional first stage (TNNetGRN) that splits the position reduction
-      // across work-groups into FChannelPartialBuffer ahead of the table kernel.
+      // An optional first stage (TNNetGRN, TNNetMetaAconC): cai_channel_sums_partial
+      // splits the position reduction across work-groups into FChannelPartialBuffer.
       FChannelPartialKernel: cl_kernel;
       FChannelPartialBuffer: cl_mem;
       FChannelPartialBufBytes: csize_t;
       // Creates KernelName and a TableBytes device table; call after the
       // inherited EnableOpenCL, which acquires FActivationKernel.
       procedure ArmChannelTableOpenCL(const KernelName: string; TableBytes: csize_t);
-      // Creates KernelName and grows FChannelPartialBuffer to PartialBytes.
-      procedure ArmChannelPartialOpenCL(const KernelName: string; PartialBytes: csize_t);
+      // Creates cai_channel_sums_partial and grows its buffer to fit FOutput.
+      procedure ArmChannelPartialOpenCL();
+      // True when the partial stage is armed large enough for the current FOutput.
+      function ChannelPartialArmed(): boolean;
+      // Writes SourceBuffer's per-slice channel sums of x, or of x^2 when Square,
+      // into FChannelPartialBuffer; returns the slice count.
+      function RunChannelPartialOpenCL(SourceBuffer: cl_mem; Square: boolean): longint;
+      // Bytes of the partial sums of the current FOutput.
+      function ChannelPartialBytes(): csize_t;
       procedure ReleaseChannelTableOpenCL();
       // True when ArmChannelTableOpenCL armed a table of TableBytes.
       function ChannelTableArmed(TableBytes: csize_t): boolean;
@@ -10604,12 +10611,10 @@ type
       procedure SizeBackpropScratch();
     protected
       {$IFDEF OpenCL}
-      // cai_channel_square_sums_partial then cai_grn_table write the 2*Depth
+      // cai_channel_sums_partial (squares) then cai_grn_table write the 2*Depth
       // coef|beta ChannelAffine table.
       function ActivationChannelBufferOnOpenCL(SourceBuffer,
         WeightBuffer: cl_mem): cl_mem; override;
-      // Bytes of the partial sums for NumPositions positions of FOutput.Depth channels.
-      function PartialSumBytes(NumPositions: integer): csize_t;
       {$ENDIF}
     public
       {$IFDEF OpenCL}
@@ -10994,8 +10999,8 @@ type
       procedure SizeBackpropScratch();
     protected
       {$IFDEF OpenCL}
-      // cai_meta_acon_table turns the p1|p2|gamma|delta pack into the p1|p2|beta
-      // table of opcode 52, beta from the source's channel means.
+      // cai_channel_sums_partial then cai_meta_acon_table turn the p1|p2|gamma|delta
+      // pack into the p1|p2|beta table of opcode 52, beta from the channel means.
       function ActivationChannelBufferOnOpenCL(SourceBuffer,
         WeightBuffer: cl_mem): cl_mem; override;
       {$ENDIF}
@@ -67757,10 +67762,6 @@ end;
 const
   // Added under the square root of each channel's sum of squares (TNNetGRN).
   csGRNEpsilon = 1e-6;
-  // cai_channel_square_sums_partial slicing: at most this many position slices
-  // of at least csGRNMinSlicePositions positions each.
-  csGRNMaxPositionSlices = 64;
-  csGRNMinSlicePositions = 32;
 
 { TNNetGRN }
 constructor TNNetGRN.Create();
@@ -68030,54 +68031,26 @@ begin
   inherited EnableOpenCL(DotProductKernel);
   ArmChannelTableOpenCL('cai_grn_table',
     csize_t(2 * FOutput.Depth) * csNeuralFloatSize);
-  ArmChannelPartialOpenCL('cai_channel_square_sums_partial',
-    PartialSumBytes(FOutput.SizeX * FOutput.SizeY));
+  ArmChannelPartialOpenCL();
 end;
 
 function TNNetGRN.WillOpenCL(): boolean;
 begin
   Result := (not FIsTrainable) and
     ChannelTableArmed(csize_t(2 * FOutput.Depth) * csNeuralFloatSize) and
-    Assigned(FChannelPartialKernel) and
-    (PartialSumBytes(FOutput.SizeX * FOutput.SizeY) <= FChannelPartialBufBytes) and
-    inherited WillOpenCL();
-end;
-
-// Positions per cai_channel_square_sums_partial slice.
-function GRNPositionsPerSlice(NumPositions: integer): integer;
-begin
-  Result := Max(csGRNMinSlicePositions,
-    (NumPositions + csGRNMaxPositionSlices - 1) div csGRNMaxPositionSlices);
-end;
-
-function TNNetGRN.PartialSumBytes(NumPositions: integer): csize_t;
-var
-  PositionsPerSlice: integer;
-begin
-  PositionsPerSlice := GRNPositionsPerSlice(NumPositions);
-  Result := csize_t((NumPositions + PositionsPerSlice - 1) div PositionsPerSlice) *
-    csize_t(FOutput.Depth) * csNeuralFloatSize;
+    ChannelPartialArmed() and inherited WillOpenCL();
 end;
 
 function TNNetGRN.ActivationChannelBufferOnOpenCL(SourceBuffer,
   WeightBuffer: cl_mem): cl_mem;
 var
   k: cl_kernel;
-  iNumPositions, iDepth, iPositionsPerSlice, iNumSlices: longint;
+  iDepth, iNumSlices: longint;
   fEps: single;
   LocalSize: csize_t;
 begin
-  iNumPositions := FOutput.SizeX * FOutput.SizeY;
   iDepth := FOutput.Depth;
-  iPositionsPerSlice := GRNPositionsPerSlice(iNumPositions);
-  iNumSlices := (iNumPositions + iPositionsPerSlice - 1) div iPositionsPerSlice;
-  k := FChannelPartialKernel;
-  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
-  clSetKernelArg(k, 1, csLongintSize, @iDepth);
-  clSetKernelArg(k, 2, csLongintSize, @iPositionsPerSlice);
-  clSetKernelArg(k, 3, csCLMemSize, @SourceBuffer);
-  clSetKernelArg(k, 4, csCLMemSize, @FChannelPartialBuffer);
-  FActivationKernel.RunKernel2D(k, csize_t(iDepth), csize_t(iNumSlices));
+  iNumSlices := RunChannelPartialOpenCL(SourceBuffer, true);
   k := FChannelTableKernel;
   fEps := csGRNEpsilon;
   LocalSize := TNNetKernelCL.ReductionLocalSize(iDepth);
@@ -69659,31 +69632,32 @@ begin
   inherited EnableOpenCL(DotProductKernel);
   ArmChannelTableOpenCL('cai_meta_acon_table',
     csize_t(3 * FOutput.Depth) * csNeuralFloatSize);
+  ArmChannelPartialOpenCL();
 end;
 
 function TNNetMetaAconC.WillOpenCL(): boolean;
 begin
   Result := (not FIsTrainable) and
     ChannelTableArmed(csize_t(3 * FOutput.Depth) * csNeuralFloatSize) and
-    inherited WillOpenCL();
+    ChannelPartialArmed() and inherited WillOpenCL();
 end;
 
 function TNNetMetaAconC.ActivationChannelBufferOnOpenCL(SourceBuffer,
   WeightBuffer: cl_mem): cl_mem;
 var
   k: cl_kernel;
-  iNumPositions, iDepth: longint;
+  iNumSlices, iDepth: longint;
   fInvNumPositions: single;
 begin
+  iNumSlices := RunChannelPartialOpenCL(SourceBuffer, false);
   k := FChannelTableKernel;
-  iNumPositions := FOutput.SizeX * FOutput.SizeY;
   iDepth := FOutput.Depth;
-  fInvNumPositions := 1 / iNumPositions;
-  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
+  fInvNumPositions := 1 / (FOutput.SizeX * FOutput.SizeY);
+  clSetKernelArg(k, 0, csLongintSize, @iNumSlices);
   clSetKernelArg(k, 1, csLongintSize, @iDepth);
   clSetKernelArg(k, 2, csNeuralFloatSize, @fInvNumPositions);
   clSetKernelArg(k, 3, csCLMemSize, @WeightBuffer);
-  clSetKernelArg(k, 4, csCLMemSize, @SourceBuffer);
+  clSetKernelArg(k, 4, csCLMemSize, @FChannelPartialBuffer);
   clSetKernelArg(k, 5, csCLMemSize, @FChannelTableBuffer);
   FActivationKernel.RunKernel(k, iDepth);
   Result := FChannelTableBuffer;
@@ -85992,14 +85966,62 @@ begin
   end;
 end;
 
-procedure TNNetChannelTransformBase.ArmChannelPartialOpenCL(
-  const KernelName: string; PartialBytes: csize_t);
+const
+  // cai_channel_sums_partial slicing: at most this many position slices of at
+  // least csChannelPartialMinSlicePositions positions each.
+  csChannelPartialMaxSlices = 64;
+  csChannelPartialMinSlicePositions = 32;
+
+function ChannelPartialPositionsPerSlice(NumPositions: integer): integer;
+begin
+  Result := Max(csChannelPartialMinSlicePositions,
+    (NumPositions + csChannelPartialMaxSlices - 1) div csChannelPartialMaxSlices);
+end;
+
+function TNNetChannelTransformBase.ChannelPartialBytes(): csize_t;
+var
+  NumPositions, PositionsPerSlice: integer;
+begin
+  NumPositions := FOutput.SizeX * FOutput.SizeY;
+  PositionsPerSlice := ChannelPartialPositionsPerSlice(NumPositions);
+  Result := csize_t((NumPositions + PositionsPerSlice - 1) div PositionsPerSlice) *
+    csize_t(FOutput.Depth) * csNeuralFloatSize;
+end;
+
+procedure TNNetChannelTransformBase.ArmChannelPartialOpenCL();
 begin
   if not Assigned(FActivationKernel) then exit;
   if not Assigned(FChannelPartialKernel) then
-    FChannelPartialKernel := FActivationKernel.CreateKernel(KernelName);
+    FChannelPartialKernel := FActivationKernel.CreateKernel('cai_channel_sums_partial');
   FActivationKernel.EnsureBuffer(FChannelPartialBuffer, FChannelPartialBufBytes,
-    CL_MEM_READ_WRITE, PartialBytes);
+    CL_MEM_READ_WRITE, ChannelPartialBytes());
+end;
+
+function TNNetChannelTransformBase.ChannelPartialArmed(): boolean;
+begin
+  Result := Assigned(FChannelPartialKernel) and
+    (ChannelPartialBytes() <= FChannelPartialBufBytes);
+end;
+
+function TNNetChannelTransformBase.RunChannelPartialOpenCL(SourceBuffer: cl_mem;
+  Square: boolean): longint;
+var
+  k: cl_kernel;
+  iNumPositions, iDepth, iPositionsPerSlice, iSquare: longint;
+begin
+  iNumPositions := FOutput.SizeX * FOutput.SizeY;
+  iDepth := FOutput.Depth;
+  iPositionsPerSlice := ChannelPartialPositionsPerSlice(iNumPositions);
+  iSquare := Ord(Square);
+  Result := (iNumPositions + iPositionsPerSlice - 1) div iPositionsPerSlice;
+  k := FChannelPartialKernel;
+  clSetKernelArg(k, 0, csLongintSize, @iNumPositions);
+  clSetKernelArg(k, 1, csLongintSize, @iDepth);
+  clSetKernelArg(k, 2, csLongintSize, @iPositionsPerSlice);
+  clSetKernelArg(k, 3, csLongintSize, @iSquare);
+  clSetKernelArg(k, 4, csCLMemSize, @SourceBuffer);
+  clSetKernelArg(k, 5, csCLMemSize, @FChannelPartialBuffer);
+  FActivationKernel.RunKernel2D(k, csize_t(iDepth), csize_t(Result));
 end;
 
 procedure TNNetChannelTransformBase.ReleaseChannelTableOpenCL();
