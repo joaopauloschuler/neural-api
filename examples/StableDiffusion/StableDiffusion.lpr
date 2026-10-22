@@ -17,7 +17,8 @@ Each component is loaded when its stage starts and freed when it ends, so
 only one is in memory at a time. --repeat N > 1 makes N images from one
 prompt encode and keeps the three components loaded. --int8 stores the UNet
 and text encoder weights in int8. --stats prints a per-image stage table
-(wall ms; host<->OpenCL MB with --gpu).
+(wall ms; host<->OpenCL MB with --gpu). --embedding FILE[:TOKEN] (repeatable)
+loads a textual inversion concept, as diffusers load_textual_inversion.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -47,6 +48,8 @@ const
 type
   TStableDiffusionOptions = record
     ModelFolder, Prompt, NegativePrompt, OutputFile: string;
+    // --embedding values: FILE or FILE:TOKEN, in load order.
+    Embeddings: array of string;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
@@ -167,6 +170,12 @@ begin
   WriteLn('                    once. N > 1 keeps the components loaded and ',
     'numbers the files');
   WriteLn('                    (stable_diffusion_0001.png, ...; default 1)');
+  WriteLn('  --embedding F[:T] textual inversion embedding (diffusers ',
+    'learned_embeds');
+  WriteLn('                    .safetensors/.bin or A1111 .pt) under token T ',
+    '(default: the');
+  WriteLn('                    file''s); use the token in the prompts; ',
+    'repeatable');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -228,6 +237,7 @@ begin
   Opt.UseStats := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
+  SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
   while ArgPos <= ParamCount do
@@ -250,6 +260,11 @@ begin
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
     else if Arg = '--sampler' then Opt.SamplerName := LowerCase(NextArg())
     else if Arg = '--repeat' then Opt.RepeatCount := StrToInt(NextArg())
+    else if Arg = '--embedding' then
+    begin
+      SetLength(Opt.Embeddings, Length(Opt.Embeddings) + 1);
+      Opt.Embeddings[High(Opt.Embeddings)] := NextArg();
+    end
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -272,6 +287,22 @@ begin
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
 end;
 
+// Splits an --embedding value at its last ':' unless that is a drive letter's
+// or is followed by a path; Token '' leaves the token to the file.
+procedure SplitEmbeddingSpec(const Spec: string; out FileName, Token: string);
+var
+  ColonPos: integer;
+begin
+  FileName := Spec;
+  Token := '';
+  ColonPos := LastDelimiter(':', Spec);
+  if (ColonPos <= 2) or (LastDelimiter('/\', Spec) > ColonPos) then exit;
+  FileName := Copy(Spec, 1, ColonPos - 1);
+  Token := Copy(Spec, ColonPos + 1, Length(Spec));
+  if Token = '' then
+    raise Exception.Create('--embedding ' + Spec + ': empty token');
+end;
+
 // --output for one image; else Base with _0001, _0002, ... before the extension.
 function ImageFileName(const Base: string; ImagePos, ImageCount: integer): string;
 begin
@@ -285,8 +316,8 @@ var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
   Image, PromptEmbeds: TNNetVolume;
-  ComputeText, ImageFile: string;
-  ImageWidth, ImageHeight, ImagePos: integer;
+  ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
+  ImageWidth, ImageHeight, ImagePos, EmbeddingPos: integer;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
   PngSaveMs: double;
@@ -353,6 +384,14 @@ begin
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
     if Opt.UseInt8 then WriteLn('Weights:  UNet int8, text encoder int8')
     else WriteLn('Weights:  FP32');
+    for EmbeddingPos := 0 to High(Opt.Embeddings) do
+    begin
+      SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,
+        EmbeddingToken);
+      EmbeddingToken := Pipeline.LoadTextualInversion(EmbeddingFile,
+        EmbeddingToken);
+      WriteLn('Embedding: ', EmbeddingToken, ' from ', EmbeddingFile);
+    end;
     if Opt.RepeatCount > 1 then
     begin
       WriteLn('Loading the text encoder, the UNet and the VAE decoder to ',

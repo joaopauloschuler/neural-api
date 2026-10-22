@@ -35,6 +35,30 @@ folder the int8 image is within 0.0092 of the FP32 one (pixels in [0, 1]) and
 the prompt embeds within 0.045 (`TestStableDiffusionPipelineInt8`); the
 quality on a real checkpoint is not measured yet.
 
+`--embedding FILE[:TOKEN]` (repeatable) loads a textual inversion concept, as
+diffusers `load_textual_inversion` does
+(`TStableDiffusionPipeline.LoadTextualInversion`). FILE is a diffusers
+`learned_embeds.safetensors` / `.bin` (one `{token: [N, hidden]}` tensor) or an
+AUTOMATIC1111 `.pt` (`string_to_param['*']`, token from its `name`). TOKEN
+replaces the file's token. The concept's N vectors become N new tokens (TOKEN,
+TOKEN_1, ..., TOKEN_{N-1}) after the CLIP vocab, and a prompt that names TOKEN
+gets all N, as diffusers' `maybe_convert_prompt`. Put the token in `--prompt`
+or `--negative`:
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --embedding ~/embeddings/cat-toy/learned_embeds.safetensors \
+  --prompt "a <cat-toy> on a beach"
+```
+
+The vector width must equal the text encoder's hidden size (768 for SD 1.x;
+an SD 2.x embedding is 1024 wide and is rejected). As in diffusers, the token
+matches in any case, but only an all-lowercase token expands to its N vectors:
+a mixed-case token such as `EasyNegative` uses its first vector only. Pass a
+lowercase TOKEN (`file.pt:easynegative`) to get all of them. Tested against
+diffusers float64 on the pico folder (`TestStableDiffusionTextualInversion*`);
+no real embedding has been run yet.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -72,6 +96,9 @@ StableDiffusion [--model DIR] [options]
   --repeat N        N images, seeds --seed, --seed+1, ...; the prompt is encoded
                     once. N > 1 keeps the components loaded and numbers the files
                     (stable_diffusion_0001.png, ...; default 1)
+  --embedding F[:T] textual inversion embedding (diffusers learned_embeds
+                    .safetensors/.bin or A1111 .pt) under token T (default: the
+                    file's); use the token in the prompts; repeatable
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)
