@@ -845,6 +845,25 @@ rather than acted on.
       synthesis backbone is reuse. Distinct from NAFNet/SwinIR (generic restoration
       with no generative face prior). Pico parity vs a float64 oracle on the SFT
       injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
+- [ ] DDColor photo-colorization importer (`BuildDDColorFromSafeTensors[Ex]`,
+      Kang et al. ICCV 2023, arXiv:2212.11613, Apache-2.0 checkpoints
+      `piddnad/ddcolor_paper_tiny` / `ddcolor_modelscope` / `ddcolor_artistic`;
+      `.pth` through `TNNetTorchBinReader`) + examples/ColorizePhoto. Turns a real
+      grayscale photo of any size into color; examples/Colorization only trains a
+      small CIFAR-10 U-Net from scratch. Architecture: ConvNeXt-T/L encoder (reuse
+      `BuildConvNeXt`, exposing its stage 1/4..1/32 features), a pixel decoder of
+      PixelShuffle up-blocks (`TNNetPixelShuffle`), a multi-scale color decoder of
+      learnable color queries (cross-attention to the 1/16, 1/8, 1/4 features, then
+      self-attention + FFN, the Mask2Former order: reuse the landed Mask2Former
+      decoder layers), the query x pixel-feature product (reuse
+      `Mask2FormerMaskEinsum`) and a 1x1 fusion conv to a*b*. Pre/post: resize to
+      512 (or 256), L of `RgbToLab` with a*b* = 0 back to RGB as input, bilinear
+      a*b* back to the source size recombined with the source L via `LabToRgb`.
+      Every block must be an existing neuralnetwork.pas layer; a missing one is
+      added there, not in neuralpretrained.pas. Pico parity vs the official
+      `basicsr/archs/ddcolor_arch.py` in the ~/x venv (tiny random config,
+      tests/fixtures), an OpenCL forward test, then a real-checkpoint run on the
+      GPU box before README calls it supported.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
