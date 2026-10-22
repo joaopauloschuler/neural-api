@@ -73,11 +73,6 @@ rather than acted on.
 
 ## Bugs
 
-- [X] Defect (found 2026-10-22, 9b2390c6): `TNNetGroupNorm.GroupNormEpsilon` is
-      not saved in the layer structure, so `Clone` / `SaveToString` of an SD
-      UNet or VAE silently resets its 1e-6 norms to 1e-5. Stored in FFloatSt[0]
-      (0 in old files loads as 1e-5; TNNetInstanceNorm inherits it);
-      TestGroupNormEpsilonSerializationRoundTrip.
 - [ ] Probable defect (not fixed, awaits user decision; found during the
       Restormer importer): `BuildNAFNet` and `BuildSwinIRFromSafeTensors` load
       the conv before their `TNNetDepthToSpace` upsample unpermuted, but torch
@@ -538,26 +533,11 @@ rather than acted on.
       - [ ] Latent Consistency Models in TStableDiffusionPipeline: 2-8 step
             SD 1.5 images, about 6-10x fewer UNet passes than 25-50 step
             sampling.
-        - [X] Route (1), LCM-LoRA: `--sampler lcm` / scheduler_config
-              "LCMScheduler" -> smLCM on TNNetLCMScheduler (origin grid,
-              next-step re-noise, img2img strength scales the origin grid via
-              BuildImg2ImgSchedule), pico parity vs diffusers float64
-              (TestStableDiffusionLCMParity, tiny_sd15_lcm_io.json), README
-              section. c_out had a sigma_data factor and an off-by-one t that
-              diffusers does not have; both fixed.
         - [ ] Real LCM-LoRA run on the user's GPU box:
               latent-consistency/lcm-lora-sdv1-5 through --lora + --sampler lcm,
               4 steps, guidance 1.0 and 1.5. Check that every LoRA key of that
               file merges (the pico LoRA test covers attention, proj_in, ff,
               conv1 and time_emb_proj only).
-        - [X] Route (2), LCM-distilled UNets: BuildSDUNet wires
-              time_embedding.cond_proj (guidance input = TNNetInput #3,
-              TNNetSinusoidalTimeEmbedding with DownscaleFreqShift 1), the
-              pipeline runs one pass per step (CFGGuidanceScale = 1), model_index
-              LatentConsistencyModel[Img2Img]Pipeline accepted, example
-              defaults guidance 8.5. Pico parity vs diffusers float64
-              (TestStableDiffusionLCMDistilledParity, TestSDUNetTimeCondProjDimParity,
-              tiny_sd15_lcm_distilled/).
         - [ ] Real LCM-distilled run on the user's GPU box:
               SimianLuo/LCM_Dreamshaper_v7, 4 steps, guidance 8.5, text-to-image
               and --init-image. Its unet is F32 safetensors; check the load and
@@ -575,14 +555,8 @@ rather than acted on.
               documented LCM-LoRA img2img route, AutoPipelineForImage2Image)
               keeps the last int(steps * strength) of the full grid instead
               (-> 499, 259). Optionally offer that one too.
-      - [X] SD 2.x pico parity: tests/fixtures/tiny_sd2
-            (tools/make_pico_sd2_pipeline_fixture.py), TestStableDiffusion2*:
-            v_prediction in DDIM/PNDM/Euler/DPM++ 2M/LCM and img2img (Euler a
-            too), gelu text encoder, linear projection, per-block heads, the
-            "!" pad of special_tokens_map.json (also split out of prompts as a
-            special token), default size from sample_size. Verified on the
-            real 2.1 files: text_encoder num_hidden_layers 23 (layers 0..22
-            stored), hidden_act gelu.
+      - [ ] SD 2.x follow-ups (pico parity: tests/fixtures/tiny_sd2,
+            TestStableDiffusion2*):
         - [ ] Real SD 2.1 run on the user's GPU box (768x768, v_prediction).
               stabilityai/stable-diffusion-2-1 is gone from the Hub; the
               sd2-community/stable-diffusion-2-1 mirror has the same files.
@@ -592,27 +566,13 @@ rather than acted on.
               inpainting checkpoint shows up.
         - [ ] SD 2.x upcast_attention is ignored (all FP32); it matters only
               with the F16 item below.
-        - [X] SD 2.x depth-to-image with a supplied depth map:
-              TStableDiffusionDepth2Img (an img2img whose 5-channel UNet sees
-              latents | depth; DiffusersDepthToLatentGrid = prepare_depth_map's
-              torch bicubic resize + per-image min/max to [-1, 1]),
-              examples/StableDiffusion --init-image + --depth-image. Pico parity
-              tests/fixtures/tiny_sd2_depth (make_pico_sd2_pipeline_fixture.py
-              --depth-only), TestStableDiffusion2Depth2ImgParity / ...OpenCL:
-              DDIM and Euler a at strength 0.6, depth maps smaller and larger
-              than the latent grid.
+        - [ ] SD 2.x depth-to-image follow-ups (TStableDiffusionDepth2Img,
+              TestStableDiffusion2Depth2ImgParity):
           - [ ] Real stabilityai/stable-diffusion-2-depth run on the user's GPU
                 box (512x512) with a depth map from another estimator
                 (--depth-image).
-          - [X] DPT-Hybrid importer (Intel/dpt-hybrid-midas, the checkpoint's
-                depth_estimator/): BuildDPT reads model_type "dpt" with
-                is_hybrid (BiT bottleneck backbone, weight standardization folded
-                into the conv weights at load, GroupNorm, TF SAME / dynamic
-                padding; ViT-hybrid embeddings; readout "project";
-                neck_ignore_stages [0, 1]; DPTDepthEstimationHead) and the
-                plain-ViT DPT (Intel/dpt-large). Pico parity vs transformers
-                float64 (tools/make_pico_dpt_hybrid_fixture.py):
-                TestDPTHybridDepthEstimationParity, TestDPTViTDepthEstimationParity.
+          - [ ] DPT-Hybrid / plain-ViT DPT follow-ups (BuildDPT;
+                TestDPTHybridDepthEstimationParity, TestDPTViTDepthEstimationParity):
             - [ ] Real Intel/dpt-hybrid-midas and Intel/dpt-large runs on the
                   user's GPU box (384x384; compare against transformers).
             - [ ] Only the native image_size: the position table is not
@@ -624,14 +584,8 @@ rather than acted on.
             - [ ] FPC 3.x -O2 miscompiled `B <> (Flag and (I < 2))` in a for
                   loop in BuildDPT (garbage index register; rewritten with a
                   local boolean). Report upstream with a reduced case.
-          - [X] Depth2Img runs the depth_estimator/ + feature_extractor/ of
-                the pipeline folder (or DepthEstimatorFolder) when no depth map
-                is set (diffusers depth_map=None; DPTImageProcessor through
-                ClipPreprocessImage, PIL bilinear uint8 resize);
-                examples/StableDiffusion needs only --init-image on a depth
-                folder. Pico parity (make_pico_sd2_pipeline_fixture.py
-                --depth-estimator-only): TestStableDiffusion2Depth2ImgEstimatorParity
-                / ...EstimatorOpenCL.
+          - [ ] Depth2Img depth-estimator follow-ups (EstimateDepthMap;
+                TestStableDiffusion2Depth2ImgEstimatorParity):
             - [ ] Real stabilityai/stable-diffusion-2-depth run with its own
                   depth_estimator on the user's GPU box (512x512); compare the
                   estimated depth with diffusers.
@@ -649,10 +603,7 @@ rather than acted on.
             the pipeline refuses addition_embed_type "text_time" today.
       - [ ] F16 weights: the SD UNet / VAE / CLIP loaders are unverified on F16
             and *.fp16.safetensors variant files (pick the variant by name).
-      - [X] CLIP tokenizer.json (fast) path: LoadFromFile recognizes the CLIP
-            Split / Lowercase / Replace(\s+) / end_of_word_suffix and reuses
-            SplitClipPieces; TStableDiffusionPipeline reads
-            tokenizer/tokenizer.json when present.
+      - [ ] CLIP tokenizer.json (fast) path follow-ups:
         - [ ] The post_processor is not read: BosId / EosId come from the
               <|startoftext|> / <|endoftext|> added tokens. A CLIP-family
               tokenizer.json with other bos/eos names gets no BosId.
@@ -665,13 +616,8 @@ rather than acted on.
             image, user's GPU box; `UNetInt8` / `TextEncoderInt8`, `--int8`),
             then int4 UNet weights (QuantizeWeightsInt4, the QwenImage --int4
             path) after the int8 check.
-      - [X] A kept pipeline's size change reads no safetensors: the UNet, VAE
-            decoder/encoder, ControlNet and T2I-Adapter weights are read once
-            into a 1x1-grid weight owner (int8-quantized there), and each size
-            builds a net borrowing them (BuildWeightOwner; borrowing builds pair
-            weight-bearing layers in order, so the odd-size TNNetCrop is fine).
-            WeightFileLoadCount; TestStableDiffusion*SizeChange*,
-            TestSDUNetBorrowedWeightsOpenCL.
+      - [ ] Kept-pipeline size-change follow-ups (weight owners,
+            BuildWeightOwner):
         - [ ] --gpu: the owners stay on the host, so each size change uploads
               the UNet weights (int8 codes or FP32) into the new net's own
               OpenCL context again. Arming the owners in one shared context
@@ -680,10 +626,6 @@ rather than acted on.
               measure on the GPU box first.
         - [ ] A different IP-Adapter file still re-reads the UNet (the owner
               holds the IP-Adapter attention weights).
-        - [X] TNNetGroupNorm.GroupNormEpsilon is not in the saved structure, so
-              Clone / SaveToString of an SD UNet or VAE resets the 1e-6 norms to
-              1e-5. The builders now set it at construction; the save format
-              does not carry it.
       - [ ] Per-prompt caching of the cross-attention text K/V (low payoff,
             ~0.4% of a 512x512 SD 1.5 pass: 2*77*768*sum(C)=1.5 GMAC over the
             16 attn2 blocks vs ~400 GMAC). Needs a TNNet mechanism to skip the
@@ -710,10 +652,8 @@ rather than acted on.
               mask); (2) IP-Adapter + img2img / inpainting parity (code path
               shared with the tested InstructPix2Pix case); (3) a T2I MultiAdapter
               test (diffusers MultiAdapter adapter_weights).
-        - [X] ControlNet config global_pool_conditions (first net's flag forces
-              guess mode, pooled residuals; TestStableDiffusion*GlobalPool*) and
-              a repeatable --controlnet in examples/ControlNetCanny. Real-checkpoint
-              run (lllyasviel/control_v11e_sd15_shuffle) still pending.
+        - [ ] Real-checkpoint run of a global_pool_conditions ControlNet
+              (lllyasviel/control_v11e_sd15_shuffle).
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
       - [ ] Textual inversion on a real checkpoint: SD 1.5 with a
@@ -785,18 +725,8 @@ rather than acted on.
         - [ ] InstructPix2Pix extras: an --edit-image whose
               sides are not a VAE-factor multiple (resize parity, see (6)
               above), and PAG/SLG-style extra passes through PredictGuidedNoise.
-      - [X] FreeU (Si et al. 2023, arXiv:2309.11497; diffusers
-            `pipe.enable_freeu(s1, s2, b1, b2)`): DONE. `TNNetFreeUFourierFilter`
-            (diffusers `fourier_filter(threshold=1)` by projection, O(H*W), no
-            FFT, forward + backward + OpenCL `cai_freeu_fourier_filter`), the
-            backbone half-channel scale from TNNetSplitChannels +
-            TNNetMulByConstant + TNNetDeepConcat, `TSDUNetConfig.UseFreeU` /
-            `SDUNetSetFreeU`, `TStableDiffusionPipeline.EnableFreeU` /
-            `DisableFreeU`, examples/StableDiffusion `--freeu s1,s2,b1,b2|sd15|sd21`.
-            Current diffusers apply_freeu is FreeU v1 (plain b scale, no
-            mean-based mask) and runs at EVERY skip popped in up blocks 0 and 1.
-            Pico parity < 1e-4 vs diffusers float64 at 32x16 and 14x10
-            (`tools/make_pico_sd_pipeline_fixture.py --freeu-only`).
+      - [ ] FreeU follow-ups (`TNNetFreeUFourierFilter`,
+            examples/StableDiffusion `--freeu`):
         - [ ] FreeU follow-up: a with/without image pair from the GPU box on a
               real SD 1.5 checkpoint (`--freeu sd15`) for the README section,
               and its UNet pass time with and without FreeU.
@@ -1171,20 +1101,12 @@ rather than acted on.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
-        - [X] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
-          neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
-          scratch. Chunks over out-channels now (GEMM and direct scatter, dense
-          and grouped); each range owns its product columns, so no per-thread
-          scratch. Few-channel deconvs get few chunks.
         - [ ] `cai_conv_transpose` is untiled (one work-item per output cell and
           channel, like `cai_conv_implicit`); a large dense deconv (Kokoro
           generator ups) may want a tiled or phase-split GEMM. Not timed on a GPU.
         - [ ] Trainable deconvolutions and activations without a fused opcode
           (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
           CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
-        - [X] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
-          deconv) for 32-multiple channel counts: one extra weight copy (dense
-          deconvs only now).
         - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
           `pcr_sinf` loop; the per-channel path is vectorized.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
