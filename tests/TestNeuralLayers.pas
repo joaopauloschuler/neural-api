@@ -74,6 +74,7 @@ type
     procedure TestSinScalarParity;
     procedure TestSinWideRangeSweep;
     procedure TestSnakeInferenceMatchesFormula;
+    procedure TestSnakeTrainingForwardMatchesFormula;
     procedure TestCosScalarParity;
     procedure TestSinCosMatchesSeparateSinAndCos;
     procedure TestArcSinhScalarParity;
@@ -1841,6 +1842,64 @@ begin
       end;
       AssertTrue('Snake case ' + IntToStr(CasePos) + ': max scaled diff ' +
         FloatToStr(MaxDiff), MaxDiff < 1);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSnakeTrainingForwardMatchesFormula;
+// Training Snake forward (both alpha modes): output and the cached derivative
+// 1 + 2*sin(ax)*cos(ax) vs pcr_sincosf, on shapes spanning several blocks.
+const
+  csScalarAlpha = 1.7;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Snake: TNNetLayer;
+  CasePos, ElementPos, Depth: integer;
+  x, Alpha, SinAx, CosAx, Expected, Diff, MaxDiff, MaxDerivDiff: TNeuralFloat;
+begin
+  RandSeed := 20261023;
+  for CasePos := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create();
+    try
+      if CasePos = 0 then Input.ReSize(1500, 1, 5) else Input.ReSize(3, 1, 2100);
+      for ElementPos := 0 to Input.Size - 1 do
+        if ElementPos mod 3 = 0 then Input.FData[ElementPos] := 600 * (2 * Random - 1)
+        else Input.FData[ElementPos] := 3 * (2 * Random - 1);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth, 1));
+      Snake := NN.AddLayer(TNNetSnake.Create(csScalarAlpha, CasePos = 1));
+      Depth := Input.Depth;
+      if CasePos = 1 then
+        for ElementPos := 0 to Depth - 1 do
+          Snake.Neurons[0].Weights.FData[ElementPos] := 0.2 + 2.0 * ElementPos / Depth;
+      AssertEquals('derivative volume sized', Snake.Output.Size,
+        Snake.OutputErrorDeriv.Size);
+      NN.Compute(Input);
+      MaxDiff := 0;
+      MaxDerivDiff := 0;
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        x := Input.FData[ElementPos];
+        if CasePos = 1 then Alpha := Snake.Neurons[0].Weights.FData[ElementPos mod Depth]
+        else Alpha := csScalarAlpha;
+        pcr_sincosf(Alpha * x, SinAx, CosAx);
+        Expected := x + SinAx * SinAx / Alpha;
+        Diff := Abs(Snake.Output.FData[ElementPos] - Expected) /
+          (1e-5 / Alpha + 2.4e-7 * Abs(x));
+        if Diff > MaxDiff then MaxDiff := Diff;
+        Diff := Abs(Snake.OutputErrorDeriv.FData[ElementPos] -
+          (1.0 + 2.0 * SinAx * CosAx));
+        if Diff > MaxDerivDiff then MaxDerivDiff := Diff;
+      end;
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max scaled output diff ' +
+        FloatToStr(MaxDiff), MaxDiff < 1);
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max derivative diff ' +
+        FloatToStr(MaxDerivDiff), MaxDerivDiff < 1e-5);
     finally
       Input.Free;
       NN.Free;
