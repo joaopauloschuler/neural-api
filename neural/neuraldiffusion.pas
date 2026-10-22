@@ -576,6 +576,15 @@ type
   // UniPC B(h) (diffusers solver_type): ustBh1 B(h) = -h, ustBh2 B(h) = e^-h - 1.
   TNNetUniPCSolverType = (ustBh1, ustBh2);
 
+  // The diffusers scheduler whose use_flow_sigmas schedule SetTimesteps builds
+  // (T = NumTrainTimesteps, k = 0..N-1 before the shift):
+  //   ffFlowMatchEuler : linspace(1, 1/N, N); Timestep = sigma*T.
+  //   ffUniPC          : linspace(1, 1/T, N+1)[:-1]; Timestep = int(sigma*T),
+  //     a first sigma of 1 read as 1 - 1e-6.
+  //   ffDPMSolver      : 1 - linspace(1, 1/T, N+1) reversed, its 0 dropped;
+  //     Timestep = int(sigma*T).
+  TNNetFlowScheduleFamily = (ffFlowMatchEuler, ffUniPC, ffDPMSolver);
+
   { TNNetFlowMatchEulerScheduler }
   // Deterministic sampler for rectified-flow models that predict the velocity
   // v = noise - x0 (diffusers FlowMatchEulerDiscreteScheduler): sigma runs from
@@ -606,6 +615,10 @@ type
     FHistoryLen, FPrevOrder: integer;
     FUniPCSolverType: TNNetUniPCSolverType;
     FUniPCCorrector: boolean;
+    FScheduleFamily: TNNetFlowScheduleFamily;
+    // CreateFromDiffusersConfigText of a UniPC / DPM-Solver multistep config.
+    procedure ReadMultistepFlowConfig(Obj: TJSONObject; const Source,
+      SchedulerClass: string);
     procedure SetSampler(Value: TNNetFlowSampler);
     // DPM-Solver++(2M) step; second order when step StepIndex-1 left history.
     procedure StepDPMSolverPP2M(Sample, Velocity: TNNetVolume;
@@ -630,6 +643,10 @@ type
     // Reads a diffusers FlowMatchEulerDiscreteScheduler scheduler_config.json;
     // raises on a setting this class does not implement (Karras sigmas, ...).
     constructor CreateFromDiffusersConfig(const FileName: string);
+    // The config text; UniPCMultistepScheduler -> fsUniPC and
+    // DPMSolverMultistepScheduler -> fsDPMSolverPP2M need use_flow_sigmas.
+    constructor CreateFromDiffusersConfigText(const ConfigJson: string;
+      const Source: string = 'text');
     // diffusers calculate_shift: mu linear in the image token count through
     // (BaseSeqLen, BaseShift) and (MaxSeqLen, MaxShift); extrapolates outside.
     class function CalculateShift(ImageSeqLen: integer;
@@ -662,7 +679,8 @@ type
     property NumSteps: integer read GetNumSteps;
     // Sigma[0..NumSteps]; Sigma[NumSteps] = 0.
     property Sigma[StepIndex: integer]: double read GetSigma;
-    // Timestep[0..NumSteps-1] = Sigma * NumTrainTimesteps (the model input).
+    // Timestep[0..NumSteps-1] = Sigma * NumTrainTimesteps (the model input),
+    // truncated to an integer outside ffFlowMatchEuler (TNNetFlowScheduleFamily).
     property Timestep[StepIndex: integer]: double read GetTimestep;
     property NumTrainTimesteps: integer read FNumTrainTimesteps;
     property Shift: double read FShift;
@@ -676,6 +694,9 @@ type
     property UniPCSolverType: TNNetUniPCSolverType read FUniPCSolverType
       write FUniPCSolverType;
     property UniPCCorrector: boolean read FUniPCCorrector write FUniPCCorrector;
+    // ffFlowMatchEuler unless a UniPC / DPM-Solver config set it.
+    property ScheduleFamily: TNNetFlowScheduleFamily read FScheduleFamily
+      write FScheduleFamily;
     property ShiftTerminal: double read FShiftTerminal;
     property BaseImageSeqLen: integer read FBaseImageSeqLen;
     property MaxImageSeqLen: integer read FMaxImageSeqLen;
@@ -2723,6 +2744,7 @@ begin
   FPrevOrder := 1;
   FUniPCSolverType := ustBh2;
   FUniPCCorrector := true;
+  FScheduleFamily := ffFlowMatchEuler;
 end;
 
 destructor TNNetFlowMatchEulerScheduler.Destroy;
@@ -2737,26 +2759,37 @@ constructor TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(
   const FileName: string);
 var
   JsonText: TStringList;
+begin
+  JsonText := TStringList.Create;
+  try
+    JsonText.LoadFromFile(FileName);
+    CreateFromDiffusersConfigText(JsonText.Text, FileName);
+  finally
+    JsonText.Free;
+  end;
+end;
+
+constructor TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+  const ConfigJson: string; const Source: string);
+var
   Root: TJSONData;
   Obj: TJSONObject;
-  ShiftTypeName: string;
+  ShiftTypeName, SchedulerClass: string;
   ShiftType: TNNetFlowTimeShift;
 
   procedure RefuseFlag(const Key: string);
   begin
     if Obj.Get(Key, false) then
-      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+      raise Exception.Create('Flow-matching scheduler config ' + Source +
         ': "' + Key + '" = true is not implemented.');
   end;
 
 begin
-  JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
-    Root := GetJSON(JsonText.Text);
+    Root := GetJSON(ConfigJson);
     if not (Root is TJSONObject) then
-      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+      raise Exception.Create('Flow-matching scheduler config ' + Source +
         ' is not a JSON object.');
     Obj := TJSONObject(Root);
     RefuseFlag('use_karras_sigmas');
@@ -2768,18 +2801,111 @@ begin
     if ShiftTypeName = 'exponential' then ShiftType := ftsExponential
     else if ShiftTypeName = 'linear' then ShiftType := ftsLinear
     else
-      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+      raise Exception.Create('Flow-matching scheduler config ' + Source +
         ': unknown time_shift_type "' + ShiftTypeName + '".');
-    Create(Obj.Get('num_train_timesteps', 1000), Obj.Get('shift', 1.0),
-      Obj.Get('use_dynamic_shifting', false), ShiftType,
-      Obj.Get('shift_terminal', 0.0));
-    FBaseImageSeqLen := Obj.Get('base_image_seq_len', FBaseImageSeqLen);
-    FMaxImageSeqLen := Obj.Get('max_image_seq_len', FMaxImageSeqLen);
-    FBaseShift := Obj.Get('base_shift', FBaseShift);
-    FMaxShift := Obj.Get('max_shift', FMaxShift);
+    SchedulerClass := Obj.Get('_class_name', '');
+    if (SchedulerClass = 'UniPCMultistepScheduler') or
+      (SchedulerClass = 'DPMSolverMultistepScheduler') then
+    begin
+      // flow_shift is their static shift; DPM-Solver has no shift_terminal.
+      if SchedulerClass = 'UniPCMultistepScheduler' then
+        Create(Obj.Get('num_train_timesteps', 1000), Obj.Get('flow_shift', 1.0),
+          Obj.Get('use_dynamic_shifting', false), ShiftType,
+          Obj.Get('shift_terminal', 0.0))
+      else
+        Create(Obj.Get('num_train_timesteps', 1000), Obj.Get('flow_shift', 1.0),
+          Obj.Get('use_dynamic_shifting', false), ShiftType);
+      ReadMultistepFlowConfig(Obj, Source, SchedulerClass);
+    end
+    else
+    begin
+      Create(Obj.Get('num_train_timesteps', 1000), Obj.Get('shift', 1.0),
+        Obj.Get('use_dynamic_shifting', false), ShiftType,
+        Obj.Get('shift_terminal', 0.0));
+      FBaseImageSeqLen := Obj.Get('base_image_seq_len', FBaseImageSeqLen);
+      FMaxImageSeqLen := Obj.Get('max_image_seq_len', FMaxImageSeqLen);
+      FBaseShift := Obj.Get('base_shift', FBaseShift);
+      FMaxShift := Obj.Get('max_shift', FMaxShift);
+    end;
   finally
     Root.Free;
-    JsonText.Free;
+  end;
+end;
+
+// Raises on what fsUniPC / fsDPMSolverPP2M do not implement; solver types that
+// diffusers itself replaces (UniPC midpoint, DPM bh2, ...) map as it does.
+procedure TNNetFlowMatchEulerScheduler.ReadMultistepFlowConfig(
+  Obj: TJSONObject; const Source, SchedulerClass: string);
+var
+  SolverTypeName, AlgorithmName: string;
+  IsUniPC: boolean;
+  CorrectorSkips: TJSONData;
+
+  procedure Refuse(const Detail: string);
+  begin
+    raise Exception.Create('Flow-matching scheduler config ' + Source + ' (' +
+      SchedulerClass + '): ' + Detail);
+  end;
+
+  procedure RequireString(const Key, Default, Expected: string);
+  var
+    Value: string;
+  begin
+    Value := Obj.Get(Key, Default);
+    if Value <> Expected then
+      Refuse('"' + Key + '" = "' + Value + '" is not implemented (only "' +
+        Expected + '").');
+  end;
+
+begin
+  IsUniPC := SchedulerClass = 'UniPCMultistepScheduler';
+  if not Obj.Get('use_flow_sigmas', false) then
+    Refuse('only "use_flow_sigmas" = true configs are flow matching.');
+  RequireString('prediction_type', 'epsilon', 'flow_prediction');
+  RequireString('final_sigmas_type', 'zero', 'zero');
+  if Obj.Get('solver_order', 2) <> 2 then
+    Refuse('"solver_order" = ' + IntToStr(Obj.Get('solver_order', 2)) +
+      ' is not implemented (only 2).');
+  if Obj.Get('thresholding', false) then
+    Refuse('"thresholding" = true is not implemented.');
+  if Obj.Get('use_dynamic_shifting', false) and not IsUniPC then
+    RequireString('time_shift_type', 'exponential', 'exponential');
+  if IsUniPC then
+  begin
+    if not Obj.Get('predict_x0', true) then
+      Refuse('"predict_x0" = false is not implemented.');
+    if not Obj.Get('lower_order_final', true) then
+      Refuse('"lower_order_final" = false is not implemented.');
+    CorrectorSkips := Obj.Find('disable_corrector');
+    if (CorrectorSkips is TJSONArray) and (CorrectorSkips.Count > 0) then
+      Refuse('a non-empty "disable_corrector" is not implemented.');
+    SolverTypeName := Obj.Get('solver_type', 'bh2');
+    if SolverTypeName = 'bh1' then FUniPCSolverType := ustBh1
+    else if (SolverTypeName = 'bh2') or (SolverTypeName = 'midpoint') or
+      (SolverTypeName = 'heun') or (SolverTypeName = 'logrho') then
+      FUniPCSolverType := ustBh2
+    else Refuse('unknown "solver_type" "' + SolverTypeName + '".');
+    FScheduleFamily := ffUniPC;
+    FSampler := fsUniPC;
+  end
+  else
+  begin
+    AlgorithmName := Obj.Get('algorithm_type', 'dpmsolver++');
+    if (AlgorithmName <> 'dpmsolver++') and (AlgorithmName <> 'deis') then
+      Refuse('"algorithm_type" = "' + AlgorithmName +
+        '" is not implemented (only "dpmsolver++").');
+    SolverTypeName := Obj.Get('solver_type', 'midpoint');
+    if (SolverTypeName <> 'midpoint') and (SolverTypeName <> 'logrho') and
+      (SolverTypeName <> 'bh1') and (SolverTypeName <> 'bh2') then
+      Refuse('"solver_type" = "' + SolverTypeName +
+        '" is not implemented (only "midpoint").');
+    if Obj.Get('use_lu_lambdas', false) then
+      Refuse('"use_lu_lambdas" = true is not implemented.');
+    if Obj.Get('variance_type', '') <> '' then
+      Refuse('"variance_type" = "' + Obj.Get('variance_type', '') +
+        '" is not implemented.');
+    FScheduleFamily := ffDPMSolver;
+    FSampler := fsDPMSolverPP2M;
   end;
 end;
 
@@ -2850,12 +2976,31 @@ begin
     raise Exception.Create('Flow-matching NumSteps must be >= 1.');
   SetLength(Sigmas, NumSteps);
   MaxSigmaPos := NumSteps - 1;
-  if MaxSigmaPos > 0 then SigmaStride := (1 / NumSteps - 1) / MaxSigmaPos
-  else SigmaStride := 0;
-  for SigmaPos := 0 to MaxSigmaPos do
-    Sigmas[SigmaPos] := 1 + SigmaPos * SigmaStride;
-  // numpy linspace pins the endpoint exactly.
-  Sigmas[MaxSigmaPos] := 1 / NumSteps;
+  case FScheduleFamily of
+    ffUniPC:
+      begin
+        SigmaStride := (1 / FNumTrainTimesteps - 1) / NumSteps;
+        for SigmaPos := 0 to MaxSigmaPos do
+          Sigmas[SigmaPos] := SigmaPos * SigmaStride + 1;
+      end;
+    ffDPMSolver:
+      begin
+        // 1 - alpha_(N-k) for alpha = linspace(1, 1/T, N+1); alpha_N is pinned.
+        SigmaStride := (1 / FNumTrainTimesteps - 1) / NumSteps;
+        Sigmas[0] := 1 - 1 / FNumTrainTimesteps;
+        for SigmaPos := 1 to MaxSigmaPos do
+          Sigmas[SigmaPos] := 1 - ((NumSteps - SigmaPos) * SigmaStride + 1);
+      end;
+  else
+    begin
+      if MaxSigmaPos > 0 then SigmaStride := (1 / NumSteps - 1) / MaxSigmaPos
+      else SigmaStride := 0;
+      for SigmaPos := 0 to MaxSigmaPos do
+        Sigmas[SigmaPos] := 1 + SigmaPos * SigmaStride;
+      // numpy linspace pins the endpoint exactly.
+      Sigmas[MaxSigmaPos] := 1 / NumSteps;
+    end;
+  end;
   SetSigmas(Sigmas, Mu);
 end;
 
@@ -2871,8 +3016,19 @@ begin
 end;
 
 function TNNetFlowMatchEulerScheduler.GetTimestep(StepIndex: integer): double;
+const
+  cSigmaOneNudge: double = 1e-6;
+var
+  StepSigma: double;
 begin
-  Result := FSigmas[StepIndex] * FNumTrainTimesteps;
+  StepSigma := FSigmas[StepIndex];
+  if FScheduleFamily = ffFlowMatchEuler then
+    Exit(StepSigma * FNumTrainTimesteps);
+  if (FScheduleFamily = ffUniPC) and (StepIndex = 0) and
+    (Abs(StepSigma - 1) < cSigmaOneNudge) then
+    StepSigma := StepSigma - cSigmaOneNudge;
+  // torch's int64 cast truncates.
+  Result := Trunc(StepSigma * FNumTrainTimesteps);
 end;
 
 procedure TNNetFlowMatchEulerScheduler.Step(Sample, Velocity: TNNetVolume;

@@ -2103,9 +2103,11 @@ rather than acted on.
       examples/QwenImage `--sampler euler|dpm2m|unipc`):
       - [ ] User GPU-box quality check of dpm2m and unipc at 10-12 steps
             against euler at the current default count (18).
-      - [ ] `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` reads only
+      - [X] `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` reads only
             FlowMatchEuler configs; a Wan `UniPCMultistepScheduler` config
-            (use_flow_sigmas, flow_shift, solver_type) should map onto `fsUniPC`.
+            (use_flow_sigmas, flow_shift, solver_type) should map onto `fsUniPC`
+            (also DPMSolverMultistepScheduler -> `fsDPMSolverPP2M`; `ScheduleFamily`
+            picks diffusers' sigma spacing and integer timesteps).
 - [ ] Adaptive Projected Guidance follow-ups (`TNNetAdaptiveProjectedGuidance` in
       neural/neuraldiffusion.pas, 15c5aca5; `--apg` in examples/LatentTextToImage,
       examples/ConditionalDiffusion and examples/QwenImage). Later consumers: the

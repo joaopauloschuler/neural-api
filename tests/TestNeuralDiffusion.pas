@@ -112,6 +112,12 @@ type
     procedure TestFlowMatchStepVsOracle;
     procedure TestFlowMatchStaticAndLinearShift;
     procedure TestFlowMatchFromDiffusersConfig;
+    // A Wan UniPCMultistepScheduler / a DPMSolverMultistepScheduler config with
+    // use_flow_sigmas: sampler, shift, sigmas and timesteps vs diffusers.
+    procedure TestFlowMatchFromUniPCConfig;
+    procedure TestFlowMatchFromDPMSolverConfig;
+    // Multistep flow configs with options fsUniPC / fsDPMSolverPP2M lack.
+    procedure TestFlowMatchMultistepConfigRefusals;
     procedure TestFlowMatchImg2ImgStartStepVsOracle;
     procedure TestFlowMatchScaleNoiseVsOracle;
     procedure TestFlowDPMSolverFirstOrderMatchesEuler;
@@ -1876,6 +1882,148 @@ begin
     DeleteFile(KarrasFile);
   end;
   AssertTrue('Karras sigmas are refused', Refused);
+end;
+
+const
+  // The Wan2.1 scheduler_config.json fields (flow_shift 3, the 480p setting).
+  cWanUniPCConfig = '{"_class_name": "UniPCMultistepScheduler", ' +
+    '"beta_end": 0.02, "beta_schedule": "linear", "beta_start": 0.0001, ' +
+    '"disable_corrector": [], "dynamic_thresholding_ratio": 0.995, ' +
+    '"final_sigmas_type": "zero", "flow_shift": 3.0, ' +
+    '"lower_order_final": true, "num_train_timesteps": 1000, ' +
+    '"predict_x0": true, "prediction_type": "flow_prediction", ' +
+    '"rescale_betas_zero_snr": false, "sample_max_value": 1.0, ' +
+    '"solver_order": 2, "solver_p": null, "solver_type": "bh2", ' +
+    '"steps_offset": 0, "thresholding": false, ' +
+    '"timestep_spacing": "linspace", "trained_betas": null, ' +
+    '"use_beta_sigmas": false, "use_exponential_sigmas": false, ' +
+    '"use_flow_sigmas": true, "use_karras_sigmas": false, ' +
+    '"shift_terminal": null, "sigma_min": null, "sigma_max": null}';
+
+// The sigmas and timesteps diffusers' set_timesteps gave (ad hoc float32 run).
+procedure CheckFlowSchedule(Sched: TNNetFlowMatchEulerScheduler;
+  const Sigmas: array of double; const Timesteps: array of integer);
+var
+  StepPos, MaxStepPos: integer;
+begin
+  MaxStepPos := High(Timesteps);
+  TAssert.AssertEquals('step count', Length(Timesteps), Sched.NumSteps);
+  for StepPos := 0 to MaxStepPos do
+  begin
+    // Sigma[0] stays 1 where diffusers stores UniPC's 1 - 1e-6.
+    TAssert.AssertEquals('sigma ' + IntToStr(StepPos), Sigmas[StepPos],
+      Sched.Sigma[StepPos], 2e-6);
+    TAssert.AssertEquals('timestep ' + IntToStr(StepPos), Timesteps[StepPos],
+      Sched.Timestep[StepPos], 0);
+  end;
+  TAssert.AssertEquals('final sigma', 0, Sched.Sigma[MaxStepPos + 1], 0);
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchFromUniPCConfig;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+begin
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    cWanUniPCConfig);
+  try
+    AssertTrue('fsUniPC', Sched.Sampler = fsUniPC);
+    AssertTrue('ffUniPC', Sched.ScheduleFamily = ffUniPC);
+    AssertTrue('bh2', Sched.UniPCSolverType = ustBh2);
+    AssertTrue('corrector', Sched.UniPCCorrector);
+    AssertEquals('flow_shift', 3.0, Sched.Shift, 0);
+    AssertFalse('static shift', Sched.UseDynamicShifting);
+    AssertEquals('no shift_terminal', 0, Sched.ShiftTerminal, 0);
+    Sched.SetTimesteps(5);
+    CheckFlowSchedule(Sched, [0.9999989867210388, 0.9231656789779663,
+      0.8184296488761902, 0.6672218441963196, 0.4297945201396942],
+      [999, 923, 818, 667, 429]);
+  finally
+    Sched.Free;
+  end;
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    '{"_class_name": "UniPCMultistepScheduler", "use_flow_sigmas": true, ' +
+    '"prediction_type": "flow_prediction", "solver_type": "bh1", ' +
+    '"use_dynamic_shifting": true, "time_shift_type": "linear", ' +
+    '"shift_terminal": 0.1}');
+  try
+    AssertTrue('bh1', Sched.UniPCSolverType = ustBh1);
+    AssertTrue('linear', Sched.TimeShiftType = ftsLinear);
+    Sched.SetTimesteps(4, 2.0);
+    CheckFlowSchedule(Sched, [0.9999989867210388, 0.7856163382530212,
+      0.4998667240142822, 0.10000000149011612], [999, 785, 499, 100]);
+  finally
+    Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchFromDPMSolverConfig;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+begin
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    '{"_class_name": "DPMSolverMultistepScheduler", "use_flow_sigmas": true, ' +
+    '"prediction_type": "flow_prediction", "flow_shift": 3.0, ' +
+    '"algorithm_type": "dpmsolver++", "solver_type": "midpoint", ' +
+    '"final_sigmas_type": "zero", "variance_type": null}');
+  try
+    AssertTrue('fsDPMSolverPP2M', Sched.Sampler = fsDPMSolverPP2M);
+    AssertTrue('ffDPMSolver', Sched.ScheduleFamily = ffDPMSolver);
+    AssertEquals('flow_shift', 3.0, Sched.Shift, 0);
+    Sched.SetTimesteps(5);
+    CheckFlowSchedule(Sched, [0.9996664524078369, 0.9227216839790344,
+      0.8178097009658813, 0.666296124458313, 0.42826521396636963],
+      [999, 922, 817, 666, 428]);
+  finally
+    Sched.Free;
+  end;
+  // set_timesteps(mu=0.7) sets flow_shift = exp(mu): the exponential shift.
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    '{"_class_name": "DPMSolverMultistepScheduler", "use_flow_sigmas": true, ' +
+    '"prediction_type": "flow_prediction", "use_dynamic_shifting": true}');
+  try
+    Sched.SetTimesteps(4, 0.7);
+    CheckFlowSchedule(Sched, [0.9995031356811523, 0.8574923276901245,
+      0.6677442193031311, 0.4013252854347229], [999, 857, 667, 401]);
+  finally
+    Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchMultistepConfigRefusals;
+const
+  cUniPCHead = '{"_class_name": "UniPCMultistepScheduler", ';
+  cDPMHead = '{"_class_name": "DPMSolverMultistepScheduler", ';
+  cFlowFields = '"use_flow_sigmas": true, "prediction_type": "flow_prediction"';
+  cRefusedConfigs: array[0..12] of string = (
+    cUniPCHead + '"prediction_type": "flow_prediction"}',
+    cUniPCHead + '"use_flow_sigmas": true}',
+    cUniPCHead + cFlowFields + ', "solver_type": "bh3"}',
+    cUniPCHead + cFlowFields + ', "use_karras_sigmas": true}',
+    cUniPCHead + cFlowFields + ', "solver_order": 3}',
+    cUniPCHead + cFlowFields + ', "disable_corrector": [1]}',
+    cUniPCHead + cFlowFields + ', "final_sigmas_type": "sigma_min"}',
+    cUniPCHead + cFlowFields + ', "lower_order_final": false}',
+    cUniPCHead + cFlowFields + ', "predict_x0": false}',
+    cDPMHead + cFlowFields + ', "solver_type": "heun"}',
+    cDPMHead + cFlowFields + ', "algorithm_type": "sde-dpmsolver++"}',
+    cDPMHead + cFlowFields + ', "use_dynamic_shifting": true, ' +
+      '"time_shift_type": "linear"}',
+    cDPMHead + cFlowFields + ', "use_lu_lambdas": true}');
+var
+  ConfigPos: integer;
+  Refused: boolean;
+begin
+  for ConfigPos := 0 to High(cRefusedConfigs) do
+  begin
+    Refused := false;
+    try
+      TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+        cRefusedConfigs[ConfigPos]).Free;
+    except
+      on Exception do Refused := true;
+    end;
+    AssertTrue('config ' + IntToStr(ConfigPos) + ' is refused', Refused);
+  end;
 end;
 
 const
