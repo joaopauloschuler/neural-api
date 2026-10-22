@@ -1955,6 +1955,34 @@ rather than acted on.
       Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
       either guider on QwenImage21); ask the user before adding a Python tool.
 
+- [ ] SuperPoint + LightGlue keypoint detection and image matching importer
+      (`BuildSuperPointFromSafeTensors[Ex]` + `BuildLightGlueFromSafeTensors[Ex]`,
+      transformers model_types "superpoint" / "lightglue", checkpoints
+      `magic-leap-community/superpoint` and `ETH-CVG/lightglue_superpoint`), plus
+      examples/KeypointMatching (two images in, a side-by-side PNG with the match
+      lines out, and a README.md). The library imports classifiers, detectors,
+      depth and segmentation nets, but nothing finds and matches sparse keypoints
+      between two views (panorama stitching, visual odometry, image retrieval
+      re-ranking). SuperPoint maps to existing layers: the VGG-style 3x3 conv +
+      max-pool encoder, a 65-channel score head (`TNNetPointwiseSoftMax`, drop the
+      dustbin channel, `TNNetDepthToSpace` block 8 to full resolution) and a
+      256-channel descriptor head (`TNNetL2Normalize`). The post-process is host
+      code: max-pool NMS of radius `nms_radius`, `keypoint_threshold`, border
+      removal, top-`max_keypoints`, then descriptors sampled at the keypoints
+      with the `TNNetGridSample` bilinear rule and normalized again. LightGlue is a
+      9-layer transformer over the keypoint sets: a self-attention block with a
+      rotary encoding whose angles come from a learned linear map of the 2-D
+      keypoint COORDINATES (`TNNetRotaryEmbedding` takes token indices, so this
+      needs a coordinate-driven variant or a precomputed cos/sin input), a
+      bidirectional cross-attention block (`TNNetCrossAttention`), and a match
+      head (similarity + matchability sigmoid, double log-softmax, mutual
+      nearest neighbour above `filter_threshold`). v1 runs all layers; the
+      adaptive depth (early exit) and point pruning are follow-ups. Parity: pico
+      fixtures against transformers `SuperPointForKeypointDetection` /
+      `LightGlueForKeypointMatching` in the ~/x venv (keypoints, scores,
+      descriptors, match indices). Real checkpoints are small (~5 MB + ~50 MB),
+      so a real-pair run fits the dev box.
+
 ## OpenCL forward coverage — layers still on the host
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
