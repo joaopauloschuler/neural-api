@@ -9912,6 +9912,19 @@ procedure QwenImage21SizeForAspect(TargetArea, AspectRatio: double;
   out Width, Height: integer);
 
 type
+  // Wall clock and process host<->OpenCL transfer totals when a pipeline
+  // phase started (the bytes stay 0 without -dOpenCL).
+  TNeuralPhaseMark = record
+    Start: TDateTime;
+    UploadBytes, DownloadBytes: int64;
+  end;
+
+function NeuralPhaseMarkNow(): TNeuralPhaseMark;
+// Adds the wall ms and the bytes moved since Mark to Ms and the byte totals.
+procedure NeuralChargePhase(const Mark: TNeuralPhaseMark; var Ms: double;
+  var UploadBytes, DownloadBytes: int64);
+
+type
   // The stages of TQwenImage21Pipeline; OnPhase fires as each one starts.
   // In run order: the input images, the prompt, then the image itself.
   TQwenImage21PipelinePhase = (qppLoadVisionTower, qppEncodeVision,
@@ -10016,8 +10029,7 @@ type
     // The phase DoPhase started last (qppDone: none open), when, and the
     // process transfer totals then.
     FOpenPhase: TQwenImage21PipelinePhase;
-    FOpenPhaseStart: TDateTime;
-    FOpenPhaseUploadBytes, FOpenPhaseDownloadBytes: int64;
+    FOpenPhaseMark: TNeuralPhaseMark;
     // Set by LoadComponents, nil otherwise. The text encoder's weights sit in
     // a 1-token net; each prompt builds a borrowing net of its own length.
     FTextEncoderOwner: TNNet;
@@ -12118,7 +12130,8 @@ type
   // Stable Diffusion 1.x text-to-image (diffusers StableDiffusionPipeline) over
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
-  // is built when its stage starts and freed when it ends. The scheduler config
+  // is built when its stage starts and freed when it ends, unless
+  // LoadComponents keeps it. The scheduler config
   // sets betas, spacing and prediction type, and its _class_name the Sampler
   // (DiffusersSchedulerSampler: DDIM, PNDM, Euler, Euler a, DPM++ 2M; other
   // classes run DDIM and say so in SamplerNotice).
@@ -12145,6 +12158,12 @@ type
     FHasNegativePromptEmbeds: boolean;
     FOnPhase: TStableDiffusionPhaseEvent;
     FOnStep: TStableDiffusionStepEvent;
+    // Set by LoadComponents: the nets below outlive their stage, each rebuilt
+    // only when its token count or latent grid changes; nil until built.
+    FKeepComponents: boolean;
+    FTextEncoder, FUNet, FVaeDecoder: TNNet;
+    FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
+    FVaeGridX, FVaeGridY: integer;
     {$IFDEF OpenCL}
     FUseOpenCL: boolean;
     FOpenCLPlatform: cl_platform_id;
@@ -12156,6 +12175,14 @@ type
     // Latent grid of a Width x Height image; raises unless both sides are a
     // multiple of what the VAE and the UNet down blocks need.
     procedure LatentGridFor(Width, Height: integer; out GridX, GridY: integer);
+    function UNetStepConfig(GridX, GridY, TextSeqLen: integer): TSDUNetConfig;
+    // The kept net of that shape, or a new one (kept when ComponentsLoaded)
+    // after starting its load phase; ReleaseComponent ends its use.
+    function AcquireTextEncoder(SeqLen: integer): TNNet;
+    function AcquireUNet(GridX, GridY, TextSeqLen: integer): TNNet;
+    function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
+    procedure ReleaseComponent(Net: TNNet);
+    procedure FreeKeptComponents();
     // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
     procedure EncodeTokenIdLists(const TokenLists: array of TNeuralIntegerArray;
       const Embeds: array of TNNetVolume);
@@ -12169,9 +12196,15 @@ type
     constructor Create(const ModelFolder: string);
     destructor Destroy(); override;
     {$IFDEF OpenCL}
-    // Components built by later calls run on this OpenCL device.
+    // Components built by later calls run on this OpenCL device (kept ones
+    // are rebuilt on their next use).
     procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
     {$ENDIF}
+    // Builds the text encoder, the UNet and the VAE decoder for Width x Height
+    // (< 1: DefaultImageSize) and keeps them for every later call.
+    procedure LoadComponents(Width: integer = 0; Height: integer = 0);
+    // Frees what LoadComponents kept; the stages build and free them again.
+    procedure UnloadComponents();
     // [bos] + ids (truncated) + [eos], padded with the pad token to MaxTokenCount.
     function TokenizePrompt(const Prompt: string): TNeuralIntegerArray;
     // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
@@ -12220,6 +12253,7 @@ type
     property VaeScaleFactor: integer read GetVaeScaleFactor;
     // unet sample_size * VaeScaleFactor (512 for SD 1.5).
     property DefaultImageSize: integer read GetDefaultImageSize;
+    property ComponentsLoaded: boolean read FKeepComponents;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
   end;
@@ -92237,6 +92271,7 @@ end;
 
 destructor TStableDiffusionPipeline.Destroy();
 begin
+  UnloadComponents();
   FTokenizer.Free;
   FNegativePromptEmbeds.Free;
   FScheduler.Free;
@@ -92266,11 +92301,143 @@ end;
 procedure TStableDiffusionPipeline.EnableOpenCL(platform_id: cl_platform_id;
   device_id: cl_device_id);
 begin
+  FreeKeptComponents();
   FUseOpenCL := true;
   FOpenCLPlatform := platform_id;
   FOpenCLDevice := device_id;
 end;
 {$ENDIF}
+
+procedure TStableDiffusionPipeline.FreeKeptComponents();
+begin
+  FreeAndNil(FTextEncoder);
+  FreeAndNil(FUNet);
+  FreeAndNil(FVaeDecoder);
+end;
+
+// Phases sdphLoadTextEncoder, sdphLoadUNet, sdphLoadVae, then sdphDone.
+procedure TStableDiffusionPipeline.LoadComponents(Width, Height: integer);
+var
+  GridX, GridY: integer;
+begin
+  if Width < 1 then Width := GetDefaultImageSize();
+  if Height < 1 then Height := GetDefaultImageSize();
+  LatentGridFor(Width, Height, GridX, GridY);
+  FKeepComponents := true;
+  try
+    AcquireTextEncoder(FMaxTokenCount);
+    AcquireUNet(GridX, GridY, FMaxTokenCount);
+    AcquireVaeDecoder(GridX, GridY);
+  except
+    UnloadComponents();
+    raise;
+  end;
+  DoPhase(sdphDone);
+end;
+
+procedure TStableDiffusionPipeline.UnloadComponents();
+begin
+  FKeepComponents := false;
+  FreeKeptComponents();
+end;
+
+procedure TStableDiffusionPipeline.ReleaseComponent(Net: TNNet);
+begin
+  if not FKeepComponents then Net.Free;
+end;
+
+function TStableDiffusionPipeline.UNetStepConfig(GridX, GridY,
+  TextSeqLen: integer): TSDUNetConfig;
+begin
+  Result := FUNetConfig;
+  Result.LatentGrid := GridX;
+  Result.LatentGridY := GridY;
+  Result.TextSeqLen := TextSeqLen;
+end;
+
+function TStableDiffusionPipeline.AcquireTextEncoder(SeqLen: integer): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  if Assigned(FTextEncoder) and (FTextEncoderSeqLen = SeqLen) then
+    exit(FTextEncoder);
+  DoPhase(sdphLoadTextEncoder);
+  // The old net goes first: peak memory stays one text encoder.
+  FreeAndNil(FTextEncoder);
+  Reader := CreatePretrainedTensorReader(SafeTensorsFolderWeightsFile(
+    ComponentFolder('text_encoder'), 'model'));
+  try
+    Result := BuildClipTextTower(Reader, FTextConfig, SeqLen, '',
+      {pTrainable=}false);
+  finally
+    Reader.Free;
+  end;
+  try
+    PrepareComponent(Result);
+  except
+    Result.Free;
+    raise;
+  end;
+  if FKeepComponents then
+  begin
+    FTextEncoder := Result;
+    FTextEncoderSeqLen := SeqLen;
+  end;
+end;
+
+function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
+  TextSeqLen: integer): TNNet;
+begin
+  if Assigned(FUNet) and (FUNetGridX = GridX) and (FUNetGridY = GridY) and
+    (FUNetTextSeqLen = TextSeqLen) then exit(FUNet);
+  DoPhase(sdphLoadUNet);
+  FreeAndNil(FUNet);
+  Result := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('unet'), 'diffusion_pytorch_model'),
+    UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false);
+  try
+    PrepareComponent(Result);
+  except
+    Result.Free;
+    raise;
+  end;
+  if FKeepComponents then
+  begin
+    FUNet := Result;
+    FUNetGridX := GridX;
+    FUNetGridY := GridY;
+    FUNetTextSeqLen := TextSeqLen;
+  end;
+end;
+
+function TStableDiffusionPipeline.AcquireVaeDecoder(GridX,
+  GridY: integer): TNNet;
+var
+  DecoderConfig: TVaeDecoderConfig;
+begin
+  if Assigned(FVaeDecoder) and (FVaeGridX = GridX) and (FVaeGridY = GridY) then
+    exit(FVaeDecoder);
+  DoPhase(sdphLoadVae);
+  FreeAndNil(FVaeDecoder);
+  DecoderConfig := FVaeConfig;
+  DecoderConfig.LatentGrid := GridX;
+  DecoderConfig.LatentGridY := GridY;
+  Result := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
+    {pTrainable=}false);
+  try
+    PrepareComponent(Result);
+  except
+    Result.Free;
+    raise;
+  end;
+  if FKeepComponents then
+  begin
+    FVaeDecoder := Result;
+    FVaeGridX := GridX;
+    FVaeGridY := GridY;
+  end;
+end;
 
 function TStableDiffusionPipeline.GetVaeScaleFactor(): integer;
 begin
@@ -92355,8 +92522,6 @@ procedure TStableDiffusionPipeline.EncodeTokenIdLists(
   const TokenLists: array of TNeuralIntegerArray;
   const Embeds: array of TNNetVolume);
 var
-  Folder: string;
-  Reader: TNNetSafeTensorsReader;
   TextNet: TNNet;
   TokenIds: TNNetVolume;
   SeqLen, ListPos, MaxListPos, TokenPos, MaxTokenPos: integer;
@@ -92366,17 +92531,9 @@ begin
   for ListPos := 0 to MaxListPos do
     if Length(TokenLists[ListPos]) <> SeqLen then
       ImportError('TStableDiffusionPipeline: token lists differ in length.');
-  DoPhase(sdphLoadTextEncoder);
-  Folder := ComponentFolder('text_encoder');
-  Reader := CreatePretrainedTensorReader(
-    SafeTensorsFolderWeightsFile(Folder, 'model'));
-  TextNet := nil;
+  TextNet := AcquireTextEncoder(SeqLen);
   TokenIds := TNNetVolume.Create(SeqLen, 1, 1);
   try
-    TextNet := BuildClipTextTower(Reader, FTextConfig, SeqLen, '',
-      {pTrainable=}false);
-    FreeAndNil(Reader);
-    PrepareComponent(TextNet);
     DoPhase(sdphEncodePrompt);
     MaxTokenPos := SeqLen - 1;
     for ListPos := 0 to MaxListPos do
@@ -92388,8 +92545,7 @@ begin
     end;
   finally
     TokenIds.Free;
-    TextNet.Free;
-    Reader.Free;
+    ReleaseComponent(TextNet);
   end;
 end;
 
@@ -92454,18 +92610,11 @@ begin
     ImportError('TStableDiffusionPipeline.Denoise: the negative embeds hold ' +
       IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
       IntToStr(PromptEmbeds.SizeX) + '.');
-  StepConfig := FUNetConfig;
-  StepConfig.LatentGrid := GridX;
-  StepConfig.LatentGridY := GridY;
-  StepConfig.TextSeqLen := PromptEmbeds.SizeX;
-  DoPhase(sdphLoadUNet);
-  Net := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-    ComponentFolder('unet'), 'diffusion_pytorch_model'), StepConfig,
-    {pTrainable=}false);
+  StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
+  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX);
   Pred := TNNetVolume.Create();
   PredUncond := TNNetVolume.Create();
   try
-    PrepareComponent(Net);
     DoPhase(sdphDenoise);
     Schedule := FScheduler.BuildSamplerSchedule(StepCount,
       FScheduler.ConfigSpacing, FSampler);
@@ -92494,25 +92643,19 @@ begin
   finally
     PredUncond.Free;
     Pred.Free;
-    Net.Free;
+    ReleaseComponent(Net);
   end;
 end;
 
 procedure TStableDiffusionPipeline.DecodeLatents(Latents: TNNetVolume; Width,
   Height: integer; Image: TNNetVolume);
 var
-  DecoderConfig: TVaeDecoderConfig;
   Net: TNNet;
+  GridX, GridY: integer;
 begin
-  DecoderConfig := FVaeConfig;
-  LatentGridFor(Width, Height, DecoderConfig.LatentGrid,
-    DecoderConfig.LatentGridY);
-  DoPhase(sdphLoadVae);
-  Net := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-    ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
-    {pTrainable=}false);
+  LatentGridFor(Width, Height, GridX, GridY);
+  Net := AcquireVaeDecoder(GridX, GridY);
   try
-    PrepareComponent(Net);
     DoPhase(sdphDecode);
     // The decoder applies 1/scaling_factor; diffusers postprocess is
     // (x / 2 + 0.5) clamped to [0, 1].
@@ -92522,7 +92665,7 @@ begin
     Image.Mul(0.5);
     Image.Add(0.5);
   finally
-    Net.Free;
+    ReleaseComponent(Net);
   end;
 end;
 
@@ -94668,41 +94811,47 @@ begin
   end;
 end;
 
-procedure TQwenImage21Pipeline.EndPhase();
+function NeuralPhaseMarkNow(): TNeuralPhaseMark;
 {$IFDEF OpenCL}
 var
   Transfers: TOpenCLTransferCounts;
 {$ENDIF}
 begin
+  Result.Start := Now();
+  Result.UploadBytes := 0;
+  Result.DownloadBytes := 0;
+  {$IFDEF OpenCL}
+  Transfers := OpenCLProcessTransferTotals();
+  Result.UploadBytes := Transfers.UploadBytes;
+  Result.DownloadBytes := Transfers.DownloadBytes;
+  {$ENDIF}
+end;
+
+procedure NeuralChargePhase(const Mark: TNeuralPhaseMark; var Ms: double;
+  var UploadBytes, DownloadBytes: int64);
+var
+  Current: TNeuralPhaseMark;
+begin
+  Current := NeuralPhaseMarkNow();
+  Ms := Ms + (Current.Start - Mark.Start) * MSecsPerDay;
+  Inc(UploadBytes, Current.UploadBytes - Mark.UploadBytes);
+  Inc(DownloadBytes, Current.DownloadBytes - Mark.DownloadBytes);
+end;
+
+procedure TQwenImage21Pipeline.EndPhase();
+begin
   if FOpenPhase <> qppDone then
-  begin
-    FImageStats.PhaseMs[FOpenPhase] := FImageStats.PhaseMs[FOpenPhase] +
-      (Now() - FOpenPhaseStart) * MSecsPerDay;
-    {$IFDEF OpenCL}
-    Transfers := OpenCLProcessTransferTotals();
-    Inc(FImageStats.PhaseUploadBytes[FOpenPhase],
-      Transfers.UploadBytes - FOpenPhaseUploadBytes);
-    Inc(FImageStats.PhaseDownloadBytes[FOpenPhase],
-      Transfers.DownloadBytes - FOpenPhaseDownloadBytes);
-    {$ENDIF}
-  end;
+    NeuralChargePhase(FOpenPhaseMark, FImageStats.PhaseMs[FOpenPhase],
+      FImageStats.PhaseUploadBytes[FOpenPhase],
+      FImageStats.PhaseDownloadBytes[FOpenPhase]);
   FOpenPhase := qppDone;
 end;
 
 procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
-{$IFDEF OpenCL}
-var
-  Transfers: TOpenCLTransferCounts;
-{$ENDIF}
 begin
   EndPhase();
   FOpenPhase := Phase;
-  FOpenPhaseStart := Now();
-  {$IFDEF OpenCL}
-  Transfers := OpenCLProcessTransferTotals();
-  FOpenPhaseUploadBytes := Transfers.UploadBytes;
-  FOpenPhaseDownloadBytes := Transfers.DownloadBytes;
-  {$ENDIF}
+  FOpenPhaseMark := NeuralPhaseMarkNow();
   if Assigned(FOnPhase) then FOnPhase(Phase);
 end;
 

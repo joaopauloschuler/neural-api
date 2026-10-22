@@ -46,6 +46,8 @@ type
     FSD15Oracle: TJSONData;
     FSD15StepMaxDiff: double;
     FSD15StepCount: integer;
+    // TStableDiffusionPipeline OnPhase counts (SD15CountPhase).
+    FSD15PhaseCounts: array[TStableDiffusionPipelinePhase] of integer;
     function FixturePath(const FileName: string): string;
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
@@ -57,6 +59,7 @@ type
       Dest: TNNetVolume);
     procedure SD15CheckStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
+    procedure SD15CountPhase(Phase: TStableDiffusionPipelinePhase);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1228,6 +1231,7 @@ type
     procedure TestStableDiffusionPipelineSamplers;
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
+    procedure TestStableDiffusionPipelineKeepLoaded;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -45407,6 +45411,12 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.SD15CountPhase(
+  Phase: TStableDiffusionPipelinePhase);
+begin
+  Inc(FSD15PhaseCounts[Phase]);
+end;
+
 // TokenizePrompt: [bos] + ids + [eos], padded to 77 with <|endoftext|> and
 // truncated, as diffusers' tokenizer(padding="max_length", truncation=True).
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineTokens;
@@ -45757,6 +45767,60 @@ begin
     Embeds.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// LoadComponents keeps the three nets: two prompts at two sizes match the
+// build-per-stage path exactly, and only a new latent grid rebuilds UNet/VAE.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineKeepLoaded;
+const
+  cPrompts: array[0..1] of string = ('a red cube', 'a blue ball');
+  cWidths: array[0..1] of integer = (16, 32);
+var
+  Reference, Kept: TStableDiffusionPipeline;
+  Expected: array[0..1] of TNNetVolume;
+  Image: TNNetVolume;
+  ImagePos: integer;
+  MaxDiff: double;
+begin
+  Reference := CreateSD15Pipeline();
+  Kept := CreateSD15Pipeline();
+  Expected[0] := TNNetVolume.Create;
+  Expected[1] := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    for ImagePos := 0 to 1 do
+      Reference.Generate(cPrompts[ImagePos], cWidths[ImagePos], 16, 3,
+        ImagePos + 5, Expected[ImagePos]);
+    AssertFalse('not loaded', Kept.ComponentsLoaded);
+    Kept.LoadComponents(16, 16);
+    AssertTrue('loaded', Kept.ComponentsLoaded);
+    FillChar(FSD15PhaseCounts, SizeOf(FSD15PhaseCounts), 0);
+    Kept.OnPhase := @SD15CountPhase;
+    for ImagePos := 0 to 1 do
+    begin
+      Kept.Generate(cPrompts[ImagePos], cWidths[ImagePos], 16, 3,
+        ImagePos + 5, Image);
+      MaxDiff := MaxAbsVolumeDiff(Image, Expected[ImagePos]);
+      AssertTrue('image ' + IntToStr(ImagePos) + ' max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff = 0);
+    end;
+    AssertEquals('text encoder kept', 0, FSD15PhaseCounts[sdphLoadTextEncoder]);
+    AssertEquals('prompts encoded', 2, FSD15PhaseCounts[sdphEncodePrompt]);
+    AssertEquals('UNet rebuilt for 32x16 only', 1,
+      FSD15PhaseCounts[sdphLoadUNet]);
+    AssertEquals('VAE rebuilt for 32x16 only', 1, FSD15PhaseCounts[sdphLoadVae]);
+    Kept.Generate(cPrompts[1], cWidths[1], 16, 3, 6, Image);
+    AssertEquals('same size reuses the UNet', 1, FSD15PhaseCounts[sdphLoadUNet]);
+    AssertTrue('repeat matches', MaxAbsVolumeDiff(Image, Expected[1]) = 0);
+    Kept.UnloadComponents();
+    AssertFalse('unloaded', Kept.ComponentsLoaded);
+  finally
+    Image.Free;
+    Expected[1].Free;
+    Expected[0].Free;
+    Kept.Free;
+    Reference.Free;
   end;
 end;
 
