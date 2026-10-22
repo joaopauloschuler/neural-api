@@ -49,6 +49,7 @@ type
     function FixturePath(const FileName: string): string;
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
+    function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
     // Nested JSON [S][D] -> (S,1,D); [C][H][W] (ChannelsFirst) or [H][W][C]
     // -> (W,H,C).
@@ -1224,6 +1225,7 @@ type
     procedure TestStableDiffusionPipelineEmbeds;
     procedure TestStableDiffusionPipelineGuidedNoise;
     procedure TestStableDiffusionPipelineParity;
+    procedure TestStableDiffusionPipelineSamplers;
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
@@ -45313,13 +45315,18 @@ end;
 // TMarigoldPipeline (one component at a time, configs from the folder) must
 // reproduce MarigoldPredict on the same nets, noises and scheduler.
 function TTestNeuralPretrained.LoadSD15PipelineOracle(): TJSONData;
+begin
+  Result := LoadSD15Fixture('tiny_sd15_pipeline_io.json');
+end;
+
+function TTestNeuralPretrained.LoadSD15Fixture(const FileName: string): TJSONData;
 var
   RawText: TStringStream;
   Parser: TJSONParser;
 begin
   RawText := TStringStream.Create('');
   try
-    RawText.LoadFromFile(FixturePath('tiny_sd15_pipeline_io.json'));
+    RawText.LoadFromFile(FixturePath(FileName));
     Parser := TJSONParser.Create(RawText.DataString, []);
     try
       Result := Parser.Parse;
@@ -45575,6 +45582,73 @@ begin
     Embeds.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// PNDM (PLMS), Euler and DPM-Solver++(2M) end to end against diffusers float64
+// (tests/fixtures/tiny_sd15_samplers_io.json): each sampler comes from its
+// real diffusers config through DiffusersSchedulerSampler, then the guided
+// steps from the oracle's initial latents match after every model eval.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineSamplers;
+const
+  cExpected: array[0..2] of TNNetSamplerMethod =
+    (smPNDM, smEuler, smDPMSolverPP2M);
+var
+  Root, SamplerRoot: TJSONData;
+  Samplers: TJSONArray;
+  Entry: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Latents: TNNetVolume;
+  ImageSize, SamplerPos: integer;
+  Notice: string;
+begin
+  Root := LoadSD15PipelineOracle();
+  SamplerRoot := LoadSD15Fixture('tiny_sd15_samplers_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    AssertEquals('fixture scheduler', 'DDIMScheduler',
+      Pipeline.SchedulerClassName);
+    AssertTrue('DDIM mapped', Pipeline.Sampler = smDDIM);
+    AssertEquals('no notice', '', Pipeline.SamplerNotice);
+    ImageSize := TJSONObject(Root).Get('image_size', 0);
+    Pipeline.GuidanceScale := TJSONObject(SamplerRoot).Get('guidance_scale',
+      0.0);
+    Pipeline.EncodePrompt(TJSONObject(Root).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['latents'], true, Initial);
+    Samplers := TJSONObject(SamplerRoot).Arrays['samplers'];
+    AssertEquals('sampler count', Length(cExpected), Samplers.Count);
+    for SamplerPos := 0 to Samplers.Count - 1 do
+    begin
+      Entry := Samplers.Objects[SamplerPos];
+      Pipeline.Sampler := DiffusersSchedulerSampler(
+        Entry.Objects['config'].AsJSON, Notice);
+      AssertTrue(Entry.Get('class_name', '') + ' mapped',
+        Pipeline.Sampler = cExpected[SamplerPos]);
+      AssertEquals(Entry.Get('class_name', '') + ' notice', '', Notice);
+      Latents.ReSize(Initial);
+      Latents.Copy(Initial);
+      FSD15Oracle := Entry;
+      FSD15StepMaxDiff := 0;
+      FSD15StepCount := 0;
+      Pipeline.OnStep := @SD15CheckStep;
+      Pipeline.Denoise(Embeds, ImageSize, ImageSize,
+        TJSONObject(SamplerRoot).Get('steps', 0), Latents);
+      AssertEquals(Entry.Get('class_name', '') + ' evals',
+        Entry.Arrays['latents_after'].Count, FSD15StepCount);
+      AssertTrue(Entry.Get('class_name', '') + ' step latents max |diff| = ' +
+        FloatToStr(FSD15StepMaxDiff), FSD15StepMaxDiff < 1e-4);
+    end;
+  finally
+    FSD15Oracle := nil;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    SamplerRoot.Free;
+    Root.Free;
   end;
 end;
 

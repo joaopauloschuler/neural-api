@@ -584,6 +584,16 @@ type
     property MaxShift: double read FMaxShift;
   end;
 
+// The sampler for a diffusers scheduler_config.json (its text) by _class_name:
+// DDIMScheduler -> smDDIM, PNDMScheduler -> smPNDM, EulerDiscreteScheduler ->
+// smEuler, EulerAncestralDiscreteScheduler -> smEulerAncestral (eta 1),
+// DPMSolverMultistepScheduler -> smDPMSolverPP2M. Any other class samples with
+// smDDIM: its betas, spacing and prediction type still load, so it stays
+// usable. Notice is '' or says what differs from the named scheduler (the
+// fallback, or options such as use_karras_sigmas this unit does not implement).
+function DiffusersSchedulerSampler(const ConfigJson: string;
+  out Notice: string): TNNetSamplerMethod;
+
 // Blended (no-retrain) inpainting composite, in place on Latents:
 // Latents := Known + Mask * (Latents - Known). Mask is 1 in the hole (follow
 // the sampler) and 0 where Known is kept; a 0 keeps Known exactly. All three
@@ -2718,6 +2728,87 @@ begin
     raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
       ' with ' + IntToStr(NumSteps) + ' steps leaves no step to run; raise ' +
       'the strength or the step count.');
+end;
+
+function DiffusersSchedulerSampler(const ConfigJson: string;
+  out Notice: string): TNNetSamplerMethod;
+var
+  Root: TJSONData;
+  Obj: TJSONObject;
+  SchedulerClass: string;
+
+  procedure Note(const Text: string);
+  begin
+    if Notice <> '' then Notice := Notice + '; ';
+    Notice := Notice + Text;
+  end;
+
+  procedure NoteIfSet(const Key: string);
+  begin
+    if Obj.Get(Key, false) then
+      Note(SchedulerClass + ' ' + Key + ' is not implemented; sampling without it');
+  end;
+
+  procedure NoteIfNot(const Key, Expected: string);
+  begin
+    if Obj.Get(Key, Expected) <> Expected then
+      Note(SchedulerClass + ' ' + Key + ' "' + Obj.Get(Key, Expected) +
+        '" is not implemented; sampling with "' + Expected + '"');
+  end;
+
+begin
+  Notice := '';
+  Result := smDDIM;
+  Root := GetJSON(ConfigJson);
+  try
+    if not (Root is TJSONObject) then
+    begin
+      Note('the scheduler config is not a JSON object; sampling with DDIM');
+      Exit;
+    end;
+    Obj := TJSONObject(Root);
+    SchedulerClass := Obj.Get('_class_name', '');
+    if SchedulerClass = 'DDIMScheduler' then Result := smDDIM
+    else if SchedulerClass = 'PNDMScheduler' then
+    begin
+      Result := smPNDM;
+      if not Obj.Get('skip_prk_steps', false) then
+        Note('PNDMScheduler skip_prk_steps = false: the Runge-Kutta warm-up ' +
+          'is not implemented; sampling with PLMS from the first step');
+    end
+    else if SchedulerClass = 'EulerDiscreteScheduler' then
+    begin
+      Result := smEuler;
+      NoteIfSet('use_karras_sigmas');
+      NoteIfSet('use_exponential_sigmas');
+      NoteIfSet('use_beta_sigmas');
+      NoteIfNot('interpolation_type', 'linear');
+      NoteIfNot('timestep_type', 'discrete');
+      NoteIfNot('final_sigmas_type', 'zero');
+    end
+    else if SchedulerClass = 'EulerAncestralDiscreteScheduler' then
+      Result := smEulerAncestral
+    else if SchedulerClass = 'DPMSolverMultistepScheduler' then
+    begin
+      Result := smDPMSolverPP2M;
+      NoteIfNot('algorithm_type', 'dpmsolver++');
+      NoteIfNot('solver_type', 'midpoint');
+      if Obj.Get('solver_order', 2) <> 2 then
+        Note(SchedulerClass + ' solver_order ' +
+          IntToStr(Obj.Get('solver_order', 2)) +
+          ' is not implemented; sampling with order 2');
+      NoteIfSet('use_karras_sigmas');
+      NoteIfSet('use_lu_lambdas');
+      NoteIfSet('use_exponential_sigmas');
+      NoteIfSet('use_beta_sigmas');
+      NoteIfNot('final_sigmas_type', 'zero');
+    end
+    else
+      Note('scheduler "' + SchedulerClass + '" has no sampler here; ' +
+        'sampling with DDIM');
+  finally
+    Root.Free;
+  end;
 end;
 
 procedure InpaintBlend(Latents, Known, Mask: TNNetVolume);

@@ -12100,8 +12100,10 @@ type
     sdphLoadUNet, sdphDenoise, sdphLoadVae, sdphDecode, sdphDone);
   TStableDiffusionPhaseEvent = procedure(Phase: TStableDiffusionPipelinePhase)
     of object;
-  // Fired after denoising step StepIndex (0-based) of StepCount; Latents holds
-  // the sample after that step, Timestep the diffusers timestep it started at.
+  // Fired after model eval StepIndex (0-based) of StepCount; Latents holds the
+  // sample after that step in the model-input scale (Euler's diffusers sample
+  // is it times sqrt(sigma^2+1)), Timestep the diffusers timestep it ran at.
+  // PNDM runs StepCount = steps + 1 evals, as diffusers.
   TStableDiffusionStepEvent = procedure(StepIndex, StepCount: integer;
     Timestep: double; Latents: TNNetVolume) of object;
 
@@ -12109,7 +12111,9 @@ type
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
   // is built when its stage starts and freed when it ends. The scheduler config
-  // sets betas, spacing and prediction type; Sampler picks the update (DDIM).
+  // sets betas, spacing and prediction type, and its _class_name the Sampler
+  // (DiffusersSchedulerSampler: DDIM, PNDM, Euler, Euler a, DPM++ 2M; other
+  // classes run DDIM and say so in SamplerNotice).
   // Latents are (Grid, Grid, latent_channels); images are square. Coded by Claude (AI).
   TStableDiffusionPipeline = class(TObject)
   private
@@ -12117,6 +12121,7 @@ type
     FScheduler: TNNetDiffusionScheduler;
     FSchedulerClassName: string;
     FSampler: TNNetSamplerMethod;
+    FSamplerNotice: string;
     FUNetConfig: TSDUNetConfig;
     FVaeConfig: TVaeDecoderConfig;
     FTextConfig: TClipConfig;
@@ -12172,8 +12177,10 @@ type
     // global RandSeed is restored). Torch's noise is not reproducible.
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
-    // StepCount scheduler steps on Latents in place (noise in, clean out); with
-    // GuidanceScale > 1 each step also runs the unconditional embeds (CFG).
+    // StepCount Sampler steps on Latents in place (unit noise in, scaled by
+    // the sampler's init noise sigma; clean out); with GuidanceScale > 1 each
+    // step also runs the unconditional embeds (CFG). Euler a draws its noise
+    // from the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
@@ -12192,9 +12199,12 @@ type
     property NegativePrompt: string read FNegativePrompt
       write SetNegativePrompt;
     property HasNegativePromptEmbeds: boolean read GetHasNegativePromptEmbeds;
+    // The update rule; set from the scheduler _class_name, may be overridden.
     property Sampler: TNNetSamplerMethod read FSampler write FSampler;
+    // '' or what the config asks for that the Sampler does not do.
+    property SamplerNotice: string read FSamplerNotice;
     property Scheduler: TNNetDiffusionScheduler read FScheduler;
-    // scheduler_config.json _class_name (only its betas/spacing are used).
+    // scheduler_config.json _class_name.
     property SchedulerClassName: string read FSchedulerClassName;
     property UNetConfig: TSDUNetConfig read FUNetConfig;
     property TextConfig: TClipConfig read FTextConfig;
@@ -92119,7 +92129,6 @@ begin
   FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
   FNegativePromptEmbeds := TNNetVolume.Create();
   FGuidanceScale := 7.5;
-  FSampler := smDDIM;
   IndexFile := FModelFolder + 'model_index.json';
   TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
   JsonText := TStringList.Create;
@@ -92141,6 +92150,7 @@ begin
     if Root is TJSONObject then
       FSchedulerClassName := TJSONObject(Root).Get('_class_name', '');
     FreeAndNil(Root);
+    FSampler := DiffusersSchedulerSampler(JsonText.Text, FSamplerNotice);
     FTextConfig := ReadClipConfigFromJSONFile(ComponentFolder('text_encoder') +
       'config.json');
     FMaxTokenCount := FTextConfig.TextMaxPositions;
@@ -92388,6 +92398,7 @@ var
   Pred, PredUncond: TNNetVolume;
   IsGuided: boolean;
   Grid, StepPos, MaxStepPos, Tt: integer;
+  Eta, NoiseScale: TNeuralFloat;
 begin
   Grid := LatentGridFor(Width, Height);
   if (Latents.SizeX <> Grid) or (Latents.SizeY <> Grid) or
@@ -92419,9 +92430,14 @@ begin
   try
     PrepareComponent(Net);
     DoPhase(sdphDenoise);
-    Schedule := FScheduler.BuildTimestepSchedule(StepCount,
-      FScheduler.ConfigSpacing);
-    FScheduler.ResetMultistep;
+    Schedule := FScheduler.BuildSamplerSchedule(StepCount,
+      FScheduler.ConfigSpacing, FSampler);
+    // diffusers scales the given latents by init_noise_sigma.
+    NoiseScale := FScheduler.InitialNoiseScale(FSampler,
+      FScheduler.ConfigSpacing, Schedule[0]);
+    if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+    // Euler a injects its full ancestral noise; the others are deterministic.
+    if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
     MaxStepPos := Length(Schedule) - 2;
     for StepPos := 0 to MaxStepPos do
     begin
@@ -92435,7 +92451,7 @@ begin
         TNNetDiffusionScheduler.ApplyCFG(Pred, PredUncond, Pred,
           FGuidanceScale);
       end;
-      FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, 0.0);
+      FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, Eta);
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Tt - 1, Latents);
     end;
   finally

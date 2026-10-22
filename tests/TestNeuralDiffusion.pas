@@ -85,6 +85,7 @@ type
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
     procedure TestSamplerSchedulesVsDiffusers;
+    procedure TestDiffusersSchedulerSamplerMapping;
     procedure TestPNDMVsDiffusers;
     procedure TestEulerVsDiffusers;
     procedure TestEulerAncestralVsDiffusers;
@@ -878,6 +879,44 @@ begin
   finally
     Sched.Free; X.Free;
   end;
+end;
+
+// _class_name -> sampler; unknown classes and unimplemented options run with a
+// notice instead of failing.
+procedure TTestNeuralDiffusion.TestDiffusersSchedulerSamplerMapping;
+var
+  Notice: string;
+
+  function Mapped(const Json: string): TNNetSamplerMethod;
+  begin
+    Result := DiffusersSchedulerSampler(Json, Notice);
+  end;
+
+begin
+  AssertTrue('ddim', Mapped('{"_class_name": "DDIMScheduler"}') = smDDIM);
+  AssertEquals('ddim notice', '', Notice);
+  AssertTrue('pndm', Mapped('{"_class_name": "PNDMScheduler", ' +
+    '"skip_prk_steps": true}') = smPNDM);
+  AssertEquals('pndm notice', '', Notice);
+  AssertTrue('pndm prk', Mapped('{"_class_name": "PNDMScheduler"}') = smPNDM);
+  AssertTrue('prk noticed', Pos('skip_prk_steps', Notice) > 0);
+  AssertTrue('euler', Mapped('{"_class_name": "EulerDiscreteScheduler", ' +
+    '"interpolation_type": "linear", "use_karras_sigmas": false}') = smEuler);
+  AssertEquals('euler notice', '', Notice);
+  AssertTrue('euler a', Mapped('{"_class_name": ' +
+    '"EulerAncestralDiscreteScheduler"}') = smEulerAncestral);
+  AssertTrue('dpm', Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"algorithm_type": "dpmsolver++", "solver_order": 2}') = smDPMSolverPP2M);
+  AssertEquals('dpm notice', '', Notice);
+  AssertTrue('dpm karras', Mapped('{"_class_name": ' +
+    '"DPMSolverMultistepScheduler", "use_karras_sigmas": true, ' +
+    '"solver_order": 3}') = smDPMSolverPP2M);
+  AssertTrue('karras noticed', Pos('use_karras_sigmas', Notice) > 0);
+  AssertTrue('order noticed', Pos('solver_order 3', Notice) > 0);
+  AssertTrue('lms', Mapped('{"_class_name": "LMSDiscreteScheduler"}') = smDDIM);
+  AssertTrue('lms noticed', Pos('LMSDiscreteScheduler', Notice) > 0);
+  AssertTrue('not an object', Mapped('[1]') = smDDIM);
+  AssertTrue('array noticed', Notice <> '');
 end;
 
 // PLMS with diffusers' quirks: the target is t - T div N (not the next linspace

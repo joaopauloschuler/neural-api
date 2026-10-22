@@ -24,6 +24,12 @@ transformers class (nothing downloaded), saved with the real folder layout:
     noise_pred_0    the guided noise prediction of step 0
     latents_after   latents after each step
     image           the decoded image (H,W,3) in [0,1]
+  tests/fixtures/tiny_sd15_samplers_io.json
+    per sampler (PNDM skip_prk_steps, EulerDiscrete, DPMSolverMultistep, each
+    from_config of the DDIM config): its scheduler config, timesteps and the
+    latents after each model eval, SAMPLER_STEPS steps, same latents/guidance.
+    Euler latents are divided by sqrt(sigma_next^2 + 1): the model-input (VP)
+    scale TStableDiffusionPipeline keeps. Values rounded to 10 digits.
 
 The pipeline is reloaded from the saved folder and run in float64, latents
 passed explicitly so torch's RNG does not matter.
@@ -32,28 +38,35 @@ Coded by Claude (AI).
 
 Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py
+  python tools/make_pico_sd_pipeline_fixture.py --samplers-only
+(--samplers-only keeps the committed folder and rewrites only the sampler file.)
 """
 import json
+import math
 import os
 import shutil
+import sys
 from collections import Counter
 
 import torch
 from safetensors.torch import load_file, save_file
-from diffusers import (AutoencoderKL, DDIMScheduler, StableDiffusionPipeline,
-                       UNet2DConditionModel)
+from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
+                       EulerDiscreteScheduler, PNDMScheduler,
+                       StableDiffusionPipeline, UNet2DConditionModel)
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "..", "tests", "fixtures")
 PICO_DIR = os.path.join(FIXTURES, "tiny_sd15")
 IO_FILE = os.path.join(FIXTURES, "tiny_sd15_pipeline_io.json")
+SAMPLERS_FILE = os.path.join(FIXTURES, "tiny_sd15_samplers_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
 TEXT_HIDDEN = 32
 IMAGE_SIZE = 16          # VAE factor 2 -> an 8x8 latent grid
 STEPS = 3
+SAMPLER_STEPS = 4        # PNDM reaches its 4th-order formula, DPM++ 2nd order
 GUIDANCE = 7.5
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
@@ -274,6 +287,56 @@ def make_oracle():
     print("timesteps", payload["timesteps"], "vocab", len(tokenizer))
 
 
+def rounded(value):
+    if isinstance(value, list):
+        return [rounded(item) for item in value]
+    return float("%.10g" % value)
+
+
+def make_sampler_oracle():
+    pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
+                                                   safety_checker=None)
+    pipe.set_progress_bar_config(disable=True)
+    generator = torch.Generator().manual_seed(SEED)
+    grid = IMAGE_SIZE // pipe.vae_scale_factor
+    latents = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    base_config = pipe.scheduler.config
+    samplers = [PNDMScheduler.from_config(base_config, skip_prk_steps=True),
+                EulerDiscreteScheduler.from_config(base_config),
+                DPMSolverMultistepScheduler.from_config(base_config)]
+    payload = {"steps": SAMPLER_STEPS, "guidance_scale": GUIDANCE, "samplers": []}
+    for scheduler in samplers:
+        pipe.scheduler = scheduler
+        is_euler = isinstance(scheduler, EulerDiscreteScheduler)
+        after = []
+
+        def on_step_end(_pipe, _step, _t, kwargs):
+            sample = kwargs["latents"][0]
+            if is_euler:
+                sigma = float(scheduler.sigmas[scheduler.step_index])
+                sample = sample / (sigma ** 2 + 1) ** 0.5
+            after.append(rounded(chw(sample)))
+            return kwargs
+        pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+             num_inference_steps=SAMPLER_STEPS, guidance_scale=GUIDANCE,
+             latents=latents.clone(), output_type="latent",
+             callback_on_step_end=on_step_end)
+        # JSON has no infinity (DPM lambda_min_clipped defaults to -inf).
+        config = {key: value for key, value in dict(scheduler.config).items()
+                  if not key.startswith("_") and not (
+                      isinstance(value, float) and not math.isfinite(value))}
+        config["_class_name"] = type(scheduler).__name__
+        payload["samplers"].append({
+            "class_name": type(scheduler).__name__, "config": config,
+            "timesteps": [int(t) for t in scheduler.timesteps],
+            "latents_after": after})
+        print(type(scheduler).__name__, payload["samplers"][-1]["timesteps"])
+    with open(SAMPLERS_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
-    build_folder()
-    make_oracle()
+    if "--samplers-only" not in sys.argv:
+        build_folder()
+        make_oracle()
+    make_sampler_oracle()

@@ -9,8 +9,9 @@ through TStableDiffusionPipeline in neuralpretrained.pas.
     text_encoder/, tokenizer/, unet/, vae/, scheduler/), e.g.
     runwayml/stable-diffusion-v1-5 with F32 *.safetensors weights.
 
-The scheduler config gives the betas, timestep spacing and prediction type;
-the update rule is DDIM (eta 0) whatever the config's _class_name.
+The scheduler config gives the betas, timestep spacing and prediction type,
+and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a or
+DPM-Solver++ 2M; other classes run DDIM). --sampler overrides it.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -26,14 +27,22 @@ Coded by Claude (AI).
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
-  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
+  neuralnetwork, neuralvolume, neuraldatasets, neuraldiffusion,
+  neuralpretrained;
 
 const
   PicoModelFolder = '../../tests/fixtures/tiny_sd15';
+  // --sampler names of the methods TStableDiffusionPipeline maps to.
+  SamplerOptionNames: array[0..4] of string =
+    ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m');
+  SamplerOptionMethods: array[0..4] of TNNetSamplerMethod =
+    (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M);
 
 type
   TStableDiffusionOptions = record
     ModelFolder, Prompt, NegativePrompt, OutputFile: string;
+    // 'auto' (the scheduler config's) or one of SamplerOptionNames.
+    SamplerName: string;
     // ImageSize < 1: the checkpoint default (unet sample_size * VAE factor).
     Steps, ImageSize: integer;
     GuidanceScale: double;
@@ -86,11 +95,33 @@ begin
   WriteLn('  --size N          square image side (default: the checkpoint''s, ',
     '512 for SD 1.5)');
   WriteLn('  --seed N          noise seed (default 0)');
+  WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
+  WriteLn('                    pndm, euler, euler-a or dpm++2m');
   WriteLn('  --output PNG      output file (default stable_diffusion.png)');
   WriteLn('  --gpu             run the nets on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N  OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N    OpenCL device index (default 0)');
+end;
+
+// Position of Name in SamplerOptionNames, or -1.
+function SamplerOptionIndex(const Name: string): integer;
+var
+  NamePos: integer;
+begin
+  Result := -1;
+  for NamePos := 0 to High(SamplerOptionNames) do
+    if SamplerOptionNames[NamePos] = Name then Result := NamePos;
+end;
+
+function SamplerText(Method: TNNetSamplerMethod): string;
+var
+  NamePos: integer;
+begin
+  Result := 'method ' + IntToStr(Ord(Method));
+  for NamePos := 0 to High(SamplerOptionMethods) do
+    if SamplerOptionMethods[NamePos] = Method then
+      Result := SamplerOptionNames[NamePos];
 end;
 
 function ParseOptions(out Opt: TStableDiffusionOptions): boolean;
@@ -111,6 +142,7 @@ begin
   Opt.Prompt := 'a photo of an astronaut riding a horse on mars';
   Opt.NegativePrompt := '';
   Opt.OutputFile := 'stable_diffusion.png';
+  Opt.SamplerName := 'auto';
   Opt.Steps := 25;
   Opt.ImageSize := 0;
   Opt.GuidanceScale := 7.5;
@@ -132,6 +164,7 @@ begin
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
+    else if Arg = '--sampler' then Opt.SamplerName := LowerCase(NextArg())
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -146,6 +179,9 @@ begin
     Inc(ArgPos);
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  if (Opt.SamplerName <> 'auto') and
+    (SamplerOptionIndex(Opt.SamplerName) < 0) then
+    raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
 end;
 
 procedure Run(const Opt: TStableDiffusionOptions);
@@ -202,8 +238,16 @@ begin
     WriteLn(Format('Image:    %dx%d, %d steps, guidance %.2f, seed %d, %s',
       [ImageSize, ImageSize, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
        ComputeText]));
-    WriteLn('Sampler:  DDIM with the ', Pipeline.SchedulerClassName,
-      ' config''s betas and timestep spacing');
+    if Opt.SamplerName <> 'auto' then
+      Pipeline.Sampler := SamplerOptionMethods[
+        SamplerOptionIndex(Opt.SamplerName)];
+    WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler), ' with the ',
+      Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
+    if (Opt.SamplerName = 'auto') and (Pipeline.SamplerNotice <> '') then
+      WriteLn('Notice:   ', Pipeline.SamplerNotice);
+    // Euler a draws its per-step noise from the global RNG; the initial
+    // latents use Opt.Seed itself, so this stream starts elsewhere.
+    RandSeed := Opt.Seed xor $9E3779B9;
     StartTime := Now();
     Pipeline.Generate(Opt.Prompt, ImageSize, ImageSize, Opt.Steps, Opt.Seed,
       Image);

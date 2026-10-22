@@ -535,10 +535,12 @@ rather than acted on.
             --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
             per-component parity against diffusers on the real weights (the ~/x
             venv oracle recipe).
-      - [ ] Samplers per scheduler `_class_name`: the pipeline always runs DDIM
-            (eta 0); SD 1.5 ships PNDMScheduler (PLMS), others Euler / DPM++.
-            Map DPMSolverMultistep -> smDPMSolverPP2M and add PNDM/Euler with
-            pico parity.
+      - [ ] Sampler gaps behind SamplerNotice (DDIM/PNDM/Euler/Euler a/DPM++ 2M
+            are mapped with diffusers parity): UniPCMultistepScheduler (smUniPC
+            has only a numpy oracle; diffusers takes N of N+1 points like DPM),
+            use_karras_sigmas (diffusers keeps continuous sigmas, tsKarras
+            snaps to integer timesteps), PNDM PRK warm-up, Euler linspace
+            fractional timesteps, DDPMScheduler (smDDPM ignores the stride).
       - [ ] SD 2.x: v_prediction (dpV exists), use_linear_projection and the
             head list [5,10,20,20] exist in the UNet importer, pad token "!"
             is read from tokenizer_config. The SD 2.x text_encoder config is
