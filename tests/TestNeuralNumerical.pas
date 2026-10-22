@@ -2083,6 +2083,7 @@ type
     procedure TestLayerNormSerializationRoundTrip;
     procedure TestRMSNormSerializationRoundTrip;
     procedure TestGroupNormSerializationRoundTrip;
+    procedure TestGroupNormEpsilonSerializationRoundTrip;
     procedure TestChannelStdNormalizationSerializationRoundTrip;
     procedure TestLocalResponseNorm2DSerializationRoundTrip;
     procedure TestMaxOutForward;
@@ -28649,6 +28650,45 @@ begin
   // non-default group hyperparameter through the CreateLayer dispatch.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetGroupNorm.Create(3), 'GroupNorm', 2, 2, 6, 1e-5);
+end;
+
+// A 1e-6 GroupNorm / InstanceNorm epsilon survives SaveToString and Clone; a
+// structure saved before the epsilon was stored (FFloatSt[0] = 0) loads as 1e-5.
+procedure TTestNeuralNumerical.TestGroupNormEpsilonSerializationRoundTrip;
+var
+  NN, Loaded, Cloned: TNNet;
+  OldLayer: TNNetLayer;
+  procedure CheckEpsilons(const Caption: string; Net: TNNet);
+  begin
+    AssertEquals(Caption + ' GroupNorm epsilon', 1e-6,
+      TNNetGroupNorm(Net.Layers[1]).GroupNormEpsilon, 1e-12);
+    AssertEquals(Caption + ' InstanceNorm epsilon', 1e-6,
+      TNNetInstanceNorm(Net.Layers[2]).GroupNormEpsilon, 1e-12);
+  end;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Cloned := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 6));
+    TNNetGroupNorm(NN.AddLayer(TNNetGroupNorm.Create(3))).GroupNormEpsilon := 1e-6;
+    NN.AddLayer(TNNetInstanceNorm.Create(True, 1e-6));
+    Loaded.LoadFromString(NN.SaveToString());
+    CheckEpsilons('LoadFromString', Loaded);
+    Cloned := NN.Clone();
+    CheckEpsilons('Clone', Cloned);
+    OldLayer := Loaded.CreateLayer('TNNetGroupNorm:3;1::0');
+    try
+      AssertEquals('Old structure GroupNorm epsilon', 1e-5,
+        TNNetGroupNorm(OldLayer).GroupNormEpsilon, 1e-12);
+    finally
+      OldLayer.Free;
+    end;
+  finally
+    Cloned.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestInstanceNormSerializationRoundTrip;

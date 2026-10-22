@@ -73,10 +73,11 @@ rather than acted on.
 
 ## Bugs
 
-- [ ] Defect (found 2026-10-22, 9b2390c6): `TNNetGroupNorm.GroupNormEpsilon` is
+- [X] Defect (found 2026-10-22, 9b2390c6): `TNNetGroupNorm.GroupNormEpsilon` is
       not saved in the layer structure, so `Clone` / `SaveToString` of an SD
-      UNet or VAE silently resets its 1e-6 norms to 1e-5. Store it in the
-      structure string (keeping old files at the 1e-5 default) + round-trip test.
+      UNet or VAE silently resets its 1e-6 norms to 1e-5. Stored in FFloatSt[0]
+      (0 in old files loads as 1e-5; TNNetInstanceNorm inherits it);
+      TestGroupNormEpsilonSerializationRoundTrip.
 - [ ] Probable defect (not fixed, awaits user decision; found during the
       Restormer importer): `BuildNAFNet` and `BuildSwinIRFromSafeTensors` load
       the conv before their `TNNetDepthToSpace` upsample unpermuted, but torch
@@ -629,7 +630,7 @@ rather than acted on.
               measure on the GPU box first.
         - [ ] A different IP-Adapter file still re-reads the UNet (the owner
               holds the IP-Adapter attention weights).
-        - [ ] TNNetGroupNorm.GroupNormEpsilon is not in the saved structure, so
+        - [X] TNNetGroupNorm.GroupNormEpsilon is not in the saved structure, so
               Clone / SaveToString of an SD UNet or VAE resets the 1e-6 norms to
               1e-5. The builders now set it at construction; the save format
               does not carry it.

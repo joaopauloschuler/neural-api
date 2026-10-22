@@ -10151,8 +10151,11 @@ type
       // inference-only layer neither fills nor needs it. Compute keys the
       // snapshot on FNormalized's size.
       procedure FreeBackpropScratch();
+      procedure SetGroupNormEpsilon(pEpsilon: TNeuralFloat);
     public
-      constructor Create(Groups: integer; PerChannelAffine: boolean = True); reintroduce; overload;
+      // pEpsilon <= 0 selects the 1e-5 default (structures saved without it).
+      constructor Create(Groups: integer; PerChannelAffine: boolean = True;
+        pEpsilon: TNeuralFloat = 0); reintroduce; overload;
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -10167,9 +10170,10 @@ type
       function OpenCLOutputKernel(): TNeuralKernel; override;
       function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
-      // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
+      // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6),
+      // saved in FFloatSt[0].
       property GroupNormEpsilon: TNeuralFloat read FGroupNormEpsilon
-        write FGroupNormEpsilon;
+        write SetGroupNormEpsilon;
   end;
 
   /// Instance normalization: per-sample, per-channel normalization. This is
@@ -10180,7 +10184,8 @@ type
   // Coded by Claude (AI).
   TNNetInstanceNorm = class(TNNetGroupNorm)
     public
-      constructor Create(PerChannelAffine: boolean = True); overload;
+      constructor Create(PerChannelAffine: boolean = True;
+        pEpsilon: TNeuralFloat = 0); overload;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   end;
 
@@ -87660,7 +87665,8 @@ end;
 {$ENDIF}
 
 { TNNetGroupNorm }
-constructor TNNetGroupNorm.Create(Groups: integer; PerChannelAffine: boolean);
+constructor TNNetGroupNorm.Create(Groups: integer; PerChannelAffine: boolean;
+  pEpsilon: TNeuralFloat);
 begin
   inherited Create();
   if Groups < 1 then Groups := 1;
@@ -87668,7 +87674,7 @@ begin
   FStruct[0] := Groups;
   FPerChannelAffine := PerChannelAffine;
   FStruct[1] := Ord(PerChannelAffine);
-  FGroupNormEpsilon := 1e-5;
+  if pEpsilon > 0 then SetGroupNormEpsilon(pEpsilon) else SetGroupNormEpsilon(1e-5);
   FChannelsPerGroup := 0;
   FNormalized := TNNetVolume.Create();
   FAuxChannel := TNNetVolume.Create();
@@ -87693,6 +87699,12 @@ begin
   FSumScratch.Free;
   FSumSqScratch.Free;
   inherited Destroy();
+end;
+
+procedure TNNetGroupNorm.SetGroupNormEpsilon(pEpsilon: TNeuralFloat);
+begin
+  FGroupNormEpsilon := pEpsilon;
+  FFloatSt[0] := pEpsilon;
 end;
 
 procedure TNNetGroupNorm.FreeBackpropScratch();
@@ -88046,11 +88058,12 @@ end;
 {$ENDIF}
 
 { TNNetInstanceNorm }
-constructor TNNetInstanceNorm.Create(PerChannelAffine: boolean);
+constructor TNNetInstanceNorm.Create(PerChannelAffine: boolean;
+  pEpsilon: TNeuralFloat);
 begin
   // Placeholder Groups=1; the real value is bound at SetPrevLayer once Depth
   // is known (one group per channel).
-  inherited Create(1, PerChannelAffine);
+  inherited Create(1, PerChannelAffine, pEpsilon);
 end;
 
 procedure TNNetInstanceNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -140835,8 +140848,8 @@ begin
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
       'TNNetPixelNorm':             Result := TNNetPixelNorm.Create();
-      'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0], St[1] = 1);
-      'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create(St[1] = 1);
+      'TNNetGroupNorm':             Result := TNNetGroupNorm.Create(St[0], St[1] = 1, Ft[0]);
+      'TNNetInstanceNorm':          Result := TNNetInstanceNorm.Create(St[1] = 1, Ft[0]);
       'TNNetMovingScale':           Result := TNNetMovingScale.Create(Ft[0],Ft[1]);
       'TNNetChannelStdNormalization': Result := TNNetChannelStdNormalization.Create();
       'TNNetChannelNorm':           Result := TNNetChannelNorm.Create();
@@ -141287,8 +141300,8 @@ begin
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
       if S[0] = 'TNNetPixelNorm' then Result := TNNetPixelNorm.Create() else
-      if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0], St[1] = 1) else
-      if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create(St[1] = 1) else
+      if S[0] = 'TNNetGroupNorm' then Result := TNNetGroupNorm.Create(St[0], St[1] = 1, Ft[0]) else
+      if S[0] = 'TNNetInstanceNorm' then Result := TNNetInstanceNorm.Create(St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetMovingScale' then Result := TNNetMovingScale.Create(Ft[0],Ft[1]) else
       if S[0] = 'TNNetChannelStdNormalization' then Result := TNNetChannelStdNormalization.Create() else
       if S[0] = 'TNNetChannelNorm' then Result := TNNetChannelNorm.Create() else
