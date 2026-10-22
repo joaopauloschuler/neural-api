@@ -9407,11 +9407,13 @@ type
   // vector of length D in a 1x1xD output volume:
   //   half = D div 2
   //   for i in 0..half-1:
-  //     freq[i]      = exp(-ln(MaxPeriod) * i / half)   // MaxPeriod default 10000
+  //     freq[i]      = exp(-ln(MaxPeriod) * i / (half - DownscaleFreqShift))
   //     emb[i]       = sin(t * freq[i])
   //     emb[half+i]  = cos(t * freq[i])
-  // D must be even. EmbeddingSize and MaxPeriod are stored in FStruct[0]/[1]
-  // so SaveToString/LoadFromString round-trip. The output is deterministic
+  // MaxPeriod defaults to 10000; DownscaleFreqShift is diffusers'
+  // downscale_freq_shift (default 0). D must be even. EmbeddingSize, MaxPeriod
+  // and DownscaleFreqShift are stored in FStruct[0..2] so
+  // SaveToString/LoadFromString round-trip. The output is deterministic
   // given t; there are NO learnable parameters. Backpropagate is a no-op:
   // the gradient w.r.t. the input scalar t is mathematically defined but is
   // not propagated in this v1 (timestep is typically a fixed integer index
@@ -9421,10 +9423,12 @@ type
   private
     FEmbeddingSize: integer;
     FMaxPeriod: integer;
+    FDownscaleFreqShift: integer;
     FFreq: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(EmbeddingSize: integer; MaxPeriod: integer = 10000); reintroduce;
+    constructor Create(EmbeddingSize: integer; MaxPeriod: integer = 10000;
+      DownscaleFreqShift: integer = 0); reintroduce;
     destructor Destroy(); override;
 
     procedure Compute(); override;
@@ -26011,7 +26015,7 @@ end;
 { TNNetSinusoidalTimeEmbedding }
 
 constructor TNNetSinusoidalTimeEmbedding.Create(EmbeddingSize: integer;
-  MaxPeriod: integer = 10000);
+  MaxPeriod: integer = 10000; DownscaleFreqShift: integer = 0);
 begin
   inherited Create();
   if (EmbeddingSize <= 0) or ((EmbeddingSize mod 2) <> 0) then
@@ -26020,10 +26024,15 @@ begin
   if MaxPeriod <= 1 then
     FErrorProc('TNNetSinusoidalTimeEmbedding MaxPeriod must be > 1. Got: ' +
       IntToStr(MaxPeriod));
+  if (DownscaleFreqShift < 0) or (DownscaleFreqShift >= EmbeddingSize div 2) then
+    FErrorProc('TNNetSinusoidalTimeEmbedding DownscaleFreqShift must be in ' +
+      '[0, EmbeddingSize/2). Got: ' + IntToStr(DownscaleFreqShift));
   FEmbeddingSize := EmbeddingSize;
   FMaxPeriod := MaxPeriod;
+  FDownscaleFreqShift := DownscaleFreqShift;
   FStruct[0] := EmbeddingSize;
   FStruct[1] := MaxPeriod;
+  FStruct[2] := DownscaleFreqShift;
   FOutput.ReSize(1, 1, EmbeddingSize);
   SetOutputErrorSize(1, 1, EmbeddingSize);
   FFreq := TNNetVolume.Create(1, 1, EmbeddingSize div 2);
@@ -26046,11 +26055,11 @@ begin
   FOutput.ReSize(1, 1, FEmbeddingSize);
   SetOutputErrorSize(1, 1, FEmbeddingSize);
   // Precompute the frequency table once:
-  //   freq[i] = exp(-ln(MaxPeriod) * i / half)  for i in 0..half-1.
+  //   freq[i] = exp(-ln(MaxPeriod) * i / (half - shift))  for i in 0..half-1.
   Half := FEmbeddingSize div 2;
   HalfM1 := Half - 1;
   LogMax := pcr_logf(FMaxPeriod);
-  k := -LogMax / Half;
+  k := -LogMax / (Half - FDownscaleFreqShift);
   for i := 0 to HalfM1 do
     FFreq.Raw[i] := NeuralExp(k * i);
 end;
@@ -140882,7 +140891,7 @@ begin
       'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
       'TNNetLearnedPositionalEmbedding':Result := TNNetLearnedPositionalEmbedding.Create(St[0], Ft[0]);
       'TNNetSinusoidalPositionalEmbedding': Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]);
-      'TNNetSinusoidalTimeEmbedding': Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]);
+      'TNNetSinusoidalTimeEmbedding': Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1], St[2]);
       'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetTokenAndPositionalEmbedding':Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]);
     else
@@ -141334,7 +141343,7 @@ begin
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
       if S[0] = 'TNNetLearnedPositionalEmbedding' then Result := TNNetLearnedPositionalEmbedding.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetSinusoidalPositionalEmbedding' then Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]) else
-      if S[0] = 'TNNetSinusoidalTimeEmbedding' then Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]) else
+      if S[0] = 'TNNetSinusoidalTimeEmbedding' then Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]) else
       raise Exception.create(strData + ' not allowed in CreateLayer.');

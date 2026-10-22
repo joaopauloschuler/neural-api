@@ -215,14 +215,34 @@ int(50 * strength) points, and all `--steps` steps run on it (strength 0.5,
 `StableDiffusionImg2ImgPipeline` with an `LCMScheduler` instead keeps the last
 int(steps * strength) entries of the full grid (t = 499, 259).
 
-LCM-distilled UNets such as `SimianLuo/LCM_Dreamshaper_v7` are not supported
-yet. Their `unet/config.json` sets `time_cond_proj_dim` (a guidance-scale
-embedding), and `BuildSDUNet` refuses such a config.
+### LCM-distilled UNets
+
+An LCM-distilled folder such as `SimianLuo/LCM_Dreamshaper_v7` needs no LoRA.
+Its `scheduler_config.json` already names `LCMScheduler`, so `--sampler lcm` is
+optional:
+
+```
+StableDiffusion --model ~/models/LCM_Dreamshaper_v7 \
+  --prompt "a watercolor painting of a lighthouse at dawn"
+```
+
+Its `unet/config.json` sets `time_cond_proj_dim` (256): the UNet takes the
+guidance scale as an input instead of running classifier-free guidance. The
+pipeline feeds the sinusoidal embedding of (w - 1) * 1000 (w = `--guidance`)
+through `time_embedding.cond_proj` and adds it to the timestep embedding,
+as diffusers `LatentConsistencyModelPipeline` does. Every step runs one UNet
+pass at any guidance, and no negative prompt is encoded (`--negative` has no
+effect). `--guidance` defaults to 8.5 for such a UNet, the diffusers default.
+`--init-image` works the same way as above
+(`LatentConsistencyModelImg2ImgPipeline`).
 
 Tested against diffusers float64 on the pico folder (an `LCMScheduler` from the
-DDIM config, replayed step noise): 4 steps at guidance 1.5 and 1.0, and img2img
-at strength 0.5 (`TestStableDiffusionLCMParity`). No real LCM-LoRA has been
-run yet.
+DDIM config, replayed step noise): with the base UNet, 4 steps at guidance 1.5
+and 1.0 and img2img at strength 0.5 (`TestStableDiffusionLCMParity`); with a
+pico LCM-distilled UNet, 4 steps at guidance 8.5 and 1.0 and img2img at
+strength 0.5 (`TestStableDiffusionLCMDistilledParity`), plus one UNet call
+with the guidance embedding (`TestSDUNetTimeCondProjDimParity`). No real
+LCM-LoRA or LCM-distilled checkpoint has been run yet.
 
 ## Usage
 
@@ -233,14 +253,15 @@ StableDiffusion [--model DIR] [options]
   --negative TEXT   negative prompt (default empty)
   --steps N         denoising steps (default 25; 4 with lcm)
   --guidance G      classifier-free guidance scale (default 7.5, 1.0 with lcm;
-                    <= 1 turns it off)
+                    <= 1 turns it off); an LCM-distilled UNet embeds it
+                    (default 8.5)
   --width N         image width (default: the checkpoint's, 512 for SD 1.5)
   --height N        image height (default: the checkpoint's)
   --size N          sets both --width and --height
   --seed N          noise seed (default 0)
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
-                    euler, euler-a, dpm++2m or lcm (Latent Consistency; needs
-                    an LCM-LoRA via --lora, 2-8 steps)
+                    euler, euler-a, dpm++2m or lcm (Latent Consistency; an
+                    LCM-LoRA via --lora or an LCM-distilled UNet, 2-8 steps)
   --output PNG      output file (default stable_diffusion.png)
   --repeat N        N images, seeds --seed, --seed+1, ...; the prompt is encoded
                     once. N > 1 keeps the components loaded and numbers the files

@@ -55,6 +55,9 @@ type
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
+    // tiny_sd15_lcm_distilled (unet, scheduler, model_index) with tiny_sd15's
+    // text encoder, tokenizer and VAE, assembled in a temp folder.
+    function CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
     // Nested JSON [S][D] -> (S,1,D); [C][H][W] (ChannelsFirst) or [H][W][C]
     // -> (W,H,C).
     procedure LoadNestedOracleVolume(Data: TJSONData; ChannelsFirst: boolean;
@@ -1267,7 +1270,8 @@ type
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
     procedure TestStableDiffusionLCMParity;
-    procedure TestSDUNetRefusesTimeCondProjDim;
+    procedure TestStableDiffusionLCMDistilledParity;
+    procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
@@ -45503,6 +45507,37 @@ begin
     FixturePath('tiny_sd15/model_index.json')));
 end;
 
+function TTestNeuralPretrained.CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
+const
+  cDistilledFiles: array[0..3] of string = ('model_index.json',
+    'scheduler/scheduler_config.json', 'unet/config.json',
+    'unet/diffusion_pytorch_model.safetensors');
+  cBaseFiles: array[0..7] of string = ('text_encoder/config.json',
+    'text_encoder/model.safetensors', 'tokenizer/merges.txt',
+    'tokenizer/special_tokens_map.json', 'tokenizer/tokenizer_config.json',
+    'tokenizer/vocab.json', 'vae/config.json',
+    'vae/diffusion_pytorch_model.safetensors');
+var
+  Folder: string;
+  FilePos: integer;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) +
+    'cai_sd15_lcm_distilled');
+  for FilePos := 0 to High(cDistilledFiles) do
+  begin
+    ForceDirectories(ExtractFileDir(Folder + cDistilledFiles[FilePos]));
+    CopyFileTo(FixturePath('tiny_sd15_lcm_distilled/' + cDistilledFiles[FilePos]),
+      Folder + cDistilledFiles[FilePos]);
+  end;
+  for FilePos := 0 to High(cBaseFiles) do
+  begin
+    ForceDirectories(ExtractFileDir(Folder + cBaseFiles[FilePos]));
+    CopyFileTo(FixturePath('tiny_sd15/' + cBaseFiles[FilePos]),
+      Folder + cBaseFiles[FilePos]);
+  end;
+  Result := TStableDiffusionPipeline.Create(Folder);
+end;
+
 procedure TTestNeuralPretrained.LoadNestedOracleVolume(Data: TJSONData;
   ChannelsFirst: boolean; Dest: TNNetVolume);
 var
@@ -46814,38 +46849,124 @@ begin
   end;
 end;
 
-// An LCM-distilled UNet config (time_cond_proj_dim) is read, and BuildSDUNet
-// refuses it before touching the reader.
-procedure TTestNeuralPretrained.TestSDUNetRefusesTimeCondProjDim;
+// LatentConsistencyModelPipeline / ...Img2ImgPipeline float64 on an
+// LCM-distilled UNet (tiny_sd15_lcm_distilled_io.json, replayed step noise):
+// guidance 8.5 and 1.0 embedded, one UNet pass per step, and img2img at 0.5.
+procedure TTestNeuralPretrained.TestStableDiffusionLCMDistilledParity;
 var
-  Lines: TStringList;
-  ConfigText: string;
-  Config: TSDUNetConfig;
-  IsRefused: boolean;
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TStableDiffusionImg2Img;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, ImageNoise: TNNetVolume;
+  CasePos: integer;
 begin
-  Lines := TStringList.Create;
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_lcm_distilled_io.json');
+  Pipeline := CreateSD15LCMDistilledPipeline();
+  Img2Img := TStableDiffusionImg2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
   try
-    Lines.LoadFromFile(FixturePath('tiny_sd15/unet/config.json'));
-    ConfigText := Lines.Text;
+    AssertTrue('LCM from the scheduler config', Pipeline.Sampler = smLCM);
+    AssertTrue('LCM scheduler', Pipeline.Scheduler is TNNetLCMScheduler);
+    AssertEquals('time_cond_proj_dim',
+      TJSONObject(FSD15Oracle).Get('time_cond_proj_dim', 0),
+      Pipeline.UNetConfig.TimeCondProjDim);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Pipeline.OnAncestralNoise := @SD15StepNoise;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      if Entry.Get('strength', 1.0) < 1 then
+      begin
+        Img2Img.Strength := Entry.Get('strength', 1.0);
+        Pipeline.Conditioner := Img2Img;
+      end
+      else Pipeline.Conditioner := nil;
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      AssertEquals(Entry.Get('name', '') + ' no CFG', 1.0,
+        Pipeline.CFGGuidanceScale, 0);
+      AssertEquals(Entry.Get('name', '') + ' one UNet pass per step',
+        TJSONObject(FSD15Oracle).Get('steps', 0),
+        Pipeline.ImageStats.UNetPassCount);
+    end;
+    AssertFalse('no negative prompt encoded', Pipeline.HasNegativePromptEmbeds);
   finally
-    Lines.Free;
+    ImageNoise.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
   end;
-  Config := ReadSDUNetConfigFromJSONText(ConfigText, 'tiny_sd15');
-  AssertEquals('no time_cond_proj_dim', 0, Config.TimeCondProjDim);
-  AssertTrue('fixture has the null key',
-    Pos('"time_cond_proj_dim": null', ConfigText) > 0);
-  ConfigText := StringReplace(ConfigText, '"time_cond_proj_dim": null',
-    '"time_cond_proj_dim": 256', []);
-  Config := ReadSDUNetConfigFromJSONText(ConfigText, 'lcm');
-  AssertEquals('time_cond_proj_dim', 256, Config.TimeCondProjDim);
-  IsRefused := false;
+end;
+
+// One UNet call with the guidance-scale embedding (time_embedding.cond_proj)
+// vs diffusers float64; a plain SD UNet config has no guidance input.
+procedure TTestNeuralPretrained.TestSDUNetTimeCondProjDimParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Inputs: TSDUNetConditioningInputs;
+  UNetCheck: TJSONObject;
+  Embeds, Latents, Output, Expected: TNNetVolume;
+  MaxDiff: double;
+begin
+  Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd15/unet/config.json'));
+  AssertEquals('null time_cond_proj_dim', 0, Config.TimeCondProjDim);
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_lcm_distilled_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Net := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
   try
-    BuildSDUNet(nil, Config).Free;
-  except
-    on E: EPretrainedImportError do
-      IsRefused := Pos('time_cond_proj_dim', E.Message) > 0;
+    UNetCheck := TJSONObject(FSD15Oracle).Objects['unet_check'];
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Latents);
+    LoadNestedOracleVolume(UNetCheck.Arrays['output'], true, Expected);
+    Config := ReadSDUNetConfigFromJSONFile(FixturePath(
+      'tiny_sd15_lcm_distilled/unet/config.json'));
+    AssertEquals('time_cond_proj_dim',
+      TJSONObject(FSD15Oracle).Get('time_cond_proj_dim', 0),
+      Config.TimeCondProjDim);
+    Config.LatentGrid := Latents.SizeX;
+    Config.LatentGridY := Latents.SizeY;
+    Config.TextSeqLen := Embeds.SizeX;
+    Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15_lcm_distilled/unet/diffusion_pytorch_model.safetensors'),
+      Config, {pTrainable=}false);
+    Inputs := SDUNetConditioningInputs(Net, Config, false, false, false);
+    AssertTrue('guidance input', Assigned(Inputs.GuidanceScale));
+    SDUNetFillGuidanceScale(Inputs, UNetCheck.Get('guidance_scale', 0.0));
+    SDUNetDenoise(Net, Config, Latents, Embeds, UNetCheck.Get('timestep', 0),
+      Output);
+    MaxDiff := MaxAbsVolumeDiff(Output, Expected);
+    AssertTrue('unet output max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    // The embedding matters: guidance 1 (w = 0) gives another output.
+    SDUNetFillGuidanceScale(Inputs, 1);
+    SDUNetDenoise(Net, Config, Latents, Embeds, UNetCheck.Get('timestep', 0),
+      Output);
+    AssertTrue('w = 0 differs', MaxAbsVolumeDiff(Output, Expected) > 1e-3);
+  finally
+    Expected.Free;
+    Output.Free;
+    Latents.Free;
+    Embeds.Free;
+    Net.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
   end;
-  AssertTrue('time_cond_proj_dim refused', IsRefused);
 end;
 
 // StableDiffusionInstructPix2PixPipeline float64 (tiny_sd15_ip2p_io.json, an

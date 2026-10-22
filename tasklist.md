@@ -545,14 +545,24 @@ rather than acted on.
               4 steps, guidance 1.0 and 1.5. Check that every LoRA key of that
               file merges (the pico LoRA test covers attention, proj_in, ff,
               conv1 and time_emb_proj only).
-        - [ ] Route (2), LCM-distilled UNets (SimianLuo/LCM_Dreamshaper_v7):
-              the UNet config has time_cond_proj_dim (256), i.e. a
-              guidance-scale embedding (w - 1)*1000 sinusoid fed through
-              time_embedding.cond_proj (no bias) and added to the sample before
-              linear_1, with ONE UNet pass per step (no CFG). BuildSDUNet
-              refuses the key today (TSDUNetConfig.TimeCondProjDim). Tests: a
-              pico time_cond_proj_dim UNet vs
-              LatentConsistencyModelPipeline / ...Img2ImgPipeline float64.
+        - [X] Route (2), LCM-distilled UNets: BuildSDUNet wires
+              time_embedding.cond_proj (guidance input = TNNetInput #3,
+              TNNetSinusoidalTimeEmbedding with DownscaleFreqShift 1), the
+              pipeline runs one pass per step (CFGGuidanceScale = 1), model_index
+              LatentConsistencyModel[Img2Img]Pipeline accepted, example
+              defaults guidance 8.5. Pico parity vs diffusers float64
+              (TestStableDiffusionLCMDistilledParity, TestSDUNetTimeCondProjDimParity,
+              tiny_sd15_lcm_distilled/).
+        - [ ] Real LCM-distilled run on the user's GPU box:
+              SimianLuo/LCM_Dreamshaper_v7, 4 steps, guidance 8.5, text-to-image
+              and --init-image. Its unet is F32 safetensors; check the load and
+              the image.
+        - [ ] BuildControlNet ignores a ControlNet config's time_cond_proj_dim
+              (no cond_proj wiring, no refusal); refuse it or wire it like
+              BuildSDUNet if an LCM-distilled ControlNet shows up.
+        - [ ] SDXL LCM-distilled UNets (latent-consistency/lcm-sdxl): the
+              importer builds guidance + add_embeds together, but the pipeline
+              refuses SDXL; untested.
         - [ ] Decide the LCM img2img schedule for LCM-LoRA. Today smLCM img2img
               follows LatentConsistencyModelImg2ImgPipeline (strength shrinks
               the origin grid, all steps run: 0.5 x 4 -> 499, 379, 259, 139).

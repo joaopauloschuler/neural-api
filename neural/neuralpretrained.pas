@@ -11841,7 +11841,8 @@ function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
 // noisy latent; input1 = the (1,1,1) scalar timestep t (the sinusoidal+MLP
 // runs INSIDE the net); input2 = the (TextSeqLen,1,CrossAttentionDim) text
 // encoder_hidden_states (CLIP). SDUNetDenoise fills all three, Computes, and
-// reads the (InChannels) predicted-noise volume. Exact diffusers conventions:
+// reads the (InChannels) predicted-noise volume. An LCM-distilled config
+// (time_cond_proj_dim) adds input3, the guidance scale (SDUNetFillGuidanceScale). Exact diffusers conventions:
 //   * timestep embedding flip_sin_to_cos=True -> [cos|sin]; the framework
 //     TNNetSinusoidalTimeEmbedding emits [sin|cos], so the importer SWAPS the
 //     two halves of time_embedding.linear_1's input columns at load (as DiT).
@@ -11896,8 +11897,8 @@ type
     // add_embeds input width = AdditionEmbedTextDim + 6*AdditionTimeEmbedDim,
     // i.e. projection_class_embeddings_input_dim (2816 for SDXL).
     AddEmbedsInputDim: integer;
-    // time_cond_proj_dim of LCM-distilled UNets (the guidance-scale embedding
-    // of time_embedding.cond_proj); 0 = absent. BuildSDUNet refuses it.
+    // time_cond_proj_dim of LCM-distilled UNets: the width of the guidance-scale
+    // embedding that time_embedding.cond_proj maps into the timestep one; 0 = absent.
     TimeCondProjDim: integer;
   end;
 
@@ -11978,6 +11979,8 @@ function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 type
   // The extra TNNetInputs of a BuildSDUNet net; nil / empty when not built.
   TSDUNetConditioningInputs = record
+    // LCM-distilled UNets (TimeCondProjDim > 0); see SDUNetFillGuidanceScale.
+    GuidanceScale: TNNetLayer;
     IPKeyTokens, IPValueTokens: TNNetLayer;
     // One per down block (SDUNetAdapterFeatureCount).
     Adapter: array of TNNetLayer;
@@ -11990,6 +11993,11 @@ type
 // unless Net has exactly that many TNNetInputs.
 function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
   WithIPAdapter, WithAdapter, WithControl: boolean): TSDUNetConditioningInputs;
+
+// Writes diffusers' LCM w = GuidanceScale - 1, times 1000, into
+// Inputs.GuidanceScale; does nothing when the UNet has no guidance input.
+procedure SDUNetFillGuidanceScale(const Inputs: TSDUNetConditioningInputs;
+  GuidanceScale: TNeuralFloat);
 
 // Fills all three inputs, runs one forward, and copies the predicted noise
 // into Noise. Latent is (LatentGrid, LatentGridYOf, InChannels); EncStates is
@@ -12338,6 +12346,7 @@ type
     function GetVaeScaleFactor(): integer;
     function GetDefaultImageSize(): integer;
     function GetHasNegativePromptEmbeds(): boolean;
+    function GetCFGGuidanceScale(): TNeuralFloat;
     function GetLoRACount(): integer;
     // Frees the kept UNet and text encoder and the encoded negative embeds.
     procedure LoRAsChanged();
@@ -12409,8 +12418,11 @@ type
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
     // CFG weight (diffusers guidance_scale, 7.5); <= 1 runs no unconditional pass.
+    // An LCM-distilled UNet (time_cond_proj_dim) embeds it instead, one pass.
     property GuidanceScale: TNeuralFloat read FGuidanceScale
       write FGuidanceScale;
+    // The CFG weight the passes use: GuidanceScale, or 1 when the UNet embeds it.
+    property CFGGuidanceScale: TNeuralFloat read GetCFGGuidanceScale;
     property NegativePrompt: string read FNegativePrompt
       write SetNegativePrompt;
     property HasNegativePromptEmbeds: boolean read GetHasNegativePromptEmbeds;
@@ -75983,7 +75995,7 @@ var
   AdapterInputs: array of TNNetLayer;
   AdapterTop, AdapterGridX, AdapterGridY: integer;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
-  TimeCond, NormOut, ConvOut, HLayer: TNNetLayer;
+  TimeCond, NormOut, ConvOut, HLayer, CondProj: TNNetLayer;
   AddEmbInput, AddFc0, AddSilu, AddFc2: TNNetLayer;
   WVol: TNNetVolume;
   SwapTmp: TNeuralFloat;
@@ -76031,11 +76043,6 @@ var
   end;
 
 begin
-  if Config.TimeCondProjDim > 0 then
-    ImportError('SD UNet import: time_cond_proj_dim ' +
-      IntToStr(Config.TimeCondProjDim) + ' (an LCM-distilled UNet with a ' +
-      'guidance-scale embedding) is not supported yet; for LCM use a base ' +
-      'SD UNet with an LCM-LoRA and the LCM sampler.');
   n := Config.NumBlockOut;
   nM1 := n - 1;
   d0 := Config.BlockOutChannels[0];
@@ -76080,7 +76087,26 @@ begin
 
     // input1: scalar timestep -> sinusoidal -> 2-layer MLP -> TimeCond.
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
-    TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d0) );
+
+    // input2: text encoder states (TextSeqLen,1,CrossDim).
+    TextInput := NN.AddLayer( TNNetInput.Create(Config.TextSeqLen, 1,
+      Config.CrossAttentionDim) );
+
+    // LCM-distilled UNets: input3 holds (w - 1) * 1000 (SDUNetFillGuidanceScale);
+    // its [sin|cos] embedding (diffusers get_guidance_scale_embedding divides
+    // by half - 1) goes through the bias-free cond_proj into the timestep one.
+    CondProj := nil;
+    if Config.TimeCondProjDim > 0 then
+    begin
+      NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+      NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(Config.TimeCondProjDim,
+        10000, 1) );
+      CondProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(d0).SetTrainable(pTrainable) );
+    end;
+    TSin := NN.AddLayerAfter( TNNetSinusoidalTimeEmbedding.Create(d0), TInput );
+    if CondProj <> nil then
+      NN.AddLayer( TNNetSum.Create([TSin, CondProj]) );
     TFc0 := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
     TSilu := NN.AddLayer( TNNetSiLU.Create() );
@@ -76088,18 +76114,14 @@ begin
       TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
     TimeCond := TFc2;
 
-    // input2: text encoder states (TextSeqLen,1,CrossDim).
-    TextInput := NN.AddLayer( TNNetInput.Create(Config.TextSeqLen, 1,
-      Config.CrossAttentionDim) );
-
-    // SDXL micro-conditioning (addition_embed_type=="text_time"): input3 carries
+    // SDXL micro-conditioning (addition_embed_type=="text_time"): an input carries
     // the precomputed add_embeds vector [pooled_text(AdditionEmbedTextDim) |
     // time_ids_emb(6*AdditionTimeEmbedDim)] (the sinusoidal time_ids expansion is
     // done on the HOST in SDUNetDenoiseSDXL, mirroring TNNetSinusoidalTimeEmbedding
     // with diffusers' [cos|sin] order). add_embedding = Linear->SiLU->Linear maps
     // it to TimeEmbedDim, then it is ADDED into the timestep embedding so the
-    // down/mid/up ResNet blocks see emb = emb + aug_emb. When this input exists it
-    // sits at TNNetInput #3, so the control/adapter skip inputs shift to #4+.
+    // down/mid/up ResNet blocks see emb = emb + aug_emb. This input follows the
+    // text (and guidance) inputs; the control/adapter skip inputs come after it.
     AddEmbInput := nil; AddFc0 := nil; AddSilu := nil; AddFc2 := nil;
     if Config.UseAddEmbedding then
     begin
@@ -76312,6 +76334,15 @@ begin
     LoadLlamaLinearWeights(Reader, TFc2, 'time_embedding.linear_2.weight',
       Config.TimeEmbedDim, Config.TimeEmbedDim, 0, -1, 0,
       'time_embedding.linear_2.bias');
+    // cond_proj rows land in diffusers' [cos|sin] order; TSin is [sin|cos], so
+    // the two row halves swap neurons (its input is [sin|cos] as diffusers').
+    if CondProj <> nil then
+    begin
+      LoadLlamaLinearWeights(Reader, CondProj, 'time_embedding.cond_proj.weight',
+        Config.TimeCondProjDim, half, half, d0, 0, '', 1.0, 0, 0, d0);
+      LoadLlamaLinearWeights(Reader, CondProj, 'time_embedding.cond_proj.weight',
+        Config.TimeCondProjDim, half, 0, d0, 0, '', 1.0, 0, half, d0);
+    end;
 
     // SDXL add_embedding MLP. Both layers are plain nn.Linear -- NO column swap:
     // the sinusoidal time_ids expansion (and its [cos|sin] order) is done on the
@@ -76511,11 +76542,12 @@ begin
 end;
 
 // First TNNetInput index of the control/adapter skip inputs. They follow the
-// latent(#0)/timestep(#1)/text(#2) inputs, and -- when SDXL add_embedding is on
-// -- the add_embeds input (#3). So the base is 3 (or 4 with add_embedding).
+// latent(#0)/timestep(#1)/text(#2) inputs, the LCM guidance input and the SDXL
+// add_embeds input (each when built, in that order).
 function SDUNetSkipInputBase(const Config: TSDUNetConfig): integer;
 begin
   Result := 3;
+  if Config.TimeCondProjDim > 0 then Inc(Result);
   if Config.UseAddEmbedding then Inc(Result);
 end;
 
@@ -76545,7 +76577,7 @@ begin
     ImportError('SDUNetFillAddEmbeds: pooled text size ' +
       IntToStr(PooledText.Size) + ' <> AdditionEmbedTextDim ' +
       IntToStr(Config.AdditionEmbedTextDim) + '.');
-  AddIn := SDUNetNthInput(Net, 3);
+  AddIn := SDUNetNthInput(Net, SDUNetSkipInputBase(Config) - 1);
   Vec := AddIn.Output;
   if Vec.Size <> Config.AddEmbedsInputDim then
     ImportError('SDUNetFillAddEmbeds: add_embeds input size ' +
@@ -76628,6 +76660,8 @@ begin
   Result.IPKeyTokens := nil;
   Result.IPValueTokens := nil;
   Result.ControlMid := nil;
+  Result.GuidanceScale := nil;
+  if Config.TimeCondProjDim > 0 then Result.GuidanceScale := Inputs[3];
   if WithIPAdapter then
   begin
     Result.IPKeyTokens := Inputs[NextInput];
@@ -76639,6 +76673,13 @@ begin
   SetLength(Result.ControlDown, ControlDownCount);
   TakeInputs(Result.ControlDown);
   if WithControl then Result.ControlMid := Inputs[NextInput];
+end;
+
+procedure SDUNetFillGuidanceScale(const Inputs: TSDUNetConditioningInputs;
+  GuidanceScale: TNeuralFloat);
+begin
+  if Assigned(Inputs.GuidanceScale) then
+    Inputs.GuidanceScale.Output.FData[0] := (GuidanceScale - 1) * 1000;
 end;
 
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
@@ -93247,7 +93288,9 @@ begin
     (ClassName = 'StableDiffusionAdapterPipeline') or
     (ClassName = 'StableDiffusionInpaintPipeline') or
     (ClassName = 'StableDiffusionImg2ImgPipeline') or
-    (ClassName = 'StableDiffusionInstructPix2PixPipeline');
+    (ClassName = 'StableDiffusionInstructPix2PixPipeline') or
+    (ClassName = 'LatentConsistencyModelPipeline') or
+    (ClassName = 'LatentConsistencyModelImg2ImgPipeline');
 end;
 
 constructor TStableDiffusionPipeline.Create(const ModelFolder: string);
@@ -93721,6 +93764,12 @@ begin
   Result := Length(FLoRAFiles);
 end;
 
+function TStableDiffusionPipeline.GetCFGGuidanceScale(): TNeuralFloat;
+begin
+  if FUNetConfig.TimeCondProjDim > 0 then Result := 1
+  else Result := FGuidanceScale;
+end;
+
 procedure TStableDiffusionPipeline.SetSampler(Value: TNNetSamplerMethod);
 begin
   if (Value = smLCM) and not (FScheduler is TNNetLCMScheduler) then
@@ -94089,7 +94138,7 @@ begin
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
       IntToStr(Latents.Depth) + ' do not match a ' + IntToStr(Width) +
       'x' + IntToStr(Height) + ' image.');
-  IsGuided := StepConditioner.IsGuided(FGuidanceScale);
+  IsGuided := StepConditioner.IsGuided(CFGGuidanceScale);
   if IsGuided and not FHasNegativePromptEmbeds then
   begin
     EncodeTokenIdLists([TokenizePrompt(FNegativePrompt)],
@@ -94177,6 +94226,7 @@ begin
     FUNetInputs.ControlDown[InputPos].Output.Fill(0);
   if Assigned(FUNetInputs.ControlMid) then
     FUNetInputs.ControlMid.Output.Fill(0);
+  SDUNetFillGuidanceScale(FUNetInputs, FGuidanceScale);
   MaxConditionerPos := High(FPassConditioners);
   for ConditionerPos := 0 to MaxConditionerPos do
     FPassConditioners[ConditionerPos].FillUNetInputs(FUNetInputs, Latents,
@@ -94237,7 +94287,7 @@ begin
   PromptEmbeds := TNNetVolume.Create();
   try
     ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
-    if (FGuidanceScale > 1) and not FHasNegativePromptEmbeds then
+    if (CFGGuidanceScale > 1) and not FHasNegativePromptEmbeds then
     begin
       EncodeTokenIdLists([TokenizePrompt(Prompt),
         TokenizePrompt(FNegativePrompt)], [PromptEmbeds, FNegativePromptEmbeds]);
@@ -94314,11 +94364,11 @@ procedure TStableDiffusionConditioner.PredictGuidedNoise(UNet: TNNet;
 begin
   PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
     [sdpiPrompt, sdpiImage], Pred);
-  if not IsGuided(FPipeline.GuidanceScale) then exit;
+  if not IsGuided(FPipeline.CFGGuidanceScale) then exit;
   PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [],
     FGuidancePreds[0]);
   TNNetDiffusionScheduler.ApplyCFG(Pred, FGuidancePreds[0], Pred,
-    FPipeline.GuidanceScale);
+    FPipeline.CFGGuidanceScale);
 end;
 
 procedure TStableDiffusionConditioner.StartLoadPhase();
@@ -95309,7 +95359,7 @@ var
 begin
   PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
     [sdpiPrompt, sdpiImage], Pred);
-  GuidanceScale := FPipeline.GuidanceScale;
+  GuidanceScale := FPipeline.CFGGuidanceScale;
   if not IsGuided(GuidanceScale) then exit;
   ImagePred := FGuidancePreds[0];
   UncondPred := FGuidancePreds[1];

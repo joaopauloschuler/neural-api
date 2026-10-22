@@ -48,6 +48,19 @@ transformers class (nothing downloaded), saved with the real folder layout:
     grid and every step runs (StableDiffusionImg2ImgPipeline's get_timesteps
     cut is bypassed). Per-step noise (step_noise) and the image's VAE sample
     noise are injected; latents_after, timesteps and the decoded image per case.
+  tests/fixtures/tiny_sd15_lcm_distilled/{model_index.json,
+                                          scheduler/scheduler_config.json, unet/}
+    an LCM-distilled pico UNet: tiny_sd15's UNet weights plus a random
+    time_embedding.cond_proj (time_cond_proj_dim LCM_COND_PROJ_DIM), an
+    LCMScheduler, model_index LatentConsistencyModelPipeline. text_encoder/,
+    tokenizer/ and vae/ are tiny_sd15's and not copied (tests assemble the
+    folder).
+  tests/fixtures/tiny_sd15_lcm_distilled_io.json
+    LatentConsistencyModelPipeline (one UNet pass per step, guidance embedded)
+    for LCM_STEPS steps at LCM_DISTILLED_GUIDANCE and 1.0, and
+    LatentConsistencyModelImg2ImgPipeline at strength LCM_STRENGTH, with the
+    same noise injection as the LCM file; unet_check is one UNet call
+    (timestep_cond = the guidance-scale embedding) on the initial latents.
 
 The pipeline is reloaded from the saved folder and run in float64, latents
 passed explicitly so torch's RNG does not matter.
@@ -60,24 +73,28 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --nonsquare-only
   python tools/make_pico_sd_pipeline_fixture.py --oddsize-only
   python tools/make_pico_sd_pipeline_fixture.py --lcm-only
+  python tools/make_pico_sd_pipeline_fixture.py --lcm-distilled-only
 (--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only keep the
 committed folder and rewrite only the sampler / non-square / odd-size / LCM
-file.)
+file; --lcm-distilled-only rewrites the distilled UNet folder and its file.)
 """
 import json
 import math
 import os
 import shutil
 import sys
+import tempfile
 from collections import Counter
 
 import torch
 from safetensors.torch import load_file, save_file
 from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
-                       EulerDiscreteScheduler, LCMScheduler, PNDMScheduler,
+                       EulerDiscreteScheduler, LatentConsistencyModelImg2ImgPipeline,
+                       LatentConsistencyModelPipeline, LCMScheduler, PNDMScheduler,
                        StableDiffusionImg2ImgPipeline, StableDiffusionPipeline,
                        UNet2DConditionModel)
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
+import diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_img2img as lcm_img2img_module
 import diffusers.schedulers.scheduling_lcm as lcm_module
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
@@ -89,6 +106,8 @@ SAMPLERS_FILE = os.path.join(FIXTURES, "tiny_sd15_samplers_io.json")
 NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_nonsquare_io.json")
 ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_oddsize_io.json")
 LCM_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_io.json")
+LCM_DISTILLED_DIR = os.path.join(FIXTURES, "tiny_sd15_lcm_distilled")
+LCM_DISTILLED_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_distilled_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -104,6 +123,9 @@ GUIDANCE = 7.5
 LCM_STEPS = 4
 LCM_GUIDANCE = 1.5
 LCM_STRENGTH = 0.5
+LCM_COND_PROJ_DIM = 16
+LCM_DISTILLED_GUIDANCE = 8.5    # LatentConsistencyModelPipeline's default
+LCM_UNET_CHECK_TIMESTEP = 499
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -479,7 +501,107 @@ def make_lcm_oracle():
         json.dump(payload, f)
 
 
+def build_lcm_distilled_folder(folder):
+    """Saves the full LatentConsistencyModelPipeline to folder; copies the
+    scheduler, unet and model_index into LCM_DISTILLED_DIR."""
+    torch.manual_seed(SEED + 50)
+    base = StableDiffusionPipeline.from_pretrained(PICO_DIR, safety_checker=None)
+    config = dict(base.unet.config)
+    config["time_cond_proj_dim"] = LCM_COND_PROJ_DIM
+    unet = UNet2DConditionModel.from_config(config)
+    missing, unexpected = unet.load_state_dict(base.unet.state_dict(), strict=False)
+    assert missing == ["time_embedding.cond_proj.weight"] and not unexpected, missing
+    pipe = LatentConsistencyModelPipeline(
+        vae=base.vae, text_encoder=base.text_encoder, tokenizer=base.tokenizer,
+        unet=unet, scheduler=LCMScheduler.from_config(base.scheduler.config),
+        safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+    pipe.save_pretrained(folder, safe_serialization=True)
+    if os.path.isdir(LCM_DISTILLED_DIR):
+        shutil.rmtree(LCM_DISTILLED_DIR)
+    os.makedirs(LCM_DISTILLED_DIR)
+    shutil.copy(os.path.join(folder, "model_index.json"), LCM_DISTILLED_DIR)
+    for component in ("scheduler", "unet"):
+        shutil.copytree(os.path.join(folder, component),
+                        os.path.join(LCM_DISTILLED_DIR, component))
+
+
+def make_lcm_distilled_oracle():
+    generator = torch.Generator().manual_seed(SEED + 60)
+    grid = IMAGE_SIZE // 2
+    noise = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+    step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(LCM_STEPS)]
+    init_image = torch.randint(0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE),
+                               generator=generator).to(torch.float64) / 255.0
+    pending_step_noise = []
+    lcm_module.randn_tensor = lambda *args, **kwargs: pending_step_noise.pop(0).clone()
+    lcm_img2img_module.randn_tensor = lambda *args, **kwargs: noise.clone()
+    lcm_img2img_module.retrieve_latents = (
+        lambda output, generator=None, sample_mode="sample":
+        output.latent_dist.mean + output.latent_dist.std * image_noise)
+    with tempfile.TemporaryDirectory() as folder:
+        build_lcm_distilled_folder(folder)
+        cases = []
+        for name, guidance, strength in (
+                ("text2img", LCM_DISTILLED_GUIDANCE, None),
+                ("text2img_w0", 1.0, None),
+                ("img2img_strength", LCM_DISTILLED_GUIDANCE, LCM_STRENGTH)):
+            pipe_class = (LatentConsistencyModelPipeline if strength is None
+                          else LatentConsistencyModelImg2ImgPipeline)
+            pipe = pipe_class.from_pretrained(folder, torch_dtype=torch.float64,
+                                              safety_checker=None)
+            pipe.set_progress_bar_config(disable=True)
+            extra = {"height": IMAGE_SIZE, "width": IMAGE_SIZE, "latents": noise.clone()}
+            if strength is not None:
+                extra = {"image": init_image, "strength": strength}
+            pending_step_noise[:] = step_noise
+            after = []
+
+            def on_step_end(_pipe, _step, _t, kwargs):
+                after.append(rounded(chw(kwargs["latents"][0])))
+                return kwargs
+            result = pipe(PROMPT, num_inference_steps=LCM_STEPS, guidance_scale=guidance,
+                          output_type="np", callback_on_step_end=on_step_end, **extra)
+            assert len(pending_step_noise) == 1, name
+            cases.append({"name": name, "guidance_scale": guidance,
+                          "strength": 1.0 if strength is None else strength,
+                          "timesteps": [int(t) for t in pipe.scheduler.timesteps],
+                          "latents_after": after,
+                          "image": rounded(result.images[0].tolist())})
+            print("LCM distilled", name, cases[-1]["timesteps"])
+        pipe = LatentConsistencyModelPipeline.from_pretrained(
+            folder, torch_dtype=torch.float64, safety_checker=None)
+        prompt_embeds, _ = pipe.encode_prompt(PROMPT, "cpu", 1, False, None)
+        w_embedding = pipe.get_guidance_scale_embedding(
+            torch.tensor([LCM_DISTILLED_GUIDANCE - 1.0]), LCM_COND_PROJ_DIM,
+            torch.float64)
+        with torch.no_grad():
+            output = pipe.unet(noise, LCM_UNET_CHECK_TIMESTEP,
+                               timestep_cond=w_embedding,
+                               encoder_hidden_states=prompt_embeds).sample
+            plain = pipe.unet(noise, LCM_UNET_CHECK_TIMESTEP,
+                              encoder_hidden_states=prompt_embeds).sample
+        print("cond embedding moves the UNet output by",
+              float((output - plain).abs().max()))
+    payload = {"width": IMAGE_SIZE, "height": IMAGE_SIZE, "steps": LCM_STEPS,
+               "prompt": PROMPT, "time_cond_proj_dim": LCM_COND_PROJ_DIM,
+               "init_image": rounded(init_image[0].permute(1, 2, 0).tolist()),
+               "latents": rounded(chw(noise[0])),
+               "image_sample_noise": rounded(chw(image_noise[0])),
+               "step_noise": [rounded(chw(item[0])) for item in step_noise],
+               "unet_check": {"timestep": LCM_UNET_CHECK_TIMESTEP,
+                              "guidance_scale": LCM_DISTILLED_GUIDANCE,
+                              "output": rounded(chw(output[0]))},
+               "cases": cases}
+    with open(LCM_DISTILLED_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--lcm-distilled-only" in sys.argv:
+        make_lcm_distilled_oracle()
+        sys.exit(0)
     if "--lcm-only" in sys.argv:
         make_lcm_oracle()
         sys.exit(0)
@@ -496,3 +618,4 @@ if __name__ == "__main__":
     make_nonsquare_oracle()
     make_oddsize_oracle()
     make_lcm_oracle()
+    make_lcm_distilled_oracle()

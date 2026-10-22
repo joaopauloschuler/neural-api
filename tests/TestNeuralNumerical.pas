@@ -14141,6 +14141,7 @@ end;
 // per Ho et al. 2020 (DDPM). Forward test verifies:
 //   t=0 -> sin half = 0, cos half = 1.
 //   t=5 -> matches the closed-form freq[i] = exp(-ln(MaxPeriod)*i/half).
+//   DownscaleFreqShift 1 at t=500 -> freq[i] = exp(-ln(MaxPeriod)*i/(half-1)).
 // ---------------------------------------------------------------------------
 procedure TTestNeuralNumerical.TestSinusoidalTimeEmbeddingForward;
 var
@@ -14184,6 +14185,22 @@ begin
       AssertEquals('TimeEmb t=5 cos[' + IntToStr(i) + ']',
         Cos(Angle), NN.GetLastLayer.Output.Raw[Half + i], 1e-5);
     end;
+
+    NN.Free;
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NN.AddLayer(TNNetSinusoidalTimeEmbedding.Create(D, MaxPeriod, 1));
+    t := 500.0;
+    Input.Raw[0] := t;
+    NN.Compute(Input);
+    for i := 0 to Half - 1 do
+    begin
+      Angle := t * Exp(-LogMax * i / (Half - 1));
+      AssertEquals('TimeEmb shift 1 sin[' + IntToStr(i) + ']',
+        Sin(Angle), NN.GetLastLayer.Output.Raw[i], 1e-4);
+      AssertEquals('TimeEmb shift 1 cos[' + IntToStr(i) + ']',
+        Cos(Angle), NN.GetLastLayer.Output.Raw[Half + i], 1e-4);
+    end;
   finally
     NN.Free;
     Input.Free;
@@ -14197,14 +14214,14 @@ var
   Saved: string;
   D, i: integer;
 begin
-  // Non-default MaxPeriod=1000 to confirm both FStruct[0] (EmbeddingSize)
-  // and FStruct[1] (MaxPeriod) survive Save/Load.
+  // Non-default MaxPeriod=1000 and DownscaleFreqShift=1 confirm FStruct[0..2]
+  // survive Save/Load.
   D := 8;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(1, 1, 1);
   try
     NN.AddLayer(TNNetInput.Create(1, 1, 1, 1));
-    NN.AddLayer(TNNetSinusoidalTimeEmbedding.Create(D, 1000));
+    NN.AddLayer(TNNetSinusoidalTimeEmbedding.Create(D, 1000, 1));
     Input.Raw[0] := 3.0;
     NN.Compute(Input);
     Saved := NN.SaveToString();

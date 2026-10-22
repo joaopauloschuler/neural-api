@@ -13,7 +13,9 @@ The scheduler config gives the betas, timestep spacing and prediction type,
 and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a,
 DPM-Solver++ 2M or LCM; other classes run DDIM). --sampler overrides it.
 --sampler lcm with an LCM-LoRA (--lora, e.g. latent-consistency/
-lcm-lora-sdv1-5) samples in 2-8 steps (default 4, guidance 1.0).
+lcm-lora-sdv1-5) samples in 2-8 steps (default 4, guidance 1.0). An
+LCM-distilled folder (SimianLuo/LCM_Dreamshaper_v7) needs no LoRA: its UNet
+embeds the guidance (default 8.5) and runs one pass per step.
 
 Each component is loaded when its stage starts and freed when it ends, so
 only one is in memory at a time. --repeat N > 1 makes N images from one
@@ -78,7 +80,8 @@ type
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
-    // Steps -1 / GuidanceScale < 0: the sampler's default (LCM: 4 / 1.0).
+    // Steps -1 / GuidanceScale < 0: the sampler's default (LCM: 4 / 1.0;
+    // an LCM-distilled UNet: 4 / 8.5).
     Steps, ImageWidth, ImageHeight, RepeatCount: integer;
     GuidanceScale: double;
     Seed: cardinal;
@@ -183,7 +186,8 @@ begin
   WriteLn('  --steps N         denoising steps (default 25; 4 with lcm)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5, ',
     '1.0 with lcm;');
-  WriteLn('                    <= 1 turns it off)');
+  WriteLn('                    <= 1 turns it off); an LCM-distilled UNet ',
+    'embeds it (default 8.5)');
   WriteLn('  --width N         image width (default: the checkpoint''s, ',
     '512 for SD 1.5)');
   WriteLn('  --height N        image height (default: the checkpoint''s)');
@@ -192,7 +196,8 @@ begin
   WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
   WriteLn('                    pndm, euler, euler-a, dpm++2m or lcm (Latent ',
     'Consistency;');
-  WriteLn('                    needs an LCM-LoRA via --lora, 2-8 steps)');
+  WriteLn('                    an LCM-LoRA via --lora or an LCM-distilled ',
+    'UNet, 2-8 steps)');
   WriteLn('  --output PNG      output file (default stable_diffusion.png)');
   WriteLn('  --repeat N        N images, seeds --seed, --seed+1, ...; the ',
     'prompt is encoded');
@@ -484,6 +489,9 @@ begin
     if Pipeline.Sampler = smLCM then
     begin
       if StepCount < 1 then StepCount := 4;
+      // diffusers LatentConsistencyModelPipeline's default for distilled UNets.
+      if (GuidanceScale < 0) and (Pipeline.UNetConfig.TimeCondProjDim > 0) then
+        GuidanceScale := 8.5;
       if GuidanceScale < 0 then GuidanceScale := 1.0;
     end
     else
@@ -505,6 +513,8 @@ begin
     WriteLn(Format('Image:    %dx%d, %d steps, guidance %.2f, seed %d, %s',
       [ImageWidth, ImageHeight, StepCount, GuidanceScale, Opt.Seed,
        ComputeText]));
+    if Pipeline.UNetConfig.TimeCondProjDim > 0 then
+      WriteLn('UNet:     LCM-distilled, guidance embedded (one pass per step)');
     if Pipeline.Sampler = smLCM then
       WriteLn('Sampler:  lcm with the ', Pipeline.SchedulerClassName,
         ' config''s betas and the LCM origin timesteps')
