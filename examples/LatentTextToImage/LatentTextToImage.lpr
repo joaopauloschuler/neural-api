@@ -221,7 +221,7 @@ begin
 end;
 
 // Single-pass denoiser wrapper for the LCM few-step driver. TNNetLCMScheduler.
-// LCMSample wants a method-of-object callback (Xt,Output,Tt) that returns the
+// Sample wants a method-of-object callback (Xt,Output,Tt) that returns the
 // raw model output for ONE forward pass -- guidance is baked into a distilled
 // consistency model, so the LCM branch uses ONLY the conditional (prompt) pass,
 // no cond/uncond CFG. This object just closes over the net/config/prompt states.
@@ -435,14 +435,14 @@ begin
     begin
       // LCM few-step path: a SINGLE conditional model pass per step (guidance is
       // baked into a distilled consistency model -- no cond/uncond CFG), driven
-      // by TNNetLCMScheduler.LCMSample over its boundary-scaling consistency
+      // by TNNetLCMScheduler.Sample (smLCM) over its boundary-scaling consistency
       // function. The driver leaves the sampled x0 estimate in Latent.
       LCMDenoiser.Net := PixArtNet;
       LCMDenoiser.Cfg := PixCfg;
       LCMDenoiser.Prompt := TextStates;
       LCMDenoiser.Preview := Preview;
       Preview.Scheduler := LCMScheduler;
-      LCMScheduler.LCMSample(Latent, @LCMDenoiser.Denoise, NumSteps, tsUniform);
+      LCMScheduler.Sample(Latent, @LCMDenoiser.Denoise, NumSteps, smLCM);
       WriteLn('  LCM done in ', NumSteps, ' step(s)  |latent|=',
         Latent.GetMagnitude():0:4);
     end

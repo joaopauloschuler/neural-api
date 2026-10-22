@@ -59,7 +59,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, Math, neuralvolume;
+  Classes, SysUtils, Math, fpjson, neuralvolume;
 
 type
   // Beta schedule families.
@@ -105,8 +105,11 @@ type
   //     Euler in sigma-space. Samples stay in the VP scale x_t = y/sqrt(sigma^2+1)
   //     that diffusers' scale_model_input feeds the model; InitialNoiseScale is
   //     the matching init_noise_sigma. For eps-prediction it equals DDIM.
+  //   smLCM : diffusers LCMScheduler (Latent Consistency Models): the
+  //     consistency step of TNNetLCMScheduler over its origin-grid timesteps.
+  //     Only a TNNetLCMScheduler runs it; the base class raises.
   TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
-    smUniPC, smHeun, smPNDM, smEuler);
+    smUniPC, smHeun, smPNDM, smEuler, smLCM);
 
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
@@ -213,6 +216,9 @@ type
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
+    // CreateFromDiffusersConfig hands the parsed config here after Create, so a
+    // descendant reads its own keys.
+    procedure ReadDiffusersConfig(Config: TJSONObject); virtual;
   public
     // Build a list of NumSteps+1 timesteps (descending, last entry 0 = clean
     // image) using the requested spacing. Caller-owned dynamic array.
@@ -227,7 +233,12 @@ type
     // Calls ResetMultistep. Pairs Schedule[k] -> Schedule[k+1] drive Step.
     function BuildSamplerSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
-      TNeuralIntegerArray;
+      TNeuralIntegerArray; virtual;
+    // The img2img/inpaint schedule at Strength, Schedule[0] the start: here
+    // BuildSamplerSchedule from the Img2ImgStartStep entry on (get_timesteps).
+    function BuildImg2ImgSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+      Strength: double): TNeuralIntegerArray; virtual;
     // diffusers SD img2img/inpaint get_timesteps: the first schedule entry that
     // runs at Strength, N - min(int(N * Strength), N); raises when no step runs.
     class function Img2ImgStartStep(NumSteps: integer;
@@ -274,6 +285,7 @@ type
     // given it receives the sampled noise (the eps training target). When
     // PreSampledNoise is supplied that noise is used (and copied to NoiseOut)
     // instead of drawing fresh Gaussian samples -- handy for deterministic tests.
+    // Xt may alias X0.
     procedure AddNoise(X0, Xt: TNNetVolume; Tt: integer;
       NoiseOut: TNNetVolume = nil; PreSampledNoise: TNNetVolume = nil);
 
@@ -306,11 +318,11 @@ type
     // scales the injected ancestral noise (Eta=1 = the standard "Euler a";
     // Eta=0 reduces it to a deterministic Euler step). smEuler ignores Eta.
     // smPNDM ignores TtPrev once BuildSamplerSchedule set its stride.
-    // Noise (smEulerAncestral only) supplies the standard-normal draw instead
+    // Noise (smEulerAncestral, smLCM) supplies the standard-normal draw instead
     // of RandG, e.g. to replay another implementation's noise.
     procedure Step(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer;
       Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0;
-      Noise: TNNetVolume = nil);
+      Noise: TNNetVolume = nil); virtual;
 
     // Per-timestep noise level sigma_t = sqrt((1-ab_t)/ab_t) (Karras VE form).
     property SigmaAt[Tt: integer]: TNeuralFloat read SigmaOf;
@@ -337,41 +349,61 @@ type
 
   { TNNetLCMScheduler }
   // Latent Consistency Model (LCM) few-step sampler (Luo et al. 2023,
-  // arXiv:2310.04378). Unlike the iterative noise-prediction integrators (DDIM /
-  // DPM++ / Euler) it does NOT integrate the probability-flow ODE step by step;
-  // instead it evaluates a learned CONSISTENCY function f(x_t,t) that maps any
-  // noised latent DIRECTLY toward the clean solution x0, parameterized with the
-  // standard boundary scalings c_skip(t), c_out(t) (sigma_data=0.5):
-  //   f(x,t) = c_skip(t)*x + c_out(t)*x0_hat,
-  //   c_skip(t) = sigma_data^2 / ((t/0.1)^2 + sigma_data^2),
-  //   c_out(t)  = (t/0.1)*sigma_data / sqrt((t/0.1)^2 + sigma_data^2),
-  // where x0_hat is the model's x0 prediction (eps/v converted via the inherited
-  // shared plumbing -- the LCM sampler consumes the SAME raw model output the
-  // other samplers do). Generation is a SMALL number of steps (1-4): predict x0
-  // via f, then re-noise x0 forward to the NEXT (smaller) timestep with the
-  // inherited AddNoise using fresh Gaussian noise, repeat. Guidance is BAKED IN
-  // (the distilled consistency model already absorbed CFG), so there is no
-  // cond/uncond double pass per step. All schedule tables (alpha-bar/sigma) and
-  // the timestep-schedule builder are inherited unchanged.
+  // arXiv:2310.04378), diffusers LCMScheduler. Each step evaluates the
+  // consistency function f(x_t,t) = c_skip(t)*x_t + c_out(t)*x0_hat, with
+  // x0_hat the model's x0 prediction (eps/v through PredictX0) and, at the
+  // diffusers timestep t = Tt - 1 scaled by TimestepScaling (s, default 10):
+  //   c_skip(t) = sigma_data^2 / ((s*t)^2 + sigma_data^2), sigma_data = 0.5,
+  //   c_out(t)  = s*t / sqrt((s*t)^2 + sigma_data^2),
+  // then re-noises f to the next timestep with fresh Gaussian noise; the last
+  // step returns f. Sample/Step/BuildSamplerSchedule run it as Method smLCM over
+  // the origin grid: k*i - 1, k = T div OriginalInferenceSteps (4 of 50 steps:
+  // diffusers 999, 759, 499, 259). Other methods run the inherited samplers.
   // Coded by Claude (AI).
   TNNetLCMScheduler = class(TNNetDiffusionScheduler)
+  private
+    FOriginalInferenceSteps: integer;
+    FTimestepScaling: TNeuralFloat;
+  protected
+    // original_inference_steps and timestep_scaling.
+    procedure ReadDiffusersConfig(Config: TJSONObject); override;
   public
-    // Boundary scalings at (integer) timestep Tt with sigma_data=0.5. At the
-    // largest Tt c_skip -> small and c_out -> ~sigma_data; at Tt->0 c_skip -> 1
-    // and c_out -> 0 (the consistency boundary condition f(x,0)=x).
+    constructor Create(pT: integer; pSchedule: TNNetBetaSchedule = dsLinear;
+      pPrediction: TNNetPredictionType = dpEps;
+      Beta1: TNeuralFloat = 1.0e-4; BetaT: TNeuralFloat = 0.02;
+      CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false;
+      pFinalAlphaBarIsOne: boolean = true);
+    // Boundary scalings at the 1-based timestep Tt: c_skip(1) = 1, c_out(1) = 0
+    // (f(x,0) = x at diffusers t = 0); c_out -> 1 at large Tt.
     function CSkip(Tt: integer): TNeuralFloat;
     function COut(Tt: integer): TNeuralFloat;
-    // ONE consistency step: evaluate f(Xt,Tt) IN PLACE into Xt, writing the
-    // consistency-mapped clean-image estimate x0_consistent. RawPred is the raw
-    // model output (eps or v) at Tt. After this Xt holds the f-estimate of x0.
+    // ONE consistency evaluation in place: Xt := f(Xt, Tt). RawPred is the raw
+    // model output (eps or v) at Tt.
     procedure LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
-    // High-level few-step driver. X starts as N(0,I) noise (text->image) or a
-    // partially-noised latent. Runs NumSteps (typically 1-4) consistency steps
-    // over the inherited timestep schedule: at each step predict x0 via f, and
-    // (unless it is the last step) re-noise that x0 forward to the NEXT, smaller
-    // timestep with fresh Gaussian noise. Leaves the sampled x0 in X.
-    procedure LCMSample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
-      NumSteps: integer = 4; Spacing: TNNetTimestepSpacing = tsUniform);
+    // diffusers LCMScheduler.set_timesteps(NumSteps, strength): NumSteps of the
+    // first int(OriginalInferenceSteps * Strength) origin points as Tt, then 0.
+    function BuildOriginSchedule(NumSteps: integer;
+      Strength: double = 1.0): TNeuralIntegerArray;
+    // smLCM: BuildOriginSchedule; Spacing does not apply (diffusers ignores
+    // timestep_spacing too). Other methods: inherited.
+    function BuildSamplerSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
+      TNeuralIntegerArray; override;
+    // smLCM: the origin grid scaled by Strength, every one of NumSteps run.
+    function BuildImg2ImgSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+      Strength: double): TNeuralIntegerArray; override;
+    // smLCM: LCMStep, then (TtPrev > 0) Xt := sqrt(ab_TtPrev)*Xt +
+    // sqrt(1-ab_TtPrev)*(Noise, or RandG when nil). Other methods: inherited.
+    procedure Step(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer;
+      Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0;
+      Noise: TNNetVolume = nil); override;
+    // diffusers original_inference_steps (50): the origin grid size.
+    property OriginalInferenceSteps: integer read FOriginalInferenceSteps
+      write FOriginalInferenceSteps;
+    // diffusers timestep_scaling (10) of the boundary scalings.
+    property TimestepScaling: TNeuralFloat read FTimestepScaling
+      write FTimestepScaling;
   end;
 
   { TNNetAdaptiveProjectedGuidance }
@@ -591,7 +623,8 @@ type
 // The sampler for a diffusers scheduler_config.json (its text) by _class_name:
 // DDIMScheduler -> smDDIM, PNDMScheduler -> smPNDM, EulerDiscreteScheduler ->
 // smEuler, EulerAncestralDiscreteScheduler -> smEulerAncestral (eta 1),
-// DPMSolverMultistepScheduler -> smDPMSolverPP2M. Any other class samples with
+// DPMSolverMultistepScheduler -> smDPMSolverPP2M, LCMScheduler -> smLCM (needs
+// a TNNetLCMScheduler). Any other class samples with
 // smDDIM: its betas, spacing and prediction type still load, so it stays
 // usable. Notice is '' or says what differs from the named scheduler (the
 // fallback, or options such as use_karras_sigmas this unit does not implement).
@@ -675,7 +708,7 @@ type
 implementation
 
 uses
-  fpjson, jsonparser;
+  jsonparser;
 
 const
   // Stand-in for an alpha_bar of exactly 0 in reciprocals (diffusers uses 2**-24).
@@ -840,10 +873,15 @@ begin
       Obj.Get('set_alpha_to_one', true));
     FConfigSpacing := Spacing;
     FStepsOffset := Obj.Get('steps_offset', 0);
+    ReadDiffusersConfig(Obj);
   finally
     Root.Free;
     JsonText.Free;
   end;
+end;
+
+procedure TNNetDiffusionScheduler.ReadDiffusersConfig(Config: TJSONObject);
+begin
 end;
 
 destructor TNNetDiffusionScheduler.Destroy;
@@ -1208,7 +1246,7 @@ begin
     end
     else
     begin
-      Xt.Copy(X0);
+      if Xt <> X0 then Xt.Copy(X0);
       Xt.Mul(sab);
       Xt.MulAdd(somab, PreSampledNoise);
     end;
@@ -1328,6 +1366,8 @@ var
   invSqrtAbT, somabT, cA, cB, kX, kD: TNeuralFloat;
   kA, cE, kZ: TNeuralFloat;    // per-step affine coeffs for the sampler loops (#5)
 begin
+  if Method = smLCM then
+    raise Exception.Create('Step: smLCM needs a TNNetLCMScheduler.');
   // Persistent lazily-sized eps scratch (rule #17). Step and PredictX0 never
   // run nested, so they safely share FEpsScratch.
   if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
@@ -1753,6 +1793,9 @@ var
   k, Tt, MaxStepPos, LeadingStride: integer;
   LinspaceStep: double;
 begin
+  if Method = smLCM then
+    raise Exception.Create('BuildSamplerSchedule: smLCM needs a ' +
+      'TNNetLCMScheduler.');
   ResetMultistep;
   FPndmStride := 0;
   if NumSteps < 1 then NumSteps := 1;
@@ -1789,6 +1832,17 @@ begin
       for k := NumSteps + 1 downto 2 do Result[k] := Result[k - 1];
     end;
   end;
+end;
+
+function TNNetDiffusionScheduler.BuildImg2ImgSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+  Strength: double): TNeuralIntegerArray;
+var
+  StartStep: integer;
+begin
+  Result := BuildSamplerSchedule(NumSteps, Spacing, Method);
+  StartStep := Img2ImgStartStep(NumSteps, Strength);
+  Result := Copy(Result, StartStep, Length(Result) - StartStep);
 end;
 
 class function TNNetDiffusionScheduler.Img2ImgStartStep(NumSteps: integer;
@@ -2200,81 +2254,123 @@ end;
 
 const
   cLCMSigmaData = 0.5;   // sigma_data in the LCM boundary scalings.
-  cLCMTimeScale = 0.1;   // the 1/0.1 = 10x timestep scaling (Luo et al. 2023).
+
+constructor TNNetLCMScheduler.Create(pT: integer; pSchedule: TNNetBetaSchedule;
+  pPrediction: TNNetPredictionType; Beta1: TNeuralFloat; BetaT: TNeuralFloat;
+  CosineS: TNeuralFloat; pRescaleZeroTerminalSNR: boolean;
+  pFinalAlphaBarIsOne: boolean);
+begin
+  inherited Create(pT, pSchedule, pPrediction, Beta1, BetaT, CosineS,
+    pRescaleZeroTerminalSNR, pFinalAlphaBarIsOne);
+  FOriginalInferenceSteps := 50;
+  FTimestepScaling := 10;
+end;
+
+procedure TNNetLCMScheduler.ReadDiffusersConfig(Config: TJSONObject);
+begin
+  FOriginalInferenceSteps := Config.Get('original_inference_steps', 50);
+  FTimestepScaling := Config.Get('timestep_scaling', 10.0);
+end;
 
 function TNNetLCMScheduler.CSkip(Tt: integer): TNeuralFloat;
-var ts2, sd2: double;
+var
+  ScaledT2, SigmaData2: double;
 begin
-  // c_skip(t) = sigma_data^2 / ((t/0.1)^2 + sigma_data^2).
-  ts2 := Sqr(Tt / cLCMTimeScale);
-  sd2 := Sqr(cLCMSigmaData);
-  Result := sd2 / (ts2 + sd2);
+  ScaledT2 := Sqr(double(Tt - 1) * FTimestepScaling);
+  SigmaData2 := Sqr(cLCMSigmaData);
+  Result := SigmaData2 / (ScaledT2 + SigmaData2);
 end;
 
 function TNNetLCMScheduler.COut(Tt: integer): TNeuralFloat;
-var ts, sd2: double;
+var
+  ScaledT: double;
 begin
-  // c_out(t) = (t/0.1)*sigma_data / sqrt((t/0.1)^2 + sigma_data^2).
-  ts := Tt / cLCMTimeScale;
-  sd2 := Sqr(cLCMSigmaData);
-  Result := ts * cLCMSigmaData / Sqrt(Sqr(ts) + sd2);
+  ScaledT := double(Tt - 1) * FTimestepScaling;
+  Result := ScaledT / Sqrt(Sqr(ScaledT) + Sqr(cLCMSigmaData));
 end;
 
 procedure TNNetLCMScheduler.LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
 var
-  cs, co: TNeuralFloat;
-  X0Hat: TNNetVolume;
+  SkipCoef, OutCoef: TNeuralFloat;
 begin
-  // f(x,t) = c_skip(t)*x + c_out(t)*x0_hat. x0_hat reuses the shared eps/v->x0
-  // plumbing so LCM consumes the SAME raw model output the iterative samplers do.
-  cs := CSkip(Tt);
-  co := COut(Tt);
+  SkipCoef := CSkip(Tt);
+  OutCoef := COut(Tt);
   // Persistent lazily-sized x0_hat scratch (rule #17); PredictX0 uses the
   // separate FEpsScratch internally, so the two never collide.
   if not Assigned(FX0HatScratch) then FX0HatScratch := TNNetVolume.Create(Xt)
   else FX0HatScratch.ReSize(Xt);
-  X0Hat := FX0HatScratch;
-  PredictX0(Xt, RawPred, X0Hat, Tt);
-  // Xt := cs*Xt + co*X0Hat (rule #13); X0Hat is a distinct scratch.
-  Xt.Mul(cs);
-  Xt.MulAdd(co, X0Hat);
+  PredictX0(Xt, RawPred, FX0HatScratch, Tt);
+  Xt.Mul(SkipCoef);
+  Xt.MulAdd(OutCoef, FX0HatScratch);
 end;
 
-procedure TNNetLCMScheduler.LCMSample(X: TNNetVolume;
-  Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
+function TNNetLCMScheduler.BuildOriginSchedule(NumSteps: integer;
+  Strength: double): TNeuralIntegerArray;
 var
-  k, Tt, TtNext: integer;
-  NumStepsM1: integer;
-  Pred, X0: TNNetVolume;
-  Schedule: TNeuralIntegerArray;
+  GridStride, OriginCount, MaxStepPos, StepPos, OriginPos: integer;
+  OriginPerStep: double;
 begin
-  if NumSteps < 1 then NumSteps := 1;
-  NumStepsM1 := NumSteps - 1;
-  // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
-  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
-  Pred := TNNetVolume.Create(X);
-  X0   := TNNetVolume.Create(X);
-  try
-    for k := 0 to NumStepsM1 do
-    begin
-      Tt := Schedule[k];
-      TtNext := Schedule[k + 1];
-      // 1. evaluate the consistency function f(x_t,t) -> x0 estimate.
-      Denoise(X, Pred, Tt);
-      LCMStep(X, Pred, Tt);   // X now holds the consistency x0 estimate.
-      if TtNext > 0 then
-      begin
-        // 2. re-noise the x0 estimate FORWARD to the next, smaller timestep with
-        //    fresh Gaussian noise (the LCM multistep "noise back" hop).
-        X0.Copy(X);
-        AddNoise(X0, X, TtNext);
-      end;
-      // On the last step (TtNext=0) X already holds the final x0 estimate.
-    end;
-  finally
-    Pred.Free;
-    X0.Free;
+  if (FOriginalInferenceSteps < 1) or (FOriginalInferenceSteps > FT) then
+    raise Exception.Create('LCM original_inference_steps ' +
+      IntToStr(FOriginalInferenceSteps) + ' is outside 1..' + IntToStr(FT) + '.');
+  if not ((Strength > 0) and (Strength <= 1)) then
+    raise Exception.Create('LCM strength ' + FloatToStr(Strength) +
+      ' is outside (0, 1].');
+  if (NumSteps < 1) or (NumSteps > FOriginalInferenceSteps) then
+    raise Exception.Create('LCM step count ' + IntToStr(NumSteps) +
+      ' is outside 1..' + IntToStr(FOriginalInferenceSteps) +
+      ' (original_inference_steps).');
+  GridStride := FT div FOriginalInferenceSteps;
+  // Double product, so the truncation lands where Python's int() does.
+  OriginCount := Trunc(FOriginalInferenceSteps * Strength);
+  if OriginCount < NumSteps then
+    raise Exception.Create('LCM: ' + IntToStr(NumSteps) + ' steps need at ' +
+      'least that many origin points; strength ' + FloatToStr(Strength) +
+      ' leaves ' + IntToStr(OriginCount) + ' of ' +
+      IntToStr(FOriginalInferenceSteps) + '.');
+  ResetMultistep;
+  Result := nil;
+  SetLength(Result, NumSteps + 1);
+  // numpy floor(linspace(0, OriginCount, NumSteps, endpoint=False)) picks
+  // descending origin entry OriginPos, diffusers t = (OriginCount-OriginPos)*k-1.
+  OriginPerStep := OriginCount / NumSteps;
+  MaxStepPos := NumSteps - 1;
+  for StepPos := 0 to MaxStepPos do
+  begin
+    OriginPos := Floor(StepPos * OriginPerStep);
+    Result[StepPos] := (OriginCount - OriginPos) * GridStride;
   end;
+  Result[NumSteps] := 0;
+end;
+
+function TNNetLCMScheduler.BuildSamplerSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
+  TNeuralIntegerArray;
+begin
+  if Method = smLCM then Result := BuildOriginSchedule(NumSteps)
+  else Result := inherited BuildSamplerSchedule(NumSteps, Spacing, Method);
+end;
+
+function TNNetLCMScheduler.BuildImg2ImgSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+  Strength: double): TNeuralIntegerArray;
+begin
+  if Method = smLCM then Result := BuildOriginSchedule(NumSteps, Strength)
+  else Result := inherited BuildImg2ImgSchedule(NumSteps, Spacing, Method,
+    Strength);
+end;
+
+procedure TNNetLCMScheduler.Step(Xt, RawPred: TNNetVolume; Tt,
+  TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat;
+  Noise: TNNetVolume);
+begin
+  if Method <> smLCM then
+  begin
+    inherited Step(Xt, RawPred, Tt, TtPrev, Method, Eta, Noise);
+    exit;
+  end;
+  LCMStep(Xt, RawPred, Tt);
+  if TtPrev > 0 then AddNoise(Xt, Xt, TtPrev, nil, Noise);
 end;
 
 { TNNetFlowMatchEulerScheduler }
@@ -2827,6 +2923,7 @@ begin
       NoteIfSet('use_beta_sigmas');
       NoteIfNot('final_sigmas_type', 'zero');
     end
+    else if SchedulerClass = 'LCMScheduler' then Result := smLCM
     else
       Note('scheduler "' + SchedulerClass + '" has no sampler here; ' +
         'sampling with DDIM');

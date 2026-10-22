@@ -11896,6 +11896,9 @@ type
     // add_embeds input width = AdditionEmbedTextDim + 6*AdditionTimeEmbedDim,
     // i.e. projection_class_embeddings_input_dim (2816 for SDXL).
     AddEmbedsInputDim: integer;
+    // time_cond_proj_dim of LCM-distilled UNets (the guidance-scale embedding
+    // of time_embedding.cond_proj); 0 = absent. BuildSDUNet refuses it.
+    TimeCondProjDim: integer;
   end;
 
 const
@@ -12200,7 +12203,7 @@ type
     // Before the first step; Latents is the unit noise (grid, latent channels).
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); virtual;
-    // diffusers strength: Denoise runs the last Img2ImgStartStep steps.
+    // diffusers strength: Denoise runs Scheduler.BuildImg2ImgSchedule at it.
     function DenoiseStrength(): double; virtual;
     // True: start from NoiseImageLatents, not from noise. Base: strength < 1.
     function StartsFromImage(): boolean; virtual;
@@ -12231,8 +12234,8 @@ type
   // is built when its stage starts and freed when it ends, unless
   // LoadComponents keeps it. The scheduler config
   // sets betas, spacing and prediction type, and its _class_name the Sampler
-  // (DiffusersSchedulerSampler: DDIM, PNDM, Euler, Euler a, DPM++ 2M; other
-  // classes run DDIM and say so in SamplerNotice).
+  // (DiffusersSchedulerSampler: DDIM, PNDM, Euler, Euler a, DPM++ 2M, LCM;
+  // other classes run DDIM and say so in SamplerNotice).
   // Latents are (Width, Height, latent_channels) / VaeScaleFactor. Coded by Claude (AI).
   TStableDiffusionPipeline = class(TObject)
   private
@@ -12338,6 +12341,9 @@ type
     function GetLoRACount(): integer;
     // Frees the kept UNet and text encoder and the encoded negative embeds.
     procedure LoRAsChanged();
+    // smLCM swaps in a TNNetLCMScheduler of the same scheduler config
+    // (diffusers LCMScheduler.from_config).
+    procedure SetSampler(Value: TNNetSamplerMethod);
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12383,8 +12389,9 @@ type
     // StepCount Sampler steps on Latents in place (unit noise in, scaled by
     // the sampler's init noise sigma; clean out); Conditioner.PredictGuidedNoise
     // runs the UNet passes of each step (CFG when GuidanceScale > 1).
-    // A Conditioner strength < 1 runs only the last steps. Euler a draws its
-    // noise from OnAncestralNoise or the global RNG.
+    // A Conditioner strength < 1 runs only the last steps (LCM: all StepCount
+    // over a shorter origin grid). Euler a and LCM draw their step noise from
+    // OnAncestralNoise or the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
     // VAE latents of VaeImage (W, H, 3) in [-1, 1], (W, H) / VaeScaleFactor:
@@ -12408,9 +12415,10 @@ type
       write SetNegativePrompt;
     property HasNegativePromptEmbeds: boolean read GetHasNegativePromptEmbeds;
     // The update rule; set from the scheduler _class_name, may be overridden.
-    property Sampler: TNNetSamplerMethod read FSampler write FSampler;
+    property Sampler: TNNetSamplerMethod read FSampler write SetSampler;
     // '' or what the config asks for that the Sampler does not do.
     property SamplerNotice: string read FSamplerNotice;
+    // A TNNetLCMScheduler once Sampler is smLCM: setting it frees the old one.
     property Scheduler: TNNetDiffusionScheduler read FScheduler;
     // scheduler_config.json _class_name.
     property SchedulerClassName: string read FSchedulerClassName;
@@ -12429,7 +12437,8 @@ type
       write SetTextEncoderInt8;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
-    // When set, Euler a takes each step's noise from it, not the global RNG.
+    // When set, Euler a and LCM take each step's noise from it, not the global
+    // RNG (LCM ignores the last step's).
     property OnAncestralNoise: TStableDiffusionNoiseEvent
       read FOnAncestralNoise write FOnAncestralNoise;
     // ControlNet / T2I-Adapter / IP-Adapter / img2img / inpainting /
@@ -12718,8 +12727,8 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
   end;
 
-  // diffusers StableDiffusionImg2ImgPipeline: the last Img2ImgStartStep steps
-  // run from the sampled VAE latents of the image noised to the first of them.
+  // diffusers StableDiffusionImg2ImgPipeline: the BuildImg2ImgSchedule steps run
+  // from the sampled VAE latents of the image noised to the first of them.
   TStableDiffusionImg2Img = class(TStableDiffusionImageConditioner)
   protected
     // The unit noise the run started from.
@@ -75569,6 +75578,11 @@ begin
     else if (s <> '') then
       ImportError('SD UNet import: addition_embed_type "' + s +
         '" unsupported (only "text_time" / absent).');
+    ArrData := Obj.Find('time_cond_proj_dim');
+    if (ArrData <> nil) and (ArrData.JSONType = jtNumber) then
+      Result.TimeCondProjDim := ArrData.AsInteger
+    else
+      Result.TimeCondProjDim := 0;
   finally
     Root.Free;
   end;
@@ -76017,6 +76031,11 @@ var
   end;
 
 begin
+  if Config.TimeCondProjDim > 0 then
+    ImportError('SD UNet import: time_cond_proj_dim ' +
+      IntToStr(Config.TimeCondProjDim) + ' (an LCM-distilled UNet with a ' +
+      'guidance-scale embedding) is not supported yet; for LCM use a base ' +
+      'SD UNet with an LCM-LoRA and the LCM sampler.');
   n := Config.NumBlockOut;
   nM1 := n - 1;
   d0 := Config.BlockOutChannels[0];
@@ -93268,6 +93287,7 @@ begin
       FSchedulerClassName := TJSONObject(Root).Get('_class_name', '');
     FreeAndNil(Root);
     FSampler := DiffusersSchedulerSampler(JsonText.Text, FSamplerNotice);
+    if FSampler = smLCM then SetSampler(smLCM);
     FTextConfig := ReadClipConfigFromJSONFile(ComponentFolder('text_encoder') +
       'config.json');
     FMaxTokenCount := FTextConfig.TextMaxPositions;
@@ -93294,8 +93314,9 @@ begin
     Root.Free;
     JsonText.Free;
   end;
-  FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
-    ComponentFolder('scheduler') + 'scheduler_config.json');
+  if FScheduler = nil then
+    FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+      ComponentFolder('scheduler') + 'scheduler_config.json');
   FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
     'config.json');
   FVaeConfig := ReadVaeDecoderConfigFromJSONFile(ComponentFolder('vae') +
@@ -93700,6 +93721,17 @@ begin
   Result := Length(FLoRAFiles);
 end;
 
+procedure TStableDiffusionPipeline.SetSampler(Value: TNNetSamplerMethod);
+begin
+  if (Value = smLCM) and not (FScheduler is TNNetLCMScheduler) then
+  begin
+    FreeAndNil(FScheduler);
+    FScheduler := TNNetLCMScheduler.CreateFromDiffusersConfig(
+      ComponentFolder('scheduler') + 'scheduler_config.json');
+  end;
+  FSampler := Value;
+end;
+
 procedure TStableDiffusionPipeline.LoRAsChanged();
 begin
   FreeAndNil(FTextEncoder);
@@ -94039,7 +94071,7 @@ var
   Pred, StepNoise: TNNetVolume;
   IsGuided, WithControl, WithAdapter: boolean;
   IPAdapterFile: string;
-  GridX, GridY, StepPos, MaxStepPos, Tt, StartStep: integer;
+  GridX, GridY, StepPos, MaxStepPos, Tt: integer;
   Eta, NoiseScale: TNeuralFloat;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
@@ -94084,19 +94116,18 @@ begin
       IPAdapterFile <> '', WithAdapter, WithControl);
     StepConditioner.CollectConditioners(FPassConditioners);
     DoPhase(sdphDenoise);
-    Schedule := FScheduler.BuildSamplerSchedule(StepCount,
-      FScheduler.ConfigSpacing, FSampler);
     if StepConditioner.StartsFromImage() then
     begin
-      // diffusers get_timesteps: drop the first steps, then start from the
-      // image latents noised to the first kept timestep (no init sigma).
-      StartStep := TNNetDiffusionScheduler.Img2ImgStartStep(StepCount,
-        StepConditioner.DenoiseStrength());
-      Schedule := Copy(Schedule, StartStep, Length(Schedule) - StartStep);
+      // Start from the image latents noised to the first timestep of the
+      // strength schedule (no init sigma).
+      Schedule := FScheduler.BuildImg2ImgSchedule(StepCount,
+        FScheduler.ConfigSpacing, FSampler, StepConditioner.DenoiseStrength());
       StepConditioner.NoiseImageLatents(Latents, Schedule[0]);
     end
     else
     begin
+      Schedule := FScheduler.BuildSamplerSchedule(StepCount,
+        FScheduler.ConfigSpacing, FSampler);
       // diffusers scales the given latents by init_noise_sigma.
       NoiseScale := FScheduler.InitialNoiseScale(FSampler,
         FScheduler.ConfigSpacing, Schedule[0]);
@@ -94104,7 +94135,7 @@ begin
     end;
     // Euler a injects its full ancestral noise; the others are deterministic.
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
-    if (FSampler = smEulerAncestral) and Assigned(FOnAncestralNoise) then
+    if (FSampler in [smEulerAncestral, smLCM]) and Assigned(FOnAncestralNoise) then
       StepNoise := TNNetVolume.Create(Latents);
     MaxStepPos := Length(Schedule) - 2;
     FStepCount := MaxStepPos + 1;

@@ -1266,6 +1266,8 @@ type
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
+    procedure TestStableDiffusionLCMParity;
+    procedure TestSDUNetRefusesTimeCondProjDim;
     procedure TestStableDiffusionInstructPix2PixParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
@@ -1433,7 +1435,7 @@ implementation
 
 type
   // Single-pass PixArt denoiser wrapper for the LCM smoke (TNNetLCMScheduler.
-  // LCMSample wants a method-of-object callback). The LCM path uses ONLY the
+  // Sample wants a method-of-object callback). The LCM path uses ONLY the
   // conditional pass -- no classifier-free guidance double pass.
   TLCMPixArtDenoiser = class
   public
@@ -46747,6 +46749,105 @@ begin
   end;
 end;
 
+// LCMScheduler on tiny_sd15 vs diffusers float64 (tiny_sd15_lcm_io.json,
+// replayed step noise): 4 steps of text-to-image at guidance 1.5 and 1.0, and
+// img2img at strength 0.5 over the shrunken origin grid (all 4 steps run).
+procedure TTestNeuralPretrained.TestStableDiffusionLCMParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TStableDiffusionImg2Img;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, ImageNoise: TNNetVolume;
+  CasePos, PassesPerStep: integer;
+  Notice: string;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_lcm_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Img2Img := TStableDiffusionImg2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  try
+    AssertFalse('DDIM config: base scheduler',
+      Pipeline.Scheduler is TNNetLCMScheduler);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Pipeline.OnAncestralNoise := @SD15StepNoise;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      Pipeline.Sampler := DiffusersSchedulerSampler(
+        Entry.Objects['scheduler_config'].AsJSON, Notice);
+      AssertTrue(Entry.Get('name', '') + ' mapped', Pipeline.Sampler = smLCM);
+      AssertEquals(Entry.Get('name', '') + ' notice', '', Notice);
+      AssertTrue(Entry.Get('name', '') + ' LCM scheduler',
+        Pipeline.Scheduler is TNNetLCMScheduler);
+      if Entry.Get('strength', 1.0) < 1 then
+      begin
+        Img2Img.Strength := Entry.Get('strength', 1.0);
+        Pipeline.Conditioner := Img2Img;
+      end
+      else Pipeline.Conditioner := nil;
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      if Entry.Get('guidance_scale', 0.0) > 1 then PassesPerStep := 2
+      else PassesPerStep := 1;
+      AssertEquals(Entry.Get('name', '') + ' UNet passes',
+        PassesPerStep * TJSONObject(FSD15Oracle).Get('steps', 0),
+        Pipeline.ImageStats.UNetPassCount);
+    end;
+    // Back to DDIM: the LCM scheduler runs the inherited samplers.
+    Pipeline.Sampler := smDDIM;
+    AssertTrue('ddim after lcm', Pipeline.Sampler = smDDIM);
+  finally
+    ImageNoise.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// An LCM-distilled UNet config (time_cond_proj_dim) is read, and BuildSDUNet
+// refuses it before touching the reader.
+procedure TTestNeuralPretrained.TestSDUNetRefusesTimeCondProjDim;
+var
+  Lines: TStringList;
+  ConfigText: string;
+  Config: TSDUNetConfig;
+  IsRefused: boolean;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_sd15/unet/config.json'));
+    ConfigText := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+  Config := ReadSDUNetConfigFromJSONText(ConfigText, 'tiny_sd15');
+  AssertEquals('no time_cond_proj_dim', 0, Config.TimeCondProjDim);
+  AssertTrue('fixture has the null key',
+    Pos('"time_cond_proj_dim": null', ConfigText) > 0);
+  ConfigText := StringReplace(ConfigText, '"time_cond_proj_dim": null',
+    '"time_cond_proj_dim": 256', []);
+  Config := ReadSDUNetConfigFromJSONText(ConfigText, 'lcm');
+  AssertEquals('time_cond_proj_dim', 256, Config.TimeCondProjDim);
+  IsRefused := false;
+  try
+    BuildSDUNet(nil, Config).Free;
+  except
+    on E: EPretrainedImportError do
+      IsRefused := Pos('time_cond_proj_dim', E.Message) > 0;
+  end;
+  AssertTrue('time_cond_proj_dim refused', IsRefused);
+end;
+
 // StableDiffusionInstructPix2PixPipeline float64 (tiny_sd15_ip2p_io.json, an
 // 8-channel UNet, injected noise): 3 steps of Euler a and DDIM at guidance 7.5 /
 // image guidance 1.5 (three passes), and Euler a at 1 / 1 (one pass).
@@ -49461,7 +49562,7 @@ begin
     AssertTrue('decoded image is finite', AllFinite);
 
     // ---- LCM few-step sampler path (opt-in --lcm in the example) ----
-    // TNNetLCMScheduler.LCMSample drives the consistency function with a SINGLE
+    // TNNetLCMScheduler.Sample (smLCM) drives the consistency function with a SINGLE
     // conditional model pass per step (guidance baked in -- NO cond/uncond CFG
     // double pass), in ~4 steps over the SAME pico fixtures. The pico weights
     // are not LCM-distilled, so this asserts the few-step loop RUNS and produces
@@ -49472,7 +49573,7 @@ begin
     LCMDenoiser.Prompt := TextStates;
     LCMLatent.ReSize(HW, HW, PixCfg.InChannels);
     LCMLatent.RandomizeGaussian(1.0);
-    LCMScheduler.LCMSample(LCMLatent, @LCMDenoiser.Denoise, {NumSteps=}4, tsUniform);
+    LCMScheduler.Sample(LCMLatent, @LCMDenoiser.Denoise, {NumSteps=}4, smLCM);
     AssertEquals('LCM latent grid', HW, LCMLatent.SizeX);
     AssertEquals('LCM latent channels', PixCfg.InChannels, LCMLatent.Depth);
     AllFinite := true;

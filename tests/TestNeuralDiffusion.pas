@@ -102,6 +102,8 @@ type
     procedure TestLCMBoundaryScalings;
     procedure TestLCMConsistencyFixedPoint;
     procedure TestLCMReproducible;
+    procedure TestLCMOriginScheduleVsDiffusers;
+    procedure TestLCMFromDiffusersConfig;
     procedure TestFlowMatchCalculateShiftVsOracle;
     procedure TestFlowMatchSigmasVsOracle;
     procedure TestFlowMatchStepVsOracle;
@@ -1334,28 +1336,17 @@ end;
 procedure TTestNeuralDiffusion.TestLCMBoundaryScalings;
 var
   Sched: TNNetLCMScheduler;
-  cs1, csT, co1, coT: TNeuralFloat;
-const
-  cSigmaData = 0.5;
 begin
-  // c_skip(t) = sigma_data^2/((t/0.1)^2+sigma_data^2),
-  // c_out(t)  = (t/0.1)*sigma_data/sqrt((t/0.1)^2+sigma_data^2).
-  // At the LARGEST sigma (t=T) the (t/0.1)^2 term dominates: c_skip -> ~0 and
-  // c_out -> ~sigma_data. At small t (t=1) c_skip is near 1 and c_out near 0
-  // (the consistency boundary condition f(x,0)=x).
+  // diffusers get_scalings_for_boundary_condition_discrete at t = Tt - 1,
+  // timestep_scaling 10: c_skip = 0.25/((10t)^2+0.25), c_out = 10t/sqrt(...).
   Sched := TNNetLCMScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
   try
-    cs1 := Sched.CSkip(1);    co1 := Sched.COut(1);
-    csT := Sched.CSkip(cT);   coT := Sched.COut(cT);
-    // At t=1: (1/0.1)^2 = 100 vs sigma_data^2 = 0.25 -> c_skip ~ 0.25/100.25.
-    AssertEquals('c_skip(1)', 0.25 / 100.25, cs1, 1e-6);
-    AssertEquals('c_out(1)', 10.0 * 0.5 / Sqrt(100.0 + 0.25), co1, 1e-6);
-    // Monotonicity: c_skip shrinks with t, c_out grows toward sigma_data.
-    AssertTrue('c_skip largest-sigma small', csT < cs1);
-    AssertTrue('c_skip(T) < 1e-3', csT < 1e-3);
-    AssertTrue('c_out grows with t', coT > co1);
-    AssertTrue('c_out(T) ~ sigma_data', Abs(coT - cSigmaData) < 1e-3);
-    AssertTrue('c_out(T) < sigma_data', coT < cSigmaData);
+    AssertEquals('c_skip(t=0)', 1.0, Sched.CSkip(1), 0);
+    AssertEquals('c_out(t=0)', 0.0, Sched.COut(1), 0);
+    AssertEquals('c_skip(t=1)', 0.0024937655860349127, Sched.CSkip(2), 1e-9);
+    AssertEquals('c_out(t=1)', 0.9987523388778445, Sched.COut(2), 1e-7);
+    AssertEquals('c_skip(t=199)', 6.312971496113009e-08, Sched.CSkip(cT), 1e-12);
+    AssertEquals('c_out(t=199)', 0.9999999684351419, Sched.COut(cT), 1e-7);
   finally
     Sched.Free;
   end;
@@ -1382,7 +1373,7 @@ begin
     gLCMSched := Sched;
     // Start from the clean target fully noised toward t=T (pure-noise regime).
     Sched.AddNoise(Target, X, cT);
-    Sched.LCMSample(X, @LCMOracleModel, 4, tsUniform);
+    Sched.Sample(X, @LCMOracleModel, 4, smLCM);
     for i := 0 to cN - 1 do
     begin
       AssertFalse('lcm no NaN @ ' + IntToStr(i),
@@ -1415,11 +1406,11 @@ begin
 
     RandSeed := 777; gLCMSched := SchedA;
     for i := 0 to cN - 1 do XA.FData[i] := RandG(0, 1);
-    SchedA.LCMSample(XA, @LCMOracleModel, 4, tsUniform);
+    SchedA.Sample(XA, @LCMOracleModel, 4, smLCM);
 
     RandSeed := 777; gLCMSched := SchedB;
     for i := 0 to cN - 1 do XB.FData[i] := RandG(0, 1);
-    SchedB.LCMSample(XB, @LCMOracleModel, 4, tsUniform);
+    SchedB.Sample(XB, @LCMOracleModel, 4, smLCM);
 
     for i := 0 to cN - 1 do
       AssertEquals('lcm reproducible @ ' + IntToStr(i),
@@ -1427,6 +1418,135 @@ begin
   finally
     gLCMTarget := nil; gLCMSched := nil;
     SchedA.Free; SchedB.Free; XA.Free; XB.Free; Target.Free;
+  end;
+end;
+
+
+// diffusers LCMScheduler.set_timesteps (SD 1.5 betas) as 1-based Tt, for
+// step counts, strengths and original_inference_steps; the refusals; and the
+// inherited samplers for other methods.
+procedure TTestNeuralDiffusion.TestLCMOriginScheduleVsDiffusers;
+var
+  Sched: TNNetLCMScheduler;
+  Base: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+
+  procedure CheckSchedule(const Name: string; const Actual: TNeuralIntegerArray;
+    const Expected: array of integer);
+  var
+    StepPos: integer;
+  begin
+    AssertEquals(Name + ' length', Length(Expected) + 1, Length(Actual));
+    for StepPos := 0 to High(Expected) do
+      AssertEquals(Name + ' @ ' + IntToStr(StepPos), Expected[StepPos] + 1,
+        Actual[StepPos]);
+    AssertEquals(Name + ' final', 0, Actual[Length(Expected)]);
+  end;
+
+  function Refused(NumSteps: integer; Strength: double): boolean;
+  begin
+    Result := false;
+    try
+      Sched.BuildOriginSchedule(NumSteps, Strength);
+    except
+      on Exception do Result := true;
+    end;
+  end;
+
+begin
+  Sched := TNNetLCMScheduler.Create(1000, dsScaledLinear, dpEps, 0.00085, 0.012);
+  Base := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpEps, 0.00085,
+    0.012);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    AssertEquals('default original steps', 50, Sched.OriginalInferenceSteps);
+    CheckSchedule('4 steps', Sched.BuildSamplerSchedule(4, tsLeading, smLCM),
+      [999, 759, 499, 259]);
+    CheckSchedule('8 steps', Sched.BuildOriginSchedule(8),
+      [999, 879, 759, 639, 499, 379, 259, 139]);
+    CheckSchedule('1 step', Sched.BuildOriginSchedule(1), [999]);
+    CheckSchedule('strength 0.5', Sched.BuildImg2ImgSchedule(4, tsLeading,
+      smLCM, 0.5), [499, 379, 259, 139]);
+    CheckSchedule('strength 0.3', Sched.BuildOriginSchedule(3, 0.3),
+      [299, 199, 99]);
+    AssertTrue('51 steps refused', Refused(51, 1));
+    AssertTrue('strength 0.05 leaves 2 of 4 points', Refused(4, 0.05));
+    AssertTrue('strength 0 refused', Refused(1, 0));
+    AssertFalse('50 steps run', Refused(50, 1));
+    Sched.OriginalInferenceSteps := 25;
+    CheckSchedule('original 25', Sched.BuildOriginSchedule(4),
+      [999, 759, 519, 279]);
+    // Other methods: the inherited schedule and img2img cut.
+    CheckSchedule('ddim', Sched.BuildSamplerSchedule(4, tsLeading, smDDIM),
+      [750, 500, 250, 0]);
+    CheckSchedule('ddim strength 0.5', Sched.BuildImg2ImgSchedule(4, tsLeading,
+      smDDIM, 0.5), [250, 0]);
+    AssertEquals('base matches', Base.BuildSamplerSchedule(4, tsLeading,
+      smDDIM)[0], Sched.BuildSamplerSchedule(4, tsLeading, smDDIM)[0]);
+    // The base class does not run smLCM.
+    try
+      Base.BuildSamplerSchedule(4, tsLeading, smLCM);
+      Fail('base BuildSamplerSchedule ran smLCM');
+    except
+      on E: Exception do
+        AssertTrue('schedule refusal names the class',
+          Pos('TNNetLCMScheduler', E.Message) > 0);
+    end;
+    try
+      Base.Step(X, X, 10, 5, smLCM);
+      Fail('base Step ran smLCM');
+    except
+      on E: Exception do
+        AssertTrue('step refusal names the class',
+          Pos('TNNetLCMScheduler', E.Message) > 0);
+    end;
+  finally
+    X.Free;
+    Base.Free;
+    Sched.Free;
+  end;
+end;
+
+// original_inference_steps / timestep_scaling come from the config (defaults
+// 50 / 10 for a config without them); DiffusersSchedulerSampler maps the class.
+procedure TTestNeuralDiffusion.TestLCMFromDiffusersConfig;
+const
+  csLCMConfig = '{"_class_name": "LCMScheduler", "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+    '"num_train_timesteps": 1000, "original_inference_steps": 25, ' +
+    '"timestep_scaling": 5.0, "clip_sample": false, "set_alpha_to_one": true}';
+  csDDIMConfig = '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+    '"clip_sample": false}';
+var
+  FileName, Notice: string;
+  Lines: TStringList;
+  Sched: TNNetLCMScheduler;
+begin
+  FileName := GetTempDir(false) + 'cai_lcm_scheduler_config.json';
+  Lines := TStringList.Create;
+  Sched := nil;
+  try
+    Lines.Text := csLCMConfig;
+    Lines.SaveToFile(FileName);
+    Sched := TNNetLCMScheduler.CreateFromDiffusersConfig(FileName);
+    AssertEquals('original steps', 25, Sched.OriginalInferenceSteps);
+    AssertEquals('timestep scaling', 5.0, Sched.TimestepScaling, 0);
+    AssertEquals('c_out at t = 1, scaling 5', 5 / Sqrt(25.25), Sched.COut(2),
+      1e-7);
+    AssertTrue('LCMScheduler -> smLCM',
+      DiffusersSchedulerSampler(csLCMConfig, Notice) = smLCM);
+    AssertEquals('lcm notice', '', Notice);
+    FreeAndNil(Sched);
+    Lines.Text := csDDIMConfig;
+    Lines.SaveToFile(FileName);
+    Sched := TNNetLCMScheduler.CreateFromDiffusersConfig(FileName);
+    AssertEquals('default original steps', 50, Sched.OriginalInferenceSteps);
+    AssertEquals('default timestep scaling', 10.0, Sched.TimestepScaling, 0);
+  finally
+    Sched.Free;
+    Lines.Free;
+    DeleteFile(FileName);
   end;
 end;
 
@@ -2415,7 +2535,8 @@ begin
   // no FP trap and a finite result. Eta 1 also covers the stochastic branches.
   for Prediction := Low(TNNetPredictionType) to High(TNNetPredictionType) do
   begin
-    Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, Prediction,
+    // TNNetLCMScheduler runs smLCM and hands every other method to the base.
+    Sched := TNNetLCMScheduler.Create(1000, dsScaledLinear, Prediction,
       0.00085, 0.012, 0.008, true);
     X := TNNetVolume.Create(cN, 1, 1);
     try

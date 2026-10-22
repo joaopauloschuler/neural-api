@@ -39,6 +39,15 @@ transformers class (nothing downloaded), saved with the real folder layout:
     multiple of the UNet's 2: diffusers resizes each upsample to its skip
     (upsample_size). check_inputs is skipped (it wants multiples of 8, the
     real VAE factor, not the pico 2).
+  tests/fixtures/tiny_sd15_lcm_io.json
+    LCMScheduler.from_config of the DDIM config (the LCM-LoRA recipe),
+    LCM_STEPS steps on the tiny_sd15 UNet with the usual two-half CFG: text to
+    image at guidance LCM_GUIDANCE and at 1.0 (one pass), and img2img at
+    strength LCM_STRENGTH. The img2img case follows LatentConsistencyModel-
+    Img2ImgPipeline's schedule: set_timesteps(strength=...) shrinks the origin
+    grid and every step runs (StableDiffusionImg2ImgPipeline's get_timesteps
+    cut is bypassed). Per-step noise (step_noise) and the image's VAE sample
+    noise are injected; latents_after, timesteps and the decoded image per case.
 
 The pipeline is reloaded from the saved folder and run in float64, latents
 passed explicitly so torch's RNG does not matter.
@@ -50,8 +59,10 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --samplers-only
   python tools/make_pico_sd_pipeline_fixture.py --nonsquare-only
   python tools/make_pico_sd_pipeline_fixture.py --oddsize-only
-(--samplers-only / --nonsquare-only / --oddsize-only keep the committed folder
-and rewrite only the sampler / non-square / odd-size file.)
+  python tools/make_pico_sd_pipeline_fixture.py --lcm-only
+(--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only keep the
+committed folder and rewrite only the sampler / non-square / odd-size / LCM
+file.)
 """
 import json
 import math
@@ -63,8 +74,11 @@ from collections import Counter
 import torch
 from safetensors.torch import load_file, save_file
 from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
-                       EulerDiscreteScheduler, PNDMScheduler,
-                       StableDiffusionPipeline, UNet2DConditionModel)
+                       EulerDiscreteScheduler, LCMScheduler, PNDMScheduler,
+                       StableDiffusionImg2ImgPipeline, StableDiffusionPipeline,
+                       UNet2DConditionModel)
+import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
+import diffusers.schedulers.scheduling_lcm as lcm_module
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +88,7 @@ IO_FILE = os.path.join(FIXTURES, "tiny_sd15_pipeline_io.json")
 SAMPLERS_FILE = os.path.join(FIXTURES, "tiny_sd15_samplers_io.json")
 NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_nonsquare_io.json")
 ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_oddsize_io.json")
+LCM_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -86,6 +101,9 @@ ODD_HEIGHT = 10
 STEPS = 3
 SAMPLER_STEPS = 4        # PNDM reaches its 4th-order formula, DPM++ 2nd order
 GUIDANCE = 7.5
+LCM_STEPS = 4
+LCM_GUIDANCE = 1.5
+LCM_STRENGTH = 0.5
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -399,7 +417,72 @@ def make_oddsize_oracle():
     make_nonsquare_oracle(ODD_WIDTH, ODD_HEIGHT, ODDSIZE_FILE)
 
 
+def make_lcm_oracle():
+    generator = torch.Generator().manual_seed(SEED + 40)
+    grid = IMAGE_SIZE // 2
+    noise = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+    step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(LCM_STEPS)]
+    init_image = torch.randint(0, 256, (1, 3, IMAGE_SIZE, IMAGE_SIZE),
+                               generator=generator).to(torch.float64) / 255.0
+    pending_step_noise = []
+    lcm_module.randn_tensor = lambda *args, **kwargs: pending_step_noise.pop(0).clone()
+    img2img_module.randn_tensor = lambda *args, **kwargs: noise.clone()
+    img2img_module.retrieve_latents = (
+        lambda output, generator=None, sample_mode="sample":
+        output.latent_dist.mean + output.latent_dist.std * image_noise)
+    cases = []
+    for name, guidance, strength in (("text2img", LCM_GUIDANCE, None),
+                                     ("text2img_no_cfg", 1.0, None),
+                                     ("img2img_strength", LCM_GUIDANCE, LCM_STRENGTH)):
+        pipe_class = StableDiffusionPipeline if strength is None else StableDiffusionImg2ImgPipeline
+        pipe = pipe_class.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
+                                          safety_checker=None)
+        pipe.set_progress_bar_config(disable=True)
+        pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+        extra = {"height": IMAGE_SIZE, "width": IMAGE_SIZE, "latents": noise.clone()}
+        if strength is not None:
+            base_set_timesteps = pipe.scheduler.set_timesteps
+            pipe.scheduler.set_timesteps = (
+                lambda *args, **kwargs: base_set_timesteps(*args, strength=strength, **kwargs))
+            pipe.get_timesteps = lambda steps, _strength, _device: (
+                pipe.scheduler.timesteps, len(pipe.scheduler.timesteps))
+            extra = {"image": init_image, "strength": strength}
+        pending_step_noise[:] = step_noise
+        after = []
+
+        def on_step_end(_pipe, _step, _t, kwargs):
+            after.append(rounded(chw(kwargs["latents"][0])))
+            return kwargs
+        result = pipe(PROMPT, num_inference_steps=LCM_STEPS, guidance_scale=guidance,
+                      output_type="np", callback_on_step_end=on_step_end, **extra)
+        assert len(pending_step_noise) == 1, name
+        config = dict(pipe.scheduler.config)
+        config["_class_name"] = type(pipe.scheduler).__name__
+        cases.append({"name": name, "guidance_scale": guidance,
+                      "strength": 1.0 if strength is None else strength,
+                      "scheduler_config": {key: value for key, value in config.items()
+                                           if not key.startswith("_") or key == "_class_name"},
+                      "timesteps": [int(t) for t in pipe.scheduler.timesteps],
+                      "latents_after": after,
+                      "image": rounded(result.images[0].tolist())})
+        print("LCM", name, cases[-1]["timesteps"])
+    payload = {"width": IMAGE_SIZE, "height": IMAGE_SIZE, "steps": LCM_STEPS,
+               "prompt": PROMPT,
+               "init_image": rounded(init_image[0].permute(1, 2, 0).tolist()),
+               "latents": rounded(chw(noise[0])),
+               "image_sample_noise": rounded(chw(image_noise[0])),
+               "step_noise": [rounded(chw(item[0])) for item in step_noise],
+               "cases": cases}
+    with open(LCM_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--lcm-only" in sys.argv:
+        make_lcm_oracle()
+        sys.exit(0)
     if "--nonsquare-only" in sys.argv:
         make_nonsquare_oracle()
         sys.exit(0)
@@ -412,3 +495,4 @@ if __name__ == "__main__":
     make_sampler_oracle()
     make_nonsquare_oracle()
     make_oddsize_oracle()
+    make_lcm_oracle()

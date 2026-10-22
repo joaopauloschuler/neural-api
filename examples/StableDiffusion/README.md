@@ -178,12 +178,51 @@ The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 | `EulerDiscreteScheduler`          | Euler      | `euler`     |
 | `EulerAncestralDiscreteScheduler` | Euler a    | `euler-a`   |
 | `DPMSolverMultistepScheduler`     | DPM-Solver++ 2M | `dpm++2m` |
+| `LCMScheduler`                    | LCM (see below) | `lcm`   |
 
 Any other class runs DDIM and prints a `Notice:` line. The notice also lists
 config options that are not implemented and are ignored, e.g.
 `use_karras_sigmas`, `solver_order` other than 2, or `skip_prk_steps: false`
 (the Runge-Kutta warm-up). `--sampler` overrides the config's choice. PNDM
 runs one more UNet step than `--steps`, as diffusers does.
+
+## Latent Consistency Models (`--sampler lcm`)
+
+An LCM-LoRA turns a plain SD 1.5 checkpoint into a 2-8 step sampler: about
+6-10x fewer UNet passes than 25-50 step sampling. Merge the LoRA with `--lora`
+and pick the LCM sampler:
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --lora ~/models/lcm-lora-sdv1-5/pytorch_lora_weights.safetensors \
+  --sampler lcm --prompt "a watercolor painting of a lighthouse at dawn"
+```
+
+`--sampler lcm` runs diffusers `LCMScheduler` (a `scheduler_config.json` with
+that `_class_name` selects it too). With it, `--steps` defaults to 4 and
+`--guidance` to 1.0. Guidance 1.0 runs one UNet pass per step. Guidance above 1
+runs the usual two-pass classifier-free guidance; LCM-LoRA works best at
+1.0-2.0. The betas come from the scheduler config. The timesteps come from
+the LCM origin grid of `original_inference_steps` (50) points, k*i - 1 with
+k = 1000 / 50; 4 steps run at t = 999, 759, 499 and 259. Each step maps the
+latents to a clean estimate and re-noises it to the next timestep with fresh
+noise. The last step returns the clean estimate.
+
+With `--init-image`, the strength shrinks the origin grid to its first
+int(50 * strength) points, and all `--steps` steps run on it (strength 0.5,
+4 steps: t = 499, 379, 259, 139). This is the schedule of diffusers
+`LatentConsistencyModelImg2ImgPipeline`. diffusers
+`StableDiffusionImg2ImgPipeline` with an `LCMScheduler` instead keeps the last
+int(steps * strength) entries of the full grid (t = 499, 259).
+
+LCM-distilled UNets such as `SimianLuo/LCM_Dreamshaper_v7` are not supported
+yet. Their `unet/config.json` sets `time_cond_proj_dim` (a guidance-scale
+embedding), and `BuildSDUNet` refuses such a config.
+
+Tested against diffusers float64 on the pico folder (an `LCMScheduler` from the
+DDIM config, replayed step noise): 4 steps at guidance 1.5 and 1.0, and img2img
+at strength 0.5 (`TestStableDiffusionLCMParity`). No real LCM-LoRA has been
+run yet.
 
 ## Usage
 
@@ -192,14 +231,16 @@ StableDiffusion [--model DIR] [options]
   --model DIR       diffusers StableDiffusionPipeline folder (default: the pico fixture)
   --prompt TEXT     prompt (default "a photo of an astronaut riding a horse on mars")
   --negative TEXT   negative prompt (default empty)
-  --steps N         denoising steps (default 25)
-  --guidance G      classifier-free guidance scale (default 7.5; <= 1 turns it off)
+  --steps N         denoising steps (default 25; 4 with lcm)
+  --guidance G      classifier-free guidance scale (default 7.5, 1.0 with lcm;
+                    <= 1 turns it off)
   --width N         image width (default: the checkpoint's, 512 for SD 1.5)
   --height N        image height (default: the checkpoint's)
   --size N          sets both --width and --height
   --seed N          noise seed (default 0)
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
-                    euler, euler-a or dpm++2m
+                    euler, euler-a, dpm++2m or lcm (Latent Consistency; needs
+                    an LCM-LoRA via --lora, 2-8 steps)
   --output PNG      output file (default stable_diffusion.png)
   --repeat N        N images, seeds --seed, --seed+1, ...; the prompt is encoded
                     once. N > 1 keeps the components loaded and numbers the files
@@ -217,7 +258,8 @@ StableDiffusion [--model DIR] [options]
   --init-image PNG  image-to-image from this image; the output takes its size
                     (rounded down to the VAE factor) unless --width/--height
   --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);
-                    runs the last int(steps * S) steps
+                    runs the last int(steps * S) steps (lcm: all steps over the
+                    first int(50 * S) LCM timesteps)
   --edit-image PNG  InstructPix2Pix: edit this image as the prompt says (needs an
                     8-channel UNet folder, e.g. timbrooks/instruct-pix2pix); the
                     output takes its size (rounded down to the VAE factor)
@@ -278,8 +320,8 @@ Stages of image 2 (wall time):
   latent grid (`TestStableDiffusionPipelineOddSize`).
 * The weights must be F32 `*.safetensors`; the `*.fp16.safetensors` variant
   files are untested.
-* The noise (the initial latents, the Euler a step noise and the img2img VAE
-  sample) comes from the Free Pascal RNG, so a seed does not reproduce a diffusers image.
+* The noise (the initial latents, the Euler a and LCM step noise and the
+  img2img VAE sample) comes from the Free Pascal RNG, so a seed does not reproduce a diffusers image.
 * Every UNet pass recomputes the cross-attention K/V of the text states,
   which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
   pass, so the K/V are not cached.

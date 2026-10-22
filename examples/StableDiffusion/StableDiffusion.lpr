@@ -10,8 +10,10 @@ through TStableDiffusionPipeline in neuralpretrained.pas.
     runwayml/stable-diffusion-v1-5 with F32 *.safetensors weights.
 
 The scheduler config gives the betas, timestep spacing and prediction type,
-and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a or
-DPM-Solver++ 2M; other classes run DDIM). --sampler overrides it.
+and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a,
+DPM-Solver++ 2M or LCM; other classes run DDIM). --sampler overrides it.
+--sampler lcm with an LCM-LoRA (--lora, e.g. latent-consistency/
+lcm-lora-sdv1-5) samples in 2-8 steps (default 4, guidance 1.0).
 
 Each component is loaded when its stage starts and freed when it ends, so
 only one is in memory at a time. --repeat N > 1 makes N images from one
@@ -51,10 +53,10 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
 const
   PicoModelFolder = '../../tests/fixtures/tiny_sd15';
   // --sampler names of the methods TStableDiffusionPipeline maps to.
-  SamplerOptionNames: array[0..4] of string =
-    ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m');
-  SamplerOptionMethods: array[0..4] of TNNetSamplerMethod =
-    (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M);
+  SamplerOptionNames: array[0..5] of string =
+    ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m', 'lcm');
+  SamplerOptionMethods: array[0..5] of TNNetSamplerMethod =
+    (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M, smLCM);
 
 type
   TStableDiffusionOptions = record
@@ -76,6 +78,7 @@ type
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
+    // Steps -1 / GuidanceScale < 0: the sampler's default (LCM: 4 / 1.0).
     Steps, ImageWidth, ImageHeight, RepeatCount: integer;
     GuidanceScale: double;
     Seed: cardinal;
@@ -177,16 +180,19 @@ begin
   WriteLn('  --prompt TEXT     prompt (default "a photo of an astronaut ',
     'riding a horse on mars")');
   WriteLn('  --negative TEXT   negative prompt (default empty)');
-  WriteLn('  --steps N         denoising steps (default 25)');
-  WriteLn('  --guidance G      classifier-free guidance scale (default 7.5; ',
-    '<= 1 turns it off)');
+  WriteLn('  --steps N         denoising steps (default 25; 4 with lcm)');
+  WriteLn('  --guidance G      classifier-free guidance scale (default 7.5, ',
+    '1.0 with lcm;');
+  WriteLn('                    <= 1 turns it off)');
   WriteLn('  --width N         image width (default: the checkpoint''s, ',
     '512 for SD 1.5)');
   WriteLn('  --height N        image height (default: the checkpoint''s)');
   WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
-  WriteLn('                    pndm, euler, euler-a or dpm++2m');
+  WriteLn('                    pndm, euler, euler-a, dpm++2m or lcm (Latent ',
+    'Consistency;');
+  WriteLn('                    needs an LCM-LoRA via --lora, 2-8 steps)');
   WriteLn('  --output PNG      output file (default stable_diffusion.png)');
   WriteLn('  --repeat N        N images, seeds --seed, --seed+1, ...; the ',
     'prompt is encoded');
@@ -216,7 +222,9 @@ begin
     '--width/--height');
   WriteLn('  --strength S      how much of --init-image to repaint, (0, 1] ',
     '(default 0.8);');
-  WriteLn('                    runs the last int(steps * S) steps');
+  WriteLn('                    runs the last int(steps * S) steps (lcm: all ',
+    'steps over');
+  WriteLn('                    the first int(50 * S) LCM timesteps)');
   WriteLn('  --edit-image PNG  InstructPix2Pix: edit this image as the prompt ',
     'says (needs an');
   WriteLn('                    8-channel UNet folder, e.g. ',
@@ -282,10 +290,10 @@ begin
   Opt.EditImageFile := '';
   Opt.ImageGuidanceScale := -1;
   Opt.SamplerName := 'auto';
-  Opt.Steps := 25;
+  Opt.Steps := -1;
   Opt.ImageWidth := 0;
   Opt.ImageHeight := 0;
-  Opt.GuidanceScale := 7.5;
+  Opt.GuidanceScale := -1;
   Opt.Seed := 0;
   Opt.RepeatCount := 1;
   Opt.UseOpenCL := false;
@@ -356,7 +364,8 @@ begin
       raise Exception.Create('unknown argument: ' + Arg);
     Inc(ArgPos);
   end;
-  if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  if (Opt.Steps < 1) and (Opt.Steps <> -1) then
+    raise Exception.Create('--steps must be >= 1');
   if Opt.RepeatCount < 1 then raise Exception.Create('--repeat must be >= 1');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
@@ -409,6 +418,8 @@ var
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
+  StepCount, Img2ImgStepCount: integer;
+  GuidanceScale: double;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
   PngSaveMs: double;
@@ -465,7 +476,22 @@ begin
     end;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
-    Pipeline.GuidanceScale := Opt.GuidanceScale;
+    if Opt.SamplerName <> 'auto' then
+      Pipeline.Sampler := SamplerOptionMethods[
+        SamplerOptionIndex(Opt.SamplerName)];
+    StepCount := Opt.Steps;
+    GuidanceScale := Opt.GuidanceScale;
+    if Pipeline.Sampler = smLCM then
+    begin
+      if StepCount < 1 then StepCount := 4;
+      if GuidanceScale < 0 then GuidanceScale := 1.0;
+    end
+    else
+    begin
+      if StepCount < 1 then StepCount := 25;
+      if GuidanceScale < 0 then GuidanceScale := 7.5;
+    end;
+    Pipeline.GuidanceScale := GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.UNetInt8 := Opt.UseInt8;
     Pipeline.TextEncoderInt8 := Opt.UseInt8;
@@ -477,13 +503,14 @@ begin
     WriteLn('Model:    ', Opt.ModelFolder);
     WriteLn('Prompt:   "', Opt.Prompt, '"');
     WriteLn(Format('Image:    %dx%d, %d steps, guidance %.2f, seed %d, %s',
-      [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
+      [ImageWidth, ImageHeight, StepCount, GuidanceScale, Opt.Seed,
        ComputeText]));
-    if Opt.SamplerName <> 'auto' then
-      Pipeline.Sampler := SamplerOptionMethods[
-        SamplerOptionIndex(Opt.SamplerName)];
-    WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler), ' with the ',
-      Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
+    if Pipeline.Sampler = smLCM then
+      WriteLn('Sampler:  lcm with the ', Pipeline.SchedulerClassName,
+        ' config''s betas and the LCM origin timesteps')
+    else
+      WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler), ' with the ',
+        Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
     if (Opt.SamplerName = 'auto') and (Pipeline.SamplerNotice <> '') then
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
     if Opt.UseInt8 then WriteLn('Weights:  UNet int8, text encoder int8')
@@ -503,10 +530,15 @@ begin
         Opt.LoRAScales[LoRAPos]]));
     end;
     if Assigned(Img2Img) then
+    begin
+      // LCM runs every step over a strength-scaled timestep grid.
+      if Pipeline.Sampler = smLCM then Img2ImgStepCount := StepCount
+      else Img2ImgStepCount := StepCount -
+        TNNetDiffusionScheduler.Img2ImgStartStep(StepCount, Img2Img.Strength);
       WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
         [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
-         Opt.Steps - TNNetDiffusionScheduler.Img2ImgStartStep(Opt.Steps,
-         Img2Img.Strength), Opt.Steps]));
+         Img2ImgStepCount, StepCount]));
+    end;
     if Assigned(InstructPix2Pix) then
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',
         [Opt.EditImageFile, Image.SizeX, Image.SizeY,
@@ -545,15 +577,16 @@ begin
       ImageFile := ImageFileName(Opt.OutputFile, ImagePos, Opt.RepeatCount);
       if Opt.RepeatCount > 1 then
         WriteLn('Image ', ImagePos + 1, '/', Opt.RepeatCount, ', seed ', Seed);
-      // Euler a and the img2img VAE sample draw their noise from the global
-      // RNG; the initial latents use Seed itself, so this stream starts elsewhere.
+      // Euler a, LCM and the img2img VAE sample draw their noise from the
+      // global RNG; the initial latents use Seed itself, so this stream starts
+      // elsewhere.
       RandSeed := Seed xor $9E3779B9;
       StartTime := Now();
       if Opt.RepeatCount > 1 then
         Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
-          Opt.Steps, Seed, Image)
+          StepCount, Seed, Image)
       else
-        Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
+        Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, StepCount,
           Seed, Image);
       SaveStart := Now();
       Image.Mul(255.0);
