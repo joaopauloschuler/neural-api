@@ -202,7 +202,7 @@ ResNet + ViT, `BuildDPT`) estimates the depth from the init image, after the
 `feature_extractor/` `DPTImageProcessor` resize (bilinear to 384x384, mean and
 std 0.5), as diffusers does with `depth_map=None`. `--depth-image PNG`
 supplies the depth map instead: it is read as its luma (brighter = nearer, as
-the relative inverse depth of DPT / MiDaS), for example the grayscale PGM of
+the relative inverse depth of DPT / MiDaS; a 16-bit PNG keeps all 16 bits), for example the grayscale PGM of
 `examples/DepthAnythingV2` saved as PNG (`examples/MarigoldDepth` writes 0 =
 near: invert it first). Either map is resized to the latent grid with torch
 bicubic interpolation and normalized to [-1, 1] by its minimum and maximum;

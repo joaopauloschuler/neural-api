@@ -194,10 +194,12 @@ begin
       '--output');
 end;
 
-// Loads FileName as an RGB [0,1] volume.
-procedure LoadUnitRangeImage(const FileName: string; Image: TNNetVolume);
+// Loads FileName as an RGB [0,1] volume; FullPrecision keeps 16-bit samples.
+procedure LoadUnitRangeImage(const FileName: string; Image: TNNetVolume;
+  FullPrecision: boolean = false);
 begin
-  if not LoadImageFromFileIntoVolume(FileName, Image) then
+  if not LoadImageFromFileIntoVolume(FileName, Image, {pWithAlpha=}false,
+    FullPrecision) then
     raise Exception.Create('could not load ' + FileName);
   Image.Divi(cMaxPixelValue);
 end;
@@ -214,12 +216,20 @@ begin
       0.587 * RGB.FData[PixelPos * 3 + 1] + 0.114 * RGB.FData[PixelPos * 3 + 2];
 end;
 
-// Writes a [0,1] image (1 or 3 channels) to FileName, clamped to 0..255.
-procedure SaveUnitRangeImage(Img: TNNetVolume; const FileName: string);
+// Writes a [0,1] image (1 or 3 channels) to FileName, clamped to 0..255; a .png
+// with Use16BitPNG is written at 16 bits.
+procedure SaveUnitRangeImage(Img: TNNetVolume; const FileName: string;
+  Use16BitPNG: boolean = false);
 var
   ByteImage: TNNetVolume;
   PixelPos, MaxPixelPos: integer;
 begin
+  if Use16BitPNG and (LowerCase(ExtractFileExt(FileName)) = '.png') then
+  begin
+    if not SavePNG16FromVolume(Img, FileName, Img.Depth = 1) then
+      raise Exception.Create('could not save ' + FileName);
+    exit;
+  end;
   ByteImage := TNNetVolume.Create();
   try
     if Img.Depth = 1 then
@@ -339,8 +349,9 @@ begin
   try
     if Config.DualPixelTask then
     begin
-      LoadUnitRangeImage(Opt.LeftFile, Image);
-      LoadUnitRangeImage(Opt.RightFile, RightImage);
+      // The official test script reads the views at 16 bits and writes 16 bits.
+      LoadUnitRangeImage(Opt.LeftFile, Image, {FullPrecision=}true);
+      LoadUnitRangeImage(Opt.RightFile, RightImage, {FullPrecision=}true);
       RestormerPackDualPixel(Config, Image, RightImage, NetInput);
     end
     else
@@ -356,7 +367,7 @@ begin
     StartTime := Now();
     Restored := RestoreImage(WeightsFile, Config, NetInput, Opt, ComputeText);
     WriteLn(Format('  %.1f s', [(Now() - StartTime) * 86400.0]));
-    SaveUnitRangeImage(Restored, Opt.OutputFile);
+    SaveUnitRangeImage(Restored, Opt.OutputFile, Config.DualPixelTask);
     WriteLn(Format('  %dx%d -> %s', [Restored.SizeX, Restored.SizeY,
       Opt.OutputFile]));
   finally

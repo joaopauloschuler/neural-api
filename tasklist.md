@@ -595,8 +595,8 @@ rather than acted on.
             - [ ] transformers with torchvision uses the torchvision uint8
                   resize for DPTImageProcessor; the oracle here is the PIL
                   backend (torchvision is not installed in ~/x).
-          - [ ] --depth-image loads 8 bits per channel; a 16-bit depth PNG
-                loses precision (SetDepthMap itself takes any float map).
+          - [x] --depth-image loads 8 bits per channel: DONE, it loads with
+                LoadImageFromFileIntoVolume pFullPrecision (16-bit PNG kept).
         - [ ] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
               stabilityai/stable-diffusion-x4-upscaler) is not covered.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
@@ -783,9 +783,11 @@ rather than acted on.
         checkpoint).
   - [ ] Dual-pixel defocus follow-ups (examples/Restormer `--left/--right` +
         `RestormerPackDualPixel`, cee1d880):
-    - [ ] 16-bit PNG precision: `LoadImageIntoVolume` keeps the high 8 bits
-          (`shr 8`) and the example writes 8-bit output; the official script
-          reads /65535 and writes 16-bit PNG.
+    - [x] 16-bit PNG precision: DONE, --left/--right load with
+          LoadImageFromFileIntoVolume pFullPrecision and a .png output is
+          16-bit (SavePNG16FromVolume); TestLoadImage16BitFullPrecision.
+    - [ ] `--input` (single-image tasks) still reads and writes 8 bits; check
+          whether the official single-image defocus script reads DPDD at 16.
     - [ ] Not run on a real DPDD pair (needs `dual_pixel_defocus_deblurring.pth`).
   - [ ] GPU timing at 1-4 MP tiles, then coalescing `cai_transposed_attn_dots`,
         which reads q|k with a 3C stride per position (uncoalesced).

@@ -190,9 +190,10 @@ type
   // M.LoadFromFile, except netpbm (.ppm/.pgm/.pbm/.pnm) goes through a reader
   // that works around the FPC 3.2 raw-PNM bug (pixel bytes lost to a buffer).
   function LoadFPImageFromFile(M: TFPMemoryImage; ImageFileName: string): boolean;
-  // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each.
+  // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each. With
+  // pFullPrecision a 16-bit image loads as sample / 257; 8-bit ones load the same.
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
-    pWithAlpha: boolean = false);
+    pWithAlpha: boolean = false; pFullPrecision: boolean = false);
   // Depth 4 carries the 4th channel as alpha; smaller depths are opaque.
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
   // A depth-4 volume saved as .png keeps its alpha channel (0..255 each).
@@ -200,10 +201,14 @@ type
   // Channel 0 of V, clamped to [0,1], as a 16-bit grayscale PNG (value*65535,
   // as diffusers export_depth_to_16bit_png). False when the save fails.
   function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
+  // Channel 0 (pGrayScale) or channels 0..2 of V, clamped to [0,1], as a 16-bit
+  // PNG (value*65535). False when the save fails.
+  function SavePNG16FromVolume(V: TNNetVolume; const FileName: string;
+    pGrayScale: boolean): boolean;
   // V becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha (opaque files get
-  // alpha 255); 0..255 each. False when the file does not load.
+  // alpha 255); 0..255 each (pFullPrecision: see LoadImageIntoVolume).
   function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
-    pWithAlpha: boolean): boolean; overload;
+    pWithAlpha: boolean; pFullPrecision: boolean = false): boolean; overload;
   {$ENDIF}
 
   // Loads an image from a file and stores it into a Volume.
@@ -2963,14 +2968,14 @@ begin
 end;
 
 function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
-  pWithAlpha: boolean): boolean;
+  pWithAlpha: boolean; pFullPrecision: boolean): boolean;
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
   try
     Result := LoadFPImageFromFile(M, ImageFileName);
-    if Result then LoadImageIntoVolume(M, V, pWithAlpha);
+    if Result then LoadImageIntoVolume(M, V, pWithAlpha, pFullPrecision);
   finally
     M.Free;
   end;
@@ -3005,13 +3010,37 @@ begin
 end;
 
 function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
+begin
+  Result := SavePNG16FromVolume(V, FileName, {pGrayScale=}true);
+end;
+
+function SavePNG16FromVolume(V: TNNetVolume; const FileName: string;
+  pGrayScale: boolean): boolean;
 var
   M: TFPMemoryImage;
   PngWriter: TFPWriterPNG;
   LocalColor: TFPColor;
-  X, Y, MaxX, MaxY: integer;
-  GrayValue: word;
+  X, Y, MaxX, MaxY, RawPos, GreenOffset, BlueOffset: integer;
+
+  function Word16(Value: TNeuralFloat): word;
+  begin
+    Result := Round(Max(0.0, Min(1.0, Value)) * 65535);
+  end;
+
 begin
+  if pGrayScale then
+  begin
+    GreenOffset := 0;
+    BlueOffset := 0;
+  end
+  else
+  begin
+    if V.Depth < 3 then
+      raise Exception.Create('SavePNG16FromVolume: RGB needs 3 channels, got ' +
+        IntToStr(V.Depth) + '.');
+    GreenOffset := 1;
+    BlueOffset := 2;
+  end;
   M := TFPMemoryImage.Create(V.SizeX, V.SizeY);
   PngWriter := TFPWriterPNG.Create;
   try
@@ -3021,13 +3050,13 @@ begin
     for Y := 0 to MaxY do
       for X := 0 to MaxX do
       begin
-        GrayValue := Round(Max(0.0, Min(1.0, V.FData[V.GetRawPos(X, Y)])) * 65535);
-        LocalColor.red := GrayValue;
-        LocalColor.green := GrayValue;
-        LocalColor.blue := GrayValue;
+        RawPos := V.GetRawPos(X, Y);
+        LocalColor.red := Word16(V.FData[RawPos]);
+        LocalColor.green := Word16(V.FData[RawPos + GreenOffset]);
+        LocalColor.blue := Word16(V.FData[RawPos + BlueOffset]);
         M.Colors[X, Y] := LocalColor;
       end;
-    PngWriter.GrayScale := true;
+    PngWriter.GrayScale := pGrayScale;
     PngWriter.WordSized := true;
     PngWriter.UseAlpha := false;
     try
@@ -3043,14 +3072,42 @@ begin
 end;
 
 procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
-  pWithAlpha: boolean);
+  pWithAlpha: boolean; pFullPrecision: boolean);
+const
+  csSampleToByteDivisor = 257;
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalColor: TFPColor;
   RawPos, PixelStride: integer;
+
+  // FPImage readers widen an 8-bit sample v to v * 257 (PNG, BMP) or v shl 8
+  // (JPEG); any other low byte is 16-bit data.
+  function IsWide(Sample: word): boolean;
+  begin
+    Result := ((Sample and 255) <> 0) and ((Sample and 255) <> (Sample shr 8));
+  end;
+
+  function HasWideSamples(): boolean;
+  var
+    ScanX, ScanY: integer;
+    ScanColor: TFPColor;
+  begin
+    Result := true;
+    for ScanY := 0 to MaxY do
+      for ScanX := 0 to MaxX do
+      begin
+        ScanColor := M.Colors[ScanX, ScanY];
+        if IsWide(ScanColor.red) or IsWide(ScanColor.green) or
+          IsWide(ScanColor.blue) or (pWithAlpha and IsWide(ScanColor.alpha)) then
+          exit;
+      end;
+    Result := false;
+  end;
+
 begin
   MaxX := M.Width - 1;
   MaxY := M.Height - 1;
+  if pFullPrecision then pFullPrecision := HasWideSamples();
   if pWithAlpha then PixelStride := 4 else PixelStride := 3;
   Vol.ReSize(MaxX + 1, MaxY + 1, PixelStride);
 
@@ -3060,11 +3117,21 @@ begin
     for CountX := 0 to MaxX do
     begin
       LocalColor := M.Colors[CountX, CountY];
-
-      Vol.FData[RawPos]     := LocalColor.red shr 8;
-      Vol.FData[RawPos + 1] := LocalColor.green shr 8;
-      Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
-      if pWithAlpha then Vol.FData[RawPos + 3] := LocalColor.alpha shr 8;
+      if pFullPrecision then
+      begin
+        Vol.FData[RawPos]     := LocalColor.red / csSampleToByteDivisor;
+        Vol.FData[RawPos + 1] := LocalColor.green / csSampleToByteDivisor;
+        Vol.FData[RawPos + 2] := LocalColor.blue / csSampleToByteDivisor;
+        if pWithAlpha then
+          Vol.FData[RawPos + 3] := LocalColor.alpha / csSampleToByteDivisor;
+      end
+      else
+      begin
+        Vol.FData[RawPos]     := LocalColor.red shr 8;
+        Vol.FData[RawPos + 1] := LocalColor.green shr 8;
+        Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
+        if pWithAlpha then Vol.FData[RawPos + 3] := LocalColor.alpha shr 8;
+      end;
       Inc(RawPos, PixelStride);
     end;
   end;

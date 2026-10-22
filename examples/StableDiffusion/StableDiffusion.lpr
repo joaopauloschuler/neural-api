@@ -552,7 +552,8 @@ begin
       Depth2Img := TStableDiffusionDepth2Img.Create();
       if Opt.DepthImageFile <> '' then
       begin
-        if not LoadImageFromFileIntoVolume(Opt.DepthImageFile, Image) then
+        if not LoadImageFromFileIntoVolume(Opt.DepthImageFile, Image,
+          {pWithAlpha=}false, {pFullPrecision=}true) then
           raise Exception.Create('could not load ' + Opt.DepthImageFile);
         Depth2Img.SetDepthMap(Image);
       end;

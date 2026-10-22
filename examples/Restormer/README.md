@@ -113,10 +113,12 @@ The builder also refuses a checkpoint whose `patch_embed` input channels or
 `skip_conv` presence disagree with the config, so a dual-pixel `.pth` run with
 `--task defocus` stops with a message naming `inp_channels`.
 
-16-bit PNGs (the DPDD release format) load, but `LoadImageFromFileIntoVolume`
-keeps only the high 8 bits of each channel, and the output is written as an
-8-bit image. The official test script reads the views at 16 bits (`/65535`) and
-writes a 16-bit PNG, so results differ from it by up to that quantization.
+As the official test script does (`/65535` in, 16-bit PNG out), the views
+load at their full precision: `LoadImageFromFileIntoVolume` with
+`pFullPrecision` keeps all 16 bits of a 16-bit PNG (the DPDD release format),
+and an 8-bit view loads as before. A `.png` `--output` is written as a 16-bit
+PNG (`SavePNG16FromVolume`); other formats are 8-bit. The single-image tasks
+(`--input`) still read and write 8 bits.
 
 With no arguments, the example runs a smoke test on the committed random pico
 fixtures (`tests/fixtures/tiny_restormer.*` and `tiny_restormer_dp.*`). A
@@ -128,7 +130,6 @@ the output is not a restoration.
 ## Not covered
 
 * No real checkpoint has been run, and no GPU timing exists yet.
-* 16-bit input precision and 16-bit output (see above).
 
 ## Tests
 

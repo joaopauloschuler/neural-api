@@ -62,6 +62,7 @@ type
     // with its alpha; a 3-channel volume reloads opaque.
     procedure TestSaveImageRGBAPngRoundTrip;
     procedure TestSaveGray16PngRoundTrip;
+    procedure TestLoadImage16BitFullPrecision;
     // GaussianBlurImage of a centred hot pixel keeps its mass of 1, is
     // symmetric, peaks at 1/S^2 (S = the 1-D tap sum); a flat channel stays flat.
     procedure TestGaussianBlurImageHotPixel;
@@ -554,6 +555,63 @@ begin
   finally
     DeleteFile(FN);
     Img.Free;
+    Src.Free;
+  end;
+end;
+
+// 16-bit RGB / gray PNGs whose samples differ only in the low byte load as
+// sample / 257 with pFullPrecision; 8-bit PNG and JPEG load bit-identically.
+procedure TTestNeuralImagePreprocess.TestLoadImage16BitFullPrecision;
+const
+  cWords: array[0..3] of word = ($8001, $8002, $80FE, $1234);
+var
+  Src, Loaded, Plain: TNNetVolume;
+  FN, Ext: string;
+  X, C, ExtCnt: integer;
+begin
+  FN := GetTempDir + 'cai_rgb16_roundtrip.png';
+  Src := TNNetVolume.Create(4, 1, 3);
+  Loaded := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  try
+    for X := 0 to 3 do
+      for C := 0 to 2 do Src[X, 0, C] := cWords[(X + C) mod 4] / 65535;
+    AssertTrue('saved rgb16', SavePNG16FromVolume(Src, FN, {pGrayScale=}false));
+    AssertTrue('loaded full', LoadImageFromFileIntoVolume(FN, Loaded, false, true));
+    AssertTrue('loaded plain', LoadImageFromFileIntoVolume(FN, Plain, false));
+    AssertEquals('depth', 3, Loaded.Depth);
+    for X := 0 to 3 do
+      for C := 0 to 2 do
+      begin
+        AssertEquals('full ' + IntToStr(X) + ',' + IntToStr(C),
+          cWords[(X + C) mod 4] / 257, Loaded[X, 0, C], 1e-4);
+        AssertEquals('plain keeps the high byte', cWords[(X + C) mod 4] shr 8,
+          Plain[X, 0, C], 0);
+      end;
+    AssertTrue('low byte kept', Loaded[0, 0, 0] <> Loaded[1, 0, 0]);
+    AssertTrue('saved gray16', SavePNG16FromVolume(Src, FN, {pGrayScale=}true));
+    AssertTrue('loaded gray', LoadImageFromFileIntoVolume(FN, Loaded, false, true));
+    for X := 0 to 3 do
+      for C := 0 to 2 do
+        AssertEquals('gray ' + IntToStr(X), cWords[X] / 257, Loaded[X, 0, C], 1e-4);
+    DeleteFile(FN);
+    for X := 0 to 3 do
+      for C := 0 to 2 do Src[X, 0, C] := (X * 61 + C * 97) mod 256;
+    for ExtCnt := 0 to 1 do
+    begin
+      if ExtCnt = 0 then Ext := '.png' else Ext := '.jpg';
+      FN := GetTempDir + 'cai_rgb8_fullprecision' + Ext;
+      AssertTrue('saved 8-bit' + Ext, SaveImageFromVolumeIntoFile(Src, FN));
+      AssertTrue('loaded full' + Ext,
+        LoadImageFromFileIntoVolume(FN, Loaded, false, true));
+      AssertTrue('loaded plain' + Ext, LoadImageFromFileIntoVolume(FN, Plain));
+      AssertEquals('8-bit' + Ext + ' bit identical', 0.0, Loaded.SumDiff(Plain), 0);
+      DeleteFile(FN);
+    end;
+  finally
+    DeleteFile(FN);
+    Plain.Free;
+    Loaded.Free;
     Src.Free;
   end;
 end;
