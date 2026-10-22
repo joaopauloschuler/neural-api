@@ -46,7 +46,9 @@ StableDiffusion [--model DIR] [options]
   --negative TEXT   negative prompt (default empty)
   --steps N         denoising steps (default 25)
   --guidance G      classifier-free guidance scale (default 7.5; <= 1 turns it off)
-  --size N          square image side (default: the checkpoint's, 512 for SD 1.5)
+  --width N         image width (default: the checkpoint's, 512 for SD 1.5)
+  --height N        image height (default: the checkpoint's)
+  --size N          sets both --width and --height
   --seed N          noise seed (default 0)
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
                     euler, euler-a or dpm++2m
@@ -74,7 +76,10 @@ only.
   No real checkpoint has been run yet.
 * Euler with `linspace` spacing rounds the timesteps to integers; diffusers
   keeps fractional ones when `T - 1` is not a multiple of `steps - 1`.
-* Images are square: the UNet and VAE builders take one latent grid side.
+* Width and height must each be a multiple of the VAE factor times the UNet
+  down factor (8 * 8 = 64 for SD 1.5; 4 for the pico folder). Non-square sizes
+  are tested against diffusers at 32x16 on the pico folder
+  (`TestStableDiffusionPipelineNonSquare`).
 * The weights must be F32 `*.safetensors`; the `*.fp16.safetensors` variant
   files are untested.
 * The noise (the initial latents and the Euler a step noise) comes from the

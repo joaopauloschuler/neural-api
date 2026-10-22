@@ -1227,6 +1227,7 @@ type
     procedure TestStableDiffusionPipelineParity;
     procedure TestStableDiffusionPipelineSamplers;
     procedure TestStableDiffusionPipelineRefusesBadSize;
+    procedure TestStableDiffusionPipelineNonSquare;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -45652,8 +45653,8 @@ begin
   end;
 end;
 
-// Non-square sizes and sides that are not a multiple of the VAE factor times
-// the UNet down factor are refused before any weight loads.
+// Sides that are not a multiple of the VAE factor times the UNet down factor
+// are refused before any weight loads; non-square sizes are fine.
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineRefusesBadSize;
 var
   Pipeline: TStableDiffusionPipeline;
@@ -45674,14 +45675,88 @@ begin
   Latents := TNNetVolume.Create;
   try
     AssertEquals('vae factor', 2, Pipeline.VaeScaleFactor);
-    AssertTrue('non-square', Refused(16, 32));
     AssertTrue('not a multiple of 4', Refused(6, 6));
+    AssertTrue('height not a multiple of 4', Refused(16, 6));
     AssertFalse('16 is fine', Refused(16, 16));
     AssertEquals('latent grid', 8, Latents.SizeX);
     AssertEquals('latent depth', 4, Latents.Depth);
+    AssertFalse('16x32 is fine', Refused(16, 32));
+    AssertEquals('latent grid x', 8, Latents.SizeX);
+    AssertEquals('latent grid y', 16, Latents.SizeY);
   finally
     Latents.Free;
     Pipeline.Free;
+  end;
+end;
+
+// 32x16 against diffusers float64 (tests/fixtures/tiny_sd15_nonsquare_io.json):
+// the step-0 UNet output, the guided steps and the decoded image, all < 1e-4.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineNonSquare;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Embeds, Initial, Noise, Image, Expected: TNNetVolume;
+  ImageWidth, ImageHeight: integer;
+  MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_nonsquare_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Net := nil;
+  try
+    ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
+    ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
+    AssertTrue('fixture is non-square', ImageWidth <> ImageHeight);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    AssertEquals('latent x', ImageWidth div 2, Initial.SizeX);
+    AssertEquals('latent y', ImageHeight div 2, Initial.SizeY);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Initial.SizeX;
+    Config.LatentGridY := Initial.SizeY;
+    Config.TextSeqLen := Embeds.SizeX;
+    Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+    SDUNetDenoise(Net, Config, Initial, Embeds,
+      TJSONObject(FSD15Oracle).Arrays['timesteps'].Integers[0], Noise);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['unet_cond_0'], true,
+      Expected);
+    MaxDiff := MaxAbsVolumeDiff(Noise, Expected);
+    AssertTrue('unet output max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    FreeAndNil(Net);
+    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
+      0.0);
+    FSD15StepMaxDiff := 0;
+    FSD15StepCount := 0;
+    Pipeline.OnStep := @SD15CheckStep;
+    Pipeline.GenerateFromEmbeds(Embeds, ImageWidth, ImageHeight,
+      TJSONObject(FSD15Oracle).Get('steps', 0), 0, Image, Initial);
+    AssertEquals('steps run', TJSONObject(FSD15Oracle).Get('steps', 0),
+      FSD15StepCount);
+    AssertTrue('step latents max |diff| = ' + FloatToStr(FSD15StepMaxDiff),
+      FSD15StepMaxDiff < 1e-4);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['image'], false,
+      Expected);
+    AssertEquals('image width', ImageWidth, Image.SizeX);
+    AssertEquals('image height', ImageHeight, Image.SizeY);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('image max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    Net.Free;
+    Expected.Free;
+    Image.Free;
+    Noise.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
   end;
 end;
 

@@ -11700,7 +11700,8 @@ type
     BlockOutChannels: array[0..7] of integer; // diffusers block_out_channels
     LayersPerBlock: integer;                 // ResNet blocks per up block - 1
     NormNumGroups: integer;                  // GroupNorm groups (32)
-    LatentGrid: integer;                     // LATENT grid H=W for the Input
+    LatentGrid: integer;                     // LATENT grid W (and H when square)
+    LatentGridY: integer;                    // LATENT grid H; 0 = LatentGrid
     ScalingFactor: TNeuralFloat;             // SD latent scaling (0.18215)
     NormEps: TNeuralFloat;                   // GroupNorm eps (1e-6)
     ModelType: string;                       // 'AutoencoderKL'
@@ -11716,10 +11717,13 @@ function ReadVaeDecoderConfigFromJSONFile(
 
 function VaeDecoderConfigToString(const Config: TVaeDecoderConfig): string;
 
+// The latent grid height: LatentGridY, or LatentGrid when LatentGridY = 0.
+function LatentGridYOf(const Config: TVaeDecoderConfig): integer; overload;
+
 // Builds the AutoencoderKL DECODER described by Config and loads every weight
-// from Reader (caller owns Reader). The net takes a (LatentGrid, LatentGrid,
-// LatentChannels) latent volume and outputs a (LatentGrid*2^(num_block-1))^2
-// RGB image with OutChannels channels (raw, pre-clamp).
+// from Reader (caller owns Reader). The net takes a (LatentGrid, LatentGridYOf,
+// LatentChannels) latent volume and outputs that grid times 2^(num_block-1)
+// as an RGB image with OutChannels channels (raw, pre-clamp).
 function BuildVaeDecoder(Reader: TNNetSafeTensorsReader;
   const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
@@ -11857,7 +11861,8 @@ type
                                               // (a head COUNT; SD1.5 8 everywhere,
                                               // SD2.x [5,10,20,20]).
     NormNumGroups: integer;                   // GroupNorm groups (32)
-    LatentGrid: integer;                      // latent H=W for the Input
+    LatentGrid: integer;                      // latent W (and H when square)
+    LatentGridY: integer;                     // latent H; 0 = LatentGrid
     TextSeqLen: integer;                      // encoder_hidden_states length
     TimeEmbedDim: integer;                    // 4*BlockOutChannels[0]
     ModelType: string;                        // 'UNet2DConditionModel'
@@ -11890,6 +11895,9 @@ function ReadSDUNetConfigFromJSONText(const JsonSource,
   SourceName: string): TSDUNetConfig;
 
 function SDUNetConfigToString(const Config: TSDUNetConfig): string;
+
+// The latent grid height: LatentGridY, or LatentGrid when LatentGridY = 0.
+function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
 
 // Builds the UNet2DConditionModel described by Config and loads every weight
 // from Reader (caller owns Reader). Three TNNetInputs (latent, timestep, text
@@ -11932,8 +11940,8 @@ function SDUNetTimestepInput(Net: TNNet): TNNetLayer;
 function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 
 // Fills all three inputs, runs one forward, and copies the predicted noise
-// (InChannels, LatentGrid, LatentGrid) into Noise. Latent/EncStates are
-// (InChannels,Grid,Grid)/(TextSeqLen,1,CrossDim) volumes.
+// into Noise. Latent is (LatentGrid, LatentGridYOf, InChannels); EncStates is
+// (TextSeqLen, 1, CrossDim).
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
 
@@ -12114,7 +12122,7 @@ type
   // sets betas, spacing and prediction type, and its _class_name the Sampler
   // (DiffusersSchedulerSampler: DDIM, PNDM, Euler, Euler a, DPM++ 2M; other
   // classes run DDIM and say so in SamplerNotice).
-  // Latents are (Grid, Grid, latent_channels); images are square. Coded by Claude (AI).
+  // Latents are (Width, Height, latent_channels) / VaeScaleFactor. Coded by Claude (AI).
   TStableDiffusionPipeline = class(TObject)
   private
     FModelFolder: string;
@@ -12145,9 +12153,9 @@ type
     function ComponentFolder(const Component: string): string;
     procedure DoPhase(Phase: TStableDiffusionPipelinePhase);
     procedure PrepareComponent(Net: TNNet);
-    // Latent grid of a Width x Height image; raises unless it is square and a
+    // Latent grid of a Width x Height image; raises unless both sides are a
     // multiple of what the VAE and the UNet down blocks need.
-    function LatentGridFor(Width, Height: integer): integer;
+    procedure LatentGridFor(Width, Height: integer; out GridX, GridY: integer);
     // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
     procedure EncodeTokenIdLists(const TokenLists: array of TNeuralIntegerArray;
       const Embeds: array of TNNetVolume);
@@ -12173,8 +12181,8 @@ type
     // Replaces the unconditional embeds (NegativePrompt's, encoded on demand).
     procedure SetNegativePromptEmbeds(Embeds: TNNetVolume);
     procedure ClearNegativePrompt();
-    // Standard-normal (Grid, Grid, in_channels) latents from Seed (FPC RNG; the
-    // global RandSeed is restored). Torch's noise is not reproducible.
+    // Standard-normal (GridX, GridY, in_channels) latents from Seed (FPC RNG;
+    // the global RandSeed is restored). Torch's noise is not reproducible.
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
     // StepCount Sampler steps on Latents in place (unit noise in, scaled by
@@ -72414,6 +72422,7 @@ begin
           '"latent_size" (latent grid) or "sample_size" (image size).');
       Result.LatentGrid := SampleSize shr (Result.NumBlockOut - 1);
     end;
+    Result.LatentGridY := 0;
     if Result.LatentGrid < 1 then
       ImportError('VAE import: resolved latent grid is ' +
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
@@ -72455,6 +72464,14 @@ begin
     ', norm_num_groups=' + IntToStr(Config.NormNumGroups) +
     ', latent_grid=' + IntToStr(Config.LatentGrid) +
     ', scaling_factor=' + FloatToStr(Config.ScalingFactor);
+  if Config.LatentGridY > 0 then
+    Result := Result + ', latent_grid_y=' + IntToStr(Config.LatentGridY);
+end;
+
+function LatentGridYOf(const Config: TVaeDecoderConfig): integer;
+begin
+  if Config.LatentGridY > 0 then Result := Config.LatentGridY
+  else Result := Config.LatentGrid;
 end;
 
 // Loads a diffusers nn.Conv2d (weight [O,I,kh,kw] + bias [O]) into a CAI
@@ -72717,7 +72734,7 @@ begin
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    NN.AddLayer( TNNetInput.Create(Config.LatentGrid, Config.LatentGrid,
+    NN.AddLayer( TNNetInput.Create(Config.LatentGrid, LatentGridYOf(Config),
       Config.LatentChannels) );
     // Undo the SD latent scaling, then post_quant_conv (1x1) + conv_in (3x3).
     NN.AddLayer( TNNetMulByConstant.Create(1.0 / Config.ScalingFactor) );
@@ -74731,6 +74748,7 @@ begin
         ImportError('SD UNet import: config needs "latent_size" or "sample_size".');
       Result.LatentGrid := SampleSize;
     end;
+    Result.LatentGridY := 0;
     if Result.LatentGrid < 1 then
       ImportError('SD UNet import: resolved latent grid is ' +
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
@@ -74828,6 +74846,8 @@ begin
     ', groups=' + IntToStr(Config.NormNumGroups) +
     ', latent_grid=' + IntToStr(Config.LatentGrid) +
     ', text_seq=' + IntToStr(Config.TextSeqLen);
+  if Config.LatentGridY > 0 then
+    Result := Result + ', latent_grid_y=' + IntToStr(Config.LatentGridY);
   if Config.UseLinearProjection then Result := Result + ', linear_proj';
   Result := Result + ', tlpb=[';
   for i := 0 to NumBlockOutM1 do
@@ -74841,6 +74861,12 @@ begin
       IntToStr(Config.AdditionTimeEmbedDim) + ', text=' +
       IntToStr(Config.AdditionEmbedTextDim) + ', add_embeds_in=' +
       IntToStr(Config.AddEmbedsInputDim);
+end;
+
+function LatentGridYOf(const Config: TSDUNetConfig): integer;
+begin
+  if Config.LatentGridY > 0 then Result := Config.LatentGridY
+  else Result := Config.LatentGrid;
 end;
 
 type
@@ -75119,13 +75145,13 @@ end;
 // only adds controlnet residuals into down_block_res_samples). The control input
 // is appended to CtrlInputs. No-op (returns HLayer) when pWithControl is false.
 function SDUNetSpliceControlSkip(NN: TNNet; HLayer: TNNetLayer;
-  Grid, Ch: integer; pWithControl: boolean;
+  GridX, GridY, Ch: integer; pWithControl: boolean;
   var CtrlInputs: array of TNNetLayer; var CtrlTop: integer): TNNetLayer;
 var
   Ctrl: TNNetLayer;
 begin
   if not pWithControl then begin Result := HLayer; Exit; end;
-  Ctrl := NN.AddLayer( TNNetInput.Create(Grid, Grid, Ch) );
+  Ctrl := NN.AddLayer( TNNetInput.Create(GridX, GridY, Ch) );
   CtrlInputs[CtrlTop] := Ctrl; Inc(CtrlTop);
   Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Ctrl])], HLayer );
 end;
@@ -75135,13 +75161,13 @@ end;
 // state that flows DOWNSTREAM (unlike SDUNetSpliceControlSkip which only feeds
 // the decoder skip). No-op (returns HLayer) when pWithAdapter is false.
 function SDUNetSpliceAdapterMain(NN: TNNet; HLayer: TNNetLayer;
-  Grid, Ch: integer; pWithAdapter: boolean;
+  GridX, GridY, Ch: integer; pWithAdapter: boolean;
   var AdapterInputs: array of TNNetLayer; var AdapterTop: integer): TNNetLayer;
 var
   Adp: TNNetLayer;
 begin
   if not pWithAdapter then begin Result := HLayer; Exit; end;
-  Adp := NN.AddLayer( TNNetInput.Create(Grid, Grid, Ch) );
+  Adp := NN.AddLayer( TNNetInput.Create(GridX, GridY, Ch) );
   AdapterInputs[AdapterTop] := Adp; Inc(AdapterTop);
   Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Adp])], HLayer );
 end;
@@ -75160,7 +75186,7 @@ var
   SwapTmp: TNeuralFloat;
   d0, half, halfM1, n, nM1, NumResnet, i, j, ci, b: integer;
   InCh, OutCh, MidCh, RevIdx, PrevOut, InputCh, ResSkip, ResnetIn: integer;
-  CurGrid: integer;
+  CurGridX, CurGridY: integer;
   Prefix: string;
   // skip stack (down-path res samples) + per-block layer refs.
   Skips: array of TNNetLayer;
@@ -75188,6 +75214,13 @@ begin
   NumResnetM1 := NumResnet - 1;
   if (Config.NumHeads < 1) then
     ImportError('SD UNet import: num_heads must be >= 1.');
+  // Each down block halves the grid and the up blocks double it back, so the
+  // skip concats only line up when both sides divide by 2^(n-1).
+  if (Config.LatentGrid mod (1 shl nM1) <> 0) or
+    (LatentGridYOf(Config) mod (1 shl nM1) <> 0) then
+    ImportError('SD UNet import: latent grid ' + IntToStr(Config.LatentGrid) +
+      'x' + IntToStr(LatentGridYOf(Config)) + ' is not a multiple of ' +
+      IntToStr(1 shl nM1) + '.');
   NN := TNNet.Create();
   try
     SetLength(DownRes, n);
@@ -75203,12 +75236,13 @@ begin
     CtrlTop := 0;
     SetLength(AdapterInputs, 64);
     AdapterTop := 0;
-    CurGrid := Config.LatentGrid;
+    CurGridX := Config.LatentGrid;
+    CurGridY := LatentGridYOf(Config);
 
     // ---------------- Architecture ----------------
     // input0: noisy latent.
-    LatentInput := NN.AddLayer( TNNetInput.Create(Config.LatentGrid,
-      Config.LatentGrid, Config.InChannels) );
+    LatentInput := NN.AddLayer( TNNetInput.Create(CurGridX, CurGridY,
+      Config.InChannels) );
     ConvIn := NN.AddLayer(
       TNNetConvolutionLinear.Create(d0, 3, 1, 1, 0).SetTrainable(pTrainable) );
     HLayer := ConvIn;
@@ -75253,8 +75287,8 @@ begin
 
     // conv_in skip (deferred until after the latent/timestep/text inputs so the
     // skip control inputs all sit at TNNetInput index >= 3).
-    Skips[SkipTop] := SDUNetSpliceControlSkip(NN, ConvIn, CurGrid, d0,
-      pWithControl, CtrlInputs, CtrlTop);
+    Skips[SkipTop] := SDUNetSpliceControlSkip(NN, ConvIn, CurGridX, CurGridY,
+      d0, pWithControl, CtrlInputs, CtrlTop);
     SkipCh[SkipTop] := d0; Inc(SkipTop);
 
     // ---- DOWN blocks ----
@@ -75277,14 +75311,14 @@ begin
             pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
-        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
-          pWithControl, CtrlInputs, CtrlTop);
+        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
+          CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end;
       // T2I-Adapter: add the per-stage feature into the MAIN path at the end of
       // this down block, BEFORE the downsampler (diffusers intrablock residual).
-      HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGrid, OutCh,
-        pWithAdapter, AdapterInputs, AdapterTop);
+      HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
+        OutCh, pWithAdapter, AdapterInputs, AdapterTop);
       InCh := OutCh;
       if i < nM1 then
       begin
@@ -75293,9 +75327,10 @@ begin
           [TNNetConvolutionLinear.Create(OutCh, 3, 1, 2, 0).SetTrainable(pTrainable)],
           HLayer);
         HLayer := NN.GetLastLayer();
-        CurGrid := CurGrid div 2;
-        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
-          pWithControl, CtrlInputs, CtrlTop);
+        CurGridX := CurGridX div 2;
+        CurGridY := CurGridY div 2;
+        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
+          CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end
       else
@@ -75317,7 +75352,7 @@ begin
     // mid residual is ADDED into the value flowing into the up blocks.
     if pWithControl then
     begin
-      MidCtrlInput := NN.AddLayer( TNNetInput.Create(CurGrid, CurGrid, MidCh) );
+      MidCtrlInput := NN.AddLayer( TNNetInput.Create(CurGridX, CurGridY, MidCh) );
       HLayer := NN.AddLayerAfter( [TNNetSum.Create([HLayer, MidCtrlInput])],
         HLayer );
     end;
@@ -77472,7 +77507,7 @@ var
   MidAttn: TVaeAttnLayers;
   DownRes: array of array of TVaeResnetLayers;
   DownConv: array of TNNetLayer;
-  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, Out2: integer;
+  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, ImgGridY, Out2: integer;
   NumBlockOutM1, nResnetM1: integer;
   Prefix: string;
 begin
@@ -77486,12 +77521,13 @@ begin
   nResnetM1 := nResnet - 1;
   Out2 := 2 * Config.LatentChannels;
   ImgGrid := Config.LatentGrid shl (Config.NumBlockOut - 1);
+  ImgGridY := LatentGridYOf(Config) shl (Config.NumBlockOut - 1);
   SetLength(DownRes, Config.NumBlockOut);
   SetLength(DownConv, Config.NumBlockOut);
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.OutChannels) );
+    NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGridY, Config.OutChannels) );
     ConvIn := NN.AddLayer(
       TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).SetTrainable(pTrainable) );
     // DOWN blocks: block_out_channels in low->high order. Block d has nResnet
@@ -77712,6 +77748,7 @@ begin
   Result.LayersPerBlock := Config.LayersPerBlock;
   Result.NormNumGroups := Config.NormNumGroups;
   Result.LatentGrid := Config.LatentGrid;
+  Result.LatentGridY := 0;
   Result.ScalingFactor := 1.0;   // VQModel has NO latent scaling
   Result.NormEps := Config.NormEps;
   Result.ModelType := Config.ModelType;
@@ -92250,20 +92287,19 @@ begin
   Result := FHasNegativePromptEmbeds;
 end;
 
-function TStableDiffusionPipeline.LatentGridFor(Width,
-  Height: integer): integer;
+procedure TStableDiffusionPipeline.LatentGridFor(Width, Height: integer;
+  out GridX, GridY: integer);
 var
   SideMultiple: integer;
 begin
   SideMultiple := GetVaeScaleFactor() * (1 shl (FUNetConfig.NumBlockOut - 1));
-  if Width <> Height then
-    ImportError('TStableDiffusionPipeline: ' + IntToStr(Width) + 'x' +
-      IntToStr(Height) + ' is not square; the UNet and VAE builders take ' +
-      'one latent grid side.');
-  if (Width < SideMultiple) or (Width mod SideMultiple <> 0) then
-    ImportError('TStableDiffusionPipeline: image side ' + IntToStr(Width) +
-      ' is not a positive multiple of ' + IntToStr(SideMultiple) + '.');
-  Result := Width div GetVaeScaleFactor();
+  if (Width < SideMultiple) or (Width mod SideMultiple <> 0) or
+    (Height < SideMultiple) or (Height mod SideMultiple <> 0) then
+    ImportError('TStableDiffusionPipeline: image ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ' needs both sides a positive multiple of ' +
+      IntToStr(SideMultiple) + '.');
+  GridX := Width div GetVaeScaleFactor();
+  GridY := Height div GetVaeScaleFactor();
 end;
 
 procedure TStableDiffusionPipeline.SetNegativePrompt(const Value: string);
@@ -92378,11 +92414,11 @@ end;
 procedure TStableDiffusionPipeline.MakeInitialLatents(Width, Height: integer;
   Seed: cardinal; Latents: TNNetVolume);
 var
-  Grid: integer;
+  GridX, GridY: integer;
   SavedSeed: cardinal;
 begin
-  Grid := LatentGridFor(Width, Height);
-  Latents.ReSize(Grid, Grid, FUNetConfig.InChannels);
+  LatentGridFor(Width, Height, GridX, GridY);
+  Latents.ReSize(GridX, GridY, FUNetConfig.InChannels);
   SavedSeed := RandSeed;
   RandSeed := Seed;
   Latents.RandomizeGaussian(1.0);
@@ -92397,11 +92433,11 @@ var
   Schedule: TNeuralIntegerArray;
   Pred, PredUncond: TNNetVolume;
   IsGuided: boolean;
-  Grid, StepPos, MaxStepPos, Tt: integer;
+  GridX, GridY, StepPos, MaxStepPos, Tt: integer;
   Eta, NoiseScale: TNeuralFloat;
 begin
-  Grid := LatentGridFor(Width, Height);
-  if (Latents.SizeX <> Grid) or (Latents.SizeY <> Grid) or
+  LatentGridFor(Width, Height, GridX, GridY);
+  if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
     (Latents.Depth <> FUNetConfig.InChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
@@ -92419,7 +92455,8 @@ begin
       IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
       IntToStr(PromptEmbeds.SizeX) + '.');
   StepConfig := FUNetConfig;
-  StepConfig.LatentGrid := Grid;
+  StepConfig.LatentGrid := GridX;
+  StepConfig.LatentGridY := GridY;
   StepConfig.TextSeqLen := PromptEmbeds.SizeX;
   DoPhase(sdphLoadUNet);
   Net := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
@@ -92468,7 +92505,8 @@ var
   Net: TNNet;
 begin
   DecoderConfig := FVaeConfig;
-  DecoderConfig.LatentGrid := LatentGridFor(Width, Height);
+  LatentGridFor(Width, Height, DecoderConfig.LatentGrid,
+    DecoderConfig.LatentGridY);
   DoPhase(sdphLoadVae);
   Net := BuildVaeDecoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
     ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,

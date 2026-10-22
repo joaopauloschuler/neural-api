@@ -43,8 +43,8 @@ type
     ModelFolder, Prompt, NegativePrompt, OutputFile: string;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
-    // ImageSize < 1: the checkpoint default (unet sample_size * VAE factor).
-    Steps, ImageSize: integer;
+    // A side < 1: the checkpoint default (unet sample_size * VAE factor).
+    Steps, ImageWidth, ImageHeight: integer;
     GuidanceScale: double;
     Seed: cardinal;
     UseOpenCL: boolean;
@@ -92,8 +92,10 @@ begin
   WriteLn('  --steps N         denoising steps (default 25)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5; ',
     '<= 1 turns it off)');
-  WriteLn('  --size N          square image side (default: the checkpoint''s, ',
+  WriteLn('  --width N         image width (default: the checkpoint''s, ',
     '512 for SD 1.5)');
+  WriteLn('  --height N        image height (default: the checkpoint''s)');
+  WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
   WriteLn('                    pndm, euler, euler-a or dpm++2m');
@@ -144,7 +146,8 @@ begin
   Opt.OutputFile := 'stable_diffusion.png';
   Opt.SamplerName := 'auto';
   Opt.Steps := 25;
-  Opt.ImageSize := 0;
+  Opt.ImageWidth := 0;
+  Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
   Opt.Seed := 0;
   Opt.UseOpenCL := false;
@@ -160,7 +163,13 @@ begin
     else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
     else if Arg = '--output' then Opt.OutputFile := NextArg()
     else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
-    else if Arg = '--size' then Opt.ImageSize := StrToInt(NextArg())
+    else if Arg = '--width' then Opt.ImageWidth := StrToInt(NextArg())
+    else if Arg = '--height' then Opt.ImageHeight := StrToInt(NextArg())
+    else if Arg = '--size' then
+    begin
+      Opt.ImageWidth := StrToInt(NextArg());
+      Opt.ImageHeight := Opt.ImageWidth;
+    end
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
@@ -190,7 +199,7 @@ var
   Reporter: TStableDiffusionReporter;
   Image: TNNetVolume;
   ComputeText: string;
-  ImageSize: integer;
+  ImageWidth, ImageHeight: integer;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
   OpenCLDevices: TEasyOpenCL;
@@ -227,8 +236,10 @@ begin
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
     end;
-    ImageSize := Opt.ImageSize;
-    if ImageSize < 1 then ImageSize := Pipeline.DefaultImageSize;
+    ImageWidth := Opt.ImageWidth;
+    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
+    ImageHeight := Opt.ImageHeight;
+    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
     Pipeline.GuidanceScale := Opt.GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.OnPhase := @Reporter.OnPhase;
@@ -236,7 +247,7 @@ begin
     WriteLn('Model:    ', Opt.ModelFolder);
     WriteLn('Prompt:   "', Opt.Prompt, '"');
     WriteLn(Format('Image:    %dx%d, %d steps, guidance %.2f, seed %d, %s',
-      [ImageSize, ImageSize, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
+      [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
        ComputeText]));
     if Opt.SamplerName <> 'auto' then
       Pipeline.Sampler := SamplerOptionMethods[
@@ -249,8 +260,8 @@ begin
     // latents use Opt.Seed itself, so this stream starts elsewhere.
     RandSeed := Opt.Seed xor $9E3779B9;
     StartTime := Now();
-    Pipeline.Generate(Opt.Prompt, ImageSize, ImageSize, Opt.Steps, Opt.Seed,
-      Image);
+    Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
+      Opt.Seed, Image);
     WriteLn(Format('Total:    %.1f s', [(Now() - StartTime) * 86400.0]));
     Image.Mul(255.0);
     if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then
