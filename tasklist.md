@@ -591,10 +591,46 @@ rather than acted on.
             TSDAttnLayers.Blocks[].Cross_K / Cross_V) while it is unchanged, and two
             caches, because CFG alternates the cond and uncond text every step
             (or run CFG as one batch-2 pass).
-      - [ ] Wire DiffusionInpainting / ControlNetCanny / T2IAdapterSketch to the
-            real CLIP text states (TStableDiffusionPipeline.EncodePrompt) and a
-            full sampling loop; they still fill the UNet text input with
-            synthetic states, and ControlNet/T2I run one step and write no image.
+      - [X] Wire DiffusionInpainting / ControlNetCanny / T2IAdapterSketch to the
+            real CLIP text states and a full sampling loop (e97cee7f, 7249e7a5,
+            fb7c86b7). TStableDiffusionConditioner hooks every UNet pass of
+            TStableDiffusionPipeline.Denoise; TStableDiffusionControlNet,
+            TStableDiffusionT2IAdapter and TStableDiffusionInpainter (9-channel
+            UNet, or the 4-channel blend after each step) sit on it, and the
+            three examples take --model + --controlnet/--adapter/--image/--mask
+            and write a PNG. Pico parity < 1e-4 vs diffusers float64
+            (tools/make_pico_sd_conditioning_fixtures.py): ControlNet (scale
+            0.5), a one-channel sketch adapter (scale 0.8), inpainting with
+            4-channel DDIM + Euler and 9-channel DDIM. Fixed on the way:
+            BuildSDUNet(pWithAdapter) added the T2I features after the block's
+            last skip (diffusers adds them before it), and the ControlNet / T2I
+            config readers refused real diffusers configs (no sample_size /
+            cond_size). Follow-ups:
+        - [ ] Real-checkpoint runs on the user's GPU box (--gpu, also --int8):
+              lllyasviel/sd-controlnet-canny, TencentARC/t2iadapter_sketch_sd15v2
+              and runwayml/stable-diffusion-inpainting (plus the blended mode on
+              SD 1.5). The conditioners' OpenCL and int8 paths only ran on the
+              pico (CPU) so far.
+        - [ ] T2I-Adapter on a plain DownBlock2D that has a downsampler (the
+              feature goes after the downsampler, in place on the last skip):
+              coded from the diffusers source, no fixture has such a block.
+        - [ ] Canny edge extraction (a cv2.Canny port: Gaussian blur, Sobel,
+              non-maximum suppression, hysteresis) so ControlNetCanny can take a
+              photo; it takes a ready edge map today.
+        - [ ] Inpainting strength < 1 (start from the re-noised image latents
+              at the truncated schedule) and the sampled VAE latents (diffusers
+              retrieve_latents samples; ours takes the mean).
+        - [ ] ControlNet guess mode, control_guidance_start/end, MultiControlNet,
+              T2I MultiAdapter, and ControlNet + T2I-Adapter at once (BuildSDUNet
+              interleaves the control and adapter TNNetInputs when both flags are
+              set, which SDUNetDenoiseWithControl/WithAdapter do not expect).
+        - [ ] Retire SDUNetDenoiseInpaint (its blend runs before the UNet with
+              fresh AddNoise draws, not diffusers' after-step blend with the
+              initial noise) and TestDiffusionInpaintSmoke, superseded by
+              TStableDiffusionInpainter.
+        - [ ] Two diffusers image-processor ports: DiffusersPrepareImage and
+              QwenImage21ResizeToRgba/QwenImage21PrepareVaeImage (premultiplied
+              RGBA). Fold the Qwen pair onto one routine.
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
       - [X] Textual inversion embeddings (port of diffusers
@@ -740,8 +776,8 @@ rather than acted on.
       TestControlNetParity 2.89e-6 < 1e-4). First conditioning-by-feature-injection model.
       DEFERRED follow-ups: (a) real-checkpoint slicer (slice sd-controlnet-canny like
       slice_llama.py) for parity vs real weights on top of the synthetic fixture;
-      (b) the diffusers per-residual conditioning_scale multiplier (constant 1.0
-      here); (c) T2I-Adapter (BuildT2IAdapterFromSafeTensors[Ex], landed)
+      (b) [X] the diffusers controlnet_conditioning_scale multiplier
+      (TStableDiffusionControlNet.ConditioningScale, e97cee7f); (c) T2I-Adapter (BuildT2IAdapterFromSafeTensors[Ex], landed)
       follow-ups: real-checkpoint slicer (TencentARC/t2iadapter_*_sd15v2),
       light_adapter variant, multi-adapter blending.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
@@ -1532,8 +1568,9 @@ rather than acted on.
 - [ ] Stable Diffusion img2img + inpainting follow-ups (on top of
       BuildVaeEncoderFromSafeTensors, examples/ImageToImage and
       SDUNetDenoiseInpaint / examples/DiffusionInpainting): (1) the non-deterministic VAE reparameterize head
-      (mean+exp(0.5*logvar)*noise); (2) the 9-channel inpaint-specialized UNet
-      (conv_in widened to 4 latent + 1 mask + 4 masked-latent) importer support;
+      (mean+exp(0.5*logvar)*noise); (2) [X] the 9-channel inpaint-specialized UNet
+      (conv_in widened to 4 latent + 1 mask + 4 masked-latent): TStableDiffusionInpainter,
+      fb7c86b7;
       (3) a fixed-seed img2img latent trajectory matching diffusers
       `StableDiffusionImg2ImgPipeline` step-for-step.
 - [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
