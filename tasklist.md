@@ -2240,7 +2240,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased
       variant into its own entry point.
-- [ ] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
+- [X] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
       style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
       re-laid out k-major on the host and uploaded every forward before
       `cai_conv_implicit` runs. To keep the base kernel resident instead,
@@ -2248,6 +2248,21 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       per-row scale on `cai_conv_implicit`, with d[o] from a resident
       sum_t w[o,t,i]^2 table times s^2). Measure the upload share on the GPU
       box first; at 1024x1024 the contraction should dominate.
+      - DONE differently: the base kernel stays resident in the GEMM's A
+        buffer (uploaded only after `AfterWeightUpdate`), and
+        `TDotProductSharedKernel.ComputeModulatedConv` derives w'' on OpenCL
+        per forward (`cai_conv_weight_square_sums` once per weight change,
+        `cai_conv_modulation_row_scales` for d[o], `cai_conv_modulate_weights`
+        for w*s[i]*d[o]) before an unchanged `cai_conv_implicit`. The style is
+        bound when resident, else uploaded (Cin floats). The extra pass is
+        Cout*K*K*Cin per forward, 1/(H*W) of the conv; the conv kernels and
+        their other callers are untouched. `TestModulatedConv2DOpenCLParity`
+        pins the per-forward upload bytes.
+      - [ ] GPU-box timing at 1024x1024: StyleGAN2 generator forward with
+        OpenCL, per-layer forward time of the 1024x1024 `TNNetModulatedConv2D`
+        layers against the parent commit (host w'' slab + upload every forward).
+        `examples/StyleGAN2Generate` has no OpenCL switch yet, so the run
+        needs `NN.EnableOpenCL` added (or a small timing harness).
 - [ ] The rest of the vision attention subclasses that override `Compute` and
       so lose `TNNetScaledDotProductAttention`'s device path:
       - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item

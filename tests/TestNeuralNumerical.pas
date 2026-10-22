@@ -684,8 +684,8 @@ type
     // TNNetConcat device forward: exact vs CPU; resident sources are copied in
     // OpenCL memory (sentinels survive), host-only sources are uploaded.
     procedure TestConcatResidentOpenCLParity;
-    // TNNetModulatedConv2D device forward (cai_conv_implicit on the w'' slab):
-    // vs CPU with a non-trivial style; the output stays resident for a ReLU.
+    // TNNetModulatedConv2D OpenCL forward vs CPU over shapes, demod/bias and
+    // resident or host styles; only a weight update uploads the kernel.
     procedure TestModulatedConv2DOpenCLParity;
     // TNNetCausalConv1D device forward (cai_conv_implicit, K x 1 kernel, left
     // padding only): vs CPU over dilations, biases and a weight update.
@@ -75421,97 +75421,198 @@ procedure TTestNeuralNumerical.TestModulatedConv2DOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
-  csSizeX = 9;
-  csSizeY = 7;
   csInC = 8;
 var
   NN: TNNet;
-  XData, SData, Expected, ModCPU: TNNetVolume;
-  XInput, SInput, Affine: TNNetLayer;
+  XData, SData1, SData2: TNNetVolume;
+  ExpectedA1, ExpectedA2, ExpectedB2, FirstW0, FirstBias: TNNetVolume;
+  XInput, SInput, StyleSrc: TNNetLayer;
   ModConv: TNNetModulatedConv2D;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  CaseCnt, OutC, KSz, SuppressBias, Demod, Pos, MaxPos, MaxNeuronPos: integer;
-  SentinelSurvivors: integer;
-  MaxDiff, RelDiff: TNeuralFloat;
+  CaseCnt, OutC, KSz, SuppressBias, Demod, SizeX, SizeY: integer;
+  Pos, MaxPos, SentinelSurvivors, SlabBytes, BaseUploadBytes: integer;
+  SquareSumsBefore: integer;
+  WasCounting, HostStyle, StyleIsInput: boolean;
+  TransfersBefore, TransfersAfter, TransfersUpdate: TOpenCLTransferCounts;
+  RelDiffA1, RelDiffA2, RelDiffB2: TNeuralFloat;
   CaseName: string;
+
+  procedure ComputeWithStyle(Style: TNNetVolume);
+  begin
+    SInput.Output.Copy(Style);
+    NN.Compute(XData);
+  end;
+
+  function RelDiffToOutput(Expected: TNNetVolume): TNeuralFloat;
+  begin
+    Result := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output) /
+      Max(Expected.GetMaxAbs(), 1e-6);
+  end;
+
+  // Second weight set: neuron 0 scaled by -1.5, every bias moved by 0.25.
+  procedure ApplyWeights(Second: boolean);
+  begin
+    ModConv.Neurons[0].Weights.Copy(FirstW0);
+    ModConv.Neurons[OutC].Weights.Copy(FirstBias);
+    if Second then
+    begin
+      ModConv.Neurons[0].Weights.Mul(-1.5);
+      ModConv.Neurons[OutC].Weights.Add(0.25);
+    end;
+    ModConv.FlushWeightCache();
+  end;
+
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for CaseCnt := 0 to 1 do
+  WasCounting := OpenCLTransferCounting;
+  for CaseCnt := 0 to 3 do
   begin
-    if CaseCnt = 0 then
-    begin
-      // The synthesis conv: 3x3, demodulated, with bias.
-      CaseName := '3x3 demod + bias';
-      OutC := 16; KSz := 3; SuppressBias := 0; Demod := 1;
-    end
-    else
-    begin
-      // The toRGB conv: 1x1, no demodulation, no bias.
-      CaseName := '1x1 no demod, no bias';
-      OutC := 3; KSz := 1; SuppressBias := 1; Demod := 0;
+    SizeX := 9; SizeY := 7; HostStyle := false; StyleIsInput := false;
+    case CaseCnt of
+      0:
+      begin
+        CaseName := '3x3 demod + bias, resident style';
+        OutC := 16; KSz := 3; SuppressBias := 0; Demod := 1;
+      end;
+      1:
+      begin
+        CaseName := '1x1 no demod, no bias, host style';
+        OutC := 3; KSz := 1; SuppressBias := 1; Demod := 0; HostStyle := true;
+      end;
+      2:
+      begin
+        CaseName := '5x5 demod, no bias, 13x11, style is the input';
+        OutC := 7; KSz := 5; SuppressBias := 1; Demod := 1;
+        SizeX := 13; SizeY := 11; StyleIsInput := true;
+      end;
+      else
+      begin
+        CaseName := '3x3 no demod + bias, 40 rows, host style';
+        OutC := 40; KSz := 3; SuppressBias := 0; Demod := 0; HostStyle := true;
+      end;
     end;
     NN := TNNet.Create();
-    XData := TNNetVolume.Create(csSizeX, csSizeY, csInC);
-    SData := TNNetVolume.Create(csInC, 1, 1);
-    Expected := TNNetVolume.Create();
-    ModCPU := TNNetVolume.Create();
+    XData := TNNetVolume.Create(SizeX, SizeY, csInC);
+    SData1 := TNNetVolume.Create(csInC, 1, 1);
+    SData2 := TNNetVolume.Create(csInC, 1, 1);
+    ExpectedA1 := TNNetVolume.Create();
+    ExpectedA2 := TNNetVolume.Create();
+    ExpectedB2 := TNNetVolume.Create();
+    FirstW0 := TNNetVolume.Create();
+    FirstBias := TNNetVolume.Create();
     try
-      XInput := NN.AddLayer(TNNetInput.Create(csSizeX, csSizeY, csInC));
+      XInput := NN.AddLayer(TNNetInput.Create(SizeX, SizeY, csInC));
       SInput := NN.AddLayerAfter(TNNetInput.Create(csInC, 1, 1), 0);
-      Affine := NN.AddLayerAfter(TNNetFullConnectLinear.Create(csInC), SInput);
+      if StyleIsInput then StyleSrc := SInput
+      else if HostStyle then
+        StyleSrc := NN.AddLayerAfter(THostOnlyMulByConstant.Create(1.0), SInput)
+      else
+        StyleSrc := NN.AddLayerAfter(TNNetMulByConstant.Create(1.0), SInput);
       ModConv := TNNetModulatedConv2D.Create(OutC, KSz, SuppressBias, Demod,
-        Affine);
+        StyleSrc);
       NN.AddLayerAfter(ModConv, XInput);
       NN.AddLayer(TNNetReLU.Create());
       NN.SetTrainable(False, False);
       MaxPos := XData.Size - 1;
       for Pos := 0 to MaxPos do XData.Raw[Pos] := Sin(Pos * 0.37) - 0.2;
-      MaxPos := SData.Size - 1;
-      for Pos := 0 to MaxPos do SData.Raw[Pos] := Cos(Pos * 0.41) * 0.9 + 0.3;
-      MaxNeuronPos := OutC - 1;
-      for Pos := 0 to MaxNeuronPos do
+      MaxPos := csInC - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        SData1.Raw[Pos] := Cos(Pos * 0.41) * 0.9 + 0.3;
+        SData2.Raw[Pos] := Sin(Pos * 0.73) * 1.3 - 0.1;
+      end;
+      MaxPos := OutC - 1;
+      for Pos := 0 to MaxPos do
         ModConv.Neurons[OutC].Weights.Raw[Pos] := 0.05 * (Pos - 1);
+      SlabBytes := OutC * KSz * KSz * csInC * SizeOf(TNeuralFloat);
+      if SuppressBias = 0 then Inc(SlabBytes, OutC * SizeOf(TNeuralFloat));
+      FirstW0.Copy(ModConv.Neurons[0].Weights);
+      FirstBias.Copy(ModConv.Neurons[OutC].Weights);
 
-      SInput.Output.Copy(SData);
-      NN.Compute(XData);
-      Expected.Copy(NN.GetLastLayer.Output);
-      ModCPU.Copy(ModConv.Output);
+      ComputeWithStyle(SData1);
+      ExpectedA1.Copy(NN.GetLastLayer.Output);
+      ComputeWithStyle(SData2);
+      ExpectedA2.Copy(NN.GetLastLayer.Output);
+      ApplyWeights(true);
+      ComputeWithStyle(SData2);
+      ExpectedB2.Copy(NN.GetLastLayer.Output);
+      ApplyWeights(false);
 
       NN.EnableOpenCL(PlatformId, DeviceId);
-      SInput.Output.Copy(SData);
-      NN.Compute(XData);
+      if not (HostStyle or StyleIsInput) then StyleSrc.ForceOpenCL(true);
+      ComputeWithStyle(SData1);
+      RelDiffA1 := RelDiffToOutput(ExpectedA1);
+      SquareSumsBefore :=
+        ModConv.OpenCLSquareSumsBuildCount();
       // A download or a host forward would overwrite these.
       ModConv.Output.Fill(csSentinel);
-      SInput.Output.Copy(SData);
-      NN.Compute(XData);
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      ComputeWithStyle(SData2);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      OpenCLTransferCounting := WasCounting;
       SentinelSurvivors := 0;
       MaxPos := ModConv.Output.Size - 1;
       for Pos := 0 to MaxPos do
         if ModConv.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
-      MaxDiff := MaxAbsDiffToOutput(Expected, NN.GetLastLayer.Output);
-      ModConv.ForceOutputOnRAM();
-      MaxDiff := Max(MaxDiff, MaxAbsDiffToOutput(ModCPU, ModConv.Output));
-      RelDiff := MaxDiff / ModCPU.GetMaxAbs();
-      WriteLn('  ModulatedConv2D OpenCL (', CaseName, '): max|diff|=',
-        MaxDiff:0:9, ' rel=', RelDiff:0:9, ' gpu forwards=',
-        ModConv.ForwardGPUCnt, ' sentinels=', SentinelSurvivors, '/',
-        ModConv.Output.Size);
-      AssertEquals('TNNetModulatedConv2D ran both forwards on OpenCL (' +
-        CaseName + ')', 2, ModConv.ForwardGPUCnt);
+      RelDiffA2 := RelDiffToOutput(ExpectedA2);
+      AssertEquals('a forward with unchanged weights keeps the square sums (' +
+        CaseName + ')', SquareSumsBefore,
+        ModConv.OpenCLSquareSumsBuildCount());
+      ApplyWeights(true);
+      OpenCLTransferCounting := true;
+      TransfersUpdate := OpenCLProcessTransferTotals();
+      ComputeWithStyle(SData2);
+      TransfersUpdate.UploadBytes :=
+        OpenCLProcessTransferTotals().UploadBytes - TransfersUpdate.UploadBytes;
+      OpenCLTransferCounting := WasCounting;
+      RelDiffB2 := RelDiffToOutput(ExpectedB2);
+      // Both inputs upload every forward; a host style is uploaded once more.
+      BaseUploadBytes := (XData.Size + csInC) * SizeOf(TNeuralFloat);
+      if HostStyle then Inc(BaseUploadBytes, csInC * SizeOf(TNeuralFloat));
+      WriteLn('  ModulatedConv2D OpenCL (', CaseName, '): rel diff ',
+        RelDiffA1:0:9, ' / ', RelDiffA2:0:9, ' / ', RelDiffB2:0:9,
+        ' gpu forwards=', ModConv.ForwardGPUCnt, ' sentinels=',
+        SentinelSurvivors, '/', ModConv.Output.Size, ' upload bytes=',
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes, ' / ',
+        TransfersUpdate.UploadBytes);
+      AssertEquals('TNNetModulatedConv2D ran every forward on OpenCL (' +
+        CaseName + ')', 3, ModConv.ForwardGPUCnt);
       AssertEquals('the ReLU binds the resident output (' + CaseName + ')',
         ModConv.Output.Size, SentinelSurvivors);
-      AssertTrue('the CPU reference is not degenerate', ModCPU.GetMaxAbs() > 0);
-      AssertTrue('TNNetModulatedConv2D OpenCL vs CPU (' + CaseName +
-        '): relative max |diff| = ' + FloatToStr(RelDiff), RelDiff < 1e-5);
+      AssertEquals('style source offered on OpenCL (' + CaseName + ')',
+        not HostStyle, StyleSrc.OutputBindableOnOpenCL());
+      AssertEquals('no kernel upload without a weight update (' + CaseName +
+        ')', BaseUploadBytes,
+        TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+      AssertEquals('a weight update uploads the kernel and bias once (' +
+        CaseName + ')', BaseUploadBytes + SlabBytes, TransfersUpdate.UploadBytes);
+      AssertEquals('a weight update rebuilds the square sums (' + CaseName +
+        ')', SquareSumsBefore + 1,
+        ModConv.OpenCLSquareSumsBuildCount());
+      AssertTrue('the CPU reference is not degenerate', ExpectedA2.GetMaxAbs() > 0);
+      AssertTrue('the two styles give different outputs (' + CaseName + ')',
+        MaxAbsDiffToOutput(ExpectedA1, ExpectedA2) > 1e-3);
+      AssertTrue('OpenCL vs CPU, style 1 (' + CaseName + '): ' +
+        FloatToStr(RelDiffA1), RelDiffA1 < 1e-5);
+      AssertTrue('OpenCL vs CPU, style 2 (' + CaseName + '): ' +
+        FloatToStr(RelDiffA2), RelDiffA2 < 1e-5);
+      AssertTrue('OpenCL vs CPU, updated weights (' + CaseName + '): ' +
+        FloatToStr(RelDiffB2), RelDiffB2 < 1e-5);
     finally
-      ModCPU.Free;
-      Expected.Free;
-      SData.Free;
+      OpenCLTransferCounting := WasCounting;
+      FirstBias.Free;
+      FirstW0.Free;
+      ExpectedB2.Free;
+      ExpectedA2.Free;
+      ExpectedA1.Free;
+      SData2.Free;
+      SData1.Free;
       XData.Free;
       NN.Free;
     end;

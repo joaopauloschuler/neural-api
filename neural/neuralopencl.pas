@@ -534,6 +534,15 @@ type
       FUpsampleFoldWeightsKernel: cl_kernel;
       FUpsampleFoldStale: boolean;
       FUpsampleFoldLaunchCount: integer;
+      /// MODULATED CONVOLUTION (PrepareModulatedConv): FModulatedAsBuffer is the
+      /// slab cai_conv_modulate_weights derives per forward from FInputBufferAs;
+      /// FModSquareSumsBuffer is stale until rebuilt after the A operand changed.
+      FModulatedAsBuffer, FModSquareSumsBuffer, FModRowScalesBuffer,
+        FModStyleBuffer: cl_mem;
+      FModSquareSumsKernel, FModRowScalesKernel, FModulateWeightsKernel: cl_kernel;
+      FModSquareSumsStale: boolean;
+      FModInDepth: longint;
+      FModulatedConvLaunchCount, FModSquareSumsLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
       /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
@@ -554,6 +563,8 @@ type
       function BindTiledFixedArgs(pKernel: cl_kernel): integer;
       /// Releases FTiledKernel, FTiledBlockKernel and the split-K pair.
       procedure ReleaseTiledKernels();
+      /// Releases the modulated-convolution kernels and buffers.
+      procedure ReleaseModulatedConv();
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -690,6 +701,15 @@ type
       procedure ComputeUpsampleFoldConv(VAs, SrcVol: TNNetVolume; pActFN: longint;
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean; pExternalSrc: cl_mem);
+      /// Allocates the modulation kernels and buffers after PrepareImplicitConv
+      /// for InDepth input channels; False when the device refused them.
+      function PrepareModulatedConv(InDepth: longint): boolean;
+      /// ComputeImplicitConv (stride 1, SAME padding) of VAs modulated on OpenCL by
+      /// StyleBuffer (InDepth floats) and, when Demodulate, demodulated per row.
+      procedure ComputeModulatedConv(VAs, SrcVol: TNNetVolume; StyleBuffer: cl_mem;
+        FeatureSize, pActFN: longint; Demodulate: boolean; DemodEps: TNeuralFloat;
+        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean; pExternalSrc: cl_mem);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -783,6 +803,13 @@ type
       function UpsampleFoldReady(): boolean;
       /// ComputeUpsampleFoldConv launches (also counted as implicit convs).
       property UpsampleFoldLaunchCount: integer read FUpsampleFoldLaunchCount;
+      /// True after a successful PrepareModulatedConv.
+      function ModulatedConvReady(): boolean;
+      /// InDepth floats a caller uploads a host-side style into.
+      property ModulationStyleBuffer: cl_mem read FModStyleBuffer;
+      /// ComputeModulatedConv launches, and rebuilds of the square-sum table.
+      property ModulatedConvLaunchCount: integer read FModulatedConvLaunchCount;
+      property ModSquareSumsLaunchCount: integer read FModSquareSumsLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -1051,7 +1078,9 @@ begin
   Result := OpenCLMemBytes(FInputBufferBs) +
     OpenCLMemBytes(FResultBuffer) +
     OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
-    OpenCLMemBytes(FInputBufferBsFP16) + OpenCLMemBytes(FUpsampleFoldBuffer);
+    OpenCLMemBytes(FInputBufferBsFP16) + OpenCLMemBytes(FUpsampleFoldBuffer) +
+    OpenCLMemBytes(FModulatedAsBuffer) + OpenCLMemBytes(FModSquareSumsBuffer) +
+    OpenCLMemBytes(FModRowScalesBuffer) + OpenCLMemBytes(FModStyleBuffer);
   if not FWeightsBorrowed then
     Result := Result + OpenCLMemBytes(FInputBufferAs);
   if not FBiasBorrowed then
@@ -1095,6 +1124,7 @@ begin
   FUpsampleFoldWeightsKernel := nil;
   FUpsampleFoldBuffer := nil;
   FUpsampleFoldStale := false;
+  ReleaseModulatedConv();
   FMainKernel := nil;
   FSinglePassKernel := nil;
   FTiledRejected := false;
@@ -2479,6 +2509,137 @@ begin
     exit;
   end;
   Inc(FUpsampleFoldLaunchCount);
+end;
+
+function TDotProductSharedKernel.ModulatedConvReady(): boolean;
+begin
+  Result := FImplicitConvReady and Assigned(FModulatedAsBuffer) and
+    Assigned(FModSquareSumsBuffer) and Assigned(FModRowScalesBuffer) and
+    Assigned(FModStyleBuffer) and Assigned(FModSquareSumsKernel) and
+    Assigned(FModRowScalesKernel) and Assigned(FModulateWeightsKernel);
+end;
+
+procedure TDotProductSharedKernel.ReleaseModulatedConv();
+begin
+  if Assigned(FModSquareSumsKernel) then clReleaseKernel(FModSquareSumsKernel);
+  if Assigned(FModRowScalesKernel) then clReleaseKernel(FModRowScalesKernel);
+  if Assigned(FModulateWeightsKernel) then clReleaseKernel(FModulateWeightsKernel);
+  if Assigned(FModulatedAsBuffer) then clReleaseMemObject(FModulatedAsBuffer);
+  if Assigned(FModSquareSumsBuffer) then clReleaseMemObject(FModSquareSumsBuffer);
+  if Assigned(FModRowScalesBuffer) then clReleaseMemObject(FModRowScalesBuffer);
+  if Assigned(FModStyleBuffer) then clReleaseMemObject(FModStyleBuffer);
+  FModSquareSumsKernel := nil;
+  FModRowScalesKernel := nil;
+  FModulateWeightsKernel := nil;
+  FModulatedAsBuffer := nil;
+  FModSquareSumsBuffer := nil;
+  FModRowScalesBuffer := nil;
+  FModStyleBuffer := nil;
+  FModSquareSumsStale := false;
+  FModInDepth := 0;
+end;
+
+function TDotProductSharedKernel.PrepareModulatedConv(InDepth: longint): boolean;
+begin
+  Result := ModulatedConvReady() and (FModInDepth = InDepth);
+  if Result or (not FImplicitConvReady) or (InDepth <= 0) or
+    (FSize mod InDepth <> 0) then exit;
+  ReleaseModulatedConv();
+  FModSquareSumsKernel := FDotProductKernel.CreateKernel('cai_conv_weight_square_sums');
+  FModRowScalesKernel := FDotProductKernel.CreateKernel('cai_conv_modulation_row_scales');
+  FModulateWeightsKernel := FDotProductKernel.CreateKernel('cai_conv_modulate_weights');
+  FModulatedAsBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * FSize * csNeuralFloatSize);
+  FModSquareSumsBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * InDepth * csNeuralFloatSize);
+  FModRowScalesBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * csNeuralFloatSize);
+  FModStyleBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_ONLY,
+    csize_t(InDepth) * csNeuralFloatSize);
+  FModInDepth := InDepth;
+  FModSquareSumsStale := true;
+  Result := ModulatedConvReady();
+  if not Result then ReleaseModulatedConv();
+end;
+
+procedure TDotProductSharedKernel.ComputeModulatedConv(VAs, SrcVol: TNNetVolume;
+  StyleBuffer: cl_mem; FeatureSize, pActFN: longint; Demodulate: boolean;
+  DemodEps: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InDepth, Padding, DemodulateFlag: longint;
+  SrcBuffer: cl_mem;
+begin
+  InDepth := SrcVol.Depth;
+  if (not ModulatedConvReady()) or (InDepth <> FModInDepth) or
+    (VAs.Size <> FSize * FNumAs) or
+    (FSize <> FeatureSize * FeatureSize * InDepth) or
+    (FNumBs <> SrcVol.SizeX * SrcVol.SizeY) or (StyleBuffer = nil) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeModulatedConv - ' +
+      'unarmed or shape mismatch: FSize ' + IntToStr(FSize) + ', NumBs ' +
+      IntToStr(FNumBs) + ', source ' + IntToStr(SrcVol.SizeX) + 'x' +
+      IntToStr(SrcVol.SizeY) + 'x' + IntToStr(InDepth));
+    exit;
+  end;
+  FActFun := pActFN;
+  Padding := FeatureSize shr 1;
+  if Demodulate then DemodulateFlag := 1 else DemodulateFlag := 0;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs then
+  begin
+    if not FWeightsBorrowed then
+      err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FModSquareSumsStale := true;
+  end;
+  if FModSquareSumsStale and (err = CL_SUCCESS) then
+  begin
+    err := err or clSetKernelArg(FModSquareSumsKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 1, csLongintSize, @InDepth);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 2, csLongintSize, @FSize);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 3, csCLMemSize, @FInputBufferAs);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 4, csCLMemSize, @FModSquareSumsBuffer);
+    if err = CL_SUCCESS then
+      err := FDotProductKernel.RunKernel2D(FModSquareSumsKernel, FNumAs, InDepth);
+    if err = CL_SUCCESS then
+    begin
+      FModSquareSumsStale := false;
+      Inc(FModSquareSumsLaunchCount);
+    end;
+  end;
+  err := err or clSetKernelArg(FModRowScalesKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FModRowScalesKernel, 1, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(FModRowScalesKernel, 2, csLongintSize, @DemodulateFlag);
+  err := err or clSetKernelArg(FModRowScalesKernel, 3, csNeuralFloatSize, @DemodEps);
+  err := err or clSetKernelArg(FModRowScalesKernel, 4, csCLMemSize, @FModSquareSumsBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 5, csCLMemSize, @StyleBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 6, csCLMemSize, @FModRowScalesBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 1, csLongintSize, @FSize);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 2, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 3, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 4, csCLMemSize, @StyleBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 5, csCLMemSize, @FModRowScalesBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 6, csCLMemSize, @FModulatedAsBuffer);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel(FModRowScalesKernel, FNumAs);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel2D(FModulateWeightsKernel, FNumAs, FSize);
+  if err = CL_SUCCESS then
+    LaunchImplicitConv(FModulatedAsBuffer, SrcBuffer, FNumBs, FSize, UseBias,
+      {OutSizeX}SrcVol.SizeX, {RowSpan}FeatureSize * InDepth, SrcVol.SizeX,
+      SrcVol.SizeY, InDepth, {Stride}1, Padding, Padding, {DilationX}1,
+      {PixelStride}InDepth, {OutFrames}1, {FrameStep}0, {UpsampleFold}0, err);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeModulatedConv - failed ' +
+      'uploading, modulating the weights or launching: ' + IntToStr(err));
+    exit;
+  end;
+  Inc(FModulatedConvLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;

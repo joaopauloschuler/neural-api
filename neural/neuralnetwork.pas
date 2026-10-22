@@ -7224,8 +7224,8 @@ type
   // source slot (like TNNetConcat) so it round-trips through SaveToString.
   // SCOPE NOTE (v1): inference-oriented synthesis primitive -- no fused
   // up/downsampling (use a separate TNNetUpsample), no grouped/minibatch-std.
-  // OpenCL (inference): the host-built w'' slab feeds cai_conv_implicit with
-  // the bias fused, so the output stays resident for the next layer.
+  // OpenCL (inference): the base kernel stays resident; OpenCL derives w'' from
+  // it and the (bound or uploaded) style per forward for cai_conv_implicit.
   // Coded by Claude (AI).
   TNNetModulatedConv2D = class(TNNetLayer)
   private
@@ -7240,7 +7240,7 @@ type
     FGModW: TNNetVolume;         // dL/d(w''[o,t]), [tapsPerOut,1,FOutChannels]
     FGBias: TNNetVolume;         // dL/d(bias[o]),  [FOutChannels,1,1]
     {$IFDEF OpenCL}
-    FModWeightsInter: TNNetVolume; // FModWeights in the interleaved device A layout
+    FWeightsInter: TNNetVolume;  // base kernel in the k-major OpenCL A layout
     procedure ArmOpenCLForward();
     procedure ComputeOpenCL();
     {$ENDIF}
@@ -7254,6 +7254,9 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    // Builds of the OpenCL sum_t w^2 table (0 without FDotCL): the test hook
+    // proving that only a weight update rebuilds it.
+    function OpenCLSquareSumsBuildCount(): integer;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -49128,6 +49131,10 @@ end;
 
 { TNNetModulatedConv2D }
 
+const
+  // Added to sum (w*s)^2 before the demodulation square root (StyleGAN2 eps).
+  csModulatedConvDemodEps = 1e-8;
+
 constructor TNNetModulatedConv2D.Create(pNumFeatures, pFeatureSize,
   pSuppressBias, pDemodulate: integer; StyleSource: TNNetLayer);
 begin
@@ -49171,7 +49178,7 @@ begin
   FGModW.Free;
   FGBias.Free;
   {$IFDEF OpenCL}
-  FModWeightsInter.Free;
+  FWeightsInter.Free;
   {$ENDIF}
   inherited Destroy();
 end;
@@ -49268,12 +49275,21 @@ var
   Acc, g, wm, BiasO: TNeuralFloat;
   BiasW, W: TNNetVolume;
   UseBias: boolean;
-const
-  cDemodEps = 1e-8;
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
   FStyleLayer.ForceOutputOnRAM();
+  FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   X := FPrevLayer.FOutput;
   Style := FStyleLayer.FOutput;
@@ -49303,25 +49319,12 @@ begin
         end;
         Inc(Base, FInChannels);               // #6
       end;
-    if FDemodulate then FDemodScale.FData[o] := 1.0 / pcr_sqrtf(g + cDemodEps)
+    if FDemodulate then FDemodScale.FData[o] := 1.0 / pcr_sqrtf(g + csModulatedConvDemodEps)
     else FDemodScale.FData[o] := 1.0;
     if FDemodulate then
       TNNetVolume.Mul(FModWeights.GetRawPtr(oBase), FDemodScale.FData[o],
         tapsPerOut);
   end;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end;
-  Inc(FForwardCPUCnt);
-  FPrevLayer.ForceOutputOnRAM();
-  FOutputOnOpenCL := false;
-  FOutputOnRAM := true;
-  {$ENDIF}
   // ---- SAME-padding stride-1 convolution with the modulated kernel ----
   FOutput.Fill(0);
   MaxOutputY := FOutput.SizeY - 1;
@@ -49359,20 +49362,21 @@ begin
 end;
 
 {$IFDEF OpenCL}
-// Shapes FDotCL as the implicit conv: Cout rows of K*K*Cin taps against every
-// output position. No-op until SetPrevLayer has sized the layer.
+// Shapes FDotCL as the implicit conv (Cout rows of K*K*Cin taps against every
+// output position) plus the modulation buffers. No-op until SetPrevLayer.
 procedure TNNetModulatedConv2D.ArmOpenCLForward();
 var
   TapsPerOut: integer;
 begin
   TapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
-  ArmImplicitConv(FModWeightsInter, FOutChannels, TapsPerOut,
+  ArmImplicitConv(FWeightsInter, FOutChannels, TapsPerOut,
     FOutput.SizeX * FOutput.SizeY);
+  if FDotCL.ImplicitConvReady then FDotCL.PrepareModulatedConv(FInChannels);
 end;
 
 procedure TNNetModulatedConv2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
-  CreateImplicitConvCL(FModWeightsInter);
+  CreateImplicitConvCL(FWeightsInter);
   ArmOpenCLForward();
 end;
 
@@ -49380,22 +49384,58 @@ end;
 function TNNetModulatedConv2D.WillOpenCL(): boolean;
 begin
   Result := Assigned(FDotCL) and FHasOpenCL and (not FIsTrainable) and
-    FDotCL.ImplicitConvReady and (FModWeightsInter.Size = FModWeights.Size) and
+    FDotCL.ModulatedConvReady() and (FWeightsInter.Size = FModWeights.Size) and
     (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
 end;
 
-// Compute built FModWeights (w''); the slab is re-laid out k-major and uploaded
-// every forward because the style changes per sample.
+function TNNetModulatedConv2D.OpenCLSquareSumsBuildCount(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.ModSquareSumsLaunchCount
+  else Result := 0;
+end;
+
+// Uploads the base kernel and bias only after a weight update; the style is
+// bound when resident, else uploaded (InChannels floats).
 procedure TNNetModulatedConv2D.ComputeOpenCL();
 var
   BiasVol: TNNetVolume;
+  StyleUpload, StyleBuffer, GatherSrcBuffer: cl_mem;
+  WeightsChanged: boolean;
+  OutChannelPos, MaxOutChannelPos, TapsPerOut: integer;
 begin
-  FModWeightsInter.InterleaveWithXFrom(FModWeights, FModWeights.SizeX);
+  WeightsChanged := FAfterWeightUpdateHasBeenCalled;
+  if WeightsChanged then
+  begin
+    TapsPerOut := FModWeights.SizeX;
+    MaxOutChannelPos := FOutChannels - 1;
+    for OutChannelPos := 0 to MaxOutChannelPos do
+      Move(FArrNeurons[OutChannelPos].FWeights.FData[0],
+        FModWeights.FData[OutChannelPos * TapsPerOut],
+        TapsPerOut * csNeuralFloatSize);
+    FWeightsInter.InterleaveWithXFrom(FModWeights, TapsPerOut);
+    FAfterWeightUpdateHasBeenCalled := false;
+  end;
   if FSuppressBias = 0 then BiasVol := FNeurons[FOutChannels].FWeights
   else BiasVol := nil;
-  ComputeImplicitConvOnOpenCL(FModWeightsInter, BiasVol, {NewWeights}true,
-    {RowSpan}FInChannels * FFeatureSize, {Stride}1, {PaddingX}FFeatureSize shr 1,
-    {PaddingY}FFeatureSize shr 1, {DilationX}1);
+  StyleUpload := nil;
+  if not FStyleLayer.OutputBindableOnOpenCL() then
+    StyleUpload := FDotCL.ModulationStyleBuffer;
+  StyleBuffer := BindOrUploadOpenCLOperand(FStyleLayer, FDotCL.DotProductKernel,
+    StyleUpload);
+  GatherSrcBuffer := nil;
+  if PrevOutputOnOpenCL() then
+  begin
+    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+    FPrevLayer.ForceOutputOnRAM();
+  FDotCL.ComputeModulatedConv(FWeightsInter, FPrevLayer.FOutput, StyleBuffer,
+    FFeatureSize, csActNone, FDemodulate, csModulatedConvDemodEps,
+    {NewVAs}WeightsChanged, BiasVol, {NewVBias}WeightsChanged,
+    {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 

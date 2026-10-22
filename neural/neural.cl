@@ -1511,6 +1511,77 @@ __kernel void cai_conv_upsample_fold_weights
   Dst[a + (Phase * 4 * InDepth + (r * 2 + c) * InDepth + d) * NumAs] = Sum;
 }
 
+// MODULATED CONVOLUTION (StyleGAN2): the slab cai_conv_implicit reads is
+// w''(a, k) = w(a, k) * Style[k mod InDepth] * RowScales[a], derived per
+// forward from the resident base kernel w in the [a + k*NumAs] layout.
+
+// SquareSums(a, d) = sum over the taps of w(a, tap*InDepth + d)^2, stored at
+// d*NumAs + a; it depends on w only. Launch (NumAs, InDepth).
+__kernel void cai_conv_weight_square_sums
+(
+  const int NumAs,
+  const int InDepth,
+  const int FSize,
+  __global const float* A,
+  __global float* SquareSums
+)
+{
+  const int a = get_global_id(0);
+  const int d = get_global_id(1);
+  if ((a >= NumAs) || (d >= InDepth)) return;
+  const int TapStep = InDepth * NumAs;
+  const int MaxPos = FSize * NumAs;
+  float Sum = 0.0f;
+  for (int Pos = a + d * NumAs; Pos < MaxPos; Pos += TapStep)
+    Sum = mad(A[Pos], A[Pos], Sum);
+  SquareSums[d * NumAs + a] = Sum;
+}
+
+// RowScales[a] = 1 / sqrt(sum_d SquareSums(a, d) * Style[d]^2 + Eps), the
+// demodulation factor, or 1 when Demodulate is 0. Launch (NumAs).
+__kernel void cai_conv_modulation_row_scales
+(
+  const int NumAs,
+  const int InDepth,
+  const int Demodulate,
+  const float Eps,
+  __global const float* SquareSums,
+  __global const float* Style,
+  __global float* RowScales
+)
+{
+  const int a = get_global_id(0);
+  if (a >= NumAs) return;
+  float Sum = 0.0f;
+  for (int d = 0; d < InDepth; d++)
+  {
+    const float s = Style[d];
+    Sum = mad(SquareSums[d * NumAs + a], s * s, Sum);
+  }
+  // Sum + Eps > 0, so the division never traps even when Demodulate is 0.
+  RowScales[a] = (Demodulate != 0) ? 1.0f / sqrt(Sum + Eps) : 1.0f;
+}
+
+// Dst(a, k) = A(a, k) * Style[k mod InDepth] * RowScales[a], both in the
+// [a + k*NumAs] layout. Launch (NumAs, FSize).
+__kernel void cai_conv_modulate_weights
+(
+  const int NumAs,
+  const int FSize,
+  const int InDepth,
+  __global const float* A,
+  __global const float* Style,
+  __global const float* RowScales,
+  __global float* Dst
+)
+{
+  const int a = get_global_id(0);
+  const int k = get_global_id(1);
+  if ((a >= NumAs) || (k >= FSize)) return;
+  const int Pos = a + k * NumAs;
+  Dst[Pos] = (A[Pos] * Style[k % InDepth]) * RowScales[a];
+}
+
 // int4 body: the int8 lane map, one Q4_0 block per K-step (blocks [StepFirst,
 // StepEnd)), weight = (code - 8) * scale; RawPartials as cai_codes_int8_body.
 static inline void cai_codes_int4_body(const int FNumAs, const int FNumBs,
