@@ -556,7 +556,8 @@ begin
     FSerial.Snake(SerialOut, Alpha);
     FThreaded.Snake(ThreadedOut, Alpha);
     Diff := MaxAbsDiff(SerialOut, SnakeLayer.Output);
-    AssertTrue('max diff ' + FloatToStr(Diff), Diff = 0);
+    // The layer runs Sin over whole blocks, these rows through its scalar tail.
+    AssertTrue('max diff ' + FloatToStr(Diff), Diff < 1e-5);
     AssertEquals('serial vs threaded', 0,
       MaxAbsDiff(SerialOut, ThreadedOut), 0);
   finally

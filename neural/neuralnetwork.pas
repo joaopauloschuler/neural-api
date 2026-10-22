@@ -2361,11 +2361,16 @@ type
   TNNetSnake = class(TNNetReLUBase)
   private
     FPerChannelAlpha: boolean;
-    // Depth-long scratch of the per-channel path: the current row's sin(a*x)
-    // terms, 1/alpha, and the backward alpha-gradient accumulator.
-    FSnakeRow, FInvAlpha, FAlphaGrad: TNNetVolume;
+    // Depth-long scratch of the per-channel path: 1/alpha and the backward
+    // alpha-gradient accumulator.
+    FInvAlpha, FAlphaGrad: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    procedure ComputePerChannel();
+    procedure ComputePerChannelDeriv();
+    // Inference forward of both alpha modes, in place in FOutput, one
+    // cache-sized block at a time through the vectorized Sin.
+    procedure ComputeNoDeriv();
+    procedure ScaleBlock(pPtr, pChannelScale: TNeuralFloatArrPtr;
+      pScale: TNeuralFloat; pLen: integer);
   protected
     function ActivationChannelParams(): TNNetVolume; override;
   public
@@ -57473,7 +57478,6 @@ begin
   FFloatSt[0] := pAlpha;
   FPerChannelAlpha := pPerChannelAlpha;
   FStruct[0] := Ord(pPerChannelAlpha);
-  FSnakeRow := TNNetVolume.Create();
   FInvAlpha := TNNetVolume.Create();
   FAlphaGrad := TNNetVolume.Create();
   if pPerChannelAlpha then FActivationOpcode := csActSnakeChannel
@@ -57484,7 +57488,6 @@ destructor TNNetSnake.Destroy();
 begin
   FAlphaGrad.Free;
   FInvAlpha.Free;
-  FSnakeRow.Free;
   inherited Destroy();
 end;
 
@@ -57495,7 +57498,6 @@ begin
   begin
     if FNeurons.Count < 1 then AddMissingNeurons(1);
     SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
-    FSnakeRow.ReSize(1, 1, FOutput.Depth);
     FInvAlpha.ReSize(1, 1, FOutput.Depth);
     FAlphaGrad.ReSize(1, 1, FOutput.Depth);
     InitDefault();
@@ -57522,11 +57524,11 @@ begin
   else Result := nil;
 end;
 
-procedure TNNetSnake.ComputePerChannel();
+procedure TNNetSnake.ComputePerChannelDeriv();
 var
   Depth, MaxPositionPos, PositionPos, MaxChannelPos, ChannelPos, ElementPos: integer;
   x, SinAx, CosAx: TNeuralFloat;
-  AlphaPtr, InvAlphaPtr, RowPtr, OutputPtr: TNeuralFloatArrPtr;
+  AlphaPtr, InvAlphaPtr: TNeuralFloatArrPtr;
 begin
   Depth := FOutput.Depth;
   MaxPositionPos := FOutput.SizeX * FOutput.SizeY - 1;
@@ -57535,34 +57537,79 @@ begin
   for ChannelPos := 0 to MaxChannelPos do
     FInvAlpha.FData[ChannelPos] := 1 / AlphaPtr^[ChannelPos];
   InvAlphaPtr := FInvAlpha.GetRawPtr();
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  ElementPos := 0;
+  for PositionPos := 0 to MaxPositionPos do
+    for ChannelPos := 0 to MaxChannelPos do
+    begin
+      x := FPrevLayer.FOutput.FData[ElementPos];
+      pcr_sincosf(AlphaPtr^[ChannelPos] * x, SinAx, CosAx);
+      FOutput.FData[ElementPos] := x + InvAlphaPtr^[ChannelPos] * SinAx * SinAx;
+      FOutputErrorDeriv.FData[ElementPos] := 1.0 + 2.0 * SinAx * CosAx;
+      Inc(ElementPos);
+    end;
+end;
+
+procedure TNNetSnake.ScaleBlock(pPtr, pChannelScale: TNeuralFloatArrPtr;
+  pScale: TNeuralFloat; pLen: integer);
+var
+  Depth, MaxRowPos, RowPos, RowOffset: integer;
+begin
+  if FPerChannelAlpha then
   begin
-    ElementPos := 0;
-    for PositionPos := 0 to MaxPositionPos do
-      for ChannelPos := 0 to MaxChannelPos do
-      begin
-        x := FPrevLayer.FOutput.FData[ElementPos];
-        pcr_sincosf(AlphaPtr^[ChannelPos] * x, SinAx, CosAx);
-        FOutput.FData[ElementPos] := x + InvAlphaPtr^[ChannelPos] * SinAx * SinAx;
-        FOutputErrorDeriv.FData[ElementPos] := 1.0 + 2.0 * SinAx * CosAx;
-        Inc(ElementPos);
-      end;
+    Depth := FOutput.Depth;
+    MaxRowPos := pLen div Depth - 1;
+    RowOffset := 0;
+    for RowPos := 0 to MaxRowPos do
+    begin
+      TNNetVolume.Mul(TNeuralFloatArrPtr(@pPtr^[RowOffset]), pChannelScale, Depth);
+      Inc(RowOffset, Depth);
+    end;
   end
   else
+    TNNetVolume.Mul(pPtr, pScale, pLen);
+end;
+
+procedure TNNetSnake.ComputeNoDeriv();
+const
+  // Output and source blocks of 16 KB each stay in L1 across the five passes.
+  csSnakeBlockFloats = 4096;
+var
+  Depth, BlockLen, MaxBlockPos, BlockPos, ElementPos, BlockSize: integer;
+  MaxChannelPos, ChannelPos: integer;
+  Alpha, InvAlpha: TNeuralFloat;
+  AlphaPtr, InvAlphaPtr, OutputPtr, SourcePtr: TNeuralFloatArrPtr;
+begin
+  if FOutput.Size = 0 then exit;
+  Depth := FOutput.Depth;
+  Alpha := FFloatSt[0];
+  InvAlpha := 1 / Alpha;
+  AlphaPtr := nil;
+  InvAlphaPtr := nil;
+  if FPerChannelAlpha then
   begin
-    // y = x + (1/a) .* sin(a .* x)^2, one depth-contiguous row at a time.
-    FOutput.CopyNoChecks(FPrevLayer.FOutput);
-    RowPtr := FSnakeRow.GetRawPtr();
-    for PositionPos := 0 to MaxPositionPos do
-    begin
-      OutputPtr := FOutput.GetRawPtr(PositionPos * Depth);
-      System.Move(OutputPtr^, RowPtr^, Depth * csNeuralFloatSize);
-      TNNetVolume.Mul(RowPtr, AlphaPtr, Depth);
-      TNNetVolume.Sin(RowPtr, RowPtr, Depth);
-      TNNetVolume.Mul(RowPtr, RowPtr, Depth);
-      TNNetVolume.Mul(RowPtr, InvAlphaPtr, Depth);
-      TNNetVolume.Add(OutputPtr, RowPtr, Depth);
-    end;
+    AlphaPtr := FNeurons[0].FWeights.GetRawPtr();
+    MaxChannelPos := Depth - 1;
+    for ChannelPos := 0 to MaxChannelPos do
+      FInvAlpha.FData[ChannelPos] := 1 / AlphaPtr^[ChannelPos];
+    InvAlphaPtr := FInvAlpha.GetRawPtr();
+  end;
+  // A whole number of depth rows per block keeps the per-channel alphas aligned.
+  BlockLen := Max(1, csSnakeBlockFloats div Depth) * Depth;
+  MaxBlockPos := (FOutput.Size - 1) div BlockLen;
+  ElementPos := 0;
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    BlockSize := Min(BlockLen, FOutput.Size - ElementPos);
+    OutputPtr := FOutput.GetRawPtr(ElementPos);
+    SourcePtr := FPrevLayer.FOutput.GetRawPtr(ElementPos);
+    // y = x + (1/a) * sin(a * x)^2.
+    System.Move(SourcePtr^, OutputPtr^, BlockSize * csNeuralFloatSize);
+    ScaleBlock(OutputPtr, AlphaPtr, Alpha, BlockSize);
+    TNNetVolume.Sin(OutputPtr, OutputPtr, BlockSize);
+    TNNetVolume.Mul(OutputPtr, OutputPtr, BlockSize);
+    ScaleBlock(OutputPtr, InvAlphaPtr, InvAlpha, BlockSize);
+    TNNetVolume.Add(OutputPtr, SourcePtr, BlockSize);
+    Inc(ElementPos, BlockLen);
   end;
 end;
 
@@ -57635,19 +57682,16 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  if FPerChannelAlpha then
+  if (FOutput.Size <> FOutputError.Size) or (FOutputErrorDeriv.Size <> FOutput.Size) then
+    // can't calculate error on input layers.
+    ComputeNoDeriv()
+  else if FPerChannelAlpha then
+    ComputePerChannelDeriv()
+  else
   begin
-    ComputePerChannel();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end;
-  LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
-
-  // Snake(x) = x + (1/alpha) * sin(alpha*x)^2.
-  // Derivative is 1 + sin(2*alpha*x).
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
-  begin
+    LocalPrevOutput := FPrevLayer.Output;
+    SizeM1 := LocalPrevOutput.Size - 1;
+    // Snake(x) = x + (1/alpha) * sin(alpha*x)^2; derivative 1 + sin(2*alpha*x).
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
@@ -57656,16 +57700,6 @@ begin
       pcr_sincosf(Alpha * x, SinAx, CosAx);
       FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
       FOutputErrorDeriv.FData[OutputCnt] := 1.0 + 2.0 * SinAx * CosAx;
-    end;
-  end
-  else
-  begin
-    // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      SinAx := pcr_sinf(Alpha * x);
-      FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);

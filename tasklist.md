@@ -1125,8 +1125,12 @@ rather than acted on.
         - [ ] Trainable deconvolutions and activations without a fused opcode
           (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
           CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
-        - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar
-          `pcr_sinf` loop; the per-channel path is vectorized.
+        - [X] `TNNetSnake` inference (scalar and per-channel alpha) shares one
+          blocked in-place path through the vectorized `Sin` (~5.5x on AVX2 for
+          the scalar case, CPU A/B, 1-core VM).
+        - [ ] `TNNetSnake` training forward (both alpha modes) still runs the
+          scalar `pcr_sincosf` loop; blocked `TNNetVolume.SinCos` could write
+          sin into `FOutput` and cos into `FOutputErrorDeriv` with no scratch.
         - [ ] The new `cai_group_norm` and the OpenCL residency of the norm /
           activation chain are unmeasured on a GPU (PoCL parity only).
   - [ ] 0.5 Stage-net holder for Kokoro (stage A: `TNNetKokoro.PrepareStageA`;

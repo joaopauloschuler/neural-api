@@ -72,6 +72,8 @@ type
     procedure TestSinhScalarParity;
     procedure TestLnScalarParity;
     procedure TestSinScalarParity;
+    procedure TestSinWideRangeSweep;
+    procedure TestSnakeInferenceMatchesFormula;
     procedure TestCosScalarParity;
     procedure TestSinCosMatchesSeparateSinAndCos;
     procedure TestArcSinhScalarParity;
@@ -1755,6 +1757,93 @@ begin
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSinWideRangeSweep;
+// Dense sweep of Sin vs pcr_sinf over |arg| <= 1000, the range Snake feeds it
+// (alpha * x for loud audio activations).
+const
+  N = 200003;
+  AbsTol = 5e-7;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  e, maxErr, maxArg: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -1000.0 + 2000.0 * I / (N - 1);
+    TNNetVolume.Sin(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    maxArg := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_sinf(Src.FData[I]));
+      if e > maxErr then
+      begin
+        maxErr := e;
+        maxArg := Src.FData[I];
+      end;
+    end;
+    AssertTrue('Sin vs pcr_sinf on |x| <= 1000: max abs err ' + FloatToStr(maxErr) +
+      ' at x = ' + FloatToStr(maxArg), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSnakeInferenceMatchesFormula;
+// Inference Snake (both alpha modes) vs x + sin(a*x)^2 / a through pcr_sinf.
+// 1500 x 5 spans two blocks plus a partial one; depth 5000 exceeds one block.
+const
+  csScalarAlpha = 1.7;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Snake: TNNetLayer;
+  CasePos, ElementPos, Depth: integer;
+  x, Alpha, SinAx, Expected, Diff, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 20261022;
+  for CasePos := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create();
+    try
+      if CasePos = 0 then Input.ReSize(1500, 1, 5) else Input.ReSize(3, 1, 5000);
+      for ElementPos := 0 to Input.Size - 1 do
+        if ElementPos mod 3 = 0 then Input.FData[ElementPos] := 600 * (2 * Random - 1)
+        else Input.FData[ElementPos] := 3 * (2 * Random - 1);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+      Snake := NN.AddLayer(TNNetSnake.Create(csScalarAlpha, CasePos = 1));
+      Depth := Input.Depth;
+      if CasePos = 1 then
+        for ElementPos := 0 to Depth - 1 do
+          Snake.Neurons[0].Weights.FData[ElementPos] := 0.2 + 2.0 * ElementPos / Depth;
+      NN.SetTrainable(False, False);
+      NN.Compute(Input);
+      MaxDiff := 0;
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        x := Input.FData[ElementPos];
+        if CasePos = 1 then Alpha := Snake.Neurons[0].Weights.FData[ElementPos mod Depth]
+        else Alpha := csScalarAlpha;
+        SinAx := pcr_sinf(Alpha * x);
+        Expected := x + SinAx * SinAx / Alpha;
+        // Absolute sin error over alpha, plus the rounding of the final x + term.
+        Diff := Abs(NN.GetLastLayer.Output.FData[ElementPos] - Expected) /
+          (1e-5 / Alpha + 2.4e-7 * Abs(x));
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max scaled diff ' +
+        FloatToStr(MaxDiff), MaxDiff < 1);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
   end;
 end;
 

@@ -1110,7 +1110,7 @@ begin
   ScratchPtr := FPatch[Index].DataPtr;
   AlphaPtr := FJobAlpha.DataPtr;
   InvAlphaPtr := FInvAlpha.DataPtr;
-  // The TNNetSnake.ComputePerChannel inference sequence, one row at a time.
+  // y = x + (1/a) .* sin(a .* x)^2, one depth-contiguous row at a time.
   for Position := StartPos to FinishPos do
   begin
     RowPtr := FJobOutput.GetRawPtr(Position * Channels);
