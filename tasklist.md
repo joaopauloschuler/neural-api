@@ -380,9 +380,9 @@ rather than acted on.
       High resolution goes through the Deep Guided Filter refiner
       (`downsample_ratio`): box filters of the low-res image/prediction, a
       small 1x1 conv stack for A and b, bilinear A/b upsample, then
-      `A * hr_image + b`. A box-filter layer does not exist yet; add it to
-      neuralnetwork.pas (separable running-sum mean, AVX row pass, OpenCL
-      forward) rather than coding it inside neuralpretrained.pas. Per-frame API
+      `A * hr_image + b`. `TNNetBoxFilter` landed (47705a13) for the
+      fast_guided_filter refiner; the DGF `box_filter` is a TRAINED depthwise
+      3x3 conv in both checkpoints (not 1/9), so load it as one. Per-frame API
       `RVMStep(Net, Frame, State)` keeps the four hidden maps between calls
       (same holder pattern as the other recurrent decode paths). The example
       reads a numbered PNG/JPG frame folder and writes RGBA frames, a green-
