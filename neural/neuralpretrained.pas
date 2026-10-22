@@ -12199,7 +12199,7 @@ type
 
   // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
   // T2I-Adapter, IP-Adapter, img2img, inpainting, InstructPix2Pix,
-  // depth2img); this base runs the plain UNet with CFG. Coded by Claude (AI).
+  // depth2img, x4 upscaling); this base runs the plain UNet with CFG. Coded by Claude (AI).
   TStableDiffusionConditioner = class(TObject)
   protected
     FPipeline: TStableDiffusionPipeline;
@@ -12863,8 +12863,14 @@ type
     FImageLatents: TNNetVolume;
     // latents | ExtraChannels, the input of a UNet wider than the latents.
     FUNetInput: TNNetVolume;
-    // From BeginDenoise: VaeImage is the image at the latent size in [-1, 1].
+    // VaeImage := the image in [-1, 1] at the latent grid times VaeScaleFactor.
+    procedure ResizeSourceImage(Latents, VaeImage: TNNetVolume); virtual;
+    // From BeginDenoise: VaeImage is the image ResizeSourceImage made.
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); virtual; abstract;
+    // Noise := standard-normal (SizeX, SizeY, Depth) unless IsSupplied, when
+    // it must already hold that many values.
+    procedure PrepareUnitNoise(Noise: TNNetVolume; IsSupplied: boolean;
+      SizeX, SizeY, Depth: integer);
     // Pred := the UNet output for Latents with ExtraChannels concatenated in depth.
     procedure PredictWithExtraChannels(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, ExtraChannels, Embeds: TNNetVolume; Timestep: TNeuralFloat;
@@ -12874,9 +12880,10 @@ type
     destructor Destroy(); override;
     // The image (W, H, 3|4) in 0..255; resized to the image size.
     procedure SetImage(Image: TNNetVolume);
-    // diffusers get_default_height_width: the image sides rounded down to a
-    // multiple of VaeScaleFactor.
-    procedure ImageSizeFor(VaeScaleFactor: integer; out Width, Height: integer);
+    // The Width x Height Denoise and DecodeLatents take for the image: diffusers
+    // get_default_height_width, the sides rounded down to a VaeScaleFactor multiple.
+    procedure ImageSizeFor(VaeScaleFactor: integer; out Width,
+      Height: integer); virtual;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
   end;
@@ -12892,9 +12899,6 @@ type
     FHasSampleNoise: boolean;
     FStrength: double;
     procedure SetStrength(Value: double);
-    // Noise := the set sample noise (raises unless it matches Latents) or a
-    // global-RNG draw.
-    procedure PrepareSampleNoise(Noise, Latents: TNNetVolume);
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
   public
     constructor Create();
@@ -13013,6 +13017,49 @@ type
     // pipeline's model folder.
     property DepthEstimatorFolder: string read FDepthEstimatorFolder
       write FDepthEstimatorFolder;
+  end;
+
+  // diffusers StableDiffusionUpscalePipeline (stabilityai/stable-diffusion-x4-upscaler):
+  // a 7-channel UNet sees latents | the low-res RGB image noised to NoiseLevel
+  // by low_res_scheduler/, NoiseLevel also being its class label. The latents
+  // have the low-res size, so the decoded image is VaeScaleFactor times larger.
+  TStableDiffusionUpscaler = class(TStableDiffusionImageConditioner)
+  private
+    FLowResScheduler: TNNetDiffusionScheduler;
+    // The unit noise low_res_scheduler adds (latent grid, 3 channels).
+    FImageNoise: TNNetVolume;
+    FHasImageNoise: boolean;
+    FNoiseLevel, FMaxNoiseLevel: integer;
+    procedure SetNoiseLevel(Value: integer);
+  protected
+    // PIL bicubic on the RGB bytes to the latent grid (VaeImageProcessor).
+    procedure ResizeSourceImage(Latents, VaeImage: TNNetVolume); override;
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); override;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // The low_res_scheduler unit noise (latent grid, 3); until set,
+    // BeginDenoise draws it from the global RNG.
+    procedure SetImageNoise(Noise: TNNetVolume);
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    // VaeScaleFactor times the low-res sides rounded down to its multiple.
+    procedure ImageSizeFor(VaeScaleFactor: integer; out Width,
+      Height: integer); override;
+    // Reads max_noise_level (model_index.json) and low_res_scheduler/.
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    // diffusers feeds the same noised image to the prompt and unconditional pass.
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    // diffusers noise_level (20): 0 .. max_noise_level (350), checked by BeginDenoise.
+    property NoiseLevel: integer read FNoiseLevel write SetNoiseLevel;
+    // The low-res image after low_res_scheduler add_noise (last BeginDenoise).
+    property NoisedImage: TNNetVolume read FImageLatents;
   end;
 
 // ---------------------------------------------------------------------------
@@ -94381,6 +94428,7 @@ begin
     (ClassName = 'StableDiffusionImg2ImgPipeline') or
     (ClassName = 'StableDiffusionInstructPix2PixPipeline') or
     (ClassName = 'StableDiffusionDepth2ImgPipeline') or
+    (ClassName = 'StableDiffusionUpscalePipeline') or
     (ClassName = 'LatentConsistencyModelPipeline') or
     (ClassName = 'LatentConsistencyModelImg2ImgPipeline');
 end;
@@ -94480,8 +94528,10 @@ begin
     ImportError('TStableDiffusionPipeline: the unet uses SDXL ' +
       'addition_embed_type "text_time"; SDXL is not supported yet.');
   // An inpainting UNet takes latents | mask | masked-image latents, an
-  // InstructPix2Pix one latents | image latents, a depth2img one latents | depth.
+  // InstructPix2Pix one latents | image latents, a depth2img one latents |
+  // depth, an x4 upscaler one latents | the RGB low-res image.
   if ((FUNetConfig.InChannels <> FVaeConfig.LatentChannels) and
+    (FUNetConfig.InChannels <> FVaeConfig.LatentChannels + 3) and
     (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels + 1) and
     (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels) and
     (FUNetConfig.InChannels <> FVaeConfig.LatentChannels + 1)) or
@@ -95679,7 +95729,8 @@ begin
       IntToStr(FUNetConfig.InChannels) + ' input channels (an inpainting ' +
       'unet needs a TStableDiffusionInpainter, an InstructPix2Pix one a ' +
       'TStableDiffusionInstructPix2Pix, a depth2img one a ' +
-      'TStableDiffusionDepth2Img).');
+      'TStableDiffusionDepth2Img, an x4 upscaler one a ' +
+      'TStableDiffusionUpscaler).');
   if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
     (Latents.Depth <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
@@ -96778,6 +96829,32 @@ begin
   FSourceImage.Copy(Image);
 end;
 
+procedure TStableDiffusionImageConditioner.ResizeSourceImage(Latents,
+  VaeImage: TNNetVolume);
+begin
+  ConvertAndResizeImagePIL(FSourceImage, VaeImage,
+    Latents.SizeX * FPipeline.VaeScaleFactor,
+    Latents.SizeY * FPipeline.VaeScaleFactor, 3,
+    {ClipToByteRange=}false, -1, 1);
+end;
+
+procedure TStableDiffusionImageConditioner.PrepareUnitNoise(Noise: TNNetVolume;
+  IsSupplied: boolean; SizeX, SizeY, Depth: integer);
+begin
+  if IsSupplied then
+  begin
+    if Noise.Size <> SizeX * SizeY * Depth then
+      ImportError(ClassName + ': the supplied noise holds ' +
+        IntToStr(Noise.Size) + ' values, not ' + IntToStr(SizeX) + 'x' +
+        IntToStr(SizeY) + 'x' + IntToStr(Depth) + '.');
+  end
+  else
+  begin
+    Noise.ReSize(SizeX, SizeY, Depth);
+    Noise.RandomizeGaussian(1.0);
+  end;
+end;
+
 procedure TStableDiffusionImageConditioner.ImageSizeFor(VaeScaleFactor: integer;
   out Width, Height: integer);
 begin
@@ -96799,10 +96876,7 @@ begin
   VaeImage := TNNetVolume.Create();
   try
     StartLoadPhase();
-    ConvertAndResizeImagePIL(FSourceImage, VaeImage,
-      Latents.SizeX * Pipeline.VaeScaleFactor,
-      Latents.SizeY * Pipeline.VaeScaleFactor, 3,
-      {ClipToByteRange=}false, -1, 1);
+    ResizeSourceImage(Latents, VaeImage);
     EncodeImage(VaeImage, Latents);
   finally
     VaeImage.Free;
@@ -96839,27 +96913,12 @@ begin
   FHasSampleNoise := true;
 end;
 
-procedure TStableDiffusionImg2Img.PrepareSampleNoise(Noise,
-  Latents: TNNetVolume);
-begin
-  if FHasSampleNoise then
-  begin
-    if Noise.Size <> Latents.Size then
-      ImportError(ClassName + ': the sample noise does not match the ' +
-        IntToStr(Latents.Size) + ' latents.');
-  end
-  else
-  begin
-    Noise.ReSize(Latents);
-    Noise.RandomizeGaussian(1.0);
-  end;
-end;
-
 procedure TStableDiffusionImg2Img.BeginDenoise(
   Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
   TextSeqLen: integer);
 begin
-  PrepareSampleNoise(FImageSampleNoise, Latents);
+  PrepareUnitNoise(FImageSampleNoise, FHasSampleNoise, Latents.SizeX,
+    Latents.SizeY, Latents.Depth);
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
   FNoise.ReSize(Latents);
   FNoise.Copy(Latents);
@@ -96943,7 +97002,8 @@ begin
   if FSourceMask.Size = 0 then
     ImportError('TStableDiffusionInpainter: call SetImage and SetMask first.');
   FIsConcatUNet := FPipeline.UNetConfig.InChannels <> Latents.Depth;
-  PrepareSampleNoise(FMaskedImageSampleNoise, Latents);
+  PrepareUnitNoise(FMaskedImageSampleNoise, FHasSampleNoise, Latents.SizeX,
+    Latents.SizeY, Latents.Depth);
   BinaryMask := TNNetVolume.Create();
   KeepMask := TNNetVolume.Create();
   try
@@ -97224,6 +97284,130 @@ procedure TStableDiffusionDepth2Img.EndDenoise();
 begin
   inherited EndDenoise();
   if not FPipeline.ComponentsLoaded then FreeAndNil(FEstimator);
+end;
+
+constructor TStableDiffusionUpscaler.Create();
+begin
+  inherited Create();
+  FImageNoise := TNNetVolume.Create();
+  FNoiseLevel := 20;
+  FMaxNoiseLevel := 350;
+end;
+
+destructor TStableDiffusionUpscaler.Destroy();
+begin
+  FLowResScheduler.Free;
+  FImageNoise.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionUpscaler.SetNoiseLevel(Value: integer);
+begin
+  if Value < 0 then
+    ImportError(ClassName + ': noise level ' + IntToStr(Value) +
+      ' is negative.');
+  FNoiseLevel := Value;
+end;
+
+procedure TStableDiffusionUpscaler.SetImageNoise(Noise: TNNetVolume);
+begin
+  FImageNoise.ReSize(Noise);
+  FImageNoise.Copy(Noise);
+  FHasImageNoise := true;
+end;
+
+function TStableDiffusionUpscaler.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  Result := InChannels = LatentChannels + 3;
+end;
+
+procedure TStableDiffusionUpscaler.ImageSizeFor(VaeScaleFactor: integer;
+  out Width, Height: integer);
+begin
+  inherited ImageSizeFor(VaeScaleFactor, Width, Height);
+  Width := Width * VaeScaleFactor;
+  Height := Height * VaeScaleFactor;
+end;
+
+procedure TStableDiffusionUpscaler.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  SchedulerFile: string;
+  ClassCount: integer;
+begin
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(Pipeline.FModelFolder + 'model_index.json');
+    Root := GetJSON(JsonText.Text);
+    if Root is TJSONObject then
+      FMaxNoiseLevel := TJSONObject(Root).Get('max_noise_level', 350);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if FNoiseLevel > FMaxNoiseLevel then
+    ImportError(ClassName + ': noise level ' + IntToStr(FNoiseLevel) +
+      ' exceeds max_noise_level ' + IntToStr(FMaxNoiseLevel) + '.');
+  ClassCount := Pipeline.UNetConfig.NumClassEmbeds;
+  if (ClassCount > 0) and (FNoiseLevel >= ClassCount) then
+    ImportError(ClassName + ': noise level ' + IntToStr(FNoiseLevel) +
+      ' has no row in the ' + IntToStr(ClassCount) + ' unet class embeddings.');
+  SchedulerFile := Pipeline.ComponentFolder('low_res_scheduler') +
+    'scheduler_config.json';
+  if not FileExists(SchedulerFile) then
+    ImportError(ClassName + ': ' + SchedulerFile + ' is missing.');
+  FreeAndNil(FLowResScheduler);
+  FLowResScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+    SchedulerFile, {ForwardProcessOnly=}true);
+  if FNoiseLevel >= FLowResScheduler.NumTimesteps then
+    ImportError(ClassName + ': noise level ' + IntToStr(FNoiseLevel) +
+      ' is past the ' + IntToStr(FLowResScheduler.NumTimesteps) +
+      ' low_res_scheduler timesteps.');
+  PrepareUnitNoise(FImageNoise, FHasImageNoise, Latents.SizeX, Latents.SizeY, 3);
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+end;
+
+procedure TStableDiffusionUpscaler.ResizeSourceImage(Latents,
+  VaeImage: TNNetVolume);
+begin
+  ConvertAndResizeImagePIL(FSourceImage, VaeImage, FSourceImage.SizeX,
+    FSourceImage.SizeY, 3, {ClipToByteRange=}true, 0, 255);
+  if (VaeImage.SizeX <> Latents.SizeX) or (VaeImage.SizeY <> Latents.SizeY) then
+    ResizeImagePIL(VaeImage, VaeImage, Latents.SizeX, Latents.SizeY,
+      irfBicubic, {RoundToBytes=}true);
+  // pil_to_numpy / 255, then normalize 2x - 1.
+  VaeImage.Mul(2 / 255);
+  VaeImage.Add(-1);
+end;
+
+procedure TStableDiffusionUpscaler.EncodeImage(VaeImage, Latents: TNNetVolume);
+begin
+  // diffusers add_noise at the 0-based noise_level, i.e. 1-based Tt + 1.
+  FImageLatents.ReSize(VaeImage);
+  FLowResScheduler.AddNoise(VaeImage, FImageLatents, FNoiseLevel + 1, nil,
+    FImageNoise);
+end;
+
+procedure TStableDiffusionUpscaler.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
+begin
+  if Assigned(UNetInputs.ClassLabel) then
+    UNetInputs.ClassLabel.Output.FData[0] := FNoiseLevel;
+end;
+
+procedure TStableDiffusionUpscaler.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  PredictWithExtraChannels(UNet, Config, Latents, FImageLatents, Embeds,
+    Timestep, Pred);
 end;
 
 const

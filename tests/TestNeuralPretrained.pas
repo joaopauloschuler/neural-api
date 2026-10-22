@@ -1338,6 +1338,7 @@ type
     procedure TestStableDiffusion2Depth2ImgEstimatorParity;
     procedure TestStableDiffusion2Depth2ImgEstimatorOpenCL;
     procedure TestStableDiffusion2Depth2ImgEstimatorKept;
+    procedure TestStableDiffusionUpscalerParity;
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
@@ -47377,6 +47378,100 @@ end;
 
 // The same after LoadComponents, twice: the second run reads no weights file
 // (the depth estimator is kept) and still matches.
+// StableDiffusionUpscalePipeline float64 on tiny_sd_x4_upscaler: DDIM on a
+// 12x8 image at noise level 20 and Euler on a 13x10 one (bicubic to 12x8) at
+// 150, then the first case again with the components kept.
+procedure TTestNeuralPretrained.TestStableDiffusionUpscalerParity;
+var
+  Pipeline, PlainPipeline: TStableDiffusionPipeline;
+  Upscaler: TStableDiffusionUpscaler;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  LowResImage, ImageNoise, Latents, Embeds: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight: integer;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd_x4_upscaler_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd_x4_upscaler');
+  PlainPipeline := nil;
+  Upscaler := TStableDiffusionUpscaler.Create();
+  LowResImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    AssertEquals('7-channel unet', 7, Pipeline.UNetConfig.InChannels);
+    AssertEquals('3-level vae', 4, Pipeline.VaeScaleFactor);
+    AssertEquals('default noise level', 20, Upscaler.NoiseLevel);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['image_noise'],
+      true, ImageNoise);
+    Upscaler.SetImageNoise(ImageNoise);
+    Pipeline.Conditioner := Upscaler;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 2, Cases.Count);
+    for CasePos := 0 to Cases.Count do
+    begin
+      if CasePos = Cases.Count then
+      begin
+        Entry := Cases.Objects[0];
+        Pipeline.LoadComponents(ImageWidth, ImageHeight);
+      end
+      else Entry := Cases.Objects[CasePos];
+      if Entry.Get('scheduler', '') = 'DDIMScheduler' then
+        Pipeline.Sampler := smDDIM
+      else Pipeline.Sampler := smEuler;
+      LoadNestedOracleVolume(Entry.Arrays['low_res_image'], false, LowResImage);
+      Upscaler.SetImage(LowResImage);
+      Upscaler.NoiseLevel := Entry.Get('noise_level', 0);
+      Upscaler.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+      AssertEquals('output width', TJSONObject(FSD15Oracle).Get('width', 0),
+        ImageWidth);
+      AssertEquals('output height', TJSONObject(FSD15Oracle).Get('height', 0),
+        ImageHeight);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+    end;
+    Pipeline.OnStep := nil;
+    Pipeline.GuidanceScale := 1;
+    Pipeline.EncodePrompt('a', Embeds);
+    Upscaler.NoiseLevel := 351;
+    Pipeline.MakeInitialLatents(ImageWidth, ImageHeight, 1, Latents);
+    IsRefused := false;
+    try
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('noise level past max_noise_level refused', IsRefused);
+    Pipeline.Conditioner := nil;
+    IsRefused := false;
+    try
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('plain conditioner refused for the upscaler unet', IsRefused);
+    Upscaler.NoiseLevel := 20;
+    PlainPipeline := CreateSDPipeline('tiny_sd2');
+    PlainPipeline.Conditioner := Upscaler;
+    IsRefused := false;
+    try
+      PlainPipeline.Denoise(Embeds, 24, 24, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('4-channel unet refused for the upscaler', IsRefused);
+  finally
+    Embeds.Free;
+    Latents.Free;
+    ImageNoise.Free;
+    LowResImage.Free;
+    PlainPipeline.Free;
+    Pipeline.Free;
+    Upscaler.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgEstimatorKept;
 begin
   CheckSD2Depth2ImgEstimatorParity(false, true);

@@ -266,7 +266,9 @@ type
       pFinalAlphaBarIsOne: boolean = true);
     // Reads a diffusers DDIM/DDPM/PNDM-style scheduler_config.json (beta and
     // spacing fields); raises on what this class does not implement.
-    constructor CreateFromDiffusersConfig(const FileName: string);
+    // ForwardProcessOnly (AddNoise use) accepts the step-only clip_sample.
+    constructor CreateFromDiffusersConfig(const FileName: string;
+      ForwardProcessOnly: boolean = false);
     destructor Destroy; override;
 
     // Schedule tables (1-based timesteps; index 0 = clean anchor).
@@ -815,7 +817,7 @@ begin
 end;
 
 constructor TNNetDiffusionScheduler.CreateFromDiffusersConfig(
-  const FileName: string);
+  const FileName: string; ForwardProcessOnly: boolean);
 var
   JsonText: TStringList;
   Root, TrainedBetas: TJSONData;
@@ -846,7 +848,7 @@ begin
     SchedulerClass := Obj.Get('_class_name', '');
     ClipSampleDefault := (SchedulerClass = '') or
       (SchedulerClass = 'DDIMScheduler') or (SchedulerClass = 'DDPMScheduler');
-    if Obj.Get('clip_sample', ClipSampleDefault) then
+    if Obj.Get('clip_sample', ClipSampleDefault) and not ForwardProcessOnly then
       Refuse('"clip_sample" = true');
     if Obj.Get('thresholding', false) then Refuse('"thresholding" = true');
     TrainedBetas := Obj.Find('trained_betas');
