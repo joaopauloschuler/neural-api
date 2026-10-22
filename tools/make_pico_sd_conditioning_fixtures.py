@@ -32,8 +32,16 @@ not matter; values rounded to 10 digits):
       then per case (4-channel tiny_sd15 with DDIM and with Euler, 9-channel
       tiny_sd15_inpaint with DDIM): latents, timesteps, latents_after and the
       decoded output. The VAE encode takes the latent mean (retrieve_latents is
-      patched to argmax), as our encoder does. Euler latents are divided by
-      sqrt(sigma_next^2 + 1), the model-input scale the pipeline keeps.
+      patched to argmax; the Pascal test sets zero sample noise). Euler latents
+      are divided by sqrt(sigma_next^2 + 1), the model-input scale the
+      pipeline keeps.
+  tests/fixtures/tiny_sd15_inpaint_strength_io.json
+      the same image and mask, STRENGTH_STEPS steps at strength STRENGTH (the
+      4-channel tiny_sd15 with DDIM and Euler, the 9-channel tiny_sd15_inpaint
+      with DDIM) and the 9-channel one at strength 1. The noise ("latents")
+      and the unit noise of the image / masked-image latent samples are
+      injected (randn_tensor and retrieve_latents patched), so the VAE latents
+      are sampled as diffusers does: mean + std * noise.
 
   tests/fixtures/tiny_sd15_controlnet_nonsquare_io.json
       the ControlNet run at CONTROLNET_WIDTH x CONTROLNET_HEIGHT, a 7x5 latent
@@ -49,8 +57,9 @@ Coded by Claude (AI).
 Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py
   python tools/make_pico_sd_conditioning_fixtures.py --nonsquare-only
+  python tools/make_pico_sd_conditioning_fixtures.py --inpaint-strength-only
 (--nonsquare-only keeps the committed folders and writes only the two
-non-square files.)
+non-square files; --inpaint-strength-only writes only the strength file.)
 """
 import json
 import os
@@ -75,6 +84,7 @@ INPAINT_DIR = os.path.join(FIXTURES, "tiny_sd15_inpaint")
 CONTROLNET_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_io.json")
 ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_io.json")
 INPAINT_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_io.json")
+INPAINT_STRENGTH_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_strength_io.json")
 CONTROLNET_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_nonsquare_io.json")
 ADAPTER_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_nonsquare_io.json")
 
@@ -88,6 +98,8 @@ STEPS = 3
 GUIDANCE = 7.5
 CONTROLNET_SCALE = 0.5
 ADAPTER_SCALE = 0.8
+STRENGTH = 0.6
+STRENGTH_STEPS = 5
 PROMPT = "a photo of an astronaut riding a horse on mars"
 
 
@@ -125,7 +137,7 @@ def initial_latents(width=IMAGE_SIZE, height=IMAGE_SIZE):
 
 
 def run(pipe, extra, latents, euler=False, legacy_callback=False,
-        width=IMAGE_SIZE, height=IMAGE_SIZE):
+        width=IMAGE_SIZE, height=IMAGE_SIZE, steps=STEPS):
     pipe.set_progress_bar_config(disable=True)
     if width % 8 or height % 8:
         pipe.check_inputs = lambda *args, **kwargs: None
@@ -147,8 +159,9 @@ def run(pipe, extra, latents, euler=False, legacy_callback=False,
     else:
         extra = dict(extra, callback_on_step_end=on_step_end)
     result = pipe(PROMPT, height=height, width=width,
-                  num_inference_steps=STEPS, guidance_scale=GUIDANCE,
-                  latents=latents.clone(), output_type="np", **extra)
+                  num_inference_steps=steps, guidance_scale=GUIDANCE,
+                  latents=None if latents is None else latents.clone(),
+                  output_type="np", **extra)
     return {"timesteps": [int(t) for t in pipe.scheduler.timesteps],
             "latents_after": after,
             "image": rounded(result.images[0].tolist())}
@@ -237,10 +250,7 @@ def make_inpaint():
     # Our VAE encoder returns the latent mean; diffusers samples by default.
     inpaint_module.retrieve_latents = (
         lambda output, generator=None, sample_mode="sample": output.latent_dist.mode())
-    image = byte_image(torch.Generator().manual_seed(SEED + 21), 3)
-    mask = torch.zeros((1, 1, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float64)
-    mask[:, :, 3:13, 8:] = 1.0
-    mask[:, :, 0:4, 0:4] = 1.0
+    image, mask = inpaint_image_and_mask()
     latents = initial_latents()
     cases = []
     for name, folder, euler in (("unet4_ddim", PICO_DIR, False),
@@ -260,6 +270,65 @@ def make_inpaint():
                "prompt": PROMPT, "init_image": hwc(image), "mask": hwc(mask),
                "latents": chw(latents[0]), "cases": cases}
     with open(INPAINT_IO, "w") as f:
+        json.dump(payload, f)
+
+
+def inpaint_image_and_mask():
+    image = byte_image(torch.Generator().manual_seed(SEED + 21), 3)
+    mask = torch.zeros((1, 1, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float64)
+    mask[:, :, 3:13, 8:] = 1.0
+    mask[:, :, 0:4, 0:4] = 1.0
+    return image, mask
+
+
+def make_inpaint_strength():
+    image, mask = inpaint_image_and_mask()
+    noise = initial_latents()
+    generator = torch.Generator().manual_seed(SEED + 22)
+    image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+    masked_image_noise = torch.randn(noise.shape, generator=generator,
+                                     dtype=torch.float64)
+    sample_noise = []
+
+    def sampled(output, generator=None, sample_mode="sample"):
+        dist = output.latent_dist
+        return dist.mean + dist.std * sample_noise.pop(0)
+    inpaint_module.retrieve_latents = sampled
+    inpaint_module.randn_tensor = lambda *args, **kwargs: noise.clone()
+    cases = []
+    for name, folder, euler, strength in (
+            ("unet4_ddim_strength", PICO_DIR, False, STRENGTH),
+            ("unet4_euler_strength", PICO_DIR, True, STRENGTH),
+            ("unet9_ddim_strength", INPAINT_DIR, False, STRENGTH),
+            ("unet9_ddim_sampled", INPAINT_DIR, False, 1.0)):
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            folder, torch_dtype=torch.float64, safety_checker=None)
+        if euler:
+            pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        # prepare_latents encodes the image (4 channels or strength < 1), then
+        # prepare_mask_latents the masked image.
+        if folder == INPAINT_DIR and strength == 1.0:
+            sample_noise[:] = [masked_image_noise]
+        else:
+            sample_noise[:] = [image_noise, masked_image_noise]
+        out = run(pipe, {"image": image, "mask_image": mask, "strength": strength},
+                  None, euler, steps=STRENGTH_STEPS)
+        assert not sample_noise, name
+        # The steps that ran: get_timesteps keeps the last ones.
+        out["timesteps"] = out["timesteps"][-len(out["latents_after"]):]
+        out["name"] = name
+        out["folder"] = os.path.basename(folder)
+        out["scheduler"] = type(pipe.scheduler).__name__
+        out["strength"] = strength
+        cases.append(out)
+        print(name, out["timesteps"], len(out["latents_after"]), "steps run")
+    payload = {"image_size": IMAGE_SIZE, "steps": STRENGTH_STEPS,
+               "guidance_scale": GUIDANCE, "prompt": PROMPT,
+               "init_image": hwc(image), "mask": hwc(mask),
+               "latents": chw(noise[0]), "image_sample_noise": chw(image_noise[0]),
+               "masked_image_sample_noise": chw(masked_image_noise[0]),
+               "cases": cases}
+    with open(INPAINT_STRENGTH_IO, "w") as f:
         json.dump(payload, f)
 
 
@@ -301,9 +370,13 @@ def make_adapter_nonsquare():
 
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
+    if "--inpaint-strength-only" in sys.argv:
+        make_inpaint_strength()
+        sys.exit(0)
     if "--nonsquare-only" not in sys.argv:
         make_controlnet()
         make_adapter()
         make_inpaint()
+        make_inpaint_strength()
     make_controlnet_nonsquare()
     make_adapter_nonsquare()

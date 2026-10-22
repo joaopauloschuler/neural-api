@@ -12170,6 +12170,12 @@ type
     // Before the first step; Latents is the unit noise (grid, latent channels).
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); virtual;
+    // diffusers strength: 1 runs the whole schedule from noise; below 1 Denoise
+    // runs the last steps (Img2ImgStartStep) from NoiseImageLatents.
+    function DenoiseStrength(): double; virtual;
+    // Strength < 1: Latents (the unit noise) := the image latents noised to
+    // the 1-based timestep Tt (diffusers add_noise). This base raises.
+    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); virtual;
     // Pred := the UNet output for Latents (model-input scale) and Embeds at
     // diffusers timestep Timestep.
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
@@ -12319,12 +12325,14 @@ type
     // StepCount Sampler steps on Latents in place (unit noise in, scaled by
     // the sampler's init noise sigma; clean out); each UNet pass goes through
     // Conditioner, the unconditional one too when GuidanceScale > 1 (CFG).
-    // Euler a draws its noise from the global RNG.
+    // A Conditioner strength < 1 runs only the last steps. Euler a draws its
+    // noise from the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
-    // VAE encode of VaeImage (W, H, 3) in [-1, 1]: the latent mean times
-    // scaling_factor, (W, H) / VaeScaleFactor. Kept like the other components.
-    procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume);
+    // VAE latents of VaeImage (W, H, 3) in [-1, 1], (W, H) / VaeScaleFactor:
+    // (mean + std * SampleNoise; nil: mean) * scaling_factor (latent_dist.sample).
+    procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume;
+      SampleNoise: TNNetVolume = nil);
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
       Image: TNNetVolume);
@@ -12620,17 +12628,21 @@ type
     property Config: TT2IAdapterConfig read FConfig;
   end;
 
-  // diffusers StableDiffusionInpaintPipeline at strength 1: a 9-channel UNet
-  // sees latents | mask | masked-image latents; a 4-channel one gets the kept
-  // region re-noised and blended back after every step. VAE latents: the mean.
+  // diffusers StableDiffusionInpaintPipeline: a 9-channel UNet sees latents |
+  // mask | masked-image latents; a 4-channel one gets the kept region
+  // re-noised and blended back after every step. VAE latents are sampled.
   TStableDiffusionInpainter = class(TStableDiffusionConditioner)
   private
     FSourceImage, FSourceMask: TNNetVolume;
-    // 9 channels: mask | masked-image latents; 4: the image latents, the
+    // 9 channels: mask | masked-image latents. The image latents, the unit
     // noise, the re-noised image latents and the latent mask per channel.
     FMaskAndImageLatents, FUNetInput: TNNetVolume;
     FImageLatents, FNoise, FKnownLatents, FMaskLatents: TNNetVolume;
-    FIsConcatUNet: boolean;
+    // The unit Gaussian noise of the image / masked-image latent samples.
+    FImageSampleNoise, FMaskedImageSampleNoise: TNNetVolume;
+    FHasSampleNoise, FIsConcatUNet: boolean;
+    FStrength: double;
+    procedure SetStrength(Value: double);
   public
     constructor Create();
     destructor Destroy(); override;
@@ -12638,16 +12650,23 @@ type
     procedure SetImage(Image: TNNetVolume);
     // The mask (W, H, 1|3|4) in 0..255, white = regenerate; resized.
     procedure SetMask(Mask: TNNetVolume);
+    // The unit noise of the two VAE latent samples (zeros: the latent mean);
+    // until set, BeginDenoise draws it from the global RNG.
+    procedure SetSampleNoise(ImageNoise, MaskedImageNoise: TNNetVolume);
     function AcceptsUNetInChannels(InChannels,
       LatentChannels: integer): boolean; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
+    function DenoiseStrength(): double; override;
+    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); override;
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Pred: TNNetVolume); override;
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
     // True after BeginDenoise saw a 9-channel inpainting UNet.
     property IsConcatUNet: boolean read FIsConcatUNet;
+    // diffusers strength in (0, 1] (1: start from pure noise).
+    property Strength: double read FStrength write SetStrength;
   end;
 
 // ---------------------------------------------------------------------------
@@ -92892,16 +92911,51 @@ begin
 end;
 
 procedure TStableDiffusionPipeline.EncodeVaeImage(VaeImage,
-  Latents: TNNetVolume);
+  Latents: TNNetVolume; SampleNoise: TNNetVolume);
 var
   Net: TNNet;
-  GridX, GridY: integer;
+  Moments: TNNetLayer;
+  GridX, GridY, LatentChannels, CellPos, MaxCellPos, ChannelPos,
+    MaxChannelPos, LatentPos, LogVarPos: integer;
+  LogVar, StdScale: TNeuralFloat;
 begin
   LatentGridFor(VaeImage.SizeX, VaeImage.SizeY, GridX, GridY);
   Net := AcquireVaeEncoder(GridX, GridY);
   try
     Net.Compute(VaeImage);
     Net.GetOutput(Latents);
+    if Assigned(SampleNoise) then
+    begin
+      if SampleNoise.Size <> Latents.Size then
+        ImportError('TStableDiffusionPipeline.EncodeVaeImage: sample noise ' +
+          'of ' + IntToStr(SampleNoise.Size) + ' values for ' +
+          IntToStr(Latents.Size) + ' latents.');
+      // BuildVaeEncoder ends quant_conv (mean | logvar), mean split, scale.
+      Moments := Net.Layers[Net.GetLastLayerIdx() - 2];
+      Moments.ForceOutputOnRAM();
+      LatentChannels := Latents.Depth;
+      if Moments.Output.Depth <> 2 * LatentChannels then
+        ImportError('TStableDiffusionPipeline.EncodeVaeImage: the VAE ' +
+          'encoder does not end in quant_conv, mean split and scale.');
+      MaxCellPos := Latents.SizeX * Latents.SizeY - 1;
+      MaxChannelPos := LatentChannels - 1;
+      LatentPos := 0;
+      for CellPos := 0 to MaxCellPos do
+      begin
+        LogVarPos := 2 * LatentChannels * CellPos + LatentChannels;
+        for ChannelPos := 0 to MaxChannelPos do
+        begin
+          // DiagonalGaussianDistribution: std = exp(0.5 * clamp(logvar, -30, 20)).
+          LogVar := Moments.Output.FData[LogVarPos + ChannelPos];
+          if LogVar < -30 then LogVar := -30
+          else if LogVar > 20 then LogVar := 20;
+          StdScale := FVaeConfig.ScalingFactor * Exp(0.5 * LogVar);
+          Latents.FData[LatentPos] := Latents.FData[LatentPos] +
+            StdScale * SampleNoise.FData[LatentPos];
+          Inc(LatentPos);
+        end;
+      end;
+    end;
   finally
     ReleaseComponent(Net);
   end;
@@ -93228,8 +93282,9 @@ var
   Schedule: TNeuralIntegerArray;
   Pred, PredUncond: TNNetVolume;
   IsGuided: boolean;
-  GridX, GridY, StepPos, MaxStepPos, Tt: integer;
+  GridX, GridY, StepPos, MaxStepPos, Tt, StartStep: integer;
   Eta, NoiseScale: TNeuralFloat;
+  Strength: double;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
   StepConditioner := ActiveConditioner();
@@ -93268,10 +93323,23 @@ begin
     DoPhase(sdphDenoise);
     Schedule := FScheduler.BuildSamplerSchedule(StepCount,
       FScheduler.ConfigSpacing, FSampler);
-    // diffusers scales the given latents by init_noise_sigma.
-    NoiseScale := FScheduler.InitialNoiseScale(FSampler,
-      FScheduler.ConfigSpacing, Schedule[0]);
-    if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+    Strength := StepConditioner.DenoiseStrength();
+    if Strength < 1 then
+    begin
+      // diffusers get_timesteps: drop the first steps, then start from the
+      // image latents noised to the first kept timestep (no init sigma).
+      StartStep := TNNetDiffusionScheduler.Img2ImgStartStep(StepCount,
+        Strength);
+      Schedule := Copy(Schedule, StartStep, Length(Schedule) - StartStep);
+      StepConditioner.NoiseImageLatents(Latents, Schedule[0]);
+    end
+    else
+    begin
+      // diffusers scales the given latents by init_noise_sigma.
+      NoiseScale := FScheduler.InitialNoiseScale(FSampler,
+        FScheduler.ConfigSpacing, Schedule[0]);
+      if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+    end;
     // Euler a injects its full ancestral noise; the others are deterministic.
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
     MaxStepPos := Length(Schedule) - 2;
@@ -93404,6 +93472,17 @@ procedure TStableDiffusionConditioner.BeginDenoise(
   TextSeqLen: integer);
 begin
   FPipeline := Pipeline;
+end;
+
+function TStableDiffusionConditioner.DenoiseStrength(): double;
+begin
+  Result := 1;
+end;
+
+procedure TStableDiffusionConditioner.NoiseImageLatents(Latents: TNNetVolume;
+  Tt: integer);
+begin
+  ImportError(ClassName + ': no image to start a strength < 1 run from.');
 end;
 
 procedure TStableDiffusionConditioner.PredictNoise(UNet: TNNet;
@@ -93765,10 +93844,15 @@ begin
   FNoise := TNNetVolume.Create();
   FKnownLatents := TNNetVolume.Create();
   FMaskLatents := TNNetVolume.Create();
+  FImageSampleNoise := TNNetVolume.Create();
+  FMaskedImageSampleNoise := TNNetVolume.Create();
+  FStrength := 1;
 end;
 
 destructor TStableDiffusionInpainter.Destroy();
 begin
+  FMaskedImageSampleNoise.Free;
+  FImageSampleNoise.Free;
   FMaskLatents.Free;
   FKnownLatents.Free;
   FNoise.Free;
@@ -93778,6 +93862,14 @@ begin
   FSourceMask.Free;
   FSourceImage.Free;
   inherited Destroy();
+end;
+
+procedure TStableDiffusionInpainter.SetStrength(Value: double);
+begin
+  if not ((Value > 0) and (Value <= 1)) then
+    ImportError('TStableDiffusionInpainter: strength ' + FloatToStr(Value) +
+      ' is outside (0, 1].');
+  FStrength := Value;
 end;
 
 procedure TStableDiffusionInpainter.SetImage(Image: TNNetVolume);
@@ -93790,6 +93882,16 @@ procedure TStableDiffusionInpainter.SetMask(Mask: TNNetVolume);
 begin
   FSourceMask.ReSize(Mask);
   FSourceMask.Copy(Mask);
+end;
+
+procedure TStableDiffusionInpainter.SetSampleNoise(ImageNoise,
+  MaskedImageNoise: TNNetVolume);
+begin
+  FImageSampleNoise.ReSize(ImageNoise);
+  FImageSampleNoise.Copy(ImageNoise);
+  FMaskedImageSampleNoise.ReSize(MaskedImageNoise);
+  FMaskedImageSampleNoise.Copy(MaskedImageNoise);
+  FHasSampleNoise := true;
 end;
 
 function TStableDiffusionInpainter.AcceptsUNetInChannels(InChannels,
@@ -93810,6 +93912,20 @@ begin
   if (FSourceImage.Size = 0) or (FSourceMask.Size = 0) then
     ImportError('TStableDiffusionInpainter: call SetImage and SetMask first.');
   FIsConcatUNet := Pipeline.UNetConfig.InChannels <> Latents.Depth;
+  if FHasSampleNoise then
+  begin
+    if (FImageSampleNoise.Size <> Latents.Size) or
+      (FMaskedImageSampleNoise.Size <> Latents.Size) then
+      ImportError('TStableDiffusionInpainter: the sample noise does not ' +
+        'match the ' + IntToStr(Latents.Size) + ' latents.');
+  end
+  else
+  begin
+    FImageSampleNoise.ReSize(Latents);
+    FImageSampleNoise.RandomizeGaussian(1.0);
+    FMaskedImageSampleNoise.ReSize(Latents);
+    FMaskedImageSampleNoise.RandomizeGaussian(1.0);
+  end;
   Width := Latents.SizeX * Pipeline.VaeScaleFactor;
   Height := Latents.SizeY * Pipeline.VaeScaleFactor;
   VaeImage := TNNetVolume.Create();
@@ -93825,6 +93941,9 @@ begin
     else MaskChannels := Latents.Depth;
     DiffusersMaskToLatentGrid(BinaryMask, Pipeline.VaeScaleFactor,
       MaskChannels, FMaskLatents);
+    // The 4-channel blend and every strength < 1 start need the image latents.
+    if (not FIsConcatUNet) or (FStrength < 1) then
+      Pipeline.EncodeVaeImage(VaeImage, FImageLatents, FImageSampleNoise);
     if FIsConcatUNet then
     begin
       // masked_image = image * (mask < 0.5), the mask on all 3 channels.
@@ -93832,21 +93951,29 @@ begin
       KeepMask.Mul(-1);
       KeepMask.Add(1);
       VaeImage.Mul(KeepMask);
-      Pipeline.EncodeVaeImage(VaeImage, FImageLatents);
-      FMaskAndImageLatents.AddLayers(FMaskLatents, FImageLatents);
+      Pipeline.EncodeVaeImage(VaeImage, FKnownLatents,
+        FMaskedImageSampleNoise);
+      FMaskAndImageLatents.AddLayers(FMaskLatents, FKnownLatents);
     end
-    else
-    begin
-      Pipeline.EncodeVaeImage(VaeImage, FImageLatents);
-      FNoise.ReSize(Latents);
-      FNoise.Copy(Latents);
-      FKnownLatents.ReSize(FImageLatents);
-    end;
+    else FKnownLatents.ReSize(FImageLatents);
+    FNoise.ReSize(Latents);
+    FNoise.Copy(Latents);
   finally
     KeepMask.Free;
     BinaryMask.Free;
     VaeImage.Free;
   end;
+end;
+
+function TStableDiffusionInpainter.DenoiseStrength(): double;
+begin
+  Result := FStrength;
+end;
+
+procedure TStableDiffusionInpainter.NoiseImageLatents(Latents: TNNetVolume;
+  Tt: integer);
+begin
+  FPipeline.Scheduler.AddNoise(FImageLatents, Latents, Tt, nil, FNoise);
 end;
 
 procedure TStableDiffusionInpainter.PredictNoise(UNet: TNNet;

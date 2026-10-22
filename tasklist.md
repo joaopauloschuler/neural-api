@@ -588,9 +588,13 @@ rather than acted on.
               photo; it takes a ready edge map today. DONE: CannyEdges in
               neuralimageresize.pas + ControlNetCanny --photo/--canny-*;
               not yet compared with a real cv2 run.
-        - [ ] Inpainting strength < 1 (start from the re-noised image latents
+        - [X] Inpainting strength < 1 (start from the re-noised image latents
               at the truncated schedule) and the sampled VAE latents (diffusers
-              retrieve_latents samples; ours takes the mean).
+              retrieve_latents samples; ours takes the mean). DONE:
+              TStableDiffusionInpainter.Strength/SetSampleNoise, Denoise
+              truncates via TNNetDiffusionScheduler.Img2ImgStartStep,
+              EncodeVaeImage samples; DiffusionInpainting --strength;
+              TestStableDiffusionInpaintStrengthParity < 1e-4.
         - [ ] ControlNet guess mode, control_guidance_start/end, MultiControlNet,
               T2I MultiAdapter, and ControlNet + T2I-Adapter at once (BuildSDUNet
               interleaves the control and adapter TNNetInputs when both flags are

@@ -1245,6 +1245,7 @@ type
     procedure TestStableDiffusionT2IAdapterParity;
     procedure TestStableDiffusionT2IAdapterNonSquare;
     procedure TestStableDiffusionInpaintParity;
+    procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45994,8 +45995,9 @@ begin
 end;
 
 // StableDiffusionInpaintPipeline float64 (tiny_sd15_inpaint_io.json, VAE
-// latents taken at the mean): the 4-channel tiny_sd15 blended after each DDIM
-// and each Euler step, and the 9-channel tiny_sd15_inpaint, 3 guided steps.
+// latents taken at the mean, zero sample noise here): the 4-channel tiny_sd15
+// blended after each DDIM and each Euler step, and the 9-channel
+// tiny_sd15_inpaint, 3 guided steps.
 procedure TTestNeuralPretrained.TestStableDiffusionInpaintParity;
 var
   Pipeline: TStableDiffusionPipeline;
@@ -46021,6 +46023,10 @@ begin
     Mask.Mul(255);
     Inpainter.SetImage(SourceImage);
     Inpainter.SetMask(Mask);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Latents);
+    Latents.Fill(0);
+    Inpainter.SetSampleNoise(Latents, Latents);
     Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
     AssertEquals('cases', 3, Cases.Count);
     for CasePos := 0 to Cases.Count - 1 do
@@ -46049,6 +46055,85 @@ begin
   finally
     Pipeline.Free;
     Latents.Free;
+    Mask.Free;
+    SourceImage.Free;
+    Inpainter.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionInpaintPipeline float64 (tiny_sd15_inpaint_strength_io.json,
+// injected noise, sampled VAE latents): strength 0.6 of 5 guided steps on the
+// 4-channel UNet with DDIM and Euler and the 9-channel UNet, and the 9-channel
+// UNet at strength 1.
+procedure TTestNeuralPretrained.TestStableDiffusionInpaintStrengthParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Inpainter: TStableDiffusionInpainter;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, Mask, ImageNoise, MaskedImageNoise: TNNetVolume;
+  CasePos: integer;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_inpaint_strength_io.json');
+  Inpainter := TStableDiffusionInpainter.Create();
+  SourceImage := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  MaskedImageNoise := TNNetVolume.Create;
+  Pipeline := nil;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['mask'], false,
+      Mask);
+    Mask.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'masked_image_sample_noise'], true, MaskedImageNoise);
+    Inpainter.SetImage(SourceImage);
+    Inpainter.SetMask(Mask);
+    Inpainter.SetSampleNoise(ImageNoise, MaskedImageNoise);
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 4, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      FreeAndNil(Pipeline);
+      Pipeline := TStableDiffusionPipeline.Create(ExtractFileDir(FixturePath(
+        Entry.Get('folder', '') + '/model_index.json')));
+      if Entry.Get('scheduler', '') = 'EulerDiscreteScheduler' then
+        Pipeline.Sampler := smEuler;
+      Inpainter.Strength := Entry.Get('strength', 0.0);
+      Pipeline.Conditioner := Inpainter;
+      CheckSD15ConditionedParity(Pipeline, Entry);
+    end;
+    // diffusers get_timesteps: int(5 * 0.6) = 3 steps; int(5 * 0.1) = 0 runs none.
+    AssertEquals('start step', 2,
+      TNNetDiffusionScheduler.Img2ImgStartStep(5, 0.6));
+    AssertEquals('start step 0.55 of 10', 5,
+      TNNetDiffusionScheduler.Img2ImgStartStep(10, 0.55));
+    IsRefused := false;
+    try
+      TNNetDiffusionScheduler.Img2ImgStartStep(5, 0.1);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('no step left refused', IsRefused);
+    IsRefused := false;
+    try
+      Inpainter.Strength := 0;
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('strength 0 refused', IsRefused);
+  finally
+    Pipeline.Free;
+    MaskedImageNoise.Free;
+    ImageNoise.Free;
     Mask.Free;
     SourceImage.Free;
     Inpainter.Free;

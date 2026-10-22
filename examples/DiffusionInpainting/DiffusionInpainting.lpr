@@ -1,9 +1,11 @@
 program DiffusionInpainting;
 (*
 DiffusionInpainting: Stable Diffusion 1.x inpainting (diffusers
-StableDiffusionInpaintPipeline at strength 1) through TStableDiffusionPipeline
-with a TStableDiffusionInpainter conditioner in neuralpretrained.pas. The
-prompt regenerates the white part of the mask; the rest follows the image.
+StableDiffusionInpaintPipeline) through TStableDiffusionPipeline with a
+TStableDiffusionInpainter conditioner in neuralpretrained.pas. The prompt
+regenerates the white part of the mask; the rest follows the image. With
+--strength below 1 the run starts from the image latents re-noised to a later
+timestep and runs only the last steps.
 
   * a 9-channel inpainting UNet (e.g. runwayml/stable-diffusion-inpainting)
     sees latents | mask | masked-image latents at every step;
@@ -40,7 +42,7 @@ type
       OutputFile: string;
     // A side < 1: the checkpoint default (512 for SD 1.5).
     Steps, ImageWidth, ImageHeight: integer;
-    GuidanceScale: double;
+    GuidanceScale, Strength: double;
     Seed: cardinal;
     UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
@@ -83,6 +85,8 @@ begin
   WriteLn('  --negative TEXT   negative prompt (default empty)');
   WriteLn('  --steps N         denoising steps (default 25)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
+  WriteLn('  --strength S      0 < S <= 1: how far the image is re-noised; ',
+    'runs int(steps * S) steps (default 1)');
   WriteLn('  --width N         image width (default: the checkpoint''s)');
   WriteLn('  --height N        image height (default: the checkpoint''s)');
   WriteLn('  --seed N          noise seed (default 0)');
@@ -118,6 +122,7 @@ begin
   Opt.ImageWidth := 0;
   Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
+  Opt.Strength := 1;
   Opt.Seed := 0;
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
@@ -139,6 +144,8 @@ begin
     else if Arg = '--height' then Opt.ImageHeight := StrToInt(NextArg())
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--strength' then
+      Opt.Strength := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -155,6 +162,8 @@ begin
     Inc(ArgPos);
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  if not ((Opt.Strength > 0) and (Opt.Strength <= 1)) then
+    raise Exception.Create('--strength must be in (0, 1]');
 end;
 
 // A (Width, Height, 3) color ramp in 0..255: red left to right, green top to
@@ -236,6 +245,7 @@ begin
     else DrawRightHalfMask(Mask, ImageWidth, ImageHeight);
     Inpainter.SetImage(SourceImage);
     Inpainter.SetMask(Mask);
+    Inpainter.Strength := Opt.Strength;
     Pipeline.Conditioner := Inpainter;
     Pipeline.GuidanceScale := Opt.GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
@@ -253,12 +263,12 @@ begin
     if Opt.MaskFile <> '' then WriteLn('Mask:     ', Opt.MaskFile)
     else WriteLn('Mask:     the right half');
     WriteLn('Prompt:   "', Opt.Prompt, '"');
-    WriteLn(Format('Output:   %dx%d, %d steps, guidance %.2f, seed %d, %s',
-      [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
-       ComputeText]));
+    WriteLn(Format('Output:   %dx%d, %d steps, strength %.2f, guidance %.2f, ' +
+      'seed %d, %s', [ImageWidth, ImageHeight, Opt.Steps, Opt.Strength,
+      Opt.GuidanceScale, Opt.Seed, ComputeText]));
     if Pipeline.SamplerNotice <> '' then
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
-    // Euler a draws its per-step noise from the global RNG.
+    // Euler a and the VAE latent samples draw their noise from the global RNG.
     RandSeed := Opt.Seed xor $9E3779B9;
     StartTime := Now();
     Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,

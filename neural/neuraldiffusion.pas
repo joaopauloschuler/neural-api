@@ -228,6 +228,10 @@ type
     function BuildSamplerSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
       TNeuralIntegerArray;
+    // diffusers SD img2img/inpaint get_timesteps: the first schedule entry that
+    // runs at Strength, N - min(int(N * Strength), N); raises when no step runs.
+    class function Img2ImgStartStep(NumSteps: integer;
+      Strength: double): integer;
     // Factor on unit Gaussian noise for the first sample of Method at FirstTt:
     // diffusers init_noise_sigma over the model-input scale. 1 except for
     // smEuler/smEulerAncestral with tsUniform/tsTrailing, whose init sigma is
@@ -1785,6 +1789,26 @@ begin
       for k := NumSteps + 1 downto 2 do Result[k] := Result[k - 1];
     end;
   end;
+end;
+
+class function TNNetDiffusionScheduler.Img2ImgStartStep(NumSteps: integer;
+  Strength: double): integer;
+var
+  InitStepCount: integer;
+begin
+  if NumSteps < 1 then
+    raise Exception.Create('Img2ImgStartStep: NumSteps must be >= 1.');
+  if not ((Strength >= 0) and (Strength <= 1)) then
+    raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
+      ' is outside [0, 1].');
+  // Double product, so the truncation lands where Python's int() does.
+  InitStepCount := Trunc(NumSteps * Strength);
+  if InitStepCount > NumSteps then InitStepCount := NumSteps;
+  if InitStepCount < 1 then
+    raise Exception.Create('img2img strength ' + FloatToStr(Strength) +
+      ' with ' + IntToStr(NumSteps) + ' steps leaves no step to run; raise ' +
+      'the strength or the step count.');
+  Result := NumSteps - InitStepCount;
 end;
 
 function TNNetDiffusionScheduler.InitialNoiseScale(Method: TNNetSamplerMethod;
