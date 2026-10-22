@@ -2386,10 +2386,13 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       weights2 for the negative-frequency modes) and uses irfft2. Decide
       whether to add the second corner (needed to import a torch FNO
       checkpoint) or document the layer as a one-corner variant.
-- [ ] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
+- [X] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
       ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
       big map (56x56x384) it runs on one compute unit; split positions
       across groups if it shows up on the GPU box.
+      - Done: `cai_channel_square_sums_partial` writes up to 64 position-slice
+        partial sums per channel (buffer sized at EnableOpenCL), then
+        `cai_grn_table` finishes in one group. GPU timing pending.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

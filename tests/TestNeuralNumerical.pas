@@ -74225,8 +74225,10 @@ procedure TTestNeuralNumerical.TestGRNOpenCLParity;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
-  // Depth 40 leaves lanes idle; depth 300 gives some lanes two channels.
-  csShapes: array[0..1, 0..2] of integer = ((6, 5, 40), (3, 4, 300));
+  // Depth 40 leaves lanes idle; depth 300 gives some lanes two channels. The
+  // last two split positions into 14 (ragged) and 63 partial-sum slices.
+  csShapes: array[0..3, 0..2] of integer = ((6, 5, 40), (3, 4, 300),
+    (23, 19, 48), (50, 45, 8));
 var
   NN, NNCPU: TNNet;
   Input, OutCPU, LastCPU: TNNetVolume;

@@ -3171,9 +3171,36 @@ __kernel void cai_group_norm
   }
 }
 
-// Global Response Normalization table (TNNetGRN forward, ConvNeXt-V2). From one
-// depth-contiguous volume of FNumPositions positions x FDepth channels it writes
-// the cai_activation ChannelAffine table (opcode 46), 2*FDepth long:
+// Per-slice channel sums of squares of one depth-contiguous volume: work-item
+// (c, slice) writes FPartial[slice * FDepth + c] = sum of x[p,c]^2 over the
+// positions [slice * FPositionsPerSlice, +FPositionsPerSlice) clipped to
+// FNumPositions. Launch (FDepth, slice count); adjacent c read adjacent floats.
+__kernel void cai_channel_square_sums_partial
+(
+  const int FNumPositions,
+  const int FDepth,
+  const int FPositionsPerSlice,
+  __global const float* FX,
+  __global float* FPartial
+)
+{
+  const int c = get_global_id(0);
+  const int slice = get_global_id(1);
+  if (c >= FDepth) return;
+  const int firstPos = slice * FPositionsPerSlice;
+  const int lastPos = min(firstPos + FPositionsPerSlice, FNumPositions);
+  float ss = 0.0f;
+  for (int p = firstPos; p < lastPos; p++)
+  {
+    const float v = FX[p * FDepth + c];
+    ss = mad(v, v, ss);
+  }
+  FPartial[slice * FDepth + c] = ss;
+}
+
+// Global Response Normalization table (TNNetGRN forward, ConvNeXt-V2). From the
+// FNumSlices x FDepth partial sums of squares of cai_channel_square_sums_partial
+// it writes the cai_activation ChannelAffine table (opcode 46), 2*FDepth long:
 //   Gx[c]          = sqrt(sum_p x[p,c]^2 + FEps)
 //   FTable[c]      = 1 + gamma[c] * Gx[c] / mean_c(Gx)
 //   FTable[D + c]  = beta[c]
@@ -3184,11 +3211,11 @@ __kernel void cai_group_norm
 // 0, so the channel mean is never zero. Forward-only.
 __kernel void cai_grn_table
 (
-  const int FNumPositions,
+  const int FNumSlices,
   const int FDepth,
   const float FEps,
   __global const float* FWeights,
-  __global const float* FX,
+  __global const float* FPartial,
   __global float* FTable,
   __local float* FScratch
 )
@@ -3200,11 +3227,8 @@ __kernel void cai_grn_table
   for (int c = lid; c < FDepth; c += lsize)
   {
     float ss = 0.0f;
-    for (int p = 0; p < FNumPositions; p++)
-    {
-      const float v = FX[p * FDepth + c];
-      ss = mad(v, v, ss);
-    }
+    for (int slice = 0; slice < FNumSlices; slice++)
+      ss += FPartial[slice * FDepth + c];
     const float gx = sqrt(ss + FEps);
     FTable[c] = gx;
     gxSum += gx;
