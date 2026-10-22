@@ -502,9 +502,6 @@ rather than acted on.
   - [ ] metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
         "metric") untested on a real ckpt.
   - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
-  - [x] non-native / non-square input: DONE, TDPTConfig.InputWidth/InputHeight
-        (bicubic position resize, TestDepthAnythingV2ResizedParity) and
-        examples/DepthAnythingV2 --size WxH.
   - [ ] real keep_aspect_ratio run (518, ensure_multiple_of 14) with
         DPTPreprocessImage on a photo; the example has no image input yet.
 
@@ -580,16 +577,8 @@ rather than acted on.
                 TestDPTHybridDepthEstimationParity, TestDPTViTDepthEstimationParity):
             - [ ] Real Intel/dpt-hybrid-midas and Intel/dpt-large runs on the
                   user's GPU box (384x384; compare against transformers).
-            - [x] Only the native image_size: DONE, TDPTConfig.InputWidth/
-                  InputHeight (any multiple of patch_size) resize the position
-                  grid as transformers does (bilinear for DPTViT(Hybrid)
-                  Embeddings, bicubic for Dinov2Embeddings, align_corners
-                  False); ReadDPTImageProcessorConfig / DPTResizeOutputSize /
-                  DPTPreprocessImage port keep_aspect_ratio + ensure_multiple_of
-                  and depth2img builds its estimator at the processed size.
-                  TestDPTViTResizedParity (16x16, 48x16), TestDPTHybridResized
-                  Parity (96x32), TestDepthAnythingV2ResizedParity (16x10),
-                  all < 1e-4 vs tools/make_pico_dpt_resized_cases.py.
+            - [ ] Non-native input size (TDPTConfig.InputWidth/InputHeight)
+                  follow-ups:
               - [ ] Stock transformers refuses a non-native DPT-Hybrid input
                     and reshapes a non-square ViT DPT neck input to
                     sqrt(tokens); the oracle lifts both (image_size override,
@@ -613,19 +602,12 @@ rather than acted on.
             - [ ] Real stabilityai/stable-diffusion-2-depth run with its own
                   depth_estimator on the user's GPU box (512x512); compare the
                   estimated depth with diffusers.
-            - [x] The estimator is rebuilt (and its 490 MB read) on every
-                  BeginDenoise: DONE, kept while ComponentsLoaded
-                  (TestStableDiffusion2Depth2ImgEstimatorKept).
             - [ ] transformers with torchvision uses the torchvision uint8
                   resize for DPTImageProcessor; the oracle here is the PIL
                   backend (torchvision is not installed in ~/x).
-          - [x] --depth-image loads 8 bits per channel: DONE, it loads with
-                LoadImageFromFileIntoVolume pFullPrecision (16-bit PNG kept).
-        - [x] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
-              stabilityai/stable-diffusion-x4-upscaler): DONE,
-              TStableDiffusionUpscaler + BuildSDUNet num_class_embeds /
-              only_cross_attention, `--upscale-image` / `--noise-level`
-              (TestStableDiffusionUpscalerParity, pico only).
+        - [ ] SD 2.x x4 upscaler follow-ups (TStableDiffusionUpscaler,
+              `--upscale-image` / `--noise-level`,
+              TestStableDiffusionUpscalerParity):
           - [ ] Real stabilityai/stable-diffusion-x4-upscaler run on the
                 user's GPU box (e.g. 128x128 -> 512x512, `--gpu`): check its
                 unet/vae/scheduler configs load (the pico folder mirrors the
@@ -717,11 +699,6 @@ rather than acted on.
             float64 reimplementation of lpw's get_weighted_text_embeddings
             (tools/make_pico_sd_prompt_weighting_fixture.py; the community
             pipeline is not in the ~/x venv). Open:
-        - [x] `--clip-skip N` (diffusers `clip_skip`): DONE as property
-              `ClipSkip` (AcquireTextEncoder builds num_hidden_layers - N
-              blocks + final_layer_norm), applied to the negative prompt too
-              (A1111; diffusers does not); TestStableDiffusionClipSkipParity
-              vs encode_prompt(clip_skip=1) (tools/make_pico_sd_clip_skip_fixture.py).
         - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
         - [ ] A1111 extras not done: `BREAK`, moving a chunk split back to a
               nearby comma, per-chunk mean restore (lpw restores the whole
@@ -846,9 +823,6 @@ rather than acted on.
         checkpoint).
   - [ ] Dual-pixel defocus follow-ups (examples/Restormer `--left/--right` +
         `RestormerPackDualPixel`, cee1d880):
-    - [x] 16-bit PNG precision: DONE, --left/--right load with
-          LoadImageFromFileIntoVolume pFullPrecision and a .png output is
-          16-bit (SavePNG16FromVolume); TestLoadImage16BitFullPrecision.
     - [ ] `--input` (single-image tasks) still reads and writes 8 bits; check
           whether the official single-image defocus script reads DPDD at 16.
     - [ ] Not run on a real DPDD pair (needs `dual_pixel_defocus_deblurring.pth`).
