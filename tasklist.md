@@ -1125,9 +1125,20 @@ rather than acted on.
         - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
           neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
           scratch.
-        - [ ] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
+        - [X] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
           products and scatters on the host; no resident source/output, and no
           borrowing (`EnableOpenCLInContextOf`) test for the deconv.
+          DONE 2026-10-22: `cai_conv_transpose` gather (each output cell sums its
+          landing taps, bias + fused activation opcodes 0-8), binds a resident
+          source, output stays in OpenCL memory, lends/borrows its A operand;
+          inference only. `TestDeconvolutionOpenCLParity` (8 shapes, sentinels),
+          `TestDeconvolutionOpenCLBorrowing`.
+        - [ ] `cai_conv_transpose` is untiled (one work-item per output cell and
+          channel, like `cai_conv_implicit`); a large dense deconv (Kokoro
+          generator ups) may want a tiled or phase-split GEMM. Not timed on a GPU.
+        - [ ] Trainable deconvolutions and activations without a fused opcode
+          (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
+          CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
         - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
           deconv) for 32-multiple channel counts: one extra weight copy (dense
           deconvs only now).
@@ -1152,8 +1163,10 @@ rather than acted on.
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
   - 2.6 `AdainResBlk1d` follow-ups:
-        - [ ] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
+        - [X] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
           grouped deconvolution downloads its source and re-uploads its output.
+          DONE 2026-10-22: `cai_conv_transpose` reads each row's group slice;
+          dense and grouped share the one kernel.
   - 2.9 Forward complex STFT follow-ups:
         - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.

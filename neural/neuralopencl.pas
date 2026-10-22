@@ -527,6 +527,9 @@ type
       FImplicitConvKernel, FImplicitConvTiledKernel: cl_kernel;
       FImplicitConvReady: boolean;
       FImplicitConvLaunchCount: integer;
+      /// TRANSPOSED CONVOLUTION (cai_conv_transpose): owned handle bound by
+      /// PrepareTransposedConv.
+      FTransposedConvKernel: cl_kernel;
       /// NEAREST-2X UPSAMPLE FOLD (PrepareUpsampleFold): the four 2x2 phase
       /// slabs cai_conv_upsample_fold_weights derives from FInputBufferAs; stale
       /// until derived after the A operand last changed.
@@ -693,6 +696,15 @@ type
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil;
         OutFrames: longint = 1; FrameStep: longint = 0; WindowDepth: longint = 0);
+      /// Binds cai_conv_transpose after an FP32 PrepareForCompute whose FNumBs
+      /// is the output position count; False when the device rejected it.
+      function PrepareTransposedConv(): boolean;
+      /// Transposed convolution of SrcVol (or borrowed pExternalSrc) into the
+      /// result buffer; VAs is the [row + k*FNumAs] neuron weight layout.
+      procedure ComputeTransposedConv(VAs, SrcVol: TNNetVolume;
+        OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY,
+        Groups, pActFN: longint; NewVAs: boolean; VBias: TNNetVolume;
+        NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
       /// Allocates the phase slabs after PrepareImplicitConv on a 3x3 layout
       /// (FSize = 9 x depth); False when the device refused them.
       function PrepareUpsampleFold(): boolean;
@@ -796,6 +808,8 @@ type
       property LastTiledGemmSplits: integer read FLastTiledSplits;
       /// True after a successful PrepareImplicitConv.
       property ImplicitConvReady: boolean read FImplicitConvReady;
+      /// True after a successful PrepareTransposedConv.
+      function TransposedConvReady(): boolean;
       /// Implicit-GEMM convolution launches (tiled ones count in
       /// TiledGemmLaunchCount too).
       property ImplicitConvLaunchCount: integer read FImplicitConvLaunchCount;
@@ -1116,11 +1130,13 @@ begin
   ReleaseTiledKernels();
   if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
   if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
+  if Assigned(FTransposedConvKernel)       then clReleaseKernel(FTransposedConvKernel);
   if Assigned(FUpsampleFoldWeightsKernel)  then clReleaseKernel(FUpsampleFoldWeightsKernel);
   if Assigned(FUpsampleFoldBuffer) then clReleaseMemObject(FUpsampleFoldBuffer);
   FImplicitConvKernel := nil;
   FImplicitConvTiledKernel := nil;
   FImplicitConvReady := false;
+  FTransposedConvKernel := nil;
   FUpsampleFoldWeightsKernel := nil;
   FUpsampleFoldBuffer := nil;
   FUpsampleFoldStale := false;
@@ -2423,6 +2439,83 @@ begin
       then FDotProductKernel.RunKernel3D(K, FNumAs, NumBs, PhaseCount)
       else FDotProductKernel.RunKernel2D(K, FNumAs, NumBs);
   Inc(FImplicitConvLaunchCount);
+end;
+
+function TDotProductSharedKernel.TransposedConvReady(): boolean;
+begin
+  Result := Assigned(FTransposedConvKernel);
+end;
+
+function TDotProductSharedKernel.PrepareTransposedConv(): boolean;
+begin
+  if (not Assigned(FTransposedConvKernel)) and (not FInt8Ready) and
+    (not FInt4Ready) then
+    FTransposedConvKernel := FDotProductKernel.CreateKernel('cai_conv_transpose');
+  Result := Assigned(FTransposedConvKernel);
+end;
+
+procedure TDotProductSharedKernel.ComputeTransposedConv(VAs, SrcVol: TNNetVolume;
+  OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+  pActFN: longint; NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+  NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InSizeX, InSizeY, InDepth: longint;
+  SrcBuffer: cl_mem;
+  K: cl_kernel;
+begin
+  K := FTransposedConvKernel;
+  if not Assigned(K) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv without ' +
+      'PrepareTransposedConv.');
+    exit;
+  end;
+  if VAs.Size <> FSize * FNumAs then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - VA size: ' +
+      IntToStr(VAs.Size) + ' FSize: ' + IntToStr(FSize) +
+      ' NumAs:' + IntToStr(FNumAs));
+    exit;
+  end;
+  FActFun := pActFN;
+  InSizeX := SrcVol.SizeX;
+  InSizeY := SrcVol.SizeY;
+  InDepth := SrcVol.Depth;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs and not FWeightsBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - failed ' +
+      'uploading: ' + IntToStr(err));
+    exit;
+  end;
+  err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 3, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(K, 6, csLongintSize, @UseBias);
+  err := err or clSetKernelArg(K, 7, csCLMemSize, @FBiasBuffer);
+  err := err or clSetKernelArg(K, 8, csLongintSize, @OutSizeX);
+  err := err or clSetKernelArg(K, 9, csLongintSize, @InSizeX);
+  err := err or clSetKernelArg(K, 10, csLongintSize, @InSizeY);
+  err := err or clSetKernelArg(K, 11, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(K, 12, csLongintSize, @FeatureSizeX);
+  err := err or clSetKernelArg(K, 13, csLongintSize, @FeatureSizeY);
+  err := err or clSetKernelArg(K, 14, csLongintSize, @Stride);
+  err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
+  err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
+  err := err or clSetKernelArg(K, 17, csLongintSize, @Groups);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
+  if err <> CL_SUCCESS then
+    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - failed ' +
+      'launching: ' + IntToStr(err));
 end;
 
 function TDotProductSharedKernel.UpsampleFoldReady(): boolean;

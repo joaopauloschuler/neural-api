@@ -16832,7 +16832,7 @@ type
       function OpenCLWeightsShareable(): boolean; virtual;
       // FDotCL holding the FP32 weights and bias in OpenCL memory (uploaded
       // now when stale), for a borrower to retain; nil when not lendable.
-      function LendOpenCLWeights(): TDotProductSharedKernel;
+      function LendOpenCLWeights(): TDotProductSharedKernel; virtual;
       // Arms FDotCL on FWeightOwner's lent weights (no upload); re-arming the
       // owner with changed weights leaves this layer on the old buffers.
       function BorrowOwnerOpenCLWeights(pNumBs: integer): boolean;
@@ -19017,11 +19017,8 @@ type
     // output, so the CPU GEMM does not compute mostly discarded products.
     FMostTapsLandInOutput: boolean;
     {$IFDEF OpenCL}
-    // Scratch operands for the device "scatter GEMM": the per-(tap,out-channel)
-    // weight rows (A), the per-input-position depth columns (B) and the dense
-    // GEMM result. The overlap-add SCATTER back into FOutputRaw stays on the
-    // CPU (overlapping output writes).
-    FGemmWInter, FGemmIn, FGemmRes: TNNetVolume;
+    // cai_conv_transpose A operand (neuron weights, [neuron + k*neurons]) and bias.
+    FWeightsCL, FBiasCL: TNNetVolume;
     {$ENDIF}
     function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer; override;
     function CalcOutputSizeY(pInputSizeY: integer): integer; override;
@@ -19042,9 +19039,11 @@ type
     // FOutputRaw += bias, FOutput := activation(FOutputRaw). Coded by Claude (AI).
     procedure ApplyBiasAndActivation();
     {$IFDEF OpenCL}
+    // Inference forward on cai_conv_transpose: binds a resident source, fuses
+    // bias + activation and leaves the output in OpenCL memory.
     procedure ComputeOpenCL();
-    // Grouped layers stay on the CPU: the device GEMM contracts all channels.
-    function WillOpenCL(): boolean; override;
+    // Lends the cai_conv_transpose A operand and bias, not the concatenated bank.
+    function LendOpenCLWeights(): TDotProductSharedKernel; override;
     {$ENDIF}
   public
     constructor Create(pNumFeatures, pFeatureSize: integer;
@@ -19059,7 +19058,11 @@ type
     procedure Backpropagate(); override;
     property Groups: integer read FGroups;
     {$IFDEF OpenCL}
+    // Inference only, dense or grouped; a resident source overrides the size
+    // verdict. An activation without a fused opcode stays on the CPU.
+    function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
 
@@ -112854,9 +112857,8 @@ begin
   FGemmChunkIn.Free;
   FGemmChunkProducts.Free;
   {$IFDEF OpenCL}
-  FGemmWInter.Free;
-  FGemmIn.Free;
-  FGemmRes.Free;
+  FWeightsCL.Free;
+  FBiasCL.Free;
   {$ENDIF}
   inherited Destroy();
 end;
@@ -112915,6 +112917,8 @@ begin
   FShouldOpenCL := FShouldOpenCL and
     (Int64(FNeurons.Count) * (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY)
      * (FFeatureSizeX * FFeatureSizeY) * FPrevLayer.FOutput.Depth >= cNeuralOpenCLMinWork);
+  // The inherited call armed the A operand before the group sizing above.
+  if FHasOpenCL and Assigned(FDotCL) then EnableOpenCL(nil);
   {$ENDIF}
 end;
 
@@ -112934,7 +112938,6 @@ procedure TNNetDeconvolution.Compute();
 var
   StartTime: double;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FNeurons.Count = 0 then
   begin
     FErrorProc('Neuronal layer contains no neuron:' + IntToStr(FNeurons.Count));
@@ -112942,19 +112945,17 @@ begin
   end;
   StartTime := Now();
   {$IFDEF OpenCL}
-  // Offload the dense (input-cell x kernel-tap x out-channel) contraction to the
-  // device when OpenCL is armed and the work is large enough to amortise the
-  // upload/dispatch. The overlap-add SCATTER back into FOutputRaw stays on the
-  // CPU. Below the work threshold (or with OpenCL off) the whole deconv runs on
-  // the CPU.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   if CPUGemmEligible()
     then ComputeCPUGemm()
@@ -113152,119 +113153,91 @@ end;
 
 {$IFDEF OpenCL}
 function TNNetDeconvolution.WillOpenCL(): boolean;
+var
+  ActOpcode: integer;
 begin
-  Result := (FGroups = 1) and inherited WillOpenCL();
+  Result := Assigned(FDotCL) and FHasOpenCL and FDotCL.TransposedConvReady() and
+    (FNeurons.Count > 0) and
+    (FWeightsCL.Size = FNeurons[0].Weights.Size * FNeurons.Count) and
+    IsActivationFunctionInOpenCL(ActOpcode) and
+    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL());
 end;
 
+// Deliberately not chained to TNNetConvolutionBase.EnableOpenCL, which arms the
+// forward-conv GEMM over a concatenated weight bank this layer never reads.
 procedure TNNetDeconvolution.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
-  // Deliberately do NOT chain through TNNetConvolutionBase.EnableOpenCL: that
-  // path concats/interleaves a per-output-feature weight bank and arms the
-  // standard FORWARD-conv GEMM (out[ox,oy,co] = patch . W), which is the wrong
-  // contraction for a transposed conv (we scatter each input cell, not gather
-  // an output patch). Arm only the bare TNNetLayer (FHasOpenCL + shared kernel)
-  // and our own scratch; the offload runs through ComputeOpenCL.
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
     FDotCL := NewDotProductCL(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
-  if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
-  if not Assigned(FGemmIn)     then FGemmIn     := TNNetVolume.Create();
-  if not Assigned(FGemmRes)    then FGemmRes    := TNNetVolume.Create();
+  if not Assigned(FWeightsCL) then FWeightsCL := TNNetVolume.Create();
+  if not Assigned(FBiasCL) then FBiasCL := TNNetVolume.Create();
+  if (FNeurons.Count > 0) and
+    BorrowOwnerOpenCLWeights(FOutput.SizeX * FOutput.SizeY) then
+  begin
+    // Sized for WillOpenCL; the owner's buffers hold the packed weights.
+    FWeightsCL.ReSize(FNeurons[0].Weights.Size, 1, FNeurons.Count);
+    FBiasCL.ReSize(FNeurons.Count, 1, 1);
+    FOutputOnOpenCL := false;
+  end
+  else
+    ArmNeuronImplicitConv(FWeightsCL, FBiasCL, FOutput.SizeX * FOutput.SizeY);
+  FDotCL.PrepareTransposedConv();
 end;
 
-// Device "scatter GEMM" for the transposed convolution. The dense depth-axis
-// contraction is offloaded; the overlap-add SCATTER (overlapping output writes)
-// and the bias+activation stay on the CPU. ComputeCPU is the fallback whenever
-// OpenCL is off or below the work threshold.
-//
-// For every input position t = iy*InW+ix and every (kernel-tap k, out-channel
-// oc) the deconv computes the SAME depth dot product as the CPU path:
-//   G[t][k*N + oc] = sum_id W_oc[kx,ky,id] * in[ix,iy,id]
-// which is exactly one GEMM with contraction Size = InDepth:
-//   A rows : a = (ky*FeatureSizeX+kx)*N + oc   -> A[a][id] = W_oc[kx,ky,id]
-//            NumAs = FeatureSizeX*FeatureSizeY*N (one row per tap x out-channel)
-//            stored INTERLEAVED A[id*NumAs + a] (the kernel's A layout).
-//   B rows : t = iy*InW+ix                     -> B[t][id] = in[ix,iy,id]
-//            NumBs = InW*InH (one column per input cell), row-major [t*Size+id].
-// The kernel returns Res[t*NumAs + a]. ScatterTapProducts then adds each tap
-// into FOutputRaw, and ApplyBiasAndActivation finishes as on the CPU.
+function TNNetDeconvolution.LendOpenCLWeights(): TDotProductSharedKernel;
+var
+  BiasVol: TNNetVolume;
+begin
+  Result := nil;
+  if (not FHasOpenCL) or (not Assigned(FDotCL)) or
+    (not FDotCL.TransposedConvReady()) or (not OpenCLWeightsShareable()) then exit;
+  if RefreshNeuronImplicitConv(FWeightsCL, FBiasCL) then
+  begin
+    if FSuppressBias = 0 then BiasVol := FBiasCL else BiasVol := nil;
+    if not FDotCL.UploadResidentWeights(FWeightsCL, BiasVol) then
+    begin
+      FAfterWeightUpdateHasBeenCalled := true;
+      exit;
+    end;
+  end;
+  Result := FDotCL;
+end;
+
+procedure TNNetDeconvolution.DisableOpenCL();
+begin
+  // A kept output lives in FDotCL's result buffer, which the inherited call frees.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+end;
+
 procedure TNNetDeconvolution.ComputeOpenCL();
 var
-  Prev: TNNetVolume;
-  InW, InH, InD: integer;
-  ix, iy, id, kx, ky, oc, t, a, pos: integer;
-  MaxInX, MaxInY, MaxN: integer;
-  FeatYMax, FeatXMax, InDMax: integer;
-  N, NumAs, NumBs, aBase, wBase: integer;
-  W: TNNetVolume;
+  GatherSrcBuffer: cl_mem;
+  BiasVol: TNNetVolume;
+  WUpdated: boolean;
+  ActOpcode: integer;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Prev := FPrevLayer.FOutput;
-  InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
-  MaxInX := InW - 1; MaxInY := InH - 1;
-  MaxN := FNeurons.Count - 1;
-  N := FNeurons.Count;
-  NumAs := FFeatureSizeX * FFeatureSizeY * N;
-  NumBs := InW * InH;
-  FeatYMax := FFeatureSizeY - 1; FeatXMax := FFeatureSizeX - 1;
-  InDMax := InD - 1;
-
-  // 1. A operand: one row per (tap k, out-channel oc), each InD contiguous
-  //    weights W_oc[kx,ky,:]. Row a = (ky*FeatureSizeX+kx)*N + oc. Rebuilt +
-  //    re-uploaded only on a weight change (FAfterWeightUpdateHasBeenCalled);
-  //    the interleave is weight-only, so the resident device copy is reused
-  //    otherwise (NewVAs=false at the GEMM below).
-  if FAfterWeightUpdateHasBeenCalled then
+  GatherSrcBuffer := nil;
+  if PrevOutputOnOpenCL() then
   begin
-    FGemmWInter.ReSize(NumAs * InD, 1, 1);
-    for ky := 0 to FeatYMax do
-     for kx := 0 to FeatXMax do
-     begin
-      // #10/#11: the tap's row block is invariant across oc, and the array
-      // mirror skips the neuron list getter.
-      aBase := (ky * FFeatureSizeX + kx) * N;
-      for oc := 0 to MaxN do
-      begin
-        W := FArrNeurons[oc].FWeights;
-        a := aBase + oc;
-        // INTERLEAVED A layout the kernel reads: A[id*NumAs + a].
-        wBase := W.GetRawPos(kx, ky);
-        pos := a;
-        for id := 0 to InDMax do
-        begin
-          FGemmWInter.FData[pos] := W.FData[wBase + id];
-          Inc(pos, NumAs);
-        end;
-      end;
-     end;
-  end;
-
-  // 2. B operand: one row per input cell, its InD contiguous depth column.
-  FGemmIn.ReSize(NumBs * InD, 1, 1);
-  for iy := 0 to MaxInY do
-   for ix := 0 to MaxInX do
-   begin
-     t := iy * InW + ix;
-     // #13: contiguous depth column is a single memmove.
-     Move(Prev.FData[Prev.GetRawPos(ix, iy)], FGemmIn.FData[t * InD],
-       InD * csNeuralFloatSize);
-   end;
-
-  // 3. Device GEMM: Res[t*NumAs + a] = sum_id A[a][id] * B[t][id].
-  FGemmRes.ReSize(NumBs * NumAs, 1, 1);
-  FDotCL.ReallocateBuffersIfRequired(FGemmWInter, FGemmIn, InD);
-  FDotCL.Compute(FGemmWInter, FGemmIn, {ActFN}0,
-    {NewVAs}FAfterWeightUpdateHasBeenCalled, {NewVBs}true);
-  FDotCL.FinishAndLoadResult(FGemmRes, 0);
-  FAfterWeightUpdateHasBeenCalled := false;
-
-  // 4. Overlap-add scatter (host), 5. bias + activation.
-  FOutputRaw.Fill(0);
-  ScatterTapProducts(FGemmRes, 0, NumBs, {TapStride}N, {NeuronStride}1);
-  ApplyBiasAndActivation();
+    GatherSrcBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+    FPrevLayer.ForceOutputOnRAM();
+  IsActivationFunctionInOpenCL(ActOpcode);
+  WUpdated := RefreshNeuronImplicitConv(FWeightsCL, FBiasCL);
+  if FSuppressBias = 0 then BiasVol := FBiasCL else BiasVol := nil;
+  FDotCL.ComputeTransposedConv(FWeightsCL, FPrevLayer.FOutput, FOutput.SizeX,
+    FFeatureSizeX, FFeatureSizeY, FStride, FPadding, FPaddingY, FGroups,
+    ActOpcode, {NewVAs}WUpdated, BiasVol, {NewVBias}WUpdated,
+    {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 

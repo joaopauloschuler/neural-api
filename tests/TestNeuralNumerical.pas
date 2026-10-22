@@ -426,7 +426,11 @@ type
     procedure TestResize2DAntialiasTorchParity;
     procedure TestResize2DAntialiasInputGradientCheck;
     procedure TestResize2DAntialiasSerializationRoundTrip;
+    // Dense and grouped, 1-D and 2-D, stride 1-3, padding, ReLU and linear in a
+    // forced resident chain: parity, sentinels prove the binds, a weight update.
     procedure TestDeconvolutionOpenCLParity;
+    // A borrower net in the owner's context reuses the owner's resident weights.
+    procedure TestDeconvolutionOpenCLBorrowing;
     // A conv that first runs the fused-activation device forward (output left
     // in OpenCL memory) and is then switched to the Winograd path, which writes
     // FOutput on the host: the Winograd pass must publish host residency, or a
@@ -1503,7 +1507,7 @@ type
     // TNNetDeconv1DLinear vs a torch ConvTranspose1d oracle on the Kokoro-82M
     // transposed geometries (trainable scatter and inference CPU GEMM).
     procedure TestDeconv1DLinearTorchParity;
-    // The dense geometries through the OpenCL scatter GEMM; grouped stay on CPU.
+    // Every geometry, dense and grouped, through cai_conv_transpose.
     procedure TestDeconv1DLinearOpenCLParity;
     procedure TestDeconv1DLinearSaveLoadRoundTrip;
     // An owner built at length 1 (kernel longer than its input) lends weights.
@@ -68447,13 +68451,8 @@ begin
           NN.Compute(Input);
           // Unchanged weights: the resident A operand is reused.
           NN.Compute(Input);
-          // A grouped layer stays on the CPU.
-          if IsDense then
-            AssertEquals(CaseName + ': OpenCL forwards', 2,
-              Deconv.ForwardGPUCnt - OpenCLForwardsBefore)
-          else
-            AssertEquals(CaseName + ': OpenCL forwards', 0,
-              Deconv.ForwardGPUCnt - OpenCLForwardsBefore);
+          AssertEquals(CaseName + ': OpenCL forwards', 2,
+            Deconv.ForwardGPUCnt - OpenCLForwardsBefore);
         finally
           NN.ForceOpenCL(False);
         end;
@@ -76144,20 +76143,190 @@ begin
 end;
 {$ENDIF}
 
-// Transposed-convolution (TNNetDeconvolution) device "scatter GEMM" parity.
-// Same shape as the conv parity tests: build the deconv, compute on the CPU,
-// then force the device path (MinWork 0) and assert the upsampled output
-// matches within the importer gate. Coded by Claude (AI).
+type
+  // Sets the protected channel groups of a 2-D deconvolution under test.
+  TDeconvGroupsAccess = class(TNNetDeconvolution);
+
+const
+  // InX, InY, InC, OutC, K, Stride, Pad, OutPad, Groups, ReLU, Is1D, SuppressBias.
+  csDeconvCaseWidth = 12;
+
+// Input -> PointwiseConvLinear(InC) -> deconvolution -> PointwiseConvLinear(3),
+// inference-only, with non-trivial deconvolution weights and biases.
+function BuildDeconvParityNet(const Cases: array of integer; CaseBase: integer;
+  out Producer, Deconv: TNNetLayer): TNNet;
+var
+  NeuronPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(Cases[CaseBase], Cases[CaseBase + 1],
+    Cases[CaseBase + 2]));
+  Producer := Result.AddLayer(TNNetPointwiseConvLinear.Create(Cases[CaseBase + 2]));
+  if Cases[CaseBase + 10] = 1 then
+    Deconv := TNNetDeconv1DLinear.Create(Cases[CaseBase + 3],
+      Cases[CaseBase + 4], Cases[CaseBase + 5], Cases[CaseBase + 6],
+      Cases[CaseBase + 7], Cases[CaseBase + 8], Cases[CaseBase + 11])
+  else
+  begin
+    if Cases[CaseBase + 9] = 1 then
+      Deconv := TNNetDeconvolutionReLU.Create(Cases[CaseBase + 3],
+        Cases[CaseBase + 4], Cases[CaseBase + 5], Cases[CaseBase + 6],
+        Cases[CaseBase + 7], Cases[CaseBase + 11])
+    else
+      Deconv := TNNetDeconvolutionLinear.Create(Cases[CaseBase + 3],
+        Cases[CaseBase + 4], Cases[CaseBase + 5], Cases[CaseBase + 6],
+        Cases[CaseBase + 7], Cases[CaseBase + 11]);
+    TDeconvGroupsAccess(Deconv).FGroups := Cases[CaseBase + 8];
+  end;
+  Result.AddLayer(Deconv);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(3));
+  Result.SetTrainable(False, False);
+  for NeuronPos := 0 to Cases[CaseBase + 3] - 1 do
+  begin
+    SetRandomNeuronWeights(Deconv, NeuronPos, 0, 0.6);
+    Deconv.Neurons[NeuronPos].BiasWeight := 0.1 * (NeuronPos mod 5) - 0.2;
+  end;
+  Deconv.FlushWeightCache();
+end;
+
 procedure TTestNeuralNumerical.TestDeconvolutionOpenCLParity;
 {$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  // 2-D: dense ReLU s2 p1 op1, dense linear s1, grouped ReLU s2, K2 s2 without
+  // bias, K2 s3 (taps skip positions). 1-D: dense k12 s6 p3, depthwise k3 s2 p1
+  // op1, grouped bias-free k20 s10 p5 (the Kokoro geometries).
+  csCases: array[0..95] of integer = (
+    6, 5, 4, 5, 3, 2, 1, 1, 1, 1, 0, 0,
+    4, 4, 3, 4, 4, 1, 0, 0, 1, 0, 0, 0,
+    5, 4, 6, 4, 3, 2, 0, 0, 2, 1, 0, 0,
+    3, 3, 8, 6, 2, 2, 0, 0, 1, 0, 0, 1,
+    4, 3, 4, 6, 2, 3, 0, 0, 2, 1, 0, 0,
+    7, 1, 4, 6, 12, 6, 3, 0, 1, 0, 1, 0,
+    9, 1, 6, 6, 3, 2, 1, 1, 6, 0, 1, 0,
+    5, 1, 4, 2, 20, 10, 5, 0, 2, 0, 1, 1);
 var
-  NN: TNNet;
-  Input, OutCPU: TNNetVolume;
-  DC: TNNetDeconvolution;
+  NN, NNCPU: TNNet;
+  Input, DeconvCPU, LastCPU: TNNetVolume;
+  Producer, Deconv, ProducerCPU, DeconvRefCPU: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i, InSize: integer;
-  Diff, MaxDiff: TNeuralFloat;
+  CasePos, MaxCasePos, CaseBase, NeuronPos, Pos, MaxPos: integer;
+  SentinelSurvivors, SentinelCount: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  RelDiff, RefreshDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  WasCounting := OpenCLTransferCounting;
+  MaxCasePos := Length(csCases) div csDeconvCaseWidth - 1;
+  for CasePos := 0 to MaxCasePos do
+  begin
+    CaseBase := CasePos * csDeconvCaseWidth;
+    CaseName := 'case ' + IntToStr(CasePos);
+    RandSeed := 20261022 + CasePos;
+    NN := BuildDeconvParityNet(csCases, CaseBase, Producer, Deconv);
+    NNCPU := BuildDeconvParityNet(csCases, CaseBase, ProducerCPU, DeconvRefCPU);
+    Input := TNNetVolume.Create(csCases[CaseBase], csCases[CaseBase + 1],
+      csCases[CaseBase + 2]);
+    DeconvCPU := TNNetVolume.Create();
+    LastCPU := TNNetVolume.Create();
+    try
+      NNCPU.CopyWeights(NN);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.37) + 0.4 * Cos(Pos * 1.3);
+      NNCPU.Compute(Input);
+      DeconvCPU.Copy(DeconvRefCPU.Output);
+      LastCPU.Copy(NNCPU.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+      NN.Compute(Input);
+      // Producer sentinels survive only when the deconvolution binds its
+      // source; its own survive only when the consumer binds its output.
+      Producer.Output.Fill(csSentinel);
+      Deconv.Output.Fill(csSentinel);
+      SentinelCount := Producer.Output.Size + Deconv.Output.Size;
+      OpenCLTransferCounting := true;
+      TransfersBefore := OpenCLProcessTransferTotals();
+      NN.Compute(Input);
+      TransfersAfter := OpenCLProcessTransferTotals();
+      SentinelSurvivors := 0;
+      for Pos := 0 to Producer.Output.Size - 1 do
+        if Producer.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      for Pos := 0 to Deconv.Output.Size - 1 do
+        if Deconv.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+      RelDiff := MaxAbsDiffToOutput(LastCPU, NN.GetLastLayer.Output) /
+        LastCPU.GetMaxAbs();
+      Deconv.ForceOutputOnRAM();
+      RelDiff := Max(RelDiff, MaxAbsDiffToOutput(DeconvCPU, Deconv.Output) /
+        DeconvCPU.GetMaxAbs());
+
+      // A weight and bias update must reach the OpenCL operand.
+      for NeuronPos := 0 to csCases[CaseBase + 3] - 1 do
+      begin
+        SetRandomNeuronWeights(Deconv, NeuronPos, 0.1, 1);
+        Deconv.Neurons[NeuronPos].BiasWeight := 0.2 - 0.03 * NeuronPos;
+      end;
+      Deconv.FlushWeightCache();
+      NNCPU.CopyWeights(NN);
+      NNCPU.Compute(Input);
+      NN.Compute(Input);
+      Deconv.ForceOutputOnRAM();
+      RefreshDiff := MaxAbsDiffToOutput(DeconvRefCPU.Output, Deconv.Output) /
+        DeconvRefCPU.Output.GetMaxAbs();
+      WriteLn('  TNNetDeconvolution OpenCL ', CaseName, ': rel max|diff|=',
+        RelDiff:0:9, ' after update=', RefreshDiff:0:9, ' sentinels=',
+        SentinelSurvivors, '/', SentinelCount, ' uploads=',
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount, ' downloads=',
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals(CaseName + ': every forward ran on OpenCL', 3,
+        Deconv.ForwardGPUCnt);
+      AssertEquals(CaseName + ': source and output are bound, not downloaded',
+        SentinelCount, SentinelSurvivors);
+      AssertEquals(CaseName + ': only the input is uploaded', 1,
+        TransfersAfter.UploadCount - TransfersBefore.UploadCount);
+      AssertEquals(CaseName + ': only the last layer is downloaded', 1,
+        TransfersAfter.DownloadCount - TransfersBefore.DownloadCount);
+      AssertTrue(CaseName + ': the CPU reference is not degenerate',
+        DeconvCPU.GetMaxAbs() > 0);
+      AssertTrue(CaseName + ': OpenCL vs CPU rel max |diff| = ' +
+        FloatToStr(RelDiff), RelDiff < 1e-5);
+      AssertTrue(CaseName + ': after a weight update rel max |diff| = ' +
+        FloatToStr(RefreshDiff), RefreshDiff < 1e-5);
+    finally
+      OpenCLTransferCounting := WasCounting;
+      LastCPU.Free;
+      DeconvCPU.Free;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDeconvolutionOpenCLBorrowing;
+{$IFDEF OpenCL}
+var
+  Owner, Borrower: TNNet;
+  Input, OwnerInput, OutCPU, OwnerCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos: integer;
+  WasCounting: boolean;
+  TransfersBefore, TransfersAfter: TOpenCLTransferCounts;
+  MaxDiff: TNeuralFloat;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -76165,46 +76334,65 @@ begin
     Exit;
   end;
   RandSeed := 424242;
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(8, 8, 4);
+  WasCounting := OpenCLTransferCounting;
+  Owner := TNNet.Create();
+  Borrower := TNNet.Create();
+  Input := TNNetVolume.Create(13, 1, 6);
+  OwnerInput := TNNetVolume.Create(2, 1, 6);
   OutCPU := TNNetVolume.Create();
+  OwnerCPU := TNNetVolume.Create();
   try
-    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
-    // 5 features, 3x3, stride2, pad1 -> upsample 8x8 -> 15x15, contraction 4.
-    DC := TNNetDeconvolution.Create(5, 3, 2, 1, 0);
-    NN.AddLayer(DC);
-    InSize := Input.Size;
-    for i := 0 to InSize - 1 do
-      Input.Raw[i] := 0.05 * i - 0.3;
+    AddDeconv1DChain(Owner, 2, false);
+    Borrower.BuildWeightOwner := Owner;
+    AddDeconv1DChain(Borrower, 13, false);
+    Borrower.BuildWeightOwner := nil;
+    FillConv1DChainInput(Input);
+    FillConv1DChainInput(OwnerInput);
+    Borrower.Compute(Input);
+    OutCPU.Copy(Borrower.GetLastLayer.Output);
+    Owner.Compute(OwnerInput);
+    OwnerCPU.Copy(Owner.GetLastLayer.Output);
 
-    // CPU forward.
-    NN.Compute(Input);
-    OutCPU.Copy(NN.GetLastLayer.Output);
-
-    // Device forward (force the scatter-GEMM path).
-    NN.ForceOpenCL(True);
-    NN.EnableOpenCL(PlatformId, DeviceId);
-    try
-      NN.Compute(Input);
-      // Second device forward with UNCHANGED weights: exercises the
-      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
-      NN.Compute(Input);
-      MaxDiff := 0;
-      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
-      for i := 0 to OutCPU.Size - 1 do
-      begin
-        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
-        if Diff > MaxDiff then MaxDiff := Diff;
-      end;
-    finally
-      NN.ForceOpenCL(False);
-    end;
-    AssertTrue('Deconvolution OpenCL vs CPU parity: max |diff| = ' +
-      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Borrower.EnableOpenCLInContextOf(Owner);
+    Borrower.ForceOpenCL(true);
+    for LayerPos := 1 to 3 do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows the OpenCL weights',
+        TNNetLayerConcatedWeights(Borrower.Layers[LayerPos]).OpenCLWeightsBorrowed());
+    // The CPU forward's output must not pass for the OpenCL one.
+    Borrower.GetLastLayer.Output.Fill(-7777);
+    OpenCLTransferCounting := true;
+    TransfersBefore := OpenCLProcessTransferTotals();
+    Borrower.Compute(Input);
+    TransfersAfter := OpenCLProcessTransferTotals();
+    MaxDiff := MaxAbsDiffToOutput(OutCPU, Borrower.GetLastLayer.Output);
+    WriteLn('  Borrowed TNNetDeconvolution OpenCL weights: uploads ',
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes, ' B, max|diff|=',
+      MaxDiff:0:9);
+    for LayerPos := 1 to 3 do
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' ran on OpenCL', 1,
+        Borrower.Layers[LayerPos].ForwardGPUCnt);
+    AssertEquals('the borrower uploads only its input',
+      int64(Input.Size) * SizeOf(TNeuralFloat),
+      TransfersAfter.UploadBytes - TransfersBefore.UploadBytes);
+    AssertTrue('borrower vs CPU: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    // The owner computes on the buffers it lent.
+    Owner.ForceOpenCL(true);
+    Owner.GetLastLayer.Output.Fill(-7777);
+    Owner.Compute(OwnerInput);
+    MaxDiff := MaxAbsDiffToOutput(OwnerCPU, Owner.GetLastLayer.Output);
+    AssertEquals('the owner ran on OpenCL', 1, Owner.Layers[3].ForwardGPUCnt);
+    AssertTrue('owner vs CPU: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
   finally
+    OpenCLTransferCounting := WasCounting;
+    OwnerCPU.Free;
     OutCPU.Free;
+    OwnerInput.Free;
     Input.Free;
-    NN.Free;
+    Borrower.Free;
+    Owner.Free;
   end;
 end;
 {$ELSE}

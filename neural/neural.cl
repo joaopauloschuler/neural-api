@@ -1479,6 +1479,74 @@ __kernel void cai_conv_implicit
   FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
 }
 
+// TRANSPOSED CONVOLUTION (TNNetDeconvolution) as a gather, no atomics: output
+// (ox, oy, row a) sums every tap (kx, ky) whose source pixel ((ox + PaddingX -
+// kx) / Stride, (oy + PaddingY - ky) / Stride) is whole and inside the source,
+// dotting A's tap column with row a's group slice of that pixel. A element
+// (a, k) sits at a + k * FNumAs, k = (ky * FeatureSizeX + kx) * GroupInDepth
+// + d (the neuron weight layout); row a belongs to group a / (FNumAs / Groups).
+// One work-item per (row, output position), launch (FNumAs, FNumBs).
+// Coded by Claude (AI).
+__kernel void cai_conv_transpose
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  const int OutSizeX,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int FeatureSizeX,
+  const int FeatureSizeY,
+  const int Stride,
+  const int PaddingX,
+  const int PaddingY,
+  const int Groups
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
+  const int GroupInDepth = InDepth / Groups;
+  const int SrcOffset = (a_id / (FNumAs / Groups)) * GroupInDepth;
+  const int oy = b_id / OutSizeX;
+  const int ox = b_id - oy * OutSizeX;
+  const int ShiftedY = oy + PaddingY;
+  const int ShiftedX = ox + PaddingX;
+  const int TapStep = GroupInDepth * FNumAs;
+  float acc = 0.0f;
+  // Only taps congruent to the shifted position modulo Stride land on a whole
+  // source pixel; the source index falls as the tap index rises.
+  for (int ky = ShiftedY % Stride; ky < FeatureSizeY; ky += Stride)
+  {
+    const int iy = (ShiftedY - ky) / Stride;
+    if (iy < 0) break;
+    if (iy >= InSizeY) continue;
+    for (int kx = ShiftedX % Stride; kx < FeatureSizeX; kx += Stride)
+    {
+      const int ix = (ShiftedX - kx) / Stride;
+      if (ix < 0) break;
+      if (ix < InSizeX)
+      {
+        const int SrcPos = (iy * InSizeX + ix) * InDepth + SrcOffset;
+        int APos = a_id + (ky * FeatureSizeX + kx) * TapStep;
+        for (int d = 0; d < GroupInDepth; d++)
+        {
+          acc = mad(FInputBufferAs[APos], FSrc[SrcPos + d], acc);
+          APos += FNumAs;
+        }
+      }
+    }
+  }
+  if (UseBias != 0) acc += FRowBias[a_id];
+  FResultBuffer[b_id * FNumAs + a_id] = cai_fused_act(acc, ActFN);
+}
+
 // Phase weights of a 3x3 conv over a nearest-2x upsample (UpsampleFold): tap
 // (r, c) of phase (py, px) sums the 3x3 taps ky in [r*(1+py), py+r*(2-py)]
 // (same for kx), i.e. the taps that land on one source pixel. Src is the
