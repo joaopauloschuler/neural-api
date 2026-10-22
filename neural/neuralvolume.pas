@@ -548,8 +548,10 @@ type
       // A slice over all B is the neuron-axis intra-layer chunk; kernel-size
       // agnostic (VBs is the im2col matrix, so VectorSize folds the kernel), so
       // it covers spatial convs, not just pointwise. Reuses the same inline
-      // kernel - no per-element call overhead. Coded by Claude (AI).
-      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // kernel - no per-element call overhead. ResultBOffset shifts the written
+      // rows: B row CntB lands at FData[(CntB-ResultBOffset)*NumAs + CntA].
+      // Coded by Claude (AI).
+      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1; ResultBOffset: integer = 0); overload;
       // DotProductsPacked's weight layout: panels of csDotProductPanelRows rows,
       // each stored [element][row]; rows past NumAs are zero.
       class procedure PackDotProductRows(PtrDst, PtrSrc: TNeuralFloatArrPtr; NumAs, VectorSize: integer); static;
@@ -14378,7 +14380,7 @@ begin
   DotProductsTiled(NumAs, 0, NumBs-1, VectorSize, VAs, VBs, TileSizeA, TileSizeB);
 end;
 
-procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
+procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1; ResultBOffset: integer = 0);
 var
   CntA, CntB: Integer;
   RowBase, AOfs, BPos: integer;
@@ -14426,7 +14428,7 @@ begin
       EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
       TileAOfs0 := StartTileA * VectorSize; // #5: hoisted, invariant across CntB
       BPos := StartTileB * VectorSize;   // #12: carried CntB*VectorSize
-      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
+      RowBase := (StartTileB - ResultBOffset) * NumAs; // #12: carried
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(BPos);

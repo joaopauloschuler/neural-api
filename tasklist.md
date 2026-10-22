@@ -1124,16 +1124,18 @@ rather than acted on.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
           `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
           `FDilationX`; only `BackpropagateFastTiledCPU` is called.
-        - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
+        - [X] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
           neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
-          scratch.
+          scratch. Chunks over out-channels now (GEMM and direct scatter, dense
+          and grouped); each range owns its product columns, so no per-thread
+          scratch. Few-channel deconvs get few chunks.
         - [ ] `cai_conv_transpose` is untiled (one work-item per output cell and
           channel, like `cai_conv_implicit`); a large dense deconv (Kokoro
           generator ups) may want a tiled or phase-split GEMM. Not timed on a GPU.
         - [ ] Trainable deconvolutions and activations without a fused opcode
           (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
           CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
-        - [ ] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
+        - [X] Base `SetPrevLayer` still builds `FConcatedWInter` (unused by the
           deconv) for 32-multiple channel counts: one extra weight copy (dense
           deconvs only now).
         - [ ] `TNNetSnake` scalar-alpha inference still runs the scalar

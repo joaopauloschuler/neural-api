@@ -14,6 +14,15 @@ const
   MAX_NAN_CHECK_ITERATIONS = 100;
 
 type
+  // Runs a deconvolution's out-channel ranges on an explicit thread pool,
+  // split as the scheduler splits wkChunk items. Coded by Claude (AI).
+  TDeconvChunkProbe = class(TNNetDeconvolution)
+  private
+    procedure ComputeRangeWorker(index, threadnum: integer);
+  public
+    procedure ComputeOnPool(pPool: TNeuralThreadList);
+  end;
+
   // Builds round-trip net pKind; pTrainable=False adds every layer inference-only.
   TRoundTripNetBuilder = function(pKind: integer;
     pTrainable, pLowMemory: boolean): TNNet of object;
@@ -171,7 +180,9 @@ type
     procedure TestNetQuantizeWeightsInt4CountsConvertedLayers;
     procedure TestConvImportInt4QuantRowMatchesQuantizeRow;
     procedure TestBeginInt4QuantImportRefusesIneligibleLayers;
-    procedure TestDeconvolutionNeverChunkEligible;
+    procedure TestDeconvolutionChunkEligible;
+    procedure TestDeconvolutionChunkParity;
+    procedure TestDeconvolutionSkipsInterleavedWeights;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
     procedure TestDequantizeWeightsInt8DropsInt8Input;
@@ -179,6 +190,22 @@ type
   end;
 
 implementation
+
+procedure TDeconvChunkProbe.ComputeRangeWorker(index, threadnum: integer);
+var
+  WorkCount, FirstNeuron, LastNeuron: integer;
+begin
+  WorkCount := ChunkWorkCount();
+  FirstNeuron := (index * WorkCount) div threadnum;
+  LastNeuron := ((index + 1) * WorkCount) div threadnum - 1;
+  if LastNeuron >= FirstNeuron then ComputeRange(FirstNeuron, LastNeuron);
+end;
+
+procedure TDeconvChunkProbe.ComputeOnPool(pPool: TNeuralThreadList);
+begin
+  PrepareChunkedForward();
+  pPool.StartProc({$IFDEF FPC}@{$ENDIF}ComputeRangeWorker, true);
+end;
 
 procedure TTestNeuralLayers.TestFullyConnectedForward;
 var
@@ -5525,23 +5552,182 @@ begin
   end;
 end;
 
-// A chunked TNNetDeconvolution would run the inherited forward-convolution
-// ComputeRange instead of its transposed scatter. Coded by Claude (AI).
-procedure TTestNeuralLayers.TestDeconvolutionNeverChunkEligible;
+// The deconvolution chunks over out-channels whenever intra-layer threading
+// is on and the forward stays on the CPU. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionChunkEligible;
 var
   NN: TNNet;
   Deconv: TNNetDeconvolution;
-  Conv: TNNetConvolution;
 begin
   NN := TNNet.Create();
   try
     NN.AddLayer(TNNetInput.Create(8, 8, 16));
-    Conv := TNNetConvolution(NN.AddLayer(TNNetConvolution.Create(16, 3, 1, 1)));
-    Deconv := TNNetDeconvolution(NN.AddLayer(TNNetDeconvolution.Create(16, 3, 2, 1)));
+    Deconv := TNNetDeconvolution(NN.AddLayer(TNNetDeconvolution.Create(13, 3, 2, 1)));
+    AssertFalse('no chunks without intra-layer threading', Deconv.ChunkEligible());
     NN.EnableIntraLayerThreading(true);
-    NN.SchedulerMinGain := 0;
-    AssertTrue('the plain convolution is chunk-eligible', Conv.ChunkEligible());
-    AssertFalse('the deconvolution must never chunk', Deconv.ChunkEligible());
+    AssertTrue('the deconvolution chunks', Deconv.ChunkEligible());
+    AssertEquals('one work item per out-channel', 13, Deconv.ChunkWorkCount());
+  finally
+    NN.Free;
+  end;
+end;
+
+// Out-channel ranges computed on 2, 3 and 4 real threads must reproduce the
+// serial forward (output and pre-activation) over dense, grouped, depthwise,
+// strided, padded and odd-channel shapes, on the GEMM and the direct path, in
+// inference, low-memory and trainable mode. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionChunkParity;
+const
+  csSentinel = -7777;
+  csTolerance = 1e-5;
+  // InX, InY, InC, OutC, K, Stride, Pad, OutPad, Groups, Activation (0 identity,
+  // 1 ReLU, 2 tanh), Mode (0 inference, 1 trainable, 2 low-memory), SuppressBias.
+  csCaseWidth = 12;
+  csCases: array[0..119] of integer = (
+    6, 5, 4, 5, 3, 2, 1, 1, 1, 1, 0, 0,
+    5, 4, 6, 7, 3, 2, 0, 0, 1, 2, 0, 0,
+    3, 3, 8, 6, 2, 2, 0, 0, 1, 1, 0, 1,
+    4, 3, 5, 9, 2, 3, 0, 0, 1, 0, 0, 0,
+    5, 4, 6, 4, 3, 2, 0, 0, 2, 1, 0, 0,
+    4, 4, 9, 9, 3, 2, 1, 1, 9, 0, 0, 1,
+    7, 6, 6, 9, 4, 2, 1, 0, 3, 2, 1, 0,
+    6, 5, 5, 7, 3, 1, 1, 0, 1, 0, 1, 0,
+    5, 5, 7, 11, 3, 2, 1, 1, 1, 2, 2, 0,
+    6, 4, 6, 3, 3, 2, 0, 1, 3, 1, 2, 0);
+  csThreadCounts: array[0..2] of integer = (2, 3, 4);
+var
+  NN: TNNet;
+  Deconv: TDeconvChunkProbe;
+  Input, SerialOutput, SerialRaw: TNNetVolume;
+  Pool: TNeuralThreadList;
+  CaseBase, CasePos, MaxCasePos, ThreadPos, NeuronPos, WeightPos: integer;
+  ElementPos, MaxElementPos, GemmCaseCnt, DirectCaseCnt: integer;
+  CaseName: string;
+begin
+  Input := TNNetVolume.Create();
+  SerialOutput := TNNetVolume.Create();
+  SerialRaw := TNNetVolume.Create();
+  GemmCaseCnt := 0;
+  DirectCaseCnt := 0;
+  try
+    MaxCasePos := Length(csCases) div csCaseWidth - 1;
+    for CasePos := 0 to MaxCasePos do
+    begin
+      CaseBase := CasePos * csCaseWidth;
+      CaseName := 'case ' + IntToStr(CasePos);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(csCases[CaseBase], csCases[CaseBase + 1],
+          csCases[CaseBase + 2]));
+        Deconv := TDeconvChunkProbe.Create(csCases[CaseBase + 3],
+          csCases[CaseBase + 4], csCases[CaseBase + 5], csCases[CaseBase + 6],
+          csCases[CaseBase + 7], csCases[CaseBase + 11]);
+        Deconv.FGroups := csCases[CaseBase + 8];
+        case csCases[CaseBase + 9] of
+          0: begin
+               Deconv.FActivationFn := @Identity;
+               Deconv.FActivationFnDerivative := @IdentityDerivative;
+             end;
+          1: begin
+               Deconv.FActivationFn := @RectifiedLinearUnit;
+               Deconv.FActivationFnDerivative := @RectifiedLinearUnitDerivative;
+             end;
+        else
+          begin
+            Deconv.FActivationFn := @HiperbolicTangent;
+            Deconv.FActivationFnDerivative := @HiperbolicTangentDerivative;
+          end;
+        end;
+        NN.AddLayer(Deconv);
+        if csCases[CaseBase + 10] <> 1 then
+          NN.SetTrainable(False, {pLowMemory=}csCases[CaseBase + 10] = 2);
+        for NeuronPos := 0 to Deconv.Neurons.Count - 1 do
+        begin
+          for WeightPos := 0 to Deconv.Neurons[NeuronPos].Weights.Size - 1 do
+            Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+              0.3 * Sin(NeuronPos * 0.71 + WeightPos * 0.13);
+          Deconv.Neurons[NeuronPos].BiasWeight := 0.1 * (NeuronPos mod 5) - 0.2;
+        end;
+        Deconv.FlushWeightCache();
+        if Deconv.CPUGemmEligible() then Inc(GemmCaseCnt) else Inc(DirectCaseCnt);
+        Input.ReSize(csCases[CaseBase], csCases[CaseBase + 1], csCases[CaseBase + 2]);
+        for ElementPos := 0 to Input.Size - 1 do
+          Input.Raw[ElementPos] := Sin(ElementPos * 0.37) - 0.1;
+
+        NN.Compute(Input);
+        SerialOutput.Copy(Deconv.Output);
+        SerialRaw.Copy(Deconv.FOutputRaw);
+        AssertTrue(CaseName + ' serial output is non-trivial',
+          SerialOutput.GetSumAbs() > 0);
+        MaxElementPos := SerialOutput.Size - 1;
+
+        for ThreadPos := 0 to High(csThreadCounts) do
+        begin
+          Deconv.Output.Fill(csSentinel);
+          Deconv.FOutputRaw.Fill(csSentinel);
+          Pool := TNeuralThreadList.Create(csThreadCounts[ThreadPos]);
+          try
+            Pool.StartEngine();
+            Deconv.ComputeOnPool(Pool);
+            Pool.StopEngine();
+          finally
+            Pool.Free;
+          end;
+          for ElementPos := 0 to MaxElementPos do
+          begin
+            AssertEquals(CaseName + ' output at ' + IntToStr(ElementPos) +
+              ' on ' + IntToStr(csThreadCounts[ThreadPos]) + ' threads',
+              SerialOutput.FData[ElementPos], Deconv.Output.FData[ElementPos],
+              csTolerance);
+            AssertEquals(CaseName + ' pre-activation at ' + IntToStr(ElementPos) +
+              ' on ' + IntToStr(csThreadCounts[ThreadPos]) + ' threads',
+              SerialRaw.FData[ElementPos], Deconv.FOutputRaw.FData[ElementPos],
+              csTolerance);
+          end;
+        end;
+
+        // The planner's chunk path (serial fallback on a one-core box).
+        NN.EnableIntraLayerThreading(true);
+        NN.SchedulerMinGain := 0;
+        AssertTrue(CaseName + ' is chunk-eligible', Deconv.ChunkEligible());
+        Deconv.Output.Fill(csSentinel);
+        NN.Compute(Input, 0, {Parallel=}true);
+        for ElementPos := 0 to MaxElementPos do
+          AssertEquals(CaseName + ' scheduled output at ' + IntToStr(ElementPos),
+            SerialOutput.FData[ElementPos], Deconv.Output.FData[ElementPos],
+            csTolerance);
+      finally
+        NN.Free;
+      end;
+    end;
+    AssertTrue('some cases run the CPU GEMM', GemmCaseCnt > 0);
+    AssertTrue('some cases run the direct scatter', DirectCaseCnt > 0);
+  finally
+    SerialRaw.Free;
+    SerialOutput.Free;
+    Input.Free;
+  end;
+end;
+
+// No deconvolution forward reads FConcatedWInter, so a 32-multiple channel
+// count must not build that weight copy. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionSkipsInterleavedWeights;
+var
+  NN: TNNet;
+  Deconv: TDeconvChunkProbe;
+  WeightCount: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 32));
+    Deconv := TDeconvChunkProbe.Create(32, 3, 2, 1);
+    NN.AddLayer(Deconv);
+    NN.SetTrainable(False, {pLowMemory=}False);
+    Deconv.FlushWeightCache();
+    WeightCount := Deconv.Neurons.Count * Deconv.Neurons[0].Weights.Size;
+    AssertEquals('the GEMM bank is built', WeightCount,
+      Deconv.FConcatedWeights.Size);
+    AssertTrue('no interleaved copy', Deconv.FConcatedWInter.Size < WeightCount);
   finally
     NN.Free;
   end;
