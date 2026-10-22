@@ -742,9 +742,6 @@ rather than acted on.
         - [ ] GPU box: SD 1.5, 50 steps DDIM, `--deepcache 2/3/5` (branch 0 and
               the default) vs off: time per image and image pairs in
               examples/StableDiffusion/README.md.
-        - [X] A ControlNet still runs on shallow-only steps although only its
-              shallow-skip residuals are used; skip its deep part there
-              (T2I-Adapter features run once per image: nothing to skip).
       - [ ] Self-Attention Guidance for the SD UNet: the with/without image
             pair on SD 1.5 from the GPU box in examples/StableDiffusion/README.md
             (`--sag-scale 0.75`). The pipeline side is done
@@ -1144,9 +1141,6 @@ rather than acted on.
         - [ ] Trainable deconvolutions and activations without a fused opcode
           (anything but Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish) run on the
           CPU under OpenCL; the old host-scatter OpenCL path served trainable ones.
-        - [X] `TNNetSnake` inference (scalar and per-channel alpha) shares one
-          blocked in-place path through the vectorized `Sin` (~5.5x on AVX2 for
-          the scalar case, CPU A/B, 1-core VM).
         - [ ] `TNNetSnake` training forward (both alpha modes) still runs the
           scalar `pcr_sincosf` loop; blocked `TNNetVolume.SinCos` could write
           sin into `FOutput` and cos into `FOutputErrorDeriv` with no scratch.
@@ -1711,9 +1705,8 @@ rather than acted on.
   - [ ] downsample-in-first-stage=true real configs (code handles it, untested
         on a real ckpt).
 - [ ] Qwen-Image-2.1 text-to-image and image editing (Qwen/Qwen-Image-2.1, diffusers
-      `QwenImage21Pipeline`, Qwen Research License). Target: Phase A (text-to-image)
-      first, 1024x1024 on the OpenCL GPU box, branch a19; B and C are recorded, not
-      scheduled. One Opus agent per task, run serially, test + commit after each.
+      `QwenImage21Pipeline`, Qwen Research License). 1024x1024 on the OpenCL GPU box,
+      branch a19. One Opus agent per task, run serially, test + commit after each.
       Reference: diffusers `transformer_qwenimage21.py`, `autoencoder_kl_qwenimage21.py`,
       `pipelines/qwenimage21/pipeline_qwenimage21.py` (merged 2026-09-18).
       Checkpoint facts (from the configs and safetensors headers):
@@ -2126,11 +2119,6 @@ rather than acted on.
       examples/QwenImage `--sampler euler|dpm2m|unipc`):
       - [ ] User GPU-box quality check of dpm2m and unipc at 10-12 steps
             against euler at the current default count (18).
-      - [X] `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` reads only
-            FlowMatchEuler configs; a Wan `UniPCMultistepScheduler` config
-            (use_flow_sigmas, flow_shift, solver_type) should map onto `fsUniPC`
-            (also DPMSolverMultistepScheduler -> `fsDPMSolverPP2M`; `ScheduleFamily`
-            picks diffusers' sigma spacing and integer timesteps).
 - [ ] Adaptive Projected Guidance follow-ups (`TNNetAdaptiveProjectedGuidance` in
       neural/neuraldiffusion.pas, 15c5aca5; `--apg` in examples/LatentTextToImage,
       examples/ConditionalDiffusion and examples/QwenImage). Later consumers: the
@@ -2397,14 +2385,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [X] `TNNetSpectralConv2D` OpenCL forward follow-up: the inverse
-      `cai_rfft2_cols_c2c` launch sums all SizeY rows of the mixed spectrum,
-      though only the first ModesY are nonzero (the mix kernel writes the rest
-      as zeros). If an FNO shows up on the GPU box, give the column kernel a
-      separate input-row count so it skips the zero rows.
-      - Done: `cai_rfft2_cols_c2c` takes FInRows (ModesY on the inverse pass,
-        full H elsewhere) and `cai_spectral_mode_mix` no longer writes the zero
-        rows. GPU timing pending.
 - [ ] Check (not verified): `TNNetSpectralConv2D` (CPU and OpenCL) keeps only
       the low corner [0..ModesX-1][0..ModesY-1] of the spectrum and takes the
       real part of the inverse 2-D FFT. The reference FNO `SpectralConv2d`
@@ -2412,18 +2392,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       weights2 for the negative-frequency modes) and uses irfft2. Decide
       whether to add the second corner (needed to import a torch FNO
       checkpoint) or document the layer as a one-corner variant.
-- [X] `TNNetGRN` device forward follow-up: `cai_grn_table` (the coef|beta table
-      ahead of the ChannelAffine opcode 46 tail) is one work-group, so on a
-      big map (56x56x384) it runs on one compute unit; split positions
-      across groups if it shows up on the GPU box.
-      - Done: `cai_channel_sums_partial` writes up to 64 position-slice
-        partial sums per channel (buffer sized at EnableOpenCL), then
-        `cai_grn_table` finishes in one group. GPU timing pending.
-- [X] `TNNetMetaAconC` device forward: `cai_meta_acon_table` looped every
-      position per channel in one work-item. It now sums the partials of
-      `cai_channel_sums_partial` (sum-of-x mode; GRN uses the square mode),
-      armed through the shared `TNNetChannelTransformBase` helpers. PoCL
-      parity at 1 to 63 slices; GPU timing pending.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and
