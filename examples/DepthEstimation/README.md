@@ -38,6 +38,12 @@ from either the example directory or the repo root.
 - A real run loads `depth-anything/Depth-Anything-V2-Small-hf` the same way and
   processes a photograph; the math is identical, only the checkpoint and image
   differ.
+- `BuildDPTFromSafeTensors` also reads transformers `DPTForDepthEstimation`
+  folders (model_type `"dpt"`): the plain-ViT `Intel/dpt-large` and the
+  DPT-Hybrid `Intel/dpt-hybrid-midas` (a BiT ResNet in front of the ViT; the
+  depth estimator of `stabilityai/stable-diffusion-2-depth`). Both are checked
+  only against pico random fixtures so far, at the checkpoint's native
+  `image_size` (384).
 - Inference only, pure CPU, finishes well under a second.
 
 Coded by Joao Paulo Schwarz Schuler with Claude (AI).

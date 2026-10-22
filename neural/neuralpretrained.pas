@@ -14744,11 +14744,29 @@ function BuildBeitForImageClassificationWithConfig(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 type
-  // DPT / Depth-Anything monocular depth-estimation config. The DINOv2 (or ViT)
-  // backbone is described by Backbone; the rest is the DPT reassemble/fusion neck
-  // + depth head. The repo's FIRST dense per-pixel REGRESSION vision importer.
+  // transformers BitConfig as the DPT-Hybrid backbone: a ResNet of bottleneck
+  // units with weight-standardized convs, GroupNorm and TF "SAME" padding.
+  TBiTConfig = record
+    NumChannels: integer;             // num_channels
+    EmbeddingSize: integer;           // embedding_size (stem width)
+    HiddenSizes: TNeuralIntegerArray; // hidden_sizes (one per stage, extra ignored)
+    Depths: TNeuralIntegerArray;      // depths (bottleneck units per stage)
+    NumGroups: integer;               // num_groups (GroupNorm)
+    WidthFactor: integer;             // width_factor
+    OutputStride: integer;            // output_stride
+    LayerType: string;                // layer_type ('bottleneck' supported)
+    GlobalPadding: string;            // global_padding ('SAME' supported)
+    HiddenAct: string;                // hidden_act ('relu' supported)
+    EmbeddingDynamicPadding: boolean; // embedding_dynamic_padding
+  end;
+
+  // DPT / Depth-Anything monocular depth-estimation config. Backbone is the
+  // DINOv2 backbone_config (Depth Anything) or, for model_type "dpt", the
+  // top-level ViT fields (Backbone.ModelType 'vit', IntermediateSize from
+  // intermediate_size); Bit is the BiT backbone of a DPT-Hybrid. The rest is the
+  // DPT reassemble/fusion neck + depth head.
   TDPTConfig = record
-    Backbone: TDINOv2Config;          // backbone_config (model_type dinov2)
+    Backbone: TDINOv2Config;          // backbone_config (dinov2) or the ViT fields
     PatchSize: integer;               // patch_size (top-level; = Backbone.PatchSize)
     ReassembleHiddenSize: integer;    // reassemble_hidden_size (= backbone hidden)
     NeckHiddenSizes: array[0..3] of integer;   // neck_hidden_sizes (4 levels)
@@ -14761,13 +14779,20 @@ type
     ModelType: string;                // 'depth_anything' or 'dpt'
     OutIndices: array[0..3] of integer;  // backbone out_indices (1-based stages;
                                          // stageK = encoder block K-1). Default =
-                                         // last 4 blocks (HF [N-3..N]).
+                                         // last 4 blocks (HF [N-3..N]). For the
+                                         // ViT DPT: backbone_out_indices + 1.
+    IsHybrid: boolean;                // is_hybrid (BiT + ViT-hybrid embeddings)
+    Bit: TBiTConfig;                  // backbone_config of a hybrid
+    ReadoutType: string;              // readout_type: 'ignore', 'add', 'project'
+    NeckIgnoreStages: array[0..3] of boolean; // neck_ignore_stages (hybrid)
+    AddProjection: boolean;           // add_projection (3x3 conv before the head)
   end;
 
 // Reads a HF Depth-Anything / DPT config.json (model_type "depth_anything" or
-// "dpt"). The backbone is read from the nested "backbone_config" object (must be
-// model_type "dinov2"); out_features there select the hooked stages (all N layers
-// for the pico fixture). Required neck fields: neck_hidden_sizes (4 entries),
+// "dpt"). A "dinov2" backbone_config is the Depth Anything layout; out_features
+// there select the hooked stages. A "dpt" config without one is the ViT DPT
+// (Intel/dpt-large; is_hybrid adds the "bit" backbone_config of
+// Intel/dpt-hybrid-midas). Required neck fields: neck_hidden_sizes (4 entries),
 // reassemble_factors (4), fusion_hidden_size, head_hidden_size. Defaults follow
 // DepthAnythingConfig: head_in_index -1, depth_estimation_type "relative",
 // max_depth 1, reassemble_hidden_size = backbone hidden_size.
@@ -85923,13 +85948,132 @@ begin
   end;
 end;
 
+// Boolean field Key of Obj; Default when it is missing or null.
+function ReadJSONBoolOrDefault(Obj: TJSONObject; const Key: string;
+  Default: boolean): boolean;
+var
+  Data: TJSONData;
+begin
+  Data := Obj.Find(Key);
+  if (Data = nil) or (Data.JSONType = jtNull) then Result := Default
+  else Result := Data.AsBoolean;
+end;
+
+// The ViT fields of a DPTConfig (top level of a "dpt" config.json) as a
+// TDINOv2Config with ModelType 'vit'; missing fields take the DPTConfig defaults.
+function ReadDPTViTBackboneFromObject(Obj: TJSONObject): TDINOv2Config;
+begin
+  Result.ModelType := 'vit';
+  Result.HiddenSize := Obj.Get('hidden_size', 768);
+  Result.NumLayers := Obj.Get('num_hidden_layers', 12);
+  Result.NumHeads := Obj.Get('num_attention_heads', 12);
+  Result.IntermediateSize := Obj.Get('intermediate_size', 3072);
+  Result.ImageSize := Obj.Get('image_size', 384);
+  Result.PatchSize := Obj.Get('patch_size', 16);
+  Result.NumChannels := Obj.Get('num_channels', 3);
+  Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000000000001);
+  Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+  Result.MlpRatio := 0;
+  Result.NumRegisterTokens := 0;
+  Result.UseSwiGLUFFN := false;
+  if (Result.HiddenSize < 1) or (Result.NumLayers < 1) or
+    (Result.NumHeads < 1) or (Result.IntermediateSize < 1) or
+    (Result.ImageSize < 1) or (Result.PatchSize < 1) then
+    ImportError('DPT import: hidden_size, num_hidden_layers, ' +
+      'num_attention_heads, intermediate_size, image_size and patch_size ' +
+      'must be positive.');
+  if not ReadJSONBoolOrDefault(Obj, 'qkv_bias', true) then
+    ImportError('DPT import: qkv_bias false is not supported.');
+end;
+
+// transformers BitConfig from Bc; Bc = nil gives DPTConfig's hybrid default
+// (bottleneck, SAME padding, depths [3, 4, 9], dynamic stem padding).
+function ReadBiTConfigFromObject(Bc: TJSONObject): TBiTConfig;
+const
+  DefaultHiddenSizes: array[0..3] of integer = (256, 512, 1024, 2048);
+  HybridDepths: array[0..2] of integer = (3, 4, 9);
+  BitDepths: array[0..3] of integer = (3, 4, 6, 3);
+var
+  EmptyObj: TJSONObject;
+begin
+  EmptyObj := nil;
+  if Bc = nil then
+  begin
+    EmptyObj := TJSONObject.Create();
+    Bc := EmptyObj;
+  end;
+  try
+    if Bc.Get('model_type', 'bit') <> 'bit' then
+      ImportError('DPT import: a hybrid backbone_config must be model_type ' +
+        '"bit", got "' + Bc.Get('model_type', '') + '".');
+    Result.NumChannels := Bc.Get('num_channels', 3);
+    Result.EmbeddingSize := Bc.Get('embedding_size', 64);
+    Result.HiddenSizes := ReadJSONIntArray(Bc, 'hidden_sizes',
+      DefaultHiddenSizes);
+    if Assigned(EmptyObj) then
+    begin
+      Result.Depths := ReadJSONIntArray(Bc, 'depths', HybridDepths);
+      Result.LayerType := 'bottleneck';
+      Result.GlobalPadding := 'SAME';
+      Result.EmbeddingDynamicPadding := true;
+    end
+    else
+    begin
+      Result.Depths := ReadJSONIntArray(Bc, 'depths', BitDepths);
+      Result.LayerType := Bc.Get('layer_type', 'preactivation');
+      if (Bc.Find('global_padding') = nil) or
+        (Bc.Find('global_padding').JSONType = jtNull) then
+        Result.GlobalPadding := ''
+      else Result.GlobalPadding := UpperCase(Bc.Get('global_padding', ''));
+      Result.EmbeddingDynamicPadding :=
+        ReadJSONBoolOrDefault(Bc, 'embedding_dynamic_padding', false);
+    end;
+    Result.NumGroups := Bc.Get('num_groups', 32);
+    Result.WidthFactor := Bc.Get('width_factor', 1);
+    Result.OutputStride := Bc.Get('output_stride', 32);
+    Result.HiddenAct := Bc.Get('hidden_act', 'relu');
+  finally
+    EmptyObj.Free;
+  end;
+end;
+
+// backbone_out_indices of a ViT DPT (0-based encoder blocks, default
+// [2, 5, 8, 11]) as 1-based stages; the used entries must increase.
+procedure ReadDPTBackboneOutIndices(Obj: TJSONObject; NumLayers: integer;
+  IsHybrid: boolean; out OutIndices: array of integer);
+const
+  DefaultOutIndices: array[0..3] of integer = (2, 5, 8, 11);
+var
+  BlockIndices: TNeuralIntegerArray;
+  StagePos, FirstUsedPos: integer;
+begin
+  BlockIndices := ReadJSONIntArray(Obj, 'backbone_out_indices',
+    DefaultOutIndices);
+  if Length(BlockIndices) <> 4 then
+    ImportError('DPT import: backbone_out_indices must have 4 entries.');
+  if IsHybrid then FirstUsedPos := 2 else FirstUsedPos := 0;
+  for StagePos := 0 to 3 do
+  begin
+    OutIndices[StagePos] := BlockIndices[StagePos] + 1;
+    if StagePos < FirstUsedPos then continue;
+    if (BlockIndices[StagePos] < 0) or (BlockIndices[StagePos] >= NumLayers) then
+      ImportError('DPT import: backbone_out_indices entry ' +
+        IntToStr(BlockIndices[StagePos]) + ' is outside 0..' +
+        IntToStr(NumLayers - 1) + '.');
+    if (StagePos > FirstUsedPos) and
+      (BlockIndices[StagePos] <= BlockIndices[StagePos - 1]) then
+      ImportError('DPT import: backbone_out_indices must increase.');
+  end;
+end;
+
 function ReadDPTConfigFromJSONFile(const FileName: string): TDPTConfig;
 var
   JsonText: TStringList;
-  Root, BcData, FacData: TJSONData;
+  Root, BcData, FacData, IgnoreData: TJSONData;
   Obj, Bc: TJSONObject;
   Arr: TJSONArray;
   i: integer;
+  IsViTDPT: boolean;
 
   procedure ReadIntArray4(const Key: string; var Dst: array of integer);
   var d: TJSONData; a: TJSONArray; k: integer;
@@ -85969,16 +86113,61 @@ begin
       ImportError('DPT import: model_type "' + Result.ModelType +
         '" unsupported (only "depth_anything" / "dpt").');
     BcData := Obj.Find('backbone_config');
-    if (BcData = nil) or not (BcData is TJSONObject) then
-      ImportError('DPT import: config is missing the "backbone_config" object.');
-    Bc := TJSONObject(BcData);
-    Result.Backbone := ReadDINOv2ConfigFromObject(Bc, 'DPT import');
-    // backbone out_indices: which 4 encoder stages feed the DPT neck. HF stores
-    // 1-based stage indices in backbone_config.out_indices (or out_features as
-    // "stage{K}"). stageK = the output of 0-based encoder block K-1. Default =
-    // the last 4 blocks ([N-3 .. N], 1-based), matching the all-N pico fixture
-    // and HF's default [N-3,N-2,N-1,N].
-    ReadDPTOutIndices(Bc, Result.Backbone.NumLayers, Result.OutIndices);
+    Bc := nil;
+    if BcData is TJSONObject then Bc := TJSONObject(BcData);
+    Result.IsHybrid := ReadJSONBoolOrDefault(Obj, 'is_hybrid', false);
+    Result.AddProjection := ReadJSONBoolOrDefault(Obj, 'add_projection', false);
+    Result.ReadoutType := 'ignore';
+    for i := 0 to 3 do Result.NeckIgnoreStages[i] := false;
+    IsViTDPT := (Result.ModelType = 'dpt') and
+      (Result.IsHybrid or (Bc = nil));
+    if IsViTDPT then
+    begin
+      Result.Backbone := ReadDPTViTBackboneFromObject(Obj);
+      ReadDPTBackboneOutIndices(Obj, Result.Backbone.NumLayers,
+        Result.IsHybrid, Result.OutIndices);
+      Result.ReadoutType := LowerCase(Obj.Get('readout_type', 'project'));
+      if (Result.ReadoutType <> 'ignore') and (Result.ReadoutType <> 'add') and
+        (Result.ReadoutType <> 'project') then
+        ImportError('DPT import: readout_type "' + Result.ReadoutType +
+          '" unsupported.');
+      if Result.IsHybrid then
+      begin
+        Result.Bit := ReadBiTConfigFromObject(Bc);
+        Result.NeckIgnoreStages[0] := true;
+        Result.NeckIgnoreStages[1] := true;
+        IgnoreData := Obj.Find('neck_ignore_stages');
+        if IgnoreData is TJSONArray then
+        begin
+          Result.NeckIgnoreStages[0] := false;
+          Result.NeckIgnoreStages[1] := false;
+          for i := 0 to TJSONArray(IgnoreData).Count - 1 do
+            if (TJSONArray(IgnoreData).Integers[i] >= 0) and
+              (TJSONArray(IgnoreData).Integers[i] <= 3) then
+              Result.NeckIgnoreStages[TJSONArray(IgnoreData).Integers[i]] := true;
+        end;
+      end;
+      if ReadJSONBoolOrDefault(Obj, 'use_batch_norm_in_fusion_residual', false)
+        or not ReadJSONBoolOrDefault(Obj, 'use_bias_in_fusion_residual', true) then
+        ImportError('DPT import: batch-norm or bias-free fusion residual ' +
+          'units are not supported.');
+      // DPTDepthEstimationHead hard-codes 32 channels after its upsample.
+      Result.HeadHiddenSize := 32;
+    end
+    else
+    begin
+      if Bc = nil then
+        ImportError('DPT import: config is missing the "backbone_config" object.');
+      Result.Backbone := ReadDINOv2ConfigFromObject(Bc, 'DPT import');
+      // backbone out_indices: which 4 encoder stages feed the DPT neck. HF
+      // stores 1-based stage indices in backbone_config.out_indices (or
+      // out_features as "stage{K}"). stageK = the output of 0-based encoder
+      // block K-1. Default = the last 4 blocks ([N-3 .. N], 1-based).
+      ReadDPTOutIndices(Bc, Result.Backbone.NumLayers, Result.OutIndices);
+      Result.HeadHiddenSize := Obj.Get('head_hidden_size', 0);
+      if Result.HeadHiddenSize <= 0 then
+        ImportError('DPT import: head_hidden_size must be a positive integer.');
+    end;
     Result.PatchSize := Obj.Get('patch_size', Result.Backbone.PatchSize);
     Result.ReassembleHiddenSize :=
       Obj.Get('reassemble_hidden_size', Result.Backbone.HiddenSize);
@@ -85993,9 +86182,6 @@ begin
     Result.FusionHiddenSize := Obj.Get('fusion_hidden_size', 0);
     if Result.FusionHiddenSize <= 0 then
       ImportError('DPT import: fusion_hidden_size must be a positive integer.');
-    Result.HeadHiddenSize := Obj.Get('head_hidden_size', 0);
-    if Result.HeadHiddenSize <= 0 then
-      ImportError('DPT import: head_hidden_size must be a positive integer.');
     Result.HeadInIndex := Obj.Get('head_in_index', -1);
     Result.DepthEstimationType := Obj.Get('depth_estimation_type', 'relative');
     Result.MaxDepth := Obj.Get('max_depth', double(1));
@@ -86022,7 +86208,9 @@ begin
     IntToStr(Config.OutIndices[1]) + ',' + IntToStr(Config.OutIndices[2]) + ',' +
     IntToStr(Config.OutIndices[3]) + ']' +
     ', type=' + Config.DepthEstimationType +
-    ', max_depth=' + FloatToStr(Config.MaxDepth);
+    ', max_depth=' + FloatToStr(Config.MaxDepth) +
+    ', readout=' + Config.ReadoutType +
+    ', hybrid=' + BoolToStr(Config.IsHybrid, true);
 end;
 
 // Loads a bias-FREE nn.Conv2d (weight [OutCh,InCh,K,K]) into a CAI conv layer
@@ -86179,291 +86367,796 @@ type
     Res1, Res2: TDPTResidualRefs;    // residual_layer1 (skip), residual_layer2
   end;
 
-function BuildDPT(Reader: TNNetSafeTensorsReader;
-  const Config: TDPTConfig; pTrainable: boolean): TNNet;
-var
-  NN: TNNet;
-  Bk: TDINOv2Config;
-  Blocks: TDINOv2BlockLayersArray;
-  PatchConv, PosEmb: TNNetLayer;
-  BlockOut: array of TNNetLayer;            // each encoder block's sequence output
-  StageLN: array[0..3] of TNNetLayer;       // shared final-LN copies (one per hook)
-  Reassembled: array[0..3] of TNNetLayer;   // (Wr,Hr,fusion) after neck conv
-  Fusion: array[0..3] of TDPTFusionRefs;
-  Proj: array[0..3] of TNNetLayer;          // reassemble projection (1x1)
-  ResizeUp: array[0..3] of TNNetLayer;      // transpose-conv pointwise (factor>1)
-  ResizeDown: array[0..3] of TNNetLayer;    // 3x3 downsample (factor<1)
-  NeckConv: array[0..3] of TNNetLayer;
-  HeadConv1, HeadConv2, HeadConv3: TNNetLayer;
-  Tmp: TNNetVolume;
-  Grid, NumPatches, BlockCnt, ci, d, i, K, Wr, Hr, Fus: integer;
-  NumLayersM1, dM1: integer;
-  GW, GH: array[0..3] of integer;
-  Fac: double;
-  Pfx, BkPfx, Nm: string;
-  Cur, Residual: TNNetLayer;
-  TargetW, TargetH: integer;
-
-  // shared LN load into one of the StageLN copies.
-  procedure LoadSharedLN(Layer: TNNetLayer);
-  begin
-    LoadLayerNormWeights(Reader, Layer, BkPfx + 'layernorm.weight',
-      BkPfx + 'layernorm.bias', d);
+  // The DPT neck and depth head as AddDPTNeckAndHead appends them; nil entries
+  // are layers the config does not have.
+  TDPTNeckLayers = record
+    Proj, ResizeUp, ResizeDown, NeckConv: array[0..3] of TNNetLayer;
+    Fusion: array[0..3] of TDPTFusionRefs;
+    HeadProjection, HeadConv1, HeadConv2, HeadConv3: TNNetLayer;
   end;
 
+  // The DINOv2 backbone of the Depth Anything layout.
+  TDPTDINOv2Layers = record
+    PatchConv, PosEmb: TNNetLayer;
+    Blocks: TDINOv2BlockLayersArray;
+    StageLN: array[0..3] of TNNetLayer;   // shared final-LN copies (one per hook)
+  end;
+
+  // One BiT bottleneck unit; DownConv / DownNorm only on a stage's first unit.
+  TBiTBottleneckLayers = record
+    Conv1, Norm1, Conv2, Norm2, Conv3, Norm3, DownConv, DownNorm: TNNetLayer;
+    InChannels, MidChannels, OutChannels: integer;
+    Prefix: string;                       // 'encoder.stages.S.layers.L.'
+  end;
+
+  // The ViT DPT backbone: patch embeddings or (hybrid) the BiT ResNet and its
+  // 1x1 projection, the ViT blocks, and the readout projections.
+  TDPTViTLayers = record
+    PatchConv, PosEmb: TNNetLayer;
+    StemConv, StemNorm, Projection: TNNetLayer;
+    BitUnits: array of TBiTBottleneckLayers;
+    BitOutChannels: integer;
+    Blocks: TClipBlockLayersArray;
+    Readout: array[0..3] of TNNetLayer;
+  end;
+
+const
+  // WeightStandardizedConv2d eps of every BiT conv; BitGroupNormActivation eps.
+  csBiTWeightStandardizationEps: double = 1e-8;
+  csBiTGroupNormEps = 1e-5;
+
+// True for the Depth Anything layout (DINOv2 backbone, head.conv1..3, head
+// upsample to the input size); else transformers' DPTDepthEstimationHead.
+function DPTHasDepthAnythingHead(const Config: TDPTConfig): boolean;
+begin
+  Result := Config.Backbone.ModelType = 'dinov2';
+end;
+
+// Loads a biased patch conv: Name.weight [Hidden, Channels, Patch, Patch] and
+// Name.bias.
+procedure LoadDPTBiasedPatchConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Name: string; NumChannels, Patch, Hidden: integer);
+var
+  Bias: TNNetVolume;
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  LoadClipPatchConv(Reader, Layer, Name + '.weight', NumChannels, Patch, Hidden);
+  Bias := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name + '.bias', Bias);
+    if Bias.Size <> Hidden then
+      ImportError('DPT import: "' + Name + '.bias" must have ' +
+        IntToStr(Hidden) + ' elements.');
+    MaxNeuronPos := Hidden - 1;
+    for NeuronPos := 0 to MaxNeuronPos do
+      Layer.FArrNeurons[NeuronPos].BiasWeight := Bias.FData[NeuronPos];
+    Layer.FlushWeightCache();
+  finally
+    Bias.Free;
+  end;
+end;
+
+// Loads Pfx position_embeddings into PosEmb and folds Pfx cls_token into row 0
+// (the cls slot the builders leave at zero).
+procedure LoadDPTPositionTable(Reader: TNNetSafeTensorsReader;
+  PosEmb: TNNetLayer; const Pfx: string; TokenCount, Hidden: integer);
+var
+  Table: TNNetVolume;
+begin
+  Table := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Pfx + 'position_embeddings', Table);
+    if Table.Size <> TokenCount * Hidden then
+      ImportError('DPT import: position_embeddings size mismatch (native ' +
+        'resolution only).');
+    PosEmb.FArrNeurons[0].Weights.Copy(Table);
+    Reader.LoadTensorFlat(Pfx + 'cls_token', Table);
+    if Table.Size <> Hidden then
+      ImportError('DPT import: cls_token must have ' + IntToStr(Hidden) +
+        ' elements.');
+    TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+      Table.GetRawPtr(0), Hidden);
+    PosEmb.FlushWeightCache();
+  finally
+    Table.Free;
+  end;
+end;
+
+// transformers BiT make_div: Value rounded to a multiple of 8 (at least 8),
+// plus 8 when the rounding lost more than 10%.
+function BiTMakeDivisible(Value: double): integer;
+begin
+  Result := Max(8, (Trunc(Value + 4) div 8) * 8);
+  if Result < 0.9 * Value then Inc(Result, 8);
+end;
+
+// TF "SAME" zero padding of BiT (static or DynamicPad2d) after Source: each axis
+// gets Max((Ceil(In/Stride)-1)*Stride + Kernel - In, 0), the odd pixel on the far side.
+function AddBiTSamePadding(NN: TNNet; Source: TNNetLayer;
+  KernelSize, Stride: integer): TNNetLayer;
+var
+  InX, InY, PadX, PadY, FarX, FarY: integer;
+begin
+  Result := Source;
+  InX := Source.Output.SizeX;
+  InY := Source.Output.SizeY;
+  PadX := Max(((InX + Stride - 1) div Stride - 1) * Stride + KernelSize - InX, 0);
+  PadY := Max(((InY + Stride - 1) div Stride - 1) * Stride + KernelSize - InY, 0);
+  if (PadX = 0) and (PadY = 0) then Exit;
+  FarX := PadX - PadX div 2;
+  FarY := PadY - PadY div 2;
+  Result := NN.AddLayerAfter(TNNetPadXY.Create(FarX, FarY), Source);
+  if (FarX <> PadX div 2) or (FarY <> PadY div 2) then
+    Result := NN.AddLayer(TNNetCrop.Create(FarX - PadX div 2,
+      FarY - PadY div 2, InX + PadX, InY + PadY));
+end;
+
+// A bias-free BiT conv after its SAME padding; LoadBiTStandardizedConv fills it.
+function AddBiTConv(NN: TNNet; Source: TNNetLayer; OutChannels, KernelSize,
+  Stride: integer; pTrainable: boolean): TNNetLayer;
+begin
+  Source := AddBiTSamePadding(NN, Source, KernelSize, Stride);
+  if (KernelSize = 1) and (Stride = 1) then
+    Result := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(OutChannels,
+      {pSuppressBias=}1).SetTrainable(pTrainable), Source)
+  else
+    Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutChannels,
+      KernelSize, 0, Stride, {pSuppressBias=}1).SetTrainable(pTrainable), Source);
+end;
+
+// BitGroupNormActivation: GroupNorm, then ReLU when WithActivation.
+function AddBiTGroupNorm(NN: TNNet; const Bit: TBiTConfig;
+  WithActivation, pTrainable: boolean): TNNetLayer;
+begin
+  Result := NN.AddLayer(CreateGroupNorm(Bit.NumGroups,
+    csBiTGroupNormEps).SetTrainable(pTrainable));
+  if WithActivation then NN.AddLayer(TNNetReLU.Create());
+end;
+
+// transformers BitBottleneckLayer on NN's last layer: 1x1 -> 3x3 (Stride) ->
+// 1x1 with GroupNorms, the 1x1 shortcut conv when HasDownsample, ReLU(sum).
+procedure AddBiTBottleneck(NN: TNNet; const Bit: TBiTConfig; Stride: integer;
+  HasDownsample, pTrainable: boolean; var Units: TBiTBottleneckLayers);
+var
+  UnitInput, Shortcut: TNNetLayer;
+begin
+  UnitInput := NN.GetLastLayer();
+  Shortcut := UnitInput;
+  Units.DownConv := nil;
+  Units.DownNorm := nil;
+  if HasDownsample then
+  begin
+    Units.DownConv := AddBiTConv(NN, UnitInput, Units.OutChannels, 1, Stride,
+      pTrainable);
+    Units.DownNorm := AddBiTGroupNorm(NN, Bit, false, pTrainable);
+    Shortcut := Units.DownNorm;
+  end;
+  Units.Conv1 := AddBiTConv(NN, UnitInput, Units.MidChannels, 1, 1, pTrainable);
+  Units.Norm1 := AddBiTGroupNorm(NN, Bit, true, pTrainable);
+  Units.Conv2 := AddBiTConv(NN, NN.GetLastLayer(), Units.MidChannels, 3, Stride,
+    pTrainable);
+  Units.Norm2 := AddBiTGroupNorm(NN, Bit, true, pTrainable);
+  Units.Conv3 := AddBiTConv(NN, NN.GetLastLayer(), Units.OutChannels, 1, 1,
+    pTrainable);
+  Units.Norm3 := AddBiTGroupNorm(NN, Bit, false, pTrainable);
+  NN.AddLayer(TNNetSum.Create([Units.Norm3, Shortcut]));
+  NN.AddLayer(TNNetReLU.Create());
+end;
+
+// The BiT stem and its three stages on NN's last layer (the DPT-Hybrid
+// backbone); StageOut[k] is stage k's output.
+procedure AddDPTBiTBackbone(NN: TNNet; const Bit: TBiTConfig;
+  pTrainable: boolean; var Layers: TDPTViTLayers;
+  var StageOut: array of TNNetLayer);
+var
+  StagePos, UnitPos, UnitCount, Stride, CurrentStride, InChannels,
+    OutChannels, PaddedX, PaddedY, PooledX, PooledY: integer;
+  Cur: TNNetLayer;
+begin
+  if (LowerCase(Bit.LayerType) <> 'bottleneck') or
+    (Bit.GlobalPadding <> 'SAME') or (LowerCase(Bit.HiddenAct) <> 'relu') then
+    ImportError('DPT import: the BiT backbone must be layer_type ' +
+      '"bottleneck", global_padding "SAME" and hidden_act "relu".');
+  if (Length(Bit.Depths) <> 3) or (Length(Bit.HiddenSizes) < 3) then
+    ImportError('DPT import: the hybrid BiT backbone needs 3 stages, got ' +
+      IntToStr(Length(Bit.Depths)) + '.');
+  Layers.StemConv := AddBiTConv(NN, NN.GetLastLayer(), Bit.EmbeddingSize, 7, 2,
+    pTrainable);
+  Layers.StemNorm := AddBiTGroupNorm(NN, Bit, true, pTrainable);
+  // BitMaxPool2d(3, 2): CAI pools Ceil(In/2) clipped windows, so the extra
+  // window past torch's Floor((In-3)/2)+1 is cropped.
+  Cur := NN.GetLastLayer();
+  if Bit.EmbeddingDynamicPadding then Cur := AddBiTSamePadding(NN, Cur, 3, 2);
+  PaddedX := Cur.Output.SizeX;
+  PaddedY := Cur.Output.SizeY;
+  Cur := NN.AddLayerAfter(TNNetMaxPool.Create(3, 2), Cur);
+  PooledX := (PaddedX - 3) div 2 + 1;
+  PooledY := (PaddedY - 3) div 2 + 1;
+  if (Cur.Output.SizeX <> PooledX) or (Cur.Output.SizeY <> PooledY) then
+    NN.AddLayer(TNNetCrop.Create(0, 0, PooledX, PooledY));
+  UnitCount := Bit.Depths[0] + Bit.Depths[1] + Bit.Depths[2];
+  SetLength(Layers.BitUnits, UnitCount);
+  UnitCount := 0;
+  InChannels := Bit.EmbeddingSize;
+  OutChannels := InChannels;
+  CurrentStride := 4;
+  for StagePos := 0 to 2 do
+  begin
+    OutChannels := BiTMakeDivisible(Bit.HiddenSizes[StagePos] * Bit.WidthFactor);
+    if StagePos = 0 then Stride := 1 else Stride := 2;
+    if CurrentStride >= Bit.OutputStride then
+      ImportError('DPT import: BiT output_stride ' +
+        IntToStr(Bit.OutputStride) + ' needs dilated stages (not supported).');
+    for UnitPos := 0 to Bit.Depths[StagePos] - 1 do
+    begin
+      Layers.BitUnits[UnitCount].InChannels := InChannels;
+      Layers.BitUnits[UnitCount].OutChannels := OutChannels;
+      Layers.BitUnits[UnitCount].MidChannels :=
+        BiTMakeDivisible(OutChannels * 0.25);
+      Layers.BitUnits[UnitCount].Prefix := 'encoder.stages.' +
+        IntToStr(StagePos) + '.layers.' + IntToStr(UnitPos) + '.';
+      if UnitPos = 0 then
+        AddBiTBottleneck(NN, Bit, Stride, true, pTrainable,
+          Layers.BitUnits[UnitCount])
+      else
+        AddBiTBottleneck(NN, Bit, 1, false, pTrainable,
+          Layers.BitUnits[UnitCount]);
+      InChannels := OutChannels;
+      Inc(UnitCount);
+    end;
+    CurrentStride := CurrentStride * Stride;
+    StageOut[StagePos] := NN.GetLastLayer();
+  end;
+  Layers.BitOutChannels := OutChannels;
+end;
+
+// Loads a bias-free BiT conv and standardizes each filter as
+// WeightStandardizedConv2d does (biased variance), in double.
+procedure LoadBiTStandardizedConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; OutCh, InCh, K: integer);
+var
+  Filter: TNNetVolume;
+  NeuronPos, MaxNeuronPos, WeightPos, MaxWeightPos: integer;
+  Mean, Variance, Diff, InvStd: double;
+begin
+  LoadDPTConvNoBias(Reader, Layer, WName, OutCh, InCh, K);
+  MaxNeuronPos := Layer.Neurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+  begin
+    Filter := Layer.FArrNeurons[NeuronPos].Weights;
+    MaxWeightPos := Filter.Size - 1;
+    Mean := 0;
+    for WeightPos := 0 to MaxWeightPos do Mean := Mean + Filter.FData[WeightPos];
+    Mean := Mean / Filter.Size;
+    Variance := 0;
+    for WeightPos := 0 to MaxWeightPos do
+    begin
+      Diff := Filter.FData[WeightPos] - Mean;
+      Variance := Variance + Diff * Diff;
+    end;
+    InvStd := 1 / Sqrt(Variance / Filter.Size + csBiTWeightStandardizationEps);
+    for WeightPos := 0 to MaxWeightPos do
+      Filter.FData[WeightPos] := (Filter.FData[WeightPos] - Mean) * InvStd;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the BiT stem and units under Pfx ('dpt.embeddings.backbone.bit.').
+procedure LoadBiTBackboneWeights(Reader: TNNetSafeTensorsReader;
+  const Bit: TBiTConfig; const Layers: TDPTViTLayers; const Pfx: string);
+var
+  UnitPos, MaxUnitPos: integer;
+  UnitPfx: string;
+begin
+  LoadBiTStandardizedConv(Reader, Layers.StemConv,
+    Pfx + 'embedder.convolution.weight', Bit.EmbeddingSize, Bit.NumChannels, 7);
+  LoadVaeGroupNorm(Reader, Layers.StemNorm, Pfx + 'embedder.norm',
+    Bit.EmbeddingSize, csBiTGroupNormEps);
+  MaxUnitPos := Length(Layers.BitUnits) - 1;
+  for UnitPos := 0 to MaxUnitPos do
+  begin
+    UnitPfx := Pfx + Layers.BitUnits[UnitPos].Prefix;
+    if Assigned(Layers.BitUnits[UnitPos].DownConv) then
+    begin
+      LoadBiTStandardizedConv(Reader, Layers.BitUnits[UnitPos].DownConv,
+        UnitPfx + 'downsample.conv.weight', Layers.BitUnits[UnitPos].OutChannels,
+        Layers.BitUnits[UnitPos].InChannels, 1);
+      LoadVaeGroupNorm(Reader, Layers.BitUnits[UnitPos].DownNorm,
+        UnitPfx + 'downsample.norm', Layers.BitUnits[UnitPos].OutChannels,
+        csBiTGroupNormEps);
+    end;
+    LoadBiTStandardizedConv(Reader, Layers.BitUnits[UnitPos].Conv1,
+      UnitPfx + 'conv1.weight', Layers.BitUnits[UnitPos].MidChannels,
+      Layers.BitUnits[UnitPos].InChannels, 1);
+    LoadVaeGroupNorm(Reader, Layers.BitUnits[UnitPos].Norm1, UnitPfx + 'norm1',
+      Layers.BitUnits[UnitPos].MidChannels, csBiTGroupNormEps);
+    LoadBiTStandardizedConv(Reader, Layers.BitUnits[UnitPos].Conv2,
+      UnitPfx + 'conv2.weight', Layers.BitUnits[UnitPos].MidChannels,
+      Layers.BitUnits[UnitPos].MidChannels, 3);
+    LoadVaeGroupNorm(Reader, Layers.BitUnits[UnitPos].Norm2, UnitPfx + 'norm2',
+      Layers.BitUnits[UnitPos].MidChannels, csBiTGroupNormEps);
+    LoadBiTStandardizedConv(Reader, Layers.BitUnits[UnitPos].Conv3,
+      UnitPfx + 'conv3.weight', Layers.BitUnits[UnitPos].OutChannels,
+      Layers.BitUnits[UnitPos].MidChannels, 1);
+    LoadVaeGroupNorm(Reader, Layers.BitUnits[UnitPos].Norm3, UnitPfx + 'norm3',
+      Layers.BitUnits[UnitPos].OutChannels, csBiTGroupNormEps);
+  end;
+end;
+
+// The DINOv2 backbone of the Depth Anything layout on NN's input; StageMaps[k]
+// is hook k after the shared final LayerNorm, without the cls row, as a grid.
+procedure AddDPTDINOv2Backbone(NN: TNNet; const Config: TDPTConfig;
+  pTrainable: boolean; var Layers: TDPTDINOv2Layers;
+  var StageMaps: array of TNNetLayer);
+var
+  Bk: TDINOv2Config;
+  BlockOut: array of TNNetLayer;
+  Grid, NumPatches, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
 begin
   Bk := Config.Backbone;
-  d := Bk.HiddenSize;
-  if Config.ReassembleHiddenSize <> d then
-    ImportError('DPT import: reassemble_hidden_size=' +
-      IntToStr(Config.ReassembleHiddenSize) +
-      ' must equal backbone hidden_size=' + IntToStr(d) + '.');
-  if (Bk.NumHeads < 1) or ((d mod Bk.NumHeads) <> 0) then
-    ImportError('DPT import: hidden_size not divisible by num_attention_heads.');
-  if (Bk.PatchSize < 1) or ((Bk.ImageSize mod Bk.PatchSize) <> 0) then
-    ImportError('DPT import: image_size not a multiple of patch_size.');
-  if Bk.UseSwiGLUFFN then
-    ImportError('DPT import: use_swiglu_ffn backbone not supported.');
-  if Bk.NumRegisterTokens > 0 then
-    ImportError('DPT import: register-token backbone not supported.');
-  if Bk.NumLayers < 4 then
-    ImportError('DPT import: backbone needs >= 4 layers (4 hooked stages).');
-  if (LowerCase(Config.DepthEstimationType) <> 'relative') and
-     (LowerCase(Config.DepthEstimationType) <> 'metric') then
-    ImportError('DPT import: depth_estimation_type "' +
-      Config.DepthEstimationType + '" unsupported.');
+  Hidden := Bk.HiddenSize;
   Grid := Bk.ImageSize div Bk.PatchSize;
   NumPatches := Grid * Grid;
-  NumLayersM1 := Bk.NumLayers - 1;
-  dM1 := d - 1;
-  Fus := Config.FusionHiddenSize;
-  // reassemble grids per level.
-  for i := 0 to 3 do
+  Layers.PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+    Hidden, Bk.PatchSize, 0, Bk.PatchSize, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReshape.Create(NumPatches, 1, Hidden));
+  NN.AddLayer(TNNetPadXY.Create(1, 0));
+  NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
+  Layers.PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(
+    NumPatches + 1).SetTrainable(pTrainable));
+  if not pTrainable then NN.SetTrainable();
+  SetLength(Layers.Blocks, Bk.NumLayers);
+  SetLength(BlockOut, Bk.NumLayers);
+  // Every block continues from the previous block's sequence output; the hooks
+  // are side branches added afterwards.
+  MaxBlockPos := Bk.NumLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
   begin
-    Fac := Config.ReassembleFactors[i];
-    if Fac >= 1 then
+    AddDINOv2EncoderBlock(NN, Bk, Layers.Blocks[BlockPos], pTrainable);
+    BlockOut[BlockPos] := NN.GetLastLayer();
+  end;
+  for StagePos := 0 to 3 do
+  begin
+    // out_indices stageK = block K-1; HF applies the SHARED final LayerNorm.
+    Layers.StageLN[StagePos] := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetTrainable(pTrainable),
+      BlockOut[Config.OutIndices[StagePos] - 1]);
+    NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
+    StageMaps[StagePos] := NN.AddLayer(TNNetReshape.Create(Grid, Grid, Hidden));
+  end;
+end;
+
+procedure LoadDPTDINOv2BackboneWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; const Layers: TDPTDINOv2Layers);
+var
+  Bk: TDINOv2Config;
+  Pfx: string;
+  Grid, BlockPos, MaxBlockPos, StagePos: integer;
+begin
+  Bk := Config.Backbone;
+  Grid := Bk.ImageSize div Bk.PatchSize;
+  if Reader.HasTensor('backbone.embeddings.cls_token') then Pfx := 'backbone.'
+  else if Reader.HasTensor('dinov2.embeddings.cls_token') then Pfx := 'dinov2.'
+  else Pfx := '';
+  LoadDPTBiasedPatchConv(Reader, Layers.PatchConv,
+    Pfx + 'embeddings.patch_embeddings.projection', Bk.NumChannels,
+    Bk.PatchSize, Bk.HiddenSize);
+  LoadDPTPositionTable(Reader, Layers.PosEmb, Pfx + 'embeddings.',
+    Grid * Grid + 1, Bk.HiddenSize);
+  MaxBlockPos := Bk.NumLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
+    LoadDINOv2EncoderBlockWeights(Reader, Layers.Blocks[BlockPos],
+      Pfx + 'encoder.layer.' + IntToStr(BlockPos) + '.', Bk);
+  for StagePos := 0 to 3 do
+    LoadLayerNormWeights(Reader, Layers.StageLN[StagePos],
+      Pfx + 'layernorm.weight', Pfx + 'layernorm.bias', Bk.HiddenSize);
+end;
+
+// The encoder tower shape of a ViT DPT backbone.
+function DPTViTTower(const Bk: TDINOv2Config): TClipTowerConfig;
+begin
+  Result.HiddenSize := Bk.HiddenSize;
+  Result.IntermediateSize := Bk.IntermediateSize;
+  Result.NumLayers := Bk.NumLayers;
+  Result.NumHeads := Bk.NumHeads;
+  Result.LayerNormEps := Bk.LayerNormEps;
+  Result.HiddenAct := Bk.HiddenAct;
+end;
+
+// The ViT DPT backbone on NN's input: patch embeddings or (hybrid) the BiT
+// ResNet + 1x1 projection, then the encoder; StageMaps[k] is neck input k.
+procedure AddDPTViTBackbone(NN: TNNet; const Config: TDPTConfig;
+  pTrainable: boolean; var Layers: TDPTViTLayers;
+  var StageMaps: array of TNNetLayer);
+var
+  Bk: TDINOv2Config;
+  BitStageOut: array[0..2] of TNNetLayer;
+  BlockOut: array of TNNetLayer;
+  Grid, NumPatches, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
+  Hook, Tokens, ClsMap: TNNetLayer;
+begin
+  Bk := Config.Backbone;
+  Hidden := Bk.HiddenSize;
+  Grid := Bk.ImageSize div Bk.PatchSize;
+  NumPatches := Grid * Grid;
+  Layers.PatchConv := nil;
+  Layers.Projection := nil;
+  if Config.IsHybrid then
+  begin
+    AddDPTBiTBackbone(NN, Config.Bit, pTrainable, Layers, BitStageOut);
+    if (BitStageOut[2].Output.SizeX <> Grid) or
+      (BitStageOut[2].Output.SizeY <> Grid) then
+      ImportError('DPT import: the BiT stage-3 map is ' +
+        IntToStr(BitStageOut[2].Output.SizeX) + 'x' +
+        IntToStr(BitStageOut[2].Output.SizeY) + '; the position table needs ' +
+        IntToStr(Grid) + 'x' + IntToStr(Grid) + ' (image_size / patch_size).');
+    Layers.Projection := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
+  end
+  else
+    Layers.PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Hidden, Bk.PatchSize, 0, Bk.PatchSize, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReshape.Create(NumPatches, 1, Hidden));
+  NN.AddLayer(TNNetPadXY.Create(1, 0));
+  NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
+  Layers.PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(
+    NumPatches + 1).SetTrainable(pTrainable));
+  if not pTrainable then NN.SetTrainable();
+  SetLength(Layers.Blocks, Bk.NumLayers);
+  SetLength(BlockOut, Bk.NumLayers);
+  MaxBlockPos := Bk.NumLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    AddClipEncoderBlock(NN, DPTViTTower(Bk), {CausalMask=}false,
+      Layers.Blocks[BlockPos], pTrainable);
+    BlockOut[BlockPos] := NN.GetLastLayer();
+  end;
+  for StagePos := 0 to 3 do
+  begin
+    Layers.Readout[StagePos] := nil;
+    if Config.NeckIgnoreStages[StagePos] then
     begin
-      GW[i] := Round(Grid * Fac); GH[i] := Round(Grid * Fac);
+      StageMaps[StagePos] := BitStageOut[StagePos];
+      continue;
+    end;
+    // The hooked block output, without the final LayerNorm.
+    Hook := BlockOut[Config.OutIndices[StagePos] - 1];
+    NN.AddLayerAfter(TNNetCrop.Create(1, 0, NumPatches, 1), Hook);
+    Tokens := NN.AddLayer(TNNetReshape.Create(Grid, Grid, Hidden));
+    if Config.ReadoutType <> 'ignore' then
+    begin
+      // The cls row, repeated over the grid.
+      NN.AddLayerAfter(TNNetCrop.Create(0, 0, 1, 1), Hook);
+      ClsMap := NN.AddLayer(TNNetBilinearResize.Create(Grid, Grid, 0));
+      if Config.ReadoutType = 'add' then
+        NN.AddLayer(TNNetSum.Create([Tokens, ClsMap]))
+      else
+      begin
+        // readout "project": Linear(cat(token, cls)) + hidden_act.
+        NN.AddLayer(TNNetDeepConcat.Create([Tokens, ClsMap]));
+        Layers.Readout[StagePos] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
+        AddClipHiddenAct(NN, Bk.HiddenAct);
+      end;
+    end;
+    StageMaps[StagePos] := NN.GetLastLayer();
+  end;
+  if not pTrainable then NN.SetTrainable();
+end;
+
+procedure LoadDPTViTBackboneWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; const Layers: TDPTViTLayers);
+var
+  Bk: TDINOv2Config;
+  Pfx, ReadoutName: string;
+  Grid, Hidden, BlockPos, MaxBlockPos, StagePos: integer;
+begin
+  Bk := Config.Backbone;
+  Hidden := Bk.HiddenSize;
+  Grid := Bk.ImageSize div Bk.PatchSize;
+  if Reader.HasTensor('dpt.embeddings.cls_token') then Pfx := 'dpt.'
+  else Pfx := '';
+  if Config.IsHybrid then
+  begin
+    LoadBiTBackboneWeights(Reader, Config.Bit, Layers,
+      Pfx + 'embeddings.backbone.bit.');
+    LoadSegformer1x1(Reader, Layers.Projection,
+      Pfx + 'embeddings.projection.weight', Hidden, Layers.BitOutChannels,
+      Pfx + 'embeddings.projection.bias');
+  end
+  else
+    LoadDPTBiasedPatchConv(Reader, Layers.PatchConv,
+      Pfx + 'embeddings.patch_embeddings.projection', Bk.NumChannels,
+      Bk.PatchSize, Hidden);
+  LoadDPTPositionTable(Reader, Layers.PosEmb, Pfx + 'embeddings.',
+    Grid * Grid + 1, Hidden);
+  MaxBlockPos := Bk.NumLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
+    LoadViTEncoderBlockWeights(Reader, Layers.Blocks[BlockPos],
+      Pfx + 'encoder.layer.' + IntToStr(BlockPos) + '.', DPTViTTower(Bk));
+  for StagePos := 0 to 3 do
+    if Assigned(Layers.Readout[StagePos]) then
+    begin
+      ReadoutName := 'neck.reassemble_stage.readout_projects.' +
+        IntToStr(StagePos) + '.0.';
+      LoadSegformer1x1(Reader, Layers.Readout[StagePos],
+        ReadoutName + 'weight', Hidden, 2 * Hidden, ReadoutName + 'bias');
+    end;
+end;
+
+// Appends the DPT neck and depth head to the four neck inputs: reassemble
+// (unless in neck_ignore_stages), the 3x3 neck convs, the fusion and the head.
+procedure AddDPTNeckAndHead(NN: TNNet; const Config: TDPTConfig;
+  const StageMaps: array of TNNetLayer; pTrainable: boolean;
+  var Neck: TDPTNeckLayers);
+var
+  Reassembled: array[0..3] of TNNetLayer;
+  Cur, Residual: TNNetLayer;
+  StagePos, FusionPos, K, Fus, TargetX, TargetY: integer;
+  Fac: double;
+  IsDepthAnything: boolean;
+begin
+  IsDepthAnything := DPTHasDepthAnythingHead(Config);
+  Fus := Config.FusionHiddenSize;
+  // ---------------- reassemble stage + neck convs ------------------------
+  for StagePos := 0 to 3 do
+  begin
+    Neck.Proj[StagePos] := nil;
+    Neck.ResizeUp[StagePos] := nil;
+    Neck.ResizeDown[StagePos] := nil;
+    Cur := StageMaps[StagePos];
+    if Config.NeckIgnoreStages[StagePos] then
+    begin
+      if Cur.Output.Depth <> Config.NeckHiddenSizes[StagePos] then
+        ImportError('DPT import: neck input ' + IntToStr(StagePos) + ' has ' +
+          IntToStr(Cur.Output.Depth) + ' channels, neck_hidden_sizes says ' +
+          IntToStr(Config.NeckHiddenSizes[StagePos]) + '.');
     end
     else
     begin
-      GW[i] := Round(Grid / Round(1 / Fac)); GH[i] := GW[i];
-    end;
-  end;
-  NN := TNNet.Create();
-  try
-    // ---------------- DINOv2 backbone (tapped at all 4 hooked stages) -------
-    NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
-    PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      d, Bk.PatchSize, 0, Bk.PatchSize, 0).SetTrainable(pTrainable));
-    NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
-    NN.AddLayer(TNNetPadXY.Create(1, 0));
-    NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
-    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable));
-    if not pTrainable then NN.SetTrainable();
-    SetLength(Blocks, Bk.NumLayers);
-    SetLength(BlockOut, Bk.NumLayers);
-    // Build every encoder block first (each continues from the previous block's
-    // SEQUENCE output), recording the block output layers; the hooks are added
-    // afterwards as SIDE BRANCHES so they don't redirect the encoder backbone.
-    for BlockCnt := 0 to NumLayersM1 do
-    begin
-      AddDINOv2EncoderBlock(NN, Bk, Blocks[BlockCnt], pTrainable);
-      BlockOut[BlockCnt] := NN.GetLastLayer();
-    end;
-    // Hook the last 4 blocks (out_features stage_{N-3..N}): shared final
-    // LayerNorm on the hooked sequence, drop the CLS row, reshape to (Grid,Grid).
-    for i := 0 to 3 do
-    begin
-      // tap the encoder block selected by out_indices (1-based stageK = block
-      // K-1); HF applies the SHARED final LayerNorm to each hooked stage.
-      StageLN[i] := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetTrainable(pTrainable),
-        BlockOut[Config.OutIndices[i] - 1]);
-      // drop the CLS row (sequence index 0 along X), keep patch rows 1..N.
-      NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
-      Reassembled[i] := NN.AddLayer(TNNetReshape.Create(Grid, Grid, d));
-    end;
-    // ---------------- reassemble stage -------------------------------------
-    for i := 0 to 3 do
-    begin
-      Fac := Config.ReassembleFactors[i];
+      Fac := Config.ReassembleFactors[StagePos];
       // 1x1 projection backbone-hidden -> neck_hidden_sizes[i] (biased).
-      Proj[i] := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]).SetTrainable(pTrainable),
-        Reassembled[i]);
-      ResizeUp[i] := nil; ResizeDown[i] := nil;
+      Neck.Proj[StagePos] := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+        Config.NeckHiddenSizes[StagePos]).SetTrainable(pTrainable), Cur);
       if Fac > 1 then
       begin
         K := Round(Fac);
         // ConvTranspose kernel=stride=K -> pointwise(K*K*neck) + PixelShuffle(K).
-        ResizeUp[i] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
-          K * K * Config.NeckHiddenSizes[i]).SetTrainable(pTrainable));
+        Neck.ResizeUp[StagePos] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
+          K * K * Config.NeckHiddenSizes[StagePos]).SetTrainable(pTrainable));
         NN.AddLayer(TNNetPixelShuffle.Create(K));
       end
       else if Fac < 1 then
       begin
         // 3x3 stride-2 pad-1 downsample (explicit pad to dodge kernel clamp).
         NN.AddLayer(TNNetPadXY.Create(1, 1));
-        ResizeDown[i] := NN.AddLayer(TNNetConvolutionLinear.Create(
-          Config.NeckHiddenSizes[i], 3, 0, Round(1 / Fac), 0));
+        Neck.ResizeDown[StagePos] := NN.AddLayer(TNNetConvolutionLinear.Create(
+          Config.NeckHiddenSizes[StagePos], 3, 0, Round(1 / Fac), 0));
       end;
-      // neck 3x3 pad-1 bias-free conv -> fusion_hidden.
-      NN.AddLayer(TNNetPadXY.Create(1, 1));
-      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0).SetTrainable(pTrainable));
-      Reassembled[i] := NN.GetLastLayer();
+      Cur := NN.GetLastLayer();
     end;
-    // ---------------- fusion stage (reversed: coarse -> fine) --------------
-    // levels reversed: idx 0 = level 3 (coarsest, GW[3]) .. idx 3 = level 0.
-    Cur := nil;
-    for i := 0 to 3 do
+    // neck 3x3 pad-1 bias-free conv -> fusion_hidden.
+    NN.AddLayerAfter(TNNetPadXY.Create(1, 1), Cur);
+    Neck.NeckConv[StagePos] := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Fus, 3, 0, 1, 0).SetTrainable(pTrainable));
+    Reassembled[StagePos] := Neck.NeckConv[StagePos];
+  end;
+  // ---------------- fusion stage (coarse -> fine) ------------------------
+  // FusionPos 0 starts from the coarsest level 3; the fused map is upsampled at
+  // the end of each step to the next finer level's grid (2x for the last).
+  Cur := nil;
+  for FusionPos := 0 to 3 do
+  begin
+    Residual := Reassembled[3 - FusionPos];
+    NN.AddLayerAfter(TNNetIdentity.Create(), Residual);
+    if FusionPos > 0 then
     begin
-      Residual := Reassembled[3 - i];  // level (3-i): 3,2,1,0
-      if i = 0 then
-      begin
-        // start from the coarsest feature directly.
-        NN.AddLayerAfter(TNNetIdentity.Create(), Residual);
-        Cur := NN.GetLastLayer();
-      end
-      else
-      begin
-        // fused so far is at the PREVIOUS (coarser) grid; the current residual
-        // is at this (finer) grid. residual_layer1 refines the residual then it
-        // is added to the (already up-sampled) fused state. Here fused was
-        // up-sampled at the END of the previous iteration to THIS grid, so the
-        // shapes match and no residual interpolate is needed.
-        NN.AddLayerAfter(TNNetIdentity.Create(), Residual);
-        AddDPTResidualUnit(NN, Fus, Fusion[i].Res1);
-        NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Cur]));
-        Cur := NN.GetLastLayer();
-      end;
-      // residual_layer2 refine.
-      AddDPTResidualUnit(NN, Fus, Fusion[i].Res2);
-      Cur := NN.GetLastLayer();
-      // upsample (align_corners=True): to next finer level's grid, or x2 for the
-      // last layer (idx 3 -> 2x the finest reassemble grid).
-      if i < 3 then
-      begin
-        TargetW := GW[3 - (i + 1)]; TargetH := GH[3 - (i + 1)];
-      end
-      else
-      begin
-        TargetW := Cur.Output.SizeX * 2; TargetH := Cur.Output.SizeY * 2;
-      end;
-      NN.AddLayer(TNNetBilinearResize.Create(TargetW, TargetH, 1));
-      // 1x1 projection (biased).
-      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus).SetTrainable(pTrainable));
-      Cur := NN.GetLastLayer();
+      AddDPTResidualUnit(NN, Fus, Neck.Fusion[FusionPos].Res1);
+      NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Cur]));
     end;
-    // ---------------- depth head -------------------------------------------
-    // conv1 3x3 pad1 (fusion -> fusion/2, biased).
-    NN.AddLayer(TNNetPadXY.Create(1, 1));
-    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0).SetTrainable(pTrainable));
-    // bilinear upsample to (Grid*patch, Grid*patch) = input resolution (a-c True).
-    NN.AddLayer(TNNetBilinearResize.Create(
-      Grid * Bk.PatchSize, Grid * Bk.PatchSize, 1));
-    // conv2 3x3 pad1 (fusion/2 -> head_hidden, biased) -> ReLU.
-    NN.AddLayer(TNNetPadXY.Create(1, 1));
-    HeadConv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadHiddenSize, 3, 0, 1, 0).SetTrainable(pTrainable));
-    NN.AddLayer(TNNetReLU.Create());
-    // conv3 1x1 (head_hidden -> 1, biased).
-    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1).SetTrainable(pTrainable));
-    // relative -> ReLU; metric -> Sigmoid (then * max_depth folded as a mul).
-    if LowerCase(Config.DepthEstimationType) = 'metric' then
-      NN.AddLayer(TNNetSigmoid.Create())
+    AddDPTResidualUnit(NN, Fus, Neck.Fusion[FusionPos].Res2);
+    Cur := NN.GetLastLayer();
+    if FusionPos < 3 then
+    begin
+      TargetX := Reassembled[2 - FusionPos].Output.SizeX;
+      TargetY := Reassembled[2 - FusionPos].Output.SizeY;
+      // DPTFeatureFusionLayer upsamples by 2; a finer level of another size
+      // would be resized instead, which this builder does not do.
+      if (not IsDepthAnything) and ((TargetX <> 2 * Cur.Output.SizeX) or
+        (TargetY <> 2 * Cur.Output.SizeY)) then
+        ImportError('DPT import: neck level ' + IntToStr(2 - FusionPos) +
+          ' is ' + IntToStr(TargetX) + 'x' + IntToStr(TargetY) +
+          ', not twice the coarser ' + IntToStr(Cur.Output.SizeX) + 'x' +
+          IntToStr(Cur.Output.SizeY) + '.');
+    end
     else
-      NN.AddLayer(TNNetReLU.Create());
-    // HF scales the activated depth by max_depth (no-op for relative max_depth=1).
-    if Abs(Config.MaxDepth - 1) > 1e-12 then
-      NN.AddLayer(TNNetMulByConstant.Create(Config.MaxDepth));
-    if not pTrainable then NN.SetTrainable();
+    begin
+      TargetX := Cur.Output.SizeX * 2;
+      TargetY := Cur.Output.SizeY * 2;
+    end;
+    NN.AddLayer(TNNetBilinearResize.Create(TargetX, TargetY, 1));
+    Neck.Fusion[FusionPos].Projection := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Fus).SetTrainable(pTrainable));
+    Cur := NN.GetLastLayer();
+  end;
+  // ---------------- depth head -------------------------------------------
+  Neck.HeadProjection := nil;
+  if Config.AddProjection then
+  begin
+    NN.AddLayer(TNNetPadXY.Create(1, 1));
+    Neck.HeadProjection := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Fus, 3, 0, 1, 0).SetTrainable(pTrainable));
+    NN.AddLayer(TNNetReLU.Create());
+  end;
+  NN.AddLayer(TNNetPadXY.Create(1, 1));
+  Neck.HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(
+    Fus div 2, 3, 0, 1, 0).SetTrainable(pTrainable));
+  // Bilinear (align corners) to the input size (Depth Anything) or 2x (DPT).
+  if IsDepthAnything then
+  begin
+    TargetX := (Config.Backbone.ImageSize div Config.Backbone.PatchSize) *
+      Config.Backbone.PatchSize;
+    TargetY := TargetX;
+  end
+  else
+  begin
+    TargetX := Cur.Output.SizeX * 2;
+    TargetY := Cur.Output.SizeY * 2;
+  end;
+  NN.AddLayer(TNNetBilinearResize.Create(TargetX, TargetY, 1));
+  NN.AddLayer(TNNetPadXY.Create(1, 1));
+  Neck.HeadConv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
+    Config.HeadHiddenSize, 3, 0, 1, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReLU.Create());
+  Neck.HeadConv3 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(1).SetTrainable(pTrainable));
+  // relative -> ReLU; metric -> Sigmoid (then * max_depth folded as a mul).
+  if LowerCase(Config.DepthEstimationType) = 'metric' then
+    NN.AddLayer(TNNetSigmoid.Create())
+  else
+    NN.AddLayer(TNNetReLU.Create());
+  if Abs(Config.MaxDepth - 1) > 1e-12 then
+    NN.AddLayer(TNNetMulByConstant.Create(Config.MaxDepth));
+  if not pTrainable then NN.SetTrainable();
+end;
 
-    // ---------------- Weights ----------------------------------------------
-    if Reader.HasTensor('backbone.embeddings.cls_token') then Pfx := 'backbone.'
-    else if Reader.HasTensor('dinov2.embeddings.cls_token') then Pfx := 'dinov2.'
-    else Pfx := '';
-    BkPfx := Pfx;
-    LoadClipPatchConv(Reader, PatchConv,
-      Pfx + 'embeddings.patch_embeddings.projection.weight',
-      Bk.NumChannels, Bk.PatchSize, d);
-    Nm := Pfx + 'embeddings.patch_embeddings.projection.bias';
-    Tmp := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Nm, Tmp);
-      for ci := 0 to dM1 do PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
-      PatchConv.FlushWeightCache();
-    finally Tmp.Free; end;
-    Tmp := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Pfx + 'embeddings.position_embeddings', Tmp);
-      if Tmp.Size <> (NumPatches + 1) * d then
-        ImportError('DPT import: position_embeddings size mismatch (native ' +
-          'resolution only).');
-      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
-      Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
-      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
-        Tmp.GetRawPtr(0), d);
-      PosEmb.FlushWeightCache();
-    finally Tmp.Free; end;
-    for BlockCnt := 0 to NumLayersM1 do
-      LoadDINOv2EncoderBlockWeights(Reader, Blocks[BlockCnt],
-        Pfx + 'encoder.layer.' + IntToStr(BlockCnt) + '.', Bk);
-    for i := 0 to 3 do LoadSharedLN(StageLN[i]);
-    // reassemble projections + resize.
-    for i := 0 to 3 do
+procedure LoadDPTNeckAndHeadWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; const Neck: TDPTNeckLayers);
+var
+  StagePos, FusionPos, Fus, Hidden: integer;
+  Fac: double;
+  Nm, HeadConv1Name, HeadConv2Name, HeadConv3Name: string;
+begin
+  Fus := Config.FusionHiddenSize;
+  Hidden := Config.Backbone.HiddenSize;
+  for StagePos := 0 to 3 do
+  begin
+    Nm := 'neck.reassemble_stage.layers.' + IntToStr(StagePos) + '.';
+    if Assigned(Neck.Proj[StagePos]) then
     begin
-      Fac := Config.ReassembleFactors[i];
-      LoadSegformer1x1(Reader, Proj[i],
-        'neck.reassemble_stage.layers.' + IntToStr(i) + '.projection.weight',
-        Config.NeckHiddenSizes[i], d,
-        'neck.reassemble_stage.layers.' + IntToStr(i) + '.projection.bias');
+      Fac := Config.ReassembleFactors[StagePos];
+      LoadSegformer1x1(Reader, Neck.Proj[StagePos], Nm + 'projection.weight',
+        Config.NeckHiddenSizes[StagePos], Hidden, Nm + 'projection.bias');
       if Fac > 1 then
-      begin
-        K := Round(Fac);
-        LoadDPTTransposeResize(Reader, ResizeUp[i],
-          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.weight',
-          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.bias',
-          Config.NeckHiddenSizes[i], Config.NeckHiddenSizes[i], K);
-      end
+        LoadDPTTransposeResize(Reader, Neck.ResizeUp[StagePos],
+          Nm + 'resize.weight', Nm + 'resize.bias',
+          Config.NeckHiddenSizes[StagePos], Config.NeckHiddenSizes[StagePos],
+          Round(Fac))
       else if Fac < 1 then
-        LoadConvNeXtConv(Reader, ResizeDown[i],
-          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.weight',
-          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.bias',
-          Config.NeckHiddenSizes[i], Config.NeckHiddenSizes[i], 3);
-      LoadDPTConvNoBias(Reader, NeckConv[i],
-        'neck.convs.' + IntToStr(i) + '.weight',
-        Fus, Config.NeckHiddenSizes[i], 3);
+        LoadConvNeXtConv(Reader, Neck.ResizeDown[StagePos],
+          Nm + 'resize.weight', Nm + 'resize.bias',
+          Config.NeckHiddenSizes[StagePos], Config.NeckHiddenSizes[StagePos], 3);
     end;
-    // fusion stage weights.
-    for i := 0 to 3 do
+    LoadDPTConvNoBias(Reader, Neck.NeckConv[StagePos],
+      'neck.convs.' + IntToStr(StagePos) + '.weight',
+      Fus, Config.NeckHiddenSizes[StagePos], 3);
+  end;
+  for FusionPos := 0 to 3 do
+  begin
+    Nm := 'neck.fusion_stage.layers.' + IntToStr(FusionPos) + '.';
+    LoadSegformer1x1(Reader, Neck.Fusion[FusionPos].Projection,
+      Nm + 'projection.weight', Fus, Fus, Nm + 'projection.bias');
+    if FusionPos > 0 then
     begin
-      Nm := 'neck.fusion_stage.layers.' + IntToStr(i) + '.';
-      LoadSegformer1x1(Reader, Fusion[i].Projection, Nm + 'projection.weight',
-        Fus, Fus, Nm + 'projection.bias');
-      if i > 0 then
-      begin
-        LoadConvNeXtConv(Reader, Fusion[i].Res1.Conv1,
-          Nm + 'residual_layer1.convolution1.weight',
-          Nm + 'residual_layer1.convolution1.bias', Fus, Fus, 3);
-        LoadConvNeXtConv(Reader, Fusion[i].Res1.Conv2,
-          Nm + 'residual_layer1.convolution2.weight',
-          Nm + 'residual_layer1.convolution2.bias', Fus, Fus, 3);
-      end;
-      LoadConvNeXtConv(Reader, Fusion[i].Res2.Conv1,
-        Nm + 'residual_layer2.convolution1.weight',
-        Nm + 'residual_layer2.convolution1.bias', Fus, Fus, 3);
-      LoadConvNeXtConv(Reader, Fusion[i].Res2.Conv2,
-        Nm + 'residual_layer2.convolution2.weight',
-        Nm + 'residual_layer2.convolution2.bias', Fus, Fus, 3);
+      LoadConvNeXtConv(Reader, Neck.Fusion[FusionPos].Res1.Conv1,
+        Nm + 'residual_layer1.convolution1.weight',
+        Nm + 'residual_layer1.convolution1.bias', Fus, Fus, 3);
+      LoadConvNeXtConv(Reader, Neck.Fusion[FusionPos].Res1.Conv2,
+        Nm + 'residual_layer1.convolution2.weight',
+        Nm + 'residual_layer1.convolution2.bias', Fus, Fus, 3);
     end;
-    // depth head.
-    LoadConvNeXtConv(Reader, HeadConv1, 'head.conv1.weight', 'head.conv1.bias',
-      Fus div 2, Fus, 3);
-    LoadConvNeXtConv(Reader, HeadConv2, 'head.conv2.weight', 'head.conv2.bias',
-      Config.HeadHiddenSize, Fus div 2, 3);
-    LoadSegformer1x1(Reader, HeadConv3, 'head.conv3.weight', 1,
-      Config.HeadHiddenSize, 'head.conv3.bias');
+    LoadConvNeXtConv(Reader, Neck.Fusion[FusionPos].Res2.Conv1,
+      Nm + 'residual_layer2.convolution1.weight',
+      Nm + 'residual_layer2.convolution1.bias', Fus, Fus, 3);
+    LoadConvNeXtConv(Reader, Neck.Fusion[FusionPos].Res2.Conv2,
+      Nm + 'residual_layer2.convolution2.weight',
+      Nm + 'residual_layer2.convolution2.bias', Fus, Fus, 3);
+  end;
+  if DPTHasDepthAnythingHead(Config) then
+  begin
+    HeadConv1Name := 'head.conv1.';
+    HeadConv2Name := 'head.conv2.';
+    HeadConv3Name := 'head.conv3.';
+  end
+  else
+  begin
+    HeadConv1Name := 'head.head.0.';
+    HeadConv2Name := 'head.head.2.';
+    HeadConv3Name := 'head.head.4.';
+  end;
+  if Assigned(Neck.HeadProjection) then
+    LoadConvNeXtConv(Reader, Neck.HeadProjection, 'head.projection.weight',
+      'head.projection.bias', Fus, Fus, 3);
+  LoadConvNeXtConv(Reader, Neck.HeadConv1, HeadConv1Name + 'weight',
+    HeadConv1Name + 'bias', Fus div 2, Fus, 3);
+  LoadConvNeXtConv(Reader, Neck.HeadConv2, HeadConv2Name + 'weight',
+    HeadConv2Name + 'bias', Config.HeadHiddenSize, Fus div 2, 3);
+  LoadSegformer1x1(Reader, Neck.HeadConv3, HeadConv3Name + 'weight', 1,
+    Config.HeadHiddenSize, HeadConv3Name + 'bias');
+end;
+
+function BuildDPT(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  Bk: TDINOv2Config;
+  StageMaps: array[0..3] of TNNetLayer;
+  DINOv2Layers: TDPTDINOv2Layers;
+  ViTLayers: TDPTViTLayers;
+  Neck: TDPTNeckLayers;
+  StagePos: integer;
+  IsDepthAnything, IsIgnoreExpected: boolean;
+begin
+  Bk := Config.Backbone;
+  IsDepthAnything := DPTHasDepthAnythingHead(Config);
+  if Config.ReassembleHiddenSize <> Bk.HiddenSize then
+    ImportError('DPT import: reassemble_hidden_size=' +
+      IntToStr(Config.ReassembleHiddenSize) +
+      ' must equal backbone hidden_size=' + IntToStr(Bk.HiddenSize) + '.');
+  if (Bk.NumHeads < 1) or ((Bk.HiddenSize mod Bk.NumHeads) <> 0) then
+    ImportError('DPT import: hidden_size not divisible by num_attention_heads.');
+  if (Bk.PatchSize < 1) or ((Bk.ImageSize mod Bk.PatchSize) <> 0) then
+    ImportError('DPT import: image_size not a multiple of patch_size.');
+  if (LowerCase(Config.DepthEstimationType) <> 'relative') and
+     (LowerCase(Config.DepthEstimationType) <> 'metric') then
+    ImportError('DPT import: depth_estimation_type "' +
+      Config.DepthEstimationType + '" unsupported.');
+  if IsDepthAnything then
+  begin
+    if Bk.UseSwiGLUFFN then
+      ImportError('DPT import: use_swiglu_ffn backbone not supported.');
+    if Bk.NumRegisterTokens > 0 then
+      ImportError('DPT import: register-token backbone not supported.');
+    if Bk.NumLayers < 4 then
+      ImportError('DPT import: backbone needs >= 4 layers (4 hooked stages).');
+  end
+  else
+  begin
+    // A hybrid feeds the two BiT stage maps raw; a plain ViT DPT reassembles all.
+    for StagePos := 0 to 3 do
+    begin
+      IsIgnoreExpected := false;
+      if Config.IsHybrid then IsIgnoreExpected := StagePos < 2;
+      if Config.NeckIgnoreStages[StagePos] <> IsIgnoreExpected then
+        ImportError('DPT import: neck_ignore_stages must be [0, 1] for a ' +
+          'hybrid and empty otherwise.');
+    end;
+    if Config.IsHybrid and (Config.Bit.NumChannels <> Bk.NumChannels) then
+      ImportError('DPT import: the BiT and ViT num_channels differ.');
+  end;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
+    if IsDepthAnything then
+      AddDPTDINOv2Backbone(NN, Config, pTrainable, DINOv2Layers, StageMaps)
+    else
+      AddDPTViTBackbone(NN, Config, pTrainable, ViTLayers, StageMaps);
+    AddDPTNeckAndHead(NN, Config, StageMaps, pTrainable, Neck);
+    if IsDepthAnything then
+      LoadDPTDINOv2BackboneWeights(Reader, Config, DINOv2Layers)
+    else
+      LoadDPTViTBackboneWeights(Reader, Config, ViTLayers);
+    LoadDPTNeckAndHeadWeights(Reader, Config, Neck);
     Result := NN;
   except
     NN.Free;

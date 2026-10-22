@@ -603,23 +603,28 @@ rather than acted on.
               than the latent grid.
           - [ ] Real stabilityai/stable-diffusion-2-depth run on the user's GPU
                 box (512x512) with a depth map from another estimator.
-          - [ ] The checkpoint's depth_estimator/ (DPTForDepthEstimation,
-                dpt-hybrid-midas) is not supported: BuildDPT only takes a DINOv2
-                backbone_config (the Depth Anything layout). The hybrid needs
-                (transformers modeling_dpt.py): a BiT backbone_config (model_type
-                "bit", bottleneck layers, depths [3, 4, 9], weight-standardized
-                convs + GroupNorm, global_padding "same", dynamic-pad stem);
-                DPTViTHybridEmbeddings (BiT feature map -> 1x1 projection to the
-                ViT width, cls token, resized position embeddings) feeding a ViT
-                encoder; readout_type "project" (cls concat + Linear + GELU);
-                neck_ignore_stages [0, 1] (the first two neck inputs are BiT
-                stage feature maps, not reassembled tokens); the DPT neck
-                (reassemble resize, fusion pre-activation residual units) and
-                DPTDepthEstimationHead (conv, 2x bilinear align_corners upsample,
-                conv, ReLU, 1x1 conv, ReLU); and DPTImageProcessor from
-                feature_extractor/preprocessor_config.json. Then Depth2Img runs
-                it when no depth map is set. The plain-ViT DPT (Intel/dpt-large,
-                is_hybrid false) is not supported either.
+          - [X] DPT-Hybrid importer (Intel/dpt-hybrid-midas, the checkpoint's
+                depth_estimator/): BuildDPT reads model_type "dpt" with
+                is_hybrid (BiT bottleneck backbone, weight standardization folded
+                into the conv weights at load, GroupNorm, TF SAME / dynamic
+                padding; ViT-hybrid embeddings; readout "project";
+                neck_ignore_stages [0, 1]; DPTDepthEstimationHead) and the
+                plain-ViT DPT (Intel/dpt-large). Pico parity vs transformers
+                float64 (tools/make_pico_dpt_hybrid_fixture.py):
+                TestDPTHybridDepthEstimationParity, TestDPTViTDepthEstimationParity.
+            - [ ] Real Intel/dpt-hybrid-midas and Intel/dpt-large runs on the
+                  user's GPU box (384x384; compare against transformers).
+            - [ ] Only the native image_size: the position table is not
+                  interpolated, so DPTImageProcessor keep_aspect_ratio /
+                  other sizes are refused.
+            - [ ] readout "add" is built but has no fixture; BiT
+                  preactivation layers, dilated stages (output_stride reached)
+                  and batch-norm fusion units are refused.
+            - [ ] FPC 3.x -O2 miscompiled `B <> (Flag and (I < 2))` in a for
+                  loop in BuildDPT (garbage index register; rewritten with a
+                  local boolean). Report upstream with a reduced case.
+          - [ ] Depth2Img runs the depth_estimator/ + feature_extractor/ of
+                the pipeline folder when no depth map is set.
           - [ ] --depth-image loads 8 bits per channel; a 16-bit depth PNG
                 loses precision (SetDepthMap itself takes any float map).
         - [ ] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,

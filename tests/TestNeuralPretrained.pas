@@ -172,6 +172,10 @@ type
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
       pRoundTrip: boolean; pPackedPath: boolean = false): double;
+    // Largest |depth - oracle| of BuildDPTFromSafeTensors over every case of
+    // IoFile ({"cases": [{"input", "out_grid_w", "out_grid_h", "output"}]}).
+    function DPTDepthParityMaxDiff(const WeightsFile, ConfigFile,
+      IoFile: string): double;
     // Loads a {"shape": [T, C, ...], "data": [...]} oracle tensor of Root as a
     // (T,1,C*...) token-major volume.
     procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
@@ -1195,6 +1199,9 @@ type
     procedure TestSegformerSemanticSegmentationParity;
     procedure TestDPTConfigFromJSONFile;
     procedure TestDPTDepthEstimationParity;
+    procedure TestDPTHybridConfigFromJSONFile;
+    procedure TestDPTHybridDepthEstimationParity;
+    procedure TestDPTViTDepthEstimationParity;
     procedure TestDepthAnythingV2Parity;
     procedure TestVideoMAEConfigFromJSONFile;
     procedure TestVideoMAEClassificationParity;
@@ -40831,6 +40838,18 @@ end;
 // residual units + align-corners bilinear upsample), and the depth head.
 procedure TTestNeuralPretrained.TestDPTDepthEstimationParity;
 var
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  MaxDiff := DPTDepthParityMaxDiff(FixturePath('tiny_dpt.safetensors'),
+    FixturePath('tiny_dpt_config.json'), FixturePath('tiny_dpt_io.json'));
+  AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+function TTestNeuralPretrained.DPTDepthParityMaxDiff(const WeightsFile,
+  ConfigFile, IoFile: string): double;
+var
   NN: TNNet;
   Config: TDPTConfig;
   RefRoot: TJSONData;
@@ -40839,21 +40858,19 @@ var
   CaseObj: TJSONObject;
   Img: TNNetVolume;
   Output: TNNetVolume;
-  RefVal, GotVal, Diff, MaxDiff: double;
   CaseCnt, x, yy, c, FlatIdx, GW, GH, W, H, NumCh: integer;
 begin
-  RandSeed := 424242;
-  NN := BuildDPTFromSafeTensors(FixturePath('tiny_dpt.safetensors'),
-    Config, {pTrainable=}true, FixturePath('tiny_dpt_config.json'));
+  NN := BuildDPTFromSafeTensors(WeightsFile, Config, {pTrainable=}true,
+    ConfigFile);
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
-  MaxDiff := 0;
+  Result := 0;
   W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;
   NumCh := Config.Backbone.NumChannels;
   try
     AssertTrue('net built', NN <> nil);
-    RefJson.LoadFromFile(FixturePath('tiny_dpt_io.json'));
+    RefJson.LoadFromFile(IoFile);
     RefRoot := GetJSON(RefJson.Text);
     CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
     AssertTrue('cases present', CasesArr <> nil);
@@ -40870,7 +40887,7 @@ begin
           for c := 0 to NumCh - 1 do
           begin
             FlatIdx := (yy * W + x) * NumCh + c;
-            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+            Img.FData[FlatIdx] := InArr.Items[FlatIdx].AsFloat;
           end;
       NN.Compute(Img);
       Output := NN.GetLastLayer().Output;
@@ -40881,20 +40898,80 @@ begin
         for x := 0 to GW - 1 do
         begin
           FlatIdx := yy * GW + x;
-          RefVal := OutArr.Items[FlatIdx].AsFloat;
-          GotVal := Output.FData[(yy * GW + x)];
-          Diff := Abs(GotVal - RefVal);
-          if Diff > MaxDiff then MaxDiff := Diff;
+          Result := Max(Result, Abs(Output.FData[FlatIdx] -
+            OutArr.Items[FlatIdx].AsFloat));
         end;
     end;
-    AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
-      ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;
     Img.Free;
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// The DPT-Hybrid config of the pico depth2img estimator: ViT fields at the top
+// level, a "bit" backbone_config, readout "project", neck_ignore_stages [0, 1].
+procedure TTestNeuralPretrained.TestDPTHybridConfigFromJSONFile;
+var
+  Config: TDPTConfig;
+begin
+  Config := ReadDPTConfigFromJSONFile(FixturePath('tiny_sd2_depth_estimator' +
+    DirectorySeparator + 'depth_estimator' + DirectorySeparator + 'config.json'));
+  AssertEquals('model_type', 'dpt', Config.ModelType);
+  AssertTrue('is_hybrid', Config.IsHybrid);
+  AssertEquals('backbone kind', 'vit', Config.Backbone.ModelType);
+  AssertEquals('hidden', 16, Config.Backbone.HiddenSize);
+  AssertEquals('intermediate', 32, Config.Backbone.IntermediateSize);
+  AssertEquals('layers', 5, Config.Backbone.NumLayers);
+  AssertEquals('image', 64, Config.Backbone.ImageSize);
+  AssertEquals('patch', 16, Config.Backbone.PatchSize);
+  AssertEquals('hooked block of stage 3 (1-based)', 5, Config.OutIndices[3]);
+  AssertEquals('readout', 'project', Config.ReadoutType);
+  AssertTrue('stage 0 ignored', Config.NeckIgnoreStages[0]);
+  AssertTrue('stage 1 ignored', Config.NeckIgnoreStages[1]);
+  AssertFalse('stage 2 reassembled', Config.NeckIgnoreStages[2]);
+  AssertEquals('DPT head hidden', 32, Config.HeadHiddenSize);
+  AssertEquals('bit embedding', 8, Config.Bit.EmbeddingSize);
+  AssertEquals('bit stages', 3, Length(Config.Bit.Depths));
+  AssertEquals('bit depth[0]', 2, Config.Bit.Depths[0]);
+  AssertEquals('bit groups', 4, Config.Bit.NumGroups);
+  AssertEquals('bit padding', 'SAME', Config.Bit.GlobalPadding);
+  AssertTrue('bit dynamic stem padding', Config.Bit.EmbeddingDynamicPadding);
+end;
+
+// tiny_sd2_depth_estimator/depth_estimator: a pico random DPTForDepthEstimation
+// with is_hybrid (BiT bottleneck units with weight-standardized convs and
+// GroupNorm, SAME and dynamic padding, ViT-hybrid embeddings, readout project,
+// two raw BiT neck inputs); oracle = transformers float64 predicted_depth.
+procedure TTestNeuralPretrained.TestDPTHybridDepthEstimationParity;
+var
+  Folder: string;
+  MaxDiff: double;
+begin
+  Folder := 'tiny_sd2_depth_estimator' + DirectorySeparator +
+    'depth_estimator' + DirectorySeparator;
+  MaxDiff := DPTDepthParityMaxDiff(FixturePath(Folder + 'model.safetensors'),
+    FixturePath(Folder + 'config.json'), FixturePath('tiny_dpt_hybrid_io.json'));
+  WriteLn('  DPT-Hybrid depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('DPT-Hybrid depth: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// tiny_dpt_vit: a pico random plain-ViT DPTForDepthEstimation (the
+// Intel/dpt-large layout: patch embeddings, reassemble factors 4/2/1/0.5,
+// readout project on all four hooks); oracle = transformers float64.
+procedure TTestNeuralPretrained.TestDPTViTDepthEstimationParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := DPTDepthParityMaxDiff(
+    FixturePath('tiny_dpt_vit' + DirectorySeparator + 'model.safetensors'),
+    FixturePath('tiny_dpt_vit' + DirectorySeparator + 'config.json'),
+    FixturePath('tiny_dpt_vit_io.json'));
+  WriteLn('  ViT DPT depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('ViT DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 
 // Depth Anything V2 monocular relative-depth importer parity. tiny_depth_anything
