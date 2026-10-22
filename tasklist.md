@@ -97,8 +97,7 @@ rather than acted on.
 - [ ] Possible trap (not changed, awaits user decision; found during fcfbfa66):
       FPC's `genrand_MT19937` reseeds when `RandSeed <> OldRandSeed`, then sets
       `RandSeed := not RandSeed` and stores that as `OldRandSeed`. Code that saves
-      `RandSeed` and restores it afterwards (e.g. `MakeInitialLatents`, about 89
-      sites in neural/) restores a value equal to `OldRandSeed`, so the next draw
+      `RandSeed` and restores it afterwards (about 89 sites in neural/) restores a value equal to `OldRandSeed`, so the next draw
       CONTINUES the old Mersenne Twister state instead of replaying the seed;
       "same seed" noise can then differ by call order (it broke
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
@@ -707,8 +706,8 @@ rather than acted on.
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
 - [ ] FP16 (half-precision) OpenCL compute path for the FP32-weight
-      dot-product/matmul offload. PARTLY LANDED: `--gpu-fp16` narrows the
-      activation (B operand) and the split-K partials to half for the int8/int4
+      dot-product/matmul offload. PARTLY LANDED: `--experimental-fp16` narrows the
+      activation (B operand) and the split-K partials to half for the int8
       GEMV/GEMM (`cai_dot_product_int8_h`, `cai_f32_to_half`, `cai_im2col_h`);
       user-measured +10.2% decode on the 27B. That path uses half as STORAGE only,
       read through `vload_half` (core OpenCL, no `cl_khr_fp16`), so it runs and is
@@ -1143,11 +1142,12 @@ rather than acted on.
       loop over the pico PixArt (regression TestLatentTextToImageSmoke) and decodes the
       (6,6,4) latent through a matched pico VAE decoder to a (12,12,3) RGB P6 PPM.
       Remaining steps:
-  - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) + CFG (cond vs
-        empty-caption uncond) and a hard-coded prompt; ulimit-bounded demo that
+  - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) over a tokenized
+        prompt, so the existing `--cfg` loop gets a real empty-caption uncond
+        branch (today uncond is zero T5 states); ulimit-bounded demo that
         generates one small image. The CV-generative-stack-composes capstone.
-        (Steps 1+2 supply only DETERMINISTIC SYNTHETIC T5 states + pico fixtures;
-        Step 3 swaps in a real T5 encoder + real PixArt/VAE checkpoint.)
+        (Real PixArt/VAE checkpoints already load from the command line; the T5
+        states are still DETERMINISTIC SYNTHETIC.)
   - [ ] Follow-up — the pico PixArt + matched pico VAE are RANDOM (smoke only);
         once a real checkpoint is wired (Step 3) re-verify the chain produces a
         sensible image, and expose the existing `smEulerAncestral` sampler /
@@ -1309,9 +1309,10 @@ rather than acted on.
         "merged visual tokens as input v1"). Build the real DaViT: a 4-stage conv-embed
         (kernel/stride/pad per stage, pre/post LayerNorm), per-block depthwise 3x3 convs
         (TNNetDepthwiseConv), WINDOW attention (partition H*W into windows; reuse
-        TNNetWindowAttention), and the genuinely-new GROUPED CHANNEL attention (attention
-        ACROSS channels within groups, scale = num_tokens^-0.5 — NO existing Pascal layer,
-        needs a new leaf or a transposed-SDPA builder). Then drop the precomputed-feature
+        TNNetWindowAttention), and the GROUPED CHANNEL attention (attention ACROSS
+        channels within groups, scale = num_tokens^-0.5). The closest layer is
+        `TNNetTransposedChannelAttention` (Restormer MDTA), which L2-normalizes q/k and
+        uses a learned per-head temperature instead; extend it with an option. Then drop the precomputed-feature
         shortcut and add the patch_embed/window-partition reshape plumbing.
   - [ ] Real-checkpoint parity (microsoft/Florence-2-base) + the real DaViT image
         preprocessing + the Florence-2 tokenizer (post-processing the <loc_>/box token
@@ -1325,8 +1326,8 @@ rather than acted on.
   - [ ] The native-dynamic-resolution VISION TOWER (Conv3d patch embed + window
         attention over a variable patch grid + the 2x2 spatial patch-merger MLP) — v1
         takes the MERGED visual tokens as input (precomputed). Reuse the landed
-        BuildClipVisionTower/SigLIP ViT path; build the variable-grid window-attention
-        mask + the patch merger. Then drop the precomputed-embeds shortcut.
+        `TQwen3VLVisionTower` / `TQwen3VLVisionMergerLayers` (2x2 patch merger,
+        two-frame patch embed); build the variable-grid window-attention mask. Then drop the precomputed-embeds shortcut.
   - [ ] Qwen2.5-VL specifics (the temporal M-RoPE section for VIDEO, the per-frame
         time_interval, the windowed full-attention layer pattern, MRoPE rope_deltas for
         incremental decode) — the M-RoPE index builder already has the temporal slot.
@@ -1584,8 +1585,10 @@ rather than acted on.
         Second GPU run (user, 2026-09-30, L4): 1024x1024 --int4, 10 steps:
         36.3 s/step (16.5x the 256x256 step for 16x the tokens: linear, so
         attention does not dominate; ~75 TFLOP/step, ~2 TFLOPS achieved),
-        denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
-        transformer 245.2 s, peak RSS 10.9 GB.
+        denoise 370.4 s, VAE decode 528.2 s (CPU), load transformer 245.2 s,
+        peak RSS 10.9 GB. Superseded by the run with the VAE on OpenCL in
+        examples/QwenImage/README.md (1024x1024 --int4, 10 steps: 13.05 s/step,
+        VAE decode 35.2 s, load transformer 55.3 s, peak RSS 12.7 GB).
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (these writes
           are the only mid-block waits).
@@ -1614,9 +1617,8 @@ rather than acted on.
         `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
         + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
         today's rate is ~9 min per step.
-  - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
-        Estimate (not measured): a CPU VAE decode at 1024x1024 is ~8 min (16x the
-        31 s measured at 256x256), so it is the next bottleneck.
+  - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels. Measured at
+        1024x1024: 528.2 s on the CPU, 35.2 s on OpenCL (L4, tiles 256/192).
     - [ ] B2b follow-up: Drop the armed nets' host FConcatedWeights/FConcatedWInter
           copies (~2 GB) after the upload.
     - [ ] B2b follow-up: Measure --serial vs the default parallel scheduler with
@@ -1757,8 +1759,10 @@ rather than acted on.
       item under "Layer follow-ups") would allow 256-pixel tiles;
       (2) DEFERRED, needs the user's approval for a new Python tool: a pico
       basicsr x2plus fixture (`tools/` generator from the ~/x venv using basicsr's
-      RRDBNet definition), parity < 1e-4 on the whole net. Today only the
-      unshuffle stem has an oracle (Pascal-side, `TestRRDBNetPixelUnshuffleX2`);
+      RRDBNet definition), parity < 1e-4 on the whole net. The x4 and scale-2
+      nearest layouts have whole-net numpy oracles (`TestRRDBNetParity`,
+      `TestRRDBNetParityScale2`); the x2plus unshuffle layout has only the
+      Pascal-side stem check `TestRRDBNetPixelUnshuffleX2`;
       (3) a real `RealESRGAN_x4plus.pth` (and x2plus) run on the user's box,
       through both examples (QwenImage: `--width 512 --height 512 --upscale`);
       (4) not supported: the old ESRGAN `model.N.*` key layout.
@@ -1876,7 +1880,8 @@ rather than acted on.
         kill %1
         ```
         PASS = max abs difference <= 5e-3 (exit 0). `--fp32` is required: int8
-        weights move the probabilities far more than FP32 rounding.
+        weights move the probabilities far more than FP32 rounding. A first run on a
+        0.5B chat checkpoint gave a questionable yes/no answer; stays planned (coded).
   Stage 2 — Kev and Open-Jev:
   - [ ] D2.7 User-box real checks: Kev-0.8B (Kev's own test record) and
         Open-Jev-2B against their Python servers; commands written by the agents.
@@ -1913,8 +1918,6 @@ rather than acted on.
         ```
         - Open-Jev-2B: sanity check done on the user box 2026-10-19 (`--gpu --int4`, now SUPPORTED); its `--fp32` parity run above is still open.
         - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
-        - [ ] AnyJev L0: ran on a 0.5B chat checkpoint, but the yes/no answer was
-              questionable; stays planned (coded).
   Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
   `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
   `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
@@ -1987,7 +1990,7 @@ rather than acted on.
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
 `TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
-training on OpenCL"). About 66 of the 513 `TNNet*` classes in `neuralnetwork.pas` (2026-10-21)
+training on OpenCL"). About 66 of the 515 `TNNet*` classes in `neuralnetwork.pas` (2026-10-21)
 declare a `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
@@ -2020,7 +2023,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         device forward; it is not on any fused-bank path today.
   - [ ] A top-k gate with 32 < k < experts stays on the host
         (`CAI_TOPK_GATE_MAX_K`, the kernel's private selection buffers).
-- [ ] `--gpu-fp16`: narrow each resident FP32 source to half ONCE per forward,
+- [ ] `--experimental-fp16`: narrow each resident FP32 source to half ONCE per forward,
       not once per consumer. `TDotProductSharedKernel.PrepareInt8BOperand` calls
       `CastBOperandToFP16` (`cai_f32_to_half`) into the layer's own
       `FInputBufferBsFP16` on every forward, so consumers sharing one source
@@ -2296,8 +2299,9 @@ cannot pay for its own transfer.
       (the even/odd split trick) to halve the row cost. Low priority: the FFTs
       are small next to LaMa's convolutions; do it only if a profile shows them.
 - [ ] Decision for the user: inference-time release of the convolution im2col
-      matrix (`FInputPrepared`). Every convolution keeps it after the forward in
-      both memory modes; for big-lama at 512x512 that is ~6.7 GB of the ~8.6 GB
+      matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
+      convolution keeps it after the forward in both memory modes (the FP32
+      inference implicit-GEMM OpenCL path, `ShouldOpenCLImplicitConv`, has none); for big-lama at 512x512 that is ~6.7 GB of the ~8.6 GB
       estimate. Options: free/share it when the net is not trainable, or tile the
       im2col along Y. Library-wide; propose and wait for approval before coding.
 
@@ -2429,8 +2433,8 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       confirm none still ship the diagonal-only approximation.
 - [ ] Numerical-gradient stress test for TNNetSoftMax / TNNetPointwiseSoftMax
       across SeqLen / Depth / SizeX combinations.
-- [ ] Backward audit for TNNetPointwiseNorm — its backward is the scalar-
-      only `Mul(1/n)` approximation; TNNetL2Normalize now implements the
+- [ ] Backward audit for TNNetPointwiseNorm — its backward is the diagonal-
+      only per-position `PointwiseMul(1/n)` approximation; TNNetL2Normalize now implements the
       exact Jacobian. Either replace or add a deprecation comment.
 - [ ] Random-architecture forward/backward fuzz — generate ~50 random
       stacks, seed-controlled, assert no NaN/Inf in forward, backward,
