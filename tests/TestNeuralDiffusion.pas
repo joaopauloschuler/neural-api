@@ -2103,10 +2103,15 @@ const
     '"prediction_type": "v_prediction", "rescale_betas_zero_snr": true, ' +
     '"set_alpha_to_one": false, "steps_offset": 1, "thresholding": false, ' +
     '"timestep_spacing": "trailing"}';
+  csSD15Config = '{"_class_name": "PNDMScheduler", "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+    '"num_train_timesteps": 1000, "set_alpha_to_one": false, ' +
+    '"skip_prk_steps": true, "steps_offset": 1, "trained_betas": null}';
 var
   FileName: string;
   Lines: TStringList;
   FromConfig, Reference: TNNetDiffusionScheduler;
+  Schedule: TNeuralIntegerArray;
   Tt: integer;
 
   function Refused(const Json: string): boolean;
@@ -2148,13 +2153,32 @@ begin
         FromConfig.AlphaBar[Tt], 0);
     AssertTrue('clip_sample defaults to true',
       Refused('{"timestep_spacing": "trailing"}'));
-    AssertTrue('leading spacing', Refused('{"clip_sample": false}'));
+    AssertTrue('linspace spacing', Refused('{"clip_sample": false, ' +
+      '"timestep_spacing": "linspace"}'));
     AssertTrue('sample prediction', Refused('{"clip_sample": false, ' +
       '"timestep_spacing": "trailing", "prediction_type": "sample"}'));
     AssertTrue('trained betas', Refused('{"clip_sample": false, ' +
       '"timestep_spacing": "trailing", "trained_betas": [0.1, 0.2]}'));
     AssertFalse('null trained betas load', Refused('{"clip_sample": false, ' +
       '"timestep_spacing": "trailing", "trained_betas": null}'));
+    // runwayml/stable-diffusion-v1-5: PNDM (no clip_sample default), leading
+    // spacing, steps_offset 1; diffusers 3 steps are t = 667, 334, 1.
+    FromConfig.Free;
+    FromConfig := nil;
+    Lines.Text := csSD15Config;
+    Lines.SaveToFile(FileName);
+    FromConfig := TNNetDiffusionScheduler.CreateFromDiffusersConfig(FileName);
+    AssertTrue('SD 1.5 leading', FromConfig.ConfigSpacing = tsLeading);
+    AssertEquals('SD 1.5 steps_offset', 1, FromConfig.StepsOffset);
+    AssertTrue('SD 1.5 eps', FromConfig.PredictionType = dpEps);
+    Schedule := FromConfig.BuildTimestepSchedule(3, tsLeading);
+    AssertEquals('leading length', 4, Length(Schedule));
+    AssertEquals('leading 0', 668, Schedule[0]);
+    AssertEquals('leading 1', 335, Schedule[1]);
+    AssertEquals('leading 2', 2, Schedule[2]);
+    AssertEquals('leading end', 0, Schedule[3]);
+    AssertTrue('PNDM without clip_sample loads', not Refused(
+      '{"_class_name": "PNDMScheduler"}'));
   finally
     FromConfig.Free;
     Reference.Free;

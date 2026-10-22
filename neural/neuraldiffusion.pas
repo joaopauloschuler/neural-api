@@ -109,7 +109,9 @@ type
   //     first step is always Tt=T (T=1000, N=4: 1000,750,500,250). A plain
   //     timestep list, so it works with every method; it replaces tsKarras
   //     rather than combining with it. Used with the zero-terminal-SNR rescale.
-  TNNetTimestepSpacing = (tsUniform, tsKarras, tsTrailing);
+  //   tsLeading : diffusers timestep_spacing="leading" (SD 1.x/2.x): diffusers t
+  //     = k*(T div N) + steps_offset, i.e. Tt = k*(T div N) + StepsOffset + 1.
+  TNNetTimestepSpacing = (tsUniform, tsKarras, tsTrailing, tsLeading);
 
   // Caller-supplied denoiser. Given noisy Xt at integer timestep Tt (1..T) it
   // must write the model prediction (eps or v, per the scheduler's
@@ -136,6 +138,9 @@ type
     // as do FSigma and FLambda, so no sampler divides by zero.
     FInvSqrtAlphaBar: array of TNeuralFloat;
     FRescaleZeroTerminalSNR: boolean;
+    // diffusers steps_offset (tsLeading) and timestep_spacing of the config.
+    FStepsOffset: integer;
+    FConfigSpacing: TNNetTimestepSpacing;
     // ab_prev of DDIM's final step: 1, or ab_1 (diffusers alphas_cumprod[0]).
     FFinalAlphaBar: TNeuralFloat;
     // DPM-Solver++ multistep state (previous step's converted x0 prediction).
@@ -205,8 +210,8 @@ type
       Beta1: TNeuralFloat = 1.0e-4; BetaT: TNeuralFloat = 0.02;
       CosineS: TNeuralFloat = 0.008; pRescaleZeroTerminalSNR: boolean = false;
       pFinalAlphaBarIsOne: boolean = true);
-    // Reads a diffusers DDIMScheduler / DDPMScheduler scheduler_config.json;
-    // raises on what this class does not implement (clip_sample, non-trailing).
+    // Reads a diffusers DDIM/DDPM/PNDM-style scheduler_config.json (beta and
+    // spacing fields); raises on what this class does not implement.
     constructor CreateFromDiffusersConfig(const FileName: string);
     destructor Destroy; override;
 
@@ -218,6 +223,9 @@ type
     property PredictionType: TNNetPredictionType read FPrediction;
     property RescaleZeroTerminalSNR: boolean read FRescaleZeroTerminalSNR;
     property FinalAlphaBar: TNeuralFloat read FFinalAlphaBar;
+    // The config's timestep_spacing (tsUniform from Create) and steps_offset.
+    property ConfigSpacing: TNNetTimestepSpacing read FConfigSpacing;
+    property StepsOffset: integer read FStepsOffset;
 
     // FORWARD process. Xt := sqrt(ab_t)*X0 + sqrt(1-ab_t)*Noise. If NoiseOut is
     // given it receives the sampled noise (the eps training target). When
@@ -691,6 +699,8 @@ begin
   FSchedule := pSchedule;
   FPrediction := pPrediction;
   FRescaleZeroTerminalSNR := pRescaleZeroTerminalSNR;
+  FStepsOffset := 0;
+  FConfigSpacing := tsUniform;
   SetLength(FBeta, FT + 1);
   SetLength(FAlpha, FT + 1);
   SetLength(FAlphaBar, FT + 1);
@@ -720,9 +730,11 @@ var
   JsonText: TStringList;
   Root, TrainedBetas: TJSONData;
   Obj: TJSONObject;
-  ScheduleName, PredictionName, SpacingName: string;
+  ScheduleName, PredictionName, SpacingName, SchedulerClass: string;
   Schedule: TNNetBetaSchedule;
   Prediction: TNNetPredictionType;
+  Spacing: TNNetTimestepSpacing;
+  ClipSampleDefault: boolean;
 
   procedure Refuse(const Setting: string);
   begin
@@ -740,8 +752,12 @@ begin
       raise Exception.Create('Diffusion scheduler config ' + FileName +
         ' is not a JSON object.');
     Obj := TJSONObject(Root);
-    // diffusers defaults: clip_sample true, thresholding false.
-    if Obj.Get('clip_sample', true) then Refuse('"clip_sample" = true');
+    // clip_sample exists (default true) only on the DDIM/DDPM schedulers.
+    SchedulerClass := Obj.Get('_class_name', '');
+    ClipSampleDefault := (SchedulerClass = '') or
+      (SchedulerClass = 'DDIMScheduler') or (SchedulerClass = 'DDPMScheduler');
+    if Obj.Get('clip_sample', ClipSampleDefault) then
+      Refuse('"clip_sample" = true');
     if Obj.Get('thresholding', false) then Refuse('"thresholding" = true');
     TrainedBetas := Obj.Find('trained_betas');
     if (TrainedBetas <> nil) and not (TrainedBetas.JSONType = jtNull) then
@@ -755,14 +771,16 @@ begin
     if PredictionName = 'epsilon' then Prediction := dpEps
     else if PredictionName = 'v_prediction' then Prediction := dpV
     else Refuse('prediction_type "' + PredictionName + '"');
-    // Only "trailing" matches diffusers exactly; tsUniform is not "leading".
     SpacingName := Obj.Get('timestep_spacing', 'leading');
-    if SpacingName <> 'trailing' then
-      Refuse('timestep_spacing "' + SpacingName + '"');
+    if SpacingName = 'trailing' then Spacing := tsTrailing
+    else if SpacingName = 'leading' then Spacing := tsLeading
+    else Refuse('timestep_spacing "' + SpacingName + '"');
     Create(Obj.Get('num_train_timesteps', 1000), Schedule, Prediction,
       Obj.Get('beta_start', 0.0001), Obj.Get('beta_end', 0.02), 0.008,
       Obj.Get('rescale_betas_zero_snr', false),
       Obj.Get('set_alpha_to_one', true));
+    FConfigSpacing := Spacing;
+    FStepsOffset := Obj.Get('steps_offset', 0);
   finally
     Root.Free;
     JsonText.Free;
@@ -976,7 +994,7 @@ function TNNetDiffusionScheduler.BuildTimestepSchedule(NumSteps: integer;
   Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
 var
   k, Tt: integer;
-  NumStepsM1, FTM1: integer;
+  NumStepsM1, FTM1, LeadingStride: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
   pMax, pMin, trailingStride: double;
 const
@@ -1021,6 +1039,19 @@ begin
         begin
           Tt := Round(FT - k * trailingStride);
           if Tt < 1 then Tt := 1;
+          Result[k] := Tt;
+        end;
+        Result[NumSteps] := 0;
+      end;
+    tsLeading:
+      begin
+        // diffusers: (arange(N) * (T div N))[::-1] + steps_offset, 0-based.
+        LeadingStride := FT div NumSteps;
+        for k := 0 to NumStepsM1 do
+        begin
+          Tt := (NumStepsM1 - k) * LeadingStride + FStepsOffset + 1;
+          if Tt < 1 then Tt := 1
+          else if Tt > FT then Tt := FT;
           Result[k] := Tt;
         end;
         Result[NumSteps] := 0;
