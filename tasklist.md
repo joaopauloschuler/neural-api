@@ -685,6 +685,41 @@ rather than acted on.
               (4) a plain img2img mode (TStableDiffusionImg2Img conditioner over
               the DenoiseStrength / NoiseImageLatents hooks) plus
               examples/StableDiffusion --init-image/--strength.
+      - [ ] InstructPix2Pix instruction-based image editing (port of diffusers
+            StableDiffusionInstructPix2PixPipeline; checkpoint
+            timbrooks/instruct-pix2pix: "make it winter", "turn him into a
+            statue"). The checkpoint is an SD 1.5 UNet with an 8-channel conv_in
+            (latents | image latents), so BuildSDUNet already builds it; the
+            pieces are:
+            (1) TStableDiffusionInstructPix2Pix = class(TStableDiffusionConditioner)
+                with SetImage / ImageGuidanceScale (diffusers
+                image_guidance_scale, default 1.5); AcceptsUNetInChannels takes
+                2 * LatentChannels. BeginDenoise encodes the image once with
+                EncodeVaeImage(SampleNoise = nil) (the latent mean; diffusers
+                does NOT apply scaling_factor here, while EncodeVaeImage always
+                does: add a parameter rather than dividing it back out) and the
+                output size follows the image (multiple
+                of the VAE factor, as ConvertAndResizeImagePIL gives).
+                PredictNoise concatenates the model-input-scaled latents with the
+                image latents on the channel axis (the inpainter's FUNetInput
+                pattern).
+            (2) Three-way guidance: diffusers runs [prompt, image],
+                [negative, image], [negative, ZERO image latents] and combines
+                uncond + g * (text - image) + ig * (image - uncond); guidance is
+                on when g > 1 and ig >= 1. The pipeline's two-half CFG cannot
+                express this; add a conditioner hook that owns the guidance
+                combine (also usable for the PAG/SLG-style extra passes), with
+                an explicit pass flag rather than the embeds-object identity
+                TStableDiffusionIPAdapter relies on today.
+            (3) The checkpoint's scheduler is EulerAncestralDiscreteScheduler
+                (already mapped with diffusers parity).
+            Tests: a pico 8-channel UNet in tools/make_pico_sd_conditioning_fixtures.py
+            (--ip2p-only), 3 Euler a / DDIM steps + the decoded image vs
+            diffusers float64 < 1e-4, and ImageGuidanceScale = 1 with
+            GuidanceScale = 1 matching a single conditioned pass. CLI:
+            examples/StableDiffusion --edit-image PNG --image-guidance S (or a
+            new examples/InstructPix2Pix with its README), then a real run on the
+            user's GPU box.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
