@@ -541,8 +541,10 @@ rather than acted on.
             the pipeline refuses addition_embed_type "text_time" today.
       - [ ] F16 weights: the SD UNet / VAE / CLIP loaders are unverified on F16
             and *.fp16.safetensors variant files (pick the variant by name).
-      - [ ] transformers >= 5 CLIPTextModel exports drop the `text_model.` key
+      - [X] transformers >= 5 CLIPTextModel exports drop the `text_model.` key
             prefix; BuildClipTextTower requires it (the pico fixture re-adds it).
+            DONE: both CLIP towers detect the prefix (DetectOptionalTensorPrefix);
+            TestClipTowersUnprefixedKeys.
       - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
             CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
       - [X] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for

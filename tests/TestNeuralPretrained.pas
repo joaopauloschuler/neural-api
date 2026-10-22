@@ -996,6 +996,7 @@ type
     procedure TestClapFreqRatio4Parity;
     procedure TestClipScore;
     procedure TestClipVisionFeatures;
+    procedure TestClipTowersUnprefixedKeys;
     procedure TestOpenClipVisionTowerParity;
     procedure TestClipImagePreprocess;
     // size {"height","width"}: direct resize to (H,W), no crop, equal to
@@ -29378,6 +29379,88 @@ begin
     ImageInput.Free;
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// transformers >= 5 CLIPTextModel / CLIPVisionModel exports drop the
+// text_model. / vision_model. prefix: both towers load either layout alike.
+procedure TTestNeuralPretrained.TestClipTowersUnprefixedKeys;
+const
+  csTextSeqLen = 5;
+var
+  Config: TClipConfig;
+  PrefixedReader, TextReader, VisionReader: TNNetSafeTensorsReader;
+  PrefixedNet, UnprefixedNet: TNNet;
+  Input, PrefixedOutput, UnprefixedOutput: TNNetVolume;
+  TokenPos: integer;
+begin
+  Config := ReadClipConfigFromJSONFile(FixturePath('tiny_clip_config.json'));
+  PrefixedReader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_clip.safetensors'));
+  TextReader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_clip.safetensors'));
+  VisionReader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_clip.safetensors'));
+  PrefixedNet := nil;
+  UnprefixedNet := nil;
+  Input := TNNetVolume.Create();
+  PrefixedOutput := TNNetVolume.Create();
+  UnprefixedOutput := TNNetVolume.Create();
+  try
+    // One tower per file, as CLIPTextModel / CLIPVisionModel save them.
+    TextReader.RemoveTensorsWithPrefix('vision_model.');
+    AssertTrue('text_model. keys renamed',
+      TextReader.RenameTensorPrefix('text_model.', '') > 0);
+    VisionReader.RemoveTensorsWithPrefix('text_model.');
+    AssertTrue('vision_model. keys renamed',
+      VisionReader.RenameTensorPrefix('vision_model.', '') > 0);
+
+    PrefixedNet := BuildClipTextTower(PrefixedReader, Config, csTextSeqLen,
+      'text_projection.weight', {pTrainable=}false);
+    UnprefixedNet := BuildClipTextTower(TextReader, Config,
+      csTextSeqLen, 'text_projection.weight', {pTrainable=}false);
+    Input.ReSize(csTextSeqLen, 1, 1);
+    for TokenPos := 0 to csTextSeqLen - 1 do
+      Input.FData[TokenPos] := (TokenPos * 7 + 3) mod Config.TextVocabSize;
+    PrefixedNet.Compute(Input);
+    PrefixedNet.GetOutput(PrefixedOutput);
+    UnprefixedNet.Compute(Input);
+    UnprefixedNet.GetOutput(UnprefixedOutput);
+    AssertEquals('text output size', PrefixedOutput.Size,
+      UnprefixedOutput.Size);
+    AssertEquals('text tower: unprefixed = prefixed', 0,
+      MaxAbsVolumeDiff(PrefixedOutput, UnprefixedOutput), 0);
+    FreeAndNil(PrefixedNet);
+    FreeAndNil(UnprefixedNet);
+
+    PrefixedNet := BuildClipVisionTower(PrefixedReader, Config.Vision,
+      Config.ImageSize, Config.PatchSize, Config.NumChannels,
+      Config.ProjectionDim, 'vision_model.', 'visual_projection.weight',
+      {pTrainable=}false);
+    UnprefixedNet := BuildClipVisionTower(VisionReader, Config.Vision,
+      Config.ImageSize, Config.PatchSize, Config.NumChannels,
+      Config.ProjectionDim, 'vision_model.', 'visual_projection.weight',
+      {pTrainable=}false);
+    Input.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    RandSeed := 31337;
+    Input.Randomize();
+    PrefixedNet.Compute(Input);
+    PrefixedNet.GetOutput(PrefixedOutput);
+    UnprefixedNet.Compute(Input);
+    UnprefixedNet.GetOutput(UnprefixedOutput);
+    AssertEquals('vision output size', PrefixedOutput.Size,
+      UnprefixedOutput.Size);
+    AssertEquals('vision tower: unprefixed = prefixed', 0,
+      MaxAbsVolumeDiff(PrefixedOutput, UnprefixedOutput), 0);
+  finally
+    UnprefixedOutput.Free;
+    PrefixedOutput.Free;
+    Input.Free;
+    UnprefixedNet.Free;
+    PrefixedNet.Free;
+    VisionReader.Free;
+    TextReader.Free;
+    PrefixedReader.Free;
   end;
 end;
 

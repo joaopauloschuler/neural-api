@@ -7922,7 +7922,7 @@ procedure BuildClipFromSafeTensors(const FileName: string;
   TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
-// CLIP TEXT tower alone from Reader ("text_model.*"): (SeqLen,1,1) ids -> per-token
+// CLIP TEXT tower alone from Reader ("text_model.*" or unprefixed): (SeqLen,1,1) ids -> per-token
 // features; '' projection: post-LN last_hidden_state. ExtraTokenRows: rows after the vocab.
 function BuildClipTextTower(Reader: TNNetSafeTensorsReader;
   const Config: TClipConfig; TextSeqLen: integer;
@@ -62132,6 +62132,17 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Prefix when Reader holds Prefix + ProbeName; '' when it holds ProbeName alone
+// (transformers >= 5 CLIPTextModel / CLIPVisionModel exports); else Prefix.
+function DetectOptionalTensorPrefix(Reader: TNNetSafeTensorsReader;
+  const Prefix, ProbeName: string): string;
+begin
+  Result := Prefix;
+  if (Prefix <> '') and not Reader.HasTensor(Prefix + ProbeName) and
+    Reader.HasTensor(ProbeName) then
+    Result := '';
+end;
+
 function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
@@ -62145,8 +62156,10 @@ var
   Tbl, WVol: TNNetVolume;
   Grid, NumPatches, BlockCnt, BuiltLayers: integer;
   BuiltLayersM1: integer;
-  PreLNName: string;
+  PreLNName, TensorPrefix: string;
 begin
+  TensorPrefix := DetectOptionalTensorPrefix(Reader, Prefix,
+    'embeddings.patch_embedding.weight');
   if (Tower.NumHeads < 1) or
      ((Tower.HiddenSize mod Tower.NumHeads) <> 0) then
     ImportError('CLIP import: vision hidden_size=' +
@@ -62218,20 +62231,20 @@ begin
 
     // ---------------- Weights ----------------
     LoadClipPatchConv(Reader, PatchConv,
-      Prefix + 'embeddings.patch_embedding.weight',
+      TensorPrefix + 'embeddings.patch_embedding.weight',
       NumChannels, PatchSize, Tower.HiddenSize);
     LoadClipEmbeddingTable(Reader, PosEmb,
-      Prefix + 'embeddings.position_embedding.weight',
+      TensorPrefix + 'embeddings.position_embedding.weight',
       NumPatches + 1, Tower.HiddenSize);
     // class_embedding [hidden] folded into position row 0 (see above).
-    if not Reader.HasTensor(Prefix + 'embeddings.class_embedding') then
-      ImportError('CLIP import: missing tensor "' + Prefix +
+    if not Reader.HasTensor(TensorPrefix + 'embeddings.class_embedding') then
+      ImportError('CLIP import: missing tensor "' + TensorPrefix +
         'embeddings.class_embedding".');
     Tbl := TNNetVolume.Create;
     try
-      Reader.LoadTensorFlat(Prefix + 'embeddings.class_embedding', Tbl);
+      Reader.LoadTensorFlat(TensorPrefix + 'embeddings.class_embedding', Tbl);
       if Tbl.Size <> Tower.HiddenSize then
-        ImportError('CLIP import: "' + Prefix +
+        ImportError('CLIP import: "' + TensorPrefix +
           'embeddings.class_embedding" must have ' +
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tbl.Size) + '.');
@@ -62243,18 +62256,18 @@ begin
     end;
     // modeling_clip's historical "pre_layrnorm" spelling; accept the
     // fixed spelling too in case an exporter normalizes it.
-    PreLNName := Prefix + 'pre_layrnorm';
+    PreLNName := TensorPrefix + 'pre_layrnorm';
     if not Reader.HasTensor(PreLNName + '.weight') then
-      PreLNName := Prefix + 'pre_layernorm';
+      PreLNName := TensorPrefix + 'pre_layernorm';
     LoadLayerNormWeights(Reader, PreLN, PreLNName + '.weight',
       PreLNName + '.bias', Tower.HiddenSize);
     for BlockCnt := 0 to BuiltLayersM1 do
       LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
-        Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
+        TensorPrefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
     if PostLN <> nil then
       LoadLayerNormWeights(Reader, PostLN,
-        Prefix + 'post_layernorm.weight',
-        Prefix + 'post_layernorm.bias', Tower.HiddenSize);
+        TensorPrefix + 'post_layernorm.weight',
+        TensorPrefix + 'post_layernorm.bias', Tower.HiddenSize);
     if Proj <> nil then
       LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
         Tower.HiddenSize, ProjectionDim); // bias-free: CAI biases zeroed
@@ -62504,7 +62517,10 @@ var
   TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
   SeqLen, BlockCnt, TextNumLayersM1, ExtraTokenCount: integer;
+  TextPrefix: string;
 begin
+  TextPrefix := DetectOptionalTensorPrefix(Reader, 'text_model.',
+    'embeddings.token_embedding.weight');
   ExtraTokenCount := 0;
   if Assigned(ExtraTokenRows) then
   begin
@@ -62551,18 +62567,18 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     LoadClipEmbeddingTable(Reader, TokEmb,
-      'text_model.embeddings.token_embedding.weight',
+      TextPrefix + 'embeddings.token_embedding.weight',
       Config.TextVocabSize, Config.Text.HiddenSize, ExtraTokenRows);
     LoadClipEmbeddingTable(Reader, PosEmb,
-      'text_model.embeddings.position_embedding.weight',
+      TextPrefix + 'embeddings.position_embedding.weight',
       Config.TextMaxPositions, Config.Text.HiddenSize);
     for BlockCnt := 0 to TextNumLayersM1 do
       LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
-        'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+        TextPrefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.',
         Config.Text);
     LoadLayerNormWeights(Reader, FinalLN,
-      'text_model.final_layer_norm.weight',
-      'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      TextPrefix + 'final_layer_norm.weight',
+      TextPrefix + 'final_layer_norm.bias', Config.Text.HiddenSize);
     if Proj <> nil then
       LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
         Config.Text.HiddenSize, Config.ProjectionDim); // bias-free
