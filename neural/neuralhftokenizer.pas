@@ -189,6 +189,10 @@ type
       FBertCleanText: boolean;    // BertNormalizer clean_text
       FBertHandleChinese: boolean;// BertNormalizer handle_chinese_chars
       FDecWordPieceCleanup: boolean; // WordPiece decoder cleanup flag
+      // CLIP (LoadCLIPVocabAndMerges): the CLIP split regex on lowercased text,
+      // byte-level alphabet, FEndOfWordSuffix on each piece's last symbol.
+      FClipPreTok: boolean;
+      FEndOfWordSuffix: string;
       // pre-tokenizer / normalizer
       FByteLevel: boolean;        // ByteLevel pre-tokenizer present
       FAddPrefixSpace: boolean;
@@ -296,6 +300,10 @@ type
       procedure EncodeSegment(const Segment: string; Ids: TIntegerList;
         IsFirstSegment: boolean);
       procedure ByteLevelPieces(const Segment: string; Pieces: TStringList);
+      procedure SplitClipPieces(const Segment: string; Pieces: TStringList);
+      // Fills FVocab / FIdToToken from a BPE vocab object (token -> id).
+      procedure LoadBPEVocabObject(VocabObj: TJSONObject;
+        ShieldedKeys: TStringList);
       procedure SplitCl100kPieces(const Segment: string;
         Pieces: TStringList);
       procedure SplitDeepSeekPieces(const Segment: string;
@@ -335,6 +343,10 @@ type
       // parsed/applied here; a standard NFKC/NFKD normalizer declared in a
       // tokenizer.json IS applied in full (see UnicodeNormalize).
       procedure LoadSentencePieceModel(const FileName: string);
+
+      // Loads a CLIP tokenizer from its slow-tokenizer files (the tokenizer/
+      // folder of Stable Diffusion 1.x/2.x: vocab.json + merges.txt).
+      procedure LoadCLIPVocabAndMerges(const VocabFile, MergesFile: string);
 
       // Loads the tokenizer straight from the tokenizer.ggml.* metadata of a
       // .gguf checkpoint, so a single .gguf file is self-contained for
@@ -1367,6 +1379,8 @@ begin
   FBertCleanText := false;
   FBertHandleChinese := false;
   FDecWordPieceCleanup := false;
+  FClipPreTok := false;
+  FEndOfWordSuffix := '';
   FNormPrepend := '';
   FNormUnicodeForm := '';
   FDecStripLeft := 0;
@@ -1411,6 +1425,20 @@ begin
     FByteToCP[B] := CP;
     FByteToStr[B] := CodePointToUTF8(CP);
     FCPToByte[CP] := B;
+  end;
+end;
+
+// The whole file as raw bytes.
+function HFReadFileBytes(const FileName: string): string;
+var
+  FS: TFileStream;
+begin
+  FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, FS.Size);
+    if FS.Size > 0 then FS.ReadBuffer(Result[1], FS.Size);
+  finally
+    FS.Free;
   end;
 end;
 
@@ -1730,14 +1758,12 @@ procedure TNeuralHFTokenizer.LoadFromFile(const FileName: string);
 var
   Root: TJSONData;
   RootObj, ModelObj, Entry: TJSONObject;
-  VocabObj: TJSONObject;
   MergesArr, AddedArr, SubArr, VocabArr: TJSONArray;
-  FS: TFileStream;
-  Cnt, TokenId, MaxId, UniCPLen: integer;
-  VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
-  VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
+  Cnt, UniCPLen: integer;
+  VocabCnt, MergesCnt, AddedCnt: integer;
+  VocabCntM1, AddedCntM1: integer;
   Score: double;
-  Left, Right, MergeStr, NormType, Content, Restored: string;
+  Left, Right, MergeStr, NormType, Content: string;
   SpacePos: integer;
   Node: TJSONData;
   ShieldedKeys: TStringList;
@@ -2069,13 +2095,7 @@ begin
   RaiseIfGitLfsPointer(FileName, EHFTokenizerError);
   ClearState();
   DetectKeyMangling();
-  FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
-  try
-    SetLength(RawJson, FS.Size);
-    if FS.Size > 0 then FS.ReadBuffer(RawJson[1], FS.Size);
-  finally
-    FS.Free;
-  end;
+  RawJson := HFReadFileBytes(FileName);
   // Sniff: a non-'{' first non-whitespace byte means this is a binary
   // ModelProto saved under a non-.model name (e.g. some tokenizer.model).
   if (Length(RawJson) > 0) and (RawJson[1] <> '{') and (RawJson[1] <> #$EF) then
@@ -2148,31 +2168,7 @@ begin
       if (Node <> nil) and not Node.IsNull then FUnkId := Node.AsInteger;
     end
     else
-    begin
-      VocabObj := ModelObj.Objects['vocab'];
-      VocabObjCnt := VocabObj.Count;
-      MaxId := -1;
-      VocabObjCntM1 := VocabObjCnt - 1;
-      for Cnt := 0 to VocabObjCntM1 do
-        MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
-      SetLength(FIdToToken, MaxId + 1);
-      FVocab.Sorted := false;
-      for Cnt := 0 to VocabObjCntM1 do
-      begin
-        TokenId := VocabObj.Items[Cnt].AsInteger;
-        Content := VocabObj.Names[Cnt];
-        Restored := HFUnshieldJSONKey(Content, ShieldedKeys);
-        if Restored <> Content then
-          // shielded long key: raw bytes captured before fpjson, so the
-          // widestring-manager mangling FixJSONKey inverts never happened
-          Content := Restored
-        else
-          Content := FixJSONKey(Content);
-        FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
-        FIdToToken[TokenId] := Content;
-      end;
-      HFEndBulkFill(FVocab);
-    end;
+      LoadBPEVocabObject(ModelObj.Objects['vocab'], ShieldedKeys);
 
     // merges: ["a b", ...] (old) or [["a","b"], ...] (new).
     // WordPiece (greedy longest-match) and Unigram (Viterbi) have no merges.
@@ -2262,6 +2258,109 @@ begin
     Root.Free;
     ShieldedKeys.Free;
   end;
+end;
+
+procedure TNeuralHFTokenizer.LoadBPEVocabObject(VocabObj: TJSONObject;
+  ShieldedKeys: TStringList);
+var
+  Cnt, TokenId, MaxId, MaxVocabPos: integer;
+  Content, Restored: string;
+begin
+  MaxId := -1;
+  MaxVocabPos := VocabObj.Count - 1;
+  for Cnt := 0 to MaxVocabPos do
+    MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
+  SetLength(FIdToToken, MaxId + 1);
+  FVocab.Sorted := false;
+  for Cnt := 0 to MaxVocabPos do
+  begin
+    TokenId := VocabObj.Items[Cnt].AsInteger;
+    Content := VocabObj.Names[Cnt];
+    Restored := HFUnshieldJSONKey(Content, ShieldedKeys);
+    if Restored <> Content then
+      // shielded long key: raw bytes captured before fpjson, so the
+      // widestring-manager mangling FixJSONKey inverts never happened
+      Content := Restored
+    else
+      Content := FixJSONKey(Content);
+    FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
+    FIdToToken[TokenId] := Content;
+  end;
+  HFEndBulkFill(FVocab);
+end;
+
+procedure TNeuralHFTokenizer.LoadCLIPVocabAndMerges(const VocabFile,
+  MergesFile: string);
+const
+  csSpecialTokens: array[0..1] of string = ('<|startoftext|>',
+    '<|endoftext|>');
+var
+  Root: TJSONData;
+  ShieldedKeys, MergeLines: TStringList;
+  MergeLine: string;
+  LinePos, MaxLinePos, SpacePos, Rank, SpecialPos, TokenId: integer;
+begin
+  RaiseIfGitLfsPointer(VocabFile, EHFTokenizerError);
+  RaiseIfGitLfsPointer(MergesFile, EHFTokenizerError);
+  ClearState();
+  DetectKeyMangling();
+  ShieldedKeys := TStringList.Create();
+  MergeLines := TStringList.Create();
+  Root := nil;
+  try
+    Root := ParseJSONRaw(HFShieldLongJSONKeys(
+      DecodeUnicodeEscapes(HFReadFileBytes(VocabFile)), ShieldedKeys));
+    if not (Root is TJSONObject) then
+      raise EHFTokenizerError.Create(VocabFile + ': root is not an object');
+    LoadBPEVocabObject(TJSONObject(Root), ShieldedKeys);
+    // merges.txt: an optional '#version' header, then one 'left right' per
+    // line; the rank is the line's position among the merges.
+    MergeLines.LoadFromFile(MergesFile);
+    MaxLinePos := MergeLines.Count - 1;
+    Rank := 0;
+    FMerges.Sorted := false;
+    for LinePos := 0 to MaxLinePos do
+    begin
+      MergeLine := MergeLines[LinePos];
+      if (MergeLine = '') or ((LinePos = 0) and
+        (Copy(MergeLine, 1, 9) = '#version:')) then continue;
+      SpacePos := Pos(' ', MergeLine);
+      if SpacePos <= 1 then
+        raise EHFTokenizerError.Create(MergesFile + ': line ' +
+          IntToStr(LinePos + 1) + ' is not a "left right" merge.');
+      FMerges.AddObject(Copy(MergeLine, 1, SpacePos - 1) + csMergeSep +
+        Copy(MergeLine, SpacePos + 1, Length(MergeLine)),
+        TObject(PtrInt(Rank)));
+      Inc(Rank);
+    end;
+    HFEndBulkFill(FMerges);
+    FMergeHashBuilt := false;   // merge pair hash must be rebuilt
+  finally
+    Root.Free;
+    MergeLines.Free;
+    ShieldedKeys.Free;
+  end;
+  // transformers CLIPTokenizer: NFC + lowercase normalizer (whitespace only
+  // separates pieces), the CLIP Split regex, ByteLevel, BPE with '</w>'.
+  FClipPreTok := true;
+  FEndOfWordSuffix := '</w>';
+  FNormUnicodeForm := 'NFC';
+  FBertLowercase := true;
+  FAddedIdIndexBuilt := false;
+  for SpecialPos := 0 to High(csSpecialTokens) do
+  begin
+    TokenId := VocabFind(csSpecialTokens[SpecialPos]);
+    if TokenId < 0 then
+      raise EHFTokenizerError.Create(VocabFile + ' has no ' +
+        csSpecialTokens[SpecialPos] + ' token.');
+    SetLength(FAddedTokens, Length(FAddedTokens) + 1);
+    FAddedTokens[High(FAddedTokens)].Content := csSpecialTokens[SpecialPos];
+    FAddedTokens[High(FAddedTokens)].Id := TokenId;
+    FAddedTokens[High(FAddedTokens)].Special := true;
+  end;
+  FBosId := FAddedTokens[0].Id;
+  FEosId := FAddedTokens[1].Id;
+  FUnkId := FEosId;
 end;
 
 type
@@ -3313,6 +3412,44 @@ begin
   end;
 end;
 
+// CLIP Split pattern 's|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+
+// (behavior removed, inverted): whitespace only separates the matches.
+procedure TNeuralHFTokenizer.SplitClipPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  CPs: TPieceCodePoints;
+  CPByte: TPieceByteOffsets;
+  Total, Idx, RunEnd: integer;
+begin
+  Total := DecodePieceCodePoints(Segment, CPs, CPByte);
+  Idx := 0;
+  while Idx < Total do
+  begin
+    RunEnd := MatchContractionAt(CPs, Idx, true);
+    if RunEnd > 0 then RunEnd := Idx + RunEnd - 1
+    else if IsLetterCP(CPs[Idx]) then
+    begin
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsLetterCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+    end
+    else if IsNumberCP(CPs[Idx]) then RunEnd := Idx
+    else if IsWhitespaceCP(CPs[Idx]) then
+    begin
+      Inc(Idx);
+      continue;
+    end
+    else
+    begin
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsOtherCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+    end;
+    Pieces.Add(Copy(Segment, CPByte[Idx], CPByte[RunEnd + 1] - CPByte[Idx]));
+    Idx := RunEnd + 1;
+  end;
+end;
+
 // The Digits pre-tokenizer: isolates \p{N} codepoints from everything else.
 // IndividualDigits=true -> every numeric codepoint is its own piece
 // (StarCoder2); false -> maximal numeric runs are single pieces (Falcon).
@@ -4335,7 +4472,7 @@ procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
 var
   Pieces, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
-  PieceLen: integer;
+  PieceLen, LastSymbolPos: integer;
   MSLen, NormLen: integer;
   Normalized: string;
   Seg, Piece: string;
@@ -4385,6 +4522,25 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
         WordPieceWord(Pieces[Cnt], Ids);
+    finally
+      Pieces.Free;
+    end;
+  end
+  else if FClipPreTok then
+  begin
+    // BertNormalize only lowercases here (the other Bert flags are off).
+    Pieces := TStringList.Create();
+    try
+      SplitClipPieces(BertNormalize(Seg), Pieces);
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
+      begin
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        LastSymbolPos := FSymbolBuf.Count - 1;
+        FSymbolBuf[LastSymbolPos] := FSymbolBuf[LastSymbolPos] +
+          FEndOfWordSuffix;
+        BPEWord(FSymbolBuf, Ids);
+      end;
     finally
       Pieces.Free;
     end;
@@ -4856,7 +5012,8 @@ end;
 
 function TNeuralHFTokenizer.DecodeIsConcatenative(): boolean;
 begin
-  Result := (not FWordPiece) and (FDecStripLeft = 0);
+  Result := (not FWordPiece) and (FDecStripLeft = 0) and
+    (FEndOfWordSuffix = '');
 end;
 
 function TNeuralHFTokenizer.DecodeCount(const Ids: array of integer;
@@ -4944,6 +5101,9 @@ begin
     Result := StringReplace(Result, ' ''ve', '''ve', [rfReplaceAll]);
     Result := StringReplace(Result, ' ''re', '''re', [rfReplaceAll]);
   end;
+  // CLIPTokenizer decode: each end-of-word suffix becomes a space, then strip.
+  if FEndOfWordSuffix <> '' then
+    Result := Trim(StringReplace(Result, FEndOfWordSuffix, ' ', [rfReplaceAll]));
   // decoder Strip(' ', start, 0): drop up to N leading spaces
   Stripped := 0;
   while (Stripped < FDecStripLeft) and (Length(Result) > Stripped) and

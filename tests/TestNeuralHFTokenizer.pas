@@ -30,6 +30,7 @@ type
     procedure TestMetaspaceParityWithHF;
     procedure TestWordPieceParityWithHF;
     procedure TestUnigramParityWithHF;
+    procedure TestCLIPVocabAndMergesParity;
     procedure TestUnigramSegmentationAndFusedUnk;
     // Raw SentencePiece .model protobuf reader (LoadSentencePieceModel):
     // ids must match the SentencePiece encoder oracle for every pinned
@@ -285,6 +286,51 @@ end;
 procedure TTestNeuralHFTokenizer.TestUnigramParityWithHF;
 begin
   RunParityBattery('unigram');
+end;
+
+// CLIP slow-tokenizer files (the Stable Diffusion tokenizer/ folder) against
+// transformers CLIPTokenizer ids from tools/make_pico_sd_pipeline_fixture.py.
+procedure TTestNeuralHFTokenizer.TestCLIPVocabAndMergesParity;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Cases, ExpectedIds: TJSONArray;
+  CaseObj: TJSONObject;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context, Folder: string;
+begin
+  Root := LoadFixtureJSON(FixturePath('tiny_sd15_pipeline_io.json'));
+  Folder := ExtractFilePath(FixturePath('tiny_sd15' + DirectorySeparator +
+    'tokenizer' + DirectorySeparator + 'vocab.json'));
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Tok.LoadCLIPVocabAndMerges(Folder + 'vocab.json', Folder + 'merges.txt');
+    AssertEquals('bos', Tok.GetVocabSize() - 2, Tok.BosId);
+    AssertEquals('eos', Tok.GetVocabSize() - 1, Tok.EosId);
+    Cases := TJSONObject(Root).Arrays['tokens'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('prompt', '');
+      ExpectedIds := CaseObj.Arrays['raw_ids'];
+      Context := 'case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+    end;
+    Ids.Clear;
+    Tok.Encode('A photo of an  Astronaut!', Ids);
+    AssertEquals('decode', 'a photo of an astronaut !', Tok.Decode(Ids, true));
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
 end;
 
 // Targeted Unigram checks: the IsUnigram flag, a known multi-character
