@@ -668,11 +668,14 @@ rather than acted on.
         - [ ] IP-Adapter extras: set_ip_adapter_scale per-block dicts
               (style/layout), several adapters/images, ip_adapter_masks,
               ip-adapter-plus (Resampler), FaceID, SDXL.
-        - [ ] TStableDiffusionIPAdapter.PredictNoise tells the CFG halves apart by
+        - [X] TStableDiffusionIPAdapter.PredictNoise tells the CFG halves apart by
               comparing the embeds object with the negative-prompt embeds
               (object identity). Pass an explicit "unguided half" flag through
               the conditioner hook instead, so a caller that copies the embeds
               cannot silently get the wrong image tokens.
+              DONE 2026-10-22: PredictNoise takes TStableDiffusionPassInputs
+              (sdpiPrompt, sdpiImage); IP-Adapter uses the zero-embedding
+              tokens when sdpiImage is absent.
         - [ ] Conditioner follow-ups from the 2026-10-22 batch:
               (1) cross-check CannyEdges against a real cv2.Canny run (cv2 is
               not in the ~/x venv; needs user approval to install it);
@@ -699,7 +702,7 @@ rather than acted on.
               output size: add a fixture whose sides are not a VAE-factor
               multiple (diffusers resizes a PIL image with lanczos after uint8
               rounding, a tensor with torch interpolate) and check the resize.
-      - [ ] InstructPix2Pix instruction-based image editing (port of diffusers
+      - [X] InstructPix2Pix instruction-based image editing (port of diffusers
             StableDiffusionInstructPix2PixPipeline; checkpoint
             timbrooks/instruct-pix2pix: "make it winter", "turn him into a
             statue"). The checkpoint is an SD 1.5 UNet with an 8-channel conv_in
@@ -734,6 +737,23 @@ rather than acted on.
             examples/StableDiffusion --edit-image PNG --image-guidance S (or a
             new examples/InstructPix2Pix with its README), then a real run on the
             user's GPU box.
+            DONE 2026-10-22: TStableDiffusionInstructPix2Pix over a new
+            TStableDiffusionImageConditioner base (SetImage / ImageSizeFor /
+            the VAE encode; TStableDiffusionImg2Img now derives from it too, so
+            InstructPix2Pix does not inherit strength / sample noise);
+            EncodeVaeImage(ApplyScalingFactor); conditioner hooks IsGuided +
+            PredictGuidedNoise (base = CFG) with PredictPass and an explicit
+            TStableDiffusionPassInputs flag; pico folder tiny_sd15_ip2p (Euler a
+            scheduler config) + --ip2p-only fixture; Euler a / DDIM at 7.5 / 1.5
+            and Euler a at 1 / 1 (one pass per step) match diffusers float64
+            < 1e-4 (TestStableDiffusionInstructPix2PixParity); CLI
+            examples/StableDiffusion --edit-image / --image-guidance.
+        - [ ] Run timbrooks/instruct-pix2pix on the user's GPU box (only the pico
+              fixture is tested; its F32 safetensors / fp16 variants unchecked).
+        - [ ] InstructPix2Pix extras: IP-Adapter on top of it (diffusers allows
+              it; one conditioner per Denoise today), an --edit-image whose
+              sides are not a VAE-factor multiple (resize parity, see (6)
+              above), and PAG/SLG-style extra passes through PredictGuidedNoise.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):

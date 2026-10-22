@@ -24,6 +24,9 @@ h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
 diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
 [--strength S] turns it into image-to-image (diffusers
 StableDiffusionImg2ImgPipeline): the output takes the image's size.
+--edit-image PNG [--image-guidance S] edits the image as the prompt instructs
+with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
+StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -59,6 +62,9 @@ type
     // --init-image ('' for text-to-image) and its --strength.
     InitImageFile: string;
     Strength: double;
+    // --edit-image ('' for none) and its --image-guidance (< 0: default).
+    EditImageFile: string;
+    ImageGuidanceScale: double;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
@@ -201,6 +207,14 @@ begin
   WriteLn('  --strength S      how much of --init-image to repaint, (0, 1] ',
     '(default 0.8);');
   WriteLn('                    runs the last int(steps * S) steps');
+  WriteLn('  --edit-image PNG  InstructPix2Pix: edit this image as the prompt ',
+    'says (needs an');
+  WriteLn('                    8-channel UNet folder, e.g. ',
+    'timbrooks/instruct-pix2pix); the output');
+  WriteLn('                    takes its size (rounded down to the VAE factor)');
+  WriteLn('  --image-guidance S how closely --edit-image is kept (default 1.5; ',
+    '< 1 turns all');
+  WriteLn('                    guidance off)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -255,6 +269,8 @@ begin
   Opt.IPScale := 1.0;
   Opt.InitImageFile := '';
   Opt.Strength := -1;
+  Opt.EditImageFile := '';
+  Opt.ImageGuidanceScale := -1;
   Opt.SamplerName := 'auto';
   Opt.Steps := 25;
   Opt.ImageWidth := 0;
@@ -302,6 +318,9 @@ begin
     else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
     else if Arg = '--strength' then
       Opt.Strength := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--edit-image' then Opt.EditImageFile := NextArg()
+    else if Arg = '--image-guidance' then
+      Opt.ImageGuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -325,6 +344,12 @@ begin
     raise Exception.Create('--strength needs --init-image');
   if (Opt.InitImageFile <> '') and (Opt.IPAdapterFile <> '') then
     raise Exception.Create('--init-image and --ip-adapter cannot be combined');
+  if (Opt.ImageGuidanceScale >= 0) and (Opt.EditImageFile = '') then
+    raise Exception.Create('--image-guidance needs --edit-image');
+  if (Opt.EditImageFile <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.IPAdapterFile <> '')) then
+    raise Exception.Create('--edit-image cannot be combined with ' +
+      '--init-image or --ip-adapter');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
@@ -360,7 +385,10 @@ var
   Reporter: TStableDiffusionReporter;
   IPAdapter: TStableDiffusionIPAdapter;
   Img2Img: TStableDiffusionImg2Img;
+  InstructPix2Pix: TStableDiffusionInstructPix2Pix;
+  ImageConditioner: TStableDiffusionImageConditioner;
   Image, PromptEmbeds: TNNetVolume;
+  SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos: integer;
   Seed: cardinal;
@@ -374,6 +402,8 @@ begin
   Reporter := TStableDiffusionReporter.Create;
   IPAdapter := nil;
   Img2Img := nil;
+  InstructPix2Pix := nil;
+  ImageConditioner := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
   try
@@ -393,12 +423,26 @@ begin
     if Opt.InitImageFile <> '' then
     begin
       Img2Img := TStableDiffusionImg2Img.Create();
-      if not LoadImageFromFileIntoVolume(Opt.InitImageFile, Image) then
-        raise Exception.Create('could not load ' + Opt.InitImageFile);
-      Img2Img.SetImage(Image);
       if Opt.Strength >= 0 then Img2Img.Strength := Opt.Strength;
-      Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
-      Pipeline.Conditioner := Img2Img;
+      ImageConditioner := Img2Img;
+      SourceImageFile := Opt.InitImageFile;
+    end
+    else if Opt.EditImageFile <> '' then
+    begin
+      InstructPix2Pix := TStableDiffusionInstructPix2Pix.Create();
+      if Opt.ImageGuidanceScale >= 0 then
+        InstructPix2Pix.ImageGuidanceScale := Opt.ImageGuidanceScale;
+      ImageConditioner := InstructPix2Pix;
+      SourceImageFile := Opt.EditImageFile;
+    end;
+    if Assigned(ImageConditioner) then
+    begin
+      if not LoadImageFromFileIntoVolume(SourceImageFile, Image) then
+        raise Exception.Create('could not load ' + SourceImageFile);
+      ImageConditioner.SetImage(Image);
+      ImageConditioner.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth,
+        ImageHeight);
+      Pipeline.Conditioner := ImageConditioner;
     end;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
@@ -438,6 +482,10 @@ begin
         [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
          Opt.Steps - TNNetDiffusionScheduler.Img2ImgStartStep(Opt.Steps,
          Img2Img.Strength), Opt.Steps]));
+    if Assigned(InstructPix2Pix) then
+      WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',
+        [Opt.EditImageFile, Image.SizeX, Image.SizeY,
+         InstructPix2Pix.ImageGuidanceScale]));
     if Opt.IPAdapterFile <> '' then
     begin
       IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
@@ -495,7 +543,7 @@ begin
     Image.Free;
     Pipeline.Free;
     IPAdapter.Free;
-    Img2Img.Free;
+    ImageConditioner.Free;
     Reporter.Free;
   end;
 end;

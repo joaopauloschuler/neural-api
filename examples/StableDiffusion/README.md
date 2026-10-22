@@ -1,7 +1,7 @@
 # StableDiffusion
 
-Text-to-image and image-to-image with a diffusers Stable Diffusion 1.x
-folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
+Text-to-image, image-to-image and InstructPix2Pix image editing with a
+diffusers Stable Diffusion 1.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
 
 One `Generate` call:
 
@@ -105,6 +105,32 @@ PNDM, DPM-Solver++ 2M, Euler and Euler a (replayed step noise), and with DDIM
 at strength 1 (`TestStableDiffusionImg2ImgParity`). No real checkpoint has
 been run yet.
 
+`--edit-image PNG [--image-guidance S]` edits the image as the prompt
+instructs ("make it winter"), as diffusers
+`StableDiffusionInstructPix2PixPipeline` (`TStableDiffusionInstructPix2Pix`).
+It needs an InstructPix2Pix folder such as `timbrooks/instruct-pix2pix`,
+whose UNet takes 8 channels: the latents and the VAE latent mean of the
+image. Every step runs three UNet passes (prompt + image, image only, neither)
+and combines them as
+`uncond + guidance * (text - image) + image_guidance * (image - uncond)`.
+S (default 1.5) sets how closely the output keeps the image. Guidance is on
+when `--guidance` > 1 and S >= 1; otherwise each step runs one pass. All steps
+run from pure noise. The output takes the image's size, rounded down to a
+multiple of the VAE factor. `--edit-image` cannot be combined with
+`--init-image` or `--ip-adapter`:
+
+```
+StableDiffusion --model ~/models/instruct-pix2pix \
+  --edit-image photo.png --image-guidance 1.5 --steps 20 \
+  --prompt "turn him into a statue"
+```
+
+Tested against diffusers float64 on a pico 8-channel folder
+(`tests/fixtures/tiny_sd15_ip2p`) with Euler a (the checkpoint's scheduler,
+replayed step noise) and DDIM at guidance 7.5 / image guidance 1.5, and at
+1 / 1 (`TestStableDiffusionInstructPix2PixParity`). No real checkpoint has
+been run yet.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -153,6 +179,11 @@ StableDiffusion [--model DIR] [options]
                     (rounded down to the VAE factor) unless --width/--height
   --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);
                     runs the last int(steps * S) steps
+  --edit-image PNG  InstructPix2Pix: edit this image as the prompt says (needs an
+                    8-channel UNet folder, e.g. timbrooks/instruct-pix2pix); the
+                    output takes its size (rounded down to the VAE factor)
+  --image-guidance S how closely --edit-image is kept (default 1.5; < 1 turns all
+                    guidance off)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

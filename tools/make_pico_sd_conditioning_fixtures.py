@@ -65,6 +65,17 @@ not matter; values rounded to 10 digits):
   tests/fixtures/tiny_sd15_ip_adapter_io.json
       StableDiffusionPipeline + load_ip_adapter: ip_image (H,W,3) in 0..255,
       ip_scale, the image_embeds, latents, timesteps, latents_after, image
+  tests/fixtures/tiny_sd15_ip2p/
+      a copy of tiny_sd15 whose unet takes 8 channels (latents | image
+      latents) and whose scheduler is EulerAncestralDiscreteScheduler, as
+      timbrooks/instruct-pix2pix; model_index names
+      StableDiffusionInstructPix2PixPipeline
+  tests/fixtures/tiny_sd15_ip2p_io.json
+      StableDiffusionInstructPix2PixPipeline on tiny_sd15_ip2p: a
+      IMG2IMG_WIDTH x IMG2IMG_HEIGHT image, STEPS steps of Euler a and DDIM at
+      guidance GUIDANCE / image guidance IMAGE_GUIDANCE (three UNet passes),
+      and Euler a at 1 / 1 (one pass). The noise and Euler a's per-step noise
+      are injected.
 
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
@@ -76,10 +87,12 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py --inpaint-strength-only
   python tools/make_pico_sd_conditioning_fixtures.py --ip-adapter-only
   python tools/make_pico_sd_conditioning_fixtures.py --img2img-only
+  python tools/make_pico_sd_conditioning_fixtures.py --ip2p-only
 (--nonsquare-only keeps the committed folders and writes only the two
 non-square files; --inpaint-strength-only writes only the strength file;
 --ip-adapter-only writes only the IP-Adapter folder and its file;
---img2img-only writes only the img2img file.)
+--img2img-only writes only the img2img file; --ip2p-only writes only the
+InstructPix2Pix folder and its file.)
 """
 import json
 import os
@@ -91,12 +104,13 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file, save_file
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
-from diffusers import (ControlNetModel, DPMSolverMultistepScheduler,
+from diffusers import (ControlNetModel, DDIMScheduler, DPMSolverMultistepScheduler,
                        EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                        PNDMScheduler, StableDiffusionAdapterPipeline,
                        StableDiffusionControlNetPipeline,
                        StableDiffusionImg2ImgPipeline,
-                       StableDiffusionInpaintPipeline, StableDiffusionPipeline,
+                       StableDiffusionInpaintPipeline,
+                       StableDiffusionInstructPix2PixPipeline, StableDiffusionPipeline,
                        T2IAdapter, UNet2DConditionModel)
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint as inpaint_module
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
@@ -117,6 +131,8 @@ CONTROLNET_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_nonsquare
 ADAPTER_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_nonsquare_io.json")
 IP_ADAPTER_DIR = os.path.join(FIXTURES, "tiny_sd15_ip_adapter")
 IP_ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_ip_adapter_io.json")
+IP2P_DIR = os.path.join(FIXTURES, "tiny_sd15_ip2p")
+IP2P_IO = os.path.join(FIXTURES, "tiny_sd15_ip2p_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
@@ -136,6 +152,7 @@ IP_SCALE = 0.7
 IP_IMAGE_WIDTH = 20      # resized (shortest edge) and center-cropped to 8x8
 IP_IMAGE_HEIGHT = 13
 IP_TOKENS = 4            # diffusers ImageProjection of an ip-adapter_sd15
+IMAGE_GUIDANCE = 1.5
 PROMPT = "a photo of an astronaut riding a horse on mars"
 
 
@@ -173,7 +190,8 @@ def initial_latents(width=IMAGE_SIZE, height=IMAGE_SIZE):
 
 
 def run(pipe, extra, latents, euler=False, legacy_callback=False,
-        width=IMAGE_SIZE, height=IMAGE_SIZE, steps=STEPS, sized=True):
+        width=IMAGE_SIZE, height=IMAGE_SIZE, steps=STEPS, sized=True,
+        guidance=GUIDANCE):
     pipe.set_progress_bar_config(disable=True)
     if width % 8 or height % 8:
         pipe.check_inputs = lambda *args, **kwargs: None
@@ -198,7 +216,7 @@ def run(pipe, extra, latents, euler=False, legacy_callback=False,
         # img2img takes its size from the image and draws its own noise.
         extra = dict(extra, height=height, width=width,
                      latents=None if latents is None else latents.clone())
-    result = pipe(PROMPT, num_inference_steps=steps, guidance_scale=GUIDANCE,
+    result = pipe(PROMPT, num_inference_steps=steps, guidance_scale=guidance,
                   output_type="np", **extra)
     return {"timesteps": [int(t) for t in pipe.scheduler.timesteps],
             "latents_after": after,
@@ -519,8 +537,78 @@ def make_ip_adapter():
     print("ip-adapter timesteps", out["timesteps"])
 
 
+def make_ip2p_folder():
+    torch.manual_seed(SEED + 40)
+    if os.path.isdir(IP2P_DIR):
+        shutil.rmtree(IP2P_DIR)
+    shutil.copytree(PICO_DIR, IP2P_DIR)
+    base = UNet2DConditionModel.from_pretrained(os.path.join(PICO_DIR, "unet"))
+    config = dict(base.config)
+    config["in_channels"] = 8
+    unet = UNet2DConditionModel.from_config(config)
+    perturb(unet)
+    unet_dir = os.path.join(IP2P_DIR, "unet")
+    shutil.rmtree(unet_dir)
+    unet.save_pretrained(unet_dir, safe_serialization=True)
+    scheduler_file = os.path.join(IP2P_DIR, "scheduler", "scheduler_config.json")
+    with open(scheduler_file) as f:
+        scheduler = json.load(f)
+    scheduler["_class_name"] = "EulerAncestralDiscreteScheduler"
+    with open(scheduler_file, "w") as f:
+        json.dump(scheduler, f, indent=2)
+    index_file = os.path.join(IP2P_DIR, "model_index.json")
+    with open(index_file) as f:
+        index = json.load(f)
+    index["_class_name"] = "StableDiffusionInstructPix2PixPipeline"
+    index["scheduler"] = ["diffusers", "EulerAncestralDiscreteScheduler"]
+    with open(index_file, "w") as f:
+        json.dump(index, f, indent=2)
+
+
+def make_ip2p():
+    make_ip2p_folder()
+    image = byte_image(torch.Generator().manual_seed(SEED + 41), 3,
+                       IMG2IMG_WIDTH, IMG2IMG_HEIGHT)
+    noise = initial_latents(IMG2IMG_WIDTH, IMG2IMG_HEIGHT)
+    generator = torch.Generator().manual_seed(SEED + 42)
+    step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(STEPS)]
+    pending_step_noise = []
+    euler_a_module.randn_tensor = lambda *args, **kwargs: pending_step_noise.pop(0).clone()
+    cases = []
+    for name, ddim, guidance, image_guidance in (
+            ("euler_a", False, GUIDANCE, IMAGE_GUIDANCE),
+            ("ddim", True, GUIDANCE, IMAGE_GUIDANCE),
+            ("euler_a_unguided", False, 1.0, 1.0)):
+        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+            IP2P_DIR, torch_dtype=torch.float64, safety_checker=None)
+        if ddim:
+            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        pending_step_noise[:] = step_noise
+        euler = not ddim
+        out = run(pipe, {"image": image, "image_guidance_scale": image_guidance,
+                         "latents": noise.clone()},
+                  None, euler, sized=False, guidance=guidance)
+        out["name"] = name
+        out["scheduler"] = type(pipe.scheduler).__name__
+        out["guidance_scale"] = guidance
+        out["image_guidance_scale"] = image_guidance
+        cases.append(out)
+        print(name, out["timesteps"])
+    payload = {"width": IMG2IMG_WIDTH, "height": IMG2IMG_HEIGHT,
+               "steps": STEPS, "prompt": PROMPT, "init_image": hwc(image),
+               "latents": chw(noise[0]),
+               "step_noise": [chw(item[0]) for item in step_noise],
+               "cases": cases}
+    with open(IP2P_IO, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
+    if "--ip2p-only" in sys.argv:
+        make_ip2p()
+        sys.exit(0)
     if "--ip-adapter-only" in sys.argv:
         make_ip_adapter()
         sys.exit(0)
@@ -540,3 +628,4 @@ if __name__ == "__main__":
     make_adapter_nonsquare()
     if "--nonsquare-only" not in sys.argv:
         make_ip_adapter()
+        make_ip2p()

@@ -12124,21 +12124,35 @@ type
 
   TStableDiffusionPipeline = class;
 
+  // The inputs one UNet pass of a guided step sees: the prompt (else the
+  // negative prompt) and the conditioner's guided image (IP-Adapter, InstructPix2Pix).
+  TStableDiffusionPassInput = (sdpiPrompt, sdpiImage);
+  TStableDiffusionPassInputs = set of TStableDiffusionPassInput;
+
   // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
-  // T2I-Adapter, IP-Adapter, img2img, inpainting); this base runs the plain
-  // UNet. Coded by Claude (AI).
+  // T2I-Adapter, IP-Adapter, img2img, inpainting, InstructPix2Pix); this base
+  // runs the plain UNet with CFG. Coded by Claude (AI).
   TStableDiffusionConditioner = class(TObject)
   protected
     FPipeline: TStableDiffusionPipeline;
     // FPipeline.ComponentEpoch when the nets below were built.
     FNetEpoch: integer;
+    // The predictions of the extra passes of PredictGuidedNoise.
+    FGuidancePreds: array[0..1] of TNNetVolume;
     // Opens sdphLoadUNet unless it is the open phase: the conditioner's
     // own nets load (and run once) there.
     procedure StartLoadPhase();
     // True when a net built at FNetEpoch for this grid is still usable.
     function IsNetCurrent(Net: TNNet; NetGridX, NetGridY, GridX,
       GridY: integer): boolean;
+    // PredictNoise on PromptEmbeds (sdpiPrompt in Inputs) or the negative
+    // embeds; counted in the pipeline's ImageStats.UNetPassCount.
+    procedure PredictPass(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume);
   public
+    constructor Create();
+    destructor Destroy(); override;
     // Builds the UNet with the ControlNet skip / T2I-Adapter inputs.
     function UNetWithControl(): boolean; virtual;
     function UNetWithAdapter(): boolean; virtual;
@@ -12157,11 +12171,18 @@ type
     // StartsFromImage: Latents (the unit noise) := the image latents noised to
     // the 1-based timestep Tt (diffusers add_noise). This base raises.
     procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); virtual;
+    // True when the steps need the negative prompt (base: GuidanceScale > 1).
+    function IsGuided(GuidanceScale: TNeuralFloat): boolean; virtual;
+    // Pred := one step's guided prediction from PredictPass calls; this base
+    // is CFG: the full pass, plus the input-free one when IsGuided.
+    procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); virtual;
     // Pred := the UNet output for Latents (model-input scale) and Embeds at
-    // diffusers timestep Timestep.
+    // diffusers timestep Timestep, for the pass that sees Inputs.
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Pred: TNNetVolume); virtual;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); virtual;
     // After the sampler step that reached NextTt (1-based; 0 = clean).
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); virtual;
     // Frees the nets unless the pipeline keeps its components loaded.
@@ -12306,8 +12327,8 @@ type
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
     // StepCount Sampler steps on Latents in place (unit noise in, scaled by
-    // the sampler's init noise sigma; clean out); each UNet pass goes through
-    // Conditioner, the unconditional one too when GuidanceScale > 1 (CFG).
+    // the sampler's init noise sigma; clean out); Conditioner.PredictGuidedNoise
+    // runs the UNet passes of each step (CFG when GuidanceScale > 1).
     // A Conditioner strength < 1 runs only the last steps. Euler a draws its
     // noise from OnAncestralNoise or the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
@@ -12315,7 +12336,7 @@ type
     // VAE latents of VaeImage (W, H, 3) in [-1, 1], (W, H) / VaeScaleFactor:
     // (mean + std * SampleNoise; nil: mean) * scaling_factor (latent_dist.sample).
     procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume;
-      SampleNoise: TNNetVolume = nil);
+      SampleNoise: TNNetVolume = nil; ApplyScalingFactor: boolean = true);
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
       Image: TNNetVolume);
@@ -12357,8 +12378,8 @@ type
     // When set, Euler a takes each step's noise from it, not the global RNG.
     property OnAncestralNoise: TStableDiffusionNoiseEvent
       read FOnAncestralNoise write FOnAncestralNoise;
-    // ControlNet / T2I-Adapter / IP-Adapter / img2img / inpainting for later Denoise
-    // calls; nil runs the plain UNet. Not owned.
+    // ControlNet / T2I-Adapter / IP-Adapter / img2img / inpainting /
+    // InstructPix2Pix for later Denoise calls; nil runs the plain UNet. Not owned.
     property Conditioner: TStableDiffusionConditioner read FConditioner
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
@@ -12573,7 +12594,7 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Pred: TNNetVolume); override;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers controlnet_conditioning_scale (1.0).
     property ConditioningScale: TNeuralFloat read FConditioningScale
@@ -12602,7 +12623,7 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Pred: TNNetVolume); override;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers adapter_conditioning_scale (1.0).
     property ConditioningScale: TNeuralFloat read FConditioningScale
@@ -12610,13 +12631,32 @@ type
     property Config: TT2IAdapterConfig read FConfig;
   end;
 
-  // diffusers StableDiffusionImg2ImgPipeline: the last Img2ImgStartStep steps
-  // run from the sampled VAE latents of the image noised to the first of them.
-  TStableDiffusionImg2Img = class(TStableDiffusionConditioner)
+  // A conditioner over one source image, which BeginDenoise VAE-encodes at
+  // the output size (img2img, inpainting, InstructPix2Pix).
+  TStableDiffusionImageConditioner = class(TStableDiffusionConditioner)
   protected
     FSourceImage: TNNetVolume;
-    // The image latents and the unit noise the run started from.
-    FImageLatents, FNoise: TNNetVolume;
+    FImageLatents: TNNetVolume;
+    // From BeginDenoise: VaeImage is the image at the latent size in [-1, 1].
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); virtual; abstract;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // The image (W, H, 3|4) in 0..255; resized to the image size.
+    procedure SetImage(Image: TNNetVolume);
+    // diffusers get_default_height_width: the image sides rounded down to a
+    // multiple of VaeScaleFactor.
+    procedure ImageSizeFor(VaeScaleFactor: integer; out Width, Height: integer);
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+  end;
+
+  // diffusers StableDiffusionImg2ImgPipeline: the last Img2ImgStartStep steps
+  // run from the sampled VAE latents of the image noised to the first of them.
+  TStableDiffusionImg2Img = class(TStableDiffusionImageConditioner)
+  protected
+    // The unit noise the run started from.
+    FNoise: TNNetVolume;
     // The unit Gaussian noise of the image latent sample.
     FImageSampleNoise: TNNetVolume;
     FHasSampleNoise: boolean;
@@ -12625,19 +12665,13 @@ type
     // Noise := the set sample noise (raises unless it matches Latents) or a
     // global-RNG draw.
     procedure PrepareSampleNoise(Noise, Latents: TNNetVolume);
-    // From BeginDenoise: VaeImage is the image at the latent size in [-1, 1].
-    procedure EncodeImage(VaeImage, Latents: TNNetVolume); virtual;
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
   public
     constructor Create();
     destructor Destroy(); override;
-    // The image (W, H, 3|4) in 0..255; resized to the image size.
-    procedure SetImage(Image: TNNetVolume);
     // The unit noise of the VAE latent sample (zeros: the latent mean); until
     // set, BeginDenoise draws it from the global RNG.
     procedure SetSampleNoise(ImageNoise: TNNetVolume); overload;
-    // diffusers get_default_height_width: the image sides rounded down to a
-    // multiple of VaeScaleFactor.
-    procedure ImageSizeFor(VaeScaleFactor: integer; out Width, Height: integer);
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
     function DenoiseStrength(): double; override;
@@ -12676,10 +12710,40 @@ type
     function StartsFromImage(): boolean; override;
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Pred: TNNetVolume); override;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
     // True after BeginDenoise saw a 9-channel inpainting UNet.
     property IsConcatUNet: boolean read FIsConcatUNet;
+  end;
+
+  // diffusers StableDiffusionInstructPix2PixPipeline (timbrooks/instruct-pix2pix):
+  // an 8-channel UNet sees latents | the VAE latent mean of the image (unscaled).
+  TStableDiffusionInstructPix2Pix = class(TStableDiffusionImageConditioner)
+  private
+    // latents | image latents; zeros stand in for the image in the passes
+    // without sdpiImage.
+    FUNetInput, FZeroImageLatents: TNNetVolume;
+    FImageGuidanceScale: TNeuralFloat;
+  protected
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    // diffusers: guided when GuidanceScale > 1 and ImageGuidanceScale >= 1.
+    function IsGuided(GuidanceScale: TNeuralFloat): boolean; override;
+    // Guided: uncond + g * (text - image) + ig * (image - uncond) over the
+    // passes [prompt, image], [image] and [].
+    procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    // diffusers image_guidance_scale (1.5): the pull toward the input image.
+    property ImageGuidanceScale: TNeuralFloat read FImageGuidanceScale
+      write FImageGuidanceScale;
   end;
 
 // ---------------------------------------------------------------------------
@@ -12788,7 +12852,7 @@ type
     FImageEncoder, FImageProj: TNNet;
     FSourceImage, FPixels, FImageEmbeds, FZeroEmbeds: TNNetVolume;
     // to_k_ip tokens and the Scale-weighted to_v_ip ones, of the image and
-    // of the zero embedding (the unguided CFG half).
+    // of the zero embedding (the passes without sdpiImage).
     FImageTokens, FImageValueTokens: TNNetVolume;
     FUncondTokens, FUncondValueTokens: TNNetVolume;
     FScale: TNeuralFloat;
@@ -12807,7 +12871,7 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Pred: TNNetVolume); override;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers set_ip_adapter_scale (1.0); 0 leaves the text attention alone.
     property Scale: TNeuralFloat read FScale write FScale;
@@ -92782,7 +92846,8 @@ begin
     (ClassName = 'StableDiffusionControlNetPipeline') or
     (ClassName = 'StableDiffusionAdapterPipeline') or
     (ClassName = 'StableDiffusionInpaintPipeline') or
-    (ClassName = 'StableDiffusionImg2ImgPipeline');
+    (ClassName = 'StableDiffusionImg2ImgPipeline') or
+    (ClassName = 'StableDiffusionInstructPix2PixPipeline');
 end;
 
 constructor TStableDiffusionPipeline.Create(const ModelFolder: string);
@@ -92857,9 +92922,11 @@ begin
   if FUNetConfig.UseAddEmbedding then
     ImportError('TStableDiffusionPipeline: the unet uses SDXL ' +
       'addition_embed_type "text_time"; SDXL is not supported yet.');
-  // An inpainting UNet takes latents | mask | masked-image latents.
+  // An inpainting UNet takes latents | mask | masked-image latents, an
+  // InstructPix2Pix one latents | image latents.
   if ((FUNetConfig.InChannels <> FVaeConfig.LatentChannels) and
-    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels + 1)) or
+    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels + 1) and
+    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels)) or
     (FUNetConfig.OutChannels <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline: unet in/out_channels ' +
       IntToStr(FUNetConfig.InChannels) + '/' +
@@ -93161,19 +93228,32 @@ begin
 end;
 
 procedure TStableDiffusionPipeline.EncodeVaeImage(VaeImage,
-  Latents: TNNetVolume; SampleNoise: TNNetVolume);
+  Latents: TNNetVolume; SampleNoise: TNNetVolume; ApplyScalingFactor: boolean);
 var
   Net: TNNet;
-  Moments: TNNetLayer;
+  Moments, Mean: TNNetLayer;
   GridX, GridY, LatentChannels, CellPos, MaxCellPos, ChannelPos,
     MaxChannelPos, LatentPos, LogVarPos: integer;
-  LogVar, StdScale: TNeuralFloat;
+  LogVar, StdScale, LatentScale: TNeuralFloat;
 begin
   LatentGridFor(VaeImage.SizeX, VaeImage.SizeY, GridX, GridY);
   Net := AcquireVaeEncoder(GridX, GridY);
   try
     Net.Compute(VaeImage);
-    Net.GetOutput(Latents);
+    if ApplyScalingFactor then
+    begin
+      Net.GetOutput(Latents);
+      LatentScale := FVaeConfig.ScalingFactor;
+    end
+    else
+    begin
+      // The mean split, before the scaling_factor layer.
+      Mean := Net.Layers[Net.GetLastLayerIdx() - 1];
+      Mean.ForceOutputOnRAM();
+      Latents.ReSize(Mean.Output);
+      Latents.Copy(Mean.Output);
+      LatentScale := 1;
+    end;
     if Assigned(SampleNoise) then
     begin
       if SampleNoise.Size <> Latents.Size then
@@ -93199,7 +93279,7 @@ begin
           LogVar := Moments.Output.FData[LogVarPos + ChannelPos];
           if LogVar < -30 then LogVar := -30
           else if LogVar > 20 then LogVar := 20;
-          StdScale := FVaeConfig.ScalingFactor * Exp(0.5 * LogVar);
+          StdScale := LatentScale * Exp(0.5 * LogVar);
           Latents.FData[LatentPos] := Latents.FData[LatentPos] +
             StdScale * SampleNoise.FData[LatentPos];
           Inc(LatentPos);
@@ -93530,7 +93610,7 @@ var
   Net: TNNet;
   StepConditioner: TStableDiffusionConditioner;
   Schedule: TNeuralIntegerArray;
-  Pred, PredUncond, StepNoise: TNNetVolume;
+  Pred, StepNoise: TNNetVolume;
   IsGuided: boolean;
   GridX, GridY, StepPos, MaxStepPos, Tt, StartStep: integer;
   Eta, NoiseScale: TNeuralFloat;
@@ -93542,14 +93622,15 @@ begin
     ImportError('TStableDiffusionPipeline.Denoise: a ' +
       StepConditioner.ClassName + ' cannot feed a unet of ' +
       IntToStr(FUNetConfig.InChannels) + ' input channels (an inpainting ' +
-      'unet needs a TStableDiffusionInpainter).');
+      'unet needs a TStableDiffusionInpainter, an InstructPix2Pix one a ' +
+      'TStableDiffusionInstructPix2Pix).');
   if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
     (Latents.Depth <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
       IntToStr(Latents.Depth) + ' do not match a ' + IntToStr(Width) +
       'x' + IntToStr(Height) + ' image.');
-  IsGuided := FGuidanceScale > 1;
+  IsGuided := StepConditioner.IsGuided(FGuidanceScale);
   if IsGuided and not FHasNegativePromptEmbeds then
   begin
     EncodeTokenIdLists([TokenizePrompt(FNegativePrompt)],
@@ -93567,7 +93648,6 @@ begin
     StepConditioner.UNetWithControl(), StepConditioner.UNetWithAdapter(),
     StepConditioner.UNetIPAdapterFile());
   Pred := TNNetVolume.Create();
-  PredUncond := TNNetVolume.Create();
   StepNoise := nil;
   try
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
@@ -93599,17 +93679,8 @@ begin
     begin
       // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
       Tt := Schedule[StepPos];
-      StepConditioner.PredictNoise(Net, StepConfig, Latents, PromptEmbeds, Tt - 1,
-        Pred);
-      Inc(FImageStats.UNetPassCount);
-      if IsGuided then
-      begin
-        StepConditioner.PredictNoise(Net, StepConfig, Latents,
-          FNegativePromptEmbeds, Tt - 1, PredUncond);
-        Inc(FImageStats.UNetPassCount);
-        TNNetDiffusionScheduler.ApplyCFG(Pred, PredUncond, Pred,
-          FGuidanceScale);
-      end;
+      StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
+        PromptEmbeds, Tt - 1, Pred);
       if Assigned(StepNoise) then FOnAncestralNoise(StepPos, StepNoise);
       FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, Eta,
         StepNoise);
@@ -93620,7 +93691,6 @@ begin
     EndPhase();
     StepConditioner.EndDenoise();
     StepNoise.Free;
-    PredUncond.Free;
     Pred.Free;
     ReleaseComponent(Net);
   end;
@@ -93693,6 +93763,52 @@ begin
   end;
 end;
 
+constructor TStableDiffusionConditioner.Create();
+begin
+  inherited Create();
+  FGuidancePreds[0] := TNNetVolume.Create();
+  FGuidancePreds[1] := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionConditioner.Destroy();
+begin
+  FGuidancePreds[1].Free;
+  FGuidancePreds[0].Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionConditioner.PredictPass(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  if sdpiPrompt in Inputs then
+    PredictNoise(UNet, Config, Latents, PromptEmbeds, Timestep, Inputs, Pred)
+  else
+    PredictNoise(UNet, Config, Latents, FPipeline.FNegativePromptEmbeds,
+      Timestep, Inputs, Pred);
+  Inc(FPipeline.FImageStats.UNetPassCount);
+end;
+
+function TStableDiffusionConditioner.IsGuided(
+  GuidanceScale: TNeuralFloat): boolean;
+begin
+  Result := GuidanceScale > 1;
+end;
+
+procedure TStableDiffusionConditioner.PredictGuidedNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
+    [sdpiPrompt, sdpiImage], Pred);
+  if not IsGuided(FPipeline.GuidanceScale) then exit;
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [],
+    FGuidancePreds[0]);
+  TNNetDiffusionScheduler.ApplyCFG(Pred, FGuidancePreds[0], Pred,
+    FPipeline.GuidanceScale);
+end;
+
 procedure TStableDiffusionConditioner.StartLoadPhase();
 begin
   if FPipeline.FOpenPhase <> sdphLoadUNet then
@@ -93752,7 +93868,8 @@ end;
 
 procedure TStableDiffusionConditioner.PredictNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Pred: TNNetVolume);
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
 begin
   SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
 end;
@@ -93915,7 +94032,8 @@ end;
 
 procedure TStableDiffusionControlNet.PredictNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Pred: TNNetVolume);
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
 var
   ResidualPos, MaxResidualPos: integer;
 begin
@@ -94039,7 +94157,8 @@ end;
 
 procedure TStableDiffusionT2IAdapter.PredictNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Pred: TNNetVolume);
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
 begin
   SDUNetDenoiseWithAdapter(UNet, Config, Latents, Embeds, Timestep,
     FFeatures, Pred);
@@ -94196,10 +94315,10 @@ end;
 
 procedure TStableDiffusionIPAdapter.PredictNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Pred: TNNetVolume);
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
 begin
-  // Denoise runs the unguided CFG half on FNegativePromptEmbeds.
-  if Embeds = FPipeline.FNegativePromptEmbeds then
+  if not (sdpiImage in Inputs) then
     SDUNetDenoiseWithIPAdapter(UNet, Config, Latents, Embeds, Timestep,
       FUncondTokens, FUncondValueTokens, Pred)
   else
@@ -94216,11 +94335,60 @@ begin
   end;
 end;
 
-constructor TStableDiffusionImg2Img.Create();
+constructor TStableDiffusionImageConditioner.Create();
 begin
   inherited Create();
   FSourceImage := TNNetVolume.Create();
   FImageLatents := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionImageConditioner.Destroy();
+begin
+  FImageLatents.Free;
+  FSourceImage.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionImageConditioner.SetImage(Image: TNNetVolume);
+begin
+  FSourceImage.ReSize(Image);
+  FSourceImage.Copy(Image);
+end;
+
+procedure TStableDiffusionImageConditioner.ImageSizeFor(VaeScaleFactor: integer;
+  out Width, Height: integer);
+begin
+  if FSourceImage.Size = 0 then
+    ImportError(ClassName + ': call SetImage first.');
+  Width := FSourceImage.SizeX - FSourceImage.SizeX mod VaeScaleFactor;
+  Height := FSourceImage.SizeY - FSourceImage.SizeY mod VaeScaleFactor;
+end;
+
+procedure TStableDiffusionImageConditioner.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  VaeImage: TNNetVolume;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  if FSourceImage.Size = 0 then
+    ImportError(ClassName + ': call SetImage first.');
+  VaeImage := TNNetVolume.Create();
+  try
+    StartLoadPhase();
+    ConvertAndResizeImagePIL(FSourceImage, VaeImage,
+      Latents.SizeX * Pipeline.VaeScaleFactor,
+      Latents.SizeY * Pipeline.VaeScaleFactor, 3,
+      {ClipToByteRange=}false, -1, 1);
+    EncodeImage(VaeImage, Latents);
+  finally
+    VaeImage.Free;
+  end;
+end;
+
+constructor TStableDiffusionImg2Img.Create();
+begin
+  inherited Create();
   FNoise := TNNetVolume.Create();
   FImageSampleNoise := TNNetVolume.Create();
   FStrength := 0.8;
@@ -94230,8 +94398,6 @@ destructor TStableDiffusionImg2Img.Destroy();
 begin
   FImageSampleNoise.Free;
   FNoise.Free;
-  FImageLatents.Free;
-  FSourceImage.Free;
   inherited Destroy();
 end;
 
@@ -94243,26 +94409,11 @@ begin
   FStrength := Value;
 end;
 
-procedure TStableDiffusionImg2Img.SetImage(Image: TNNetVolume);
-begin
-  FSourceImage.ReSize(Image);
-  FSourceImage.Copy(Image);
-end;
-
 procedure TStableDiffusionImg2Img.SetSampleNoise(ImageNoise: TNNetVolume);
 begin
   FImageSampleNoise.ReSize(ImageNoise);
   FImageSampleNoise.Copy(ImageNoise);
   FHasSampleNoise := true;
-end;
-
-procedure TStableDiffusionImg2Img.ImageSizeFor(VaeScaleFactor: integer;
-  out Width, Height: integer);
-begin
-  if FSourceImage.Size = 0 then
-    ImportError(ClassName + ': call SetImage first.');
-  Width := FSourceImage.SizeX - FSourceImage.SizeX mod VaeScaleFactor;
-  Height := FSourceImage.SizeY - FSourceImage.SizeY mod VaeScaleFactor;
 end;
 
 procedure TStableDiffusionImg2Img.PrepareSampleNoise(Noise,
@@ -94284,26 +94435,11 @@ end;
 procedure TStableDiffusionImg2Img.BeginDenoise(
   Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
   TextSeqLen: integer);
-var
-  VaeImage: TNNetVolume;
 begin
-  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
-  if FSourceImage.Size = 0 then
-    ImportError(ClassName + ': call SetImage first.');
   PrepareSampleNoise(FImageSampleNoise, Latents);
-  VaeImage := TNNetVolume.Create();
-  try
-    StartLoadPhase();
-    ConvertAndResizeImagePIL(FSourceImage, VaeImage,
-      Latents.SizeX * Pipeline.VaeScaleFactor,
-      Latents.SizeY * Pipeline.VaeScaleFactor, 3,
-      {ClipToByteRange=}false, -1, 1);
-    EncodeImage(VaeImage, Latents);
-    FNoise.ReSize(Latents);
-    FNoise.Copy(Latents);
-  finally
-    VaeImage.Free;
-  end;
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  FNoise.ReSize(Latents);
+  FNoise.Copy(Latents);
 end;
 
 procedure TStableDiffusionImg2Img.EncodeImage(VaeImage, Latents: TNNetVolume);
@@ -94419,7 +94555,8 @@ end;
 
 procedure TStableDiffusionInpainter.PredictNoise(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Pred: TNNetVolume);
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
 begin
   if FIsConcatUNet then
   begin
@@ -94442,6 +94579,75 @@ begin
     InpaintBlend(Latents, FKnownLatents, FMaskLatents);
   end
   else InpaintBlend(Latents, FImageLatents, FMaskLatents);
+end;
+
+constructor TStableDiffusionInstructPix2Pix.Create();
+begin
+  inherited Create();
+  FUNetInput := TNNetVolume.Create();
+  FZeroImageLatents := TNNetVolume.Create();
+  FImageGuidanceScale := 1.5;
+end;
+
+destructor TStableDiffusionInstructPix2Pix.Destroy();
+begin
+  FZeroImageLatents.Free;
+  FUNetInput.Free;
+  inherited Destroy();
+end;
+
+function TStableDiffusionInstructPix2Pix.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  Result := InChannels = 2 * LatentChannels;
+end;
+
+function TStableDiffusionInstructPix2Pix.IsGuided(
+  GuidanceScale: TNeuralFloat): boolean;
+begin
+  Result := (GuidanceScale > 1) and (FImageGuidanceScale >= 1);
+end;
+
+procedure TStableDiffusionInstructPix2Pix.EncodeImage(VaeImage,
+  Latents: TNNetVolume);
+begin
+  // diffusers prepare_image_latents: latent_dist.mode(), no scaling_factor.
+  FPipeline.EncodeVaeImage(VaeImage, FImageLatents, nil,
+    {ApplyScalingFactor=}false);
+  FZeroImageLatents.ReSize(FImageLatents);
+  FZeroImageLatents.Fill(0);
+end;
+
+procedure TStableDiffusionInstructPix2Pix.PredictGuidedNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+var
+  ImagePred, UncondPred: TNNetVolume;
+  GuidanceScale: TNeuralFloat;
+begin
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep,
+    [sdpiPrompt, sdpiImage], Pred);
+  GuidanceScale := FPipeline.GuidanceScale;
+  if not IsGuided(GuidanceScale) then exit;
+  ImagePred := FGuidancePreds[0];
+  UncondPred := FGuidancePreds[1];
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [sdpiImage],
+    ImagePred);
+  PredictPass(UNet, Config, Latents, PromptEmbeds, Timestep, [], UncondPred);
+  // g * text + (ig - g) * image + (1 - ig) * uncond.
+  Pred.MulMulAdd(GuidanceScale, FImageGuidanceScale - GuidanceScale,
+    ImagePred);
+  Pred.MulAdd(1 - FImageGuidanceScale, UncondPred);
+end;
+
+procedure TStableDiffusionInstructPix2Pix.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  if sdpiImage in Inputs then FUNetInput.AddLayers(Latents, FImageLatents)
+  else FUNetInput.AddLayers(Latents, FZeroImageLatents);
+  SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
 end;
 
 const

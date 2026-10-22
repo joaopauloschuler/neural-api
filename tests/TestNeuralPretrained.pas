@@ -1253,6 +1253,7 @@ type
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
+    procedure TestStableDiffusionInstructPix2PixParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45947,8 +45948,8 @@ begin
     ImageWidth := TJSONObject(FSD15Oracle).Get('width',
       TJSONObject(FSD15Oracle).Get('image_size', 0));
     ImageHeight := TJSONObject(FSD15Oracle).Get('height', ImageWidth);
-    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
-      0.0);
+    Pipeline.GuidanceScale := Expected.Get('guidance_scale',
+      TJSONObject(FSD15Oracle).Get('guidance_scale', 0.0));
     Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
     LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
       Initial);
@@ -46446,6 +46447,79 @@ begin
     SourceImage.Free;
     Pipeline.Free;
     Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionInstructPix2PixPipeline float64 (tiny_sd15_ip2p_io.json, an
+// 8-channel UNet, injected noise): 3 steps of Euler a and DDIM at guidance 7.5 /
+// image guidance 1.5 (three passes), and Euler a at 1 / 1 (one pass).
+procedure TTestNeuralPretrained.TestStableDiffusionInstructPix2PixParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  InstructPix2Pix: TStableDiffusionInstructPix2Pix;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, Latents: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight, PassesPerStep: integer;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_ip2p_io.json');
+  Pipeline := TStableDiffusionPipeline.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_ip2p/model_index.json')));
+  InstructPix2Pix := TStableDiffusionInstructPix2Pix.Create();
+  SourceImage := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    AssertTrue('Euler a from the scheduler config',
+      Pipeline.Sampler = smEulerAncestral);
+    AssertEquals('sampler notice', '', Pipeline.SamplerNotice);
+    AssertEquals('default image guidance', 1.5,
+      InstructPix2Pix.ImageGuidanceScale, 1e-12);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    InstructPix2Pix.SetImage(SourceImage);
+    InstructPix2Pix.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth,
+      ImageHeight);
+    AssertEquals('output width', TJSONObject(FSD15Oracle).Get('width', 0),
+      ImageWidth);
+    AssertEquals('output height', TJSONObject(FSD15Oracle).Get('height', 0),
+      ImageHeight);
+    Pipeline.Conditioner := InstructPix2Pix;
+    Pipeline.OnAncestralNoise := @SD15StepNoise;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      if Entry.Get('scheduler', '') = 'DDIMScheduler' then
+        Pipeline.Sampler := smDDIM
+      else Pipeline.Sampler := smEulerAncestral;
+      InstructPix2Pix.ImageGuidanceScale := Entry.Get('image_guidance_scale',
+        0.0);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      if Entry.Get('guidance_scale', 0.0) > 1 then PassesPerStep := 3
+      else PassesPerStep := 1;
+      AssertEquals(Entry.Get('name', '') + ' UNet passes',
+        PassesPerStep * TJSONObject(FSD15Oracle).Get('steps', 0),
+        Pipeline.ImageStats.UNetPassCount);
+    end;
+    // The 8-channel UNet needs the InstructPix2Pix conditioner.
+    Pipeline.Conditioner := nil;
+    Pipeline.MakeInitialLatents(16, 12, 1, Latents);
+    IsRefused := false;
+    try
+      Pipeline.Denoise(Latents, 16, 12, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('8-channel unet refused without InstructPix2Pix', IsRefused);
+  finally
+    Latents.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    InstructPix2Pix.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;
