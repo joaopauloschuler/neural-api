@@ -46,7 +46,8 @@ lazbuild -B ControlNetCanny.lpi
 | `--prompt`, `--negative` | prompt and negative prompt |
 | `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
 | `--scale S` | `controlnet_conditioning_scale` (1.0) |
-| `--size N` | square image side (default: the checkpoint's, 512 for SD 1.5) |
+| `--width N`, `--height N` | image size, each a multiple of 8 for SD 1.5 (default: the checkpoint's, 512) |
+| `--size N` | sets both `--width` and `--height` |
 | `--out PNG` | output file (default `controlnet_canny.png`) |
 | `--int8` | UNet, ControlNet and text encoder weights in int8 |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
@@ -60,8 +61,10 @@ it checks wiring and I/O, not image quality.
 the pipeline with the pico ControlNet (a diffusers `ControlNetModel.from_unet`
 of `tiny_sd15`, conditioning scale 0.5) for 3 guided DDIM steps and compares
 the latents after each step and the decoded image with a diffusers float64
-`StableDiffusionControlNetPipeline` run: max |diff| < 1e-4. The fixture and the
-oracle come from `tools/make_pico_sd_conditioning_fixtures.py`.
+`StableDiffusionControlNetPipeline` run: max |diff| < 1e-4.
+`TestStableDiffusionControlNetNonSquare` does the same at 14x10, a 7x5 latent
+grid that is neither square nor a multiple of the UNet down factor. The
+fixtures and the oracles come from `tools/make_pico_sd_conditioning_fixtures.py`.
 
 ## Canny edges
 
@@ -77,7 +80,6 @@ hysteresis cases; no `cv2` comparison has been run.
 
 ## Limits
 
-- Square images only (`TControlNetConfig.CondGrid` takes one side).
 - `--photo` extracts the edges after resizing the photo to the image size;
   the diffusers recipe runs `cv2.Canny` on the original photo and lets the
   pipeline resize the edge map. Resize the photo yourself and pass it at the

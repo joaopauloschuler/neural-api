@@ -35,12 +35,22 @@ not matter; values rounded to 10 digits):
       patched to argmax), as our encoder does. Euler latents are divided by
       sqrt(sigma_next^2 + 1), the model-input scale the pipeline keeps.
 
+  tests/fixtures/tiny_sd15_controlnet_nonsquare_io.json
+      the ControlNet run at CONTROLNET_WIDTH x CONTROLNET_HEIGHT, a 7x5 latent
+      grid (odd, so the UNet resizes its upsamples to the skips); check_inputs
+      is skipped (it wants multiples of 8, the real VAE factor)
+  tests/fixtures/tiny_sd15_t2i_adapter_nonsquare_io.json
+      the T2I-Adapter run at ADAPTER_WIDTH x ADAPTER_HEIGHT
+
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
 Coded by Claude (AI).
 
 Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py
+  python tools/make_pico_sd_conditioning_fixtures.py --nonsquare-only
+(--nonsquare-only keeps the committed folders and writes only the two
+non-square files.)
 """
 import json
 import os
@@ -65,9 +75,15 @@ INPAINT_DIR = os.path.join(FIXTURES, "tiny_sd15_inpaint")
 CONTROLNET_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_io.json")
 ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_io.json")
 INPAINT_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_io.json")
+CONTROLNET_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_nonsquare_io.json")
+ADAPTER_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_nonsquare_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
+CONTROLNET_WIDTH = 14
+CONTROLNET_HEIGHT = 10
+ADAPTER_WIDTH = 24       # sides must be multiples of the adapter's 2 * 2
+ADAPTER_HEIGHT = 8
 STEPS = 3
 GUIDANCE = 7.5
 CONTROLNET_SCALE = 0.5
@@ -91,9 +107,9 @@ def chw(tensor):
     return rounded(tensor.to(torch.float64).tolist())
 
 
-def byte_image(generator, channels):
+def byte_image(generator, channels, width=IMAGE_SIZE, height=IMAGE_SIZE):
     """(1, C, H, W) float64 in [0, 1], multiples of 1/255."""
-    levels = torch.randint(0, 256, (1, channels, IMAGE_SIZE, IMAGE_SIZE),
+    levels = torch.randint(0, 256, (1, channels, height, width),
                            generator=generator)
     return levels.to(torch.float64) / 255.0
 
@@ -102,14 +118,17 @@ def hwc(image):
     return rounded(image[0].permute(1, 2, 0).tolist())
 
 
-def initial_latents():
+def initial_latents(width=IMAGE_SIZE, height=IMAGE_SIZE):
     generator = torch.Generator().manual_seed(SEED)
-    grid = IMAGE_SIZE // 2
-    return torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    return torch.randn((1, 4, height // 2, width // 2), generator=generator,
+                       dtype=torch.float64)
 
 
-def run(pipe, extra, latents, euler=False, legacy_callback=False):
+def run(pipe, extra, latents, euler=False, legacy_callback=False,
+        width=IMAGE_SIZE, height=IMAGE_SIZE):
     pipe.set_progress_bar_config(disable=True)
+    if width % 8 or height % 8:
+        pipe.check_inputs = lambda *args, **kwargs: None
     after = []
 
     def record(sample):
@@ -127,7 +146,7 @@ def run(pipe, extra, latents, euler=False, legacy_callback=False):
                      callback_steps=1)
     else:
         extra = dict(extra, callback_on_step_end=on_step_end)
-    result = pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+    result = pipe(PROMPT, height=height, width=width,
                   num_inference_steps=STEPS, guidance_scale=GUIDANCE,
                   latents=latents.clone(), output_type="np", **extra)
     return {"timesteps": [int(t) for t in pipe.scheduler.timesteps],
@@ -244,8 +263,47 @@ def make_inpaint():
         json.dump(payload, f)
 
 
+def make_controlnet_nonsquare():
+    controlnet = ControlNetModel.from_pretrained(CONTROLNET_DIR, torch_dtype=torch.float64)
+    pipe = StableDiffusionControlNetPipeline(controlnet=controlnet, **base_components())
+    image = byte_image(torch.Generator().manual_seed(SEED + 2), 3,
+                       CONTROLNET_WIDTH, CONTROLNET_HEIGHT)
+    latents = initial_latents(CONTROLNET_WIDTH, CONTROLNET_HEIGHT)
+    out = run(pipe, {"image": image, "controlnet_conditioning_scale": CONTROLNET_SCALE},
+              latents, width=CONTROLNET_WIDTH, height=CONTROLNET_HEIGHT)
+    payload = {"width": CONTROLNET_WIDTH, "height": CONTROLNET_HEIGHT, "steps": STEPS,
+               "guidance_scale": GUIDANCE, "prompt": PROMPT,
+               "conditioning_scale": CONTROLNET_SCALE,
+               "control_image": hwc(image), "latents": chw(latents[0])}
+    payload.update(out)
+    with open(CONTROLNET_NONSQUARE_IO, "w") as f:
+        json.dump(payload, f)
+    print("controlnet non-square", len(out["image"][0]), "x", len(out["image"]))
+
+
+def make_adapter_nonsquare():
+    adapter = T2IAdapter.from_pretrained(ADAPTER_DIR, torch_dtype=torch.float64)
+    pipe = StableDiffusionAdapterPipeline(adapter=adapter, **base_components())
+    hint = byte_image(torch.Generator().manual_seed(SEED + 12), 1,
+                      ADAPTER_WIDTH, ADAPTER_HEIGHT)
+    latents = initial_latents(ADAPTER_WIDTH, ADAPTER_HEIGHT)
+    out = run(pipe, {"image": hint, "adapter_conditioning_scale": ADAPTER_SCALE},
+              latents, legacy_callback=True, width=ADAPTER_WIDTH, height=ADAPTER_HEIGHT)
+    payload = {"width": ADAPTER_WIDTH, "height": ADAPTER_HEIGHT, "steps": STEPS,
+               "guidance_scale": GUIDANCE, "prompt": PROMPT,
+               "conditioning_scale": ADAPTER_SCALE,
+               "hint_image": hwc(hint), "latents": chw(latents[0])}
+    payload.update(out)
+    with open(ADAPTER_NONSQUARE_IO, "w") as f:
+        json.dump(payload, f)
+    print("adapter non-square", len(out["image"][0]), "x", len(out["image"]))
+
+
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
-    make_controlnet()
-    make_adapter()
-    make_inpaint()
+    if "--nonsquare-only" not in sys.argv:
+        make_controlnet()
+        make_adapter()
+        make_inpaint()
+    make_controlnet_nonsquare()
+    make_adapter_nonsquare()

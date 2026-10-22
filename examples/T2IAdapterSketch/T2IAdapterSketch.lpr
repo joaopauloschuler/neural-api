@@ -12,7 +12,8 @@ with a TStableDiffusionT2IAdapter conditioner in neuralpretrained.pas.
 
 --hint FILE is the hint image (for a sketch adapter: white strokes on black);
 a one-channel adapter reads it as PIL 'L' gray, and it is resized to the image
-size. Without it the example draws a house outline. Square sizes only.
+size. Without it the example draws a house outline. Both sides must be a
+multiple of the adapter's total downscale factor (64 for SD 1.5 adapters).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -37,8 +38,8 @@ type
   TT2IAdapterSketchOptions = record
     ModelFolder, AdapterFolder, HintFile, Prompt, NegativePrompt,
       OutputFile: string;
-    // ImageSize < 1: the checkpoint default (512 for SD 1.5).
-    Steps, ImageSize: integer;
+    // A side < 1: the checkpoint default (512 for SD 1.5).
+    Steps, ImageWidth, ImageHeight: integer;
     GuidanceScale, ConditioningScale: double;
     Seed: cardinal;
     UseOpenCL, UseInt8: boolean;
@@ -84,7 +85,10 @@ begin
   WriteLn('  --steps N         denoising steps (default 25)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
   WriteLn('  --scale S         adapter_conditioning_scale (default 1.0)');
-  WriteLn('  --size N          square image side (default: the checkpoint''s)');
+  WriteLn('  --width N         image width (default: the checkpoint''s, ',
+    '512 for SD 1.5)');
+  WriteLn('  --height N        image height (default: the checkpoint''s)');
+  WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --out PNG         output file (default t2i_adapter_sketch.png)');
   WriteLn('  --int8            UNet and text encoder weights in int8');
@@ -115,7 +119,8 @@ begin
   Opt.NegativePrompt := '';
   Opt.OutputFile := 't2i_adapter_sketch.png';
   Opt.Steps := 25;
-  Opt.ImageSize := 0;
+  Opt.ImageWidth := 0;
+  Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
   Opt.ConditioningScale := 1.0;
   Opt.Seed := 0;
@@ -135,7 +140,13 @@ begin
     else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
     else if Arg = '--out' then Opt.OutputFile := NextArg()
     else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
-    else if Arg = '--size' then Opt.ImageSize := StrToInt(NextArg())
+    else if Arg = '--width' then Opt.ImageWidth := StrToInt(NextArg())
+    else if Arg = '--height' then Opt.ImageHeight := StrToInt(NextArg())
+    else if Arg = '--size' then
+    begin
+      Opt.ImageWidth := StrToInt(NextArg());
+      Opt.ImageHeight := Opt.ImageWidth;
+    end
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--scale' then
@@ -158,24 +169,25 @@ begin
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
 end;
 
-// A (Size, Size, 1) sketch in 0..255: white one-pixel strokes of a house (a
-// square body under a triangular roof) on black.
-procedure DrawHouseSketch(Image: TNNetVolume; Size: integer);
+// A (Width, Height, 1) sketch in 0..255: white one-pixel strokes of a house (a
+// rectangular body under a triangular roof) on black.
+procedure DrawHouseSketch(Image: TNNetVolume; Width, Height: integer);
 var
-  X, Y, MaxPos, Left, Right, Top, Bottom, Apex, Center: integer;
+  X, Y, MaxX, MaxY, Left, Right, Top, Bottom, Apex, Center: integer;
   IsStroke: boolean;
 begin
-  Image.ReSize(Size, Size, 1);
+  Image.ReSize(Width, Height, 1);
   Image.Fill(0);
-  MaxPos := Size - 1;
-  Left := Size div 4;
-  Right := Size * 3 div 4;
-  Top := Size div 2;
-  Bottom := Size * 7 div 8;
-  Apex := Size div 8;
-  Center := Size div 2;
-  for Y := 0 to MaxPos do
-    for X := 0 to MaxPos do
+  MaxX := Width - 1;
+  MaxY := Height - 1;
+  Left := Width div 4;
+  Right := Width * 3 div 4;
+  Top := Height div 2;
+  Bottom := Height * 7 div 8;
+  Apex := Height div 8;
+  Center := Width div 2;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       IsStroke := (((X = Left) or (X = Right)) and (Y >= Top) and
         (Y <= Bottom)) or (((Y = Top) or (Y = Bottom)) and (X >= Left) and
@@ -196,7 +208,7 @@ var
   Reporter: TAdapterReporter;
   Hint, Image: TNNetVolume;
   ComputeText: string;
-  ImageSize: integer;
+  ImageWidth, ImageHeight: integer;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
   OpenCLText: string;
@@ -219,14 +231,16 @@ begin
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
     end;
-    ImageSize := Opt.ImageSize;
-    if ImageSize < 1 then ImageSize := Pipeline.DefaultImageSize;
+    ImageWidth := Opt.ImageWidth;
+    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
+    ImageHeight := Opt.ImageHeight;
+    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
     if Opt.HintFile <> '' then
     begin
       if not LoadImageFromFileIntoVolume(Opt.HintFile, Hint) then
         raise Exception.Create('could not read ' + Opt.HintFile);
     end
-    else DrawHouseSketch(Hint, ImageSize);
+    else DrawHouseSketch(Hint, ImageWidth, ImageHeight);
     Adapter.SetHintImage(Hint);
     Adapter.ConditioningScale := Opt.ConditioningScale;
     Pipeline.Conditioner := Adapter;
@@ -243,14 +257,14 @@ begin
     else WriteLn('Hint:     drawn house outline');
     WriteLn('Prompt:   "', Opt.Prompt, '"');
     WriteLn(Format('Image:    %dx%d, %d steps, guidance %.2f, scale %.2f, ' +
-      'seed %d, %s', [ImageSize, ImageSize, Opt.Steps, Opt.GuidanceScale,
+      'seed %d, %s', [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale,
       Opt.ConditioningScale, Opt.Seed, ComputeText]));
     if Pipeline.SamplerNotice <> '' then
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
     // Euler a draws its per-step noise from the global RNG.
     RandSeed := Opt.Seed xor $9E3779B9;
     StartTime := Now();
-    Pipeline.Generate(Opt.Prompt, ImageSize, ImageSize, Opt.Steps, Opt.Seed,
+    Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps, Opt.Seed,
       Image);
     Image.Mul(255.0);
     if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then

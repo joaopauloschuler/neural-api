@@ -15,8 +15,7 @@ with a TStableDiffusionControlNet conditioner in neuralpretrained.pas.
 black, e.g. the output of cv2.Canny); it is resized to the image size. --photo
 FILE instead resizes a photo to the image size and extracts its edges with
 CannyEdges (a cv2.Canny port in neuralimageresize.pas). Without either the
-example draws a circle and a square outline. ControlNet runs at square sizes
-only.
+example draws a circle and a square outline.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -42,8 +41,8 @@ type
   TControlNetCannyOptions = record
     ModelFolder, ControlNetFolder, ControlFile, PhotoFile, EdgesFile, Prompt,
       NegativePrompt, OutputFile: string;
-    // ImageSize < 1: the checkpoint default (512 for SD 1.5).
-    Steps, ImageSize: integer;
+    // A side < 1: the checkpoint default (512 for SD 1.5).
+    Steps, ImageWidth, ImageHeight: integer;
     GuidanceScale, ConditioningScale: double;
     // cv2.Canny thresholds and the optional GaussianBlurImage radius before it.
     CannyLow, CannyHigh, CannyBlur: double;
@@ -98,7 +97,10 @@ begin
   WriteLn('  --steps N         denoising steps (default 25)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
   WriteLn('  --scale S         controlnet_conditioning_scale (default 1.0)');
-  WriteLn('  --size N          square image side (default: the checkpoint''s)');
+  WriteLn('  --width N         image width (default: the checkpoint''s, ',
+    '512 for SD 1.5)');
+  WriteLn('  --height N        image height (default: the checkpoint''s)');
+  WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --out PNG         output file (default controlnet_canny.png)');
   WriteLn('  --int8            UNet, ControlNet and text encoder weights in ',
@@ -135,7 +137,8 @@ begin
   Opt.NegativePrompt := '';
   Opt.OutputFile := 'controlnet_canny.png';
   Opt.Steps := 25;
-  Opt.ImageSize := 0;
+  Opt.ImageWidth := 0;
+  Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
   Opt.ConditioningScale := 1.0;
   Opt.Seed := 0;
@@ -163,7 +166,13 @@ begin
     else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
     else if Arg = '--out' then Opt.OutputFile := NextArg()
     else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
-    else if Arg = '--size' then Opt.ImageSize := StrToInt(NextArg())
+    else if Arg = '--width' then Opt.ImageWidth := StrToInt(NextArg())
+    else if Arg = '--height' then Opt.ImageHeight := StrToInt(NextArg())
+    else if Arg = '--size' then
+    begin
+      Opt.ImageWidth := StrToInt(NextArg());
+      Opt.ImageHeight := Opt.ImageWidth;
+    end
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--scale' then
@@ -188,28 +197,29 @@ begin
     raise Exception.Create('pass --control or --photo, not both');
 end;
 
-// A (Size, Size, 3) edge map in 0..255: one-pixel white outlines of a circle
-// and of a square on black.
-procedure DrawEdgeMap(Image: TNNetVolume; Size: integer);
+// A (Width, Height, 3) edge map in 0..255: one-pixel white outlines of a
+// centered circle and square (sized by the shorter side) on black.
+procedure DrawEdgeMap(Image: TNNetVolume; Width, Height: integer);
 var
-  X, Y, MaxPos, Center, Radius, SquareLow, SquareHigh: integer;
+  X, Y, MaxX, MaxY, CenterX, CenterY, Radius, HalfSquare: integer;
   IsEdge: boolean;
 begin
-  Image.ReSize(Size, Size, 3);
+  Image.ReSize(Width, Height, 3);
   Image.Fill(0);
-  MaxPos := Size - 1;
-  Center := Size div 2;
-  Radius := Size * 3 div 8;
-  SquareLow := Size div 4;
-  SquareHigh := Size * 3 div 4;
-  for Y := 0 to MaxPos do
-    for X := 0 to MaxPos do
+  MaxX := Width - 1;
+  MaxY := Height - 1;
+  CenterX := Width div 2;
+  CenterY := Height div 2;
+  Radius := Min(Width, Height) * 3 div 8;
+  HalfSquare := Min(Width, Height) div 4;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
-      IsEdge := Abs(Round(Sqrt(Sqr(X - Center) + Sqr(Y - Center))) - Radius) = 0;
-      IsEdge := IsEdge or (((X = SquareLow) or (X = SquareHigh)) and
-        (Y >= SquareLow) and (Y <= SquareHigh)) or
-        (((Y = SquareLow) or (Y = SquareHigh)) and
-        (X >= SquareLow) and (X <= SquareHigh));
+      IsEdge := Abs(Round(Sqrt(Sqr(X - CenterX) + Sqr(Y - CenterY))) -
+        Radius) = 0;
+      IsEdge := IsEdge or ((Abs(X - CenterX) = HalfSquare) and
+        (Abs(Y - CenterY) <= HalfSquare)) or
+        ((Abs(Y - CenterY) = HalfSquare) and (Abs(X - CenterX) <= HalfSquare));
       if IsEdge then
       begin
         Image[X, Y, 0] := 255;
@@ -226,7 +236,7 @@ var
   Reporter: TControlNetReporter;
   Control, Image: TNNetVolume;
   ComputeText: string;
-  ImageSize: integer;
+  ImageWidth, ImageHeight: integer;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
   OpenCLText: string;
@@ -249,8 +259,10 @@ begin
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
     end;
-    ImageSize := Opt.ImageSize;
-    if ImageSize < 1 then ImageSize := Pipeline.DefaultImageSize;
+    ImageWidth := Opt.ImageWidth;
+    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
+    ImageHeight := Opt.ImageHeight;
+    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
     if Opt.ControlFile <> '' then
     begin
       if not LoadImageFromFileIntoVolume(Opt.ControlFile, Control) then
@@ -260,14 +272,14 @@ begin
     begin
       if not LoadImageFromFileIntoVolume(Opt.PhotoFile, Image) then
         raise Exception.Create('could not read ' + Opt.PhotoFile);
-      ResizeImagePIL(Image, Image, ImageSize, ImageSize, irfLanczos, true);
+      ResizeImagePIL(Image, Image, ImageWidth, ImageHeight, irfLanczos, true);
       GaussianBlurImage(Image, Image, Opt.CannyBlur);
       CannyEdges(Image, Control, Opt.CannyLow, Opt.CannyHigh, false, 3);
       if (Opt.EdgesFile <> '') and
         not SaveImageFromVolumeIntoFile(Control, Opt.EdgesFile) then
         raise Exception.Create('could not save ' + Opt.EdgesFile);
     end
-    else DrawEdgeMap(Control, ImageSize);
+    else DrawEdgeMap(Control, ImageWidth, ImageHeight);
     ControlNet.SetControlImage(Control);
     ControlNet.ConditioningScale := Opt.ConditioningScale;
     Pipeline.Conditioner := ControlNet;
@@ -287,15 +299,15 @@ begin
     else WriteLn('Control:    drawn circle and square outlines');
     WriteLn('Prompt:     "', Opt.Prompt, '"');
     WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, scale %.2f, ' +
-      'seed %d, %s', [ImageSize, ImageSize, Opt.Steps, Opt.GuidanceScale,
+      'seed %d, %s', [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale,
       Opt.ConditioningScale, Opt.Seed, ComputeText]));
     if Pipeline.SamplerNotice <> '' then
       WriteLn('Notice:     ', Pipeline.SamplerNotice);
     // Euler a draws its per-step noise from the global RNG.
     RandSeed := Opt.Seed xor $9E3779B9;
     StartTime := Now();
-    Pipeline.Generate(Opt.Prompt, ImageSize, ImageSize, Opt.Steps, Opt.Seed,
-      Image);
+    Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
+      Opt.Seed, Image);
     Image.Mul(255.0);
     if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then
       raise Exception.Create('could not save ' + Opt.OutputFile);

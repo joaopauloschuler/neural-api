@@ -145,10 +145,13 @@ Stages of image 2 (wall time):
   No real checkpoint has been run yet.
 * Euler with `linspace` spacing rounds the timesteps to integers; diffusers
   keeps fractional ones when `T - 1` is not a multiple of `steps - 1`.
-* Width and height must each be a multiple of the VAE factor times the UNet
-  down factor (8 * 8 = 64 for SD 1.5; 4 for the pico folder). Non-square sizes
-  are tested against diffusers at 32x16 on the pico folder
-  (`TestStableDiffusionPipelineNonSquare`).
+* Width and height must each be a multiple of the VAE factor (8 for SD 1.5;
+  2 for the pico folder). When a latent side is not a multiple of the UNet
+  down factor (a 520-pixel side on SD 1.5), `BuildSDUNet` crops each nearest
+  2x upsample to the size of its skip, as diffusers does with `upsample_size`.
+  Non-square sizes are tested against diffusers at 32x16 on the pico folder
+  (`TestStableDiffusionPipelineNonSquare`), odd latent grids at 14x10, a 7x5
+  latent grid (`TestStableDiffusionPipelineOddSize`).
 * The weights must be F32 `*.safetensors`; the `*.fp16.safetensors` variant
   files are untested.
 * The noise (the initial latents and the Euler a step noise) comes from the

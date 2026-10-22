@@ -545,13 +545,17 @@ rather than acted on.
             prefix; BuildClipTextTower requires it (the pico fixture re-adds it).
       - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
             CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
-      - [ ] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for
+      - [X] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for
             SD 1.5); diffusers allows multiples of 8 by passing upsample_size
             to the up blocks (nearest-resize to the skip size). Needs an
             odd-size upsample in BuildSDUNet.
-      - [ ] ControlNet / T2I-Adapter are still square: TControlNetConfig.CondGrid
+            DONE: ceil-sized downsamples + TNNetCrop after each 2x upsample;
+            pipeline takes multiples of the VAE factor (TestStableDiffusionPipelineOddSize).
+      - [X] ControlNet / T2I-Adapter are still square: TControlNetConfig.CondGrid
             and TT2IAdapterConfig take one side; BuildControlNet ignores
             Base.LatentGridY.
+            DONE: CondGridY / LatentGridY; T2I-Adapter refuses sides off its
+            total downscale factor (Test*ControlNetNonSquare, *T2IAdapterNonSquare).
       - [ ] int8 quality on a real SD 1.5 checkpoint (UNet + CLIP int8 vs FP32
             image, user's GPU box; `UNetInt8` / `TextEncoderInt8`, `--int8`),
             then int4 UNet weights (QuantizeWeightsInt4, the QwenImage --int4

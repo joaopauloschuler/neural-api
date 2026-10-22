@@ -39,7 +39,8 @@ lazbuild -B T2IAdapterSketch.lpi
 | `--prompt`, `--negative` | prompt and negative prompt |
 | `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
 | `--scale S` | `adapter_conditioning_scale` (1.0) |
-| `--size N` | square image side (default: the checkpoint's, 512 for SD 1.5) |
+| `--width N`, `--height N` | image size (default: the checkpoint's, 512 for SD 1.5); each a multiple of the adapter's total downscale factor, see Limits |
+| `--size N` | sets both `--width` and `--height` |
 | `--out PNG` | output file (default `t2i_adapter_sketch.png`) |
 | `--int8` | UNet and text encoder weights in int8 (the adapter stays FP32) |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
@@ -53,11 +54,17 @@ checks wiring and I/O, not image quality.
 the pipeline with the pico one-channel adapter (conditioning scale 0.8) for 3
 guided DDIM steps and compares the latents after each step and the decoded
 image with a diffusers float64 `StableDiffusionAdapterPipeline` run: max |diff|
-< 1e-4. Fixture and oracle: `tools/make_pico_sd_conditioning_fixtures.py`.
+< 1e-4. `TestStableDiffusionT2IAdapterNonSquare` does the same at 24x8 and
+checks that 14x10 is refused. Fixtures and oracles:
+`tools/make_pico_sd_conditioning_fixtures.py`.
 
 ## Limits
 
-- Square images only (`TT2IAdapterConfig` takes one side).
+- Both sides must be a multiple of the adapter's total downscale factor,
+  `downscale_factor * 2^(stages - 1)` (64 for the SD 1.5 adapters, 4 for the
+  pico one): the adapter's `AvgPool2d(2)` stages floor odd sizes, so their
+  features would not match the UNet's down blocks. diffusers has the same
+  rule. `TStableDiffusionT2IAdapter` refuses other sizes with that message.
 - `full_adapter` only: `light_adapter` and the SDXL `full_adapter_xl` are refused.
 - One adapter; diffusers' `MultiAdapter` is not implemented.
 - Real checkpoints are untested.

@@ -34,6 +34,11 @@ transformers class (nothing downloaded), saved with the real folder layout:
     the DDIM run of tiny_sd15_pipeline_io.json at NONSQUARE_WIDTH x
     NONSQUARE_HEIGHT: latents (C,H,W), unet_cond_0 (the conditional UNet
     output of step 0), noise_pred_0, latents_after and image (H,W,3).
+  tests/fixtures/tiny_sd15_oddsize_io.json
+    the same at ODD_WIDTH x ODD_HEIGHT, a 7x5 latent grid that is not a
+    multiple of the UNet's 2: diffusers resizes each upsample to its skip
+    (upsample_size). check_inputs is skipped (it wants multiples of 8, the
+    real VAE factor, not the pico 2).
 
 The pipeline is reloaded from the saved folder and run in float64, latents
 passed explicitly so torch's RNG does not matter.
@@ -44,8 +49,9 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py
   python tools/make_pico_sd_pipeline_fixture.py --samplers-only
   python tools/make_pico_sd_pipeline_fixture.py --nonsquare-only
-(--samplers-only / --nonsquare-only keep the committed folder and rewrite only
-the sampler / non-square file.)
+  python tools/make_pico_sd_pipeline_fixture.py --oddsize-only
+(--samplers-only / --nonsquare-only / --oddsize-only keep the committed folder
+and rewrite only the sampler / non-square / odd-size file.)
 """
 import json
 import math
@@ -67,6 +73,7 @@ PICO_DIR = os.path.join(FIXTURES, "tiny_sd15")
 IO_FILE = os.path.join(FIXTURES, "tiny_sd15_pipeline_io.json")
 SAMPLERS_FILE = os.path.join(FIXTURES, "tiny_sd15_samplers_io.json")
 NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_nonsquare_io.json")
+ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_oddsize_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -74,6 +81,8 @@ TEXT_HIDDEN = 32
 IMAGE_SIZE = 16          # VAE factor 2 -> an 8x8 latent grid
 NONSQUARE_WIDTH = 32     # -> a 16x8 latent grid, 8x4 at the UNet mid block
 NONSQUARE_HEIGHT = 16
+ODD_WIDTH = 14           # -> a 7x5 latent grid, 4x3 at the UNet mid block
+ODD_HEIGHT = 10
 STEPS = 3
 SAMPLER_STEPS = 4        # PNDM reaches its 4th-order formula, DPM++ 2nd order
 GUIDANCE = 7.5
@@ -344,13 +353,16 @@ def make_sampler_oracle():
         json.dump(payload, f)
 
 
-def make_nonsquare_oracle():
+def make_nonsquare_oracle(width=NONSQUARE_WIDTH, height=NONSQUARE_HEIGHT,
+                          out_file=NONSQUARE_FILE):
     pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
                                                    safety_checker=None)
     pipe.set_progress_bar_config(disable=True)
+    if width % 8 or height % 8:
+        pipe.check_inputs = lambda *args, **kwargs: None
     generator = torch.Generator().manual_seed(SEED)
     factor = pipe.vae_scale_factor
-    latents = torch.randn((1, 4, NONSQUARE_HEIGHT // factor, NONSQUARE_WIDTH // factor),
+    latents = torch.randn((1, 4, height // factor, width // factor),
                           generator=generator, dtype=torch.float64)
     captured = []
 
@@ -362,14 +374,14 @@ def make_nonsquare_oracle():
     def on_step_end(_pipe, _step, _t, kwargs):
         after.append(rounded(chw(kwargs["latents"][0])))
         return kwargs
-    result = pipe(PROMPT, height=NONSQUARE_HEIGHT, width=NONSQUARE_WIDTH,
+    result = pipe(PROMPT, height=height, width=width,
                   num_inference_steps=STEPS, guidance_scale=GUIDANCE,
                   latents=latents.clone(), output_type="np",
                   callback_on_step_end=on_step_end)
     hook.remove()
     uncond, cond = captured[0].chunk(2)
     payload = {
-        "width": NONSQUARE_WIDTH, "height": NONSQUARE_HEIGHT, "steps": STEPS,
+        "width": width, "height": height, "steps": STEPS,
         "guidance_scale": GUIDANCE, "prompt": PROMPT,
         "latents": rounded(chw(latents[0])),
         "timesteps": [int(t) for t in pipe.scheduler.timesteps],
@@ -378,17 +390,25 @@ def make_nonsquare_oracle():
         "latents_after": after,
         "image": rounded(result.images[0].tolist()),
     }
-    with open(NONSQUARE_FILE, "w") as f:
+    with open(out_file, "w") as f:
         json.dump(payload, f)
-    print("non-square image", result.images[0].shape)
+    print("image", result.images[0].shape, "->", os.path.basename(out_file))
+
+
+def make_oddsize_oracle():
+    make_nonsquare_oracle(ODD_WIDTH, ODD_HEIGHT, ODDSIZE_FILE)
 
 
 if __name__ == "__main__":
     if "--nonsquare-only" in sys.argv:
         make_nonsquare_oracle()
         sys.exit(0)
+    if "--oddsize-only" in sys.argv:
+        make_oddsize_oracle()
+        sys.exit(0)
     if "--samplers-only" not in sys.argv:
         build_folder()
         make_oracle()
     make_sampler_oracle()
     make_nonsquare_oracle()
+    make_oddsize_oracle()
