@@ -98,9 +98,10 @@ type
     GuidanceScale: double;
     Seed: cardinal;
     UseOpenCL, UseInt8, UseStats: boolean;
-    // --no-prompt-weighting clears UsePromptWeighting; --max-prompt-chunks.
+    // --no-prompt-weighting clears UsePromptWeighting; --max-prompt-chunks;
+    // --clip-skip.
     UsePromptWeighting: boolean;
-    MaxPromptChunkCount: integer;
+    MaxPromptChunkCount, ClipSkip: integer;
     OpenCLPlatform, OpenCLDevice: integer;
     // --freeu s1, s2, b1, b2; UseFreeU false when not given.
     UseFreeU: boolean;
@@ -210,6 +211,9 @@ begin
   WriteLn('  --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens ',
     '(default 3;');
   WriteLn('                    0: no limit); longer prompts are cut with a notice');
+  WriteLn('  --clip-skip N     skip the last N text encoder layers (diffusers ',
+    'clip_skip;');
+  WriteLn('                    A1111 "Clip skip" N+1; default 0)');
   WriteLn('  --steps N         denoising steps (default 25; 4 with lcm)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5, ',
     '1.0 with lcm;');
@@ -368,6 +372,7 @@ begin
   Opt.UseStats := false;
   Opt.UsePromptWeighting := true;
   Opt.MaxPromptChunkCount := 3;
+  Opt.ClipSkip := 0;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
   Opt.UseFreeU := false;
@@ -428,6 +433,7 @@ begin
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
+    else if Arg = '--clip-skip' then Opt.ClipSkip := StrToInt(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -601,6 +607,7 @@ begin
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.PromptWeighting := Opt.UsePromptWeighting;
     Pipeline.MaxPromptChunkCount := Opt.MaxPromptChunkCount;
+    Pipeline.ClipSkip := Opt.ClipSkip;
     Pipeline.UNetInt8 := Opt.UseInt8;
     Pipeline.TextEncoderInt8 := Opt.UseInt8;
     if Opt.UseFreeU then

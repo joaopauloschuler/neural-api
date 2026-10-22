@@ -12304,7 +12304,7 @@ type
     FNegativePromptEmbeds: TNNetVolume;
     FHasNegativePromptEmbeds, FNegativeEmbedsFromPrompt: boolean;
     FPromptWeighting: boolean;
-    FMaxPromptChunkCount: integer;
+    FMaxPromptChunkCount, FClipSkip: integer;
     FPromptNotice: string;
     FOnPhase: TStableDiffusionPhaseEvent;
     FOnStep: TStableDiffusionStepEvent;
@@ -12323,7 +12323,8 @@ type
     FUNetOwner, FVaeDecoderOwner, FVaeEncoderOwner: TNNet;
     FUNetOwnerIPAdapterFile: string;
     FWeightFileLoadCount: integer;
-    FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
+    FTextEncoderSeqLen, FTextEncoderClipSkip: integer;
+    FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
     FUNetIPAdapterFile: string;
     // During Denoise: the UNet's extra inputs, the conditioners that fill
@@ -12391,7 +12392,8 @@ type
       Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
     procedure ReleaseComponent(Net: TNNet);
     procedure FreeKeptComponents();
-    // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
+    // Builds text_encoder/ once for every list; Embeds[i] := its hidden state
+    // ClipSkip blocks before the last, through final_layer_norm.
     procedure EncodeTokenIdLists(const TokenLists: array of TNeuralIntegerArray;
       const Embeds: array of TNNetVolume);
     // Prompt's ids without bos/eos after ExpandInversionTokens, one weight per
@@ -12417,6 +12419,7 @@ type
       const Weights: TNeuralFloatDynArr);
     procedure SetPromptWeighting(Value: boolean);
     procedure SetMaxPromptChunkCount(Value: integer);
+    procedure SetClipSkip(Value: integer);
     procedure SetNegativePrompt(const Value: string);
     function GetVaeScaleFactor(): integer;
     function GetDefaultImageSize(): integer;
@@ -12468,7 +12471,7 @@ type
     function TokenizePromptChunks(const Prompt: string;
       out Weights: TNeuralFloatDynArr;
       MinChunkCount: integer = 1): TNeuralIntegerArray;
-    // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
+    // CLIP hidden state (ClipSkip) of TokenIds: (Length(TokenIds), 1, hidden).
     procedure EncodeTokenIds(const TokenIds: array of integer;
       PromptEmbeds: TNNetVolume);
     // lpw_stable_diffusion / A1111 long prompt: (ChunkCount * MaxTokenCount, 1,
@@ -12535,6 +12538,9 @@ type
     // default 3; < 1: no cap).
     property MaxPromptChunkCount: integer read FMaxPromptChunkCount
       write SetMaxPromptChunkCount;
+    // diffusers clip_skip (A1111 "Clip skip" minus 1): the text encoder runs
+    // its first num_hidden_layers - ClipSkip blocks; 0 (default) runs all.
+    property ClipSkip: integer read FClipSkip write SetClipSkip;
     // '' or which prompts EncodePrompt / Generate cut at MaxPromptChunkCount.
     property PromptNotice: string read FPromptNotice;
     property VaeScaleFactor: integer read GetVaeScaleFactor;
@@ -94524,8 +94530,10 @@ function TStableDiffusionPipeline.AcquireTextEncoder(SeqLen: integer): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   ExtraTokenRows: TNNetVolume;
+  SkippedConfig: TClipConfig;
 begin
-  if Assigned(FTextEncoder) and (FTextEncoderSeqLen = SeqLen) then
+  if Assigned(FTextEncoder) and (FTextEncoderSeqLen = SeqLen) and
+    (FTextEncoderClipSkip = FClipSkip) then
     exit(FTextEncoder);
   DoPhase(sdphLoadTextEncoder);
   // The old net goes first: peak memory stays one text encoder.
@@ -94548,7 +94556,9 @@ begin
       ExtraTokenRows := TNNetVolume.Create();
       FInversionVectors.ConcatInto(ExtraTokenRows);
     end;
-    Result := BuildClipTextTower(Reader, FTextConfig, SeqLen, '',
+    SkippedConfig := FTextConfig;
+    Dec(SkippedConfig.Text.NumLayers, FClipSkip);
+    Result := BuildClipTextTower(Reader, SkippedConfig, SeqLen, '',
       {pTrainable=}false, ExtraTokenRows);
   finally
     ExtraTokenRows.Free;
@@ -94564,6 +94574,7 @@ begin
   begin
     FTextEncoder := Result;
     FTextEncoderSeqLen := SeqLen;
+    FTextEncoderClipSkip := FClipSkip;
   end;
 end;
 
@@ -95432,6 +95443,16 @@ procedure TStableDiffusionPipeline.SetMaxPromptChunkCount(Value: integer);
 begin
   if Value = FMaxPromptChunkCount then exit;
   FMaxPromptChunkCount := Value;
+  if FNegativeEmbedsFromPrompt then FHasNegativePromptEmbeds := false;
+end;
+
+procedure TStableDiffusionPipeline.SetClipSkip(Value: integer);
+begin
+  if Value = FClipSkip then exit;
+  if (Value < 0) or (Value >= FTextConfig.Text.NumLayers) then
+    ImportError('TStableDiffusionPipeline: ClipSkip=' + IntToStr(Value) +
+      ' is outside 0..' + IntToStr(FTextConfig.Text.NumLayers - 1) + '.');
+  FClipSkip := Value;
   if FNegativeEmbedsFromPrompt then FHasNegativePromptEmbeds := false;
 end;
 

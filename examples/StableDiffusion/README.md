@@ -103,6 +103,15 @@ the community pipeline is not packaged with diffusers): token ids and weights
 match exactly, and 2-chunk weighted prompts are within 4.3e-5
 (`TestStableDiffusionLongPrompt*`, `TestSDPromptWeightParser`).
 
+`--clip-skip N` (property `ClipSkip`, diffusers `clip_skip`) takes the text
+encoder's hidden state N layers before the last, through its final layer norm:
+`TStableDiffusionPipeline` builds the text encoder with only its first
+`num_hidden_layers - N` layers. diffusers' `clip_skip=1` is AUTOMATIC1111's
+"Clip skip: 2". As A1111 does, the skip applies to the negative prompt too;
+diffusers' `encode_prompt` encodes the negative prompt with every layer. Tested
+against diffusers `encode_prompt(clip_skip=1)` on the pico folder within 1e-4
+(`TestStableDiffusionClipSkipParity`, `tools/make_pico_sd_clip_skip_fixture.py`).
+
 `--lora FILE[:SCALE]` (repeatable) merges a LoRA `.safetensors` into the
 weights as they load, as diffusers `load_lora_weights` + `fuse_lora` do
 (`TStableDiffusionPipeline.AddLoRA`, `TNNetLoRAMergeReader`). Every adapted
@@ -409,6 +418,8 @@ StableDiffusion [--model DIR] [options]
   --no-prompt-weighting  read brackets in the prompts as plain text
   --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens (default 3;
                     0: no limit); longer prompts are cut with a notice
+  --clip-skip N     skip the last N text encoder layers (diffusers clip_skip;
+                    A1111 "Clip skip" N+1; default 0)
   --steps N         denoising steps (default 25; 4 with lcm)
   --guidance G      classifier-free guidance scale (default 7.5, 1.0 with lcm;
                     <= 1 turns it off); an LCM-distilled UNet embeds it

@@ -677,12 +677,11 @@ rather than acted on.
             float64 reimplementation of lpw's get_weighted_text_embeddings
             (tools/make_pico_sd_prompt_weighting_fixture.py; the community
             pipeline is not in the ~/x venv). Open:
-        - [ ] `--clip-skip N` (diffusers `clip_skip`): take the hidden state
-              N layers before the last and apply the text model's
-              final_layer_norm to it. Every chunk goes through
-              `EncodeTokenIdLists`, so clip skip belongs there; property on
-              the pipeline, flag in examples/StableDiffusion, README update.
-              Parity: a pico-fixture test vs diffusers `clip_skip`.
+        - [x] `--clip-skip N` (diffusers `clip_skip`): DONE as property
+              `ClipSkip` (AcquireTextEncoder builds num_hidden_layers - N
+              blocks + final_layer_norm), applied to the negative prompt too
+              (A1111; diffusers does not); TestStableDiffusionClipSkipParity
+              vs encode_prompt(clip_skip=1) (tools/make_pico_sd_clip_skip_fixture.py).
         - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
         - [ ] A1111 extras not done: `BREAK`, moving a chunk split back to a
               nearby comma, per-chunk mean restore (lpw restores the whole

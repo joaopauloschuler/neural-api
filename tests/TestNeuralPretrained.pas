@@ -1344,6 +1344,7 @@ type
     procedure TestSDPromptWeightParser;
     procedure TestStableDiffusionLongPromptTokens;
     procedure TestStableDiffusionLongPromptEmbeds;
+    procedure TestStableDiffusionClipSkipParity;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -48358,6 +48359,65 @@ begin
     end;
   finally
     Latents.Free;
+    Expected.Free;
+    GotNegative.Free;
+    Got.Free;
+    Root.Free;
+  end;
+end;
+
+// ClipSkip = 1 vs diffusers encode_prompt(clip_skip=1) (tiny_sd15_clip_skip_io.json,
+// float64), both prompts in one load; a kept text encoder is rebuilt per ClipSkip.
+procedure TTestNeuralPretrained.TestStableDiffusionClipSkipParity;
+var
+  Root: TJSONData;
+  CaseObj: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  Got, GotNegative, Expected, Plain: TNNetVolume;
+  Prompt, NegativePrompt: string;
+  MaxDiff: double;
+  Raised: boolean;
+  KeptCnt: integer;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_clip_skip_io.json');
+  Got := TNNetVolume.Create;
+  GotNegative := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Pipeline := CreateSD15Pipeline();
+  try
+    Prompt := TJSONObject(Root).Get('prompt', '');
+    NegativePrompt := TJSONObject(Root).Get('negative_prompt', '');
+    CaseObj := TJSONObject(Root).Arrays['cases'].Objects[0];
+    AssertEquals('pico layers', Pipeline.TextConfig.Text.NumLayers,
+      TJSONObject(Root).Get('num_hidden_layers', 0));
+    AssertEquals('no skip by default', 0, Pipeline.ClipSkip);
+    for KeptCnt := 0 to 1 do
+    begin
+      if KeptCnt = 1 then Pipeline.LoadComponents(16, 16);
+      Pipeline.ClipSkip := 0;
+      Pipeline.EncodePrompt(Prompt, Plain);
+      Pipeline.ClipSkip := CaseObj.Get('clip_skip', 0);
+      Pipeline.EncodePrompts([Prompt, NegativePrompt], [Got, GotNegative]);
+      LoadNestedOracleVolume(CaseObj.Arrays['prompt_embeds'], false, Expected);
+      MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+      AssertTrue('prompt max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+      LoadNestedOracleVolume(CaseObj.Arrays['negative_prompt_embeds'], false,
+        Expected);
+      MaxDiff := MaxAbsVolumeDiff(GotNegative, Expected);
+      AssertTrue('negative max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+      AssertTrue('skip changes the embeds', MaxAbsVolumeDiff(Got, Plain) > 1e-3);
+    end;
+    Raised := false;
+    try
+      Pipeline.ClipSkip := Pipeline.TextConfig.Text.NumLayers;
+    except
+      Raised := true;
+    end;
+    AssertTrue('ClipSkip = num_hidden_layers refused', Raised);
+  finally
+    Pipeline.Free;
+    Plain.Free;
     Expected.Free;
     GotNegative.Free;
     Got.Free;
