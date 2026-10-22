@@ -97,7 +97,7 @@ rather than acted on.
 - [ ] Possible trap (not changed, awaits user decision; found during fcfbfa66):
       FPC's `genrand_MT19937` reseeds when `RandSeed <> OldRandSeed`, then sets
       `RandSeed := not RandSeed` and stores that as `OldRandSeed`. Code that saves
-      `RandSeed` and restores it afterwards (about 89 sites in neural/) restores a value equal to `OldRandSeed`, so the next draw
+      `RandSeed` and restores it afterwards (about 40 sites in neural/) restores a value equal to `OldRandSeed`, so the next draw
       CONTINUES the old Mersenne Twister state instead of replaying the seed;
       "same seed" noise can then differ by call order (it broke
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
@@ -137,7 +137,7 @@ rather than acted on.
 
 - [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
       re-prefill (design agreed with the user 2026-10-02). Conversation slots
-      (`--kv-slots`, `TConversationSlot`, T1-T5) are coded; open items below.
+      (`--kv-slots`, `TConversationSlot`, T1-T6) are coded; open items below.
       Compute stays serialized (one request at a time). Process: one Opus coder per task, then
       an independent Opus review, commit after review + green suites
       (lazbuild -B; default AND -dAVX2 suites; the PoCL suite when OpenCL code is
@@ -671,7 +671,7 @@ rather than acted on.
             ~0.4% of a 512x512 SD 1.5 pass: 2*77*768*sum(C)=1.5 GMAC over the
             16 attn2 blocks vs ~400 GMAC). Needs a TNNet mechanism to skip the
             layers that depend only on the text input (AddSDTransformer2D's
-            TSDAttnLayers.Blocks[].Cross_K / Cross_V) while it is unchanged, and two
+            TSDAttnLayers.Blocks[].Cross.K / Cross.V) while it is unchanged, and two
             caches, because CFG alternates the cond and uncond text every step
             (or run CFG as one batch-2 pass).
       - [ ] Follow-ups of the ControlNet / T2I-Adapter / inpainting conditioners
@@ -801,8 +801,8 @@ rather than acted on.
       pico parity TestNAFNetParity < 1e-4 vs a numpy float64 oracle;
       examples/ImageRestoration end-to-end CPU denoise):
   - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
-        weights are large / not redistributable; importer uses the canonical
-        NAFNet state_dict key scheme so a real checkpoint should drop in).
+        weights are large / not redistributable). Needs the PixelShuffle
+        channel-order fix under "Bugs" first.
   - [ ] NAFBlock dropout + the wider official width/block configs are wired by
         config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer follow-ups
@@ -815,7 +815,8 @@ rather than acted on.
         same-resolution denoise tail (upscale=1, single conv reconstruction) is
         wired by config but only the SR shape is parity-pinned.
   - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
-        not obtainable offline); the importer accepts a real checkpoint path.
+        not obtainable offline). Needs the PixelShuffle channel-order fix under
+        "Bugs" first.
   - [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
         nearest+conv "real-world" SR upsampler variants not yet wired.
 - [ ] Restormer image-restoration follow-ups (`TNNetTransposedChannelAttention`,
@@ -897,9 +898,8 @@ rather than acted on.
       (error-compensating rounding / activation-aware scale search) and
       FP16/BF16 weight storage as a zero-drift middle rung. GGUF dovetails (reader
       landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
-      int8 weight-only storage instead of dequantize-then-requantize (the
-      k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
-      neural/neuralgguf.pas).
+      int8 weight-only storage instead of the per-row dequantize-then-requantize
+      of the row-streaming loader (Q4_0 already loads straight into int4 rows).
 - [ ] FP16 (half-precision) OpenCL compute path for the FP32-weight
       dot-product/matmul offload. PARTLY LANDED: `--experimental-fp16` narrows the
       activation (B operand) and the split-K partials to half for the int8
@@ -1402,7 +1402,8 @@ rather than acted on.
       Builds on the landed SD UNet importer (BuildSDUNetFromSafeTensors); the natural
       successor to the landed ControlNet. Pico parity vs a diffusers
       float64 oracle on one motion-module output for a fixed multi-frame latent; an
-      examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU. Note:
+      examples/TextToVideo `--animatediff` mode (the example already writes PPM
+      frames and `--gif`). Note:
       a cheaper no-UNet route to video is bolting the same temporal block onto the
       landed PixArt DiT.
 - [ ] CogVideoX text-to-VIDEO DiT real-checkpoint follow-up
@@ -1804,23 +1805,16 @@ rather than acted on.
           OpenCL on the L4. The PoCL oversubscription (idle workers spinning hot)
           is fixed: only worker 0 stays hot while OpenCL is armed. Cap the workers
           for CPU OpenCL devices only if a --serial gap remains.
-    - [ ] B2f. Big tiles / untiled decode. Plan (2026-10-03, computed from the
-          code and the real config, not measured; dims 1152/1152/1152/576/288/
-          144, 1.06 TFLOP per 256-px tile; 1024x1024 = 29.2 TFLOP at 256/192,
-          26.5 at 512/384, 17.0 untiled). OpenCL bytes per sized net at a
-          256 tile / 512 / untiled 1024: today 10.4 / 38.5 / 151 GB (im2col
-          6.1 GB at 256); after B2f1 4.2 / 13.6 / 51.4; after B2f2 3.5 / 11.0 /
-          41.0; after B2f3 ~1.3 / ~1.9 / ~4.7. Host today 9.9 + 2.0 GB at 256.
-          Corrections to earlier notes: the 1 GB FP32 upload is inside the net
-          (first forward) and small; blending is milliseconds; the ~22 s outside
-          the nets was attributed to host-side arming per tile shape
-          (`AfterWeightUpdate`: 1 GB concat + scalar transpose + output-sized
-          bias fill; a78b169f removed the second call and shares one weight
-          copy across the tile-shape nets, so re-measure) plus ~10 GB of
-          zero-filled host volumes per build. Untiled 1024
-          also overflows on the host (`TVolume.ReSize` integer size;
-          `FInputPrepared` 2.72e9 elements). In the REPL the transformer stays
-          resident, so the VAE has ~10-14 GB on a 24 GB L4.
+    - [ ] B2f. Big tiles / untiled decode (dims 1152/1152/1152/576/288/144,
+          1.06 TFLOP per 256-px tile; 1024x1024 = 29.2 TFLOP at 256/192, 26.5
+          at 512/384, 17.0 untiled). B2f1-B2f5 are done (implicit-GEMM conv,
+          per-row bias + lazy host conv buffers, OpenCL and host output sharing
+          by liveness, the upsample fold); the planned OpenCL bytes per sized
+          net after them are ~1.3 / ~1.9 / ~4.7 GB at a 256 tile / 512 /
+          untiled 1024. a78b169f shares one weight copy across the tile-shape
+          nets, so re-measure the time outside the nets. Untiled 1024 still
+          overflows on the host (`TVolume.ReSize` integer size). In the REPL
+          the transformer stays resident, so the VAE has ~10-14 GB on a 24 GB L4.
           - [ ] B2f5 follow-ups (the nearest-2x + 3x3 OpenCL fold, c42915c0):
                 - [ ] GPU timing of the fold on the L4.
                 - [ ] B2f5 follow-up: the "single reader" test is
@@ -1833,7 +1827,8 @@ rather than acted on.
           - [ ] B2f6. Untiled path: memory estimator vs the device limits,
                 `--vae-tile 0`; L4 runs 256/192 -> 512/384 -> untiled in the REPL;
                 then the default decision with the user.
-          Side note: `FInputBufferBs` (READ_ONLY) is written by cai_im2col and
+          Side note: `FInputBufferBs` (READ_ONLY) is written by cai_im2col
+          (int8, FP16 and training paths) and
           `FResultBuffer` (WRITE_ONLY) is read by consumer kernels; works on
           NVIDIA/PoCL, undefined per spec; pool buffers must be READ_WRITE.
   - [ ] B3 follow-up (negative-prompt guidance, 90e08744: examples/QwenImage
@@ -2124,15 +2119,19 @@ rather than acted on.
 - [ ] Perturbed-Attention Guidance (PAG, Ahn et al. 2024, arXiv:2403.17377) and
       Skip Layer Guidance (SLG) follow-ups. The Qwen-Image pipeline runs both
       (`TQwenImage21Pipeline.PerturbedGuidance`, `--pag-scale` / `--slg` in
-      examples/QwenImage). Open:
+      examples/QwenImage); the SD pipeline runs PAG
+      (`TStableDiffusionPipeline.PerturbedGuidance`, `--pag-scale` in
+      examples/StableDiffusion, diffusers parity `TestStableDiffusionPAGParity`).
+      Open:
       - [ ] A with/without image pair and the measured denoise cost at the
             defaults (2 of 18 steps run the extra pass) from the user's GPU
             box, for examples/QwenImage/README.md; the default blocks (PAG 16,
             SLG 6,7,8) are untuned on the real checkpoint.
-      - [ ] Later consumers: examples/LatentTextToImage and CogVideoX; a
-            with/without PAG image pair on a real SD 1.5 checkpoint.
-      A diffusers oracle needs a patched block / processor registry and a
-      Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
+      - [ ] A with/without PAG image pair on a real SD 1.5 checkpoint
+            (examples/StableDiffusion/README.md).
+      - [ ] Later consumers: examples/LatentTextToImage (PixArt) and CogVideoX.
+      A Qwen-Image diffusers oracle needs a patched block / processor registry
+      and a Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
       either guider on QwenImage21); ask the user before adding a Python tool.
 
 - [ ] SuperPoint + LightGlue follow-ups (`BuildSuperPointFromSafeTensors[Ex]`,
@@ -2157,7 +2156,7 @@ rather than acted on.
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
 `TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
-training on OpenCL"). About 66 of the 515 `TNNet*` classes in `neuralnetwork.pas` (2026-10-21)
+training on OpenCL"). About 69 of the 529 `TNNet*` classes in `neuralnetwork.pas` (2026-10-22)
 declare a `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
@@ -2564,8 +2563,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       gradient and full weight-gradient FINITE-DIFFERENCE checks
       (TestDeconvolutionGradient central-differences a single weight only;
       TestDeconvolutionDepthVectorEquality checks both against an analytic
-      reference; Upsample / DeMaxPool / DeAvgPool already covered). Likely benefits from the Double-precision accumulator
-      of DeMaxPoolFamilyGradientCheck (tests/TestNeuralNumerical.pas).
+      reference; Upsample / DeMaxPool / DeAvgPool already covered). Use
+      `LayerInputAndWeightGradientCheck(..., AUseDoubleAccumulator)`
+      (tests/TestNeuralNumerical.pas), which checks every weight too.
 - [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient path
       (sparse-update pattern — easy place for a silent broadcast/reduction
       bug), TNNetTokenAndPositionalEmbedding, etc.
@@ -2619,8 +2619,8 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       assert per-layer gradient norms with the norm layer are uniformly
       bounded above the no-norm case.
 - [ ] TNNetDotProducts numerical-gradient test — standalone class still
-      ships, weight-gradient path looks like the kind of place a silent
-      bug could live.
+      ships; its input-gradient path (both branches A and B) is only
+      forward-tested (`TestDotProductNumerical`).
 - [ ] TNNetLocalConnect / TNNetDeLocalConnect input + weight gradient tests.
 - [ ] Kink-region test parametric helper: with Clamp / HardShrink /
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
