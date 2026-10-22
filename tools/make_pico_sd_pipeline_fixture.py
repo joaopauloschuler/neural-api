@@ -30,6 +30,13 @@ transformers class (nothing downloaded), saved with the real folder layout:
     latents after each model eval, SAMPLER_STEPS steps, same latents/guidance.
     Euler latents are divided by sqrt(sigma_next^2 + 1): the model-input (VP)
     scale TStableDiffusionPipeline keeps. Values rounded to 10 digits.
+  tests/fixtures/tiny_sd15_karras_io.json
+    continuous-sigma sampling, the latents/guidance of the sampler file at
+    KARRAS_STEPS steps, one case per KARRAS_CASES entry (from_config of the DDIM
+    config with use_karras_sigmas and/or timestep_spacing "linspace"): the
+    scheduler config, the float model timesteps, the sigmas and the latents
+    after each step (Euler ones divided by sqrt(sigma_next^2 + 1)). The Euler a
+    case injects step_noise (randn_tensor patched).
   tests/fixtures/tiny_sd15_nonsquare_io.json
     the DDIM run of tiny_sd15_pipeline_io.json at NONSQUARE_WIDTH x
     NONSQUARE_HEIGHT: latents (C,H,W), unet_cond_0 (the conditional UNet
@@ -89,9 +96,11 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --lcm-distilled-only
   python tools/make_pico_sd_pipeline_fixture.py --freeu-only
   python tools/make_pico_sd_pipeline_fixture.py --pag-only
+  python tools/make_pico_sd_pipeline_fixture.py --karras-only
 (--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only /
---freeu-only / --pag-only keep the committed folder and rewrite only the
-sampler / non-square / odd-size / LCM / FreeU / PAG files; --lcm-distilled-only
+--freeu-only / --pag-only / --karras-only keep the committed folder and
+rewrite only the sampler / non-square / odd-size / LCM / FreeU / PAG / Karras
+files; --lcm-distilled-only
 rewrites the distilled UNet folder and its file.)
 """
 import json
@@ -106,6 +115,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from diffusers.utils.torch_utils import fourier_filter
 from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
+                       EulerAncestralDiscreteScheduler,
                        EulerDiscreteScheduler, LatentConsistencyModelImg2ImgPipeline,
                        LatentConsistencyModelPipeline, LCMScheduler, PNDMScheduler,
                        StableDiffusionImg2ImgPipeline, StableDiffusionPAGPipeline,
@@ -113,6 +123,7 @@ from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
 import diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_img2img as lcm_img2img_module
 import diffusers.schedulers.scheduling_lcm as lcm_module
+import diffusers.schedulers.scheduling_euler_ancestral_discrete as euler_a_module
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +140,7 @@ FREEU_FILTER_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_filter_io.json")
 FREEU_NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_nonsquare_io.json")
 FREEU_ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_oddsize_io.json")
 PAG_FILE = os.path.join(FIXTURES, "tiny_sd15_pag_io.json")
+KARRAS_FILE = os.path.join(FIXTURES, "tiny_sd15_karras_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -140,6 +152,7 @@ ODD_WIDTH = 14           # -> a 7x5 latent grid, 4x3 at the UNet mid block
 ODD_HEIGHT = 10
 STEPS = 3
 SAMPLER_STEPS = 4        # PNDM reaches its 4th-order formula, DPM++ 2nd order
+KARRAS_STEPS = 5         # linspace(0, 999, 5) is fractional (249.75 apart)
 GUIDANCE = 7.5
 LCM_STEPS = 4
 LCM_GUIDANCE = 1.5
@@ -158,6 +171,16 @@ PAG_CASES = [
     ("cfg_mid", GUIDANCE, 3.0, 0.0, ["mid"]),
     ("no_cfg_down_up", 1.0, 2.0, 0.0, ["down", r"up_blocks\.1\.attentions\.1"]),
     ("cfg_adaptive_all", GUIDANCE, 3.0, 0.004, ["(down|mid|up)"]),
+]
+# name, scheduler class, from_config overrides (on the leading DDIM config).
+KARRAS_CASES = [
+    ("euler_karras_leading", EulerDiscreteScheduler, {"use_karras_sigmas": True}),
+    ("euler_karras_linspace", EulerDiscreteScheduler,
+     {"use_karras_sigmas": True, "timestep_spacing": "linspace"}),
+    ("euler_linspace", EulerDiscreteScheduler, {"timestep_spacing": "linspace"}),
+    ("euler_a_linspace", EulerAncestralDiscreteScheduler,
+     {"timestep_spacing": "linspace"}),
+    ("dpm_karras", DPMSolverMultistepScheduler, {"use_karras_sigmas": True}),
 ]
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
@@ -423,6 +446,53 @@ def make_sampler_oracle():
             "latents_after": after})
         print(type(scheduler).__name__, payload["samplers"][-1]["timesteps"])
     with open(SAMPLERS_FILE, "w") as f:
+        json.dump(payload, f)
+
+
+def make_karras_oracle():
+    pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
+                                                   safety_checker=None)
+    pipe.set_progress_bar_config(disable=True)
+    generator = torch.Generator().manual_seed(SEED)
+    grid = IMAGE_SIZE // pipe.vae_scale_factor
+    latents = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    step_noise = [torch.randn(latents.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(KARRAS_STEPS)]
+    pending_step_noise = []
+    euler_a_module.randn_tensor = lambda *args, **kwargs: pending_step_noise.pop(0).clone()
+    base_config = pipe.scheduler.config
+    payload = {"steps": KARRAS_STEPS, "guidance_scale": GUIDANCE,
+               "step_noise": [rounded(chw(item[0])) for item in step_noise],
+               "cases": []}
+    for name, scheduler_class, overrides in KARRAS_CASES:
+        scheduler = scheduler_class.from_config(base_config, **overrides)
+        pipe.scheduler = scheduler
+        is_euler = scheduler_class is not DPMSolverMultistepScheduler
+        pending_step_noise[:] = step_noise
+        after = []
+
+        def on_step_end(_pipe, _step, _t, kwargs):
+            sample = kwargs["latents"][0]
+            if is_euler:
+                sigma = float(scheduler.sigmas[scheduler.step_index])
+                sample = sample / (sigma ** 2 + 1) ** 0.5
+            after.append(rounded(chw(sample)))
+            return kwargs
+        pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+             num_inference_steps=KARRAS_STEPS, guidance_scale=GUIDANCE,
+             latents=latents.clone(), output_type="latent",
+             callback_on_step_end=on_step_end)
+        config = {key: value for key, value in dict(scheduler.config).items()
+                  if not key.startswith("_") and not (
+                      isinstance(value, float) and not math.isfinite(value))}
+        config["_class_name"] = scheduler_class.__name__
+        payload["cases"].append({
+            "name": name, "config": config,
+            "timesteps": [rounded(float(t)) for t in scheduler.timesteps],
+            "sigmas": [rounded(float(s)) for s in scheduler.sigmas],
+            "latents_after": after})
+        print(name, payload["cases"][-1]["timesteps"], payload["cases"][-1]["sigmas"])
+    with open(KARRAS_FILE, "w") as f:
         json.dump(payload, f)
 
 
@@ -704,6 +774,9 @@ if __name__ == "__main__":
     if "--pag-only" in sys.argv:
         make_pag_oracle()
         sys.exit(0)
+    if "--karras-only" in sys.argv:
+        make_karras_oracle()
+        sys.exit(0)
     if "--samplers-only" not in sys.argv:
         build_folder()
         make_oracle()
@@ -714,3 +787,4 @@ if __name__ == "__main__":
     make_lcm_distilled_oracle()
     make_freeu_oracles()
     make_pag_oracle()
+    make_karras_oracle()

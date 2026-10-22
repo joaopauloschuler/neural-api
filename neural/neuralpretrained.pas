@@ -12336,6 +12336,9 @@ type
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); virtual;
     // After the sampler step that reached NextTt (1-based; 0 = clean).
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); virtual;
+    // True when the steps may run at continuous sigmas: NoiseImageLatents and
+    // AfterStep are not needed. Base: not StartsFromImage.
+    function AcceptsSigmaSchedule(): boolean; virtual;
     // Frees the nets unless the pipeline keeps its components loaded.
     procedure EndDenoise(); virtual;
   end;
@@ -12363,6 +12366,7 @@ type
     FSchedulerClassName: string;
     FSampler: TNNetSamplerMethod;
     FSamplerNotice: string;
+    FKarrasSigmas: boolean;
     FUNetConfig: TSDUNetConfig;
     FVaeConfig: TVaeDecoderConfig;
     FTextConfig: TClipConfig;
@@ -12625,6 +12629,9 @@ type
     property Sampler: TNNetSamplerMethod read FSampler write SetSampler;
     // '' or what the config asks for that the Sampler does not do.
     property SamplerNotice: string read FSamplerNotice;
+    // diffusers use_karras_sigmas (default: the scheduler config's): Euler,
+    // Euler a and DPM++ 2M sample at continuous Karras sigmas; others ignore it.
+    property KarrasSigmas: boolean read FKarrasSigmas write FKarrasSigmas;
     // A TNNetLCMScheduler once Sampler is smLCM: setting it frees the old one.
     property Scheduler: TNNetDiffusionScheduler read FScheduler;
     // scheduler_config.json _class_name.
@@ -13053,6 +13060,7 @@ type
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    function AcceptsSigmaSchedule(): boolean; override;
     // True after BeginDenoise saw a 9-channel inpainting UNet.
     property IsConcatUNet: boolean read FIsConcatUNet;
   end;
@@ -13336,6 +13344,7 @@ type
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
       Pred: TNNetVolume); override;
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    function AcceptsSigmaSchedule(): boolean; override;
     procedure EndDenoise(); override;
   end;
 
@@ -95127,6 +95136,7 @@ begin
       FSchedulerClassName := TJSONObject(Root).Get('_class_name', '');
     FreeAndNil(Root);
     FSampler := DiffusersSchedulerSampler(JsonText.Text, FSamplerNotice);
+    FKarrasSigmas := DiffusersSchedulerUsesKarrasSigmas(JsonText.Text);
     if FSampler = smLCM then SetSampler(smLCM);
     FTextConfig := ReadClipConfigFromJSONFile(ComponentFolder('text_encoder') +
       'config.json');
@@ -96439,12 +96449,14 @@ var
   Net: TNNet;
   StepConditioner: TStableDiffusionConditioner;
   Schedule: TNeuralIntegerArray;
+  SigmaSchedule: TNNetSigmaSchedule;
   Pred, StepNoise: TNNetVolume;
-  IsGuided, WithControl, WithAdapter: boolean;
+  IsGuided, WithControl, WithAdapter, UseSigmaSchedule: boolean;
   IPAdapterFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
-  GridX, GridY, StepPos, MaxStepPos, Tt, ChunkCount, CachePos: integer;
+  GridX, GridY, StepPos, MaxStepPos, ChunkCount, CachePos: integer;
   Eta, NoiseScale: TNeuralFloat;
+  Timestep: double;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
   StepConditioner := ActiveConditioner();
@@ -96507,7 +96519,21 @@ begin
       IPAdapterFile <> '', WithAdapter, WithControl);
     StepConditioner.CollectConditioners(FPassConditioners);
     DoPhase(sdphDenoise);
-    if StepConditioner.StartsFromImage() then
+    // diffusers Euler / Euler a (linspace: fractional timesteps) and Karras
+    // sigmas sample at continuous sigmas; image starts keep integer timesteps.
+    UseSigmaSchedule := StepConditioner.AcceptsSigmaSchedule() and
+      (((FSampler in [smEuler, smEulerAncestral]) and (FKarrasSigmas or
+      (FScheduler.ConfigSpacing = tsUniform))) or
+      ((FSampler = smDPMSolverPP2M) and FKarrasSigmas));
+    if UseSigmaSchedule then
+    begin
+      SigmaSchedule := FScheduler.BuildSigmaSchedule(StepCount,
+        FScheduler.ConfigSpacing, FSampler, FKarrasSigmas);
+      NoiseScale := FScheduler.InitialNoiseScaleAtSigma(FSampler,
+        FScheduler.ConfigSpacing, SigmaSchedule.Sigmas[0]);
+      if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+    end
+    else if StepConditioner.StartsFromImage() then
     begin
       // Start from the image latents noised to the first timestep of the
       // strength schedule (no init sigma).
@@ -96528,20 +96554,28 @@ begin
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
     if (FSampler in [smEulerAncestral, smLCM]) and Assigned(FOnAncestralNoise) then
       StepNoise := TNNetVolume.Create(Latents);
-    MaxStepPos := Length(Schedule) - 2;
+    if UseSigmaSchedule then MaxStepPos := High(SigmaSchedule.ModelTimesteps)
+    else MaxStepPos := Length(Schedule) - 2;
     FStepCount := MaxStepPos + 1;
     for StepPos := 0 to MaxStepPos do
     begin
       FStepPos := StepPos;
-      // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
-      Tt := Schedule[StepPos];
+      // Schedule is 1-based; the UNet takes the diffusers timestep Tt - 1.
+      if UseSigmaSchedule then Timestep := SigmaSchedule.ModelTimesteps[StepPos]
+      else Timestep := Schedule[StepPos] - 1;
       StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
-        PromptEmbeds, Tt - 1, Pred);
+        PromptEmbeds, Timestep, Pred);
       if Assigned(StepNoise) then FOnAncestralNoise(StepPos, StepNoise);
-      FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, Eta,
-        StepNoise);
-      StepConditioner.AfterStep(Latents, Schedule[StepPos + 1]);
-      if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Tt - 1, Latents);
+      if UseSigmaSchedule then
+        FScheduler.StepAtSigma(Latents, Pred, SigmaSchedule.Sigmas[StepPos],
+          SigmaSchedule.Sigmas[StepPos + 1], FSampler, Eta, StepNoise)
+      else
+      begin
+        FScheduler.Step(Latents, Pred, Schedule[StepPos],
+          Schedule[StepPos + 1], FSampler, Eta, StepNoise);
+        StepConditioner.AfterStep(Latents, Schedule[StepPos + 1]);
+      end;
+      if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Timestep, Latents);
     end;
   finally
     EndPhase();
@@ -96854,6 +96888,11 @@ end;
 procedure TStableDiffusionConditioner.AfterStep(Latents: TNNetVolume;
   NextTt: integer);
 begin
+end;
+
+function TStableDiffusionConditioner.AcceptsSigmaSchedule(): boolean;
+begin
+  Result := not StartsFromImage();
 end;
 
 procedure TStableDiffusionConditioner.EndDenoise();
@@ -97575,6 +97614,13 @@ begin
     FImageConditioner.AfterStep(Latents, NextTt);
 end;
 
+function TStableDiffusionMultiConditioner.AcceptsSigmaSchedule(): boolean;
+begin
+  if Assigned(FImageConditioner) then
+    Result := FImageConditioner.AcceptsSigmaSchedule()
+  else Result := inherited AcceptsSigmaSchedule();
+end;
+
 procedure TStableDiffusionMultiConditioner.EndDenoise();
 var
   MemberPos, MaxMemberPos: integer;
@@ -97843,6 +97889,12 @@ begin
     InpaintBlend(Latents, FKnownLatents, FMaskLatents);
   end
   else InpaintBlend(Latents, FImageLatents, FMaskLatents);
+end;
+
+function TStableDiffusionInpainter.AcceptsSigmaSchedule(): boolean;
+begin
+  // The 4-channel blend noises the kept region at each integer timestep.
+  Result := FIsConcatUNet and inherited AcceptsSigmaSchedule();
 end;
 
 constructor TStableDiffusionInstructPix2Pix.Create();

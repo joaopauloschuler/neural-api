@@ -104,6 +104,8 @@ type
     LoRAScales: array of TNeuralFloat;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
+    // --karras-sigmas 1, --no-karras-sigmas 0, -1: the scheduler config's.
+    KarrasSigmas: integer;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
     // Steps -1 / GuidanceScale < 0: the sampler's default (LCM: 4 / 1.0;
     // an LCM-distilled UNet: 4 / 8.5).
@@ -213,7 +215,7 @@ end;
 procedure TStableDiffusionReporter.OnStep(StepIndex, StepCount: integer;
   Timestep: double; Latents: TNNetVolume);
 begin
-  WriteLn(Format('    step %d/%d  t=%.0f', [StepIndex + 1, StepCount, Timestep]));
+  WriteLn(Format('    step %d/%d  t=%.6g', [StepIndex + 1, StepCount, Timestep]));
 end;
 
 procedure PrintUsage();
@@ -251,6 +253,11 @@ begin
     'Consistency;');
   WriteLn('                    an LCM-LoRA via --lora or an LCM-distilled ',
     'UNet, 2-8 steps)');
+  WriteLn('  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m ',
+    '(diffusers');
+  WriteLn('                    use_karras_sigmas); --no-karras-sigmas turns ',
+    'them off');
+  WriteLn('                    (default: the scheduler config''s)');
   WriteLn('  --output PNG      output file (default stable_diffusion.png)');
   WriteLn('  --repeat N        N images, seeds --seed, --seed+1, ...; the ',
     'prompt is encoded');
@@ -418,6 +425,7 @@ begin
   Opt.UpscaleImageFile := '';
   Opt.NoiseLevel := -1;
   Opt.SamplerName := 'auto';
+  Opt.KarrasSigmas := -1;
   Opt.Steps := -1;
   Opt.ImageWidth := 0;
   Opt.ImageHeight := 0;
@@ -460,6 +468,8 @@ begin
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
     else if Arg = '--sampler' then Opt.SamplerName := LowerCase(NextArg())
+    else if Arg = '--karras-sigmas' then Opt.KarrasSigmas := 1
+    else if Arg = '--no-karras-sigmas' then Opt.KarrasSigmas := 0
     else if Arg = '--repeat' then Opt.RepeatCount := StrToInt(NextArg())
     else if Arg = '--embedding' then
     begin
@@ -701,6 +711,7 @@ begin
     if Opt.SamplerName <> 'auto' then
       Pipeline.Sampler := SamplerOptionMethods[
         SamplerOptionIndex(Opt.SamplerName)];
+    if Opt.KarrasSigmas >= 0 then Pipeline.KarrasSigmas := Opt.KarrasSigmas = 1;
     StepCount := Opt.Steps;
     GuidanceScale := Opt.GuidanceScale;
     if Pipeline.Sampler = smLCM then
@@ -765,6 +776,9 @@ begin
     else
       WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler), ' with the ',
         Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
+    if Pipeline.KarrasSigmas and
+      (Pipeline.Sampler in [smEuler, smEulerAncestral, smDPMSolverPP2M]) then
+      WriteLn('Sigmas:   Karras (rho 7)');
     if (Opt.SamplerName = 'auto') and (Pipeline.SamplerNotice <> '') then
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
     if Opt.UseInt8 then WriteLn('Weights:  UNet int8, text encoder int8')

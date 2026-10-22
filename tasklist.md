@@ -526,12 +526,18 @@ rather than acted on.
             --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
             per-component parity against diffusers on the real weights (the ~/x
             venv oracle recipe).
+      - [X] use_karras_sigmas (Euler, DPM++ 2M; --karras-sigmas also on
+            Euler a) and Euler / Euler a linspace fractional timesteps:
+            continuous sigmas through BuildSigmaSchedule / StepAtSigma
+            (TestStableDiffusionPipelineKarrasSigmas, < 1e-4).
       - [ ] Sampler gaps behind SamplerNotice (DDIM/PNDM/Euler/Euler a/DPM++ 2M
             are mapped with diffusers parity): UniPCMultistepScheduler (smUniPC
             has only a numpy oracle; diffusers takes N of N+1 points like DPM),
-            use_karras_sigmas (diffusers keeps continuous sigmas, tsKarras
-            snaps to integer timesteps), PNDM PRK warm-up, Euler linspace
-            fractional timesteps, DDPMScheduler (smDDPM ignores the stride).
+            PNDM PRK warm-up, DDPMScheduler (smDDPM ignores the stride).
+            Continuous sigmas for img2img and the 4-channel inpaint blend
+            (NoiseImageLatents / AfterStep take an integer timestep, so those
+            runs keep integer timesteps), Euler sigma_min / sigma_max
+            overrides and final_sigmas_type "sigma_min" (noticed, not done).
       - [ ] Latent Consistency Models in TStableDiffusionPipeline: 2-8 step
             SD 1.5 images, about 6-10x fewer UNet passes than 25-50 step
             sampling.

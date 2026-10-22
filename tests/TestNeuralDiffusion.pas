@@ -913,8 +913,21 @@ begin
   AssertTrue('dpm karras', Mapped('{"_class_name": ' +
     '"DPMSolverMultistepScheduler", "use_karras_sigmas": true, ' +
     '"solver_order": 3}') = smDPMSolverPP2M);
-  AssertTrue('karras noticed', Pos('use_karras_sigmas', Notice) > 0);
+  AssertTrue('karras followed, not noticed',
+    Pos('use_karras_sigmas', Notice) = 0);
   AssertTrue('order noticed', Pos('solver_order 3', Notice) > 0);
+  AssertTrue('dpm karras flag', DiffusersSchedulerUsesKarrasSigmas(
+    '{"_class_name": "DPMSolverMultistepScheduler", "use_karras_sigmas": true}'));
+  AssertTrue('euler karras flag', DiffusersSchedulerUsesKarrasSigmas(
+    '{"_class_name": "EulerDiscreteScheduler", "use_karras_sigmas": true}'));
+  AssertFalse('euler a has no karras', DiffusersSchedulerUsesKarrasSigmas(
+    '{"_class_name": "EulerAncestralDiscreteScheduler", ' +
+    '"use_karras_sigmas": true}'));
+  AssertFalse('karras off', DiffusersSchedulerUsesKarrasSigmas(
+    '{"_class_name": "EulerDiscreteScheduler"}'));
+  Mapped('{"_class_name": "EulerDiscreteScheduler", "use_karras_sigmas": ' +
+    'true, "sigma_max": 10.0}');
+  AssertTrue('karras sigma_max noticed', Pos('sigma_max', Notice) > 0);
   AssertTrue('lms', Mapped('{"_class_name": "LMSDiscreteScheduler"}') = smDDIM);
   AssertTrue('lms noticed', Pos('LMSDiscreteScheduler', Notice) > 0);
   AssertTrue('not an object', Mapped('[1]') = smDDIM);

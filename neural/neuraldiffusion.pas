@@ -131,6 +131,13 @@ type
   // PredictionType) into Output. Output is pre-sized to match Xt.
   TNNetDenoiseCallback = procedure(Xt, Output: TNNetVolume; Tt: integer) of object;
 
+  // Continuous-sigma schedule (diffusers Euler / DPM set_timesteps): Sigmas has
+  // NumSteps+1 entries ending in 0; ModelTimesteps[k] is the 0-based model input.
+  TNNetSigmaSchedule = record
+    Sigmas: array of double;
+    ModelTimesteps: array of double;
+  end;
+
   { TNNetDiffusionScheduler }
   // Reusable noise scheduler + reverse-process sampler. Holds the precomputed
   // schedule tables for T steps and a chosen beta-schedule family.
@@ -213,6 +220,18 @@ type
       NumSteps: integer; Spacing: TNNetTimestepSpacing);
     // diffusers PNDMScheduler.step_plms (smPNDM of Step).
     procedure StepPNDM(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer);
+    // X0Out := x0 of RawPred at a point with sqrt(ab), sqrt(1-ab), 1/sqrt(ab).
+    procedure PredictX0At(Xt, RawPred, X0Out: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb, InvSqrtAb: TNeuralFloat);
+    // Euler(-ancestral) move of Xt (VP scale) from SigmaCur to SigmaNext > 0 given X0.
+    procedure EulerAncestralUpdate(Xt, X0, Noise: TNNetVolume; SigmaCur,
+      SigmaNext, InvSqrtAbCur, SqrtAbNext, Eta: TNeuralFloat);
+    // DPM-Solver++(2M) move of Xt to a point of ab AbNext > 0 given X0; KX is
+    // sqrt(1-ab_next)/sqrt(1-ab_cur). Updates the multistep history.
+    procedure DPMSolverPP2MUpdate(Xt, X0: TNNetVolume; LambdaCur, LambdaNext,
+      KX, AbNext: TNeuralFloat);
+    // np.interp of the sigma table at a fractional 0-based timestep.
+    function InterpolatedSigma(ModelTimestep: double): double;
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
@@ -249,6 +268,22 @@ type
     // sigma_max, i.e. sqrt(1-ab) in the VP scale these samplers keep.
     function InitialNoiseScale(Method: TNNetSamplerMethod;
       Spacing: TNNetTimestepSpacing; FirstTt: integer): TNeuralFloat;
+    // InitialNoiseScale for a TNNetSigmaSchedule starting at FirstSigma.
+    function InitialNoiseScaleAtSigma(Method: TNNetSamplerMethod;
+      Spacing: TNNetTimestepSpacing; FirstSigma: double): TNeuralFloat;
+    // diffusers _sigma_to_t: the fractional 0-based timestep of Sigma by
+    // log-sigma interpolation of the schedule table.
+    function SigmaToModelTimestep(Sigma: double): double;
+    // diffusers set_timesteps of Euler / Euler a (Spacing tsUniform = linspace,
+    // fractional) or, with KarrasSigmas, Euler / DPM++ 2M use_karras_sigmas.
+    function BuildSigmaSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+      KarrasSigmas: boolean): TNNetSigmaSchedule;
+    // Step from Sigma to NextSigma (0: clean) for smEuler, smEulerAncestral and
+    // smDPMSolverPP2M; Xt in the VP scale, as Step. Call ResetMultistep first.
+    procedure StepAtSigma(Xt, RawPred: TNNetVolume; Sigma, NextSigma: double;
+      Method: TNNetSamplerMethod; Eta: TNeuralFloat = 0.0;
+      Noise: TNNetVolume = nil);
     // x0 from eps or v (dpV: sqrt(ab_t)*x_t - sqrt(1-ab_t)*v, exact at ab_t = 0).
     // X0Out may alias RawPred, never Xt.
     procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
@@ -644,9 +679,13 @@ type
 // a TNNetLCMScheduler). Any other class samples with
 // smDDIM: its betas, spacing and prediction type still load, so it stays
 // usable. Notice is '' or says what differs from the named scheduler (the
-// fallback, or options such as use_karras_sigmas this unit does not implement).
+// fallback, or options such as solver_order 3 this unit does not implement).
 function DiffusersSchedulerSampler(const ConfigJson: string;
   out Notice: string): TNNetSamplerMethod;
+
+// True when the config is an Euler or DPM-Solver multistep scheduler with
+// use_karras_sigmas (follow it with BuildSigmaSchedule).
+function DiffusersSchedulerUsesKarrasSigmas(const ConfigJson: string): boolean;
 
 // Blended (no-retrain) inpainting composite, in place on Latents:
 // Latents := Known + Mask * (Latents - Known). Mask is 1 in the hole (follow
@@ -1216,6 +1255,13 @@ end;
 
 procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;
   Tt: integer);
+begin
+  PredictX0At(Xt, RawPred, X0Out, FSqrtAlphaBar[Tt],
+    FSqrtOneMinusAlphaBar[Tt], FInvSqrtAlphaBar[Tt]);
+end;
+
+procedure TNNetDiffusionScheduler.PredictX0At(Xt, RawPred,
+  X0Out: TNNetVolume; SqrtAb, SqrtOneMinusAb, InvSqrtAb: TNeuralFloat);
 var
   RawCoef, XtCoef: TNeuralFloat;
 begin
@@ -1223,13 +1269,13 @@ begin
   // may alias RawPred. v needs no 1/sqrt(ab), which keeps ab_t = 0 exact.
   if FPrediction = dpV then
   begin
-    RawCoef := -FSqrtOneMinusAlphaBar[Tt];
-    XtCoef := FSqrtAlphaBar[Tt];
+    RawCoef := -SqrtOneMinusAb;
+    XtCoef := SqrtAb;
   end
   else
   begin
-    XtCoef := FInvSqrtAlphaBar[Tt];
-    RawCoef := -FSqrtOneMinusAlphaBar[Tt] * XtCoef;
+    XtCoef := InvSqrtAb;
+    RawCoef := -SqrtOneMinusAb * XtCoef;
   end;
   if X0Out <> RawPred then X0Out.Copy(RawPred);
   X0Out.Mul(RawCoef);
@@ -1370,9 +1416,9 @@ var
   XtSizeM1: integer;
   Eps: TNNetVolume;
   invSqrtAlpha, sigma, z: TNeuralFloat;
-  abT, abPrev, sqrtAbPrev, x0, dirCoef: TNeuralFloat;
+  abT, abPrev, sqrtAbPrev, dirCoef: TNeuralFloat;
   // DPM-Solver++ locals.
-  lamT, lamPrev, h, hLast, r0: TNeuralFloat;
+  lamT, lamPrev, h: TNeuralFloat;
   // UniPC locals (order-2 bh2, predict_x0).
   alphaT, sigmaTuni, sigmaS0, rk: TNeuralFloat;
   WeightM0, WeightM1, WeightMT: double;
@@ -1380,8 +1426,8 @@ var
   // Loop-invariant hoists (rule #5): per-step coefficients pulled out of the
   // per-element loops below.
   needNoise: boolean;
-  invSqrtAbT, somabT, cA, cB, kX, kD: TNeuralFloat;
-  kA, cE, kZ: TNeuralFloat;    // per-step affine coeffs for the sampler loops (#5)
+  somabT, cA, cB, kX: TNeuralFloat;
+  kA, cE: TNeuralFloat;    // per-step affine coeffs for the sampler loops (#5)
 begin
   if Method = smLCM then
     raise Exception.Create('Step: smLCM needs a TNNetLCMScheduler.');
@@ -1507,42 +1553,8 @@ begin
             Xt.Copy(Eps);
             Exit;
           end;
-          invSqrtAbT := FInvSqrtAlphaBar[Tt];
-          sqrtAbPrev := FSqrtAlphaBar[TtPrev];
-          // Reuse DPM locals as scratch for the sigma split.
-          lamT := SigmaOf(Tt);                       // s1
-          lamPrev := SigmaOf(TtPrev);                // s2
-          if (Eta > 0) and (lamT > 0) then
-            sigma := Eta * Sqrt((lamPrev * lamPrev *
-              Max(0.0, lamT * lamT - lamPrev * lamPrev)) / (lamT * lamT))
-          else
-            sigma := 0;                            // sigma_up
-          h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
-          if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
-          // #5: the update folds to kA*x_t + cE*x0 + kZ*z per step.
-          kA := sqrtAbPrev * r0 * invSqrtAbT;
-          cE := sqrtAbPrev * (1 - r0);
-          if (sigma > 0) and Assigned(Noise) then
-          begin
-            Xt.Mul(kA);
-            Xt.MulAdd(cE, Eps);
-            Xt.MulAdd(sqrtAbPrev * sigma, Noise);
-          end
-          else if sigma > 0 then
-          begin
-            kZ := sqrtAbPrev * sigma;
-            for i := 0 to XtSizeM1 do
-            begin
-              z := RandG(0, 1);
-              Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + kZ * z;
-            end;
-          end
-          else
-          begin
-            // sigma=0 (z=0): a uniform affine map (#13).
-            Xt.Mul(kA);
-            Xt.MulAdd(cE, Eps);
-          end;
+          EulerAncestralUpdate(Xt, Eps, Noise, SigmaOf(Tt), SigmaOf(TtPrev),
+            FInvSqrtAlphaBar[Tt], FSqrtAlphaBar[TtPrev], Eta);
         end;
       smDPMSolverPP2M:
         begin
@@ -1565,34 +1577,9 @@ begin
             FHasPrev := false;
             Exit;
           end;
-          abPrev := FAlphaBar[TtPrev];
-          lamPrev := Lambda(TtPrev);
-          h := lamPrev - lamT;                      // > 0
-          // Step-invariant update coefficients (rule #5): kX scales x_t, kD
-          // scales the data-prediction term.
           kX := FSqrtOneMinusAlphaBar[TtPrev] / FSqrtOneMinusAlphaBar[Tt];
-          kD := Sqrt(abPrev) * (Exp(-h) - 1.0);
-          if not FHasPrev then
-          begin
-            // First order (equal to DDIM): kX*Xt - kD*Eps (#13).
-            Xt.Mul(kX);
-            Xt.MulAdd(-kD, Eps);
-          end
-          else
-          begin
-            hLast := lamT - FPrevLambda;            // > 0
-            cB := DPMSolverPP2MHistoryWeight(hLast, h);
-            cA := 1.0 + cB;
-            // Xt := kX*Xt - kD*(cA*Eps - cB*FPrevX0) as a uniform affine map (#13).
-            Xt.Mul(kX);
-            Xt.MulAdd(-kD * cA, Eps);
-            Xt.MulAdd(kD * cB, FPrevX0);
-          end;
-          // Store this step's x0 and lambda for the next multistep correction.
-          if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Xt);
-          FPrevX0.Copy(Eps);   // Eps currently holds curX0
-          FPrevLambda := lamT;
-          FHasPrev := true;
+          DPMSolverPP2MUpdate(Xt, Eps, lamT, Lambda(TtPrev), kX,
+            FAlphaBar[TtPrev]);
         end;
       smUniPC:
         begin
@@ -1893,6 +1880,249 @@ begin
     Result := FSqrtOneMinusAlphaBar[FirstTt]
   else
     Result := 1;
+end;
+
+function TNNetDiffusionScheduler.InitialNoiseScaleAtSigma(
+  Method: TNNetSamplerMethod; Spacing: TNNetTimestepSpacing;
+  FirstSigma: double): TNeuralFloat;
+begin
+  // sigma_max over sqrt(sigma_max^2 + 1): the sqrt(1-ab) of InitialNoiseScale.
+  if (Method in [smEuler, smEulerAncestral]) and
+    (Spacing in [tsUniform, tsTrailing]) then
+    Result := FirstSigma / Sqrt(1 + FirstSigma * FirstSigma)
+  else
+    Result := 1;
+end;
+
+procedure TNNetDiffusionScheduler.EulerAncestralUpdate(Xt, X0,
+  Noise: TNNetVolume; SigmaCur, SigmaNext, InvSqrtAbCur, SqrtAbNext,
+  Eta: TNeuralFloat);
+var
+  i, XtSizeM1: integer;
+  SigmaUp, SigmaDown, DriftRatio, kA, cE, kZ, z: TNeuralFloat;
+begin
+  // Euler-ancestral ("Euler a", Karras et al. 2022) in the VE sigma
+  // parameterisation sigma = sqrt((1-ab)/ab), with s1 = SigmaCur, s2 = SigmaNext:
+  //   sigma_up   = eta * sqrt( (s2^2*(s1^2 - s2^2)) / s1^2 )   (injected)
+  //   sigma_down = sqrt( max(0, s2^2 - sigma_up^2) )          (Euler drift)
+  //   x = sqrt(ab_next)*(x0 + (sigma_down/s1)*(x_t/sqrt(ab_t) - x0)
+  //       + sigma_up*z).
+  if (Eta > 0) and (SigmaCur > 0) then
+    SigmaUp := Eta * Sqrt((SigmaNext * SigmaNext *
+      Max(0.0, SigmaCur * SigmaCur - SigmaNext * SigmaNext)) /
+      (SigmaCur * SigmaCur))
+  else
+    SigmaUp := 0;
+  SigmaDown := Sqrt(Max(0.0, SigmaNext * SigmaNext - SigmaUp * SigmaUp));
+  if SigmaCur > 0 then DriftRatio := SigmaDown / SigmaCur else DriftRatio := 0;
+  // #5: the update folds to kA*x_t + cE*x0 + kZ*z per step.
+  kA := SqrtAbNext * DriftRatio * InvSqrtAbCur;
+  cE := SqrtAbNext * (1 - DriftRatio);
+  if (SigmaUp > 0) and Assigned(Noise) then
+  begin
+    Xt.Mul(kA);
+    Xt.MulAdd(cE, X0);
+    Xt.MulAdd(SqrtAbNext * SigmaUp, Noise);
+  end
+  else if SigmaUp > 0 then
+  begin
+    kZ := SqrtAbNext * SigmaUp;
+    XtSizeM1 := Xt.Size - 1;
+    for i := 0 to XtSizeM1 do
+    begin
+      z := RandG(0, 1);
+      Xt.FData[i] := kA * Xt.FData[i] + cE * X0.FData[i] + kZ * z;
+    end;
+  end
+  else
+  begin
+    // sigma_up = 0 (z = 0): a uniform affine map (#13).
+    Xt.Mul(kA);
+    Xt.MulAdd(cE, X0);
+  end;
+end;
+
+procedure TNNetDiffusionScheduler.DPMSolverPP2MUpdate(Xt, X0: TNNetVolume;
+  LambdaCur, LambdaNext, KX, AbNext: TNeuralFloat);
+var
+  h, hLast, kD, cA, cB: TNeuralFloat;
+begin
+  // x_next = KX*x_t - alpha_next*(exp(-h)-1)*D, h = lambda_next - lambda_cur;
+  // D = x0 on the first step, else the midpoint (1+1/(2r))*x0 - (1/(2r))*x0_prev.
+  h := LambdaNext - LambdaCur;              // > 0
+  kD := Sqrt(AbNext) * (Exp(-h) - 1.0);
+  if not FHasPrev then
+  begin
+    // First order (equal to DDIM): KX*Xt - kD*X0 (#13).
+    Xt.Mul(KX);
+    Xt.MulAdd(-kD, X0);
+  end
+  else
+  begin
+    hLast := LambdaCur - FPrevLambda;       // > 0
+    cB := DPMSolverPP2MHistoryWeight(hLast, h);
+    cA := 1.0 + cB;
+    // Xt := KX*Xt - kD*(cA*X0 - cB*FPrevX0) as a uniform affine map (#13).
+    Xt.Mul(KX);
+    Xt.MulAdd(-kD * cA, X0);
+    Xt.MulAdd(kD * cB, FPrevX0);
+  end;
+  // Store this step's x0 and lambda for the next multistep correction.
+  if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Xt);
+  FPrevX0.Copy(X0);
+  FPrevLambda := LambdaCur;
+  FHasPrev := true;
+end;
+
+function TNNetDiffusionScheduler.InterpolatedSigma(
+  ModelTimestep: double): double;
+var
+  LowPos: integer;
+  Frac: double;
+begin
+  // The 0-based timestep t reads FSigma[t + 1]; np.interp clamps at the ends.
+  if ModelTimestep <= 0 then Exit(FSigma[1]);
+  if ModelTimestep >= FT - 1 then Exit(FSigma[FT]);
+  LowPos := Trunc(ModelTimestep);
+  Frac := ModelTimestep - LowPos;
+  Result := FSigma[LowPos + 1] + Frac * (FSigma[LowPos + 2] - FSigma[LowPos + 1]);
+end;
+
+function TNNetDiffusionScheduler.SigmaToModelTimestep(Sigma: double): double;
+var
+  LogSigma, LogLow, LogHigh, Weight: double;
+  Lo, Hi, Mid, LowPos: integer;
+begin
+  // diffusers _sigma_to_t: LowPos = the last 0-based index whose log sigma is
+  // <= log(Sigma) (0 when none), at most T-2; then linear in log sigma.
+  LogSigma := Ln(Max(Sigma, 1e-10));
+  Lo := 0;
+  Hi := FT - 1;
+  while Lo < Hi do
+  begin
+    Mid := (Lo + Hi + 1) shr 1;
+    if Ln(FSigma[Mid + 1]) <= LogSigma then Lo := Mid else Hi := Mid - 1;
+  end;
+  LowPos := Lo;
+  if LowPos > FT - 2 then LowPos := FT - 2;
+  LogLow := Ln(FSigma[LowPos + 1]);
+  LogHigh := Ln(FSigma[LowPos + 2]);
+  if LogLow = LogHigh then Weight := 0
+  else Weight := EnsureRange((LogLow - LogSigma) / (LogLow - LogHigh), 0, 1);
+  Result := (1 - Weight) * LowPos + Weight * (LowPos + 1);
+end;
+
+function TNNetDiffusionScheduler.BuildSigmaSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+  KarrasSigmas: boolean): TNNetSigmaSchedule;
+const
+  cRho = 7.0;
+var
+  IntSchedule: TNeuralIntegerArray;
+  StepPos, MaxStepPos: integer;
+  LinspaceStride, SigmaMin, SigmaMax, InvRhoMin, InvRhoMax, Ramp: double;
+  IsDPM: boolean;
+begin
+  if not (Method in [smEuler, smEulerAncestral, smDPMSolverPP2M]) then
+    raise Exception.Create('BuildSigmaSchedule: only Euler, Euler a and ' +
+      'DPM++ 2M sample at continuous sigmas.');
+  IsDPM := Method = smDPMSolverPP2M;
+  if IsDPM and not KarrasSigmas then
+    raise Exception.Create('BuildSigmaSchedule: DPM++ 2M without Karras ' +
+      'sigmas samples at integer timesteps (BuildSamplerSchedule).');
+  if NumSteps < 1 then NumSteps := 1;
+  MaxStepPos := NumSteps - 1;
+  SetLength(Result.Sigmas, NumSteps + 1);
+  SetLength(Result.ModelTimesteps, NumSteps);
+  if IsDPM then
+  begin
+    // DPMSolverMultistepScheduler: the Karras range is the whole table.
+    SigmaMin := FSigma[1];
+    SigmaMax := FSigma[FT];
+  end
+  else
+  begin
+    // Euler: the spacing's own timesteps, sigmas interpolated linearly
+    // (fractional for linspace, float32 as diffusers' np.linspace).
+    if Spacing = tsUniform then
+    begin
+      if NumSteps > 1 then LinspaceStride := (FT - 1) / MaxStepPos
+      else LinspaceStride := 0;
+      for StepPos := 0 to MaxStepPos do
+        Result.ModelTimesteps[StepPos] :=
+          Single((MaxStepPos - StepPos) * LinspaceStride);
+    end
+    else if Spacing in [tsLeading, tsTrailing] then
+    begin
+      IntSchedule := BuildTimestepSchedule(NumSteps, Spacing);
+      for StepPos := 0 to MaxStepPos do
+        Result.ModelTimesteps[StepPos] := IntSchedule[StepPos] - 1;
+    end
+    else
+      raise Exception.Create('BuildSigmaSchedule: Euler takes linspace ' +
+        '(tsUniform), leading or trailing spacing.');
+    for StepPos := 0 to MaxStepPos do
+      Result.Sigmas[StepPos] := InterpolatedSigma(Result.ModelTimesteps[StepPos]);
+    SigmaMax := Result.Sigmas[0];
+    SigmaMin := Result.Sigmas[MaxStepPos];
+  end;
+  if KarrasSigmas then
+  begin
+    // Karras et al. (2022) rho = 7 ramp, each sigma mapped back to its
+    // fractional timestep (rounded for DPM unless the schedule is cosine).
+    InvRhoMax := Power(SigmaMax, 1 / cRho);
+    InvRhoMin := Power(SigmaMin, 1 / cRho);
+    for StepPos := 0 to MaxStepPos do
+    begin
+      if MaxStepPos > 0 then Ramp := StepPos / MaxStepPos else Ramp := 0;
+      Result.Sigmas[StepPos] :=
+        Power(InvRhoMax + Ramp * (InvRhoMin - InvRhoMax), cRho);
+      Result.ModelTimesteps[StepPos] :=
+        SigmaToModelTimestep(Result.Sigmas[StepPos]);
+      if IsDPM and (FSchedule <> dsCosine) then
+        Result.ModelTimesteps[StepPos] := Round(Result.ModelTimesteps[StepPos]);
+    end;
+  end;
+  Result.Sigmas[NumSteps] := 0;
+  ResetMultistep;
+end;
+
+procedure TNNetDiffusionScheduler.StepAtSigma(Xt, RawPred: TNNetVolume;
+  Sigma, NextSigma: double; Method: TNNetSamplerMethod; Eta: TNeuralFloat;
+  Noise: TNNetVolume);
+var
+  InvSqrtAb, SqrtAb, NextInvSqrtAb: double;
+begin
+  if not (Method in [smEuler, smEulerAncestral, smDPMSolverPP2M]) then
+    raise Exception.Create('StepAtSigma: only Euler, Euler a and DPM++ 2M ' +
+      'step at continuous sigmas.');
+  if not (Sigma > 0) then
+    raise Exception.Create('StepAtSigma: sigma ' + FloatToStr(Sigma) +
+      ' must be > 0.');
+  if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
+  else FEpsScratch.ReSize(Xt);
+  // ab = 1/(1 + sigma^2) at a continuous sigma.
+  InvSqrtAb := Sqrt(1 + Sigma * Sigma);
+  SqrtAb := 1 / InvSqrtAb;
+  PredictX0At(Xt, RawPred, FEpsScratch, SqrtAb, Sigma * SqrtAb, InvSqrtAb);
+  if NextSigma <= 0 then
+  begin
+    // Final hop to sigma 0 (final_sigmas_type "zero"): the x0 prediction.
+    Xt.Copy(FEpsScratch);
+    FHasPrev := false;
+    Exit;
+  end;
+  NextInvSqrtAb := Sqrt(1 + NextSigma * NextSigma);
+  if Method = smDPMSolverPP2M then
+    // lambda = log(alpha/sigma_vp) = -ln(sigma); sqrt(1-ab) = sigma*sqrt(ab).
+    DPMSolverPP2MUpdate(Xt, FEpsScratch, -Ln(Sigma), -Ln(NextSigma),
+      (NextSigma / NextInvSqrtAb) / (Sigma * SqrtAb), 1 / Sqr(NextInvSqrtAb))
+  else
+  begin
+    if Method = smEuler then Eta := 0;
+    EulerAncestralUpdate(Xt, FEpsScratch, Noise, Sigma, NextSigma, InvSqrtAb,
+      1 / NextInvSqrtAb, Eta);
+  end;
 end;
 
 procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
@@ -2946,7 +3176,11 @@ begin
     else if SchedulerClass = 'EulerDiscreteScheduler' then
     begin
       Result := smEuler;
-      NoteIfSet('use_karras_sigmas');
+      if Obj.Get('use_karras_sigmas', false) and
+        ((Obj.Find('sigma_min') is TJSONNumber) or
+        (Obj.Find('sigma_max') is TJSONNumber)) then
+        Note(SchedulerClass + ' sigma_min / sigma_max is not implemented; ' +
+          'the Karras range comes from the timestep schedule');
       NoteIfSet('use_exponential_sigmas');
       NoteIfSet('use_beta_sigmas');
       NoteIfNot('interpolation_type', 'linear');
@@ -2964,7 +3198,6 @@ begin
         Note(SchedulerClass + ' solver_order ' +
           IntToStr(Obj.Get('solver_order', 2)) +
           ' is not implemented; sampling with order 2');
-      NoteIfSet('use_karras_sigmas');
       NoteIfSet('use_lu_lambdas');
       NoteIfSet('use_exponential_sigmas');
       NoteIfSet('use_beta_sigmas');
@@ -2974,6 +3207,24 @@ begin
     else
       Note('scheduler "' + SchedulerClass + '" has no sampler here; ' +
         'sampling with DDIM');
+  finally
+    Root.Free;
+  end;
+end;
+
+function DiffusersSchedulerUsesKarrasSigmas(const ConfigJson: string): boolean;
+var
+  Root: TJSONData;
+  SchedulerClass: string;
+begin
+  Result := false;
+  Root := GetJSON(ConfigJson);
+  try
+    if not (Root is TJSONObject) then Exit;
+    SchedulerClass := TJSONObject(Root).Get('_class_name', '');
+    Result := ((SchedulerClass = 'EulerDiscreteScheduler') or
+      (SchedulerClass = 'DPMSolverMultistepScheduler')) and
+      TJSONObject(Root).Get('use_karras_sigmas', false);
   finally
     Root.Free;
   end;

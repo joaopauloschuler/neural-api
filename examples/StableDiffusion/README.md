@@ -320,10 +320,22 @@ The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 | `LCMScheduler`                    | LCM (see below) | `lcm`   |
 
 Any other class runs DDIM and prints a `Notice:` line. The notice also lists
-config options that are not implemented and are ignored, e.g.
-`use_karras_sigmas`, `solver_order` other than 2, or `skip_prk_steps: false`
-(the Runge-Kutta warm-up). `--sampler` overrides the config's choice. PNDM
-runs one more UNet step than `--steps`, as diffusers does.
+config options that are not implemented and are ignored, e.g. `solver_order`
+other than 2, or `skip_prk_steps: false` (the Runge-Kutta warm-up).
+`--sampler` overrides the config's choice. PNDM runs one more UNet step than
+`--steps`, as diffusers does.
+
+Euler, Euler a and DPM-Solver++ 2M follow `use_karras_sigmas` as diffusers
+does: the sigmas follow the Karras rho = 7 ramp and stay continuous, and each
+sigma maps back to a timestep by log-sigma interpolation. Euler takes the
+sigma range from its spacing's first and last timesteps and gives the UNet the
+fractional timestep; DPM-Solver++ 2M spans the whole training schedule and
+rounds the timestep. Euler and Euler a with `linspace` spacing also give the
+UNet fractional timesteps (e.g. 749.25 at 5 steps). `--karras-sigmas` turns
+Karras sigmas on for any config (Euler a too, which diffusers does not offer),
+and `--no-karras-sigmas` turns them off. Pico parity `< 1e-4` against diffusers
+float64 (`TestStableDiffusionPipelineKarrasSigmas`). Image-to-image and the
+4-channel inpainting blend still run these samplers at integer timesteps.
 
 ## Latent Consistency Models (`--sampler lcm`)
 
@@ -584,6 +596,9 @@ StableDiffusion [--model DIR] [options]
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
                     euler, euler-a, dpm++2m or lcm (Latent Consistency; an
                     LCM-LoRA via --lora or an LCM-distilled UNet, 2-8 steps)
+  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m (diffusers
+                    use_karras_sigmas); --no-karras-sigmas turns them off
+                    (default: the scheduler config's)
   --output PNG      output file (default stable_diffusion.png)
   --repeat N        N images, seeds --seed, --seed+1, ...; the prompt is encoded
                     once. N > 1 keeps the components loaded and numbers the files

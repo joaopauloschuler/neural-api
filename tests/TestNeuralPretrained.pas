@@ -81,6 +81,10 @@ type
     // tiny_sd15_lcm_distilled (unet, scheduler, model_index) with tiny_sd15's
     // text encoder, tokenizer and VAE, assembled in a temp folder.
     function CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
+    // tiny_sd15 copied to a temp folder with SchedulerConfigJson as its
+    // scheduler_config.json.
+    function CreateSD15PipelineWithScheduler(
+      const SchedulerConfigJson: string): TStableDiffusionPipeline;
     // tiny_sd15 in a temp folder whose tokenizer/ holds only the
     // tiny_sd15_fast_tokenizer tokenizer.json + tokenizer_config.json.
     function CreateSD15FastTokenizerPipeline(): TStableDiffusionPipeline;
@@ -1305,6 +1309,7 @@ type
     procedure TestStableDiffusionPipelineGuidedNoise;
     procedure TestStableDiffusionPipelineParity;
     procedure TestStableDiffusionPipelineSamplers;
+    procedure TestStableDiffusionPipelineKarrasSigmas;
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineOddSize;
@@ -45862,6 +45867,39 @@ begin
   Result := TStableDiffusionPipeline.Create(Folder);
 end;
 
+function TTestNeuralPretrained.CreateSD15PipelineWithScheduler(
+  const SchedulerConfigJson: string): TStableDiffusionPipeline;
+const
+  cFiles: array[0..10] of string = ('model_index.json',
+    'text_encoder/config.json', 'text_encoder/model.safetensors',
+    'tokenizer/merges.txt', 'tokenizer/special_tokens_map.json',
+    'tokenizer/tokenizer_config.json', 'tokenizer/vocab.json',
+    'unet/config.json', 'unet/diffusion_pytorch_model.safetensors',
+    'vae/config.json', 'vae/diffusion_pytorch_model.safetensors');
+var
+  Folder: string;
+  FilePos: integer;
+  Lines: TStringList;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) +
+    'cai_sd15_scheduler');
+  for FilePos := 0 to High(cFiles) do
+  begin
+    ForceDirectories(ExtractFileDir(Folder + cFiles[FilePos]));
+    CopyFileTo(FixturePath('tiny_sd15/' + cFiles[FilePos]),
+      Folder + cFiles[FilePos]);
+  end;
+  ForceDirectories(Folder + 'scheduler');
+  Lines := TStringList.Create;
+  try
+    Lines.Text := SchedulerConfigJson;
+    Lines.SaveToFile(Folder + 'scheduler/scheduler_config.json');
+  finally
+    Lines.Free;
+  end;
+  Result := TStableDiffusionPipeline.Create(Folder);
+end;
+
 procedure TTestNeuralPretrained.LoadNestedOracleVolume(Data: TJSONData;
   ChannelsFirst: boolean; Dest: TNNetVolume);
 var
@@ -45919,8 +45957,8 @@ begin
       true, Expected);
     FSD15StepMaxDiff := Max(FSD15StepMaxDiff,
       MaxAbsVolumeDiff(Latents, Expected));
-    AssertEquals('step timestep', StepOracle.Arrays['timesteps'].Integers[
-      StepIndex], Round(Timestep));
+    AssertEquals('step timestep', StepOracle.Arrays['timesteps'].Floats[
+      StepIndex], Timestep, 1e-3);
     Inc(FSD15StepCount);
   finally
     Expected.Free;
@@ -46200,6 +46238,95 @@ procedure TTestNeuralPretrained.TestStableDiffusionPipelineSamplers;
 begin
   CheckSDPipelineSamplers('tiny_sd15', 'tiny_sd15_pipeline_io.json',
     'tiny_sd15_samplers_io.json');
+end;
+
+// Continuous-sigma sampling against diffusers float64
+// (tests/fixtures/tiny_sd15_karras_io.json): Euler and DPM++ 2M with
+// use_karras_sigmas, Euler and Euler a (injected noise) with linspace
+// fractional timesteps, each from its scheduler_config.json.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineKarrasSigmas;
+const
+  cExpected: array[0..4] of TNNetSamplerMethod =
+    (smEuler, smEuler, smEuler, smEulerAncestral, smDPMSolverPP2M);
+  cKarras: array[0..4] of boolean = (true, true, false, false, true);
+var
+  Root, KarrasRoot: TJSONData;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Latents: TNNetVolume;
+  SigmaSchedule: TNNetSigmaSchedule;
+  ImageSize, CasePos, StepCount, StepPos: integer;
+  CaseName: string;
+  SigmaDiff, TimestepDiff: double;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_pipeline_io.json');
+  KarrasRoot := LoadSD15Fixture('tiny_sd15_karras_io.json');
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Pipeline := nil;
+  try
+    ImageSize := TJSONObject(Root).Get('image_size', 0);
+    StepCount := TJSONObject(KarrasRoot).Get('steps', 0);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['latents'], true, Initial);
+    Cases := TJSONObject(KarrasRoot).Arrays['cases'];
+    AssertEquals('case count', Length(cExpected), Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      CaseName := Entry.Get('name', '');
+      FreeAndNil(Pipeline);
+      Pipeline := CreateSD15PipelineWithScheduler(
+        Entry.Objects['config'].AsJSON);
+      AssertTrue(CaseName + ' sampler',
+        Pipeline.Sampler = cExpected[CasePos]);
+      AssertEquals(CaseName + ' notice', '', Pipeline.SamplerNotice);
+      AssertEquals(CaseName + ' karras', cKarras[CasePos],
+        Pipeline.KarrasSigmas);
+      SigmaSchedule := Pipeline.Scheduler.BuildSigmaSchedule(StepCount,
+        Pipeline.Scheduler.ConfigSpacing, Pipeline.Sampler,
+        Pipeline.KarrasSigmas);
+      SigmaDiff := 0;
+      TimestepDiff := 0;
+      for StepPos := 0 to StepCount do
+        SigmaDiff := Max(SigmaDiff, Abs(SigmaSchedule.Sigmas[StepPos] -
+          Entry.Arrays['sigmas'].Floats[StepPos]) /
+          Max(1.0, SigmaSchedule.Sigmas[StepPos]));
+      for StepPos := 0 to StepCount - 1 do
+        TimestepDiff := Max(TimestepDiff,
+          Abs(SigmaSchedule.ModelTimesteps[StepPos] -
+          Entry.Arrays['timesteps'].Floats[StepPos]));
+      AssertTrue(CaseName + ' sigmas rel |diff| = ' + FloatToStr(SigmaDiff),
+        SigmaDiff < 1e-5);
+      AssertTrue(CaseName + ' timesteps |diff| = ' + FloatToStr(TimestepDiff),
+        TimestepDiff < 1e-3);
+      Pipeline.GuidanceScale := TJSONObject(KarrasRoot).Get('guidance_scale',
+        0.0);
+      Pipeline.EncodePrompt(TJSONObject(Root).Get('prompt', ''), Embeds);
+      Latents.ReSize(Initial);
+      Latents.Copy(Initial);
+      FSD15Oracle := KarrasRoot;
+      FSD15StepOracle := Entry;
+      FSD15StepMaxDiff := 0;
+      FSD15StepCount := 0;
+      Pipeline.OnStep := @SD15CheckStep;
+      Pipeline.OnAncestralNoise := @SD15StepNoise;
+      Pipeline.Denoise(Embeds, ImageSize, ImageSize, StepCount, Latents);
+      AssertEquals(CaseName + ' evals', StepCount, FSD15StepCount);
+      AssertTrue(CaseName + ' step latents max |diff| = ' +
+        FloatToStr(FSD15StepMaxDiff), FSD15StepMaxDiff < 1e-4);
+    end;
+  finally
+    FSD15Oracle := nil;
+    FSD15StepOracle := nil;
+    Pipeline.Free;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    KarrasRoot.Free;
+    Root.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.CheckSDPipelineSamplers(const Folder,
