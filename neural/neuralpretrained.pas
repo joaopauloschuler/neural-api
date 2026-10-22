@@ -15666,6 +15666,88 @@ function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
 procedure FreeMask2Former(NN: TNNet);
 
 // ---------------------------------------------------------------------------
+// DDCOLOR PHOTO-COLORIZATION IMPORT (Kang et al., ICCV 2023, arXiv:2212.11613;
+// piddnad/DDColor basicsr/archs/ddcolor_arch.py, e.g. piddnad/ddcolor_paper_tiny
+// and ddcolor_modelscope). Input: a grayscale RGB image (L of the photo, a*b*=0,
+// back to RGB, in [0,1]); output: the a*b* chroma (Lab units) at the input size.
+//   - ConvNeXt encoder (AddConvNeXtTrunk, facebookresearch key names) with a
+//     channel LayerNorm tap (norm0..norm3) on each stage output.
+//   - Pixel decoder: 3 UnetBlockWide (1x1 conv+BN -> ReLU -> PixelShuffle(2) ->
+//     blur, BN skip, concat, ReLU, 3x3 conv -> ReLU -> BN) up to stride 4, then
+//     a 1x1 conv -> ReLU -> PixelShuffle(4) -> blur up to full resolution. The
+//     blur (ReplicationPad2d((1,0,1,0)) + AvgPool2d(2,1)) is TNNetGridAvgPool(2,
+//     1,1) + TNNetCrop: a 2-wide window over a replicated edge averages the same
+//     values as the count_include_pad=False window.
+//   - Multi-scale color decoder: learnable color queries, Mask2Former-order
+//     layers (AddMask2FormerDecoderLayer: cross-attention to the stride-16/8/4
+//     decoder features round-robin, self-attention, FFN, post-norm) without
+//     masks; DETR sine positions on the keys, level_embed folded into input_proj.
+//   - The query x pixel product (einsum bqc,bchw->bqhw) is TNNetDotProducts,
+//     then concat with the normalized input and a 1x1 conv (refine_net) to a*b*.
+// spectral_norm (weight_orig/u/v) and weight_norm convs are folded at load;
+// BatchNorm is folded into the preceding conv when no ReLU sits between.
+// Coded by Claude (AI).
+type
+  TDDColorConfig = record
+    EncoderName: string;              // 'convnext-t' / 'convnext-l'
+    Depths: array[0..3] of integer;   // ConvNeXt blocks per stage
+    Dims: array[0..3] of integer;     // ConvNeXt channels per stage
+    NF: integer;                      // pixel-decoder width (512)
+    NumQueries: integer;              // color queries (100)
+    NumScales: integer;               // decoder feature levels (3)
+    DecLayers: integer;               // color-decoder layers (9)
+    Hidden: integer;                  // color-decoder width (256)
+    Heads: integer;                   // attention heads (8)
+    FFNDim: integer;                  // color-decoder FFN width (2048)
+    ColorEmbedDim: integer;           // query embedding width (= NF div 2)
+    NumOutputChannels: integer;       // 2 (a*b*)
+    InputWidth, InputHeight: integer; // net input size, multiples of 32 (512)
+  end;
+
+// Defaults of the official checkpoints for EncoderName 'convnext-t' (tiny) or
+// 'convnext-l' (large): 512x512 input, 100 queries, 9 layers, 8 heads.
+function DefaultDDColorConfig(const EncoderName: string): TDDColorConfig;
+
+// Reads a DDColor config.json (encoder_name, input_size [h, w], num_queries,
+// num_scales, dec_layers, num_output_channels; optional nheads).
+function ReadDDColorConfigFromJSONFile(const FileName: string): TDDColorConfig;
+
+// Overwrites the tensor-determined fields of Config (depths, dims, nf, queries,
+// widths, layer count, output channels) from the checkpoint shapes.
+procedure InferDDColorConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TDDColorConfig);
+
+function DDColorConfigToString(const Config: TDDColorConfig): string;
+
+// Builds DDColor and loads every weight from Reader (caller owns Reader).
+// Input (InputWidth, InputHeight, 3) RGB in [0,1]; output (W, H, 2) a*b*.
+function BuildDDColor(Reader: TNNetSafeTensorsReader;
+  const Config: TDDColorConfig; pTrainable: boolean = true): TNNet;
+
+// Same from a .safetensors / .pth / .bin checkpoint file.
+function BuildDDColorFromSafeTensorsEx(const FileName: string;
+  const Config: TDDColorConfig; pTrainable: boolean = true): TNNet;
+
+// Config from ConfigFileName (default: config.json beside FileName, else the
+// convnext-l defaults) with the shapes inferred from the checkpoint.
+function BuildDDColorFromSafeTensors(const FileName: string;
+  out Config: TDDColorConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Image (W, H, 3) RGB 0..255 -> NetInput (InputWidth, InputHeight, 3): bilinear
+// resize, L of RgbToLab with a*b* = 0, LabToRgb, scaled to [0,1].
+procedure DDColorPrepareInput(Image: TNNetVolume; const Config: TDDColorConfig;
+  NetInput: TNNetVolume);
+
+// Bilinear-resizes the net's a*b* (W', H', 2) to Image's size and recombines it
+// with Image's own L via LabToRgb into Colorized (W, H, 3) RGB 0..255.
+procedure DDColorComposeOutput(Image, AB: TNNetVolume; Colorized: TNNetVolume);
+
+// DDColorPrepareInput -> NN.Compute -> DDColorComposeOutput.
+procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
+  Image, Colorized: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
 // ultralytics/yolov8n) -- the repo's FIRST anchor-free fully-convolutional
 // one-stage detector, STRUCTURALLY DISTINCT from the landed DETR importer (no
@@ -66341,22 +66423,110 @@ begin
   else Result := Result + ', maxpool=cai';
 end;
 
+// Reads BatchNorm BnPrefix.{weight,bias,running_mean,running_var} (Ch each) as
+// the eval-mode per-channel affine y = x*Scale + Shift.
+procedure LoadTorchBatchNormScaleShift(Reader: TNNetSafeTensorsReader;
+  const BnPrefix: string; Ch: integer; BnEps: TNeuralFloat;
+  Scale, Shift: TNNetVolume);
+var
+  Mean, Var_: TNNetVolume;
+  MaxChannelPos, ChannelPos: integer;
+begin
+  if not Reader.HasTensor(BnPrefix + '.weight') then
+    ImportError('Import: missing BatchNorm tensor "' + BnPrefix + '.weight".');
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BnPrefix + '.weight', Scale);
+    Reader.LoadTensorFlat(BnPrefix + '.bias', Shift);
+    Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+    Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+    if (Scale.Size <> Ch) or (Shift.Size <> Ch) or
+       (Mean.Size <> Ch) or (Var_.Size <> Ch) then
+      ImportError('Import: BatchNorm "' + BnPrefix +
+        '" parameters must each have ' + IntToStr(Ch) + ' elements.');
+    MaxChannelPos := Ch - 1;
+    for ChannelPos := 0 to MaxChannelPos do
+    begin
+      Scale.FData[ChannelPos] := Scale.FData[ChannelPos] /
+        Sqrt(Var_.FData[ChannelPos] + BnEps);
+      Shift.FData[ChannelPos] := Shift.FData[ChannelPos] -
+        Mean.FData[ChannelPos] * Scale.FData[ChannelPos];
+    end;
+  finally
+    Mean.Free;
+    Var_.Free;
+  end;
+end;
+
+// Writes a torch Conv2d weight W [OutCh,InCh,K,K] into Layer as FData[(ky*K+kx)*
+// InCh + c] times Scale[o]; bias = Bias[o]*Scale[o] + Shift[o]. nil = 0 / 1 / 0.
+procedure WriteTorchConvWeights(Layer: TNNetLayer;
+  W, Bias, Scale, Shift: TNNetVolume; OutCh, InCh, K: integer);
+var
+  o, c, ky, kx, kBase, srcIdx, KK: integer;
+  OutChM1, InChM1, KM1: integer;
+  ChannelScale, ChannelBias: TNeuralFloat;
+  WVol: TNNetVolume;
+begin
+  EnsureWritableImportWeights(Layer);
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('Import: internal error - conv target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * InCh then
+    ImportError('Import: internal error - conv target neuron has ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(K * K * InCh) + '.');
+  if W.Size <> OutCh * InCh * K * K then
+    ImportError('Import: internal error - conv weight has ' +
+      IntToStr(W.Size) + ' elements, expected ' +
+      IntToStr(OutCh * InCh * K * K) + '.');
+  OutChM1 := OutCh - 1;
+  InChM1 := InCh - 1;
+  KM1 := K - 1;
+  KK := K * K;
+  for o := 0 to OutChM1 do
+  begin
+    if Scale <> nil then ChannelScale := Scale.FData[o] else ChannelScale := 1.0;
+    if Bias <> nil then ChannelBias := Bias.FData[o] * ChannelScale
+    else ChannelBias := 0.0;
+    if Shift <> nil then ChannelBias := ChannelBias + Shift.FData[o];
+    WVol := Layer.FArrNeurons[o].Weights;
+    if K = 1 then
+    begin
+      // 1x1: the InCh weights of a filter are contiguous in both tensors,
+      // so the transpose degenerates to a copy plus a scale (App. C, #13).
+      Move(W.FData[o * InCh], WVol.FData[0], InCh * csNeuralFloatSize);
+      if ChannelScale <> 1.0 then
+        TNNetVolume.Mul(@WVol.FData[0], ChannelScale, InCh);
+    end
+    else
+      for ky := 0 to KM1 do
+        for kx := 0 to KM1 do
+        begin
+          kBase := (ky * K + kx) * InCh;
+          // #12: the source walks c with a fixed K*K stride.
+          srcIdx := (o * InCh * K + ky) * K + kx;
+          for c := 0 to InChM1 do
+          begin
+            WVol.FData[kBase + c] := W.FData[srcIdx] * ChannelScale;
+            Inc(srcIdx, KK);
+          end;
+        end;
+    Layer.FArrNeurons[o].BiasWeight := ChannelBias;
+  end;
+  Layer.FlushWeightCache();
+end;
+
 // Loads a torchvision Conv2d (weight [O,I,kh,kw], bias=False) into a CAI conv
-// layer, FOLDING the following BatchNorm2d into it. The CAI conv stores each
-// neuron's weights depth-contiguous as FData[(ky*K + kx)*I + c] (the layout
-// LoadClipPatchConv uses) and the fold scale/shift go into the weight and
-// BiasWeight. When BnPrefix = '' the conv is loaded without a fold (no BN).
+// layer, FOLDING the following BatchNorm2d into it (BnPrefix '' = no BN).
 procedure LoadResNetConvFoldBN(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const ConvWName, BnPrefix: string;
   OutCh, InCh, K: integer; BnEps: TNeuralFloat);
 var
-  W, Gamma, Beta, Mean, Var_: TNNetVolume;
-  o, c, ky, kx, kBase, srcIdx, KK: integer;
-  OutChM1, InChM1, KM1: integer;
-  Scale, Shift, Denom: TNeuralFloat;
-  WVol: TNNetVolume;
+  W, Scale, Shift: TNNetVolume;
 begin
-  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(ConvWName) then
     ImportError('ResNet import: missing tensor "' + ConvWName + '".');
   if (Reader.DimCount(ConvWName) <> 4) or
@@ -66368,79 +66538,20 @@ begin
       IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
       IntToStr(K) + '] (nn.Conv2d [out,in,kh,kw]), got ' +
       Reader.ShapeAsString(ConvWName));
-  if Layer.Neurons.Count <> OutCh then
-    ImportError('ResNet import: internal error - conv "' + ConvWName +
-      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
-      IntToStr(OutCh) + '.');
-  if Layer.FArrNeurons[0].Weights.Size <> K * K * InCh then
-    ImportError('ResNet import: internal error - conv "' + ConvWName +
-      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
-      ' weights, expected ' + IntToStr(K * K * InCh) + '.');
   W := TNNetVolume.Create;
-  Gamma := TNNetVolume.Create;
-  Beta := TNNetVolume.Create;
-  Mean := TNNetVolume.Create;
-  Var_ := TNNetVolume.Create;
+  Scale := TNNetVolume.Create;
+  Shift := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(ConvWName, W);
     if BnPrefix <> '' then
     begin
-      if not Reader.HasTensor(BnPrefix + '.weight') then
-        ImportError('ResNet import: missing BatchNorm tensor "' +
-          BnPrefix + '.weight".');
-      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
-      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
-      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
-      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
-      if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
-         (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
-        ImportError('ResNet import: BatchNorm "' + BnPrefix +
-          '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
-    end;
-    OutChM1 := OutCh - 1;
-    InChM1 := InCh - 1;
-    KM1 := K - 1;
-    KK := K * K;
-    for o := 0 to OutChM1 do
-    begin
-      if BnPrefix <> '' then
-      begin
-        // Fold BN: w' = w * gamma/sqrt(var+eps); b' = beta - gamma*mean/...
-        Denom := Sqrt(Var_.FData[o] + BnEps);
-        Scale := Gamma.FData[o] / Denom;
-        Shift := Beta.FData[o] - Gamma.FData[o] * Mean.FData[o] / Denom;
-      end
-      else
-      begin
-        Scale := 1.0;
-        Shift := 0.0;
-      end;
-      WVol := Layer.FArrNeurons[o].Weights;
-      if K = 1 then
-      begin
-        // 1x1: the InCh weights of a filter are contiguous in both tensors,
-        // so the transpose degenerates to a copy plus a scale (App. C, #13).
-        Move(W.FData[o * InCh], WVol.FData[0], InCh * csNeuralFloatSize);
-        if Scale <> 1.0 then TNNetVolume.Mul(@WVol.FData[0], Scale, InCh);
-      end
-      else
-        for ky := 0 to KM1 do
-          for kx := 0 to KM1 do
-          begin
-            kBase := (ky * K + kx) * InCh;
-            // #12: the source walks c with a fixed K*K stride.
-            srcIdx := (o * InCh * K + ky) * K + kx;
-            for c := 0 to InChM1 do
-            begin
-              WVol.FData[kBase + c] := W.FData[srcIdx] * Scale;
-              Inc(srcIdx, KK);
-            end;
-          end;
-      Layer.FArrNeurons[o].BiasWeight := Shift;
-    end;
-    Layer.FlushWeightCache();
+      LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh, BnEps, Scale, Shift);
+      WriteTorchConvWeights(Layer, W, nil, Scale, Shift, OutCh, InCh, K);
+    end
+    else
+      WriteTorchConvWeights(Layer, W, nil, nil, nil, OutCh, InCh, K);
   finally
-    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+    W.Free; Scale.Free; Shift.Free;
   end;
 end;
 
@@ -68015,6 +68126,12 @@ begin
 end;
 
 type
+  // Tensor names of HF transformers ('convnext.encoder.stages.S.layers.B...')
+  // or of the original facebookresearch repo ('stages.S.B...').
+  TConvNeXtKeyScheme = (cksHuggingFace, cksFacebook);
+  // Last layer of each stage (strides 4, 8, 16, 32), before any norm tap.
+  TConvNeXtStageOutputs = array[0..3] of TNNetLayer;
+
   // Layer refs needed to load one ConvNeXt block's weights.
   TConvNeXtBlockLayers = record
     DwConv, DwBias, LN, PwConv1, PwConv2: TNNetLayer;
@@ -68055,117 +68172,141 @@ begin
   NN.AddLayer(TNNetSum.Create([Branch, Input]));
 end;
 
+// Builds the ConvNeXt stem + 4 stages after Source and loads their weights.
+// Scheme picks HF (Prefix 'convnext.') or original facebookresearch key names.
+procedure AddConvNeXtTrunk(NN: TNNet; Source: TNNetLayer;
+  Reader: TNNetSafeTensorsReader; const Config: TConvNeXtConfig;
+  Scheme: TConvNeXtKeyScheme; const Prefix: string; pTrainable: boolean;
+  out StageOutputs: TConvNeXtStageOutputs);
+var
+  StemConv, StemLN, DownLN, DownConv: TNNetLayer;
+  Refs: TConvNeXtBlockLayers;
+  Stage, BlockIdx, InDim, Dim, MaxBlockPos: integer;
+  BlockPrefix, StemConvName, StemLNName, DownLNName, DownConvName: string;
+  BlockLNName, LayerScaleName, GRNGammaName, GRNBetaName: string;
+begin
+  if Scheme = cksHuggingFace then
+  begin
+    StemConvName := Prefix + 'embeddings.patch_embeddings';
+    StemLNName := Prefix + 'embeddings.layernorm';
+    BlockLNName := '.layernorm';
+    LayerScaleName := '.layer_scale_parameter';
+    GRNGammaName := '.grn.weight';
+    GRNBetaName := '.grn.bias';
+  end
+  else
+  begin
+    StemConvName := Prefix + 'downsample_layers.0.0';
+    StemLNName := Prefix + 'downsample_layers.0.1';
+    BlockLNName := '.norm';
+    LayerScaleName := '.gamma';
+    GRNGammaName := '.grn.gamma';
+    GRNBetaName := '.grn.beta';
+  end;
+  // Stem: patchify conv (PxP stride P, biased) -> channel LayerNorm.
+  StemConv := NN.AddLayerAfter(TNNetConvolutionLinear.Create(
+    Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable),
+    Source);
+  LoadConvNeXtConv(Reader, StemConv, StemConvName + '.weight',
+    StemConvName + '.bias', Config.Dims[0], Config.NumChannels,
+    Config.PatchSize);
+  StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+  LoadLayerNormWeights(Reader, StemLN, StemLNName + '.weight',
+    StemLNName + '.bias', Config.Dims[0]);
+  for Stage := 0 to 3 do StageOutputs[Stage] := nil;
+  InDim := Config.Dims[0];
+  for Stage := 0 to 3 do
+  begin
+    Dim := Config.Dims[Stage];
+    // Stages 1..3: downsample = channel LayerNorm -> 2x2 stride-2 conv.
+    if Stage > 0 then
+    begin
+      if Scheme = cksHuggingFace then
+      begin
+        DownLNName := Prefix + 'encoder.stages.' + IntToStr(Stage) +
+          '.downsampling_layer.0';
+        DownConvName := Prefix + 'encoder.stages.' + IntToStr(Stage) +
+          '.downsampling_layer.1';
+      end
+      else
+      begin
+        DownLNName := Prefix + 'downsample_layers.' + IntToStr(Stage) + '.0';
+        DownConvName := Prefix + 'downsample_layers.' + IntToStr(Stage) + '.1';
+      end;
+      DownLN := NN.AddLayerAfter(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable),
+        StageOutputs[Stage - 1]);
+      LoadLayerNormWeights(Reader, DownLN, DownLNName + '.weight',
+        DownLNName + '.bias', InDim);
+      DownConv := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0).SetTrainable(pTrainable));
+      LoadConvNeXtConv(Reader, DownConv, DownConvName + '.weight',
+        DownConvName + '.bias', Dim, InDim, 2);
+    end;
+    MaxBlockPos := Config.Depths[Stage] - 1;
+    for BlockIdx := 0 to MaxBlockPos do
+    begin
+      if Scheme = cksHuggingFace then
+        BlockPrefix := Prefix + 'encoder.stages.' + IntToStr(Stage) +
+          '.layers.' + IntToStr(BlockIdx)
+      else
+        BlockPrefix := Prefix + 'stages.' + IntToStr(Stage) + '.' +
+          IntToStr(BlockIdx);
+      AddConvNeXtBlock(NN, Config, Dim, Refs);
+      LoadConvNeXtDepthwise(Reader, Refs.DwConv,
+        BlockPrefix + '.dwconv.weight', BlockPrefix + '.dwconv.bias', Dim, 7);
+      LoadConvNeXtChannelVector(Reader, Refs.DwBias,
+        BlockPrefix + '.dwconv.bias', 0, Dim);
+      LoadLayerNormWeights(Reader, Refs.LN, BlockPrefix + BlockLNName + '.weight',
+        BlockPrefix + BlockLNName + '.bias', Dim);
+      LoadLlamaLinearWeights(Reader, Refs.PwConv1,
+        BlockPrefix + '.pwconv1.weight', Dim, 4 * Dim, 0, -1, 0,
+        BlockPrefix + '.pwconv1.bias');
+      LoadLlamaLinearWeights(Reader, Refs.PwConv2,
+        BlockPrefix + '.pwconv2.weight', 4 * Dim, Dim, 0, -1, 0,
+        BlockPrefix + '.pwconv2.bias');
+      if Config.Version >= 2 then
+      begin
+        // GRN: gamma -> Neurons[0], beta -> Neurons[1] (over 4*Dim channels).
+        LoadConvNeXtChannelVector(Reader, Refs.GRN,
+          BlockPrefix + GRNGammaName, 0, 4 * Dim);
+        LoadConvNeXtChannelVector(Reader, Refs.GRN,
+          BlockPrefix + GRNBetaName, 1, 4 * Dim);
+      end
+      else
+        LoadConvNeXtChannelVector(Reader, Refs.LayerScale,
+          BlockPrefix + LayerScaleName, 0, Dim);
+    end;
+    StageOutputs[Stage] := NN.GetLastLayer();
+    InDim := Dim;
+  end;
+end;
+
 function BuildConvNeXt(Reader: TNNetSafeTensorsReader;
   const Config: TConvNeXtConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
-  StemConv, StemLN, HeadLN, FC: TNNetLayer;
-  DownLN: array[0..3] of TNNetLayer;       // per-stage downsample LN (1..3)
-  DownConv: array[0..3] of TNNetLayer;     // per-stage downsample conv (1..3)
-  BlockRefs: array of TConvNeXtBlockLayers;
-  RefCount, Stage, BlockIdx, InDim, Dim, DepthM1: integer;
-  Prefix, StagePrefix, Pre: string;
+  HeadLN, FC: TNNetLayer;
+  StageOutputs: TConvNeXtStageOutputs;
+  Pre: string;
 begin
   if Config.NumChannels < 1 then
     ImportError('ConvNeXt import: num_channels must be >= 1.');
   if Config.NumLabels < 1 then
     ImportError('ConvNeXt import: num_labels must be >= 1.');
-  RefCount := 0;
-  for Stage := 0 to 3 do RefCount := RefCount + Config.Depths[Stage];
-  SetLength(BlockRefs, RefCount);
   // HF tensor prefix: "convnext." (v1) or "convnextv2." (v2).
   if Config.Version >= 2 then Pre := 'convnextv2.' else Pre := 'convnext.';
   NN := TNNet.Create();
   try
-    // ---------------- Architecture ----------------
     NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels));
-    // Stem: patchify conv (PxP stride P, biased) -> channel LayerNorm.
-    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable));
-    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
-    RefCount := 0;
-    InDim := Config.Dims[0];
-    for Stage := 0 to 3 do
-    begin
-      Dim := Config.Dims[Stage];
-      DownLN[Stage] := nil; DownConv[Stage] := nil;
-      // Stages 1..3: downsample = channel LayerNorm -> 2x2 stride-2 conv.
-      if Stage > 0 then
-      begin
-        DownLN[Stage] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
-        DownConv[Stage] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0).SetTrainable(pTrainable));
-      end;
-      DepthM1 := Config.Depths[Stage] - 1;
-      for BlockIdx := 0 to DepthM1 do
-      begin
-        AddConvNeXtBlock(NN, Config, Dim, BlockRefs[RefCount]);
-        Inc(RefCount);
-      end;
-      InDim := Dim;
-    end;
+    AddConvNeXtTrunk(NN, NN.GetLastLayer(), Reader, Config, cksHuggingFace,
+      Pre, pTrainable, StageOutputs);
     // Head: global average pool over spatial grid -> channel LayerNorm -> fc.
     NN.AddLayer(TNNetAvgChannel.Create());
     HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
     FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
     if not pTrainable then NN.SetTrainable();
-
-    // ---------------- Weights ----------------
-    LoadConvNeXtConv(Reader, StemConv,
-      Pre + 'embeddings.patch_embeddings.weight',
-      Pre + 'embeddings.patch_embeddings.bias',
-      Config.Dims[0], Config.NumChannels, Config.PatchSize);
-    LoadLayerNormWeights(Reader, StemLN,
-      Pre + 'embeddings.layernorm.weight',
-      Pre + 'embeddings.layernorm.bias', Config.Dims[0]);
-    RefCount := 0;
-    InDim := Config.Dims[0];
-    for Stage := 0 to 3 do
-    begin
-      Dim := Config.Dims[Stage];
-      StagePrefix := Pre + 'encoder.stages.' + IntToStr(Stage);
-      if Stage > 0 then
-      begin
-        LoadLayerNormWeights(Reader, DownLN[Stage],
-          StagePrefix + '.downsampling_layer.0.weight',
-          StagePrefix + '.downsampling_layer.0.bias', InDim);
-        LoadConvNeXtConv(Reader, DownConv[Stage],
-          StagePrefix + '.downsampling_layer.1.weight',
-          StagePrefix + '.downsampling_layer.1.bias', Dim, InDim, 2);
-      end;
-      DepthM1 := Config.Depths[Stage] - 1;
-      for BlockIdx := 0 to DepthM1 do
-      begin
-        Prefix := StagePrefix + '.layers.' + IntToStr(BlockIdx);
-        LoadConvNeXtDepthwise(Reader, BlockRefs[RefCount].DwConv,
-          Prefix + '.dwconv.weight', Prefix + '.dwconv.bias', Dim, 7);
-        LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].DwBias,
-          Prefix + '.dwconv.bias', 0, Dim);
-        LoadLayerNormWeights(Reader, BlockRefs[RefCount].LN,
-          Prefix + '.layernorm.weight', Prefix + '.layernorm.bias', Dim);
-        LoadLlamaLinearWeights(Reader, BlockRefs[RefCount].PwConv1,
-          Prefix + '.pwconv1.weight', Dim, 4 * Dim, 0, -1, 0,
-          Prefix + '.pwconv1.bias');
-        LoadLlamaLinearWeights(Reader, BlockRefs[RefCount].PwConv2,
-          Prefix + '.pwconv2.weight', 4 * Dim, Dim, 0, -1, 0,
-          Prefix + '.pwconv2.bias');
-        if Config.Version >= 2 then
-        begin
-          // GRN: gamma -> Neurons[0], beta -> Neurons[1] (over 4*Dim channels).
-          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].GRN,
-            Prefix + '.grn.weight', 0, 4 * Dim);
-          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].GRN,
-            Prefix + '.grn.bias', 1, 4 * Dim);
-        end
-        else
-          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].LayerScale,
-            Prefix + '.layer_scale_parameter', 0, Dim);
-        Inc(RefCount);
-      end;
-      InDim := Dim;
-    end;
     LoadLayerNormWeights(Reader, HeadLN,
       Pre + 'layernorm.weight', Pre + 'layernorm.bias', Config.Dims[3]);
     LoadLlamaLinearWeights(Reader, FC, 'classifier.weight',
@@ -82689,19 +82830,24 @@ begin
         Result[ChannelPos * 4 + dy * 2 + dx] := (dx * 2 + dy) * C + ChannelPos;
 end;
 
-// Source neuron of each up-conv neuron: TNNetPixelShuffle(2) reads channel
-// c*4 + dx*2 + dy where torch PixelShuffle(2) reads c*4 + dy*2 + dx.
-function RestormerPixelShuffleNeurons(OutCh: integer): TNeuralIntegerArray;
+// Source neuron of each conv neuron feeding a pixel shuffle: TNNetPixelShuffle(r)
+// reads channel c*r*r + dx*r + dy where torch PixelShuffle(r) reads c*r*r + dy*r + dx.
+function TorchPixelShuffleNeurons(OutCh, Factor: integer): TNeuralIntegerArray;
 var
-  ChannelPos, MaxChannelPos, dx, dy: integer;
+  ChannelPos, MaxChannelPos, dx, dy, MaxOffset, ChannelBase, FactorSquared: integer;
 begin
   Result := nil;
-  SetLength(Result, 4 * OutCh);
+  FactorSquared := Factor * Factor;
+  SetLength(Result, FactorSquared * OutCh);
   MaxChannelPos := OutCh - 1;
+  MaxOffset := Factor - 1;
   for ChannelPos := 0 to MaxChannelPos do
-    for dx := 0 to 1 do
-      for dy := 0 to 1 do
-        Result[ChannelPos * 4 + dx * 2 + dy] := ChannelPos * 4 + dy * 2 + dx;
+  begin
+    ChannelBase := ChannelPos * FactorSquared;
+    for dx := 0 to MaxOffset do
+      for dy := 0 to MaxOffset do
+        Result[ChannelBase + dx * Factor + dy] := ChannelBase + dy * Factor + dx;
+  end;
 end;
 
 // Source of each channel when the two halves of Count channels swap places.
@@ -82943,7 +83089,7 @@ begin
       LoadVaeConv(Reader, UpConvs[LevelPos], Prefix + 'up' +
         IntToStr(LevelPos + 2) + '_' + LevelName + '.body.0.weight', '', 2 * C,
         C, 3);
-      PermuteLayerNeurons(UpConvs[LevelPos], RestormerPixelShuffleNeurons(C div 2));
+      PermuteLayerNeurons(UpConvs[LevelPos], TorchPixelShuffleNeurons(C div 2, 2));
       if LevelPos > 0 then
       begin
         if Config.Bias then
@@ -89555,73 +89701,111 @@ type
     ME0, ME1, ME2: TNNetLayer;
   end;
 
-// Builds one masked-attention decoder layer as a standalone net. The masked
-// cross-attention uses an EXPLICIT DotProducts score matrix so we can ADD the
-// per-layer background mask bias (additive -1e9) before softmax -- there is no
-// off-the-shelf masked-cross-attention leaf. Order is cross -> self -> FFN with
-// POST-norm (Mask2Former-specific, differs from DETR's self-first ordering).
+type
+  // Loadable layers of one cross -> self -> FFN post-norm decoder layer.
+  TMask2FormerDecoderLayerRefs = record
+    CQ, CK, CV, CO: TNNetLayer;       // cross_attn q/k/v/o proj
+    CrossNorm: TNNetLayer;
+    SQ, SK, SV, SO: TNNetLayer;       // self_attn q/k/v/o proj
+    SelfNorm: TNNetLayer;
+    Fc1, Fc2, FfnNorm: TNNetLayer;
+  end;
+
+// Multi-head attention over an EXPLICIT DotProducts score matrix so an additive
+// [key,query,1] MaskBias (nil = none) can be summed before the key softmax.
+function AddMask2FormerAttention(NN: TNNet; Hidden, Heads: integer;
+  QSrcLayer, KSrcLayer, VSrcLayer, MaskBias: TNNetLayer;
+  out QP, KP, VP, OP: TNNetLayer): TNNetLayer;
+var
+  hh, HeadDim, HeadsM1: integer;
+  InvSqrt: TNeuralFloat;
+  qh, kh, vh, vth, sc, wh, oh: TNNetLayer;
+  outs: array of TNNetLayer;
+begin
+  HeadDim := Hidden div Heads;
+  HeadsM1 := Heads - 1;
+  InvSqrt := 1.0 / Sqrt(HeadDim);
+  SetLength(outs, Heads);
+  QP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden, 0), QSrcLayer);
+  KP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden, 0), KSrcLayer);
+  VP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden, 0), VSrcLayer);
+  for hh := 0 to HeadsM1 do
+  begin
+    qh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), QP);
+    kh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), KP);
+    vh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), VP);
+    // scores = DotProducts(Q,K) -> [X=key, Y=1, D=query]; scale; transpose to
+    // [key, query, 1] so the mask bias (also [key,query,1]) can be summed.
+    sc := NN.AddLayer(TNNetDotProducts.Create(qh, kh));
+    sc := NN.AddLayer(TNNetMulByConstant.Create(InvSqrt));
+    sc := NN.AddLayerAfter(TNNetTransposeYD.Create(), sc);
+    if MaskBias <> nil then
+      wh := NN.AddLayer(TNNetSum.Create([sc, MaskBias]))
+    else
+      wh := sc;
+    // softmax over the key axis: [1,query,key]; PointwiseSoftMax over Depth=key.
+    wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
+    wh := NN.AddLayerAfter(TNNetPointwiseSoftMax.Create(), wh);
+    wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
+    // weights . V (rectangular cross-attention; key=S may differ from query=Q):
+    // out[q,d] = sum_s prob[s,q] * V[s,d], contracting the KEY axis. Arrange
+    // prob [key=S, query=Q, 1] -> [Q, 1, S] (TransposeYD then TransposeXD) and
+    // V [S, 1, d_k] -> [d_k, 1, S] (TransposeXD); DotProducts contracts Depth=S
+    // -> [B.X=Q, B.Y=1, A.X*A.Y=d_k] = [query, 1, HeadDim].
+    wh := NN.AddLayerAfter(TNNetTransposeYD.Create(), wh);   // [S,1,Q]
+    wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);   // [Q,1,S]
+    vth := NN.AddLayerAfter(TNNetTransposeXD.Create(), vh);  // [d_k,1,S]
+    oh := NN.AddLayer(TNNetDotProducts.Create(vth, wh));     // [Q,1,d_k]
+    outs[hh] := oh;
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create(outs));
+  OP := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden, 0));
+  Result := OP;
+end;
+
+// Appends one Mask2Former decoder layer (cross -> self -> FFN, POST-norm) to NN:
+// q = Hs + QueryEmbed, k = KeyPos, v = Memory. Returns the layer's output.
+function AddMask2FormerDecoderLayer(NN: TNNet; Hidden, Heads, FFNDim: integer;
+  Hs, QueryEmbed, Memory, KeyPos, MaskBias: TNNetLayer; pTrainable: boolean;
+  out Refs: TMask2FormerDecoderLayerRefs): TNNetLayer;
+var
+  QSrc, CrossNormed, SaSrc, SelfNormed: TNNetLayer;
+begin
+  // ===== cross-attention (cross FIRST, post-norm) =====
+  QSrc := NN.AddLayer(TNNetSum.Create([Hs, QueryEmbed]));
+  AddMask2FormerAttention(NN, Hidden, Heads, QSrc, KeyPos, Memory, MaskBias,
+    Refs.CQ, Refs.CK, Refs.CV, Refs.CO);
+  NN.AddLayer(TNNetSum.Create([Refs.CO, Hs]));
+  Refs.CrossNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  CrossNormed := Refs.CrossNorm;
+  // ===== self-attention: q = k = CrossNormed + QueryEmbed ; v = CrossNormed =====
+  SaSrc := NN.AddLayer(TNNetSum.Create([CrossNormed, QueryEmbed]));
+  AddMask2FormerAttention(NN, Hidden, Heads, SaSrc, SaSrc, CrossNormed, nil,
+    Refs.SQ, Refs.SK, Refs.SV, Refs.SO);
+  NN.AddLayer(TNNetSum.Create([Refs.SO, CrossNormed]));
+  Refs.SelfNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  SelfNormed := Refs.SelfNorm;
+  // ===== FFN =====
+  Refs.Fc1 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(FFNDim, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReLU.Create());
+  Refs.Fc2 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetSum.Create([Refs.Fc2, SelfNormed]));
+  Refs.FfnNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  Result := Refs.FfnNorm;
+end;
+
+// Builds one masked-attention decoder layer as a standalone net (the Pascal
+// orchestrator recomputes the attention mask between layers).
 function BuildMask2FormerLayerNet(const Config: TMask2FormerConfig;
   LevelKeys: integer; pTrainable: boolean): TMask2FormerLayerNet;
 var
   NN: TNNet;
-  HeadDim, h, HeadsM1: integer;
-  InvSqrt: TNeuralFloat;
-  QSrc, QHead, KHead, VHead, VTHead, Score, WHead, OutHead: TNNetLayer;
-  CrossNormed, SaSrc, SaQHead, SaKHead, SaVHead, SaVTHead: TNNetLayer;
-  SaScore, SaWHead, SaOutHead, SelfNormed, FfnRes: TNNetLayer;
-  HeadOutputs, SaHeadOutputs: array of TNNetLayer;
-
-  // The masked/plain attention score path shared by cross- and self-attention.
-  // QSrcLayer/KSrcLayer/VSrcLayer feed q/k/v projections; MaskBias (or nil) is an
-  // additive [key,query,1] bias added before softmax over the key axis.
-  function AddAttention(QSrcLayer, KSrcLayer, VSrcLayer, MaskBias: TNNetLayer;
-    out QP, KP, VP, OP: TNNetLayer): TNNetLayer;
-  var
-    hh: integer;
-    qh, kh, vh, vth, sc, wh, oh: TNNetLayer;
-    outs: array of TNNetLayer;
-  begin
-    SetLength(outs, Config.Heads);
-    QP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), QSrcLayer);
-    KP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), KSrcLayer);
-    VP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), VSrcLayer);
-    for hh := 0 to HeadsM1 do
-    begin
-      qh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), QP);
-      kh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), KP);
-      vh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), VP);
-      // scores = DotProducts(Q,K) -> [X=key, Y=1, D=query]; scale; transpose to
-      // [key, query, 1] so the mask bias (also [key,query,1]) can be summed.
-      sc := NN.AddLayer(TNNetDotProducts.Create(qh, kh));
-      sc := NN.AddLayer(TNNetMulByConstant.Create(InvSqrt));
-      sc := NN.AddLayerAfter(TNNetTransposeYD.Create(), sc);
-      if MaskBias <> nil then
-        wh := NN.AddLayer(TNNetSum.Create([sc, MaskBias]))
-      else
-        wh := sc;
-      // softmax over the key axis: [1,query,key]; PointwiseSoftMax over Depth=key.
-      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
-      wh := NN.AddLayerAfter(TNNetPointwiseSoftMax.Create(), wh);
-      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
-      // weights . V (rectangular cross-attention; key=S may differ from query=Q):
-      // out[q,d] = sum_s prob[s,q] * V[s,d], contracting the KEY axis. Arrange
-      // prob [key=S, query=Q, 1] -> [Q, 1, S] (TransposeYD then TransposeXD) and
-      // V [S, 1, d_k] -> [d_k, 1, S] (TransposeXD); DotProducts contracts Depth=S
-      // -> [B.X=Q, B.Y=1, A.X*A.Y=d_k] = [query, 1, HeadDim].
-      wh := NN.AddLayerAfter(TNNetTransposeYD.Create(), wh);   // [S,1,Q]
-      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);   // [Q,1,S]
-      vth := NN.AddLayerAfter(TNNetTransposeXD.Create(), vh);  // [d_k,1,S]
-      oh := NN.AddLayer(TNNetDotProducts.Create(vth, wh));     // [Q,1,d_k]
-      outs[hh] := oh;
-      // silence per-head unused
-      if (qh = nil) or (kh = nil) or (vh = nil) or (vth = nil) or (sc = nil) or
-         (wh = nil) or (oh = nil) then ;
-    end;
-    NN.AddLayer(TNNetDeepConcat.Create(outs));
-    OP := NN.AddLayer(TNNetPointwiseConvLinear.Create(Config.Hidden, 0));
-    Result := OP;
-    SetLength(outs, 0);
-  end;
+  Refs: TMask2FormerDecoderLayerRefs;
 
   procedure AddPredictor(HsLayer: TNNetLayer);
   begin
@@ -89650,12 +89834,6 @@ var
 begin
   NN := TNNet.Create();
   Result.NN := NN;
-  HeadDim := Config.Hidden div Config.Heads;
-  HeadsM1 := Config.Heads - 1;
-  InvSqrt := 1.0 / Sqrt(HeadDim);
-  SetLength(HeadOutputs, Config.Heads);
-  SetLength(SaHeadOutputs, Config.Heads);
-
   // ---- inputs ----
   // Sizes are FIXED at build time (each decoder layer attends to a SPECIFIC
   // round-robin level, so LevelKeys=S is known). Static shapes are REQUIRED:
@@ -89667,50 +89845,20 @@ begin
     TNNetInput.Create(LevelKeys, Config.NumQueries, 1));  // [key, query, 1]
   Result.QueryEmbedIn := NN.AddLayer(
     TNNetInput.Create(Config.NumQueries, 1, Config.Hidden));
-
-  // ===== masked cross-attention (cross FIRST, post-norm) =====
-  // q = Hs + QueryEmbed ; k = KeyPos ; v = Mem.
-  QSrc := NN.AddLayer(TNNetSum.Create([Result.HsIn, Result.QueryEmbedIn]));
-  AddAttention(QSrc, Result.KeyPosIn, Result.MemIn, Result.MaskBiasIn,
-    Result.CQ, Result.CK, Result.CV, Result.CO);
-  NN.AddLayer(TNNetSum.Create([Result.CO, Result.HsIn]));
-  Result.CrossNorm := NN.AddLayer(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
-  CrossNormed := Result.CrossNorm;
-
-  // ===== self-attention =====
-  // q = k = CrossNormed + QueryEmbed ; v = CrossNormed.
-  SaSrc := NN.AddLayer(TNNetSum.Create([CrossNormed, Result.QueryEmbedIn]));
-  AddAttention(SaSrc, SaSrc, CrossNormed, nil,
-    Result.SQ, Result.SK, Result.SV, Result.SO);
-  NN.AddLayer(TNNetSum.Create([Result.SO, CrossNormed]));
-  Result.SelfNorm := NN.AddLayer(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
-  SelfNormed := Result.SelfNorm;
-
-  // ===== FFN =====
-  Result.Fc1 := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.FFNDim, 0).SetTrainable(pTrainable));
-  NN.AddLayer(TNNetReLU.Create());
-  Result.Fc2 := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
-  FfnRes := NN.AddLayer(TNNetSum.Create([Result.Fc2, SelfNormed]));
-  Result.FfnNorm := NN.AddLayer(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
-  Result.HsOut := Result.FfnNorm;
-
+  Result.HsOut := AddMask2FormerDecoderLayer(NN, Config.Hidden, Config.Heads,
+    Config.FFNDim, Result.HsIn, Result.QueryEmbedIn, Result.MemIn,
+    Result.KeyPosIn, Result.MaskBiasIn, pTrainable, Refs);
+  Result.CQ := Refs.CQ; Result.CK := Refs.CK;
+  Result.CV := Refs.CV; Result.CO := Refs.CO;
+  Result.CrossNorm := Refs.CrossNorm;
+  Result.SQ := Refs.SQ; Result.SK := Refs.SK;
+  Result.SV := Refs.SV; Result.SO := Refs.SO;
+  Result.SelfNorm := Refs.SelfNorm;
+  Result.Fc1 := Refs.Fc1; Result.Fc2 := Refs.Fc2;
+  Result.FfnNorm := Refs.FfnNorm;
   // ===== predictor head (shared weights, loaded per net) =====
   AddPredictor(Result.HsOut);
-
   if not pTrainable then NN.SetTrainable();
-  // silence unused
-  if (QHead = nil) and (KHead = nil) and (VHead = nil) and (VTHead = nil) and
-     (Score = nil) and (WHead = nil) and (OutHead = nil) and (SaQHead = nil) and
-     (SaKHead = nil) and (SaVHead = nil) and (SaVTHead = nil) and
-     (SaScore = nil) and (SaWHead = nil) and (SaOutHead = nil) and
-     (FfnRes = nil) then ;
-  SetLength(HeadOutputs, 0);
-  SetLength(SaHeadOutputs, 0);
 end;
 
 // Builds the "initial" predictor (before layer 0): decoder.layernorm over
@@ -90288,6 +90436,677 @@ begin
   end;
   UnregisterMask2Former(NN);
   M2F.Free;  // frees InitNet.NN (== container), every layer net, the tables.
+end;
+
+// ===========================================================================
+// DDCOLOR PHOTO-COLORIZATION IMPORT
+// ===========================================================================
+const
+  csDDColorImporter = 'DDColor import';
+  // torchvision ImageNet statistics applied by DDColor.normalize.
+  cDDColorMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  cDDColorStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+  cDDColorBatchNormEps = 0.00001;
+
+function DefaultDDColorConfig(const EncoderName: string): TDDColorConfig;
+const
+  cTinyDims: array[0..3] of integer = (96, 192, 384, 768);
+  cLargeDims: array[0..3] of integer = (192, 384, 768, 1536);
+var
+  StagePos: integer;
+begin
+  Result.EncoderName := LowerCase(EncoderName);
+  for StagePos := 0 to 3 do
+  begin
+    if Result.EncoderName = 'convnext-l' then
+      Result.Dims[StagePos] := cLargeDims[StagePos]
+    else if (Result.EncoderName = 'convnext-t') or
+      (Result.EncoderName = 'convnext') then
+      Result.Dims[StagePos] := cTinyDims[StagePos]
+    else
+      ImportError(csDDColorImporter + ': unsupported encoder_name "' +
+        EncoderName + '" (expected convnext-t or convnext-l).');
+    Result.Depths[StagePos] := 3;
+  end;
+  if Result.EncoderName = 'convnext-l' then Result.Depths[2] := 27
+  else Result.Depths[2] := 9;
+  Result.NF := 512;
+  Result.NumQueries := 100;
+  Result.NumScales := 3;
+  Result.DecLayers := 9;
+  Result.Hidden := 256;
+  Result.Heads := 8;
+  Result.FFNDim := 2048;
+  Result.ColorEmbedDim := 256;
+  Result.NumOutputChannels := 2;
+  Result.InputWidth := 512;
+  Result.InputHeight := 512;
+end;
+
+function ReadDDColorConfigFromJSONFile(const FileName: string): TDDColorConfig;
+var
+  JsonText: TStringList;
+  Root, ArrData: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+begin
+  if not FileExists(FileName) then
+    ImportError(csDDColorImporter + ': config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csDDColorImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csDDColorImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    if Obj.Get('decoder_name', 'MultiScaleColorDecoder') <>
+      'MultiScaleColorDecoder' then
+      ImportError(csDDColorImporter + ': only decoder_name ' +
+        'MultiScaleColorDecoder is supported.');
+    Result := DefaultDDColorConfig(Obj.Get('encoder_name', 'convnext-l'));
+    Result.NumQueries := Obj.Get('num_queries', Result.NumQueries);
+    Result.NumScales := Obj.Get('num_scales', Result.NumScales);
+    Result.DecLayers := Obj.Get('dec_layers', Result.DecLayers);
+    Result.NumOutputChannels := Obj.Get('num_output_channels',
+      Result.NumOutputChannels);
+    Result.Heads := Obj.Get('nheads', Result.Heads);
+    // input_size is torch (height, width).
+    ArrData := Obj.Find('input_size');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 2 then
+        ImportError(csDDColorImporter + ': "input_size" must be [h, w].');
+      Result.InputHeight := Arr.Integers[0];
+      Result.InputWidth := Arr.Integers[1];
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// Name of the tensor holding a conv's raw weight under any of the plain,
+// spectral_norm (weight_orig) or weight_norm (weight_v / original1) layouts.
+function DDColorWeightTensorName(Reader: TNNetSafeTensorsReader;
+  const Prefix: string): string;
+begin
+  if Reader.HasTensor(Prefix + '.weight') then Result := Prefix + '.weight'
+  else if Reader.HasTensor(Prefix + '.weight_orig') then
+    Result := Prefix + '.weight_orig'
+  else if Reader.HasTensor(Prefix + '.weight_v') then
+    Result := Prefix + '.weight_v'
+  else if Reader.HasTensor(Prefix + '.parametrizations.weight.original1') then
+    Result := Prefix + '.parametrizations.weight.original1'
+  else
+  begin
+    Result := '';
+    ImportError(csDDColorImporter + ': missing weight tensor "' + Prefix +
+      '.weight" (also tried weight_orig, weight_v, ' +
+      'parametrizations.weight.original1).');
+  end;
+end;
+
+// Loads Prefix's effective torch weight into W, folding spectral_norm (W/sigma,
+// sigma = u.(W v), the eval-mode formula) or weight_norm (g * v/||v|| per row).
+procedure LoadTorchNormalizedWeight(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; W: TNNetVolume);
+var
+  WName: string;
+  U, V, G: TNNetVolume;
+  RowCount, RowLen, MaxRowPos, RowPos: integer;
+  Sigma, RowNorm: TNeuralFloat;
+begin
+  WName := DDColorWeightTensorName(Reader, Prefix);
+  Reader.LoadTensorFlat(WName, W);
+  RowCount := Reader.DimSize(WName, 0);
+  RowLen := W.Size div RowCount;
+  MaxRowPos := RowCount - 1;
+  U := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  G := TNNetVolume.Create;
+  try
+    if WName = Prefix + '.weight_orig' then
+    begin
+      Reader.LoadTensorFlat(Prefix + '.weight_u', U);
+      Reader.LoadTensorFlat(Prefix + '.weight_v', V);
+      if (U.Size <> RowCount) or (V.Size <> RowLen) then
+        ImportError(csDDColorImporter + ': spectral_norm vectors of "' +
+          Prefix + '" do not match the weight shape ' +
+          Reader.ShapeAsString(WName) + '.');
+      Sigma := 0;
+      for RowPos := 0 to MaxRowPos do
+        Sigma := Sigma + U.FData[RowPos] *
+          TNNetVolume.DotProduct(@W.FData[RowPos * RowLen], @V.FData[0], RowLen);
+      if Sigma = 0 then
+        ImportError(csDDColorImporter + ': spectral_norm sigma of "' + Prefix +
+          '" is zero.');
+      W.Divi(Sigma);
+    end
+    else if WName <> Prefix + '.weight' then
+    begin
+      if WName = Prefix + '.weight_v' then
+        Reader.LoadTensorFlat(Prefix + '.weight_g', G)
+      else
+        Reader.LoadTensorFlat(Prefix + '.parametrizations.weight.original0', G);
+      if G.Size <> RowCount then
+        ImportError(csDDColorImporter + ': weight_norm magnitude of "' +
+          Prefix + '" must have ' + IntToStr(RowCount) + ' elements.');
+      for RowPos := 0 to MaxRowPos do
+      begin
+        RowNorm := Sqrt(TNNetVolume.DotProduct(@W.FData[RowPos * RowLen],
+          @W.FData[RowPos * RowLen], RowLen));
+        if RowNorm = 0 then RowNorm := 1;
+        TNNetVolume.Mul(@W.FData[RowPos * RowLen], G.FData[RowPos] / RowNorm,
+          RowLen);
+      end;
+    end;
+  finally
+    U.Free;
+    V.Free;
+    G.Free;
+  end;
+end;
+
+// Loads torch conv Prefix [OutCh, InCh, K, K] (+ Prefix.bias when present) into
+// Layer, folding BatchNorm BnPrefix ('' = none) and adding ExtraBias (or nil).
+procedure LoadDDColorConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix, BnPrefix: string; OutCh, InCh, K: integer;
+  ExtraBias: TNNetVolume = nil);
+var
+  W, Bias, Scale, Shift: TNNetVolume;
+  WName: string;
+begin
+  WName := DDColorWeightTensorName(Reader, Prefix);
+  if (Reader.DimCount(WName) <> 4) or (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError(csDDColorImporter + ': "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  Bias := TNNetVolume.Create(OutCh, 1, 1);
+  Scale := TNNetVolume.Create;
+  Shift := TNNetVolume.Create;
+  try
+    LoadTorchNormalizedWeight(Reader, Prefix, W);
+    if Reader.HasTensor(Prefix + '.bias') then
+    begin
+      Reader.LoadTensorFlat(Prefix + '.bias', Bias);
+      if Bias.Size <> OutCh then
+        ImportError(csDDColorImporter + ': "' + Prefix + '.bias" must have ' +
+          IntToStr(OutCh) + ' elements.');
+    end
+    else
+      Bias.Fill(0);
+    if ExtraBias <> nil then Bias.Add(ExtraBias);
+    if BnPrefix <> '' then
+    begin
+      LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh,
+        cDDColorBatchNormEps, Scale, Shift);
+      WriteTorchConvWeights(Layer, W, Bias, Scale, Shift, OutCh, InCh, K);
+    end
+    else
+      WriteTorchConvWeights(Layer, W, Bias, nil, nil, OutCh, InCh, K);
+  finally
+    W.Free;
+    Bias.Free;
+    Scale.Free;
+    Shift.Free;
+  end;
+end;
+
+// Copies the Count values of Values into the per-channel weight vector of a
+// TNNetChannelMul / TNNetChannelBias layer.
+procedure WriteChannelVector(Layer: TNNetLayer; Values: TNNetVolume;
+  Count: integer);
+begin
+  EnsureWritableImportWeights(Layer);
+  if (Values.Size <> Count) or (Layer.FArrNeurons[0].Weights.Size <> Count) then
+    ImportError(csDDColorImporter + ': internal error - channel vector of ' +
+      IntToStr(Values.Size) + ' values for a layer of ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' channels.');
+  Move(Values.FData[0], Layer.FArrNeurons[0].Weights.FData[0],
+    Count * csNeuralFloatSize);
+  Layer.FlushWeightCache();
+end;
+
+// Appends a BatchNorm2d over Source as TNNetChannelMul + TNNetChannelBias.
+function AddDDColorBatchNorm(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Source: TNNetLayer; const BnPrefix: string; Ch: integer): TNNetLayer;
+var
+  Scale, Shift: TNNetVolume;
+  MulLayer: TNNetLayer;
+begin
+  Scale := TNNetVolume.Create;
+  Shift := TNNetVolume.Create;
+  try
+    LoadTorchBatchNormScaleShift(Reader, BnPrefix, Ch, cDDColorBatchNormEps,
+      Scale, Shift);
+    MulLayer := NN.AddLayerAfter(TNNetChannelMul.Create(), Source);
+    WriteChannelVector(MulLayer, Scale, Ch);
+    Result := NN.AddLayer(TNNetChannelBias.Create());
+    WriteChannelVector(Result, Shift, Ch);
+  finally
+    Scale.Free;
+    Shift.Free;
+  end;
+end;
+
+// Appends CustomPixelShuffle_ICNR over Source: 1x1 conv (+ BN at BnPrefix) ->
+// ReLU -> PixelShuffle(Factor) -> blur. Returns the (W*Factor, H*Factor) output.
+function AddDDColorPixelShuffleUp(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Source: TNNetLayer; const ConvPrefix, BnPrefix: string;
+  InCh, OutCh, Factor: integer): TNNetLayer;
+var
+  Conv, Shuffled: TNNetLayer;
+begin
+  Conv := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(OutCh * Factor * Factor), Source);
+  LoadDDColorConv(Reader, Conv, ConvPrefix, BnPrefix, OutCh * Factor * Factor,
+    InCh, 1);
+  PermuteLayerNeurons(Conv, TorchPixelShuffleNeurons(OutCh, Factor));
+  NN.AddLayer(TNNetReLU.Create());
+  Shuffled := NN.AddLayer(TNNetPixelShuffle.Create(Factor));
+  // ReplicationPad2d((1,0,1,0)) + AvgPool2d(2, stride 1).
+  NN.AddLayer(TNNetGridAvgPool.Create(2, 1, 1));
+  Result := NN.AddLayer(TNNetCrop.Create(0, 0, Shuffled.Output.SizeX,
+    Shuffled.Output.SizeY));
+end;
+
+procedure InferDDColorConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TDDColorConfig);
+const
+  cEnc = 'encoder.arch.';
+  cColor = 'decoder.color_decoder.';
+
+  function CountIndexed(const Before, After: string): integer;
+  begin
+    Result := 0;
+    while Reader.HasTensor(Before + IntToStr(Result) + After) do Inc(Result);
+  end;
+
+  function OutChannels(const Prefix: string): integer;
+  begin
+    Result := Reader.DimSize(DDColorWeightTensorName(Reader, Prefix), 0);
+  end;
+
+  function RequireDim(const Name: string; DimIdx: integer): integer;
+  begin
+    if not Reader.HasTensor(Name) then
+      ImportError(csDDColorImporter + ': missing tensor "' + Name + '".');
+    Result := Reader.DimSize(Name, DimIdx);
+  end;
+
+var
+  StagePos: integer;
+begin
+  Config.Dims[0] := RequireDim(cEnc + 'downsample_layers.0.0.weight', 0);
+  for StagePos := 1 to 3 do
+    Config.Dims[StagePos] := RequireDim(cEnc + 'downsample_layers.' +
+      IntToStr(StagePos) + '.1.weight', 0);
+  for StagePos := 0 to 3 do
+    Config.Depths[StagePos] := CountIndexed(cEnc + 'stages.' +
+      IntToStr(StagePos) + '.', '.dwconv.weight');
+  Config.NF := OutChannels('decoder.layers.0.conv.0');
+  Config.NumQueries := RequireDim(cColor + 'query_feat.weight', 0);
+  Config.Hidden := RequireDim(cColor + 'query_feat.weight', 1);
+  Config.NumScales := RequireDim(cColor + 'level_embed.weight', 0);
+  Config.FFNDim := RequireDim(cColor + 'transformer_ffn_layers.0.linear1.weight', 0);
+  Config.DecLayers := CountIndexed(cColor + 'transformer_ffn_layers.',
+    '.linear1.weight');
+  Config.ColorEmbedDim := RequireDim(cColor + 'color_embed.layers.2.weight', 0);
+  Config.NumOutputChannels := OutChannels('refine_net.0.0');
+end;
+
+function DDColorConfigToString(const Config: TDDColorConfig): string;
+begin
+  Result := 'DDColor(' + Config.EncoderName + ', depths=[' +
+    IntToStr(Config.Depths[0]) + ',' + IntToStr(Config.Depths[1]) + ',' +
+    IntToStr(Config.Depths[2]) + ',' + IntToStr(Config.Depths[3]) +
+    '], dims=[' + IntToStr(Config.Dims[0]) + ',' + IntToStr(Config.Dims[1]) +
+    ',' + IntToStr(Config.Dims[2]) + ',' + IntToStr(Config.Dims[3]) +
+    '], nf=' + IntToStr(Config.NF) + ', queries=' +
+    IntToStr(Config.NumQueries) + ', layers=' + IntToStr(Config.DecLayers) +
+    ', hidden=' + IntToStr(Config.Hidden) + ', heads=' +
+    IntToStr(Config.Heads) + ', ffn=' + IntToStr(Config.FFNDim) +
+    ', out=' + IntToStr(Config.NumOutputChannels) + ', input=' +
+    IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight) + ')';
+end;
+
+function BuildDDColor(Reader: TNNetSafeTensorsReader;
+  const Config: TDDColorConfig; pTrainable: boolean = true): TNNet;
+const
+  cColor = 'decoder.color_decoder.';
+var
+  NN: TNNet;
+  InputMul, NormalizedInput, Tap, Skip, UpOut, Merged, Conv: TNNetLayer;
+  ImageFeatures, QueryZero, QueryFeat, QueryEmbed, Hs, Mlp: TNNetLayer;
+  ColorEmbed, PerQuery: TNNetLayer;
+  Values, LevelEmbed, LevelBias: TNNetVolume;
+  ConvNeXtConfig: TConvNeXtConfig;
+  StageOutputs: TConvNeXtStageOutputs;
+  Taps: array[0..3] of TNNetLayer;
+  DecoderOutputs: array[0..2] of TNNetLayer;
+  Sources, KeyPositions: array[0..2] of TNNetLayer;
+  Refs: TMask2FormerDecoderLayerRefs;
+  StagePos, BlockPos, LevelPos, LayerPos, MaxLayerPos, UpInCh, OutCh: integer;
+  LevelWidth, LevelHeight, SkipCh, SkipStage: integer;
+  BlockPrefix, LayerPrefix, ChannelPrefix: string;
+begin
+  if Config.NumScales <> 3 then
+    ImportError(csDDColorImporter + ': num_scales must be 3, got ' +
+      IntToStr(Config.NumScales) + '.');
+  if (Config.Heads < 1) or (Config.Hidden mod Config.Heads <> 0) or
+     Odd(Config.Hidden) then
+    ImportError(csDDColorImporter + ': hidden width ' + IntToStr(Config.Hidden) +
+      ' must be even and divisible by the ' + IntToStr(Config.Heads) +
+      ' heads.');
+  if Config.ColorEmbedDim <> Config.NF div 2 then
+    ImportError(csDDColorImporter + ': color embedding width ' +
+      IntToStr(Config.ColorEmbedDim) + ' must equal nf/2 = ' +
+      IntToStr(Config.NF div 2) + '.');
+  if (Config.InputWidth < 32) or (Config.InputHeight < 32) or
+     (Config.InputWidth mod 32 <> 0) or (Config.InputHeight mod 32 <> 0) then
+    ImportError(csDDColorImporter + ': input size ' +
+      IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight) +
+      ' must be a positive multiple of 32 on both axes.');
+  ConvNeXtConfig.Version := 1;
+  for StagePos := 0 to 3 do
+  begin
+    ConvNeXtConfig.Depths[StagePos] := Config.Depths[StagePos];
+    ConvNeXtConfig.Dims[StagePos] := Config.Dims[StagePos];
+  end;
+  ConvNeXtConfig.PatchSize := 4;
+  ConvNeXtConfig.ImageSize := Config.InputWidth;
+  ConvNeXtConfig.NumChannels := 3;
+  ConvNeXtConfig.NumLabels := 1;
+  ConvNeXtConfig.LayerNormEps := 0.000001;
+  ConvNeXtConfig.LayerScaleInit := 0.000001;
+  ConvNeXtConfig.ModelType := 'convnext';
+  NN := TNNet.Create();
+  Values := TNNetVolume.Create(3, 1, 1);
+  LevelEmbed := TNNetVolume.Create;
+  LevelBias := TNNetVolume.Create;
+  try try
+    NN.AddLayer(TNNetInput.Create(Config.InputWidth, Config.InputHeight, 3));
+    // DDColor.normalize: (x - mean) / std per RGB channel.
+    InputMul := NN.AddLayer(TNNetChannelMul.Create());
+    for StagePos := 0 to 2 do
+      Values.FData[StagePos] := 1 / cDDColorStd[StagePos];
+    WriteChannelVector(InputMul, Values, 3);
+    NormalizedInput := NN.AddLayer(TNNetChannelBias.Create());
+    for StagePos := 0 to 2 do
+      Values.FData[StagePos] := -cDDColorMean[StagePos] / cDDColorStd[StagePos];
+    WriteChannelVector(NormalizedInput, Values, 3);
+
+    // ---- encoder: ConvNeXt + norm0..norm3 taps (hook features) ----
+    AddConvNeXtTrunk(NN, NormalizedInput, Reader, ConvNeXtConfig, cksFacebook,
+      'encoder.arch.', pTrainable, StageOutputs);
+    for StagePos := 0 to 3 do
+    begin
+      Tap := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(
+        ConvNeXtConfig.LayerNormEps).SetTrainable(pTrainable),
+        StageOutputs[StagePos]);
+      LoadLayerNormWeights(Reader, Tap,
+        'encoder.arch.norm' + IntToStr(StagePos) + '.weight',
+        'encoder.arch.norm' + IntToStr(StagePos) + '.bias',
+        Config.Dims[StagePos]);
+      Taps[StagePos] := Tap;
+    end;
+
+    // ---- pixel decoder: 3 UnetBlockWide (strides 16, 8, 4) ----
+    UpInCh := Config.Dims[3];
+    UpOut := Taps[3];
+    for BlockPos := 0 to 2 do
+    begin
+      BlockPrefix := 'decoder.layers.' + IntToStr(BlockPos);
+      if BlockPos = 2 then OutCh := Config.NF div 2 else OutCh := Config.NF;
+      SkipStage := 2 - BlockPos;
+      SkipCh := Config.Dims[SkipStage];
+      UpOut := AddDDColorPixelShuffleUp(NN, Reader, UpOut,
+        BlockPrefix + '.shuf.conv.0', BlockPrefix + '.shuf.conv.1',
+        UpInCh, OutCh, 2);
+      Skip := AddDDColorBatchNorm(NN, Reader, Taps[SkipStage],
+        BlockPrefix + '.bn', SkipCh);
+      NN.AddLayer(TNNetDeepConcat.Create([UpOut, Skip]));
+      NN.AddLayer(TNNetReLU.Create());
+      Conv := NN.AddLayer(TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 1));
+      LoadDDColorConv(Reader, Conv, BlockPrefix + '.conv.0', '', OutCh,
+        OutCh + SkipCh, 3);
+      NN.AddLayer(TNNetReLU.Create());
+      UpOut := AddDDColorBatchNorm(NN, Reader, NN.GetLastLayer(),
+        BlockPrefix + '.conv.2', OutCh);
+      DecoderOutputs[BlockPos] := UpOut;
+      UpInCh := OutCh;
+    end;
+    ImageFeatures := AddDDColorPixelShuffleUp(NN, Reader, UpOut,
+      'decoder.last_shuf.conv.0', '', UpInCh, Config.NF div 2, 4);
+
+    // ---- color decoder memory: input_proj (+ level_embed) and sine keys ----
+    Reader.LoadTensorFlat(cColor + 'level_embed.weight', LevelEmbed);
+    if LevelEmbed.Size <> 3 * Config.Hidden then
+      ImportError(csDDColorImporter + ': level_embed must be [3, ' +
+        IntToStr(Config.Hidden) + '].');
+    LevelBias.ReSize(Config.Hidden, 1, 1);
+    for LevelPos := 0 to 2 do
+    begin
+      LevelWidth := DecoderOutputs[LevelPos].Output.SizeX;
+      LevelHeight := DecoderOutputs[LevelPos].Output.SizeY;
+      Move(LevelEmbed.FData[LevelPos * Config.Hidden], LevelBias.FData[0],
+        Config.Hidden * csNeuralFloatSize);
+      Conv := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden),
+        DecoderOutputs[LevelPos]);
+      LoadDDColorConv(Reader, Conv, cColor + 'input_proj.' + IntToStr(LevelPos),
+        '', Config.Hidden, DecoderOutputs[LevelPos].Output.Depth, 1, LevelBias);
+      Sources[LevelPos] := NN.AddLayer(TNNetReshape.Create(
+        LevelWidth * LevelHeight, 1, Config.Hidden));
+      KeyPositions[LevelPos] := NN.AddLayerAfter(
+        TNNetLearnedPositionalEmbedding.Create(LevelWidth * LevelHeight),
+        Sources[LevelPos]);
+      FillDetrSpatialPosEmbed(KeyPositions[LevelPos], LevelHeight, LevelWidth,
+        Config.Hidden);
+    end;
+
+    // ---- learnable color queries (constant tables over a zero input) ----
+    QueryZero := NN.AddLayerAfter(
+      TNNetInput.Create(Config.NumQueries, 1, Config.Hidden, 1), 0);
+    QueryZero.Output.Fill(0);
+    QueryFeat := NN.AddLayerAfter(
+      TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), QueryZero);
+    LoadDetrLearnedPosEmbed(Reader, QueryFeat, cColor + 'query_feat.weight',
+      Config.NumQueries, Config.Hidden);
+    QueryEmbed := NN.AddLayerAfter(
+      TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), QueryZero);
+    LoadDetrLearnedPosEmbed(Reader, QueryEmbed, cColor + 'query_embed.weight',
+      Config.NumQueries, Config.Hidden);
+
+    // ---- color decoder layers: cross (round-robin level) -> self -> FFN ----
+    Hs := QueryFeat;
+    MaxLayerPos := Config.DecLayers - 1;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      LevelPos := LayerPos mod 3;
+      Hs := AddMask2FormerDecoderLayer(NN, Config.Hidden, Config.Heads,
+        Config.FFNDim, Hs, QueryEmbed, Sources[LevelPos],
+        KeyPositions[LevelPos], nil, pTrainable, Refs);
+      LayerPrefix := cColor + 'transformer_cross_attention_layers.' +
+        IntToStr(LayerPos) + '.';
+      LoadM2FPackedProj(Reader, Refs.CQ, LayerPrefix + 'multihead_attn.in_proj_weight',
+        LayerPrefix + 'multihead_attn.in_proj_bias', Config.Hidden, 0);
+      LoadM2FPackedProj(Reader, Refs.CK, LayerPrefix + 'multihead_attn.in_proj_weight',
+        LayerPrefix + 'multihead_attn.in_proj_bias', Config.Hidden, Config.Hidden);
+      LoadM2FPackedProj(Reader, Refs.CV, LayerPrefix + 'multihead_attn.in_proj_weight',
+        LayerPrefix + 'multihead_attn.in_proj_bias', Config.Hidden,
+        2 * Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Refs.CO,
+        LayerPrefix + 'multihead_attn.out_proj.weight', Config.Hidden,
+        Config.Hidden, 0, -1, 0, LayerPrefix + 'multihead_attn.out_proj.bias');
+      LoadLayerNormWeights(Reader, Refs.CrossNorm, LayerPrefix + 'norm.weight',
+        LayerPrefix + 'norm.bias', Config.Hidden);
+      LayerPrefix := cColor + 'transformer_self_attention_layers.' +
+        IntToStr(LayerPos) + '.';
+      LoadM2FPackedProj(Reader, Refs.SQ, LayerPrefix + 'self_attn.in_proj_weight',
+        LayerPrefix + 'self_attn.in_proj_bias', Config.Hidden, 0);
+      LoadM2FPackedProj(Reader, Refs.SK, LayerPrefix + 'self_attn.in_proj_weight',
+        LayerPrefix + 'self_attn.in_proj_bias', Config.Hidden, Config.Hidden);
+      LoadM2FPackedProj(Reader, Refs.SV, LayerPrefix + 'self_attn.in_proj_weight',
+        LayerPrefix + 'self_attn.in_proj_bias', Config.Hidden, 2 * Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Refs.SO,
+        LayerPrefix + 'self_attn.out_proj.weight', Config.Hidden,
+        Config.Hidden, 0, -1, 0, LayerPrefix + 'self_attn.out_proj.bias');
+      LoadLayerNormWeights(Reader, Refs.SelfNorm, LayerPrefix + 'norm.weight',
+        LayerPrefix + 'norm.bias', Config.Hidden);
+      LayerPrefix := cColor + 'transformer_ffn_layers.' + IntToStr(LayerPos) + '.';
+      LoadLlamaLinearWeights(Reader, Refs.Fc1, LayerPrefix + 'linear1.weight',
+        Config.Hidden, Config.FFNDim, 0, -1, 0, LayerPrefix + 'linear1.bias');
+      LoadLlamaLinearWeights(Reader, Refs.Fc2, LayerPrefix + 'linear2.weight',
+        Config.FFNDim, Config.Hidden, 0, -1, 0, LayerPrefix + 'linear2.bias');
+      LoadLayerNormWeights(Reader, Refs.FfnNorm, LayerPrefix + 'norm.weight',
+        LayerPrefix + 'norm.bias', Config.Hidden);
+    end;
+
+    // ---- decoder_norm -> color_embed MLP (relu, relu, linear) ----
+    Mlp := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Hs);
+    LoadLayerNormWeights(Reader, Mlp, cColor + 'decoder_norm.weight',
+      cColor + 'decoder_norm.bias', Config.Hidden);
+    for LayerPos := 0 to 2 do
+    begin
+      if LayerPos = 2 then OutCh := Config.ColorEmbedDim
+      else OutCh := Config.Hidden;
+      ChannelPrefix := cColor + 'color_embed.layers.' + IntToStr(LayerPos);
+      Mlp := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(OutCh, 0).SetTrainable(pTrainable));
+      LoadLlamaLinearWeights(Reader, Mlp, ChannelPrefix + '.weight',
+        Config.Hidden, OutCh, 0, -1, 0, ChannelPrefix + '.bias');
+      if LayerPos < 2 then NN.AddLayer(TNNetReLU.Create());
+    end;
+    ColorEmbed := Mlp;
+
+    // ---- einsum bqc,bchw->bqhw, concat the normalized input, refine_net ----
+    PerQuery := NN.AddLayer(TNNetDotProducts.Create(ColorEmbed, ImageFeatures));
+    Merged := NN.AddLayer(TNNetDeepConcat.Create([PerQuery, NormalizedInput]));
+    Conv := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.NumOutputChannels), Merged);
+    LoadDDColorConv(Reader, Conv, 'refine_net.0.0', '',
+      Config.NumOutputChannels, Config.NumQueries + 3, 1);
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+  finally
+    Values.Free;
+    LevelEmbed.Free;
+    LevelBias.Free;
+  end;
+end;
+
+function BuildDDColorFromSafeTensorsEx(const FileName: string;
+  const Config: TDDColorConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDDColor(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDDColorFromSafeTensors(const FileName: string;
+  out Config: TDDColorConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  if (ConfigFileName <> '') or FileExists(ConfigPath) then
+    Config := ReadDDColorConfigFromJSONFile(ConfigPath)
+  else
+    Config := DefaultDDColorConfig('convnext-l');
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    InferDDColorConfigFromTensors(Reader, Config);
+    Result := BuildDDColor(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure DDColorPrepareInput(Image: TNNetVolume; const Config: TDDColorConfig;
+  NetInput: TNNetVolume);
+begin
+  if Image.Depth <> 3 then
+    ImportError(csDDColorImporter + ': DDColorPrepareInput needs an RGB image, ' +
+      'got depth ' + IntToStr(Image.Depth) + '.');
+  ResizeImageBilinearNoAntialias(Image, NetInput, Config.InputWidth,
+    Config.InputHeight);
+  NetInput.RgbToLab();
+  NetInput.MulAtDepth(1, 0);
+  NetInput.MulAtDepth(2, 0);
+  NetInput.LabToRgb();
+  NetInput.Mul(1 / 255);
+end;
+
+procedure DDColorComposeOutput(Image, AB: TNNetVolume; Colorized: TNNetVolume);
+var
+  ABResized: TNNetVolume;
+  MaxPixelPos, PixelPos, LabPos, ABPos: integer;
+begin
+  if (Image.Depth <> 3) or (AB.Depth <> 2) then
+    ImportError(csDDColorImporter + ': DDColorComposeOutput needs an RGB image ' +
+      'and a 2-channel a*b* volume.');
+  ABResized := TNNetVolume.Create;
+  try
+    ResizeImageBilinearNoAntialias(AB, ABResized, Image.SizeX, Image.SizeY);
+    Colorized.Copy(Image);
+    Colorized.RgbToLab();
+    MaxPixelPos := Image.SizeX * Image.SizeY - 1;
+    LabPos := 1;
+    ABPos := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      Colorized.FData[LabPos] := ABResized.FData[ABPos];
+      Colorized.FData[LabPos + 1] := ABResized.FData[ABPos + 1];
+      Inc(LabPos, 3);
+      Inc(ABPos, 2);
+    end;
+    Colorized.LabToRgb();
+  finally
+    ABResized.Free;
+  end;
+end;
+
+procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
+  Image, Colorized: TNNetVolume);
+var
+  NetInput, AB: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  AB := TNNetVolume.Create;
+  try
+    DDColorPrepareInput(Image, Config, NetInput);
+    NN.Compute(NetInput);
+    NN.GetOutput(AB);
+    DDColorComposeOutput(Image, AB, Colorized);
+  finally
+    NetInput.Free;
+    AB.Free;
+  end;
 end;
 
 // ===========================================================================

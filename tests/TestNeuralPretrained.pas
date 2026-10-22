@@ -190,6 +190,10 @@ type
       pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // Max |diff| of the pico DDColor (weights WeightsFile) vs its float64 torch
+    // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
+    function DDColorParityMaxDiff(const WeightsFile: string;
+      pRoundTrip: boolean; out Config: TDDColorConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
       pRoundTrip: boolean; pPackedPath: boolean = false): double;
     // Largest |depth - oracle| of BuildDPTFromSafeTensors over every case of
@@ -1487,6 +1491,9 @@ type
     procedure TestRestormerConfig;
     procedure TestRestormerRejectsMismatchedConfig;
     procedure TestRestormerTiledOpenCL;
+    procedure TestDDColorParity;
+    procedure TestDDColorPthParityInfersConfig;
+    procedure TestDDColorPrepareAndCompose;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -54660,6 +54667,189 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+// Copies a torch [C, H, W] tensor of Reader into Dest as a CAI (W, H, C) volume.
+procedure LoadDDColorTorchImage(Reader: TNNetSafeTensorsReader;
+  const Name: string; Dest: TNNetVolume);
+var
+  Flat: TNNetVolume;
+  Channels, Height, Width, ChannelPos, Y, X, SrcPos: integer;
+  MaxChannelPos, MaxY, MaxX: integer;
+begin
+  Channels := Reader.DimSize(Name, 0);
+  Height := Reader.DimSize(Name, 1);
+  Width := Reader.DimSize(Name, 2);
+  MaxChannelPos := Channels - 1;
+  MaxY := Height - 1;
+  MaxX := Width - 1;
+  Flat := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Flat);
+    Dest.ReSize(Width, Height, Channels);
+    SrcPos := 0;
+    for ChannelPos := 0 to MaxChannelPos do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
+        begin
+          Dest[X, Y, ChannelPos] := Flat.FData[SrcPos];
+          Inc(SrcPos);
+        end;
+  finally
+    Flat.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.DDColorParityMaxDiff(const WeightsFile: string;
+  pRoundTrip: boolean; out Config: TDDColorConfig): double;
+var
+  NN, Reloaded: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput, Expected, NetOutput: TNNetVolume;
+begin
+  NN := BuildDDColorFromSafeTensors(FixturePath(WeightsFile), Config,
+    {pTrainable=}false, FixturePath('tiny_ddcolor_config.json'));
+  Reloaded := nil;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_ddcolor_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NetOutput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    LoadDDColorTorchImage(IO, 'ab', Expected);
+    AssertEquals('input width', Config.InputWidth, NetInput.SizeX);
+    AssertEquals('input height', Config.InputHeight, NetInput.SizeY);
+    NN.Compute(NetInput);
+    NN.GetOutput(NetOutput);
+    AssertEquals('a*b* width', Expected.SizeX, NetOutput.SizeX);
+    AssertEquals('a*b* height', Expected.SizeY, NetOutput.SizeY);
+    AssertEquals('a*b* channels', 2, NetOutput.Depth);
+    Result := MaxAbsVolumeDiff(NetOutput, Expected);
+    if pRoundTrip then
+    begin
+      Reloaded := TNNet.Create();
+      Reloaded.LoadFromString(NN.SaveToString());
+      Reloaded.SetTrainable();
+      Reloaded.Compute(NetInput);
+      AssertEquals('save/load round trip reproduces the a*b*', 0,
+        MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output, NetOutput), 1e-6);
+    end;
+  finally
+    Reloaded.Free;
+    NetOutput.Free;
+    Expected.Free;
+    NetInput.Free;
+    IO.Free;
+    NN.Free;
+  end;
+end;
+
+// tiny_ddcolor.*: the official basicsr ddcolor_arch.py at pico widths (ConvNeXt
+// [1,1,2,1]x[8,12,16,24], nf 32, 6 queries, 4 layers, 2 heads, 32x64 input),
+// random weights incl. spectral_norm u/v and a weight_norm last_shuf, float64 torch.
+procedure TTestNeuralPretrained.TestDDColorParity;
+var
+  Config: TDDColorConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := DDColorParityMaxDiff('tiny_ddcolor.safetensors',
+    {pRoundTrip=}true, Config);
+  WriteLn('  DDColor safetensors max|diff| = ', MaxDiff:0:9);
+  AssertTrue('a*b* max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+    MaxDiff < 1e-4);
+end;
+
+// Same weights in a {'params': state_dict} .pth (the official release format,
+// with int64 num_batches_tracked); every shape comes from the tensors.
+procedure TTestNeuralPretrained.TestDDColorPthParityInfersConfig;
+var
+  Config: TDDColorConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := DDColorParityMaxDiff('tiny_ddcolor.pth', {pRoundTrip=}false,
+    Config);
+  WriteLn('  DDColor .pth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('a*b* max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+    MaxDiff < 1e-4);
+  AssertEquals('depths[2]', 2, Config.Depths[2]);
+  AssertEquals('dims[0]', 8, Config.Dims[0]);
+  AssertEquals('dims[3]', 24, Config.Dims[3]);
+  AssertEquals('nf', 32, Config.NF);
+  AssertEquals('queries', 6, Config.NumQueries);
+  AssertEquals('hidden', 16, Config.Hidden);
+  AssertEquals('ffn', 24, Config.FFNDim);
+  AssertEquals('layers', 4, Config.DecLayers);
+  AssertEquals('color embed', 16, Config.ColorEmbedDim);
+  AssertEquals('heads (config.json)', 2, Config.Heads);
+  AssertEquals('input width (input_size[1])', 32, Config.InputWidth);
+  AssertEquals('input height (input_size[0])', 64, Config.InputHeight);
+end;
+
+// DDColorPrepareInput keeps only L (gray RGB in [0,1]); DDColorComposeOutput keeps
+// the source L and takes the chroma from the a*b* volume.
+procedure TTestNeuralPretrained.TestDDColorPrepareAndCompose;
+var
+  Config: TDDColorConfig;
+  Image, NetInput, AB, Colorized, SourceLab, ColorizedLab: TNNetVolume;
+  X, Y: integer;
+begin
+  Config := DefaultDDColorConfig('convnext-t');
+  Config.InputWidth := 16;
+  Config.InputHeight := 8;
+  Image := TNNetVolume.Create(24, 12, 3);
+  NetInput := TNNetVolume.Create;
+  AB := TNNetVolume.Create(16, 8, 2);
+  Colorized := TNNetVolume.Create;
+  SourceLab := TNNetVolume.Create;
+  ColorizedLab := TNNetVolume.Create;
+  try
+    for Y := 0 to Image.SizeY - 1 do
+      for X := 0 to Image.SizeX - 1 do
+      begin
+        Image[X, Y, 0] := 40 + 7 * X;
+        Image[X, Y, 1] := 90 + 5 * Y;
+        Image[X, Y, 2] := 200 - 6 * X;
+      end;
+    DDColorPrepareInput(Image, Config, NetInput);
+    AssertEquals('net input width', 16, NetInput.SizeX);
+    AssertEquals('net input height', 8, NetInput.SizeY);
+    for Y := 0 to NetInput.SizeY - 1 do
+      for X := 0 to NetInput.SizeX - 1 do
+      begin
+        AssertEquals('gray R=G', NetInput[X, Y, 0], NetInput[X, Y, 1], 2e-3);
+        AssertEquals('gray G=B', NetInput[X, Y, 1], NetInput[X, Y, 2], 2e-3);
+        AssertTrue('in [0,1]', (NetInput[X, Y, 0] >= 0) and
+          (NetInput[X, Y, 0] <= 1));
+      end;
+    AB.Fill(0);
+    for Y := 0 to AB.SizeY - 1 do
+      for X := 0 to AB.SizeX - 1 do
+      begin
+        AB[X, Y, 0] := 4 + X * 0.5;
+        AB[X, Y, 1] := -6 + Y;
+      end;
+    DDColorComposeOutput(Image, AB, Colorized);
+    AssertEquals('colorized width', 24, Colorized.SizeX);
+    AssertEquals('colorized height', 12, Colorized.SizeY);
+    SourceLab.Copy(Image);
+    SourceLab.RgbToLab();
+    ColorizedLab.Copy(Colorized);
+    ColorizedLab.RgbToLab();
+    for Y := 0 to Image.SizeY - 1 do
+      for X := 0 to Image.SizeX - 1 do
+        AssertEquals('L kept from the source', SourceLab[X, Y, 0],
+          ColorizedLab[X, Y, 0], 0.05);
+    // Pixel (0, 0) samples a*b* cell (0, 0) exactly (half-pixel bilinear, clamped).
+    AssertEquals('a* from the a*b* volume', 4, ColorizedLab[0, 0, 1], 0.6);
+    AssertEquals('b* from the a*b* volume', -6, ColorizedLab[0, 0, 2], 0.6);
+  finally
+    ColorizedLab.Free;
+    SourceLab.Free;
+    Colorized.Free;
+    AB.Free;
+    NetInput.Free;
+    Image.Free;
+  end;
+end;
 
 // Verifies ReadCLIPSegConfigFromJSONFile on the committed pico config.
 procedure TTestNeuralPretrained.TestCLIPSegConfigFromJSONFile;
