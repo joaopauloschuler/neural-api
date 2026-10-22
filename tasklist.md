@@ -73,6 +73,10 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] Defect (found 2026-10-22, 9b2390c6): `TNNetGroupNorm.GroupNormEpsilon` is
+      not saved in the layer structure, so `Clone` / `SaveToString` of an SD
+      UNet or VAE silently resets its 1e-6 norms to 1e-5. Store it in the
+      structure string (keeping old files at the 1e-5 default) + round-trip test.
 - [ ] Probable defect (not fixed, awaits user decision; found during the
       Restormer importer): `BuildNAFNet` and `BuildSwinIRFromSafeTensors` load
       the conv before their `TNNetDepthToSpace` upsample unpermuted, but torch
