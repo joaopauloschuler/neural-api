@@ -11975,36 +11975,6 @@ procedure SDUNetDenoiseSDXL(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates, PooledText: TNNetVolume; t: TNeuralFloat;
   const TimeIds: array of TNeuralFloat; Noise: TNNetVolume);
 
-// Blended-diffusion (latent-space) INPAINTING: run a complete reverse trajectory
-// on the standard 4-channel SD UNet, but at EVERY step blend the KNOWN region
-// back in so only the masked hole is freely generated (the "blended diffusion"
-// SD inpaint mode that needs NO 9-channel inpaint-specialized conv_in UNet --
-// Avrahami et al. 2022 "Blended Diffusion", arXiv:2111.14818).
-//
-//   Z0          clean source latent (VAE-encoded, mask resolution).
-//   MaskLatent  per-voxel mask in {0,1} on the latent grid: 1 = HOLE (generate),
-//               0 = KEEP (pin to source). Same shape as Z0.
-//   Schedule    descending timestep array (e.g. T..0, Length = Steps+1) the
-//               caller already strides; Sched drives Step between adjacent pairs.
-//
-// At each step t: noised_known = Sched.AddNoise(Z0, t) (forward q_sample of the
-// clean source to the current noise level), then the working latent becomes
-//   latents := MaskLatent*latents + (1-MaskLatent)*noised_known
-// BEFORE the UNet step, so the visible region always carries exactly the right
-// amount of noise for t while the hole follows the denoiser. The reusable
-// scheduler does all the noise/step math; the only inpaint-specific code is the
-// per-step composite. On return Latents holds the final latent (the kept region
-// equals Z0 exactly by the t<1 final composite); decode it with the VAE decoder.
-// EncStates is the (TextSeqLen,1,CrossDim) prompt; Net is a plain BuildSDUNet.
-//
-// FOLLOW-UP (deferred): the 9-channel inpaint-specialized UNet (conv_in widened
-// to latent|mask|masked-latent) and a non-deterministic reparameterized VAE
-// sampling head are NOT done here -- this blended mode is the no-retrain path.
-procedure SDUNetDenoiseInpaint(Net: TNNet; const Config: TSDUNetConfig;
-  Z0, MaskLatent, EncStates: TNNetVolume; Sched: TNNetDiffusionScheduler;
-  const Schedule: array of integer; Sampler: TNNetSamplerMethod;
-  Eta: TNeuralFloat; Latents, Scratch, KnownNoised: TNNetVolume);
-
 // Marigold: NumSteps trailing DDIM (eta 0) steps on Target in place; the UNet sees
 // ImageLatent ++ Target (depth) at t = Tt-1. UNetInput, Pred: caller scratch.
 procedure MarigoldDenoise(UNet: TNNet; const Config: TSDUNetConfig;
@@ -76013,37 +75983,6 @@ begin
   SDUNetFillAddEmbeds(Net, Config, PooledText, TimeIds);
   Net.Compute(Latent);
   Net.GetOutput(Noise);
-end;
-
-procedure SDUNetDenoiseInpaint(Net: TNNet; const Config: TSDUNetConfig;
-  Z0, MaskLatent, EncStates: TNNetVolume; Sched: TNNetDiffusionScheduler;
-  const Schedule: array of integer; Sampler: TNNetSamplerMethod;
-  Eta: TNeuralFloat; Latents, Scratch, KnownNoised: TNNetVolume);
-var
-  sIdx, ScheduleM2: integer;
-begin
-  // Start the working latent from the source re-noised to the FIRST scheduled
-  // timestep (Schedule[0]); the hole then drifts toward generation while the
-  // composite below keeps pinning the visible region to the source.
-  KnownNoised.ReSize(Z0);
-  Sched.AddNoise(Z0, KnownNoised, Schedule[0]);
-  Latents.Copy(KnownNoised);
-  Sched.ResetMultistep;
-  ScheduleM2 := Length(Schedule) - 2;
-  for sIdx := 0 to ScheduleM2 do
-  begin
-    if Schedule[sIdx] < 1 then Continue;          // skip degenerate t=0 steps
-    // BLEND: overwrite the KEPT region with the clean source re-noised to THIS
-    // timestep, so the visible region carries the right noise level for t while
-    // only the hole (mask=1) is driven by the denoiser.
-    Sched.AddNoise(Z0, KnownNoised, Schedule[sIdx]);
-    InpaintBlend(Latents, KnownNoised, MaskLatent);
-    SDUNetDenoise(Net, Config, Latents, EncStates, Schedule[sIdx], Scratch);
-    Sched.Step(Latents, Scratch, Schedule[sIdx], Schedule[sIdx + 1], Sampler, Eta);
-  end;
-  // Final composite at t=0: the kept region is EXACTLY the clean source latent so
-  // the unmasked output is pixel-faithful (latent-exact) by construction.
-  InpaintBlend(Latents, Z0, MaskLatent);
 end;
 
 procedure MarigoldDenoise(UNet: TNNet; const Config: TSDUNetConfig;

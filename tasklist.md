@@ -599,10 +599,10 @@ rather than acted on.
               T2I MultiAdapter, and ControlNet + T2I-Adapter at once (BuildSDUNet
               interleaves the control and adapter TNNetInputs when both flags are
               set, which SDUNetDenoiseWithControl/WithAdapter do not expect).
-        - [ ] Retire SDUNetDenoiseInpaint (its blend runs before the UNet with
+        - [X] Retire SDUNetDenoiseInpaint (its blend runs before the UNet with
               fresh AddNoise draws, not diffusers' after-step blend with the
               initial noise) and TestDiffusionInpaintSmoke, superseded by
-              TStableDiffusionInpainter.
+              TStableDiffusionInpainter. DONE: both removed; no other caller.
         - [ ] Two diffusers image-processor ports: DiffusersPrepareImage and
               QwenImage21ResizeToRgba/QwenImage21PrepareVaeImage (premultiplied
               RGBA). Fold the Qwen pair onto one routine.
@@ -1556,7 +1556,8 @@ rather than acted on.
 
 - [ ] Stable Diffusion img2img + inpainting follow-ups (on top of
       BuildVaeEncoderFromSafeTensors, examples/ImageToImage and
-      SDUNetDenoiseInpaint / examples/DiffusionInpainting): (1) the non-deterministic VAE reparameterize head
+      TStableDiffusionInpainter / examples/DiffusionInpainting): (1) [DONE:
+      TStableDiffusionPipeline.EncodeVaeImage SampleNoise] the non-deterministic VAE reparameterize head
       (mean+exp(0.5*logvar)*noise); (2) a fixed-seed img2img latent trajectory matching diffusers
       `StableDiffusionImg2ImgPipeline` step-for-step.
 - [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
