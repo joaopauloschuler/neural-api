@@ -763,6 +763,30 @@ rather than acted on.
         - [ ] FreeU follow-up: an `sdxl` preset (0.6, 0.4, 1.1, 1.2 in the diffusers
               FreeU docs) once an SDXL pipeline CLI exists; BuildSDUNet already
               applies FreeU to SDXL configs (up blocks 0 and 1).
+      - [ ] DeepCache for the SD UNet (Ma et al. 2023, reference code
+            horseee/DeepCache `DeepCacheSDHelper(cache_interval, cache_branch_id)`):
+            a training-free ~2x denoise speed-up. On a full step the whole UNet
+            runs and the input of the last up block's deep half (the
+            upsampled output of the up block above it, before the concat with
+            down block 0's skips) is stored; on the next `cache_interval - 1`
+            steps only the shallow branch runs (conv_in, time embedding, down
+            block 0, the last up block, conv_out) and the stored volume stands
+            in for everything deeper. The UNet is one index-ordered TNNet, so
+            a cached step is `Compute(..., EndLayerIdx = last layer of down
+            block 0)`, a copy of the stored volume into the cache-point layer's
+            output (MarkOutputWrittenOnRAM), then `ComputeFromFilledInput` from
+            the next layer; BuildSDUNet records the layer indices. First check
+            that no deep layer index falls after the cache point (time-
+            embedding and ControlNet/T2I residual inputs included), and reorder
+            the build where one does. The skip decision belongs with
+            `TDiTFirstBlockCache` in one shared step-cache policy, not in a
+            second class. Expose `TStableDiffusionPipeline.DeepCacheInterval`
+            (1 = off) and examples/StableDiffusion `--deepcache N`. Tests:
+            interval 1 bit-identical to today; interval 3 against a plain-loop
+            reference that runs the same shallow/deep split by hand on the
+            pico UNet; CFG batches and img2img keep working. Then the user's
+            GPU box: SD 1.5, 50 steps DDIM, interval 2/3/5 vs off — time per
+            image and image pairs in examples/StableDiffusion/README.md.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
