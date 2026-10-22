@@ -1271,6 +1271,7 @@ type
     procedure TestSDUNetLinearProjParity;
     procedure TestSDUNetSDXLParity;
     procedure TestSDUNetPerBlockHeadsParity;
+    procedure TestSDUNetClassEmbedOnlyCrossParity;
     procedure TestMarigoldDenoiseSmoke;
     procedure TestMarigoldPreprocessPadsReplicate;
     procedure TestMarigoldPreprocessResizesLongSide;
@@ -44980,6 +44981,60 @@ begin
     Noise.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// The x4-upscaler-shaped pico UNet (tiny_sd_x4_upscaler/unet): 7 input
+// channels, num_class_embeds 1000 and only_cross_attention [T, T, F]; one
+// diffusers float64 forward with class_labels (tiny_sd_x4_upscaler_unet_io.json).
+procedure TTestNeuralPretrained.TestSDUNetClassEmbedOnlyCrossParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  Oracle: TJSONData;
+  Sample, EncStates, Noise, Expected: TNNetVolume;
+  Inputs: TSDUNetConditioningInputs;
+  MaxDiff: double;
+begin
+  Config := ReadSDUNetConfigFromJSONFile(
+    FixturePath('tiny_sd_x4_upscaler/unet/config.json'));
+  AssertEquals('num_class_embeds', 1000, Config.NumClassEmbeds);
+  AssertTrue('only_cross_attention [T, T, F]', Config.OnlyCrossAttention[0] and
+    Config.OnlyCrossAttention[1] and not Config.OnlyCrossAttention[2]);
+  AssertFalse('mid block self-attends', Config.MidBlockOnlyCrossAttention);
+  Oracle := LoadSD15Fixture('tiny_sd_x4_upscaler_unet_io.json');
+  Sample := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadNestedOracleVolume(TJSONObject(Oracle).Arrays['sample'], true, Sample);
+    LoadNestedOracleVolume(TJSONObject(Oracle).Arrays['encoder_hidden_states'],
+      false, EncStates);
+    LoadNestedOracleVolume(TJSONObject(Oracle).Arrays['noise'], true, Expected);
+    Config.LatentGrid := Sample.SizeX;
+    Config.LatentGridY := Sample.SizeY;
+    Config.TextSeqLen := EncStates.SizeX;
+    NN := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd_x4_upscaler/unet/diffusion_pytorch_model.safetensors'), Config,
+      {pTrainable=}false);
+    Inputs := SDUNetConditioningInputs(NN, Config, false, false, false);
+    AssertTrue('class label input', Inputs.ClassLabel <> nil);
+    Inputs.ClassLabel.Output.FData[0] :=
+      TJSONObject(Oracle).Get('class_label', 0);
+    SDUNetDenoise(NN, Config, Sample, EncStates,
+      TJSONObject(Oracle).Get('timestep', 0), Noise);
+    MaxDiff := MaxAbsVolumeDiff(Noise, Expected);
+    AssertTrue('predicted noise max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    NN.Free;
+    Expected.Free;
+    Noise.Free;
+    EncStates.Free;
+    Sample.Free;
+    Oracle.Free;
   end;
 end;
 
