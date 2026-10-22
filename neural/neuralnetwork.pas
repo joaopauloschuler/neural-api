@@ -1082,11 +1082,13 @@ type
       // per-neuron CPU forward path (default False = safe). WillOpenCL
       // (declared on TNNetLayerThreading) is True when the layer will
       // dispatch to an OpenCL kernel, in which case the concatenated-weight
-      // caches must be kept (default False). ActiveLowMemory is the complete
-      // guard call sites use: low-memory weights are dropped and the
-      // per-neuron path is used only when all three conditions hold.
+      // caches must be kept (default False). ActiveLowMemory is the per-pass
+      // guard: the per-neuron path is used only when all three conditions hold.
       function SupportsLowMemory(): boolean; virtual;
       function ActiveLowMemory(): boolean;
+      // Low-memory inference may free the concatenated-weight caches. An OpenCL-armed
+      // layer keeps them: a resident source can route any pass to OpenCL.
+      function DropsLowMemoryWeightCaches(): boolean;
       procedure InitDefault(); virtual;
       // Makes Output host-readable and reports whether it is. Every reader of
       // Output calls this first. No-op in non-OpenCL builds.
@@ -88512,7 +88514,7 @@ begin
       //    LinkBuildWeightOwner points them at the owner's.
       //  - the arming call right after ShareOwnerWeightCaches. Any other call
       //    rebuilds shared caches in place: equal dims never reallocate.
-      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() and
+      if not FQuantInt8 and not FQuantInt4 and not DropsLowMemoryWeightCaches() and
         not FBuildLinkPending and not FSkipSharedCacheRebuild then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
@@ -149199,6 +149201,12 @@ begin
   {$IFDEF OpenCL} and not WillOpenCL() {$ENDIF};
 end;
 
+function TNNetLayer.DropsLowMemoryWeightCaches(): boolean;
+begin
+  Result := FLowMemory and SupportsLowMemory()
+  {$IFDEF OpenCL} and not Assigned(FDotCL) {$ENDIF};
+end;
+
 {$IFDEF OpenCL}
 procedure TNNetLayer.ForceOpenCL(pForce: boolean);
 begin
@@ -151772,7 +151780,7 @@ begin
   FWinogradKernelsTValid := false;
   {$ENDIF}
   // Caches shared with the owner cost this layer nothing, so they stay.
-  if ActiveLowMemory() and not WeightCachesSharedWithOwner() then
+  if DropsLowMemoryWeightCaches() and not WeightCachesSharedWithOwner() then
   begin
     // Release the persistent weight caches the per-neuron forward does not need.
     // The biases stay - ComputeLowMemoryCPU adds FBiasOutput.

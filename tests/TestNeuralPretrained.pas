@@ -1494,6 +1494,9 @@ type
     procedure TestDDColorParity;
     procedure TestDDColorPthParityInfersConfig;
     procedure TestDDColorPrepareAndCompose;
+    // The tiny fixture with EnableOpenCL (ForceOpenCL off) against the host net:
+    // the a*b* and every layer output.
+    procedure TestDDColorOpenCLParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -54783,6 +54786,70 @@ begin
   AssertEquals('input width (input_size[1])', 32, Config.InputWidth);
   AssertEquals('input height (input_size[0])', 64, Config.InputHeight);
 end;
+
+procedure TTestNeuralPretrained.TestDDColorOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TDDColorConfig;
+  NN, NNCPU: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, FirstBadLayer: integer;
+  LayerDiff, MaxDiff, OutputDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildDDColorFromSafeTensors(FixturePath('tiny_ddcolor.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_ddcolor_config.json'));
+  NNCPU := BuildDDColorFromSafeTensors(FixturePath('tiny_ddcolor.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_ddcolor_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_ddcolor_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    NNCPU.Compute(NetInput);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    for LayerPos := 1 to NN.CountLayers() - 1 do
+    begin
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output);
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  DDColor OpenCL first layer past 1e-4: ', LayerPos, ' ',
+          NN.Layers[LayerPos].ClassName, ' max|diff|=', LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  DDColor OpenCL a*b* max|diff| = ', OutputDiff:0:9,
+      ' any layer = ', MaxDiff:0:9);
+    AssertTrue('a*b* OpenCL vs CPU max |diff| = ' + FloatToStr(OutputDiff) +
+      ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertEquals('every layer OpenCL vs CPU within 1e-4', -1, FirstBadLayer);
+  finally
+    NetInput.Free;
+    IO.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // DDColorPrepareInput keeps only L (gray RGB in [0,1]); DDColorComposeOutput keeps
 // the source L and takes the chroma from the a*b* volume.

@@ -748,6 +748,9 @@ type
     // TNNetMetaAconC chained resident (cai_meta_acon_table + AconC) at one- and
     // many-slice shapes, then after a weight update, against a host-only twin net.
     procedure TestMetaAconCOpenCLParity;
+    // Input -> PointwiseConvLinear -> GELUErf -> PointwiseConvLinear -> ChannelMul
+    // (a ConvNeXt MLP), low-memory inference, ForceOpenCL off, vs a host-only twin.
+    procedure TestPointwiseConvChainOpenCLParity;
     // Input -> TNNetRealFFT2D -> TNNetInverseRealFFT2D resident on OpenCL at
     // power-of-two and odd/non-power-of-two sizes, one per norm: both layers
     // and the round trip against a host-only twin net and the input.
@@ -74443,6 +74446,80 @@ begin
       NNCPU.Free;
       NN.Free;
     end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+function BuildPointwiseConvChainNet(Depth, Hidden: integer): TNNet;
+var
+  ScaleLayer: TNNetLayer;
+  ChannelPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(1, 2, Depth));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  Result.AddLayer(TNNetGELUErf.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(Depth));
+  ScaleLayer := Result.AddLayer(TNNetChannelMul.Create());
+  Result.SetTrainable(False, {pLowMemory=}True);
+  for ChannelPos := 0 to Depth - 1 do
+    ScaleLayer.Neurons[0].Weights.Raw[ChannelPos] := 0.5 + 0.1 * ChannelPos;
+  ScaleLayer.FlushWeightCache();
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestPointwiseConvChainOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csDepth = 24;
+  csHidden = 96;
+var
+  NN, NNCPU: TNNet;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, Pos, MaxPos: integer;
+  LayerDiff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261022;
+  NN := BuildPointwiseConvChainNet(csDepth, csHidden);
+  NNCPU := BuildPointwiseConvChainNet(csDepth, csHidden);
+  Input := TNNetVolume.Create(1, 2, csDepth);
+  try
+    NNCPU.CopyWeights(NN);
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7);
+    NNCPU.Compute(Input);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    NN.Compute(Input);
+    MaxDiff := 0;
+    for LayerPos := 1 to NN.CountLayers() - 1 do
+    begin
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsDiffToOutput(NNCPU.Layers[LayerPos].Output,
+        NN.Layers[LayerPos].Output);
+      WriteLn('  pointwise chain layer ', LayerPos, ' ',
+        NN.Layers[LayerPos].ClassName, ': max|diff|=', LayerDiff:0:9);
+      MaxDiff := Max(MaxDiff, LayerDiff);
+    end;
+    AssertTrue('pointwise chain OpenCL vs CPU: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Input.Free;
+    NNCPU.Free;
+    NN.Free;
   end;
 end;
 {$ELSE}
