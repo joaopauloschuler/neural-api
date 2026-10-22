@@ -668,6 +668,23 @@ rather than acted on.
         - [ ] IP-Adapter extras: set_ip_adapter_scale per-block dicts
               (style/layout), several adapters/images, ip_adapter_masks,
               ip-adapter-plus (Resampler), FaceID, SDXL.
+        - [ ] TStableDiffusionIPAdapter.PredictNoise tells the CFG halves apart by
+              comparing the embeds object with the negative-prompt embeds
+              (object identity). Pass an explicit "unguided half" flag through
+              the conditioner hook instead, so a caller that copies the embeds
+              cannot silently get the wrong image tokens.
+        - [ ] Conditioner follow-ups from the 2026-10-22 batch:
+              (1) cross-check CannyEdges against a real cv2.Canny run (cv2 is
+              not in the ~/x venv; needs user approval to install it);
+              (2) rerun tools/make_pico_sd_conditioning_fixtures.py in full and
+              confirm the committed ControlNet / T2I / inpaint fixtures come out
+              byte-identical after the --nonsquare-only / --inpaint-strength-only
+              / --ip-adapter-only refactors;
+              (3) strength < 1 parity for PNDM, DPM++ 2M and Euler a (only DDIM
+              and Euler are covered);
+              (4) a plain img2img mode (TStableDiffusionImg2Img conditioner over
+              the DenoiseStrength / NoiseImageLatents hooks) plus
+              examples/StableDiffusion --init-image/--strength.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
