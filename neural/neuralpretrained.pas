@@ -12161,6 +12161,7 @@ type
     // Set by LoadComponents: the nets below outlive their stage, each rebuilt
     // only when its token count or latent grid changes; nil until built.
     FKeepComponents: boolean;
+    FUNetInt8, FTextEncoderInt8: boolean;
     FTextEncoder, FUNet, FVaeDecoder: TNNet;
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FVaeGridX, FVaeGridY: integer;
@@ -12171,7 +12172,10 @@ type
     {$ENDIF}
     function ComponentFolder(const Component: string): string;
     procedure DoPhase(Phase: TStableDiffusionPipelinePhase);
-    procedure PrepareComponent(Net: TNNet);
+    // Quantizes Net (QuantizeInt8) and arms OpenCL when EnableOpenCL asked.
+    procedure PrepareComponent(Net: TNNet; QuantizeInt8: boolean);
+    procedure SetUNetInt8(Value: boolean);
+    procedure SetTextEncoderInt8(Value: boolean);
     // Latent grid of a Width x Height image; raises unless both sides are a
     // multiple of what the VAE and the UNet down blocks need.
     procedure LatentGridFor(Width, Height: integer; out GridX, GridY: integer);
@@ -12254,6 +12258,11 @@ type
     // unet sample_size * VaeScaleFactor (512 for SD 1.5).
     property DefaultImageSize: integer read GetDefaultImageSize;
     property ComponentsLoaded: boolean read FKeepComponents;
+    // int8 weights (TNNet.QuantizeWeightsInt8) for the UNet / the text
+    // encoder built from now on; a kept net of a changed one is rebuilt.
+    property UNetInt8: boolean read FUNetInt8 write SetUNetInt8;
+    property TextEncoderInt8: boolean read FTextEncoderInt8
+      write SetTextEncoderInt8;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
   end;
@@ -92290,8 +92299,10 @@ begin
   if Assigned(FOnPhase) then FOnPhase(Phase);
 end;
 
-procedure TStableDiffusionPipeline.PrepareComponent(Net: TNNet);
+procedure TStableDiffusionPipeline.PrepareComponent(Net: TNNet;
+  QuantizeInt8: boolean);
 begin
+  if QuantizeInt8 then Net.QuantizeWeightsInt8();
   {$IFDEF OpenCL}
   if FUseOpenCL then Net.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice);
   {$ENDIF}
@@ -92307,6 +92318,18 @@ begin
   FOpenCLDevice := device_id;
 end;
 {$ENDIF}
+
+procedure TStableDiffusionPipeline.SetUNetInt8(Value: boolean);
+begin
+  if Value <> FUNetInt8 then FreeAndNil(FUNet);
+  FUNetInt8 := Value;
+end;
+
+procedure TStableDiffusionPipeline.SetTextEncoderInt8(Value: boolean);
+begin
+  if Value <> FTextEncoderInt8 then FreeAndNil(FTextEncoder);
+  FTextEncoderInt8 := Value;
+end;
 
 procedure TStableDiffusionPipeline.FreeKeptComponents();
 begin
@@ -92373,7 +92396,7 @@ begin
     Reader.Free;
   end;
   try
-    PrepareComponent(Result);
+    PrepareComponent(Result, FTextEncoderInt8);
   except
     Result.Free;
     raise;
@@ -92396,7 +92419,7 @@ begin
     ComponentFolder('unet'), 'diffusion_pytorch_model'),
     UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false);
   try
-    PrepareComponent(Result);
+    PrepareComponent(Result, FUNetInt8);
   except
     Result.Free;
     raise;
@@ -92426,7 +92449,7 @@ begin
     ComponentFolder('vae'), 'diffusion_pytorch_model'), DecoderConfig,
     {pTrainable=}false);
   try
-    PrepareComponent(Result);
+    PrepareComponent(Result, {QuantizeInt8=}false);
   except
     Result.Free;
     raise;

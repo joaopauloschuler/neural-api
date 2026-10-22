@@ -1232,6 +1232,7 @@ type
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineKeepLoaded;
+    procedure TestStableDiffusionPipelineInt8;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -45821,6 +45822,51 @@ begin
     Expected[0].Free;
     Kept.Free;
     Reference.Free;
+  end;
+end;
+
+// int8 UNet + text encoder vs FP32 (pico): embeds (|max| ~4) move > 0 and
+// < 0.1, the [0, 1] image > 0 and < 0.03 (measured 0.045 and 0.0092).
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineInt8;
+var
+  Pipeline: TStableDiffusionPipeline;
+  EmbedsFP32, EmbedsInt8, ImageFP32, ImageInt8: TNNetVolume;
+  EmbedsDiff, ImageDiff: double;
+begin
+  Pipeline := CreateSD15Pipeline();
+  EmbedsFP32 := TNNetVolume.Create;
+  EmbedsInt8 := TNNetVolume.Create;
+  ImageFP32 := TNNetVolume.Create;
+  ImageInt8 := TNNetVolume.Create;
+  try
+    Pipeline.EncodePrompt('a red cube', EmbedsFP32);
+    Pipeline.Generate('a red cube', 16, 16, 3, 5, ImageFP32);
+    Pipeline.LoadComponents(16, 16);
+    FillChar(FSD15PhaseCounts, SizeOf(FSD15PhaseCounts), 0);
+    Pipeline.OnPhase := @SD15CountPhase;
+    Pipeline.UNetInt8 := true;
+    Pipeline.TextEncoderInt8 := true;
+    Pipeline.ClearNegativePrompt();
+    Pipeline.EncodePrompt('a red cube', EmbedsInt8);
+    Pipeline.Generate('a red cube', 16, 16, 3, 5, ImageInt8);
+    AssertEquals('kept text encoder rebuilt int8', 1,
+      FSD15PhaseCounts[sdphLoadTextEncoder]);
+    AssertEquals('kept UNet rebuilt int8', 1, FSD15PhaseCounts[sdphLoadUNet]);
+    AssertEquals('kept VAE untouched', 0, FSD15PhaseCounts[sdphLoadVae]);
+    EmbedsDiff := MaxAbsVolumeDiff(EmbedsInt8, EmbedsFP32);
+    ImageDiff := MaxAbsVolumeDiff(ImageInt8, ImageFP32);
+    AssertTrue('int8 embeds moved', EmbedsDiff > 0);
+    AssertTrue('int8 image moved', ImageDiff > 0);
+    AssertTrue('int8 embeds max |diff| = ' + FloatToStr(EmbedsDiff),
+      EmbedsDiff < 0.1);
+    AssertTrue('int8 image max |diff| = ' + FloatToStr(ImageDiff),
+      ImageDiff < 0.03);
+  finally
+    ImageInt8.Free;
+    ImageFP32.Free;
+    EmbedsInt8.Free;
+    EmbedsFP32.Free;
+    Pipeline.Free;
   end;
 end;
 

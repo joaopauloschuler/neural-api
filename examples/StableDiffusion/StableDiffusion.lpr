@@ -13,6 +13,11 @@ The scheduler config gives the betas, timestep spacing and prediction type,
 and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a or
 DPM-Solver++ 2M; other classes run DDIM). --sampler overrides it.
 
+Each component is loaded when its stage starts and freed when it ends, so
+only one is in memory at a time. --repeat N > 1 makes N images from one
+prompt encode and keeps the three components loaded. --int8 stores the UNet
+and text encoder weights in int8.
+
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
 This program is free software; you can redistribute it and/or modify
@@ -44,10 +49,10 @@ type
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
     SamplerName: string;
     // A side < 1: the checkpoint default (unet sample_size * VAE factor).
-    Steps, ImageWidth, ImageHeight: integer;
+    Steps, ImageWidth, ImageHeight, RepeatCount: integer;
     GuidanceScale: double;
     Seed: cardinal;
-    UseOpenCL: boolean;
+    UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
 
@@ -100,6 +105,13 @@ begin
   WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
   WriteLn('                    pndm, euler, euler-a or dpm++2m');
   WriteLn('  --output PNG      output file (default stable_diffusion.png)');
+  WriteLn('  --repeat N        N images, seeds --seed, --seed+1, ...; the ',
+    'prompt is encoded');
+  WriteLn('                    once. N > 1 keeps the components loaded and ',
+    'numbers the files');
+  WriteLn('                    (stable_diffusion_0001.png, ...; default 1)');
+  WriteLn('  --int8            UNet and text encoder weights in int8 ',
+    '(default FP32)');
   WriteLn('  --gpu             run the nets on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N  OpenCL platform index (default 0)');
@@ -150,7 +162,9 @@ begin
   Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
   Opt.Seed := 0;
+  Opt.RepeatCount := 1;
   Opt.UseOpenCL := false;
+  Opt.UseInt8 := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
   Result := true;
@@ -174,6 +188,8 @@ begin
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
     else if Arg = '--sampler' then Opt.SamplerName := LowerCase(NextArg())
+    else if Arg = '--repeat' then Opt.RepeatCount := StrToInt(NextArg())
+    else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -188,18 +204,28 @@ begin
     Inc(ArgPos);
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  if Opt.RepeatCount < 1 then raise Exception.Create('--repeat must be >= 1');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
+end;
+
+// --output for one image; else Base with _0001, _0002, ... before the extension.
+function ImageFileName(const Base: string; ImagePos, ImageCount: integer): string;
+begin
+  if ImageCount = 1 then exit(Base);
+  Result := ChangeFileExt(Base, '') + Format('_%.4d', [ImagePos + 1]) +
+    ExtractFileExt(Base);
 end;
 
 procedure Run(const Opt: TStableDiffusionOptions);
 var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
-  Image: TNNetVolume;
-  ComputeText: string;
-  ImageWidth, ImageHeight: integer;
+  Image, PromptEmbeds: TNNetVolume;
+  ComputeText, ImageFile: string;
+  ImageWidth, ImageHeight, ImagePos: integer;
+  Seed: cardinal;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
   OpenCLDevices: TEasyOpenCL;
@@ -210,6 +236,7 @@ begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   Image := TNNetVolume.Create;
+  PromptEmbeds := TNNetVolume.Create;
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -242,6 +269,8 @@ begin
     if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
     Pipeline.GuidanceScale := Opt.GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
+    Pipeline.UNetInt8 := Opt.UseInt8;
+    Pipeline.TextEncoderInt8 := Opt.UseInt8;
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     WriteLn('Model:    ', Opt.ModelFolder);
@@ -256,21 +285,48 @@ begin
       Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
     if (Opt.SamplerName = 'auto') and (Pipeline.SamplerNotice <> '') then
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
-    // Euler a draws its per-step noise from the global RNG; the initial
-    // latents use Opt.Seed itself, so this stream starts elsewhere.
-    RandSeed := Opt.Seed xor $9E3779B9;
-    StartTime := Now();
-    Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
-      Opt.Seed, Image);
-    WriteLn(Format('Total:    %.1f s', [(Now() - StartTime) * 86400.0]));
-    Image.Mul(255.0);
-    if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then
-      raise Exception.Create('could not save ' + Opt.OutputFile);
-    WriteLn('Wrote ', Opt.OutputFile);
+    if Opt.UseInt8 then WriteLn('Weights:  UNet int8, text encoder int8')
+    else WriteLn('Weights:  FP32');
+    if Opt.RepeatCount > 1 then
+    begin
+      WriteLn('Loading the text encoder, the UNet and the VAE decoder to ',
+        'keep them in memory.');
+      StartTime := Now();
+      Pipeline.LoadComponents(ImageWidth, ImageHeight);
+      WriteLn(Format('Loaded:   %.1f s', [(Now() - StartTime) * 86400.0]));
+      Pipeline.EncodePrompt(Opt.Prompt, PromptEmbeds);
+    end;
+    Seed := Opt.Seed;
+    for ImagePos := 0 to Opt.RepeatCount - 1 do
+    begin
+      ImageFile := ImageFileName(Opt.OutputFile, ImagePos, Opt.RepeatCount);
+      if Opt.RepeatCount > 1 then
+        WriteLn('Image ', ImagePos + 1, '/', Opt.RepeatCount, ', seed ', Seed);
+      // Euler a draws its per-step noise from the global RNG; the initial
+      // latents use Seed itself, so this stream starts elsewhere.
+      RandSeed := Seed xor $9E3779B9;
+      StartTime := Now();
+      if Opt.RepeatCount > 1 then
+        Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
+          Opt.Steps, Seed, Image)
+      else
+        Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
+          Seed, Image);
+      WriteLn(Format('Total:    %.1f s', [(Now() - StartTime) * 86400.0]));
+      Image.Mul(255.0);
+      if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
+        raise Exception.Create('could not save ' + ImageFile);
+      WriteLn('Wrote ', ImageFile);
+      // The seed wraps from High(cardinal) to 0.
+      {$PUSH}{$Q-}{$R-}
+      Inc(Seed);
+      {$POP}
+    end;
   finally
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}
+    PromptEmbeds.Free;
     Image.Free;
     Reporter.Free;
     Pipeline.Free;
