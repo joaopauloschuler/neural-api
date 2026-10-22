@@ -225,8 +225,10 @@ latent grid (`TestStableDiffusion2Depth2ImgParity`, and on OpenCL
 pico DPT-Hybrid (`tests/fixtures/tiny_sd2_depth_estimator`,
 `TestStableDiffusion2Depth2ImgEstimatorParity` / `...EstimatorOpenCL`). No
 real checkpoint has been run yet. The estimator only runs at its native
-`image_size` (`keep_aspect_ratio` processors are refused) and is rebuilt for
-every run.
+`image_size` (`keep_aspect_ratio` processors are refused). With `--repeat N`
+(`LoadComponents`) it is built once and kept with the other components; it
+still estimates the depth for every image
+(`TestStableDiffusion2Depth2ImgEstimatorKept`).
 
 `--edit-image PNG [--image-guidance S]` edits the image as the prompt
 instructs ("make it winter"), as diffusers

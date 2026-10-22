@@ -12566,8 +12566,8 @@ type
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
     property LoRACount: integer read GetLoRACount;
-    // Component nets built by reading a weights file (text encoder, UNet, VAE,
-    // ControlNet, T2I-Adapter); a kept net rebuilt for a new size reads none.
+    // Nets built by reading a weights file (text encoder, UNet, VAE, ControlNet,
+    // T2I-Adapter, depth estimator); a kept net rebuilt for a new size reads none.
     property WeightFileLoadCount: integer read FWeightFileLoadCount;
   end;
 
@@ -12974,6 +12974,10 @@ type
     FDepthMap, FDepthLatents: TNNetVolume;
     FHasSuppliedDepthMap: boolean;
     FDepthEstimatorFolder: string;
+    // Kept by EstimateDepthMap while ComponentsLoaded (built at FNetEpoch from
+    // FEstimatorFolder); nil otherwise.
+    FEstimator: TNNet;
+    FEstimatorFolder: string;
     // FDepthMap := the DPT predicted_depth of FSourceImage (diffusers
     // prepare_depth_map with depth_map=None).
     procedure EstimateDepthMap();
@@ -12991,6 +12995,7 @@ type
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    procedure EndDenoise(); override;
     // The normalized depth (GridX, GridY, 1) in [-1, 1] of the last BeginDenoise.
     property DepthLatents: TNNetVolume read FDepthLatents;
     // The supplied depth map, or the one the last BeginDenoise estimated.
@@ -96950,6 +96955,7 @@ end;
 
 destructor TStableDiffusionDepth2Img.Destroy();
 begin
+  FEstimator.Free;
   FDepthLatents.Free;
   FDepthMap.Free;
   inherited Destroy();
@@ -96981,7 +96987,6 @@ var
   Root: TJSONData;
   Preprocess: TClipImageProcessorConfig;
   Config: TDPTConfig;
-  Estimator: TNNet;
   RGBImage, Pixels: TNNetVolume;
   MultipleOf: integer;
 begin
@@ -97044,23 +97049,30 @@ begin
       IntToStr(Preprocess.CropWidth) + 'x' + IntToStr(Preprocess.CropHeight) +
       ' (multiple of ' + IntToStr(MultipleOf) + ') is not the estimator ' +
       'image_size ' + IntToStr(Config.Backbone.ImageSize) + '.');
+  if not Assigned(FEstimator) or (FNetEpoch <> FPipeline.ComponentEpoch) or
+    (FEstimatorFolder <> EstimatorFolder) then
+  begin
+    FreeAndNil(FEstimator);
+    FEstimator := BuildDPTFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+      EstimatorFolder, 'model'), Config, {pTrainable=}false);
+    Inc(FPipeline.FWeightFileLoadCount);
+    FEstimatorFolder := EstimatorFolder;
+    FNetEpoch := FPipeline.ComponentEpoch;
+    FPipeline.PrepareComponent(FEstimator, {QuantizeInt8=}false);
+  end;
   RGBImage := TNNetVolume.Create;
   Pixels := TNNetVolume.Create;
-  Estimator := nil;
   try
-    Estimator := BuildDPTFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
-      EstimatorFolder, 'model'), Config, {pTrainable=}false);
-    FPipeline.PrepareComponent(Estimator, {QuantizeInt8=}false);
     if FSourceImage.Depth = 3 then RGBImage.Copy(FSourceImage)
     else ConvertAndResizeImagePIL(FSourceImage, RGBImage, FSourceImage.SizeX,
       FSourceImage.SizeY, 3, {ClipToByteRange=}true, 0, 255);
     ClipPreprocessImage(RGBImage, Pixels, Preprocess);
-    Estimator.Compute(Pixels);
-    Estimator.GetLastLayer().ForceOutputOnRAM();
-    FDepthMap.ReSize(Estimator.GetLastLayer().Output);
-    FDepthMap.Copy(Estimator.GetLastLayer().Output);
+    FEstimator.Compute(Pixels);
+    FEstimator.GetLastLayer().ForceOutputOnRAM();
+    FDepthMap.ReSize(FEstimator.GetLastLayer().Output);
+    FDepthMap.Copy(FEstimator.GetLastLayer().Output);
   finally
-    Estimator.Free;
+    if not FPipeline.ComponentsLoaded then FreeAndNil(FEstimator);
     Pixels.Free;
     RGBImage.Free;
   end;
@@ -97083,6 +97095,12 @@ begin
   // diffusers feeds the same depth to the prompt and the unconditional pass.
   PredictWithExtraChannels(UNet, Config, Latents, FDepthLatents, Embeds,
     Timestep, Pred);
+end;
+
+procedure TStableDiffusionDepth2Img.EndDenoise();
+begin
+  inherited EndDenoise();
+  if not FPipeline.ComponentsLoaded then FreeAndNil(FEstimator);
 end;
 
 const

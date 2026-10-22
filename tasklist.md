@@ -589,8 +589,9 @@ rather than acted on.
             - [ ] Real stabilityai/stable-diffusion-2-depth run with its own
                   depth_estimator on the user's GPU box (512x512); compare the
                   estimated depth with diffusers.
-            - [ ] The estimator is rebuilt (and its 490 MB read) on every
-                  BeginDenoise; keep it with the pipeline's kept components.
+            - [x] The estimator is rebuilt (and its 490 MB read) on every
+                  BeginDenoise: DONE, kept while ComponentsLoaded
+                  (TestStableDiffusion2Depth2ImgEstimatorKept).
             - [ ] transformers with torchvision uses the torchvision uint8
                   resize for DPTImageProcessor; the oracle here is the PIL
                   backend (torchvision is not installed in ~/x).

@@ -108,7 +108,8 @@ type
     procedure CheckSD2Depth2ImgParity(OnOpenCL: boolean);
     // tiny_sd2_depth without a depth map: the pico DPT-Hybrid estimator of
     // tiny_sd2_depth_estimator vs tiny_sd2_depth_estimator_io.json.
-    procedure CheckSD2Depth2ImgEstimatorParity(OnOpenCL: boolean);
+    procedure CheckSD2Depth2ImgEstimatorParity(OnOpenCL: boolean;
+      KeepComponents: boolean = false);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1335,6 +1336,7 @@ type
     procedure TestStableDiffusion2Depth2ImgOpenCL;
     procedure TestStableDiffusion2Depth2ImgEstimatorParity;
     procedure TestStableDiffusion2Depth2ImgEstimatorOpenCL;
+    procedure TestStableDiffusion2Depth2ImgEstimatorKept;
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
@@ -47318,14 +47320,22 @@ begin
   {$ENDIF}
 end;
 
+// The same after LoadComponents, twice: the second run reads no weights file
+// (the depth estimator is kept) and still matches.
+procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgEstimatorKept;
+begin
+  CheckSD2Depth2ImgEstimatorParity(false, true);
+end;
+
 procedure TTestNeuralPretrained.CheckSD2Depth2ImgEstimatorParity(
-  OnOpenCL: boolean);
+  OnOpenCL: boolean; KeepComponents: boolean);
 var
   Pipeline: TStableDiffusionPipeline;
   Depth2Img: TStableDiffusionDepth2Img;
   Entry: TJSONObject;
   SourceImage, ImageNoise, Expected: TNNetVolume;
   MaxDiff: double;
+  RunCnt, LoadCount: integer;
   {$IFDEF OpenCL}
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -47367,18 +47377,33 @@ begin
     Pipeline.Sampler := smDDIM;
     Entry := TJSONObject(FSD15Oracle).Arrays['cases'].Objects[0];
     AssertEquals('scheduler', 'DDIMScheduler', Entry.Get('scheduler', ''));
-    CheckSD15ConditionedParity(Pipeline, Entry);
-    LoadNestedOracleVolume(Entry.Arrays['depth_map'], false, Expected);
-    AssertEquals('estimated depth width', Expected.SizeX,
-      Depth2Img.DepthMap.SizeX);
-    MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthMap, Expected);
-    WriteLn('  depth2img estimated depth max|diff| = ', MaxDiff:0:9);
-    AssertTrue('estimated depth max |diff| = ' + FloatToStr(MaxDiff),
-      MaxDiff < 1e-4);
-    LoadNestedOracleVolume(Entry.Arrays['depth_latents'], false, Expected);
-    MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthLatents, Expected);
-    AssertTrue('estimated depth latents max |diff| = ' + FloatToStr(MaxDiff),
-      MaxDiff < 1e-4);
+    if KeepComponents then
+      Pipeline.LoadComponents(TJSONObject(FSD15Oracle).Get('width',
+        TJSONObject(FSD15Oracle).Get('image_size', 0)),
+        TJSONObject(FSD15Oracle).Get('height',
+        TJSONObject(FSD15Oracle).Get('image_size', 0)));
+    for RunCnt := 0 to Ord(KeepComponents) do
+    begin
+      LoadCount := Pipeline.WeightFileLoadCount;
+      Depth2Img.DepthMap.Fill(0);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      if RunCnt = 1 then
+        AssertEquals('kept run reads no weights file', LoadCount,
+          Pipeline.WeightFileLoadCount)
+      else AssertTrue('estimator read counted',
+        Pipeline.WeightFileLoadCount > LoadCount);
+      LoadNestedOracleVolume(Entry.Arrays['depth_map'], false, Expected);
+      AssertEquals('estimated depth width', Expected.SizeX,
+        Depth2Img.DepthMap.SizeX);
+      MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthMap, Expected);
+      WriteLn('  depth2img estimated depth max|diff| = ', MaxDiff:0:9);
+      AssertTrue('estimated depth max |diff| = ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-4);
+      LoadNestedOracleVolume(Entry.Arrays['depth_latents'], false, Expected);
+      MaxDiff := MaxAbsVolumeDiff(Depth2Img.DepthLatents, Expected);
+      AssertTrue('estimated depth latents max |diff| = ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-4);
+    end;
   finally
     Expected.Free;
     ImageNoise.Free;
