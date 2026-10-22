@@ -579,9 +579,11 @@ rather than acted on.
         - [ ] T2I-Adapter on a plain DownBlock2D that has a downsampler (the
               feature goes after the downsampler, in place on the last skip):
               coded from the diffusers source, no fixture has such a block.
-        - [ ] Canny edge extraction (a cv2.Canny port: Gaussian blur, Sobel,
+        - [X] Canny edge extraction (a cv2.Canny port: Gaussian blur, Sobel,
               non-maximum suppression, hysteresis) so ControlNetCanny can take a
-              photo; it takes a ready edge map today.
+              photo; it takes a ready edge map today. DONE: CannyEdges in
+              neuralimageresize.pas + ControlNetCanny --photo/--canny-*;
+              not yet compared with a real cv2 run.
         - [ ] Inpainting strength < 1 (start from the re-noised image latents
               at the truncated schedule) and the sampled VAE latents (diffusers
               retrieve_latents samples; ours takes the mean).

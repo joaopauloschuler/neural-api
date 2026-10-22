@@ -12,9 +12,11 @@ with a TStableDiffusionControlNet conditioner in neuralpretrained.pas.
     ControlNetModel folder, e.g. lllyasviel/sd-controlnet-canny.
 
 --control FILE is the control image (for the canny ControlNet: white edges on
-black, e.g. the output of cv2.Canny); it is resized to the image size. Without
-it the example draws a circle and a square outline. ControlNet runs at square
-sizes only.
+black, e.g. the output of cv2.Canny); it is resized to the image size. --photo
+FILE instead resizes a photo to the image size and extracts its edges with
+CannyEdges (a cv2.Canny port in neuralimageresize.pas). Without either the
+example draws a circle and a square outline. ControlNet runs at square sizes
+only.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -29,7 +31,8 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
-  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
+  neuralimageresize;
 
 const
   PicoModelFolder = '../../tests/fixtures/tiny_sd15';
@@ -37,11 +40,13 @@ const
 
 type
   TControlNetCannyOptions = record
-    ModelFolder, ControlNetFolder, ControlFile, Prompt, NegativePrompt,
-      OutputFile: string;
+    ModelFolder, ControlNetFolder, ControlFile, PhotoFile, EdgesFile, Prompt,
+      NegativePrompt, OutputFile: string;
     // ImageSize < 1: the checkpoint default (512 for SD 1.5).
     Steps, ImageSize: integer;
     GuidanceScale, ConditioningScale: double;
+    // cv2.Canny thresholds and the optional GaussianBlurImage radius before it.
+    CannyLow, CannyHigh, CannyBlur: double;
     Seed: cardinal;
     UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
@@ -80,6 +85,13 @@ begin
     '(default: the pico fixture)');
   WriteLn('  --control FILE    control image, e.g. a canny edge map ',
     '(default: drawn outlines)');
+  WriteLn('  --photo FILE      photo to extract canny edges from instead ',
+    'of --control');
+  WriteLn('  --canny-low T     canny low threshold (default 100)');
+  WriteLn('  --canny-high T    canny high threshold (default 200)');
+  WriteLn('  --canny-blur R    Gaussian blur radius before canny ',
+    '(default 0: none, as cv2.Canny)');
+  WriteLn('  --edges-out PNG   also save the extracted edge map');
   WriteLn('  --prompt TEXT     prompt (default "a futuristic city, ',
     'detailed, sharp focus")');
   WriteLn('  --negative TEXT   negative prompt (default empty)');
@@ -114,6 +126,11 @@ begin
   Opt.ModelFolder := PicoModelFolder;
   Opt.ControlNetFolder := PicoControlNetFolder;
   Opt.ControlFile := '';
+  Opt.PhotoFile := '';
+  Opt.EdgesFile := '';
+  Opt.CannyLow := 100;
+  Opt.CannyHigh := 200;
+  Opt.CannyBlur := 0;
   Opt.Prompt := 'a futuristic city, detailed, sharp focus';
   Opt.NegativePrompt := '';
   Opt.OutputFile := 'controlnet_canny.png';
@@ -134,6 +151,14 @@ begin
     if Arg = '--model' then Opt.ModelFolder := NextArg()
     else if Arg = '--controlnet' then Opt.ControlNetFolder := NextArg()
     else if Arg = '--control' then Opt.ControlFile := NextArg()
+    else if Arg = '--photo' then Opt.PhotoFile := NextArg()
+    else if Arg = '--edges-out' then Opt.EdgesFile := NextArg()
+    else if Arg = '--canny-low' then
+      Opt.CannyLow := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--canny-high' then
+      Opt.CannyHigh := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--canny-blur' then
+      Opt.CannyBlur := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--prompt' then Opt.Prompt := NextArg()
     else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
     else if Arg = '--out' then Opt.OutputFile := NextArg()
@@ -159,6 +184,8 @@ begin
     Inc(ArgPos);
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  if (Opt.ControlFile <> '') and (Opt.PhotoFile <> '') then
+    raise Exception.Create('pass --control or --photo, not both');
 end;
 
 // A (Size, Size, 3) edge map in 0..255: one-pixel white outlines of a circle
@@ -229,6 +256,17 @@ begin
       if not LoadImageFromFileIntoVolume(Opt.ControlFile, Control) then
         raise Exception.Create('could not read ' + Opt.ControlFile);
     end
+    else if Opt.PhotoFile <> '' then
+    begin
+      if not LoadImageFromFileIntoVolume(Opt.PhotoFile, Image) then
+        raise Exception.Create('could not read ' + Opt.PhotoFile);
+      ResizeImagePIL(Image, Image, ImageSize, ImageSize, irfLanczos, true);
+      GaussianBlurImage(Image, Image, Opt.CannyBlur);
+      CannyEdges(Image, Control, Opt.CannyLow, Opt.CannyHigh, false, 3);
+      if (Opt.EdgesFile <> '') and
+        not SaveImageFromVolumeIntoFile(Control, Opt.EdgesFile) then
+        raise Exception.Create('could not save ' + Opt.EdgesFile);
+    end
     else DrawEdgeMap(Control, ImageSize);
     ControlNet.SetControlImage(Control);
     ControlNet.ConditioningScale := Opt.ConditioningScale;
@@ -242,6 +280,10 @@ begin
     WriteLn('Model:      ', Opt.ModelFolder);
     WriteLn('ControlNet: ', Opt.ControlNetFolder);
     if Opt.ControlFile <> '' then WriteLn('Control:    ', Opt.ControlFile)
+    else if Opt.PhotoFile <> '' then
+      WriteLn(Format('Control:    canny edges of %s (low %.0f, high %.0f, ' +
+        'blur %.2f)', [Opt.PhotoFile, Opt.CannyLow, Opt.CannyHigh,
+        Opt.CannyBlur]))
     else WriteLn('Control:    drawn circle and square outlines');
     WriteLn('Prompt:     "', Opt.Prompt, '"');
     WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, scale %.2f, ' +

@@ -108,6 +108,14 @@ type
     // 13x7 photo through ViT int size 5 and DeiT size 6 / crop 4 configs vs
     // transformers' PIL processors.
     procedure TestIntSizeSquarePreprocessMatchesTransformers;
+    // CannyEdges of a vertical step: one-pixel edge on the dark side, the
+    // strict > thresholds, swapped thresholds, L2 gradient, RGB input.
+    procedure TestCannyEdgesStepEdge;
+    // CannyEdges of a filled square: hand-computed Sobel + 4-direction NMS.
+    procedure TestCannyEdgesSquare;
+    // Hysteresis keeps a weak edge 8-connected to a strong one and drops a
+    // weak edge with no strong pixel.
+    procedure TestCannyEdgesHysteresis;
   end;
 
 implementation
@@ -1362,6 +1370,168 @@ begin
     DeleteFile(FN);
     Dst.Free;
     Src.Free;
+  end;
+end;
+
+// Asserts Edges (W,H,D) is 255 where Expected[Y][X] = '#' and 0 elsewhere.
+procedure AssertCannyEdges(const Context: string; Edges: TNNetVolume;
+  const Expected: array of string);
+var
+  X, Y, Channel, MaxX, MaxY, MaxChannel: integer;
+  ExpectedValue: TNeuralFloat;
+begin
+  MaxY := High(Expected);
+  TAssert.AssertEquals(Context + ' height', MaxY + 1, Edges.SizeY);
+  MaxX := Length(Expected[0]) - 1;
+  TAssert.AssertEquals(Context + ' width', MaxX + 1, Edges.SizeX);
+  MaxChannel := Edges.Depth - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      if Expected[Y][X + 1] = '#' then ExpectedValue := 255
+      else ExpectedValue := 0;
+      for Channel := 0 to MaxChannel do
+        TAssert.AssertEquals(Context + ' at ' + IntToStr(X) + ',' + IntToStr(Y),
+          ExpectedValue, Edges[X, Y, Channel], 0);
+    end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestCannyEdgesStepEdge;
+const
+  // Sobel gives |dx| = 400 at X = 3 and X = 4; NMS keeps X = 3 (> left,
+  // >= right).
+  csEdge: array[0..5] of string = ('...#....', '...#....', '...#....',
+    '...#....', '...#....', '...#....');
+  csNone: array[0..5] of string = ('........', '........', '........',
+    '........', '........', '........');
+var
+  Image, Edges: TNNetVolume;
+  X, Y: integer;
+begin
+  Image := TNNetVolume.Create(8, 6, 1);
+  Edges := TNNetVolume.Create;
+  try
+    Image.Fill(0);
+    for Y := 0 to 5 do
+      for X := 4 to 7 do Image[X, Y, 0] := 100;
+    CannyEdges(Image, Edges, 100, 200);
+    AssertEquals('depth', 1, Edges.Depth);
+    AssertCannyEdges('100/200', Edges, csEdge);
+    CannyEdges(Image, Edges, 100, 399);
+    AssertCannyEdges('high 399', Edges, csEdge);
+    CannyEdges(Image, Edges, 100, 400);
+    AssertCannyEdges('high 400 is not > 400', Edges, csNone);
+    CannyEdges(Image, Edges, 399, 10);
+    AssertCannyEdges('swapped thresholds', Edges, csEdge);
+    CannyEdges(Image, Edges, 100, 399, true);
+    AssertCannyEdges('L2 400^2 > 399^2', Edges, csEdge);
+    CannyEdges(Image, Edges, 100, 400, true);
+    AssertCannyEdges('L2 400^2 is not > 400^2', Edges, csNone);
+    // RGB: the step only in the blue channel; the strongest channel wins.
+    Image.ReSize(8, 6, 3);
+    Image.Fill(0);
+    for Y := 0 to 5 do
+      for X := 4 to 7 do
+      begin
+        Image[X, Y, 0] := 5;
+        Image[X, Y, 2] := 100;
+      end;
+    CannyEdges(Image, Edges, 100, 200, false, 3);
+    AssertEquals('dest depth', 3, Edges.Depth);
+    AssertCannyEdges('RGB', Edges, csEdge);
+    // Dest may be Source.
+    CannyEdges(Image, Image, 100, 200);
+    AssertCannyEdges('in place', Image, csEdge);
+  finally
+    Edges.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestCannyEdgesSquare;
+const
+  // L1 magnitudes / 100 (rows mirror about 3.5):
+  //   0 2 4 4 4 4 2 0 / 0 4 6 4 4 6 4 0 / 0 4 4 0 0 4 4 0
+  // NMS ties keep the left / upper pixel of each pair, so the ring is not
+  // mirror-symmetric, as in cv2.
+  csEdges: array[0..7] of string = (
+    '........',
+    '...##...',
+    '..#..#..',
+    '.#...#..',
+    '.#...#..',
+    '..####..',
+    '........',
+    '........');
+var
+  Image, Edges: TNNetVolume;
+  X, Y: integer;
+begin
+  Image := TNNetVolume.Create(8, 8, 1);
+  Edges := TNNetVolume.Create;
+  try
+    Image.Fill(0);
+    for Y := 2 to 5 do
+      for X := 2 to 5 do Image[X, Y, 0] := 100;
+    CannyEdges(Image, Edges, 100, 200);
+    AssertCannyEdges('square', Edges, csEdges);
+  finally
+    Edges.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestCannyEdgesHysteresis;
+const
+  // Step at X = 4 of height 100 in rows 0..4 and 30 in rows 5..9: the upper
+  // rows (400) and the horizontal step (280, 400, 540) are strong; rows 6..9
+  // (120) are weak and join through (4,5).
+  csLinked: array[0..9] of string = (
+    '...#......',
+    '...#......',
+    '...#......',
+    '...#......',
+    '....######',
+    '....#.....',
+    '...#......',
+    '...#......',
+    '...#......',
+    '...#......');
+  csNone: array[0..5] of string = ('........', '........', '........',
+    '........', '........', '........');
+  csWeakAsStrong: array[0..5] of string = ('...#....', '...#....',
+    '...#....', '...#....', '...#....', '...#....');
+var
+  Image, Edges: TNNetVolume;
+  X, Y: integer;
+begin
+  Image := TNNetVolume.Create(10, 10, 1);
+  Edges := TNNetVolume.Create;
+  try
+    Image.Fill(0);
+    for Y := 0 to 9 do
+      for X := 4 to 9 do
+        if Y <= 4 then Image[X, Y, 0] := 100
+        else Image[X, Y, 0] := 30;
+    CannyEdges(Image, Edges, 100, 200);
+    AssertCannyEdges('linked', Edges, csLinked);
+    // No pixel above 540: nothing seeds the hysteresis.
+    CannyEdges(Image, Edges, 100, 540);
+    AssertEquals('no strong pixel', 0, Edges.GetSum(), 0);
+    // An isolated weak step (|dx| = 120).
+    Image.ReSize(8, 6, 1);
+    Image.Fill(0);
+    for Y := 0 to 5 do
+      for X := 4 to 7 do Image[X, Y, 0] := 30;
+    CannyEdges(Image, Edges, 100, 200);
+    AssertCannyEdges('isolated weak', Edges, csNone);
+    CannyEdges(Image, Edges, 100, 119);
+    AssertCannyEdges('weak above high', Edges, csWeakAsStrong);
+    CannyEdges(Image, Edges, 120, 200);
+    AssertCannyEdges('120 is not > low 120', Edges, csNone);
+  finally
+    Edges.Free;
+    Image.Free;
   end;
 end;
 

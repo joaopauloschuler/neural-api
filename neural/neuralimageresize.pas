@@ -39,6 +39,12 @@ procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
 // GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
 
+// cv2.Canny(Source, Low, High, apertureSize=3, L2gradient) of a 0..255 image
+// (no blur; strongest channel per pixel): Dest (W,H,DestDepth) holds 0 or 255.
+procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,
+  HighThreshold: TNeuralFloat; L2Gradient: boolean = false;
+  DestDepth: integer = 1);
+
 // Canvas := Image with Left/Top/Right/Bottom pixels added on each side, each
 // new pixel copying the nearest edge pixel (torch F.pad mode="replicate").
 procedure PadImageClampToEdge(Image: TNNetVolume; Left, Top, Right,
@@ -548,6 +554,203 @@ begin
         Dest.FData[PixelPos + Channel] := Sum;
       end;
     end;
+end;
+
+procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,
+  HighThreshold: TNeuralFloat; L2Gradient: boolean; DestDepth: integer);
+const
+  // cv2's fixed-point tangent tests: tan(22.5) * 2^15 and tan(67.5) * 2^15.
+  csTan22Fixed = 13573;
+  csTan67Fixed = 13573 + 65536;
+  csFixedOne = 32768;
+  csMapCandidate = 0;
+  csMapNotEdge = 1;
+  csMapEdge = 2;
+var
+  // Gradient magnitudes framed by a one-pixel zero border, row stride PaddedX.
+  Magnitudes: array of TNeuralFloat;
+  // Sobel dx and dy of each pixel's strongest channel, row stride SizeX.
+  GradientX, GradientY: array of TNeuralFloat;
+  // Padded like Magnitudes; the border stays csMapNotEdge.
+  EdgeMap: array of byte;
+  // Padded positions of edge pixels whose neighbours are still unvisited.
+  Stack: array of integer;
+  NeighbourOffsets: array[0..7] of integer;
+  SizeX, SizeY, Depth, MaxX, MaxY, MaxChannel, PaddedX, RowStride: integer;
+  X, Y, Channel, RowAbove, RowHere, RowBelow, ColumnLeft, ColumnRight,
+    ColumnHere, GradientPos, PaddedPos, StackCount, NeighbourPos,
+    NeighbourIndex, DiagonalStep, PixelPos, MaxDestChannel: integer;
+  ChannelGradientX, ChannelGradientY, ChannelMagnitude, BestMagnitude,
+    Magnitude: TNeuralFloat;
+  LowFloor, HighFloor, Swap, AbsGradientX, ScaledAbsGradientY: double;
+  IsMaximum: boolean;
+  EdgeValue: TNeuralFloat;
+begin
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  Depth := Source.Depth;
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  MaxChannel := Depth - 1;
+  RowStride := SizeX * Depth;
+  PaddedX := SizeX + 2;
+  LowFloor := LowThreshold;
+  HighFloor := HighThreshold;
+  if LowFloor > HighFloor then
+  begin
+    Swap := LowFloor;
+    LowFloor := HighFloor;
+    HighFloor := Swap;
+  end;
+  if L2Gradient then
+  begin
+    LowFloor := Min(32767.0, LowFloor);
+    HighFloor := Min(32767.0, HighFloor);
+    if LowFloor > 0 then LowFloor := LowFloor * LowFloor;
+    if HighFloor > 0 then HighFloor := HighFloor * HighFloor;
+  end;
+  LowFloor := Floor(LowFloor);
+  HighFloor := Floor(HighFloor);
+  SetLength(Magnitudes, PaddedX * (SizeY + 2));
+  FillChar(Magnitudes[0], Length(Magnitudes) * SizeOf(TNeuralFloat), 0);
+  SetLength(GradientX, SizeX * SizeY);
+  SetLength(GradientY, SizeX * SizeY);
+  // 3x3 Sobel with replicated borders, as cv2.Canny calls cv::Sobel.
+  GradientPos := 0;
+  for Y := 0 to MaxY do
+  begin
+    RowAbove := Max(Y - 1, 0) * RowStride;
+    RowHere := Y * RowStride;
+    RowBelow := Min(Y + 1, MaxY) * RowStride;
+    PaddedPos := (Y + 1) * PaddedX + 1;
+    for X := 0 to MaxX do
+    begin
+      ColumnLeft := Max(X - 1, 0) * Depth;
+      ColumnHere := X * Depth;
+      ColumnRight := Min(X + 1, MaxX) * Depth;
+      BestMagnitude := -1;
+      for Channel := 0 to MaxChannel do
+      begin
+        ChannelGradientX :=
+          (Source.FData[RowAbove + ColumnRight + Channel] -
+           Source.FData[RowAbove + ColumnLeft + Channel]) +
+          2 * (Source.FData[RowHere + ColumnRight + Channel] -
+           Source.FData[RowHere + ColumnLeft + Channel]) +
+          (Source.FData[RowBelow + ColumnRight + Channel] -
+           Source.FData[RowBelow + ColumnLeft + Channel]);
+        ChannelGradientY :=
+          (Source.FData[RowBelow + ColumnLeft + Channel] +
+           2 * Source.FData[RowBelow + ColumnHere + Channel] +
+           Source.FData[RowBelow + ColumnRight + Channel]) -
+          (Source.FData[RowAbove + ColumnLeft + Channel] +
+           2 * Source.FData[RowAbove + ColumnHere + Channel] +
+           Source.FData[RowAbove + ColumnRight + Channel]);
+        if L2Gradient then
+          ChannelMagnitude := ChannelGradientX * ChannelGradientX +
+            ChannelGradientY * ChannelGradientY
+        else
+          ChannelMagnitude := Abs(ChannelGradientX) + Abs(ChannelGradientY);
+        // cv2 keeps the first channel on a tie.
+        if ChannelMagnitude > BestMagnitude then
+        begin
+          BestMagnitude := ChannelMagnitude;
+          GradientX[GradientPos] := ChannelGradientX;
+          GradientY[GradientPos] := ChannelGradientY;
+        end;
+      end;
+      Magnitudes[PaddedPos] := BestMagnitude;
+      Inc(GradientPos);
+      Inc(PaddedPos);
+    end;
+  end;
+  // Non-maximum suppression and the double threshold; strong pixels seed Stack.
+  SetLength(EdgeMap, Length(Magnitudes));
+  FillChar(EdgeMap[0], Length(EdgeMap), csMapNotEdge);
+  SetLength(Stack, SizeX * SizeY);
+  StackCount := 0;
+  GradientPos := 0;
+  for Y := 0 to MaxY do
+  begin
+    PaddedPos := (Y + 1) * PaddedX + 1;
+    for X := 0 to MaxX do
+    begin
+      Magnitude := Magnitudes[PaddedPos];
+      if Magnitude > LowFloor then
+      begin
+        AbsGradientX := Abs(GradientX[GradientPos]);
+        ScaledAbsGradientY := Abs(GradientY[GradientPos]) * csFixedOne;
+        if ScaledAbsGradientY < AbsGradientX * csTan22Fixed then
+          IsMaximum := (Magnitude > Magnitudes[PaddedPos - 1]) and
+            (Magnitude >= Magnitudes[PaddedPos + 1])
+        else if ScaledAbsGradientY > AbsGradientX * csTan67Fixed then
+          IsMaximum := (Magnitude > Magnitudes[PaddedPos - PaddedX]) and
+            (Magnitude >= Magnitudes[PaddedPos + PaddedX])
+        else
+        begin
+          if (GradientX[GradientPos] < 0) <> (GradientY[GradientPos] < 0) then
+            DiagonalStep := -1
+          else
+            DiagonalStep := 1;
+          IsMaximum :=
+            (Magnitude > Magnitudes[PaddedPos - PaddedX - DiagonalStep]) and
+            (Magnitude > Magnitudes[PaddedPos + PaddedX + DiagonalStep]);
+        end;
+        if IsMaximum then
+        begin
+          if Magnitude > HighFloor then
+          begin
+            EdgeMap[PaddedPos] := csMapEdge;
+            Stack[StackCount] := PaddedPos;
+            Inc(StackCount);
+          end
+          else
+            EdgeMap[PaddedPos] := csMapCandidate;
+        end;
+      end;
+      Inc(GradientPos);
+      Inc(PaddedPos);
+    end;
+  end;
+  // Hysteresis: grow the strong edges through 8-connected candidates.
+  NeighbourOffsets[0] := -PaddedX - 1;
+  NeighbourOffsets[1] := -PaddedX;
+  NeighbourOffsets[2] := -PaddedX + 1;
+  NeighbourOffsets[3] := -1;
+  NeighbourOffsets[4] := 1;
+  NeighbourOffsets[5] := PaddedX - 1;
+  NeighbourOffsets[6] := PaddedX;
+  NeighbourOffsets[7] := PaddedX + 1;
+  while StackCount > 0 do
+  begin
+    Dec(StackCount);
+    PaddedPos := Stack[StackCount];
+    for NeighbourIndex := 0 to 7 do
+    begin
+      NeighbourPos := PaddedPos + NeighbourOffsets[NeighbourIndex];
+      if EdgeMap[NeighbourPos] = csMapCandidate then
+      begin
+        EdgeMap[NeighbourPos] := csMapEdge;
+        Stack[StackCount] := NeighbourPos;
+        Inc(StackCount);
+      end;
+    end;
+  end;
+  Dest.ReSize(SizeX, SizeY, DestDepth);
+  MaxDestChannel := DestDepth - 1;
+  PixelPos := 0;
+  for Y := 0 to MaxY do
+  begin
+    PaddedPos := (Y + 1) * PaddedX + 1;
+    for X := 0 to MaxX do
+    begin
+      if EdgeMap[PaddedPos] = csMapEdge then EdgeValue := 255
+      else EdgeValue := 0;
+      for Channel := 0 to MaxDestChannel do
+        Dest.FData[PixelPos + Channel] := EdgeValue;
+      Inc(PixelPos, DestDepth);
+      Inc(PaddedPos);
+    end;
+  end;
 end;
 
 // The canvas rectangle the outpaint mask keeps: the image without an Overlap
