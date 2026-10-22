@@ -19033,9 +19033,9 @@ type
     procedure ComputeCPUGemm();
     // Adds pProducts (input positions pFirstPos.. pFirstPos+pPosCount-1, one
     // NumNeurons*taps row each, product of out-channel Oc and tap K at
-    // Oc*pNeuronStride + K*pTapStride) into FOutputRaw. Coded by Claude (AI).
+    // Oc*taps + K) into FOutputRaw. Coded by Claude (AI).
     procedure ScatterTapProducts(pProducts: TNNetVolume;
-      pFirstPos, pPosCount, pTapStride, pNeuronStride: integer);
+      pFirstPos, pPosCount: integer);
     // FOutputRaw += bias, FOutput := activation(FOutputRaw). Coded by Claude (AI).
     procedure ApplyBiasAndActivation();
     {$IFDEF OpenCL}
@@ -113048,17 +113048,16 @@ begin
     // floats): product (position, Oc, K) lands at Oc*TapsPerNeuron + K.
     FGemmChunkProducts.DotProductsTiled(NumProducts, ChunkPositions, InDepth,
       FConcatedWeights, FGemmChunkIn, {TileSizeA}16, {TileSizeB}ChunkPositions);
-    ScatterTapProducts(FGemmChunkProducts, FirstPos, ChunkPositions,
-      {TapStride}1, {NeuronStride}TapsPerNeuron);
+    ScatterTapProducts(FGemmChunkProducts, FirstPos, ChunkPositions);
     Inc(FirstPos, ChunkPositions);
   end;
   ApplyBiasAndActivation();
 end;
 
 procedure TNNetDeconvolution.ScatterTapProducts(pProducts: TNNetVolume;
-  pFirstPos, pPosCount, pTapStride, pNeuronStride: integer);
+  pFirstPos, pPosCount: integer);
 var
-  InSizeX, OutSizeX, OutSizeY, NumProducts: integer;
+  InSizeX, OutSizeX, OutSizeY, NumProducts, TapsPerNeuron: integer;
   MaxPos, MaxNeuronPos, MaxFeatureXPos, MaxFeatureYPos: integer;
   PosCnt, InX, InY, FeatureX, FeatureY, OutX, OutY, NeuronCnt: integer;
   RowStart, TapStart, ProductPos, OutBase, FirstOutX, FirstOutY: integer;
@@ -113066,7 +113065,8 @@ begin
   InSizeX := FPrevLayer.FOutput.SizeX;
   OutSizeX := FOutputRaw.SizeX;
   OutSizeY := FOutputRaw.SizeY;
-  NumProducts := FNeurons.Count * FFeatureSizeX * FFeatureSizeY;
+  TapsPerNeuron := FFeatureSizeX * FFeatureSizeY;
+  NumProducts := FNeurons.Count * TapsPerNeuron;
   MaxPos := pFirstPos + pPosCount - 1;
   MaxNeuronPos := FNeurons.Count - 1;
   MaxFeatureXPos := FFeatureSizeX - 1;
@@ -113086,21 +113086,14 @@ begin
       begin
         OutX := FirstOutX + FeatureX;
         if (OutX < 0) or (OutX >= OutSizeX) then continue;
-        TapStart := RowStart + (FeatureY * FFeatureSizeX + FeatureX) * pTapStride;
+        TapStart := RowStart + FeatureY * FFeatureSizeX + FeatureX;
         OutBase := FOutputRaw.GetRawPos(OutX, OutY);
-        if pNeuronStride = 1 then
-          // #13: the out-channel run is a contiguous accumulate.
-          TNNetVolume.Add(FOutputRaw.GetRawPtr(OutBase),
-            pProducts.GetRawPtr(TapStart), FNeurons.Count)
-        else
+        ProductPos := TapStart;
+        for NeuronCnt := 0 to MaxNeuronPos do
         begin
-          ProductPos := TapStart;
-          for NeuronCnt := 0 to MaxNeuronPos do
-          begin
-            FOutputRaw.FData[OutBase + NeuronCnt] :=
-              FOutputRaw.FData[OutBase + NeuronCnt] + pProducts.FData[ProductPos];
-            Inc(ProductPos, pNeuronStride);
-          end;
+          FOutputRaw.FData[OutBase + NeuronCnt] :=
+            FOutputRaw.FData[OutBase + NeuronCnt] + pProducts.FData[ProductPos];
+          Inc(ProductPos, TapsPerNeuron);
         end;
       end;
     end;
