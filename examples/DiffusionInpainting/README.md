@@ -52,10 +52,17 @@ lazbuild -B DiffusionInpainting.lpi
 | `--prompt`, `--negative` | prompt and negative prompt |
 | `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
 | `--strength S` | 0 < S <= 1 (default 1): runs `int(steps * S)` steps from the re-noised image latents |
-| `--width N`, `--height N` | output size (default: the checkpoint's, 512 for SD 1.5) |
+| `--width N`, `--height N` | output size (default: the `--image` size rounded down to a multiple of the VAE factor, 8 for SD 1.5; without `--image` the checkpoint's, 512 for SD 1.5) |
 | `--out PNG` | output file (default `inpainted.png`) |
 | `--int8` | UNet and text encoder weights in int8 |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
+
+The output takes the `--image` size as `--init-image` does in
+`examples/StableDiffusion` (`TStableDiffusionImageConditioner.ImageSizeFor`): a
+1000x750 photo gives a 1000x744 image. `--width` / `--height` override either
+side and resize the image and the mask to it. diffusers'
+`StableDiffusionInpaintPipeline` defaults to the checkpoint size instead; pass
+`--width 512 --height 512` for its default on SD 1.5.
 
 With no `--model` the run uses a random-weight pico folder: it checks wiring
 and I/O, not image quality.

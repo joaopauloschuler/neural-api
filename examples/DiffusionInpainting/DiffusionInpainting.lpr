@@ -40,7 +40,8 @@ type
   TDiffusionInpaintingOptions = record
     ModelFolder, ImageFile, MaskFile, Prompt, NegativePrompt,
       OutputFile: string;
-    // A side < 1: the checkpoint default (512 for SD 1.5).
+    // A side < 1: the --image side rounded down to a VAE-factor multiple, or
+    // without --image the checkpoint default (512 for SD 1.5).
     Steps, ImageWidth, ImageHeight: integer;
     GuidanceScale, Strength: double;
     Seed: cardinal;
@@ -87,8 +88,10 @@ begin
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
   WriteLn('  --strength S      0 < S <= 1: how far the image is re-noised; ',
     'runs int(steps * S) steps (default 1)');
-  WriteLn('  --width N         image width (default: the checkpoint''s)');
-  WriteLn('  --height N        image height (default: the checkpoint''s)');
+  WriteLn('  --width N         image width (default: the --image width, else ',
+    'the checkpoint''s)');
+  WriteLn('  --height N        image height (default: the --image height, else ',
+    'the checkpoint''s)');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --out PNG         output file (default inpainted.png)');
   WriteLn('  --int8            UNet and text encoder weights in int8');
@@ -235,15 +238,26 @@ begin
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
     end;
-    ImageWidth := Opt.ImageWidth;
-    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
-    ImageHeight := Opt.ImageHeight;
-    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
-    if Opt.ImageFile <> '' then LoadOrDie(Opt.ImageFile, SourceImage)
-    else DrawColorRamp(SourceImage, ImageWidth, ImageHeight);
+    if Opt.ImageFile <> '' then
+    begin
+      LoadOrDie(Opt.ImageFile, SourceImage);
+      Inpainter.SetImage(SourceImage);
+      Inpainter.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    end
+    else
+    begin
+      ImageWidth := Pipeline.DefaultImageSize;
+      ImageHeight := Pipeline.DefaultImageSize;
+    end;
+    if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
+    if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
+    if Opt.ImageFile = '' then
+    begin
+      DrawColorRamp(SourceImage, ImageWidth, ImageHeight);
+      Inpainter.SetImage(SourceImage);
+    end;
     if Opt.MaskFile <> '' then LoadOrDie(Opt.MaskFile, Mask)
     else DrawRightHalfMask(Mask, ImageWidth, ImageHeight);
-    Inpainter.SetImage(SourceImage);
     Inpainter.SetMask(Mask);
     Inpainter.Strength := Opt.Strength;
     Pipeline.Conditioner := Inpainter;

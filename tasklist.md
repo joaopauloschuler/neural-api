@@ -726,8 +726,8 @@ rather than acted on.
               confirm the committed ControlNet / T2I / inpaint fixtures come out
               byte-identical after the --nonsquare-only / --inpaint-strength-only
               / --ip-adapter-only refactors;
-              (5) examples/DiffusionInpainting could take its output size from the
-              image through ImageSizeFor, as --init-image does;
+              (5) DONE: examples/DiffusionInpainting takes its output size from
+              the image through ImageSizeFor, as --init-image does;
               (6) img2img / inpaint parity covers only images already at the
               output size: add a fixture whose sides are not a VAE-factor
               multiple (diffusers resizes a PIL image with lanczos after uint8
