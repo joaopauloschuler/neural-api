@@ -597,8 +597,23 @@ rather than acted on.
                   backend (torchvision is not installed in ~/x).
           - [x] --depth-image loads 8 bits per channel: DONE, it loads with
                 LoadImageFromFileIntoVolume pFullPrecision (16-bit PNG kept).
-        - [ ] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
-              stabilityai/stable-diffusion-x4-upscaler) is not covered.
+        - [x] The SD 2.x x4 upscaler (StableDiffusionUpscalePipeline,
+              stabilityai/stable-diffusion-x4-upscaler): DONE,
+              TStableDiffusionUpscaler + BuildSDUNet num_class_embeds /
+              only_cross_attention, `--upscale-image` / `--noise-level`
+              (TestStableDiffusionUpscalerParity, pico only).
+          - [ ] Real stabilityai/stable-diffusion-x4-upscaler run on the
+                user's GPU box (e.g. 128x128 -> 512x512, `--gpu`): check its
+                unet/vae/scheduler configs load (the pico folder mirrors the
+                layout from memory of the real configs), time it, and compare
+                the image with diffusers.
+          - [ ] The real UNet ships as fp16 weights in many mirrors; the F16
+                loader item below applies.
+          - [ ] OpenCL parity for the upscaler (no TestStableDiffusionUpscaler
+                OpenCL variant yet; the class-label TNNetEmbedding runs on the
+                CPU by design).
+          - [ ] diffusers' upscale pipeline takes a batch of images and
+                num_images_per_prompt; the conditioner takes one image.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
             pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
             the pipeline refuses addition_embed_type "text_time" today.

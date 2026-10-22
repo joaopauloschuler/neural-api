@@ -1,7 +1,7 @@
 # StableDiffusion
 
-Text-to-image, image-to-image, depth-to-image and InstructPix2Pix image
-editing with a diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
+Text-to-image, image-to-image, depth-to-image, InstructPix2Pix image
+editing and x4 upscaling with a diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
 
 One `Generate` call:
 
@@ -258,6 +258,52 @@ replayed step noise) and DDIM at guidance 7.5 / image guidance 1.5, and at
 1 / 1 (`TestStableDiffusionInstructPix2PixParity`). No real checkpoint has
 been run yet.
 
+## x4 upscaler (`--upscale-image`)
+
+`--upscale-image PNG [--noise-level N]` upscales an image 4x with an x4
+upscaler folder such as `stabilityai/stable-diffusion-x4-upscaler`, as
+diffusers `StableDiffusionUpscalePipeline` (`TStableDiffusionUpscaler`). The
+prompt describes the image; it steers the detail the UNet adds.
+
+* The VAE has 3 blocks (factor 4, `scaling_factor` 0.08333), so the latents
+  have the size of the low-res image and the decoded image is 4 times larger.
+  The image sides are first rounded down to a multiple of 4 with PIL bicubic,
+  as diffusers' `VaeImageProcessor(resample="bicubic")`; a 128x128 image
+  gives 512x512.
+* `low_res_scheduler/` (a DDPM schedule) noises the low-res image to
+  `--noise-level` N (default 20, at most the `max_noise_level` 350 of
+  `model_index.json`). More noise lets the UNet invent more detail and keep
+  less of the input.
+* The UNet takes 7 channels: the latents and the noised RGB image. N is also
+  its class label: `num_class_embeds` 1000 adds one learned row per noise
+  level into the timestep embedding (`BuildSDUNet` reads `num_class_embeds`).
+  A block with `only_cross_attention` in the UNet config builds its first
+  attention over the text tokens instead of over every pixel.
+* Both passes of classifier-free guidance see the same noised image. The
+  defaults follow diffusers: 75 steps and guidance 9.0; the sampler and the
+  prediction type come from `scheduler/` as usual. `--width`, `--height` and `--size`
+  are refused (the image sets the size); `--init-image` and `--edit-image`
+  cannot be combined with it.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-x4-upscaler \
+  --upscale-image cat_128.png --prompt "a white cat" --output cat_512.png
+StableDiffusion --model ~/models/stable-diffusion-x4-upscaler \
+  --upscale-image cat_128.png --prompt "a white cat" --noise-level 50 \
+  --steps 30 --gpu
+```
+
+Tested against diffusers float64 on the pico folder
+`tests/fixtures/tiny_sd_x4_upscaler` (`tools/make_pico_sd_upscale_fixture.py`:
+a 7-channel UNet with `num_class_embeds` and `only_cross_attention`, a 3-block
+VAE, the `tiny_sd2` text encoder): DDIM on a 12x8 image at noise level 20,
+Euler on a 13x10 image (resized to 12x8) at noise level 150, and the first
+case again with the components kept; the latents after each step match to
+1e-5 and the 48x32 image to 4e-6 (`TestStableDiffusionUpscalerParity`; the
+UNet alone in `TestSDUNetClassEmbedOnlyCrossParity`). No real checkpoint has
+been run yet. The UNet runs at the low-res size: a 128x128 input is a
+128x128 latent grid (SD 1.5 at 512x512 runs 64x64), so plan on a GPU.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -341,6 +387,7 @@ LCM-LoRA or LCM-distilled checkpoint has been run yet.
 | --- | --- |
 | Stable Diffusion 1.x (e.g. `runwayml/stable-diffusion-v1-5`) | coded; pico parity against diffusers; no real checkpoint run yet |
 | Stable Diffusion 2.x (e.g. `stabilityai/stable-diffusion-2-1`, 768x768, `v_prediction`) | coded; pico parity against diffusers only; no real checkpoint run yet, so not supported |
+| Stable Diffusion x4 upscaler (`stabilityai/stable-diffusion-x4-upscaler`) | coded; pico parity against diffusers only; no real checkpoint run yet, so not supported |
 | SDXL | not supported (the pipeline refuses `addition_embed_type` `text_time`) |
 
 What SD 2.x changes, and how the pipeline reads it from the folder:
@@ -462,6 +509,12 @@ StableDiffusion [--model DIR] [options]
                     output takes its size (rounded down to the VAE factor)
   --image-guidance S how closely --edit-image is kept (default 1.5; < 1 turns all
                     guidance off)
+  --upscale-image PNG x4 upscaler: upscale this image (needs a 7-channel UNet
+                    folder, e.g. stabilityai/stable-diffusion-x4-upscaler); the
+                    output is VAE factor x its size (sides rounded down to the
+                    factor); default 75 steps, guidance 9.0
+  --noise-level N   noise added to --upscale-image, 0..max_noise_level (350;
+                    default 20); more noise lets the UNet invent more detail
   --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales S1, S2 and
                     backbone scales B1, B2 of the first two up blocks; presets
                     sd15 (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)

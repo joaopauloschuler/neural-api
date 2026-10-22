@@ -40,6 +40,9 @@ brighter = nearer).
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
 --ip-adapter combines with either (TStableDiffusionMultiConditioner).
+--upscale-image PNG [--noise-level N] upscales the image 4x with an x4
+upscaler folder such as stabilityai/stable-diffusion-x4-upscaler (diffusers
+StableDiffusionUpscalePipeline; default 75 steps, guidance 9.0).
 --freeu s1,s2,b1,b2 (or the paper's presets sd15 / sd21) turns on FreeU, as
 diffusers enable_freeu: no extra UNet pass.
 
@@ -84,6 +87,9 @@ type
     // --edit-image ('' for none) and its --image-guidance (< 0: default).
     EditImageFile: string;
     ImageGuidanceScale: double;
+    // --upscale-image ('' for none) and its --noise-level (< 0: default).
+    UpscaleImageFile: string;
+    NoiseLevel: integer;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
     // --lora files and their scales, in load order.
@@ -276,6 +282,17 @@ begin
   WriteLn('  --image-guidance S how closely --edit-image is kept (default 1.5; ',
     '< 1 turns all');
   WriteLn('                    guidance off)');
+  WriteLn('  --upscale-image PNG x4 upscaler: upscale this image (needs a ',
+    '7-channel UNet folder,');
+  WriteLn('                    e.g. stabilityai/stable-diffusion-x4-upscaler); ',
+    'the output is');
+  WriteLn('                    VAE factor x its size (sides rounded down to the ',
+    'factor);');
+  WriteLn('                    default 75 steps, guidance 9.0');
+  WriteLn('  --noise-level N   noise added to --upscale-image, 0..max_noise_level ',
+    '(350;');
+  WriteLn('                    default 20); more noise lets the UNet invent ',
+    'more detail');
   WriteLn('  --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales ',
     'S1, S2 and backbone');
   WriteLn('                    scales B1, B2 of the first two up blocks; ',
@@ -360,6 +377,8 @@ begin
   Opt.Strength := -1;
   Opt.EditImageFile := '';
   Opt.ImageGuidanceScale := -1;
+  Opt.UpscaleImageFile := '';
+  Opt.NoiseLevel := -1;
   Opt.SamplerName := 'auto';
   Opt.Steps := -1;
   Opt.ImageWidth := 0;
@@ -425,6 +444,8 @@ begin
     else if Arg = '--edit-image' then Opt.EditImageFile := NextArg()
     else if Arg = '--image-guidance' then
       Opt.ImageGuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--upscale-image' then Opt.UpscaleImageFile := NextArg()
+    else if Arg = '--noise-level' then Opt.NoiseLevel := StrToInt(NextArg())
     else if Arg = '--freeu' then
     begin
       ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
@@ -463,6 +484,16 @@ begin
   if (Opt.EditImageFile <> '') and (Opt.InitImageFile <> '') then
     raise Exception.Create('--edit-image cannot be combined with ' +
       '--init-image');
+  if (Opt.NoiseLevel >= 0) and (Opt.UpscaleImageFile = '') then
+    raise Exception.Create('--noise-level needs --upscale-image');
+  if (Opt.UpscaleImageFile <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.EditImageFile <> '')) then
+    raise Exception.Create('--upscale-image cannot be combined with ' +
+      '--init-image or --edit-image');
+  if (Opt.UpscaleImageFile <> '') and ((Opt.ImageWidth >= 1) or
+    (Opt.ImageHeight >= 1)) then
+    raise Exception.Create('--upscale-image sets the output size; drop ' +
+      '--width / --height / --size');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
@@ -501,13 +532,14 @@ var
   Img2Img: TStableDiffusionImg2Img;
   Depth2Img: TStableDiffusionDepth2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
+  Upscaler: TStableDiffusionUpscaler;
   ImageConditioner: TStableDiffusionImageConditioner;
   Image, PromptEmbeds: TNNetVolume;
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
   StepCount, Img2ImgStepCount: integer;
-  IsDepthUNet: boolean;
+  IsDepthUNet, IsUpscalerUNet: boolean;
   GuidanceScale: double;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
@@ -523,6 +555,7 @@ begin
   Img2Img := nil;
   Depth2Img := nil;
   InstructPix2Pix := nil;
+  Upscaler := nil;
   ImageConditioner := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
@@ -547,6 +580,12 @@ begin
     if IsDepthUNet and (Opt.InitImageFile = '') then
       raise Exception.Create('this is a depth-to-image UNet: give ' +
         '--init-image (and optionally --depth-image)');
+    // An x4 upscaler UNet takes latents | the noised low-res RGB image.
+    IsUpscalerUNet := Pipeline.UNetConfig.InChannels =
+      Pipeline.UNetConfig.OutChannels + 3;
+    if IsUpscalerUNet and (Opt.UpscaleImageFile = '') then
+      raise Exception.Create('this is an x4 upscaler UNet: give ' +
+        '--upscale-image');
     if IsDepthUNet or (Opt.DepthImageFile <> '') then
     begin
       Depth2Img := TStableDiffusionDepth2Img.Create();
@@ -574,6 +613,13 @@ begin
         InstructPix2Pix.ImageGuidanceScale := Opt.ImageGuidanceScale;
       ImageConditioner := InstructPix2Pix;
       SourceImageFile := Opt.EditImageFile;
+    end
+    else if Opt.UpscaleImageFile <> '' then
+    begin
+      Upscaler := TStableDiffusionUpscaler.Create();
+      if Opt.NoiseLevel >= 0 then Upscaler.NoiseLevel := Opt.NoiseLevel;
+      ImageConditioner := Upscaler;
+      SourceImageFile := Opt.UpscaleImageFile;
     end;
     if Assigned(ImageConditioner) then
     begin
@@ -598,6 +644,12 @@ begin
       if (GuidanceScale < 0) and (Pipeline.UNetConfig.TimeCondProjDim > 0) then
         GuidanceScale := 8.5;
       if GuidanceScale < 0 then GuidanceScale := 1.0;
+    end
+    else if Assigned(Upscaler) then
+    begin
+      // diffusers StableDiffusionUpscalePipeline's defaults.
+      if StepCount < 1 then StepCount := 75;
+      if GuidanceScale < 0 then GuidanceScale := 9.0;
     end
     else
     begin
@@ -672,6 +724,10 @@ begin
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',
         [Opt.EditImageFile, Image.SizeX, Image.SizeY,
          InstructPix2Pix.ImageGuidanceScale]));
+    if Assigned(Upscaler) then
+      WriteLn(Format('Upscale image: %s (%dx%d), noise level %d',
+        [Opt.UpscaleImageFile, Image.SizeX, Image.SizeY,
+         Upscaler.NoiseLevel]));
     if Opt.IPAdapterFile <> '' then
     begin
       IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
