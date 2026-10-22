@@ -2049,10 +2049,16 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 - [ ] Audit after 0ea67b17 (gather-copy layers now share OpenCL outputs by
       liveness): pipelines that enable output sharing (Restormer and other
       neuralpretrained.pas pipelines) now also share TNNetPad / Crop /
-      Transpose / SpaceToDepth / upsample outputs. Find any host code that
-      reads one of those intermediate outputs after the forward and mark that
-      layer `OutputPinned`; then a real Restormer / Qwen-Image VAE run on the
-      GPU box against the parent commit (output and time).
+      Transpose / SpaceToDepth / upsample outputs.
+  - [X] Code audit: no host reader of an unpinned intermediate output. The
+        sharing nets (Kokoro stage A front/block/tail, Qwen-Image VAE decoder,
+        Real-ESRGAN via PaddedTiledNetCompute, examples/Restormer) read only
+        the last layer; first-layer reads are shape-only. SuperPoint never
+        enables sharing, and its descriptor head (TNNetL2Normalize) has no
+        in-net reader, so the planner pins it anyway. Contract test:
+        TestGatherCopyHostTapsShareOutputsByLiveness (OpenCL suite).
+  - [ ] A real Restormer / Qwen-Image VAE run on the GPU box against the
+        parent commit (output and time).
 - [ ] Follow-ups of the `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device
       forward (2ebe172b; `cai_topk_gate`) plus the device slot-map build
       (`cai_moe_build_slot_map`): router -> gate|up -> down has no host hop per

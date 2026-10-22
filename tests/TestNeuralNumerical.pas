@@ -641,6 +641,9 @@ type
     // (upsample, space/depth, pixel shuffle, flip, pad, crop): they reuse each
     // other's buffers and the output equals the unshared and the CPU nets.
     procedure TestGatherCopyShareOutputsByLiveness;
+    // SuperPoint-shaped net with a pinned PadXY host tap: under sharing, the tap
+    // and the unread descriptor head keep their own buffers and outputs.
+    procedure TestGatherCopyHostTapsShareOutputsByLiveness;
     // ForceOpenCL off: TNNetInput -> Pad -> ChannelShuffle -> ExpandDims ->
     // Squeeze -> ExpandDims -> Squeeze -> Reshape -> Gather -> ReLU stays
     // resident; the ExpandDims/Squeeze/Reshape outputs are views.
@@ -79283,6 +79286,149 @@ begin
   finally
     OutCPU.Free;
     Input.Free;
+    NetOn.Free;
+    NetOff.Free;
+    NetCPU.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGatherCopyHostTapsShareOutputsByLiveness;
+{$IFDEF OpenCL}
+const
+  cTapIdx = 3;
+  cDescriptorIdx = 8;
+  cHostReadIdx: array[0..2] of integer = (cTapIdx, cDescriptorIdx, 13);
+var
+  NetCPU, NetOff, NetOn, NetUnpinned: TNNet;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ElementPos, MaxElementPos, PassPos, ReadPos, LayerIdx: integer;
+  MaxAbs, Diff: TNeuralFloat;
+
+  // SuperPoint (cell 2) with a PadXY -> Crop pair in the trunk; the score head
+  // branches off the encoder (layer 5) and ends in DepthToSpace.
+  function BuildNet(): TNNet;
+  var
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+    Encoder: TNNetLayer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(8, 6, 1));
+    Result.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1, 0));
+    Result.AddLayer(TNNetMaxPool.Create(2));                 // 4 x 3 x 8
+    Result.AddLayer(TNNetPadXY.Create(1, 1));                // 6 x 5 x 8, tap
+    Result.AddLayer(TNNetCrop.Create(1, 1, 4, 3));           // 4 x 3 x 8
+    Encoder := Result.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1, 0));
+    Result.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1, 0));
+    Result.AddLayer(TNNetConvolutionLinear.Create(6, 1, 0, 1, 0));
+    Result.AddLayer(TNNetL2Normalize.Create(0, 1e-24));      // descriptor head
+    Result.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1, 0), Encoder);
+    Result.AddLayer(TNNetConvolutionLinear.Create(5, 1, 0, 1, 0));
+    Result.AddLayer(TNNetPointwiseSoftMax.Create());
+    Result.AddLayer(TNNetSplitChannels.Create(0, 4));
+    Result.AddLayer(TNNetDepthToSpace.Create(2));            // 8 x 6 x 1
+    Result.SetTrainable(false, {pLowMemory=}false);
+    for LayerCnt := 0 to Result.GetLastLayerIdx() do
+    begin
+      for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.05 + 0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+      end;
+      Result.Layers[LayerCnt].FlushWeightCache();
+    end;
+  end;
+
+  procedure Arm(NN: TNNet; Share: boolean);
+  begin
+    NN.ShareOpenCLOutputsByLiveness := Share;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(true);
+  end;
+
+  function SharesBufferWithAnotherLayer(NN: TNNet; Idx: integer): boolean;
+  var
+    OtherIdx: integer;
+  begin
+    Result := false;
+    if not Assigned(NN.Layers[Idx].OpenCLOutputBuffer()) then exit;
+    for OtherIdx := 0 to NN.GetLastLayerIdx() do
+      if (OtherIdx <> Idx) and (NN.Layers[OtherIdx].OpenCLOutputBuffer() =
+        NN.Layers[Idx].OpenCLOutputBuffer()) then exit(true);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NetCPU := BuildNet();
+  NetOff := BuildNet();
+  NetOn := BuildNet();
+  NetUnpinned := BuildNet();
+  Input := TNNetVolume.Create(8, 6, 1);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.7 * Sin(ElementPos * 0.37) + 0.05;
+    NetCPU.Compute(Input);
+    Arm(NetOff, false);
+    NetOn.Layers[cTapIdx].OutputPinned := true;
+    Arm(NetOn, true);
+    Arm(NetUnpinned, true);
+    AssertTrue('the PadXY tap can share its OpenCL output',
+      NetOn.Layers[cTapIdx].CanShareOpenCLOutput());
+    AssertTrue('the DepthToSpace head can share its OpenCL output',
+      NetOn.GetLastLayer().CanShareOpenCLOutput());
+    AssertTrue('layers share OpenCL buffers',
+      NetOn.OpenCLSharedOutputLayerCount() > 0);
+    for PassPos := 0 to 1 do
+    begin
+      NetOff.Compute(Input);
+      NetOn.Compute(Input);
+      NetUnpinned.Compute(Input);
+      AssertTrue('unpinned, a later layer writes into the tap''s buffer',
+        SharesBufferWithAnotherLayer(NetUnpinned, cTapIdx));
+      for ReadPos := 0 to High(cHostReadIdx) do
+      begin
+        LayerIdx := cHostReadIdx[ReadPos];
+        AssertFalse('layer ' + IntToStr(LayerIdx) + ' ' +
+          NetOn.Layers[LayerIdx].ClassName + ' keeps a buffer of its own',
+          SharesBufferWithAnotherLayer(NetOn, LayerIdx));
+        AssertTrue('layer ' + IntToStr(LayerIdx) + ' keeps its output',
+          NetOn.Layers[LayerIdx].ForceOutputOnRAM());
+        NetOff.Layers[LayerIdx].ForceOutputOnRAM();
+        AssertEquals('pass ' + IntToStr(PassPos) + ', layer ' +
+          IntToStr(LayerIdx) + ': shared vs private', 0,
+          MaxAbsDiffOfVolumes(NetOn.Layers[LayerIdx].Output,
+          NetOff.Layers[LayerIdx].Output), 0);
+        MaxAbs := NetCPU.Layers[LayerIdx].Output.GetMaxAbs();
+        Diff := MaxAbsDiffOfVolumes(NetOn.Layers[LayerIdx].Output,
+          NetCPU.Layers[LayerIdx].Output);
+        AssertTrue('pass ' + IntToStr(PassPos) + ', layer ' +
+          IntToStr(LayerIdx) + ' vs CPU: ' + FloatToStr(Diff),
+          Diff < 1e-4 * (MaxAbs + 1));
+      end;
+    end;
+    AssertTrue('the PadXY tap ran on OpenCL',
+      NetOn.Layers[cTapIdx].ForwardGPUCnt > 0);
+    WriteLn('  GatherCopy host taps: ', NetOn.OpenCLSharedOutputLayerCount(),
+      ' layers share ', NetOn.OpenCLSharedOutputBytes(), ' B (private: ',
+      NetOn.OpenCLSharedOutputPrivateBytes(), ' B)');
+  finally
+    Input.Free;
+    NetUnpinned.Free;
     NetOn.Free;
     NetOff.Free;
     NetCPU.Free;
