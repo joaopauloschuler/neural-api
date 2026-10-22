@@ -48549,8 +48549,8 @@ begin
   end;
 end;
 
-// EncodePrompts vs lpw_stable_diffusion get_weighted_text_embeddings (float64;
-// torch float32 is itself 4.9e-5 off on the inversion case): 2-chunk weighted prompts (one with a textual inversion token), the negative
+// EncodePrompts vs lpw_stable_diffusion get_weighted_text_embeddings (float64,
+// means in float64; measured <= 1.7e-6, the encoder's float32 floor): 2-chunk weighted prompts (one with a textual inversion token), the negative
 // padded to the prompt's chunks; the 3-chunk cut notice; Denoise re-encoding
 // the negative prompt for a 2-chunk prompt.
 procedure TTestNeuralPretrained.TestStableDiffusionLongPromptEmbeds;
@@ -48587,14 +48587,14 @@ begin
         AssertEquals('negative tokens', Got.SizeX, GotNegative.SizeX);
         MaxDiff := MaxAbsVolumeDiff(Got, Expected);
         AssertTrue(CaseObj.Get('name', '') + ' embeds max |diff| = ' +
-          FloatToStr(MaxDiff), MaxDiff < 1e-4);
+          FloatToStr(MaxDiff), MaxDiff < 1e-5);
         if CaseObj.Find('negative_prompt_embeds') <> nil then
         begin
           LoadNestedOracleVolume(CaseObj.Arrays['negative_prompt_embeds'],
             false, Expected);
           MaxDiff := MaxAbsVolumeDiff(GotNegative, Expected);
           AssertTrue(CaseObj.Get('name', '') + ' negative max |diff| = ' +
-            FloatToStr(MaxDiff), MaxDiff < 1e-4);
+            FloatToStr(MaxDiff), MaxDiff < 1e-5);
         end;
       finally
         Pipeline.Free;

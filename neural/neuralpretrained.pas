@@ -95710,7 +95710,19 @@ procedure TStableDiffusionPipeline.ApplyPromptWeights(Embeds: TNNetVolume;
 var
   RowSize, TokenPos, MaxTokenPos: integer;
   IsWeighted: boolean;
-  PreviousMean, CurrentMean: TNeuralFloat;
+  PreviousSum, CurrentSum: double;
+
+  // The mean is ~1e-3 of the row magnitudes, so a float32 sum loses digits.
+  function SumAsDouble(): double;
+  var
+    ValuePos, MaxValuePos: integer;
+  begin
+    Result := 0;
+    MaxValuePos := Embeds.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Result := Result + Embeds.FData[ValuePos];
+  end;
+
 begin
   IsWeighted := false;
   MaxTokenPos := High(Weights);
@@ -95718,13 +95730,13 @@ begin
     if Weights[TokenPos] <> 1 then IsWeighted := true;
   if not IsWeighted then exit;
   RowSize := Embeds.Depth;
-  PreviousMean := Embeds.GetAvg();
+  PreviousSum := SumAsDouble();
   for TokenPos := 0 to MaxTokenPos do
     if Weights[TokenPos] <> 1 then
       TNNetVolume.Mul(Embeds.GetRawPtr(TokenPos * RowSize), Weights[TokenPos],
         RowSize);
-  CurrentMean := Embeds.GetAvg();
-  if CurrentMean <> 0 then Embeds.Mul(PreviousMean / CurrentMean);
+  CurrentSum := SumAsDouble();
+  if CurrentSum <> 0 then Embeds.Mul(PreviousSum / CurrentSum);
 end;
 
 procedure TStableDiffusionPipeline.EncodePromptList(

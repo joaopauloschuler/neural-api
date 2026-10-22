@@ -17,7 +17,8 @@ venv, so parse_prompt_attention, get_prompts_with_weights,
 pad_tokens_and_weights, get_unweighted_text_embeddings and
 get_weighted_text_embeddings (max_embeddings_multiples=3,
 no_boseos_middle=False, its defaults) are reimplemented below as that file
-writes them. The tiny_sd15 tokenizer pads with <|endoftext|>, so lpw's single
+writes them, except that the weight-restoring means stay in float64. The
+tiny_sd15 tokenizer pads with <|endoftext|>, so lpw's single
 trailing eos and the per-chunk [bos] ids [eos] pad layout are the same ids.
 
 Coded by Claude (AI).
@@ -218,9 +219,12 @@ def get_weighted_text_embeddings(pipe, prompt, uncond_prompt, skip_parsing):
             embeds = get_unweighted_text_embeddings(pipe, text_input, model_max_length)
         weight_tensor = torch.tensor(weights, dtype=embeds.dtype)
         if not skip_parsing:
-            previous_mean = embeds.float().mean(axis=[-2, -1]).to(embeds.dtype)
+            # lpw takes these means through .float() (fp16 safety); the
+            # float64 oracle keeps them in float64, as the means sum ~5000
+            # values to ~1e-3 and float32 there moves the result by ~5e-5.
+            previous_mean = embeds.mean(axis=[-2, -1])
             embeds = embeds * weight_tensor.unsqueeze(-1)
-            current_mean = embeds.float().mean(axis=[-2, -1]).to(embeds.dtype)
+            current_mean = embeds.mean(axis=[-2, -1])
             embeds = embeds * (previous_mean / current_mean).unsqueeze(-1).unsqueeze(-1)
         out.append((ids, weights[0], embeds[0]))
     return multiples, out

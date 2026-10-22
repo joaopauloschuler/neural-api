@@ -100,7 +100,7 @@ StableDiffusion --model ~/models/stable-diffusion-v1-5 \
 Tested against a reimplementation of lpw's `get_weighted_text_embeddings` in
 float64 on the pico folder (`tools/make_pico_sd_prompt_weighting_fixture.py`;
 the community pipeline is not packaged with diffusers): token ids and weights
-match exactly, and 2-chunk weighted prompts are within 4.3e-5
+match exactly, and 2-chunk weighted prompts are within 1.7e-6
 (`TestStableDiffusionLongPrompt*`, `TestSDPromptWeightParser`).
 
 `--clip-skip N` (property `ClipSkip`, diffusers `clip_skip`) takes the text
