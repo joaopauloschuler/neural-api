@@ -11931,10 +11931,11 @@ function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
 // TNNetSum layers carry no weights, so weight loading is unaffected.
 //
 // pWithAdapter (T2I-Adapter, the lighter ControlNet successor) splices a
-// TNNetSum onto the MAIN hidden-state path at the END of each down block (after
-// the last resnet/attn, BEFORE the downsampler) so a T2I-Adapter's per-stage
-// feature maps can be ADDED into `sample` exactly as diffusers'
-// StableDiffusionAdapterPipeline (down_intrablock_additional_residuals) does --
+// TNNetSum onto the MAIN hidden-state path of each down block, ahead of its
+// last skip -- a cross-attn block's last resnet/attn output (before the
+// downsampler), a plain block's output -- so a T2I-Adapter's feature maps are
+// ADDED into `sample` exactly as diffusers' UNet2DConditionModel does with
+// down_intrablock_additional_residuals --
 // distinct from pWithControl, which adds into the decoder SKIPS. There is one
 // adapter input per down block (NumBlockOut total); they sit AFTER the
 // latent/timestep/text/control inputs and start zero-filled, so a plain
@@ -12560,6 +12561,35 @@ type
     property ConditioningScale: TNeuralFloat read FConditioningScale
       write FConditioningScale;
     property Config: TControlNetConfig read FConfig;
+  end;
+
+  // diffusers StableDiffusionAdapterPipeline: a T2IAdapter (full_adapter)
+  // folder; its features, from one run per image, join every UNet pass.
+  TStableDiffusionT2IAdapter = class(TStableDiffusionConditioner)
+  private
+    FWeightsFile: string;
+    FConfig, FNetConfig: TT2IAdapterConfig;
+    FNet: TNNet;
+    FNetGrid: integer;
+    FSourceImage, FHintImage: TNNetVolume;
+    FFeatures: array of TNNetVolume;
+    FConditioningScale: TNeuralFloat;
+  public
+    constructor Create(const AdapterFolder: string);
+    destructor Destroy(); override;
+    // The hint image (W, H, 1|3|4) in 0..255; resized to the image size.
+    procedure SetHintImage(Image: TNNetVolume);
+    function UNetWithAdapter(): boolean; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure EndDenoise(); override;
+    // diffusers adapter_conditioning_scale (1.0).
+    property ConditioningScale: TNeuralFloat read FConditioningScale
+      write FConditioningScale;
+    property Config: TT2IAdapterConfig read FConfig;
   end;
 
 // ---------------------------------------------------------------------------
@@ -75503,14 +75533,16 @@ begin
             pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
+        // T2I-Adapter: the feature joins the block's last skip and what flows
+        // on (diffusers adds it in a cross-attn block before the downsampler,
+        // in a plain block after it, in place on the last skip tensor).
+        if (j = NumResnetM1) and (Config.DownHasAttn[i] or (i = nM1)) then
+          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
+            OutCh, pWithAdapter, AdapterInputs, AdapterTop);
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
           CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end;
-      // T2I-Adapter: add the per-stage feature into the MAIN path at the end of
-      // this down block, BEFORE the downsampler (diffusers intrablock residual).
-      HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
-        OutCh, pWithAdapter, AdapterInputs, AdapterTop);
       InCh := OutCh;
       if i < nM1 then
       begin
@@ -75521,6 +75553,9 @@ begin
         HLayer := NN.GetLastLayer();
         CurGridX := CurGridX div 2;
         CurGridY := CurGridY div 2;
+        if not Config.DownHasAttn[i] then
+          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
+            OutCh, pWithAdapter, AdapterInputs, AdapterTop);
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
           CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh; Inc(SkipTop);
@@ -93388,6 +93423,110 @@ begin
 end;
 
 procedure TStableDiffusionControlNet.EndDenoise();
+begin
+  if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
+end;
+
+constructor TStableDiffusionT2IAdapter.Create(const AdapterFolder: string);
+var
+  Folder: string;
+begin
+  inherited Create();
+  Folder := IncludeTrailingPathDelimiter(AdapterFolder);
+  FConfig := ReadT2IAdapterConfigFromJSONFile(Folder + 'config.json');
+  FWeightsFile := SafeTensorsFolderWeightsFile(Folder,
+    'diffusion_pytorch_model');
+  FSourceImage := TNNetVolume.Create();
+  FHintImage := TNNetVolume.Create();
+  FConditioningScale := 1;
+end;
+
+destructor TStableDiffusionT2IAdapter.Destroy();
+var
+  FeaturePos, MaxFeaturePos: integer;
+begin
+  FNet.Free;
+  MaxFeaturePos := High(FFeatures);
+  for FeaturePos := 0 to MaxFeaturePos do FFeatures[FeaturePos].Free;
+  FHintImage.Free;
+  FSourceImage.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionT2IAdapter.SetHintImage(Image: TNNetVolume);
+begin
+  FSourceImage.ReSize(Image);
+  FSourceImage.Copy(Image);
+end;
+
+function TStableDiffusionT2IAdapter.UNetWithAdapter(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TStableDiffusionT2IAdapter.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  Grid, FeaturePos, MaxFeaturePos: integer;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  Grid := Latents.SizeX;
+  if Latents.SizeY <> Grid then
+    ImportError('TStableDiffusionT2IAdapter: the image must be square (' +
+      'latents ' + IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) +
+      ').');
+  if FSourceImage.Size = 0 then
+    ImportError('TStableDiffusionT2IAdapter: call SetHintImage first.');
+  if FConfig.DownscaleFactor <> Pipeline.VaeScaleFactor then
+    ImportError('TStableDiffusionT2IAdapter: downscale_factor ' +
+      IntToStr(FConfig.DownscaleFactor) + ' <> the VAE factor ' +
+      IntToStr(Pipeline.VaeScaleFactor) + '.');
+  if FConfig.NumChannels <> SDUNetAdapterFeatureCount(Pipeline.UNetConfig) then
+    ImportError('TStableDiffusionT2IAdapter: ' +
+      IntToStr(FConfig.NumChannels) + ' adapter stages, the unet has ' +
+      IntToStr(SDUNetAdapterFeatureCount(Pipeline.UNetConfig)) +
+      ' down blocks.');
+  if not IsNetCurrent(FNet, FNetGrid, Grid) then
+  begin
+    StartLoadPhase();
+    FreeAndNil(FNet);
+    FNetConfig := FConfig;
+    FNetConfig.LatentGrid := Grid;
+    FNetConfig.CondGrid := Grid * FConfig.DownscaleFactor;
+    FNet := BuildT2IAdapterFromSafeTensorsEx(FWeightsFile, FNetConfig,
+      {pTrainable=}false);
+    FNetGrid := Grid;
+    FNetEpoch := Pipeline.ComponentEpoch;
+    Pipeline.PrepareComponent(FNet, {QuantizeInt8=}false);
+  end;
+  if Length(FFeatures) <> FConfig.NumChannels then
+  begin
+    SetLength(FFeatures, FConfig.NumChannels);
+    MaxFeaturePos := High(FFeatures);
+    for FeaturePos := 0 to MaxFeaturePos do
+      FFeatures[FeaturePos] := TNNetVolume.Create();
+  end;
+  StableDiffusionPrepareImage(FSourceImage, FNetConfig.CondGrid,
+    FNetConfig.CondGrid, FConfig.CondChannels, FHintImage);
+  T2IAdapterFeatures(FNet, FNetConfig, FHintImage, FFeatures);
+  MaxFeaturePos := High(FFeatures);
+  if FConditioningScale <> 1 then
+    for FeaturePos := 0 to MaxFeaturePos do
+      FFeatures[FeaturePos].Mul(FConditioningScale);
+  // The features hold for every step.
+  if not Pipeline.ComponentsLoaded then FreeAndNil(FNet);
+end;
+
+procedure TStableDiffusionT2IAdapter.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  SDUNetDenoiseWithAdapter(UNet, Config, Latents, Embeds, Timestep,
+    FFeatures, Pred);
+end;
+
+procedure TStableDiffusionT2IAdapter.EndDenoise();
 begin
   if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
 end;

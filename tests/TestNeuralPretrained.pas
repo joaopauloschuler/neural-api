@@ -45,6 +45,8 @@ type
     // TStableDiffusionPipeline OnStep check against the oracle's latents_after.
     FSD15Oracle: TJSONData;
     FSD15StepMaxDiff: double;
+    // The latents_after/timesteps SD15CheckStep reads; nil: FSD15Oracle.
+    FSD15StepOracle: TJSONObject;
     FSD15StepCount: integer;
     // TStableDiffusionPipeline OnPhase counts (SD15CountPhase).
     FSD15PhaseCounts: array[TStableDiffusionPipelinePhase] of integer;
@@ -60,6 +62,8 @@ type
     procedure SD15CheckStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
     procedure SD15CountPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
+      const Expected: TJSONObject);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1234,6 +1238,7 @@ type
     procedure TestStableDiffusionPipelineKeepLoaded;
     procedure TestStableDiffusionPipelineInt8;
     procedure TestStableDiffusionControlNetParity;
+    procedure TestStableDiffusionT2IAdapterParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45401,15 +45406,18 @@ procedure TTestNeuralPretrained.SD15CheckStep(StepIndex, StepCount: integer;
   Timestep: double; Latents: TNNetVolume);
 var
   Expected: TNNetVolume;
+  StepOracle: TJSONObject;
 begin
   Expected := TNNetVolume.Create;
   try
-    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents_after'].
-      Items[StepIndex], true, Expected);
+    StepOracle := FSD15StepOracle;
+    if StepOracle = nil then StepOracle := TJSONObject(FSD15Oracle);
+    LoadNestedOracleVolume(StepOracle.Arrays['latents_after'].Items[StepIndex],
+      true, Expected);
     FSD15StepMaxDiff := Max(FSD15StepMaxDiff,
       MaxAbsVolumeDiff(Latents, Expected));
-    AssertEquals('step timestep', TJSONObject(FSD15Oracle).
-      Arrays['timesteps'].Integers[StepIndex], Round(Timestep));
+    AssertEquals('step timestep', StepOracle.Arrays['timesteps'].Integers[
+      StepIndex], Round(Timestep));
     Inc(FSD15StepCount);
   finally
     Expected.Free;
@@ -45775,35 +45783,21 @@ begin
   end;
 end;
 
-// StableDiffusionControlNetPipeline float64 (tiny_sd15_controlnet_io.json, a
-// diffusers ControlNetModel.from_unet of tiny_sd15): 3 guided DDIM steps with
-// conditioning scale 0.5, then the image, all < 1e-4.
-procedure TTestNeuralPretrained.TestStableDiffusionControlNetParity;
+// Runs Pipeline (its Conditioner set) on the prompt, guidance, steps and
+// latents of FSD15Oracle; the latents after each step and the image < 1e-4.
+procedure TTestNeuralPretrained.CheckSD15ConditionedParity(
+  Pipeline: TStableDiffusionPipeline; const Expected: TJSONObject);
 var
-  Pipeline: TStableDiffusionPipeline;
-  ControlNet: TStableDiffusionControlNet;
-  Embeds, Initial, ControlImage, Image, Expected: TNNetVolume;
+  Embeds, Initial, Image, ExpectedImage: TNNetVolume;
   ImageSize: integer;
   MaxDiff: double;
 begin
-  FSD15Oracle := LoadSD15Fixture('tiny_sd15_controlnet_io.json');
-  Pipeline := CreateSD15Pipeline();
-  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
-    FixturePath('tiny_sd15_controlnet/config.json')));
   Embeds := TNNetVolume.Create;
   Initial := TNNetVolume.Create;
-  ControlImage := TNNetVolume.Create;
   Image := TNNetVolume.Create;
-  Expected := TNNetVolume.Create;
+  ExpectedImage := TNNetVolume.Create;
   try
     ImageSize := TJSONObject(FSD15Oracle).Get('image_size', 0);
-    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['control_image'],
-      false, ControlImage);
-    ControlImage.Mul(255);
-    ControlNet.SetControlImage(ControlImage);
-    ControlNet.ConditioningScale := TJSONObject(FSD15Oracle).Get(
-      'conditioning_scale', 0.0);
-    Pipeline.Conditioner := ControlNet;
     Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
       0.0);
     Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
@@ -45811,25 +45805,84 @@ begin
       Initial);
     FSD15StepMaxDiff := 0;
     FSD15StepCount := 0;
+    FSD15StepOracle := Expected;
     Pipeline.OnStep := @SD15CheckStep;
     Pipeline.GenerateFromEmbeds(Embeds, ImageSize, ImageSize,
       TJSONObject(FSD15Oracle).Get('steps', 0), 0, Image, Initial);
-    AssertEquals('steps run', TJSONObject(FSD15Oracle).Get('steps', 0),
+    AssertEquals('steps run', Expected.Arrays['latents_after'].Count,
       FSD15StepCount);
     AssertTrue('step latents max |diff| = ' + FloatToStr(FSD15StepMaxDiff),
       FSD15StepMaxDiff < 1e-4);
-    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['image'], false,
-      Expected);
-    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    LoadNestedOracleVolume(Expected.Arrays['image'], false, ExpectedImage);
+    MaxDiff := MaxAbsVolumeDiff(Image, ExpectedImage);
     AssertTrue('image max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
   finally
-    Expected.Free;
+    FSD15StepOracle := nil;
+    ExpectedImage.Free;
     Image.Free;
-    ControlImage.Free;
     Initial.Free;
     Embeds.Free;
+  end;
+end;
+
+// StableDiffusionControlNetPipeline float64 (tiny_sd15_controlnet_io.json, a
+// diffusers ControlNetModel.from_unet of tiny_sd15): 3 guided DDIM steps with
+// conditioning scale 0.5.
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet: TStableDiffusionControlNet;
+  ControlImage: TNNetVolume;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_controlnet_io.json');
+  Pipeline := CreateSD15Pipeline();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  ControlImage := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['control_image'],
+      false, ControlImage);
+    ControlImage.Mul(255);
+    ControlNet.SetControlImage(ControlImage);
+    ControlNet.ConditioningScale := TJSONObject(FSD15Oracle).Get(
+      'conditioning_scale', 0.0);
+    Pipeline.Conditioner := ControlNet;
+    CheckSD15ConditionedParity(Pipeline, TJSONObject(FSD15Oracle));
+  finally
+    ControlImage.Free;
     Pipeline.Free;
     ControlNet.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionAdapterPipeline float64 (tiny_sd15_t2i_adapter_io.json): a
+// one-channel sketch T2IAdapter on tiny_sd15, conditioning scale 0.8.
+procedure TTestNeuralPretrained.TestStableDiffusionT2IAdapterParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Adapter: TStableDiffusionT2IAdapter;
+  HintImage: TNNetVolume;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_t2i_adapter_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Adapter := TStableDiffusionT2IAdapter.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_t2i_adapter/config.json')));
+  HintImage := TNNetVolume.Create;
+  try
+    AssertEquals('sketch adapter', 1, Adapter.Config.CondChannels);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['hint_image'],
+      false, HintImage);
+    HintImage.Mul(255);
+    Adapter.SetHintImage(HintImage);
+    Adapter.ConditioningScale := TJSONObject(FSD15Oracle).Get(
+      'conditioning_scale', 0.0);
+    Pipeline.Conditioner := Adapter;
+    CheckSD15ConditionedParity(Pipeline, TJSONObject(FSD15Oracle));
+  finally
+    HintImage.Free;
+    Pipeline.Free;
+    Adapter.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;

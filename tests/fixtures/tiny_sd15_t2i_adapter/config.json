@@ -1,0 +1,12 @@
+{
+  "_class_name": "T2IAdapter",
+  "_diffusers_version": "0.41.0.dev0",
+  "adapter_type": "full_adapter",
+  "channels": [
+    8,
+    16
+  ],
+  "downscale_factor": 2,
+  "in_channels": 1,
+  "num_res_blocks": 1
+}

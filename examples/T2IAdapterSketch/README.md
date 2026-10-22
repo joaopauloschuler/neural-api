@@ -1,64 +1,63 @@
-# T2I-Adapter sketch conditioning (base UNet + adapter, single-step smoke)
+# T2IAdapterSketch
 
-An offline, CPU smoke that wires an end-to-end **base Stable-Diffusion UNet +
-T2I-Adapter** single-step denoise — the `StableDiffusionAdapterPipeline` inner
-loop, composed over the repo's already-landed importers.
-
-**T2I-Adapter** is the lighter sibling of ControlNet: a small conv encoder over a
-spatial hint (canny / sketch / depth) produces a **pyramid of per-resolution
-feature maps** that are *added* into the SD UNet down-block hidden state — no
-transformer and no per-block zero-conv, just a lightweight ResNet-ish ladder.
-
-## What it does
+Stable Diffusion 1.x text-to-image guided by a T2I-Adapter, as diffusers'
+`StableDiffusionAdapterPipeline`. The example drives `TStableDiffusionPipeline`
+(`neural/neuralpretrained.pas`) with a `TStableDiffusionT2IAdapter` conditioner:
 
 ```
-spatial hint (sketch/canny-style image)
-  -> T2I-Adapter (BuildT2IAdapterFromSafeTensors / T2IAdapterFeatures)
-     -> per-stage feature pyramid (one feature per UNet down block)
-  -> base SD UNet built WITH adapter injection (BuildSDUNetFromSafeTensorsEx, pWithAdapter=true)
-  -> SDUNetDenoiseWithAdapter ADDS those features into `sample` at the end of
-     each down block (diffusers' down_intrablock_additional_residuals)
-  -> predicted noise (the eps a sampler would step on)
+hint image --T2I-Adapter (once)--> one feature map per UNet down block (x scale)
+prompt --CLIP tokenizer + text encoder--> text states (and the empty prompt's, for CFG)
+for each sampler step, for the conditional and the unconditional pass:
+  UNet(latents, text states, t, + adapter features) -> noise prediction
+  CFG mix, scheduler step
+VAE decoder -> PNG
 ```
 
-Nothing here is a new leaf layer — it is pure plumbing over landed pieces. This
-is a **wiring / throughput smoke**: it proves the chain runs offline and produces
-a **finite** noise prediction, not photorealism (the pico fixtures carry random
-weights). The adapter feature pyramid itself is parity-checked < 1e-4 in
-`TestT2IAdapterParity`.
-
-### Key neural-api pieces (`neuralpretrained`)
-
-- **`BuildSDUNetFromSafeTensorsEx(..., pWithAdapter=true)`** — base SD UNet with
-  the extra zero-default main-path inputs for adapter injection
-  (`TSDUNetConfig`).
-- **`BuildT2IAdapterFromSafeTensors` / `T2IAdapterFeatures`** — the adapter
-  importer and its forward producing the feature pyramid (`TT2IAdapterConfig`).
-- **`SDUNetDenoiseWithAdapter`** — one denoise step that adds the features into
-  the UNet down-block path. `SDUNetAdapterFeatureCount` is asserted to match the
-  adapter's feature count (config compatibility check).
+A T2I-Adapter is a small conv ladder over the hint (PixelUnshuffle, conv_in,
+adapter ResNet blocks with AvgPool between stages). Its features do not depend
+on the timestep, so it runs once per image; the UNet adds each feature to the
+end of its down block, as diffusers' `down_intrablock_additional_residuals`.
 
 ## Running
 
-```
+```sh
 cd examples/T2IAdapterSketch
-lazbuild T2IAdapterSketch.lpi --build-mode=Release
-./T2IAdapterSketch                                  # committed pico fixtures
-./T2IAdapterSketch <unet.st> <unet.cfg> <adapter.st> <adapter.cfg>   # real, config-compatible checkpoints
+lazbuild -B T2IAdapterSketch.lpi
+../../bin/x86_64-linux/bin/T2IAdapterSketch                        # pico fixtures
+../../bin/x86_64-linux/bin/T2IAdapterSketch \
+  --model /path/to/stable-diffusion-v1-5 \
+  --adapter /path/to/t2iadapter_sketch_sd15v2 \
+  --hint sketch.png --prompt "a cozy cottage, watercolor" --steps 25 \
+  --out cottage.png --gpu
 ```
 
-(Or compile the `.lpr` with `fpc -Fu../../neural`.)
+| Option | Meaning |
+| --- | --- |
+| `--model DIR` | diffusers Stable Diffusion 1.x folder (default `tests/fixtures/tiny_sd15`) |
+| `--adapter DIR` | diffusers `T2IAdapter` (`full_adapter`) folder: `config.json` + `diffusion_pytorch_model.safetensors` (default `tests/fixtures/tiny_sd15_t2i_adapter`) |
+| `--hint FILE` | hint image; for a sketch adapter white strokes on black. A one-channel adapter reads it as PIL 'L' gray. Resized to the image size (Lanczos). Default: a drawn house outline |
+| `--prompt`, `--negative` | prompt and negative prompt |
+| `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
+| `--scale S` | `adapter_conditioning_scale` (1.0) |
+| `--size N` | square image side (default: the checkpoint's, 512 for SD 1.5) |
+| `--out PNG` | output file (default `t2i_adapter_sketch.png`) |
+| `--int8` | UNet and text encoder weights in int8 (the adapter stays FP32) |
+| `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
 
-## Inputs / outputs
+With no `--model` / `--adapter` the run uses random-weight pico fixtures: it
+checks wiring and I/O, not image quality.
 
-- **Fixtures (default):** `tests/fixtures/tiny_sd_unet.*` and the matched
-  `tests/fixtures/tiny_t2i_adapter.*` — fully self-contained, no network access.
-- **Inputs:** deterministic synthetic fillers (latent, T5-style text states, and
-  a toy bright-lattice "sketch" hint) — no RNG, reproducible.
-- **Shapes (pico fixtures):** sketch `(16,16,3)` → 2 adapter features `(16,8,8)`
-  + `(32,4,4)`; latent `(8,8,4)`; text `(5,1,12)` → predicted noise `(8,8,4)`.
-- **Output:** prints the configs, the produced feature-map shapes, and the
-  predicted-noise min/max/mean, then asserts the prediction is finite
-  (`OK` / `FAIL` with a non-zero exit code on NaN/Inf). No image file is written.
+## Parity
 
-Coded by Claude (AI).
+`TestStableDiffusionT2IAdapterParity` (`tests/TestNeuralPretrained.pas`) runs
+the pipeline with the pico one-channel adapter (conditioning scale 0.8) for 3
+guided DDIM steps and compares the latents after each step and the decoded
+image with a diffusers float64 `StableDiffusionAdapterPipeline` run: max |diff|
+< 1e-4. Fixture and oracle: `tools/make_pico_sd_conditioning_fixtures.py`.
+
+## Limits
+
+- Square images only (`TT2IAdapterConfig` takes one side).
+- `full_adapter` only: `light_adapter` and the SDXL `full_adapter_xl` are refused.
+- One adapter; diffusers' `MultiAdapter` is not implemented.
+- Real checkpoints are untested.
