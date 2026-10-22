@@ -669,33 +669,24 @@ rather than acted on.
             added-token match needs the lowercase to keep the byte length.
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
-      - [ ] Prompt control in TStableDiffusionPipeline: long prompts, prompt
-            weighting and CLIP skip. Today `TokenizePrompt` silently cuts the
-            prompt at `FMaxTokenCount - 2` (75) tokens, and there is no way to
-            stress or soften a word or to read an earlier text-encoder layer.
-            The UNet already takes any text length (`AcquireUNet` and
-            `UNetStepConfig` are sized by `PromptEmbeds.SizeX`), so:
-            (1) Long prompts as in diffusers' lpw_stable_diffusion and A1111:
-            split the ids into 75-token chunks, wrap each in BOS/EOS/pad to
-            77, encode each chunk through `EncodeTokenIdLists`, and
-            concatenate the chunk embeddings along the token axis; pad the
-            negative prompt to the same chunk count (Denoise already rejects
-            a length mismatch). Print a notice instead of truncating silently
-            when a prompt is cut.
-            (2) Prompt weighting with the A1111 syntax `(word:1.3)`, `(word)`
-            = 1.1, `[word]` = 1/1.1 and `\(` escapes: parse to (text, weight)
-            spans, carry one weight per token id, scale each token's embedding
-            row by its weight, then restore the chunk mean as A1111 and
-            lpw_stable_diffusion do. Works with textual-inversion tokens
-            (`ExpandInversionTokens` runs first).
-            (3) `--clip-skip N` (diffusers `clip_skip`): take the hidden state
-            N layers before the last and apply the text model's
-            final_layer_norm to it.
-            Flags in examples/StableDiffusion: `--clip-skip N`, weighting on by
-            default with `--no-prompt-weighting` to turn it off; README update.
-            Parity: a pico-fixture test vs diffusers `clip_skip` and vs
-            lpw_stable_diffusion `get_weighted_text_embeddings` for a
-            >77-token weighted prompt, generated in the ~/x venv.
+      - [ ] Prompt control in TStableDiffusionPipeline follow-ups. Long prompts
+            (75-token chunks, lpw_stable_diffusion layout, MaxPromptChunkCount /
+            `--max-prompt-chunks`, PromptNotice) and A1111 prompt weighting
+            (ParseSDPromptWeights, PromptWeighting / `--no-prompt-weighting`,
+            lpw whole-prompt mean restore) are DONE with pico parity vs a
+            float64 reimplementation of lpw's get_weighted_text_embeddings
+            (tools/make_pico_sd_prompt_weighting_fixture.py; the community
+            pipeline is not in the ~/x venv). Open:
+        - [ ] `--clip-skip N` (diffusers `clip_skip`): take the hidden state
+              N layers before the last and apply the text model's
+              final_layer_norm to it. Every chunk goes through
+              `EncodeTokenIdLists`, so clip skip belongs there; property on
+              the pipeline, flag in examples/StableDiffusion, README update.
+              Parity: a pico-fixture test vs diffusers `clip_skip`.
+        - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
+        - [ ] A1111 extras not done: `BREAK`, moving a chunk split back to a
+              nearby comma, per-chunk mean restore (lpw restores the whole
+              prompt's mean, which is what is coded).
       - [ ] IP-Adapter image prompts in TStableDiffusionPipeline follow-ups
             (TStableDiffusionIPAdapter, h94/IP-Adapter ip-adapter_sd15,
             StableDiffusion --ip-adapter/--ip-image/--ip-scale):

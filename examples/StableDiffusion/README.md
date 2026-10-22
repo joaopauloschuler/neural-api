@@ -63,6 +63,46 @@ lowercase TOKEN (`file.pt:easynegative`) to get all of them. Tested against
 diffusers float64 on the pico folder (`TestStableDiffusionTextualInversion*`);
 no real embedding has been run yet.
 
+### Long prompts and prompt weighting
+
+A prompt longer than 75 tokens is not cut at 75. As diffusers'
+`lpw_stable_diffusion` community pipeline and AUTOMATIC1111 do,
+`TStableDiffusionPipeline.EncodePrompt` splits the token ids into chunks of 75,
+wraps each chunk in `<|startoftext|>` ... `<|endoftext|>` padded to 77, encodes
+every chunk through the text encoder and concatenates the chunk states, so the
+UNet sees 77, 154 or 231 text tokens. The negative prompt is padded to the
+same chunk count (`EncodePrompts`). `--max-prompt-chunks N` (property
+`MaxPromptChunkCount`, default 3 as lpw's `max_embeddings_multiples`; 0 for no
+limit) caps the chunk count; a longer prompt is cut and the program prints a
+`Notice:` line saying how many tokens were dropped (`PromptNotice`).
+
+Prompts take the AUTOMATIC1111 weighting syntax (property `PromptWeighting`,
+on by default; `--no-prompt-weighting` reads the brackets as plain text):
+
+| Syntax | Weight |
+| --- | --- |
+| `(word:1.3)` | 1.3 |
+| `(word)`, `((word))` | 1.1, 1.21 |
+| `[word]` | 1 / 1.1 |
+| `\(`, `\)`, `\[`, `\]`, `\\` | the literal character |
+
+Each token's text-encoder output row is multiplied by its weight, then the
+whole prompt's states are rescaled to their unweighted mean, as lpw's
+`get_weighted_text_embeddings` does. A textual inversion token works inside a
+weighted span: `(<cat-toy>:1.3)` weights all of its vectors.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --prompt "a (photo:1.2) of an ((astronaut)) riding a [horse] on mars" \
+  --negative "(blurry:1.3), low quality"
+```
+
+Tested against a reimplementation of lpw's `get_weighted_text_embeddings` in
+float64 on the pico folder (`tools/make_pico_sd_prompt_weighting_fixture.py`;
+the community pipeline is not packaged with diffusers): token ids and weights
+match exactly, and 2-chunk weighted prompts are within 4.3e-5
+(`TestStableDiffusionLongPrompt*`, `TestSDPromptWeightParser`).
+
 `--lora FILE[:SCALE]` (repeatable) merges a LoRA `.safetensors` into the
 weights as they load, as diffusers `load_lora_weights` + `fuse_lora` do
 (`TStableDiffusionPipeline.AddLoRA`, `TNNetLoRAMergeReader`). Every adapted
@@ -363,6 +403,12 @@ StableDiffusion [--model DIR] [options]
   --model DIR       diffusers StableDiffusionPipeline folder (default: the pico fixture)
   --prompt TEXT     prompt (default "a photo of an astronaut riding a horse on mars")
   --negative TEXT   negative prompt (default empty)
+                    Both take A1111 weights: (word:1.3), (word) = x1.1, [word] = /1.1,
+                    \( \) \[ \] for literal brackets; prompts longer than 75 tokens
+                    are encoded in chunks of 75 (lpw_stable_diffusion)
+  --no-prompt-weighting  read brackets in the prompts as plain text
+  --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens (default 3;
+                    0: no limit); longer prompts are cut with a notice
   --steps N         denoising steps (default 25; 4 with lcm)
   --guidance G      classifier-free guidance scale (default 7.5, 1.0 with lcm;
                     <= 1 turns it off); an LCM-distilled UNet embeds it
@@ -463,6 +509,13 @@ Stages of image 2 (wall time):
   files are untested.
 * The noise (the initial latents, the Euler a and LCM step noise and the
   img2img VAE sample) comes from the Free Pascal RNG, so a seed does not reproduce a diffusers image.
+* Long prompts split at every 75th token, as lpw_stable_diffusion does;
+  AUTOMATIC1111 also moves a split back to a nearby comma and reads `BREAK`.
+  The weighted states are rescaled to the mean of the whole prompt (lpw), not
+  of each chunk (A1111). On SD 2.x (pad token `!`) each chunk is
+  `<|startoftext|>` ids `<|endoftext|>` then pads, as A1111 and the diffusers
+  pipeline lay out one chunk; lpw puts a single `<|endoftext|>` at the end of
+  each chunk instead, so its pad rows differ there.
 * Every UNet pass recomputes the cross-attention K/V of the text states,
   which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
   pass, so the K/V are not cached.

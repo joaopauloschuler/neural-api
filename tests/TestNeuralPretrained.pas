@@ -1341,6 +1341,9 @@ type
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
+    procedure TestSDPromptWeightParser;
+    procedure TestStableDiffusionLongPromptTokens;
+    procedure TestStableDiffusionLongPromptEmbeds;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -48171,6 +48174,194 @@ begin
     AssertEquals('then eos', Pipeline.TokenizePrompt('')[1], Ids[3]);
   finally
     Pipeline.Free;
+  end;
+end;
+
+// ParseSDPromptWeights vs lpw_stable_diffusion parse_prompt_attention (the
+// spans and Python double weights printed by its reimplementation in
+// tools/make_pico_sd_prompt_weighting_fixture.py).
+procedure TTestNeuralPretrained.TestSDPromptWeightParser;
+
+  procedure CheckSpans(const Prompt: string; const Texts: array of string;
+    const Weights: array of double);
+  var
+    Spans: TSDPromptSpanArray;
+    SpanPos: integer;
+  begin
+    Spans := ParseSDPromptWeights(Prompt);
+    AssertEquals('"' + Prompt + '" span count', Length(Texts), Length(Spans));
+    for SpanPos := 0 to High(Texts) do
+    begin
+      AssertEquals('"' + Prompt + '" text ' + IntToStr(SpanPos),
+        Texts[SpanPos], Spans[SpanPos].Text);
+      AssertEquals('"' + Prompt + '" weight ' + IntToStr(SpanPos),
+        Weights[SpanPos], Spans[SpanPos].Weight, 1e-15);
+    end;
+  end;
+
+begin
+  CheckSpans('normal text', ['normal text'], [1.0]);
+  CheckSpans('an (important) word', ['an ', 'important', ' word'],
+    [1.0, 1.1, 1.0]);
+  CheckSpans('a (very (nested):1.3) [soft] end',
+    ['a ', 'very ', 'nested', ' ', 'soft', ' end'],
+    [1.0, 1.3, 1.4300000000000002, 1.0, 0.9090909090909091, 1.0]);
+  CheckSpans('\(literal\) and \[x\] and \\', ['(literal) and [x] and \'],
+    [1.0]);
+  CheckSpans('unbalanced (open', ['unbalanced ', 'open'], [1.0, 1.1]);
+  CheckSpans('close) and ]', ['close) and ]'], [1.0]);
+  CheckSpans('(a:1.5) x:2 (b:abc) (c:-0.5)', ['a', ' x:2 ', 'b:abc', ' ', 'c'],
+    [1.5, 1.0, 1.1, 1.0, -0.5]);
+  CheckSpans('[[a]] (b) c', ['a', ' ', 'b', ' c'],
+    [0.8264462809917354, 1.0, 1.1, 1.0]);
+  CheckSpans('', [''], [1.0]);
+  CheckSpans('a\b', ['ab'], [1.0]);
+  CheckSpans('(x:1.)', ['x'], [1.0]);
+  CheckSpans('(x:.5) y', ['x', ' y'], [0.5, 1.0]);
+  CheckSpans(':1.3) alone', [':1.3) alone'], [1.0]);
+end;
+
+// TokenizePromptChunks vs lpw_stable_diffusion (tiny_sd15_lpw_io.json): the
+// chunked ids and per-id weights of prompt and negative prompt at one chunk count.
+procedure TTestNeuralPretrained.TestStableDiffusionLongPromptTokens;
+var
+  Root: TJSONData;
+  Cases: TJSONArray;
+  CaseObj: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  CaseCnt, ChunkCount, SideCnt: integer;
+  Side: string;
+
+  procedure CheckIds(const Name, Prompt: string; ExpectedIds,
+    ExpectedWeights: TJSONArray);
+  var
+    Ids: TNeuralIntegerArray;
+    Weights: TNeuralFloatDynArr;
+    IdCnt: integer;
+  begin
+    Ids := Pipeline.TokenizePromptChunks(Prompt, Weights, ChunkCount);
+    AssertEquals(Name + ' id count', ExpectedIds.Count, Length(Ids));
+    AssertEquals(Name + ' weight count', ExpectedWeights.Count, Length(Weights));
+    for IdCnt := 0 to ExpectedIds.Count - 1 do
+    begin
+      AssertEquals(Name + ' id ' + IntToStr(IdCnt),
+        ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+      AssertEquals(Name + ' weight ' + IntToStr(IdCnt),
+        ExpectedWeights.Floats[IdCnt], Weights[IdCnt], 1e-6);
+    end;
+  end;
+
+begin
+  Root := LoadSD15Fixture('tiny_sd15_lpw_io.json');
+  try
+    AssertEquals('lpw max_embeddings_multiples', 3,
+      TJSONObject(Root).Get('max_chunk_count', 0));
+    Cases := TJSONObject(Root).Arrays['cases'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Pipeline := CreateSD15Pipeline();
+      try
+        AssertTrue('weighting by default', Pipeline.PromptWeighting);
+        AssertEquals('3 chunks by default', 3, Pipeline.MaxPromptChunkCount);
+        if CaseObj.Get('inversion', false) then
+          Pipeline.LoadTextualInversion(
+            FixturePath('tiny_sd15_ti/pico_cat.safetensors'));
+        Pipeline.PromptWeighting := CaseObj.Get('weighting', true);
+        ChunkCount := CaseObj.Get('chunk_count', 0);
+        for SideCnt := 0 to 1 do
+        begin
+          if SideCnt = 0 then Side := '' else Side := 'negative_';
+          CheckIds(CaseObj.Get('name', '') + ' ' + Side + 'prompt',
+            CaseObj.Get(Side + 'prompt', ''),
+            CaseObj.Arrays[Side + 'chunk_ids'],
+            CaseObj.Arrays[Side + 'chunk_weights']);
+        end;
+      finally
+        Pipeline.Free;
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+// EncodePrompts vs lpw_stable_diffusion get_weighted_text_embeddings (float64;
+// torch float32 is itself 4.9e-5 off on the inversion case): 2-chunk weighted prompts (one with a textual inversion token), the negative
+// padded to the prompt's chunks; the 3-chunk cut notice; Denoise re-encoding
+// the negative prompt for a 2-chunk prompt.
+procedure TTestNeuralPretrained.TestStableDiffusionLongPromptEmbeds;
+var
+  Root: TJSONData;
+  Cases: TJSONArray;
+  CaseObj: TJSONObject;
+  Pipeline: TStableDiffusionPipeline;
+  Got, GotNegative, Expected, Latents: TNNetVolume;
+  CaseCnt: integer;
+  MaxDiff: double;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_lpw_io.json');
+  Got := TNNetVolume.Create;
+  GotNegative := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    Cases := TJSONObject(Root).Arrays['cases'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      if CaseObj.Find('prompt_embeds') = nil then continue;
+      Pipeline := CreateSD15Pipeline();
+      try
+        if CaseObj.Get('inversion', false) then
+          Pipeline.LoadTextualInversion(
+            FixturePath('tiny_sd15_ti/pico_cat.safetensors'));
+        Pipeline.EncodePrompts([CaseObj.Get('prompt', ''),
+          CaseObj.Get('negative_prompt', '')], [Got, GotNegative]);
+        AssertEquals('no cut', '', Pipeline.PromptNotice);
+        LoadNestedOracleVolume(CaseObj.Arrays['prompt_embeds'], false, Expected);
+        AssertEquals('prompt tokens', Expected.SizeX, Got.SizeX);
+        AssertEquals('negative tokens', Got.SizeX, GotNegative.SizeX);
+        MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+        AssertTrue(CaseObj.Get('name', '') + ' embeds max |diff| = ' +
+          FloatToStr(MaxDiff), MaxDiff < 1e-4);
+        if CaseObj.Find('negative_prompt_embeds') <> nil then
+        begin
+          LoadNestedOracleVolume(CaseObj.Arrays['negative_prompt_embeds'],
+            false, Expected);
+          MaxDiff := MaxAbsVolumeDiff(GotNegative, Expected);
+          AssertTrue(CaseObj.Get('name', '') + ' negative max |diff| = ' +
+            FloatToStr(MaxDiff), MaxDiff < 1e-4);
+        end;
+      finally
+        Pipeline.Free;
+      end;
+    end;
+    Pipeline := CreateSD15Pipeline();
+    try
+      Pipeline.EncodePrompt(Cases.Objects[2].Get('prompt', ''), Got);
+      AssertEquals('cut at 3 chunks', 3 * 77, Got.SizeX);
+      AssertTrue('cut notice: ' + Pipeline.PromptNotice,
+        Pos('were cut', Pipeline.PromptNotice) > 0);
+      // A 2-chunk prompt after Denoise encoded the negative at 1 chunk.
+      Pipeline.NegativePrompt := Cases.Objects[0].Get('negative_prompt', '');
+      Pipeline.EncodePrompt('a cat', Got);
+      Pipeline.MakeInitialLatents(16, 16, 7, Latents);
+      Pipeline.Denoise(Got, 16, 16, 1, Latents);
+      Pipeline.EncodePrompt(Cases.Objects[0].Get('prompt', ''), Got);
+      AssertEquals('2 chunks', 2 * 77, Got.SizeX);
+      Pipeline.MakeInitialLatents(16, 16, 7, Latents);
+      Pipeline.Denoise(Got, 16, 16, 1, Latents);
+      AssertTrue('finite latents', not IsNan(Latents.GetSum()));
+    finally
+      Pipeline.Free;
+    end;
+  finally
+    Latents.Free;
+    Expected.Free;
+    GotNegative.Free;
+    Got.Free;
+    Root.Free;
   end;
 end;
 

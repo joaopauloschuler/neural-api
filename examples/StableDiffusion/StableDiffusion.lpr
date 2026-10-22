@@ -98,6 +98,9 @@ type
     GuidanceScale: double;
     Seed: cardinal;
     UseOpenCL, UseInt8, UseStats: boolean;
+    // --no-prompt-weighting clears UsePromptWeighting; --max-prompt-chunks.
+    UsePromptWeighting: boolean;
+    MaxPromptChunkCount: integer;
     OpenCLPlatform, OpenCLDevice: integer;
     // --freeu s1, s2, b1, b2; UseFreeU false when not given.
     UseFreeU: boolean;
@@ -198,6 +201,15 @@ begin
   WriteLn('  --prompt TEXT     prompt (default "a photo of an astronaut ',
     'riding a horse on mars")');
   WriteLn('  --negative TEXT   negative prompt (default empty)');
+  WriteLn('                    Both take A1111 weights: (word:1.3), (word) = ',
+    'x1.1, [word] = /1.1,');
+  WriteLn('                    \( \) \[ \] for literal brackets; prompts ',
+    'longer than 75 tokens');
+  WriteLn('                    are encoded in chunks of 75 (lpw_stable_diffusion)');
+  WriteLn('  --no-prompt-weighting  read brackets in the prompts as plain text');
+  WriteLn('  --max-prompt-chunks N  keep at most N chunks of 75 prompt tokens ',
+    '(default 3;');
+  WriteLn('                    0: no limit); longer prompts are cut with a notice');
   WriteLn('  --steps N         denoising steps (default 25; 4 with lcm)');
   WriteLn('  --guidance G      classifier-free guidance scale (default 7.5, ',
     '1.0 with lcm;');
@@ -354,6 +366,8 @@ begin
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
   Opt.UseStats := false;
+  Opt.UsePromptWeighting := true;
+  Opt.MaxPromptChunkCount := 3;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
   Opt.UseFreeU := false;
@@ -411,6 +425,9 @@ begin
       ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
       Opt.UseFreeU := true;
     end
+    else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
+    else if Arg = '--max-prompt-chunks' then
+      Opt.MaxPromptChunkCount := StrToInt(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -582,6 +599,8 @@ begin
     end;
     Pipeline.GuidanceScale := GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
+    Pipeline.PromptWeighting := Opt.UsePromptWeighting;
+    Pipeline.MaxPromptChunkCount := Opt.MaxPromptChunkCount;
     Pipeline.UNetInt8 := Opt.UseInt8;
     Pipeline.TextEncoderInt8 := Opt.UseInt8;
     if Opt.UseFreeU then
@@ -690,6 +709,9 @@ begin
       else
         Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, StepCount,
           Seed, Image);
+      // The prompt and the negative prompt are encoded by the first image.
+      if (ImagePos = 0) and (Pipeline.PromptNotice <> '') then
+        WriteLn('Notice:   ', Pipeline.PromptNotice);
       SaveStart := Now();
       Image.Mul(255.0);
       if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
