@@ -456,6 +456,52 @@ step and the image at 32x16 and 14x10
 `TestStableDiffusionPipelineFreeUOpenCL`), all < 1e-4. No real checkpoint has
 been run with FreeU yet.
 
+## DeepCache (`--deepcache`)
+
+DeepCache (Ma et al. 2023, arXiv:2312.00858; reference code
+horseee/DeepCache `DeepCacheSDHelper`) skips most of the UNet on most steps.
+The deep features of the UNet change little from one step to the next, so
+`--deepcache N` runs the whole UNet on steps 0, N, 2N, ... of each image and,
+on the steps between, only the shallow branch: `conv_in`, the time embedding,
+the first resnets of down block 0, the last resnets of the last up block and
+`conv_out`. The input of those last up-block resnets comes from the last
+whole run instead of from the deep layers. This is DeepCache's uniform mode;
+it needs no new weights and changes the image (it is an approximation).
+
+`--deepcache-branch B` (DeepCache `cache_branch_id`, 0..`layers_per_block`)
+sets the size of the shallow branch: B resnets of down block 0 and B + 1
+resnets of the last up block run (with their attention). The default is
+`layers_per_block` (2 on SD 1.5): down block 0 and the last up block run
+whole. `--deepcache-branch 0` runs the fewest layers and is DeepCache's own
+default (`set_params(cache_interval=3, cache_branch_id=0)`).
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 50 \
+  --sampler ddim --deepcache 3 --prompt "a watercolor painting of a lighthouse" --gpu --stats
+```
+
+Each kind of UNet pass keeps its own deep features: the prompt and the
+unconditional pass of classifier-free guidance, and the three passes of
+InstructPix2Pix. img2img and inpainting count the steps from the first step
+they run. A ControlNet still runs every step, but on a shallow-only step only
+its residuals for the shallow skips reach the UNet; T2I-Adapter features of
+deep blocks are likewise those of the last whole run. `--stats` shows how many
+passes ran only the shallow branch.
+
+`TStableDiffusionPipeline.DeepCacheInterval` (1 = off) and `DeepCacheBranch`
+are the API. `BuildSDUNet` records the split of every branch
+(`TSDUNetDeepCacheLayout`) and checks that no shallow layer reads a deep one;
+`SDUNetDenoise` with a `TDiTFirstBlockCache` (`Interval`) runs layers up to
+the split, writes back the kept output of the cache point and runs the rest.
+diffusers has no DeepCache, so the tests compare with a hand-written loop on
+the pico folder instead: interval 1 bit-identical to the plain loop, interval
+3 bit-identical to a loop that runs the whole UNet and then reruns the tail
+from the kept output, on every branch, with CFG
+(`TestStableDiffusionDeepCacheReference`); img2img
+(`TestStableDiffusionDeepCacheImg2Img`); OpenCL against the CPU < 1e-4
+(`TestStableDiffusionDeepCacheOpenCL`). Speed and image quality on a real
+SD 1.5 checkpoint have not been measured yet.
+
 ## Usage
 
 ```
@@ -520,6 +566,11 @@ StableDiffusion [--model DIR] [options]
   --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales S1, S2 and
                     backbone scales B1, B2 of the first two up blocks; presets
                     sd15 (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)
+  --deepcache N     DeepCache: the whole UNet every N-th step, only its shallow
+                    branch in between (default 1 = off; DeepCache's SD example uses 3)
+  --deepcache-branch B shallow branch size, 0..layers_per_block: B resnets of
+                    down block 0 and B + 1 of the last up block run (default
+                    layers_per_block: both blocks whole; 0 is the fastest)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

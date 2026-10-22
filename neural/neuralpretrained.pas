@@ -9384,10 +9384,19 @@ type
   // ShouldRunRemainingBlocks, then either runs the other blocks and calls
   // StoreTailResidual with the last block's output, or skips them and calls
   // ApplyTailResidual on block 0's output. Only the residuals of the last
-  // fully computed step are kept, as diffusers does. Coded by Claude (AI).
+  // fully computed step are kept, as diffusers does. Interval > 1 decides by
+  // the step count instead (DeepCache's uniform mode); with the parameterless
+  // ShouldRunRemainingBlocks the caller keeps the tail OUTPUT itself through
+  // StoreTailOutput / RestoreTailOutput (SDUNetDenoise's DeepCache split).
+  // Coded by Claude (AI).
   TDiTFirstBlockCache = class(TObject)
   private
     FThreshold: TNeuralFloat;
+    FInterval: integer;
+    // The tail output a run step stored (parameterless decisions only).
+    FTailOutput: TNNetVolume;
+    // The last decision came from the parameterless ShouldRunRemainingBlocks.
+    FIsOutputKept: boolean;
     // Block 0's residual of this step, and of the last fully computed step.
     FResidual, FHeadResidual: TNNetVolume;
     FHeadResidualSumAbs: TNeuralFloat;
@@ -9398,6 +9407,12 @@ type
     FStepCount, FSkippedStepCount: integer;
     FLastRelativeDiff: TNeuralFloat;
     function GetEnabled(): boolean;
+    procedure SetInterval(Value: integer);
+    // Interval mode: true on the first step after Reset, with no kept tail,
+    // and on every Interval-th step.
+    function IsIntervalRunStep(): boolean;
+    // Raises unless the last decision kept what Caller works on.
+    procedure CheckKeptKind(IsOutput: boolean; const Caller: string);
   public
     constructor Create(pThreshold: TNeuralFloat = 0);
     destructor Destroy(); override;
@@ -9408,13 +9423,22 @@ type
     // r = HeadOutput - HeadInput. True on the first step after Reset or when
     // mean|r - r_prev| / mean|r_prev| > Threshold; true keeps r as r_prev.
     function ShouldRunRemainingBlocks(HeadInput,
-      HeadOutput: TNNetVolume): boolean;
+      HeadOutput: TNNetVolume): boolean; overload;
     // After ShouldRunRemainingBlocks = true: keeps TailOutput - HeadOutput.
     procedure StoreTailResidual(TailOutput: TNNetVolume);
     // After ShouldRunRemainingBlocks = false: HeadOutput += the kept residual.
     procedure ApplyTailResidual(HeadOutput: TNNetVolume);
+    // The Interval decision for a caller that keeps the tail output, not a
+    // residual: true asks for StoreTailOutput, false for RestoreTailOutput.
+    function ShouldRunRemainingBlocks(): boolean; overload;
+    procedure StoreTailOutput(TailOutput: TNNetVolume);
+    // Dest := the kept tail output (Dest must already have its size).
+    procedure RestoreTailOutput(Dest: TNNetVolume);
     // 0 = off: the caller runs every block and never asks.
     property Threshold: TNeuralFloat read FThreshold write FThreshold;
+    // 1 = off (the default); N > 1 runs the remaining blocks on steps 0, N,
+    // 2N, ... since Reset and skips the others, whatever Threshold says.
+    property Interval: integer read FInterval write SetInterval;
     property Enabled: boolean read GetEnabled;
     // ShouldRunRemainingBlocks calls since Reset, and how many said false.
     property StepCount: integer read FStepCount;
@@ -11980,7 +12004,28 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil): TNNet; overload;
+
+type
+  // A DeepCache split of a BuildSDUNet forward (Ma et al. 2023): layers
+  // 0..HeadEndIdx and CachePointIdx+1..last are the shallow branch; the
+  // layers between them are the deep one, ending in the cached CachePointIdx.
+  TSDUNetDeepCacheSplit = record
+    HeadEndIdx, CachePointIdx: integer;
+  end;
+  // Indexed by the DeepCache branch B (0..LayersPerBlock): the shallow branch
+  // runs down block 0's first B resnets and the last up block's last B + 1;
+  // B = LayersPerBlock runs both blocks whole. Empty for a 1-block UNet.
+  TSDUNetDeepCacheLayout = array of TSDUNetDeepCacheSplit;
+
+// BuildSDUNet that also returns the DeepCache split of every branch; it raises
+// when a shallow layer would read a deep one.
+function BuildSDUNet(Reader: TNNetSafeTensorsReader;
+  const Config: TSDUNetConfig; out DeepCacheLayout: TSDUNetDeepCacheLayout;
+  pTrainable: boolean = true; pWithControl: boolean = false;
+  pWithAdapter: boolean = false;
+  IPAdapterReader: TNNetSafeTensorsReader = nil;
+  pWeightOwner: TNNet = nil): TNNet; overload;
 
 // IPAdapterFile '' builds no IP-Adapter attention.
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
@@ -12033,6 +12078,12 @@ procedure SDUNetFillGuidanceScale(const Inputs: TSDUNetConditioningInputs;
 // (TextSeqLen, 1, CrossDim).
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+  overload;
+// With Cache (Interval > 1), a step it skips runs only Split's shallow branch
+// on the deep output Cache kept; nil or Interval 1 runs the full forward.
+procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume;
+  Cache: TDiTFirstBlockCache; const Split: TSDUNetDeepCacheSplit); overload;
 
 // SDXL single-step denoise for a UNet built with addition_embed_type=="text_time"
 // (Config.UseAddEmbedding=true). PooledText is the (AdditionEmbedTextDim) pooled
@@ -12186,6 +12237,8 @@ type
     TransfersCounted: boolean;
     // UNet passes of the last Denoise: one per model eval, two when guided.
     UNetPassCount: integer;
+    // The passes of UNetPassCount that ran only the DeepCache shallow branch.
+    UNetCachedPassCount: integer;
   end;
 
   TStableDiffusionPipeline = class;
@@ -12222,6 +12275,10 @@ type
     procedure PredictPass(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume);
+    // SDUNetDenoise under the pipeline's DeepCache of the pass PredictPass runs
+    // (a full forward outside one, or with DeepCacheInterval 1).
+    procedure DenoiseUNet(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat; Pred: TNNetVolume);
     // Appends the conditioners whose FillUNetInputs runs before every pass.
     procedure CollectConditioners(
       var Conditioners: TStableDiffusionConditionerArray); virtual;
@@ -12341,6 +12398,13 @@ type
     FUNetInputs: TSDUNetConditioningInputs;
     FPassConditioners: TStableDiffusionConditionerArray;
     FStepPos, FStepCount: integer;
+    // DeepCache: one step cache per pass kind (DeepCacheFor), the DeepCache
+    // layout of the kept FUNet, the split Denoise runs, the running pass's cache.
+    FDeepCacheInterval, FDeepCacheBranch: integer;
+    FDeepCaches: array[0..3] of TDiTFirstBlockCache;
+    FUNetDeepCacheLayout: TSDUNetDeepCacheLayout;
+    FDeepCacheSplit: TSDUNetDeepCacheSplit;
+    FPassDeepCache: TDiTFirstBlockCache;
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
     FLoRAScales: TNeuralFloatDynArr;
@@ -12382,13 +12446,15 @@ type
     // after starting its load phase; ReleaseComponent ends its use.
     function AcquireTextEncoder(SeqLen: integer): TNNet;
     function AcquireUNet(GridX, GridY, TextSeqLen: integer;
-      WithControl, WithAdapter: boolean; const IPAdapterFile: string): TNNet;
+      WithControl, WithAdapter: boolean; const IPAdapterFile: string;
+      out DeepCacheLayout: TSDUNetDeepCacheLayout): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
     function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
     // The UNet / VAE nets read from their weights file (WeightFileLoadCount);
     // pWeightOwner set: the net borrows its weights and nothing is read.
     function BuildUNet(GridX, GridY, TextSeqLen: integer; WithControl,
       WithAdapter: boolean; const IPAdapterFile: string;
+      out DeepCacheLayout: TSDUNetDeepCacheLayout;
       pWeightOwner: TNNet = nil): TNNet;
     function BuildVaeDecoderNet(GridX, GridY: integer;
       pWeightOwner: TNNet = nil): TNNet;
@@ -12440,6 +12506,10 @@ type
     // smLCM swaps in a TNNetLCMScheduler of the same scheduler config
     // (diffusers LCMScheduler.from_config).
     procedure SetSampler(Value: TNNetSamplerMethod);
+    procedure SetDeepCacheInterval(Value: integer);
+    procedure SetDeepCacheBranch(Value: integer);
+    // The step cache of the passes that see Inputs; nil when DeepCache is off.
+    function DeepCacheFor(Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12578,6 +12648,15 @@ type
     // Nets built by reading a weights file (text encoder, UNet, VAE, ControlNet,
     // T2I-Adapter, depth estimator); a kept net rebuilt for a new size reads none.
     property WeightFileLoadCount: integer read FWeightFileLoadCount;
+    // DeepCache (Ma et al. 2023, uniform mode): every UNet pass kind runs whole
+    // on steps 0, N, 2N, ... of each Denoise and only its shallow branch in
+    // between, reusing the deep branch output of its last whole run. 1 = off.
+    property DeepCacheInterval: integer read FDeepCacheInterval
+      write SetDeepCacheInterval;
+    // DeepCache cache_branch_id (TSDUNetDeepCacheLayout), 0..LayersPerBlock;
+    // default LayersPerBlock (down block 0 and the last up block run whole).
+    property DeepCacheBranch: integer read FDeepCacheBranch
+      write SetDeepCacheBranch;
   end;
 
 // A1111 / lpw_stable_diffusion parse_prompt_attention: "(a:1.3)", "(a)" x 1.1,
@@ -76412,6 +76491,61 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
   pWeightOwner: TNNet = nil): TNNet;
 var
+  DeepCacheLayout: TSDUNetDeepCacheLayout;
+begin
+  Result := BuildSDUNet(Reader, Config, DeepCacheLayout, pTrainable,
+    pWithControl, pWithAdapter, IPAdapterReader, pWeightOwner);
+end;
+
+// Raises unless every layer after each CachePointIdx reads only the head
+// (0..HeadEndIdx), the cache point or the tail.
+procedure SDUNetCheckDeepCacheLayout(NN: TNNet;
+  const DeepCacheLayout: TSDUNetDeepCacheLayout);
+var
+  InputLayers: TList;
+  Split: TSDUNetDeepCacheSplit;
+  BranchPos, MaxBranchPos, LayerPos, MaxLayerPos, InputPos, MaxInputPos,
+    InputIdx: integer;
+begin
+  MaxBranchPos := High(DeepCacheLayout);
+  MaxLayerPos := NN.GetLastLayerIdx();
+  InputLayers := TList.Create();
+  try
+    for BranchPos := 0 to MaxBranchPos do
+    begin
+      Split := DeepCacheLayout[BranchPos];
+      if (Split.HeadEndIdx < 0) or (Split.CachePointIdx <= Split.HeadEndIdx) or
+        (Split.CachePointIdx >= MaxLayerPos) then
+        ImportError('SD UNet import: DeepCache branch ' + IntToStr(BranchPos) +
+          ' has head end ' + IntToStr(Split.HeadEndIdx) + ' and cache point ' +
+          IntToStr(Split.CachePointIdx) + '.');
+      for LayerPos := Split.CachePointIdx + 1 to MaxLayerPos do
+      begin
+        InputLayers.Clear();
+        NN.Layers[LayerPos].AppendInputLayers(InputLayers);
+        MaxInputPos := InputLayers.Count - 1;
+        for InputPos := 0 to MaxInputPos do
+        begin
+          InputIdx := TNNetLayer(InputLayers[InputPos]).LayerIdx;
+          if (InputIdx > Split.HeadEndIdx) and (InputIdx < Split.CachePointIdx) then
+            ImportError('SD UNet import: DeepCache branch ' +
+              IntToStr(BranchPos) + ': shallow layer ' + IntToStr(LayerPos) +
+              ' reads deep layer ' + IntToStr(InputIdx) + '.');
+        end;
+      end;
+    end;
+  finally
+    InputLayers.Free;
+  end;
+end;
+
+function BuildSDUNet(Reader: TNNetSafeTensorsReader;
+  const Config: TSDUNetConfig; out DeepCacheLayout: TSDUNetDeepCacheLayout;
+  pTrainable: boolean = true; pWithControl: boolean = false;
+  pWithAdapter: boolean = false;
+  IPAdapterReader: TNNetSafeTensorsReader = nil;
+  pWeightOwner: TNNet = nil): TNNet;
+var
   NN: TNNet;
   IPKeyInput, IPValueInput: TNNetLayer;
   IPConfig: TIPAdapterConfig;
@@ -76482,6 +76616,8 @@ begin
   if IPAdapterReader <> nil then
     IPConfig := ReadIPAdapterImageProjConfig(IPAdapterReader,
       Config.CrossAttentionDim);
+  DeepCacheLayout := nil;
+  if n >= 2 then SetLength(DeepCacheLayout, NumResnet + 1);
   NN := TNNet.Create();
   try
     NN.BuildWeightOwner := pWeightOwner;
@@ -76629,6 +76765,8 @@ begin
       for j := 0 to NumResnetM1 do
       begin
         if j = 0 then b := InCh else b := OutCh;
+        if (i = 0) and (n >= 2) then
+          DeepCacheLayout[j].HeadEndIdx := NN.GetLastLayerIdx();
         AddSDResnetBlock(NN, Config, TimeCond, HLayer, b, OutCh, pTrainable,
           DownRes[i][j]);
         HLayer := NN.GetLastLayer();
@@ -76655,6 +76793,8 @@ begin
       InCh := OutCh;
       if i < nM1 then
       begin
+        if i = 0 then
+          DeepCacheLayout[NumResnet].HeadEndIdx := NN.GetLastLayerIdx();
         // Downsample2D: symmetric pad-1 stride-2 3x3 conv.
         DownSamp[i] := NN.AddLayerAfter(
           [TNNetConvolutionLinear.Create(OutCh, 3, 1, 2, 0).SetTrainable(pTrainable)],
@@ -76712,6 +76852,10 @@ begin
         // pop the LIFO skip, concat on channels, then resnet.
         Dec(SkipTop);
         PoppedCh := SkipCh[SkipTop];
+        // DeepCache: the last up block's resnet j starts the shallow tail of
+        // branch NumResnet - j; HLayer is the layer added last.
+        if (i = nM1) and (n >= 2) then
+          DeepCacheLayout[NumResnet - j].CachePointIdx := HLayer.LayerIdx;
         if j = 0 then ResnetIn := PrevOut else ResnetIn := OutCh;
         // FreeU acts on the first two up blocks (diffusers resolution_idx 0, 1).
         if Config.UseFreeU and (i <= 1) then
@@ -76756,6 +76900,7 @@ begin
     ConvOut := NN.AddLayer(
       TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
+    SDUNetCheckDeepCacheLayout(NN, DeepCacheLayout);
     if pWeightOwner <> nil then
     begin
       EndBorrowingBuild(NN, 'SD UNet import');
@@ -76907,11 +77052,14 @@ begin
     pWithControl, pWithAdapter, IPAdapterFile);
 end;
 
-function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+// BuildSDUNetFromSafeTensorsEx (LoRA) returning the DeepCache layout; the
+// net is inference-only.
+function BuildSDUNetFromSafeTensorsWithLayout(const FileName: string;
   const Config: TSDUNetConfig; const LoRAFiles: array of string;
-  const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
-  pWithControl: boolean = false; pWithAdapter: boolean = false;
-  const IPAdapterFile: string = ''): TNNet;
+  const LoRAScales: array of TNeuralFloat;
+  out DeepCacheLayout: TSDUNetDeepCacheLayout; pWithControl,
+  pWithAdapter: boolean; const IPAdapterFile: string;
+  pTrainable: boolean = false): TNNet;
 var
   Reader, IPAdapterReader: TNNetSafeTensorsReader;
 begin
@@ -76923,12 +77071,25 @@ begin
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
-    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl, pWithAdapter,
-      IPAdapterReader);
+    Result := BuildSDUNet(Reader, Config, DeepCacheLayout, pTrainable,
+      pWithControl, pWithAdapter, IPAdapterReader);
   finally
     IPAdapterReader.Free;
     Reader.Free;
   end;
+end;
+
+function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+  const Config: TSDUNetConfig; const LoRAFiles: array of string;
+  const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
+  pWithControl: boolean = false; pWithAdapter: boolean = false;
+  const IPAdapterFile: string = ''): TNNet;
+var
+  DeepCacheLayout: TSDUNetDeepCacheLayout;
+begin
+  Result := BuildSDUNetFromSafeTensorsWithLayout(FileName, Config, LoRAFiles,
+    LoRAScales, DeepCacheLayout, pWithControl, pWithAdapter, IPAdapterFile,
+    pTrainable);
 end;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
@@ -77144,8 +77305,18 @@ end;
 
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+begin
+  SDUNetDenoise(Net, Config, Latent, EncStates, t, Noise, nil,
+    Default(TSDUNetDeepCacheSplit));
+end;
+
+// A run step stores the cache point before the tail runs: nothing after it
+// may overwrite it first. A skipped step writes it back on the host.
+procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume;
+  Cache: TDiTFirstBlockCache; const Split: TSDUNetDeepCacheSplit);
 var
-  TextIn: TNNetLayer;
+  TextIn, CachePoint: TNNetLayer;
 begin
   SDUNetTimestepInput(Net).Output.FData[0] := t;
   TextIn := SDUNetTextStatesInput(Net);
@@ -77154,7 +77325,29 @@ begin
       IntToStr(EncStates.Size) + ' <> the net text input size ' +
       IntToStr(TextIn.Output.Size) + ' (TextSeqLen/CrossDim mismatch?).');
   TextIn.Output.Copy(EncStates);
-  Net.Compute(Latent);
+  if (Cache = nil) or (Cache.Interval <= 1) then Net.Compute(Latent)
+  else
+  begin
+    if (Split.HeadEndIdx < 0) or (Split.CachePointIdx <= Split.HeadEndIdx) or
+      (Split.CachePointIdx >= Net.GetLastLayerIdx()) then
+      ImportError('SDUNetDenoise: DeepCache split ' +
+        IntToStr(Split.HeadEndIdx) + '/' + IntToStr(Split.CachePointIdx) +
+        ' does not fit a net of ' + IntToStr(Net.CountLayers()) + ' layers.');
+    CachePoint := Net.Layers[Split.CachePointIdx];
+    if Cache.ShouldRunRemainingBlocks() then
+    begin
+      Net.Compute(Latent, 0, false, Split.CachePointIdx);
+      CachePoint.ForceOutputOnRAM();
+      Cache.StoreTailOutput(CachePoint.Output);
+    end
+    else
+    begin
+      Net.Compute(Latent, 0, false, Split.HeadEndIdx);
+      Cache.RestoreTailOutput(CachePoint.Output);
+      CachePoint.MarkOutputWrittenOnRAM();
+    end;
+    Net.ComputeFromFilledInput(Split.CachePointIdx + 1, false, -1);
+  end;
   Net.GetOutput(Noise);
 end;
 
@@ -94178,14 +94371,17 @@ constructor TDiTFirstBlockCache.Create(pThreshold: TNeuralFloat);
 begin
   inherited Create();
   FThreshold := pThreshold;
+  FInterval := 1;
   FResidual := TNNetVolume.Create();
   FHeadResidual := TNNetVolume.Create();
   FHeadMinusTail := TNNetVolume.Create();
+  FTailOutput := TNNetVolume.Create();
   Reset();
 end;
 
 destructor TDiTFirstBlockCache.Destroy();
 begin
+  FTailOutput.Free;
   FHeadMinusTail.Free;
   FHeadResidual.Free;
   FResidual.Free;
@@ -94194,7 +94390,30 @@ end;
 
 function TDiTFirstBlockCache.GetEnabled(): boolean;
 begin
-  Result := FThreshold > 0;
+  Result := (FThreshold > 0) or (FInterval > 1);
+end;
+
+procedure TDiTFirstBlockCache.SetInterval(Value: integer);
+begin
+  if Value < 1 then
+    raise Exception.Create('TDiTFirstBlockCache.Interval: ' +
+      IntToStr(Value) + ' must be >= 1 (1 = off).');
+  FInterval := Value;
+end;
+
+// FStepCount is the 0-based index of the step being decided.
+function TDiTFirstBlockCache.IsIntervalRunStep(): boolean;
+begin
+  Result := not FHasTailResidual or (FStepCount mod FInterval = 0);
+end;
+
+procedure TDiTFirstBlockCache.CheckKeptKind(IsOutput: boolean;
+  const Caller: string);
+begin
+  if IsOutput <> FIsOutputKept then
+    raise Exception.Create('TDiTFirstBlockCache.' + Caller + ': the last ' +
+      'ShouldRunRemainingBlocks call keeps a tail ' +
+      BoolToStr(FIsOutputKept, 'output', 'residual') + '.');
 end;
 
 procedure TDiTFirstBlockCache.Reset();
@@ -94202,6 +94421,7 @@ begin
   FHasHeadResidual := false;
   FHasTailResidual := false;
   FIsTailPending := false;
+  FIsOutputKept := false;
   FHeadResidualSumAbs := 0;
   FStepCount := 0;
   FSkippedStepCount := 0;
@@ -94214,6 +94434,7 @@ begin
   FResidual.ReSize(1, 1, 1);
   FHeadResidual.ReSize(1, 1, 1);
   FHeadMinusTail.ReSize(1, 1, 1);
+  FTailOutput.ReSize(1, 1, 1);
 end;
 
 // mean|r - r_prev| / mean|r_prev| is computed as the ratio of the two sums;
@@ -94227,18 +94448,25 @@ begin
     raise Exception.Create('TDiTFirstBlockCache: block 0 input has ' +
       IntToStr(HeadInput.Size) + ' values, its output ' +
       IntToStr(HeadOutput.Size) + '.');
+  if FIsOutputKept then
+  begin
+    // A tail output is no residual: start over from a run step.
+    FIsOutputKept := false;
+    FHasTailResidual := false;
+  end;
   FResidual.Copy(HeadOutput);
   FResidual.Sub(HeadInput);
-  Inc(FStepCount);
   FLastRelativeDiff := -1;
   Result := true;
-  if FHasHeadResidual and FHasTailResidual and
+  if FInterval > 1 then Result := IsIntervalRunStep()
+  else if FHasHeadResidual and FHasTailResidual and
     (FHeadResidual.Size = FResidual.Size) and (FHeadResidualSumAbs > 0) then
   begin
     FLastRelativeDiff := FResidual.SumDiff(FHeadResidual) /
       FHeadResidualSumAbs;
     Result := FLastRelativeDiff > FThreshold;
   end;
+  Inc(FStepCount);
   if Result then
   begin
     Swap := FHeadResidual;
@@ -94253,8 +94481,54 @@ begin
   else Inc(FSkippedStepCount);
 end;
 
+function TDiTFirstBlockCache.ShouldRunRemainingBlocks(): boolean;
+begin
+  if FInterval <= 1 then
+    raise Exception.Create('TDiTFirstBlockCache.ShouldRunRemainingBlocks: ' +
+      'without block 0''s input and output only Interval > 1 can decide.');
+  if not FIsOutputKept then
+  begin
+    FIsOutputKept := true;
+    FHasTailResidual := false;
+  end;
+  FLastRelativeDiff := -1;
+  Result := IsIntervalRunStep();
+  Inc(FStepCount);
+  if Result then
+  begin
+    FHasTailResidual := false;
+    FIsTailPending := true;
+  end
+  else Inc(FSkippedStepCount);
+end;
+
+procedure TDiTFirstBlockCache.StoreTailOutput(TailOutput: TNNetVolume);
+begin
+  CheckKeptKind(true, 'StoreTailOutput');
+  if not FIsTailPending then
+    raise Exception.Create('TDiTFirstBlockCache.StoreTailOutput: ' +
+      'ShouldRunRemainingBlocks did not ask for the remaining blocks.');
+  FTailOutput.Copy(TailOutput);
+  FIsTailPending := false;
+  FHasTailResidual := true;
+end;
+
+procedure TDiTFirstBlockCache.RestoreTailOutput(Dest: TNNetVolume);
+begin
+  CheckKeptKind(true, 'RestoreTailOutput');
+  if FIsTailPending or not FHasTailResidual then
+    raise Exception.Create('TDiTFirstBlockCache.RestoreTailOutput: no tail ' +
+      'output from a fully computed step.');
+  if Dest.Size <> FTailOutput.Size then
+    raise Exception.Create('TDiTFirstBlockCache.RestoreTailOutput: the ' +
+      'destination has ' + IntToStr(Dest.Size) + ' values, the kept output ' +
+      IntToStr(FTailOutput.Size) + '.');
+  Dest.CopyNoChecks(FTailOutput);
+end;
+
 procedure TDiTFirstBlockCache.StoreTailResidual(TailOutput: TNNetVolume);
 begin
+  CheckKeptKind(false, 'StoreTailResidual');
   if not FIsTailPending then
     raise Exception.Create('TDiTFirstBlockCache.StoreTailResidual: ' +
       'ShouldRunRemainingBlocks did not ask for the remaining blocks.');
@@ -94269,6 +94543,7 @@ end;
 
 procedure TDiTFirstBlockCache.ApplyTailResidual(HeadOutput: TNNetVolume);
 begin
+  CheckKeptKind(false, 'ApplyTailResidual');
   if FIsTailPending or not FHasTailResidual then
     raise Exception.Create('TDiTFirstBlockCache.ApplyTailResidual: no tail ' +
       'residual from a fully computed step.');
@@ -94620,6 +94895,7 @@ var
   Root, Node: TJSONData;
   Obj: TJSONObject;
   IndexFile, TokenizerConfigFile, SpecialTokensFile: string;
+  CachePos: integer;
 
   procedure ReadPadToken(Config: TJSONObject);
   var
@@ -94634,6 +94910,9 @@ var
 begin
   inherited Create;
   FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
+  for CachePos := 0 to High(FDeepCaches) do
+    FDeepCaches[CachePos] := TDiTFirstBlockCache.Create();
+  FDeepCacheInterval := 1;
   FNegativePromptEmbeds := TNNetVolume.Create();
   FInversionVectors := TNNetVolumeList.Create();
   FGuidanceScale := 7.5;
@@ -94703,6 +94982,7 @@ begin
       ComponentFolder('scheduler') + 'scheduler_config.json');
   FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
     'config.json');
+  FDeepCacheBranch := FUNetConfig.LayersPerBlock;
   FVaeConfig := ReadVaeDecoderConfigFromJSONFile(ComponentFolder('vae') +
     'config.json');
   if FUNetConfig.UseAddEmbedding then
@@ -94728,8 +95008,11 @@ begin
 end;
 
 destructor TStableDiffusionPipeline.Destroy();
+var
+  CachePos: integer;
 begin
   UnloadComponents();
+  for CachePos := 0 to High(FDeepCaches) do FDeepCaches[CachePos].Free;
   FPlainConditioner.Free;
   {$IFDEF OpenCL}
   FOpenCLDevices.Free;
@@ -94845,6 +95128,7 @@ end;
 // Phases sdphLoadTextEncoder, sdphLoadUNet, sdphLoadVae, then sdphDone.
 procedure TStableDiffusionPipeline.LoadComponents(Width, Height: integer);
 var
+  DeepCacheLayout: TSDUNetDeepCacheLayout;
   GridX, GridY: integer;
 begin
   if Width < 1 then Width := GetDefaultImageSize();
@@ -94856,7 +95140,7 @@ begin
     AcquireUNet(GridX, GridY, FMaxTokenCount,
       ActiveConditioner().UNetWithControl(),
       ActiveConditioner().UNetWithAdapter(),
-      ActiveConditioner().UNetIPAdapterFile());
+      ActiveConditioner().UNetIPAdapterFile(), DeepCacheLayout);
     AcquireVaeDecoder(GridX, GridY);
   except
     UnloadComponents();
@@ -94939,25 +95223,25 @@ end;
 
 function TStableDiffusionPipeline.BuildUNet(GridX, GridY, TextSeqLen: integer;
   WithControl, WithAdapter: boolean; const IPAdapterFile: string;
-  pWeightOwner: TNNet): TNNet;
+  out DeepCacheLayout: TSDUNetDeepCacheLayout; pWeightOwner: TNNet): TNNet;
 var
   IPAdapterReader: TNNetSafeTensorsReader;
 begin
   if pWeightOwner = nil then
   begin
     Inc(FWeightFileLoadCount);
-    exit(BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    exit(BuildSDUNetFromSafeTensorsWithLayout(SafeTensorsFolderWeightsFile(
       ComponentFolder('unet'), 'diffusion_pytorch_model'),
       UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
-      {pTrainable=}false, WithControl, WithAdapter, IPAdapterFile));
+      DeepCacheLayout, WithControl, WithAdapter, IPAdapterFile));
   end;
   IPAdapterReader := nil;
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
     Result := BuildSDUNet(nil, UNetStepConfig(GridX, GridY, TextSeqLen),
-      {pTrainable=}false, WithControl, WithAdapter, IPAdapterReader,
-      pWeightOwner);
+      DeepCacheLayout, {pTrainable=}false, WithControl, WithAdapter,
+      IPAdapterReader, pWeightOwner);
   finally
     IPAdapterReader.Free;
   end;
@@ -94965,12 +95249,19 @@ end;
 
 function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
   TextSeqLen: integer; WithControl, WithAdapter: boolean;
-  const IPAdapterFile: string): TNNet;
+  const IPAdapterFile: string;
+  out DeepCacheLayout: TSDUNetDeepCacheLayout): TNNet;
+var
+  OwnerLayout: TSDUNetDeepCacheLayout;
 begin
   if Assigned(FUNet) and (FUNetGridX = GridX) and (FUNetGridY = GridY) and
     (FUNetTextSeqLen = TextSeqLen) and (FUNetWithControl = WithControl) and
     (FUNetWithAdapter = WithAdapter) and
-    (FUNetIPAdapterFile = IPAdapterFile) then exit(FUNet);
+    (FUNetIPAdapterFile = IPAdapterFile) then
+  begin
+    DeepCacheLayout := FUNetDeepCacheLayout;
+    exit(FUNet);
+  end;
   DoPhase(sdphLoadUNet);
   FreeAndNil(FUNet);
   if FKeepComponents then
@@ -94979,16 +95270,17 @@ begin
     if FUNetOwner = nil then
     begin
       // The control / adapter inputs are weightless: one owner serves all.
-      FUNetOwner := BuildUNet(1, 1, 1, false, false, IPAdapterFile);
+      FUNetOwner := BuildUNet(1, 1, 1, false, false, IPAdapterFile,
+        OwnerLayout);
       FUNetOwnerIPAdapterFile := IPAdapterFile;
       if FUNetInt8 then FUNetOwner.QuantizeWeightsInt8();
     end;
     Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
-      IPAdapterFile, FUNetOwner);
+      IPAdapterFile, DeepCacheLayout, FUNetOwner);
   end
   else
     Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
-      IPAdapterFile);
+      IPAdapterFile, DeepCacheLayout);
   try
     // A borrowing net links the owner's int8 tables.
     PrepareComponent(Result, FUNetInt8 and not FKeepComponents);
@@ -94999,6 +95291,7 @@ begin
   if FKeepComponents then
   begin
     FUNet := Result;
+    FUNetDeepCacheLayout := DeepCacheLayout;
     FUNetGridX := GridX;
     FUNetGridY := GridY;
     FUNetTextSeqLen := TextSeqLen;
@@ -95198,6 +95491,34 @@ begin
       ComponentFolder('scheduler') + 'scheduler_config.json');
   end;
   FSampler := Value;
+end;
+
+procedure TStableDiffusionPipeline.SetDeepCacheInterval(Value: integer);
+begin
+  if Value < 1 then
+    ImportError('TStableDiffusionPipeline.DeepCacheInterval: ' +
+      IntToStr(Value) + ' must be >= 1 (1 = off).');
+  FDeepCacheInterval := Value;
+end;
+
+procedure TStableDiffusionPipeline.SetDeepCacheBranch(Value: integer);
+begin
+  if (Value < 0) or (Value > FUNetConfig.LayersPerBlock) then
+    ImportError('TStableDiffusionPipeline.DeepCacheBranch: ' +
+      IntToStr(Value) + ' is not in 0..' +
+      IntToStr(FUNetConfig.LayersPerBlock) + ' (the unet layers_per_block).');
+  FDeepCacheBranch := Value;
+end;
+
+// The pass kinds of a step (CFG, InstructPix2Pix) each keep their own deep
+// branch output: Inputs as a 2-bit index.
+function TStableDiffusionPipeline.DeepCacheFor(
+  Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
+begin
+  Result := nil;
+  if FDeepCacheInterval > 1 then
+    Result := FDeepCaches[Ord(sdpiPrompt in Inputs) +
+      2 * Ord(sdpiImage in Inputs)];
 end;
 
 procedure TStableDiffusionPipeline.EnableFreeU(S1, S2, B1, B2: TNeuralFloat);
@@ -95910,7 +96231,8 @@ var
   Pred, StepNoise: TNNetVolume;
   IsGuided, WithControl, WithAdapter: boolean;
   IPAdapterFile: string;
-  GridX, GridY, StepPos, MaxStepPos, Tt, ChunkCount: integer;
+  DeepCacheLayout: TSDUNetDeepCacheLayout;
+  GridX, GridY, StepPos, MaxStepPos, Tt, ChunkCount, CachePos: integer;
   Eta, NoiseScale: TNeuralFloat;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
@@ -95947,14 +96269,27 @@ begin
   StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
+  FImageStats.UNetCachedPassCount := 0;
   WithControl := StepConditioner.UNetWithControl();
   WithAdapter := StepConditioner.UNetWithAdapter();
   IPAdapterFile := StepConditioner.UNetIPAdapterFile();
   Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX, WithControl,
-    WithAdapter, IPAdapterFile);
+    WithAdapter, IPAdapterFile, DeepCacheLayout);
   Pred := TNNetVolume.Create();
   StepNoise := nil;
   try
+    if FDeepCacheInterval > 1 then
+    begin
+      if FDeepCacheBranch > High(DeepCacheLayout) then
+        ImportError('TStableDiffusionPipeline.Denoise: DeepCache needs a ' +
+          'unet of 2 or more blocks.');
+      FDeepCacheSplit := DeepCacheLayout[FDeepCacheBranch];
+      for CachePos := 0 to High(FDeepCaches) do
+      begin
+        FDeepCaches[CachePos].Interval := FDeepCacheInterval;
+        FDeepCaches[CachePos].Reset();
+      end;
+    end;
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
     FUNetInputs := SDUNetConditioningInputs(Net, StepConfig,
       IPAdapterFile <> '', WithAdapter, WithControl);
@@ -95998,6 +96333,13 @@ begin
     end;
   finally
     EndPhase();
+    // ReleaseBuffers also resets the counts the stats read first.
+    for CachePos := 0 to High(FDeepCaches) do
+    begin
+      Inc(FImageStats.UNetCachedPassCount,
+        FDeepCaches[CachePos].SkippedStepCount);
+      FDeepCaches[CachePos].ReleaseBuffers();
+    end;
     StepConditioner.EndDenoise();
     FPassConditioners := nil;
     FUNetInputs := Default(TSDUNetConditioningInputs);
@@ -96137,8 +96479,23 @@ begin
   if sdpiPrompt in Inputs then Embeds := PromptEmbeds
   else Embeds := FPipeline.FNegativePromptEmbeds;
   FPipeline.FillUNetInputs(Latents, Embeds, Timestep, Inputs);
-  PredictNoise(UNet, Config, Latents, Embeds, Timestep, Inputs, Pred);
+  FPipeline.FPassDeepCache := FPipeline.DeepCacheFor(Inputs);
+  try
+    PredictNoise(UNet, Config, Latents, Embeds, Timestep, Inputs, Pred);
+  finally
+    FPipeline.FPassDeepCache := nil;
+  end;
   Inc(FPipeline.FImageStats.UNetPassCount);
+end;
+
+procedure TStableDiffusionConditioner.DenoiseUNet(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  if Assigned(FPipeline) then
+    SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred,
+      FPipeline.FPassDeepCache, FPipeline.FDeepCacheSplit)
+  else SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
 end;
 
 procedure TStableDiffusionConditioner.CollectConditioners(
@@ -96246,7 +96603,7 @@ procedure TStableDiffusionConditioner.PredictNoise(UNet: TNNet;
   Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
   Pred: TNNetVolume);
 begin
-  SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
+  DenoiseUNet(UNet, Config, Latents, Embeds, Timestep, Pred);
 end;
 
 procedure TStableDiffusionConditioner.AfterStep(Latents: TNNetVolume;
@@ -97003,7 +97360,7 @@ procedure TStableDiffusionImageConditioner.PredictWithExtraChannels(
   Embeds: TNNetVolume; Timestep: TNeuralFloat; Pred: TNNetVolume);
 begin
   FUNetInput.AddLayers(Latents, ExtraChannels);
-  SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
+  DenoiseUNet(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
 end;
 
 procedure TStableDiffusionImageConditioner.SetImage(Image: TNNetVolume);
@@ -97225,7 +97582,7 @@ begin
   if FIsConcatUNet then
     PredictWithExtraChannels(UNet, Config, Latents, FMaskAndImageLatents,
       Embeds, Timestep, Pred)
-  else SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
+  else DenoiseUNet(UNet, Config, Latents, Embeds, Timestep, Pred);
 end;
 
 procedure TStableDiffusionInpainter.AfterStep(Latents: TNNetVolume;

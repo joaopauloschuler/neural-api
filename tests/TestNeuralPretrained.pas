@@ -54,6 +54,8 @@ type
     FSD15StepCount: integer;
     // TStableDiffusionPipeline OnPhase counts (SD15CountPhase).
     FSD15PhaseCounts: array[TStableDiffusionPipelinePhase] of integer;
+    // The latents after step 0 (SDCaptureFirstStep).
+    FSDFirstStepLatents: TNNetVolume;
     function FixturePath(const FileName: string): string;
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
@@ -89,6 +91,13 @@ type
     procedure SD15CheckStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
     procedure SD15CountPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure SDCaptureFirstStep(StepIndex, StepCount: integer;
+      Timestep: double; Latents: TNNetVolume);
+    // Pipeline's guided DDIM denoise by hand on tiny_sd15: each step runs the
+    // whole UNet; a step DeepCache skips then rewrites the cache point and reruns the tail.
+    procedure RunSDDeepCacheReference(Pipeline: TStableDiffusionPipeline;
+      Cond, Uncond: TNNetVolume; StepCount, Interval, Branch: integer;
+      Latents: TNNetVolume);
     // Euler a step noise StepIndex from FSD15Oracle step_noise.
     procedure SD15StepNoise(StepIndex: integer; Noise: TNNetVolume);
     procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
@@ -1353,6 +1362,16 @@ type
     procedure TestStableDiffusionLongPromptTokens;
     procedure TestStableDiffusionLongPromptEmbeds;
     procedure TestStableDiffusionClipSkipParity;
+    // TDiTFirstBlockCache.Interval: the run/skip pattern, the kept tail output,
+    // the residual calls under an Interval, misuse refusals.
+    procedure TestDiTFirstBlockCacheInterval;
+    // SD DeepCache (DDIM, CFG) against RunSDDeepCacheReference: interval 1 bit
+    // for bit, interval 3 on every branch, bad settings refused.
+    procedure TestStableDiffusionDeepCacheReference;
+    // img2img at interval 3: step 0 bit-identical to interval 1, cached passes.
+    procedure TestStableDiffusionDeepCacheImg2Img;
+    // SDUNetDenoise's DeepCache split on a forced-OpenCL UNet vs the CPU.
+    procedure TestStableDiffusionDeepCacheOpenCL;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -48685,6 +48704,425 @@ begin
     Got.Free;
     Root.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.SDCaptureFirstStep(StepIndex,
+  StepCount: integer; Timestep: double; Latents: TNNetVolume);
+begin
+  if StepIndex = 0 then FSDFirstStepLatents.Copy(Latents);
+end;
+
+procedure TTestNeuralPretrained.RunSDDeepCacheReference(
+  Pipeline: TStableDiffusionPipeline; Cond, Uncond: TNNetVolume; StepCount,
+  Interval, Branch: integer; Latents: TNNetVolume);
+var
+  Config: TSDUNetConfig;
+  Reader: TNNetSafeTensorsReader;
+  Net: TNNet;
+  Layout: TSDUNetDeepCacheLayout;
+  CachePoint: TNNetLayer;
+  Schedule: TNeuralIntegerArray;
+  Embeds, Preds, Kept: array[0..1] of TNNetVolume;
+  NoiseScale: TNeuralFloat;
+  StepPos, MaxStepPos, PassPos, Tt: integer;
+begin
+  Config := Pipeline.UNetConfig;
+  Config.LatentGrid := Latents.SizeX;
+  Config.LatentGridY := Latents.SizeY;
+  Config.TextSeqLen := Cond.SizeX;
+  Reader := CreatePretrainedTensorReader(FixturePath(
+    'tiny_sd15/unet/diffusion_pytorch_model.safetensors'));
+  try
+    Net := BuildSDUNet(Reader, Config, Layout, {pTrainable=}false);
+  finally
+    Reader.Free;
+  end;
+  Embeds[0] := Cond;
+  Embeds[1] := Uncond;
+  for PassPos := 0 to 1 do
+  begin
+    Preds[PassPos] := TNNetVolume.Create;
+    Kept[PassPos] := TNNetVolume.Create;
+  end;
+  try
+    AssertEquals('one split per branch', Config.LayersPerBlock + 1,
+      Length(Layout));
+    CachePoint := Net.Layers[Layout[Branch].CachePointIdx];
+    Schedule := Pipeline.Scheduler.BuildSamplerSchedule(StepCount,
+      Pipeline.Scheduler.ConfigSpacing, smDDIM);
+    NoiseScale := Pipeline.Scheduler.InitialNoiseScale(smDDIM,
+      Pipeline.Scheduler.ConfigSpacing, Schedule[0]);
+    if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+    MaxStepPos := Length(Schedule) - 2;
+    for StepPos := 0 to MaxStepPos do
+    begin
+      Tt := Schedule[StepPos];
+      for PassPos := 0 to 1 do
+      begin
+        SDUNetDenoise(Net, Config, Latents, Embeds[PassPos], Tt - 1,
+          Preds[PassPos]);
+        if StepPos mod Interval = 0 then Kept[PassPos].Copy(CachePoint.Output)
+        else
+        begin
+          CachePoint.Output.Copy(Kept[PassPos]);
+          Net.ComputeSerial(Layout[Branch].CachePointIdx + 1);
+          Net.GetOutput(Preds[PassPos]);
+        end;
+      end;
+      TNNetDiffusionScheduler.ApplyCFG(Preds[0], Preds[1], Preds[0],
+        Pipeline.CFGGuidanceScale);
+      Pipeline.Scheduler.Step(Latents, Preds[0], Tt, Schedule[StepPos + 1],
+        smDDIM, 0);
+    end;
+  finally
+    for PassPos := 0 to 1 do
+    begin
+      Kept[PassPos].Free;
+      Preds[PassPos].Free;
+    end;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDiTFirstBlockCacheInterval;
+const
+  ValueCount = 37;
+  // Interval 3 over 7 steps.
+  RunPattern: array[0..6] of boolean =
+    (true, false, false, true, false, false, true);
+var
+  Cache: TDiTFirstBlockCache;
+  HeadInput, HeadOutput, TailOutput, Dest, Expected, OtherSize: TNNetVolume;
+  StepPos, ValuePos: integer;
+
+  function IsRefused(Kind: integer): boolean;
+  begin
+    Result := false;
+    try
+      case Kind of
+        0: Cache.ShouldRunRemainingBlocks();
+        1: Cache.RestoreTailOutput(Dest);
+        2: Cache.ApplyTailResidual(HeadOutput);
+        3: Cache.StoreTailOutput(TailOutput);
+        4: Cache.Interval := 0;
+        5: Cache.RestoreTailOutput(OtherSize);
+      end;
+    except
+      on Exception do Result := true;
+    end;
+  end;
+
+begin
+  Cache := TDiTFirstBlockCache.Create();
+  HeadInput := TNNetVolume.Create(ValueCount, 1, 1);
+  HeadOutput := TNNetVolume.Create(ValueCount, 1, 1);
+  TailOutput := TNNetVolume.Create(ValueCount, 1, 1);
+  Dest := TNNetVolume.Create(ValueCount, 1, 1);
+  Expected := TNNetVolume.Create(ValueCount, 1, 1);
+  OtherSize := TNNetVolume.Create(ValueCount + 1, 1, 1);
+  try
+    AssertEquals('default interval', 1, Cache.Interval);
+    AssertFalse('off by default', Cache.Enabled);
+    AssertTrue('interval 1 cannot decide alone', IsRefused(0));
+    AssertTrue('interval 0 refused', IsRefused(4));
+    Cache.Interval := 3;
+    AssertTrue('interval 3 is on', Cache.Enabled);
+    AssertTrue('no tail output before a run step', IsRefused(1));
+    for StepPos := 0 to High(RunPattern) do
+    begin
+      for ValuePos := 0 to ValueCount - 1 do
+        TailOutput.FData[ValuePos] := StepPos + 0.01 * ValuePos;
+      AssertEquals('step ' + IntToStr(StepPos), RunPattern[StepPos],
+        Cache.ShouldRunRemainingBlocks());
+      if RunPattern[StepPos] then
+      begin
+        AssertTrue('restore refused while the tail is pending', IsRefused(1));
+        Cache.StoreTailOutput(TailOutput);
+        Expected.Copy(TailOutput);
+      end
+      else
+      begin
+        Dest.Fill(-7);
+        Cache.RestoreTailOutput(Dest);
+        AssertEquals('step ' + IntToStr(StepPos) + ' restores the last run',
+          0, MaxAbsVolumeDiff(Dest, Expected), 0);
+      end;
+    end;
+    AssertEquals('steps', 7, Cache.StepCount);
+    AssertEquals('skipped', 4, Cache.SkippedStepCount);
+    AssertTrue('a residual call after an output decision', IsRefused(2));
+    AssertTrue('another size refused', IsRefused(5));
+    Cache.Reset();
+    AssertEquals('reset steps', 0, Cache.StepCount);
+    AssertTrue('first step after Reset runs', Cache.ShouldRunRemainingBlocks());
+    AssertTrue('nothing kept after Reset', IsRefused(1));
+
+    // The residual calls follow the same Interval, whatever Threshold says.
+    Cache.Interval := 2;
+    Cache.Reset();
+    for ValuePos := 0 to ValueCount - 1 do
+    begin
+      HeadInput.FData[ValuePos] := 0.25 * Cos(ValuePos);
+      HeadOutput.FData[ValuePos] := HeadInput.FData[ValuePos] + 1;
+      TailOutput.FData[ValuePos] := 2 * HeadOutput.FData[ValuePos];
+    end;
+    AssertTrue('residual step 0 runs', Cache.ShouldRunRemainingBlocks(
+      HeadInput, HeadOutput));
+    AssertTrue('an output store after a residual decision', IsRefused(3));
+    Cache.StoreTailResidual(TailOutput);
+    AssertFalse('residual step 1 skips', Cache.ShouldRunRemainingBlocks(
+      HeadInput, HeadOutput));
+    Cache.ApplyTailResidual(HeadOutput);
+    AssertEquals('residual skip adds the kept residual', 0,
+      MaxAbsVolumeDiff(HeadOutput, TailOutput), 1e-6);
+    AssertTrue('residual step 2 runs', Cache.ShouldRunRemainingBlocks(
+      HeadInput, HeadOutput));
+    AssertTrue('an output decision after a residual one starts with a run',
+      Cache.ShouldRunRemainingBlocks());
+    AssertEquals('skips across the switch', 1, Cache.SkippedStepCount);
+  finally
+    OtherSize.Free;
+    Expected.Free;
+    Dest.Free;
+    TailOutput.Free;
+    HeadOutput.Free;
+    HeadInput.Free;
+    Cache.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionDeepCacheReference;
+const
+  StepCount = 7;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Cond, Uncond, Initial, Plain, Got, Expected: TNNetVolume;
+  ImageSide, Branch: integer;
+  MaxDiff: double;
+  Refused: boolean;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Cond := TNNetVolume.Create;
+  Uncond := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Pipeline.Sampler := smDDIM;
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompts(['a red cube on a table', ''], [Cond, Uncond]);
+    Pipeline.SetNegativePromptEmbeds(Uncond);
+    ImageSide := Pipeline.DefaultImageSize;
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    AssertEquals('default interval', 1, Pipeline.DeepCacheInterval);
+    AssertEquals('default branch', Pipeline.UNetConfig.LayersPerBlock,
+      Pipeline.DeepCacheBranch);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Cond, ImageSide, ImageSide, StepCount, Plain);
+    AssertEquals('interval 1 caches nothing', 0,
+      Pipeline.ImageStats.UNetCachedPassCount);
+    Expected.Copy(Initial);
+    RunSDDeepCacheReference(Pipeline, Cond, Uncond, StepCount, 1, 0, Expected);
+    AssertEquals('interval 1 bit-identical to the plain loop', 0,
+      MaxAbsVolumeDiff(Plain, Expected), 0);
+    Pipeline.DeepCacheInterval := 3;
+    for Branch := 0 to Pipeline.UNetConfig.LayersPerBlock do
+    begin
+      Pipeline.DeepCacheBranch := Branch;
+      Got.Copy(Initial);
+      Pipeline.Denoise(Cond, ImageSide, ImageSide, StepCount, Got);
+      AssertEquals('passes', 2 * StepCount, Pipeline.ImageStats.UNetPassCount);
+      // Steps 1, 2, 4 and 5 of 7 skip, in both CFG passes.
+      AssertEquals('branch ' + IntToStr(Branch) + ' cached passes', 8,
+        Pipeline.ImageStats.UNetCachedPassCount);
+      Expected.Copy(Initial);
+      RunSDDeepCacheReference(Pipeline, Cond, Uncond, StepCount, 3, Branch,
+        Expected);
+      MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+      AssertEquals('branch ' + IntToStr(Branch) + ' vs the hand loop', 0,
+        MaxDiff, 0);
+      AssertTrue('branch ' + IntToStr(Branch) + ' reuses deep outputs',
+        MaxAbsVolumeDiff(Got, Plain) > 0);
+    end;
+    Refused := false;
+    try
+      Pipeline.DeepCacheInterval := 0;
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('interval 0 refused', Refused);
+    Refused := false;
+    try
+      Pipeline.DeepCacheBranch := Pipeline.UNetConfig.LayersPerBlock + 1;
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('branch past layers_per_block refused', Refused);
+  finally
+    Expected.Free;
+    Got.Free;
+    Plain.Free;
+    Initial.Free;
+    Uncond.Free;
+    Cond.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionDeepCacheImg2Img;
+const
+  StepCount = 8;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TStableDiffusionImg2Img;
+  SourceImage, ImageNoise, Embeds, Initial, Plain, PlainFirst,
+    Got: TNNetVolume;
+  ImageWidth, ImageHeight, RunStepCount: integer;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Img2Img := TStableDiffusionImg2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  PlainFirst := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Img2Img.Strength := 0.75;
+    Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    Pipeline.Conditioner := Img2Img;
+    Pipeline.Sampler := smDDIM;
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    Pipeline.MakeInitialLatents(ImageWidth, ImageHeight, 3, Initial);
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, StepCount, Plain);
+    PlainFirst.Copy(FSDFirstStepLatents);
+    Pipeline.DeepCacheInterval := 3;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, StepCount, Got);
+    RunStepCount := Pipeline.ImageStats.UNetPassCount div 2;
+    AssertEquals('strength 0.75 runs 6 of 8 steps', 6, RunStepCount);
+    AssertEquals('steps 1, 2, 4, 5 skip in both passes', 8,
+      Pipeline.ImageStats.UNetCachedPassCount);
+    AssertEquals('step 0 runs the whole unet', 0,
+      MaxAbsVolumeDiff(FSDFirstStepLatents, PlainFirst), 0);
+    AssertTrue('later steps reuse deep outputs',
+      MaxAbsVolumeDiff(Got, Plain) > 0);
+    AssertFalse('finite latents', IsNan(Got.GetSumAbs()) or
+      IsInfinite(Got.GetSumAbs()));
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    Got.Free;
+    PlainFirst.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    ImageNoise.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionDeepCacheOpenCL;
+{$IFDEF OpenCL}
+const
+  StepCount = 5;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Reader: TNNetSafeTensorsReader;
+  Nets: array[0..1] of TNNet;
+  Caches: array[0..1] of TDiTFirstBlockCache;
+  Noises: array[0..1] of TNNetVolume;
+  Layout: TSDUNetDeepCacheLayout;
+  Embeds, Latents: TNNetVolume;
+  NetPos, Branch, StepPos: integer;
+  MaxDiff: double;
+{$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  for NetPos := 0 to 1 do
+  begin
+    Nets[NetPos] := nil;
+    Caches[NetPos] := TDiTFirstBlockCache.Create();
+    Caches[NetPos].Interval := 2;
+    Noises[NetPos] := TNNetVolume.Create;
+  end;
+  try
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    Pipeline.MakeInitialLatents(Pipeline.DefaultImageSize,
+      Pipeline.DefaultImageSize, 5, Latents);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Latents.SizeX;
+    Config.LatentGridY := Latents.SizeY;
+    Config.TextSeqLen := Embeds.SizeX;
+    for NetPos := 0 to 1 do
+    begin
+      Reader := CreatePretrainedTensorReader(FixturePath(
+        'tiny_sd15/unet/diffusion_pytorch_model.safetensors'));
+      try
+        Nets[NetPos] := BuildSDUNet(Reader, Config, Layout, false);
+      finally
+        Reader.Free;
+      end;
+    end;
+    Nets[1].ForceOpenCL(true);
+    Nets[1].EnableOpenCL(PlatformId, DeviceId);
+    MaxDiff := 0;
+    for Branch := 0 to High(Layout) do
+    begin
+      for NetPos := 0 to 1 do Caches[NetPos].Reset();
+      for StepPos := 0 to StepCount - 1 do
+        for NetPos := 0 to 1 do
+        begin
+          SDUNetDenoise(Nets[NetPos], Config, Latents, Embeds,
+            900 - 150 * StepPos, Noises[NetPos], Caches[NetPos],
+            Layout[Branch]);
+          if NetPos = 1 then
+            MaxDiff := Max(MaxDiff, MaxAbsVolumeDiff(Noises[0], Noises[1]));
+        end;
+      AssertEquals('branch ' + IntToStr(Branch) + ' skips', 2,
+        Caches[1].SkippedStepCount);
+    end;
+    AssertTrue('OpenCL vs CPU max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+  finally
+    for NetPos := 0 to 1 do
+    begin
+      Noises[NetPos].Free;
+      Caches[NetPos].Free;
+      Nets[NetPos].Free;
+    end;
+    Latents.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.TestMarigoldPipelineMatchesPredict;

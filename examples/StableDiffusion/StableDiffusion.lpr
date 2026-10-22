@@ -45,6 +45,9 @@ upscaler folder such as stabilityai/stable-diffusion-x4-upscaler (diffusers
 StableDiffusionUpscalePipeline; default 75 steps, guidance 9.0).
 --freeu s1,s2,b1,b2 (or the paper's presets sd15 / sd21) turns on FreeU, as
 diffusers enable_freeu: no extra UNet pass.
+--deepcache N [--deepcache-branch B] turns on DeepCache (Ma et al. 2023): the
+whole UNet runs on every N-th step, the steps between run only its shallow
+branch and reuse the deep branch output of the last whole run.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -112,6 +115,8 @@ type
     // --freeu s1, s2, b1, b2; UseFreeU false when not given.
     UseFreeU: boolean;
     FreeUFactors: array[0..3] of TNeuralFloat;
+    // --deepcache N (1 = off); --deepcache-branch B (-1: the pipeline default).
+    DeepCacheInterval, DeepCacheBranch: integer;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -183,6 +188,9 @@ begin
     if (Phase = sdphDenoise) and (Stats.UNetPassCount > 0) then
       Detail := Format('%d UNet passes x %.1f ms', [Stats.UNetPassCount,
         Stats.PhaseMs[Phase] / Stats.UNetPassCount]);
+    if (Phase = sdphDenoise) and (Stats.UNetCachedPassCount > 0) then
+      Detail := Detail + Format(' (%d shallow only)',
+        [Stats.UNetCachedPassCount]);
     if Stats.TransfersCounted and ((Stats.PhaseUploadBytes[Phase] > 0) or
       (Stats.PhaseDownloadBytes[Phase] > 0)) then
       Detail := Trim(Detail + Format('  up %.2f MB, down %.2f MB',
@@ -298,6 +306,16 @@ begin
   WriteLn('                    scales B1, B2 of the first two up blocks; ',
     'presets sd15');
   WriteLn('                    (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)');
+  WriteLn('  --deepcache N     DeepCache: the whole UNet every N-th step, only ',
+    'its shallow');
+  WriteLn('                    branch in between (default 1 = off; ',
+    'DeepCache''s SD example uses 3)');
+  WriteLn('  --deepcache-branch B shallow branch size, 0..layers_per_block: ',
+    'B resnets of');
+  WriteLn('                    down block 0 and B + 1 of the last up block run ',
+    '(default');
+  WriteLn('                    layers_per_block: both blocks whole; 0 is the ',
+    'fastest)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -395,6 +413,8 @@ begin
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
   Opt.UseFreeU := false;
+  Opt.DeepCacheInterval := 1;
+  Opt.DeepCacheBranch := -1;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -451,6 +471,9 @@ begin
       ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
       Opt.UseFreeU := true;
     end
+    else if Arg = '--deepcache' then Opt.DeepCacheInterval := StrToInt(NextArg())
+    else if Arg = '--deepcache-branch' then
+      Opt.DeepCacheBranch := StrToInt(NextArg())
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
@@ -473,6 +496,10 @@ begin
   if (Opt.Steps < 1) and (Opt.Steps <> -1) then
     raise Exception.Create('--steps must be >= 1');
   if Opt.RepeatCount < 1 then raise Exception.Create('--repeat must be >= 1');
+  if Opt.DeepCacheInterval < 1 then
+    raise Exception.Create('--deepcache must be >= 1');
+  if (Opt.DeepCacheBranch >= 0) and (Opt.DeepCacheInterval < 2) then
+    raise Exception.Create('--deepcache-branch needs --deepcache 2 or more');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
@@ -666,6 +693,9 @@ begin
     if Opt.UseFreeU then
       Pipeline.EnableFreeU(Opt.FreeUFactors[0], Opt.FreeUFactors[1],
         Opt.FreeUFactors[2], Opt.FreeUFactors[3]);
+    Pipeline.DeepCacheInterval := Opt.DeepCacheInterval;
+    if Opt.DeepCacheBranch >= 0 then
+      Pipeline.DeepCacheBranch := Opt.DeepCacheBranch;
     {$IFDEF OpenCL}
     if Opt.UseStats then OpenCLTransferCounting := true;
     {$ENDIF}
@@ -692,6 +722,9 @@ begin
       WriteLn(Format('FreeU:    s1 %.2f, s2 %.2f, b1 %.2f, b2 %.2f',
         [Opt.FreeUFactors[0], Opt.FreeUFactors[1], Opt.FreeUFactors[2],
          Opt.FreeUFactors[3]]));
+    if Pipeline.DeepCacheInterval > 1 then
+      WriteLn(Format('DeepCache: interval %d, branch %d',
+        [Pipeline.DeepCacheInterval, Pipeline.DeepCacheBranch]));
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,
