@@ -12162,8 +12162,9 @@ type
     // Builds the UNet with the ControlNet skip / T2I-Adapter inputs.
     function UNetWithControl(): boolean; virtual;
     function UNetWithAdapter(): boolean; virtual;
-    // The UNet in_channels this conditioner feeds for LatentChannels latents.
-    function UNetInputChannels(LatentChannels: integer): integer; virtual;
+    // True when this conditioner can feed a UNet with InChannels inputs.
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; virtual;
     // Before the first step; Latents is the unit noise (grid, latent channels).
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); virtual;
@@ -12221,10 +12222,10 @@ type
     // only when its token count or latent grid changes; nil until built.
     FKeepComponents: boolean;
     FUNetInt8, FTextEncoderInt8: boolean;
-    FTextEncoder, FUNet, FVaeDecoder: TNNet;
+    FTextEncoder, FUNet, FVaeDecoder, FVaeEncoder: TNNet;
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
-    FVaeGridX, FVaeGridY: integer;
+    FVaeGridX, FVaeGridY, FVaeEncoderGridX, FVaeEncoderGridY: integer;
     // Bumped whenever kept nets become stale (OpenCL, int8, unload).
     FComponentEpoch: integer;
     FConditioner: TStableDiffusionConditioner;
@@ -12263,6 +12264,7 @@ type
     function AcquireUNet(GridX, GridY, TextSeqLen: integer;
       WithControl, WithAdapter: boolean): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
+    function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
     // The Conditioner, or the plain one when none is set.
     function ActiveConditioner(): TStableDiffusionConditioner;
     procedure ReleaseComponent(Net: TNNet);
@@ -12318,6 +12320,9 @@ type
     // Euler a draws its noise from the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
+    // VAE encode of VaeImage (W, H, 3) in [-1, 1]: the latent mean times
+    // scaling_factor, (W, H) / VaeScaleFactor. Kept like the other components.
+    procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume);
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
       Image: TNNetVolume);
@@ -12530,8 +12535,16 @@ procedure T2IAdapterFeatures(Net: TNNet; const Config: TT2IAdapterConfig;
 
 // Source (W, H, 1|3|4) in 0..255 -> Dest (Width, Height, Channels) in [0, 1]
 // as diffusers' image processors: PIL 'L' for 1 channel, alpha dropped, Lanczos.
-procedure StableDiffusionPrepareImage(Source: TNNetVolume; Width, Height,
+procedure DiffusersPrepareImage(Source: TNNetVolume; Width, Height,
   Channels: integer; Dest: TNNetVolume);
+// Inpaint mask (W, H, 1|3|4) in 0..255 (white = regenerate) -> BinaryMask
+// (Width, Height, 1) of 0/1 as diffusers' mask processor (gray, resize, >= 0.5).
+procedure DiffusersBinarizeMask(Mask: TNNetVolume; Width, Height: integer;
+  BinaryMask: TNNetVolume);
+// BinaryMask (W, H, 1) -> MaskLatents (W/PixelsPerLatent, H/PixelsPerLatent,
+// Channels): each cell's top-left pixel (torch nearest interpolate), per channel.
+procedure DiffusersMaskToLatentGrid(BinaryMask: TNNetVolume;
+  PixelsPerLatent, Channels: integer; MaskLatents: TNNetVolume);
 
 type
   // diffusers StableDiffusionControlNetPipeline: a ControlNetModel folder
@@ -12590,6 +12603,36 @@ type
     property ConditioningScale: TNeuralFloat read FConditioningScale
       write FConditioningScale;
     property Config: TT2IAdapterConfig read FConfig;
+  end;
+
+  // diffusers StableDiffusionInpaintPipeline at strength 1: a 9-channel UNet
+  // sees latents | mask | masked-image latents; a 4-channel one gets the kept
+  // region re-noised and blended back after every step. VAE latents: the mean.
+  TStableDiffusionInpainter = class(TStableDiffusionConditioner)
+  private
+    FSourceImage, FSourceMask: TNNetVolume;
+    // 9 channels: mask | masked-image latents; 4: the image latents, the
+    // noise, the re-noised image latents and the latent mask per channel.
+    FMaskAndImageLatents, FUNetInput: TNNetVolume;
+    FImageLatents, FNoise, FKnownLatents, FMaskLatents: TNNetVolume;
+    FIsConcatUNet: boolean;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // The image (W, H, 3|4) in 0..255; resized to the image size.
+    procedure SetImage(Image: TNNetVolume);
+    // The mask (W, H, 1|3|4) in 0..255, white = regenerate; resized.
+    procedure SetMask(Mask: TNNetVolume);
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    // True after BeginDenoise saw a 9-channel inpainting UNet.
+    property IsConcatUNet: boolean read FIsConcatUNet;
   end;
 
 // ---------------------------------------------------------------------------
@@ -92597,6 +92640,7 @@ begin
   FreeAndNil(FTextEncoder);
   FreeAndNil(FUNet);
   FreeAndNil(FVaeDecoder);
+  FreeAndNil(FVaeEncoder);
 end;
 
 // Phases sdphLoadTextEncoder, sdphLoadUNet, sdphLoadVae, then sdphDone.
@@ -92741,6 +92785,51 @@ begin
     FVaeDecoder := Result;
     FVaeGridX := GridX;
     FVaeGridY := GridY;
+  end;
+end;
+
+function TStableDiffusionPipeline.AcquireVaeEncoder(GridX,
+  GridY: integer): TNNet;
+var
+  EncoderConfig: TVaeDecoderConfig;
+begin
+  if Assigned(FVaeEncoder) and (FVaeEncoderGridX = GridX) and
+    (FVaeEncoderGridY = GridY) then exit(FVaeEncoder);
+  FreeAndNil(FVaeEncoder);
+  EncoderConfig := ReadVaeEncoderConfigFromJSONFile(ComponentFolder('vae') +
+    'config.json');
+  EncoderConfig.LatentGrid := GridX;
+  EncoderConfig.LatentGridY := GridY;
+  Result := BuildVaeEncoderFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
+    ComponentFolder('vae'), 'diffusion_pytorch_model'), EncoderConfig,
+    {pTrainable=}false);
+  try
+    PrepareComponent(Result, {QuantizeInt8=}false);
+  except
+    Result.Free;
+    raise;
+  end;
+  if FKeepComponents then
+  begin
+    FVaeEncoder := Result;
+    FVaeEncoderGridX := GridX;
+    FVaeEncoderGridY := GridY;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.EncodeVaeImage(VaeImage,
+  Latents: TNNetVolume);
+var
+  Net: TNNet;
+  GridX, GridY: integer;
+begin
+  LatentGridFor(VaeImage.SizeX, VaeImage.SizeY, GridX, GridY);
+  Net := AcquireVaeEncoder(GridX, GridY);
+  try
+    Net.Compute(VaeImage);
+    Net.GetOutput(Latents);
+  finally
+    ReleaseComponent(Net);
   end;
 end;
 
@@ -93069,13 +93158,12 @@ var
 begin
   LatentGridFor(Width, Height, GridX, GridY);
   StepConditioner := ActiveConditioner();
-  if StepConditioner.UNetInputChannels(FVaeConfig.LatentChannels) <>
-    FUNetConfig.InChannels then
-    ImportError('TStableDiffusionPipeline.Denoise: the unet takes ' +
-      IntToStr(FUNetConfig.InChannels) + ' input channels, the ' +
-      StepConditioner.ClassName + ' feeds ' + IntToStr(
-      StepConditioner.UNetInputChannels(FVaeConfig.LatentChannels)) +
-      ' (an inpainting unet needs a TStableDiffusionInpainter).');
+  if not StepConditioner.AcceptsUNetInChannels(FUNetConfig.InChannels,
+    FVaeConfig.LatentChannels) then
+    ImportError('TStableDiffusionPipeline.Denoise: a ' +
+      StepConditioner.ClassName + ' cannot feed a unet of ' +
+      IntToStr(FUNetConfig.InChannels) + ' input channels (an inpainting ' +
+      'unet needs a TStableDiffusionInpainter).');
   if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
     (Latents.Depth <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
@@ -93230,10 +93318,10 @@ begin
   Result := false;
 end;
 
-function TStableDiffusionConditioner.UNetInputChannels(
-  LatentChannels: integer): integer;
+function TStableDiffusionConditioner.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
 begin
-  Result := LatentChannels;
+  Result := InChannels = LatentChannels;
 end;
 
 procedure TStableDiffusionConditioner.BeginDenoise(
@@ -93259,7 +93347,7 @@ procedure TStableDiffusionConditioner.EndDenoise();
 begin
 end;
 
-procedure StableDiffusionPrepareImage(Source: TNNetVolume; Width, Height,
+procedure DiffusersPrepareImage(Source: TNNetVolume; Width, Height,
   Channels: integer; Dest: TNNetVolume);
 const
   MaxChannelValue: TNeuralFloat = 255;
@@ -93273,13 +93361,13 @@ var
   PixelPos, MaxPixelPos, SourcePos, DestPos, Channel, MaxChannel: integer;
 begin
   if (Source.Depth <> 1) and (Source.Depth <> 3) and (Source.Depth <> 4) then
-    ImportError('StableDiffusionPrepareImage: the image has ' +
+    ImportError('DiffusersPrepareImage: the image has ' +
       IntToStr(Source.Depth) + ' channels, expected gray, RGB or RGBA.');
   if (Channels <> 1) and (Channels <> 3) then
-    ImportError('StableDiffusionPrepareImage: ' + IntToStr(Channels) +
+    ImportError('DiffusersPrepareImage: ' + IntToStr(Channels) +
       ' output channels; 1 or 3 are supported.');
   if Source = Dest then
-    ImportError('StableDiffusionPrepareImage: Dest must not be Source.');
+    ImportError('DiffusersPrepareImage: Dest must not be Source.');
   Converted := TNNetVolume.Create(Source.SizeX, Source.SizeY, Channels);
   try
     MaxPixelPos := Source.SizeX * Source.SizeY - 1;
@@ -93311,6 +93399,59 @@ begin
   finally
     Converted.Free;
   end;
+end;
+
+procedure DiffusersBinarizeMask(Mask: TNNetVolume; Width, Height: integer;
+  BinaryMask: TNNetVolume);
+const
+  // L / 255 >= 0.5 on the gray image in 0..255.
+  csBinarizeThreshold = 127.5;
+var
+  Gray: TNNetVolume;
+  PixelPos, MaxPixelPos: integer;
+begin
+  Gray := TNNetVolume.Create();
+  try
+    DiffusersPrepareImage(Mask, Width, Height, 1, Gray);
+    BinaryMask.ReSize(Width, Height, 1);
+    MaxPixelPos := Gray.Size - 1;
+    // Gray is in [0, 1]; compare in 0..255 so integer levels stay exact.
+    for PixelPos := 0 to MaxPixelPos do
+      if Gray.FData[PixelPos] * 255 >= csBinarizeThreshold then
+        BinaryMask.FData[PixelPos] := 1
+      else BinaryMask.FData[PixelPos] := 0;
+  finally
+    Gray.Free;
+  end;
+end;
+
+procedure DiffusersMaskToLatentGrid(BinaryMask: TNNetVolume;
+  PixelsPerLatent, Channels: integer; MaskLatents: TNNetVolume);
+var
+  GridX, GridY, X, Y, MaxX, MaxY, Channel, MaxChannel, CellPos: integer;
+  CellValue: TNeuralFloat;
+begin
+  if (PixelsPerLatent < 1) or (Channels < 1) or (BinaryMask.Depth <> 1) or
+    (BinaryMask.SizeX mod PixelsPerLatent <> 0) or
+    (BinaryMask.SizeY mod PixelsPerLatent <> 0) then
+    ImportError('DiffusersMaskToLatentGrid: a ' + IntToStr(BinaryMask.SizeX) +
+      'x' + IntToStr(BinaryMask.SizeY) + 'x' + IntToStr(BinaryMask.Depth) +
+      ' mask is not a grid of ' + IntToStr(PixelsPerLatent) + '-pixel cells.');
+  GridX := BinaryMask.SizeX div PixelsPerLatent;
+  GridY := BinaryMask.SizeY div PixelsPerLatent;
+  MaskLatents.ReSize(GridX, GridY, Channels);
+  MaxX := GridX - 1;
+  MaxY := GridY - 1;
+  MaxChannel := Channels - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      CellValue := BinaryMask.FData[BinaryMask.GetRawPos(X * PixelsPerLatent,
+        Y * PixelsPerLatent)];
+      CellPos := MaskLatents.GetRawPos(X, Y);
+      for Channel := 0 to MaxChannel do
+        MaskLatents.FData[CellPos + Channel] := CellValue;
+    end;
 end;
 
 constructor TStableDiffusionControlNet.Create(const ControlNetFolder: string);
@@ -93392,7 +93533,7 @@ begin
     FNetEpoch := Pipeline.ComponentEpoch;
     Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8);
   end;
-  StableDiffusionPrepareImage(FSourceImage, FNetConfig.CondGrid,
+  DiffusersPrepareImage(FSourceImage, FNetConfig.CondGrid,
     FNetConfig.CondGrid, FConfig.CondChannels, FControlImage);
   if Length(FDownResiduals) <> FConfig.NumDownResiduals then
   begin
@@ -93507,7 +93648,7 @@ begin
     for FeaturePos := 0 to MaxFeaturePos do
       FFeatures[FeaturePos] := TNNetVolume.Create();
   end;
-  StableDiffusionPrepareImage(FSourceImage, FNetConfig.CondGrid,
+  DiffusersPrepareImage(FSourceImage, FNetConfig.CondGrid,
     FNetConfig.CondGrid, FConfig.CondChannels, FHintImage);
   T2IAdapterFeatures(FNet, FNetConfig, FHintImage, FFeatures);
   MaxFeaturePos := High(FFeatures);
@@ -93529,6 +93670,128 @@ end;
 procedure TStableDiffusionT2IAdapter.EndDenoise();
 begin
   if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
+end;
+
+constructor TStableDiffusionInpainter.Create();
+begin
+  inherited Create();
+  FSourceImage := TNNetVolume.Create();
+  FSourceMask := TNNetVolume.Create();
+  FMaskAndImageLatents := TNNetVolume.Create();
+  FUNetInput := TNNetVolume.Create();
+  FImageLatents := TNNetVolume.Create();
+  FNoise := TNNetVolume.Create();
+  FKnownLatents := TNNetVolume.Create();
+  FMaskLatents := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionInpainter.Destroy();
+begin
+  FMaskLatents.Free;
+  FKnownLatents.Free;
+  FNoise.Free;
+  FImageLatents.Free;
+  FUNetInput.Free;
+  FMaskAndImageLatents.Free;
+  FSourceMask.Free;
+  FSourceImage.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionInpainter.SetImage(Image: TNNetVolume);
+begin
+  FSourceImage.ReSize(Image);
+  FSourceImage.Copy(Image);
+end;
+
+procedure TStableDiffusionInpainter.SetMask(Mask: TNNetVolume);
+begin
+  FSourceMask.ReSize(Mask);
+  FSourceMask.Copy(Mask);
+end;
+
+function TStableDiffusionInpainter.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  Result := (InChannels = LatentChannels) or
+    (InChannels = 2 * LatentChannels + 1);
+end;
+
+procedure TStableDiffusionInpainter.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  VaeImage, BinaryMask, KeepMask: TNNetVolume;
+  Width, Height, MaskChannels: integer;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  if (FSourceImage.Size = 0) or (FSourceMask.Size = 0) then
+    ImportError('TStableDiffusionInpainter: call SetImage and SetMask first.');
+  FIsConcatUNet := Pipeline.UNetConfig.InChannels <> Latents.Depth;
+  Width := Latents.SizeX * Pipeline.VaeScaleFactor;
+  Height := Latents.SizeY * Pipeline.VaeScaleFactor;
+  VaeImage := TNNetVolume.Create();
+  BinaryMask := TNNetVolume.Create();
+  KeepMask := TNNetVolume.Create();
+  try
+    StartLoadPhase();
+    DiffusersPrepareImage(FSourceImage, Width, Height, 3, VaeImage);
+    VaeImage.Mul(2);
+    VaeImage.Add(-1);
+    DiffusersBinarizeMask(FSourceMask, Width, Height, BinaryMask);
+    if FIsConcatUNet then MaskChannels := 1
+    else MaskChannels := Latents.Depth;
+    DiffusersMaskToLatentGrid(BinaryMask, Pipeline.VaeScaleFactor,
+      MaskChannels, FMaskLatents);
+    if FIsConcatUNet then
+    begin
+      // masked_image = image * (mask < 0.5), the mask on all 3 channels.
+      DiffusersMaskToLatentGrid(BinaryMask, 1, VaeImage.Depth, KeepMask);
+      KeepMask.Mul(-1);
+      KeepMask.Add(1);
+      VaeImage.Mul(KeepMask);
+      Pipeline.EncodeVaeImage(VaeImage, FImageLatents);
+      FMaskAndImageLatents.AddLayers(FMaskLatents, FImageLatents);
+    end
+    else
+    begin
+      Pipeline.EncodeVaeImage(VaeImage, FImageLatents);
+      FNoise.ReSize(Latents);
+      FNoise.Copy(Latents);
+      FKnownLatents.ReSize(FImageLatents);
+    end;
+  finally
+    KeepMask.Free;
+    BinaryMask.Free;
+    VaeImage.Free;
+  end;
+end;
+
+procedure TStableDiffusionInpainter.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  if FIsConcatUNet then
+  begin
+    FUNetInput.AddLayers(Latents, FMaskAndImageLatents);
+    SDUNetDenoise(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
+  end
+  else SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
+end;
+
+procedure TStableDiffusionInpainter.AfterStep(Latents: TNNetVolume;
+  NextTt: integer);
+begin
+  if FIsConcatUNet then exit;
+  // The kept region at the next step's noise level (the same noise as the
+  // initial latents), or clean after the last step.
+  if NextTt >= 1 then
+  begin
+    FPipeline.Scheduler.AddNoise(FImageLatents, FKnownLatents, NextTt, nil,
+      FNoise);
+    InpaintBlend(Latents, FKnownLatents, FMaskLatents);
+  end
+  else InpaintBlend(Latents, FImageLatents, FMaskLatents);
 end;
 
 const
@@ -95280,24 +95543,9 @@ end;
 
 procedure QwenImage21MaskToLatents(Mask: TNNetVolume; Width, Height,
   Channels: integer; MaskLatents: TNNetVolume);
-const
-  // PIL 'L' = (R*19595 + G*38470 + B*7471 + 0x8000) >> 16; L / 255 >= 0.5
-  // is L >= 128, so the shifted sum is compared with 128 << 16.
-  csLumaR = 19595;
-  csLumaG = 38470;
-  csLumaB = 7471;
-  csLumaRound = 32768;
-  csLumaThreshold = 128 * 65536;
 var
-  Gray, Resized, Source: TNNetVolume;
-  GridW, GridH, X, Y, MaxX, MaxY, PixelPos, MaxPixelPos, SourcePos,
-    TokenBase, ValuePos, MaxValuePos: integer;
-  Luma: double;
-  IsResized: boolean;
+  BinaryMask: TNNetVolume;
 begin
-  if (Mask.Depth <> 1) and (Mask.Depth <> 3) and (Mask.Depth <> 4) then
-    ImportError('QwenImage21MaskToLatents: the mask has ' +
-      IntToStr(Mask.Depth) + ' channels, expected gray, RGB or RGBA.');
   if (Width < csQwenImage21PixelsPerLatent) or
     (Height < csQwenImage21PixelsPerLatent) or
     (Width mod csQwenImage21PixelsPerLatent <> 0) or
@@ -95306,61 +95554,15 @@ begin
       IntToStr(Height) + ' with ' + IntToStr(Channels) + ' channels is not ' +
       'a latent grid of ' + IntToStr(csQwenImage21PixelsPerLatent) +
       '-pixel cells.');
-  IsResized := (Mask.SizeX <> Width) or (Mask.SizeY <> Height);
-  Gray := nil;
-  Resized := nil;
+  BinaryMask := TNNetVolume.Create();
   try
-    Source := Mask;
-    // A gray RGB copy to resize (PIL resizes the 'L' image) or to read a
-    // one-channel mask with the luma below (gray in, the same gray out).
-    if IsResized or (Mask.Depth = 1) then
-    begin
-      Gray := TNNetVolume.Create(Mask.SizeX, Mask.SizeY, 3);
-      MaxPixelPos := Mask.SizeX * Mask.SizeY - 1;
-      for PixelPos := 0 to MaxPixelPos do
-      begin
-        SourcePos := PixelPos * Mask.Depth;
-        if Mask.Depth = 1 then Luma := Mask.FData[SourcePos]
-        else Luma := Trunc((Mask.FData[SourcePos] * csLumaR +
-          Mask.FData[SourcePos + 1] * csLumaG +
-          Mask.FData[SourcePos + 2] * csLumaB + csLumaRound) / 65536);
-        Gray.FData[PixelPos * 3] := Luma;
-        Gray.FData[PixelPos * 3 + 1] := Luma;
-        Gray.FData[PixelPos * 3 + 2] := Luma;
-      end;
-      Source := Gray;
-      if IsResized then
-      begin
-        Resized := TNNetVolume.Create();
-        QwenImage21ResizeToRgba(Gray, Width, Height, Resized);
-        Source := Resized;
-      end;
-    end;
-    GridW := Width div csQwenImage21PixelsPerLatent;
-    GridH := Height div csQwenImage21PixelsPerLatent;
-    MaskLatents.ReSize(GridW * GridH, 1, Channels);
-    MaskLatents.Fill(0);
-    MaxX := GridW - 1;
-    MaxY := GridH - 1;
-    for Y := 0 to MaxY do
-      for X := 0 to MaxX do
-      begin
-        SourcePos := Source.GetRawPos(X * csQwenImage21PixelsPerLatent,
-          Y * csQwenImage21PixelsPerLatent);
-        if Source.FData[SourcePos] * csLumaR +
-          Source.FData[SourcePos + 1] * csLumaG +
-          Source.FData[SourcePos + 2] * csLumaB + csLumaRound >=
-          csLumaThreshold then
-        begin
-          TokenBase := (Y * GridW + X) * Channels;
-          MaxValuePos := TokenBase + Channels - 1;
-          for ValuePos := TokenBase to MaxValuePos do
-            MaskLatents.FData[ValuePos] := 1;
-        end;
-      end;
+    DiffusersBinarizeMask(Mask, Width, Height, BinaryMask);
+    DiffusersMaskToLatentGrid(BinaryMask, csQwenImage21PixelsPerLatent,
+      Channels, MaskLatents);
+    // The token layout (GridW*GridH, 1, Channels) keeps the data order.
+    MaskLatents.ReSize(MaskLatents.SizeX * MaskLatents.SizeY, 1, Channels);
   finally
-    Resized.Free;
-    Gray.Free;
+    BinaryMask.Free;
   end;
 end;
 

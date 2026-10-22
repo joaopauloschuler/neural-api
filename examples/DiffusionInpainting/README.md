@@ -1,64 +1,70 @@
-# DiffusionInpainting: blended-diffusion Stable-Diffusion inpainting
+# DiffusionInpainting
 
-**Latent-space SD inpainting** on the **standard 4-channel SD UNet** (Avrahami et
-al. 2022, *Blended Diffusion for Text-driven Editing of Natural Images*,
-[arXiv:2111.14818](https://arxiv.org/abs/2111.14818)): regenerate ONLY a masked
-hole while the rest stays pixel-faithful, with **no 9-channel
-inpaint-specialized `conv_in`** and **no retrained inpaint weights** — the
-most-used no-retrain SD inpaint path.
+Stable Diffusion 1.x inpainting, as diffusers' `StableDiffusionInpaintPipeline`
+at strength 1: the prompt regenerates the white part of the mask. The example
+drives `TStableDiffusionPipeline` (`neural/neuralpretrained.pas`) with a
+`TStableDiffusionInpainter` conditioner, which handles both kinds of UNet:
 
-The sibling of [ImageToImage](../ImageToImage) (it shares the encode → denoise →
-decode skeleton) but drives the landed **SD UNet**
-(`BuildSDUNetFromSafeTensors` + `SDUNetDenoiseInpaint`) instead of PixArt, with
-**matched VAE/UNet latent grids** so there is no crop. The pipeline:
-
-1. **encode** — `BuildVaeEncoderFromSafeTensors` maps the RGB source to a clean
-   latent `z0`;
-2. **mask** — a binary RGB mask (1 = hole to reconstruct, 0 = keep) is
-   downsampled to a per-voxel latent mask in `{0,1}`;
-3. **blended denoise** — the reusable `SDUNetDenoiseInpaint` driver runs a full
-   reverse DDIM trajectory and at **every** step blends the known region back in
-   (`latents = mask·denoised + (1-mask)·AddNoise(z0, t)`), so only the hole
-   follows the denoiser;
-4. **decode** — `BuildVaeDecoderFromSafeTensors` returns the inpainted RGB.
-
-The only new code vs the SDEdit example is the per-step latent blend + the latent
-mask downsample, both inside `SDUNetDenoiseInpaint`. The 4-channel UNet, the VAE
-encoder/decoder and the scheduler are reused untouched.
-
-## Build / run
+- **9-channel inpainting UNet** (e.g. `runwayml/stable-diffusion-inpainting`):
+  every UNet pass sees `latents | mask | masked-image latents`, the mask
+  nearest-resized to the latent grid and the masked image
+  (`image * (mask < 0.5)`) VAE-encoded once.
+- **Standard 4-channel UNet** (e.g. `runwayml/stable-diffusion-v1-5`): after
+  every sampler step the kept region is replaced by the image latents
+  re-noised to the next timestep with the initial noise (clean after the last
+  step), the blended-diffusion mode diffusers runs for such a UNet.
 
 ```
+image, mask --diffusers image/mask processors--> VAE encoder (latent mean)
+prompt --CLIP tokenizer + text encoder--> text states (and the empty prompt's)
+for each sampler step (conditional + unconditional UNet pass, CFG, step):
+  9 channels: UNet(latents | mask | masked-image latents)
+  4 channels: UNet(latents), then blend the kept region back
+VAE decoder -> PNG
+```
+
+## Running
+
+```sh
 cd examples/DiffusionInpainting
-LAZUTILS_PATH=$(find /usr/lib/lazarus /usr/share/lazarus -name "utf8process.ppu" -printf "%h\n" 2>/dev/null | head -1)
-fpc -O3 -Mobjfpc -Sh -Fu../../neural -Fu"$LAZUTILS_PATH" DiffusionInpainting.lpr
-# or: lazbuild DiffusionInpainting.lpi --build-mode=Release
-./DiffusionInpainting                 # smoke run on the tiny fixtures
-./DiffusionInpainting --steps 8       # more reverse steps
+lazbuild -B DiffusionInpainting.lpi
+../../bin/x86_64-linux/bin/DiffusionInpainting                     # pico, 9 channels
+../../bin/x86_64-linux/bin/DiffusionInpainting --model ../../tests/fixtures/tiny_sd15
+../../bin/x86_64-linux/bin/DiffusionInpainting \
+  --model /path/to/stable-diffusion-inpainting \
+  --image photo.png --mask mask.png --prompt "a red brick wall" \
+  --steps 25 --seed 1 --out wall.png --gpu
 ```
 
-Real checkpoints: `--vae-encoder enc.safetensors --vae-encoder-config enc.json
---vae-decoder dec.safetensors --vae-decoder-config dec.json --unet
-unet.safetensors --unet-config unet.json`.
+| Option | Meaning |
+| --- | --- |
+| `--model DIR` | diffusers Stable Diffusion 1.x folder, inpainting or standard (default `tests/fixtures/tiny_sd15_inpaint`) |
+| `--image FILE` | image to edit, resized to the output size (Lanczos). Default: a color ramp |
+| `--mask FILE` | mask, white = regenerate; PIL 'L' gray, binarized at 0.5. Default: the right half |
+| `--prompt`, `--negative` | prompt and negative prompt |
+| `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
+| `--width N`, `--height N` | output size (default: the checkpoint's, 512 for SD 1.5) |
+| `--out PNG` | output file (default `inpainted.png`) |
+| `--int8` | UNet and text encoder weights in int8 |
+| `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
 
-## Input
+With no `--model` the run uses a random-weight pico folder: it checks wiring
+and I/O, not image quality.
 
-Real SD checkpoints are far too large for this environment, so by default the
-example runs a self-contained smoke on the committed tiny **random** fixtures
-(`tests/fixtures/tiny_vae_encoder|decoder.safetensors` + `tiny_sd_unet`). Those
-nets are untrained, so the inpaint is not a meaningful picture — the point is to
-exercise the full driver path end to end within a small RAM/time budget. A
-synthetic color-ramp source and a rectangular right-half hole are generated by
-default.
+## Parity
 
-> Deferred follow-up: the 9-channel inpaint-specialized UNet (`conv_in` widened
-> to `latent|mask|masked-latent`, the diffusers `stable-diffusion-inpainting`
-> weights) and a non-deterministic reparameterized VAE sampling head.
+`TestStableDiffusionInpaintParity` (`tests/TestNeuralPretrained.pas`) runs the
+pipeline on a 16x16 image and mask for 3 guided steps in three cases: the
+4-channel `tiny_sd15` with DDIM and with Euler, and the 9-channel
+`tiny_sd15_inpaint` with DDIM. It compares the latents after each step and the
+decoded image with a diffusers float64 `StableDiffusionInpaintPipeline` run
+whose VAE encode takes the latent mean: max |diff| < 1e-4. Fixtures and oracle:
+`tools/make_pico_sd_conditioning_fixtures.py`.
 
-## Output
+## Limits
 
-`masked_input.ppm` (the source VAE round-trip with the hole greyed out) and
-`inpainted.ppm` (the blended-inpaint result). The run asserts no NaN/Inf decoded
-pixels, that the kept latent region equals the source exactly, and that the
-masked region was changed by the denoiser. `TestDiffusionInpaintSmoke` pins these
-assertions. Pure CPU.
+- Strength 1 only (start from pure noise); diffusers' `strength < 1` is not
+  implemented.
+- The VAE encoder returns the latent mean; diffusers samples it by default.
+- The output is the decoded image; the kept region is not pasted back.
+- Real checkpoints are untested.

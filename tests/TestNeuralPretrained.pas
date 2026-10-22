@@ -1239,6 +1239,7 @@ type
     procedure TestStableDiffusionPipelineInt8;
     procedure TestStableDiffusionControlNetParity;
     procedure TestStableDiffusionT2IAdapterParity;
+    procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45883,6 +45884,69 @@ begin
     HintImage.Free;
     Pipeline.Free;
     Adapter.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionInpaintPipeline float64 (tiny_sd15_inpaint_io.json, VAE
+// latents taken at the mean): the 4-channel tiny_sd15 blended after each DDIM
+// and each Euler step, and the 9-channel tiny_sd15_inpaint, 3 guided steps.
+procedure TTestNeuralPretrained.TestStableDiffusionInpaintParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Inpainter: TStableDiffusionInpainter;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, Mask, Latents: TNNetVolume;
+  CasePos: integer;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_inpaint_io.json');
+  Inpainter := TStableDiffusionInpainter.Create();
+  SourceImage := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Pipeline := nil;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['mask'], false,
+      Mask);
+    Mask.Mul(255);
+    Inpainter.SetImage(SourceImage);
+    Inpainter.SetMask(Mask);
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      FreeAndNil(Pipeline);
+      Pipeline := TStableDiffusionPipeline.Create(ExtractFileDir(FixturePath(
+        Entry.Get('folder', '') + '/model_index.json')));
+      if Entry.Get('scheduler', '') = 'EulerDiscreteScheduler' then
+        Pipeline.Sampler := smEuler;
+      Pipeline.Conditioner := Inpainter;
+      CheckSD15ConditionedParity(Pipeline, Entry);
+      AssertEquals(Entry.Get('name', '') + ' concat unet',
+        Pipeline.UNetConfig.InChannels = 9, Inpainter.IsConcatUNet);
+    end;
+    // The 9-channel UNet needs the inpainter.
+    Pipeline.Conditioner := nil;
+    Pipeline.MakeInitialLatents(16, 16, 1, Latents);
+    IsRefused := false;
+    try
+      Pipeline.Denoise(Latents, 16, 16, 1, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('9-channel unet refused without an inpainter', IsRefused);
+  finally
+    Pipeline.Free;
+    Latents.Free;
+    Mask.Free;
+    SourceImage.Free;
+    Inpainter.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;
