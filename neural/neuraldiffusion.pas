@@ -95,8 +95,18 @@ type
   //     step, so the Sample() driver calls Denoise TWICE per step and SKIPS the
   //     corrector on the final step (sigma_{t-1} = 0), matching k-diffusion's
   //     `if sigmas[i+1] == 0` branch. Pairs naturally with tsKarras spacing.
+  //   smPNDM : diffusers PNDMScheduler with skip_prk_steps (the PLMS sampler
+  //     of the SD 1.x configs): a linear multistep on eps of up to 4th order.
+  //     It evaluates the model NumSteps+1 times; the second eval repeats the
+  //     second timestep and averages the first two eps (a Heun-like bootstrap),
+  //     so drive it with BuildSamplerSchedule, which repeats that timestep.
+  //     Step derives the target timestep from the schedule stride, as diffusers.
+  //   smEuler : diffusers EulerDiscreteScheduler (s_churn = 0): deterministic
+  //     Euler in sigma-space. Samples stay in the VP scale x_t = y/sqrt(sigma^2+1)
+  //     that diffusers' scale_model_input feeds the model; InitialNoiseScale is
+  //     the matching init_noise_sigma. For eps-prediction it equals DDIM.
   TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
-    smUniPC, smHeun);
+    smUniPC, smHeun, smPNDM, smEuler);
 
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
@@ -161,6 +171,17 @@ type
     FUniHistX0: array[0..1] of TNNetVolume;
     FUniHistT: array[0..1] of integer;
     FUniHistLen: integer;
+    // PNDM (PLMS) state, as diffusers PNDMScheduler: FPndmCounter counts the
+    // steps of this trajectory, FPndmEts holds the last FPndmEtsLen raw model
+    // outputs (oldest first), FPndmCurSample the sample of the first step (the
+    // second step restarts from it), FPndmMix the combined eps scratch.
+    // FPndmStride = T div NumSteps (set by BuildSamplerSchedule; 0 = unknown).
+    FPndmCounter: integer;
+    FPndmEtsLen: integer;
+    FPndmEts: array[0..3] of TNNetVolume;
+    FPndmCurSample, FPndmMix: TNNetVolume;
+    FPndmStride: integer;
+    FPndmFirstT: integer;
     // Persistent, lazily-sized eps/x0 scratch buffers (rule #17). Amortized
     // resize replaces the per-step TNNetVolume.Create/Free in Step/PredictX0/
     // LCMStep. FEpsScratch is shared by Step and PredictX0 (never nested);
@@ -187,6 +208,8 @@ type
     // second derivative), so it cannot share the single-eval Step() dispatch.
     procedure SampleHeun(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
       NumSteps: integer; Spacing: TNNetTimestepSpacing);
+    // diffusers PNDMScheduler.step_plms (smPNDM of Step).
+    procedure StepPNDM(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer);
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
@@ -195,6 +218,22 @@ type
     // image) using the requested spacing. Caller-owned dynamic array.
     function BuildTimestepSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+    // The model-eval timesteps of Method as the matching diffusers scheduler
+    // sets them, plus the final 0: BuildTimestepSchedule except that
+    //   smPNDM repeats the second timestep (NumSteps+1 evals, NumSteps >= 2)
+    //     and records the stride T div NumSteps that its Step uses;
+    //   smDPMSolverPP2M with tsLeading/tsUniform takes NumSteps of NumSteps+1
+    //     points (leading stride T div (NumSteps+1); linspace over 0..T-1).
+    // Calls ResetMultistep. Pairs Schedule[k] -> Schedule[k+1] drive Step.
+    function BuildSamplerSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
+      TNeuralIntegerArray;
+    // Factor on unit Gaussian noise for the first sample of Method at FirstTt:
+    // diffusers init_noise_sigma over the model-input scale. 1 except for
+    // smEuler/smEulerAncestral with tsUniform/tsTrailing, whose init sigma is
+    // sigma_max, i.e. sqrt(1-ab) in the VP scale these samplers keep.
+    function InitialNoiseScale(Method: TNNetSamplerMethod;
+      Spacing: TNNetTimestepSpacing; FirstTt: integer): TNeuralFloat;
     // x0 from eps or v (dpV: sqrt(ab_t)*x_t - sqrt(1-ab_t)*v, exact at ab_t = 0).
     // X0Out may alias RawPred, never Xt.
     procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
@@ -261,9 +300,13 @@ type
     // deterministic DDIM used by the examples; ignored by DDPM/DPM++). For DDPM
     // TtPrev is ignored (it uses Tt-1 by construction). For smEulerAncestral Eta
     // scales the injected ancestral noise (Eta=1 = the standard "Euler a";
-    // Eta=0 reduces it to a deterministic Euler step).
+    // Eta=0 reduces it to a deterministic Euler step). smEuler ignores Eta.
+    // smPNDM ignores TtPrev once BuildSamplerSchedule set its stride.
+    // Noise (smEulerAncestral only) supplies the standard-normal draw instead
+    // of RandG, e.g. to replay another implementation's noise.
     procedure Step(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer;
-      Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0);
+      Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0;
+      Noise: TNNetVolume = nil);
 
     // Per-timestep noise level sigma_t = sqrt((1-ab_t)/ab_t) (Karras VE form).
     property SigmaAt[Tt: integer]: TNeuralFloat read SigmaOf;
@@ -774,6 +817,8 @@ begin
     SpacingName := Obj.Get('timestep_spacing', 'leading');
     if SpacingName = 'trailing' then Spacing := tsTrailing
     else if SpacingName = 'leading' then Spacing := tsLeading
+    // diffusers linspace(0, T-1, N).round() is tsUniform.
+    else if SpacingName = 'linspace' then Spacing := tsUniform
     else Refuse('timestep_spacing "' + SpacingName + '"');
     Create(Obj.Get('num_train_timesteps', 1000), Schedule, Prediction,
       Obj.Get('beta_start', 0.0001), Obj.Get('beta_end', 0.02), 0.008,
@@ -795,6 +840,12 @@ begin
   if Assigned(FUniHistX0[1]) then FUniHistX0[1].Free;
   if Assigned(FEpsScratch) then FEpsScratch.Free;
   if Assigned(FX0HatScratch) then FX0HatScratch.Free;
+  FPndmEts[0].Free;
+  FPndmEts[1].Free;
+  FPndmEts[2].Free;
+  FPndmEts[3].Free;
+  FPndmCurSample.Free;
+  FPndmMix.Free;
   inherited Destroy;
 end;
 
@@ -1238,10 +1289,13 @@ begin
   FUniThisOrder := 1;
   FUniLowerOrderNums := 0;
   FUniHistLen := 0;
+  FPndmCounter := 0;
+  FPndmEtsLen := 0;
 end;
 
 procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
-  Tt, TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat);
+  Tt, TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat;
+  Noise: TNNetVolume);
 var
   i: integer;
   XtSizeM1: integer;
@@ -1267,8 +1321,16 @@ begin
   Eps := FEpsScratch;
   // The other updates work from eps; v-prediction is converted up front.
   // DDPM, DDIM, DPM++, UniPC and Euler read RawPred directly or through PredictX0.
-  if not (Method in [smDDPM, smDDIM, smDPMSolverPP2M, smUniPC, smEulerAncestral]) then
+  if Method = smPNDM then
+  begin
+    StepPNDM(Xt, RawPred, Tt, TtPrev);
+    Exit;
+  end;
+  if not (Method in [smDDPM, smDDIM, smDPMSolverPP2M, smUniPC, smEulerAncestral,
+    smEuler]) then
     ToEps(Xt, RawPred, Eps, Tt);
+  // smEuler is the Eta = 0 (sigma_up = 0) case of the Euler-ancestral update.
+  if Method = smEuler then Eta := 0;
   XtSizeM1 := Xt.Size - 1;
   case Method of
       smDDPM:
@@ -1358,7 +1420,7 @@ begin
             Xt.MulAdd(cE, RawPred);
           end;
         end;
-      smEulerAncestral:
+      smEulerAncestral, smEuler:
         begin
           // Euler-ancestral ("Euler a", Karras et al. 2022) in the VE sigma
           // parameterisation sigma = sqrt((1-ab)/ab). With x0 from PredictX0
@@ -1389,7 +1451,13 @@ begin
           // #5: the update folds to kA*x_t + cE*x0 + kZ*z per step.
           kA := sqrtAbPrev * r0 * invSqrtAbT;
           cE := sqrtAbPrev * (1 - r0);
-          if sigma > 0 then
+          if (sigma > 0) and Assigned(Noise) then
+          begin
+            Xt.Mul(kA);
+            Xt.MulAdd(cE, Eps);
+            Xt.MulAdd(sqrtAbPrev * sigma, Noise);
+          end
+          else if sigma > 0 then
           begin
             kZ := sqrtAbPrev * sigma;
             for i := 0 to XtSizeM1 do
@@ -1408,55 +1476,40 @@ begin
       smDPMSolverPP2M:
         begin
           // DPM-Solver++(2M) in the data-prediction (x0) form (Lu et al. 2022,
-          // arXiv:2211.01095). lambda = half-log-SNR INCREASES as Tt decreases.
-          // For a step Tt -> TtPrev: h = lambda_{TtPrev} - lambda_t > 0, and the
-          // base (first-order) update is
-          //   x_{TtPrev} = (sqrt(ab_prev)/sqrt(ab_t))*x_t
-          //               - sqrt(1-ab_prev)*(exp(-h)-1)*D
-          // where D is the data-prediction x0 (2nd-order corrected when history
-          // is available): D = (1+1/(2r))*x0_cur - (1/(2r))*x0_prev,
-          //   r = h_last / h, h_last = lambda_t - lambda_{Tt of previous step}.
-          invSqrtAbT := FInvSqrtAlphaBar[Tt];
-          // Current x0 prediction into Eps (it holds curX0 from here on).
-          PredictX0(Xt, RawPred, Eps, Tt);
+          // arXiv:2211.01095), as diffusers DPMSolverMultistepScheduler
+          // (dpmsolver++, midpoint, final_sigmas_type "zero"). With
+          // alpha = sqrt(ab), sigma = sqrt(1-ab), lambda = log(alpha/sigma)
+          // (it INCREASES as Tt decreases) and h = lambda_{TtPrev} - lambda_t:
+          //   x_{TtPrev} = (sigma_prev/sigma_t)*x_t - alpha_prev*(exp(-h)-1)*D,
+          // D = x0_cur on the first step, else the midpoint 2nd-order
+          //   D = (1+1/(2r))*x0_cur - (1/(2r))*x0_prev, r = h_last/h,
+          // h_last = lambda_t - lambda of the previous step.
+          PredictX0(Xt, RawPred, Eps, Tt);   // Eps holds x0_cur from here on.
           lamT := Lambda(Tt);
           if TtPrev = 0 then
           begin
-            // Final hop to the clean image: emit the (corrected) x0 prediction.
-            if FHasPrev then
-            begin
-              hLast := lamT - FPrevLambda;          // < 0
-              h := -hLast;                          // approximate remaining step
-              cB := DPMSolverPP2MHistoryWeight(hLast, h);
-              cA := 1.0 + cB;
-              // cA*Eps - cB*FPrevX0 as a uniform affine map (#13).
-              Xt.Copy(Eps);
-              Xt.Mul(cA);
-              Xt.MulAdd(-cB, FPrevX0);
-            end
-            else
-              Xt.Copy(Eps);
+            // Final hop to sigma = 0 is first order (diffusers lower_order_final):
+            // alpha_prev = 1, sigma_prev = 0, h = +inf, so x = x0_cur.
+            Xt.Copy(Eps);
             FHasPrev := false;
             Exit;
           end;
           abPrev := FAlphaBar[TtPrev];
           lamPrev := Lambda(TtPrev);
-          sqrtAbPrev := Sqrt(abPrev);
           h := lamPrev - lamT;                      // > 0
           // Step-invariant update coefficients (rule #5): kX scales x_t, kD
           // scales the data-prediction term.
-          kX := sqrtAbPrev * invSqrtAbT;
-          kD := Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0);
+          kX := FSqrtOneMinusAlphaBar[TtPrev] / FSqrtOneMinusAlphaBar[Tt];
+          kD := Sqrt(abPrev) * (Exp(-h) - 1.0);
           if not FHasPrev then
           begin
-            // First-order (DDIM-equivalent) bootstrap.
-            // kX*Xt - kD*Eps as a uniform affine map (#13).
+            // First order (equal to DDIM): kX*Xt - kD*Eps (#13).
             Xt.Mul(kX);
             Xt.MulAdd(-kD, Eps);
           end
           else
           begin
-            hLast := lamT - FPrevLambda;            // < 0
+            hLast := lamT - FPrevLambda;            // > 0
             cB := DPMSolverPP2MHistoryWeight(hLast, h);
             cA := 1.0 + cB;
             // Xt := kX*Xt - kD*(cA*Eps - cB*FPrevX0) as a uniform affine map (#13).
@@ -1583,6 +1636,160 @@ begin
     end;
 end;
 
+procedure TNNetDiffusionScheduler.StepPNDM(Xt, RawPred: TNNetVolume;
+  Tt, TtPrev: integer);
+var
+  Timestep, PrevT: integer;
+  Oldest, EpsVol: TNNetVolume;
+  abT, abPrev, SampleCoef, EpsCoef: double;
+begin
+  // diffusers PNDMScheduler.step_plms. The target is Tt - T div N whatever
+  // the spacing; the second step re-runs the FIRST hop from the first sample
+  // with the mean of its two eps.
+  if FPndmStride > 0 then PrevT := Tt - FPndmStride else PrevT := TtPrev;
+  Timestep := Tt;
+  if FPndmCounter <> 1 then
+  begin
+    // ets = ets[-3:] + [model_output]; the dropped volume is recycled.
+    if FPndmEtsLen = 4 then
+    begin
+      Oldest := FPndmEts[0];
+      FPndmEts[0] := FPndmEts[1];
+      FPndmEts[1] := FPndmEts[2];
+      FPndmEts[2] := FPndmEts[3];
+      FPndmEts[3] := Oldest;
+      FPndmEtsLen := 3;
+    end;
+    if not Assigned(FPndmEts[FPndmEtsLen]) then
+      FPndmEts[FPndmEtsLen] := TNNetVolume.Create(RawPred)
+    else FPndmEts[FPndmEtsLen].ReSize(RawPred);
+    FPndmEts[FPndmEtsLen].Copy(RawPred);
+    Inc(FPndmEtsLen);
+  end
+  else
+  begin
+    PrevT := Tt;
+    if FPndmStride > 0 then Timestep := Min(Tt + FPndmStride, FT)
+    else Timestep := FPndmFirstT;
+  end;
+  if not Assigned(FPndmMix) then FPndmMix := TNNetVolume.Create(Xt)
+  else FPndmMix.ReSize(Xt);
+  // Adams-Bashforth weights on the stored raw outputs, newest last (#13).
+  if (FPndmEtsLen = 1) and (FPndmCounter = 0) then
+  begin
+    FPndmMix.Copy(RawPred);
+    FPndmFirstT := Tt;
+    if not Assigned(FPndmCurSample) then FPndmCurSample := TNNetVolume.Create(Xt)
+    else FPndmCurSample.ReSize(Xt);
+    FPndmCurSample.Copy(Xt);
+  end
+  else if (FPndmEtsLen = 1) and (FPndmCounter = 1) then
+  begin
+    FPndmMix.Copy(RawPred);
+    FPndmMix.Add(FPndmEts[0]);
+    FPndmMix.Mul(0.5);
+    Xt.Copy(FPndmCurSample);
+  end
+  else if FPndmEtsLen = 2 then
+  begin
+    FPndmMix.Copy(FPndmEts[1]);
+    FPndmMix.Mul(1.5);
+    FPndmMix.MulAdd(-0.5, FPndmEts[0]);
+  end
+  else if FPndmEtsLen = 3 then
+  begin
+    FPndmMix.Copy(FPndmEts[2]);
+    FPndmMix.Mul(23 / 12);
+    FPndmMix.MulAdd(-16 / 12, FPndmEts[1]);
+    FPndmMix.MulAdd(5 / 12, FPndmEts[0]);
+  end
+  else
+  begin
+    FPndmMix.Copy(FPndmEts[3]);
+    FPndmMix.Mul(55 / 24);
+    FPndmMix.MulAdd(-59 / 24, FPndmEts[2]);
+    FPndmMix.MulAdd(37 / 24, FPndmEts[1]);
+    FPndmMix.MulAdd(-9 / 24, FPndmEts[0]);
+  end;
+  // v is converted after the mix, against the sample the hop starts from.
+  if FPrediction = dpV then
+  begin
+    ToEps(Xt, FPndmMix, FEpsScratch, Timestep);
+    EpsVol := FEpsScratch;
+  end
+  else EpsVol := FPndmMix;
+  // _get_prev_sample (PNDM paper eq. 9):
+  //   x_prev = sqrt(ab_prev/ab_t)*x_t - (ab_prev - ab_t)*eps /
+  //     (ab_t*sqrt(1-ab_prev) + sqrt(ab_t*(1-ab_t)*ab_prev)).
+  // ab_t = 0 (zero terminal SNR) reads as cMinAlphaBar, as FInvSqrtAlphaBar.
+  abT := Max(FAlphaBar[Timestep], cMinAlphaBar);
+  if PrevT >= 1 then abPrev := FAlphaBar[PrevT] else abPrev := FFinalAlphaBar;
+  SampleCoef := Sqrt(abPrev / abT);
+  EpsCoef := -(abPrev - abT) /
+    (abT * Sqrt(1.0 - abPrev) + Sqrt(abT * (1.0 - abT) * abPrev));
+  Xt.Mul(SampleCoef);
+  Xt.MulAdd(EpsCoef, EpsVol);
+  Inc(FPndmCounter);
+end;
+
+function TNNetDiffusionScheduler.BuildSamplerSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod):
+  TNeuralIntegerArray;
+var
+  k, Tt, MaxStepPos, LeadingStride: integer;
+  LinspaceStep: double;
+begin
+  ResetMultistep;
+  FPndmStride := 0;
+  if NumSteps < 1 then NumSteps := 1;
+  MaxStepPos := NumSteps - 1;
+  if (Method = smDPMSolverPP2M) and (Spacing in [tsLeading, tsUniform]) then
+  begin
+    // diffusers DPMSolverMultistepScheduler drops the last of NumSteps+1
+    // points: leading (arange(N+1)*(T div (N+1)))[::-1][:-1] + steps_offset,
+    // linspace linspace(0, T-1, N+1).round()[::-1][:-1] (numpy's i*step).
+    SetLength(Result, NumSteps + 1);
+    LeadingStride := FT div (NumSteps + 1);
+    LinspaceStep := (FT - 1) / NumSteps;
+    for k := 0 to MaxStepPos do
+    begin
+      if Spacing = tsLeading then
+        Tt := (NumSteps - k) * LeadingStride + FStepsOffset + 1
+      else
+        Tt := 1 + Round((NumSteps - k) * LinspaceStep);
+      if Tt < 1 then Tt := 1
+      else if Tt > FT then Tt := FT;
+      Result[k] := Tt;
+    end;
+    Result[NumSteps] := 0;
+  end
+  else
+    Result := BuildTimestepSchedule(NumSteps, Spacing);
+  if Method = smPNDM then
+  begin
+    // plms_timesteps: the second timestep twice (_timesteps[-2:-1] again).
+    if Spacing <> tsKarras then FPndmStride := FT div NumSteps;
+    if NumSteps >= 2 then
+    begin
+      SetLength(Result, NumSteps + 2);
+      for k := NumSteps + 1 downto 2 do Result[k] := Result[k - 1];
+    end;
+  end;
+end;
+
+function TNNetDiffusionScheduler.InitialNoiseScale(Method: TNNetSamplerMethod;
+  Spacing: TNNetTimestepSpacing; FirstTt: integer): TNeuralFloat;
+begin
+  // diffusers Euler init_noise_sigma is sigma_max for linspace/trailing and
+  // sqrt(sigma_max^2+1) otherwise; over the model-input scale sqrt(sigma^2+1)
+  // that is sqrt(1-ab) or 1.
+  if (Method in [smEuler, smEulerAncestral]) and
+    (Spacing in [tsUniform, tsTrailing]) then
+    Result := FSqrtOneMinusAlphaBar[FirstTt]
+  else
+    Result := 1;
+end;
+
 procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
   Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
 var
@@ -1682,7 +1889,7 @@ procedure TNNetDiffusionScheduler.Sample(X: TNNetVolume;
   Method: TNNetSamplerMethod; Eta: TNeuralFloat; Spacing: TNNetTimestepSpacing);
 var
   k, Tt, TtPrev: integer;
-  NumStepsM1: integer;
+  MaxStepPos: integer;
   Pred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
@@ -1692,14 +1899,12 @@ begin
     SampleHeun(X, Denoise, NumSteps, Spacing);
     Exit;
   end;
-  if NumSteps < 1 then NumSteps := 1;
-  NumStepsM1 := NumSteps - 1;
-  ResetMultistep;
-  // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
-  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
+  // Descending timesteps ending in 0 (clean); PNDM visits one extra.
+  Schedule := BuildSamplerSchedule(NumSteps, Spacing, Method);
+  MaxStepPos := Length(Schedule) - 2;
   Pred := TNNetVolume.Create(X);
   try
-    for k := 0 to NumStepsM1 do
+    for k := 0 to MaxStepPos do
     begin
       Tt := Schedule[k];
       TtPrev := Schedule[k + 1];

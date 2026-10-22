@@ -69,38 +69,31 @@ def lam(abar, t):
 
 
 def dpmpp_2m_trajectory(abar, x_start, num_steps):
-    # DPM-Solver++(2M), data-prediction form (matches neuraldiffusion.pas).
+    # DPM-Solver++(2M), data-prediction midpoint form, as diffusers
+    # DPMSolverMultistepScheduler (timestep_spacing "linspace", final sigma 0):
+    #   x = (sigma_prev/sigma_t)*x - alpha_prev*(exp(-h)-1)*D.
+    # Timesteps linspace(0, T-1, N+1).round()[::-1][:-1], 1-based here.
+    ts = [int(t) + 1 for t in np.linspace(0, T - 1, num_steps + 1).round()[::-1][:-1]]
+    ts.append(0)
     x = x_start.copy()
     prevx0 = None
     prevlam = None
-    for k in range(num_steps - 1, -1, -1):
-        t = 1 + round(k * (T - 1) / (num_steps - 1))
-        tprev = 1 + round((k - 1) * (T - 1) / (num_steps - 1)) if k > 0 else 0
+    for k in range(num_steps):
+        t, tprev = ts[k], ts[k + 1]
         eps = model_eps(x, t)
         abt = abar[t]
         x0 = (x - np.sqrt(1.0 - abt) * eps) / np.sqrt(abt)
         lamt = lam(abar, t)
         if tprev == 0:
-            if prevx0 is not None:
-                hlast = lamt - prevlam
-                h = -hlast
-                r0 = hlast / h
-                x = (1 + 1 / (2 * r0)) * x0 - (1 / (2 * r0)) * prevx0
-            else:
-                x = x0
-            break
+            return x0  # first-order hop to sigma = 0
         abprev = abar[tprev]
-        lamprev = lam(abar, tprev)
-        h = lamprev - lamt
-        if prevx0 is None:
-            x = (np.sqrt(abprev) / np.sqrt(abt)) * x \
-                - np.sqrt(1 - abprev) * (np.exp(-h) - 1) * x0
-        else:
-            hlast = lamt - prevlam
-            r0 = hlast / h
+        h = lam(abar, tprev) - lamt
+        D = x0
+        if prevx0 is not None:
+            r0 = (lamt - prevlam) / h
             D = (1 + 1 / (2 * r0)) * x0 - (1 / (2 * r0)) * prevx0
-            x = (np.sqrt(abprev) / np.sqrt(abt)) * x \
-                - np.sqrt(1 - abprev) * (np.exp(-h) - 1) * D
+        x = (np.sqrt(1 - abprev) / np.sqrt(1 - abt)) * x \
+            - np.sqrt(abprev) * (np.exp(-h) - 1) * D
         prevx0 = x0
         prevlam = lamt
     return x

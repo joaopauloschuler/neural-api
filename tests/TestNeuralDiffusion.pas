@@ -14,8 +14,11 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
  - Classifier-free guidance mixing matches eps_uncond + w*(eps_cond-eps_uncond).
  - v-prediction is converted to the equivalent eps consistently with the
    forward-process identity.
- - DDPM and DPM-Solver++(2M) trajectories run without NaN and land near the
-   deterministic DDIM result for the same toy model.
+ - DDPM runs without NaN; DPM-Solver++(2M) matches the diffusers
+   DPMSolverMultistepScheduler form (tools/diffusion_scheduler_oracle.py).
+ - PNDM (PLMS, eps and v), deterministic Euler and Euler-ancestral (replayed
+   noise) match diffusers float64 finals (tools/diffusers_sampler_toy_oracle.py),
+   and BuildSamplerSchedule reproduces their timesteps.
  - Euler-ancestral with Eta=0 reduces ANALYTICALLY to deterministic DDIM (eta=0)
    and matches it to single-precision tolerance (the exact deterministic anchor).
  - The Karras sigma table sigma_t = sqrt((1-ab_t)/ab_t) is strictly increasing,
@@ -81,6 +84,10 @@ type
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
+    procedure TestSamplerSchedulesVsDiffusers;
+    procedure TestPNDMVsDiffusers;
+    procedure TestEulerVsDiffusers;
+    procedure TestEulerAncestralVsDiffusers;
     procedure TestUniPCVsOracle;
     procedure TestHeunVsOracle;
     procedure TestHeunZeroSigmaRunsFinite;
@@ -135,11 +142,44 @@ const
     (-0.8797523845208538, -0.6598142883906404, -0.4398761922604269,
      -0.21993809613021345, 0.0, 0.21993809613021345,
       0.4398761922604269, 0.6598142883906404);
-  // DPM-Solver++(2M) final from the SAME numpy oracle (same toy model & start).
+  // DPM-Solver++(2M) final (diffusers DPMSolverMultistepScheduler, linspace
+  // spacing) from the numpy oracle, same toy model & start; diffusers itself
+  // gives -0.96552890 at [0] (its sigmas are float32).
   cOracleDPM: array[0..7] of double =
-    (-5.69458245535186, -4.270936841513894, -2.84729122767593,
-     -1.423645613837965, 0.0, 1.423645613837965,
-      2.84729122767593, 4.270936841513894);
+    (-0.9655285887419517, -0.7241464415564635, -0.48276429437097584,
+     -0.24138214718548792, 0.0, 0.24138214718548792,
+      0.48276429437097584, 0.7241464415564635);
+  // diffusers float64 finals of tools/diffusers_sampler_toy_oracle.py (same
+  // toy model & start; the model sees scale_model_input).
+  // PNDMScheduler(skip_prk_steps, linspace, set_alpha_to_one=False), 10 steps.
+  cOraclePNDM: array[0..7] of double =
+    (-0.9828584041251481, -0.7371438030938611, -0.49142920206257407,
+     -0.24571460103128703, 0.0, 0.24571460103128703, 0.49142920206257407,
+      0.7371438030938611);
+  // The same with prediction_type v_prediction.
+  cOraclePNDMV: array[0..7] of double =
+    (-0.5442082901924374, -0.40815621764432813, -0.2721041450962187,
+     -0.13605207254810936, 0.0, 0.13605207254810936, 0.2721041450962187,
+      0.40815621764432813);
+  // EulerDiscreteScheduler, trailing (init_noise_sigma = sigma_max), 10 steps.
+  cOracleEuler: array[0..7] of double =
+    (-0.825409763608135, -0.6190572941448793, -0.4127048818040675,
+     -0.20635244090203375, 0.0, 0.20635244090203375, 0.4127048818040675,
+      0.6190572941448793);
+  // EulerAncestralDiscreteScheduler, leading, 4 steps, replaying its noise.
+  cEulerANoise: array[0..23] of double =
+    (-0.1467950974849952, 0.7861412987235358, 0.9468216090039564,
+     -1.1143440212610307, 1.6907901257942333, -0.8948278791726386,
+     -0.3556250270062136, 1.2323857451651945, 0.13817266368739245,
+     -1.6821984860536687, 0.31767831539796804, 0.13280696453151092,
+      0.1373240964733236, 0.2405461286050214, 1.3954507962006726,
+      1.3470226203485132, 2.4382081623118323, 0.202758282866977,
+      2.4505412457460647, 2.0256017922932585, 1.77915501934496,
+     -0.9179307346473358, -0.45781890986397766, -0.724473294750947);
+  cOracleEulerA: array[0..7] of double =
+    (-0.4240828388146988, -0.5385330522760837, 0.20056166990819768,
+     -0.41460828703677105, 0.6050061463886979, -0.1233071142778826,
+      0.486501166264323, 1.0959327831214518);
   // UniPC (order-2 bh2, predict_x0) final from the float64 numpy oracle
   // tools/unipc_scheduler_oracle.py (same toy model, start & uniform schedule).
   cOracleUniPC: array[0..7] of double =
@@ -801,6 +841,142 @@ begin
   end;
 end;
 
+// BuildSamplerSchedule against diffusers' timesteps (+1, then the clean 0):
+// PNDM linspace repeats the second one, DPMSolverMultistep linspace drops the
+// last of N+1 points. The driver evaluates the model once per entry.
+procedure TTestNeuralDiffusion.TestSamplerSchedulesVsDiffusers;
+const
+  cPNDMTimesteps: array[0..11] of integer =
+    (200, 178, 178, 156, 134, 112, 89, 67, 45, 23, 1, 0);
+  cDPMTimesteps: array[0..10] of integer =
+    (200, 180, 160, 140, 120, 101, 81, 61, 41, 21, 0);
+var
+  Sched: TNNetDiffusionScheduler;
+  Schedule: TNeuralIntegerArray;
+  X: TNNetVolume;
+  StepPos: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    Schedule := Sched.BuildSamplerSchedule(cSteps, tsUniform, smPNDM);
+    AssertEquals('pndm length', Length(cPNDMTimesteps), Length(Schedule));
+    for StepPos := 0 to High(cPNDMTimesteps) do
+      AssertEquals('pndm t ' + IntToStr(StepPos), cPNDMTimesteps[StepPos],
+        Schedule[StepPos]);
+    Schedule := Sched.BuildSamplerSchedule(cSteps, tsUniform, smDPMSolverPP2M);
+    AssertEquals('dpm length', Length(cDPMTimesteps), Length(Schedule));
+    for StepPos := 0 to High(cDPMTimesteps) do
+      AssertEquals('dpm t ' + IntToStr(StepPos), cDPMTimesteps[StepPos],
+        Schedule[StepPos]);
+    // One PNDM step is a single plain hop; N >= 2 adds the repeated eval.
+    AssertEquals('pndm 1 step', 2,
+      Length(Sched.BuildSamplerSchedule(1, tsUniform, smPNDM)));
+    FRecN := 0;
+    Sched.Sample(X, @RecordingModel, cSteps, smPNDM, 0.0, tsUniform);
+    AssertEquals('pndm evals', cSteps + 1, FRecN);
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+// PLMS with diffusers' quirks: the target is t - T div N (not the next linspace
+// entry), the second eval re-runs the first hop with the mean eps, and v is
+// converted after the multistep mix.
+procedure TTestNeuralDiffusion.TestPNDMVsDiffusers;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  Prediction: TNNetPredictionType;
+  i: integer;
+begin
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for Prediction := dpEps to dpV do
+    begin
+      Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, Prediction, cBeta1,
+        cBetaT, 0.008, false, {pFinalAlphaBarIsOne=}false);
+      try
+        for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+        Sched.Sample(X, @ToyModel, cSteps, smPNDM, 0.0, tsUniform);
+        for i := 0 to cN - 1 do
+          if Prediction = dpEps then
+            AssertEquals('pndm eps @ ' + IntToStr(i), cOraclePNDM[i],
+              X.FData[i], 1e-4)
+          else
+            AssertEquals('pndm v @ ' + IntToStr(i), cOraclePNDMV[i],
+              X.FData[i], 1e-4);
+      finally
+        Sched.Free;
+      end;
+    end;
+  finally
+    X.Free;
+  end;
+end;
+
+// Deterministic Euler with trailing spacing, whose init_noise_sigma is
+// sigma_max: the VP start is the unit noise times InitialNoiseScale.
+procedure TTestNeuralDiffusion.TestEulerVsDiffusers;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  Scale: TNeuralFloat;
+  i: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    Scale := Sched.InitialNoiseScale(smEuler, tsTrailing,
+      Sched.BuildSamplerSchedule(cSteps, tsTrailing, smEuler)[0]);
+    AssertEquals('leading scale', 1.0,
+      Sched.InitialNoiseScale(smEuler, tsLeading, cT), 0);
+    AssertEquals('ddim scale', 1.0,
+      Sched.InitialNoiseScale(smDDIM, tsTrailing, cT), 0);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3 * Scale;
+    Sched.Sample(X, @ToyModel, cSteps, smEuler, 1.0, tsTrailing);
+    for i := 0 to cN - 1 do
+      AssertEquals('euler @ ' + IntToStr(i), cOracleEuler[i], X.FData[i], 1e-4);
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+// Euler-ancestral (Eta = 1) replaying the noise diffusers drew.
+procedure TTestNeuralDiffusion.TestEulerAncestralVsDiffusers;
+const
+  cAncestralSteps = 4;
+var
+  Sched: TNNetDiffusionScheduler;
+  X, Pred, Noise: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+  StepPos, i: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  Pred := TNNetVolume.Create(cN, 1, 1);
+  Noise := TNNetVolume.Create(cN, 1, 1);
+  try
+    Schedule := Sched.BuildSamplerSchedule(cAncestralSteps, tsLeading,
+      smEulerAncestral);
+    AssertEquals('first t', 151, Schedule[0]);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    for StepPos := 0 to cAncestralSteps - 1 do
+    begin
+      ToyModel(X, Pred, Schedule[StepPos]);
+      if StepPos < cAncestralSteps - 1 then
+        for i := 0 to cN - 1 do Noise.FData[i] := cEulerANoise[StepPos * cN + i];
+      Sched.Step(X, Pred, Schedule[StepPos], Schedule[StepPos + 1],
+        smEulerAncestral, 1.0, Noise);
+    end;
+    for i := 0 to cN - 1 do
+      AssertEquals('euler-a @ ' + IntToStr(i), cOracleEulerA[i], X.FData[i],
+        1e-4);
+  finally
+    Sched.Free; X.Free; Pred.Free; Noise.Free;
+  end;
+end;
+
 procedure TTestNeuralDiffusion.TestDPMSolverVsOracle;
 var
   Sched: TNNetDiffusionScheduler;
@@ -812,15 +988,13 @@ begin
   try
     for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
     Sched.Sample(X, @ToyModel, cSteps, smDPMSolverPP2M, 0.0);
-    // Match the numpy DPM-Solver++(2M) float64 oracle (same toy model & start).
-    // The magnitudes are large because the toy eps grows x; the point is the
-    // multistep lambda/correction bookkeeping reproduces numpy exactly.
+    // Match the DPM-Solver++(2M) float64 oracle (same toy model & start).
     for i := 0 to cN - 1 do
     begin
       AssertFalse('dpm++ no NaN @ ' + IntToStr(i),
         IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
       AssertEquals('dpm++ vs oracle @ ' + IntToStr(i),
-        cOracleDPM[i], X.FData[i], 1e-2);
+        cOracleDPM[i], X.FData[i], 1e-4);
     end;
   finally
     Sched.Free; X.Free;
@@ -2153,8 +2327,10 @@ begin
         FromConfig.AlphaBar[Tt], 0);
     AssertTrue('clip_sample defaults to true',
       Refused('{"timestep_spacing": "trailing"}'));
-    AssertTrue('linspace spacing', Refused('{"clip_sample": false, ' +
+    AssertFalse('linspace spacing loads', Refused('{"clip_sample": false, ' +
       '"timestep_spacing": "linspace"}'));
+    AssertTrue('unknown spacing', Refused('{"clip_sample": false, ' +
+      '"timestep_spacing": "karras"}'));
     AssertTrue('sample prediction', Refused('{"clip_sample": false, ' +
       '"timestep_spacing": "trailing", "prediction_type": "sample"}'));
     AssertTrue('trained betas', Refused('{"clip_sample": false, ' +
