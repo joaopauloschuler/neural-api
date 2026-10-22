@@ -570,12 +570,25 @@ rather than acted on.
               documented LCM-LoRA img2img route, AutoPipelineForImage2Image)
               keeps the last int(steps * strength) of the full grid instead
               (-> 499, 259). Optionally offer that one too.
-      - [ ] SD 2.x: v_prediction (dpV exists), use_linear_projection and the
-            head list [5,10,20,20] exist in the UNet importer, pad token "!"
-            is read from tokenizer_config. The SD 2.x text_encoder config is
-            believed to keep 23 of 24 layers (so its last hidden state is the
-            penultimate one; verify). Needs a pico SD 2.x fixture parity, then a
-            real 2.1 run.
+      - [X] SD 2.x pico parity: tests/fixtures/tiny_sd2
+            (tools/make_pico_sd2_pipeline_fixture.py), TestStableDiffusion2*:
+            v_prediction in DDIM/PNDM/Euler/DPM++ 2M/LCM and img2img (Euler a
+            too), gelu text encoder, linear projection, per-block heads, the
+            "!" pad of special_tokens_map.json (also split out of prompts as a
+            special token), default size from sample_size. Verified on the
+            real 2.1 files: text_encoder num_hidden_layers 23 (layers 0..22
+            stored), hidden_act gelu.
+        - [ ] Real SD 2.1 run on the user's GPU box (768x768, v_prediction).
+              stabilityai/stable-diffusion-2-1 is gone from the Hub; the
+              sd2-community/stable-diffusion-2-1 mirror has the same files.
+              Then 2.1-base (512, epsilon).
+        - [ ] Inpainting with v_prediction has no fixture (inspection only: it
+              noises with the same AddNoise as img2img). Add one if a v
+              inpainting checkpoint shows up.
+        - [ ] SD 2.x upcast_attention is ignored (all FP32); it matters only
+              with the F16 item below.
+        - [ ] SD 2.x depth-to-image (StableDiffusionDepth2ImgPipeline, 5-channel
+              UNet) and the x4 upscaler are not covered.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
             pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
             the pipeline refuses addition_embed_type "text_time" today.

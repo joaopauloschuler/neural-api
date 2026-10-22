@@ -12236,7 +12236,7 @@ type
     procedure EndDenoise(); virtual;
   end;
 
-  // Stable Diffusion 1.x text-to-image (diffusers StableDiffusionPipeline) over
+  // Stable Diffusion 1.x / 2.x text-to-image (diffusers StableDiffusionPipeline) over
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
   // is built when its stage starts and freed when it ends, unless
@@ -12255,8 +12255,9 @@ type
     FUNetConfig: TSDUNetConfig;
     FVaeConfig: TVaeDecoderConfig;
     FTextConfig: TClipConfig;
-    // tokenizer_config.json: model_max_length (capped at the text positions)
-    // and the pad token text; FTokenizer is loaded by the first TokenizePrompt.
+    // tokenizer_config.json: model_max_length (capped at the text positions);
+    // the pad token text (special_tokens_map.json wins); FTokenizer is loaded
+    // by the first TokenizePrompt.
     FMaxTokenCount: integer;
     FPadToken: string;
     FTokenizer: TNeuralHFTokenizer;
@@ -12306,7 +12307,8 @@ type
     FOpenCLDevices: TEasyOpenCL;
     {$ENDIF}
     function ComponentFolder(const Component: string): string;
-    // Loads tokenizer/ and registers the textual inversion tokens.
+    // Loads tokenizer/, registers the pad token as special and the textual
+    // inversion tokens.
     procedure EnsureTokenizer();
     // Adds Token, Token_1, ... of concept ConceptPos to FTokenizer; raises
     // unless their ids are the embedding rows after the text encoder vocab.
@@ -12438,7 +12440,7 @@ type
     property TextConfig: TClipConfig read FTextConfig;
     property MaxTokenCount: integer read FMaxTokenCount;
     property VaeScaleFactor: integer read GetVaeScaleFactor;
-    // unet sample_size * VaeScaleFactor (512 for SD 1.5).
+    // unet sample_size * VaeScaleFactor (512 for SD 1.5, 768 for SD 2.1).
     property DefaultImageSize: integer read GetDefaultImageSize;
     property ComponentsLoaded: boolean read FKeepComponents;
     property ImageStats: TStableDiffusionImageStats read FImageStats;
@@ -93298,7 +93300,18 @@ var
   JsonText: TStringList;
   Root, Node: TJSONData;
   Obj: TJSONObject;
-  IndexFile, TokenizerConfigFile: string;
+  IndexFile, TokenizerConfigFile, SpecialTokensFile: string;
+
+  procedure ReadPadToken(Config: TJSONObject);
+  var
+    PadNode: TJSONData;
+  begin
+    PadNode := Config.Find('pad_token');
+    if PadNode is TJSONString then FPadToken := PadNode.AsString
+    else if PadNode is TJSONObject then
+      FPadToken := TJSONObject(PadNode).Get('content', FPadToken);
+  end;
+
 begin
   inherited Create;
   FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
@@ -93309,6 +93322,7 @@ begin
   FPlainConditioner := TStableDiffusionConditioner.Create();
   IndexFile := FModelFolder + 'model_index.json';
   TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
+  SpecialTokensFile := ComponentFolder('tokenizer') + 'special_tokens_map.json';
   JsonText := TStringList.Create;
   Root := nil;
   try
@@ -93347,11 +93361,17 @@ begin
         if (Node is TJSONNumber) and (Node.AsFloat >= 2) and
           (Node.AsFloat < FMaxTokenCount) then
           FMaxTokenCount := Round(Node.AsFloat);
-        Node := Obj.Find('pad_token');
-        if Node is TJSONString then FPadToken := Node.AsString
-        else if Node is TJSONObject then
-          FPadToken := TJSONObject(Node).Get('content', FPadToken);
+        ReadPadToken(Obj);
       end;
+      FreeAndNil(Root);
+    end;
+    // transformers lets special_tokens_map.json override tokenizer_config.json
+    // (SD 2.x: "!" over "<|endoftext|>").
+    if FileExists(SpecialTokensFile) then
+    begin
+      JsonText.LoadFromFile(SpecialTokensFile);
+      Root := GetJSON(JsonText.Text);
+      if Root is TJSONObject then ReadPadToken(TJSONObject(Root));
     end;
   finally
     Root.Free;
@@ -93867,6 +93887,9 @@ begin
   try
     FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
       Folder + 'merges.txt');
+    // transformers splits the pad token out of prompts (SD 2.x: every "!").
+    if FTokenizer.TokenToId(FPadToken) >= 0 then
+      FTokenizer.AddSpecialToken(FPadToken);
     MaxConceptPos := High(FInversionTokens);
     for ConceptPos := 0 to MaxConceptPos do
       RegisterInversionTokens(ConceptPos);

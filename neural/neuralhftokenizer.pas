@@ -458,6 +458,9 @@ type
       // Registers Content as a non-special added token (HF add_tokens) with the
       // next free id, returned; a CLIP tokenizer stores and matches it lowercased.
       function AddToken(const Content: string): integer;
+      // Registers vocab entry Content as a special token, split out of the text
+      // before BPE as HF special tokens are; returns its id (kept if added).
+      function AddSpecialToken(const Content: string): integer;
 
       property UnkId: integer read FUnkId; // -1 if none
       property BosId: integer read FBosId; // -1 if none
@@ -5279,6 +5282,26 @@ begin
   FAddedTokens[AddedHi + 1].Id := Result;
   FAddedTokens[AddedHi + 1].Special := false;
   FAddedTokens[AddedHi + 1].Normalized := FClipPreTok;
+  FAddedIdIndexBuilt := false;
+end;
+
+function TNeuralHFTokenizer.AddSpecialToken(const Content: string): integer;
+var
+  TokenIndex, AddedHi: integer;
+begin
+  AddedHi := High(FAddedTokens);
+  for TokenIndex := 0 to AddedHi do
+    if FAddedTokens[TokenIndex].Content = Content then
+      exit(FAddedTokens[TokenIndex].Id);
+  Result := TokenToId(Content);
+  if Result < 0 then
+    raise EHFTokenizerError.Create('AddSpecialToken: "' + Content +
+      '" is not in the vocabulary.');
+  SetLength(FAddedTokens, AddedHi + 2);
+  FAddedTokens[AddedHi + 1].Content := Content;
+  FAddedTokens[AddedHi + 1].Id := Result;
+  FAddedTokens[AddedHi + 1].Special := true;
+  FAddedTokens[AddedHi + 1].Normalized := false;
   FAddedIdIndexBuilt := false;
 end;
 

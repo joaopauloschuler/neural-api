@@ -55,6 +55,17 @@ type
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
+    // The pipeline of fixture folder Folder (tiny_sd15, tiny_sd2).
+    function CreateSDPipeline(const Folder: string): TStableDiffusionPipeline;
+    // Pipeline parity checks of fixture folder Folder against its
+    // tools/make_pico_sd*_pipeline_fixture.py oracle files.
+    procedure CheckSDPipelineTokens(const Folder, OracleFile: string);
+    procedure CheckSDPipelineEmbeds(const Folder, OracleFile: string);
+    procedure CheckSDPipelineParity(const Folder, OracleFile: string);
+    procedure CheckSDPipelineSamplers(const Folder, OracleFile,
+      SamplersFile: string);
+    procedure CheckSDImg2ImgParity(const Folder, OracleFile: string);
+    procedure CheckSDLCMParity(const Folder, OracleFile: string);
     // tiny_sd15_lcm_distilled (unet, scheduler, model_index) with tiny_sd15's
     // text encoder, tokenizer and VAE, assembled in a temp folder.
     function CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
@@ -1271,6 +1282,13 @@ type
     procedure TestStableDiffusionImg2ImgParity;
     procedure TestStableDiffusionLCMParity;
     procedure TestStableDiffusionLCMDistilledParity;
+    procedure TestStableDiffusion2Config;
+    procedure TestStableDiffusion2Tokens;
+    procedure TestStableDiffusion2Embeds;
+    procedure TestStableDiffusion2Parity;
+    procedure TestStableDiffusion2Samplers;
+    procedure TestStableDiffusion2Img2ImgParity;
+    procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
     procedure TestStableDiffusionTextualInversionTokens;
@@ -45503,8 +45521,14 @@ end;
 
 function TTestNeuralPretrained.CreateSD15Pipeline(): TStableDiffusionPipeline;
 begin
+  Result := CreateSDPipeline('tiny_sd15');
+end;
+
+function TTestNeuralPretrained.CreateSDPipeline(
+  const Folder: string): TStableDiffusionPipeline;
+begin
   Result := TStableDiffusionPipeline.Create(ExtractFileDir(
-    FixturePath('tiny_sd15/model_index.json')));
+    FixturePath(Folder + '/model_index.json')));
 end;
 
 function TTestNeuralPretrained.CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
@@ -45619,6 +45643,12 @@ end;
 // TokenizePrompt: [bos] + ids + [eos], padded to 77 with <|endoftext|> and
 // truncated, as diffusers' tokenizer(padding="max_length", truncation=True).
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineTokens;
+begin
+  CheckSDPipelineTokens('tiny_sd15', 'tiny_sd15_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDPipelineTokens(const Folder,
+  OracleFile: string);
 var
   Root: TJSONData;
   Pipeline: TStableDiffusionPipeline;
@@ -45626,8 +45656,8 @@ var
   Ids: TNeuralIntegerArray;
   CaseCnt, IdCnt: integer;
 begin
-  Root := LoadSD15PipelineOracle();
-  Pipeline := CreateSD15Pipeline();
+  Root := LoadSD15Fixture(OracleFile);
+  Pipeline := CreateSDPipeline(Folder);
   try
     AssertEquals('max tokens', 77, Pipeline.MaxTokenCount);
     Cases := TJSONObject(Root).Arrays['tokens'];
@@ -45650,14 +45680,20 @@ end;
 // EncodePrompt: the CLIP last hidden state of the prompt and of "" against
 // diffusers encode_prompt (float64).
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineEmbeds;
+begin
+  CheckSDPipelineEmbeds('tiny_sd15', 'tiny_sd15_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDPipelineEmbeds(const Folder,
+  OracleFile: string);
 var
   Root: TJSONData;
   Pipeline: TStableDiffusionPipeline;
   Got, Expected: TNNetVolume;
   MaxDiff: double;
 begin
-  Root := LoadSD15PipelineOracle();
-  Pipeline := CreateSD15Pipeline();
+  Root := LoadSD15Fixture(OracleFile);
+  Pipeline := CreateSDPipeline(Folder);
   Got := TNNetVolume.Create;
   Expected := TNNetVolume.Create;
   try
@@ -45748,14 +45784,20 @@ end;
 // End to end from the prompt text and the oracle's initial latents: 3 guided
 // DDIM steps (latents after each) and the decoded 16x16 image.
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineParity;
+begin
+  CheckSDPipelineParity('tiny_sd15', 'tiny_sd15_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDPipelineParity(const Folder,
+  OracleFile: string);
 var
   Pipeline: TStableDiffusionPipeline;
   Embeds, Initial, Image, Expected: TNNetVolume;
   ImageSize: integer;
   MaxDiff: double;
 begin
-  FSD15Oracle := LoadSD15PipelineOracle();
-  Pipeline := CreateSD15Pipeline();
+  FSD15Oracle := LoadSD15Fixture(OracleFile);
+  Pipeline := CreateSDPipeline(Folder);
   Embeds := TNNetVolume.Create;
   Initial := TNNetVolume.Create;
   Image := TNNetVolume.Create;
@@ -45800,6 +45842,13 @@ end;
 // real diffusers config through DiffusersSchedulerSampler, then the guided
 // steps from the oracle's initial latents match after every model eval.
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineSamplers;
+begin
+  CheckSDPipelineSamplers('tiny_sd15', 'tiny_sd15_pipeline_io.json',
+    'tiny_sd15_samplers_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDPipelineSamplers(const Folder,
+  OracleFile, SamplersFile: string);
 const
   cExpected: array[0..2] of TNNetSamplerMethod =
     (smPNDM, smEuler, smDPMSolverPP2M);
@@ -45812,9 +45861,9 @@ var
   ImageSize, SamplerPos: integer;
   Notice: string;
 begin
-  Root := LoadSD15PipelineOracle();
-  SamplerRoot := LoadSD15Fixture('tiny_sd15_samplers_io.json');
-  Pipeline := CreateSD15Pipeline();
+  Root := LoadSD15Fixture(OracleFile);
+  SamplerRoot := LoadSD15Fixture(SamplersFile);
+  Pipeline := CreateSDPipeline(Folder);
   Embeds := TNNetVolume.Create;
   Initial := TNNetVolume.Create;
   Latents := TNNetVolume.Create;
@@ -46720,6 +46769,12 @@ end;
 // with DDIM, PNDM, DPM++ 2M, Euler and Euler a (replayed step noise), and DDIM
 // at strength 1.
 procedure TTestNeuralPretrained.TestStableDiffusionImg2ImgParity;
+begin
+  CheckSDImg2ImgParity('tiny_sd15', 'tiny_sd15_img2img_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDImg2ImgParity(const Folder,
+  OracleFile: string);
 var
   Pipeline: TStableDiffusionPipeline;
   Img2Img: TStableDiffusionImg2Img;
@@ -46730,8 +46785,8 @@ var
   Notice: string;
   IsRefused: boolean;
 begin
-  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
-  Pipeline := CreateSD15Pipeline();
+  FSD15Oracle := LoadSD15Fixture(OracleFile);
+  Pipeline := CreateSDPipeline(Folder);
   Img2Img := TStableDiffusionImg2Img.Create();
   SourceImage := TNNetVolume.Create;
   ImageNoise := TNNetVolume.Create;
@@ -46788,6 +46843,12 @@ end;
 // replayed step noise): 4 steps of text-to-image at guidance 1.5 and 1.0, and
 // img2img at strength 0.5 over the shrunken origin grid (all 4 steps run).
 procedure TTestNeuralPretrained.TestStableDiffusionLCMParity;
+begin
+  CheckSDLCMParity('tiny_sd15', 'tiny_sd15_lcm_io.json');
+end;
+
+procedure TTestNeuralPretrained.CheckSDLCMParity(const Folder,
+  OracleFile: string);
 var
   Pipeline: TStableDiffusionPipeline;
   Img2Img: TStableDiffusionImg2Img;
@@ -46797,8 +46858,8 @@ var
   CasePos, PassesPerStep: integer;
   Notice: string;
 begin
-  FSD15Oracle := LoadSD15Fixture('tiny_sd15_lcm_io.json');
-  Pipeline := CreateSD15Pipeline();
+  FSD15Oracle := LoadSD15Fixture(OracleFile);
+  Pipeline := CreateSDPipeline(Folder);
   Img2Img := TStableDiffusionImg2Img.Create();
   SourceImage := TNNetVolume.Create;
   ImageNoise := TNNetVolume.Create;
@@ -46906,6 +46967,61 @@ begin
     Img2Img.Free;
     FreeAndNil(FSD15Oracle);
   end;
+end;
+
+// tiny_sd2 (tools/make_pico_sd2_pipeline_fixture.py) is read as SD 2.1 is:
+// v_prediction, gelu text encoder, linear projection, per-block heads, size.
+procedure TTestNeuralPretrained.TestStableDiffusion2Config;
+var
+  Pipeline: TStableDiffusionPipeline;
+begin
+  Pipeline := CreateSDPipeline('tiny_sd2');
+  try
+    AssertTrue('v_prediction', Pipeline.Scheduler.PredictionType = dpV);
+    AssertTrue('DDIM mapped', Pipeline.Sampler = smDDIM);
+    AssertEquals('no notice', '', Pipeline.SamplerNotice);
+    AssertTrue('gelu text encoder',
+      Pipeline.TextConfig.Text.HiddenAct = chaGeluExact);
+    AssertTrue('linear projection', Pipeline.UNetConfig.UseLinearProjection);
+    AssertEquals('block 0 heads', 2, Pipeline.UNetConfig.HeadsPerBlock[0]);
+    AssertEquals('block 1 heads', 4, Pipeline.UNetConfig.HeadsPerBlock[1]);
+    AssertEquals('default size: sample_size * VAE factor', 24,
+      Pipeline.DefaultImageSize);
+  finally
+    Pipeline.Free;
+  end;
+end;
+
+// The "!" pad of special_tokens_map.json wins over tokenizer_config.json's.
+procedure TTestNeuralPretrained.TestStableDiffusion2Tokens;
+begin
+  CheckSDPipelineTokens('tiny_sd2', 'tiny_sd2_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Embeds;
+begin
+  CheckSDPipelineEmbeds('tiny_sd2', 'tiny_sd2_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Parity;
+begin
+  CheckSDPipelineParity('tiny_sd2', 'tiny_sd2_pipeline_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Samplers;
+begin
+  CheckSDPipelineSamplers('tiny_sd2', 'tiny_sd2_pipeline_io.json',
+    'tiny_sd2_samplers_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2Img2ImgParity;
+begin
+  CheckSDImg2ImgParity('tiny_sd2', 'tiny_sd2_img2img_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusion2LCMParity;
+begin
+  CheckSDLCMParity('tiny_sd2', 'tiny_sd2_lcm_io.json');
 end;
 
 // One UNet call with the guidance-scale embedding (time_embedding.cond_proj)

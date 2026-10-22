@@ -1,13 +1,14 @@
 # StableDiffusion
 
 Text-to-image, image-to-image and InstructPix2Pix image editing with a
-diffusers Stable Diffusion 1.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
+diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
 
 One `Generate` call:
 
 1. tokenizes the prompt and the negative prompt with the CLIP tokenizer in
    `tokenizer/` (`vocab.json` + `merges.txt`): `[bos] ids [eos]`, padded to 77
-   tokens with the pad token of `tokenizer_config.json`,
+   tokens with the pad token (`special_tokens_map.json` wins over
+   `tokenizer_config.json`, as in transformers; SD 2.x pads with `!`),
 2. encodes both with the CLIP text encoder in `text_encoder/` (last hidden
    state),
 3. runs the denoising steps with the UNet in `unet/`: per step one pass on the
@@ -51,8 +52,8 @@ StableDiffusion --model ~/models/stable-diffusion-v1-5 \
   --prompt "a <cat-toy> on a beach"
 ```
 
-The vector width must equal the text encoder's hidden size (768 for SD 1.x;
-an SD 2.x embedding is 1024 wide and is rejected). As in diffusers, the token
+The vector width must equal the text encoder's hidden size (768 for SD 1.x,
+1024 for SD 2.x; an embedding made for the other family is rejected). As in diffusers, the token
 matches in any case, but only an all-lowercase token expands to its N vectors:
 a mixed-case token such as `EasyNegative` uses its first vector only. Pass a
 lowercase TOKEN (`file.pt:easynegative`) to get all of them. Tested against
@@ -244,6 +245,39 @@ strength 0.5 (`TestStableDiffusionLCMDistilledParity`), plus one UNet call
 with the guidance embedding (`TestSDUNetTimeCondProjDimParity`). No real
 LCM-LoRA or LCM-distilled checkpoint has been run yet.
 
+## Checkpoints
+
+| Checkpoint | Status |
+| --- | --- |
+| Stable Diffusion 1.x (e.g. `runwayml/stable-diffusion-v1-5`) | coded; pico parity against diffusers; no real checkpoint run yet |
+| Stable Diffusion 2.x (e.g. `stabilityai/stable-diffusion-2-1`, 768x768, `v_prediction`) | coded; pico parity against diffusers only; no real checkpoint run yet, so not supported |
+| SDXL | not supported (the pipeline refuses `addition_embed_type` `text_time`) |
+
+What SD 2.x changes, and how the pipeline reads it from the folder:
+
+* `scheduler_config.json` `prediction_type` `v_prediction`: every sampler
+  (DDIM, PNDM, Euler, Euler a, DPM++ 2M, LCM) converts the UNet's v output,
+  in text-to-image, img2img and inpainting.
+* The text encoder is OpenCLIP ViT-H as a `CLIPTextModel`: `hidden_act`
+  `gelu` (exact erf), hidden size 1024, and `num_hidden_layers` 23 of the
+  original 24, so its last hidden state is OpenCLIP's penultimate layer.
+* The UNet config has `use_linear_projection` and a head count per block
+  (`attention_head_dim` `[5, 10, 20, 20]`; diffusers reads it as head counts).
+* `special_tokens_map.json` sets the pad token to `!`. transformers also
+  treats it as a special token, so each `!` in a prompt becomes its own token
+  (id 0); the pipeline does the same.
+* The default size is the UNet `sample_size` times the VAE factor:
+  96 x 8 = 768 for SD 2.1, 64 x 8 = 512 for SD 2.1-base and SD 1.5.
+
+The pico SD 2.x folder `tests/fixtures/tiny_sd2`
+(`tools/make_pico_sd2_pipeline_fixture.py`) has all of the above at random
+weights. `TestStableDiffusion2*` match diffusers float64 below 1e-4 on the
+tokens, the prompt embeds, the latents after each step and the decoded image,
+with CFG, for DDIM, PNDM, Euler, DPM++ 2M and LCM, and for img2img with DDIM,
+PNDM, DPM++ 2M, Euler and Euler a. Inpainting with `v_prediction` is not
+tested separately: it noises the image latents with the same scheduler call
+as img2img, which does not depend on the prediction type.
+
 ## Usage
 
 ```
@@ -255,7 +289,8 @@ StableDiffusion [--model DIR] [options]
   --guidance G      classifier-free guidance scale (default 7.5, 1.0 with lcm;
                     <= 1 turns it off); an LCM-distilled UNet embeds it
                     (default 8.5)
-  --width N         image width (default: the checkpoint's, 512 for SD 1.5)
+  --width N         image width (default: the checkpoint's, 512 for SD 1.5,
+                    768 for SD 2.1)
   --height N        image height (default: the checkpoint's)
   --size N          sets both --width and --height
   --seed N          noise seed (default 0)
@@ -325,11 +360,11 @@ Stages of image 2 (wall time):
 
 ## Limits
 
-* Only Stable Diffusion 1.x is covered by tests (pico parity against diffusers
-  in `TestStableDiffusionPipelineParity` for DDIM and
-  `TestStableDiffusionPipelineSamplers` for PNDM, Euler and DPM-Solver++ 2M;
-  Euler a against diffusers with replayed noise in `TestNeuralDiffusion`).
-  No real checkpoint has been run yet.
+* Stable Diffusion 1.x and 2.x are covered by pico tests only (parity against
+  diffusers in `TestStableDiffusionPipelineParity` for DDIM and
+  `TestStableDiffusionPipelineSamplers` for PNDM, Euler and DPM-Solver++ 2M,
+  `TestStableDiffusion2*` for SD 2.x; Euler a against diffusers with replayed
+  noise in `TestNeuralDiffusion`). No real checkpoint has been run yet.
 * Euler with `linspace` spacing rounds the timesteps to integers; diffusers
   keeps fractional ones when `T - 1` is not a multiple of `steps - 1`.
 * Width and height must each be a multiple of the VAE factor (8 for SD 1.5;

@@ -1,13 +1,14 @@
 program StableDiffusion;
 (*
-StableDiffusion: text-to-image with a diffusers Stable Diffusion 1.x folder
+StableDiffusion: text-to-image with a diffusers Stable Diffusion 1.x / 2.x folder
 through TStableDiffusionPipeline in neuralpretrained.pas.
 
   * no --model: runs the committed random pico folder tests/fixtures/tiny_sd15
     (16x16, random weights): this checks wiring and I/O only.
   * --model DIR: a diffusers StableDiffusionPipeline folder (model_index.json,
     text_encoder/, tokenizer/, unet/, vae/, scheduler/), e.g.
-    runwayml/stable-diffusion-v1-5 with F32 *.safetensors weights.
+    runwayml/stable-diffusion-v1-5 with F32 *.safetensors weights (SD 2.x
+    folders are coded and pico-tested only).
 
 The scheduler config gives the betas, timestep spacing and prediction type,
 and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a,
@@ -189,7 +190,7 @@ begin
   WriteLn('                    <= 1 turns it off); an LCM-distilled UNet ',
     'embeds it (default 8.5)');
   WriteLn('  --width N         image width (default: the checkpoint''s, ',
-    '512 for SD 1.5)');
+    '512 for SD 1.5, 768 for SD 2.1)');
   WriteLn('  --height N        image height (default: the checkpoint''s)');
   WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
