@@ -529,31 +529,7 @@ rather than acted on.
           2026-10-02). SD 1.x pipeline + CLI LANDED 2026-10-21 (8abce32d,
           d7d07607, d55b7bfc, b764df66; pico parity vs a diffusers float64 run
           on tests/fixtures/tiny_sd15 from tools/make_pico_sd_pipeline_fixture.py).
-          Done and open pieces:
-      - [X] `TStableDiffusionPipeline` (neuralpretrained.pas): Create over
-            model_index.json + text_encoder/ tokenizer/ unet/ vae/ scheduler/,
-            TokenizePrompt, EncodeTokenIds/EncodePrompt, MakeInitialLatents,
-            Denoise, DecodeLatents, GenerateFromEmbeds, Generate, OnPhase/OnStep;
-            each component built per stage and freed. Tests:
-            TestStableDiffusionPipeline{Tokens,Embeds,GuidedNoise,Parity,
-            RefusesBadSize} (embeds 1.0e-6, guided noise 8.2e-6, step latents
-            2.0e-5, image 1.1e-6).
-      - [X] CFG: cond + empty/negative-prompt uncond UNet pass per step through
-            TNNetDiffusionScheduler.ApplyCFG; Generate encodes both prompts in
-            one text-encoder load.
-      - [X] Scheduler config: timestep_spacing "leading" + steps_offset
-            (tsLeading, the SD 1.x/2.x default) and PNDM configs (no
-            clip_sample default) load into TNNetDiffusionScheduler.
-      - [X] SD 1.x CLIP text encoder: BuildClipTextTower last hidden state, 77
-            tokens padded with tokenizer_config's pad token.
-      - [X] CLIP tokenizer from vocab.json + merges.txt
-            (TNeuralHFTokenizer.LoadCLIPVocabAndMerges, TestCLIPVocabAndMergesParity).
-      - [X] Fixed ReadSDUNetConfigFromJSONText: attention_head_dim is the head
-            COUNT in diffusers (num_attention_heads or attention_head_dim); it
-            was read as a head dim, so real SD 1.5 built 40 heads instead of 8.
-            Pico configs now state the head counts their numpy oracles used.
-      - [X] CLI: examples/StableDiffusion (separate example; the QwenImage CLI
-            is typed to TQwenImage21Pipeline's phases and stats).
+          Open pieces:
       - [ ] Real-checkpoint run of SD 1.5 (runwayml/stable-diffusion-v1-5 F32
             safetensors) on the user's GPU box with examples/StableDiffusion
             --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
@@ -1773,8 +1749,9 @@ rather than acted on.
             `FInputPrepared` is the user-decision item under "Layer follow-ups".
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
-      - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`) can take the same
-            reader once the real Stable Diffusion pipeline item above lands.
+      - [ ] The SD UNet path (`BuildSDUNetFromSafeTensors`,
+            `TStableDiffusionPipeline`) can take the same reader;
+            examples/StableDiffusion has no `--lora` yet.
       - [ ] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
             `load_lora_weights` + `fuse_lora` latent oracle, and no real
             community LoRA has run yet (user run).
@@ -1991,68 +1968,17 @@ rather than acted on.
             defaults (2 of 18 steps run the extra pass) from the user's GPU
             box, for examples/QwenImage/README.md; the default blocks (PAG 16,
             SLG 6,7,8) are untuned on the real checkpoint.
-      - [ ] Later consumers: the SD UNet path (examples/LatentTextToImage,
+      - [ ] Later consumers: the SD UNet path (`TStableDiffusionPipeline` /
+            examples/StableDiffusion and examples/LatentTextToImage,
             diffusers `StableDiffusionPAGPipeline` on mid-block self-attention)
             and CogVideoX.
       A diffusers oracle needs a patched block / processor registry and a
       Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
       either guider on QwenImage21); ask the user before adding a Python tool.
 
-- [X] SuperPoint + LightGlue keypoint detection and image matching importer
-      (`BuildSuperPointFromSafeTensors[Ex]` + `BuildLightGlueFromSafeTensors[Ex]`,
-      transformers model_types "superpoint" / "lightglue", checkpoints
-      `magic-leap-community/superpoint` and `ETH-CVG/lightglue_superpoint`), plus
-      examples/KeypointMatching (two images in, a side-by-side PNG with the match
-      lines out, and a README.md). The library imports classifiers, detectors,
-      depth and segmentation nets, but nothing finds and matches sparse keypoints
-      between two views (panorama stitching, visual odometry, image retrieval
-      re-ranking). SuperPoint maps to existing layers: the VGG-style 3x3 conv +
-      max-pool encoder, a 65-channel score head (`TNNetPointwiseSoftMax`, drop the
-      dustbin channel, `TNNetDepthToSpace` block 8 to full resolution) and a
-      256-channel descriptor head (`TNNetL2Normalize`). The post-process is host
-      code: max-pool NMS of radius `nms_radius`, `keypoint_threshold`, border
-      removal, top-`max_keypoints`, then descriptors sampled at the keypoints
-      with the `TNNetGridSample` bilinear rule and normalized again. LightGlue is a
-      9-layer transformer over the keypoint sets: a self-attention block with a
-      rotary encoding whose angles come from a learned linear map of the 2-D
-      keypoint COORDINATES (`TNNetRotaryEmbedding` takes token indices, so this
-      needs a coordinate-driven variant or a precomputed cos/sin input), a
-      bidirectional cross-attention block (`TNNetCrossAttention`), and a match
-      head (similarity + matchability sigmoid, double log-softmax, mutual
-      nearest neighbour above `filter_threshold`). v1 runs all layers; the
-      adaptive depth (early exit) and point pruning are follow-ups. Parity: pico
-      fixtures against transformers `SuperPointForKeypointDetection` /
-      `LightGlueForKeypointMatching` in the ~/x venv (keypoints, scores,
-      descriptors, match indices). Real checkpoints are small (~5 MB + ~50 MB),
-      so a real-pair run fits the dev box.
-      - [X] SuperPoint: `BuildSuperPoint[FromSafeTensors[Ex]]`,
-            `ReadSuperPointConfigFromJSONFile`, `GetSuperPointHeads`,
-            `SuperPointPreprocessImage` (the PIL-backend processor) and
-            `TSuperPointKeypoints` (NMS, threshold, border, top-k, descriptor
-            sampling) in neural/neuralpretrained.pas; pico fixture
-            tools/make_pico_superpoint_fixture.py, 4 tests (dense score and
-            descriptor maps, keypoints, scores, descriptors over 3 post-process
-            settings, preprocessing). Border removal keeps transformers' rule:
-            it compares against the full-resolution size times 8, so only the
-            near border is removed (the original SuperPoint removes both).
-      - [X] LightGlue: `BuildLightGlue[FromSafeTensors[Ex]]`,
-            `ReadLightGlueConfigFromJSONFile` (keypoint_detector_config read
-            through `ReadSuperPointConfigFromJSONObject`),
-            `BuildLightGlueKeypointDetectorFromSafeTensors` (the SuperPoint
-            inside the LightGlue checkpoint) and `TLightGlueMatcher.Match` over
-            two `TSuperPointKeypoints`. Host-side on `TNNetPlainOps` (fused
-            q|k|v per-token linears, ConcatChannels) and
-            `TNNetVolume.DotProductsPacked` (per-head attention, similarity),
-            because the keypoint counts change per pair and a `TNNet` cannot
-            resize; the coordinate rotary is computed on the host (projector,
-            `SinCos`). GQA supported. Pico fixtures
-            tools/make_pico_lightglue_fixture.py (descriptor_dim 16 with
-            input_projection; dim 8 identity + GQA), 4 tests: keypoints and
-            match indices exact, final descriptors and scores < 1e-4 vs the
-            transformers float64 forward with early exit and pruning disabled.
-      - [X] examples/KeypointMatching + README.md (pico smoke with no
-            arguments; `--model`, `--superpoint`, `--width/--height`,
-            `--max-keypoints`, `--keypoint-threshold`, `--filter-threshold`).
+- [ ] SuperPoint + LightGlue follow-ups (`BuildSuperPointFromSafeTensors[Ex]`,
+      `BuildLightGlueFromSafeTensors[Ex]`, `TSuperPointKeypoints`,
+      `TLightGlueMatcher` and examples/KeypointMatching are done):
       - [ ] LightGlue follow-ups: adaptive depth (early exit on
             `depth_confidence` with the token_confidence heads, not loaded
             now) and point pruning (`width_confidence`); a real-checkpoint run
@@ -2086,19 +2012,12 @@ dev box proves parity; throughput numbers have to come from the GPU box.
 
 ### Residency breakers on the decode path (small kernels, largest payoff)
 
-- [ ] Audit after 0ea67b17 (gather-copy layers now share OpenCL outputs by
-      liveness): pipelines that enable output sharing (Restormer and other
-      neuralpretrained.pas pipelines) now also share TNNetPad / Crop /
-      Transpose / SpaceToDepth / upsample outputs.
-  - [X] Code audit: no host reader of an unpinned intermediate output. The
-        sharing nets (Kokoro stage A front/block/tail, Qwen-Image VAE decoder,
-        Real-ESRGAN via PaddedTiledNetCompute, examples/Restormer) read only
-        the last layer; first-layer reads are shape-only. SuperPoint never
-        enables sharing, and its descriptor head (TNNetL2Normalize) has no
-        in-net reader, so the planner pins it anyway. Contract test:
-        TestGatherCopyHostTapsShareOutputsByLiveness (OpenCL suite).
-  - [ ] A real Restormer / Qwen-Image VAE run on the GPU box against the
-        parent commit (output and time).
+- [ ] GPU-box check after 0ea67b17 (gather-copy layers now share OpenCL outputs by
+      liveness; pipelines that enable output sharing, such as Restormer and other
+      neuralpretrained.pas pipelines, now also share TNNetPad / Crop / Transpose /
+      SpaceToDepth / upsample outputs; the host-tap contract is pinned by
+      TestGatherCopyHostTapsShareOutputsByLiveness): a real Restormer / Qwen-Image
+      VAE run on the GPU box against the parent commit (output and time).
 - [ ] Follow-ups of the `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device
       forward (2ebe172b; `cai_topk_gate`) plus the device slot-map build
       (`cai_moe_build_slot_map`): router -> gate|up -> down has no host hop per
@@ -2280,29 +2199,12 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased
       variant into its own entry point.
-- [X] `TNNetModulatedConv2D` device forward keeps the host in the loop: the
-      style source is downloaded, the w'' slab (Cout*Cin*K*K) is built and
-      re-laid out k-major on the host and uploaded every forward before
-      `cai_conv_implicit` runs. To keep the base kernel resident instead,
-      fold s[i] into the gather and d[o] into the epilogue (a per-column and a
-      per-row scale on `cai_conv_implicit`, with d[o] from a resident
-      sum_t w[o,t,i]^2 table times s^2). Measure the upload share on the GPU
-      box first; at 1024x1024 the contraction should dominate.
-      - DONE differently: the base kernel stays resident in the GEMM's A
-        buffer (uploaded only after `AfterWeightUpdate`), and
-        `TDotProductSharedKernel.ComputeModulatedConv` derives w'' on OpenCL
-        per forward (`cai_conv_weight_square_sums` once per weight change,
-        `cai_conv_modulation_row_scales` for d[o], `cai_conv_modulate_weights`
-        for w*s[i]*d[o]) before an unchanged `cai_conv_implicit`. The style is
-        bound when resident, else uploaded (Cin floats). The extra pass is
-        Cout*K*K*Cin per forward, 1/(H*W) of the conv; the conv kernels and
-        their other callers are untouched. `TestModulatedConv2DOpenCLParity`
-        pins the per-forward upload bytes.
-      - [ ] GPU-box timing at 1024x1024: StyleGAN2 generator forward with
-        OpenCL, per-layer forward time of the 1024x1024 `TNNetModulatedConv2D`
-        layers against the parent commit (host w'' slab + upload every forward).
-        `examples/StyleGAN2Generate` has no OpenCL switch yet, so the run
-        needs `NN.EnableOpenCL` added (or a small timing harness).
+- [ ] GPU-box timing of the resident `TNNetModulatedConv2D` forward (be2196e5,
+      `TDotProductSharedKernel.ComputeModulatedConv`) at 1024x1024: StyleGAN2
+      generator forward with OpenCL, per-layer forward time of the 1024x1024
+      `TNNetModulatedConv2D` layers against the parent commit (host w'' slab +
+      upload every forward). `examples/StyleGAN2Generate` has no OpenCL switch
+      yet, so the run needs `NN.EnableOpenCL` added (or a small timing harness).
 - [ ] The rest of the vision attention subclasses that override `Compute` and
       so lose `TNNetScaledDotProductAttention`'s device path:
       - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item
