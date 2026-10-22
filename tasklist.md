@@ -288,8 +288,8 @@ rather than acted on.
 - [ ] Marigold diffusion depth / surface normals follow-ups (`TMarigoldPipeline`
       in neuralpretrained.pas + `examples/MarigoldDepth`, dc2979d4; checkpoints
       `prs-eth/marigold-depth-v1-1` / `prs-eth/marigold-normals-v1-1`, Ke et al.
-      2024, arXiv:2312.02145). The SD2 `CLIPTextModel` 1024-wide config is not
-      yet checked against a real `text_encoder/`. Open:
+      2024, arXiv:2312.02145). The SD2 `CLIPTextModel` 1024-wide config was
+      checked against the real SD 2.1 `text_encoder/` (719fb4d2). Open:
       - [ ] Pico-fixture parity vs diffusers in the ~/x venv (tiny UNet + VAE,
             like the existing tools/sd_unet_*_fixture.py; ask the user before
             adding a new Python tool), < 1e-4 on the final depth map with fixed
@@ -297,7 +297,7 @@ rather than acted on.
       - [ ] Real-checkpoint runs of examples/MarigoldDepth (FP32, `--int8`,
             `--gpu`) on the user's GPU box: the UNet is ~865M params (3.4 GB
             FP32), above the 2 GB cap on the dev box. SD UNet / VAE under
-            OpenCL had no prior coverage; only the pico smoke ran on PoCL.
+            OpenCL are covered only by pico tests on PoCL.
 
 - [ ] LLaVA-NeXT (llava-v1.6, model_type `llava_next`) dynamic-resolution VLM
       importer follow-up to the landed `BuildLlavaFromSafeTensors`. The v1.6
