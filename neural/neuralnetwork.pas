@@ -8204,6 +8204,50 @@ type
     function LogitScale(): TNeuralFloat;
   end;
 
+  /// Multi-head window self-attention over EVERY window of a sequence in one
+  // layer: the Swin W-MSA / SW-MSA core after the window partition. The input
+  // (SeqLen, 1, 3*Dim) is the packed qkv Linear output (Q | K | V, heads
+  // contiguous inside each, as torch's reshape(N, 3, heads, head_dim)) with the
+  // tokens of window w at positions w*WindowTokens..(w+1)*WindowTokens-1. Per
+  // window and head h:
+  //   score[i,j] = Q[i].K[j] / sqrt(head_dim) + Bias[h,i,j]
+  //                (- 100 when RegionId[i] <> RegionId[j], the shift mask)
+  // and output token i, channels h*head_dim.., is softmax(score[i,:]) . V.
+  // Output (SeqLen, 1, Dim). One non-trainable neuron holds the Heads x
+  // WindowTokens x WindowTokens bias matrices (SetHeadBias) followed by one
+  // region id per token (SetRegionIds); both round-trip through the weight
+  // save/load and are constants for the backward. Backward recomputes each
+  // softmax row, so no SeqLen x WindowTokens x Heads cache is kept. Unlike one
+  // TNNetWindowAttention per (window, head), the projections around this layer
+  // are shared, so a Swin block has one copy of its weights. Host-only.
+  // Coded by Claude (AI).
+  TNNetBatchedWindowAttention = class(TNNetLayer)
+  private
+    FHeads, FWindowTokens, FHeadDim, FDim, FSeqLen: integer;
+    FInvSqrtHeadDim: TNeuralFloat;
+    // Per-row scratch (WindowTokens): softmax weights, and dL/dweights.
+    FScoreRow, FGradRow: TNNetVolume;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // True when window WinFirst..WinFirst+WindowTokens-1 spans several regions.
+    function WindowIsMasked(WinFirst: integer): boolean;
+    // FScoreRow := softmax of query QueryPos's scores against its window, head
+    // HeadOfs div head_dim (Masked applies the region mask).
+    procedure ComputeSoftmaxRow(Prev: TNNetVolume; WinFirst, QueryPos,
+      HeadOfs: integer; Masked: boolean);
+  public
+    constructor Create(pHeads, pWindowTokens: integer); reintroduce; overload;
+    destructor Destroy(); override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Bias holds WindowTokens x WindowTokens values (row = query) for Head.
+    procedure SetHeadBias(Head: integer; const Bias: TNNetVolume);
+    // One region id per input token; equal ids attend, others get -100.
+    procedure SetRegionIds(const RegionIds: TNeuralIntegerArray);
+    property Heads: integer read FHeads;
+    property WindowTokens: integer read FWindowTokens;
+  end;
+
   /// Segment-Anything (SAM) ViT image-encoder self-attention block
   // (Kirillov et al. 2023, "Segment Anything", https://arxiv.org/abs/2304.02643;
   // the ViT-det backbone with 2-D decomposed relative position embeddings from
@@ -14241,7 +14285,8 @@ type
   // output position's error back to its source position with Add (so repeated
   // indices accumulate correctly). The index list lives in its own
   // structure-string segment (no fixed cap). Requires SizeY = 1 and every index
-  // in 0 <= idx < Input.SizeX. The parameterless constructor selects position 0.
+  // in -1 <= idx < Input.SizeX; index -1 writes a ZERO token (window padding)
+  // and takes no gradient. The parameterless constructor selects position 0.
   // Coded by Claude (AI).
   TNNetGatherTokens = class(TNNetIdentity)
     private
@@ -14442,16 +14487,22 @@ type
   //   Output[ox, oy, (sx*P + sy)*C + ic] := Input[ox*P + sx, oy*P + sy, ic]
   // where 0<=sx,sy<P. This is the ViT "patchify" step. Backward applies the
   // inverse permutation (accumulating into FPrevLayer.OutputError).
+  // Tiled=1 (FStruct[1]) stacks P x P whole TILES instead of interleaved pixels
+  // (einops 'c (sy h) (sx w) -> (sx sy c) h w'):
+  //   Output[ox, oy, (sx*P + sy)*C + ic] := Input[sx*Wp + ox, sy*Hp + oy, ic].
   // Coded by Claude (AI).
   TNNetSpaceToDepth = class(TNNetIdentity)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Source offset of block (OX, OY) is GetRawPos(OX*OriginMul, OY*OriginMul);
+      // one step of sx / sy within the block adds SXStep / SYStep.
+      procedure BlockStrides(out OriginMul, SXStep, SYStep: integer);
       {$IFDEF OpenCL}
       function HasGatherCopyPlan(): boolean; override;
       procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
       {$ENDIF}
     public
-      constructor Create(BlockSize: integer); reintroduce; overload;
+      constructor Create(BlockSize: integer; pTiled: integer = 0); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -52096,6 +52147,275 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+{ TNNetBatchedWindowAttention }
+
+const
+  csSwinShiftMaskBias = -100.0; // torch Swin's masked_fill value
+
+constructor TNNetBatchedWindowAttention.Create(pHeads, pWindowTokens: integer);
+begin
+  inherited Create();
+  FStruct[0] := pHeads;
+  FStruct[1] := pWindowTokens;
+  FScoreRow := TNNetVolume.Create();
+  FGradRow := TNNetVolume.Create();
+end;
+
+destructor TNNetBatchedWindowAttention.Destroy();
+begin
+  FScoreRow.Free;
+  FGradRow.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetBatchedWindowAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Prev: TNNetVolume;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FHeads := FStruct[0];
+  FWindowTokens := FStruct[1];
+  Prev := pPrevLayer.Output;
+  if (FHeads < 1) or (FWindowTokens < 1) or (Prev.SizeY <> 1) or
+     (Prev.Depth mod (3 * FHeads) <> 0) or
+     (Prev.SizeX mod FWindowTokens <> 0) then
+  begin
+    FErrorProc('TNNetBatchedWindowAttention needs a (k*WindowTokens, 1, ' +
+      '3*Heads*head_dim) input; got ' + IntToStr(Prev.SizeX) + 'x' +
+      IntToStr(Prev.SizeY) + 'x' + IntToStr(Prev.Depth) + ', Heads=' +
+      IntToStr(FHeads) + ', WindowTokens=' + IntToStr(FWindowTokens));
+    Exit;
+  end;
+  FSeqLen := Prev.SizeX;
+  FDim := Prev.Depth div 3;
+  FHeadDim := FDim div FHeads;
+  FInvSqrtHeadDim := 1 / Sqrt(FHeadDim);
+  FOutput.ReSize(FSeqLen, 1, FDim);
+  SetOutputErrorSize(FOutput);
+  FScoreRow.ReSize(FWindowTokens, 1, 1);
+  FGradRow.ReSize(FWindowTokens, 1, 1);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1,
+    FHeads * FWindowTokens * FWindowTokens + FSeqLen);
+  FNeurons[0].FWeights.Fill(0);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetBatchedWindowAttention.InitDefault();
+begin
+  // Zero bias and one region: plain multi-head window attention.
+  if FNeurons.Count > 0 then
+  begin
+    FNeurons[0].FWeights.Fill(0);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetBatchedWindowAttention.SetHeadBias(Head: integer;
+  const Bias: TNNetVolume);
+var
+  MatrixSize: integer;
+begin
+  MatrixSize := FWindowTokens * FWindowTokens;
+  if (FNeurons.Count < 1) or (Head < 0) or (Head >= FHeads) or
+     (Bias.Size <> MatrixSize) then
+  begin
+    FErrorProc('TNNetBatchedWindowAttention.SetHeadBias: head ' +
+      IntToStr(Head) + ' with ' + IntToStr(Bias.Size) + ' values (expected ' +
+      IntToStr(MatrixSize) + '); add the layer to a net first.');
+    Exit;
+  end;
+  Move(Bias.FData[0], FNeurons[0].FWeights.FData[Head * MatrixSize],
+    MatrixSize * csNeuralFloatSize);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetBatchedWindowAttention.SetRegionIds(
+  const RegionIds: TNeuralIntegerArray);
+var
+  TokenPos, MaxTokenPos, RegionBase: integer;
+begin
+  if (FNeurons.Count < 1) or (Length(RegionIds) <> FSeqLen) then
+  begin
+    FErrorProc('TNNetBatchedWindowAttention.SetRegionIds: ' +
+      IntToStr(Length(RegionIds)) + ' ids for ' + IntToStr(FSeqLen) +
+      ' tokens; add the layer to a net first.');
+    Exit;
+  end;
+  RegionBase := FHeads * FWindowTokens * FWindowTokens;
+  MaxTokenPos := FSeqLen - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    FNeurons[0].FWeights.FData[RegionBase + TokenPos] := RegionIds[TokenPos];
+  AfterWeightUpdate();
+end;
+
+function TNNetBatchedWindowAttention.WindowIsMasked(WinFirst: integer): boolean;
+var
+  Region: TNeuralFloatArrPtr;
+  TokenPos, MaxTokenPos: integer;
+begin
+  Region := FNeurons[0].FWeights.GetRawPtr(
+    FHeads * FWindowTokens * FWindowTokens + WinFirst);
+  Result := false;
+  MaxTokenPos := FWindowTokens - 1;
+  for TokenPos := 1 to MaxTokenPos do
+    if Region^[TokenPos] <> Region^[0] then
+    begin
+      Result := true;
+      Exit;
+    end;
+end;
+
+procedure TNNetBatchedWindowAttention.ComputeSoftmaxRow(Prev: TNNetVolume;
+  WinFirst, QueryPos, HeadOfs: integer; Masked: boolean);
+var
+  KeyPos, MaxKeyPos, TokenStride, KeyOfs: integer;
+  QueryPtr, BiasRow, Region, Scores: TNeuralFloatArrPtr;
+  QueryRegion, MaxScore, SumExp: TNeuralFloat;
+begin
+  TokenStride := 3 * FDim;
+  MaxKeyPos := FWindowTokens - 1;
+  Scores := FScoreRow.GetRawPtr();
+  QueryPtr := Prev.GetRawPtr((WinFirst + QueryPos) * TokenStride + HeadOfs);
+  BiasRow := FNeurons[0].FWeights.GetRawPtr(
+    ((HeadOfs div FHeadDim) * FWindowTokens + QueryPos) * FWindowTokens);
+  KeyOfs := WinFirst * TokenStride + FDim + HeadOfs;
+  for KeyPos := 0 to MaxKeyPos do
+  begin
+    Scores^[KeyPos] := TNNetVolume.DotProduct(QueryPtr, Prev.GetRawPtr(KeyOfs),
+      FHeadDim) * FInvSqrtHeadDim + BiasRow^[KeyPos];
+    Inc(KeyOfs, TokenStride);
+  end;
+  if Masked then
+  begin
+    Region := FNeurons[0].FWeights.GetRawPtr(
+      FHeads * FWindowTokens * FWindowTokens + WinFirst);
+    QueryRegion := Region^[QueryPos];
+    for KeyPos := 0 to MaxKeyPos do
+      if Region^[KeyPos] <> QueryRegion then
+        Scores^[KeyPos] := Scores^[KeyPos] + csSwinShiftMaskBias;
+  end;
+  MaxScore := TNNetVolume.MaxValue(Scores, FWindowTokens);
+  SumExp := TNNetVolume.ExpShiftSum(Scores, Scores, MaxScore, FWindowTokens);
+  TNNetVolume.Mul(Scores, 1 / SumExp, FWindowTokens);
+end;
+
+procedure TNNetBatchedWindowAttention.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  WinFirst, MaxWinFirst, HeadOfs, MaxHeadOfs, QueryPos, KeyPos: integer;
+  MaxTokenPos, TokenStride, ValueOfs: integer;
+  Masked: boolean;
+  OutPtr, Scores: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  Prev := FPrevLayer.FOutput;
+  TokenStride := 3 * FDim;
+  MaxTokenPos := FWindowTokens - 1;
+  MaxWinFirst := FSeqLen - FWindowTokens;
+  MaxHeadOfs := FDim - FHeadDim;
+  Scores := FScoreRow.GetRawPtr();
+  WinFirst := 0;
+  while WinFirst <= MaxWinFirst do
+  begin
+    Masked := WindowIsMasked(WinFirst);
+    HeadOfs := 0;
+    while HeadOfs <= MaxHeadOfs do
+    begin
+      for QueryPos := 0 to MaxTokenPos do
+      begin
+        ComputeSoftmaxRow(Prev, WinFirst, QueryPos, HeadOfs, Masked);
+        OutPtr := FOutput.GetRawPtr((WinFirst + QueryPos) * FDim + HeadOfs);
+        FillChar(OutPtr^, FHeadDim * csNeuralFloatSize, 0);
+        ValueOfs := WinFirst * TokenStride + 2 * FDim + HeadOfs;
+        for KeyPos := 0 to MaxTokenPos do
+        begin
+          TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(ValueOfs), Scores^[KeyPos],
+            FHeadDim);
+          Inc(ValueOfs, TokenStride);
+        end;
+      end;
+      Inc(HeadOfs, FHeadDim);
+    end;
+    Inc(WinFirst, FWindowTokens);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBatchedWindowAttention.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  WinFirst, MaxWinFirst, HeadOfs, MaxHeadOfs, QueryPos, KeyPos: integer;
+  MaxTokenPos, TokenStride, QueryOfs, KeyOfs: integer;
+  Masked: boolean;
+  OutErrPtr, Scores, Grads: TNeuralFloatArrPtr;
+  WeightedGradSum, ScoreGrad: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    Prev := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    TokenStride := 3 * FDim;
+    MaxTokenPos := FWindowTokens - 1;
+    MaxWinFirst := FSeqLen - FWindowTokens;
+    MaxHeadOfs := FDim - FHeadDim;
+    Scores := FScoreRow.GetRawPtr();
+    Grads := FGradRow.GetRawPtr();
+    WinFirst := 0;
+    while WinFirst <= MaxWinFirst do
+    begin
+      Masked := WindowIsMasked(WinFirst);
+      HeadOfs := 0;
+      while HeadOfs <= MaxHeadOfs do
+      begin
+        for QueryPos := 0 to MaxTokenPos do
+        begin
+          ComputeSoftmaxRow(Prev, WinFirst, QueryPos, HeadOfs, Masked);
+          OutErrPtr := FOutputError.GetRawPtr(
+            (WinFirst + QueryPos) * FDim + HeadOfs);
+          // dV[j] += p[j] * dOut[i];  dp[j] = dOut[i] . V[j].
+          KeyOfs := WinFirst * TokenStride + 2 * FDim + HeadOfs;
+          WeightedGradSum := 0;
+          for KeyPos := 0 to MaxTokenPos do
+          begin
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(KeyOfs), OutErrPtr,
+              Scores^[KeyPos], FHeadDim);
+            Grads^[KeyPos] := TNNetVolume.DotProduct(OutErrPtr,
+              Prev.GetRawPtr(KeyOfs), FHeadDim);
+            WeightedGradSum := WeightedGradSum + Scores^[KeyPos] * Grads^[KeyPos];
+            Inc(KeyOfs, TokenStride);
+          end;
+          // dscore[j] = p[j] * (dp[j] - sum_k p[k] dp[k]), then through Q.K.
+          QueryOfs := (WinFirst + QueryPos) * TokenStride + HeadOfs;
+          KeyOfs := WinFirst * TokenStride + FDim + HeadOfs;
+          for KeyPos := 0 to MaxTokenPos do
+          begin
+            ScoreGrad := Scores^[KeyPos] * (Grads^[KeyPos] - WeightedGradSum) *
+              FInvSqrtHeadDim;
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(QueryOfs),
+              Prev.GetRawPtr(KeyOfs), ScoreGrad, FHeadDim);
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(KeyOfs),
+              Prev.GetRawPtr(QueryOfs), ScoreGrad, FHeadDim);
+            Inc(KeyOfs, TokenStride);
+          end;
+        end;
+        Inc(HeadOfs, FHeadDim);
+      end;
+      Inc(WinFirst, FWindowTokens);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetSAMVisionAttention }
 
 constructor TNNetSAMVisionAttention.Create(pHeads, pWindowSize, pHeadDim,
@@ -58592,9 +58912,9 @@ begin
   for I := 0 to OutLenM1 do
   begin
     Tok := FTokens[I];
-    if (Tok < 0) or (Tok >= SeqLen) then
+    if (Tok < -1) or (Tok >= SeqLen) then
     begin
-      FErrorProc('TNNetGatherTokens requires 0 <= idx < Input.SizeX, got idx=' +
+      FErrorProc('TNNetGatherTokens requires -1 <= idx < Input.SizeX, got idx=' +
         IntToStr(Tok) + ' SizeX=' + IntToStr(SeqLen));
       Exit;
     end;
@@ -58635,9 +58955,14 @@ begin
   MaxD := Prev.Depth - 1;
   for X := 0 to MaxX do
   begin
-    basePrev0 := Prev.GetRawPos(FTokens[X], 0);
     baseOut0  := FOutput.GetRawPos(X, 0);
-    Move(Prev.FData[basePrev0], FOutput.FData[baseOut0], (MaxD + 1) * csNeuralFloatSize);
+    if FTokens[X] < 0 then
+      FillChar(FOutput.FData[baseOut0], (MaxD + 1) * csNeuralFloatSize, 0)
+    else
+    begin
+      basePrev0 := Prev.GetRawPos(FTokens[X], 0);
+      Move(Prev.FData[basePrev0], FOutput.FData[baseOut0], (MaxD + 1) * csNeuralFloatSize);
+    end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -58666,9 +58991,12 @@ begin
     baseOutErr0 := 0;
     for X := 0 to MaxX do
     begin
-      basePrevErr0 := PrevErr.GetRawPos(FTokens[X], 0);
-      TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0),
-        FOutputError.GetRawPtr(baseOutErr0), Depth);
+      if FTokens[X] >= 0 then
+      begin
+        basePrevErr0 := PrevErr.GetRawPos(FTokens[X], 0);
+        TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0),
+          FOutputError.GetRawPtr(baseOutErr0), Depth);
+      end;
       Inc(baseOutErr0, Depth);
     end;
   end;
@@ -59056,10 +59384,31 @@ end;
 
 { TNNetSpaceToDepth }
 
-constructor TNNetSpaceToDepth.Create(BlockSize: integer);
+constructor TNNetSpaceToDepth.Create(BlockSize: integer; pTiled: integer);
 begin
   inherited Create();
   FStruct[0] := BlockSize;
+  FStruct[1] := pTiled;
+end;
+
+procedure TNNetSpaceToDepth.BlockStrides(out OriginMul, SXStep, SYStep: integer);
+var
+  C, PrevRowStride: integer;
+begin
+  C := FPrevLayer.FOutput.Depth;
+  PrevRowStride := FPrevLayer.FOutput.SizeX * C;
+  if FStruct[1] <> 0 then
+  begin
+    OriginMul := 1;
+    SXStep := FOutput.SizeX * C;
+    SYStep := FOutput.SizeY * PrevRowStride;
+  end
+  else
+  begin
+    OriginMul := FStruct[0];
+    SXStep := C;
+    SYStep := PrevRowStride;
+  end;
 end;
 
 procedure TNNetSpaceToDepth.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -59099,16 +59448,18 @@ end;
 
 procedure TNNetSpaceToDepth.BuildGatherCopyPlan(Plan: TNNetGatherCopyCL);
 var
-  P, C, SrcRowStride: integer;
+  P, C, SrcRowStride, OriginMul, SXStep, SYStep: integer;
 begin
-  // Output (OX, OY, (SX*P + SY)*C + IC) reads source (OX*P + SX, OY*P + SY, IC).
+  // Output (OX, OY, (SX*P + SY)*C + IC) reads the source block origin plus the
+  // SX / SY steps of BlockStrides.
   P := FStruct[0];
   C := FPrevLayer.FOutput.Depth;
   SrcRowStride := FPrevLayer.FOutput.SizeX * C;
-  Plan.AddAxis(FOutput.SizeY, P * SrcRowStride);
-  Plan.AddAxis(FOutput.SizeX, P * C);
-  Plan.AddAxis(P, C);
-  Plan.AddAxis(P, SrcRowStride);
+  BlockStrides(OriginMul, SXStep, SYStep);
+  Plan.AddAxis(FOutput.SizeY, OriginMul * SrcRowStride);
+  Plan.AddAxis(FOutput.SizeX, OriginMul * C);
+  Plan.AddAxis(P, SXStep);
+  Plan.AddAxis(P, SYStep);
   Plan.AddAxis(C, 1);
 end;
 {$ENDIF}
@@ -59119,7 +59470,8 @@ var
   PM1: integer;
   OX, OY, SX, SY: integer;
   MaxOX, MaxOY: integer;
-  CBytes, PrevRowStride, SrcColBase, SrcPos, DestPos: integer;
+  CBytes, SrcColBase, SrcPos, DestPos: integer;
+  OriginMul, SXStep, SYStep: integer;
   LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
@@ -59132,7 +59484,7 @@ begin
   MaxOY := FOutput.SizeY - 1;
   PM1 := P - 1;
   CBytes := C * csNeuralFloatSize;
-  PrevRowStride := LocalPrevOutput.SizeX * C;
+  BlockStrides(OriginMul, SXStep, SYStep);
   // The IC run is contiguous in depth in BOTH source and destination (depth is
   // the fastest axis), so each block cell is one Move of C floats. The
   // destination slots (SX*P + SY)*C walk the output column continuously, and one
@@ -59142,7 +59494,7 @@ begin
     for OX := 0 to MaxOX do
     begin
       DestPos := FOutput.GetRawPos(OX, OY);
-      SrcColBase := LocalPrevOutput.GetRawPos(OX * P, OY * P);
+      SrcColBase := LocalPrevOutput.GetRawPos(OX * OriginMul, OY * OriginMul);
       for SX := 0 to PM1 do
       begin
         SrcPos := SrcColBase;
@@ -59150,10 +59502,10 @@ begin
         begin
           system.Move(LocalPrevOutput.FData[SrcPos], FOutput.FData[DestPos],
             CBytes);
-          Inc(SrcPos, PrevRowStride);
+          Inc(SrcPos, SYStep);
           Inc(DestPos, C);
         end;
-        Inc(SrcColBase, C);
+        Inc(SrcColBase, SXStep);
       end;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -59165,7 +59517,8 @@ var
   PM1: integer;
   OX, OY, SX, SY: integer;
   MaxOX, MaxOY: integer;
-  PrevRowStride, SrcColBase, SrcPos, DestPos: integer;
+  SrcColBase, SrcPos, DestPos: integer;
+  OriginMul, SXStep, SYStep: integer;
   LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
@@ -59182,7 +59535,7 @@ begin
     MaxOX := FOutput.SizeX - 1;
     MaxOY := FOutput.SizeY - 1;
     PM1 := P - 1;
-    PrevRowStride := LocalPrevError.SizeX * C;
+    BlockStrides(OriginMul, SXStep, SYStep);
     // Bijective routing: the contiguous depth run is accumulated once (no
     // overlap), so the per-element Add over C floats is an AVX vector accumulate
     // that preserves exact += semantics. Offsets are carried as in Compute.
@@ -59190,7 +59543,7 @@ begin
       for OX := 0 to MaxOX do
       begin
         DestPos := FOutputError.GetRawPos(OX, OY);
-        SrcColBase := LocalPrevError.GetRawPos(OX * P, OY * P);
+        SrcColBase := LocalPrevError.GetRawPos(OX * OriginMul, OY * OriginMul);
         for SX := 0 to PM1 do
         begin
           SrcPos := SrcColBase;
@@ -59198,10 +59551,10 @@ begin
           begin
             TNNetVolume.Add(LocalPrevError.GetRawPtr(SrcPos),
               FOutputError.GetRawPtr(DestPos), C);
-            Inc(SrcPos, PrevRowStride);
+            Inc(SrcPos, SYStep);
             Inc(DestPos, C);
           end;
-          Inc(SrcColBase, C);
+          Inc(SrcColBase, SXStep);
         end;
       end;
   end;
@@ -141170,6 +141523,7 @@ begin
       'TNNetConformerRelPosAttention' : Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
+      'TNNetBatchedWindowAttention': Result := TNNetBatchedWindowAttention.Create(St[0], St[1]);
       'TNNetSwinV2WindowAttention' : Result := TNNetSwinV2WindowAttention.Create(St[0], St[5]);
       'TNNetSAMVisionAttention' :   Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
@@ -141353,7 +141707,7 @@ begin
       'TNNetGatherChannels' :       Result := TNNetGatherChannels.Create(aIdx);
       'TNNetGatherTokens' :         Result := TNNetGatherTokens.Create(aIdx);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
-      'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
+      'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0], St[1]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
       'TNNetMobileViTUnfold' :      Result := TNNetMobileViTUnfold.Create(St[0]);
       'TNNetMobileViTFold' :        Result := TNNetMobileViTFold.Create(St[0], St[1], St[2]);
@@ -141625,6 +141979,7 @@ begin
       if S[0] = 'TNNetConformerRelPosAttention' then Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
+      if S[0] = 'TNNetBatchedWindowAttention' then Result := TNNetBatchedWindowAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetSwinV2WindowAttention' then Result := TNNetSwinV2WindowAttention.Create(St[0], St[5]) else
       if S[0] = 'TNNetSAMVisionAttention' then Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
@@ -141809,7 +142164,7 @@ begin
       if S[0] = 'TNNetGatherChannels' then Result := TNNetGatherChannels.Create(aIdx) else
       if S[0] = 'TNNetGatherTokens' then Result := TNNetGatherTokens.Create(aIdx) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
-      if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
+      if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0], St[1]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
       if S[0] = 'TNNetMobileViTUnfold' then Result := TNNetMobileViTUnfold.Create(St[0]) else
       if S[0] = 'TNNetMobileViTFold' then Result := TNNetMobileViTFold.Create(St[0], St[1], St[2]) else

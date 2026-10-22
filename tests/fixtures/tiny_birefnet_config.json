@@ -1,0 +1,25 @@
+{
+ "bb": "swin_v1_l",
+ "embed_dim": 4,
+ "depths": [
+  2,
+  2,
+  2,
+  2
+ ],
+ "num_heads": [
+  1,
+  1,
+  2,
+  2
+ ],
+ "window_size": 4,
+ "dec_channels_inter": 2,
+ "aspp_channels": 4,
+ "ipt_inter_channels": 2,
+ "gdt_channels": 3,
+ "size": [
+  96,
+  64
+ ]
+}

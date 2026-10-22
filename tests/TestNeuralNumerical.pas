@@ -1707,6 +1707,11 @@ type
     procedure TestDepthToSpaceOfSpaceToDepth;
     procedure TestSpaceToDepthGradientCheck;
     procedure TestDepthToSpaceGradientCheck;
+    procedure TestSpaceToDepthTiledForward;
+    procedure TestSpaceToDepthTiledGradientCheck;
+    procedure TestGatherTokensZeroPadding;
+    procedure TestBatchedWindowAttentionMatchesWindowAttention;
+    procedure TestBatchedWindowAttentionGradientCheck;
     procedure TestGEGLUForward;
     procedure TestGEGLUGradientCheck;
     procedure TestGEGLUErfGradientCheck;
@@ -11482,6 +11487,276 @@ begin
   // the 32-cell sum-of-squares.
   DeMaxPoolFamilyGradientCheck(Self, TNNetSpaceToDepth.Create(2),
     'SpaceToDepth', 4, 4, 2, 0.001);
+end;
+
+// Tiled mode: Output[ox, oy, (sx*P + sy)*C + ic] = Input[sx*Wp + ox, sy*Hp + oy, ic].
+procedure TTestNeuralNumerical.TestSpaceToDepthTiledForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  OutX, OutY, TileX, TileY, Channel: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 6, 2));
+    NN.AddLayer(TNNetSpaceToDepth.Create(2, 1));
+    Input.FillForDebug();
+    NN.Compute(Input);
+    AssertEquals('width', 2, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('height', 3, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('depth', 8, NN.GetLastLayer().Output.Depth);
+    for OutY := 0 to 2 do
+      for OutX := 0 to 1 do
+        for TileX := 0 to 1 do
+          for TileY := 0 to 1 do
+            for Channel := 0 to 1 do
+              AssertEquals('tile value', Input[TileX * 2 + OutX, TileY * 3 + OutY,
+                Channel], NN.GetLastLayer().Output[OutX, OutY,
+                (TileX * 2 + TileY) * 2 + Channel], 0);
+    AssertTrue('tiled flag round-trips', Pos('TNNetSpaceToDepth:2;1',
+      NN.SaveStructureToString()) > 0);
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpaceToDepthTiledGradientCheck;
+begin
+  DeMaxPoolFamilyGradientCheck(Self, TNNetSpaceToDepth.Create(2, 1),
+    'SpaceToDepthTiled', 4, 4, 2, 0.001);
+end;
+
+// Index -1 writes a zero token and receives no gradient.
+procedure TTestNeuralNumerical.TestGatherTokensZeroPadding;
+var
+  NN, Reloaded: TNNet;
+  Input, Desired: TNNetVolume;
+  Channel: integer;
+begin
+  NN := TNNet.Create();
+  Reloaded := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    NN.AddLayer(TNNetGatherTokens.Create([2, -1, 0, -1]));
+    NN.SetLearningRate(1.0, 0.0);
+    Input.FillForDebug();
+    Input.Add(1.0);
+    NN.Compute(Input);
+    for Channel := 0 to 1 do
+    begin
+      AssertEquals('token 2', Input[2, 0, Channel], NN.GetLastLayer().Output[0, 0, Channel], 0);
+      AssertEquals('zero token', 0, NN.GetLastLayer().Output[1, 0, Channel], 0);
+      AssertEquals('token 0', Input[0, 0, Channel], NN.GetLastLayer().Output[2, 0, Channel], 0);
+      AssertEquals('zero token 2', 0, NN.GetLastLayer().Output[3, 0, Channel], 0);
+    end;
+    Desired.Fill(0);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for Channel := 0 to 1 do
+    begin
+      AssertEquals('unused source gets no error', 0,
+        NN.Layers[0].OutputError[1, 0, Channel], 0);
+      AssertEquals('source 2 error', Abs(Input[2, 0, Channel]),
+        Abs(NN.Layers[0].OutputError[2, 0, Channel]), 1e-6);
+    end;
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.Compute(Input);
+    AssertEquals('round trip', 0, Reloaded.GetLastLayer().Output.SumDiff(
+      NN.GetLastLayer().Output), 0);
+  finally
+    Desired.Free;
+    Input.Free;
+    Reloaded.Free;
+    NN.Free;
+  end;
+end;
+
+// Fills the (Windows*Tokens, 1, 3*Heads*HeadDim) qkv input, the per-head bias
+// matrices and the region ids (window 1 spans two regions) shared by the
+// batched window attention tests.
+procedure FillBatchedWindowAttentionCase(Input: TNNetVolume;
+  Biases: array of TNNetVolume; var RegionIds: TNeuralIntegerArray;
+  Windows, Tokens: integer);
+var
+  ElementPos, Head, TokenPos: integer;
+begin
+  for ElementPos := 0 to Input.Size - 1 do
+    Input.Raw[ElementPos] := Sin(ElementPos * 0.37) * 0.8 + 0.05;
+  for Head := 0 to High(Biases) do
+  begin
+    Biases[Head].ReSize(Tokens * Tokens, 1, 1);
+    for ElementPos := 0 to Biases[Head].Size - 1 do
+      Biases[Head].Raw[ElementPos] := 0.3 * Cos(ElementPos * 1.3 + Head);
+  end;
+  SetLength(RegionIds, Windows * Tokens);
+  for TokenPos := 0 to High(RegionIds) do
+    RegionIds[TokenPos] := 0;
+  RegionIds[Tokens + 1] := 1;
+  RegionIds[Tokens + 3] := 2;
+end;
+
+// TNNetBatchedWindowAttention equals one TNNetWindowAttention per (window, head)
+// with the region mask (-100) folded into that window's bias matrix.
+procedure TTestNeuralNumerical.TestBatchedWindowAttentionMatchesWindowAttention;
+const
+  cWindows = 3;
+  cTokens = 4;
+  cHeads = 2;
+  cHeadDim = 3;
+var
+  NN, RefNN, Reloaded: TNNet;
+  Attn: TNNetBatchedWindowAttention;
+  Input, RefInput, MaskedBias: TNNetVolume;
+  Biases: array[0..cHeads - 1] of TNNetVolume;
+  RegionIds: TNeuralIntegerArray;
+  Window, Head, TokenPos, KeyPos, Part, Element, Dim: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  Dim := cHeads * cHeadDim;
+  NN := TNNet.Create();
+  Reloaded := TNNet.Create();
+  Input := TNNetVolume.Create(cWindows * cTokens, 1, 3 * Dim);
+  RefInput := TNNetVolume.Create(cTokens, 1, 3 * cHeadDim);
+  MaskedBias := TNNetVolume.Create(cTokens * cTokens, 1, 1);
+  for Head := 0 to cHeads - 1 do Biases[Head] := TNNetVolume.Create;
+  try
+    FillBatchedWindowAttentionCase(Input, Biases, RegionIds, cWindows, cTokens);
+    NN.AddLayer(TNNetInput.Create(cWindows * cTokens, 1, 3 * Dim));
+    Attn := TNNetBatchedWindowAttention.Create(cHeads, cTokens);
+    NN.AddLayer(Attn);
+    for Head := 0 to cHeads - 1 do Attn.SetHeadBias(Head, Biases[Head]);
+    Attn.SetRegionIds(RegionIds);
+    NN.Compute(Input);
+    MaxDiff := 0;
+    for Window := 0 to cWindows - 1 do
+      for Head := 0 to cHeads - 1 do
+      begin
+        for TokenPos := 0 to cTokens - 1 do
+          for Part := 0 to 2 do
+            for Element := 0 to cHeadDim - 1 do
+              RefInput[TokenPos, 0, Part * cHeadDim + Element] :=
+                Input[Window * cTokens + TokenPos, 0,
+                Part * Dim + Head * cHeadDim + Element];
+        MaskedBias.Copy(Biases[Head]);
+        for TokenPos := 0 to cTokens - 1 do
+          for KeyPos := 0 to cTokens - 1 do
+            if RegionIds[Window * cTokens + TokenPos] <>
+               RegionIds[Window * cTokens + KeyPos] then
+              MaskedBias.Raw[TokenPos * cTokens + KeyPos] :=
+                MaskedBias.Raw[TokenPos * cTokens + KeyPos] - 100;
+        RefNN := TNNet.Create();
+        try
+          RefNN.AddLayer(TNNetInput.Create(cTokens, 1, 3 * cHeadDim));
+          RefNN.AddLayer(TNNetWindowAttention.Create(cHeadDim, cTokens));
+          TNNetWindowAttention(RefNN.GetLastLayer()).SetBiasMatrix(MaskedBias);
+          RefNN.Compute(RefInput);
+          for TokenPos := 0 to cTokens - 1 do
+            for Element := 0 to cHeadDim - 1 do
+              MaxDiff := Max(MaxDiff, Abs(RefNN.GetLastLayer().Output[TokenPos,
+                0, Element] - NN.GetLastLayer().Output[Window * cTokens +
+                TokenPos, 0, Head * cHeadDim + Element]));
+        finally
+          RefNN.Free;
+        end;
+      end;
+    AssertTrue('batched vs per-window attention max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.Compute(Input);
+    AssertEquals('save/load round trip', 0, Reloaded.GetLastLayer().Output.SumDiff(
+      NN.GetLastLayer().Output), 1e-6);
+  finally
+    for Head := 0 to cHeads - 1 do Biases[Head].Free;
+    MaskedBias.Free;
+    RefInput.Free;
+    Input.Free;
+    Reloaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBatchedWindowAttentionGradientCheck;
+const
+  cWindows = 2;
+  cTokens = 4;
+  cHeads = 2;
+  cHeadDim = 2;
+  cEpsilon = 0.001;
+var
+  NN: TNNet;
+  Attn: TNNetBatchedWindowAttention;
+  Input, InputPlus, Desired, AnalyticalGrad: TNNetVolume;
+  Biases: array[0..cHeads - 1] of TNNetVolume;
+  RegionIds: TNeuralIntegerArray;
+  LossPlus, LossMinus, NumericalGrad, MaxGradDiff: TNeuralFloat;
+  ElementPos, Head, Dim: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for OutputPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  Dim := cHeads * cHeadDim;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cWindows * cTokens, 1, 3 * Dim);
+  InputPlus := TNNetVolume.Create(cWindows * cTokens, 1, 3 * Dim);
+  Desired := TNNetVolume.Create(cWindows * cTokens, 1, Dim);
+  AnalyticalGrad := TNNetVolume.Create();
+  for Head := 0 to cHeads - 1 do Biases[Head] := TNNetVolume.Create;
+  try
+    FillBatchedWindowAttentionCase(Input, Biases, RegionIds, cWindows, cTokens);
+    for ElementPos := 0 to Desired.Size - 1 do
+      Desired.Raw[ElementPos] := Cos(ElementPos * 0.31);
+    NN.AddLayer(TNNetInput.Create(cWindows * cTokens, 1, 3 * Dim, 1));
+    Attn := TNNetBatchedWindowAttention.Create(cHeads, cTokens);
+    NN.AddLayer(Attn);
+    for Head := 0 to cHeads - 1 do Attn.SetHeadBias(Head, Biases[Head]);
+    Attn.SetRegionIds(RegionIds);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    AnalyticalGrad.Copy(NN.Layers[0].OutputError);
+    MaxGradDiff := 0;
+    for ElementPos := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] + cEpsilon;
+      LossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[ElementPos] := Input.Raw[ElementPos] - cEpsilon;
+      LossMinus := ComputeLoss(InputPlus);
+      NumericalGrad := (LossPlus - LossMinus) / (2 * cEpsilon);
+      MaxGradDiff := Max(MaxGradDiff,
+        Abs(NumericalGrad - AnalyticalGrad.Raw[ElementPos]));
+    end;
+    AssertTrue('BatchedWindowAttention input gradient max |num-ana| = ' +
+      FloatToStr(MaxGradDiff) + ', grad sum abs = ' +
+      FloatToStr(AnalyticalGrad.GetSumAbs()), MaxGradDiff < 2e-3);
+    AssertTrue('the gradient is not trivially zero',
+      AnalyticalGrad.GetSumAbs() > 1e-2);
+  finally
+    for Head := 0 to cHeads - 1 do Biases[Head].Free;
+    AnalyticalGrad.Free;
+    Desired.Free;
+    InputPlus.Free;
+    Input.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestDepthToSpaceGradientCheck;

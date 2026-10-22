@@ -14903,6 +14903,91 @@ procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
   Face, Restored: TNNetVolume);
 
 // ---------------------------------------------------------------------------
+// BiRefNet / RMBG-2.0 BACKGROUND-REMOVAL IMPORT (Zheng et al., "Bilateral
+// Reference for High-Resolution Dichotomous Image Segmentation", CAAI AIR 2024,
+// arXiv:2401.03407; ZhengPeng7/BiRefNet birefnet.py; briaai/RMBG-2.0 ships the
+// same architecture). Input: (W, H, 3) ImageNet-normalized RGB, W and H
+// multiples of 32; output: the (W, H, 1) foreground probability (sigmoid).
+// Built for the released default config only:
+//   - Swin backbone (original Microsoft keys under "bb.") run on the image AND
+//     on a bilinear 0.5x copy (mul_scl_ipt='cat'): both token sequences go
+//     through ONE set of Swin layers (AddSwinMultiImageBackbone), and each stage
+//     map concatenates the full-size features with the upsampled half-size ones;
+//   - x1..x3 resized onto x4 and concatenated (cxt_num=3), one BasicDecBlk
+//     squeeze block;
+//   - decoder: BasicDecBlk (3x3 conv+BN+ReLU, ASPPDeformable, 3x3 conv+BN) per
+//     level; ASPPDeformable = DCNv2 branches (TNNetDeformableConv, kernels 1, 1,
+//     3, 7) + a global-pool branch, 1x1 fuse; BasicLatBlk 1x1 laterals;
+//   - dec_ipt: the image split into Grid x Grid tiles stacked on channels
+//     (TNNetSpaceToDepth tiled mode) through SimpleConvs at every level;
+//   - out_ref gradient gates: features * sigmoid(1x1(ReLU(BN(3x3)))) per level;
+//   - 1x1 head + sigmoid.
+// BatchNorms fold into the convs. Training-only heads (conv_ms_spvn_*,
+// gdt_convs_pred_*) are not built. Every resize is bilinear align_corners=True.
+// Coded by Claude (AI).
+type
+  TBiRefNetConfig = record
+    Backbone: string;            // 'swin_v1_l' (BiRefNet, RMBG-2.0), 'swin_v1_t' (lite)
+    EmbedDim: integer;           // Swin stage-0 width (192)
+    Depths: TNeuralIntegerArray;   // Swin blocks per stage ([2,2,18,2])
+    NumHeads: TNeuralIntegerArray; // heads per stage ([6,12,24,48])
+    WindowSize: integer;         // 12
+    MlpRatio: TNeuralFloat;      // 4
+    DecChannelsInter: integer;   // BasicDecBlk inner width (64)
+    AsppChannels: integer;       // ASPPDeformable branch width (256)
+    IptInterChannels: integer;   // SimpleConvs inner width (64)
+    GdtChannels: integer;        // gradient-gate conv width (16)
+    InputWidth: integer;         // 1024
+    InputHeight: integer;        // 1024
+  end;
+
+// Backbone: 'swin_v1_l' (default), 'swin_v1_b', 'swin_v1_s' or 'swin_v1_t'.
+function DefaultBiRefNetConfig(const Backbone: string = 'swin_v1_l'): TBiRefNetConfig;
+
+// Reads bb, embed_dim, depths, num_heads, window_size, mlp_ratio,
+// dec_channels_inter, aspp_channels, ipt_inter_channels, gdt_channels and size
+// (N or [W, H]); missing keys keep the swin_v1_l defaults.
+function ReadBiRefNetConfigFromJSONFile(const FileName: string): TBiRefNetConfig;
+
+// Overwrites every shape field of Config from Reader and rejects checkpoints
+// of a non-default config (no 'cat' multi-scale input, no dec_ipt, ...).
+procedure InferBiRefNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TBiRefNetConfig);
+
+function BiRefNetConfigToString(const Config: TBiRefNetConfig): string;
+
+// Builds BiRefNet and loads every weight from Reader (caller owns Reader).
+function BuildBiRefNet(Reader: TNNetSafeTensorsReader;
+  const Config: TBiRefNetConfig; pTrainable: boolean = true): TNNet;
+
+// Same from a model.safetensors / .pth / .bin file.
+function BuildBiRefNetFromSafeTensorsEx(const FileName: string;
+  const Config: TBiRefNetConfig; pTrainable: boolean = true): TNNet;
+
+// Config from ConfigFileName (default: config.json beside FileName, else the
+// defaults), shape fields from the checkpoint; pInputSize > 0 sets a square input.
+function BuildBiRefNetFromSafeTensors(const FileName: string;
+  out Config: TBiRefNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pInputSize: integer = 0): TNNet;
+
+// Image (W, H, 3) RGB 0..255 -> NetInput: PIL bilinear byte resize to the
+// config size, /255, ImageNet mean/std (the official transform_image).
+procedure BiRefNetPrepareInput(Image: TNNetVolume; const Config: TBiRefNetConfig;
+  NetInput: TNNetVolume);
+
+// Net output (W, H, 1) probability -> Mask (SourceWidth, SourceHeight, 1) alpha
+// in 0..255, bilinear (PIL filter in float).
+procedure BiRefNetComposeMask(NetOutput: TNNetVolume;
+  SourceWidth, SourceHeight: integer; Mask: TNNetVolume);
+
+// RGBA (W, H, 4) := Image (W, H, 3) RGB with Mask (W, H, 1) 0..255 as alpha.
+procedure BiRefNetComposeRGBA(Image, Mask, RGBA: TNNetVolume);
+
+// BiRefNetPrepareInput -> NN.Compute -> BiRefNetComposeMask at the image size.
+procedure BiRefNetRemoveBackground(NN: TNNet; const Config: TBiRefNetConfig;
+  Image, Mask: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
 // VISUAL EMBEDDINGS (facebook/dinov2-{small,base,large}). The architecture is
 // the same pre-LN ViT encoder path as the plain "vit" importer above (reusing
@@ -71267,104 +71352,102 @@ begin
     ', ln_eps=' + FloatToStr(Config.LayerNormEps);
 end;
 
-// Builds, for one Swin block at the given grid resolution and window/shift, the
-// per-(query,key) relative_position_index (HF _create_relative_position_index)
-// AND the cyclic-shift image-region id of every window token. The window order
-// is HF window_partition order: windows iterate (window-row outer, window-col
-// inner); within a window the tokens iterate (iy outer, ix inner). Tokens are
-// laid out in the flat sequence in row-major (y*Grid + x) order. The returned
-// SwinTokenPerm maps output sequence position -> source flat token index
-// (with the cyclic roll by -ShiftSize baked in when Shifted), so a
-// TNNetGatherTokens(SwinTokenPerm) reorders the sequence into window-contiguous
-// (and shifted) order; its inverse undoes it.
-procedure SwinBuildWindowLayout(Grid, WindowSize, ShiftSize: integer;
-  Shifted: boolean; out TokenPerm: TNeuralIntegerArray;
-  out InvPerm: TNeuralIntegerArray; out RelPosIndex: TNeuralIntegerArray;
-  out RegionId: TNeuralIntegerArray; out NumWindows: integer);
+// Appends one image's window partition to a batched Swin block layout. The
+// image's GridW x GridH tokens (row-major) start at TokenBase in the source
+// sequence; its windows are appended to TokenPerm (window-row outer, window-col
+// inner, then iy, ix), the grid zero-padded to window multiples (source -1) and
+// rolled by -ShiftSize first. RegionId gets the torch img_mask region of each
+// window slot (all 0 when ShiftSize = 0); InvPerm[TokenBase + y*GridW + x]
+// gets the slot of token (x, y), so InvPerm must already span TokenBase.
+procedure SwinAppendWindowLayout(GridW, GridH, TokenBase, WindowSize,
+  ShiftSize: integer; var TokenPerm, RegionId, InvPerm: TNeuralIntegerArray);
 var
-  WPerSide, ws2, w, wy, wx, iy, ix, gy, gx, srcY, srcX, outPos, i, j: integer;
-  qy, qx, ky, kx, dy, dx, idx: integer;
-  WPerSideM1, WindowSizeM1, GridGridM1, NumWinWs2M1: integer;
+  PaddedW, PaddedH, MaxWinX, MaxWinY, MaxInWindow: integer;
+  WinX, WinY, InY, InX, GridY, GridX, SrcY, SrcX, SlotPos: integer;
+  RegionRow, RegionCol: integer;
 begin
-  WPerSide := Grid div WindowSize;
-  NumWindows := WPerSide * WPerSide;
-  ws2 := WindowSize * WindowSize;
-  WPerSideM1 := WPerSide - 1;
-  WindowSizeM1 := WindowSize - 1;
-  GridGridM1 := Grid * Grid - 1;
-  NumWinWs2M1 := NumWindows * ws2 - 1;
-  // ---- token permutation (window partition + optional cyclic roll) ----
-  SetLength(TokenPerm, Grid * Grid);
-  SetLength(InvPerm, Grid * Grid);
-  SetLength(RegionId, NumWindows * ws2);
-  outPos := 0;
-  for wy := 0 to WPerSideM1 do
-    for wx := 0 to WPerSideM1 do
-      for iy := 0 to WindowSizeM1 do
-        for ix := 0 to WindowSizeM1 do
+  PaddedW := ((GridW + WindowSize - 1) div WindowSize) * WindowSize;
+  PaddedH := ((GridH + WindowSize - 1) div WindowSize) * WindowSize;
+  MaxWinX := PaddedW div WindowSize - 1;
+  MaxWinY := PaddedH div WindowSize - 1;
+  MaxInWindow := WindowSize - 1;
+  SlotPos := Length(TokenPerm);
+  SetLength(TokenPerm, SlotPos + PaddedW * PaddedH);
+  SetLength(RegionId, SlotPos + PaddedW * PaddedH);
+  if Length(InvPerm) < TokenBase + GridW * GridH then
+    SetLength(InvPerm, TokenBase + GridW * GridH);
+  for WinY := 0 to MaxWinY do
+    for WinX := 0 to MaxWinX do
+      for InY := 0 to MaxInWindow do
+      begin
+        GridY := WinY * WindowSize + InY;
+        SrcY := (GridY + ShiftSize) mod PaddedH;
+        // torch slices [0:-ws], [-ws:-shift], [-shift:] of the padded grid.
+        if ShiftSize = 0 then RegionRow := 0
+        else if GridY < PaddedH - WindowSize then RegionRow := 0
+        else if GridY < PaddedH - ShiftSize then RegionRow := 1
+        else RegionRow := 2;
+        for InX := 0 to MaxInWindow do
         begin
-          // position in the (possibly shifted) padded grid
-          gy := wy * WindowSize + iy;
-          gx := wx * WindowSize + ix;
-          if Shifted then
+          GridX := WinX * WindowSize + InX;
+          SrcX := (GridX + ShiftSize) mod PaddedW;
+          if ShiftSize = 0 then RegionCol := 0
+          else if GridX < PaddedW - WindowSize then RegionCol := 0
+          else if GridX < PaddedW - ShiftSize then RegionCol := 1
+          else RegionCol := 2;
+          RegionId[SlotPos] := RegionRow * 3 + RegionCol;
+          if (SrcY < GridH) and (SrcX < GridW) then
           begin
-            // HF rolls hidden_states by (-shift,-shift) BEFORE partition, so the
-            // token at shifted position (gy,gx) is the original token at
-            // ((gy+shift) mod Grid, (gx+shift) mod Grid).
-            srcY := (gy + ShiftSize) mod Grid;
-            srcX := (gx + ShiftSize) mod Grid;
+            TokenPerm[SlotPos] := TokenBase + SrcY * GridW + SrcX;
+            InvPerm[TokenPerm[SlotPos]] := SlotPos;
           end
           else
-          begin
-            srcY := gy; srcX := gx;
-          end;
-          TokenPerm[outPos] := srcY * Grid + srcX;
-          outPos := outPos + 1;
+            TokenPerm[SlotPos] := -1;
+          Inc(SlotPos);
         end;
-  for i := 0 to GridGridM1 do
-    InvPerm[TokenPerm[i]] := i;
-  // ---- relative position index (one window; same for every window) ----
+      end;
+end;
+
+// relative_position_index of one WindowSize x WindowSize window (torch / HF):
+// RelPosIndex[i*ws2 + j] for query i and key j in (iy*ws + ix) order.
+procedure SwinBuildRelPosIndex(WindowSize: integer;
+  out RelPosIndex: TNeuralIntegerArray);
+var
+  ws2, WindowSizeM1, qy, qx, ky, kx, i, j: integer;
+begin
+  ws2 := WindowSize * WindowSize;
+  WindowSizeM1 := WindowSize - 1;
   SetLength(RelPosIndex, ws2 * ws2);
   for qy := 0 to WindowSizeM1 do
     for qx := 0 to WindowSizeM1 do
       for ky := 0 to WindowSizeM1 do
         for kx := 0 to WindowSizeM1 do
         begin
-          i := qy * WindowSize + qx;   // query within-window index
-          j := ky * WindowSize + kx;   // key within-window index
-          dy := (qy - ky) + (WindowSize - 1);
-          dx := (qx - kx) + (WindowSize - 1);
-          idx := dy * (2 * WindowSize - 1) + dx;
-          RelPosIndex[i * ws2 + j] := idx;
+          i := qy * WindowSize + qx;
+          j := ky * WindowSize + kx;
+          RelPosIndex[i * ws2 + j] :=
+            ((qy - ky) + WindowSizeM1) * (2 * WindowSize - 1) +
+            (qx - kx) + WindowSizeM1;
         end;
-  // ---- cyclic-shift region ids (HF get_attn_mask img_mask) ----
-  // For the shifted layer, partition the GRID into 9 regions via the three
-  // height/width slices [0:-ws], [-ws:-shift], [-shift:] and assign an
-  // increasing count to each (region-row outer, region-col inner). Tokens in
-  // the SAME window may only attend when they share a region id.
-  if Shifted then
-  begin
-    outPos := 0;
-    for wy := 0 to WPerSideM1 do
-      for wx := 0 to WPerSideM1 do
-        for iy := 0 to WindowSizeM1 do
-          for ix := 0 to WindowSizeM1 do
-          begin
-            gy := wy * WindowSize + iy;
-            gx := wx * WindowSize + ix;
-            // region row/col id from the HF slice boundaries
-            if gy < Grid - WindowSize then i := 0
-            else if gy < Grid - ShiftSize then i := 1
-            else i := 2;
-            if gx < Grid - WindowSize then j := 0
-            else if gx < Grid - ShiftSize then j := 1
-            else j := 2;
-            RegionId[outPos] := i * 3 + j;
-            outPos := outPos + 1;
-          end;
-  end
-  else
-    for i := 0 to NumWinWs2M1 do RegionId[i] := 0;
+end;
+
+// One square, unpadded Grid (a multiple of WindowSize) in HF window order:
+// SwinAppendWindowLayout for a single image plus SwinBuildRelPosIndex.
+procedure SwinBuildWindowLayout(Grid, WindowSize, ShiftSize: integer;
+  Shifted: boolean; out TokenPerm: TNeuralIntegerArray;
+  out InvPerm: TNeuralIntegerArray; out RelPosIndex: TNeuralIntegerArray;
+  out RegionId: TNeuralIntegerArray; out NumWindows: integer);
+var
+  EffShift: integer;
+begin
+  TokenPerm := nil;
+  RegionId := nil;
+  InvPerm := nil;
+  if Shifted then EffShift := ShiftSize else EffShift := 0;
+  SwinAppendWindowLayout(Grid, Grid, 0, WindowSize, EffShift, TokenPerm,
+    RegionId, InvPerm);
+  NumWindows := Sqr(Grid div WindowSize);
+  SwinBuildRelPosIndex(WindowSize, RelPosIndex);
 end;
 
 // Gathers one head's ws2 x ws2 relative-position bias from the block's
@@ -71463,6 +71546,233 @@ begin
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
+  end;
+end;
+
+type
+  // StageMaps[ImagePos][StagePos]: the norm{StagePos} (W, H, C) feature map of
+  // image ImagePos built by AddSwinMultiImageBackbone.
+  TSwinStageMaps = array of array of TNNetLayer;
+
+// Appends one Swin block over the concatenated token sequence Input (one
+// GridW[i] x GridH[i] grid per image) and loads it from BPrefix (Microsoft keys).
+function AddSwinBatchedBlock(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Input: TNNetLayer; const BPrefix: string;
+  const GridW, GridH: TNeuralIntegerArray; Dim, Heads, WindowSize,
+  ShiftSize: integer; MlpRatio, LayerNormEps: TNeuralFloat): TNNetLayer;
+var
+  TokenPerm, RegionId, InvPerm, RelPosIndex: TNeuralIntegerArray;
+  ImagePos, MaxImagePos, TokenBase, Head, MaxHead, MlpHidden: integer;
+  Norm1, Qkv, Attn, Proj, AttnResidual, Norm2, Fc1, Fc2: TNNetLayer;
+  BiasTable, HeadBias: TNNetVolume;
+  TableName: string;
+begin
+  TokenPerm := nil;
+  RegionId := nil;
+  InvPerm := nil;
+  TokenBase := 0;
+  MaxImagePos := High(GridW);
+  for ImagePos := 0 to MaxImagePos do
+  begin
+    SwinAppendWindowLayout(GridW[ImagePos], GridH[ImagePos], TokenBase,
+      WindowSize, ShiftSize, TokenPerm, RegionId, InvPerm);
+    Inc(TokenBase, GridW[ImagePos] * GridH[ImagePos]);
+  end;
+  Norm1 := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(LayerNormEps), Input);
+  NN.AddLayer(TNNetGatherTokens.Create(TokenPerm));
+  Qkv := NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * Dim));
+  Attn := NN.AddLayer(TNNetBatchedWindowAttention.Create(Heads,
+    WindowSize * WindowSize));
+  Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(Dim));
+  NN.AddLayer(TNNetGatherTokens.Create(InvPerm));
+  AttnResidual := NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Input]));
+  Norm2 := NN.AddLayer(TNNetTokenLayerNorm.Create(LayerNormEps));
+  MlpHidden := Round(Dim * MlpRatio);
+  Fc1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(MlpHidden));
+  NN.AddLayer(TNNetGELUErf.Create());
+  Fc2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Dim));
+  Result := NN.AddLayer(TNNetSum.Create([Fc2, AttnResidual]));
+
+  LoadLayerNormWeights(Reader, Norm1, BPrefix + 'norm1.weight',
+    BPrefix + 'norm1.bias', Dim);
+  LoadLlamaLinearWeights(Reader, Qkv, BPrefix + 'attn.qkv.weight', Dim,
+    3 * Dim, 0, -1, 0, BPrefix + 'attn.qkv.bias');
+  LoadLlamaLinearWeights(Reader, Proj, BPrefix + 'attn.proj.weight', Dim, Dim,
+    0, -1, 0, BPrefix + 'attn.proj.bias');
+  LoadLayerNormWeights(Reader, Norm2, BPrefix + 'norm2.weight',
+    BPrefix + 'norm2.bias', Dim);
+  LoadLlamaLinearWeights(Reader, Fc1, BPrefix + 'mlp.fc1.weight', Dim,
+    MlpHidden, 0, -1, 0, BPrefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Fc2, BPrefix + 'mlp.fc2.weight', MlpHidden,
+    Dim, 0, -1, 0, BPrefix + 'mlp.fc2.bias');
+  TableName := BPrefix + 'attn.relative_position_bias_table';
+  if not Reader.HasTensor(TableName) then
+    ImportError('Swin import: missing tensor "' + TableName + '".');
+  if (Reader.DimCount(TableName) <> 2) or
+     (Reader.DimSize(TableName, 0) <> Sqr(2 * WindowSize - 1)) or
+     (Reader.DimSize(TableName, 1) <> Heads) then
+    ImportError('Swin import: "' + TableName + '" must have shape [' +
+      IntToStr(Sqr(2 * WindowSize - 1)) + ', ' + IntToStr(Heads) + '], got ' +
+      Reader.ShapeAsString(TableName));
+  SwinBuildRelPosIndex(WindowSize, RelPosIndex);
+  BiasTable := TNNetVolume.Create;
+  HeadBias := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TableName, BiasTable);
+    MaxHead := Heads - 1;
+    for Head := 0 to MaxHead do
+    begin
+      SwinBuildHeadBias(BiasTable, RelPosIndex, Head, Heads, WindowSize,
+        HeadBias);
+      TNNetBatchedWindowAttention(Attn).SetHeadBias(Head, HeadBias);
+    end;
+  finally
+    BiasTable.Free;
+    HeadBias.Free;
+  end;
+  TNNetBatchedWindowAttention(Attn).SetRegionIds(RegionId);
+end;
+
+// Appends the Swin PatchMerging under MPrefix (norm over the 4 neighbours in
+// torch's x0..x3 order, then the bias-free 2*Dim reduction); odd grids pad with
+// zeros. Updates GridW, GridH and Dim to the merged grid.
+function AddSwinBatchedPatchMerging(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Input: TNNetLayer; const MPrefix: string;
+  var GridW, GridH: TNeuralIntegerArray; var Dim: integer;
+  LayerNormEps: TNeuralFloat): TNNetLayer;
+var
+  MergePerm: TNeuralIntegerArray;
+  ImagePos, MaxImagePos, TokenBase, MergedW, MergedH, MergedCnt: integer;
+  MergedX, MergedY, MaxMergedX, MaxMergedY, Neighbour, SrcX, SrcY, PermPos: integer;
+  MergeNorm: TNNetLayer;
+begin
+  MergedCnt := 0;
+  MaxImagePos := High(GridW);
+  for ImagePos := 0 to MaxImagePos do
+    Inc(MergedCnt, ((GridW[ImagePos] + 1) div 2) * ((GridH[ImagePos] + 1) div 2));
+  SetLength(MergePerm, 4 * MergedCnt);
+  PermPos := 0;
+  TokenBase := 0;
+  for ImagePos := 0 to MaxImagePos do
+  begin
+    MergedW := (GridW[ImagePos] + 1) div 2;
+    MergedH := (GridH[ImagePos] + 1) div 2;
+    MaxMergedX := MergedW - 1;
+    MaxMergedY := MergedH - 1;
+    for MergedY := 0 to MaxMergedY do
+      for MergedX := 0 to MaxMergedX do
+        // torch x0..x3: (2y, 2x), (2y+1, 2x), (2y, 2x+1), (2y+1, 2x+1).
+        for Neighbour := 0 to 3 do
+        begin
+          SrcY := 2 * MergedY + (Neighbour and 1);
+          SrcX := 2 * MergedX + (Neighbour shr 1);
+          if (SrcY < GridH[ImagePos]) and (SrcX < GridW[ImagePos]) then
+            MergePerm[PermPos] := TokenBase + SrcY * GridW[ImagePos] + SrcX
+          else
+            MergePerm[PermPos] := -1;
+          Inc(PermPos);
+        end;
+    Inc(TokenBase, GridW[ImagePos] * GridH[ImagePos]);
+    GridW[ImagePos] := MergedW;
+    GridH[ImagePos] := MergedH;
+  end;
+  NN.AddLayerAfter(TNNetGatherTokens.Create(MergePerm), Input);
+  NN.AddLayer(TNNetReshape.Create(MergedCnt, 1, 4 * Dim));
+  MergeNorm := NN.AddLayer(TNNetTokenLayerNorm.Create(LayerNormEps));
+  Result := NN.AddLayer(TNNetPointwiseConvLinear.Create(2 * Dim));
+  LoadLayerNormWeights(Reader, MergeNorm, MPrefix + 'norm.weight',
+    MPrefix + 'norm.bias', 4 * Dim);
+  LoadLlamaLinearWeights(Reader, Result, MPrefix + 'reduction.weight', 4 * Dim,
+    2 * Dim);
+  Dim := 2 * Dim;
+end;
+
+// Builds the original Microsoft Swin backbone (Prefix + patch_embed, layers.i,
+// norm{i}) once over every image in Images: their token sequences are concatenated,
+// so all images share one copy of the weights. Windows pad, never clamp.
+procedure AddSwinMultiImageBackbone(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const Images: array of TNNetLayer; EmbedDim: integer;
+  const Depths, NumHeads: array of integer; WindowSize: integer;
+  MlpRatio, LayerNormEps: TNeuralFloat; out StageMaps: TSwinStageMaps);
+const
+  csSwinPatchSize = 4;
+var
+  ImageCnt, MaxImagePos, ImagePos, StagePos, MaxStagePos, BlockPos: integer;
+  MaxBlockPos, TotalTokens, TokenBase, Dim, ShiftSize: integer;
+  GridW, GridH: TNeuralIntegerArray;
+  TokenLayers: array of TNNetLayer;
+  PatchConv, Tokens, StageNorm, StageOut: TNNetLayer;
+  StagePrefix: string;
+begin
+  ImageCnt := Length(Images);
+  MaxImagePos := ImageCnt - 1;
+  MaxStagePos := High(Depths);
+  SetLength(GridW, ImageCnt);
+  SetLength(GridH, ImageCnt);
+  SetLength(TokenLayers, ImageCnt);
+  SetLength(StageMaps, ImageCnt, Length(Depths));
+  TotalTokens := 0;
+  for ImagePos := 0 to MaxImagePos do
+  begin
+    if (Images[ImagePos].Output.SizeX mod csSwinPatchSize <> 0) or
+       (Images[ImagePos].Output.SizeY mod csSwinPatchSize <> 0) then
+      ImportError('Swin import: image ' + IntToStr(ImagePos) + ' is ' +
+        IntToStr(Images[ImagePos].Output.SizeX) + 'x' +
+        IntToStr(Images[ImagePos].Output.SizeY) +
+        '; both sides must be multiples of the patch size 4.');
+    GridW[ImagePos] := Images[ImagePos].Output.SizeX div csSwinPatchSize;
+    GridH[ImagePos] := Images[ImagePos].Output.SizeY div csSwinPatchSize;
+    PatchConv := NN.AddLayerAfter(TNNetConvolutionLinear.Create(EmbedDim,
+      csSwinPatchSize, 0, csSwinPatchSize, 0), Images[ImagePos]);
+    LoadClipPatchConv(Reader, PatchConv, Prefix + 'patch_embed.proj.weight',
+      Images[ImagePos].Output.Depth, csSwinPatchSize, EmbedDim);
+    LoadSwinPatchConvBias(Reader, PatchConv, Prefix + 'patch_embed.proj.bias',
+      EmbedDim);
+    TokenLayers[ImagePos] := NN.AddLayer(TNNetReshape.Create(
+      GridW[ImagePos] * GridH[ImagePos], 1, EmbedDim));
+    Inc(TotalTokens, GridW[ImagePos] * GridH[ImagePos]);
+  end;
+  if ImageCnt > 1 then
+    Tokens := NN.AddLayer(TNNetConcat.Create(TotalTokens, 1, EmbedDim,
+      TokenLayers))
+  else
+    Tokens := TokenLayers[0];
+  Tokens := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(LayerNormEps), Tokens);
+  LoadLayerNormWeights(Reader, Tokens, Prefix + 'patch_embed.norm.weight',
+    Prefix + 'patch_embed.norm.bias', EmbedDim);
+  Dim := EmbedDim;
+  for StagePos := 0 to MaxStagePos do
+  begin
+    StagePrefix := Prefix + 'layers.' + IntToStr(StagePos) + '.';
+    MaxBlockPos := Depths[StagePos] - 1;
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      if Odd(BlockPos) then ShiftSize := WindowSize div 2 else ShiftSize := 0;
+      Tokens := AddSwinBatchedBlock(NN, Reader, Tokens, StagePrefix + 'blocks.' +
+        IntToStr(BlockPos) + '.', GridW, GridH, Dim, NumHeads[StagePos],
+        WindowSize, ShiftSize, MlpRatio, LayerNormEps);
+    end;
+    StageOut := Tokens;
+    StageNorm := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(LayerNormEps),
+      StageOut);
+    LoadLayerNormWeights(Reader, StageNorm, Prefix + 'norm' +
+      IntToStr(StagePos) + '.weight', Prefix + 'norm' + IntToStr(StagePos) +
+      '.bias', Dim);
+    TokenBase := 0;
+    for ImagePos := 0 to MaxImagePos do
+    begin
+      if ImageCnt > 1 then
+        NN.AddLayerAfter(TNNetCrop.Create(TokenBase, 0,
+          GridW[ImagePos] * GridH[ImagePos], 1), StageNorm)
+      else
+        NN.AddLayerAfter(TNNetIdentity.Create(), StageNorm);
+      StageMaps[ImagePos][StagePos] := NN.AddLayer(TNNetReshape.Create(
+        GridW[ImagePos], GridH[ImagePos], Dim));
+      Inc(TokenBase, GridW[ImagePos] * GridH[ImagePos]);
+    end;
+    if StagePos < MaxStagePos then
+      Tokens := AddSwinBatchedPatchMerging(NN, Reader, StageOut, StagePrefix +
+        'downsample.', GridW, GridH, Dim, LayerNormEps);
   end;
 end;
 
@@ -84958,6 +85268,729 @@ begin
     GFPGANComposeOutput(Restored, Restored);
   finally
     NetInput.Free;
+  end;
+end;
+
+// ===========================================================================
+// BiRefNet / RMBG-2.0 BACKGROUND-REMOVAL IMPORT
+// ===========================================================================
+
+const
+  csBiRefNetImporter = 'BiRefNet import';
+  csBiRefNetBnEps = 1e-5;
+  csBiRefNetLnEps = 1e-5;
+  csBiRefNetImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csBiRefNetImageStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+
+function DefaultBiRefNetConfig(const Backbone: string): TBiRefNetConfig;
+begin
+  Result.Backbone := Backbone;
+  Result.MlpRatio := 4;
+  Result.DecChannelsInter := 64;
+  Result.AsppChannels := 256;
+  Result.IptInterChannels := 64;
+  Result.GdtChannels := 16;
+  Result.InputWidth := 1024;
+  Result.InputHeight := 1024;
+  if Backbone = 'swin_v1_t' then
+  begin
+    Result.EmbedDim := 96;
+    Result.Depths := [2, 2, 6, 2];
+    Result.NumHeads := [3, 6, 12, 24];
+    Result.WindowSize := 7;
+  end
+  else if Backbone = 'swin_v1_s' then
+  begin
+    Result.EmbedDim := 96;
+    Result.Depths := [2, 2, 18, 2];
+    Result.NumHeads := [3, 6, 12, 24];
+    Result.WindowSize := 7;
+  end
+  else if Backbone = 'swin_v1_b' then
+  begin
+    Result.EmbedDim := 128;
+    Result.Depths := [2, 2, 18, 2];
+    Result.NumHeads := [4, 8, 16, 32];
+    Result.WindowSize := 12;
+  end
+  else if Backbone = 'swin_v1_l' then
+  begin
+    Result.EmbedDim := 192;
+    Result.Depths := [2, 2, 18, 2];
+    Result.NumHeads := [6, 12, 24, 48];
+    Result.WindowSize := 12;
+  end
+  else
+    ImportError(csBiRefNetImporter + ': unknown backbone "' + Backbone +
+      '" (swin_v1_t, swin_v1_s, swin_v1_b, swin_v1_l).');
+end;
+
+function ReadBiRefNetConfigFromJSONFile(const FileName: string): TBiRefNetConfig;
+var
+  JsonText: TStringList;
+  Root, Item: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError(csBiRefNetImporter + ': config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csBiRefNetImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csBiRefNetImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result := DefaultBiRefNetConfig(Obj.Get('bb', 'swin_v1_l'));
+    Result.EmbedDim := Obj.Get('embed_dim', Result.EmbedDim);
+    Result.Depths := ReadJSONIntArray(Obj, 'depths', Result.Depths);
+    Result.NumHeads := ReadJSONIntArray(Obj, 'num_heads', Result.NumHeads);
+    Result.WindowSize := Obj.Get('window_size', Result.WindowSize);
+    Result.MlpRatio := Obj.Get('mlp_ratio', double(Result.MlpRatio));
+    Result.DecChannelsInter := Obj.Get('dec_channels_inter',
+      Result.DecChannelsInter);
+    Result.AsppChannels := Obj.Get('aspp_channels', Result.AsppChannels);
+    Result.IptInterChannels := Obj.Get('ipt_inter_channels',
+      Result.IptInterChannels);
+    Result.GdtChannels := Obj.Get('gdt_channels', Result.GdtChannels);
+    Item := Obj.Find('size');
+    if (Item is TJSONArray) and (TJSONArray(Item).Count = 2) then
+    begin
+      Result.InputWidth := TJSONArray(Item).Integers[0];
+      Result.InputHeight := TJSONArray(Item).Integers[1];
+    end
+    else if Item is TJSONNumber then
+    begin
+      Result.InputWidth := Item.AsInteger;
+      Result.InputHeight := Item.AsInteger;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// The tensor's dimension DimPos, or an ImportError naming the missing key.
+function BiRefNetDim(Reader: TNNetSafeTensorsReader; const Name: string;
+  DimPos: integer): integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(csBiRefNetImporter + ': "' + Name + '" not found in ' +
+      Reader.FileName + ' - not a default-config BiRefNet checkpoint?');
+  Result := Reader.DimSize(Name, DimPos);
+end;
+
+procedure InferBiRefNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TBiRefNetConfig);
+var
+  StageCnt, StagePos, BlockCnt, TableRows: integer;
+  StagePrefix: string;
+begin
+  Config.EmbedDim := BiRefNetDim(Reader, 'bb.patch_embed.proj.weight', 0);
+  StageCnt := 0;
+  while Reader.HasTensor('bb.layers.' + IntToStr(StageCnt) +
+    '.blocks.0.norm1.weight') do Inc(StageCnt);
+  if StageCnt <> 4 then
+    ImportError(csBiRefNetImporter + ': expected 4 Swin stages under ' +
+      '"bb.layers.", found ' + IntToStr(StageCnt) + '.');
+  SetLength(Config.Depths, StageCnt);
+  SetLength(Config.NumHeads, StageCnt);
+  for StagePos := 0 to StageCnt - 1 do
+  begin
+    StagePrefix := 'bb.layers.' + IntToStr(StagePos) + '.blocks.';
+    BlockCnt := 0;
+    while Reader.HasTensor(StagePrefix + IntToStr(BlockCnt) +
+      '.norm1.weight') do Inc(BlockCnt);
+    Config.Depths[StagePos] := BlockCnt;
+    Config.NumHeads[StagePos] := BiRefNetDim(Reader, StagePrefix +
+      '0.attn.relative_position_bias_table', 1);
+  end;
+  TableRows := BiRefNetDim(Reader,
+    'bb.layers.0.blocks.0.attn.relative_position_bias_table', 0);
+  Config.WindowSize := (Round(Sqrt(TableRows)) + 1) div 2;
+  Config.MlpRatio := BiRefNetDim(Reader, 'bb.layers.0.blocks.0.mlp.fc1.weight',
+    0) / Config.EmbedDim;
+  if Config.EmbedDim = 192 then Config.Backbone := 'swin_v1_l'
+  else if Config.EmbedDim = 128 then Config.Backbone := 'swin_v1_b'
+  else if (Config.EmbedDim = 96) and (Config.Depths[2] = 18) then
+    Config.Backbone := 'swin_v1_s'
+  else if Config.EmbedDim = 96 then Config.Backbone := 'swin_v1_t'
+  else Config.Backbone := 'swin';
+  Config.DecChannelsInter := BiRefNetDim(Reader,
+    'decoder.decoder_block4.conv_in.weight', 0);
+  Config.AsppChannels := BiRefNetDim(Reader,
+    'decoder.decoder_block4.dec_att.aspp1.atrous_conv.regular_conv.weight', 0);
+  Config.IptInterChannels := BiRefNetDim(Reader, 'decoder.ipt_blk5.conv1.weight', 0);
+  Config.GdtChannels := BiRefNetDim(Reader, 'decoder.gdt_convs_4.0.weight', 0);
+  if BiRefNetDim(Reader, 'decoder.lateral_block4.conv.weight', 1) <>
+     8 * Config.EmbedDim then
+    ImportError(csBiRefNetImporter + ': decoder.lateral_block4 does not take ' +
+      IntToStr(8 * Config.EmbedDim) + ' channels; only mul_scl_ipt=''cat'' ' +
+      'checkpoints are supported.');
+  if Reader.HasTensor('squeeze_module.1.conv_in.weight') or
+     not Reader.HasTensor('squeeze_module.0.conv_in.weight') then
+    ImportError(csBiRefNetImporter + ': only squeeze_block=''BasicDecBlk_x1'' ' +
+      'checkpoints are supported.');
+  if BiRefNetDim(Reader, 'squeeze_module.0.conv_in.weight', 1) <>
+     30 * Config.EmbedDim then
+    ImportError(csBiRefNetImporter + ': squeeze_module.0 does not take the ' +
+      'cxt_num=3 concatenation (' + IntToStr(30 * Config.EmbedDim) +
+      ' channels).');
+end;
+
+function BiRefNetConfigToString(const Config: TBiRefNetConfig): string;
+var
+  StagePos: integer;
+  DepthText, HeadText: string;
+begin
+  DepthText := '';
+  HeadText := '';
+  for StagePos := 0 to High(Config.Depths) do
+  begin
+    if StagePos > 0 then
+    begin
+      DepthText := DepthText + ',';
+      HeadText := HeadText + ',';
+    end;
+    DepthText := DepthText + IntToStr(Config.Depths[StagePos]);
+    if StagePos <= High(Config.NumHeads) then
+      HeadText := HeadText + IntToStr(Config.NumHeads[StagePos]);
+  end;
+  Result := 'birefnet config: bb=' + Config.Backbone + ', embed_dim=' +
+    IntToStr(Config.EmbedDim) + ', depths=[' + DepthText + '], num_heads=[' +
+    HeadText + '], window=' + IntToStr(Config.WindowSize) +
+    ', dec_inter=' + IntToStr(Config.DecChannelsInter) +
+    ', aspp=' + IntToStr(Config.AsppChannels) +
+    ', ipt_inter=' + IntToStr(Config.IptInterChannels) +
+    ', gdt=' + IntToStr(Config.GdtChannels) +
+    ', size=' + IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
+end;
+
+// Loads torch Conv2d Prefix.weight [OutCh, InCh, K, K] (+ Prefix.bias when
+// present), folding BatchNorm BnPrefix ('' = none). InChannelMap[c] (nil =
+// identity) is the torch input channel that feeds CAI input channel c.
+procedure LoadBiRefNetConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix, BnPrefix: string; OutCh, InCh, K: integer;
+  const InChannelMap: TNeuralIntegerArray);
+var
+  W, Mapped, Bias, Scale, Shift: TNNetVolume;
+  WName: string;
+  OutPos, MaxOutPos, InPos, MaxInPos, KK: integer;
+begin
+  WName := Prefix + '.weight';
+  if not Reader.HasTensor(WName) then
+    ImportError(csBiRefNetImporter + ': missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError(csBiRefNetImporter + ': "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  Mapped := nil;
+  Bias := nil;
+  Scale := nil;
+  Shift := nil;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if InChannelMap <> nil then
+    begin
+      Mapped := TNNetVolume.Create(W.Size, 1, 1);
+      KK := K * K;
+      MaxOutPos := OutCh - 1;
+      MaxInPos := InCh - 1;
+      for OutPos := 0 to MaxOutPos do
+        for InPos := 0 to MaxInPos do
+          Move(W.FData[(OutPos * InCh + InChannelMap[InPos]) * KK],
+            Mapped.FData[(OutPos * InCh + InPos) * KK], KK * csNeuralFloatSize);
+      W.Copy(Mapped);
+    end;
+    if Reader.HasTensor(Prefix + '.bias') then
+    begin
+      Bias := TNNetVolume.Create;
+      Reader.LoadTensorFlat(Prefix + '.bias', Bias);
+    end;
+    if BnPrefix <> '' then
+    begin
+      Scale := TNNetVolume.Create;
+      Shift := TNNetVolume.Create;
+      LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh, csBiRefNetBnEps,
+        Scale, Shift);
+    end;
+    WriteTorchConvWeights(Layer, W, Bias, Scale, Shift, OutCh, InCh, K);
+  finally
+    W.Free;
+    Mapped.Free;
+    Bias.Free;
+    Scale.Free;
+    Shift.Free;
+  end;
+end;
+
+// Loads a BiRefNet DeformableConv2d (offset_conv, modulator_conv and the
+// bias-free regular_conv under Prefix) plus BatchNorm BnPrefix into a modulated
+// TNNetDeformableConv: torch (dy, dx) offsets become (dx, dy) and the modulator's
+// "2 * sigmoid" folds its factor 2 into the main weights.
+procedure LoadBiRefNetDeformConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Prefix, BnPrefix: string; InCh, OutCh, K: integer);
+var
+  W, OffW, OffB, ModW, ModB, Scale, Shift, SrcW, SrcB: TNNetVolume;
+  MainW, MainB, HeadW, HeadB: TNNetVolume;
+  KK, OffOut, OutPos, MaxOutPos, InPos, MaxInPos, TapPos, MaxTapPos: integer;
+  HeadPos, MaxHeadPos, SrcChannel, SrcPos: integer;
+  ChannelScale: TNeuralFloat;
+
+  procedure LoadChecked(const Name: string; Dim0: integer; IsWeight: boolean;
+    Dest: TNNetVolume);
+  begin
+    if not Reader.HasTensor(Name) then
+      ImportError(csBiRefNetImporter + ': missing tensor "' + Name + '".');
+    if (Reader.DimSize(Name, 0) <> Dim0) or (IsWeight and
+       ((Reader.DimCount(Name) <> 4) or (Reader.DimSize(Name, 1) <> InCh) or
+        (Reader.DimSize(Name, 2) <> K) or (Reader.DimSize(Name, 3) <> K))) then
+      ImportError(csBiRefNetImporter + ': "' + Name + '" has shape ' +
+        Reader.ShapeAsString(Name) + ', expected ' + IntToStr(Dim0) +
+        ' outputs over ' + IntToStr(InCh) + 'x' + IntToStr(K) + 'x' +
+        IntToStr(K) + '.');
+    Reader.LoadTensorFlat(Name, Dest);
+  end;
+
+begin
+  if not (Layer is TNNetDeformableConv) or
+     (TNNetDeformableConv(Layer).Modulated = 0) or
+     (TNNetDeformableConv(Layer).InDepth <> InCh) or
+     (TNNetDeformableConv(Layer).OutDepth <> OutCh) then
+    ImportError(csBiRefNetImporter + ': internal error - "' + Prefix +
+      '" needs a modulated TNNetDeformableConv ' + IntToStr(InCh) + ' -> ' +
+      IntToStr(OutCh) + '.');
+  EnsureWritableImportWeights(Layer);
+  KK := K * K;
+  OffOut := 3 * KK;
+  W := TNNetVolume.Create;
+  OffW := TNNetVolume.Create;
+  OffB := TNNetVolume.Create;
+  ModW := TNNetVolume.Create;
+  ModB := TNNetVolume.Create;
+  Scale := TNNetVolume.Create;
+  Shift := TNNetVolume.Create;
+  try
+    LoadChecked(Prefix + '.regular_conv.weight', OutCh, true, W);
+    LoadChecked(Prefix + '.offset_conv.weight', 2 * KK, true, OffW);
+    LoadChecked(Prefix + '.offset_conv.bias', 2 * KK, false, OffB);
+    LoadChecked(Prefix + '.modulator_conv.weight', KK, true, ModW);
+    LoadChecked(Prefix + '.modulator_conv.bias', KK, false, ModB);
+    LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh, csBiRefNetBnEps,
+      Scale, Shift);
+    MainW := Layer.FArrNeurons[0].Weights;
+    MainB := Layer.FArrNeurons[1].Weights;
+    HeadW := Layer.FArrNeurons[2].Weights;
+    HeadB := Layer.FArrNeurons[3].Weights;
+    MaxOutPos := OutCh - 1;
+    MaxInPos := InCh - 1;
+    MaxTapPos := KK - 1;
+    // torch [co, ci, tap] -> CAI [(tap*InCh + ci)*OutCh + co].
+    SrcPos := 0;
+    for OutPos := 0 to MaxOutPos do
+    begin
+      ChannelScale := 2 * Scale.FData[OutPos];
+      for InPos := 0 to MaxInPos do
+        for TapPos := 0 to MaxTapPos do
+        begin
+          MainW.FData[(TapPos * InCh + InPos) * OutCh + OutPos] :=
+            W.FData[SrcPos] * ChannelScale;
+          Inc(SrcPos);
+        end;
+      MainB.FData[OutPos] := Shift.FData[OutPos];
+    end;
+    // CAI head channel 2t / 2t+1 = dx / dy of tap t; 2KK + t = modulation.
+    MaxHeadPos := OffOut - 1;
+    for HeadPos := 0 to MaxHeadPos do
+    begin
+      if HeadPos < 2 * KK then
+      begin
+        SrcW := OffW;
+        SrcB := OffB;
+        SrcChannel := HeadPos xor 1;
+      end
+      else
+      begin
+        SrcW := ModW;
+        SrcB := ModB;
+        SrcChannel := HeadPos - 2 * KK;
+      end;
+      SrcPos := SrcChannel * InCh * KK;
+      for InPos := 0 to MaxInPos do
+        for TapPos := 0 to MaxTapPos do
+        begin
+          HeadW.FData[(TapPos * InCh + InPos) * OffOut + HeadPos] :=
+            SrcW.FData[SrcPos];
+          Inc(SrcPos);
+        end;
+      HeadB.FData[HeadPos] := SrcB.FData[SrcChannel];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free;
+    OffW.Free;
+    OffB.Free;
+    ModW.Free;
+    ModB.Free;
+    Scale.Free;
+    Shift.Free;
+  end;
+end;
+
+// Src resized to (Width, Height) bilinearly with align_corners=True, or Src.
+function AddBiRefNetResize(NN: TNNet; Src: TNNetLayer;
+  Width, Height: integer): TNNetLayer;
+begin
+  if (Src.Output.SizeX = Width) and (Src.Output.SizeY = Height) then
+    Result := Src
+  else
+    Result := NN.AddLayerAfter(TNNetBilinearResize.Create(Width, Height, 1), Src);
+end;
+
+// ASPPDeformable under Prefix over Input (InCh channels): DCNv2 aspp1 +
+// aspp_deforms.*, a global-pool branch, then the 1x1 fuse back to InCh.
+function AddBiRefNetASPPDeformable(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Input: TNNetLayer; const Prefix: string; InCh, AsppCh: integer): TNNetLayer;
+var
+  Branches: array of TNNetLayer;
+  BranchCnt, BranchPos, K: integer;
+  BranchPrefix: string;
+  Deform, PoolConv: TNNetLayer;
+begin
+  BranchCnt := 1;
+  while Reader.HasTensor(Prefix + 'aspp_deforms.' + IntToStr(BranchCnt - 1) +
+    '.atrous_conv.regular_conv.weight') do Inc(BranchCnt);
+  SetLength(Branches, BranchCnt + 1);
+  for BranchPos := 0 to BranchCnt - 1 do
+  begin
+    if BranchPos = 0 then BranchPrefix := Prefix + 'aspp1'
+    else BranchPrefix := Prefix + 'aspp_deforms.' + IntToStr(BranchPos - 1);
+    K := BiRefNetDim(Reader, BranchPrefix + '.atrous_conv.regular_conv.weight', 2);
+    Deform := NN.AddLayerAfter(TNNetDeformableConv.Create(AsppCh, K, K div 2, 1,
+      0, 1), Input);
+    LoadBiRefNetDeformConv(Reader, Deform, BranchPrefix + '.atrous_conv',
+      BranchPrefix + '.bn', InCh, AsppCh, K);
+    Branches[BranchPos] := NN.AddLayer(TNNetReLU.Create());
+  end;
+  NN.AddLayerAfter(TNNetAdaptiveAvgPool.Create(1, 1), Input);
+  PoolConv := NN.AddLayer(TNNetPointwiseConvReLU.Create(AsppCh));
+  LoadBiRefNetConv(Reader, PoolConv, Prefix + 'global_avg_pool.1',
+    Prefix + 'global_avg_pool.2', AsppCh, InCh, 1, nil);
+  Branches[BranchCnt] := NN.AddLayer(TNNetBilinearResize.Create(
+    Input.Output.SizeX, Input.Output.SizeY, 1));
+  NN.AddLayer(TNNetDeepConcat.Create(Branches));
+  Result := NN.AddLayer(TNNetPointwiseConvReLU.Create(InCh));
+  LoadBiRefNetConv(Reader, Result, Prefix + 'conv1', Prefix + 'bn1', InCh,
+    AsppCh * (BranchCnt + 1), 1, nil);
+end;
+
+// BasicDecBlk under Prefix: 3x3 conv+BN+ReLU, ASPPDeformable, 3x3 conv+BN.
+function AddBiRefNetBasicDecBlk(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Input: TNNetLayer; const Prefix: string; InCh, OutCh: integer;
+  const Config: TBiRefNetConfig): TNNetLayer;
+var
+  ConvIn, Attention: TNNetLayer;
+begin
+  ConvIn := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
+    Config.DecChannelsInter, 3, 1, 1, 0), Input);
+  LoadBiRefNetConv(Reader, ConvIn, Prefix + 'conv_in', Prefix + 'bn_in',
+    Config.DecChannelsInter, InCh, 3, nil);
+  Attention := AddBiRefNetASPPDeformable(NN, Reader, ConvIn, Prefix + 'dec_att.',
+    Config.DecChannelsInter, Config.AsppChannels);
+  Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0),
+    Attention);
+  LoadBiRefNetConv(Reader, Result, Prefix + 'conv_out', Prefix + 'bn_out',
+    OutCh, Config.DecChannelsInter, 3, nil);
+end;
+
+// The image split into Grid x Grid tiles stacked on channels (einops
+// 'b c (hg h) (wg w) -> b (c hg wg) h w', TNNetSpaceToDepth tiled) through
+// SimpleConvs under Prefix (two 3x3 convs, no activation).
+function AddBiRefNetPatchBlock(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Image: TNNetLayer; const Prefix: string; Grid, InterCh, OutCh: integer): TNNetLayer;
+var
+  Tiles, Conv1: TNNetLayer;
+  ChannelMap: TNeuralIntegerArray;
+  Channels, InCh, TileX, TileY, Channel, MaxTile, MaxChannel: integer;
+begin
+  Channels := Image.Output.Depth;
+  InCh := Channels * Grid * Grid;
+  ChannelMap := nil;
+  if Grid > 1 then
+  begin
+    Tiles := NN.AddLayerAfter(TNNetSpaceToDepth.Create(Grid, 1), Image);
+    // CAI channel (TileX*Grid + TileY)*C + c <- torch (c*Grid + TileY)*Grid + TileX.
+    SetLength(ChannelMap, InCh);
+    MaxTile := Grid - 1;
+    MaxChannel := Channels - 1;
+    for TileX := 0 to MaxTile do
+      for TileY := 0 to MaxTile do
+        for Channel := 0 to MaxChannel do
+          ChannelMap[(TileX * Grid + TileY) * Channels + Channel] :=
+            (Channel * Grid + TileY) * Grid + TileX;
+  end
+  else
+    Tiles := Image;
+  Conv1 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(InterCh, 3, 1, 1, 0),
+    Tiles);
+  LoadBiRefNetConv(Reader, Conv1, Prefix + 'conv1', '', InterCh, InCh, 3,
+    ChannelMap);
+  Result := NN.AddLayer(TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0));
+  LoadBiRefNetConv(Reader, Result, Prefix + 'conv_out', '', OutCh, InterCh, 3,
+    nil);
+end;
+
+// Features * sigmoid(gdt_convs_attn_L(gdt_convs_L(Features))), the gate
+// broadcast over the channels as AddCBAM does.
+function AddBiRefNetGradientGate(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  Features: TNNetLayer; Level, Channels, GdtCh: integer): TNNetLayer;
+var
+  GdtConv, Attention, Gate: TNNetLayer;
+  LevelText: string;
+begin
+  LevelText := IntToStr(Level);
+  GdtConv := NN.AddLayerAfter(TNNetConvolutionReLU.Create(GdtCh, 3, 1, 1, 0),
+    Features);
+  LoadBiRefNetConv(Reader, GdtConv, 'decoder.gdt_convs_' + LevelText + '.0',
+    'decoder.gdt_convs_' + LevelText + '.1', GdtCh, Channels, 3, nil);
+  Attention := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+  LoadBiRefNetConv(Reader, Attention, 'decoder.gdt_convs_attn_' + LevelText +
+    '.0', '', 1, GdtCh, 1, nil);
+  Gate := NN.AddLayer(TNNetSigmoid.Create());
+  NN.AddLayer(TNNetDeepConcat.Replicate(Channels, Gate));
+  Result := NN.AddLayer(TNNetCellMulByCell.Create(Features, NN.GetLastLayer()));
+end;
+
+function BuildBiRefNet(Reader: TNNetSafeTensorsReader;
+  const Config: TBiRefNetConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  Input, Half, Current, Patches, Decoded, Lateral: TNNetLayer;
+  StageMaps: TSwinStageMaps;
+  StageFeatures: array[0..3] of TNNetLayer;
+  ContextMaps: array[0..3] of TNNetLayer;
+  Channels, MapW, MapH: array[0..3] of integer;
+  StagePos, Level, CurrentCh, PatchCh, DecodedCh: integer;
+  LevelText: string;
+begin
+  if (Length(Config.Depths) <> 4) or (Length(Config.NumHeads) <> 4) then
+    ImportError(csBiRefNetImporter + ': the Swin backbone needs 4 stages.');
+  if (Config.InputWidth < 32) or (Config.InputHeight < 32) or
+     (Config.InputWidth mod 32 <> 0) or (Config.InputHeight mod 32 <> 0) then
+    ImportError(csBiRefNetImporter + ': input ' + IntToStr(Config.InputWidth) +
+      'x' + IntToStr(Config.InputHeight) + ' must be multiples of 32.');
+  NN := TNNet.Create();
+  try
+    Input := NN.AddLayer(TNNetInput.Create(Config.InputWidth,
+      Config.InputHeight, 3));
+    Half := NN.AddLayer(TNNetBilinearResize.Create(Config.InputWidth div 2,
+      Config.InputHeight div 2, 1));
+    AddSwinMultiImageBackbone(NN, Reader, 'bb.', [Input, Half], Config.EmbedDim,
+      Config.Depths, Config.NumHeads, Config.WindowSize, Config.MlpRatio,
+      csBiRefNetLnEps, StageMaps);
+    // x1..x4: full-size stage map ++ the half-size one resized onto it.
+    for StagePos := 0 to 3 do
+    begin
+      MapW[StagePos] := Config.InputWidth shr (StagePos + 2);
+      MapH[StagePos] := Config.InputHeight shr (StagePos + 2);
+      Channels[StagePos] := (2 * Config.EmbedDim) shl StagePos;
+      StageFeatures[StagePos] := NN.AddLayer(TNNetDeepConcat.Create(
+        [StageMaps[0][StagePos], AddBiRefNetResize(NN, StageMaps[1][StagePos],
+        MapW[StagePos], MapH[StagePos])]));
+    end;
+    for StagePos := 0 to 2 do
+      ContextMaps[StagePos] := AddBiRefNetResize(NN, StageFeatures[StagePos],
+        MapW[3], MapH[3]);
+    ContextMaps[3] := StageFeatures[3];
+    NN.AddLayer(TNNetDeepConcat.Create(ContextMaps));
+    Current := AddBiRefNetBasicDecBlk(NN, Reader, NN.GetLastLayer(),
+      'squeeze_module.0.', Channels[0] + Channels[1] + Channels[2] +
+      Channels[3], Channels[3], Config);
+    CurrentCh := Channels[3];
+    // Level L decodes at stage L-1 with Grid = 2^(L+1) image tiles per side.
+    for Level := 4 downto 1 do
+    begin
+      LevelText := IntToStr(Level);
+      PatchCh := Channels[Min(Level, 3)] div 8;
+      Patches := AddBiRefNetPatchBlock(NN, Reader, Input, 'decoder.ipt_blk' +
+        IntToStr(Level + 1) + '.', 2 shl Level, Config.IptInterChannels, PatchCh);
+      NN.AddLayer(TNNetDeepConcat.Create([Current, Patches]));
+      if Level > 1 then DecodedCh := Channels[Level - 2]
+      else DecodedCh := Channels[0] div 2;
+      Decoded := AddBiRefNetBasicDecBlk(NN, Reader, NN.GetLastLayer(),
+        'decoder.decoder_block' + LevelText + '.', CurrentCh + PatchCh,
+        DecodedCh, Config);
+      if Level > 1 then
+      begin
+        Decoded := AddBiRefNetGradientGate(NN, Reader, Decoded, Level,
+          DecodedCh, Config.GdtChannels);
+        Current := AddBiRefNetResize(NN, Decoded, MapW[Level - 2],
+          MapH[Level - 2]);
+        Lateral := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(DecodedCh),
+          StageFeatures[Level - 2]);
+        LoadBiRefNetConv(Reader, Lateral, 'decoder.lateral_block' + LevelText +
+          '.conv', '', DecodedCh, DecodedCh, 1, nil);
+        Current := NN.AddLayer(TNNetSum.Create([Current, Lateral]));
+      end
+      else
+        Current := AddBiRefNetResize(NN, Decoded, Config.InputWidth,
+          Config.InputHeight);
+      CurrentCh := DecodedCh;
+    end;
+    PatchCh := Channels[0] div 8;
+    Patches := AddBiRefNetPatchBlock(NN, Reader, Input, 'decoder.ipt_blk1.', 1,
+      Config.IptInterChannels, PatchCh);
+    NN.AddLayer(TNNetDeepConcat.Create([Current, Patches]));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+    LoadBiRefNetConv(Reader, NN.GetLastLayer(), 'decoder.conv_out1.0', '', 1,
+      CurrentCh + PatchCh, 1, nil);
+    NN.AddLayer(TNNetSigmoid.Create());
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildBiRefNetFromSafeTensorsEx(const FileName: string;
+  const Config: TBiRefNetConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildBiRefNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildBiRefNetFromSafeTensors(const FileName: string;
+  out Config: TBiRefNetConfig; pTrainable: boolean;
+  const ConfigFileName: string; pInputSize: integer): TNNet;
+var
+  ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  if (ConfigFileName <> '') or FileExists(ConfigPath) then
+    Config := ReadBiRefNetConfigFromJSONFile(ConfigPath)
+  else
+    Config := DefaultBiRefNetConfig();
+  if pInputSize > 0 then
+  begin
+    Config.InputWidth := pInputSize;
+    Config.InputHeight := pInputSize;
+  end;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    InferBiRefNetConfigFromTensors(Reader, Config);
+    Result := BuildBiRefNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BiRefNetPrepareInput(Image: TNNetVolume; const Config: TBiRefNetConfig;
+  NetInput: TNNetVolume);
+var
+  PixelPos, MaxPixelPos, Channel: integer;
+  ChannelScale, ChannelShift: array[0..2] of TNeuralFloat;
+  Pixel: TNeuralFloatArrPtr;
+begin
+  if Image.Depth <> 3 then
+    ImportError(csBiRefNetImporter + ': BiRefNetPrepareInput needs an RGB ' +
+      'image, got depth ' + IntToStr(Image.Depth) + '.');
+  if (Image.SizeX = Config.InputWidth) and (Image.SizeY = Config.InputHeight) then
+    NetInput.Copy(Image)
+  else
+    ResizeImagePIL(Image, NetInput, Config.InputWidth, Config.InputHeight,
+      irfBilinear, {RoundToBytes=}true);
+  // (v/255 - mean) / std = v * Scale + Shift per channel.
+  for Channel := 0 to 2 do
+  begin
+    ChannelScale[Channel] := 1 / (255 * csBiRefNetImageStd[Channel]);
+    ChannelShift[Channel] := -csBiRefNetImageMean[Channel] /
+      csBiRefNetImageStd[Channel];
+  end;
+  MaxPixelPos := NetInput.SizeX * NetInput.SizeY - 1;
+  Pixel := NetInput.DataPtr;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    for Channel := 0 to 2 do
+      Pixel^[Channel] := Pixel^[Channel] * ChannelScale[Channel] +
+        ChannelShift[Channel];
+    Pixel := TNeuralFloatArrPtr(@Pixel^[3]);
+  end;
+end;
+
+procedure BiRefNetComposeMask(NetOutput: TNNetVolume;
+  SourceWidth, SourceHeight: integer; Mask: TNNetVolume);
+var
+  Scaled: TNNetVolume;
+begin
+  Scaled := TNNetVolume.Create;
+  try
+    Scaled.Copy(NetOutput);
+    Scaled.Mul(255);
+    if (Scaled.SizeX = SourceWidth) and (Scaled.SizeY = SourceHeight) then
+      Mask.Copy(Scaled)
+    else
+      ResizeImagePIL(Scaled, Mask, SourceWidth, SourceHeight, irfBilinear);
+  finally
+    Scaled.Free;
+  end;
+end;
+
+procedure BiRefNetComposeRGBA(Image, Mask, RGBA: TNNetVolume);
+var
+  PixelPos, MaxPixelPos: integer;
+  Src, Dst: TNeuralFloatArrPtr;
+begin
+  if (Image.Depth <> 3) or (Mask.Depth <> 1) or (Mask.SizeX <> Image.SizeX) or
+     (Mask.SizeY <> Image.SizeY) then
+    ImportError(csBiRefNetImporter + ': BiRefNetComposeRGBA needs an RGB ' +
+      'image and a same-size one-channel mask.');
+  RGBA.ReSize(Image.SizeX, Image.SizeY, 4);
+  MaxPixelPos := Image.SizeX * Image.SizeY - 1;
+  Src := Image.DataPtr;
+  Dst := RGBA.DataPtr;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    Move(Src^[0], Dst^[0], 3 * csNeuralFloatSize);
+    Dst^[3] := Mask.FData[PixelPos];
+    Src := TNeuralFloatArrPtr(@Src^[3]);
+    Dst := TNeuralFloatArrPtr(@Dst^[4]);
+  end;
+end;
+
+procedure BiRefNetRemoveBackground(NN: TNNet; const Config: TBiRefNetConfig;
+  Image, Mask: TNNetVolume);
+var
+  NetInput, NetOutput: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  NetOutput := TNNetVolume.Create;
+  try
+    BiRefNetPrepareInput(Image, Config, NetInput);
+    NN.Compute(NetInput);
+    NN.GetOutput(NetOutput);
+    BiRefNetComposeMask(NetOutput, Image.SizeX, Image.SizeY, Mask);
+  finally
+    NetInput.Free;
+    NetOutput.Free;
   end;
 end;
 

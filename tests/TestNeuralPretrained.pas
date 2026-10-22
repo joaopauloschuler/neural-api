@@ -1515,6 +1515,11 @@ type
     procedure TestGFPGANPrepareAndCompose;
     // The tiny fixture with EnableOpenCL against the host net, every layer.
     procedure TestGFPGANOpenCLParity;
+    procedure TestBiRefNetParity;
+    procedure TestBiRefNetInfersConfig;
+    procedure TestBiRefNetPrepareAndCompose;
+    // The tiny fixture with EnableOpenCL against the host net, every layer.
+    procedure TestBiRefNetOpenCLParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestDINOv3ConfigFromJSONFile;
@@ -55780,6 +55785,232 @@ begin
       NN.CountLayers() - 1);
     AssertTrue('some layers ran on OpenCL', OpenCLLayerCnt > 0);
     AssertTrue('face OpenCL vs CPU max |diff| = ' + FloatToStr(OutputDiff) +
+      ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertEquals('every layer OpenCL vs CPU within 1e-4', -1, FirstBadLayer);
+  finally
+    NetInput.Free;
+    IO.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The first layer of NN whose output is (SizeX, SizeY, Depth), or nil.
+function FirstLayerWithShape(NN: TNNet; SizeX, SizeY, Depth: integer): TNNetLayer;
+var
+  LayerPos, MaxLayerPos: integer;
+begin
+  Result := nil;
+  MaxLayerPos := NN.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if (NN.Layers[LayerPos].Output.SizeX = SizeX) and
+       (NN.Layers[LayerPos].Output.SizeY = SizeY) and
+       (NN.Layers[LayerPos].Output.Depth = Depth) then
+    begin
+      Result := NN.Layers[LayerPos];
+      Exit;
+    end;
+end;
+
+// tiny_birefnet.*: the official birefnet.py (default config: swin_v1_l arch at
+// embed 4, depths [2,2,2,2], heads [1,1,2,2], window 4; decoder widths 2/4/2/3)
+// in float64 torch with random weights, BN statistics and DCN offsets; a
+// 96x64 input, so windows pad, the 0.5x pass merges odd grids and shift masks
+// run at grid = window.
+procedure TTestNeuralPretrained.TestBiRefNetParity;
+var
+  Config: TBiRefNetConfig;
+  NN, Reloaded: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput, Logits, Expected, Feature: TNNetVolume;
+  FeatureLayer: TNNetLayer;
+  StagePos: integer;
+  LogitDiff, MaskDiff, FeatureDiff: double;
+begin
+  NN := BuildBiRefNetFromSafeTensors(FixturePath('tiny_birefnet.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_birefnet_config.json'));
+  Reloaded := nil;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_birefnet_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Feature := TNNetVolume.Create;
+  try
+    AssertEquals('input width', 96, Config.InputWidth);
+    AssertEquals('input height', 64, Config.InputHeight);
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    LoadDDColorTorchImage(IO, 'logits', Logits);
+    NN.Compute(NetInput);
+    // enc_x1..x3: stage features (full ++ upsampled half); enc_x4 with context.
+    for StagePos := 1 to 4 do
+    begin
+      LoadDDColorTorchImage(IO, 'enc_x' + IntToStr(StagePos), Feature);
+      FeatureLayer := FirstLayerWithShape(NN, Feature.SizeX, Feature.SizeY,
+        Feature.Depth);
+      AssertTrue('a layer shaped like enc_x' + IntToStr(StagePos),
+        FeatureLayer <> nil);
+      FeatureDiff := MaxAbsVolumeDiff(FeatureLayer.Output, Feature);
+      WriteLn('  BiRefNet enc_x', StagePos, ' max|diff| = ', FeatureDiff:0:9);
+      AssertTrue('enc_x' + IntToStr(StagePos) + ' max |diff| = ' +
+        FloatToStr(FeatureDiff) + ' must be < 1e-4', FeatureDiff < 1e-4);
+    end;
+    LogitDiff := MaxAbsVolumeDiff(NN.Layers[NN.CountLayers() - 2].Output, Logits);
+    Expected.Copy(Logits);
+    TNNetVolume.Sigmoid(Expected.DataPtr, Expected.DataPtr, Expected.Size);
+    MaskDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Expected);
+    WriteLn('  BiRefNet logits max|diff| = ', LogitDiff:0:9, ' mask max|diff| = ',
+      MaskDiff:0:9);
+    AssertTrue('logits max |diff| = ' + FloatToStr(LogitDiff) +
+      ' must be < 1e-4', LogitDiff < 1e-4);
+    AssertTrue('mask max |diff| = ' + FloatToStr(MaskDiff) + ' must be < 1e-4',
+      MaskDiff < 1e-4);
+    Reloaded := TNNet.Create();
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.SetTrainable();
+    Reloaded.Compute(NetInput);
+    AssertEquals('save/load round trip reproduces the mask', 0,
+      MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output,
+      NN.GetLastLayer().Output), 1e-6);
+  finally
+    Feature.Free;
+    Expected.Free;
+    Logits.Free;
+    NetInput.Free;
+    Reloaded.Free;
+    IO.Free;
+    NN.Free;
+  end;
+end;
+
+// Every shape field comes from the tensors, so a bare checkpoint (the HF
+// config.json carries none of them) needs no BiRefNet config.
+procedure TTestNeuralPretrained.TestBiRefNetInfersConfig;
+var
+  Config: TBiRefNetConfig;
+  Reader: TNNetSafeTensorsReader;
+begin
+  Config := DefaultBiRefNetConfig();
+  AssertEquals('default embed', 192, Config.EmbedDim);
+  AssertEquals('default window', 12, Config.WindowSize);
+  AssertEquals('default depth[2]', 18, Config.Depths[2]);
+  AssertEquals('lite embed', 96, DefaultBiRefNetConfig('swin_v1_t').EmbedDim);
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_birefnet.safetensors'));
+  try
+    InferBiRefNetConfigFromTensors(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+  AssertEquals('embed', 4, Config.EmbedDim);
+  AssertEquals('stages', 4, Length(Config.Depths));
+  AssertEquals('depth[3]', 2, Config.Depths[3]);
+  AssertEquals('heads[1]', 1, Config.NumHeads[1]);
+  AssertEquals('heads[2]', 2, Config.NumHeads[2]);
+  AssertEquals('window', 4, Config.WindowSize);
+  AssertEquals('mlp ratio', 4, Config.MlpRatio, 1e-6);
+  AssertEquals('dec inter', 2, Config.DecChannelsInter);
+  AssertEquals('aspp', 4, Config.AsppChannels);
+  AssertEquals('ipt inter', 2, Config.IptInterChannels);
+  AssertEquals('gdt', 3, Config.GdtChannels);
+  AssertEquals('input untouched', 1024, Config.InputWidth);
+end;
+
+// BiRefNetPrepareInput normalizes with the ImageNet statistics; the mask goes
+// back to the source size and becomes the alpha channel.
+procedure TTestNeuralPretrained.TestBiRefNetPrepareAndCompose;
+var
+  Config: TBiRefNetConfig;
+  Image, NetInput, NetOutput, Mask, RGBA: TNNetVolume;
+begin
+  Config := DefaultBiRefNetConfig();
+  Config.InputWidth := 32;
+  Config.InputHeight := 32;
+  Image := TNNetVolume.Create(40, 20, 3);
+  NetInput := TNNetVolume.Create;
+  NetOutput := TNNetVolume.Create(32, 32, 1);
+  Mask := TNNetVolume.Create;
+  RGBA := TNNetVolume.Create;
+  try
+    Image.Fill(255);
+    BiRefNetPrepareInput(Image, Config, NetInput);
+    AssertEquals('net width', 32, NetInput.SizeX);
+    AssertEquals('net height', 32, NetInput.SizeY);
+    AssertEquals('red', (1 - 0.485) / 0.229, NetInput[3, 4, 0], 1e-4);
+    AssertEquals('blue', (1 - 0.406) / 0.225, NetInput[7, 9, 2], 1e-4);
+    NetOutput.Fill(0.25);
+    BiRefNetComposeMask(NetOutput, 40, 20, Mask);
+    AssertEquals('mask width', 40, Mask.SizeX);
+    AssertEquals('mask height', 20, Mask.SizeY);
+    AssertEquals('mask depth', 1, Mask.Depth);
+    AssertEquals('alpha', 63.75, Mask[11, 7, 0], 1e-3);
+    Image[5, 6, 1] := 17;
+    BiRefNetComposeRGBA(Image, Mask, RGBA);
+    AssertEquals('rgba depth', 4, RGBA.Depth);
+    AssertEquals('rgba green', 17, RGBA[5, 6, 1], 1e-6);
+    AssertEquals('rgba alpha', 63.75, RGBA[5, 6, 3], 1e-3);
+  finally
+    RGBA.Free;
+    Mask.Free;
+    NetOutput.Free;
+    NetInput.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestBiRefNetOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TBiRefNetConfig;
+  NN, NNCPU: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, FirstBadLayer: integer;
+  LayerDiff, MaxDiff, OutputDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildBiRefNetFromSafeTensors(FixturePath('tiny_birefnet.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_birefnet_config.json'));
+  NNCPU := BuildBiRefNetFromSafeTensors(FixturePath('tiny_birefnet.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_birefnet_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_birefnet_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    NNCPU.Compute(NetInput);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    NN.GetLastLayer().ForceOutputOnRAM();
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    for LayerPos := 1 to NN.CountLayers() - 1 do
+    begin
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output);
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  BiRefNet OpenCL first layer past 1e-4: ', LayerPos, ' ',
+          NN.Layers[LayerPos].ClassName, ' max|diff|=', LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  BiRefNet OpenCL mask max|diff| = ', OutputDiff:0:9,
+      ' any layer = ', MaxDiff:0:9);
+    AssertTrue('mask OpenCL vs CPU max |diff| = ' + FloatToStr(OutputDiff) +
       ' must be < 1e-4', OutputDiff < 1e-4);
     AssertEquals('every layer OpenCL vs CPU within 1e-4', -1, FirstBadLayer);
   finally
