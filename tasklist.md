@@ -597,7 +597,7 @@ rather than acted on.
             synthetic states, and ControlNet/T2I run one step and write no image.
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
-      - [ ] Textual inversion embeddings (port of diffusers
+      - [X] Textual inversion embeddings (port of diffusers
             `TextualInversionLoaderMixin.load_textual_inversion`): a
             `TStableDiffusionPipeline.LoadTextualInversion(FileName, Token)` that
             reads a diffusers `learned_embeds.safetensors` / `.bin` (one
@@ -615,6 +615,18 @@ rather than acted on.
             (< 1e-5), and the tokenizer output with the multi-vector expansion.
             Then a `--embedding file[:token]` option (repeatable) in
             examples/StableDiffusion and its README.
+            DONE b6c1c5dd (library + tests) and 274b14f3 (CLI + README).
+      - [ ] Textual inversion on a real checkpoint: SD 1.5 with a
+            sd-concepts-library learned_embeds.safetensors and an A1111 .pt
+            (e.g. EasyNegative); only the pico fixture is tested.
+      - [ ] Textual inversion: mixed-case tokens never expand to their N
+            vectors (diffusers' maybe_convert_prompt looks the lowercased
+            token up by the token as given; ported as is). Decide whether to
+            expand them anyway (A1111 does) at the cost of diffusers parity.
+      - [ ] TNeuralHFTokenizer.AddToken on CLIP matches in an ASCII-lowercased
+            copy of the text; HF lowercases Unicode (non-ASCII tokens differ).
+      - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
+            pickle) are rejected by TNNetTorchBinReader.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
