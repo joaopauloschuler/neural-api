@@ -32,12 +32,24 @@ lazbuild -B ControlNetCanny.lpi
   --model /path/to/stable-diffusion-v1-5 \
   --controlnet /path/to/sd-controlnet-canny \
   --photo photo.jpg --edges-out edges.png --prompt "a futuristic city" --gpu
+../../bin/x86_64-linux/bin/ControlNetCanny \
+  --model /path/to/stable-diffusion-v1-5 \
+  --controlnet /path/to/sd-controlnet-canny --control edges.png --scale 0.8 \
+  --controlnet /path/to/sd-controlnet-depth --control depth.png --scale 0.5 \
+  --control-start 0.2 --prompt "a futuristic city" --gpu
 ```
+
+Each `--controlnet DIR` after the first adds another ControlNet (diffusers
+`MultiControlNetModel`, through `TStableDiffusionMultiConditioner`).
+`--control`, `--photo`, `--edges-out`, `--scale`, `--control-start` and
+`--control-end` apply to the latest `--controlnet` given before them; before
+any `--controlnet` they apply to the first one. The canny thresholds, the
+blur and `--guess-mode` apply to all.
 
 | Option | Meaning |
 | --- | --- |
 | `--model DIR` | diffusers Stable Diffusion 1.x folder (default `tests/fixtures/tiny_sd15`) |
-| `--controlnet DIR` | diffusers `ControlNetModel` folder: `config.json` + `diffusion_pytorch_model.safetensors` (default `tests/fixtures/tiny_sd15_controlnet`) |
+| `--controlnet DIR` | diffusers `ControlNetModel` folder: `config.json` + `diffusion_pytorch_model.safetensors` (default `tests/fixtures/tiny_sd15_controlnet`); repeat it for several ControlNets |
 | `--control FILE` | control image; for the canny ControlNet white edges on black (e.g. `cv2.Canny` output). Resized to the image size (Lanczos). Default: drawn circle and square outlines |
 | `--photo FILE` | photo to take the edges from instead of `--control`: resized to the image size (PIL Lanczos, uint8 rounding), then `CannyEdges` |
 | `--canny-low T`, `--canny-high T` | `cv2.Canny` thresholds (100, 200: the diffusers ControlNet recipe) |
@@ -47,7 +59,7 @@ lazbuild -B ControlNetCanny.lpi
 | `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
 | `--scale S` | `controlnet_conditioning_scale` (1.0) |
 | `--control-start F`, `--control-end F` | `control_guidance_start` / `control_guidance_end` (0, 1): step i of N gets the residuals when F_start <= i / N and (i + 1) / N <= F_end |
-| `--guess-mode` | diffusers `guess_mode`: the ControlNet runs in the prompt pass only, its down residuals scaled from 0.1 up to 1 (`logspace(-1, 0)`); the CFG pass without the prompt gets none |
+| `--guess-mode` | diffusers `guess_mode`: the ControlNets run in the prompt pass only, their down residuals scaled from 0.1 up to 1 (`logspace(-1, 0)`); the CFG pass without the prompt gets none. A first ControlNet whose `config.json` sets `global_pool_conditions` (e.g. `lllyasviel/control_v11e_sd15_shuffle`) turns it on for all, as diffusers does |
 | `--ip-adapter FILE`, `--ip-image PNG`, `--ip-scale S` | an h94/IP-Adapter `ip-adapter_sd15` image prompt on top of the ControlNet (its `image_encoder/` folder beside FILE), as `pipe.load_ip_adapter` on a `StableDiffusionControlNetPipeline`; scale 1.0 |
 | `--width N`, `--height N` | image size, each a multiple of 8 for SD 1.5 (default: the checkpoint's, 512) |
 | `--size N` | sets both `--width` and `--height` |
@@ -62,8 +74,8 @@ The IP-Adapter joins through a `TStableDiffusionMultiConditioner`, which runs
 several conditioners in one `Denoise`: ControlNets and T2I-Adapters (their
 residuals summed, as diffusers `MultiControlNetModel`), at most one
 IP-Adapter, and at most one img2img / inpainting / InstructPix2Pix
-conditioner. The example exposes one ControlNet plus the IP-Adapter; code can
-add more:
+conditioner. The example exposes several ControlNets plus the IP-Adapter; in
+code:
 
 ```pascal
 Multi := TStableDiffusionMultiConditioner.Create();
@@ -92,7 +104,14 @@ steps each) match diffusers float64 to 1e-4 as well:
 `TestStableDiffusionControlNetAdapterIPParity` (ControlNet + T2I-Adapter +
 IP-Adapter; diffusers has no pipeline for a ControlNet and a T2I-Adapter
 together, so that oracle adds the adapter features to the ControlNet
-pipeline's UNet calls). The fixtures and the oracles come from
+pipeline's UNet calls). `global_pool_conditions` has its own oracle
+(`tests/fixtures/tiny_sd15_controlnet_global_pool_io.json`, the pico
+ControlNet with the flag set): `TestStableDiffusionControlNetGlobalPoolParity`
+(alone: guess mode forced, every down / mid residual mean-pooled over H, W),
+`TestStableDiffusionMultiControlNetGlobalPoolParity` (two pooled nets) and
+`TestStableDiffusionControlNetGlobalPoolSecondParity` (a pooled net after a
+plain one: no guess mode, since diffusers reads the flag of the first net
+only). The fixtures and the oracles come from
 `tools/make_pico_sd_conditioning_fixtures.py`.
 
 ## Canny edges
@@ -115,6 +134,8 @@ hysteresis cases; no `cv2` comparison has been run.
   image size for the same result.
 - Real checkpoints (`lllyasviel/sd-controlnet-canny` on SD 1.5, an
   `ip-adapter_sd15`) are untested.
-- The command line takes one ControlNet; several need code (above).
-- A ControlNet `config.json` with `global_pool_conditions` (diffusers forces
-  guess mode and pools the residuals) is not handled.
+- A pooled (`global_pool_conditions`) ControlNet first and a plain one after
+  it runs here; diffusers fails on that order (its MultiControlNet sums the
+  1x1 pooled residuals in place), so it has no oracle.
+- `--guess-mode` is one switch for all ControlNets, as diffusers' pipeline
+  argument; `TStableDiffusionControlNet.GuessMode` can differ per net in code.

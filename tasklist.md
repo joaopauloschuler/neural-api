@@ -659,9 +659,11 @@ rather than acted on.
               diffusers' ControlNet-inpaint prepares its control image with the
               mask); (2) IP-Adapter + img2img / inpainting parity (code path
               shared with the tested InstructPix2Pix case); (3) a T2I MultiAdapter
-              test (diffusers MultiAdapter adapter_weights); (4) ControlNet
-              config global_pool_conditions (forces guess mode, pools the
-              residuals) is not read; (5) CLI for several ControlNets.
+              test (diffusers MultiAdapter adapter_weights).
+        - [X] ControlNet config global_pool_conditions (first net's flag forces
+              guess mode, pooled residuals; TestStableDiffusion*GlobalPool*) and
+              a repeatable --controlnet in examples/ControlNetCanny. Real-checkpoint
+              run (lllyasviel/control_v11e_sd15_shuffle) still pending.
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
       - [ ] Textual inversion on a real checkpoint: SD 1.5 with a

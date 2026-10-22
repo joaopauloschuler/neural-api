@@ -12561,6 +12561,7 @@ type
     CondGrid: integer;                        // control image W (and H when square)
     CondGridY: integer;                       // control image H; 0 = CondGrid
     NumDownResiduals: integer;                // count of down-block tap convs
+    GlobalPoolConditions: boolean;            // residuals mean-pooled over H, W
   end;
 
 function ReadControlNetConfigFromJSONFile(const FileName: string): TControlNetConfig;
@@ -12700,6 +12701,9 @@ type
     FConditioningScale: TNeuralFloat;
     FGuidanceStart, FGuidanceEnd: double;
     FGuessMode: boolean;
+    // Guess mode of the current run: GuessMode or the global_pool_conditions
+    // of the run's first ControlNet (set by BeginDenoise and the multi one).
+    FRunGuessMode: boolean;
   protected
     procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
@@ -12721,7 +12725,7 @@ type
     property GuidanceStart: double read FGuidanceStart write FGuidanceStart;
     property GuidanceEnd: double read FGuidanceEnd write FGuidanceEnd;
     // diffusers guess_mode: residuals only in the prompt pass, the down ones
-    // scaled by logspace(-1, 0) toward the mid one.
+    // scaled by logspace(-1, 0) toward the mid one unless pooled.
     property GuessMode: boolean read FGuessMode write FGuessMode;
     property Config: TControlNetConfig read FConfig;
   end;
@@ -77513,6 +77517,7 @@ begin
       if i < Result.Base.NumBlockOut - 1 then Inc(BaseDownTaps);
     end;
     Result.NumDownResiduals := BaseDownTaps;
+    Result.GlobalPoolConditions := Obj.Get('global_pool_conditions', false);
     s := ''; if s = '' then ; // silence unused
   finally
     Root.Free;
@@ -77538,6 +77543,8 @@ begin
   if CondGridYOf(Config) <> Config.CondGrid then
     Result := Result + 'x' + IntToStr(CondGridYOf(Config));
   Result := Result + ', down_residuals=' + IntToStr(Config.NumDownResiduals);
+  if Config.GlobalPoolConditions then
+    Result := Result + ', global_pool_conditions';
 end;
 
 function CondGridYOf(const Config: TControlNetConfig): integer;
@@ -94819,6 +94826,7 @@ begin
     for ResidualPos := 0 to MaxResidualPos do
       FDownResiduals[ResidualPos] := TNNetVolume.Create();
   end;
+  FRunGuessMode := FGuessMode or FConfig.GlobalPoolConditions;
 end;
 
 procedure TStableDiffusionControlNet.FillUNetInputs(
@@ -94828,28 +94836,45 @@ var
   ResidualPos, MaxResidualPos: integer;
   StepStart, StepEnd: double;
   ResidualScale: TNeuralFloat;
+  LogspaceScales: boolean;
+
+  // global_pool_conditions: every position takes its channel's H, W mean (the
+  // UNet broadcasts the pooled residual over the skip).
+  procedure PoolResidual(Residual: TNNetVolume);
+  var
+    Channel, MaxChannel: integer;
+  begin
+    MaxChannel := Residual.Depth - 1;
+    for Channel := 0 to MaxChannel do
+      Residual.FillAtDepth(Channel, Residual.AvgAtDepth(Channel));
+  end;
+
 begin
   // diffusers controlnet_keep, in float64.
   StepStart := FPipeline.FStepPos / FPipeline.FStepCount;
   StepEnd := (FPipeline.FStepPos + 1) / FPipeline.FStepCount;
   if (StepStart < FGuidanceStart) or (StepEnd > FGuidanceEnd) then exit;
-  if FGuessMode and not (sdpiPrompt in Inputs) then exit;
+  if FRunGuessMode and not (sdpiPrompt in Inputs) then exit;
   ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, FControlImage,
     Timestep, FDownResiduals, FMidResidual);
+  LogspaceScales := FRunGuessMode and not FConfig.GlobalPoolConditions;
   MaxResidualPos := High(FDownResiduals);
   for ResidualPos := 0 to MaxResidualPos do
   begin
     ResidualScale := FConditioningScale;
     // torch.logspace(-1, 0, residual count + 1); the mid residual takes 1.
-    if FGuessMode then
+    if LogspaceScales then
       ResidualScale := ResidualScale *
         Power(10, ResidualPos / (MaxResidualPos + 1) - 1);
     if ResidualScale <> 1 then FDownResiduals[ResidualPos].Mul(ResidualScale);
+    if FConfig.GlobalPoolConditions then
+      PoolResidual(FDownResiduals[ResidualPos]);
     SDUNetWriteInput(UNetInputs.ControlDown[ResidualPos],
       FDownResiduals[ResidualPos], {Accumulate=}true,
       'TStableDiffusionControlNet: down residual');
   end;
   if FConditioningScale <> 1 then FMidResidual.Mul(FConditioningScale);
+  if FConfig.GlobalPoolConditions then PoolResidual(FMidResidual);
   SDUNetWriteInput(UNetInputs.ControlMid, FMidResidual, {Accumulate=}true,
     'TStableDiffusionControlNet: mid residual');
 end;
@@ -95243,7 +95268,9 @@ procedure TStableDiffusionMultiConditioner.BeginDenoise(
   Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
   TextSeqLen: integer);
 var
-  MaxMemberPos: integer;
+  MaxMemberPos, MemberPos: integer;
+  FirstControlNet, ControlNet: TStableDiffusionControlNet;
+  ForcedGuessMode: boolean;
 begin
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
   FBegunCount := 0;
@@ -95253,6 +95280,20 @@ begin
     FMembers[FBegunCount].BeginDenoise(Pipeline, Latents, TextSeqLen);
     Inc(FBegunCount);
   end;
+  // diffusers MultiControlNet: the first net's global_pool_conditions sets
+  // guess mode for every ControlNet.
+  FirstControlNet := nil;
+  for MemberPos := MaxMemberPos downto 0 do
+    if FMembers[MemberPos] is TStableDiffusionControlNet then
+      FirstControlNet := TStableDiffusionControlNet(FMembers[MemberPos]);
+  if FirstControlNet = nil then exit;
+  ForcedGuessMode := FirstControlNet.FConfig.GlobalPoolConditions;
+  for MemberPos := 0 to MaxMemberPos do
+    if FMembers[MemberPos] is TStableDiffusionControlNet then
+    begin
+      ControlNet := TStableDiffusionControlNet(FMembers[MemberPos]);
+      ControlNet.FRunGuessMode := ControlNet.FGuessMode or ForcedGuessMode;
+    end;
 end;
 
 function TStableDiffusionMultiConditioner.DenoiseStrength(): double;

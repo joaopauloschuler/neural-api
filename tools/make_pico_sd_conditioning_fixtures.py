@@ -97,6 +97,13 @@ not matter; values rounded to 10 digits):
       T2I-Adapter features added to every UNet call (no diffusers pipeline
       runs a ControlNet and a T2I-Adapter together), and
       StableDiffusionInstructPix2PixPipeline + load_ip_adapter on tiny_sd15_ip2p
+  tests/fixtures/tiny_sd15_controlnet_global_pool/
+      the tiny_sd15_controlnet weights with global_pool_conditions true
+  tests/fixtures/tiny_sd15_controlnet_global_pool_io.json
+      the composed layout plus controlnet_folders per case: the pooled
+      ControlNet alone and twice in a MultiControlNet (guess mode forced), and
+      second after a plain one (no guess mode, still pooled; diffusers cannot
+      run a pooled net first and a plain one second: its in-place sum fails)
 
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
@@ -111,12 +118,14 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py --ip2p-only
   python tools/make_pico_sd_conditioning_fixtures.py --lora-only
   python tools/make_pico_sd_conditioning_fixtures.py --composed-only
+  python tools/make_pico_sd_conditioning_fixtures.py --global-pool-only
 (--nonsquare-only keeps the committed folders and writes only the two
 non-square files; --inpaint-strength-only writes only the strength file;
 --ip-adapter-only writes only the IP-Adapter folder and its file;
 --img2img-only writes only the img2img file; --ip2p-only writes only the
 InstructPix2Pix folder and its file; --lora-only writes only the LoRA folder
-and its file; --composed-only writes only the composed-conditioner file.)
+and its file; --composed-only writes only the composed-conditioner file;
+--global-pool-only writes only the global-pool ControlNet folder and its file.)
 """
 import json
 import os
@@ -160,6 +169,8 @@ IP2P_IO = os.path.join(FIXTURES, "tiny_sd15_ip2p_io.json")
 LORA_DIR = os.path.join(FIXTURES, "tiny_sd15_lora")
 LORA_IO = os.path.join(FIXTURES, "tiny_sd15_lora_io.json")
 COMPOSED_IO = os.path.join(FIXTURES, "tiny_sd15_composed_io.json")
+GLOBAL_POOL_DIR = os.path.join(FIXTURES, "tiny_sd15_controlnet_global_pool")
+GLOBAL_POOL_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_global_pool_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
@@ -727,6 +738,52 @@ def make_composed():
         json.dump(payload, f)
 
 
+def make_global_pool():
+    """ControlNet config global_pool_conditions: the pipeline takes guess mode
+    from the first net's flag; the pooled net averages its residuals over H, W."""
+    if os.path.isdir(GLOBAL_POOL_DIR):
+        shutil.rmtree(GLOBAL_POOL_DIR)
+    os.makedirs(GLOBAL_POOL_DIR)
+    shutil.copy(os.path.join(CONTROLNET_DIR, "diffusion_pytorch_model.safetensors"),
+                GLOBAL_POOL_DIR)
+    with open(os.path.join(CONTROLNET_DIR, "config.json")) as f:
+        config = json.load(f)
+    config["global_pool_conditions"] = True
+    with open(os.path.join(GLOBAL_POOL_DIR, "config.json"), "w") as f:
+        json.dump(config, f, indent=2, sort_keys=True)
+    folders = {"pool": os.path.basename(GLOBAL_POOL_DIR),
+               "plain": os.path.basename(CONTROLNET_DIR)}
+    control_images = [byte_image(torch.Generator().manual_seed(SEED + 60 + pos), 3)
+                      for pos in range(2)]
+    latents = initial_latents()
+    cases = []
+    for name, kinds, scales in (("global_pool", ["pool"], [0.8]),
+                                ("global_pool_pair", ["pool", "pool"], [0.6, 0.4]),
+                                ("global_pool_second", ["plain", "pool"], [0.6, 0.4])):
+        nets = [ControlNetModel.from_pretrained(os.path.join(FIXTURES, folders[kind]),
+                                                torch_dtype=torch.float64)
+                for kind in kinds]
+        pipe = StableDiffusionControlNetPipeline(
+            controlnet=nets if len(nets) > 1 else nets[0], **base_components())
+        image_ids = list(range(len(kinds)))
+        images = [control_images[pos] for pos in image_ids]
+        out = run(pipe, {"image": images if len(images) > 1 else images[0],
+                         "controlnet_conditioning_scale":
+                             scales if len(scales) > 1 else scales[0]}, latents)
+        out.update(name=name, control_image_ids=image_ids, conditioning_scales=scales,
+                   control_guidance_start=[0.0] * len(kinds),
+                   control_guidance_end=[1.0] * len(kinds), guess_mode=False,
+                   controlnet_folders=[folders[kind] for kind in kinds])
+        cases.append(out)
+        print(name, out["timesteps"])
+    payload = {"image_size": IMAGE_SIZE, "steps": STEPS, "guidance_scale": GUIDANCE,
+               "prompt": PROMPT, "latents": chw(latents[0]),
+               "control_images": [hwc(image) for image in control_images],
+               "cases": cases}
+    with open(GLOBAL_POOL_IO, "w") as f:
+        json.dump(payload, f)
+
+
 def random_lora_layers(model, modules, seed):
     """Adds a LoRA adapter (r LORA_RANK, alpha LORA_ALPHA) on modules with
     random A and B; returns its config and peft state dict (float32)."""
@@ -819,6 +876,9 @@ if __name__ == "__main__":
     if "--composed-only" in sys.argv:
         make_composed()
         sys.exit(0)
+    if "--global-pool-only" in sys.argv:
+        make_global_pool()
+        sys.exit(0)
     if "--ip2p-only" in sys.argv:
         make_ip2p()
         sys.exit(0)
@@ -844,3 +904,4 @@ if __name__ == "__main__":
         make_ip2p()
         make_lora()
         make_composed()
+        make_global_pool()

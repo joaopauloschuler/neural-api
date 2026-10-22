@@ -93,9 +93,10 @@ type
     procedure SD15StepNoise(StepIndex: integer; Noise: TNNetVolume);
     procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
       const Expected: TJSONObject);
-    // Case CaseName of tiny_sd15_composed_io.json: its ControlNets, T2I-Adapter,
-    // IP-Adapter and InstructPix2Pix together; steps and image < 1e-4.
-    procedure CheckSD15ComposedCase(const CaseName: string);
+    // Case CaseName of FileName: its ControlNets (folders controlnet_folders),
+    // T2I-Adapter, IP-Adapter and InstructPix2Pix together; steps and image < 1e-4.
+    procedure CheckSD15ComposedCase(const CaseName: string;
+      const FileName: string = 'tiny_sd15_composed_io.json');
     // FileName's width x height plain run: step-0 UNet, steps and image < 1e-4.
     procedure CheckSD15SizedParity(const FileName: string);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
@@ -1292,6 +1293,9 @@ type
     procedure TestStableDiffusionControlNetGuidanceWindowParity;
     procedure TestStableDiffusionControlNetGuessModeParity;
     procedure TestStableDiffusionMultiControlNetParity;
+    procedure TestStableDiffusionControlNetGlobalPoolParity;
+    procedure TestStableDiffusionMultiControlNetGlobalPoolParity;
+    procedure TestStableDiffusionControlNetGlobalPoolSecondParity;
     procedure TestStableDiffusionControlNetAdapterIPParity;
     procedure TestStableDiffusionIPAdapterInstructPix2PixParity;
     procedure TestStableDiffusionMultiConditionerRefuses;
@@ -46471,7 +46475,8 @@ begin
   end;
 end;
 
-procedure TTestNeuralPretrained.CheckSD15ComposedCase(const CaseName: string);
+procedure TTestNeuralPretrained.CheckSD15ComposedCase(const CaseName: string;
+  const FileName: string);
 var
   Pipeline: TStableDiffusionPipeline;
   Multi: TStableDiffusionMultiConditioner;
@@ -46481,9 +46486,10 @@ var
   IPAdapter: TStableDiffusionIPAdapter;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   Root, Entry: TJSONObject;
-  Cases, ImageIds: TJSONArray;
+  Cases, ImageIds, ControlNetFolders: TJSONArray;
   Picture: TNNetVolume;
   CasePos, ImagePos, MemberPos: integer;
+  ControlNetFolder: string;
 
   procedure AddMember(Member: TStableDiffusionConditioner);
   begin
@@ -46493,7 +46499,7 @@ var
   end;
 
 begin
-  FSD15Oracle := LoadSD15Fixture('tiny_sd15_composed_io.json');
+  FSD15Oracle := LoadSD15Fixture(FileName);
   Root := TJSONObject(FSD15Oracle);
   Entry := nil;
   Cases := Root.Arrays['cases'];
@@ -46525,10 +46531,14 @@ begin
     else
     begin
       ImageIds := Entry.Arrays['control_image_ids'];
+      ControlNetFolders := Entry.Get('controlnet_folders', TJSONArray(nil));
       for ImagePos := 0 to ImageIds.Count - 1 do
       begin
+        ControlNetFolder := 'tiny_sd15_controlnet';
+        if Assigned(ControlNetFolders) then
+          ControlNetFolder := ControlNetFolders.Strings[ImagePos];
         ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
-          FixturePath('tiny_sd15_controlnet/config.json')));
+          FixturePath(ControlNetFolder + '/config.json')));
         AddMember(ControlNet);
         LoadNestedOracleVolume(Root.Arrays['control_images'].Items[
           ImageIds.Integers[ImagePos]], false, Picture);
@@ -46601,6 +46611,29 @@ end;
 procedure TTestNeuralPretrained.TestStableDiffusionMultiControlNetParity;
 begin
   CheckSD15ComposedCase('multi_controlnet');
+end;
+
+// ControlNet config global_pool_conditions: guess mode forced, the residuals
+// mean-pooled over H, W (scale 0.8).
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetGlobalPoolParity;
+begin
+  CheckSD15ComposedCase('global_pool',
+    'tiny_sd15_controlnet_global_pool_io.json');
+end;
+
+// Two pooled ControlNets: the first one's flag forces guess mode on both.
+procedure TTestNeuralPretrained.TestStableDiffusionMultiControlNetGlobalPoolParity;
+begin
+  CheckSD15ComposedCase('global_pool_pair',
+    'tiny_sd15_controlnet_global_pool_io.json');
+end;
+
+// A pooled ControlNet after a plain one: no guess mode (diffusers reads only
+// the first net's flag), the second still pooled.
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetGlobalPoolSecondParity;
+begin
+  CheckSD15ComposedCase('global_pool_second',
+    'tiny_sd15_controlnet_global_pool_io.json');
 end;
 
 // ControlNet + T2I-Adapter + IP-Adapter in one UNet (the oracle adds the

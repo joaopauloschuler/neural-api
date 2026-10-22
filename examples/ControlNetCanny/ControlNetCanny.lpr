@@ -23,6 +23,10 @@ control_guidance_start / _end and guess_mode). --ip-adapter FILE --ip-image PNG
 [--ip-scale S] adds an h94/IP-Adapter image prompt on top of the ControlNet
 (TStableDiffusionMultiConditioner).
 
+A second --controlnet DIR adds another ControlNet (diffusers MultiControlNet);
+--control, --photo, --edges-out, --scale, --control-start and --control-end
+apply to the latest --controlnet (to the first one before any).
+
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
 This program is free software; you can redistribute it and/or modify
@@ -44,13 +48,18 @@ const
   PicoControlNetFolder = '../../tests/fixtures/tiny_sd15_controlnet';
 
 type
+  // One --controlnet and the per-ControlNet options that follow it.
+  TControlNetEntry = record
+    Folder, ControlFile, PhotoFile, EdgesFile: string;
+    ConditioningScale, ControlStart, ControlEnd: double;
+  end;
+
   TControlNetCannyOptions = record
-    ModelFolder, ControlNetFolder, ControlFile, PhotoFile, EdgesFile, Prompt,
-      NegativePrompt, OutputFile: string;
+    ModelFolder, Prompt, NegativePrompt, OutputFile: string;
+    ControlNets: array of TControlNetEntry;
     // A side < 1: the checkpoint default (512 for SD 1.5).
     Steps, ImageWidth, ImageHeight: integer;
-    GuidanceScale, ConditioningScale: double;
-    ControlStart, ControlEnd: double;
+    GuidanceScale: double;
     GuessMode: boolean;
     // --ip-adapter weights file and --ip-image; '' for none.
     IPAdapterFile, IPImageFile: string;
@@ -92,7 +101,7 @@ begin
   WriteLn('  --model DIR       diffusers Stable Diffusion 1.x folder ',
     '(default: the pico fixture)');
   WriteLn('  --controlnet DIR  diffusers ControlNetModel folder ',
-    '(default: the pico fixture)');
+    '(default: the pico fixture); repeat for several');
   WriteLn('  --control FILE    control image, e.g. a canny edge map ',
     '(default: drawn outlines)');
   WriteLn('  --photo FILE      photo to extract canny edges from instead ',
@@ -102,6 +111,8 @@ begin
   WriteLn('  --canny-blur R    Gaussian blur radius before canny ',
     '(default 0: none, as cv2.Canny)');
   WriteLn('  --edges-out PNG   also save the extracted edge map');
+  WriteLn('                    (--control, --photo, --edges-out, --scale, ',
+    '--control-start, --control-end: of the latest --controlnet)');
   WriteLn('  --prompt TEXT     prompt (default "a futuristic city, ',
     'detailed, sharp focus")');
   WriteLn('  --negative TEXT   negative prompt (default empty)');
@@ -132,10 +143,22 @@ begin
   WriteLn('  --gpu-device N    OpenCL device index (default 0)');
 end;
 
+function DefaultControlNetEntry(const Folder: string): TControlNetEntry;
+begin
+  Result.Folder := Folder;
+  Result.ControlFile := '';
+  Result.PhotoFile := '';
+  Result.EdgesFile := '';
+  Result.ConditioningScale := 1.0;
+  Result.ControlStart := 0;
+  Result.ControlEnd := 1;
+end;
+
 function ParseOptions(out Opt: TControlNetCannyOptions): boolean;
 var
-  ArgPos: integer;
+  ArgPos, EntryPos, MaxEntryPos: integer;
   Arg: string;
+  ControlNetFolderGiven: boolean;
 
   function NextArg(): string;
   begin
@@ -147,10 +170,9 @@ var
 
 begin
   Opt.ModelFolder := PicoModelFolder;
-  Opt.ControlNetFolder := PicoControlNetFolder;
-  Opt.ControlFile := '';
-  Opt.PhotoFile := '';
-  Opt.EdgesFile := '';
+  SetLength(Opt.ControlNets, 1);
+  Opt.ControlNets[0] := DefaultControlNetEntry(PicoControlNetFolder);
+  ControlNetFolderGiven := false;
   Opt.CannyLow := 100;
   Opt.CannyHigh := 200;
   Opt.CannyBlur := 0;
@@ -161,9 +183,6 @@ begin
   Opt.ImageWidth := 0;
   Opt.ImageHeight := 0;
   Opt.GuidanceScale := 7.5;
-  Opt.ConditioningScale := 1.0;
-  Opt.ControlStart := 0;
-  Opt.ControlEnd := 1;
   Opt.GuessMode := false;
   Opt.IPAdapterFile := '';
   Opt.IPImageFile := '';
@@ -178,11 +197,23 @@ begin
   while ArgPos <= ParamCount do
   begin
     Arg := ParamStr(ArgPos);
+    EntryPos := High(Opt.ControlNets);
     if Arg = '--model' then Opt.ModelFolder := NextArg()
-    else if Arg = '--controlnet' then Opt.ControlNetFolder := NextArg()
-    else if Arg = '--control' then Opt.ControlFile := NextArg()
-    else if Arg = '--photo' then Opt.PhotoFile := NextArg()
-    else if Arg = '--edges-out' then Opt.EdgesFile := NextArg()
+    else if Arg = '--controlnet' then
+    begin
+      if ControlNetFolderGiven then
+      begin
+        SetLength(Opt.ControlNets, Length(Opt.ControlNets) + 1);
+        Opt.ControlNets[EntryPos + 1] := DefaultControlNetEntry(NextArg());
+      end
+      else Opt.ControlNets[0].Folder := NextArg();
+      ControlNetFolderGiven := true;
+    end
+    else if Arg = '--control' then
+      Opt.ControlNets[EntryPos].ControlFile := NextArg()
+    else if Arg = '--photo' then Opt.ControlNets[EntryPos].PhotoFile := NextArg()
+    else if Arg = '--edges-out' then
+      Opt.ControlNets[EntryPos].EdgesFile := NextArg()
     else if Arg = '--canny-low' then
       Opt.CannyLow := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--canny-high' then
@@ -203,11 +234,14 @@ begin
     else if Arg = '--guidance' then
       Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--scale' then
-      Opt.ConditioningScale := StrToFloat(NextArg(), DefaultFormatSettings)
+      Opt.ControlNets[EntryPos].ConditioningScale :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--control-start' then
-      Opt.ControlStart := StrToFloat(NextArg(), DefaultFormatSettings)
+      Opt.ControlNets[EntryPos].ControlStart :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--control-end' then
-      Opt.ControlEnd := StrToFloat(NextArg(), DefaultFormatSettings)
+      Opt.ControlNets[EntryPos].ControlEnd :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--guess-mode' then Opt.GuessMode := true
     else if Arg = '--ip-adapter' then Opt.IPAdapterFile := NextArg()
     else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
@@ -229,8 +263,12 @@ begin
     Inc(ArgPos);
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
-  if (Opt.ControlFile <> '') and (Opt.PhotoFile <> '') then
-    raise Exception.Create('pass --control or --photo, not both');
+  MaxEntryPos := High(Opt.ControlNets);
+  for EntryPos := 0 to MaxEntryPos do
+    if (Opt.ControlNets[EntryPos].ControlFile <> '') and
+      (Opt.ControlNets[EntryPos].PhotoFile <> '') then
+      raise Exception.Create('pass --control or --photo, not both, for ' +
+        Opt.ControlNets[EntryPos].Folder);
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
 end;
@@ -267,23 +305,51 @@ begin
     end;
 end;
 
+// Control := the entry's control image: its --control file, the canny edges
+// of its --photo at the image size, or the drawn outlines.
+procedure LoadControlImage(const Entry: TControlNetEntry; const Opt:
+  TControlNetCannyOptions; ImageWidth, ImageHeight: integer;
+  Control, Photo: TNNetVolume);
+begin
+  if Entry.ControlFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.ControlFile, Control) then
+      raise Exception.Create('could not read ' + Entry.ControlFile);
+  end
+  else if Entry.PhotoFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.PhotoFile, Photo) then
+      raise Exception.Create('could not read ' + Entry.PhotoFile);
+    ResizeImagePIL(Photo, Photo, ImageWidth, ImageHeight, irfLanczos, true);
+    GaussianBlurImage(Photo, Photo, Opt.CannyBlur);
+    CannyEdges(Photo, Control, Opt.CannyLow, Opt.CannyHigh, false, 3);
+    if (Entry.EdgesFile <> '') and
+      not SaveImageFromVolumeIntoFile(Control, Entry.EdgesFile) then
+      raise Exception.Create('could not save ' + Entry.EdgesFile);
+  end
+  else DrawEdgeMap(Control, ImageWidth, ImageHeight);
+end;
+
 procedure Run(const Opt: TControlNetCannyOptions);
 var
   Pipeline: TStableDiffusionPipeline;
-  ControlNet: TStableDiffusionControlNet;
+  ControlNets: array of TStableDiffusionControlNet;
   IPAdapter: TStableDiffusionIPAdapter;
   Multi: TStableDiffusionMultiConditioner;
   Reporter: TControlNetReporter;
   Control, Image: TNNetVolume;
   ComputeText: string;
-  ImageWidth, ImageHeight: integer;
+  Entry: TControlNetEntry;
+  ImageWidth, ImageHeight, EntryPos, MaxEntryPos: integer;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
   OpenCLText: string;
   {$ENDIF}
 begin
+  MaxEntryPos := High(Opt.ControlNets);
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
-  ControlNet := TStableDiffusionControlNet.Create(Opt.ControlNetFolder);
+  SetLength(ControlNets, Length(Opt.ControlNets));
+  for EntryPos := 0 to MaxEntryPos do ControlNets[EntryPos] := nil;
   IPAdapter := nil;
   Multi := nil;
   Reporter := TControlNetReporter.Create;
@@ -305,29 +371,19 @@ begin
     if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
     ImageHeight := Opt.ImageHeight;
     if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
-    if Opt.ControlFile <> '' then
+    for EntryPos := 0 to MaxEntryPos do
     begin
-      if not LoadImageFromFileIntoVolume(Opt.ControlFile, Control) then
-        raise Exception.Create('could not read ' + Opt.ControlFile);
-    end
-    else if Opt.PhotoFile <> '' then
-    begin
-      if not LoadImageFromFileIntoVolume(Opt.PhotoFile, Image) then
-        raise Exception.Create('could not read ' + Opt.PhotoFile);
-      ResizeImagePIL(Image, Image, ImageWidth, ImageHeight, irfLanczos, true);
-      GaussianBlurImage(Image, Image, Opt.CannyBlur);
-      CannyEdges(Image, Control, Opt.CannyLow, Opt.CannyHigh, false, 3);
-      if (Opt.EdgesFile <> '') and
-        not SaveImageFromVolumeIntoFile(Control, Opt.EdgesFile) then
-        raise Exception.Create('could not save ' + Opt.EdgesFile);
-    end
-    else DrawEdgeMap(Control, ImageWidth, ImageHeight);
-    ControlNet.SetControlImage(Control);
-    ControlNet.ConditioningScale := Opt.ConditioningScale;
-    ControlNet.GuidanceStart := Opt.ControlStart;
-    ControlNet.GuidanceEnd := Opt.ControlEnd;
-    ControlNet.GuessMode := Opt.GuessMode;
-    Pipeline.Conditioner := ControlNet;
+      ControlNets[EntryPos] := TStableDiffusionControlNet.Create(
+        Opt.ControlNets[EntryPos].Folder);
+      LoadControlImage(Opt.ControlNets[EntryPos], Opt, ImageWidth, ImageHeight,
+        Control, Image);
+      ControlNets[EntryPos].SetControlImage(Control);
+      ControlNets[EntryPos].ConditioningScale :=
+        Opt.ControlNets[EntryPos].ConditioningScale;
+      ControlNets[EntryPos].GuidanceStart := Opt.ControlNets[EntryPos].ControlStart;
+      ControlNets[EntryPos].GuidanceEnd := Opt.ControlNets[EntryPos].ControlEnd;
+      ControlNets[EntryPos].GuessMode := Opt.GuessMode;
+    end;
     if Opt.IPAdapterFile <> '' then
     begin
       IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
@@ -335,9 +391,14 @@ begin
         raise Exception.Create('could not read ' + Opt.IPImageFile);
       IPAdapter.SetImage(Image);
       IPAdapter.Scale := Opt.IPScale;
+    end;
+    if (MaxEntryPos = 0) and (IPAdapter = nil) then
+      Pipeline.Conditioner := ControlNets[0]
+    else
+    begin
       Multi := TStableDiffusionMultiConditioner.Create();
-      Multi.Add(ControlNet);
-      Multi.Add(IPAdapter);
+      for EntryPos := 0 to MaxEntryPos do Multi.Add(ControlNets[EntryPos]);
+      if Assigned(IPAdapter) then Multi.Add(IPAdapter);
       Pipeline.Conditioner := Multi;
     end;
     Pipeline.GuidanceScale := Opt.GuidanceScale;
@@ -347,25 +408,33 @@ begin
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     WriteLn('Model:      ', Opt.ModelFolder);
-    WriteLn('ControlNet: ', Opt.ControlNetFolder);
-    if Opt.ControlFile <> '' then WriteLn('Control:    ', Opt.ControlFile)
-    else if Opt.PhotoFile <> '' then
-      WriteLn(Format('Control:    canny edges of %s (low %.0f, high %.0f, ' +
-        'blur %.2f)', [Opt.PhotoFile, Opt.CannyLow, Opt.CannyHigh,
-        Opt.CannyBlur]))
-    else WriteLn('Control:    drawn circle and square outlines');
-    if (Opt.ControlStart > 0) or (Opt.ControlEnd < 1) or Opt.GuessMode then
-      WriteLn(Format('Window:     steps %.2f..%.2f of the run, guess mode %s',
-        [Opt.ControlStart, Opt.ControlEnd, BoolToStr(Opt.GuessMode, 'on',
-        'off')]));
+    for EntryPos := 0 to MaxEntryPos do
+    begin
+      Entry := Opt.ControlNets[EntryPos];
+      WriteLn(Format('ControlNet: %s, scale %.2f', [Entry.Folder,
+        Entry.ConditioningScale]));
+      if ControlNets[EntryPos].Config.GlobalPoolConditions then
+        WriteLn('            global_pool_conditions: pooled residuals');
+      if Entry.ControlFile <> '' then WriteLn('Control:    ', Entry.ControlFile)
+      else if Entry.PhotoFile <> '' then
+        WriteLn(Format('Control:    canny edges of %s (low %.0f, high %.0f, ' +
+          'blur %.2f)', [Entry.PhotoFile, Opt.CannyLow, Opt.CannyHigh,
+          Opt.CannyBlur]))
+      else WriteLn('Control:    drawn circle and square outlines');
+      if (Entry.ControlStart > 0) or (Entry.ControlEnd < 1) then
+        WriteLn(Format('Window:     steps %.2f..%.2f of the run',
+          [Entry.ControlStart, Entry.ControlEnd]));
+    end;
+    if Opt.GuessMode or ControlNets[0].Config.GlobalPoolConditions then
+      WriteLn('Guess mode: on');
     if Assigned(IPAdapter) then
       WriteLn(Format('IP-Adapter: %s, image %s (%dx%d), scale %.2f',
         [Opt.IPAdapterFile, Opt.IPImageFile, Image.SizeX, Image.SizeY,
          Opt.IPScale]));
     WriteLn('Prompt:     "', Opt.Prompt, '"');
-    WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, scale %.2f, ' +
-      'seed %d, %s', [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale,
-      Opt.ConditioningScale, Opt.Seed, ComputeText]));
+    WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, seed %d, %s',
+      [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
+      ComputeText]));
     if Pipeline.SamplerNotice <> '' then
       WriteLn('Notice:     ', Pipeline.SamplerNotice);
     // Euler a draws its per-step noise from the global RNG.
@@ -385,7 +454,7 @@ begin
     Pipeline.Free;
     Multi.Free;
     IPAdapter.Free;
-    ControlNet.Free;
+    for EntryPos := 0 to MaxEntryPos do ControlNets[EntryPos].Free;
   end;
 end;
 
@@ -395,7 +464,7 @@ begin
   try
     if not ParseOptions(Options) then exit;
     if (Options.ModelFolder = PicoModelFolder) or
-      (Options.ControlNetFolder = PicoControlNetFolder) then
+      (Options.ControlNets[0].Folder = PicoControlNetFolder) then
       WriteLn('Pico fixture in use: random weights (wiring check only).');
     Run(Options);
   except
