@@ -21,7 +21,9 @@ and text encoder weights in int8. --stats prints a per-image stage table
 loads a textual inversion concept, as diffusers load_textual_inversion.
 --ip-adapter FILE --ip-image PNG [--ip-scale S] adds an image prompt through an
 h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
-diffusers load_ip_adapter + set_ip_adapter_scale.
+diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
+[--strength S] turns it into image-to-image (diffusers
+StableDiffusionImg2ImgPipeline): the output takes the image's size.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -54,6 +56,9 @@ type
     // --ip-adapter weights file and --ip-image; '' for none.
     IPAdapterFile, IPImageFile: string;
     IPScale: double;
+    // --init-image ('' for text-to-image) and its --strength.
+    InitImageFile: string;
+    Strength: double;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
@@ -189,6 +194,13 @@ begin
   WriteLn('  --ip-image PNG    the image prompt of --ip-adapter');
   WriteLn('  --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the ',
     'image)');
+  WriteLn('  --init-image PNG  image-to-image from this image; the output ',
+    'takes its size');
+  WriteLn('                    (rounded down to the VAE factor) unless ',
+    '--width/--height');
+  WriteLn('  --strength S      how much of --init-image to repaint, (0, 1] ',
+    '(default 0.8);');
+  WriteLn('                    runs the last int(steps * S) steps');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -241,6 +253,8 @@ begin
   Opt.IPAdapterFile := '';
   Opt.IPImageFile := '';
   Opt.IPScale := 1.0;
+  Opt.InitImageFile := '';
+  Opt.Strength := -1;
   Opt.SamplerName := 'auto';
   Opt.Steps := 25;
   Opt.ImageWidth := 0;
@@ -285,6 +299,9 @@ begin
     else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
     else if Arg = '--ip-scale' then
       Opt.IPScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
+    else if Arg = '--strength' then
+      Opt.Strength := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -304,6 +321,10 @@ begin
   if Opt.RepeatCount < 1 then raise Exception.Create('--repeat must be >= 1');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
+  if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
+    raise Exception.Create('--strength needs --init-image');
+  if (Opt.InitImageFile <> '') and (Opt.IPAdapterFile <> '') then
+    raise Exception.Create('--init-image and --ip-adapter cannot be combined');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
@@ -338,6 +359,7 @@ var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
   IPAdapter: TStableDiffusionIPAdapter;
+  Img2Img: TStableDiffusionImg2Img;
   Image, PromptEmbeds: TNNetVolume;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos: integer;
@@ -351,6 +373,7 @@ begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   IPAdapter := nil;
+  Img2Img := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
   try
@@ -365,10 +388,20 @@ begin
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
     end;
-    ImageWidth := Opt.ImageWidth;
-    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
-    ImageHeight := Opt.ImageHeight;
-    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
+    ImageWidth := Pipeline.DefaultImageSize;
+    ImageHeight := Pipeline.DefaultImageSize;
+    if Opt.InitImageFile <> '' then
+    begin
+      Img2Img := TStableDiffusionImg2Img.Create();
+      if not LoadImageFromFileIntoVolume(Opt.InitImageFile, Image) then
+        raise Exception.Create('could not load ' + Opt.InitImageFile);
+      Img2Img.SetImage(Image);
+      if Opt.Strength >= 0 then Img2Img.Strength := Opt.Strength;
+      Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+      Pipeline.Conditioner := Img2Img;
+    end;
+    if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
+    if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
     Pipeline.GuidanceScale := Opt.GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.UNetInt8 := Opt.UseInt8;
@@ -400,6 +433,11 @@ begin
         EmbeddingToken);
       WriteLn('Embedding: ', EmbeddingToken, ' from ', EmbeddingFile);
     end;
+    if Assigned(Img2Img) then
+      WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
+        [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
+         Opt.Steps - TNNetDiffusionScheduler.Img2ImgStartStep(Opt.Steps,
+         Img2Img.Strength), Opt.Steps]));
     if Opt.IPAdapterFile <> '' then
     begin
       IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
@@ -427,8 +465,8 @@ begin
       ImageFile := ImageFileName(Opt.OutputFile, ImagePos, Opt.RepeatCount);
       if Opt.RepeatCount > 1 then
         WriteLn('Image ', ImagePos + 1, '/', Opt.RepeatCount, ', seed ', Seed);
-      // Euler a draws its per-step noise from the global RNG; the initial
-      // latents use Seed itself, so this stream starts elsewhere.
+      // Euler a and the img2img VAE sample draw their noise from the global
+      // RNG; the initial latents use Seed itself, so this stream starts elsewhere.
       RandSeed := Seed xor $9E3779B9;
       StartTime := Now();
       if Opt.RepeatCount > 1 then
@@ -457,6 +495,7 @@ begin
     Image.Free;
     Pipeline.Free;
     IPAdapter.Free;
+    Img2Img.Free;
     Reporter.Free;
   end;
 end;

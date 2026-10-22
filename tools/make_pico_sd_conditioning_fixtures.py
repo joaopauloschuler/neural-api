@@ -43,6 +43,13 @@ not matter; values rounded to 10 digits):
       injected (randn_tensor and retrieve_latents patched), so the VAE latents
       are sampled as diffusers does: mean + std * noise.
 
+  tests/fixtures/tiny_sd15_img2img_io.json
+      StableDiffusionImg2ImgPipeline on tiny_sd15: a IMG2IMG_WIDTH x
+      IMG2IMG_HEIGHT image, STRENGTH_STEPS steps at strength STRENGTH with
+      DDIM, PNDM (PLMS), DPM++ 2M, Euler and Euler a, and DDIM at strength 1.
+      The noise, the unit noise of the image latent sample and Euler a's
+      per-step noise ("step_noise") are injected.
+
   tests/fixtures/tiny_sd15_controlnet_nonsquare_io.json
       the ControlNet run at CONTROLNET_WIDTH x CONTROLNET_HEIGHT, a 7x5 latent
       grid (odd, so the UNet resizes its upsamples to the skips); check_inputs
@@ -68,9 +75,11 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py --nonsquare-only
   python tools/make_pico_sd_conditioning_fixtures.py --inpaint-strength-only
   python tools/make_pico_sd_conditioning_fixtures.py --ip-adapter-only
+  python tools/make_pico_sd_conditioning_fixtures.py --img2img-only
 (--nonsquare-only keeps the committed folders and writes only the two
 non-square files; --inpaint-strength-only writes only the strength file;
---ip-adapter-only writes only the IP-Adapter folder and its file.)
+--ip-adapter-only writes only the IP-Adapter folder and its file;
+--img2img-only writes only the img2img file.)
 """
 import json
 import os
@@ -82,12 +91,16 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file, save_file
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
-from diffusers import (ControlNetModel, EulerDiscreteScheduler,
-                       StableDiffusionAdapterPipeline,
+from diffusers import (ControlNetModel, DPMSolverMultistepScheduler,
+                       EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
+                       PNDMScheduler, StableDiffusionAdapterPipeline,
                        StableDiffusionControlNetPipeline,
+                       StableDiffusionImg2ImgPipeline,
                        StableDiffusionInpaintPipeline, StableDiffusionPipeline,
                        T2IAdapter, UNet2DConditionModel)
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint as inpaint_module
+import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
+import diffusers.schedulers.scheduling_euler_ancestral_discrete as euler_a_module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "..", "tests", "fixtures")
@@ -99,6 +112,7 @@ CONTROLNET_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_io.json")
 ADAPTER_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_io.json")
 INPAINT_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_io.json")
 INPAINT_STRENGTH_IO = os.path.join(FIXTURES, "tiny_sd15_inpaint_strength_io.json")
+IMG2IMG_IO = os.path.join(FIXTURES, "tiny_sd15_img2img_io.json")
 CONTROLNET_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_controlnet_nonsquare_io.json")
 ADAPTER_NONSQUARE_IO = os.path.join(FIXTURES, "tiny_sd15_t2i_adapter_nonsquare_io.json")
 IP_ADAPTER_DIR = os.path.join(FIXTURES, "tiny_sd15_ip_adapter")
@@ -116,6 +130,8 @@ CONTROLNET_SCALE = 0.5
 ADAPTER_SCALE = 0.8
 STRENGTH = 0.6
 STRENGTH_STEPS = 5
+IMG2IMG_WIDTH = 16
+IMG2IMG_HEIGHT = 12
 IP_SCALE = 0.7
 IP_IMAGE_WIDTH = 20      # resized (shortest edge) and center-cropped to 8x8
 IP_IMAGE_HEIGHT = 13
@@ -157,7 +173,7 @@ def initial_latents(width=IMAGE_SIZE, height=IMAGE_SIZE):
 
 
 def run(pipe, extra, latents, euler=False, legacy_callback=False,
-        width=IMAGE_SIZE, height=IMAGE_SIZE, steps=STEPS):
+        width=IMAGE_SIZE, height=IMAGE_SIZE, steps=STEPS, sized=True):
     pipe.set_progress_bar_config(disable=True)
     if width % 8 or height % 8:
         pipe.check_inputs = lambda *args, **kwargs: None
@@ -178,9 +194,11 @@ def run(pipe, extra, latents, euler=False, legacy_callback=False,
                      callback_steps=1)
     else:
         extra = dict(extra, callback_on_step_end=on_step_end)
-    result = pipe(PROMPT, height=height, width=width,
-                  num_inference_steps=steps, guidance_scale=GUIDANCE,
-                  latents=None if latents is None else latents.clone(),
+    if sized:
+        # img2img takes its size from the image and draws its own noise.
+        extra = dict(extra, height=height, width=width,
+                     latents=None if latents is None else latents.clone())
+    result = pipe(PROMPT, num_inference_steps=steps, guidance_scale=GUIDANCE,
                   output_type="np", **extra)
     return {"timesteps": [int(t) for t in pipe.scheduler.timesteps],
             "latents_after": after,
@@ -352,6 +370,61 @@ def make_inpaint_strength():
         json.dump(payload, f)
 
 
+def make_img2img():
+    image = byte_image(torch.Generator().manual_seed(SEED + 30), 3,
+                       IMG2IMG_WIDTH, IMG2IMG_HEIGHT)
+    noise = initial_latents(IMG2IMG_WIDTH, IMG2IMG_HEIGHT)
+    generator = torch.Generator().manual_seed(SEED + 31)
+    image_noise = torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+    step_noise = [torch.randn(noise.shape, generator=generator, dtype=torch.float64)
+                  for _ in range(STRENGTH_STEPS)]
+    img2img_module.retrieve_latents = (
+        lambda output, generator=None, sample_mode="sample":
+        output.latent_dist.mean + output.latent_dist.std * image_noise)
+    img2img_module.randn_tensor = lambda *args, **kwargs: noise.clone()
+    pending_step_noise = []
+    euler_a_module.randn_tensor = lambda *args, **kwargs: pending_step_noise.pop(0).clone()
+    base = StableDiffusionImg2ImgPipeline.from_pretrained(
+        PICO_DIR, torch_dtype=torch.float64, safety_checker=None)
+    base_config = base.scheduler.config
+    cases = []
+    for name, scheduler, strength in (
+            ("ddim_strength", None, STRENGTH),
+            ("ddim_full_strength", None, 1.0),
+            ("pndm_strength", PNDMScheduler.from_config(base_config, skip_prk_steps=True), STRENGTH),
+            ("dpmpp2m_strength", DPMSolverMultistepScheduler.from_config(base_config), STRENGTH),
+            ("euler_strength", EulerDiscreteScheduler.from_config(base_config), STRENGTH),
+            ("euler_a_strength", EulerAncestralDiscreteScheduler.from_config(base_config), STRENGTH)):
+        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            PICO_DIR, torch_dtype=torch.float64, safety_checker=None)
+        if scheduler is not None:
+            pipe.scheduler = scheduler
+        pending_step_noise[:] = step_noise
+        euler = isinstance(pipe.scheduler, (EulerDiscreteScheduler,
+                                            EulerAncestralDiscreteScheduler))
+        out = run(pipe, {"image": image, "strength": strength}, None, euler,
+                  steps=STRENGTH_STEPS, sized=False)
+        # The steps that ran: get_timesteps keeps the last ones.
+        out["timesteps"] = out["timesteps"][-len(out["latents_after"]):]
+        out["name"] = name
+        out["scheduler"] = type(pipe.scheduler).__name__
+        # Strict JSON: drop non-finite values (DPM++ lambda_min_clipped = -inf).
+        out["scheduler_config"] = {
+            key: value for key, value in pipe.scheduler.config.items()
+            if not (isinstance(value, float) and not numpy.isfinite(value))}
+        out["strength"] = strength
+        cases.append(out)
+        print(name, out["timesteps"], len(out["latents_after"]), "steps run")
+    payload = {"width": IMG2IMG_WIDTH, "height": IMG2IMG_HEIGHT,
+               "steps": STRENGTH_STEPS, "guidance_scale": GUIDANCE,
+               "prompt": PROMPT, "init_image": hwc(image),
+               "latents": chw(noise[0]), "image_sample_noise": chw(image_noise[0]),
+               "step_noise": [chw(item[0]) for item in step_noise],
+               "cases": cases}
+    with open(IMG2IMG_IO, "w") as f:
+        json.dump(payload, f)
+
+
 def make_controlnet_nonsquare():
     controlnet = ControlNetModel.from_pretrained(CONTROLNET_DIR, torch_dtype=torch.float64)
     pipe = StableDiffusionControlNetPipeline(controlnet=controlnet, **base_components())
@@ -454,11 +527,15 @@ if __name__ == "__main__":
     if "--inpaint-strength-only" in sys.argv:
         make_inpaint_strength()
         sys.exit(0)
+    if "--img2img-only" in sys.argv:
+        make_img2img()
+        sys.exit(0)
     if "--nonsquare-only" not in sys.argv:
         make_controlnet()
         make_adapter()
         make_inpaint()
         make_inpaint_strength()
+        make_img2img()
     make_controlnet_nonsquare()
     make_adapter_nonsquare()
     if "--nonsquare-only" not in sys.argv:

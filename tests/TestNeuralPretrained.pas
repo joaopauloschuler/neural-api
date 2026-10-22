@@ -62,6 +62,8 @@ type
     procedure SD15CheckStep(StepIndex, StepCount: integer; Timestep: double;
       Latents: TNNetVolume);
     procedure SD15CountPhase(Phase: TStableDiffusionPipelinePhase);
+    // Euler a step noise StepIndex from FSD15Oracle step_noise.
+    procedure SD15StepNoise(StepIndex: integer; Noise: TNNetVolume);
     procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
       const Expected: TJSONObject);
     // FileName's width x height plain run: step-0 UNet, steps and image < 1e-4.
@@ -1250,6 +1252,7 @@ type
     procedure TestSDUNetIPAdapterRefusesControl;
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
+    procedure TestStableDiffusionImg2ImgParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45546,6 +45549,13 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.SD15StepNoise(StepIndex: integer;
+  Noise: TNNetVolume);
+begin
+  LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['step_noise'].Items[
+    StepIndex], true, Noise);
+end;
+
 procedure TTestNeuralPretrained.SD15CountPhase(
   Phase: TStableDiffusionPipelinePhase);
 begin
@@ -46367,6 +46377,75 @@ begin
     Mask.Free;
     SourceImage.Free;
     Inpainter.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionImg2ImgPipeline float64 (tiny_sd15_img2img_io.json, injected
+// noise, sampled VAE latents, a 16x12 image): strength 0.6 of 5 guided steps
+// with DDIM, PNDM, DPM++ 2M, Euler and Euler a (replayed step noise), and DDIM
+// at strength 1.
+procedure TTestNeuralPretrained.TestStableDiffusionImg2ImgParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TStableDiffusionImg2Img;
+  Cases: TJSONArray;
+  Entry: TJSONObject;
+  SourceImage, ImageNoise: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight: integer;
+  Notice: string;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Img2Img := TStableDiffusionImg2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  try
+    AssertEquals('default strength', 0.8, Img2Img.Strength, 1e-12);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    AssertEquals('output width', TJSONObject(FSD15Oracle).Get('width', 0),
+      ImageWidth);
+    AssertEquals('output height', TJSONObject(FSD15Oracle).Get('height', 0),
+      ImageHeight);
+    Pipeline.Conditioner := Img2Img;
+    Pipeline.OnAncestralNoise := @SD15StepNoise;
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 6, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      Pipeline.Sampler := DiffusersSchedulerSampler(
+        Entry.Objects['scheduler_config'].AsJSON, Notice);
+      AssertEquals(Entry.Get('name', '') + ' notice', '', Notice);
+      Img2Img.Strength := Entry.Get('strength', 0.0);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+    end;
+    // diffusers get_default_height_width rounds the sides down.
+    SourceImage.ReSize(17, 13, 3);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    AssertEquals('17 rounded down', 16, ImageWidth);
+    AssertEquals('13 rounded down', 12, ImageHeight);
+    IsRefused := false;
+    try
+      Img2Img.Strength := 1.5;
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('strength 1.5 refused', IsRefused);
+  finally
+    ImageNoise.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    Img2Img.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;

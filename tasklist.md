@@ -680,11 +680,25 @@ rather than acted on.
               confirm the committed ControlNet / T2I / inpaint fixtures come out
               byte-identical after the --nonsquare-only / --inpaint-strength-only
               / --ip-adapter-only refactors;
-              (3) strength < 1 parity for PNDM, DPM++ 2M and Euler a (only DDIM
-              and Euler are covered);
-              (4) a plain img2img mode (TStableDiffusionImg2Img conditioner over
+              [X] (3) strength < 1 parity for PNDM, DPM++ 2M and Euler a (only DDIM
+              and Euler are covered); DONE 2026-10-22: all three match diffusers
+              at strength 0.6 on img2img (TestStableDiffusionImg2ImgParity, Euler a
+              through the new TStableDiffusionPipeline.OnAncestralNoise); no
+              sampler bug found;
+              [X] (4) a plain img2img mode (TStableDiffusionImg2Img conditioner over
               the DenoiseStrength / NoiseImageLatents hooks) plus
-              examples/StableDiffusion --init-image/--strength.
+              examples/StableDiffusion --init-image/--strength. DONE 2026-10-22:
+              TStableDiffusionInpainter now derives from TStableDiffusionImg2Img
+              (shared image / strength / sample noise / NoiseImageLatents); new
+              StartsFromImage hook (img2img starts from the noised image even at
+              strength 1, inpainting from pure noise); ImageSizeFor gives the
+              output size from the image;
+              (5) examples/DiffusionInpainting could take its output size from the
+              image through ImageSizeFor, as --init-image does;
+              (6) img2img / inpaint parity covers only images already at the
+              output size: add a fixture whose sides are not a VAE-factor
+              multiple (diffusers resizes a PIL image with lanczos after uint8
+              rounding, a tensor with torch interpolate) and check the resize.
       - [ ] InstructPix2Pix instruction-based image editing (port of diffusers
             StableDiffusionInstructPix2PixPipeline; checkpoint
             timbrooks/instruct-pix2pix: "make it winter", "turn him into a
@@ -1621,11 +1635,13 @@ rather than acted on.
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
 
-- [ ] Stable Diffusion img2img + inpainting follow-ups (on top of
+- [X] Stable Diffusion img2img + inpainting follow-ups (on top of
       BuildVaeEncoderFromSafeTensors, examples/ImageToImage and
       TStableDiffusionInpainter / examples/DiffusionInpainting): (1) [DONE:
       TStableDiffusionPipeline.EncodeVaeImage SampleNoise] the non-deterministic VAE reparameterize head
-      (mean+exp(0.5*logvar)*noise); (2) a fixed-seed img2img latent trajectory matching diffusers
+      (mean+exp(0.5*logvar)*noise); (2) [DONE 2026-10-22: TStableDiffusionImg2Img,
+      TestStableDiffusionImg2ImgParity on tiny_sd15_img2img_io.json, DDIM / PNDM /
+      DPM++ 2M / Euler / Euler a < 1e-4] a fixed-seed img2img latent trajectory matching diffusers
       `StableDiffusionImg2ImgPipeline` step-for-step.
 - [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
       model_type "kosmos-2", e.g. microsoft/kosmos-2-patch14-224). DISTINCT from the

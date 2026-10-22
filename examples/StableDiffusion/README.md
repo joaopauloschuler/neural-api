@@ -1,7 +1,7 @@
 # StableDiffusion
 
-Text-to-image with a diffusers Stable Diffusion 1.x folder, through
-`TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
+Text-to-image and image-to-image with a diffusers Stable Diffusion 1.x
+folder, through `TStableDiffusionPipeline` in `neural/neuralpretrained.pas`.
 
 One `Generate` call:
 
@@ -84,6 +84,27 @@ ip-adapter_sd15 and CLIP vision tower (`TestStableDiffusionIPAdapterParity`,
 `TestStableDiffusionIPAdapterScaleZero`). No real IP-Adapter has been run yet.
 IP-Adapter-Plus, FaceID and SDXL adapters are not supported.
 
+`--init-image PNG [--strength S]` turns the run into image-to-image, as
+diffusers `StableDiffusionImg2ImgPipeline` (`TStableDiffusionImg2Img`). The
+image is VAE-encoded (the latents are sampled: mean + std * noise), noised to
+the first timestep that runs, and denoised with the prompt. S (default 0.8)
+sets how much of the image is repainted: only the last `int(steps * S)` steps
+run, so `--steps 25 --strength 0.6` runs 15 UNet steps. S = 1 still starts
+from the noised image, not from pure noise. The output takes the image's size,
+rounded down to a multiple of the VAE factor; `--width` / `--height` resize
+the image instead. `--init-image` cannot be combined with `--ip-adapter`:
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --init-image sketch.png --strength 0.75 \
+  --prompt "a fantasy landscape, trending on artstation"
+```
+
+Tested against diffusers float64 on the pico folder at strength 0.6 with DDIM,
+PNDM, DPM-Solver++ 2M, Euler and Euler a (replayed step noise), and with DDIM
+at strength 1 (`TestStableDiffusionImg2ImgParity`). No real checkpoint has
+been run yet.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -128,6 +149,10 @@ StableDiffusion [--model DIR] [options]
                     image_encoder/ folder beside it; needs --ip-image
   --ip-image PNG    the image prompt of --ip-adapter
   --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the image)
+  --init-image PNG  image-to-image from this image; the output takes its size
+                    (rounded down to the VAE factor) unless --width/--height
+  --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);
+                    runs the last int(steps * S) steps
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)
@@ -183,8 +208,8 @@ Stages of image 2 (wall time):
   latent grid (`TestStableDiffusionPipelineOddSize`).
 * The weights must be F32 `*.safetensors`; the `*.fp16.safetensors` variant
   files are untested.
-* The noise (the initial latents and the Euler a step noise) comes from the
-  Free Pascal RNG, so a seed does not reproduce a diffusers image.
+* The noise (the initial latents, the Euler a step noise and the img2img VAE
+  sample) comes from the Free Pascal RNG, so a seed does not reproduce a diffusers image.
 * Every UNet pass recomputes the cross-attention K/V of the text states,
   which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
   pass, so the K/V are not cached.
