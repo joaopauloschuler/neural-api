@@ -121,7 +121,7 @@ type
     Content: string;
     Id: integer;
     Special: boolean;
-    // Matched against the ASCII-lowercased text (Content is lowercase), as HF
+    // Matched against the lowercased text (Content is lowercase), as HF
     // normalized added tokens on a lowercasing normalizer (CLIP).
     Normalized: boolean;
   end;
@@ -194,8 +194,8 @@ type
       FBertCleanText: boolean;    // BertNormalizer clean_text
       FBertHandleChinese: boolean;// BertNormalizer handle_chinese_chars
       FDecWordPieceCleanup: boolean; // WordPiece decoder cleanup flag
-      // CLIP (LoadCLIPVocabAndMerges): the CLIP split regex on lowercased text,
-      // byte-level alphabet, FEndOfWordSuffix on each piece's last symbol.
+      // CLIP (LoadCLIPVocabAndMerges, or the CLIP Split in a tokenizer.json):
+      // CLIP split, byte-level alphabet, FEndOfWordSuffix on the last symbol.
       FClipPreTok: boolean;
       FEndOfWordSuffix: string;
       // pre-tokenizer / normalizer
@@ -351,7 +351,7 @@ type
       procedure LoadSentencePieceModel(const FileName: string);
 
       // Loads a CLIP tokenizer from its slow-tokenizer files (the tokenizer/
-      // folder of Stable Diffusion 1.x/2.x: vocab.json + merges.txt).
+      // folder of Stable Diffusion 1.x/2.x); LoadFromFile reads tokenizer.json.
       procedure LoadCLIPVocabAndMerges(const VocabFile, MergesFile: string);
 
       // Loads the tokenizer straight from the tokenizer.ggml.* metadata of a
@@ -557,6 +557,11 @@ const
   csQwen35SplitPattern =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|' +
     '\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // CLIP (Removed, invert=true; SplitClipPieces). transformers prefixes it with
+  // the special-token alternatives csClipSpecialSplitPrefix.
+  csClipSplitPattern =
+    '''s|''t|''re|''ve|''m|''ll|''d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+';
+  csClipSpecialSplitPrefix = '<\|startoftext\|>|<\|endoftext\|>|';
   // Llama-3 / cl100k / GPT-4 style: digit runs capped at 3.
   csCl100kSplitPattern =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|' +
@@ -1190,6 +1195,32 @@ begin
   if (CP >= $179) and (CP <= $17E) and ((CP and 1) = 1) then Exit(CP + 1);
 end;
 
+// LowercaseCP over every code point of UTF-8 S. Keeps the byte length, so
+// byte positions in the result are the positions in S.
+function LowercaseCodePoints(const S: string): string;
+var
+  Position, CPStart, OutPos, TextLen: integer;
+  CP, LowerCP: cardinal;
+begin
+  Result := S;
+  UniqueString(Result);
+  TextLen := Length(S);
+  Position := 1;
+  while Position <= TextLen do
+  begin
+    CPStart := Position;
+    CP := NextCodePoint(S, Position);
+    LowerCP := LowercaseCP(CP);
+    // LowercaseCP stays below U+0180: one byte for ASCII, else two.
+    if (LowerCP <> CP) and
+      ((Position - CPStart = 1) = (LowerCP < $80)) then
+    begin
+      OutPos := CPStart - 1;
+      HFWriteCodePointUTF8(PAnsiChar(Result), OutPos, LowerCP);
+    end;
+  end;
+end;
+
 // Inverse of LowercaseCP over the same blocks (ASCII, Latin-1, Latin
 // Extended-A); every other code point comes back unchanged.
 function UppercaseCP(CP: cardinal): cardinal;
@@ -1779,6 +1810,8 @@ var
   SpacePos: integer;
   Node: TJSONData;
   ShieldedKeys: TStringList;
+  // Normalizers only the CLIP splitter supports, checked after pre_tokenizer.
+  HasLowercaseNormalizer, HasWhitespaceCollapse: boolean;
 
   procedure AddNormalizer(NormObj: TJSONObject);
   var
@@ -1796,6 +1829,13 @@ var
     end
     else if Kind = 'Prepend' then
       FNormPrepend := NormObj.Get('prepend', '')
+    else if (Kind = 'Replace') and
+      (NormObj.Objects['pattern'].Get('Regex', '') = '\s+') and
+      (NormObj.Get('content', '') = ' ') then
+      // CLIP: whitespace only separates pieces in SplitClipPieces.
+      HasWhitespaceCollapse := true
+    else if Kind = 'Lowercase' then
+      HasLowercaseNormalizer := true
     else if Kind = 'Replace' then
     begin
       SetLength(FNormReplaceFrom, Length(FNormReplaceFrom) + 1);
@@ -1999,6 +2039,18 @@ var
         if Pattern = '' then
           Pattern := TJSONObject(SubNode).Get('String', '');
       end;
+      if (Pattern = csClipSplitPattern) or
+        (Pattern = csClipSpecialSplitPrefix + csClipSplitPattern) then
+      begin
+        // The special-token alternatives need no code: an uncased one splits
+        // into the same pieces, and ByteLevel's regex re-splits a cased one.
+        if (PreObj.Get('behavior', '') <> 'Removed') or
+          not PreObj.Get('invert', false) then
+          raise EHFTokenizerError.Create('Unsupported CLIP Split behavior "' +
+            PreObj.Get('behavior', '') + '" (only Removed, invert=true)');
+        FClipPreTok := true;
+        Exit;
+      end;
       if (PreObj.Get('behavior', '') <> 'Isolated') or
         PreObj.Get('invert', false) then
         raise EHFTokenizerError.Create(
@@ -2148,6 +2200,14 @@ begin
     begin
       FWPPrefix := ModelObj.Get('continuing_subword_prefix', '##');
       FWPMaxChars := ModelObj.Get('max_input_chars_per_word', 100);
+    end
+    else if not FUnigram then
+    begin
+      FEndOfWordSuffix := ModelObj.Get('end_of_word_suffix', '');
+      if ModelObj.Get('continuing_subword_prefix', '') <> '' then
+        raise EHFTokenizerError.Create('Unsupported BPE ' +
+          'continuing_subword_prefix "' +
+          ModelObj.Get('continuing_subword_prefix', '') + '"');
     end;
 
     // vocab. BPE/WordPiece: an object token -> id. Unigram: an ARRAY of
@@ -2234,6 +2294,7 @@ begin
         FAddedTokens[Cnt].Content := Entry.Get('content', '');
         FAddedTokens[Cnt].Id := Entry.Get('id', -1);
         FAddedTokens[Cnt].Special := Entry.Get('special', false);
+        FAddedTokens[Cnt].Normalized := Entry.Get('normalized', false);
         Content := FAddedTokens[Cnt].Content;
         if FAddedTokens[Cnt].Special then
         begin
@@ -2251,6 +2312,8 @@ begin
     end;
 
     // ---- normalizer / pre_tokenizer / decoder -------------------
+    HasLowercaseNormalizer := false;
+    HasWhitespaceCollapse := false;
     Node := RootObj.Find('normalizer');
     if (Node <> nil) and (Node is TJSONObject) then
       AddNormalizer(TJSONObject(Node));
@@ -2263,6 +2326,27 @@ begin
     if FDigitsPreTok and (not FByteLevel) then
       raise EHFTokenizerError.Create(
         'Unsupported pre_tokenizer: Digits without ByteLevel');
+    if (HasLowercaseNormalizer or HasWhitespaceCollapse or
+      (FEndOfWordSuffix <> '')) and not FClipPreTok then
+      raise EHFTokenizerError.Create('Unsupported tokenizer.json: the ' +
+        'Lowercase / Replace(\s+) normalizers and end_of_word_suffix are ' +
+        'only supported with the CLIP Split pre_tokenizer');
+    if FClipPreTok and ((not FByteLevel) or FAddPrefixSpace) then
+      raise EHFTokenizerError.Create('Unsupported CLIP pre_tokenizer: the ' +
+        'Split must be followed by ByteLevel(add_prefix_space=false)');
+    if FClipPreTok then FBertLowercase := HasLowercaseNormalizer;
+    // HF matches a normalized added token in the normalized text; only the
+    // CLIP lowercase is modelled (see FindAddedToken).
+    HasLowercaseNormalizer := FClipPreTok and HasLowercaseNormalizer;
+    AddedCntM1 := High(FAddedTokens);
+    for Cnt := 0 to AddedCntM1 do
+      if FAddedTokens[Cnt].Normalized then
+      begin
+        FAddedTokens[Cnt].Normalized := HasLowercaseNormalizer;
+        if HasLowercaseNormalizer then
+          FAddedTokens[Cnt].Content :=
+            LowercaseCodePoints(FAddedTokens[Cnt].Content);
+      end;
     Node := RootObj.Find('decoder');
     if (Node <> nil) and (Node is TJSONObject) then
       AddDecoder(TJSONObject(Node));
@@ -2355,6 +2439,7 @@ begin
   // transformers CLIPTokenizer: NFC + lowercase normalizer (whitespace only
   // separates pieces), the CLIP Split regex, ByteLevel, BPE with '</w>'.
   FClipPreTok := true;
+  FByteLevel := true;
   FEndOfWordSuffix := '</w>';
   FNormUnicodeForm := 'NFC';
   FBertLowercase := true;
@@ -3068,6 +3153,9 @@ begin
     raise EHFTokenizerError.Create('SaveTokenizerToGGUF: the WordPiece (BERT) ' +
       'path has no GGUF "bert" tokenizer.ggml.model yet (only byte-level BPE ' +
       '"gpt2" and Unigram-with-scores "llama").');
+  if FEndOfWordSuffix <> '' then
+    raise EHFTokenizerError.Create('SaveTokenizerToGGUF: GGUF has no field ' +
+      'for the CLIP end_of_word_suffix "' + FEndOfWordSuffix + '".');
 
   TokCount := Length(FIdToToken);
   if TokCount = 0 then
@@ -3203,6 +3291,13 @@ begin
     begin
       FHasNormalizedAddedTokens := true;
       FAddedFirstByte[byte(UpCase(Content[1]))] := true;
+      // Latin-1 / Latin Extended-A case pairs can differ in the lead byte.
+      if (Content[1] >= #$C3) and (Content[1] <= #$C5) then
+      begin
+        FAddedFirstByte[$C3] := true;
+        FAddedFirstByte[$C4] := true;
+        FAddedFirstByte[$C5] := true;
+      end;
     end;
   end;
   MaxId := -1;
@@ -4763,7 +4858,7 @@ begin
   SegStart := 1;
   TextLen := Length(Text); // #2/#5: Text is const, not mutated in loop
   if not FAddedIdIndexBuilt then BuildAddedIdIndex();
-  if FHasNormalizedAddedTokens then LowerText := LowerCase(Text)
+  if FHasNormalizedAddedTokens then LowerText := LowercaseCodePoints(Text)
   else LowerText := Text;
   while Position <= TextLen do
   begin
@@ -5268,7 +5363,8 @@ var
 begin
   if Content = '' then
     raise EHFTokenizerError.Create('AddToken: empty token.');
-  if FClipPreTok then Stored := LowerCase(Content) else Stored := Content;
+  if FClipPreTok then Stored := LowercaseCodePoints(Content)
+  else Stored := Content;
   if TokenToId(Stored) >= 0 then
     raise EHFTokenizerError.Create('AddToken: "' + Content +
       '" is already in the vocabulary.');

@@ -93885,8 +93885,12 @@ begin
   Folder := ComponentFolder('tokenizer');
   FTokenizer := TNeuralHFTokenizer.Create();
   try
-    FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
-      Folder + 'merges.txt');
+    // transformers prefers the fast tokenizer.json when the folder has one.
+    if FileExists(Folder + 'tokenizer.json') then
+      FTokenizer.LoadFromFile(Folder + 'tokenizer.json')
+    else
+      FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
+        Folder + 'merges.txt');
     // transformers splits the pad token out of prompts (SD 2.x: every "!").
     if FTokenizer.TokenToId(FPadToken) >= 0 then
       FTokenizer.AddSpecialToken(FPadToken);
@@ -94056,7 +94060,7 @@ begin
   PadId := FTokenizer.TokenToId(FPadToken);
   if PadId < 0 then
     ImportError('TStableDiffusionPipeline: pad token "' + FPadToken +
-      '" is not in tokenizer/vocab.json.');
+      '" is not in the tokenizer vocabulary.');
   TextIds := FTokenizer.Encode(ExpandInversionTokens(Prompt));
   TextCount := Min(Length(TextIds), FMaxTokenCount - 2);
   SetLength(Result, FMaxTokenCount);

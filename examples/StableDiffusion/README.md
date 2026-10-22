@@ -6,7 +6,8 @@ diffusers Stable Diffusion 1.x or 2.x folder, through `TStableDiffusionPipeline`
 One `Generate` call:
 
 1. tokenizes the prompt and the negative prompt with the CLIP tokenizer in
-   `tokenizer/` (`vocab.json` + `merges.txt`): `[bos] ids [eos]`, padded to 77
+   `tokenizer/` (`tokenizer.json` when present, else `vocab.json` +
+   `merges.txt`): `[bos] ids [eos]`, padded to 77
    tokens with the pad token (`special_tokens_map.json` wins over
    `tokenizer_config.json`, as in transformers; SD 2.x pads with `!`),
 2. encodes both with the CLIP text encoder in `text_encoder/` (last hidden

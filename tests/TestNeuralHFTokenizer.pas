@@ -31,6 +31,9 @@ type
     procedure TestWordPieceParityWithHF;
     procedure TestUnigramParityWithHF;
     procedure TestCLIPVocabAndMergesParity;
+    // CLIP tokenizer.json (tools/make_clip_fast_tokenizer_fixture.py) and the
+    // vocab.json + merges.txt path against HF ids, incl. added tokens.
+    procedure TestCLIPTokenizerJsonParity;
     procedure TestUnigramSegmentationAndFusedUnk;
     // Raw SentencePiece .model protobuf reader (LoadSentencePieceModel):
     // ids must match the SentencePiece encoder oracle for every pinned
@@ -329,6 +332,101 @@ begin
   finally
     Ids.Free;
     Tok.Free;
+    Root.Free;
+  end;
+end;
+
+procedure CheckTokenIds(const Context: string; Expected: TJSONArray;
+  Ids: TIntegerList);
+var
+  IdPos: integer;
+begin
+  TAssert.AssertEquals(Context + ': id count', Expected.Count, Ids.Count);
+  for IdPos := 0 to Expected.Count - 1 do
+    TAssert.AssertEquals(Context + ': id[' + IntToStr(IdPos) + ']',
+      Expected.Integers[IdPos], Ids[IdPos]);
+end;
+
+procedure TTestNeuralHFTokenizer.TestCLIPTokenizerJsonParity;
+var
+  FastTok, SlowTok, AddedTok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Cases, AddedNames: TJSONArray;
+  CaseObj: TJSONObject;
+  Ids: TIntegerList;
+  CaseCnt, NamePos: integer;
+  Text, Context, SlowFolder: string;
+begin
+  Root := LoadFixtureJSON(FixturePath('tiny_sd15_fast_tokenizer_io.json'));
+  SlowFolder := ExtractFilePath(FixturePath('tiny_sd15' + DirectorySeparator +
+    'tokenizer' + DirectorySeparator + 'vocab.json'));
+  FastTok := TNeuralHFTokenizer.Create();
+  SlowTok := TNeuralHFTokenizer.Create();
+  AddedTok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    FastTok.LoadFromFile(FixturePath('tiny_sd15_fast_tokenizer' +
+      DirectorySeparator + 'tokenizer.json'));
+    SlowTok.LoadCLIPVocabAndMerges(SlowFolder + 'vocab.json',
+      SlowFolder + 'merges.txt');
+    AddedTok.LoadFromFile(FixturePath('tiny_sd15_fast_tokenizer' +
+      DirectorySeparator + 'added_tokens' + DirectorySeparator +
+      'tokenizer.json'));
+    AssertEquals('vocab size', SlowTok.GetVocabSize(), FastTok.GetVocabSize());
+    AssertEquals('bos', SlowTok.BosId, FastTok.BosId);
+    AssertEquals('eos', SlowTok.EosId, FastTok.EosId);
+    AssertEquals('unk', SlowTok.UnkId, FastTok.UnkId);
+    Cases := TJSONObject(Root).Arrays['cases'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      Context := 'case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      FastTok.Encode(Text, Ids);
+      CheckTokenIds('fast ' + Context, CaseObj.Arrays['ids'], Ids);
+      // The RobertaProcessing post_processor: [bos] ids [eos].
+      Ids.Insert(0, FastTok.BosId);
+      Ids.Add(FastTok.EosId);
+      CheckTokenIds('fast+special ' + Context,
+        CaseObj.Arrays['ids_with_special'], Ids);
+      Ids.Clear;
+      SlowTok.Encode(Text, Ids);
+      CheckTokenIds('slow ' + Context, CaseObj.Arrays['ids'], Ids);
+    end;
+    Ids.Clear;
+    FastTok.Encode('Naïve  CAFÉ!', Ids);
+    AssertEquals('fast decode', 'naïve café !', FastTok.Decode(Ids, true));
+    AssertEquals('slow decode', 'naïve café !', SlowTok.Decode(Ids, true));
+    // Normalized added tokens: read from tokenizer.json, and registered with
+    // AddToken on both paths; HF lowercases them and the text with Unicode.
+    AddedNames := TJSONObject(Root).Arrays['added_tokens'];
+    for NamePos := 0 to AddedNames.Count - 1 do
+    begin
+      FastTok.AddToken(AddedNames.Strings[NamePos]);
+      SlowTok.AddToken(AddedNames.Strings[NamePos]);
+    end;
+    Cases := TJSONObject(Root).Arrays['added_cases'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      Context := 'added case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      AddedTok.Encode(Text, Ids);
+      CheckTokenIds('tokenizer.json ' + Context, CaseObj.Arrays['ids'], Ids);
+      Ids.Clear;
+      FastTok.Encode(Text, Ids);
+      CheckTokenIds('fast AddToken ' + Context, CaseObj.Arrays['ids'], Ids);
+      Ids.Clear;
+      SlowTok.Encode(Text, Ids);
+      CheckTokenIds('slow AddToken ' + Context, CaseObj.Arrays['ids'], Ids);
+    end;
+  finally
+    Ids.Free;
+    AddedTok.Free;
+    SlowTok.Free;
+    FastTok.Free;
     Root.Free;
   end;
 end;

@@ -594,8 +594,18 @@ rather than acted on.
             the pipeline refuses addition_embed_type "text_time" today.
       - [ ] F16 weights: the SD UNet / VAE / CLIP loaders are unverified on F16
             and *.fp16.safetensors variant files (pick the variant by name).
-      - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
-            CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
+      - [X] CLIP tokenizer.json (fast) path: LoadFromFile recognizes the CLIP
+            Split / Lowercase / Replace(\s+) / end_of_word_suffix and reuses
+            SplitClipPieces; TStableDiffusionPipeline reads
+            tokenizer/tokenizer.json when present.
+        - [ ] The post_processor is not read: BosId / EosId come from the
+              <|startoftext|> / <|endoftext|> added tokens. A CLIP-family
+              tokenizer.json with other bos/eos names gets no BosId.
+        - [ ] HF matches normalized added tokens in the NFC + whitespace-
+              collapsed text; Encode matches them in the lowercased raw text
+              (differs only on decomposed input).
+        - [ ] IsWhitespaceCP vs the Rust regex \s (Unicode White_Space) of the
+              CLIP Split: only ASCII whitespace, U+00A0 and U+3000 are tested.
       - [ ] int8 quality on a real SD 1.5 checkpoint (UNet + CLIP int8 vs FP32
             image, user's GPU box; `UNetInt8` / `TextEncoderInt8`, `--int8`),
             then int4 UNet weights (QuantizeWeightsInt4, the QwenImage --int4
@@ -641,8 +651,10 @@ rather than acted on.
             vectors (diffusers' maybe_convert_prompt looks the lowercased
             token up by the token as given; ported as is). Decide whether to
             expand them anyway (A1111 does) at the cost of diffusers parity.
-      - [ ] TNeuralHFTokenizer.AddToken on CLIP matches in an ASCII-lowercased
-            copy of the text; HF lowercases Unicode (non-ASCII tokens differ).
+      - [ ] CLIP lowercasing (LowercaseCP: the text, AddToken and normalized
+            added tokens) covers only ASCII, Latin-1 and Latin Extended-A; HF
+            lowercases all of Unicode (Greek, Cyrillic, ... differ). The
+            added-token match needs the lowercase to keep the byte length.
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
       - [ ] IP-Adapter image prompts in TStableDiffusionPipeline follow-ups

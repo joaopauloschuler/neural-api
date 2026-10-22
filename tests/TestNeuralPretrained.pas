@@ -60,6 +60,8 @@ type
     // Pipeline parity checks of fixture folder Folder against its
     // tools/make_pico_sd*_pipeline_fixture.py oracle files.
     procedure CheckSDPipelineTokens(const Folder, OracleFile: string);
+    procedure CheckSDPipelineTokenIds(Pipeline: TStableDiffusionPipeline;
+      const OracleFile: string);
     procedure CheckSDPipelineEmbeds(const Folder, OracleFile: string);
     procedure CheckSDPipelineParity(const Folder, OracleFile: string);
     procedure CheckSDPipelineSamplers(const Folder, OracleFile,
@@ -69,6 +71,9 @@ type
     // tiny_sd15_lcm_distilled (unet, scheduler, model_index) with tiny_sd15's
     // text encoder, tokenizer and VAE, assembled in a temp folder.
     function CreateSD15LCMDistilledPipeline(): TStableDiffusionPipeline;
+    // tiny_sd15 in a temp folder whose tokenizer/ holds only the
+    // tiny_sd15_fast_tokenizer tokenizer.json + tokenizer_config.json.
+    function CreateSD15FastTokenizerPipeline(): TStableDiffusionPipeline;
     // Nested JSON [S][D] -> (S,1,D); [C][H][W] (ChannelsFirst) or [H][W][C]
     // -> (W,H,C).
     procedure LoadNestedOracleVolume(Data: TJSONData; ChannelsFirst: boolean;
@@ -1254,6 +1259,7 @@ type
     procedure TestMarigoldWidenUNetConvIn;
     procedure TestMarigoldPipelineMatchesPredict;
     procedure TestStableDiffusionPipelineTokens;
+    procedure TestStableDiffusionPipelineFastTokenizer;
     procedure TestStableDiffusionPipelineEmbeds;
     procedure TestStableDiffusionPipelineGuidedNoise;
     procedure TestStableDiffusionPipelineParity;
@@ -45647,17 +45653,73 @@ begin
   CheckSDPipelineTokens('tiny_sd15', 'tiny_sd15_pipeline_io.json');
 end;
 
+// The same token oracle through a tokenizer/ folder with only tokenizer.json.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineFastTokenizer;
+var
+  Pipeline: TStableDiffusionPipeline;
+begin
+  Pipeline := CreateSD15FastTokenizerPipeline();
+  try
+    CheckSDPipelineTokenIds(Pipeline, 'tiny_sd15_pipeline_io.json');
+  finally
+    Pipeline.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.CreateSD15FastTokenizerPipeline():
+  TStableDiffusionPipeline;
+const
+  cBaseFiles: array[0..7] of string = ('model_index.json',
+    'scheduler/scheduler_config.json', 'text_encoder/config.json',
+    'text_encoder/model.safetensors', 'unet/config.json',
+    'unet/diffusion_pytorch_model.safetensors', 'vae/config.json',
+    'vae/diffusion_pytorch_model.safetensors');
+  cTokenizerFiles: array[0..1] of string = ('tokenizer.json',
+    'tokenizer_config.json');
+var
+  Folder: string;
+  FilePos: integer;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) +
+    'cai_sd15_fast_tokenizer');
+  for FilePos := 0 to High(cBaseFiles) do
+  begin
+    ForceDirectories(ExtractFileDir(Folder + cBaseFiles[FilePos]));
+    CopyFileTo(FixturePath('tiny_sd15/' + cBaseFiles[FilePos]),
+      Folder + cBaseFiles[FilePos]);
+  end;
+  ForceDirectories(Folder + 'tokenizer');
+  for FilePos := 0 to High(cTokenizerFiles) do
+    CopyFileTo(FixturePath('tiny_sd15_fast_tokenizer/' +
+      cTokenizerFiles[FilePos]), Folder + 'tokenizer/' +
+      cTokenizerFiles[FilePos]);
+  AssertFalse('no slow tokenizer files', FileExists(Folder +
+    'tokenizer/vocab.json') or FileExists(Folder + 'tokenizer/merges.txt'));
+  Result := TStableDiffusionPipeline.Create(Folder);
+end;
+
 procedure TTestNeuralPretrained.CheckSDPipelineTokens(const Folder,
   OracleFile: string);
 var
-  Root: TJSONData;
   Pipeline: TStableDiffusionPipeline;
+begin
+  Pipeline := CreateSDPipeline(Folder);
+  try
+    CheckSDPipelineTokenIds(Pipeline, OracleFile);
+  finally
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckSDPipelineTokenIds(
+  Pipeline: TStableDiffusionPipeline; const OracleFile: string);
+var
+  Root: TJSONData;
   Cases, ExpectedIds: TJSONArray;
   Ids: TNeuralIntegerArray;
   CaseCnt, IdCnt: integer;
 begin
   Root := LoadSD15Fixture(OracleFile);
-  Pipeline := CreateSDPipeline(Folder);
   try
     AssertEquals('max tokens', 77, Pipeline.MaxTokenCount);
     Cases := TJSONObject(Root).Arrays['tokens'];
@@ -45672,7 +45734,6 @@ begin
           ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
     end;
   finally
-    Pipeline.Free;
     Root.Free;
   end;
 end;
