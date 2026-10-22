@@ -46,6 +46,9 @@ lazbuild -B ControlNetCanny.lpi
 | `--prompt`, `--negative` | prompt and negative prompt |
 | `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
 | `--scale S` | `controlnet_conditioning_scale` (1.0) |
+| `--control-start F`, `--control-end F` | `control_guidance_start` / `control_guidance_end` (0, 1): step i of N gets the residuals when F_start <= i / N and (i + 1) / N <= F_end |
+| `--guess-mode` | diffusers `guess_mode`: the ControlNet runs in the prompt pass only, its down residuals scaled from 0.1 up to 1 (`logspace(-1, 0)`); the CFG pass without the prompt gets none |
+| `--ip-adapter FILE`, `--ip-image PNG`, `--ip-scale S` | an h94/IP-Adapter `ip-adapter_sd15` image prompt on top of the ControlNet (its `image_encoder/` folder beside FILE), as `pipe.load_ip_adapter` on a `StableDiffusionControlNetPipeline`; scale 1.0 |
 | `--width N`, `--height N` | image size, each a multiple of 8 for SD 1.5 (default: the checkpoint's, 512) |
 | `--size N` | sets both `--width` and `--height` |
 | `--out PNG` | output file (default `controlnet_canny.png`) |
@@ -54,6 +57,21 @@ lazbuild -B ControlNetCanny.lpi
 
 With no `--model` / `--controlnet` the run uses random-weight pico fixtures:
 it checks wiring and I/O, not image quality.
+
+The IP-Adapter joins through a `TStableDiffusionMultiConditioner`, which runs
+several conditioners in one `Denoise`: ControlNets and T2I-Adapters (their
+residuals summed, as diffusers `MultiControlNetModel`), at most one
+IP-Adapter, and at most one img2img / inpainting / InstructPix2Pix
+conditioner. The example exposes one ControlNet plus the IP-Adapter; code can
+add more:
+
+```pascal
+Multi := TStableDiffusionMultiConditioner.Create();
+Multi.Add(ControlNetCanny);   // TStableDiffusionControlNet
+Multi.Add(ControlNetDepth);   // a second one: MultiControlNet
+Multi.Add(IPAdapter);         // TStableDiffusionIPAdapter
+Pipeline.Conditioner := Multi;
+```
 
 ## Parity
 
@@ -64,7 +82,18 @@ the latents after each step and the decoded image with a diffusers float64
 `StableDiffusionControlNetPipeline` run: max |diff| < 1e-4.
 `TestStableDiffusionControlNetNonSquare` does the same at 14x10, a 7x5 latent
 grid that is neither square nor a multiple of the UNet down factor. The
-fixtures and the oracles come from `tools/make_pico_sd_conditioning_fixtures.py`.
+composed runs (`tests/fixtures/tiny_sd15_composed_io.json`, 3 guided DDIM
+steps each) match diffusers float64 to 1e-4 as well:
+`TestStableDiffusionIPAdapterControlNetParity` (ControlNet + IP-Adapter),
+`TestStableDiffusionControlNetGuidanceWindowParity` (start 0.3, end 0.7),
+`TestStableDiffusionControlNetGuessModeParity`,
+`TestStableDiffusionMultiControlNetParity` (two control images, scales 0.5 /
+0.3, the second from 0.4 of the steps) and
+`TestStableDiffusionControlNetAdapterIPParity` (ControlNet + T2I-Adapter +
+IP-Adapter; diffusers has no pipeline for a ControlNet and a T2I-Adapter
+together, so that oracle adds the adapter features to the ControlNet
+pipeline's UNet calls). The fixtures and the oracles come from
+`tools/make_pico_sd_conditioning_fixtures.py`.
 
 ## Canny edges
 
@@ -84,6 +113,8 @@ hysteresis cases; no `cv2` comparison has been run.
   the diffusers recipe runs `cv2.Canny` on the original photo and lets the
   pipeline resize the edge map. Resize the photo yourself and pass it at the
   image size for the same result.
-- Real checkpoints (`lllyasviel/sd-controlnet-canny` on SD 1.5) are untested.
-- One ControlNet; diffusers' `control_guidance_start/end` and guess mode are
-  not implemented.
+- Real checkpoints (`lllyasviel/sd-controlnet-canny` on SD 1.5, an
+  `ip-adapter_sd15`) are untested.
+- The command line takes one ControlNet; several need code (above).
+- A ControlNet `config.json` with `global_pool_conditions` (diffusers forces
+  guess mode and pools the residuals) is not handled.

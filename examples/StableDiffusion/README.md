@@ -124,7 +124,9 @@ sets how much of the image is repainted: only the last `int(steps * S)` steps
 run, so `--steps 25 --strength 0.6` runs 15 UNet steps. S = 1 still starts
 from the noised image, not from pure noise. The output takes the image's size,
 rounded down to a multiple of the VAE factor; `--width` / `--height` resize
-the image instead. `--init-image` cannot be combined with `--ip-adapter`:
+the image instead. With `--ip-adapter` too, the image prompt joins the
+img2img run (`TStableDiffusionMultiConditioner`, as `load_ip_adapter` on
+`StableDiffusionImg2ImgPipeline`; not compared with diffusers):
 
 ```
 StableDiffusion --model ~/models/stable-diffusion-v1-5 \
@@ -149,7 +151,9 @@ S (default 1.5) sets how closely the output keeps the image. Guidance is on
 when `--guidance` > 1 and S >= 1; otherwise each step runs one pass. All steps
 run from pure noise. The output takes the image's size, rounded down to a
 multiple of the VAE factor. `--edit-image` cannot be combined with
-`--init-image` or `--ip-adapter`:
+`--init-image`. With `--ip-adapter`, the image prompt goes with the prompt
+pass only, as diffusers' `[image, zero, zero]` embeds
+(`TestStableDiffusionIPAdapterInstructPix2PixParity`):
 
 ```
 StableDiffusion --model ~/models/instruct-pix2pix \

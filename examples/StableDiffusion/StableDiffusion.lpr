@@ -29,6 +29,7 @@ StableDiffusionImg2ImgPipeline): the output takes the image's size.
 --edit-image PNG [--image-guidance S] edits the image as the prompt instructs
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
+--ip-adapter combines with either (TStableDiffusionMultiConditioner).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -361,14 +362,11 @@ begin
     raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
     raise Exception.Create('--strength needs --init-image');
-  if (Opt.InitImageFile <> '') and (Opt.IPAdapterFile <> '') then
-    raise Exception.Create('--init-image and --ip-adapter cannot be combined');
   if (Opt.ImageGuidanceScale >= 0) and (Opt.EditImageFile = '') then
     raise Exception.Create('--image-guidance needs --edit-image');
-  if (Opt.EditImageFile <> '') and ((Opt.InitImageFile <> '') or
-    (Opt.IPAdapterFile <> '')) then
+  if (Opt.EditImageFile <> '') and (Opt.InitImageFile <> '') then
     raise Exception.Create('--edit-image cannot be combined with ' +
-      '--init-image or --ip-adapter');
+      '--init-image');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
@@ -403,6 +401,7 @@ var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
   IPAdapter: TStableDiffusionIPAdapter;
+  Multi: TStableDiffusionMultiConditioner;
   Img2Img: TStableDiffusionImg2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   ImageConditioner: TStableDiffusionImageConditioner;
@@ -420,6 +419,7 @@ begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   IPAdapter := nil;
+  Multi := nil;
   Img2Img := nil;
   InstructPix2Pix := nil;
   ImageConditioner := nil;
@@ -518,7 +518,14 @@ begin
         raise Exception.Create('could not load ' + Opt.IPImageFile);
       IPAdapter.SetImage(Image);
       IPAdapter.Scale := Opt.IPScale;
-      Pipeline.Conditioner := IPAdapter;
+      if Assigned(ImageConditioner) then
+      begin
+        Multi := TStableDiffusionMultiConditioner.Create();
+        Multi.Add(ImageConditioner);
+        Multi.Add(IPAdapter);
+        Pipeline.Conditioner := Multi;
+      end
+      else Pipeline.Conditioner := IPAdapter;
       WriteLn(Format('IP-Adapter: %s, image %s (%dx%d), scale %.2f',
         [Opt.IPAdapterFile, Opt.IPImageFile, Image.SizeX, Image.SizeY,
          Opt.IPScale]));
@@ -567,6 +574,7 @@ begin
     PromptEmbeds.Free;
     Image.Free;
     Pipeline.Free;
+    Multi.Free;
     IPAdapter.Free;
     ImageConditioner.Free;
     Reporter.Free;

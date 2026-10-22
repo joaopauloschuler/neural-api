@@ -66,6 +66,9 @@ type
     procedure SD15StepNoise(StepIndex: integer; Noise: TNNetVolume);
     procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
       const Expected: TJSONObject);
+    // Case CaseName of tiny_sd15_composed_io.json: its ControlNets, T2I-Adapter,
+    // IP-Adapter and InstructPix2Pix together; steps and image < 1e-4.
+    procedure CheckSD15ComposedCase(const CaseName: string);
     // FileName's width x height plain run: step-0 UNet, steps and image < 1e-4.
     procedure CheckSD15SizedParity(const FileName: string);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
@@ -1252,7 +1255,14 @@ type
     procedure TestStableDiffusionT2IAdapterNonSquare;
     procedure TestStableDiffusionIPAdapterParity;
     procedure TestStableDiffusionIPAdapterScaleZero;
-    procedure TestSDUNetIPAdapterRefusesControl;
+    procedure TestSDUNetConditioningInputsLayout;
+    procedure TestStableDiffusionIPAdapterControlNetParity;
+    procedure TestStableDiffusionControlNetGuidanceWindowParity;
+    procedure TestStableDiffusionControlNetGuessModeParity;
+    procedure TestStableDiffusionMultiControlNetParity;
+    procedure TestStableDiffusionControlNetAdapterIPParity;
+    procedure TestStableDiffusionIPAdapterInstructPix2PixParity;
+    procedure TestStableDiffusionMultiConditionerRefuses;
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
@@ -46212,31 +46222,311 @@ begin
   end;
 end;
 
-// BuildSDUNet refuses an IP-Adapter together with the ControlNet inputs.
-procedure TTestNeuralPretrained.TestSDUNetIPAdapterRefusesControl;
+// BuildSDUNet with IP-Adapter, T2I-Adapter and ControlNet inputs at once:
+// SDUNetConditioningInputs finds each kind with its shape; zero extra inputs
+// (and zero to_v_ip tokens) reproduce the plain UNet.
+procedure TTestNeuralPretrained.TestSDUNetConditioningInputsLayout;
 var
   Pipeline: TStableDiffusionPipeline;
   Config: TSDUNetConfig;
-  Net: TNNet;
+  Plain, Combined, Single: TNNet;
+  Inputs, SingleInputs: TSDUNetConditioningInputs;
+  Latent, Embeds, PlainNoise, CombinedNoise: TNNetVolume;
+  InputPos: integer;
   Refused: boolean;
 begin
   Pipeline := CreateSD15Pipeline();
-  Net := nil;
+  Plain := nil;
+  Combined := nil;
+  Single := nil;
+  Latent := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  PlainNoise := TNNetVolume.Create;
+  CombinedNoise := TNNetVolume.Create;
   try
     Config := Pipeline.UNetConfig;
+    Config.LatentGrid := 7;
+    Config.LatentGridY := 5;
+    Config.TextSeqLen := 4;
+    Plain := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+    Combined := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false,
+      {pWithControl=}true, {pWithAdapter=}true, FixturePath(
+      'tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+    Inputs := SDUNetConditioningInputs(Combined, Config, true, true, true);
+    AssertEquals('adapter inputs', SDUNetAdapterFeatureCount(Config),
+      Length(Inputs.Adapter));
+    AssertEquals('control inputs', SDUNetControlDownCount(Config),
+      Length(Inputs.ControlDown));
+    AssertTrue('mid control input', Assigned(Inputs.ControlMid));
+    AssertTrue('IP-Adapter inputs', Assigned(Inputs.IPKeyTokens) and
+      Assigned(Inputs.IPValueTokens));
+    // Each kind has the shapes of the net built with that kind alone.
+    Single := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false,
+      {pWithControl=}true, {pWithAdapter=}false);
+    SingleInputs := SDUNetConditioningInputs(Single, Config, false, false, true);
+    for InputPos := 0 to High(Inputs.ControlDown) do
+      AssertTrue('control input ' + IntToStr(InputPos) + ' shape',
+        Inputs.ControlDown[InputPos].Output.SameSize(
+        SingleInputs.ControlDown[InputPos].Output));
+    AssertTrue('mid shape', Inputs.ControlMid.Output.SameSize(
+      SingleInputs.ControlMid.Output));
+    FreeAndNil(Single);
+    Single := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false,
+      {pWithControl=}false, {pWithAdapter=}true);
+    SingleInputs := SDUNetConditioningInputs(Single, Config, false, true, false);
+    for InputPos := 0 to High(Inputs.Adapter) do
+      AssertTrue('adapter input ' + IntToStr(InputPos) + ' shape',
+        Inputs.Adapter[InputPos].Output.SameSize(
+        SingleInputs.Adapter[InputPos].Output));
     Refused := false;
     try
-      Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
-        'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false,
-        {pWithControl=}true, {pWithAdapter=}false, FixturePath(
-        'tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+      SDUNetConditioningInputs(Combined, Config, true, false, true);
     except
-      on E: EPretrainedImportError do
-        Refused := Pos('IP-Adapter', E.Message) > 0;
+      on EPretrainedImportError do Refused := true;
     end;
-    AssertTrue('IP-Adapter with ControlNet refused', Refused);
+    AssertTrue('wrong options refused', Refused);
+    Latent.ReSize(7, 5, Config.InChannels);
+    Latent.RandomizeGaussian(1.0);
+    Embeds.ReSize(4, 1, Config.CrossAttentionDim);
+    Embeds.RandomizeGaussian(1.0);
+    SDUNetDenoise(Plain, Config, Latent, Embeds, 500, PlainNoise);
+    Inputs.IPKeyTokens.Output.Fill(1);
+    Inputs.IPValueTokens.Output.Fill(0);
+    SDUNetDenoise(Combined, Config, Latent, Embeds, 500, CombinedNoise);
+    AssertTrue('zero extra inputs max |diff| = ' + FloatToStr(
+      MaxAbsVolumeDiff(PlainNoise, CombinedNoise)),
+      MaxAbsVolumeDiff(PlainNoise, CombinedNoise) < 1e-5);
   finally
-    Net.Free;
+    CombinedNoise.Free;
+    PlainNoise.Free;
+    Embeds.Free;
+    Latent.Free;
+    Single.Free;
+    Combined.Free;
+    Plain.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckSD15ComposedCase(const CaseName: string);
+var
+  Pipeline: TStableDiffusionPipeline;
+  Multi: TStableDiffusionMultiConditioner;
+  Members: array of TStableDiffusionConditioner;
+  ControlNet: TStableDiffusionControlNet;
+  Adapter: TStableDiffusionT2IAdapter;
+  IPAdapter: TStableDiffusionIPAdapter;
+  InstructPix2Pix: TStableDiffusionInstructPix2Pix;
+  Root, Entry: TJSONObject;
+  Cases, ImageIds: TJSONArray;
+  Picture: TNNetVolume;
+  CasePos, ImagePos, MemberPos: integer;
+
+  procedure AddMember(Member: TStableDiffusionConditioner);
+  begin
+    SetLength(Members, Length(Members) + 1);
+    Members[High(Members)] := Member;
+    Multi.Add(Member);
+  end;
+
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_composed_io.json');
+  Root := TJSONObject(FSD15Oracle);
+  Entry := nil;
+  Cases := Root.Arrays['cases'];
+  for CasePos := 0 to Cases.Count - 1 do
+    if Cases.Objects[CasePos].Get('name', '') = CaseName then
+      Entry := Cases.Objects[CasePos];
+  AssertTrue('case ' + CaseName, Assigned(Entry));
+  if CaseName = 'ip_ip2p' then
+  begin
+    Pipeline := TStableDiffusionPipeline.Create(ExtractFileDir(
+      FixturePath('tiny_sd15_ip2p/model_index.json')));
+    Pipeline.Sampler := smDDIM;
+  end
+  else Pipeline := CreateSD15Pipeline();
+  Multi := TStableDiffusionMultiConditioner.Create();
+  Members := nil;
+  Picture := TNNetVolume.Create;
+  try
+    if CaseName = 'ip_ip2p' then
+    begin
+      InstructPix2Pix := TStableDiffusionInstructPix2Pix.Create();
+      AddMember(InstructPix2Pix);
+      LoadNestedOracleVolume(Root.Arrays['init_image'], false, Picture);
+      Picture.Mul(255);
+      InstructPix2Pix.SetImage(Picture);
+      InstructPix2Pix.ImageGuidanceScale := Entry.Get('image_guidance_scale',
+        0.0);
+    end
+    else
+    begin
+      ImageIds := Entry.Arrays['control_image_ids'];
+      for ImagePos := 0 to ImageIds.Count - 1 do
+      begin
+        ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+          FixturePath('tiny_sd15_controlnet/config.json')));
+        AddMember(ControlNet);
+        LoadNestedOracleVolume(Root.Arrays['control_images'].Items[
+          ImageIds.Integers[ImagePos]], false, Picture);
+        Picture.Mul(255);
+        ControlNet.SetControlImage(Picture);
+        ControlNet.ConditioningScale := Entry.Arrays['conditioning_scales'].
+          Floats[ImagePos];
+        ControlNet.GuidanceStart := Entry.Arrays['control_guidance_start'].
+          Floats[ImagePos];
+        ControlNet.GuidanceEnd := Entry.Arrays['control_guidance_end'].
+          Floats[ImagePos];
+        ControlNet.GuessMode := Entry.Get('guess_mode', false);
+      end;
+    end;
+    if Entry.Get('t2i_adapter', false) then
+    begin
+      Adapter := TStableDiffusionT2IAdapter.Create(ExtractFileDir(
+        FixturePath('tiny_sd15_t2i_adapter/config.json')));
+      AddMember(Adapter);
+      LoadNestedOracleVolume(Root.Arrays['hint_image'], false, Picture);
+      Picture.Mul(255);
+      Adapter.SetHintImage(Picture);
+      Adapter.ConditioningScale := Root.Get('adapter_scale', 0.0);
+    end;
+    if Entry.Get('ip_adapter', false) then
+    begin
+      IPAdapter := TStableDiffusionIPAdapter.Create(
+        FixturePath('tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+      AddMember(IPAdapter);
+      LoadNestedOracleVolume(Root.Arrays['ip_image'], false, Picture);
+      IPAdapter.SetImage(Picture);
+      IPAdapter.Scale := Root.Get('ip_scale', 0.0);
+    end;
+    // A lone conditioner runs without the multi-conditioner.
+    if Length(Members) = 1 then Pipeline.Conditioner := Members[0]
+    else Pipeline.Conditioner := Multi;
+    CheckSD15ConditionedParity(Pipeline, Entry);
+  finally
+    Picture.Free;
+    Pipeline.Free;
+    Multi.Free;
+    for MemberPos := 0 to High(Members) do Members[MemberPos].Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionControlNetPipeline + load_ip_adapter float64: 3 guided DDIM
+// steps, ControlNet scale 0.5 and IP-Adapter scale 0.7.
+procedure TTestNeuralPretrained.TestStableDiffusionIPAdapterControlNetParity;
+begin
+  CheckSD15ComposedCase('ip_controlnet');
+end;
+
+// diffusers control_guidance_start 0.3 / _end 0.7: only the middle of the 3
+// steps gets the ControlNet residuals.
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetGuidanceWindowParity;
+begin
+  CheckSD15ComposedCase('control_window');
+end;
+
+// diffusers guess_mode: the ControlNet only in the prompt pass, its down
+// residuals scaled by logspace(-1, 0).
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetGuessModeParity;
+begin
+  CheckSD15ComposedCase('guess_mode');
+end;
+
+// diffusers MultiControlNetModel: two control images (scales 0.5 / 0.3, the
+// second from 0.4 of the steps) summed into the same UNet skips.
+procedure TTestNeuralPretrained.TestStableDiffusionMultiControlNetParity;
+begin
+  CheckSD15ComposedCase('multi_controlnet');
+end;
+
+// ControlNet + T2I-Adapter + IP-Adapter in one UNet (the oracle adds the
+// adapter features to the ControlNet pipeline's UNet calls).
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetAdapterIPParity;
+begin
+  CheckSD15ComposedCase('controlnet_adapter_ip');
+end;
+
+// StableDiffusionInstructPix2PixPipeline + load_ip_adapter: the image tokens
+// go with the prompt pass only ([image, zero, zero] embeds), 3 DDIM steps.
+procedure TTestNeuralPretrained.TestStableDiffusionIPAdapterInstructPix2PixParity;
+begin
+  CheckSD15ComposedCase('ip_ip2p');
+end;
+
+// TStableDiffusionMultiConditioner refuses a second IP-Adapter or image
+// conditioner; a ControlNet guidance window with start >= end is refused.
+procedure TTestNeuralPretrained.TestStableDiffusionMultiConditionerRefuses;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Multi: TStableDiffusionMultiConditioner;
+  IPAdapters: array[0..1] of TStableDiffusionIPAdapter;
+  Img2Img, Inpainter: TStableDiffusionConditioner;
+  ControlNet: TStableDiffusionControlNet;
+  Picture, Latents, Embeds: TNNetVolume;
+
+  function IsRefused(Conditioner: TStableDiffusionConditioner): boolean;
+  begin
+    Result := false;
+    try
+      Multi.Add(Conditioner);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+  function IsDenoiseRefused(): boolean;
+  begin
+    Result := false;
+    try
+      Pipeline.Denoise(Embeds, 16, 16, 1, Latents);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  Multi := TStableDiffusionMultiConditioner.Create();
+  IPAdapters[0] := TStableDiffusionIPAdapter.Create(
+    FixturePath('tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+  IPAdapters[1] := TStableDiffusionIPAdapter.Create(
+    FixturePath('tiny_sd15_ip_adapter/ip-adapter_sd15.safetensors'));
+  Img2Img := TStableDiffusionImg2Img.Create();
+  Inpainter := TStableDiffusionInpainter.Create();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  Picture := TNNetVolume.Create(16, 16, 3);
+  Latents := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    Multi.Add(IPAdapters[0]);
+    AssertTrue('second IP-Adapter refused', IsRefused(IPAdapters[1]));
+    Multi.Add(Img2Img);
+    AssertTrue('second image conditioner refused', IsRefused(Inpainter));
+    AssertTrue('nested multi-conditioner refused', IsRefused(Multi));
+    Picture.Fill(128);
+    ControlNet.SetControlImage(Picture);
+    ControlNet.GuidanceStart := 0.5;
+    ControlNet.GuidanceEnd := 0.5;
+    Pipeline.Conditioner := ControlNet;
+    Pipeline.EncodePrompt('', Embeds);
+    Pipeline.MakeInitialLatents(16, 16, 1, Latents);
+    AssertTrue('empty guidance window refused', IsDenoiseRefused());
+  finally
+    Embeds.Free;
+    Latents.Free;
+    Picture.Free;
+    ControlNet.Free;
+    Inpainter.Free;
+    Img2Img.Free;
+    IPAdapters[1].Free;
+    IPAdapters[0].Free;
+    Multi.Free;
     Pipeline.Free;
   end;
 end;

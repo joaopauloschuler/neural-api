@@ -89,6 +89,14 @@ not matter; values rounded to 10 digits):
       STEPS guided DDIM steps from injected latents, per case (each file at
       its own scale, and both stacked through set_adapters): files, scales,
       timesteps, latents_after, image
+  tests/fixtures/tiny_sd15_composed_io.json
+      conditioners run together, STEPS guided DDIM steps from injected latents
+      on 16x16: StableDiffusionControlNetPipeline + load_ip_adapter, ControlNet
+      control_guidance_start/end, guess_mode, MultiControlNet (the pico
+      ControlNet twice, two control images), ControlNet + IP-Adapter + the
+      T2I-Adapter features added to every UNet call (no diffusers pipeline
+      runs a ControlNet and a T2I-Adapter together), and
+      StableDiffusionInstructPix2PixPipeline + load_ip_adapter on tiny_sd15_ip2p
 
 Images are multiples of 1/255 so the 0..255 inputs of the Pascal side are exact.
 
@@ -102,12 +110,13 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_conditioning_fixtures.py --img2img-only
   python tools/make_pico_sd_conditioning_fixtures.py --ip2p-only
   python tools/make_pico_sd_conditioning_fixtures.py --lora-only
+  python tools/make_pico_sd_conditioning_fixtures.py --composed-only
 (--nonsquare-only keeps the committed folders and writes only the two
 non-square files; --inpaint-strength-only writes only the strength file;
 --ip-adapter-only writes only the IP-Adapter folder and its file;
 --img2img-only writes only the img2img file; --ip2p-only writes only the
 InstructPix2Pix folder and its file; --lora-only writes only the LoRA folder
-and its file.)
+and its file; --composed-only writes only the composed-conditioner file.)
 """
 import json
 import os
@@ -150,6 +159,7 @@ IP2P_DIR = os.path.join(FIXTURES, "tiny_sd15_ip2p")
 IP2P_IO = os.path.join(FIXTURES, "tiny_sd15_ip2p_io.json")
 LORA_DIR = os.path.join(FIXTURES, "tiny_sd15_lora")
 LORA_IO = os.path.join(FIXTURES, "tiny_sd15_lora_io.json")
+COMPOSED_IO = os.path.join(FIXTURES, "tiny_sd15_composed_io.json")
 
 SEED = 20261022
 IMAGE_SIZE = 16
@@ -544,10 +554,7 @@ def make_ip_adapter():
                          weight_name="ip-adapter_sd15.safetensors")
     pipe.set_ip_adapter_scale(IP_SCALE)
     pipe.to(torch.float64)
-    generator = torch.Generator().manual_seed(SEED + 31)
-    levels = torch.randint(0, 256, (IP_IMAGE_HEIGHT, IP_IMAGE_WIDTH, 3),
-                           generator=generator)
-    ip_image = Image.fromarray(levels.numpy().astype(numpy.uint8), "RGB")
+    levels, ip_image = ip_prompt_image(SEED + 31)
     pixels = pipe.feature_extractor(ip_image, return_tensors="pt").pixel_values
     image_embeds = pipe.image_encoder(pixels.to(torch.float64)).image_embeds
     latents = initial_latents()
@@ -627,6 +634,96 @@ def make_ip2p():
                "step_noise": [chw(item[0]) for item in step_noise],
                "cases": cases}
     with open(IP2P_IO, "w") as f:
+        json.dump(payload, f)
+
+
+def ip_prompt_image(seed):
+    levels = torch.randint(0, 256, (IP_IMAGE_HEIGHT, IP_IMAGE_WIDTH, 3),
+                           generator=torch.Generator().manual_seed(seed))
+    return levels, Image.fromarray(levels.numpy().astype(numpy.uint8), "RGB")
+
+
+def load_pico_ip_adapter(pipe):
+    pipe.load_ip_adapter(IP_ADAPTER_DIR, subfolder="",
+                         weight_name="ip-adapter_sd15.safetensors")
+    pipe.set_ip_adapter_scale(IP_SCALE)
+    pipe.to(torch.float64)
+
+
+def inject_adapter_features(pipe, adapter, hint):
+    """Adds the T2I-Adapter features (times ADAPTER_SCALE) to every UNet call of
+    pipe, as StableDiffusionAdapterPipeline passes down_intrablock_additional_residuals."""
+    features = [state * ADAPTER_SCALE for state in adapter(hint)]
+    unet_forward = pipe.unet.forward
+
+    def forward(sample, timestep, *args, **kwargs):
+        kwargs["down_intrablock_additional_residuals"] = [
+            state.repeat(sample.shape[0], 1, 1, 1) for state in features]
+        return unet_forward(sample, timestep, *args, **kwargs)
+    pipe.unet.forward = forward
+
+
+def make_composed():
+    """Conditioners run together: IP-Adapter + ControlNet, ControlNet
+    control_guidance_start/end, guess mode, MultiControlNet, ControlNet +
+    T2I-Adapter + IP-Adapter (the adapter features injected into the UNet
+    calls of the ControlNet pipeline) and IP-Adapter + InstructPix2Pix."""
+    control_images = [byte_image(torch.Generator().manual_seed(SEED + 50 + pos), 3)
+                      for pos in range(2)]
+    hint = byte_image(torch.Generator().manual_seed(SEED + 52), 1)
+    ip_levels, ip_image = ip_prompt_image(SEED + 53)
+    init_image = byte_image(torch.Generator().manual_seed(SEED + 54), 3)
+    latents = initial_latents()
+    cases = []
+    for name, image_ids, scales, starts, ends, guess, with_ip, with_adapter in (
+            ("ip_controlnet", [0], [CONTROLNET_SCALE], [0.0], [1.0], False, True, False),
+            ("control_window", [0], [1.0], [0.3], [0.7], False, False, False),
+            ("guess_mode", [0], [0.8], [0.0], [1.0], True, False, False),
+            ("multi_controlnet", [0, 1], [0.5, 0.3], [0.0, 0.4], [1.0, 1.0], False,
+             False, False),
+            ("controlnet_adapter_ip", [0], [CONTROLNET_SCALE], [0.0], [1.0], False,
+             True, True)):
+        parts = base_components()
+        controlnet = ControlNetModel.from_pretrained(CONTROLNET_DIR,
+                                                     torch_dtype=torch.float64)
+        if len(image_ids) > 1:
+            controlnet = [controlnet] * len(image_ids)
+        pipe = StableDiffusionControlNetPipeline(controlnet=controlnet, **parts)
+        if with_ip:
+            load_pico_ip_adapter(pipe)
+        if with_adapter:
+            adapter = T2IAdapter.from_pretrained(ADAPTER_DIR, torch_dtype=torch.float64)
+            inject_adapter_features(pipe, adapter, hint)
+        images = [control_images[pos] for pos in image_ids]
+        extra = {"image": images if len(images) > 1 else images[0],
+                 "controlnet_conditioning_scale": scales if len(scales) > 1 else scales[0],
+                 "control_guidance_start": starts, "control_guidance_end": ends,
+                 "guess_mode": guess}
+        if with_ip:
+            extra["ip_adapter_image"] = ip_image
+        out = run(pipe, extra, latents)
+        out.update(name=name, control_image_ids=image_ids, conditioning_scales=scales,
+                   control_guidance_start=starts, control_guidance_end=ends,
+                   guess_mode=guess, ip_adapter=with_ip, t2i_adapter=with_adapter)
+        cases.append(out)
+        print(name, out["timesteps"])
+    pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+        IP2P_DIR, torch_dtype=torch.float64, safety_checker=None)
+    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    load_pico_ip_adapter(pipe)
+    out = run(pipe, {"image": init_image, "image_guidance_scale": IMAGE_GUIDANCE,
+                     "latents": latents.clone(), "ip_adapter_image": ip_image},
+              None, sized=False)
+    out.update(name="ip_ip2p", image_guidance_scale=IMAGE_GUIDANCE, ip_adapter=True)
+    cases.append(out)
+    print("ip_ip2p", out["timesteps"])
+    payload = {"image_size": IMAGE_SIZE, "steps": STEPS, "guidance_scale": GUIDANCE,
+               "prompt": PROMPT, "latents": chw(latents[0]),
+               "control_images": [hwc(image) for image in control_images],
+               "hint_image": hwc(hint), "adapter_scale": ADAPTER_SCALE,
+               "ip_image": ip_levels.tolist(), "ip_scale": IP_SCALE,
+               "init_image": hwc(init_image), "cases": cases}
+    with open(COMPOSED_IO, "w") as f:
         json.dump(payload, f)
 
 
@@ -719,6 +816,9 @@ if __name__ == "__main__":
     if "--lora-only" in sys.argv:
         make_lora()
         sys.exit(0)
+    if "--composed-only" in sys.argv:
+        make_composed()
+        sys.exit(0)
     if "--ip2p-only" in sys.argv:
         make_ip2p()
         sys.exit(0)
@@ -743,3 +843,4 @@ if __name__ == "__main__":
         make_ip_adapter()
         make_ip2p()
         make_lora()
+        make_composed()

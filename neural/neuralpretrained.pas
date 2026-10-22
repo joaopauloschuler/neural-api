@@ -11935,14 +11935,17 @@ function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
 // ADDED into `sample` exactly as diffusers' UNet2DConditionModel does with
 // down_intrablock_additional_residuals --
 // distinct from pWithControl, which adds into the decoder SKIPS. There is one
-// adapter input per down block (NumBlockOut total); they sit AFTER the
-// latent/timestep/text/control inputs and start zero-filled, so a plain
+// adapter input per down block (NumBlockOut total), zero-filled, so a plain
 // SDUNetDenoise on an adapter-enabled net is bit-identical to the base UNet.
 // SDUNetDenoiseWithAdapter fills them.
 //
 // A non-nil IPAdapterReader (an ip-adapter_sd15 file) gives every attn2 the
-// IP-Adapter to_k_ip / to_v_ip attention over two more TNNetInputs (#3, #4)
-// that SDUNetDenoiseWithIPAdapter fills; it refuses pWithControl/pWithAdapter.
+// IP-Adapter to_k_ip / to_v_ip attention over two more TNNetInputs that
+// SDUNetDenoiseWithIPAdapter fills.
+//
+// The three combine; the extra inputs follow the latent/timestep/text (and
+// SDXL add_embeds) ones in the order IP-Adapter, adapter, control
+// (SDUNetConditioningInputs finds them).
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
@@ -11968,6 +11971,22 @@ function BuildSDUNetFromSafeTensors(const FileName: string;
 // Returns the timestep (input1) / text-states (input2) TNNetInput of a UNet.
 function SDUNetTimestepInput(Net: TNNet): TNNetLayer;
 function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
+
+type
+  // The extra TNNetInputs of a BuildSDUNet net; nil / empty when not built.
+  TSDUNetConditioningInputs = record
+    IPKeyTokens, IPValueTokens: TNNetLayer;
+    // One per down block (SDUNetAdapterFeatureCount).
+    Adapter: array of TNNetLayer;
+    // SDUNetControlDownCount skip inputs, in build order, then the mid one.
+    ControlDown: array of TNNetLayer;
+    ControlMid: TNNetLayer;
+  end;
+
+// The extra inputs of a UNet built with these BuildSDUNet options; raises
+// unless Net has exactly that many TNNetInputs.
+function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
+  WithIPAdapter, WithAdapter, WithControl: boolean): TSDUNetConditioningInputs;
 
 // Fills all three inputs, runs one forward, and copies the predicted noise
 // into Noise. Latent is (LatentGrid, LatentGridYOf, InChannels); EncStates is
@@ -12130,9 +12149,11 @@ type
   end;
 
   TStableDiffusionPipeline = class;
+  TStableDiffusionConditioner = class;
+  TStableDiffusionConditionerArray = array of TStableDiffusionConditioner;
 
   // The inputs one UNet pass of a guided step sees: the prompt (else the
-  // negative prompt) and the conditioner's guided image (IP-Adapter, InstructPix2Pix).
+  // negative prompt; the IP-Adapter image goes with it) and InstructPix2Pix's image.
   TStableDiffusionPassInput = (sdpiPrompt, sdpiImage);
   TStableDiffusionPassInputs = set of TStableDiffusionPassInput;
 
@@ -12157,6 +12178,14 @@ type
     procedure PredictPass(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume);
+    // Appends the conditioners whose FillUNetInputs runs before every pass.
+    procedure CollectConditioners(
+      var Conditioners: TStableDiffusionConditionerArray); virtual;
+    // Before every UNet pass: adds into the control / adapter inputs (zeroed
+    // per pass) or sets the IP-Adapter tokens. This base fills nothing.
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); virtual;
   public
     constructor Create();
     destructor Destroy(); override;
@@ -12244,6 +12273,11 @@ type
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
     FUNetIPAdapterFile: string;
+    // During Denoise: the UNet's extra inputs, the conditioners that fill
+    // them, and the step running (0-based) out of StepCount.
+    FUNetInputs: TSDUNetConditioningInputs;
+    FPassConditioners: TStableDiffusionConditionerArray;
+    FStepPos, FStepCount: integer;
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
     FLoRAScales: TNeuralFloatDynArr;
@@ -12289,6 +12323,9 @@ type
     function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
     // The Conditioner, or the plain one when none is set.
     function ActiveConditioner(): TStableDiffusionConditioner;
+    // Zeroes the control / adapter inputs, then FPassConditioners fill them.
+    procedure FillUNetInputs(Latents, Embeds: TNNetVolume;
+      Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
     procedure ReleaseComponent(Net: TNNet);
     procedure FreeKeptComponents();
     // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
@@ -12396,7 +12433,8 @@ type
     property OnAncestralNoise: TStableDiffusionNoiseEvent
       read FOnAncestralNoise write FOnAncestralNoise;
     // ControlNet / T2I-Adapter / IP-Adapter / img2img / inpainting /
-    // InstructPix2Pix for later Denoise calls; nil runs the plain UNet. Not owned.
+    // InstructPix2Pix (several: TStableDiffusionMultiConditioner) for later
+    // Denoise calls; nil runs the plain UNet. Not owned.
     property Conditioner: TStableDiffusionConditioner read FConditioner
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
@@ -12602,6 +12640,12 @@ type
     FSourceImage, FControlImage, FMidResidual: TNNetVolume;
     FDownResiduals: array of TNNetVolume;
     FConditioningScale: TNeuralFloat;
+    FGuidanceStart, FGuidanceEnd: double;
+    FGuessMode: boolean;
+  protected
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); override;
   public
     constructor Create(const ControlNetFolder: string);
     destructor Destroy(); override;
@@ -12610,13 +12654,17 @@ type
     function UNetWithControl(): boolean; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
-    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
-      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers controlnet_conditioning_scale (1.0).
     property ConditioningScale: TNeuralFloat read FConditioningScale
       write FConditioningScale;
+    // diffusers control_guidance_start / _end (0, 1): step i of N gets the
+    // residuals when start <= i / N and (i + 1) / N <= end.
+    property GuidanceStart: double read FGuidanceStart write FGuidanceStart;
+    property GuidanceEnd: double read FGuidanceEnd write FGuidanceEnd;
+    // diffusers guess_mode: residuals only in the prompt pass, the down ones
+    // scaled by logspace(-1, 0) toward the mid one.
+    property GuessMode: boolean read FGuessMode write FGuessMode;
     property Config: TControlNetConfig read FConfig;
   end;
 
@@ -12631,6 +12679,10 @@ type
     FSourceImage, FHintImage: TNNetVolume;
     FFeatures: array of TNNetVolume;
     FConditioningScale: TNeuralFloat;
+  protected
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); override;
   public
     constructor Create(const AdapterFolder: string);
     destructor Destroy(); override;
@@ -12639,9 +12691,6 @@ type
     function UNetWithAdapter(): boolean; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
-    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
-      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers adapter_conditioning_scale (1.0).
     property ConditioningScale: TNeuralFloat read FConditioningScale
@@ -12870,12 +12919,17 @@ type
     FImageEncoder, FImageProj: TNNet;
     FSourceImage, FPixels, FImageEmbeds, FZeroEmbeds: TNNetVolume;
     // to_k_ip tokens and the Scale-weighted to_v_ip ones, of the image and
-    // of the zero embedding (the passes without sdpiImage).
+    // of the zero embedding (the passes without sdpiPrompt).
     FImageTokens, FImageValueTokens: TNNetVolume;
     FUncondTokens, FUncondValueTokens: TNNetVolume;
     FScale: TNeuralFloat;
     // Image tokens and their Scale copy of Embeds through image_proj.
     procedure ProjectImageEmbeds(Embeds, Tokens, ValueTokens: TNNetVolume);
+  protected
+    // The image tokens in the prompt passes, the zero embedding's otherwise.
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); override;
   public
     // WeightsFile: ip-adapter_sd15 (.safetensors / .bin); ImageEncoderFolder
     // '' is image_encoder/ beside it (CLIPVisionModelWithProjection).
@@ -12887,15 +12941,46 @@ type
     function UNetIPAdapterFile(): string; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
-    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
-      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
-      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
     procedure EndDenoise(); override;
     // diffusers set_ip_adapter_scale (1.0); 0 leaves the text attention alone.
     property Scale: TNeuralFloat read FScale write FScale;
     // The image_embeds (ClipEmbeddingsDim, 1, 1) of the last BeginDenoise.
     property ImageEmbeds: TNNetVolume read FImageEmbeds;
     property ImageEncoderConfig: TClipConfig read FImageEncoderConfig;
+  end;
+
+  // Several conditioners (not owned) in one Denoise: ControlNets and
+  // T2I-Adapters (summed, as diffusers MultiControlNetModel), at most one
+  // IP-Adapter and at most one image conditioner (img2img, inpainting,
+  // InstructPix2Pix), which then owns the start, the guided passes and the steps.
+  TStableDiffusionMultiConditioner = class(TStableDiffusionConditioner)
+  private
+    FMembers: TStableDiffusionConditionerArray;
+    FImageConditioner: TStableDiffusionConditioner;
+    // Members whose BeginDenoise ran; only they get EndDenoise.
+    FBegunCount: integer;
+  protected
+    procedure CollectConditioners(
+      var Conditioners: TStableDiffusionConditionerArray); override;
+  public
+    // Raises on a second IP-Adapter or image conditioner, or a multi one.
+    procedure Add(Conditioner: TStableDiffusionConditioner);
+    function UNetWithControl(): boolean; override;
+    function UNetWithAdapter(): boolean; override;
+    function UNetIPAdapterFile(): string; override;
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    function DenoiseStrength(): double; override;
+    function StartsFromImage(): boolean; override;
+    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); override;
+    function IsGuided(GuidanceScale: TNeuralFloat): boolean; override;
+    procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    procedure EndDenoise(); override;
   end;
 
 // ---------------------------------------------------------------------------
@@ -75859,20 +75944,17 @@ begin
   Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Ctrl])], HLayer );
 end;
 
-// T2I-Adapter main-path splice: when pWithAdapter, appends a zero-filled adapter
-// feature TNNetInput and returns Sum(HLayer, AdapterInput) -- the new hidden
-// state that flows DOWNSTREAM (unlike SDUNetSpliceControlSkip which only feeds
-// the decoder skip). No-op (returns HLayer) when pWithAdapter is false.
+// T2I-Adapter main-path splice: Sum(HLayer, AdapterInputs[AdapterTop]) -- the
+// hidden state that flows DOWNSTREAM, unlike SDUNetSpliceControlSkip's skip
+// copy. No-op (returns HLayer) when pWithAdapter is false.
 function SDUNetSpliceAdapterMain(NN: TNNet; HLayer: TNNetLayer;
-  GridX, GridY, Ch: integer; pWithAdapter: boolean;
-  var AdapterInputs: array of TNNetLayer; var AdapterTop: integer): TNNetLayer;
-var
-  Adp: TNNetLayer;
+  pWithAdapter: boolean; const AdapterInputs: array of TNNetLayer;
+  var AdapterTop: integer): TNNetLayer;
 begin
   if not pWithAdapter then begin Result := HLayer; Exit; end;
-  Adp := NN.AddLayer( TNNetInput.Create(GridX, GridY, Ch) );
-  AdapterInputs[AdapterTop] := Adp; Inc(AdapterTop);
-  Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Adp])], HLayer );
+  Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer,
+    AdapterInputs[AdapterTop]])], HLayer );
+  Inc(AdapterTop);
 end;
 
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
@@ -75885,7 +75967,7 @@ var
   IPConfig: TIPAdapterConfig;
   IPKeyId: integer;
   AdapterInputs: array of TNNetLayer;
-  AdapterTop: integer;
+  AdapterTop, AdapterGridX, AdapterGridY: integer;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
   TimeCond, NormOut, ConvOut, HLayer: TNNetLayer;
   AddEmbInput, AddFc0, AddSilu, AddFc2: TNNetLayer;
@@ -75948,13 +76030,8 @@ begin
   IPKeyInput := nil;
   IPValueInput := nil;
   if IPAdapterReader <> nil then
-  begin
-    if pWithControl or pWithAdapter then
-      ImportError('SD UNet import: an IP-Adapter does not combine with the ' +
-        'ControlNet / T2I-Adapter inputs.');
     IPConfig := ReadIPAdapterImageProjConfig(IPAdapterReader,
       Config.CrossAttentionDim);
-  end;
   NN := TNNet.Create();
   try
     SetLength(DownRes, n);
@@ -75970,7 +76047,6 @@ begin
     SkipTop := 0;
     SetLength(CtrlInputs, 64);
     CtrlTop := 0;
-    SetLength(AdapterInputs, 64);
     AdapterTop := 0;
     CurGridX := Config.LatentGrid;
     CurGridY := LatentGridYOf(Config);
@@ -76028,6 +76104,31 @@ begin
         Config.CrossAttentionDim) );
     end;
 
+    // One T2I-Adapter input per down block, ahead of every control input: a
+    // block with attention (or the last one) takes it before its downsampler,
+    // a plain one after it.
+    if pWithAdapter then
+    begin
+      SetLength(AdapterInputs, n);
+      AdapterGridX := CurGridX;
+      AdapterGridY := CurGridY;
+      for i := 0 to nM1 do
+      begin
+        if not (Config.DownHasAttn[i] or (i = nM1)) then
+        begin
+          AdapterGridX := (AdapterGridX + 1) div 2;
+          AdapterGridY := (AdapterGridY + 1) div 2;
+        end;
+        AdapterInputs[i] := NN.AddLayer( TNNetInput.Create(AdapterGridX,
+          AdapterGridY, Config.BlockOutChannels[i]) );
+        if Config.DownHasAttn[i] and (i < nM1) then
+        begin
+          AdapterGridX := (AdapterGridX + 1) div 2;
+          AdapterGridY := (AdapterGridY + 1) div 2;
+        end;
+      end;
+    end;
+
     if not pTrainable then NN.SetTrainable();
 
     // conv_in skip (deferred until after the latent/timestep/text inputs so the
@@ -76062,8 +76163,8 @@ begin
         // on (diffusers adds it in a cross-attn block before the downsampler,
         // in a plain block after it, in place on the last skip tensor).
         if (j = NumResnetM1) and (Config.DownHasAttn[i] or (i = nM1)) then
-          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
-            OutCh, pWithAdapter, AdapterInputs, AdapterTop);
+          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, pWithAdapter,
+            AdapterInputs, AdapterTop);
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
           CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh;
@@ -76082,8 +76183,8 @@ begin
         CurGridX := (CurGridX + 1) div 2;
         CurGridY := (CurGridY + 1) div 2;
         if not Config.DownHasAttn[i] then
-          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGridX, CurGridY,
-            OutCh, pWithAdapter, AdapterInputs, AdapterTop);
+          HLayer := SDUNetSpliceAdapterMain(NN, HLayer, pWithAdapter,
+            AdapterInputs, AdapterTop);
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGridX,
           CurGridY, OutCh, pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh;
@@ -76462,6 +76563,63 @@ end;
 function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 begin
   Result := SDUNetNthInput(Net, 2);
+end;
+
+function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
+  WithIPAdapter, WithAdapter, WithControl: boolean): TSDUNetConditioningInputs;
+var
+  Inputs: array of TNNetLayer;
+  InputCount, LayerPos, MaxLayerPos, NextInput, ExpectedCount: integer;
+  AdapterCount, ControlDownCount: integer;
+
+  procedure TakeInputs(var Dest: array of TNNetLayer);
+  var
+    DestPos, MaxDestPos: integer;
+  begin
+    MaxDestPos := High(Dest);
+    for DestPos := 0 to MaxDestPos do
+    begin
+      Dest[DestPos] := Inputs[NextInput];
+      Inc(NextInput);
+    end;
+  end;
+
+begin
+  AdapterCount := 0;
+  if WithAdapter then AdapterCount := SDUNetAdapterFeatureCount(Config);
+  ControlDownCount := 0;
+  if WithControl then ControlDownCount := SDUNetControlDownCount(Config);
+  NextInput := SDUNetSkipInputBase(Config);
+  ExpectedCount := NextInput + AdapterCount + ControlDownCount;
+  if WithIPAdapter then Inc(ExpectedCount, 2);
+  if WithControl then Inc(ExpectedCount);
+  SetLength(Inputs, ExpectedCount);
+  InputCount := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if Net.Layers[LayerPos] is TNNetInput then
+    begin
+      if InputCount < ExpectedCount then Inputs[InputCount] := Net.Layers[LayerPos];
+      Inc(InputCount);
+    end;
+  if InputCount <> ExpectedCount then
+    ImportError('SDUNetConditioningInputs: the net has ' +
+      IntToStr(InputCount) + ' TNNetInput layers, these options build ' +
+      IntToStr(ExpectedCount) + '.');
+  Result.IPKeyTokens := nil;
+  Result.IPValueTokens := nil;
+  Result.ControlMid := nil;
+  if WithIPAdapter then
+  begin
+    Result.IPKeyTokens := Inputs[NextInput];
+    Result.IPValueTokens := Inputs[NextInput + 1];
+    Inc(NextInput, 2);
+  end;
+  SetLength(Result.Adapter, AdapterCount);
+  TakeInputs(Result.Adapter);
+  SetLength(Result.ControlDown, ControlDownCount);
+  TakeInputs(Result.ControlDown);
+  if WithControl then Result.ControlMid := Inputs[NextInput];
 end;
 
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
@@ -93879,7 +94037,8 @@ var
   StepConditioner: TStableDiffusionConditioner;
   Schedule: TNeuralIntegerArray;
   Pred, StepNoise: TNNetVolume;
-  IsGuided: boolean;
+  IsGuided, WithControl, WithAdapter: boolean;
+  IPAdapterFile: string;
   GridX, GridY, StepPos, MaxStepPos, Tt, StartStep: integer;
   Eta, NoiseScale: TNeuralFloat;
 begin
@@ -93912,13 +94071,18 @@ begin
   StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
-  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX,
-    StepConditioner.UNetWithControl(), StepConditioner.UNetWithAdapter(),
-    StepConditioner.UNetIPAdapterFile());
+  WithControl := StepConditioner.UNetWithControl();
+  WithAdapter := StepConditioner.UNetWithAdapter();
+  IPAdapterFile := StepConditioner.UNetIPAdapterFile();
+  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX, WithControl,
+    WithAdapter, IPAdapterFile);
   Pred := TNNetVolume.Create();
   StepNoise := nil;
   try
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
+    FUNetInputs := SDUNetConditioningInputs(Net, StepConfig,
+      IPAdapterFile <> '', WithAdapter, WithControl);
+    StepConditioner.CollectConditioners(FPassConditioners);
     DoPhase(sdphDenoise);
     Schedule := FScheduler.BuildSamplerSchedule(StepCount,
       FScheduler.ConfigSpacing, FSampler);
@@ -93943,8 +94107,10 @@ begin
     if (FSampler = smEulerAncestral) and Assigned(FOnAncestralNoise) then
       StepNoise := TNNetVolume.Create(Latents);
     MaxStepPos := Length(Schedule) - 2;
+    FStepCount := MaxStepPos + 1;
     for StepPos := 0 to MaxStepPos do
     begin
+      FStepPos := StepPos;
       // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
       Tt := Schedule[StepPos];
       StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
@@ -93958,10 +94124,32 @@ begin
   finally
     EndPhase();
     StepConditioner.EndDenoise();
+    FPassConditioners := nil;
+    FUNetInputs := Default(TSDUNetConditioningInputs);
     StepNoise.Free;
     Pred.Free;
     ReleaseComponent(Net);
   end;
+end;
+
+procedure TStableDiffusionPipeline.FillUNetInputs(Latents,
+  Embeds: TNNetVolume; Timestep: TNeuralFloat;
+  Inputs: TStableDiffusionPassInputs);
+var
+  InputPos, MaxInputPos, ConditionerPos, MaxConditionerPos: integer;
+begin
+  MaxInputPos := High(FUNetInputs.Adapter);
+  for InputPos := 0 to MaxInputPos do
+    FUNetInputs.Adapter[InputPos].Output.Fill(0);
+  MaxInputPos := High(FUNetInputs.ControlDown);
+  for InputPos := 0 to MaxInputPos do
+    FUNetInputs.ControlDown[InputPos].Output.Fill(0);
+  if Assigned(FUNetInputs.ControlMid) then
+    FUNetInputs.ControlMid.Output.Fill(0);
+  MaxConditionerPos := High(FPassConditioners);
+  for ConditionerPos := 0 to MaxConditionerPos do
+    FPassConditioners[ConditionerPos].FillUNetInputs(FUNetInputs, Latents,
+      Embeds, Timestep, Inputs);
 end;
 
 procedure TStableDiffusionPipeline.DecodeLatents(Latents: TNNetVolume; Width,
@@ -94049,13 +94237,38 @@ procedure TStableDiffusionConditioner.PredictPass(UNet: TNNet;
   const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
   Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
   Pred: TNNetVolume);
+var
+  Embeds: TNNetVolume;
 begin
-  if sdpiPrompt in Inputs then
-    PredictNoise(UNet, Config, Latents, PromptEmbeds, Timestep, Inputs, Pred)
-  else
-    PredictNoise(UNet, Config, Latents, FPipeline.FNegativePromptEmbeds,
-      Timestep, Inputs, Pred);
+  if sdpiPrompt in Inputs then Embeds := PromptEmbeds
+  else Embeds := FPipeline.FNegativePromptEmbeds;
+  FPipeline.FillUNetInputs(Latents, Embeds, Timestep, Inputs);
+  PredictNoise(UNet, Config, Latents, Embeds, Timestep, Inputs, Pred);
   Inc(FPipeline.FImageStats.UNetPassCount);
+end;
+
+procedure TStableDiffusionConditioner.CollectConditioners(
+  var Conditioners: TStableDiffusionConditionerArray);
+begin
+  SetLength(Conditioners, Length(Conditioners) + 1);
+  Conditioners[High(Conditioners)] := Self;
+end;
+
+procedure TStableDiffusionConditioner.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
+begin
+end;
+
+// Adds Volume into (Accumulate) or copies it to the input layer InputLayer.
+procedure SDUNetWriteInput(InputLayer: TNNetLayer; Volume: TNNetVolume;
+  Accumulate: boolean; const What: string);
+begin
+  if Volume.Size <> InputLayer.Output.Size then
+    ImportError(What + ' size ' + IntToStr(Volume.Size) + ' <> the unet ' +
+      'input size ' + IntToStr(InputLayer.Output.Size) + '.');
+  if Accumulate then InputLayer.Output.Add(Volume)
+  else InputLayer.Output.Copy(Volume);
 end;
 
 function TStableDiffusionConditioner.IsGuided(
@@ -94221,6 +94434,8 @@ begin
   FControlImage := TNNetVolume.Create();
   FMidResidual := TNNetVolume.Create();
   FConditioningScale := 1;
+  FGuidanceStart := 0;
+  FGuidanceEnd := 1;
 end;
 
 destructor TStableDiffusionControlNet.Destroy();
@@ -94258,6 +94473,11 @@ begin
   GridY := Latents.SizeY;
   if FSourceImage.Size = 0 then
     ImportError('TStableDiffusionControlNet: call SetControlImage first.');
+  if (FGuidanceStart < 0) or (FGuidanceEnd > 1) or
+    (FGuidanceStart >= FGuidanceEnd) then
+    ImportError('TStableDiffusionControlNet: guidance start ' +
+      FloatToStr(FGuidanceStart) + ' and end ' + FloatToStr(FGuidanceEnd) +
+      ' need 0 <= start < end <= 1.');
   CondFactor := 1 shl (FConfig.NumCondEmbedOut - 1);
   if CondFactor <> Pipeline.VaeScaleFactor then
     ImportError('TStableDiffusionControlNet: the conditioning embedding ' +
@@ -94298,24 +94518,37 @@ begin
   end;
 end;
 
-procedure TStableDiffusionControlNet.PredictNoise(UNet: TNNet;
-  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
-  Pred: TNNetVolume);
+procedure TStableDiffusionControlNet.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
 var
   ResidualPos, MaxResidualPos: integer;
+  StepStart, StepEnd: double;
+  ResidualScale: TNeuralFloat;
 begin
+  // diffusers controlnet_keep, in float64.
+  StepStart := FPipeline.FStepPos / FPipeline.FStepCount;
+  StepEnd := (FPipeline.FStepPos + 1) / FPipeline.FStepCount;
+  if (StepStart < FGuidanceStart) or (StepEnd > FGuidanceEnd) then exit;
+  if FGuessMode and not (sdpiPrompt in Inputs) then exit;
   ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, FControlImage,
     Timestep, FDownResiduals, FMidResidual);
-  if FConditioningScale <> 1 then
+  MaxResidualPos := High(FDownResiduals);
+  for ResidualPos := 0 to MaxResidualPos do
   begin
-    MaxResidualPos := High(FDownResiduals);
-    for ResidualPos := 0 to MaxResidualPos do
-      FDownResiduals[ResidualPos].Mul(FConditioningScale);
-    FMidResidual.Mul(FConditioningScale);
+    ResidualScale := FConditioningScale;
+    // torch.logspace(-1, 0, residual count + 1); the mid residual takes 1.
+    if FGuessMode then
+      ResidualScale := ResidualScale *
+        Power(10, ResidualPos / (MaxResidualPos + 1) - 1);
+    if ResidualScale <> 1 then FDownResiduals[ResidualPos].Mul(ResidualScale);
+    SDUNetWriteInput(UNetInputs.ControlDown[ResidualPos],
+      FDownResiduals[ResidualPos], {Accumulate=}true,
+      'TStableDiffusionControlNet: down residual');
   end;
-  SDUNetDenoiseWithControl(UNet, Config, Latents, Embeds, Timestep,
-    FDownResiduals, FMidResidual, Pred);
+  if FConditioningScale <> 1 then FMidResidual.Mul(FConditioningScale);
+  SDUNetWriteInput(UNetInputs.ControlMid, FMidResidual, {Accumulate=}true,
+    'TStableDiffusionControlNet: mid residual');
 end;
 
 procedure TStableDiffusionControlNet.EndDenoise();
@@ -94423,13 +94656,16 @@ begin
   if not Pipeline.ComponentsLoaded then FreeAndNil(FNet);
 end;
 
-procedure TStableDiffusionT2IAdapter.PredictNoise(UNet: TNNet;
-  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
-  Pred: TNNetVolume);
+procedure TStableDiffusionT2IAdapter.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
+var
+  FeaturePos, MaxFeaturePos: integer;
 begin
-  SDUNetDenoiseWithAdapter(UNet, Config, Latents, Embeds, Timestep,
-    FFeatures, Pred);
+  MaxFeaturePos := High(FFeatures);
+  for FeaturePos := 0 to MaxFeaturePos do
+    SDUNetWriteInput(UNetInputs.Adapter[FeaturePos], FFeatures[FeaturePos],
+      {Accumulate=}true, 'TStableDiffusionT2IAdapter: feature');
 end;
 
 procedure TStableDiffusionT2IAdapter.EndDenoise();
@@ -94581,17 +94817,24 @@ begin
   end;
 end;
 
-procedure TStableDiffusionIPAdapter.PredictNoise(UNet: TNNet;
-  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
-  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
-  Pred: TNNetVolume);
+procedure TStableDiffusionIPAdapter.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
+const
+  csWhat = 'TStableDiffusionIPAdapter: image tokens';
 begin
-  if not (sdpiImage in Inputs) then
-    SDUNetDenoiseWithIPAdapter(UNet, Config, Latents, Embeds, Timestep,
-      FUncondTokens, FUncondValueTokens, Pred)
+  if sdpiPrompt in Inputs then
+  begin
+    SDUNetWriteInput(UNetInputs.IPKeyTokens, FImageTokens, false, csWhat);
+    SDUNetWriteInput(UNetInputs.IPValueTokens, FImageValueTokens, false,
+      csWhat);
+  end
   else
-    SDUNetDenoiseWithIPAdapter(UNet, Config, Latents, Embeds, Timestep,
-      FImageTokens, FImageValueTokens, Pred);
+  begin
+    SDUNetWriteInput(UNetInputs.IPKeyTokens, FUncondTokens, false, csWhat);
+    SDUNetWriteInput(UNetInputs.IPValueTokens, FUncondValueTokens, false,
+      csWhat);
+  end;
 end;
 
 procedure TStableDiffusionIPAdapter.EndDenoise();
@@ -94601,6 +94844,146 @@ begin
     FreeAndNil(FImageEncoder);
     FreeAndNil(FImageProj);
   end;
+end;
+
+procedure TStableDiffusionMultiConditioner.CollectConditioners(
+  var Conditioners: TStableDiffusionConditionerArray);
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  MaxMemberPos := High(FMembers);
+  for MemberPos := 0 to MaxMemberPos do
+    FMembers[MemberPos].CollectConditioners(Conditioners);
+end;
+
+procedure TStableDiffusionMultiConditioner.Add(
+  Conditioner: TStableDiffusionConditioner);
+begin
+  if Conditioner is TStableDiffusionMultiConditioner then
+    ImportError('TStableDiffusionMultiConditioner: add the members, not ' +
+      'another multi-conditioner.');
+  if (Conditioner is TStableDiffusionImageConditioner) and
+    Assigned(FImageConditioner) then
+    ImportError('TStableDiffusionMultiConditioner: one image conditioner at ' +
+      'most (' + FImageConditioner.ClassName + ' is set).');
+  if (Conditioner.UNetIPAdapterFile() <> '') and (UNetIPAdapterFile() <> '') then
+    ImportError('TStableDiffusionMultiConditioner: one IP-Adapter at most.');
+  if Conditioner is TStableDiffusionImageConditioner then
+    FImageConditioner := Conditioner;
+  SetLength(FMembers, Length(FMembers) + 1);
+  FMembers[High(FMembers)] := Conditioner;
+end;
+
+function TStableDiffusionMultiConditioner.UNetWithControl(): boolean;
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  Result := false;
+  MaxMemberPos := High(FMembers);
+  for MemberPos := 0 to MaxMemberPos do
+    Result := Result or FMembers[MemberPos].UNetWithControl();
+end;
+
+function TStableDiffusionMultiConditioner.UNetWithAdapter(): boolean;
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  Result := false;
+  MaxMemberPos := High(FMembers);
+  for MemberPos := 0 to MaxMemberPos do
+    Result := Result or FMembers[MemberPos].UNetWithAdapter();
+end;
+
+function TStableDiffusionMultiConditioner.UNetIPAdapterFile(): string;
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  Result := '';
+  MaxMemberPos := High(FMembers);
+  for MemberPos := 0 to MaxMemberPos do
+    if Result = '' then Result := FMembers[MemberPos].UNetIPAdapterFile();
+end;
+
+function TStableDiffusionMultiConditioner.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  if Assigned(FImageConditioner) then
+    Result := FImageConditioner.AcceptsUNetInChannels(InChannels,
+      LatentChannels)
+  else Result := inherited AcceptsUNetInChannels(InChannels, LatentChannels);
+end;
+
+procedure TStableDiffusionMultiConditioner.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  MaxMemberPos: integer;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  FBegunCount := 0;
+  MaxMemberPos := High(FMembers);
+  while FBegunCount <= MaxMemberPos do
+  begin
+    FMembers[FBegunCount].BeginDenoise(Pipeline, Latents, TextSeqLen);
+    Inc(FBegunCount);
+  end;
+end;
+
+function TStableDiffusionMultiConditioner.DenoiseStrength(): double;
+begin
+  if Assigned(FImageConditioner) then
+    Result := FImageConditioner.DenoiseStrength()
+  else Result := inherited DenoiseStrength();
+end;
+
+function TStableDiffusionMultiConditioner.StartsFromImage(): boolean;
+begin
+  if Assigned(FImageConditioner) then
+    Result := FImageConditioner.StartsFromImage()
+  else Result := inherited StartsFromImage();
+end;
+
+procedure TStableDiffusionMultiConditioner.NoiseImageLatents(
+  Latents: TNNetVolume; Tt: integer);
+begin
+  if Assigned(FImageConditioner) then
+    FImageConditioner.NoiseImageLatents(Latents, Tt)
+  else inherited NoiseImageLatents(Latents, Tt);
+end;
+
+function TStableDiffusionMultiConditioner.IsGuided(
+  GuidanceScale: TNeuralFloat): boolean;
+begin
+  if Assigned(FImageConditioner) then
+    Result := FImageConditioner.IsGuided(GuidanceScale)
+  else Result := inherited IsGuided(GuidanceScale);
+end;
+
+procedure TStableDiffusionMultiConditioner.PredictGuidedNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  if Assigned(FImageConditioner) then
+    FImageConditioner.PredictGuidedNoise(UNet, Config, Latents, PromptEmbeds,
+      Timestep, Pred)
+  else inherited PredictGuidedNoise(UNet, Config, Latents, PromptEmbeds,
+    Timestep, Pred);
+end;
+
+procedure TStableDiffusionMultiConditioner.AfterStep(Latents: TNNetVolume;
+  NextTt: integer);
+begin
+  if Assigned(FImageConditioner) then
+    FImageConditioner.AfterStep(Latents, NextTt);
+end;
+
+procedure TStableDiffusionMultiConditioner.EndDenoise();
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  MaxMemberPos := FBegunCount - 1;
+  FBegunCount := 0;
+  for MemberPos := 0 to MaxMemberPos do FMembers[MemberPos].EndDenoise();
 end;
 
 constructor TStableDiffusionImageConditioner.Create();

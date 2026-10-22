@@ -597,10 +597,27 @@ rather than acted on.
               truncates via TNNetDiffusionScheduler.Img2ImgStartStep,
               EncodeVaeImage samples; DiffusionInpainting --strength;
               TestStableDiffusionInpaintStrengthParity < 1e-4.
-        - [ ] ControlNet guess mode, control_guidance_start/end, MultiControlNet,
+        - [X] ControlNet guess mode, control_guidance_start/end, MultiControlNet,
               T2I MultiAdapter, and ControlNet + T2I-Adapter at once (BuildSDUNet
               interleaves the control and adapter TNNetInputs when both flags are
               set, which SDUNetDenoiseWithControl/WithAdapter do not expect).
+              DONE 2026-10-22: TStableDiffusionControlNet.GuidanceStart /
+              GuidanceEnd / GuessMode; BuildSDUNet creates the adapter inputs
+              ahead of the control ones (order IP, adapter, control;
+              SDUNetConditioningInputs finds them); TStableDiffusionMultiConditioner
+              sums several ControlNets / T2I-Adapters; ControlNetCanny
+              --control-start/--control-end/--guess-mode. Pico parity < 1e-4:
+              window, guess mode, MultiControlNet, ControlNet + T2I + IP-Adapter
+              (tiny_sd15_composed_io.json). T2I MultiAdapter has no test.
+        - [ ] Composed-conditioner follow-ups: (1) parity for ControlNet / T2I on
+              img2img and inpainting (diffusers StableDiffusionControlNetImg2Img /
+              Inpaint pipelines; the multi-conditioner runs them, untested, and
+              diffusers' ControlNet-inpaint prepares its control image with the
+              mask); (2) IP-Adapter + img2img / inpainting parity (code path
+              shared with the tested InstructPix2Pix case); (3) a T2I MultiAdapter
+              test (diffusers MultiAdapter adapter_weights); (4) ControlNet
+              config global_pool_conditions (forces guess mode, pools the
+              residuals) is not read; (5) CLI for several ControlNets.
         - [X] Retire SDUNetDenoiseInpaint (its blend runs before the UNet with
               fresh AddNoise draws, not diffusers' after-step blend with the
               initial noise) and TestDiffusionInpaintSmoke, superseded by
@@ -663,8 +680,16 @@ rather than acted on.
             < 1e-4, key order down/up/mid verified on the fixture.
         - [ ] Run h94/IP-Adapter ip-adapter_sd15 on real SD 1.5 (only the pico
               fixture is tested).
-        - [ ] IP-Adapter with ControlNet / T2I-Adapter: one conditioner per
+        - [X] IP-Adapter with ControlNet / T2I-Adapter: one conditioner per
               Denoise today, and BuildSDUNet refuses the combination.
+              DONE 2026-10-22: TStableDiffusionMultiConditioner (members fill the
+              UNet's extra inputs before every pass, through the new
+              TStableDiffusionConditioner.FillUNetInputs hook; one image
+              conditioner owns the steps). IP-Adapter tokens now follow the
+              prompt pass (diffusers' [image, zero, zero] on InstructPix2Pix).
+              Parity < 1e-4: IP + ControlNet, IP + ControlNet + T2I, IP +
+              InstructPix2Pix. CLI: ControlNetCanny --ip-adapter, StableDiffusion
+              --ip-adapter with --init-image / --edit-image.
         - [ ] IP-Adapter extras: set_ip_adapter_scale per-block dicts
               (style/layout), several adapters/images, ip_adapter_masks,
               ip-adapter-plus (Resampler), FaceID, SDXL.
