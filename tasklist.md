@@ -526,10 +526,6 @@ rather than acted on.
             --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
             per-component parity against diffusers on the real weights (the ~/x
             venv oracle recipe).
-      - [X] use_karras_sigmas (Euler, DPM++ 2M; --karras-sigmas also on
-            Euler a) and Euler / Euler a linspace fractional timesteps:
-            continuous sigmas through BuildSigmaSchedule / StepAtSigma
-            (TestStableDiffusionPipelineKarrasSigmas, < 1e-4).
       - [ ] Sampler gaps behind SamplerNotice (DDIM/PNDM/Euler/Euler a/DPM++ 2M
             are mapped with diffusers parity): UniPCMultistepScheduler (smUniPC
             has only a numpy oracle; diffusers takes N of N+1 points like DPM),
@@ -621,9 +617,6 @@ rather than acted on.
                 the image with diffusers.
           - [ ] The real UNet ships as fp16 weights in many mirrors; the F16
                 loader item below applies.
-          - [x] OpenCL parity for the upscaler
-                (TestStableDiffusionUpscalerOpenCL, < 1e-4 on PoCL; the
-                class-label TNNetEmbedding runs on the CPU by design).
           - [ ] diffusers' upscale pipeline takes a batch of images and
                 num_images_per_prompt; the conditioner takes one image.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
@@ -706,8 +699,6 @@ rather than acted on.
             (tools/make_pico_sd_prompt_weighting_fixture.py; the community
             pipeline is not in the ~/x venv). Open:
         - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
-        - [x] A1111 `BREAK` (TestSDPromptBreakParser,
-              TestStableDiffusionPromptBreakTokens).
         - [ ] A1111 extras not done: moving a chunk split back to a nearby
               comma, per-chunk mean restore (lpw restores the whole prompt's
               mean, which is what is coded).
@@ -726,8 +717,6 @@ rather than acted on.
               confirm the committed ControlNet / T2I / inpaint fixtures come out
               byte-identical after the --nonsquare-only / --inpaint-strength-only
               / --ip-adapter-only refactors;
-              (5) DONE: examples/DiffusionInpainting takes its output size from
-              the image through ImageSizeFor, as --init-image does;
               (6) img2img / inpaint parity covers only images already at the
               output size: add a fixture whose sides are not a VAE-factor
               multiple (diffusers resizes a PIL image with lanczos after uint8
@@ -748,16 +737,8 @@ rather than acted on.
         - [ ] FreeU follow-up: an `sdxl` preset (0.6, 0.4, 1.1, 1.2 in the diffusers
               FreeU docs) once an SDXL pipeline CLI exists; BuildSDUNet already
               applies FreeU to SDXL configs (up blocks 0 and 1).
-      - [X] DeepCache for the SD UNet (Ma et al. 2023, horseee/DeepCache
-            uniform mode): `TStableDiffusionPipeline.DeepCacheInterval` /
-            `DeepCacheBranch` (= `cache_branch_id` with block 0, default
-            LayersPerBlock = the spec's split), examples/StableDiffusion
-            `--deepcache N --deepcache-branch B`. BuildSDUNet records a
-            `TSDUNetDeepCacheLayout` and checks no shallow layer reads a deep
-            one (no reorder was needed); the decision is
-            `TDiTFirstBlockCache.Interval` + StoreTailOutput/RestoreTailOutput;
-            one cache per pass kind (CFG, InstructPix2Pix). Tests
-            `TestDiTFirstBlockCacheInterval`, `TestStableDiffusionDeepCache*`.
+      - [ ] DeepCache follow-ups (`TStableDiffusionPipeline.DeepCacheInterval`,
+            examples/StableDiffusion `--deepcache N --deepcache-branch B`):
         - [ ] GPU box: SD 1.5, 50 steps DDIM, `--deepcache 2/3/5` (branch 0 and
               the default) vs off: time per image and image pairs in
               examples/StableDiffusion/README.md.
@@ -2154,10 +2135,6 @@ rather than acted on.
             defaults (2 of 18 steps run the extra pass) from the user's GPU
             box, for examples/QwenImage/README.md; the default blocks (PAG 16,
             SLG 6,7,8) are untuned on the real checkpoint.
-      - [X] SD UNet consumer: `TStableDiffusionPipeline.PerturbedGuidance`
-            and examples/StableDiffusion `--pag-scale` / `--pag-layers` /
-            `--pag-adaptive-scale`, as diffusers `StableDiffusionPAGPipeline`
-            (pico parity < 1e-4, `TestStableDiffusionPAG*`).
       - [ ] Later consumers: examples/LatentTextToImage and CogVideoX; a
             with/without PAG image pair on a real SD 1.5 checkpoint.
       A diffusers oracle needs a patched block / processor registry and a
