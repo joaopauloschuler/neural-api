@@ -337,6 +337,10 @@ type
     procedure TestRealFFT2DRoundTrip;
     procedure TestRealFFT2DGradientCheck;
     procedure TestRealFFT2DSerializationRoundTrip;
+    // TNNetFreeUFourierFilter (FreeU skip filter): input gradient, odd, even
+    // and 1-wide sides; structure round trip.
+    procedure TestFreeUFourierFilterGradientCheck;
+    procedure TestFreeUFourierFilterSerializationRoundTrip;
     // AddFourierNeuralOperator1D/2D block builders (spectral + pointwise residual)
     procedure TestFourierNeuralOperator1DShape;
     procedure TestFourierNeuralOperator2DShape;
@@ -1095,6 +1099,10 @@ type
     // resident chain with ForceOpenCL off.
     procedure LocalResponseNormOpenCLParity;
     procedure LocalResponseNormResidentChainOpenCL;
+    // TNNetFreeUFourierFilter OpenCL forward vs CPU, and in a resident chain
+    // with ForceOpenCL off.
+    procedure FreeUFourierFilterOpenCLParity;
+    procedure FreeUFourierFilterResidentChainOpenCL;
     // TNNetConvGRUCell OpenCL forward vs CPU, and in a resident chain with
     // ForceOpenCL off.
     procedure ConvGRUCellOpenCLParity;
@@ -66126,6 +66134,35 @@ begin
   WriteLn('  RealFFT2D pair gradient check max scaled error: ', MaxErr:0:8);
 end;
 
+procedure TTestNeuralNumerical.TestFreeUFourierFilterGradientCheck;
+const
+  CaseCount = 5;
+  SizeXs: array[0..CaseCount - 1] of integer = (5, 4, 1, 6, 2);
+  SizeYs: array[0..CaseCount - 1] of integer = (3, 4, 5, 1, 2);
+  Scales: array[0..CaseCount - 1] of TNeuralFloat = (0.2, 0.9, 1.6, 0.5, 0.3);
+var
+  CasePos: integer;
+  Err, MaxErr: Double;
+begin
+  MaxErr := 0;
+  for CasePos := 0 to CaseCount - 1 do
+  begin
+    Err := RealFFT2DGradientError(TNNetFreeUFourierFilter.Create(Scales[CasePos]),
+      SizeXs[CasePos], SizeYs[CasePos], 3);
+    AssertTrue('FreeU filter input gradient ' + IntToStr(SizeXs[CasePos]) + 'x' +
+      IntToStr(SizeYs[CasePos]) + ' err=' + FloatToStr(Err), Err < 1e-2);
+    MaxErr := Max(MaxErr, Err);
+  end;
+  WriteLn('  FreeU filter gradient check max scaled error: ', MaxErr:0:8);
+end;
+
+procedure TTestNeuralNumerical.TestFreeUFourierFilterSerializationRoundTrip;
+begin
+  // Weightless, but the scale (FFloatSt[0]) must survive dispatch.
+  SerializationRoundTrip(Self, TNNetFreeUFourierFilter.Create(0.2),
+    'FreeUFourierFilter', 5, 3, 4, 1e-5);
+end;
+
 procedure TTestNeuralNumerical.TestRealFFT2DSerializationRoundTrip;
 var
   NN, NN2: TNNet;
@@ -91339,6 +91376,159 @@ begin
     finally
       OutCPUB.Free; OutCPUA.Free; InputB.Free; InputA.Free; NN.Free;
     end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetFreeUFourierFilter under ForceOpenCL vs the host forward, over odd, even
+// and 1-wide sides, two inputs each; a trainable layer stays on the host.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.FreeUFourierFilterOpenCLParity;
+{$IFDEF OpenCL}
+const
+  CaseCount = 5;
+  SizeXs: array[0..CaseCount - 1] of integer = (7, 8, 1, 6, 2);
+  SizeYs: array[0..CaseCount - 1] of integer = (5, 8, 4, 1, 2);
+  Depths: array[0..CaseCount - 1] of integer = (6, 9, 3, 5, 4);
+  Scales: array[0..CaseCount - 1] of TNeuralFloat = (0.9, 0.2, 0.5, 1.4, 0.3);
+var
+  NN: TNNet;
+  InputA, InputB, OutCPUA, OutCPUB: TNNetVolume;
+  Filter: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos: integer;
+  DiffA, DiffB, FilterEffect: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to CaseCount - 1 do
+  begin
+    RandSeed := 7300 + CasePos;
+    NN := TNNet.Create();
+    InputA := TNNetVolume.Create(SizeXs[CasePos], SizeYs[CasePos], Depths[CasePos]);
+    InputB := TNNetVolume.Create(InputA);
+    OutCPUA := TNNetVolume.Create();
+    OutCPUB := TNNetVolume.Create();
+    try
+      InputA.RandomizeGaussian();
+      InputA.Add(0.5);
+      InputB.RandomizeGaussian();
+      NN.AddLayer(TNNetInput.Create(SizeXs[CasePos], SizeYs[CasePos],
+        Depths[CasePos]));
+      Filter := NN.AddLayer(TNNetFreeUFourierFilter.Create(Scales[CasePos]));
+      NN.SetTrainable(False, False);
+      NN.Compute(InputA);
+      OutCPUA.Copy(Filter.Output);
+      NN.Compute(InputB);
+      OutCPUB.Copy(Filter.Output);
+      FilterEffect := MaxAbsDiffOfVolumes(OutCPUA, InputA);
+      AssertTrue('the filter must change the input, max|diff| = ' +
+        FloatToStr(FilterEffect), FilterEffect > 1e-2);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(InputA);
+        AssertTrue('ForceOutputOnRAM must report the filter readable',
+          Filter.ForceOutputOnRAM());
+        DiffA := MaxAbsDiffOfVolumes(OutCPUA, Filter.Output);
+        NN.Compute(InputB);
+        Filter.ForceOutputOnRAM();
+        DiffB := MaxAbsDiffOfVolumes(OutCPUB, Filter.Output);
+        WriteLn('  FreeU filter OpenCL parity case ', CasePos, ': max|diff| A=',
+          DiffA:0:9, ' B=', DiffB:0:9, ' gpu forwards=', Filter.ForwardGPUCnt);
+        AssertEquals('both forwards must run in OpenCL', 2, Filter.ForwardGPUCnt);
+        AssertTrue('FreeU filter input A OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-5);
+        AssertTrue('FreeU filter input B OpenCL vs CPU max |diff| = ' +
+          FloatToStr(DiffB), DiffB < 1e-5);
+        NN.SetTrainable(True, False);
+        NN.Compute(InputA);
+        AssertEquals('a trainable filter must stay on the host', 2,
+          Filter.ForwardGPUCnt);
+        DiffA := MaxAbsDiffOfVolumes(OutCPUA, Filter.Output);
+        AssertTrue('trainable host forward after OpenCL max |diff| = ' +
+          FloatToStr(DiffA), DiffA < 1e-5);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+    finally
+      OutCPUB.Free; OutCPUA.Free; InputB.Free; InputA.Free; NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// ForceOpenCL off: TNNetInput -> pointwise conv -> TNNetFreeUFourierFilter ->
+// pointwise conv. The filter binds the resident source and keeps its own output
+// resident (sentinel); the result matches the CPU. Coded by Claude (AI).
+procedure TTestNeuralNumerical.FreeUFourierFilterResidentChainOpenCL;
+{$IFDEF OpenCL}
+const
+  InW = 7;
+  InH = 6;
+  InDepth = 4;
+  csSentinel = -7777;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Filter, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 4343;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InW, InH, InDepth);
+  OutCPU := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.AddLayer(TNNetInput.Create(InW, InH, InDepth));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    Filter := NN.AddLayer(TNNetFreeUFourierFilter.Create(0.2));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(5));
+    NN.SetTrainable(False, False);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    Conv.Output.Fill(csSentinel);
+    Filter.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    WriteLn('  FreeU filter resident chain: gpu forwards conv=', Conv.ForwardGPUCnt,
+      ' filter=', Filter.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('the conv must run in OpenCL', Conv.ForwardGPUCnt >= 2);
+    AssertTrue('the filter must follow its resident source',
+      Filter.ForwardGPUCnt >= 2);
+    AssertTrue('the projection must follow the resident filter output',
+      Proj.ForwardGPUCnt >= 2);
+    AssertEquals('conv host output not downloaded', csSentinel,
+      Conv.Output.Raw[0], 0);
+    AssertEquals('filter host output not downloaded', csSentinel,
+      Filter.Output.Raw[0], 0);
+    NN.GetLastLayer.ForceOutputOnRAM();
+    MaxDiff := MaxAbsDiffOfVolumes(OutCPU, NN.GetLastLayer.Output);
+    WriteLn('  FreeU filter resident chain: max|diff|=', MaxDiff:0:9);
+    AssertTrue('FreeU filter resident chain vs CPU max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-3);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}

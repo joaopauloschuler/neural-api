@@ -552,6 +552,7 @@ begin
     382: begin AddImgInput(ANet); Exit(L('TNNetRealFFT2D', TNNetRealFFT2D.Create(csFFTNormOrtho))); end;
     383: begin ANet.AddLayer(TNNetInput.Create(5, 8, 8, 1)); Exit(L('TNNetInverseRealFFT2D', TNNetInverseRealFFT2D.Create(8, csFFTNormOrtho))); end;
     384: begin ANet.AddLayer(TNNetInput.Create(4, 3, 12, 1)); Exit(L('TNNetTransposedChannelAttention', TNNetTransposedChannelAttention.Create(2))); end;
+    385: begin AddImgInput(ANet); Exit(L('TNNetFreeUFourierFilter', TNNetFreeUFourierFilter.Create(0.2))); end;
     else
       Result := False;
   end;

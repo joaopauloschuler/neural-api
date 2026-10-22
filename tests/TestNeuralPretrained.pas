@@ -37,7 +37,7 @@ type
 
   // What the kept pipeline of CheckSD15KeptSizeChange adds to the plain one.
   TSD15SizeChangeCase = (sccPlain, sccInt8, sccLoRA, sccControlNet,
-    sccT2IAdapter);
+    sccT2IAdapter, sccFreeU);
 
   TTestNeuralPretrained = class(TTestCase)
   private
@@ -98,7 +98,11 @@ type
     procedure CheckSD15ComposedCase(const CaseName: string;
       const FileName: string = 'tiny_sd15_composed_io.json');
     // FileName's width x height plain run: step-0 UNet, steps and image < 1e-4.
-    procedure CheckSD15SizedParity(const FileName: string);
+    // The step-0 UNet output, the guided steps and the image of FileName's
+    // non-square size < 1e-4, with FreeU when the file has "freeu"; OnOpenCL
+    // runs the UNet forced onto OpenCL and the pipeline with OpenCL enabled.
+    procedure CheckSD15SizedParity(const FileName: string;
+      OnOpenCL: boolean = false);
     // Writes the linear-projection pico UNet with conv_in widened to 8 input
     // channels (Marigold: image latent ++ target latent) to Path.
     procedure WriteMarigoldPicoUNet(const Path: string);
@@ -1276,6 +1280,10 @@ type
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineOddSize;
+    procedure TestFreeUFourierFilterTorchParity;
+    procedure TestStableDiffusionPipelineFreeUNonSquare;
+    procedure TestStableDiffusionPipelineFreeUOddSize;
+    procedure TestStableDiffusionPipelineFreeUOpenCL;
     procedure TestStableDiffusionPipelineKeepLoaded;
     procedure TestStableDiffusionPipelineSizeChangeBorrows;
     procedure TestStableDiffusionConditionerSizeChangeBorrows;
@@ -46041,15 +46049,94 @@ begin
   CheckSD15SizedParity('tiny_sd15_oddsize_io.json');
 end;
 
-procedure TTestNeuralPretrained.CheckSD15SizedParity(const FileName: string);
+// diffusers fourier_filter(threshold=1) on odd, even and 1-wide sides
+// (tiny_sd15_freeu_filter_io.json) vs TNNetFreeUFourierFilter, < 1e-5.
+procedure TTestNeuralPretrained.TestFreeUFourierFilterTorchParity;
+var
+  Root: TJSONData;
+  Cases: TJSONArray;
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  CasePos: integer;
+  MaxDiff, FilterEffect: double;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_freeu_filter_io.json');
+  Input := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Cases := TJSONObject(Root).Arrays['cases'];
+    AssertTrue('filter cases', Cases.Count >= 9);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      LoadNestedOracleVolume(Cases.Objects[CasePos].Arrays['input'], true, Input);
+      LoadNestedOracleVolume(Cases.Objects[CasePos].Arrays['output'], true,
+        Expected);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+        NN.AddLayer(TNNetFreeUFourierFilter.Create(
+          TJSONObject(Root).Get('scale', 0.0)));
+        NN.Compute(Input);
+        MaxDiff := MaxAbsVolumeDiff(NN.GetLastLayer.Output, Expected);
+        FilterEffect := MaxAbsVolumeDiff(Input, Expected);
+      finally
+        NN.Free;
+      end;
+      AssertTrue(Format('%dx%d: the oracle filters', [Input.SizeX,
+        Input.SizeY]), FilterEffect > 1e-2);
+      AssertTrue(Format('%dx%d: max |diff| = %g', [Input.SizeX, Input.SizeY,
+        MaxDiff]), MaxDiff < 1e-5);
+    end;
+  finally
+    Expected.Free;
+    Input.Free;
+    Root.Free;
+  end;
+end;
+
+// 32x16 with diffusers enable_freeu(0.9, 0.2, 1.5, 1.6): even sides at both
+// FreeU up blocks.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineFreeUNonSquare;
+begin
+  CheckSD15SizedParity('tiny_sd15_freeu_nonsquare_io.json');
+end;
+
+// 14x10 with FreeU: 4x3 and 7x5 grids at the two FreeU up blocks.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineFreeUOddSize;
+begin
+  CheckSD15SizedParity('tiny_sd15_freeu_oddsize_io.json');
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineFreeUOpenCL;
+begin
+  {$IFDEF OpenCL}
+  CheckSD15SizedParity('tiny_sd15_freeu_oddsize_io.json', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.CheckSD15SizedParity(const FileName: string;
+  OnOpenCL: boolean);
 var
   Pipeline: TStableDiffusionPipeline;
   Config: TSDUNetConfig;
   Net: TNNet;
   Embeds, Initial, Noise, Image, Expected: TNNetVolume;
+  FreeU: TJSONArray;
   ImageWidth, ImageHeight: integer;
   MaxDiff: double;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, FilterGPUForwards, FilterCount: integer;
+  {$ENDIF}
 begin
+  {$IFDEF OpenCL}
+  if OnOpenCL and not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  {$ENDIF}
   FSD15Oracle := LoadSD15Fixture(FileName);
   Pipeline := CreateSD15Pipeline();
   Embeds := TNNetVolume.Create;
@@ -46071,10 +46158,44 @@ begin
     Config.LatentGrid := Initial.SizeX;
     Config.LatentGridY := Initial.SizeY;
     Config.TextSeqLen := Embeds.SizeX;
+    FreeU := TJSONObject(FSD15Oracle).Find('freeu', jtArray) as TJSONArray;
+    if FreeU <> nil then
+    begin
+      SDUNetSetFreeU(Config, true, FreeU.Floats[0], FreeU.Floats[1],
+        FreeU.Floats[2], FreeU.Floats[3]);
+      Pipeline.EnableFreeU(FreeU.Floats[0], FreeU.Floats[1], FreeU.Floats[2],
+        FreeU.Floats[3]);
+      AssertTrue('FreeU on', Pipeline.UNetConfig.UseFreeU);
+    end;
     Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
       'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      Net.ForceOpenCL(true);
+      Net.EnableOpenCL(PlatformId, DeviceId);
+      Pipeline.EnableOpenCL(PlatformId, DeviceId);
+    end;
+    {$ENDIF}
     SDUNetDenoise(Net, Config, Initial, Embeds,
       TJSONObject(FSD15Oracle).Arrays['timesteps'].Integers[0], Noise);
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      FilterCount := 0;
+      FilterGPUForwards := 0;
+      for LayerPos := 0 to Net.GetLastLayerIdx() do
+        if Net.Layers[LayerPos] is TNNetFreeUFourierFilter then
+        begin
+          Inc(FilterCount);
+          Inc(FilterGPUForwards, Net.Layers[LayerPos].ForwardGPUCnt);
+        end;
+      // tiny_sd15: two FreeU up blocks of LayersPerBlock + 1 = 2 skips each.
+      AssertEquals('FreeU filters', 4, FilterCount);
+      AssertEquals('every FreeU filter ran on OpenCL', FilterCount,
+        FilterGPUForwards);
+    end;
+    {$ENDIF}
     LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['unet_cond_0'], true,
       Expected);
     MaxDiff := MaxAbsVolumeDiff(Noise, Expected);
@@ -47385,6 +47506,7 @@ var
     if OnOpenCL then Result.EnableOpenCL(PlatformId, DeviceId);
     {$ENDIF}
     Result.UNetInt8 := SizeChangeCase in [sccInt8, sccControlNet];
+    if SizeChangeCase = sccFreeU then Result.EnableFreeU(0.9, 0.2, 1.5, 1.6);
     if SizeChangeCase = sccLoRA then
       Result.AddLoRA(FixturePath('tiny_sd15_lora/peft.safetensors'), 0.8);
     Result.Conditioner := Conditioner;
@@ -47455,13 +47577,14 @@ begin
   end;
 end;
 
-// The kept UNet and VAE borrow the weights read once: FP32, int8 and a
-// LoRA-merged UNet at sizes A, B, A match fresh pipelines.
+// The kept UNet and VAE borrow the weights read once: FP32, int8, a
+// LoRA-merged and a FreeU UNet at sizes A, B, A match fresh pipelines.
 procedure TTestNeuralPretrained.TestStableDiffusionPipelineSizeChangeBorrows;
 begin
   CheckSD15KeptSizeChange(sccPlain, false);
   CheckSD15KeptSizeChange(sccInt8, false);
   CheckSD15KeptSizeChange(sccLoRA, false);
+  CheckSD15KeptSizeChange(sccFreeU, false);
 end;
 
 // A kept int8 ControlNet and a kept T2I-Adapter rebuilt per size borrow too.
@@ -47476,6 +47599,7 @@ begin
   {$IFDEF OpenCL}
   CheckSD15KeptSizeChange(sccPlain, true);
   CheckSD15KeptSizeChange(sccInt8, true);
+  CheckSD15KeptSizeChange(sccFreeU, true);
   {$ENDIF}
 end;
 

@@ -708,29 +708,24 @@ rather than acted on.
         - [ ] InstructPix2Pix extras: an --edit-image whose
               sides are not a VAE-factor multiple (resize parity, see (6)
               above), and PAG/SLG-style extra passes through PredictGuidedNoise.
-      - [ ] FreeU (Si et al. 2023, arXiv:2309.11497; diffusers
-            `pipe.enable_freeu(s1, s2, b1, b2)`, `apply_freeu` /
-            `fourier_filter` in diffusers/utils/torch_utils.py): a training-free
-            quality boost for SD 1.x / 2.x UNets at no extra UNet pass. At the
-            skip concat of the first two up stages (resolution_idx 0 and 1, the
-            TNNetDeepConcat([HLayer, Skips[SkipTop]]) in the SD UNet builder of
-            neuralpretrained.pas) diffusers multiplies the first C/2 channels of
-            the backbone by b1 / b2 and scales the low-frequency box of the skip
-            by s1 / s2 (fftshift, mask [H/2-1, H/2+1) x [W/2-1, W/2+1), ifft,
-            real part). For real input that box is the DC bin times s plus the
-            (0,±1), (±1,0), (1,1)/(-1,-1) conjugate pairs times (1+s)/2 (only the
-            -1 bin of each pair is in the box); the (1,-1) pair is untouched. So
-            a layer can project out those few cosine/sine components per
-            channel in O(H*W) without an FFT and without buffers. Needs: a
-            weightless TNNetFreeUSkipFilter (forward + backward, OpenCL so the
-            --gpu UNet stays resident), a backbone half-channel scale (check
-            TNNetChannelMul or an existing fixed per-channel scale first), a
-            FreeU flag in TSDUNetConfig so BuildSDUNet inserts both only when
-            enabled, and examples/StableDiffusion `--freeu s1,s2,b1,b2` with the
-            paper presets (SD 1.5: 0.9,0.2,1.5,1.6; SD 2.1: 0.9,0.2,1.4,1.6).
-            Pico parity against a diffusers float64 run with enable_freeu on
-            tests/fixtures/tiny_sd15 (odd and even latent sides: crow = H div 2),
-            README section with a with/without image pair from the GPU box.
+      - [X] FreeU (Si et al. 2023, arXiv:2309.11497; diffusers
+            `pipe.enable_freeu(s1, s2, b1, b2)`): DONE. `TNNetFreeUFourierFilter`
+            (diffusers `fourier_filter(threshold=1)` by projection, O(H*W), no
+            FFT, forward + backward + OpenCL `cai_freeu_fourier_filter`), the
+            backbone half-channel scale from TNNetSplitChannels +
+            TNNetMulByConstant + TNNetDeepConcat, `TSDUNetConfig.UseFreeU` /
+            `SDUNetSetFreeU`, `TStableDiffusionPipeline.EnableFreeU` /
+            `DisableFreeU`, examples/StableDiffusion `--freeu s1,s2,b1,b2|sd15|sd21`.
+            Current diffusers apply_freeu is FreeU v1 (plain b scale, no
+            mean-based mask) and runs at EVERY skip popped in up blocks 0 and 1.
+            Pico parity < 1e-4 vs diffusers float64 at 32x16 and 14x10
+            (`tools/make_pico_sd_pipeline_fixture.py --freeu-only`).
+        - [ ] FreeU follow-up: a with/without image pair from the GPU box on a
+              real SD 1.5 checkpoint (`--freeu sd15`) for the README section,
+              and its UNet pass time with and without FreeU.
+        - [ ] FreeU follow-up: an `sdxl` preset (0.6, 0.4, 1.1, 1.2 in the diffusers
+              FreeU docs) once an SDXL pipeline CLI exists; BuildSDUNet already
+              applies FreeU to SDXL configs (up blocks 0 and 1).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):

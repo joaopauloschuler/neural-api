@@ -3546,6 +3546,83 @@ __kernel void cai_local_response_norm
   FDst[g_id] = FSrc[g_id] / pow(1.0f + FScale * SumSq, FBeta);
 }
 
+// FreeU skip filter forward (TNNetFreeUFourierFilter, diffusers fourier_filter
+// with threshold 1). One work-item per channel d: the cosine/sine sums of the
+// DC, (-1,0), (0,-1) and (-1,-1) bins, times FGain = (s - 1) / (H * W), are
+// added back on the same basis. A side of 1 has no -1 bin (mask, no branch).
+// Raw layout [(y*W + x)*Depth + d]. Coded by Claude (AI).
+__kernel void cai_freeu_fourier_filter
+(
+  const int FSizeX,
+  const int FSizeY,
+  const int FDepth,
+  const float FGain,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  if (d >= FDepth) return;
+  const float RowMask = (FSizeY >= 2) ? 1.0f : 0.0f;
+  const float ColMask = (FSizeX >= 2) ? 1.0f : 0.0f;
+  const float RowStep = 6.283185307179586f / (float)FSizeY;
+  const float ColStep = 6.283185307179586f / (float)FSizeX;
+  float SumDC = 0.0f;
+  float SumRowCos = 0.0f, SumRowSin = 0.0f;
+  float SumColCos = 0.0f, SumColSin = 0.0f;
+  float SumDiagCos = 0.0f, SumDiagSin = 0.0f;
+  int Offset = d;
+  for (int y = 0; y < FSizeY; y++)
+  {
+    float RowCos;
+    const float RowSin = sincos(RowStep * (float)y, &RowCos);
+    for (int x = 0; x < FSizeX; x++)
+    {
+      float ColCos;
+      const float ColSin = sincos(ColStep * (float)x, &ColCos);
+      const float v = FSrc[Offset];
+      SumDC += v;
+      SumRowCos = mad(v, RowCos, SumRowCos);
+      SumRowSin = mad(v, RowSin, SumRowSin);
+      SumColCos = mad(v, ColCos, SumColCos);
+      SumColSin = mad(v, ColSin, SumColSin);
+      SumDiagCos = mad(v, RowCos * ColCos - RowSin * ColSin, SumDiagCos);
+      SumDiagSin = mad(v, RowSin * ColCos + RowCos * ColSin, SumDiagSin);
+      Offset += FDepth;
+    }
+  }
+  const float RowGain = FGain * RowMask;
+  const float ColGain = FGain * ColMask;
+  const float DiagGain = RowGain * ColMask;
+  SumDC *= FGain;
+  SumRowCos *= RowGain;
+  SumRowSin *= RowGain;
+  SumColCos *= ColGain;
+  SumColSin *= ColGain;
+  SumDiagCos *= DiagGain;
+  SumDiagSin *= DiagGain;
+  Offset = d;
+  for (int y = 0; y < FSizeY; y++)
+  {
+    float RowCos;
+    const float RowSin = sincos(RowStep * (float)y, &RowCos);
+    for (int x = 0; x < FSizeX; x++)
+    {
+      float ColCos;
+      const float ColSin = sincos(ColStep * (float)x, &ColCos);
+      float Low = SumDC;
+      Low = mad(SumRowCos, RowCos, Low);
+      Low = mad(SumRowSin, RowSin, Low);
+      Low = mad(SumColCos, ColCos, Low);
+      Low = mad(SumColSin, ColSin, Low);
+      Low = mad(SumDiagCos, RowCos * ColCos - RowSin * ColSin, Low);
+      Low = mad(SumDiagSin, RowSin * ColCos + RowCos * ColSin, Low);
+      FDst[Offset] = FSrc[Offset] + Low;
+      Offset += FDepth;
+    }
+  }
+}
+
 // TNNetConvGRUCell reset step: FDst = [r*h ; x] per pixel, where h|x is the cell
 // input FSrc (FHiddenC + FInputC channels) and r is the second half of the fused
 // z|r gate map FGates (2*FHiddenC channels per pixel). One work-item per output float.

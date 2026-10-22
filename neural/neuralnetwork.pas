@@ -6007,6 +6007,25 @@ type
     function BufferBytes(): int64; override;
   end;
 
+  /// OpenCL forward helper for TNNetFreeUFourierFilter (cai_freeu_fourier_filter,
+  // one work-item per channel). Coded by Claude (AI).
+  TNNetFreeUFourierFilterCL = class(TNNetKernelCL)
+  private
+    // Persistent buffers (grow-only): the uploaded host source and the result.
+    FBufX, FBufY: cl_mem;
+    FCapX, FCapY: csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Y := X with its low-frequency box scaled (Gain = (Scale - 1) / (SizeX * SizeY));
+    // pExternalSrc is bound instead of uploading X. The result stays in ResultBuffer.
+    procedure Filter(X: TNNetVolume; Y: TNNetVolume; Gain: TNeuralFloat;
+      pExternalSrc: cl_mem);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   /// OpenCL forward helper for TNNetTransposedChannelAttention: cai_transposed_attn_dots,
   // _softmax and _apply, all on FKernel's queue. Coded by Claude (AI).
   TNNetTransposedChannelAttentionCL = class(TNNetKernelCL)
@@ -17729,6 +17748,41 @@ type
     constructor Create(); overload; override;
     constructor Create(pOutputWidth: integer; pNorm: integer = csFFTNormBackward); reintroduce; overload;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  end;
+
+  /// FreeU's skip filter, diffusers fourier_filter(threshold=1): per channel, scales the
+  /// DC, (-1,0), (0,-1) and (-1,-1) bins of the 2-D spectrum by Scale, in O(SizeX*SizeY) with no FFT.
+  // Coded by Claude (AI).
+  TNNetFreeUFourierFilter = class(TNNetIdentity)
+    private
+      // Per basis function (rows) and channel: the input's projection onto the box's
+      // cosine/sine basis, times the gain.
+      FBoxProjections: TNNetVolume;
+      {$IFDEF OpenCL}
+      FFourierFilterCL: TNNetFreeUFourierFilterCL;
+      {$ENDIF}
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Dest := Source with its box scaled; Dest may be Source. The map is
+      // symmetric, so the backward applies it to the error.
+      procedure ScaleLowFrequencyBox(Source, Dest: TNNetVolume);
+      function Gain(): TNeuralFloat;
+      // True when the OpenCL forward ran; False leaves the source on RAM.
+      function ComputeOnOpenCL(StartTime: double): boolean;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pScale: TNeuralFloat); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      {$IFDEF OpenCL}
+      // Inference only, like TNNetLocalResponseNorm2D.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
   end;
 
   /// SINGLE-LEVEL 1-D DISCRETE WAVELET TRANSFORM layer implemented with the
@@ -42242,6 +42296,61 @@ begin
     FKernel.Finish();
     FKernel.ReadBuffer(bufY, Y, CL_TRUE);
   end;
+end;
+
+{ TNNetFreeUFourierFilterCL }
+
+constructor TNNetFreeUFourierFilterCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_freeu_fourier_filter');
+end;
+
+destructor TNNetFreeUFourierFilterCL.Destroy();
+begin
+  if Assigned(FBufX) then clReleaseMemObject(FBufX);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  inherited Destroy();
+end;
+
+function TNNetFreeUFourierFilterCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetFreeUFourierFilterCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetFreeUFourierFilterCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufY);
+end;
+
+procedure TNNetFreeUFourierFilterCL.Filter(X: TNNetVolume; Y: TNNetVolume;
+  Gain: TNeuralFloat; pExternalSrc: cl_mem);
+var
+  bufX, bufY: cl_mem;
+  k: cl_kernel;
+  iSizeX, iSizeY, iDepth: longint;
+  fGain: single;
+begin
+  k := FKernel.Kernel;
+  iSizeX := X.SizeX;
+  iSizeY := X.SizeY;
+  iDepth := X.Depth;
+  fGain := Gain;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  clSetKernelArg(k, 0, csLongintSize, @iSizeX);
+  clSetKernelArg(k, 1, csLongintSize, @iSizeY);
+  clSetKernelArg(k, 2, csLongintSize, @iDepth);
+  clSetKernelArg(k, 3, csNeuralFloatSize, @fGain);
+  clSetKernelArg(k, 4, csCLMemSize, @bufX);
+  clSetKernelArg(k, 5, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, iDepth);
 end;
 
 { TNNetTransposedChannelAttentionCL }
@@ -98360,6 +98469,241 @@ begin
   RealToHalfSpectrum(Src, Dst);
 end;
 
+{ TNNetFreeUFourierFilter }
+
+const
+  // DC, then the cosine and sine of the (-1,0), (0,-1) and (-1,-1) bins.
+  csFreeUBoxBasisCount = 7;
+
+constructor TNNetFreeUFourierFilter.Create();
+begin
+  inherited Create();
+  FFloatSt[0] := 1;
+  FBoxProjections := TNNetVolume.Create();
+end;
+
+constructor TNNetFreeUFourierFilter.Create(pScale: TNeuralFloat);
+begin
+  Create();
+  FFloatSt[0] := pScale;
+end;
+
+destructor TNNetFreeUFourierFilter.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FFourierFilterCL) then FreeAndNil(FFourierFilterCL);
+  {$ENDIF}
+  FBoxProjections.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetFreeUFourierFilter.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FBoxProjections.ReSize(csFreeUBoxBasisCount, 1, FOutput.Depth);
+end;
+
+function TNNetFreeUFourierFilter.Gain(): TNeuralFloat;
+begin
+  Result := (FFloatSt[0] - 1) / (FOutput.SizeX * FOutput.SizeY);
+end;
+
+// Re(ifft(box * (Scale - 1))) of a real channel is Gain * sum over the box bins
+// of (C cos + S sin), C and S the channel's cosine and sine sums of that bin.
+procedure TNNetFreeUFourierFilter.ScaleLowFrequencyBox(Source, Dest: TNNetVolume);
+var
+  PixelBasis: array[0..csFreeUBoxBasisCount - 1] of TNeuralFloat;
+  X, Y, MaxX, MaxY, Depth, BasisPos, MaxBasisPos: integer;
+  PixelOffset, ProjectionOffset: integer;
+  HasRowBin, HasColBin: boolean;
+  RowStep, ColStep, RowSin, RowCos, ColSin, ColCos: TNeuralFloat;
+  SourcePtr, DestPtr, ProjectionPtr: TNeuralFloatArrPtr;
+
+  // PixelBasis[1..MaxBasisPos] at column X of the row RowSin/RowCos belong to.
+  procedure FillPixelBasis(X: integer);
+  var
+    ColBasisPos: integer;
+  begin
+    ColBasisPos := 1;
+    if HasRowBin then
+    begin
+      PixelBasis[1] := RowCos;
+      PixelBasis[2] := RowSin;
+      ColBasisPos := 3;
+    end;
+    if HasColBin then
+    begin
+      pcr_sincosf(X * ColStep, ColSin, ColCos);
+      PixelBasis[ColBasisPos] := ColCos;
+      PixelBasis[ColBasisPos + 1] := ColSin;
+      if HasRowBin then
+      begin
+        PixelBasis[5] := RowCos * ColCos - RowSin * ColSin;
+        PixelBasis[6] := RowSin * ColCos + RowCos * ColSin;
+      end;
+    end;
+  end;
+
+begin
+  Depth := Source.Depth;
+  MaxX := Source.SizeX - 1;
+  MaxY := Source.SizeY - 1;
+  // A side of 1 has no -1 bin: the box slice wraps onto the DC row/column.
+  HasRowBin := Source.SizeY >= 2;
+  HasColBin := Source.SizeX >= 2;
+  MaxBasisPos := 0;
+  if HasRowBin then Inc(MaxBasisPos, 2);
+  if HasColBin then Inc(MaxBasisPos, 2);
+  if HasRowBin and HasColBin then Inc(MaxBasisPos, 2);
+  RowStep := 2 * Pi / Source.SizeY;
+  ColStep := 2 * Pi / Source.SizeX;
+  PixelBasis[0] := 1;
+  RowSin := 0;
+  RowCos := 1;
+  FBoxProjections.Fill(0);
+  ProjectionPtr := FBoxProjections.DataPtr;
+  SourcePtr := Source.DataPtr;
+  PixelOffset := 0;
+  for Y := 0 to MaxY do
+  begin
+    if HasRowBin then pcr_sincosf(Y * RowStep, RowSin, RowCos);
+    for X := 0 to MaxX do
+    begin
+      FillPixelBasis(X);
+      ProjectionOffset := 0;
+      for BasisPos := 0 to MaxBasisPos do
+      begin
+        TNNetVolume.MulAdd(@ProjectionPtr^[ProjectionOffset],
+          @SourcePtr^[PixelOffset], PixelBasis[BasisPos], Depth);
+        Inc(ProjectionOffset, Depth);
+      end;
+      Inc(PixelOffset, Depth);
+    end;
+  end;
+  FBoxProjections.Mul(Gain());
+  if Dest <> Source then Dest.CopyNoChecks(Source);
+  DestPtr := Dest.DataPtr;
+  PixelOffset := 0;
+  for Y := 0 to MaxY do
+  begin
+    if HasRowBin then pcr_sincosf(Y * RowStep, RowSin, RowCos);
+    for X := 0 to MaxX do
+    begin
+      FillPixelBasis(X);
+      ProjectionOffset := 0;
+      for BasisPos := 0 to MaxBasisPos do
+      begin
+        TNNetVolume.MulAdd(@DestPtr^[PixelOffset],
+          @ProjectionPtr^[ProjectionOffset], PixelBasis[BasisPos], Depth);
+        Inc(ProjectionOffset, Depth);
+      end;
+      Inc(PixelOffset, Depth);
+    end;
+  end;
+end;
+
+{$IFDEF OpenCL}
+function TNNetFreeUFourierFilter.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FFourierFilterCL) and FHasOpenCL and (not FIsTrainable) and
+    (FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetFreeUFourierFilter.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FNN) and not Assigned(FFourierFilterCL) then
+    FFourierFilterCL := TNNetFreeUFourierFilterCL.Create(FNN);
+end;
+
+procedure TNNetFreeUFourierFilter.DisableOpenCL();
+begin
+  // FFourierFilterCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FFourierFilterCL);
+end;
+
+function TNNetFreeUFourierFilter.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FFourierFilterCL) then Result := FFourierFilterCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetFreeUFourierFilter.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FFourierFilterCL) then Result := FFourierFilterCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetFreeUFourierFilter.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FFourierFilterCL) then
+    Result := Result + FFourierFilterCL.BufferBytes();
+end;
+{$ENDIF}
+
+function TNNetFreeUFourierFilter.ComputeOnOpenCL(StartTime: double): boolean;
+{$IFDEF OpenCL}
+var
+  SourceBuffer: cl_mem;
+{$ENDIF}
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    if PrevOutputOnOpenCL() then
+    begin
+      SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FFourierFilterCL.OutputKernel());
+    end
+    else
+    begin
+      SourceBuffer := nil;
+      FPrevLayer.ForceOutputOnRAM();
+    end;
+    FFourierFilterCL.Filter(FPrevLayer.FOutput, FOutput, Gain(), SourceBuffer);
+    FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit(true);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous OpenCL forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
+
+procedure TNNetFreeUFourierFilter.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  if ComputeOnOpenCL(StartTime) then exit;
+  ScaleLowFrequencyBox(FPrevLayer.FOutput, FOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFreeUFourierFilter.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  ScaleLowFrequencyBox(FOutputError, FOutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  BackpropagateNoTest();
+end;
+
 { TNNetTropicalLinear }
 
 // Tropical (max-plus / min-plus) dense layer. The forward map per output i is
@@ -140722,6 +141066,7 @@ begin
       'TNNetLocalConnectReLU' :     Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetMulLearning'  :         Result := TNNetMulLearning.Create(Ft[0]);
       'TNNetMulByConstant'  :       Result := TNNetMulByConstant.Create(Ft[0]);
+      'TNNetFreeUFourierFilter':    Result := TNNetFreeUFourierFilter.Create(Ft[0]);
       'TNNetAddConstant'  :         Result := TNNetAddConstant.Create(Ft[0]);
       'TNNetNegate'  :              Result := TNNetNegate.Create();
       'TNNetGradientReversal' :     Result := TNNetGradientReversal.Create(Ft[0]);
@@ -141174,6 +141519,7 @@ begin
       if S[0] = 'TNNetLocalConnectReLU' then Result := TNNetLocalConnectReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMulLearning' then Result := TNNetMulLearning.Create(Ft[0]) else
       if S[0] = 'TNNetMulByConstant' then Result := TNNetMulByConstant.Create(Ft[0]) else
+      if S[0] = 'TNNetFreeUFourierFilter' then Result := TNNetFreeUFourierFilter.Create(Ft[0]) else
       if S[0] = 'TNNetAddConstant' then Result := TNNetAddConstant.Create(Ft[0]) else
       if S[0] = 'TNNetNegate' then Result := TNNetNegate.Create() else
       if S[0] = 'TNNetGradientReversal' then Result := TNNetGradientReversal.Create(Ft[0]) else

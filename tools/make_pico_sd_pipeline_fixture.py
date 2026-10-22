@@ -39,6 +39,14 @@ transformers class (nothing downloaded), saved with the real folder layout:
     multiple of the UNet's 2: diffusers resizes each upsample to its skip
     (upsample_size). check_inputs is skipped (it wants multiples of 8, the
     real VAE factor, not the pico 2).
+  tests/fixtures/tiny_sd15_freeu_filter_io.json
+    diffusers fourier_filter(threshold=1) (FreeU's skip filter) on random
+    (C,H,W) inputs: odd, even and 1-wide sides, scale FREEU_FILTER_SCALE.
+  tests/fixtures/tiny_sd15_freeu_nonsquare_io.json,
+  tests/fixtures/tiny_sd15_freeu_oddsize_io.json
+    the non-square / odd-size runs with pipe.enable_freeu(*FREEU_SD15) (the
+    SD 1.5 preset): 16x8 latents (even sides at both FreeU up blocks) and 7x5
+    latents (4x3 and 7x5 at the two FreeU up blocks).
   tests/fixtures/tiny_sd15_lcm_io.json
     LCMScheduler.from_config of the DDIM config (the LCM-LoRA recipe),
     LCM_STEPS steps on the tiny_sd15 UNet with the usual two-half CFG: text to
@@ -74,9 +82,11 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --oddsize-only
   python tools/make_pico_sd_pipeline_fixture.py --lcm-only
   python tools/make_pico_sd_pipeline_fixture.py --lcm-distilled-only
-(--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only keep the
-committed folder and rewrite only the sampler / non-square / odd-size / LCM
-file; --lcm-distilled-only rewrites the distilled UNet folder and its file.)
+  python tools/make_pico_sd_pipeline_fixture.py --freeu-only
+(--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only /
+--freeu-only keep the committed folder and rewrite only the sampler /
+non-square / odd-size / LCM / FreeU files; --lcm-distilled-only rewrites the
+distilled UNet folder and its file.)
 """
 import json
 import math
@@ -88,6 +98,7 @@ from collections import Counter
 
 import torch
 from safetensors.torch import load_file, save_file
+from diffusers.utils.torch_utils import fourier_filter
 from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
                        EulerDiscreteScheduler, LatentConsistencyModelImg2ImgPipeline,
                        LatentConsistencyModelPipeline, LCMScheduler, PNDMScheduler,
@@ -108,6 +119,9 @@ ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_oddsize_io.json")
 LCM_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_io.json")
 LCM_DISTILLED_DIR = os.path.join(FIXTURES, "tiny_sd15_lcm_distilled")
 LCM_DISTILLED_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_distilled_io.json")
+FREEU_FILTER_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_filter_io.json")
+FREEU_NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_nonsquare_io.json")
+FREEU_ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_oddsize_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -126,6 +140,11 @@ LCM_STRENGTH = 0.5
 LCM_COND_PROJ_DIM = 16
 LCM_DISTILLED_GUIDANCE = 8.5    # LatentConsistencyModelPipeline's default
 LCM_UNET_CHECK_TIMESTEP = 499
+FREEU_SD15 = (0.9, 0.2, 1.5, 1.6)   # s1, s2, b1, b2 of the FreeU paper for SD 1.5
+FREEU_FILTER_SCALE = 0.37
+FREEU_FILTER_SIZES = [(1, 1), (1, 4), (3, 1), (2, 2), (2, 5), (4, 4), (5, 3),
+                      (6, 7), (8, 8)]   # (H, W)
+FREEU_FILTER_CHANNELS = 3
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -394,10 +413,12 @@ def make_sampler_oracle():
 
 
 def make_nonsquare_oracle(width=NONSQUARE_WIDTH, height=NONSQUARE_HEIGHT,
-                          out_file=NONSQUARE_FILE):
+                          out_file=NONSQUARE_FILE, freeu=None):
     pipe = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
                                                    safety_checker=None)
     pipe.set_progress_bar_config(disable=True)
+    if freeu is not None:
+        pipe.enable_freeu(*freeu)
     if width % 8 or height % 8:
         pipe.check_inputs = lambda *args, **kwargs: None
     generator = torch.Generator().manual_seed(SEED)
@@ -430,6 +451,8 @@ def make_nonsquare_oracle(width=NONSQUARE_WIDTH, height=NONSQUARE_HEIGHT,
         "latents_after": after,
         "image": rounded(result.images[0].tolist()),
     }
+    if freeu is not None:
+        payload["freeu"] = list(freeu)
     with open(out_file, "w") as f:
         json.dump(payload, f)
     print("image", result.images[0].shape, "->", os.path.basename(out_file))
@@ -437,6 +460,22 @@ def make_nonsquare_oracle(width=NONSQUARE_WIDTH, height=NONSQUARE_HEIGHT,
 
 def make_oddsize_oracle():
     make_nonsquare_oracle(ODD_WIDTH, ODD_HEIGHT, ODDSIZE_FILE)
+
+
+def make_freeu_oracles():
+    generator = torch.Generator().manual_seed(SEED + 50)
+    cases = []
+    for height, width in FREEU_FILTER_SIZES:
+        sample = torch.randn((1, FREEU_FILTER_CHANNELS, height, width),
+                             generator=generator, dtype=torch.float64)
+        filtered = fourier_filter(sample, threshold=1, scale=FREEU_FILTER_SCALE)
+        cases.append({"input": rounded(chw(sample[0])),
+                      "output": rounded(chw(filtered[0]))})
+    with open(FREEU_FILTER_FILE, "w") as f:
+        json.dump({"scale": FREEU_FILTER_SCALE, "cases": cases}, f)
+    make_nonsquare_oracle(NONSQUARE_WIDTH, NONSQUARE_HEIGHT, FREEU_NONSQUARE_FILE,
+                          FREEU_SD15)
+    make_nonsquare_oracle(ODD_WIDTH, ODD_HEIGHT, FREEU_ODDSIZE_FILE, FREEU_SD15)
 
 
 def make_lcm_oracle():
@@ -611,6 +650,9 @@ if __name__ == "__main__":
     if "--oddsize-only" in sys.argv:
         make_oddsize_oracle()
         sys.exit(0)
+    if "--freeu-only" in sys.argv:
+        make_freeu_oracles()
+        sys.exit(0)
     if "--samplers-only" not in sys.argv:
         build_folder()
         make_oracle()
@@ -619,3 +661,4 @@ if __name__ == "__main__":
     make_oddsize_oracle()
     make_lcm_oracle()
     make_lcm_distilled_oracle()
+    make_freeu_oracles()

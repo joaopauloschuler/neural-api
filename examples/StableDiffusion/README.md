@@ -281,6 +281,45 @@ PNDM, DPM++ 2M, Euler and Euler a. Inpainting with `v_prediction` is not
 tested separately: it noises the image latents with the same scheduler call
 as img2img, which does not depend on the prediction type.
 
+## FreeU (`--freeu`)
+
+FreeU (Si et al. 2023, arXiv:2309.11497) reweights the two inputs of the first
+two UNet up blocks with no extra UNet pass and no new weights.
+`--freeu s1,s2,b1,b2` does what diffusers `pipe.enable_freeu(s1, s2, b1, b2)`
+does. At each skip connection of up block 0 (and 1), before the concat:
+
+* the first half of the backbone channels is multiplied by `b1` (`b2`);
+* the skip is filtered: per channel, the low-frequency box of its `fftshift`ed
+  2-D spectrum (the DC, `(-1,0)`, `(0,-1)` and `(-1,-1)` bins) is scaled by
+  `s1` (`s2`), as diffusers `fourier_filter(threshold=1)`.
+
+The presets of the FreeU paper are `--freeu sd15` (0.9,0.2,1.5,1.6) and
+`--freeu sd21` (0.9,0.2,1.4,1.6). A zero factor turns FreeU off, as in
+diffusers.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --freeu sd15 \
+  --prompt "a watercolor painting of a lighthouse at dawn" --gpu
+```
+
+`BuildSDUNet` adds the layers only when `TSDUNetConfig.UseFreeU` is set
+(`SDUNetSetFreeU`; `TStableDiffusionPipeline.EnableFreeU` / `DisableFreeU`).
+The skip filter is `TNNetFreeUFourierFilter`: it projects the few cosine/sine
+components of the box out of each channel in O(H*W), without an FFT, and has
+an OpenCL forward, so a `--gpu` UNet keeps its activations in OpenCL memory.
+The backbone scale reuses `TNNetSplitChannels`, `TNNetMulByConstant` and
+`TNNetDeepConcat`. All of these layers are weightless, so a kept UNet still
+borrows the weights it read once.
+
+Tested against diffusers float64 with `enable_freeu(0.9, 0.2, 1.5, 1.6)` on
+the pico folder: the filter alone on odd, even and 1-wide sides
+(`TestFreeUFourierFilterTorchParity`), and the step-0 UNet output, every DDIM
+step and the image at 32x16 and 14x10
+(`TestStableDiffusionPipelineFreeUNonSquare`,
+`TestStableDiffusionPipelineFreeUOddSize`; OpenCL:
+`TestStableDiffusionPipelineFreeUOpenCL`), all < 1e-4. No real checkpoint has
+been run with FreeU yet.
+
 ## Usage
 
 ```
@@ -324,6 +363,9 @@ StableDiffusion [--model DIR] [options]
                     output takes its size (rounded down to the VAE factor)
   --image-guidance S how closely --edit-image is kept (default 1.5; < 1 turns all
                     guidance off)
+  --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales S1, S2 and
+                    backbone scales B1, B2 of the first two up blocks; presets
+                    sd15 (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

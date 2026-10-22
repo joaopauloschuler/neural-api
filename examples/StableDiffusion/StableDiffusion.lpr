@@ -35,6 +35,8 @@ StableDiffusionImg2ImgPipeline): the output takes the image's size.
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
 --ip-adapter combines with either (TStableDiffusionMultiConditioner).
+--freeu s1,s2,b1,b2 (or the paper's presets sd15 / sd21) turns on FreeU, as
+diffusers enable_freeu: no extra UNet pass.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -60,6 +62,10 @@ const
     ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m', 'lcm');
   SamplerOptionMethods: array[0..5] of TNNetSamplerMethod =
     (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M, smLCM);
+  // --freeu presets of the FreeU paper (s1, s2, b1, b2).
+  FreeUPresetNames: array[0..1] of string = ('sd15', 'sd21');
+  FreeUPresetFactors: array[0..1, 0..3] of TNeuralFloat =
+    ((0.9, 0.2, 1.5, 1.6), (0.9, 0.2, 1.4, 1.6));
 
 type
   TStableDiffusionOptions = record
@@ -88,6 +94,9 @@ type
     Seed: cardinal;
     UseOpenCL, UseInt8, UseStats: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
+    // --freeu s1, s2, b1, b2; UseFreeU false when not given.
+    UseFreeU: boolean;
+    FreeUFactors: array[0..3] of TNeuralFloat;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -239,6 +248,11 @@ begin
   WriteLn('  --image-guidance S how closely --edit-image is kept (default 1.5; ',
     '< 1 turns all');
   WriteLn('                    guidance off)');
+  WriteLn('  --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales ',
+    'S1, S2 and backbone');
+  WriteLn('                    scales B1, B2 of the first two up blocks; ',
+    'presets sd15');
+  WriteLn('                    (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -268,6 +282,28 @@ begin
   for NamePos := 0 to High(SamplerOptionMethods) do
     if SamplerOptionMethods[NamePos] = Method then
       Result := SamplerOptionNames[NamePos];
+end;
+
+// --freeu value: a preset name or four comma-separated factors.
+procedure ParseFreeUSpec(const Spec: string; out Factors: array of TNeuralFloat);
+var
+  Parts: TStringArray;
+  PresetPos, FactorPos: integer;
+begin
+  for PresetPos := 0 to High(FreeUPresetNames) do
+    if LowerCase(Spec) = FreeUPresetNames[PresetPos] then
+    begin
+      for FactorPos := 0 to 3 do
+        Factors[FactorPos] := FreeUPresetFactors[PresetPos, FactorPos];
+      exit;
+    end;
+  Parts := Spec.Split([',']);
+  if Length(Parts) <> 4 then
+    raise Exception.Create('--freeu wants s1,s2,b1,b2, sd15 or sd21, not "' +
+      Spec + '"');
+  for FactorPos := 0 to 3 do
+    Factors[FactorPos] := StrToFloat(Trim(Parts[FactorPos]),
+      DefaultFormatSettings);
 end;
 
 function ParseOptions(out Opt: TStableDiffusionOptions): boolean;
@@ -307,6 +343,7 @@ begin
   Opt.UseStats := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
+  Opt.UseFreeU := false;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -355,6 +392,11 @@ begin
     else if Arg = '--edit-image' then Opt.EditImageFile := NextArg()
     else if Arg = '--image-guidance' then
       Opt.ImageGuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--freeu' then
+    begin
+      ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
+      Opt.UseFreeU := true;
+    end
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -504,6 +546,9 @@ begin
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.UNetInt8 := Opt.UseInt8;
     Pipeline.TextEncoderInt8 := Opt.UseInt8;
+    if Opt.UseFreeU then
+      Pipeline.EnableFreeU(Opt.FreeUFactors[0], Opt.FreeUFactors[1],
+        Opt.FreeUFactors[2], Opt.FreeUFactors[3]);
     {$IFDEF OpenCL}
     if Opt.UseStats then OpenCLTransferCounting := true;
     {$ENDIF}
@@ -526,6 +571,10 @@ begin
       WriteLn('Notice:   ', Pipeline.SamplerNotice);
     if Opt.UseInt8 then WriteLn('Weights:  UNet int8, text encoder int8')
     else WriteLn('Weights:  FP32');
+    if Pipeline.UNetConfig.UseFreeU then
+      WriteLn(Format('FreeU:    s1 %.2f, s2 %.2f, b1 %.2f, b2 %.2f',
+        [Opt.FreeUFactors[0], Opt.FreeUFactors[1], Opt.FreeUFactors[2],
+         Opt.FreeUFactors[3]]));
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,

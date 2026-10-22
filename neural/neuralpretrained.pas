@@ -11903,6 +11903,12 @@ type
     // time_cond_proj_dim of LCM-distilled UNets: the width of the guidance-scale
     // embedding that time_embedding.cond_proj maps into the timestep one; 0 = absent.
     TimeCondProjDim: integer;
+    // FreeU (diffusers enable_freeu; off when the reader sets it): up blocks 0 and
+    // 1 scale each popped skip's low-frequency box by s1 / s2 and the first half
+    // of the backbone channels by b1 / b2 (SDUNetSetFreeU).
+    UseFreeU: boolean;
+    FreeUSkipScale: array[0..1] of TNeuralFloat;     // s1, s2
+    FreeUBackboneScale: array[0..1] of TNeuralFloat; // b1, b2
   end;
 
 const
@@ -11920,6 +11926,12 @@ function SDUNetConfigToString(const Config: TSDUNetConfig): string;
 
 // The latent grid height: LatentGridY, or LatentGrid when LatentGridY = 0.
 function LatentGridYOf(const Config: TSDUNetConfig): integer; overload;
+
+// Turns FreeU on with skip scales S1, S2 and backbone scales B1, B2, or off; a
+// zero factor turns it off, as diffusers' is_freeu_enabled does.
+procedure SDUNetSetFreeU(var Config: TSDUNetConfig; Enabled: boolean;
+  S1: TNeuralFloat = 1; S2: TNeuralFloat = 1; B1: TNeuralFloat = 1;
+  B2: TNeuralFloat = 1);
 
 // Builds the UNet2DConditionModel described by Config and loads every weight
 // from Reader (caller owns Reader). Three TNNetInputs (latent, timestep, text
@@ -12410,6 +12422,10 @@ type
     // text encoder as they load; drops kept nets and encoded negative embeds.
     procedure AddLoRA(const FileName: string; Scale: TNeuralFloat = 1.0);
     procedure ClearLoRAs();
+    // diffusers enable_freeu / disable_freeu on the UNet (SDUNetSetFreeU);
+    // drops a kept UNet, not the weights it borrows.
+    procedure EnableFreeU(S1, S2, B1, B2: TNeuralFloat);
+    procedure DisableFreeU();
     // [bos] + ids (truncated) + [eos], padded with the pad token to MaxTokenCount.
     function TokenizePrompt(const Prompt: string): TNeuralIntegerArray;
     // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
@@ -75668,6 +75684,7 @@ begin
       Result.TimeCondProjDim := ArrData.AsInteger
     else
       Result.TimeCondProjDim := 0;
+    SDUNetSetFreeU(Result, false);
   finally
     Root.Free;
   end;
@@ -75724,6 +75741,17 @@ begin
   else Result := Config.LatentGrid;
 end;
 
+procedure SDUNetSetFreeU(var Config: TSDUNetConfig; Enabled: boolean;
+  S1: TNeuralFloat; S2: TNeuralFloat; B1: TNeuralFloat; B2: TNeuralFloat);
+begin
+  Config.UseFreeU := Enabled and (S1 <> 0) and (S2 <> 0) and (B1 <> 0) and
+    (B2 <> 0);
+  Config.FreeUSkipScale[0] := S1;
+  Config.FreeUSkipScale[1] := S2;
+  Config.FreeUBackboneScale[0] := B1;
+  Config.FreeUBackboneScale[1] := B2;
+end;
+
 type
   TSDResnetLayers = record
     GN1, Conv1, TimeProj, GN2, Conv2, Shortcut: TNNetLayer;
@@ -75743,6 +75771,25 @@ type
     GN, ProjIn, ProjOut: TNNetLayer;
     Blocks: array of TSDBasicBlockLayers;
   end;
+
+// diffusers apply_freeu, then torch.cat: [the first Depth div 2 backbone channels
+// * BackboneScale | the rest | the skip with its low-frequency box * SkipScale].
+procedure AddSDFreeUSkipConcat(NN: TNNet; Backbone, Skip: TNNetLayer;
+  BackboneScale, SkipScale: TNeuralFloat);
+var
+  BackboneDepth, HalfDepth: integer;
+  ScaledHalf, OtherHalf, FilteredSkip: TNNetLayer;
+begin
+  BackboneDepth := Backbone.Output.Depth;
+  HalfDepth := BackboneDepth div 2;
+  NN.AddLayerAfter(TNNetSplitChannels.Create(0, HalfDepth), Backbone);
+  ScaledHalf := NN.AddLayer(TNNetMulByConstant.Create(BackboneScale));
+  OtherHalf := NN.AddLayerAfter(TNNetSplitChannels.Create(HalfDepth,
+    BackboneDepth - HalfDepth), Backbone);
+  FilteredSkip := NN.AddLayerAfter(TNNetFreeUFourierFilter.Create(SkipScale),
+    Skip);
+  NN.AddLayer(TNNetDeepConcat.Create([ScaledHalf, OtherHalf, FilteredSkip]));
+end;
 
 // One diffusers ResnetBlock2D with ADDITIVE timestep injection. Same pre-norm
 // residual idiom as AddVaeResnetBlock, but after conv1 the (1,1,out_ch)
@@ -76348,7 +76395,12 @@ begin
         Dec(SkipTop);
         PoppedCh := SkipCh[SkipTop];
         if j = 0 then ResnetIn := PrevOut else ResnetIn := OutCh;
-        NN.AddLayerAfter( [TNNetDeepConcat.Create([HLayer, Skips[SkipTop]])], HLayer );
+        // FreeU acts on the first two up blocks (diffusers resolution_idx 0, 1).
+        if Config.UseFreeU and (i <= 1) then
+          AddSDFreeUSkipConcat(NN, HLayer, Skips[SkipTop],
+            Config.FreeUBackboneScale[i], Config.FreeUSkipScale[i])
+        else
+          NN.AddLayerAfter( [TNNetDeepConcat.Create([HLayer, Skips[SkipTop]])], HLayer );
         HLayer := NN.GetLastLayer();
         AddSDResnetBlock(NN, Config, TimeCond, HLayer, ResnetIn + PoppedCh,
           OutCh, pTrainable, UpRes[i][j]);
@@ -93975,6 +94027,18 @@ begin
       ComponentFolder('scheduler') + 'scheduler_config.json');
   end;
   FSampler := Value;
+end;
+
+procedure TStableDiffusionPipeline.EnableFreeU(S1, S2, B1, B2: TNeuralFloat);
+begin
+  SDUNetSetFreeU(FUNetConfig, true, S1, S2, B1, B2);
+  FreeAndNil(FUNet);
+end;
+
+procedure TStableDiffusionPipeline.DisableFreeU();
+begin
+  SDUNetSetFreeU(FUNetConfig, false);
+  FreeAndNil(FUNet);
 end;
 
 procedure TStableDiffusionPipeline.LoRAsChanged();
