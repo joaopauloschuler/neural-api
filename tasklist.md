@@ -102,8 +102,8 @@ rather than acted on.
       "same seed" noise can then differ by call order (it broke
       `TestQwenImage21Img2ImgKeepLoaded` once). Options: restore with `RandSeed :=
       Saved` followed by an explicit reseed, or a private seeded generator for
-      latent noise. Audit the call sites first. PARTLY DONE (37b3922a):
-      `RestartRandSeed(Seed)` (neuralvolume.pas) forces the reseed and
+      latent noise. Audit the call sites first. `RestartRandSeed(Seed)`
+      (neuralvolume.pas, 37b3922a) forces the reseed and
       `MakeInitialLatents` uses it; the other save/restore sites in neural/
       are unchanged and could switch to it.
 - [ ] Possible defect (not fixed, awaits user decision): dense `TNNetSpectralNorm`
@@ -572,23 +572,8 @@ rather than acted on.
             the pipeline refuses addition_embed_type "text_time" today.
       - [ ] F16 weights: the SD UNet / VAE / CLIP loaders are unverified on F16
             and *.fp16.safetensors variant files (pick the variant by name).
-      - [X] transformers >= 5 CLIPTextModel exports drop the `text_model.` key
-            prefix; BuildClipTextTower requires it (the pico fixture re-adds it).
-            DONE: both CLIP towers detect the prefix (DetectOptionalTensorPrefix);
-            TestClipTowersUnprefixedKeys.
       - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
             CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
-      - [X] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for
-            SD 1.5); diffusers allows multiples of 8 by passing upsample_size
-            to the up blocks (nearest-resize to the skip size). Needs an
-            odd-size upsample in BuildSDUNet.
-            DONE: ceil-sized downsamples + TNNetCrop after each 2x upsample;
-            pipeline takes multiples of the VAE factor (TestStableDiffusionPipelineOddSize).
-      - [X] ControlNet / T2I-Adapter are still square: TControlNetConfig.CondGrid
-            and TT2IAdapterConfig take one side; BuildControlNet ignores
-            Base.LatentGridY.
-            DONE: CondGridY / LatentGridY; T2I-Adapter refuses sides off its
-            total downscale factor (Test*ControlNetNonSquare, *T2IAdapterNonSquare).
       - [ ] int8 quality on a real SD 1.5 checkpoint (UNet + CLIP int8 vs FP32
             image, user's GPU box; `UNetInt8` / `TextEncoderInt8`, `--int8`),
             then int4 UNet weights (QuantizeWeightsInt4, the QwenImage --int4
@@ -616,30 +601,6 @@ rather than acted on.
         - [ ] T2I-Adapter on a plain DownBlock2D that has a downsampler (the
               feature goes after the downsampler, in place on the last skip):
               coded from the diffusers source, no fixture has such a block.
-        - [X] Canny edge extraction (a cv2.Canny port: Gaussian blur, Sobel,
-              non-maximum suppression, hysteresis) so ControlNetCanny can take a
-              photo; it takes a ready edge map today. DONE: CannyEdges in
-              neuralimageresize.pas + ControlNetCanny --photo/--canny-*;
-              not yet compared with a real cv2 run.
-        - [X] Inpainting strength < 1 (start from the re-noised image latents
-              at the truncated schedule) and the sampled VAE latents (diffusers
-              retrieve_latents samples; ours takes the mean). DONE:
-              TStableDiffusionInpainter.Strength/SetSampleNoise, Denoise
-              truncates via TNNetDiffusionScheduler.Img2ImgStartStep,
-              EncodeVaeImage samples; DiffusionInpainting --strength;
-              TestStableDiffusionInpaintStrengthParity < 1e-4.
-        - [X] ControlNet guess mode, control_guidance_start/end, MultiControlNet,
-              T2I MultiAdapter, and ControlNet + T2I-Adapter at once (BuildSDUNet
-              interleaves the control and adapter TNNetInputs when both flags are
-              set, which SDUNetDenoiseWithControl/WithAdapter do not expect).
-              DONE 2026-10-22: TStableDiffusionControlNet.GuidanceStart /
-              GuidanceEnd / GuessMode; BuildSDUNet creates the adapter inputs
-              ahead of the control ones (order IP, adapter, control;
-              SDUNetConditioningInputs finds them); TStableDiffusionMultiConditioner
-              sums several ControlNets / T2I-Adapters; ControlNetCanny
-              --control-start/--control-end/--guess-mode. Pico parity < 1e-4:
-              window, guess mode, MultiControlNet, ControlNet + T2I + IP-Adapter
-              (tiny_sd15_composed_io.json). T2I MultiAdapter has no test.
         - [ ] Composed-conditioner follow-ups: (1) parity for ControlNet / T2I on
               img2img and inpainting (diffusers StableDiffusionControlNetImg2Img /
               Inpaint pipelines; the multi-conditioner runs them, untested, and
@@ -649,15 +610,6 @@ rather than acted on.
               test (diffusers MultiAdapter adapter_weights); (4) ControlNet
               config global_pool_conditions (forces guess mode, pools the
               residuals) is not read; (5) CLI for several ControlNets.
-        - [X] Retire SDUNetDenoiseInpaint (its blend runs before the UNet with
-              fresh AddNoise draws, not diffusers' after-step blend with the
-              initial noise) and TestDiffusionInpaintSmoke, superseded by
-              TStableDiffusionInpainter. DONE: both removed; no other caller.
-        - [X] Two diffusers image-processor ports: DiffusersPrepareImage and
-              QwenImage21ResizeToRgba/QwenImage21PrepareVaeImage (premultiplied
-              RGBA). Fold the Qwen pair onto one routine.
-              DONE: all three replaced by ConvertAndResizeImagePIL (neuralimageresize);
-              bit-exact (TestConvertAndResizeImagePILPinned).
       - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
             Marigold checkpoints (all read the same UNet config parser).
       - [ ] Textual inversion on a real checkpoint: SD 1.5 with a
@@ -671,67 +623,14 @@ rather than acted on.
             copy of the text; HF lowercases Unicode (non-ASCII tokens differ).
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
-      - [X] IP-Adapter image prompts in TStableDiffusionPipeline (port of
-            diffusers `load_ip_adapter` + `set_ip_adapter_scale` +
-            IPAdapterAttnProcessor, h94/IP-Adapter ip-adapter_sd15). Today
-            BuildIPAdapter builds only image_proj + ONE isolated decoupled
-            cross-attention block (TestIPAdapterParity); nothing taps it into the
-            UNet. Pieces, all reusing existing code:
-            (1) BuildSDUNet(pWithIPAdapter): AddSDTransformer2D gives every attn2
-                a second K/V pair (to_k_ip / to_v_ip over a NumImageTokens
-                TNNetInput, the same TNNetCrossAttention construction
-                BuildIPAdapter uses) whose output is added to the text
-                attention, times Scale, before to_out.0. The weights are
-                `ip_adapter.<idx>.to_{k,v}_ip.weight` with odd idx 1..31 for
-                SD 1.5; idx follows diffusers' attn_processors order
-                (module-registration order: down_blocks, up_blocks, then
-                mid_block; verify on the fixture). The IP K/V get quantized
-                along with the rest of the UNet when UNetInt8 is set.
-            (2) The image tokens: ClipPreprocessImage + BuildClipVisionTower
-                (models/image_encoder, CLIPVisionModelWithProjection ViT-H/14,
-                unnormalized `image_embeds`) -> the image_proj part of
-                BuildIPAdapter -> (NumImageTokens,1,CrossAttentionDim), computed
-                once per Generate. The unguided half of CFG uses image_proj of a
-                ZERO embedding (diffusers' negative_image_embeds), which is not
-                a zero token block.
-            (3) TStableDiffusionIPAdapter = class(TStableDiffusionConditioner)
-                with a UNetWithIPAdapter hook (like UNetWithControl /
-                UNetWithAdapter) that feeds the image-token input every UNet
-                pass, plus a Scale property.
-            Tests: extend tools/make_pico_sd_conditioning_fixtures.py with a
-            pico IP-Adapter + pico CLIP vision tower; 3 DDIM steps + the image
-            vs diffusers float64 < 1e-4, and Scale = 0 matching the plain
-            pipeline. CLI: `--ip-adapter FILE --ip-image PNG --ip-scale S` in
-            examples/StableDiffusion + its README. Out of scope: IP-Adapter-Plus
-            (Resampler image_proj over the penultimate hidden states), FaceID,
-            SDXL, combining it with ControlNet / T2I-Adapter.
-            DONE: BuildSDUNet(IPAdapterReader) + TStableDiffusionIPAdapter
-            (hook UNetIPAdapterFile; Scale rides on the to_v_ip token input) +
-            StableDiffusion --ip-adapter/--ip-image/--ip-scale; pico parity
-            < 1e-4, key order down/up/mid verified on the fixture.
+      - [ ] IP-Adapter image prompts in TStableDiffusionPipeline follow-ups
+            (TStableDiffusionIPAdapter, h94/IP-Adapter ip-adapter_sd15,
+            StableDiffusion --ip-adapter/--ip-image/--ip-scale):
         - [ ] Run h94/IP-Adapter ip-adapter_sd15 on real SD 1.5 (only the pico
               fixture is tested).
-        - [X] IP-Adapter with ControlNet / T2I-Adapter: one conditioner per
-              Denoise today, and BuildSDUNet refuses the combination.
-              DONE 2026-10-22: TStableDiffusionMultiConditioner (members fill the
-              UNet's extra inputs before every pass, through the new
-              TStableDiffusionConditioner.FillUNetInputs hook; one image
-              conditioner owns the steps). IP-Adapter tokens now follow the
-              prompt pass (diffusers' [image, zero, zero] on InstructPix2Pix).
-              Parity < 1e-4: IP + ControlNet, IP + ControlNet + T2I, IP +
-              InstructPix2Pix. CLI: ControlNetCanny --ip-adapter, StableDiffusion
-              --ip-adapter with --init-image / --edit-image.
         - [ ] IP-Adapter extras: set_ip_adapter_scale per-block dicts
               (style/layout), several adapters/images, ip_adapter_masks,
               ip-adapter-plus (Resampler), FaceID, SDXL.
-        - [X] TStableDiffusionIPAdapter.PredictNoise tells the CFG halves apart by
-              comparing the embeds object with the negative-prompt embeds
-              (object identity). Pass an explicit "unguided half" flag through
-              the conditioner hook instead, so a caller that copies the embeds
-              cannot silently get the wrong image tokens.
-              DONE 2026-10-22: PredictNoise takes TStableDiffusionPassInputs
-              (sdpiPrompt, sdpiImage); IP-Adapter uses the zero-embedding
-              tokens when sdpiImage is absent.
         - [ ] Conditioner follow-ups from the 2026-10-22 batch:
               (1) cross-check CannyEdges against a real cv2.Canny run (cv2 is
               not in the ~/x venv; needs user approval to install it);
@@ -739,75 +638,18 @@ rather than acted on.
               confirm the committed ControlNet / T2I / inpaint fixtures come out
               byte-identical after the --nonsquare-only / --inpaint-strength-only
               / --ip-adapter-only refactors;
-              [X] (3) strength < 1 parity for PNDM, DPM++ 2M and Euler a (only DDIM
-              and Euler are covered); DONE 2026-10-22: all three match diffusers
-              at strength 0.6 on img2img (TestStableDiffusionImg2ImgParity, Euler a
-              through the new TStableDiffusionPipeline.OnAncestralNoise); no
-              sampler bug found;
-              [X] (4) a plain img2img mode (TStableDiffusionImg2Img conditioner over
-              the DenoiseStrength / NoiseImageLatents hooks) plus
-              examples/StableDiffusion --init-image/--strength. DONE 2026-10-22:
-              TStableDiffusionInpainter now derives from TStableDiffusionImg2Img
-              (shared image / strength / sample noise / NoiseImageLatents); new
-              StartsFromImage hook (img2img starts from the noised image even at
-              strength 1, inpainting from pure noise); ImageSizeFor gives the
-              output size from the image;
               (5) examples/DiffusionInpainting could take its output size from the
               image through ImageSizeFor, as --init-image does;
               (6) img2img / inpaint parity covers only images already at the
               output size: add a fixture whose sides are not a VAE-factor
               multiple (diffusers resizes a PIL image with lanczos after uint8
               rounding, a tensor with torch interpolate) and check the resize.
-      - [X] InstructPix2Pix instruction-based image editing (port of diffusers
-            StableDiffusionInstructPix2PixPipeline; checkpoint
-            timbrooks/instruct-pix2pix: "make it winter", "turn him into a
-            statue"). The checkpoint is an SD 1.5 UNet with an 8-channel conv_in
-            (latents | image latents), so BuildSDUNet already builds it; the
-            pieces are:
-            (1) TStableDiffusionInstructPix2Pix = class(TStableDiffusionConditioner)
-                with SetImage / ImageGuidanceScale (diffusers
-                image_guidance_scale, default 1.5); AcceptsUNetInChannels takes
-                2 * LatentChannels. BeginDenoise encodes the image once with
-                EncodeVaeImage(SampleNoise = nil) (the latent mean; diffusers
-                does NOT apply scaling_factor here, while EncodeVaeImage always
-                does: add a parameter rather than dividing it back out) and the
-                output size follows the image (multiple
-                of the VAE factor, as ConvertAndResizeImagePIL gives).
-                PredictNoise concatenates the model-input-scaled latents with the
-                image latents on the channel axis (the inpainter's FUNetInput
-                pattern).
-            (2) Three-way guidance: diffusers runs [prompt, image],
-                [negative, image], [negative, ZERO image latents] and combines
-                uncond + g * (text - image) + ig * (image - uncond); guidance is
-                on when g > 1 and ig >= 1. The pipeline's two-half CFG cannot
-                express this; add a conditioner hook that owns the guidance
-                combine (also usable for the PAG/SLG-style extra passes), with
-                an explicit pass flag rather than the embeds-object identity
-                TStableDiffusionIPAdapter relies on today.
-            (3) The checkpoint's scheduler is EulerAncestralDiscreteScheduler
-                (already mapped with diffusers parity).
-            Tests: a pico 8-channel UNet in tools/make_pico_sd_conditioning_fixtures.py
-            (--ip2p-only), 3 Euler a / DDIM steps + the decoded image vs
-            diffusers float64 < 1e-4, and ImageGuidanceScale = 1 with
-            GuidanceScale = 1 matching a single conditioned pass. CLI:
-            examples/StableDiffusion --edit-image PNG --image-guidance S (or a
-            new examples/InstructPix2Pix with its README), then a real run on the
-            user's GPU box.
-            DONE 2026-10-22: TStableDiffusionInstructPix2Pix over a new
-            TStableDiffusionImageConditioner base (SetImage / ImageSizeFor /
-            the VAE encode; TStableDiffusionImg2Img now derives from it too, so
-            InstructPix2Pix does not inherit strength / sample noise);
-            EncodeVaeImage(ApplyScalingFactor); conditioner hooks IsGuided +
-            PredictGuidedNoise (base = CFG) with PredictPass and an explicit
-            TStableDiffusionPassInputs flag; pico folder tiny_sd15_ip2p (Euler a
-            scheduler config) + --ip2p-only fixture; Euler a / DDIM at 7.5 / 1.5
-            and Euler a at 1 / 1 (one pass per step) match diffusers float64
-            < 1e-4 (TestStableDiffusionInstructPix2PixParity); CLI
-            examples/StableDiffusion --edit-image / --image-guidance.
+      - [ ] InstructPix2Pix instruction-based image editing follow-ups
+            (TStableDiffusionInstructPix2Pix, checkpoint timbrooks/instruct-pix2pix;
+            examples/StableDiffusion --edit-image / --image-guidance):
         - [ ] Run timbrooks/instruct-pix2pix on the user's GPU box (only the pico
               fixture is tested; its F32 safetensors / fp16 variants unchecked).
-        - [ ] InstructPix2Pix extras: IP-Adapter on top of it (diffusers allows
-              it; one conditioner per Denoise today), an --edit-image whose
+        - [ ] InstructPix2Pix extras: an --edit-image whose
               sides are not a VAE-factor multiple (resize parity, see (6)
               above), and PAG/SLG-style extra passes through PredictGuidedNoise.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
@@ -822,7 +664,7 @@ rather than acted on.
       (`make_pico_cogvlm_fixture.py`, reusing the slice-real-checkpoint pattern)
       checked < 1e-4 vs a transformers float64 oracle. Add a CV captioning /
       VQA smoke under examples/ once a small checkpoint is obtainable offline.
-- [ ] Mask2Former universal-segmentation importer LANDED
+- [ ] Mask2Former universal-segmentation importer follow-ups
       (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former";
       masked-attention decoder + per-query mask/class heads, RunMask2FormerSemantic +
       DecodeMask2FormerSemantic, TestMask2FormerParity ~1.2e-7 < 1e-4,
@@ -917,13 +759,13 @@ rather than acted on.
       the Johnson-2016 perceptual loss + d(Loss)/d(pixels) gradient through the
       frozen VGG; calibrated unit-normalize is a follow-up) into an SR example as
       an opt-in objective.
-- [ ] ControlNet spatial-conditioning importer LANDED
+- [ ] ControlNet spatial-conditioning importer follow-ups
       (BuildControlNetFromSafeTensors[Ex], lllyasviel/sd-controlnet-canny;
       hint stem + per-resolution zero-conv residual taps + ControlNetResiduals driver,
       TestControlNetParity 2.89e-6 < 1e-4). First conditioning-by-feature-injection model.
       DEFERRED follow-ups: (a) real-checkpoint slicer (slice sd-controlnet-canny like
       slice_llama.py) for parity vs real weights on top of the synthetic fixture;
-      (b) T2I-Adapter (BuildT2IAdapterFromSafeTensors[Ex], landed)
+      (b) T2I-Adapter (BuildT2IAdapterFromSafeTensors[Ex])
       follow-ups: real-checkpoint slicer (TencentARC/t2iadapter_*_sd15v2),
       light_adapter variant.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
@@ -1181,14 +1023,6 @@ rather than acted on.
         - [ ] `TNNetDeconvolution` is single-threaded (`ChunkEligible` false); a
           neuron-axis `ComputeRange` over the CPU GEMM needs per-thread chunk
           scratch.
-        - [X] OpenCL: the scatter GEMM uploads the input, downloads all L*K*N
-          products and scatters on the host; no resident source/output, and no
-          borrowing (`EnableOpenCLInContextOf`) test for the deconv.
-          DONE 2026-10-22: `cai_conv_transpose` gather (each output cell sums its
-          landing taps, bias + fused activation opcodes 0-8), binds a resident
-          source, output stays in OpenCL memory, lends/borrows its A operand;
-          inference only. `TestDeconvolutionOpenCLParity` (8 shapes, sentinels),
-          `TestDeconvolutionOpenCLBorrowing`.
         - [ ] `cai_conv_transpose` is untiled (one work-item per output cell and
           channel, like `cai_conv_implicit`); a large dense deconv (Kokoro
           generator ups) may want a tiled or phase-split GEMM. Not timed on a GPU.
@@ -1218,11 +1052,6 @@ rather than acted on.
         - [ ] `bfAlbert` through `BuildBertFromSafeTensorsWithConfig` (HF
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
-  - 2.6 `AdainResBlk1d` follow-ups:
-        - [X] Grouped `TNNetDeconvolution` stays on the CPU under OpenCL: each
-          grouped deconvolution downloads its source and re-uploads its output.
-          DONE 2026-10-22: `cai_conv_transpose` reads each row's group slice;
-          dense and grouped share the one kernel.
   - 2.9 Forward complex STFT follow-ups:
         - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
@@ -1724,14 +1553,6 @@ rather than acted on.
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
 
-- [X] Stable Diffusion img2img + inpainting follow-ups (on top of
-      BuildVaeEncoderFromSafeTensors, examples/ImageToImage and
-      TStableDiffusionInpainter / examples/DiffusionInpainting): (1) [DONE:
-      TStableDiffusionPipeline.EncodeVaeImage SampleNoise] the non-deterministic VAE reparameterize head
-      (mean+exp(0.5*logvar)*noise); (2) [DONE 2026-10-22: TStableDiffusionImg2Img,
-      TestStableDiffusionImg2ImgParity on tiny_sd15_img2img_io.json, DDIM / PNDM /
-      DPM++ 2M / Euler / Euler a < 1e-4] a fixed-seed img2img latent trajectory matching diffusers
-      `StableDiffusionImg2ImgPipeline` step-for-step.
 - [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
       model_type "kosmos-2", e.g. microsoft/kosmos-2-patch14-224). DISTINCT from the
       landed caption VLMs (LLaVA/Blip2/Florence-2 fuse image features as prepended
@@ -1987,22 +1808,6 @@ rather than acted on.
             `FInputPrepared` is the user-decision item under "Layer follow-ups".
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
-      - [X] The SD UNet path (`BuildSDUNetFromSafeTensors`,
-            `TStableDiffusionPipeline`) can take the same reader;
-            examples/StableDiffusion has no `--lora` yet.
-            DONE: `TStableDiffusionPipeline.AddLoRA/ClearLoRAs`, a
-            `BuildSDUNetFromSafeTensorsEx` overload with LoRA files, the text
-            encoder merged too, `--lora FILE[:SCALE]` + README; the reader
-            gained SD key layouts (older diffusers lora.down /
-            lora_linear_layer / attn-processor, kohya lora_te_), conv LoRA
-            (1x1 and 3x3 LoCon), skip prefixes per component and the
-            `lora_adapter_metadata` alpha.
-      - [X] Tests use a Pascal-side oracle (W + scale * B @ A) only; no diffusers
-            `load_lora_weights` + `fuse_lora` latent oracle, and no real
-            community LoRA has run yet (user run).
-            DONE for SD: `TestStableDiffusionPipelineLoRA` against diffusers
-            float64 (`--lora-only` in make_pico_sd_conditioning_fixtures.py),
-            plus `TestLoRAMergeSDUNetLayouts` / `TestLoRAMergeSDTextEncoder`.
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
             runwayml/stable-diffusion-v1-5 (user run).
       - [ ] Qwen-Image has no diffusers `fuse_lora` latent oracle; its reader
