@@ -121,6 +121,9 @@ type
     Content: string;
     Id: integer;
     Special: boolean;
+    // Matched against the ASCII-lowercased text (Content is lowercase), as HF
+    // normalized added tokens on a lowercasing normalizer (CLIP).
+    Normalized: boolean;
   end;
 
   // One emitted token's char span in the ORIGINAL input text. Start is the
@@ -172,6 +175,8 @@ type
       // same flag as) FAddedIdToIndex.
       FAddedFirstByte: array[byte] of boolean;
       FAddedIdIndexBuilt: boolean;
+      // Some added token is Normalized: Encode also scans a lowercased copy.
+      FHasNormalizedAddedTokens: boolean;
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
       FUnkId, FBosId, FEosId: integer;
@@ -316,7 +321,8 @@ type
         Pieces: TStringList);
       procedure MapPieceToByteLevel(const Piece: string;
         Symbols: TStringList);
-      function FindAddedToken(const Text: string; Position: integer;
+      // Longest added token at Position; Normalized ones match in LowerText.
+      function FindAddedToken(const Text, LowerText: string; Position: integer;
         out TokenIndex: integer): boolean;
       function IsAddedTokenId(Id: integer; out TokenIndex: integer): boolean;
       procedure BuildAddedIdIndex();
@@ -449,6 +455,9 @@ type
       function IdToToken(Id: integer): string;
       function AddedTokenCount(): integer;
       function GetAddedToken(Index: integer): TNeuralAddedToken;
+      // Registers Content as a non-special added token (HF add_tokens) with the
+      // next free id, returned; a CLIP tokenizer stores and matches it lowercased.
+      function AddToken(const Content: string): integer;
 
       property UnkId: integer read FUnkId; // -1 if none
       property BosId: integer read FBosId; // -1 if none
@@ -3136,11 +3145,12 @@ begin
     Writer.AddMetaUInt32('tokenizer.ggml.unknown_token_id', cardinal(FUnkId));
 end;
 
-function TNeuralHFTokenizer.FindAddedToken(const Text: string;
+function TNeuralHFTokenizer.FindAddedToken(const Text, LowerText: string;
   Position: integer; out TokenIndex: integer): boolean;
 var
   Cnt, BestLen, ContentLen, AddedHi, TextLen: integer;
   Content: string;
+  Source: PChar;
 begin
   Result := false;
   TokenIndex := -1;
@@ -3151,14 +3161,16 @@ begin
   begin
     Content := FAddedTokens[Cnt].Content;
     ContentLen := Length(Content);
-    // Match Content against Text at Position without a Copy() allocation.
-    // Bound + first-byte guards short-circuit before the CompareMem read
-    // (BestLen >= 0 => ContentLen >= 1 when the length test passes, so
-    // Text[Position] and Content[1] are in range).
+    if FAddedTokens[Cnt].Normalized then Source := @LowerText[Position]
+    else Source := @Text[Position];
+    // Match Content against the source at Position without a Copy()
+    // allocation. Bound + first-byte guards short-circuit before the
+    // CompareMem read (BestLen >= 0 => ContentLen >= 1 when the length test
+    // passes, so Source[0] and Content[1] are in range).
     if (ContentLen > BestLen) and
       (Position + ContentLen - 1 <= TextLen) and
-      (Text[Position] = Content[1]) and
-      CompareMem(@Text[Position], @Content[1], ContentLen) then
+      (Source^ = Content[1]) and
+      CompareMem(Source, @Content[1], ContentLen) then
     begin
       BestLen := ContentLen;
       TokenIndex := Cnt;
@@ -3177,11 +3189,18 @@ var
 begin
   AddedHi := High(FAddedTokens);
   FillChar(FAddedFirstByte, SizeOf(FAddedFirstByte), 0);
+  FHasNormalizedAddedTokens := false;
   for Cnt := 0 to AddedHi do
   begin
     // An empty added token can never match, so it must not pass the prefilter.
     Content := FAddedTokens[Cnt].Content;
-    if Content <> '' then FAddedFirstByte[byte(Content[1])] := true;
+    if Content = '' then continue;
+    FAddedFirstByte[byte(Content[1])] := true;
+    if FAddedTokens[Cnt].Normalized then
+    begin
+      FHasNormalizedAddedTokens := true;
+      FAddedFirstByte[byte(UpCase(Content[1]))] := true;
+    end;
   end;
   MaxId := -1;
   for Cnt := 0 to AddedHi do
@@ -4733,6 +4752,7 @@ end;
 procedure TNeuralHFTokenizer.Encode(const Text: string; Ids: TIntegerList);
 var
   Position, SegStart, TokenIndex, TextLen: integer;
+  LowerText: string;
 begin
   if GetVocabSize() = 0 then
     raise EHFTokenizerError.Create('Encode called before LoadFromFile.');
@@ -4740,12 +4760,16 @@ begin
   SegStart := 1;
   TextLen := Length(Text); // #2/#5: Text is const, not mutated in loop
   if not FAddedIdIndexBuilt then BuildAddedIdIndex();
+  if FHasNormalizedAddedTokens then LowerText := LowerCase(Text)
+  else LowerText := Text;
   while Position <= TextLen do
   begin
     // The gate is exact: FindAddedToken only ever matches a token whose first
-    // byte equals Text[Position], so a closed gate cannot hide a match.
+    // byte equals Text[Position] (or its lowercase for a Normalized token,
+    // whose uppercase first byte is gated too), so a closed gate cannot hide
+    // a match.
     if FAddedFirstByte[byte(Text[Position])] and
-      FindAddedToken(Text, Position, TokenIndex) then
+      FindAddedToken(Text, LowerText, Position, TokenIndex) then
     begin
       if Position > SegStart then
         EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids,
@@ -5232,6 +5256,30 @@ end;
 function TNeuralHFTokenizer.GetAddedToken(Index: integer): TNeuralAddedToken;
 begin
   Result := FAddedTokens[Index];
+end;
+
+function TNeuralHFTokenizer.AddToken(const Content: string): integer;
+var
+  Stored: string;
+  TokenIndex, AddedHi: integer;
+begin
+  if Content = '' then
+    raise EHFTokenizerError.Create('AddToken: empty token.');
+  if FClipPreTok then Stored := LowerCase(Content) else Stored := Content;
+  if TokenToId(Stored) >= 0 then
+    raise EHFTokenizerError.Create('AddToken: "' + Content +
+      '" is already in the vocabulary.');
+  Result := GetVocabSize();
+  AddedHi := High(FAddedTokens);
+  for TokenIndex := 0 to AddedHi do
+    if FAddedTokens[TokenIndex].Id >= Result then
+      Result := FAddedTokens[TokenIndex].Id + 1;
+  SetLength(FAddedTokens, AddedHi + 2);
+  FAddedTokens[AddedHi + 1].Content := Stored;
+  FAddedTokens[AddedHi + 1].Id := Result;
+  FAddedTokens[AddedHi + 1].Special := false;
+  FAddedTokens[AddedHi + 1].Normalized := FClipPreTok;
+  FAddedIdIndexBuilt := false;
 end;
 
 end.

@@ -1233,6 +1233,9 @@ type
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineKeepLoaded;
     procedure TestStableDiffusionPipelineInt8;
+    procedure TestStableDiffusionTextualInversionTokens;
+    procedure TestStableDiffusionTextualInversionEmbeds;
+    procedure TestStableDiffusionTextualInversionRejects;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -45879,6 +45882,131 @@ begin
     ImageFP32.Free;
     EmbedsInt8.Free;
     EmbedsFP32.Free;
+    Pipeline.Free;
+  end;
+end;
+
+// Textual inversion (tests/fixtures/tiny_sd15_ti, a 2-vector "<pico-cat>"
+// .safetensors and an A1111 2-vector "PicoStyle" .pt) vs diffusers'
+// maybe_convert_prompt + tokenizer: expansion, case-insensitive matching.
+procedure TTestNeuralPretrained.TestStableDiffusionTextualInversionTokens;
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Cases, ExpectedIds: TJSONArray;
+  CaseObj: TJSONObject;
+  Ids: TNeuralIntegerArray;
+  CaseCnt, IdCnt: integer;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_ti_io.json');
+  Pipeline := CreateSD15Pipeline();
+  try
+    AssertEquals('safetensors token', '<pico-cat>', Pipeline.LoadTextualInversion(
+      FixturePath('tiny_sd15_ti/pico_cat.safetensors')));
+    AssertEquals('A1111 name', 'PicoStyle', Pipeline.LoadTextualInversion(
+      FixturePath('tiny_sd15_ti/pico_style.pt')));
+    Cases := TJSONObject(Root).Arrays['cases'];
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      AssertEquals('case ' + IntToStr(CaseCnt) + ' converted',
+        CaseObj.Get('converted', ''),
+        Pipeline.ExpandInversionTokens(CaseObj.Get('prompt', '')));
+      ExpectedIds := CaseObj.Arrays['input_ids'];
+      Ids := Pipeline.TokenizePrompt(CaseObj.Get('prompt', ''));
+      AssertEquals('case ' + IntToStr(CaseCnt) + ' count', ExpectedIds.Count,
+        Length(Ids));
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals('case ' + IntToStr(CaseCnt) + ' id ' + IntToStr(IdCnt),
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+    end;
+  finally
+    Pipeline.Free;
+    Root.Free;
+  end;
+end;
+
+// Prompt embeds with the concept tokens vs diffusers encode_prompt (float64):
+// one pipeline per format, the .bin one after LoadComponents kept an encoder.
+procedure TTestNeuralPretrained.TestStableDiffusionTextualInversionEmbeds;
+var
+  Root: TJSONData;
+  Pipeline, BinPipeline: TStableDiffusionPipeline;
+  Cases: TJSONArray;
+  Got, Expected: TNNetVolume;
+  CaseCnt: integer;
+  MaxDiff: double;
+begin
+  Root := LoadSD15Fixture('tiny_sd15_ti_io.json');
+  Pipeline := CreateSD15Pipeline();
+  BinPipeline := CreateSD15Pipeline();
+  Got := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Pipeline.LoadTextualInversion(FixturePath('tiny_sd15_ti/pico_cat.safetensors'));
+    Pipeline.LoadTextualInversion(FixturePath('tiny_sd15_ti/pico_style.pt'));
+    Cases := TJSONObject(Root).Arrays['cases'];
+    for CaseCnt := 0 to 1 do
+    begin
+      Pipeline.EncodePrompt(Cases.Objects[CaseCnt].Get('prompt', ''), Got);
+      LoadNestedOracleVolume(Cases.Objects[CaseCnt].Arrays['prompt_embeds'],
+        false, Expected);
+      MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+      AssertTrue('case ' + IntToStr(CaseCnt) + ' embeds max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    end;
+    // Case 0 uses "<pico-cat>" only; the token comes from the .bin tensor name.
+    BinPipeline.LoadComponents(16, 16);
+    BinPipeline.EncodePrompt('a red cube', Got);
+    AssertEquals('.bin token', '<pico-cat>', BinPipeline.LoadTextualInversion(
+      FixturePath('tiny_sd15_ti/pico_cat.bin')));
+    BinPipeline.EncodePrompt(Cases.Objects[0].Get('prompt', ''), Got);
+    LoadNestedOracleVolume(Cases.Objects[0].Arrays['prompt_embeds'], false,
+      Expected);
+    MaxDiff := MaxAbsVolumeDiff(Got, Expected);
+    AssertTrue('.bin after keep-loaded max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-5);
+  finally
+    Expected.Free;
+    Got.Free;
+    BinPipeline.Free;
+    Pipeline.Free;
+    Root.Free;
+  end;
+end;
+
+// A hidden size other than the text encoder's and a token already in the
+// tokenizer raise and leave the pipeline as it was.
+procedure TTestNeuralPretrained.TestStableDiffusionTextualInversionRejects;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Raised: boolean;
+  Ids: TNeuralIntegerArray;
+begin
+  Pipeline := CreateSD15Pipeline();
+  try
+    Raised := false;
+    try
+      Pipeline.LoadTextualInversion(
+        FixturePath('tiny_sd15_ti/wrong_width.safetensors'));
+    except
+      on E: Exception do Raised := Pos('width 16', E.Message) > 0;
+    end;
+    AssertTrue('hidden 16 vs 32 rejected', Raised);
+    Pipeline.LoadTextualInversion(FixturePath('tiny_sd15_ti/pico_cat.safetensors'));
+    Raised := false;
+    try
+      Pipeline.LoadTextualInversion(
+        FixturePath('tiny_sd15_ti/pico_style.pt'), '<PICO-cat>');
+    except
+      on E: Exception do Raised := Pos('already', E.Message) > 0;
+    end;
+    AssertTrue('token clash rejected', Raised);
+    Ids := Pipeline.TokenizePrompt('<pico-cat>');
+    AssertEquals('token', 618, Ids[1]);
+    AssertEquals('expanded', 619, Ids[2]);
+    AssertEquals('then eos', Pipeline.TokenizePrompt('')[1], Ids[3]);
+  finally
     Pipeline.Free;
   end;
 end;

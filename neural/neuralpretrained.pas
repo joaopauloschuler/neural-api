@@ -7922,10 +7922,11 @@ procedure BuildClipFromSafeTensors(const FileName: string;
   const ConfigFileName: string = '');
 
 // CLIP TEXT tower alone from Reader ("text_model.*"): (SeqLen,1,1) ids -> per-token
-// features; ProjectionTensorName = '' outputs the post-LN last_hidden_state.
+// features; '' projection: post-LN last_hidden_state. ExtraTokenRows: rows after the vocab.
 function BuildClipTextTower(Reader: TNNetSafeTensorsReader;
   const Config: TClipConfig; TextSeqLen: integer;
-  const ProjectionTensorName: string; pTrainable: boolean): TNNet;
+  const ProjectionTensorName: string; pTrainable: boolean;
+  ExtraTokenRows: TNNetVolume = nil): TNNet;
 
 // Builds + loads the CLIP ViT VISION tower alone (the reusable half: a
 // plain pre-LN ViT with a class token). Prefix is the tensor-name prefix
@@ -12162,6 +12163,10 @@ type
     FMaxTokenCount: integer;
     FPadToken: string;
     FTokenizer: TNeuralHFTokenizer;
+    // Textual inversion concepts in load order: the token as given and its
+    // flat [N, hidden] vectors, the token embedding rows after the vocab.
+    FInversionTokens: array of string;
+    FInversionVectors: TNNetVolumeList;
     FGuidanceScale: TNeuralFloat;
     FNegativePrompt: string;
     // The unconditional embeds of guided steps: set, or encoded on first use.
@@ -12186,6 +12191,11 @@ type
     FOpenCLDevice: cl_device_id;
     {$ENDIF}
     function ComponentFolder(const Component: string): string;
+    // Loads tokenizer/ and registers the textual inversion tokens.
+    procedure EnsureTokenizer();
+    // Adds Token, Token_1, ... of concept ConceptPos to FTokenizer; raises
+    // unless their ids are the embedding rows after the text encoder vocab.
+    procedure RegisterInversionTokens(ConceptPos: integer);
     // Charges the open phase to ImageStats, then starts Phase (EndPhase: none)
     // and fires OnPhase.
     procedure DoPhase(Phase: TStableDiffusionPipelinePhase);
@@ -12229,6 +12239,12 @@ type
     procedure LoadComponents(Width: integer = 0; Height: integer = 0);
     // Frees what LoadComponents kept; the stages build and free them again.
     procedure UnloadComponents();
+    // diffusers load_textual_inversion: a learned_embeds .safetensors / .bin
+    // ({token: [N, hidden]}) or an A1111 .pt; Token '' keeps the file's. Returns it.
+    function LoadTextualInversion(const FileName: string;
+      const Token: string = ''): string;
+    // diffusers maybe_convert_prompt: "Token" -> "Token Token_1 ..." per concept.
+    function ExpandInversionTokens(const Prompt: string): string;
     // [bos] + ids (truncated) + [eos], padded with the pad token to MaxTokenCount.
     function TokenizePrompt(const Prompt: string): TNeuralIntegerArray;
     // CLIP last hidden state of TokenIds: (Length(TokenIds), 1, hidden).
@@ -61788,13 +61804,17 @@ end;
 
 // Loads a [Rows, Cols] embedding table straight into the single-neuron
 // weight volume of a TNNetEmbedding / TNNetLearnedPositionalEmbedding
-// (row-major in both the checkpoint and the layer) - the BERT path's
-// loader without the row offset.
+// (row-major in both the checkpoint and the layer); ExtraRows (flat
+// [*, Cols]) fill the rows after the table.
 procedure LoadClipEmbeddingTable(Reader: TNNetSafeTensorsReader;
-  Layer: TNNetLayer; const TName: string; Rows, Cols: integer);
+  Layer: TNNetLayer; const TName: string; Rows, Cols: integer;
+  ExtraRows: TNNetVolume = nil);
 var
   Tmp: TNNetVolume;
+  ExtraSize: integer;
 begin
+  ExtraSize := 0;
+  if Assigned(ExtraRows) then ExtraSize := ExtraRows.Size;
   if not Reader.HasTensor(TName) then
     ImportError('CLIP import: missing tensor "' + TName + '".');
   if (Reader.DimCount(TName) <> 2) or
@@ -61807,11 +61827,15 @@ begin
   try
     Reader.LoadTensorFlat(TName, Tmp);
     EnsureWritableImportWeights(Layer);
-    if Layer.FArrNeurons[0].Weights.Size <> Rows * Cols then
+    if Layer.FArrNeurons[0].Weights.Size <> Rows * Cols + ExtraSize then
       ImportError('CLIP import: "' + TName + '" element count ' +
-        IntToStr(Rows * Cols) + ' does not match the table size ' +
+        IntToStr(Rows * Cols + ExtraSize) + ' does not match the table size ' +
         IntToStr(Layer.FArrNeurons[0].Weights.Size) + '.');
-    Layer.FArrNeurons[0].Weights.Copy(Tmp);
+    Move(Tmp.FData[0], Layer.FArrNeurons[0].Weights.FData[0],
+      Rows * Cols * SizeOf(TNeuralFloat));
+    if ExtraSize > 0 then
+      Move(ExtraRows.FData[0], Layer.FArrNeurons[0].Weights.FData[Rows * Cols],
+        ExtraSize * SizeOf(TNeuralFloat));
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -62247,13 +62271,23 @@ end;
 
 function BuildClipTextTower(Reader: TNNetSafeTensorsReader;
   const Config: TClipConfig; TextSeqLen: integer;
-  const ProjectionTensorName: string; pTrainable: boolean): TNNet;
+  const ProjectionTensorName: string; pTrainable: boolean;
+  ExtraTokenRows: TNNetVolume): TNNet;
 var
   NN: TNNet;
   TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
-  SeqLen, BlockCnt, TextNumLayersM1: integer;
+  SeqLen, BlockCnt, TextNumLayersM1, ExtraTokenCount: integer;
 begin
+  ExtraTokenCount := 0;
+  if Assigned(ExtraTokenRows) then
+  begin
+    if ExtraTokenRows.Size mod Config.Text.HiddenSize <> 0 then
+      ImportError('CLIP import: ' + IntToStr(ExtraTokenRows.Size) +
+        ' extra token values are not whole rows of ' +
+        IntToStr(Config.Text.HiddenSize) + '.');
+    ExtraTokenCount := ExtraTokenRows.Size div Config.Text.HiddenSize;
+  end;
   if (Config.Text.NumHeads < 1) or
      ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
     ImportError('CLIP import: text hidden_size=' +
@@ -62270,7 +62304,8 @@ begin
     NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
     // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
     TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-      Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      Config.TextVocabSize + ExtraTokenCount, Config.Text.HiddenSize,
+      {EncodeZero=}1).SetTrainable(pTrainable) );
     PosEmb := NN.AddLayer(
       TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
@@ -62291,7 +62326,7 @@ begin
 
     LoadClipEmbeddingTable(Reader, TokEmb,
       'text_model.embeddings.token_embedding.weight',
-      Config.TextVocabSize, Config.Text.HiddenSize);
+      Config.TextVocabSize, Config.Text.HiddenSize, ExtraTokenRows);
     LoadClipEmbeddingTable(Reader, PosEmb,
       'text_model.embeddings.position_embedding.weight',
       Config.TextMaxPositions, Config.Text.HiddenSize);
@@ -92229,6 +92264,7 @@ begin
   inherited Create;
   FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
   FNegativePromptEmbeds := TNNetVolume.Create();
+  FInversionVectors := TNNetVolumeList.Create();
   FGuidanceScale := 7.5;
   FOpenPhase := sdphDone;
   IndexFile := FModelFolder + 'model_index.json';
@@ -92304,6 +92340,7 @@ destructor TStableDiffusionPipeline.Destroy();
 begin
   UnloadComponents();
   FTokenizer.Free;
+  FInversionVectors.Free;
   FNegativePromptEmbeds.Free;
   FScheduler.Free;
   inherited Destroy;
@@ -92430,18 +92467,26 @@ end;
 function TStableDiffusionPipeline.AcquireTextEncoder(SeqLen: integer): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
+  ExtraTokenRows: TNNetVolume;
 begin
   if Assigned(FTextEncoder) and (FTextEncoderSeqLen = SeqLen) then
     exit(FTextEncoder);
   DoPhase(sdphLoadTextEncoder);
   // The old net goes first: peak memory stays one text encoder.
   FreeAndNil(FTextEncoder);
+  ExtraTokenRows := nil;
   Reader := CreatePretrainedTensorReader(SafeTensorsFolderWeightsFile(
     ComponentFolder('text_encoder'), 'model'));
   try
+    if FInversionVectors.Count > 0 then
+    begin
+      ExtraTokenRows := TNNetVolume.Create();
+      FInversionVectors.ConcatInto(ExtraTokenRows);
+    end;
     Result := BuildClipTextTower(Reader, FTextConfig, SeqLen, '',
-      {pTrainable=}false);
+      {pTrainable=}false, ExtraTokenRows);
   finally
+    ExtraTokenRows.Free;
     Reader.Free;
   end;
   try
@@ -92562,25 +92607,191 @@ begin
   FHasNegativePromptEmbeds := false;
 end;
 
+function InversionTokenName(const Token: string; VectorPos: integer): string;
+begin
+  if VectorPos = 0 then Result := Token
+  else Result := Token + '_' + IntToStr(VectorPos);
+end;
+
+procedure TStableDiffusionPipeline.EnsureTokenizer();
+var
+  Folder: string;
+  ConceptPos, MaxConceptPos: integer;
+begin
+  if Assigned(FTokenizer) then exit;
+  Folder := ComponentFolder('tokenizer');
+  FTokenizer := TNeuralHFTokenizer.Create();
+  try
+    FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
+      Folder + 'merges.txt');
+    MaxConceptPos := High(FInversionTokens);
+    for ConceptPos := 0 to MaxConceptPos do
+      RegisterInversionTokens(ConceptPos);
+  except
+    FreeAndNil(FTokenizer);
+    raise;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.RegisterInversionTokens(
+  ConceptPos: integer);
+var
+  FirstId, TokenId, PriorPos, MaxPriorPos, VectorPos, MaxVectorPos: integer;
+begin
+  FirstId := FTextConfig.TextVocabSize;
+  MaxPriorPos := ConceptPos - 1;
+  for PriorPos := 0 to MaxPriorPos do
+    Inc(FirstId, FInversionVectors[PriorPos].Size div
+      FTextConfig.Text.HiddenSize);
+  MaxVectorPos := FInversionVectors[ConceptPos].Size div
+    FTextConfig.Text.HiddenSize - 1;
+  for VectorPos := 0 to MaxVectorPos do
+  begin
+    TokenId := FTokenizer.AddToken(
+      InversionTokenName(FInversionTokens[ConceptPos], VectorPos));
+    if TokenId <> FirstId + VectorPos then
+      ImportError('TStableDiffusionPipeline: textual inversion token "' +
+        InversionTokenName(FInversionTokens[ConceptPos], VectorPos) +
+        '" got tokenizer id ' + IntToStr(TokenId) + ', but its embedding ' +
+        'row is ' + IntToStr(FirstId + VectorPos) + ' (the tokenizer and ' +
+        'text_encoder vocab_size ' + IntToStr(FTextConfig.TextVocabSize) +
+        ' disagree).');
+  end;
+end;
+
+function TStableDiffusionPipeline.LoadTextualInversion(const FileName: string;
+  const Token: string): string;
+const
+  csA1111TensorName = 'string_to_param.*';
+var
+  Reader: TNNetSafeTensorsReader;
+  Vectors: TNNetVolume;
+  TensorName, CandidateToken: string;
+  Hidden, DimCount, VectorPos, MaxVectorPos, ConceptPos: integer;
+begin
+  Vectors := TNNetVolume.Create();
+  try
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      if Reader.HasTensor(csA1111TensorName) then
+      begin
+        TensorName := csA1111TensorName;
+        Result := '';
+        if Reader is TNNetTorchBinReader then
+          Result := TNNetTorchBinReader(Reader).GetMetadataStr('name', '');
+      end
+      else if Reader.Count = 1 then
+      begin
+        TensorName := Reader.TensorName(0);
+        Result := TensorName;
+        if (Reader is TNNetTorchBinReader) and
+          (TensorName = TorchBinBareTensorName) then Result := '';
+      end
+      else
+        ImportError('LoadTextualInversion: ' + FileName + ' holds ' +
+          IntToStr(Reader.Count) + ' tensors, neither one {token: [N, ' +
+          'hidden]} tensor nor an A1111 string_to_param.');
+      if Token <> '' then Result := Token;
+      if Result = '' then
+        ImportError('LoadTextualInversion: ' + FileName +
+          ' names no token; pass one.');
+      DimCount := Reader.DimCount(TensorName);
+      if (DimCount < 1) or (DimCount > 2) or
+        (Reader.ElementCount(TensorName) = 0) then
+        ImportError('LoadTextualInversion: "' + TensorName + '" has shape ' +
+          Reader.ShapeAsString(TensorName) + ', not [N, hidden].');
+      Hidden := Reader.DimSize(TensorName, DimCount - 1);
+      if Hidden <> FTextConfig.Text.HiddenSize then
+        ImportError('LoadTextualInversion: ' + FileName + ' holds vectors ' +
+          'of width ' + IntToStr(Hidden) + ', the text encoder hidden_size ' +
+          'is ' + IntToStr(FTextConfig.Text.HiddenSize) +
+          ' (an embedding trained for another model?).');
+      Reader.LoadTensorFlat(TensorName, Vectors);
+    finally
+      Reader.Free;
+    end;
+    EnsureTokenizer();
+    MaxVectorPos := Vectors.Size div Hidden - 1;
+    for VectorPos := 0 to MaxVectorPos do
+    begin
+      CandidateToken := InversionTokenName(Result, VectorPos);
+      if (FTokenizer.TokenToId(CandidateToken) >= 0) or
+        (FTokenizer.TokenToId(LowerCase(CandidateToken)) >= 0) then
+        ImportError('LoadTextualInversion: token "' + CandidateToken +
+          '" is already in the tokenizer; pass another token.');
+    end;
+    ConceptPos := Length(FInversionTokens);
+    SetLength(FInversionTokens, ConceptPos + 1);
+    FInversionTokens[ConceptPos] := Result;
+    FInversionVectors.Add(Vectors);
+    Vectors := nil;
+    try
+      RegisterInversionTokens(ConceptPos);
+    except
+      SetLength(FInversionTokens, ConceptPos);
+      FInversionVectors.Delete(ConceptPos);
+      FreeAndNil(FTokenizer);
+      raise;
+    end;
+  finally
+    Vectors.Free;
+  end;
+  // A kept encoder lacks the new rows; a negative prompt may use the token.
+  FreeAndNil(FTextEncoder);
+  if FNegativePrompt <> '' then FHasNegativePromptEmbeds := false;
+end;
+
+function TStableDiffusionPipeline.ExpandInversionTokens(
+  const Prompt: string): string;
+var
+  TextIds: TNeuralIntegerArray;
+  Replacement: string;
+  ConceptId, VectorCount, ConceptPos, MaxConceptPos: integer;
+  IdPos, MaxIdPos, VectorPos, MaxVectorPos: integer;
+  IsUsed: boolean;
+begin
+  Result := Prompt;
+  if Length(FInversionTokens) = 0 then exit;
+  EnsureTokenizer();
+  TextIds := FTokenizer.Encode(Prompt);
+  MaxIdPos := High(TextIds);
+  ConceptId := FTextConfig.TextVocabSize;
+  MaxConceptPos := High(FInversionTokens);
+  for ConceptPos := 0 to MaxConceptPos do
+  begin
+    VectorCount := FInversionVectors[ConceptPos].Size div
+      FTextConfig.Text.HiddenSize;
+    IsUsed := false;
+    for IdPos := 0 to MaxIdPos do
+      if TextIds[IdPos] = ConceptId then IsUsed := true;
+    Inc(ConceptId, VectorCount);
+    // diffusers looks the tokenized (lowercased) token up among the tokens
+    // as given, so a mixed-case token never expands.
+    if (VectorCount < 2) or not IsUsed or
+      (FInversionTokens[ConceptPos] <> LowerCase(FInversionTokens[ConceptPos]))
+      then continue;
+    Replacement := FInversionTokens[ConceptPos];
+    MaxVectorPos := VectorCount - 1;
+    for VectorPos := 1 to MaxVectorPos do
+      Replacement := Replacement + ' ' +
+        InversionTokenName(FInversionTokens[ConceptPos], VectorPos);
+    Result := StringReplace(Result, FInversionTokens[ConceptPos], Replacement,
+      [rfReplaceAll]);
+  end;
+end;
+
 function TStableDiffusionPipeline.TokenizePrompt(
   const Prompt: string): TNeuralIntegerArray;
 var
-  Folder: string;
   TextIds: TNeuralIntegerArray;
   TextCount, PadId, TokenPos, MaxTokenPos: integer;
 begin
-  if not Assigned(FTokenizer) then
-  begin
-    Folder := ComponentFolder('tokenizer');
-    FTokenizer := TNeuralHFTokenizer.Create();
-    FTokenizer.LoadCLIPVocabAndMerges(Folder + 'vocab.json',
-      Folder + 'merges.txt');
-  end;
+  EnsureTokenizer();
   PadId := FTokenizer.TokenToId(FPadToken);
   if PadId < 0 then
     ImportError('TStableDiffusionPipeline: pad token "' + FPadToken +
       '" is not in tokenizer/vocab.json.');
-  TextIds := FTokenizer.Encode(Prompt);
+  TextIds := FTokenizer.Encode(ExpandInversionTokens(Prompt));
   TextCount := Min(Length(TextIds), FMaxTokenCount - 2);
   SetLength(Result, FMaxTokenCount);
   Result[0] := FTokenizer.BosId;
