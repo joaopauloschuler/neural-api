@@ -85682,7 +85682,7 @@ begin
       BranchPrefix + '.bn', InCh, AsppCh, K);
     Branches[BranchPos] := NN.AddLayer(TNNetReLU.Create());
   end;
-  NN.AddLayerAfter(TNNetAdaptiveAvgPool.Create(1, 1), Input);
+  NN.AddLayerAfter(TNNetAvgChannel.Create(), Input);
   PoolConv := NN.AddLayer(TNNetPointwiseConvReLU.Create(AsppCh));
   LoadBiRefNetConv(Reader, PoolConv, Prefix + 'global_avg_pool.1',
     Prefix + 'global_avg_pool.2', AsppCh, InCh, 1, nil);
@@ -88394,8 +88394,7 @@ begin
       // HF: layernorm(hidden_states[:, 1:, :].mean(1)). Drop the cls row, then
       // MEAN-pool the patch tokens. Reshape the (NumPatches,1,d) patch sequence
       // to the (Grid,Grid,d) grid so TNNetAvgChannel divides by Grid*Grid =
-      // NumPatches (an (N,1,F) bag would divide by N*N - see AvgChannel pool
-      // scaling); the patch order is exactly the row-major (y,x) grid.
+      // NumPatches; the patch order is exactly the row-major (y,x) grid.
       NN.AddLayer( TNNetCrop.Create({StartX=}1, {StartY=}0, {LenX=}NumPatches, {LenY=}1) );
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, d) );
       NN.AddLayer( TNNetAvgChannel.Create() );  // -> (1,1,d)
@@ -105930,8 +105929,8 @@ begin
       CapFc2 := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
       TextStates := CapFc2;
-      // pooled text -> (1,1,d) cond. TNNetAvgChannel over the (TextSeqLen,1,d)
-      // stream returns sum / TextSeqLen^2 (see oracle, which matches exactly).
+      // pooled text -> (1,1,d) cond: TNNetAvgChannel mean over the
+      // (TextSeqLen,1,d) stream.
       TextPool := NN.AddLayerAfter( TNNetAvgChannel.Create(), TextStates );
       CondLayer := TextPool;
     end

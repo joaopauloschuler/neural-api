@@ -19432,6 +19432,8 @@ type
     // one input-row-wide tiling of the (already divided) output gradient so the
     // scatter collapses to a single contiguous AVX accumulate per input row.
     FBackScatterRow: TNNetVolume;
+    // Cells averaged per output: FPoolSize^2, or SizeX*SizeY for TNNetAvgChannel.
+    FPoolDivisor: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pPoolSize: integer); overload;
@@ -91062,11 +91064,14 @@ end;
 { TNNetAvgChannel }
 procedure TNNetAvgChannel.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
-  FPoolSize := pPrevLayer.Output.SizeX;
+  // One window spanning the larger axis gives a (1,1,Depth) output on any
+  // rectangle; the divisor is the true cell count, not FPoolSize^2.
+  FPoolSize := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY);
   FStride := FPoolSize;
   FPadding := 0;
 
   inherited SetPrevLayer(pPrevLayer);
+  FPoolDivisor := pPrevLayer.Output.SizeX * pPrevLayer.Output.SizeY;
 end;
 
 constructor TNNetAvgChannel.Create();
@@ -112310,6 +112315,7 @@ begin
   SetLength(FMaxPosY, 0);
   // One input row wide scratch (SizeX * Depth) for the AVX backward fast path.
   FBackScatterRow.ReSize(1, 1, pPrevLayer.Output.SizeX * pPrevLayer.Output.Depth);
+  FPoolDivisor := FPoolSize * FPoolSize;
 end;
 
 constructor TNNetAvgPool.Create(pPoolSize: integer);
@@ -112349,8 +112355,8 @@ begin
   StartTime := Now();
   {$IFDEF OpenCL}
   // Device avg-pool forward. Sum over the clipped window divided by the FULL
-  // FPoolSize*FPoolSize -- matching the scalar Output.Divi(FPoolSize*FPoolSize)
-  // even for edge windows. Stride == FPoolSize, no padding. Forward-only.
+  // FPoolDivisor -- matching the scalar Output.Divi(FPoolDivisor) even for
+  // edge windows. Stride == FPoolSize, no padding. Forward-only.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -112370,7 +112376,7 @@ begin
     FPool2DCL.Pool(FPrevLayer.Output, FOutput,
       FPrevLayer.Output.SizeX, FPrevLayer.Output.SizeY, FOutput.Depth,
       FOutput.SizeX, FOutput.SizeY, FPoolSize, FPoolSize, 1,
-      FPoolSize * FPoolSize, SourceBuffer, KeepOnOpenCL);
+      FPoolDivisor, SourceBuffer, KeepOnOpenCL);
     FOutputOnOpenCL := KeepOnOpenCL;
     FOutputOnRAM := not KeepOnOpenCL;
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -112404,7 +112410,7 @@ begin
       );
     end;
   end;
-  Output.Divi(FPoolSize*FPoolSize);
+  Output.Divi(FPoolDivisor);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -112425,7 +112431,7 @@ begin
     (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
-  OutputError.Divi(FPoolSize*FPoolSize);
+  OutputError.Divi(FPoolDivisor);
   PrevSizeX := FPrevLayer.Output.SizeX;
   PrevDepth := FPrevLayer.Output.Depth;
   MaxX := PrevSizeX - 1;

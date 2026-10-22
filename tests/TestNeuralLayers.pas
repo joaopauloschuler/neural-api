@@ -158,6 +158,7 @@ type
     procedure TestMaxChannelRectangular;
     procedure TestMinChannelRectangular;
     procedure TestMaxChannelSquareRegression;
+    procedure TestAvgChannelRectangular;
     procedure TestFlipXPaddedConvBackprop;
     procedure TestFlipYPaddedConvBackprop;
     // Int8 convolution input (quantized FInputCopy + byte im2col)
@@ -4489,6 +4490,66 @@ begin
 end;
 
 // The SQUARE case must be unchanged by the rectangular fix.
+// TNNetAvgChannel on W<>H maps (both orientations) is the true global mean,
+// and its backward spreads dOut/(W*H) to every cell.
+procedure TTestNeuralLayers.TestAvgChannelRectangular;
+const
+  Shapes: array[0..1, 0..1] of integer = ((3, 5), (6, 2));
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+  ShapeCnt, CntX, CntY, W, H: integer;
+  Sum0, Sum1: TNeuralFloat;
+begin
+  for ShapeCnt := 0 to 1 do
+  begin
+    W := Shapes[ShapeCnt, 0];
+    H := Shapes[ShapeCnt, 1];
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(W, H, 2);
+    try
+      NN.AddLayer(TNNetInput.Create(W, H, 2, 1));
+      ChannelLayer := NN.AddLayer(TNNetAvgChannel.Create());
+      Sum0 := 0;
+      Sum1 := 0;
+      for CntY := 0 to H - 1 do
+        for CntX := 0 to W - 1 do
+        begin
+          Input[CntX, CntY, 0] := CntX + 10 * CntY;
+          Input[CntX, CntY, 1] := -0.5 * CntX * CntY + 1;
+          Sum0 := Sum0 + Input[CntX, CntY, 0];
+          Sum1 := Sum1 + Input[CntX, CntY, 1];
+        end;
+      NN.Compute(Input);
+      AssertEquals('Output SizeX must be 1', 1, ChannelLayer.Output.SizeX);
+      AssertEquals('Output SizeY must be 1', 1, ChannelLayer.Output.SizeY);
+      AssertEquals('Output Depth must be 2', 2, ChannelLayer.Output.Depth);
+      AssertEquals('Global mean of channel 0', Sum0 / (W * H),
+        ChannelLayer.Output.Raw[0], 0.0001);
+      AssertEquals('Global mean of channel 1', Sum1 / (W * H),
+        ChannelLayer.Output.Raw[1], 0.0001);
+
+      ChannelLayer.OutputError.Raw[0] := 1.0;
+      ChannelLayer.OutputError.Raw[1] := 3.0;
+      NN.GetFirstLayer.OutputError.Fill(0);
+      ChannelLayer.IncDepartingBranchesCnt();
+      ChannelLayer.Backpropagate();
+      for CntY := 0 to H - 1 do
+        for CntX := 0 to W - 1 do
+        begin
+          AssertEquals('Grad channel 0', 1.0 / (W * H),
+            NN.GetFirstLayer.OutputError[CntX, CntY, 0], 0.00001);
+          AssertEquals('Grad channel 1', 3.0 / (W * H),
+            NN.GetFirstLayer.OutputError[CntX, CntY, 1], 0.00001);
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestMaxChannelSquareRegression;
 var
   NN: TNNet;

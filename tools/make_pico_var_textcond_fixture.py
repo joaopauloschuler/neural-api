@@ -25,10 +25,7 @@ text_proj.linear_2: hidden->hidden) maps the text width to the transformer
 width.
 
 POOLING NOTE: the Pascal build pools the projected text with TNNetAvgChannel
-over the (text_len,1,hidden) stream, which returns sum / text_len**2 (a square
-text_len x text_len pool window over a 1-row volume), NOT sum / text_len. The
-oracle mirrors that exact scaling so parity is bit-tight; a downstream linear
-(ada_lin) absorbs the constant factor, so this is a faithful pooled-text cond.
+over the (text_len,1,hidden) stream, the true mean over text_len.
 
 The fixture writes RAW VAR tensor names; the Pascal importer
 BuildVARFromSafeTensors (with text_cond=true) reads exactly these.
@@ -189,8 +186,8 @@ def var_textcond_forward(idx, text):
     enc = linear(text, W["text_proj.linear_1.weight"], W["text_proj.linear_1.bias"])
     enc = gelu_tanh(enc)
     enc = linear(enc, W["text_proj.linear_2.weight"], W["text_proj.linear_2.bias"])
-    # pooled-text cond: TNNetAvgChannel returns sum / TEXT_LEN**2 (square pool).
-    c = enc.sum(axis=0) / (TEXT_LEN * TEXT_LEN)  # (hidden,)
+    # pooled-text cond: TNNetAvgChannel mean over the text tokens.
+    c = enc.mean(axis=0)  # (hidden,)
     for i in range(LAYERS):
         p = f"blocks.{i}."
         W_QKV, B_QKV = W[p + "attn.qkv.weight"], W[p + "attn.qkv.bias"]

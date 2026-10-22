@@ -104,6 +104,7 @@ type
     procedure TestPoolingWithOddDimensions;
     procedure TestMinChannelGradientCheck;
     procedure TestMaxChannelGradientCheck;
+    procedure TestAvgChannelRectangularGradientCheck;
     procedure TestLpPoolGradientCheckP2;
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
@@ -1063,6 +1064,7 @@ type
     // pool/stride/padding geometries (exact); a trainable layer stays on the host.
     procedure MaxPoolPortableOpenCLParity;
     procedure AvgPoolOpenCLParity;
+    procedure AvgChannelRectangularOpenCLParity;
     // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
     procedure EmbeddingOpenCLParity;
     // Same, with the vocab table quantized: cai_embedding_gather_int8 must
@@ -8605,6 +8607,15 @@ begin
   // input as MinChannel - no ties for a 4x4x3 volume.
   LayerInputGradientCheck(Self, TNNetMaxChannel.Create(),
     'MaxChannel', 4, 4, 3, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestAvgChannelRectangularGradientCheck;
+begin
+  // Global mean over W<>H maps in both orientations (wide and tall).
+  LayerInputGradientCheck(Self, TNNetAvgChannel.Create(),
+    'AvgChannel(5x3)', 5, 3, 2, 0.01);
+  LayerInputGradientCheck(Self, TNNetAvgChannel.Create(),
+    'AvgChannel(2x6)', 2, 6, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestLpPoolGradientCheckP2;
@@ -90438,6 +90449,70 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward for TNNetAvgChannel on a tall W<>H map: must equal the CPU
+// forward and the analytic per-channel mean (divisor W*H, not pool^2).
+procedure TTestNeuralNumerical.AvgChannelRectangularOpenCLParity;
+{$IFDEF OpenCL}
+const
+  W = 3; H = 7; D = 4;
+var
+  NN: TNNet;
+  Input, OutCPU, Mean: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, CntX, CntY, CntD: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, D);
+  OutCPU := TNNetVolume.Create();
+  Mean := TNNetVolume.Create(1, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    NN.AddLayer(TNNetAvgChannel.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+    for CntY := 0 to H - 1 do
+      for CntX := 0 to W - 1 do
+        for CntD := 0 to D - 1 do
+          Mean.Raw[CntD] := Mean.Raw[CntD] + Input[CntX, CntY, CntD] / (W * H);
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertEquals('output is (1,1,D)', D, OutCPU.Size);
+    for CntD := 0 to D - 1 do
+      AssertEquals('CPU global mean', Mean.Raw[CntD], OutCPU.Raw[CntD], 1e-5);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertTrue('AvgChannel OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    Mean.Free; OutCPU.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}
