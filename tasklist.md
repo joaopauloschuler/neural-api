@@ -556,9 +556,19 @@ rather than acted on.
             prefix; BuildClipTextTower requires it (the pico fixture re-adds it).
       - [ ] CLIP tokenizer.json (fast) path: LoadFromFile does not recognize the
             CLIP Split pattern / end_of_word_suffix; reuse the CLIP splitter.
-      - [ ] Resolution: images must be square; the UNet / VAE TNNetInput is
-            sized from one LatentGrid at build, so each size needs a rebuild
-            (or a resizable input) and non-square needs LatentGridX/Y.
+      - [X] Resolution: non-square images (3b18da8b). TSDUNetConfig /
+            TVaeDecoderConfig LatentGridY (0 = square), UNet + VAE decoder +
+            encoder + pipeline + examples/StableDiffusion --width/--height.
+            Pico parity vs diffusers float64 at 32x16: UNet output, 3 DDIM
+            steps and the image < 1e-4 (TestStableDiffusionPipelineNonSquare).
+            Each size still rebuilds the UNet/VAE (see Memory/speed below).
+      - [ ] Sides must be a multiple of VAE factor * 2^(UNet blocks-1) (64 for
+            SD 1.5); diffusers allows multiples of 8 by passing upsample_size
+            to the up blocks (nearest-resize to the skip size). Needs an
+            odd-size upsample in BuildSDUNet.
+      - [ ] ControlNet / T2I-Adapter are still square: TControlNetConfig.CondGrid
+            and TT2IAdapterConfig take one side; BuildControlNet ignores
+            Base.LatentGridY.
       - [ ] Memory/speed: int8/int4 UNet weights (QuantizeWeightsInt8 as in
             TMarigoldPipeline), keep components loaded across prompts
             (LoadComponents like TQwenImage21Pipeline), per-phase time/transfer
