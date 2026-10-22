@@ -74866,9 +74866,10 @@ procedure TTestNeuralNumerical.TestSpectralConv2DOpenCLParity;
 const
   csSentinel = -7777;
   // SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY: power of two; non-powers
-  // of two with ModesX > SizeX div 2; every Y mode kept.
-  csShapes: array[0..2, 0..5] of integer = (
-    (8, 8, 3, 4, 3, 3), (7, 5, 2, 3, 6, 4), (12, 9, 4, 2, 5, 9));
+  // of two with ModesX > SizeX div 2; every Y mode kept; 2 of 16 Y modes kept.
+  csShapes: array[0..3, 0..5] of integer = (
+    (8, 8, 3, 4, 3, 3), (7, 5, 2, 3, 6, 4), (12, 9, 4, 2, 5, 9),
+    (10, 16, 3, 3, 4, 2));
 var
   NN, NNCPU: TNNet;
   Input: TNNetVolume;

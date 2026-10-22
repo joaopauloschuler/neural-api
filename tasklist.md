@@ -2374,11 +2374,14 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [ ] `TNNetSpectralConv2D` OpenCL forward follow-up: the inverse
+- [X] `TNNetSpectralConv2D` OpenCL forward follow-up: the inverse
       `cai_rfft2_cols_c2c` launch sums all SizeY rows of the mixed spectrum,
       though only the first ModesY are nonzero (the mix kernel writes the rest
       as zeros). If an FNO shows up on the GPU box, give the column kernel a
       separate input-row count so it skips the zero rows.
+      - Done: `cai_rfft2_cols_c2c` takes FInRows (ModesY on the inverse pass,
+        full H elsewhere) and `cai_spectral_mode_mix` no longer writes the zero
+        rows. GPU timing pending.
 - [ ] Check (not verified): `TNNetSpectralConv2D` (CPU and OpenCL) keeps only
       the low corner [0..ModesX-1][0..ModesY-1] of the spectrum and takes the
       real part of the inverse 2-D FFT. The reference FNO `SpectralConv2d`

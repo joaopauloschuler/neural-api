@@ -2659,13 +2659,14 @@ __kernel void cai_rfft2_rows_r2c
 }
 
 // Along H, half spectrum -> half spectrum:
-//   Dst[ky, kw] = s[kw] * sum_y Src[y, kw] * exp(i*FSign*2*pi*ky*y/H),
+//   Dst[ky, kw] = s[kw] * sum_{y < FInRows} Src[y, kw] * exp(i*FSign*2*pi*ky*y/H),
 // FSign = -1 (forward) or +1 (unnormalised inverse); s = FBinScale when
-// FApplyBinScale != 0, else 1.
+// FApplyBinScale != 0, else 1. FInRows < FH skips source rows known to be zero.
 __kernel void cai_rfft2_cols_c2c
 (
   const int FNumOut,
   const int FH,
+  const int FInRows,
   const int FHalfW,
   const int FC,
   const float FSign,
@@ -2686,7 +2687,7 @@ __kernel void cai_rfft2_cols_c2c
   int Idx = 0;
   float Re = 0.0f;
   float Im = 0.0f;
-  for (int y = 0; y < FH; y++)
+  for (int y = 0; y < FInRows; y++)
   {
     const float a = FSrc[SrcPos];
     const float b = FSrc[SrcPos + 1];
@@ -2748,7 +2749,7 @@ __kernel void cai_irfft2_rows_c2r
 // TNNetSpectralConv2D per-mode channel mixing between the rfft2 kernels above:
 //   Dst[ky, mx, co] = sum_ci W[mx, ky, ci, co] * Src[ky, mx, ci]   (complex),
 // W at 2*(((mx*FModesY + ky)*FInDepth + ci)*FOutDepth + co), Re then Im. Src is
-// (FModesY, FModesX, FInDepth) complex; Dst rows ky >= FModesY are written as 0.
+// (FModesY, FModesX, FInDepth) and Dst (FModesY, FModesX, FOutDepth) complex.
 __kernel void cai_spectral_mode_mix
 (
   const int FNumOut,
@@ -2769,22 +2770,19 @@ __kernel void cai_spectral_mode_mix
   const int mx = Mode - ky * FModesX;
   float Re = 0.0f;
   float Im = 0.0f;
-  if (ky < FModesY)
+  int SrcPos = 2 * Mode * FInDepth;
+  int WPos = 2 * ((mx * FModesY + ky) * FInDepth * FOutDepth + co);
+  const int WStride = 2 * FOutDepth;
+  for (int ci = 0; ci < FInDepth; ci++)
   {
-    int SrcPos = 2 * Mode * FInDepth;
-    int WPos = 2 * ((mx * FModesY + ky) * FInDepth * FOutDepth + co);
-    const int WStride = 2 * FOutDepth;
-    for (int ci = 0; ci < FInDepth; ci++)
-    {
-      const float xr = FSrc[SrcPos];
-      const float xi = FSrc[SrcPos + 1];
-      const float wr = FWeights[WPos];
-      const float wi = FWeights[WPos + 1];
-      Re = mad(wr, xr, mad(-wi, xi, Re));
-      Im = mad(wr, xi, mad(wi, xr, Im));
-      SrcPos += 2;
-      WPos += WStride;
-    }
+    const float xr = FSrc[SrcPos];
+    const float xi = FSrc[SrcPos + 1];
+    const float wr = FWeights[WPos];
+    const float wi = FWeights[WPos + 1];
+    Re = mad(wr, xr, mad(-wi, xi, Re));
+    Im = mad(wr, xi, mad(wi, xr, Im));
+    SrcPos += 2;
+    WPos += WStride;
   }
   FDst[2 * g_id] = Re;
   FDst[2 * g_id + 1] = Im;

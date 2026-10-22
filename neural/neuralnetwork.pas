@@ -5762,9 +5762,10 @@ type
     function BindOrUploadSource(Prev: TNNetLayer; CanBind: boolean): cl_mem;
     // Keeps Layer's result resident when KeepResult, else reads it back.
     procedure FinishResult(Layer: TNNetLayer; KeepResult: boolean);
-    // The three DFT launches; BinCount bins of each line are computed.
+    // The three DFT launches; BinCount bins of each line are computed, and the
+    // column pass sums only the first InRows (<= H) source rows.
     procedure RunRowsR2C(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
-    procedure RunColsC2C(NumOut, H, BinCount, C: longint; Sign: single;
+    procedure RunColsC2C(NumOut, H, InRows, BinCount, C: longint; Sign: single;
       ApplyBinScale: longint; Src, Dst: cl_mem);
     procedure RunRowsC2R(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
   public
@@ -41670,7 +41671,7 @@ begin
   FKernel.RunKernel(k, NumOut);
 end;
 
-procedure TNNetRealFFT2DCL.RunColsC2C(NumOut, H, BinCount, C: longint;
+procedure TNNetRealFFT2DCL.RunColsC2C(NumOut, H, InRows, BinCount, C: longint;
   Sign: single; ApplyBinScale: longint; Src, Dst: cl_mem);
 var
   k: cl_kernel;
@@ -41678,14 +41679,15 @@ begin
   k := FColsKernel;
   clSetKernelArg(k, 0, csLongintSize, @NumOut);
   clSetKernelArg(k, 1, csLongintSize, @H);
-  clSetKernelArg(k, 2, csLongintSize, @BinCount);
-  clSetKernelArg(k, 3, csLongintSize, @C);
-  clSetKernelArg(k, 4, csNeuralFloatSize, @Sign);
-  clSetKernelArg(k, 5, csLongintSize, @ApplyBinScale);
-  clSetKernelArg(k, 6, csCLMemSize, @FBufTwidH);
-  clSetKernelArg(k, 7, csCLMemSize, @FBufBinScale);
-  clSetKernelArg(k, 8, csCLMemSize, @Src);
-  clSetKernelArg(k, 9, csCLMemSize, @Dst);
+  clSetKernelArg(k, 2, csLongintSize, @InRows);
+  clSetKernelArg(k, 3, csLongintSize, @BinCount);
+  clSetKernelArg(k, 4, csLongintSize, @C);
+  clSetKernelArg(k, 5, csNeuralFloatSize, @Sign);
+  clSetKernelArg(k, 6, csLongintSize, @ApplyBinScale);
+  clSetKernelArg(k, 7, csCLMemSize, @FBufTwidH);
+  clSetKernelArg(k, 8, csCLMemSize, @FBufBinScale);
+  clSetKernelArg(k, 9, csCLMemSize, @Src);
+  clSetKernelArg(k, 10, csCLMemSize, @Dst);
   FKernel.RunKernel(k, NumOut);
 end;
 
@@ -41726,8 +41728,8 @@ begin
   begin
     // Columns: unnormalised inverse DFT along H; rows: c2r along W with the
     // Hermitian bin counts and the norm.
-    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FHalfW, Layer.FChannels, 1, 0,
-      bufSrc, bufMid);
+    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FSpatialH, Layer.FHalfW,
+      Layer.FChannels, 1, 0, bufSrc, bufMid);
     RunRowsC2R(Layer.FOutput.Size, Layer.FSpatialW, Layer.FHalfW,
       Layer.FChannels, bufMid, bufDst);
   end
@@ -41737,8 +41739,8 @@ begin
     // the norm.
     RunRowsR2C(NumMid, Layer.FSpatialW, Layer.FHalfW, Layer.FChannels,
       bufSrc, bufMid);
-    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FHalfW, Layer.FChannels, -1, 1,
-      bufMid, bufDst);
+    RunColsC2C(NumMid, Layer.FSpatialH, Layer.FSpatialH, Layer.FHalfW,
+      Layer.FChannels, -1, 1, bufMid, bufDst);
   end;
   FinishResult(Layer, KeepResult);
 end;
@@ -41789,7 +41791,7 @@ procedure TNNetSpectralConv2DCL.ConvolveFromPrevLayer(Consumer: TNNetLayer);
 var
   Layer: TNNetSpectralConv2D;
   bufSrc, bufMid, bufSpec, bufDst: cl_mem;
-  SpecCount, PaddedCount, MaxDepth: longint;
+  SpecCount, MixCount, MaxDepth: longint;
   SpecBytes: csize_t;
   k: cl_kernel;
 begin
@@ -41806,12 +41808,12 @@ begin
   RunRowsR2C(Layer.FSizeY * Layer.FModesX * Layer.FInDepth, Layer.FSizeX,
     Layer.FModesX, Layer.FInDepth, bufSrc, bufMid);
   SpecCount := Layer.FModesY * Layer.FModesX * Layer.FInDepth;
-  RunColsC2C(SpecCount, Layer.FSizeY, Layer.FModesX, Layer.FInDepth, -1, 0,
-    bufMid, bufSpec);
-  // Channel mixing into a (SizeY, ModesX, OutDepth) spectrum, zero past ModesY.
-  PaddedCount := Layer.FSizeY * Layer.FModesX * Layer.FOutDepth;
+  RunColsC2C(SpecCount, Layer.FSizeY, Layer.FSizeY, Layer.FModesX,
+    Layer.FInDepth, -1, 0, bufMid, bufSpec);
+  // Channel mixing into a (ModesY, ModesX, OutDepth) spectrum.
+  MixCount := Layer.FModesY * Layer.FModesX * Layer.FOutDepth;
   k := FMixKernel;
-  clSetKernelArg(k, 0, csLongintSize, @PaddedCount);
+  clSetKernelArg(k, 0, csLongintSize, @MixCount);
   clSetKernelArg(k, 1, csLongintSize, @Layer.FModesX);
   clSetKernelArg(k, 2, csLongintSize, @Layer.FModesY);
   clSetKernelArg(k, 3, csLongintSize, @Layer.FInDepth);
@@ -41819,10 +41821,11 @@ begin
   clSetKernelArg(k, 5, csCLMemSize, @FBufWeights);
   clSetKernelArg(k, 6, csCLMemSize, @bufSpec);
   clSetKernelArg(k, 7, csCLMemSize, @bufMid);
-  FKernel.RunKernel(k, PaddedCount);
-  // Inverse DFT along SizeY, then Re of the inverse along SizeX with 1/(SizeX*SizeY).
-  RunColsC2C(PaddedCount, Layer.FSizeY, Layer.FModesX, Layer.FOutDepth, 1, 0,
-    bufMid, bufSpec);
+  FKernel.RunKernel(k, MixCount);
+  // Inverse DFT along SizeY over the ModesY nonzero rows, then Re of the
+  // inverse along SizeX with 1/(SizeX*SizeY).
+  RunColsC2C(Layer.FSizeY * Layer.FModesX * Layer.FOutDepth, Layer.FSizeY,
+    Layer.FModesY, Layer.FModesX, Layer.FOutDepth, 1, 0, bufMid, bufSpec);
   RunRowsC2R(Layer.FOutput.Size, Layer.FSizeX, Layer.FModesX, Layer.FOutDepth,
     bufSpec, bufDst);
   FinishResult(Layer, true);
