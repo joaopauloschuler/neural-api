@@ -15729,10 +15729,10 @@ function BuildDDColorFromSafeTensorsEx(const FileName: string;
   const Config: TDDColorConfig; pTrainable: boolean = true): TNNet;
 
 // Config from ConfigFileName (default: config.json beside FileName, else the
-// convnext-l defaults) with the shapes inferred from the checkpoint.
+// convnext-l defaults), shapes from the checkpoint; pInputSize > 0 = square input.
 function BuildDDColorFromSafeTensors(const FileName: string;
   out Config: TDDColorConfig; pTrainable: boolean = true;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pInputSize: integer = 0): TNNet;
 
 // Image (W, H, 3) RGB 0..255 -> NetInput (InputWidth, InputHeight, 3): bilinear
 // resize, L of RgbToLab with a*b* = 0, LabToRgb, scaled to [0,1].
@@ -91027,7 +91027,7 @@ end;
 
 function BuildDDColorFromSafeTensors(const FileName: string;
   out Config: TDDColorConfig; pTrainable: boolean = true;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pInputSize: integer = 0): TNNet;
 var
   ConfigPath: string;
   Reader: TNNetSafeTensorsReader;
@@ -91041,6 +91041,11 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     InferDDColorConfigFromTensors(Reader, Config);
+    if pInputSize > 0 then
+    begin
+      Config.InputWidth := pInputSize;
+      Config.InputHeight := pInputSize;
+    end;
     Result := BuildDDColor(Reader, Config, pTrainable);
   finally
     Reader.Free;

@@ -1497,6 +1497,8 @@ type
     // The tiny fixture with EnableOpenCL (ForceOpenCL off) against the host net:
     // the a*b* and every layer output.
     procedure TestDDColorOpenCLParity;
+    // pInputSize builds a square net input regardless of config.json input_size.
+    procedure TestDDColorInputSizeOverride;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -54785,6 +54787,32 @@ begin
   AssertEquals('heads (config.json)', 2, Config.Heads);
   AssertEquals('input width (input_size[1])', 32, Config.InputWidth);
   AssertEquals('input height (input_size[0])', 64, Config.InputHeight);
+end;
+
+procedure TTestNeuralPretrained.TestDDColorInputSizeOverride;
+var
+  Config: TDDColorConfig;
+  NN: TNNet;
+  NetInput: TNNetVolume;
+begin
+  NN := BuildDDColorFromSafeTensors(FixturePath('tiny_ddcolor.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_ddcolor_config.json'),
+    {pInputSize=}64);
+  NetInput := TNNetVolume.Create(64, 64, 3);
+  try
+    AssertEquals('config width', 64, Config.InputWidth);
+    AssertEquals('config height', 64, Config.InputHeight);
+    AssertEquals('input layer width', 64, NN.Layers[0].Output.SizeX);
+    AssertEquals('input layer height', 64, NN.Layers[0].Output.SizeY);
+    NetInput.Fill(0.5);
+    NN.Compute(NetInput);
+    AssertEquals('a*b* width', 64, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('a*b* height', 64, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('a*b* channels', 2, NN.GetLastLayer().Output.Depth);
+  finally
+    NetInput.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestDDColorOpenCLParity;
