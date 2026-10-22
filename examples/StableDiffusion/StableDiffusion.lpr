@@ -322,37 +322,21 @@ var
   StartTime, SaveStart: TDateTime;
   PngSaveMs: double;
   {$IFDEF OpenCL}
-  OpenCLDevices: TEasyOpenCL;
-  OpenCLProblem: string;
-  OpenCLPlatform, OpenCLDevice: integer;
+  OpenCLText: string;
   {$ENDIF}
 begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
-  {$IFDEF OpenCL}
-  OpenCLDevices := nil;
-  {$ENDIF}
   try
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
     begin
       {$IFDEF OpenCL}
-      OpenCLDevices := TEasyOpenCL.Create();
-      OpenCLPlatform := Opt.OpenCLPlatform;
-      OpenCLDevice := Opt.OpenCLDevice;
-      if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
-        OpenCLProblem) then
-      begin
-        Pipeline.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
-          OpenCLDevices.Devices[OpenCLDevice]);
-        ComputeText := 'OpenCL on ' +
-          OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
-          OpenCLDevices.DeviceNames[OpenCLDevice];
-      end
-      else
-        ComputeText := 'CPU (' + OpenCLProblem + ')';
+      if Pipeline.EnableOpenCLDevice(Opt.OpenCLPlatform, Opt.OpenCLDevice,
+        OpenCLText) then ComputeText := 'OpenCL on ' + OpenCLText
+      else ComputeText := 'CPU (' + OpenCLText + ')';
       {$ELSE}
       ComputeText := 'CPU (built without -dOpenCL)';
       {$ENDIF}
@@ -433,9 +417,6 @@ begin
       {$POP}
     end;
   finally
-    {$IFDEF OpenCL}
-    OpenCLDevices.Free;
-    {$ENDIF}
     PromptEmbeds.Free;
     Image.Free;
     Reporter.Free;

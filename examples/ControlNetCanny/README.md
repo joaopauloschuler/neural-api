@@ -1,59 +1,64 @@
 # ControlNetCanny
 
-End-to-end **base-UNet-plus-ControlNet** single-step denoise smoke — the inner
-loop of diffusers' `StableDiffusionControlNetPipeline`, wired offline on CPU over
-the repo's already-landed importers.
-
-## What it does
+Stable Diffusion 1.x text-to-image guided by a ControlNet, as diffusers'
+`StableDiffusionControlNetPipeline`. The example drives `TStableDiffusionPipeline`
+(`neural/neuralpretrained.pas`) with a `TStableDiffusionControlNet` conditioner:
 
 ```
-noisy latent + text states + a (canny-edge-style) control image
-  -> ControlNet  (BuildControlNetFromSafeTensors / ControlNetResiduals)
-     produces down_block_res_samples + mid_block_res_sample
-  -> base SD UNet built WITH control injection
-     (BuildSDUNet(..., pWithControl=true))
-  -> SDUNetDenoiseWithControl ADDS the residuals into the decoder skip
-     connections, exactly as diffusers does:
-       down_block_res_samples = [d + c for d, c in zip(down, controlnet_down)]
-       mid_block_res_sample  += controlnet_mid
-  -> predicted noise (the eps a sampler would step on)
+prompt --CLIP tokenizer + text encoder--> text states (and the empty prompt's, for CFG)
+for each sampler step, for the conditional and the unconditional pass:
+  ControlNet(latents, text states, control image, t)  -> down + mid residuals (x scale)
+  UNet(latents, text states, t, + residuals)            -> noise prediction
+  CFG mix, scheduler step
+VAE decoder -> PNG
 ```
 
-Nothing here is a new leaf layer — it is pure plumbing over landed pieces (the
-ControlNet importer + `ControlNetResiduals`, the SD UNet importer + the
-`SDUNetDenoiseWithControl` driver). It is a **wiring / throughput smoke**: it
-proves the chain runs offline and produces a **finite** noise prediction, not
-photorealism (the pico fixtures carry random weights).
+The sampling loop (CFG, the sampler named by `scheduler_config.json`, the
+steps) is the pipeline's own `Denoise`; the conditioner only adds the
+ControlNet residuals to each UNet pass.
 
 ## Running
 
 ```sh
 cd examples/ControlNetCanny
-LAZUTILS_PATH=$(find /usr/lib/lazarus /usr/share/lazarus -name utf8process.ppu -printf '%h\n' 2>/dev/null | head -1)
-fpc -Fu../../neural -Fu"$LAZUTILS_PATH" -Mobjfpc -Sh -O2 ControlNetCanny.lpr
-./ControlNetCanny                              # committed pico fixtures
-./ControlNetCanny <unet.st> <unet.cfg> <controlnet.st> <controlnet.cfg>
+lazbuild -B ControlNetCanny.lpi
+../../bin/x86_64-linux/bin/ControlNetCanny                       # pico fixtures
+../../bin/x86_64-linux/bin/ControlNetCanny \
+  --model /path/to/stable-diffusion-v1-5 \
+  --controlnet /path/to/sd-controlnet-canny \
+  --control edges.png --prompt "a futuristic city" --steps 25 --seed 1 \
+  --out city.png --gpu
 ```
 
-With no arguments it falls back to the committed config-compatible pico fixtures
-(`tests/fixtures/tiny_sd_unet.*` + `tests/fixtures/tiny_controlnet.*`). To run a
-real model pass a config-compatible diffusers base UNet **and** ControlNet
-(`block_out_channels`, `layers_per_block`, `cross_attention_dim`, latent grid,
-text seq must match between the two).
+| Option | Meaning |
+| --- | --- |
+| `--model DIR` | diffusers Stable Diffusion 1.x folder (default `tests/fixtures/tiny_sd15`) |
+| `--controlnet DIR` | diffusers `ControlNetModel` folder: `config.json` + `diffusion_pytorch_model.safetensors` (default `tests/fixtures/tiny_sd15_controlnet`) |
+| `--control FILE` | control image; for the canny ControlNet white edges on black (e.g. `cv2.Canny` output). Resized to the image size (Lanczos). Default: drawn circle and square outlines |
+| `--prompt`, `--negative` | prompt and negative prompt |
+| `--steps N`, `--guidance G`, `--seed N` | 25, 7.5, 0 |
+| `--scale S` | `controlnet_conditioning_scale` (1.0) |
+| `--size N` | square image side (default: the checkpoint's, 512 for SD 1.5) |
+| `--out PNG` | output file (default `controlnet_canny.png`) |
+| `--int8` | UNet, ControlNet and text encoder weights in int8 |
+| `--gpu`, `--gpu-platform N`, `--gpu-device N` | OpenCL |
 
-## Shapes (pico fixtures)
-
-```
-latent          (8, 8, in_channels=4)
-text states     (text_seq=5, 1, cross_dim=12)
-control image   (16, 16, cond_channels=3)
-  -> 4 down residuals + 1 mid residual
-  -> predicted noise (8, 8, out_channels=4)
-```
+With no `--model` / `--controlnet` the run uses random-weight pico fixtures:
+it checks wiring and I/O, not image quality.
 
 ## Parity
 
-The combined forward (base UNet noise prediction **with** the ControlNet
-residuals injected) is parity-checked against a numpy float64 oracle
-(`tools/controlnet_combined_fixture.py`) at `max|diff| < 1e-4` by
-`TestControlNetCombinedParity` in `tests/TestNeuralPretrained.pas`.
+`TestStableDiffusionControlNetParity` (`tests/TestNeuralPretrained.pas`) runs
+the pipeline with the pico ControlNet (a diffusers `ControlNetModel.from_unet`
+of `tiny_sd15`, conditioning scale 0.5) for 3 guided DDIM steps and compares
+the latents after each step and the decoded image with a diffusers float64
+`StableDiffusionControlNetPipeline` run: max |diff| < 1e-4. The fixture and the
+oracle come from `tools/make_pico_sd_conditioning_fixtures.py`.
+
+## Limits
+
+- Square images only (`TControlNetConfig.CondGrid` takes one side).
+- No canny edge extraction: pass a ready edge map.
+- Real checkpoints (`lllyasviel/sd-controlnet-canny` on SD 1.5) are untested.
+- One ControlNet; diffusers' `control_guidance_start/end` and guess mode are
+  not implemented.

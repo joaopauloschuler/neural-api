@@ -11900,6 +11900,10 @@ type
     AddEmbedsInputDim: integer;
   end;
 
+const
+  // SD 1.5's latent grid (512 / 8): the default of configs without one.
+  csSDUNetDefaultLatentGrid = 64;
+
 function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
 // Same parser fed from a JSON string. SourceName only names the source in error
 // messages, so a caller holding a patched config in memory (ControlNet) can
@@ -12139,6 +12143,40 @@ type
     UNetPassCount: integer;
   end;
 
+  TStableDiffusionPipeline = class;
+
+  // Extra UNet conditioning of TStableDiffusionPipeline.Denoise (ControlNet,
+  // T2I-Adapter, inpainting); this base runs the plain UNet. Coded by Claude (AI).
+  TStableDiffusionConditioner = class(TObject)
+  protected
+    FPipeline: TStableDiffusionPipeline;
+    // FPipeline.ComponentEpoch when the nets below were built.
+    FNetEpoch: integer;
+    // Opens sdphLoadUNet unless it is the open phase: the conditioner's
+    // own nets load (and run once) there.
+    procedure StartLoadPhase();
+    // True when a net built at FNetEpoch for this grid is still usable.
+    function IsNetCurrent(Net: TNNet; NetGrid, Grid: integer): boolean;
+  public
+    // Builds the UNet with the ControlNet skip / T2I-Adapter inputs.
+    function UNetWithControl(): boolean; virtual;
+    function UNetWithAdapter(): boolean; virtual;
+    // The UNet in_channels this conditioner feeds for LatentChannels latents.
+    function UNetInputChannels(LatentChannels: integer): integer; virtual;
+    // Before the first step; Latents is the unit noise (grid, latent channels).
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); virtual;
+    // Pred := the UNet output for Latents (model-input scale) and Embeds at
+    // diffusers timestep Timestep.
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); virtual;
+    // After the sampler step that reached NextTt (1-based; 0 = clean).
+    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); virtual;
+    // Frees the nets unless the pipeline keeps its components loaded.
+    procedure EndDenoise(); virtual;
+  end;
+
   // Stable Diffusion 1.x text-to-image (diffusers StableDiffusionPipeline) over
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
@@ -12184,11 +12222,19 @@ type
     FUNetInt8, FTextEncoderInt8: boolean;
     FTextEncoder, FUNet, FVaeDecoder: TNNet;
     FTextEncoderSeqLen, FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
+    FUNetWithControl, FUNetWithAdapter: boolean;
     FVaeGridX, FVaeGridY: integer;
+    // Bumped whenever kept nets become stale (OpenCL, int8, unload).
+    FComponentEpoch: integer;
+    FConditioner: TStableDiffusionConditioner;
+    // Runs Denoise when Conditioner is nil.
+    FPlainConditioner: TStableDiffusionConditioner;
     {$IFDEF OpenCL}
     FUseOpenCL: boolean;
     FOpenCLPlatform: cl_platform_id;
     FOpenCLDevice: cl_device_id;
+    // Created by EnableOpenCLDevice.
+    FOpenCLDevices: TEasyOpenCL;
     {$ENDIF}
     function ComponentFolder(const Component: string): string;
     // Loads tokenizer/ and registers the textual inversion tokens.
@@ -12213,8 +12259,11 @@ type
     // The kept net of that shape, or a new one (kept when ComponentsLoaded)
     // after starting its load phase; ReleaseComponent ends its use.
     function AcquireTextEncoder(SeqLen: integer): TNNet;
-    function AcquireUNet(GridX, GridY, TextSeqLen: integer): TNNet;
+    function AcquireUNet(GridX, GridY, TextSeqLen: integer;
+      WithControl, WithAdapter: boolean): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
+    // The Conditioner, or the plain one when none is set.
+    function ActiveConditioner(): TStableDiffusionConditioner;
     procedure ReleaseComponent(Net: TNNet);
     procedure FreeKeptComponents();
     // Builds text_encoder/ once for every list; Embeds[i] := its last hidden state.
@@ -12233,6 +12282,10 @@ type
     // Components built by later calls run on this OpenCL device (kept ones
     // are rebuilt on their next use).
     procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+    // EnableOpenCL on device DeviceIndex of platform PlatformIndex; false, with
+    // Description saying why, when none exists ("platform / device" otherwise).
+    function EnableOpenCLDevice(PlatformIndex, DeviceIndex: integer;
+      out Description: string): boolean;
     {$ENDIF}
     // Builds the text encoder, the UNet and the VAE decoder for Width x Height
     // (< 1: DefaultImageSize) and keeps them for every later call.
@@ -12259,9 +12312,9 @@ type
     procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
       Latents: TNNetVolume);
     // StepCount Sampler steps on Latents in place (unit noise in, scaled by
-    // the sampler's init noise sigma; clean out); with GuidanceScale > 1 each
-    // step also runs the unconditional embeds (CFG). Euler a draws its noise
-    // from the global RNG.
+    // the sampler's init noise sigma; clean out); each UNet pass goes through
+    // Conditioner, the unconditional one too when GuidanceScale > 1 (CFG).
+    // Euler a draws its noise from the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
@@ -12302,6 +12355,11 @@ type
       write SetTextEncoderInt8;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
+    // ControlNet / T2I-Adapter / inpainting for later Denoise calls; nil runs
+    // the plain UNet. Not owned.
+    property Conditioner: TStableDiffusionConditioner read FConditioner
+      write FConditioner;
+    property ComponentEpoch: integer read FComponentEpoch;
   end;
 
 // End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
@@ -12468,6 +12526,41 @@ function T2IAdapterCondInput(Net: TNNet): TNNetLayer;
 // (CondCh,CondGrid,CondGrid) hint volume.
 procedure T2IAdapterFeatures(Net: TNNet; const Config: TT2IAdapterConfig;
   Cond: TNNetVolume; Features: array of TNNetVolume);
+
+// Source (W, H, 1|3|4) in 0..255 -> Dest (Width, Height, Channels) in [0, 1]
+// as diffusers' image processors: PIL 'L' for 1 channel, alpha dropped, Lanczos.
+procedure StableDiffusionPrepareImage(Source: TNNetVolume; Width, Height,
+  Channels: integer; Dest: TNNetVolume);
+
+type
+  // diffusers StableDiffusionControlNetPipeline: a ControlNetModel folder
+  // (config.json + weights) whose residuals join every UNet pass. Square only.
+  TStableDiffusionControlNet = class(TStableDiffusionConditioner)
+  private
+    FWeightsFile: string;
+    FConfig, FNetConfig: TControlNetConfig;
+    FNet: TNNet;
+    FNetGrid: integer;
+    FSourceImage, FControlImage, FMidResidual: TNNetVolume;
+    FDownResiduals: array of TNNetVolume;
+    FConditioningScale: TNeuralFloat;
+  public
+    constructor Create(const ControlNetFolder: string);
+    destructor Destroy(); override;
+    // The control image (W, H, 1|3|4) in 0..255; resized to the image size.
+    procedure SetControlImage(Image: TNNetVolume);
+    function UNetWithControl(): boolean; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure EndDenoise(); override;
+    // diffusers controlnet_conditioning_scale (1.0).
+    property ConditioningScale: TNeuralFloat read FConditioningScale
+      write FConditioningScale;
+    property Config: TControlNetConfig read FConfig;
+  end;
 
 // ---------------------------------------------------------------------------
 // IP-ADAPTER IMAGE-PROMPT IMPORT (h94/IP-Adapter ip-adapter_sd15, the plain
@@ -76497,6 +76590,11 @@ begin
     Obj.Add('up_block_types', GetJSON(MirrorJson));
     if Obj.IndexOfName('_class_name') >= 0 then Obj.Delete('_class_name');
     Obj.Add('_class_name', 'UNet2DConditionModel');
+    // ControlNetModel configs carry no grid; the SD 1.5 latent grid stands
+    // in until the caller sets Base.LatentGrid.
+    if (Obj.IndexOfName('latent_size') < 0) and
+      (Obj.IndexOfName('sample_size') < 0) then
+      Obj.Add('sample_size', csSDUNetDefaultLatentGrid);
     // out_channels is irrelevant for ControlNet (no conv_out) but the SD reader
     // defaults it; leave as-is.
     Result.Base := ReadSDUNetConfigFromJSONText(Obj.AsJSON, FileName);
@@ -76982,6 +77080,9 @@ begin
     Result.DownscaleFactor := Obj.Get('downscale_factor', 8);
     if Result.DownscaleFactor < 1 then
       ImportError('T2I-Adapter import: downscale_factor must be >= 1.');
+    if Obj.Get('adapter_type', 'full_adapter') <> 'full_adapter' then
+      ImportError('T2I-Adapter import: adapter_type "' +
+        Obj.Get('adapter_type', '') + '" - only full_adapter is supported.');
     // The hint grid must be supplied (pico "cond_size") or derived from the
     // latent grid; conv_in maps cond_grid / downscale_factor -> latent grid.
     if Obj.IndexOfName('cond_size') >= 0 then
@@ -76999,8 +77100,11 @@ begin
       Result.CondGrid := Result.LatentGrid * Result.DownscaleFactor;
     end
     else
-      ImportError('T2I-Adapter import: config needs "cond_size" or ' +
-        '"latent_size" (the hint / latent grid).');
+    begin
+      // diffusers configs carry no grid; SD 1.5's until the caller sets one.
+      Result.LatentGrid := csSDUNetDefaultLatentGrid;
+      Result.CondGrid := Result.LatentGrid * Result.DownscaleFactor;
+    end;
   finally
     Root.Free;
     JsonText.Free;
@@ -92254,6 +92358,16 @@ begin
   end;
 end;
 
+// model_index.json classes whose components the pipeline can run.
+function IsStableDiffusionPipelineClass(const ClassName: string): boolean;
+begin
+  Result := (ClassName = 'StableDiffusionPipeline') or
+    (ClassName = 'StableDiffusionControlNetPipeline') or
+    (ClassName = 'StableDiffusionAdapterPipeline') or
+    (ClassName = 'StableDiffusionInpaintPipeline') or
+    (ClassName = 'StableDiffusionImg2ImgPipeline');
+end;
+
 constructor TStableDiffusionPipeline.Create(const ModelFolder: string);
 var
   JsonText: TStringList;
@@ -92267,6 +92381,7 @@ begin
   FInversionVectors := TNNetVolumeList.Create();
   FGuidanceScale := 7.5;
   FOpenPhase := sdphDone;
+  FPlainConditioner := TStableDiffusionConditioner.Create();
   IndexFile := FModelFolder + 'model_index.json';
   TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
   JsonText := TStringList.Create;
@@ -92277,10 +92392,11 @@ begin
     if not (Root is TJSONObject) then
       ImportError('TStableDiffusionPipeline: ' + IndexFile +
         ' is not a JSON object.');
-    if TJSONObject(Root).Get('_class_name', '') <> 'StableDiffusionPipeline' then
+    if not IsStableDiffusionPipelineClass(
+      TJSONObject(Root).Get('_class_name', '')) then
       ImportError('TStableDiffusionPipeline: ' + IndexFile + ' names "' +
-        TJSONObject(Root).Get('_class_name', '') +
-        '", not StableDiffusionPipeline.');
+        TJSONObject(Root).Get('_class_name', '') + '", not a Stable ' +
+        'Diffusion 1.x/2.x pipeline (StableDiffusionPipeline, ...).');
     FreeAndNil(Root);
     JsonText.LoadFromFile(ComponentFolder('scheduler') +
       'scheduler_config.json');
@@ -92324,11 +92440,13 @@ begin
   if FUNetConfig.UseAddEmbedding then
     ImportError('TStableDiffusionPipeline: the unet uses SDXL ' +
       'addition_embed_type "text_time"; SDXL is not supported yet.');
-  if (FUNetConfig.InChannels <> FVaeConfig.LatentChannels) or
+  // An inpainting UNet takes latents | mask | masked-image latents.
+  if ((FUNetConfig.InChannels <> FVaeConfig.LatentChannels) and
+    (FUNetConfig.InChannels <> 2 * FVaeConfig.LatentChannels + 1)) or
     (FUNetConfig.OutChannels <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline: unet in/out_channels ' +
       IntToStr(FUNetConfig.InChannels) + '/' +
-      IntToStr(FUNetConfig.OutChannels) + ' <> vae latent_channels ' +
+      IntToStr(FUNetConfig.OutChannels) + ' do not fit vae latent_channels ' +
       IntToStr(FVaeConfig.LatentChannels) + '.');
   if FTextConfig.Text.HiddenSize <> FUNetConfig.CrossAttentionDim then
     ImportError('TStableDiffusionPipeline: text encoder hidden_size ' +
@@ -92339,6 +92457,10 @@ end;
 destructor TStableDiffusionPipeline.Destroy();
 begin
   UnloadComponents();
+  FPlainConditioner.Free;
+  {$IFDEF OpenCL}
+  FOpenCLDevices.Free;
+  {$ENDIF}
   FTokenizer.Free;
   FInversionVectors.Free;
   FNegativePromptEmbeds.Free;
@@ -92403,11 +92525,28 @@ begin
   FOpenCLPlatform := platform_id;
   FOpenCLDevice := device_id;
 end;
+
+function TStableDiffusionPipeline.EnableOpenCLDevice(PlatformIndex,
+  DeviceIndex: integer; out Description: string): boolean;
+begin
+  if FOpenCLDevices = nil then FOpenCLDevices := TEasyOpenCL.Create();
+  Result := FOpenCLDevices.SelectPlatformAndDevice(PlatformIndex, DeviceIndex,
+    Description);
+  if not Result then exit;
+  EnableOpenCL(FOpenCLDevices.PlatformIds[PlatformIndex],
+    FOpenCLDevices.Devices[DeviceIndex]);
+  Description := FOpenCLDevices.PlatformNames[PlatformIndex] + ' / ' +
+    FOpenCLDevices.DeviceNames[DeviceIndex];
+end;
 {$ENDIF}
 
 procedure TStableDiffusionPipeline.SetUNetInt8(Value: boolean);
 begin
-  if Value <> FUNetInt8 then FreeAndNil(FUNet);
+  if Value <> FUNetInt8 then
+  begin
+    FreeAndNil(FUNet);
+    Inc(FComponentEpoch);
+  end;
   FUNetInt8 := Value;
 end;
 
@@ -92419,6 +92558,7 @@ end;
 
 procedure TStableDiffusionPipeline.FreeKeptComponents();
 begin
+  Inc(FComponentEpoch);
   FreeAndNil(FTextEncoder);
   FreeAndNil(FUNet);
   FreeAndNil(FVaeDecoder);
@@ -92435,7 +92575,9 @@ begin
   FKeepComponents := true;
   try
     AcquireTextEncoder(FMaxTokenCount);
-    AcquireUNet(GridX, GridY, FMaxTokenCount);
+    AcquireUNet(GridX, GridY, FMaxTokenCount,
+      ActiveConditioner().UNetWithControl(),
+      ActiveConditioner().UNetWithAdapter());
     AcquireVaeDecoder(GridX, GridY);
   except
     UnloadComponents();
@@ -92503,15 +92645,17 @@ begin
 end;
 
 function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
-  TextSeqLen: integer): TNNet;
+  TextSeqLen: integer; WithControl, WithAdapter: boolean): TNNet;
 begin
   if Assigned(FUNet) and (FUNetGridX = GridX) and (FUNetGridY = GridY) and
-    (FUNetTextSeqLen = TextSeqLen) then exit(FUNet);
+    (FUNetTextSeqLen = TextSeqLen) and (FUNetWithControl = WithControl) and
+    (FUNetWithAdapter = WithAdapter) then exit(FUNet);
   DoPhase(sdphLoadUNet);
   FreeAndNil(FUNet);
   Result := BuildSDUNetFromSafeTensorsEx(SafeTensorsFolderWeightsFile(
     ComponentFolder('unet'), 'diffusion_pytorch_model'),
-    UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false);
+    UNetStepConfig(GridX, GridY, TextSeqLen), {pTrainable=}false,
+    WithControl, WithAdapter);
   try
     PrepareComponent(Result, FUNetInt8);
   except
@@ -92524,7 +92668,16 @@ begin
     FUNetGridX := GridX;
     FUNetGridY := GridY;
     FUNetTextSeqLen := TextSeqLen;
+    FUNetWithControl := WithControl;
+    FUNetWithAdapter := WithAdapter;
   end;
+end;
+
+function TStableDiffusionPipeline.ActiveConditioner(
+  ): TStableDiffusionConditioner;
+begin
+  Result := FConditioner;
+  if Result = nil then Result := FPlainConditioner;
 end;
 
 function TStableDiffusionPipeline.AcquireVaeDecoder(GridX,
@@ -92860,7 +93013,7 @@ var
   SavedSeed: cardinal;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
-  Latents.ReSize(GridX, GridY, FUNetConfig.InChannels);
+  Latents.ReSize(GridX, GridY, FVaeConfig.LatentChannels);
   SavedSeed := RandSeed;
   RandSeed := Seed;
   Latents.RandomizeGaussian(1.0);
@@ -92872,6 +93025,7 @@ procedure TStableDiffusionPipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
 var
   StepConfig: TSDUNetConfig;
   Net: TNNet;
+  StepConditioner: TStableDiffusionConditioner;
   Schedule: TNeuralIntegerArray;
   Pred, PredUncond: TNNetVolume;
   IsGuided: boolean;
@@ -92879,8 +93033,16 @@ var
   Eta, NoiseScale: TNeuralFloat;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
+  StepConditioner := ActiveConditioner();
+  if StepConditioner.UNetInputChannels(FVaeConfig.LatentChannels) <>
+    FUNetConfig.InChannels then
+    ImportError('TStableDiffusionPipeline.Denoise: the unet takes ' +
+      IntToStr(FUNetConfig.InChannels) + ' input channels, the ' +
+      StepConditioner.ClassName + ' feeds ' + IntToStr(
+      StepConditioner.UNetInputChannels(FVaeConfig.LatentChannels)) +
+      ' (an inpainting unet needs a TStableDiffusionInpainter).');
   if (Latents.SizeX <> GridX) or (Latents.SizeY <> GridY) or
-    (Latents.Depth <> FUNetConfig.InChannels) then
+    (Latents.Depth <> FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: latents ' +
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
       IntToStr(Latents.Depth) + ' do not match a ' + IntToStr(Width) +
@@ -92899,10 +93061,12 @@ begin
   StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
-  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX);
+  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX,
+    StepConditioner.UNetWithControl(), StepConditioner.UNetWithAdapter());
   Pred := TNNetVolume.Create();
   PredUncond := TNNetVolume.Create();
   try
+    StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
     DoPhase(sdphDenoise);
     Schedule := FScheduler.BuildSamplerSchedule(StepCount,
       FScheduler.ConfigSpacing, FSampler);
@@ -92917,21 +93081,24 @@ begin
     begin
       // Tt is 1-based; the UNet takes the diffusers timestep Tt - 1.
       Tt := Schedule[StepPos];
-      SDUNetDenoise(Net, StepConfig, Latents, PromptEmbeds, Tt - 1, Pred);
+      StepConditioner.PredictNoise(Net, StepConfig, Latents, PromptEmbeds, Tt - 1,
+        Pred);
       Inc(FImageStats.UNetPassCount);
       if IsGuided then
       begin
-        SDUNetDenoise(Net, StepConfig, Latents, FNegativePromptEmbeds, Tt - 1,
-          PredUncond);
+        StepConditioner.PredictNoise(Net, StepConfig, Latents,
+          FNegativePromptEmbeds, Tt - 1, PredUncond);
         Inc(FImageStats.UNetPassCount);
         TNNetDiffusionScheduler.ApplyCFG(Pred, PredUncond, Pred,
           FGuidanceScale);
       end;
       FScheduler.Step(Latents, Pred, Tt, Schedule[StepPos + 1], FSampler, Eta);
+      StepConditioner.AfterStep(Latents, Schedule[StepPos + 1]);
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Tt - 1, Latents);
     end;
   finally
     EndPhase();
+    StepConditioner.EndDenoise();
     PredUncond.Free;
     Pred.Free;
     ReleaseComponent(Net);
@@ -93003,6 +93170,226 @@ begin
   finally
     PromptEmbeds.Free;
   end;
+end;
+
+procedure TStableDiffusionConditioner.StartLoadPhase();
+begin
+  if FPipeline.FOpenPhase <> sdphLoadUNet then
+    FPipeline.DoPhase(sdphLoadUNet);
+end;
+
+function TStableDiffusionConditioner.IsNetCurrent(Net: TNNet; NetGrid,
+  Grid: integer): boolean;
+begin
+  Result := Assigned(Net) and (NetGrid = Grid) and
+    (FNetEpoch = FPipeline.ComponentEpoch);
+end;
+
+function TStableDiffusionConditioner.UNetWithControl(): boolean;
+begin
+  Result := false;
+end;
+
+function TStableDiffusionConditioner.UNetWithAdapter(): boolean;
+begin
+  Result := false;
+end;
+
+function TStableDiffusionConditioner.UNetInputChannels(
+  LatentChannels: integer): integer;
+begin
+  Result := LatentChannels;
+end;
+
+procedure TStableDiffusionConditioner.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+begin
+  FPipeline := Pipeline;
+end;
+
+procedure TStableDiffusionConditioner.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  SDUNetDenoise(UNet, Config, Latents, Embeds, Timestep, Pred);
+end;
+
+procedure TStableDiffusionConditioner.AfterStep(Latents: TNNetVolume;
+  NextTt: integer);
+begin
+end;
+
+procedure TStableDiffusionConditioner.EndDenoise();
+begin
+end;
+
+procedure StableDiffusionPrepareImage(Source: TNNetVolume; Width, Height,
+  Channels: integer; Dest: TNNetVolume);
+const
+  MaxChannelValue: TNeuralFloat = 255;
+  // PIL 'L' = (R*19595 + G*38470 + B*7471 + 0x8000) >> 16.
+  csLumaR = 19595;
+  csLumaG = 38470;
+  csLumaB = 7471;
+  csLumaRound = 32768;
+var
+  Converted: TNNetVolume;
+  PixelPos, MaxPixelPos, SourcePos, DestPos, Channel, MaxChannel: integer;
+begin
+  if (Source.Depth <> 1) and (Source.Depth <> 3) and (Source.Depth <> 4) then
+    ImportError('StableDiffusionPrepareImage: the image has ' +
+      IntToStr(Source.Depth) + ' channels, expected gray, RGB or RGBA.');
+  if (Channels <> 1) and (Channels <> 3) then
+    ImportError('StableDiffusionPrepareImage: ' + IntToStr(Channels) +
+      ' output channels; 1 or 3 are supported.');
+  if Source = Dest then
+    ImportError('StableDiffusionPrepareImage: Dest must not be Source.');
+  Converted := TNNetVolume.Create(Source.SizeX, Source.SizeY, Channels);
+  try
+    MaxPixelPos := Source.SizeX * Source.SizeY - 1;
+    MaxChannel := Channels - 1;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      SourcePos := PixelPos * Source.Depth;
+      DestPos := PixelPos * Channels;
+      if Source.Depth = 1 then
+        for Channel := 0 to MaxChannel do
+          Converted.FData[DestPos + Channel] := Source.FData[SourcePos]
+      else if Channels = 1 then
+        Converted.FData[DestPos] := Trunc((Source.FData[SourcePos] * csLumaR +
+          Source.FData[SourcePos + 1] * csLumaG +
+          Source.FData[SourcePos + 2] * csLumaB + csLumaRound) / 65536)
+      else
+        for Channel := 0 to MaxChannel do
+          Converted.FData[DestPos + Channel] :=
+            Source.FData[SourcePos + Channel];
+    end;
+    if (Source.SizeX <> Width) or (Source.SizeY <> Height) then
+      ResizeImageLanczos(Converted, Dest, Width, Height)
+    else
+    begin
+      Dest.ReSize(Converted);
+      Dest.Copy(Converted);
+    end;
+    Dest.Mul(1 / MaxChannelValue);
+  finally
+    Converted.Free;
+  end;
+end;
+
+constructor TStableDiffusionControlNet.Create(const ControlNetFolder: string);
+var
+  Folder: string;
+begin
+  inherited Create();
+  Folder := IncludeTrailingPathDelimiter(ControlNetFolder);
+  FConfig := ReadControlNetConfigFromJSONFile(Folder + 'config.json');
+  FWeightsFile := SafeTensorsFolderWeightsFile(Folder,
+    'diffusion_pytorch_model');
+  FSourceImage := TNNetVolume.Create();
+  FControlImage := TNNetVolume.Create();
+  FMidResidual := TNNetVolume.Create();
+  FConditioningScale := 1;
+end;
+
+destructor TStableDiffusionControlNet.Destroy();
+var
+  ResidualPos, MaxResidualPos: integer;
+begin
+  FNet.Free;
+  MaxResidualPos := High(FDownResiduals);
+  for ResidualPos := 0 to MaxResidualPos do FDownResiduals[ResidualPos].Free;
+  FMidResidual.Free;
+  FControlImage.Free;
+  FSourceImage.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionControlNet.SetControlImage(Image: TNNetVolume);
+begin
+  FSourceImage.ReSize(Image);
+  FSourceImage.Copy(Image);
+end;
+
+function TStableDiffusionControlNet.UNetWithControl(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TStableDiffusionControlNet.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  Grid, CondFactor, ResidualPos, MaxResidualPos: integer;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  Grid := Latents.SizeX;
+  if Latents.SizeY <> Grid then
+    ImportError('TStableDiffusionControlNet: the image must be square (' +
+      'latents ' + IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) +
+      ').');
+  if FSourceImage.Size = 0 then
+    ImportError('TStableDiffusionControlNet: call SetControlImage first.');
+  CondFactor := 1 shl (FConfig.NumCondEmbedOut - 1);
+  if CondFactor <> Pipeline.VaeScaleFactor then
+    ImportError('TStableDiffusionControlNet: the conditioning embedding ' +
+      'downsamples by ' + IntToStr(CondFactor) + ', the VAE by ' +
+      IntToStr(Pipeline.VaeScaleFactor) + '.');
+  if FConfig.NumDownResiduals <> SDUNetControlDownCount(Pipeline.UNetConfig)
+    then
+    ImportError('TStableDiffusionControlNet: ' +
+      IntToStr(FConfig.NumDownResiduals) + ' down residuals, the unet has ' +
+      IntToStr(SDUNetControlDownCount(Pipeline.UNetConfig)) + ' skips.');
+  if not IsNetCurrent(FNet, FNetGrid, Grid) or
+    (FNetConfig.Base.TextSeqLen <> TextSeqLen) then
+  begin
+    StartLoadPhase();
+    FreeAndNil(FNet);
+    FNetConfig := FConfig;
+    FNetConfig.Base.LatentGrid := Grid;
+    FNetConfig.Base.LatentGridY := 0;
+    FNetConfig.Base.TextSeqLen := TextSeqLen;
+    FNetConfig.CondGrid := Grid * CondFactor;
+    FNet := BuildControlNetFromSafeTensorsEx(FWeightsFile, FNetConfig,
+      {pTrainable=}false);
+    FNetGrid := Grid;
+    FNetEpoch := Pipeline.ComponentEpoch;
+    Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8);
+  end;
+  StableDiffusionPrepareImage(FSourceImage, FNetConfig.CondGrid,
+    FNetConfig.CondGrid, FConfig.CondChannels, FControlImage);
+  if Length(FDownResiduals) <> FConfig.NumDownResiduals then
+  begin
+    SetLength(FDownResiduals, FConfig.NumDownResiduals);
+    MaxResidualPos := High(FDownResiduals);
+    for ResidualPos := 0 to MaxResidualPos do
+      FDownResiduals[ResidualPos] := TNNetVolume.Create();
+  end;
+end;
+
+procedure TStableDiffusionControlNet.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+var
+  ResidualPos, MaxResidualPos: integer;
+begin
+  ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, FControlImage,
+    Timestep, FDownResiduals, FMidResidual);
+  if FConditioningScale <> 1 then
+  begin
+    MaxResidualPos := High(FDownResiduals);
+    for ResidualPos := 0 to MaxResidualPos do
+      FDownResiduals[ResidualPos].Mul(FConditioningScale);
+    FMidResidual.Mul(FConditioningScale);
+  end;
+  SDUNetDenoiseWithControl(UNet, Config, Latents, Embeds, Timestep,
+    FDownResiduals, FMidResidual, Pred);
+end;
+
+procedure TStableDiffusionControlNet.EndDenoise();
+begin
+  if not FPipeline.ComponentsLoaded then FreeAndNil(FNet);
 end;
 
 const

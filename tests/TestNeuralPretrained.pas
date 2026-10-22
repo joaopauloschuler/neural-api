@@ -1233,6 +1233,7 @@ type
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineKeepLoaded;
     procedure TestStableDiffusionPipelineInt8;
+    procedure TestStableDiffusionControlNetParity;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -45770,6 +45771,65 @@ begin
     Initial.Free;
     Embeds.Free;
     Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// StableDiffusionControlNetPipeline float64 (tiny_sd15_controlnet_io.json, a
+// diffusers ControlNetModel.from_unet of tiny_sd15): 3 guided DDIM steps with
+// conditioning scale 0.5, then the image, all < 1e-4.
+procedure TTestNeuralPretrained.TestStableDiffusionControlNetParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet: TStableDiffusionControlNet;
+  Embeds, Initial, ControlImage, Image, Expected: TNNetVolume;
+  ImageSize: integer;
+  MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_controlnet_io.json');
+  Pipeline := CreateSD15Pipeline();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  ControlImage := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    ImageSize := TJSONObject(FSD15Oracle).Get('image_size', 0);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['control_image'],
+      false, ControlImage);
+    ControlImage.Mul(255);
+    ControlNet.SetControlImage(ControlImage);
+    ControlNet.ConditioningScale := TJSONObject(FSD15Oracle).Get(
+      'conditioning_scale', 0.0);
+    Pipeline.Conditioner := ControlNet;
+    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
+      0.0);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    FSD15StepMaxDiff := 0;
+    FSD15StepCount := 0;
+    Pipeline.OnStep := @SD15CheckStep;
+    Pipeline.GenerateFromEmbeds(Embeds, ImageSize, ImageSize,
+      TJSONObject(FSD15Oracle).Get('steps', 0), 0, Image, Initial);
+    AssertEquals('steps run', TJSONObject(FSD15Oracle).Get('steps', 0),
+      FSD15StepCount);
+    AssertTrue('step latents max |diff| = ' + FloatToStr(FSD15StepMaxDiff),
+      FSD15StepMaxDiff < 1e-4);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['image'], false,
+      Expected);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('image max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    Expected.Free;
+    Image.Free;
+    ControlImage.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    ControlNet.Free;
     FreeAndNil(FSD15Oracle);
   end;
 end;

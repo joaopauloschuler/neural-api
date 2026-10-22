@@ -1,200 +1,287 @@
 program ControlNetCanny;
 (*
-ControlNetCanny: an OFFLINE, CPU smoke for END-TO-END base-UNet-plus-ControlNet
-single-step denoising -- the StableDiffusionControlNetPipeline inner loop wired
-over the repo's already-landed importers:
+ControlNetCanny: Stable Diffusion 1.x text-to-image guided by a ControlNet
+(diffusers StableDiffusionControlNetPipeline), through TStableDiffusionPipeline
+with a TStableDiffusionControlNet conditioner in neuralpretrained.pas.
 
-  noisy latent + text states + a (canny-edge-style) control image
-    -> ControlNet (BuildControlNetFromSafeTensors / ControlNetResiduals)
-       produces down_block_res_samples + mid_block_res_sample
-    -> base SD UNet built WITH control injection
-       (BuildSDUNet(..., pWithControl=true))
-    -> SDUNetDenoiseWithControl ADDS those residuals into the decoder skip
-       connections, exactly as diffusers does:
-         down_block_res_samples = [d + c for d,c in zip(down, controlnet_down)]
-         mid_block_res_sample  += controlnet_mid
-    -> predicted noise (the eps a sampler would step on).
+  * no --model / --controlnet: the committed random pico fixtures
+    tests/fixtures/tiny_sd15 + tests/fixtures/tiny_sd15_controlnet (16x16,
+    random weights): this checks wiring and I/O only.
+  * --model DIR: a diffusers Stable Diffusion 1.x folder, e.g.
+    runwayml/stable-diffusion-v1-5; --controlnet DIR: a diffusers
+    ControlNetModel folder, e.g. lllyasviel/sd-controlnet-canny.
 
-Nothing here is a new leaf layer: it is pure plumbing over landed pieces (the
-ControlNet importer + ControlNetResiduals, the SD UNet importer + the new
-SDUNetDenoiseWithControl driver). It is a WIRING / THROUGHPUT smoke: it proves
-the base UNet + ControlNet chain runs offline and produces a FINITE noise
-prediction, NOT photorealism (the pico fixtures carry random weights).
+--control FILE is the control image (for the canny ControlNet: white edges on
+black, e.g. the output of cv2.Canny); it is resized to the image size. Without
+it the example draws a circle and a square outline. ControlNet runs at square
+sizes only.
 
-The committed pico fixtures are config-compatible (both share block_out_channels
-[16,32], latent grid 8, text seq 5, cross dim 12), so the ControlNet residuals
-flow straight into the base UNet skips with no reshaping. The combined forward is
-parity-checked < 1e-4 in TestControlNetCombinedParity
-(tools/controlnet_combined_fixture.py).
+Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
-SHAPES (pico fixtures, the default run):
-  latent          (8, 8, in_channels=4)
-  text states     (text_seq=5, 1, cross_dim=12)
-  control image   (16, 16, cond_channels=3)
-    -> 4 down residuals + 1 mid residual
-    -> predicted noise (8, 8, out_channels=4)
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+any later version.
 
-USAGE:
-  ./ControlNetCanny                              use the committed pico fixtures
-  ./ControlNetCanny <unet.st> <unet.cfg> <controlnet.st> <controlnet.cfg>
-                                                 real diffusers checkpoints
-                                                 (config-compatible base UNet +
-                                                 ControlNet)
-
-NO NETWORK ACCESS / SELF-CONTAINED: falls back to the committed pico SD UNet
-(tests/fixtures/tiny_sd_unet.* files) and the matched pico ControlNet
-(tests/fixtures/tiny_controlnet.* files).
+Coded by Claude (AI).
 *)
 {$mode objfpc}{$H+}
 
-uses
-  SysUtils, Math,
-  neuralvolume, neuralnetwork, neuralpretrained;
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
+  Classes, SysUtils, Math,
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
 
 const
-  cUNetST   = '../../tests/fixtures/tiny_sd_unet.safetensors';
-  cUNetCfg  = '../../tests/fixtures/tiny_sd_unet_config.json';
-  cCtrlST   = '../../tests/fixtures/tiny_controlnet.safetensors';
-  cCtrlCfg  = '../../tests/fixtures/tiny_controlnet_config.json';
+  PicoModelFolder = '../../tests/fixtures/tiny_sd15';
+  PicoControlNetFolder = '../../tests/fixtures/tiny_sd15_controlnet';
 
-// Deterministic, finite synthetic input fillers (no RNG -> reproducible smoke).
-procedure FillLatent(V: TNNetVolume; Grid, Ch: integer);
-var c, y, x: integer;
+type
+  TControlNetCannyOptions = record
+    ModelFolder, ControlNetFolder, ControlFile, Prompt, NegativePrompt,
+      OutputFile: string;
+    // ImageSize < 1: the checkpoint default (512 for SD 1.5).
+    Steps, ImageSize: integer;
+    GuidanceScale, ConditioningScale: double;
+    Seed: cardinal;
+    UseOpenCL, UseInt8: boolean;
+    OpenCLPlatform, OpenCLDevice: integer;
+  end;
+
+  // Prints the pipeline's stages and steps as they run.
+  TControlNetReporter = class(TObject)
+  public
+    procedure OnPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure OnStep(StepIndex, StepCount: integer; Timestep: double;
+      Latents: TNNetVolume);
+  end;
+
+procedure TControlNetReporter.OnPhase(Phase: TStableDiffusionPipelinePhase);
+const
+  PhaseNames: array[TStableDiffusionPipelinePhase] of string = (
+    'loading the text encoder', 'encoding the prompt',
+    'loading the UNet and the ControlNet', 'denoising',
+    'loading the VAE decoder', 'decoding', 'done');
 begin
-  V.ReSize(Grid, Grid, Ch);
-  for c := 0 to Ch - 1 do
-    for y := 0 to Grid - 1 do
-      for x := 0 to Grid - 1 do
-        V.FData[(y * Grid + x) * Ch + c] :=
-          (((c * 64 + y * Grid + x) * 7) mod 13 - 6) / 8.0;
+  WriteLn('  ', PhaseNames[Phase]);
 end;
 
-procedure FillText(V: TNNetVolume; SeqLen, Dim: integer);
-var s, d: integer;
+procedure TControlNetReporter.OnStep(StepIndex, StepCount: integer;
+  Timestep: double; Latents: TNNetVolume);
 begin
-  V.ReSize(SeqLen, 1, Dim);
-  for s := 0 to SeqLen - 1 do
-    for d := 0 to Dim - 1 do
-      V.FData[s * Dim + d] := (((s * 16 + d) * 5) mod 11 - 5) / 8.0;
+  WriteLn(Format('    step %d/%d  t=%.0f', [StepIndex + 1, StepCount, Timestep]));
 end;
 
-// A toy "canny edge" control image: a bright grid lattice (edges every 4 px) on
-// a dark field, replicated across the RGB channels. Just a viewable, finite map.
-procedure FillCanny(V: TNNetVolume; Grid, Ch: integer);
-var c, y, x: integer; edge: TNeuralFloat;
+procedure PrintUsage();
 begin
-  V.ReSize(Grid, Grid, Ch);
-  for y := 0 to Grid - 1 do
-    for x := 0 to Grid - 1 do
+  WriteLn('Usage: ControlNetCanny [--model DIR] [--controlnet DIR] [options]');
+  WriteLn('  --model DIR       diffusers Stable Diffusion 1.x folder ',
+    '(default: the pico fixture)');
+  WriteLn('  --controlnet DIR  diffusers ControlNetModel folder ',
+    '(default: the pico fixture)');
+  WriteLn('  --control FILE    control image, e.g. a canny edge map ',
+    '(default: drawn outlines)');
+  WriteLn('  --prompt TEXT     prompt (default "a futuristic city, ',
+    'detailed, sharp focus")');
+  WriteLn('  --negative TEXT   negative prompt (default empty)');
+  WriteLn('  --steps N         denoising steps (default 25)');
+  WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
+  WriteLn('  --scale S         controlnet_conditioning_scale (default 1.0)');
+  WriteLn('  --size N          square image side (default: the checkpoint''s)');
+  WriteLn('  --seed N          noise seed (default 0)');
+  WriteLn('  --out PNG         output file (default controlnet_canny.png)');
+  WriteLn('  --int8            UNet, ControlNet and text encoder weights in ',
+    'int8');
+  WriteLn('  --gpu             run the nets on OpenCL (needs a build with ',
+    '-dOpenCL)');
+  WriteLn('  --gpu-platform N  OpenCL platform index (default 0)');
+  WriteLn('  --gpu-device N    OpenCL device index (default 0)');
+end;
+
+function ParseOptions(out Opt: TControlNetCannyOptions): boolean;
+var
+  ArgPos: integer;
+  Arg: string;
+
+  function NextArg(): string;
+  begin
+    Inc(ArgPos);
+    if ArgPos > ParamCount then
+      raise Exception.Create(Arg + ' needs a value');
+    Result := ParamStr(ArgPos);
+  end;
+
+begin
+  Opt.ModelFolder := PicoModelFolder;
+  Opt.ControlNetFolder := PicoControlNetFolder;
+  Opt.ControlFile := '';
+  Opt.Prompt := 'a futuristic city, detailed, sharp focus';
+  Opt.NegativePrompt := '';
+  Opt.OutputFile := 'controlnet_canny.png';
+  Opt.Steps := 25;
+  Opt.ImageSize := 0;
+  Opt.GuidanceScale := 7.5;
+  Opt.ConditioningScale := 1.0;
+  Opt.Seed := 0;
+  Opt.UseOpenCL := false;
+  Opt.UseInt8 := false;
+  Opt.OpenCLPlatform := 0;
+  Opt.OpenCLDevice := 0;
+  Result := true;
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
+  begin
+    Arg := ParamStr(ArgPos);
+    if Arg = '--model' then Opt.ModelFolder := NextArg()
+    else if Arg = '--controlnet' then Opt.ControlNetFolder := NextArg()
+    else if Arg = '--control' then Opt.ControlFile := NextArg()
+    else if Arg = '--prompt' then Opt.Prompt := NextArg()
+    else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
+    else if Arg = '--out' then Opt.OutputFile := NextArg()
+    else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
+    else if Arg = '--size' then Opt.ImageSize := StrToInt(NextArg())
+    else if Arg = '--guidance' then
+      Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--scale' then
+      Opt.ConditioningScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
+    else if Arg = '--int8' then Opt.UseInt8 := true
+    else if Arg = '--gpu' then Opt.UseOpenCL := true
+    else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
+    else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
+    else if (Arg = '--help') or (Arg = '-h') then
     begin
-      if ((x mod 4) = 0) or ((y mod 4) = 0) then edge := 1.0 else edge := -1.0;
-      for c := 0 to Ch - 1 do
-        V.FData[(y * Grid + x) * Ch + c] := edge;
+      PrintUsage();
+      Result := false;
+      exit;
+    end
+    else
+      raise Exception.Create('unknown argument: ' + Arg);
+    Inc(ArgPos);
+  end;
+  if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+end;
+
+// A (Size, Size, 3) edge map in 0..255: one-pixel white outlines of a circle
+// and of a square on black.
+procedure DrawEdgeMap(Image: TNNetVolume; Size: integer);
+var
+  X, Y, MaxPos, Center, Radius, SquareLow, SquareHigh: integer;
+  IsEdge: boolean;
+begin
+  Image.ReSize(Size, Size, 3);
+  Image.Fill(0);
+  MaxPos := Size - 1;
+  Center := Size div 2;
+  Radius := Size * 3 div 8;
+  SquareLow := Size div 4;
+  SquareHigh := Size * 3 div 4;
+  for Y := 0 to MaxPos do
+    for X := 0 to MaxPos do
+    begin
+      IsEdge := Abs(Round(Sqrt(Sqr(X - Center) + Sqr(Y - Center))) - Radius) = 0;
+      IsEdge := IsEdge or (((X = SquareLow) or (X = SquareHigh)) and
+        (Y >= SquareLow) and (Y <= SquareHigh)) or
+        (((Y = SquareLow) or (Y = SquareHigh)) and
+        (X >= SquareLow) and (X <= SquareHigh));
+      if IsEdge then
+      begin
+        Image[X, Y, 0] := 255;
+        Image[X, Y, 1] := 255;
+        Image[X, Y, 2] := 255;
+      end;
     end;
 end;
 
-procedure VolumeStats(V: TNNetVolume; out MinV, MaxV, MeanV: TNeuralFloat;
-  out Finite: boolean);
-var i: integer; s, val: TNeuralFloat;
+procedure Run(const Opt: TControlNetCannyOptions);
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet: TStableDiffusionControlNet;
+  Reporter: TControlNetReporter;
+  Control, Image: TNNetVolume;
+  ComputeText: string;
+  ImageSize: integer;
+  StartTime: TDateTime;
+  {$IFDEF OpenCL}
+  OpenCLText: string;
+  {$ENDIF}
 begin
-  MinV := 1e30; MaxV := -1e30; s := 0; Finite := true;
-  for i := 0 to V.Size - 1 do
-  begin
-    val := V.FData[i];
-    if IsNan(val) or IsInfinite(val) then Finite := false;
-    if val < MinV then MinV := val;
-    if val > MaxV then MaxV := val;
-    s := s + val;
+  Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
+  ControlNet := TStableDiffusionControlNet.Create(Opt.ControlNetFolder);
+  Reporter := TControlNetReporter.Create;
+  Control := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    ComputeText := 'CPU';
+    if Opt.UseOpenCL then
+    begin
+      {$IFDEF OpenCL}
+      if Pipeline.EnableOpenCLDevice(Opt.OpenCLPlatform, Opt.OpenCLDevice,
+        OpenCLText) then ComputeText := 'OpenCL on ' + OpenCLText
+      else ComputeText := 'CPU (' + OpenCLText + ')';
+      {$ELSE}
+      ComputeText := 'CPU (built without -dOpenCL)';
+      {$ENDIF}
+    end;
+    ImageSize := Opt.ImageSize;
+    if ImageSize < 1 then ImageSize := Pipeline.DefaultImageSize;
+    if Opt.ControlFile <> '' then
+    begin
+      if not LoadImageFromFileIntoVolume(Opt.ControlFile, Control) then
+        raise Exception.Create('could not read ' + Opt.ControlFile);
+    end
+    else DrawEdgeMap(Control, ImageSize);
+    ControlNet.SetControlImage(Control);
+    ControlNet.ConditioningScale := Opt.ConditioningScale;
+    Pipeline.Conditioner := ControlNet;
+    Pipeline.GuidanceScale := Opt.GuidanceScale;
+    Pipeline.NegativePrompt := Opt.NegativePrompt;
+    Pipeline.UNetInt8 := Opt.UseInt8;
+    Pipeline.TextEncoderInt8 := Opt.UseInt8;
+    Pipeline.OnPhase := @Reporter.OnPhase;
+    Pipeline.OnStep := @Reporter.OnStep;
+    WriteLn('Model:      ', Opt.ModelFolder);
+    WriteLn('ControlNet: ', Opt.ControlNetFolder);
+    if Opt.ControlFile <> '' then WriteLn('Control:    ', Opt.ControlFile)
+    else WriteLn('Control:    drawn circle and square outlines');
+    WriteLn('Prompt:     "', Opt.Prompt, '"');
+    WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, scale %.2f, ' +
+      'seed %d, %s', [ImageSize, ImageSize, Opt.Steps, Opt.GuidanceScale,
+      Opt.ConditioningScale, Opt.Seed, ComputeText]));
+    if Pipeline.SamplerNotice <> '' then
+      WriteLn('Notice:     ', Pipeline.SamplerNotice);
+    // Euler a draws its per-step noise from the global RNG.
+    RandSeed := Opt.Seed xor $9E3779B9;
+    StartTime := Now();
+    Pipeline.Generate(Opt.Prompt, ImageSize, ImageSize, Opt.Steps, Opt.Seed,
+      Image);
+    Image.Mul(255.0);
+    if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then
+      raise Exception.Create('could not save ' + Opt.OutputFile);
+    WriteLn(Format('Total:      %.1f s', [(Now() - StartTime) * 86400.0]));
+    WriteLn('Wrote ', Opt.OutputFile);
+  finally
+    Image.Free;
+    Control.Free;
+    Reporter.Free;
+    Pipeline.Free;
+    ControlNet.Free;
   end;
-  if V.Size > 0 then MeanV := s / V.Size else MeanV := 0;
 end;
 
 var
-  UNet, CNet: TNNet;
-  UCfg: TSDUNetConfig;
-  CCfg: TControlNetConfig;
-  UNetST, UNetCfg, CtrlST, CtrlCfg: string;
-  Latent, Text, Cond, MidRes, Noise: TNNetVolume;
-  DownRes: array of TNNetVolume;
-  DownCnt, i: integer;
-  t, MinV, MaxV, MeanV: TNeuralFloat;
-  Finite: boolean;
+  Options: TControlNetCannyOptions;
 begin
-  WriteLn('=== ControlNetCanny: base-UNet + ControlNet single-step smoke ===');
-
-  if ParamCount >= 4 then
-  begin
-    UNetST := ParamStr(1); UNetCfg := ParamStr(2);
-    CtrlST := ParamStr(3); CtrlCfg := ParamStr(4);
-    WriteLn('Using user checkpoints:');
-    WriteLn('  base UNet : ', UNetST);
-    WriteLn('  controlnet: ', CtrlST);
-  end
-  else
-  begin
-    UNetST := cUNetST; UNetCfg := cUNetCfg;
-    CtrlST := cCtrlST; CtrlCfg := cCtrlCfg;
-    WriteLn('No checkpoints passed; using the committed pico fixtures.');
-  end;
-
-  // Base UNet built WITH control injection (extra zero-default skip inputs).
-  UCfg := ReadSDUNetConfigFromJSONFile(UNetCfg);
-  UNet := BuildSDUNetFromSafeTensorsEx(UNetST, UCfg,
-    {pTrainable=}false, {pWithControl=}true);
-  CNet := BuildControlNetFromSafeTensors(CtrlST, CCfg,
-    {pTrainable=}false, CtrlCfg);
-  WriteLn('Base UNet : ', SDUNetConfigToString(UCfg));
-  WriteLn('ControlNet: ', ControlNetConfigToString(CCfg));
-
-  DownCnt := CCfg.NumDownResiduals;
-  if SDUNetControlDownCount(UCfg) <> DownCnt then
-  begin
-    WriteLn('FATAL: base UNet skip count (', SDUNetControlDownCount(UCfg),
-      ') <> controlnet down residual count (', DownCnt,
-      ') -- fixtures are not config-compatible.');
-    Halt(1);
-  end;
-
-  Latent := TNNetVolume.Create;
-  Text := TNNetVolume.Create;
-  Cond := TNNetVolume.Create;
-  MidRes := TNNetVolume.Create;
-  Noise := TNNetVolume.Create;
-  SetLength(DownRes, DownCnt);
-  for i := 0 to DownCnt - 1 do DownRes[i] := TNNetVolume.Create;
   try
-    FillLatent(Latent, UCfg.LatentGrid, UCfg.InChannels);
-    FillText(Text, UCfg.TextSeqLen, UCfg.CrossAttentionDim);
-    FillCanny(Cond, CCfg.CondGrid, CCfg.CondChannels);
-    t := 23.0;
-
-    // 1) ControlNet -> residuals.
-    ControlNetResiduals(CNet, CCfg, Latent, Text, Cond, t, DownRes, MidRes);
-    WriteLn('ControlNet produced ', DownCnt,
-      ' down residuals + 1 mid residual:');
-    for i := 0 to DownCnt - 1 do
-      WriteLn(Format('  down[%d]: (%d,%d,%d)', [i, DownRes[i].Depth,
-        DownRes[i].SizeY, DownRes[i].SizeX]));
-    WriteLn(Format('  mid    : (%d,%d,%d)',
-      [MidRes.Depth, MidRes.SizeY, MidRes.SizeX]));
-
-    // 2) base UNet denoise WITH the residuals injected into the decoder skips.
-    SDUNetDenoiseWithControl(UNet, UCfg, Latent, Text, t,
-      DownRes, MidRes, Noise);
-
-    VolumeStats(Noise, MinV, MaxV, MeanV, Finite);
-    WriteLn(Format('Predicted noise (%d,%d,%d): min %.4f max %.4f mean %.4f',
-      [Noise.Depth, Noise.SizeY, Noise.SizeX, MinV, MaxV, MeanV]));
-    if Finite then
-      WriteLn('OK: finite noise prediction (base UNet + ControlNet wired).')
-    else
+    if not ParseOptions(Options) then exit;
+    if (Options.ModelFolder = PicoModelFolder) or
+      (Options.ControlNetFolder = PicoControlNetFolder) then
+      WriteLn('Pico fixture in use: random weights (wiring check only).');
+    Run(Options);
+  except
+    on E: Exception do
     begin
-      WriteLn('FAIL: noise prediction contains NaN/Inf.');
-      Halt(2);
+      WriteLn('Error: ', E.Message);
+      ExitCode := 1;
     end;
-  finally
-    for i := 0 to DownCnt - 1 do DownRes[i].Free;
-    Noise.Free; MidRes.Free; Cond.Free; Text.Free; Latent.Free;
-    CNet.Free; UNet.Free;
   end;
 end.
