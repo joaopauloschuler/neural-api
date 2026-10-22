@@ -1372,6 +1372,21 @@ type
     procedure TestStableDiffusionDeepCacheImg2Img;
     // SDUNetDenoise's DeepCache split on a forced-OpenCL UNet vs the CPU.
     procedure TestStableDiffusionDeepCacheOpenCL;
+    // SDUNetSelfAttentionNames / SDUNetPAGLayerIndices on tiny_sd15: diffusers'
+    // module names, re.search patterns, an unmatched pattern refused.
+    procedure TestStableDiffusionPAGLayerNames;
+    // PerturbedGuidance with PerturbedScale 0 (or < 0) bit-identical to none.
+    procedure TestStableDiffusionPAGScaleZero;
+    // SkipAttentionScores on the selected attn1 heads vs a forward that writes
+    // each head's V rows by hand.
+    procedure TestStableDiffusionPAGIdentityReference;
+    // diffusers float64 StableDiffusionPAGPipeline (tiny_sd15_pag_io.json): CFG
+    // + mid, no CFG + down/up, adaptive scale over every self-attention.
+    procedure TestStableDiffusionPAGParity;
+    // PAG under DeepCache: the perturbed pass keeps its own cache slot.
+    procedure TestStableDiffusionPAGDeepCache;
+    // The identity heads of a forced-OpenCL UNet vs the CPU.
+    procedure TestStableDiffusionPAGOpenCL;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -49124,6 +49139,392 @@ begin
   end;
   {$ENDIF}
 end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGLayerNames;
+var
+  Config: TSDUNetConfig;
+  Pipeline: TStableDiffusionPipeline;
+  Names: TStringArray;
+  Indices: TNeuralIntegerArray;
+  Refused: boolean;
+
+  function IndexList(const Patterns: array of string): string;
+  var
+    IndexPos: integer;
+  begin
+    Indices := SDUNetPAGLayerIndices(Config, Patterns);
+    Result := '';
+    for IndexPos := 0 to High(Indices) do
+      Result := Result + IntToStr(Indices[IndexPos]) + ' ';
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  try
+    Config := Pipeline.UNetConfig;
+    Names := SDUNetSelfAttentionNames(Config);
+    AssertEquals('self-attentions', 4, Length(Names));
+    AssertEquals('down_blocks.0.attentions.0.transformer_blocks.0.attn1',
+      Names[0]);
+    AssertEquals('mid_block.attentions.0.transformer_blocks.0.attn1', Names[1]);
+    AssertEquals('up_blocks.1.attentions.0.transformer_blocks.0.attn1',
+      Names[2]);
+    AssertEquals('up_blocks.1.attentions.1.transformer_blocks.0.attn1',
+      Names[3]);
+    AssertEquals('mid', '1 ', IndexList(['mid']));
+    AssertEquals('down', '0 ', IndexList(['down']));
+    AssertEquals('up block 1', '2 3 ', IndexList(['up_blocks.1']));
+    AssertEquals('regex, sorted, no duplicates', '0 1 3 ',
+      IndexList(['up_blocks\.1\.attentions\.1', '(down|mid)', 'mid']));
+    AssertEquals('every one', '0 1 2 3 ', IndexList(['attn1']));
+    Refused := false;
+    try
+      SDUNetPAGLayerIndices(Config, ['mid', 'down_blocks.1']);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('down block 1 has no attention: refused', Refused);
+  finally
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGScaleZero;
+const
+  StepCount = 4;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Plain, Got: TNNetVolume;
+  ImageSide, PlainPassCount, ScalePos: integer;
+  Scale: TNeuralFloat;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    ImageSide := Pipeline.DefaultImageSize;
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Plain);
+    PlainPassCount := Pipeline.ImageStats.UNetPassCount;
+    AssertEquals('CFG passes', 2 * StepCount, PlainPassCount);
+    for ScalePos := 0 to 1 do
+    begin
+      Scale := -ScalePos;
+      Pipeline.PerturbedGuidance := TNNetPerturbedGuidance.Create(1, Scale);
+      Got.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+      AssertEquals('scale ' + FloatToStr(Scale) + ' passes', PlainPassCount,
+        Pipeline.ImageStats.UNetPassCount);
+      AssertEquals('scale ' + FloatToStr(Scale) + ' bit-identical', 0,
+        MaxAbsVolumeDiff(Got, Plain), 0);
+    end;
+    Pipeline.PerturbedGuidance.PerturbedScale := 3;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('PAG passes', 3 * StepCount,
+      Pipeline.ImageStats.UNetPassCount);
+    AssertTrue('PAG moves the latents', MaxAbsVolumeDiff(Got, Plain) > 1e-4);
+    Pipeline.PerturbedGuidance := nil;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('nil again: bit-identical', 0, MaxAbsVolumeDiff(Got, Plain), 0);
+  finally
+    Got.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGIdentityReference;
+const
+  Patterns: array[0..1] of string = ('mid', 'up_blocks.1.attentions.1');
+  Timestep = 500;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Embeds, Latents, Plain, Got, Expected, Source, HeadOutput: TNNetVolume;
+  Heads: TNNetLayerRefArr;
+  PatternPos, HeadPos, TokenPos, DimPos, Dk, HeadIdx, PrevHeadIdx: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Net := nil;
+  try
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    Pipeline.MakeInitialLatents(Pipeline.DefaultImageSize,
+      Pipeline.DefaultImageSize, 5, Latents);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Latents.SizeX;
+    Config.TextSeqLen := Embeds.SizeX;
+    Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+    SDUNetDenoise(Net, Config, Latents, Embeds, Timestep, Plain);
+    for PatternPos := 0 to High(Patterns) do
+    begin
+      Heads := SDUNetSelfAttentionHeads(Net, Config,
+        SDUNetPAGLayerIndices(Config, [Patterns[PatternPos]]));
+      AssertTrue(Patterns[PatternPos] + ' heads', Length(Heads) > 0);
+      for HeadPos := 0 to High(Heads) do
+        TNNetScaledDotProductAttention(Heads[HeadPos]).SkipAttentionScores :=
+          true;
+      SDUNetDenoise(Net, Config, Latents, Embeds, Timestep, Got);
+      for HeadPos := 0 to High(Heads) do
+        TNNetScaledDotProductAttention(Heads[HeadPos]).SkipAttentionScores :=
+          false;
+      // By hand: run up to each head, overwrite it with its V rows, go on.
+      SDUNetTimestepInput(Net).Output.FData[0] := Timestep;
+      SDUNetTextStatesInput(Net).Output.Copy(Embeds);
+      PrevHeadIdx := -1;
+      for HeadPos := 0 to High(Heads) do
+      begin
+        HeadIdx := Heads[HeadPos].LayerIdx;
+        AssertTrue('heads in build order', HeadIdx > PrevHeadIdx);
+        if PrevHeadIdx < 0 then Net.Compute(Latents, 0, false, HeadIdx)
+        else Net.ComputeFromFilledInput(PrevHeadIdx + 1, false, HeadIdx);
+        Source := Heads[HeadPos].PrevLayer.Output;
+        HeadOutput := Heads[HeadPos].Output;
+        Dk := HeadOutput.Depth;
+        AssertEquals('Q|K|V source', 3 * Dk, Source.Depth);
+        for TokenPos := 0 to HeadOutput.SizeX - 1 do
+          for DimPos := 0 to Dk - 1 do
+            HeadOutput[TokenPos, 0, DimPos] :=
+              Source[TokenPos, 0, 2 * Dk + DimPos];
+        PrevHeadIdx := HeadIdx;
+      end;
+      Net.ComputeFromFilledInput(PrevHeadIdx + 1, false, -1);
+      Net.GetOutput(Expected);
+      AssertEquals(Patterns[PatternPos] + ' vs the hand forward', 0,
+        MaxAbsVolumeDiff(Got, Expected), 0);
+      AssertTrue(Patterns[PatternPos] + ' perturbs the output',
+        MaxAbsVolumeDiff(Got, Plain) > 1e-6);
+    end;
+    SDUNetDenoise(Net, Config, Latents, Embeds, Timestep, Got);
+    AssertEquals('flags cleared: the plain output again', 0,
+      MaxAbsVolumeDiff(Got, Plain), 0);
+  finally
+    Net.Free;
+    Expected.Free;
+    Got.Free;
+    Plain.Free;
+    Latents.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Guidance: TNNetPerturbedGuidance;
+  Cases, LayerPatterns: TJSONArray;
+  CaseObject: TJSONObject;
+  Embeds, Initial, Image, Expected: TNNetVolume;
+  Patterns: array of string;
+  CaseName: string;
+  CasePos, PatternPos, ImageWidth, ImageHeight, StepCount,
+    PassesPerStep: integer;
+  GuidanceScale, MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_pag_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
+    ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
+    StepCount := TJSONObject(FSD15Oracle).Get('steps', 0);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    Cases := TJSONObject(FSD15Oracle).Arrays['cases'];
+    AssertEquals('cases', 3, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObject := Cases.Objects[CasePos];
+      CaseName := CaseObject.Get('name', '');
+      GuidanceScale := CaseObject.Get('guidance_scale', 0.0);
+      Pipeline.GuidanceScale := GuidanceScale;
+      Guidance := TNNetPerturbedGuidance.Create(1,
+        CaseObject.Get('pag_scale', 0.0));
+      Pipeline.PerturbedGuidance := Guidance;
+      Guidance.AdaptiveScale := CaseObject.Get('pag_adaptive_scale', 0.0);
+      LayerPatterns := CaseObject.Arrays['pag_applied_layers'];
+      SetLength(Patterns, LayerPatterns.Count);
+      for PatternPos := 0 to LayerPatterns.Count - 1 do
+        Patterns[PatternPos] := LayerPatterns.Strings[PatternPos];
+      Guidance.SetPerturbedLayers(SDUNetPAGLayerIndices(Pipeline.UNetConfig,
+        Patterns));
+      FSD15StepOracle := CaseObject;
+      FSD15StepMaxDiff := 0;
+      FSD15StepCount := 0;
+      Pipeline.OnStep := @SD15CheckStep;
+      Pipeline.GenerateFromEmbeds(Embeds, ImageWidth, ImageHeight, StepCount,
+        0, Image, Initial);
+      AssertEquals(CaseName + ' steps run', StepCount, FSD15StepCount);
+      if GuidanceScale > 1 then PassesPerStep := 3 else PassesPerStep := 2;
+      AssertEquals(CaseName + ' passes', PassesPerStep * StepCount,
+        Pipeline.ImageStats.UNetPassCount);
+      AssertTrue(CaseName + ' step latents max |diff| = ' +
+        FloatToStr(FSD15StepMaxDiff), FSD15StepMaxDiff < 1e-4);
+      LoadNestedOracleVolume(CaseObject.Arrays['image'], false, Expected);
+      MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+      AssertTrue(CaseName + ' image max |diff| = ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-4);
+    end;
+  finally
+    FSD15StepOracle := nil;
+    Expected.Free;
+    Image.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGDeepCache;
+const
+  StepCount = 7;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Plain, PlainFirst, Got: TNNetVolume;
+  ImageSide: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  PlainFirst := TNNetVolume.Create;
+  Got := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.PerturbedGuidance := TNNetPerturbedGuidance.Create(1, 3);
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    ImageSide := Pipeline.DefaultImageSize;
+    Pipeline.MakeInitialLatents(ImageSide, ImageSide, 7, Initial);
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Plain.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Plain);
+    PlainFirst.Copy(FSDFirstStepLatents);
+    Pipeline.DeepCacheInterval := 3;
+    Got.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSide, ImageSide, StepCount, Got);
+    AssertEquals('passes', 3 * StepCount, Pipeline.ImageStats.UNetPassCount);
+    // Steps 1, 2, 4 and 5 of 7 skip in each of the three pass kinds; a shared
+    // slot would advance twice per step and skip another pattern.
+    AssertEquals('cached passes', 12, Pipeline.ImageStats.UNetCachedPassCount);
+    AssertEquals('step 0 runs the whole unet', 0,
+      MaxAbsVolumeDiff(FSDFirstStepLatents, PlainFirst), 0);
+    AssertTrue('later steps reuse deep outputs',
+      MaxAbsVolumeDiff(Got, Plain) > 0);
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    Got.Free;
+    PlainFirst.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPAGOpenCL;
+{$IFDEF OpenCL}
+const
+  Timestep = 500;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pipeline: TStableDiffusionPipeline;
+  Config: TSDUNetConfig;
+  Nets: array[0..1] of TNNet;
+  Heads: array[0..1] of TNNetLayerRefArr;
+  Noises: array[0..1] of TNNetVolume;
+  Embeds, Latents: TNNetVolume;
+  NetPos, HeadPos, LayerPos, OpenCLHeadCount: integer;
+  MaxDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Pipeline := CreateSD15Pipeline();
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  for NetPos := 0 to 1 do
+  begin
+    Nets[NetPos] := nil;
+    Noises[NetPos] := TNNetVolume.Create;
+  end;
+  try
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    Pipeline.MakeInitialLatents(Pipeline.DefaultImageSize,
+      Pipeline.DefaultImageSize, 5, Latents);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Latents.SizeX;
+    Config.TextSeqLen := Embeds.SizeX;
+    for NetPos := 0 to 1 do
+    begin
+      Nets[NetPos] := BuildSDUNetFromSafeTensorsEx(FixturePath(
+        'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, false);
+      Heads[NetPos] := SDUNetSelfAttentionHeads(Nets[NetPos], Config,
+        SDUNetPAGLayerIndices(Config, ['mid']));
+      for HeadPos := 0 to High(Heads[NetPos]) do
+        TNNetScaledDotProductAttention(Heads[NetPos][HeadPos]).
+          SkipAttentionScores := true;
+    end;
+    Nets[1].ForceOpenCL(true);
+    Nets[1].EnableOpenCL(PlatformId, DeviceId);
+    for NetPos := 0 to 1 do
+      SDUNetDenoise(Nets[NetPos], Config, Latents, Embeds, Timestep,
+        Noises[NetPos]);
+    MaxDiff := MaxAbsVolumeDiff(Noises[0], Noises[1]);
+    AssertTrue('OpenCL vs CPU max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    for HeadPos := 0 to High(Heads[1]) do
+    begin
+      AssertEquals('identity head on the host', 0,
+        Heads[1][HeadPos].ForwardGPUCnt);
+      AssertEquals('identity head ran once', 1,
+        Heads[1][HeadPos].ForwardCPUCnt);
+    end;
+    OpenCLHeadCount := 0;
+    for LayerPos := 0 to Nets[1].GetLastLayerIdx() do
+      if (Nets[1].Layers[LayerPos].ClassType = TNNetScaledDotProductAttention)
+        and (Nets[1].Layers[LayerPos].ForwardGPUCnt > 0) then
+        Inc(OpenCLHeadCount);
+    AssertTrue('the other heads ran on OpenCL', OpenCLHeadCount > 0);
+  finally
+    for NetPos := 0 to 1 do
+    begin
+      Noises[NetPos].Free;
+      Nets[NetPos].Free;
+    end;
+    Latents.Free;
+    Embeds.Free;
+    Pipeline.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.TestMarigoldPipelineMatchesPredict;
 const

@@ -456,11 +456,16 @@ type
   TNNetPerturbedGuidance = class(TObject)
   private
     FGuidanceScale, FPerturbedScale, FGuidanceRescale: TNeuralFloat;
+    FAdaptiveScale: TNeuralFloat;
     FPerturbedStart, FPerturbedStop, FGuidanceStart, FGuidanceStop: double;
     FUseOriginalFormulation: boolean;
     FMode: TNNetPerturbedGuidanceMode;
     FPerturbedLayers: TNeuralIntegerArray;
     procedure SetPerturbedWindow(pStart, pStop: double);
+    // Dst := CondCoef*Cond + UncondCoef*Uncond + SkipCoef*Skip, the Dst-aliased
+    // term first; Uncond may be nil (its term dropped).
+    procedure MixPredictions(CondCoef, UncondCoef, SkipCoef: TNeuralFloat;
+      Cond, Uncond, Skip, Dst: TNNetVolume);
   public
     // Fractions of the schedule as in diffusers: 0 <= pPerturbedStart < 1 and
     // pPerturbedStart <= pPerturbedStop <= 1, else EArgumentException.
@@ -480,9 +485,19 @@ type
     // Skip). Uncond / Skip may be nil when their guidance is off at this step.
     procedure Apply(Step, NumSteps: integer; Cond, Uncond, Skip,
       Dst: TNNetVolume);
+    // diffusers PAGMixin._get_pag_scale: Max(0, PerturbedScale - AdaptiveScale
+    // * (1000 - Timestep)) when both are > 0, else PerturbedScale.
+    function PerturbedScaleAt(Timestep: TNeuralFloat): TNeuralFloat;
+    // diffusers PAGMixin._apply_perturbed_attention_guidance: Dst := Uncond + W*(Cond
+    // - Uncond) (Cond when Uncond is nil) + PerturbedScaleAt(Timestep)*(Cond - Skip).
+    procedure ApplyPerturbedAttentionGuidance(Timestep, W: TNeuralFloat;
+      Cond, Uncond, Skip, Dst: TNNetVolume);
     property GuidanceScale: TNeuralFloat read FGuidanceScale write FGuidanceScale;
     property PerturbedScale: TNeuralFloat read FPerturbedScale
       write FPerturbedScale;
+    // diffusers pag_adaptive_scale (default 0 = off); read by PerturbedScaleAt.
+    property AdaptiveScale: TNeuralFloat read FAdaptiveScale
+      write FAdaptiveScale;
     property GuidanceRescale: TNeuralFloat read FGuidanceRescale
       write FGuidanceRescale;
     property PerturbedStart: double read FPerturbedStart;
@@ -2224,13 +2239,22 @@ begin
       FPerturbedScale + BaseCoef, FGuidanceRescale);
     exit;
   end;
-  // Both on: Dst := cC*Cond + cU*Uncond + cS*Skip, the Dst-aliased term first.
   CondCoef := BaseCoef + FGuidanceScale + FPerturbedScale;
   UncondCoef := (1 - BaseCoef) - FGuidanceScale;
   SkipCoef := -FPerturbedScale;
   StdCond := 0;
   if FGuidanceRescale <> 0 then StdCond := Cond.GetStdDeviation();
-  if Dst = Uncond then
+  MixPredictions(CondCoef, UncondCoef, SkipCoef, Cond, Uncond, Skip, Dst);
+  TNNetDiffusionScheduler.RescaleGuidance(Dst, StdCond, FGuidanceRescale);
+end;
+
+procedure TNNetPerturbedGuidance.MixPredictions(CondCoef, UncondCoef,
+  SkipCoef: TNeuralFloat; Cond, Uncond, Skip, Dst: TNNetVolume);
+var
+  HasUncond: boolean;
+begin
+  HasUncond := Assigned(Uncond);
+  if HasUncond and (Dst = Uncond) then
   begin
     Dst.Mul(UncondCoef);
     Dst.MulAdd(CondCoef, Cond);
@@ -2240,16 +2264,37 @@ begin
   begin
     Dst.Mul(SkipCoef);
     Dst.MulAdd(CondCoef, Cond);
-    Dst.MulAdd(UncondCoef, Uncond);
+    if HasUncond then Dst.MulAdd(UncondCoef, Uncond);
   end
   else
   begin
     if Dst <> Cond then Dst.Copy(Cond);
     Dst.Mul(CondCoef);
-    Dst.MulAdd(UncondCoef, Uncond);
+    if HasUncond then Dst.MulAdd(UncondCoef, Uncond);
     Dst.MulAdd(SkipCoef, Skip);
   end;
-  TNNetDiffusionScheduler.RescaleGuidance(Dst, StdCond, FGuidanceRescale);
+end;
+
+function TNNetPerturbedGuidance.PerturbedScaleAt(
+  Timestep: TNeuralFloat): TNeuralFloat;
+begin
+  Result := FPerturbedScale;
+  if (FAdaptiveScale > 0) and (FPerturbedScale > 0) then
+  begin
+    Result := FPerturbedScale - FAdaptiveScale * (1000 - Timestep);
+    if Result < 0 then Result := 0;
+  end;
+end;
+
+procedure TNNetPerturbedGuidance.ApplyPerturbedAttentionGuidance(Timestep,
+  W: TNeuralFloat; Cond, Uncond, Skip, Dst: TNNetVolume);
+var
+  StepScale, CondCoef: TNeuralFloat;
+begin
+  StepScale := PerturbedScaleAt(Timestep);
+  if Assigned(Uncond) then CondCoef := W + StepScale
+  else CondCoef := 1 + StepScale;
+  MixPredictions(CondCoef, 1 - W, -StepScale, Cond, Uncond, Skip, Dst);
 end;
 
 { TNNetLCMScheduler }

@@ -502,6 +502,61 @@ from the kept output, on every branch, with CFG
 (`TestStableDiffusionDeepCacheOpenCL`). Speed and image quality on a real
 SD 1.5 checkpoint have not been measured yet.
 
+## Perturbed-Attention Guidance (`--pag-scale`)
+
+Perturbed-Attention Guidance (PAG; Ahn et al. 2024, arXiv:2403.17377) runs
+one more UNet pass per step, on the prompt, with the self-attention (`attn1`)
+of the chosen transformer blocks replaced by identity attention: each token
+keeps its own value row, so the attention output is `to_out(to_v(x))`. The
+step's noise moves away from that perturbed prediction:
+
+* with CFG: `uncond + guidance * (cond - uncond) + pag * (cond - perturbed)`
+* without CFG (`--guidance 1`): `cond + pag * (cond - perturbed)`
+
+This is diffusers' `StableDiffusionPAGPipeline` (`PAGMixin`). It runs on
+every step; diffusers' default `pag_scale` is 3.0 and the default layers are
+`mid` (the self-attention of the mid block).
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 25 \
+  --pag-scale 3 --prompt "a watercolor painting of a lighthouse" --gpu
+```
+
+`--pag-layers L1,L2,...` takes diffusers' `pag_applied_layers` patterns. Each
+one is a regular expression searched in the module name of every UNet
+self-attention, for example
+`down_blocks.1.attentions.0.transformer_blocks.0.attn1`,
+`mid_block.attentions.0.transformer_blocks.0.attn1` or
+`up_blocks.2.attentions.1.transformer_blocks.0.attn1`. So `mid` takes the mid
+block, `down_blocks.2` every self-attention of down block 2, and
+`up_blocks\.1\.attentions\.0` one transformer of up block 1. A pattern that
+matches nothing is an error, as in diffusers. The example prints the
+self-attentions it perturbs. `--pag-adaptive-scale A` lowers the scale to
+`max(0, pag - A * (1000 - t))` at timestep t (diffusers `pag_adaptive_scale`).
+
+PAG combines with img2img, inpainting, depth2img, ControlNet, T2I-Adapter,
+IP-Adapter, LoRA, FreeU and DeepCache (the perturbed pass keeps its own deep
+features). It does not combine with `--edit-image` (diffusers has no
+InstructPix2Pix PAG pipeline).
+
+`TStableDiffusionPipeline.PerturbedGuidance` (a `TNNetPerturbedGuidance`, the
+settings class of the Qwen-Image `--pag-scale`; `PerturbedScale`,
+`AdaptiveScale`, `SetPerturbedLayers`) is the API. `SDUNetSelfAttentionNames`
+lists the diffusers names in index order and `SDUNetPAGLayerIndices` turns
+patterns into the indices `SetPerturbedLayers` takes (empty: `mid`). The
+perturbed pass sets `TNNetScaledDotProductAttention.SkipAttentionScores` on
+the attention heads of those self-attentions; it allocates nothing and does
+not rebuild the UNet. Tests on the pico folder: `--pag-scale 0` bit-identical
+to no PAG (`TestStableDiffusionPAGScaleZero`); the perturbed UNet
+bit-identical to a forward that writes each head's V rows by hand
+(`TestStableDiffusionPAGIdentityReference`); diffusers float64
+`StableDiffusionPAGPipeline` with DDIM, with CFG on `mid`, without CFG on two
+patterns, and with an adaptive scale on every self-attention, step latents
+within 2.2e-5 and images within 1.6e-6 (`TestStableDiffusionPAGParity`);
+DeepCache (`TestStableDiffusionPAGDeepCache`); OpenCL against the CPU < 1e-4
+(`TestStableDiffusionPAGOpenCL`). A real checkpoint has not been run with PAG
+yet.
+
 ## Usage
 
 ```
@@ -571,6 +626,13 @@ StableDiffusion [--model DIR] [options]
   --deepcache-branch B shallow branch size, 0..layers_per_block: B resnets of
                     down block 0 and B + 1 of the last up block run (default
                     layers_per_block: both blocks whole; 0 is the fastest)
+  --pag-scale S     Perturbed-Attention Guidance scale (default 0 = off; diffusers
+                    uses 3.0): one more UNet pass per step
+  --pag-layers L1,L2 the self-attentions PAG perturbs, diffusers pag_applied_layers
+                    patterns (regular expressions over names such as
+                    mid_block.attentions.0.transformer_blocks.0.attn1; default mid)
+  --pag-adaptive-scale A lowers the PAG scale by A per timestep below 1000
+                    (diffusers pag_adaptive_scale, default 0)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

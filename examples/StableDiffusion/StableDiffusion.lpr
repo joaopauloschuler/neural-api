@@ -48,6 +48,10 @@ diffusers enable_freeu: no extra UNet pass.
 --deepcache N [--deepcache-branch B] turns on DeepCache (Ma et al. 2023): the
 whole UNet runs on every N-th step, the steps between run only its shallow
 branch and reuse the deep branch output of the last whole run.
+--pag-scale S [--pag-layers L1,L2] [--pag-adaptive-scale A] turns on
+Perturbed-Attention Guidance (Ahn et al. 2024), as diffusers
+StableDiffusionPAGPipeline: one more UNet pass per step with the self-attention
+of the chosen layers (default mid) replaced by identity attention.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -117,6 +121,10 @@ type
     FreeUFactors: array[0..3] of TNeuralFloat;
     // --deepcache N (1 = off); --deepcache-branch B (-1: the pipeline default).
     DeepCacheInterval, DeepCacheBranch: integer;
+    // --pag-scale (<= 0: off), --pag-adaptive-scale and the --pag-layers
+    // patterns (diffusers pag_applied_layers).
+    PAGScale, PAGAdaptiveScale: double;
+    PAGLayers: TStringArray;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -316,6 +324,18 @@ begin
     '(default');
   WriteLn('                    layers_per_block: both blocks whole; 0 is the ',
     'fastest)');
+  WriteLn('  --pag-scale S     Perturbed-Attention Guidance scale (default 0 = ',
+    'off; diffusers');
+  WriteLn('                    uses 3.0): one more UNet pass per step');
+  WriteLn('  --pag-layers L1,L2 the self-attentions PAG perturbs, diffusers ',
+    'pag_applied_layers');
+  WriteLn('                    patterns (regular expressions over names such ',
+    'as');
+  WriteLn('                    mid_block.attentions.0.transformer_blocks.0.',
+    'attn1; default mid)');
+  WriteLn('  --pag-adaptive-scale A lowers the PAG scale by A per timestep ',
+    'below 1000');
+  WriteLn('                    (diffusers pag_adaptive_scale, default 0)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -415,6 +435,9 @@ begin
   Opt.UseFreeU := false;
   Opt.DeepCacheInterval := 1;
   Opt.DeepCacheBranch := -1;
+  Opt.PAGScale := 0;
+  Opt.PAGAdaptiveScale := 0;
+  Opt.PAGLayers := nil;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -474,6 +497,12 @@ begin
     else if Arg = '--deepcache' then Opt.DeepCacheInterval := StrToInt(NextArg())
     else if Arg = '--deepcache-branch' then
       Opt.DeepCacheBranch := StrToInt(NextArg())
+    else if Arg = '--pag-scale' then
+      Opt.PAGScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--pag-adaptive-scale' then
+      Opt.PAGAdaptiveScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--pag-layers' then
+      Opt.PAGLayers := NextArg().Split([','])
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
@@ -500,6 +529,12 @@ begin
     raise Exception.Create('--deepcache must be >= 1');
   if (Opt.DeepCacheBranch >= 0) and (Opt.DeepCacheInterval < 2) then
     raise Exception.Create('--deepcache-branch needs --deepcache 2 or more');
+  if ((Length(Opt.PAGLayers) > 0) or (Opt.PAGAdaptiveScale <> 0)) and
+    (Opt.PAGScale <= 0) then
+    raise Exception.Create('--pag-layers and --pag-adaptive-scale need ' +
+      '--pag-scale > 0');
+  if (Opt.PAGScale > 0) and (Opt.EditImageFile <> '') then
+    raise Exception.Create('--pag-scale cannot be combined with --edit-image');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
@@ -565,6 +600,10 @@ var
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
+  PerturbedGuidance: TNNetPerturbedGuidance;
+  SelfAttentionNames: TStringArray;
+  PAGLayerIndices: TNeuralIntegerArray;
+  PAGLayerPos: integer;
   StepCount, Img2ImgStepCount: integer;
   IsDepthUNet, IsUpscalerUNet: boolean;
   GuidanceScale: double;
@@ -696,6 +735,18 @@ begin
     Pipeline.DeepCacheInterval := Opt.DeepCacheInterval;
     if Opt.DeepCacheBranch >= 0 then
       Pipeline.DeepCacheBranch := Opt.DeepCacheBranch;
+    if Opt.PAGScale > 0 then
+    begin
+      PerturbedGuidance := TNNetPerturbedGuidance.Create(1, Opt.PAGScale);
+      Pipeline.PerturbedGuidance := PerturbedGuidance;
+      PerturbedGuidance.AdaptiveScale := Opt.PAGAdaptiveScale;
+      if Length(Opt.PAGLayers) > 0 then
+        PAGLayerIndices := SDUNetPAGLayerIndices(Pipeline.UNetConfig,
+          Opt.PAGLayers)
+      else PAGLayerIndices := SDUNetPAGLayerIndices(Pipeline.UNetConfig,
+        ['mid']);
+      PerturbedGuidance.SetPerturbedLayers(PAGLayerIndices);
+    end;
     {$IFDEF OpenCL}
     if Opt.UseStats then OpenCLTransferCounting := true;
     {$ENDIF}
@@ -725,6 +776,15 @@ begin
     if Pipeline.DeepCacheInterval > 1 then
       WriteLn(Format('DeepCache: interval %d, branch %d',
         [Pipeline.DeepCacheInterval, Pipeline.DeepCacheBranch]));
+    if Opt.PAGScale > 0 then
+    begin
+      WriteLn(Format('PAG:      scale %.2f, adaptive scale %g, %d ' +
+        'self-attention(s):', [Opt.PAGScale, Opt.PAGAdaptiveScale,
+        Length(PAGLayerIndices)]));
+      SelfAttentionNames := SDUNetSelfAttentionNames(Pipeline.UNetConfig);
+      for PAGLayerPos := 0 to High(PAGLayerIndices) do
+        WriteLn('          ', SelfAttentionNames[PAGLayerIndices[PAGLayerPos]]);
+    end;
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,

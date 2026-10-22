@@ -2124,10 +2124,12 @@ rather than acted on.
             defaults (2 of 18 steps run the extra pass) from the user's GPU
             box, for examples/QwenImage/README.md; the default blocks (PAG 16,
             SLG 6,7,8) are untuned on the real checkpoint.
-      - [ ] Later consumers: the SD UNet path (`TStableDiffusionPipeline` /
-            examples/StableDiffusion and examples/LatentTextToImage,
-            diffusers `StableDiffusionPAGPipeline` on mid-block self-attention)
-            and CogVideoX.
+      - [X] SD UNet consumer: `TStableDiffusionPipeline.PerturbedGuidance`
+            and examples/StableDiffusion `--pag-scale` / `--pag-layers` /
+            `--pag-adaptive-scale`, as diffusers `StableDiffusionPAGPipeline`
+            (pico parity < 1e-4, `TestStableDiffusionPAG*`).
+      - [ ] Later consumers: examples/LatentTextToImage and CogVideoX; a
+            with/without PAG image pair on a real SD 1.5 checkpoint.
       A diffusers oracle needs a patched block / processor registry and a
       Prefix + i identity rule in Python (diffusers 0.41.0.dev0 cannot run
       either guider on QwenImage21); ask the user before adding a Python tool.

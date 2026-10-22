@@ -4560,6 +4560,7 @@ type
     // (old saved models load with 0 = equality, bit-identical). Coded by Claude (AI).
     FBlockCausalSeg: boolean;
     FKeepAttentionWeights: boolean; // see KeepAttentionWeights
+    FSkipAttentionScores: boolean;  // see SkipAttentionScores
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -4752,6 +4753,8 @@ type
     function SinkLogits(): TNNetVolume; virtual;
     // The KV-cache forward of a whole input (Compute runs it when the cache is on).
     procedure ComputeIncremental(); virtual;
+    // SkipAttentionScores' uncached forward: every token row outputs its own V.
+    procedure ComputeIdentityScores();
     // Raises and returns true when SeqLen more tokens overflow the cache.
     function CacheOverflows(SeqLen: integer): boolean;
     // Appends the K and V of the packed [Q|K|V] row Src to the cache, first
@@ -4990,6 +4993,10 @@ type
     // True keeps the forward off the flash kernel so AttentionWeights is filled.
     property KeepAttentionWeights: boolean read FKeepAttentionWeights
       write FKeepAttentionWeights;
+    // Inference-only PAG switch, not saved: identity scores, each row outputs its
+    // own V row. Read by this class's uncached forward and by TNNetFusedSDPA.
+    property SkipAttentionScores: boolean read FSkipAttentionScores
+      write FSkipAttentionScores;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property Window: integer read FWindow;
@@ -5412,8 +5419,6 @@ type
     // Bumped by SetRowKeyEnds (never 0), so the OpenCL helper re-uploads
     // the ends only when they change.
     FRowKeyEndsVersion: integer;
-    // See SkipAttentionScores.
-    FSkipAttentionScores: boolean;
     // Identity scores for heads h1..h2: every token row's head h output is
     // its own V slice of KV group h div FGroupSize.
     procedure ComputeIdentityScoreHeads(h1, h2: integer);
@@ -5507,10 +5512,6 @@ type
     // (mask mode none) over an FP32 cache. Eviction must be off.
     property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
       write SetCachedForwardNonCausal;
-    // Inference-only (Perturbed-Attention Guidance): the score matrix is the
-    // identity, so each row outputs its own V row; the cache still appends.
-    property SkipAttentionScores: boolean read FSkipAttentionScores
-      write FSkipAttentionScores;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -36756,7 +36757,8 @@ begin
     exit;
   end;
   SeqLen := FPrevLayer.FOutput.SizeX;
-  Result := FlashForwardIsExact() and (FCausal or (FWindow = 0))
+  Result := (not FSkipAttentionScores) and FlashForwardIsExact()
+    and (FCausal or (FWindow = 0))
     and (PrevOutputOnOpenCL() or (SeqLen >= csSDPAOpenCLMinSeqLen))
     and FFusedSDPACL.FlashTilesFit(FDk, {Int8KV=}false)
     and FusedSDPAFlashIndicesFit(1, 1, SeqLen, SeqLen, FDk);
@@ -36966,6 +36968,11 @@ begin
     ComputeIncremental();
     exit;
   end;
+  if FSkipAttentionScores then
+  begin
+    ComputeIdentityScores();
+    exit;
+  end;
   {$IFDEF OpenCL}
   // Prefill score matmul on the device when OpenCL is enabled and the sequence
   // is long enough to amortize the per-forward upload/dispatch (short prompts
@@ -37119,6 +37126,29 @@ begin
         TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
       Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetScaledDotProductAttention.ComputeIdentityScores();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  TokenPos, MaxTokenPos, ValuePos, OutputPos, RowStride, RowBytes: integer;
+begin
+  Inc(FForwardCPUCnt);
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  MaxTokenPos := Prev.SizeX - 1;
+  RowStride := Prev.GetRawPos(1, 0);
+  RowBytes := FDk * csNeuralFloatSize;
+  ValuePos := 2 * FDk;
+  OutputPos := 0;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    Move(Prev.FData[ValuePos], FOutput.FData[OutputPos], RowBytes);
+    Inc(ValuePos, RowStride);
+    Inc(OutputPos, FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

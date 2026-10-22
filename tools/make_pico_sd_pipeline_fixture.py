@@ -56,6 +56,11 @@ transformers class (nothing downloaded), saved with the real folder layout:
     grid and every step runs (StableDiffusionImg2ImgPipeline's get_timesteps
     cut is bypassed). Per-step noise (step_noise) and the image's VAE sample
     noise are injected; latents_after, timesteps and the decoded image per case.
+  tests/fixtures/tiny_sd15_pag_io.json
+    StableDiffusionPAGPipeline (Perturbed-Attention Guidance) on tiny_sd15,
+    DDIM, STEPS steps from the fixed latents of tiny_sd15_pipeline_io.json, one
+    case per PAG_CASES entry (guidance scale, pag_scale, pag_adaptive_scale,
+    pag_applied_layers): timesteps, latents_after and the decoded image.
   tests/fixtures/tiny_sd15_lcm_distilled/{model_index.json,
                                           scheduler/scheduler_config.json, unet/}
     an LCM-distilled pico UNet: tiny_sd15's UNet weights plus a random
@@ -83,10 +88,11 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --lcm-only
   python tools/make_pico_sd_pipeline_fixture.py --lcm-distilled-only
   python tools/make_pico_sd_pipeline_fixture.py --freeu-only
+  python tools/make_pico_sd_pipeline_fixture.py --pag-only
 (--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only /
---freeu-only keep the committed folder and rewrite only the sampler /
-non-square / odd-size / LCM / FreeU files; --lcm-distilled-only rewrites the
-distilled UNet folder and its file.)
+--freeu-only / --pag-only keep the committed folder and rewrite only the
+sampler / non-square / odd-size / LCM / FreeU / PAG files; --lcm-distilled-only
+rewrites the distilled UNet folder and its file.)
 """
 import json
 import math
@@ -102,8 +108,8 @@ from diffusers.utils.torch_utils import fourier_filter
 from diffusers import (AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler,
                        EulerDiscreteScheduler, LatentConsistencyModelImg2ImgPipeline,
                        LatentConsistencyModelPipeline, LCMScheduler, PNDMScheduler,
-                       StableDiffusionImg2ImgPipeline, StableDiffusionPipeline,
-                       UNet2DConditionModel)
+                       StableDiffusionImg2ImgPipeline, StableDiffusionPAGPipeline,
+                       StableDiffusionPipeline, UNet2DConditionModel)
 import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as img2img_module
 import diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_img2img as lcm_img2img_module
 import diffusers.schedulers.scheduling_lcm as lcm_module
@@ -122,6 +128,7 @@ LCM_DISTILLED_FILE = os.path.join(FIXTURES, "tiny_sd15_lcm_distilled_io.json")
 FREEU_FILTER_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_filter_io.json")
 FREEU_NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_nonsquare_io.json")
 FREEU_ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_oddsize_io.json")
+PAG_FILE = os.path.join(FIXTURES, "tiny_sd15_pag_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -145,6 +152,13 @@ FREEU_FILTER_SCALE = 0.37
 FREEU_FILTER_SIZES = [(1, 1), (1, 4), (3, 1), (2, 2), (2, 5), (4, 4), (5, 3),
                       (6, 7), (8, 8)]   # (H, W)
 FREEU_FILTER_CHANNELS = 3
+# name, guidance_scale, pag_scale, pag_adaptive_scale, pag_applied_layers. The
+# adaptive scale reaches 0 within the 3 DDIM steps (timesteps 667, 334, 1).
+PAG_CASES = [
+    ("cfg_mid", GUIDANCE, 3.0, 0.0, ["mid"]),
+    ("no_cfg_down_up", 1.0, 2.0, 0.0, ["down", r"up_blocks\.1\.attentions\.1"]),
+    ("cfg_adaptive_all", GUIDANCE, 3.0, 0.004, ["(down|mid|up)"]),
+]
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -462,6 +476,40 @@ def make_oddsize_oracle():
     make_nonsquare_oracle(ODD_WIDTH, ODD_HEIGHT, ODDSIZE_FILE)
 
 
+def make_pag_oracle():
+    base = StableDiffusionPipeline.from_pretrained(PICO_DIR, torch_dtype=torch.float64,
+                                                   safety_checker=None)
+    generator = torch.Generator().manual_seed(SEED)
+    grid = IMAGE_SIZE // base.vae_scale_factor
+    latents = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    cases = []
+    for name, guidance, pag_scale, adaptive, layers in PAG_CASES:
+        pipe = StableDiffusionPAGPipeline(**base.components, pag_applied_layers=layers)
+        pipe.set_progress_bar_config(disable=True)
+        after = []
+
+        def on_step_end(_pipe, _step, _t, kwargs):
+            after.append(rounded(chw(kwargs["latents"][0])))
+            return kwargs
+        result = pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+                      num_inference_steps=STEPS, guidance_scale=guidance,
+                      pag_scale=pag_scale, pag_adaptive_scale=adaptive,
+                      latents=latents.clone(), output_type="np",
+                      callback_on_step_end=on_step_end)
+        cases.append({"name": name, "guidance_scale": guidance,
+                      "pag_scale": pag_scale, "pag_adaptive_scale": adaptive,
+                      "pag_applied_layers": layers,
+                      "timesteps": [int(t) for t in pipe.scheduler.timesteps],
+                      "latents_after": after,
+                      "image": rounded(result.images[0].tolist())})
+        print("PAG", name, cases[-1]["timesteps"])
+    payload = {"width": IMAGE_SIZE, "height": IMAGE_SIZE, "steps": STEPS,
+               "prompt": PROMPT, "latents": rounded(chw(latents[0])),
+               "cases": cases}
+    with open(PAG_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 def make_freeu_oracles():
     generator = torch.Generator().manual_seed(SEED + 50)
     cases = []
@@ -653,6 +701,9 @@ if __name__ == "__main__":
     if "--freeu-only" in sys.argv:
         make_freeu_oracles()
         sys.exit(0)
+    if "--pag-only" in sys.argv:
+        make_pag_oracle()
+        sys.exit(0)
     if "--samplers-only" not in sys.argv:
         build_folder()
         make_oracle()
@@ -662,3 +713,4 @@ if __name__ == "__main__":
     make_lcm_oracle()
     make_lcm_distilled_oracle()
     make_freeu_oracles()
+    make_pag_oracle()
