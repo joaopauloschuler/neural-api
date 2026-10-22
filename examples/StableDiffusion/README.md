@@ -59,6 +59,31 @@ lowercase TOKEN (`file.pt:easynegative`) to get all of them. Tested against
 diffusers float64 on the pico folder (`TestStableDiffusionTextualInversion*`);
 no real embedding has been run yet.
 
+`--ip-adapter FILE --ip-image PNG [--ip-scale S]` adds an image prompt, as
+diffusers `load_ip_adapter` + `set_ip_adapter_scale` do with
+`h94/IP-Adapter` `models/ip-adapter_sd15.safetensors` (or `.bin`)
+(`TStableDiffusionIPAdapter`). The CLIP image encoder
+(`CLIPVisionModelWithProjection`) is read from the `image_encoder/` folder
+beside FILE. Once per image, the encoder turns the CLIP-preprocessed image into
+`image_embeds`, and the adapter's `image_proj` turns those into 4 image tokens.
+Every cross-attention of the UNet gets a second attention over those tokens
+(`to_k_ip` / `to_v_ip`), added to the text attention times S before
+`to_out.0`. The unguided half of CFG uses the tokens of a zero embedding, as
+diffusers does. S = 0 gives the plain pipeline's image. The image preprocessing
+reads `feature_extractor/preprocessor_config.json` from the model folder when
+it exists, else uses `CLIPImageProcessor` defaults at the encoder's image size:
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --ip-adapter ~/models/IP-Adapter/models/ip-adapter_sd15.safetensors \
+  --ip-image style.png --ip-scale 0.6 --prompt "a cat, best quality"
+```
+
+Tested against diffusers float64 on the pico folder with a random
+ip-adapter_sd15 and CLIP vision tower (`TestStableDiffusionIPAdapterParity`,
+`TestStableDiffusionIPAdapterScaleZero`). No real IP-Adapter has been run yet.
+IP-Adapter-Plus, FaceID and SDXL adapters are not supported.
+
 The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 `steps_offset`) and the prediction type come from
 `scheduler/scheduler_config.json`. Its `_class_name` picks the sampler:
@@ -99,6 +124,10 @@ StableDiffusion [--model DIR] [options]
   --embedding F[:T] textual inversion embedding (diffusers learned_embeds
                     .safetensors/.bin or A1111 .pt) under token T (default: the
                     file's); use the token in the prompts; repeatable
+  --ip-adapter FILE IP-Adapter ip-adapter_sd15 (.safetensors/.bin) with its
+                    image_encoder/ folder beside it; needs --ip-image
+  --ip-image PNG    the image prompt of --ip-adapter
+  --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the image)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

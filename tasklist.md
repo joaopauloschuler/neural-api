@@ -619,7 +619,7 @@ rather than acted on.
             copy of the text; HF lowercases Unicode (non-ASCII tokens differ).
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
-      - [ ] IP-Adapter image prompts in TStableDiffusionPipeline (port of
+      - [X] IP-Adapter image prompts in TStableDiffusionPipeline (port of
             diffusers `load_ip_adapter` + `set_ip_adapter_scale` +
             IPAdapterAttnProcessor, h94/IP-Adapter ip-adapter_sd15). Today
             BuildIPAdapter builds only image_proj + ONE isolated decoupled
@@ -653,6 +653,17 @@ rather than acted on.
             examples/StableDiffusion + its README. Out of scope: IP-Adapter-Plus
             (Resampler image_proj over the penultimate hidden states), FaceID,
             SDXL, combining it with ControlNet / T2I-Adapter.
+            DONE: BuildSDUNet(IPAdapterReader) + TStableDiffusionIPAdapter
+            (hook UNetIPAdapterFile; Scale rides on the to_v_ip token input) +
+            StableDiffusion --ip-adapter/--ip-image/--ip-scale; pico parity
+            < 1e-4, key order down/up/mid verified on the fixture.
+        - [ ] Run h94/IP-Adapter ip-adapter_sd15 on real SD 1.5 (only the pico
+              fixture is tested).
+        - [ ] IP-Adapter with ControlNet / T2I-Adapter: one conditioner per
+              Denoise today, and BuildSDUNet refuses the combination.
+        - [ ] IP-Adapter extras: set_ip_adapter_scale per-block dicts
+              (style/layout), several adapters/images, ip_adapter_masks,
+              ip-adapter-plus (Resampler), FaceID, SDXL.
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):

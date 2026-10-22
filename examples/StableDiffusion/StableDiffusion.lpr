@@ -19,6 +19,9 @@ prompt encode and keeps the three components loaded. --int8 stores the UNet
 and text encoder weights in int8. --stats prints a per-image stage table
 (wall ms; host<->OpenCL MB with --gpu). --embedding FILE[:TOKEN] (repeatable)
 loads a textual inversion concept, as diffusers load_textual_inversion.
+--ip-adapter FILE --ip-image PNG [--ip-scale S] adds an image prompt through an
+h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
+diffusers load_ip_adapter + set_ip_adapter_scale.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -48,6 +51,9 @@ const
 type
   TStableDiffusionOptions = record
     ModelFolder, Prompt, NegativePrompt, OutputFile: string;
+    // --ip-adapter weights file and --ip-image; '' for none.
+    IPAdapterFile, IPImageFile: string;
+    IPScale: double;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
     // 'auto' (the scheduler config's) or one of SamplerOptionNames.
@@ -176,6 +182,13 @@ begin
     '(default: the');
   WriteLn('                    file''s); use the token in the prompts; ',
     'repeatable');
+  WriteLn('  --ip-adapter FILE IP-Adapter ip-adapter_sd15 (.safetensors/.bin) ',
+    'with its');
+  WriteLn('                    image_encoder/ folder beside it; needs ',
+    '--ip-image');
+  WriteLn('  --ip-image PNG    the image prompt of --ip-adapter');
+  WriteLn('  --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the ',
+    'image)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -225,6 +238,9 @@ begin
   Opt.Prompt := 'a photo of an astronaut riding a horse on mars';
   Opt.NegativePrompt := '';
   Opt.OutputFile := 'stable_diffusion.png';
+  Opt.IPAdapterFile := '';
+  Opt.IPImageFile := '';
+  Opt.IPScale := 1.0;
   Opt.SamplerName := 'auto';
   Opt.Steps := 25;
   Opt.ImageWidth := 0;
@@ -265,6 +281,10 @@ begin
       SetLength(Opt.Embeddings, Length(Opt.Embeddings) + 1);
       Opt.Embeddings[High(Opt.Embeddings)] := NextArg();
     end
+    else if Arg = '--ip-adapter' then Opt.IPAdapterFile := NextArg()
+    else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
+    else if Arg = '--ip-scale' then
+      Opt.IPScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--stats' then Opt.UseStats := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
@@ -282,6 +302,8 @@ begin
   end;
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
   if Opt.RepeatCount < 1 then raise Exception.Create('--repeat must be >= 1');
+  if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
+    raise Exception.Create('--ip-adapter and --ip-image go together');
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
@@ -315,6 +337,7 @@ procedure Run(const Opt: TStableDiffusionOptions);
 var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
+  IPAdapter: TStableDiffusionIPAdapter;
   Image, PromptEmbeds: TNNetVolume;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos: integer;
@@ -327,6 +350,7 @@ var
 begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
+  IPAdapter := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
   try
@@ -376,6 +400,18 @@ begin
         EmbeddingToken);
       WriteLn('Embedding: ', EmbeddingToken, ' from ', EmbeddingFile);
     end;
+    if Opt.IPAdapterFile <> '' then
+    begin
+      IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
+      if not LoadImageFromFileIntoVolume(Opt.IPImageFile, Image) then
+        raise Exception.Create('could not load ' + Opt.IPImageFile);
+      IPAdapter.SetImage(Image);
+      IPAdapter.Scale := Opt.IPScale;
+      Pipeline.Conditioner := IPAdapter;
+      WriteLn(Format('IP-Adapter: %s, image %s (%dx%d), scale %.2f',
+        [Opt.IPAdapterFile, Opt.IPImageFile, Image.SizeX, Image.SizeY,
+         Opt.IPScale]));
+    end;
     if Opt.RepeatCount > 1 then
     begin
       WriteLn('Loading the text encoder, the UNet and the VAE decoder to ',
@@ -419,8 +455,9 @@ begin
   finally
     PromptEmbeds.Free;
     Image.Free;
-    Reporter.Free;
     Pipeline.Free;
+    IPAdapter.Free;
+    Reporter.Free;
   end;
 end;
 
