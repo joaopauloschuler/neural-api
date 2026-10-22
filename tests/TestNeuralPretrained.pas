@@ -52184,6 +52184,8 @@ begin
     begin
       Reloaded := TNNet.Create();
       Reloaded.LoadFromString(NN.SaveToString());
+      // NN is inference-only (low-memory kernels); exact equality needs the same.
+      Reloaded.SetTrainable(false);
       Reloaded.Compute(ImgInput);
       AssertEquals(Stem + ' save/load round trip', 0,
         MaxAbsVolumeDiff(NetOutput, Reloaded.GetLastLayer().Output), 0);
